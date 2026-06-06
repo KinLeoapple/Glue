@@ -166,8 +166,12 @@ pub const Parser = struct {
                 .kw_pub,
                 .kw_val,
                 .kw_var,
-                .r_brace,
                 => return,
+                .r_brace,
+                => {
+                    _ = self.advance();
+                    return;
+                },
                 else => {
                     _ = self.advance();
                 },
@@ -502,10 +506,12 @@ pub const Parser = struct {
         if (!self.check(.string_literal)) return null;
         const msg = self.advance();
         _ = self.expect(.r_paren, "期望 ')'") catch return null;
+        // 去除字符串字面量的引号
+        const raw_msg = if (msg.lexeme.len >= 2) msg.lexeme[1 .. msg.lexeme.len - 1] else msg.lexeme;
         return ast.TypeDef{
             .error_newtype = .{
                 .name = "Error",
-                .message = msg.lexeme,
+                .message = raw_msg,
             },
         };
     }
@@ -1798,7 +1804,7 @@ pub const Parser = struct {
                 return err;
             };
             try arms.append(self.allocator, arm);
-            if (!self.matchToken(.comma)) break;
+            _ = self.matchToken(.comma); // 逗号可选
         }
 
         _ = self.expect(.r_brace, "期望 '}'") catch {};

@@ -4,7 +4,7 @@
 //! - 通配符模式（_）
 //! - 字面量模式（int, float, bool, char, string, null）
 //! - 变量绑定模式
-//! - 构造器模式（Ok, Err 等 ADT 构造器）
+//! - 构造器模式（Ok, Error 等 ADT 构造器）
 //! - 记录模式（(field: pattern, ...)）
 //! - 或模式（pattern1 | pattern2）
 //!
@@ -76,7 +76,7 @@ fn matchLiteralPattern(lit: ast.PatternLiteral, val: value.Value) PatternError!b
 
 /// 构造器模式匹配
 fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor), val: value.Value, environment: *env.Environment) PatternError!bool {
-    // Ok/Err 构造器模式匹配 Throw<T, E> 值
+    // Ok/Error 构造器模式匹配 Throw<T, E> 值
     if (std.mem.eql(u8, con.name, "Ok")) {
         if (val == .throw_val) {
             switch (val.throw_val.*) {
@@ -95,7 +95,7 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
         }
         return true;
     }
-    if (std.mem.eql(u8, con.name, "Err")) {
+    if (std.mem.eql(u8, con.name, "Error")) {
         if (val == .throw_val) {
             switch (val.throw_val.*) {
                 .ok => return false,

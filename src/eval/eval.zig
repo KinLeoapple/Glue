@@ -70,12 +70,15 @@ pub const Evaluator = struct {
     tail_call: ?TailCall = null,
     /// TCO: 当前是否在尾位置（用于检测尾调用）
     in_tail_position: bool = false,
+    /// 自定义错误类型上下文列表
+    error_newtype_contexts: std.ArrayList(*ErrorNewtypeCtx),
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
             .allocator = allocator,
             .global_env = Environment.init(allocator),
             .closures = std.ArrayList(*value.Closure).empty,
+            .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
         };
         ev.registerBuiltins();
         return ev;
@@ -87,6 +90,7 @@ pub const Evaluator = struct {
             .global_env = Environment.init(allocator),
             .io = io,
             .closures = std.ArrayList(*value.Closure).empty,
+            .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
         };
         ev.registerBuiltins();
         return ev;
@@ -99,6 +103,13 @@ pub const Evaluator = struct {
             self.allocator.destroy(closure);
         }
         self.closures.deinit(self.allocator);
+        // 释放所有错误类型上下文
+        for (self.error_newtype_contexts.items) |ctx| {
+            self.allocator.free(ctx.type_name);
+            self.allocator.free(ctx.default_prefix);
+            self.allocator.destroy(ctx);
+        }
+        self.error_newtype_contexts.deinit(self.allocator);
     }
 
     /// 触发 Glue panic — 不可捕获，但允许 defer 执行
@@ -118,89 +129,93 @@ pub const Evaluator = struct {
     fn registerBuiltins(self: *Evaluator) void {
 
         // println
-        self.global_env.define("println", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("println", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinPrintln(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // print
-        self.global_env.define("print", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("print", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinPrint(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // eprintln
-        self.global_env.define("eprintln", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("eprintln", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinEprintln(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // eprint
-        self.global_env.define("eprint", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("eprint", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinEprint(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // assert
-        self.global_env.define("assert", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("assert", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinAssert(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // precondition
-        self.global_env.define("precondition", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("precondition", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinPrecondition(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // fatal
-        self.global_env.define("fatal", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("fatal", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinFatal(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // eq (结构相等)
-        self.global_env.define("eq", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("eq", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinEq(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // string (类型转换)
-        self.global_env.define("string", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("string", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinString(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // Error 构造器
-        self.global_env.define("Error", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("Error", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinError(args);
             }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
         // Ok 构造器 — 创建 ThrowValue.ok
-        self.global_env.define("Ok", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        self.global_env.define("Ok", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinOk(args);
             }
-        }.call }, true) catch {};
-        // Err 构造器 — 创建 ThrowValue.err
-        self.global_env.define("Err", Value{ .builtin = struct {
-            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
-                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
-                return ev.builtinErr(args);
-            }
-        }.call }, true) catch {};
+        }.call } }, true) catch {};
     }
 
     // ============================================================
@@ -320,30 +335,13 @@ pub const Evaluator = struct {
             .string => |s| s,
             else => return error.TypeMismatch,
         };
-        return Value{ .error_val = value.ErrorValue{
-            .type_name = try self.allocator.dupe(u8, "Error"),
-            .message = try self.allocator.dupe(u8, message),
-        } };
+        return throw_mod.makeErr(self.allocator, "Error", message);
     }
 
     /// Ok(value) — 创建 ThrowValue.ok
     fn builtinOk(self: *Evaluator, args: []const Value) EvalError!Value {
         if (args.len != 1) return error.WrongArity;
         return throw_mod.makeOk(self.allocator, args[0]);
-    }
-
-    /// Err(error) — 创建 ThrowValue.err
-    fn builtinErr(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
-        const err_val = switch (args[0]) {
-            .error_val => |e| e,
-            .string => |s| value.ErrorValue{
-                .type_name = try self.allocator.dupe(u8, "Error"),
-                .message = try self.allocator.dupe(u8, s),
-            },
-            else => return error.TypeMismatch,
-        };
-        return throw_mod.makeErr(self.allocator, err_val.type_name, err_val.message);
     }
 
     // ============================================================
@@ -374,49 +372,56 @@ pub const Evaluator = struct {
                     .error_newtype => |en| {
                         // 注册自定义错误类型构造器
                         // type FileError = Error("file error")
-                        // FileError("msg") 创建 ErrorValue{ type_name = "FileError", message = "file error: msg" }
+                        // FileError("msg") 创建 ThrowValue.err{ type_name = "FileError", message = "file error: msg" }
                         const ctx_data = try self.allocator.create(ErrorNewtypeCtx);
                         ctx_data.* = .{
                             .type_name = try self.allocator.dupe(u8, en.name),
                             .default_prefix = try self.allocator.dupe(u8, en.message),
                         };
-                        try environment.define(td.name, Value{ .builtin = struct {
-                            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
-                                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
-                                if (args.len != 1) return error.WrongArity;
-                                const message = switch (args[0]) {
-                                    .string => |s| s,
-                                    else => return error.TypeMismatch,
-                                };
-                                // 从闭包上下文获取类型名和默认前缀
-                                const data: *ErrorNewtypeCtx = @ptrCast(@alignCast(ctx));
-                                // 组合默认前缀和消息：prefix + ": " + message
-                                var full_msg = std.ArrayList(u8).empty;
-                                defer full_msg.deinit(ev.allocator);
-                                try full_msg.appendSlice(ev.allocator, data.default_prefix);
-                                try full_msg.appendSlice(ev.allocator, ": ");
-                                try full_msg.appendSlice(ev.allocator, message);
-                                return Value{ .error_val = value.ErrorValue{
-                                    .type_name = try ev.allocator.dupe(u8, data.type_name),
-                                    .message = try full_msg.toOwnedSlice(ev.allocator),
-                                } };
-                            }
-                        }.call }, true);
+                        try self.error_newtype_contexts.append(self.allocator, ctx_data);
+                        try environment.define(td.name, Value{ .builtin = value.Builtin{
+                            .fn_ptr = struct {
+                                fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                                    const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                                    if (args.len != 1) return error.WrongArity;
+                                    const message = switch (args[0]) {
+                                        .string => |s| s,
+                                        else => return error.TypeMismatch,
+                                    };
+                                    // 从 user_ctx 获取 ErrorNewtypeCtx
+                                    const data: *ErrorNewtypeCtx = @ptrCast(@alignCast(user_ctx orelse return error.TypeMismatch));
+                                    // 组合默认前缀和消息：prefix + ": " + message
+                                    var full_msg = std.ArrayList(u8).empty;
+                                    defer full_msg.deinit(ev.allocator);
+                                    try full_msg.appendSlice(ev.allocator, data.default_prefix);
+                                    try full_msg.appendSlice(ev.allocator, ": ");
+                                    try full_msg.appendSlice(ev.allocator, message);
+                                    const tv = try ev.allocator.create(value.ThrowValue);
+                                    tv.* = value.ThrowValue{ .err = value.ErrorValue{
+                                        .type_name = try ev.allocator.dupe(u8, data.type_name),
+                                        .message = try full_msg.toOwnedSlice(ev.allocator),
+                                    } };
+                                    return Value{ .throw_val = tv };
+                                }
+                            }.call,
+                            .user_ctx = ctx_data,
+                        } }, true);
                     },
                     .newtype => |nt| {
                         // 注册 newtype 构造器
                         // type UserId = UserId(i32)
                         // UserId(42) 创建一个包装值
                         _ = nt;
-                        try environment.define(td.name, Value{ .builtin = struct {
-                            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+                        try environment.define(td.name, Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+                            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                                _ = user_ctx;
                                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                                 if (args.len != 1) return error.WrongArity;
                                 // Phase 1: newtype 值直接返回内部值（零开销）
                                 // 后续 Phase 2 类型检查器会区分类型
                                 return args[0].clone(ev.allocator) catch |err| return err;
                             }
-                        }.call }, true);
+                        }.call } }, true);
                     },
                     .alias => {
                         // Type Alias — Phase 1 无类型检查器，空操作即可
@@ -833,22 +838,24 @@ pub const Evaluator = struct {
 
         // 求值参数
         var args = std.ArrayList(Value).empty;
-        errdefer {
-            for (args.items) |*a| a.deinit(self.allocator);
-            args.deinit(self.allocator);
-        }
+        var args_transferred = false; // TCO 路径中标记所有权已转移
         for (call.arguments) |arg_expr| {
             try args.append(self.allocator, try self.evalExpr(arg_expr, environment));
         }
-        defer args.deinit(self.allocator);
+        defer {
+            if (!args_transferred) {
+                for (args.items) |*a| a.deinit(self.allocator);
+                args.deinit(self.allocator);
+            }
+        }
 
         // TCO: 如果在尾位置且被调用者是闭包，使用尾调用优化
-        // 注意：必须复制参数，因为 args 会在 defer 时释放
         if (self.in_tail_position and callee == .closure) {
-            const args_copy = try self.allocator.dupe(Value, args.items);
+            const owned_args = try self.allocator.dupe(Value, args.items);
+            args_transferred = true; // 标记所有权已转移，errdefer/defer 不再释放
             self.tail_call = TailCall{
                 .closure = callee.closure,
-                .args = args_copy,
+                .args = owned_args,
             };
             return error.TailCall;
         }
@@ -868,7 +875,7 @@ pub const Evaluator = struct {
                 // Trampoline 循环：尾调用不创建新栈帧，而是循环执行
                 var current_closure = initial_closure;
                 var current_args = args;
-                // 跟踪需要释放的 args 副本（由 evalCall 中 dupe 分配）
+                // 跟踪需要释放的 args（由 evalCall 中 toOwnedSlice 转移所有权）
                 var args_owned: ?[]const Value = null;
                 defer {
                     if (args_owned) |owned| self.allocator.free(owned);
@@ -911,9 +918,18 @@ pub const Evaluator = struct {
                             }
                             current_closure = tc.closure;
                             current_args = tc.args;
-                            // tc.args 是 evalCall 中 dupe 分配的，需要在此释放
+                            // tc.args 是 evalCall 中 toOwnedSlice 转移的，需要在此释放
                             args_owned = tc.args;
                             continue;
+                        },
+                        error.ThrowValue => {
+                            // throw 语句产生的 ThrowValue.err 作为函数返回值
+                            // 函数返回 Throw<T, E> 时，throw 等价于 return Error(...)
+                            if (self.throw_value) |tv| {
+                                self.throw_value = null;
+                                return tv;
+                            }
+                            return error.ThrowValue;
                         },
                         else => return err,
                     };
@@ -921,8 +937,8 @@ pub const Evaluator = struct {
                     return final_result;
                 }
             },
-            .builtin => |fn_ptr| {
-                const result = fn_ptr(@ptrCast(self), args) catch |err| {
+            .builtin => |b| {
+                const result = b.fn_ptr(@ptrCast(self), b.user_ctx, args) catch |err| {
                     // anyerror 不能直接转换为 EvalResult，只传播已知的错误
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -1054,15 +1070,14 @@ pub const Evaluator = struct {
     fn evalPropagate(self: *Evaluator, prop: @TypeOf(@as(ast.Expr, undefined).propagate), environment: *Environment) EvalResult!Value {
         const val = try self.evalExpr(prop.expr, environment);
         if (val.isNull()) {
-            // ? 作用于 T? 时，null 提前返回 null（等价于 match { null => return null }）
-            // 使用 ReturnValue 携带 null 值返回
+            // ? 作用于 T? 时，null 提前返回 null
             self.return_value = Value.null_val;
             return error.ReturnValue;
         }
         if (val == .throw_val) {
             // ? 作用于 Throw<T, E> 时：
             // - 如果是 Ok(v)，解包返回 v
-            // - 如果是 Err(e)，提前传播 throw
+            // - 如果是 Error(e)，提前传播 throw
             switch (val.throw_val.*) {
                 .ok => |v| return v.*,
                 .err => {
@@ -1070,12 +1085,6 @@ pub const Evaluator = struct {
                     return error.ThrowValue;
                 },
             }
-        }
-        if (val == .error_val) {
-            // error_val 不应该直接被 ? 传播，应该先包装为 throw_val
-            // 但为向后兼容，也处理这种情况
-            self.throw_value = val;
-            return error.ThrowValue;
         }
         return val;
     }
@@ -1414,24 +1423,23 @@ pub const Evaluator = struct {
             },
             .throw_stmt => |thr| {
                 const val = try self.evalExpr(thr.expr, environment);
-                // throw 语句创建 Throw Err 值
-                // 如果 val 已经是 error_val，包装为 Throw Err
-                // 如果 val 是 string，创建 Error 类型
-                const err_val: value.ErrorValue = switch (val) {
-                    .error_val => |e| e,
-                    .string => |s| value.ErrorValue{
-                        .type_name = try self.allocator.dupe(u8, "Error"),
-                        .message = try self.allocator.dupe(u8, s),
+                // throw 语句：抛出满足 Error trait 的值
+                switch (val) {
+                    .throw_val => |tv| {
+                        // throw Error("msg") / throw FileError("msg")
+                        // 表达式已经是 ThrowValue.err，直接传播
+                        self.throw_value = Value{ .throw_val = tv };
+                        return error.ThrowValue;
                     },
-                    else => value.ErrorValue{
-                        .type_name = try self.allocator.dupe(u8, "Error"),
-                        .message = try self.allocator.dupe(u8, "unknown error"),
+                    .error_val => |e| {
+                        // 旧路径：error_val 包装为 ThrowValue.err
+                        const tv = try self.allocator.create(value.ThrowValue);
+                        tv.* = value.ThrowValue{ .err = e };
+                        self.throw_value = Value{ .throw_val = tv };
+                        return error.ThrowValue;
                     },
-                };
-                const tv = try self.allocator.create(value.ThrowValue);
-                tv.* = value.ThrowValue{ .err = err_val };
-                self.throw_value = Value{ .throw_val = tv };
-                return error.ThrowValue;
+                    else => return error.TypeMismatch,
+                }
             },
             .break_stmt => {
                 return error.BreakSignal;
@@ -1603,7 +1611,7 @@ fn structuralEquals(a: Value, b: Value) bool {
             return true;
         },
         .closure => |c| c == b.closure,
-        .builtin => |fn_ptr| fn_ptr == b.builtin,
+        .builtin => |b_val| b_val.fn_ptr == b.builtin.fn_ptr and b_val.user_ctx == b.builtin.user_ctx,
         .error_val => |e| std.mem.eql(u8, e.type_name, b.error_val.type_name) and std.mem.eql(u8, e.message, b.error_val.message),
         .throw_val => |tv| tv == b.throw_val, // 引用相等
     };

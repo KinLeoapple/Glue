@@ -17,17 +17,17 @@ val z: i32? = 10
 val w = z ?? 99
 println(w)
 
-// 3. Ok/Err 和 Throw
+// 3. Ok/Error 和 Throw
 val result = Ok(42)
 println(result)
 
-val err = Err(Error("something failed"))
+val err = Error("something failed")
 println(err)
 
-// 4. match Ok/Err
+// 4. match Ok/Error
 val r = match Ok(100) {
     Ok(v) => v + 1
-    Err(e) => 0
+    Error(e) => 0
 }
 println(r)
 

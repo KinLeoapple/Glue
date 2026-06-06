@@ -163,7 +163,7 @@ pub const Pattern = union(enum) {
     },
 
     /// 构造器模式：Name(patterns) — ADT 构造器模式
-    /// 如 Circle(r), Cons(x, xs), Ok(value), Err(e)
+    /// 如 Circle(r), Cons(x, xs), Ok(value), Error(e)
     constructor: struct {
         location: SourceLocation,
         name: []const u8,

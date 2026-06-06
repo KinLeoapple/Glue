@@ -1,7 +1,7 @@
-# Glue 语言设计规范
+﻿# Glue 语言设计规范
 
-> 版本: 0.7.0-draft
-> 最后更新: 2026-06-05
+> 版本: 0.7.1-draft
+> 最后更新: 2026-06-06
 
 ---
 
@@ -319,7 +319,7 @@ fun safe_get() : String? {
 fun safe_get() : String? {
     match read_file("data.txt") {
         Ok(content) => content,
-        Err(_) => null,
+        Error(_) => null,
     }
 }
 ```
@@ -337,7 +337,7 @@ fun find_user(id: i32) : Throw<User?, FileError> {
 // 使用时两步处理
 val user = match find_user(42) {
     Ok(u) => u,           // u : User?
-    Err(e) => null,       // 降级为 null
+    Error(e) => null,       // 降级为 null
 }
 // user : User? — 还需要处理 null
 val name = user?.name ?? "anonymous"
@@ -480,7 +480,7 @@ fun read_file(path: String) : Throw<String, FileError> {
 
 `Throw<T, E>` 的值有两种状态：
 - `Ok(value)` — 成功，持有 T 类型的值
-- `Err(error)` — 失败，持有 E 类型的错误值
+- `Error(message)` — 失败，持有错误信息
 
 #### 2.4.5 throw 语句
 
@@ -516,26 +516,14 @@ fun read_config() : Throw<Config, Error> {
 
 #### 2.4.7 Throw 模式匹配
 
-**E 为具体错误类型——穷举匹配**：
-
 ```glue
 match read_file("config.json") {    // Throw<String, FileError>
     Ok(content) => process(content),
-    Err(FileError(e)) => println("file: " + e.message),
-}
-// ✅ 穷举：Err 只可能是 FileError
-```
-
-**E 为 Error 基类型——需要 catch-all**：
-
-```glue
-match read_config() {    // Throw<Config, Error>
-    Ok(config) => use(config),
-    Err(FileError(e)) => println("file: " + e.message),
-    Err(ParseError(e)) => println("parse: " + e.message),
-    Err(e) => println("error: " + e.message),    // catch-all
+    Error(e) => println("error: " + e.message),
 }
 ```
+
+`Ok(v)` 匹配成功值，`Error(e)` 匹配错误值。
 
 #### 2.4.8 Throw 与 Nullable 的组合
 
@@ -1126,7 +1114,7 @@ ch.close()
 
 match ch.send(42) {
     Ok(()) => println("sent"),
-    Err(SendError) => println("channel closed"),
+    Error(e) => println("channel closed"),
 }
 
 loop {
@@ -1355,7 +1343,7 @@ fun main() {
 核心优势：
 - **零全局暂停**：每个 heap 独立回收
 - **天然防数据竞争**：两个协程不可能同时访问同一块内存
-- **高效回收**：函数式风格产生大量短命对象，隔离 GC 各自独立回收
+- **高效回收**：函数式风格产生大量的短命对象，隔离 GC 各自独立回收
 
 GC 算法：**分代式复制收集器**（新生代 + 老生代 + 大对象区）
 
@@ -1502,7 +1490,7 @@ fun greet() : String? {
 // 模式匹配
 match read_file("config.json") {
     Ok(content) => process(content),
-    Err(FileError(e)) => println("file: " + e.message),
+    Error(e) => println("file: " + e.message),
 }
 ```
 
@@ -1784,7 +1772,7 @@ glue/
 | 求值器 | 可执行基本表达式 |
 | 基础类型 | i8..i128, u8..u128, f32, f64, bool, char |
 | Nullable | `T?`、`null`、`?.`、`??`、`!`、类型收窄、`?` 传播 |
-| Throw | `Throw<T, E>`、`throw`、`?` 传播、`Ok/Err` 模式匹配 |
+| Throw | `Throw<T, E>`、`throw`、`?` 传播、`Ok/Error` 模式匹配 |
 | `?` 不跨 Nullable/Throw | `?` 严格按类型匹配 |
 | Error | 内建 Error trait、自定义错误类型、Error 子类型 |
 | Type Alias + Newtype | 类型别名与零开销包装 |
@@ -1963,6 +1951,7 @@ glue/
 | D70 | 无匿名元组 | 记录必须有命名字段 | 支持匿名元组 |
 | D71 | 去掉 Agent | spawn+channel 已足够，减少概念 | 保留 Agent |
 | D72 | 保留 Arc<T> | 不可变数据零拷贝无替代方案 | 去掉 Arc |
+| D73 | Throw 构造器简化为 Ok/Error | 消除 Err(Error(...)) 双重包装冗余，Error() 直接创建 ThrowValue.err | 保留 Err + Error 双层构造 |
 
 ## 附录 B：术语表
 

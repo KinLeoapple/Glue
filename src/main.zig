@@ -22,7 +22,7 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void
     const source = cwd.readFileAlloc(io, filename, allocator, .unlimited) catch |err| {
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-        stderr_writer.interface.print("错误：无法读取文件 '{s}': {}\n", .{ filename, err }) catch {};
+        stderr_writer.interface.print("Error: unable to read file '{s}': {}\n", .{ filename, err }) catch {};
         stderr_writer.flush() catch {};
         return;
     };
@@ -48,9 +48,9 @@ fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, &in_buf);
     const stdin = &stdin_reader.interface;
 
-    try stdout.print("Glue v0.1.0 — 交互式求值器\n", .{});
+    try stdout.print("Glue v0.1.0 -- Interactive REPL\n", .{});
     try stdout_writer.flush();
-    try stdout.print("输入表达式求值，输入 :quit 退出\n\n", .{});
+    try stdout.print("Enter expressions to evaluate, type :quit to exit\n\n", .{});
     try stdout_writer.flush();
 
     var ev = eval.Evaluator.initWithIo(allocator, io);
@@ -62,7 +62,7 @@ fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
 
         const line = stdin.takeDelimiter('\n') catch |err| {
             if (err == error.EndOfStream) break;
-            try stdout.print("读取错误: {}\n", .{err});
+            try stdout.print("Read error: {}\n", .{err});
             try stdout_writer.flush();
             continue;
         };
@@ -78,7 +78,7 @@ fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
         }
     }
 
-    try stdout.print("\n再见！\n", .{});
+    try stdout.print("\nBye!\n", .{});
     try stdout_writer.flush();
 }
 
@@ -90,7 +90,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
     const tokens = lex.tokenize() catch |err| {
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-        stderr_writer.interface.print("词法分析错误: {}\n", .{err}) catch {};
+        stderr_writer.interface.print("Lexer error: {}\n", .{err}) catch {};
         stderr_writer.flush() catch {};
         return;
     };
@@ -129,7 +129,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             else => {
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                stderr_writer.interface.print("求值错误: {}\n", .{err}) catch {};
+                stderr_writer.interface.print("Evaluation error: {}\n", .{err}) catch {};
                 stderr_writer.flush() catch {};
                 return;
             },
@@ -162,7 +162,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         else => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("求值错误: {}\n", .{err}) catch {};
+            stderr_writer.interface.print("Evaluation error: {}\n", .{err}) catch {};
             stderr_writer.flush() catch {};
         },
     };

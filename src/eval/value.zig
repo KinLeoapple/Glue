@@ -84,11 +84,11 @@ pub const ErrorValue = struct {
 /// Throw<T, E> 的运行时值
 /// 文档 2.4.4: Throw<T, E> 的值有两种状态：
 /// - Ok(value) — 成功，持有 T 类型的值
-/// - Err(error) — 失败，持有 E 类型的错误值
+/// - Error(message) — 失败，持有错误信息
 pub const ThrowValue = union(enum) {
     /// Ok(value) — 成功状态
     ok: *Value,
-    /// Err(error) — 失败状态
+    /// Error(message) — 失败状态
     err: ErrorValue,
 };
 
@@ -101,7 +101,16 @@ pub const ThrowValue = union(enum) {
 /// 使用 *anyopaque 作为上下文指针以避免与 Evaluator 的循环依赖。
 /// 在 eval.zig 中注册内建函数时，将 *Evaluator 转换为 *anyopaque；
 /// 调用时，内建函数的 wrapper 将 *anyopaque 转换回 *Evaluator。
-pub const BuiltinFn = *const fn (*anyopaque, []const Value) anyerror!Value;
+pub const BuiltinFn = *const fn (*anyopaque, ?*anyopaque, []const Value) anyerror!Value;
+
+/// 内建函数（带用户上下文）
+///
+/// ctx: *Evaluator（通过 @ptrCast 传递）
+/// user_ctx: 可选的用户上下文指针（如 ErrorNewtypeCtx）
+pub const Builtin = struct {
+    fn_ptr: BuiltinFn,
+    user_ctx: ?*anyopaque = null,
+};
 
 // ============================================================
 // 闭包
@@ -139,7 +148,7 @@ pub const Value = union(enum) {
     closure: *Closure,
 
     // 内建函数
-    builtin: BuiltinFn,
+    builtin: Builtin,
 
     // 错误值（用于 throw 传播）
     error_val: ErrorValue,
@@ -289,7 +298,7 @@ pub const Value = union(enum) {
                         try buf.appendSlice(allocator, ")");
                     },
                     .err => |e| {
-                        try buf.print(allocator, "Err({s}(\"{s}\"))", .{ e.type_name, e.message });
+                        try buf.print(allocator, "{s}(\"{s}\")", .{ e.type_name, e.message });
                     },
                 }
             },
@@ -313,7 +322,7 @@ pub const Value = union(enum) {
             .array => |a| @intFromPtr(&a) == @intFromPtr(&other.array),
             .record => |r| @intFromPtr(&r) == @intFromPtr(&other.record),
             .closure => |c| c == other.closure,
-            .builtin => |b| b == other.builtin,
+            .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,
             .error_val => |e| std.mem.eql(u8, e.type_name, other.error_val.type_name) and std.mem.eql(u8, e.message, other.error_val.message),
             .throw_val => |tv| tv == other.throw_val, // 引用相等
         };
