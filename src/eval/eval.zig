@@ -35,6 +35,25 @@ pub const ControlFlow = value.ControlFlow;
 pub const EvalResult = value.EvalResult;
 
 // ============================================================
+// 尾调用优化 (TCO)
+// ============================================================
+
+/// 尾调用信息 — 用于 trampoline 实现 TCO
+///
+/// 当函数在尾位置调用另一个函数时，不创建新的栈帧，
+/// 而是设置 tail_call 信息，由 callFunction 的循环处理。
+const TailCall = struct {
+    closure: *value.Closure,
+    args: []const Value,
+};
+
+/// 自定义错误类型构造器的上下文数据
+const ErrorNewtypeCtx = struct {
+    type_name: []const u8,
+    default_prefix: []const u8,
+};
+
+// ============================================================
 // 求值器
 // ============================================================
 
@@ -44,7 +63,13 @@ pub const Evaluator = struct {
     io: ?std.Io = null,
     return_value: ?Value = null,
     throw_value: ?Value = null,
+    /// Glue panic 消息 — 不可捕获，但允许 defer 执行
+    panic_message: ?[]const u8 = null,
     closures: std.ArrayList(*value.Closure),
+    /// TCO: 尾调用信息，用于 trampoline
+    tail_call: ?TailCall = null,
+    /// TCO: 当前是否在尾位置（用于检测尾调用）
+    in_tail_position: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
@@ -74,6 +99,16 @@ pub const Evaluator = struct {
             self.allocator.destroy(closure);
         }
         self.closures.deinit(self.allocator);
+    }
+
+    /// 触发 Glue panic — 不可捕获，但允许 defer 执行
+    ///
+    /// 文档要求：panic 不可捕获，但 defer 在 panic 时仍执行。
+    /// 实现方式：设置 panic_message 并返回 error.GluePanic，
+    /// evalBlock 捕获后执行 defer 栈，然后重新抛出。
+    fn gluePanic(self: *Evaluator, message: []const u8) EvalResult!Value {
+        self.panic_message = message;
+        return error.GluePanic;
     }
 
     // ============================================================
@@ -143,6 +178,27 @@ pub const Evaluator = struct {
             fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinString(args);
+            }
+        }.call }, true) catch {};
+        // Error 构造器
+        self.global_env.define("Error", Value{ .builtin = struct {
+            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                return ev.builtinError(args);
+            }
+        }.call }, true) catch {};
+        // Ok 构造器 — 创建 ThrowValue.ok
+        self.global_env.define("Ok", Value{ .builtin = struct {
+            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                return ev.builtinOk(args);
+            }
+        }.call }, true) catch {};
+        // Err 构造器 — 创建 ThrowValue.err
+        self.global_env.define("Err", Value{ .builtin = struct {
+            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                return ev.builtinErr(args);
             }
         }.call }, true) catch {};
     }
@@ -217,40 +273,31 @@ pub const Evaluator = struct {
         return Value.unit;
     }
 
-    fn builtinAssert(self: *Evaluator, args: []const Value) EvalError!Value {
-        _ = self;
+    fn builtinAssert(self: *Evaluator, args: []const Value) EvalResult!Value {
         if (args.len != 1) return error.WrongArity;
         const cond = args[0];
         if (cond != .boolean or !cond.boolean) {
-            @panic("assertion failed");
+            return self.gluePanic("assertion failed");
         }
         return Value.unit;
     }
 
-    fn builtinPrecondition(self: *Evaluator, args: []const Value) EvalError!Value {
-        _ = self;
+    fn builtinPrecondition(self: *Evaluator, args: []const Value) EvalResult!Value {
         if (args.len != 1) return error.WrongArity;
         const cond = args[0];
         if (cond != .boolean or !cond.boolean) {
-            @panic("precondition failed");
+            return self.gluePanic("precondition failed");
         }
         return Value.unit;
     }
 
-    fn builtinFatal(self: *Evaluator, args: []const Value) EvalError!Value {
+    fn builtinFatal(self: *Evaluator, args: []const Value) EvalResult!Value {
         if (args.len != 1) return error.WrongArity;
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator) catch {};
-        if (self.io) |io| {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("{s}", .{buf.items}) catch {};
-            stderr_writer.flush() catch {};
-        } else {
-            std.debug.print("{s}", .{buf.items});
-        }
-        return error.Unreachable;
+        const msg = try self.allocator.dupe(u8, buf.items);
+        return self.gluePanic(msg);
     }
 
     fn builtinEq(self: *Evaluator, args: []const Value) EvalError!Value {
@@ -265,6 +312,38 @@ pub const Evaluator = struct {
         errdefer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator) catch return error.OutOfMemory;
         return Value{ .string = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory };
+    }
+
+    fn builtinError(self: *Evaluator, args: []const Value) EvalError!Value {
+        if (args.len != 1) return error.WrongArity;
+        const message = switch (args[0]) {
+            .string => |s| s,
+            else => return error.TypeMismatch,
+        };
+        return Value{ .error_val = value.ErrorValue{
+            .type_name = try self.allocator.dupe(u8, "Error"),
+            .message = try self.allocator.dupe(u8, message),
+        } };
+    }
+
+    /// Ok(value) — 创建 ThrowValue.ok
+    fn builtinOk(self: *Evaluator, args: []const Value) EvalError!Value {
+        if (args.len != 1) return error.WrongArity;
+        return throw_mod.makeOk(self.allocator, args[0]);
+    }
+
+    /// Err(error) — 创建 ThrowValue.err
+    fn builtinErr(self: *Evaluator, args: []const Value) EvalError!Value {
+        if (args.len != 1) return error.WrongArity;
+        const err_val = switch (args[0]) {
+            .error_val => |e| e,
+            .string => |s| value.ErrorValue{
+                .type_name = try self.allocator.dupe(u8, "Error"),
+                .message = try self.allocator.dupe(u8, s),
+            },
+            else => return error.TypeMismatch,
+        };
+        return throw_mod.makeErr(self.allocator, err_val.type_name, err_val.message);
     }
 
     // ============================================================
@@ -290,8 +369,63 @@ pub const Evaluator = struct {
                 try self.closures.append(self.allocator, closure);
                 try environment.define(f.name, Value{ .closure = closure }, false);
             },
-            .type_decl => {
-                // Phase 1: 简单处理，注册类型名但不做更多
+            .type_decl => |td| {
+                switch (td.def) {
+                    .error_newtype => |en| {
+                        // 注册自定义错误类型构造器
+                        // type FileError = Error("file error")
+                        // FileError("msg") 创建 ErrorValue{ type_name = "FileError", message = "file error: msg" }
+                        const ctx_data = try self.allocator.create(ErrorNewtypeCtx);
+                        ctx_data.* = .{
+                            .type_name = try self.allocator.dupe(u8, en.name),
+                            .default_prefix = try self.allocator.dupe(u8, en.message),
+                        };
+                        try environment.define(td.name, Value{ .builtin = struct {
+                            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+                                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                                if (args.len != 1) return error.WrongArity;
+                                const message = switch (args[0]) {
+                                    .string => |s| s,
+                                    else => return error.TypeMismatch,
+                                };
+                                // 从闭包上下文获取类型名和默认前缀
+                                const data: *ErrorNewtypeCtx = @ptrCast(@alignCast(ctx));
+                                // 组合默认前缀和消息：prefix + ": " + message
+                                var full_msg = std.ArrayList(u8).empty;
+                                defer full_msg.deinit(ev.allocator);
+                                try full_msg.appendSlice(ev.allocator, data.default_prefix);
+                                try full_msg.appendSlice(ev.allocator, ": ");
+                                try full_msg.appendSlice(ev.allocator, message);
+                                return Value{ .error_val = value.ErrorValue{
+                                    .type_name = try ev.allocator.dupe(u8, data.type_name),
+                                    .message = try full_msg.toOwnedSlice(ev.allocator),
+                                } };
+                            }
+                        }.call }, true);
+                    },
+                    .newtype => |nt| {
+                        // 注册 newtype 构造器
+                        // type UserId = UserId(i32)
+                        // UserId(42) 创建一个包装值
+                        _ = nt;
+                        try environment.define(td.name, Value{ .builtin = struct {
+                            fn call(ctx: *anyopaque, args: []const Value) anyerror!Value {
+                                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                                if (args.len != 1) return error.WrongArity;
+                                // Phase 1: newtype 值直接返回内部值（零开销）
+                                // 后续 Phase 2 类型检查器会区分类型
+                                return args[0].clone(ev.allocator) catch |err| return err;
+                            }
+                        }.call }, true);
+                    },
+                    .alias => {
+                        // Type Alias — Phase 1 无类型检查器，空操作即可
+                        // 类型别名在运行时无影响
+                    },
+                    .adt, .record => {
+                        // Phase 1: ADT 和记录类型暂不处理
+                    },
+                }
             },
             .trait_decl => {
                 // Phase 1: 简单处理
@@ -309,9 +443,19 @@ pub const Evaluator = struct {
                 if (ed.stmt) |s| {
                     var defer_stack = std.ArrayList(*const ast.Expr).empty;
                     defer defer_stack.deinit(self.allocator);
-                    _ = try self.evalStmt(s, environment, &defer_stack);
+                    _ = self.evalStmt(s, environment, &defer_stack) catch |err| switch (err) {
+                        // 顶层 ? 传播：null 或 throw 导致提前退出当前语句，
+                        // 但不应中断整个模块求值
+                        error.ReturnValue, error.ThrowValue => {},
+                        error.GluePanic => return error.GluePanic,
+                        else => return err,
+                    };
                 } else {
-                    _ = try self.evalExpr(ed.expr, environment);
+                    _ = self.evalExpr(ed.expr, environment) catch |err| switch (err) {
+                        error.ReturnValue, error.ThrowValue => {},
+                        error.GluePanic => return error.GluePanic,
+                        else => return err,
+                    };
                 }
             },
         }
@@ -363,7 +507,7 @@ pub const Evaluator = struct {
 
         // 解析整数值
         const int_val = parseInt(i128, raw) catch
-            return error.IntegerOverflow;
+            return self.gluePanic("integer overflow in literal");
 
         // 如果有类型后缀，检查范围
         if (suffix) |s| {
@@ -482,7 +626,7 @@ pub const Evaluator = struct {
     fn evalAdd(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         if (left == .integer and right == .integer) {
             const result = @addWithOverflow(left.integer, right.integer);
-            if (result[1] != 0) return error.IntegerOverflow;
+            if (result[1] != 0) return self.gluePanic("integer overflow");
             return Value{ .integer = result[0] };
         }
         if (left == .float and right == .float) {
@@ -504,10 +648,9 @@ pub const Evaluator = struct {
     }
 
     fn evalSub(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
-        _ = self;
         if (left == .integer and right == .integer) {
             const result = @subWithOverflow(left.integer, right.integer);
-            if (result[1] != 0) return error.IntegerOverflow;
+            if (result[1] != 0) return self.gluePanic("integer overflow");
             return Value{ .integer = result[0] };
         }
         if (left == .float and right == .float) {
@@ -523,10 +666,9 @@ pub const Evaluator = struct {
     }
 
     fn evalMul(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
-        _ = self;
         if (left == .integer and right == .integer) {
             const result = @mulWithOverflow(left.integer, right.integer);
-            if (result[1] != 0) return error.IntegerOverflow;
+            if (result[1] != 0) return self.gluePanic("integer overflow");
             return Value{ .integer = result[0] };
         }
         if (left == .float and right == .float) {
@@ -542,37 +684,36 @@ pub const Evaluator = struct {
     }
 
     fn evalDiv(self: *Evaluator, left: Value, right: Value, location: ast.SourceLocation) EvalResult!Value {
-        _ = self;
         _ = location;
         if (left == .integer and right == .integer) {
-            if (right.integer == 0) return error.DivisionByZero;
+            if (right.integer == 0) return self.gluePanic("division by zero");
             // 检查 i128 最小值 / -1 溢出
             if (left.integer == std.math.minInt(i128) and right.integer == -1) {
-                return error.IntegerOverflow;
+                return self.gluePanic("integer overflow");
             }
             return Value{ .integer = @divTrunc(left.integer, right.integer) };
         }
         if (left == .float and right == .float) {
-            if (right.float == 0.0) return error.DivisionByZero;
+            if (right.float == 0.0) return self.gluePanic("division by zero");
             const result = left.float / right.float;
             if (std.math.isNan(result) or std.math.isInf(result)) {
-                return error.DivisionByZero;
+                return self.gluePanic("division by zero");
             }
             return Value{ .float = result };
         }
         if (left == .integer and right == .float) {
-            if (right.float == 0.0) return error.DivisionByZero;
+            if (right.float == 0.0) return self.gluePanic("division by zero");
             const result = @as(f64, @floatFromInt(left.integer)) / right.float;
             if (std.math.isNan(result) or std.math.isInf(result)) {
-                return error.DivisionByZero;
+                return self.gluePanic("division by zero");
             }
             return Value{ .float = result };
         }
         if (left == .float and right == .integer) {
-            if (right.integer == 0) return error.DivisionByZero;
+            if (right.integer == 0) return self.gluePanic("division by zero");
             const result = left.float / @as(f64, @floatFromInt(right.integer));
             if (std.math.isNan(result) or std.math.isInf(result)) {
-                return error.DivisionByZero;
+                return self.gluePanic("division by zero");
             }
             return Value{ .float = result };
         }
@@ -580,14 +721,13 @@ pub const Evaluator = struct {
     }
 
     fn evalMod(self: *Evaluator, left: Value, right: Value, location: ast.SourceLocation) EvalResult!Value {
-        _ = self;
         _ = location;
         if (left == .integer and right == .integer) {
-            if (right.integer == 0) return error.DivisionByZero;
+            if (right.integer == 0) return self.gluePanic("division by zero");
             return Value{ .integer = @mod(left.integer, right.integer) };
         }
         if (left == .float and right == .float) {
-            if (right.float == 0.0) return error.DivisionByZero;
+            if (right.float == 0.0) return self.gluePanic("division by zero");
             return Value{ .float = @mod(left.float, right.float) };
         }
         return error.TypeMismatch;
@@ -666,7 +806,7 @@ pub const Evaluator = struct {
             .neg => switch (operand) {
                 .integer => |i| {
                     const result = @subWithOverflow(@as(i128, 0), i);
-                    if (result[1] != 0) return error.IntegerOverflow;
+                    if (result[1] != 0) return self.gluePanic("integer overflow");
                     return Value{ .integer = result[0] };
                 },
                 .float => |f| Value{ .float = -f },
@@ -702,41 +842,84 @@ pub const Evaluator = struct {
         }
         defer args.deinit(self.allocator);
 
+        // TCO: 如果在尾位置且被调用者是闭包，使用尾调用优化
+        // 注意：必须复制参数，因为 args 会在 defer 时释放
+        if (self.in_tail_position and callee == .closure) {
+            const args_copy = try self.allocator.dupe(Value, args.items);
+            self.tail_call = TailCall{
+                .closure = callee.closure,
+                .args = args_copy,
+            };
+            return error.TailCall;
+        }
+
         return self.callFunction(callee, args.items, environment);
     }
 
     fn callFunction(self: *Evaluator, callee: Value, args: []const Value, environment: ?*Environment) EvalResult!Value {
         _ = environment;
+
         switch (callee) {
-            .closure => |closure| {
-                if (args.len != closure.params.len) {
+            .closure => |initial_closure| {
+                if (args.len != initial_closure.params.len) {
                     return error.WrongArity;
                 }
 
-                // 从 *anyopaque 恢复 *Environment
-                const closure_env: *Environment = @ptrCast(@alignCast(closure.env));
-                const call_env = try closure_env.createChild();
-
-                for (closure.params, 0..) |param, i| {
-                    try call_env.define(param.name, args[i], param.is_var);
+                // Trampoline 循环：尾调用不创建新栈帧，而是循环执行
+                var current_closure = initial_closure;
+                var current_args = args;
+                // 跟踪需要释放的 args 副本（由 evalCall 中 dupe 分配）
+                var args_owned: ?[]const Value = null;
+                defer {
+                    if (args_owned) |owned| self.allocator.free(owned);
                 }
 
-                // 执行闭包体
-                const result = switch (closure.body) {
-                    .block => |body| self.evalExpr(body, call_env),
-                    .expression => |expr| self.evalExpr(expr, call_env),
-                };
+                while (true) {
+                    // 从 *anyopaque 恢复 *Environment
+                    const closure_env: *Environment = @ptrCast(@alignCast(current_closure.env));
+                    const call_env = try closure_env.createChild();
 
-                return result catch |err| switch (err) {
-                    error.ReturnValue => {
-                        if (self.return_value) |val| {
-                            self.return_value = null;
-                            return val;
-                        }
-                        return Value.unit;
-                    },
-                    else => err,
-                };
+                    for (current_closure.params, 0..) |param, i| {
+                        try call_env.define(param.name, current_args[i], param.is_var);
+                    }
+
+                    // 清除尾调用标记
+                    self.tail_call = null;
+
+                    // 执行闭包体
+                    const result = switch (current_closure.body) {
+                        .block => |body| self.evalExpr(body, call_env),
+                        .expression => |expr| self.evalExpr(expr, call_env),
+                    };
+
+                    const final_result = result catch |err| switch (err) {
+                        error.ReturnValue => {
+                            if (self.return_value) |val| {
+                                self.return_value = null;
+                                return val;
+                            }
+                            return Value.unit;
+                        },
+                        error.TailCall => {
+                            // TCO: 检测到尾调用，循环执行下一次调用
+                            const tc = self.tail_call.?;
+                            self.tail_call = null;
+                            // 释放上一次的 args 副本
+                            if (args_owned) |owned| {
+                                self.allocator.free(owned);
+                                args_owned = null;
+                            }
+                            current_closure = tc.closure;
+                            current_args = tc.args;
+                            // tc.args 是 evalCall 中 dupe 分配的，需要在此释放
+                            args_owned = tc.args;
+                            continue;
+                        },
+                        else => return err,
+                    };
+
+                    return final_result;
+                }
             },
             .builtin => |fn_ptr| {
                 const result = fn_ptr(@ptrCast(self), args) catch |err| {
@@ -746,14 +929,11 @@ pub const Evaluator = struct {
                         error.TypeMismatch => return error.TypeMismatch,
                         error.UndefinedVariable => return error.UndefinedVariable,
                         error.ImmutableAssignment => return error.ImmutableAssignment,
-                        error.DivisionByZero => return error.DivisionByZero,
-                        error.IntegerOverflow => return error.IntegerOverflow,
                         error.NotCallable => return error.NotCallable,
                         error.WrongArity => return error.WrongArity,
                         error.IndexOutOfBounds => return error.IndexOutOfBounds,
-                        error.NullPointer => return error.NullPointer,
                         error.UnsupportedOperation => return error.UnsupportedOperation,
-                        error.Unreachable => return error.Unreachable,
+                        error.GluePanic => return error.GluePanic,
                         else => return error.UnsupportedOperation,
                     }
                 };
@@ -867,16 +1047,34 @@ pub const Evaluator = struct {
 
     fn evalNonNullAssert(self: *Evaluator, nna: @TypeOf(@as(ast.Expr, undefined).non_null_assert), environment: *Environment) EvalResult!Value {
         const val = try self.evalExpr(nna.expr, environment);
-        if (val.isNull()) return error.NullPointer;
+        if (val.isNull()) return self.gluePanic("non-null assertion failed: value is null");
         return val;
     }
 
     fn evalPropagate(self: *Evaluator, prop: @TypeOf(@as(ast.Expr, undefined).propagate), environment: *Environment) EvalResult!Value {
         const val = try self.evalExpr(prop.expr, environment);
         if (val.isNull()) {
-            return error.ThrowValue;
+            // ? 作用于 T? 时，null 提前返回 null（等价于 match { null => return null }）
+            // 使用 ReturnValue 携带 null 值返回
+            self.return_value = Value.null_val;
+            return error.ReturnValue;
+        }
+        if (val == .throw_val) {
+            // ? 作用于 Throw<T, E> 时：
+            // - 如果是 Ok(v)，解包返回 v
+            // - 如果是 Err(e)，提前传播 throw
+            switch (val.throw_val.*) {
+                .ok => |v| return v.*,
+                .err => {
+                    self.throw_value = val;
+                    return error.ThrowValue;
+                },
+            }
         }
         if (val == .error_val) {
+            // error_val 不应该直接被 ? 传播，应该先包装为 throw_val
+            // 但为向后兼容，也处理这种情况
+            self.throw_value = val;
             return error.ThrowValue;
         }
         return val;
@@ -944,6 +1142,7 @@ pub const Evaluator = struct {
 
     fn evalIfExpr(self: *Evaluator, ie: @TypeOf(@as(ast.Expr, undefined).if_expr), environment: *Environment) EvalResult!Value {
         const condition = try self.evalExpr(ie.condition, environment);
+        // if 表达式的分支在尾位置时保持尾位置标记
         if (condition.isTruthy()) {
             return self.evalExpr(ie.then_branch, environment);
         } else if (ie.else_branch) |else_br| {
@@ -964,8 +1163,8 @@ pub const Evaluator = struct {
         // 执行语句
         for (blk.statements) |stmt| {
             const stmt_result = self.evalStmt(stmt, block_env, &defer_stack) catch |err| switch (err) {
-                error.ReturnValue, error.ThrowValue, error.BreakSignal, error.ContinueSignal => {
-                    // 执行 defer
+                error.ReturnValue, error.ThrowValue, error.BreakSignal, error.ContinueSignal, error.GluePanic => {
+                    // 执行 defer（覆盖正常返回/throw/panic）
                     self.runDefers(defer_stack.items, block_env) catch {};
                     return err;
                 },
@@ -976,9 +1175,29 @@ pub const Evaluator = struct {
             }
         }
 
-        // 尾表达式
+        // 尾表达式 — 设置尾位置标记用于 TCO
         if (blk.trailing_expr) |expr| {
-            result = try self.evalExpr(expr, block_env);
+            const saved_tail = self.in_tail_position;
+            self.in_tail_position = true;
+            result = self.evalExpr(expr, block_env) catch |err| switch (err) {
+                error.ReturnValue, error.ThrowValue, error.BreakSignal, error.ContinueSignal, error.GluePanic => {
+                    self.in_tail_position = saved_tail;
+                    // 执行 defer（覆盖正常返回/throw/panic）
+                    self.runDefers(defer_stack.items, block_env) catch {};
+                    return err;
+                },
+                error.TailCall => {
+                    self.in_tail_position = saved_tail;
+                    // 执行 defer 后传播尾调用
+                    self.runDefers(defer_stack.items, block_env) catch {};
+                    return err;
+                },
+                else => {
+                    self.in_tail_position = saved_tail;
+                    return err;
+                },
+            };
+            self.in_tail_position = saved_tail;
         }
 
         // 执行 defer
@@ -1040,7 +1259,7 @@ pub const Evaluator = struct {
             }
         }
 
-        return error.Unreachable;
+        return self.gluePanic("match expression: no pattern matched");
     }
 
     // ============================================================
@@ -1076,31 +1295,56 @@ pub const Evaluator = struct {
     }
 
     fn castInteger(self: *Evaluator, val: i128, type_name: []const u8) EvalResult!Value {
-        _ = self;
-        if (std.mem.eql(u8, type_name, "i8")) return Value{ .integer = clampInt(val, i8) };
-        if (std.mem.eql(u8, type_name, "i16")) return Value{ .integer = clampInt(val, i16) };
-        if (std.mem.eql(u8, type_name, "i32")) return Value{ .integer = clampInt(val, i32) };
-        if (std.mem.eql(u8, type_name, "i64")) return Value{ .integer = clampInt(val, i64) };
+        if (std.mem.eql(u8, type_name, "i8")) {
+            const result = clampInt(val, i8) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
+        if (std.mem.eql(u8, type_name, "i16")) {
+            const result = clampInt(val, i16) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
+        if (std.mem.eql(u8, type_name, "i32")) {
+            const result = clampInt(val, i32) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
+        if (std.mem.eql(u8, type_name, "i64")) {
+            const result = clampInt(val, i64) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
         if (std.mem.eql(u8, type_name, "i128")) return Value{ .integer = val };
-        if (std.mem.eql(u8, type_name, "u8")) return Value{ .integer = clampUInt(val, u8) };
-        if (std.mem.eql(u8, type_name, "u16")) return Value{ .integer = clampUInt(val, u16) };
-        if (std.mem.eql(u8, type_name, "u32")) return Value{ .integer = clampUInt(val, u32) };
-        if (std.mem.eql(u8, type_name, "u64")) return Value{ .integer = clampUInt(val, u64) };
-        if (std.mem.eql(u8, type_name, "u128")) return Value{ .integer = clampUInt(val, u128) };
+        if (std.mem.eql(u8, type_name, "u8")) {
+            const result = clampUInt(val, u8) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
+        if (std.mem.eql(u8, type_name, "u16")) {
+            const result = clampUInt(val, u16) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
+        if (std.mem.eql(u8, type_name, "u32")) {
+            const result = clampUInt(val, u32) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
+        if (std.mem.eql(u8, type_name, "u64")) {
+            const result = clampUInt(val, u64) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
+        if (std.mem.eql(u8, type_name, "u128")) {
+            const result = clampUInt(val, u128) catch return self.gluePanic("integer overflow in narrowing conversion");
+            return Value{ .integer = result };
+        }
         if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = @as(f64, @floatFromInt(val)) };
         if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = @as(f64, @floatFromInt(val)) };
         return error.TypeMismatch;
     }
 
     fn castFloat(self: *Evaluator, val: f64, type_name: []const u8) EvalResult!Value {
-        _ = self;
         if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = @as(f64, @floatCast(@as(f32, @floatCast(val)))) };
         if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = val };
-        if (std.mem.eql(u8, type_name, "i8")) return floatToInt(val, i8);
-        if (std.mem.eql(u8, type_name, "i16")) return floatToInt(val, i16);
-        if (std.mem.eql(u8, type_name, "i32")) return floatToInt(val, i32);
-        if (std.mem.eql(u8, type_name, "i64")) return floatToInt(val, i64);
-        if (std.mem.eql(u8, type_name, "i128")) return floatToInt(val, i128);
+        if (std.mem.eql(u8, type_name, "i8")) return floatToInt(val, i8) catch return self.gluePanic("integer overflow in narrowing conversion");
+        if (std.mem.eql(u8, type_name, "i16")) return floatToInt(val, i16) catch return self.gluePanic("integer overflow in narrowing conversion");
+        if (std.mem.eql(u8, type_name, "i32")) return floatToInt(val, i32) catch return self.gluePanic("integer overflow in narrowing conversion");
+        if (std.mem.eql(u8, type_name, "i64")) return floatToInt(val, i64) catch return self.gluePanic("integer overflow in narrowing conversion");
+        if (std.mem.eql(u8, type_name, "i128")) return floatToInt(val, i128) catch return self.gluePanic("integer overflow in narrowing conversion");
         return error.TypeMismatch;
     }
 
@@ -1170,7 +1414,23 @@ pub const Evaluator = struct {
             },
             .throw_stmt => |thr| {
                 const val = try self.evalExpr(thr.expr, environment);
-                self.throw_value = val;
+                // throw 语句创建 Throw Err 值
+                // 如果 val 已经是 error_val，包装为 Throw Err
+                // 如果 val 是 string，创建 Error 类型
+                const err_val: value.ErrorValue = switch (val) {
+                    .error_val => |e| e,
+                    .string => |s| value.ErrorValue{
+                        .type_name = try self.allocator.dupe(u8, "Error"),
+                        .message = try self.allocator.dupe(u8, s),
+                    },
+                    else => value.ErrorValue{
+                        .type_name = try self.allocator.dupe(u8, "Error"),
+                        .message = try self.allocator.dupe(u8, "unknown error"),
+                    },
+                };
+                const tv = try self.allocator.create(value.ThrowValue);
+                tv.* = value.ThrowValue{ .err = err_val };
+                self.throw_value = Value{ .throw_val = tv };
                 return error.ThrowValue;
             },
             .break_stmt => {
@@ -1344,7 +1604,8 @@ fn structuralEquals(a: Value, b: Value) bool {
         },
         .closure => |c| c == b.closure,
         .builtin => |fn_ptr| fn_ptr == b.builtin,
-        .error_val => |e| std.mem.eql(u8, e.message, b.error_val.message),
+        .error_val => |e| std.mem.eql(u8, e.type_name, b.error_val.type_name) and std.mem.eql(u8, e.message, b.error_val.message),
+        .throw_val => |tv| tv == b.throw_val, // 引用相等
     };
 }
 
@@ -1384,14 +1645,14 @@ fn parseInt(comptime T: type, raw: []const u8) !T {
     // 去除下划线
     while (i < end) : (i += 1) {
         if (raw[i] != '_') {
-            clean.append(std.heap.page_allocator, raw[i]) catch return error.IntegerOverflow;
+            clean.append(std.heap.page_allocator, raw[i]) catch return error.Overflow;
         }
     }
 
     const str = clean.items;
     if (str.len == 0) return 0;
 
-    return std.fmt.parseInt(T, str, base) catch error.IntegerOverflow;
+    return std.fmt.parseInt(T, str, base) catch error.Overflow;
 }
 
 fn parseFloat(comptime T: type, raw: []const u8) !T {
@@ -1422,19 +1683,18 @@ fn isBuiltinType(name: []const u8) bool {
     return false;
 }
 
-fn clampInt(val: i128, comptime T: type) i128 {
+fn clampInt(val: i128, comptime T: type) !i128 {
     const min: i128 = std.math.minInt(T);
     const max: i128 = std.math.maxInt(T);
     if (val < min or val > max) {
-        // 溢出 panic
-        @panic("integer overflow in narrowing conversion");
+        return error.GluePanic;
     }
     return val;
 }
 
-fn clampUInt(val: i128, comptime T: type) i128 {
+fn clampUInt(val: i128, comptime T: type) !i128 {
     if (val < 0) {
-        @panic("integer overflow in narrowing conversion");
+        return error.GluePanic;
     }
     // 对于 u128，i128 的最大值就是上限（因为 i128 < u128::MAX）
     if (comptime std.math.maxInt(T) > std.math.maxInt(i128)) {
@@ -1443,16 +1703,16 @@ fn clampUInt(val: i128, comptime T: type) i128 {
     }
     const max: i128 = @intCast(std.math.maxInt(T));
     if (val > max) {
-        @panic("integer overflow in narrowing conversion");
+        return error.GluePanic;
     }
     return val;
 }
 
 fn floatToInt(val: f64, comptime T: type) EvalResult!Value {
-    if (std.math.isNan(val) or std.math.isInf(val)) return error.IntegerOverflow;
+    if (std.math.isNan(val) or std.math.isInf(val)) return error.GluePanic;
     const min: f64 = @floatFromInt(std.math.minInt(T));
     const max: f64 = @floatFromInt(std.math.maxInt(T));
-    if (val < min or val > max) return error.IntegerOverflow;
+    if (val < min or val > max) return error.GluePanic;
     return Value{ .integer = @as(i128, @intFromFloat(val)) };
 }
 

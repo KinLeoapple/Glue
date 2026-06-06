@@ -1,0 +1,56 @@
+// Phase 1 功能验证
+
+// 1. 基础类型
+val a = 42
+val b = 3.14
+val c = true
+println(a)
+println(b)
+println(c)
+
+// 2. Nullable
+val x: i32? = null
+val y = x ?? 99
+println(y)
+
+val z: i32? = 10
+val w = z ?? 99
+println(w)
+
+// 3. Ok/Err 和 Throw
+val result = Ok(42)
+println(result)
+
+val err = Err(Error("something failed"))
+println(err)
+
+// 4. match Ok/Err
+val r = match Ok(100) {
+    Ok(v) => v + 1
+    Err(e) => 0
+}
+println(r)
+
+// 5. 自定义错误类型
+type FileError = Error("file error")
+val fe = FileError("config.json not found")
+println(fe)
+
+// 6. 字符串插值
+val name = "Glue"
+println("Hello, {name}!")
+
+// 7. defer
+var counter = 0
+{
+    counter = 1
+    defer counter = 10
+    println(counter)
+}
+println(counter)
+
+// 8. TCO - 尾递归
+fun sum(n: i32, acc: i32): i32 {
+    if (n == 0) { acc } else { sum(n - 1, acc + n) }
+}
+println(sum(1000, 0))

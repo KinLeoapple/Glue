@@ -20,14 +20,10 @@ pub const EvalError = error{
     TypeMismatch,
     UndefinedVariable,
     ImmutableAssignment,
-    DivisionByZero,
-    IntegerOverflow,
     NotCallable,
     WrongArity,
     IndexOutOfBounds,
-    NullPointer,
     UnsupportedOperation,
-    Unreachable,
 };
 
 /// 控制流信号 — 使用 Zig error 机制实现非局部跳转
@@ -36,6 +32,10 @@ pub const ControlFlow = error{
     ThrowValue,
     BreakSignal,
     ContinueSignal,
+    /// Glue panic — 不可捕获，但允许 defer 执行
+    GluePanic,
+    /// 尾调用信号 — TCO trampoline 使用
+    TailCall,
 };
 
 /// 合并的求值错误集
@@ -72,7 +72,24 @@ pub const Range = struct {
 // ============================================================
 
 pub const ErrorValue = struct {
+    /// 错误类型名（如 "Error"、"FileError"）
+    type_name: []const u8,
     message: []const u8,
+};
+
+// ============================================================
+// Throw 值（Throw<T, E> 的运行时表示）
+// ============================================================
+
+/// Throw<T, E> 的运行时值
+/// 文档 2.4.4: Throw<T, E> 的值有两种状态：
+/// - Ok(value) — 成功，持有 T 类型的值
+/// - Err(error) — 失败，持有 E 类型的错误值
+pub const ThrowValue = union(enum) {
+    /// Ok(value) — 成功状态
+    ok: *Value,
+    /// Err(error) — 失败状态
+    err: ErrorValue,
 };
 
 // ============================================================
@@ -127,6 +144,9 @@ pub const Value = union(enum) {
     // 错误值（用于 throw 传播）
     error_val: ErrorValue,
 
+    // Throw 值（Throw<T, E> 的运行时表示）
+    throw_val: *ThrowValue,
+
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .array => |*arr| {
@@ -148,7 +168,21 @@ pub const Value = union(enum) {
                 allocator.free(s);
             },
             .error_val => |e| {
+                allocator.free(e.type_name);
                 allocator.free(e.message);
+            },
+            .throw_val => |tv| {
+                switch (tv.*) {
+                    .ok => |v| {
+                        v.deinit(allocator);
+                        allocator.destroy(v);
+                    },
+                    .err => |e| {
+                        allocator.free(e.type_name);
+                        allocator.free(e.message);
+                    },
+                }
+                allocator.destroy(tv);
             },
             else => {},
         }
@@ -184,8 +218,27 @@ pub const Value = union(enum) {
             },
             .closure => self,
             .error_val => |e| Value{ .error_val = ErrorValue{
+                .type_name = try allocator.dupe(u8, e.type_name),
                 .message = try allocator.dupe(u8, e.message),
             } },
+            .throw_val => |tv| {
+                const new_tv = try allocator.create(ThrowValue);
+                switch (tv.*) {
+                    .ok => |v| {
+                        const cloned_val = try v.clone(allocator);
+                        const cloned_ptr = try allocator.create(Value);
+                        cloned_ptr.* = cloned_val;
+                        new_tv.* = ThrowValue{ .ok = cloned_ptr };
+                    },
+                    .err => |e| {
+                        new_tv.* = ThrowValue{ .err = ErrorValue{
+                            .type_name = try allocator.dupe(u8, e.type_name),
+                            .message = try allocator.dupe(u8, e.message),
+                        } };
+                    },
+                }
+                return Value{ .throw_val = new_tv };
+            },
         };
     }
 
@@ -227,7 +280,19 @@ pub const Value = union(enum) {
             },
             .closure => try buf.appendSlice(allocator, "<closure>"),
             .builtin => try buf.appendSlice(allocator, "<builtin>"),
-            .error_val => |e| try buf.print(allocator, "Error(\"{s}\")", .{e.message}),
+            .error_val => |e| try buf.print(allocator, "{s}(\"{s}\")", .{ e.type_name, e.message }),
+            .throw_val => |tv| {
+                switch (tv.*) {
+                    .ok => |v| {
+                        try buf.appendSlice(allocator, "Ok(");
+                        try v.format(buf, allocator);
+                        try buf.appendSlice(allocator, ")");
+                    },
+                    .err => |e| {
+                        try buf.print(allocator, "Err({s}(\"{s}\"))", .{ e.type_name, e.message });
+                    },
+                }
+            },
         }
     }
 
@@ -249,7 +314,8 @@ pub const Value = union(enum) {
             .record => |r| @intFromPtr(&r) == @intFromPtr(&other.record),
             .closure => |c| c == other.closure,
             .builtin => |b| b == other.builtin,
-            .error_val => |e| std.mem.eql(u8, e.message, other.error_val.message),
+            .error_val => |e| std.mem.eql(u8, e.type_name, other.error_val.type_name) and std.mem.eql(u8, e.message, other.error_val.message),
+            .throw_val => |tv| tv == other.throw_val, // 引用相等
         };
     }
 

@@ -76,18 +76,42 @@ fn matchLiteralPattern(lit: ast.PatternLiteral, val: value.Value) PatternError!b
 
 /// 构造器模式匹配
 fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor), val: value.Value, environment: *env.Environment) PatternError!bool {
-    // Phase 1: 简单处理构造器模式
-    // 对于 Ok/Err 等构造器，检查 error_val
+    // Ok/Err 构造器模式匹配 Throw<T, E> 值
     if (std.mem.eql(u8, con.name, "Ok")) {
+        if (val == .throw_val) {
+            switch (val.throw_val.*) {
+                .ok => |v| {
+                    if (con.patterns.len == 1) {
+                        return matchPattern(con.patterns[0], v.*, environment);
+                    }
+                    return true;
+                },
+                .err => return false,
+            }
+        }
+        // 非 throw_val 的 Ok 匹配：直接匹配值本身
         if (con.patterns.len == 1) {
             return matchPattern(con.patterns[0], val, environment);
         }
+        return true;
     }
     if (std.mem.eql(u8, con.name, "Err")) {
+        if (val == .throw_val) {
+            switch (val.throw_val.*) {
+                .ok => return false,
+                .err => |e| {
+                    if (con.patterns.len == 1) {
+                        // 将错误值作为 ErrorValue 记录匹配
+                        const err_record = value.Value{ .error_val = e };
+                        return matchPattern(con.patterns[0], err_record, environment);
+                    }
+                    return true;
+                },
+            }
+        }
+        // 兼容旧的 error_val
         if (val == .error_val and con.patterns.len == 1) {
-            // 将 error_val 的消息作为字符串匹配
-            const err_str = value.Value{ .string = val.error_val.message };
-            return matchPattern(con.patterns[0], err_str, environment);
+            return matchPattern(con.patterns[0], val, environment);
         }
         return false;
     }
@@ -153,14 +177,14 @@ fn parseInt(comptime T: type, raw: []const u8) !T {
     // 去除下划线
     while (i < end) : (i += 1) {
         if (raw[i] != '_') {
-            clean.append(std.heap.page_allocator, raw[i]) catch return error.IntegerOverflow;
+            clean.append(std.heap.page_allocator, raw[i]) catch return error.Overflow;
         }
     }
 
     const str = clean.items;
     if (str.len == 0) return 0;
 
-    return std.fmt.parseInt(T, str, base) catch error.IntegerOverflow;
+    return std.fmt.parseInt(T, str, base) catch error.Overflow;
 }
 
 /// 解析浮点字面量（支持类型后缀）

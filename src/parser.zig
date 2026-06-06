@@ -411,7 +411,13 @@ pub const Parser = struct {
 
         _ = self.expect(.eq, "期望 '=' 定义类型体") catch {};
 
-        const def = try self.parseTypeDef();
+        var def = try self.parseTypeDef();
+
+        // 修正 error_newtype 的 name：文档语法 type FileError = Error("msg")
+        // 中 FileError 才是类型名，Error("msg") 只是定义体
+        if (def == .error_newtype) {
+            def.error_newtype.name = name_tok.lexeme;
+        }
 
         return ast.Decl{
             .type_decl = .{
@@ -1574,7 +1580,8 @@ pub const Parser = struct {
     fn parseStringLiteral(self: *Parser, tok: lexer.Token) ParserError!*ast.Expr {
         const raw = tok.lexeme;
         if (!containsInterpolation(raw)) {
-            const value = raw[1 .. raw.len - 1];
+            const content = raw[1 .. raw.len - 1];
+            const value = try self.unescapeString(content);
             return self.allocExpr(ast.Expr{
                 .string_literal = .{
                     .location = tokenLoc(tok),
@@ -1583,10 +1590,71 @@ pub const Parser = struct {
             });
         }
 
+        // 解析字符串插值：将 "Hello, {name}!" 解析为
+        // [literal("Hello, "), expression(name), literal("!")]
         var parts = std.ArrayList(ast.InterpolationPart).empty;
-        try parts.append(self.allocator, ast.InterpolationPart{
-            .literal = raw,
-        });
+        errdefer {
+            for (parts.items) |*p| {
+                switch (p.*) {
+                    .literal => |s| self.allocator.free(s),
+                    else => {},
+                }
+            }
+            parts.deinit(self.allocator);
+        }
+
+        // 内容区域（去掉首尾引号）
+        const content = raw[1 .. raw.len - 1];
+        var i: usize = 0;
+        var literal_start: usize = 0;
+
+        while (i < content.len) {
+            if (content[i] == '\\') {
+                // 转义序列：跳过两个字符
+                i += 2;
+                continue;
+            }
+            if (content[i] == '{') {
+                // 检查 {{ 转义
+                if (i + 1 < content.len and content[i + 1] == '{') {
+                    i += 2;
+                    continue;
+                }
+                // 保存前面的字面量文本
+                if (i > literal_start) {
+                    const text = try self.unescapeString(content[literal_start..i]);
+                    try parts.append(self.allocator, ast.InterpolationPart{ .literal = text });
+                }
+                // 找到匹配的 }
+                i += 1;
+                const expr_start = i;
+                var brace_depth: usize = 1;
+                while (i < content.len and brace_depth > 0) {
+                    if (content[i] == '{') {
+                        brace_depth += 1;
+                    } else if (content[i] == '}') {
+                        brace_depth -= 1;
+                    } else if (content[i] == '\\') {
+                        i += 1; // 跳过转义
+                    }
+                    i += 1;
+                }
+                // expr_start..i-1 是插值表达式文本
+                const expr_text = content[expr_start .. i - 1];
+                // 对插值表达式文本进行词法分析和语法分析
+                const expr = try self.parseInterpolationExpr(expr_text);
+                try parts.append(self.allocator, ast.InterpolationPart{ .expression = expr });
+                literal_start = i;
+                continue;
+            }
+            i += 1;
+        }
+
+        // 保存尾部字面量文本
+        if (literal_start < content.len) {
+            const text = try self.unescapeString(content[literal_start..]);
+            try parts.append(self.allocator, ast.InterpolationPart{ .literal = text });
+        }
 
         return self.allocExpr(ast.Expr{
             .string_interpolation = .{
@@ -1594,6 +1662,78 @@ pub const Parser = struct {
                 .parts = try parts.toOwnedSlice(self.allocator),
             },
         });
+    }
+
+    /// 对插值表达式文本进行词法分析和语法分析
+    fn parseInterpolationExpr(self: *Parser, text: []const u8) ParserError!*ast.Expr {
+        var interp_lex = lexer.Lexer.init(self.allocator, text);
+        const tokens = interp_lex.tokenize() catch return error.UnexpectedToken;
+        defer self.allocator.free(tokens);
+
+        var interp_parser = Parser.init(self.allocator, tokens);
+        // 不需要 deinit，因为分配的节点由外层 parser 管理
+        const expr = interp_parser.parseExpr() catch return error.UnexpectedToken;
+        return expr;
+    }
+
+    /// 处理字符串中的转义序列，返回新分配的字符串
+    fn unescapeString(self: *Parser, text: []const u8) ParserError![]const u8 {
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] == '\\' and i + 1 < text.len) {
+                const next = text[i + 1];
+                switch (next) {
+                    'n' => {
+                        try result.append(self.allocator, '\n');
+                        i += 2;
+                    },
+                    't' => {
+                        try result.append(self.allocator, '\t');
+                        i += 2;
+                    },
+                    'r' => {
+                        try result.append(self.allocator, '\r');
+                        i += 2;
+                    },
+                    '\\' => {
+                        try result.append(self.allocator, '\\');
+                        i += 2;
+                    },
+                    '"' => {
+                        try result.append(self.allocator, '"');
+                        i += 2;
+                    },
+                    '{' => {
+                        try result.append(self.allocator, '{');
+                        i += 2;
+                    },
+                    '}' => {
+                        try result.append(self.allocator, '}');
+                        i += 2;
+                    },
+                    else => {
+                        try result.append(self.allocator, text[i]);
+                        i += 1;
+                    },
+                }
+            } else if (text[i] == '{' and i + 1 < text.len and text[i + 1] == '{') {
+                // {{ 转义为 {
+                try result.append(self.allocator, '{');
+                i += 2;
+            } else if (text[i] == '}' and i + 1 < text.len and text[i + 1] == '}') {
+                // }} 转义为 }
+                try result.append(self.allocator, '}');
+                i += 2;
+            } else {
+                try result.append(self.allocator, text[i]);
+                i += 1;
+            }
+        }
+
+        return result.toOwnedSlice(self.allocator);
     }
 
     fn parseLambdaFun(self: *Parser) ParserError!*ast.Expr {

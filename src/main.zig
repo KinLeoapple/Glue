@@ -18,8 +18,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void {
-    const dir = std.Io.Dir.cwd();
-    const source = dir.readFileAlloc(io, filename, allocator, .unlimited) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    const source = cwd.readFileAlloc(io, filename, allocator, .unlimited) catch |err| {
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         stderr_writer.interface.print("错误：无法读取文件 '{s}': {}\n", .{ filename, err }) catch {};
@@ -116,12 +116,23 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         };
 
         // 求值表达式
-        const result = ev.evalExpr(expr, &ev.global_env) catch |err| {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("求值错误: {}\n", .{err}) catch {};
-            stderr_writer.flush() catch {};
-            return;
+        const result = ev.evalExpr(expr, &ev.global_env) catch |err| switch (err) {
+            error.GluePanic => {
+                var err_buf: [4096]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                const msg = ev.panic_message orelse "unknown panic";
+                stderr_writer.interface.print("panic: {s}\n", .{msg}) catch {};
+                stderr_writer.flush() catch {};
+                ev.panic_message = null;
+                return;
+            },
+            else => {
+                var err_buf: [4096]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                stderr_writer.interface.print("求值错误: {}\n", .{err}) catch {};
+                stderr_writer.flush() catch {};
+                return;
+            },
         };
 
         // 打印结果
@@ -139,10 +150,20 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
     };
 
     // 求值模块
-    ev.evalModule(module) catch |err| {
-        var err_buf: [4096]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-        stderr_writer.interface.print("求值错误: {}\n", .{err}) catch {};
-        stderr_writer.flush() catch {};
+    ev.evalModule(module) catch |err| switch (err) {
+        error.GluePanic => {
+            var err_buf: [4096]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+            const msg = ev.panic_message orelse "unknown panic";
+            stderr_writer.interface.print("panic: {s}\n", .{msg}) catch {};
+            stderr_writer.flush() catch {};
+            ev.panic_message = null;
+        },
+        else => {
+            var err_buf: [4096]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+            stderr_writer.interface.print("求值错误: {}\n", .{err}) catch {};
+            stderr_writer.flush() catch {};
+        },
     };
 }
