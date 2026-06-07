@@ -72,6 +72,14 @@ pub const Evaluator = struct {
     in_tail_position: bool = false,
     /// 自定义错误类型上下文列表
     error_newtype_contexts: std.ArrayList(*ErrorNewtypeCtx),
+    /// 模块级 defer 栈 — 顶层 defer 语句注册到这里，模块结束时执行
+    module_defer_stack: std.ArrayList(*const ast.Expr),
+    /// 正在加载的模块集合（用于循环依赖检测）
+    /// key: 模块名, value: void
+    loading_modules: std.StringHashMap(void),
+    /// 已加载完成的模块集合（避免重复加载）
+    /// key: 模块名, value: void
+    loaded_modules: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
@@ -79,6 +87,9 @@ pub const Evaluator = struct {
             .global_env = Environment.init(allocator),
             .closures = std.ArrayList(*value.Closure).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
+            .module_defer_stack = std.ArrayList(*const ast.Expr).empty,
+            .loading_modules = std.StringHashMap(void).init(allocator),
+            .loaded_modules = std.StringHashMap(void).init(allocator),
         };
         ev.registerBuiltins();
         return ev;
@@ -91,6 +102,9 @@ pub const Evaluator = struct {
             .io = io,
             .closures = std.ArrayList(*value.Closure).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
+            .module_defer_stack = std.ArrayList(*const ast.Expr).empty,
+            .loading_modules = std.StringHashMap(void).init(allocator),
+            .loaded_modules = std.StringHashMap(void).init(allocator),
         };
         ev.registerBuiltins();
         return ev;
@@ -110,6 +124,22 @@ pub const Evaluator = struct {
             self.allocator.destroy(ctx);
         }
         self.error_newtype_contexts.deinit(self.allocator);
+        self.module_defer_stack.deinit(self.allocator);
+        // 释放模块跟踪集合的 key
+        {
+            var iter = self.loading_modules.keyIterator();
+            while (iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+            self.loading_modules.deinit();
+        }
+        {
+            var iter = self.loaded_modules.keyIterator();
+            while (iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+            self.loaded_modules.deinit();
+        }
     }
 
     /// 触发 Glue panic — 不可捕获，但允许 defer 执行
@@ -160,28 +190,12 @@ pub const Evaluator = struct {
                 return ev.builtinEprint(args);
             }
         }.call } }, true) catch {};
-        // assert
-        self.global_env.define("assert", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        // Panic 构造器
+        self.global_env.define("Panic", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
-                return ev.builtinAssert(args);
-            }
-        }.call } }, true) catch {};
-        // precondition
-        self.global_env.define("precondition", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
-            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
-                _ = user_ctx;
-                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
-                return ev.builtinPrecondition(args);
-            }
-        }.call } }, true) catch {};
-        // fatal
-        self.global_env.define("fatal", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
-            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
-                _ = user_ctx;
-                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
-                return ev.builtinFatal(args);
+                return ev.builtinPanic(args);
             }
         }.call } }, true) catch {};
         // eq (结构相等)
@@ -288,25 +302,7 @@ pub const Evaluator = struct {
         return Value.unit;
     }
 
-    fn builtinAssert(self: *Evaluator, args: []const Value) EvalResult!Value {
-        if (args.len != 1) return error.WrongArity;
-        const cond = args[0];
-        if (cond != .boolean or !cond.boolean) {
-            return self.gluePanic("assertion failed");
-        }
-        return Value.unit;
-    }
-
-    fn builtinPrecondition(self: *Evaluator, args: []const Value) EvalResult!Value {
-        if (args.len != 1) return error.WrongArity;
-        const cond = args[0];
-        if (cond != .boolean or !cond.boolean) {
-            return self.gluePanic("precondition failed");
-        }
-        return Value.unit;
-    }
-
-    fn builtinFatal(self: *Evaluator, args: []const Value) EvalResult!Value {
+    fn builtinPanic(self: *Evaluator, args: []const Value) EvalResult!Value {
         if (args.len != 1) return error.WrongArity;
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
@@ -349,9 +345,39 @@ pub const Evaluator = struct {
     // ============================================================
 
     pub fn evalModule(self: *Evaluator, module: ast.Module) !void {
+        const module_name = module.name;
+
+        // 循环依赖检测：如果模块正在加载中，说明存在循环依赖
+        if (self.loading_modules.contains(module_name)) {
+            return error.CircularDependency;
+        }
+
+        // 如果模块已加载完成，跳过重复加载
+        if (self.loaded_modules.contains(module_name)) {
+            return;
+        }
+
+        // 标记模块为"正在加载"
+        const owned_name = try self.allocator.dupe(u8, module_name);
+        try self.loading_modules.put(owned_name, {});
+        defer {
+            // 从 loading_modules 中移除
+            if (self.loading_modules.fetchRemove(module_name)) |entry| {
+                self.allocator.free(entry.key);
+            }
+        }
+
         for (module.declarations) |decl| {
             try self.evalDecl(decl, &self.global_env);
         }
+
+        // 执行模块级 defer（LIFO 顺序）
+        self.runDefers(self.module_defer_stack.items, &self.global_env) catch {};
+        self.module_defer_stack.clearRetainingCapacity();
+
+        // 标记模块为"已加载完成"
+        const loaded_name = try self.allocator.dupe(u8, module_name);
+        try self.loaded_modules.put(loaded_name, {});
     }
 
     pub fn evalDecl(self: *Evaluator, decl: ast.Decl, environment: *Environment) !void {
@@ -438,23 +464,47 @@ pub const Evaluator = struct {
             .impl_decl => {
                 // Phase 1: 简单处理
             },
-            .use_decl => {
-                // Phase 1: 简单处理
+            .use_decl => |ud| {
+                // 模块循环依赖检测
+                // use 声明中的模块路径第一个组件是模块名
+                if (ud.module_path.len > 0) {
+                    const target_module = ud.module_path[0];
+                    // 如果目标模块正在加载中，说明存在循环依赖
+                    if (self.loading_modules.contains(target_module)) {
+                        return error.CircularDependency;
+                    }
+                }
+                // Phase 1: use 声明暂不执行实际导入
             },
             .pack_decl => {
                 // Phase 1: 简单处理
             },
             .expr_decl => |ed| {
                 if (ed.stmt) |s| {
-                    var defer_stack = std.ArrayList(*const ast.Expr).empty;
-                    defer defer_stack.deinit(self.allocator);
-                    _ = self.evalStmt(s, environment, &defer_stack) catch |err| switch (err) {
-                        // 顶层 ? 传播：null 或 throw 导致提前退出当前语句，
-                        // 但不应中断整个模块求值
-                        error.ReturnValue, error.ThrowValue => {},
-                        error.GluePanic => return error.GluePanic,
-                        else => return err,
-                    };
+                    switch (s.*) {
+                        .defer_stmt => |def| {
+                            // 顶层 defer 注册到模块级 defer 栈
+                            try self.module_defer_stack.append(self.allocator, def.expr);
+                        },
+                        else => {
+                            var defer_stack = std.ArrayList(*const ast.Expr).empty;
+                            defer defer_stack.deinit(self.allocator);
+                            _ = self.evalStmt(s, environment, &defer_stack) catch |err| switch (err) {
+                                // 顶层 ? 传播：null 或 throw 导致提前退出当前语句，
+                                // 但不应中断整个模块求值
+                                error.ReturnValue, error.ThrowValue => {
+                                    self.runDefers(defer_stack.items, environment) catch {};
+                                },
+                                error.GluePanic => {
+                                    self.runDefers(defer_stack.items, environment) catch {};
+                                    return error.GluePanic;
+                                },
+                                else => return err,
+                            };
+                            // 正常完成时也执行 defer
+                            self.runDefers(defer_stack.items, environment) catch {};
+                        },
+                    }
                 } else {
                     _ = self.evalExpr(ed.expr, environment) catch |err| switch (err) {
                         error.ReturnValue, error.ThrowValue => {},
@@ -471,6 +521,24 @@ pub const Evaluator = struct {
     // ============================================================
 
     pub fn evalExpr(self: *Evaluator, expr: *const ast.Expr, environment: *Environment) EvalResult!Value {
+        // 只有以下表达式类型可以传递尾位置：
+        // - .call: 尾位置的函数调用可以 TCO
+        // - .if_expr: 分支在尾位置时保持
+        // - .block: 尾表达式在尾位置时保持
+        // - .match: 分支在尾位置时保持
+        // 其他表达式类型（二元运算、一元运算等）的子表达式不在尾位置
+        const preserves_tail = switch (expr.*) {
+            .call, .if_expr, .block, .match => true,
+            else => false,
+        };
+        const saved_tail = self.in_tail_position;
+        if (!preserves_tail) {
+            self.in_tail_position = false;
+        }
+        defer {
+            self.in_tail_position = saved_tail;
+        }
+
         return switch (expr.*) {
             .int_literal => |lit| self.evalIntLiteral(lit),
             .float_literal => |lit| self.evalFloatLiteral(lit),
@@ -481,6 +549,7 @@ pub const Evaluator = struct {
             .null_literal => Value.null_val,
             .unit_literal => Value.unit,
             .identifier => |id| self.evalIdentifier(id, environment),
+            .assignment_expr => |ae| self.evalAssignmentExpr(ae, environment),
             .binary => |bin| self.evalBinary(bin, environment),
             .unary => |un| self.evalUnary(un, environment),
             .call => |c| self.evalCall(c, environment),
@@ -569,6 +638,17 @@ pub const Evaluator = struct {
             return v.value;
         }
         return error.UndefinedVariable;
+    }
+
+    fn evalAssignmentExpr(self: *Evaluator, ae: @TypeOf(@as(ast.Expr, undefined).assignment_expr), environment: *Environment) EvalResult!Value {
+        const val = try self.evalExpr(ae.value, environment);
+        switch (ae.target.*) {
+            .identifier => |id| {
+                try environment.set(id.name, val);
+            },
+            else => return error.TypeMismatch,
+        }
+        return val;
     }
 
     // ============================================================
@@ -838,21 +918,15 @@ pub const Evaluator = struct {
 
         // 求值参数
         var args = std.ArrayList(Value).empty;
-        var args_transferred = false; // TCO 路径中标记所有权已转移
         for (call.arguments) |arg_expr| {
             try args.append(self.allocator, try self.evalExpr(arg_expr, environment));
         }
-        defer {
-            if (!args_transferred) {
-                for (args.items) |*a| a.deinit(self.allocator);
-                args.deinit(self.allocator);
-            }
-        }
+        // 注意：不 deinit 参数值，因为它们可能与环境中的变量共享内存（如数组切片）
+        defer args.deinit(self.allocator);
 
         // TCO: 如果在尾位置且被调用者是闭包，使用尾调用优化
         if (self.in_tail_position and callee == .closure) {
             const owned_args = try self.allocator.dupe(Value, args.items);
-            args_transferred = true; // 标记所有权已转移，errdefer/defer 不再释放
             self.tail_call = TailCall{
                 .closure = callee.closure,
                 .args = owned_args,
@@ -964,13 +1038,10 @@ pub const Evaluator = struct {
 
         // 求值参数
         var args = std.ArrayList(Value).empty;
-        errdefer {
-            for (args.items) |*a| a.deinit(self.allocator);
-            args.deinit(self.allocator);
-        }
         for (mc.arguments) |arg_expr| {
             try args.append(self.allocator, try self.evalExpr(arg_expr, environment));
         }
+        // 注意：不 deinit 参数值，因为它们可能与环境中的变量共享内存
         defer args.deinit(self.allocator);
 
         return self.callMethod(object, mc.method, args.items, environment);
@@ -981,7 +1052,7 @@ pub const Evaluator = struct {
         if (std.mem.eql(u8, method, "len")) {
             return switch (object) {
                 .string => |s| Value{ .integer = @as(i128, @intCast(s.len)) },
-                .array => |arr| Value{ .integer = @as(i128, @intCast(arr.items.len)) },
+                .array => |arr| Value{ .integer = @as(i128, @intCast(arr.len)) },
                 else => error.TypeMismatch,
             };
         }
@@ -1026,11 +1097,32 @@ pub const Evaluator = struct {
     }
 
     fn accessField(self: *Evaluator, object: Value, field: []const u8) EvalResult!Value {
-        _ = self;
         switch (object) {
             .record => |map| {
                 if (map.get(field)) |val| {
                     return val;
+                }
+                return error.UndefinedVariable;
+            },
+            .error_val => |e| {
+                // 文档 2.4.1: Error 有 message 字段
+                // val e = Error("not found")
+                // e.message    // "not found"
+                if (std.mem.eql(u8, field, "message")) {
+                    return Value{ .string = try self.allocator.dupe(u8, e.message) };
+                }
+                return error.UndefinedVariable;
+            },
+            .throw_val => |tv| {
+                // 文档 2.4.7: Error(e) => println("error: " + e.message)
+                // throw_val 的 .message 访问其内部错误消息
+                switch (tv.*) {
+                    .err => |e| {
+                        if (std.mem.eql(u8, field, "message")) {
+                            return Value{ .string = try self.allocator.dupe(u8, e.message) };
+                        }
+                    },
+                    .ok => {},
                 }
                 return error.UndefinedVariable;
             },
@@ -1049,13 +1141,10 @@ pub const Evaluator = struct {
         if (object.isNull()) return Value.null_val;
 
         var args = std.ArrayList(Value).empty;
-        errdefer {
-            for (args.items) |*a| a.deinit(self.allocator);
-            args.deinit(self.allocator);
-        }
         for (smc.arguments) |arg_expr| {
             try args.append(self.allocator, try self.evalExpr(arg_expr, environment));
         }
+        // 注意：不 deinit 参数值，因为它们可能与环境中的变量共享内存
         defer args.deinit(self.allocator);
 
         return self.callMethod(object, smc.method, args.items, environment);
@@ -1096,30 +1185,38 @@ pub const Evaluator = struct {
         switch (object) {
             .array => |arr| {
                 const i = try index_val.asInteger();
-                if (i < 0 or i >= @as(i128, @intCast(arr.items.len))) {
+                if (i < 0 or i >= @as(i128, @intCast(arr.len))) {
                     return error.IndexOutOfBounds;
                 }
-                return arr.items[@as(usize, @intCast(i))];
+                return arr[@as(usize, @intCast(i))];
             },
             .string => |s| {
                 const i = try index_val.asInteger();
-                if (i < 0 or i >= @as(i128, @intCast(s.len))) {
-                    return error.IndexOutOfBounds;
+                if (i < 0) return error.IndexOutOfBounds;
+                // 文档 §2.2: 索引为 O(n) 操作，按字符位置索引，返回 Unicode 标量值
+                const view = std.unicode.Utf8View.init(s) catch return error.IndexOutOfBounds;
+                var iter = view.iterator();
+                var char_idx: i128 = 0;
+                while (iter.nextCodepoint()) |cp| {
+                    if (char_idx == i) {
+                        return Value{ .char_val = @as(u21, @intCast(cp)) };
+                    }
+                    char_idx += 1;
                 }
-                return Value{ .char_val = @as(u21, @intCast(s[@as(usize, @intCast(i))])) };
+                return error.IndexOutOfBounds;
             },
             else => return error.TypeMismatch,
         }
     }
 
     fn evalArrayLiteral(self: *Evaluator, al: @TypeOf(@as(ast.Expr, undefined).array_literal), environment: *Environment) EvalResult!Value {
-        var arr = std.ArrayList(Value).empty;
+        var arr = try self.allocator.alloc(Value, al.elements.len);
         errdefer {
-            for (arr.items) |*a| a.deinit(self.allocator);
-            arr.deinit(self.allocator);
+            for (arr) |*a| a.deinit(self.allocator);
+            self.allocator.free(arr);
         }
-        for (al.elements) |elem| {
-            try arr.append(self.allocator, try self.evalExpr(elem, environment));
+        for (al.elements, 0..) |elem, i| {
+            arr[i] = try self.evalExpr(elem, environment);
         }
         return Value{ .array = arr };
     }
@@ -1464,7 +1561,7 @@ pub const Evaluator = struct {
 
         switch (iterable) {
             .array => |arr| {
-                for (arr.items) |item| {
+                for (arr) |item| {
                     const loop_env = try environment.createChild();
 
                     try loop_env.define(fs.name, item, false);
@@ -1585,8 +1682,8 @@ fn structuralEquals(a: Value, b: Value) bool {
         .unit => true,
         .range => |r| r.start == b.range.start and r.end == b.range.end and r.inclusive == b.range.inclusive,
         .array => |arr| {
-            if (arr.items.len != b.array.items.len) return false;
-            for (arr.items, b.array.items) |item_a, item_b| {
+            if (arr.len != b.array.len) return false;
+            for (arr, b.array) |item_a, item_b| {
                 if (!structuralEquals(item_a, item_b)) return false;
             }
             return true;
@@ -1618,7 +1715,6 @@ fn structuralEquals(a: Value, b: Value) bool {
 }
 
 fn parseInt(comptime T: type, raw: []const u8) !T {
-    // 去除下划线
     var clean = std.ArrayList(u8).empty;
     defer clean.deinit(std.heap.page_allocator);
 
@@ -1639,14 +1735,23 @@ fn parseInt(comptime T: type, raw: []const u8) !T {
         }
     }
 
-    // 去除类型后缀
+    // 去除类型后缀（如 i8, u32, i64, i128, u8, f32, f64 等）
+    // 后缀格式：字母开头，后跟数字和字母
     var end = raw.len;
-    while (end > i) {
-        const ch = raw[end - 1];
-        if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
-            end -= 1;
-        } else {
-            break;
+    if (end > 0) {
+        var j = end;
+        // 先跳过末尾的数字
+        while (j > i and raw[j - 1] >= '0' and raw[j - 1] <= '9') {
+            j -= 1;
+        }
+        // 再跳过字母部分
+        if (j > i and ((raw[j - 1] >= 'a' and raw[j - 1] <= 'z') or (raw[j - 1] >= 'A' and raw[j - 1] <= 'Z'))) {
+            j -= 1;
+            // 继续跳过更多字母（如 i128 中的 i 后面没有更多字母，但 f32 有 f）
+            while (j > i and ((raw[j - 1] >= 'a' and raw[j - 1] <= 'z') or (raw[j - 1] >= 'A' and raw[j - 1] <= 'Z'))) {
+                j -= 1;
+            }
+            end = j;
         }
     }
 
@@ -1746,7 +1851,16 @@ pub fn evalSource(allocator: std.mem.Allocator, source: []const u8) !Value {
     var evaluator = Evaluator.init(allocator);
     defer evaluator.deinit();
 
-    return try evaluator.evalExpr(expr, &evaluator.global_env);
+    // 顶层表达式求值 — 如果产生 TailCall，需要 trampoline 处理
+    const result = evaluator.evalExpr(expr, &evaluator.global_env) catch |err| switch (err) {
+        error.TailCall => {
+            const tc = evaluator.tail_call.?;
+            evaluator.tail_call = null;
+            return evaluator.callFunction(Value{ .closure = tc.closure }, tc.args, null);
+        },
+        else => return err,
+    };
+    return result;
 }
 
 // ============================================================
@@ -2023,10 +2137,10 @@ test "求值器 - 数组字面量" {
 
     const result = try evalSource(allocator, "[1, 2, 3]");
     try std.testing.expect(result == .array);
-    try std.testing.expectEqual(@as(usize, 3), result.array.items.len);
-    try std.testing.expectEqual(@as(i128, 1), result.array.items[0].integer);
-    try std.testing.expectEqual(@as(i128, 2), result.array.items[1].integer);
-    try std.testing.expectEqual(@as(i128, 3), result.array.items[2].integer);
+    try std.testing.expectEqual(@as(usize, 3), result.array.len);
+    try std.testing.expectEqual(@as(i128, 1), result.array[0].integer);
+    try std.testing.expectEqual(@as(i128, 2), result.array[1].integer);
+    try std.testing.expectEqual(@as(i128, 3), result.array[2].integer);
 }
 
 test "求值器 - 索引访问" {
@@ -2107,12 +2221,12 @@ test "求值器 - for 循环" {
     try evaluator.evalModule(module);
 
     const fn_val = evaluator.global_env.get("sum_arr").?;
-    var arr = std.ArrayList(Value).empty;
-    try arr.append(allocator, Value{ .integer = 1 });
-    try arr.append(allocator, Value{ .integer = 2 });
-    try arr.append(allocator, Value{ .integer = 3 });
-    try arr.append(allocator, Value{ .integer = 4 });
-    try arr.append(allocator, Value{ .integer = 5 });
+    var arr = try allocator.alloc(Value, 5);
+    arr[0] = Value{ .integer = 1 };
+    arr[1] = Value{ .integer = 2 };
+    arr[2] = Value{ .integer = 3 };
+    arr[3] = Value{ .integer = 4 };
+    arr[4] = Value{ .integer = 5 };
     const args = [_]Value{Value{ .array = arr }};
     const result = try evaluator.callFunction(fn_val.value, &args, null);
     try std.testing.expectEqual(@as(i128, 15), result.integer);
@@ -2173,12 +2287,12 @@ test "求值器 - for 循环 continue" {
     try evaluator.evalModule(module);
 
     const fn_val = evaluator.global_env.get("skip_three").?;
-    var arr = std.ArrayList(Value).empty;
-    try arr.append(allocator, Value{ .integer = 1 });
-    try arr.append(allocator, Value{ .integer = 2 });
-    try arr.append(allocator, Value{ .integer = 3 });
-    try arr.append(allocator, Value{ .integer = 4 });
-    try arr.append(allocator, Value{ .integer = 5 });
+    var arr = try allocator.alloc(Value, 5);
+    arr[0] = Value{ .integer = 1 };
+    arr[1] = Value{ .integer = 2 };
+    arr[2] = Value{ .integer = 3 };
+    arr[3] = Value{ .integer = 4 };
+    arr[4] = Value{ .integer = 5 };
     const args = [_]Value{Value{ .array = arr }};
     const result = try evaluator.callFunction(fn_val.value, &args, null);
     try std.testing.expectEqual(@as(i128, 12), result.integer);

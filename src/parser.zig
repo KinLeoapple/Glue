@@ -240,7 +240,7 @@ pub const Parser = struct {
                 continue;
             }
 
-            // 声明解析失败，尝试解析为顶层表达式
+            // 声明解析失败，尝试解析为顶层表达式或赋值语句
             const expr = self.parseExpr() catch |err| {
                 if (err == error.UnexpectedToken) {
                     self.synchronize();
@@ -248,13 +248,40 @@ pub const Parser = struct {
                 }
                 return err;
             };
-            // 将表达式包装为表达式声明
-            try declarations.append(self.allocator, ast.Decl{
-                .expr_decl = .{
-                    .location = getExprLocation(expr),
-                    .expr = expr,
-                },
-            });
+
+            // 检查是否是赋值语句（identifier = expr）
+            if (self.matchToken(.eq)) {
+                const value = self.parseExpr() catch |err| {
+                    if (err == error.UnexpectedToken) {
+                        self.synchronize();
+                        continue;
+                    }
+                    return err;
+                };
+                // 包装为赋值语句的表达式声明
+                const stmt = try self.allocStmt(ast.Stmt{
+                    .assignment = .{
+                        .location = getExprLocation(expr),
+                        .target = expr,
+                        .value = value,
+                    },
+                });
+                try declarations.append(self.allocator, ast.Decl{
+                    .expr_decl = .{
+                        .location = getExprLocation(expr),
+                        .expr = expr,
+                        .stmt = stmt,
+                    },
+                });
+            } else {
+                // 将表达式包装为表达式声明
+                try declarations.append(self.allocator, ast.Decl{
+                    .expr_decl = .{
+                        .location = getExprLocation(expr),
+                        .expr = expr,
+                    },
+                });
+            }
         }
 
         return ast.Module{
@@ -459,9 +486,32 @@ pub const Parser = struct {
             self.current = saved;
         }
 
+        // 检查 newtype：Name(Type) — 构造器名与类型名相同
+        // type UserId = UserId(i32)
+        if (self.check(.identifier)) {
+            const saved = self.current;
+            if (self.tryParseNewtypeDef()) |def| {
+                return def;
+            }
+            self.current = saved;
+        }
+
         // 类型别名：target_type
         const target = try self.parseType();
         return ast.TypeDef{ .alias = .{ .target = target } };
+    }
+
+    /// 尝试解析 newtype 定义：Name(Type)
+    fn tryParseNewtypeDef(self: *Parser) ?ast.TypeDef {
+        const name_tok = self.advance(); // 消费构造器名
+        if (!self.check(.l_paren)) return null;
+        _ = self.advance(); // 消费 (
+        const inner = self.parseType() catch return null;
+        _ = self.expect(.r_paren, "期望 ')'") catch return null;
+        return ast.TypeDef{ .newtype = .{
+            .name = name_tok.lexeme,
+            .inner = inner,
+        } };
     }
 
     /// 尝试解析记录类型定义
@@ -860,6 +910,7 @@ pub const Parser = struct {
 
     fn parseParam(self: *Parser) ParserError!ast.Param {
         var is_var = false;
+        // 支持 var 在参数名前面：var data: i32
         if (self.matchToken(.kw_var)) {
             is_var = true;
         } else {
@@ -870,6 +921,10 @@ pub const Parser = struct {
 
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
+            // 支持 var 在类型注解中：data: var i32
+            if (self.matchToken(.kw_var)) {
+                is_var = true;
+            }
             type_annotation = try self.parseType();
         }
 
@@ -2317,6 +2372,7 @@ pub const Parser = struct {
         return switch (self.peek().type) {
             .kw_val,
             .kw_var,
+            .kw_fun,
             .kw_return,
             .kw_defer,
             .kw_throw,
@@ -2336,6 +2392,11 @@ pub const Parser = struct {
         }
         if (self.matchToken(.kw_var)) {
             return self.parseVarDecl();
+        }
+        if (self.matchToken(.kw_fun)) {
+            // 块内 fun 声明：fun name(...) { ... } 转为 val name = fun(...) { ... }
+            // 或者 lambda 表达式：fun(x) { ... }
+            return self.parseFunStmt();
         }
         if (self.matchToken(.kw_return)) {
             return self.parseReturnStmt();
@@ -2369,6 +2430,82 @@ pub const Parser = struct {
         }
 
         return self.parseExprOrAssignmentStmt();
+    }
+
+    /// 解析块内 fun 语句
+    /// fun name(params): Type { body } → val name = fun(params) { body }
+    /// fun(params) { body } → 表达式语句（lambda）
+    fn parseFunStmt(self: *Parser) ParserError!*ast.Stmt {
+        const fun_tok = self.previous(); // fun 已被消费
+
+        // 检查是否是命名函数：fun name(...)
+        if (self.check(.identifier) and !self.checkIdentifier("in")) {
+            const name_tok = self.advance();
+
+            // 解析参数列表
+            var params = std.ArrayList(ast.Param).empty;
+            _ = self.expect(.l_paren, "期望 '('") catch {};
+            if (!self.check(.r_paren)) {
+                try self.parseParamList(&params);
+            }
+            _ = self.expect(.r_paren, "期望 ')'") catch {};
+
+            // 返回类型
+            var return_type: ?*ast.TypeNode = null;
+            if (self.matchToken(.colon)) {
+                return_type = try self.parseType();
+            }
+
+            // 函数体
+            const body_expr = try self.parseExpr();
+            const body = ast.LambdaBody{ .block = body_expr };
+
+            // 构建 lambda 表达式
+            const lambda_expr = try self.allocExpr(ast.Expr{
+                .lambda = .{
+                    .location = tokenLoc(fun_tok),
+                    .params = try params.toOwnedSlice(self.allocator),
+                    .body = body,
+                },
+            });
+
+            // 返回 val name = lambda
+            return self.allocStmt(ast.Stmt{
+                .val_decl = .{
+                    .location = tokenLoc(fun_tok),
+                    .name = name_tok.lexeme,
+                    .type_annotation = null,
+                    .value = lambda_expr,
+                },
+            });
+        }
+
+        // Lambda 表达式：fun(params) { body }
+        // fun 已被消费，需要解析参数和函数体
+        var params = std.ArrayList(ast.Param).empty;
+        _ = self.expect(.l_paren, "期望 '('") catch {};
+        if (!self.check(.r_paren)) {
+            try self.parseParamList(&params);
+        }
+        _ = self.expect(.r_paren, "期望 ')'") catch {};
+
+        const body_expr = try self.parseExpr();
+        const body = ast.LambdaBody{ .block = body_expr };
+
+        const lambda_expr = try self.allocExpr(ast.Expr{
+            .lambda = .{
+                .location = tokenLoc(fun_tok),
+                .params = try params.toOwnedSlice(self.allocator),
+                .body = body,
+            },
+        });
+
+        return self.allocStmt(ast.Stmt{
+            .expression = .{
+                .location = tokenLoc(fun_tok),
+                .expr = lambda_expr,
+            },
+        });
     }
 
     fn parseValDecl(self: *Parser) ParserError!*ast.Stmt {
@@ -2434,6 +2571,28 @@ pub const Parser = struct {
     fn parseDeferStmt(self: *Parser) ParserError!*ast.Stmt {
         const defer_tok = self.previous();
         const expr = try self.parseExpr();
+
+        // 支持 defer 中包含赋值（如 defer counter = 10）
+        if (self.matchToken(.eq)) {
+            const value = try self.parseExpr();
+            // 将赋值包装为赋值表达式 — 使用 field_assignment 或 assignment
+            // 但 defer_stmt.expr 是 *Expr，不是 *Stmt
+            // 我们需要将赋值包装为一个特殊的表达式
+            // 最简单的方案：将 defer 后面的 "identifier = expr" 解析为一个赋值表达式
+            const assign_expr = try self.allocExpr(ast.Expr{
+                .assignment_expr = .{
+                    .location = getExprLocation(expr),
+                    .target = expr,
+                    .value = value,
+                },
+            });
+            return self.allocStmt(ast.Stmt{
+                .defer_stmt = .{
+                    .location = tokenLoc(defer_tok),
+                    .expr = assign_expr,
+                },
+            });
+        }
 
         return self.allocStmt(ast.Stmt{
             .defer_stmt = .{
@@ -2582,6 +2741,7 @@ fn getExprLocation(expr: *const ast.Expr) ast.SourceLocation {
         .null_literal => |l| l,
         .unit_literal => |l| l,
         .identifier => |e| e.location,
+        .assignment_expr => |e| e.location,
         .binary => |e| e.location,
         .unary => |e| e.location,
         .call => |e| e.location,

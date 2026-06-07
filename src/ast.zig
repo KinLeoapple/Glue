@@ -470,6 +470,13 @@ pub const Expr = union(enum) {
         name: []const u8,
     },
 
+    /// 赋值表达式：target = value（用于 defer 等上下文中）
+    assignment_expr: struct {
+        location: SourceLocation,
+        target: *Expr,
+        value: *Expr,
+    },
+
     /// 二元运算：left op right
     binary: struct {
         location: SourceLocation,

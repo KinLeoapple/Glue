@@ -1,4 +1,4 @@
-﻿# Glue 语言设计规范
+# Glue 语言设计规范
 
 > 版本: 0.7.1-draft
 > 最后更新: 2026-06-06
@@ -774,6 +774,24 @@ fun add(a: i32, b: i32) : i32 { a + b }
 val add5 = add(5)
 add5(3)  // => 8
 ```
+
+**禁止链式调用**：不允许 `f(a)(b)` 这种写法，必须将部分应用的结果绑定到变量后再调用：
+
+```glue
+// ❌ 禁止链式调用
+add(5)(3)           // 语法错误
+multiply(2)(3)(4)   // 语法错误
+
+// ✅ 必须绑定到变量
+val add5 = add(5)
+add5(3)             // => 8
+
+val step1 = multiply(2)
+val step2 = step1(3)
+step2(4)            // => 24
+```
+
+理由：链式调用 `f(a)(b)` 可读性差，容易与嵌套函数调用混淆。显式绑定让中间值和类型更清晰。
 
 #### 2.8.2 函数类型语法
 
@@ -1787,11 +1805,10 @@ glue/
 | 闭包捕获 | 普通闭包引用捕获，spawn 闭包深拷贝 |
 | var 与值语义 | 支持重新赋值和原地修改 |
 | main 签名 | `fun main()` 无参数 |
-| 数组 | 固定大小（参考 C），动态集合用 List |
+| 数组 | 固定大小（参考 C），动态集合后续由 std 库 List 提供 |
 | 模块依赖 | 循环依赖编译错误 |
 | Range | 非独立类型，元素类型由推断决定 |
 | 字符串插值 | `{expr}` 插值，`{{`/`}}` 转义 |
-| List | 标准库类型 |
 | 函数参数 | 默认 val，`var` 标注才可修改 |
 | 尾调用优化 | 保证 TCO |
 | 元组 | 无匿名元组，记录必须有命名字段 |
@@ -1945,13 +1962,14 @@ glue/
 | D64 | 普通闭包引用捕获 | spawn 闭包深拷贝 | 统一引用/深拷贝 |
 | D65 | Range 非独立类型 | 元素类型由推断决定 | Range<T> 独立类型 |
 | D66 | 字符串插值 | `{expr}` 插值，调用 `string()`（内建类型转换） | 无插值 |
-| D67 | List 是标准库类型 | 核心语言只提供 Array | List 内建 |
+| D67 | List 属于 std 库 | Phase 8 标准库提供，核心语言只提供 Array | List 内建 |
 | D68 | 函数参数默认 val | 安全默认 | 默认 var |
-| D69 | 尾调用优化 | 保证 TCO，含相互递归 | 不保证 TCO |
-| D70 | 无匿名元组 | 记录必须有命名字段 | 支持匿名元组 |
-| D71 | 去掉 Agent | spawn+channel 已足够，减少概念 | 保留 Agent |
-| D72 | 保留 Arc<T> | 不可变数据零拷贝无替代方案 | 去掉 Arc |
-| D73 | Throw 构造器简化为 Ok/Error | 消除 Err(Error(...)) 双重包装冗余，Error() 直接创建 ThrowValue.err | 保留 Err + Error 双层构造 |
+| D69 | 禁止链式调用 `f(a)(b)` | 可读性差，易与嵌套调用混淆，显式绑定更清晰 | 允许链式调用 |
+| D70 | 尾调用优化 | 保证 TCO，含相互递归 | 不保证 TCO |
+| D71 | 无匿名元组 | 记录必须有命名字段 | 支持匿名元组 |
+| D72 | 去掉 Agent | spawn+channel 已足够，减少概念 | 保留 Agent |
+| D73 | 保留 Arc<T> | 不可变数据零拷贝无替代方案 | 去掉 Arc |
+| D74 | Throw 构造器简化为 Ok/Error | 消除 Err(Error(...)) 双重包装冗余，Error() 直接创建 ThrowValue.err | 保留 Err + Error 双层构造 |
 
 ## 附录 B：术语表
 
@@ -1992,7 +2010,7 @@ glue/
 | 引用相等 | Reference Equality | `==` 比较内存地址（ADT）或值（基础类型） |
 | 结构相等 | Structural Equality | `eq` 方法逐字段比较值 |
 | Panic | Panic | 不可恢复的 bug，不可捕获，协程级隔离 |
-| 断言 | Assertion | assert/precondition/fatal 三级断言 |
+| 断言 | Assertion | 统一为 `Panic()` 构造器，不可恢复，不可捕获 |
 | defer | defer | 延迟执行，LIFO 顺序，覆盖正常返回/throw/panic |
 | 整数溢出 | Integer Overflow | Debug + Release 均 panic，无 wrapping |
 | Channel 关闭 | Channel Close | 仅 Sender 可关闭，关闭后缓冲数据可读 |

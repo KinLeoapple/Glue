@@ -24,6 +24,7 @@ pub const EvalError = error{
     WrongArity,
     IndexOutOfBounds,
     UnsupportedOperation,
+    CircularDependency,
 };
 
 /// 控制流信号 — 使用 Zig error 机制实现非局部跳转
@@ -138,7 +139,7 @@ pub const Value = union(enum) {
     unit,
 
     // 复合类型
-    array: std.ArrayList(Value),
+    array: []Value,
     record: std.StringHashMap(Value),
 
     // 范围
@@ -158,11 +159,11 @@ pub const Value = union(enum) {
 
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .array => |*arr| {
-                for (arr.items) |*item| {
+            .array => |arr| {
+                for (arr) |*item| {
                     item.deinit(allocator);
                 }
-                arr.deinit(allocator);
+                allocator.free(arr);
             },
             .record => |*map| {
                 var iter = map.iterator();
@@ -209,9 +210,9 @@ pub const Value = union(enum) {
             .range => self,
             .string => |s| Value{ .string = try allocator.dupe(u8, s) },
             .array => |arr| {
-                var new_arr = std.ArrayList(Value).empty;
-                for (arr.items) |item| {
-                    try new_arr.append(allocator, try item.clone(allocator));
+                var new_arr = try allocator.alloc(Value, arr.len);
+                for (arr, 0..) |item, i| {
+                    new_arr[i] = try item.clone(allocator);
                 }
                 return Value{ .array = new_arr };
             },
@@ -269,7 +270,7 @@ pub const Value = union(enum) {
             },
             .array => |arr| {
                 try buf.appendSlice(allocator, "[");
-                for (arr.items, 0..) |item, i| {
+                for (arr, 0..) |item, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
                     try item.format(buf, allocator);
                 }
@@ -319,7 +320,7 @@ pub const Value = union(enum) {
             .unit => true,
             .range => |r| r.start == other.range.start and r.end == other.range.end and r.inclusive == other.range.inclusive,
             // 引用相等
-            .array => |a| @intFromPtr(&a) == @intFromPtr(&other.array),
+            .array => |a| a.ptr == other.array.ptr,
             .record => |r| @intFromPtr(&r) == @intFromPtr(&other.record),
             .closure => |c| c == other.closure,
             .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,

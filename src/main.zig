@@ -159,6 +159,12 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             stderr_writer.flush() catch {};
             ev.panic_message = null;
         },
+        error.CircularDependency => {
+            var err_buf: [4096]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+            stderr_writer.interface.print("error: circular module dependency detected\n", .{}) catch {};
+            stderr_writer.flush() catch {};
+        },
         else => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
