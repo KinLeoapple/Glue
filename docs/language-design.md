@@ -1796,7 +1796,7 @@ glue/
 | Type Alias + Newtype | 类型别名与零开销包装 |
 | 类型转换 | 显式 `Type(value)`，widening 合法 narrowing 运行时检查 |
 | 相等性 | `==` 引用相等，`eq` 结构相等 |
-| Panic | 不可捕获，三级断言，协程隔离 |
+| Panic | 不可捕获，`Panic()` 构造器，协程隔离 |
 | defer | LIFO 顺序，覆盖正常返回/throw/panic |
 | 整数溢出 | Debug + Release 均 panic，无 wrapping |
 | 浮点数 | 无 NaN/Infinity，除零 panic |

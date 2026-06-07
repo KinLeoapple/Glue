@@ -1,10 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const lexer = @import("lexer");
 const parser = @import("parser");
 const ast = @import("ast");
 const eval = @import("eval");
 
 pub fn main(init: std.process.Init) !void {
+    // Windows 控制台默认使用 GBK 编码，需设置为 UTF-8 以正确输出非 ASCII 字符
+    if (builtin.os.tag == .windows) {
+        setWindowsConsoleUtf8();
+    }
+
     const allocator = init.gpa;
     const io = init.io;
 
@@ -173,3 +179,14 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         },
     };
 }
+
+fn setWindowsConsoleUtf8() void {
+    const windows = std.os.windows;
+    const CP_UTF8: windows.UINT = 65001;
+    _ = SetConsoleOutputCP(CP_UTF8);
+}
+
+const SetConsoleOutputCP = @extern(
+    *const fn (std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL,
+    .{ .name = "SetConsoleOutputCP" },
+);
