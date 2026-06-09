@@ -629,6 +629,7 @@ pub const Evaluator = struct {
                                     tv.* = value.ThrowValue{ .err = value.ErrorValue{
                                         .type_name = try ev.allocator.dupe(u8, data.type_name),
                                         .message = try full_msg.toOwnedSlice(ev.allocator),
+                                        .is_error_subtype = true, // 文档 2.4.3: FileError <: Error
                                     } };
                                     return Value{ .throw_val = tv };
                                 }

@@ -135,6 +135,9 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
             switch (val.throw_val.*) {
                 .ok => return false,
                 .err => |e| {
+                    // 文档 2.4.3: Error(p) 匹配所有 Error 子类型
+                    // FileError <: Error，所以 Error(e) 也能匹配 FileError
+                    if (!std.mem.eql(u8, e.type_name, "Error") and !e.is_error_subtype) return false;
                     if (con.patterns.len == 1) {
                         // 将错误值作为 ErrorValue 记录匹配
                         const err_record = value.Value{ .error_val = e };
@@ -145,8 +148,14 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
             }
         }
         // 兼容旧的 error_val
-        if (val == .error_val and con.patterns.len == 1) {
-            return matchPattern(con.patterns[0], val, environment, guard_eval);
+        if (val == .error_val) {
+            const e = val.error_val;
+            // 文档 2.4.3: Error(p) 匹配所有 Error 子类型
+            if (!std.mem.eql(u8, e.type_name, "Error") and !e.is_error_subtype) return false;
+            if (con.patterns.len == 1) {
+                return matchPattern(con.patterns[0], val, environment, guard_eval);
+            }
+            return true;
         }
         return false;
     }
@@ -162,6 +171,33 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
             }
         }
         return true;
+    }
+    // 自定义错误构造器模式匹配（文档 2.4.3: FileError <: Error）
+    // match result { FileError(e) => ... } 匹配 ThrowValue.err{ type_name = "FileError" }
+    if (val == .throw_val) {
+        switch (val.throw_val.*) {
+            .ok => return false,
+            .err => |e| {
+                if (!std.mem.eql(u8, e.type_name, con.name)) return false;
+                if (con.patterns.len == 0) return true;
+                if (con.patterns.len == 1) {
+                    // 将错误值作为 ErrorValue 记录匹配
+                    const err_record = value.Value{ .error_val = e };
+                    return matchPattern(con.patterns[0], err_record, environment, guard_eval);
+                }
+                return false;
+            },
+        }
+    }
+    // 兼容旧的 error_val 路径：自定义错误构造器匹配
+    if (val == .error_val) {
+        const e = val.error_val;
+        if (!std.mem.eql(u8, e.type_name, con.name)) return false;
+        if (con.patterns.len == 0) return true;
+        if (con.patterns.len == 1) {
+            return matchPattern(con.patterns[0], val, environment, guard_eval);
+        }
+        return false;
     }
     // Newtype 构造器模式匹配
     // type UserId = UserId(i32)

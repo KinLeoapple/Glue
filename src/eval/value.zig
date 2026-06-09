@@ -77,6 +77,9 @@ pub const ErrorValue = struct {
     /// 错误类型名（如 "Error"、"FileError"）
     type_name: []const u8,
     message: []const u8,
+    /// 是否为 Error 的子类型（文档 2.4.3: FileError <: Error）
+    /// 自定义错误类型（type X = Error("...")）自动是 Error 的子类型
+    is_error_subtype: bool = false,
 };
 
 // ============================================================
@@ -310,6 +313,7 @@ pub const Value = union(enum) {
             .error_val => |e| Value{ .error_val = ErrorValue{
                 .type_name = try allocator.dupe(u8, e.type_name),
                 .message = try allocator.dupe(u8, e.message),
+                .is_error_subtype = e.is_error_subtype,
             } },
             .throw_val => |tv| {
                 const new_tv = try allocator.create(ThrowValue);
