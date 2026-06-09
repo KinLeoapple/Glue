@@ -308,13 +308,34 @@ pub const Parser = struct {
             return self.parseTraitDecl(visibility) catch return null;
         }
         if (self.check(.kw_impl)) {
-            return self.parseImplDecl() catch return null;
+            return self.parseImplDecl(visibility) catch return null;
         }
         if (self.check(.kw_use)) {
-            return self.parseUseDecl() catch return null;
+            return self.parseUseDecl(visibility) catch return null;
         }
         if (self.check(.kw_pack)) {
             return self.parsePackDecl(visibility) catch return null;
+        }
+
+        // 支持 pub val / pub var 作为顶层声明
+        if (visibility == .public and (self.check(.kw_val) or self.check(.kw_var))) {
+            const stmt = self.parseStmt() catch return null;
+            // 将 visibility 注入到 val_decl/var_decl 中
+            switch (stmt.*) {
+                .val_decl => |*vd| vd.visibility = visibility,
+                .var_decl => |*vd| vd.visibility = visibility,
+                else => {},
+            }
+            const dummy = self.allocExpr(ast.Expr{
+                .unit_literal = stmt.getLocation(),
+            }) catch return null;
+            return ast.Decl{
+                .expr_decl = .{
+                    .location = stmt.getLocation(),
+                    .expr = dummy,
+                    .stmt = stmt,
+                },
+            };
         }
 
         // 如果消费了 pub 但后面不是声明关键字，回退
@@ -366,16 +387,36 @@ pub const Parser = struct {
             return self.parseTraitDecl(visibility);
         }
         if (self.check(.kw_impl)) {
-            return self.parseImplDecl();
+            return self.parseImplDecl(visibility);
         }
         if (self.check(.kw_use)) {
-            return self.parseUseDecl();
+            return self.parseUseDecl(visibility);
         }
         if (self.check(.kw_pack)) {
             return self.parsePackDecl(visibility);
         }
 
-        try self.reportError("期望顶层声明（fun/type/trait/impl/use/pack）");
+        // 支持 pub val / pub var 作为顶层声明
+        if (visibility == .public and (self.check(.kw_val) or self.check(.kw_var))) {
+            const stmt = try self.parseStmt();
+            switch (stmt.*) {
+                .val_decl => |*vd| vd.visibility = visibility,
+                .var_decl => |*vd| vd.visibility = visibility,
+                else => {},
+            }
+            const dummy = try self.allocExpr(ast.Expr{
+                .unit_literal = stmt.getLocation(),
+            });
+            return ast.Decl{
+                .expr_decl = .{
+                    .location = stmt.getLocation(),
+                    .expr = dummy,
+                    .stmt = stmt,
+                },
+            };
+        }
+
+        try self.reportError("期望顶层声明（fun/type/trait/impl/use/pack/val/var）");
         return error.UnexpectedToken;
     }
 
@@ -550,12 +591,53 @@ pub const Parser = struct {
             };
         }
 
-        // 无命名字段 — 解析为 newtype：Name(Type)
-        const inner = self.parseType() catch return null;
+        // 位置参数 — 解析类型列表
+        // 单个位置参数：Name(Type) → newtype
+        // 多个位置参数：Name(Type, Type, ...) → ADT 构造器
+        const first_type = self.parseType() catch return null;
+
+        if (self.check(.comma)) {
+            // 多个位置参数 — 解析为 ADT 构造器
+            // Name(Type1, Type2, ...)
+            var fields = std.ArrayList(ast.ConstructorField).empty;
+            fields.append(self.allocator, .{
+                .name = null,
+                .ty = first_type,
+            }) catch return null;
+            while (self.matchToken(.comma)) {
+                const ty = self.parseType() catch {
+                    fields.deinit(self.allocator);
+                    return null;
+                };
+                fields.append(self.allocator, .{
+                    .name = null,
+                    .ty = ty,
+                }) catch {
+                    fields.deinit(self.allocator);
+                    return null;
+                };
+            }
+            _ = self.expect(.r_paren, "期望 ')' 关闭构造器字段") catch {
+                fields.deinit(self.allocator);
+                return null;
+            };
+            const ctors = self.allocator.alloc(ast.ConstructorDef, 1) catch return null;
+            ctors[0] = .{
+                .location = tokenLoc(name_tok),
+                .name = name_tok.lexeme,
+                .fields = fields.toOwnedSlice(self.allocator) catch return null,
+                .return_type = null,
+            };
+            return ast.TypeDef{
+                .adt = .{ .constructors = ctors },
+            };
+        }
+
+        // 单个位置参数 — 解析为 newtype：Name(Type)
         _ = self.expect(.r_paren, "期望 ')'") catch return null;
         return ast.TypeDef{ .newtype = .{
             .name = name_tok.lexeme,
-            .inner = inner,
+            .inner = first_type,
         } };
     }
 
@@ -745,6 +827,11 @@ pub const Parser = struct {
 
     /// 解析方法声明
     fn parseMethodDecl(self: *Parser) ParserError!ast.MethodDecl {
+        var visibility: ast.Visibility = .private;
+        if (self.matchToken(.kw_pub)) {
+            visibility = .public;
+        }
+
         var is_override = false;
         if (self.matchToken(.kw_override)) {
             is_override = true;
@@ -784,11 +871,12 @@ pub const Parser = struct {
             .return_type = return_type,
             .body = body,
             .is_override = is_override,
+            .visibility = visibility,
         };
     }
 
     /// 解析 Impl 声明：impl TraitName<Type> { methods }
-    fn parseImplDecl(self: *Parser) ParserError!ast.Decl {
+    fn parseImplDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const impl_tok = self.advance(); // 消费 impl
         const name_tok = try self.expect(.identifier, "期望 Trait 名");
 
@@ -811,12 +899,13 @@ pub const Parser = struct {
                 .trait_name = name_tok.lexeme,
                 .type_args = try type_args.toOwnedSlice(self.allocator),
                 .methods = try methods.toOwnedSlice(self.allocator),
+                .visibility = visibility,
             },
         };
     }
 
     /// 解析 use 声明：use Module.{items}
-    fn parseUseDecl(self: *Parser) ParserError!ast.Decl {
+    fn parseUseDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const use_tok = self.advance(); // 消费 use
 
         var module_path = std.ArrayList([]const u8).empty;
@@ -849,6 +938,7 @@ pub const Parser = struct {
                 .location = tokenLoc(use_tok),
                 .module_path = try module_path.toOwnedSlice(self.allocator),
                 .items = items,
+                .visibility = visibility,
             },
         };
     }
@@ -2157,10 +2247,50 @@ pub const Parser = struct {
             self.current = saved;
         }
 
-        // 括号表达式
-        const expr = try self.parseExpr();
+        // 解析第一个表达式
+        const first_expr = try self.parseExpr();
+
+        // 如果后面跟着逗号，解析为元组（位置记录）
+        if (self.matchToken(.comma)) {
+            var fields = std.ArrayList(ast.RecordFieldExpr).empty;
+            // 位置键：0, 1, 2, ...
+            const key0 = try self.allocator.dupe(u8, "0");
+            try fields.append(self.allocator, .{
+                .name = key0,
+                .value = first_expr,
+            });
+            var idx: usize = 1;
+            if (!self.check(.r_paren)) {
+                const elem = try self.parseExpr();
+                const key = try intToKey(self.allocator, idx);
+                try fields.append(self.allocator, .{
+                    .name = key,
+                    .value = elem,
+                });
+                idx += 1;
+                while (self.matchToken(.comma)) {
+                    if (self.check(.r_paren)) break;
+                    const next_elem = try self.parseExpr();
+                    const k = try intToKey(self.allocator, idx);
+                    try fields.append(self.allocator, .{
+                        .name = k,
+                        .value = next_elem,
+                    });
+                    idx += 1;
+                }
+            }
+            _ = self.expect(.r_paren, "期望 ')'") catch {};
+            return self.allocExpr(ast.Expr{
+                .record_literal = .{
+                    .location = location,
+                    .fields = try fields.toOwnedSlice(self.allocator),
+                },
+            });
+        }
+
+        // 单个表达式 = 括号表达式
         _ = self.expect(.r_paren, "期望 ')'") catch {};
-        return expr;
+        return first_expr;
     }
 
     fn tryParseLambda(self: *Parser, saved: usize, location: ast.SourceLocation) ?*ast.Expr {
@@ -2381,22 +2511,58 @@ pub const Parser = struct {
 
         var fields = std.ArrayList(ast.PatternRecordField).empty;
         if (!self.check(.r_paren)) {
-            const name_tok = try self.expect(.identifier, "期望字段名");
-            _ = self.expect(.colon, "期望 ':'") catch {};
-            const pattern = try self.parsePattern();
+            // 尝试判断是命名字段 (name: pattern) 还是位置字段 (pattern)
+            // 命名字段：identifier 后面跟着 :
+            if (self.peek().type == .identifier) {
+                const saved = self.current;
+                const name_tok = self.advance();
+                if (self.check(.colon)) {
+                    // 命名字段模式
+                    _ = self.advance(); // 消费 :
+                    const pattern = try self.parsePattern();
+                    try fields.append(self.allocator, .{
+                        .name = name_tok.lexeme,
+                        .pattern = pattern,
+                    });
+                    while (self.matchToken(.comma)) {
+                        if (self.check(.r_paren)) break;
+                        const field_name = try self.expect(.identifier, "期望字段名");
+                        _ = self.expect(.colon, "期望 ':'") catch {};
+                        const field_pattern = try self.parsePattern();
+                        try fields.append(self.allocator, .{
+                            .name = field_name.lexeme,
+                            .pattern = field_pattern,
+                        });
+                    }
+                    _ = self.expect(.r_paren, "期望 ')'") catch {};
+                    return self.allocPattern(ast.Pattern{
+                        .record = .{
+                            .location = location,
+                            .fields = try fields.toOwnedSlice(self.allocator),
+                        },
+                    });
+                }
+                // 不是命名字段，回退
+                self.current = saved;
+            }
+
+            // 位置字段模式（元组模式）：(pattern1, pattern2, ...)
+            const first_pattern = try self.parsePattern();
+            const key0 = try self.allocator.dupe(u8, "0");
             try fields.append(self.allocator, .{
-                .name = name_tok.lexeme,
-                .pattern = pattern,
+                .name = key0,
+                .pattern = first_pattern,
             });
+            var idx: usize = 1;
             while (self.matchToken(.comma)) {
                 if (self.check(.r_paren)) break;
-                const field_name = try self.expect(.identifier, "期望字段名");
-                _ = self.expect(.colon, "期望 ':'") catch {};
-                const field_pattern = try self.parsePattern();
+                const next_pattern = try self.parsePattern();
+                const k = try intToKey(self.allocator, idx);
                 try fields.append(self.allocator, .{
-                    .name = field_name.lexeme,
-                    .pattern = field_pattern,
+                    .name = k,
+                    .pattern = next_pattern,
                 });
+                idx += 1;
             }
         }
         _ = self.expect(.r_paren, "期望 ')'") catch {};
@@ -2867,6 +3033,32 @@ fn containsInterpolation(raw: []const u8) bool {
         i += 1;
     }
     return false;
+}
+
+/// 将 usize 转换为位置键字符串（用于元组的位置索引）
+fn intToKey(allocator: std.mem.Allocator, idx: usize) ![]const u8 {
+    var buf: [16]u8 = undefined;
+    var len: usize = 0;
+    var n = idx;
+    if (n == 0) {
+        buf[0] = '0';
+        len = 1;
+    } else {
+        var tmp: [16]u8 = undefined;
+        var tmp_len: usize = 0;
+        while (n > 0) {
+            tmp[tmp_len] = @intCast('0' + (n % 10));
+            tmp_len += 1;
+            n /= 10;
+        }
+        // 反转
+        var i: usize = 0;
+        while (i < tmp_len) : (i += 1) {
+            buf[i] = tmp[tmp_len - 1 - i];
+        }
+        len = tmp_len;
+    }
+    return allocator.dupe(u8, buf[0..len]);
 }
 
 fn isDigitOrUnderscore(ch: u8) bool {

@@ -7,9 +7,7 @@
 //! - 构造器模式（Ok, Error 等 ADT 构造器）
 //! - 记录模式（(field: pattern, ...)）
 //! - 或模式（pattern1 | pattern2）
-//!
-//! 注意：守卫模式（pattern if condition）需要调用 evalExpr，
-//! 因此守卫求值由 eval.zig 中的 Evaluator 处理，此处不涉及。
+//! - 守卫模式（pattern if condition）
 
 const std = @import("std");
 const value = @import("value");
@@ -19,9 +17,23 @@ const ast = @import("ast");
 /// 模式匹配错误集
 pub const PatternError = value.EvalError || value.ControlFlow;
 
+/// 守卫条件求值函数类型
+/// ctx: 求值器上下文（*Evaluator 通过 @ptrCast 传递）
+/// condition: 守卫条件表达式
+/// environment: 当前环境（守卫条件中的变量从此环境查找）
+/// 返回 true 表示守卫条件满足
+pub const GuardEvalFn = *const fn (*anyopaque, *const ast.Expr, *env.Environment) PatternError!bool;
+
+/// 守卫求值上下文
+pub const GuardEvalCtx = struct {
+    fn_ptr: GuardEvalFn,
+    ctx: *anyopaque,
+};
+
 /// 将模式与值进行匹配，在环境中绑定变量。
 /// 返回 true 表示匹配成功。
-pub fn matchPattern(pattern: *const ast.Pattern, val: value.Value, environment: *env.Environment) PatternError!bool {
+/// guard_eval: 可选的守卫条件求值回调，为 null 时遇到守卫模式返回 error.UnsupportedOperation
+pub fn matchPattern(pattern: *const ast.Pattern, val: value.Value, environment: *env.Environment, guard_eval: ?GuardEvalCtx) PatternError!bool {
     return switch (pattern.*) {
         .wildcard => true,
         .literal => |lit| matchLiteralPattern(lit, val),
@@ -33,21 +45,34 @@ pub fn matchPattern(pattern: *const ast.Pattern, val: value.Value, environment: 
                 if (val == .adt and std.mem.eql(u8, v.name, val.adt.constructor)) {
                     return true;
                 }
+                // Newtype 构造器：无子模式的构造器名匹配
+                if (val == .newtype and std.mem.eql(u8, v.name, val.newtype.type_name)) {
+                    return true;
+                }
                 return false;
             }
             // 小写开头：变量绑定，始终匹配
             try environment.define(v.name, val, false);
             return true;
         },
-        .constructor => |con| matchConstructorPattern(con, val, environment),
-        .record => |rec| matchRecordPattern(rec, val, environment),
+        .constructor => |con| matchConstructorPattern(con, val, environment, guard_eval),
+        .record => |rec| matchRecordPattern(rec, val, environment, guard_eval),
         .or_pattern => |or_p| {
-            if (try matchPattern(or_p.left, val, environment)) return true;
-            return matchPattern(or_p.right, val, environment);
+            // 保存环境状态，左侧匹配失败时回滚已绑定的变量
+            const saved_count = environment.values.count();
+            if (try matchPattern(or_p.left, val, environment, guard_eval)) return true;
+            // 左侧失败，回滚左侧绑定的变量
+            rollbackEnvironment(environment, saved_count);
+            return matchPattern(or_p.right, val, environment, guard_eval);
         },
-        .guard => {
-            // 守卫模式需要 evalExpr 来求值条件表达式，
-            // 此处无法处理，应由 Evaluator 在 eval.zig 中处理。
+        .guard => |g| {
+            // 先匹配内部模式
+            if (!try matchPattern(g.pattern, val, environment, guard_eval)) return false;
+            // 然后求值守卫条件
+            if (guard_eval) |ge| {
+                return ge.fn_ptr(ge.ctx, g.condition, environment);
+            }
+            // 无守卫求值回调时返回 UnsupportedOperation
             return error.UnsupportedOperation;
         },
     };
@@ -85,14 +110,14 @@ fn matchLiteralPattern(lit: ast.PatternLiteral, val: value.Value) PatternError!b
 }
 
 /// 构造器模式匹配
-fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor), val: value.Value, environment: *env.Environment) PatternError!bool {
+fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor), val: value.Value, environment: *env.Environment, guard_eval: ?GuardEvalCtx) PatternError!bool {
     // Ok/Error 构造器模式匹配 Throw<T, E> 值
     if (std.mem.eql(u8, con.name, "Ok")) {
         if (val == .throw_val) {
             switch (val.throw_val.*) {
                 .ok => |v| {
                     if (con.patterns.len == 1) {
-                        return matchPattern(con.patterns[0], v.*, environment);
+                        return matchPattern(con.patterns[0], v.*, environment, guard_eval);
                     }
                     return true;
                 },
@@ -101,7 +126,7 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
         }
         // 非 throw_val 的 Ok 匹配：直接匹配值本身
         if (con.patterns.len == 1) {
-            return matchPattern(con.patterns[0], val, environment);
+            return matchPattern(con.patterns[0], val, environment, guard_eval);
         }
         return true;
     }
@@ -113,7 +138,7 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
                     if (con.patterns.len == 1) {
                         // 将错误值作为 ErrorValue 记录匹配
                         const err_record = value.Value{ .error_val = e };
-                        return matchPattern(con.patterns[0], err_record, environment);
+                        return matchPattern(con.patterns[0], err_record, environment, guard_eval);
                     }
                     return true;
                 },
@@ -121,7 +146,7 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
         }
         // 兼容旧的 error_val
         if (val == .error_val and con.patterns.len == 1) {
-            return matchPattern(con.patterns[0], val, environment);
+            return matchPattern(con.patterns[0], val, environment, guard_eval);
         }
         return false;
     }
@@ -132,22 +157,33 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
         // 按位置匹配字段
         if (con.patterns.len > val.adt.fields.len) return false;
         for (con.patterns, 0..) |pat, i| {
-            if (!try matchPattern(pat, val.adt.fields[i].value, environment)) {
+            if (!try matchPattern(pat, val.adt.fields[i].value, environment, guard_eval)) {
                 return false;
             }
         }
         return true;
     }
+    // Newtype 构造器模式匹配
+    // type UserId = UserId(i32)
+    // match uid { UserId(v) => v } — 解包内部值
+    if (val == .newtype) {
+        if (!std.mem.eql(u8, val.newtype.type_name, con.name)) return false;
+        if (con.patterns.len == 0) return true;
+        if (con.patterns.len == 1) {
+            return matchPattern(con.patterns[0], val.newtype.inner, environment, guard_eval);
+        }
+        return false;
+    }
     return false;
 }
 
 /// 记录模式匹配
-fn matchRecordPattern(rec: @TypeOf(@as(ast.Pattern, undefined).record), val: value.Value, environment: *env.Environment) PatternError!bool {
+fn matchRecordPattern(rec: @TypeOf(@as(ast.Pattern, undefined).record), val: value.Value, environment: *env.Environment, guard_eval: ?GuardEvalCtx) PatternError!bool {
     if (val != .record) return false;
 
     for (rec.fields) |field| {
         if (val.record.get(field.name)) |field_val| {
-            if (!try matchPattern(field.pattern, field_val, environment)) {
+            if (!try matchPattern(field.pattern, field_val, environment, guard_eval)) {
                 return false;
             }
         } else {
@@ -161,6 +197,25 @@ fn matchRecordPattern(rec: @TypeOf(@as(ast.Pattern, undefined).record), val: val
 // ============================================================
 // 辅助函数
 // ============================================================
+
+/// 回滚环境到指定条目数，移除之后新增的变量绑定。
+/// 用于或模式左侧匹配失败时清理已绑定的变量。
+fn rollbackEnvironment(environment: *env.Environment, saved_count: usize) void {
+    while (environment.values.count() > saved_count) {
+        var iter = environment.values.iterator();
+        // 找到最后插入的条目并移除
+        var last_key: ?[]const u8 = null;
+        while (iter.next()) |entry| {
+            last_key = entry.key_ptr.*;
+        }
+        if (last_key) |key| {
+            if (environment.values.fetchRemove(key)) |removed| {
+                environment.allocator.free(removed.key);
+                // 注意：不 deinit removed.value.value，因为值可能被其他引用共享
+            }
+        } else break;
+    }
+}
 
 /// 解析整数字面量（支持进制前缀、下划线分隔、类型后缀）
 fn parseInt(comptime T: type, raw: []const u8) !T {

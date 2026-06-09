@@ -1264,12 +1264,60 @@ pub type Pair<K, V> = Pair(K, V)    // 模块自身定义
 
 ### 4.4 可见性
 
-| 声明 | 可见范围 |
-|---|---|
-| 默认（无 `pub`） | 仅当前模块 |
-| `pub` | 所有模块 |
-| `pub pack X` | 子模块对外可见 |
-| `pack X` | 子模块仅内部可见 |
+Glue 采用**默认私有**的可见性模型（类似 Rust）：所有声明默认仅在当前模块内可见，跨模块访问必须显式标注 `pub`。
+
+#### 4.4.1 可见性规则
+
+| 声明 | 默认可见性 | 公开方式 |
+|---|---|---|
+| `fun` | 私有 | `pub fun` |
+| `val` / `var` | 私有 | `pub val` / `pub var` |
+| `type` / ADT | 私有 | `pub type` |
+| ADT 构造器 | 私有 | 抽象类型（构造器不对外暴露） |
+| `trait` | 私有 | `pub trait` |
+| trait 方法 | 私有 | `pub fun` in trait |
+| trait 关联类型 | 私有 | `pub type` in trait |
+| `impl` 方法 | 私有 | `pub fun` in impl |
+| `pack` | 私有 | `pub pack` |
+
+#### 4.4.2 模块内自由访问
+
+同一模块（文件）内的所有声明互相可见，不受 `pub` 限制：
+
+```glue
+// Utils.glue
+fun helper() : i32 { 42 }       // 私有，但同模块可调用
+pub fun api() : i32 { helper() } // 公开，跨模块可调用
+```
+
+#### 4.4.3 跨模块访问
+
+跨模块（`use` 导入）只能访问 `pub` 声明：
+
+```glue
+// Main.glue
+use Utils.{api}     // ✅ api 是 pub
+use Utils.{helper}  // ❌ 编译错误：helper 是私有的
+```
+
+#### 4.4.4 抽象类型
+
+`pub type` 公开类型名但隐藏构造器，实现抽象数据类型：
+
+```glue
+pub type Handle = Handle(i32)
+// 类型 Handle 对外可见，但构造器 Handle(i32) 是私有的
+// 外部只能通过模块提供的 pub fun 创建
+```
+
+#### 4.4.5 `use` 导入的可见性
+
+`use` 导入的符号在当前模块中默认私有（即导入后不会自动再导出）：
+
+```glue
+use Collections.{Map}   // Map 在当前模块中是私有的
+pub use Collections.{Map} // Map 在当前模块中是公开的，可被再导出
+```
 
 ### 4.5 `use` 导入
 

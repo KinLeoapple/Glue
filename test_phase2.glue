@@ -11,12 +11,12 @@ type Ordering =
     | Gt
 
 // 无参构造器直接使用
-val lt_val = Lt
-val eq_val = Eq
-val gt_val = Gt
-println(lt_val)
-println(eq_val)
-println(gt_val)
+val lt = Lt
+val eq = Eq
+val gt = Gt
+println(lt)
+println(eq)
+println(gt)
 
 // ============================================================
 // 2. ADT — 带参数构造器

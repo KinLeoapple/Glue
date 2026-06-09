@@ -140,6 +140,24 @@ pub const AdtValue = struct {
 };
 
 // ============================================================
+// Newtype 值（零开销包装类型的运行时表示）
+// ============================================================
+
+/// Newtype 值 — 单字段 ADT，创建语义不同但运行时零开销的新类型
+///
+/// 如 `type UserId = UserId(i32)` 声明后，`UserId(42)` 创建
+/// NewtypeValue{ .type_name = "UserId", .inner = Value{ .integer = 42 } }
+///
+/// 文档 2.14: Newtype — 创建新类型，运行时零开销
+/// 术语表: Newtype — 单字段 ADT，创建语义不同但运行时无开销的新类型
+pub const NewtypeValue = struct {
+    /// 类型名（如 UserId, Celsius）
+    type_name: []const u8,
+    /// 内部被包装的值
+    inner: Value,
+};
+
+// ============================================================
 // 闭包
 // ============================================================
 
@@ -170,6 +188,9 @@ pub const Value = union(enum) {
 
     // ADT 值（代数数据类型构造器实例）
     adt: *AdtValue,
+
+    // Newtype 值（零开销包装类型实例）
+    newtype: *NewtypeValue,
 
     // 范围
     range: Range,
@@ -227,6 +248,9 @@ pub const Value = union(enum) {
                 // ADT 值由 Evaluator 统一管理（通过 arena allocator），
                 // 不在此释放，避免同一 *AdtValue 被多个 Value 引用导致 double-free
             },
+            .newtype => {
+                // Newtype 值由 Evaluator 统一管理，不在此释放
+            },
             else => {},
         }
     }
@@ -274,6 +298,14 @@ pub const Value = union(enum) {
                     };
                 }
                 return Value{ .adt = new_av };
+            },
+            .newtype => |nv| {
+                const new_nv = try allocator.create(NewtypeValue);
+                new_nv.* = NewtypeValue{
+                    .type_name = try allocator.dupe(u8, nv.type_name),
+                    .inner = try nv.inner.clone(allocator),
+                };
+                return Value{ .newtype = new_nv };
             },
             .error_val => |e| Value{ .error_val = ErrorValue{
                 .type_name = try allocator.dupe(u8, e.type_name),
@@ -352,6 +384,11 @@ pub const Value = union(enum) {
                     try buf.appendSlice(allocator, ")");
                 }
             },
+            .newtype => |nv| {
+                try buf.print(allocator, "{s}(", .{nv.type_name});
+                try nv.inner.format(buf, allocator);
+                try buf.appendSlice(allocator, ")");
+            },
             .error_val => |e| try buf.print(allocator, "{s}(\"{s}\")", .{ e.type_name, e.message }),
             .throw_val => |tv| {
                 switch (tv.*) {
@@ -385,6 +422,7 @@ pub const Value = union(enum) {
             .array => |a| a.ptr == other.array.ptr,
             .record => |r| @intFromPtr(&r) == @intFromPtr(&other.record),
             .adt => |av| av == other.adt, // 引用相等
+            .newtype => |nv| nv == other.newtype, // 引用相等
             .closure => |c| c == other.closure,
             .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,
             .error_val => |e| std.mem.eql(u8, e.type_name, other.error_val.type_name) and std.mem.eql(u8, e.message, other.error_val.message),

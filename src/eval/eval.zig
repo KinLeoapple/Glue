@@ -524,14 +524,36 @@ pub const Evaluator = struct {
                 .type_decl => |t| t.visibility,
                 .trait_decl => |t| t.visibility,
                 .pack_decl => |p| p.visibility,
-                else => ast.Visibility.private,
+                .impl_decl => |i| i.visibility,
+                .use_decl => |u| u.visibility,
+                .expr_decl => |ed| blk: {
+                    if (ed.stmt) |s| {
+                        break :blk switch (s.*) {
+                            .val_decl => |vd| vd.visibility,
+                            .var_decl => |vd| vd.visibility,
+                            else => ast.Visibility.private,
+                        };
+                    }
+                    break :blk ast.Visibility.private;
+                },
             };
             const decl_name = switch (decl) {
                 .fun_decl => |f| f.name,
                 .type_decl => |t| t.name,
                 .trait_decl => |t| t.name,
                 .pack_decl => |p| p.name,
-                else => null,
+                .impl_decl => |i| i.trait_name,
+                .use_decl => null,
+                .expr_decl => |ed| blk: {
+                    if (ed.stmt) |s| {
+                        break :blk switch (s.*) {
+                            .val_decl => |vd| vd.name,
+                            .var_decl => |vd| vd.name,
+                            else => null,
+                        };
+                    }
+                    break :blk null;
+                },
             };
             if (decl_visibility == .public) {
                 if (decl_name) |name| {
@@ -572,7 +594,7 @@ pub const Evaluator = struct {
                     .allocator = self.allocator,
                 };
                 try self.closures.append(self.allocator, closure);
-                try environment.define(f.name, Value{ .closure = closure }, false);
+                try environment.defineWithVisibility(f.name, Value{ .closure = closure }, false, f.visibility == .public);
             },
             .type_decl => |td| {
                 switch (td.def) {
@@ -586,7 +608,7 @@ pub const Evaluator = struct {
                             .default_prefix = try self.allocator.dupe(u8, en.message),
                         };
                         try self.error_newtype_contexts.append(self.allocator, ctx_data);
-                        try environment.define(td.name, Value{ .builtin = value.Builtin{
+                        try environment.defineWithVisibility(td.name, Value{ .builtin = value.Builtin{
                             .fn_ptr = struct {
                                 fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                     const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -612,23 +634,41 @@ pub const Evaluator = struct {
                                 }
                             }.call,
                             .user_ctx = ctx_data,
-                        } }, true);
+                        } }, true, td.visibility == .public);
                     },
                     .newtype => |nt| {
                         // 注册 newtype 构造器
                         // type UserId = UserId(i32)
-                        // UserId(42) 创建一个包装值
-                        _ = nt;
-                        try environment.define(td.name, Value{ .builtin = value.Builtin{ .fn_ptr = struct {
-                            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
-                                _ = user_ctx;
-                                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
-                                if (args.len != 1) return error.WrongArity;
-                                // Phase 1: newtype 值直接返回内部值（零开销）
-                                // 后续 Phase 2 类型检查器会区分类型
-                                return args[0].clone(ev.allocator) catch |err| return err;
-                            }
-                        }.call } }, true);
+                        // UserId(42) 创建 NewtypeValue{ .type_name = "UserId", .inner = 42 }
+                        //
+                        // 抽象类型（文档 2.5.4）：
+                        // pub type Handle = Handle(i32) — 类型名公开，构造器私有
+                        // newtype 的构造器名与类型名相同，构造器始终私有
+                        const type_name = try self.allocator.dupe(u8, nt.name);
+                        const ctx = try self.allocator.create(ErrorNewtypeCtx);
+                        ctx.* = .{
+                            .type_name = type_name,
+                            .default_prefix = "", // newtype 不使用 default_prefix
+                        };
+                        try self.error_newtype_contexts.append(self.allocator, ctx);
+                        // newtype 构造器始终私有（即使类型是 pub）— 这是抽象类型的核心
+                        // pub type Handle = Handle(i32) → Handle 类型名公开，Handle() 构造器私有
+                        try environment.defineWithVisibility(td.name, Value{ .builtin = value.Builtin{
+                            .fn_ptr = struct {
+                                fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                                    const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
+                                    if (args.len != 1) return error.WrongArity;
+                                    const data: *ErrorNewtypeCtx = @ptrCast(@alignCast(user_ctx orelse return error.TypeMismatch));
+                                    const nv = try ev.allocator.create(value.NewtypeValue);
+                                    nv.* = value.NewtypeValue{
+                                        .type_name = data.type_name,
+                                        .inner = args[0],
+                                    };
+                                    return Value{ .newtype = nv };
+                                }
+                            }.call,
+                            .user_ctx = ctx,
+                        } }, true, false); // newtype 构造器始终私有
                     },
                     .alias => {
                         // Type Alias — Phase 1 无类型检查器，空操作即可
@@ -638,6 +678,7 @@ pub const Evaluator = struct {
                         // 注册每个 ADT 构造器为可调用值
                         // 无参构造器（如 Lt, Nil）直接注册为 AdtValue
                         // 有参构造器（如 Circle(f64)）注册为 builtin 函数
+                        const is_pub = td.visibility == .public;
                         for (adt_def.constructors) |con| {
                             if (con.fields.len == 0) {
                                 // 无参构造器：直接注册为 AdtValue
@@ -648,7 +689,7 @@ pub const Evaluator = struct {
                                     .constructor = try self.allocator.dupe(u8, con.name),
                                     .fields = empty_fields,
                                 };
-                                try environment.define(con.name, Value{ .adt = av }, true);
+                                try environment.defineWithVisibility(con.name, Value{ .adt = av }, true, is_pub);
                             } else {
                                 // 有参构造器：注册为 builtin 函数
                                 const ctx = try self.allocator.create(AdtConstructorCtx);
@@ -661,7 +702,7 @@ pub const Evaluator = struct {
                                     ctx.field_names[i] = if (field.name) |n| try self.allocator.dupe(u8, n) else null;
                                 }
                                 try self.adt_constructor_contexts.append(self.allocator, ctx);
-                                try environment.define(con.name, Value{ .builtin = value.Builtin{
+                                try environment.defineWithVisibility(con.name, Value{ .builtin = value.Builtin{
                                     .fn_ptr = struct {
                                         fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                             const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
@@ -685,7 +726,7 @@ pub const Evaluator = struct {
                                         }
                                     }.call,
                                     .user_ctx = ctx,
-                                } }, true);
+                                } }, true, is_pub);
                             }
                         }
                     },
@@ -701,7 +742,7 @@ pub const Evaluator = struct {
                             ctx.field_names[i] = try self.allocator.dupe(u8, field.name);
                         }
                         try self.record_constructor_contexts.append(self.allocator, ctx);
-                        try environment.define(td.name, Value{ .builtin = value.Builtin{
+                        try environment.defineWithVisibility(td.name, Value{ .builtin = value.Builtin{
                             .fn_ptr = struct {
                                 fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                     const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
@@ -717,7 +758,7 @@ pub const Evaluator = struct {
                                 }
                             }.call,
                             .user_ctx = ctx,
-                        } }, true);
+                        } }, true, td.visibility == .public);
                     },
                 }
             },
@@ -780,7 +821,8 @@ pub const Evaluator = struct {
                         });
 
                         // 同时将方法注册为环境中的函数（支持直接调用）
-                        try environment.define(method.name, Value{ .closure = closure }, true);
+                        // 方法可见性由 MethodDecl.visibility 决定
+                        try environment.defineWithVisibility(method.name, Value{ .closure = closure }, true, method.visibility == .public);
                     }
                 }
             },
@@ -809,32 +851,23 @@ pub const Evaluator = struct {
 
                 // 从模块导出表中导入
                 if (self.module_exports.getPtr(ud.module_path[0])) |export_info| {
+                    const is_reexport = ud.visibility == .public;
                     if (ud.items) |items| {
                         // 选择性导入：use Module.{Item1, Item2}
                         for (items) |item| {
-                            // 检查是否为 pub 声明
-                            if (!self.isPubName(export_info.pub_names, item.name)) {
-                                continue; // 跳过私有声明
-                            }
-                            // 从模块环境中查找值
+                            // 检查是否为 pub 声明（通过 Variable.is_public 字段）
                             if (export_info.env.get(item.name)) |val| {
+                                if (!val.is_public) continue; // 跳过私有声明
                                 const import_name = item.alias orelse item.name;
-                                try environment.define(import_name, val.value, false);
+                                try environment.defineWithVisibility(import_name, val.value, false, is_reexport);
                             }
                         }
                     } else {
                         // 导入整个模块的所有 pub 声明：use Module
-                        var name_start: usize = 0;
-                        for (export_info.pub_names, 0..) |ch, i| {
-                            if (ch == 0 or i == export_info.pub_names.len - 1) {
-                                const end = if (ch == 0) i else i + 1;
-                                if (end > name_start) {
-                                    const name = export_info.pub_names[name_start..end];
-                                    if (export_info.env.get(name)) |val| {
-                                        try environment.define(name, val.value, false);
-                                    }
-                                }
-                                name_start = i + 1;
+                        var iter = export_info.env.values.iterator();
+                        while (iter.next()) |entry| {
+                            if (entry.value_ptr.is_public) {
+                                try environment.defineWithVisibility(entry.key_ptr.*, entry.value_ptr.value, false, is_reexport);
                             }
                         }
                     }
@@ -1642,7 +1675,11 @@ pub const Evaluator = struct {
     }
 
     fn evalIfExpr(self: *Evaluator, ie: @TypeOf(@as(ast.Expr, undefined).if_expr), environment: *Environment) EvalResult!Value {
+        // 条件不在尾位置 — 必须先求值完毕再判断分支
+        const saved_tail = self.in_tail_position;
+        self.in_tail_position = false;
         const condition = try self.evalExpr(ie.condition, environment);
+        self.in_tail_position = saved_tail;
         // if 表达式的分支在尾位置时保持尾位置标记
         if (condition.isTruthy()) {
             return self.evalExpr(ie.then_branch, environment);
@@ -1728,37 +1765,34 @@ pub const Evaluator = struct {
     // ============================================================
 
     fn evalMatch(self: *Evaluator, m: @TypeOf(@as(ast.Expr, undefined).match), environment: *Environment) EvalResult!Value {
+        // scrutinee 不在尾位置 — 必须先求值完毕再进行匹配
+        const saved_tail = self.in_tail_position;
+        self.in_tail_position = false;
         const scrutinee = try self.evalExpr(m.scrutinee, environment);
+        self.in_tail_position = saved_tail;
+
+        // 守卫条件求值回调，将 evalExpr 传入 pattern.zig
+        const guard_eval_ctx = pattern.GuardEvalCtx{
+            .fn_ptr = struct {
+                fn eval(ctx: *anyopaque, condition: *const ast.Expr, guard_env: *Environment) pattern.PatternError!bool {
+                    const evaluator: *Evaluator = @ptrCast(@alignCast(ctx));
+                    const result = try evaluator.evalExpr(condition, guard_env);
+                    return result.isTruthy();
+                }
+            }.eval,
+            .ctx = @ptrCast(self),
+        };
 
         for (m.arms) |arm| {
             // Phase 1: 不 deinit match_env，因为闭包可能引用它
             const match_env = try environment.createChild();
 
-            // 尝试使用 pattern.zig 的 matchPattern
-            const matched = pattern.matchPattern(arm.pattern, scrutinee, match_env) catch |err| switch (err) {
-                error.UnsupportedOperation => {
-                    // 守卫模式需要 evalExpr，在此处理
-                    if (arm.pattern.* == .guard) {
-                        const guard_pattern = arm.pattern.guard;
-                        if (try pattern.matchPattern(guard_pattern.pattern, scrutinee, match_env)) {
-                            const guard_val = try self.evalExpr(guard_pattern.condition, match_env);
-                            if (guard_val.isTruthy()) {
-                                // 检查 arm 级别守卫
-                                if (arm.guard) |guard| {
-                                    const arm_guard_val = try self.evalExpr(guard, match_env);
-                                    if (!arm_guard_val.isTruthy()) continue;
-                                }
-                                return self.evalExpr(arm.body, match_env);
-                            }
-                        }
-                    }
-                    continue;
-                },
-                else => return err,
+            const matched = pattern.matchPattern(arm.pattern, scrutinee, match_env, guard_eval_ctx) catch |err| {
+                return err;
             };
 
             if (matched) {
-                // 检查守卫条件
+                // 检查 arm 级别守卫条件
                 if (arm.guard) |guard| {
                     const guard_val = try self.evalExpr(guard, match_env);
                     if (!guard_val.isTruthy()) continue;
@@ -1871,12 +1905,12 @@ pub const Evaluator = struct {
         return switch (stmt.*) {
             .val_decl => |vd| {
                 const val = try self.evalExpr(vd.value, environment);
-                try environment.define(vd.name, val, false);
+                try environment.defineWithVisibility(vd.name, val, false, vd.visibility == .public);
                 return null;
             },
             .var_decl => |vd| {
                 const val = try self.evalExpr(vd.value, environment);
-                try environment.define(vd.name, val, true);
+                try environment.defineWithVisibility(vd.name, val, true, vd.visibility == .public);
                 return null;
             },
             .assignment => |asgn| {
@@ -2245,9 +2279,15 @@ fn structuralEquals(a: Value, b: Value) bool {
             if (!std.mem.eql(u8, av.constructor, b.adt.constructor)) return false;
             if (av.fields.len != b.adt.fields.len) return false;
             for (av.fields, b.adt.fields) |a_field, b_field| {
+                if (a_field.name == null or b_field.name == null) return false;
+                if (!std.mem.eql(u8, a_field.name.?, b_field.name.?)) return false;
                 if (!structuralEquals(a_field.value, b_field.value)) return false;
             }
             return true;
+        },
+        .newtype => |nv| {
+            if (!std.mem.eql(u8, nv.type_name, b.newtype.type_name)) return false;
+            return structuralEquals(nv.inner, b.newtype.inner);
         },
     };
 }

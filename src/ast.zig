@@ -397,6 +397,8 @@ pub const MethodDecl = struct {
     body: ?*Expr,
     /// 是否为 override（用于 Trait 组合中的冲突消解）
     is_override: bool,
+    /// 可见性
+    visibility: Visibility = .private,
 };
 
 /// 关联类型声明（Trait 中使用）
@@ -671,6 +673,8 @@ pub const Stmt = union(enum) {
         name: []const u8,
         type_annotation: ?*TypeNode,
         value: *Expr,
+        /// 可见性
+        visibility: Visibility = .private,
     },
 
     /// 可变绑定：var name [: Type] = expr
@@ -679,6 +683,8 @@ pub const Stmt = union(enum) {
         name: []const u8,
         type_annotation: ?*TypeNode,
         value: *Expr,
+        /// 可见性
+        visibility: Visibility = .private,
     },
 
     /// 赋值语句：target = value
@@ -823,7 +829,7 @@ pub const Decl = union(enum) {
         methods: []MethodDecl,
     },
 
-    /// Impl 声明：impl TraitName<Type> { methods }
+    /// Impl 假明：impl TraitName<Type> { methods }
     impl_decl: struct {
         location: SourceLocation,
         /// Trait 名称
@@ -832,18 +838,23 @@ pub const Decl = union(enum) {
         type_args: []*TypeNode,
         /// 方法实现
         methods: []MethodDecl,
+        /// 可见性
+        visibility: Visibility = .private,
     },
 
     /// use 声明：use Module.{items}
     /// use Collections.{Map, insert, empty}  — 选择性导入
     /// use Collections.Map                     — 导入整个模块
     /// use Collections.{Map as CMap}           — 别名导入
+    /// pub use Collections.{Map}               — 公开再导出
     use_decl: struct {
         location: SourceLocation,
         /// 模块路径，如 ["Collections"] 或 ["Collections", "Map"]
         module_path: [][]const u8,
         /// 导入项列表（null 表示导入整个模块）
         items: ?[]UseItem,
+        /// 可见性（pub use 表示公开再导出）
+        visibility: Visibility = .private,
     },
 
     /// pack 声明：[pub] pack Name

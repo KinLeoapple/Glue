@@ -12,6 +12,9 @@ const value = @import("value");
 pub const Variable = struct {
     value: value.Value,
     is_mutable: bool,
+    /// 是否对外公开（pub 声明）
+    /// 抽象类型：pub type Handle = Handle(i32) — 类型名公开，构造器私有
+    is_public: bool = false,
 };
 
 /// 变量环境（词法作用域）
@@ -52,13 +55,19 @@ pub const Environment = struct {
     }
 
     pub fn define(self: *Environment, name: []const u8, val: value.Value, is_mutable: bool) !void {
-        const key = try self.allocator.dupe(u8, name);
-        // 如果已存在，释放旧 key 和旧值
-        if (try self.values.fetchPut(key, Variable{ .value = val, .is_mutable = is_mutable })) |old| {
+        return self.defineWithVisibility(name, val, is_mutable, false);
+    }
+
+    pub fn defineWithVisibility(self: *Environment, name: []const u8, val: value.Value, is_mutable: bool, is_public: bool) !void {
+        // 如果已存在，先移除旧条目并释放旧 key 和旧值
+        if (self.values.fetchRemove(name)) |old| {
             self.allocator.free(old.key);
             var old_val = old.value.value;
             old_val.deinit(self.allocator);
         }
+        // 插入新条目（需要分配 key 的独立副本）
+        const key = try self.allocator.dupe(u8, name);
+        try self.values.put(key, Variable{ .value = val, .is_mutable = is_mutable, .is_public = is_public });
     }
 
     pub fn get(self: *Environment, name: []const u8) ?Variable {
