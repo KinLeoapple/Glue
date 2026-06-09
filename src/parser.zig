@@ -486,11 +486,12 @@ pub const Parser = struct {
             self.current = saved;
         }
 
-        // 检查 newtype：Name(Type) — 构造器名与类型名相同
-        // type UserId = UserId(i32)
+        // 检查单构造器 ADT：Name(field: Type, ...) 或 Name(Type, ...)
+        // type Pair = Pair(first: i32, second: i32)
+        // type Handle = Handle(i32)
         if (self.check(.identifier)) {
             const saved = self.current;
-            if (self.tryParseNewtypeDef()) |def| {
+            if (self.tryParseSingleCtorAdt()) |def| {
                 return def;
             }
             self.current = saved;
@@ -501,11 +502,55 @@ pub const Parser = struct {
         return ast.TypeDef{ .alias = .{ .target = target } };
     }
 
-    /// 尝试解析 newtype 定义：Name(Type)
-    fn tryParseNewtypeDef(self: *Parser) ?ast.TypeDef {
+    /// 尝试解析单构造器 ADT：Name(field: Type, ...) 或 Name(Type)
+    /// type Pair = Pair(first: i32, second: i32)
+    /// type Handle = Handle(i32)
+    fn tryParseSingleCtorAdt(self: *Parser) ?ast.TypeDef {
         const name_tok = self.advance(); // 消费构造器名
         if (!self.check(.l_paren)) return null;
         _ = self.advance(); // 消费 (
+
+        // 检查空构造器：Name()
+        if (self.check(.r_paren)) {
+            _ = self.advance();
+            const ctors = self.allocator.alloc(ast.ConstructorDef, 1) catch return null;
+            ctors[0] = .{
+                .location = tokenLoc(name_tok),
+                .name = name_tok.lexeme,
+                .fields = &[_]ast.ConstructorField{},
+                .return_type = null,
+            };
+            return ast.TypeDef{
+                .adt = .{ .constructors = ctors },
+            };
+        }
+
+        // 检查是否有命名字段：Name(field: Type, ...)
+        // 通过看第一个标识符后是否跟着冒号来判断
+        if (self.check(.identifier) and self.current + 1 < self.tokens.len and self.tokens[self.current + 1].type == .colon) {
+            // 有命名字段 — 解析为 ADT 构造器
+            var fields = std.ArrayList(ast.ConstructorField).empty;
+            self.parseConstructorFieldList(&fields) catch {
+                fields.deinit(self.allocator);
+                return null;
+            };
+            _ = self.expect(.r_paren, "期望 ')' 关闭构造器字段") catch {
+                fields.deinit(self.allocator);
+                return null;
+            };
+            const ctors = self.allocator.alloc(ast.ConstructorDef, 1) catch return null;
+            ctors[0] = .{
+                .location = tokenLoc(name_tok),
+                .name = name_tok.lexeme,
+                .fields = fields.toOwnedSlice(self.allocator) catch return null,
+                .return_type = null,
+            };
+            return ast.TypeDef{
+                .adt = .{ .constructors = ctors },
+            };
+        }
+
+        // 无命名字段 — 解析为 newtype：Name(Type)
         const inner = self.parseType() catch return null;
         _ = self.expect(.r_paren, "期望 ')'") catch return null;
         return ast.TypeDef{ .newtype = .{

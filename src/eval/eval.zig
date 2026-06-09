@@ -22,6 +22,7 @@ const env = @import("env");
 const pattern = @import("pattern");
 const throw_mod = @import("throw_mod");
 const module_eval = @import("module_eval");
+const sema = @import("sema");
 
 // ============================================================
 // 便捷重导出
@@ -53,6 +54,42 @@ const ErrorNewtypeCtx = struct {
     default_prefix: []const u8,
 };
 
+/// ADT 构造器上下文数据
+const AdtConstructorCtx = struct {
+    type_name: []const u8,
+    constructor_name: []const u8,
+    field_names: []?[]const u8,
+};
+
+/// 记录类型构造器上下文数据
+const RecordConstructorCtx = struct {
+    field_names: [][]const u8,
+};
+
+/// Trait 声明信息
+const TraitInfo = struct {
+    name: []const u8,
+    /// 方法名列表
+    method_names: []const u8,
+    /// 默认实现的方法（方法名 -> 闭包）
+    default_methods: std.StringHashMap(*value.Closure),
+};
+
+/// Impl 方法注册项
+const ImplMethodEntry = struct {
+    trait_name: []const u8,
+    method_name: []const u8,
+    closure: *value.Closure,
+};
+
+/// 模块导出信息
+const ModuleExportInfo = struct {
+    /// 模块环境（包含所有声明）
+    env: *Environment,
+    /// pub 声明名称（以 \0 分隔的字符串）
+    pub_names: []const u8,
+};
+
 // ============================================================
 // 求值器
 // ============================================================
@@ -72,6 +109,19 @@ pub const Evaluator = struct {
     in_tail_position: bool = false,
     /// 自定义错误类型上下文列表
     error_newtype_contexts: std.ArrayList(*ErrorNewtypeCtx),
+    /// ADT 构造器上下文列表
+    adt_constructor_contexts: std.ArrayList(*AdtConstructorCtx),
+    /// 记录类型构造器上下文列表
+    record_constructor_contexts: std.ArrayList(*RecordConstructorCtx),
+    /// Trait 声明注册表（trait_name -> TraitInfo）
+    trait_registry: std.StringHashMap(TraitInfo),
+    /// 所有已注册的 impl 方法
+    impl_methods: std.ArrayList(ImplMethodEntry),
+    /// 已加载模块的导出信息
+    /// key: 模块路径, value: ModuleExportInfo
+    module_exports: std.StringHashMap(ModuleExportInfo),
+    /// 当前模块的源文件目录（用于解析相对模块路径）
+    current_source_dir: ?[]const u8,
     /// 模块级 defer 栈 — 顶层 defer 语句注册到这里，模块结束时执行
     module_defer_stack: std.ArrayList(*const ast.Expr),
     /// 正在加载的模块集合（用于循环依赖检测）
@@ -80,6 +130,8 @@ pub const Evaluator = struct {
     /// 已加载完成的模块集合（避免重复加载）
     /// key: 模块名, value: void
     loaded_modules: std.StringHashMap(void),
+    /// Hindley-Milner 类型推断器
+    type_inferencer: sema.TypeInferencer,
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
@@ -87,9 +139,16 @@ pub const Evaluator = struct {
             .global_env = Environment.init(allocator),
             .closures = std.ArrayList(*value.Closure).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
+            .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
+            .record_constructor_contexts = std.ArrayList(*RecordConstructorCtx).empty,
+            .trait_registry = std.StringHashMap(TraitInfo).init(allocator),
+            .impl_methods = std.ArrayList(ImplMethodEntry).empty,
+            .module_exports = std.StringHashMap(ModuleExportInfo).init(allocator),
+            .current_source_dir = null,
             .module_defer_stack = std.ArrayList(*const ast.Expr).empty,
             .loading_modules = std.StringHashMap(void).init(allocator),
             .loaded_modules = std.StringHashMap(void).init(allocator),
+            .type_inferencer = sema.TypeInferencer.init(allocator),
         };
         ev.registerBuiltins();
         return ev;
@@ -102,9 +161,16 @@ pub const Evaluator = struct {
             .io = io,
             .closures = std.ArrayList(*value.Closure).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
+            .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
+            .record_constructor_contexts = std.ArrayList(*RecordConstructorCtx).empty,
+            .trait_registry = std.StringHashMap(TraitInfo).init(allocator),
+            .impl_methods = std.ArrayList(ImplMethodEntry).empty,
+            .module_exports = std.StringHashMap(ModuleExportInfo).init(allocator),
+            .current_source_dir = null,
             .module_defer_stack = std.ArrayList(*const ast.Expr).empty,
             .loading_modules = std.StringHashMap(void).init(allocator),
             .loaded_modules = std.StringHashMap(void).init(allocator),
+            .type_inferencer = sema.TypeInferencer.init(allocator),
         };
         ev.registerBuiltins();
         return ev;
@@ -124,6 +190,61 @@ pub const Evaluator = struct {
             self.allocator.destroy(ctx);
         }
         self.error_newtype_contexts.deinit(self.allocator);
+        // 释放所有 ADT 构造器上下文
+        for (self.adt_constructor_contexts.items) |ctx| {
+            self.allocator.free(ctx.type_name);
+            self.allocator.free(ctx.constructor_name);
+            for (ctx.field_names) |fn_opt| {
+                if (fn_opt) |n| self.allocator.free(n);
+            }
+            self.allocator.free(ctx.field_names);
+            self.allocator.destroy(ctx);
+        }
+        self.adt_constructor_contexts.deinit(self.allocator);
+        // 释放所有记录类型构造器上下文
+        for (self.record_constructor_contexts.items) |ctx| {
+            for (ctx.field_names) |n| {
+                self.allocator.free(n);
+            }
+            self.allocator.free(ctx.field_names);
+            self.allocator.destroy(ctx);
+        }
+        self.record_constructor_contexts.deinit(self.allocator);
+        // 释放 Trait 注册表
+        {
+            var iter = self.trait_registry.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.name);
+                self.allocator.free(entry.value_ptr.method_names);
+                var dm_iter = entry.value_ptr.default_methods.iterator();
+                while (dm_iter.next()) |dm_entry| {
+                    self.allocator.free(dm_entry.key_ptr.*);
+                }
+                entry.value_ptr.default_methods.deinit();
+            }
+            self.trait_registry.deinit();
+        }
+        // 释放 impl 方法注册表
+        for (self.impl_methods.items) |entry| {
+            self.allocator.free(entry.trait_name);
+            self.allocator.free(entry.method_name);
+        }
+        self.impl_methods.deinit(self.allocator);
+        // 释放模块导出表
+        {
+            var iter = self.module_exports.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.pub_names);
+                // 注意：不释放 env，因为闭包可能引用它
+            }
+            self.module_exports.deinit();
+        }
+        // 释放 current_source_dir
+        if (self.current_source_dir) |dir| {
+            self.allocator.free(dir);
+        }
         self.module_defer_stack.deinit(self.allocator);
         // 释放模块跟踪集合的 key
         {
@@ -140,6 +261,8 @@ pub const Evaluator = struct {
             }
             self.loaded_modules.deinit();
         }
+        // 释放类型推断器
+        self.type_inferencer.deinit();
     }
 
     /// 触发 Glue panic — 不可捕获，但允许 defer 执行
@@ -357,6 +480,23 @@ pub const Evaluator = struct {
             return;
         }
 
+        // 设置当前模块的源文件目录
+        const saved_source_dir = self.current_source_dir;
+        if (module.source_path) |sp| {
+            // 提取目录部分
+            if (std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep)) |idx| {
+                self.current_source_dir = try self.allocator.dupe(u8, sp[0..idx]);
+            } else if (std.mem.lastIndexOfScalar(u8, sp, '/')) |idx| {
+                self.current_source_dir = try self.allocator.dupe(u8, sp[0..idx]);
+            }
+        }
+        defer {
+            if (saved_source_dir) |dir| {
+                self.allocator.free(dir);
+            }
+            self.current_source_dir = saved_source_dir;
+        }
+
         // 标记模块为"正在加载"
         const owned_name = try self.allocator.dupe(u8, module_name);
         try self.loading_modules.put(owned_name, {});
@@ -367,9 +507,50 @@ pub const Evaluator = struct {
             }
         }
 
+        // 先检查后求值：运行 Hindley-Milner 类型推断
+        self.type_inferencer.checkModule(&module) catch {
+            // 类型推断错误不阻止求值，仅记录
+            // 重置 panic_message 以避免干扰后续求值
+            self.panic_message = null;
+        };
+
+        // 收集 pub 声明名称
+        var pub_names = std.ArrayList(u8).empty;
+        defer pub_names.deinit(self.allocator);
+
         for (module.declarations) |decl| {
+            const decl_visibility = switch (decl) {
+                .fun_decl => |f| f.visibility,
+                .type_decl => |t| t.visibility,
+                .trait_decl => |t| t.visibility,
+                .pack_decl => |p| p.visibility,
+                else => ast.Visibility.private,
+            };
+            const decl_name = switch (decl) {
+                .fun_decl => |f| f.name,
+                .type_decl => |t| t.name,
+                .trait_decl => |t| t.name,
+                .pack_decl => |p| p.name,
+                else => null,
+            };
+            if (decl_visibility == .public) {
+                if (decl_name) |name| {
+                    if (pub_names.items.len > 0) {
+                        try pub_names.append(self.allocator, 0);
+                    }
+                    try pub_names.appendSlice(self.allocator, name);
+                }
+            }
             try self.evalDecl(decl, &self.global_env);
         }
+
+        // 存储模块导出信息
+        const export_key = try self.allocator.dupe(u8, module_name);
+        const owned_pub_names = try pub_names.toOwnedSlice(self.allocator);
+        try self.module_exports.put(export_key, ModuleExportInfo{
+            .env = &self.global_env,
+            .pub_names = owned_pub_names,
+        });
 
         // 执行模块级 defer（LIFO 顺序）
         self.runDefers(self.module_defer_stack.items, &self.global_env) catch {};
@@ -453,28 +634,211 @@ pub const Evaluator = struct {
                         // Type Alias — Phase 1 无类型检查器，空操作即可
                         // 类型别名在运行时无影响
                     },
-                    .adt, .record => {
-                        // Phase 1: ADT 和记录类型暂不处理
+                    .adt => |adt_def| {
+                        // 注册每个 ADT 构造器为可调用值
+                        // 无参构造器（如 Lt, Nil）直接注册为 AdtValue
+                        // 有参构造器（如 Circle(f64)）注册为 builtin 函数
+                        for (adt_def.constructors) |con| {
+                            if (con.fields.len == 0) {
+                                // 无参构造器：直接注册为 AdtValue
+                                const av = try self.allocator.create(value.AdtValue);
+                                const empty_fields = try self.allocator.alloc(value.AdtField, 0);
+                                av.* = value.AdtValue{
+                                    .type_name = try self.allocator.dupe(u8, td.name),
+                                    .constructor = try self.allocator.dupe(u8, con.name),
+                                    .fields = empty_fields,
+                                };
+                                try environment.define(con.name, Value{ .adt = av }, true);
+                            } else {
+                                // 有参构造器：注册为 builtin 函数
+                                const ctx = try self.allocator.create(AdtConstructorCtx);
+                                ctx.* = .{
+                                    .type_name = try self.allocator.dupe(u8, td.name),
+                                    .constructor_name = try self.allocator.dupe(u8, con.name),
+                                    .field_names = try self.allocator.alloc(?[]const u8, con.fields.len),
+                                };
+                                for (con.fields, 0..) |field, i| {
+                                    ctx.field_names[i] = if (field.name) |n| try self.allocator.dupe(u8, n) else null;
+                                }
+                                try self.adt_constructor_contexts.append(self.allocator, ctx);
+                                try environment.define(con.name, Value{ .builtin = value.Builtin{
+                                    .fn_ptr = struct {
+                                        fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                                            const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
+                                            const data: *AdtConstructorCtx = @ptrCast(@alignCast(user_ctx orelse return error.TypeMismatch));
+                                            if (args.len != data.field_names.len) return error.WrongArity;
+
+                                            const av = try ev.allocator.create(value.AdtValue);
+                                            const fields = try ev.allocator.alloc(value.AdtField, args.len);
+                                            for (args, 0..) |arg, i| {
+                                                fields[i] = value.AdtField{
+                                                    .name = if (data.field_names[i]) |n| try ev.allocator.dupe(u8, n) else null,
+                                                    .value = arg,
+                                                };
+                                            }
+                                            av.* = value.AdtValue{
+                                                .type_name = try ev.allocator.dupe(u8, data.type_name),
+                                                .constructor = try ev.allocator.dupe(u8, data.constructor_name),
+                                                .fields = fields,
+                                            };
+                                            return Value{ .adt = av };
+                                        }
+                                    }.call,
+                                    .user_ctx = ctx,
+                                } }, true);
+                            }
+                        }
+                    },
+                    .record => |rec_def| {
+                        // 注册记录类型构造器
+                        // type User = (name: String, age: i32)
+                        // User("Alice", 30) 创建记录值 {name: "Alice", age: 30}
+                        const ctx = try self.allocator.create(RecordConstructorCtx);
+                        ctx.* = .{
+                            .field_names = try self.allocator.alloc([]const u8, rec_def.fields.len),
+                        };
+                        for (rec_def.fields, 0..) |field, i| {
+                            ctx.field_names[i] = try self.allocator.dupe(u8, field.name);
+                        }
+                        try self.record_constructor_contexts.append(self.allocator, ctx);
+                        try environment.define(td.name, Value{ .builtin = value.Builtin{
+                            .fn_ptr = struct {
+                                fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                                    const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
+                                    const data: *RecordConstructorCtx = @ptrCast(@alignCast(user_ctx orelse return error.TypeMismatch));
+                                    if (args.len != data.field_names.len) return error.WrongArity;
+
+                                    var map = std.StringHashMap(Value).init(ev.allocator);
+                                    for (args, 0..) |arg, i| {
+                                        const key = try ev.allocator.dupe(u8, data.field_names[i]);
+                                        try map.put(key, arg);
+                                    }
+                                    return Value{ .record = map };
+                                }
+                            }.call,
+                            .user_ctx = ctx,
+                        } }, true);
                     },
                 }
             },
-            .trait_decl => {
-                // Phase 1: 简单处理
+            .trait_decl => |td| {
+                // 注册 Trait 声明
+                // 存储方法名列表和默认实现
+                var method_names = std.ArrayList(u8).empty;
+                defer method_names.deinit(self.allocator);
+                var default_methods = std.StringHashMap(*value.Closure).init(self.allocator);
+
+                for (td.methods) |method| {
+                    // 方法名以 \0 分隔存储
+                    if (method_names.items.len > 0) {
+                        try method_names.append(self.allocator, 0);
+                    }
+                    try method_names.appendSlice(self.allocator, method.name);
+
+                    // 如果方法有默认实现，创建闭包
+                    if (method.body) |body| {
+                        const closure = try self.allocator.create(value.Closure);
+                        closure.* = value.Closure{
+                            .params = method.params,
+                            .body = .{ .block = body },
+                            .env = @ptrCast(environment),
+                            .allocator = self.allocator,
+                        };
+                        try self.closures.append(self.allocator, closure);
+                        const method_name = try self.allocator.dupe(u8, method.name);
+                        try default_methods.put(method_name, closure);
+                    }
+                }
+
+                const owned_name = try self.allocator.dupe(u8, td.name);
+                const owned_method_names = try method_names.toOwnedSlice(self.allocator);
+                const trait_key = try self.allocator.dupe(u8, td.name);
+                try self.trait_registry.put(trait_key, TraitInfo{
+                    .name = owned_name,
+                    .method_names = owned_method_names,
+                    .default_methods = default_methods,
+                });
             },
-            .impl_decl => {
-                // Phase 1: 简单处理
+            .impl_decl => |id| {
+                // 注册 Impl 声明
+                // 为每个有方法体的方法创建闭包并注册到 impl_methods
+                for (id.methods) |method| {
+                    if (method.body) |body| {
+                        const closure = try self.allocator.create(value.Closure);
+                        closure.* = value.Closure{
+                            .params = method.params,
+                            .body = .{ .block = body },
+                            .env = @ptrCast(environment),
+                            .allocator = self.allocator,
+                        };
+                        try self.closures.append(self.allocator, closure);
+
+                        try self.impl_methods.append(self.allocator, ImplMethodEntry{
+                            .trait_name = try self.allocator.dupe(u8, id.trait_name),
+                            .method_name = try self.allocator.dupe(u8, method.name),
+                            .closure = closure,
+                        });
+
+                        // 同时将方法注册为环境中的函数（支持直接调用）
+                        try environment.define(method.name, Value{ .closure = closure }, true);
+                    }
+                }
             },
             .use_decl => |ud| {
                 // 模块循环依赖检测
-                // use 声明中的模块路径第一个组件是模块名
                 if (ud.module_path.len > 0) {
                     const target_module = ud.module_path[0];
-                    // 如果目标模块正在加载中，说明存在循环依赖
                     if (self.loading_modules.contains(target_module)) {
                         return error.CircularDependency;
                     }
                 }
-                // Phase 1: use 声明暂不执行实际导入
+
+                // 构建模块路径键
+                // (用于将来模块路径规范化，当前直接使用 module_path[0])
+
+                // 检查模块是否已加载
+                if (!self.loaded_modules.contains(ud.module_path[0])) {
+                    // 尝试从文件系统加载模块
+                    self.loadModuleFromFile(ud.module_path) catch |err| switch (err) {
+                        error.FileNotFound => {
+                            // 模块文件不存在，跳过（可能是内建模块或尚未实现）
+                        },
+                        else => return err,
+                    };
+                }
+
+                // 从模块导出表中导入
+                if (self.module_exports.getPtr(ud.module_path[0])) |export_info| {
+                    if (ud.items) |items| {
+                        // 选择性导入：use Module.{Item1, Item2}
+                        for (items) |item| {
+                            // 检查是否为 pub 声明
+                            if (!self.isPubName(export_info.pub_names, item.name)) {
+                                continue; // 跳过私有声明
+                            }
+                            // 从模块环境中查找值
+                            if (export_info.env.get(item.name)) |val| {
+                                const import_name = item.alias orelse item.name;
+                                try environment.define(import_name, val.value, false);
+                            }
+                        }
+                    } else {
+                        // 导入整个模块的所有 pub 声明：use Module
+                        var name_start: usize = 0;
+                        for (export_info.pub_names, 0..) |ch, i| {
+                            if (ch == 0 or i == export_info.pub_names.len - 1) {
+                                const end = if (ch == 0) i else i + 1;
+                                if (end > name_start) {
+                                    const name = export_info.pub_names[name_start..end];
+                                    if (export_info.env.get(name)) |val| {
+                                        try environment.define(name, val.value, false);
+                                    }
+                                }
+                                name_start = i + 1;
+                            }
+                        }
+                    }
+                }
             },
             .pack_decl => {
                 // Phase 1: 简单处理
@@ -563,8 +927,8 @@ pub const Evaluator = struct {
             .array_literal => |al| self.evalArrayLiteral(al, environment),
             .record_literal => |rl| self.evalRecordLiteral(rl, environment),
             .lambda => |lam| self.evalLambda(lam, environment),
-            .if_expr => |ie| self.evalIfExpr(ie, environment),
-            .block => |blk| self.evalBlock(blk, environment),
+            .if_expr => |ie| return self.evalIfExpr(ie, environment),
+            .block => |blk| return self.evalBlock(blk, environment),
             .match => |m| self.evalMatch(m, environment),
             .type_cast => |tc| self.evalTypeCast(tc, environment),
             .spawn => error.UnsupportedOperation,
@@ -633,11 +997,16 @@ pub const Evaluator = struct {
     }
 
     fn evalIdentifier(self: *Evaluator, id: @TypeOf(@as(ast.Expr, undefined).identifier), environment: *Environment) EvalResult!Value {
-        _ = self;
         if (environment.get(id.name)) |v| {
             return v.value;
         }
-        return error.UndefinedVariable;
+        // 构建包含变量名的错误消息（需要分配以超过 panic_message 的生命周期）
+        var buf = std.ArrayList(u8).empty;
+        buf.appendSlice(self.allocator, "undefined variable: ") catch return error.UndefinedVariable;
+        buf.appendSlice(self.allocator, id.name) catch return error.UndefinedVariable;
+        const msg = buf.toOwnedSlice(self.allocator) catch return error.UndefinedVariable;
+        self.panic_message = msg;
+        return error.GluePanic;
     }
 
     fn evalAssignmentExpr(self: *Evaluator, ae: @TypeOf(@as(ast.Expr, undefined).assignment_expr), environment: *Environment) EvalResult!Value {
@@ -1024,6 +1393,7 @@ pub const Evaluator = struct {
                         error.IndexOutOfBounds => return error.IndexOutOfBounds,
                         error.UnsupportedOperation => return error.UnsupportedOperation,
                         error.GluePanic => return error.GluePanic,
+                        error.FileNotFound => return error.FileNotFound,
                         else => return error.UnsupportedOperation,
                     }
                 };
@@ -1088,6 +1458,20 @@ pub const Evaluator = struct {
             }
         }
 
+        // Impl 方法分派 — 搜索已注册的 impl 方法
+        for (self.impl_methods.items) |entry| {
+            if (std.mem.eql(u8, entry.method_name, method)) {
+                // 将 object 作为第一个参数传递
+                var full_args = std.ArrayList(Value).empty;
+                try full_args.append(self.allocator, object);
+                for (args) |arg| {
+                    try full_args.append(self.allocator, arg);
+                }
+                defer full_args.deinit(self.allocator);
+                return self.callFunction(Value{ .closure = entry.closure }, full_args.items, environment);
+            }
+        }
+
         return error.UndefinedVariable;
     }
 
@@ -1101,6 +1485,17 @@ pub const Evaluator = struct {
             .record => |map| {
                 if (map.get(field)) |val| {
                     return val;
+                }
+                return error.UndefinedVariable;
+            },
+            .adt => |av| {
+                // ADT 命名字段访问：circle.radius
+                for (av.fields) |f| {
+                    if (f.name) |n| {
+                        if (std.mem.eql(u8, n, field)) {
+                            return f.value;
+                        }
+                    }
                 }
                 return error.UndefinedVariable;
             },
@@ -1266,20 +1661,27 @@ pub const Evaluator = struct {
 
         var result: Value = Value.unit;
 
-        // 执行语句
+        // 执行语句 — 语句不在尾位置，必须清除尾位置标记
+        const saved_tail_for_stmts = self.in_tail_position;
+        self.in_tail_position = false;
         for (blk.statements) |stmt| {
             const stmt_result = self.evalStmt(stmt, block_env, &defer_stack) catch |err| switch (err) {
                 error.ReturnValue, error.ThrowValue, error.BreakSignal, error.ContinueSignal, error.GluePanic => {
+                    self.in_tail_position = saved_tail_for_stmts;
                     // 执行 defer（覆盖正常返回/throw/panic）
                     self.runDefers(defer_stack.items, block_env) catch {};
                     return err;
                 },
-                else => return err,
+                else => {
+                    self.in_tail_position = saved_tail_for_stmts;
+                    return err;
+                },
             };
             if (stmt_result) |val| {
                 result = val;
             }
         }
+        self.in_tail_position = saved_tail_for_stmts;
 
         // 尾表达式 — 设置尾位置标记用于 TCO
         if (blk.trailing_expr) |expr| {
@@ -1556,6 +1958,98 @@ pub const Evaluator = struct {
         };
     }
 
+    // ============================================================
+    // 模块加载
+    // ============================================================
+
+    /// 从文件系统加载模块
+    /// module_path: 模块路径组件，如 ["Collections"] 或 ["Collections", "Map"]
+    fn loadModuleFromFile(self: *Evaluator, module_path: [][]const u8) anyerror!void {
+        const allocator = self.allocator;
+        const io = self.io orelse return error.FileNotFound;
+
+        // 构建文件路径
+        var file_path = std.ArrayList(u8).empty;
+        defer file_path.deinit(allocator);
+
+        // 基础目录
+        const base_dir = self.current_source_dir orelse ".";
+
+        // 拼接路径
+        try file_path.appendSlice(allocator, base_dir);
+        for (module_path) |component| {
+            try file_path.append(allocator, std.fs.path.sep);
+            try file_path.appendSlice(allocator, component);
+        }
+
+        // 尝试 .glue 文件
+        const path_with_ext = try std.fmt.allocPrint(allocator, "{s}.glue", .{file_path.items});
+        defer allocator.free(path_with_ext);
+
+        // 尝试直接文件
+        const cwd = std.Io.Dir.cwd();
+        if (cwd.readFileAlloc(io, path_with_ext, allocator, .unlimited)) |source| {
+            defer allocator.free(source);
+            try self.evalSourceModule(source, module_path[0], path_with_ext);
+            return;
+        } else |_| {
+            // 尝试 pack.glue（目录模块）
+            const pack_path = try std.fmt.allocPrint(allocator, "{s}" ++ [_]u8{std.fs.path.sep} ++ "pack.glue", .{file_path.items});
+            defer allocator.free(pack_path);
+
+            if (cwd.readFileAlloc(io, pack_path, allocator, .unlimited)) |pack_source| {
+                defer allocator.free(pack_source);
+                try self.evalSourceModule(pack_source, module_path[0], pack_path);
+                return;
+            } else |_| {
+                return error.FileNotFound;
+            }
+        }
+    }
+
+    /// 解析并求值源代码作为模块
+    fn evalSourceModule(self: *Evaluator, source: []const u8, module_name: []const u8, source_path: []const u8) anyerror!void {
+        const allocator = self.allocator;
+        const lexer_mod = @import("lexer");
+        const parser_mod = @import("parser");
+
+        // 词法分析
+        var lex = lexer_mod.Lexer.init(allocator, source);
+        defer lex.deinit();
+        const tokens = try lex.tokenize();
+        defer allocator.free(tokens);
+
+        // 语法分析
+        var p = parser_mod.Parser.init(allocator, tokens);
+        defer p.deinit();
+
+        const module = try p.parseModule(module_name);
+
+        // 创建带源路径的模块
+        var module_with_path = module;
+        module_with_path.source_path = source_path;
+
+        // 求值模块
+        try self.evalModule(module_with_path);
+    }
+
+    /// 检查名称是否在 pub_names 中
+    fn isPubName(self: *Evaluator, pub_names: []const u8, name: []const u8) bool {
+        _ = self;
+        var start: usize = 0;
+        for (pub_names, 0..) |ch, i| {
+            if (ch == 0 or i == pub_names.len - 1) {
+                const end = if (ch == 0) i else i + 1;
+                if (end > start) {
+                    const pub_name = pub_names[start..end];
+                    if (std.mem.eql(u8, pub_name, name)) return true;
+                }
+                start = i + 1;
+            }
+        }
+        return false;
+    }
+
     fn evalForStmt(self: *Evaluator, fs: @TypeOf(@as(ast.Stmt, undefined).for_stmt), environment: *Environment) EvalResult!?Value {
         const iterable = try self.evalExpr(fs.iterable, environment);
 
@@ -1632,7 +2126,42 @@ pub const Evaluator = struct {
                     };
                 }
             },
-            else => return error.TypeMismatch,
+            else => {
+                // 非内建类型：尝试 Iterable/Iterator 协议
+                // for item in list { body }
+                // 脱糖为：val iter = list.iterator(); loop { match iter.next() { null => break, item => body } }
+                return self.evalForStmtWithIterator(fs, iterable, environment);
+            },
+        }
+
+        return null;
+    }
+
+    /// 通过 Iterable/Iterator 协议执行 for 循环
+    /// 用于实现了 Iterable<T> trait 的自定义类型
+    fn evalForStmtWithIterator(self: *Evaluator, fs: @TypeOf(@as(ast.Stmt, undefined).for_stmt), iterable: Value, environment: *Environment) EvalResult!?Value {
+        // 调用 iterable.iterator() 获取迭代器
+        const iter = self.callMethod(iterable, "iterator", &[_]Value{}, environment) catch |err| switch (err) {
+            error.UndefinedVariable => return error.TypeMismatch,
+            else => return err,
+        };
+
+        // 循环调用 iter.next()
+        while (true) {
+            const next_val = self.callMethod(iter, "next", &[_]Value{}, environment) catch |err| switch (err) {
+                error.UndefinedVariable => return error.TypeMismatch,
+                else => return err,
+            };
+            if (next_val.isNull()) break;
+
+            const loop_env = try environment.createChild();
+            try loop_env.define(fs.name, next_val, false);
+
+            _ = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {
+                error.BreakSignal => break,
+                error.ContinueSignal => continue,
+                else => return err,
+            };
         }
 
         return null;
@@ -1711,6 +2240,15 @@ fn structuralEquals(a: Value, b: Value) bool {
         .builtin => |b_val| b_val.fn_ptr == b.builtin.fn_ptr and b_val.user_ctx == b.builtin.user_ctx,
         .error_val => |e| std.mem.eql(u8, e.type_name, b.error_val.type_name) and std.mem.eql(u8, e.message, b.error_val.message),
         .throw_val => |tv| tv == b.throw_val, // 引用相等
+        .adt => |av| {
+            if (!std.mem.eql(u8, av.type_name, b.adt.type_name)) return false;
+            if (!std.mem.eql(u8, av.constructor, b.adt.constructor)) return false;
+            if (av.fields.len != b.adt.fields.len) return false;
+            for (av.fields, b.adt.fields) |a_field, b_field| {
+                if (!structuralEquals(a_field.value, b_field.value)) return false;
+            }
+            return true;
+        },
     };
 }
 
@@ -2437,4 +2975,403 @@ test "求值器 - match null 模式" {
 
     const result = try evalSource(allocator, "match null { null => 0, _ => 1 }");
     try std.testing.expectEqual(@as(i128, 0), result.integer);
+}
+
+// ============================================================
+// Phase 2 测试
+// ============================================================
+
+// --- ADT + Pattern Matching ---
+
+test "Phase 2 - ADT 枚举类型（无参构造器）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source =
+        \\type Ordering =
+        \\    | Lt
+        \\    | Eq
+        \\    | Gt
+        \\
+        \\fun test_ordering() {
+        \\    match Lt {
+        \\        Lt => 1,
+        \\        Eq => 2,
+        \\        Gt => 3,
+        \\    }
+        \\}
+    ;
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("test_ordering").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectEqual(@as(i128, 1), result.integer);
+}
+
+test "Phase 2 - ADT 带参构造器和字段访问" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source =
+        \\type Shape =
+        \\    | Circle(radius: f64)
+        \\    | Rectangle(width: f64, height: f64)
+        \\
+        \\fun test_field() {
+        \\    val s = Circle(3.0)
+        \\    s.radius
+        \\}
+    ;
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("test_field").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), result.float, 0.001);
+}
+
+test "Phase 2 - ADT 模式匹配" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source =
+        \\type Shape =
+        \\    | Circle(radius: f64)
+        \\    | Rectangle(width: f64, height: f64)
+        \\
+        \\fun area(shape) {
+        \\    match shape {
+        \\        Circle(r) => 3.14159 * r * r,
+        \\        Rectangle(w, h) => w * h,
+        \\    }
+        \\}
+    ;
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("area").?;
+    // 调用 Circle(2.0) 来测试
+    const circle_val = evaluator.global_env.get("Circle").?;
+    const circle_args = [_]Value{Value{ .float = 2.0 }};
+    const shape = try evaluator.callFunction(circle_val.value, &circle_args, null);
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{shape}, null);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14159 * 2.0 * 2.0), result.float, 0.01);
+}
+
+test "Phase 2 - ADT 多构造器匹配" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source =
+        \\type Option =
+        \\    | Some(value: i32)
+        \\    | None
+        \\
+        \\fun test_match() {
+        \\    match Some(42) {
+        \\        Some(v) => v,
+        \\        None => 0,
+        \\    }
+        \\}
+    ;
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("test_match").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectEqual(@as(i128, 42), result.integer);
+}
+
+test "Phase 2 - ADT 枚举匹配不同分支" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source =
+        \\type Ordering =
+        \\    | Lt
+        \\    | Eq
+        \\    | Gt
+        \\
+        \\fun describe(o) {
+        \\    match o {
+        \\        Lt => 1,
+        \\        Eq => 2,
+        \\        Gt => 3,
+        \\    }
+        \\}
+    ;
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("describe").?;
+    const lt_val = evaluator.global_env.get("Lt").?;
+    const eq_val = evaluator.global_env.get("Eq").?;
+    const gt_val = evaluator.global_env.get("Gt").?;
+
+    const r1 = try evaluator.callFunction(fn_val.value, &[_]Value{lt_val.value}, null);
+    try std.testing.expectEqual(@as(i128, 1), r1.integer);
+
+    const r2 = try evaluator.callFunction(fn_val.value, &[_]Value{eq_val.value}, null);
+    try std.testing.expectEqual(@as(i128, 2), r2.integer);
+
+    const r3 = try evaluator.callFunction(fn_val.value, &[_]Value{gt_val.value}, null);
+    try std.testing.expectEqual(@as(i128, 3), r3.integer);
+}
+
+// --- Trait 定义与实现 ---
+
+test "Phase 2 - Trait 方法调用" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source =
+        \\trait Describable {
+        \\    fun describe(self) : i32
+        \\}
+        \\
+        \\impl Describable {
+        \\    fun describe(self) {
+        \\        99
+        \\    }
+        \\}
+        \\
+        \\fun test_trait() {
+        \\    42.describe()
+        \\}
+    ;
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("test_trait").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectEqual(@as(i128, 99), result.integer);
+}
+
+// --- 记录类型构造器 ---
+
+test "Phase 2 - 记录类型构造器" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source =
+        \\type Point = (x: f64, y: f64)
+        \\
+        \\fun test_point() {
+        \\    val p = Point(1.0, 2.0)
+        \\    p.x
+        \\}
+    ;
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("test_point").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.float, 0.001);
+}
+
+// --- for 循环（内建 Iterable） ---
+
+test "Phase 2 - for 循环数组迭代" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source = "fun sum_arr() { var s = 0; for x in [1, 2, 3, 4, 5] { s = s + x }; s }";
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("sum_arr").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectEqual(@as(i128, 15), result.integer);
+}
+
+test "Phase 2 - for 循环字符串迭代" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source = "fun count_chars() { var c = 0; for ch in \"abc\" { c = c + 1 }; c }";
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("count_chars").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectEqual(@as(i128, 3), result.integer);
+}
+
+test "Phase 2 - for 循环 range 迭代" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source = "fun sum_range() { var s = 0; for x in 1..5 { s = s + x }; s }";
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("sum_range").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectEqual(@as(i128, 10), result.integer);
+}
+
+// --- ADT 字段访问 ---
+
+test "Phase 2 - ADT 字段访问" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lexer_mod = @import("lexer");
+    const parser_mod = @import("parser");
+
+    const source =
+        \\type Pair = Pair(first: i32, second: i32)
+        \\
+        \\fun test_pair() {
+        \\    val p = Pair(10, 20)
+        \\    p.first + p.second
+        \\}
+    ;
+    var lex = lexer_mod.Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    var p = parser_mod.Parser.init(allocator, tokens);
+    defer p.deinit();
+    const module = try p.parseModule("test");
+
+    var evaluator = Evaluator.init(allocator);
+    defer evaluator.deinit();
+    try evaluator.evalModule(module);
+
+    const fn_val = evaluator.global_env.get("test_pair").?;
+    const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
+    try std.testing.expectEqual(@as(i128, 30), result.integer);
 }

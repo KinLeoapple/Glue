@@ -175,6 +175,9 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
             stderr_writer.interface.print("Evaluation error: {}\n", .{err}) catch {};
+            if (ev.panic_message) |msg| {
+                stderr_writer.interface.print("  detail: {s}\n", .{msg}) catch {};
+            }
             stderr_writer.flush() catch {};
         },
     };

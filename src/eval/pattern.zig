@@ -26,6 +26,16 @@ pub fn matchPattern(pattern: *const ast.Pattern, val: value.Value, environment: 
         .wildcard => true,
         .literal => |lit| matchLiteralPattern(lit, val),
         .variable => |v| {
+            // Glue 约定：大写开头的标识符在模式中视为构造器模式
+            // 小写开头的标识符视为变量绑定模式
+            if (v.name.len > 0 and v.name[0] >= 'A' and v.name[0] <= 'Z') {
+                // 大写开头：视为构造器模式
+                if (val == .adt and std.mem.eql(u8, v.name, val.adt.constructor)) {
+                    return true;
+                }
+                return false;
+            }
+            // 小写开头：变量绑定，始终匹配
             try environment.define(v.name, val, false);
             return true;
         },
@@ -115,7 +125,19 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
         }
         return false;
     }
-    // 其他构造器暂不支持
+    // ADT 构造器模式匹配
+    if (val == .adt) {
+        if (!std.mem.eql(u8, val.adt.constructor, con.name)) return false;
+        if (con.patterns.len == 0) return true;
+        // 按位置匹配字段
+        if (con.patterns.len > val.adt.fields.len) return false;
+        for (con.patterns, 0..) |pat, i| {
+            if (!try matchPattern(pat, val.adt.fields[i].value, environment)) {
+                return false;
+            }
+        }
+        return true;
+    }
     return false;
 }
 

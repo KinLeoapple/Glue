@@ -25,6 +25,7 @@ pub const EvalError = error{
     IndexOutOfBounds,
     UnsupportedOperation,
     CircularDependency,
+    FileNotFound,
 };
 
 /// 控制流信号 — 使用 Zig error 机制实现非局部跳转
@@ -114,6 +115,31 @@ pub const Builtin = struct {
 };
 
 // ============================================================
+// ADT 值（代数数据类型的运行时表示）
+// ============================================================
+
+/// ADT 构造器字段
+pub const AdtField = struct {
+    /// 字段名（位置参数为 null）
+    name: ?[]const u8,
+    value: Value,
+};
+
+/// ADT 值 — 代数数据类型构造器的运行时实例
+///
+/// 如 `Circle(3.14)` 创建 AdtValue{ .type_name = "Shape", .constructor = "Circle", .fields = [...] }
+/// 如 `Cons(1, Nil)` 创建 AdtValue{ .type_name = "List", .constructor = "Cons", .fields = [...] }
+/// 如 `Lt` 创建 AdtValue{ .type_name = "Ordering", .constructor = "Lt", .fields = [] }
+pub const AdtValue = struct {
+    /// 类型名（如 Shape, List, Ordering）
+    type_name: []const u8,
+    /// 构造器名（如 Circle, Cons, Lt）
+    constructor: []const u8,
+    /// 构造器字段值
+    fields: []AdtField,
+};
+
+// ============================================================
 // 闭包
 // ============================================================
 
@@ -141,6 +167,9 @@ pub const Value = union(enum) {
     // 复合类型
     array: []Value,
     record: std.StringHashMap(Value),
+
+    // ADT 值（代数数据类型构造器实例）
+    adt: *AdtValue,
 
     // 范围
     range: Range,
@@ -194,6 +223,10 @@ pub const Value = union(enum) {
                 }
                 allocator.destroy(tv);
             },
+            .adt => {
+                // ADT 值由 Evaluator 统一管理（通过 arena allocator），
+                // 不在此释放，避免同一 *AdtValue 被多个 Value 引用导致 double-free
+            },
             else => {},
         }
     }
@@ -227,6 +260,21 @@ pub const Value = union(enum) {
                 return Value{ .record = new_map };
             },
             .closure => self,
+            .adt => |av| {
+                const new_av = try allocator.create(AdtValue);
+                new_av.* = AdtValue{
+                    .type_name = try allocator.dupe(u8, av.type_name),
+                    .constructor = try allocator.dupe(u8, av.constructor),
+                    .fields = try allocator.alloc(AdtField, av.fields.len),
+                };
+                for (av.fields, 0..) |f, i| {
+                    new_av.fields[i] = AdtField{
+                        .name = if (f.name) |n| try allocator.dupe(u8, n) else null,
+                        .value = try f.value.clone(allocator),
+                    };
+                }
+                return Value{ .adt = new_av };
+            },
             .error_val => |e| Value{ .error_val = ErrorValue{
                 .type_name = try allocator.dupe(u8, e.type_name),
                 .message = try allocator.dupe(u8, e.message),
@@ -290,6 +338,20 @@ pub const Value = union(enum) {
             },
             .closure => try buf.appendSlice(allocator, "<closure>"),
             .builtin => try buf.appendSlice(allocator, "<builtin>"),
+            .adt => |av| {
+                try buf.print(allocator, "{s}", .{av.constructor});
+                if (av.fields.len > 0) {
+                    try buf.appendSlice(allocator, "(");
+                    for (av.fields, 0..) |f, i| {
+                        if (i > 0) try buf.appendSlice(allocator, ", ");
+                        if (f.name) |n| {
+                            try buf.print(allocator, "{s}: ", .{n});
+                        }
+                        try f.value.format(buf, allocator);
+                    }
+                    try buf.appendSlice(allocator, ")");
+                }
+            },
             .error_val => |e| try buf.print(allocator, "{s}(\"{s}\")", .{ e.type_name, e.message }),
             .throw_val => |tv| {
                 switch (tv.*) {
@@ -322,6 +384,7 @@ pub const Value = union(enum) {
             // 引用相等
             .array => |a| a.ptr == other.array.ptr,
             .record => |r| @intFromPtr(&r) == @intFromPtr(&other.record),
+            .adt => |av| av == other.adt, // 引用相等
             .closure => |c| c == other.closure,
             .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,
             .error_val => |e| std.mem.eql(u8, e.type_name, other.error_val.type_name) and std.mem.eql(u8, e.message, other.error_val.message),

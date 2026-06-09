@@ -4,7 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // 共享模块
+    // ============================================================
+    // 共享基础模块
+    // ============================================================
+
     const ast_module = b.createModule(.{
         .root_source_file = b.path("src/ast.zig"),
         .target = target,
@@ -25,7 +28,127 @@ pub fn build(b: *std.Build) void {
     parser_module.addImport("ast", ast_module);
     parser_module.addImport("lexer", lexer_module);
 
-    // eval 子模块
+    // ============================================================
+    // sema/ 子模块
+    // ============================================================
+
+    const type_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/type_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    type_check_module.addImport("ast", ast_module);
+
+    const kind_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/kind_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kind_check_module.addImport("ast", ast_module);
+
+    const throw_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/throw_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    throw_check_module.addImport("ast", ast_module);
+
+    const subtype_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/subtype_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    subtype_check_module.addImport("ast", ast_module);
+
+    const variance_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/variance.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    variance_module.addImport("ast", ast_module);
+
+    const trait_resolve_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/trait_resolve.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    trait_resolve_module.addImport("ast", ast_module);
+
+    const gadt_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/gadt_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gadt_check_module.addImport("ast", ast_module);
+
+    const module_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/module_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module_check_module.addImport("ast", ast_module);
+
+    // ============================================================
+    // module/ 子模块
+    // ============================================================
+
+    const module_resolver_module = b.createModule(.{
+        .root_source_file = b.path("src/module/resolver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module_resolver_module.addImport("ast", ast_module);
+
+    const dependency_graph_module = b.createModule(.{
+        .root_source_file = b.path("src/module/graph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ============================================================
+    // runtime/ 子模块
+    // ============================================================
+
+    const scheduler_module = b.createModule(.{
+        .root_source_file = b.path("runtime/scheduler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const gc_module = b.createModule(.{
+        .root_source_file = b.path("runtime/gc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const channel_module = b.createModule(.{
+        .root_source_file = b.path("runtime/channel.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const task_module = b.createModule(.{
+        .root_source_file = b.path("runtime/task.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const arc_module = b.createModule(.{
+        .root_source_file = b.path("runtime/arc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const vtable_module = b.createModule(.{
+        .root_source_file = b.path("runtime/vtable.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ============================================================
+    // eval/ 子模块
+    // ============================================================
+
     const value_module = b.createModule(.{
         .root_source_file = b.path("src/eval/value.zig"),
         .target = target,
@@ -78,8 +201,27 @@ pub fn build(b: *std.Build) void {
     eval_module.addImport("module_eval", module_eval_module);
     eval_module.addImport("lexer", lexer_module);
     eval_module.addImport("parser", parser_module);
+    eval_module.addImport("sema", type_check_module);
+    eval_module.addImport("module_resolver", module_resolver_module);
+    eval_module.addImport("dependency_graph", dependency_graph_module);
+    eval_module.addImport("kind_check", kind_check_module);
+    eval_module.addImport("throw_check", throw_check_module);
+    eval_module.addImport("subtype_check", subtype_check_module);
+    eval_module.addImport("variance", variance_module);
+    eval_module.addImport("trait_resolve", trait_resolve_module);
+    eval_module.addImport("gadt_check", gadt_check_module);
+    eval_module.addImport("module_check", module_check_module);
+    eval_module.addImport("scheduler", scheduler_module);
+    eval_module.addImport("gc", gc_module);
+    eval_module.addImport("channel", channel_module);
+    eval_module.addImport("task", task_module);
+    eval_module.addImport("arc", arc_module);
+    eval_module.addImport("vtable_rt", vtable_module);
 
-    // 创建根模块
+    // ============================================================
+    // 根模块
+    // ============================================================
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -111,26 +253,33 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "运行 Glue 解释器");
     run_step.dependOn(&run_cmd.step);
 
-    // 测试 — eval 模块
+    // ============================================================
+    // 测试
+    // ============================================================
+
     const eval_unit_tests = b.addTest(.{
         .root_module = eval_module,
     });
     const run_eval_unit_tests = b.addRunArtifact(eval_unit_tests);
 
-    // 测试 — lexer
     const lexer_unit_tests = b.addTest(.{
         .root_module = lexer_module,
     });
     const run_lexer_unit_tests = b.addRunArtifact(lexer_unit_tests);
 
-    // 测试 — parser
     const parser_unit_tests = b.addTest(.{
         .root_module = parser_module,
     });
     const run_parser_unit_tests = b.addRunArtifact(parser_unit_tests);
 
+    const type_check_unit_tests = b.addTest(.{
+        .root_module = type_check_module,
+    });
+    const run_type_check_unit_tests = b.addRunArtifact(type_check_unit_tests);
+
     const test_step = b.step("test", "运行测试");
     test_step.dependOn(&run_eval_unit_tests.step);
     test_step.dependOn(&run_lexer_unit_tests.step);
     test_step.dependOn(&run_parser_unit_tests.step);
+    test_step.dependOn(&run_type_check_unit_tests.step);
 }

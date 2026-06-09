@@ -1,0 +1,470 @@
+// Phase 2 功能验证：顺序语义完整
+// 目标：ADT + Pattern Matching, Hindley-Milner 类型推断, Trait, Iterable/Iterator, 模块系统
+
+// ============================================================
+// 1. ADT — 枚举类型（Sum Type）
+// ============================================================
+
+type Ordering =
+    | Lt
+    | Eq
+    | Gt
+
+// 无参构造器直接使用
+val lt_val = Lt
+val eq_val = Eq
+val gt_val = Gt
+println(lt_val)
+println(eq_val)
+println(gt_val)
+
+// ============================================================
+// 2. ADT — 带参数构造器
+// ============================================================
+
+type Shape =
+    | Circle(radius: f64)
+    | Rectangle(width: f64, height: f64)
+
+val c = Circle(5.0)
+val r = Rectangle(3.0, 4.0)
+println(c)
+println(r)
+
+// ============================================================
+// 3. ADT — 单构造器 ADT（记录式）
+// ============================================================
+
+type Pair = Pair(first: i32, second: i32)
+
+val p = Pair(1, 2)
+println(p)
+
+// ============================================================
+// 4. ADT — Pattern Matching（无参构造器）
+// ============================================================
+
+fun orderingName(o: Ordering): String {
+    match o {
+        Lt => "less than"
+        Eq => "equal"
+        Gt => "greater than"
+    }
+}
+
+println(orderingName(Lt))
+println(orderingName(Eq))
+println(orderingName(Gt))
+
+// ============================================================
+// 5. ADT — Pattern Matching（带参数构造器，解构字段）
+// ============================================================
+
+fun shapeArea(s: Shape): f64 {
+    match s {
+        Circle(r) => 3.14159 * r * r
+        Rectangle(w, h) => w * h
+    }
+}
+
+println(shapeArea(Circle(10.0)))
+println(shapeArea(Rectangle(6.0, 7.0)))
+
+// ============================================================
+// 6. ADT — 递归类型
+// ============================================================
+
+type List =
+    | Nil
+    | Cons(i32, List)
+
+val list1 = Cons(1, Cons(2, Cons(3, Nil)))
+println(list1)
+
+// 递归求和
+fun listSum(l: List): i32 {
+    match l {
+        Nil => 0
+        Cons(head, tail) => head + listSum(tail)
+    }
+}
+
+println(listSum(list1))
+println(listSum(Nil))
+
+// ============================================================
+// 7. ADT — 嵌套 Pattern Matching
+// ============================================================
+
+fun secondElement(l: List): i32? {
+    match l {
+        Nil => null
+        Cons(_, Nil) => null
+        Cons(_, Cons(x, _)) => x
+    }
+}
+
+println(secondElement(Nil))
+println(secondElement(Cons(1, Nil)))
+println(secondElement(Cons(1, Cons(2, Nil))))
+println(secondElement(Cons(1, Cons(2, Cons(3, Nil)))))
+
+// ============================================================
+// 8. ADT — 通配符模式
+// ============================================================
+
+fun isNil(l: List): bool {
+    match l {
+        Nil => true
+        _ => false
+    }
+}
+
+println(isNil(Nil))
+println(isNil(Cons(1, Nil)))
+
+// ============================================================
+// 9. ADT — 字段访问
+// ============================================================
+
+val circle = Circle(42.0)
+println(circle.radius)
+
+val rect = Rectangle(3.0, 4.0)
+println(rect.width)
+println(rect.height)
+
+// ============================================================
+// 10. ADT — Newtype
+// ============================================================
+
+type UserId = UserId(i32)
+type Celsius = Celsius(f64)
+
+val uid = UserId(42)
+val temp = Celsius(36.5)
+println(uid)
+println(temp)
+
+// ============================================================
+// 11. Trait — 定义
+// ============================================================
+
+trait Describable {
+    fun describe(self): String
+}
+
+// ============================================================
+// 12. Trait — impl 实现（语法：impl TraitName<Type> { methods }）
+// ============================================================
+
+impl Describable<Ordering> {
+    fun describe(self): String {
+        match self {
+            Lt => "less than"
+            Eq => "equal"
+            Gt => "greater than"
+        }
+    }
+}
+
+// ============================================================
+// 13. Trait — 带默认实现的 Trait
+// ============================================================
+
+trait Printable {
+    fun format(self): String
+    fun print(self): String {
+        "<" + self.format() + ">"
+    }
+}
+
+// ============================================================
+// 14. Trait — Comparable
+// ============================================================
+
+trait Comparable {
+    fun compare(a, b): Ordering
+}
+
+impl Comparable<i32> {
+    fun compare(a, b): Ordering {
+        if (a < b) { Lt } else if (a == b) { Eq } else { Gt }
+    }
+}
+
+// 使用 impl 中注册的方法
+val cmp1 = compare(1, 2)
+val cmp2 = compare(5, 5)
+val cmp3 = compare(10, 3)
+println(cmp1)
+println(cmp2)
+println(cmp3)
+
+// ============================================================
+// 15. Trait Bound — with 语法
+// ============================================================
+
+fun myMax(a: i32, b: i32): i32 with Comparable {
+    match compare(a, b) {
+        Lt => b
+        Eq => a
+        Gt => a
+    }
+}
+
+println(myMax(3, 7))
+println(myMax(10, 2))
+println(myMax(5, 5))
+
+// ============================================================
+// 16. Iterable/Iterator — 内建类型 for 循环
+// ============================================================
+
+// Array 迭代
+var arr_sum = 0
+for item in [10, 20, 30, 40, 50] {
+    arr_sum = arr_sum + item
+}
+println(arr_sum)
+
+// Range 迭代
+var range_sum = 0
+for i in 1..=10 {
+    range_sum = range_sum + i
+}
+println(range_sum)
+
+// String 迭代
+var char_count = 0
+for ch in "hello" {
+    char_count = char_count + 1
+}
+println(char_count)
+
+// ============================================================
+// 17. ADT — Result 类型（Ok/Error 模式匹配）
+// ============================================================
+
+val r1 = match Ok(100) {
+    Ok(v) => v + 1
+    Error(e) => 0
+}
+println(r1)
+
+val r2 = match Error("failed") {
+    Ok(v) => "ok"
+    Error(e) => e
+}
+println(r2)
+
+// ============================================================
+// 18. ADT — 模式匹配中的守卫条件
+// ============================================================
+
+fun classify(n: i32): String {
+    match n {
+        0 => "zero"
+        n if n < 0 => "negative"
+        n if n > 100 => "large"
+        _ => "small"
+    }
+}
+
+println(classify(0))
+println(classify(-5))
+println(classify(50))
+println(classify(200))
+
+// ============================================================
+// 19. ADT — 或模式
+// ============================================================
+
+fun isWeekend(day: String): bool {
+    match day {
+        "Saturday" | "Sunday" => true
+        _ => false
+    }
+}
+
+println(isWeekend("Saturday"))
+println(isWeekend("Monday"))
+
+// ============================================================
+// 20. 类型推断 — let 多态
+// ============================================================
+
+fun identity(x) { x }
+
+val id_int = identity(42)
+val id_str = identity("hello")
+println(id_int)
+println(id_str)
+
+// ============================================================
+// 21. 类型推断 — 复合表达式
+// ============================================================
+
+val inferred = 10 + 20 * 3
+println(inferred)
+
+fun double(x) { x * 2 }
+println(double(21))
+
+// ============================================================
+// 22. ADT — 构造器作为函数
+// ============================================================
+
+val makeCircle = Circle
+val c2 = makeCircle(7.0)
+println(c2)
+
+// ============================================================
+// 23. ADT — 表达式树
+// ============================================================
+
+type Expr =
+    | Num(i32)
+    | Add(Expr, Expr)
+    | Mul(Expr, Expr)
+
+fun eval(e: Expr): i32 {
+    match e {
+        Num(n) => n
+        Add(left, right) => eval(left) + eval(right)
+        Mul(left, right) => eval(left) * eval(right)
+    }
+}
+
+// (1 + 2) * 3 = 9
+val expr = Mul(Add(Num(1), Num(2)), Num(3))
+println(eval(expr))
+
+// 1 + (2 * 3) = 7
+val expr2 = Add(Num(1), Mul(Num(2), Num(3)))
+println(eval(expr2))
+
+// ============================================================
+// 24. ADT — Nullable 与 ADT 交互
+// ============================================================
+
+fun firstOf(l: List): i32? {
+    match l {
+        Nil => null
+        Cons(head, _) => head
+    }
+}
+
+println(firstOf(Nil))
+println(firstOf(Cons(99, Nil)))
+
+// ============================================================
+// 25. ADT — 模式匹配穷举（_ 兜底）
+// ============================================================
+
+type Color =
+    | Red
+    | Green
+    | Blue
+    | Yellow
+
+fun isPrimary(c: Color): bool {
+    match c {
+        Red | Green | Blue => true
+        _ => false
+    }
+}
+
+println(isPrimary(Red))
+println(isPrimary(Yellow))
+
+// ============================================================
+// 26. Trait — 多方法 Trait
+// ============================================================
+
+trait Numeric {
+    fun add(a, b)
+    fun zero()
+}
+
+impl Numeric<i32> {
+    fun add(a, b): i32 {
+        a + b
+    }
+    fun zero(): i32 {
+        0
+    }
+}
+
+println(add(10, 20))
+println(zero())
+
+// ============================================================
+// 27. ADT — 构造器嵌套匹配
+// ============================================================
+
+fun deepMatch(l: List): String {
+    match l {
+        Nil => "empty"
+        Cons(x, Nil) => "one: " + string(x)
+        Cons(x, Cons(y, Nil)) => "two: " + string(x) + ", " + string(y)
+        _ => "many"
+    }
+}
+
+println(deepMatch(Nil))
+println(deepMatch(Cons(1, Nil)))
+println(deepMatch(Cons(1, Cons(2, Nil))))
+println(deepMatch(Cons(1, Cons(2, Cons(3, Nil)))))
+
+// ============================================================
+// 28. 综合测试 — 二叉树
+// ============================================================
+
+type Tree =
+    | Leaf
+    | Node(i32, Tree, Tree)
+
+fun treeSize(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(_, left, right) => 1 + treeSize(left) + treeSize(right)
+    }
+}
+
+fun treeDepth(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(_, left, right) => {
+            val ld = treeDepth(left)
+            val rd = treeDepth(right)
+            if (ld > rd) { ld + 1 } else { rd + 1 }
+        }
+    }
+}
+
+//       5
+//      / \
+//     3   8
+//    / \
+//   1   4
+val tree = Node(5, Node(3, Node(1, Leaf, Leaf), Node(4, Leaf, Leaf)), Node(8, Leaf, Leaf))
+
+println(treeSize(tree))
+println(treeDepth(tree))
+
+fun treeSum(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(v, left, right) => v + treeSum(left) + treeSum(right)
+    }
+}
+
+println(treeSum(tree))
+
+// ============================================================
+// 29. 模块系统 — use 导入（需要多文件，此处验证单文件正常）
+// ============================================================
+
+// use 声明在多文件场景下测试
+// 单文件中验证模块循环依赖检测等特性需多文件配合
