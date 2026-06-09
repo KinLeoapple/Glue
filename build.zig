@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ============================================================
-    // 共享基础模块
+    // Shared base modules
     // ============================================================
 
     const ast_module = b.createModule(.{
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     parser_module.addImport("lexer", lexer_module);
 
     // ============================================================
-    // sema/ 子模块
+    // sema/ sub-modules
     // ============================================================
 
     const type_check_module = b.createModule(.{
@@ -89,7 +89,7 @@ pub fn build(b: *std.Build) void {
     module_check_module.addImport("ast", ast_module);
 
     // ============================================================
-    // module/ 子模块
+    // module/ sub-modules
     // ============================================================
 
     const module_resolver_module = b.createModule(.{
@@ -106,7 +106,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ============================================================
-    // runtime/ 子模块
+    // runtime/ sub-modules
     // ============================================================
 
     const scheduler_module = b.createModule(.{
@@ -146,7 +146,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ============================================================
-    // eval/ 子模块
+    // eval/ sub-modules
     // ============================================================
 
     const value_module = b.createModule(.{
@@ -219,7 +219,7 @@ pub fn build(b: *std.Build) void {
     eval_module.addImport("vtable_rt", vtable_module);
 
     // ============================================================
-    // 根模块
+    // Root module
     // ============================================================
 
     const root_module = b.createModule(.{
@@ -232,29 +232,29 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("parser", parser_module);
     root_module.addImport("eval", eval_module);
 
-    // 创建 glue 可执行文件
+    // Create glue executable
     const exe = b.addExecutable(.{
         .name = "glue",
         .root_module = root_module,
     });
 
-    // 安装可执行文件到输出目录
+    // Install executable to output directory
     b.installArtifact(exe);
 
-    // 创建 run 命令：zig build run
+    // Create run command: zig build run
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    // 允许通过 -- 传递参数给程序
+    // Allow passing arguments to the program via --
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "运行 Glue 解释器");
+    const run_step = b.step("run", "Run the Glue interpreter");
     run_step.dependOn(&run_cmd.step);
 
     // ============================================================
-    // 测试
+    // Tests
     // ============================================================
 
     const eval_unit_tests = b.addTest(.{
@@ -277,7 +277,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_type_check_unit_tests = b.addRunArtifact(type_check_unit_tests);
 
-    const test_step = b.step("test", "运行测试");
+    const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_eval_unit_tests.step);
     test_step.dependOn(&run_lexer_unit_tests.step);
     test_step.dependOn(&run_parser_unit_tests.step);
