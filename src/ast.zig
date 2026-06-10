@@ -410,6 +410,15 @@ pub const AssociatedType = struct {
     kind: ?*Kind,
 };
 
+/// impl 中的关联类型定义（如 type Item = i32）
+pub const AssociatedTypeDef = struct {
+    location: SourceLocation,
+    /// 关联类型名称
+    name: []const u8,
+    /// 关联类型的实际类型
+    actual_type: *TypeNode,
+};
+
 // ============================================================
 // 表达式
 // ============================================================
@@ -834,8 +843,12 @@ pub const Decl = union(enum) {
         location: SourceLocation,
         /// Trait 名称
         trait_name: []const u8,
+        /// impl 的目标类型名（如 impl Comparable<i32> 中的 "i32"）
+        type_name: []const u8 = "",
         /// Trait 的类型参数
         type_args: []*TypeNode,
+        /// 关联类型定义（如 type Item = i32）
+        associated_type_defs: []AssociatedTypeDef,
         /// 方法实现
         methods: []MethodDecl,
         /// 可见性

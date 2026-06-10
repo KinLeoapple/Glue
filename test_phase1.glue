@@ -301,7 +301,7 @@ fun maybeNull(): i32? {
 }
 
 // ? 传播 null：maybeNull()? 返回 null，函数提前退出
-fun useNullable(): i32 {
+fun useNullable(): i32? {
     val v = maybeNull()?
     v + 1
 }
@@ -363,3 +363,135 @@ println(earlyReturn(20))
 // ============================================================
 // 33. 模块循环依赖检测（需要多文件，此处仅验证单文件正常）
 // ============================================================
+
+// ============================================================
+// 34. 泛型 ADT — 泛型列表
+// ============================================================
+
+type List<T> =
+    | Nil
+    | Cons(T, List<T>)
+
+val intList = Cons(1, Cons(2, Cons(3, Nil)))
+println(intList)
+
+// 泛型列表求和
+fun listSum(l: List<i32>): i32 {
+    match l {
+        Nil => 0
+        Cons(head, tail) => head + listSum(tail)
+    }
+}
+println(listSum(intList))
+
+// 字符串列表
+val strList = Cons("x", Cons("y", Cons("z", Nil)))
+println(strList)
+
+// ============================================================
+// 35. 泛型 ADT — 泛型 Pair
+// ============================================================
+
+type Pair<A, B> = Pair(first: A, second: B)
+
+val ip = Pair(10, 20)
+val sp = Pair("hello", 42)
+println(ip.first)
+println(ip.second)
+println(sp.first)
+println(sp.second)
+
+// ============================================================
+// 36. 泛型 ADT — 泛型函数
+// ============================================================
+
+fun identity<T>(x: T): T { x }
+
+val id1 = identity(100)
+val id2 = identity("world")
+println(id1)
+println(id2)
+
+// ============================================================
+// 37. Nullable 与泛型交互
+// ============================================================
+
+fun first<T>(l: List<T>): T? {
+    match l {
+        Nil => null
+        Cons(x, _) => x
+    }
+}
+
+println(first(intList))
+println(first(Nil))
+
+// ============================================================
+// 38. ? 传播 — Throw 类型
+// ============================================================
+
+fun safeDiv(a: i32, b: i32): Throw<i32, Error> {
+    if (b == 0) {
+        throw Error("division by zero")
+    }
+    Ok(a / b)
+}
+
+val divResult = match safeDiv(10, 3) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(divResult)
+
+val divError = match safeDiv(10, 0) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(divError)
+
+// ============================================================
+// 39. 泛型 ADT — 泛型树
+// ============================================================
+
+type Tree<T> =
+    | Leaf
+    | Node(T, Tree<T>, Tree<T>)
+
+val intTree = Node(5, Node(3, Leaf, Leaf), Node(8, Leaf, Leaf))
+
+fun treeSum(t: Tree<i32>): i32 {
+    match t {
+        Leaf => 0
+        Node(v, left, right) => v + treeSum(left) + treeSum(right)
+    }
+}
+println(treeSum(intTree))
+
+// ============================================================
+// 40. 泛型 newtype
+// ============================================================
+
+type Wrapper<T> = Wrapper(T)
+
+val wrapped = Wrapper(42)
+println(wrapped)
+
+// ============================================================
+// 41. 多层 ? 传播
+// ============================================================
+
+fun getFirst(): i32? { null }
+fun getSecond(): i32? { 42 }
+
+fun chain(): i32? {
+    val a = getFirst()?
+    val b = getSecond()?
+    a + b
+}
+println(chain())
+
+fun chain2(): i32? {
+    val b = getSecond()?
+    b + 1
+}
+println(chain2())

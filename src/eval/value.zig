@@ -172,6 +172,29 @@ pub const Closure = struct {
 };
 
 // ============================================================
+// 迭代器值（Iterable/Iterator 协议的运行时表示）
+// ============================================================
+
+/// 数组迭代器
+pub const ArrayIterator = struct {
+    array: []Value,
+    index: usize,
+};
+
+/// 字符串迭代器（UTF-8 码点）
+pub const StringIterator = struct {
+    string: []const u8,
+    byte_offset: usize,
+};
+
+/// 范围迭代器
+pub const RangeIterator = struct {
+    current: i128,
+    end: i128,
+    inclusive: bool,
+};
+
+// ============================================================
 // 运行时值
 // ============================================================
 
@@ -209,6 +232,14 @@ pub const Value = union(enum) {
 
     // Throw 值（Throw<T, E> 的运行时表示）
     throw_val: *ThrowValue,
+
+    // 迭代器（Iterable/Iterator 协议的运行时表示）
+    /// 数组迭代器
+    array_iterator: *ArrayIterator,
+    /// 字符串迭代器（UTF-8 码点）
+    string_iterator: *StringIterator,
+    /// 范围迭代器
+    range_iterator: *RangeIterator,
 
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -253,6 +284,9 @@ pub const Value = union(enum) {
             },
             .newtype => {
                 // Newtype 值由 Evaluator 统一管理，不在此释放
+            },
+            .array_iterator, .string_iterator, .range_iterator => {
+                // 迭代器由 Evaluator 统一管理，不在此释放
             },
             else => {},
         }
@@ -333,6 +367,9 @@ pub const Value = union(enum) {
                 }
                 return Value{ .throw_val = new_tv };
             },
+            .array_iterator => |ai| Value{ .array_iterator = ai }, // 引用相等
+            .string_iterator => |si| Value{ .string_iterator = si }, // 引用相等
+            .range_iterator => |ri| Value{ .range_iterator = ri }, // 引用相等
         };
     }
 
@@ -406,6 +443,9 @@ pub const Value = union(enum) {
                     },
                 }
             },
+            .array_iterator => try buf.appendSlice(allocator, "<array_iterator>"),
+            .string_iterator => try buf.appendSlice(allocator, "<string_iterator>"),
+            .range_iterator => try buf.appendSlice(allocator, "<range_iterator>"),
         }
     }
 
@@ -431,6 +471,9 @@ pub const Value = union(enum) {
             .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,
             .error_val => |e| std.mem.eql(u8, e.type_name, other.error_val.type_name) and std.mem.eql(u8, e.message, other.error_val.message),
             .throw_val => |tv| tv == other.throw_val, // 引用相等
+            .array_iterator => |ai| ai == other.array_iterator, // 引用相等
+            .string_iterator => |si| si == other.string_iterator, // 引用相等
+            .range_iterator => |ri| ri == other.range_iterator, // 引用相等
         };
     }
 

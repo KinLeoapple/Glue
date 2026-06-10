@@ -468,3 +468,205 @@ println(treeSum(tree))
 
 // use 声明在多文件场景下测试
 // 单文件中验证模块循环依赖检测等特性需多文件配合
+
+// ============================================================
+// 30. 泛型 ADT — 泛型列表
+// ============================================================
+
+type GList<T> =
+    | GNil
+    | GCons(T, GList<T>)
+
+val glist1 = GCons(10, GCons(20, GCons(30, GNil)))
+val glist2 = GCons("a", GCons("b", GCons("c", GNil)))
+
+fun glistLen(l: GList<i32>): i32 {
+    match l {
+        GNil => 0
+        GCons(_, tail) => 1 + glistLen(tail)
+    }
+}
+println(glistLen(glist1))
+println(glistLen(GNil))
+
+// ============================================================
+// 31. 泛型 ADT — 泛型 Pair 记录
+// ============================================================
+
+type GPair<A, B> = GPair(first: A, second: B)
+
+val gp1 = GPair(1, "one")
+val gp2 = GPair(true, 42)
+println(gp1.first)
+println(gp1.second)
+println(gp2.first)
+println(gp2.second)
+
+// ============================================================
+// 32. 泛型函数 — 泛型 Trait Bound
+// ============================================================
+
+fun genericMax<T>(a: T, b: T): T with Comparable<T> {
+    match compare(a, b) {
+        Lt => b
+        Eq => a
+        Gt => a
+    }
+}
+
+println(genericMax(3, 7))
+println(genericMax(10, 2))
+
+// ============================================================
+// 33. 泛型 ADT — Nullable 与泛型交互
+// ============================================================
+
+fun glistHead<T>(l: GList<T>): T? {
+    match l {
+        GNil => null
+        GCons(x, _) => x
+    }
+}
+
+println(glistHead(glist1))
+println(glistHead(GNil))
+
+// ============================================================
+// 34. 泛型 ADT — 泛型树
+// ============================================================
+
+type GTree<T> =
+    | GLeaf
+    | GNode(T, GTree<T>, GTree<T>)
+
+val gtree = GNode(5, GNode(3, GLeaf, GLeaf), GNode(8, GLeaf, GLeaf))
+
+fun gtreeSum(t: GTree<i32>): i32 {
+    match t {
+        GLeaf => 0
+        GNode(v, left, right) => v + gtreeSum(left) + gtreeSum(right)
+    }
+}
+println(gtreeSum(gtree))
+
+// ============================================================
+// 35. 泛型 newtype
+// ============================================================
+
+type Tagged<T> = Tagged(T)
+
+val tagged1 = Tagged(42)
+val tagged2 = Tagged("label")
+println(tagged1)
+println(tagged2)
+
+// ============================================================
+// 36. Trait — 关联类型（类型检查验证）
+// ============================================================
+
+trait Container {
+    type Item
+    fun empty()
+    fun insert(self, item)
+    fun len(self): i32
+}
+
+// 关联类型验证：impl 必须定义 type Item = i32
+impl Container<GList<i32>> {
+    type Item = i32
+    fun empty(): GList<i32> {
+        GNil
+    }
+    fun insert(self, item: i32): GList<i32> {
+        GCons(item, self)
+    }
+    fun len(self): i32 {
+        glistLen(self)
+    }
+}
+
+// 注：关联类型验证在类型检查阶段完成
+// 运行时调用 trait 方法需要完整 vtable 支持（后续 Phase 实现）
+
+// ============================================================
+// 37. Trait 组合 — 父 Trait 继承
+// ============================================================
+
+trait Show {
+    fun show(self): String
+}
+
+trait Debug extends Show {
+    fun debug(self): String
+}
+
+impl Show<Ordering> {
+    fun show(self): String {
+        match self {
+            Lt => "Lt"
+            Eq => "Eq"
+            Gt => "Gt"
+        }
+    }
+}
+
+impl Debug<Ordering> {
+    fun debug(self): String {
+        "Debug(" + self.show() + ")"
+    }
+}
+
+println(Lt.show())
+println(Eq.debug())
+
+// ============================================================
+// 38. 泛型 ADT — map 函数
+// ============================================================
+
+fun glistMap<T, U>(l: GList<T>, f): GList<U> {
+    match l {
+        GNil => GNil
+        GCons(x, tail) => GCons(f(x), glistMap(tail, f))
+    }
+}
+
+val doubled = glistMap(glist1, fun(x) { x * 2 })
+println(doubled)
+
+// ============================================================
+// 39. 泛型 ADT — filter 函数
+// ============================================================
+
+fun glistFilter(l: GList<i32>, pred): GList<i32> {
+    match l {
+        GNil => GNil
+        GCons(x, tail) => {
+            val rest = glistFilter(tail, pred)
+            if (pred(x)) { GCons(x, rest) } else { rest }
+        }
+    }
+}
+
+val evens = glistFilter(glist1, fun(x) { x % 2 == 0 })
+println(evens)
+
+// ============================================================
+// 40. 综合测试 — 泛型表达式求值器
+// ============================================================
+
+type Expr<T> =
+    | Lit(T)
+    | Add(Expr<i32>, Expr<i32>)
+
+fun evalExpr(e: Expr<i32>): i32 {
+    match e {
+        Lit(n) => n
+        Add(a, b) => evalExpr(a) + evalExpr(b)
+    }
+}
+
+val expr1 = Add(Lit(10), Lit(20))
+println(evalExpr(expr1))
+
+val expr2 = Add(Add(Lit(1), Lit(2)), Lit(3))
+println(evalExpr(expr2))

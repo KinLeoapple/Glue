@@ -886,10 +886,35 @@ pub const Parser = struct {
             _ = self.expect(.gt, "期望 '>'") catch {};
         }
 
+        // 提取目标类型名（如 impl Comparable<i32> 中的 "i32"）
+        var type_name: []const u8 = "";
+        if (type_args.items.len > 0) {
+            switch (type_args.items[0].*) {
+                .named => |n| type_name = n.name,
+                .generic => |g| type_name = g.name,
+                else => {},
+            }
+        }
+
+        var assoc_type_defs = std.ArrayList(ast.AssociatedTypeDef).empty;
         var methods = std.ArrayList(ast.MethodDecl).empty;
         _ = self.expect(.l_brace, "期望 '{'") catch {};
         while (!self.check(.r_brace) and !self.isAtEnd()) {
-            try methods.append(self.allocator, try self.parseMethodDecl());
+            // 解析关联类型定义：type Item = i32
+            if (self.check(.kw_type)) {
+                const type_tok = self.advance();
+                const assoc_name = try self.expect(.identifier, "期望关联类型名称");
+                if (self.matchToken(.eq)) {
+                    const actual_type = try self.parseType();
+                    try assoc_type_defs.append(self.allocator, ast.AssociatedTypeDef{
+                        .location = tokenLoc(type_tok),
+                        .name = assoc_name.lexeme,
+                        .actual_type = actual_type,
+                    });
+                }
+            } else {
+                try methods.append(self.allocator, try self.parseMethodDecl());
+            }
         }
         _ = self.expect(.r_brace, "期望 '}'") catch {};
 
@@ -897,7 +922,9 @@ pub const Parser = struct {
             .impl_decl = .{
                 .location = tokenLoc(impl_tok),
                 .trait_name = name_tok.lexeme,
+                .type_name = type_name,
                 .type_args = try type_args.toOwnedSlice(self.allocator),
+                .associated_type_defs = try assoc_type_defs.toOwnedSlice(self.allocator),
                 .methods = try methods.toOwnedSlice(self.allocator),
                 .visibility = visibility,
             },

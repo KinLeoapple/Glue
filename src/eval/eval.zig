@@ -73,6 +73,8 @@ const TraitInfo = struct {
     method_names: []const u8,
     /// 默认实现的方法（方法名 -> 闭包）
     default_methods: std.StringHashMap(*value.Closure),
+    /// 父 Trait 名称列表
+    parent_names: []const []const u8,
 };
 
 /// Impl 方法注册项
@@ -508,11 +510,35 @@ pub const Evaluator = struct {
         }
 
         // 先检查后求值：运行 Hindley-Milner 类型推断
-        self.type_inferencer.checkModule(&module) catch {
-            // 类型推断错误不阻止求值，仅记录
-            // 重置 panic_message 以避免干扰后续求值
-            self.panic_message = null;
-        };
+        // 文档 7.1: 先检查后求值 — 类型推断错误报告给用户但不阻止求值
+        self.type_inferencer.checkModule(&module);
+
+        // 报告类型推断错误到 stderr
+        if (self.type_inferencer.errors.items.len > 0) {
+            if (self.io) |io| {
+                var err_buf: [4096]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                for (self.type_inferencer.errors.items) |err| {
+                    const kind_str = switch (err.kind) {
+                        .type_mismatch => "type error",
+                        .unbound_variable => "type error",
+                        .arity_mismatch => "type error",
+                        .occurs_check_failed => "type error",
+                        .missing_implementation => "type error",
+                        .recursive_type => "type error",
+                        .non_exhaustive_match => "match error",
+                        .propagate_cross_type => "type error",
+                        .unsatisfied_bound => "bound error",
+                    };
+                    if (err.line > 0) {
+                        stderr_writer.interface.print("{s}:{d}:{d}: {s}: {s}\n", .{ kind_str, err.line, err.column, kind_str, err.message }) catch {};
+                    } else {
+                        stderr_writer.interface.print("{s}: {s}\n", .{ kind_str, err.message }) catch {};
+                    }
+                }
+                stderr_writer.flush() catch {};
+            }
+        }
 
         // 收集 pub 声明名称
         var pub_names = std.ArrayList(u8).empty;
@@ -766,9 +792,29 @@ pub const Evaluator = struct {
             .trait_decl => |td| {
                 // 注册 Trait 声明
                 // 存储方法名列表和默认实现
+                // 文档 2.7.2: 子 Trait 自动拥有所有父 Trait 的方法，默认方法从父 Trait 继承
                 var method_names = std.ArrayList(u8).empty;
                 defer method_names.deinit(self.allocator);
                 var default_methods = std.StringHashMap(*value.Closure).init(self.allocator);
+
+                // 先合并父 Trait 的方法名和默认方法
+                for (td.parents) |parent| {
+                    if (self.trait_registry.getPtr(parent.trait_name)) |parent_info| {
+                        // 合并父 Trait 的方法名
+                        if (parent_info.method_names.len > 0) {
+                            if (method_names.items.len > 0) {
+                                try method_names.append(self.allocator, 0);
+                            }
+                            try method_names.appendSlice(self.allocator, parent_info.method_names);
+                        }
+                        // 合并父 Trait 的默认方法（子 Trait 可覆写）
+                        var dm_iter = parent_info.default_methods.iterator();
+                        while (dm_iter.next()) |dm_entry| {
+                            const name_copy = try self.allocator.dupe(u8, dm_entry.key_ptr.*);
+                            try default_methods.put(name_copy, dm_entry.value_ptr.*);
+                        }
+                    }
+                }
 
                 for (td.methods) |method| {
                     // 方法名以 \0 分隔存储
@@ -792,18 +838,34 @@ pub const Evaluator = struct {
                     }
                 }
 
+                // 存储父 Trait 名称列表
+                var parent_names = std.ArrayList([]const u8).empty;
+                defer parent_names.deinit(self.allocator);
+                for (td.parents) |parent| {
+                    const name_copy = try self.allocator.dupe(u8, parent.trait_name);
+                    try parent_names.append(self.allocator, name_copy);
+                }
+
                 const owned_name = try self.allocator.dupe(u8, td.name);
                 const owned_method_names = try method_names.toOwnedSlice(self.allocator);
+                const owned_parent_names = try parent_names.toOwnedSlice(self.allocator);
                 const trait_key = try self.allocator.dupe(u8, td.name);
                 try self.trait_registry.put(trait_key, TraitInfo{
                     .name = owned_name,
                     .method_names = owned_method_names,
                     .default_methods = default_methods,
+                    .parent_names = owned_parent_names,
                 });
             },
             .impl_decl => |id| {
                 // 注册 Impl 声明
                 // 为每个有方法体的方法创建闭包并注册到 impl_methods
+                // 文档 2.7.2: impl 未覆写的默认方法自动从 trait 继承
+
+                // 收集 impl 中已覆写的方法名
+                var overridden_methods = std.StringHashMap(void).init(self.allocator);
+                defer overridden_methods.deinit();
+
                 for (id.methods) |method| {
                     if (method.body) |body| {
                         const closure = try self.allocator.create(value.Closure);
@@ -824,6 +886,25 @@ pub const Evaluator = struct {
                         // 同时将方法注册为环境中的函数（支持直接调用）
                         // 方法可见性由 MethodDecl.visibility 决定
                         try environment.defineWithVisibility(method.name, Value{ .closure = closure }, true, method.visibility == .public);
+
+                        // 记录已覆写的方法名
+                        const name_copy = try self.allocator.dupe(u8, method.name);
+                        try overridden_methods.put(name_copy, {});
+                    }
+                }
+
+                // 将 trait 的默认方法注册到环境中（impl 未覆写的部分）
+                // 文档 2.7.2: 子 Trait 自动拥有所有父 Trait 的方法
+                if (self.trait_registry.getPtr(id.trait_name)) |trait_info| {
+                    var dm_iter = trait_info.default_methods.iterator();
+                    while (dm_iter.next()) |dm_entry| {
+                        // 仅注册 impl 未覆写的默认方法
+                        if (!overridden_methods.contains(dm_entry.key_ptr.*)) {
+                            // 检查环境中是否已有同名函数（避免覆盖其他 impl 的方法）
+                            if (environment.get(dm_entry.key_ptr.*) == null) {
+                                try environment.defineWithVisibility(dm_entry.key_ptr.*, Value{ .closure = dm_entry.value_ptr.* }, true, true);
+                            }
+                        }
                     }
                 }
             },
@@ -874,8 +955,42 @@ pub const Evaluator = struct {
                     }
                 }
             },
-            .pack_decl => {
-                // Phase 1: 简单处理
+            .pack_decl => |pd| {
+                // 文档 4.2-4.3: pack.glue 中的子模块声明
+                // pub pack Name — 公开子模块，公开成员合并到父模块命名空间
+                // pack Name — 私有子模块，仅注册模块名
+                const sub_module_name = pd.name;
+
+                // 检查子模块是否已加载
+                if (!self.loaded_modules.contains(sub_module_name)) {
+                    // 构建子模块路径
+                    const module_path = try self.allocator.alloc([]const u8, 1);
+                    module_path[0] = sub_module_name;
+                    self.loadModuleFromFile(module_path) catch |err| switch (err) {
+                        error.FileNotFound => {
+                            // 子模块文件不存在，跳过
+                        },
+                        else => return err,
+                    };
+                }
+
+                // 从模块导出表中获取子模块的公开声明
+                if (self.module_exports.getPtr(sub_module_name)) |export_info| {
+                    if (pd.visibility == .public) {
+                        // pub pack: 子模块的公开成员合并到当前环境
+                        var iter = export_info.env.values.iterator();
+                        while (iter.next()) |entry| {
+                            if (entry.value_ptr.is_public) {
+                                // 避免覆盖已有定义
+                                if (environment.get(entry.key_ptr.*) == null) {
+                                    try environment.defineWithVisibility(entry.key_ptr.*, entry.value_ptr.value, false, true);
+                                }
+                            }
+                        }
+                    }
+                    // 私有 pack: 子模块已加载到 module_exports，但不合并到当前环境
+                    // 可通过 use SubModule 显式导入
+                }
             },
             .expr_decl => |ed| {
                 if (ed.stmt) |s| {
@@ -1485,6 +1600,74 @@ pub const Evaluator = struct {
             return Value{ .string = try buf.toOwnedSlice(self.allocator) };
         }
 
+        // Iterable/Iterator 协议方法
+        if (std.mem.eql(u8, method, "iterator")) {
+            return switch (object) {
+                .array => |arr| {
+                    const iter = try self.allocator.create(value.ArrayIterator);
+                    iter.* = .{ .array = arr, .index = 0 };
+                    return Value{ .array_iterator = iter };
+                },
+                .string => |s| {
+                    const iter = try self.allocator.create(value.StringIterator);
+                    iter.* = .{ .string = s, .byte_offset = 0 };
+                    return Value{ .string_iterator = iter };
+                },
+                .range => |r| {
+                    const iter = try self.allocator.create(value.RangeIterator);
+                    iter.* = .{ .current = r.start, .end = r.end, .inclusive = r.inclusive };
+                    return Value{ .range_iterator = iter };
+                },
+                else => error.TypeMismatch,
+            };
+        }
+
+        if (std.mem.eql(u8, method, "next")) {
+            return switch (object) {
+                .array_iterator => |ai| {
+                    if (ai.index < ai.array.len) {
+                        const val = ai.array[ai.index];
+                        ai.index += 1;
+                        return val;
+                    }
+                    return Value.null_val;
+                },
+                .string_iterator => |si| {
+                    if (si.byte_offset >= si.string.len) return Value.null_val;
+                    const remaining = si.string[si.byte_offset..];
+                    const view = std.unicode.Utf8View.init(remaining) catch {
+                        // 无效 UTF-8，回退到字节迭代
+                        const byte = remaining[0];
+                        si.byte_offset += 1;
+                        return Value{ .char_val = @as(u21, @intCast(byte)) };
+                    };
+                    var iter = view.iterator();
+                    if (iter.nextCodepoint()) |codepoint| {
+                        si.byte_offset += std.unicode.utf8CodepointSequenceLength(codepoint) catch 1;
+                        return Value{ .char_val = codepoint };
+                    }
+                    return Value.null_val;
+                },
+                .range_iterator => |ri| {
+                    if (ri.inclusive) {
+                        if (ri.current <= ri.end) {
+                            const val = ri.current;
+                            ri.current += 1;
+                            return Value{ .integer = val };
+                        }
+                    } else {
+                        if (ri.current < ri.end) {
+                            const val = ri.current;
+                            ri.current += 1;
+                            return Value{ .integer = val };
+                        }
+                    }
+                    return Value.null_val;
+                },
+                else => error.TypeMismatch,
+            };
+        }
+
         // 记录方法 — 在记录中查找方法字段
         if (object == .record) {
             if (object.record.get(method)) |val| {
@@ -1503,6 +1686,25 @@ pub const Evaluator = struct {
                 }
                 defer full_args.deinit(self.allocator);
                 return self.callFunction(Value{ .closure = entry.closure }, full_args.items, environment);
+            }
+        }
+
+        // Trait 默认方法分派 — impl 未覆写时回退到 trait 默认实现
+        // 文档 2.7.2: 子 Trait 自动拥有所有父 Trait 的方法，默认方法在 impl 未覆写时自动使用
+        {
+            var trait_iter = self.trait_registry.iterator();
+            while (trait_iter.next()) |entry| {
+                if (entry.value_ptr.default_methods.get(method)) |closure| {
+                    // 检查该方法是否已被 impl 覆写（impl 方法优先于默认方法）
+                    // 上面 impl_methods 搜索已确认未覆写，直接使用默认实现
+                    var full_args = std.ArrayList(Value).empty;
+                    try full_args.append(self.allocator, object);
+                    for (args) |arg| {
+                        try full_args.append(self.allocator, arg);
+                    }
+                    defer full_args.deinit(self.allocator);
+                    return self.callFunction(Value{ .closure = closure }, full_args.items, environment);
+                }
             }
         }
 
@@ -2086,90 +2288,19 @@ pub const Evaluator = struct {
     }
 
     fn evalForStmt(self: *Evaluator, fs: @TypeOf(@as(ast.Stmt, undefined).for_stmt), environment: *Environment) EvalResult!?Value {
-        const iterable = try self.evalExpr(fs.iterable, environment);
+        var iterable = try self.evalExpr(fs.iterable, environment);
 
-        switch (iterable) {
-            .array => |arr| {
-                for (arr) |item| {
-                    const loop_env = try environment.createChild();
-
-                    try loop_env.define(fs.name, item, false);
-
-                    _ = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {
-                        error.BreakSignal => break,
-                        error.ContinueSignal => continue,
-                        else => return err,
-                    };
-                }
-            },
-            .string => |s| {
-                // UTF-8 码点迭代
-                var iter = std.unicode.Utf8View.init(s) catch {
-                    // 如果不是有效 UTF-8，回退到字节迭代
-                    for (s) |byte| {
-                        const loop_env = try environment.createChild();
-                        try loop_env.define(fs.name, Value{ .char_val = @as(u21, @intCast(byte)) }, false);
-                        _ = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {
-                            error.BreakSignal => break,
-                            error.ContinueSignal => continue,
-                            else => return err,
-                        };
-                    }
-                    return null;
-                };
-                var utf8_iter = iter.iterator();
-                while (utf8_iter.nextCodepoint()) |codepoint| {
-                    const loop_env = try environment.createChild();
-
-                    try loop_env.define(fs.name, Value{ .char_val = codepoint }, false);
-
-                    _ = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {
-                        error.BreakSignal => break,
-                        error.ContinueSignal => continue,
-                        else => return err,
-                    };
-                }
-            },
-            .range => |r| {
-                var i: i128 = r.start;
-                const end_val: i128 = if (r.inclusive) r.end + 1 else r.end;
-                while (i < end_val) : (i += 1) {
-                    const loop_env = try environment.createChild();
-
-                    try loop_env.define(fs.name, Value{ .integer = i }, false);
-
-                    _ = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {
-                        error.BreakSignal => break,
-                        error.ContinueSignal => continue,
-                        else => return err,
-                    };
-                }
-            },
-            .integer => |range_end| {
-                // 整数作为范围上限（0..range_end）
-                if (range_end < 0) return null;
-                var i: i128 = 0;
-                while (i < range_end) : (i += 1) {
-                    const loop_env = try environment.createChild();
-
-                    try loop_env.define(fs.name, Value{ .integer = i }, false);
-
-                    _ = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {
-                        error.BreakSignal => break,
-                        error.ContinueSignal => continue,
-                        else => return err,
-                    };
-                }
-            },
-            else => {
-                // 非内建类型：尝试 Iterable/Iterator 协议
-                // for item in list { body }
-                // 脱糖为：val iter = list.iterator(); loop { match iter.next() { null => break, item => body } }
-                return self.evalForStmtWithIterator(fs, iterable, environment);
-            },
+        // 整数作为范围上限（0..n）的语法糖，转换为 Range
+        if (iterable == .integer) {
+            const range_end = iterable.integer;
+            if (range_end < 0) return null;
+            iterable = Value{ .range = Range{ .start = 0, .end = range_end, .inclusive = false } };
         }
 
-        return null;
+        // 所有类型统一通过 Iterable/Iterator 协议
+        // for item in list { body }
+        // 脱糖为：val iter = list.iterator(); loop { match iter.next() { null => break, item => body } }
+        return self.evalForStmtWithIterator(fs, iterable, environment);
     }
 
     /// 通过 Iterable/Iterator 协议执行 for 循环
@@ -2290,6 +2421,9 @@ fn structuralEquals(a: Value, b: Value) bool {
             if (!std.mem.eql(u8, nv.type_name, b.newtype.type_name)) return false;
             return structuralEquals(nv.inner, b.newtype.inner);
         },
+        .array_iterator => |ai| ai == b.array_iterator, // 引用相等
+        .string_iterator => |si| si == b.string_iterator, // 引用相等
+        .range_iterator => |ri| ri == b.range_iterator, // 引用相等
     };
 }
 
