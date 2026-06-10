@@ -329,9 +329,25 @@ pub const TypeEnv = struct {
         return child;
     }
 
+    /// 定义绑定：同层级不允许重复定义
+    /// 嵌套作用域（child_env）中允许遮蔽外层
     pub fn define(self: *TypeEnv, name: []const u8, scheme: TypeScheme) !void {
+        // 检查当前层级是否已有同名绑定
+        if (self.bindings.contains(name)) {
+            return error.DuplicateDefinition;
+        }
         const key = try self.allocator.dupe(u8, name);
         try self.bindings.put(key, scheme);
+    }
+
+    /// 定义绑定（容错版）：重复定义时返回 false 而非错误
+    pub fn defineOrReport(self: *TypeEnv, name: []const u8, scheme: TypeScheme) !bool {
+        if (self.bindings.contains(name)) {
+            return false;
+        }
+        const key = try self.allocator.dupe(u8, name);
+        try self.bindings.put(key, scheme);
+        return true;
     }
 
     pub fn lookup(self: *TypeEnv, name: []const u8) ?TypeScheme {
@@ -357,6 +373,7 @@ pub const SemaError = error{
     OccursCheckFailed,
     MissingImplementation,
     RecursiveType,
+    DuplicateDefinition,
 };
 
 /// 类型错误种类
@@ -412,6 +429,8 @@ pub const TypeInferencer = struct {
     /// 已注册的 impl 记录（用于 Overlapping 检查）
     /// key: "trait_name::type_name"，value: impl 的位置信息
     registered_impls: std.StringHashMap(ImplRecord),
+    /// 内建函数/构造器名称集合（用于禁止用户遮蔽内建定义）
+    builtin_names: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator) TypeInferencer {
         return TypeInferencer{
@@ -426,6 +445,7 @@ pub const TypeInferencer = struct {
             .trait_defining_modules = std.StringHashMap([]const u8).init(allocator),
             .type_defining_modules = std.StringHashMap([]const u8).init(allocator),
             .registered_impls = std.StringHashMap(ImplRecord).init(allocator),
+            .builtin_names = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -477,6 +497,13 @@ pub const TypeInferencer = struct {
                 self.allocator.free(key.*);
             }
             self.registered_impls.deinit();
+        }
+        {
+            var iter = self.builtin_names.keyIterator();
+            while (iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+            self.builtin_names.deinit();
         }
         // 释放错误消息
         for (self.errors.items) |err| {
@@ -1164,15 +1191,27 @@ pub const TypeInferencer = struct {
     pub fn inferStmt(self: *TypeInferencer, stmt: *const ast.Stmt, env: *TypeEnv) SemaError!?*Type {
         return switch (stmt.*) {
             .val_decl => |vd| {
-                const val_ty = try self.inferExpr(vd.value, env);
-                const scheme = try self.generalize(env, val_ty);
-                try env.define(vd.name, scheme);
+                if (self.isBuiltinName(vd.name)) {
+                    self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{vd.name});
+                } else {
+                    const val_ty = try self.inferExpr(vd.value, env);
+                    const scheme = try self.generalize(env, val_ty);
+                    if (!(try env.defineOrReport(vd.name, scheme))) {
+                        self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
+                    }
+                }
                 return null;
             },
             .var_decl => |vd| {
-                const val_ty = try self.inferExpr(vd.value, env);
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = val_ty };
-                try env.define(vd.name, scheme);
+                if (self.isBuiltinName(vd.name)) {
+                    self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{vd.name});
+                } else {
+                    const val_ty = try self.inferExpr(vd.value, env);
+                    const scheme = try self.generalize(env, val_ty);
+                    if (!(try env.defineOrReport(vd.name, scheme))) {
+                        self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
+                    }
+                }
                 return null;
             },
             .assignment => |asgn| {
@@ -1372,6 +1411,7 @@ pub const TypeInferencer = struct {
     }
 
     /// 注册内建函数到类型环境，与求值器的 registerBuiltins 对应
+    /// 同时将内建名称注册到 builtin_names，禁止用户遮蔽
     fn registerBuiltins(self: *TypeInferencer, env: *TypeEnv) void {
         // 内建函数使用 let 多态：quantified_vars 包含类型变量 ID
         // 这样每次使用 println 时都会实例化一个新的类型变量
@@ -1384,7 +1424,8 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("println", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch {};
+            env.define("println", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("println");
         }
 
         // print : forall a. (a) -> ()
@@ -1395,7 +1436,8 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("print", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch {};
+            env.define("print", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("print");
         }
 
         // eprintln : forall a. (a) -> ()
@@ -1406,7 +1448,8 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("eprintln", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch {};
+            env.define("eprintln", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("eprintln");
         }
 
         // eprint : forall a. (a) -> ()
@@ -1417,7 +1460,8 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("eprint", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch {};
+            env.define("eprint", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("eprint");
         }
 
         // Panic : (String) -> !
@@ -1425,7 +1469,8 @@ pub const TypeInferencer = struct {
             const params = self.allocator.alloc(*Type, 1) catch return;
             params[0] = self.makeType(.string_type) catch return;
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
-            env.define("Panic", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch {};
+            env.define("Panic", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("Panic");
         }
 
         // eq : forall a. (a, a) -> bool
@@ -1437,7 +1482,8 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.bool_type) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("eq", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch {};
+            env.define("eq", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("eq");
         }
 
         // string : forall a. (a) -> String
@@ -1448,7 +1494,8 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.string_type) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("string", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch {};
+            env.define("string", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("string");
         }
 
         // Error ADT 类型（用于 Throw<T, Error> 中的 Error 类型参数）
@@ -1463,11 +1510,12 @@ pub const TypeInferencer = struct {
             params[0] = self.makeType(.string_type) catch return;
             const throw_ty = self.allocator.create(Type) catch return;
             throw_ty.* = Type{ .throw_type = .{ .value_type = val_ty, .error_type = error_adt_ty } };
-            self.types.append(self.allocator, throw_ty) catch {};
+            self.types.append(self.allocator, throw_ty) catch return;
             const fn_ty = self.makeFnType(params, throw_ty) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = val_ty.type_var.id;
-            env.define("Error", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch {};
+            env.define("Error", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("Error");
         }
 
         // Ok : forall a. (a) -> Throw<a, Error>
@@ -1477,12 +1525,69 @@ pub const TypeInferencer = struct {
             params[0] = val_ty;
             const throw_ty = self.allocator.create(Type) catch return;
             throw_ty.* = Type{ .throw_type = .{ .value_type = val_ty, .error_type = error_adt_ty } };
-            self.types.append(self.allocator, throw_ty) catch {};
+            self.types.append(self.allocator, throw_ty) catch return;
             const fn_ty = self.makeFnType(params, throw_ty) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = val_ty.type_var.id;
-            env.define("Ok", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch {};
+            env.define("Ok", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("Ok");
         }
+
+        // 数值类型转换函数：Type(value) 显式转换
+        // 文档 2.15: i8(), i16(), i32(), i64(), i128(), u8(), u16(), u32(), u64(), u128(), f32(), f64()
+        // 当前类型系统只有 int_type(i32) 和 float_type(f64)，其余类型系统支持后完善
+        {
+            // i32 : forall a. (a) -> i32
+            const param = self.freshTypeVar() catch return;
+            const params = self.allocator.alloc(*Type, 1) catch return;
+            params[0] = param;
+            const fn_ty = self.makeFnType(params, self.makeType(.int_type) catch return) catch return;
+            const qvars = self.allocator.alloc(usize, 1) catch return;
+            qvars[0] = param.type_var.id;
+            env.define("i32", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("i32");
+        }
+        {
+            // f64 : forall a. (a) -> f64
+            const param = self.freshTypeVar() catch return;
+            const params = self.allocator.alloc(*Type, 1) catch return;
+            params[0] = param;
+            const fn_ty = self.makeFnType(params, self.makeType(.float_type) catch return) catch return;
+            const qvars = self.allocator.alloc(usize, 1) catch return;
+            qvars[0] = param.type_var.id;
+            env.define("f64", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("f64");
+        }
+        // 其余数值类型转换函数：暂注册为占位（类型系统支持后完善）
+        // 禁止用户遮蔽这些名称
+        inline for (&.{
+            "i8", "i16", "i64", "i128",
+            "u8", "u16", "u32", "u64", "u128",
+            "f32",
+        }) |name| {
+            // 占位注册：forall a. (a) -> a（类型系统完善后改为具体类型）
+            const param = self.freshTypeVar() catch return;
+            const params = self.allocator.alloc(*Type, 1) catch return;
+            params[0] = param;
+            const fn_ty = self.makeFnType(params, param) catch return;
+            const qvars = self.allocator.alloc(usize, 1) catch return;
+            qvars[0] = param.type_var.id;
+            env.define(name, TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName(name);
+        }
+    }
+
+    /// 将名称注册到 builtin_names 集合
+    fn registerBuiltinName(self: *TypeInferencer, name: []const u8) void {
+        if (!self.builtin_names.contains(name)) {
+            const key = self.allocator.dupe(u8, name) catch return;
+            self.builtin_names.put(key, {}) catch return;
+        }
+    }
+
+    /// 检查名称是否为内建函数/构造器
+    fn isBuiltinName(self: *TypeInferencer, name: []const u8) bool {
+        return self.builtin_names.contains(name);
     }
 
     /// 文档 2.7.6: Orphan Instance 禁止
@@ -1613,7 +1718,11 @@ pub const TypeInferencer = struct {
                 // 同时注册到外层环境（供后续声明使用）
                 // 推断完函数体后重新泛化，捕获推断出的自由类型变量（let 多态）
                 const final_scheme = self.generalize(env, fn_ty) catch return;
-                env.define(f.name, final_scheme) catch return;
+                if (self.isBuiltinName(f.name)) {
+                    self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{f.name});
+                } else if (!(env.defineOrReport(f.name, final_scheme) catch false)) {
+                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{f.name});
+                }
 
                 // 文档 2.7.3: Trait Bound `with` 验证
                 for (f.bounds) |bound| {
@@ -1657,12 +1766,18 @@ pub const TypeInferencer = struct {
 
                         const key = self.allocator.dupe(u8, td.name) catch return;
                         const owned_type_param_names = type_param_names.toOwnedSlice(self.allocator) catch return;
-                        self.adt_types.put(key, AdtInfo{
-                            .ty = adt_ty,
-                            .constructor_names = ctor_names,
-                            .type_param_names = owned_type_param_names,
-                            .defining_module = self.current_module,
-                        }) catch return;
+                        if (self.isBuiltinName(td.name)) {
+                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
+                        } else if (self.adt_types.contains(td.name)) {
+                            self.addError(.type_mismatch, "duplicate type definition: '{s}' is already defined", .{td.name});
+                        } else {
+                            self.adt_types.put(key, AdtInfo{
+                                .ty = adt_ty,
+                                .constructor_names = ctor_names,
+                                .type_param_names = owned_type_param_names,
+                                .defining_module = self.current_module,
+                            }) catch return;
+                        }
                         // 记录类型定义模块（用于 Orphan 检查）
                         const mod_key = self.allocator.dupe(u8, td.name) catch return;
                         const mod_val = self.allocator.dupe(u8, self.current_module) catch return;
@@ -1672,10 +1787,14 @@ pub const TypeInferencer = struct {
                         for (adt_def.constructors) |con| {
                             // 每个构造器需要独立的 quantified_vars 副本
                             const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
-                            if (con.fields.len == 0) {
+                            if (self.isBuiltinName(con.name)) {
+                                self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{con.name});
+                            } else if (con.fields.len == 0) {
                                 // 无参构造器：直接返回 ADT 类型
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = adt_ty };
-                                env.define(con.name, scheme) catch return;
+                                if (!(env.defineOrReport(con.name, scheme) catch false)) {
+                                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{con.name});
+                                }
                             } else {
                                 // 带参构造器：参数类型 -> ADT 类型
                                 var param_types = self.allocator.alloc(*Type, con.fields.len) catch return;
@@ -1687,7 +1806,9 @@ pub const TypeInferencer = struct {
                                 }
                                 const ctor_ty = self.makeFnType(param_types, adt_ty) catch return;
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
-                                env.define(con.name, scheme) catch return;
+                                if (!(env.defineOrReport(con.name, scheme) catch false)) {
+                                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{con.name});
+                                }
                             }
                         }
                     },
@@ -1722,7 +1843,11 @@ pub const TypeInferencer = struct {
                         const ctor_ty = self.makeFnType(param_types, rec_ty) catch return;
                         const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
-                        env.define(td.name, scheme) catch return;
+                        if (self.isBuiltinName(td.name)) {
+                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
+                        } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
+                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{td.name});
+                        }
                     },
                     .alias => {
                         // 类型别名：不创建新类型
@@ -1755,7 +1880,11 @@ pub const TypeInferencer = struct {
                         const ctor_ty = self.makeFnType(ctor_params, newtype_ty) catch return;
                         const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
-                        env.define(nt.name, scheme) catch return;
+                        if (self.isBuiltinName(nt.name)) {
+                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{nt.name});
+                        } else if (!(env.defineOrReport(nt.name, scheme) catch false)) {
+                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{nt.name});
+                        }
                     },
                     .error_newtype => |en| {
                         // 错误 newtype：构造器类型 String -> ErrorADT
@@ -1766,12 +1895,22 @@ pub const TypeInferencer = struct {
                         ctor_params[0] = self.makeType(.string_type) catch return;
                         const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
                         const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
-                        env.define(en.name, scheme) catch return;
+                        if (self.isBuiltinName(en.name)) {
+                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{en.name});
+                        } else if (!(env.defineOrReport(en.name, scheme) catch false)) {
+                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{en.name});
+                        }
                         // 注册为 ADT 类型，标记为 error newtype
-                        const key = self.allocator.dupe(u8, en.name) catch return;
-                        const ctor_names = self.allocator.alloc([]const u8, 1) catch return;
-                        ctor_names[0] = en.name;
-                        self.adt_types.put(key, AdtInfo{ .ty = error_adt, .constructor_names = ctor_names, .is_error_newtype = true }) catch return;
+                        if (self.isBuiltinName(en.name)) {
+                            // 已在上面报错
+                        } else if (self.adt_types.contains(en.name)) {
+                            self.addError(.type_mismatch, "duplicate type definition: '{s}' is already defined", .{en.name});
+                        } else {
+                            const key = self.allocator.dupe(u8, en.name) catch return;
+                            const ctor_names = self.allocator.alloc([]const u8, 1) catch return;
+                            ctor_names[0] = en.name;
+                            self.adt_types.put(key, AdtInfo{ .ty = error_adt, .constructor_names = ctor_names, .is_error_newtype = true }) catch return;
+                        }
                     },
                 }
             },
@@ -1793,12 +1932,18 @@ pub const TypeInferencer = struct {
                 }
 
                 const key = self.allocator.dupe(u8, td.name) catch return;
-                self.trait_types.put(key, TraitInfo{
-                    .ty = trait_ty,
-                    .associated_type_names = assoc_names,
-                    .method_names = meth_names,
-                    .defining_module = self.current_module,
-                }) catch return;
+                if (self.isBuiltinName(td.name)) {
+                    self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
+                } else if (self.trait_types.contains(td.name)) {
+                    self.addError(.type_mismatch, "duplicate trait definition: '{s}' is already defined", .{td.name});
+                } else {
+                    self.trait_types.put(key, TraitInfo{
+                        .ty = trait_ty,
+                        .associated_type_names = assoc_names,
+                        .method_names = meth_names,
+                        .defining_module = self.current_module,
+                    }) catch return;
+                }
                 // 记录 Trait 定义模块（用于 Orphan 检查）
                 const mod_key = self.allocator.dupe(u8, td.name) catch return;
                 const mod_val = self.allocator.dupe(u8, self.current_module) catch return;
@@ -1831,7 +1976,11 @@ pub const TypeInferencer = struct {
                             self.freshTypeVar() catch return;
                         const fn_ty = self.makeFnType(param_types, ret_ty) catch return;
                         const scheme = self.generalize(env, fn_ty) catch return;
-                        env.define(method.name, scheme) catch return;
+                        if (self.isBuiltinName(method.name)) {
+                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{method.name});
+                        } else if (!(env.defineOrReport(method.name, scheme) catch false)) {
+                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{method.name});
+                        }
                     }
                 }
             },
@@ -2031,6 +2180,7 @@ pub const TypeInferencer = struct {
             error.OccursCheckFailed => self.addErrorAt(.recursive_type, location.line, location.column, "recursive type (occurs check failed)", .{}),
             error.MissingImplementation => self.addErrorAt(.missing_implementation, location.line, location.column, "missing implementation", .{}),
             error.RecursiveType => self.addErrorAt(.recursive_type, location.line, location.column, "recursive type", .{}),
+            error.DuplicateDefinition => self.addErrorAt(.type_mismatch, location.line, location.column, "duplicate definition", .{}),
             error.OutOfMemory => {}, // 不报告 OOM
         }
     }

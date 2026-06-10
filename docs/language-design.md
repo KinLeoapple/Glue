@@ -983,7 +983,64 @@ string('a')         // "a"
 
 `string()` 也是字符串插值 `{expr}` 的底层机制——插值时自动调用 `string(expr)`。
 
-### 2.16 迭代器
+### 2.16 命名规则
+
+**同层级禁止重复定义**：在同一作用域内，`val`、`var`、`fun`、`type`、`trait` 不允许重复定义同名标识符：
+
+```glue
+val x = 1
+val x = 2       // ❌ duplicate definition: 'x' is already defined in this scope
+
+fun f() = 1
+fun f() = 2     // ❌ duplicate definition: 'f' is already defined in this scope
+
+type A = | Foo
+type B = | Foo  // ❌ duplicate definition: 'Foo' is already defined
+```
+
+**嵌套作用域允许遮蔽**：内层作用域可以定义与外层同名的 `val`/`var`：
+
+```glue
+val x = 1
+{
+    val x = 2   // ✅ 内层遮蔽外层
+    println(x)  // 2
+}
+println(x)      // 1
+```
+
+**`var` 允许重新赋值但不允许重复定义**：
+
+```glue
+var x = 1
+x = 2           // ✅ 重新赋值
+var x = 3       // ❌ duplicate definition: 'x' is already defined in this scope
+```
+
+**内建名称禁止重新定义**：以下内建函数和类型转换函数不允许被用户定义遮蔽：
+
+| 类别 | 名称 |
+|------|------|
+| I/O | `println`, `print`, `eprintln`, `eprint` |
+| 工具 | `Panic`, `eq`, `string` |
+| 错误处理 | `Error`, `Ok` |
+| 类型转换 | `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`, `f32`, `f64` |
+
+```glue
+val println = 42     // ❌ cannot redefine built-in 'println'
+fun eq(a, b) = a     // ❌ cannot redefine built-in 'eq'
+type Error = ...     // ❌ cannot redefine built-in 'Error'
+```
+
+**大小写敏感**：`eq` 和 `Eq` 是不同的标识符。`eq` 是内建函数，`Eq` 可以作为构造器名：
+
+```glue
+type Ordering = | Lt | Eq | Gt   // ✅ 构造器 Eq 与内建函数 eq 不冲突
+val eq = Eq                       // ❌ 变量名 eq 与内建函数冲突
+val eq_val = Eq                   // ✅
+```
+
+### 2.17 迭代器
 
 ```glue
 trait Iterable<T> {

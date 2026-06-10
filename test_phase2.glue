@@ -12,10 +12,10 @@ type Ordering =
 
 // 无参构造器直接使用
 val lt = Lt
-val eq = Eq
+val eq_val = Eq
 val gt = Gt
 println(lt)
-println(eq)
+println(eq_val)
 println(gt)
 
 // ============================================================
@@ -654,19 +654,19 @@ println(evens)
 // 40. 综合测试 — 泛型表达式求值器
 // ============================================================
 
-type Expr<T> =
+type GExpr<T> =
     | Lit(T)
-    | Add(Expr<i32>, Expr<i32>)
+    | GAdd(GExpr<i32>, GExpr<i32>)
 
-fun evalExpr(e: Expr<i32>): i32 {
+fun evalExpr(e: GExpr<i32>): i32 {
     match e {
         Lit(n) => n
-        Add(a, b) => evalExpr(a) + evalExpr(b)
+        GAdd(a, b) => evalExpr(a) + evalExpr(b)
     }
 }
 
-val expr1 = Add(Lit(10), Lit(20))
-println(evalExpr(expr1))
+val gexpr1 = GAdd(Lit(10), Lit(20))
+println(evalExpr(gexpr1))
 
-val expr2 = Add(Add(Lit(1), Lit(2)), Lit(3))
-println(evalExpr(expr2))
+val gexpr2 = GAdd(GAdd(Lit(1), Lit(2)), Lit(3))
+println(evalExpr(gexpr2))
