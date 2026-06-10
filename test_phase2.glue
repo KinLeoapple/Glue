@@ -44,7 +44,7 @@ println(p)
 // 4. ADT — Pattern Matching（无参构造器）
 // ============================================================
 
-fun orderingName(o: Ordering): String {
+fun orderingName(o: Ordering): str {
     match o {
         Lt => "less than"
         Eq => "equal"
@@ -151,7 +151,7 @@ println(temp)
 // ============================================================
 
 trait Describable {
-    fun describe(self): String
+    fun describe(self): str
 }
 
 // ============================================================
@@ -159,7 +159,7 @@ trait Describable {
 // ============================================================
 
 impl Describable<Ordering> {
-    fun describe(self): String {
+    fun describe(self): str {
         match self {
             Lt => "less than"
             Eq => "equal"
@@ -173,8 +173,8 @@ impl Describable<Ordering> {
 // ============================================================
 
 trait Printable {
-    fun format(self): String
-    fun print(self): String {
+    fun format(self): str
+    fun print(self): str {
         "<" + self.format() + ">"
     }
 }
@@ -235,7 +235,7 @@ for i in 1..=10 {
 }
 println(range_sum)
 
-// String 迭代
+// str 迭代
 var char_count = 0
 for ch in "hello" {
     char_count = char_count + 1
@@ -262,7 +262,7 @@ println(r2)
 // 18. ADT — 模式匹配中的守卫条件
 // ============================================================
 
-fun classify(n: i32): String {
+fun classify(n: i32): str {
     match n {
         0 => "zero"
         n if n < 0 => "negative"
@@ -280,7 +280,7 @@ println(classify(200))
 // 19. ADT — 或模式
 // ============================================================
 
-fun isWeekend(day: String): bool {
+fun isWeekend(day: str): bool {
     match day {
         "Saturday" | "Sunday" => true
         _ => false
@@ -403,11 +403,11 @@ println(zero())
 // 27. ADT — 构造器嵌套匹配
 // ============================================================
 
-fun deepMatch(l: List): String {
+fun deepMatch(l: List): str {
     match l {
         Nil => "empty"
-        Cons(x, Nil) => "one: " + string(x)
-        Cons(x, Cons(y, Nil)) => "two: " + string(x) + ", " + string(y)
+        Cons(x, Nil) => "one: " + str(x)
+        Cons(x, Cons(y, Nil)) => "two: " + str(x) + ", " + str(y)
         _ => "many"
     }
 }
@@ -593,15 +593,15 @@ impl Container<GList<i32>> {
 // ============================================================
 
 trait Show {
-    fun show(self): String
+    fun show(self): str
 }
 
 trait Debug extends Show {
-    fun debug(self): String
+    fun debug(self): str
 }
 
 impl Show<Ordering> {
-    fun show(self): String {
+    fun show(self): str {
         match self {
             Lt => "Lt"
             Eq => "Eq"
@@ -611,7 +611,7 @@ impl Show<Ordering> {
 }
 
 impl Debug<Ordering> {
-    fun debug(self): String {
+    fun debug(self): str {
         "Debug(" + self.show() + ")"
     }
 }

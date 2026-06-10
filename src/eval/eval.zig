@@ -331,8 +331,8 @@ pub const Evaluator = struct {
                 return ev.builtinEq(args);
             }
         }.call } }, true) catch {};
-        // string (类型转换)
-        self.global_env.define("string", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        // str (类型转换)
+        self.global_env.define("str", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -510,7 +510,7 @@ pub const Evaluator = struct {
         }
 
         // 先检查后求值：运行 Hindley-Milner 类型推断
-        // 文档 7.1: 先检查后求值 — 类型推断错误报告给用户但不阻止求值
+        // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值
         self.type_inferencer.checkModule(&module);
 
         // 报告类型推断错误到 stderr
@@ -538,6 +538,7 @@ pub const Evaluator = struct {
                 }
                 stderr_writer.flush() catch {};
             }
+            return;
         }
 
         // 收集 pub 声明名称
@@ -2021,7 +2022,7 @@ pub const Evaluator = struct {
     }
 
     fn castValue(self: *Evaluator, val: Value, type_name: []const u8) EvalResult!Value {
-        if (std.mem.eql(u8, type_name, "string")) {
+        if (std.mem.eql(u8, type_name, "str")) {
             return self.valueToString(val);
         }
         if (val == .integer) {
@@ -2031,7 +2032,7 @@ pub const Evaluator = struct {
             return self.castFloat(val.float, type_name);
         }
         if (val == .boolean) {
-            if (std.mem.eql(u8, type_name, "string")) {
+            if (std.mem.eql(u8, type_name, "str")) {
                 return self.valueToString(val);
             }
             return error.TypeMismatch;
@@ -2501,7 +2502,7 @@ fn isBuiltinType(name: []const u8) bool {
         "i8",   "i16",  "i32",  "i64",  "i128",
         "u8",   "u16",  "u32",  "u64",  "u128",
         "f32",  "f64",
-        "bool", "string",
+        "bool", "str",
     };
     for (builtin_types) |bt| {
         if (std.mem.eql(u8, name, bt)) return true;

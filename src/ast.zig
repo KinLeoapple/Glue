@@ -136,6 +136,13 @@ pub const TypeNode = union(enum) {
         fields: []RecordFieldType,
     },
 
+    /// 数组类型：T[N]（固定大小）或 T[]（动态）
+    array: struct {
+        location: SourceLocation,
+        element_type: *TypeNode,
+        size: ?u64,
+    },
+
     /// Kind 注解类型：F : * -> *（用于 HKT 类型参数约束）
     kind_annotated: struct {
         location: SourceLocation,

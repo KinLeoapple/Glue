@@ -18,11 +18,25 @@ var next_type_id: usize = 0;
 
 /// 类型节点
 pub const Type = union(enum) {
-    // 基本类型
-    int_type,
-    float_type,
+    // 整数类型（方案 B：12 个独立 tag）
+    i8_type,
+    i16_type,
+    i32_type,
+    i64_type,
+    i128_type,
+    u8_type,
+    u16_type,
+    u32_type,
+    u64_type,
+    u128_type,
+
+    // 浮点类型
+    f32_type,
+    f64_type,
+
+    // 其他基本类型
     bool_type,
-    string_type,
+    str_type,
     char_type,
     null_type,
     unit_type,
@@ -56,6 +70,12 @@ pub const Type = union(enum) {
         args: []*Type,
     },
 
+    // 数组类型：T[N]（固定大小）或 T[]（动态大小）
+    array_type: struct {
+        element_type: *Type,
+        size: ?u64, // null 表示动态数组
+    },
+
     // Throw 类型：Throw<T, E>
     throw_type: struct {
         value_type: *Type,
@@ -71,12 +91,44 @@ pub const Type = union(enum) {
     // 未知类型（推断失败时的回退）
     unknown_type,
 
+    /// 判断是否为整数类型
+    pub fn isIntType(self: Type) bool {
+        return switch (self) {
+            .i8_type, .i16_type, .i32_type, .i64_type, .i128_type,
+            .u8_type, .u16_type, .u32_type, .u64_type, .u128_type => true,
+            else => false,
+        };
+    }
+
+    /// 判断是否为浮点类型
+    pub fn isFloatType(self: Type) bool {
+        return switch (self) {
+            .f32_type, .f64_type => true,
+            else => false,
+        };
+    }
+
+    /// 判断是否为数值类型（整数或浮点）
+    pub fn isNumericType(self: Type) bool {
+        return self.isIntType() or self.isFloatType();
+    }
+
     pub fn format(self: Type, writer: anytype) !void {
         switch (self) {
-            .int_type => try writer.writeAll("i32"),
-            .float_type => try writer.writeAll("f64"),
+            .i8_type => try writer.writeAll("i8"),
+            .i16_type => try writer.writeAll("i16"),
+            .i32_type => try writer.writeAll("i32"),
+            .i64_type => try writer.writeAll("i64"),
+            .i128_type => try writer.writeAll("i128"),
+            .u8_type => try writer.writeAll("u8"),
+            .u16_type => try writer.writeAll("u16"),
+            .u32_type => try writer.writeAll("u32"),
+            .u64_type => try writer.writeAll("u64"),
+            .u128_type => try writer.writeAll("u128"),
+            .f32_type => try writer.writeAll("f32"),
+            .f64_type => try writer.writeAll("f64"),
             .bool_type => try writer.writeAll("bool"),
-            .string_type => try writer.writeAll("String"),
+            .str_type => try writer.writeAll("str"),
             .char_type => try writer.writeAll("char"),
             .null_type => try writer.writeAll("Null"),
             .unit_type => try writer.writeAll("()"),
@@ -131,6 +183,14 @@ pub const Type = union(enum) {
                     try writer.writeAll(">");
                 }
             },
+            .array_type => |at| {
+                try at.element_type.*.format(writer);
+                try writer.writeAll("[");
+                if (at.size) |s| {
+                    try writer.print("{}", .{s});
+                }
+                try writer.writeAll("]");
+            },
             .throw_type => |tt| {
                 try writer.writeAll("Throw<");
                 try tt.value_type.*.format(writer);
@@ -156,10 +216,20 @@ pub const Type = union(enum) {
     /// 将类型格式化到 ArrayList（使用 ArrayList 的 print/appendSlice API）
     pub fn formatArrayList(self: Type, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
         switch (self) {
-            .int_type => try buf.appendSlice(allocator, "i32"),
-            .float_type => try buf.appendSlice(allocator, "f64"),
+            .i8_type => try buf.appendSlice(allocator, "i8"),
+            .i16_type => try buf.appendSlice(allocator, "i16"),
+            .i32_type => try buf.appendSlice(allocator, "i32"),
+            .i64_type => try buf.appendSlice(allocator, "i64"),
+            .i128_type => try buf.appendSlice(allocator, "i128"),
+            .u8_type => try buf.appendSlice(allocator, "u8"),
+            .u16_type => try buf.appendSlice(allocator, "u16"),
+            .u32_type => try buf.appendSlice(allocator, "u32"),
+            .u64_type => try buf.appendSlice(allocator, "u64"),
+            .u128_type => try buf.appendSlice(allocator, "u128"),
+            .f32_type => try buf.appendSlice(allocator, "f32"),
+            .f64_type => try buf.appendSlice(allocator, "f64"),
             .bool_type => try buf.appendSlice(allocator, "bool"),
-            .string_type => try buf.appendSlice(allocator, "String"),
+            .str_type => try buf.appendSlice(allocator, "str"),
             .char_type => try buf.appendSlice(allocator, "char"),
             .null_type => try buf.appendSlice(allocator, "Null"),
             .unit_type => try buf.appendSlice(allocator, "()"),
@@ -213,6 +283,14 @@ pub const Type = union(enum) {
                     }
                     try buf.appendSlice(allocator, ">");
                 }
+            },
+            .array_type => |at| {
+                try at.element_type.*.formatArrayList(buf, allocator);
+                try buf.appendSlice(allocator, "[");
+                if (at.size) |s| {
+                    try buf.print(allocator, "{}", .{s});
+                }
+                try buf.appendSlice(allocator, "]");
             },
             .throw_type => |tt| {
                 try buf.appendSlice(allocator, "Throw<");
@@ -554,10 +632,18 @@ pub const TypeInferencer = struct {
         return t;
     }
 
-    /// 创建基本类型
-    pub fn makeType(self: *TypeInferencer, comptime tag: @TypeOf(Type.int_type)) !*Type {
+    /// 创建基本类型（void tag，如 .i32_type, .bool_type 等）
+    pub fn makeType(self: *TypeInferencer, comptime tag: @TypeOf(Type.i32_type)) !*Type {
         const t = try self.allocator.create(Type);
         t.* = tag;
+        try self.types.append(self.allocator, t);
+        return t;
+    }
+
+    /// 创建数组类型：T[N] 或 T[]
+    pub fn makeArrayType(self: *TypeInferencer, element_type: *Type, size: ?u64) !*Type {
+        const t = try self.allocator.create(Type);
+        t.* = Type{ .array_type = .{ .element_type = element_type, .size = size } };
         try self.types.append(self.allocator, t);
         return t;
     }
@@ -890,6 +976,21 @@ pub const TypeInferencer = struct {
                 try self.types.append(self.allocator, t);
                 return t;
             },
+            .array_type => |at| {
+                const new_elem = try self.applySubst(at.element_type, subst);
+                return self.makeArrayType(new_elem, at.size);
+            },
+            .generic_type => |gt| {
+                if (gt.args.len == 0) return resolved;
+                var new_args = try self.allocator.alloc(*Type, gt.args.len);
+                for (gt.args, 0..) |arg, i| {
+                    new_args[i] = try self.applySubst(arg, subst);
+                }
+                const t = try self.allocator.create(Type);
+                t.* = Type{ .generic_type = .{ .name = gt.name, .args = new_args } };
+                try self.types.append(self.allocator, t);
+                return t;
+            },
             else => return resolved,
         }
     }
@@ -901,11 +1002,11 @@ pub const TypeInferencer = struct {
     /// 推断表达式的类型
     pub fn inferExpr(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv) SemaError!*Type {
         return switch (expr.*) {
-            .int_literal => self.makeType(.int_type),
-            .float_literal => self.makeType(.float_type),
+            .int_literal => self.makeType(.i32_type),
+            .float_literal => self.makeType(.f64_type),
             .bool_literal => self.makeType(.bool_type),
             .char_literal => self.makeType(.char_type),
-            .string_literal => self.makeType(.string_type),
+            .string_literal => self.makeType(.str_type),
             .null_literal => {
                 // null 的类型由上下文决定：统一为 T? 时自动收窄
                 const tv = try self.freshTypeVar();
@@ -939,15 +1040,15 @@ pub const TypeInferencer = struct {
                         return self.makeType(.bool_type);
                     },
                     .concat => {
-                        try self.unify(left_ty, try self.makeType(.string_type));
-                        try self.unify(right_ty, try self.makeType(.string_type));
-                        return self.makeType(.string_type);
+                        try self.unify(left_ty, try self.makeType(.str_type));
+                        try self.unify(right_ty, try self.makeType(.str_type));
+                        return self.makeType(.str_type);
                     },
                     .range, .range_inclusive => {
-                        try self.unify(left_ty, try self.makeType(.int_type));
-                        try self.unify(right_ty, try self.makeType(.int_type));
+                        try self.unify(left_ty, try self.makeType(.i32_type));
+                        try self.unify(right_ty, try self.makeType(.i32_type));
                         // Range 类型不是独立类型，元素类型由推断决定
-                        return self.makeType(.int_type);
+                        return self.makeType(.i32_type);
                     },
                     .elvis => {
                         // ?? 运算符：左操作数为 T?，右操作数为 T
@@ -1162,12 +1263,12 @@ pub const TypeInferencer = struct {
                 const obj_ty = try self.inferExpr(idx.object, env);
                 const idx_ty = try self.inferExpr(idx.index, env);
                 _ = obj_ty;
-                try self.unify(idx_ty, try self.makeType(.int_type));
+                try self.unify(idx_ty, try self.makeType(.i32_type));
                 return self.freshTypeVar();
             },
 
             .string_interpolation => {
-                return self.makeType(.string_type);
+                return self.makeType(.str_type);
             },
 
             .type_cast => |tc| {
@@ -1195,6 +1296,13 @@ pub const TypeInferencer = struct {
                     self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{vd.name});
                 } else {
                     const val_ty = try self.inferExpr(vd.value, env);
+                    // 验证类型注解
+                    if (vd.type_annotation) |ta| {
+                        const annot_ty = self.typeFromAstWithParams(ta, null) catch null;
+                        if (annot_ty) |at| {
+                            _ = self.unify(at, val_ty) catch {};
+                        }
+                    }
                     const scheme = try self.generalize(env, val_ty);
                     if (!(try env.defineOrReport(vd.name, scheme))) {
                         self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
@@ -1207,6 +1315,13 @@ pub const TypeInferencer = struct {
                     self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{vd.name});
                 } else {
                     const val_ty = try self.inferExpr(vd.value, env);
+                    // 验证类型注解
+                    if (vd.type_annotation) |ta| {
+                        const annot_ty = self.typeFromAstWithParams(ta, null) catch null;
+                        if (annot_ty) |at| {
+                            _ = self.unify(at, val_ty) catch {};
+                        }
+                    }
                     const scheme = try self.generalize(env, val_ty);
                     if (!(try env.defineOrReport(vd.name, scheme))) {
                         self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
@@ -1307,23 +1422,24 @@ pub const TypeInferencer = struct {
     pub fn typeFromAstWithParams(self: *TypeInferencer, type_node: *const ast.TypeNode, type_param_map: ?*const std.StringHashMap(*Type)) SemaError!*Type {
         switch (type_node.*) {
             .named => |n| {
-                if (std.mem.eql(u8, n.name, "i32") or std.mem.eql(u8, n.name, "i64") or
-                    std.mem.eql(u8, n.name, "i16") or std.mem.eql(u8, n.name, "i8"))
-                {
-                    return self.makeType(.int_type);
-                }
-                if (std.mem.eql(u8, n.name, "f64") or std.mem.eql(u8, n.name, "f32")) {
-                    return self.makeType(.float_type);
-                }
-                if (std.mem.eql(u8, n.name, "bool")) {
-                    return self.makeType(.bool_type);
-                }
-                if (std.mem.eql(u8, n.name, "String") or std.mem.eql(u8, n.name, "string")) {
-                    return self.makeType(.string_type);
-                }
-                if (std.mem.eql(u8, n.name, "char")) {
-                    return self.makeType(.char_type);
-                }
+                // 整数类型映射
+                if (std.mem.eql(u8, n.name, "i8")) return self.makeType(.i8_type);
+                if (std.mem.eql(u8, n.name, "i16")) return self.makeType(.i16_type);
+                if (std.mem.eql(u8, n.name, "i32")) return self.makeType(.i32_type);
+                if (std.mem.eql(u8, n.name, "i64")) return self.makeType(.i64_type);
+                if (std.mem.eql(u8, n.name, "i128")) return self.makeType(.i128_type);
+                if (std.mem.eql(u8, n.name, "u8")) return self.makeType(.u8_type);
+                if (std.mem.eql(u8, n.name, "u16")) return self.makeType(.u16_type);
+                if (std.mem.eql(u8, n.name, "u32")) return self.makeType(.u32_type);
+                if (std.mem.eql(u8, n.name, "u64")) return self.makeType(.u64_type);
+                if (std.mem.eql(u8, n.name, "u128")) return self.makeType(.u128_type);
+                // 浮点类型映射
+                if (std.mem.eql(u8, n.name, "f32")) return self.makeType(.f32_type);
+                if (std.mem.eql(u8, n.name, "f64")) return self.makeType(.f64_type);
+                // 其他基本类型
+                if (std.mem.eql(u8, n.name, "bool")) return self.makeType(.bool_type);
+                if (std.mem.eql(u8, n.name, "str")) return self.makeType(.str_type);
+                if (std.mem.eql(u8, n.name, "char")) return self.makeType(.char_type);
                 // 查找类型参数映射（泛型 ADT 构造器中的 T 等）
                 if (type_param_map) |tpm| {
                     if (tpm.get(n.name)) |ty| {
@@ -1350,6 +1466,13 @@ pub const TypeInferencer = struct {
                         return t;
                     }
                 }
+                // 检查是否为已注册的泛型 ADT
+                if (self.adt_types.get(g.name)) |adt_info| {
+                    if (adt_info.type_param_names.len > 0) {
+                        return self.makeAdtType(g.name, args);
+                    }
+                }
+                self.addError(.type_mismatch, "undefined type '{s}'", .{g.name});
                 return self.makeAdtType(g.name, args);
             },
             .nullable => |n| {
@@ -1376,6 +1499,10 @@ pub const TypeInferencer = struct {
                 t.* = Type{ .record_type = .{ .fields = fields } };
                 try self.types.append(self.allocator, t);
                 return t;
+            },
+            .array => |a| {
+                const elem = try self.typeFromAstWithParams(a.element_type, type_param_map);
+                return self.makeArrayType(elem, a.size);
             },
             .kind_annotated => |ka| {
                 return self.typeFromAstWithParams(ka.inner, type_param_map);
@@ -1467,7 +1594,7 @@ pub const TypeInferencer = struct {
         // Panic : (String) -> !
         {
             const params = self.allocator.alloc(*Type, 1) catch return;
-            params[0] = self.makeType(.string_type) catch return;
+            params[0] = self.makeType(.str_type) catch return;
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
             env.define("Panic", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
             self.registerBuiltinName("Panic");
@@ -1491,11 +1618,11 @@ pub const TypeInferencer = struct {
             const param = self.freshTypeVar() catch return;
             const params = self.allocator.alloc(*Type, 1) catch return;
             params[0] = param;
-            const fn_ty = self.makeFnType(params, self.makeType(.string_type) catch return) catch return;
+            const fn_ty = self.makeFnType(params, self.makeType(.str_type) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("string", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("string");
+            env.define("str", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("str");
         }
 
         // Error ADT 类型（用于 Throw<T, Error> 中的 Error 类型参数）
@@ -1507,7 +1634,7 @@ pub const TypeInferencer = struct {
         {
             const val_ty = self.freshTypeVar() catch return;
             const params = self.allocator.alloc(*Type, 1) catch return;
-            params[0] = self.makeType(.string_type) catch return;
+            params[0] = self.makeType(.str_type) catch return;
             const throw_ty = self.allocator.create(Type) catch return;
             throw_ty.* = Type{ .throw_type = .{ .value_type = val_ty, .error_type = error_adt_ty } };
             self.types.append(self.allocator, throw_ty) catch return;
@@ -1535,45 +1662,30 @@ pub const TypeInferencer = struct {
 
         // 数值类型转换函数：Type(value) 显式转换
         // 文档 2.15: i8(), i16(), i32(), i64(), i128(), u8(), u16(), u32(), u64(), u128(), f32(), f64()
-        // 当前类型系统只有 int_type(i32) 和 float_type(f64)，其余类型系统支持后完善
-        {
-            // i32 : forall a. (a) -> i32
+        // 签名: forall a. (a) -> TargetType
+        const numeric_casts = .{
+            .{ "i8", Type.i8_type },
+            .{ "i16", Type.i16_type },
+            .{ "i32", Type.i32_type },
+            .{ "i64", Type.i64_type },
+            .{ "i128", Type.i128_type },
+            .{ "u8", Type.u8_type },
+            .{ "u16", Type.u16_type },
+            .{ "u32", Type.u32_type },
+            .{ "u64", Type.u64_type },
+            .{ "u128", Type.u128_type },
+            .{ "f32", Type.f32_type },
+            .{ "f64", Type.f64_type },
+        };
+        inline for (numeric_casts) |cast| {
             const param = self.freshTypeVar() catch return;
             const params = self.allocator.alloc(*Type, 1) catch return;
             params[0] = param;
-            const fn_ty = self.makeFnType(params, self.makeType(.int_type) catch return) catch return;
+            const fn_ty = self.makeFnType(params, self.makeType(cast[1]) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("i32", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("i32");
-        }
-        {
-            // f64 : forall a. (a) -> f64
-            const param = self.freshTypeVar() catch return;
-            const params = self.allocator.alloc(*Type, 1) catch return;
-            params[0] = param;
-            const fn_ty = self.makeFnType(params, self.makeType(.float_type) catch return) catch return;
-            const qvars = self.allocator.alloc(usize, 1) catch return;
-            qvars[0] = param.type_var.id;
-            env.define("f64", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("f64");
-        }
-        // 其余数值类型转换函数：暂注册为占位（类型系统支持后完善）
-        // 禁止用户遮蔽这些名称
-        inline for (&.{
-            "i8", "i16", "i64", "i128",
-            "u8", "u16", "u32", "u64", "u128",
-            "f32",
-        }) |name| {
-            // 占位注册：forall a. (a) -> a（类型系统完善后改为具体类型）
-            const param = self.freshTypeVar() catch return;
-            const params = self.allocator.alloc(*Type, 1) catch return;
-            params[0] = param;
-            const fn_ty = self.makeFnType(params, param) catch return;
-            const qvars = self.allocator.alloc(usize, 1) catch return;
-            qvars[0] = param.type_var.id;
-            env.define(name, TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName(name);
+            env.define(cast[0], TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName(cast[0]);
         }
     }
 
@@ -1892,7 +2004,7 @@ pub const TypeInferencer = struct {
                         // 文档 2.4.2: Name 是 Error 的子类型——FileError <: Error
                         const error_adt = self.makeAdtType(en.name, &[_]*Type{}) catch return;
                         const ctor_params = self.allocator.alloc(*Type, 1) catch return;
-                        ctor_params[0] = self.makeType(.string_type) catch return;
+                        ctor_params[0] = self.makeType(.str_type) catch return;
                         const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
                         const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
                         if (self.isBuiltinName(en.name)) {

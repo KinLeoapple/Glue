@@ -1186,21 +1186,48 @@ pub const Parser = struct {
             }
             _ = self.expect(.gt, "期望 '>' 关闭类型参数") catch {};
 
-            return self.allocType(ast.TypeNode{
+            const generic_ty = try self.allocType(ast.TypeNode{
                 .generic = .{
                     .location = location,
                     .name = name_tok.lexeme,
                     .args = try args.toOwnedSlice(self.allocator),
                 },
             });
+
+            // 泛型类型后不支持 []，直接返回
+            return generic_ty;
         }
 
-        return self.allocType(ast.TypeNode{
+        var ty = try self.allocType(ast.TypeNode{
             .named = .{
                 .location = location,
                 .name = name_tok.lexeme,
             },
         });
+
+        // 支持 T[N] 和 T[] 数组类型语法
+        while (self.matchToken(.l_bracket)) {
+            const arr_location = tokenLoc(name_tok);
+            var size: ?u64 = null;
+            if (!self.check(.r_bracket)) {
+                // 解析大小表达式（必须是整数）
+                const size_tok = try self.expect(.int_literal, "期望数组大小");
+                size = std.fmt.parseInt(u64, size_tok.lexeme, 10) catch {
+                    try self.reportError("数组大小必须是正整数");
+                    return error.UnexpectedToken;
+                };
+            }
+            _ = self.expect(.r_bracket, "期望 ']'") catch {};
+            ty = try self.allocType(ast.TypeNode{
+                .array = .{
+                    .location = arr_location,
+                    .element_type = ty,
+                    .size = size,
+                },
+            });
+        }
+
+        return ty;
     }
 
     fn parseRecordType(self: *Parser) ParserError!*ast.TypeNode {
@@ -2963,6 +2990,7 @@ fn getTypeNodeLocation(ty: *const ast.TypeNode) ast.SourceLocation {
         .nullable => |n| n.location,
         .function => |f| f.location,
         .record => |r| r.location,
+        .array => |a| a.location,
         .kind_annotated => |k| k.location,
     };
 }
@@ -3011,7 +3039,7 @@ fn isBuiltinType(name: []const u8) bool {
         "i8",   "i16",  "i32",  "i64",  "i128",
         "u8",   "u16",  "u32",  "u64",  "u128",
         "f32",  "f64",
-        "bool", "string",
+        "bool", "str",
     };
     for (builtin_types) |bt| {
         if (std.mem.eql(u8, name, bt)) return true;
