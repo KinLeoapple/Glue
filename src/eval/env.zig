@@ -80,6 +80,16 @@ pub const Environment = struct {
         return null;
     }
 
+    pub fn getPtr(self: *Environment, name: []const u8) ?*Variable {
+        if (self.values.getPtr(name)) |v| {
+            return v;
+        }
+        if (self.parent) |p| {
+            return p.getPtr(name);
+        }
+        return null;
+    }
+
     pub fn set(self: *Environment, name: []const u8, val: value.Value) !void {
         if (self.values.getPtr(name)) |v| {
             if (!v.is_mutable) {

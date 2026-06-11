@@ -509,6 +509,8 @@ pub const TypeInferencer = struct {
     registered_impls: std.StringHashMap(ImplRecord),
     /// 内建函数/构造器名称集合（用于禁止用户遮蔽内建定义）
     builtin_names: std.StringHashMap(void),
+    /// 用于 analyzeNullCheck 中翻转 is_non_null 的临时缓冲
+    narrowing_buf: [4]NarrowingInfo = undefined,
 
     pub fn init(allocator: std.mem.Allocator) TypeInferencer {
         return TypeInferencer{
@@ -773,6 +775,9 @@ pub const TypeInferencer = struct {
                 // 声明返回 T?，推断为 T → 将 T 统一到 T? 的内部类型
                 switch (resolved_inferred.*) {
                     .nullable_type => try self.unify(declared, inferred),
+                    .unit_type => {
+                        // Function body is all throws/defer, return type T? is OK
+                    },
                     else => try self.unify(inner, inferred),
                 }
             },
@@ -780,6 +785,9 @@ pub const TypeInferencer = struct {
                 // 声明返回 Throw<T, E>，推断为 T → 将 T 统一到 Throw 的 value_type
                 switch (resolved_inferred.*) {
                     .throw_type => try self.unify(declared, inferred),
+                    .unit_type => {
+                        // Function body is all throws/defer, return type Throw<T, E> is OK
+                    },
                     else => try self.unify(tt.value_type, inferred),
                 }
             },
@@ -996,6 +1004,192 @@ pub const TypeInferencer = struct {
     }
 
     // ============================================================
+    // Nullable 类型收窄（flow typing）
+    // ============================================================
+
+    /// 收窄信息：变量名 + 是否为非空
+    const NarrowingInfo = struct {
+        name: []const u8,
+        is_non_null: bool,
+    };
+
+    /// 分析条件表达式中的 null 检查
+    /// 返回收窄信息列表：
+    /// - `x != null` → [("x", true)]  （then 分支中 x 为非空）
+    /// - `x == null` → [("x", false)] （else 分支中 x 为非空）
+    /// - 复合条件 `&&` → 合并两侧的收窄信息
+    fn analyzeNullCheck(self: *TypeInferencer, cond: *const ast.Expr) []const NarrowingInfo {
+        switch (cond.*) {
+            .binary => |bin| {
+                switch (bin.op) {
+                    .not_eq => {
+                        // expr != null → then 分支中 expr 非空
+                        if (self.isNullLiteral(bin.right)) {
+                            if (self.getIdentifierName(bin.left)) |name| {
+                                return &[_]NarrowingInfo{.{ .name = name, .is_non_null = true }};
+                            }
+                        }
+                        // null != expr → 同上
+                        if (self.isNullLiteral(bin.left)) {
+                            if (self.getIdentifierName(bin.right)) |name| {
+                                return &[_]NarrowingInfo{.{ .name = name, .is_non_null = true }};
+                            }
+                        }
+                    },
+                    .eq => {
+                        // expr == null → else 分支中 expr 非空
+                        if (self.isNullLiteral(bin.right)) {
+                            if (self.getIdentifierName(bin.left)) |name| {
+                                return &[_]NarrowingInfo{.{ .name = name, .is_non_null = false }};
+                            }
+                        }
+                        // null == expr → 同上
+                        if (self.isNullLiteral(bin.left)) {
+                            if (self.getIdentifierName(bin.right)) |name| {
+                                return &[_]NarrowingInfo{.{ .name = name, .is_non_null = false }};
+                            }
+                        }
+                    },
+                    .and_op => {
+                        // a && b → 合并两侧的收窄信息
+                        const left_narrowings = self.analyzeNullCheck(bin.left);
+                        const right_narrowings = self.analyzeNullCheck(bin.right);
+                        // 简单合并：左侧 + 右侧
+                        // 注意：这返回的是栈上临时切片，仅在当前调用栈有效
+                        // 对于 && 短路，两侧的收窄在 then 分支都成立
+                        if (left_narrowings.len == 0) return right_narrowings;
+                        if (right_narrowings.len == 0) return left_narrowings;
+                        // 两边都有收窄信息时，只返回左侧（简化处理，避免动态分配）
+                        return left_narrowings;
+                    },
+                    else => {},
+                }
+            },
+            .unary => |un| {
+                switch (un.op) {
+                    .not => {
+                        // !(x == null) → then 分支中 x 非空，等价于 x != null
+                        const inner = self.analyzeNullCheck(un.operand);
+                        if (inner.len == 1) {
+                            // 翻转 is_non_null
+                            self.narrowing_buf[0] = .{ .name = inner[0].name, .is_non_null = !inner[0].is_non_null };
+                            return self.narrowing_buf[0..1];
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+        return &[_]NarrowingInfo{};
+    }
+
+    /// 检查表达式是否为 null 字面量
+    fn isNullLiteral(self: *TypeInferencer, expr: *const ast.Expr) bool {
+        _ = self;
+        return switch (expr.*) {
+            .null_literal => true,
+            .identifier => |id| std.mem.eql(u8, id.name, "null"),
+            else => false,
+        };
+    }
+
+    /// 提取标识符名称（仅当表达式为简单标识符时）
+    fn getIdentifierName(self: *TypeInferencer, expr: *const ast.Expr) ?[]const u8 {
+        _ = self;
+        return switch (expr.*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+    }
+
+    /// 在子环境中应用收窄：将 T? 绑定收窄为 T
+    fn applyNarrowing(self: *TypeInferencer, env: *TypeEnv, narrowings: []const NarrowingInfo, want_non_null: bool) void {
+        for (narrowings) |n| {
+            if (n.is_non_null == want_non_null) {
+                if (env.lookup(n.name)) |scheme| {
+                    const resolved = self.resolve(scheme.ty);
+                    if (resolved.* == .nullable_type) {
+                        const narrowed_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = resolved.nullable_type };
+                        env.define(n.name, narrowed_scheme) catch {};
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to unify two types with auto-widening support
+    /// - T and T? → unify T with inner, return T?
+    /// - T? and T → unify inner with T, return T?
+    /// - T and Throw<T', E> → unify T with T', return Throw<T', E>
+    /// Falls back to regular unify if no widening applies
+    fn tryWidenUnify(self: *TypeInferencer, t1: *Type, t2: *Type) SemaError!*Type {
+        const r1 = self.resolve(t1);
+        const r2 = self.resolve(t2);
+
+        // Try direct unification first
+        if (self.unify(r1, r2)) {
+            return r1;
+        } else |_| {
+            // Try auto-widening
+            switch (r1.*) {
+                .nullable_type => |inner1| {
+                    switch (r2.*) {
+                        .nullable_type => {
+                            // Both nullable but inner types don't match - propagate error
+                            return error.TypeMismatch;
+                        },
+                        .unit_type => {
+                            // () is compatible with T? (e.g., function body is all throws)
+                            return r1;
+                        },
+                        else => {
+                            // t1 is T?, t2 is non-nullable → try unify inner with t2
+                            self.unify(inner1, r2) catch return error.TypeMismatch;
+                            return r1; // Return T?
+                        },
+                    }
+                },
+                .throw_type => |tt1| {
+                    switch (r2.*) {
+                        .throw_type => return error.TypeMismatch,
+                        .unit_type => {
+                            // () is compatible with Throw<T, E> (function body is all throws)
+                            return r1;
+                        },
+                        else => {
+                            // t1 is Throw<T, E>, t2 is T → try unify value_type with t2
+                            self.unify(tt1.value_type, r2) catch return error.TypeMismatch;
+                            return r1;
+                        },
+                    }
+                },
+                .unit_type => {
+                    switch (r2.*) {
+                        .nullable_type, .throw_type => return r2,
+                        else => return error.TypeMismatch,
+                    }
+                },
+                else => {
+                    switch (r2.*) {
+                        .nullable_type => |inner2| {
+                            // t1 is non-nullable, t2 is T? → try unify t1 with inner
+                            self.unify(r1, inner2) catch return error.TypeMismatch;
+                            return r2; // Return T?
+                        },
+                        .throw_type => |tt2| {
+                            // t1 is non-nullable, t2 is Throw<T', E> → try unify t1 with T'
+                            self.unify(r1, tt2.value_type) catch return error.TypeMismatch;
+                            return r2; // Return Throw<T', E>
+                        },
+                        else => return error.TypeMismatch,
+                    }
+                },
+            }
+        }
+    }
+
+    // ============================================================
     // 类型推断（Algorithm W）
     // ============================================================
 
@@ -1097,17 +1291,50 @@ pub const TypeInferencer = struct {
                     arg_types[i] = try self.inferExpr(arg, env);
                 }
                 const expected_fn_ty = try self.makeFnType(arg_types, ret_ty);
-                try self.unify(callee_ty, expected_fn_ty);
-                return ret_ty;
+                // 先尝试直接统一
+                if (self.unify(callee_ty, expected_fn_ty)) {
+                    return ret_ty;
+                } else |_| {
+                    // 尝试参数自动提升：T 传给 T? 参数，T 传给 Throw<T, E> 参数
+                    const resolved_callee = self.resolve(callee_ty);
+                    switch (resolved_callee.*) {
+                        .fn_type => |ft| {
+                            if (ft.params.len == arg_types.len) {
+                                var all_ok = true;
+                                for (ft.params, arg_types) |param_ty, arg_ty| {
+                                    _ = self.tryWidenUnify(param_ty, arg_ty) catch {
+                                        all_ok = false;
+                                        break;
+                                    };
+                                }
+                                if (all_ok) return ft.return_type;
+                            }
+                        },
+                        else => {},
+                    }
+                    return error.TypeMismatch;
+                }
             },
 
             .if_expr => |ie| {
                 const cond_ty = try self.inferExpr(ie.condition, env);
                 try self.unify(cond_ty, try self.makeType(.bool_type));
-                const then_ty = try self.inferExpr(ie.then_branch, env);
+
+                // 分析条件中的 null 检查，获取收窄信息
+                const narrowings = self.analyzeNullCheck(ie.condition);
+
+                // Then 分支：应用 is_non_null == true 的收窄
+                const then_env = try env.createChild();
+                self.applyNarrowing(then_env, narrowings, true);
+                const then_ty = try self.inferExpr(ie.then_branch, then_env);
+
                 if (ie.else_branch) |else_br| {
-                    const else_ty = try self.inferExpr(else_br, env);
-                    try self.unify(then_ty, else_ty);
+                    // Else 分支：应用 is_non_null == false 的收窄（即条件取反时非空）
+                    const else_env = try env.createChild();
+                    self.applyNarrowing(else_env, narrowings, false);
+                    const else_ty = try self.inferExpr(else_br, else_env);
+                    const unified = try self.tryWidenUnify(then_ty, else_ty);
+                    return unified;
                 }
                 return then_ty;
             },
@@ -1126,13 +1353,33 @@ pub const TypeInferencer = struct {
 
             .match => |m| {
                 const scrutinee_ty = try self.inferExpr(m.scrutinee, env);
+                const resolved_scrutinee = self.resolve(scrutinee_ty);
+
+                // 如果 scrutinee 是 T?，提取内部类型 T 用于非 null 分支的收窄
+                const nullable_inner: ?*Type = switch (resolved_scrutinee.*) {
+                    .nullable_type => |inner| inner,
+                    else => null,
+                };
+
                 var result_ty: ?*Type = null;
                 for (m.arms) |arm| {
                     const child_env = try env.createChild();
-                    try self.inferPattern(arm.pattern, scrutinee_ty, child_env);
+
+                    // 判断当前 arm 是否匹配 null
+                    const arm_matches_null = self.patternCoversNull(arm.pattern);
+
+                    // 如果 scrutinee 是 T? 且当前 arm 不匹配 null，
+                    // 则变量绑定应收窄为 T（而非 T?）
+                    const pattern_ty: *Type = if (nullable_inner) |inner|
+                        if (arm_matches_null) scrutinee_ty else inner
+                    else
+                        scrutinee_ty;
+
+                    try self.inferPattern(arm.pattern, pattern_ty, child_env);
                     const body_ty = try self.inferExpr(arm.body, child_env);
                     if (result_ty) |rt| {
-                        try self.unify(rt, body_ty);
+                        const unified = try self.tryWidenUnify(rt, body_ty);
+                        result_ty = unified;
                     } else {
                         result_ty = body_ty;
                     }
@@ -1295,17 +1542,55 @@ pub const TypeInferencer = struct {
                 if (self.isBuiltinName(vd.name)) {
                     self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{vd.name});
                 } else {
-                    const val_ty = try self.inferExpr(vd.value, env);
-                    // 验证类型注解
-                    if (vd.type_annotation) |ta| {
-                        const annot_ty = self.typeFromAstWithParams(ta, null) catch null;
-                        if (annot_ty) |at| {
-                            _ = self.unify(at, val_ty) catch {};
+                    // 如果值是 lambda，先注册函数类型到环境以支持递归调用
+                    if (vd.value.* == .lambda) {
+                        const lam = vd.value.*.lambda;
+                        const child_env = try env.createChild();
+                        var param_types = try self.allocator.alloc(*Type, lam.params.len);
+                        for (lam.params, 0..) |param, i| {
+                            const param_ty = if (param.type_annotation) |ta|
+                                try self.typeFromAst(ta)
+                            else
+                                try self.freshTypeVar();
+                            param_types[i] = param_ty;
+                            const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = param_ty };
+                            try child_env.define(param.name, scheme);
                         }
-                    }
-                    const scheme = try self.generalize(env, val_ty);
-                    if (!(try env.defineOrReport(vd.name, scheme))) {
-                        self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
+                        const ret_ty = if (vd.type_annotation) |ta|
+                            try self.typeFromAst(ta)
+                        else
+                            try self.freshTypeVar();
+                        const fn_ty = try self.makeFnType(param_types, ret_ty);
+                        // 先注册到环境（支持递归调用）
+                        const fn_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
+                        try child_env.define(vd.name, fn_scheme);
+
+                        // 推断 lambda 体
+                        const body_ty = switch (lam.body) {
+                            .block => |body| try self.inferExpr(body, child_env),
+                            .expression => |e| try self.inferExpr(e, child_env),
+                        };
+                        // 统一返回类型
+                        _ = self.tryWidenUnify(ret_ty, body_ty) catch {};
+
+                        // 注册到外层环境
+                        const final_scheme = try self.generalize(env, fn_ty);
+                        if (!(try env.defineOrReport(vd.name, final_scheme))) {
+                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
+                        }
+                    } else {
+                        const val_ty = try self.inferExpr(vd.value, env);
+                        // 验证类型注解
+                        if (vd.type_annotation) |ta| {
+                            const annot_ty = self.typeFromAstWithParams(ta, null) catch null;
+                            if (annot_ty) |at| {
+                                _ = self.tryWidenUnify(at, val_ty) catch {};
+                            }
+                        }
+                        const scheme = try self.generalize(env, val_ty);
+                        if (!(try env.defineOrReport(vd.name, scheme))) {
+                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
+                        }
                     }
                 }
                 return null;
@@ -1319,7 +1604,7 @@ pub const TypeInferencer = struct {
                     if (vd.type_annotation) |ta| {
                         const annot_ty = self.typeFromAstWithParams(ta, null) catch null;
                         if (annot_ty) |at| {
-                            _ = self.unify(at, val_ty) catch {};
+                            _ = self.tryWidenUnify(at, val_ty) catch {};
                         }
                     }
                     const scheme = try self.generalize(env, val_ty);
@@ -1488,6 +1773,8 @@ pub const TypeInferencer = struct {
                 return self.makeFnType(params, ret);
             },
             .record => |r| {
+                // Empty record type () = unit type
+                if (r.fields.len == 0) return self.makeType(.unit_type);
                 var fields = try self.allocator.alloc(FieldType, r.fields.len);
                 for (r.fields, 0..) |f, i| {
                     fields[i] = FieldType{
@@ -1961,8 +2248,55 @@ pub const TypeInferencer = struct {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{td.name});
                         }
                     },
-                    .alias => {
-                        // 类型别名：不创建新类型
+                    .alias => |ta| {
+                        // 类型别名：type IntList = List<i32>
+                        // 文档 2.14: Type Alias 不创建新类型
+                        // 在类型环境中注册别名，使其在类型注解中可用
+                        var type_param_map = std.StringHashMap(*Type).init(self.allocator);
+                        defer type_param_map.deinit();
+                        var type_param_ids = std.ArrayList(usize).empty;
+                        defer type_param_ids.deinit(self.allocator);
+
+                        for (td.type_params) |tp| {
+                            const tv = self.freshTypeVar() catch return;
+                            type_param_map.put(tp.name, tv) catch return;
+                            type_param_ids.append(self.allocator, tv.type_var.id) catch return;
+                        }
+
+                        // 解析目标类型
+                        const target_ty = self.typeFromAstWithParams(ta.target, &type_param_map) catch {
+                            self.addError(.type_mismatch, "invalid target type in alias '{s}'", .{td.name});
+                            return;
+                        };
+
+                        // 注册别名为类型方案（与目标类型等价）
+                        const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
+                        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = target_ty };
+                        if (self.isBuiltinName(td.name)) {
+                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
+                        } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
+                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{td.name});
+                        }
+
+                        // 同时注册到 adt_types 中作为别名（用于 typeFromAst 解析泛型别名）
+                        if (td.type_params.len > 0) {
+                            const key = self.allocator.dupe(u8, td.name) catch return;
+                            var type_param_names = std.ArrayList([]const u8).empty;
+                            defer type_param_names.deinit(self.allocator);
+                            for (td.type_params) |tp| {
+                                const name_copy = self.allocator.dupe(u8, tp.name) catch return;
+                                type_param_names.append(self.allocator, name_copy) catch return;
+                            }
+                            const owned_type_param_names = type_param_names.toOwnedSlice(self.allocator) catch return;
+                            if (!self.adt_types.contains(td.name)) {
+                                self.adt_types.put(key, AdtInfo{
+                                    .ty = target_ty,
+                                    .constructor_names = &[_][]const u8{},
+                                    .type_param_names = owned_type_param_names,
+                                    .defining_module = self.current_module,
+                                }) catch return;
+                            }
+                        }
                     },
                     .newtype => |nt| {
                         // newtype 构造器类型：inner -> newtype

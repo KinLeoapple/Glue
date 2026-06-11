@@ -495,3 +495,1270 @@ fun chain2(): i32? {
     b + 1
 }
 println(chain2())
+
+// ============================================================
+// 42. Nullable 类型收窄 — if 分支
+// ============================================================
+
+// if 收窄：在 then 分支中 s 被收窄为 str
+fun length(s: str?): i32 {
+    if (s != null) { s.len() } else { 0 }
+}
+println(length("hello"))
+println(length(null))
+
+// ============================================================
+// 43. Nullable 类型收窄 — match 分支
+// ============================================================
+
+fun describe(n: i32?): str {
+    match n {
+        null => "nothing"
+        x => "got " + str(x)
+    }
+}
+println(describe(null))
+println(describe(42))
+
+// ============================================================
+// 44. Nullable — 链式 ?.
+// ============================================================
+
+type Address = Address(city: str)
+type User = User(name: str, addr: Address?)
+val u1: User? = User("Alice", Address("Beijing"))
+val u2: User? = null
+
+println(u1?.name)
+println(u1?.addr?.city)
+println(u2?.name)
+
+// ============================================================
+// 45. Nullable — 链式 ??
+// ============================================================
+
+val a1: i32? = null
+val a2: i32? = null
+val a3: i32? = 42
+
+val chain_elvis = a1 ?? a2 ?? a3 ?? 0
+println(chain_elvis)
+
+val chain_elvis2 = a1 ?? a2 ?? 99
+println(chain_elvis2)
+
+// ============================================================
+// 46. 所有整数类型
+// ============================================================
+
+val v_i8: i8 = 127
+val v_i16: i16 = 32767
+val v_i32: i32 = 2147483647
+val v_i64: i64 = 9999999999i64
+val v_i128: i128 = 999999999999999999i128
+
+val v_u8: u8 = 255
+val v_u16: u16 = 65535
+val v_u32: u32 = 4294967295u32
+val v_u64: u64 = 9999999999u64
+val v_u128: u128 = 999999999999999999u128
+
+println(v_i8)
+println(v_i16)
+println(v_i32)
+println(v_i64)
+println(v_i128)
+println(v_u8)
+println(v_u16)
+println(v_u32)
+println(v_u64)
+println(v_u128)
+
+// ============================================================
+// 47. 浮点类型 f32 / f64
+// ============================================================
+
+val f32_val: f32 = 3.14
+val f64_val: f64 = 2.718281828
+println(f32_val)
+println(f64_val)
+
+// 浮点类型后缀
+val f32_lit: f32 = 1.5
+val f64_lit: f64 = 2.5
+println(f32_lit)
+println(f64_lit)
+
+// ============================================================
+// 48. 类型转换 — narrowing 运行时检查
+// ============================================================
+
+// widening: 小类型到大类型
+val i8_to_i32 = i32(v_i8)
+val i32_to_i64 = i64(v_i32)
+val i32_to_f64 = f64(v_i32)
+println(i8_to_i32)
+println(i32_to_i64)
+println(i32_to_f64)
+
+// narrowing: 大类型到小类型（合法范围内）
+val small_i64: i64 = 100
+val i64_to_i32 = i32(small_i64)
+println(i64_to_i32)
+
+// bool 与整数互转（bool→int 暂未实现，仅测试 int→bool 相关逻辑）
+// val bool_to_i32 = i32(true)
+
+// ============================================================
+// 49. Type Alias
+// ============================================================
+
+type IntList = List<i32>
+type Name = str
+
+val names: IntList = Cons(1, Cons(2, Nil))
+println(listSum(names))
+
+val my_name: Name = "Glue"
+println(my_name)
+
+// ============================================================
+// 50. Error 子类型验证
+// ============================================================
+
+type NetworkError = Error("network error")
+
+// 自定义错误类型可以赋值给 Error 类型的变量
+fun handleErrors(x: i32): Throw<i32, Error> {
+    if (x == 1) {
+        throw FileError("file not found")
+    }
+    if (x == 2) {
+        throw NetworkError("connection refused")
+    }
+    Ok(x)
+}
+
+val err1 = match handleErrors(1) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(err1)
+
+val err2 = match handleErrors(2) {
+    Ok(v) => v
+    Error(e) => -2
+}
+println(err2)
+
+val err3 = match handleErrors(3) {
+    Ok(v) => v
+    Error(e) => -3
+}
+println(err3)
+
+// ============================================================
+// 51. defer 覆盖 throw 路径
+// ============================================================
+
+var defer_throw_flag = 0
+fun throwsWithDefer(): Throw<i32, Error> {
+    defer defer_throw_flag = 42
+    throw Error("oops")
+}
+
+val throw_result = match throwsWithDefer() {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(throw_result)
+println(defer_throw_flag)
+
+// ============================================================
+// 52. 动态数组 T[] 操作
+// ============================================================
+
+var dyn_arr = [1, 2, 3]
+println(dyn_arr.len())
+
+// push 返回新数组
+dyn_arr = dyn_arr.push(4)
+println(dyn_arr.len())
+println(dyn_arr)
+
+// pop 返回最后一个元素
+val popped = dyn_arr.pop()
+println(popped)
+println(dyn_arr.len())
+
+// contains
+println(dyn_arr.contains(2))
+println(dyn_arr.contains(99))
+
+// isEmpty
+println(dyn_arr.isEmpty())
+println([].isEmpty())
+
+// first / last
+println(dyn_arr.first())
+println(dyn_arr.last())
+
+// 空数组的 first/last 返回 null
+val empty_arr: i32[] = []
+println(empty_arr.first())
+println(empty_arr.last())
+
+// drop_last
+val dropped = dyn_arr.drop_last()
+println(dropped)
+
+// ============================================================
+// 53. Nullable 与泛型交互 — 更多场景
+// ============================================================
+
+// Nullable 作为函数返回值
+fun findUser(id: i32): str? {
+    if (id == 1) { "Alice" } else { null }
+}
+
+val user1 = findUser(1)
+val user2 = findUser(2)
+println(user1 ?? "unknown")
+println(user2 ?? "unknown")
+
+// Nullable 嵌套在 Throw 中
+fun findOrError(id: i32): Throw<str?, Error> {
+    if (id < 0) {
+        throw Error("invalid id")
+    }
+    if (id == 0) {
+        Ok(null)
+    } else {
+        Ok(findUser(id))
+    }
+}
+
+val r3 = match findOrError(-1) {
+    Ok(v) => v ?? "null value"
+    Error(e) => "error: " + e.message
+}
+println(r3)
+
+val r4 = match findOrError(0) {
+    Ok(v) => v ?? "null value"
+    Error(e) => "error"
+}
+println(r4)
+
+val r5 = match findOrError(1) {
+    Ok(v) => v ?? "null value"
+    Error(e) => "error"
+}
+println(r5)
+
+// ============================================================
+// 54. Range 更多场景
+// ============================================================
+
+// 范围求和
+var sum_1_10 = 0
+for i in 1..=10 {
+    sum_1_10 = sum_1_10 + i
+}
+println(sum_1_10)
+
+// 排除范围
+var sum_1_9 = 0
+for i in 1..10 {
+    sum_1_9 = sum_1_9 + i
+}
+println(sum_1_9)
+
+// ============================================================
+// 55. 字符串更多操作
+// ============================================================
+
+// 字符串拼接
+val hello = "Hello" + " " + "World"
+println(hello)
+
+// 字符串比较
+println("abc" == "abc")
+println("abc" != "def")
+
+// 字符串插值 — 表达式
+val x_val = 42
+val y_val = 3.14
+println("x = {x_val}, y = {y_val}")
+println("sum = {x_val + 10}")
+
+// ============================================================
+// 56. 记录类型更多操作
+// ============================================================
+
+// 记录字段修改
+var pt = (x: 10, y: 20)
+pt.x = 30
+println(pt.x)
+println(pt.y)
+
+// 嵌套记录
+val nested = (inner: (a: 1, b: 2), label: "point")
+println(nested.inner.a)
+println(nested.inner.b)
+println(nested.label)
+
+// ============================================================
+// 57. Newtype 解包
+// ============================================================
+
+type Celsius = Celsius(f64)
+val temp = Celsius(36.5)
+
+// match 解包 newtype
+val raw_temp = match temp {
+    Celsius(v) => v
+}
+println(raw_temp)
+
+// ============================================================
+// 58. 多种整数运算
+// ============================================================
+
+// 位运算
+println(0xFF & 0x0F)
+println(0xF0 | 0x0F)
+println(0xFF ^ 0x0F)
+
+// 比较运算
+println(1 < 2)
+println(2 > 1)
+println(1 <= 1)
+println(1 >= 1)
+
+// ============================================================
+// 59. 字符操作
+// ============================================================
+
+val ch_a = 'A'
+val ch_z = 'Z'
+println(ch_a)
+println(ch_z)
+
+// 字符比较
+println(ch_a < ch_z)
+
+// ============================================================
+// 60. 闭包捕获 — 捕获多个外部变量
+// ============================================================
+val base_v = 10
+val mult_v = 3
+val compute = fun(x) { base_v + x * mult_v }
+println(compute(5))
+
+// ============================================================
+// 61. 递归与 TCO — 更深层递归
+// ============================================================
+
+// 阶乘（非尾递归）
+fun factorial(n: i32): i32 {
+    if (n <= 1) { 1 } else { n * factorial(n - 1) }
+}
+println(factorial(10))
+
+// 尾递归倒计数
+fun countdown(n: i32): i32 {
+    if (n == 0) { 0 } else { countdown(n - 1) }
+}
+println(countdown(1000))
+
+// ============================================================
+// 62. 多种 match 模式
+// ============================================================
+
+// 字面量模式
+fun classify(n: i32): str {
+    match n {
+        0 => "zero"
+        1 => "one"
+        _ => "other"
+    }
+}
+println(classify(0))
+println(classify(1))
+println(classify(42))
+
+// 布尔模式
+fun boolMatch(b: bool): str {
+    match b {
+        true => "yes"
+        false => "no"
+    }
+}
+println(boolMatch(true))
+println(boolMatch(false))
+
+// ============================================================
+// 63. 空值安全操作综合
+// ============================================================
+
+type Config = Config(host: str, port: i32)
+
+fun loadConfig(): Config? {
+    null
+}
+
+val config = loadConfig()
+val host = config?.host ?? "localhost"
+val port = config?.port ?? 8080
+println(host)
+println(port)
+
+// ============================================================
+// 64. Throw 链式 ? 传播
+// ============================================================
+
+fun step1(): Throw<i32, Error> {
+    Ok(10)
+}
+
+fun step2(x: i32): Throw<i32, Error> {
+    if (x > 5) { Ok(x * 2) } else { throw Error("too small") }
+}
+
+fun step3(x: i32): Throw<i32, Error> {
+    if (x < 100) { Ok(x + 1) } else { throw Error("too large") }
+}
+
+fun pipeline(): Throw<i32, Error> {
+    val a = step1()?
+    val b = step2(a)?
+    val c = step3(b)?
+    c
+}
+
+val pipe_result = match pipeline() {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(pipe_result)
+
+// ============================================================
+// 65. 数组迭代与变换
+// ============================================================
+
+val nums = [10, 20, 30, 40, 50]
+
+// 手动求和
+var arr_sum = 0
+for n in nums {
+    arr_sum = arr_sum + n
+}
+println(arr_sum)
+
+// 数组索引访问
+println(nums[0])
+println(nums[4])
+
+// ============================================================
+// 66. 多个 defer 和 return 交互
+// ============================================================
+
+fun deferReturn(): i32 {
+    var result = 0
+    {
+        defer result = result + 10
+        result = 5
+    }
+    result
+}
+println(deferReturn())
+
+// ============================================================
+// 67. 字符串迭代
+// ============================================================
+
+var char_count = 0
+for ch in "Hello" {
+    char_count = char_count + 1
+}
+println(char_count)
+
+// ============================================================
+// 68. 单位值
+// ============================================================
+
+fun doNothing(): () { }
+val unit_val = doNothing()
+println(unit_val)
+
+// ============================================================
+// 69. str() 内建转换函数
+// ============================================================
+
+println(str(42))
+println(str(3.14))
+println(str(true))
+
+// ============================================================
+// 70. 字符串转义字符
+// ============================================================
+
+println("tab\there")
+println("newline\nhere")
+println("back\\slash")
+
+// ============================================================
+// 71. Nullable — 函数参数和返回值
+// ============================================================
+
+fun defaultIfNull(value: i32?, default: i32) {
+    value ?? default
+}
+println(defaultIfNull(null, 0))
+println(defaultIfNull(42, 0))
+
+// Nullable 返回值 — 返回非空值
+fun wrapInNullable(x: i32): i32? { x }
+val wrapped_val = wrapInNullable(100)
+println(wrapped_val ?? -1)
+
+// ============================================================
+// 72. Nullable — 非空断言和链式操作综合
+// ============================================================
+
+val maybe_str: str? = "hello"
+println(maybe_str!)
+println(maybe_str?.len())
+
+// ============================================================
+// 73. Throw — 多分支验证
+// ============================================================
+
+fun validateAge(age: i32): Throw<i32, Error> {
+    if (age < 0) { throw Error("age cannot be negative") }
+    if (age > 150) { throw Error("age too large") }
+    Ok(age)
+}
+
+val age1 = match validateAge(25) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(age1)
+
+val age2 = match validateAge(-1) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(age2)
+
+val age3 = match validateAge(200) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(age3)
+
+// ============================================================
+// 74. 闭包 — 闭包作为函数参数传递
+// ============================================================
+
+fun transform(value: i32, f): i32 { f(value) }
+val doubled = transform(21, fun(x) { x * 2 })
+val squared = transform(5, fun(x) { x * x })
+println(doubled)
+println(squared)
+
+// ============================================================
+// 75. 闭包 — 捕获多个变量
+// ============================================================
+
+val a_val = 5
+val b_val = 10
+val combined = fun(x) { a_val * x + b_val }
+println(combined(3))
+
+// 闭包捕获 var 并修改
+var accum = 0
+val adder = fun(x) { accum = accum + x }
+adder(1)
+adder(2)
+adder(3)
+println(accum)
+
+// ============================================================
+// 76. var — 值语义深拷贝
+// ============================================================
+
+var original = 42
+var copy_val = original
+copy_val = 100
+println(original)
+println(copy_val)
+
+// ============================================================
+// 77. 记录类型 — 记录作为函数参数和返回值
+// ============================================================
+
+type Point = Point(x: i32, y: i32)
+
+fun makePoint(x: i32, y: i32): Point { Point(x, y) }
+fun pointSum(p: Point): i32 { p.x + p.y }
+
+val pt3 = makePoint(3, 4)
+println(pt3.x)
+println(pt3.y)
+println(pointSum(pt3))
+
+// ============================================================
+// 78. 动态数组 — 操作组合
+// ============================================================
+
+var dyn2 = [10, 20, 30]
+dyn2 = dyn2.push(40)
+dyn2 = dyn2.push(50)
+println(dyn2.len())
+
+val last_elem = dyn2.last()
+println(last_elem ?? -1)
+
+val first_elem = dyn2.first()
+println(first_elem ?? -1)
+
+// ============================================================
+// 79. Range — 求积
+// ============================================================
+
+var product = 1
+for i in 1..=5 {
+    product = product * i
+}
+println(product)
+
+// ============================================================
+// 80. Type Alias — 别名在函数签名中使用
+// ============================================================
+
+type Age = i32
+
+fun isAdult(age: i32): bool { age >= 18 }
+println(isAdult(20))
+println(isAdult(10))
+
+// ============================================================
+// 81. Newtype — 解包更多场景
+// ============================================================
+
+type Email = Email(str)
+val email = Email("test@example.com")
+val email_str = match email {
+    Email(s) => s
+}
+println(email_str)
+
+// ============================================================
+// 82. match — 字符串和字面量模式
+// ============================================================
+
+fun direction(s: str): i32 {
+    match s {
+        "north" => 1
+        "south" => 2
+        "east" => 3
+        "west" => 4
+        _ => 0
+    }
+}
+println(direction("north"))
+println(direction("south"))
+println(direction("unknown"))
+
+// ============================================================
+// 83. 嵌套 if-else 表达式
+// ============================================================
+
+fun classifyNum(x: i32): str {
+    if (x < 0) {
+        "negative"
+    } else if (x == 0) {
+        "zero"
+    } else if (x < 100) {
+        "small"
+    } else {
+        "large"
+    }
+}
+println(classifyNum(-5))
+println(classifyNum(0))
+println(classifyNum(50))
+println(classifyNum(200))
+
+// ============================================================
+// 84. 浮点运算更多
+// ============================================================
+
+val f1: f64 = 10.0
+val f2: f64 = 3.0
+println(f1 + f2)
+println(f1 - f2)
+println(f1 * f2)
+
+// ============================================================
+// 85. bool 运算更多
+// ============================================================
+
+val t_val = true
+val f_val = false
+println(t_val && t_val)
+println(t_val && f_val)
+println(t_val || f_val)
+println(f_val || f_val)
+
+// ============================================================
+// 86. 单位值更多场景
+// ============================================================
+
+fun sideEffect(): () {
+    println("side effect")
+}
+val unit_result = sideEffect()
+
+// ============================================================
+// 87. 数组 — 求最大值
+// ============================================================
+
+val nums_arr = [5, 3, 8, 1, 9, 2]
+var max_val = nums_arr[0]
+for n in nums_arr {
+    if (n > max_val) { max_val = n }
+}
+println(max_val)
+
+// ============================================================
+// 88. 字符串 — 拼接和比较
+// ============================================================
+
+val greeting = "Hello" + ", " + "World" + "!"
+println(greeting)
+println("abc" < "abd")
+
+// ============================================================
+// 89. 泛型 — compose 函数
+// ============================================================
+
+fun compose(f, g, x): i32 { f(g(x)) }
+val double_it = fun(x) { x * 2 }
+val add_one = fun(x) { x + 1 }
+println(compose(double_it, add_one, 5))
+
+// ============================================================
+// 90. Error — 多种错误类型
+// ============================================================
+
+type ParseError = Error("parse error")
+
+fun parseOrThrow(s: str): Throw<i32, Error> {
+    if (s == "valid") { Ok(42) }
+    else if (s == "parse_fail") { throw ParseError("invalid syntax") }
+    else { throw Error("unknown error") }
+}
+
+val pr1 = match parseOrThrow("valid") {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(pr1)
+
+val pr2 = match parseOrThrow("parse_fail") {
+    Ok(v) => v
+    Error(e) => -2
+}
+println(pr2)
+
+val pr3 = match parseOrThrow("other") {
+    Ok(v) => v
+    Error(e) => -3
+}
+println(pr3)
+
+// ============================================================
+// 91. defer — 循环和嵌套块
+// ============================================================
+
+// defer 在嵌套块中
+var defer_nested = ""
+{
+    defer defer_nested = defer_nested + "outer"
+    {
+        defer defer_nested = defer_nested + "inner"
+    }
+}
+println(defer_nested)
+
+// ============================================================
+// 92. 类型转换 — 更多场景
+// ============================================================
+
+// 整数到浮点
+val int_to_float = f64(42)
+println(int_to_float)
+
+// ============================================================
+// 93. Nullable + Throw 组合
+// ============================================================
+
+// Nullable 嵌套在 Throw 中
+fun findOrError2(id: i32): Throw<str, Error> {
+    if (id < 0) {
+        throw Error("invalid id")
+    }
+    if (id == 0) {
+        Ok("")
+    } else {
+        Ok("user" + str(id))
+    }
+}
+
+val r6 = match findOrError2(-1) {
+    Ok(v) => v
+    Error(e) => "error"
+}
+println(r6)
+
+val r7 = match findOrError2(0) {
+    Ok(v) => v
+    Error(e) => "error"
+}
+println(r7)
+
+val r8 = match findOrError2(5) {
+    Ok(v) => v
+    Error(e) => "error"
+}
+println(r8)
+
+// ============================================================
+// 94. 记录 — 字段更新
+// ============================================================
+
+var config2 = (host: "localhost", port: 8080)
+config2.host = "127.0.0.1"
+println(config2.host)
+
+// ============================================================
+// 95. Nullable — if-else 返回不同类型（auto-widening）
+// ============================================================
+
+// if 分支返回 i32，else 分支返回 null，统一为 i32?
+val maybe_val: i32? = if (true) { 42 } else { null }
+println(maybe_val ?? -1)
+
+val maybe_val2: i32? = if (false) { 42 } else { null }
+println(maybe_val2 ?? -1)
+
+// ============================================================
+// 96. Throw — Ok 和 throw 混合
+// ============================================================
+
+fun maybeThrow(cond: bool): Throw<i32, Error> {
+    if (cond) { Ok(100) } else { throw Error("failed") }
+}
+
+val mt1 = match maybeThrow(true) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(mt1)
+
+val mt2 = match maybeThrow(false) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(mt2)
+
+// ============================================================
+// 97. 闭包 — 嵌套闭包
+// ============================================================
+
+fun outer_fn2(x: i32): i32 {
+    fun inner(y: i32): i32 { x + y }
+    inner(10)
+}
+println(outer_fn2(5))
+
+// ============================================================
+// 98. 综合测试 — Nullable + Throw + 闭包
+// ============================================================
+
+fun safeCompute(x: i32): Throw<i32, Error> {
+    if (x < 0) { throw Error("negative") }
+    Ok(x * 2)
+}
+
+val sc1 = match safeCompute(10) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(sc1)
+
+val sc2 = match safeCompute(0) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(sc2)
+
+val sc3 = match safeCompute(-5) {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(sc3)
+
+// ============================================================
+// 99. 多层 ? 传播 — Throw 链
+// ============================================================
+
+fun step1b(): Throw<i32, Error> { Ok(10) }
+fun step2b(x: i32): Throw<i32, Error> {
+    if (x > 5) { Ok(x * 2) } else { throw Error("too small") }
+}
+
+fun pipeline2(): Throw<i32, Error> {
+    val a = step1b()?
+    val b = step2b(a)?
+    b + 1
+}
+
+val pipe2_result = match pipeline2() {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(pipe2_result)
+
+// ============================================================
+// 100. 泛型 ADT — 更多模式匹配
+// ============================================================
+
+fun listLength(l: List<i32>): i32 {
+    match l {
+        Nil => 0
+        Cons(_, tail) => 1 + listLength(tail)
+    }
+}
+println(listLength(Nil))
+println(listLength(Cons(1, Cons(2, Cons(3, Nil)))))
+
+// ============================================================
+// 101. 数组 — 索引访问和迭代
+// ============================================================
+
+val arr2 = [100, 200, 300]
+println(arr2[0])
+println(arr2[1])
+println(arr2[2])
+
+var arr_total = 0
+for v in arr2 {
+    arr_total = arr_total + v
+}
+println(arr_total)
+
+// ============================================================
+// 102. 字符串 — 插值复杂表达式
+// ============================================================
+
+val px = 3
+val py = 4
+println("point: ({px}, {py})")
+println("distance squared: {px * px + py * py}")
+
+// ============================================================
+// 103. 记录 — 记录字段访问链
+// ============================================================
+
+type Addr = Addr(city: str, zip: i32)
+type Person = Person(name: str, addr: Addr)
+
+val person = Person("Bob", Addr("Shanghai", 200000))
+println(person.name)
+println(person.addr.city)
+println(person.addr.zip)
+
+// ============================================================
+// 104. 递归 — 斐波那契更多
+// ============================================================
+
+fun fib2(n: i32): i32 {
+    if (n <= 1) { n } else { fib2(n - 1) + fib2(n - 2) }
+}
+println(fib2(0))
+println(fib2(1))
+println(fib2(15))
+
+// ============================================================
+// 105. while 循环 — 复杂条件
+// ============================================================
+
+var w_a = 1
+var w_b = 1
+while w_a < 100 {
+    val temp = w_a + w_b
+    w_a = w_b
+    w_b = temp
+}
+println(w_a)
+
+// ============================================================
+// 106. match — 嵌套 match
+// ============================================================
+
+fun nestedMatch(x: i32, y: i32): str {
+    match x {
+        0 => "zero"
+        _ => match y {
+            0 => "x nonzero, y zero"
+            _ => "both nonzero"
+        }
+    }
+}
+println(nestedMatch(0, 0))
+println(nestedMatch(1, 0))
+println(nestedMatch(1, 1))
+
+// ============================================================
+// 107. loop — 带条件退出
+// ============================================================
+
+var loop_val = 1
+var loop_result = 1
+loop {
+    loop_result = loop_result * loop_val
+    loop_val = loop_val + 1
+    if (loop_val > 5) { break }
+}
+println(loop_result)
+
+// ============================================================
+// 108. Newtype — 多种 newtype
+// ============================================================
+
+type Kelvin = Kelvin(f64)
+val k = Kelvin(273.15)
+val k_raw = match k {
+    Kelvin(v) => v
+}
+println(k_raw)
+
+// ============================================================
+// 109. Type Alias — 别名等价性
+// ============================================================
+
+type IntList2 = List<i32>
+val il: IntList2 = Cons(10, Cons(20, Nil))
+println(listSum(il))
+
+// ============================================================
+// 110. 函数 — 多参数和默认值
+// ============================================================
+
+fun add3(a: i32, b: i32, c: i32): i32 { a + b + c }
+println(add3(1, 2, 3))
+
+// ============================================================
+// 111. 二元运算 — 比较运算符
+// ============================================================
+
+println(10 <= 10)
+println(10 >= 10)
+println(10 < 20)
+println(20 > 10)
+
+// ============================================================
+// 112. 字符串 — len 和索引
+// ============================================================
+
+val s2 = "Glue"
+println(s2.len())
+println(s2[0])
+
+// ============================================================
+// 113. 动态数组 — contains 和 isEmpty
+// ============================================================
+
+val check_arr = [1, 2, 3, 4, 5]
+println(check_arr.contains(3))
+println(check_arr.contains(99))
+println(check_arr.isEmpty())
+
+// ============================================================
+// 114. Nullable — match 中 null 模式
+// ============================================================
+
+fun describeNullable(n: i32?): str {
+    match n {
+        null => "is null"
+        0 => "is zero"
+        _ => "is positive"
+    }
+}
+println(describeNullable(null))
+println(describeNullable(0))
+println(describeNullable(42))
+
+// ============================================================
+// 115. Throw — Ok 包含 null
+// ============================================================
+
+fun maybeNullResult(x: i32): Throw<i32, Error> {
+    if (x == 0) { Ok(-1) }
+    else { Ok(x) }
+}
+
+val mnr1 = match maybeNullResult(0) {
+    Ok(v) => v
+    Error(e) => -2
+}
+println(mnr1)
+
+val mnr2 = match maybeNullResult(5) {
+    Ok(v) => v
+    Error(e) => -2
+}
+println(mnr2)
+
+// ============================================================
+// 116. 泛型 — identity 更多
+// ============================================================
+
+val id3 = identity(42)
+val id4 = identity("test")
+println(id3)
+println(id4)
+
+// ============================================================
+// 117. Error — 自定义错误 message
+// ============================================================
+
+type DbError = Error("database error")
+val dbe = DbError("connection timeout")
+val dbe_msg = match dbe {
+    Ok(v) => "ok"
+    Error(e) => e.message
+}
+println(dbe_msg)
+
+// ============================================================
+// 118. defer — 与 throw 交互
+// ============================================================
+
+var defer_throw_val = 0
+fun throwsWithDefer2(): Throw<i32, Error> {
+    defer defer_throw_val = 99
+    throw Error("oops2")
+}
+
+val dt2 = match throwsWithDefer2() {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(dt2)
+println(defer_throw_val)
+
+// ============================================================
+// 119. 数组 — 固定数组操作
+// ============================================================
+
+val fixed: i32[3] = [10, 20, 30]
+println(fixed.len())
+println(fixed[0])
+println(fixed[2])
+
+// ============================================================
+// 120. 综合测试 — 多特性组合
+// ============================================================
+
+// 泛型 + Nullable + match
+fun safeHead(l: List<i32>): i32? {
+    match l {
+        Nil => null
+        Cons(x, _) => x
+    }
+}
+println(safeHead(Nil))
+println(safeHead(Cons(7, Nil)))
+
+// Type Alias + 函数
+type Score = i32
+fun passThreshold(s: i32): bool { s >= 60 }
+println(passThreshold(85))
+println(passThreshold(30))
+
+// ============================================================
+// 121. 嵌套函数 — 多层嵌套
+// ============================================================
+
+fun outer2(x: i32): i32 {
+    fun middle(y: i32): i32 {
+        fun innermost(z: i32): i32 {
+            x + y + z
+        }
+        innermost(100)
+    }
+    middle(10)
+}
+println(outer2(1))
+
+// 嵌套函数访问外层局部变量
+fun makeCounter(start: i32): i32 {
+    var count = start
+    fun increment(): i32 {
+        count = count + 1
+        count
+    }
+    increment()
+    increment()
+    increment()
+}
+println(makeCounter(0))
+
+// ============================================================
+// 122. 方法链式调用
+// ============================================================
+
+// 字符串方法链
+val chain_str = "Hello"
+println(chain_str.len())
+
+// 数组方法链
+val chain_arr = [1, 2, 3]
+println(chain_arr.push(4).len())
+println(chain_arr.push(10).push(20).len())
+
+// ============================================================
+// 123. 嵌套函数 — 嵌套调用
+// ============================================================
+
+fun addAndDouble(a: i32, b: i32): i32 {
+    fun double(x: i32): i32 { x * 2 }
+    double(a + b)
+}
+println(addAndDouble(3, 4))
+
+// 嵌套递归函数
+fun outer3(n: i32): i32 {
+    fun helper(acc: i32, i: i32): i32 {
+        if (i > n) { acc } else { helper(acc + i, i + 1) }
+    }
+    helper(0, 1)
+}
+println(outer3(10))
+
+// ============================================================
+// 124. 记录 — 嵌套记录方法
+// ============================================================
+
+type Inner2 = Inner2(value: i32)
+type Outer2 = Outer2(inner: Inner2, label: str)
+
+val o2 = Outer2(Inner2(42), "test")
+println(o2.inner.value)
+println(o2.label)

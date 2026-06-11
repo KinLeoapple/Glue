@@ -1594,6 +1594,90 @@ pub const Evaluator = struct {
             };
         }
 
+        // 动态数组方法（T[]）
+        if (std.mem.eql(u8, method, "push")) {
+            return switch (object) {
+                .array => |arr| {
+                    // push: 追加元素，返回新数组
+                    // 文档：var 与值语义——支持重新赋值和原地修改
+                    // 用法：var arr = [1, 2]; arr = arr.push(3)
+                    if (args.len != 1) return error.WrongArity;
+                    var new_arr = try self.allocator.alloc(Value, arr.len + 1);
+                    @memcpy(new_arr[0..arr.len], arr);
+                    new_arr[arr.len] = try args[0].clone(self.allocator);
+                    return Value{ .array = new_arr };
+                },
+                else => error.TypeMismatch,
+            };
+        }
+
+        if (std.mem.eql(u8, method, "pop")) {
+            return switch (object) {
+                .array => |arr| {
+                    // pop: 弹出最后一个元素，返回 T?
+                    if (arr.len == 0) return Value.null_val;
+                    return try arr[arr.len - 1].clone(self.allocator);
+                },
+                else => error.TypeMismatch,
+            };
+        }
+
+        if (std.mem.eql(u8, method, "contains")) {
+            return switch (object) {
+                .array => |arr| {
+                    // contains: 检查是否包含元素（结构相等）
+                    if (args.len != 1) return error.WrongArity;
+                    for (arr) |item| {
+                        if (structuralEquals(item, args[0])) {
+                            return Value{ .boolean = true };
+                        }
+                    }
+                    return Value{ .boolean = false };
+                },
+                else => error.TypeMismatch,
+            };
+        }
+
+        if (std.mem.eql(u8, method, "isEmpty")) {
+            return switch (object) {
+                .array => |arr| Value{ .boolean = arr.len == 0 },
+                else => error.TypeMismatch,
+            };
+        }
+
+        if (std.mem.eql(u8, method, "first")) {
+            return switch (object) {
+                .array => |arr| {
+                    if (arr.len == 0) return Value.null_val;
+                    return try arr[0].clone(self.allocator);
+                },
+                else => error.TypeMismatch,
+            };
+        }
+
+        if (std.mem.eql(u8, method, "last")) {
+            return switch (object) {
+                .array => |arr| {
+                    if (arr.len == 0) return Value.null_val;
+                    return try arr[arr.len - 1].clone(self.allocator);
+                },
+                else => error.TypeMismatch,
+            };
+        }
+
+        if (std.mem.eql(u8, method, "drop_last")) {
+            return switch (object) {
+                .array => |arr| {
+                    // drop_last: 返回去掉最后一个元素的新数组
+                    if (arr.len == 0) return Value{ .array = arr };
+                    const new_arr = try self.allocator.alloc(Value, arr.len - 1);
+                    @memcpy(new_arr, arr[0 .. arr.len - 1]);
+                    return Value{ .array = new_arr };
+                },
+                else => error.TypeMismatch,
+            };
+        }
+
         if (std.mem.eql(u8, method, "toString")) {
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(self.allocator);
@@ -2123,22 +2207,65 @@ pub const Evaluator = struct {
                     .identifier => |id| {
                         try environment.set(id.name, val);
                     },
+                    .field_access => |fa| {
+                        // 处理 object.field = value 形式的赋值
+                        switch (fa.object.*) {
+                            .identifier => |id| {
+                                if (environment.getPtr(id.name)) |variable| {
+                                    if (variable.*.value == .record) {
+                                        const map = &variable.*.value.record;
+                                        if (map.getPtr(fa.field)) |existing| {
+                                            existing.* = val;
+                                        } else {
+                                            return error.UndefinedVariable;
+                                        }
+                                    } else {
+                                        return error.TypeMismatch;
+                                    }
+                                } else {
+                                    return error.UndefinedVariable;
+                                }
+                            },
+                            else => return error.TypeMismatch,
+                        }
+                    },
                     else => return error.TypeMismatch,
                 }
                 return null;
             },
             .field_assignment => |fa| {
                 const val = try self.evalExpr(fa.value, environment);
-                const object = try self.evalExpr(fa.object, environment);
-                switch (object) {
-                    .record => |*map| {
-                        if (map.getPtr(fa.field)) |existing| {
-                            existing.* = val;
+                // 如果对象是标识符，直接修改环境中的变量
+                switch (fa.object.*) {
+                    .identifier => |id| {
+                        if (environment.getPtr(id.name)) |variable| {
+                            if (variable.*.value == .record) {
+                                const map = &variable.*.value.record;
+                                if (map.getPtr(fa.field)) |existing| {
+                                    existing.* = val;
+                                } else {
+                                    return error.UndefinedVariable;
+                                }
+                            } else {
+                                return error.TypeMismatch;
+                            }
                         } else {
                             return error.UndefinedVariable;
                         }
                     },
-                    else => return error.TypeMismatch,
+                    else => {
+                        const object = try self.evalExpr(fa.object, environment);
+                        switch (object) {
+                            .record => |*map| {
+                                if (map.getPtr(fa.field)) |existing| {
+                                    existing.* = val;
+                                } else {
+                                    return error.UndefinedVariable;
+                                }
+                            },
+                            else => return error.TypeMismatch,
+                        }
+                    },
                 }
                 return null;
             },

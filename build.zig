@@ -127,14 +127,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const task_module = b.createModule(.{
-        .root_source_file = b.path("runtime/task.zig"),
+    const spawn_module = b.createModule(.{
+        .root_source_file = b.path("runtime/spawn.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const arc_module = b.createModule(.{
-        .root_source_file = b.path("runtime/arc.zig"),
+    const atomic_module = b.createModule(.{
+        .root_source_file = b.path("runtime/atomic.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -214,8 +214,8 @@ pub fn build(b: *std.Build) void {
     eval_module.addImport("scheduler", scheduler_module);
     eval_module.addImport("gc", gc_module);
     eval_module.addImport("channel", channel_module);
-    eval_module.addImport("task", task_module);
-    eval_module.addImport("arc", arc_module);
+    eval_module.addImport("spawn", spawn_module);
+    eval_module.addImport("atomic", atomic_module);
     eval_module.addImport("vtable_rt", vtable_module);
 
     // ============================================================
