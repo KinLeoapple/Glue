@@ -636,8 +636,8 @@ pub const Expr = union(enum) {
     },
 
     /// spawn 表达式：spawn { body }
-    /// 创建协程，返回 Task<T>
-    /// spawn 闭包深拷贝捕获（Arc<T> 例外，浅拷贝）
+    /// 创建协程，返回 Spawn<T>
+    /// spawn 闭包深拷贝捕获（Atomic<T> 例外，浅拷贝）
     spawn: struct {
         location: SourceLocation,
         body: *Expr,
