@@ -858,8 +858,21 @@ pub const Parser = struct {
             return_type = try self.parseType();
         }
 
+        // 委托语法：= TraitName.method_name
+        // 文档 2.7.2: fun to_string(self): str = Serializable.to_string
+        var delegate: ?ast.DelegateInfo = null;
         var body: ?*ast.Expr = null;
-        if (self.check(.l_brace)) {
+
+        if (self.matchToken(.eq)) {
+            // 解析 TraitName.method_name
+            const trait_tok = try self.expect(.identifier, "期望委托的 Trait 名称");
+            _ = self.expect(.dot, "期望 '.'") catch {};
+            const method_tok = try self.expect(.identifier, "期望委托的方法名");
+            delegate = ast.DelegateInfo{
+                .trait_name = trait_tok.lexeme,
+                .method_name = method_tok.lexeme,
+            };
+        } else if (self.check(.l_brace)) {
             body = try self.parseExpr();
         }
 
@@ -871,6 +884,7 @@ pub const Parser = struct {
             .return_type = return_type,
             .body = body,
             .is_override = is_override,
+            .delegate = delegate,
             .visibility = visibility,
         };
     }
@@ -1491,6 +1505,16 @@ pub const Parser = struct {
         }
         if (self.matchToken(.minus)) {
             const op_tok = self.previous();
+            // 优化：-int_literal 合并为负整数字面量，避免 -2147483648 等边界值溢出
+            if (self.check(.int_literal)) {
+                const lit_tok = self.advance();
+                return self.parseNegativeIntLiteral(op_tok, lit_tok);
+            }
+            // 优化：-float_literal 合并为负浮点字面量
+            if (self.check(.float_literal)) {
+                const lit_tok = self.advance();
+                return self.parseNegativeFloatLiteral(op_tok, lit_tok);
+            }
             const operand = try self.parseUnary();
             return self.allocExpr(ast.Expr{
                 .unary = .{
@@ -1798,6 +1822,63 @@ pub const Parser = struct {
             .int_literal = .{
                 .location = tokenLoc(tok),
                 .raw = raw,
+                .suffix = suffix,
+            },
+        });
+    }
+
+    /// 解析负整数字面量（如 -2147483648），将负号合并到 raw 中
+    fn parseNegativeIntLiteral(self: *Parser, minus_tok: lexer.Token, lit_tok: lexer.Token) ParserError!*ast.Expr {
+        _ = minus_tok;
+        var suffix: ?[]const u8 = null;
+        const lit_raw = lit_tok.lexeme;
+        var i: usize = 0;
+        if (lit_raw.len > 2 and lit_raw[0] == '0') {
+            if (lit_raw[1] == 'x' or lit_raw[1] == 'X' or lit_raw[1] == 'o' or lit_raw[1] == 'O' or lit_raw[1] == 'b' or lit_raw[1] == 'B') {
+                i = 2;
+            }
+        }
+        while (i < lit_raw.len and isDigitOrUnderscore(lit_raw[i])) : (i += 1) {}
+        if (i < lit_raw.len and lit_raw.len > 2 and lit_raw[0] == '0' and (lit_raw[1] == 'x' or lit_raw[1] == 'X')) {
+            while (i < lit_raw.len and isHexOrUnderscore(lit_raw[i])) : (i += 1) {}
+        }
+        if (i < lit_raw.len) {
+            suffix = lit_raw[i..];
+        }
+        // 合并负号：raw = "-" + lit_raw
+        const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw});
+        return self.allocExpr(ast.Expr{
+            .int_literal = .{
+                .location = tokenLoc(lit_tok),
+                .raw = neg_raw,
+                .suffix = suffix,
+            },
+        });
+    }
+
+    /// 解析负浮点字面量（如 -3.14），将负号合并到 raw 中
+    fn parseNegativeFloatLiteral(self: *Parser, minus_tok: lexer.Token, lit_tok: lexer.Token) ParserError!*ast.Expr {
+        _ = minus_tok;
+        var suffix: ?[]const u8 = null;
+        const lit_raw = lit_tok.lexeme;
+        var i: usize = lit_raw.len;
+        while (i > 0) {
+            const ch = lit_raw[i - 1];
+            if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        if (i < lit_raw.len) {
+            suffix = lit_raw[i..];
+        }
+        // 合并负号：raw = "-" + lit_raw
+        const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw});
+        return self.allocExpr(ast.Expr{
+            .float_literal = .{
+                .location = tokenLoc(lit_tok),
+                .raw = neg_raw,
                 .suffix = suffix,
             },
         });

@@ -404,8 +404,20 @@ pub const MethodDecl = struct {
     body: ?*Expr,
     /// 是否为 override（用于 Trait 组合中的冲突消解）
     is_override: bool,
+    /// 委托信息（用于 Trait 组合中的冲突消解）
+    /// `fun to_string(self): str = Serializable.to_string` 中的 `Serializable.to_string`
+    delegate: ?DelegateInfo = null,
     /// 可见性
     visibility: Visibility = .private,
+};
+
+/// 委托信息（Trait 冲突消解中的委托语法）
+/// `fun to_string(self): str = Serializable.to_string`
+pub const DelegateInfo = struct {
+    /// 委托的 Trait 名称（如 "Serializable"）
+    trait_name: []const u8,
+    /// 委托的方法名（如 "to_string"）
+    method_name: []const u8,
 };
 
 /// 关联类型声明（Trait 中使用）

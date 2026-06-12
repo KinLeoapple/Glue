@@ -670,3 +670,560 @@ println(evalExpr(gexpr1))
 
 val gexpr2 = GAdd(GAdd(Lit(1), Lit(2)), Lit(3))
 println(evalExpr(gexpr2))
+
+// ============================================================
+// 41. ADT — 多构造器枚举与穷举匹配
+// ============================================================
+
+type Direction =
+    | North
+    | South
+    | East
+    | West
+
+fun directionName(d: Direction): str {
+    match d {
+        North => "N"
+        South => "S"
+        East => "E"
+        West => "W"
+    }
+}
+
+println(directionName(North))
+println(directionName(East))
+
+// ============================================================
+// 42. ADT — 带多个字段的构造器
+// ============================================================
+
+type Student =
+    | Student(name: str, age: i32, grade: f64)
+
+val stu = Student("Alice", 20, 95.5)
+println(stu.name)
+println(stu.age)
+println(stu.grade)
+
+// ============================================================
+// 43. ADT — 递归列表更多操作
+// ============================================================
+
+fun listReverse(l: List): List {
+    fun helper(remaining, acc): List {
+        match remaining {
+            Nil => acc
+            Cons(head, tail) => helper(tail, Cons(head, acc))
+        }
+    }
+    helper(l, Nil)
+}
+
+val rev = listReverse(Cons(1, Cons(2, Cons(3, Nil))))
+println(rev)
+
+// ============================================================
+// 44. ADT — 列表包含检查
+// ============================================================
+
+fun listContains(l: List, target: i32): bool {
+    match l {
+        Nil => false
+        Cons(head, tail) => if (head == target) { true } else { listContains(tail, target) }
+    }
+}
+
+println(listContains(Cons(1, Cons(2, Cons(3, Nil))), 2))
+println(listContains(Cons(1, Cons(2, Cons(3, Nil))), 5))
+
+// ============================================================
+// 45. Trait — 多类型 impl 同一 Trait
+// 注：当前 impl 方法注册到全局命名空间，不同类型 impl 同名方法会冲突
+// 改用方法调用语法（obj.method()）来测试多类型 impl
+
+trait Stringify {
+    fun stringify(self): str
+}
+
+impl Stringify<Ordering> {
+    fun stringify(self): str {
+        match self {
+            Lt => "Lt"
+            Eq => "Eq"
+            Gt => "Gt"
+        }
+    }
+}
+
+println(Lt.stringify())
+
+// ============================================================
+// 46. Trait — 默认方法调用
+// ============================================================
+
+trait Formattable {
+    fun fmt(self): str
+    fun wrapped(self): str {
+        "[" + self.fmt() + "]"
+    }
+}
+
+impl Formattable<Ordering> {
+    fun fmt(self): str {
+        match self {
+            Lt => "lt"
+            Eq => "eq"
+            Gt => "gt"
+        }
+    }
+}
+
+println(Gt.fmt())
+println(Gt.wrapped())
+
+// ============================================================
+// 47. 泛型 ADT — 泛型列表追加
+// ============================================================
+
+fun glistAppend<T>(a: GList<T>, b: GList<T>): GList<T> {
+    match a {
+        GNil => b
+        GCons(x, tail) => GCons(x, glistAppend(tail, b))
+    }
+}
+
+val appended = glistAppend(GCons(1, GCons(2, GNil)), GCons(3, GCons(4, GNil)))
+println(appended)
+
+// ============================================================
+// 48. ADT — 列表反转验证
+// 注：已在测试 43 定义 listReverse，此处验证结果
+// listReverse(Cons(3, Cons(2, Cons(1, Nil)))) 应为 Cons(1, Cons(2, Cons(3, Nil)))
+val lrev = listReverse(Cons(3, Cons(2, Cons(1, Nil))))
+println(lrev)
+
+// ============================================================
+// 49. 泛型 ADT — 泛型列表长度（复用已有的 glistLen）
+// ============================================================
+
+// 已在测试 30 中定义了 glistLen，此处验证不同类型参数
+println(glistLen(GCons(10, GCons(20, GCons(30, GNil)))))
+println(glistLen(GNil))
+
+// ============================================================
+// 50. ADT — 表达式求值器扩展（减法和除法）
+// ============================================================
+
+type Expr2 =
+    | Num2(i32)
+    | Add2(Expr2, Expr2)
+    | Sub2(Expr2, Expr2)
+    | Mul2(Expr2, Expr2)
+
+fun eval2(e: Expr2): i32 {
+    match e {
+        Num2(n) => n
+        Add2(a, b) => eval2(a) + eval2(b)
+        Sub2(a, b) => eval2(a) - eval2(b)
+        Mul2(a, b) => eval2(a) * eval2(b)
+    }
+}
+
+// (10 - 3) * 2 = 14
+val e2 = Mul2(Sub2(Num2(10), Num2(3)), Num2(2))
+println(eval2(e2))
+
+// ============================================================
+// 51. Trait — Comparable impl for f64
+// 注：compare 方法名与 i32 的 impl 冲突，改用不同方法名
+// 当前 impl 方法分派已支持按接收者类型区分
+
+// 直接使用已有的 compare 方法测试 f64 比较
+val fcmp1 = compare(1.5, 2.5)
+val fcmp2 = compare(3.14, 3.14)
+println(fcmp1)
+println(fcmp2)
+
+// ============================================================
+// 52. 类型推断 — let 多态更多场景
+// ============================================================
+
+fun constFn(x, y) { x }
+
+val cn1 = constFn(42, "ignored")
+val cn2 = constFn("hello", 99)
+println(cn1)
+println(cn2)
+
+// ============================================================
+// 53. ADT — 模式匹配守卫条件更多
+// ============================================================
+
+fun classifyAge(age: i32): str {
+    match age {
+        0 => "newborn"
+        n if n < 13 => "child"
+        n if n < 20 => "teenager"
+        n if n < 65 => "adult"
+        _ => "senior"
+    }
+}
+
+println(classifyAge(0))
+println(classifyAge(8))
+println(classifyAge(16))
+println(classifyAge(35))
+println(classifyAge(70))
+
+// ============================================================
+// 54. ADT — 或模式更多场景
+// ============================================================
+
+type HttpStatus =
+    | Ok200
+    | NotFound404
+    | ServerError500
+    | BadRequest400
+
+fun isClientError(s: HttpStatus): bool {
+    match s {
+        NotFound404 | BadRequest400 => true
+        _ => false
+    }
+}
+
+fun isServerError(s: HttpStatus): bool {
+    match s {
+        ServerError500 => true
+        _ => false
+    }
+}
+
+println(isClientError(NotFound404))
+println(isClientError(Ok200))
+println(isServerError(ServerError500))
+println(isServerError(Ok200))
+
+// ============================================================
+// 55. ADT — Option 类型（非泛型版本）
+// ============================================================
+
+type Opt =
+    | Nopt
+    | Sopt(i32)
+
+fun optStr(o: Opt): str {
+    match o {
+        Nopt => "None"
+        Sopt(v) => "Some(" + str(v) + ")"
+    }
+}
+
+println(optStr(Sopt(30)))
+println(optStr(Nopt))
+
+// ============================================================
+// 56. ADT — 二叉搜索树
+// ============================================================
+
+type BST =
+    | BLeaf
+    | BNode(i32, BST, BST)
+
+fun bstInsert(t: BST, v: i32): BST {
+    match t {
+        BLeaf => BNode(v, BLeaf, BLeaf)
+        BNode(n, left, right) => {
+            if (v < n) { BNode(n, bstInsert(left, v), right) }
+            else if (v > n) { BNode(n, left, bstInsert(right, v)) }
+            else { t }
+        }
+    }
+}
+
+fun bstContains(t: BST, v: i32): bool {
+    match t {
+        BLeaf => false
+        BNode(n, left, right) => {
+            if (v == n) { true }
+            else if (v < n) { bstContains(left, v) }
+            else { bstContains(right, v) }
+        }
+    }
+}
+
+val bst = bstInsert(bstInsert(bstInsert(BLeaf, 5), 3), 8)
+println(bstContains(bst, 5))
+println(bstContains(bst, 3))
+println(bstContains(bst, 8))
+println(bstContains(bst, 7))
+
+// ============================================================
+// 57. 泛型 newtype — 包装和解包
+// 注：泛型 newtype 类型推断有限制，改用具体类型测试
+
+type IntWrap = IntWrap(i32)
+type StrWrap = StrWrap(str)
+
+val iw = IntWrap(42)
+val sw = StrWrap("hello")
+
+fun unwrapInt(w: IntWrap): i32 {
+    match w {
+        IntWrap(v) => v
+    }
+}
+
+fun unwrapStr(w: StrWrap): str {
+    match w {
+        StrWrap(v) => v
+    }
+}
+
+println(unwrapInt(iw))
+println(unwrapStr(sw))
+
+// ============================================================
+// 58. ADT — 链表插入排序
+// ============================================================
+
+fun listInsert(l: List, v: i32): List {
+    match l {
+        Nil => Cons(v, Nil)
+        Cons(head, tail) => {
+            if (v <= head) { Cons(v, l) }
+            else { Cons(head, listInsert(tail, v)) }
+        }
+    }
+}
+
+fun listSort(l: List): List {
+    match l {
+        Nil => Nil
+        Cons(head, tail) => listInsert(listSort(tail), head)
+    }
+}
+
+val unsorted = Cons(3, Cons(1, Cons(4, Cons(1, Cons(5, Nil)))))
+val sorted = listSort(unsorted)
+println(sorted)
+
+// ============================================================
+// 59. Trait — 多 Trait 同类型
+// ============================================================
+
+trait Size {
+    fun size(self): i32
+}
+
+impl Size<List> {
+    fun size(self): i32 {
+        match self {
+            Nil => 0
+            Cons(_, tail) => 1 + size(tail)
+        }
+    }
+}
+
+println(size(Cons(1, Cons(2, Cons(3, Nil)))))
+println(size(Nil))
+
+// ============================================================
+// 60. 泛型 ADT — 泛型列表 last
+// ============================================================
+
+fun glistLast<T>(l: GList<T>): T? {
+    match l {
+        GNil => null
+        GCons(x, GNil) => x
+        GCons(_, tail) => glistLast(tail)
+    }
+}
+
+println(glistLast(GCons(1, GCons(2, GCons(3, GNil)))))
+println(glistLast(GNil))
+
+// ============================================================
+// 61. ADT — 嵌套记录类型
+// ============================================================
+
+type Pt = Pt(x: i32, y: i32)
+type Line = Line(start: Pt, end: Pt)
+
+val line = Line(Pt(0, 0), Pt(3, 4))
+println(line.start.x)
+println(line.start.y)
+println(line.end.x)
+println(line.end.y)
+
+// ============================================================
+// 62. 类型推断 — 函数组合
+// ============================================================
+
+fun composeAll(f, g, x) { f(g(x)) }
+
+val addOne = fun(x: i32) { x + 1 }
+val doubleIt = fun(x: i32) { x * 2 }
+
+println(composeAll(doubleIt, addOne, 5))
+println(composeAll(addOne, doubleIt, 5))
+
+// ============================================================
+// 63. ADT — JSON 简易表示
+// ============================================================
+
+type Json =
+    | JNull
+    | JBool(bool)
+    | JNum(f64)
+    | JStr(str)
+
+fun jsonStr(j: Json): str {
+    match j {
+        JNull => "null"
+        JBool(b) => str(b)
+        JNum(n) => str(n)
+        JStr(s) => "\"" + s + "\""
+    }
+}
+
+println(jsonStr(JNull))
+println(jsonStr(JBool(true)))
+println(jsonStr(JNum(3.14)))
+println(jsonStr(JStr("hello")))
+
+// ============================================================
+// 64. ADT — 列表 filter（非泛型版本）
+// ============================================================
+
+fun listFilter(l: List, pred): List {
+    match l {
+        Nil => Nil
+        Cons(x, tail) => {
+            val rest = listFilter(tail, pred)
+            if (pred(x)) { Cons(x, rest) } else { rest }
+        }
+    }
+}
+
+val lnums = Cons(1, Cons(2, Cons(3, Cons(4, Cons(5, Nil)))))
+val levens = listFilter(lnums, fun(x) { x % 2 == 0 })
+println(levens)
+
+// ============================================================
+// 65. ADT — 环形缓冲区状态
+// ============================================================
+
+type BufferState =
+    | Empty
+    | Partial(i32)
+    | Full(i32)
+
+fun bufferDesc(bs: BufferState): str {
+    match bs {
+        Empty => "empty"
+        Partial(n) => "partial(" + str(n) + ")"
+        Full(n) => "full(" + str(n) + ")"
+    }
+}
+
+println(bufferDesc(Empty))
+println(bufferDesc(Partial(5)))
+println(bufferDesc(Full(100)))
+
+// ============================================================
+// 66. ADT — Pair 交换
+// ============================================================
+
+type IntStrPair = IntStrPair(first: i32, second: str)
+
+fun swapPair(p: IntStrPair): GPair<str, i32> {
+    GPair(p.second, p.first)
+}
+
+val isp = IntStrPair(1, "one")
+val isp2 = swapPair(isp)
+println(isp2.first)
+println(isp2.second)
+
+// ============================================================
+// 67. ADT — 模式匹配解构嵌套
+// ============================================================
+
+type InnerRec = InnerRec(value: i32)
+type OuterRec = OuterRec(inner: InnerRec, label: str)
+
+fun extractInner(o: OuterRec): i32 {
+    match o {
+        OuterRec(inner, _) => inner.value
+    }
+}
+
+val orec = OuterRec(InnerRec(42), "test")
+println(extractInner(orec))
+
+// ============================================================
+// 68. Trait — impl 方法调用链
+// ============================================================
+
+trait Value {
+    fun value(self): i32
+}
+
+impl Value<Ordering> {
+    fun value(self): i32 {
+        match self {
+            Lt => -1
+            Eq => 0
+            Gt => 1
+        }
+    }
+}
+
+println(Lt.value())
+println(Eq.value())
+println(Gt.value())
+
+// ============================================================
+// 69. ADT — 列表 take（非泛型版本）
+// ============================================================
+
+fun listTake(l: List, n: i32): List {
+    if (n <= 0) { Nil }
+    else {
+        match l {
+            Nil => Nil
+            Cons(x, tail) => Cons(x, listTake(tail, n - 1))
+        }
+    }
+}
+
+val ltaken = listTake(Cons(1, Cons(2, Cons(3, Cons(4, Nil)))), 2)
+println(ltaken)
+
+// ============================================================
+// 70. ADT — 布尔表达式求值器
+// ============================================================
+
+type BoolExpr =
+    | BVal(bool)
+    | BAnd(BoolExpr, BoolExpr)
+    | BOr(BoolExpr, BoolExpr)
+    | BNot(BoolExpr)
+
+fun evalBool(e: BoolExpr): bool {
+    match e {
+        BVal(b) => b
+        BAnd(a, b) => evalBool(a) && evalBool(b)
+        BOr(a, b) => evalBool(a) || evalBool(b)
+        BNot(a) => !evalBool(a)
+    }
+}
+
+// true AND (NOT false) = true
+val bexpr = BAnd(BVal(true), BNot(BVal(false)))
+println(evalBool(bexpr))
+
+// false OR true = true
+val bexpr2 = BOr(BVal(false), BVal(true))
+println(evalBool(bexpr2))

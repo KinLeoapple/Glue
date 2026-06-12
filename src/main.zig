@@ -145,7 +145,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         if (result != .unit) {
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(allocator);
-            result.format(&buf, allocator) catch return;
+            result.format(&buf, allocator, false) catch return;
             buf.append(allocator, '\n') catch {};
             var out_buf: [4096]u8 = undefined;
             var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);

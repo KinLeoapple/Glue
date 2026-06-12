@@ -83,7 +83,7 @@ fn matchLiteralPattern(lit: ast.PatternLiteral, val: value.Value) PatternError!b
     return switch (lit) {
         .int => |raw| {
             const pat_val = parseInt(i128, raw) catch return false;
-            if (val == .integer) return val.integer == pat_val;
+            if (val == .integer) return val.integer.value == pat_val;
             return false;
         },
         .float => |raw| {

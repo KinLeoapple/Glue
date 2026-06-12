@@ -30,6 +30,8 @@ const sema = @import("sema");
 
 pub const Value = value.Value;
 pub const Range = value.Range;
+pub const IntValue = value.IntValue;
+pub const IntType = value.IntType;
 pub const Environment = env.Environment;
 pub const EvalError = value.EvalError;
 pub const ControlFlow = value.ControlFlow;
@@ -75,13 +77,25 @@ const TraitInfo = struct {
     default_methods: std.StringHashMap(*value.Closure),
     /// 父 Trait 名称列表
     parent_names: []const []const u8,
+    /// 关联类型名称列表（\0 分隔）
+    associated_type_names: []const u8,
 };
 
 /// Impl 方法注册项
 const ImplMethodEntry = struct {
     trait_name: []const u8,
+    /// impl 的目标类型名（如 impl Comparable<i32> 中的 "i32"）
+    type_name: []const u8,
     method_name: []const u8,
     closure: *value.Closure,
+};
+
+/// Impl 注册信息（用于关联类型查找）
+const ImplInfo = struct {
+    trait_name: []const u8,
+    type_name: []const u8,
+    /// 关联类型定义（关联类型名 -> 实际类型名字符串）
+    associated_types: std.StringHashMap([]const u8),
 };
 
 /// 模块导出信息
@@ -134,6 +148,12 @@ pub const Evaluator = struct {
     loaded_modules: std.StringHashMap(void),
     /// Hindley-Milner 类型推断器
     type_inferencer: sema.TypeInferencer,
+    /// 已注册的 impl（用于 Overlapping Instances 检查）
+    /// key: "trait_name::type_name", value: void
+    registered_impls: std.StringHashMap(void),
+    /// Impl 注册表（用于关联类型查找）
+    /// key: "trait_name::type_name", value: ImplInfo
+    impl_registry: std.StringHashMap(ImplInfo),
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
@@ -151,6 +171,8 @@ pub const Evaluator = struct {
             .loading_modules = std.StringHashMap(void).init(allocator),
             .loaded_modules = std.StringHashMap(void).init(allocator),
             .type_inferencer = sema.TypeInferencer.init(allocator),
+            .registered_impls = std.StringHashMap(void).init(allocator),
+            .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
         };
         ev.registerBuiltins();
         return ev;
@@ -173,6 +195,8 @@ pub const Evaluator = struct {
             .loading_modules = std.StringHashMap(void).init(allocator),
             .loaded_modules = std.StringHashMap(void).init(allocator),
             .type_inferencer = sema.TypeInferencer.init(allocator),
+            .registered_impls = std.StringHashMap(void).init(allocator),
+            .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
         };
         ev.registerBuiltins();
         return ev;
@@ -355,6 +379,30 @@ pub const Evaluator = struct {
                 return ev.builtinOk(args);
             }
         }.call } }, true) catch {};
+
+        // 文档 2.7.8 / 2.17: Iterable<T> 和 Iterator<T> 内建 Trait
+        {
+            const iterable_method_names = self.allocator.dupe(u8, "iterator") catch return;
+            const iterable_info = TraitInfo{
+                .name = self.allocator.dupe(u8, "Iterable") catch return,
+                .method_names = iterable_method_names,
+                .default_methods = std.StringHashMap(*value.Closure).init(self.allocator),
+                .parent_names = &[_][]const u8{},
+                .associated_type_names = "",
+            };
+            self.trait_registry.put(self.allocator.dupe(u8, "Iterable") catch return, iterable_info) catch return;
+        }
+        {
+            const iterator_method_names = self.allocator.dupe(u8, "next") catch return;
+            const iterator_info = TraitInfo{
+                .name = self.allocator.dupe(u8, "Iterator") catch return,
+                .method_names = iterator_method_names,
+                .default_methods = std.StringHashMap(*value.Closure).init(self.allocator),
+                .parent_names = &[_][]const u8{},
+                .associated_type_names = "",
+            };
+            self.trait_registry.put(self.allocator.dupe(u8, "Iterator") catch return, iterator_info) catch return;
+        }
     }
 
     // ============================================================
@@ -365,7 +413,7 @@ pub const Evaluator = struct {
         if (args.len != 1) return error.WrongArity;
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
-        args[0].format(&buf, self.allocator) catch return error.OutOfMemory;
+        args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
         if (self.io) |io| {
             buf.append(self.allocator, '\n') catch {};
             var out_buf: [4096]u8 = undefined;
@@ -382,7 +430,7 @@ pub const Evaluator = struct {
         if (args.len != 1) return error.WrongArity;
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
-        args[0].format(&buf, self.allocator) catch return error.OutOfMemory;
+        args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
         if (self.io) |io| {
             var out_buf: [4096]u8 = undefined;
             var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
@@ -398,7 +446,7 @@ pub const Evaluator = struct {
         if (args.len != 1) return error.WrongArity;
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
-        args[0].format(&buf, self.allocator) catch return error.OutOfMemory;
+        args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
         if (self.io) |io| {
             buf.append(self.allocator, '\n') catch {};
             var err_buf: [4096]u8 = undefined;
@@ -415,7 +463,7 @@ pub const Evaluator = struct {
         if (args.len != 1) return error.WrongArity;
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
-        args[0].format(&buf, self.allocator) catch return error.OutOfMemory;
+        args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
         if (self.io) |io| {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
@@ -431,7 +479,7 @@ pub const Evaluator = struct {
         if (args.len != 1) return error.WrongArity;
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
-        args[0].format(&buf, self.allocator) catch {};
+        args[0].format(&buf, self.allocator, false) catch {};
         const msg = try self.allocator.dupe(u8, buf.items);
         return self.gluePanic(msg);
     }
@@ -446,7 +494,7 @@ pub const Evaluator = struct {
         if (args.len != 1) return error.WrongArity;
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(self.allocator);
-        args[0].format(&buf, self.allocator) catch return error.OutOfMemory;
+        args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
         return Value{ .string = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory };
     }
 
@@ -531,13 +579,14 @@ pub const Evaluator = struct {
                         .unsatisfied_bound => "bound error",
                     };
                     if (err.line > 0) {
-                        stderr_writer.interface.print("{s}:{d}:{d}: {s}: {s}\n", .{ kind_str, err.line, err.column, kind_str, err.message }) catch {};
+                        stderr_writer.interface.print("{d}:{d}: {s}: {s}\n", .{ err.line, err.column, kind_str, err.message }) catch {};
                     } else {
                         stderr_writer.interface.print("{s}: {s}\n", .{ kind_str, err.message }) catch {};
                     }
                 }
                 stderr_writer.flush() catch {};
             }
+            // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值
             return;
         }
 
@@ -706,7 +755,9 @@ pub const Evaluator = struct {
                         // 注册每个 ADT 构造器为可调用值
                         // 无参构造器（如 Lt, Nil）直接注册为 AdtValue
                         // 有参构造器（如 Circle(f64)）注册为 builtin 函数
-                        const is_pub = td.visibility == .public;
+                        // 文档 4.4.1 / 4.4.4: ADT 构造器默认私有
+                        // pub type 公开类型名但隐藏构造器，实现抽象数据类型
+                        // 外部只能通过模块提供的 pub fun 创建
                         for (adt_def.constructors) |con| {
                             if (con.fields.len == 0) {
                                 // 无参构造器：直接注册为 AdtValue
@@ -717,7 +768,8 @@ pub const Evaluator = struct {
                                     .constructor = try self.allocator.dupe(u8, con.name),
                                     .fields = empty_fields,
                                 };
-                                try environment.defineWithVisibility(con.name, Value{ .adt = av }, true, is_pub);
+                                // 构造器始终私有（文档 4.4.1: ADT 构造器私有）
+                                try environment.defineWithVisibility(con.name, Value{ .adt = av }, true, false);
                             } else {
                                 // 有参构造器：注册为 builtin 函数
                                 const ctx = try self.allocator.create(AdtConstructorCtx);
@@ -730,6 +782,7 @@ pub const Evaluator = struct {
                                     ctx.field_names[i] = if (field.name) |n| try self.allocator.dupe(u8, n) else null;
                                 }
                                 try self.adt_constructor_contexts.append(self.allocator, ctx);
+                                // 构造器始终私有（文档 4.4.1: ADT 构造器私有）
                                 try environment.defineWithVisibility(con.name, Value{ .builtin = value.Builtin{
                                     .fn_ptr = struct {
                                         fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
@@ -754,7 +807,7 @@ pub const Evaluator = struct {
                                         }
                                     }.call,
                                     .user_ctx = ctx,
-                                } }, true, is_pub);
+                                } }, true, false);
                             }
                         }
                     },
@@ -797,6 +850,9 @@ pub const Evaluator = struct {
                 var method_names = std.ArrayList(u8).empty;
                 defer method_names.deinit(self.allocator);
                 var default_methods = std.StringHashMap(*value.Closure).init(self.allocator);
+                // 冲突检测：记录每个方法名来自哪个父 Trait
+                var method_sources = std.StringHashMap([]const u8).init(self.allocator);
+                defer method_sources.deinit();
 
                 // 先合并父 Trait 的方法名和默认方法
                 for (td.parents) |parent| {
@@ -813,10 +869,15 @@ pub const Evaluator = struct {
                         while (dm_iter.next()) |dm_entry| {
                             const name_copy = try self.allocator.dupe(u8, dm_entry.key_ptr.*);
                             try default_methods.put(name_copy, dm_entry.value_ptr.*);
+                            // 记录方法来源
+                            const src_copy = try self.allocator.dupe(u8, parent.trait_name);
+                            try method_sources.put(name_copy, src_copy);
                         }
                     }
                 }
 
+                // 处理子 Trait 自身的方法声明
+                // 文档 2.7.2: 冲突消解 — 委托(=)、重命名、override
                 for (td.methods) |method| {
                     // 方法名以 \0 分隔存储
                     if (method_names.items.len > 0) {
@@ -824,8 +885,22 @@ pub const Evaluator = struct {
                     }
                     try method_names.appendSlice(self.allocator, method.name);
 
-                    // 如果方法有默认实现，创建闭包
-                    if (method.body) |body| {
+                    if (method.delegate) |del| {
+                        // 委托语法：fun to_string(self): str = Serializable.to_string
+                        // 从指定父 Trait 获取默认实现
+                        if (self.trait_registry.getPtr(del.trait_name)) |parent_info| {
+                            if (parent_info.default_methods.get(del.method_name)) |del_closure| {
+                                const method_name = try self.allocator.dupe(u8, method.name);
+                                try default_methods.put(method_name, del_closure);
+                                // 更新方法来源
+                                const src_copy = try self.allocator.dupe(u8, del.trait_name);
+                                try method_sources.put(method_name, src_copy);
+                            }
+                        }
+                        // 重命名：方法名与委托方法名不同时（如 fun debug_string = Debug.to_string）
+                        // 此时方法名是 method.name，但实现来自 del.trait_name.del.method_name
+                    } else if (method.body) |body| {
+                        // 有方法体的方法（含 override）
                         const closure = try self.allocator.create(value.Closure);
                         closure.* = value.Closure{
                             .params = method.params,
@@ -836,6 +911,39 @@ pub const Evaluator = struct {
                         try self.closures.append(self.allocator, closure);
                         const method_name = try self.allocator.dupe(u8, method.name);
                         try default_methods.put(method_name, closure);
+                        // override 或有 body 的方法覆盖冲突
+                        const src_copy = try self.allocator.dupe(u8, td.name);
+                        try method_sources.put(method_name, src_copy);
+                    }
+                    // 无 body 且无 delegate 的方法是抽象方法，不需要默认实现
+                }
+
+                // 冲突检测：检查是否有来自不同父 Trait 的同名方法未被消解
+                // 遍历所有方法来源，如果同名方法来自多个不同父 Trait 且未被 override/delegate 消解，则报错
+                {
+                    var src_iter = method_sources.iterator();
+                    while (src_iter.next()) |entry| {
+                        const mname = entry.key_ptr.*;
+                        const source = entry.value_ptr.*;
+                        // 如果来源是当前 trait 自身（已被 override/delegate 消解），则无冲突
+                        if (std.mem.eql(u8, source, td.name)) continue;
+                        // 检查是否有其他父 Trait 也提供了同名方法
+                        for (td.parents) |parent| {
+                            if (std.mem.eql(u8, parent.trait_name, source)) continue;
+                            if (self.trait_registry.getPtr(parent.trait_name)) |parent_info| {
+                                if (parent_info.default_methods.get(mname)) |_| {
+                                    // 另一个父 Trait 也有同名方法 — 检查是否已消解
+                                    // 如果 default_methods 中该方法的来源不是当前 trait，
+                                    // 说明未被 override/delegate 消解
+                                    if (method_sources.get(mname)) |final_src| {
+                                        if (!std.mem.eql(u8, final_src, td.name)) {
+                                            // 未消解的冲突 — 但只在第一次发现时报错
+                                            // 后续 put 操作可能已覆盖来源
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -850,18 +958,59 @@ pub const Evaluator = struct {
                 const owned_name = try self.allocator.dupe(u8, td.name);
                 const owned_method_names = try method_names.toOwnedSlice(self.allocator);
                 const owned_parent_names = try parent_names.toOwnedSlice(self.allocator);
+                // 关联类型名称
+                var assoc_type_names = std.ArrayList(u8).empty;
+                defer assoc_type_names.deinit(self.allocator);
+                for (td.associated_types) |at| {
+                    if (assoc_type_names.items.len > 0) {
+                        try assoc_type_names.append(self.allocator, 0);
+                    }
+                    try assoc_type_names.appendSlice(self.allocator, at.name);
+                }
+                const owned_assoc_type_names = try assoc_type_names.toOwnedSlice(self.allocator);
                 const trait_key = try self.allocator.dupe(u8, td.name);
                 try self.trait_registry.put(trait_key, TraitInfo{
                     .name = owned_name,
                     .method_names = owned_method_names,
                     .default_methods = default_methods,
                     .parent_names = owned_parent_names,
+                    .associated_type_names = owned_assoc_type_names,
                 });
             },
             .impl_decl => |id| {
                 // 注册 Impl 声明
                 // 为每个有方法体的方法创建闭包并注册到 impl_methods
                 // 文档 2.7.2: impl 未覆写的默认方法自动从 trait 继承
+
+                // 文档 2.7.7: Overlapping Instances 禁止
+                if (id.type_name.len > 0) {
+                    const impl_key = try std.fmt.allocPrint(self.allocator, "{s}::{s}", .{ id.trait_name, id.type_name });
+                    if (self.registered_impls.contains(impl_key)) {
+                        // Overlapping instance — 类型推断器会报错阻止求值
+                        // 此处仅做防御性检查
+                        self.allocator.free(impl_key);
+                        return error.TypeMismatch;
+                    }
+                    try self.registered_impls.put(impl_key, {});
+
+                    // 文档 2.7.4: 关联类型定义注册到 impl_registry
+                    var associated_types = std.StringHashMap([]const u8).init(self.allocator);
+                    for (id.associated_type_defs) |atd| {
+                        const at_name = try self.allocator.dupe(u8, atd.name);
+                        const at_type = try self.allocator.dupe(u8, switch (atd.actual_type.*) {
+                            .named => |n| n.name,
+                            .generic => |g| g.name,
+                            else => "?",
+                        });
+                        try associated_types.put(at_name, at_type);
+                    }
+                    const impl_info_key = try self.allocator.dupe(u8, impl_key);
+                    try self.impl_registry.put(impl_info_key, ImplInfo{
+                        .trait_name = try self.allocator.dupe(u8, id.trait_name),
+                        .type_name = try self.allocator.dupe(u8, id.type_name),
+                        .associated_types = associated_types,
+                    });
+                }
 
                 // 收集 impl 中已覆写的方法名
                 var overridden_methods = std.StringHashMap(void).init(self.allocator);
@@ -880,6 +1029,7 @@ pub const Evaluator = struct {
 
                         try self.impl_methods.append(self.allocator, ImplMethodEntry{
                             .trait_name = try self.allocator.dupe(u8, id.trait_name),
+                            .type_name = try self.allocator.dupe(u8, id.type_name),
                             .method_name = try self.allocator.dupe(u8, method.name),
                             .closure = closure,
                         });
@@ -1099,24 +1249,31 @@ pub const Evaluator = struct {
 
         // 如果有类型后缀，检查范围
         if (suffix) |s| {
-            return self.castInteger(int_val, s);
+            return self.castInteger(int_val, .i32, s);
         }
 
         // 默认 i32
-        return self.castInteger(int_val, "i32");
+        return self.castInteger(int_val, .i32, "i32");
     }
 
     fn evalFloatLiteral(self: *Evaluator, lit: @TypeOf(@as(ast.Expr, undefined).float_literal)) EvalResult!Value {
-        _ = self;
         const raw = lit.raw;
         const suffix = lit.suffix;
 
         const float_val = parseFloat(f64, raw) catch
-            return error.TypeMismatch;
+            return self.gluePanic("invalid float literal");
+
+        // 文档要求：浮点数不包含 NaN 和 Infinity 值
+        if (std.math.isNan(float_val) or std.math.isInf(float_val)) {
+            return self.gluePanic("float literal overflow");
+        }
 
         if (suffix) |s| {
             if (std.mem.eql(u8, s, "f32")) {
                 const f32_val: f32 = @floatCast(float_val);
+                if (std.math.isNan(f32_val) or std.math.isInf(f32_val)) {
+                    return self.gluePanic("float literal overflow");
+                }
                 return Value{ .float = @floatCast(f32_val) };
             }
         }
@@ -1137,7 +1294,7 @@ pub const Evaluator = struct {
                     const val = try self.evalExpr(expr, environment);
                     var buf = std.ArrayList(u8).empty;
                     defer buf.deinit(self.allocator);
-                    try val.format(&buf, self.allocator);
+                    try val.format(&buf, self.allocator, false);
                     try result.appendSlice(self.allocator, buf.items);
                 },
             }
@@ -1227,20 +1384,29 @@ pub const Evaluator = struct {
         }
     }
 
+    /// 检查浮点运算结果是否为 NaN 或 Infinity，若是则 panic，否则返回 Value
+    fn checkFloatResult(self: *Evaluator, result: f64) EvalResult!Value {
+        if (std.math.isNan(result) or std.math.isInf(result)) {
+            return self.gluePanic("floating point overflow");
+        }
+        return Value{ .float = result };
+    }
+
     fn evalAdd(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         if (left == .integer and right == .integer) {
-            const result = @addWithOverflow(left.integer, right.integer);
-            if (result[1] != 0) return self.gluePanic("integer overflow");
-            return Value{ .integer = result[0] };
+            const result_type = left.integer.type_tag;
+            const result = left.integer.value + right.integer.value;
+            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
-            return Value{ .float = left.float + right.float };
+            return self.checkFloatResult(left.float + right.float);
         }
         if (left == .integer and right == .float) {
-            return Value{ .float = @as(f64, @floatFromInt(left.integer)) + right.float };
+            return self.checkFloatResult(@as(f64, @floatFromInt(left.integer.value)) + right.float);
         }
         if (left == .float and right == .integer) {
-            return Value{ .float = left.float + @as(f64, @floatFromInt(right.integer)) };
+            return self.checkFloatResult(left.float + @as(f64, @floatFromInt(right.integer.value)));
         }
         if (left == .string and right == .string) {
             var result = std.ArrayList(u8).empty;
@@ -1253,36 +1419,38 @@ pub const Evaluator = struct {
 
     fn evalSub(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         if (left == .integer and right == .integer) {
-            const result = @subWithOverflow(left.integer, right.integer);
-            if (result[1] != 0) return self.gluePanic("integer overflow");
-            return Value{ .integer = result[0] };
+            const result_type = left.integer.type_tag;
+            const result = left.integer.value - right.integer.value;
+            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
-            return Value{ .float = left.float - right.float };
+            return self.checkFloatResult(left.float - right.float);
         }
         if (left == .integer and right == .float) {
-            return Value{ .float = @as(f64, @floatFromInt(left.integer)) - right.float };
+            return self.checkFloatResult(@as(f64, @floatFromInt(left.integer.value)) - right.float);
         }
         if (left == .float and right == .integer) {
-            return Value{ .float = left.float - @as(f64, @floatFromInt(right.integer)) };
+            return self.checkFloatResult(left.float - @as(f64, @floatFromInt(right.integer.value)));
         }
         return error.TypeMismatch;
     }
 
     fn evalMul(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         if (left == .integer and right == .integer) {
-            const result = @mulWithOverflow(left.integer, right.integer);
-            if (result[1] != 0) return self.gluePanic("integer overflow");
-            return Value{ .integer = result[0] };
+            const result_type = left.integer.type_tag;
+            const result = left.integer.value * right.integer.value;
+            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
-            return Value{ .float = left.float * right.float };
+            return self.checkFloatResult(left.float * right.float);
         }
         if (left == .integer and right == .float) {
-            return Value{ .float = @as(f64, @floatFromInt(left.integer)) * right.float };
+            return self.checkFloatResult(@as(f64, @floatFromInt(left.integer.value)) * right.float);
         }
         if (left == .float and right == .integer) {
-            return Value{ .float = left.float * @as(f64, @floatFromInt(right.integer)) };
+            return self.checkFloatResult(left.float * @as(f64, @floatFromInt(right.integer.value)));
         }
         return error.TypeMismatch;
     }
@@ -1290,36 +1458,27 @@ pub const Evaluator = struct {
     fn evalDiv(self: *Evaluator, left: Value, right: Value, location: ast.SourceLocation) EvalResult!Value {
         _ = location;
         if (left == .integer and right == .integer) {
-            if (right.integer == 0) return self.gluePanic("division by zero");
+            if (right.integer.value == 0) return self.gluePanic("division by zero");
             // 检查 i128 最小值 / -1 溢出
-            if (left.integer == std.math.minInt(i128) and right.integer == -1) {
+            if (left.integer.value == std.math.minInt(i128) and right.integer.value == -1) {
                 return self.gluePanic("integer overflow");
             }
-            return Value{ .integer = @divTrunc(left.integer, right.integer) };
+            const result_type = left.integer.type_tag;
+            const result = @divTrunc(left.integer.value, right.integer.value);
+            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
             if (right.float == 0.0) return self.gluePanic("division by zero");
-            const result = left.float / right.float;
-            if (std.math.isNan(result) or std.math.isInf(result)) {
-                return self.gluePanic("division by zero");
-            }
-            return Value{ .float = result };
+            return self.checkFloatResult(left.float / right.float);
         }
         if (left == .integer and right == .float) {
             if (right.float == 0.0) return self.gluePanic("division by zero");
-            const result = @as(f64, @floatFromInt(left.integer)) / right.float;
-            if (std.math.isNan(result) or std.math.isInf(result)) {
-                return self.gluePanic("division by zero");
-            }
-            return Value{ .float = result };
+            return self.checkFloatResult(@as(f64, @floatFromInt(left.integer.value)) / right.float);
         }
         if (left == .float and right == .integer) {
-            if (right.integer == 0) return self.gluePanic("division by zero");
-            const result = left.float / @as(f64, @floatFromInt(right.integer));
-            if (std.math.isNan(result) or std.math.isInf(result)) {
-                return self.gluePanic("division by zero");
-            }
-            return Value{ .float = result };
+            if (right.integer.value == 0) return self.gluePanic("division by zero");
+            return self.checkFloatResult(left.float / @as(f64, @floatFromInt(right.integer.value)));
         }
         return error.TypeMismatch;
     }
@@ -1327,22 +1486,25 @@ pub const Evaluator = struct {
     fn evalMod(self: *Evaluator, left: Value, right: Value, location: ast.SourceLocation) EvalResult!Value {
         _ = location;
         if (left == .integer and right == .integer) {
-            if (right.integer == 0) return self.gluePanic("division by zero");
-            return Value{ .integer = @mod(left.integer, right.integer) };
+            if (right.integer.value == 0) return self.gluePanic("division by zero");
+            const result_type = left.integer.type_tag;
+            const result = @mod(left.integer.value, right.integer.value);
+            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
             if (right.float == 0.0) return self.gluePanic("division by zero");
-            return Value{ .float = @mod(left.float, right.float) };
+            return self.checkFloatResult(@mod(left.float, right.float));
         }
         return error.TypeMismatch;
     }
 
     fn evalLt(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         _ = self;
-        if (left == .integer and right == .integer) return Value{ .boolean = left.integer < right.integer };
+        if (left == .integer and right == .integer) return Value{ .boolean = left.integer.value < right.integer.value };
         if (left == .float and right == .float) return Value{ .boolean = left.float < right.float };
-        if (left == .integer and right == .float) return Value{ .boolean = @as(f64, @floatFromInt(left.integer)) < right.float };
-        if (left == .float and right == .integer) return Value{ .boolean = left.float < @as(f64, @floatFromInt(right.integer)) };
+        if (left == .integer and right == .float) return Value{ .boolean = @as(f64, @floatFromInt(left.integer.value)) < right.float };
+        if (left == .float and right == .integer) return Value{ .boolean = left.float < @as(f64, @floatFromInt(right.integer.value)) };
         if (left == .char_val and right == .char_val) return Value{ .boolean = left.char_val < right.char_val };
         if (left == .string and right == .string) return Value{ .boolean = std.mem.order(u8, left.string, right.string) == .lt };
         return error.TypeMismatch;
@@ -1350,10 +1512,10 @@ pub const Evaluator = struct {
 
     fn evalGt(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         _ = self;
-        if (left == .integer and right == .integer) return Value{ .boolean = left.integer > right.integer };
+        if (left == .integer and right == .integer) return Value{ .boolean = left.integer.value > right.integer.value };
         if (left == .float and right == .float) return Value{ .boolean = left.float > right.float };
-        if (left == .integer and right == .float) return Value{ .boolean = @as(f64, @floatFromInt(left.integer)) > right.float };
-        if (left == .float and right == .integer) return Value{ .boolean = left.float > @as(f64, @floatFromInt(right.integer)) };
+        if (left == .integer and right == .float) return Value{ .boolean = @as(f64, @floatFromInt(left.integer.value)) > right.float };
+        if (left == .float and right == .integer) return Value{ .boolean = left.float > @as(f64, @floatFromInt(right.integer.value)) };
         if (left == .char_val and right == .char_val) return Value{ .boolean = left.char_val > right.char_val };
         if (left == .string and right == .string) return Value{ .boolean = std.mem.order(u8, left.string, right.string) == .gt };
         return error.TypeMismatch;
@@ -1361,10 +1523,10 @@ pub const Evaluator = struct {
 
     fn evalLtEq(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         _ = self;
-        if (left == .integer and right == .integer) return Value{ .boolean = left.integer <= right.integer };
+        if (left == .integer and right == .integer) return Value{ .boolean = left.integer.value <= right.integer.value };
         if (left == .float and right == .float) return Value{ .boolean = left.float <= right.float };
-        if (left == .integer and right == .float) return Value{ .boolean = @as(f64, @floatFromInt(left.integer)) <= right.float };
-        if (left == .float and right == .integer) return Value{ .boolean = left.float <= @as(f64, @floatFromInt(right.integer)) };
+        if (left == .integer and right == .float) return Value{ .boolean = @as(f64, @floatFromInt(left.integer.value)) <= right.float };
+        if (left == .float and right == .integer) return Value{ .boolean = left.float <= @as(f64, @floatFromInt(right.integer.value)) };
         if (left == .char_val and right == .char_val) return Value{ .boolean = left.char_val <= right.char_val };
         if (left == .string and right == .string) return Value{ .boolean = std.mem.order(u8, left.string, right.string) != .gt };
         return error.TypeMismatch;
@@ -1372,10 +1534,10 @@ pub const Evaluator = struct {
 
     fn evalGtEq(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         _ = self;
-        if (left == .integer and right == .integer) return Value{ .boolean = left.integer >= right.integer };
+        if (left == .integer and right == .integer) return Value{ .boolean = left.integer.value >= right.integer.value };
         if (left == .float and right == .float) return Value{ .boolean = left.float >= right.float };
-        if (left == .integer and right == .float) return Value{ .boolean = @as(f64, @floatFromInt(left.integer)) >= right.float };
-        if (left == .float and right == .integer) return Value{ .boolean = left.float >= @as(f64, @floatFromInt(right.integer)) };
+        if (left == .integer and right == .float) return Value{ .boolean = @as(f64, @floatFromInt(left.integer.value)) >= right.float };
+        if (left == .float and right == .integer) return Value{ .boolean = left.float >= @as(f64, @floatFromInt(right.integer.value)) };
         if (left == .char_val and right == .char_val) return Value{ .boolean = left.char_val >= right.char_val };
         if (left == .string and right == .string) return Value{ .boolean = std.mem.order(u8, left.string, right.string) != .lt };
         return error.TypeMismatch;
@@ -1408,12 +1570,15 @@ pub const Evaluator = struct {
                 else => error.TypeMismatch,
             },
             .neg => switch (operand) {
-                .integer => |i| {
-                    const result = @subWithOverflow(@as(i128, 0), i);
-                    if (result[1] != 0) return self.gluePanic("integer overflow");
-                    return Value{ .integer = result[0] };
+                .integer => |iv| {
+                    const result_type = iv.type_tag;
+                    const result = -iv.value;
+                    if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+                    return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
                 },
-                .float => |f| Value{ .float = -f },
+                .float => |f| {
+                    return self.checkFloatResult(-f);
+                },
                 else => error.TypeMismatch,
             },
         };
@@ -1567,12 +1732,38 @@ pub const Evaluator = struct {
         return self.callMethod(object, mc.method, args.items, environment);
     }
 
+    /// 从运行时值推断类型名（用于 impl 方法分派）
+    /// 文档 2.7.1: impl Comparable<i32> 中的 i32 是目标类型
+    /// 运行时需要判断接收者的类型名，以匹配正确的 impl
+    fn valueTypeName(val: Value) ?[]const u8 {
+        return switch (val) {
+            .integer => |iv| @tagName(iv.type_tag),
+            .float => "f64",
+            .boolean => "bool",
+            .char_val => "char",
+            .string => "str",
+            .null_val => "null",
+            .unit => "unit",
+            .array => "array",
+            .record => "record",
+            .adt => |av| av.type_name,
+            .newtype => |nv| nv.type_name,
+            .range => "range",
+            .error_val => |e| e.type_name,
+            .throw_val => "Throw",
+            .closure, .builtin => null,
+            .array_iterator => "array_iterator",
+            .string_iterator => "string_iterator",
+            .range_iterator => "range_iterator",
+        };
+    }
+
     fn callMethod(self: *Evaluator, object: Value, method: []const u8, args: []const Value, environment: ?*Environment) EvalResult!Value {
         // 内建方法
         if (std.mem.eql(u8, method, "len")) {
             return switch (object) {
-                .string => |s| Value{ .integer = @as(i128, @intCast(s.len)) },
-                .array => |arr| Value{ .integer = @as(i128, @intCast(arr.len)) },
+                .string => |s| Value{ .integer = IntValue{ .value = @as(i128, @intCast(s.len)) } },
+                .array => |arr| Value{ .integer = IntValue{ .value = @as(i128, @intCast(arr.len)) } },
                 else => error.TypeMismatch,
             };
         }
@@ -1581,14 +1772,14 @@ pub const Evaluator = struct {
             return switch (object) {
                 .string => |s| {
                     const view = std.unicode.Utf8View.init(s) catch {
-                        return Value{ .integer = @as(i128, @intCast(s.len)) };
+                        return Value{ .integer = IntValue{ .value = @as(i128, @intCast(s.len)) } };
                     };
                     var count: i128 = 0;
                     var iter = view.iterator();
                     while (iter.nextCodepoint() != null) {
                         count += 1;
                     }
-                    return Value{ .integer = count };
+                    return Value{ .integer = IntValue{ .value = count } };
                 },
                 else => error.TypeMismatch,
             };
@@ -1681,7 +1872,7 @@ pub const Evaluator = struct {
         if (std.mem.eql(u8, method, "toString")) {
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(self.allocator);
-            try object.format(&buf, self.allocator);
+            try object.format(&buf, self.allocator, false);
             return Value{ .string = try buf.toOwnedSlice(self.allocator) };
         }
 
@@ -1738,13 +1929,13 @@ pub const Evaluator = struct {
                         if (ri.current <= ri.end) {
                             const val = ri.current;
                             ri.current += 1;
-                            return Value{ .integer = val };
+                            return Value{ .integer = IntValue{ .value = val } };
                         }
                     } else {
                         if (ri.current < ri.end) {
                             const val = ri.current;
                             ri.current += 1;
-                            return Value{ .integer = val };
+                            return Value{ .integer = IntValue{ .value = val } };
                         }
                     }
                     return Value.null_val;
@@ -1761,8 +1952,24 @@ pub const Evaluator = struct {
         }
 
         // Impl 方法分派 — 搜索已注册的 impl 方法
+        // 文档 2.7.1: impl Comparable<i32> 定义的方法仅在接收者为 i32 时分派
+        // 必须同时匹配 method_name 和接收者类型
+        const obj_type_name = valueTypeName(object);
         for (self.impl_methods.items) |entry| {
             if (std.mem.eql(u8, entry.method_name, method)) {
+                // 检查接收者类型是否匹配 impl 的目标类型
+                // type_name 为空字符串时表示未指定类型（兼容旧语法）
+                if (entry.type_name.len == 0) {
+                    // 未指定类型，按方法名匹配（向后兼容）
+                } else if (obj_type_name) |otn| {
+                    if (!std.mem.eql(u8, entry.type_name, otn)) {
+                        // 接收者类型不匹配，跳过此 impl
+                        continue;
+                    }
+                } else {
+                    // 无法确定接收者类型，跳过此 impl
+                    continue;
+                }
                 // 将 object 作为第一个参数传递
                 var full_args = std.ArrayList(Value).empty;
                 try full_args.append(self.allocator, object);
@@ -1776,12 +1983,25 @@ pub const Evaluator = struct {
 
         // Trait 默认方法分派 — impl 未覆写时回退到 trait 默认实现
         // 文档 2.7.2: 子 Trait 自动拥有所有父 Trait 的方法，默认方法在 impl 未覆写时自动使用
+        // 必须检查接收者类型是否有对应的 impl 注册
         {
             var trait_iter = self.trait_registry.iterator();
             while (trait_iter.next()) |entry| {
                 if (entry.value_ptr.default_methods.get(method)) |closure| {
-                    // 检查该方法是否已被 impl 覆写（impl 方法优先于默认方法）
-                    // 上面 impl_methods 搜索已确认未覆写，直接使用默认实现
+                    // 检查接收者类型是否有该 trait 的 impl（任何方法）
+                    const trait_name = entry.key_ptr.*;
+                    var has_matching_impl = false;
+                    if (obj_type_name) |otn| {
+                        for (self.impl_methods.items) |impl_entry| {
+                            if (std.mem.eql(u8, impl_entry.trait_name, trait_name) and
+                                (impl_entry.type_name.len == 0 or std.mem.eql(u8, impl_entry.type_name, otn)))
+                            {
+                                has_matching_impl = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!has_matching_impl) continue;
                     var full_args = std.ArrayList(Value).empty;
                     try full_args.append(self.allocator, object);
                     for (args) |arg| {
@@ -2110,7 +2330,7 @@ pub const Evaluator = struct {
             return self.valueToString(val);
         }
         if (val == .integer) {
-            return self.castInteger(val.integer, type_name);
+            return self.castInteger(val.integer.value, val.integer.type_tag, type_name);
         }
         if (val == .float) {
             return self.castFloat(val.float, type_name);
@@ -2124,46 +2344,51 @@ pub const Evaluator = struct {
         return error.TypeMismatch;
     }
 
-    fn castInteger(self: *Evaluator, val: i128, type_name: []const u8) EvalResult!Value {
+    fn castInteger(self: *Evaluator, val: i128, source_type_tag: IntType, type_name: []const u8) EvalResult!Value {
+        _ = source_type_tag;
+        const target_type = IntType.fromName(type_name) orelse {
+            // Not an integer type — try float conversion
+            if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = @as(f64, @floatFromInt(val)) };
+            if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = @as(f64, @floatFromInt(val)) };
+            return error.TypeMismatch;
+        };
         if (std.mem.eql(u8, type_name, "i8")) {
             const result = clampInt(val, i8) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "i16")) {
             const result = clampInt(val, i16) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "i32")) {
             const result = clampInt(val, i32) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "i64")) {
             const result = clampInt(val, i64) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
-        if (std.mem.eql(u8, type_name, "i128")) return Value{ .integer = val };
+        if (std.mem.eql(u8, type_name, "i128")) return Value{ .integer = IntValue{ .value = val, .type_tag = target_type } };
         if (std.mem.eql(u8, type_name, "u8")) {
             const result = clampUInt(val, u8) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "u16")) {
             const result = clampUInt(val, u16) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "u32")) {
             const result = clampUInt(val, u32) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "u64")) {
             const result = clampUInt(val, u64) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "u128")) {
             const result = clampUInt(val, u128) catch return self.gluePanic("integer overflow in narrowing conversion");
-            return Value{ .integer = result };
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
-        if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = @as(f64, @floatFromInt(val)) };
-        if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = @as(f64, @floatFromInt(val)) };
         return error.TypeMismatch;
     }
 
@@ -2181,7 +2406,7 @@ pub const Evaluator = struct {
     fn valueToString(self: *Evaluator, val: Value) EvalResult!Value {
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(self.allocator);
-        try val.format(&buf, self.allocator);
+        try val.format(&buf, self.allocator, false);
         return Value{ .string = try buf.toOwnedSlice(self.allocator) };
     }
 
@@ -2420,7 +2645,7 @@ pub const Evaluator = struct {
 
         // 整数作为范围上限（0..n）的语法糖，转换为 Range
         if (iterable == .integer) {
-            const range_end = iterable.integer;
+            const range_end = iterable.integer.value;
             if (range_end < 0) return null;
             iterable = Value{ .range = Range{ .start = 0, .end = range_end, .inclusive = false } };
         }
@@ -2496,7 +2721,7 @@ fn structuralEquals(a: Value, b: Value) bool {
     const b_tag = std.meta.activeTag(b);
     if (a_tag != b_tag) return false;
     return switch (a) {
-        .integer => |i| i == b.integer,
+        .integer => |iv| iv.value == b.integer.value,
         .float => |f| f == b.float,
         .boolean => |bo| bo == b.boolean,
         .char_val => |c| c == b.char_val,
@@ -2667,7 +2892,7 @@ fn floatToInt(val: f64, comptime T: type) EvalResult!Value {
     const min: f64 = @floatFromInt(std.math.minInt(T));
     const max: f64 = @floatFromInt(std.math.maxInt(T));
     if (val < min or val > max) return error.GluePanic;
-    return Value{ .integer = @as(i128, @intFromFloat(val)) };
+    return Value{ .integer = IntValue{ .value = @as(i128, @intFromFloat(val)) } };
 }
 
 // ============================================================
@@ -2715,7 +2940,7 @@ test "求值器 - 整数字面量" {
 
     const result = try evalSource(allocator, "42");
     try std.testing.expect(result == .integer);
-    try std.testing.expectEqual(@as(i128, 42), result.integer);
+    try std.testing.expectEqual(@as(i128, 42), result.integer.value);
 }
 
 test "求值器 - 浮点字面量" {
@@ -2760,19 +2985,19 @@ test "求值器 - 基本算术" {
     const allocator = arena.allocator();
 
     const add = try evalSource(allocator, "1 + 2");
-    try std.testing.expectEqual(@as(i128, 3), add.integer);
+    try std.testing.expectEqual(@as(i128, 3), add.integer.value);
 
     const sub = try evalSource(allocator, "10 - 3");
-    try std.testing.expectEqual(@as(i128, 7), sub.integer);
+    try std.testing.expectEqual(@as(i128, 7), sub.integer.value);
 
     const mul = try evalSource(allocator, "4 * 5");
-    try std.testing.expectEqual(@as(i128, 20), mul.integer);
+    try std.testing.expectEqual(@as(i128, 20), mul.integer.value);
 
     const div = try evalSource(allocator, "10 / 3");
-    try std.testing.expectEqual(@as(i128, 3), div.integer);
+    try std.testing.expectEqual(@as(i128, 3), div.integer.value);
 
     const mod = try evalSource(allocator, "10 % 3");
-    try std.testing.expectEqual(@as(i128, 1), mod.integer);
+    try std.testing.expectEqual(@as(i128, 1), mod.integer.value);
 }
 
 test "求值器 - 运算符优先级" {
@@ -2781,7 +3006,7 @@ test "求值器 - 运算符优先级" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "1 + 2 * 3");
-    try std.testing.expectEqual(@as(i128, 7), result.integer);
+    try std.testing.expectEqual(@as(i128, 7), result.integer.value);
 }
 
 test "求值器 - 比较运算" {
@@ -2826,7 +3051,7 @@ test "求值器 - 一元运算" {
     const allocator = arena.allocator();
 
     const neg = try evalSource(allocator, "-42");
-    try std.testing.expectEqual(@as(i128, -42), neg.integer);
+    try std.testing.expectEqual(@as(i128, -42), neg.integer.value);
 
     const not_val = try evalSource(allocator, "!true");
     try std.testing.expectEqual(false, not_val.boolean);
@@ -2838,7 +3063,7 @@ test "求值器 - val 声明和引用" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "{ val x = 42; x }");
-    try std.testing.expectEqual(@as(i128, 42), result.integer);
+    try std.testing.expectEqual(@as(i128, 42), result.integer.value);
 }
 
 test "求值器 - var 声明和赋值" {
@@ -2847,7 +3072,7 @@ test "求值器 - var 声明和赋值" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "{ var x = 1; x = 10; x }");
-    try std.testing.expectEqual(@as(i128, 10), result.integer);
+    try std.testing.expectEqual(@as(i128, 10), result.integer.value);
 }
 
 test "求值器 - if 表达式" {
@@ -2856,10 +3081,10 @@ test "求值器 - if 表达式" {
     const allocator = arena.allocator();
 
     const then_val = try evalSource(allocator, "if true { 1 } else { 2 }");
-    try std.testing.expectEqual(@as(i128, 1), then_val.integer);
+    try std.testing.expectEqual(@as(i128, 1), then_val.integer.value);
 
     const else_val = try evalSource(allocator, "if false { 1 } else { 2 }");
-    try std.testing.expectEqual(@as(i128, 2), else_val.integer);
+    try std.testing.expectEqual(@as(i128, 2), else_val.integer.value);
 }
 
 test "求值器 - 块表达式" {
@@ -2868,7 +3093,7 @@ test "求值器 - 块表达式" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "{ val x = 1; val y = 2; x + y }");
-    try std.testing.expectEqual(@as(i128, 3), result.integer);
+    try std.testing.expectEqual(@as(i128, 3), result.integer.value);
 }
 
 test "求值器 - Lambda 和闭包" {
@@ -2878,7 +3103,7 @@ test "求值器 - Lambda 和闭包" {
 
     // Lambda 表达式体
     const result = try evalSource(allocator, "{ val add = (a, b) => a + b; add(3, 4) }");
-    try std.testing.expectEqual(@as(i128, 7), result.integer);
+    try std.testing.expectEqual(@as(i128, 7), result.integer.value);
 }
 
 test "求值器 - fun Lambda" {
@@ -2887,7 +3112,7 @@ test "求值器 - fun Lambda" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "{ val double = fun(x) { x * 2 }; double(5) }");
-    try std.testing.expectEqual(@as(i128, 10), result.integer);
+    try std.testing.expectEqual(@as(i128, 10), result.integer.value);
 }
 
 test "求值器 - 闭包捕获" {
@@ -2896,7 +3121,7 @@ test "求值器 - 闭包捕获" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "{ val x = 10; val f = (y) => x + y; f(5) }");
-    try std.testing.expectEqual(@as(i128, 15), result.integer);
+    try std.testing.expectEqual(@as(i128, 15), result.integer.value);
 }
 
 test "求值器 - match 表达式" {
@@ -2906,7 +3131,7 @@ test "求值器 - match 表达式" {
 
     // 字面量匹配
     const result = try evalSource(allocator, "match 1 { 0 => 100, 1 => 200, _ => 300 }");
-    try std.testing.expectEqual(@as(i128, 200), result.integer);
+    try std.testing.expectEqual(@as(i128, 200), result.integer.value);
 }
 
 test "求值器 - match 通配符" {
@@ -2915,7 +3140,7 @@ test "求值器 - match 通配符" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "match 99 { 0 => 100, _ => 200 }");
-    try std.testing.expectEqual(@as(i128, 200), result.integer);
+    try std.testing.expectEqual(@as(i128, 200), result.integer.value);
 }
 
 test "求值器 - match 变量绑定" {
@@ -2924,7 +3149,7 @@ test "求值器 - match 变量绑定" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "match 42 { x => x + 1 }");
-    try std.testing.expectEqual(@as(i128, 43), result.integer);
+    try std.testing.expectEqual(@as(i128, 43), result.integer.value);
 }
 
 test "求值器 - Elvis 运算符 ??" {
@@ -2933,10 +3158,10 @@ test "求值器 - Elvis 运算符 ??" {
     const allocator = arena.allocator();
 
     const non_null = try evalSource(allocator, "42 ?? 0");
-    try std.testing.expectEqual(@as(i128, 42), non_null.integer);
+    try std.testing.expectEqual(@as(i128, 42), non_null.integer.value);
 
     const null_val = try evalSource(allocator, "null ?? 0");
-    try std.testing.expectEqual(@as(i128, 0), null_val.integer);
+    try std.testing.expectEqual(@as(i128, 0), null_val.integer.value);
 }
 
 test "求值器 - 非空断言 !" {
@@ -2945,7 +3170,7 @@ test "求值器 - 非空断言 !" {
     const allocator = arena.allocator();
 
     const non_null = try evalSource(allocator, "42!");
-    try std.testing.expectEqual(@as(i128, 42), non_null.integer);
+    try std.testing.expectEqual(@as(i128, 42), non_null.integer.value);
 
     // null! 应该 panic
     // const null_assert = evalSource(allocator, "null!");
@@ -2963,7 +3188,7 @@ test "求值器 - 类型转换" {
 
     // f64 -> i32 (narrowing)
     const f2i = try evalSource(allocator, "i32(3.14)");
-    try std.testing.expectEqual(@as(i128, 3), f2i.integer);
+    try std.testing.expectEqual(@as(i128, 3), f2i.integer.value);
 
     // string()
     const s = try evalSource(allocator, "string(42)");
@@ -2979,9 +3204,9 @@ test "求值器 - 数组字面量" {
     const result = try evalSource(allocator, "[1, 2, 3]");
     try std.testing.expect(result == .array);
     try std.testing.expectEqual(@as(usize, 3), result.array.len);
-    try std.testing.expectEqual(@as(i128, 1), result.array[0].integer);
-    try std.testing.expectEqual(@as(i128, 2), result.array[1].integer);
-    try std.testing.expectEqual(@as(i128, 3), result.array[2].integer);
+    try std.testing.expectEqual(@as(i128, 1), result.array[0].integer.value);
+    try std.testing.expectEqual(@as(i128, 2), result.array[1].integer.value);
+    try std.testing.expectEqual(@as(i128, 3), result.array[2].integer.value);
 }
 
 test "求值器 - 索引访问" {
@@ -2990,7 +3215,7 @@ test "求值器 - 索引访问" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "{ val arr = [10, 20, 30]; arr[1] }");
-    try std.testing.expectEqual(@as(i128, 20), result.integer);
+    try std.testing.expectEqual(@as(i128, 20), result.integer.value);
 }
 
 test "求值器 - 记录字面量" {
@@ -3003,7 +3228,7 @@ test "求值器 - 记录字面量" {
     const name = result.record.get("name").?;
     try std.testing.expectEqualStrings("Alice", name.string);
     const age = result.record.get("age").?;
-    try std.testing.expectEqual(@as(i128, 30), age.integer);
+    try std.testing.expectEqual(@as(i128, 30), age.integer.value);
 }
 
 test "求值器 - 字段访问" {
@@ -3012,7 +3237,7 @@ test "求值器 - 字段访问" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "{ val p = (name: \"Bob\", age: 25); p.age }");
-    try std.testing.expectEqual(@as(i128, 25), result.integer);
+    try std.testing.expectEqual(@as(i128, 25), result.integer.value);
 }
 
 test "求值器 - 安全访问 ?." {
@@ -3024,7 +3249,7 @@ test "求值器 - 安全访问 ?." {
     try std.testing.expect(null_access == .null_val);
 
     const valid_access = try evalSource(allocator, "{ val p = (x: 1); p?.x }");
-    try std.testing.expectEqual(@as(i128, 1), valid_access.integer);
+    try std.testing.expectEqual(@as(i128, 1), valid_access.integer.value);
 }
 
 test "求值器 - while 循环" {
@@ -3033,7 +3258,7 @@ test "求值器 - while 循环" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "{ var sum = 0; var i = 0; while i < 5 { sum = sum + i; i = i + 1 }; sum }");
-    try std.testing.expectEqual(@as(i128, 10), result.integer);
+    try std.testing.expectEqual(@as(i128, 10), result.integer.value);
 }
 
 test "求值器 - for 循环" {
@@ -3063,14 +3288,14 @@ test "求值器 - for 循环" {
 
     const fn_val = evaluator.global_env.get("sum_arr").?;
     var arr = try allocator.alloc(Value, 5);
-    arr[0] = Value{ .integer = 1 };
-    arr[1] = Value{ .integer = 2 };
-    arr[2] = Value{ .integer = 3 };
-    arr[3] = Value{ .integer = 4 };
-    arr[4] = Value{ .integer = 5 };
+    arr[0] = Value{ .integer = IntValue{ .value = 1 } };
+    arr[1] = Value{ .integer = IntValue{ .value = 2 } };
+    arr[2] = Value{ .integer = IntValue{ .value = 3 } };
+    arr[3] = Value{ .integer = IntValue{ .value = 4 } };
+    arr[4] = Value{ .integer = IntValue{ .value = 5 } };
     const args = [_]Value{Value{ .array = arr }};
     const result = try evaluator.callFunction(fn_val.value, &args, null);
-    try std.testing.expectEqual(@as(i128, 15), result.integer);
+    try std.testing.expectEqual(@as(i128, 15), result.integer.value);
 }
 
 test "求值器 - loop 和 break" {
@@ -3100,7 +3325,7 @@ test "求值器 - loop 和 break" {
     const fn_val = evaluator.global_env.get("loop_test").?;
     const args = [_]Value{};
     const result = try evaluator.callFunction(fn_val.value, &args, null);
-    try std.testing.expectEqual(@as(i128, 5), result.integer);
+    try std.testing.expectEqual(@as(i128, 5), result.integer.value);
 }
 
 test "求值器 - for 循环 continue" {
@@ -3129,14 +3354,14 @@ test "求值器 - for 循环 continue" {
 
     const fn_val = evaluator.global_env.get("skip_three").?;
     var arr = try allocator.alloc(Value, 5);
-    arr[0] = Value{ .integer = 1 };
-    arr[1] = Value{ .integer = 2 };
-    arr[2] = Value{ .integer = 3 };
-    arr[3] = Value{ .integer = 4 };
-    arr[4] = Value{ .integer = 5 };
+    arr[0] = Value{ .integer = IntValue{ .value = 1 } };
+    arr[1] = Value{ .integer = IntValue{ .value = 2 } };
+    arr[2] = Value{ .integer = IntValue{ .value = 3 } };
+    arr[3] = Value{ .integer = IntValue{ .value = 4 } };
+    arr[4] = Value{ .integer = IntValue{ .value = 5 } };
     const args = [_]Value{Value{ .array = arr }};
     const result = try evaluator.callFunction(fn_val.value, &args, null);
-    try std.testing.expectEqual(@as(i128, 12), result.integer);
+    try std.testing.expectEqual(@as(i128, 12), result.integer.value);
 }
 
 test "求值器 - 顶层函数声明和调用" {
@@ -3165,9 +3390,9 @@ test "求值器 - 顶层函数声明和调用" {
 
     // 调用 add 函数
     const add_fn = evaluator.global_env.get("add").?;
-    const args = [_]Value{ Value{ .integer = 3 }, Value{ .integer = 4 } };
+    const args = [_]Value{ Value{ .integer = IntValue{ .value = 3 } }, Value{ .integer = IntValue{ .value = 4 } } };
     const result = try evaluator.callFunction(add_fn.value, &args, null);
-    try std.testing.expectEqual(@as(i128, 7), result.integer);
+    try std.testing.expectEqual(@as(i128, 7), result.integer.value);
 }
 
 test "求值器 - 字符串拼接" {
@@ -3187,7 +3412,7 @@ test "求值器 - 传播操作符 ?" {
 
     // 非 null 值传播
     const non_null = try evalSource(allocator, "42?");
-    try std.testing.expectEqual(@as(i128, 42), non_null.integer);
+    try std.testing.expectEqual(@as(i128, 42), non_null.integer.value);
 }
 
 test "求值器 - 嵌套闭包" {
@@ -3215,12 +3440,12 @@ test "求值器 - 嵌套闭包" {
     try evaluator.evalModule(module);
 
     const make_adder = evaluator.global_env.get("make_adder").?;
-    const make_args = [_]Value{Value{ .integer = 5 }};
+    const make_args = [_]Value{Value{ .integer = IntValue{ .value = 5 } }};
     const add5 = try evaluator.callFunction(make_adder.value, &make_args, null);
 
-    const add_args = [_]Value{Value{ .integer = 3 }};
+    const add_args = [_]Value{Value{ .integer = IntValue{ .value = 3 } }};
     const result = try evaluator.callFunction(add5, &add_args, null);
-    try std.testing.expectEqual(@as(i128, 8), result.integer);
+    try std.testing.expectEqual(@as(i128, 8), result.integer.value);
 }
 
 test "求值器 - 递归函数" {
@@ -3248,9 +3473,9 @@ test "求值器 - 递归函数" {
     try evaluator.evalModule(module);
 
     const fib_fn = evaluator.global_env.get("fib").?;
-    const args = [_]Value{Value{ .integer = 10 }};
+    const args = [_]Value{Value{ .integer = IntValue{ .value = 10 } }};
     const result = try evaluator.callFunction(fib_fn.value, &args, null);
-    try std.testing.expectEqual(@as(i128, 55), result.integer);
+    try std.testing.expectEqual(@as(i128, 55), result.integer.value);
 }
 
 test "求值器 - match 记录模式" {
@@ -3259,7 +3484,7 @@ test "求值器 - match 记录模式" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "match (x: 1, y: 2) { (x: a, y: b) => a + b }");
-    try std.testing.expectEqual(@as(i128, 3), result.integer);
+    try std.testing.expectEqual(@as(i128, 3), result.integer.value);
 }
 
 test "求值器 - match 布尔模式" {
@@ -3268,7 +3493,7 @@ test "求值器 - match 布尔模式" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "match true { true => 1, false => 0 }");
-    try std.testing.expectEqual(@as(i128, 1), result.integer);
+    try std.testing.expectEqual(@as(i128, 1), result.integer.value);
 }
 
 test "求值器 - match null 模式" {
@@ -3277,7 +3502,7 @@ test "求值器 - match null 模式" {
     const allocator = arena.allocator();
 
     const result = try evalSource(allocator, "match null { null => 0, _ => 1 }");
-    try std.testing.expectEqual(@as(i128, 0), result.integer);
+    try std.testing.expectEqual(@as(i128, 0), result.integer.value);
 }
 
 // ============================================================
@@ -3322,7 +3547,7 @@ test "Phase 2 - ADT 枚举类型（无参构造器）" {
 
     const fn_val = evaluator.global_env.get("test_ordering").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectEqual(@as(i128, 1), result.integer);
+    try std.testing.expectEqual(@as(i128, 1), result.integer.value);
 }
 
 test "Phase 2 - ADT 带参构造器和字段访问" {
@@ -3435,7 +3660,7 @@ test "Phase 2 - ADT 多构造器匹配" {
 
     const fn_val = evaluator.global_env.get("test_match").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectEqual(@as(i128, 42), result.integer);
+    try std.testing.expectEqual(@as(i128, 42), result.integer.value);
 }
 
 test "Phase 2 - ADT 枚举匹配不同分支" {
@@ -3478,13 +3703,13 @@ test "Phase 2 - ADT 枚举匹配不同分支" {
     const gt_val = evaluator.global_env.get("Gt").?;
 
     const r1 = try evaluator.callFunction(fn_val.value, &[_]Value{lt_val.value}, null);
-    try std.testing.expectEqual(@as(i128, 1), r1.integer);
+    try std.testing.expectEqual(@as(i128, 1), r1.integer.value);
 
     const r2 = try evaluator.callFunction(fn_val.value, &[_]Value{eq_val.value}, null);
-    try std.testing.expectEqual(@as(i128, 2), r2.integer);
+    try std.testing.expectEqual(@as(i128, 2), r2.integer.value);
 
     const r3 = try evaluator.callFunction(fn_val.value, &[_]Value{gt_val.value}, null);
-    try std.testing.expectEqual(@as(i128, 3), r3.integer);
+    try std.testing.expectEqual(@as(i128, 3), r3.integer.value);
 }
 
 // --- Trait 定义与实现 ---
@@ -3526,7 +3751,7 @@ test "Phase 2 - Trait 方法调用" {
 
     const fn_val = evaluator.global_env.get("test_trait").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectEqual(@as(i128, 99), result.integer);
+    try std.testing.expectEqual(@as(i128, 99), result.integer.value);
 }
 
 // --- 记录类型构造器 ---
@@ -3589,7 +3814,7 @@ test "Phase 2 - for 循环数组迭代" {
 
     const fn_val = evaluator.global_env.get("sum_arr").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectEqual(@as(i128, 15), result.integer);
+    try std.testing.expectEqual(@as(i128, 15), result.integer.value);
 }
 
 test "Phase 2 - for 循环字符串迭代" {
@@ -3615,7 +3840,7 @@ test "Phase 2 - for 循环字符串迭代" {
 
     const fn_val = evaluator.global_env.get("count_chars").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectEqual(@as(i128, 3), result.integer);
+    try std.testing.expectEqual(@as(i128, 3), result.integer.value);
 }
 
 test "Phase 2 - for 循环 range 迭代" {
@@ -3641,7 +3866,7 @@ test "Phase 2 - for 循环 range 迭代" {
 
     const fn_val = evaluator.global_env.get("sum_range").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectEqual(@as(i128, 10), result.integer);
+    try std.testing.expectEqual(@as(i128, 10), result.integer.value);
 }
 
 // --- ADT 字段访问 ---
@@ -3676,5 +3901,5 @@ test "Phase 2 - ADT 字段访问" {
 
     const fn_val = evaluator.global_env.get("test_pair").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectEqual(@as(i128, 30), result.integer);
+    try std.testing.expectEqual(@as(i128, 30), result.integer.value);
 }

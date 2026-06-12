@@ -149,7 +149,7 @@ pub const AdtValue = struct {
 /// Newtype 值 — 单字段 ADT，创建语义不同但运行时零开销的新类型
 ///
 /// 如 `type UserId = UserId(i32)` 声明后，`UserId(42)` 创建
-/// NewtypeValue{ .type_name = "UserId", .inner = Value{ .integer = 42 } }
+/// NewtypeValue{ .type_name = "UserId", .inner = Value{ .integer = IntValue{ .value = 42 } } }
 ///
 /// 文档 2.14: Newtype — 创建新类型，运行时零开销
 /// 术语表: Newtype — 单字段 ADT，创建语义不同但运行时无开销的新类型
@@ -195,12 +195,84 @@ pub const RangeIterator = struct {
 };
 
 // ============================================================
+// 整数类型标签
+// ============================================================
+
+/// 整数具体类型标签，用于运行时溢出检查
+pub const IntType = enum {
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+
+    /// 返回该整数类型的最小值
+    pub fn minInt(self: IntType) i128 {
+        return switch (self) {
+            .i8 => std.math.minInt(i8),
+            .i16 => std.math.minInt(i16),
+            .i32 => std.math.minInt(i32),
+            .i64 => std.math.minInt(i64),
+            .i128 => std.math.minInt(i128),
+            .u8, .u16, .u32, .u64, .u128 => 0,
+        };
+    }
+
+    /// 返回该整数类型的最大值
+    pub fn maxInt(self: IntType) i128 {
+        return switch (self) {
+            .i8 => std.math.maxInt(i8),
+            .i16 => std.math.maxInt(i16),
+            .i32 => std.math.maxInt(i32),
+            .i64 => std.math.maxInt(i64),
+            .i128 => std.math.maxInt(i128),
+            .u8 => std.math.maxInt(u8),
+            .u16 => std.math.maxInt(u16),
+            .u32 => std.math.maxInt(u32),
+            .u64 => std.math.maxInt(u64),
+            .u128 => std.math.maxInt(i128), // i128 无法表示 u128::MAX，取 i128::MAX
+        };
+    }
+
+    /// 检查值是否在该类型的范围内
+    pub fn inRange(self: IntType, val: i128) bool {
+        return val >= self.minInt() and val <= self.maxInt();
+    }
+
+    /// 从类型名称字符串解析
+    pub fn fromName(name: []const u8) ?IntType {
+        if (std.mem.eql(u8, name, "i8")) return .i8;
+        if (std.mem.eql(u8, name, "i16")) return .i16;
+        if (std.mem.eql(u8, name, "i32")) return .i32;
+        if (std.mem.eql(u8, name, "i64")) return .i64;
+        if (std.mem.eql(u8, name, "i128")) return .i128;
+        if (std.mem.eql(u8, name, "u8")) return .u8;
+        if (std.mem.eql(u8, name, "u16")) return .u16;
+        if (std.mem.eql(u8, name, "u32")) return .u32;
+        if (std.mem.eql(u8, name, "u64")) return .u64;
+        if (std.mem.eql(u8, name, "u128")) return .u128;
+        return null;
+    }
+};
+
+/// 带类型标签的整数值
+pub const IntValue = struct {
+    value: i128,
+    type_tag: IntType = .i32, // 默认 i32（文档：默认整数字面量为 i32）
+};
+
+// ============================================================
 // 运行时值
 // ============================================================
 
 pub const Value = union(enum) {
     // 基本类型
-    integer: i128,
+    integer: IntValue,
     float: f64,
     boolean: bool,
     char_val: u21,
@@ -373,13 +445,19 @@ pub const Value = union(enum) {
         };
     }
 
-    pub fn format(self: Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    /// debug=false: display 模式（顶层字符串无引号，用户友好）
+    /// debug=true: repr 模式（字符串带引号，结构化表示）
+    pub fn format(self: Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator, debug: bool) !void {
         switch (self) {
-            .integer => |i| try buf.print(allocator, "{}", .{i}),
+            .integer => |iv| try buf.print(allocator, "{}", .{iv.value}),
             .float => |f| try buf.print(allocator, "{d}", .{f}),
             .boolean => |b| try buf.print(allocator, "{}", .{b}),
             .char_val => |c| try buf.print(allocator, "{u}", .{c}),
-            .string => |s| try buf.print(allocator, "{s}", .{s}),
+            .string => |s| if (debug) {
+                try buf.print(allocator, "\"{s}\"", .{s});
+            } else {
+                try buf.print(allocator, "{s}", .{s});
+            },
             .null_val => try buf.appendSlice(allocator, "null"),
             .unit => try buf.appendSlice(allocator, "()"),
             .range => |r| {
@@ -393,7 +471,7 @@ pub const Value = union(enum) {
                 try buf.appendSlice(allocator, "[");
                 for (arr, 0..) |item, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try item.format(buf, allocator);
+                    try item.format(buf, allocator, true);
                 }
                 try buf.appendSlice(allocator, "]");
             },
@@ -405,7 +483,7 @@ pub const Value = union(enum) {
                     if (!first) try buf.appendSlice(allocator, ", ");
                     first = false;
                     try buf.print(allocator, "{s}: ", .{entry.key_ptr.*});
-                    try entry.value_ptr.*.format(buf, allocator);
+                    try entry.value_ptr.*.format(buf, allocator, true);
                 }
                 try buf.appendSlice(allocator, ")");
             },
@@ -420,14 +498,14 @@ pub const Value = union(enum) {
                         if (f.name) |n| {
                             try buf.print(allocator, "{s}: ", .{n});
                         }
-                        try f.value.format(buf, allocator);
+                        try f.value.format(buf, allocator, true);
                     }
                     try buf.appendSlice(allocator, ")");
                 }
             },
             .newtype => |nv| {
                 try buf.print(allocator, "{s}(", .{nv.type_name});
-                try nv.inner.format(buf, allocator);
+                try nv.inner.format(buf, allocator, true);
                 try buf.appendSlice(allocator, ")");
             },
             .error_val => |e| try buf.print(allocator, "{s}(\"{s}\")", .{ e.type_name, e.message }),
@@ -435,7 +513,7 @@ pub const Value = union(enum) {
                 switch (tv.*) {
                     .ok => |v| {
                         try buf.appendSlice(allocator, "Ok(");
-                        try v.format(buf, allocator);
+                        try v.format(buf, allocator, true);
                         try buf.appendSlice(allocator, ")");
                     },
                     .err => |e| {
@@ -454,7 +532,7 @@ pub const Value = union(enum) {
         const other_tag = std.meta.activeTag(other);
         if (self_tag != other_tag) return false;
         return switch (self) {
-            .integer => |i| i == other.integer,
+            .integer => |iv| iv.value == other.integer.value,
             .float => |f| f == other.float,
             .boolean => |b| b == other.boolean,
             .char_val => |c| c == other.char_val,
@@ -480,7 +558,7 @@ pub const Value = union(enum) {
     pub fn isTruthy(self: Value) bool {
         return switch (self) {
             .boolean => |b| b,
-            .integer => |i| i != 0,
+            .integer => |iv| iv.value != 0,
             .float => |f| f != 0.0,
             .null_val => false,
             .unit => false,
@@ -494,7 +572,7 @@ pub const Value = union(enum) {
 
     pub fn asInteger(self: Value) !i128 {
         return switch (self) {
-            .integer => |i| i,
+            .integer => |iv| iv.value,
             else => error.TypeMismatch,
         };
     }
@@ -502,7 +580,7 @@ pub const Value = union(enum) {
     pub fn asFloat(self: Value) !f64 {
         return switch (self) {
             .float => |f| f,
-            .integer => |i| @floatFromInt(i),
+            .integer => |iv| @floatFromInt(iv.value),
             else => error.TypeMismatch,
         };
     }

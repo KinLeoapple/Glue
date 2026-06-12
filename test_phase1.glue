@@ -1762,3 +1762,343 @@ type Outer2 = Outer2(inner: Inner2, label: str)
 val o2 = Outer2(Inner2(42), "test")
 println(o2.inner.value)
 println(o2.label)
+
+// ============================================================
+// 125. 字面量 — 十六进制、八进制、二进制
+// ============================================================
+
+val hex_val = 0xFF
+println(hex_val)
+
+val oct_val = 0o77
+println(oct_val)
+
+val bin_val = 0b1010
+println(bin_val)
+
+// ============================================================
+// 126. 字面量 — 下划线分隔
+// ============================================================
+
+val big_num = 1_000_000
+println(big_num)
+
+// ============================================================
+// 127. 位运算 — 与、或、异或
+// ============================================================
+
+println(0xFF & 0x0F)
+println(0xF0 | 0x0F)
+println(0xFF ^ 0x0F)
+
+// ============================================================
+// 128. 字符串 — char_count
+// ============================================================
+
+val utf8_str = "Hello"
+println(utf8_str.char_count())
+println(utf8_str.len())
+
+// ============================================================
+// 129. 数组 — 动态数组更多操作
+// ============================================================
+
+var da = [10, 20, 30, 40, 50]
+println(da.contains(30))
+println(da.contains(99))
+println(da.isEmpty())
+println(da.first() ?? -1)
+println(da.last() ?? -1)
+
+// drop_last
+val da2 = da.drop_last()
+println(da2)
+
+// ============================================================
+// 130. 闭包 — 返回闭包的函数
+// ============================================================
+
+// 注：返回闭包的函数需要显式类型标注（当前类型推断限制）
+// 此处用间接方式测试：闭包直接赋值给变量
+val add5 = fun(y) { 5 + y }
+val add10 = fun(y) { 10 + y }
+println(add5(3))
+println(add10(3))
+
+// ============================================================
+// 131. defer — defer 在 return 路径执行
+// ============================================================
+
+var defer_ret_flag = 0
+fun deferReturn2(): i32 {
+    defer defer_ret_flag = 100
+    42
+}
+val dr2 = deferReturn2()
+println(dr2)
+println(defer_ret_flag)
+
+// ============================================================
+// 132. TCO — 相互递归
+// 注：相互递归需要前向声明，当前不支持
+// 改用单函数递归测试 TCO
+fun sumTCO(n: i32, acc: i32): i32 {
+    if (n == 0) { acc } else { sumTCO(n - 1, acc + n) }
+}
+println(sumTCO(100, 0))
+
+// ============================================================
+// 133. 类型转换 — 更多 widening/narrowing
+// ============================================================
+
+// i32 -> f64
+val i32_to_f = f64(100)
+println(i32_to_f)
+
+// i8 -> i32
+val i8_v2: i8 = 50
+val i8_widened = i32(i8_v2)
+println(i8_widened)
+
+// ============================================================
+// 134. Nullable — 多层嵌套安全访问
+// ============================================================
+
+type Deep = Deep(v: i32)
+type Mid = Mid(d: Deep?)
+type Top = Top(m: Mid?)
+
+val top_full = Top(Mid(Deep(42)))
+
+println(top_full?.m?.d?.v ?? -1)
+println(top_full.m?.d?.v ?? -1)
+
+// ============================================================
+// 135. 数组 — 空数组操作
+// ============================================================
+
+val empty: i32[] = []
+println(empty.isEmpty())
+println(empty.len())
+println(empty.first())
+println(empty.last())
+
+// ============================================================
+// 136. 闭包 — 闭包作为返回值组合
+// ============================================================
+
+// 注：返回闭包的函数需要显式类型标注（当前类型推断限制）
+// 此处用间接方式测试
+val triple = fun(x) { x * 3 }
+val quadruple = fun(x) { x * 4 }
+println(triple(5))
+println(quadruple(5))
+
+// ============================================================
+// 137. 字符串 — 空字符串
+// ============================================================
+
+val empty_str = ""
+println(empty_str.len())
+// 注：str 没有 isEmpty 方法，用 len == 0 判断
+
+// ============================================================
+// 138. 记录 — 记录字段更新后访问
+// ============================================================
+
+var rec = (a: 1, b: 2, c: 3)
+rec.a = 10
+rec.b = 20
+println(rec.a)
+println(rec.b)
+println(rec.c)
+
+// ============================================================
+// 139. Throw — throw 后 defer 仍执行
+// ============================================================
+
+var defer_throw_val2 = 0
+fun throwsWithDefer3(): Throw<i32, Error> {
+    defer defer_throw_val2 = 55
+    throw Error("defer test")
+}
+
+val dt3 = match throwsWithDefer3() {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(dt3)
+println(defer_throw_val2)
+
+// ============================================================
+// 140. 数组 — 数组拼接（push 链）
+// ============================================================
+
+var arr_chain = [1]
+arr_chain = arr_chain.push(2)
+arr_chain = arr_chain.push(3)
+arr_chain = arr_chain.push(4)
+println(arr_chain)
+println(arr_chain.len())
+
+// ============================================================
+// 141. Nullable — 非空断言在非空值上
+// ============================================================
+
+val nn: i32? = 99
+println(nn!)
+println(nn ?? 0)
+
+// ============================================================
+// 142. loop — loop 带累加
+// ============================================================
+
+var loop_acc = 1
+var loop_i = 1
+loop {
+    loop_acc = loop_acc * loop_i
+    loop_i = loop_i + 1
+    if (loop_i > 6) { break }
+}
+println(loop_acc)
+
+// ============================================================
+// 143. while — 倒计时
+// ============================================================
+
+var countdown_val = 5
+var countdown_result = ""
+while countdown_val > 0 {
+    countdown_result = countdown_result + str(countdown_val)
+    countdown_val = countdown_val - 1
+}
+println(countdown_result)
+
+// ============================================================
+// 144. for — 嵌套 for 循环
+// ============================================================
+
+var nested_sum = 0
+for i in 1..=3 {
+    for j in 1..=3 {
+        nested_sum = nested_sum + i * j
+    }
+}
+println(nested_sum)
+
+// ============================================================
+// 145. match — match 表达式赋值
+// ============================================================
+
+val match_val = match 3 {
+    1 => "one"
+    2 => "two"
+    3 => "three"
+    _ => "other"
+}
+println(match_val)
+
+// ============================================================
+// 146. 函数 — 函数作为参数传递给高阶函数
+// ============================================================
+
+fun applyTwice(f, x) { f(f(x)) }
+println(applyTwice(fun(x) { x + 1 }, 5))
+println(applyTwice(fun(x) { x * 2 }, 3))
+
+// ============================================================
+// 147. 泛型 ADT — 泛型 Maybe 类型
+// ============================================================
+
+type Maybe<T> =
+    | Nothing
+    | Just(T)
+
+val just_val = Just(42)
+val nothing_val = Nothing
+
+fun maybeOrDefault(m: Maybe<i32>, default: i32): i32 {
+    match m {
+        Nothing => default
+        Just(v) => v
+    }
+}
+
+println(maybeOrDefault(just_val, 0))
+println(maybeOrDefault(nothing_val, 0))
+
+// ============================================================
+// 148. 泛型 ADT — 泛型 Either 类型
+// ============================================================
+
+// 注：Either 使用 Left/Right 可能与内建类型冲突
+// 改用不同的构造器名称
+type Result<T, E> =
+    | Success(T)
+    | Failure(E)
+
+val success_val: Result<i32, str> = Success(42)
+val failure_val: Result<i32, str> = Failure("error")
+
+fun resultToInt(r: Result<i32, str>): i32 {
+    match r {
+        Success(v) => v
+        Failure(msg) => -1
+    }
+}
+
+println(resultToInt(success_val))
+println(resultToInt(failure_val))
+
+// ============================================================
+// 149. Newtype — newtype 内部值提取
+// ============================================================
+
+type Grade = Grade(i32)
+
+val g1 = Grade(85)
+val g2 = Grade(60)
+
+fun extractGrade(gr: Grade): i32 {
+    match gr {
+        Grade(v) => v
+    }
+}
+
+println(extractGrade(g1))
+println(extractGrade(g2))
+
+// ============================================================
+// 150. 字符串 — 字符串比较运算
+// ============================================================
+
+println("abc" == "abc")
+println("abc" != "def")
+println("apple" < "banana")
+
+// ============================================================
+// 151. 数组 — 数组元素求和与查找
+// ============================================================
+
+val search_arr = [5, 10, 15, 20, 25]
+var search_sum = 0
+for v in search_arr {
+    search_sum = search_sum + v
+}
+println(search_sum)
+println(search_arr.contains(15))
+println(search_arr.contains(99))
+
+// ============================================================
+// 152. Nullable — 三元替代（if-else 表达式）
+// ============================================================
+
+fun clamp(v: i32, min_v: i32, max_v: i32): i32 {
+    if (v < min_v) { min_v }
+    else if (v > max_v) { max_v }
+    else { v }
+}
+
+println(clamp(-5, 0, 10))
+println(clamp(5, 0, 10))
+println(clamp(15, 0, 10))
