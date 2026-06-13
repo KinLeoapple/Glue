@@ -656,6 +656,8 @@ pub const Parser = struct {
                 }) catch return null;
 
                 while (self.matchToken(.comma)) {
+                    // 支持尾随逗号：(name: str, age: i32,)
+                    if (self.check(.r_paren)) break;
                     const field_name = self.expect(.identifier, "期望字段名") catch return null;
                     _ = self.expect(.colon, "期望 ':'") catch return null;
                     const field_ty = self.parseType() catch return null;

@@ -794,10 +794,22 @@ pub const TypeInferencer = struct {
             },
             .record_type => |rt1| {
                 const rt2 = resolved2.record_type;
-                if (rt1.fields.len != rt2.fields.len) return error.TypeMismatch;
-                for (rt1.fields, rt2.fields) |f1, f2| {
-                    if (!std.mem.eql(u8, f1.name, f2.name)) return error.TypeMismatch;
-                    try self.unify(f1.ty, f2.ty);
+                // 文档 §2.5.2：记录类型是匿名的，基于结构化匹配
+                // 支持宽度子类型：字段更多的记录可以统一到字段更少的记录
+                // 即 (name: str, age: i32, email: str?) 可以传给 (name: str, age: i32)
+                const smaller = if (rt1.fields.len <= rt2.fields.len) rt1 else rt2;
+                const larger = if (rt1.fields.len <= rt2.fields.len) rt2 else rt1;
+                // 较小记录的每个字段必须在较大记录中存在且类型兼容
+                for (smaller.fields) |sf| {
+                    var found = false;
+                    for (larger.fields) |lf| {
+                        if (std.mem.eql(u8, sf.name, lf.name)) {
+                            try self.unify(sf.ty, lf.ty);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return error.TypeMismatch;
                 }
             },
             .nullable_type => |inner1| {
@@ -2449,6 +2461,20 @@ pub const TypeInferencer = struct {
                             self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
                         } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{td.name});
+                        }
+                        // 注册记录类型名到 adt_types，使类型注解中可用
+                        // 例如 fun greet(u: User): str 中的 User 需要解析为 record_type
+                        if (!self.adt_types.contains(td.name)) {
+                            const key = self.allocator.dupe(u8, td.name) catch return;
+                            const type_param_names = self.allocator.alloc([]const u8, td.type_params.len) catch return;
+                            for (td.type_params, 0..) |tp, i| {
+                                type_param_names[i] = tp.name;
+                            }
+                            self.adt_types.put(key, AdtInfo{
+                                .ty = rec_ty,
+                                .constructor_names = &[_][]const u8{},
+                                .type_param_names = type_param_names,
+                            }) catch return;
                         }
                     },
                     .alias => |ta| {

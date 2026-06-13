@@ -210,6 +210,24 @@ fn matchConstructorPattern(con: @TypeOf(@as(ast.Pattern, undefined).constructor)
         }
         return false;
     }
+    // 记录类型构造器模式匹配
+    // type User = (name: str, age: i32)
+    // match u { User(name, age) => ... } — 按位置解构记录字段
+    if (val == .record) {
+        if (val.record.type_name.len > 0 and !std.mem.eql(u8, val.record.type_name, con.name)) return false;
+        // 按位置匹配字段：构造器模式中的子模式与记录字段按插入顺序对应
+        if (con.patterns.len == 0) return true;
+        var field_iter = val.record.fields.iterator();
+        var pattern_idx: usize = 0;
+        while (field_iter.next()) |entry| {
+            if (pattern_idx >= con.patterns.len) break;
+            if (!try matchPattern(con.patterns[pattern_idx], entry.value_ptr.*, environment, guard_eval)) {
+                return false;
+            }
+            pattern_idx += 1;
+        }
+        return pattern_idx == con.patterns.len;
+    }
     return false;
 }
 
@@ -218,7 +236,7 @@ fn matchRecordPattern(rec: @TypeOf(@as(ast.Pattern, undefined).record), val: val
     if (val != .record) return false;
 
     for (rec.fields) |field| {
-        if (val.record.get(field.name)) |field_val| {
+        if (val.record.fields.get(field.name)) |field_val| {
             if (!try matchPattern(field.pattern, field_val, environment, guard_eval)) {
                 return false;
             }

@@ -67,7 +67,9 @@ pub const Environment = struct {
         }
         // 插入新条目（需要分配 key 的独立副本）
         const key = try self.allocator.dupe(u8, name);
-        try self.values.put(key, Variable{ .value = val, .is_mutable = is_mutable, .is_public = is_public });
+        // 深拷贝值，确保每个环境拥有自己的数据副本，避免 double-free
+        const cloned_val = try val.clone(self.allocator);
+        try self.values.put(key, Variable{ .value = cloned_val, .is_mutable = is_mutable, .is_public = is_public });
     }
 
     pub fn get(self: *Environment, name: []const u8) ?Variable {

@@ -65,6 +65,7 @@ const AdtConstructorCtx = struct {
 
 /// 记录类型构造器上下文数据
 const RecordConstructorCtx = struct {
+    type_name: []const u8,
     field_names: [][]const u8,
 };
 
@@ -229,6 +230,7 @@ pub const Evaluator = struct {
         self.adt_constructor_contexts.deinit(self.allocator);
         // 释放所有记录类型构造器上下文
         for (self.record_constructor_contexts.items) |ctx| {
+            self.allocator.free(ctx.type_name);
             for (ctx.field_names) |n| {
                 self.allocator.free(n);
             }
@@ -817,6 +819,7 @@ pub const Evaluator = struct {
                         // User("Alice", 30) 创建记录值 {name: "Alice", age: 30}
                         const ctx = try self.allocator.create(RecordConstructorCtx);
                         ctx.* = .{
+                            .type_name = try self.allocator.dupe(u8, td.name),
                             .field_names = try self.allocator.alloc([]const u8, rec_def.fields.len),
                         };
                         for (rec_def.fields, 0..) |field, i| {
@@ -835,7 +838,7 @@ pub const Evaluator = struct {
                                         const key = try ev.allocator.dupe(u8, data.field_names[i]);
                                         try map.put(key, arg);
                                     }
-                                    return Value{ .record = map };
+                                    return Value{ .record = .{ .type_name = try ev.allocator.dupe(u8, data.type_name), .fields = map } };
                                 }
                             }.call,
                             .user_ctx = ctx,
@@ -1946,7 +1949,7 @@ pub const Evaluator = struct {
 
         // 记录方法 — 在记录中查找方法字段
         if (object == .record) {
-            if (object.record.get(method)) |val| {
+            if (object.record.fields.get(method)) |val| {
                 return self.callFunction(val, args, environment);
             }
         }
@@ -2023,8 +2026,8 @@ pub const Evaluator = struct {
 
     fn accessField(self: *Evaluator, object: Value, field: []const u8) EvalResult!Value {
         switch (object) {
-            .record => |map| {
-                if (map.get(field)) |val| {
+            .record => |rec| {
+                if (rec.fields.get(field)) |val| {
                     return val;
                 }
                 return error.UndefinedVariable;
@@ -2167,7 +2170,7 @@ pub const Evaluator = struct {
             try map.put(key, val);
         }
 
-        return Value{ .record = map };
+        return Value{ .record = .{ .type_name = "", .fields = map } };
     }
 
     fn evalLambda(self: *Evaluator, lam: @TypeOf(@as(ast.Expr, undefined).lambda), environment: *Environment) EvalResult!Value {
@@ -2438,7 +2441,7 @@ pub const Evaluator = struct {
                             .identifier => |id| {
                                 if (environment.getPtr(id.name)) |variable| {
                                     if (variable.*.value == .record) {
-                                        const map = &variable.*.value.record;
+                                        const map = &variable.*.value.record.fields;
                                         if (map.getPtr(fa.field)) |existing| {
                                             existing.* = val;
                                         } else {
@@ -2465,7 +2468,7 @@ pub const Evaluator = struct {
                     .identifier => |id| {
                         if (environment.getPtr(id.name)) |variable| {
                             if (variable.*.value == .record) {
-                                const map = &variable.*.value.record;
+                                const map = &variable.*.value.record.fields;
                                 if (map.getPtr(fa.field)) |existing| {
                                     existing.* = val;
                                 } else {
@@ -2481,8 +2484,8 @@ pub const Evaluator = struct {
                     else => {
                         const object = try self.evalExpr(fa.object, environment);
                         switch (object) {
-                            .record => |*map| {
-                                if (map.getPtr(fa.field)) |existing| {
+                            .record => |*rec| {
+                                if (rec.fields.getPtr(fa.field)) |existing| {
                                     existing.* = val;
                                 } else {
                                     return error.UndefinedVariable;
@@ -2736,20 +2739,20 @@ fn structuralEquals(a: Value, b: Value) bool {
             }
             return true;
         },
-        .record => |map| {
+        .record => |rec| {
             // 比较所有键值对
-            var iter = map.iterator();
+            var iter = rec.fields.iterator();
             while (iter.next()) |entry| {
-                if (b.record.get(entry.key_ptr.*)) |b_val| {
+                if (b.record.fields.get(entry.key_ptr.*)) |b_val| {
                     if (!structuralEquals(entry.value_ptr.*, b_val)) return false;
                 } else {
                     return false;
                 }
             }
             // 确保没有多余的键
-            var b_iter = b.record.iterator();
+            var b_iter = b.record.fields.iterator();
             while (b_iter.next()) |entry| {
-                if (map.get(entry.key_ptr.*)) |_| {} else {
+                if (rec.fields.get(entry.key_ptr.*)) |_| {} else {
                     return false;
                 }
             }
@@ -3225,9 +3228,9 @@ test "求值器 - 记录字面量" {
 
     const result = try evalSource(allocator, "(name: \"Alice\", age: 30)");
     try std.testing.expect(result == .record);
-    const name = result.record.get("name").?;
+    const name = result.record.fields.get("name").?;
     try std.testing.expectEqualStrings("Alice", name.string);
-    const age = result.record.get("age").?;
+    const age = result.record.fields.get("age").?;
     try std.testing.expectEqual(@as(i128, 30), age.integer.value);
 }
 

@@ -270,6 +270,14 @@ pub const IntValue = struct {
 // 运行时值
 // ============================================================
 
+/// 记录值（积类型 / Product Type）
+/// 文档 §2.5.2：记录类型是匿名的，基于结构化匹配
+/// type_name 存储创建时的类型名（如 "User"），用于构造器模式匹配
+pub const RecordValue = struct {
+    type_name: []const u8, // 创建时的类型名，匿名记录字面量为 ""
+    fields: std.StringHashMap(Value),
+};
+
 pub const Value = union(enum) {
     // 基本类型
     integer: IntValue,
@@ -282,7 +290,7 @@ pub const Value = union(enum) {
 
     // 复合类型
     array: []Value,
-    record: std.StringHashMap(Value),
+    record: RecordValue,
 
     // ADT 值（代数数据类型构造器实例）
     adt: *AdtValue,
@@ -321,14 +329,17 @@ pub const Value = union(enum) {
                 }
                 allocator.free(arr);
             },
-            .record => |*map| {
-                var iter = map.iterator();
+            .record => |*rv| {
+                if (rv.type_name.len > 0) {
+                    allocator.free(rv.type_name);
+                }
+                var iter = rv.fields.iterator();
                 while (iter.next()) |entry| {
                     allocator.free(entry.key_ptr.*);
                     var val = entry.value_ptr.*;
                     val.deinit(allocator);
                 }
-                map.deinit();
+                rv.fields.deinit();
             },
             .string => |s| {
                 allocator.free(s);
@@ -382,15 +393,18 @@ pub const Value = union(enum) {
                 }
                 return Value{ .array = new_arr };
             },
-            .record => |map| {
+            .record => |rv| {
                 var new_map = std.StringHashMap(Value).init(allocator);
-                var iter = map.iterator();
+                var iter = rv.fields.iterator();
                 while (iter.next()) |entry| {
                     const key = try allocator.dupe(u8, entry.key_ptr.*);
                     const val = try entry.value_ptr.*.clone(allocator);
                     try new_map.put(key, val);
                 }
-                return Value{ .record = new_map };
+                return Value{ .record = .{
+                    .type_name = if (rv.type_name.len > 0) try allocator.dupe(u8, rv.type_name) else "",
+                    .fields = new_map,
+                } };
             },
             .closure => self,
             .adt => |av| {
@@ -434,6 +448,7 @@ pub const Value = union(enum) {
                         new_tv.* = ThrowValue{ .err = ErrorValue{
                             .type_name = try allocator.dupe(u8, e.type_name),
                             .message = try allocator.dupe(u8, e.message),
+                            .is_error_subtype = e.is_error_subtype,
                         } };
                     },
                 }
@@ -475,9 +490,13 @@ pub const Value = union(enum) {
                 }
                 try buf.appendSlice(allocator, "]");
             },
-            .record => |map| {
-                try buf.appendSlice(allocator, "(");
-                var iter = map.iterator();
+            .record => |rv| {
+                if (rv.type_name.len > 0) {
+                    try buf.print(allocator, "{s}(", .{rv.type_name});
+                } else {
+                    try buf.appendSlice(allocator, "(");
+                }
+                var iter = rv.fields.iterator();
                 var first = true;
                 while (iter.next()) |entry| {
                     if (!first) try buf.appendSlice(allocator, ", ");
