@@ -26,6 +26,7 @@ pub const EvalError = error{
     UnsupportedOperation,
     CircularDependency,
     FileNotFound,
+    MissingMain,
 };
 
 /// 控制流信号 — 使用 Zig error 机制实现非局部跳转
@@ -278,6 +279,12 @@ pub const RecordValue = struct {
     fields: std.StringHashMap(Value),
 };
 
+/// 数组值
+pub const ArrayValue = struct {
+    elements: []Value,
+    fixed_size: ?u64, // null = 动态 T[], non-null = 固定大小 T[N]
+};
+
 pub const Value = union(enum) {
     // 基本类型
     integer: IntValue,
@@ -289,7 +296,7 @@ pub const Value = union(enum) {
     unit,
 
     // 复合类型
-    array: []Value,
+    array: ArrayValue,
     record: RecordValue,
 
     // ADT 值（代数数据类型构造器实例）
@@ -324,10 +331,10 @@ pub const Value = union(enum) {
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .array => |arr| {
-                for (arr) |*item| {
+                for (arr.elements) |*item| {
                     item.deinit(allocator);
                 }
-                allocator.free(arr);
+                allocator.free(arr.elements);
             },
             .record => |*rv| {
                 if (rv.type_name.len > 0) {
@@ -387,11 +394,11 @@ pub const Value = union(enum) {
             .range => self,
             .string => |s| Value{ .string = try allocator.dupe(u8, s) },
             .array => |arr| {
-                var new_arr = try allocator.alloc(Value, arr.len);
-                for (arr, 0..) |item, i| {
+                var new_arr = try allocator.alloc(Value, arr.elements.len);
+                for (arr.elements, 0..) |item, i| {
                     new_arr[i] = try item.clone(allocator);
                 }
-                return Value{ .array = new_arr };
+                return Value{ .array = ArrayValue{ .elements = new_arr, .fixed_size = arr.fixed_size } };
             },
             .record => |rv| {
                 var new_map = std.StringHashMap(Value).init(allocator);
@@ -484,7 +491,7 @@ pub const Value = union(enum) {
             },
             .array => |arr| {
                 try buf.appendSlice(allocator, "[");
-                for (arr, 0..) |item, i| {
+                for (arr.elements, 0..) |item, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
                     try item.format(buf, allocator, true);
                 }
@@ -560,7 +567,7 @@ pub const Value = union(enum) {
             .unit => true,
             .range => |r| r.start == other.range.start and r.end == other.range.end and r.inclusive == other.range.inclusive,
             // 引用相等
-            .array => |a| a.ptr == other.array.ptr,
+            .array => |a| a.elements.ptr == other.array.elements.ptr,
             .record => |r| @intFromPtr(&r) == @intFromPtr(&other.record),
             .adt => |av| av == other.adt, // 引用相等
             .newtype => |nv| nv == other.newtype, // 引用相等

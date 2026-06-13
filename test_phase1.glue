@@ -1792,12 +1792,11 @@ println(0xF0 | 0x0F)
 println(0xFF ^ 0x0F)
 
 // ============================================================
-// 128. 字符串 — char_count
+// 128. 字符串 — len() 返回 Unicode 标量值
 // ============================================================
 
 val utf8_str = "Hello"
-println(utf8_str.char_count())
-println(utf8_str.len())
+println(utf8_str.len())   // 5
 
 // ============================================================
 // 129. 数组 — 动态数组更多操作
@@ -2102,3 +2101,219 @@ fun clamp(v: i32, min_v: i32, max_v: i32): i32 {
 println(clamp(-5, 0, 10))
 println(clamp(5, 0, 10))
 println(clamp(15, 0, 10))
+
+// ============================================================
+// 152. UTF-8 字符串 — len() 返回 Unicode 标量值
+// ============================================================
+
+val cn = "你好"
+println(cn.len())          // 2（2 个 Unicode 标量值）
+
+// 混合 ASCII + 多字节
+val mixed = "a你好b"
+println(mixed.len())       // 4
+
+// ============================================================
+// 153. char → str 转换
+// ============================================================
+
+println(str('A'))          // A
+println(str('Z'))          // Z
+
+// ============================================================
+// 154. 守卫条件与或模式组合
+// ============================================================
+
+fun classifyNum2(n: i32): str {
+    match n {
+        0 => "zero"
+        1 | 2 | 3 => "small"
+        n if n < 0 => "negative"
+        _ => "other"
+    }
+}
+println(classifyNum2(0))    // zero
+println(classifyNum2(2))    // small
+println(classifyNum2(-5))   // negative
+println(classifyNum2(100))  // other
+
+// ============================================================
+// 155. 记录模式解构
+// ============================================================
+
+type Pt2 = Pt2(x: i32, y: i32)
+
+fun quadrant(p: Pt2): str {
+    match p {
+        Pt2(0, 0) => "origin"
+        Pt2(x, y) if x > 0 && y > 0 => "Q1"
+        Pt2(x, y) if x < 0 && y > 0 => "Q2"
+        Pt2(x, y) if x < 0 && y < 0 => "Q3"
+        Pt2(x, y) if x > 0 && y < 0 => "Q4"
+        _ => "axis"
+    }
+}
+println(quadrant(Pt2(0, 0)))    // origin
+println(quadrant(Pt2(1, 1)))    // Q1
+println(quadrant(Pt2(-1, 1)))   // Q2
+println(quadrant(Pt2(-1, -1)))  // Q3
+println(quadrant(Pt2(1, -1)))   // Q4
+println(quadrant(Pt2(0, 5)))    // axis
+
+// ============================================================
+// 156. Nullable — if-else 返回 Nullable 综合场景
+// ============================================================
+
+fun safeDiv2(a: i32, b: i32): i32? {
+    if (b == 0) { null } else { a / b }
+}
+println(safeDiv2(10, 2) ?? -1)  // 5
+println(safeDiv2(10, 0) ?? -1)  // -1
+
+// ============================================================
+// 157. Throw — 链式 ? 传播更多场景
+// ============================================================
+
+fun parsePositive(s: str): Throw<i32, Error> {
+    if (s == "valid") { Ok(42) }
+    else { throw Error("parse error") }
+}
+
+fun doubleIfPositive(n: i32): Throw<i32, Error> {
+    if (n > 0) { Ok(n * 2) } else { throw Error("not positive") }
+}
+
+fun parseAndDouble(s: str): Throw<i32, Error> {
+    val n = parsePositive(s)?
+    doubleIfPositive(n)?
+}
+
+val pad1 = match parseAndDouble("valid") {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(pad1)  // 84
+
+val pad2 = match parseAndDouble("invalid") {
+    Ok(v) => v
+    Error(e) => -1
+}
+println(pad2)  // -1
+
+// ============================================================
+// 158. 闭包 — 闭包作为参数传递给高阶函数
+// ============================================================
+
+fun applyTwice2(f, x) { f(f(x)) }
+println(applyTwice2(fun(x) { x + 1 }, 5))   // 7
+println(applyTwice2(fun(x) { x * 2 }, 3))   // 12
+
+// ============================================================
+// 159. 数组 — 数组操作综合
+// ============================================================
+
+var arr_ops = [1, 2, 3]
+arr_ops = arr_ops.push(4)
+arr_ops = arr_ops.push(5)
+println(arr_ops.len())       // 5
+println(arr_ops.contains(3)) // true
+println(arr_ops.contains(99)) // false
+
+val arr_drop = arr_ops.drop_last()
+println(arr_drop.len())      // 4
+
+// ============================================================
+// 160. 嵌套记录 — 更多场景
+// ============================================================
+
+type Rect = Rect(w: f64, h: f64)
+type Shape2 = Shape2(rect: Rect, label: str)
+
+val s1 = Shape2(Rect(3.0, 4.0), "rectangle")
+println(s1.rect.w)       // 3
+println(s1.rect.h)       // 4
+println(s1.label)         // rectangle
+
+// ============================================================
+// 161. match — 守卫条件与嵌套组合
+// ============================================================
+
+fun fizzbuzz(n: i32): str {
+    match n {
+        n if n % 15 == 0 => "FizzBuzz"
+        n if n % 3 == 0 => "Fizz"
+        n if n % 5 == 0 => "Buzz"
+        _ => str(n)
+    }
+}
+println(fizzbuzz(15))   // FizzBuzz
+println(fizzbuzz(9))    // Fizz
+println(fizzbuzz(10))   // Buzz
+println(fizzbuzz(7))    // 7
+
+// ============================================================
+// 162. 字符串 — 更多插值
+// ============================================================
+
+val px2 = 3
+val py2 = 4
+println("point: ({px2}, {py2})")                    // point: (3, 4)
+println("distance squared: {px2 * px2 + py2 * py2}")   // distance squared: 25
+
+// ============================================================
+// 163. 递归 — 更复杂的递归
+// ============================================================
+
+// 最大公约数（欧几里得算法）
+fun gcd(a: i32, b: i32): i32 {
+    if (b == 0) { a } else { gcd(b, a % b) }
+}
+println(gcd(48, 18))   // 6
+println(gcd(100, 75))  // 25
+
+// ============================================================
+// 164. 动态数组 — map/filter 模式
+// ============================================================
+
+// 手动 map
+fun mapArray(arr, f) {
+    var result = []
+    for item in arr {
+        result = result.push(f(item))
+    }
+    result
+}
+
+val mapped = mapArray([1, 2, 3, 4, 5], fun(x) { x * x })
+println(mapped)          // [1, 4, 9, 16, 25]
+
+// 手动 filter
+fun filterArray(arr, pred) {
+    var result = []
+    for item in arr {
+        if (pred(item)) {
+            result = result.push(item)
+        }
+    }
+    result
+}
+
+val evens = filterArray([1, 2, 3, 4, 5, 6], fun(x) { x % 2 == 0 })
+println(evens)           // [2, 4, 6]
+
+// ============================================================
+// 165. while — 欧几里得算法迭代版
+// ============================================================
+
+fun gcdIter(a: i32, b: i32): i32 {
+    var x = a
+    var y = b
+    while y != 0 {
+        val temp = y
+        y = x % y
+        x = temp
+    }
+    x
+}
+println(gcdIter(48, 18))   // 6
+println(gcdIter(100, 75))  // 25

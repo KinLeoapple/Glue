@@ -1227,3 +1227,310 @@ println(evalBool(bexpr))
 // false OR true = true
 val bexpr2 = BOr(BVal(false), BVal(true))
 println(evalBool(bexpr2))
+
+// ============================================================
+// 71. GADT — 基本定义与求值
+// ============================================================
+
+type ExprG<T> =
+    | IntLitG(i32) : ExprG<i32>
+    | BoolLitG(bool) : ExprG<bool>
+    | AddG(ExprG<i32>, ExprG<i32>) : ExprG<i32>
+
+fun evalGADT(e: ExprG<i32>): i32 {
+    match e {
+        IntLitG(n) => n
+        BoolLitG(_) => 0
+        AddG(a, b) => evalGADT(a) + evalGADT(b)
+    }
+}
+
+// IntLit
+println(evalGADT(IntLitG(42)))                           // 42
+
+// Add
+println(evalGADT(AddG(IntLitG(10), IntLitG(20))))        // 30
+
+// ============================================================
+// 72. Trait — 委托语法（冲突消解）
+// ============================================================
+
+trait Serializable {
+    fun to_string(self): str
+}
+
+trait DebugTrait {
+    fun to_string(self): str
+}
+
+impl Serializable<Ordering> {
+    fun to_string(self): str {
+        match self {
+            Lt => "Lt"
+            Eq => "Eq"
+            Gt => "Gt"
+        }
+    }
+}
+
+impl DebugTrait<Ordering> {
+    fun to_string(self): str {
+        "Debug[" + match self {
+            Lt => "Lt"
+            Eq => "Eq"
+            Gt => "Gt"
+        } + "]"
+    }
+}
+
+// 委托：to_string 委托给 Serializable
+trait Combined(Serializable, DebugTrait) {
+    fun to_string(self): str = Serializable.to_string
+}
+
+// 测试委托
+println(Lt.to_string())   // Lt
+println(Eq.to_string())   // Eq
+println(Gt.to_string())   // Gt
+
+// ============================================================
+// 73. Trait — override 语法（冲突消解）
+// ============================================================
+
+trait Overridden(Serializable, DebugTrait) {
+    override fun to_string(self): str {
+        "[" + match self {
+            Lt => "Lt"
+            Eq => "Eq"
+            Gt => "Gt"
+        } + "]"
+    }
+}
+
+// override 输出带方括号的版本
+println(Lt.to_string())   // [Lt]
+
+// ============================================================
+// 74. 关联类型 — 实际运行时调用
+// ============================================================
+
+trait Container2 {
+    type Item
+    fun empty2()
+    fun insert2(self, item)
+    fun len2(self): i32
+}
+
+impl Container2<GList<i32>> {
+    type Item = i32
+    fun empty2(): GList<i32> {
+        GNil
+    }
+    fun insert2(self, item: i32): GList<i32> {
+        GCons(item, self)
+    }
+    fun len2(self): i32 {
+        glistLen(self)
+    }
+}
+
+// 调用 impl 方法
+val empty_container = empty2()
+println(glistLen(empty_container))   // 0
+
+val inserted = insert2(empty_container, 42)
+println(glistLen(inserted))          // 1
+
+val container_len = len2(inserted)
+println(container_len)               // 1
+
+// ============================================================
+// 75. 记录模式解构 — 嵌套解构
+// ============================================================
+
+type Addr2 = Addr2(city: str, zip: i32)
+type Person2 = Person2(name: str, addr: Addr2)
+
+fun personCity(p: Person2): str {
+    match p {
+        Person2(name, Addr2(city, _)) => name + " lives in " + city
+    }
+}
+println(personCity(Person2("Bob", Addr2("Shanghai", 200000))))
+// Bob lives in Shanghai
+
+// ============================================================
+// 76. ADT — 跨类型嵌套解构
+// ============================================================
+
+type Config3 = Config3(name: str, value: i32?)
+
+fun extractConfig(c: Config3): i32? {
+    match c {
+        Config3(_, v) => v
+    }
+}
+println(extractConfig(Config3("x", 42)))    // 42
+println(extractConfig(Config3("y", null)))  // null
+
+// ============================================================
+// 77. 泛型 ADT — 泛型列表 fold
+// ============================================================
+
+fun glistFold(l: GList<i32>, init: i32, f): i32 {
+    match l {
+        GNil => init
+        GCons(x, tail) => glistFold(tail, f(init, x), f)
+    }
+}
+
+val fold_sum = glistFold(GCons(1, GCons(2, GCons(3, GCons(4, GCons(5, GNil))))), 0, fun(a, b) { a + b })
+println(fold_sum)   // 15
+
+val fold_prod = glistFold(GCons(1, GCons(2, GCons(3, GCons(4, GCons(5, GNil))))), 1, fun(a, b) { a * b })
+println(fold_prod)  // 120
+
+// ============================================================
+// 78. ADT — 列表 zip
+// ============================================================
+
+fun listZip(l1: List, l2: List): List {
+    match l1 {
+        Nil => Nil
+        Cons(_, _) => match l2 {
+            Nil => Nil
+            Cons(x, tx) => match l1 {
+                Cons(y, ty) => Cons(y, listZip(ty, tx))
+                Nil => Nil
+            }
+        }
+    }
+}
+
+val zipped = listZip(Cons(1, Cons(2, Cons(3, Nil))), Cons(10, Cons(20, Cons(30, Nil))))
+println(zipped)   // Cons(1, Cons(2, Cons(3, Nil)))
+
+// ============================================================
+// 79. Trait — 多类型 impl 同一 Trait（方法调用语法）
+// ============================================================
+
+trait Stringify2 {
+    fun stringify2(self): str
+}
+
+impl Stringify2<Ordering> {
+    fun stringify2(self): str {
+        match self {
+            Lt => "Lt"
+            Eq => "Eq"
+            Gt => "Gt"
+        }
+    }
+}
+
+impl Stringify2<Color> {
+    fun stringify2(self): str {
+        match self {
+            Red => "Red"
+            Green => "Green"
+            Blue => "Blue"
+            Yellow => "Yellow"
+        }
+    }
+}
+
+println(Lt.stringify2())      // Lt
+println(Red.stringify2())     // Red
+println(Blue.stringify2())    // Blue
+
+// ============================================================
+// 80. ADT — 二叉树遍历（中序）
+// ============================================================
+
+fun listAppend2(a: List, b: List): List {
+    match a {
+        Nil => b
+        Cons(head, tail) => Cons(head, listAppend2(tail, b))
+    }
+}
+
+fun treeInorder(t: Tree): List {
+    match t {
+        Leaf => Nil
+        Node(v, left, right) => {
+            val leftList = treeInorder(left)
+            val rightList = treeInorder(right)
+            listAppend2(listAppend2(leftList, Cons(v, Nil)), rightList)
+        }
+    }
+}
+
+val inorder = treeInorder(Node(5, Node(3, Node(1, Leaf, Leaf), Node(4, Leaf, Leaf)), Node(8, Leaf, Leaf)))
+println(inorder)   // Cons(1, Cons(3, Cons(4, Cons(5, Cons(8, Nil)))))
+
+// ============================================================
+// 81. ADT — 表达式求值器（含除法）
+// ============================================================
+
+type Expr3 =
+    | Num3(i32)
+    | Add3(Expr3, Expr3)
+    | Sub3(Expr3, Expr3)
+    | Mul3(Expr3, Expr3)
+    | Div3(Expr3, Expr3)
+
+fun eval3(e: Expr3): i32 {
+    match e {
+        Num3(n) => n
+        Add3(a, b) => eval3(a) + eval3(b)
+        Sub3(a, b) => eval3(a) - eval3(b)
+        Mul3(a, b) => eval3(a) * eval3(b)
+        Div3(a, b) => eval3(a) / eval3(b)
+    }
+}
+
+// (20 - 5) * 2 / 3 = 10
+val e3 = Div3(Mul3(Sub3(Num3(20), Num3(5)), Num3(2)), Num3(3))
+println(eval3(e3))   // 10
+
+// ============================================================
+// 82. 泛型 ADT — 泛型 Maybe 类型
+// ============================================================
+
+type Maybe<T> =
+    | Nothing
+    | Just(T)
+
+val just_val = Just(42)
+val nothing_val = Nothing
+
+fun maybeOrDefault(m: Maybe<i32>, default: i32): i32 {
+    match m {
+        Nothing => default
+        Just(v) => v
+    }
+}
+
+println(maybeOrDefault(just_val, 0))    // 42
+println(maybeOrDefault(nothing_val, 0)) // 0
+
+// ============================================================
+// 83. 泛型 ADT — 泛型 Either 类型
+// ============================================================
+
+type Result<T, E> =
+    | Success(T)
+    | Failure(E)
+
+val success_val: Result<i32, str> = Success(42)
+val failure_val: Result<i32, str> = Failure("error")
+
+fun resultToInt(r: Result<i32, str>): i32 {
+    match r {
+        Success(v) => v
+        Failure(msg) => -1
+    }
+}
+
+println(resultToInt(success_val))   // 42
+println(resultToInt(failure_val))   // -1

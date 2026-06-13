@@ -138,12 +138,11 @@ str 使用 UTF-8 编码存储，这是内存效率最高的 Unicode 编码方式
 
 - **迭代产生 `char`**：遍历 str 时产生 Unicode 标量值（`char`），而非字节
 - **索引是 O(n) 操作**：由于 UTF-8 是变长编码，通过索引访问第 n 个字符需要从头遍历字节
-- **字节长度与字符数不同**：`str.len()` 返回字节长度，`str.char_count()` 返回字符数
+- **`len()` 返回字符数**：`str.len()` 返回 Unicode 标量值数量（字符数），而非字节数
 
 ```glue
 val s = "你好"
-s.len()          // 6（UTF-8 编码，每个中文字符占 3 字节）
-s.char_count()   // 2（2 个 Unicode 标量值）
+s.len()          // 2（2 个 Unicode 标量值）
 
 // 迭代产生 char
 for c in s {

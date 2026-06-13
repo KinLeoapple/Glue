@@ -29,6 +29,7 @@ const sema = @import("sema");
 // ============================================================
 
 pub const Value = value.Value;
+pub const ArrayValue = value.ArrayValue;
 pub const Range = value.Range;
 pub const IntValue = value.IntValue;
 pub const IntType = value.IntType;
@@ -69,6 +70,12 @@ const RecordConstructorCtx = struct {
     field_names: [][]const u8,
 };
 
+/// 委托信息（运行时动态分派用）
+const DelegateEntry = struct {
+    target_trait: []const u8,
+    target_method: []const u8,
+};
+
 /// Trait 声明信息
 const TraitInfo = struct {
     name: []const u8,
@@ -80,6 +87,12 @@ const TraitInfo = struct {
     parent_names: []const []const u8,
     /// 关联类型名称列表（\0 分隔）
     associated_type_names: []const u8,
+    /// override 方法名集合（方法名 -> void），仅 override 的方法可覆盖父 Trait impl
+    override_methods: std.StringHashMap(void),
+    /// 委托方法名集合（方法名 -> void），委托方法也可覆盖父 Trait impl
+    delegate_methods: std.StringHashMap(void),
+    /// 委托信息（方法名 -> DelegateEntry），运行时动态查找父 Trait impl
+    delegate_infos: std.StringHashMap(DelegateEntry),
 };
 
 /// Impl 方法注册项
@@ -132,6 +145,8 @@ pub const Evaluator = struct {
     record_constructor_contexts: std.ArrayList(*RecordConstructorCtx),
     /// Trait 声明注册表（trait_name -> TraitInfo）
     trait_registry: std.StringHashMap(TraitInfo),
+    /// Trait 定义顺序（后定义的优先），用于方法分派消歧
+    trait_definition_order: std.ArrayList([]const u8),
     /// 所有已注册的 impl 方法
     impl_methods: std.ArrayList(ImplMethodEntry),
     /// 已加载模块的导出信息
@@ -165,6 +180,7 @@ pub const Evaluator = struct {
             .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
             .record_constructor_contexts = std.ArrayList(*RecordConstructorCtx).empty,
             .trait_registry = std.StringHashMap(TraitInfo).init(allocator),
+            .trait_definition_order = std.ArrayList([]const u8).empty,
             .impl_methods = std.ArrayList(ImplMethodEntry).empty,
             .module_exports = std.StringHashMap(ModuleExportInfo).init(allocator),
             .current_source_dir = null,
@@ -189,6 +205,7 @@ pub const Evaluator = struct {
             .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
             .record_constructor_contexts = std.ArrayList(*RecordConstructorCtx).empty,
             .trait_registry = std.StringHashMap(TraitInfo).init(allocator),
+            .trait_definition_order = std.ArrayList([]const u8).empty,
             .impl_methods = std.ArrayList(ImplMethodEntry).empty,
             .module_exports = std.StringHashMap(ModuleExportInfo).init(allocator),
             .current_source_dir = null,
@@ -391,8 +408,12 @@ pub const Evaluator = struct {
                 .default_methods = std.StringHashMap(*value.Closure).init(self.allocator),
                 .parent_names = &[_][]const u8{},
                 .associated_type_names = "",
+                .override_methods = std.StringHashMap(void).init(self.allocator),
+                .delegate_methods = std.StringHashMap(void).init(self.allocator),
+                .delegate_infos = std.StringHashMap(DelegateEntry).init(self.allocator),
             };
             self.trait_registry.put(self.allocator.dupe(u8, "Iterable") catch return, iterable_info) catch return;
+            self.trait_definition_order.append(self.allocator, self.allocator.dupe(u8, "Iterable") catch return) catch return;
         }
         {
             const iterator_method_names = self.allocator.dupe(u8, "next") catch return;
@@ -402,8 +423,12 @@ pub const Evaluator = struct {
                 .default_methods = std.StringHashMap(*value.Closure).init(self.allocator),
                 .parent_names = &[_][]const u8{},
                 .associated_type_names = "",
+                .override_methods = std.StringHashMap(void).init(self.allocator),
+                .delegate_methods = std.StringHashMap(void).init(self.allocator),
+                .delegate_infos = std.StringHashMap(DelegateEntry).init(self.allocator),
             };
             self.trait_registry.put(self.allocator.dupe(u8, "Iterator") catch return, iterator_info) catch return;
+            self.trait_definition_order.append(self.allocator, self.allocator.dupe(u8, "Iterator") catch return) catch return;
         }
     }
 
@@ -516,6 +541,25 @@ pub const Evaluator = struct {
     }
 
     // ============================================================
+    // 入口点调用
+    // ============================================================
+
+    /// 查找并调用全局环境中的 `main` 函数
+    ///
+    /// 仅在文件模式下调用（REPL 不调用）。
+    /// 如果未找到 main，返回 error.MissingMain。
+    /// 如果找到但不可调用，返回 error.TypeMismatch。
+    pub fn callMain(self: *Evaluator) EvalResult!Value {
+        const main_var = self.global_env.get("main") orelse return error.MissingMain;
+        switch (main_var.value) {
+            .closure, .builtin => {
+                return self.callFunction(main_var.value, &[_]Value{}, null);
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    // ============================================================
     // 模块求值
     // ============================================================
 
@@ -571,19 +615,19 @@ pub const Evaluator = struct {
                 for (self.type_inferencer.errors.items) |err| {
                     const kind_str = switch (err.kind) {
                         .type_mismatch => "type error",
-                        .unbound_variable => "type error",
-                        .arity_mismatch => "type error",
+                        .unbound_variable => "scope error",
+                        .arity_mismatch => "arity error",
                         .occurs_check_failed => "type error",
-                        .missing_implementation => "type error",
+                        .missing_implementation => "impl error",
                         .recursive_type => "type error",
                         .non_exhaustive_match => "match error",
                         .propagate_cross_type => "type error",
                         .unsatisfied_bound => "bound error",
                     };
                     if (err.line > 0) {
-                        stderr_writer.interface.print("{d}:{d}: {s}: {s}\n", .{ err.line, err.column, kind_str, err.message }) catch {};
+                        stderr_writer.interface.print("{s}:{d}:{d}: {s}: {s}\n", .{ module_name, err.line, err.column, kind_str, err.message }) catch {};
                     } else {
-                        stderr_writer.interface.print("{s}: {s}\n", .{ kind_str, err.message }) catch {};
+                        stderr_writer.interface.print("{s}: {s}: {s}\n", .{ module_name, kind_str, err.message }) catch {};
                     }
                 }
                 stderr_writer.flush() catch {};
@@ -853,6 +897,12 @@ pub const Evaluator = struct {
                 var method_names = std.ArrayList(u8).empty;
                 defer method_names.deinit(self.allocator);
                 var default_methods = std.StringHashMap(*value.Closure).init(self.allocator);
+                // 文档 2.7.2: override 方法名集合，仅 override 可覆盖父 Trait impl
+                var override_method_names = std.StringHashMap(void).init(self.allocator);
+                // 文档 2.7.2: 委托方法名集合，委托方法也可覆盖父 Trait impl
+                var delegate_method_names = std.StringHashMap(void).init(self.allocator);
+                // 文档 2.7.2: 委托信息（方法名 -> DelegateEntry），运行时动态查找
+                var delegate_info_map = std.StringHashMap(DelegateEntry).init(self.allocator);
                 // 冲突检测：记录每个方法名来自哪个父 Trait
                 var method_sources = std.StringHashMap([]const u8).init(self.allocator);
                 defer method_sources.deinit();
@@ -890,16 +940,17 @@ pub const Evaluator = struct {
 
                     if (method.delegate) |del| {
                         // 委托语法：fun to_string(self): str = Serializable.to_string
-                        // 从指定父 Trait 获取默认实现
-                        if (self.trait_registry.getPtr(del.trait_name)) |parent_info| {
-                            if (parent_info.default_methods.get(del.method_name)) |del_closure| {
-                                const method_name = try self.allocator.dupe(u8, method.name);
-                                try default_methods.put(method_name, del_closure);
-                                // 更新方法来源
-                                const src_copy = try self.allocator.dupe(u8, del.trait_name);
-                                try method_sources.put(method_name, src_copy);
-                            }
-                        }
+                        // 文档 2.7.2: 委托方法在运行时动态查找父 Trait 的 impl 方法
+                        // 不再静态绑定闭包，而是存储委托信息供运行时查找
+                        try delegate_method_names.put(try self.allocator.dupe(u8, method.name), {});
+                        const method_name = try self.allocator.dupe(u8, method.name);
+                        try delegate_info_map.put(method_name, DelegateEntry{
+                            .target_trait = try self.allocator.dupe(u8, del.trait_name),
+                            .target_method = try self.allocator.dupe(u8, del.method_name),
+                        });
+                        // 更新方法来源
+                        const src_copy = try self.allocator.dupe(u8, del.trait_name);
+                        try method_sources.put(method_name, src_copy);
                         // 重命名：方法名与委托方法名不同时（如 fun debug_string = Debug.to_string）
                         // 此时方法名是 method.name，但实现来自 del.trait_name.del.method_name
                     } else if (method.body) |body| {
@@ -914,6 +965,10 @@ pub const Evaluator = struct {
                         try self.closures.append(self.allocator, closure);
                         const method_name = try self.allocator.dupe(u8, method.name);
                         try default_methods.put(method_name, closure);
+                        // 文档 2.7.2: override 方法标记，仅 override 可覆盖父 Trait impl
+                        if (method.is_override) {
+                            try override_method_names.put(try self.allocator.dupe(u8, method.name), {});
+                        }
                         // override 或有 body 的方法覆盖冲突
                         const src_copy = try self.allocator.dupe(u8, td.name);
                         try method_sources.put(method_name, src_copy);
@@ -922,30 +977,55 @@ pub const Evaluator = struct {
                 }
 
                 // 冲突检测：检查是否有来自不同父 Trait 的同名方法未被消解
-                // 遍历所有方法来源，如果同名方法来自多个不同父 Trait 且未被 override/delegate 消解，则报错
+                // 文档 2.7.2: 当多个父 Trait 有同名方法时，必须显式处理（委托/重命名/override）
                 {
-                    var src_iter = method_sources.iterator();
-                    while (src_iter.next()) |entry| {
-                        const mname = entry.key_ptr.*;
-                        const source = entry.value_ptr.*;
-                        // 如果来源是当前 trait 自身（已被 override/delegate 消解），则无冲突
-                        if (std.mem.eql(u8, source, td.name)) continue;
-                        // 检查是否有其他父 Trait 也提供了同名方法
-                        for (td.parents) |parent| {
-                            if (std.mem.eql(u8, parent.trait_name, source)) continue;
-                            if (self.trait_registry.getPtr(parent.trait_name)) |parent_info| {
-                                if (parent_info.default_methods.get(mname)) |_| {
-                                    // 另一个父 Trait 也有同名方法 — 检查是否已消解
-                                    // 如果 default_methods 中该方法的来源不是当前 trait，
-                                    // 说明未被 override/delegate 消解
-                                    if (method_sources.get(mname)) |final_src| {
-                                        if (!std.mem.eql(u8, final_src, td.name)) {
-                                            // 未消解的冲突 — 但只在第一次发现时报错
-                                            // 后续 put 操作可能已覆盖来源
-                                        }
-                                    }
+                    // 收集每个方法名来自的所有父 Trait
+                    var method_all_sources = std.StringHashMap(std.ArrayList([]const u8)).init(self.allocator);
+                    defer {
+                        var mas_iter = method_all_sources.iterator();
+                        while (mas_iter.next()) |entry| {
+                            entry.value_ptr.deinit(self.allocator);
+                        }
+                        method_all_sources.deinit();
+                    }
+
+                    // 从父 Trait 的默认方法中收集来源
+                    for (td.parents) |parent| {
+                        if (self.trait_registry.getPtr(parent.trait_name)) |parent_info| {
+                            var dm_iter2 = parent_info.default_methods.iterator();
+                            while (dm_iter2.next()) |dm_entry| {
+                                const mname = dm_entry.key_ptr.*;
+                                if (method_all_sources.getPtr(mname)) |sources| {
+                                    sources.append(self.allocator, parent.trait_name) catch {};
+                                } else {
+                                    var new_list = std.ArrayList([]const u8).empty;
+                                    new_list.append(self.allocator, parent.trait_name) catch {};
+                                    const name_copy = self.allocator.dupe(u8, mname) catch return;
+                                    method_all_sources.put(name_copy, new_list) catch return;
                                 }
                             }
+                        }
+                    }
+
+                    // 检查未消解的冲突
+                    var conflict_iter = method_all_sources.iterator();
+                    while (conflict_iter.next()) |entry| {
+                        const mname = entry.key_ptr.*;
+                        const sources = entry.value_ptr.*;
+                        // 只有来自多个不同父 Trait 的同名方法才是冲突
+                        if (sources.items.len < 2) continue;
+                        // 检查是否已被消解（override/delegate/有 body 的方法）
+                        if (method_sources.get(mname)) |src| {
+                            if (std.mem.eql(u8, src, td.name)) continue; // 已被消解
+                        }
+                        // 未消解的冲突 — 报错
+                        const first = sources.items[0];
+                        const second = sources.items[1];
+                        if (self.io) |io| {
+                            var err_buf: [4096]u8 = undefined;
+                            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                            stderr_writer.interface.print("{s}: error: unresolved conflict for method '{s}' — inherited from both {s} and {s}; use delegation, renaming, or override to resolve\n", .{ td.name, mname, first, second }) catch {};
+                            stderr_writer.flush() catch {};
                         }
                     }
                 }
@@ -978,7 +1058,11 @@ pub const Evaluator = struct {
                     .default_methods = default_methods,
                     .parent_names = owned_parent_names,
                     .associated_type_names = owned_assoc_type_names,
+                    .override_methods = override_method_names,
+                    .delegate_methods = delegate_method_names,
+                    .delegate_infos = delegate_info_map,
                 });
+                try self.trait_definition_order.append(self.allocator, try self.allocator.dupe(u8, td.name));
             },
             .impl_decl => |id| {
                 // 注册 Impl 声明
@@ -1248,7 +1332,7 @@ pub const Evaluator = struct {
 
         // 解析整数值
         const int_val = parseInt(i128, raw) catch
-            return self.gluePanic("integer overflow in literal");
+            return self.gluePanic("arithmetic overflow: integer literal out of range");
 
         // 如果有类型后缀，检查范围
         if (suffix) |s| {
@@ -1264,18 +1348,18 @@ pub const Evaluator = struct {
         const suffix = lit.suffix;
 
         const float_val = parseFloat(f64, raw) catch
-            return self.gluePanic("invalid float literal");
+            return self.gluePanic("invalid floating-point literal");
 
         // 文档要求：浮点数不包含 NaN 和 Infinity 值
         if (std.math.isNan(float_val) or std.math.isInf(float_val)) {
-            return self.gluePanic("float literal overflow");
+            return self.gluePanic("arithmetic overflow: floating-point literal out of range");
         }
 
         if (suffix) |s| {
             if (std.mem.eql(u8, s, "f32")) {
                 const f32_val: f32 = @floatCast(float_val);
                 if (std.math.isNan(f32_val) or std.math.isInf(f32_val)) {
-                    return self.gluePanic("float literal overflow");
+                    return self.gluePanic("arithmetic overflow: floating-point literal out of range");
                 }
                 return Value{ .float = @floatCast(f32_val) };
             }
@@ -1324,6 +1408,20 @@ pub const Evaluator = struct {
         switch (ae.target.*) {
             .identifier => |id| {
                 try environment.set(id.name, val);
+            },
+            .index => |idx| {
+                const object = try self.evalExpr(idx.object, environment);
+                const index_val = try self.evalExpr(idx.index, environment);
+                switch (object) {
+                    .array => |*arr| {
+                        const i = try index_val.asInteger();
+                        if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
+                            return error.IndexOutOfBounds;
+                        }
+                        arr.elements[@as(usize, @intCast(i))] = val;
+                    },
+                    else => return error.TypeMismatch,
+                }
             },
             else => return error.TypeMismatch,
         }
@@ -1390,7 +1488,7 @@ pub const Evaluator = struct {
     /// 检查浮点运算结果是否为 NaN 或 Infinity，若是则 panic，否则返回 Value
     fn checkFloatResult(self: *Evaluator, result: f64) EvalResult!Value {
         if (std.math.isNan(result) or std.math.isInf(result)) {
-            return self.gluePanic("floating point overflow");
+            return self.gluePanic("arithmetic overflow: floating-point operation out of range");
         }
         return Value{ .float = result };
     }
@@ -1399,7 +1497,7 @@ pub const Evaluator = struct {
         if (left == .integer and right == .integer) {
             const result_type = left.integer.type_tag;
             const result = left.integer.value + right.integer.value;
-            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
@@ -1424,7 +1522,7 @@ pub const Evaluator = struct {
         if (left == .integer and right == .integer) {
             const result_type = left.integer.type_tag;
             const result = left.integer.value - right.integer.value;
-            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
@@ -1443,7 +1541,7 @@ pub const Evaluator = struct {
         if (left == .integer and right == .integer) {
             const result_type = left.integer.type_tag;
             const result = left.integer.value * right.integer.value;
-            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
@@ -1461,26 +1559,26 @@ pub const Evaluator = struct {
     fn evalDiv(self: *Evaluator, left: Value, right: Value, location: ast.SourceLocation) EvalResult!Value {
         _ = location;
         if (left == .integer and right == .integer) {
-            if (right.integer.value == 0) return self.gluePanic("division by zero");
+            if (right.integer.value == 0) return self.gluePanic("arithmetic error: division by zero");
             // 检查 i128 最小值 / -1 溢出
             if (left.integer.value == std.math.minInt(i128) and right.integer.value == -1) {
-                return self.gluePanic("integer overflow");
+                return self.gluePanic("arithmetic overflow: integer operation out of range");
             }
             const result_type = left.integer.type_tag;
             const result = @divTrunc(left.integer.value, right.integer.value);
-            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
-            if (right.float == 0.0) return self.gluePanic("division by zero");
+            if (right.float == 0.0) return self.gluePanic("arithmetic error: division by zero");
             return self.checkFloatResult(left.float / right.float);
         }
         if (left == .integer and right == .float) {
-            if (right.float == 0.0) return self.gluePanic("division by zero");
+            if (right.float == 0.0) return self.gluePanic("arithmetic error: division by zero");
             return self.checkFloatResult(@as(f64, @floatFromInt(left.integer.value)) / right.float);
         }
         if (left == .float and right == .integer) {
-            if (right.integer.value == 0) return self.gluePanic("division by zero");
+            if (right.integer.value == 0) return self.gluePanic("arithmetic error: division by zero");
             return self.checkFloatResult(left.float / @as(f64, @floatFromInt(right.integer.value)));
         }
         return error.TypeMismatch;
@@ -1489,14 +1587,14 @@ pub const Evaluator = struct {
     fn evalMod(self: *Evaluator, left: Value, right: Value, location: ast.SourceLocation) EvalResult!Value {
         _ = location;
         if (left == .integer and right == .integer) {
-            if (right.integer.value == 0) return self.gluePanic("division by zero");
+            if (right.integer.value == 0) return self.gluePanic("arithmetic error: division by zero");
             const result_type = left.integer.type_tag;
             const result = @mod(left.integer.value, right.integer.value);
-            if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+            if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
         }
         if (left == .float and right == .float) {
-            if (right.float == 0.0) return self.gluePanic("division by zero");
+            if (right.float == 0.0) return self.gluePanic("arithmetic error: division by zero");
             return self.checkFloatResult(@mod(left.float, right.float));
         }
         return error.TypeMismatch;
@@ -1576,7 +1674,7 @@ pub const Evaluator = struct {
                 .integer => |iv| {
                     const result_type = iv.type_tag;
                     const result = -iv.value;
-                    if (!result_type.inRange(result)) return self.gluePanic("integer overflow");
+                    if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
                     return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
                 },
                 .float => |f| {
@@ -1712,6 +1810,7 @@ pub const Evaluator = struct {
                         error.UnsupportedOperation => return error.UnsupportedOperation,
                         error.GluePanic => return error.GluePanic,
                         error.FileNotFound => return error.FileNotFound,
+                        error.MissingMain => return error.MissingMain,
                         else => return error.UnsupportedOperation,
                     }
                 };
@@ -1733,6 +1832,29 @@ pub const Evaluator = struct {
         defer args.deinit(self.allocator);
 
         return self.callMethod(object, mc.method, args.items, environment);
+    }
+
+    /// 检查接收者类型是否实现了指定 trait 的所有父 Trait
+    /// 文档 2.7.2: 子 Trait 的 override 方法仅在接收者类型实现了所有父 Trait 时生效
+    fn hasAllParentImpls(self: *Evaluator, trait_name: []const u8, obj_type_name: ?[]const u8) bool {
+        const trait_info = self.trait_registry.getPtr(trait_name) orelse return false;
+        if (obj_type_name) |otn| {
+            // 检查每个父 Trait 是否有对应的 impl
+            for (trait_info.parent_names) |parent_name| {
+                var found = false;
+                for (self.impl_methods.items) |impl_entry| {
+                    if (std.mem.eql(u8, impl_entry.trait_name, parent_name) and
+                        (impl_entry.type_name.len == 0 or std.mem.eql(u8, impl_entry.type_name, otn)))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     /// 从运行时值推断类型名（用于 impl 方法分派）
@@ -1765,15 +1887,8 @@ pub const Evaluator = struct {
         // 内建方法
         if (std.mem.eql(u8, method, "len")) {
             return switch (object) {
-                .string => |s| Value{ .integer = IntValue{ .value = @as(i128, @intCast(s.len)) } },
-                .array => |arr| Value{ .integer = IntValue{ .value = @as(i128, @intCast(arr.len)) } },
-                else => error.TypeMismatch,
-            };
-        }
-
-        if (std.mem.eql(u8, method, "char_count")) {
-            return switch (object) {
                 .string => |s| {
+                    // len() 返回 Unicode 标量值（字符数），而非字节数
                     const view = std.unicode.Utf8View.init(s) catch {
                         return Value{ .integer = IntValue{ .value = @as(i128, @intCast(s.len)) } };
                     };
@@ -1784,6 +1899,7 @@ pub const Evaluator = struct {
                     }
                     return Value{ .integer = IntValue{ .value = count } };
                 },
+                .array => |arr| Value{ .integer = IntValue{ .value = @as(i128, @intCast(arr.elements.len)) } },
                 else => error.TypeMismatch,
             };
         }
@@ -1796,10 +1912,10 @@ pub const Evaluator = struct {
                     // 文档：var 与值语义——支持重新赋值和原地修改
                     // 用法：var arr = [1, 2]; arr = arr.push(3)
                     if (args.len != 1) return error.WrongArity;
-                    var new_arr = try self.allocator.alloc(Value, arr.len + 1);
-                    @memcpy(new_arr[0..arr.len], arr);
-                    new_arr[arr.len] = try args[0].clone(self.allocator);
-                    return Value{ .array = new_arr };
+                    var new_arr = try self.allocator.alloc(Value, arr.elements.len + 1);
+                    @memcpy(new_arr[0..arr.elements.len], arr.elements);
+                    new_arr[arr.elements.len] = try args[0].clone(self.allocator);
+                    return Value{ .array = .{ .elements = new_arr, .fixed_size = null } };
                 },
                 else => error.TypeMismatch,
             };
@@ -1809,8 +1925,8 @@ pub const Evaluator = struct {
             return switch (object) {
                 .array => |arr| {
                     // pop: 弹出最后一个元素，返回 T?
-                    if (arr.len == 0) return Value.null_val;
-                    return try arr[arr.len - 1].clone(self.allocator);
+                    if (arr.elements.len == 0) return Value.null_val;
+                    return try arr.elements[arr.elements.len - 1].clone(self.allocator);
                 },
                 else => error.TypeMismatch,
             };
@@ -1821,7 +1937,7 @@ pub const Evaluator = struct {
                 .array => |arr| {
                     // contains: 检查是否包含元素（结构相等）
                     if (args.len != 1) return error.WrongArity;
-                    for (arr) |item| {
+                    for (arr.elements) |item| {
                         if (structuralEquals(item, args[0])) {
                             return Value{ .boolean = true };
                         }
@@ -1834,7 +1950,7 @@ pub const Evaluator = struct {
 
         if (std.mem.eql(u8, method, "isEmpty")) {
             return switch (object) {
-                .array => |arr| Value{ .boolean = arr.len == 0 },
+                .array => |arr| Value{ .boolean = arr.elements.len == 0 },
                 else => error.TypeMismatch,
             };
         }
@@ -1842,8 +1958,8 @@ pub const Evaluator = struct {
         if (std.mem.eql(u8, method, "first")) {
             return switch (object) {
                 .array => |arr| {
-                    if (arr.len == 0) return Value.null_val;
-                    return try arr[0].clone(self.allocator);
+                    if (arr.elements.len == 0) return Value.null_val;
+                    return try arr.elements[0].clone(self.allocator);
                 },
                 else => error.TypeMismatch,
             };
@@ -1852,8 +1968,8 @@ pub const Evaluator = struct {
         if (std.mem.eql(u8, method, "last")) {
             return switch (object) {
                 .array => |arr| {
-                    if (arr.len == 0) return Value.null_val;
-                    return try arr[arr.len - 1].clone(self.allocator);
+                    if (arr.elements.len == 0) return Value.null_val;
+                    return try arr.elements[arr.elements.len - 1].clone(self.allocator);
                 },
                 else => error.TypeMismatch,
             };
@@ -1863,10 +1979,10 @@ pub const Evaluator = struct {
             return switch (object) {
                 .array => |arr| {
                     // drop_last: 返回去掉最后一个元素的新数组
-                    if (arr.len == 0) return Value{ .array = arr };
-                    const new_arr = try self.allocator.alloc(Value, arr.len - 1);
-                    @memcpy(new_arr, arr[0 .. arr.len - 1]);
-                    return Value{ .array = new_arr };
+                    if (arr.elements.len == 0) return Value{ .array = arr };
+                    const new_arr = try self.allocator.alloc(Value, arr.elements.len - 1);
+                    @memcpy(new_arr, arr.elements[0 .. arr.elements.len - 1]);
+                    return Value{ .array = .{ .elements = new_arr, .fixed_size = null } };
                 },
                 else => error.TypeMismatch,
             };
@@ -1884,7 +2000,7 @@ pub const Evaluator = struct {
             return switch (object) {
                 .array => |arr| {
                     const iter = try self.allocator.create(value.ArrayIterator);
-                    iter.* = .{ .array = arr, .index = 0 };
+                    iter.* = .{ .array = arr.elements, .index = 0 };
                     return Value{ .array_iterator = iter };
                 },
                 .string => |s| {
@@ -1957,7 +2073,72 @@ pub const Evaluator = struct {
         // Impl 方法分派 — 搜索已注册的 impl 方法
         // 文档 2.7.1: impl Comparable<i32> 定义的方法仅在接收者为 i32 时分派
         // 必须同时匹配 method_name 和接收者类型
+        // 文档 2.7.2: 子 Trait 的 override 方法优先于父 Trait 的 impl 方法
         const obj_type_name = valueTypeName(object);
+
+        // 子 Trait 方法分派 — 搜索组合 Trait 的方法覆盖
+        // 文档 2.7.2: 在单个 Trait 组合内，override > 委托 > 父 Trait impl
+        // 非 override 的 body 方法不能覆盖父 Trait impl（必须用 override 或委托）
+        // 当多个 Trait 组合同时匹配时，后定义的优先（覆盖先定义的）
+        {
+            var best_result: ?Value = null;
+            // 按定义顺序遍历 Trait，后定义的覆盖先定义的
+            for (self.trait_definition_order.items) |trait_name| {
+                const trait_info = self.trait_registry.getPtr(trait_name) orelse continue;
+                if (trait_info.parent_names.len == 0) continue;
+                if (!self.hasAllParentImpls(trait_name, obj_type_name)) continue;
+
+                // 在此 Trait 组合内按优先级查找方法
+                // 1) override 方法 — 覆盖父 Trait impl
+                if (trait_info.override_methods.contains(method)) {
+                    if (trait_info.default_methods.get(method)) |closure| {
+                        var full_args = std.ArrayList(Value).empty;
+                        try full_args.append(self.allocator, object);
+                        for (args) |arg| {
+                            try full_args.append(self.allocator, arg);
+                        }
+                        defer full_args.deinit(self.allocator);
+                        best_result = self.callFunction(Value{ .closure = closure }, full_args.items, environment) catch |err| {
+                            if (err == error.RecursionDetected) return err;
+                            best_result = null;
+                            continue;
+                        };
+                        continue;
+                    }
+                }
+                // 2) 委托方法 — 运行时动态查找父 Trait 的 impl 方法
+                if (trait_info.delegate_methods.contains(method)) {
+                    if (trait_info.delegate_infos.get(method)) |del_info| {
+                        if (obj_type_name) |otn| {
+                            for (self.impl_methods.items) |impl_entry| {
+                                if (std.mem.eql(u8, impl_entry.trait_name, del_info.target_trait) and
+                                    std.mem.eql(u8, impl_entry.method_name, del_info.target_method) and
+                                    (impl_entry.type_name.len == 0 or std.mem.eql(u8, impl_entry.type_name, otn)))
+                                {
+                                    var full_args = std.ArrayList(Value).empty;
+                                    try full_args.append(self.allocator, object);
+                                    for (args) |arg| {
+                                        try full_args.append(self.allocator, arg);
+                                    }
+                                    defer full_args.deinit(self.allocator);
+                                    best_result = self.callFunction(Value{ .closure = impl_entry.closure }, full_args.items, environment) catch |err| {
+                                        if (err == error.RecursionDetected) return err;
+                                        best_result = null;
+                                        break;
+                                    };
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // 注意：非 override、非委托的 body 方法不能覆盖父 Trait impl
+                // 类型检查器已确保同名方法必须加 override 或使用委托
+            }
+            if (best_result) |result| return result;
+        }
+
         for (self.impl_methods.items) |entry| {
             if (std.mem.eql(u8, entry.method_name, method)) {
                 // 检查接收者类型是否匹配 impl 的目标类型
@@ -2091,7 +2272,7 @@ pub const Evaluator = struct {
 
     fn evalNonNullAssert(self: *Evaluator, nna: @TypeOf(@as(ast.Expr, undefined).non_null_assert), environment: *Environment) EvalResult!Value {
         const val = try self.evalExpr(nna.expr, environment);
-        if (val.isNull()) return self.gluePanic("non-null assertion failed: value is null");
+        if (val.isNull()) return self.gluePanic("non-null assertion failed on null value");
         return val;
     }
 
@@ -2124,10 +2305,10 @@ pub const Evaluator = struct {
         switch (object) {
             .array => |arr| {
                 const i = try index_val.asInteger();
-                if (i < 0 or i >= @as(i128, @intCast(arr.len))) {
+                if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
                     return error.IndexOutOfBounds;
                 }
-                return arr[@as(usize, @intCast(i))];
+                return arr.elements[@as(usize, @intCast(i))];
             },
             .string => |s| {
                 const i = try index_val.asInteger();
@@ -2157,7 +2338,7 @@ pub const Evaluator = struct {
         for (al.elements, 0..) |elem, i| {
             arr[i] = try self.evalExpr(elem, environment);
         }
-        return Value{ .array = arr };
+        return Value{ .array = .{ .elements = arr, .fixed_size = null } };
     }
 
     fn evalRecordLiteral(self: *Evaluator, rl: @TypeOf(@as(ast.Expr, undefined).record_literal), environment: *Environment) EvalResult!Value {
@@ -2312,7 +2493,7 @@ pub const Evaluator = struct {
             }
         }
 
-        return self.gluePanic("match expression: no pattern matched");
+        return self.gluePanic("non-exhaustive match: no pattern matched the scrutinee value");
     }
 
     // ============================================================
@@ -2356,40 +2537,40 @@ pub const Evaluator = struct {
             return error.TypeMismatch;
         };
         if (std.mem.eql(u8, type_name, "i8")) {
-            const result = clampInt(val, i8) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampInt(val, i8) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "i16")) {
-            const result = clampInt(val, i16) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampInt(val, i16) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "i32")) {
-            const result = clampInt(val, i32) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampInt(val, i32) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "i64")) {
-            const result = clampInt(val, i64) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampInt(val, i64) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "i128")) return Value{ .integer = IntValue{ .value = val, .type_tag = target_type } };
         if (std.mem.eql(u8, type_name, "u8")) {
-            const result = clampUInt(val, u8) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampUInt(val, u8) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "u16")) {
-            const result = clampUInt(val, u16) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampUInt(val, u16) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "u32")) {
-            const result = clampUInt(val, u32) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampUInt(val, u32) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "u64")) {
-            const result = clampUInt(val, u64) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampUInt(val, u64) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         if (std.mem.eql(u8, type_name, "u128")) {
-            const result = clampUInt(val, u128) catch return self.gluePanic("integer overflow in narrowing conversion");
+            const result = clampUInt(val, u128) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
         return error.TypeMismatch;
@@ -2398,11 +2579,11 @@ pub const Evaluator = struct {
     fn castFloat(self: *Evaluator, val: f64, type_name: []const u8) EvalResult!Value {
         if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = @as(f64, @floatCast(@as(f32, @floatCast(val)))) };
         if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = val };
-        if (std.mem.eql(u8, type_name, "i8")) return floatToInt(val, i8) catch return self.gluePanic("integer overflow in narrowing conversion");
-        if (std.mem.eql(u8, type_name, "i16")) return floatToInt(val, i16) catch return self.gluePanic("integer overflow in narrowing conversion");
-        if (std.mem.eql(u8, type_name, "i32")) return floatToInt(val, i32) catch return self.gluePanic("integer overflow in narrowing conversion");
-        if (std.mem.eql(u8, type_name, "i64")) return floatToInt(val, i64) catch return self.gluePanic("integer overflow in narrowing conversion");
-        if (std.mem.eql(u8, type_name, "i128")) return floatToInt(val, i128) catch return self.gluePanic("integer overflow in narrowing conversion");
+        if (std.mem.eql(u8, type_name, "i8")) return floatToInt(val, i8) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "i16")) return floatToInt(val, i16) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "i32")) return floatToInt(val, i32) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "i64")) return floatToInt(val, i64) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "i128")) return floatToInt(val, i128) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
         return error.TypeMismatch;
     }
 
@@ -2453,6 +2634,20 @@ pub const Evaluator = struct {
                                 } else {
                                     return error.UndefinedVariable;
                                 }
+                            },
+                            else => return error.TypeMismatch,
+                        }
+                    },
+                    .index => |idx| {
+                        const object = try self.evalExpr(idx.object, environment);
+                        const index_val = try self.evalExpr(idx.index, environment);
+                        switch (object) {
+                            .array => |*arr| {
+                                const i = try index_val.asInteger();
+                                if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
+                                    return error.IndexOutOfBounds;
+                                }
+                                arr.elements[@as(usize, @intCast(i))] = val;
                             },
                             else => return error.TypeMismatch,
                         }
@@ -2733,8 +2928,8 @@ fn structuralEquals(a: Value, b: Value) bool {
         .unit => true,
         .range => |r| r.start == b.range.start and r.end == b.range.end and r.inclusive == b.range.inclusive,
         .array => |arr| {
-            if (arr.len != b.array.len) return false;
-            for (arr, b.array) |item_a, item_b| {
+            if (arr.elements.len != b.array.elements.len) return false;
+            for (arr.elements, b.array.elements) |item_a, item_b| {
                 if (!structuralEquals(item_a, item_b)) return false;
             }
             return true;
@@ -3206,10 +3401,10 @@ test "求值器 - 数组字面量" {
 
     const result = try evalSource(allocator, "[1, 2, 3]");
     try std.testing.expect(result == .array);
-    try std.testing.expectEqual(@as(usize, 3), result.array.len);
-    try std.testing.expectEqual(@as(i128, 1), result.array[0].integer.value);
-    try std.testing.expectEqual(@as(i128, 2), result.array[1].integer.value);
-    try std.testing.expectEqual(@as(i128, 3), result.array[2].integer.value);
+    try std.testing.expectEqual(@as(usize, 3), result.array.elements.len);
+    try std.testing.expectEqual(@as(i128, 1), result.array.elements[0].integer.value);
+    try std.testing.expectEqual(@as(i128, 2), result.array.elements[1].integer.value);
+    try std.testing.expectEqual(@as(i128, 3), result.array.elements[2].integer.value);
 }
 
 test "求值器 - 索引访问" {
@@ -3296,7 +3491,7 @@ test "求值器 - for 循环" {
     arr[2] = Value{ .integer = IntValue{ .value = 3 } };
     arr[3] = Value{ .integer = IntValue{ .value = 4 } };
     arr[4] = Value{ .integer = IntValue{ .value = 5 } };
-    const args = [_]Value{Value{ .array = arr }};
+    const args = [_]Value{Value{ .array = .{ .elements = arr, .fixed_size = null } }};
     const result = try evaluator.callFunction(fn_val.value, &args, null);
     try std.testing.expectEqual(@as(i128, 15), result.integer.value);
 }
@@ -3362,7 +3557,7 @@ test "求值器 - for 循环 continue" {
     arr[2] = Value{ .integer = IntValue{ .value = 3 } };
     arr[3] = Value{ .integer = IntValue{ .value = 4 } };
     arr[4] = Value{ .integer = IntValue{ .value = 5 } };
-    const args = [_]Value{Value{ .array = arr }};
+    const args = [_]Value{Value{ .array = .{ .elements = arr, .fixed_size = null } }};
     const result = try evaluator.callFunction(fn_val.value, &args, null);
     try std.testing.expectEqual(@as(i128, 12), result.integer.value);
 }

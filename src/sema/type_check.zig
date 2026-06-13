@@ -373,6 +373,17 @@ pub const TypeScheme = struct {
     quantified_vars: []usize,
     /// 类型
     ty: *Type,
+    /// 文档 2.7.3: Trait Bound 信息
+    /// 每个 bound 包含 trait_name 和类型参数在 quantified_vars 中的索引
+    /// 例如 `fun max<T>(a: T, b: T): T with Ord<T>` 的 bounds 为 [{Ord, 0}]
+    bounds: []BoundInfo = &[_]BoundInfo{},
+};
+
+/// Trait Bound 信息（用于 TypeScheme）
+pub const BoundInfo = struct {
+    trait_name: []const u8,
+    /// 类型参数在 quantified_vars 中的索引
+    type_param_index: usize,
 };
 
 // ============================================================
@@ -428,6 +439,13 @@ pub const TypeEnv = struct {
         const key = try self.allocator.dupe(u8, name);
         try self.bindings.put(key, scheme);
         return true;
+    }
+
+    /// 重新定义绑定：允许覆盖已有定义（用于 impl 方法覆盖内建函数）
+    /// 文档 2.7.1: impl 方法允许与内建函数同名（如 eq、compare），通过接收者类型分派
+    pub fn redefine(self: *TypeEnv, name: []const u8, scheme: TypeScheme) !void {
+        const key = try self.allocator.dupe(u8, name);
+        try self.bindings.put(key, scheme);
     }
 
     pub fn lookup(self: *TypeEnv, name: []const u8) ?TypeScheme {
@@ -522,6 +540,9 @@ pub const TypeInferencer = struct {
     /// 已注册的 impl 记录（用于 Overlapping 检查）
     /// key: "trait_name::type_name"，value: impl 的位置信息
     registered_impls: std.StringHashMap(ImplRecord),
+    /// 文档 2.7.3: 函数 Trait Bound 记录（函数名 -> bounds）
+    /// 用于在调用点验证泛型 Trait Bound
+    fn_bounds: std.StringHashMap([]ast.TraitBound),
     /// 内建函数/构造器名称集合（用于禁止用户遮蔽内建定义）
     builtin_names: std.StringHashMap(void),
     /// 用于 analyzeNullCheck 中翻转 is_non_null 的临时缓冲
@@ -554,6 +575,7 @@ pub const TypeInferencer = struct {
             .trait_defining_modules = std.StringHashMap([]const u8).init(allocator),
             .type_defining_modules = std.StringHashMap([]const u8).init(allocator),
             .registered_impls = std.StringHashMap(ImplRecord).init(allocator),
+            .fn_bounds = std.StringHashMap([]ast.TraitBound).init(allocator),
             .builtin_names = std.StringHashMap(void).init(allocator),
         };
     }
@@ -607,6 +629,7 @@ pub const TypeInferencer = struct {
             }
             self.registered_impls.deinit();
         }
+        self.fn_bounds.deinit();
         {
             var iter = self.builtin_names.keyIterator();
             while (iter.next()) |key| {
@@ -940,6 +963,45 @@ pub const TypeInferencer = struct {
         return TypeScheme{
             .quantified_vars = quantified,
             .ty = ty,
+        };
+    }
+
+    /// 泛化（带 Trait Bound）：将类型中的自由变量转换为量化变量，并记录 bound 信息
+    pub fn generalizeWithBounds(self: *TypeInferencer, env: *TypeEnv, ty: *Type, type_param_ids: []usize, bounds: []ast.TraitBound) !TypeScheme {
+        _ = env;
+        var free_vars = std.ArrayList(usize).empty;
+        defer free_vars.deinit(self.allocator);
+        self.collectFreeVars(ty, &free_vars);
+
+        const quantified = try self.allocator.dupe(usize, free_vars.items);
+
+        // 将 AST bounds 转换为 BoundInfo
+        var bound_infos = std.ArrayList(BoundInfo).empty;
+        defer bound_infos.deinit(self.allocator);
+        for (bounds) |bound| {
+            for (bound.type_args) |_| {
+                // 查找类型参数名对应的量化变量索引
+                for (type_param_ids, 0..) |param_id, param_idx| {
+                    for (quantified, 0..) |qvar_id, qidx| {
+                        if (qvar_id == param_id) {
+                            bound_infos.append(self.allocator, BoundInfo{
+                                .trait_name = bound.trait_name,
+                                .type_param_index = qidx,
+                            }) catch return TypeScheme{ .quantified_vars = quantified, .ty = ty };
+                            break;
+                        }
+                    }
+                    _ = param_idx;
+                    break;
+                }
+            }
+        }
+
+        const owned_bounds = try self.allocator.dupe(BoundInfo, bound_infos.items);
+        return TypeScheme{
+            .quantified_vars = quantified,
+            .ty = ty,
+            .bounds = owned_bounds,
         };
     }
 
@@ -1316,7 +1378,7 @@ pub const TypeInferencer = struct {
                             // 多态递归检测：泛型函数无返回类型标注时，
                             // 递归调用不允许实例化类型参数
                             // 报错并要求添加类型标注
-                            self.addErrorAt(.recursive_type, id.location.line, id.location.column, "polymorphic recursive function '{s}' requires explicit return type annotation", .{id.name});
+                            self.addErrorAt(.recursive_type, id.location.line, id.location.column, "polymorphic recursive function '{s}' requires an explicit return type annotation", .{id.name});
                             // 不实例化，直接返回类型（避免无限类型）
                             return scheme.ty;
                         }
@@ -1404,6 +1466,8 @@ pub const TypeInferencer = struct {
                 const expected_fn_ty = try self.makeFnType(arg_types, ret_ty);
                 // 先尝试直接统一
                 if (self.unify(callee_ty, expected_fn_ty)) {
+                    // 文档 2.7.3: 调用点 Trait Bound 延迟检查
+                    self.checkCallSiteTraitBound(c.callee, c.location);
                     return ret_ty;
                 } else |_| {
                     // 尝试参数自动提升：T 传给 T? 参数，T 传给 Throw<T, E> 参数
@@ -1418,7 +1482,11 @@ pub const TypeInferencer = struct {
                                         break;
                                     };
                                 }
-                                if (all_ok) return ft.return_type;
+                                if (all_ok) {
+                                    // 文档 2.7.3: 调用点 Trait Bound 延迟检查
+                                    self.checkCallSiteTraitBound(c.callee, c.location);
+                                    return ft.return_type;
+                                }
                             }
                         },
                         else => {},
@@ -1534,7 +1602,7 @@ pub const TypeInferencer = struct {
                                 return field.ty;
                             }
                         }
-                        self.addErrorAt(.type_mismatch, fa.location.line, fa.location.column, "record type has no field '{s}'", .{fa.field});
+                        self.addErrorAt(.type_mismatch, fa.location.line, fa.location.column, "record type has no field named '{s}'", .{fa.field});
                         return self.freshTypeVar() catch unreachable;
                     },
                     else => return self.freshTypeVar() catch unreachable,
@@ -1582,7 +1650,7 @@ pub const TypeInferencer = struct {
                                 },
                                 else => {
                                     // ❌ 在非 Nullable 返回函数中对 T? 用 ?
-                                    self.addErrorAt(.propagate_cross_type, prop.location.line, prop.location.column, "? on T? requires enclosing function to return U?, but got non-nullable return type", .{});
+                                    self.addErrorAt(.propagate_cross_type, prop.location.line, prop.location.column, "propagation operator '?' on T? requires enclosing function to return U?, but return type is non-nullable", .{});
                                 },
                             }
                         } else {
@@ -1601,7 +1669,7 @@ pub const TypeInferencer = struct {
                                 },
                                 else => {
                                     // ❌ 在非 Throw 返回函数中对 Throw 用 ?
-                                    self.addErrorAt(.propagate_cross_type, prop.location.line, prop.location.column, "? on Throw<T, E> requires enclosing function to return Throw<U, E'>, but got non-throw return type", .{});
+                                    self.addErrorAt(.propagate_cross_type, prop.location.line, prop.location.column, "propagation operator '?' on Throw<T, E> requires enclosing function to return Throw<U, E'>, but return type is non-throw", .{});
                                 },
                             }
                         }
@@ -1615,11 +1683,11 @@ pub const TypeInferencer = struct {
                             switch (resolved_ret.*) {
                                 .nullable_type, .throw_type => {
                                     // 外层期望 Nullable/Throw 但表达式不是
-                                    self.addErrorAt(.propagate_cross_type, prop.location.line, prop.location.column, "? cannot be used on a non-nullable, non-throw expression", .{});
+                                    self.addErrorAt(.propagate_cross_type, prop.location.line, prop.location.column, "propagation operator '?' cannot be used on a non-nullable, non-throw expression", .{});
                                 },
                                 else => {
                                     // 普通函数中对普通值用 ? — 也报错
-                                    self.addErrorAt(.propagate_cross_type, prop.location.line, prop.location.column, "? cannot be used on a non-nullable, non-throw expression", .{});
+                                    self.addErrorAt(.propagate_cross_type, prop.location.line, prop.location.column, "propagation operator '?' cannot be used on a non-nullable, non-throw expression", .{});
                                 },
                             }
                         }
@@ -1695,7 +1763,7 @@ pub const TypeInferencer = struct {
         return switch (stmt.*) {
             .val_decl => |vd| {
                 if (self.isBuiltinName(vd.name)) {
-                    self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{vd.name});
+                    self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{vd.name});
                 } else {
                     // 如果值是 lambda，先注册函数类型到环境以支持递归调用
                     if (vd.value.* == .lambda) {
@@ -1727,7 +1795,7 @@ pub const TypeInferencer = struct {
                         };
                         // 统一返回类型
                         _ = self.tryWidenUnify(ret_ty, body_ty) catch {
-                            self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "type mismatch in val declaration: return type does not match body", .{});
+                            self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "type mismatch in val declaration: annotation does not match inferred type", .{});
                         };
 
                         // 注册到外层环境
@@ -1756,7 +1824,7 @@ pub const TypeInferencer = struct {
             },
             .var_decl => |vd| {
                 if (self.isBuiltinName(vd.name)) {
-                    self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{vd.name});
+                    self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{vd.name});
                 } else {
                     const val_ty = try self.inferExpr(vd.value, env);
                     // 验证类型注解
@@ -1805,11 +1873,38 @@ pub const TypeInferencer = struct {
             .for_stmt => |fs| {
                 const iterable_ty = try self.inferExpr(fs.iterable, env);
                 const child_env = try env.createChild();
-                // for item in iterable: item 的类型由 iterable 推断
+                // 文档 2.7.8: for item in list 要求 list 的类型满足 Iterable<T>
+                // 推断 item 的类型
                 const item_ty = try self.freshTypeVar();
+
+                // 验证可迭代类型：检查是否有 Iterable<T> 的 impl 或是内建可迭代类型
+                const resolved_iterable = self.resolve(iterable_ty);
+                const is_builtin_iterable = switch (resolved_iterable.*) {
+                    .array_type => true,
+                    .str_type => true,
+                    else => false,
+                };
+                if (!is_builtin_iterable) {
+                    // 检查是否有 Iterable<T> 的 impl
+                    const iterable_type_name: ?[]const u8 = switch (resolved_iterable.*) {
+                        .adt_type => |adt| adt.name,
+                        .generic_type => |g| g.name,
+                        else => null,
+                    };
+                    if (iterable_type_name) |tn| {
+                        const impl_key = std.fmt.allocPrint(self.allocator, "Iterable::{s}", .{tn}) catch "";
+                        defer {
+                            if (impl_key.len > 0) self.allocator.free(impl_key);
+                        }
+                        if (impl_key.len > 0 and !self.registered_impls.contains(impl_key)) {
+                            // 没有找到 Iterable 的 impl，但不阻止推断
+                            // （运行时会尝试 callMethod 分派）
+                        }
+                    }
+                }
+
                 const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = item_ty };
                 try child_env.define(fs.name, scheme);
-                _ = iterable_ty;
                 _ = try self.inferExpr(fs.body, child_env);
                 return null;
             },
@@ -2145,12 +2240,32 @@ pub const TypeInferencer = struct {
             iterable_method_names[0] = "iterator";
             const iterable_assoc_names = self.allocator.alloc([]const u8, 1) catch return;
             iterable_assoc_names[0] = "Item";
+            // 注册方法签名：fun iterator(self: Iterable<T>) : Iterator<T>
+            var iterable_method_schemes = std.StringHashMap(TypeScheme).init(self.allocator);
+            {
+                const t_var = self.freshTypeVar() catch return;
+                const self_args = self.allocator.alloc(*Type, 1) catch return;
+                self_args[0] = t_var;
+                const self_type = self.allocator.create(Type) catch return;
+                self_type.* = Type{ .trait_type = .{ .name = "Iterable", .type_args = self_args } };
+                self.types.append(self.allocator, self_type) catch return;
+                const ret_args = self.allocator.alloc(*Type, 1) catch return;
+                ret_args[0] = t_var;
+                const ret_type = self.allocator.create(Type) catch return;
+                ret_type.* = Type{ .trait_type = .{ .name = "Iterator", .type_args = ret_args } };
+                self.types.append(self.allocator, ret_type) catch return;
+                const fn_params = self.allocator.alloc(*Type, 1) catch return;
+                fn_params[0] = self_type;
+                const fn_ty = self.makeFnType(fn_params, ret_type) catch return;
+                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
+                iterable_method_schemes.put(self.allocator.dupe(u8, "iterator") catch return, scheme) catch return;
+            }
             const iterable_key = self.allocator.dupe(u8, "Iterable") catch return;
             self.trait_types.put(iterable_key, TraitInfo{
                 .ty = iterable_trait_ty,
                 .associated_type_names = iterable_assoc_names,
                 .method_names = iterable_method_names,
-                .method_schemes = std.StringHashMap(TypeScheme).init(self.allocator),
+                .method_schemes = iterable_method_schemes,
                 .defining_module = "<builtin>",
             }) catch return;
             self.builtin_names.put(self.allocator.dupe(u8, "Iterable") catch return, {}) catch return;
@@ -2163,12 +2278,28 @@ pub const TypeInferencer = struct {
             iterator_method_names[0] = "next";
             const iterator_assoc_names = self.allocator.alloc([]const u8, 1) catch return;
             iterator_assoc_names[0] = "Item";
+            // 注册方法签名：fun next(self: Iterator<T>) : T?
+            var iterator_method_schemes = std.StringHashMap(TypeScheme).init(self.allocator);
+            {
+                const t_var = self.freshTypeVar() catch return;
+                const self_args = self.allocator.alloc(*Type, 1) catch return;
+                self_args[0] = t_var;
+                const self_type = self.allocator.create(Type) catch return;
+                self_type.* = Type{ .trait_type = .{ .name = "Iterator", .type_args = self_args } };
+                self.types.append(self.allocator, self_type) catch return;
+                const ret_type = self.makeNullableType(t_var) catch return;
+                const fn_params = self.allocator.alloc(*Type, 1) catch return;
+                fn_params[0] = self_type;
+                const fn_ty = self.makeFnType(fn_params, ret_type) catch return;
+                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
+                iterator_method_schemes.put(self.allocator.dupe(u8, "next") catch return, scheme) catch return;
+            }
             const iterator_key = self.allocator.dupe(u8, "Iterator") catch return;
             self.trait_types.put(iterator_key, TraitInfo{
                 .ty = iterator_trait_ty,
                 .associated_type_names = iterator_assoc_names,
                 .method_names = iterator_method_names,
-                .method_schemes = std.StringHashMap(TypeScheme).init(self.allocator),
+                .method_schemes = iterator_method_schemes,
                 .defining_module = "<builtin>",
             }) catch return;
             self.builtin_names.put(self.allocator.dupe(u8, "Iterator") catch return, {}) catch return;
@@ -2245,6 +2376,57 @@ pub const TypeInferencer = struct {
             if (!defined_names.contains(assoc_name)) {
                 self.addError(.unsatisfied_bound, "impl {s} for {s}: missing associated type '{s}'", .{ id.trait_name, id.type_name, assoc_name });
             }
+        }
+    }
+
+    /// 文档 2.7.2: 递归注册父 Trait 的方法到类型环境
+    /// impl Child<T> 会自动满足所有父 Trait 的 bound
+    fn registerParentTraitMethods(self: *TypeInferencer, env: *TypeEnv, trait_name: []const u8, overridden: *std.StringHashMap(void)) void {
+        if (self.trait_types.getPtr(trait_name)) |trait_info| {
+            // 注册该 Trait 的方法签名
+            var ms_iter = trait_info.method_schemes.iterator();
+            while (ms_iter.next()) |entry| {
+                const mname = entry.key_ptr.*;
+                if (!overridden.contains(mname)) {
+                    if (env.lookup(mname) == null) {
+                        env.redefine(mname, entry.value_ptr.*) catch return;
+                    }
+                }
+            }
+        }
+        // 注意：父 Trait 的方法已在 trait_decl 时合并到子 Trait 的 method_schemes 中
+        // 所以不需要单独遍历父 Trait
+    }
+
+    /// 将类型中的所有类型变量替换为具体类型
+    /// 用于 impl 方法的类型实例化（如 impl Ord<i32> 中 T -> i32）
+    fn instantiateWithConcreteType(self: *TypeInferencer, ty: *Type, concrete: *Type) SemaError!*Type {
+        const resolved = self.resolve(ty);
+        switch (resolved.*) {
+            .type_var => {
+                // 将类型变量替换为具体类型
+                return concrete;
+            },
+            .fn_type => |ft| {
+                var param_types = std.ArrayList(*Type).empty;
+                for (ft.params) |pt| {
+                    const inst_pt = try self.instantiateWithConcreteType(pt, concrete);
+                    param_types.append(self.allocator, inst_pt) catch return error.OutOfMemory;
+                }
+                const inst_ret = try self.instantiateWithConcreteType(ft.return_type, concrete);
+                return self.makeFnType(param_types.items, inst_ret);
+            },
+            .adt_type => return resolved,
+            .i32_type => return resolved,
+            .i64_type => return resolved,
+            .bool_type => return resolved,
+            .str_type => return resolved,
+            .unit_type => return resolved,
+            .nullable_type => return resolved,
+            .throw_type => return resolved,
+            .record_type => return resolved,
+            .trait_type => return resolved,
+            else => return resolved,
         }
     }
 
@@ -2331,9 +2513,19 @@ pub const TypeInferencer = struct {
 
                 // 同时注册到外层环境（供后续声明使用）
                 // 推断完函数体后重新泛化，捕获推断出的自由类型变量（let 多态）
-                const final_scheme = self.generalize(env, fn_ty) catch return;
+                const final_scheme = if (f.bounds.len > 0)
+                    self.generalizeWithBounds(env, fn_ty, type_param_ids.items, f.bounds) catch return
+                else
+                    self.generalize(env, fn_ty) catch return;
                 if (self.isBuiltinName(f.name)) {
-                    self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{f.name});
+                    // 文档 2.7.1: impl 方法允许与内建函数同名（通过接收者类型分派）
+                    // eq、compare、str 等方法名在 impl 中常见，允许覆盖
+                    if (!std.mem.eql(u8, f.name, "eq") and !std.mem.eql(u8, f.name, "compare") and !std.mem.eql(u8, f.name, "str")) {
+                        self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{f.name});
+                    } else {
+                        // 允许覆盖内建函数（使用 redefine 而非 defineOrReport）
+                        env.redefine(f.name, final_scheme) catch return;
+                    }
                 } else if (!(env.defineOrReport(f.name, final_scheme) catch false)) {
                     self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{f.name});
                 }
@@ -2341,6 +2533,15 @@ pub const TypeInferencer = struct {
                 // 文档 2.7.3: Trait Bound `with` 验证
                 for (f.bounds) |bound| {
                     self.checkTraitBound(bound, f.location);
+                }
+
+                // 文档 2.7.3: 记录函数的 Trait Bound，用于调用点延迟检查
+                if (f.bounds.len > 0) {
+                    const name_copy = self.allocator.dupe(u8, f.name) catch return;
+                    // 复制 bounds 数组
+                    const bounds_copy = self.allocator.alloc(ast.TraitBound, f.bounds.len) catch return;
+                    @memcpy(bounds_copy, f.bounds);
+                    self.fn_bounds.put(name_copy, bounds_copy) catch return;
                 }
             },
             .type_decl => |td| {
@@ -2381,9 +2582,9 @@ pub const TypeInferencer = struct {
                         const key = self.allocator.dupe(u8, td.name) catch return;
                         const owned_type_param_names = type_param_names.toOwnedSlice(self.allocator) catch return;
                         if (self.isBuiltinName(td.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
+                            self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (self.adt_types.contains(td.name)) {
-                            self.addError(.type_mismatch, "duplicate type definition: '{s}' is already defined", .{td.name});
+                            self.addError(.type_mismatch, "duplicate type definition: '{s}' is already defined in this scope", .{td.name});
                         } else {
                             self.adt_types.put(key, AdtInfo{
                                 .ty = adt_ty,
@@ -2402,12 +2603,12 @@ pub const TypeInferencer = struct {
                             // 每个构造器需要独立的 quantified_vars 副本
                             const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
                             if (self.isBuiltinName(con.name)) {
-                                self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{con.name});
+                                self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{con.name});
                             } else if (con.fields.len == 0) {
                                 // 无参构造器：直接返回 ADT 类型
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = adt_ty };
                                 if (!(env.defineOrReport(con.name, scheme) catch false)) {
-                                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{con.name});
+                                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
                                 }
                             } else {
                                 // 带参构造器：参数类型 -> ADT 类型
@@ -2421,7 +2622,7 @@ pub const TypeInferencer = struct {
                                 const ctor_ty = self.makeFnType(param_types, adt_ty) catch return;
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
                                 if (!(env.defineOrReport(con.name, scheme) catch false)) {
-                                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{con.name});
+                                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
                                 }
                             }
                         }
@@ -2458,7 +2659,7 @@ pub const TypeInferencer = struct {
                         const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
                         if (self.isBuiltinName(td.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
+                            self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{td.name});
                         }
@@ -2498,7 +2699,7 @@ pub const TypeInferencer = struct {
 
                         // 解析目标类型
                         const target_ty = self.typeFromAstWithParams(ta.target, &type_param_map) catch {
-                            self.addError(.type_mismatch, "invalid target type in alias '{s}'", .{td.name});
+                            self.addError(.type_mismatch, "invalid target type in type alias '{s}'", .{td.name});
                             return;
                         };
 
@@ -2506,7 +2707,7 @@ pub const TypeInferencer = struct {
                         const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = target_ty };
                         if (self.isBuiltinName(td.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
+                            self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{td.name});
                         }
@@ -2553,7 +2754,7 @@ pub const TypeInferencer = struct {
                         const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
                         if (self.isBuiltinName(nt.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{nt.name});
+                            self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{nt.name});
                         } else if (!(env.defineOrReport(nt.name, scheme) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{nt.name});
                         }
@@ -2568,7 +2769,7 @@ pub const TypeInferencer = struct {
                         const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
                         const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
                         if (self.isBuiltinName(en.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{en.name});
+                            self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{en.name});
                         } else if (!(env.defineOrReport(en.name, scheme) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{en.name});
                         }
@@ -2597,22 +2798,94 @@ pub const TypeInferencer = struct {
                     assoc_names[i] = at.name;
                 }
 
+                // 创建类型参数映射（如 T -> 类型变量）
+                var type_param_map = std.StringHashMap(*Type).init(self.allocator);
+                defer type_param_map.deinit();
+                for (td.type_params) |tp| {
+                    const tv = self.freshTypeVar() catch return;
+                    type_param_map.put(tp.name, tv) catch return;
+                }
+                // 文档 2.7.4: 关联类型也作为类型参数映射
+                // 在 Trait 方法签名中，关联类型名（如 Item）应被解析为类型变量
+                for (td.associated_types) |at| {
+                    const tv = self.freshTypeVar() catch return;
+                    type_param_map.put(at.name, tv) catch return;
+                }
+
                 // 收集方法名称和类型签名
-                var meth_names = self.allocator.alloc([]const u8, td.methods.len) catch return;
+                // 文档 2.7.2: 子 Trait 自动拥有所有父 Trait 的方法
+                var meth_names_list = std.ArrayList([]const u8).empty;
+                defer meth_names_list.deinit(self.allocator);
                 var method_schemes = std.StringHashMap(TypeScheme).init(self.allocator);
-                for (td.methods, 0..) |m, i| {
-                    meth_names[i] = m.name;
+
+                // 先合并父 Trait 的方法签名
+                for (td.parents) |parent| {
+                    if (self.trait_types.getPtr(parent.trait_name)) |parent_info| {
+                        // 合并父 Trait 的方法名
+                        for (parent_info.method_names) |mname| {
+                            meth_names_list.append(self.allocator, mname) catch return;
+                        }
+                        // 合并父 Trait 的方法签名
+                        var ms_iter = parent_info.method_schemes.iterator();
+                        while (ms_iter.next()) |entry| {
+                            const mname = self.allocator.dupe(u8, entry.key_ptr.*) catch return;
+                            method_schemes.put(mname, entry.value_ptr.*) catch return;
+                        }
+                    }
+                }
+
+                // 再处理子 Trait 自身的方法（可覆盖父 Trait 的方法）
+                for (td.methods) |m| {
+                    // 文档 2.7.2: 检查子 Trait 方法是否与父 Trait 方法同名
+                    var name_conflicts_with_parent = false;
+                    for (td.parents) |parent| {
+                        if (self.trait_types.getPtr(parent.trait_name)) |parent_info| {
+                            for (parent_info.method_names) |pmname| {
+                                if (std.mem.eql(u8, pmname, m.name)) {
+                                    name_conflicts_with_parent = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (name_conflicts_with_parent) break;
+                    }
+                    // 文档 2.7.2: 与父 Trait 同名的方法必须加 override 或使用委托
+                    if (name_conflicts_with_parent and !m.is_override and m.delegate == null) {
+                        self.addError(.type_mismatch, "method '{s}' conflicts with parent trait — use 'override' or delegation to resolve", .{m.name});
+                    }
+                    // 文档 2.7.2: override 合法性验证 — 检查被 override 的方法确实存在于父 Trait
+                    if (m.is_override and !name_conflicts_with_parent) {
+                        self.addError(.type_mismatch, "override method '{s}' not found in any parent trait", .{m.name});
+                    }
+                    // 文档 2.7.2: 委托合法性验证 — 检查委托的 Trait 和方法确实存在
+                    if (m.delegate) |del| {
+                        if (self.trait_types.getPtr(del.trait_name)) |del_trait| {
+                            var found_method = false;
+                            for (del_trait.method_names) |dmname| {
+                                if (std.mem.eql(u8, dmname, del.method_name)) {
+                                    found_method = true;
+                                    break;
+                                }
+                            }
+                            if (!found_method) {
+                                self.addError(.type_mismatch, "delegate method '{s}' not found in trait '{s}'", .{ del.method_name, del.trait_name });
+                            }
+                        } else {
+                            self.addError(.type_mismatch, "delegate trait '{s}' is not defined", .{del.trait_name});
+                        }
+                    }
+                    meth_names_list.append(self.allocator, m.name) catch return;
                     // 推断方法类型签名
                     var param_types = std.ArrayList(*Type).empty;
                     for (m.params) |param| {
                         const pt = if (param.type_annotation) |ta|
-                            self.typeFromAst(ta) catch self.freshTypeVar() catch return
+                            self.typeFromAstWithParams(ta, &type_param_map) catch self.freshTypeVar() catch return
                         else
                             self.freshTypeVar() catch return;
                         param_types.append(self.allocator, pt) catch return;
                     }
                     const ret_type = if (m.return_type) |rt|
-                        self.typeFromAst(rt) catch self.freshTypeVar() catch return
+                        self.typeFromAstWithParams(rt, &type_param_map) catch self.freshTypeVar() catch return
                     else
                         self.freshTypeVar() catch return;
                     const fn_type = self.makeFnType(param_types.items, ret_type) catch return;
@@ -2621,11 +2894,62 @@ pub const TypeInferencer = struct {
                     method_schemes.put(mname, scheme) catch return;
                 }
 
+                // 文档 2.7.2: 冲突检测 — 当多个父 Trait 有同名方法时，必须显式处理
+                {
+                    // 收集每个方法名来自的所有父 Trait
+                    var method_all_sources = std.StringHashMap(std.ArrayList([]const u8)).init(self.allocator);
+                    defer {
+                        var mas_iter = method_all_sources.iterator();
+                        while (mas_iter.next()) |entry| {
+                            entry.value_ptr.deinit(self.allocator);
+                        }
+                        method_all_sources.deinit();
+                    }
+
+                    for (td.parents) |parent| {
+                        if (self.trait_types.getPtr(parent.trait_name)) |parent_info| {
+                            for (parent_info.method_names) |mname| {
+                                if (method_all_sources.getPtr(mname)) |sources| {
+                                    sources.append(self.allocator, parent.trait_name) catch {};
+                                } else {
+                                    var new_list = std.ArrayList([]const u8).empty;
+                                    new_list.append(self.allocator, parent.trait_name) catch {};
+                                    const name_copy = self.allocator.dupe(u8, mname) catch return;
+                                    method_all_sources.put(name_copy, new_list) catch return;
+                                }
+                            }
+                        }
+                    }
+
+                    // 检查未消解的冲突
+                    var conflict_iter = method_all_sources.iterator();
+                    while (conflict_iter.next()) |entry| {
+                        const mname = entry.key_ptr.*;
+                        const sources = entry.value_ptr.*;
+                        if (sources.items.len < 2) continue;
+                        // 检查子 Trait 是否已消解（仅 override 或委托可消解冲突）
+                        var resolved = false;
+                        for (td.methods) |m| {
+                            if (std.mem.eql(u8, m.name, mname) and (m.is_override or m.delegate != null)) {
+                                resolved = true;
+                                break;
+                            }
+                        }
+                        if (!resolved) {
+                            const first = sources.items[0];
+                            const second = sources.items[1];
+                            self.addError(.type_mismatch, "unresolved conflict for method '{s}' — inherited from both {s} and {s}; use 'override' or delegation to resolve", .{ mname, first, second });
+                        }
+                    }
+                }
+
+                const meth_names = meth_names_list.toOwnedSlice(self.allocator) catch return;
+
                 const key = self.allocator.dupe(u8, td.name) catch return;
                 if (self.isBuiltinName(td.name)) {
-                    self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{td.name});
+                    self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
                 } else if (self.trait_types.contains(td.name)) {
-                    self.addError(.type_mismatch, "duplicate trait definition: '{s}' is already defined", .{td.name});
+                    self.addError(.type_mismatch, "duplicate trait definition: '{s}' is already defined in this scope", .{td.name});
                 } else {
                     self.trait_types.put(key, TraitInfo{
                         .ty = trait_ty,
@@ -2649,30 +2973,86 @@ pub const TypeInferencer = struct {
                 // impl 必须定义 Trait 中声明的所有关联类型
                 self.checkImplAssociatedTypes(id);
 
+                // 构建 impl 的类型参数映射（如 impl Ord<i32> 中 T -> i32）
+                var impl_type_param_map = std.StringHashMap(*Type).init(self.allocator);
+                defer impl_type_param_map.deinit();
+                if (self.trait_types.getPtr(id.trait_name)) |trait_info| {
+                    // 从 trait 的类型参数和 impl 的类型参数构建映射
+                    // trait Ord<T> 的 type_params 是 ["T"]
+                    // impl Ord<i32> 的 type_args 是 [i32]
+                    _ = trait_info;
+                }
+                // 文档 2.7.4: 将关联类型定义加入类型参数映射
+                // impl Container for ... { type Item = i32 ... } 中 Item -> i32
+                for (id.associated_type_defs) |atd| {
+                    const assoc_ty = self.typeFromAst(atd.actual_type) catch self.freshTypeVar() catch continue;
+                    impl_type_param_map.put(atd.name, assoc_ty) catch continue;
+                }
+                // 从 impl 的 type_args 构建具体类型
+                // impl Comparable<i32> 中 type_args[0] = i32
+                // 我们需要知道 trait 的类型参数名来建立映射
+                // 简化方法：直接用 impl 的 type_name 作为所有类型参数的替换
+                // 对于单参数 trait（如 Comparable<T>），T -> type_name
+                // 对于多参数 trait，需要更复杂的映射
+                const concrete_type = if (id.type_name.len > 0)
+                    self.typeFromAst(&ast.TypeNode{ .named = .{ .location = .{ .line = 0, .column = 0 }, .name = id.type_name } }) catch null
+                else
+                    null;
+
+                // 收集 impl 中已覆写的方法名
+                var overridden = std.StringHashMap(void).init(self.allocator);
+                defer overridden.deinit();
+
                 // Impl 声明：将 impl 中的方法注册到类型环境
-                // 这样后续代码可以直接调用 compare(a, b) 等
+                // 文档 2.7.1: impl 方法允许与内建函数同名（如 eq、compare），通过接收者类型分派
                 for (id.methods) |method| {
                     if (method.body) |_| {
                         // 构造方法类型
                         var param_types = self.allocator.alloc(*Type, method.params.len) catch return;
                         for (method.params, 0..) |param, i| {
                             param_types[i] = if (param.type_annotation) |ta|
-                                self.typeFromAst(ta) catch self.freshTypeVar() catch return
+                                self.typeFromAstWithParams(ta, &impl_type_param_map) catch self.freshTypeVar() catch return
                             else
                                 self.freshTypeVar() catch return;
                         }
                         const ret_ty = if (method.return_type) |rt|
-                            self.typeFromAst(rt) catch self.freshTypeVar() catch return
+                            self.typeFromAstWithParams(rt, &impl_type_param_map) catch self.freshTypeVar() catch return
                         else
                             self.freshTypeVar() catch return;
                         const fn_ty = self.makeFnType(param_types, ret_ty) catch return;
                         const scheme = self.generalize(env, fn_ty) catch return;
-                        if (self.isBuiltinName(method.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in '{s}'", .{method.name});
-                        } else if (!(env.defineOrReport(method.name, scheme) catch false)) {
-                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{method.name});
+                        // 文档 2.7.1: impl 方法允许覆盖内建函数（如 eq、compare）
+                        env.redefine(method.name, scheme) catch return;
+                        const name_copy = self.allocator.dupe(u8, method.name) catch return;
+                        overridden.put(name_copy, {}) catch return;
+                    }
+                }
+
+                // 文档 2.7.2: 将 Trait 的默认方法注册到类型环境（impl 未覆写的部分）
+                // 子 Trait 自动拥有所有父 Trait 的方法
+                if (self.trait_types.getPtr(id.trait_name)) |trait_info| {
+                    // 注册 Trait 自身的默认方法
+                    var ms_iter = trait_info.method_schemes.iterator();
+                    while (ms_iter.next()) |entry| {
+                        const mname = entry.key_ptr.*;
+                        if (!overridden.contains(mname)) {
+                            // 检查环境中是否已有同名函数（避免覆盖其他 impl 的方法）
+                            if (env.lookup(mname) == null) {
+                                // 实例化方法类型：将类型变量替换为具体类型
+                                const method_scheme = entry.value_ptr.*;
+                                if (concrete_type) |ct| {
+                                    // 创建实例化的类型方案
+                                    const inst_ty = self.instantiateWithConcreteType(method_scheme.ty, ct) catch return;
+                                    const inst_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = inst_ty };
+                                    env.redefine(mname, inst_scheme) catch return;
+                                } else {
+                                    env.redefine(mname, method_scheme) catch return;
+                                }
+                            }
                         }
                     }
+                    // 递归注册父 Trait 的方法
+                    self.registerParentTraitMethods(env, id.trait_name, &overridden);
                 }
             },
             .use_decl => {
@@ -2865,26 +3245,26 @@ pub const TypeInferencer = struct {
     /// 报告推断错误
     fn reportInferError(self: *TypeInferencer, err: SemaError, location: ast.SourceLocation) void {
         switch (err) {
-            error.TypeMismatch => self.addErrorAt(.type_mismatch, location.line, location.column, "type mismatch", .{}),
-            error.UnboundVariable => self.addErrorAt(.unbound_variable, location.line, location.column, "unbound variable", .{}),
-            error.ArityMismatch => self.addErrorAt(.arity_mismatch, location.line, location.column, "arity mismatch", .{}),
+            error.TypeMismatch => self.addErrorAt(.type_mismatch, location.line, location.column, "type mismatch: incompatible types", .{}),
+            error.UnboundVariable => self.addErrorAt(.unbound_variable, location.line, location.column, "undefined variable '{s}'", .{"?"}),
+            error.ArityMismatch => self.addErrorAt(.arity_mismatch, location.line, location.column, "function argument count mismatch", .{}),
             error.OccursCheckFailed => {
                 // 文档 2.10: 多态递归函数必须提供类型标注
                 // 当泛型函数的递归调用使用了与自身不同的类型参数时，
                 // HM 推断无法处理，会产生无限类型（occurs check 失败）
                 if (self.current_fn_info) |fn_info| {
                     if (fn_info.has_type_params and !fn_info.has_return_annotation) {
-                        self.addErrorAt(.recursive_type, location.line, location.column, "polymorphic recursive function '{s}' requires explicit type annotation (add return type)", .{fn_info.name});
+                        self.addErrorAt(.recursive_type, location.line, location.column, "polymorphic recursive function '{s}' requires an explicit return type annotation", .{fn_info.name});
                     } else {
-                        self.addErrorAt(.recursive_type, location.line, location.column, "recursive type (occurs check failed)", .{});
+                        self.addErrorAt(.recursive_type, location.line, location.column, "infinite type: occurs check failed", .{});
                     }
                 } else {
-                    self.addErrorAt(.recursive_type, location.line, location.column, "recursive type (occurs check failed)", .{});
+                    self.addErrorAt(.recursive_type, location.line, location.column, "infinite type: occurs check failed", .{});
                 }
             },
-            error.MissingImplementation => self.addErrorAt(.missing_implementation, location.line, location.column, "missing implementation", .{}),
-            error.RecursiveType => self.addErrorAt(.recursive_type, location.line, location.column, "recursive type", .{}),
-            error.DuplicateDefinition => self.addErrorAt(.type_mismatch, location.line, location.column, "duplicate definition", .{}),
+            error.MissingImplementation => self.addErrorAt(.missing_implementation, location.line, location.column, "trait method not implemented", .{}),
+            error.RecursiveType => self.addErrorAt(.recursive_type, location.line, location.column, "infinite type", .{}),
+            error.DuplicateDefinition => self.addErrorAt(.type_mismatch, location.line, location.column, "duplicate definition in scope", .{}),
             error.OutOfMemory => {}, // 不报告 OOM
         }
     }
@@ -2905,25 +3285,87 @@ pub const TypeInferencer = struct {
         }
     }
 
+    /// 文档 2.7.3: 调用点 Trait Bound 延迟检查
+    /// 当调用泛型函数时，检查类型参数是否满足函数声明的 Trait Bound
+    fn checkCallSiteTraitBound(self: *TypeInferencer, callee: *const ast.Expr, location: ast.SourceLocation) void {
+        // 获取被调用函数名
+        const fn_name: ?[]const u8 = switch (callee.*) {
+            .identifier => |v| v.name,
+            else => null,
+        };
+        const name = fn_name orelse return;
+        const bounds = self.fn_bounds.get(name) orelse return;
+
+        for (bounds) |bound| {
+            if (bound.type_args.len == 0) continue;
+            for (bound.type_args) |tp| {
+                const tp_name: []const u8 = switch (tp.*) {
+                    .named => |n| n.name,
+                    .generic => |g| g.name,
+                    else => continue,
+                };
+                // 跳过泛型类型参数（如 T），只检查具体类型
+                // 泛型参数在声明时已检查，调用时类型参数已被替换为具体类型
+                if (isBuiltinTypeName(tp_name)) {
+                    // 具体内建类型，检查 impl
+                    const impl_key = std.fmt.allocPrint(self.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
+                    defer self.allocator.free(impl_key);
+                    if (!self.registered_impls.contains(impl_key)) {
+                        self.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
+                    }
+                }
+                if (self.type_defining_modules.contains(tp_name)) {
+                    // 具体用户定义类型，检查 impl
+                    const impl_key = std.fmt.allocPrint(self.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
+                    defer self.allocator.free(impl_key);
+                    if (!self.registered_impls.contains(impl_key)) {
+                        self.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
+                    }
+                }
+            }
+        }
+    }
+
+    /// 文档 2.7.3: 从 TypeScheme 的 BoundInfo 检查 Trait Bound
+    /// 在实例化后调用，检查实例化后的类型参数是否满足 bound
+    fn checkInstantiatedBounds(self: *TypeInferencer, scheme: TypeScheme, location: ast.SourceLocation) void {
+        for (scheme.bounds) |bound| {
+            if (bound.type_param_index >= scheme.quantified_vars.len) continue;
+            const var_id = scheme.quantified_vars[bound.type_param_index];
+            // 查找类型变量的当前解析结果
+            for (self.type_vars.items) |tv| {
+                if (tv.type_var.id == var_id and tv.type_var.bound != null) {
+                    const resolved = self.resolve(tv.type_var.bound.?);
+                    const type_name: ?[]const u8 = switch (resolved.*) {
+                        .adt_type => |adt| adt.name,
+                        .named => |n| n.name,
+                        else => null,
+                    };
+                    if (type_name) |tn| {
+                        const impl_key = std.fmt.allocPrint(self.allocator, "{s}::{s}", .{ bound.trait_name, tn }) catch return;
+                        defer self.allocator.free(impl_key);
+                        if (!self.registered_impls.contains(impl_key)) {
+                            self.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for {s}<{s}>", .{ bound.trait_name, tn });
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     /// 文档 2.7.3: Trait Bound `with` 验证
     /// 检查声明的 Trait bound 是否有对应的 trait 定义和 impl 实现
     fn checkTraitBound(self: *TypeInferencer, bound: ast.TraitBound, location: ast.SourceLocation) void {
         if (self.trait_types.getPtr(bound.trait_name)) |trait_info| {
-            // 1. 检查泛型参数是否满足 trait 的类型参数数量
-            // 简化：仅检查 bound 的 type_args 是否与 trait 的类型参数数量匹配
-            // （完整实现需要解析 trait 定义中的类型参数列表）
-            // 如果 bound 有类型参数，检查数量
-            if (bound.type_args.len > 0 and trait_info.associated_type_names.len > 0) {
-                // 关联类型验证：impl 中必须定义所有关联类型
-                // 这里只做基本检查
-            }
+            // 1. 验证 bound 的类型参数数量与 Trait 的类型参数数量匹配
+            // 通过检查 Trait 的方法签名中是否有类型参数来推断
+            // 简化：如果 bound 有 type_args，验证 Trait 确实是泛型的
+            // （完整实现需要从 AST 获取 trait 的类型参数列表）
 
-            // 2. 检查函数体内调用的方法是否在 trait 的方法列表中
-            // （在 inferExpr 的 method_call 中处理）
-
-            // 3. 检查调用点是否有对应的 impl
-            // 对于泛型 bound（如 `with Ord<T>`），impl 在具体类型确定后才能检查
-            // 对于具体 bound（如 `with Ord<i32>`），可以立即检查
+            // 2. 检查调用点是否有对应的 impl
+            // 对于具体 bound（如 `with Ord<i32>`），立即检查 impl 是否存在
+            // 对于泛型 bound（如 `with Ord<T>`），在具体类型确定后才能检查
             if (bound.type_args.len > 0) {
                 for (bound.type_args) |tp| {
                     // 从 TypeNode 提取类型名
@@ -2936,13 +3378,31 @@ pub const TypeInferencer = struct {
                     const impl_key = std.fmt.allocPrint(self.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
                     defer self.allocator.free(impl_key);
                     if (!self.registered_impls.contains(impl_key)) {
-                        // 对于泛型参数（如 T），不要求有 impl
-                        // 只对具体类型（如 i32）检查
+                        // 对于泛型参数（如 T），不要求有 impl — bound 约束在调用点检查
+                        // 对于具体类型（如 i32、Bool 等），必须有 impl
                         if (isBuiltinTypeName(tp_name)) {
-                            self.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for {s}<{s}>", .{ bound.trait_name, tp_name });
+                            self.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for trait {s}<{s}>", .{ bound.trait_name, tp_name });
+                        }
+                        // 对于用户定义的具体类型，也检查 impl 是否存在
+                        // 通过检查 type_defining_modules 判断是否为用户定义类型
+                        if (self.type_defining_modules.contains(tp_name)) {
+                            self.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for trait {s}<{s}>", .{ bound.trait_name, tp_name });
                         }
                     }
                 }
+            } else {
+                // 无类型参数的 Trait bound（如 `with Serializable`）
+                // 检查是否有 impl（type_name 为空字符串的 impl）
+                const impl_key = std.fmt.allocPrint(self.allocator, "{s}::", .{bound.trait_name}) catch return;
+                defer self.allocator.free(impl_key);
+                // 无类型参数的 bound 暂时不强制要求 impl
+            }
+
+            // 3. 验证关联类型：如果 Trait 声明了关联类型，bound 中应指定关联类型
+            // 简化：仅检查 Trait 是否有关联类型声明
+            if (trait_info.associated_type_names.len > 0 and bound.type_args.len == 0) {
+                // Trait 有关联类型但 bound 没有指定 — 可能需要关联类型定义
+                // 简化：不强制要求
             }
         } else {
             // Trait 未定义
