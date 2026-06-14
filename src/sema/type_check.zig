@@ -488,6 +488,8 @@ pub const TypeErrorKind = enum {
     non_exhaustive_match,
     propagate_cross_type,
     unsatisfied_bound,
+    /// 文档 §3.3.3: Spawn 线性类型 — 未消费的 Spawn 离开作用域
+    unconsumed_spawn,
 };
 
 /// 类型错误信息
@@ -500,6 +502,16 @@ pub const TypeError = struct {
     line: u32 = 0,
     /// 源码位置（列号，0-based）
     column: u32 = 0,
+};
+
+/// 文档 §3.3.3: Spawn 线性类型追踪
+/// 每个 Spawn<T> 变量必须被 await() 或 cancel() 消费
+/// 线性变量信息 — 追踪 Spawn 变量的消费状态
+const LinearVarInfo = struct {
+    name: []const u8,
+    consumed: bool,
+    line: u32,
+    column: u32,
 };
 
 // ============================================================
@@ -540,6 +552,10 @@ pub const TypeInferencer = struct {
     /// 当前正在推断的函数信息（用于多态递归检测）
     current_fn_info: ?CurrentFnInfo = null,
 
+    /// 文档 §3.3.3: Spawn 线性类型追踪
+    /// 作用域栈 — 每个元素是当前作用域中的线性变量列表
+    linear_scope_stack: std.ArrayList(std.ArrayList(LinearVarInfo)),
+
     /// 当前正在推断的函数信息
     const CurrentFnInfo = struct {
         /// 函数名
@@ -567,6 +583,7 @@ pub const TypeInferencer = struct {
             .registered_impls = std.StringHashMap(ImplRecord).init(allocator),
             .fn_bounds = std.StringHashMap([]ast.TraitBound).init(allocator),
             .builtin_names = std.StringHashMap(void).init(allocator),
+            .linear_scope_stack = std.ArrayList(std.ArrayList(LinearVarInfo)).empty,
         };
     }
 
@@ -632,6 +649,11 @@ pub const TypeInferencer = struct {
             self.allocator.free(err.message);
         }
         self.errors.deinit(self.allocator);
+        // 释放线性变量追踪栈
+        for (self.linear_scope_stack.items) |*scope| {
+            scope.deinit(self.allocator);
+        }
+        self.linear_scope_stack.deinit(self.allocator);
     }
 
     /// 添加类型错误到错误列表
@@ -654,6 +676,70 @@ pub const TypeInferencer = struct {
         }) catch {};
     }
 
+    // ============================================================
+    // 文档 §3.3.3: Spawn 线性类型追踪
+    // ============================================================
+
+    /// 进入新作用域 — 推入新的线性变量列表
+    pub fn pushLinearScope(self: *TypeInferencer) void {
+        self.linear_scope_stack.append(self.allocator, std.ArrayList(LinearVarInfo).empty) catch {};
+    }
+
+    /// 退出作用域 — 检查未消费的 Spawn 变量，然后弹出
+    /// 文档 §3.3.3: Spawn 离开作用域时若未被消费 → 编译错误
+    pub fn popLinearScope(self: *TypeInferencer) void {
+        if (self.linear_scope_stack.items.len == 0) return;
+        const scope = &self.linear_scope_stack.items[self.linear_scope_stack.items.len - 1];
+        // 检查当前作用域中未消费的 Spawn 变量
+        for (scope.items) |info| {
+            if (!info.consumed) {
+                self.addErrorAt(.unconsumed_spawn, info.line, info.column, "Spawn<{s}> must be consumed (await or cancel)", .{info.name});
+            }
+        }
+        scope.deinit(self.allocator);
+        _ = self.linear_scope_stack.pop();
+    }
+
+    /// 注册 Spawn 线性变量
+    /// 在 val/var 声明时调用，如果类型是 Spawn<T>
+    pub fn registerLinearVar(self: *TypeInferencer, name: []const u8, line: u32, column: u32) void {
+        if (self.linear_scope_stack.items.len == 0) return;
+        const scope = &self.linear_scope_stack.items[self.linear_scope_stack.items.len - 1];
+        scope.append(self.allocator, LinearVarInfo{
+            .name = name,
+            .consumed = false,
+            .line = line,
+            .column = column,
+        }) catch {};
+    }
+
+    /// 标记 Spawn 线性变量为已消费
+    /// 在 await()/cancel() 方法调用时调用
+    /// 从当前作用域向外查找名为 name 的线性变量
+    pub fn markLinearVarConsumed(self: *TypeInferencer, name: []const u8) void {
+        // 从最内层作用域向外查找
+        var i: usize = self.linear_scope_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            const scope = &self.linear_scope_stack.items[i];
+            for (scope.items) |*info| {
+                if (std.mem.eql(u8, info.name, name)) {
+                    info.consumed = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 检查类型是否为 Spawn<T>
+    pub fn isSpawnType(self: *TypeInferencer, ty: *Type) bool {
+        const resolved = self.resolve(ty);
+        return switch (resolved.*) {
+            .generic_type => |gt| std.mem.eql(u8, gt.name, "Spawn"),
+            else => false,
+        };
+    }
+
     /// 重置推断器状态（保留 ADT/Trait 注册表，用于跨模块复用）
     pub fn resetForNextModule(self: *TypeInferencer) void {
         // 不清空 type_vars 和 types，因为 adt_types/trait_types 仍引用它们
@@ -663,6 +749,11 @@ pub const TypeInferencer = struct {
             self.allocator.free(err.message);
         }
         self.errors.clearRetainingCapacity();
+        // 清理线性变量追踪栈（模块切换时重置）
+        for (self.linear_scope_stack.items) |*scope| {
+            scope.deinit(self.allocator);
+        }
+        self.linear_scope_stack.clearRetainingCapacity();
     }
 
     /// 创建新的类型变量
@@ -1514,10 +1605,12 @@ pub const TypeInferencer = struct {
                     try child_env.define(param.name, scheme);
                 }
 
+                self.pushLinearScope();
                 const body_ty = switch (lam.body) {
                     .block => |body| try self.inferExpr(body, child_env),
                     .expression => |e| try self.inferExpr(e, child_env),
                 };
+                self.popLinearScope();
 
                 return self.makeFnType(param_types, body_ty);
             },
@@ -1593,13 +1686,17 @@ pub const TypeInferencer = struct {
                 // Then 分支：应用 is_non_null == true 的收窄
                 const then_env = try env.createChild();
                 self.applyNarrowing(then_env, narrowings, true);
+                self.pushLinearScope();
                 const then_ty = try self.inferExpr(ie.then_branch, then_env);
+                self.popLinearScope();
 
                 if (ie.else_branch) |else_br| {
                     // Else 分支：应用 is_non_null == false 的收窄（即条件取反时非空）
                     const else_env = try env.createChild();
                     self.applyNarrowing(else_env, narrowings, false);
+                    self.pushLinearScope();
                     const else_ty = try self.inferExpr(else_br, else_env);
+                    self.popLinearScope();
                     const unified = try self.tryWidenUnify(then_ty, else_ty);
                     return unified;
                 }
@@ -1608,6 +1705,7 @@ pub const TypeInferencer = struct {
 
             .block => |blk| {
                 const child_env = try env.createChild();
+                self.pushLinearScope();
                 var result_ty = try self.makeType(.unit_type);
                 for (blk.statements) |stmt| {
                     _ = try self.inferStmt(stmt, child_env);
@@ -1615,6 +1713,8 @@ pub const TypeInferencer = struct {
                 if (blk.trailing_expr) |te| {
                     result_ty = try self.inferExpr(te, child_env);
                 }
+                // 文档 §3.3.3: 检查未消费的 Spawn 变量
+                self.popLinearScope();
                 return result_ty;
             },
 
@@ -1643,7 +1743,9 @@ pub const TypeInferencer = struct {
                         scrutinee_ty;
 
                     try self.inferPattern(arm.pattern, pattern_ty, child_env);
+                    self.pushLinearScope();
                     const body_ty = try self.inferExpr(arm.body, child_env);
+                    self.popLinearScope();
                     if (result_ty) |rt| {
                         const unified = try self.tryWidenUnify(rt, body_ty);
                         result_ty = unified;
@@ -1742,7 +1844,20 @@ pub const TypeInferencer = struct {
             },
 
             .method_call => |mc| {
-                return trait_resolve.inferMethodCall(self, mc, env);
+                const result_ty = try trait_resolve.inferMethodCall(self, mc, env);
+                // 文档 §3.3.3: Spawn 线性类型追踪
+                // await() 和 cancel() 消费 Spawn<T>
+                if (std.mem.eql(u8, mc.method, "await") or std.mem.eql(u8, mc.method, "cancel")) {
+                    // 检查对象类型是否为 Spawn<T>
+                    const obj_ty = self.inferExpr(mc.object, env) catch return result_ty;
+                    if (self.isSpawnType(obj_ty)) {
+                        // 如果对象是标识符，标记对应的线性变量为已消费
+                        if (self.getIdentifierName(mc.object)) |name| {
+                            self.markLinearVarConsumed(name);
+                        }
+                    }
+                }
+                return result_ty;
             },
 
             .propagate => |prop| {
@@ -1788,7 +1903,34 @@ pub const TypeInferencer = struct {
 
             .assignment_expr => |ae| {
                 const val_ty = try self.inferExpr(ae.value, env);
+                // 文档 §3.3.3: Spawn 线性类型追踪
+                // 赋值表达式中的 Spawn 值也需要追踪
+                if (self.isSpawnType(val_ty)) {
+                    if (self.getIdentifierName(ae.target)) |name| {
+                        self.registerLinearVar(name, ae.location.line, ae.location.column);
+                    }
+                }
                 return val_ty;
+            },
+
+            .compound_assign => |ca| {
+                var target_ty = try self.inferExpr(ca.target, env);
+                var val_ty = try self.inferExpr(ca.value, env);
+
+                // 文档 §3.4.2: Atomic<T> 透明操作 — 自动解包
+                target_ty = self.unwrapAtomic(target_ty);
+                val_ty = self.unwrapAtomic(val_ty);
+
+                switch (ca.op) {
+                    .add_assign, .sub_assign, .mul_assign, .div_assign, .mod_assign => {
+                        try self.unify(target_ty, val_ty);
+                        return target_ty;
+                    },
+                    .bit_and_assign, .bit_or_assign => {
+                        try self.unify(target_ty, val_ty);
+                        return target_ty;
+                    },
+                }
             },
 
             // 尚未实现的表达式类型 — Phase 4 并发原语类型推断
@@ -1874,6 +2016,10 @@ pub const TypeInferencer = struct {
                                 };
                             }
                         }
+                        // 文档 §3.3.3: Spawn 线性类型追踪
+                        if (self.isSpawnType(val_ty)) {
+                            self.registerLinearVar(vd.name, vd.location.line, vd.location.column);
+                        }
                         const scheme = try self.generalize(env, val_ty);
                         if (!(try env.defineOrReport(vd.name, scheme))) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
@@ -1896,6 +2042,10 @@ pub const TypeInferencer = struct {
                             };
                         }
                     }
+                    // 文档 §3.3.3: Spawn 线性类型追踪
+                    if (self.isSpawnType(val_ty)) {
+                        self.registerLinearVar(vd.name, vd.location.line, vd.location.column);
+                    }
                     const scheme = try self.generalize(env, val_ty);
                     if (!(try env.defineOrReport(vd.name, scheme))) {
                         self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
@@ -1904,7 +2054,14 @@ pub const TypeInferencer = struct {
                 return null;
             },
             .assignment => |asgn| {
-                _ = try self.inferExpr(asgn.value, env);
+                const val_ty = try self.inferExpr(asgn.value, env);
+                // 文档 §3.3.3: Spawn 线性类型追踪
+                // 赋值给 Spawn 变量时，注册新的线性变量
+                if (self.isSpawnType(val_ty)) {
+                    if (self.getIdentifierName(asgn.target)) |name| {
+                        self.registerLinearVar(name, asgn.location.line, asgn.location.column);
+                    }
+                }
                 return null;
             },
             .field_assignment => |fa| {
@@ -1920,7 +2077,10 @@ pub const TypeInferencer = struct {
                 }
                 return self.makeType(.unit_type);
             },
-            .defer_stmt => {
+            .defer_stmt => |ds| {
+                // 文档 §3.3.4: defer s.await() / defer s.cancel() 消费 Spawn
+                // 需要推断 defer 中的表达式以追踪 Spawn 消费
+                _ = try self.inferExpr(ds.expr, env);
                 return null;
             },
             .throw_stmt => |thr| {
@@ -1965,17 +2125,32 @@ pub const TypeInferencer = struct {
 
                 const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = item_ty };
                 try child_env.define(fs.name, scheme);
+                self.pushLinearScope();
                 _ = try self.inferExpr(fs.body, child_env);
+                self.popLinearScope();
                 return null;
             },
             .while_stmt => |ws| {
                 const cond_ty = try self.inferExpr(ws.condition, env);
                 try self.unify(cond_ty, try self.makeType(.bool_type));
+                self.pushLinearScope();
                 _ = try self.inferExpr(ws.body, env);
+                self.popLinearScope();
                 return null;
             },
             .loop_stmt => |ls| {
+                self.pushLinearScope();
                 _ = try self.inferExpr(ls.body, env);
+                self.popLinearScope();
+                return null;
+            },
+            .compound_assignment => |ca| {
+                _ = try self.inferExpr(&ast.Expr{ .compound_assign = .{
+                    .location = ca.location,
+                    .op = ca.op,
+                    .target = ca.target,
+                    .value = ca.value,
+                } }, env);
                 return null;
             },
         };
@@ -2135,9 +2310,12 @@ pub const TypeInferencer = struct {
         // 注册内建函数到类型环境
         self.registerBuiltins(&env);
 
+        // 文档 §3.3.3: 模块级别的 Spawn 线性类型追踪
+        self.pushLinearScope();
         for (module.declarations) |decl| {
             self.checkDeclCollecting(decl, &env);
         }
+        self.popLinearScope();
     }
 
     /// 注册内建函数到类型环境，与求值器的 registerBuiltins 对应

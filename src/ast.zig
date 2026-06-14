@@ -71,6 +71,19 @@ pub const BinaryOp = enum {
     elvis, // ??
 };
 
+/// 复合赋值运算符
+/// 文档 §3.4.2: Atomic<T> 透明操作
+/// counter += 1 → fetch_add, counter -= 1 → fetch_sub, etc.
+pub const CompoundAssignOp = enum {
+    add_assign, // +=
+    sub_assign, // -=
+    mul_assign, // *=
+    div_assign, // /=
+    mod_assign, // %=
+    bit_and_assign, // &=
+    bit_or_assign, // |=
+};
+
 /// 一元运算符
 pub const UnaryOp = enum {
     /// 逻辑非 !
@@ -511,6 +524,15 @@ pub const Expr = union(enum) {
         value: *Expr,
     },
 
+    /// 复合赋值表达式：target op= value
+    /// 文档 §3.4.2: counter += 1 映射到 fetch_add，counter &= 0xFF 映射到 fetch_and
+    compound_assign: struct {
+        location: SourceLocation,
+        op: CompoundAssignOp,
+        target: *Expr,
+        value: *Expr,
+    },
+
     /// 二元运算：left op right
     binary: struct {
         location: SourceLocation,
@@ -752,6 +774,15 @@ pub const Stmt = union(enum) {
         value: *Expr,
     },
 
+    /// 复合赋值语句：target op= value
+    /// 文档 §3.4.2: Atomic<T> 透明操作
+    compound_assignment: struct {
+        location: SourceLocation,
+        target: *Expr,
+        op: CompoundAssignOp,
+        value: *Expr,
+    },
+
     /// 表达式语句（表达式作为语句，丢弃返回值）
     expression: struct {
         location: SourceLocation,
@@ -832,6 +863,7 @@ pub const Stmt = union(enum) {
             .for_stmt => |v| v.location,
             .while_stmt => |v| v.location,
             .loop_stmt => |v| v.location,
+            .compound_assignment => |v| v.location,
         };
     }
 };

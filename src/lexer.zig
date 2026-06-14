@@ -156,6 +156,20 @@ pub const TokenType = enum {
     // --- 赋值 ---
     /// =
     eq,
+    /// +=
+    plus_eq,
+    /// -=
+    minus_eq,
+    /// *=
+    star_eq,
+    /// /=
+    slash_eq,
+    /// %=
+    percent_eq,
+    /// &=
+    amp_eq,
+    /// |=
+    pipe_eq,
 
     // --- 箭头 ---
     /// =>
@@ -385,6 +399,8 @@ pub const Lexer = struct {
                     try self.skipLineComment();
                 } else if (self.matchChar('*')) {
                     try self.skipBlockComment();
+                } else if (self.matchChar('=')) {
+                    try self.addToken(.slash_eq, start, start_line, start_col);
                 } else {
                     try self.addToken(.slash, start, start_line, start_col);
                 }
@@ -400,18 +416,38 @@ pub const Lexer = struct {
             ',' => try self.addToken(.comma, start, start_line, start_col),
             ';' => {}, // Glue 没有分号，跳过
             ':' => try self.addToken(.colon, start, start_line, start_col),
-            '%' => try self.addToken(.percent, start, start_line, start_col),
+            '%' => {
+                if (self.matchChar('=')) {
+                    try self.addToken(.percent_eq, start, start_line, start_col);
+                } else {
+                    try self.addToken(.percent, start, start_line, start_col);
+                }
+            },
 
-            // + (单字符)
-            '+' => try self.addToken(.plus, start, start_line, start_col),
+            // + 或 +=
+            '+' => {
+                if (self.matchChar('=')) {
+                    try self.addToken(.plus_eq, start, start_line, start_col);
+                } else {
+                    try self.addToken(.plus, start, start_line, start_col);
+                }
+            },
 
-            // * (单字符)
-            '*' => try self.addToken(.star, start, start_line, start_col),
+            // * 或 *=
+            '*' => {
+                if (self.matchChar('=')) {
+                    try self.addToken(.star_eq, start, start_line, start_col);
+                } else {
+                    try self.addToken(.star, start, start_line, start_col);
+                }
+            },
 
-            // | 或 ||
+            // | 或 || 或 |=
             '|' => {
                 if (self.matchChar('|')) {
                     try self.addToken(.pipe_pipe, start, start_line, start_col);
+                } else if (self.matchChar('=')) {
+                    try self.addToken(.pipe_eq, start, start_line, start_col);
                 } else {
                     try self.addToken(.pipe, start, start_line, start_col);
                 }
@@ -455,10 +491,12 @@ pub const Lexer = struct {
                 }
             },
 
-            // - 或 ->
+            // - 或 -> 或 -=
             '-' => {
                 if (self.matchChar('>')) {
                     try self.addToken(.minus_gt, start, start_line, start_col);
+                } else if (self.matchChar('=')) {
+                    try self.addToken(.minus_eq, start, start_line, start_col);
                 } else {
                     try self.addToken(.minus, start, start_line, start_col);
                 }
@@ -499,6 +537,8 @@ pub const Lexer = struct {
             '&' => {
                 if (self.matchChar('&')) {
                     try self.addToken(.amp_amp, start, start_line, start_col);
+                } else if (self.matchChar('=')) {
+                    try self.addToken(.amp_eq, start, start_line, start_col);
                 } else {
                     try self.addToken(.ampersand, start, start_line, start_col);
                 }

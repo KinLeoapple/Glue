@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    spawn_module.addImport("zio", zio_module);
 
     const atomic_module = b.createModule(.{
         .root_source_file = b.path("runtime/atomic.zig"),
@@ -265,6 +266,11 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("parser", parser_module);
     root_module.addImport("eval", eval_module);
     root_module.addImport("zio", zio_module);
+
+    // Zio 在 Windows 上需要 ws2_32（Winsock2，IOCP 后端依赖）
+    if (target.result.os.tag == .windows) {
+        root_module.linkSystemLibrary("ws2_32", .{});
+    }
 
     // Create glue executable
     const exe = b.addExecutable(.{

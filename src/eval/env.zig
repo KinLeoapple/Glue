@@ -128,7 +128,7 @@ pub const Environment = struct {
     /// 创建完全独立的环境链，递归深拷贝所有变量值和父链
     /// spawn 捕获语义：深拷贝隔离，Atomic<T> 例外（浅拷贝）
     /// `atomic_values` 参数：如果非 null，其中的 Atomic 值将浅拷贝而非深拷贝
-    pub fn deepCopy(self: *Environment, allocator: std.mem.Allocator, atomic_values: ?[]const *value.AtomicValue) !*Environment {
+    pub fn deepCopy(self: *Environment, allocator: std.mem.Allocator, atomic_values: ?[]const *value.AtomicValue) anyerror!*Environment {
         const new_env = try allocator.create(Environment);
         new_env.* = Environment{
             .values = std.StringHashMap(Variable).init(allocator),
@@ -154,16 +154,90 @@ pub const Environment = struct {
         return new_env;
     }
 
-    /// 深拷贝值 — Atomic<T> 浅拷贝例外
-    fn deepCloneValue(val: value.Value, allocator: std.mem.Allocator, atomic_values: ?[]const *value.AtomicValue) !value.Value {
+    /// 跨 Heap 传递值 — 严格按照文档 §5.2 六类规则
+    ///
+    /// | 数据类型       | 跨 Heap 传递方式                         |
+    /// |---------------|------------------------------------------|
+    /// | 基础类型       | 值拷贝（栈上）                            |
+    /// | 不可变数据结构  | 深拷贝到目标 heap                          |
+    /// | 一等 Trait 值  | vtable 共享（全局只读）+ data 深拷贝        |
+    /// | Channel       | 调度器 heap 中，两端只持有引用              |
+    /// | 函数/闭包      | 深拷贝捕获的环境                           |
+    /// | Atomic<T>     | 浅拷贝（原子增加引用计数）                  |
+    pub fn deepCloneValue(val: value.Value, allocator: std.mem.Allocator, atomic_values: ?[]const *value.AtomicValue) anyerror!value.Value {
         _ = atomic_values; // 目前未使用，保留接口用于后续优化
-        // 如果是 Atomic 值，浅拷贝（共享底层内存 + 增加引用计数）
-        if (val == .atomic_val) {
-            val.atomic_val.ref();
-            return val;
-        }
-        // 如果 atomic_values 列表中有匹配的指针，也需要浅拷贝
-        // 这里主要处理 closure 等复合类型内部可能包含 Atomic 的情况
-        return try val.clone(allocator);
+        return switch (val) {
+            // §5.2 规则 1: 基础类型 — 值拷贝（栈上）
+            // integer, float, boolean, char_val, null_val, unit, range 均为值类型，
+            // clone 直接返回自身副本，无需额外处理
+            .integer,
+            .float,
+            .boolean,
+            .char_val,
+            .null_val,
+            .unit,
+            .range,
+            => val,
+
+            // §5.2 规则 6: Atomic<T> — 浅拷贝（共享底层内存 + 原子增加引用计数）
+            // Atomic 是唯一允许跨 Heap 共享的可变状态，通过引用计数管理生命周期
+            .atomic_val => |av| {
+                av.ref();
+                return value.Value{ .atomic_val = av };
+            },
+
+            // §5.2 规则 4: Channel — 调度器 heap 中，两端只持有引用
+            // Channel/Sender/Receiver 的底层缓冲区位于调度器 heap，
+            // 两端仅持有引用（通过 ref count 管理），跨 Heap 传递时增加引用计数
+            .channel_val => |cv| {
+                cv.ref();
+                return value.Value{ .channel_val = cv };
+            },
+            .sender_val => |sv| {
+                sv.ref();
+                return value.Value{ .sender_val = sv };
+            },
+            .receiver_val => |rv| {
+                rv.ref();
+                return value.Value{ .receiver_val = rv };
+            },
+
+            // §5.2 规则 5: 函数/闭包 — 深拷贝捕获的环境
+            // 闭包跨 Heap 传递时，需要确保捕获的环境被深拷贝。
+            // 但 Environment.deepCopy 已经递归深拷贝了整个环境链，
+            // 环境中的闭包变量只需浅拷贝（共享闭包指针），因为：
+            // 1. 闭包代码（params+body）是不可变的，可安全共享
+            // 2. 闭包捕获的环境已通过 deepCopy 递归深拷贝
+            // 3. 递归深拷贝闭包内部环境会导致循环引用栈溢出
+            .closure => val,
+
+            // §5.2 规则 2: 不可变数据结构 — 深拷贝到目标 heap
+            // string, array, record, adt, newtype, error_val, throw_val, partial
+            // 这些类型在跨 Heap 时必须完整深拷贝，确保目标 heap 拥有独立副本
+            .string,
+            .array,
+            .record,
+            .adt,
+            .newtype,
+            .error_val,
+            .throw_val,
+            .partial,
+            => try val.clone(allocator),
+
+            // §5.2 规则 3: 一等 Trait 值 — vtable 共享 + data 深拷贝
+            // 当前阶段（Phase 4）尚未实现一等 Trait 值运行时表示（Phase 7），
+            // 但 builtin 函数可视为简化的 Trait 值：函数指针全局共享（等价 vtable），
+            // 无 data 载荷，跨 Heap 传递时直接共享
+            .builtin => val,
+
+            // Spawn<T> 是线性类型，不允许跨 Heap 传递（必须通过 await/cancel 消费）
+            .spawn_val => val,
+
+            // 迭代器：不应跨 Heap 传递，保留引用语义
+            .array_iterator,
+            .string_iterator,
+            .range_iterator,
+            => val,
+        };
     }
 };

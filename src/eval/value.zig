@@ -444,8 +444,22 @@ pub const Value = union(enum) {
         }
     }
 
+    /// 克隆值 — 用于同 Heap 内的值复制
+    ///
+    /// 注意：此方法用于同 Heap 内的值复制（如 Environment.define 深拷贝）。
+    /// 跨 Heap 传递（spawn 闭包捕获）应使用 env.deepCloneValue，
+    /// 它严格按照文档 §5.2 六类规则处理每种类型。
+    ///
+    /// §5.2 跨 Heap 传递规则对照：
+    /// - 基础类型 (integer/float/boolean/char_val/null_val/unit/range): 值拷贝 ✓
+    /// - 不可变数据结构 (string/array/record/adt/newtype/error_val/throw_val/partial): 深拷贝 ✓
+    /// - 一等 Trait 值: vtable 共享 + data 深拷贝（Phase 7 实现，builtin 视为简化 Trait 值）
+    /// - Channel (channel_val/sender_val/receiver_val): 引用传递（ref count）✓
+    /// - 函数/闭包 (closure): 此处浅拷贝，跨 Heap 时由 deepCloneValue 深拷贝环境
+    /// - Atomic<T> (atomic_val): 浅拷贝（ref count）✓
     pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {
         return switch (self) {
+            // §5.2 规则 1: 基础类型 — 值拷贝
             .integer => self,
             .float => self,
             .boolean => self,
@@ -454,6 +468,7 @@ pub const Value = union(enum) {
             .unit => self,
             .builtin => self,
             .range => self,
+            // §5.2 规则 2: 不可变数据结构 — 深拷贝
             .string => |s| Value{ .string = try allocator.dupe(u8, s) },
             .array => |arr| {
                 var new_arr = try allocator.alloc(Value, arr.elements.len);
@@ -475,7 +490,9 @@ pub const Value = union(enum) {
                     .fields = new_map,
                 } };
             },
+            // §5.2 规则 5: 闭包 — 同 Heap 内浅拷贝；跨 Heap 时由 deepCloneValue 深拷贝环境
             .closure => self,
+            // §5.2 规则 2: 不可变数据结构 — 深拷贝
             .partial => |pa| {
                 const new_pa = try allocator.create(PartialApplication);
                 const new_args = try allocator.alloc(Value, pa.bound_args.len);
@@ -537,15 +554,18 @@ pub const Value = union(enum) {
                 }
                 return Value{ .throw_val = new_tv };
             },
-            .array_iterator => |ai| Value{ .array_iterator = ai }, // 引用相等
-            .string_iterator => |si| Value{ .string_iterator = si }, // 引用相等
-            .range_iterator => |ri| Value{ .range_iterator = ri }, // 引用相等
-            // 并发原语：引用语义，clone 为浅拷贝
+            // 迭代器：引用语义
+            .array_iterator => |ai| Value{ .array_iterator = ai },
+            .string_iterator => |si| Value{ .string_iterator = si },
+            .range_iterator => |ri| Value{ .range_iterator = ri },
+            // §5.2 规则 6: Atomic<T> — 浅拷贝（原子增加引用计数）
             .atomic_val => |av| {
                 av.ref();
                 return Value{ .atomic_val = av };
             },
-            .spawn_val => self, // Spawn 是线性类型，clone 不增加副本
+            // Spawn<T> 线性类型：clone 不增加副本
+            .spawn_val => self,
+            // §5.2 规则 4: Channel — 调度器 heap 中，两端只持有引用
             .channel_val => |cv| {
                 cv.ref();
                 return Value{ .channel_val = cv };

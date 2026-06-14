@@ -3232,12 +3232,45 @@ pub const Parser = struct {
             }
         }
 
+        // 复合赋值运算符：+=, -=, *=, /=, %=, &=, |=
+        const compound_op = self.peekCompoundAssign();
+        if (compound_op != null) {
+            _ = self.advance();
+            const op_tok = self.previous();
+            const value = try self.parseExpr();
+            const op = compound_op.?;
+
+            return self.allocStmt(ast.Stmt{
+                .compound_assignment = .{
+                    .location = tokenLoc(op_tok),
+                    .target = expr,
+                    .op = op,
+                    .value = value,
+                },
+            });
+        }
+
         return self.allocStmt(ast.Stmt{
             .expression = .{
                 .location = getExprLocation(expr),
                 .expr = expr,
             },
         });
+    }
+
+    /// 检查当前 token 是否为复合赋值运算符，返回对应的 CompoundAssignOp
+    fn peekCompoundAssign(self: *Parser) ?ast.CompoundAssignOp {
+        const tok_type = self.peek().type;
+        return switch (tok_type) {
+            .plus_eq => .add_assign,
+            .minus_eq => .sub_assign,
+            .star_eq => .mul_assign,
+            .slash_eq => .div_assign,
+            .percent_eq => .mod_assign,
+            .amp_eq => .bit_and_assign,
+            .pipe_eq => .bit_or_assign,
+            else => null,
+        };
     }
 };
 
@@ -3303,6 +3336,7 @@ fn getExprLocation(expr: *const ast.Expr) ast.SourceLocation {
         .select => |e| e.location,
         .monad_comprehension => |e| e.location,
         .inline_trait_value => |e| e.location,
+        .compound_assign => |e| e.location,
     };
 }
 

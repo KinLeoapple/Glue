@@ -26,6 +26,8 @@ const sema = @import("sema");
 const vtable_rt = @import("vtable_rt");
 const module_resolver = @import("module_resolver");
 const gc_mod = @import("gc");
+const scheduler_mod = @import("scheduler");
+const zio = @import("zio");
 
 // ============================================================
 // 便捷重导出
@@ -108,6 +110,15 @@ pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     global_env: Environment,
     io: ?std.Io = null,
+    /// Work-stealing 调度器（基于 Zio Runtime）
+    /// 文档 §3.7: M:N 调度，少量 OS 线程上运行大量轻量级协程
+    /// 文档 §5.3: Work-stealing 调度器
+    scheduler: ?*scheduler_mod.Scheduler = null,
+    /// Per-heap GC 引用（spawn 协程中设置，主 Evaluator 为 null）
+    gc: ?*gc_mod.GarbageCollector = null,
+    /// Shadow Stack — 根集追踪方案 B
+    /// 在分配前 pushRoot 保护临时 Value，防止 GC 误回收
+    shadow_stack: std.ArrayList(value.Value),
     return_value: ?Value = null,
     throw_value: ?Value = null,
     /// Glue panic 消息 — 不可捕获，但允许 defer 执行
@@ -162,19 +173,25 @@ pub const Evaluator = struct {
     /// 模块路径解析器
     resolver: module_resolver.ModuleResolver,
 
-    /// spawn 线程上下文 — 必须是命名结构体，供 evalSpawn 和 spawnThreadFunc 共享类型
+    /// spawn 协程上下文 — 必须是命名结构体，供 evalSpawn 和 spawnCoroutineFunc 共享类型
+    /// 文档 §3.7: spawn 通过 Zio 协程执行，不再使用 std.Thread
     pub const SpawnContext = struct {
         handle: *value.SpawnHandle,
         body: *const ast.Expr,
         env: *Environment,
         backing_allocator: std.mem.Allocator,
         io: std.Io,
+        /// 继承父 Evaluator 的 scheduler，使嵌套 spawn 也能走 Zio 协程路径
+        scheduler: ?*scheduler_mod.Scheduler,
+        /// 继承父 Evaluator 的 GC 引用
+        gc: ?*gc_mod.GarbageCollector,
     };
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
             .allocator = allocator,
             .global_env = Environment.init(allocator),
+            .shadow_stack = std.ArrayList(value.Value).empty,
             .closures = std.ArrayList(*value.Closure).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
             .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
@@ -203,6 +220,39 @@ pub const Evaluator = struct {
             .allocator = allocator,
             .global_env = Environment.init(allocator),
             .io = io,
+            .shadow_stack = std.ArrayList(value.Value).empty,
+            .closures = std.ArrayList(*value.Closure).empty,
+            .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
+            .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
+            .record_constructor_contexts = std.ArrayList(*RecordConstructorCtx).empty,
+            .trait_registry = std.StringHashMap(TraitInfo).init(allocator),
+            .trait_definition_order = std.ArrayList([]const u8).empty,
+            .impl_methods = std.ArrayList(ImplMethodEntry).empty,
+            .module_exports = std.StringHashMap(ModuleExportInfo).init(allocator),
+            .current_source_dir = null,
+            .module_defer_stack = std.ArrayList(*const ast.Expr).empty,
+            .loading_modules = std.StringHashMap(void).init(allocator),
+            .loaded_modules = std.StringHashMap(void).init(allocator),
+            .type_inferencer = sema.TypeInferencer.init(allocator),
+            .registered_impls = std.StringHashMap(void).init(allocator),
+            .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
+            .scan_line_buf = std.ArrayList(u8).empty,
+            .spawn_handles = std.ArrayList(*value.SpawnHandle).empty,
+            .resolver = module_resolver.ModuleResolver.init(allocator),
+        };
+        ev.registerBuiltins();
+        return ev;
+    }
+
+    /// 初始化带调度器的 Evaluator
+    /// 文档 §3.7: spawn 通过 Zio 协程执行，需要调度器
+    pub fn initWithScheduler(allocator: std.mem.Allocator, sched: *scheduler_mod.Scheduler) Evaluator {
+        var ev = Evaluator{
+            .allocator = allocator,
+            .global_env = Environment.init(allocator),
+            .io = sched.getIo(),
+            .scheduler = sched,
+            .shadow_stack = std.ArrayList(value.Value).empty,
             .closures = std.ArrayList(*value.Closure).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
             .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
@@ -227,6 +277,7 @@ pub const Evaluator = struct {
     }
 
     pub fn deinit(self: *Evaluator) void {
+        self.shadow_stack.deinit(self.allocator);
         self.global_env.deinit();
         // 释放所有注册的闭包
         for (self.closures.items) |closure| {
@@ -321,10 +372,7 @@ pub const Evaluator = struct {
         self.scan_line_buf.deinit(self.allocator);
         // 等待所有 spawn 协程完成并释放 handle
         for (self.spawn_handles.items) |handle| {
-            // 等待线程完成
-            if (handle.thread) |t| {
-                t.join();
-            }
+            // Zio 协程：无需手动 join，调度器管理协程生命周期
             handle.deinit();
             self.allocator.destroy(handle);
         }
@@ -341,6 +389,191 @@ pub const Evaluator = struct {
     fn gluePanic(self: *Evaluator, message: []const u8) EvalResult!Value {
         self.panic_message = message;
         return error.GluePanic;
+    }
+
+    // ── Shadow Stack 根集追踪（方案 B）──
+
+    /// 将临时 Value 压入 shadow stack，保护其不被 GC 回收
+    /// 在跨分配点持有 Value 时调用
+    pub fn pushRoot(self: *Evaluator, val: Value) void {
+        self.shadow_stack.append(self.allocator, val) catch {};
+    }
+
+    /// 弹出一个 shadow stack 条目
+    pub fn popRoot(self: *Evaluator) void {
+        if (self.shadow_stack.items.len > 0) {
+            _ = self.shadow_stack.pop();
+        }
+    }
+
+    /// 弹出 n 个 shadow stack 条目
+    pub fn popRoots(self: *Evaluator, n: usize) void {
+        if (n <= self.shadow_stack.items.len) {
+            self.shadow_stack.shrinkRetainingCapacity(self.shadow_stack.items.len - n);
+        }
+    }
+
+    /// 从 Value 递归追踪所有可达的堆对象，标记到 GC 的 mark_set
+    /// markObject 返回 true 表示新标记（需要继续追踪子对象）
+    fn traceValue(self: *Evaluator, val: Value) void {
+        const gc = self.gc orelse return;
+        switch (val) {
+            .unit, .null_val, .integer, .float, .boolean, .char_val, .builtin => {},
+            .string => |s| {
+                // 字符串切片的 ptr 指向堆分配的字符数据
+                if (s.len > 0) {
+                    _ = gc.markObject(@intFromPtr(s.ptr));
+                }
+            },
+            .error_val => |ev| {
+                if (ev.message.len > 0) _ = gc.markObject(@intFromPtr(ev.message.ptr));
+                if (ev.type_name.len > 0) _ = gc.markObject(@intFromPtr(ev.type_name.ptr));
+            },
+            .range => {},
+            .array => |av| {
+                if (av.elements.len > 0) {
+                    if (gc.markObject(@intFromPtr(av.elements.ptr))) {
+                        for (av.elements) |v| self.traceValue(v);
+                    }
+                }
+            },
+            .record => |rv| {
+                // RecordValue 内联于 Value，fields 是 StringHashMap(Value)
+                var iter = rv.fields.iterator();
+                while (iter.next()) |entry| {
+                    self.traceValue(entry.value_ptr.*);
+                }
+            },
+            .adt => |av| {
+                if (gc.markObject(@intFromPtr(av))) {
+                    if (av.fields.len > 0) {
+                        if (gc.markObject(@intFromPtr(av.fields.ptr))) {
+                            for (av.fields) |field| {
+                                self.traceValue(field.value);
+                            }
+                        }
+                    }
+                }
+            },
+            .newtype => |nv| {
+                if (gc.markObject(@intFromPtr(nv))) {
+                    self.traceValue(nv.inner);
+                }
+            },
+            .closure => |cl| {
+                if (gc.markObject(@intFromPtr(cl))) {
+                    // 追踪闭包捕获的环境
+                    const closure_env: *Environment = @ptrCast(@alignCast(cl.env));
+                    self.traceEnv(closure_env);
+                }
+            },
+            .partial => |pa| {
+                if (gc.markObject(@intFromPtr(pa))) {
+                    self.traceValue(pa.func);
+                    if (pa.bound_args.len > 0) {
+                        if (gc.markObject(@intFromPtr(pa.bound_args.ptr))) {
+                            for (pa.bound_args) |v| self.traceValue(v);
+                        }
+                    }
+                }
+            },
+            .throw_val => |tv| {
+                if (gc.markObject(@intFromPtr(tv))) {
+                    switch (tv.*) {
+                        .ok => |v_ptr| self.traceValue(v_ptr.*),
+                        .err => {},
+                    }
+                }
+            },
+            .array_iterator => |ai| {
+                if (gc.markObject(@intFromPtr(ai))) {
+                    if (ai.array.len > 0) {
+                        if (gc.markObject(@intFromPtr(ai.array.ptr))) {
+                            for (ai.array) |v| self.traceValue(v);
+                        }
+                    }
+                }
+            },
+            .string_iterator => |si| {
+                _ = gc.markObject(@intFromPtr(si));
+            },
+            .range_iterator => |ri| {
+                _ = gc.markObject(@intFromPtr(ri));
+            },
+            .atomic_val => |av| {
+                _ = gc.markObject(@intFromPtr(av));
+            },
+            .spawn_val => |handle| {
+                if (gc.markObject(@intFromPtr(handle))) {
+                    if (handle.result) |r| self.traceValue(r);
+                }
+            },
+            .channel_val => |ch| {
+                if (gc.markObject(@intFromPtr(ch))) {
+                    if (ch.buffer.items.len > 0) {
+                        if (gc.markObject(@intFromPtr(ch.buffer.items.ptr))) {
+                            for (ch.buffer.items) |v| self.traceValue(v);
+                        }
+                    }
+                }
+            },
+            .sender_val => |sv| {
+                if (gc.markObject(@intFromPtr(sv))) {
+                    self.traceValue(.{ .channel_val = sv.channel });
+                }
+            },
+            .receiver_val => |rv| {
+                if (gc.markObject(@intFromPtr(rv))) {
+                    self.traceValue(.{ .channel_val = rv.channel });
+                }
+            },
+        }
+    }
+
+    /// 从 Environment 递归追踪所有可达的堆对象
+    fn traceEnv(self: *Evaluator, environment: *Environment) void {
+        const gc = self.gc orelse return;
+        if (gc.markObject(@intFromPtr(environment))) {
+            // 追踪所有绑定值
+            var iter = environment.values.iterator();
+            while (iter.next()) |entry| {
+                self.traceValue(entry.value_ptr.value);
+            }
+            // 追踪父环境
+            if (environment.parent) |parent| {
+                self.traceEnv(parent);
+            }
+            // 追踪子环境
+            for (environment.children.items) |child| {
+                self.traceEnv(child);
+            }
+        }
+    }
+
+    /// 执行垃圾回收：clearMarks → trace from roots → sweep
+    /// 在安全点调用（声明之间、语句之间）
+    pub fn collectGarbage(self: *Evaluator) void {
+        const gc = self.gc orelse return;
+
+        // 1. 清除所有标记
+        gc.clearMarks();
+
+        // 2. 从根集追踪：shadow stack + global_env
+        for (self.shadow_stack.items) |val| {
+            self.traceValue(val);
+        }
+        self.traceEnv(&self.global_env);
+
+        // 3. Sweep：回收未标记的分配
+        gc.sweep();
+    }
+
+    /// 检查是否应该触发 GC，如果应该则执行回收
+    pub fn maybeCollectGarbage(self: *Evaluator) void {
+        const gc = self.gc orelse return;
+        if (gc.shouldCollect()) {
+            self.collectGarbage();
+        }
     }
 
     /// 创建 SpawnStatus ADT 值
@@ -712,13 +945,12 @@ pub const Evaluator = struct {
     /// 文档 §3.5: val ch = channel<i32>(0) 无缓冲，channel<i32>(10) 缓冲区大小 10
     fn builtinChannel(self: *Evaluator, args: []const Value) EvalResult!Value {
         if (args.len != 1) return error.WrongArity;
-        const io = self.io orelse return self.gluePanic("channel: no IO context");
         const cap = switch (args[0]) {
             .integer => |iv| @as(usize, @intCast(iv.value)),
             else => return error.TypeMismatch,
         };
         const ch = try self.allocator.create(value.ChannelValue);
-        ch.* = value.ChannelValue.init(self.allocator, cap, io);
+        ch.* = value.ChannelValue.init(self.allocator, cap);
         return Value{ .channel_val = ch };
     }
 
@@ -805,6 +1037,7 @@ pub const Evaluator = struct {
                         .non_exhaustive_match => "match error",
                         .propagate_cross_type => "type error",
                         .unsatisfied_bound => "bound error",
+                        .unconsumed_spawn => "linear type error",
                     };
                     if (err.line > 0) {
                         stderr_writer.interface.print("{s}:{d}:{d}: {s}: {s}\n", .{ module_name, err.line, err.column, kind_str, err.message }) catch {};
@@ -874,6 +1107,8 @@ pub const Evaluator = struct {
                 continue;
             }
             try self.evalDecl(decl, &self.global_env);
+            // 安全点：声明之间触发 GC
+            self.maybeCollectGarbage();
         }
 
         // 存储模块导出信息
@@ -1509,6 +1744,7 @@ pub const Evaluator = struct {
             .type_cast => |tc| self.evalTypeCast(tc, environment),
             .spawn => |sp| self.evalSpawn(sp, environment),
             .atomic_expr => |ae| self.evalAtomicExpr(ae, environment),
+            .compound_assign => |ca| self.evalCompoundAssign(ca, environment),
             .lazy => error.UnsupportedOperation,
             .select => |sel| self.evalSelect(sel, environment),
             .monad_comprehension => error.UnsupportedOperation,
@@ -1569,6 +1805,8 @@ pub const Evaluator = struct {
                 },
                 .expression => |expr| {
                     const val = try self.evalExpr(expr, environment);
+                    self.pushRoot(val); // 保护 val：format 可能分配
+                    defer self.popRoot();
                     var buf = std.ArrayList(u8).empty;
                     defer buf.deinit(self.allocator);
                     try val.format(&buf, self.allocator, false);
@@ -1599,13 +1837,19 @@ pub const Evaluator = struct {
 
     fn evalAssignmentExpr(self: *Evaluator, ae: @TypeOf(@as(ast.Expr, undefined).assignment_expr), environment: *Environment) EvalResult!Value {
         const val = try self.evalExpr(ae.value, environment);
+        // 保护 val：后续求值可能触发 GC
+        self.pushRoot(val);
+        defer self.popRoot();
+
         switch (ae.target.*) {
             .identifier => |id| {
                 try environment.set(id.name, val);
             },
             .index => |idx| {
                 const object = try self.evalExpr(idx.object, environment);
+                self.pushRoot(object);
                 const index_val = try self.evalExpr(idx.index, environment);
+                defer self.popRoot(); // pop object
                 switch (object) {
                     .array => |*arr| {
                         const i = try index_val.asInteger();
@@ -1620,6 +1864,109 @@ pub const Evaluator = struct {
             else => return error.TypeMismatch,
         }
         return val;
+    }
+
+    fn evalCompoundAssign(self: *Evaluator, ca: @TypeOf(@as(ast.Expr, undefined).compound_assign), environment: *Environment) EvalResult!Value {
+        const val = try self.evalExpr(ca.value, environment);
+
+        // 如果目标是标识符且持有 Atomic 值，使用原子 fetch 操作
+        switch (ca.target.*) {
+            .identifier => |id| {
+                if (environment.getPtr(id.name)) |variable| {
+                    if (variable.value == .atomic_val) {
+                        const av = variable.value.atomic_val;
+                        const operand = value.valueToAtomicRaw(val, av.type_tag);
+                        switch (ca.op) {
+                            .add_assign => {
+                                _ = av.fetchAdd(operand);
+                                return av.load();
+                            },
+                            .sub_assign => {
+                                _ = av.fetchSub(operand);
+                                return av.load();
+                            },
+                            .mul_assign => {
+                                _ = av.fetchMul(operand);
+                                return av.load();
+                            },
+                            .div_assign => {
+                                // CAS loop for division
+                                while (true) {
+                                    const current = av.data.load(.seq_cst);
+                                    const current_val = av.load();
+                                    const result = try self.evalDiv(current_val, val, ca.location);
+                                    const new_raw = value.valueToAtomicRaw(result, av.type_tag);
+                                    if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst)) |_| {
+                                        continue;
+                                    }
+                                    return result;
+                                }
+                            },
+                            .mod_assign => {
+                                // CAS loop for modulo
+                                while (true) {
+                                    const current = av.data.load(.seq_cst);
+                                    const current_val = av.load();
+                                    const result = try self.evalMod(current_val, val, ca.location);
+                                    const new_raw = value.valueToAtomicRaw(result, av.type_tag);
+                                    if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst)) |_| {
+                                        continue;
+                                    }
+                                    return result;
+                                }
+                            },
+                            .bit_and_assign => {
+                                _ = av.fetchAnd(operand);
+                                return av.load();
+                            },
+                            .bit_or_assign => {
+                                _ = av.fetchOr(operand);
+                                return av.load();
+                            },
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+
+        // 非 Atomic 路径：读取当前值，执行二元运算，赋值，返回新值
+        const current = try self.evalExpr(ca.target, environment);
+        const result = switch (ca.op) {
+            .add_assign => try self.evalAdd(current, val),
+            .sub_assign => try self.evalSub(current, val),
+            .mul_assign => try self.evalMul(current, val),
+            .div_assign => try self.evalDiv(current, val, ca.location),
+            .mod_assign => try self.evalMod(current, val, ca.location),
+            .bit_and_assign => {
+                if (current == .integer and val == .integer) {
+                    const result_type = current.integer.type_tag;
+                    const r = current.integer.value & val.integer.value;
+                    if (!result_type.inRange(r)) return self.gluePanic("arithmetic overflow: integer operation out of range");
+                    return Value{ .integer = IntValue{ .value = r, .type_tag = result_type } };
+                }
+                return self.gluePanic("bitwise & requires integer operands");
+            },
+            .bit_or_assign => {
+                if (current == .integer and val == .integer) {
+                    const result_type = current.integer.type_tag;
+                    const r = current.integer.value | val.integer.value;
+                    if (!result_type.inRange(r)) return self.gluePanic("arithmetic overflow: integer operation out of range");
+                    return Value{ .integer = IntValue{ .value = r, .type_tag = result_type } };
+                }
+                return self.gluePanic("bitwise | requires integer operands");
+            },
+        };
+
+        // 赋值新值
+        switch (ca.target.*) {
+            .identifier => |id| {
+                try environment.set(id.name, result);
+            },
+            else => return error.TypeMismatch,
+        }
+
+        return result;
     }
 
     // ============================================================
@@ -1650,6 +1997,9 @@ pub const Evaluator = struct {
         }
 
         const left = try self.evalExpr(bin.left, environment);
+        // 保护 left：求值 right 期间可能触发 GC
+        self.pushRoot(left);
+        defer self.popRoot();
         const right = try self.evalExpr(bin.right, environment);
 
         switch (bin.op) {
@@ -1922,13 +2272,23 @@ pub const Evaluator = struct {
 
         const callee = try self.evalExpr(call.callee, environment);
 
+        // 保护 callee：求值参数期间可能触发 GC
+        self.pushRoot(callee);
+        defer self.popRoot();
+
         // 求值参数
         var args = std.ArrayList(Value).empty;
         for (call.arguments) |arg_expr| {
-            try args.append(self.allocator, try self.evalExpr(arg_expr, environment));
+            const arg = try self.evalExpr(arg_expr, environment);
+            self.pushRoot(arg);
+            try args.append(self.allocator, arg);
+            // arg 已复制到 args 中，但 pushRoot 保护直到函数返回
         }
         // 注意：不 deinit 参数值，因为它们可能与环境中的变量共享内存（如数组切片）
-        defer args.deinit(self.allocator);
+        defer {
+            args.deinit(self.allocator);
+            self.popRoots(args.items.len); // 弹出所有参数的 root
+        }
 
         // TCO: 如果在尾位置且被调用者是闭包，使用尾调用优化
         if (self.in_tail_position and callee == .closure) {
@@ -2086,13 +2446,23 @@ pub const Evaluator = struct {
             else => try self.evalExpr(mc.object, environment),
         };
 
+        // 保护 object：求值参数期间可能触发 GC
+        self.pushRoot(object);
+        defer self.popRoot();
+
         // 求值参数
         var args = std.ArrayList(Value).empty;
+        const root_count_before = self.shadow_stack.items.len;
         for (mc.arguments) |arg_expr| {
-            try args.append(self.allocator, try self.evalExpr(arg_expr, environment));
+            const arg = try self.evalExpr(arg_expr, environment);
+            self.pushRoot(arg);
+            try args.append(self.allocator, arg);
         }
         // 注意：不 deinit 参数值，因为它们可能与环境中的变量共享内存
-        defer args.deinit(self.allocator);
+        defer {
+            args.deinit(self.allocator);
+            self.popRoots(self.shadow_stack.items.len - root_count_before);
+        }
 
         return self.callMethod(object, mc.method, args.items, environment);
     }
@@ -2471,23 +2841,20 @@ pub const Evaluator = struct {
         // ============================================================
 
         // Spawn<T> 方法
+        // 使用 Zio Mutex/Condition — 在协程上下文中挂起当前协程让出执行权
         if (object == .spawn_val) {
             const handle = object.spawn_val;
             if (std.mem.eql(u8, method, "await")) {
                 if (args.len != 0) return error.WrongArity;
-                // 阻塞等待完成
-                handle.mutex.lockUncancelable(handle.io);
+                // 文档 §3.7: Spawn<T>.await() 挂起当前协程，让出执行权
+                // Zio Condition.wait() 在协程上下文中挂起当前协程让出执行权
+                handle.mutex.lockUncancelable();
                 while (handle.status.load(.seq_cst) == .Pending or handle.status.load(.seq_cst) == .Running) {
-                    handle.condition.waitUncancelable(handle.io, &handle.mutex);
+                    handle.condition.waitUncancelable(&handle.mutex);
                 }
                 const result = handle.result;
                 handle.consumed.store(true, .seq_cst);
-                handle.mutex.unlock(handle.io);
-                // 等待线程结束
-                if (handle.thread) |t| {
-                    t.join();
-                    handle.thread = null;
-                }
+                handle.mutex.unlock();
                 if (handle.status.load(.seq_cst) == .Failed) {
                     // 文档 §3.6: Panic 协程隔离
                     // await 时如果子协程 panic，传播 panic 到当前协程
@@ -2498,11 +2865,11 @@ pub const Evaluator = struct {
             }
             if (std.mem.eql(u8, method, "cancel")) {
                 if (args.len != 0) return error.WrongArity;
-                handle.mutex.lockUncancelable(handle.io);
+                handle.mutex.lockUncancelable();
                 handle.status.store(.Cancelled, .seq_cst);
                 handle.consumed.store(true, .seq_cst);
-                handle.condition.broadcast(handle.io);
-                handle.mutex.unlock(handle.io);
+                handle.condition.broadcast();
+                handle.mutex.unlock();
                 return Value.unit;
             }
             if (std.mem.eql(u8, method, "status")) {
@@ -2513,13 +2880,13 @@ pub const Evaluator = struct {
             }
             if (std.mem.eql(u8, method, "result")) {
                 if (args.len != 0) return error.WrongArity;
-                handle.mutex.lockUncancelable(handle.io);
+                handle.mutex.lockUncancelable();
                 if (handle.status.load(.seq_cst) == .Completed) {
                     const r = handle.result;
-                    handle.mutex.unlock(handle.io);
+                    handle.mutex.unlock();
                     return r orelse Value.null_val;
                 }
-                handle.mutex.unlock(handle.io);
+                handle.mutex.unlock();
                 return Value.null_val;
             }
         }
@@ -2707,6 +3074,9 @@ pub const Evaluator = struct {
 
     fn evalIndex(self: *Evaluator, idx: @TypeOf(@as(ast.Expr, undefined).index), environment: *Environment) EvalResult!Value {
         const object = try self.evalExpr(idx.object, environment);
+        // 保护 object：求值 index 期间可能触发 GC
+        self.pushRoot(object);
+        defer self.popRoot();
         const index_val = try self.evalExpr(idx.index, environment);
 
         switch (object) {
@@ -2742,9 +3112,12 @@ pub const Evaluator = struct {
             for (arr) |*a| a.deinit(self.allocator);
             self.allocator.free(arr);
         }
+        const root_count_before = self.shadow_stack.items.len;
         for (al.elements, 0..) |elem, i| {
             arr[i] = try self.evalExpr(elem, environment);
+            self.pushRoot(arr[i]); // 保护已求值的元素
         }
+        self.popRoots(self.shadow_stack.items.len - root_count_before);
         return Value{ .array = .{ .elements = arr, .fixed_size = null } };
     }
 
@@ -2752,11 +3125,14 @@ pub const Evaluator = struct {
         var map = std.StringHashMap(Value).init(self.allocator);
         errdefer map.deinit();
 
+        const root_count_before = self.shadow_stack.items.len;
         for (rl.fields) |field| {
             const key = try self.allocator.dupe(u8, field.name);
             const val = try self.evalExpr(field.value, environment);
+            self.pushRoot(val); // 保护已求值的字段值
             try map.put(key, val);
         }
+        self.popRoots(self.shadow_stack.items.len - root_count_before);
 
         return Value{ .record = .{ .type_name = "", .fields = map } };
     }
@@ -2771,6 +3147,10 @@ pub const Evaluator = struct {
         // base 必须是记录
         switch (base_val) {
             .record => |base_rec| {
+                // 保护 base_val：后续 dupe/evalExpr 可能触发 GC
+                self.pushRoot(base_val);
+                defer self.popRoot();
+
                 // 复制 base 的所有字段
                 var map = std.StringHashMap(Value).init(self.allocator);
                 errdefer map.deinit();
@@ -2782,12 +3162,15 @@ pub const Evaluator = struct {
                 }
 
                 // 应用 updates（覆盖或新增字段）
+                const root_count_before = self.shadow_stack.items.len;
                 for (re.updates) |update| {
                     const key = try self.allocator.dupe(u8, update.name);
                     const val = try self.evalExpr(update.value, environment);
+                    self.pushRoot(val); // 保护已求值的更新值
                     // 如果 key 已存在，put 会覆盖旧值
                     try map.put(key, val);
                 }
+                self.popRoots(self.shadow_stack.items.len - root_count_before);
 
                 return Value{ .record = .{ .type_name = "", .fields = map } };
             },
@@ -2944,6 +3327,10 @@ pub const Evaluator = struct {
     /// 创建部分应用值 — 默认柯里化的核心
     /// 文档 §2.8.1: val add5 = add(5)  // 部分应用
     fn createPartialApplication(self: *Evaluator, func: Value, existing_bound: []const Value, new_args: []const Value, remaining: usize) EvalResult!Value {
+        // 保护 func：后续 alloc/clone 可能触发 GC
+        self.pushRoot(func);
+        defer self.popRoot();
+
         const total_bound = existing_bound.len + new_args.len;
         const bound_args = try self.allocator.alloc(Value, total_bound);
         @memcpy(bound_args[0..existing_bound.len], existing_bound);
@@ -3065,66 +3452,103 @@ pub const Evaluator = struct {
     /// 文档 §3.2.2: spawn 创建新协程，立即返回 Spawn<T>
     /// 文档 §5.1: 每个协程拥有独立的 GC heap（Per-heap GC）
     /// 文档 §3.6: Panic 协程隔离，子协程 panic 不影响父协程
+    /// 文档 §3.7: M:N 调度，spawn 通过 Zio 协程执行
     fn evalSpawn(self: *Evaluator, sp: @TypeOf(@as(ast.Expr, undefined).spawn), environment: *Environment) EvalResult!Value {
         const io = self.io orelse return self.gluePanic("spawn: no IO context");
 
         // 深拷贝捕获环境（Atomic 例外）
-        const cloned_env = try environment.deepCopy(self.allocator, null);
+        // deepCopy 返回 anyerror，需要转换到 EvalResult
+        const cloned_env = environment.deepCopy(self.allocator, null) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.OutOfMemory,
+            };
+        };
 
         // 创建 SpawnHandle
         const handle = try self.allocator.create(value.SpawnHandle);
         handle.* = value.SpawnHandle.init(self.allocator, io);
 
-        // 注册 spawn handle 到 evaluator（在 spawn 线程启动前注册，避免竞态）
+        // 保护 handle：后续分配可能触发 GC
+        self.pushRoot(.{ .spawn_val = handle });
+        defer self.popRoot();
+
+        // 注册 spawn handle 到 evaluator（在协程启动前注册，避免竞态）
         try self.spawn_handles.append(self.allocator, handle);
 
-        // 准备 spawn 线程数据
+        // 准备 spawn 协程数据
         const ctx = try self.allocator.create(Evaluator.SpawnContext);
         ctx.* = Evaluator.SpawnContext{
             .handle = handle,
             .body = sp.body,
             .env = cloned_env,
-            .backing_allocator = self.allocator,
+            .backing_allocator = std.heap.page_allocator,
             .io = io,
+            .scheduler = self.scheduler,
+            .gc = self.gc,
         };
 
-        // 在新线程中执行 spawn body
+        // 通过 Zio 调度器提交协程
+        // 文档 §3.7: M:N 调度，少量 OS 线程上运行大量轻量级协程
         handle.status.store(.Running, .seq_cst);
-        const thread = std.Thread.spawn(.{}, spawnThreadFunc, .{ctx}) catch {
-            handle.status.store(.Failed, .seq_cst);
-            handle.mutex.lockUncancelable(io);
-            handle.panic_message = try self.allocator.dupe(u8, "spawn: failed to create thread");
-            handle.condition.broadcast(io);
-            handle.mutex.unlock(io);
-            return Value{ .spawn_val = handle };
-        };
-        handle.thread = thread;
+        if (self.scheduler) |sched| {
+            // 有调度器：通过 Zio 协程执行（M:N 调度，用户态切换）
+            const join_handle = sched.getRuntime().spawn(spawnCoroutineFunc, .{ctx}) catch {
+                handle.status.store(.Failed, .seq_cst);
+                handle.mutex.lockUncancelable();
+                handle.panic_message = try self.allocator.dupe(u8, "spawn: failed to create coroutine");
+                handle.condition.broadcast();
+                handle.mutex.unlock();
+                return Value{ .spawn_val = handle };
+            };
+            // detach：协程自行管理生命周期，通过 SpawnHandle 的 mutex/condition 同步
+            _ = join_handle;
+        } else {
+            // 无调度器：回退到 std.Thread（1:1 OS 线程）
+            const thread = std.Thread.spawn(.{}, spawnThreadFunc, .{ctx}) catch {
+                handle.status.store(.Failed, .seq_cst);
+                handle.mutex.lockUncancelable();
+                handle.panic_message = try self.allocator.dupe(u8, "spawn: failed to create thread");
+                handle.condition.broadcast();
+                handle.mutex.unlock();
+                return Value{ .spawn_val = handle };
+            };
+            thread.detach();
+        }
 
         return Value{ .spawn_val = handle };
     }
 
-    /// spawn 线程入口函数
-    /// 在独立线程中创建独立 Evaluator + ArenaAllocator 执行 spawn body
+    /// spawn 协程入口函数（Zio 协程）
+    /// 文档 §3.7: 在 Zio 协程中创建独立 Evaluator + ArenaAllocator 执行 spawn body
     /// 实现 Per-heap GC 隔离和 Panic 协程隔离
-    fn spawnThreadFunc(ctx: *const Evaluator.SpawnContext) void {
+    /// 使用 Zio Mutex/Condition — 在协程上下文中挂起当前协程让出执行权
+    fn spawnCoroutineFunc(ctx: *Evaluator.SpawnContext) void {
         const handle = ctx.handle;
         const body = ctx.body;
         const env_ptr = ctx.env;
         const backing_allocator = ctx.backing_allocator;
-        const io = ctx.io;
 
-        // 创建 Per-heap GC（独立 ArenaAllocator）
-        var gc = gc_mod.GarbageCollector.init(backing_allocator);
+        // 创建 Per-heap GC（分代式复制收集器）
+        var gc = gc_mod.GarbageCollector.init(backing_allocator) catch {
+            handle.status.store(.Failed, .seq_cst);
+            handle.mutex.lockUncancelable();
+            handle.condition.signal();
+            handle.mutex.unlock();
+            return;
+        };
         defer gc.deinit();
         const arena_alloc = gc.allocator();
 
-        // 创建独立 Evaluator（使用 Arena 分配器）
-        var ev = Evaluator.initWithIo(arena_alloc, io);
+        // 创建独立 Evaluator（使用 GC 分配器，继承 IO 上下文和 scheduler）
+        var ev = Evaluator.initWithIo(arena_alloc, ctx.io);
+        ev.scheduler = ctx.scheduler;
+        ev.gc = &gc; // 指向本协程的 Per-heap GC
         defer ev.deinit();
 
         // 执行 spawn body
         const result = ev.evalExpr(body, env_ptr) catch |err| {
-            handle.mutex.lockUncancelable(io);
+            handle.mutex.lockUncancelable();
             if (err == error.GluePanic) {
                 // 文档 §3.6: Panic 协程隔离
                 // 子协程 panic 被捕获存入 SpawnHandle，不影响父协程
@@ -3135,17 +3559,66 @@ pub const Evaluator = struct {
             } else {
                 handle.status.store(.Failed, .seq_cst);
             }
-            handle.condition.broadcast(io);
-            handle.mutex.unlock(io);
+            handle.condition.broadcast();
+            handle.mutex.unlock();
             return;
         };
 
         // 存储结果
-        handle.mutex.lockUncancelable(io);
+        handle.mutex.lockUncancelable();
         handle.result = result;
         handle.status.store(.Completed, .seq_cst);
-        handle.condition.broadcast(io);
-        handle.mutex.unlock(io);
+        handle.condition.broadcast();
+        handle.mutex.unlock();
+    }
+
+    /// spawn 线程入口函数（std.Thread 回退）
+    /// 无调度器时使用 1:1 OS 线程模型
+    fn spawnThreadFunc(ctx: *Evaluator.SpawnContext) void {
+        const handle = ctx.handle;
+        const body = ctx.body;
+        const env_ptr = ctx.env;
+        const backing_allocator = ctx.backing_allocator;
+
+        // 创建 Per-heap GC（分代式复制收集器）
+        var gc = gc_mod.GarbageCollector.init(backing_allocator) catch {
+            handle.status.store(.Failed, .seq_cst);
+            handle.mutex.lockUncancelable();
+            handle.condition.signal();
+            handle.mutex.unlock();
+            return;
+        };
+        defer gc.deinit();
+        const arena_alloc = gc.allocator();
+
+        // 创建独立 Evaluator（使用 GC 分配器，继承 scheduler）
+        var ev = Evaluator.initWithIo(arena_alloc, ctx.io);
+        ev.scheduler = ctx.scheduler;
+        ev.gc = &gc; // 指向本协程的 Per-heap GC
+        defer ev.deinit();
+
+        // 执行 spawn body
+        const result = ev.evalExpr(body, env_ptr) catch |err| {
+            handle.mutex.lockUncancelable();
+            if (err == error.GluePanic) {
+                if (ev.panic_message) |msg| {
+                    handle.panic_message = backing_allocator.dupe(u8, msg) catch null;
+                }
+                handle.status.store(.Failed, .seq_cst);
+            } else {
+                handle.status.store(.Failed, .seq_cst);
+            }
+            handle.condition.broadcast();
+            handle.mutex.unlock();
+            return;
+        };
+
+        // 存储结果
+        handle.mutex.lockUncancelable();
+        handle.result = result;
+        handle.status.store(.Completed, .seq_cst);
+        handle.condition.broadcast();
+        handle.mutex.unlock();
     }
 
     // ============================================================
@@ -3157,6 +3630,9 @@ pub const Evaluator = struct {
     /// atomic 是关键字前缀表达式，不是函数调用
     fn evalAtomicExpr(self: *Evaluator, ae: @TypeOf(@as(ast.Expr, undefined).atomic_expr), environment: *Environment) EvalResult!Value {
         const val = try self.evalExpr(ae.value, environment);
+        // 保护 val：create 可能触发 GC
+        self.pushRoot(val);
+        defer self.popRoot();
         const av = try self.allocator.create(value.AtomicValue);
         switch (val) {
             .integer => |iv| {
@@ -3410,6 +3886,106 @@ pub const Evaluator = struct {
             },
             .loop_stmt => |ls| {
                 return self.evalLoopStmt(ls, environment);
+            },
+            .compound_assignment => |ca| {
+                const val = try self.evalExpr(ca.value, environment);
+                // 如果目标是标识符且持有 Atomic 值，使用原子 fetch 操作
+                switch (ca.target.*) {
+                    .identifier => |id| {
+                        if (environment.getPtr(id.name)) |variable| {
+                            if (variable.value == .atomic_val) {
+                                const av = variable.value.atomic_val;
+                                const operand = value.valueToAtomicRaw(val, av.type_tag);
+                                switch (ca.op) {
+                                    .add_assign => {
+                                        _ = av.fetchAdd(operand);
+                                    },
+                                    .sub_assign => {
+                                        _ = av.fetchSub(operand);
+                                    },
+                                    .mul_assign => {
+                                        _ = av.fetchMul(operand);
+                                    },
+                                    .div_assign => {
+                                        while (true) {
+                                            const current = av.data.load(.seq_cst);
+                                            const current_val = av.load();
+                                            const result = try self.evalDiv(current_val, val, ca.location);
+                                            const new_raw = value.valueToAtomicRaw(result, av.type_tag);
+                                            if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst)) |_| {
+                                                continue;
+                                            }
+                                            break;
+                                        }
+                                    },
+                                    .mod_assign => {
+                                        while (true) {
+                                            const current = av.data.load(.seq_cst);
+                                            const current_val = av.load();
+                                            const result = try self.evalMod(current_val, val, ca.location);
+                                            const new_raw = value.valueToAtomicRaw(result, av.type_tag);
+                                            if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst)) |_| {
+                                                continue;
+                                            }
+                                            break;
+                                        }
+                                    },
+                                    .bit_and_assign => {
+                                        _ = av.fetchAnd(operand);
+                                    },
+                                    .bit_or_assign => {
+                                        _ = av.fetchOr(operand);
+                                    },
+                                }
+                                return null;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+                // 非 Atomic 路径
+                const current = try self.evalExpr(ca.target, environment);
+                const result = switch (ca.op) {
+                    .add_assign => try self.evalAdd(current, val),
+                    .sub_assign => try self.evalSub(current, val),
+                    .mul_assign => try self.evalMul(current, val),
+                    .div_assign => try self.evalDiv(current, val, ca.location),
+                    .mod_assign => try self.evalMod(current, val, ca.location),
+                    .bit_and_assign => blk: {
+                        if (current == .integer and val == .integer) {
+                            const result_type = current.integer.type_tag;
+                            const r = current.integer.value & val.integer.value;
+                            if (!result_type.inRange(r)) {
+                                self.panic_message = "arithmetic overflow: integer operation out of range";
+                                return error.GluePanic;
+                            }
+                            break :blk Value{ .integer = IntValue{ .value = r, .type_tag = result_type } };
+                        }
+                        self.panic_message = "bitwise & requires integer operands";
+                        return error.GluePanic;
+                    },
+                    .bit_or_assign => blk: {
+                        if (current == .integer and val == .integer) {
+                            const result_type = current.integer.type_tag;
+                            const r = current.integer.value | val.integer.value;
+                            if (!result_type.inRange(r)) {
+                                self.panic_message = "arithmetic overflow: integer operation out of range";
+                                return error.GluePanic;
+                            }
+                            break :blk Value{ .integer = IntValue{ .value = r, .type_tag = result_type } };
+                        }
+                        self.panic_message = "bitwise | requires integer operands";
+                        return error.GluePanic;
+                    },
+                };
+                // 赋值
+                switch (ca.target.*) {
+                    .identifier => |id| {
+                        try environment.set(id.name, result);
+                    },
+                    else => return error.TypeMismatch,
+                }
+                return null;
             },
         };
     }
