@@ -2410,6 +2410,24 @@ pub const TypeInferencer = struct {
             self.registerBuiltinName("Ok");
         }
 
+        // scan : () -> str?
+        {
+            const params = self.allocator.alloc(*Type, 0) catch return;
+            const ret_ty = self.makeNullableType(self.makeType(.str_type) catch return) catch return;
+            const fn_ty = self.makeFnType(params, ret_ty) catch return;
+            env.define("scan", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("scan");
+        }
+
+        // scanln : () -> str?
+        {
+            const params = self.allocator.alloc(*Type, 0) catch return;
+            const ret_ty = self.makeNullableType(self.makeType(.str_type) catch return) catch return;
+            const fn_ty = self.makeFnType(params, ret_ty) catch return;
+            env.define("scanln", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("scanln");
+        }
+
         // 数值类型转换函数：Type(value) 显式转换
         // 文档 2.15: i8(), i16(), i32(), i64(), i128(), u8(), u16(), u32(), u64(), u128(), f32(), f64()
         // 签名: forall a. (a) -> TargetType

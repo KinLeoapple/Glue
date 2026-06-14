@@ -1,0 +1,29 @@
+// 测试 scan 和 scanln
+fun main() {
+    // 1. 纯 scanln 测试
+    val line1 = scanln()
+    println("L1:[" + (line1 ?? "NULL") + "]")
+
+    val line2 = scanln()
+    println("L2:[" + (line2 ?? "NULL") + "]")
+
+    // 2. scan 后 scanln — 返回当前行剩余内容
+    val t1 = scan()
+    val rest1 = scanln()
+    println("T1:[" + (t1 ?? "NULL") + "]")
+    println("R1:[" + (rest1 ?? "NULL") + "]")
+
+    // 3. 纯 scan — 跨行读取 token
+    val t2 = scan()
+    val t3 = scan()
+    val t4 = scan()
+    println("T2:[" + (t2 ?? "NULL") + "]")
+    println("T3:[" + (t3 ?? "NULL") + "]")
+    println("T4:[" + (t4 ?? "NULL") + "]")
+
+    // 4. EOF 测试
+    val eof1 = scan()
+    val eof2 = scanln()
+    println("EOF1:[" + (eof1 ?? "NULL") + "]")
+    println("EOF2:[" + (eof2 ?? "NULL") + "]")
+}

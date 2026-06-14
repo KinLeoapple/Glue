@@ -1021,7 +1021,7 @@ var x = 3       // ✗ duplicate definition: 'x' is already defined in this scop
 
 | 类别 | 名称 |
 |------|------|
-| I/O | `println`, `print`, `eprintln`, `eprint` |
+| I/O | `println`, `print`, `eprintln`, `eprint`, `scanln`, `scan` |
 | 工具 | `Panic`, `eq` |
 | 类型转换 | `str`, `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`, `f32`, `f64` |
 | 错误处理 | `Error`, `Ok` |
@@ -1084,6 +1084,32 @@ loop {
 | 操作可能失败，错误类型明确 | `Throw<T, SpecificError>` | 穷举匹配，类型安全 |
 | 聚合多种错误 | `Throw<T, Error>` | 统一处理，catch-all |
 | 并发任务中的错误 | Channel 传递 `Throw<T, E>` | CSP 模型 |
+
+### 2.19 I/O 内建函数
+
+#### 输出
+
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `println` | `Any -> Unit` | 输出值 + 换行到 stdout |
+| `print` | `Any -> Unit` | 输出值到 stdout（无换行） |
+| `eprintln` | `Any -> Unit` | 输出值 + 换行到 stderr |
+| `eprint` | `Any -> Unit` | 输出值到 stderr（无换行） |
+
+#### 输入
+
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `scanln` | `() -> str?` | 从 stdin 读取一行（不含 `\n`），EOF 返回 `null` |
+| `scan` | `() -> str?` | 从 stdin 读取一个空白分隔的 token，EOF 返回 `null` |
+
+**错误处理**：I/O 错误（如 stdin 不可用）触发 panic，不使用 Throw。解析由用户显式完成：
+
+```glue
+val line = scanln()          // "42"
+val n = i32(line ?? "0")     // 用户负责类型转换
+val t = scan()               // 读取一个空白分隔的 token
+```
 
 ---
 
@@ -2063,6 +2089,7 @@ glue/
 | Parser | AST |
 | 求值器 | 可执行基本表达式 |
 | 基础类型 | i8..i128, u8..u128, f32, f64, bool, char |
+| I/O | `println`/`print`/`eprintln`/`eprint` 输出，`scanln`/`scan` 输入（`str?`，EOF 返回 null，错误 panic） |
 | Nullable | `T?`、`null`、`?.`、`??`、`!`、类型收窄、`?` 传播 |
 | Throw | `Throw<T, E>`、`throw`、`?` 传播、`Ok/Error` 模式匹配 |
 | `?` 不跨 Nullable/Throw | `?` 严格按类型匹配 |

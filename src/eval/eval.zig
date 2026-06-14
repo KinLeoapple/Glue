@@ -124,6 +124,13 @@ const ModuleExportInfo = struct {
 // 求值器
 // ============================================================
 
+/// 持久化 stdin 读取器 — 存储读取缓冲区和 File.Reader
+/// 避免每次调用 scan/scanln 时重建 reader 导致缓冲数据丢失
+const StdinState = struct {
+    buffer: [8192]u8 = undefined,
+    reader: std.Io.File.Reader,
+};
+
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     global_env: Environment,
@@ -170,6 +177,12 @@ pub const Evaluator = struct {
     /// Impl 注册表（用于关联类型查找）
     /// key: "trait_name::type_name", value: ImplInfo
     impl_registry: std.StringHashMap(ImplInfo),
+    /// scan/scanln 的持久化 stdin 读取器（堆分配，首次调用时创建）
+    stdin_state: ?*StdinState = null,
+    /// scan/scanln 的当前行缓冲区 — 由 readNextLine 填充
+    scan_line_buf: std.ArrayList(u8),
+    /// scan_line_buf 中当前读取位置
+    scan_line_pos: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
@@ -190,6 +203,7 @@ pub const Evaluator = struct {
             .type_inferencer = sema.TypeInferencer.init(allocator),
             .registered_impls = std.StringHashMap(void).init(allocator),
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
+            .scan_line_buf = std.ArrayList(u8).empty,
         };
         ev.registerBuiltins();
         return ev;
@@ -215,6 +229,7 @@ pub const Evaluator = struct {
             .type_inferencer = sema.TypeInferencer.init(allocator),
             .registered_impls = std.StringHashMap(void).init(allocator),
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
+            .scan_line_buf = std.ArrayList(u8).empty,
         };
         ev.registerBuiltins();
         return ev;
@@ -308,6 +323,11 @@ pub const Evaluator = struct {
         }
         // 释放类型推断器
         self.type_inferencer.deinit();
+        // 释放 stdin 读取器和行缓冲区
+        if (self.stdin_state) |state| {
+            self.allocator.destroy(state);
+        }
+        self.scan_line_buf.deinit(self.allocator);
     }
 
     /// 触发 Glue panic — 不可捕获，但允许 defer 执行
@@ -396,6 +416,22 @@ pub const Evaluator = struct {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinOk(args);
+            }
+        }.call } }, true) catch {};
+        // scan — 读取一个空白分隔的 token，EOF 返回 null
+        self.global_env.define("scan", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
+                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                return ev.builtinScan(args);
+            }
+        }.call } }, true) catch {};
+        // scanln — 读取一行，EOF 返回 null
+        self.global_env.define("scanln", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
+                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                return ev.builtinScanln(args);
             }
         }.call } }, true) catch {};
 
@@ -538,6 +574,104 @@ pub const Evaluator = struct {
     fn builtinOk(self: *Evaluator, args: []const Value) EvalError!Value {
         if (args.len != 1) return error.WrongArity;
         return throw_mod.makeOk(self.allocator, args[0]);
+    }
+
+    /// 确保 stdin 持久化读取器已创建（首次调用时堆分配），返回读取器接口指针
+    fn ensureStdinReader(self: *Evaluator) EvalResult!*std.Io.Reader {
+        if (self.stdin_state) |state| return &state.reader.interface;
+        const io = self.io orelse {
+            self.panic_message = "scan: no IO context";
+            return error.GluePanic;
+        };
+        const state = self.allocator.create(StdinState) catch return error.OutOfMemory;
+        state.* = .{
+            .buffer = undefined,
+            .reader = std.Io.File.Reader.initStreaming(std.Io.File.stdin(), io, &state.buffer),
+        };
+        self.stdin_state = state;
+        return &state.reader.interface;
+    }
+
+    /// 从 stdin 读取一行到 scan_line_buf（使用持久化 reader），不含 '\n' 和 '\r'，EOF 返回 null
+    fn readNextLine(self: *Evaluator) EvalResult!?[]const u8 {
+        const reader = try self.ensureStdinReader();
+        self.scan_line_buf.clearRetainingCapacity();
+        const line = reader.takeDelimiter('\n') catch |err| {
+            const msg = std.fmt.allocPrint(self.allocator, "scan: IO error: {s}", .{@errorName(err)}) catch "scan: IO error";
+            self.panic_message = msg;
+            return error.GluePanic;
+        };
+        if (line) |l| {
+            // Windows CRLF: 去掉尾部 '\r'
+            const trimmed = if (l.len > 0 and l[l.len - 1] == '\r') l[0 .. l.len - 1] else l;
+            self.scan_line_buf.appendSlice(self.allocator, trimmed) catch return error.OutOfMemory;
+            self.scan_line_pos = 0;
+            return self.scan_line_buf.items;
+        } else {
+            return null;
+        }
+    }
+
+    /// scanln() — 读取一行（不含 '\n'），EOF 返回 null，IO 错误 panic
+    fn builtinScanln(self: *Evaluator, args: []const Value) EvalResult!Value {
+        if (args.len != 0) return error.WrongArity;
+
+        // 如果当前行还有未消费内容，返回剩余部分
+        if (self.scan_line_buf.items.len > 0 and self.scan_line_pos < self.scan_line_buf.items.len) {
+            const remaining = self.scan_line_buf.items[self.scan_line_pos..];
+            const owned = self.allocator.dupe(u8, remaining) catch return error.OutOfMemory;
+            self.scan_line_pos = self.scan_line_buf.items.len;
+            return Value{ .string = owned };
+        }
+
+        // 从 stdin 读取新行
+        const line_opt = self.readNextLine() catch |err| {
+            if (err == error.GluePanic) return error.GluePanic;
+            return error.OutOfMemory;
+        };
+        if (line_opt) |line| {
+            const owned = self.allocator.dupe(u8, line) catch return error.OutOfMemory;
+            self.scan_line_pos = self.scan_line_buf.items.len;
+            return Value{ .string = owned };
+        } else {
+            return Value.null_val;
+        }
+    }
+
+    /// scan() — 读取一个空白分隔的 token，EOF 返回 null，IO 错误 panic
+    fn builtinScan(self: *Evaluator, args: []const Value) EvalResult!Value {
+        if (args.len != 0) return error.WrongArity;
+
+        while (true) {
+            // 尝试从当前行提取 token
+            if (self.scan_line_buf.items.len > 0 and self.scan_line_pos < self.scan_line_buf.items.len) {
+                const remaining = self.scan_line_buf.items[self.scan_line_pos..];
+                // 跳过前导空白
+                var start: usize = 0;
+                while (start < remaining.len and (remaining[start] == ' ' or remaining[start] == '\t' or remaining[start] == '\r')) {
+                    start += 1;
+                }
+                if (start < remaining.len) {
+                    // 找到 token 结尾
+                    var end = start + 1;
+                    while (end < remaining.len and remaining[end] != ' ' and remaining[end] != '\t' and remaining[end] != '\r') {
+                        end += 1;
+                    }
+                    const token_slice = remaining[start..end];
+                    self.scan_line_pos += end;
+                    const owned = self.allocator.dupe(u8, token_slice) catch return error.OutOfMemory;
+                    return Value{ .string = owned };
+                }
+            }
+
+            // 当前行没有更多 token，读取新行
+            const line_opt = self.readNextLine() catch |err| {
+                if (err == error.GluePanic) return error.GluePanic;
+                return error.OutOfMemory;
+            };
+            if (line_opt == null) return Value.null_val;
+            // 循环回去从新行中提取 token
+        }
     }
 
     // ============================================================
