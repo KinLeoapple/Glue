@@ -49,7 +49,7 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void
         error.MissingMain => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("{s}: error: undefined entry point — every program requires a 'fun main()' declaration\n", .{filename}) catch {};
+            stderr_writer.interface.print("{s}: error: undefined entry point\n", .{filename}) catch {};
             stderr_writer.flush() catch {};
         },
         error.GluePanic => {
