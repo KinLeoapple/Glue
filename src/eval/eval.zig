@@ -571,8 +571,402 @@ pub const Evaluator = struct {
     /// 检查是否应该触发 GC，如果应该则执行回收
     pub fn maybeCollectGarbage(self: *Evaluator) void {
         const gc = self.gc orelse return;
+        // Minor GC：nursery 使用率超过阈值
+        if (gc.shouldMinorCollect()) {
+            self.minorGC();
+        }
+        // Major GC：老生代分配超过阈值
         if (gc.shouldCollect()) {
             self.collectGarbage();
+        }
+    }
+
+    /// Minor GC：将 nursery 中所有活对象疏散到老生代
+    /// 流程：beginMinorGC → 疏散根集 → endMinorGC
+    pub fn minorGC(self: *Evaluator) void {
+        const gc = self.gc orelse return;
+        gc.beginMinorGC();
+
+        // 疏散 shadow_stack 中的所有 Value
+        for (self.shadow_stack.items) |*val| {
+            self.evacuateValue(val);
+        }
+
+        // 疏散 global_env
+        self.evacuateEnv(&self.global_env);
+
+        gc.endMinorGC();
+    }
+
+    /// 疏散 Value：就地更新 Value 中所有 nursery 指针到老生代
+    /// 对于每个 nursery 指针：晋升数据到老生代，更新 Value 中的指针
+    fn evacuateValue(self: *Evaluator, val: *Value) void {
+        const gc = self.gc orelse return;
+        switch (val.*) {
+            .unit, .null_val, .integer, .float, .boolean, .char_val, .builtin, .range => {},
+            .string => |*s| {
+                if (s.len > 0 and gc.isInNursery(@intFromPtr(s.ptr))) {
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(s.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, s.len);
+                    s.ptr = @ptrCast(@constCast(new_ptr));
+                }
+            },
+            .error_val => |*ev| {
+                if (ev.message.len > 0 and gc.isInNursery(@intFromPtr(ev.message.ptr))) {
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(ev.message.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, ev.message.len);
+                    ev.message.ptr = @ptrCast(@constCast(new_ptr));
+                }
+                if (ev.type_name.len > 0 and gc.isInNursery(@intFromPtr(ev.type_name.ptr))) {
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(ev.type_name.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, ev.type_name.len);
+                    ev.type_name.ptr = @ptrCast(@constCast(new_ptr));
+                }
+            },
+            .array => |*av| {
+                if (av.elements.len > 0 and gc.isInNursery(@intFromPtr(av.elements.ptr))) {
+                    const byte_size = av.elements.len * @sizeOf(Value);
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(av.elements.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_elements: [*]Value = @ptrCast(@alignCast(new_ptr));
+                    av.elements = new_elements[0..av.elements.len];
+                }
+                // 递归疏散每个元素
+                for (av.elements) |*elem| {
+                    self.evacuateValue(elem);
+                }
+            },
+            .record => |*rv| {
+                // RecordValue 的 fields 是 StringHashMap(Value)
+                // HashMap 内部存储可能在 nursery 中，需要整体迁移
+                self.evacuateStringHashMap(Value, &rv.fields);
+            },
+            .adt => |*av_ptr| {
+                if (gc.isInNursery(@intFromPtr(av_ptr.*))) {
+                    const byte_size = @sizeOf(value.AdtValue);
+                    const old_ptr: [*]u8 = @ptrCast(av_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_av: *value.AdtValue = @ptrCast(@alignCast(new_ptr));
+                    av_ptr.* = new_av;
+                }
+                // 疏散 AdtValue 内部字段
+                const av = av_ptr.*;
+                // type_name
+                if (av.type_name.len > 0 and gc.isInNursery(@intFromPtr(av.type_name.ptr))) {
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(av.type_name.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, av.type_name.len);
+                    av.type_name.ptr = @ptrCast(@constCast(new_ptr));
+                }
+                // constructor
+                if (av.constructor.len > 0 and gc.isInNursery(@intFromPtr(av.constructor.ptr))) {
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(av.constructor.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, av.constructor.len);
+                    av.constructor.ptr = @ptrCast(@constCast(new_ptr));
+                }
+                // fields 数组
+                if (av.fields.len > 0 and gc.isInNursery(@intFromPtr(av.fields.ptr))) {
+                    const byte_size = av.fields.len * @sizeOf(value.AdtField);
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(av.fields.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_fields: [*]value.AdtField = @ptrCast(@alignCast(new_ptr));
+                    av.fields = new_fields[0..av.fields.len];
+                }
+                // 递归疏散每个字段
+                for (av.fields) |*field| {
+                    if (field.name) |name| {
+                        if (name.len > 0 and gc.isInNursery(@intFromPtr(name.ptr))) {
+                            const old_ptr: [*]u8 = @ptrCast(@constCast(name.ptr));
+                            const new_ptr = gc.promoteToOldGen(old_ptr, name.len);
+                            field.name = new_ptr[0..name.len];
+                        }
+                    }
+                    self.evacuateValue(&field.value);
+                }
+            },
+            .newtype => |*nv_ptr| {
+                if (gc.isInNursery(@intFromPtr(nv_ptr.*))) {
+                    const byte_size = @sizeOf(value.NewtypeValue);
+                    const old_ptr: [*]u8 = @ptrCast(nv_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_nv: *value.NewtypeValue = @ptrCast(@alignCast(new_ptr));
+                    nv_ptr.* = new_nv;
+                }
+                // type_name
+                if (nv_ptr.*.type_name.len > 0 and gc.isInNursery(@intFromPtr(nv_ptr.*.type_name.ptr))) {
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(nv_ptr.*.type_name.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, nv_ptr.*.type_name.len);
+                    nv_ptr.*.type_name.ptr = @ptrCast(@constCast(new_ptr));
+                }
+                self.evacuateValue(&nv_ptr.*.inner);
+            },
+            .closure => |*cl_ptr| {
+                if (gc.isInNursery(@intFromPtr(cl_ptr.*))) {
+                    const byte_size = @sizeOf(value.Closure);
+                    const old_ptr: [*]u8 = @ptrCast(cl_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_cl: *value.Closure = @ptrCast(@alignCast(new_ptr));
+                    cl_ptr.* = new_cl;
+                }
+                // 疏散闭包捕获的环境
+                const closure_env: *Environment = @ptrCast(@alignCast(cl_ptr.*.env));
+                self.evacuateEnv(closure_env);
+            },
+            .partial => |*pa_ptr| {
+                if (gc.isInNursery(@intFromPtr(pa_ptr.*))) {
+                    const byte_size = @sizeOf(value.PartialApplication);
+                    const old_ptr: [*]u8 = @ptrCast(pa_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_pa: *value.PartialApplication = @ptrCast(@alignCast(new_ptr));
+                    pa_ptr.* = new_pa;
+                }
+                self.evacuateValue(&pa_ptr.*.func);
+                if (pa_ptr.*.bound_args.len > 0 and gc.isInNursery(@intFromPtr(pa_ptr.*.bound_args.ptr))) {
+                    const byte_size = pa_ptr.*.bound_args.len * @sizeOf(Value);
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(pa_ptr.*.bound_args.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_args: [*]Value = @ptrCast(@alignCast(new_ptr));
+                    pa_ptr.*.bound_args = new_args[0..pa_ptr.*.bound_args.len];
+                }
+                for (pa_ptr.*.bound_args) |*arg| {
+                    self.evacuateValue(arg);
+                }
+            },
+            .throw_val => |*tv_ptr| {
+                if (gc.isInNursery(@intFromPtr(tv_ptr.*))) {
+                    const byte_size = @sizeOf(value.ThrowValue);
+                    const old_ptr: [*]u8 = @ptrCast(tv_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_tv: *value.ThrowValue = @ptrCast(@alignCast(new_ptr));
+                    tv_ptr.* = new_tv;
+                }
+                // 疏散 ThrowValue 内部数据
+                switch (tv_ptr.*.*) {
+                    .ok => |v_ptr| self.evacuateValue(v_ptr),
+                    .err => |*ev| {
+                        if (ev.message.len > 0 and gc.isInNursery(@intFromPtr(ev.message.ptr))) {
+                            const old_ptr: [*]u8 = @ptrCast(@constCast(ev.message.ptr));
+                            const new_ptr = gc.promoteToOldGen(old_ptr, ev.message.len);
+                            ev.message.ptr = @ptrCast(@constCast(new_ptr));
+                        }
+                        if (ev.type_name.len > 0 and gc.isInNursery(@intFromPtr(ev.type_name.ptr))) {
+                            const old_ptr: [*]u8 = @ptrCast(@constCast(ev.type_name.ptr));
+                            const new_ptr = gc.promoteToOldGen(old_ptr, ev.type_name.len);
+                            ev.type_name.ptr = @ptrCast(@constCast(new_ptr));
+                        }
+                    },
+                }
+            },
+            .array_iterator => |*ai_ptr| {
+                if (gc.isInNursery(@intFromPtr(ai_ptr.*))) {
+                    const byte_size = @sizeOf(value.ArrayIterator);
+                    const old_ptr: [*]u8 = @ptrCast(ai_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_ai: *value.ArrayIterator = @ptrCast(@alignCast(new_ptr));
+                    ai_ptr.* = new_ai;
+                }
+                if (ai_ptr.*.array.len > 0 and gc.isInNursery(@intFromPtr(ai_ptr.*.array.ptr))) {
+                    const byte_size = ai_ptr.*.array.len * @sizeOf(Value);
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(ai_ptr.*.array.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_arr: [*]Value = @ptrCast(@alignCast(new_ptr));
+                    ai_ptr.*.array = new_arr[0..ai_ptr.*.array.len];
+                }
+                for (ai_ptr.*.array) |*elem| {
+                    self.evacuateValue(elem);
+                }
+            },
+            .string_iterator => |*si_ptr| {
+                if (gc.isInNursery(@intFromPtr(si_ptr.*))) {
+                    const byte_size = @sizeOf(value.StringIterator);
+                    const old_ptr: [*]u8 = @ptrCast(si_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_si: *value.StringIterator = @ptrCast(@alignCast(new_ptr));
+                    si_ptr.* = new_si;
+                }
+                if (si_ptr.*.string.len > 0 and gc.isInNursery(@intFromPtr(si_ptr.*.string.ptr))) {
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(si_ptr.*.string.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, si_ptr.*.string.len);
+                    si_ptr.*.string.ptr = @ptrCast(@constCast(new_ptr));
+                }
+            },
+            .range_iterator => |*ri_ptr| {
+                if (gc.isInNursery(@intFromPtr(ri_ptr.*))) {
+                    const byte_size = @sizeOf(value.RangeIterator);
+                    const old_ptr: [*]u8 = @ptrCast(ri_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_ri: *value.RangeIterator = @ptrCast(@alignCast(new_ptr));
+                    ri_ptr.* = new_ri;
+                }
+            },
+            .atomic_val => |*av_ptr| {
+                if (gc.isInNursery(@intFromPtr(av_ptr.*))) {
+                    const byte_size = @sizeOf(value.AtomicValue);
+                    const old_ptr: [*]u8 = @ptrCast(av_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_av: *value.AtomicValue = @ptrCast(@alignCast(new_ptr));
+                    av_ptr.* = new_av;
+                }
+            },
+            .spawn_val => |*handle_ptr| {
+                if (gc.isInNursery(@intFromPtr(handle_ptr.*))) {
+                    const byte_size = @sizeOf(value.SpawnHandle);
+                    const old_ptr: [*]u8 = @ptrCast(handle_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_handle: *value.SpawnHandle = @ptrCast(@alignCast(new_ptr));
+                    handle_ptr.* = new_handle;
+                }
+                if (handle_ptr.*.result) |*r| {
+                    self.evacuateValue(r);
+                }
+            },
+            .channel_val => |*ch_ptr| {
+                if (gc.isInNursery(@intFromPtr(ch_ptr.*))) {
+                    const byte_size = @sizeOf(value.ChannelValue);
+                    const old_ptr: [*]u8 = @ptrCast(ch_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_ch: *value.ChannelValue = @ptrCast(@alignCast(new_ptr));
+                    ch_ptr.* = new_ch;
+                }
+                // Channel buffer 中的值
+                if (ch_ptr.*.buffer.items.len > 0 and gc.isInNursery(@intFromPtr(ch_ptr.*.buffer.items.ptr))) {
+                    const byte_size = ch_ptr.*.buffer.items.len * @sizeOf(Value);
+                    const old_ptr: [*]u8 = @ptrCast(@constCast(ch_ptr.*.buffer.items.ptr));
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_items: [*]Value = @ptrCast(@alignCast(new_ptr));
+                    ch_ptr.*.buffer.items = new_items[0..ch_ptr.*.buffer.items.len];
+                }
+                for (ch_ptr.*.buffer.items) |*item| {
+                    self.evacuateValue(item);
+                }
+            },
+            .sender_val => |*sv_ptr| {
+                if (gc.isInNursery(@intFromPtr(sv_ptr.*))) {
+                    const byte_size = @sizeOf(value.SenderValue);
+                    const old_ptr: [*]u8 = @ptrCast(sv_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_sv: *value.SenderValue = @ptrCast(@alignCast(new_ptr));
+                    sv_ptr.* = new_sv;
+                }
+                // channel 指针
+                if (gc.isInNursery(@intFromPtr(sv_ptr.*.channel))) {
+                    const byte_size = @sizeOf(value.ChannelValue);
+                    const old_ptr: [*]u8 = @ptrCast(sv_ptr.*.channel);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_ch: *value.ChannelValue = @ptrCast(@alignCast(new_ptr));
+                    sv_ptr.*.channel = new_ch;
+                    // 疏散 channel 内部
+                    self.evacuateChannelValue(new_ch);
+                }
+            },
+            .receiver_val => |*rv_ptr| {
+                if (gc.isInNursery(@intFromPtr(rv_ptr.*))) {
+                    const byte_size = @sizeOf(value.ReceiverValue);
+                    const old_ptr: [*]u8 = @ptrCast(rv_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_rv: *value.ReceiverValue = @ptrCast(@alignCast(new_ptr));
+                    rv_ptr.* = new_rv;
+                }
+                // channel 指针
+                if (gc.isInNursery(@intFromPtr(rv_ptr.*.channel))) {
+                    const byte_size = @sizeOf(value.ChannelValue);
+                    const old_ptr: [*]u8 = @ptrCast(rv_ptr.*.channel);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+                    const new_ch: *value.ChannelValue = @ptrCast(@alignCast(new_ptr));
+                    rv_ptr.*.channel = new_ch;
+                    self.evacuateChannelValue(new_ch);
+                }
+            },
+        }
+    }
+
+    /// 疏散 ChannelValue 内部数据（buffer items）
+    fn evacuateChannelValue(self: *Evaluator, ch: *value.ChannelValue) void {
+        const gc = self.gc orelse return;
+        if (ch.buffer.items.len > 0 and gc.isInNursery(@intFromPtr(ch.buffer.items.ptr))) {
+            const byte_size = ch.buffer.items.len * @sizeOf(Value);
+            const old_ptr: [*]u8 = @ptrCast(@constCast(ch.buffer.items.ptr));
+            const new_ptr = gc.promoteToOldGen(old_ptr, byte_size);
+            const new_items: [*]Value = @ptrCast(@alignCast(new_ptr));
+            ch.buffer.items = new_items[0..ch.buffer.items.len];
+        }
+        for (ch.buffer.items) |*item| {
+            self.evacuateValue(item);
+        }
+    }
+
+    /// 疏散 StringHashMap：将 HashMap 内部存储和所有 key/value 从 nursery 晋升到老生代
+    /// HashMap 的内部结构不透明，采用重建策略：创建新 HashMap，逐条迁移
+    fn evacuateStringHashMap(self: *Evaluator, comptime V: type, map: *std.StringHashMap(V)) void {
+        const gc = self.gc orelse return;
+
+        // 检查是否有任何数据在 nursery 中
+        var has_nursery_data = false;
+        var iter = map.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (gc.isInNursery(@intFromPtr(key.ptr))) {
+                has_nursery_data = true;
+                break;
+            }
+        }
+
+        if (!has_nursery_data) {
+            // key 都不在 nursery，但 value 可能是 Value 类型需要疏散
+            iter = map.iterator();
+            while (iter.next()) |entry| {
+                self.evacuateHashMapValue(V, entry.value_ptr);
+            }
+            return;
+        }
+
+        // 有 nursery 数据：重建 HashMap
+        var new_map = std.StringHashMap(V).init(self.allocator);
+        errdefer new_map.deinit();
+
+        iter = map.iterator();
+        while (iter.next()) |entry| {
+            // 晋升 key
+            const old_key = entry.key_ptr.*;
+            var new_key: []const u8 = old_key;
+            if (gc.isInNursery(@intFromPtr(old_key.ptr))) {
+                const old_ptr: [*]u8 = @ptrCast(@constCast(old_key.ptr));
+                const new_ptr = gc.promoteToOldGen(old_ptr, old_key.len);
+                new_key = new_ptr[0..old_key.len];
+            }
+
+            // 晋升 value
+            var v = entry.value_ptr.*;
+            self.evacuateHashMapValue(V, &v);
+
+            new_map.put(new_key, v) catch {};
+        }
+
+        // 替换旧 map（不 deinit 旧 map，nursery 内存会整体重置）
+        map.* = new_map;
+    }
+
+    /// 疏散 HashMap 中的值（根据类型分派）
+    fn evacuateHashMapValue(self: *Evaluator, comptime V: type, val_ptr: *V) void {
+        if (V == Value) {
+            self.evacuateValue(val_ptr);
+        } else if (V == env.Variable) {
+            self.evacuateValue(&val_ptr.value);
+        }
+    }
+
+    /// 疏散 Environment：就地更新所有 nursery 指针
+    fn evacuateEnv(self: *Evaluator, environment: *Environment) void {
+        // 疏散 values HashMap
+        self.evacuateStringHashMap(env.Variable, &environment.values);
+
+        // 疏散父环境
+        if (environment.parent) |parent| {
+            self.evacuateEnv(parent);
+        }
+
+        // 疏散子环境
+        for (environment.children.items) |child| {
+            self.evacuateEnv(child);
         }
     }
 

@@ -9,23 +9,29 @@
 //! - 高效回收：函数式风格产生大量的短命对象，新生代频繁回收
 //!
 //! 设计：
-//! - 新生代（Nursery）：半空间复制收集，小对象快速 bump 分配（预留，需根集追踪）
+//! - 新生代（Nursery）：Promoting Nursery，bump 分配 + Minor GC 疏散到老生代
 //! - 老生代（Old Generation）：FreeList 分配器，支持单个 free + 块级 bump 分配
 //! - 大对象区（Large Object Space）：直接分配，标记-清除收集
-//! - 写屏障（Write Barrier）：记录老生代→新生代引用，避免全堆扫描
+//! - 写屏障（Write Barrier）：记录老生代→新生代引用（预留）
 //!
 //! 根集追踪（Shadow Stack 方案 B）：
 //! - Evaluator 维护 shadow_stack，在分配前 pushRoot 保护临时 Value
 //! - GC 提供 mark/sweep 基础设施，Evaluator 负责从根集追踪可达对象
 //! - mark_set 记录标记的堆地址，sweep 回收未标记的分配
+//!
+//! Minor GC（Promoting Nursery）：
+//! - 新生代使用 bump 分配，小对象快速分配
+//! - Minor GC 时，从根集追踪所有可达的 nursery 对象
+//! - 将活对象疏散（evacuate）到老生代，更新所有引用
+//! - 重置 nursery bump 指针，整个 nursery 空间可重用
 
 const std = @import("std");
 
 /// 大对象阈值：超过此大小的对象直接分配到大对象区
 const LARGE_OBJECT_THRESHOLD: usize = 4096;
 
-/// 新生代半空间大小（预留，当前未使用）
-const NURSERY_SEMI_SPACE_SIZE: usize = 256 * 1024;
+/// 新生代 bump 分配区域大小
+const NURSERY_SIZE: usize = 256 * 1024;
 
 /// 老生代 FreeList 分配器的块大小
 const OLD_GEN_BLOCK_SIZE: usize = 64 * 1024;
@@ -33,8 +39,11 @@ const OLD_GEN_BLOCK_SIZE: usize = 64 * 1024;
 /// FreeList 节点最小对齐
 const FREE_LIST_ALIGNMENT: usize = 16;
 
-/// GC 自动触发阈值增量
+/// GC 自动触发阈值增量（Major GC）
 const GC_COLLECT_THRESHOLD_INCREMENT: usize = 4 * 1024 * 1024;
+
+/// Nursery 使用率阈值，超过此比例触发 Minor GC
+const NURSERY_GC_THRESHOLD: f64 = 0.75;
 
 /// 老生代 FreeList 分配器
 /// 替代 ArenaAllocator，提供更精细的内存管理：
@@ -205,11 +214,12 @@ pub const OldGenAllocator = struct {
 pub const GarbageCollector = struct {
     backing_allocator: std.mem.Allocator,
 
-    /// 新生代 From/To 空间（预留，当前未使用）
-    nursery_from: []u8,
-    nursery_to: []u8,
+    /// 新生代 bump 分配区域
+    nursery: []u8,
+    /// 新生代 bump 分配偏移
     nursery_alloc_ptr: usize,
-    using_from: bool,
+    /// 是否正在执行 Minor GC（疏散期间禁止分配到 nursery）
+    in_minor_gc: bool,
 
     /// 老生代（FreeList 分配器，支持 individual free）
     old_generation: OldGenAllocator,
@@ -222,6 +232,7 @@ pub const GarbageCollector = struct {
 
     /// GC 统计
     gc_count: usize,
+    minor_gc_count: usize,
     total_allocated: usize,
     total_freed_by_gc: usize,
 
@@ -230,12 +241,19 @@ pub const GarbageCollector = struct {
     /// 标记集合：记录当前 GC 周期中标记为可达的堆地址
     mark_set: std.AutoHashMap(usize, void),
 
-    /// 分配注册表：记录所有通过 GC 分配器分配的内存块
-    /// 用于 sweep 阶段回收未标记的分配
+    /// 分配注册表：记录所有通过老生代分配器分配的内存块
+    /// 用于 Major GC sweep 阶段回收未标记的分配
+    /// 注意：nursery 分配不注册在此，由 Minor GC 疏散处理
     alloc_registry: std.ArrayList(AllocRecord),
 
     /// 上次 GC 后的分配阈值，超过此值触发下次 GC
     last_collect_threshold: usize,
+
+    // ── Minor GC 疏散基础设施 ──
+
+    /// 转发映射表：记录 nursery 对象疏散后的新地址
+    /// key = nursery 中的旧地址, value = 老生代中的新地址
+    forwarding_map: std.AutoHashMap(usize, usize),
 
     const LargeObject = struct {
         ptr: [*]u8,
@@ -250,25 +268,34 @@ pub const GarbageCollector = struct {
     };
 
     pub fn init(backing_allocator: std.mem.Allocator) !GarbageCollector {
+        // 分配 nursery bump 区域
+        const nursery = backing_allocator.alignedAlloc(u8, .@"16", NURSERY_SIZE) catch @as([]u8, &.{});
+
         return GarbageCollector{
             .backing_allocator = backing_allocator,
-            .nursery_from = &.{},
-            .nursery_to = &.{},
+            .nursery = nursery,
             .nursery_alloc_ptr = 0,
-            .using_from = true,
+            .in_minor_gc = false,
             .old_generation = OldGenAllocator.init(backing_allocator),
             .large_objects = std.ArrayList(*LargeObject).empty,
             .remembered_set = std.AutoHashMap(usize, std.ArrayList(usize)).init(backing_allocator),
             .gc_count = 0,
+            .minor_gc_count = 0,
             .total_allocated = 0,
             .total_freed_by_gc = 0,
             .mark_set = std.AutoHashMap(usize, void).init(backing_allocator),
             .alloc_registry = std.ArrayList(AllocRecord).empty,
             .last_collect_threshold = 0,
+            .forwarding_map = std.AutoHashMap(usize, usize).init(backing_allocator),
         };
     }
 
     pub fn deinit(self: *GarbageCollector) void {
+        // 释放 nursery
+        if (self.nursery.len > 0) {
+            self.backing_allocator.free(self.nursery);
+        }
+
         self.old_generation.deinit();
 
         for (self.large_objects.items) |obj| {
@@ -285,6 +312,7 @@ pub const GarbageCollector = struct {
 
         self.mark_set.deinit();
         self.alloc_registry.deinit(self.backing_allocator);
+        self.forwarding_map.deinit();
     }
 
     pub fn allocator(self: *GarbageCollector) std.mem.Allocator {
@@ -308,11 +336,23 @@ pub const GarbageCollector = struct {
             return self.allocLarge(len, alignment) orelse null;
         }
 
-        // 所有分配走老生代（FreeList 分配器）
+        // Minor GC 期间，所有分配走老生代（避免在疏散过程中分配到 nursery）
+        if (!self.in_minor_gc and self.nursery.len > 0) {
+            // 尝试 nursery bump 分配
+            const align_bytes = alignment.toByteUnits();
+            const aligned_offset = std.mem.alignForward(usize, self.nursery_alloc_ptr, align_bytes);
+            if (aligned_offset + len <= self.nursery.len) {
+                self.nursery_alloc_ptr = aligned_offset + len;
+                return self.nursery.ptr + aligned_offset;
+            }
+            // Nursery 满，回退到老生代（下次安全点会触发 Minor GC）
+        }
+
+        // 老生代分配（FreeList 分配器）
         const result = self.old_generation.allocator().rawAlloc(len, alignment, @returnAddress());
         if (result != null) {
             self.total_allocated += len;
-            // 注册分配到 alloc_registry
+            // 注册分配到 alloc_registry（用于 Major GC sweep）
             self.alloc_registry.append(self.backing_allocator, .{
                 .ptr = result.?,
                 .size = len,
@@ -431,34 +471,80 @@ pub const GarbageCollector = struct {
         self.last_collect_threshold = self.total_allocated;
     }
 
-    /// 检查是否应该触发 GC
+    /// 检查是否应该触发 Major GC
     pub fn shouldCollect(self: *const GarbageCollector) bool {
         return self.total_allocated >= self.last_collect_threshold + GC_COLLECT_THRESHOLD_INCREMENT;
     }
 
-    /// Minor GC：新生代垃圾回收（预留，当前无操作）
-    pub fn minorGC(self: *GarbageCollector) void {
-        self.gc_count += 1;
-        // 当前所有分配走老生代，nursery 无需回收
+    /// 检查是否应该触发 Minor GC（nursery 使用率超过阈值）
+    pub fn shouldMinorCollect(self: *const GarbageCollector) bool {
+        if (self.nursery.len == 0) return false;
+        const usage: f64 = @as(f64, @floatFromInt(self.nursery_alloc_ptr)) /
+            @as(f64, @floatFromInt(self.nursery.len));
+        return usage >= NURSERY_GC_THRESHOLD;
     }
 
-    /// Major GC：全堆垃圾回收（由 Evaluator 调用 clearMarks + mark + sweep）
-    pub fn majorGC(self: *GarbageCollector) void {
-        self.minorGC();
+    // ── Minor GC 疏散 API ──
 
-        // 清除大对象区中未标记的对象
-        var i: usize = 0;
-        while (i < self.large_objects.items.len) {
-            const obj = self.large_objects.items[i];
-            if (!obj.alive) {
-                self.backing_allocator.free(obj.ptr[0..obj.size]);
-                self.backing_allocator.destroy(obj);
-                _ = self.large_objects.swapRemove(i);
-            } else {
-                obj.alive = false;
-                i += 1;
-            }
+    /// 检查指针是否在新生代中
+    pub fn isInNursery(self: *const GarbageCollector, ptr: usize) bool {
+        if (self.nursery.len == 0) return false;
+        const start = @intFromPtr(self.nursery.ptr);
+        const end = start + self.nursery.len;
+        return ptr >= start and ptr < end;
+    }
+
+    /// 将 nursery 中的对象晋升（复制）到老生代
+    /// 如果该地址已有转发记录，直接返回新地址（不重复复制）
+    /// 返回晋升后的新地址
+    pub fn promoteToOldGen(self: *GarbageCollector, old_ptr: [*]u8, size: usize) [*]u8 {
+        const old_addr = @intFromPtr(old_ptr);
+
+        // 检查是否已经晋升过
+        if (self.forwarding_map.get(old_addr)) |new_addr| {
+            return @ptrFromInt(new_addr);
         }
+
+        // 在老生代分配空间
+        const new_ptr = self.old_generation.allocator().rawAlloc(size, .@"16", @returnAddress()) orelse {
+            // 分配失败，返回原地址（对象留在 nursery，下次 GC 会重试）
+            return old_ptr;
+        };
+
+        // 复制数据
+        @memcpy(new_ptr[0..size], old_ptr[0..size]);
+
+        // 注册到 alloc_registry（用于 Major GC sweep）
+        self.alloc_registry.append(self.backing_allocator, .{
+            .ptr = new_ptr,
+            .size = size,
+        }) catch {};
+
+        // 记录转发映射
+        self.forwarding_map.put(old_addr, @intFromPtr(new_ptr)) catch {};
+
+        self.total_allocated += size;
+        return new_ptr;
+    }
+
+    /// 查询转发映射：如果 nursery 地址已晋升，返回新地址；否则返回 null
+    pub fn getForwarding(self: *const GarbageCollector, old_addr: usize) ?usize {
+        return self.forwarding_map.get(old_addr);
+    }
+
+    /// 开始 Minor GC：设置标志，清空转发映射
+    pub fn beginMinorGC(self: *GarbageCollector) void {
+        self.in_minor_gc = true;
+        self.forwarding_map.clearRetainingCapacity();
+    }
+
+    /// 结束 Minor GC：重置 nursery，清除标志
+    pub fn endMinorGC(self: *GarbageCollector) void {
+        // 重置 nursery bump 指针
+        self.nursery_alloc_ptr = 0;
+        self.in_minor_gc = false;
+        self.forwarding_map.clearRetainingCapacity();
+        self.minor_gc_count += 1;
     }
 
     /// 写屏障（预留）
@@ -470,30 +556,28 @@ pub const GarbageCollector = struct {
         result.value_ptr.append(self.backing_allocator, new_gen_ptr) catch {};
     }
 
-    /// 检查指针是否在新生代中
-    pub fn isInNursery(self: *GarbageCollector, ptr: usize) bool {
-        const space = if (self.using_from) self.nursery_from else self.nursery_to;
-        const start = @intFromPtr(space.ptr);
-        const end = start + space.len;
-        return ptr >= start and ptr < end;
-    }
-
     /// 获取 GC 统计信息
     pub fn stats(self: *const GarbageCollector) GCStats {
         return GCStats{
             .gc_count = self.gc_count,
+            .minor_gc_count = self.minor_gc_count,
             .total_allocated = self.total_allocated,
             .total_freed_by_gc = self.total_freed_by_gc,
             .large_object_count = self.large_objects.items.len,
             .alloc_registry_count = self.alloc_registry.items.len,
+            .nursery_used = self.nursery_alloc_ptr,
+            .nursery_capacity = self.nursery.len,
         };
     }
 };
 
 pub const GCStats = struct {
     gc_count: usize,
+    minor_gc_count: usize,
     total_allocated: usize,
     total_freed_by_gc: usize,
     large_object_count: usize,
     alloc_registry_count: usize,
+    nursery_used: usize,
+    nursery_capacity: usize,
 };
