@@ -1540,6 +1540,28 @@ pub const TypeInferencer = struct {
                     const resolved_callee = self.resolve(callee_ty);
                     switch (resolved_callee.*) {
                         .fn_type => |ft| {
+                            // 文档 §2.8.1 默认柯里化：参数不足时返回剩余函数类型
+                            if (c.arguments.len < ft.params.len) {
+                                // 统一已提供的参数与前 N 个参数
+                                var all_ok = true;
+                                for (arg_types, 0..) |arg_ty, i| {
+                                    if (self.tryWidenUnify(ft.params[i], arg_ty)) |_| {} else |_| {
+                                        all_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (all_ok) {
+                                    self.checkCallSiteTraitBound(c.callee, c.location);
+                                    // 返回剩余参数的函数类型
+                                    const remaining_count = ft.params.len - c.arguments.len;
+                                    var remaining_params = try self.allocator.alloc(*Type, remaining_count);
+                                    for (0..remaining_count) |i| {
+                                        remaining_params[i] = ft.params[c.arguments.len + i];
+                                    }
+                                    return self.makeFnType(remaining_params, ft.return_type);
+                                }
+                            }
+                            // 参数数量匹配时，尝试自动提升
                             if (ft.params.len == arg_types.len) {
                                 var all_ok = true;
                                 for (ft.params, arg_types) |param_ty, arg_ty| {

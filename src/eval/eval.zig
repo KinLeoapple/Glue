@@ -716,7 +716,7 @@ pub const Evaluator = struct {
     pub fn callMain(self: *Evaluator) EvalResult!Value {
         const main_var = self.global_env.get("main") orelse return error.MissingMain;
         switch (main_var.value) {
-            .closure, .builtin => {
+            .closure, .builtin, .partial => {
                 return self.callFunction(main_var.value, &[_]Value{}, null);
             },
             else => return error.TypeMismatch,
@@ -1929,8 +1929,32 @@ pub const Evaluator = struct {
         _ = environment;
 
         switch (callee) {
+            .partial => |pa| {
+                // 合并已绑定参数和新参数
+                const total = pa.bound_args.len + args.len;
+
+                if (total == pa.remaining + pa.bound_args.len) {
+                    // 参数足够，执行原始函数
+                    var all_args = try self.allocator.alloc(Value, total);
+                    defer self.allocator.free(all_args);
+                    @memcpy(all_args[0..pa.bound_args.len], pa.bound_args);
+                    @memcpy(all_args[pa.bound_args.len..], args);
+                    return self.callFunction(pa.func, all_args, null);
+                } else if (total < pa.remaining + pa.bound_args.len) {
+                    // 参数仍不足，继续部分应用
+                    return self.createPartialApplication(pa.func, pa.bound_args, args, pa.remaining + pa.bound_args.len - total);
+                } else {
+                    // 参数过多
+                    return error.WrongArity;
+                }
+            },
             .closure => |initial_closure| {
-                if (args.len != initial_closure.params.len) {
+                // 默认柯里化：参数不足时返回部分应用
+                if (args.len < initial_closure.params.len) {
+                    return self.createPartialApplication(callee, &[_]Value{}, args, initial_closure.params.len - args.len);
+                }
+                // 参数过多
+                if (args.len > initial_closure.params.len) {
                     return error.WrongArity;
                 }
 
@@ -2098,6 +2122,7 @@ pub const Evaluator = struct {
             .error_val => |e| e.type_name,
             .throw_val => "Throw",
             .closure, .builtin => null,
+            .partial => "partial",
             .array_iterator => "array_iterator",
             .string_iterator => "string_iterator",
             .range_iterator => "range_iterator",
@@ -2895,6 +2920,26 @@ pub const Evaluator = struct {
     // 类型转换
     // ============================================================
 
+    /// 创建部分应用值 — 默认柯里化的核心
+    /// 文档 §2.8.1: val add5 = add(5)  // 部分应用
+    fn createPartialApplication(self: *Evaluator, func: Value, existing_bound: []const Value, new_args: []const Value, remaining: usize) EvalResult!Value {
+        const total_bound = existing_bound.len + new_args.len;
+        const bound_args = try self.allocator.alloc(Value, total_bound);
+        @memcpy(bound_args[0..existing_bound.len], existing_bound);
+        for (new_args, 0..) |arg, i| {
+            bound_args[existing_bound.len + i] = try arg.clone(self.allocator);
+        }
+
+        const pa = try self.allocator.create(value.PartialApplication);
+        pa.* = value.PartialApplication{
+            .func = try func.clone(self.allocator),
+            .bound_args = bound_args,
+            .remaining = remaining,
+            .allocator = self.allocator,
+        };
+        return Value{ .partial = pa };
+    }
+
     fn evalTypeCast(self: *Evaluator, tc: @TypeOf(@as(ast.Expr, undefined).type_cast), environment: *Environment) EvalResult!Value {
         const val = try self.evalExpr(tc.expr, environment);
         const type_name = switch (tc.target_type.*) {
@@ -3502,6 +3547,7 @@ fn structuralEquals(a: Value, b: Value) bool {
             return true;
         },
         .closure => |c| c == b.closure,
+        .partial => |pa| pa == b.partial, // 引用相等
         .builtin => |b_val| b_val.fn_ptr == b.builtin.fn_ptr and b_val.user_ctx == b.builtin.user_ctx,
         .error_val => |e| std.mem.eql(u8, e.type_name, b.error_val.type_name) and std.mem.eql(u8, e.message, b.error_val.message),
         .throw_val => |tv| tv == b.throw_val, // 引用相等

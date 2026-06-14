@@ -289,6 +289,11 @@ pub const Parser = struct {
             }
         }
 
+        // 如果解析过程中有错误，返回错误让调用者报告
+        if (self.errors.items.len > 0) {
+            return error.UnexpectedToken;
+        }
+
         return ast.Module{
             .name = module_name,
             .source_path = null,
@@ -422,29 +427,29 @@ pub const Parser = struct {
             };
         }
 
-        try self.reportError("期望顶层声明（fun/type/trait/impl/use/pack/val/var）");
+        try self.reportError("expected top-level declaration (fun/type/trait/impl/use/pack/val/var)");
         return error.UnexpectedToken;
     }
 
     /// 解析函数声明：fun name<T>(params) : ReturnType with Bounds { body }
     fn parseFunDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const fun_tok = self.advance(); // 消费 fun
-        const name_tok = try self.expect(.identifier, "期望函数名");
+        const name_tok = try self.expect(.identifier, "expected function name");
 
         // 类型参数
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
-            _ = self.expect(.gt, "期望 '>' 关闭类型参数列表") catch {};
+            _ = self.expect(.gt, "expected '>' to close type parameter list") catch {};
         }
 
         // 参数列表
         var params = std.ArrayList(ast.Param).empty;
-        _ = self.expect(.l_paren, "期望 '(' 开始参数列表") catch {};
+        _ = self.expect(.l_paren, "expected '(' to start parameter list") catch {};
         if (!self.check(.r_paren)) {
             try self.parseParamList(&params);
         }
-        _ = self.expect(.r_paren, "期望 ')' 关闭参数列表") catch {};
+        _ = self.expect(.r_paren, "expected ')' to close parameter list") catch {};
 
         // 返回类型
         var return_type: ?*ast.TypeNode = null;
@@ -482,16 +487,16 @@ pub const Parser = struct {
     /// 解析类型声明：type Name<T> = ...
     fn parseTypeDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const type_tok = self.advance(); // 消费 type
-        const name_tok = try self.expect(.identifier, "期望类型名");
+        const name_tok = try self.expect(.identifier, "expected type name");
 
         // 类型参数
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
-            _ = self.expect(.gt, "期望 '>' 关闭类型参数列表") catch {};
+            _ = self.expect(.gt, "expected '>' to close type parameter list") catch {};
         }
 
-        _ = self.expect(.eq, "期望 '=' 定义类型体") catch {};
+        _ = self.expect(.eq, "expected '=' to define type body") catch {};
 
         var def = try self.parseTypeDef();
 
@@ -585,7 +590,7 @@ pub const Parser = struct {
                 fields.deinit(self.allocator);
                 return null;
             };
-            _ = self.expect(.r_paren, "期望 ')' 关闭构造器字段") catch {
+            _ = self.expect(.r_paren, "expected ')' to close constructor fields") catch {
                 fields.deinit(self.allocator);
                 return null;
             };
@@ -627,7 +632,7 @@ pub const Parser = struct {
                     return null;
                 };
             }
-            _ = self.expect(.r_paren, "期望 ')' 关闭构造器字段") catch {
+            _ = self.expect(.r_paren, "expected ')' to close constructor fields") catch {
                 fields.deinit(self.allocator);
                 return null;
             };
@@ -644,7 +649,7 @@ pub const Parser = struct {
         }
 
         // 单个位置参数 — 解析为 newtype：Name(Type)
-        _ = self.expect(.r_paren, "期望 ')'") catch return null;
+        _ = self.expect(.r_paren, "expected ')'") catch return null;
         return ast.TypeDef{ .newtype = .{
             .name = name_tok.lexeme,
             .inner = first_type,
@@ -668,15 +673,15 @@ pub const Parser = struct {
                 while (self.matchToken(.comma)) {
                     // 支持尾随逗号：(name: str, age: i32,)
                     if (self.check(.r_paren)) break;
-                    const field_name = self.expect(.identifier, "期望字段名") catch return null;
-                    _ = self.expect(.colon, "期望 ':'") catch return null;
+                    const field_name = self.expect(.identifier, "expected field name") catch return null;
+                    _ = self.expect(.colon, "expected ':'") catch return null;
                     const field_ty = self.parseType() catch return null;
                     fields.append(self.allocator, .{
                         .name = field_name.lexeme,
                         .ty = field_ty,
                     }) catch return null;
                 }
-                _ = self.expect(.r_paren, "期望 ')'") catch return null;
+                _ = self.expect(.r_paren, "expected ')'") catch return null;
                 return ast.TypeDef{
                     .record = .{ .fields = fields.toOwnedSlice(self.allocator) catch return null },
                 };
@@ -694,7 +699,7 @@ pub const Parser = struct {
         _ = self.advance(); // 消费 (
         if (!self.check(.string_literal)) return null;
         const msg = self.advance();
-        _ = self.expect(.r_paren, "期望 ')'") catch return null;
+        _ = self.expect(.r_paren, "expected ')'") catch return null;
         // 去除字符串字面量的引号
         const raw_msg = if (msg.lexeme.len >= 2) msg.lexeme[1 .. msg.lexeme.len - 1] else msg.lexeme;
         return ast.TypeDef{
@@ -722,14 +727,14 @@ pub const Parser = struct {
 
     /// 解析构造器定义：Name(fields) [: ReturnType]
     fn parseConstructorDef(self: *Parser) ParserError!ast.ConstructorDef {
-        const name_tok = try self.expect(.identifier, "期望构造器名");
+        const name_tok = try self.expect(.identifier, "expected constructor name");
 
         var fields = std.ArrayList(ast.ConstructorField).empty;
         if (self.matchToken(.l_paren)) {
             if (!self.check(.r_paren)) {
                 try self.parseConstructorFieldList(&fields);
             }
-            _ = self.expect(.r_paren, "期望 ')' 关闭构造器字段") catch {};
+            _ = self.expect(.r_paren, "expected ')' to close constructor fields") catch {};
         }
 
         var return_type: ?*ast.TypeNode = null;
@@ -778,12 +783,12 @@ pub const Parser = struct {
     /// 解析 Trait 声明：trait Name<T>(Parents) { methods }
     fn parseTraitDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const trait_tok = self.advance(); // 消费 trait
-        const name_tok = try self.expect(.identifier, "期望 Trait 名");
+        const name_tok = try self.expect(.identifier, "expected trait name");
 
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
-            _ = self.expect(.gt, "期望 '>' 关闭类型参数列表") catch {};
+            _ = self.expect(.gt, "expected '>' to close type parameter list") catch {};
         }
 
         var parents = std.ArrayList(ast.TraitBound).empty;
@@ -791,13 +796,13 @@ pub const Parser = struct {
             if (!self.check(.r_paren)) {
                 try self.parseTraitBoundListInner(&parents);
             }
-            _ = self.expect(.r_paren, "期望 ')' 关闭父 Trait 列表") catch {};
+            _ = self.expect(.r_paren, "expected ')' to close parent trait list") catch {};
         }
 
         var associated_types = std.ArrayList(ast.AssociatedType).empty;
         var methods = std.ArrayList(ast.MethodDecl).empty;
 
-        _ = self.expect(.l_brace, "期望 '{' 开始 Trait 体") catch {};
+        _ = self.expect(.l_brace, "expected '{' to start trait body") catch {};
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             if (self.checkIdentifier("type")) {
                 try associated_types.append(self.allocator, try self.parseAssociatedType());
@@ -805,7 +810,7 @@ pub const Parser = struct {
                 try methods.append(self.allocator, try self.parseMethodDecl());
             }
         }
-        _ = self.expect(.r_brace, "期望 '}' 关闭 Trait 体") catch {};
+        _ = self.expect(.r_brace, "expected '}' to close trait body") catch {};
 
         return ast.Decl{
             .trait_decl = .{
@@ -823,7 +828,7 @@ pub const Parser = struct {
     /// 解析关联类型声明
     fn parseAssociatedType(self: *Parser) ParserError!ast.AssociatedType {
         const type_tok = self.advance(); // 消费 type
-        const name_tok = try self.expect(.identifier, "期望关联类型名");
+        const name_tok = try self.expect(.identifier, "expected associated type name");
 
         var kind: ?*ast.Kind = null;
         if (self.matchToken(.colon)) {
@@ -849,21 +854,21 @@ pub const Parser = struct {
             is_override = true;
         }
 
-        _ = self.expect(.kw_fun, "期望 'fun'") catch {};
-        const name_tok = try self.expect(.identifier, "期望方法名");
+        _ = self.expect(.kw_fun, "expected 'fun'") catch {};
+        const name_tok = try self.expect(.identifier, "expected method name");
 
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
-            _ = self.expect(.gt, "期望 '>'") catch {};
+            _ = self.expect(.gt, "expected '>'") catch {};
         }
 
         var params = std.ArrayList(ast.Param).empty;
-        _ = self.expect(.l_paren, "期望 '('") catch {};
+        _ = self.expect(.l_paren, "expected '('") catch {};
         if (!self.check(.r_paren)) {
             try self.parseParamList(&params);
         }
-        _ = self.expect(.r_paren, "期望 ')'") catch {};
+        _ = self.expect(.r_paren, "expected ')'") catch {};
 
         var return_type: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
@@ -877,9 +882,9 @@ pub const Parser = struct {
 
         if (self.matchToken(.eq)) {
             // 解析 TraitName.method_name
-            const trait_tok = try self.expect(.identifier, "期望委托的 Trait 名称");
-            _ = self.expect(.dot, "期望 '.'") catch {};
-            const method_tok = try self.expect(.identifier, "期望委托的方法名");
+            const trait_tok = try self.expect(.identifier, "expected delegate trait name");
+            _ = self.expect(.dot, "expected '.'") catch {};
+            const method_tok = try self.expect(.identifier, "expected delegate method name");
             delegate = ast.DelegateInfo{
                 .trait_name = trait_tok.lexeme,
                 .method_name = method_tok.lexeme,
@@ -904,12 +909,12 @@ pub const Parser = struct {
     /// 解析 Impl 声明：impl TraitName<Type> { methods }
     fn parseImplDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const impl_tok = self.advance(); // 消费 impl
-        const name_tok = try self.expect(.identifier, "期望 Trait 名");
+        const name_tok = try self.expect(.identifier, "expected trait name");
 
         var type_args = std.ArrayList(*ast.TypeNode).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeArgList(&type_args);
-            _ = self.expect(.gt, "期望 '>'") catch {};
+            _ = self.expect(.gt, "expected '>'") catch {};
         }
 
         // 提取目标类型名（如 impl Comparable<i32> 中的 "i32"）
@@ -924,12 +929,12 @@ pub const Parser = struct {
 
         var assoc_type_defs = std.ArrayList(ast.AssociatedTypeDef).empty;
         var methods = std.ArrayList(ast.MethodDecl).empty;
-        _ = self.expect(.l_brace, "期望 '{'") catch {};
+        _ = self.expect(.l_brace, "expected '{'") catch {};
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             // 解析关联类型定义：type Item = i32
             if (self.check(.kw_type)) {
                 const type_tok = self.advance();
-                const assoc_name = try self.expect(.identifier, "期望关联类型名称");
+                const assoc_name = try self.expect(.identifier, "expected associated type name");
                 if (self.matchToken(.eq)) {
                     const actual_type = try self.parseType();
                     try assoc_type_defs.append(self.allocator, ast.AssociatedTypeDef{
@@ -942,7 +947,7 @@ pub const Parser = struct {
                 try methods.append(self.allocator, try self.parseMethodDecl());
             }
         }
-        _ = self.expect(.r_brace, "期望 '}'") catch {};
+        _ = self.expect(.r_brace, "expected '}'") catch {};
 
         return ast.Decl{
             .impl_decl = .{
@@ -962,18 +967,18 @@ pub const Parser = struct {
         const use_tok = self.advance(); // 消费 use
 
         var module_path = std.ArrayList([]const u8).empty;
-        const first = try self.expect(.identifier, "期望模块名");
+        const first = try self.expect(.identifier, "expected module name");
         try module_path.append(self.allocator, first.lexeme);
 
         while (self.matchToken(.dot)) {
             if (self.check(.l_brace)) break;
-            const part = try self.expect(.identifier, "期望模块路径段");
+            const part = try self.expect(.identifier, "expected module path segment");
             try module_path.append(self.allocator, part.lexeme);
         }
 
         var items: ?[]ast.UseItem = null;
         if (self.matchToken(.dot)) {
-            _ = self.expect(.l_brace, "期望 '{'") catch {};
+            _ = self.expect(.l_brace, "expected '{'") catch {};
             var item_list = std.ArrayList(ast.UseItem).empty;
             if (!self.check(.r_brace)) {
                 try item_list.append(self.allocator, try self.parseUseItem());
@@ -982,7 +987,7 @@ pub const Parser = struct {
                     try item_list.append(self.allocator, try self.parseUseItem());
                 }
             }
-            _ = self.expect(.r_brace, "期望 '}'") catch {};
+            _ = self.expect(.r_brace, "expected '}'") catch {};
             items = try item_list.toOwnedSlice(self.allocator);
         }
 
@@ -998,10 +1003,10 @@ pub const Parser = struct {
 
     /// 解析单个 use 导入项
     fn parseUseItem(self: *Parser) ParserError!ast.UseItem {
-        const name = try self.expect(.identifier, "期望导入项名");
+        const name = try self.expect(.identifier, "expected import item name");
         var alias: ?[]const u8 = null;
         if (self.matchToken(.kw_as)) {
-            const alias_tok = try self.expect(.identifier, "期望别名");
+            const alias_tok = try self.expect(.identifier, "expected alias");
             alias = alias_tok.lexeme;
         }
         return ast.UseItem{
@@ -1013,7 +1018,7 @@ pub const Parser = struct {
     /// 解析 pack 声明：[pub] pack Name
     fn parsePackDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const pack_tok = self.advance(); // 消费 pack
-        const name_tok = try self.expect(.identifier, "期望 pack 名");
+        const name_tok = try self.expect(.identifier, "expected pack name");
 
         return ast.Decl{
             .pack_decl = .{
@@ -1036,7 +1041,7 @@ pub const Parser = struct {
     }
 
     fn parseTypeParam(self: *Parser) ParserError!ast.TypeParam {
-        const name_tok = try self.expect(.identifier, "期望类型参数名");
+        const name_tok = try self.expect(.identifier, "expected type parameter name");
 
         var kind: ?*ast.Kind = null;
         if (self.matchToken(.colon)) {
@@ -1081,10 +1086,10 @@ pub const Parser = struct {
         }
         if (self.matchToken(.l_paren)) {
             const kind = try self.parseKindArrow();
-            _ = self.expect(.r_paren, "期望 ')'") catch {};
+            _ = self.expect(.r_paren, "expected ')'") catch {};
             return kind;
         }
-        try self.reportError("期望 Kind（* 或箭头 Kind）");
+        try self.reportError("expected kind (* or arrow kind)");
         return error.UnexpectedToken;
     }
 
@@ -1105,7 +1110,7 @@ pub const Parser = struct {
             _ = self.matchToken(.kw_val);
         }
 
-        const name_tok = try self.expect(.identifier, "期望参数名");
+        const name_tok = try self.expect(.identifier, "expected parameter name");
 
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
@@ -1136,12 +1141,12 @@ pub const Parser = struct {
     }
 
     fn parseTraitBound(self: *Parser) ParserError!ast.TraitBound {
-        const name_tok = try self.expect(.identifier, "期望 Trait 名");
+        const name_tok = try self.expect(.identifier, "expected trait name");
 
         var type_args = std.ArrayList(*ast.TypeNode).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeArgList(&type_args);
-            _ = self.expect(.gt, "期望 '>'") catch {};
+            _ = self.expect(.gt, "expected '>'") catch {};
         }
 
         return ast.TraitBound{
@@ -1201,7 +1206,7 @@ pub const Parser = struct {
             return self.parseRecordType();
         }
 
-        const name_tok = try self.expect(.identifier, "期望类型名");
+        const name_tok = try self.expect(.identifier, "expected type name");
         const location = tokenLoc(name_tok);
 
         if (self.matchToken(.lt)) {
@@ -1210,7 +1215,7 @@ pub const Parser = struct {
             while (self.matchToken(.comma)) {
                 try args.append(self.allocator, try self.parseType());
             }
-            _ = self.expect(.gt, "期望 '>' 关闭类型参数") catch {};
+            _ = self.expect(.gt, "expected '>' to close type parameters") catch {};
 
             const generic_ty = try self.allocType(ast.TypeNode{
                 .generic = .{
@@ -1237,13 +1242,13 @@ pub const Parser = struct {
             var size: ?u64 = null;
             if (!self.check(.r_bracket)) {
                 // 解析大小表达式（必须是整数）
-                const size_tok = try self.expect(.int_literal, "期望数组大小");
+                const size_tok = try self.expect(.int_literal, "expected array size");
                 size = std.fmt.parseInt(u64, size_tok.lexeme, 10) catch {
                     try self.reportError("数组大小必须是正整数");
                     return error.UnexpectedToken;
                 };
             }
-            _ = self.expect(.r_bracket, "期望 ']'") catch {};
+            _ = self.expect(.r_bracket, "expected ']'") catch {};
             ty = try self.allocType(ast.TypeNode{
                 .array = .{
                     .location = arr_location,
@@ -1263,8 +1268,8 @@ pub const Parser = struct {
         var fields = std.ArrayList(ast.RecordFieldType).empty;
 
         if (!self.check(.r_paren)) {
-            const name_tok = try self.expect(.identifier, "期望字段名");
-            _ = self.expect(.colon, "期望 ':'") catch {};
+            const name_tok = try self.expect(.identifier, "expected field name");
+            _ = self.expect(.colon, "expected ':'") catch {};
             const ty = try self.parseType();
             try fields.append(self.allocator, .{
                 .name = name_tok.lexeme,
@@ -1273,8 +1278,8 @@ pub const Parser = struct {
 
             while (self.matchToken(.comma)) {
                 if (self.check(.r_paren)) break;
-                const field_name = try self.expect(.identifier, "期望字段名");
-                _ = self.expect(.colon, "期望 ':'") catch {};
+                const field_name = try self.expect(.identifier, "expected field name");
+                _ = self.expect(.colon, "expected ':'") catch {};
                 const field_ty = try self.parseType();
                 try fields.append(self.allocator, .{
                     .name = field_name.lexeme,
@@ -1283,7 +1288,7 @@ pub const Parser = struct {
             }
         }
 
-        _ = self.expect(.r_paren, "期望 ')'") catch {};
+        _ = self.expect(.r_paren, "expected ')'") catch {};
 
         return self.allocType(ast.TypeNode{
             .record = .{
@@ -1612,7 +1617,7 @@ pub const Parser = struct {
                 });
             } else if (self.matchToken(.question_dot)) {
                 const op_tok = self.previous();
-                const field_tok = try self.expect(.identifier, "期望字段或方法名");
+                const field_tok = try self.expect(.identifier, "expected field or method name");
 
                 if (self.check(.l_paren)) {
                     var args = std.ArrayList(*ast.Expr).empty;
@@ -1620,17 +1625,17 @@ pub const Parser = struct {
                     if (self.matchToken(.lt)) {
                         var ta = std.ArrayList(*ast.TypeNode).empty;
                         try self.parseTypeArgList(&ta);
-                        _ = self.expect(.gt, "期望 '>'") catch {};
+                        _ = self.expect(.gt, "expected '>'") catch {};
                         type_args = try ta.toOwnedSlice(self.allocator);
                     }
-                    _ = self.expect(.l_paren, "期望 '('") catch {};
+                    _ = self.expect(.l_paren, "expected '('") catch {};
                     if (!self.check(.r_paren)) {
                         try args.append(self.allocator, try self.parseExpr());
                         while (self.matchToken(.comma)) {
                             try args.append(self.allocator, try self.parseExpr());
                         }
                     }
-                    _ = self.expect(.r_paren, "期望 ')'") catch {};
+                    _ = self.expect(.r_paren, "expected ')'") catch {};
 
                     expr_node = try self.allocExpr(ast.Expr{
                         .safe_method_call = .{
@@ -1652,7 +1657,7 @@ pub const Parser = struct {
                 }
             } else if (self.matchToken(.dot)) {
                 const op_tok = self.previous();
-                const field_tok = try self.expect(.identifier, "期望字段或方法名");
+                const field_tok = try self.expect(.identifier, "expected field or method name");
 
                 if (self.check(.l_paren)) {
                     var args = std.ArrayList(*ast.Expr).empty;
@@ -1660,17 +1665,17 @@ pub const Parser = struct {
                     if (self.matchToken(.lt)) {
                         var ta = std.ArrayList(*ast.TypeNode).empty;
                         try self.parseTypeArgList(&ta);
-                        _ = self.expect(.gt, "期望 '>'") catch {};
+                        _ = self.expect(.gt, "expected '>'") catch {};
                         type_args = try ta.toOwnedSlice(self.allocator);
                     }
-                    _ = self.expect(.l_paren, "期望 '('") catch {};
+                    _ = self.expect(.l_paren, "expected '('") catch {};
                     if (!self.check(.r_paren)) {
                         try args.append(self.allocator, try self.parseExpr());
                         while (self.matchToken(.comma)) {
                             try args.append(self.allocator, try self.parseExpr());
                         }
                     }
-                    _ = self.expect(.r_paren, "期望 ')'") catch {};
+                    _ = self.expect(.r_paren, "expected ')'") catch {};
 
                     expr_node = try self.allocExpr(ast.Expr{
                         .method_call = .{
@@ -1691,6 +1696,17 @@ pub const Parser = struct {
                     });
                 }
             } else if (self.check(.l_paren)) {
+                // 文档 D69: 禁止链式调用 f(a)(b)
+                // 默认柯里化下，f(a)(b) 是语法错误，必须绑定中间结果
+                if (expr_node.* == .call) {
+                    const tok = self.peek();
+                    try self.errors.append(self.allocator, ParseError{
+                        .line = tok.line,
+                        .column = tok.column,
+                        .message = "chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first",
+                    });
+                    return error.UnexpectedToken;
+                }
                 const call_tok = self.peek();
                 var args = std.ArrayList(*ast.Expr).empty;
                 var type_args: ?[]*ast.TypeNode = null;
@@ -1706,14 +1722,14 @@ pub const Parser = struct {
                     }
                 }
 
-                _ = self.expect(.l_paren, "期望 '('") catch {};
+                _ = self.expect(.l_paren, "expected '('") catch {};
                 if (!self.check(.r_paren)) {
                     try args.append(self.allocator, try self.parseExpr());
                     while (self.matchToken(.comma)) {
                         try args.append(self.allocator, try self.parseExpr());
                     }
                 }
-                _ = self.expect(.r_paren, "期望 ')'") catch {};
+                _ = self.expect(.r_paren, "expected ')'") catch {};
 
                 expr_node = try self.allocExpr(ast.Expr{
                     .call = .{
@@ -1726,7 +1742,7 @@ pub const Parser = struct {
             } else if (self.matchToken(.l_bracket)) {
                 const bracket_tok = self.previous();
                 const index = try self.parseExpr();
-                _ = self.expect(.r_bracket, "期望 ']'") catch {};
+                _ = self.expect(.r_bracket, "expected ']'") catch {};
 
                 expr_node = try self.allocExpr(ast.Expr{
                     .index = .{
@@ -1865,7 +1881,7 @@ pub const Parser = struct {
             });
         }
 
-        try self.reportError("期望表达式");
+        try self.reportError("expected expression");
         return error.UnexpectedToken;
     }
 
@@ -2139,11 +2155,11 @@ pub const Parser = struct {
         const location = tokenLoc(fun_tok);
 
         var params = std.ArrayList(ast.Param).empty;
-        _ = self.expect(.l_paren, "期望 '('") catch {};
+        _ = self.expect(.l_paren, "expected '('") catch {};
         if (!self.check(.r_paren)) {
             try self.parseParamList(&params);
         }
-        _ = self.expect(.r_paren, "期望 ')'") catch {};
+        _ = self.expect(.r_paren, "expected ')'") catch {};
 
         const body_expr = try self.parseExpr();
         const body = ast.LambdaBody{ .block = body_expr };
@@ -2181,7 +2197,7 @@ pub const Parser = struct {
         const match_tok = self.previous();
         const scrutinee = try self.parseExpr();
 
-        _ = self.expect(.l_brace, "期望 '{'") catch {};
+        _ = self.expect(.l_brace, "expected '{'") catch {};
 
         var arms = std.ArrayList(ast.MatchArm).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
@@ -2199,7 +2215,7 @@ pub const Parser = struct {
             _ = self.matchToken(.comma); // 逗号可选
         }
 
-        _ = self.expect(.r_brace, "期望 '}'") catch {};
+        _ = self.expect(.r_brace, "expected '}'") catch {};
 
         return self.allocExpr(ast.Expr{
             .match = .{
@@ -2218,7 +2234,7 @@ pub const Parser = struct {
             guard = try self.parseExpr();
         }
 
-        _ = self.expect(.eq_gt, "期望 '=>'") catch {};
+        _ = self.expect(.eq_gt, "expected '=>'") catch {};
         const body = try self.parseExpr();
 
         return ast.MatchArm{
@@ -2271,7 +2287,7 @@ pub const Parser = struct {
 
     fn parseSelectExpr(self: *Parser) ParserError!*ast.Expr {
         const select_tok = self.previous();
-        _ = self.expect(.l_brace, "期望 '{'") catch {};
+        _ = self.expect(.l_brace, "expected '{'") catch {};
 
         var arms = std.ArrayList(ast.SelectArm).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
@@ -2279,7 +2295,7 @@ pub const Parser = struct {
             // 消费可选的逗号分隔符
             _ = self.matchToken(.comma);
         }
-        _ = self.expect(.r_brace, "期望 '}'") catch {};
+        _ = self.expect(.r_brace, "expected '}'") catch {};
 
         return self.allocExpr(ast.Expr{
             .select = .{
@@ -2292,10 +2308,10 @@ pub const Parser = struct {
     fn parseSelectArm(self: *Parser) ParserError!ast.SelectArm {
         if (self.checkIdentifier("timeout")) {
             const timeout_tok = self.advance();
-            _ = self.expect(.l_paren, "期望 '('") catch {};
+            _ = self.expect(.l_paren, "expected '('") catch {};
             const duration = try self.parseExpr();
-            _ = self.expect(.r_paren, "期望 ')'") catch {};
-            _ = self.expect(.eq_gt, "期望 '=>'") catch {};
+            _ = self.expect(.r_paren, "expected ')'") catch {};
+            _ = self.expect(.eq_gt, "expected '=>'") catch {};
             const body = try self.parseExpr();
             return ast.SelectArm{
                 .timeout = .{
@@ -2307,7 +2323,7 @@ pub const Parser = struct {
         }
 
         const channel_expr = try self.parseExpr();
-        _ = self.expect(.eq_gt, "期望 '=>'") catch {};
+        _ = self.expect(.eq_gt, "expected '=>'") catch {};
 
         const binding: ?[]const u8 = null;
 
@@ -2325,13 +2341,13 @@ pub const Parser = struct {
 
     fn parseMonadExpr(self: *Parser) ParserError!*ast.Expr {
         const at_tok = self.previous();
-        const type_tok = try self.expect(.identifier, "期望 Monad 类型名");
-        _ = self.expect(.l_brace, "期望 '{'") catch {};
+        const type_tok = try self.expect(.identifier, "expected monad type name");
+        _ = self.expect(.l_brace, "expected '{'") catch {};
 
         var bindings = std.ArrayList(ast.MonadBinding).empty;
         // 简化：暂不解析绑定列表
         const result = try self.parseExpr();
-        _ = self.expect(.r_brace, "期望 '}'") catch {};
+        _ = self.expect(.r_brace, "expected '}'") catch {};
 
         return self.allocExpr(ast.Expr{
             .monad_comprehension = .{
@@ -2345,13 +2361,13 @@ pub const Parser = struct {
 
     fn parseInlineTraitValue(self: *Parser) ParserError!*ast.Expr {
         const trait_tok = self.advance(); // 消费 trait
-        _ = self.expect(.l_brace, "期望 '{'") catch {};
+        _ = self.expect(.l_brace, "expected '{'") catch {};
 
         var methods = std.ArrayList(ast.MethodDecl).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             try methods.append(self.allocator, try self.parseMethodDecl());
         }
-        _ = self.expect(.r_brace, "期望 '}'") catch {};
+        _ = self.expect(.r_brace, "expected '}'") catch {};
 
         return self.allocExpr(ast.Expr{
             .inline_trait_value = .{
@@ -2372,7 +2388,7 @@ pub const Parser = struct {
                 try elements.append(self.allocator, try self.parseExpr());
             }
         }
-        _ = self.expect(.r_bracket, "期望 ']'") catch {};
+        _ = self.expect(.r_bracket, "expected ']'") catch {};
 
         return self.allocExpr(ast.Expr{
             .array_literal = .{
@@ -2409,7 +2425,7 @@ pub const Parser = struct {
             }
         }
 
-        _ = self.expect(.r_brace, "期望 '}'") catch {};
+        _ = self.expect(.r_brace, "expected '}'") catch {};
 
         return self.allocExpr(ast.Expr{
             .block = .{
@@ -2451,15 +2467,15 @@ pub const Parser = struct {
                 // 解析后续的 , field: val
                 while (self.matchToken(.comma)) {
                     if (self.check(.r_paren)) break;
-                    const field_name = try self.expect(.identifier, "期望字段名");
-                    _ = self.expect(.colon, "期望 ':'") catch {};
+                    const field_name = try self.expect(.identifier, "expected field name");
+                    _ = self.expect(.colon, "expected ':'") catch {};
                     const field_value = try self.parseExpr();
                     try updates.append(self.allocator, .{
                         .name = field_name.lexeme,
                         .value = field_value,
                     });
                 }
-                _ = self.expect(.r_paren, "期望 ')'") catch {};
+                _ = self.expect(.r_paren, "expected ')'") catch {};
                 return self.allocExpr(ast.Expr{
                     .record_extend = .{
                         .location = location,
@@ -2492,15 +2508,15 @@ pub const Parser = struct {
                         // 解析后续的 , field: val
                         while (self.matchToken(.comma)) {
                             if (self.check(.r_paren)) break;
-                            const field_name = try self.expect(.identifier, "期望字段名");
-                            _ = self.expect(.colon, "期望 ':'") catch {};
+                            const field_name = try self.expect(.identifier, "expected field name");
+                            _ = self.expect(.colon, "expected ':'") catch {};
                             const field_value = try self.parseExpr();
                             try updates.append(self.allocator, .{
                                 .name = field_name.lexeme,
                                 .value = field_value,
                             });
                         }
-                        _ = self.expect(.r_paren, "期望 ')'") catch {};
+                        _ = self.expect(.r_paren, "expected ')'") catch {};
                         return self.allocExpr(ast.Expr{
                             .record_extend = .{
                                 .location = location,
@@ -2509,15 +2525,15 @@ pub const Parser = struct {
                             },
                         });
                     }
-                    const field_name = try self.expect(.identifier, "期望字段名");
-                    _ = self.expect(.colon, "期望 ':'") catch {};
+                    const field_name = try self.expect(.identifier, "expected field name");
+                    _ = self.expect(.colon, "expected ':'") catch {};
                     const field_value = try self.parseExpr();
                     try fields.append(self.allocator, .{
                         .name = field_name.lexeme,
                         .value = field_value,
                     });
                 }
-                _ = self.expect(.r_paren, "期望 ')'") catch {};
+                _ = self.expect(.r_paren, "expected ')'") catch {};
                 return self.allocExpr(ast.Expr{
                     .record_literal = .{
                         .location = location,
@@ -2560,7 +2576,7 @@ pub const Parser = struct {
                     idx += 1;
                 }
             }
-            _ = self.expect(.r_paren, "期望 ')'") catch {};
+            _ = self.expect(.r_paren, "expected ')'") catch {};
             return self.allocExpr(ast.Expr{
                 .record_literal = .{
                     .location = location,
@@ -2570,7 +2586,7 @@ pub const Parser = struct {
         }
 
         // 单个表达式 = 括号表达式
-        _ = self.expect(.r_paren, "期望 ')'") catch {};
+        _ = self.expect(.r_paren, "expected ')'") catch {};
         return first_expr;
     }
 
@@ -2616,7 +2632,7 @@ pub const Parser = struct {
             _ = self.matchToken(.kw_val);
         }
 
-        const name_tok = try self.expect(.identifier, "期望参数名");
+        const name_tok = try self.expect(.identifier, "expected parameter name");
 
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
@@ -2642,9 +2658,9 @@ pub const Parser = struct {
             },
         });
 
-        _ = self.expect(.l_paren, "期望 '('") catch {};
+        _ = self.expect(.l_paren, "expected '('") catch {};
         const expr = try self.parseExpr();
-        _ = self.expect(.r_paren, "期望 ')'") catch {};
+        _ = self.expect(.r_paren, "expected ')'") catch {};
 
         return self.allocExpr(ast.Expr{
             .type_cast = .{
@@ -2767,7 +2783,7 @@ pub const Parser = struct {
                         try patterns.append(self.allocator, try self.parsePattern());
                     }
                 }
-                _ = self.expect(.r_paren, "期望 ')'") catch {};
+                _ = self.expect(.r_paren, "expected ')'") catch {};
                 return self.allocPattern(ast.Pattern{
                     .constructor = .{
                         .location = tokenLoc(name_tok),
@@ -2795,7 +2811,7 @@ pub const Parser = struct {
                         try patterns.append(self.allocator, try self.parsePattern());
                     }
                 }
-                _ = self.expect(.r_paren, "期望 ')'") catch {};
+                _ = self.expect(.r_paren, "expected ')'") catch {};
                 return self.allocPattern(ast.Pattern{
                     .constructor = .{
                         .location = tokenLoc(name_tok),
@@ -2812,7 +2828,7 @@ pub const Parser = struct {
             });
         }
 
-        try self.reportError("期望模式");
+        try self.reportError("expected pattern");
         return error.UnexpectedToken;
     }
 
@@ -2837,15 +2853,15 @@ pub const Parser = struct {
                     });
                     while (self.matchToken(.comma)) {
                         if (self.check(.r_paren)) break;
-                        const field_name = try self.expect(.identifier, "期望字段名");
-                        _ = self.expect(.colon, "期望 ':'") catch {};
+                        const field_name = try self.expect(.identifier, "expected field name");
+                        _ = self.expect(.colon, "expected ':'") catch {};
                         const field_pattern = try self.parsePattern();
                         try fields.append(self.allocator, .{
                             .name = field_name.lexeme,
                             .pattern = field_pattern,
                         });
                     }
-                    _ = self.expect(.r_paren, "期望 ')'") catch {};
+                    _ = self.expect(.r_paren, "expected ')'") catch {};
                     return self.allocPattern(ast.Pattern{
                         .record = .{
                             .location = location,
@@ -2876,7 +2892,7 @@ pub const Parser = struct {
                 idx += 1;
             }
         }
-        _ = self.expect(.r_paren, "期望 ')'") catch {};
+        _ = self.expect(.r_paren, "expected ')'") catch {};
 
         return self.allocPattern(ast.Pattern{
             .record = .{
@@ -2966,11 +2982,11 @@ pub const Parser = struct {
 
             // 解析参数列表
             var params = std.ArrayList(ast.Param).empty;
-            _ = self.expect(.l_paren, "期望 '('") catch {};
+            _ = self.expect(.l_paren, "expected '('") catch {};
             if (!self.check(.r_paren)) {
                 try self.parseParamList(&params);
             }
-            _ = self.expect(.r_paren, "期望 ')'") catch {};
+            _ = self.expect(.r_paren, "expected ')'") catch {};
 
             // 返回类型
             var return_type: ?*ast.TypeNode = null;
@@ -3005,11 +3021,11 @@ pub const Parser = struct {
         // Lambda 表达式：fun(params) { body }
         // fun 已被消费，需要解析参数和函数体
         var params = std.ArrayList(ast.Param).empty;
-        _ = self.expect(.l_paren, "期望 '('") catch {};
+        _ = self.expect(.l_paren, "expected '('") catch {};
         if (!self.check(.r_paren)) {
             try self.parseParamList(&params);
         }
-        _ = self.expect(.r_paren, "期望 ')'") catch {};
+        _ = self.expect(.r_paren, "expected ')'") catch {};
 
         const body_expr = try self.parseExpr();
         const body = ast.LambdaBody{ .block = body_expr };
@@ -3032,14 +3048,14 @@ pub const Parser = struct {
 
     fn parseValDecl(self: *Parser) ParserError!*ast.Stmt {
         const val_tok = self.previous();
-        const name_tok = try self.expect(.identifier, "期望变量名");
+        const name_tok = try self.expect(.identifier, "expected variable name");
 
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             type_annotation = try self.parseType();
         }
 
-        _ = self.expect(.eq, "期望 '='") catch {};
+        _ = self.expect(.eq, "expected '='") catch {};
         const value = try self.parseExpr();
 
         return self.allocStmt(ast.Stmt{
@@ -3054,14 +3070,14 @@ pub const Parser = struct {
 
     fn parseVarDecl(self: *Parser) ParserError!*ast.Stmt {
         const var_tok = self.previous();
-        const name_tok = try self.expect(.identifier, "期望变量名");
+        const name_tok = try self.expect(.identifier, "expected variable name");
 
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             type_annotation = try self.parseType();
         }
 
-        _ = self.expect(.eq, "期望 '='") catch {};
+        _ = self.expect(.eq, "expected '='") catch {};
         const value = try self.parseExpr();
 
         return self.allocStmt(ast.Stmt{
@@ -3138,8 +3154,8 @@ pub const Parser = struct {
 
     fn parseForStmt(self: *Parser) ParserError!*ast.Stmt {
         const for_tok = self.previous();
-        const name_tok = try self.expect(.identifier, "期望迭代变量名");
-        _ = self.expect(.kw_in, "期望 'in'") catch {};
+        const name_tok = try self.expect(.identifier, "expected iterator variable name");
+        _ = self.expect(.kw_in, "expected 'in'") catch {};
         const iterable = try self.parseExpr();
         const body = try self.parseExpr();
 

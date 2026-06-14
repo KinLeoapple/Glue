@@ -299,6 +299,29 @@ pub const RecordValue = struct {
     fields: std.StringHashMap(Value),
 };
 
+/// 部分应用值 — 默认柯里化的运行时表示
+/// 文档 §2.8.1: fun add(a: i32, b: i32) : i32 { a + b }
+///   val add5 = add(5)  // 部分应用，返回 PartialApplication
+///   add5(3)            // => 8
+pub const PartialApplication = struct {
+    /// 原始函数（闭包或内置函数）
+    func: Value,
+    /// 已绑定的参数
+    bound_args: []Value,
+    /// 剩余需要的参数数量
+    remaining: usize,
+    /// 分配器
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PartialApplication) void {
+        for (self.bound_args) |arg| {
+            var v = arg;
+            v.deinit(self.allocator);
+        }
+        self.allocator.free(self.bound_args);
+    }
+};
+
 /// 数组值
 pub const ArrayValue = struct {
     elements: []Value,
@@ -330,6 +353,9 @@ pub const Value = union(enum) {
 
     // 闭包
     closure: *Closure,
+
+    // 部分应用（默认柯里化）
+    partial: *PartialApplication,
 
     // 内建函数
     builtin: Builtin,
@@ -407,6 +433,10 @@ pub const Value = union(enum) {
             .newtype => {
                 // Newtype 值由 Evaluator 统一管理，不在此释放
             },
+            .partial => |pa| {
+                pa.deinit();
+                allocator.destroy(pa);
+            },
             .array_iterator, .string_iterator, .range_iterator => {
                 // 迭代器由 Evaluator 统一管理，不在此释放
             },
@@ -446,6 +476,20 @@ pub const Value = union(enum) {
                 } };
             },
             .closure => self,
+            .partial => |pa| {
+                const new_pa = try allocator.create(PartialApplication);
+                const new_args = try allocator.alloc(Value, pa.bound_args.len);
+                for (pa.bound_args, 0..) |arg, i| {
+                    new_args[i] = try arg.clone(allocator);
+                }
+                new_pa.* = PartialApplication{
+                    .func = try pa.func.clone(allocator),
+                    .bound_args = new_args,
+                    .remaining = pa.remaining,
+                    .allocator = allocator,
+                };
+                return Value{ .partial = new_pa };
+            },
             .adt => |av| {
                 const new_av = try allocator.create(AdtValue);
                 new_av.* = AdtValue{
@@ -564,6 +608,7 @@ pub const Value = union(enum) {
                 try buf.appendSlice(allocator, ")");
             },
             .closure => try buf.appendSlice(allocator, "<closure>"),
+            .partial => try buf.appendSlice(allocator, "<partial>"),
             .builtin => try buf.appendSlice(allocator, "<builtin>"),
             .adt => |av| {
                 try buf.print(allocator, "{s}", .{av.constructor});
@@ -627,6 +672,7 @@ pub const Value = union(enum) {
             .adt => |av| av == other.adt, // 引用相等
             .newtype => |nv| nv == other.newtype, // 引用相等
             .closure => |c| c == other.closure,
+            .partial => |pa| pa == other.partial,
             .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,
             .error_val => |e| std.mem.eql(u8, e.type_name, other.error_val.type_name) and std.mem.eql(u8, e.message, other.error_val.message),
             .throw_val => |tv| tv == other.throw_val, // 引用相等

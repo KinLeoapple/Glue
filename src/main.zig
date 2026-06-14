@@ -42,35 +42,37 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void
     var ev = eval.Evaluator.initWithIo(arena_alloc, io);
     defer ev.deinit();
 
-    executeSource(arena_alloc, &ev, io, source, filename);
+    const has_error = executeSource(arena_alloc, &ev, io, source, filename);
 
     // 文件模式下，查找并调用 main 入口函数
     // 文档 D13: 入口点默认 Main.main，约定优于配置
-    _ = ev.callMain() catch |err| switch (err) {
-        error.MissingMain => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("{s}: error: undefined entry point\n", .{filename}) catch {};
-            stderr_writer.flush() catch {};
-        },
-        error.GluePanic => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            const msg = ev.panic_message orelse "unknown error";
-            stderr_writer.interface.print("{s}: runtime panic: {s}\n", .{ filename, msg }) catch {};
-            stderr_writer.flush() catch {};
-            ev.panic_message = null;
-        },
-        else => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, @errorName(err) }) catch {};
-            if (ev.panic_message) |msg| {
-                stderr_writer.interface.print("  detail: {s}\n", .{msg}) catch {};
-            }
-            stderr_writer.flush() catch {};
-        },
-    };
+    if (!has_error) {
+        _ = ev.callMain() catch |err| switch (err) {
+            error.MissingMain => {
+                var err_buf: [4096]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                stderr_writer.interface.print("{s}: error: undefined entry point\n", .{filename}) catch {};
+                stderr_writer.flush() catch {};
+            },
+            error.GluePanic => {
+                var err_buf: [4096]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                const msg = ev.panic_message orelse "unknown error";
+                stderr_writer.interface.print("{s}: runtime panic: {s}\n", .{ filename, msg }) catch {};
+                stderr_writer.flush() catch {};
+                ev.panic_message = null;
+            },
+            else => {
+                var err_buf: [4096]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, @errorName(err) }) catch {};
+                if (ev.panic_message) |msg| {
+                    stderr_writer.interface.print("  detail: {s}\n", .{msg}) catch {};
+                }
+                stderr_writer.flush() catch {};
+            },
+        };
+    }
 }
 
 fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -106,7 +108,7 @@ fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
             if (trimmed.len == 0) continue;
             if (std.mem.eql(u8, trimmed, ":quit") or std.mem.eql(u8, trimmed, ":q")) break;
 
-            executeSource(allocator, &ev, io, trimmed, "<repl>");
+            _ = executeSource(allocator, &ev, io, trimmed, "<repl>");
         } else {
             break;
         }
@@ -116,7 +118,7 @@ fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
     try stdout_writer.flush();
 }
 
-fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, source: []const u8, filename: []const u8) void {
+fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, source: []const u8, filename: []const u8) bool {
     // 词法分析
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
@@ -126,7 +128,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         stderr_writer.interface.print("{s}: lexer error: {s}\n", .{ filename, @errorName(err) }) catch {};
         stderr_writer.flush() catch {};
-        return;
+        return true;
     };
     defer allocator.free(tokens);
 
@@ -135,18 +137,39 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
     defer p.deinit();
 
     const module = p.parseModule(filename) catch {
-        // 模块解析失败，尝试解析为表达式
+        // 模块解析失败，保存错误信息
+        const module_errors = allocator.dupe(parser.ParseError, p.errors.items) catch {
+            // 内存不足，直接报告表达式解析错误
+            p.errors.clearRetainingCapacity();
+            p.current = 0;
+            const expr_fallback = p.parseExpr() catch {
+                var err_buf: [4096]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                for (p.errors.items) |e| {
+                    stderr_writer.interface.print("{s}:{d}:{d}: parse error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
+                }
+                stderr_writer.flush() catch {};
+                return true;
+            };
+            _ = expr_fallback;
+            return true;
+        };
+        defer allocator.free(module_errors);
+
+        // 尝试解析为表达式
         p.errors.clearRetainingCapacity();
         p.current = 0;
 
         const expr = p.parseExpr() catch {
+            // 表达式解析也失败，报告所有模块解析错误
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            for (p.errors.items) |e| {
+            const errors_to_report = if (module_errors.len > 0) module_errors else p.errors.items;
+            for (errors_to_report) |e| {
                 stderr_writer.interface.print("{s}:{d}:{d}: parse error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
             }
             stderr_writer.flush() catch {};
-            return;
+            return true;
         };
 
         // 求值表达式
@@ -158,14 +181,14 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
                 stderr_writer.interface.print("{s}: panic: {s}\n", .{ filename, msg }) catch {};
                 stderr_writer.flush() catch {};
                 ev.panic_message = null;
-                return;
+                return true;
             },
             else => {
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
                 stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, @errorName(err) }) catch {};
                 stderr_writer.flush() catch {};
-                return;
+                return true;
             },
         };
 
@@ -173,14 +196,14 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         if (result != .unit) {
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(allocator);
-            result.format(&buf, allocator, false) catch return;
+            result.format(&buf, allocator, false) catch return true;
             buf.append(allocator, '\n') catch {};
             var out_buf: [4096]u8 = undefined;
             var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
             stdout_writer.interface.print("{s}", .{buf.items}) catch {};
             stdout_writer.flush() catch {};
         }
-        return;
+        return false;
     };
 
     // 求值模块
@@ -192,12 +215,14 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             stderr_writer.interface.print("{s}: runtime panic: {s}\n", .{ filename, msg }) catch {};
             stderr_writer.flush() catch {};
             ev.panic_message = null;
+            return true;
         },
         error.CircularDependency => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
             stderr_writer.interface.print("{s}: error: circular module dependency\n", .{filename}) catch {};
             stderr_writer.flush() catch {};
+            return true;
         },
         else => {
             var err_buf: [4096]u8 = undefined;
@@ -207,8 +232,10 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
                 stderr_writer.interface.print("  detail: {s}\n", .{msg}) catch {};
             }
             stderr_writer.flush() catch {};
+            return true;
         },
     };
+    return false;
 }
 
 fn setWindowsConsoleUtf8() void {
