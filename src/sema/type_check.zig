@@ -748,6 +748,16 @@ pub const TypeInferencer = struct {
         return t;
     }
 
+    /// 创建泛型类型（如 Spawn<T>, Channel<T>, Atomic<T> 等）
+    pub fn makeGenericType(self: *TypeInferencer, name: []const u8, args: []const *Type) !*Type {
+        const owned_name = try self.allocator.dupe(u8, name);
+        const owned_args = try self.allocator.dupe(*Type, args);
+        const t = try self.allocator.create(Type);
+        t.* = Type{ .generic_type = .{ .name = owned_name, .args = owned_args } };
+        try self.types.append(self.allocator, t);
+        return t;
+    }
+
     /// 创建可空类型
     pub fn makeNullableType(self: *TypeInferencer, inner: *Type) !*Type {
         const t = try self.allocator.create(Type);
@@ -1541,15 +1551,20 @@ pub const TypeInferencer = struct {
                             return scheme.ty;
                         }
                     }
-                    return self.instantiate(scheme);
+                    const ty = try self.instantiate(scheme);
+                    return ty;
                 }
                 self.addErrorAt(.unbound_variable, id.location.line, id.location.column, "undefined variable '{s}'", .{id.name});
                 return self.freshTypeVar() catch error.OutOfMemory;
             },
 
             .binary => |bin| {
-                const left_ty = try self.inferExpr(bin.left, env);
-                const right_ty = try self.inferExpr(bin.right, env);
+                var left_ty = try self.inferExpr(bin.left, env);
+                var right_ty = try self.inferExpr(bin.right, env);
+
+                // 文档 §3.4.2: Atomic<T> 透明操作 — 算术/比较运算时自动解包
+                left_ty = self.unwrapAtomic(left_ty);
+                right_ty = self.unwrapAtomic(right_ty);
 
                 switch (bin.op) {
                     .add, .sub, .mul, .div, .mod => {
@@ -1958,8 +1973,28 @@ pub const TypeInferencer = struct {
                 return val_ty;
             },
 
-            // 尚未实现的表达式类型
-            .spawn, .lazy, .select, .monad_comprehension, .inline_trait_value => {
+            // 尚未实现的表达式类型 — Phase 4 并发原语类型推断
+            .spawn => |sp| {
+                const body_ty = try self.inferExpr(sp.body, env);
+                // 返回 Spawn<T>，其中 T = body 类型
+                return self.makeGenericType("Spawn", &[_]*Type{body_ty});
+            },
+            .atomic_expr => |ae| {
+                const val_ty = try self.inferExpr(ae.value, env);
+                // 返回 Atomic<T>，其中 T = 值类型
+                return self.makeGenericType("Atomic", &[_]*Type{val_ty});
+            },
+            .select => |sel| {
+                // select 返回第一个就绪分支体的类型
+                if (sel.arms.len > 0) {
+                    switch (sel.arms[0]) {
+                        .receive => |recv_arm| return try self.inferExpr(recv_arm.body, env),
+                        .timeout => |timeout_arm| return try self.inferExpr(timeout_arm.body, env),
+                    }
+                }
+                return self.freshTypeVar();
+            },
+            .lazy, .monad_comprehension, .inline_trait_value => {
                 return self.freshTypeVar();
             },
         };
@@ -2529,6 +2564,21 @@ pub const TypeInferencer = struct {
             }) catch return;
             self.builtin_names.put(self.allocator.dupe(u8, "Iterator") catch return, {}) catch return;
         }
+
+        // Phase 4 并发原语内建函数类型签名
+
+        // channel : (i32) -> Channel<T>  — 简化为 forall a. (i32) -> Channel<a>
+        {
+            const t_var = self.freshTypeVar() catch return;
+            const params = self.allocator.alloc(*Type, 1) catch return;
+            params[0] = self.makeType(.i32_type) catch return;
+            const ret_ty = self.makeGenericType("Channel", &[_]*Type{t_var}) catch return;
+            const fn_ty = self.makeFnType(params, ret_ty) catch return;
+            const qvars = self.allocator.alloc(usize, 1) catch return;
+            qvars[0] = t_var.type_var.id;
+            env.define("channel", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("channel");
+        }
     }
 
     /// 将名称注册到 builtin_names 集合
@@ -2542,6 +2592,18 @@ pub const TypeInferencer = struct {
     /// 检查名称是否为内建函数/构造器
     fn isBuiltinName(self: *TypeInferencer, name: []const u8) bool {
         return self.builtin_names.contains(name);
+    }
+
+    /// 文档 §3.4.2: Atomic<T> 透明操作 — 解包 Atomic<T> 为 T
+    /// 在算术/比较运算、函数参数等上下文中自动调用
+    fn unwrapAtomic(self: *TypeInferencer, ty: *Type) *Type {
+        const resolved = self.resolve(ty);
+        if (resolved.* == .generic_type) {
+            if (std.mem.eql(u8, resolved.generic_type.name, "Atomic") and resolved.generic_type.args.len == 1) {
+                return resolved.generic_type.args[0];
+            }
+        }
+        return ty;
     }
 
     /// 文档 2.7.6: Orphan Instance 禁止

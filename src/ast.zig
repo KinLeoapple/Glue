@@ -669,6 +669,14 @@ pub const Expr = union(enum) {
         body: *Expr,
     },
 
+    /// atomic 表达式：atomic expr
+    /// 文档 §3.4.1: 在堆上创建原子值，返回 Atomic<T> 引用
+    /// atomic 是关键字前缀表达式，不是函数调用
+    atomic_expr: struct {
+        location: SourceLocation,
+        value: *Expr,
+    },
+
     /// lazy 表达式：lazy expr
     /// 延迟求值，首次访问时计算并缓存
     lazy: struct {

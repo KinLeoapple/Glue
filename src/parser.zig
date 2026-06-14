@@ -1818,6 +1818,10 @@ pub const Parser = struct {
             return self.parseLazyExpr();
         }
 
+        if (self.matchToken(.kw_atomic)) {
+            return self.parseAtomicExpr();
+        }
+
         if (self.matchToken(.kw_select)) {
             return self.parseSelectExpr();
         }
@@ -1845,7 +1849,7 @@ pub const Parser = struct {
             return self.parseParenOrRecordOrLambda();
         }
 
-        if (self.check(.identifier) or self.check(.kw_val) or self.check(.kw_var)) {
+        if (self.check(.identifier) or self.check(.kw_val) or self.check(.kw_var) or self.check(.kw_channel)) {
             // 检查类型转换：Name(expr) 其中 Name 是内建类型
             if (isBuiltinType(self.peek().lexeme)) {
                 if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_paren) {
@@ -2226,7 +2230,9 @@ pub const Parser = struct {
 
     fn parseSpawnExpr(self: *Parser) ParserError!*ast.Expr {
         const spawn_tok = self.previous();
-        const body = try self.parseExpr();
+        // spawn body 只解析一个基本表达式（通常是 block），
+        // 不贪婪消费后续的方法调用/字段访问（如 .await()）
+        const body = try self.parsePrimary();
 
         return self.allocExpr(ast.Expr{
             .spawn = .{
@@ -2248,6 +2254,21 @@ pub const Parser = struct {
         });
     }
 
+    /// atomic expr — 解析为 atomic_expr AST 节点
+    /// 文档 §3.4.1: `atomic expr` 在堆上创建原子值，返回 Atomic<T> 引用
+    /// atomic 是关键字前缀表达式，不是函数调用
+    fn parseAtomicExpr(self: *Parser) ParserError!*ast.Expr {
+        const atomic_tok = self.previous();
+        const value_expr = try self.parsePrimary();
+
+        return self.allocExpr(ast.Expr{
+            .atomic_expr = .{
+                .location = tokenLoc(atomic_tok),
+                .value = value_expr,
+            },
+        }) catch return error.OutOfMemory;
+    }
+
     fn parseSelectExpr(self: *Parser) ParserError!*ast.Expr {
         const select_tok = self.previous();
         _ = self.expect(.l_brace, "期望 '{'") catch {};
@@ -2255,6 +2276,8 @@ pub const Parser = struct {
         var arms = std.ArrayList(ast.SelectArm).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             try arms.append(self.allocator, try self.parseSelectArm());
+            // 消费可选的逗号分隔符
+            _ = self.matchToken(.comma);
         }
         _ = self.expect(.r_brace, "期望 '}'") catch {};
 
@@ -3261,6 +3284,7 @@ fn getExprLocation(expr: *const ast.Expr) ast.SourceLocation {
         .match => |e| e.location,
         .type_cast => |e| e.location,
         .spawn => |e| e.location,
+        .atomic_expr => |e| e.location,
         .lazy => |e| e.location,
         .select => |e| e.location,
         .monad_comprehension => |e| e.location,

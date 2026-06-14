@@ -1,6 +1,7 @@
 //! Atomic<T> 原子操作
 //!
 //! Phase 4 实现：并发原语
+//! 文档 §3.4: Atomic<T> 是跨协程共享原子状态的唯一方式，替代 Arc<T>
 
 const std = @import("std");
 

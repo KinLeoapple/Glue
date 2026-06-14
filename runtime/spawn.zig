@@ -1,6 +1,7 @@
-//! Spawn<T> 实现（基于 Zio Task）
+//! Spawn<T> 实现（基于 std.Thread）
 //!
 //! Phase 4 实现：并发原语
+//! 文档 §3.3: Spawn 是线性类型，必须被 await() 或 cancel() 消费
 
 const std = @import("std");
 

@@ -183,6 +183,8 @@ pub const Evaluator = struct {
     scan_line_buf: std.ArrayList(u8),
     /// scan_line_buf 中当前读取位置
     scan_line_pos: usize = 0,
+    /// 已创建的 SpawnHandle 列表（用于 deinit 时释放）
+    spawn_handles: std.ArrayList(*value.SpawnHandle),
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
@@ -204,6 +206,7 @@ pub const Evaluator = struct {
             .registered_impls = std.StringHashMap(void).init(allocator),
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
             .scan_line_buf = std.ArrayList(u8).empty,
+            .spawn_handles = std.ArrayList(*value.SpawnHandle).empty,
         };
         ev.registerBuiltins();
         return ev;
@@ -230,6 +233,7 @@ pub const Evaluator = struct {
             .registered_impls = std.StringHashMap(void).init(allocator),
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
             .scan_line_buf = std.ArrayList(u8).empty,
+            .spawn_handles = std.ArrayList(*value.SpawnHandle).empty,
         };
         ev.registerBuiltins();
         return ev;
@@ -328,6 +332,16 @@ pub const Evaluator = struct {
             self.allocator.destroy(state);
         }
         self.scan_line_buf.deinit(self.allocator);
+        // 等待所有 spawn 协程完成并释放 handle
+        for (self.spawn_handles.items) |handle| {
+            // 等待线程完成
+            if (handle.thread) |t| {
+                t.join();
+            }
+            handle.deinit();
+            self.allocator.destroy(handle);
+        }
+        self.spawn_handles.deinit(self.allocator);
     }
 
     /// 触发 Glue panic — 不可捕获，但允许 defer 执行
@@ -338,6 +352,24 @@ pub const Evaluator = struct {
     fn gluePanic(self: *Evaluator, message: []const u8) EvalResult!Value {
         self.panic_message = message;
         return error.GluePanic;
+    }
+
+    /// 创建 SpawnStatus ADT 值
+    fn makeSpawnStatus(self: *Evaluator, status: value.SpawnStatus) EvalResult!Value {
+        const name = switch (status) {
+            .Pending => "Pending",
+            .Running => "Running",
+            .Completed => "Completed",
+            .Cancelled => "Cancelled",
+            .Failed => "Failed",
+        };
+        const av = try self.allocator.create(value.AdtValue);
+        av.* = value.AdtValue{
+            .type_name = "SpawnStatus",
+            .constructor = name,
+            .fields = &[_]value.AdtField{},
+        };
+        return Value{ .adt = av };
     }
 
     // ============================================================
@@ -432,6 +464,15 @@ pub const Evaluator = struct {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
                 return ev.builtinScanln(args);
+            }
+        }.call } }, true) catch {};
+
+        // channel — 创建 CSP 通道
+        self.global_env.define("channel", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
+                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                return ev.builtinChannel(args);
             }
         }.call } }, true) catch {};
 
@@ -672,6 +713,24 @@ pub const Evaluator = struct {
             if (line_opt == null) return Value.null_val;
             // 循环回去从新行中提取 token
         }
+    }
+
+    // ============================================================
+    // 并发原语内建函数
+    // ============================================================
+
+    /// channel(capacity) — 创建 CSP 通道
+    /// 文档 §3.5: val ch = channel<i32>(0) 无缓冲，channel<i32>(10) 缓冲区大小 10
+    fn builtinChannel(self: *Evaluator, args: []const Value) EvalResult!Value {
+        if (args.len != 1) return error.WrongArity;
+        const io = self.io orelse return self.gluePanic("channel: no IO context");
+        const cap = switch (args[0]) {
+            .integer => |iv| @as(usize, @intCast(iv.value)),
+            else => return error.TypeMismatch,
+        };
+        const ch = try self.allocator.create(value.ChannelValue);
+        ch.* = value.ChannelValue.init(self.allocator, cap, io);
+        return Value{ .channel_val = ch };
     }
 
     // ============================================================
@@ -1459,9 +1518,10 @@ pub const Evaluator = struct {
             .block => |blk| return self.evalBlock(blk, environment),
             .match => |m| self.evalMatch(m, environment),
             .type_cast => |tc| self.evalTypeCast(tc, environment),
-            .spawn => error.UnsupportedOperation,
+            .spawn => |sp| self.evalSpawn(sp, environment),
+            .atomic_expr => |ae| self.evalAtomicExpr(ae, environment),
             .lazy => error.UnsupportedOperation,
-            .select => error.UnsupportedOperation,
+            .select => |sel| self.evalSelect(sel, environment),
             .monad_comprehension => error.UnsupportedOperation,
             .inline_trait_value => error.UnsupportedOperation,
         };
@@ -1533,6 +1593,10 @@ pub const Evaluator = struct {
 
     fn evalIdentifier(self: *Evaluator, id: @TypeOf(@as(ast.Expr, undefined).identifier), environment: *Environment) EvalResult!Value {
         if (environment.get(id.name)) |v| {
+            // Atomic<T> 透明操作：读取时使用 atomic_load
+            if (v.value == .atomic_val) {
+                return v.value.atomic_val.load();
+            }
             return v.value;
         }
         // 构建包含变量名的错误消息（需要分配以超过 panic_message 的生命周期）
@@ -1989,7 +2053,25 @@ pub const Evaluator = struct {
     }
 
     fn evalMethodCall(self: *Evaluator, mc: @TypeOf(@as(ast.Expr, undefined).method_call), environment: *Environment) EvalResult!Value {
-        const object = try self.evalExpr(mc.object, environment);
+        // 文档 §3.4.2: Atomic<T> 方法调用时，不进行透明 atomic_load
+        // 需要获取原始 Atomic/Channel/Sender/Receiver 值作为方法接收者
+        const object = switch (mc.object.*) {
+            .identifier => |id| raw_val: {
+                if (environment.get(id.name)) |v| {
+                    // 对并发原语类型，直接返回原始值（不做透明解包）
+                    if (v.value == .atomic_val or v.value == .channel_val or v.value == .sender_val or v.value == .receiver_val or v.value == .spawn_val) {
+                        break :raw_val v.value;
+                    }
+                }
+                break :raw_val try self.evalExpr(mc.object, environment);
+            },
+            .field_access => |fa| raw_val: {
+                const obj = try self.evalExpr(fa.object, environment);
+                const field_val = self.accessField(obj, fa.field) catch break :raw_val try self.evalExpr(mc.object, environment);
+                break :raw_val field_val;
+            },
+            else => try self.evalExpr(mc.object, environment),
+        };
 
         // 求值参数
         var args = std.ArrayList(Value).empty;
@@ -2048,6 +2130,11 @@ pub const Evaluator = struct {
             .array_iterator => "array_iterator",
             .string_iterator => "string_iterator",
             .range_iterator => "range_iterator",
+            .atomic_val => "Atomic",
+            .spawn_val => "Spawn",
+            .channel_val => "Channel",
+            .sender_val => "Sender",
+            .receiver_val => "Receiver",
         };
     }
 
@@ -2365,6 +2452,125 @@ pub const Evaluator = struct {
             }
         }
 
+        // ============================================================
+        // 并发原语方法分派
+        // ============================================================
+
+        // Spawn<T> 方法
+        if (object == .spawn_val) {
+            const handle = object.spawn_val;
+            if (std.mem.eql(u8, method, "await")) {
+                if (args.len != 0) return error.WrongArity;
+                // 阻塞等待完成
+                handle.mutex.lockUncancelable(handle.io);
+                while (handle.status.load(.seq_cst) == .Pending or handle.status.load(.seq_cst) == .Running) {
+                    handle.condition.waitUncancelable(handle.io, &handle.mutex);
+                }
+                const result = handle.result;
+                handle.consumed.store(true, .seq_cst);
+                handle.mutex.unlock(handle.io);
+                // 等待线程结束
+                if (handle.thread) |t| {
+                    t.join();
+                    handle.thread = null;
+                }
+                if (handle.status.load(.seq_cst) == .Failed) {
+                    return self.gluePanic("spawn: coroutine failed");
+                }
+                return result orelse Value.unit;
+            }
+            if (std.mem.eql(u8, method, "cancel")) {
+                if (args.len != 0) return error.WrongArity;
+                handle.mutex.lockUncancelable(handle.io);
+                handle.status.store(.Cancelled, .seq_cst);
+                handle.consumed.store(true, .seq_cst);
+                handle.condition.broadcast(handle.io);
+                handle.mutex.unlock(handle.io);
+                return Value.unit;
+            }
+            if (std.mem.eql(u8, method, "status")) {
+                if (args.len != 0) return error.WrongArity;
+                const s = handle.status.load(.seq_cst);
+                // 返回 SpawnStatus ADT 值
+                return self.makeSpawnStatus(s);
+            }
+            if (std.mem.eql(u8, method, "result")) {
+                if (args.len != 0) return error.WrongArity;
+                handle.mutex.lockUncancelable(handle.io);
+                if (handle.status.load(.seq_cst) == .Completed) {
+                    const r = handle.result;
+                    handle.mutex.unlock(handle.io);
+                    return r orelse Value.null_val;
+                }
+                handle.mutex.unlock(handle.io);
+                return Value.null_val;
+            }
+        }
+
+        // Channel<T> 方法
+        if (object == .channel_val) {
+            const ch = object.channel_val;
+            if (std.mem.eql(u8, method, "send")) {
+                if (args.len != 1) return error.WrongArity;
+                const ok = ch.send(args[0]) catch return error.OutOfMemory;
+                if (!ok) return self.gluePanic("channel: send on closed channel");
+                return Value.unit;
+            }
+            if (std.mem.eql(u8, method, "recv")) {
+                if (args.len != 0) return error.WrongArity;
+                const val = ch.recv();
+                return val orelse Value.null_val;
+            }
+            if (std.mem.eql(u8, method, "close")) {
+                if (args.len != 0) return error.WrongArity;
+                ch.close();
+                return Value.unit;
+            }
+        }
+
+        // Sender<T> 方法
+        if (object == .sender_val) {
+            const sv = object.sender_val;
+            if (std.mem.eql(u8, method, "send")) {
+                if (args.len != 1) return error.WrongArity;
+                const ok = sv.channel.send(args[0]) catch return error.OutOfMemory;
+                if (!ok) return self.gluePanic("channel: send on closed channel");
+                return Value.unit;
+            }
+            if (std.mem.eql(u8, method, "close")) {
+                if (args.len != 0) return error.WrongArity;
+                sv.channel.close();
+                return Value.unit;
+            }
+        }
+
+        // Receiver<T> 方法
+        if (object == .receiver_val) {
+            const rv = object.receiver_val;
+            if (std.mem.eql(u8, method, "recv")) {
+                if (args.len != 0) return error.WrongArity;
+                const val = rv.channel.recv();
+                return val orelse Value.null_val;
+            }
+        }
+
+        // Atomic<T> 方法
+        if (object == .atomic_val) {
+            const av = object.atomic_val;
+            if (std.mem.eql(u8, method, "cas")) {
+                if (args.len != 2) return error.WrongArity;
+                const expected = try args[0].asInteger();
+                const new_val = try args[1].asInteger();
+                return Value{ .boolean = av.cas(expected, new_val) };
+            }
+            if (std.mem.eql(u8, method, "swap")) {
+                if (args.len != 1) return error.WrongArity;
+                const new_val = try args[0].asInteger();
+                const old_raw = av.xchg(new_val);
+                return Value{ .integer = IntValue{ .value = old_raw, .type_tag = value.atomicTypeToIntType(av.type_tag) } };
+            }
+        }
+
         return error.UndefinedVariable;
     }
 
@@ -2415,6 +2621,22 @@ pub const Evaluator = struct {
                 return error.UndefinedVariable;
             },
             else => return error.TypeMismatch,
+            // Channel 方向类型字段访问
+            .channel_val => |cv| {
+                if (std.mem.eql(u8, field, "sender")) {
+                    const sv = try self.allocator.create(value.SenderValue);
+                    sv.* = value.SenderValue{ .channel = cv };
+                    cv.ref();
+                    return Value{ .sender_val = sv };
+                }
+                if (std.mem.eql(u8, field, "receiver")) {
+                    const rv = try self.allocator.create(value.ReceiverValue);
+                    rv.* = value.ReceiverValue{ .channel = cv };
+                    cv.ref();
+                    return Value{ .receiver_val = rv };
+                }
+                return error.UndefinedVariable;
+            },
         }
     }
 
@@ -2794,6 +3016,159 @@ pub const Evaluator = struct {
         errdefer buf.deinit(self.allocator);
         try val.format(&buf, self.allocator, false);
         return Value{ .string = try buf.toOwnedSlice(self.allocator) };
+    }
+
+    // ============================================================
+    // spawn 表达式求值
+    // ============================================================
+
+    /// spawn 表达式求值
+    /// 文档 §3.2: spawn 创建协程，立即返回 Spawn<T>，不阻塞当前代码
+    /// 文档 §3.2.1: spawn 闭包深拷贝捕获，Atomic<T> 例外（浅拷贝）
+    /// 当前实现：同步执行（保留深拷贝语义），避免 Evaluator 线程安全问题
+    /// TODO: 后续引入线程安全 Evaluator 或 per-thread Evaluator 后启用真正并发
+    fn evalSpawn(self: *Evaluator, sp: @TypeOf(@as(ast.Expr, undefined).spawn), environment: *Environment) EvalResult!Value {
+        const io = self.io orelse return self.gluePanic("spawn: no IO context");
+
+        // 深拷贝捕获环境（Atomic 例外）
+        const cloned_env = try environment.deepCopy(self.allocator, null);
+
+        // 创建 SpawnHandle
+        const handle = try self.allocator.create(value.SpawnHandle);
+        handle.* = value.SpawnHandle.init(self.allocator, io);
+
+        // 同步执行 spawn body（在当前线程中执行）
+        handle.status.store(.Running, .seq_cst);
+
+        const result = self.evalExpr(sp.body, cloned_env) catch {
+            handle.status.store(.Failed, .seq_cst);
+            return Value{ .spawn_val = handle };
+        };
+
+        handle.mutex.lockUncancelable(handle.io);
+        handle.result = result;
+        handle.status.store(.Completed, .seq_cst);
+        handle.condition.broadcast(handle.io);
+        handle.mutex.unlock(handle.io);
+
+        // 注册 spawn handle 到 evaluator
+        try self.spawn_handles.append(self.allocator, handle);
+
+        return Value{ .spawn_val = handle };
+    }
+
+    // ============================================================
+    // atomic 表达式求值
+    // ============================================================
+
+    /// atomic 表达式求值
+    /// 文档 §3.4.1: atomic expr 在堆上创建原子值，返回 Atomic<T> 引用
+    /// atomic 是关键字前缀表达式，不是函数调用
+    fn evalAtomicExpr(self: *Evaluator, ae: @TypeOf(@as(ast.Expr, undefined).atomic_expr), environment: *Environment) EvalResult!Value {
+        const val = try self.evalExpr(ae.value, environment);
+        const av = try self.allocator.create(value.AtomicValue);
+        switch (val) {
+            .integer => |iv| {
+                av.* = value.AtomicValue.initInt(iv.value, value.intTypeToAtomicType(iv.type_tag));
+            },
+            .float => |f| {
+                av.* = value.AtomicValue.initFloat(f, .f64);
+            },
+            .boolean => |b| {
+                av.* = value.AtomicValue.initBool(b);
+            },
+            .char_val => |c| {
+                av.* = value.AtomicValue.initChar(c);
+            },
+            else => return self.gluePanic("atomic: unsupported type"),
+        }
+        return Value{ .atomic_val = av };
+    }
+
+    // ============================================================
+    // select 表达式求值
+    // ============================================================
+
+    /// select 表达式求值
+    /// 文档 §3.5.3: 多路复用通道操作
+    fn evalSelect(self: *Evaluator, sel: @TypeOf(@as(ast.Expr, undefined).select), environment: *Environment) EvalResult!Value {
+        // 简化实现：轮询所有接收分支，执行第一个就绪的
+        // 如果没有就绪分支且有超时，执行超时分支
+        // 否则阻塞等待
+
+        // 辅助函数：从 channel_expr 中提取 Channel 值
+        // 文档 §3.5.3: select arm 语法为 ch.recv() => body
+        // channel_expr 可能是方法调用 ch.recv()，需要提取 ch 而非执行 recv
+        const getChannelFromExpr = struct {
+            fn run(ev: *Evaluator, expr: *const ast.Expr, eval_env: *Environment) EvalResult!*value.ChannelValue {
+                // 如果是方法调用 ch.recv()，提取 ch
+                if (expr.* == .method_call) {
+                    const mc = expr.method_call;
+                    if (std.mem.eql(u8, mc.method, "recv")) {
+                        const obj = try ev.evalExpr(mc.object, eval_env);
+                        return switch (obj) {
+                            .channel_val => |cv| cv,
+                            .receiver_val => |rv| rv.channel,
+                            .sender_val => |sv| sv.channel,
+                            else => error.TypeMismatch,
+                        };
+                    }
+                }
+                // 否则直接求值，期望得到 Channel/Sender/Receiver
+                const val = try ev.evalExpr(expr, eval_env);
+                return switch (val) {
+                    .channel_val => |cv| cv,
+                    .receiver_val => |rv| rv.channel,
+                    .sender_val => |sv| sv.channel,
+                    else => error.TypeMismatch,
+                };
+            }
+        }.run;
+
+        for (sel.arms) |arm| {
+            switch (arm) {
+                .receive => |recv_arm| {
+                    const ch = try getChannelFromExpr(self, recv_arm.channel_expr, environment);
+                    // 非阻塞尝试接收
+                    if (ch.tryRecv()) |val| {
+                        if (recv_arm.binding) |binding_name| {
+                            try environment.define(binding_name, val, true);
+                        }
+                        return self.evalExpr(recv_arm.body, environment);
+                    }
+                },
+                .timeout => continue,
+            }
+        }
+
+        // 轮询未命中，检查超时分支
+        for (sel.arms) |arm| {
+            switch (arm) {
+                .timeout => |timeout_arm| {
+                    return self.evalExpr(timeout_arm.body, environment);
+                },
+                .receive => continue,
+            }
+        }
+
+        // 没有超时分支，阻塞等待第一个就绪的通道
+        for (sel.arms) |arm| {
+            switch (arm) {
+                .receive => |recv_arm| {
+                    const ch = try getChannelFromExpr(self, recv_arm.channel_expr, environment);
+                    const val = ch.recv();
+                    if (val) |v| {
+                        if (recv_arm.binding) |binding_name| {
+                            try environment.define(binding_name, v, true);
+                        }
+                        return self.evalExpr(recv_arm.body, environment);
+                    }
+                },
+                .timeout => continue,
+            }
+        }
+
+        return Value.unit;
     }
 
     // ============================================================
@@ -3177,6 +3552,11 @@ fn structuralEquals(a: Value, b: Value) bool {
         .array_iterator => |ai| ai == b.array_iterator, // 引用相等
         .string_iterator => |si| si == b.string_iterator, // 引用相等
         .range_iterator => |ri| ri == b.range_iterator, // 引用相等
+        .atomic_val => |av| av == b.atomic_val, // 引用相等
+        .spawn_val => |sh| sh == b.spawn_val, // 引用相等
+        .channel_val => |cv| cv == b.channel_val, // 引用相等
+        .sender_val => |sv| sv == b.sender_val, // 引用相等
+        .receiver_val => |rv| rv == b.receiver_val, // 引用相等
     };
 }
 

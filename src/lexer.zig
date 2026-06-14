@@ -70,6 +70,8 @@ pub const TokenType = enum {
     kw_channel,
     /// select
     kw_select,
+    /// atomic
+    kw_atomic,
     /// loop
     kw_loop,
     /// for
@@ -1171,6 +1173,7 @@ fn keywordType(text: []const u8) TokenType {
     if (std.mem.eql(u8, text, "spawn")) return .kw_spawn;
     if (std.mem.eql(u8, text, "channel")) return .kw_channel;
     if (std.mem.eql(u8, text, "select")) return .kw_select;
+    if (std.mem.eql(u8, text, "atomic")) return .kw_atomic;
     if (std.mem.eql(u8, text, "loop")) return .kw_loop;
     if (std.mem.eql(u8, text, "for")) return .kw_for;
     if (std.mem.eql(u8, text, "in")) return .kw_in;

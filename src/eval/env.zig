@@ -97,6 +97,11 @@ pub const Environment = struct {
             if (!v.is_mutable) {
                 return error.ImmutableAssignment;
             }
+            // Atomic<T> 透明操作：写入时使用 atomic_store
+            if (v.value == .atomic_val) {
+                v.value.atomic_val.store(val);
+                return;
+            }
             v.value = val;
             return;
         }
@@ -117,5 +122,48 @@ pub const Environment = struct {
         };
         try self.children.append(self.allocator, child);
         return child;
+    }
+
+    /// 深拷贝环境 — 用于 spawn 闭包捕获
+    /// 创建完全独立的环境链，递归深拷贝所有变量值和父链
+    /// spawn 捕获语义：深拷贝隔离，Atomic<T> 例外（浅拷贝）
+    /// `atomic_values` 参数：如果非 null，其中的 Atomic 值将浅拷贝而非深拷贝
+    pub fn deepCopy(self: *Environment, allocator: std.mem.Allocator, atomic_values: ?[]const *value.AtomicValue) !*Environment {
+        const new_env = try allocator.create(Environment);
+        new_env.* = Environment{
+            .values = std.StringHashMap(Variable).init(allocator),
+            .parent = null,
+            .children = std.ArrayList(*Environment).empty,
+            .allocator = allocator,
+        };
+        // 深拷贝当前环境的所有变量
+        var iter = self.values.iterator();
+        while (iter.next()) |entry| {
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            const cloned_val = try deepCloneValue(entry.value_ptr.value, allocator, atomic_values);
+            try new_env.values.put(key, Variable{
+                .value = cloned_val,
+                .is_mutable = entry.value_ptr.is_mutable,
+                .is_public = entry.value_ptr.is_public,
+            });
+        }
+        // 递归深拷贝父环境链
+        if (self.parent) |parent| {
+            new_env.parent = try parent.deepCopy(allocator, atomic_values);
+        }
+        return new_env;
+    }
+
+    /// 深拷贝值 — Atomic<T> 浅拷贝例外
+    fn deepCloneValue(val: value.Value, allocator: std.mem.Allocator, atomic_values: ?[]const *value.AtomicValue) !value.Value {
+        _ = atomic_values; // 目前未使用，保留接口用于后续优化
+        // 如果是 Atomic 值，浅拷贝（共享底层内存 + 增加引用计数）
+        if (val == .atomic_val) {
+            val.atomic_val.ref();
+            return val;
+        }
+        // 如果 atomic_values 列表中有匹配的指针，也需要浅拷贝
+        // 这里主要处理 closure 等复合类型内部可能包含 Atomic 的情况
+        return try val.clone(allocator);
     }
 };

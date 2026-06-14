@@ -173,6 +173,358 @@ pub const Closure = struct {
 };
 
 // ============================================================
+// 并发原语值（Phase 4）
+// ============================================================
+
+/// Atomic<T> 值 — 跨协程共享原子状态
+/// 文档 §3.4: Atomic<T> 是引用类型，atomic expr 创建堆上原子值
+/// T 限制为原始类型：i8..i128, u8..u128, f32, f64, bool, char
+pub const AtomicValue = struct {
+    /// 原子存储的值 — 使用 i128 统一表示所有整数类型
+    /// f64/bool/char 也通过 @bitCast 存储为 i128
+    data: std.atomic.Value(i128),
+    /// 引用计数 — 归零时自动释放
+    ref_count: std.atomic.Value(usize),
+    /// 类型标签 — 确定如何解释 data
+    type_tag: AtomicType,
+
+    pub const AtomicType = enum {
+        i8, i16, i32, i64, i128,
+        u8, u16, u32, u64, u128,
+        f32, f64,
+        bool,
+        char,
+    };
+
+    /// 从整数值创建 AtomicValue
+    pub fn initInt(int_val: i128, tag: AtomicType) AtomicValue {
+        return AtomicValue{
+            .data = std.atomic.Value(i128).init(int_val),
+            .ref_count = std.atomic.Value(usize).init(1),
+            .type_tag = tag,
+        };
+    }
+
+    /// 从浮点值创建 AtomicValue
+    pub fn initFloat(float_val: f64, tag: AtomicType) AtomicValue {
+        const bits: u64 = @bitCast(float_val);
+        return AtomicValue{
+            .data = std.atomic.Value(i128).init(@as(i128, @intCast(bits))),
+            .ref_count = std.atomic.Value(usize).init(1),
+            .type_tag = tag,
+        };
+    }
+
+    /// 从布尔值创建 AtomicValue
+    pub fn initBool(b: bool) AtomicValue {
+        return AtomicValue{
+            .data = std.atomic.Value(i128).init(if (b) 1 else 0),
+            .ref_count = std.atomic.Value(usize).init(1),
+            .type_tag = .bool,
+        };
+    }
+
+    /// 从字符值创建 AtomicValue
+    pub fn initChar(c: u21) AtomicValue {
+        return AtomicValue{
+            .data = std.atomic.Value(i128).init(@as(i128, @intCast(c))),
+            .ref_count = std.atomic.Value(usize).init(1),
+            .type_tag = .char,
+        };
+    }
+
+    /// 加载当前值到 Value
+    pub fn load(self: *AtomicValue) Value {
+        const raw = self.data.load(.seq_cst);
+        return switch (self.type_tag) {
+            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128 => Value{ .integer = IntValue{ .value = raw, .type_tag = atomicTypeToIntType(self.type_tag) } },
+            .f32, .f64 => Value{ .float = @bitCast(@as(u64, @intCast(raw))) },
+            .bool => Value{ .boolean = raw != 0 },
+            .char => Value{ .char_val = @intCast(raw) },
+        };
+    }
+
+    /// 原子存储 Value
+    pub fn store(self: *AtomicValue, val: Value) void {
+        const raw = valueToAtomicRaw(val, self.type_tag);
+        self.data.store(raw, .seq_cst);
+    }
+
+    /// 原子 fetch_add
+    pub fn fetchAdd(self: *AtomicValue, operand: i128) i128 {
+        return self.data.fetchAdd(operand, .seq_cst);
+    }
+
+    /// 原子 fetch_sub
+    pub fn fetchSub(self: *AtomicValue, operand: i128) i128 {
+        return self.data.fetchSub(operand, .seq_cst);
+    }
+
+    /// 原子 fetch_mul (使用 CAS 循环，因为没有硬件 fetch_mul)
+    pub fn fetchMul(self: *AtomicValue, operand: i128) i128 {
+        while (true) {
+            const current = self.data.load(.seq_cst);
+            const new_val = current * operand;
+            if (self.data.cmpxchgStrong(current, new_val, .seq_cst, .seq_cst)) |_| {
+                continue;
+            }
+            return current;
+        }
+    }
+
+    /// 原子 fetch_and
+    pub fn fetchAnd(self: *AtomicValue, operand: i128) i128 {
+        return self.data.fetchAnd(operand, .seq_cst);
+    }
+
+    /// 原子 fetch_or
+    pub fn fetchOr(self: *AtomicValue, operand: i128) i128 {
+        return self.data.fetchOr(operand, .seq_cst);
+    }
+
+    /// CAS (compare-and-swap)，返回是否成功
+    pub fn cas(self: *AtomicValue, expected: i128, new: i128) bool {
+        return self.data.cmpxchgStrong(expected, new, .seq_cst, .seq_cst) == null;
+    }
+
+    /// 原子交换，返回旧值
+    pub fn xchg(self: *AtomicValue, new: i128) i128 {
+        return self.data.swap(new, .seq_cst);
+    }
+
+    /// 增加引用计数
+    pub fn ref(self: *AtomicValue) void {
+        _ = self.ref_count.fetchAdd(1, .seq_cst);
+    }
+
+    /// 减少引用计数，归零返回 true
+    pub fn unref(self: *AtomicValue) bool {
+        return self.ref_count.fetchSub(1, .seq_cst) == 1;
+    }
+};
+
+pub fn atomicTypeToIntType(at: AtomicValue.AtomicType) IntType {
+    return switch (at) {
+        .i8 => .i8, .i16 => .i16, .i32 => .i32, .i64 => .i64, .i128 => .i128,
+        .u8 => .u8, .u16 => .u16, .u32 => .u32, .u64 => .u64, .u128 => .u128,
+        else => .i32, // f32/f64/bool/char 不应该走到这里
+    };
+}
+
+pub fn intTypeToAtomicType(it: IntType) AtomicValue.AtomicType {
+    return switch (it) {
+        .i8 => .i8, .i16 => .i16, .i32 => .i32, .i64 => .i64, .i128 => .i128,
+        .u8 => .u8, .u16 => .u16, .u32 => .u32, .u64 => .u64, .u128 => .u128,
+    };
+}
+
+pub fn valueToAtomicRaw(val: Value, tag: AtomicValue.AtomicType) i128 {
+    _ = tag;
+    return switch (val) {
+        .integer => |iv| iv.value,
+        .float => |f| @as(i128, @intCast(@as(u64, @bitCast(f)))),
+        .boolean => |b| if (b) 1 else 0,
+        .char_val => |c| @as(i128, @intCast(c)),
+        else => 0,
+    };
+}
+
+/// SpawnStatus 枚举值 — 协程状态
+pub const SpawnStatus = enum(u8) {
+    Pending,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+};
+
+/// SpawnHandle — Spawn<T> 的运行时表示
+/// 文档 §3.3: Spawn 是线性类型，必须被 await() 或 cancel() 消费
+pub const SpawnHandle = struct {
+    status: std.atomic.Value(SpawnStatus),
+    /// 协程执行结果（完成后存储）
+    result: ?Value,
+    /// 协程线程
+    thread: ?std.Thread,
+    /// 互斥锁 — 保护 result 和状态转换
+    mutex: std.Io.Mutex,
+    /// 条件变量 — await 阻塞等待
+    condition: std.Io.Condition,
+    /// 是否已被消费（await 或 cancel）
+    consumed: std.atomic.Value(bool),
+    /// 分配器
+    allocator: std.mem.Allocator,
+    /// IO 上下文
+    io: std.Io,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) SpawnHandle {
+        return SpawnHandle{
+            .status = std.atomic.Value(SpawnStatus).init(.Pending),
+            .result = null,
+            .thread = null,
+            .mutex = std.Io.Mutex.init,
+            .condition = std.Io.Condition.init,
+            .consumed = std.atomic.Value(bool).init(false),
+            .allocator = allocator,
+            .io = io,
+        };
+    }
+
+    pub fn deinit(self: *SpawnHandle) void {
+        if (self.result) |r| {
+            var v = r;
+            v.deinit(self.allocator);
+        }
+    }
+};
+
+/// Channel 值 — CSP 通信通道
+/// 文档 §3.5: 通过 channel 通信，不通过共享内存通信
+pub const ChannelValue = struct {
+    /// 内部缓冲区
+    buffer: std.ArrayList(Value),
+    /// 缓冲区容量（0 = 同步/无缓冲）
+    capacity: usize,
+    /// 是否已关闭
+    closed: std.atomic.Value(bool),
+    /// 互斥锁 — 保护缓冲区和关闭状态
+    mutex: std.Io.Mutex,
+    /// 条件变量 — recv 等待数据
+    not_empty: std.Io.Condition,
+    /// 条件变量 — send 等待空间
+    not_full: std.Io.Condition,
+    /// 分配器
+    allocator: std.mem.Allocator,
+    /// 引用计数
+    ref_count: std.atomic.Value(usize),
+    /// IO 上下文
+    io: std.Io,
+
+    pub fn init(allocator: std.mem.Allocator, cap: usize, io: std.Io) ChannelValue {
+        return ChannelValue{
+            .buffer = std.ArrayList(Value).empty,
+            .capacity = cap,
+            .closed = std.atomic.Value(bool).init(false),
+            .mutex = std.Io.Mutex.init,
+            .not_empty = std.Io.Condition.init,
+            .not_full = std.Io.Condition.init,
+            .allocator = allocator,
+            .ref_count = std.atomic.Value(usize).init(1),
+            .io = io,
+        };
+    }
+
+    /// 发送值到通道
+    /// 关闭后返回 false
+    pub fn send(self: *ChannelValue, val: Value) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.closed.load(.seq_cst)) return false;
+
+        // 同步通道（容量 0）：暂存一个元素，等待 recv 取走
+        // 缓冲通道：缓冲未满时写入
+        if (self.capacity == 0) {
+            // 同步通道：直接放入一个元素
+            try self.buffer.append(self.allocator, val);
+            self.not_empty.signal(self.io);
+            // 等待 recv 取走（简化实现：对于同步通道直接返回）
+            return true;
+        } else {
+            while (self.buffer.items.len >= self.capacity) {
+                if (self.closed.load(.seq_cst)) return false;
+                self.not_full.waitUncancelable(self.io, &self.mutex);
+            }
+            try self.buffer.append(self.allocator, val);
+            self.not_empty.signal(self.io);
+            return true;
+        }
+    }
+
+    /// 从通道接收值
+    /// 缓冲区耗尽且已关闭返回 null
+    pub fn recv(self: *ChannelValue) ?Value {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        while (self.buffer.items.len == 0) {
+            if (self.closed.load(.seq_cst)) return null;
+            self.not_empty.waitUncancelable(self.io, &self.mutex);
+        }
+
+        const val = self.buffer.orderedRemove(0);
+        self.not_full.signal(self.io);
+        return val;
+    }
+
+    /// 非阻塞接收 — 用于 select
+    /// 无数据时返回 null（不区分关闭和空缓冲）
+    pub fn tryRecv(self: *ChannelValue) ?Value {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.buffer.items.len == 0) return null;
+        const val = self.buffer.orderedRemove(0);
+        self.not_full.signal(self.io);
+        return val;
+    }
+
+    /// 关闭通道（仅 Sender 可调用）
+    pub fn close(self: *ChannelValue) void {
+        self.mutex.lockUncancelable(self.io);
+        self.closed.store(true, .seq_cst);
+        self.not_empty.broadcast(self.io);
+        self.not_full.broadcast(self.io);
+        self.mutex.unlock(self.io);
+    }
+
+    /// 增加引用计数
+    pub fn ref(self: *ChannelValue) void {
+        _ = self.ref_count.fetchAdd(1, .seq_cst);
+    }
+
+    /// 减少引用计数，归零返回 true
+    pub fn unref(self: *ChannelValue) bool {
+        return self.ref_count.fetchSub(1, .seq_cst) == 1;
+    }
+
+    pub fn deinit(self: *ChannelValue) void {
+        for (self.buffer.items) |v| {
+            var val = v;
+            val.deinit(self.allocator);
+        }
+        self.buffer.deinit(self.allocator);
+    }
+};
+
+/// Sender 值 — Channel 的发送端
+/// 文档 §3.5.2: 方向类型，限制只能 send 和 close
+pub const SenderValue = struct {
+    channel: *ChannelValue,
+
+    pub fn ref(self: *SenderValue) void {
+        self.channel.ref();
+    }
+    pub fn unref(self: *SenderValue) bool {
+        return self.channel.unref();
+    }
+};
+
+/// Receiver 值 — Channel 的接收端
+/// 文档 §3.5.2: 方向类型，限制只能 recv
+/// 文档 §3.5.4: Receiver<T> 实现了 Iterable<T>，通道关闭后循环自动结束
+pub const ReceiverValue = struct {
+    channel: *ChannelValue,
+
+    pub fn ref(self: *ReceiverValue) void {
+        self.channel.ref();
+    }
+    pub fn unref(self: *ReceiverValue) bool {
+        return self.channel.unref();
+    }
+};
+
+// ============================================================
 // 迭代器值（Iterable/Iterator 协议的运行时表示）
 // ============================================================
 
@@ -328,6 +680,18 @@ pub const Value = union(enum) {
     /// 范围迭代器
     range_iterator: *RangeIterator,
 
+    // 并发原语值（Phase 4）
+    /// Atomic<T> — 跨协程共享原子状态
+    atomic_val: *AtomicValue,
+    /// Spawn<T> — 协程句柄（线性类型）
+    spawn_val: *SpawnHandle,
+    /// Channel<T> — CSP 通信通道
+    channel_val: *ChannelValue,
+    /// Sender<T> — Channel 发送端
+    sender_val: *SenderValue,
+    /// Receiver<T> — Channel 接收端
+    receiver_val: *ReceiverValue,
+
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .array => |arr| {
@@ -464,6 +828,24 @@ pub const Value = union(enum) {
             .array_iterator => |ai| Value{ .array_iterator = ai }, // 引用相等
             .string_iterator => |si| Value{ .string_iterator = si }, // 引用相等
             .range_iterator => |ri| Value{ .range_iterator = ri }, // 引用相等
+            // 并发原语：引用语义，clone 为浅拷贝
+            .atomic_val => |av| {
+                av.ref();
+                return Value{ .atomic_val = av };
+            },
+            .spawn_val => self, // Spawn 是线性类型，clone 不增加副本
+            .channel_val => |cv| {
+                cv.ref();
+                return Value{ .channel_val = cv };
+            },
+            .sender_val => |sv| {
+                sv.ref();
+                return Value{ .sender_val = sv };
+            },
+            .receiver_val => |rv| {
+                rv.ref();
+                return Value{ .receiver_val = rv };
+            },
         };
     }
 
@@ -550,6 +932,11 @@ pub const Value = union(enum) {
             .array_iterator => try buf.appendSlice(allocator, "<array_iterator>"),
             .string_iterator => try buf.appendSlice(allocator, "<string_iterator>"),
             .range_iterator => try buf.appendSlice(allocator, "<range_iterator>"),
+            .atomic_val => try buf.appendSlice(allocator, "<atomic>"),
+            .spawn_val => try buf.appendSlice(allocator, "<spawn>"),
+            .channel_val => try buf.appendSlice(allocator, "<channel>"),
+            .sender_val => try buf.appendSlice(allocator, "<sender>"),
+            .receiver_val => try buf.appendSlice(allocator, "<receiver>"),
         }
     }
 
@@ -578,6 +965,11 @@ pub const Value = union(enum) {
             .array_iterator => |ai| ai == other.array_iterator, // 引用相等
             .string_iterator => |si| si == other.string_iterator, // 引用相等
             .range_iterator => |ri| ri == other.range_iterator, // 引用相等
+            .atomic_val => |av| av == other.atomic_val, // 引用相等
+            .spawn_val => |sh| sh == other.spawn_val, // 引用相等
+            .channel_val => |cv| cv == other.channel_val, // 引用相等
+            .sender_val => |sv| sv == other.sender_val, // 引用相等
+            .receiver_val => |rv| rv == other.receiver_val, // 引用相等
         };
     }
 
