@@ -23,6 +23,7 @@ const pattern = @import("pattern");
 const throw_mod = @import("throw_mod");
 const module_eval = @import("module_eval");
 const sema = @import("sema");
+const vtable_rt = @import("vtable_rt");
 
 // ============================================================
 // 便捷重导出
@@ -70,47 +71,17 @@ const RecordConstructorCtx = struct {
     field_names: [][]const u8,
 };
 
-/// 委托信息（运行时动态分派用）
-const DelegateEntry = struct {
-    target_trait: []const u8,
-    target_method: []const u8,
-};
+/// 委托信息（运行时动态分派用）— 从 vtable 模块 re-export
+pub const DelegateEntry = vtable_rt.DelegateEntry;
 
-/// Trait 声明信息
-const TraitInfo = struct {
-    name: []const u8,
-    /// 方法名列表
-    method_names: []const u8,
-    /// 默认实现的方法（方法名 -> 闭包）
-    default_methods: std.StringHashMap(*value.Closure),
-    /// 父 Trait 名称列表
-    parent_names: []const []const u8,
-    /// 关联类型名称列表（\0 分隔）
-    associated_type_names: []const u8,
-    /// override 方法名集合（方法名 -> void），仅 override 的方法可覆盖父 Trait impl
-    override_methods: std.StringHashMap(void),
-    /// 委托方法名集合（方法名 -> void），委托方法也可覆盖父 Trait impl
-    delegate_methods: std.StringHashMap(void),
-    /// 委托信息（方法名 -> DelegateEntry），运行时动态查找父 Trait impl
-    delegate_infos: std.StringHashMap(DelegateEntry),
-};
+/// Trait 声明信息 — 从 vtable 模块 re-export
+pub const TraitInfo = vtable_rt.TraitInfo;
 
-/// Impl 方法注册项
-const ImplMethodEntry = struct {
-    trait_name: []const u8,
-    /// impl 的目标类型名（如 impl Comparable<i32> 中的 "i32"）
-    type_name: []const u8,
-    method_name: []const u8,
-    closure: *value.Closure,
-};
+/// Impl 方法注册项 — 从 vtable 模块 re-export
+pub const ImplMethodEntry = vtable_rt.ImplMethodEntry;
 
-/// Impl 注册信息（用于关联类型查找）
-const ImplInfo = struct {
-    trait_name: []const u8,
-    type_name: []const u8,
-    /// 关联类型定义（关联类型名 -> 实际类型名字符串）
-    associated_types: std.StringHashMap([]const u8),
-};
+/// Impl 注册信息 — 从 vtable 模块 re-export
+pub const ImplInfo = vtable_rt.ImplInfo;
 
 /// 模块导出信息
 const ModuleExportInfo = struct {

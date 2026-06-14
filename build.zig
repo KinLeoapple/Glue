@@ -29,83 +29,6 @@ pub fn build(b: *std.Build) void {
     parser_module.addImport("lexer", lexer_module);
 
     // ============================================================
-    // sema/ sub-modules
-    // ============================================================
-
-    const type_check_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/type_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    type_check_module.addImport("ast", ast_module);
-
-    const kind_check_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/kind_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    kind_check_module.addImport("ast", ast_module);
-
-    const throw_check_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/throw_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    throw_check_module.addImport("ast", ast_module);
-
-    const subtype_check_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/subtype_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    subtype_check_module.addImport("ast", ast_module);
-
-    const variance_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/variance.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    variance_module.addImport("ast", ast_module);
-
-    const trait_resolve_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/trait_resolve.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    trait_resolve_module.addImport("ast", ast_module);
-
-    const gadt_check_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/gadt_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    gadt_check_module.addImport("ast", ast_module);
-
-    const module_check_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/module_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    module_check_module.addImport("ast", ast_module);
-
-    // ============================================================
-    // module/ sub-modules
-    // ============================================================
-
-    const module_resolver_module = b.createModule(.{
-        .root_source_file = b.path("src/module/resolver.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    module_resolver_module.addImport("ast", ast_module);
-
-    const dependency_graph_module = b.createModule(.{
-        .root_source_file = b.path("src/module/graph.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // ============================================================
     // runtime/ sub-modules
     // ============================================================
 
@@ -155,6 +78,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     value_module.addImport("ast", ast_module);
+    // value ↔ runtime: 循环依赖（value re-export runtime 类型，runtime 引用 Value）
+    value_module.addImport("atomic", atomic_module);
+    value_module.addImport("channel", channel_module);
+    value_module.addImport("spawn", spawn_module);
+    atomic_module.addImport("value", value_module);
+    channel_module.addImport("value", value_module);
+    spawn_module.addImport("value", value_module);
+    vtable_module.addImport("value", value_module);
 
     const env_module = b.createModule(.{
         .root_source_file = b.path("src/eval/env.zig"),
@@ -187,6 +118,95 @@ pub fn build(b: *std.Build) void {
     module_eval_module.addImport("ast", ast_module);
     module_eval_module.addImport("value", value_module);
     module_eval_module.addImport("env", env_module);
+
+    // ============================================================
+    // sema/ sub-modules
+    // ============================================================
+
+    const type_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/type_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    type_check_module.addImport("ast", ast_module);
+
+    const subtype_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/subtype_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    subtype_check_module.addImport("ast", ast_module);
+
+    const throw_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/throw_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    throw_check_module.addImport("ast", ast_module);
+
+    const trait_resolve_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/trait_resolve.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    trait_resolve_module.addImport("ast", ast_module);
+
+    const kind_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/kind_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kind_check_module.addImport("ast", ast_module);
+
+    const variance_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/variance.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    variance_module.addImport("ast", ast_module);
+
+    const gadt_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/gadt_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gadt_check_module.addImport("ast", ast_module);
+
+    const module_check_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/module_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module_check_module.addImport("ast", ast_module);
+
+    // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
+    type_check_module.addImport("subtype_check", subtype_check_module);
+    type_check_module.addImport("throw_check", throw_check_module);
+    type_check_module.addImport("trait_resolve", trait_resolve_module);
+    subtype_check_module.addImport("type_check", type_check_module);
+    throw_check_module.addImport("type_check", type_check_module);
+    trait_resolve_module.addImport("type_check", type_check_module);
+
+    // ============================================================
+    // module/ sub-modules
+    // ============================================================
+
+    const module_resolver_module = b.createModule(.{
+        .root_source_file = b.path("src/module/resolver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module_resolver_module.addImport("ast", ast_module);
+
+    const dependency_graph_module = b.createModule(.{
+        .root_source_file = b.path("src/module/graph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ============================================================
+    // eval module (core — depends on everything)
+    // ============================================================
 
     const eval_module = b.createModule(.{
         .root_source_file = b.path("src/eval/eval.zig"),
