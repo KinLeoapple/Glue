@@ -5,6 +5,16 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ============================================================
+    // Zio dependency (stackful coroutine runtime)
+    // ============================================================
+
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_module = zio_dep.module("zio");
+
+    // ============================================================
     // Shared base modules
     // ============================================================
 
@@ -37,6 +47,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    scheduler_module.addImport("zio", zio_module);
 
     const gc_module = b.createModule(.{
         .root_source_file = b.path("runtime/gc.zig"),
@@ -49,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    channel_module.addImport("zio", zio_module);
 
     const spawn_module = b.createModule(.{
         .root_source_file = b.path("runtime/spawn.zig"),
@@ -237,6 +249,7 @@ pub fn build(b: *std.Build) void {
     eval_module.addImport("spawn", spawn_module);
     eval_module.addImport("atomic", atomic_module);
     eval_module.addImport("vtable_rt", vtable_module);
+    eval_module.addImport("zio", zio_module);
 
     // ============================================================
     // Root module
@@ -251,6 +264,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("lexer", lexer_module);
     root_module.addImport("parser", parser_module);
     root_module.addImport("eval", eval_module);
+    root_module.addImport("zio", zio_module);
 
     // Create glue executable
     const exe = b.addExecutable(.{

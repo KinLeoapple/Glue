@@ -24,6 +24,8 @@ const throw_mod = @import("throw_mod");
 const module_eval = @import("module_eval");
 const sema = @import("sema");
 const vtable_rt = @import("vtable_rt");
+const module_resolver = @import("module_resolver");
+const gc_mod = @import("gc");
 
 // ============================================================
 // 便捷重导出
@@ -157,6 +159,18 @@ pub const Evaluator = struct {
     /// 已创建的 SpawnHandle 列表（用于 deinit 时释放）
     spawn_handles: std.ArrayList(*value.SpawnHandle),
 
+    /// 模块路径解析器
+    resolver: module_resolver.ModuleResolver,
+
+    /// spawn 线程上下文 — 必须是命名结构体，供 evalSpawn 和 spawnThreadFunc 共享类型
+    pub const SpawnContext = struct {
+        handle: *value.SpawnHandle,
+        body: *const ast.Expr,
+        env: *Environment,
+        backing_allocator: std.mem.Allocator,
+        io: std.Io,
+    };
+
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
             .allocator = allocator,
@@ -178,6 +192,7 @@ pub const Evaluator = struct {
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
             .scan_line_buf = std.ArrayList(u8).empty,
             .spawn_handles = std.ArrayList(*value.SpawnHandle).empty,
+            .resolver = module_resolver.ModuleResolver.init(allocator),
         };
         ev.registerBuiltins();
         return ev;
@@ -205,6 +220,7 @@ pub const Evaluator = struct {
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
             .scan_line_buf = std.ArrayList(u8).empty,
             .spawn_handles = std.ArrayList(*value.SpawnHandle).empty,
+            .resolver = module_resolver.ModuleResolver.init(allocator),
         };
         ev.registerBuiltins();
         return ev;
@@ -313,6 +329,8 @@ pub const Evaluator = struct {
             self.allocator.destroy(handle);
         }
         self.spawn_handles.deinit(self.allocator);
+        // 释放模块解析器
+        self.resolver.deinit();
     }
 
     /// 触发 Glue panic — 不可捕获，但允许 defer 执行
@@ -1664,7 +1682,7 @@ pub const Evaluator = struct {
                     if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
                     return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
                 }
-                return self.gluePanic("位运算 & 要求整数操作数");
+                return self.gluePanic("bitwise & requires integer operands");
             },
             .bit_or => {
                 if (left == .integer and right == .integer) {
@@ -1673,7 +1691,7 @@ pub const Evaluator = struct {
                     if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
                     return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
                 }
-                return self.gluePanic("位运算 | 要求整数操作数");
+                return self.gluePanic("bitwise | requires integer operands");
             },
             .bit_xor => {
                 if (left == .integer and right == .integer) {
@@ -1682,7 +1700,7 @@ pub const Evaluator = struct {
                     if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
                     return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
                 }
-                return self.gluePanic("位运算 ^ 要求整数操作数");
+                return self.gluePanic("bitwise ^ requires integer operands");
             },
             else => unreachable,
         }
@@ -2471,7 +2489,10 @@ pub const Evaluator = struct {
                     handle.thread = null;
                 }
                 if (handle.status.load(.seq_cst) == .Failed) {
-                    return self.gluePanic("spawn: coroutine failed");
+                    // 文档 §3.6: Panic 协程隔离
+                    // await 时如果子协程 panic，传播 panic 到当前协程
+                    const msg = handle.panic_message orelse "spawn: coroutine failed";
+                    return self.gluePanic(msg);
                 }
                 return result orelse Value.unit;
             }
@@ -2504,6 +2525,7 @@ pub const Evaluator = struct {
         }
 
         // Channel<T> 方法
+        // 文档 D57: 仅 Sender 可关闭 Channel
         if (object == .channel_val) {
             const ch = object.channel_val;
             if (std.mem.eql(u8, method, "send")) {
@@ -2517,10 +2539,9 @@ pub const Evaluator = struct {
                 const val = ch.recv();
                 return val orelse Value.null_val;
             }
+            // close 仅 Sender 可调用，Channel 本身不提供 close 方法
             if (std.mem.eql(u8, method, "close")) {
-                if (args.len != 0) return error.WrongArity;
-                ch.close();
-                return Value.unit;
+                return self.gluePanic("channel: close is only available on Sender, use ch.sender.close()");
             }
         }
 
@@ -3041,8 +3062,9 @@ pub const Evaluator = struct {
     /// spawn 表达式求值
     /// 文档 §3.2: spawn 创建协程，立即返回 Spawn<T>，不阻塞当前代码
     /// 文档 §3.2.1: spawn 闭包深拷贝捕获，Atomic<T> 例外（浅拷贝）
-    /// 当前实现：同步执行（保留深拷贝语义），避免 Evaluator 线程安全问题
-    /// TODO: 后续引入线程安全 Evaluator 或 per-thread Evaluator 后启用真正并发
+    /// 文档 §3.2.2: spawn 创建新协程，立即返回 Spawn<T>
+    /// 文档 §5.1: 每个协程拥有独立的 GC heap（Per-heap GC）
+    /// 文档 §3.6: Panic 协程隔离，子协程 panic 不影响父协程
     fn evalSpawn(self: *Evaluator, sp: @TypeOf(@as(ast.Expr, undefined).spawn), environment: *Environment) EvalResult!Value {
         const io = self.io orelse return self.gluePanic("spawn: no IO context");
 
@@ -3053,24 +3075,77 @@ pub const Evaluator = struct {
         const handle = try self.allocator.create(value.SpawnHandle);
         handle.* = value.SpawnHandle.init(self.allocator, io);
 
-        // 同步执行 spawn body（在当前线程中执行）
-        handle.status.store(.Running, .seq_cst);
-
-        const result = self.evalExpr(sp.body, cloned_env) catch {
-            handle.status.store(.Failed, .seq_cst);
-            return Value{ .spawn_val = handle };
-        };
-
-        handle.mutex.lockUncancelable(handle.io);
-        handle.result = result;
-        handle.status.store(.Completed, .seq_cst);
-        handle.condition.broadcast(handle.io);
-        handle.mutex.unlock(handle.io);
-
-        // 注册 spawn handle 到 evaluator
+        // 注册 spawn handle 到 evaluator（在 spawn 线程启动前注册，避免竞态）
         try self.spawn_handles.append(self.allocator, handle);
 
+        // 准备 spawn 线程数据
+        const ctx = try self.allocator.create(Evaluator.SpawnContext);
+        ctx.* = Evaluator.SpawnContext{
+            .handle = handle,
+            .body = sp.body,
+            .env = cloned_env,
+            .backing_allocator = self.allocator,
+            .io = io,
+        };
+
+        // 在新线程中执行 spawn body
+        handle.status.store(.Running, .seq_cst);
+        const thread = std.Thread.spawn(.{}, spawnThreadFunc, .{ctx}) catch {
+            handle.status.store(.Failed, .seq_cst);
+            handle.mutex.lockUncancelable(io);
+            handle.panic_message = try self.allocator.dupe(u8, "spawn: failed to create thread");
+            handle.condition.broadcast(io);
+            handle.mutex.unlock(io);
+            return Value{ .spawn_val = handle };
+        };
+        handle.thread = thread;
+
         return Value{ .spawn_val = handle };
+    }
+
+    /// spawn 线程入口函数
+    /// 在独立线程中创建独立 Evaluator + ArenaAllocator 执行 spawn body
+    /// 实现 Per-heap GC 隔离和 Panic 协程隔离
+    fn spawnThreadFunc(ctx: *const Evaluator.SpawnContext) void {
+        const handle = ctx.handle;
+        const body = ctx.body;
+        const env_ptr = ctx.env;
+        const backing_allocator = ctx.backing_allocator;
+        const io = ctx.io;
+
+        // 创建 Per-heap GC（独立 ArenaAllocator）
+        var gc = gc_mod.GarbageCollector.init(backing_allocator);
+        defer gc.deinit();
+        const arena_alloc = gc.allocator();
+
+        // 创建独立 Evaluator（使用 Arena 分配器）
+        var ev = Evaluator.initWithIo(arena_alloc, io);
+        defer ev.deinit();
+
+        // 执行 spawn body
+        const result = ev.evalExpr(body, env_ptr) catch |err| {
+            handle.mutex.lockUncancelable(io);
+            if (err == error.GluePanic) {
+                // 文档 §3.6: Panic 协程隔离
+                // 子协程 panic 被捕获存入 SpawnHandle，不影响父协程
+                if (ev.panic_message) |msg| {
+                    handle.panic_message = backing_allocator.dupe(u8, msg) catch null;
+                }
+                handle.status.store(.Failed, .seq_cst);
+            } else {
+                handle.status.store(.Failed, .seq_cst);
+            }
+            handle.condition.broadcast(io);
+            handle.mutex.unlock(io);
+            return;
+        };
+
+        // 存储结果
+        handle.mutex.lockUncancelable(io);
+        handle.result = result;
+        handle.status.store(.Completed, .seq_cst);
+        handle.condition.broadcast(io);
+        handle.mutex.unlock(io);
     }
 
     // ============================================================
@@ -3349,43 +3424,16 @@ pub const Evaluator = struct {
         const allocator = self.allocator;
         const io = self.io orelse return error.FileNotFound;
 
-        // 构建文件路径
-        var file_path = std.ArrayList(u8).empty;
-        defer file_path.deinit(allocator);
+        // 使用 ModuleResolver 解析路径
+        self.resolver.setSourceDir(self.current_source_dir orelse ".") catch {};
+        const resolved_path = try self.resolver.resolvePath(io, module_path) orelse return error.FileNotFound;
+        defer allocator.free(resolved_path);
 
-        // 基础目录
-        const base_dir = self.current_source_dir orelse ".";
+        // 使用 ModuleResolver 加载源代码
+        const source = try self.resolver.loadSource(io, resolved_path);
+        defer allocator.free(source);
 
-        // 拼接路径
-        try file_path.appendSlice(allocator, base_dir);
-        for (module_path) |component| {
-            try file_path.append(allocator, std.fs.path.sep);
-            try file_path.appendSlice(allocator, component);
-        }
-
-        // 尝试 .glue 文件
-        const path_with_ext = try std.fmt.allocPrint(allocator, "{s}.glue", .{file_path.items});
-        defer allocator.free(path_with_ext);
-
-        // 尝试直接文件
-        const cwd = std.Io.Dir.cwd();
-        if (cwd.readFileAlloc(io, path_with_ext, allocator, .unlimited)) |source| {
-            defer allocator.free(source);
-            try self.evalSourceModule(source, module_path[0], path_with_ext);
-            return;
-        } else |_| {
-            // 尝试 pack.glue（目录模块）
-            const pack_path = try std.fmt.allocPrint(allocator, "{s}" ++ [_]u8{std.fs.path.sep} ++ "pack.glue", .{file_path.items});
-            defer allocator.free(pack_path);
-
-            if (cwd.readFileAlloc(io, pack_path, allocator, .unlimited)) |pack_source| {
-                defer allocator.free(pack_source);
-                try self.evalSourceModule(pack_source, module_path[0], pack_path);
-                return;
-            } else |_| {
-                return error.FileNotFound;
-            }
-        }
+        try self.evalSourceModule(source, module_path[0], resolved_path);
     }
 
     /// 解析并求值源代码作为模块

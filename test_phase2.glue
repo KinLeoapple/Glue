@@ -421,7 +421,7 @@ trait Show {
     fun show(self): str
 }
 
-trait Debug extends Show {
+trait Debug(Show) {
     fun debug(self): str
 }
 

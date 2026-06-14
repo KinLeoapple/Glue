@@ -2071,11 +2071,13 @@ glue/
 │       └── graph.zig         // 依赖图
 ├── runtime/
 │   ├── scheduler.zig         // 基于 Zio 的调度器封装
-│   ├── gc.zig                // Per-heap GC
-│   ├── channel.zig           // Channel 实现（基于 Zio）
-│   ├── spawn.zig             // Spawn<T> 实现（基于 Zio Task）
+│   ├── gc.zig                // Per-heap GC（ArenaAllocator）
+│   ├── channel.zig           // Channel 实现
+│   ├── spawn.zig             // Spawn<T> 实现（std.Thread + Per-heap GC + Panic 隔离）
 │   ├── atomic.zig            // Atomic<T> 原子操作
 │   └── vtable.zig            // 一等 Trait 值 vtable 支持
+├── vendor/
+│   └── zio/                  // Zio 异步 I/O 框架（stackful coroutine + io_uring/IOCP）
 └── build.zig                 // Zig 构建脚本
 ```
 
@@ -2249,7 +2251,7 @@ glue/
 | D50 | `==` 引用相等 | 性能可预测 O(1)，结构相等用 `eq` | 结构相等为默认 |
 | D51 | `?` 不跨 Nullable/Throw | null 和 error 语义不同 | 自动转换 |
 | D52 | Panic 不可捕获 | bug 不应恢复，协程级隔离 | panic/recover |
-| D53 | 三级断言 | 区分开发期检查、接口契约、不可达 | 统一 assert |
+| D53 | `Panic()` 触发 panic | 不可捕获，协程级隔离，简单统一 | 三级断言(assert/precondition/fatal) |
 | D54 | OOM 是可恢复错误 | 分配 API 返回 T? | OOM 触发 panic |
 | D55 | `defer` 关键字 | LIFO，覆盖正常返回/throw/panic | RAII |
 | D56 | 整数溢出均 panic | 无 wrap around 语义 | Release 时 wrap |

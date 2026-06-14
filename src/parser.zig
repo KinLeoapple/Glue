@@ -804,7 +804,7 @@ pub const Parser = struct {
 
         _ = self.expect(.l_brace, "expected '{' to start trait body") catch {};
         while (!self.check(.r_brace) and !self.isAtEnd()) {
-            if (self.checkIdentifier("type")) {
+            if (self.check(.kw_type)) {
                 try associated_types.append(self.allocator, try self.parseAssociatedType());
             } else {
                 try methods.append(self.allocator, try self.parseMethodDecl());
@@ -1191,12 +1191,21 @@ pub const Parser = struct {
         var ty = try self.parsePrimaryType();
         while (self.matchToken(.question)) {
             const location = getTypeNodeLocation(ty);
-            ty = try self.allocType(ast.TypeNode{
-                .nullable = .{
-                    .location = location,
-                    .inner = ty,
+            // 文档 D20: T?? 扁平化为 T?
+            // 如果内部已经是 nullable，直接复用（不嵌套）
+            switch (ty.*) {
+                .nullable => {
+                    // T? 已经是 nullable，T?? 等价于 T?，跳过嵌套
                 },
-            });
+                else => {
+                    ty = try self.allocType(ast.TypeNode{
+                        .nullable = .{
+                            .location = location,
+                            .inner = ty,
+                        },
+                    });
+                },
+            }
         }
         return ty;
     }
@@ -2547,42 +2556,22 @@ pub const Parser = struct {
         // 解析第一个表达式
         const first_expr = try self.parseExpr();
 
-        // 如果后面跟着逗号，解析为元组（位置记录）
+        // 文档 D71: 无匿名元组，记录必须有命名字段
+        // (expr, expr, ...) 语法被禁止
         if (self.matchToken(.comma)) {
-            var fields = std.ArrayList(ast.RecordFieldExpr).empty;
-            // 位置键：0, 1, 2, ...
-            const key0 = try self.allocator.dupe(u8, "0");
-            try fields.append(self.allocator, .{
-                .name = key0,
-                .value = first_expr,
+            const loc = tokenLoc(lparen_tok);
+            try self.errors.append(self.allocator, ParseError{
+                .line = loc.line,
+                .column = loc.column,
+                .message = "anonymous tuples are not allowed; use named record fields like (name: value, ...)",
             });
-            var idx: usize = 1;
-            if (!self.check(.r_paren)) {
-                const elem = try self.parseExpr();
-                const key = try intToKey(self.allocator, idx);
-                try fields.append(self.allocator, .{
-                    .name = key,
-                    .value = elem,
-                });
-                idx += 1;
-                while (self.matchToken(.comma)) {
-                    if (self.check(.r_paren)) break;
-                    const next_elem = try self.parseExpr();
-                    const k = try intToKey(self.allocator, idx);
-                    try fields.append(self.allocator, .{
-                        .name = k,
-                        .value = next_elem,
-                    });
-                    idx += 1;
-                }
+            // 错误恢复：跳到右括号
+            while (!self.check(.r_paren) and !self.isAtEnd()) {
+                _ = self.advance();
             }
-            _ = self.expect(.r_paren, "expected ')'") catch {};
-            return self.allocExpr(ast.Expr{
-                .record_literal = .{
-                    .location = location,
-                    .fields = try fields.toOwnedSlice(self.allocator),
-                },
-            });
+            _ = self.matchToken(.r_paren);
+            // 返回第一个表达式作为恢复结果
+            return first_expr;
         }
 
         // 单个表达式 = 括号表达式
@@ -2591,15 +2580,24 @@ pub const Parser = struct {
     }
 
     fn tryParseLambda(self: *Parser, saved: usize, location: ast.SourceLocation) ?*ast.Expr {
+        const saved_error_count = self.errors.items.len;
         var params = std.ArrayList(ast.Param).empty;
         if (!self.check(.r_paren)) {
-            self.parseLambdaParamList(&params) catch return null;
+            self.parseLambdaParamList(&params) catch {
+                // 回滚尝试 lambda 时产生的虚假错误消息
+                self.errors.shrinkRetainingCapacity(saved_error_count);
+                return null;
+            };
         }
-        if (!self.check(.r_paren)) return null;
+        if (!self.check(.r_paren)) {
+            self.errors.shrinkRetainingCapacity(saved_error_count);
+            return null;
+        }
         _ = self.advance(); // 消费 )
 
         if (!self.check(.eq_gt)) {
             self.current = saved;
+            self.errors.shrinkRetainingCapacity(saved_error_count);
             return null;
         }
         _ = self.advance(); // 消费 =>

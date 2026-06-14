@@ -1,6 +1,9 @@
-//! Spawn<T> 实现（基于 std.Thread）
+//! Spawn<T> 实现（基于 std.Thread 真正并发）
 //!
 //! 文档 §3.3: Spawn 是线性类型，必须被 await() 或 cancel() 消费
+//! 每个 spawn 在独立线程中执行，拥有独立 Evaluator + ArenaAllocator
+//! 实现 Per-heap GC 隔离（协程结束时 Arena 整体释放）
+//! 实现 Panic 协程隔离（panic 被捕获存入 SpawnHandle）
 
 const std = @import("std");
 const value = @import("value");
@@ -34,6 +37,8 @@ pub const SpawnHandle = struct {
     allocator: std.mem.Allocator,
     /// IO 上下文
     io: std.Io,
+    /// Panic 消息（协程隔离：子协程 panic 不影响主协程）
+    panic_message: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) SpawnHandle {
         return SpawnHandle{
@@ -52,6 +57,9 @@ pub const SpawnHandle = struct {
         if (self.result) |r| {
             var v = r;
             v.deinit(self.allocator);
+        }
+        if (self.panic_message) |msg| {
+            self.allocator.free(msg);
         }
     }
 };
