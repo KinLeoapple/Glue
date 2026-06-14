@@ -45,6 +45,7 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void
     executeSource(arena_alloc, &ev, io, source, filename);
 
     // 文件模式下，查找并调用 main 入口函数
+    // 文档 D13: 入口点默认 Main.main，约定优于配置
     _ = ev.callMain() catch |err| switch (err) {
         error.MissingMain => {
             var err_buf: [4096]u8 = undefined;

@@ -685,6 +685,12 @@ pub const Evaluator = struct {
                     try pub_names.appendSlice(self.allocator, name);
                 }
             }
+            // 文档 D13: 入口点默认 Main.main，像 Java/Go 一样
+            // 顶层裸表达式语句（如 println(...)）不执行，只有 fun main() 内的代码才执行
+            // val/var 定义仍需求值（类似 Go 的包级变量初始化）
+            if (decl == .expr_decl and decl.expr_decl.stmt == null) {
+                continue;
+            }
             try self.evalDecl(decl, &self.global_env);
         }
 
@@ -1313,6 +1319,7 @@ pub const Evaluator = struct {
             .index => |idx| self.evalIndex(idx, environment),
             .array_literal => |al| self.evalArrayLiteral(al, environment),
             .record_literal => |rl| self.evalRecordLiteral(rl, environment),
+            .record_extend => |re| self.evalRecordExtend(re, environment),
             .lambda => |lam| self.evalLambda(lam, environment),
             .if_expr => |ie| return self.evalIfExpr(ie, environment),
             .block => |blk| return self.evalBlock(blk, environment),
@@ -1480,6 +1487,33 @@ pub const Evaluator = struct {
                 const left_int = try left.asInteger();
                 const right_int = try right.asInteger();
                 return Value{ .range = Range{ .start = left_int, .end = right_int, .inclusive = true } };
+            },
+            .bit_and => {
+                if (left == .integer and right == .integer) {
+                    const result_type = left.integer.type_tag;
+                    const result = left.integer.value & right.integer.value;
+                    if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
+                    return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
+                }
+                return self.gluePanic("位运算 & 要求整数操作数");
+            },
+            .bit_or => {
+                if (left == .integer and right == .integer) {
+                    const result_type = left.integer.type_tag;
+                    const result = left.integer.value | right.integer.value;
+                    if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
+                    return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
+                }
+                return self.gluePanic("位运算 | 要求整数操作数");
+            },
+            .bit_xor => {
+                if (left == .integer and right == .integer) {
+                    const result_type = left.integer.type_tag;
+                    const result = left.integer.value ^ right.integer.value;
+                    if (!result_type.inRange(result)) return self.gluePanic("arithmetic overflow: integer operation out of range");
+                    return Value{ .integer = IntValue{ .value = result, .type_tag = result_type } };
+                }
+                return self.gluePanic("位运算 ^ 要求整数操作数");
             },
             else => unreachable,
         }
@@ -2352,6 +2386,40 @@ pub const Evaluator = struct {
         }
 
         return Value{ .record = .{ .type_name = "", .fields = map } };
+    }
+
+    /// 记录扩展/更新求值
+    /// Phase 3: 文档 §2.12.1 记录操作
+    /// (...base, field: val) — 从 base 复制所有字段，然后用 updates 覆盖/新增
+    fn evalRecordExtend(self: *Evaluator, re: @TypeOf(@as(ast.Expr, undefined).record_extend), environment: *Environment) EvalResult!Value {
+        // 求值 base 表达式
+        const base_val = try self.evalExpr(re.base, environment);
+
+        // base 必须是记录
+        switch (base_val) {
+            .record => |base_rec| {
+                // 复制 base 的所有字段
+                var map = std.StringHashMap(Value).init(self.allocator);
+                errdefer map.deinit();
+
+                var iter = base_rec.fields.iterator();
+                while (iter.next()) |entry| {
+                    const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+                    try map.put(key, entry.value_ptr.*);
+                }
+
+                // 应用 updates（覆盖或新增字段）
+                for (re.updates) |update| {
+                    const key = try self.allocator.dupe(u8, update.name);
+                    const val = try self.evalExpr(update.value, environment);
+                    // 如果 key 已存在，put 会覆盖旧值
+                    try map.put(key, val);
+                }
+
+                return Value{ .record = .{ .type_name = "", .fields = map } };
+            },
+            else => return error.TypeMismatch,
+        }
     }
 
     fn evalLambda(self: *Evaluator, lam: @TypeOf(@as(ast.Expr, undefined).lambda), environment: *Environment) EvalResult!Value {

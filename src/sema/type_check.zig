@@ -804,7 +804,22 @@ pub const TypeInferencer = struct {
         const tag1 = std.meta.activeTag(resolved1.*);
         const tag2 = std.meta.activeTag(resolved2.*);
 
-        if (tag1 != tag2) return error.TypeMismatch;
+        // Phase 3: 子类型关系允许不同 tag 之间的兼容
+        // - T <: T? (nullable_type)
+        // - FileError <: Error (adt_type)
+        // - Throw<T, E1> <: Throw<T, E2> 当 E1 <: E2
+        if (tag1 != tag2) {
+            // T <: T?：非 nullable 类型可以统一到 nullable 类型
+            if (resolved2.* == .nullable_type) {
+                try self.unify(resolved1, resolved2.nullable_type);
+                return;
+            }
+            // Null <: T?
+            if (resolved1.* == .null_type and resolved2.* == .nullable_type) {
+                return;
+            }
+            return error.TypeMismatch;
+        }
 
         switch (resolved1.*) {
             .fn_type => |ft1| {
@@ -817,9 +832,9 @@ pub const TypeInferencer = struct {
             },
             .record_type => |rt1| {
                 const rt2 = resolved2.record_type;
-                // 文档 §2.5.2：记录类型是匿名的，基于结构化匹配
-                // 支持宽度子类型：字段更多的记录可以统一到字段更少的记录
-                // 即 (name: str, age: i32, email: str?) 可以传给 (name: str, age: i32)
+                // 文档 §2.12.1：记录宽度子类型
+                // 字段更多的记录是字段更少的记录的子类型
+                // (name: str, age: i32) <: (name: str)
                 const smaller = if (rt1.fields.len <= rt2.fields.len) rt1 else rt2;
                 const larger = if (rt1.fields.len <= rt2.fields.len) rt2 else rt1;
                 // 较小记录的每个字段必须在较大记录中存在且类型兼容
@@ -840,6 +855,14 @@ pub const TypeInferencer = struct {
             },
             .adt_type => |at1| {
                 const at2 = resolved2.adt_type;
+                // Phase 3: Error 子类型（文档 §2.12.3）
+                // FileError <: Error — 自定义错误类型是 Error 的子类型
+                if (self.isSubtype(resolved1, resolved2)) {
+                    return;
+                }
+                if (self.isSubtype(resolved2, resolved1)) {
+                    return;
+                }
                 if (!std.mem.eql(u8, at1.name, at2.name)) return error.TypeMismatch;
                 if (at1.type_args.len != at2.type_args.len) return error.TypeMismatch;
                 for (at1.type_args, at2.type_args) |a1, a2| {
@@ -848,6 +871,10 @@ pub const TypeInferencer = struct {
             },
             .throw_type => |tt1| {
                 const tt2 = resolved2.throw_type;
+                // Phase 3: Throw 子类型 — Throw<T, E1> <: Throw<T, E2> 当 E1 <: E2
+                if (self.isSubtype(resolved1, resolved2)) {
+                    return;
+                }
                 try self.unify(tt1.value_type, tt2.value_type);
                 try self.unify(tt1.error_type, tt2.error_type);
             },
@@ -857,6 +884,20 @@ pub const TypeInferencer = struct {
                 if (gt1.args.len != gt2.args.len) return error.TypeMismatch;
                 for (gt1.args, gt2.args) |a1, a2| {
                     try self.unify(a1, a2);
+                }
+            },
+            .trait_type => {
+                // Phase 3: Trait 结构化子类型（文档 §2.12.2）
+                // 方法更多的模块是方法更少的 Trait 的子类型
+                if (self.isSubtype(resolved1, resolved2)) {
+                    return;
+                }
+                if (self.isSubtype(resolved2, resolved1)) {
+                    return;
+                }
+                // 名字不同且无子类型关系
+                if (!std.mem.eql(u8, resolved1.trait_type.name, resolved2.trait_type.name)) {
+                    return error.TypeMismatch;
                 }
             },
             else => {
@@ -909,6 +950,123 @@ pub const TypeInferencer = struct {
             },
             else => return t,
         }
+    }
+
+    // ============================================================
+    // 子类型检查（Phase 3: 文档 §2.12）
+    // ============================================================
+
+    /// 判断 sub 是否是 super 的子类型
+    /// 文档 §2.12: Glue 使用三种子类型关系
+    /// - 记录宽度子类型（§2.12.1）
+    /// - Trait 结构化子类型（§2.12.2）
+    /// - Error 子类型（§2.12.3）
+    pub fn isSubtype(self: *TypeInferencer, sub: *Type, super: *Type) bool {
+        const resolved_sub = self.resolve(sub);
+        const resolved_super = self.resolve(super);
+
+        // 相同类型
+        if (resolved_sub == resolved_super) return true;
+
+        // 1. Null <: T?（文档 §2.3.1: null 是所有 T? 的共享值）
+        if (resolved_sub.* == .null_type and resolved_super.* == .nullable_type) return true;
+
+        // 2. T <: T?（任何类型都是其可空版本的子类型）
+        if (resolved_super.* == .nullable_type) {
+            const inner = resolved_super.nullable_type;
+            if (self.isSubtype(resolved_sub, inner)) return true;
+        }
+
+        // 3. 记录宽度子类型（文档 §2.12.1）
+        //    (name: str, age: i32) <: (name: str)
+        if (resolved_sub.* == .record_type and resolved_super.* == .record_type) {
+            return self.isRecordSubtype(resolved_sub.record_type.fields, resolved_super.record_type.fields);
+        }
+
+        // 4. Error 子类型（文档 §2.12.3）
+        //    FileError <: Error
+        if (resolved_sub.* == .adt_type and resolved_super.* == .adt_type) {
+            return self.isErrorSubtype(resolved_sub.adt_type.name, resolved_super.adt_type.name);
+        }
+
+        // 5. Throw 子类型：Throw<T, E1> <: Throw<T, E2> 当 E1 <: E2
+        if (resolved_sub.* == .throw_type and resolved_super.* == .throw_type) {
+            return self.isThrowSubtype(
+                resolved_sub.throw_type.value_type,
+                resolved_sub.throw_type.error_type,
+                resolved_super.throw_type.value_type,
+                resolved_super.throw_type.error_type,
+            );
+        }
+
+        // 6. Trait 结构化子类型（文档 §2.12.2）
+        //    方法更多的模块是方法更少的 Trait 的子类型
+        if (resolved_sub.* == .trait_type and resolved_super.* == .trait_type) {
+            return self.isTraitStructuralSubtype(resolved_sub.trait_type.name, resolved_super.trait_type.name);
+        }
+
+        return false;
+    }
+
+    /// 记录宽度子类型检查
+    /// 文档 §2.12.1: 字段更多的记录是字段更少的记录的子类型
+    fn isRecordSubtype(self: *TypeInferencer, sub_fields: []const FieldType, super_fields: []const FieldType) bool {
+        _ = self;
+        // 子类型（字段更多）必须包含父类型（字段更少）的所有字段
+        for (super_fields) |super_field| {
+            var found = false;
+            for (sub_fields) |sub_field| {
+                if (std.mem.eql(u8, super_field.name, sub_field.name)) {
+                    // 字段类型必须相同（简化处理，递归子类型检查在 unify 中处理）
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /// Error 子类型检查
+    /// 文档 §2.12.3: 自定义错误类型是 Error 的子类型
+    fn isErrorSubtype(self: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
+        // 检查 sub 是否是 Error 的子类型
+        if (std.mem.eql(u8, super_name, "Error")) {
+            if (self.adt_types.get(sub_name)) |info| {
+                if (info.is_error_newtype) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Throw 子类型检查
+    /// Throw<T, E1> <: Throw<T, E2> 当 E1 <: E2
+    fn isThrowSubtype(self: *TypeInferencer, sub_val: *Type, sub_err: *Type, super_val: *Type, super_err: *Type) bool {
+        // 值类型必须兼容
+        if (!self.isSubtype(sub_val, super_val)) return false;
+        // 错误类型必须是子类型关系
+        if (!self.isSubtype(sub_err, super_err)) return false;
+        return true;
+    }
+
+    /// Trait 结构化子类型检查
+    /// 文档 §2.12.2: 方法更多的模块是方法更少的 Trait 的子类型
+    fn isTraitStructuralSubtype(self: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
+        const sub_info = self.trait_types.get(sub_name) orelse return false;
+        const super_info = self.trait_types.get(super_name) orelse return false;
+
+        // sub 必须包含 super 的所有方法
+        for (super_info.method_names) |super_method| {
+            var found = false;
+            for (sub_info.method_names) |sub_method| {
+                if (std.mem.eql(u8, super_method, sub_method)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
     }
 
     /// Occurs check：检查类型变量 id 是否出现在类型 t 中
@@ -1385,7 +1543,8 @@ pub const TypeInferencer = struct {
                     }
                     return self.instantiate(scheme);
                 }
-                return error.UnboundVariable;
+                self.addErrorAt(.unbound_variable, id.location.line, id.location.column, "undefined variable '{s}'", .{id.name});
+                return self.freshTypeVar() catch error.OutOfMemory;
             },
 
             .binary => |bin| {
@@ -1405,6 +1564,10 @@ pub const TypeInferencer = struct {
                         try self.unify(left_ty, try self.makeType(.bool_type));
                         try self.unify(right_ty, try self.makeType(.bool_type));
                         return self.makeType(.bool_type);
+                    },
+                    .bit_and, .bit_or, .bit_xor => {
+                        try self.unify(left_ty, right_ty);
+                        return left_ty;
                     },
                     .concat => {
                         try self.unify(left_ty, try self.makeType(.str_type));
@@ -1590,6 +1753,50 @@ pub const TypeInferencer = struct {
                 t.* = Type{ .record_type = .{ .fields = fields } };
                 try self.types.append(self.allocator, t);
                 return t;
+            },
+
+            .record_extend => |re| {
+                // Phase 3: 记录扩展/更新的类型推断
+                // (...base, field: val) 的类型 = base 的字段类型 + updates 的字段类型
+                const base_ty = self.inferExpr(re.base, env) catch return self.freshTypeVar() catch unreachable;
+                const resolved_base = self.resolve(base_ty);
+
+                switch (resolved_base.*) {
+                    .record_type => |rt| {
+                        // 收集 base 的字段
+                        var all_fields = std.ArrayList(FieldType).empty;
+                        for (rt.fields) |f| {
+                            try all_fields.append(self.allocator, f);
+                        }
+                        // 应用 updates（覆盖或新增）
+                        for (re.updates) |update| {
+                            const update_ty = try self.inferExpr(update.value, env);
+                            // 检查是否覆盖已有字段
+                            var found = false;
+                            for (all_fields.items, 0..) |*f, i| {
+                                if (std.mem.eql(u8, f.name, update.name)) {
+                                    all_fields.items[i].ty = update_ty;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                try all_fields.append(self.allocator, FieldType{
+                                    .name = update.name,
+                                    .ty = update_ty,
+                                });
+                            }
+                        }
+                        const t = try self.allocator.create(Type);
+                        t.* = Type{ .record_type = .{ .fields = try all_fields.toOwnedSlice(self.allocator) } };
+                        try self.types.append(self.allocator, t);
+                        return t;
+                    },
+                    else => {
+                        self.addErrorAt(.type_mismatch, re.location.line, re.location.column, "record extend requires record type, got {}", .{resolved_base.*});
+                        return self.freshTypeVar() catch unreachable;
+                    },
+                }
             },
 
             .field_access => |fa| {
@@ -3246,7 +3453,7 @@ pub const TypeInferencer = struct {
     fn reportInferError(self: *TypeInferencer, err: SemaError, location: ast.SourceLocation) void {
         switch (err) {
             error.TypeMismatch => self.addErrorAt(.type_mismatch, location.line, location.column, "type mismatch: incompatible types", .{}),
-            error.UnboundVariable => self.addErrorAt(.unbound_variable, location.line, location.column, "undefined variable '{s}'", .{"?"}),
+            error.UnboundVariable => self.addErrorAt(.unbound_variable, location.line, location.column, "undefined variable", .{}),
             error.ArityMismatch => self.addErrorAt(.arity_mismatch, location.line, location.column, "function argument count mismatch", .{}),
             error.OccursCheckFailed => {
                 // 文档 2.10: 多态递归函数必须提供类型标注

@@ -1,9 +1,9 @@
 //! 子类型检查
 //!
-//! Phase 7+ 实现：结构化子类型、Trait 子类型关系
+//! Phase 3 实现在 type_check.zig 的 TypeInferencer.isSubtype() 方法中。
+//! 此模块保留为未来独立子类型检查器的入口点。
 
 const std = @import("std");
-const ast = @import("ast");
 
 pub const SubtypeChecker = struct {
     allocator: std.mem.Allocator,

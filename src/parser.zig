@@ -241,13 +241,18 @@ pub const Parser = struct {
             }
 
             // 声明解析失败，尝试解析为顶层表达式或赋值语句
-            const expr = self.parseExpr() catch |err| {
-                if (err == error.UnexpectedToken) {
-                    self.synchronize();
-                    continue;
-                }
-                return err;
+            const before_expr = self.current;
+            const expr = self.parseExpr() catch {
+                // 表达式也解析失败，同步到下一个语句开始
+                self.synchronize();
+                continue;
             };
+
+            // 如果 parseExpr 没有消费任何 token，跳过当前 token 避免无限循环
+            if (self.current == before_expr) {
+                _ = self.advance();
+                continue;
+            }
 
             // 检查是否是赋值语句（identifier = expr）
             if (self.matchToken(.eq)) {
@@ -292,6 +297,7 @@ pub const Parser = struct {
     }
 
     /// 尝试解析顶层声明，失败返回 null
+    /// 注意：失败时解析器位置可能已改变，调用者需用 synchronize 跳过无法解析的内容
     fn tryParseDecl(self: *Parser) ?ast.Decl {
         var visibility: ast.Visibility = .private;
         if (self.matchToken(.kw_pub)) {
@@ -443,7 +449,9 @@ pub const Parser = struct {
         // 返回类型
         var return_type: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
-            return_type = try self.parseType();
+            return_type = self.parseType() catch |err| {
+                return err;
+            };
         }
 
         // Trait 约束 with Bounds
@@ -453,7 +461,9 @@ pub const Parser = struct {
         }
 
         // 函数体
-        const body = try self.parseExpr();
+        const body = self.parseExpr() catch |err| {
+            return err;
+        };
 
         return ast.Decl{
             .fun_decl = .{
@@ -1326,14 +1336,65 @@ pub const Parser = struct {
     }
 
     fn parseAnd(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseEquality();
+        var left = try self.parseBitOr();
         while (self.matchToken(.amp_amp)) {
+            const op_tok = self.previous();
+            const right = try self.parseBitOr();
+            left = try self.allocExpr(ast.Expr{
+                .binary = .{
+                    .location = tokenLoc(op_tok),
+                    .op = .and_op,
+                    .left = left,
+                    .right = right,
+                },
+            });
+        }
+        return left;
+    }
+
+    fn parseBitOr(self: *Parser) ParserError!*ast.Expr {
+        var left = try self.parseBitXor();
+        while (self.matchToken(.pipe)) {
+            const op_tok = self.previous();
+            const right = try self.parseBitXor();
+            left = try self.allocExpr(ast.Expr{
+                .binary = .{
+                    .location = tokenLoc(op_tok),
+                    .op = .bit_or,
+                    .left = left,
+                    .right = right,
+                },
+            });
+        }
+        return left;
+    }
+
+    fn parseBitXor(self: *Parser) ParserError!*ast.Expr {
+        var left = try self.parseBitAnd();
+        while (self.matchToken(.caret)) {
+            const op_tok = self.previous();
+            const right = try self.parseBitAnd();
+            left = try self.allocExpr(ast.Expr{
+                .binary = .{
+                    .location = tokenLoc(op_tok),
+                    .op = .bit_xor,
+                    .left = left,
+                    .right = right,
+                },
+            });
+        }
+        return left;
+    }
+
+    fn parseBitAnd(self: *Parser) ParserError!*ast.Expr {
+        var left = try self.parseEquality();
+        while (self.matchToken(.ampersand)) {
             const op_tok = self.previous();
             const right = try self.parseEquality();
             left = try self.allocExpr(ast.Expr{
                 .binary = .{
                     .location = tokenLoc(op_tok),
-                    .op = .and_op,
+                    .op = .bit_and,
                     .left = left,
                     .right = right,
                 },
@@ -1784,7 +1845,7 @@ pub const Parser = struct {
             return self.parseParenOrRecordOrLambda();
         }
 
-        if (self.check(.identifier)) {
+        if (self.check(.identifier) or self.check(.kw_val) or self.check(.kw_var)) {
             // 检查类型转换：Name(expr) 其中 Name 是内建类型
             if (isBuiltinType(self.peek().lexeme)) {
                 if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_paren) {
@@ -2307,11 +2368,15 @@ pub const Parser = struct {
 
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             if (self.isStmtStart()) {
-                const stmt = try self.parseStmt();
+                const stmt = self.parseStmt() catch |err| {
+                    return err;
+                };
                 try statements.append(self.allocator, stmt);
             } else {
                 // 使用 parseExprOrAssignmentStmt 处理赋值语句（如 x = 10）
-                const stmt = try self.parseExprOrAssignmentStmt();
+                const stmt = self.parseExprOrAssignmentStmt() catch |err| {
+                    return err;
+                };
                 // 检查是否是尾表达式（纯表达式语句且后面紧跟 }）
                 if (stmt.* == .expression and self.check(.r_brace)) {
                     trailing_expr = stmt.expression.expr;
@@ -2352,8 +2417,35 @@ pub const Parser = struct {
 
         self.current = saved;
 
-        // 尝试解析为记录字面量
-        if (self.peek().type == .identifier) {
+        // 尝试解析为记录字面量（可能包含 ...spread 扩展）
+        // Phase 3: 支持 (...expr, field: val) 记录扩展语法
+        if (self.peek().type == .identifier or self.peek().type == .ellipsis) {
+            // 检查是否以 ... 开头（记录扩展）
+            if (self.peek().type == .ellipsis) {
+                _ = self.advance(); // 消费 ...
+                const base_expr = try self.parseExpr();
+                var updates = std.ArrayList(ast.RecordFieldExpr).empty;
+                // 解析后续的 , field: val
+                while (self.matchToken(.comma)) {
+                    if (self.check(.r_paren)) break;
+                    const field_name = try self.expect(.identifier, "期望字段名");
+                    _ = self.expect(.colon, "期望 ':'") catch {};
+                    const field_value = try self.parseExpr();
+                    try updates.append(self.allocator, .{
+                        .name = field_name.lexeme,
+                        .value = field_value,
+                    });
+                }
+                _ = self.expect(.r_paren, "期望 ')'") catch {};
+                return self.allocExpr(ast.Expr{
+                    .record_extend = .{
+                        .location = location,
+                        .base = base_expr,
+                        .updates = try updates.toOwnedSlice(self.allocator),
+                    },
+                });
+            }
+
             const name_tok = self.advance();
             if (self.check(.colon)) {
                 _ = self.advance(); // 消费 :
@@ -2365,6 +2457,35 @@ pub const Parser = struct {
                 });
                 while (self.matchToken(.comma)) {
                     if (self.check(.r_paren)) break;
+                    // 支持 ...spread 在字段列表中间
+                    if (self.check(.ellipsis)) {
+                        _ = self.advance(); // 消费 ...
+                        const base_expr = try self.parseExpr();
+                        var updates = std.ArrayList(ast.RecordFieldExpr).empty;
+                        // 将已有的字段加入 updates
+                        for (fields.items) |f| {
+                            try updates.append(self.allocator, f);
+                        }
+                        // 解析后续的 , field: val
+                        while (self.matchToken(.comma)) {
+                            if (self.check(.r_paren)) break;
+                            const field_name = try self.expect(.identifier, "期望字段名");
+                            _ = self.expect(.colon, "期望 ':'") catch {};
+                            const field_value = try self.parseExpr();
+                            try updates.append(self.allocator, .{
+                                .name = field_name.lexeme,
+                                .value = field_value,
+                            });
+                        }
+                        _ = self.expect(.r_paren, "期望 ')'") catch {};
+                        return self.allocExpr(ast.Expr{
+                            .record_extend = .{
+                                .location = location,
+                                .base = base_expr,
+                                .updates = try updates.toOwnedSlice(self.allocator),
+                            },
+                        });
+                    }
                     const field_name = try self.expect(.identifier, "期望字段名");
                     _ = self.expect(.colon, "期望 ':'") catch {};
                     const field_value = try self.parseExpr();
@@ -2608,6 +2729,36 @@ pub const Parser = struct {
 
         if (self.matchToken(.l_paren)) {
             return self.parseRecordPattern();
+        }
+
+        // kw_val/kw_var 在模式上下文中作为变量名使用
+        // 例如 Ok(val) 中的 val 会被词法分析器识别为 kw_val
+        if (self.check(.kw_val) or self.check(.kw_var)) {
+            const name_tok = self.advance();
+            if (self.check(.l_paren)) {
+                _ = self.advance(); // 消费 (
+                var patterns = std.ArrayList(*ast.Pattern).empty;
+                if (!self.check(.r_paren)) {
+                    try patterns.append(self.allocator, try self.parsePattern());
+                    while (self.matchToken(.comma)) {
+                        try patterns.append(self.allocator, try self.parsePattern());
+                    }
+                }
+                _ = self.expect(.r_paren, "期望 ')'") catch {};
+                return self.allocPattern(ast.Pattern{
+                    .constructor = .{
+                        .location = tokenLoc(name_tok),
+                        .name = name_tok.lexeme,
+                        .patterns = try patterns.toOwnedSlice(self.allocator),
+                    },
+                });
+            }
+            return self.allocPattern(ast.Pattern{
+                .variable = .{
+                    .location = tokenLoc(name_tok),
+                    .name = name_tok.lexeme,
+                },
+            });
         }
 
         if (self.check(.identifier)) {
@@ -3103,6 +3254,7 @@ fn getExprLocation(expr: *const ast.Expr) ast.SourceLocation {
         .index => |e| e.location,
         .array_literal => |e| e.location,
         .record_literal => |e| e.location,
+        .record_extend => |e| e.location,
         .lambda => |e| e.location,
         .if_expr => |e| e.location,
         .block => |e| e.location,

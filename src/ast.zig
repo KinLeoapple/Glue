@@ -58,6 +58,10 @@ pub const BinaryOp = enum {
     // 逻辑运算符
     and_op, // &&
     or_op, // ||
+    // 位运算符
+    bit_and, // &
+    bit_or, // |
+    bit_xor, // ^
     // 字符串拼接
     concat, // +（字符串上下文）
     // 范围运算符
@@ -602,6 +606,16 @@ pub const Expr = union(enum) {
     record_literal: struct {
         location: SourceLocation,
         fields: []RecordFieldExpr,
+    },
+
+    /// 记录扩展/更新：(...record, field: val) 或 (...record, field: new_val)
+    /// Phase 3: 文档 §2.12.1 记录操作
+    record_extend: struct {
+        location: SourceLocation,
+        /// 被扩展的记录表达式
+        base: *Expr,
+        /// 新增或覆盖的字段
+        updates: []RecordFieldExpr,
     },
 
     /// Lambda 表达式：

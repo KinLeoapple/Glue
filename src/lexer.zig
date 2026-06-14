@@ -128,6 +128,12 @@ pub const TokenType = enum {
     /// ! (前缀逻辑非)
     bang,
 
+    // --- 位运算符 ---
+    /// & (按位与)
+    ampersand,
+    /// ^ (按位异或)
+    caret,
+
     // --- Nullable 运算符 ---
     /// ?.
     question_dot,
@@ -142,6 +148,8 @@ pub const TokenType = enum {
     dot_dot,
     /// ..=
     dot_dot_eq,
+    /// ... (spread/ellipsis，用于记录扩展)
+    ellipsis,
 
     // --- 赋值 ---
     /// =
@@ -454,11 +462,13 @@ pub const Lexer = struct {
                 }
             },
 
-            // . 或 .. 或 ..=
+            // . 或 .. 或 ..= 或 ...
             '.' => {
                 if (self.matchChar('.')) {
                     if (self.matchChar('=')) {
                         try self.addToken(.dot_dot_eq, start, start_line, start_col);
+                    } else if (self.matchChar('.')) {
+                        try self.addToken(.ellipsis, start, start_line, start_col);
                     } else {
                         try self.addToken(.dot_dot, start, start_line, start_col);
                     }
@@ -483,15 +493,17 @@ pub const Lexer = struct {
                 }
             },
 
-            // & (仅支持 &&)
+            // & 或 &&
             '&' => {
                 if (self.matchChar('&')) {
                     try self.addToken(.amp_amp, start, start_line, start_col);
                 } else {
-                    // 单独的 & 在 Glue 中不支持，报错
-                    try self.addError(start, start_line, start_col);
+                    try self.addToken(.ampersand, start, start_line, start_col);
                 }
             },
+
+            // ^ (按位异或)
+            '^' => try self.addToken(.caret, start, start_line, start_col),
 
             // @ (Monad 上下文表达式)
             '@' => try self.addToken(.at, start, start_line, start_col),

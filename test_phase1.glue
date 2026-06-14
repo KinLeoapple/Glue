@@ -1,5 +1,567 @@
 // Phase 1 功能验证
+// 严格按照语言设计规范 Phase 1 表格：
+//   基础类型、Nullable、Throw、Error、Type Alias + Newtype、类型转换、
+//   相等性、Panic、defer、整数溢出、浮点数、闭包捕获、var 与值语义、
+//   main 签名、数组、Range、字符串插值、函数参数、尾调用优化、记录
 
+// ============================================================
+// 类型声明（顶层）—— 仅 Phase 1 类型
+// ============================================================
+
+// 自定义错误类型（Error 子类型）
+type FileError = Error("file error")
+type NetworkError = Error("network error")
+type ParseError = Error("parse error")
+type DbError = Error("database error")
+
+// Newtype — 零开销包装
+type UserId = UserId(i32)
+type Celsius = Celsius(f64)
+type Kelvin = Kelvin(f64)
+type Email = Email(str)
+type Grade = Grade(i32)
+
+// Newtype — 记录式（命名字段）
+type Point = Point(x: i32, y: i32)
+type Config = Config(host: str, port: i32)
+type Address = Address(city: str)
+type User = User(name: str, addr: Address?)
+type Addr = Addr(city: str, zip: i32)
+type Person = Person(name: str, addr: Addr)
+type Pt2 = Pt2(x: i32, y: i32)
+type Rect = Rect(w: f64, h: f64)
+type Shape2 = Shape2(rect: Rect, label: str)
+type Inner2 = Inner2(value: i32)
+type Outer2 = Outer2(inner: Inner2, label: str)
+
+// Newtype — 嵌套 Nullable
+type Deep = Deep(v: i32)
+type Mid = Mid(d: Deep?)
+type Top = Top(m: Mid?)
+
+// Type Alias — 类型别名
+type Name = str
+type Age = i32
+type Score = i32
+
+// ============================================================
+// 函数声明（顶层）
+// ============================================================
+
+// Throw — throw 语句
+fun mightFail(x: i32): Throw<i32, Error> {
+    if (x < 0) {
+        throw Error("negative value")
+    }
+    Ok(x * 2)
+}
+
+// TCO — 尾递归
+fun sum(n: i32, acc: i32): i32 {
+    if (n == 0) { acc } else { sum(n - 1, acc + n) }
+}
+
+// 递归 — 非尾递归（验证 TCO 不误优化）
+fun fib(n: i32): i32 {
+    if (n <= 1) { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+// var 参数
+fun modify(data: var i32): i32 {
+    data = data + 1
+    data
+}
+
+// ? 传播 — Nullable
+fun maybeNull(): i32? {
+    null
+}
+
+fun useNullable(): i32? {
+    val v = maybeNull()?
+    v + 1
+}
+
+// 函数作为一等公民
+fun apply(f, x): i32 {
+    f(x)
+}
+
+// 嵌套函数
+fun outer_fn(x: i32): i32 {
+    fun inner(y: i32): i32 {
+        x + y
+    }
+    inner(10)
+}
+
+// return 语句
+fun earlyReturn(x: i32): i32 {
+    if (x > 10) { return 100 }
+    x
+}
+
+// ? 传播 — Throw
+fun safeDiv(a: i32, b: i32): Throw<i32, Error> {
+    if (b == 0) {
+        throw Error("division by zero")
+    }
+    Ok(a / b)
+}
+
+// 多层 ? 传播 — Nullable
+fun getFirst(): i32? { null }
+fun getSecond(): i32? { 42 }
+
+fun chain(): i32? {
+    val a = getFirst()?
+    val b = getSecond()?
+    a + b
+}
+
+fun chain2(): i32? {
+    val b = getSecond()?
+    b + 1
+}
+
+// Nullable 类型收窄 — if 分支
+fun length(s: str?): i32 {
+    if (s != null) { s.len() } else { 0 }
+}
+
+// Nullable 类型收窄 — match 分支
+fun describe(n: i32?): str {
+    match n {
+        null => "nothing"
+        x => "got " + str(x)
+    }
+}
+
+// Error 子类型验证
+fun handleErrors(x: i32): Throw<i32, Error> {
+    if (x == 1) {
+        throw FileError("file not found")
+    }
+    if (x == 2) {
+        throw NetworkError("connection refused")
+    }
+    Ok(x)
+}
+
+// defer 覆盖 throw 路径
+var defer_throw_flag = 0
+
+fun throwsWithDefer(): Throw<i32, Error> {
+    defer defer_throw_flag = 42
+    throw Error("oops")
+}
+
+// Nullable 作为函数返回值
+fun findUser(id: i32): str? {
+    if (id == 1) { "Alice" } else { null }
+}
+
+// Nullable 嵌套在 Throw 中
+fun findOrError(id: i32): Throw<str?, Error> {
+    if (id < 0) {
+        throw Error("invalid id")
+    }
+    if (id == 0) {
+        Ok(null)
+    } else {
+        Ok(findUser(id))
+    }
+}
+
+// 递归与 TCO — 阶乘（非尾递归）
+fun factorial(n: i32): i32 {
+    if (n <= 1) { 1 } else { n * factorial(n - 1) }
+}
+
+// 尾递归倒计数
+fun countdown(n: i32): i32 {
+    if (n == 0) { 0 } else { countdown(n - 1) }
+}
+
+// match — 字面量模式
+fun classify(n: i32): str {
+    match n {
+        0 => "zero"
+        1 => "one"
+        _ => "other"
+    }
+}
+
+// 布尔模式
+fun boolMatch(b: bool): str {
+    match b {
+        true => "yes"
+        false => "no"
+    }
+}
+
+// 空值安全操作综合
+fun loadConfig(): Config? {
+    null
+}
+
+// Throw 链式 ? 传播
+fun step1(): Throw<i32, Error> {
+    Ok(10)
+}
+
+fun step2(x: i32): Throw<i32, Error> {
+    if (x > 5) { Ok(x * 2) } else { throw Error("too small") }
+}
+
+fun step3(x: i32): Throw<i32, Error> {
+    if (x < 100) { Ok(x + 1) } else { throw Error("too large") }
+}
+
+fun pipeline(): Throw<i32, Error> {
+    val a = step1()?
+    val b = step2(a)?
+    val c = step3(b)?
+    c
+}
+
+// 多个 defer 和 return 交互
+fun deferReturn(): i32 {
+    var result = 0
+    {
+        defer result = result + 10
+        result = 5
+    }
+    result
+}
+
+// 单位值
+fun doNothing(): () { }
+
+// Nullable — 函数参数和返回值
+fun defaultIfNull(value: i32?, default: i32) {
+    value ?? default
+}
+
+fun wrapInNullable(x: i32): i32? { x }
+
+// Throw — 多分支验证
+fun validateAge(age: i32): Throw<i32, Error> {
+    if (age < 0) { throw Error("age cannot be negative") }
+    if (age > 150) { throw Error("age too large") }
+    Ok(age)
+}
+
+// 闭包 — 闭包作为函数参数传递
+fun transform(value: i32, f): i32 { f(value) }
+
+// 记录类型 — 记录作为函数参数和返回值
+fun makePoint(x: i32, y: i32): Point { Point(x, y) }
+fun pointSum(p: Point): i32 { p.x + p.y }
+
+// Type Alias — 别名在函数签名中使用
+fun isAdult(age: i32): bool { age >= 18 }
+
+// match — 字符串和字面量模式
+fun direction(s: str): i32 {
+    match s {
+        "north" => 1
+        "south" => 2
+        "east" => 3
+        "west" => 4
+        _ => 0
+    }
+}
+
+// 嵌套 if-else 表达式
+fun classifyNum(x: i32): str {
+    if (x < 0) {
+        "negative"
+    } else if (x == 0) {
+        "zero"
+    } else if (x < 100) {
+        "small"
+    } else {
+        "large"
+    }
+}
+
+// 单位值更多场景
+fun sideEffect(): () {
+    println("side effect")
+}
+
+// 函数组合
+fun compose(f, g, x): i32 { f(g(x)) }
+
+// Error — 多种错误类型
+fun parseOrThrow(s: str): Throw<i32, Error> {
+    if (s == "valid") { Ok(42) }
+    else if (s == "parse_fail") { throw ParseError("invalid syntax") }
+    else { throw Error("unknown error") }
+}
+
+// Nullable + Throw 组合
+fun findOrError2(id: i32): Throw<str, Error> {
+    if (id < 0) {
+        throw Error("invalid id")
+    }
+    if (id == 0) {
+        Ok("")
+    } else {
+        Ok("user" + str(id))
+    }
+}
+
+// Throw — Ok 和 throw 混合
+fun maybeThrow(cond: bool): Throw<i32, Error> {
+    if (cond) { Ok(100) } else { throw Error("failed") }
+}
+
+// 闭包 — 嵌套闭包
+fun outer_fn2(x: i32): i32 {
+    fun inner(y: i32): i32 { x + y }
+    inner(10)
+}
+
+// 综合测试 — Nullable + Throw + 闭包
+fun safeCompute(x: i32): Throw<i32, Error> {
+    if (x < 0) { throw Error("negative") }
+    Ok(x * 2)
+}
+
+// 多层 ? 传播 — Throw 链
+fun step1b(): Throw<i32, Error> { Ok(10) }
+fun step2b(x: i32): Throw<i32, Error> {
+    if (x > 5) { Ok(x * 2) } else { throw Error("too small") }
+}
+
+fun pipeline2(): Throw<i32, Error> {
+    val a = step1b()?
+    val b = step2b(a)?
+    b + 1
+}
+
+// 嵌套 match
+fun nestedMatch(x: i32, y: i32): str {
+    match x {
+        0 => "zero"
+        _ => match y {
+            0 => "x nonzero, y zero"
+            _ => "both nonzero"
+        }
+    }
+}
+
+// defer — 与 throw 交互
+var defer_throw_val = 0
+
+fun throwsWithDefer2(): Throw<i32, Error> {
+    defer defer_throw_val = 99
+    throw Error("oops2")
+}
+
+// Type Alias + 函数
+fun passThreshold(s: i32): bool { s >= 60 }
+
+// 嵌套函数 — 多层嵌套
+fun outer2(x: i32): i32 {
+    fun middle(y: i32): i32 {
+        fun innermost(z: i32): i32 {
+            x + y + z
+        }
+        innermost(100)
+    }
+    middle(10)
+}
+
+// 嵌套函数访问外层局部变量
+fun makeCounter(start: i32): i32 {
+    var count = start
+    fun increment(): i32 {
+        count = count + 1
+        count
+    }
+    increment()
+    increment()
+    increment()
+}
+
+// 嵌套函数 — 嵌套调用
+fun addAndDouble(a: i32, b: i32): i32 {
+    fun double(x: i32): i32 { x * 2 }
+    double(a + b)
+}
+
+// 嵌套递归函数
+fun outer3(n: i32): i32 {
+    fun helper(acc: i32, i: i32): i32 {
+        if (i > n) { acc } else { helper(acc + i, i + 1) }
+    }
+    helper(0, 1)
+}
+
+// defer — defer 在 return 路径执行
+var defer_ret_flag = 0
+
+fun deferReturn2(): i32 {
+    defer defer_ret_flag = 100
+    42
+}
+
+// TCO — 单函数递归
+fun sumTCO(n: i32, acc: i32): i32 {
+    if (n == 0) { acc } else { sumTCO(n - 1, acc + n) }
+}
+
+// Throw — throw 后 defer 仍执行
+var defer_throw_val2 = 0
+
+fun throwsWithDefer3(): Throw<i32, Error> {
+    defer defer_throw_val2 = 55
+    throw Error("defer test")
+}
+
+// 函数作为参数传递给高阶函数
+fun applyTwice(f, x) { f(f(x)) }
+
+// Newtype — newtype 内部值提取
+fun extractGrade(gr: Grade): i32 {
+    match gr {
+        Grade(v) => v
+    }
+}
+
+// Nullable — 三元替代（if-else 表达式）
+fun clamp(v: i32, min_v: i32, max_v: i32): i32 {
+    if (v < min_v) { min_v }
+    else if (v > max_v) { max_v }
+    else { v }
+}
+
+// 守卫条件与或模式组合
+fun classifyNum2(n: i32): str {
+    match n {
+        0 => "zero"
+        1 | 2 | 3 => "small"
+        n if n < 0 => "negative"
+        _ => "other"
+    }
+}
+
+// 记录模式解构
+fun quadrant(p: Pt2): str {
+    match p {
+        Pt2(0, 0) => "origin"
+        Pt2(x, y) if x > 0 && y > 0 => "Q1"
+        Pt2(x, y) if x < 0 && y > 0 => "Q2"
+        Pt2(x, y) if x < 0 && y < 0 => "Q3"
+        Pt2(x, y) if x > 0 && y < 0 => "Q4"
+        _ => "axis"
+    }
+}
+
+// Nullable — if-else 返回 Nullable
+fun safeDiv2(a: i32, b: i32): i32? {
+    if (b == 0) { null } else { a / b }
+}
+
+// Throw — 链式 ? 传播更多场景
+fun parsePositive(s: str): Throw<i32, Error> {
+    if (s == "valid") { Ok(42) }
+    else { throw Error("parse error") }
+}
+
+fun doubleIfPositive(n: i32): Throw<i32, Error> {
+    if (n > 0) { Ok(n * 2) } else { throw Error("not positive") }
+}
+
+fun parseAndDouble(s: str): Throw<i32, Error> {
+    val n = parsePositive(s)?
+    doubleIfPositive(n)?
+}
+
+// 闭包 — 闭包作为参数传递给高阶函数
+fun applyTwice2(f, x) { f(f(x)) }
+
+// 动态数组 — map/filter 模式
+fun mapArray(arr, f) {
+    var result = []
+    for item in arr {
+        result = result.push(f(item))
+    }
+    result
+}
+
+fun filterArray(arr, pred) {
+    var result = []
+    for item in arr {
+        if (pred(item)) {
+            result = result.push(item)
+        }
+    }
+    result
+}
+
+// while — 欧几里得算法迭代版
+fun gcdIter(a: i32, b: i32): i32 {
+    var x = a
+    var y = b
+    while y != 0 {
+        val temp = y
+        y = x % y
+        x = temp
+    }
+    x
+}
+
+// match — 守卫条件
+fun fizzbuzz(n: i32): str {
+    match n {
+        n if n % 15 == 0 => "FizzBuzz"
+        n if n % 3 == 0 => "Fizz"
+        n if n % 5 == 0 => "Buzz"
+        _ => str(n)
+    }
+}
+
+// 递归 — 更复杂的递归
+fun gcd(a: i32, b: i32): i32 {
+    if (b == 0) { a } else { gcd(b, a % b) }
+}
+
+// 递归 — 斐波那契更多
+fun fib2(n: i32): i32 {
+    if (n <= 1) { n } else { fib2(n - 1) + fib2(n - 2) }
+}
+
+// 函数 — 多参数
+fun add3(a: i32, b: i32, c: i32): i32 { a + b + c }
+
+// Nullable — match 中 null 模式
+fun describeNullable(n: i32?): str {
+    match n {
+        null => "is null"
+        0 => "is zero"
+        _ => "is positive"
+    }
+}
+
+// Throw — Ok 包含值
+fun maybeNullResult(x: i32): Throw<i32, Error> {
+    if (x == 0) { Ok(-1) }
+    else { Ok(x) }
+}
+
+// 闭包 — 闭包作为参数传递给高阶函数
+fun applyTwice3(f, x) { f(f(x)) }
+
+
+// ============================================================
+// 测试函数
+// ============================================================
+
+fun test1(): () {
 // ============================================================
 // 1. 基础类型
 // ============================================================
@@ -51,12 +613,6 @@ val err = Error("something failed")
 println(err)
 
 // throw 语句
-fun mightFail(x: i32): Throw<i32, Error> {
-    if (x < 0) {
-        throw Error("negative value")
-    }
-    Ok(x * 2)
-}
 println(mightFail(5))
 
 // ============================================================
@@ -71,7 +627,6 @@ println(r)
 // ============================================================
 // 5. 自定义错误类型
 // ============================================================
-type FileError = Error("file error")
 val fe = FileError("config.json not found")
 println(fe)
 
@@ -104,17 +659,9 @@ var order = ""
 println(order)
 
 // ============================================================
-// 8. TCO - 尾递归
+// 8. TCO — 尾递归
 // ============================================================
-fun sum(n: i32, acc: i32): i32 {
-    if (n == 0) { acc } else { sum(n - 1, acc + n) }
-}
 println(sum(1000, 0))
-
-// TCO - 斐波那契（非尾递归，验证 TCO 不误优化）
-fun fib(n: i32): i32 {
-    if (n <= 1) { n } else { fib(n - 1) + fib(n - 2) }
-}
 println(fib(10))
 
 // ============================================================
@@ -136,6 +683,9 @@ for item in arr {
 }
 println(total)
 
+}
+
+fun test2(): () {
 // ============================================================
 // 11. Error.message 属性访问
 // ============================================================
@@ -208,22 +758,11 @@ println(outer)
 // ============================================================
 // 17. var 参数
 // ============================================================
-fun modify(data: var i32): i32 {
-    data = data + 1
-    data
-}
 val modified = modify(100)
 println(modified)
 
 // ============================================================
-// 18. Panic 构造器
-// ============================================================
-// Panic("message") 会触发 panic 并终止程序，此处不直接测试
-// 以下仅验证 Panic 作为标识符可被识别（不会报 UndefinedVariable）
-// 实际 panic 触发需单独测试
-
-// ============================================================
-// 19. if-else 表达式
+// 18. if-else 表达式
 // ============================================================
 val cond = if (true) { 1 } else { 2 }
 println(cond)
@@ -232,7 +771,7 @@ val cond2 = if (false) { "a" } else { "b" }
 println(cond2)
 
 // ============================================================
-// 20. while 循环
+// 19. while 循环
 // ============================================================
 var w_count = 0
 var w_sum = 0
@@ -242,14 +781,17 @@ while w_count < 5 {
 }
 println(w_sum)
 
+}
+
+fun test3(): () {
 // ============================================================
-// 21. 一元运算
+// 20. 一元运算
 // ============================================================
 println(-42)
 println(!true)
 
 // ============================================================
-// 22. 二元运算
+// 21. 二元运算
 // ============================================================
 println(10 + 3)
 println(10 - 3)
@@ -260,7 +802,7 @@ println(true && false)
 println(true || false)
 
 // ============================================================
-// 23. 相等性
+// 22. 相等性
 // ============================================================
 println(42 == 42)
 println(42 != 43)
@@ -271,7 +813,7 @@ println(eq(42, 42))
 println(eq("abc", "abc"))
 
 // ============================================================
-// 24. 字符串操作
+// 23. 字符串操作
 // ============================================================
 println("hello".len())
 val s = "abc"
@@ -280,36 +822,26 @@ println(s[1])
 println(s[2])
 
 // ============================================================
-// 25. 记录类型
+// 24. 记录类型
 // ============================================================
 val point = (x: 1, y: 2)
 println(point.x)
 println(point.y)
 
 // ============================================================
-// 26. Type Alias / Newtype
+// 25. Type Alias / Newtype
 // ============================================================
-type UserId = UserId(i32)
 val uid = UserId(42)
 println(uid)
 
 // ============================================================
-// 27. ? 传播
+// 26. ? 传播 Nullable
 // ============================================================
-fun maybeNull(): i32? {
-    null
-}
-
-// ? 传播 null：maybeNull()? 返回 null，函数提前退出
-fun useNullable(): i32? {
-    val v = maybeNull()?
-    v + 1
-}
 val use_result = useNullable()
 println(use_result)
 
 // ============================================================
-// 28. loop 和 break
+// 27. loop 和 break
 // ============================================================
 var loop_count = 0
 var loop_sum = 0
@@ -321,7 +853,7 @@ loop {
 println(loop_sum)
 
 // ============================================================
-// 29. for 循环 continue
+// 28. for 循环 continue
 // ============================================================
 var skip_sum = 0
 for i in 1..=10 {
@@ -331,112 +863,28 @@ for i in 1..=10 {
 println(skip_sum)
 
 // ============================================================
-// 30. 函数作为一等公民
+// 29. 函数作为一等公民
 // ============================================================
-fun apply(f, x): i32 {
-    f(x)
-}
 val double = fun(n) { n * 2 }
 println(apply(double, 5))
 
 // ============================================================
-// 31. 嵌套函数
+// 30. 嵌套函数
 // ============================================================
-fun outer_fn(x: i32): i32 {
-    fun inner(y: i32): i32 {
-        x + y
-    }
-    inner(10)
-}
 println(outer_fn(5))
 
 // ============================================================
-// 32. return 语句
+// 31. return 语句
 // ============================================================
-fun earlyReturn(x: i32): i32 {
-    if (x > 10) { return 100 }
-    x
-}
 println(earlyReturn(5))
 println(earlyReturn(20))
 
-// ============================================================
-// 33. 模块循环依赖检测（需要多文件，此处仅验证单文件正常）
-// ============================================================
-
-// ============================================================
-// 34. 泛型 ADT — 泛型列表
-// ============================================================
-
-type List<T> =
-    | Nil
-    | Cons(T, List<T>)
-
-val intList = Cons(1, Cons(2, Cons(3, Nil)))
-println(intList)
-
-// 泛型列表求和
-fun listSum(l: List<i32>): i32 {
-    match l {
-        Nil => 0
-        Cons(head, tail) => head + listSum(tail)
-    }
-}
-println(listSum(intList))
-
-// 字符串列表
-val strList = Cons("x", Cons("y", Cons("z", Nil)))
-println(strList)
-
-// ============================================================
-// 35. 泛型 ADT — 泛型 Pair
-// ============================================================
-
-type Pair<A, B> = Pair(first: A, second: B)
-
-val ip = Pair(10, 20)
-val sp = Pair("hello", 42)
-println(ip.first)
-println(ip.second)
-println(sp.first)
-println(sp.second)
-
-// ============================================================
-// 36. 泛型 ADT — 泛型函数
-// ============================================================
-
-fun identity<T>(x: T): T { x }
-
-val id1 = identity(100)
-val id2 = identity("world")
-println(id1)
-println(id2)
-
-// ============================================================
-// 37. Nullable 与泛型交互
-// ============================================================
-
-fun first<T>(l: List<T>): T? {
-    match l {
-        Nil => null
-        Cons(x, _) => x
-    }
 }
 
-println(first(intList))
-println(first(Nil))
-
+fun test4(): () {
 // ============================================================
-// 38. ? 传播 — Throw 类型
+// 32. ? 传播 — Throw 类型
 // ============================================================
-
-fun safeDiv(a: i32, b: i32): Throw<i32, Error> {
-    if (b == 0) {
-        throw Error("division by zero")
-    }
-    Ok(a / b)
-}
-
 val divResult = match safeDiv(10, 3) {
     Ok(v) => v
     Error(e) => -1
@@ -450,82 +898,26 @@ val divError = match safeDiv(10, 0) {
 println(divError)
 
 // ============================================================
-// 39. 泛型 ADT — 泛型树
+// 33. 多层 ? 传播 Nullable
 // ============================================================
-
-type Tree<T> =
-    | Leaf
-    | Node(T, Tree<T>, Tree<T>)
-
-val intTree = Node(5, Node(3, Leaf, Leaf), Node(8, Leaf, Leaf))
-
-fun treeSum(t: Tree<i32>): i32 {
-    match t {
-        Leaf => 0
-        Node(v, left, right) => v + treeSum(left) + treeSum(right)
-    }
-}
-println(treeSum(intTree))
-
-// ============================================================
-// 40. 泛型 newtype
-// ============================================================
-
-type Wrapper<T> = Wrapper(T)
-
-val wrapped = Wrapper(42)
-println(wrapped)
-
-// ============================================================
-// 41. 多层 ? 传播
-// ============================================================
-
-fun getFirst(): i32? { null }
-fun getSecond(): i32? { 42 }
-
-fun chain(): i32? {
-    val a = getFirst()?
-    val b = getSecond()?
-    a + b
-}
 println(chain())
-
-fun chain2(): i32? {
-    val b = getSecond()?
-    b + 1
-}
 println(chain2())
 
 // ============================================================
-// 42. Nullable 类型收窄 — if 分支
+// 34. Nullable 类型收窄 — if 分支
 // ============================================================
-
-// if 收窄：在 then 分支中 s 被收窄为 str
-fun length(s: str?): i32 {
-    if (s != null) { s.len() } else { 0 }
-}
 println(length("hello"))
 println(length(null))
 
 // ============================================================
-// 43. Nullable 类型收窄 — match 分支
+// 35. Nullable 类型收窄 — match 分支
 // ============================================================
-
-fun describe(n: i32?): str {
-    match n {
-        null => "nothing"
-        x => "got " + str(x)
-    }
-}
 println(describe(null))
 println(describe(42))
 
 // ============================================================
-// 44. Nullable — 链式 ?.
+// 36. Nullable — 链式 ?.
 // ============================================================
-
-type Address = Address(city: str)
-type User = User(name: str, addr: Address?)
 val u1: User? = User("Alice", Address("Beijing"))
 val u2: User? = null
 
@@ -534,9 +926,8 @@ println(u1?.addr?.city)
 println(u2?.name)
 
 // ============================================================
-// 45. Nullable — 链式 ??
+// 37. Nullable — 链式 ??
 // ============================================================
-
 val a1: i32? = null
 val a2: i32? = null
 val a3: i32? = 42
@@ -548,9 +939,8 @@ val chain_elvis2 = a1 ?? a2 ?? 99
 println(chain_elvis2)
 
 // ============================================================
-// 46. 所有整数类型
+// 38. 所有整数类型
 // ============================================================
-
 val v_i8: i8 = 127
 val v_i16: i16 = 32767
 val v_i32: i32 = 2147483647
@@ -575,25 +965,17 @@ println(v_u64)
 println(v_u128)
 
 // ============================================================
-// 47. 浮点类型 f32 / f64
+// 39. 浮点类型 f32 / f64
 // ============================================================
-
 val f32_val: f32 = 3.14
 val f64_val: f64 = 2.718281828
 println(f32_val)
 println(f64_val)
 
-// 浮点类型后缀
-val f32_lit: f32 = 1.5
-val f64_lit: f64 = 2.5
-println(f32_lit)
-println(f64_lit)
-
 // ============================================================
-// 48. 类型转换 — narrowing 运行时检查
+// 40. 类型转换 — widening/narrowing
 // ============================================================
-
-// widening: 小类型到大类型
+// widening
 val i8_to_i32 = i32(v_i8)
 val i32_to_i64 = i64(v_i32)
 val i32_to_f64 = f64(v_i32)
@@ -601,44 +983,26 @@ println(i8_to_i32)
 println(i32_to_i64)
 println(i32_to_f64)
 
-// narrowing: 大类型到小类型（合法范围内）
+// narrowing（合法范围内）
 val small_i64: i64 = 100
 val i64_to_i32 = i32(small_i64)
 println(i64_to_i32)
 
-// bool 与整数互转（bool→int 暂未实现，仅测试 int→bool 相关逻辑）
-// val bool_to_i32 = i32(true)
-
 // ============================================================
-// 49. Type Alias
+// 41. Type Alias
 // ============================================================
-
-type IntList = List<i32>
-type Name = str
-
-val names: IntList = Cons(1, Cons(2, Nil))
-println(listSum(names))
-
 val my_name: Name = "Glue"
 println(my_name)
 
-// ============================================================
-// 50. Error 子类型验证
-// ============================================================
+val my_age: Age = 25
+println(my_age)
 
-type NetworkError = Error("network error")
-
-// 自定义错误类型可以赋值给 Error 类型的变量
-fun handleErrors(x: i32): Throw<i32, Error> {
-    if (x == 1) {
-        throw FileError("file not found")
-    }
-    if (x == 2) {
-        throw NetworkError("connection refused")
-    }
-    Ok(x)
 }
 
+fun test5(): () {
+// ============================================================
+// 42. Error 子类型验证
+// ============================================================
 val err1 = match handleErrors(1) {
     Ok(v) => v
     Error(e) => -1
@@ -658,15 +1022,8 @@ val err3 = match handleErrors(3) {
 println(err3)
 
 // ============================================================
-// 51. defer 覆盖 throw 路径
+// 43. defer 覆盖 throw 路径
 // ============================================================
-
-var defer_throw_flag = 0
-fun throwsWithDefer(): Throw<i32, Error> {
-    defer defer_throw_flag = 42
-    throw Error("oops")
-}
-
 val throw_result = match throwsWithDefer() {
     Ok(v) => v
     Error(e) => -1
@@ -675,9 +1032,8 @@ println(throw_result)
 println(defer_throw_flag)
 
 // ============================================================
-// 52. 动态数组 T[] 操作
+// 44. 动态数组 T[] 操作
 // ============================================================
-
 var dyn_arr = [1, 2, 3]
 println(dyn_arr.len())
 
@@ -713,30 +1069,12 @@ val dropped = dyn_arr.drop_last()
 println(dropped)
 
 // ============================================================
-// 53. Nullable 与泛型交互 — 更多场景
+// 45. Nullable 与泛型交互 — 更多场景
 // ============================================================
-
-// Nullable 作为函数返回值
-fun findUser(id: i32): str? {
-    if (id == 1) { "Alice" } else { null }
-}
-
 val user1 = findUser(1)
 val user2 = findUser(2)
 println(user1 ?? "unknown")
 println(user2 ?? "unknown")
-
-// Nullable 嵌套在 Throw 中
-fun findOrError(id: i32): Throw<str?, Error> {
-    if (id < 0) {
-        throw Error("invalid id")
-    }
-    if (id == 0) {
-        Ok(null)
-    } else {
-        Ok(findUser(id))
-    }
-}
 
 val r3 = match findOrError(-1) {
     Ok(v) => v ?? "null value"
@@ -757,32 +1095,29 @@ val r5 = match findOrError(1) {
 println(r5)
 
 // ============================================================
-// 54. Range 更多场景
+// 46. Range 更多场景
 // ============================================================
-
-// 范围求和
 var sum_1_10 = 0
 for i in 1..=10 {
     sum_1_10 = sum_1_10 + i
 }
 println(sum_1_10)
 
-// 排除范围
 var sum_1_9 = 0
 for i in 1..10 {
     sum_1_9 = sum_1_9 + i
 }
 println(sum_1_9)
 
-// ============================================================
-// 55. 字符串更多操作
-// ============================================================
+}
 
-// 字符串拼接
+fun test6(): () {
+// ============================================================
+// 47. 字符串更多操作
+// ============================================================
 val hello = "Hello" + " " + "World"
 println(hello)
 
-// 字符串比较
 println("abc" == "abc")
 println("abc" != "def")
 
@@ -793,10 +1128,8 @@ println("x = {x_val}, y = {y_val}")
 println("sum = {x_val + 10}")
 
 // ============================================================
-// 56. 记录类型更多操作
+// 48. 记录类型更多操作
 // ============================================================
-
-// 记录字段修改
 var pt = (x: 10, y: 20)
 pt.x = 30
 println(pt.x)
@@ -809,22 +1142,17 @@ println(nested.inner.b)
 println(nested.label)
 
 // ============================================================
-// 57. Newtype 解包
+// 49. Newtype 解包
 // ============================================================
-
-type Celsius = Celsius(f64)
 val temp = Celsius(36.5)
-
-// match 解包 newtype
 val raw_temp = match temp {
     Celsius(v) => v
 }
 println(raw_temp)
 
 // ============================================================
-// 58. 多种整数运算
+// 50. 多种整数运算
 // ============================================================
-
 // 位运算
 println(0xFF & 0x0F)
 println(0xF0 | 0x0F)
@@ -837,19 +1165,16 @@ println(1 <= 1)
 println(1 >= 1)
 
 // ============================================================
-// 59. 字符操作
+// 51. 字符操作
 // ============================================================
-
 val ch_a = 'A'
 val ch_z = 'Z'
 println(ch_a)
 println(ch_z)
-
-// 字符比较
 println(ch_a < ch_z)
 
 // ============================================================
-// 60. 闭包捕获 — 捕获多个外部变量
+// 52. 闭包捕获 — 捕获多个外部变量
 // ============================================================
 val base_v = 10
 val mult_v = 3
@@ -857,57 +1182,27 @@ val compute = fun(x) { base_v + x * mult_v }
 println(compute(5))
 
 // ============================================================
-// 61. 递归与 TCO — 更深层递归
+// 53. 递归与 TCO — 更深层递归
 // ============================================================
-
-// 阶乘（非尾递归）
-fun factorial(n: i32): i32 {
-    if (n <= 1) { 1 } else { n * factorial(n - 1) }
-}
 println(factorial(10))
-
-// 尾递归倒计数
-fun countdown(n: i32): i32 {
-    if (n == 0) { 0 } else { countdown(n - 1) }
-}
 println(countdown(1000))
 
 // ============================================================
-// 62. 多种 match 模式
+// 54. 多种 match 模式
 // ============================================================
-
-// 字面量模式
-fun classify(n: i32): str {
-    match n {
-        0 => "zero"
-        1 => "one"
-        _ => "other"
-    }
-}
 println(classify(0))
 println(classify(1))
 println(classify(42))
 
-// 布尔模式
-fun boolMatch(b: bool): str {
-    match b {
-        true => "yes"
-        false => "no"
-    }
-}
 println(boolMatch(true))
 println(boolMatch(false))
 
-// ============================================================
-// 63. 空值安全操作综合
-// ============================================================
-
-type Config = Config(host: str, port: i32)
-
-fun loadConfig(): Config? {
-    null
 }
 
+fun test7(): () {
+// ============================================================
+// 55. 空值安全操作综合
+// ============================================================
 val config = loadConfig()
 val host = config?.host ?? "localhost"
 val port = config?.port ?? 8080
@@ -915,28 +1210,8 @@ println(host)
 println(port)
 
 // ============================================================
-// 64. Throw 链式 ? 传播
+// 56. Throw 链式 ? 传播
 // ============================================================
-
-fun step1(): Throw<i32, Error> {
-    Ok(10)
-}
-
-fun step2(x: i32): Throw<i32, Error> {
-    if (x > 5) { Ok(x * 2) } else { throw Error("too small") }
-}
-
-fun step3(x: i32): Throw<i32, Error> {
-    if (x < 100) { Ok(x + 1) } else { throw Error("too large") }
-}
-
-fun pipeline(): Throw<i32, Error> {
-    val a = step1()?
-    val b = step2(a)?
-    val c = step3(b)?
-    c
-}
-
 val pipe_result = match pipeline() {
     Ok(v) => v
     Error(e) => -1
@@ -944,40 +1219,26 @@ val pipe_result = match pipeline() {
 println(pipe_result)
 
 // ============================================================
-// 65. 数组迭代与变换
+// 57. 数组迭代与变换
 // ============================================================
-
 val nums = [10, 20, 30, 40, 50]
-
-// 手动求和
 var arr_sum = 0
 for n in nums {
     arr_sum = arr_sum + n
 }
 println(arr_sum)
 
-// 数组索引访问
 println(nums[0])
 println(nums[4])
 
 // ============================================================
-// 66. 多个 defer 和 return 交互
+// 58. 多个 defer 和 return 交互
 // ============================================================
-
-fun deferReturn(): i32 {
-    var result = 0
-    {
-        defer result = result + 10
-        result = 5
-    }
-    result
-}
 println(deferReturn())
 
 // ============================================================
-// 67. 字符串迭代
+// 59. 字符串迭代
 // ============================================================
-
 var char_count = 0
 for ch in "Hello" {
     char_count = char_count + 1
@@ -985,62 +1246,47 @@ for ch in "Hello" {
 println(char_count)
 
 // ============================================================
-// 68. 单位值
+// 60. 单位值
 // ============================================================
-
-fun doNothing(): () { }
 val unit_val = doNothing()
 println(unit_val)
 
 // ============================================================
-// 69. str() 内建转换函数
+// 61. str() 内建转换函数
 // ============================================================
-
 println(str(42))
 println(str(3.14))
 println(str(true))
 
 // ============================================================
-// 70. 字符串转义字符
+// 62. 字符串转义字符
 // ============================================================
-
 println("tab\there")
 println("newline\nhere")
 println("back\\slash")
 
 // ============================================================
-// 71. Nullable — 函数参数和返回值
+// 63. Nullable — 函数参数和返回值
 // ============================================================
-
-fun defaultIfNull(value: i32?, default: i32) {
-    value ?? default
-}
 println(defaultIfNull(null, 0))
 println(defaultIfNull(42, 0))
 
-// Nullable 返回值 — 返回非空值
-fun wrapInNullable(x: i32): i32? { x }
 val wrapped_val = wrapInNullable(100)
 println(wrapped_val ?? -1)
 
 // ============================================================
-// 72. Nullable — 非空断言和链式操作综合
+// 64. Nullable — 非空断言和链式操作综合
 // ============================================================
-
 val maybe_str: str? = "hello"
 println(maybe_str!)
 println(maybe_str?.len())
 
-// ============================================================
-// 73. Throw — 多分支验证
-// ============================================================
-
-fun validateAge(age: i32): Throw<i32, Error> {
-    if (age < 0) { throw Error("age cannot be negative") }
-    if (age > 150) { throw Error("age too large") }
-    Ok(age)
 }
 
+fun test8(): () {
+// ============================================================
+// 65. Throw — 多分支验证
+// ============================================================
 val age1 = match validateAge(25) {
     Ok(v) => v
     Error(e) => -1
@@ -1060,19 +1306,16 @@ val age3 = match validateAge(200) {
 println(age3)
 
 // ============================================================
-// 74. 闭包 — 闭包作为函数参数传递
+// 66. 闭包 — 闭包作为函数参数传递
 // ============================================================
-
-fun transform(value: i32, f): i32 { f(value) }
 val doubled = transform(21, fun(x) { x * 2 })
 val squared = transform(5, fun(x) { x * x })
 println(doubled)
 println(squared)
 
 // ============================================================
-// 75. 闭包 — 捕获多个变量
+// 67. 闭包 — 捕获多个变量
 // ============================================================
-
 val a_val = 5
 val b_val = 10
 val combined = fun(x) { a_val * x + b_val }
@@ -1087,9 +1330,8 @@ adder(3)
 println(accum)
 
 // ============================================================
-// 76. var — 值语义深拷贝
+// 68. var — 值语义深拷贝
 // ============================================================
-
 var original = 42
 var copy_val = original
 copy_val = 100
@@ -1097,23 +1339,16 @@ println(original)
 println(copy_val)
 
 // ============================================================
-// 77. 记录类型 — 记录作为函数参数和返回值
+// 69. 记录类型 — 记录作为函数参数和返回值
 // ============================================================
-
-type Point = Point(x: i32, y: i32)
-
-fun makePoint(x: i32, y: i32): Point { Point(x, y) }
-fun pointSum(p: Point): i32 { p.x + p.y }
-
 val pt3 = makePoint(3, 4)
 println(pt3.x)
 println(pt3.y)
 println(pointSum(pt3))
 
 // ============================================================
-// 78. 动态数组 — 操作组合
+// 70. 动态数组 — 操作组合
 // ============================================================
-
 var dyn2 = [10, 20, 30]
 dyn2 = dyn2.push(40)
 dyn2 = dyn2.push(50)
@@ -1126,9 +1361,8 @@ val first_elem = dyn2.first()
 println(first_elem ?? -1)
 
 // ============================================================
-// 79. Range — 求积
+// 71. Range — 求积
 // ============================================================
-
 var product = 1
 for i in 1..=5 {
     product = product * i
@@ -1136,20 +1370,14 @@ for i in 1..=5 {
 println(product)
 
 // ============================================================
-// 80. Type Alias — 别名在函数签名中使用
+// 72. Type Alias — 别名在函数签名中使用
 // ============================================================
-
-type Age = i32
-
-fun isAdult(age: i32): bool { age >= 18 }
 println(isAdult(20))
 println(isAdult(10))
 
 // ============================================================
-// 81. Newtype — 解包更多场景
+// 73. Newtype — 解包更多场景
 // ============================================================
-
-type Email = Email(str)
 val email = Email("test@example.com")
 val email_str = match email {
     Email(s) => s
@@ -1157,46 +1385,26 @@ val email_str = match email {
 println(email_str)
 
 // ============================================================
-// 82. match — 字符串和字面量模式
+// 74. match — 字符串和字面量模式
 // ============================================================
-
-fun direction(s: str): i32 {
-    match s {
-        "north" => 1
-        "south" => 2
-        "east" => 3
-        "west" => 4
-        _ => 0
-    }
-}
 println(direction("north"))
 println(direction("south"))
 println(direction("unknown"))
 
 // ============================================================
-// 83. 嵌套 if-else 表达式
+// 75. 嵌套 if-else 表达式
 // ============================================================
-
-fun classifyNum(x: i32): str {
-    if (x < 0) {
-        "negative"
-    } else if (x == 0) {
-        "zero"
-    } else if (x < 100) {
-        "small"
-    } else {
-        "large"
-    }
-}
 println(classifyNum(-5))
 println(classifyNum(0))
 println(classifyNum(50))
 println(classifyNum(200))
 
-// ============================================================
-// 84. 浮点运算更多
-// ============================================================
+}
 
+fun test9(): () {
+// ============================================================
+// 76. 浮点运算更多
+// ============================================================
 val f1: f64 = 10.0
 val f2: f64 = 3.0
 println(f1 + f2)
@@ -1204,9 +1412,8 @@ println(f1 - f2)
 println(f1 * f2)
 
 // ============================================================
-// 85. bool 运算更多
+// 77. bool 运算更多
 // ============================================================
-
 val t_val = true
 val f_val = false
 println(t_val && t_val)
@@ -1215,18 +1422,13 @@ println(t_val || f_val)
 println(f_val || f_val)
 
 // ============================================================
-// 86. 单位值更多场景
+// 78. 单位值更多场景
 // ============================================================
-
-fun sideEffect(): () {
-    println("side effect")
-}
 val unit_result = sideEffect()
 
 // ============================================================
-// 87. 数组 — 求最大值
+// 79. 数组 — 求最大值
 // ============================================================
-
 val nums_arr = [5, 3, 8, 1, 9, 2]
 var max_val = nums_arr[0]
 for n in nums_arr {
@@ -1235,34 +1437,22 @@ for n in nums_arr {
 println(max_val)
 
 // ============================================================
-// 88. 字符串 — 拼接和比较
+// 80. 字符串 — 拼接和比较
 // ============================================================
-
 val greeting = "Hello" + ", " + "World" + "!"
 println(greeting)
 println("abc" < "abd")
 
 // ============================================================
-// 89. 泛型 — compose 函数
+// 81. 函数组合
 // ============================================================
-
-fun compose(f, g, x): i32 { f(g(x)) }
 val double_it = fun(x) { x * 2 }
 val add_one = fun(x) { x + 1 }
 println(compose(double_it, add_one, 5))
 
 // ============================================================
-// 90. Error — 多种错误类型
+// 82. Error — 多种错误类型
 // ============================================================
-
-type ParseError = Error("parse error")
-
-fun parseOrThrow(s: str): Throw<i32, Error> {
-    if (s == "valid") { Ok(42) }
-    else if (s == "parse_fail") { throw ParseError("invalid syntax") }
-    else { throw Error("unknown error") }
-}
-
 val pr1 = match parseOrThrow("valid") {
     Ok(v) => v
     Error(e) => -1
@@ -1282,10 +1472,8 @@ val pr3 = match parseOrThrow("other") {
 println(pr3)
 
 // ============================================================
-// 91. defer — 循环和嵌套块
+// 83. defer — 循环和嵌套块
 // ============================================================
-
-// defer 在嵌套块中
 var defer_nested = ""
 {
     defer defer_nested = defer_nested + "outer"
@@ -1296,29 +1484,14 @@ var defer_nested = ""
 println(defer_nested)
 
 // ============================================================
-// 92. 类型转换 — 更多场景
+// 84. 类型转换 — 更多场景
 // ============================================================
-
-// 整数到浮点
 val int_to_float = f64(42)
 println(int_to_float)
 
 // ============================================================
-// 93. Nullable + Throw 组合
+// 85. Nullable + Throw 组合
 // ============================================================
-
-// Nullable 嵌套在 Throw 中
-fun findOrError2(id: i32): Throw<str, Error> {
-    if (id < 0) {
-        throw Error("invalid id")
-    }
-    if (id == 0) {
-        Ok("")
-    } else {
-        Ok("user" + str(id))
-    }
-}
-
 val r6 = match findOrError2(-1) {
     Ok(v) => v
     Error(e) => "error"
@@ -1337,19 +1510,19 @@ val r8 = match findOrError2(5) {
 }
 println(r8)
 
-// ============================================================
-// 94. 记录 — 字段更新
-// ============================================================
+}
 
+fun test10(): () {
+// ============================================================
+// 86. 记录 — 字段更新
+// ============================================================
 var config2 = (host: "localhost", port: 8080)
 config2.host = "127.0.0.1"
 println(config2.host)
 
 // ============================================================
-// 95. Nullable — if-else 返回不同类型（auto-widening）
+// 87. Nullable — if-else 返回不同类型（auto-widening）
 // ============================================================
-
-// if 分支返回 i32，else 分支返回 null，统一为 i32?
 val maybe_val: i32? = if (true) { 42 } else { null }
 println(maybe_val ?? -1)
 
@@ -1357,13 +1530,8 @@ val maybe_val2: i32? = if (false) { 42 } else { null }
 println(maybe_val2 ?? -1)
 
 // ============================================================
-// 96. Throw — Ok 和 throw 混合
+// 88. Throw — Ok 和 throw 混合
 // ============================================================
-
-fun maybeThrow(cond: bool): Throw<i32, Error> {
-    if (cond) { Ok(100) } else { throw Error("failed") }
-}
-
 val mt1 = match maybeThrow(true) {
     Ok(v) => v
     Error(e) => -1
@@ -1377,24 +1545,13 @@ val mt2 = match maybeThrow(false) {
 println(mt2)
 
 // ============================================================
-// 97. 闭包 — 嵌套闭包
+// 89. 闭包 — 嵌套闭包
 // ============================================================
-
-fun outer_fn2(x: i32): i32 {
-    fun inner(y: i32): i32 { x + y }
-    inner(10)
-}
 println(outer_fn2(5))
 
 // ============================================================
-// 98. 综合测试 — Nullable + Throw + 闭包
+// 90. 综合测试 — Nullable + Throw + 闭包
 // ============================================================
-
-fun safeCompute(x: i32): Throw<i32, Error> {
-    if (x < 0) { throw Error("negative") }
-    Ok(x * 2)
-}
-
 val sc1 = match safeCompute(10) {
     Ok(v) => v
     Error(e) => -1
@@ -1414,20 +1571,8 @@ val sc3 = match safeCompute(-5) {
 println(sc3)
 
 // ============================================================
-// 99. 多层 ? 传播 — Throw 链
+// 91. 多层 ? 传播 — Throw 链
 // ============================================================
-
-fun step1b(): Throw<i32, Error> { Ok(10) }
-fun step2b(x: i32): Throw<i32, Error> {
-    if (x > 5) { Ok(x * 2) } else { throw Error("too small") }
-}
-
-fun pipeline2(): Throw<i32, Error> {
-    val a = step1b()?
-    val b = step2b(a)?
-    b + 1
-}
-
 val pipe2_result = match pipeline2() {
     Ok(v) => v
     Error(e) => -1
@@ -1435,22 +1580,8 @@ val pipe2_result = match pipeline2() {
 println(pipe2_result)
 
 // ============================================================
-// 100. 泛型 ADT — 更多模式匹配
+// 92. 数组 — 索引访问和迭代
 // ============================================================
-
-fun listLength(l: List<i32>): i32 {
-    match l {
-        Nil => 0
-        Cons(_, tail) => 1 + listLength(tail)
-    }
-}
-println(listLength(Nil))
-println(listLength(Cons(1, Cons(2, Cons(3, Nil)))))
-
-// ============================================================
-// 101. 数组 — 索引访问和迭代
-// ============================================================
-
 val arr2 = [100, 200, 300]
 println(arr2[0])
 println(arr2[1])
@@ -1463,41 +1594,31 @@ for v in arr2 {
 println(arr_total)
 
 // ============================================================
-// 102. 字符串 — 插值复杂表达式
+// 93. 字符串 — 插值复杂表达式
 // ============================================================
-
 val px = 3
 val py = 4
 println("point: ({px}, {py})")
 println("distance squared: {px * px + py * py}")
 
 // ============================================================
-// 103. 记录 — 记录字段访问链
+// 94. 记录 — 记录字段访问链
 // ============================================================
-
-type Addr = Addr(city: str, zip: i32)
-type Person = Person(name: str, addr: Addr)
-
 val person = Person("Bob", Addr("Shanghai", 200000))
 println(person.name)
 println(person.addr.city)
 println(person.addr.zip)
 
 // ============================================================
-// 104. 递归 — 斐波那契更多
+// 95. 递归 — 斐波那契更多
 // ============================================================
-
-fun fib2(n: i32): i32 {
-    if (n <= 1) { n } else { fib2(n - 1) + fib2(n - 2) }
-}
 println(fib2(0))
 println(fib2(1))
 println(fib2(15))
 
 // ============================================================
-// 105. while 循环 — 复杂条件
+// 96. while 循环 — 复杂条件
 // ============================================================
-
 var w_a = 1
 var w_b = 1
 while w_a < 100 {
@@ -1507,27 +1628,19 @@ while w_a < 100 {
 }
 println(w_a)
 
-// ============================================================
-// 106. match — 嵌套 match
-// ============================================================
-
-fun nestedMatch(x: i32, y: i32): str {
-    match x {
-        0 => "zero"
-        _ => match y {
-            0 => "x nonzero, y zero"
-            _ => "both nonzero"
-        }
-    }
 }
+
+fun test11(): () {
+// ============================================================
+// 97. 嵌套 match
+// ============================================================
 println(nestedMatch(0, 0))
 println(nestedMatch(1, 0))
 println(nestedMatch(1, 1))
 
 // ============================================================
-// 107. loop — 带条件退出
+// 98. loop — 带条件退出
 // ============================================================
-
 var loop_val = 1
 var loop_result = 1
 loop {
@@ -1538,10 +1651,8 @@ loop {
 println(loop_result)
 
 // ============================================================
-// 108. Newtype — 多种 newtype
+// 99. Newtype — 多种 newtype
 // ============================================================
-
-type Kelvin = Kelvin(f64)
 val k = Kelvin(273.15)
 val k_raw = match k {
     Kelvin(v) => v
@@ -1549,70 +1660,43 @@ val k_raw = match k {
 println(k_raw)
 
 // ============================================================
-// 109. Type Alias — 别名等价性
+// 100. 函数 — 多参数
 // ============================================================
-
-type IntList2 = List<i32>
-val il: IntList2 = Cons(10, Cons(20, Nil))
-println(listSum(il))
-
-// ============================================================
-// 110. 函数 — 多参数和默认值
-// ============================================================
-
-fun add3(a: i32, b: i32, c: i32): i32 { a + b + c }
 println(add3(1, 2, 3))
 
 // ============================================================
-// 111. 二元运算 — 比较运算符
+// 101. 二元运算 — 比较运算符
 // ============================================================
-
 println(10 <= 10)
 println(10 >= 10)
 println(10 < 20)
 println(20 > 10)
 
 // ============================================================
-// 112. 字符串 — len 和索引
+// 102. 字符串 — len 和索引
 // ============================================================
-
 val s2 = "Glue"
 println(s2.len())
 println(s2[0])
 
 // ============================================================
-// 113. 动态数组 — contains 和 isEmpty
+// 103. 动态数组 — contains 和 isEmpty
 // ============================================================
-
 val check_arr = [1, 2, 3, 4, 5]
 println(check_arr.contains(3))
 println(check_arr.contains(99))
 println(check_arr.isEmpty())
 
 // ============================================================
-// 114. Nullable — match 中 null 模式
+// 104. Nullable — match 中 null 模式
 // ============================================================
-
-fun describeNullable(n: i32?): str {
-    match n {
-        null => "is null"
-        0 => "is zero"
-        _ => "is positive"
-    }
-}
 println(describeNullable(null))
 println(describeNullable(0))
 println(describeNullable(42))
 
 // ============================================================
-// 115. Throw — Ok 包含 null
+// 105. Throw — Ok 包含值
 // ============================================================
-
-fun maybeNullResult(x: i32): Throw<i32, Error> {
-    if (x == 0) { Ok(-1) }
-    else { Ok(x) }
-}
-
 val mnr1 = match maybeNullResult(0) {
     Ok(v) => v
     Error(e) => -2
@@ -1626,19 +1710,8 @@ val mnr2 = match maybeNullResult(5) {
 println(mnr2)
 
 // ============================================================
-// 116. 泛型 — identity 更多
+// 106. Error — 自定义错误 message
 // ============================================================
-
-val id3 = identity(42)
-val id4 = identity("test")
-println(id3)
-println(id4)
-
-// ============================================================
-// 117. Error — 自定义错误 message
-// ============================================================
-
-type DbError = Error("database error")
 val dbe = DbError("connection timeout")
 val dbe_msg = match dbe {
     Ok(v) => "ok"
@@ -1647,15 +1720,8 @@ val dbe_msg = match dbe {
 println(dbe_msg)
 
 // ============================================================
-// 118. defer — 与 throw 交互
+// 107. defer — 与 throw 交互
 // ============================================================
-
-var defer_throw_val = 0
-fun throwsWithDefer2(): Throw<i32, Error> {
-    defer defer_throw_val = 99
-    throw Error("oops2")
-}
-
 val dt2 = match throwsWithDefer2() {
     Ok(v) => v
     Error(e) => -1
@@ -1663,110 +1729,49 @@ val dt2 = match throwsWithDefer2() {
 println(dt2)
 println(defer_throw_val)
 
-// ============================================================
-// 119. 数组 — 固定数组操作
-// ============================================================
+}
 
+fun test12(): () {
+// ============================================================
+// 108. 数组 — 固定数组操作
+// ============================================================
 val fixed: i32[3] = [10, 20, 30]
 println(fixed.len())
 println(fixed[0])
 println(fixed[2])
 
 // ============================================================
-// 120. 综合测试 — 多特性组合
+// 109. 嵌套函数 — 多层嵌套
 // ============================================================
-
-// 泛型 + Nullable + match
-fun safeHead(l: List<i32>): i32? {
-    match l {
-        Nil => null
-        Cons(x, _) => x
-    }
-}
-println(safeHead(Nil))
-println(safeHead(Cons(7, Nil)))
-
-// Type Alias + 函数
-type Score = i32
-fun passThreshold(s: i32): bool { s >= 60 }
-println(passThreshold(85))
-println(passThreshold(30))
-
-// ============================================================
-// 121. 嵌套函数 — 多层嵌套
-// ============================================================
-
-fun outer2(x: i32): i32 {
-    fun middle(y: i32): i32 {
-        fun innermost(z: i32): i32 {
-            x + y + z
-        }
-        innermost(100)
-    }
-    middle(10)
-}
 println(outer2(1))
-
-// 嵌套函数访问外层局部变量
-fun makeCounter(start: i32): i32 {
-    var count = start
-    fun increment(): i32 {
-        count = count + 1
-        count
-    }
-    increment()
-    increment()
-    increment()
-}
 println(makeCounter(0))
 
 // ============================================================
-// 122. 方法链式调用
+// 110. 方法链式调用
 // ============================================================
-
-// 字符串方法链
 val chain_str = "Hello"
 println(chain_str.len())
 
-// 数组方法链
 val chain_arr = [1, 2, 3]
 println(chain_arr.push(4).len())
 println(chain_arr.push(10).push(20).len())
 
 // ============================================================
-// 123. 嵌套函数 — 嵌套调用
+// 111. 嵌套函数 — 嵌套调用
 // ============================================================
-
-fun addAndDouble(a: i32, b: i32): i32 {
-    fun double(x: i32): i32 { x * 2 }
-    double(a + b)
-}
 println(addAndDouble(3, 4))
-
-// 嵌套递归函数
-fun outer3(n: i32): i32 {
-    fun helper(acc: i32, i: i32): i32 {
-        if (i > n) { acc } else { helper(acc + i, i + 1) }
-    }
-    helper(0, 1)
-}
 println(outer3(10))
 
 // ============================================================
-// 124. 记录 — 嵌套记录方法
+// 112. 记录 — 嵌套记录方法
 // ============================================================
-
-type Inner2 = Inner2(value: i32)
-type Outer2 = Outer2(inner: Inner2, label: str)
-
 val o2 = Outer2(Inner2(42), "test")
 println(o2.inner.value)
 println(o2.label)
 
 // ============================================================
-// 125. 字面量 — 十六进制、八进制、二进制
+// 113. 字面量 — 十六进制、八进制、二进制
 // ============================================================
-
 val hex_val = 0xFF
 println(hex_val)
 
@@ -1777,31 +1782,27 @@ val bin_val = 0b1010
 println(bin_val)
 
 // ============================================================
-// 126. 字面量 — 下划线分隔
+// 114. 字面量 — 下划线分隔
 // ============================================================
-
 val big_num = 1_000_000
 println(big_num)
 
 // ============================================================
-// 127. 位运算 — 与、或、异或
+// 115. 位运算 — 与、或、异或
 // ============================================================
-
 println(0xFF & 0x0F)
 println(0xF0 | 0x0F)
 println(0xFF ^ 0x0F)
 
 // ============================================================
-// 128. 字符串 — len() 返回 Unicode 标量值
+// 116. 字符串 — len() 返回 Unicode 标量值
 // ============================================================
-
 val utf8_str = "Hello"
-println(utf8_str.len())   // 5
+println(utf8_str.len())
 
 // ============================================================
-// 129. 数组 — 动态数组更多操作
+// 117. 数组 — 动态数组更多操作
 // ============================================================
-
 var da = [10, 20, 30, 40, 50]
 println(da.contains(30))
 println(da.contains(99))
@@ -1809,73 +1810,53 @@ println(da.isEmpty())
 println(da.first() ?? -1)
 println(da.last() ?? -1)
 
-// drop_last
 val da2 = da.drop_last()
 println(da2)
 
 // ============================================================
-// 130. 闭包 — 返回闭包的函数
+// 118. 闭包 — 返回闭包的函数（间接测试）
 // ============================================================
-
-// 注：返回闭包的函数需要显式类型标注（当前类型推断限制）
-// 此处用间接方式测试：闭包直接赋值给变量
 val add5 = fun(y) { 5 + y }
 val add10 = fun(y) { 10 + y }
 println(add5(3))
 println(add10(3))
 
-// ============================================================
-// 131. defer — defer 在 return 路径执行
-// ============================================================
-
-var defer_ret_flag = 0
-fun deferReturn2(): i32 {
-    defer defer_ret_flag = 100
-    42
 }
+
+fun test13(): () {
+// ============================================================
+// 119. defer — defer 在 return 路径执行
+// ============================================================
 val dr2 = deferReturn2()
 println(dr2)
 println(defer_ret_flag)
 
 // ============================================================
-// 132. TCO — 相互递归
-// 注：相互递归需要前向声明，当前不支持
-// 改用单函数递归测试 TCO
-fun sumTCO(n: i32, acc: i32): i32 {
-    if (n == 0) { acc } else { sumTCO(n - 1, acc + n) }
-}
+// 120. TCO — 单函数递归
+// ============================================================
 println(sumTCO(100, 0))
 
 // ============================================================
-// 133. 类型转换 — 更多 widening/narrowing
+// 121. 类型转换 — 更多 widening/narrowing
 // ============================================================
-
-// i32 -> f64
 val i32_to_f = f64(100)
 println(i32_to_f)
 
-// i8 -> i32
 val i8_v2: i8 = 50
 val i8_widened = i32(i8_v2)
 println(i8_widened)
 
 // ============================================================
-// 134. Nullable — 多层嵌套安全访问
+// 122. Nullable — 多层嵌套安全访问
 // ============================================================
-
-type Deep = Deep(v: i32)
-type Mid = Mid(d: Deep?)
-type Top = Top(m: Mid?)
-
 val top_full = Top(Mid(Deep(42)))
 
 println(top_full?.m?.d?.v ?? -1)
 println(top_full.m?.d?.v ?? -1)
 
 // ============================================================
-// 135. 数组 — 空数组操作
+// 123. 数组 — 空数组操作
 // ============================================================
-
 val empty: i32[] = []
 println(empty.isEmpty())
 println(empty.len())
@@ -1883,28 +1864,22 @@ println(empty.first())
 println(empty.last())
 
 // ============================================================
-// 136. 闭包 — 闭包作为返回值组合
+// 124. 闭包 — 闭包作为返回值组合（间接测试）
 // ============================================================
-
-// 注：返回闭包的函数需要显式类型标注（当前类型推断限制）
-// 此处用间接方式测试
 val triple = fun(x) { x * 3 }
 val quadruple = fun(x) { x * 4 }
 println(triple(5))
 println(quadruple(5))
 
 // ============================================================
-// 137. 字符串 — 空字符串
+// 125. 字符串 — 空字符串
 // ============================================================
-
 val empty_str = ""
 println(empty_str.len())
-// 注：str 没有 isEmpty 方法，用 len == 0 判断
 
 // ============================================================
-// 138. 记录 — 记录字段更新后访问
+// 126. 记录 — 记录字段更新后访问
 // ============================================================
-
 var rec = (a: 1, b: 2, c: 3)
 rec.a = 10
 rec.b = 20
@@ -1913,15 +1888,8 @@ println(rec.b)
 println(rec.c)
 
 // ============================================================
-// 139. Throw — throw 后 defer 仍执行
+// 127. Throw — throw 后 defer 仍执行
 // ============================================================
-
-var defer_throw_val2 = 0
-fun throwsWithDefer3(): Throw<i32, Error> {
-    defer defer_throw_val2 = 55
-    throw Error("defer test")
-}
-
 val dt3 = match throwsWithDefer3() {
     Ok(v) => v
     Error(e) => -1
@@ -1930,9 +1898,8 @@ println(dt3)
 println(defer_throw_val2)
 
 // ============================================================
-// 140. 数组 — 数组拼接（push 链）
+// 128. 数组 — 数组拼接（push 链）
 // ============================================================
-
 var arr_chain = [1]
 arr_chain = arr_chain.push(2)
 arr_chain = arr_chain.push(3)
@@ -1941,17 +1908,15 @@ println(arr_chain)
 println(arr_chain.len())
 
 // ============================================================
-// 141. Nullable — 非空断言在非空值上
+// 129. Nullable — 非空断言在非空值上
 // ============================================================
-
 val nn: i32? = 99
 println(nn!)
 println(nn ?? 0)
 
 // ============================================================
-// 142. loop — loop 带累加
+// 130. loop — loop 带累加
 // ============================================================
-
 var loop_acc = 1
 var loop_i = 1
 loop {
@@ -1961,10 +1926,12 @@ loop {
 }
 println(loop_acc)
 
-// ============================================================
-// 143. while — 倒计时
-// ============================================================
+}
 
+fun test14(): () {
+// ============================================================
+// 131. while — 倒计时
+// ============================================================
 var countdown_val = 5
 var countdown_result = ""
 while countdown_val > 0 {
@@ -1974,9 +1941,8 @@ while countdown_val > 0 {
 println(countdown_result)
 
 // ============================================================
-// 144. for — 嵌套 for 循环
+// 132. for — 嵌套 for 循环
 // ============================================================
-
 var nested_sum = 0
 for i in 1..=3 {
     for j in 1..=3 {
@@ -1986,9 +1952,8 @@ for i in 1..=3 {
 println(nested_sum)
 
 // ============================================================
-// 145. match — match 表达式赋值
+// 133. match — match 表达式赋值
 // ============================================================
-
 val match_val = match 3 {
     1 => "one"
     2 => "two"
@@ -1998,87 +1963,29 @@ val match_val = match 3 {
 println(match_val)
 
 // ============================================================
-// 146. 函数 — 函数作为参数传递给高阶函数
+// 134. 函数 — 函数作为参数传递给高阶函数
 // ============================================================
-
-fun applyTwice(f, x) { f(f(x)) }
 println(applyTwice(fun(x) { x + 1 }, 5))
 println(applyTwice(fun(x) { x * 2 }, 3))
 
 // ============================================================
-// 147. 泛型 ADT — 泛型 Maybe 类型
+// 135. Newtype — newtype 内部值提取
 // ============================================================
-
-type Maybe<T> =
-    | Nothing
-    | Just(T)
-
-val just_val = Just(42)
-val nothing_val = Nothing
-
-fun maybeOrDefault(m: Maybe<i32>, default: i32): i32 {
-    match m {
-        Nothing => default
-        Just(v) => v
-    }
-}
-
-println(maybeOrDefault(just_val, 0))
-println(maybeOrDefault(nothing_val, 0))
-
-// ============================================================
-// 148. 泛型 ADT — 泛型 Either 类型
-// ============================================================
-
-// 注：Either 使用 Left/Right 可能与内建类型冲突
-// 改用不同的构造器名称
-type Result<T, E> =
-    | Success(T)
-    | Failure(E)
-
-val success_val: Result<i32, str> = Success(42)
-val failure_val: Result<i32, str> = Failure("error")
-
-fun resultToInt(r: Result<i32, str>): i32 {
-    match r {
-        Success(v) => v
-        Failure(msg) => -1
-    }
-}
-
-println(resultToInt(success_val))
-println(resultToInt(failure_val))
-
-// ============================================================
-// 149. Newtype — newtype 内部值提取
-// ============================================================
-
-type Grade = Grade(i32)
-
 val g1 = Grade(85)
 val g2 = Grade(60)
-
-fun extractGrade(gr: Grade): i32 {
-    match gr {
-        Grade(v) => v
-    }
-}
-
 println(extractGrade(g1))
 println(extractGrade(g2))
 
 // ============================================================
-// 150. 字符串 — 字符串比较运算
+// 136. 字符串 — 字符串比较运算
 // ============================================================
-
 println("abc" == "abc")
 println("abc" != "def")
 println("apple" < "banana")
 
 // ============================================================
-// 151. 数组 — 数组元素求和与查找
+// 137. 数组 — 数组元素求和与查找
 // ============================================================
-
 val search_arr = [5, 10, 15, 20, 25]
 var search_sum = 0
 for v in search_arr {
@@ -2089,231 +1996,165 @@ println(search_arr.contains(15))
 println(search_arr.contains(99))
 
 // ============================================================
-// 152. Nullable — 三元替代（if-else 表达式）
+// 138. Nullable — 三元替代（if-else 表达式）
 // ============================================================
-
-fun clamp(v: i32, min_v: i32, max_v: i32): i32 {
-    if (v < min_v) { min_v }
-    else if (v > max_v) { max_v }
-    else { v }
-}
-
 println(clamp(-5, 0, 10))
 println(clamp(5, 0, 10))
 println(clamp(15, 0, 10))
 
 // ============================================================
-// 152. UTF-8 字符串 — len() 返回 Unicode 标量值
+// 139. UTF-8 字符串 — len() 返回 Unicode 标量值
 // ============================================================
-
 val cn = "你好"
-println(cn.len())          // 2（2 个 Unicode 标量值）
+println(cn.len())
 
-// 混合 ASCII + 多字节
 val mixed = "a你好b"
-println(mixed.len())       // 4
+println(mixed.len())
 
 // ============================================================
-// 153. char → str 转换
+// 140. char → str 转换
 // ============================================================
-
-println(str('A'))          // A
-println(str('Z'))          // Z
-
-// ============================================================
-// 154. 守卫条件与或模式组合
-// ============================================================
-
-fun classifyNum2(n: i32): str {
-    match n {
-        0 => "zero"
-        1 | 2 | 3 => "small"
-        n if n < 0 => "negative"
-        _ => "other"
-    }
-}
-println(classifyNum2(0))    // zero
-println(classifyNum2(2))    // small
-println(classifyNum2(-5))   // negative
-println(classifyNum2(100))  // other
+println(str('A'))
+println(str('Z'))
 
 // ============================================================
-// 155. 记录模式解构
+// 141. 守卫条件与或模式组合
 // ============================================================
-
-type Pt2 = Pt2(x: i32, y: i32)
-
-fun quadrant(p: Pt2): str {
-    match p {
-        Pt2(0, 0) => "origin"
-        Pt2(x, y) if x > 0 && y > 0 => "Q1"
-        Pt2(x, y) if x < 0 && y > 0 => "Q2"
-        Pt2(x, y) if x < 0 && y < 0 => "Q3"
-        Pt2(x, y) if x > 0 && y < 0 => "Q4"
-        _ => "axis"
-    }
-}
-println(quadrant(Pt2(0, 0)))    // origin
-println(quadrant(Pt2(1, 1)))    // Q1
-println(quadrant(Pt2(-1, 1)))   // Q2
-println(quadrant(Pt2(-1, -1)))  // Q3
-println(quadrant(Pt2(1, -1)))   // Q4
-println(quadrant(Pt2(0, 5)))    // axis
+println(classifyNum2(0))
+println(classifyNum2(2))
+println(classifyNum2(-5))
+println(classifyNum2(100))
 
 // ============================================================
-// 156. Nullable — if-else 返回 Nullable 综合场景
+// 142. 记录模式解构
 // ============================================================
+println(quadrant(Pt2(0, 0)))
+println(quadrant(Pt2(1, 1)))
+println(quadrant(Pt2(-1, 1)))
+println(quadrant(Pt2(-1, -1)))
+println(quadrant(Pt2(1, -1)))
+println(quadrant(Pt2(0, 5)))
 
-fun safeDiv2(a: i32, b: i32): i32? {
-    if (b == 0) { null } else { a / b }
-}
-println(safeDiv2(10, 2) ?? -1)  // 5
-println(safeDiv2(10, 0) ?? -1)  // -1
-
-// ============================================================
-// 157. Throw — 链式 ? 传播更多场景
-// ============================================================
-
-fun parsePositive(s: str): Throw<i32, Error> {
-    if (s == "valid") { Ok(42) }
-    else { throw Error("parse error") }
 }
 
-fun doubleIfPositive(n: i32): Throw<i32, Error> {
-    if (n > 0) { Ok(n * 2) } else { throw Error("not positive") }
-}
+fun test15(): () {
+// ============================================================
+// 143. Nullable — if-else 返回 Nullable
+// ============================================================
+println(safeDiv2(10, 2) ?? -1)
+println(safeDiv2(10, 0) ?? -1)
 
-fun parseAndDouble(s: str): Throw<i32, Error> {
-    val n = parsePositive(s)?
-    doubleIfPositive(n)?
-}
-
+// ============================================================
+// 144. Throw — 链式 ? 传播更多场景
+// ============================================================
 val pad1 = match parseAndDouble("valid") {
     Ok(v) => v
     Error(e) => -1
 }
-println(pad1)  // 84
+println(pad1)
 
 val pad2 = match parseAndDouble("invalid") {
     Ok(v) => v
     Error(e) => -1
 }
-println(pad2)  // -1
+println(pad2)
 
 // ============================================================
-// 158. 闭包 — 闭包作为参数传递给高阶函数
+// 145. 闭包 — 闭包作为参数传递给高阶函数
 // ============================================================
-
-fun applyTwice2(f, x) { f(f(x)) }
-println(applyTwice2(fun(x) { x + 1 }, 5))   // 7
-println(applyTwice2(fun(x) { x * 2 }, 3))   // 12
+println(applyTwice2(fun(x) { x + 1 }, 5))
+println(applyTwice2(fun(x) { x * 2 }, 3))
 
 // ============================================================
-// 159. 数组 — 数组操作综合
+// 146. 数组 — 数组操作综合
 // ============================================================
-
 var arr_ops = [1, 2, 3]
 arr_ops = arr_ops.push(4)
 arr_ops = arr_ops.push(5)
-println(arr_ops.len())       // 5
-println(arr_ops.contains(3)) // true
-println(arr_ops.contains(99)) // false
+println(arr_ops.len())
+println(arr_ops.contains(3))
+println(arr_ops.contains(99))
 
 val arr_drop = arr_ops.drop_last()
-println(arr_drop.len())      // 4
+println(arr_drop.len())
 
 // ============================================================
-// 160. 嵌套记录 — 更多场景
+// 147. 嵌套记录 — 更多场景
 // ============================================================
-
-type Rect = Rect(w: f64, h: f64)
-type Shape2 = Shape2(rect: Rect, label: str)
-
 val s1 = Shape2(Rect(3.0, 4.0), "rectangle")
-println(s1.rect.w)       // 3
-println(s1.rect.h)       // 4
-println(s1.label)         // rectangle
+println(s1.rect.w)
+println(s1.rect.h)
+println(s1.label)
 
 // ============================================================
-// 161. match — 守卫条件与嵌套组合
+// 148. match — 守卫条件
 // ============================================================
-
-fun fizzbuzz(n: i32): str {
-    match n {
-        n if n % 15 == 0 => "FizzBuzz"
-        n if n % 3 == 0 => "Fizz"
-        n if n % 5 == 0 => "Buzz"
-        _ => str(n)
-    }
-}
-println(fizzbuzz(15))   // FizzBuzz
-println(fizzbuzz(9))    // Fizz
-println(fizzbuzz(10))   // Buzz
-println(fizzbuzz(7))    // 7
+println(fizzbuzz(15))
+println(fizzbuzz(9))
+println(fizzbuzz(10))
+println(fizzbuzz(7))
 
 // ============================================================
-// 162. 字符串 — 更多插值
+// 149. 字符串 — 更多插值
 // ============================================================
-
 val px2 = 3
 val py2 = 4
-println("point: ({px2}, {py2})")                    // point: (3, 4)
-println("distance squared: {px2 * px2 + py2 * py2}")   // distance squared: 25
+println("point: ({px2}, {py2})")
+println("distance squared: {px2 * px2 + py2 * py2}")
 
 // ============================================================
-// 163. 递归 — 更复杂的递归
+// 150. 递归 — 更复杂的递归
 // ============================================================
-
-// 最大公约数（欧几里得算法）
-fun gcd(a: i32, b: i32): i32 {
-    if (b == 0) { a } else { gcd(b, a % b) }
-}
-println(gcd(48, 18))   // 6
-println(gcd(100, 75))  // 25
+println(gcd(48, 18))
+println(gcd(100, 75))
 
 // ============================================================
-// 164. 动态数组 — map/filter 模式
+// 151. 动态数组 — map/filter 模式
 // ============================================================
-
-// 手动 map
-fun mapArray(arr, f) {
-    var result = []
-    for item in arr {
-        result = result.push(f(item))
-    }
-    result
-}
-
 val mapped = mapArray([1, 2, 3, 4, 5], fun(x) { x * x })
-println(mapped)          // [1, 4, 9, 16, 25]
-
-// 手动 filter
-fun filterArray(arr, pred) {
-    var result = []
-    for item in arr {
-        if (pred(item)) {
-            result = result.push(item)
-        }
-    }
-    result
-}
+println(mapped)
 
 val evens = filterArray([1, 2, 3, 4, 5, 6], fun(x) { x % 2 == 0 })
-println(evens)           // [2, 4, 6]
+println(evens)
 
 // ============================================================
-// 165. while — 欧几里得算法迭代版
+// 152. while — 欧几里得算法迭代版
 // ============================================================
+println(gcdIter(48, 18))
+println(gcdIter(100, 75))
 
-fun gcdIter(a: i32, b: i32): i32 {
-    var x = a
-    var y = b
-    while y != 0 {
-        val temp = y
-        y = x % y
-        x = temp
-    }
-    x
+// ============================================================
+// 153. Type Alias — 函数中使用
+// ============================================================
+println(passThreshold(85))
+println(passThreshold(30))
+
+// ============================================================
+// 154. 闭包 — applyTwice3
+// ============================================================
+println(applyTwice3(fun(x) { x + 1 }, 5))
+println(applyTwice3(fun(x) { x * 2 }, 3))
+
 }
-println(gcdIter(48, 18))   // 6
-println(gcdIter(100, 75))  // 25
+
+// ============================================================
+// 主入口
+// ============================================================
+
+fun main() {
+    test1()
+    test2()
+    test3()
+    test4()
+    test5()
+    test6()
+    test7()
+    test8()
+    test9()
+    test10()
+    test11()
+    test12()
+    test13()
+    test14()
+    test15()
+}
