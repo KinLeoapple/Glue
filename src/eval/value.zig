@@ -232,37 +232,79 @@ pub const IntType = enum {
     u64,
     u128,
 
-    /// 返回该整数类型的最小值
-    pub fn minInt(self: IntType) i128 {
+    /// 该类型是否为有符号整数
+    pub fn isSigned(self: IntType) bool {
         return switch (self) {
-            .i8 => std.math.minInt(i8),
-            .i16 => std.math.minInt(i16),
-            .i32 => std.math.minInt(i32),
-            .i64 => std.math.minInt(i64),
-            .i128 => std.math.minInt(i128),
+            .i8, .i16, .i32, .i64, .i128 => true,
+            .u8, .u16, .u32, .u64, .u128 => false,
+        };
+    }
+
+    /// 返回该整数类型的最小值（u128 存储，有符号类型使用二补数表示）
+    pub fn minInt(self: IntType) u128 {
+        return switch (self) {
+            .i8 => @as(u128, @bitCast(@as(i128, std.math.minInt(i8)))),
+            .i16 => @as(u128, @bitCast(@as(i128, std.math.minInt(i16)))),
+            .i32 => @as(u128, @bitCast(@as(i128, std.math.minInt(i32)))),
+            .i64 => @as(u128, @bitCast(@as(i128, std.math.minInt(i64)))),
+            .i128 => @as(u128, @bitCast(@as(i128, std.math.minInt(i128)))),
             .u8, .u16, .u32, .u64, .u128 => 0,
         };
     }
 
     /// 返回该整数类型的最大值
-    pub fn maxInt(self: IntType) i128 {
+    pub fn maxInt(self: IntType) u128 {
         return switch (self) {
-            .i8 => std.math.maxInt(i8),
-            .i16 => std.math.maxInt(i16),
-            .i32 => std.math.maxInt(i32),
-            .i64 => std.math.maxInt(i64),
-            .i128 => std.math.maxInt(i128),
+            .i8 => @as(u128, std.math.maxInt(i8)),
+            .i16 => @as(u128, std.math.maxInt(i16)),
+            .i32 => @as(u128, std.math.maxInt(i32)),
+            .i64 => @as(u128, std.math.maxInt(i64)),
+            .i128 => @as(u128, @bitCast(@as(i128, std.math.maxInt(i128)))),
             .u8 => std.math.maxInt(u8),
             .u16 => std.math.maxInt(u16),
             .u32 => std.math.maxInt(u32),
             .u64 => std.math.maxInt(u64),
-            .u128 => std.math.maxInt(i128), // i128 无法表示 u128::MAX，取 i128::MAX
+            .u128 => std.math.maxInt(u128),
         };
     }
 
     /// 检查值是否在该类型的范围内
-    pub fn inRange(self: IntType, val: i128) bool {
-        return val >= self.minInt() and val <= self.maxInt();
+    /// 有符号类型：将 u128 解释为 i128 进行有符号比较
+    /// 无符号类型：直接与 maxInt 比较
+    pub fn inRange(self: IntType, val: u128) bool {
+        return switch (self) {
+            inline .i8, .i16, .i32, .i64, .i128 => |tag| {
+                const signed_val: i128 = @bitCast(val);
+                const signed_min: i128 = switch (tag) {
+                    .i8 => std.math.minInt(i8),
+                    .i16 => std.math.minInt(i16),
+                    .i32 => std.math.minInt(i32),
+                    .i64 => std.math.minInt(i64),
+                    .i128 => std.math.minInt(i128),
+                    else => unreachable,
+                };
+                const signed_max: i128 = switch (tag) {
+                    .i8 => std.math.maxInt(i8),
+                    .i16 => std.math.maxInt(i16),
+                    .i32 => std.math.maxInt(i32),
+                    .i64 => std.math.maxInt(i64),
+                    .i128 => std.math.maxInt(i128),
+                    else => unreachable,
+                };
+                return signed_val >= signed_min and signed_val <= signed_max;
+            },
+            inline .u8, .u16, .u32, .u64, .u128 => |tag| {
+                const unsigned_max: u128 = switch (tag) {
+                    .u8 => std.math.maxInt(u8),
+                    .u16 => std.math.maxInt(u16),
+                    .u32 => std.math.maxInt(u32),
+                    .u64 => std.math.maxInt(u64),
+                    .u128 => std.math.maxInt(u128),
+                    else => unreachable,
+                };
+                return val <= unsigned_max;
+            },
+        };
     }
 
     /// 从类型名称字符串解析
@@ -282,9 +324,45 @@ pub const IntType = enum {
 };
 
 /// 带类型标签的整数值
+/// value 使用 u128 存储，可表示 u128::MAX
+/// 有符号类型的负值以二补数形式存储，通过 type_tag 区分解释方式
 pub const IntValue = struct {
-    value: i128,
+    value: u128,
     type_tag: IntType = .i32, // 默认 i32（文档：默认整数字面量为 i32）
+
+    /// 获取有符号整数值（仅用于有符号类型）
+    pub fn signedValue(self: IntValue) i128 {
+        return @bitCast(self.value);
+    }
+};
+
+// ============================================================
+// 浮点类型标签
+// ============================================================
+
+/// 浮点具体类型标签，用于运行时精度检查
+/// 文档 §2.2: f32 为 32 位浮点数，f64 为 64 位浮点数（默认浮点字面量）
+pub const FloatType = enum {
+    f32,
+    f64,
+
+    pub fn fromName(name: []const u8) ?FloatType {
+        if (std.mem.eql(u8, name, "f32")) return .f32;
+        if (std.mem.eql(u8, name, "f64")) return .f64;
+        return null;
+    }
+};
+
+/// 带类型标签的浮点值
+/// value 统一使用 f64 存储（f32 值可精确表示在 f64 中）
+/// type_tag 区分 f32/f64，用于：
+/// - 类型名推断（valueTypeName）
+/// - 精度范围检查（f32 运算结果需验证在 f32 范围内）
+/// - impl 方法分派
+/// - Atomic<T> 类型标签
+pub const FloatValue = struct {
+    value: f64,
+    type_tag: FloatType = .f64, // 默认 f64（文档：默认浮点字面量为 f64）
 };
 
 // ============================================================
@@ -331,7 +409,7 @@ pub const ArrayValue = struct {
 pub const Value = union(enum) {
     // 基本类型
     integer: IntValue,
-    float: f64,
+    float: FloatValue,
     boolean: bool,
     char_val: u21,
     string: []const u8,
@@ -585,8 +663,14 @@ pub const Value = union(enum) {
     /// debug=true: repr 模式（字符串带引号，结构化表示）
     pub fn format(self: Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator, debug: bool) !void {
         switch (self) {
-            .integer => |iv| try buf.print(allocator, "{}", .{iv.value}),
-            .float => |f| try buf.print(allocator, "{d}", .{f}),
+            .integer => |iv| {
+                if (iv.type_tag.isSigned()) {
+                    try buf.print(allocator, "{}", .{@as(i128, @bitCast(iv.value))});
+                } else {
+                    try buf.print(allocator, "{}", .{iv.value});
+                }
+            },
+            .float => |fv| try buf.print(allocator, "{d}", .{fv.value}),
             .boolean => |b| try buf.print(allocator, "{}", .{b}),
             .char_val => |c| try buf.print(allocator, "{u}", .{c}),
             .string => |s| if (debug) {
@@ -678,8 +762,8 @@ pub const Value = union(enum) {
         const other_tag = std.meta.activeTag(other);
         if (self_tag != other_tag) return false;
         return switch (self) {
-            .integer => |iv| iv.value == other.integer.value,
-            .float => |f| f == other.float,
+            .integer => |iv| iv.value == other.integer.value and iv.type_tag == other.integer.type_tag,
+            .float => |fv| fv.value == other.float.value and fv.type_tag == other.float.type_tag,
             .boolean => |b| b == other.boolean,
             .char_val => |c| c == other.char_val,
             .string => |s| std.mem.eql(u8, s, other.string),
@@ -711,7 +795,7 @@ pub const Value = union(enum) {
         return switch (self) {
             .boolean => |b| b,
             .integer => |iv| iv.value != 0,
-            .float => |f| f != 0.0,
+            .float => |fv| fv.value != 0.0,
             .null_val => false,
             .unit => false,
             else => true,
@@ -722,7 +806,7 @@ pub const Value = union(enum) {
         return self == .null_val;
     }
 
-    pub fn asInteger(self: Value) !i128 {
+    pub fn asInteger(self: Value) !u128 {
         return switch (self) {
             .integer => |iv| iv.value,
             else => error.TypeMismatch,
@@ -731,8 +815,8 @@ pub const Value = union(enum) {
 
     pub fn asFloat(self: Value) !f64 {
         return switch (self) {
-            .float => |f| f,
-            .integer => |iv| @floatFromInt(iv.value),
+            .float => |fv| fv.value,
+            .integer => |iv| if (iv.type_tag.isSigned()) @floatFromInt(@as(i128, @bitCast(iv.value))) else @floatFromInt(iv.value),
             else => error.TypeMismatch,
         };
     }

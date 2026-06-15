@@ -82,13 +82,13 @@ pub fn matchPattern(pattern: *const ast.Pattern, val: value.Value, environment: 
 fn matchLiteralPattern(lit: ast.PatternLiteral, val: value.Value) PatternError!bool {
     return switch (lit) {
         .int => |raw| {
-            const pat_val = parseInt(i128, raw) catch return false;
+            const pat_val = parseInt(u128, raw) catch return false;
             if (val == .integer) return val.integer.value == pat_val;
             return false;
         },
         .float => |raw| {
             const pat_val = parseFloat(f64, raw) catch return false;
-            if (val == .float) return val.float == pat_val;
+            if (val == .float) return val.float.value == pat_val;
             return false;
         },
         .bool => |b| {

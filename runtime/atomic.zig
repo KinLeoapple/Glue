@@ -8,6 +8,7 @@ const value = @import("value");
 const Value = value.Value;
 const IntValue = value.IntValue;
 const IntType = value.IntType;
+const FloatValue = value.FloatValue;
 
 /// Atomic<T> 值 — 跨协程共享原子状态
 /// 文档 §3.4: Atomic<T> 是引用类型，atomic expr 创建堆上原子值
@@ -70,8 +71,9 @@ pub const AtomicValue = struct {
     pub fn load(self: *AtomicValue) Value {
         const raw = self.data.load(.seq_cst);
         return switch (self.type_tag) {
-            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128 => Value{ .integer = IntValue{ .value = raw, .type_tag = atomicTypeToIntType(self.type_tag) } },
-            .f32, .f64 => Value{ .float = @bitCast(@as(u64, @intCast(raw))) },
+            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128 => Value{ .integer = IntValue{ .value = @bitCast(raw), .type_tag = atomicTypeToIntType(self.type_tag) } },
+            .f32 => Value{ .float = FloatValue{ .value = @bitCast(@as(u64, @intCast(raw))), .type_tag = .f32 } },
+            .f64 => Value{ .float = FloatValue{ .value = @bitCast(@as(u64, @intCast(raw))), .type_tag = .f64 } },
             .bool => Value{ .boolean = raw != 0 },
             .char => Value{ .char_val = @intCast(raw) },
         };
@@ -154,8 +156,8 @@ pub fn intTypeToAtomicType(it: IntType) AtomicValue.AtomicType {
 pub fn valueToAtomicRaw(val: Value, tag: AtomicValue.AtomicType) i128 {
     _ = tag;
     return switch (val) {
-        .integer => |iv| iv.value,
-        .float => |f| @as(i128, @intCast(@as(u64, @bitCast(f)))),
+        .integer => |iv| @bitCast(iv.value),
+        .float => |fv| @as(i128, @intCast(@as(u64, @bitCast(fv.value)))),
         .boolean => |b| if (b) 1 else 0,
         .char_val => |c| @as(i128, @intCast(c)),
         else => 0,
