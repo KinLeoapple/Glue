@@ -321,6 +321,17 @@ pub const IntType = enum {
         if (std.mem.eql(u8, name, "u128")) return .u128;
         return null;
     }
+
+    /// 返回该整数类型的位宽
+    pub fn bitWidth(self: IntType) usize {
+        return switch (self) {
+            .i8, .u8 => 8,
+            .i16, .u16 => 16,
+            .i32, .u32 => 32,
+            .i64, .u64 => 64,
+            .i128, .u128 => 128,
+        };
+    }
 };
 
 /// 带类型标签的整数值
@@ -328,7 +339,7 @@ pub const IntType = enum {
 /// 有符号类型的负值以二补数形式存储，通过 type_tag 区分解释方式
 pub const IntValue = struct {
     value: u128,
-    type_tag: IntType = .i32, // 默认 i32（文档：默认整数字面量为 i32）
+    type_tag: IntType = .i32,
 
     /// 获取有符号整数值（仅用于有符号类型）
     pub fn signedValue(self: IntValue) i128 {
@@ -336,33 +347,122 @@ pub const IntValue = struct {
     }
 };
 
+/// 整数字面量自动推断：返回能容纳该值的最小整数类型
+/// 推断顺序：i8 → u8 → i16 → u16 → i32 → u32 → i64 → u64 → i128 → u128
+/// 负值只考虑有符号类型
+pub fn inferIntType(val: u128) IntType {
+    // 先尝试有符号类型
+    const signed_val: i128 = @bitCast(val);
+    if (signed_val >= 0) {
+        // 非负值：先尝试有符号，再尝试同位宽无符号
+        if (val <= std.math.maxInt(i8)) return .i8;
+        if (val <= std.math.maxInt(u8)) return .u8;
+        if (val <= std.math.maxInt(i16)) return .i16;
+        if (val <= std.math.maxInt(u16)) return .u16;
+        if (val <= std.math.maxInt(i32)) return .i32;
+        if (val <= std.math.maxInt(u32)) return .u32;
+        if (val <= std.math.maxInt(i64)) return .i64;
+        if (val <= std.math.maxInt(u64)) return .u64;
+        if (val <= @as(u128, @bitCast(@as(i128, std.math.maxInt(i128))))) return .i128;
+        return .u128;
+    } else {
+        // 负值：只考虑有符号类型
+        if (signed_val >= std.math.minInt(i8)) return .i8;
+        if (signed_val >= std.math.minInt(i16)) return .i16;
+        if (signed_val >= std.math.minInt(i32)) return .i32;
+        if (signed_val >= std.math.minInt(i64)) return .i64;
+        return .i128;
+    }
+}
+
+/// 整数算术类型提升：返回两个整数类型中较大的类型
+/// 规则：较大位宽优先；同位宽不同符号时，提升为有符号类型
+pub fn promoteIntTypes(left: IntType, right: IntType) IntType {
+    const left_bits = left.bitWidth();
+    const right_bits = right.bitWidth();
+    if (left_bits > right_bits) return left;
+    if (right_bits > left_bits) return right;
+    // 同位宽：如果有任一是无符号，提升为下一级有符号类型
+    if (!left.isSigned() or !right.isSigned()) {
+        return switch (left_bits) {
+            8 => .i16,
+            16 => .i32,
+            32 => .i64,
+            64 => .i128,
+            128 => .i128,
+            else => unreachable,
+        };
+    }
+    return left;
+}
+
 // ============================================================
 // 浮点类型标签
 // ============================================================
 
 /// 浮点具体类型标签，用于运行时精度检查
-/// 文档 §2.2: f32 为 32 位浮点数，f64 为 64 位浮点数（默认浮点字面量）
+/// 文档 §2.2: f16/f32/f64/f128
 pub const FloatType = enum {
+    f16,
     f32,
     f64,
+    f128,
 
     pub fn fromName(name: []const u8) ?FloatType {
+        if (std.mem.eql(u8, name, "f16")) return .f16;
         if (std.mem.eql(u8, name, "f32")) return .f32;
         if (std.mem.eql(u8, name, "f64")) return .f64;
+        if (std.mem.eql(u8, name, "f128")) return .f128;
         return null;
+    }
+
+    /// 返回该浮点类型的位宽
+    pub fn bitWidth(self: FloatType) usize {
+        return switch (self) {
+            .f16 => 16,
+            .f32 => 32,
+            .f64 => 64,
+            .f128 => 128,
+        };
     }
 };
 
+/// 浮点字面量自动推断：使用往返检查确定最小适用类型
+/// 推断顺序：f16 → f32 → f64 → f128
+/// 将 f128 值依次尝试转换为 f16/f32/f64 再转回 f128，若相等则该类型可精确表示
+pub fn inferFloatType(val: f128) FloatType {
+    // 尝试 f16
+    const f16_val: f16 = @floatCast(val);
+    const f16_rt: f128 = @floatCast(f16_val);
+    if (f16_rt == val and !std.math.isNan(f16_val) and !std.math.isInf(f16_val)) return .f16;
+    // 尝试 f32
+    const f32_val: f32 = @floatCast(val);
+    const f32_rt: f128 = @floatCast(f32_val);
+    if (f32_rt == val and !std.math.isNan(f32_val) and !std.math.isInf(f32_val)) return .f32;
+    // 尝试 f64
+    const f64_val: f64 = @floatCast(val);
+    const f64_rt: f128 = @floatCast(f64_val);
+    if (f64_rt == val and !std.math.isNan(f64_val) and !std.math.isInf(f64_val)) return .f64;
+    // 使用 f128
+    return .f128;
+}
+
+/// 浮点算术类型提升：返回两个浮点类型中较大的类型
+pub fn promoteFloatTypes(left: FloatType, right: FloatType) FloatType {
+    if (left.bitWidth() >= right.bitWidth()) return left;
+    return right;
+}
+
 /// 带类型标签的浮点值
-/// value 统一使用 f64 存储（f32 值可精确表示在 f64 中）
-/// type_tag 区分 f32/f64，用于：
+/// value 统一使用 f128 存储（所有浮点类型均可精确表示在 f128 中）
+/// type_tag 区分 f16/f32/f64/f128，用于：
 /// - 类型名推断（valueTypeName）
-/// - 精度范围检查（f32 运算结果需验证在 f32 范围内）
+/// - 精度范围检查（f16/f32 运算结果需验证在对应精度范围内）
 /// - impl 方法分派
 /// - Atomic<T> 类型标签
 pub const FloatValue = struct {
-    value: f64,
-    type_tag: FloatType = .f64, // 默认 f64（文档：默认浮点字面量为 f64）
+    value: f128,
+    type_tag: FloatType = .f64,
 };
 
 // ============================================================
@@ -813,7 +913,7 @@ pub const Value = union(enum) {
         };
     }
 
-    pub fn asFloat(self: Value) !f64 {
+    pub fn asFloat(self: Value) !f128 {
         return switch (self) {
             .float => |fv| fv.value,
             .integer => |iv| if (iv.type_tag.isSigned()) @floatFromInt(@as(i128, @bitCast(iv.value))) else @floatFromInt(iv.value),

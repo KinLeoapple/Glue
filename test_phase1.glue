@@ -149,7 +149,7 @@ fun handleErrors(x: i32): Throw<i32, Error> {
 }
 
 // defer 覆盖 throw 路径
-var defer_throw_flag = 0
+var defer_throw_flag: i32 = 0
 
 fun throwsWithDefer(): Throw<i32, Error> {
     defer defer_throw_flag = 42
@@ -227,7 +227,7 @@ fun pipeline(): Throw<i32, Error> {
 
 // 多个 defer 和 return 交互
 fun deferReturn(): i32 {
-    var result = 0
+    var result: i32 = 0
     {
         defer result = result + 10
         result = 5
@@ -354,7 +354,7 @@ fun nestedMatch(x: i32, y: i32): str {
 }
 
 // defer — 与 throw 交互
-var defer_throw_val = 0
+var defer_throw_val: i32 = 0
 
 fun throwsWithDefer2(): Throw<i32, Error> {
     defer defer_throw_val = 99
@@ -402,7 +402,7 @@ fun outer3(n: i32): i32 {
 }
 
 // defer — defer 在 return 路径执行
-var defer_ret_flag = 0
+var defer_ret_flag: i32 = 0
 
 fun deferReturn2(): i32 {
     defer defer_ret_flag = 100
@@ -415,7 +415,7 @@ fun sumTCO(n: i32, acc: i32): i32 {
 }
 
 // Throw — throw 后 defer 仍执行
-var defer_throw_val2 = 0
+var defer_throw_val2: i32 = 0
 
 fun throwsWithDefer3(): Throw<i32, Error> {
     defer defer_throw_val2 = 55
@@ -586,11 +586,11 @@ println(i64_val)
 // 2. Nullable
 // ============================================================
 val x: i32? = null
-val y = x ?? 99
+val y: i32 = x ?? 99
 println(y)
 
 val z: i32? = 10
-val w = z ?? 99
+val w: i32 = z ?? 99
 println(w)
 
 // 非空断言 !
@@ -641,7 +641,7 @@ println("Use {{ and }} for braces")
 // ============================================================
 // 7. defer
 // ============================================================
-var counter = 0
+var counter: i32 = 0
 {
     counter = 1
     defer counter = 10
@@ -677,7 +677,7 @@ println(arr[2])
 // ============================================================
 // 10. for 循环迭代数组
 // ============================================================
-var total = 0
+var total: i32 = 0
 for item in arr {
     total = total + item
 }
@@ -714,14 +714,14 @@ println(msg)
 // ============================================================
 // 14. Range 迭代
 // ============================================================
-var range_sum = 0
+var range_sum: i32 = 0
 for i in 1..=5 {
     range_sum = range_sum + i
 }
 println(range_sum)
 
 // 排除范围
-var range_sum2 = 0
+var range_sum2: i32 = 0
 for i in 1..5 {
     range_sum2 = range_sum2 + i
 }
@@ -748,7 +748,7 @@ val add_x = fun(y) { x10 + y }
 println(add_x(5))
 
 // 闭包修改外部 var
-var outer = 0
+var outer: i32 = 0
 val increment = fun() { outer = outer + 1 }
 increment()
 increment()
@@ -773,8 +773,8 @@ println(cond2)
 // ============================================================
 // 19. while 循环
 // ============================================================
-var w_count = 0
-var w_sum = 0
+var w_count: i32 = 0
+var w_sum: i32 = 0
 while w_count < 5 {
     w_sum = w_sum + w_count
     w_count = w_count + 1
@@ -843,8 +843,8 @@ println(use_result)
 // ============================================================
 // 27. loop 和 break
 // ============================================================
-var loop_count = 0
-var loop_sum = 0
+var loop_count: i32 = 0
+var loop_sum: i32 = 0
 loop {
     if (loop_count >= 5) { break }
     loop_sum = loop_sum + loop_count
@@ -855,7 +855,7 @@ println(loop_sum)
 // ============================================================
 // 28. for 循环 continue
 // ============================================================
-var skip_sum = 0
+var skip_sum: i32 = 0
 for i in 1..=10 {
     if (i % 2 == 0) { continue }
     skip_sum = skip_sum + i
@@ -932,10 +932,10 @@ val a1: i32? = null
 val a2: i32? = null
 val a3: i32? = 42
 
-val chain_elvis = a1 ?? a2 ?? a3 ?? 0
+val chain_elvis: i32 = a1 ?? a2 ?? a3 ?? 0
 println(chain_elvis)
 
-val chain_elvis2 = a1 ?? a2 ?? 99
+val chain_elvis2: i32 = a1 ?? a2 ?? 99
 println(chain_elvis2)
 
 // ============================================================
@@ -1097,13 +1097,13 @@ println(r5)
 // ============================================================
 // 46. Range 更多场景
 // ============================================================
-var sum_1_10 = 0
+var sum_1_10: i32 = 0
 for i in 1..=10 {
     sum_1_10 = sum_1_10 + i
 }
 println(sum_1_10)
 
-var sum_1_9 = 0
+var sum_1_9: i32 = 0
 for i in 1..10 {
     sum_1_9 = sum_1_9 + i
 }
@@ -1222,7 +1222,7 @@ println(pipe_result)
 // 57. 数组迭代与变换
 // ============================================================
 val nums = [10, 20, 30, 40, 50]
-var arr_sum = 0
+var arr_sum: i32 = 0
 for n in nums {
     arr_sum = arr_sum + n
 }
@@ -1239,7 +1239,7 @@ println(deferReturn())
 // ============================================================
 // 59. 字符串迭代
 // ============================================================
-var char_count = 0
+var char_count: i32 = 0
 for ch in "Hello" {
     char_count = char_count + 1
 }
@@ -1322,7 +1322,7 @@ val combined = fun(x) { a_val * x + b_val }
 println(combined(3))
 
 // 闭包捕获 var 并修改
-var accum = 0
+var accum: i32 = 0
 val adder = fun(x) { accum = accum + x }
 adder(1)
 adder(2)
@@ -1363,7 +1363,7 @@ println(first_elem ?? -1)
 // ============================================================
 // 71. Range — 求积
 // ============================================================
-var product = 1
+var product: i32 = 1
 for i in 1..=5 {
     product = product * i
 }
@@ -1587,7 +1587,7 @@ println(arr2[0])
 println(arr2[1])
 println(arr2[2])
 
-var arr_total = 0
+var arr_total: i32 = 0
 for v in arr2 {
     arr_total = arr_total + v
 }
@@ -1619,8 +1619,8 @@ println(fib2(15))
 // ============================================================
 // 96. while 循环 — 复杂条件
 // ============================================================
-var w_a = 1
-var w_b = 1
+var w_a: i32 = 1
+var w_b: i32 = 1
 while w_a < 100 {
     val temp = w_a + w_b
     w_a = w_b
@@ -1641,8 +1641,8 @@ println(nestedMatch(1, 1))
 // ============================================================
 // 98. loop — 带条件退出
 // ============================================================
-var loop_val = 1
-var loop_result = 1
+var loop_val: i32 = 1
+var loop_result: i32 = 1
 loop {
     loop_result = loop_result * loop_val
     loop_val = loop_val + 1
@@ -1917,8 +1917,8 @@ println(nn ?? 0)
 // ============================================================
 // 130. loop — loop 带累加
 // ============================================================
-var loop_acc = 1
-var loop_i = 1
+var loop_acc: i32 = 1
+var loop_i: i32 = 1
 loop {
     loop_acc = loop_acc * loop_i
     loop_i = loop_i + 1
@@ -1943,7 +1943,7 @@ println(countdown_result)
 // ============================================================
 // 132. for — 嵌套 for 循环
 // ============================================================
-var nested_sum = 0
+var nested_sum: i32 = 0
 for i in 1..=3 {
     for j in 1..=3 {
         nested_sum = nested_sum + i * j
@@ -1987,7 +1987,7 @@ println("apple" < "banana")
 // 137. 数组 — 数组元素求和与查找
 // ============================================================
 val search_arr = [5, 10, 15, 20, 25]
-var search_sum = 0
+var search_sum: i32 = 0
 for v in search_arr {
     search_sum = search_sum + v
 }

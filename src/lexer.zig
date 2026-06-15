@@ -1244,7 +1244,7 @@ fn isIntSuffix(suffix: []const u8) bool {
 
 /// 判断是否为有效的浮点类型后缀
 fn isFloatSuffix(suffix: []const u8) bool {
-    const valid = [_][]const u8{ "f32", "f64" };
+    const valid = [_][]const u8{ "f16", "f32", "f64", "f128" };
     for (valid) |v| {
         if (std.mem.eql(u8, suffix, v)) return true;
     }

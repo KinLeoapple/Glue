@@ -1195,9 +1195,9 @@ val cmp2 = compare(5, 5)
 val cmp3 = compare(10, 3)
 
 // 16. Iterable/Iterator — 内建类型 for 循环
-var arr_sum = 0
-var range_sum = 0
-var char_count = 0
+var arr_sum: i32 = 0
+var range_sum: i32 = 0
+var char_count: i32 = 0
 
 // 17. ADT — Result 类型（Ok/Error 模式匹配）
 val r1 = match Ok(100) {
@@ -1214,7 +1214,7 @@ val id_int = identity(42)
 val id_str = identity("hello")
 
 // 21. 类型推断 — 复合表达式
-val inferred = 10 + 20 * 3
+val inferred: i32 = 10 + 20 * 3
 
 // 22. ADT — 构造器作为函数
 val makeCircle = Circle

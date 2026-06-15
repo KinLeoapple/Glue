@@ -40,6 +40,10 @@ pub const IntValue = value.IntValue;
 pub const IntType = value.IntType;
 pub const FloatValue = value.FloatValue;
 pub const FloatType = value.FloatType;
+pub const inferIntType = value.inferIntType;
+pub const inferFloatType = value.inferFloatType;
+pub const promoteIntTypes = value.promoteIntTypes;
+pub const promoteFloatTypes = value.promoteFloatTypes;
 pub const Environment = env.Environment;
 pub const EvalError = value.EvalError;
 pub const ControlFlow = value.ControlFlow;
@@ -2157,20 +2161,22 @@ pub const Evaluator = struct {
             @bitCast(parseInt(i128, raw) catch
                 return self.gluePanic("arithmetic overflow: integer literal out of range"));
 
-        // 如果有类型后缀，检查范围
+        // 如果有类型后缀，使用后缀指定的类型
         if (suffix) |s| {
             return self.castInteger(int_val, .i32, s);
         }
 
-        // 默认 i32
-        return self.castInteger(int_val, .i32, "i32");
+        // 无后缀：自动推断最小适用类型
+        const inferred_type = inferIntType(int_val);
+        if (!inferred_type.inRange(int_val)) return self.gluePanic("arithmetic overflow: integer literal out of range");
+        return Value{ .integer = IntValue{ .value = int_val, .type_tag = inferred_type } };
     }
 
     fn evalFloatLiteral(self: *Evaluator, lit: @TypeOf(@as(ast.Expr, undefined).float_literal)) EvalResult!Value {
         const raw = lit.raw;
         const suffix = lit.suffix;
 
-        const float_val = parseFloat(f64, raw) catch
+        const float_val = parseFloat(f128, raw) catch
             return self.gluePanic("invalid floating-point literal");
 
         // 文档要求：浮点数不包含 NaN 和 Infinity 值
@@ -2179,16 +2185,36 @@ pub const Evaluator = struct {
         }
 
         if (suffix) |s| {
-            if (std.mem.eql(u8, s, "f32")) {
-                const f32_val: f32 = @floatCast(float_val);
-                if (std.math.isNan(f32_val) or std.math.isInf(f32_val)) {
-                    return self.gluePanic("arithmetic overflow: floating-point literal out of range");
-                }
-                return Value{ .float = FloatValue{ .value = @floatCast(f32_val), .type_tag = .f32 } };
+            // 显式后缀：使用指定类型，检查范围
+            const target_type = FloatType.fromName(s) orelse
+                return self.gluePanic("invalid float type suffix");
+            // 验证值在目标类型范围内
+            switch (target_type) {
+                .f16 => {
+                    const f16_val: f16 = @floatCast(float_val);
+                    if (std.math.isNan(f16_val) or std.math.isInf(f16_val))
+                        return self.gluePanic("arithmetic overflow: floating-point literal out of range");
+                },
+                .f32 => {
+                    const f32_val: f32 = @floatCast(float_val);
+                    if (std.math.isNan(f32_val) or std.math.isInf(f32_val))
+                        return self.gluePanic("arithmetic overflow: floating-point literal out of range");
+                },
+                .f64 => {
+                    const f64_val: f64 = @floatCast(float_val);
+                    if (std.math.isNan(f64_val) or std.math.isInf(f64_val))
+                        return self.gluePanic("arithmetic overflow: floating-point literal out of range");
+                },
+                .f128 => {
+                    // f128 always works (already checked NaN/Inf above)
+                },
             }
+            return Value{ .float = FloatValue{ .value = float_val, .type_tag = target_type } };
         }
 
-        return Value{ .float = FloatValue{ .value = float_val, .type_tag = .f64 } };
+        // 无后缀：自动推断最小适用类型（往返检查）
+        const inferred_type = inferFloatType(float_val);
+        return Value{ .float = FloatValue{ .value = float_val, .type_tag = inferred_type } };
     }
 
     fn evalStringInterpolation(self: *Evaluator, interp: @TypeOf(@as(ast.Expr, undefined).string_interpolation), environment: *Environment) EvalResult!Value {
@@ -2409,8 +2435,30 @@ pub const Evaluator = struct {
             .mul => return self.evalMul(left, right),
             .div => return self.evalDiv(left, right, bin.location),
             .mod => return self.evalMod(left, right, bin.location),
-            .eq => return Value{ .boolean = left.equals(right) },
-            .not_eq => return Value{ .boolean = !left.equals(right) },
+            .eq => {
+                if (left == .integer and right == .integer) {
+                    const result_type = promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
+                    const lv: i128 = if (result_type.isSigned()) @bitCast(left.integer.value) else @intCast(left.integer.value);
+                    const rv: i128 = if (result_type.isSigned()) @bitCast(right.integer.value) else @intCast(right.integer.value);
+                    return Value{ .boolean = lv == rv };
+                }
+                if (left == .float and right == .float) {
+                    return Value{ .boolean = left.float.value == right.float.value };
+                }
+                return Value{ .boolean = left.equals(right) };
+            },
+            .not_eq => {
+                if (left == .integer and right == .integer) {
+                    const result_type = promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
+                    const lv: i128 = if (result_type.isSigned()) @bitCast(left.integer.value) else @intCast(left.integer.value);
+                    const rv: i128 = if (result_type.isSigned()) @bitCast(right.integer.value) else @intCast(right.integer.value);
+                    return Value{ .boolean = lv != rv };
+                }
+                if (left == .float and right == .float) {
+                    return Value{ .boolean = left.float.value != right.float.value };
+                }
+                return Value{ .boolean = !left.equals(right) };
+            },
             .lt => return self.evalLt(left, right),
             .gt => return self.evalGt(left, right),
             .lt_eq => return self.evalLtEq(left, right),
@@ -2458,23 +2506,37 @@ pub const Evaluator = struct {
     }
 
     /// 检查浮点运算结果是否为 NaN 或 Infinity，若是则 panic，否则返回 Value
-    /// 保留操作数的 FloatType（f32 运算结果需额外检查 f32 精度范围）
-    fn checkFloatResult(self: *Evaluator, result: f64, type_tag: FloatType) EvalResult!Value {
+    /// 保留操作数的 FloatType（f16/f32/f64 运算结果需额外检查精度范围）
+    fn checkFloatResult(self: *Evaluator, result: f128, type_tag: FloatType) EvalResult!Value {
         if (std.math.isNan(result) or std.math.isInf(result)) {
             return self.gluePanic("arithmetic overflow: floating-point operation out of range");
         }
-        // f32 运算结果需验证在 f32 范围内
-        if (type_tag == .f32) {
-            const f32_result: f32 = @floatCast(result);
-            if (std.math.isNan(f32_result) or std.math.isInf(f32_result)) {
-                return self.gluePanic("arithmetic overflow: floating-point operation out of range");
-            }
+        // 检查结果是否在目标类型范围内
+        switch (type_tag) {
+            .f16 => {
+                const f16_result: f16 = @floatCast(result);
+                if (std.math.isNan(f16_result) or std.math.isInf(f16_result))
+                    return self.gluePanic("arithmetic overflow: floating-point operation out of range");
+            },
+            .f32 => {
+                const f32_result: f32 = @floatCast(result);
+                if (std.math.isNan(f32_result) or std.math.isInf(f32_result))
+                    return self.gluePanic("arithmetic overflow: floating-point operation out of range");
+            },
+            .f64 => {
+                const f64_result: f64 = @floatCast(result);
+                if (std.math.isNan(f64_result) or std.math.isInf(f64_result))
+                    return self.gluePanic("arithmetic overflow: floating-point operation out of range");
+            },
+            .f128 => {
+                // f128 always works (already checked NaN/Inf above)
+            },
         }
         return Value{ .float = FloatValue{ .value = result, .type_tag = type_tag } };
     }
 
-    /// 将整数值转换为 f64（根据有符号/无符号类型正确解释）
-    fn integerToFloat(iv: IntValue) f64 {
+    /// 将整数值转换为 f128（根据有符号/无符号类型正确解释）
+    fn integerToFloat(iv: IntValue) f128 {
         return if (iv.type_tag.isSigned())
             @floatFromInt(@as(i128, @bitCast(iv.value)))
         else
@@ -2482,15 +2544,13 @@ pub const Evaluator = struct {
     }
 
     /// 确定两个浮点操作数运算结果的 FloatType
-    /// 同类型保持，不同类型提升为 f64
     fn resultFloatTag(left: FloatValue, right: FloatValue) FloatType {
-        if (left.type_tag == right.type_tag) return left.type_tag;
-        return .f64;
+        return promoteFloatTypes(left.type_tag, right.type_tag);
     }
 
     fn evalAdd(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         if (left == .integer and right == .integer) {
-            const result_type = left.integer.type_tag;
+            const result_type = promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
             const result: u128 = if (result_type.isSigned())
                 @bitCast(@as(i128, @bitCast(left.integer.value)) +% @as(i128, @bitCast(right.integer.value)))
             else
@@ -2518,7 +2578,7 @@ pub const Evaluator = struct {
 
     fn evalSub(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         if (left == .integer and right == .integer) {
-            const result_type = left.integer.type_tag;
+            const result_type = promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
             const result: u128 = if (result_type.isSigned())
                 @bitCast(@as(i128, @bitCast(left.integer.value)) -% @as(i128, @bitCast(right.integer.value)))
             else
@@ -2540,7 +2600,7 @@ pub const Evaluator = struct {
 
     fn evalMul(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         if (left == .integer and right == .integer) {
-            const result_type = left.integer.type_tag;
+            const result_type = promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
             const result: u128 = if (result_type.isSigned())
                 @bitCast(@as(i128, @bitCast(left.integer.value)) *% @as(i128, @bitCast(right.integer.value)))
             else
@@ -2564,7 +2624,7 @@ pub const Evaluator = struct {
         _ = location;
         if (left == .integer and right == .integer) {
             if (right.integer.value == 0) return self.gluePanic("arithmetic error: division by zero");
-            const result_type = left.integer.type_tag;
+            const result_type = promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
             if (result_type.isSigned()) {
                 const left_signed: i128 = @bitCast(left.integer.value);
                 const right_signed: i128 = @bitCast(right.integer.value);
@@ -2599,7 +2659,7 @@ pub const Evaluator = struct {
         _ = location;
         if (left == .integer and right == .integer) {
             if (right.integer.value == 0) return self.gluePanic("arithmetic error: division by zero");
-            const result_type = left.integer.type_tag;
+            const result_type = promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
             if (result_type.isSigned()) {
                 const result = @mod(@as(i128, @bitCast(left.integer.value)), @as(i128, @bitCast(right.integer.value)));
                 if (!result_type.inRange(@bitCast(result))) return self.gluePanic("arithmetic overflow: integer operation out of range");
@@ -2824,7 +2884,19 @@ pub const Evaluator = struct {
                     const call_env = try closure_env.createChild();
 
                     for (current_closure.params, 0..) |param, i| {
-                        try call_env.define(param.name, current_args[i], param.is_var);
+                        // 如果参数有类型注解，将实参转换为目标类型
+                        const arg_val = if (param.type_annotation) |ta| blk: {
+                            switch (ta.*) {
+                                .named => |n| {
+                                    if (isBuiltinType(n.name)) {
+                                        break :blk self.castValue(current_args[i], n.name) catch current_args[i];
+                                    }
+                                },
+                                else => {},
+                            }
+                            break :blk current_args[i];
+                        } else current_args[i];
+                        try call_env.define(param.name, arg_val, param.is_var);
                     }
 
                     // 清除尾调用标记
@@ -3861,9 +3933,11 @@ pub const Evaluator = struct {
         const target_type = IntType.fromName(type_name) orelse {
             // Not an integer type — try float conversion
             const signed_val: i128 = @bitCast(val);
-            const float_val: f64 = if (source_type_tag.isSigned()) @floatFromInt(signed_val) else @floatFromInt(val);
+            const float_val: f128 = if (source_type_tag.isSigned()) @floatFromInt(signed_val) else @floatFromInt(val);
+            if (std.mem.eql(u8, type_name, "f16")) return Value{ .float = FloatValue{ .value = float_val, .type_tag = .f16 } };
             if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = FloatValue{ .value = float_val, .type_tag = .f32 } };
             if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = FloatValue{ .value = float_val, .type_tag = .f64 } };
+            if (std.mem.eql(u8, type_name, "f128")) return Value{ .float = FloatValue{ .value = float_val, .type_tag = .f128 } };
             return error.TypeMismatch;
         };
         if (std.mem.eql(u8, type_name, "i8")) {
@@ -3882,7 +3956,10 @@ pub const Evaluator = struct {
             const result = clampInt(val, i64) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
         }
-        if (std.mem.eql(u8, type_name, "i128")) return Value{ .integer = IntValue{ .value = val, .type_tag = target_type } };
+        if (std.mem.eql(u8, type_name, "i128")) {
+            const result = clampInt(val, i128) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+            return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
+        }
         if (std.mem.eql(u8, type_name, "u8")) {
             const result = clampUInt(val, u8) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
             return Value{ .integer = IntValue{ .value = result, .type_tag = target_type } };
@@ -3906,14 +3983,23 @@ pub const Evaluator = struct {
         return error.TypeMismatch;
     }
 
-    fn castFloat(self: *Evaluator, val: f64, type_name: []const u8) EvalResult!Value {
-        if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = FloatValue{ .value = @as(f64, @floatCast(@as(f32, @floatCast(val)))), .type_tag = .f32 } };
-        if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = FloatValue{ .value = val, .type_tag = .f64 } };
+    fn castFloat(self: *Evaluator, val: f128, type_name: []const u8) EvalResult!Value {
+        // Float to integer conversions
         if (std.mem.eql(u8, type_name, "i8")) return floatToInt(val, i8) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
         if (std.mem.eql(u8, type_name, "i16")) return floatToInt(val, i16) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
         if (std.mem.eql(u8, type_name, "i32")) return floatToInt(val, i32) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
         if (std.mem.eql(u8, type_name, "i64")) return floatToInt(val, i64) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
         if (std.mem.eql(u8, type_name, "i128")) return floatToInt(val, i128) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "u8")) return floatToInt(val, u8) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "u16")) return floatToInt(val, u16) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "u32")) return floatToInt(val, u32) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "u64")) return floatToInt(val, u64) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        if (std.mem.eql(u8, type_name, "u128")) return floatToInt(val, u128) catch return self.gluePanic("arithmetic overflow: narrowing conversion out of range");
+        // Float to float conversions
+        if (std.mem.eql(u8, type_name, "f16")) return Value{ .float = FloatValue{ .value = @as(f128, @floatCast(@as(f16, @floatCast(val)))), .type_tag = .f16 } };
+        if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = FloatValue{ .value = @as(f128, @floatCast(@as(f32, @floatCast(val)))), .type_tag = .f32 } };
+        if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = FloatValue{ .value = @as(f128, @floatCast(@as(f64, @floatCast(val)))), .type_tag = .f64 } };
+        if (std.mem.eql(u8, type_name, "f128")) return Value{ .float = FloatValue{ .value = val, .type_tag = .f128 } };
         return error.TypeMismatch;
     }
 
@@ -4123,8 +4209,10 @@ pub const Evaluator = struct {
             },
             .float => |fv| {
                 av.* = value.AtomicValue.initFloat(fv.value, switch (fv.type_tag) {
+                    .f16 => value.AtomicType.f16,
                     .f32 => value.AtomicType.f32,
                     .f64 => value.AtomicType.f64,
+                    .f128 => value.AtomicType.f128,
                 });
             },
             .boolean => |b| {
@@ -4231,12 +4319,34 @@ pub const Evaluator = struct {
     pub fn evalStmt(self: *Evaluator, stmt: *const ast.Stmt, environment: *Environment, defer_stack: ?*std.ArrayList(*const ast.Expr)) EvalResult!?Value {
         return switch (stmt.*) {
             .val_decl => |vd| {
-                const val = try self.evalExpr(vd.value, environment);
+                var val = try self.evalExpr(vd.value, environment);
+                // 如果有类型注解，将值转换为目标类型
+                if (vd.type_annotation) |ta| {
+                    switch (ta.*) {
+                        .named => |n| {
+                            if (isBuiltinType(n.name)) {
+                                val = self.castValue(val, n.name) catch val;
+                            }
+                        },
+                        else => {},
+                    }
+                }
                 try environment.defineWithVisibility(vd.name, val, false, vd.visibility == .public);
                 return null;
             },
             .var_decl => |vd| {
-                const val = try self.evalExpr(vd.value, environment);
+                var val = try self.evalExpr(vd.value, environment);
+                // 如果有类型注解，将值转换为目标类型
+                if (vd.type_annotation) |ta| {
+                    switch (ta.*) {
+                        .named => |n| {
+                            if (isBuiltinType(n.name)) {
+                                val = self.castValue(val, n.name) catch val;
+                            }
+                        },
+                        else => {},
+                    }
+                }
                 try environment.defineWithVisibility(vd.name, val, true, vd.visibility == .public);
                 return null;
             },
@@ -4764,7 +4874,7 @@ fn isBuiltinType(name: []const u8) bool {
     const builtin_types = [_][]const u8{
         "i8",   "i16",  "i32",  "i64",  "i128",
         "u8",   "u16",  "u32",  "u64",  "u128",
-        "f32",  "f64",
+        "f16",  "f32",  "f64",  "f128",
         "bool", "str",
     };
     for (builtin_types) |bt| {
@@ -4798,10 +4908,10 @@ fn clampUInt(val: u128, comptime T: type) !u128 {
     return val;
 }
 
-fn floatToInt(val: f64, comptime T: type) EvalResult!Value {
+fn floatToInt(val: f128, comptime T: type) EvalResult!Value {
     if (std.math.isNan(val) or std.math.isInf(val)) return error.GluePanic;
-    const min: f64 = @floatFromInt(std.math.minInt(T));
-    const max: f64 = @floatFromInt(std.math.maxInt(T));
+    const min: f128 = @floatFromInt(std.math.minInt(T));
+    const max: f128 = @floatFromInt(std.math.maxInt(T));
     if (val < min or val > max) return error.GluePanic;
     const int_val: T = @intFromFloat(val);
     const result: u128 = if (@typeInfo(T).int.signedness == .signed) @bitCast(@as(i128, int_val)) else @intCast(int_val);
@@ -4868,7 +4978,7 @@ test "求值器 - 浮点字面量" {
 
     const result = try evalSource(allocator, "3.14");
     try std.testing.expect(result == .float);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.14), result.float.value, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f128, 3.14), result.float.value, 0.001);
 }
 
 test "求值器 - 布尔字面量" {
@@ -5102,7 +5212,7 @@ test "求值器 - 类型转换" {
     // i32 -> f64 (widening)
     const i2f = try evalSource(allocator, "f64(42)");
     try std.testing.expect(i2f == .float);
-    try std.testing.expectApproxEqAbs(@as(f64, 42.0), i2f.float.value, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f128, 42.0), i2f.float.value, 0.001);
 
     // f64 -> i32 (narrowing)
     const f2i = try evalSource(allocator, "i32(3.14)");
@@ -5500,7 +5610,7 @@ test "Phase 2 - ADT 带参构造器和字段访问" {
 
     const fn_val = evaluator.global_env.get("test_field").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.0), result.float.value, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f128, 3.0), result.float.value, 0.001);
 }
 
 test "Phase 2 - ADT 模式匹配" {
@@ -5541,7 +5651,7 @@ test "Phase 2 - ADT 模式匹配" {
     const circle_args = [_]Value{Value{ .float = FloatValue{ .value = 2.0, .type_tag = .f64 } }};
     const shape = try evaluator.callFunction(circle_val.value, &circle_args, null);
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{shape}, null);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.14159 * 2.0 * 2.0), result.float.value, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f128, 3.14159 * 2.0 * 2.0), result.float.value, 0.01);
 }
 
 test "Phase 2 - ADT 多构造器匹配" {
@@ -5704,7 +5814,7 @@ test "Phase 2 - 记录类型构造器" {
 
     const fn_val = evaluator.global_env.get("test_point").?;
     const result = try evaluator.callFunction(fn_val.value, &[_]Value{}, null);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.float.value, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f128, 1.0), result.float.value, 0.001);
 }
 
 // --- for 循环（内建 Iterable） ---

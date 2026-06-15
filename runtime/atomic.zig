@@ -25,7 +25,7 @@ pub const AtomicValue = struct {
     pub const AtomicType = enum {
         i8, i16, i32, i64, i128,
         u8, u16, u32, u64, u128,
-        f32, f64,
+        f16, f32, f64, f128,
         bool,
         char,
     };
@@ -40,10 +40,10 @@ pub const AtomicValue = struct {
     }
 
     /// 从浮点值创建 AtomicValue
-    pub fn initFloat(float_val: f64, tag: AtomicType) AtomicValue {
-        const bits: u64 = @bitCast(float_val);
+    pub fn initFloat(float_val: f128, tag: AtomicType) AtomicValue {
+        const bits: u128 = @bitCast(float_val);
         return AtomicValue{
-            .data = std.atomic.Value(i128).init(@as(i128, @intCast(bits))),
+            .data = std.atomic.Value(i128).init(@as(i128, @intCast(@as(u128, bits)))),
             .ref_count = std.atomic.Value(usize).init(1),
             .type_tag = tag,
         };
@@ -72,8 +72,10 @@ pub const AtomicValue = struct {
         const raw = self.data.load(.seq_cst);
         return switch (self.type_tag) {
             .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128 => Value{ .integer = IntValue{ .value = @bitCast(raw), .type_tag = atomicTypeToIntType(self.type_tag) } },
-            .f32 => Value{ .float = FloatValue{ .value = @bitCast(@as(u64, @intCast(raw))), .type_tag = .f32 } },
-            .f64 => Value{ .float = FloatValue{ .value = @bitCast(@as(u64, @intCast(raw))), .type_tag = .f64 } },
+            .f16 => Value{ .float = FloatValue{ .value = @bitCast(@as(u128, @intCast(raw))), .type_tag = .f16 } },
+            .f32 => Value{ .float = FloatValue{ .value = @bitCast(@as(u128, @intCast(raw))), .type_tag = .f32 } },
+            .f64 => Value{ .float = FloatValue{ .value = @bitCast(@as(u128, @intCast(raw))), .type_tag = .f64 } },
+            .f128 => Value{ .float = FloatValue{ .value = @bitCast(@as(u128, @intCast(raw))), .type_tag = .f128 } },
             .bool => Value{ .boolean = raw != 0 },
             .char => Value{ .char_val = @intCast(raw) },
         };
@@ -142,7 +144,7 @@ pub fn atomicTypeToIntType(at: AtomicValue.AtomicType) IntType {
     return switch (at) {
         .i8 => .i8, .i16 => .i16, .i32 => .i32, .i64 => .i64, .i128 => .i128,
         .u8 => .u8, .u16 => .u16, .u32 => .u32, .u64 => .u64, .u128 => .u128,
-        else => .i32, // f32/f64/bool/char 不应该走到这里
+        else => .i32, // f16/f32/f64/f128/bool/char 不应该走到这里
     };
 }
 
@@ -157,7 +159,7 @@ pub fn valueToAtomicRaw(val: Value, tag: AtomicValue.AtomicType) i128 {
     _ = tag;
     return switch (val) {
         .integer => |iv| @bitCast(iv.value),
-        .float => |fv| @as(i128, @intCast(@as(u64, @bitCast(fv.value)))),
+        .float => |fv| @as(i128, @intCast(@as(u128, @bitCast(fv.value)))),
         .boolean => |b| if (b) 1 else 0,
         .char_val => |c| @as(i128, @intCast(c)),
         else => 0,

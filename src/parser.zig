@@ -1913,7 +1913,7 @@ pub const Parser = struct {
         return self.allocExpr(ast.Expr{
             .int_literal = .{
                 .location = tokenLoc(tok),
-                .raw = raw,
+                .raw = raw[0..i],
                 .suffix = suffix,
             },
         });
@@ -1937,8 +1937,8 @@ pub const Parser = struct {
         if (i < lit_raw.len) {
             suffix = lit_raw[i..];
         }
-        // 合并负号：raw = "-" + lit_raw
-        const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw});
+        // 合并负号：raw = "-" + lit_raw（不含后缀）
+        const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw[0..i]});
         return self.allocExpr(ast.Expr{
             .int_literal = .{
                 .location = tokenLoc(lit_tok),
@@ -1954,6 +1954,15 @@ pub const Parser = struct {
         var suffix: ?[]const u8 = null;
         const lit_raw = lit_tok.lexeme;
         var i: usize = lit_raw.len;
+        // 后缀可能包含字母和数字（如 f16, f128），先跳过末尾数字，再跳过字母
+        while (i > 0) {
+            const ch = lit_raw[i - 1];
+            if (ch >= '0' and ch <= '9') {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
         while (i > 0) {
             const ch = lit_raw[i - 1];
             if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
@@ -1962,11 +1971,14 @@ pub const Parser = struct {
                 break;
             }
         }
-        if (i < lit_raw.len) {
+        // 确保至少有一个字母开头（避免把纯数字当作后缀）
+        if (i < lit_raw.len and i > 0 and ((lit_raw[i] >= 'a' and lit_raw[i] <= 'z') or (lit_raw[i] >= 'A' and lit_raw[i] <= 'Z'))) {
             suffix = lit_raw[i..];
+        } else {
+            i = lit_raw.len;
         }
-        // 合并负号：raw = "-" + lit_raw
-        const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw});
+        // 合并负号：raw = "-" + lit_raw（不含后缀）
+        const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw[0..i]});
         return self.allocExpr(ast.Expr{
             .float_literal = .{
                 .location = tokenLoc(lit_tok),
@@ -1980,6 +1992,15 @@ pub const Parser = struct {
         var suffix: ?[]const u8 = null;
         const raw = tok.lexeme;
         var i: usize = raw.len;
+        // 后缀可能包含字母和数字（如 f16, f128），先跳过末尾数字，再跳过字母
+        while (i > 0) {
+            const ch = raw[i - 1];
+            if (ch >= '0' and ch <= '9') {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
         while (i > 0) {
             const ch = raw[i - 1];
             if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
@@ -1988,13 +2009,16 @@ pub const Parser = struct {
                 break;
             }
         }
-        if (i < raw.len) {
+        // 确保至少有一个字母开头（避免把纯数字当作后缀）
+        if (i < raw.len and i > 0 and ((raw[i] >= 'a' and raw[i] <= 'z') or (raw[i] >= 'A' and raw[i] <= 'Z'))) {
             suffix = raw[i..];
+        } else {
+            i = raw.len;
         }
         return self.allocExpr(ast.Expr{
             .float_literal = .{
                 .location = tokenLoc(tok),
-                .raw = raw,
+                .raw = raw[0..i],
                 .suffix = suffix,
             },
         });

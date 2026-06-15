@@ -87,7 +87,7 @@ fn matchLiteralPattern(lit: ast.PatternLiteral, val: value.Value) PatternError!b
             return false;
         },
         .float => |raw| {
-            const pat_val = parseFloat(f64, raw) catch return false;
+            const pat_val = parseFloat(f128, raw) catch return false;
             if (val == .float) return val.float.value == pat_val;
             return false;
         },
