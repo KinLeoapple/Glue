@@ -11,6 +11,7 @@ const ast = @import("ast");
 const subtype_check = @import("subtype_check");
 const trait_resolve = @import("trait_resolve");
 const throw_check = @import("throw_check");
+const kind_check = @import("kind_check");
 
 // ============================================================
 // 类型表示
@@ -367,6 +368,10 @@ pub const TraitInfo = struct {
     method_schemes: std.StringHashMap(TypeScheme),
     /// 定义该 Trait 的模块名（用于 Orphan 检查）
     defining_module: []const u8 = "",
+    /// 文档 §2.11.1: 每个类型参数声明的 kind 的 arity（`->` 个数）。
+    /// `F : * -> *` → 1，`* -> * -> *` → 2，未标注/`*` → 0。
+    /// 用于 impl 头部类型实参的 kind 检查。
+    type_param_kind_arities: []const usize = &[_]usize{},
 };
 
 /// 类型方案（用于 let-polymorphism）
@@ -545,6 +550,18 @@ pub const TypeInferencer = struct {
     /// 文档 2.7.3: 函数 Trait Bound 记录（函数名 -> bounds）
     /// 用于在调用点验证泛型 Trait Bound
     fn_bounds: std.StringHashMap([]ast.TraitBound),
+    /// 顶层函数预声明集合 — 在检查任何函数体之前注册所有顶层函数签名，
+    /// 使前向引用与相互递归可用（文档 Phase 1: 相互递归也支持 TCO）。
+    /// 记录哪些名字已被预声明，使 checkDeclCollecting 的最终注册改用 redefine。
+    predeclared_fns: std.StringHashMap(void),
+    /// 预声明阶段抑制类型错误 — 此阶段类型/trait 尚未注册，签名仅作占位，
+    /// 真正的类型检查在 checkDeclCollecting 中按声明顺序完成。
+    suppress_errors: bool = false,
+    /// 跨模块导出的函数类型 scheme 注册表（文档 §4: 文件即模块 + use）。
+    /// key: "模块名" + 0 + "符号名"，value: 该符号的 TypeScheme。
+    /// 仅记录 pub 顶层函数；类型/ADT 已通过 adt_types 跨模块持久化。
+    /// 不在 resetForNextModule 中清空——跨模块检查依赖它。
+    exported_schemes: std.StringHashMap(TypeScheme),
     /// 内建函数/构造器名称集合（用于禁止用户遮蔽内建定义）
     builtin_names: std.StringHashMap(void),
     /// 用于 analyzeNullCheck 中翻转 is_non_null 的临时缓冲
@@ -582,6 +599,8 @@ pub const TypeInferencer = struct {
             .type_defining_modules = std.StringHashMap([]const u8).init(allocator),
             .registered_impls = std.StringHashMap(ImplRecord).init(allocator),
             .fn_bounds = std.StringHashMap([]ast.TraitBound).init(allocator),
+            .predeclared_fns = std.StringHashMap(void).init(allocator),
+            .exported_schemes = std.StringHashMap(TypeScheme).init(allocator),
             .builtin_names = std.StringHashMap(void).init(allocator),
             .linear_scope_stack = std.ArrayList(std.ArrayList(LinearVarInfo)).empty,
         };
@@ -637,6 +656,12 @@ pub const TypeInferencer = struct {
             self.registered_impls.deinit();
         }
         self.fn_bounds.deinit();
+        self.predeclared_fns.deinit();
+        {
+            var it = self.exported_schemes.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+            self.exported_schemes.deinit();
+        }
         {
             var iter = self.builtin_names.keyIterator();
             while (iter.next()) |key| {
@@ -658,6 +683,7 @@ pub const TypeInferencer = struct {
 
     /// 添加类型错误到错误列表
     pub fn addError(self: *TypeInferencer, kind: TypeErrorKind, comptime fmt: []const u8, args: anytype) void {
+        if (self.suppress_errors) return;
         const message = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
         self.errors.append(self.allocator, TypeError{
             .kind = kind,
@@ -667,6 +693,7 @@ pub const TypeInferencer = struct {
 
     /// 添加带源码位置的类型错误
     pub fn addErrorAt(self: *TypeInferencer, kind: TypeErrorKind, line: u32, column: u32, comptime fmt: []const u8, args: anytype) void {
+        if (self.suppress_errors) return;
         const message = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
         self.errors.append(self.allocator, TypeError{
             .kind = kind,
@@ -749,6 +776,8 @@ pub const TypeInferencer = struct {
             self.allocator.free(err.message);
         }
         self.errors.clearRetainingCapacity();
+        // 清空上一个模块的函数预声明记录
+        self.predeclared_fns.clearRetainingCapacity();
         // 清理线性变量追踪栈（模块切换时重置）
         for (self.linear_scope_stack.items) |*scope| {
             scope.deinit(self.allocator);
@@ -1027,112 +1056,31 @@ pub const TypeInferencer = struct {
     /// - 记录宽度子类型（§2.12.1）
     /// - Trait 结构化子类型（§2.12.2）
     /// - Error 子类型（§2.12.3）
+    // 文档 §2.12 子类型关系：实现已迁移到 subtype_check.zig，
+    // 这里保留薄委托方法，使内部调用点与外部 API 保持不变。
+
     pub fn isSubtype(self: *TypeInferencer, sub: *Type, super: *Type) bool {
-        const resolved_sub = self.resolve(sub);
-        const resolved_super = self.resolve(super);
-
-        // 相同类型
-        if (resolved_sub == resolved_super) return true;
-
-        // 1. Null <: T?（文档 §2.3.1: null 是所有 T? 的共享值）
-        if (resolved_sub.* == .null_type and resolved_super.* == .nullable_type) return true;
-
-        // 2. T <: T?（任何类型都是其可空版本的子类型）
-        if (resolved_super.* == .nullable_type) {
-            const inner = resolved_super.nullable_type;
-            if (self.isSubtype(resolved_sub, inner)) return true;
-        }
-
-        // 3. 记录宽度子类型（文档 §2.12.1）
-        //    (name: str, age: i32) <: (name: str)
-        if (resolved_sub.* == .record_type and resolved_super.* == .record_type) {
-            return self.isRecordSubtype(resolved_sub.record_type.fields, resolved_super.record_type.fields);
-        }
-
-        // 4. Error 子类型（文档 §2.12.3）
-        //    FileError <: Error
-        if (resolved_sub.* == .adt_type and resolved_super.* == .adt_type) {
-            return self.isErrorSubtype(resolved_sub.adt_type.name, resolved_super.adt_type.name);
-        }
-
-        // 5. Throw 子类型：Throw<T, E1> <: Throw<T, E2> 当 E1 <: E2
-        if (resolved_sub.* == .throw_type and resolved_super.* == .throw_type) {
-            return self.isThrowSubtype(
-                resolved_sub.throw_type.value_type,
-                resolved_sub.throw_type.error_type,
-                resolved_super.throw_type.value_type,
-                resolved_super.throw_type.error_type,
-            );
-        }
-
-        // 6. Trait 结构化子类型（文档 §2.12.2）
-        //    方法更多的模块是方法更少的 Trait 的子类型
-        if (resolved_sub.* == .trait_type and resolved_super.* == .trait_type) {
-            return self.isTraitStructuralSubtype(resolved_sub.trait_type.name, resolved_super.trait_type.name);
-        }
-
-        return false;
+        return subtype_check.isSubtype(self, sub, super);
     }
 
-    /// 记录宽度子类型检查
-    /// 文档 §2.12.1: 字段更多的记录是字段更少的记录的子类型
     fn isRecordSubtype(self: *TypeInferencer, sub_fields: []const FieldType, super_fields: []const FieldType) bool {
-        _ = self;
-        // 子类型（字段更多）必须包含父类型（字段更少）的所有字段
-        for (super_fields) |super_field| {
-            var found = false;
-            for (sub_fields) |sub_field| {
-                if (std.mem.eql(u8, super_field.name, sub_field.name)) {
-                    // 字段类型必须相同（简化处理，递归子类型检查在 unify 中处理）
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
-        return true;
+        return subtype_check.isRecordSubtype(self, sub_fields, super_fields);
     }
 
-    /// Error 子类型检查
-    /// 文档 §2.12.3: 自定义错误类型是 Error 的子类型
+    fn recordArgSatisfies(self: *TypeInferencer, param: *Type, arg: *Type) bool {
+        return subtype_check.recordArgSatisfies(self, param, arg);
+    }
+
     fn isErrorSubtype(self: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
-        // 检查 sub 是否是 Error 的子类型
-        if (std.mem.eql(u8, super_name, "Error")) {
-            if (self.adt_types.get(sub_name)) |info| {
-                if (info.is_error_newtype) return true;
-            }
-        }
-        return false;
+        return subtype_check.isErrorSubtype(self, sub_name, super_name);
     }
 
-    /// Throw 子类型检查
-    /// Throw<T, E1> <: Throw<T, E2> 当 E1 <: E2
     fn isThrowSubtype(self: *TypeInferencer, sub_val: *Type, sub_err: *Type, super_val: *Type, super_err: *Type) bool {
-        // 值类型必须兼容
-        if (!self.isSubtype(sub_val, super_val)) return false;
-        // 错误类型必须是子类型关系
-        if (!self.isSubtype(sub_err, super_err)) return false;
-        return true;
+        return subtype_check.isThrowSubtype(self, sub_val, sub_err, super_val, super_err);
     }
 
-    /// Trait 结构化子类型检查
-    /// 文档 §2.12.2: 方法更多的模块是方法更少的 Trait 的子类型
     fn isTraitStructuralSubtype(self: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
-        const sub_info = self.trait_types.get(sub_name) orelse return false;
-        const super_info = self.trait_types.get(super_name) orelse return false;
-
-        // sub 必须包含 super 的所有方法
-        for (super_info.method_names) |super_method| {
-            var found = false;
-            for (sub_info.method_names) |sub_method| {
-                if (std.mem.eql(u8, super_method, sub_method)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
-        return true;
+        return subtype_check.isTraitStructuralSubtype(self, sub_name, super_name);
     }
 
     /// Occurs check：检查类型变量 id 是否出现在类型 t 中
@@ -1622,6 +1570,23 @@ pub const TypeInferencer = struct {
                 for (c.arguments, 0..) |arg, i| {
                     arg_types[i] = try self.inferExpr(arg, env);
                 }
+
+                // 文档 §2.12.1 记录宽度子类型的方向性检查：
+                // 实参记录必须是形参记录的子类型（即实参字段 ⊇ 形参字段）。
+                // unify 对记录是对称的（只比较较小集是否被较大集包含），
+                // 会错误地接受「实参字段比形参少」的情况，故在此显式按方向拒绝。
+                {
+                    const rc = self.resolve(callee_ty);
+                    if (rc.* == .fn_type and rc.fn_type.params.len == arg_types.len) {
+                        for (rc.fn_type.params, arg_types) |param_ty, arg_ty| {
+                            if (!self.recordArgSatisfies(param_ty, arg_ty)) {
+                                self.addErrorAt(.type_mismatch, c.location.line, c.location.column, "record argument missing required field(s) of parameter type", .{});
+                                return ret_ty;
+                            }
+                        }
+                    }
+                }
+
                 const expected_fn_ty = try self.makeFnType(arg_types, ret_ty);
                 // 先尝试直接统一
                 if (self.unify(callee_ty, expected_fn_ty)) {
@@ -1945,14 +1910,30 @@ pub const TypeInferencer = struct {
                 return self.makeGenericType("Atomic", &[_]*Type{val_ty});
             },
             .select => |sel| {
-                // select 返回第一个就绪分支体的类型
-                if (sel.arms.len > 0) {
-                    switch (sel.arms[0]) {
-                        .receive => |recv_arm| return try self.inferExpr(recv_arm.body, env),
-                        .timeout => |timeout_arm| return try self.inferExpr(timeout_arm.body, env),
+                // 文档 §3.5.3: 检查每个分支体；接收分支若带绑定（ch.recv() => v => body），
+                // 需在子作用域把 v 绑定为通道元素类型后再检查 body，否则 body 内 v 报 scope error。
+                var result_ty: ?*Type = null;
+                for (sel.arms) |arm| {
+                    switch (arm) {
+                        .receive => |recv_arm| {
+                            const arm_env = try env.createChild();
+                            if (recv_arm.binding) |binding_name| {
+                                // 通道接收表达式（通常是 ch.recv()，类型 T?）的内部类型 T 即绑定类型
+                                const recv_ty = self.inferExpr(recv_arm.channel_expr, env) catch try self.freshTypeVar();
+                                const resolved = self.resolve(recv_ty);
+                                const elem_ty = if (resolved.* == .nullable_type) resolved.nullable_type else recv_ty;
+                                arm_env.define(binding_name, TypeScheme{ .quantified_vars = &[_]usize{}, .ty = elem_ty }) catch {};
+                            }
+                            const body_ty = try self.inferExpr(recv_arm.body, arm_env);
+                            if (result_ty == null) result_ty = body_ty;
+                        },
+                        .timeout => |timeout_arm| {
+                            const body_ty = try self.inferExpr(timeout_arm.body, env);
+                            if (result_ty == null) result_ty = body_ty;
+                        },
                     }
                 }
-                return self.freshTypeVar();
+                return result_ty orelse try self.freshTypeVar();
             },
             .lazy, .monad_comprehension, .inline_trait_value => {
                 return self.freshTypeVar();
@@ -1962,6 +1943,16 @@ pub const TypeInferencer = struct {
 
     /// 推断语句的类型
     pub fn inferStmt(self: *TypeInferencer, stmt: *const ast.Stmt, env: *TypeEnv) SemaError!?*Type {
+        // 文档 §2.11: 函数体内 val/var 注解的 kind 检查
+        switch (stmt.*) {
+            .val_decl => |vd| {
+                if (vd.type_annotation) |ta| kind_check.checkTypeNode(self, ta, &[_][]const u8{});
+            },
+            .var_decl => |vd| {
+                if (vd.type_annotation) |ta| kind_check.checkTypeNode(self, ta, &[_][]const u8{});
+            },
+            else => {},
+        }
         return switch (stmt.*) {
             .val_decl => |vd| {
                 if (self.isBuiltinName(vd.name)) {
@@ -2226,6 +2217,13 @@ pub const TypeInferencer = struct {
                 if (self.adt_types.get(n.name)) |adt_info| {
                     return adt_info.ty;
                 }
+                // 文档 §2.17 / §4.6: trait 名可作为类型注解（一等 Trait 值 / 迭代器）。
+                if (self.trait_types.contains(n.name)) {
+                    const t = try self.allocator.create(Type);
+                    t.* = Type{ .trait_type = .{ .name = n.name, .type_args = &[_]*Type{} } };
+                    try self.types.append(self.allocator, t);
+                    return t;
+                }
                 // 未知命名类型，返回 ADT 类型占位
                 return self.makeAdtType(n.name, &[_]*Type{});
             },
@@ -2233,6 +2231,13 @@ pub const TypeInferencer = struct {
                 var args = try self.allocator.alloc(*Type, g.args.len);
                 for (g.args, 0..) |arg, i| {
                     args[i] = try self.typeFromAstWithParams(arg, type_param_map);
+                }
+                // 高阶类型变量应用：head 是作用域内的类型参数（如 Functor<F:*->*>
+                // 方法签名里的 F<T>），表示为 generic_type 保留名字与实参。
+                if (type_param_map) |tpm| {
+                    if (tpm.contains(g.name)) {
+                        return self.makeGenericType(g.name, args);
+                    }
                 }
                 if (std.mem.eql(u8, g.name, "Throw")) {
                     if (args.len == 2) {
@@ -2242,11 +2247,31 @@ pub const TypeInferencer = struct {
                         return t;
                     }
                 }
+                // 文档 §3: 并发/惰性内建泛型类型作类型注解
+                //   Atomic<T> (§3.4.1)、Spawn<T> (§3.3)、Channel<T>/Sender<T>/Receiver<T> (§3.5)、Lazy<T> (§6.10)
+                // 统一表示为 generic_type，与求值器/调度器侧一致。
+                if (std.mem.eql(u8, g.name, "Atomic") or
+                    std.mem.eql(u8, g.name, "Spawn") or
+                    std.mem.eql(u8, g.name, "Channel") or
+                    std.mem.eql(u8, g.name, "Sender") or
+                    std.mem.eql(u8, g.name, "Receiver") or
+                    std.mem.eql(u8, g.name, "Lazy"))
+                {
+                    return self.makeGenericType(g.name, args);
+                }
                 // 检查是否为已注册的泛型 ADT
                 if (self.adt_types.get(g.name)) |adt_info| {
                     if (adt_info.type_param_names.len > 0) {
                         return self.makeAdtType(g.name, args);
                     }
+                }
+                // 文档 §2.17: trait 名可作为类型注解（如 Iterable 的 iterator
+                // 返回 Iterator<T>）。注册过的 trait 解析为带类型实参的 trait_type。
+                if (self.trait_types.contains(g.name)) {
+                    const t = try self.allocator.create(Type);
+                    t.* = Type{ .trait_type = .{ .name = g.name, .type_args = args } };
+                    try self.types.append(self.allocator, t);
+                    return t;
                 }
                 self.addError(.type_mismatch, "undefined type '{s}'", .{g.name});
                 return self.makeAdtType(g.name, args);
@@ -2312,10 +2337,145 @@ pub const TypeInferencer = struct {
 
         // 文档 §3.3.3: 模块级别的 Spawn 线性类型追踪
         self.pushLinearScope();
+        // 跨模块导入（文档 §4.5 use）：先把已检查依赖模块导出的函数 scheme
+        // 注入当前 env，使后续函数体能解析这些名字。依赖模块必须已被检查
+        // （由 evalModule 在检查本模块前预加载依赖来保证），其导出 scheme
+        // 存于 self.exported_schemes。
+        for (module.declarations) |decl| {
+            if (decl == .use_decl) {
+                self.importUseDecl(decl.use_decl, &env);
+            }
+        }
+        // 前向引用 / 相互递归：先把所有顶层函数签名注册到 env，
+        // 再检查各函数体。这样 fun is_even 引用后定义的 fun is_odd、
+        // 或 main 调用其后定义的辅助函数，都能解析。
+        // 文档 Phase 1: 尾调用优化「相互递归也支持 TCO」。
+        // 预声明阶段类型/trait 尚未注册，签名仅作占位，抑制其类型错误。
+        self.suppress_errors = true;
+        for (module.declarations) |decl| {
+            if (decl == .fun_decl) {
+                self.predeclareFunction(decl.fun_decl, &env);
+            }
+        }
+        self.suppress_errors = false;
         for (module.declarations) |decl| {
             self.checkDeclCollecting(decl, &env);
         }
         self.popLinearScope();
+
+        // 记录本模块导出的 pub 顶层函数 scheme，供其它模块 use 时解析。
+        self.recordExports(module, module_name, &env);
+    }
+
+    /// 把一条 use 声明导入的符号（pub 函数）从导出注册表注入到 env。
+    /// 类型/ADT 已通过 adt_types 跨模块持久化，这里只处理函数 scheme。
+    fn importUseDecl(self: *TypeInferencer, ud: anytype, env: *TypeEnv) void {
+        if (ud.module_path.len == 0) return;
+        const mod = ud.module_path[0];
+        if (ud.items) |items| {
+            for (items) |item| {
+                const key = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ mod, item.name }) catch continue;
+                defer self.allocator.free(key);
+                if (self.exported_schemes.get(key)) |scheme| {
+                    const import_name = item.alias orelse item.name;
+                    env.redefine(import_name, scheme) catch {};
+                }
+            }
+        } else {
+            // use Module — 导入该模块全部导出函数
+            const prefix = std.fmt.allocPrint(self.allocator, "{s}\x00", .{mod}) catch return;
+            defer self.allocator.free(prefix);
+            var it = self.exported_schemes.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+                    const sym = entry.key_ptr.*[prefix.len..];
+                    env.redefine(sym, entry.value_ptr.*) catch {};
+                }
+            }
+        }
+    }
+
+    /// 记录本模块的 pub 导出 scheme 到 exported_schemes：
+    /// - pub 顶层函数
+    /// - pub use 再导出的符号（文档 §4.4.5: pub use 可被再导出）
+    fn recordExports(self: *TypeInferencer, module: *const ast.Module, module_name: []const u8, env: *TypeEnv) void {
+        for (module.declarations) |decl| {
+            switch (decl) {
+                .fun_decl => |f| {
+                    if (f.visibility != .public) continue;
+                    self.recordExportSymbol(module_name, f.name, env);
+                },
+                .use_decl => |ud| {
+                    // pub use Mod.{a, b} — 把再导出符号也登记在当前模块名下
+                    if (ud.visibility != .public) continue;
+                    if (ud.items) |items| {
+                        for (items) |item| {
+                            const local = item.alias orelse item.name;
+                            self.recordExportSymbol(module_name, local, env);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// 把 env 中名为 sym 的 scheme 登记为「module_name 导出 sym」。
+    fn recordExportSymbol(self: *TypeInferencer, module_name: []const u8, sym: []const u8, env: *TypeEnv) void {
+        const scheme = env.lookup(sym) orelse return;
+        const key = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ module_name, sym }) catch return;
+        // 已存在则覆盖（释放旧 key，避免重复检查时泄漏）
+        if (self.exported_schemes.getKey(key)) |old_key| {
+            self.exported_schemes.put(old_key, scheme) catch {};
+            self.allocator.free(key);
+        } else {
+            self.exported_schemes.put(key, scheme) catch {
+                self.allocator.free(key);
+            };
+        }
+    }
+
+    /// 预声明一个顶层函数签名（仅依据类型注解，缺省处用 fresh 变量）。
+    /// 注册到 env 以支持前向引用；同时在此完成顶层函数的重复定义检测。
+    fn predeclareFunction(self: *TypeInferencer, f: anytype, env: *TypeEnv) void {
+        // 内建同名函数（eq/compare/str 等）沿用 checkDeclCollecting 的覆盖逻辑，
+        // 不在此预声明，避免与内建 scheme 冲突。
+        if (self.isBuiltinName(f.name)) return;
+
+        // 已预声明过 → 顶层重复定义（此错误必须上报，绕过预声明阶段的抑制）
+        if (self.predeclared_fns.contains(f.name)) {
+            const msg = std.fmt.allocPrint(self.allocator, "duplicate definition: '{s}' is already defined in this scope", .{f.name}) catch return;
+            self.errors.append(self.allocator, TypeError{ .kind = .type_mismatch, .message = msg }) catch {};
+            return;
+        }
+
+        var type_param_map = std.StringHashMap(*Type).init(self.allocator);
+        defer type_param_map.deinit();
+        var type_param_ids = std.ArrayList(usize).empty;
+        defer type_param_ids.deinit(self.allocator);
+
+        for (f.type_params) |tp| {
+            const tv = self.freshTypeVar() catch return;
+            type_param_map.put(tp.name, tv) catch return;
+            type_param_ids.append(self.allocator, tv.type_var.id) catch return;
+        }
+
+        const param_types = self.allocator.alloc(*Type, f.params.len) catch return;
+        for (f.params, 0..) |param, i| {
+            param_types[i] = if (param.type_annotation) |ta|
+                self.typeFromAstWithParams(ta, &type_param_map) catch (self.freshTypeVar() catch return)
+            else
+                self.freshTypeVar() catch return;
+        }
+        const ret_ty = if (f.return_type) |rt|
+            self.typeFromAstWithParams(rt, &type_param_map) catch (self.freshTypeVar() catch return)
+        else
+            self.freshTypeVar() catch return;
+        const fn_ty = self.makeFnType(param_types, ret_ty) catch return;
+        const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
+        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = fn_ty };
+        env.define(f.name, scheme) catch return;
+        self.predeclared_fns.put(f.name, {}) catch {};
     }
 
     /// 注册内建函数到类型环境，与求值器的 registerBuiltins 对应
@@ -2494,8 +2654,10 @@ pub const TypeInferencer = struct {
             self.types.append(self.allocator, iterable_trait_ty) catch return;
             const iterable_method_names = self.allocator.alloc([]const u8, 1) catch return;
             iterable_method_names[0] = "iterator";
-            const iterable_assoc_names = self.allocator.alloc([]const u8, 1) catch return;
-            iterable_assoc_names[0] = "Item";
+            // 文档 §2.7.8 / §2.17: Iterable<T> 用泛型参数表达元素类型，
+            // 不使用关联类型。故 associated_type_names 为空——否则
+            // impl Iterable<T> 会被要求提供 `type Item`。
+            const iterable_assoc_names = &[_][]const u8{};
             // 注册方法签名：fun iterator(self: Iterable<T>) : Iterator<T>
             var iterable_method_schemes = std.StringHashMap(TypeScheme).init(self.allocator);
             {
@@ -2532,8 +2694,10 @@ pub const TypeInferencer = struct {
             self.types.append(self.allocator, iterator_trait_ty) catch return;
             const iterator_method_names = self.allocator.alloc([]const u8, 1) catch return;
             iterator_method_names[0] = "next";
-            const iterator_assoc_names = self.allocator.alloc([]const u8, 1) catch return;
-            iterator_assoc_names[0] = "Item";
+            // 文档 §2.7.8 / §2.17: Iterator<T> 用泛型参数表达元素类型，
+            // 不使用关联类型。故 associated_type_names 为空——否则
+            // impl Iterator<i32> 会被要求提供 `type Item`。
+            const iterator_assoc_names = &[_][]const u8{};
             // 注册方法签名：fun next(self: Iterator<T>) : T?
             var iterator_method_schemes = std.StringHashMap(TypeScheme).init(self.allocator);
             {
@@ -2627,7 +2791,40 @@ pub const TypeInferencer = struct {
     }
 
     /// 对声明进行类型检查，收集错误而非提前返回
+    /// 文档 §2.11: 对声明里的类型注解做 kind 合法性检查。
+    /// 收集该声明在作用域内的类型参数名（函数/类型的 <T>），委托 kind_check。
+    fn kindCheckDecl(self: *TypeInferencer, decl: ast.Decl) void {
+        switch (decl) {
+            .fun_decl => |f| {
+                var names = std.ArrayList([]const u8).empty;
+                defer names.deinit(self.allocator);
+                for (f.type_params) |tp| names.append(self.allocator, tp.name) catch return;
+                for (f.params) |p| {
+                    if (p.type_annotation) |ta| kind_check.checkTypeNode(self, ta, names.items);
+                }
+                if (f.return_type) |rt| kind_check.checkTypeNode(self, rt, names.items);
+            },
+            .expr_decl => |ed| {
+                if (ed.stmt) |s| {
+                    switch (s.*) {
+                        .val_decl => |vd| {
+                            if (vd.type_annotation) |ta| kind_check.checkTypeNode(self, ta, &[_][]const u8{});
+                        },
+                        .var_decl => |vd| {
+                            if (vd.type_annotation) |ta| kind_check.checkTypeNode(self, ta, &[_][]const u8{});
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
     fn checkDeclCollecting(self: *TypeInferencer, decl: ast.Decl, env: *TypeEnv) void {
+        // 文档 §2.11 Kind 检查：对声明中出现的类型注解做 kind 合法性检查
+        // （类型构造器必须按 arity 完全应用到 *）。在类型推断之前执行。
+        self.kindCheckDecl(decl);
         switch (decl) {
             .fun_decl => |f| {
                 const child_env = env.createChild() catch return;
@@ -2722,6 +2919,10 @@ pub const TypeInferencer = struct {
                         // 允许覆盖内建函数（使用 redefine 而非 defineOrReport）
                         env.redefine(f.name, final_scheme) catch return;
                     }
+                } else if (self.predeclared_fns.contains(f.name)) {
+                    // 已在前向引用预声明中注册（并已做重复检测），
+                    // 此处用推断后重新泛化的 scheme 覆盖占位签名。
+                    env.redefine(f.name, final_scheme) catch return;
                 } else if (!(env.defineOrReport(f.name, final_scheme) catch false)) {
                     self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{f.name});
                 }
@@ -2929,11 +3130,15 @@ pub const TypeInferencer = struct {
                         defer type_param_map.deinit();
                         var type_param_ids = std.ArrayList(usize).empty;
                         defer type_param_ids.deinit(self.allocator);
+                        var type_param_names = std.ArrayList([]const u8).empty;
+                        defer type_param_names.deinit(self.allocator);
 
                         for (td.type_params) |tp| {
                             const tv = self.freshTypeVar() catch return;
                             type_param_map.put(tp.name, tv) catch return;
                             type_param_ids.append(self.allocator, tv.type_var.id) catch return;
+                            const name_copy = self.allocator.dupe(u8, tp.name) catch return;
+                            type_param_names.append(self.allocator, name_copy) catch return;
                         }
 
                         var adt_args = std.ArrayList(*Type).empty;
@@ -2943,6 +3148,26 @@ pub const TypeInferencer = struct {
                             adt_args.append(self.allocator, tv) catch return;
                         }
                         const newtype_ty = self.makeAdtType(td.name, adt_args.items) catch return;
+
+                        // 把 newtype 注册为类型（带类型参数名），使 `Box<i32>` 等
+                        // 类型注解能解析——否则 typeFromAstWithParams 查 adt_types 落空，
+                        // 报 "undefined type"。与 .adt 分支的注册一致。
+                        if (!self.adt_types.contains(td.name)) {
+                            const type_key = self.allocator.dupe(u8, td.name) catch return;
+                            const ctor_names_single = self.allocator.alloc([]const u8, 1) catch return;
+                            ctor_names_single[0] = nt.name;
+                            const owned_tp_names = type_param_names.toOwnedSlice(self.allocator) catch return;
+                            self.adt_types.put(type_key, AdtInfo{
+                                .ty = newtype_ty,
+                                .constructor_names = ctor_names_single,
+                                .type_param_names = owned_tp_names,
+                                .defining_module = self.current_module,
+                            }) catch return;
+                            const mod_key = self.allocator.dupe(u8, td.name) catch return;
+                            const mod_val = self.allocator.dupe(u8, self.current_module) catch return;
+                            self.type_defining_modules.put(mod_key, mod_val) catch return;
+                        }
+
                         const inner_ty = self.typeFromAstWithParams(nt.inner, &type_param_map) catch return;
                         const ctor_params = self.allocator.alloc(*Type, 1) catch return;
                         ctor_params[0] = inner_ty;
@@ -3130,7 +3355,10 @@ pub const TypeInferencer = struct {
     fn patternCoversWildcard(self: *TypeInferencer, pat: *const ast.Pattern) bool {
         return switch (pat.*) {
             .wildcard => true,
-            .variable => true,
+            // Glue 约定（与 eval/pattern.zig 一致）：大写开头的 .variable 是
+            // 无参构造器模式（如 R/G/B），不是 catch-all 绑定；只有小写开头
+            // 才是真正的变量绑定（覆盖一切）。
+            .variable => |v| !(v.name.len > 0 and v.name[0] >= 'A' and v.name[0] <= 'Z'),
             .or_pattern => |or_p| self.patternCoversWildcard(or_p.left) and self.patternCoversWildcard(or_p.right),
             else => false,
         };
@@ -3165,6 +3393,17 @@ pub const TypeInferencer = struct {
                     if (std.mem.eql(u8, con.name, ctor_name)) {
                         covered[i] = true;
                         break;
+                    }
+                }
+            },
+            // 大写开头的 .variable 是无参构造器模式（R/G/B 等），需计入覆盖。
+            .variable => |v| {
+                if (v.name.len > 0 and v.name[0] >= 'A' and v.name[0] <= 'Z') {
+                    for (constructor_names, 0..) |ctor_name, i| {
+                        if (std.mem.eql(u8, v.name, ctor_name)) {
+                            covered[i] = true;
+                            break;
+                        }
                     }
                 }
             },

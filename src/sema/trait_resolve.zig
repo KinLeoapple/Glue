@@ -292,6 +292,14 @@ pub fn inferSafeMethodCall(
 }
 
 /// trait_decl 声明的处理逻辑
+/// 计算 ast.Kind 的箭头 arity（`* -> *` → 1，`* -> * -> *` → 2，`*` → 0）。
+fn kindArrowArity(k: *const ast.Kind) usize {
+    return switch (k.*) {
+        .star => 0,
+        .arrow => |a| 1 + kindArrowArity(a.result),
+    };
+}
+
 pub fn checkTraitDecl(
     inferencer: *TypeInferencer,
     td: @TypeOf(@as(ast.Decl, undefined).trait_decl),
@@ -374,16 +382,28 @@ pub fn checkTraitDecl(
             }
         }
         meth_names_list.append(inferencer.allocator, m.name) catch return;
+        // 方法自身的类型参数（如 map<T, U>）并入一个临时映射，
+        // 使方法签名里的 T/U 以及 F<T>（trait 的 F）都能解析。
+        var method_param_map = std.StringHashMap(*Type).init(inferencer.allocator);
+        defer method_param_map.deinit();
+        {
+            var it = type_param_map.iterator();
+            while (it.next()) |e| method_param_map.put(e.key_ptr.*, e.value_ptr.*) catch {};
+        }
+        for (m.type_params) |mtp| {
+            const tv = inferencer.freshTypeVar() catch return;
+            method_param_map.put(mtp.name, tv) catch {};
+        }
         var param_types = std.ArrayList(*Type).empty;
         for (m.params) |param| {
             const pt = if (param.type_annotation) |ta|
-                inferencer.typeFromAstWithParams(ta, &type_param_map) catch inferencer.freshTypeVar() catch return
+                inferencer.typeFromAstWithParams(ta, &method_param_map) catch inferencer.freshTypeVar() catch return
             else
                 inferencer.freshTypeVar() catch return;
             param_types.append(inferencer.allocator, pt) catch return;
         }
         const ret_type = if (m.return_type) |rt|
-            inferencer.typeFromAstWithParams(rt, &type_param_map) catch inferencer.freshTypeVar() catch return
+            inferencer.typeFromAstWithParams(rt, &method_param_map) catch inferencer.freshTypeVar() catch return
         else
             inferencer.freshTypeVar() catch return;
         const fn_type = inferencer.makeFnType(param_types.items, ret_type) catch return;
@@ -440,6 +460,13 @@ pub fn checkTraitDecl(
 
     const meth_names = meth_names_list.toOwnedSlice(inferencer.allocator) catch return;
 
+    // 文档 §2.11.1: 计算每个类型参数声明的 kind arity（`->` 个数），
+    // 供 impl 头部的类型实参 kind 检查使用。
+    const kind_arities = inferencer.allocator.alloc(usize, td.type_params.len) catch return;
+    for (td.type_params, 0..) |tp, i| {
+        kind_arities[i] = if (tp.kind) |k| kindArrowArity(k) else 0;
+    }
+
     const key = inferencer.allocator.dupe(u8, td.name) catch return;
     if (inferencer.isBuiltinName(td.name)) {
         inferencer.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
@@ -452,6 +479,7 @@ pub fn checkTraitDecl(
             .method_names = meth_names,
             .method_schemes = method_schemes,
             .defining_module = inferencer.current_module,
+            .type_param_kind_arities = kind_arities,
         }) catch return;
     }
     const mod_key = inferencer.allocator.dupe(u8, td.name) catch return;
@@ -467,6 +495,9 @@ pub fn checkImplDecl(
 ) void {
     // Orphan Instance 禁止 / Overlapping Instances 禁止
     checkImplOrphanAndOverlapping(inferencer, id);
+
+    // 文档 §2.11.1: impl 头部类型实参的 kind 检查
+    @import("kind_check").checkImplKinds(inferencer, id);
 
     // 关联类型验证
     checkImplAssociatedTypes(inferencer, id);

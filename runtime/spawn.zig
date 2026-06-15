@@ -43,6 +43,10 @@ pub const SpawnHandle = struct {
     result: ?Value,
     /// 是否已被消费（await 或 cancel）
     consumed: std.atomic.Value(bool),
+    /// worker 是否已彻底结束（不再触碰本 handle）。
+    /// 由 worker 在退出前最后一步置位；Evaluator.deinit 释放 handle 前自旋等待它，
+    /// 避免「主线程已 cancel/退出但 detached worker 仍在写 handle」的 use-after-free。
+    finished: std.atomic.Value(bool),
     /// 分配器
     allocator: std.mem.Allocator,
     /// IO 上下文（由 Zio Runtime 提供）
@@ -59,6 +63,7 @@ pub const SpawnHandle = struct {
             .status = std.atomic.Value(SpawnStatus).init(.Pending),
             .result = null,
             .consumed = std.atomic.Value(bool).init(false),
+            .finished = std.atomic.Value(bool).init(false),
             .allocator = allocator,
             .io = io,
             .mutex = ZioMutex.init,

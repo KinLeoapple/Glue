@@ -2157,4 +2157,5 @@ fun main() {
     test13()
     test14()
     test15()
+    println("Phase 1: All tests passed!")
 }

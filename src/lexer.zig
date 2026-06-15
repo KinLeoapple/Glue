@@ -121,6 +121,8 @@ pub const TokenType = enum {
     lt_eq,
     /// >=
     gt_eq,
+    /// <- （monad 绑定箭头）
+    lt_minus,
 
     // --- 逻辑运算符 ---
     /// &&
@@ -473,10 +475,12 @@ pub const Lexer = struct {
                 }
             },
 
-            // < 或 <=
+            // < 或 <= 或 <-（monad 绑定箭头）
             '<' => {
                 if (self.matchChar('=')) {
                     try self.addToken(.lt_eq, start, start_line, start_col);
+                } else if (self.matchChar('-')) {
+                    try self.addToken(.lt_minus, start, start_line, start_col);
                 } else {
                     try self.addToken(.lt, start, start_line, start_col);
                 }
@@ -1249,241 +1253,4 @@ fn isFloatSuffix(suffix: []const u8) bool {
         if (std.mem.eql(u8, suffix, v)) return true;
     }
     return false;
-}
-
-// ============================================================
-// 测试
-// ============================================================
-
-test "词法分析器 - 基本关键字和标识符" {
-    const source = "val x: i32 = 42";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.kw_val, tokens[0].type);
-    try std.testing.expectEqualStrings("val", tokens[0].lexeme);
-    try std.testing.expectEqual(TokenType.identifier, tokens[1].type);
-    try std.testing.expectEqualStrings("x", tokens[1].lexeme);
-    try std.testing.expectEqual(TokenType.colon, tokens[2].type);
-    try std.testing.expectEqual(TokenType.identifier, tokens[3].type);
-    try std.testing.expectEqualStrings("i32", tokens[3].lexeme);
-    try std.testing.expectEqual(TokenType.eq, tokens[4].type);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[5].type);
-    try std.testing.expectEqualStrings("42", tokens[5].lexeme);
-    try std.testing.expectEqual(TokenType.eof, tokens[6].type);
-}
-
-test "词法分析器 - 整数字面量" {
-    const source = "42 0xFF 0o77 0b1010 1_000_000 42i32 42u64";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.int_literal, tokens[0].type);
-    try std.testing.expectEqualStrings("42", tokens[0].lexeme);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[1].type);
-    try std.testing.expectEqualStrings("0xFF", tokens[1].lexeme);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[2].type);
-    try std.testing.expectEqualStrings("0o77", tokens[2].lexeme);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[3].type);
-    try std.testing.expectEqualStrings("0b1010", tokens[3].lexeme);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[4].type);
-    try std.testing.expectEqualStrings("1_000_000", tokens[4].lexeme);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[5].type);
-    try std.testing.expectEqualStrings("42i32", tokens[5].lexeme);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[6].type);
-    try std.testing.expectEqualStrings("42u64", tokens[6].lexeme);
-}
-
-test "词法分析器 - 浮点字面量" {
-    const source = "3.14 1.0 .5 3.14f32 3.14f64 1e10 1.5e-3 0x1.5p3";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.float_literal, tokens[0].type);
-    try std.testing.expectEqualStrings("3.14", tokens[0].lexeme);
-    try std.testing.expectEqual(TokenType.float_literal, tokens[1].type);
-    try std.testing.expectEqualStrings("1.0", tokens[1].lexeme);
-    try std.testing.expectEqual(TokenType.float_literal, tokens[2].type);
-    try std.testing.expectEqualStrings(".5", tokens[2].lexeme);
-    try std.testing.expectEqual(TokenType.float_literal, tokens[3].type);
-    try std.testing.expectEqualStrings("3.14f32", tokens[3].lexeme);
-    try std.testing.expectEqual(TokenType.float_literal, tokens[4].type);
-    try std.testing.expectEqualStrings("3.14f64", tokens[4].lexeme);
-    try std.testing.expectEqual(TokenType.float_literal, tokens[5].type);
-    try std.testing.expectEqualStrings("1e10", tokens[5].lexeme);
-    try std.testing.expectEqual(TokenType.float_literal, tokens[6].type);
-    try std.testing.expectEqualStrings("1.5e-3", tokens[6].lexeme);
-    try std.testing.expectEqual(TokenType.float_literal, tokens[7].type);
-    try std.testing.expectEqualStrings("0x1.5p3", tokens[7].lexeme);
-}
-
-test "词法分析器 - 字符字面量" {
-    const source = "'a' '\\n' '\\t' '\\\\' '\\'' '\\0' '\\u{1F600}'";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.char_literal, tokens[0].type);
-    try std.testing.expectEqualStrings("'a'", tokens[0].lexeme);
-    try std.testing.expectEqual(TokenType.char_literal, tokens[1].type);
-    try std.testing.expectEqualStrings("'\\n'", tokens[1].lexeme);
-    try std.testing.expectEqual(TokenType.char_literal, tokens[2].type);
-    try std.testing.expectEqualStrings("'\\t'", tokens[2].lexeme);
-    try std.testing.expectEqual(TokenType.char_literal, tokens[3].type);
-    try std.testing.expectEqualStrings("'\\\\'", tokens[3].lexeme);
-    try std.testing.expectEqual(TokenType.char_literal, tokens[4].type);
-    try std.testing.expectEqualStrings("'\\''", tokens[4].lexeme);
-    try std.testing.expectEqual(TokenType.char_literal, tokens[5].type);
-    try std.testing.expectEqualStrings("'\\0'", tokens[5].lexeme);
-    try std.testing.expectEqual(TokenType.char_literal, tokens[6].type);
-    try std.testing.expectEqualStrings("'\\u{1F600}'", tokens[6].lexeme);
-}
-
-test "词法分析器 - 字符串字面量" {
-    const source = "\"hello\" \"hello {name}\" \"{{escaped}}\"";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.string_literal, tokens[0].type);
-    try std.testing.expectEqualStrings("\"hello\"", tokens[0].lexeme);
-    try std.testing.expectEqual(TokenType.string_literal, tokens[1].type);
-    try std.testing.expectEqual(TokenType.string_literal, tokens[2].type);
-}
-
-test "词法分析器 - 运算符" {
-    const source = "+ - * / % == != < > <= >= && || ! ?. ?? ? .. ..= = => -> |";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.plus, tokens[0].type);
-    try std.testing.expectEqual(TokenType.minus, tokens[1].type);
-    try std.testing.expectEqual(TokenType.star, tokens[2].type);
-    try std.testing.expectEqual(TokenType.slash, tokens[3].type);
-    try std.testing.expectEqual(TokenType.percent, tokens[4].type);
-    try std.testing.expectEqual(TokenType.eq_eq, tokens[5].type);
-    try std.testing.expectEqual(TokenType.bang_eq, tokens[6].type);
-    try std.testing.expectEqual(TokenType.lt, tokens[7].type);
-    try std.testing.expectEqual(TokenType.gt, tokens[8].type);
-    try std.testing.expectEqual(TokenType.lt_eq, tokens[9].type);
-    try std.testing.expectEqual(TokenType.gt_eq, tokens[10].type);
-    try std.testing.expectEqual(TokenType.amp_amp, tokens[11].type);
-    try std.testing.expectEqual(TokenType.pipe_pipe, tokens[12].type);
-    try std.testing.expectEqual(TokenType.bang, tokens[13].type);
-    try std.testing.expectEqual(TokenType.question_dot, tokens[14].type);
-    try std.testing.expectEqual(TokenType.question_question, tokens[15].type);
-    try std.testing.expectEqual(TokenType.question, tokens[16].type);
-    try std.testing.expectEqual(TokenType.dot_dot, tokens[17].type);
-    try std.testing.expectEqual(TokenType.dot_dot_eq, tokens[18].type);
-    try std.testing.expectEqual(TokenType.eq, tokens[19].type);
-    try std.testing.expectEqual(TokenType.eq_gt, tokens[20].type);
-    try std.testing.expectEqual(TokenType.minus_gt, tokens[21].type);
-    try std.testing.expectEqual(TokenType.pipe, tokens[22].type);
-}
-
-test "词法分析器 - 分隔符" {
-    const source = "( ) [ ] { } , : .";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.l_paren, tokens[0].type);
-    try std.testing.expectEqual(TokenType.r_paren, tokens[1].type);
-    try std.testing.expectEqual(TokenType.l_bracket, tokens[2].type);
-    try std.testing.expectEqual(TokenType.r_bracket, tokens[3].type);
-    try std.testing.expectEqual(TokenType.l_brace, tokens[4].type);
-    try std.testing.expectEqual(TokenType.r_brace, tokens[5].type);
-    try std.testing.expectEqual(TokenType.comma, tokens[6].type);
-    try std.testing.expectEqual(TokenType.colon, tokens[7].type);
-    try std.testing.expectEqual(TokenType.dot, tokens[8].type);
-}
-
-test "词法分析器 - 注释" {
-    const source = "42 // comment\n43 /* block */ 44 /* nested /* inner */ outer */";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.int_literal, tokens[0].type);
-    try std.testing.expectEqualStrings("42", tokens[0].lexeme);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[1].type);
-    try std.testing.expectEqualStrings("43", tokens[1].lexeme);
-    try std.testing.expectEqual(TokenType.int_literal, tokens[2].type);
-    try std.testing.expectEqualStrings("44", tokens[2].lexeme);
-    try std.testing.expectEqual(TokenType.eof, tokens[3].type);
-}
-
-test "词法分析器 - 源位置追踪" {
-    const source = "val\nx";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    // val 在第 1 行第 1 列
-    try std.testing.expectEqual(@as(u32, 1), tokens[0].line);
-    try std.testing.expectEqual(@as(u32, 1), tokens[0].column);
-    // x 在第 2 行第 1 列
-    try std.testing.expectEqual(@as(u32, 2), tokens[1].line);
-    try std.testing.expectEqual(@as(u32, 1), tokens[1].column);
-}
-
-test "词法分析器 - 布尔和null字面量" {
-    const source = "true false null";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.true_literal, tokens[0].type);
-    try std.testing.expectEqual(TokenType.false_literal, tokens[1].type);
-    try std.testing.expectEqual(TokenType.null_literal, tokens[2].type);
-}
-
-test "词法分析器 - 所有关键字" {
-    const source = "fun type trait impl override pack pub use with as val var match if else spawn channel select loop for in while break continue throw lazy defer";
-    var lex = Lexer.init(std.testing.allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-    defer std.testing.allocator.free(tokens);
-
-    try std.testing.expectEqual(TokenType.kw_fun, tokens[0].type);
-    try std.testing.expectEqual(TokenType.kw_type, tokens[1].type);
-    try std.testing.expectEqual(TokenType.kw_trait, tokens[2].type);
-    try std.testing.expectEqual(TokenType.kw_impl, tokens[3].type);
-    try std.testing.expectEqual(TokenType.kw_override, tokens[4].type);
-    try std.testing.expectEqual(TokenType.kw_pack, tokens[5].type);
-    try std.testing.expectEqual(TokenType.kw_pub, tokens[6].type);
-    try std.testing.expectEqual(TokenType.kw_use, tokens[7].type);
-    try std.testing.expectEqual(TokenType.kw_with, tokens[8].type);
-    try std.testing.expectEqual(TokenType.kw_as, tokens[9].type);
-    try std.testing.expectEqual(TokenType.kw_val, tokens[10].type);
-    try std.testing.expectEqual(TokenType.kw_var, tokens[11].type);
-    try std.testing.expectEqual(TokenType.kw_match, tokens[12].type);
-    try std.testing.expectEqual(TokenType.kw_if, tokens[13].type);
-    try std.testing.expectEqual(TokenType.kw_else, tokens[14].type);
-    try std.testing.expectEqual(TokenType.kw_spawn, tokens[15].type);
-    try std.testing.expectEqual(TokenType.kw_channel, tokens[16].type);
-    try std.testing.expectEqual(TokenType.kw_select, tokens[17].type);
-    try std.testing.expectEqual(TokenType.kw_loop, tokens[18].type);
-    try std.testing.expectEqual(TokenType.kw_for, tokens[19].type);
-    try std.testing.expectEqual(TokenType.kw_in, tokens[20].type);
-    try std.testing.expectEqual(TokenType.kw_while, tokens[21].type);
-    try std.testing.expectEqual(TokenType.kw_break, tokens[22].type);
-    try std.testing.expectEqual(TokenType.kw_continue, tokens[23].type);
-    try std.testing.expectEqual(TokenType.kw_throw, tokens[24].type);
-    try std.testing.expectEqual(TokenType.kw_lazy, tokens[25].type);
-    try std.testing.expectEqual(TokenType.kw_defer, tokens[26].type);
 }

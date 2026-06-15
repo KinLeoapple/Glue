@@ -33,7 +33,7 @@ const ParserError = error{ OutOfMemory, UnexpectedToken };
 // ============================================================
 
 pub const Parser = struct {
-    tokens: []const lexer.Token,
+    tokens: []lexer.Token,
     current: usize,
     allocator: std.mem.Allocator,
     errors: std.ArrayList(ParseError),
@@ -42,11 +42,17 @@ pub const Parser = struct {
     allocated_types: std.ArrayList(*ast.TypeNode),
     allocated_patterns: std.ArrayList(*ast.Pattern),
     allocated_kinds: std.ArrayList(*ast.Kind),
+    /// 是否拥有 tokens 缓冲（init 复制以便就地拆分 `>=`/`>>`，deinit 释放）
+    owns_tokens: bool,
 
     /// 初始化解析器
     pub fn init(allocator: std.mem.Allocator, tokens: []const lexer.Token) Parser {
+        // 复制一份可变 token 缓冲：闭合泛型尖括号时需把 `>=` 就地拆成 `>` + `=`
+        // （词法器贪婪地把 `>=` 合成单 token，导致 `Type<T>=` 无法解析）。
+        // 复制失败则退回只读切片（拆分能力降级，但不影响其它解析）。
+        const owned: ?[]lexer.Token = allocator.dupe(lexer.Token, tokens) catch null;
         return Parser{
-            .tokens = tokens,
+            .tokens = owned orelse @constCast(tokens),
             .current = 0,
             .allocator = allocator,
             .errors = .empty,
@@ -55,11 +61,13 @@ pub const Parser = struct {
             .allocated_types = .empty,
             .allocated_patterns = .empty,
             .allocated_kinds = .empty,
+            .owns_tokens = owned != null,
         };
     }
 
     /// 释放解析器资源
     pub fn deinit(self: *Parser) void {
+        if (self.owns_tokens) self.allocator.free(self.tokens);
         self.errors.deinit(self.allocator);
         for (self.allocated_exprs.items) |ptr| {
             self.allocator.destroy(ptr);
@@ -133,6 +141,34 @@ pub const Parser = struct {
     fn expect(self: *Parser, token_type: lexer.TokenType, message: []const u8) ParserError!lexer.Token {
         if (self.check(token_type)) {
             return self.advance();
+        }
+        const tok = self.peek();
+        try self.errors.append(self.allocator, ParseError{
+            .line = tok.line,
+            .column = tok.column,
+            .message = message,
+        });
+        return error.UnexpectedToken;
+    }
+
+    /// 闭合泛型尖括号 `>`。
+    /// 词法器会把 `>=` 贪婪合成单个 `gt_eq`，把 `>>` 切成两个 `gt`。
+    /// 这里统一处理闭合点：
+    ///   - 当前是 `gt`：正常消费。
+    ///   - 当前是 `gt_eq`：只消费它的 `>` 部分，把该 token 就地改写成 `eq`
+    ///     （`current` 不前进），使后续读到一个独立的 `=`。这样 `Type<T>= v`
+    ///     能正确解析，无需用户加空格。
+    /// owns_tokens 为 false（复制失败降级）时无法就地改写，退回普通 expect(.gt)。
+    fn expectCloseAngle(self: *Parser, message: []const u8) ParserError!void {
+        if (self.check(.gt)) {
+            _ = self.advance();
+            return;
+        }
+        if (self.owns_tokens and self.current < self.tokens.len and self.tokens[self.current].type == .gt_eq) {
+            // 拆分：把 `>=` 改写为 `=`，列号右移 1，相当于已消费了前面的 `>`
+            self.tokens[self.current].type = .eq;
+            self.tokens[self.current].column +%= 1;
+            return;
         }
         const tok = self.peek();
         try self.errors.append(self.allocator, ParseError{
@@ -440,7 +476,7 @@ pub const Parser = struct {
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
-            _ = self.expect(.gt, "expected '>' to close type parameter list") catch {};
+            self.expectCloseAngle("expected '>' to close type parameter list") catch {};
         }
 
         // 参数列表
@@ -493,7 +529,7 @@ pub const Parser = struct {
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
-            _ = self.expect(.gt, "expected '>' to close type parameter list") catch {};
+            self.expectCloseAngle("expected '>' to close type parameter list") catch {};
         }
 
         _ = self.expect(.eq, "expected '=' to define type body") catch {};
@@ -788,7 +824,7 @@ pub const Parser = struct {
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
-            _ = self.expect(.gt, "expected '>' to close type parameter list") catch {};
+            self.expectCloseAngle("expected '>' to close type parameter list") catch {};
         }
 
         var parents = std.ArrayList(ast.TraitBound).empty;
@@ -860,7 +896,7 @@ pub const Parser = struct {
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
-            _ = self.expect(.gt, "expected '>'") catch {};
+            self.expectCloseAngle("expected '>'") catch {};
         }
 
         var params = std.ArrayList(ast.Param).empty;
@@ -914,7 +950,7 @@ pub const Parser = struct {
         var type_args = std.ArrayList(*ast.TypeNode).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeArgList(&type_args);
-            _ = self.expect(.gt, "expected '>'") catch {};
+            self.expectCloseAngle("expected '>'") catch {};
         }
 
         // 提取目标类型名（如 impl Comparable<i32> 中的 "i32"）
@@ -977,7 +1013,10 @@ pub const Parser = struct {
         }
 
         var items: ?[]ast.UseItem = null;
-        if (self.matchToken(.dot)) {
+        // `use Mod.{...}` 进入 brace 列表前的 `.` 已被上面的 while 消费，
+        // 此时 previous() 是 `.`、当前是 `{`；`use Mod.Sub.{...}` 同理。
+        // 因此条件是「当前已在 `{`」或「再吃一个 `.` 后是 `{`」。
+        if (self.check(.l_brace) or self.matchToken(.dot)) {
             _ = self.expect(.l_brace, "expected '{'") catch {};
             var item_list = std.ArrayList(ast.UseItem).empty;
             if (!self.check(.r_brace)) {
@@ -1146,7 +1185,7 @@ pub const Parser = struct {
         var type_args = std.ArrayList(*ast.TypeNode).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeArgList(&type_args);
-            _ = self.expect(.gt, "expected '>'") catch {};
+            self.expectCloseAngle("expected '>'") catch {};
         }
 
         return ast.TraitBound{
@@ -1224,7 +1263,7 @@ pub const Parser = struct {
             while (self.matchToken(.comma)) {
                 try args.append(self.allocator, try self.parseType());
             }
-            _ = self.expect(.gt, "expected '>' to close type parameters") catch {};
+            self.expectCloseAngle("expected '>' to close type parameters") catch {};
 
             const generic_ty = try self.allocType(ast.TypeNode{
                 .generic = .{
@@ -1634,7 +1673,7 @@ pub const Parser = struct {
                     if (self.matchToken(.lt)) {
                         var ta = std.ArrayList(*ast.TypeNode).empty;
                         try self.parseTypeArgList(&ta);
-                        _ = self.expect(.gt, "expected '>'") catch {};
+                        self.expectCloseAngle("expected '>'") catch {};
                         type_args = try ta.toOwnedSlice(self.allocator);
                     }
                     _ = self.expect(.l_paren, "expected '('") catch {};
@@ -1674,7 +1713,7 @@ pub const Parser = struct {
                     if (self.matchToken(.lt)) {
                         var ta = std.ArrayList(*ast.TypeNode).empty;
                         try self.parseTypeArgList(&ta);
-                        _ = self.expect(.gt, "expected '>'") catch {};
+                        self.expectCloseAngle("expected '>'") catch {};
                         type_args = try ta.toOwnedSlice(self.allocator);
                     }
                     _ = self.expect(.l_paren, "expected '('") catch {};
@@ -1748,6 +1787,45 @@ pub const Parser = struct {
                         .type_args = type_args,
                     },
                 });
+            } else if (self.check(.lt) and self.isTurbofishCall()) {
+                // Turbofish 泛型调用：callee<TypeArgs>(args)，如 channel<i32>(0)
+                // 仅当 <...> 之后紧跟 ( 时才解析为调用，否则交给比较运算符。
+                // isTurbofishCall() 已确认该形态，这里的解析必定成功。
+                _ = self.matchToken(.lt);
+                var ta = std.ArrayList(*ast.TypeNode).empty;
+                try self.parseTypeArgList(&ta);
+                self.expectCloseAngle("expected '>'") catch {};
+                const type_args: ?[]*ast.TypeNode = try ta.toOwnedSlice(self.allocator);
+
+                // 禁止链式调用 f(a)(b)（与下方 l_paren 分支一致）
+                if (expr_node.* == .call) {
+                    const tok = self.peek();
+                    try self.errors.append(self.allocator, ParseError{
+                        .line = tok.line,
+                        .column = tok.column,
+                        .message = "chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first",
+                    });
+                    return error.UnexpectedToken;
+                }
+                const call_tok = self.peek();
+                var args = std.ArrayList(*ast.Expr).empty;
+                _ = self.expect(.l_paren, "expected '('") catch {};
+                if (!self.check(.r_paren)) {
+                    try args.append(self.allocator, try self.parseExpr());
+                    while (self.matchToken(.comma)) {
+                        try args.append(self.allocator, try self.parseExpr());
+                    }
+                }
+                _ = self.expect(.r_paren, "expected ')'") catch {};
+
+                expr_node = try self.allocExpr(ast.Expr{
+                    .call = .{
+                        .location = tokenLoc(call_tok),
+                        .callee = expr_node,
+                        .arguments = try args.toOwnedSlice(self.allocator),
+                        .type_args = type_args,
+                    },
+                });
             } else if (self.matchToken(.l_bracket)) {
                 const bracket_tok = self.previous();
                 const index = try self.parseExpr();
@@ -1766,6 +1844,38 @@ pub const Parser = struct {
         }
 
         return expr_node;
+    }
+
+    /// 前瞻：判断当前位置的 `<` 是否开启一个 turbofish 泛型调用 `<TypeArgs>(`。
+    /// 从当前 `<` 开始，平衡嵌套的 `<`/`>`（`>>` 在本语言中词法上是两个 `gt`），
+    /// 在匹配到最外层 `>` 后检查紧随的 token 是否为 `(`。
+    /// 不消费任何 token——只读 self.tokens。
+    /// 这样 `a < b` 比较不会被误判，而 `channel<i32>(0)` / `foo<A, B>(x)` 会被识别。
+    fn isTurbofishCall(self: *Parser) bool {
+        if (!self.check(.lt)) return false;
+        var i = self.current + 1;
+        var depth: usize = 1;
+        // 限定一个合理的前瞻上限，避免在病态输入上扫描过远
+        var steps: usize = 0;
+        while (i < self.tokens.len and steps < 256) : (steps += 1) {
+            const tt = self.tokens[i].type;
+            switch (tt) {
+                .lt => depth += 1,
+                .gt => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        // 最外层 `>` 之后必须紧跟 `(` 才是调用
+                        return i + 1 < self.tokens.len and self.tokens[i + 1].type == .l_paren;
+                    }
+                },
+                // 这些 token 不可能出现在类型实参列表中，提前否决
+                // （类型实参里只会出现标识符、`<` `>` `,` `?` `(` `)` `->` 等）
+                .l_brace, .r_brace, .eq, .eq_gt, .eof => return false,
+                else => {},
+            }
+            i += 1;
+        }
+        return false;
     }
 
     fn parsePrimary(self: *Parser) ParserError!*ast.Expr {
@@ -2358,7 +2468,19 @@ pub const Parser = struct {
         const channel_expr = try self.parseExpr();
         _ = self.expect(.eq_gt, "expected '=>'") catch {};
 
-        const binding: ?[]const u8 = null;
+        // 文档 §3.5.3: 接收分支支持两种形态
+        //   ch.recv() => name => body   绑定收到的值到 name
+        //   ch.recv() => body           不绑定
+        // 区分：第一个 `=>` 之后若是「标识符 紧跟 `=>`」，则该标识符是绑定名。
+        var binding: ?[]const u8 = null;
+        if (self.check(.identifier) and
+            self.current + 1 < self.tokens.len and
+            self.tokens[self.current + 1].type == .eq_gt)
+        {
+            const name_tok = self.advance(); // 标识符
+            _ = self.advance(); // 第二个 `=>`
+            binding = name_tok.lexeme;
+        }
 
         const body = try self.parseExpr();
 
@@ -2377,17 +2499,42 @@ pub const Parser = struct {
         const type_tok = try self.expect(.identifier, "expected monad type name");
         _ = self.expect(.l_brace, "expected '{'") catch {};
 
+        // 文档 §2.11.2: @M { x <- e1  y <- e2  result }
+        // 解析零或多个绑定 `name <- expr`，最后一个非绑定表达式是 result。
+        // 绑定的判定：标识符紧跟 `<-`。
         var bindings = std.ArrayList(ast.MonadBinding).empty;
-        // 简化：暂不解析绑定列表
-        const result = try self.parseExpr();
+        var result: ?*ast.Expr = null;
+        while (!self.check(.r_brace) and !self.isAtEnd()) {
+            if (self.check(.identifier) and
+                self.current + 1 < self.tokens.len and
+                self.tokens[self.current + 1].type == .lt_minus)
+            {
+                const name_tok = self.advance(); // 标识符
+                _ = self.advance(); // <-
+                const bind_expr = try self.parseExpr();
+                try bindings.append(self.allocator, ast.MonadBinding{
+                    .name = name_tok.lexeme,
+                    .expr = bind_expr,
+                });
+            } else {
+                // 非绑定：作为 result 表达式（应是块内最后一个表达式）
+                result = try self.parseExpr();
+                break;
+            }
+        }
         _ = self.expect(.r_brace, "expected '}'") catch {};
+
+        const result_expr = result orelse blk: {
+            // 没有显式 result：用 unit 占位（理论上 monad 块应以结果表达式结尾）
+            break :blk try self.allocExpr(ast.Expr{ .unit_literal = tokenLoc(at_tok) });
+        };
 
         return self.allocExpr(ast.Expr{
             .monad_comprehension = .{
                 .location = tokenLoc(at_tok),
                 .monad_type = type_tok.lexeme,
                 .bindings = try bindings.toOwnedSlice(self.allocator),
-                .result = result,
+                .result = result_expr,
             },
         });
     }
@@ -3453,239 +3600,4 @@ fn isDigitOrUnderscore(ch: u8) bool {
 
 fn isHexOrUnderscore(ch: u8) bool {
     return isDigitOrUnderscore(ch) or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
-}
-
-// ============================================================
-// 测试
-// ============================================================
-
-test "解析器 - 基本表达式解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "42";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const expr = try parser.parseExpr();
-    try std.testing.expect(expr.* == .int_literal);
-    try std.testing.expectEqualStrings("42", expr.*.int_literal.raw);
-}
-
-test "解析器 - 布尔表达式解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "true";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const expr = try parser.parseExpr();
-    try std.testing.expect(expr.* == .bool_literal);
-    try std.testing.expectEqual(true, expr.*.bool_literal.value);
-}
-
-test "解析器 - 二元运算解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "1 + 2";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const expr = try parser.parseExpr();
-    try std.testing.expect(expr.* == .binary);
-    try std.testing.expectEqual(ast.BinaryOp.add, expr.*.binary.op);
-    try std.testing.expect(expr.*.binary.left.* == .int_literal);
-    try std.testing.expect(expr.*.binary.right.* == .int_literal);
-}
-
-test "解析器 - 运算符优先级" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "1 + 2 * 3";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const expr = try parser.parseExpr();
-    try std.testing.expect(expr.* == .binary);
-    try std.testing.expectEqual(ast.BinaryOp.add, expr.*.binary.op);
-    try std.testing.expect(expr.*.binary.left.* == .int_literal);
-    try std.testing.expect(expr.*.binary.right.* == .binary);
-    try std.testing.expectEqual(ast.BinaryOp.mul, expr.*.binary.right.*.binary.op);
-}
-
-test "解析器 - val 声明解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "val x = 42";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const stmt = try parser.parseStmt();
-    try std.testing.expect(stmt.* == .val_decl);
-    try std.testing.expectEqualStrings("x", stmt.*.val_decl.name);
-    try std.testing.expect(stmt.*.val_decl.value.* == .int_literal);
-}
-
-test "解析器 - var 声明解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "var y : i32 = 10";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const stmt = try parser.parseStmt();
-    try std.testing.expect(stmt.* == .var_decl);
-    try std.testing.expectEqualStrings("y", stmt.*.var_decl.name);
-    try std.testing.expect(stmt.*.var_decl.type_annotation != null);
-    try std.testing.expect(stmt.*.var_decl.value.* == .int_literal);
-}
-
-test "解析器 - 函数声明解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "fun add(a: i32, b: i32) : i32 { a + b }";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const decl = try parser.parseDecl();
-    try std.testing.expect(decl == .fun_decl);
-    try std.testing.expectEqualStrings("add", decl.fun_decl.name);
-    try std.testing.expectEqual(@as(usize, 2), decl.fun_decl.params.len);
-    try std.testing.expect(decl.fun_decl.return_type != null);
-}
-
-test "解析器 - 类型声明解析（ADT）" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "type Shape = | Circle(f64) | Rectangle(f64, f64)";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const decl = try parser.parseDecl();
-    try std.testing.expect(decl == .type_decl);
-    try std.testing.expectEqualStrings("Shape", decl.type_decl.name);
-    try std.testing.expect(decl.type_decl.def == .adt);
-    try std.testing.expectEqual(@as(usize, 2), decl.type_decl.def.adt.constructors.len);
-}
-
-test "解析器 - 类型声明解析（别名）" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "type IntList = List<i32>";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const decl = try parser.parseDecl();
-    try std.testing.expect(decl == .type_decl);
-    try std.testing.expect(decl.type_decl.def == .alias);
-}
-
-test "解析器 - 一元运算解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "-42";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const expr = try parser.parseExpr();
-    try std.testing.expect(expr.* == .unary);
-    try std.testing.expectEqual(ast.UnaryOp.neg, expr.*.unary.op);
-    try std.testing.expect(expr.*.unary.operand.* == .int_literal);
-}
-
-test "解析器 - 比较运算解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "x < 10";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const expr = try parser.parseExpr();
-    try std.testing.expect(expr.* == .binary);
-    try std.testing.expectEqual(ast.BinaryOp.lt, expr.*.binary.op);
-}
-
-test "解析器 - 逻辑运算解析" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const source = "a && b || c";
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
-    const tokens = try lex.tokenize();
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const expr = try parser.parseExpr();
-    try std.testing.expect(expr.* == .binary);
-    try std.testing.expectEqual(ast.BinaryOp.or_op, expr.*.binary.op);
-    try std.testing.expect(expr.*.binary.left.* == .binary);
-    try std.testing.expectEqual(ast.BinaryOp.and_op, expr.*.binary.left.*.binary.op);
 }

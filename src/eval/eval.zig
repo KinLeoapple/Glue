@@ -176,6 +176,12 @@ pub const Evaluator = struct {
     /// 已创建的 SpawnHandle 列表（用于 deinit 时释放）
     spawn_handles: std.ArrayList(*value.SpawnHandle),
 
+    /// 跨模块加载时保留的源代码缓冲（文档 §4: 文件即模块）。
+    /// 导入函数的闭包会捕获 AST 节点，而整数字面量的 `raw`、标识符名等
+    /// 都是对模块 source 的切片。因此依赖模块的 source 必须存活到
+    /// 求值器 deinit，否则被导入函数体在调用时会读到悬垂内存。
+    retained_sources: std.ArrayList([]const u8),
+
     /// 模块路径解析器
     resolver: module_resolver.ModuleResolver,
 
@@ -215,6 +221,7 @@ pub const Evaluator = struct {
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
             .scan_line_buf = std.ArrayList(u8).empty,
             .spawn_handles = std.ArrayList(*value.SpawnHandle).empty,
+            .retained_sources = std.ArrayList([]const u8).empty,
             .resolver = module_resolver.ModuleResolver.init(allocator),
         };
         ev.registerBuiltins();
@@ -244,6 +251,7 @@ pub const Evaluator = struct {
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
             .scan_line_buf = std.ArrayList(u8).empty,
             .spawn_handles = std.ArrayList(*value.SpawnHandle).empty,
+            .retained_sources = std.ArrayList([]const u8).empty,
             .resolver = module_resolver.ModuleResolver.init(allocator),
         };
         ev.registerBuiltins();
@@ -276,6 +284,7 @@ pub const Evaluator = struct {
             .impl_registry = std.StringHashMap(ImplInfo).init(allocator),
             .scan_line_buf = std.ArrayList(u8).empty,
             .spawn_handles = std.ArrayList(*value.SpawnHandle).empty,
+            .retained_sources = std.ArrayList([]const u8).empty,
             .resolver = module_resolver.ModuleResolver.init(allocator),
         };
         ev.registerBuiltins();
@@ -378,11 +387,20 @@ pub const Evaluator = struct {
         self.scan_line_buf.deinit(self.allocator);
         // 等待所有 spawn 协程完成并释放 handle
         for (self.spawn_handles.items) |handle| {
-            // Zio 协程：无需手动 join，调度器管理协程生命周期
+            // 等待 worker 彻底结束后再释放，避免 detached worker 写已释放内存。
+            // await 已等待结果；cancel/未消费的 handle 此处兜底等待 worker 退出。
+            while (!handle.finished.load(.seq_cst)) {
+                std.Thread.yield() catch {};
+            }
             handle.deinit();
             self.allocator.destroy(handle);
         }
         self.spawn_handles.deinit(self.allocator);
+        // 释放跨模块保留的源代码缓冲
+        for (self.retained_sources.items) |src| {
+            self.allocator.free(src);
+        }
+        self.retained_sources.deinit(self.allocator);
         // 释放模块解析器
         self.resolver.deinit();
     }
@@ -1417,6 +1435,25 @@ pub const Evaluator = struct {
             }
         }
 
+        // 跨模块导入预加载（文档 §4.5 use）：在类型检查本模块之前，
+        // 先加载并检查所有 use 依赖。这样依赖模块的导出函数 scheme 会被
+        // 注册到 type_inferencer.exported_schemes，本模块的类型检查才能
+        // 解析这些导入名字。依赖的运行时值也会在此一并求值（共享 global_env），
+        // 后续本模块求值时 use_decl 只是从导出表引用已存在的值。
+        // loading_modules 已包含本模块名，依赖若反向 use 本模块会触发循环依赖错误。
+        for (module.declarations) |decl| {
+            if (decl == .use_decl) {
+                const ud = decl.use_decl;
+                if (ud.module_path.len == 0) continue;
+                if (self.loaded_modules.contains(ud.module_path[0])) continue;
+                if (self.loading_modules.contains(ud.module_path[0])) return error.CircularDependency;
+                self.loadModuleFromFile(ud.module_path) catch |err| switch (err) {
+                    error.FileNotFound => {}, // 内建模块或尚未实现，跳过
+                    else => return err,
+                };
+            }
+        }
+
         // 先检查后求值：运行 Hindley-Milner 类型推断
         // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值
         self.type_inferencer.checkModule(&module);
@@ -2007,10 +2044,15 @@ pub const Evaluator = struct {
                         }
                     } else {
                         // 导入整个模块的所有 pub 声明：use Module
-                        var iter = export_info.env.values.iterator();
-                        while (iter.next()) |entry| {
-                            if (entry.value_ptr.is_public) {
-                                try environment.defineWithVisibility(entry.key_ptr.*, entry.value_ptr.value, false, is_reexport);
+                        // 注意：模块求值共享 global_env，若导出 env 与目标 env 是
+                        // 同一张表（依赖已预加载进 global_env），其 pub 符号已在作用域内，
+                        // 再 put 会在迭代中改写同一 map 导致迭代器失效——直接跳过。
+                        if (export_info.env != environment) {
+                            var iter = export_info.env.values.iterator();
+                            while (iter.next()) |entry| {
+                                if (entry.value_ptr.is_public) {
+                                    try environment.defineWithVisibility(entry.key_ptr.*, entry.value_ptr.value, false, is_reexport);
+                                }
                             }
                         }
                     }
@@ -2147,7 +2189,7 @@ pub const Evaluator = struct {
             .compound_assign => |ca| self.evalCompoundAssign(ca, environment),
             .lazy => error.UnsupportedOperation,
             .select => |sel| self.evalSelect(sel, environment),
-            .monad_comprehension => error.UnsupportedOperation,
+            .monad_comprehension => |mc| self.evalMonadComprehension(mc, environment),
             .inline_trait_value => error.UnsupportedOperation,
         };
     }
@@ -2239,6 +2281,20 @@ pub const Evaluator = struct {
         }
 
         return Value{ .string = try result.toOwnedSlice(self.allocator) };
+    }
+
+    /// 求值 val/var 声明的右侧。
+    /// 特例：RHS 是「裸标识符且持有 Atomic」时，别名该 Atomic 引用而非透明 load。
+    /// 文档 §3.4.5/§3.2.2：`val c = counter` 浅拷贝 Atomic 引用，使后续 `c += 1`
+    /// 与 spawn 捕获共享同一底层原子单元；其它值上下文（算术/比较）仍由
+    /// evalIdentifier 透明 load（文档 §3.4.2）。
+    fn evalDeclRhs(self: *Evaluator, expr: *const ast.Expr, environment: *Environment) EvalResult!Value {
+        if (expr.* == .identifier) {
+            if (environment.get(expr.identifier.name)) |v| {
+                if (v.value == .atomic_val) return v.value; // 别名，不 load
+            }
+        }
+        return self.evalExpr(expr, environment);
     }
 
     fn evalIdentifier(self: *Evaluator, id: @TypeOf(@as(ast.Expr, undefined).identifier), environment: *Environment) EvalResult!Value {
@@ -2798,10 +2854,22 @@ pub const Evaluator = struct {
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
             if (isBuiltinType(name) and call.arguments.len == 1) {
+                // 类型转换的实参不在尾位置（同 evalCall 主路径的理由）
+                const saved_tail_cast = self.in_tail_position;
+                self.in_tail_position = false;
+                defer self.in_tail_position = saved_tail_cast;
                 const arg = try self.evalExpr(call.arguments[0], environment);
                 return self.castValue(arg, name);
             }
         }
+
+        // 尾位置只作用于「函数应用」本身，不传递给 callee 和实参。
+        // evalExpr 对 .call 保留 in_tail_position（用于 TCO trampoline），
+        // 但 callee 与实参的子表达式都不在尾位置——否则作为实参的函数调用
+        // （如 println(f(7)) 中的 f(7)）会错误地触发 error.TailCall，
+        // 劫持外层函数的 trampoline。求值它们时必须先关闭尾位置标记。
+        const saved_tail_pos = self.in_tail_position;
+        self.in_tail_position = false;
 
         const callee = try self.evalExpr(call.callee, environment);
 
@@ -2823,6 +2891,20 @@ pub const Evaluator = struct {
             self.popRoots(args.items.len); // 弹出所有参数的 root
         }
 
+        // 恢复尾位置标记，供本次函数应用的 TCO 判断使用
+        self.in_tail_position = saved_tail_pos;
+
+        // Trait 方法的类型导向重分派：
+        // impl 方法同时按裸名注册进环境，多个 impl 同名方法（如 Monad<List>.bind 与
+        // Monad<Box>.bind）会互相覆盖，env 里只剩最后一个。当一个裸标识符调用对应
+        // 多个不同类型的 impl 方法时，按第一个实参的运行时类型重新解析到正确的 impl，
+        // 使 `bind(t, f)` 在 t 是 List 时用 List.bind、是 Box 时用 Box.bind。
+        if (call.callee.* == .identifier and args.items.len > 0) {
+            if (self.redispatchTraitMethod(call.callee.identifier.name, args.items[0])) |c| {
+                return self.callFunction(Value{ .closure = c }, args.items, environment);
+            }
+        }
+
         // TCO: 如果在尾位置且被调用者是闭包，使用尾调用优化
         if (self.in_tail_position and callee == .closure) {
             const owned_args = try self.allocator.dupe(Value, args.items);
@@ -2834,6 +2916,26 @@ pub const Evaluator = struct {
         }
 
         return self.callFunction(callee, args.items, environment);
+    }
+
+    /// 若 method_name 对应多个不同类型的 impl 方法，按 receiver 运行时类型选出
+    /// 匹配的 impl 闭包；无歧义（0 或 1 个 impl）时返回 null，走普通环境解析。
+    fn redispatchTraitMethod(self: *Evaluator, method_name: []const u8, receiver: Value) ?*value.Closure {
+        const recv_type = valueTypeName(receiver) orelse return null;
+        var match_count: usize = 0;
+        var matched: ?*value.Closure = null;
+        var name_count: usize = 0;
+        for (self.impl_methods.items) |entry| {
+            if (!std.mem.eql(u8, entry.method_name, method_name)) continue;
+            name_count += 1;
+            if (std.mem.eql(u8, entry.type_name, recv_type)) {
+                matched = entry.closure;
+                match_count += 1;
+            }
+        }
+        // 只有当该方法名存在多个 impl（有歧义）且能按类型唯一匹配时才重分派
+        if (name_count >= 2 and match_count == 1) return matched;
+        return null;
     }
 
     fn callFunction(self: *Evaluator, callee: Value, args: []const Value, environment: ?*Environment) EvalResult!Value {
@@ -2971,6 +3073,11 @@ pub const Evaluator = struct {
     }
 
     fn evalMethodCall(self: *Evaluator, mc: @TypeOf(@as(ast.Expr, undefined).method_call), environment: *Environment) EvalResult!Value {
+        // 尾位置不传递给方法接收者与实参（同 evalCall 的理由）
+        const saved_tail_mc = self.in_tail_position;
+        self.in_tail_position = false;
+        defer self.in_tail_position = saved_tail_mc;
+
         // 文档 §3.4.2: Atomic<T> 方法调用时，不进行透明 atomic_load
         // 需要获取原始 Atomic/Channel/Sender/Receiver 值作为方法接收者
         const object = switch (mc.object.*) {
@@ -3743,6 +3850,75 @@ pub const Evaluator = struct {
         return Value{ .closure = closure };
     }
 
+    /// 在 impl_methods 中查找 (type_name, method_name) 对应的方法闭包。
+    fn findImplMethodClosure(self: *Evaluator, type_name: []const u8, method_name: []const u8) ?*value.Closure {
+        for (self.impl_methods.items) |entry| {
+            if (std.mem.eql(u8, entry.method_name, method_name) and
+                std.mem.eql(u8, entry.type_name, type_name))
+            {
+                return entry.closure;
+            }
+        }
+        return null;
+    }
+
+    /// 求值 Monad `@` 上下文表达式（文档 §2.11.2）。
+    /// @M { x <- e1  y <- e2  result } 脱糖为：
+    ///   bind(e1, fun(x){ bind(e2, fun(y){ pure(result) }) })
+    /// bind/pure 取自 `impl Monad<M>`。脱糖为 AST 后求值：把解析到的 bind/pure
+    /// 闭包绑定到子环境的保留名 "@bind"/"@pure"（含 @，用户不可能定义同名），
+    /// 合成的 AST 用 identifier 引用它们。
+    fn evalMonadComprehension(self: *Evaluator, mc: @TypeOf(@as(ast.Expr, undefined).monad_comprehension), environment: *Environment) EvalResult!Value {
+        const bind_closure = self.findImplMethodClosure(mc.monad_type, "bind") orelse {
+            self.panic_message = std.fmt.allocPrint(self.allocator, "monad: no 'bind' impl for {s}", .{mc.monad_type}) catch "monad: missing bind";
+            return error.GluePanic;
+        };
+        const pure_closure = self.findImplMethodClosure(mc.monad_type, "pure") orelse {
+            self.panic_message = std.fmt.allocPrint(self.allocator, "monad: no 'pure' impl for {s}", .{mc.monad_type}) catch "monad: missing pure";
+            return error.GluePanic;
+        };
+
+        const loc = mc.location;
+        const bind_id = try self.makeIdentExpr("@bind", loc);
+        const pure_id = try self.makeIdentExpr("@pure", loc);
+
+        // 从最内层向外折叠：acc 初始为 pure(result)，再对每个绑定（逆序）包一层 bind。
+        var acc = try self.makeCallExpr(pure_id, &[_]*ast.Expr{@constCast(mc.result)}, loc);
+        var i: usize = mc.bindings.len;
+        while (i > 0) {
+            i -= 1;
+            const b = mc.bindings[i];
+            // fun(b.name) { acc }
+            const params = try self.allocator.alloc(ast.Param, 1);
+            params[0] = ast.Param{ .location = loc, .name = b.name, .type_annotation = null, .is_var = false };
+            const lambda = try self.allocator.create(ast.Expr);
+            lambda.* = ast.Expr{ .lambda = .{ .location = loc, .params = params, .body = .{ .expression = acc } } };
+            // @bind(b.expr, lambda)
+            acc = try self.makeCallExpr(bind_id, &[_]*ast.Expr{ @constCast(b.expr), lambda }, loc);
+        }
+
+        // 子环境绑定 @bind/@pure 到解析出的闭包，再求值合成 AST
+        const child = try environment.createChild();
+        try child.define("@bind", Value{ .closure = bind_closure }, false);
+        try child.define("@pure", Value{ .closure = pure_closure }, false);
+        return self.evalExpr(acc, child);
+    }
+
+    /// 合成 identifier 表达式（用于 monad 脱糖）
+    fn makeIdentExpr(self: *Evaluator, name: []const u8, loc: ast.SourceLocation) !*ast.Expr {
+        const e = try self.allocator.create(ast.Expr);
+        e.* = ast.Expr{ .identifier = .{ .location = loc, .name = name } };
+        return e;
+    }
+
+    /// 合成 call 表达式（用于 monad 脱糖）
+    fn makeCallExpr(self: *Evaluator, callee: *ast.Expr, args: []const *ast.Expr, loc: ast.SourceLocation) !*ast.Expr {
+        const owned_args = try self.allocator.dupe(*ast.Expr, args);
+        const e = try self.allocator.create(ast.Expr);
+        e.* = ast.Expr{ .call = .{ .location = loc, .callee = callee, .arguments = owned_args, .type_args = null } };
+        return e;
+    }
+
     fn evalIfExpr(self: *Evaluator, ie: @TypeOf(@as(ast.Expr, undefined).if_expr), environment: *Environment) EvalResult!Value {
         // 条件不在尾位置 — 必须先求值完毕再判断分支
         const saved_tail = self.in_tail_position;
@@ -4093,6 +4269,8 @@ pub const Evaluator = struct {
     /// 使用 Zio Mutex/Condition — 在协程上下文中挂起当前协程让出执行权
     fn spawnCoroutineFunc(ctx: *Evaluator.SpawnContext) void {
         const handle = ctx.handle;
+        // worker 退出前最后置位 finished，通知 deinit 可安全释放 handle
+        defer handle.finished.store(true, .seq_cst);
         const body = ctx.body;
         const env_ptr = ctx.env;
         const backing_allocator = ctx.backing_allocator;
@@ -4144,6 +4322,8 @@ pub const Evaluator = struct {
     /// 无调度器时使用 1:1 OS 线程模型
     fn spawnThreadFunc(ctx: *Evaluator.SpawnContext) void {
         const handle = ctx.handle;
+        // worker 退出前最后置位 finished，通知 deinit 可安全释放 handle
+        defer handle.finished.store(true, .seq_cst);
         const body = ctx.body;
         const env_ptr = ctx.env;
         const backing_allocator = ctx.backing_allocator;
@@ -4319,7 +4499,7 @@ pub const Evaluator = struct {
     pub fn evalStmt(self: *Evaluator, stmt: *const ast.Stmt, environment: *Environment, defer_stack: ?*std.ArrayList(*const ast.Expr)) EvalResult!?Value {
         return switch (stmt.*) {
             .val_decl => |vd| {
-                var val = try self.evalExpr(vd.value, environment);
+                var val = try self.evalDeclRhs(vd.value, environment);
                 // 如果有类型注解，将值转换为目标类型
                 if (vd.type_annotation) |ta| {
                     switch (ta.*) {
@@ -4335,7 +4515,7 @@ pub const Evaluator = struct {
                 return null;
             },
             .var_decl => |vd| {
-                var val = try self.evalExpr(vd.value, environment);
+                var val = try self.evalDeclRhs(vd.value, environment);
                 // 如果有类型注解，将值转换为目标类型
                 if (vd.type_annotation) |ta| {
                     switch (ta.*) {
@@ -4606,8 +4786,10 @@ pub const Evaluator = struct {
         defer allocator.free(resolved_path);
 
         // 使用 ModuleResolver 加载源代码
+        // 注意：source 不能在此释放——导入函数的闭包会切片引用它（整数字面量
+        // raw、标识符名等）。交给 retained_sources 持有到求值器 deinit。
         const source = try self.resolver.loadSource(io, resolved_path);
-        defer allocator.free(source);
+        try self.retained_sources.append(self.allocator, source);
 
         try self.evalSourceModule(source, module_path[0], resolved_path);
     }
@@ -5218,8 +5400,8 @@ test "求值器 - 类型转换" {
     const f2i = try evalSource(allocator, "i32(3.14)");
     try std.testing.expectEqual(@as(u128, 3), f2i.integer.value);
 
-    // string()
-    const s = try evalSource(allocator, "string(42)");
+    // str()（文档 §2.15: str 是内建类型转换函数，与 i32()/f64() 同类）
+    const s = try evalSource(allocator, "str(42)");
     try std.testing.expect(s == .string);
     try std.testing.expectEqualStrings("42", s.string);
 }

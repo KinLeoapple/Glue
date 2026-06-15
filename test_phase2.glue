@@ -1698,4 +1698,6 @@ fun main() {
     // 83. 泛型 ADT — 泛型 Either 类型
     println(resultToInt(success_val))   // 42
     println(resultToInt(failure_val))   // -1
+
+    println("Phase 2: All tests passed!")
 }
