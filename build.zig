@@ -197,11 +197,13 @@ pub fn build(b: *std.Build) void {
     type_check_module.addImport("throw_check", throw_check_module);
     type_check_module.addImport("trait_resolve", trait_resolve_module);
     type_check_module.addImport("kind_check", kind_check_module);
+    type_check_module.addImport("gadt_check", gadt_check_module);
     subtype_check_module.addImport("type_check", type_check_module);
     throw_check_module.addImport("type_check", type_check_module);
     trait_resolve_module.addImport("type_check", type_check_module);
     kind_check_module.addImport("type_check", type_check_module);
     trait_resolve_module.addImport("kind_check", kind_check_module);
+    gadt_check_module.addImport("type_check", type_check_module);
 
     // ============================================================
     // module/ sub-modules

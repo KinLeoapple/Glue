@@ -12,6 +12,7 @@ const subtype_check = @import("subtype_check");
 const trait_resolve = @import("trait_resolve");
 const throw_check = @import("throw_check");
 const kind_check = @import("kind_check");
+const gadt_check = @import("gadt_check");
 
 // ============================================================
 // 类型表示
@@ -347,6 +348,14 @@ pub const AdtInfo = struct {
     type_param_names: []const []const u8 = &[_][]const u8{},
     /// 定义该类型的模块名（用于 Orphan 检查）
     defining_module: []const u8 = "",
+    /// 文档 §2.13: 是否为 GADT（至少一个构造器带 `: ReturnType` 注解）。
+    /// GADT match 分支按类型细化，各分支返回类型可不同，故跨分支不强制统一。
+    is_gadt: bool = false,
+    /// 每个构造器的字段类型注解（与 constructor_names 对齐），
+    /// 用于模式匹配时把模式变量绑定到真实字段类型 + GADT 类型细化。
+    ctor_field_types: []const []const *Type = &[_][]const *Type{},
+    /// 每个构造器的 GADT 返回类型注解（无注解为 null，与 constructor_names 对齐）。
+    ctor_return_types: []const ?*Type = &[_]?*Type{},
 };
 
 /// Impl 记录（用于 Overlapping 检查）
@@ -1193,6 +1202,22 @@ pub const TypeInferencer = struct {
         return self.applySubst(scheme.ty, subst);
     }
 
+    /// 文档 §2.13: 复制一个类型，把其中的自由类型变量替换为新的 fresh 变量。
+    /// 用于 GADT match 让每个分支的类型细化局部化（互不污染兄弟分支）。
+    pub fn freshenType(self: *TypeInferencer, ty: *Type) !*Type {
+        var free_vars = std.ArrayList(usize).empty;
+        defer free_vars.deinit(self.allocator);
+        self.collectFreeVars(ty, &free_vars);
+        if (free_vars.items.len == 0) return ty;
+        var subst = std.AutoHashMap(usize, *Type).init(self.allocator);
+        defer subst.deinit();
+        for (free_vars.items) |var_id| {
+            const fresh = try self.freshTypeVar();
+            try subst.put(var_id, fresh);
+        }
+        return self.applySubst(ty, subst);
+    }
+
     fn collectFreeVars(self: *TypeInferencer, ty: *Type, free_vars: *std.ArrayList(usize)) void {
         const resolved = self.resolve(ty);
         switch (resolved.*) {
@@ -1693,6 +1718,18 @@ pub const TypeInferencer = struct {
                     else => null,
                 };
 
+                // 文档 §2.13: GADT 类型细化是「分支局部」的——IntLit 分支推出 T~i32、
+                // BoolLit 分支推出 T~bool，两者不能互相约束。检测 scrutinee 是否 GADT；
+                // 若是，则 (a) 每个分支用 scrutinee 类型的独立副本做细化，互不污染；
+                // (b) 各分支体类型不强制跨分支统一（返回首个分支类型即可，求值器动态处理）。
+                const is_gadt_scrutinee = blk: {
+                    const rs = resolved_scrutinee;
+                    if (rs.* == .adt_type) {
+                        if (self.adt_types.get(rs.adt_type.name)) |info| break :blk info.is_gadt;
+                    }
+                    break :blk false;
+                };
+
                 var result_ty: ?*Type = null;
                 for (m.arms) |arm| {
                     const child_env = try env.createChild();
@@ -1702,16 +1739,26 @@ pub const TypeInferencer = struct {
 
                     // 如果 scrutinee 是 T? 且当前 arm 不匹配 null，
                     // 则变量绑定应收窄为 T（而非 T?）
-                    const pattern_ty: *Type = if (nullable_inner) |inner|
+                    var pattern_ty: *Type = if (nullable_inner) |inner|
                         if (arm_matches_null) scrutinee_ty else inner
                     else
                         scrutinee_ty;
+                    // GADT：用 scrutinee 类型的独立副本，使细化不污染兄弟分支
+                    if (is_gadt_scrutinee) {
+                        pattern_ty = self.freshenType(scrutinee_ty) catch scrutinee_ty;
+                    }
 
                     try self.inferPattern(arm.pattern, pattern_ty, child_env);
                     self.pushLinearScope();
                     const body_ty = try self.inferExpr(arm.body, child_env);
                     self.popLinearScope();
-                    if (result_ty) |rt| {
+                    if (is_gadt_scrutinee) {
+                        // 不跨分支统一：各 GADT 分支返回类型可不同（T~i32 / T~bool）。
+                        // 分支体已在各自细化的子环境内单独检查（内部仍 sound）。
+                        // 整个 match 的结果类型保持为 fresh 变量（抽象），避免把
+                        // 具体分支类型回灌到函数返回 T 而破坏多态（多态递归 GADT）。
+                        if (result_ty == null) result_ty = try self.freshTypeVar();
+                    } else if (result_ty) |rt| {
                         const unified = try self.tryWidenUnify(rt, body_ty);
                         result_ty = unified;
                     } else {
@@ -2157,10 +2204,16 @@ pub const TypeInferencer = struct {
                 try env.define(v.name, scheme);
             },
             .constructor => |con| {
-                // ADT 构造器模式
-                for (con.patterns) |sub_pat| {
-                    const sub_ty = try self.freshTypeVar();
-                    try self.inferPattern(sub_pat, sub_ty, env);
+                // 文档 §2.13: GADT 类型细化 + 字段类型绑定。
+                // 委托 gadt_check：实例化构造器 scheme、unify 返回类型(细化)、
+                // 把子模式绑定到真实字段类型。未知构造器回退到 fresh 变量。
+                if (gadt_check.refineConstructorPattern(self, con, expected_ty, env)) {
+                    // 已处理
+                } else {
+                    for (con.patterns) |sub_pat| {
+                        const sub_ty = try self.freshTypeVar();
+                        try self.inferPattern(sub_pat, sub_ty, env);
+                    }
                 }
             },
             .record => |rec| {
@@ -2978,11 +3031,15 @@ pub const TypeInferencer = struct {
 
                         const key = self.allocator.dupe(u8, td.name) catch return;
                         const owned_type_param_names = type_param_names.toOwnedSlice(self.allocator) catch return;
+                        const dup_or_builtin = self.isBuiltinName(td.name) or self.adt_types.contains(td.name);
                         if (self.isBuiltinName(td.name)) {
                             self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (self.adt_types.contains(td.name)) {
                             self.addError(.type_mismatch, "duplicate type definition: '{s}' is already defined in this scope", .{td.name});
                         } else {
+                            // 先注册类型名（字段/返回类型尚未算），使构造器字段里对
+                            // 自身的引用（如 Add(Expr<i32>, Expr<i32>) 或 Cons(T, List<T>)）
+                            // 在下面 typeFromAstWithParams 时能解析。
                             self.adt_types.put(key, AdtInfo{
                                 .ty = adt_ty,
                                 .constructor_names = ctor_names,
@@ -2990,33 +3047,56 @@ pub const TypeInferencer = struct {
                                 .defining_module = self.current_module,
                             }) catch return;
                         }
+
+                        // 文档 §2.13: 计算每个构造器的字段类型与 GADT 返回类型，
+                        // 检测是否为 GADT（任一构造器带 `: ReturnType` 注解）。
+                        const ctor_field_types = self.allocator.alloc([]const *Type, adt_def.constructors.len) catch return;
+                        const ctor_return_types = self.allocator.alloc(?*Type, adt_def.constructors.len) catch return;
+                        var is_gadt = false;
+                        for (adt_def.constructors, 0..) |con, ci| {
+                            const fts = self.allocator.alloc(*Type, con.fields.len) catch return;
+                            for (con.fields, 0..) |field, fi| {
+                                fts[fi] = self.typeFromAstWithParams(field.ty, &type_param_map) catch (self.freshTypeVar() catch return);
+                            }
+                            ctor_field_types[ci] = fts;
+                            if (con.return_type) |rt| {
+                                is_gadt = true;
+                                ctor_return_types[ci] = self.typeFromAstWithParams(rt, &type_param_map) catch null;
+                            } else {
+                                ctor_return_types[ci] = null;
+                            }
+                        }
+                        // 回填字段/返回类型到已注册的 AdtInfo
+                        if (!dup_or_builtin) {
+                            if (self.adt_types.getPtr(td.name)) |info| {
+                                info.is_gadt = is_gadt;
+                                info.ctor_field_types = ctor_field_types;
+                                info.ctor_return_types = ctor_return_types;
+                            }
+                        }
                         // 记录类型定义模块（用于 Orphan 检查）
                         const mod_key = self.allocator.dupe(u8, td.name) catch return;
                         const mod_val = self.allocator.dupe(u8, self.current_module) catch return;
                         self.type_defining_modules.put(mod_key, mod_val) catch return;
 
                         // 注册构造器到类型环境
-                        for (adt_def.constructors) |con| {
+                        for (adt_def.constructors, 0..) |con, ci| {
                             // 每个构造器需要独立的 quantified_vars 副本
                             const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
+                            // GADT: 构造器返回类型用其 `: ReturnType` 注解（如 IntLit : Expr<i32>），
+                            // 否则用默认 adt_ty（如 List<T>）。
+                            const ret_ty = ctor_return_types[ci] orelse adt_ty;
                             if (self.isBuiltinName(con.name)) {
                                 self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{con.name});
                             } else if (con.fields.len == 0) {
-                                // 无参构造器：直接返回 ADT 类型
-                                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = adt_ty };
+                                // 无参构造器：直接返回 ADT 类型（或 GADT 返回类型）
+                                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ret_ty };
                                 if (!(env.defineOrReport(con.name, scheme) catch false)) {
                                     self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
                                 }
                             } else {
-                                // 带参构造器：参数类型 -> ADT 类型
-                                var param_types = self.allocator.alloc(*Type, con.fields.len) catch return;
-                                for (con.fields, 0..) |field, i| {
-                                    param_types[i] = self.typeFromAstWithParams(field.ty, &type_param_map) catch blk: {
-                                        self.addError(.type_mismatch, "invalid type for field '{s}' in constructor '{s}'", .{ field.name orelse "_", con.name });
-                                        break :blk self.freshTypeVar() catch return;
-                                    };
-                                }
-                                const ctor_ty = self.makeFnType(param_types, adt_ty) catch return;
+                                // 带参构造器：参数类型 -> ADT 返回类型
+                                const ctor_ty = self.makeFnType(@constCast(ctor_field_types[ci]), ret_ty) catch return;
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
                                 if (!(env.defineOrReport(con.name, scheme) catch false)) {
                                     self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
