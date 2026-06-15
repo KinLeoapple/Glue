@@ -843,8 +843,8 @@ println(use_result)
 // ============================================================
 // 27. loop 和 break
 // ============================================================
-var loop_count: i32 = 0
-var loop_sum: i32 = 0
+var loop_count = 0
+var loop_sum = 0
 loop {
     if (loop_count >= 5) { break }
     loop_sum = loop_sum + loop_count

@@ -1757,8 +1757,8 @@ fun(x) { x + 1 }
 ### 6.4 变量绑定
 
 ```glue
-val x = 42              // 不可变
-var count = 0           // 可变
+val x = 42              // 不可变，自动推断为 i8
+var count: i32 = 0      // 可变，显式 i32（累加器应标注类型）
 count = count + 1
 
 val name: str? = get_name()
