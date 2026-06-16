@@ -1,0 +1,43 @@
+// Phase 7: 一等 Trait 值与高级特性
+// 文档 §4.6 一等 Trait 值, §4.7 运行时表示 (vtable), §6.10 Lazy
+
+// ---- 内联 Trait 值 (§4.6.3) ----
+trait Logger {
+    fun log(msg: str) : Unit
+}
+
+// 一等 Trait 值作为运行时值传递 (§4.6.2)
+fun run_with(l: Logger) : Unit {
+    l.log("message via trait param")
+}
+
+// ---- Lazy 显式惰性求值 (§6.10) ----
+fun expensive() : i32 {
+    println("  [computing expensive value]")
+    100
+}
+
+fun main() {
+    // 内联 trait 值：trait { ... } 匿名实现，编译为 vtable
+    val console : Logger = trait {
+        fun log(msg) { println("[console] " + msg) }
+    }
+    console.log("direct call")
+
+    // 一等 trait 值传参：运行时 vtable 分派
+    run_with(console)
+
+    // 不同实现，同一接口
+    val prefixed : Logger = trait {
+        fun log(msg) { println(">>> " + msg) }
+    }
+    run_with(prefixed)
+
+    // Lazy<T>：延迟求值，首次访问时计算并缓存
+    val lazy_num : Lazy<i32> = lazy expensive()
+    println("lazy created (not yet computed)")
+    println(lazy_num)   // 首次访问 -> 计算
+    println(lazy_num)   // 第二次访问 -> 用缓存，不重新计算
+
+    println("Phase 7: All tests passed!")
+}

@@ -198,6 +198,7 @@ pub fn build(b: *std.Build) void {
     type_check_module.addImport("trait_resolve", trait_resolve_module);
     type_check_module.addImport("kind_check", kind_check_module);
     type_check_module.addImport("gadt_check", gadt_check_module);
+    type_check_module.addImport("module_check", module_check_module);
     subtype_check_module.addImport("type_check", type_check_module);
     throw_check_module.addImport("type_check", type_check_module);
     trait_resolve_module.addImport("type_check", type_check_module);
@@ -322,9 +323,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_type_check_unit_tests = b.addRunArtifact(type_check_unit_tests);
 
+    const module_check_unit_tests = b.addTest(.{
+        .root_module = module_check_module,
+    });
+    const run_module_check_unit_tests = b.addRunArtifact(module_check_unit_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_eval_unit_tests.step);
     test_step.dependOn(&run_lexer_unit_tests.step);
     test_step.dependOn(&run_parser_unit_tests.step);
     test_step.dependOn(&run_type_check_unit_tests.step);
+    test_step.dependOn(&run_module_check_unit_tests.step);
 }

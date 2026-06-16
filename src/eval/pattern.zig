@@ -294,14 +294,16 @@ fn parseInt(comptime T: type, raw: []const u8) !T {
         }
     }
 
-    // 去除类型后缀
+    // 去除整数类型后缀（仅形如 i8/u32/i128：i/u 后跟十进制数字）。
+    // 不能盲目剥离尾部字母，否则会把十六进制数字 A–F 误当作后缀。
     var end = raw.len;
-    while (end > i) {
-        const ch = raw[end - 1];
-        if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
-            end -= 1;
-        } else {
-            break;
+    {
+        var j = end;
+        while (j > i and raw[j - 1] >= '0' and raw[j - 1] <= '9') {
+            j -= 1;
+        }
+        if (j > i and j < end and (raw[j - 1] == 'i' or raw[j - 1] == 'u' or raw[j - 1] == 'I' or raw[j - 1] == 'U')) {
+            end = j - 1;
         }
     }
 

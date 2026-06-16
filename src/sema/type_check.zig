@@ -13,6 +13,7 @@ const trait_resolve = @import("trait_resolve");
 const throw_check = @import("throw_check");
 const kind_check = @import("kind_check");
 const gadt_check = @import("gadt_check");
+const module_check = @import("module_check");
 
 // ============================================================
 // 类型表示
@@ -571,6 +572,13 @@ pub const TypeInferencer = struct {
     /// 仅记录 pub 顶层函数；类型/ADT 已通过 adt_types 跨模块持久化。
     /// 不在 resetForNextModule 中清空——跨模块检查依赖它。
     exported_schemes: std.StringHashMap(TypeScheme),
+    /// 文档 §4.6.2 结构化匹配：每个模块的 pub 方法签名（名→arity），
+    /// key = 模块名。用于「文件模块作为 Trait 值」时与 trait 要求做结构化匹配。
+    module_member_sigs: std.StringHashMap([]module_check.MethodSig),
+    /// 每个模块的 pub pack 子模块名集合，key = 模块名（用于 `Store.Memory` 解析）。
+    module_submodules: std.StringHashMap([][]const u8),
+    /// 已知模块名集合（依赖模块 + 本模块），用于把模块名标识符识别为模块引用而非未定义变量。
+    known_modules: std.StringHashMap(void),
     /// 内建函数/构造器名称集合（用于禁止用户遮蔽内建定义）
     builtin_names: std.StringHashMap(void),
     /// 用于 analyzeNullCheck 中翻转 is_non_null 的临时缓冲
@@ -610,6 +618,9 @@ pub const TypeInferencer = struct {
             .fn_bounds = std.StringHashMap([]ast.TraitBound).init(allocator),
             .predeclared_fns = std.StringHashMap(void).init(allocator),
             .exported_schemes = std.StringHashMap(TypeScheme).init(allocator),
+            .module_member_sigs = std.StringHashMap([]module_check.MethodSig).init(allocator),
+            .module_submodules = std.StringHashMap([][]const u8).init(allocator),
+            .known_modules = std.StringHashMap(void).init(allocator),
             .builtin_names = std.StringHashMap(void).init(allocator),
             .linear_scope_stack = std.ArrayList(std.ArrayList(LinearVarInfo)).empty,
         };
@@ -670,6 +681,29 @@ pub const TypeInferencer = struct {
             var it = self.exported_schemes.keyIterator();
             while (it.next()) |k| self.allocator.free(k.*);
             self.exported_schemes.deinit();
+        }
+        {
+            var it = self.module_member_sigs.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.*) |sig| self.allocator.free(sig.name);
+                self.allocator.free(entry.value_ptr.*);
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.module_member_sigs.deinit();
+        }
+        {
+            var it = self.module_submodules.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.*) |sub| self.allocator.free(sub);
+                self.allocator.free(entry.value_ptr.*);
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.module_submodules.deinit();
+        }
+        {
+            var it = self.known_modules.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+            self.known_modules.deinit();
         }
         {
             var iter = self.builtin_names.keyIterator();
@@ -892,6 +926,44 @@ pub const TypeInferencer = struct {
         t.* = Type{ .adt_type = .{ .name = name, .type_args = owned_args } };
         try self.types.append(self.allocator, t);
         return t;
+    }
+
+    /// 模块引用类型的哨兵前缀（文档 §4.6.2）。模块名作为值（`Store`、`Store.Memory`）
+    /// 用 `adt_type{ name = "$module:<模块名>" }` 编码，调用点据此做结构化匹配。
+    const module_ref_prefix = "$module:";
+
+    /// 构造模块引用类型。
+    fn makeModuleRef(self: *TypeInferencer, module_name: []const u8) !*Type {
+        const encoded = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ module_ref_prefix, module_name });
+        return self.makeAdtType(encoded, &[_]*Type{});
+    }
+
+    /// 若 ty 是模块引用，返回其模块名，否则 null。
+    fn asModuleRef(self: *TypeInferencer, ty: *Type) ?[]const u8 {
+        const r = self.resolve(ty);
+        if (r.* == .adt_type and std.mem.startsWith(u8, r.adt_type.name, module_ref_prefix)) {
+            return r.adt_type.name[module_ref_prefix.len..];
+        }
+        return null;
+    }
+
+    /// 文档 §4.6.2 结构化匹配检查：模块 `module_name` 是否结构化满足 trait `trait_name`。
+    /// 返回诊断（ok / 缺方法 / arity 不符）。trait 未注册或模块结构未知时按 ok 放行（保守降级）。
+    fn moduleSatisfiesTrait(self: *TypeInferencer, module_name: []const u8, trait_name: []const u8) module_check.MatchResult {
+        const provided = self.module_member_sigs.get(module_name) orelse return .{ .ok = true };
+        const trait_info = self.trait_types.get(trait_name) orelse return .{ .ok = true };
+        // 从 trait 的 method_schemes 提取要求方法的 arity（fn_type 形参个数）。
+        var required = std.ArrayList(module_check.MethodSig).empty;
+        defer required.deinit(self.allocator);
+        for (trait_info.method_names) |mname| {
+            const scheme = trait_info.method_schemes.get(mname) orelse continue;
+            const rt = self.resolve(scheme.ty);
+            const arity: usize = if (rt.* == .fn_type) rt.fn_type.params.len else 0;
+            required.append(self.allocator, .{ .name = mname, .arity = arity }) catch continue;
+        }
+        var mc = module_check.ModuleChecker.init(self.allocator);
+        defer mc.deinit();
+        return mc.structurallySatisfies(provided, required.items);
     }
 
     // ============================================================
@@ -1506,6 +1578,11 @@ pub const TypeInferencer = struct {
                     const ty = try self.instantiate(scheme);
                     return ty;
                 }
+                // 文档 §4.6.2: 模块名作为值（一等 Trait 值 / 限定访问入口）。
+                // 模块名不在值环境里，但已登记于 known_modules → 返回模块引用类型。
+                if (self.known_modules.contains(id.name)) {
+                    return self.makeModuleRef(id.name) catch error.OutOfMemory;
+                }
                 self.addErrorAt(.unbound_variable, id.location.line, id.location.column, "undefined variable '{s}'", .{id.name});
                 return self.freshTypeVar() catch error.OutOfMemory;
             },
@@ -1540,6 +1617,17 @@ pub const TypeInferencer = struct {
                         try self.unify(left_ty, try self.makeType(.str_type));
                         try self.unify(right_ty, try self.makeType(.str_type));
                         return self.makeType(.str_type);
+                    },
+                    .concat_list => {
+                        // ++：数组拼接。两侧须为同一数组类型 [T]，结果为 [T]。
+                        // 用一个 fresh 元素变量构造 [T] 并与两侧统一，让 T 由元素推断决定。
+                        const elem_ty = try self.freshTypeVar();
+                        const arr_ty = try self.allocator.create(Type);
+                        arr_ty.* = Type{ .array_type = .{ .element_type = elem_ty, .size = null } };
+                        try self.types.append(self.allocator, arr_ty);
+                        try self.unify(left_ty, arr_ty);
+                        try self.unify(right_ty, arr_ty);
+                        return arr_ty;
                     },
                     .range, .range_inclusive => {
                         try self.unify(left_ty, try self.makeType(.i32_type));
@@ -1594,6 +1682,33 @@ pub const TypeInferencer = struct {
                 var arg_types = try self.allocator.alloc(*Type, c.arguments.len);
                 for (c.arguments, 0..) |arg, i| {
                     arg_types[i] = try self.inferExpr(arg, env);
+                }
+
+                // 文档 §4.6.2: 文件模块作为 Trait 值。实参是模块引用、对应形参是 trait 类型时，
+                // 做结构化匹配（§2.12.2 方法多 <: 方法少）。匹配则把实参类型替换为形参 trait
+                // 类型（使后续 unify 通过）；不匹配则报缺方法/arity 不符。
+                {
+                    const rc = self.resolve(callee_ty);
+                    if (rc.* == .fn_type and rc.fn_type.params.len == arg_types.len) {
+                        for (rc.fn_type.params, 0..) |param_ty, i| {
+                            if (self.asModuleRef(arg_types[i])) |mod_name| {
+                                const rp = self.resolve(param_ty);
+                                if (rp.* == .trait_type) {
+                                    const res = self.moduleSatisfiesTrait(mod_name, rp.trait_type.name);
+                                    if (res.ok) {
+                                        arg_types[i] = param_ty;
+                                    } else {
+                                        switch (res.reason) {
+                                            .missing => self.addErrorAt(.type_mismatch, c.location.line, c.location.column, "module '{s}' does not structurally satisfy trait '{s}': missing method '{s}'", .{ mod_name, rp.trait_type.name, res.missing_method.? }),
+                                            .arity_mismatch => self.addErrorAt(.type_mismatch, c.location.line, c.location.column, "module '{s}' does not structurally satisfy trait '{s}': method '{s}' expects {d} param(s), got {d}", .{ mod_name, rp.trait_type.name, res.missing_method.?, res.arity_expected, res.arity_got }),
+                                            .ok => {},
+                                        }
+                                        return ret_ty;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // 文档 §2.12.1 记录宽度子类型的方向性检查：
@@ -1840,6 +1955,25 @@ pub const TypeInferencer = struct {
 
             .field_access => |fa| {
                 const obj_ty = self.inferExpr(fa.object, env) catch return self.freshTypeVar() catch unreachable;
+                // 文档 §4.6.2: 模块限定访问 `Store.Memory` / `Module.member`。
+                if (self.asModuleRef(obj_ty)) |mod_name| {
+                    // 子模块？→ 返回子模块的模块引用
+                    if (self.module_submodules.get(mod_name)) |subs| {
+                        for (subs) |sub| {
+                            if (std.mem.eql(u8, sub, fa.field)) {
+                                return self.makeModuleRef(fa.field) catch unreachable;
+                            }
+                        }
+                    }
+                    // 导出函数成员？→ 返回其 scheme 实例化类型
+                    const key = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ mod_name, fa.field }) catch return self.freshTypeVar() catch unreachable;
+                    defer self.allocator.free(key);
+                    if (self.exported_schemes.get(key)) |scheme| {
+                        return self.instantiate(scheme) catch unreachable;
+                    }
+                    // 未知成员：宽松返回 fresh，避免误报（结构未完全建模）
+                    return self.freshTypeVar() catch unreachable;
+                }
                 const resolved = self.resolve(obj_ty);
                 switch (resolved.*) {
                     .record_type => |rt| {
@@ -1982,7 +2116,14 @@ pub const TypeInferencer = struct {
                 }
                 return result_ty orelse try self.freshTypeVar();
             },
-            .lazy, .monad_comprehension, .inline_trait_value => {
+            .lazy => |lz| {
+                // 文档 §6.10: lazy expr 的内部表达式仍需类型检查（捕获 thunk 体内错误）。
+                // 透明强制语义下 Lazy<T> 当作 T 使用，故结果保持灵活（fresh 变量），
+                // 以便与 `: Lazy<T>` 注解或直接当 T 使用两种写法都兼容。
+                _ = self.inferExpr(lz.expr, env) catch {};
+                return self.freshTypeVar();
+            },
+            .monad_comprehension, .inline_trait_value => {
                 return self.freshTypeVar();
             },
         };
@@ -2200,8 +2341,24 @@ pub const TypeInferencer = struct {
             .wildcard => {},
             .literal => {},
             .variable => |v| {
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = expected_ty };
-                try env.define(v.name, scheme);
+                // Glue 约定（与求值器 pattern.zig 一致）：模式中大写开头的标识符
+                // 视为「无参构造器模式」（如 Leaf、Red），而非变量绑定。
+                // 解析器把无参构造器统一解析成 .variable，故此处按首字母大小写区分：
+                // 大写 → 构造器（不引入绑定，避免嵌套 Node(v, Leaf, Leaf) 把两个
+                // Leaf 当作重复变量定义）；小写 → 变量绑定。
+                if (v.name.len > 0 and v.name[0] >= 'A' and v.name[0] <= 'Z') {
+                    // 无参构造器：尝试按 GADT 构造器细化 expected_ty（普通 ADT 无需细化），
+                    // 关键是不引入变量绑定。
+                    const nullary = @TypeOf(@as(ast.Pattern, undefined).constructor){
+                        .location = v.location,
+                        .name = v.name,
+                        .patterns = &[_]*ast.Pattern{},
+                    };
+                    _ = gadt_check.refineConstructorPattern(self, nullary, expected_ty, env);
+                } else {
+                    const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = expected_ty };
+                    try env.define(v.name, scheme);
+                }
             },
             .constructor => |con| {
                 // 文档 §2.13: GADT 类型细化 + 字段类型绑定。
@@ -2260,6 +2417,8 @@ pub const TypeInferencer = struct {
                 if (std.mem.eql(u8, n.name, "bool")) return self.makeType(.bool_type);
                 if (std.mem.eql(u8, n.name, "str")) return self.makeType(.str_type);
                 if (std.mem.eql(u8, n.name, "char")) return self.makeType(.char_type);
+                // Unit 类型注解（文档 §2.1）：`Unit` 与字面量 `()` 同一类型
+                if (std.mem.eql(u8, n.name, "Unit")) return self.makeType(.unit_type);
                 // 查找类型参数映射（泛型 ADT 构造器中的 T 等）
                 if (type_param_map) |tpm| {
                     if (tpm.get(n.name)) |ty| {
@@ -2399,6 +2558,11 @@ pub const TypeInferencer = struct {
                 self.importUseDecl(decl.use_decl, &env);
             }
         }
+        // 文档 §2.16: 同层级禁止重复定义——val/var/fun/type/trait 不允许同名。
+        // 同种类查重已分散在各注册点（duplicate fun / trait / val）。这里补**跨种类**
+        // 冲突（如 trait Foo + fun Foo、type Foo + trait Foo、ADT 构造器与函数同名）。
+        self.checkCrossKindNameClashes(module);
+
         // 前向引用 / 相互递归：先把所有顶层函数签名注册到 env，
         // 再检查各函数体。这样 fun is_even 引用后定义的 fun is_odd、
         // 或 main 调用其后定义的辅助函数，都能解析。
@@ -2471,9 +2635,100 @@ pub const TypeInferencer = struct {
                 else => {},
             }
         }
+        // 文档 §4.6.2: 记录本模块结构（pub 方法签名 + pub pack 子模块），
+        // 供「文件模块作为 Trait 值」的结构化匹配与 `Module.Sub` 限定访问使用。
+        self.recordModuleStructure(module, module_name);
     }
 
-    /// 把 env 中名为 sym 的 scheme 登记为「module_name 导出 sym」。
+    /// 文档 §2.16: 检测顶层声明的**跨种类**同名冲突。聚焦 fun/type/trait 三种具名顶层
+    /// 声明之间的冲突（如 trait Foo + fun Foo）。同种类重复（两个同名 fun、两个同名
+    /// trait）由各自注册点已报，这里只报首次出现种类与后续不同种类的冲突，避免重复报错。
+    /// 不涉及 use 导入与模块名绑定（文档 §4.6 允许 trait 名与模块名同名，分属不同命名空间），
+    /// 也不涉及 ADT 构造器（newtype `type Point = Point(...)` 类型名与构造器同名是合法惯例）。
+    fn checkCrossKindNameClashes(self: *TypeInferencer, module: *const ast.Module) void {
+        const Kind = enum { function, type_decl, trait_decl };
+        var seen = std.StringHashMap(Kind).init(self.allocator);
+        defer seen.deinit();
+
+        const consider = struct {
+            fn add(inf: *TypeInferencer, map: *std.StringHashMap(Kind), name: []const u8, kind: Kind, loc: ast.SourceLocation) void {
+                if (map.get(name)) |prev| {
+                    if (prev != kind) {
+                        inf.addErrorAt(.type_mismatch, loc.line, loc.column, "duplicate definition: '{s}' is already defined in this scope", .{name});
+                    }
+                    // 同种类冲突交由既有查重逻辑处理
+                    return;
+                }
+                map.put(name, kind) catch {};
+            }
+        };
+
+        for (module.declarations) |decl| {
+            switch (decl) {
+                .fun_decl => |f| consider.add(self, &seen, f.name, .function, f.location),
+                .trait_decl => |t| consider.add(self, &seen, t.name, .trait_decl, t.location),
+                .type_decl => |t| consider.add(self, &seen, t.name, .type_decl, t.location),
+                else => {},
+            }
+        }
+    }
+
+    /// 记录模块结构：pub 函数签名（名→arity）与 pub pack 子模块名，
+    /// 并把模块名登记到 known_modules。
+    fn recordModuleStructure(self: *TypeInferencer, module: *const ast.Module, module_name: []const u8) void {
+        var sigs = std.ArrayList(module_check.MethodSig).empty;
+        var subs = std.ArrayList([]const u8).empty;
+        for (module.declarations) |decl| {
+            switch (decl) {
+                .fun_decl => |f| {
+                    if (f.visibility != .public) continue;
+                    const name_dup = self.allocator.dupe(u8, f.name) catch continue;
+                    sigs.append(self.allocator, .{ .name = name_dup, .arity = f.params.len }) catch {};
+                },
+                .pack_decl => |pd| {
+                    if (pd.visibility != .public) continue;
+                    const sub_dup = self.allocator.dupe(u8, pd.name) catch continue;
+                    subs.append(self.allocator, sub_dup) catch {};
+                },
+                else => {},
+            }
+        }
+        self.putModuleMemberSigs(module_name, sigs.toOwnedSlice(self.allocator) catch return);
+        self.putModuleSubmodules(module_name, subs.toOwnedSlice(self.allocator) catch return);
+        self.markKnownModule(module_name);
+    }
+
+    fn putModuleMemberSigs(self: *TypeInferencer, module_name: []const u8, sigs: []module_check.MethodSig) void {
+        if (self.module_member_sigs.fetchRemove(module_name)) |old| {
+            for (old.value) |s| self.allocator.free(s.name);
+            self.allocator.free(old.value);
+            self.allocator.free(old.key);
+        }
+        const key = self.allocator.dupe(u8, module_name) catch return;
+        self.module_member_sigs.put(key, sigs) catch {
+            self.allocator.free(key);
+        };
+    }
+
+    fn putModuleSubmodules(self: *TypeInferencer, module_name: []const u8, subs: [][]const u8) void {
+        if (self.module_submodules.fetchRemove(module_name)) |old| {
+            for (old.value) |s| self.allocator.free(s);
+            self.allocator.free(old.value);
+            self.allocator.free(old.key);
+        }
+        const key = self.allocator.dupe(u8, module_name) catch return;
+        self.module_submodules.put(key, subs) catch {
+            self.allocator.free(key);
+        };
+    }
+
+    fn markKnownModule(self: *TypeInferencer, module_name: []const u8) void {
+        if (self.known_modules.contains(module_name)) return;
+        const key = self.allocator.dupe(u8, module_name) catch return;
+        self.known_modules.put(key, {}) catch {
+            self.allocator.free(key);
+        };
+    }
     fn recordExportSymbol(self: *TypeInferencer, module_name: []const u8, sym: []const u8, env: *TypeEnv) void {
         const scheme = env.lookup(sym) orelse return;
         const key = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ module_name, sym }) catch return;
@@ -2617,6 +2872,18 @@ pub const TypeInferencer = struct {
             qvars[0] = param.type_var.id;
             env.define("str", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
             self.registerBuiltinName("str");
+        }
+
+        // type : forall a. (a) -> str  —— 返回值的运行时类型名（文档 §2.15）
+        {
+            const param = self.freshTypeVar() catch return;
+            const params = self.allocator.alloc(*Type, 1) catch return;
+            params[0] = param;
+            const fn_ty = self.makeFnType(params, self.makeType(.str_type) catch return) catch return;
+            const qvars = self.allocator.alloc(usize, 1) catch return;
+            qvars[0] = param.type_var.id;
+            env.define("type", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("type");
         }
 
         // Error ADT 类型（用于 Throw<T, Error> 中的 Error 类型参数）

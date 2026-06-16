@@ -130,6 +130,8 @@ pub const Evaluator = struct {
     /// Glue panic 消息 — 不可捕获，但允许 defer 执行
     panic_message: ?[]const u8 = null,
     closures: std.ArrayList(*value.Closure),
+    /// Lazy<T> thunk 列表（Phase 7）：统一管理生命周期
+    lazy_values: std.ArrayList(*value.LazyValue),
     /// TCO: 尾调用信息，用于 trampoline
     tail_call: ?TailCall = null,
     /// TCO: 当前是否在尾位置（用于检测尾调用）
@@ -149,6 +151,9 @@ pub const Evaluator = struct {
     /// 已加载模块的导出信息
     /// key: 模块路径, value: ModuleExportInfo
     module_exports: std.StringHashMap(ModuleExportInfo),
+    /// 模块名 -> 模块值（一等 Trait 值，文档 §4.6.2 文件模块作为 Trait 值）。
+    /// pub 成员作为 vtable 方法，pub pack 子模块作为成员；支持 `Store.Memory` 限定访问。
+    module_values: std.StringHashMap(Value),
     /// 当前模块的源文件目录（用于解析相对模块路径）
     current_source_dir: ?[]const u8,
     /// 模块级 defer 栈 — 顶层 defer 语句注册到这里，模块结束时执行
@@ -205,6 +210,7 @@ pub const Evaluator = struct {
             .global_env = Environment.init(allocator),
             .shadow_stack = std.ArrayList(value.Value).empty,
             .closures = std.ArrayList(*value.Closure).empty,
+            .lazy_values = std.ArrayList(*value.LazyValue).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
             .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
             .record_constructor_contexts = std.ArrayList(*RecordConstructorCtx).empty,
@@ -212,6 +218,7 @@ pub const Evaluator = struct {
             .trait_definition_order = std.ArrayList([]const u8).empty,
             .impl_methods = std.ArrayList(ImplMethodEntry).empty,
             .module_exports = std.StringHashMap(ModuleExportInfo).init(allocator),
+            .module_values = std.StringHashMap(Value).init(allocator),
             .current_source_dir = null,
             .module_defer_stack = std.ArrayList(*const ast.Expr).empty,
             .loading_modules = std.StringHashMap(void).init(allocator),
@@ -235,6 +242,7 @@ pub const Evaluator = struct {
             .io = io,
             .shadow_stack = std.ArrayList(value.Value).empty,
             .closures = std.ArrayList(*value.Closure).empty,
+            .lazy_values = std.ArrayList(*value.LazyValue).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
             .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
             .record_constructor_contexts = std.ArrayList(*RecordConstructorCtx).empty,
@@ -242,6 +250,7 @@ pub const Evaluator = struct {
             .trait_definition_order = std.ArrayList([]const u8).empty,
             .impl_methods = std.ArrayList(ImplMethodEntry).empty,
             .module_exports = std.StringHashMap(ModuleExportInfo).init(allocator),
+            .module_values = std.StringHashMap(Value).init(allocator),
             .current_source_dir = null,
             .module_defer_stack = std.ArrayList(*const ast.Expr).empty,
             .loading_modules = std.StringHashMap(void).init(allocator),
@@ -268,6 +277,7 @@ pub const Evaluator = struct {
             .scheduler = sched,
             .shadow_stack = std.ArrayList(value.Value).empty,
             .closures = std.ArrayList(*value.Closure).empty,
+            .lazy_values = std.ArrayList(*value.LazyValue).empty,
             .error_newtype_contexts = std.ArrayList(*ErrorNewtypeCtx).empty,
             .adt_constructor_contexts = std.ArrayList(*AdtConstructorCtx).empty,
             .record_constructor_contexts = std.ArrayList(*RecordConstructorCtx).empty,
@@ -275,6 +285,7 @@ pub const Evaluator = struct {
             .trait_definition_order = std.ArrayList([]const u8).empty,
             .impl_methods = std.ArrayList(ImplMethodEntry).empty,
             .module_exports = std.StringHashMap(ModuleExportInfo).init(allocator),
+            .module_values = std.StringHashMap(Value).init(allocator),
             .current_source_dir = null,
             .module_defer_stack = std.ArrayList(*const ast.Expr).empty,
             .loading_modules = std.StringHashMap(void).init(allocator),
@@ -299,6 +310,11 @@ pub const Evaluator = struct {
             self.allocator.destroy(closure);
         }
         self.closures.deinit(self.allocator);
+        // 释放所有 Lazy thunk
+        for (self.lazy_values.items) |lz| {
+            self.allocator.destroy(lz);
+        }
+        self.lazy_values.deinit(self.allocator);
         // 释放所有错误类型上下文
         for (self.error_newtype_contexts.items) |ctx| {
             self.allocator.free(ctx.type_name);
@@ -357,6 +373,14 @@ pub const Evaluator = struct {
                 // 注意：不释放 env，因为闭包可能引用它
             }
             self.module_exports.deinit();
+        }
+        // 释放模块值表（键 owned；值 TraitValue 与其 methods 由 GC/allocator 管理）
+        {
+            var iter = self.module_values.keyIterator();
+            while (iter.next()) |k| {
+                self.allocator.free(k.*);
+            }
+            self.module_values.deinit();
         }
         // 释放 current_source_dir
         if (self.current_source_dir) |dir| {
@@ -549,6 +573,23 @@ pub const Evaluator = struct {
             .receiver_val => |rv| {
                 if (gc.markObject(@intFromPtr(rv))) {
                     self.traceValue(.{ .channel_val = rv.channel });
+                }
+            },
+            .trait_value => |tv| {
+                if (gc.markObject(@intFromPtr(tv))) {
+                    // 追踪 vtable 中的方法闭包与 data 载荷
+                    var it = tv.methods.valueIterator();
+                    while (it.next()) |m| self.traceValue(m.*);
+                    if (tv.data) |d| {
+                        if (gc.markObject(@intFromPtr(d))) self.traceValue(d.*);
+                    }
+                }
+            },
+            .lazy_val => |lz| {
+                if (gc.markObject(@intFromPtr(lz))) {
+                    if (lz.forced) {
+                        if (lz.cached) |c| self.traceValue(c);
+                    }
                 }
             },
         }
@@ -900,6 +941,18 @@ pub const Evaluator = struct {
                     self.evacuateChannelValue(new_ch);
                 }
             },
+            .trait_value => |*tv_ptr| {
+                // TraitValue 与其方法闭包用 self.allocator 分配（非 nursery）；
+                // 仅需疏散 data 载荷内部可能的 nursery 指针。
+                if (tv_ptr.*.data) |d| self.evacuateValue(d);
+            },
+            .lazy_val => |*lz_ptr| {
+                // LazyValue 用 self.allocator 分配（非 nursery）；
+                // 已求值时疏散缓存值内部可能的 nursery 指针。
+                if (lz_ptr.*.forced) {
+                    if (lz_ptr.*.cached) |*c| self.evacuateValue(c);
+                }
+            },
         }
     }
 
@@ -1074,6 +1127,14 @@ pub const Evaluator = struct {
                 return ev.builtinString(args);
             }
         }.call } }, true) catch {};
+        // type (返回值的运行时类型名，文档 §2.15)
+        self.global_env.define("type", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+            fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
+                _ = user_ctx;
+                const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+                return ev.builtinTypeName(args);
+            }
+        }.call } }, true) catch {};
         // Error 构造器
         self.global_env.define("Error", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
@@ -1240,6 +1301,15 @@ pub const Evaluator = struct {
         errdefer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
         return Value{ .string = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory };
+    }
+
+    /// type(x) — 返回 x 的运行时类型名（str）。文档 §2.15。
+    /// 基本类型返回具体类型名（如 "i32"、"str"、"bool"）；ADT/newtype 返回其类型名；
+    /// 函数值（闭包/内建/部分应用）统一返回 "function"。
+    fn builtinTypeName(self: *Evaluator, args: []const Value) EvalError!Value {
+        if (args.len != 1) return error.WrongArity;
+        const name = valueTypeName(args[0]) orelse "function";
+        return Value{ .string = self.allocator.dupe(u8, name) catch return error.OutOfMemory };
     }
 
     fn builtinError(self: *Evaluator, args: []const Value) EvalError!Value {
@@ -1556,6 +1626,11 @@ pub const Evaluator = struct {
             .pub_names = owned_pub_names,
         });
 
+        // 文档 §4.6.2: 把模块构建成「模块值」(一等 Trait 值)，pub 成员作为 vtable 方法、
+        // pub pack 子模块作为成员，绑定 module_name -> 模块值，支持 `Store.Memory` 限定访问
+        // 与「文件模块作为 Trait 值」的结构化传参。
+        try self.buildAndBindModuleValue(module, module_name);
+
         // 执行模块级 defer（LIFO 顺序）
         self.runDefers(self.module_defer_stack.items, &self.global_env) catch {};
         self.module_defer_stack.clearRetainingCapacity();
@@ -1563,6 +1638,55 @@ pub const Evaluator = struct {
         // 标记模块为"已加载完成"
         const loaded_name = try self.allocator.dupe(u8, module_name);
         try self.loaded_modules.put(loaded_name, {});
+    }
+
+    /// 构建模块值并绑定到 global_env 与 module_values 注册表。
+    /// 模块值 = TraitValue{ trait_name=模块名, methods=pub 成员(函数闭包/子模块值), data=null }。
+    fn buildAndBindModuleValue(self: *Evaluator, module: ast.Module, module_name: []const u8) !void {
+        const tv = try self.allocator.create(value.TraitValue);
+        var methods = std.StringHashMap(Value).init(self.allocator);
+
+        for (module.declarations) |decl| {
+            switch (decl) {
+                .fun_decl => |f| {
+                    if (f.visibility != .public) continue;
+                    if (self.global_env.get(f.name)) |v| {
+                        const key = try self.allocator.dupe(u8, f.name);
+                        try methods.put(key, v.value);
+                    }
+                },
+                .pack_decl => |pd| {
+                    if (pd.visibility != .public) continue;
+                    // 子模块的模块值已在其 evalModule 收尾时注册到 module_values
+                    if (self.module_values.get(pd.name)) |sub_val| {
+                        const key = try self.allocator.dupe(u8, pd.name);
+                        try methods.put(key, sub_val);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        tv.* = value.TraitValue{
+            .trait_name = try self.allocator.dupe(u8, module_name),
+            .methods = methods,
+            .data = null,
+            .allocator = self.allocator,
+        };
+        const module_val = Value{ .trait_value = tv };
+
+        // 注册到 module_values（键 owned，覆盖时释放旧键）
+        if (self.module_values.fetchRemove(module_name)) |old| {
+            self.allocator.free(old.key);
+        }
+        const reg_key = try self.allocator.dupe(u8, module_name);
+        try self.module_values.put(reg_key, module_val);
+
+        // 绑定模块名到 global_env（限定访问 Module.member 的入口）；
+        // 不覆盖同名已有绑定（如 trait 名占用——分属不同语义但共享 env 时以先到为准）。
+        if (self.global_env.get(module_name) == null) {
+            try self.global_env.define(module_name, module_val, false);
+        }
     }
 
     pub fn evalDecl(self: *Evaluator, decl: ast.Decl, environment: *Environment) !void {
@@ -2187,10 +2311,22 @@ pub const Evaluator = struct {
             .spawn => |sp| self.evalSpawn(sp, environment),
             .atomic_expr => |ae| self.evalAtomicExpr(ae, environment),
             .compound_assign => |ca| self.evalCompoundAssign(ca, environment),
-            .lazy => error.UnsupportedOperation,
+            .lazy => |lz| {
+                // 文档 §6.10: lazy expr 构建延迟求值 thunk，首次访问时计算并缓存
+                const lazy_v = try self.allocator.create(value.LazyValue);
+                lazy_v.* = value.LazyValue{
+                    .expr = lz.expr,
+                    .env = @ptrCast(environment),
+                    .cached = null,
+                    .forced = false,
+                    .allocator = self.allocator,
+                };
+                try self.lazy_values.append(self.allocator, lazy_v);
+                return Value{ .lazy_val = lazy_v };
+            },
             .select => |sel| self.evalSelect(sel, environment),
             .monad_comprehension => |mc| self.evalMonadComprehension(mc, environment),
-            .inline_trait_value => error.UnsupportedOperation,
+            .inline_trait_value => |itv| self.evalInlineTraitValue(itv, environment),
         };
     }
 
@@ -2297,11 +2433,28 @@ pub const Evaluator = struct {
         return self.evalExpr(expr, environment);
     }
 
+    /// 文档 §6.10: 强制求值 Lazy thunk。首次调用时计算表达式并缓存，
+    /// 后续调用直接返回缓存值。
+    fn forceLazy(self: *Evaluator, lz: *value.LazyValue) EvalResult!Value {
+        if (lz.forced) {
+            return lz.cached.?;
+        }
+        const lazy_env: *Environment = @ptrCast(@alignCast(lz.env));
+        const result = try self.evalExpr(lz.expr, lazy_env);
+        lz.cached = result;
+        lz.forced = true;
+        return result;
+    }
+
     fn evalIdentifier(self: *Evaluator, id: @TypeOf(@as(ast.Expr, undefined).identifier), environment: *Environment) EvalResult!Value {
         if (environment.get(id.name)) |v| {
             // Atomic<T> 透明操作：读取时使用 atomic_load
             if (v.value == .atomic_val) {
                 return v.value.atomic_val.load();
+            }
+            // Lazy<T> 透明操作（文档 §6.10）：首次访问时计算并缓存
+            if (v.value == .lazy_val) {
+                return self.forceLazy(v.value.lazy_val);
             }
             return v.value;
         }
@@ -2520,6 +2673,7 @@ pub const Evaluator = struct {
             .lt_eq => return self.evalLtEq(left, right),
             .gt_eq => return self.evalGtEq(left, right),
             .concat => return self.evalConcat(left, right),
+            .concat_list => return self.evalConcatList(left, right),
             .range => {
                 const left_int: i128 = if (left.integer.type_tag.isSigned()) left.integer.signedValue() else @intCast(left.integer.value);
                 const right_int: i128 = if (right.integer.type_tag.isSigned()) right.integer.signedValue() else @intCast(right.integer.value);
@@ -2717,7 +2871,9 @@ pub const Evaluator = struct {
             if (right.integer.value == 0) return self.gluePanic("arithmetic error: division by zero");
             const result_type = promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
             if (result_type.isSigned()) {
-                const result = @mod(@as(i128, @bitCast(left.integer.value)), @as(i128, @bitCast(right.integer.value)));
+                // 取余须与除法（@divTrunc，向零截断）保持一致：使用 @rem，
+                // 余数符号跟随被除数，满足 (a/b)*b + a%b == a（Go/Java/C 语义）。
+                const result = @rem(@as(i128, @bitCast(left.integer.value)), @as(i128, @bitCast(right.integer.value)));
                 if (!result_type.inRange(@bitCast(result))) return self.gluePanic("arithmetic overflow: integer operation out of range");
                 return Value{ .integer = IntValue{ .value = @bitCast(result), .type_tag = result_type } };
             } else {
@@ -2727,7 +2883,7 @@ pub const Evaluator = struct {
         }
         if (left == .float and right == .float) {
             if (right.float.value == 0.0) return self.gluePanic("arithmetic error: division by zero");
-            return self.checkFloatResult(@mod(left.float.value, right.float.value), resultFloatTag(left.float, right.float));
+            return self.checkFloatResult(@rem(left.float.value, right.float.value), resultFloatTag(left.float, right.float));
         }
         return error.TypeMismatch;
     }
@@ -2813,6 +2969,26 @@ pub const Evaluator = struct {
         try result.appendSlice(self.allocator, left_str);
         try result.appendSlice(self.allocator, right_str);
         return Value{ .string = try result.toOwnedSlice(self.allocator) };
+    }
+
+    /// ++ 数组拼接：把两个数组首尾相接，返回新的动态数组（元素深拷贝）。
+    fn evalConcatList(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
+        const left_arr = switch (left) {
+            .array => |a| a,
+            else => return error.TypeMismatch,
+        };
+        const right_arr = switch (right) {
+            .array => |a| a,
+            else => return error.TypeMismatch,
+        };
+        const new_arr = try self.allocator.alloc(Value, left_arr.elements.len + right_arr.elements.len);
+        for (left_arr.elements, 0..) |e, i| {
+            new_arr[i] = try e.clone(self.allocator);
+        }
+        for (right_arr.elements, 0..) |e, i| {
+            new_arr[left_arr.elements.len + i] = try e.clone(self.allocator);
+        }
+        return Value{ .array = .{ .elements = new_arr, .fixed_size = null } };
     }
 
     // ============================================================
@@ -3171,10 +3347,58 @@ pub const Evaluator = struct {
             .channel_val => "Channel",
             .sender_val => "Sender",
             .receiver_val => "Receiver",
+            .trait_value => |tv| if (tv.trait_name.len > 0) tv.trait_name else "trait",
+            .lazy_val => "Lazy",
         };
     }
 
+    /// 文档 §4.6.3: 内联 Trait 值 `trait { fun m(..){...} }`。
+    /// 把每个方法编译为闭包，构建 vtable（无 data 载荷）。
+    fn evalInlineTraitValue(self: *Evaluator, itv: @TypeOf(@as(ast.Expr, undefined).inline_trait_value), environment: *Environment) EvalResult!Value {
+        const tv = try self.allocator.create(value.TraitValue);
+        var methods = std.StringHashMap(Value).init(self.allocator);
+        for (itv.methods) |method| {
+            if (method.body) |body| {
+                const closure = try self.allocator.create(value.Closure);
+                closure.* = value.Closure{
+                    .params = method.params,
+                    .body = .{ .block = body },
+                    .env = @ptrCast(environment),
+                    .allocator = self.allocator,
+                };
+                try self.closures.append(self.allocator, closure);
+                const key = try self.allocator.dupe(u8, method.name);
+                try methods.put(key, Value{ .closure = closure });
+            }
+        }
+        tv.* = value.TraitValue{
+            .trait_name = "",
+            .methods = methods,
+            .data = null,
+            .allocator = self.allocator,
+        };
+        return Value{ .trait_value = tv };
+    }
+
     fn callMethod(self: *Evaluator, object: Value, method: []const u8, args: []const Value, environment: ?*Environment) EvalResult!Value {
+        // 文档 §4.6/§4.7: 一等 Trait 值方法调用——经 vtable 分派。
+        if (object == .trait_value) {
+            const tv = object.trait_value;
+            if (tv.methods.get(method)) |impl_fn| {
+                // 若有 data 载荷（文件模块作为 trait 值），作为首个 receiver 实参；
+                // 内联 trait 值无 data，直接用调用实参。
+                if (tv.data) |d| {
+                    var full = try self.allocator.alloc(Value, args.len + 1);
+                    defer self.allocator.free(full);
+                    full[0] = d.*;
+                    @memcpy(full[1..], args);
+                    return self.callFunction(impl_fn, full, environment);
+                }
+                return self.callFunction(impl_fn, args, environment);
+            }
+            return error.UnsupportedOperation;
+        }
+
         // 内建方法
         if (std.mem.eql(u8, method, "len")) {
             return switch (object) {
@@ -3631,6 +3855,14 @@ pub const Evaluator = struct {
                             return f.value;
                         }
                     }
+                }
+                return error.UndefinedVariable;
+            },
+            .trait_value => |tv| {
+                // 文档 §4.6.2: 模块值/Trait 值的成员访问——限定名 `Store.Memory`、
+                // `Module.member`（子模块或导出函数）。在 vtable/成员表中查找。
+                if (tv.methods.get(field)) |member| {
+                    return member;
                 }
                 return error.UndefinedVariable;
             },
@@ -4980,6 +5212,8 @@ fn structuralEquals(a: Value, b: Value) bool {
         .channel_val => |cv| cv == b.channel_val, // 引用相等
         .sender_val => |sv| sv == b.sender_val, // 引用相等
         .receiver_val => |rv| rv == b.receiver_val, // 引用相等
+        .trait_value => |tv| tv == b.trait_value, // 引用相等
+        .lazy_val => |lz| lz == b.lazy_val, // 引用相等
     };
 }
 
@@ -5004,23 +5238,19 @@ fn parseInt(comptime T: type, raw: []const u8) !T {
         }
     }
 
-    // 去除类型后缀（如 i8, u32, i64, i128, u8, f32, f64 等）
-    // 后缀格式：字母开头，后跟数字和字母
+    // 去除整数类型后缀（仅形如 i8/u32/i128 等：i/u 后跟十进制数字）。
+    // 注意：不能盲目剥离尾部字母，否则会把十六进制数字 A–F 误当作后缀
+    // （例如 0xFF 会被错误地清空）。
     var end = raw.len;
-    if (end > 0) {
+    {
         var j = end;
-        // 先跳过末尾的数字
+        // 跳过末尾的十进制数字（后缀的位宽部分，如 32、128）
         while (j > i and raw[j - 1] >= '0' and raw[j - 1] <= '9') {
             j -= 1;
         }
-        // 再跳过字母部分
-        if (j > i and ((raw[j - 1] >= 'a' and raw[j - 1] <= 'z') or (raw[j - 1] >= 'A' and raw[j - 1] <= 'Z'))) {
-            j -= 1;
-            // 继续跳过更多字母（如 i128 中的 i 后面没有更多字母，但 f32 有 f）
-            while (j > i and ((raw[j - 1] >= 'a' and raw[j - 1] <= 'z') or (raw[j - 1] >= 'A' and raw[j - 1] <= 'Z'))) {
-                j -= 1;
-            }
-            end = j;
+        // 后缀必须以单个 i/u 引导才算有效类型后缀
+        if (j > i and j < end and (raw[j - 1] == 'i' or raw[j - 1] == 'u' or raw[j - 1] == 'I' or raw[j - 1] == 'U')) {
+            end = j - 1;
         }
     }
 

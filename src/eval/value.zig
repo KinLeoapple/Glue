@@ -104,7 +104,6 @@ pub const ThrowValue = union(enum) {
 // ============================================================
 // 内建函数类型
 // ============================================================
-
 /// 内建函数指针类型
 ///
 /// 使用 *anyopaque 作为上下文指针以避免与 Evaluator 的循环依赖。
@@ -172,6 +171,43 @@ pub const Closure = struct {
     params: []ast.Param,
     body: ast.LambdaBody,
     env: *anyopaque, // *Environment — 使用不透明指针避免循环依赖
+    allocator: std.mem.Allocator,
+};
+
+// ============================================================
+// 一等 Trait 值（Phase 7）
+// ============================================================
+
+/// 一等 Trait 值的运行时表示（文档 §4.7）。
+/// 概念上是 vtable 指针 + data 载荷的胖指针；这里以方法名 -> 闭包的映射
+/// 表示 vtable（接口函数指针），data 以可选 receiver 值表示。
+/// - 内联 trait 值 `trait { fun log(msg){...} }`：data 为 null，方法是自由闭包。
+/// - 文件模块作为 trait 值：data 为模块记录，方法绑定到模块。
+pub const TraitValue = struct {
+    /// Trait 名（用于诊断与方法分派校验，可空）
+    trait_name: []const u8 = "",
+    /// vtable：方法名 -> 实现闭包
+    methods: std.StringHashMap(Value),
+    /// data 载荷（receiver）；内联 trait 值为 null
+    data: ?*Value = null,
+    allocator: std.mem.Allocator,
+};
+
+// ============================================================
+// Lazy 值（Phase 7）— 显式惰性求值
+// ============================================================
+
+/// 文档 §6.10: `Lazy<T>` 延迟求值，首次访问时计算并缓存。
+/// thunk 持有未求值表达式与其闭包环境；cached 持有首次求值后的结果。
+pub const LazyValue = struct {
+    /// 未求值的表达式（thunk body）
+    expr: *ast.Expr,
+    /// 求值时所需的环境（*Environment，不透明指针避免循环依赖）
+    env: *anyopaque,
+    /// 缓存的结果；null 表示尚未求值
+    cached: ?Value = null,
+    /// 是否已求值（区分 cached 为 null_val 的合法缓存）
+    forced: bool = false,
     allocator: std.mem.Allocator,
 };
 
@@ -351,10 +387,12 @@ pub const IntValue = struct {
 /// 推断顺序：i8 → u8 → i16 → u16 → i32 → u32 → i64 → u64 → i128 → u128
 /// 负值只考虑有符号类型
 pub fn inferIntType(val: u128) IntType {
-    // 先尝试有符号类型
+    // 文档 §6.12: 无类型后缀、且无显式类型标注的整数字面量，推断为「能容纳该值
+    // 的最小类型」。带标注时由声明/形参处的 castValue 按标注类型转换（覆盖此默认）；
+    // 带后缀时由 evalIntLiteral 直接采用后缀类型，均不经过本函数。
     const signed_val: i128 = @bitCast(val);
     if (signed_val >= 0) {
-        // 非负值：先尝试有符号，再尝试同位宽无符号
+        // 非负值：同位宽优先有符号，再无符号，逐级加宽取最小可容纳类型
         if (val <= std.math.maxInt(i8)) return .i8;
         if (val <= std.math.maxInt(u8)) return .u8;
         if (val <= std.math.maxInt(i16)) return .i16;
@@ -366,7 +404,7 @@ pub fn inferIntType(val: u128) IntType {
         if (val <= @as(u128, @bitCast(@as(i128, std.math.maxInt(i128))))) return .i128;
         return .u128;
     } else {
-        // 负值：只考虑有符号类型
+        // 负值：只考虑有符号类型，取最小可容纳位宽
         if (signed_val >= std.math.minInt(i8)) return .i8;
         if (signed_val >= std.math.minInt(i16)) return .i16;
         if (signed_val >= std.math.minInt(i32)) return .i32;
@@ -564,6 +602,12 @@ pub const Value = union(enum) {
     /// Receiver<T> — Channel 接收端
     receiver_val: *ReceiverValue,
 
+    /// 一等 Trait 值（Phase 7，文档 §4.6/§4.7）：vtable + data 胖指针
+    trait_value: *TraitValue,
+
+    /// Lazy<T> 值（Phase 7，文档 §6.10）：延迟求值 + 首次访问缓存
+    lazy_val: *LazyValue,
+
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .array => |arr| {
@@ -756,6 +800,31 @@ pub const Value = union(enum) {
                 rv.ref();
                 return Value{ .receiver_val = rv };
             },
+            // §5.2 规则 3: 一等 Trait 值 — vtable 共享（方法表浅拷贝），data 深拷贝
+            .trait_value => |tv| {
+                const new_tv = try allocator.create(TraitValue);
+                var new_methods = std.StringHashMap(Value).init(allocator);
+                var it = tv.methods.iterator();
+                while (it.next()) |entry| {
+                    const key = try allocator.dupe(u8, entry.key_ptr.*);
+                    try new_methods.put(key, try entry.value_ptr.*.clone(allocator));
+                }
+                var new_data: ?*Value = null;
+                if (tv.data) |d| {
+                    const dc = try allocator.create(Value);
+                    dc.* = try d.clone(allocator);
+                    new_data = dc;
+                }
+                new_tv.* = TraitValue{
+                    .trait_name = if (tv.trait_name.len > 0) try allocator.dupe(u8, tv.trait_name) else "",
+                    .methods = new_methods,
+                    .data = new_data,
+                    .allocator = allocator,
+                };
+                return Value{ .trait_value = new_tv };
+            },
+            // Lazy<T>：thunk 引用语义共享（保留缓存一致性）
+            .lazy_val => self,
         };
     }
 
@@ -854,6 +923,20 @@ pub const Value = union(enum) {
             .channel_val => try buf.appendSlice(allocator, "<channel>"),
             .sender_val => try buf.appendSlice(allocator, "<sender>"),
             .receiver_val => try buf.appendSlice(allocator, "<receiver>"),
+            .trait_value => |tv| {
+                if (tv.trait_name.len > 0) {
+                    try buf.print(allocator, "<trait {s}>", .{tv.trait_name});
+                } else {
+                    try buf.appendSlice(allocator, "<trait>");
+                }
+            },
+            .lazy_val => |lz| {
+                if (lz.forced) {
+                    try buf.appendSlice(allocator, "<lazy forced>");
+                } else {
+                    try buf.appendSlice(allocator, "<lazy>");
+                }
+            },
         }
     }
 
@@ -888,6 +971,8 @@ pub const Value = union(enum) {
             .channel_val => |cv| cv == other.channel_val, // 引用相等
             .sender_val => |sv| sv == other.sender_val, // 引用相等
             .receiver_val => |rv| rv == other.receiver_val, // 引用相等
+            .trait_value => |tv| tv == other.trait_value, // 引用相等
+            .lazy_val => |lz| lz == other.lazy_val, // 引用相等
         };
     }
 

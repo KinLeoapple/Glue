@@ -64,6 +64,8 @@ pub const BinaryOp = enum {
     bit_xor, // ^
     // 字符串拼接
     concat, // +（字符串上下文）
+    // 数组/列表拼接
+    concat_list, // ++（数组首尾相接）
     // 范围运算符
     range, // ..（开区间）
     range_inclusive, // ..=（闭区间）

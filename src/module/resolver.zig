@@ -49,19 +49,26 @@ pub const ModuleResolver = struct {
         defer allocator.free(path_with_ext);
 
         const cwd = std.Io.Dir.cwd();
-        if (cwd.access(io, path_with_ext, .{})) {
-            return try allocator.dupe(u8, path_with_ext);
-        } else |_| {
-            // 尝试 pack.glue（目录模块）
-            const pack_path = try std.fmt.allocPrint(allocator, "{s}" ++ [_]u8{std.fs.path.sep} ++ "pack.glue", .{file_path.items});
-            defer allocator.free(pack_path);
+        // 目录模块路径 base/.../module/pack.glue
+        const pack_path = try std.fmt.allocPrint(allocator, "{s}" ++ [_]u8{std.fs.path.sep} ++ "pack.glue", .{file_path.items});
+        defer allocator.free(pack_path);
 
-            if (cwd.access(io, pack_path, .{})) {
-                return try allocator.dupe(u8, pack_path);
-            } else |_| {
-                return null;
-            }
+        const flat_exists = if (cwd.access(io, path_with_ext, .{})) true else |_| false;
+        const dir_exists = if (cwd.access(io, pack_path, .{})) true else |_| false;
+
+        // 文档 §4.2-4.3: 同名扁平文件模块与目录模块并存属于歧义——
+        // 否则扁平文件会静默遮蔽目录模块（含其子模块），子模块限定访问 (Foo.Bar)
+        // 在运行时崩 UndefinedVariable。显式报错而非静默择一。
+        if (flat_exists and dir_exists) {
+            return error.AmbiguousModule;
         }
+        if (flat_exists) {
+            return try allocator.dupe(u8, path_with_ext);
+        }
+        if (dir_exists) {
+            return try allocator.dupe(u8, pack_path);
+        }
+        return null;
     }
 
     /// 加载模块源代码

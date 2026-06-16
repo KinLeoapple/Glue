@@ -270,9 +270,21 @@ pub const Parser = struct {
         errdefer declarations.deinit(self.allocator);
 
         while (!self.isAtEnd()) {
+            // 声明关键字开头：必然是声明，解析失败则同步到下一声明，
+            // 不回退到 parseExpr（否则会对声明残余 token 产生误导性次生错误，
+            // 如缺前导 `|` 的枚举在真正诊断后再报一次 "expected expression"）。
+            const at_decl_kw = self.check(.kw_fun) or self.check(.kw_type) or
+                self.check(.kw_trait) or self.check(.kw_impl) or
+                self.check(.kw_use) or self.check(.kw_pack) or self.check(.kw_pub);
+
             // 先尝试解析为声明
             if (self.tryParseDecl()) |decl| {
                 try declarations.append(self.allocator, decl);
+                continue;
+            }
+
+            if (at_decl_kw) {
+                self.synchronize();
                 continue;
             }
 
@@ -591,6 +603,13 @@ pub const Parser = struct {
 
         // 类型别名：target_type
         const target = try self.parseType();
+        // 文档 §2.5.1: 多构造器枚举每个构造器须以 `|` 起始（含首个）。
+        // 形如 `type Color = Red | Green`（缺前导 `|`）会把 Red 当别名解析后撞上 `|`，
+        // 原先报误导性的 "expected expression"。这里给出可操作的诊断。
+        if (self.check(.pipe)) {
+            try self.reportError("each variant of a sum type must be prefixed with '|', including the first; for example `type Color = | Red | Green`");
+            return ParserError.UnexpectedToken;
+        }
         return ast.TypeDef{ .alias = .{ .target = target } };
     }
 
@@ -1292,7 +1311,7 @@ pub const Parser = struct {
                 // 解析大小表达式（必须是整数）
                 const size_tok = try self.expect(.int_literal, "expected array size");
                 size = std.fmt.parseInt(u64, size_tok.lexeme, 10) catch {
-                    try self.reportError("数组大小必须是正整数");
+                    try self.reportError("array size must be a positive integer");
                     return error.UnexpectedToken;
                 };
             }
@@ -1558,6 +1577,18 @@ pub const Parser = struct {
                     .binary = .{
                         .location = tokenLoc(op_tok),
                         .op = .add,
+                        .left = left,
+                        .right = right,
+                    },
+                });
+            } else if (self.matchToken(.plus_plus)) {
+                // ++：数组/列表拼接，与 + 同优先级、左结合
+                const op_tok = self.previous();
+                const right = try self.parseMultiplication();
+                left = try self.allocExpr(ast.Expr{
+                    .binary = .{
+                        .location = tokenLoc(op_tok),
+                        .op = .concat_list,
                         .left = left,
                         .right = right,
                     },
@@ -1982,6 +2013,21 @@ pub const Parser = struct {
 
         if (self.matchToken(.l_paren)) {
             return self.parseParenOrRecordOrLambda();
+        }
+
+        // `type` 是关键字（type Foo = ...），但内建函数 type(x) 也用这个名字。
+        // 仅当 `type` 紧跟 `(` 时，按内建函数标识符处理；否则仍是类型定义关键字。
+        if (self.check(.kw_type) and
+            self.tokens.len > self.current + 1 and
+            self.tokens[self.current + 1].type == .l_paren)
+        {
+            const tok = self.advance();
+            return self.allocExpr(ast.Expr{
+                .identifier = .{
+                    .location = tokenLoc(tok),
+                    .name = tok.lexeme,
+                },
+            });
         }
 
         if (self.check(.identifier) or self.check(.kw_val) or self.check(.kw_var) or self.check(.kw_channel)) {
@@ -2590,6 +2636,14 @@ pub const Parser = struct {
                 const stmt = self.parseStmt() catch |err| {
                     return err;
                 };
+                // 匿名 lambda（fun(...){...}）经 parseFunStmt 包装成 .expression 语句。
+                // 若它是块内最后一项（后紧跟 }），应作为尾表达式，使块的求值/类型
+                // 结果为该 lambda（函数类型），而非 Unit。命名 fun 会变成 val_decl，
+                // 不受影响。
+                if (stmt.* == .expression and self.check(.r_brace)) {
+                    trailing_expr = stmt.expression.expr;
+                    break;
+                }
                 try statements.append(self.allocator, stmt);
             } else {
                 // 使用 parseExprOrAssignmentStmt 处理赋值语句（如 x = 10）

@@ -207,7 +207,11 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
     };
 
     // 求值模块
-    ev.evalModule(module) catch |err| switch (err) {
+    // 入口文件路径作为 source_path，使 current_source_dir 能正确解析相对 use 依赖
+    // （文档 §4.5）。否则从父目录运行 `glue dir/Main.glue` 时基目录误为 `.`。
+    var entry_module = module;
+    entry_module.source_path = filename;
+    ev.evalModule(entry_module) catch |err| switch (err) {
         error.GluePanic => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
@@ -221,6 +225,13 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
             stderr_writer.interface.print("{s}: error: circular module dependency\n", .{filename}) catch {};
+            stderr_writer.flush() catch {};
+            return true;
+        },
+        error.AmbiguousModule => {
+            var err_buf: [4096]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+            stderr_writer.interface.print("{s}: error: ambiguous module — both a flat file 'Mod.glue' and a directory module 'Mod/pack.glue' exist; remove one\n", .{filename}) catch {};
             stderr_writer.flush() catch {};
             return true;
         },

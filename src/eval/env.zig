@@ -225,10 +225,15 @@ pub const Environment = struct {
             => try val.clone(allocator),
 
             // §5.2 规则 3: 一等 Trait 值 — vtable 共享 + data 深拷贝
-            // 当前阶段（Phase 4）尚未实现一等 Trait 值运行时表示（Phase 7），
-            // 但 builtin 函数可视为简化的 Trait 值：函数指针全局共享（等价 vtable），
-            // 无 data 载荷，跨 Heap 传递时直接共享
+            // builtin 函数可视为简化的 Trait 值：函数指针全局共享（等价 vtable），
+            // 无 data 载荷，跨 Heap 传递时直接共享。
             .builtin => val,
+
+            // 一等 Trait 值（Phase 7）：clone 已实现 vtable 浅拷贝 + data 深拷贝
+            .trait_value => try val.clone(allocator),
+
+            // Lazy<T>（Phase 7）：thunk 引用语义，跨 Heap 共享
+            .lazy_val => val,
 
             // Spawn<T> 是线性类型，不允许跨 Heap 传递（必须通过 await/cancel 消费）
             .spawn_val => val,

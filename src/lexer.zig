@@ -160,6 +160,8 @@ pub const TokenType = enum {
     eq,
     /// +=
     plus_eq,
+    /// ++（数组/列表拼接）
+    plus_plus,
     /// -=
     minus_eq,
     /// *=
@@ -426,10 +428,12 @@ pub const Lexer = struct {
                 }
             },
 
-            // + 或 +=
+            // + 或 += 或 ++
             '+' => {
                 if (self.matchChar('=')) {
                     try self.addToken(.plus_eq, start, start_line, start_col);
+                } else if (self.matchChar('+')) {
+                    try self.addToken(.plus_plus, start, start_line, start_col);
                 } else {
                     try self.addToken(.plus, start, start_line, start_col);
                 }
