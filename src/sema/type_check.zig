@@ -548,6 +548,10 @@ pub const TypeInferencer = struct {
     /// 当前函数的返回类型（用于 ? 传播检查）
     /// 文档 2.3.9: ? 操作符要求外层函数的返回类型兼容
     current_fn_return_type: ?*Type = null,
+    /// 当前函数的类型参数映射（T -> 类型变量）。嵌套函数/lambda 解析类型注解时
+    /// 作为回退，使内层 `fun go(x: List<T>)` 中的 T 绑定到外层泛型函数的同一类型变量，
+    /// 而非被当成未知 ADT。仅在检查泛型函数体期间非 null。
+    current_type_params: ?*const std.StringHashMap(*Type) = null,
     /// 当前模块名（用于 Orphan 检查）
     current_module: []const u8 = "",
     /// Trait 定义模块记录（trait_name -> 定义它的模块名）
@@ -1863,6 +1867,13 @@ pub const TypeInferencer = struct {
                     self.pushLinearScope();
                     const else_ty = try self.inferExpr(else_br, else_env);
                     self.popLinearScope();
+                    // 发散分支处理：若某一分支体只含 throw（或 return/break/continue），
+                    // 其类型为 unit，不应强行与另一分支的真实值类型统一。此时整个 if
+                    // 取非发散分支的类型。例如 `if (c) { 42 } else { throw ... }` 应为 i32。
+                    const rthen = self.resolve(then_ty);
+                    const relse = self.resolve(else_ty);
+                    if (rthen.* == .unit_type and relse.* != .unit_type) return else_ty;
+                    if (relse.* == .unit_type and rthen.* != .unit_type) return then_ty;
                     const unified = try self.tryWidenUnify(then_ty, else_ty);
                     return unified;
                 }
@@ -2211,23 +2222,38 @@ pub const TypeInferencer = struct {
         return switch (stmt.*) {
             .val_decl => |vd| {
                 if (self.isBuiltinName(vd.name)) {
-                    self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{vd.name});
+                    self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "cannot redefine built-in name '{s}'", .{vd.name});
                 } else {
                     // 如果值是 lambda，先注册函数类型到环境以支持递归调用
                     if (vd.value.* == .lambda) {
                         const lam = vd.value.*.lambda;
                         const child_env = try env.createChild();
+                        // 若 val 标注是函数类型（如 `val g: () -> i32` / `i32 -> i32`），
+                        // 它描述的是整个 lambda 的类型——其 return_type 才是 lambda 体类型，
+                        // 其 params 对应 lambda 形参。早期错误地把整个标注当作返回类型，
+                        // 导致 `val g: () -> i32 = fun() { 42 }` 误报（拿 i32 体 unify 函数类型）。
+                        const annot_fn: ?*Type = blk: {
+                            if (vd.type_annotation) |ta| {
+                                const at = self.typeFromAst(ta) catch break :blk null;
+                                const rat = self.resolve(at);
+                                if (rat.* == .fn_type) break :blk rat;
+                            }
+                            break :blk null;
+                        };
                         var param_types = try self.allocator.alloc(*Type, lam.params.len);
                         for (lam.params, 0..) |param, i| {
                             const param_ty = if (param.type_annotation) |ta|
                                 try self.typeFromAst(ta)
+                            else if (annot_fn) |af| (if (i < af.fn_type.params.len) af.fn_type.params[i] else try self.freshTypeVar())
                             else
                                 try self.freshTypeVar();
                             param_types[i] = param_ty;
                             const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = param_ty };
                             try child_env.define(param.name, scheme);
                         }
-                        const ret_ty = if (vd.type_annotation) |ta|
+                        const ret_ty = if (annot_fn) |af|
+                            af.fn_type.return_type
+                        else if (vd.type_annotation) |ta|
                             try self.typeFromAst(ta)
                         else
                             try self.freshTypeVar();
@@ -2249,7 +2275,7 @@ pub const TypeInferencer = struct {
                         // 注册到外层环境
                         const final_scheme = try self.generalize(env, fn_ty);
                         if (!(try env.defineOrReport(vd.name, final_scheme))) {
-                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
+                            self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                         }
                     } else {
                         const val_ty = try self.inferExpr(vd.value, env);
@@ -2275,7 +2301,7 @@ pub const TypeInferencer = struct {
                         }
                         const scheme = try self.generalize(env, bind_ty);
                         if (!(try env.defineOrReport(vd.name, scheme))) {
-                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
+                            self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                         }
                     }
                 }
@@ -2283,7 +2309,7 @@ pub const TypeInferencer = struct {
             },
             .var_decl => |vd| {
                 if (self.isBuiltinName(vd.name)) {
-                    self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{vd.name});
+                    self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "cannot redefine built-in name '{s}'", .{vd.name});
                 } else {
                     const val_ty = try self.inferExpr(vd.value, env);
                     // 验证类型注解
@@ -2305,7 +2331,7 @@ pub const TypeInferencer = struct {
                     }
                     const scheme = try self.generalize(env, val_ty);
                     if (!(try env.defineOrReport(vd.name, scheme))) {
-                        self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
+                        self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                     }
                 }
                 return null;
@@ -2417,7 +2443,34 @@ pub const TypeInferencer = struct {
     pub fn inferPattern(self: *TypeInferencer, pat: *const ast.Pattern, expected_ty: *Type, env: *TypeEnv) SemaError!void {
         switch (pat.*) {
             .wildcard => {},
-            .literal => {},
+            .literal => |lit| {
+                // 字面量模式的类型必须与被匹配值（scrutinee）类型一致。
+                // null 模式对任意可空类型都合法，单独放行。
+                switch (lit) {
+                    .null => {},
+                    else => {
+                        const lit_ty: ?*Type = switch (lit) {
+                            .int => self.makeType(.i32_type) catch null,
+                            .float => self.makeType(.f64_type) catch null,
+                            .bool => self.makeType(.bool_type) catch null,
+                            .char => self.makeType(.char_type) catch null,
+                            .string => self.makeType(.str_type) catch null,
+                            .null => null,
+                        };
+                        if (lit_ty) |lt| {
+                            // 整数字面量与任意整数宽度兼容（不强制 i32），其余精确匹配。
+                            const re = self.resolve(expected_ty);
+                            if (lit == .int and re.isIntType()) {
+                                // ok：整数字面量匹配任意整数类型 scrutinee
+                            } else {
+                                self.unify(lt, expected_ty) catch {
+                                    self.addError(.type_mismatch, "literal pattern type does not match the matched value type", .{});
+                                };
+                            }
+                        }
+                    },
+                }
+            },
             .variable => |v| {
                 // Glue 约定（与求值器 pattern.zig 一致）：模式中大写开头的标识符
                 // 视为「无参构造器模式」（如 Leaf、Red），而非变量绑定。
@@ -2463,13 +2516,19 @@ pub const TypeInferencer = struct {
             },
             .guard => |g| {
                 try self.inferPattern(g.pattern, expected_ty, env);
+                // 守卫条件必须是 bool（模式绑定已在 env 中，可在此作用域推断条件类型）。
+                const cond_ty = self.inferExpr(g.condition, env) catch return;
+                self.unify(cond_ty, self.makeType(.bool_type) catch return) catch {
+                    self.addErrorAt(.type_mismatch, g.location.line, g.location.column, "match guard condition must be of type bool", .{});
+                };
             },
         }
     }
 
     /// 从 AST 类型注解创建类型
     pub fn typeFromAst(self: *TypeInferencer, type_node: *const ast.TypeNode) SemaError!*Type {
-        return self.typeFromAstWithParams(type_node, null);
+        // 回退到当前泛型函数的类型参数映射，使嵌套函数/lambda 注解里的 T 正确解析。
+        return self.typeFromAstWithParams(type_node, self.current_type_params);
     }
 
     /// 从 AST 类型注解创建类型，支持类型参数映射
@@ -2563,7 +2622,7 @@ pub const TypeInferencer = struct {
                     try self.types.append(self.allocator, t);
                     return t;
                 }
-                self.addError(.type_mismatch, "undefined type '{s}'", .{g.name});
+                self.addErrorAt(.type_mismatch, g.location.line, g.location.column, "undefined type '{s}'", .{g.name});
                 return self.makeAdtType(g.name, args);
             },
             .nullable => |n| {
@@ -3243,7 +3302,7 @@ pub const TypeInferencer = struct {
                 for (f.params, 0..) |param, i| {
                     const param_ty: *Type = if (param.type_annotation) |ta|
                         self.typeFromAstWithParams(ta, &type_param_map) catch blk: {
-                            self.addError(.type_mismatch, "invalid type annotation for parameter '{s}'", .{param.name});
+                            self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "invalid type annotation for parameter '{s}'", .{param.name});
                             break :blk self.freshTypeVar() catch return;
                         }
                     else
@@ -3272,6 +3331,11 @@ pub const TypeInferencer = struct {
                     self.current_fn_return_type = null;
                 }
                 defer self.current_fn_return_type = prev_fn_return;
+
+                // 让嵌套函数/lambda 能解析到本函数的类型参数（如内层 `fun go(x: List<T>)`）。
+                const prev_type_params = self.current_type_params;
+                self.current_type_params = if (f.type_params.len > 0) &type_param_map else prev_type_params;
+                defer self.current_type_params = prev_type_params;
 
                 // 设置当前函数信息（用于多态递归检测）
                 const prev_fn_info = self.current_fn_info;
@@ -3312,7 +3376,7 @@ pub const TypeInferencer = struct {
                     // 文档 2.7.1: impl 方法允许与内建函数同名（通过接收者类型分派）
                     // eq、compare、str 等方法名在 impl 中常见，允许覆盖
                     if (!std.mem.eql(u8, f.name, "eq") and !std.mem.eql(u8, f.name, "compare") and !std.mem.eql(u8, f.name, "str")) {
-                        self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{f.name});
+                        self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "cannot redefine built-in name '{s}'", .{f.name});
                     } else {
                         // 允许覆盖内建函数（使用 redefine 而非 defineOrReport）
                         env.redefine(f.name, final_scheme) catch return;
@@ -3322,7 +3386,7 @@ pub const TypeInferencer = struct {
                     // 此处用推断后重新泛化的 scheme 覆盖占位签名。
                     env.redefine(f.name, final_scheme) catch return;
                 } else if (!(env.defineOrReport(f.name, final_scheme) catch false)) {
-                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{f.name});
+                    self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "duplicate definition: '{s}' is already defined in this scope", .{f.name});
                 }
 
                 // 文档 2.7.3: Trait Bound `with` 验证
@@ -3378,9 +3442,9 @@ pub const TypeInferencer = struct {
                         const owned_type_param_names = type_param_names.toOwnedSlice(self.allocator) catch return;
                         const dup_or_builtin = self.isBuiltinName(td.name) or self.adt_types.contains(td.name);
                         if (self.isBuiltinName(td.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
+                            self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (self.adt_types.contains(td.name)) {
-                            self.addError(.type_mismatch, "duplicate type definition: '{s}' is already defined in this scope", .{td.name});
+                            self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "duplicate type definition: '{s}' is already defined in this scope", .{td.name});
                         } else {
                             // 先注册类型名（字段/返回类型尚未算），使构造器字段里对
                             // 自身的引用（如 Add(Expr<i32>, Expr<i32>) 或 Cons(T, List<T>)）
@@ -3432,19 +3496,19 @@ pub const TypeInferencer = struct {
                             // 否则用默认 adt_ty（如 List<T>）。
                             const ret_ty = ctor_return_types[ci] orelse adt_ty;
                             if (self.isBuiltinName(con.name)) {
-                                self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{con.name});
+                                self.addErrorAt(.type_mismatch, con.location.line, con.location.column, "cannot redefine built-in name '{s}'", .{con.name});
                             } else if (con.fields.len == 0) {
                                 // 无参构造器：直接返回 ADT 类型（或 GADT 返回类型）
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ret_ty };
                                 if (!(env.defineOrReport(con.name, scheme) catch false)) {
-                                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
+                                    self.addErrorAt(.type_mismatch, con.location.line, con.location.column, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
                                 }
                             } else {
                                 // 带参构造器：参数类型 -> ADT 返回类型
                                 const ctor_ty = self.makeFnType(@constCast(ctor_field_types[ci]), ret_ty) catch return;
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
                                 if (!(env.defineOrReport(con.name, scheme) catch false)) {
-                                    self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
+                                    self.addErrorAt(.type_mismatch, con.location.line, con.location.column, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
                                 }
                             }
                         }
@@ -3481,9 +3545,9 @@ pub const TypeInferencer = struct {
                         const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
                         if (self.isBuiltinName(td.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
+                            self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
-                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{td.name});
+                            self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "duplicate definition: '{s}' is already defined", .{td.name});
                         }
                         // 注册记录类型名到 adt_types，使类型注解中可用
                         // 例如 fun greet(u: User): str 中的 User 需要解析为 record_type
@@ -3521,7 +3585,7 @@ pub const TypeInferencer = struct {
 
                         // 解析目标类型
                         const target_ty = self.typeFromAstWithParams(ta.target, &type_param_map) catch {
-                            self.addError(.type_mismatch, "invalid target type in type alias '{s}'", .{td.name});
+                            self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "invalid target type in type alias '{s}'", .{td.name});
                             return;
                         };
 
@@ -3529,9 +3593,9 @@ pub const TypeInferencer = struct {
                         const qvars = self.allocator.dupe(usize, type_param_ids.items) catch return;
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = target_ty };
                         if (self.isBuiltinName(td.name)) {
-                            self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
+                            self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
-                            self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{td.name});
+                            self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "duplicate definition: '{s}' is already defined", .{td.name});
                         }
 
                         // 始终注册到 adt_types 中（用于 typeFromAst 解析类型别名）

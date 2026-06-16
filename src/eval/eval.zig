@@ -73,12 +73,17 @@ const AdtConstructorCtx = struct {
     type_name: []const u8,
     constructor_name: []const u8,
     field_names: []?[]const u8,
+    /// 各字段的内建类型名（如 "i32"），非内建类型为 null。用于构造时把实参强制
+    /// 转换到声明的字段类型（与函数形参一致），避免 `Emp(.., 90)` 里 90 留作 i8。
+    field_types: []?[]const u8,
 };
 
 /// 记录类型构造器上下文数据
 const RecordConstructorCtx = struct {
     type_name: []const u8,
     field_names: [][]const u8,
+    /// 各字段内建类型名（如 "i32"），非内建为 null。用于构造时强制转换实参到声明类型。
+    field_types: []?[]const u8,
 };
 
 /// 委托信息（运行时动态分派用）— 从 vtable 模块 re-export
@@ -134,6 +139,10 @@ pub const Evaluator = struct {
     throw_value: ?Value = null,
     /// Glue panic 消息 — 不可捕获，但允许 defer 执行
     panic_message: ?[]const u8 = null,
+    /// 最近正在求值的表达式位置（覆盖式更新）。panic 时据此报告行列。
+    current_loc: ?ast.SourceLocation = null,
+    /// panic 发生时捕获的位置（main.zig 打印用）。
+    panic_location: ?ast.SourceLocation = null,
     closures: std.ArrayList(*value.Closure),
     /// Lazy<T> thunk 列表（Phase 7）：统一管理生命周期
     lazy_values: std.ArrayList(*value.LazyValue),
@@ -445,6 +454,7 @@ pub const Evaluator = struct {
     /// evalBlock 捕获后执行 defer 栈，然后重新抛出。
     fn gluePanic(self: *Evaluator, message: []const u8) EvalResult!Value {
         self.panic_message = message;
+        if (self.panic_location == null) self.panic_location = self.current_loc;
         return error.GluePanic;
     }
 
@@ -452,6 +462,7 @@ pub const Evaluator = struct {
     /// 用于需要上下文（类型名、方法名、数量等）的专业报错。
     fn gluePanicFmt(self: *Evaluator, comptime fmt: []const u8, args: anytype, fallback: []const u8) EvalResult!Value {
         self.panic_message = std.fmt.allocPrint(self.allocator, fmt, args) catch fallback;
+        if (self.panic_location == null) self.panic_location = self.current_loc;
         return error.GluePanic;
     }
 
@@ -464,6 +475,7 @@ pub const Evaluator = struct {
     /// 那里不能返回 GluePanic）。main.zig 在打印时优先使用 panic_message。
     fn setErrMsg(self: *Evaluator, comptime fmt: []const u8, args: anytype, fallback: []const u8) void {
         self.panic_message = std.fmt.allocPrint(self.allocator, fmt, args) catch fallback;
+        if (self.panic_location == null) self.panic_location = self.current_loc;
     }
 
     // ── Shadow Stack 根集追踪（方案 B）──
@@ -1877,9 +1889,11 @@ pub const Evaluator = struct {
                                     .type_name = try self.allocator.dupe(u8, td.name),
                                     .constructor_name = try self.allocator.dupe(u8, con.name),
                                     .field_names = try self.allocator.alloc(?[]const u8, con.fields.len),
+                                    .field_types = try self.allocator.alloc(?[]const u8, con.fields.len),
                                 };
                                 for (con.fields, 0..) |field, i| {
                                     ctx.field_names[i] = if (field.name) |n| try self.allocator.dupe(u8, n) else null;
+                                    ctx.field_types[i] = try self.builtinFieldTypeName(field.ty);
                                 }
                                 try self.adt_constructor_contexts.append(self.allocator, ctx);
                                 // 构造器始终私有（文档 4.4.1: ADT 构造器私有）
@@ -1896,9 +1910,11 @@ pub const Evaluator = struct {
                                             const av = try ev.allocator.create(value.AdtValue);
                                             const fields = try ev.allocator.alloc(value.AdtField, args.len);
                                             for (args, 0..) |arg, i| {
+                                                // 把实参强制转换到声明的字段类型（如 i32），与函数形参一致。
+                                                const coerced = if (data.field_types[i]) |tn| (ev.castValue(arg, tn) catch arg) else arg;
                                                 fields[i] = value.AdtField{
                                                     .name = if (data.field_names[i]) |n| try ev.allocator.dupe(u8, n) else null,
-                                                    .value = arg,
+                                                    .value = coerced,
                                                 };
                                             }
                                             av.* = value.AdtValue{
@@ -1922,9 +1938,11 @@ pub const Evaluator = struct {
                         ctx.* = .{
                             .type_name = try self.allocator.dupe(u8, td.name),
                             .field_names = try self.allocator.alloc([]const u8, rec_def.fields.len),
+                            .field_types = try self.allocator.alloc(?[]const u8, rec_def.fields.len),
                         };
                         for (rec_def.fields, 0..) |field, i| {
                             ctx.field_names[i] = try self.allocator.dupe(u8, field.name);
+                            ctx.field_types[i] = try self.builtinFieldTypeName(field.ty);
                         }
                         try self.record_constructor_contexts.append(self.allocator, ctx);
                         try environment.defineWithVisibility(td.name, Value{ .builtin = value.Builtin{
@@ -1940,7 +1958,8 @@ pub const Evaluator = struct {
                                     var map = std.StringHashMap(Value).init(ev.allocator);
                                     for (args, 0..) |arg, i| {
                                         const key = try ev.allocator.dupe(u8, data.field_names[i]);
-                                        try map.put(key, arg);
+                                        const coerced = if (data.field_types[i]) |tn| (ev.castValue(arg, tn) catch arg) else arg;
+                                        try map.put(key, coerced);
                                     }
                                     return Value{ .record = .{ .type_name = try ev.allocator.dupe(u8, data.type_name), .fields = map } };
                                 }
@@ -2337,6 +2356,9 @@ pub const Evaluator = struct {
     // ============================================================
 
     pub fn evalExpr(self: *Evaluator, expr: *const ast.Expr, environment: *Environment) EvalResult!Value {
+        // 记录当前表达式位置（覆盖式）。panic 发生时，最近一次更新即最内层正在求值的
+        // 表达式，用于运行时错误报告行列。
+        self.current_loc = ast.exprLocation(expr);
         // 只有以下表达式类型可以传递尾位置：
         // - .call: 尾位置的函数调用可以 TCO
         // - .if_expr: 分支在尾位置时保持
@@ -3487,7 +3509,9 @@ pub const Evaluator = struct {
                 }
                 return self.callFunction(impl_fn, args, environment);
             }
-            return error.UnsupportedOperation;
+            // 成员不在 vtable 中：要么不存在，要么是模块的非 pub（私有）符号。
+            const owner = if (tv.trait_name.len > 0) tv.trait_name else "module";
+            return self.gluePanicFmt("'{s}' is not an accessible member of '{s}' (it may be private or undefined)", .{ method, owner }, "inaccessible member");
         }
 
         // 内建方法
@@ -3746,7 +3770,14 @@ pub const Evaluator = struct {
                 if (entry.type_name.len == 0) {
                     // 未指定类型，按方法名匹配（向后兼容）
                 } else if (obj_type_name) |otn| {
-                    if (!std.mem.eql(u8, entry.type_name, otn)) {
+                    // 精确匹配；或整数/浮点宽度互通匹配。
+                    // 因字面量按「最小类型」推断（5 是 i8），而用户惯常写 impl T<i32>，
+                    // 故对数值接收者放宽：任意整数类型可匹配任意整数 impl，浮点同理。
+                    // 这与求值器算术的宽度提升一致，避免 `5.method()` 因 i8≠i32 找不到 impl。
+                    if (!std.mem.eql(u8, entry.type_name, otn) and
+                        !(isNumericTypeName(otn) and isNumericTypeName(entry.type_name) and
+                        numericKindMatches(otn, entry.type_name)))
+                    {
                         // 接收者类型不匹配，跳过此 impl
                         continue;
                     }
@@ -3778,7 +3809,8 @@ pub const Evaluator = struct {
                     if (obj_type_name) |otn| {
                         for (self.impl_methods.items) |impl_entry| {
                             if (std.mem.eql(u8, impl_entry.trait_name, trait_name) and
-                                (impl_entry.type_name.len == 0 or std.mem.eql(u8, impl_entry.type_name, otn)))
+                                (impl_entry.type_name.len == 0 or std.mem.eql(u8, impl_entry.type_name, otn) or
+                                (isNumericTypeName(otn) and isNumericTypeName(impl_entry.type_name) and numericKindMatches(otn, impl_entry.type_name))))
                             {
                                 has_matching_impl = true;
                                 break;
@@ -4403,6 +4435,18 @@ pub const Evaluator = struct {
         return self.castValue(val, type_name);
     }
 
+    /// 若字段/形参的类型注解是内建类型（i32/f64/bool/str 等），返回其名字（dup 到 allocator），
+    /// 否则返回 null。用于构造器把实参强制转换到声明类型。
+    fn builtinFieldTypeName(self: *Evaluator, ty: *const ast.TypeNode) !?[]const u8 {
+        switch (ty.*) {
+            .named => |n| {
+                if (isBuiltinType(n.name)) return try self.allocator.dupe(u8, n.name);
+                return null;
+            },
+            else => return null,
+        }
+    }
+
     fn castValue(self: *Evaluator, val: Value, type_name: []const u8) EvalResult!Value {
         if (std.mem.eql(u8, type_name, "str")) {
             return self.valueToString(val);
@@ -4875,21 +4919,31 @@ pub const Evaluator = struct {
                         switch (fa.object.*) {
                             .identifier => |id| {
                                 if (environment.getPtr(id.name)) |variable| {
+                                    if (!variable.*.is_mutable) {
+                                        self.setErrMsg("cannot assign to field '{s}' of immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{ fa.field, id.name }, "cannot assign to field of immutable binding");
+                                        return error.ImmutableAssignment;
+                                    }
                                     if (variable.*.value == .record) {
                                         const map = &variable.*.value.record.fields;
                                         if (map.getPtr(fa.field)) |existing| {
                                             existing.* = val;
                                         } else {
-                                            return error.UndefinedVariable;
+                                            self.setErrMsg("no field '{s}' on type 'record'", .{fa.field}, "no such field");
+                                            return error.GluePanic;
                                         }
                                     } else {
-                                        return error.TypeMismatch;
+                                        self.setErrMsg("cannot assign field '{s}' on type '{s}'", .{ fa.field, typeNameOf(variable.*.value) }, "cannot assign field");
+                                        return error.GluePanic;
                                     }
                                 } else {
+                                    self.setErrMsg("undefined variable '{s}'", .{id.name}, "undefined variable");
                                     return error.UndefinedVariable;
                                 }
                             },
-                            else => return error.TypeMismatch,
+                            else => {
+                                self.panic_message = "invalid field assignment target";
+                                return error.GluePanic;
+                            },
                         }
                     },
                     .index => |idx| {
@@ -4920,17 +4974,25 @@ pub const Evaluator = struct {
                 switch (fa.object.*) {
                     .identifier => |id| {
                         if (environment.getPtr(id.name)) |variable| {
+                            // 不可变绑定（val / 普通参数）不允许改字段。
+                            if (!variable.*.is_mutable) {
+                                self.setErrMsg("cannot assign to field '{s}' of immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{ fa.field, id.name }, "cannot assign to field of immutable binding");
+                                return error.ImmutableAssignment;
+                            }
                             if (variable.*.value == .record) {
                                 const map = &variable.*.value.record.fields;
                                 if (map.getPtr(fa.field)) |existing| {
                                     existing.* = val;
                                 } else {
-                                    return error.UndefinedVariable;
+                                    self.setErrMsg("no field '{s}' on type 'record'", .{fa.field}, "no such field");
+                                    return error.GluePanic;
                                 }
                             } else {
-                                return error.TypeMismatch;
+                                self.setErrMsg("cannot assign field '{s}' on type '{s}'", .{ fa.field, typeNameOf(variable.*.value) }, "cannot assign field");
+                                return error.GluePanic;
                             }
                         } else {
+                            self.setErrMsg("undefined variable '{s}'", .{id.name}, "undefined variable");
                             return error.UndefinedVariable;
                         }
                     },
@@ -5390,6 +5452,26 @@ fn parseFloat(comptime T: type, raw: []const u8) !T {
     }
 
     return std.fmt.parseFloat(T, raw[0..end]) catch error.TypeMismatch;
+}
+
+/// 判断类型名是否为数值类型（整数或浮点）。用于 impl 方法分派的宽度互通匹配。
+fn isNumericTypeName(name: []const u8) bool {
+    const nums = [_][]const u8{
+        "i8", "i16", "i32", "i64", "i128",
+        "u8", "u16", "u32", "u64", "u128",
+        "f16", "f32", "f64", "f128",
+    };
+    for (nums) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
+/// 两个数值类型名是否同属一类（都整数或都浮点）——整数 impl 不应匹配浮点接收者。
+fn numericKindMatches(a: []const u8, b: []const u8) bool {
+    const a_float = a.len > 0 and a[0] == 'f';
+    const b_float = b.len > 0 and b[0] == 'f';
+    return a_float == b_float;
 }
 
 fn isBuiltinType(name: []const u8) bool {

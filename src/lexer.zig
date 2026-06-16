@@ -1086,7 +1086,17 @@ pub const Lexer = struct {
                     var brace_depth: u32 = 1;
                     while (self.position < self.source.len and brace_depth > 0) {
                         const inner = self.source[self.position];
-                        if (inner == '{') {
+                        if (inner == '\\') {
+                            // 转义序列（如外层字符串里的 \" \\ ）：跳过反斜杠和其后一个字符，
+                            // 避免把 \" 误当成插值表达式里的嵌套字符串起始。
+                            self.position += 1;
+                            self.column += 1;
+                            if (self.position < self.source.len) {
+                                self.position += 1;
+                                self.column += 1;
+                            }
+                            continue;
+                        } else if (inner == '{') {
                             brace_depth += 1;
                         } else if (inner == '}') {
                             brace_depth -= 1;

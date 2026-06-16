@@ -730,19 +730,45 @@ pub const Value = union(enum) {
                 return Value{ .partial = new_pa };
             },
             .adt => |av| {
-                const new_av = try allocator.create(AdtValue);
-                new_av.* = AdtValue{
-                    .type_name = try allocator.dupe(u8, av.type_name),
-                    .constructor = try allocator.dupe(u8, av.constructor),
-                    .fields = try allocator.alloc(AdtField, av.fields.len),
-                };
-                for (av.fields, 0..) |f, i| {
-                    new_av.fields[i] = AdtField{
-                        .name = if (f.name) |n| try allocator.dupe(u8, n) else null,
-                        .value = try f.value.clone(allocator),
+                // 链表式 ADT（如 Cons(x, Cons(x, ...))）若按字段递归 clone，会在原生栈上
+                // 递归到与列表等深，深列表(>~1500)直接爆栈。这里对「单 ADT 尾字段」构成的
+                // 脊柱做迭代 clone：每个节点的非脊柱字段照常递归 clone，脊柱字段用循环展开，
+                // 使常见的 cons-list clone 只占常数原生栈。分叉结构(树)仍走递归。
+                const head = try allocator.create(AdtValue);
+                var cur_src = av;
+                var cur_dst = head;
+                while (true) {
+                    cur_dst.* = AdtValue{
+                        .type_name = try allocator.dupe(u8, cur_src.type_name),
+                        .constructor = try allocator.dupe(u8, cur_src.constructor),
+                        .fields = try allocator.alloc(AdtField, cur_src.fields.len),
                     };
+                    // 找脊柱字段：最后一个 ADT 类型的字段作为迭代延续，其余递归 clone。
+                    var spine_idx: ?usize = null;
+                    if (cur_src.fields.len > 0) {
+                        const last = cur_src.fields.len - 1;
+                        if (cur_src.fields[last].value == .adt) spine_idx = last;
+                    }
+                    for (cur_src.fields, 0..) |f, i| {
+                        if (spine_idx != null and i == spine_idx.?) continue; // 脊柱字段稍后链接
+                        cur_dst.fields[i] = AdtField{
+                            .name = if (f.name) |n| try allocator.dupe(u8, n) else null,
+                            .value = try f.value.clone(allocator),
+                        };
+                    }
+                    if (spine_idx) |si| {
+                        const child = try allocator.create(AdtValue);
+                        cur_dst.fields[si] = AdtField{
+                            .name = if (cur_src.fields[si].name) |n| try allocator.dupe(u8, n) else null,
+                            .value = Value{ .adt = child },
+                        };
+                        cur_src = cur_src.fields[si].value.adt;
+                        cur_dst = child;
+                    } else {
+                        break;
+                    }
                 }
-                return Value{ .adt = new_av };
+                return Value{ .adt = head };
             },
             .newtype => |nv| {
                 const new_nv = try allocator.create(NewtypeValue);

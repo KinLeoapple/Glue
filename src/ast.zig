@@ -975,3 +975,48 @@ pub const Module = struct {
     /// 模块中的顶层声明
     declarations: []Decl,
 };
+
+// ============================================================
+// 工具函数
+// ============================================================
+
+/// 取任意表达式的源位置（行列）。供求值器在运行时错误中报告位置。
+pub fn exprLocation(expr: *const Expr) SourceLocation {
+    return switch (expr.*) {
+        .int_literal => |e| e.location,
+        .float_literal => |e| e.location,
+        .bool_literal => |e| e.location,
+        .char_literal => |e| e.location,
+        .string_literal => |e| e.location,
+        .string_interpolation => |e| e.location,
+        .null_literal => |l| l,
+        .unit_literal => |l| l,
+        .identifier => |e| e.location,
+        .assignment_expr => |e| e.location,
+        .binary => |e| e.location,
+        .unary => |e| e.location,
+        .call => |e| e.location,
+        .method_call => |e| e.location,
+        .field_access => |e| e.location,
+        .safe_access => |e| e.location,
+        .safe_method_call => |e| e.location,
+        .non_null_assert => |e| e.location,
+        .propagate => |e| e.location,
+        .index => |e| e.location,
+        .array_literal => |e| e.location,
+        .record_literal => |e| e.location,
+        .record_extend => |e| e.location,
+        .lambda => |e| e.location,
+        .if_expr => |e| e.location,
+        .block => |e| e.location,
+        .match => |e| e.location,
+        .type_cast => |e| e.location,
+        .spawn => |e| e.location,
+        .atomic_expr => |e| e.location,
+        .lazy => |e| e.location,
+        .select => |e| e.location,
+        .monad_comprehension => |e| e.location,
+        .inline_trait_value => |e| e.location,
+        .compound_assign => |e| e.location,
+    };
+}

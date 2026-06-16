@@ -26,6 +26,15 @@ fn runtimeErrorMessage(err: anyerror, panic_message: ?[]const u8) []const u8 {
     };
 }
 
+/// 打印一条运行时诊断，带可选行列。有位置则 `file:line:col: label: msg`，否则 `file: label: msg`。
+fn printRuntimeDiag(iface: anytype, filename: []const u8, loc: ?ast.SourceLocation, label: []const u8, msg: []const u8) void {
+    if (loc) |l| {
+        iface.print("{s}:{d}:{d}: {s}: {s}\n", .{ filename, l.line, l.column, label, msg }) catch {};
+    } else {
+        iface.print("{s}: {s}: {s}\n", .{ filename, label, msg }) catch {};
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     // Windows 控制台默认使用 GBK 编码，需设置为 UTF-8 以正确输出非 ASCII 字符
     if (builtin.os.tag == .windows) {
@@ -79,14 +88,14 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
                 const msg = ev.panic_message orelse "unknown error";
-                stderr_writer.interface.print("{s}: runtime panic: {s}\n", .{ filename, msg }) catch {};
+                printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime panic", msg);
                 stderr_writer.flush() catch {};
                 ev.panic_message = null;
             },
             else => {
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, runtimeErrorMessage(err, ev.panic_message) }) catch {};
+                printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
                 stderr_writer.flush() catch {};
             },
         };
@@ -196,7 +205,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
                 const msg = ev.panic_message orelse "unknown panic";
-                stderr_writer.interface.print("{s}: panic: {s}\n", .{ filename, msg }) catch {};
+                printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "panic", msg);
                 stderr_writer.flush() catch {};
                 ev.panic_message = null;
                 return true;
@@ -204,7 +213,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             else => {
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, runtimeErrorMessage(err, ev.panic_message) }) catch {};
+                printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
                 stderr_writer.flush() catch {};
                 return true;
             },
@@ -234,7 +243,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
             const msg = ev.panic_message orelse "unknown error";
-            stderr_writer.interface.print("{s}: runtime panic: {s}\n", .{ filename, msg }) catch {};
+            printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime panic", msg);
             stderr_writer.flush() catch {};
             ev.panic_message = null;
             return true;
@@ -256,7 +265,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         else => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, runtimeErrorMessage(err, ev.panic_message) }) catch {};
+            printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
             stderr_writer.flush() catch {};
             return true;
         },

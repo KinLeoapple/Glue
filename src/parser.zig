@@ -1229,6 +1229,28 @@ pub const Parser = struct {
     }
 
     fn parseFunctionType(self: *Parser) ParserError!*ast.TypeNode {
+        // 特例：`()` 开头的函数类型表示零参数（文档把 scanln 记为 `() -> str?`）。
+        // 普通 `(field: T, ...)` 是记录类型，由 parsePrimaryType 处理；这里仅当
+        // 看到紧挨的 `(` `)` `->` 时，才解释为零参数函数类型。
+        if (self.check(.l_paren) and
+            self.current + 2 < self.tokens.len and
+            self.tokens[self.current + 1].type == .r_paren and
+            self.tokens[self.current + 2].type == .minus_gt)
+        {
+            const loc = tokenLoc(self.peek());
+            _ = self.advance(); // (
+            _ = self.advance(); // )
+            _ = self.advance(); // ->
+            const ret = try self.parseType();
+            return self.allocType(ast.TypeNode{
+                .function = .{
+                    .location = loc,
+                    .params = &[_]*ast.TypeNode{},
+                    .return_type = ret,
+                },
+            });
+        }
+
         const left = try self.parseNullableType();
         if (self.matchToken(.minus_gt)) {
             var params = std.ArrayList(*ast.TypeNode).empty;
@@ -2423,7 +2445,23 @@ pub const Parser = struct {
         }
 
         _ = self.expect(.eq_gt, "expected '=>'") catch {};
-        const body = try self.parseExpr();
+        // match 分支体通常是表达式，但 throw/return/break/continue 是语句。
+        // 允许它们作为裸分支体（如 `Nil => throw Err(...)`），包装成单语句块表达式。
+        const body = if (self.check(.kw_throw) or self.check(.kw_return) or
+            self.check(.kw_break) or self.check(.kw_continue))
+        blk: {
+            const stmt_tok = self.peek();
+            const stmt = try self.parseStmt();
+            var stmts = std.ArrayList(*ast.Stmt).empty;
+            try stmts.append(self.allocator, stmt);
+            break :blk try self.allocExpr(ast.Expr{
+                .block = .{
+                    .location = tokenLoc(stmt_tok),
+                    .statements = try stmts.toOwnedSlice(self.allocator),
+                    .trailing_expr = null,
+                },
+            });
+        } else try self.parseExpr();
 
         return ast.MatchArm{
             .pattern = pattern,
@@ -3525,43 +3563,7 @@ fn getTypeNodeLocation(ty: *const ast.TypeNode) ast.SourceLocation {
 
 /// 获取表达式的源位置
 fn getExprLocation(expr: *const ast.Expr) ast.SourceLocation {
-    return switch (expr.*) {
-        .int_literal => |e| e.location,
-        .float_literal => |e| e.location,
-        .bool_literal => |e| e.location,
-        .char_literal => |e| e.location,
-        .string_literal => |e| e.location,
-        .string_interpolation => |e| e.location,
-        .null_literal => |l| l,
-        .unit_literal => |l| l,
-        .identifier => |e| e.location,
-        .assignment_expr => |e| e.location,
-        .binary => |e| e.location,
-        .unary => |e| e.location,
-        .call => |e| e.location,
-        .method_call => |e| e.location,
-        .field_access => |e| e.location,
-        .safe_access => |e| e.location,
-        .safe_method_call => |e| e.location,
-        .non_null_assert => |e| e.location,
-        .propagate => |e| e.location,
-        .index => |e| e.location,
-        .array_literal => |e| e.location,
-        .record_literal => |e| e.location,
-        .record_extend => |e| e.location,
-        .lambda => |e| e.location,
-        .if_expr => |e| e.location,
-        .block => |e| e.location,
-        .match => |e| e.location,
-        .type_cast => |e| e.location,
-        .spawn => |e| e.location,
-        .atomic_expr => |e| e.location,
-        .lazy => |e| e.location,
-        .select => |e| e.location,
-        .monad_comprehension => |e| e.location,
-        .inline_trait_value => |e| e.location,
-        .compound_assign => |e| e.location,
-    };
+    return ast.exprLocation(expr);
 }
 
 /// 判断标识符是否为内建类型名（用于类型转换判断）
