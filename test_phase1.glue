@@ -1051,9 +1051,9 @@ println(dyn_arr.len())
 println(dyn_arr.contains(2))
 println(dyn_arr.contains(99))
 
-// isEmpty
-println(dyn_arr.isEmpty())
-println([].isEmpty())
+// is_empty
+println(dyn_arr.is_empty())
+println([].is_empty())
 
 // first / last
 println(dyn_arr.first())
@@ -1680,12 +1680,12 @@ println(s2.len())
 println(s2[0])
 
 // ============================================================
-// 103. 动态数组 — contains 和 isEmpty
+// 103. 动态数组 — contains 和 is_empty
 // ============================================================
 val check_arr = [1, 2, 3, 4, 5]
 println(check_arr.contains(3))
 println(check_arr.contains(99))
-println(check_arr.isEmpty())
+println(check_arr.is_empty())
 
 // ============================================================
 // 104. Nullable — match 中 null 模式
@@ -1806,7 +1806,7 @@ println(utf8_str.len())
 var da = [10, 20, 30, 40, 50]
 println(da.contains(30))
 println(da.contains(99))
-println(da.isEmpty())
+println(da.is_empty())
 println(da.first() ?? -1)
 println(da.last() ?? -1)
 
@@ -1858,7 +1858,7 @@ println(top_full.m?.d?.v ?? -1)
 // 123. 数组 — 空数组操作
 // ============================================================
 val empty: i32[] = []
-println(empty.isEmpty())
+println(empty.is_empty())
 println(empty.len())
 println(empty.first())
 println(empty.last())

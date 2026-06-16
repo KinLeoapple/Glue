@@ -112,6 +112,11 @@ const StdinState = struct {
     reader: std.Io.File.Reader,
 };
 
+/// 函数调用嵌套深度上限。树遍历求值器每个 Glue 调用会在宿主栈上嵌套若干
+/// callFunction/evalExpr 帧；实测原生栈约在 360 个 callFunction 帧附近溢出，
+/// 故取保守值留出余量。超限抛 Glue panic 而非崩溃。深循环用尾递归（TCO 不增长栈）。
+const max_call_depth: u32 = 200;
+
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     global_env: Environment,
@@ -136,6 +141,10 @@ pub const Evaluator = struct {
     tail_call: ?TailCall = null,
     /// TCO: 当前是否在尾位置（用于检测尾调用）
     in_tail_position: bool = false,
+    /// 当前函数调用嵌套深度。树遍历求值器在宿主栈上递归，非尾递归过深会
+    /// 撑爆原生栈并以无信息的 Zig panic 崩溃。用此计数器在接近极限前抛出
+    /// 干净的 Glue panic（"stack overflow: recursion too deep"）。
+    call_depth: u32 = 0,
     /// 自定义错误类型上下文列表
     error_newtype_contexts: std.ArrayList(*ErrorNewtypeCtx),
     /// ADT 构造器上下文列表
@@ -437,6 +446,24 @@ pub const Evaluator = struct {
     fn gluePanic(self: *Evaluator, message: []const u8) EvalResult!Value {
         self.panic_message = message;
         return error.GluePanic;
+    }
+
+    /// 带格式化消息的 panic：用 self.allocator 拼接消息；分配失败回退到 fallback。
+    /// 用于需要上下文（类型名、方法名、数量等）的专业报错。
+    fn gluePanicFmt(self: *Evaluator, comptime fmt: []const u8, args: anytype, fallback: []const u8) EvalResult!Value {
+        self.panic_message = std.fmt.allocPrint(self.allocator, fmt, args) catch fallback;
+        return error.GluePanic;
+    }
+
+    /// 取运行时值的用户可见类型名；函数类（闭包/内建/部分应用）回退为 "function"。
+    fn typeNameOf(val: Value) []const u8 {
+        return valueTypeName(val) orelse "function";
+    }
+
+    /// 设置专业报错消息但返回调用方指定的具名错误（用于 EvalError 上下文，
+    /// 那里不能返回 GluePanic）。main.zig 在打印时优先使用 panic_message。
+    fn setErrMsg(self: *Evaluator, comptime fmt: []const u8, args: anytype, fallback: []const u8) void {
+        self.panic_message = std.fmt.allocPrint(self.allocator, fmt, args) catch fallback;
     }
 
     // ── Shadow Stack 根集追踪（方案 B）──
@@ -1215,7 +1242,10 @@ pub const Evaluator = struct {
     // ============================================================
 
     fn builtinPrintln(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("println expects 1 argument, got {d}", .{args.len}, "println: wrong number of arguments");
+            return error.WrongArity;
+        }
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
@@ -1232,7 +1262,10 @@ pub const Evaluator = struct {
     }
 
     fn builtinPrint(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("print expects 1 argument, got {d}", .{args.len}, "print: wrong number of arguments");
+            return error.WrongArity;
+        }
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
@@ -1248,7 +1281,10 @@ pub const Evaluator = struct {
     }
 
     fn builtinEprintln(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("eprintln expects 1 argument, got {d}", .{args.len}, "eprintln: wrong number of arguments");
+            return error.WrongArity;
+        }
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
@@ -1265,7 +1301,10 @@ pub const Evaluator = struct {
     }
 
     fn builtinEprint(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("eprint expects 1 argument, got {d}", .{args.len}, "eprint: wrong number of arguments");
+            return error.WrongArity;
+        }
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
@@ -1281,7 +1320,9 @@ pub const Evaluator = struct {
     }
 
     fn builtinPanic(self: *Evaluator, args: []const Value) EvalResult!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            return self.gluePanicFmt("Panic expects 1 argument, got {d}", .{args.len}, "Panic: wrong number of arguments");
+        }
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator, false) catch {};
@@ -1290,13 +1331,18 @@ pub const Evaluator = struct {
     }
 
     fn builtinEq(self: *Evaluator, args: []const Value) EvalError!Value {
-        _ = self;
-        if (args.len != 2) return error.WrongArity;
+        if (args.len != 2) {
+            self.setErrMsg("eq expects 2 arguments, got {d}", .{args.len}, "eq: wrong number of arguments");
+            return error.WrongArity;
+        }
         return Value{ .boolean = structuralEquals(args[0], args[1]) };
     }
 
     fn builtinString(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("str expects 1 argument, got {d}", .{args.len}, "str: wrong number of arguments");
+            return error.WrongArity;
+        }
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(self.allocator);
         args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
@@ -1307,23 +1353,35 @@ pub const Evaluator = struct {
     /// 基本类型返回具体类型名（如 "i32"、"str"、"bool"）；ADT/newtype 返回其类型名；
     /// 函数值（闭包/内建/部分应用）统一返回 "function"。
     fn builtinTypeName(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("type expects 1 argument, got {d}", .{args.len}, "type: wrong number of arguments");
+            return error.WrongArity;
+        }
         const name = valueTypeName(args[0]) orelse "function";
         return Value{ .string = self.allocator.dupe(u8, name) catch return error.OutOfMemory };
     }
 
     fn builtinError(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("Error expects 1 argument, got {d}", .{args.len}, "Error: wrong number of arguments");
+            return error.WrongArity;
+        }
         const message = switch (args[0]) {
             .string => |s| s,
-            else => return error.TypeMismatch,
+            else => {
+                self.setErrMsg("Error expects a str argument, got '{s}'", .{typeNameOf(args[0])}, "Error: type error");
+                return error.TypeMismatch;
+            },
         };
         return throw_mod.makeErr(self.allocator, "Error", message);
     }
 
     /// Ok(value) — 创建 ThrowValue.ok
     fn builtinOk(self: *Evaluator, args: []const Value) EvalError!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("Ok expects 1 argument, got {d}", .{args.len}, "Ok: wrong number of arguments");
+            return error.WrongArity;
+        }
         return throw_mod.makeOk(self.allocator, args[0]);
     }
 
@@ -1365,7 +1423,10 @@ pub const Evaluator = struct {
 
     /// scanln() — 读取一行（不含 '\n'），EOF 返回 null，IO 错误 panic
     fn builtinScanln(self: *Evaluator, args: []const Value) EvalResult!Value {
-        if (args.len != 0) return error.WrongArity;
+        if (args.len != 0) {
+            self.setErrMsg("scanln expects 0 arguments, got {d}", .{args.len}, "scanln: wrong number of arguments");
+            return error.WrongArity;
+        }
 
         // 如果当前行还有未消费内容，返回剩余部分
         if (self.scan_line_buf.items.len > 0 and self.scan_line_pos < self.scan_line_buf.items.len) {
@@ -1391,7 +1452,10 @@ pub const Evaluator = struct {
 
     /// scan() — 读取一个空白分隔的 token，EOF 返回 null，IO 错误 panic
     fn builtinScan(self: *Evaluator, args: []const Value) EvalResult!Value {
-        if (args.len != 0) return error.WrongArity;
+        if (args.len != 0) {
+            self.setErrMsg("scan expects 0 arguments, got {d}", .{args.len}, "scan: wrong number of arguments");
+            return error.WrongArity;
+        }
 
         while (true) {
             // 尝试从当前行提取 token
@@ -1432,10 +1496,16 @@ pub const Evaluator = struct {
     /// channel(capacity) — 创建 CSP 通道
     /// 文档 §3.5: val ch = channel<i32>(0) 无缓冲，channel<i32>(10) 缓冲区大小 10
     fn builtinChannel(self: *Evaluator, args: []const Value) EvalResult!Value {
-        if (args.len != 1) return error.WrongArity;
+        if (args.len != 1) {
+            self.setErrMsg("channel expects 1 argument, got {d}", .{args.len}, "channel: wrong number of arguments");
+            return error.WrongArity;
+        }
         const cap = switch (args[0]) {
             .integer => |iv| @as(usize, @intCast(if (iv.type_tag.isSigned()) iv.signedValue() else @as(i128, @intCast(iv.value)))),
-            else => return error.TypeMismatch,
+            else => {
+                self.setErrMsg("channel expects an integer capacity, got '{s}'", .{typeNameOf(args[0])}, "channel: type error");
+                return error.TypeMismatch;
+            },
         };
         const ch = try self.allocator.create(value.ChannelValue);
         ch.* = value.ChannelValue.init(self.allocator, cap);
@@ -1818,7 +1888,10 @@ pub const Evaluator = struct {
                                         fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                             const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
                                             const data: *AdtConstructorCtx = @ptrCast(@alignCast(user_ctx orelse return error.TypeMismatch));
-                                            if (args.len != data.field_names.len) return error.WrongArity;
+                                            if (args.len != data.field_names.len) {
+                                                ev.setErrMsg("constructor '{s}' expects {d} argument(s), got {d}", .{ data.constructor_name, data.field_names.len, args.len }, "constructor: wrong number of arguments");
+                                                return error.WrongArity;
+                                            }
 
                                             const av = try ev.allocator.create(value.AdtValue);
                                             const fields = try ev.allocator.alloc(value.AdtField, args.len);
@@ -1859,7 +1932,10 @@ pub const Evaluator = struct {
                                 fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                     const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
                                     const data: *RecordConstructorCtx = @ptrCast(@alignCast(user_ctx orelse return error.TypeMismatch));
-                                    if (args.len != data.field_names.len) return error.WrongArity;
+                                    if (args.len != data.field_names.len) {
+                                        ev.setErrMsg("constructor '{s}' expects {d} field(s), got {d}", .{ data.type_name, data.field_names.len, args.len }, "constructor: wrong number of arguments");
+                                        return error.WrongArity;
+                                    }
 
                                     var map = std.StringHashMap(Value).init(ev.allocator);
                                     for (args, 0..) |arg, i| {
@@ -2475,7 +2551,12 @@ pub const Evaluator = struct {
 
         switch (ae.target.*) {
             .identifier => |id| {
-                try environment.set(id.name, val);
+                environment.set(id.name, val) catch |err| {
+                    if (err == error.ImmutableAssignment) {
+                        self.setErrMsg("cannot assign to immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{id.name}, "cannot assign to immutable binding");
+                    }
+                    return err;
+                };
             },
             .index => |idx| {
                 const object = try self.evalExpr(idx.object, environment);
@@ -2597,9 +2678,14 @@ pub const Evaluator = struct {
         // 赋值新值
         switch (ca.target.*) {
             .identifier => |id| {
-                try environment.set(id.name, result);
+                environment.set(id.name, result) catch |err| {
+                    if (err == error.ImmutableAssignment) {
+                        self.setErrMsg("cannot assign to immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{id.name}, "cannot assign to immutable binding");
+                    }
+                    return err;
+                };
             },
-            else => return error.TypeMismatch,
+            else => return self.gluePanic("invalid assignment target"),
         }
 
         return result;
@@ -2783,7 +2869,7 @@ pub const Evaluator = struct {
             try result.appendSlice(self.allocator, right.string);
             return Value{ .string = try result.toOwnedSlice(self.allocator) };
         }
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '+' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '+'");
     }
 
     fn evalSub(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
@@ -2805,7 +2891,7 @@ pub const Evaluator = struct {
         if (left == .float and right == .integer) {
             return self.checkFloatResult(left.float.value - integerToFloat(right.integer), left.float.type_tag);
         }
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '-' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '-'");
     }
 
     fn evalMul(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
@@ -2827,7 +2913,7 @@ pub const Evaluator = struct {
         if (left == .float and right == .integer) {
             return self.checkFloatResult(left.float.value * integerToFloat(right.integer), left.float.type_tag);
         }
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '*' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '*'");
     }
 
     fn evalDiv(self: *Evaluator, left: Value, right: Value, location: ast.SourceLocation) EvalResult!Value {
@@ -2862,7 +2948,7 @@ pub const Evaluator = struct {
             if (right.integer.value == 0) return self.gluePanic("arithmetic error: division by zero");
             return self.checkFloatResult(left.float.value / integerToFloat(right.integer), left.float.type_tag);
         }
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '/' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '/'");
     }
 
     fn evalMod(self: *Evaluator, left: Value, right: Value, location: ast.SourceLocation) EvalResult!Value {
@@ -2885,11 +2971,10 @@ pub const Evaluator = struct {
             if (right.float.value == 0.0) return self.gluePanic("arithmetic error: division by zero");
             return self.checkFloatResult(@rem(left.float.value, right.float.value), resultFloatTag(left.float, right.float));
         }
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '%' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '%'");
     }
 
     fn evalLt(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
-        _ = self;
         if (left == .integer and right == .integer) {
             if (left.integer.type_tag.isSigned()) {
                 return Value{ .boolean = @as(i128, @bitCast(left.integer.value)) < @as(i128, @bitCast(right.integer.value)) };
@@ -2902,11 +2987,10 @@ pub const Evaluator = struct {
         if (left == .float and right == .integer) return Value{ .boolean = left.float.value < integerToFloat(right.integer) };
         if (left == .char_val and right == .char_val) return Value{ .boolean = left.char_val < right.char_val };
         if (left == .string and right == .string) return Value{ .boolean = std.mem.order(u8, left.string, right.string) == .lt };
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '<' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '<'");
     }
 
     fn evalGt(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
-        _ = self;
         if (left == .integer and right == .integer) {
             if (left.integer.type_tag.isSigned()) {
                 return Value{ .boolean = @as(i128, @bitCast(left.integer.value)) > @as(i128, @bitCast(right.integer.value)) };
@@ -2919,11 +3003,10 @@ pub const Evaluator = struct {
         if (left == .float and right == .integer) return Value{ .boolean = left.float.value > integerToFloat(right.integer) };
         if (left == .char_val and right == .char_val) return Value{ .boolean = left.char_val > right.char_val };
         if (left == .string and right == .string) return Value{ .boolean = std.mem.order(u8, left.string, right.string) == .gt };
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '>' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '>'");
     }
 
     fn evalLtEq(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
-        _ = self;
         if (left == .integer and right == .integer) {
             if (left.integer.type_tag.isSigned()) {
                 return Value{ .boolean = @as(i128, @bitCast(left.integer.value)) <= @as(i128, @bitCast(right.integer.value)) };
@@ -2936,11 +3019,10 @@ pub const Evaluator = struct {
         if (left == .float and right == .integer) return Value{ .boolean = left.float.value <= integerToFloat(right.integer) };
         if (left == .char_val and right == .char_val) return Value{ .boolean = left.char_val <= right.char_val };
         if (left == .string and right == .string) return Value{ .boolean = std.mem.order(u8, left.string, right.string) != .gt };
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '<=' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '<='");
     }
 
     fn evalGtEq(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
-        _ = self;
         if (left == .integer and right == .integer) {
             if (left.integer.type_tag.isSigned()) {
                 return Value{ .boolean = @as(i128, @bitCast(left.integer.value)) >= @as(i128, @bitCast(right.integer.value)) };
@@ -2953,17 +3035,17 @@ pub const Evaluator = struct {
         if (left == .float and right == .integer) return Value{ .boolean = left.float.value >= integerToFloat(right.integer) };
         if (left == .char_val and right == .char_val) return Value{ .boolean = left.char_val >= right.char_val };
         if (left == .string and right == .string) return Value{ .boolean = std.mem.order(u8, left.string, right.string) != .lt };
-        return error.TypeMismatch;
+        return self.gluePanicFmt("operator '>=' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '>='");
     }
 
     fn evalConcat(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         const left_str = switch (left) {
             .string => |s| s,
-            else => return error.TypeMismatch,
+            else => return self.gluePanicFmt("operator '+' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '+'"),
         };
         const right_str = switch (right) {
             .string => |s| s,
-            else => return error.TypeMismatch,
+            else => return self.gluePanicFmt("operator '+' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '+'"),
         };
         var result = std.ArrayList(u8).empty;
         try result.appendSlice(self.allocator, left_str);
@@ -2975,11 +3057,11 @@ pub const Evaluator = struct {
     fn evalConcatList(self: *Evaluator, left: Value, right: Value) EvalResult!Value {
         const left_arr = switch (left) {
             .array => |a| a,
-            else => return error.TypeMismatch,
+            else => return self.gluePanicFmt("operator '++' requires array operands, got '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '++'"),
         };
         const right_arr = switch (right) {
             .array => |a| a,
-            else => return error.TypeMismatch,
+            else => return self.gluePanicFmt("operator '++' requires array operands, got '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '++'"),
         };
         const new_arr = try self.allocator.alloc(Value, left_arr.elements.len + right_arr.elements.len);
         for (left_arr.elements, 0..) |e, i| {
@@ -3117,6 +3199,15 @@ pub const Evaluator = struct {
     fn callFunction(self: *Evaluator, callee: Value, args: []const Value, environment: ?*Environment) EvalResult!Value {
         _ = environment;
 
+        // 递归深度保护：树遍历求值器在宿主栈上递归，非尾递归过深会撑爆原生栈。
+        // 超过上限时抛出干净的 Glue panic，而不是无信息的 Zig 崩溃。
+        // 深循环应改用尾递归（TCO trampoline 不增长栈）。
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        if (self.call_depth > max_call_depth) {
+            return self.gluePanic("stack overflow: recursion too deep (use tail recursion for deep loops)");
+        }
+
         switch (callee) {
             .partial => |pa| {
                 // 合并已绑定参数和新参数
@@ -3244,7 +3335,7 @@ pub const Evaluator = struct {
                 };
                 return result;
             },
-            else => return error.NotCallable,
+            else => return self.gluePanicFmt("type '{s}' is not callable", .{typeNameOf(callee)}, "value is not callable"),
         }
     }
 
@@ -3426,7 +3517,7 @@ pub const Evaluator = struct {
                     // push: 追加元素，返回新数组
                     // 文档：var 与值语义——支持重新赋值和原地修改
                     // 用法：var arr = [1, 2]; arr = arr.push(3)
-                    if (args.len != 1) return error.WrongArity;
+                    if (args.len != 1) return self.gluePanicFmt("method '{s}' expects 1 argument, got {d}", .{ method, args.len }, "wrong number of arguments");
                     var new_arr = try self.allocator.alloc(Value, arr.elements.len + 1);
                     @memcpy(new_arr[0..arr.elements.len], arr.elements);
                     new_arr[arr.elements.len] = try args[0].clone(self.allocator);
@@ -3451,7 +3542,7 @@ pub const Evaluator = struct {
             return switch (object) {
                 .array => |arr| {
                     // contains: 检查是否包含元素（结构相等）
-                    if (args.len != 1) return error.WrongArity;
+                    if (args.len != 1) return self.gluePanicFmt("method '{s}' expects 1 argument, got {d}", .{ method, args.len }, "wrong number of arguments");
                     for (arr.elements) |item| {
                         if (structuralEquals(item, args[0])) {
                             return Value{ .boolean = true };
@@ -3463,10 +3554,11 @@ pub const Evaluator = struct {
             };
         }
 
-        if (std.mem.eql(u8, method, "isEmpty")) {
+        if (std.mem.eql(u8, method, "is_empty")) {
             return switch (object) {
                 .array => |arr| Value{ .boolean = arr.elements.len == 0 },
-                else => error.TypeMismatch,
+                .string => |s| Value{ .boolean = s.len == 0 },
+                else => self.gluePanicFmt("method 'is_empty' is not available on type '{s}'", .{typeNameOf(object)}, "no such method"),
             };
         }
 
@@ -3501,13 +3593,6 @@ pub const Evaluator = struct {
                 },
                 else => error.TypeMismatch,
             };
-        }
-
-        if (std.mem.eql(u8, method, "toString")) {
-            var buf = std.ArrayList(u8).empty;
-            defer buf.deinit(self.allocator);
-            try object.format(&buf, self.allocator, false);
-            return Value{ .string = try buf.toOwnedSlice(self.allocator) };
         }
 
         // Iterable/Iterator 协议方法
@@ -3721,7 +3806,7 @@ pub const Evaluator = struct {
         if (object == .spawn_val) {
             const handle = object.spawn_val;
             if (std.mem.eql(u8, method, "await")) {
-                if (args.len != 0) return error.WrongArity;
+                if (args.len != 0) return self.gluePanicFmt("method '{s}' expects 0 arguments, got {d}", .{ method, args.len }, "wrong number of arguments");
                 // 文档 §3.7: Spawn<T>.await() 挂起当前协程，让出执行权
                 // Zio Condition.wait() 在协程上下文中挂起当前协程让出执行权
                 handle.mutex.lockUncancelable();
@@ -3740,7 +3825,7 @@ pub const Evaluator = struct {
                 return result orelse Value.unit;
             }
             if (std.mem.eql(u8, method, "cancel")) {
-                if (args.len != 0) return error.WrongArity;
+                if (args.len != 0) return self.gluePanicFmt("method '{s}' expects 0 arguments, got {d}", .{ method, args.len }, "wrong number of arguments");
                 handle.mutex.lockUncancelable();
                 handle.status.store(.Cancelled, .seq_cst);
                 handle.consumed.store(true, .seq_cst);
@@ -3749,13 +3834,13 @@ pub const Evaluator = struct {
                 return Value.unit;
             }
             if (std.mem.eql(u8, method, "status")) {
-                if (args.len != 0) return error.WrongArity;
+                if (args.len != 0) return self.gluePanicFmt("method '{s}' expects 0 arguments, got {d}", .{ method, args.len }, "wrong number of arguments");
                 const s = handle.status.load(.seq_cst);
                 // 返回 SpawnStatus ADT 值
                 return self.makeSpawnStatus(s);
             }
             if (std.mem.eql(u8, method, "result")) {
-                if (args.len != 0) return error.WrongArity;
+                if (args.len != 0) return self.gluePanicFmt("method '{s}' expects 0 arguments, got {d}", .{ method, args.len }, "wrong number of arguments");
                 handle.mutex.lockUncancelable();
                 if (handle.status.load(.seq_cst) == .Completed) {
                     const r = handle.result;
@@ -3772,13 +3857,13 @@ pub const Evaluator = struct {
         if (object == .channel_val) {
             const ch = object.channel_val;
             if (std.mem.eql(u8, method, "send")) {
-                if (args.len != 1) return error.WrongArity;
+                if (args.len != 1) return self.gluePanicFmt("method '{s}' expects 1 argument, got {d}", .{ method, args.len }, "wrong number of arguments");
                 const ok = ch.send(args[0]) catch return error.OutOfMemory;
                 if (!ok) return self.gluePanic("channel: send on closed channel");
                 return Value.unit;
             }
             if (std.mem.eql(u8, method, "recv")) {
-                if (args.len != 0) return error.WrongArity;
+                if (args.len != 0) return self.gluePanicFmt("method '{s}' expects 0 arguments, got {d}", .{ method, args.len }, "wrong number of arguments");
                 const val = ch.recv();
                 return val orelse Value.null_val;
             }
@@ -3792,13 +3877,13 @@ pub const Evaluator = struct {
         if (object == .sender_val) {
             const sv = object.sender_val;
             if (std.mem.eql(u8, method, "send")) {
-                if (args.len != 1) return error.WrongArity;
+                if (args.len != 1) return self.gluePanicFmt("method '{s}' expects 1 argument, got {d}", .{ method, args.len }, "wrong number of arguments");
                 const ok = sv.channel.send(args[0]) catch return error.OutOfMemory;
                 if (!ok) return self.gluePanic("channel: send on closed channel");
                 return Value.unit;
             }
             if (std.mem.eql(u8, method, "close")) {
-                if (args.len != 0) return error.WrongArity;
+                if (args.len != 0) return self.gluePanicFmt("method '{s}' expects 0 arguments, got {d}", .{ method, args.len }, "wrong number of arguments");
                 sv.channel.close();
                 return Value.unit;
             }
@@ -3808,7 +3893,7 @@ pub const Evaluator = struct {
         if (object == .receiver_val) {
             const rv = object.receiver_val;
             if (std.mem.eql(u8, method, "recv")) {
-                if (args.len != 0) return error.WrongArity;
+                if (args.len != 0) return self.gluePanicFmt("method '{s}' expects 0 arguments, got {d}", .{ method, args.len }, "wrong number of arguments");
                 const val = rv.channel.recv();
                 return val orelse Value.null_val;
             }
@@ -3818,20 +3903,20 @@ pub const Evaluator = struct {
         if (object == .atomic_val) {
             const av = object.atomic_val;
             if (std.mem.eql(u8, method, "cas")) {
-                if (args.len != 2) return error.WrongArity;
+                if (args.len != 2) return self.gluePanicFmt("method '{s}' expects 2 arguments, got {d}", .{ method, args.len }, "wrong number of arguments");
                 const expected: i128 = @bitCast(try args[0].asInteger());
                 const new_val: i128 = @bitCast(try args[1].asInteger());
                 return Value{ .boolean = av.cas(expected, new_val) };
             }
             if (std.mem.eql(u8, method, "swap")) {
-                if (args.len != 1) return error.WrongArity;
+                if (args.len != 1) return self.gluePanicFmt("method '{s}' expects 1 argument, got {d}", .{ method, args.len }, "wrong number of arguments");
                 const new_val: i128 = @bitCast(try args[0].asInteger());
                 const old_raw = av.xchg(new_val);
                 return Value{ .integer = IntValue{ .value = @bitCast(old_raw), .type_tag = value.atomicTypeToIntType(av.type_tag) } };
             }
         }
 
-        return error.UndefinedVariable;
+        return self.gluePanicFmt("no method '{s}' on type '{s}'", .{ method, typeNameOf(object) }, "no such method");
     }
 
     fn evalFieldAccess(self: *Evaluator, fa: @TypeOf(@as(ast.Expr, undefined).field_access), environment: *Environment) EvalResult!Value {
@@ -3845,7 +3930,7 @@ pub const Evaluator = struct {
                 if (rec.fields.get(field)) |val| {
                     return val;
                 }
-                return error.UndefinedVariable;
+                return self.gluePanicFmt("no field '{s}' on type 'record'", .{field}, "no such field");
             },
             .adt => |av| {
                 // ADT 命名字段访问：circle.radius
@@ -3856,7 +3941,7 @@ pub const Evaluator = struct {
                         }
                     }
                 }
-                return error.UndefinedVariable;
+                return self.gluePanicFmt("no field '{s}' on type '{s}'", .{ field, av.type_name }, "no such field");
             },
             .trait_value => |tv| {
                 // 文档 §4.6.2: 模块值/Trait 值的成员访问——限定名 `Store.Memory`、
@@ -3864,7 +3949,7 @@ pub const Evaluator = struct {
                 if (tv.methods.get(field)) |member| {
                     return member;
                 }
-                return error.UndefinedVariable;
+                return self.gluePanicFmt("no member '{s}' on trait value '{s}'", .{ field, if (tv.trait_name.len > 0) tv.trait_name else "trait" }, "no such member");
             },
             .error_val => |e| {
                 // 文档 2.4.1: Error 有 message 字段
@@ -3873,7 +3958,7 @@ pub const Evaluator = struct {
                 if (std.mem.eql(u8, field, "message")) {
                     return Value{ .string = try self.allocator.dupe(u8, e.message) };
                 }
-                return error.UndefinedVariable;
+                return self.gluePanicFmt("no field '{s}' on type 'Error' (only 'message' is available)", .{field}, "no such field");
             },
             .throw_val => |tv| {
                 // 文档 2.4.7: Error(e) => println("error: " + e.message)
@@ -3886,9 +3971,9 @@ pub const Evaluator = struct {
                     },
                     .ok => {},
                 }
-                return error.UndefinedVariable;
+                return self.gluePanicFmt("no field '{s}' on type 'Throw'", .{field}, "no such field");
             },
-            else => return error.TypeMismatch,
+            else => return self.gluePanicFmt("cannot access field '{s}' on type '{s}'", .{ field, typeNameOf(object) }, "cannot access field"),
             // Channel 方向类型字段访问
             .channel_val => |cv| {
                 if (std.mem.eql(u8, field, "sender")) {
@@ -3903,7 +3988,7 @@ pub const Evaluator = struct {
                     cv.ref();
                     return Value{ .receiver_val = rv };
                 }
-                return error.UndefinedVariable;
+                return self.gluePanicFmt("no field '{s}' on type 'Channel' (only 'sender' and 'receiver' are available)", .{field}, "no such field");
             },
         }
     }
@@ -3967,23 +4052,23 @@ pub const Evaluator = struct {
             .array => |arr| {
                 const i_val = switch (index_val) {
                     .integer => |iv| iv,
-                    else => return error.TypeMismatch,
+                    else => return self.gluePanicFmt("array index must be an integer, got '{s}'", .{typeNameOf(index_val)}, "type error: non-integer array index"),
                 };
                 const i: i128 = if (i_val.type_tag.isSigned()) i_val.signedValue() else @intCast(i_val.value);
                 if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
-                    return error.IndexOutOfBounds;
+                    return self.gluePanicFmt("index {d} out of bounds for length {d}", .{ i, arr.elements.len }, "index out of bounds");
                 }
                 return arr.elements[@as(usize, @intCast(i))];
             },
             .string => |s| {
                 const i_val = switch (index_val) {
                     .integer => |iv| iv,
-                    else => return error.TypeMismatch,
+                    else => return self.gluePanicFmt("string index must be an integer, got '{s}'", .{typeNameOf(index_val)}, "type error: non-integer string index"),
                 };
                 const i: i128 = if (i_val.type_tag.isSigned()) i_val.signedValue() else @intCast(i_val.value);
-                if (i < 0) return error.IndexOutOfBounds;
+                if (i < 0) return self.gluePanicFmt("index {d} out of bounds", .{i}, "index out of bounds");
                 // 文档 §2.2: 索引为 O(n) 操作，按字符位置索引，返回 Unicode 标量值
-                const view = std.unicode.Utf8View.init(s) catch return error.IndexOutOfBounds;
+                const view = std.unicode.Utf8View.init(s) catch return self.gluePanic("invalid UTF-8 string");
                 var iter = view.iterator();
                 var char_idx: i128 = 0;
                 while (iter.nextCodepoint()) |cp| {
@@ -3992,9 +4077,9 @@ pub const Evaluator = struct {
                     }
                     char_idx += 1;
                 }
-                return error.IndexOutOfBounds;
+                return self.gluePanicFmt("index {d} out of bounds for length {d}", .{ i, char_idx }, "index out of bounds");
             },
-            else => return error.TypeMismatch,
+            else => return self.gluePanicFmt("cannot index into type '{s}'", .{typeNameOf(object)}, "type error: not indexable"),
         }
     }
 
@@ -4499,6 +4584,20 @@ pub const Evaluator = struct {
     /// 文档 §3.7: 在 Zio 协程中创建独立 Evaluator + ArenaAllocator 执行 spawn body
     /// 实现 Per-heap GC 隔离和 Panic 协程隔离
     /// 使用 Zio Mutex/Condition — 在协程上下文中挂起当前协程让出执行权
+    /// 把协程内未携带 panic_message 的错误映射为专业说明（供 SpawnHandle 存储）。
+    fn spawnErrorMessage(err: anyerror) []const u8 {
+        return switch (err) {
+            error.ImmutableAssignment => "cannot assign to immutable binding inside spawned task",
+            error.TypeMismatch => "type error in spawned task",
+            error.UndefinedVariable => "undefined name in spawned task",
+            error.WrongArity => "wrong number of arguments in spawned task",
+            error.NotCallable => "value is not callable in spawned task",
+            error.IndexOutOfBounds => "index out of bounds in spawned task",
+            error.OutOfMemory => "out of memory in spawned task",
+            else => "spawned task failed",
+        };
+    }
+
     fn spawnCoroutineFunc(ctx: *Evaluator.SpawnContext) void {
         const handle = ctx.handle;
         // worker 退出前最后置位 finished，通知 deinit 可安全释放 handle
@@ -4527,16 +4626,16 @@ pub const Evaluator = struct {
         // 执行 spawn body
         const result = ev.evalExpr(body, env_ptr) catch |err| {
             handle.mutex.lockUncancelable();
-            if (err == error.GluePanic) {
-                // 文档 §3.6: Panic 协程隔离
-                // 子协程 panic 被捕获存入 SpawnHandle，不影响父协程
-                if (ev.panic_message) |msg| {
-                    handle.panic_message = backing_allocator.dupe(u8, msg) catch null;
-                }
-                handle.status.store(.Failed, .seq_cst);
+            // 文档 §3.6: Panic 协程隔离 — 子协程的错误被捕获存入 SpawnHandle，
+            // await 时传播给父协程。优先用已设的 panic_message；否则按错误类型给出
+            // 专业说明，避免出现无信息的 "coroutine failed"。
+            if (ev.panic_message) |msg| {
+                handle.panic_message = backing_allocator.dupe(u8, msg) catch null;
             } else {
-                handle.status.store(.Failed, .seq_cst);
+                const detail = spawnErrorMessage(err);
+                handle.panic_message = backing_allocator.dupe(u8, detail) catch null;
             }
+            handle.status.store(.Failed, .seq_cst);
             handle.condition.broadcast();
             handle.mutex.unlock();
             return;
@@ -4580,14 +4679,12 @@ pub const Evaluator = struct {
         // 执行 spawn body
         const result = ev.evalExpr(body, env_ptr) catch |err| {
             handle.mutex.lockUncancelable();
-            if (err == error.GluePanic) {
-                if (ev.panic_message) |msg| {
-                    handle.panic_message = backing_allocator.dupe(u8, msg) catch null;
-                }
-                handle.status.store(.Failed, .seq_cst);
+            if (ev.panic_message) |msg| {
+                handle.panic_message = backing_allocator.dupe(u8, msg) catch null;
             } else {
-                handle.status.store(.Failed, .seq_cst);
+                handle.panic_message = backing_allocator.dupe(u8, spawnErrorMessage(err)) catch null;
             }
+            handle.status.store(.Failed, .seq_cst);
             handle.condition.broadcast();
             handle.mutex.unlock();
             return;
@@ -4766,7 +4863,12 @@ pub const Evaluator = struct {
                 const val = try self.evalExpr(asgn.value, environment);
                 switch (asgn.target.*) {
                     .identifier => |id| {
-                        try environment.set(id.name, val);
+                        environment.set(id.name, val) catch |err| {
+                            if (err == error.ImmutableAssignment) {
+                                self.setErrMsg("cannot assign to immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{id.name}, "cannot assign to immutable binding");
+                            }
+                            return err;
+                        };
                     },
                     .field_access => |fa| {
                         // 处理 object.field = value 形式的赋值
@@ -4993,9 +5095,17 @@ pub const Evaluator = struct {
                 // 赋值
                 switch (ca.target.*) {
                     .identifier => |id| {
-                        try environment.set(id.name, result);
+                        environment.set(id.name, result) catch |err| {
+                            if (err == error.ImmutableAssignment) {
+                                self.setErrMsg("cannot assign to immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{id.name}, "cannot assign to immutable binding");
+                            }
+                            return err;
+                        };
                     },
-                    else => return error.TypeMismatch,
+                    else => {
+                        self.panic_message = "invalid assignment target";
+                        return error.GluePanic;
+                    },
                 }
                 return null;
             },

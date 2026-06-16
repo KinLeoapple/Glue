@@ -1276,6 +1276,8 @@ pub const Parser = struct {
         const name_tok = try self.expect(.identifier, "expected type name");
         const location = tokenLoc(name_tok);
 
+        var ty: *ast.TypeNode = undefined;
+
         if (self.matchToken(.lt)) {
             var args = std.ArrayList(*ast.TypeNode).empty;
             try args.append(self.allocator, try self.parseType());
@@ -1284,26 +1286,23 @@ pub const Parser = struct {
             }
             self.expectCloseAngle("expected '>' to close type parameters") catch {};
 
-            const generic_ty = try self.allocType(ast.TypeNode{
+            ty = try self.allocType(ast.TypeNode{
                 .generic = .{
                     .location = location,
                     .name = name_tok.lexeme,
                     .args = try args.toOwnedSlice(self.allocator),
                 },
             });
-
-            // 泛型类型后不支持 []，直接返回
-            return generic_ty;
+        } else {
+            ty = try self.allocType(ast.TypeNode{
+                .named = .{
+                    .location = location,
+                    .name = name_tok.lexeme,
+                },
+            });
         }
 
-        var ty = try self.allocType(ast.TypeNode{
-            .named = .{
-                .location = location,
-                .name = name_tok.lexeme,
-            },
-        });
-
-        // 支持 T[N] 和 T[] 数组类型语法
+        // 支持 T[N] 和 T[] 数组类型语法（命名类型与泛型类型均可，如 i32[]、Spawn<i32>[]）
         while (self.matchToken(.l_bracket)) {
             const arr_location = tokenLoc(name_tok);
             var size: ?u64 = null;

@@ -5,6 +5,27 @@ const parser = @import("parser");
 const ast = @import("ast");
 const eval = @import("eval");
 
+/// 把求值器错误映射为专业英文消息（Go/Java 风格）。
+/// 若求值器已经设置了带上下文的 panic_message（如 "no method 'x' on type 'array'"），
+/// 优先使用它；否则按错误枚举给出通用但专业的兜底措辞。
+fn runtimeErrorMessage(err: anyerror, panic_message: ?[]const u8) []const u8 {
+    if (panic_message) |msg| return msg;
+    return switch (err) {
+        error.TypeMismatch => "type error: incompatible types",
+        error.UndefinedVariable => "undefined name",
+        error.ImmutableAssignment => "cannot assign to immutable binding",
+        error.NotCallable => "value is not callable",
+        error.WrongArity => "wrong number of arguments",
+        error.IndexOutOfBounds => "index out of bounds",
+        error.UnsupportedOperation => "unsupported operation",
+        error.OutOfMemory => "out of memory",
+        error.CircularDependency => "circular module dependency",
+        error.FileNotFound => "file not found",
+        error.MissingMain => "undefined entry point",
+        else => @errorName(err),
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     // Windows 控制台默认使用 GBK 编码，需设置为 UTF-8 以正确输出非 ASCII 字符
     if (builtin.os.tag == .windows) {
@@ -65,10 +86,7 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void
             else => {
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, @errorName(err) }) catch {};
-                if (ev.panic_message) |msg| {
-                    stderr_writer.interface.print("  detail: {s}\n", .{msg}) catch {};
-                }
+                stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, runtimeErrorMessage(err, ev.panic_message) }) catch {};
                 stderr_writer.flush() catch {};
             },
         };
@@ -186,7 +204,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             else => {
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, @errorName(err) }) catch {};
+                stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, runtimeErrorMessage(err, ev.panic_message) }) catch {};
                 stderr_writer.flush() catch {};
                 return true;
             },
@@ -238,10 +256,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         else => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, @errorName(err) }) catch {};
-            if (ev.panic_message) |msg| {
-                stderr_writer.interface.print("  detail: {s}\n", .{msg}) catch {};
-            }
+            stderr_writer.interface.print("{s}: runtime error: {s}\n", .{ filename, runtimeErrorMessage(err, ev.panic_message) }) catch {};
             stderr_writer.flush() catch {};
             return true;
         },

@@ -1152,6 +1152,42 @@ pub const TypeInferencer = struct {
         return subtype_check.recordArgSatisfies(self, param, arg);
     }
 
+    /// 检测「可空赋给非空」的不健全方向：target 非可空，但 source 可空（或就是 null）。
+    /// `T <: T?` 只在「非空用在期望可空处」这一个方向成立；反方向（把 T? 赋给 T）
+    /// 会让 null 漏进非空类型，必须拒绝。用于 val/var 标注与函数实参检查。
+    /// 返回 true 表示存在违例（应报错）。
+    /// 返回两个具体整数类型中「更宽」的那个（用于算术结果类型，匹配求值器的
+    /// promoteIntTypes）。按位宽等级取较大者，相同等级取左侧。
+    fn widerIntType(self: *TypeInferencer, a: *Type, b: *Type) *Type {
+        _ = self;
+        const rank = struct {
+            fn get(t: Type) u8 {
+                return switch (t) {
+                    .i8_type => 0, .u8_type => 1,
+                    .i16_type => 2, .u16_type => 3,
+                    .i32_type => 4, .u32_type => 5,
+                    .i64_type => 6, .u64_type => 7,
+                    .i128_type => 8, .u128_type => 9,
+                    else => 0,
+                };
+            }
+        }.get;
+        return if (rank(b.*) > rank(a.*)) b else a;
+    }
+
+    fn nullableViolation(self: *TypeInferencer, target: *Type, source: *Type) bool {
+        const rt = self.resolve(target);
+        const rs = self.resolve(source);
+        // target 是可空类型则永远安全（T 和 T? 都能放进 T?）
+        if (rt.* == .nullable_type) return false;
+        // target 是类型变量（泛型形参，如 Ok 的 a）：可统一为任意类型，包括可空，不算违例
+        if (rt.* == .type_var) return false;
+        // target 是具体非可空类型，source 可空 / 为 null → 违例
+        if (rs.* == .nullable_type) return true;
+        if (rs.* == .null_type) return true;
+        return false;
+    }
+
     fn isErrorSubtype(self: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
         return subtype_check.isErrorSubtype(self, sub_name, super_name);
     }
@@ -1597,11 +1633,24 @@ pub const TypeInferencer = struct {
 
                 switch (bin.op) {
                     .add, .sub, .mul, .div, .mod => {
+                        // 求值器对整数算术做宽度提升（promoteIntTypes），故两个具体整数
+                        // 类型即使位宽不同也合法（如 i64 % i16）。仅当并非「双方都是具体
+                        // 整数」时才回退到严格 unify（覆盖类型变量、浮点、字符串拼接等）。
+                        const rl = self.resolve(left_ty);
+                        const rr = self.resolve(right_ty);
+                        if (rl.isIntType() and rr.isIntType()) {
+                            return self.widerIntType(rl, rr);
+                        }
                         try self.unify(left_ty, right_ty);
                         return left_ty;
                     },
                     .eq, .not_eq, .lt, .gt, .lt_eq, .gt_eq => {
-                        try self.unify(left_ty, right_ty);
+                        const rl = self.resolve(left_ty);
+                        const rr = self.resolve(right_ty);
+                        // 两个具体整数可直接比较（宽度可不同），不强制 unify
+                        if (!(rl.isIntType() and rr.isIntType())) {
+                            try self.unify(left_ty, right_ty);
+                        }
                         return self.makeType(.bool_type);
                     },
                     .and_op, .or_op => {
@@ -1636,7 +1685,14 @@ pub const TypeInferencer = struct {
                         return self.makeType(.i32_type);
                     },
                     .elvis => {
-                        // ?? 运算符：左操作数为 T?，右操作数为 T
+                        // ?? 运算符：左操作数 T?，右操作数 T，结果为非空的 T。
+                        // 返回 left 的内部类型（剥掉一层 nullable）；若 left 非可空则原样，
+                        // 否则回退到 right_ty。这样 `x ?? 99`(x: i32?) 的结果是 i32 而非 i32?，
+                        // 才能正确赋给非空绑定。
+                        const rl = self.resolve(left_ty);
+                        if (rl.* == .nullable_type) {
+                            return rl.nullable_type;
+                        }
                         return left_ty;
                     },
                 }
@@ -1721,6 +1777,11 @@ pub const TypeInferencer = struct {
                         for (rc.fn_type.params, arg_types) |param_ty, arg_ty| {
                             if (!self.recordArgSatisfies(param_ty, arg_ty)) {
                                 self.addErrorAt(.type_mismatch, c.location.line, c.location.column, "record argument missing required field(s) of parameter type", .{});
+                                return ret_ty;
+                            }
+                            // 可空安全：不允许把 T? 实参传给 T 形参（会让 null 漏进非空类型）
+                            if (self.nullableViolation(param_ty, arg_ty)) {
+                                self.addErrorAt(.type_mismatch, c.location.line, c.location.column, "cannot pass a nullable argument where a non-nullable type is expected (use '!' or '??' to unwrap)", .{});
                                 return ret_ty;
                             }
                         }
@@ -2013,7 +2074,13 @@ pub const TypeInferencer = struct {
             },
 
             .non_null_assert => |nna| {
-                return self.inferExpr(nna.expr, env);
+                // 非空断言 `x!`：把 T? 收窄为 T（运行时若为 null 则 panic）。
+                const inner = try self.inferExpr(nna.expr, env);
+                const ri = self.resolve(inner);
+                if (ri.* == .nullable_type) {
+                    return ri.nullable_type;
+                }
+                return inner;
             },
 
             .safe_access => |sa| {
@@ -2176,7 +2243,7 @@ pub const TypeInferencer = struct {
                         };
                         // 统一返回类型
                         _ = self.tryWidenUnify(ret_ty, body_ty) catch {
-                            self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "type mismatch in val declaration: annotation does not match inferred type", .{});
+                            self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "val declaration annotation does not match inferred type", .{});
                         };
 
                         // 注册到外层环境
@@ -2186,20 +2253,27 @@ pub const TypeInferencer = struct {
                         }
                     } else {
                         const val_ty = try self.inferExpr(vd.value, env);
-                        // 验证类型注解
+                        // 验证类型注解；有标注时以标注类型作为绑定类型（标注优先于推断，
+                        // 例如 `val x: i32? = 5` 中 x 的类型是 i32? 而非 i32）。
+                        var bind_ty = val_ty;
                         if (vd.type_annotation) |ta| {
                             const annot_ty = self.typeFromAstWithParams(ta, null) catch null;
                             if (annot_ty) |at| {
-                                _ = self.tryWidenUnify(at, val_ty) catch {
-                                    self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "type mismatch in val declaration", .{});
-                                };
+                                if (self.nullableViolation(at, val_ty)) {
+                                    self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "cannot assign a nullable value to non-nullable binding '{s}' (use '!' or '??' to unwrap)", .{vd.name});
+                                } else {
+                                    _ = self.tryWidenUnify(at, val_ty) catch {
+                                        self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "annotation does not match value in val declaration", .{});
+                                    };
+                                }
+                                bind_ty = at;
                             }
                         }
                         // 文档 §3.3.3: Spawn 线性类型追踪
                         if (self.isSpawnType(val_ty)) {
                             self.registerLinearVar(vd.name, vd.location.line, vd.location.column);
                         }
-                        const scheme = try self.generalize(env, val_ty);
+                        const scheme = try self.generalize(env, bind_ty);
                         if (!(try env.defineOrReport(vd.name, scheme))) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                         }
@@ -2216,9 +2290,13 @@ pub const TypeInferencer = struct {
                     if (vd.type_annotation) |ta| {
                         const annot_ty = self.typeFromAstWithParams(ta, null) catch null;
                         if (annot_ty) |at| {
-                            _ = self.tryWidenUnify(at, val_ty) catch {
-                                self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "type mismatch in var declaration", .{});
-                            };
+                            if (self.nullableViolation(at, val_ty)) {
+                                self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "cannot assign a nullable value to non-nullable binding '{s}' (use '!' or '??' to unwrap)", .{vd.name});
+                            } else {
+                                _ = self.tryWidenUnify(at, val_ty) catch {
+                                    self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "annotation does not match value in var declaration", .{});
+                                };
+                            }
                         }
                     }
                     // 文档 §3.3.3: Spawn 线性类型追踪
@@ -3765,9 +3843,9 @@ pub const TypeInferencer = struct {
     /// 报告推断错误
     fn reportInferError(self: *TypeInferencer, err: SemaError, location: ast.SourceLocation) void {
         switch (err) {
-            error.TypeMismatch => self.addErrorAt(.type_mismatch, location.line, location.column, "type mismatch: incompatible types", .{}),
-            error.UnboundVariable => self.addErrorAt(.unbound_variable, location.line, location.column, "undefined variable", .{}),
-            error.ArityMismatch => self.addErrorAt(.arity_mismatch, location.line, location.column, "function argument count mismatch", .{}),
+            error.TypeMismatch => self.addErrorAt(.type_mismatch, location.line, location.column, "incompatible types", .{}),
+            error.UnboundVariable => self.addErrorAt(.unbound_variable, location.line, location.column, "undefined name", .{}),
+            error.ArityMismatch => self.addErrorAt(.arity_mismatch, location.line, location.column, "wrong number of arguments", .{}),
             error.OccursCheckFailed => {
                 // 文档 2.10: 多态递归函数必须提供类型标注
                 // 当泛型函数的递归调用使用了与自身不同的类型参数时，
@@ -3784,7 +3862,7 @@ pub const TypeInferencer = struct {
             },
             error.MissingImplementation => self.addErrorAt(.missing_implementation, location.line, location.column, "trait method not implemented", .{}),
             error.RecursiveType => self.addErrorAt(.recursive_type, location.line, location.column, "infinite type", .{}),
-            error.DuplicateDefinition => self.addErrorAt(.type_mismatch, location.line, location.column, "duplicate definition in scope", .{}),
+            error.DuplicateDefinition => self.addErrorAt(.type_mismatch, location.line, location.column, "duplicate definition", .{}),
             error.OutOfMemory => {}, // 不报告 OOM
         }
     }
@@ -3799,7 +3877,7 @@ pub const TypeInferencer = struct {
                 defer actual_buf.deinit(self.allocator);
                 expected.formatArrayList(&expected_buf, self.allocator) catch {};
                 actual.formatArrayList(&actual_buf, self.allocator) catch {};
-                self.addErrorAt(.type_mismatch, location.line, location.column, "type mismatch: expected {s}, got {s}", .{ expected_buf.items, actual_buf.items });
+                self.addErrorAt(.type_mismatch, location.line, location.column, "expected {s}, got {s}", .{ expected_buf.items, actual_buf.items });
             },
             else => self.reportInferError(err, location),
         }
