@@ -23,6 +23,13 @@ pub const Environment = struct {
     parent: ?*Environment,
     children: std.ArrayList(*Environment),
     allocator: std.mem.Allocator,
+    /// 运行期 Value 专用分配器（箱体/载荷归还）。默认 = allocator（行为不变）；
+    /// 主求值器把它指向 SlabPool，使绑定 release 归还 pool 而非 no-op 的 arena。
+    /// key 字符串仍走 allocator（与 define 时 dupe 同源）。
+    value_allocator: std.mem.Allocator,
+    /// 引用计数：创建时 1；被闭包捕获时 +1；作用域退出/闭包销毁时 -1，归零才真正销毁。
+    /// 闭包按指针捕获其定义环境，故帧不能在函数返回时无条件销毁——必须等无人引用。
+    rc: u32 = 1,
 
     pub fn init(allocator: std.mem.Allocator) Environment {
         return Environment{
@@ -30,7 +37,15 @@ pub const Environment = struct {
             .parent = null,
             .children = std.ArrayList(*Environment).empty,
             .allocator = allocator,
+            .value_allocator = allocator,
+            .rc = 1,
         };
+    }
+
+    /// 引用计数 +1（闭包捕获环境时调用）。返回自身。
+    pub fn retain(self: *Environment) *Environment {
+        self.rc += 1;
+        return self;
     }
 
     pub fn deinit(self: *Environment) void {
@@ -44,14 +59,53 @@ pub const Environment = struct {
         }
         self.children.deinit(self.allocator);
 
-        // 释放值中的堆分配数据
+        // 释放值中的堆分配数据。用 release（引用计数感知）而非 deinit：
+        // 共享值（rc>1）只减计数，归零才真正释放，避免多个变量持有同一记录/数组时双重释放。
         var iter = self.values.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            var val = entry.value_ptr.value;
-            val.deinit(self.allocator);
+            entry.value_ptr.value.release(self.value_allocator);
         }
         self.values.deinit();
+    }
+
+    /// 作用域退出/闭包销毁时调用：rc-1。归零则从父链摘除、release 所有绑定与残留子环境、销毁自身。
+    /// rc>0（仍被闭包等引用）则保留。被销毁的帧已从 parent.children 摘除，避免与全局 deinit 双重释放。
+    pub fn releaseEnv(self: *Environment) void {
+        if (self.rc > 1) {
+            self.rc -= 1;
+            return;
+        }
+        self.rc = 0;
+        // 从父环境 children 列表摘除自身（防止全局 deinit 重复销毁）
+        if (self.parent) |p| {
+            var idx: usize = 0;
+            while (idx < p.children.items.len) : (idx += 1) {
+                if (p.children.items[idx] == self) {
+                    _ = p.children.swapRemove(idx);
+                    break;
+                }
+            }
+        }
+        // 释放绑定
+        var iter = self.values.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.value.release(self.value_allocator);
+        }
+        self.values.deinit();
+        // 残留子环境（理论上此时应为空或仍被引用）：对每个调用 releaseEnv
+        const saved_parent = self.parent;
+        var ci: usize = self.children.items.len;
+        while (ci > 0) {
+            ci -= 1;
+            self.children.items[ci].releaseEnv();
+        }
+        self.children.deinit(self.allocator);
+        const alloc = self.allocator;
+        alloc.destroy(self);
+        // 释放对父环境的引用（子持有父，使父在子存活期间不被回收）
+        if (saved_parent) |p| p.releaseEnv();
     }
 
     pub fn define(self: *Environment, name: []const u8, val: value.Value, is_mutable: bool) !void {
@@ -59,16 +113,16 @@ pub const Environment = struct {
     }
 
     pub fn defineWithVisibility(self: *Environment, name: []const u8, val: value.Value, is_mutable: bool, is_public: bool) !void {
-        // 如果已存在，先移除旧条目并释放旧 key 和旧值
+        // 如果已存在，先移除旧条目并释放旧 key 和旧值（release：引用计数感知）
         if (self.values.fetchRemove(name)) |old| {
             self.allocator.free(old.key);
-            var old_val = old.value.value;
-            old_val.deinit(self.allocator);
+            old.value.value.release(self.value_allocator);
         }
-        // 插入新条目（需要分配 key 的独立副本）
+        // 插入新条目（需要分配 key 的独立副本）。key 走 allocator（与 free 同源）。
         const key = try self.allocator.dupe(u8, name);
-        // 深拷贝值，确保每个环境拥有自己的数据副本，避免 double-free
-        const cloned_val = try val.clone(self.allocator);
+        // clone：带 rc 的复合值仅 retain（不分配）；string 等深拷走 value_allocator
+        // 与 release 同源，避免 pool/arena 错配。
+        const cloned_val = try val.clone(self.value_allocator);
         try self.values.put(key, Variable{ .value = cloned_val, .is_mutable = is_mutable, .is_public = is_public });
     }
 
@@ -102,7 +156,10 @@ pub const Environment = struct {
                 v.value.atomic_val.store(val);
                 return;
             }
+            // owned 模型：val 为 owned，move 进变量（接管）；旧值被覆盖，release 归还。
+            const old = v.value;
             v.value = val;
+            old.release(self.value_allocator);
             return;
         }
         if (self.parent) |p| {
@@ -119,8 +176,11 @@ pub const Environment = struct {
             .parent = self,
             .children = std.ArrayList(*Environment).empty,
             .allocator = self.allocator,
+            .value_allocator = self.value_allocator,
+            .rc = 1,
         };
         try self.children.append(self.allocator, child);
+        _ = self.retain(); // 子持有父：父在子存活期间不被回收
         return child;
     }
 
@@ -135,6 +195,7 @@ pub const Environment = struct {
             .parent = null,
             .children = std.ArrayList(*Environment).empty,
             .allocator = allocator,
+            .value_allocator = allocator,
         };
         // 深拷贝当前环境的所有变量
         var iter = self.values.iterator();

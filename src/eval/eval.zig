@@ -124,6 +124,10 @@ const max_call_depth: u32 = 200;
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
+    /// 运行期 Value 堆分配专用分配器（adt/record/array/newtype/string 箱体及其内容、release 归还）。
+    /// 现阶段指向与 allocator 相同的底层（行为不变）；后续换成精确 pool 以实现运行期内存精确回收。
+    /// 编译期/全程数据(AST/类型/注册表/内建)仍走 allocator(arena)。
+    value_allocator: std.mem.Allocator,
     global_env: Environment,
     io: ?std.Io = null,
     /// Work-stealing 调度器（基于 Zio Runtime）
@@ -225,6 +229,7 @@ pub const Evaluator = struct {
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         var ev = Evaluator{
             .allocator = allocator,
+            .value_allocator = allocator,
             .global_env = Environment.init(allocator),
             .shadow_stack = std.ArrayList(value.Value).empty,
             .closures = std.ArrayList(*value.Closure).empty,
@@ -256,6 +261,7 @@ pub const Evaluator = struct {
     pub fn initWithIo(allocator: std.mem.Allocator, io: std.Io) Evaluator {
         var ev = Evaluator{
             .allocator = allocator,
+            .value_allocator = allocator,
             .global_env = Environment.init(allocator),
             .io = io,
             .shadow_stack = std.ArrayList(value.Value).empty,
@@ -290,6 +296,7 @@ pub const Evaluator = struct {
     pub fn initWithScheduler(allocator: std.mem.Allocator, sched: *scheduler_mod.Scheduler) Evaluator {
         var ev = Evaluator{
             .allocator = allocator,
+            .value_allocator = allocator,
             .global_env = Environment.init(allocator),
             .io = sched.getIo(),
             .scheduler = sched,
@@ -450,6 +457,33 @@ pub const Evaluator = struct {
     /// 触发 Glue panic — 不可捕获，但允许 defer 执行
     ///
     /// 文档要求：panic 不可捕获，但 defer 在 panic 时仍执行。
+    /// 写时拷贝：原地修改一个 var 记录/数组前调用。若该值被共享（rc>1），
+    /// 复制出一份 rc=1 的独占副本并替换变量持有的值，避免串改别名。
+    /// 顶层浅拷贝（数组 elements slice / 记录 fields map），子值仍共享（各自 retain）。
+    fn cowField(self: *Evaluator, variable: *env.Variable) !void {
+        switch (variable.value) {
+            .record => |p| {
+                if (p.rc <= 1) return;
+                var new_map = std.StringHashMap(Value).init(self.allocator);
+                var it = p.fields.iterator();
+                while (it.next()) |entry| {
+                    const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+                    try new_map.put(key, entry.value_ptr.*.retain());
+                }
+                p.rc -= 1; // 放弃对共享体的一份引用
+                variable.value = try value.Value.makeRecord(self.value_allocator, if (p.type_name.len > 0) try self.allocator.dupe(u8, p.type_name) else "", new_map);
+            },
+            .array => |p| {
+                if (p.rc <= 1) return;
+                const new_elems = try self.allocator.alloc(Value, p.elements.len);
+                for (p.elements, 0..) |e, i| new_elems[i] = e.retain();
+                p.rc -= 1;
+                variable.value = try value.Value.makeArray(self.value_allocator, new_elems, p.fixed_size);
+            },
+            else => {},
+        }
+    }
+
     /// 实现方式：设置 panic_message 并返回 error.GluePanic，
     /// evalBlock 捕获后执行 defer 栈，然后重新抛出。
     fn gluePanic(self: *Evaluator, message: []const u8) EvalResult!Value {
@@ -727,7 +761,14 @@ pub const Evaluator = struct {
                     ev.type_name.ptr = @ptrCast(@constCast(new_ptr));
                 }
             },
-            .array => |*av| {
+            .array => |*av_ptr| {
+                // array 现已装箱为 *ArrayValue：先疏散箱体，再疏散 elements 缓冲与各元素。
+                if (gc.isInNursery(@intFromPtr(av_ptr.*))) {
+                    const old_ptr: [*]u8 = @ptrCast(av_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, @sizeOf(value.ArrayValue));
+                    av_ptr.* = @ptrCast(@alignCast(new_ptr));
+                }
+                const av = av_ptr.*;
                 if (av.elements.len > 0 and gc.isInNursery(@intFromPtr(av.elements.ptr))) {
                     const byte_size = av.elements.len * @sizeOf(Value);
                     const old_ptr: [*]u8 = @ptrCast(@constCast(av.elements.ptr));
@@ -740,10 +781,14 @@ pub const Evaluator = struct {
                     self.evacuateValue(elem);
                 }
             },
-            .record => |*rv| {
-                // RecordValue 的 fields 是 StringHashMap(Value)
-                // HashMap 内部存储可能在 nursery 中，需要整体迁移
-                self.evacuateStringHashMap(Value, &rv.fields);
+            .record => |*rv_ptr| {
+                // record 现已装箱为 *RecordValue：先疏散箱体本身，再疏散其 fields map。
+                if (gc.isInNursery(@intFromPtr(rv_ptr.*))) {
+                    const old_ptr: [*]u8 = @ptrCast(rv_ptr.*);
+                    const new_ptr = gc.promoteToOldGen(old_ptr, @sizeOf(value.RecordValue));
+                    rv_ptr.* = @ptrCast(@alignCast(new_ptr));
+                }
+                self.evacuateStringHashMap(Value, &rv_ptr.*.fields);
             },
             .adt => |*av_ptr| {
                 if (gc.isInNursery(@intFromPtr(av_ptr.*))) {
@@ -1778,7 +1823,7 @@ pub const Evaluator = struct {
                 closure.* = value.Closure{
                     .params = f.params,
                     .body = .{ .block = f.body },
-                    .env = @ptrCast(environment),
+                    .env = @ptrCast(environment.retain()),
                     .allocator = self.allocator,
                 };
                 try self.closures.append(self.allocator, closure);
@@ -1961,7 +2006,7 @@ pub const Evaluator = struct {
                                         const coerced = if (data.field_types[i]) |tn| (ev.castValue(arg, tn) catch arg) else arg;
                                         try map.put(key, coerced);
                                     }
-                                    return Value{ .record = .{ .type_name = try ev.allocator.dupe(u8, data.type_name), .fields = map } };
+                                    return try value.Value.makeRecord(ev.value_allocator, try ev.allocator.dupe(u8, data.type_name), map);
                                 }
                             }.call,
                             .user_ctx = ctx,
@@ -2038,7 +2083,7 @@ pub const Evaluator = struct {
                         closure.* = value.Closure{
                             .params = method.params,
                             .body = .{ .block = body },
-                            .env = @ptrCast(environment),
+                            .env = @ptrCast(environment.retain()),
                             .allocator = self.allocator,
                         };
                         try self.closures.append(self.allocator, closure);
@@ -2188,7 +2233,7 @@ pub const Evaluator = struct {
                         closure.* = value.Closure{
                             .params = method.params,
                             .body = .{ .block = body },
-                            .env = @ptrCast(environment),
+                            .env = @ptrCast(environment.retain()),
                             .allocator = self.allocator,
                         };
                         try self.closures.append(self.allocator, closure);
@@ -2414,7 +2459,7 @@ pub const Evaluator = struct {
                 const lazy_v = try self.allocator.create(value.LazyValue);
                 lazy_v.* = value.LazyValue{
                     .expr = lz.expr,
-                    .env = @ptrCast(environment),
+                    .env = @ptrCast(environment.retain()),
                     .cached = null,
                     .forced = false,
                     .allocator = self.allocator,
@@ -2506,6 +2551,7 @@ pub const Evaluator = struct {
                     const val = try self.evalExpr(expr, environment);
                     self.pushRoot(val); // 保护 val：format 可能分配
                     defer self.popRoot();
+                    defer val.release(self.value_allocator); // 插值表达式为临时
                     var buf = std.ArrayList(u8).empty;
                     defer buf.deinit(self.allocator);
                     try val.format(&buf, self.allocator, false);
@@ -2525,7 +2571,7 @@ pub const Evaluator = struct {
     fn evalDeclRhs(self: *Evaluator, expr: *const ast.Expr, environment: *Environment) EvalResult!Value {
         if (expr.* == .identifier) {
             if (environment.get(expr.identifier.name)) |v| {
-                if (v.value == .atomic_val) return v.value; // 别名，不 load
+                if (v.value == .atomic_val) return v.value.retain(); // 别名，不 load（atomic 非 boxed，retain no-op）
             }
         }
         return self.evalExpr(expr, environment);
@@ -2535,13 +2581,15 @@ pub const Evaluator = struct {
     /// 后续调用直接返回缓存值。
     fn forceLazy(self: *Evaluator, lz: *value.LazyValue) EvalResult!Value {
         if (lz.forced) {
-            return lz.cached.?;
+            // cached 由 thunk 持有；返回 owned 副本（retain）供调用方。
+            return lz.cached.?.retain();
         }
         const lazy_env: *Environment = @ptrCast(@alignCast(lz.env));
         const result = try self.evalExpr(lz.expr, lazy_env);
         lz.cached = result;
         lz.forced = true;
-        return result;
+        // result 既存入 cached（thunk 持有）又返回，retain 出调用方那份。
+        return result.retain();
     }
 
     fn evalIdentifier(self: *Evaluator, id: @TypeOf(@as(ast.Expr, undefined).identifier), environment: *Environment) EvalResult!Value {
@@ -2554,7 +2602,8 @@ pub const Evaluator = struct {
             if (v.value == .lazy_val) {
                 return self.forceLazy(v.value.lazy_val);
             }
-            return v.value;
+            // owned 模型：标识符读取是 borrow（绑定仍由 env 持有），retain 成 owned 返回。
+            return v.value.retain();
         }
         // 构建包含变量名的错误消息（需要分配以超过 panic_message 的生命周期）
         var buf = std.ArrayList(u8).empty;
@@ -2581,12 +2630,18 @@ pub const Evaluator = struct {
                 };
             },
             .index => |idx| {
+                // 写时拷贝：若索引目标是持有共享数组的变量，先复制独占一份再原地改。
+                if (idx.object.* == .identifier) {
+                    if (environment.getPtr(idx.object.identifier.name)) |variable| {
+                        if (variable.value == .array) try self.cowField(variable);
+                    }
+                }
                 const object = try self.evalExpr(idx.object, environment);
                 self.pushRoot(object);
                 const index_val = try self.evalExpr(idx.index, environment);
                 defer self.popRoot(); // pop object
                 switch (object) {
-                    .array => |*arr| {
+                    .array => |arr| {
                         const i_val = switch (index_val) {
                             .integer => |iv| iv,
                             else => return error.TypeMismatch,
@@ -2722,29 +2777,36 @@ pub const Evaluator = struct {
         switch (bin.op) {
             .and_op => {
                 const left = try self.evalExpr(bin.left, environment);
+                defer left.release(self.value_allocator);
                 if (!try left.asBoolean()) return Value{ .boolean = false };
                 const right = try self.evalExpr(bin.right, environment);
+                defer right.release(self.value_allocator);
                 return Value{ .boolean = try right.asBoolean() };
             },
             .or_op => {
                 const left = try self.evalExpr(bin.left, environment);
+                defer left.release(self.value_allocator);
                 if (try left.asBoolean()) return Value{ .boolean = true };
                 const right = try self.evalExpr(bin.right, environment);
+                defer right.release(self.value_allocator);
                 return Value{ .boolean = try right.asBoolean() };
             },
             .elvis => {
                 const left = try self.evalExpr(bin.left, environment);
-                if (!left.isNull()) return left;
-                return try self.evalExpr(bin.right, environment);
+                if (!left.isNull()) return left; // 移交所有权给调用方
+                left.release(self.value_allocator);
+                return try self.evalExpr(bin.right, environment); // owned，移交
             },
             else => {},
         }
 
         const left = try self.evalExpr(bin.left, environment);
-        // 保护 left：求值 right 期间可能触发 GC
+        // 保护 left：求值 right 期间可能触发 GC；两操作数为临时，运算后 release。
         self.pushRoot(left);
         defer self.popRoot();
         const right = try self.evalExpr(bin.right, environment);
+        defer left.release(self.value_allocator);
+        defer right.release(self.value_allocator);
 
         switch (bin.op) {
             .add => return self.evalAdd(left, right),
@@ -3092,7 +3154,7 @@ pub const Evaluator = struct {
         for (right_arr.elements, 0..) |e, i| {
             new_arr[left_arr.elements.len + i] = try e.clone(self.allocator);
         }
-        return Value{ .array = .{ .elements = new_arr, .fixed_size = null } };
+        return try value.Value.makeArray(self.value_allocator, new_arr, null);
     }
 
     // ============================================================
@@ -3101,6 +3163,7 @@ pub const Evaluator = struct {
 
     fn evalUnary(self: *Evaluator, un: @TypeOf(@as(ast.Expr, undefined).unary), environment: *Environment) EvalResult!Value {
         const operand = try self.evalExpr(un.operand, environment);
+        defer operand.release(self.value_allocator); // 临时操作数，运算后归还
         return switch (un.op) {
             .not => switch (operand) {
                 .boolean => |b| Value{ .boolean = !b },
@@ -3153,19 +3216,27 @@ pub const Evaluator = struct {
 
         const callee = try self.evalExpr(call.callee, environment);
 
-        // 保护 callee：求值参数期间可能触发 GC
+        // 保护 callee：求值参数期间可能触发 GC。callee 为临时（callFunction 只读分派，
+        // 不接管），退出时 release。
         self.pushRoot(callee);
         defer self.popRoot();
+        defer callee.release(self.value_allocator);
 
         // 求值参数
         var args = std.ArrayList(Value).empty;
+        // args 为 owned 临时。所有权移交给 callFunction（param 绑定 / partial bound_args /
+        // builtin）。callFunction 各分支接管语义不一（define=clone、partial 浅拷接管、
+        // builtin 读取），故由被调方负责消费——本函数只负责 deinit 容器，不 release 元素。
         for (call.arguments) |arg_expr| {
             const arg = try self.evalExpr(arg_expr, environment);
             self.pushRoot(arg);
             try args.append(self.allocator, arg);
             // arg 已复制到 args 中，但 pushRoot 保护直到函数返回
         }
-        // 注意：不 deinit 参数值，因为它们可能与环境中的变量共享内存（如数组切片）
+        // args 移交 callFunction（param define / partial bound_args / builtin 读取）。
+        // 注：当前不在此 release args——callFunction 各分支接管语义不一，且与 pattern
+        // 绑定/TCO 交织，统一 release 会 use-after-free。args 所有权待 callFunction +
+        // pattern 接管语义一并重构（见 plan 阶段B 高风险子步）。
         defer {
             args.deinit(self.allocator);
             self.popRoots(args.items.len); // 弹出所有参数的 root
@@ -3303,8 +3374,11 @@ pub const Evaluator = struct {
                         error.ReturnValue => {
                             if (self.return_value) |val| {
                                 self.return_value = null;
+                                _ = val.retain(); // 返回值逃出帧：先保活，再释放帧绑定
+                                call_env.releaseEnv();
                                 return val;
                             }
+                            call_env.releaseEnv();
                             return Value.unit;
                         },
                         error.TailCall => {
@@ -3316,6 +3390,7 @@ pub const Evaluator = struct {
                                 self.allocator.free(owned);
                                 args_owned = null;
                             }
+                            call_env.releaseEnv(); // 尾调用不保留本帧
                             current_closure = tc.closure;
                             current_args = tc.args;
                             // tc.args 是 evalCall 中 toOwnedSlice 转移的，需要在此释放
@@ -3327,13 +3402,21 @@ pub const Evaluator = struct {
                             // 函数返回 Throw<T, E> 时，throw 等价于 return Error(...)
                             if (self.throw_value) |tv| {
                                 self.throw_value = null;
+                                _ = tv.retain();
+                                call_env.releaseEnv();
                                 return tv;
                             }
+                            call_env.releaseEnv();
                             return error.ThrowValue;
                         },
-                        else => return err,
+                        else => {
+                            call_env.releaseEnv();
+                            return err;
+                        },
                     };
 
+                    _ = final_result.retain(); // 正常返回值逃出帧：先保活
+                    call_env.releaseEnv();
                     return final_result;
                 }
             },
@@ -3381,15 +3464,18 @@ pub const Evaluator = struct {
             },
             .field_access => |fa| raw_val: {
                 const obj = try self.evalExpr(fa.object, environment);
+                defer obj.release(self.value_allocator); // 中间对象临时
                 const field_val = self.accessField(obj, fa.field) catch break :raw_val try self.evalExpr(mc.object, environment);
                 break :raw_val field_val;
             },
             else => try self.evalExpr(mc.object, environment),
         };
 
-        // 保护 object：求值参数期间可能触发 GC
+        // 保护 object：求值参数期间可能触发 GC。object 多数分支为 owned；并发原语
+        // (atomic/channel/...)分支是 borrow 但非 boxed，release 为 no-op，故统一 release 安全。
         self.pushRoot(object);
         defer self.popRoot();
+        defer object.release(self.value_allocator);
 
         // 求值参数
         var args = std.ArrayList(Value).empty;
@@ -3476,7 +3562,7 @@ pub const Evaluator = struct {
                 closure.* = value.Closure{
                     .params = method.params,
                     .body = .{ .block = body },
-                    .env = @ptrCast(environment),
+                    .env = @ptrCast(environment.retain()),
                     .allocator = self.allocator,
                 };
                 try self.closures.append(self.allocator, closure);
@@ -3545,7 +3631,7 @@ pub const Evaluator = struct {
                     var new_arr = try self.allocator.alloc(Value, arr.elements.len + 1);
                     @memcpy(new_arr[0..arr.elements.len], arr.elements);
                     new_arr[arr.elements.len] = try args[0].clone(self.allocator);
-                    return Value{ .array = .{ .elements = new_arr, .fixed_size = null } };
+                    return try value.Value.makeArray(self.value_allocator, new_arr, null);
                 },
                 else => error.TypeMismatch,
             };
@@ -3613,7 +3699,7 @@ pub const Evaluator = struct {
                     if (arr.elements.len == 0) return Value{ .array = arr };
                     const new_arr = try self.allocator.alloc(Value, arr.elements.len - 1);
                     @memcpy(new_arr, arr.elements[0 .. arr.elements.len - 1]);
-                    return Value{ .array = .{ .elements = new_arr, .fixed_size = null } };
+                    return try value.Value.makeArray(self.value_allocator, new_arr, null);
                 },
                 else => error.TypeMismatch,
             };
@@ -3645,7 +3731,7 @@ pub const Evaluator = struct {
             return switch (object) {
                 .array_iterator => |ai| {
                     if (ai.index < ai.array.len) {
-                        const val = ai.array[ai.index];
+                        const val = ai.array[ai.index].retain(); // borrow→owned：元素由迭代器底层数组持有
                         ai.index += 1;
                         return val;
                     }
@@ -3953,6 +4039,7 @@ pub const Evaluator = struct {
 
     fn evalFieldAccess(self: *Evaluator, fa: @TypeOf(@as(ast.Expr, undefined).field_access), environment: *Environment) EvalResult!Value {
         const object = try self.evalExpr(fa.object, environment);
+        defer object.release(self.value_allocator); // object 临时；accessField 返回 retain 出的独立子值
         return self.accessField(object, fa.field);
     }
 
@@ -3960,7 +4047,7 @@ pub const Evaluator = struct {
         switch (object) {
             .record => |rec| {
                 if (rec.fields.get(field)) |val| {
-                    return val;
+                    return val.retain(); // borrow→owned：字段值仍由 record 持有
                 }
                 return self.gluePanicFmt("no field '{s}' on type 'record'", .{field}, "no such field");
             },
@@ -3969,7 +4056,7 @@ pub const Evaluator = struct {
                 for (av.fields) |f| {
                     if (f.name) |n| {
                         if (std.mem.eql(u8, n, field)) {
-                            return f.value;
+                            return f.value.retain(); // borrow→owned
                         }
                     }
                 }
@@ -3979,7 +4066,7 @@ pub const Evaluator = struct {
                 // 文档 §4.6.2: 模块值/Trait 值的成员访问——限定名 `Store.Memory`、
                 // `Module.member`（子模块或导出函数）。在 vtable/成员表中查找。
                 if (tv.methods.get(field)) |member| {
-                    return member;
+                    return member.retain(); // borrow→owned
                 }
                 return self.gluePanicFmt("no member '{s}' on trait value '{s}'", .{ field, if (tv.trait_name.len > 0) tv.trait_name else "trait" }, "no such member");
             },
@@ -4063,7 +4150,7 @@ pub const Evaluator = struct {
             // - 如果是 Ok(v)，解包返回 v
             // - 如果是 Error(e)，提前传播 throw
             switch (val.throw_val.*) {
-                .ok => |v| return v.*,
+                .ok => |v| return v.*.retain(), // borrow→owned：内值由 throw_val 持有
                 .err => {
                     self.throw_value = val;
                     return error.ThrowValue;
@@ -4075,10 +4162,13 @@ pub const Evaluator = struct {
 
     fn evalIndex(self: *Evaluator, idx: @TypeOf(@as(ast.Expr, undefined).index), environment: *Environment) EvalResult!Value {
         const object = try self.evalExpr(idx.object, environment);
-        // 保护 object：求值 index 期间可能触发 GC
+        // 保护 object：求值 index 期间可能触发 GC。object/index 为临时，结果是 retain
+        // 出的独立元素，故二者用完 release。
         self.pushRoot(object);
         defer self.popRoot();
+        defer object.release(self.value_allocator);
         const index_val = try self.evalExpr(idx.index, environment);
+        defer index_val.release(self.value_allocator);
 
         switch (object) {
             .array => |arr| {
@@ -4090,7 +4180,7 @@ pub const Evaluator = struct {
                 if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
                     return self.gluePanicFmt("index {d} out of bounds for length {d}", .{ i, arr.elements.len }, "index out of bounds");
                 }
-                return arr.elements[@as(usize, @intCast(i))];
+                return arr.elements[@as(usize, @intCast(i))].retain(); // borrow→owned
             },
             .string => |s| {
                 const i_val = switch (index_val) {
@@ -4116,10 +4206,12 @@ pub const Evaluator = struct {
     }
 
     fn evalArrayLiteral(self: *Evaluator, al: @TypeOf(@as(ast.Expr, undefined).array_literal), environment: *Environment) EvalResult!Value {
-        var arr = try self.allocator.alloc(Value, al.elements.len);
+        // elements slice 与箱体同走 value_allocator：release 时 free(p.elements) 与此同源，
+        // 否则 pool free arena 内存（或反之）= 泄漏/invalid free。
+        var arr = try self.value_allocator.alloc(Value, al.elements.len);
         errdefer {
-            for (arr) |*a| a.deinit(self.allocator);
-            self.allocator.free(arr);
+            for (arr) |*a| a.deinit(self.value_allocator);
+            self.value_allocator.free(arr);
         }
         const root_count_before = self.shadow_stack.items.len;
         for (al.elements, 0..) |elem, i| {
@@ -4127,7 +4219,7 @@ pub const Evaluator = struct {
             self.pushRoot(arr[i]); // 保护已求值的元素
         }
         self.popRoots(self.shadow_stack.items.len - root_count_before);
-        return Value{ .array = .{ .elements = arr, .fixed_size = null } };
+        return try value.Value.makeArray(self.value_allocator, arr, null);
     }
 
     fn evalRecordLiteral(self: *Evaluator, rl: @TypeOf(@as(ast.Expr, undefined).record_literal), environment: *Environment) EvalResult!Value {
@@ -4143,7 +4235,7 @@ pub const Evaluator = struct {
         }
         self.popRoots(self.shadow_stack.items.len - root_count_before);
 
-        return Value{ .record = .{ .type_name = "", .fields = map } };
+        return try value.Value.makeRecord(self.value_allocator, "", map);
     }
 
     /// 记录扩展/更新求值
@@ -4181,7 +4273,7 @@ pub const Evaluator = struct {
                 }
                 self.popRoots(self.shadow_stack.items.len - root_count_before);
 
-                return Value{ .record = .{ .type_name = "", .fields = map } };
+                return try value.Value.makeRecord(self.value_allocator, "", map);
             },
             else => return error.TypeMismatch,
         }
@@ -4192,7 +4284,7 @@ pub const Evaluator = struct {
         closure.* = value.Closure{
             .params = lam.params,
             .body = lam.body,
-            .env = @ptrCast(environment),
+            .env = @ptrCast(environment.retain()),
             .allocator = self.allocator,
         };
         try self.closures.append(self.allocator, closure);
@@ -4274,6 +4366,7 @@ pub const Evaluator = struct {
         self.in_tail_position = false;
         const condition = try self.evalExpr(ie.condition, environment);
         self.in_tail_position = saved_tail;
+        defer condition.release(self.value_allocator); // 条件为临时
         // if 表达式的分支在尾位置时保持尾位置标记
         if (condition.isTruthy()) {
             return self.evalExpr(ie.then_branch, environment);
@@ -4342,6 +4435,10 @@ pub const Evaluator = struct {
         // 执行 defer
         try self.runDefers(defer_stack.items, block_env);
 
+        // 正常退出：返回值可能是块内局部绑定，先 retain 保活再释放本块帧。
+        // （错误/控制流出口不在此释放——由外层调用帧 releaseEnv 时传递性回收。）
+        _ = result.retain();
+        block_env.releaseEnv();
         return result;
     }
 
@@ -4884,7 +4981,11 @@ pub const Evaluator = struct {
                         else => {},
                     }
                 }
+                // RHS 为 owned（阶段A 保证 evalExpr/DeclRhs 返 owned）。define clone(=retain)
+                // 出 env 自己一份；本函数持有的 owned 引用绑定后 release，使 fresh 值
+                // (rc=1) 不会停在 rc=2 而泄漏。阶段A 后 RHS 已非 borrow，release 不再误伤。
                 try environment.defineWithVisibility(vd.name, val, false, vd.visibility == .public);
+                val.release(self.value_allocator);
                 return null;
             },
             .var_decl => |vd| {
@@ -4901,6 +5002,7 @@ pub const Evaluator = struct {
                     }
                 }
                 try environment.defineWithVisibility(vd.name, val, true, vd.visibility == .public);
+                val.release(self.value_allocator);
                 return null;
             },
             .assignment => |asgn| {
@@ -4924,14 +5026,19 @@ pub const Evaluator = struct {
                                         return error.ImmutableAssignment;
                                     }
                                     if (variable.*.value == .record) {
+                                        try self.cowField(variable);
                                         const map = &variable.*.value.record.fields;
                                         if (map.getPtr(fa.field)) |existing| {
-                                            existing.* = val;
+                                            const old = existing.*;
+                                            existing.* = val; // val owned move 进槽
+                                            old.release(self.value_allocator);
                                         } else {
+                                            val.release(self.value_allocator);
                                             self.setErrMsg("no field '{s}' on type 'record'", .{fa.field}, "no such field");
                                             return error.GluePanic;
                                         }
                                     } else {
+                                        val.release(self.value_allocator);
                                         self.setErrMsg("cannot assign field '{s}' on type '{s}'", .{ fa.field, typeNameOf(variable.*.value) }, "cannot assign field");
                                         return error.GluePanic;
                                     }
@@ -4947,10 +5054,17 @@ pub const Evaluator = struct {
                         }
                     },
                     .index => |idx| {
+                        if (idx.object.* == .identifier) {
+                            if (environment.getPtr(idx.object.identifier.name)) |variable| {
+                                if (variable.value == .array) try self.cowField(variable);
+                            }
+                        }
                         const object = try self.evalExpr(idx.object, environment);
+                        defer object.release(self.value_allocator); // object 临时（共享箱体，release 仅减计数）
                         const index_val = try self.evalExpr(idx.index, environment);
+                        defer index_val.release(self.value_allocator);
                         switch (object) {
-                            .array => |*arr| {
+                            .array => |arr| {
                                 const i_val = switch (index_val) {
                                     .integer => |iv| iv,
                                     else => return error.TypeMismatch,
@@ -4959,7 +5073,11 @@ pub const Evaluator = struct {
                                 if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
                                     return error.IndexOutOfBounds;
                                 }
-                                arr.elements[@as(usize, @intCast(i))] = val;
+                                // val owned move 进槽，接管；旧元素被覆盖，release 归还。
+                                const slot = &arr.elements[@as(usize, @intCast(i))];
+                                const old = slot.*;
+                                slot.* = val;
+                                old.release(self.value_allocator);
                             },
                             else => return error.TypeMismatch,
                         }
@@ -4980,33 +5098,46 @@ pub const Evaluator = struct {
                                 return error.ImmutableAssignment;
                             }
                             if (variable.*.value == .record) {
+                                try self.cowField(variable);
                                 const map = &variable.*.value.record.fields;
                                 if (map.getPtr(fa.field)) |existing| {
-                                    existing.* = val;
+                                    const old = existing.*;
+                                    existing.* = val; // val owned move 进槽
+                                    old.release(self.value_allocator); // 旧字段值归还
                                 } else {
+                                    val.release(self.value_allocator);
                                     self.setErrMsg("no field '{s}' on type 'record'", .{fa.field}, "no such field");
                                     return error.GluePanic;
                                 }
                             } else {
+                                val.release(self.value_allocator);
                                 self.setErrMsg("cannot assign field '{s}' on type '{s}'", .{ fa.field, typeNameOf(variable.*.value) }, "cannot assign field");
                                 return error.GluePanic;
                             }
                         } else {
+                            val.release(self.value_allocator);
                             self.setErrMsg("undefined variable '{s}'", .{id.name}, "undefined variable");
                             return error.UndefinedVariable;
                         }
                     },
                     else => {
                         const object = try self.evalExpr(fa.object, environment);
+                        defer object.release(self.value_allocator); // object 临时
                         switch (object) {
-                            .record => |*rec| {
+                            .record => |rec| {
                                 if (rec.fields.getPtr(fa.field)) |existing| {
-                                    existing.* = val;
+                                    const old = existing.*;
+                                    existing.* = val; // val owned move 进槽
+                                    old.release(self.value_allocator);
                                 } else {
+                                    val.release(self.value_allocator);
                                     return error.UndefinedVariable;
                                 }
                             },
-                            else => return error.TypeMismatch,
+                            else => {
+                                val.release(self.value_allocator);
+                                return error.TypeMismatch;
+                            },
                         }
                     },
                 }
@@ -5260,11 +5391,14 @@ pub const Evaluator = struct {
     /// 通过 Iterable/Iterator 协议执行 for 循环
     /// 用于实现了 Iterable<T> trait 的自定义类型
     fn evalForStmtWithIterator(self: *Evaluator, fs: @TypeOf(@as(ast.Stmt, undefined).for_stmt), iterable: Value, environment: *Environment) EvalResult!?Value {
+        // iterable 为 owned；迭代器内部可能引用其底层数组，故 iterable 存活到循环结束后 release。
+        defer iterable.release(self.value_allocator);
         // 调用 iterable.iterator() 获取迭代器
         const iter = self.callMethod(iterable, "iterator", &[_]Value{}, environment) catch |err| switch (err) {
             error.UndefinedVariable => return error.TypeMismatch,
             else => return err,
         };
+        defer iter.release(self.value_allocator); // 迭代器为 owned 临时
 
         // 循环调用 iter.next()
         while (true) {
@@ -5275,13 +5409,27 @@ pub const Evaluator = struct {
             if (next_val.isNull()) break;
 
             const loop_env = try environment.createChild();
+            // define clone(=retain) 出 env 自己一份；next_val 的 owned 引用绑定后 release。
             try loop_env.define(fs.name, next_val, false);
+            next_val.release(self.value_allocator);
 
-            _ = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {
-                error.BreakSignal => break,
-                error.ContinueSignal => continue,
-                else => return err,
+            const body_val = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {
+                error.BreakSignal => {
+                    loop_env.releaseEnv();
+                    break;
+                },
+                error.ContinueSignal => {
+                    loop_env.releaseEnv();
+                    continue;
+                },
+                else => {
+                    loop_env.releaseEnv();
+                    return err;
+                },
             };
+            body_val.release(self.value_allocator); // 循环体结果丢弃
+            // 每轮迭代结束释放本轮帧（若被闭包捕获则 rc>1，仅减计数，帧存活）
+            loop_env.releaseEnv();
         }
 
         return null;
@@ -5290,23 +5438,27 @@ pub const Evaluator = struct {
     fn evalWhileStmt(self: *Evaluator, ws: @TypeOf(@as(ast.Stmt, undefined).while_stmt), environment: *Environment) EvalResult!?Value {
         while (true) {
             const condition = try self.evalExpr(ws.condition, environment);
-            if (!condition.isTruthy()) break;
+            const truthy = condition.isTruthy();
+            condition.release(self.value_allocator); // 条件为临时
+            if (!truthy) break;
 
-            _ = self.evalExpr(ws.body, environment) catch |err| switch (err) {
+            const body_val = self.evalExpr(ws.body, environment) catch |err| switch (err) {
                 error.BreakSignal => break,
                 error.ContinueSignal => continue,
                 else => return err,
             };
+            body_val.release(self.value_allocator); // 循环体结果丢弃
         }
         return null;
     }
 
     fn evalLoopStmt(self: *Evaluator, ls: @TypeOf(@as(ast.Stmt, undefined).loop_stmt), environment: *Environment) EvalResult!?Value {
         while (true) {
-            _ = self.evalExpr(ls.body, environment) catch |err| switch (err) {
+            const body_val = self.evalExpr(ls.body, environment) catch |err| switch (err) {
                 error.BreakSignal => break,
                 else => return err,
             };
+            body_val.release(self.value_allocator); // 循环体结果丢弃
         }
         return null;
     }

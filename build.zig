@@ -55,6 +55,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const slab_pool_module = b.createModule(.{
+        .root_source_file = b.path("runtime/slab_pool.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const channel_module = b.createModule(.{
         .root_source_file = b.path("runtime/channel.zig"),
         .target = target,
@@ -271,6 +277,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("lexer", lexer_module);
     root_module.addImport("parser", parser_module);
     root_module.addImport("eval", eval_module);
+    root_module.addImport("slab_pool", slab_pool_module);
     root_module.addImport("zio", zio_module);
 
     // Zio 在 Windows 上需要 ws2_32（Winsock2，IOCP 后端依赖）
@@ -328,10 +335,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_module_check_unit_tests = b.addRunArtifact(module_check_unit_tests);
 
+    const slab_pool_unit_tests = b.addTest(.{
+        .root_module = slab_pool_module,
+    });
+    const run_slab_pool_unit_tests = b.addRunArtifact(slab_pool_unit_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_eval_unit_tests.step);
     test_step.dependOn(&run_lexer_unit_tests.step);
     test_step.dependOn(&run_parser_unit_tests.step);
     test_step.dependOn(&run_type_check_unit_tests.step);
     test_step.dependOn(&run_module_check_unit_tests.step);
+    test_step.dependOn(&run_slab_pool_unit_tests.step);
 }

@@ -143,6 +143,8 @@ pub const AdtValue = struct {
     constructor: []const u8,
     /// 构造器字段值
     fields: []AdtField,
+    /// 引用计数（共享 + 写时拷贝；阶段 0 仅就位，未接入释放）
+    rc: u32 = 1,
 };
 
 // ============================================================
@@ -161,6 +163,7 @@ pub const NewtypeValue = struct {
     type_name: []const u8,
     /// 内部被包装的值
     inner: Value,
+    rc: u32 = 1,
 };
 
 // ============================================================
@@ -513,6 +516,7 @@ pub const FloatValue = struct {
 pub const RecordValue = struct {
     type_name: []const u8, // 创建时的类型名，匿名记录字面量为 ""
     fields: std.StringHashMap(Value),
+    rc: u32 = 1,
 };
 
 /// 部分应用值 — 默认柯里化的运行时表示
@@ -542,6 +546,7 @@ pub const PartialApplication = struct {
 pub const ArrayValue = struct {
     elements: []Value,
     fixed_size: ?u64, // null = 动态 T[], non-null = 固定大小 T[N]
+    rc: u32 = 1,
 };
 
 pub const Value = union(enum) {
@@ -554,9 +559,9 @@ pub const Value = union(enum) {
     null_val,
     unit,
 
-    // 复合类型
-    array: ArrayValue,
-    record: RecordValue,
+    // 复合类型（装箱为指针以支持引用计数共享 + 写时拷贝）
+    array: *ArrayValue,
+    record: *RecordValue,
 
     // ADT 值（代数数据类型构造器实例）
     adt: *AdtValue,
@@ -608,6 +613,67 @@ pub const Value = union(enum) {
     /// Lazy<T> 值（Phase 7，文档 §6.10）：延迟求值 + 首次访问缓存
     lazy_val: *LazyValue,
 
+    /// 装箱构造：分配一个 rc=1 的数组值。
+    pub fn makeArray(allocator: std.mem.Allocator, elements: []Value, fixed_size: ?u64) !Value {
+        const p = try allocator.create(ArrayValue);
+        p.* = ArrayValue{ .elements = elements, .fixed_size = fixed_size, .rc = 1 };
+        return Value{ .array = p };
+    }
+
+    /// 装箱构造：分配一个 rc=1 的记录值。
+    pub fn makeRecord(allocator: std.mem.Allocator, type_name: []const u8, fields: std.StringHashMap(Value)) !Value {
+        const p = try allocator.create(RecordValue);
+        p.* = RecordValue{ .type_name = type_name, .fields = fields, .rc = 1 };
+        return Value{ .record = p };
+    }
+
+    /// 引用计数 +1（用于共享绑定/传参，替代深拷贝）。返回自身便于链式。
+    /// 仅对带 rc 的堆值有效；基础类型/无 rc 类型原样返回。
+    pub fn retain(self: Value) Value {
+        switch (self) {
+            .adt => |p| p.rc += 1,
+            .newtype => |p| p.rc += 1,
+            .array => |p| p.rc += 1,
+            .record => |p| p.rc += 1,
+            else => {},
+        }
+        return self;
+    }
+
+    /// 引用计数 -1；归零则递归 release 子值并释放箱体。
+    pub fn release(self: Value, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .adt => |p| {
+                if (p.rc > 1) { p.rc -= 1; return; }
+                for (p.fields) |*f| f.value.release(allocator);
+                allocator.free(p.fields);
+                allocator.destroy(p);
+            },
+            .newtype => |p| {
+                if (p.rc > 1) { p.rc -= 1; return; }
+                p.inner.release(allocator);
+                allocator.destroy(p);
+            },
+            .array => |p| {
+                if (p.rc > 1) { p.rc -= 1; return; }
+                for (p.elements) |*e| e.release(allocator);
+                allocator.free(p.elements);
+                allocator.destroy(p);
+            },
+            .record => |p| {
+                if (p.rc > 1) { p.rc -= 1; return; }
+                var it = p.fields.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.*.release(allocator);
+                }
+                p.fields.deinit();
+                allocator.destroy(p);
+            },
+            else => {},
+        }
+    }
+
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .array => |arr| {
@@ -616,7 +682,7 @@ pub const Value = union(enum) {
                 }
                 allocator.free(arr.elements);
             },
-            .record => |*rv| {
+            .record => |rv| {
                 if (rv.type_name.len > 0) {
                     allocator.free(rv.type_name);
                 }
@@ -690,28 +756,11 @@ pub const Value = union(enum) {
             .unit => self,
             .builtin => self,
             .range => self,
-            // §5.2 规则 2: 不可变数据结构 — 深拷贝
+            // §5.2 规则 2: 不可变数据结构 — 同 Heap 内共享（retain），写时拷贝(COW)保证别名安全。
+            // 这把绑定/传参从 O(size) 深拷贝降为 O(1) retain，链表累加从 O(n^2) 变 O(n)。
             .string => |s| Value{ .string = try allocator.dupe(u8, s) },
-            .array => |arr| {
-                var new_arr = try allocator.alloc(Value, arr.elements.len);
-                for (arr.elements, 0..) |item, i| {
-                    new_arr[i] = try item.clone(allocator);
-                }
-                return Value{ .array = ArrayValue{ .elements = new_arr, .fixed_size = arr.fixed_size } };
-            },
-            .record => |rv| {
-                var new_map = std.StringHashMap(Value).init(allocator);
-                var iter = rv.fields.iterator();
-                while (iter.next()) |entry| {
-                    const key = try allocator.dupe(u8, entry.key_ptr.*);
-                    const val = try entry.value_ptr.*.clone(allocator);
-                    try new_map.put(key, val);
-                }
-                return Value{ .record = .{
-                    .type_name = if (rv.type_name.len > 0) try allocator.dupe(u8, rv.type_name) else "",
-                    .fields = new_map,
-                } };
-            },
+            .array => self.retain(),
+            .record => self.retain(),
             // §5.2 规则 5: 闭包 — 同 Heap 内浅拷贝；跨 Heap 时由 deepCloneValue 深拷贝环境
             .closure => self,
             // §5.2 规则 2: 不可变数据结构 — 深拷贝
@@ -729,55 +778,8 @@ pub const Value = union(enum) {
                 };
                 return Value{ .partial = new_pa };
             },
-            .adt => |av| {
-                // 链表式 ADT（如 Cons(x, Cons(x, ...))）若按字段递归 clone，会在原生栈上
-                // 递归到与列表等深，深列表(>~1500)直接爆栈。这里对「单 ADT 尾字段」构成的
-                // 脊柱做迭代 clone：每个节点的非脊柱字段照常递归 clone，脊柱字段用循环展开，
-                // 使常见的 cons-list clone 只占常数原生栈。分叉结构(树)仍走递归。
-                const head = try allocator.create(AdtValue);
-                var cur_src = av;
-                var cur_dst = head;
-                while (true) {
-                    cur_dst.* = AdtValue{
-                        .type_name = try allocator.dupe(u8, cur_src.type_name),
-                        .constructor = try allocator.dupe(u8, cur_src.constructor),
-                        .fields = try allocator.alloc(AdtField, cur_src.fields.len),
-                    };
-                    // 找脊柱字段：最后一个 ADT 类型的字段作为迭代延续，其余递归 clone。
-                    var spine_idx: ?usize = null;
-                    if (cur_src.fields.len > 0) {
-                        const last = cur_src.fields.len - 1;
-                        if (cur_src.fields[last].value == .adt) spine_idx = last;
-                    }
-                    for (cur_src.fields, 0..) |f, i| {
-                        if (spine_idx != null and i == spine_idx.?) continue; // 脊柱字段稍后链接
-                        cur_dst.fields[i] = AdtField{
-                            .name = if (f.name) |n| try allocator.dupe(u8, n) else null,
-                            .value = try f.value.clone(allocator),
-                        };
-                    }
-                    if (spine_idx) |si| {
-                        const child = try allocator.create(AdtValue);
-                        cur_dst.fields[si] = AdtField{
-                            .name = if (cur_src.fields[si].name) |n| try allocator.dupe(u8, n) else null,
-                            .value = Value{ .adt = child },
-                        };
-                        cur_src = cur_src.fields[si].value.adt;
-                        cur_dst = child;
-                    } else {
-                        break;
-                    }
-                }
-                return Value{ .adt = head };
-            },
-            .newtype => |nv| {
-                const new_nv = try allocator.create(NewtypeValue);
-                new_nv.* = NewtypeValue{
-                    .type_name = try allocator.dupe(u8, nv.type_name),
-                    .inner = try nv.inner.clone(allocator),
-                };
-                return Value{ .newtype = new_nv };
-            },
+            .adt => self.retain(),
+            .newtype => self.retain(),
             .error_val => |e| Value{ .error_val = ErrorValue{
                 .type_name = try allocator.dupe(u8, e.type_name),
                 .message = try allocator.dupe(u8, e.message),

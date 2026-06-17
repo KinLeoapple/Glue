@@ -4,6 +4,7 @@ const lexer = @import("lexer");
 const parser = @import("parser");
 const ast = @import("ast");
 const eval = @import("eval");
+const slab_pool = @import("slab_pool");
 
 /// 把求值器错误映射为专业英文消息（Go/Java 风格）。
 /// 若求值器已经设置了带上下文的 panic_message（如 "no method 'x' on type 'array'"），
@@ -46,14 +47,25 @@ pub fn main(init: std.process.Init) !void {
 
     const args_slice = try std.process.Args.toSlice(init.minimal.args, init.arena.allocator());
 
-    if (args_slice.len > 1) {
-        try runFile(allocator, io, args_slice[1]);
+    // 内存诊断标志 --gpa：用 DebugAllocator 替代 arena，检测 double-free/泄漏。
+    var gpa_mode = false;
+    var file_arg: ?[]const u8 = null;
+    for (args_slice[1..]) |a| {
+        if (std.mem.eql(u8, a, "--gpa")) {
+            gpa_mode = true;
+        } else if (file_arg == null) {
+            file_arg = a;
+        }
+    }
+
+    if (file_arg) |fname| {
+        try runFile(allocator, io, fname, gpa_mode);
     } else {
         try runRepl(allocator, io);
     }
 }
 
-fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void {
+fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8, gpa_mode: bool) !void {
     const cwd = std.Io.Dir.cwd();
     const source = cwd.readFileAlloc(io, filename, allocator, .unlimited) catch |err| {
         var err_buf: [4096]u8 = undefined;
@@ -64,12 +76,53 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !void
     };
     defer allocator.free(source);
 
-    // 使用 ArenaAllocator 管理解析和求值的所有临时分配
+    // 内存诊断模式（--gpa）：用 DebugAllocator 取代 arena，精确检测 double-free 与泄漏。
+    // 默认仍用 arena（快、整体释放）。诊断模式专供 refcount 攻坚定位释放点。
+    if (gpa_mode) {
+        var dbg: std.heap.DebugAllocator(.{}) = .init;
+        const dbg_alloc = dbg.allocator();
+        {
+            // 全程用 DebugAllocator：检测整程序的 double-free / 泄漏（含编译期数据）。
+            // 编译期数据本就活到退出会被报为 leak，但 double-free / invalid-free 会立即 panic，
+            // 这正是 refcount 攻坚要抓的——优先消除 invalid-free，再逐步降低 leak。
+            // value_allocator 走 SlabPool（backing=dbg_alloc），运行期 Value 箱体/载荷的
+            // pool 归还若与 release 记账不一致，DebugAllocator 会立即 panic 定位。
+            var pool = slab_pool.SlabPool.init(dbg_alloc);
+            defer pool.deinit();
+            var ev = eval.Evaluator.initWithIo(dbg_alloc, io);
+            ev.value_allocator = pool.allocator();
+            ev.global_env.value_allocator = ev.value_allocator;
+            defer ev.deinit();
+            const had_err = executeSource(dbg_alloc, &ev, io, source, filename);
+            if (!had_err) {
+                _ = ev.callMain() catch {};
+            }
+        }
+        const leaked = dbg.deinit();
+        var err_buf: [256]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &err_buf);
+        if (leaked == .leak) {
+            w.interface.print("[GLUE_GPA] LEAK detected\n", .{}) catch {};
+        } else {
+            w.interface.print("[GLUE_GPA] clean (no leak / no double-free)\n", .{}) catch {};
+        }
+        w.flush() catch {};
+        return;
+    }
+
+    // 使用 ArenaAllocator 管理解析和求值的所有临时分配（编译期/全程数据）。
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
+    // 运行期 Value（adt/record/array/newtype 箱体及载荷）走 SlabPool。
+    // backing = 底层 gpa（非 arena）：空 slab 归还才真正还给 OS，内存随死对象回落。
+    var pool = slab_pool.SlabPool.init(allocator);
+    defer pool.deinit();
+
     var ev = eval.Evaluator.initWithIo(arena_alloc, io);
+    ev.value_allocator = pool.allocator();
+    ev.global_env.value_allocator = ev.value_allocator;
     defer ev.deinit();
 
     const has_error = executeSource(arena_alloc, &ev, io, source, filename);
