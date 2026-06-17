@@ -1893,7 +1893,8 @@ pub const Evaluator = struct {
                                     const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
                                     if (args.len != 1) return error.WrongArity;
                                     const data: *ErrorNewtypeCtx = @ptrCast(@alignCast(user_ctx orelse return error.TypeMismatch));
-                                    const nv = try ev.allocator.create(value.NewtypeValue);
+                                    // 箱体走 value_allocator：与 release 同源(否则 pool 守卫忽略→泄漏)。
+                                    const nv = try ev.value_allocator.create(value.NewtypeValue);
                                     nv.* = value.NewtypeValue{
                                         .type_name = data.type_name,
                                         .inner = args[0],
@@ -1952,19 +1953,24 @@ pub const Evaluator = struct {
                                                 return error.WrongArity;
                                             }
 
-                                            const av = try ev.allocator.create(value.AdtValue);
-                                            const fields = try ev.allocator.alloc(value.AdtField, args.len);
+                                            // 箱体 + fields 数组走 value_allocator(SlabPool)：
+                                            // release(value.zig)用 value_allocator 释放箱体+fields 数组+子值，分配/释放须同源。
+                                            // 之前走 arena → release 时 pool 魔数守卫安全忽略 → ADT 永不回收(无界泄漏)。
+                                            // type_name/constructor/field.name 直接借用 ctx 的常驻副本(注册时 dupe 一次)：
+                                            // release 不碰这些字符串，借用安全；每次构造再 dupe 是 arena 无界泄漏(churn 下累积)。
+                                            const av = try ev.value_allocator.create(value.AdtValue);
+                                            const fields = try ev.value_allocator.alloc(value.AdtField, args.len);
                                             for (args, 0..) |arg, i| {
                                                 // 把实参强制转换到声明的字段类型（如 i32），与函数形参一致。
                                                 const coerced = if (data.field_types[i]) |tn| (ev.castValue(arg, tn) catch arg) else arg;
                                                 fields[i] = value.AdtField{
-                                                    .name = if (data.field_names[i]) |n| try ev.allocator.dupe(u8, n) else null,
+                                                    .name = data.field_names[i],
                                                     .value = coerced,
                                                 };
                                             }
                                             av.* = value.AdtValue{
-                                                .type_name = try ev.allocator.dupe(u8, data.type_name),
-                                                .constructor = try ev.allocator.dupe(u8, data.constructor_name),
+                                                .type_name = data.type_name,
+                                                .constructor = data.constructor_name,
                                                 .fields = fields,
                                             };
                                             return Value{ .adt = av };
@@ -3231,15 +3237,17 @@ pub const Evaluator = struct {
         for (call.arguments) |arg_expr| {
             const arg = try self.evalExpr(arg_expr, environment);
             self.pushRoot(arg);
-            try args.append(self.allocator, arg);
+            try args.append(self.value_allocator, arg);
             // arg 已复制到 args 中，但 pushRoot 保护直到函数返回
         }
         // args 移交 callFunction 消费（closure param define=clone / partial / builtin 读取）。
         // 不在此 release：define 对 boxed 是浅 retain(共享箱体+子值)，嵌套/match 解构场景下
         // 在此 release 会递归释放已被其他持有者释放的子值 → double-free(实测崩 9 测试)。
         // fresh 实参那份 rc 的精确回收需 callFunction 接管语义重构(见续10)。
+        // backing 走 value_allocator(SlabPool)：每次调用一个 args 列表，arena 下 deinit 是
+        // no-op，深递归/大量调用会让 args backing 焊在峰值；走 pool 则即时回收。
         defer {
-            args.deinit(self.allocator);
+            args.deinit(self.value_allocator);
             self.popRoots(args.items.len); // 弹出所有参数的 root
         }
 
@@ -3259,7 +3267,10 @@ pub const Evaluator = struct {
 
         // TCO: 如果在尾位置且被调用者是闭包，使用尾调用优化
         if (self.in_tail_position and callee == .closure) {
-            const owned_args = try self.allocator.dupe(Value, args.items);
+            // args 副本走 value_allocator(SlabPool)：长 trampoline 每轮尾调用都 dupe 一份，
+            // 若走 arena 则 free 是 no-op，深递归下 args 副本焊在峰值(O(n) 内存)。
+            // 走 pool 则 trampoline 释放上一轮 args 时即时回收。释放点同源(value_allocator)。
+            const owned_args = try self.value_allocator.dupe(Value, args.items);
             self.tail_call = TailCall{
                 .closure = callee.closure,
                 .args = owned_args,
@@ -3335,10 +3346,10 @@ pub const Evaluator = struct {
                 // Trampoline 循环：尾调用不创建新栈帧，而是循环执行
                 var current_closure = initial_closure;
                 var current_args = args;
-                // 跟踪需要释放的 args（由 evalCall 中 toOwnedSlice 转移所有权）
+                // 跟踪需要释放的 args（由 evalCall 中 dupe 转移所有权，走 value_allocator）
                 var args_owned: ?[]const Value = null;
                 defer {
-                    if (args_owned) |owned| self.allocator.free(owned);
+                    if (args_owned) |owned| self.value_allocator.free(owned);
                 }
 
                 while (true) {
@@ -3386,9 +3397,9 @@ pub const Evaluator = struct {
                             // TCO: 检测到尾调用，循环执行下一次调用
                             const tc = self.tail_call.?;
                             self.tail_call = null;
-                            // 释放上一次的 args 副本
+                            // 释放上一次的 args 副本（value_allocator，与 dupe 同源）
                             if (args_owned) |owned| {
-                                self.allocator.free(owned);
+                                self.value_allocator.free(owned);
                                 args_owned = null;
                             }
                             call_env.releaseEnv(); // 尾调用不保留本帧
@@ -4423,6 +4434,12 @@ pub const Evaluator = struct {
                     self.in_tail_position = saved_tail;
                     // 执行 defer 后传播尾调用
                     self.runDefers(defer_stack.items, block_env) catch {};
+                    // 尾调用结果已移交 self.tail_call，本块帧不再需要：在此释放。
+                    // 关键：TCO trampoline 会对 call_env 显式 releaseEnv，而本 block_env
+                    // 经 createChild 已 retain 了 call_env（子持有父）。若此处不释放，call_env.rc
+                    // 卡在 1 无法归零摘除，导致 closure_env.children 随尾迭代无界增长（O(n²)
+                    // swapRemove + 内存泄漏）。释放本块帧会连带 releaseEnv 其父 call_env 的那一份引用。
+                    block_env.releaseEnv();
                     return err;
                 },
                 else => {

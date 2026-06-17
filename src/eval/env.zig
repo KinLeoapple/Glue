@@ -55,7 +55,9 @@ pub const Environment = struct {
             i -= 1;
             var child = self.children.items[i];
             child.deinit();
-            self.allocator.destroy(child);
+            // 用子自己的 allocator 销毁：运行期子帧走 value_allocator(pool)，
+            // 而父可能是 arena。用 self.allocator 销毁 pool 分配的子 → 分配器错配 invalid free。
+            child.allocator.destroy(child);
         }
         self.children.deinit(self.allocator);
 
@@ -170,12 +172,17 @@ pub const Environment = struct {
     }
 
     pub fn createChild(self: *Environment) !*Environment {
-        const child = try self.allocator.create(Environment);
+        // 运行期作用域帧走 value_allocator（SlabPool）：releaseEnv 时即时回收，
+        // 不像 arena 那样焊在峰值。深递归/大量调用下帧内存随作用域退出回落。
+        // 子帧的 allocator 设为 value_allocator，使其 key dupe / HashMap backing /
+        // children 列表 / 销毁全部同源于 pool（releaseEnv 用 self.allocator 释放）。
+        const frame_alloc = self.value_allocator;
+        const child = try frame_alloc.create(Environment);
         child.* = Environment{
-            .values = std.StringHashMap(Variable).init(self.allocator),
+            .values = std.StringHashMap(Variable).init(frame_alloc),
             .parent = self,
             .children = std.ArrayList(*Environment).empty,
-            .allocator = self.allocator,
+            .allocator = frame_alloc,
             .value_allocator = self.value_allocator,
             .rc = 1,
         };
