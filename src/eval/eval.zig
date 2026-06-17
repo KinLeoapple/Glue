@@ -3224,19 +3224,20 @@ pub const Evaluator = struct {
 
         // 求值参数
         var args = std.ArrayList(Value).empty;
-        // args 为 owned 临时。所有权移交给 callFunction（param 绑定 / partial bound_args /
-        // builtin）。callFunction 各分支接管语义不一（define=clone、partial 浅拷接管、
-        // builtin 读取），故由被调方负责消费——本函数只负责 deinit 容器，不 release 元素。
+        // args 为 owned 临时。callFunction 通过 param define(clone=retain) 出 call_env
+        // 自己一份；本函数持有的 owned 引用在 callFunction 返回后 release。
+        // 注意：release 在 callFunction 返回后(defer)执行，此时 match 等帧内求值已完成，
+        // 不影响 scrutinee/pattern 绑定。TCO 路径 args 移交 tail_call，单独标记不 release。
         for (call.arguments) |arg_expr| {
             const arg = try self.evalExpr(arg_expr, environment);
             self.pushRoot(arg);
             try args.append(self.allocator, arg);
             // arg 已复制到 args 中，但 pushRoot 保护直到函数返回
         }
-        // args 移交 callFunction（param define / partial bound_args / builtin 读取）。
-        // 注：当前不在此 release args——callFunction 各分支接管语义不一，且与 pattern
-        // 绑定/TCO 交织，统一 release 会 use-after-free。args 所有权待 callFunction +
-        // pattern 接管语义一并重构（见 plan 阶段B 高风险子步）。
+        // args 移交 callFunction 消费（closure param define=clone / partial / builtin 读取）。
+        // 不在此 release：define 对 boxed 是浅 retain(共享箱体+子值)，嵌套/match 解构场景下
+        // 在此 release 会递归释放已被其他持有者释放的子值 → double-free(实测崩 9 测试)。
+        // fresh 实参那份 rc 的精确回收需 callFunction 接管语义重构(见续10)。
         defer {
             args.deinit(self.allocator);
             self.popRoots(args.items.len); // 弹出所有参数的 root
