@@ -1439,7 +1439,11 @@ pub const Evaluator = struct {
             self.setErrMsg("Ok expects 1 argument, got {d}", .{args.len}, "Ok: wrong number of arguments");
             return error.WrongArity;
         }
-        return throw_mod.makeOk(self.allocator, args[0]);
+        // 统一调用约定(续14)：caller(evalCall) release 其 owned arg，故 Ok 须 clone 自留一份。
+        // 否则内层记录/ADT 被 evalCall 释放后 throw_val.ok 悬垂(实测 stress_json 崩)。
+        // clone 走 value_allocator 与 release 同源(SlabPool)，避免 pool/arena 错配。
+        const owned = try args[0].clone(self.value_allocator);
+        return throw_mod.makeOk(self.allocator, owned);
     }
 
     /// 确保 stdin 持久化读取器已创建（首次调用时堆分配），返回读取器接口指针
@@ -1897,7 +1901,8 @@ pub const Evaluator = struct {
                                     const nv = try ev.value_allocator.create(value.NewtypeValue);
                                     nv.* = value.NewtypeValue{
                                         .type_name = data.type_name,
-                                        .inner = args[0],
+                                        // 统一调用约定(续14)：clone 自留一份；caller(evalCall) release 其 owned arg。
+                                        .inner = try args[0].clone(ev.value_allocator),
                                     };
                                     return Value{ .newtype = nv };
                                 }
@@ -1961,8 +1966,13 @@ pub const Evaluator = struct {
                                             const av = try ev.value_allocator.create(value.AdtValue);
                                             const fields = try ev.value_allocator.alloc(value.AdtField, args.len);
                                             for (args, 0..) |arg, i| {
-                                                // 把实参强制转换到声明的字段类型（如 i32），与函数形参一致。
-                                                const coerced = if (data.field_types[i]) |tn| (ev.castValue(arg, tn) catch arg) else arg;
+                                                // 统一调用约定(续14)：caller 拥有并 release args，callee 借用并 clone
+                                                // 自己保留的那份。castValue 成功返回 fresh owned，可直接存；失败 catch 到
+                                                // borrow，须 clone 自有一份。否则 evalCall 的 release 会与本处 move 双重释放。
+                                                const coerced = if (data.field_types[i]) |tn|
+                                                    (ev.castValue(arg, tn) catch try arg.clone(ev.value_allocator))
+                                                else
+                                                    try arg.clone(ev.value_allocator);
                                                 fields[i] = value.AdtField{
                                                     .name = data.field_names[i],
                                                     .value = coerced,
@@ -2009,7 +2019,12 @@ pub const Evaluator = struct {
                                     var map = std.StringHashMap(Value).init(ev.allocator);
                                     for (args, 0..) |arg, i| {
                                         const key = try ev.allocator.dupe(u8, data.field_names[i]);
-                                        const coerced = if (data.field_types[i]) |tn| (ev.castValue(arg, tn) catch arg) else arg;
+                                        // 统一调用约定(续14)：castValue 成功=fresh owned 直接存；否则 clone 自留。
+                                        // caller(evalCall) release 其 owned arg，故此处不能 move borrow。
+                                        const coerced = if (data.field_types[i]) |tn|
+                                            (ev.castValue(arg, tn) catch try arg.clone(ev.value_allocator))
+                                        else
+                                            try arg.clone(ev.value_allocator);
                                         try map.put(key, coerced);
                                     }
                                     return try value.Value.makeRecord(ev.value_allocator, try ev.allocator.dupe(u8, data.type_name), map);
@@ -3240,13 +3255,20 @@ pub const Evaluator = struct {
             try args.append(self.value_allocator, arg);
             // arg 已复制到 args 中，但 pushRoot 保护直到函数返回
         }
-        // args 移交 callFunction 消费（closure param define=clone / partial / builtin 读取）。
-        // 不在此 release：define 对 boxed 是浅 retain(共享箱体+子值)，嵌套/match 解构场景下
-        // 在此 release 会递归释放已被其他持有者释放的子值 → double-free(实测崩 9 测试)。
-        // fresh 实参那份 rc 的精确回收需 callFunction 接管语义重构(见续10)。
-        // backing 走 value_allocator(SlabPool)：每次调用一个 args 列表，arena 下 deinit 是
-        // no-op，深递归/大量调用会让 args backing 焊在峰值；走 pool 则即时回收。
+        // owned 模型收口(续14/泄漏C)：每个 arg 由 evalExpr 返回 owned(+1)。callFunction 的
+        // 消费方(closure define / partial clone)各自再 retain 自己那份，故本函数持有的 owned +1
+        // 必须在调用返回后 release——否则 fresh 复合实参(如 Cons(n,acc))的 +1 永不归零 → 泄漏。
+        // 例外：TCO 路径把 owned 所有权 *浅 dupe* 移交 tail_call.args（同一批箱体），此时
+        // 不能在此 release(否则 trampoline 用到已释放箱体 / 双重释放)，由 moved_to_tail 标记跳过，
+        // 改由 trampoline 在轮转/退出时释放。
+        // 早前"统一 release 崩 9 测试"是 owned 模型尚不对称时(identifier 不 retain / define 非
+        // clone)的产物；现 evalIdentifier=retain、define=clone(retain)，收支对称，release 安全。
+        // backing 走 value_allocator(SlabPool)：每次调用一个 args 列表，深递归/大量调用即时回收。
+        var moved_to_tail = false;
         defer {
+            if (!moved_to_tail) {
+                for (args.items) |a| a.release(self.value_allocator);
+            }
             args.deinit(self.value_allocator);
             self.popRoots(args.items.len); // 弹出所有参数的 root
         }
@@ -3270,7 +3292,11 @@ pub const Evaluator = struct {
             // args 副本走 value_allocator(SlabPool)：长 trampoline 每轮尾调用都 dupe 一份，
             // 若走 arena 则 free 是 no-op，深递归下 args 副本焊在峰值(O(n) 内存)。
             // 走 pool 则 trampoline 释放上一轮 args 时即时回收。释放点同源(value_allocator)。
+            // dupe 是浅拷贝：复制 Value 句柄(箱体指针)而非箱体本身，rc 不变。本函数对每个 arg
+            // 持有的 owned +1 随之移交给 tail_call.args，由 trampoline 释放。置 moved_to_tail
+            // 跳过本函数 defer 的 release，避免双重释放。
             const owned_args = try self.value_allocator.dupe(Value, args.items);
+            moved_to_tail = true;
             self.tail_call = TailCall{
                 .closure = callee.closure,
                 .args = owned_args,
@@ -3346,10 +3372,16 @@ pub const Evaluator = struct {
                 // Trampoline 循环：尾调用不创建新栈帧，而是循环执行
                 var current_closure = initial_closure;
                 var current_args = args;
-                // 跟踪需要释放的 args（由 evalCall 中 dupe 转移所有权，走 value_allocator）
+                // 跟踪需要释放的 args（由 evalCall 中 dupe 转移所有权，走 value_allocator）。
+                // tail_call.args 的每个元素都携带内层 evalCall 移交的 owned +1(见 evalCall
+                // moved_to_tail)，丢弃一批时必须先逐元素 release 再释放 slice，否则尾递归累积的
+                // fresh 复合实参 +1 永不归零 → 泄漏C。
                 var args_owned: ?[]const Value = null;
                 defer {
-                    if (args_owned) |owned| self.value_allocator.free(owned);
+                    if (args_owned) |owned| {
+                        for (owned) |a| a.release(self.value_allocator);
+                        self.value_allocator.free(owned);
+                    }
                 }
 
                 while (true) {
@@ -3397,8 +3429,10 @@ pub const Evaluator = struct {
                             // TCO: 检测到尾调用，循环执行下一次调用
                             const tc = self.tail_call.?;
                             self.tail_call = null;
-                            // 释放上一次的 args 副本（value_allocator，与 dupe 同源）
+                            // 释放上一次的 args 副本（value_allocator，与 dupe 同源）。
+                            // 逐元素 release 归还移交的 owned +1，再释放 slice。
                             if (args_owned) |owned| {
+                                for (owned) |a| a.release(self.value_allocator);
                                 self.value_allocator.free(owned);
                                 args_owned = null;
                             }
@@ -3427,7 +3461,13 @@ pub const Evaluator = struct {
                         },
                     };
 
-                    _ = final_result.retain(); // 正常返回值逃出帧：先保活
+                    // 返回值逃出本调用帧。evalExpr(body) 已返回 owned(+1)：
+                    //  - block 体：evalBlock 出口已 retain 再 releaseEnv，返回 owned；
+                    //  - expression 体：evalExpr 各分支(identifier=retain / 构造器=rc1)亦返 owned。
+                    // 故此处只需释放 call_env(param 绑定)，不能再 retain——否则 fresh 返回值
+                    // (如 B(n)/Cons) 的 +1 无对应 release，每次函数调用泄漏一个箱体(实测泄漏C)。
+                    // call_env.releaseEnv 只释放本帧 param 绑定；若返回值恰好别名某 param，
+                    // 该 param 绑定 clone 时已 retain 过(rc≥2)，releaseEnv 减 1 后仍存活，owned 不丢。
                     call_env.releaseEnv();
                     return final_result;
                 }
@@ -4453,9 +4493,9 @@ pub const Evaluator = struct {
         // 执行 defer
         try self.runDefers(defer_stack.items, block_env);
 
-        // 正常退出：返回值可能是块内局部绑定，先 retain 保活再释放本块帧。
-        // （错误/控制流出口不在此释放——由外层调用帧 releaseEnv 时传递性回收。）
-        _ = result.retain();
+        // 正常退出：evalExpr 已返回 owned，且与帧内绑定的 ref 相互独立
+        // （evalIdentifier=retain 出独立 owned；构造器=rc1 fresh）。故 block_env 绑定的释放
+        // 不影响返回值的 owned ref，无需再 retain——再 retain 会使 fresh 返回值多 1 永不归零(泄漏C)。
         block_env.releaseEnv();
         return result;
     }
