@@ -7,6 +7,10 @@
 
 const std = @import("std");
 const value = @import("value");
+const intern = @import("intern");
+
+/// 变量名 id（intern 后的整数键）。见 src/intern.zig。
+pub const NameId = u32;
 
 /// 变量绑定
 pub const Variable = struct {
@@ -23,7 +27,9 @@ pub const Variable = struct {
 
 /// 变量环境（词法作用域）
 pub const Environment = struct {
-    values: std.StringHashMap(Variable),
+    /// 绑定表：键是 intern 后的名字 id（u32），非字符串。消除每次 define 的 key dupe/free
+    /// 和每次 lookup 的字符串哈希。id 是值类型、无所有权，故 deinit/release 不再 free key。
+    values: std.AutoHashMap(NameId, Variable),
     parent: ?*Environment,
     children: std.ArrayList(*Environment),
     allocator: std.mem.Allocator,
@@ -40,7 +46,7 @@ pub const Environment = struct {
 
     pub fn init(allocator: std.mem.Allocator) Environment {
         return Environment{
-            .values = std.StringHashMap(Variable).init(allocator),
+            .values = std.AutoHashMap(NameId, Variable).init(allocator),
             .parent = null,
             .children = std.ArrayList(*Environment).empty,
             .allocator = allocator,
@@ -70,10 +76,9 @@ pub const Environment = struct {
 
         // 释放值中的堆分配数据。用 release（引用计数感知）而非 deinit：
         // 共享值（rc>1）只减计数，归零才真正释放，避免多个变量持有同一记录/数组时双重释放。
-        // 续14：weak 绑定不拥有 value，跳过 release。
+        // 续14：weak 绑定不拥有 value，跳过 release。key 现为 u32 id（无所有权），不再 free。
         var iter = self.values.iterator();
         while (iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
             if (!entry.value_ptr.is_weak) entry.value_ptr.value.release(self.value_allocator);
         }
         self.values.deinit();
@@ -100,10 +105,9 @@ pub const Environment = struct {
                 }
             }
         }
-        // 释放绑定（续14：weak 绑定不拥有 value，跳过 release）
+        // 释放绑定（续14：weak 绑定不拥有 value，跳过 release）。key 现为 u32 id，不再 free。
         var iter = self.values.iterator();
         while (iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
             if (!entry.value_ptr.is_weak) entry.value_ptr.value.release(self.value_allocator);
         }
         self.values.deinit();
@@ -124,58 +128,53 @@ pub const Environment = struct {
         }
     }
 
-    pub fn define(self: *Environment, name: []const u8, val: value.Value, is_mutable: bool) !void {
-        return self.defineWithVisibility(name, val, is_mutable, false);
+    pub fn define(self: *Environment, id: NameId, val: value.Value, is_mutable: bool) !void {
+        return self.defineWithVisibility(id, val, is_mutable, false);
     }
 
-    pub fn defineWithVisibility(self: *Environment, name: []const u8, val: value.Value, is_mutable: bool, is_public: bool) !void {
-        // 如果已存在，先移除旧条目并释放旧 key 和旧值（release：引用计数感知）。
-        // 续14：weak 旧值不 release（不拥有）。
-        if (self.values.fetchRemove(name)) |old| {
-            self.allocator.free(old.key);
+    pub fn defineWithVisibility(self: *Environment, id: NameId, val: value.Value, is_mutable: bool, is_public: bool) !void {
+        // 如果已存在，先移除旧条目并释放旧值（release：引用计数感知）。
+        // 续14：weak 旧值不 release（不拥有）。key 现为 u32 id，无所有权，不再 free。
+        if (self.values.fetchRemove(id)) |old| {
             if (!old.value.is_weak) old.value.value.release(self.value_allocator);
         }
-        // 插入新条目（需要分配 key 的独立副本）。key 走 allocator（与 free 同源）。
-        const key = try self.allocator.dupe(u8, name);
         // clone：带 rc 的复合值仅 retain（不分配）；string 等深拷走 value_allocator
         // 与 release 同源，避免 pool/arena 错配。
         const cloned_val = try val.clone(self.value_allocator);
-        try self.values.put(key, Variable{ .value = cloned_val, .is_mutable = is_mutable, .is_public = is_public });
+        try self.values.put(id, Variable{ .value = cloned_val, .is_mutable = is_mutable, .is_public = is_public });
     }
 
     /// 续14/闭包转换：弱绑定（不拥有 value，不 clone/retain）。用于 letrec 递归自引用。
     /// release/teardown/覆盖时跳过 value.release，避免环与 double-free。
-    pub fn defineWeak(self: *Environment, name: []const u8, val: value.Value) !void {
-        if (self.values.fetchRemove(name)) |old| {
-            self.allocator.free(old.key);
+    pub fn defineWeak(self: *Environment, id: NameId, val: value.Value) !void {
+        if (self.values.fetchRemove(id)) |old| {
             if (!old.value.is_weak) old.value.value.release(self.value_allocator);
         }
-        const key = try self.allocator.dupe(u8, name);
-        try self.values.put(key, Variable{ .value = val, .is_mutable = false, .is_public = false, .is_weak = true });
+        try self.values.put(id, Variable{ .value = val, .is_mutable = false, .is_public = false, .is_weak = true });
     }
 
-    pub fn get(self: *Environment, name: []const u8) ?Variable {
-        if (self.values.get(name)) |v| {
+    pub fn get(self: *Environment, id: NameId) ?Variable {
+        if (self.values.get(id)) |v| {
             return v;
         }
         if (self.parent) |p| {
-            return p.get(name);
+            return p.get(id);
         }
         return null;
     }
 
-    pub fn getPtr(self: *Environment, name: []const u8) ?*Variable {
-        if (self.values.getPtr(name)) |v| {
+    pub fn getPtr(self: *Environment, id: NameId) ?*Variable {
+        if (self.values.getPtr(id)) |v| {
             return v;
         }
         if (self.parent) |p| {
-            return p.getPtr(name);
+            return p.getPtr(id);
         }
         return null;
     }
 
-    pub fn set(self: *Environment, name: []const u8, val: value.Value) !void {
-        if (self.values.getPtr(name)) |v| {
+    pub fn set(self: *Environment, id: NameId, val: value.Value) !void {
+        if (self.values.getPtr(id)) |v| {
             if (!v.is_mutable) {
                 return error.ImmutableAssignment;
             }
@@ -200,7 +199,7 @@ pub const Environment = struct {
             return;
         }
         if (self.parent) |p| {
-            try p.set(name, val);
+            try p.set(id, val);
             return;
         }
         return error.UndefinedVariable;
@@ -230,7 +229,7 @@ pub const Environment = struct {
         const alloc = self.value_allocator;
         const cap = try alloc.create(Environment);
         cap.* = Environment{
-            .values = std.StringHashMap(Variable).init(alloc),
+            .values = std.AutoHashMap(NameId, Variable).init(alloc),
             .parent = root,
             .children = std.ArrayList(*Environment).empty,
             .allocator = alloc,
@@ -244,6 +243,7 @@ pub const Environment = struct {
         // releaseEnv 在 global deinit 半途 detach root.children 造成 UAF（实测崩 21 测试）。
 
         // 从 self 向上到 root（不含 root）逐帧快照绑定，内层优先（已存在则跳过）。
+        // key 现为 u32 id（无所有权），直接复制；value 的 cell/clone 语义完全不变。
         var frame: ?*Environment = self;
         var guard: usize = 0;
         while (frame) |f| {
@@ -252,8 +252,8 @@ pub const Environment = struct {
             if (f == root) break;
             var it = f.values.iterator();
             while (it.next()) |entry| {
-                const name = entry.key_ptr.*;
-                if (cap.values.contains(name)) continue; // 内层 shadowing：已捕获则跳过外层同名
+                const id = entry.key_ptr.*;
+                if (cap.values.contains(id)) continue; // 内层 shadowing：已捕获则跳过外层同名
                 const v = entry.value_ptr;
                 if (v.is_mutable) {
                     // var：提升为共享 cell。原绑定就地装箱（若尚未），capture 持同一 cell（retain）。
@@ -264,13 +264,11 @@ pub const Environment = struct {
                     }
                     const shared = v.value.cell_val;
                     shared.rc += 1;
-                    const key = try alloc.dupe(u8, name);
-                    try cap.values.put(key, Variable{ .value = value.Value{ .cell_val = shared }, .is_mutable = true, .is_public = v.is_public });
+                    try cap.values.put(id, Variable{ .value = value.Value{ .cell_val = shared }, .is_mutable = true, .is_public = v.is_public });
                 } else {
                     // val：拷值快照（retain），与原帧独立（不可变，无需共享）。
-                    const key = try alloc.dupe(u8, name);
                     const cloned = try v.value.clone(alloc);
-                    try cap.values.put(key, Variable{ .value = cloned, .is_mutable = false, .is_public = v.is_public });
+                    try cap.values.put(id, Variable{ .value = cloned, .is_mutable = false, .is_public = v.is_public });
                 }
             }
             frame = f.parent;
@@ -286,7 +284,7 @@ pub const Environment = struct {
         const frame_alloc = self.value_allocator;
         const child = try frame_alloc.create(Environment);
         child.* = Environment{
-            .values = std.StringHashMap(Variable).init(frame_alloc),
+            .values = std.AutoHashMap(NameId, Variable).init(frame_alloc),
             .parent = self,
             .children = std.ArrayList(*Environment).empty,
             .allocator = frame_alloc,
@@ -305,18 +303,17 @@ pub const Environment = struct {
     pub fn deepCopy(self: *Environment, allocator: std.mem.Allocator, atomic_values: ?[]const *value.AtomicValue) anyerror!*Environment {
         const new_env = try allocator.create(Environment);
         new_env.* = Environment{
-            .values = std.StringHashMap(Variable).init(allocator),
+            .values = std.AutoHashMap(NameId, Variable).init(allocator),
             .parent = null,
             .children = std.ArrayList(*Environment).empty,
             .allocator = allocator,
             .value_allocator = allocator,
         };
-        // 深拷贝当前环境的所有变量
+        // 深拷贝当前环境的所有变量。key 现为 u32 id（无所有权），直接复制。
         var iter = self.values.iterator();
         while (iter.next()) |entry| {
-            const key = try allocator.dupe(u8, entry.key_ptr.*);
             const cloned_val = try deepCloneValue(entry.value_ptr.value, allocator, atomic_values);
-            try new_env.values.put(key, Variable{
+            try new_env.values.put(entry.key_ptr.*, Variable{
                 .value = cloned_val,
                 .is_mutable = entry.value_ptr.is_mutable,
                 .is_public = entry.value_ptr.is_public,

@@ -29,6 +29,8 @@ const stdlib = @import("stdlib");
 const gc_mod = @import("gc");
 const scheduler_mod = @import("scheduler");
 const zio = @import("zio");
+const intern = @import("intern");
+const resolve = @import("resolve");
 
 /// 内嵌 stdlib 模块的合成 source_path 目录前缀。既用于报错显示，也作"正在
 /// stdlib 内"的标记——其依赖据此走内嵌表而非文件系统（避免把含 `<>` 的合成
@@ -135,6 +137,13 @@ pub const Evaluator = struct {
     /// 编译期/全程数据(AST/类型/注册表/内建)仍走 allocator(arena)。
     value_allocator: std.mem.Allocator,
     global_env: Environment,
+    /// 全局字符串驻留表（见 src/intern.zig）。变量名 intern 成 u32 id，环境用整数键。
+    /// 所有 intern 在求值前完成（registerBuiltins + resolve 预pass），求值期只读
+    /// （spawn 并发求值，写 interner 会数据竞争）。
+    interner: intern.Interner,
+    /// 预 intern 的合成名字 id（monad @ 脱糖用，运行时按 id define，不在 spawn 期 intern）。
+    id_bind: u32 = intern.INVALID,
+    id_pure: u32 = intern.INVALID,
     io: ?std.Io = null,
     /// Work-stealing 调度器（基于 Zio Runtime）
     /// 文档 §3.7: M:N 调度，少量 OS 线程上运行大量轻量级协程
@@ -237,6 +246,7 @@ pub const Evaluator = struct {
             .allocator = allocator,
             .value_allocator = allocator,
             .global_env = Environment.init(allocator),
+            .interner = intern.Interner.init(allocator),
             .shadow_stack = std.ArrayList(value.Value).empty,
             .closures = std.ArrayList(*value.Closure).empty,
             .lazy_values = std.ArrayList(*value.LazyValue).empty,
@@ -269,6 +279,7 @@ pub const Evaluator = struct {
             .allocator = allocator,
             .value_allocator = allocator,
             .global_env = Environment.init(allocator),
+            .interner = intern.Interner.init(allocator),
             .io = io,
             .shadow_stack = std.ArrayList(value.Value).empty,
             .closures = std.ArrayList(*value.Closure).empty,
@@ -304,6 +315,7 @@ pub const Evaluator = struct {
             .allocator = allocator,
             .value_allocator = allocator,
             .global_env = Environment.init(allocator),
+            .interner = intern.Interner.init(allocator),
             .io = sched.getIo(),
             .scheduler = sched,
             .shadow_stack = std.ArrayList(value.Value).empty,
@@ -336,6 +348,7 @@ pub const Evaluator = struct {
     pub fn deinit(self: *Evaluator) void {
         self.shadow_stack.deinit(self.allocator);
         self.global_env.deinit();
+        self.interner.deinit();
         // 释放所有注册的闭包
         for (self.closures.items) |closure| {
             self.allocator.destroy(closure);
@@ -1119,6 +1132,16 @@ pub const Evaluator = struct {
         map.* = new_map;
     }
 
+    /// 疏散 Environment 的 values 表（u32 id 键）。key 是整数值类型、永不在 nursery，
+    /// 只需疏散 value（可能含 nursery 中的 Value 箱体）。
+    fn evacuateEnvValues(self: *Evaluator, map: *std.AutoHashMap(env.NameId, env.Variable)) void {
+        if (self.gc == null) return;
+        var iter = map.iterator();
+        while (iter.next()) |entry| {
+            self.evacuateHashMapValue(env.Variable, entry.value_ptr);
+        }
+    }
+
     /// 疏散 HashMap 中的值（根据类型分派）
     fn evacuateHashMapValue(self: *Evaluator, comptime V: type, val_ptr: *V) void {
         if (V == Value) {
@@ -1131,7 +1154,7 @@ pub const Evaluator = struct {
     /// 疏散 Environment：就地更新所有 nursery 指针
     fn evacuateEnv(self: *Evaluator, environment: *Environment) void {
         // 疏散 values HashMap
-        self.evacuateStringHashMap(env.Variable, &environment.values);
+        self.evacuateEnvValues(&environment.values);
 
         // 疏散父环境
         if (environment.parent) |parent| {
@@ -1166,10 +1189,21 @@ pub const Evaluator = struct {
     // 内建函数注册
     // ============================================================
 
+    /// 把名字 intern 成 u32 id。仅在求值前的注册/加载阶段调用（单线程），
+    /// 求值期 interner 只读（spawn 并发，写会竞争）。OOM 时返回 INVALID 哨兵
+    /// （后续 get 必失败 → 干净的 undefined 报错，不静默错配）。
+    fn internName(self: *Evaluator, name: []const u8) u32 {
+        return self.interner.intern(name) catch intern.INVALID;
+    }
+
     fn registerBuiltins(self: *Evaluator) void {
 
+        // monad @ 脱糖的合成名字：求值前 intern 一次，运行时按 id define（不在 spawn 期 intern）。
+        self.id_bind = self.internName("@bind");
+        self.id_pure = self.internName("@pure");
+
         // println
-        self.global_env.define("println", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("println"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1177,7 +1211,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // print
-        self.global_env.define("print", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("print"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1185,7 +1219,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // eprintln
-        self.global_env.define("eprintln", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("eprintln"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1193,7 +1227,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // eprint
-        self.global_env.define("eprint", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("eprint"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1201,7 +1235,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // Panic 构造器
-        self.global_env.define("Panic", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("Panic"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1209,7 +1243,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // eq (结构相等)
-        self.global_env.define("eq", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("eq"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1217,7 +1251,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // str (类型转换)
-        self.global_env.define("str", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("str"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1225,7 +1259,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // type (返回值的运行时类型名，文档 §2.15)
-        self.global_env.define("type", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("type"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1233,7 +1267,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // Error 构造器
-        self.global_env.define("Error", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("Error"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1241,7 +1275,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // Ok 构造器 — 创建 ThrowValue.ok
-        self.global_env.define("Ok", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("Ok"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1249,7 +1283,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // scan — 读取一个空白分隔的 token，EOF 返回 null
-        self.global_env.define("scan", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("scan"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1257,7 +1291,7 @@ pub const Evaluator = struct {
             }
         }.call } }, true) catch {};
         // scanln — 读取一行，EOF 返回 null
-        self.global_env.define("scanln", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("scanln"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1266,7 +1300,7 @@ pub const Evaluator = struct {
         }.call } }, true) catch {};
 
         // channel — 创建 CSP 通道
-        self.global_env.define("channel", Value{ .builtin = value.Builtin{ .fn_ptr = struct {
+        self.global_env.define(self.internName("channel"), Value{ .builtin = value.Builtin{ .fn_ptr = struct {
             fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                 _ = user_ctx;
                 const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1596,7 +1630,7 @@ pub const Evaluator = struct {
     /// 如果未找到 main，返回 error.MissingMain。
     /// 如果找到但不可调用，返回 error.TypeMismatch。
     pub fn callMain(self: *Evaluator) EvalResult!Value {
-        const main_var = self.global_env.get("main") orelse return error.MissingMain;
+        const main_var = self.global_env.get(self.internName("main")) orelse return error.MissingMain;
         switch (main_var.value) {
             .closure, .builtin, .partial => {
                 return self.callFunction(main_var.value, &[_]Value{}, null);
@@ -1704,6 +1738,10 @@ pub const Evaluator = struct {
             return error.TypeCheckFailed;
         }
 
+        // Resolve 预pass：intern 所有名字到 AST 的 name_id（单线程，求值前）。
+        // 求值器随后用整数键查环境；spawn 并发求值期 interner 只读，无竞争。
+        resolve.resolveModule(&module, &self.interner) catch {};
+
         // 收集 pub 声明名称
         var pub_names = std.ArrayList(u8).empty;
         defer pub_names.deinit(self.allocator);
@@ -1796,7 +1834,7 @@ pub const Evaluator = struct {
             switch (decl) {
                 .fun_decl => |f| {
                     if (f.visibility != .public) continue;
-                    if (self.global_env.get(f.name)) |v| {
+                    if (self.global_env.get(self.internName(f.name))) |v| {
                         const key = try self.allocator.dupe(u8, f.name);
                         try methods.put(key, v.value);
                     }
@@ -1830,8 +1868,8 @@ pub const Evaluator = struct {
 
         // 绑定模块名到 global_env（限定访问 Module.member 的入口）；
         // 不覆盖同名已有绑定（如 trait 名占用——分属不同语义但共享 env 时以先到为准）。
-        if (self.global_env.get(module_name) == null) {
-            try self.global_env.define(module_name, module_val, false);
+        if (self.global_env.get(self.internName(module_name)) == null) {
+            try self.global_env.define(self.internName(module_name), module_val, false);
         }
     }
 
@@ -1854,8 +1892,8 @@ pub const Evaluator = struct {
                 // 先补 letrec 弱自引用进 cap_env（在 define clone 之前/之后均可，cap_env 是闭包私有）。
                 // define 会 clone（rc→2）；创建时的 rc=1 那份在 define 后 release 归还，使绑定独占。
                 const cv = Value{ .closure = closure };
-                try environment.defineWithVisibility(f.name, cv, false, f.visibility == .public);
-                try cap_env.defineWeak(f.name, cv);
+                try environment.defineWithVisibility(self.internName(f.name), cv, false, f.visibility == .public);
+                try cap_env.defineWeak(self.internName(f.name), cv);
                 cv.release(self.value_allocator); // 归还创建时的 rc=1（binding clone 已持一份）
             },
             .type_decl => |td| {
@@ -1870,7 +1908,7 @@ pub const Evaluator = struct {
                             .default_prefix = try self.allocator.dupe(u8, en.message),
                         };
                         try self.error_newtype_contexts.append(self.allocator, ctx_data);
-                        try environment.defineWithVisibility(td.name, Value{ .builtin = value.Builtin{
+                        try environment.defineWithVisibility(self.internName(td.name), Value{ .builtin = value.Builtin{
                             .fn_ptr = struct {
                                 fn call(ctx: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                     const ev: *Evaluator = @ptrCast(@alignCast(ctx));
@@ -1916,7 +1954,7 @@ pub const Evaluator = struct {
                         try self.error_newtype_contexts.append(self.allocator, ctx);
                         // newtype 构造器始终私有（即使类型是 pub）— 这是抽象类型的核心
                         // pub type Handle = Handle(i32) → Handle 类型名公开，Handle() 构造器私有
-                        try environment.defineWithVisibility(td.name, Value{ .builtin = value.Builtin{
+                        try environment.defineWithVisibility(self.internName(td.name), Value{ .builtin = value.Builtin{
                             .fn_ptr = struct {
                                 fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                     const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
@@ -1957,7 +1995,7 @@ pub const Evaluator = struct {
                                     .fields = empty_fields,
                                 };
                                 // 构造器始终私有（文档 4.4.1: ADT 构造器私有）
-                                try environment.defineWithVisibility(con.name, Value{ .adt = av }, true, false);
+                                try environment.defineWithVisibility(self.internName(con.name), Value{ .adt = av }, true, false);
                             } else {
                                 // 有参构造器：注册为 builtin 函数
                                 const ctx = try self.allocator.create(AdtConstructorCtx);
@@ -1973,7 +2011,7 @@ pub const Evaluator = struct {
                                 }
                                 try self.adt_constructor_contexts.append(self.allocator, ctx);
                                 // 构造器始终私有（文档 4.4.1: ADT 构造器私有）
-                                try environment.defineWithVisibility(con.name, Value{ .builtin = value.Builtin{
+                                try environment.defineWithVisibility(self.internName(con.name), Value{ .builtin = value.Builtin{
                                     .fn_ptr = struct {
                                         fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                             const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
@@ -2031,7 +2069,7 @@ pub const Evaluator = struct {
                             ctx.field_types[i] = try self.builtinFieldTypeName(field.ty);
                         }
                         try self.record_constructor_contexts.append(self.allocator, ctx);
-                        try environment.defineWithVisibility(td.name, Value{ .builtin = value.Builtin{
+                        try environment.defineWithVisibility(self.internName(td.name), Value{ .builtin = value.Builtin{
                             .fn_ptr = struct {
                                 fn call(ctx_ptr: *anyopaque, user_ctx: ?*anyopaque, args: []const Value) anyerror!Value {
                                     const ev: *Evaluator = @ptrCast(@alignCast(ctx_ptr));
@@ -2293,7 +2331,7 @@ pub const Evaluator = struct {
 
                         // 同时将方法注册为环境中的函数（支持直接调用）
                         // 方法可见性由 MethodDecl.visibility 决定
-                        try environment.defineWithVisibility(method.name, Value{ .closure = closure }, true, method.visibility == .public);
+                        try environment.defineWithVisibility(self.internName(method.name), Value{ .closure = closure }, true, method.visibility == .public);
 
                         // 记录已覆写的方法名
                         const name_copy = try self.allocator.dupe(u8, method.name);
@@ -2309,8 +2347,9 @@ pub const Evaluator = struct {
                         // 仅注册 impl 未覆写的默认方法
                         if (!overridden_methods.contains(dm_entry.key_ptr.*)) {
                             // 检查环境中是否已有同名函数（避免覆盖其他 impl 的方法）
-                            if (environment.get(dm_entry.key_ptr.*) == null) {
-                                try environment.defineWithVisibility(dm_entry.key_ptr.*, Value{ .closure = dm_entry.value_ptr.* }, true, true);
+                            const dm_id = self.internName(dm_entry.key_ptr.*);
+                            if (environment.get(dm_id) == null) {
+                                try environment.defineWithVisibility(dm_id, Value{ .closure = dm_entry.value_ptr.* }, true, true);
                             }
                         }
                     }
@@ -2346,10 +2385,10 @@ pub const Evaluator = struct {
                         // 选择性导入：use Module.{Item1, Item2}
                         for (items) |item| {
                             // 检查是否为 pub 声明（通过 Variable.is_public 字段）
-                            if (export_info.env.get(item.name)) |val| {
+                            if (export_info.env.get(self.internName(item.name))) |val| {
                                 if (!val.is_public) continue; // 跳过私有声明
                                 const import_name = item.alias orelse item.name;
-                                try environment.defineWithVisibility(import_name, val.value, false, is_reexport);
+                                try environment.defineWithVisibility(self.internName(import_name), val.value, false, is_reexport);
                             }
                         }
                     } else {
@@ -2357,6 +2396,7 @@ pub const Evaluator = struct {
                         // 注意：模块求值共享 global_env，若导出 env 与目标 env 是
                         // 同一张表（依赖已预加载进 global_env），其 pub 符号已在作用域内，
                         // 再 put 会在迭代中改写同一 map 导致迭代器失效——直接跳过。
+                        // key 现为 u32 id（interner 全局共享，跨 env 有效），直接复用。
                         if (export_info.env != environment) {
                             var iter = export_info.env.values.iterator();
                             while (iter.next()) |entry| {
@@ -2616,7 +2656,7 @@ pub const Evaluator = struct {
     /// evalIdentifier 透明 load（文档 §3.4.2）。
     fn evalDeclRhs(self: *Evaluator, expr: *const ast.Expr, environment: *Environment) EvalResult!Value {
         if (expr.* == .identifier) {
-            if (environment.get(expr.identifier.name)) |v| {
+            if (environment.get(expr.identifier.name_id)) |v| {
                 if (v.value == .atomic_val) return v.value.retain(); // 别名，不 load（atomic 非 boxed，retain no-op）
             }
         }
@@ -2650,7 +2690,7 @@ pub const Evaluator = struct {
     }
 
     fn evalIdentifier(self: *Evaluator, id: @TypeOf(@as(ast.Expr, undefined).identifier), environment: *Environment) EvalResult!Value {
-        if (environment.get(id.name)) |v| {
+        if (environment.get(id.name_id)) |v| {
             // Atomic<T> 透明操作：读取时使用 atomic_load
             if (v.value == .atomic_val) {
                 return v.value.atomic_val.load();
@@ -2684,7 +2724,7 @@ pub const Evaluator = struct {
 
         switch (ae.target.*) {
             .identifier => |id| {
-                environment.set(id.name, val) catch |err| {
+                environment.set(id.name_id, val) catch |err| {
                     if (err == error.ImmutableAssignment) {
                         self.setErrMsg("cannot assign to immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{id.name}, "cannot assign to immutable binding");
                     }
@@ -2694,7 +2734,7 @@ pub const Evaluator = struct {
             .index => |idx| {
                 // 写时拷贝：若索引目标是持有共享数组的变量，先复制独占一份再原地改。
                 if (idx.object.* == .identifier) {
-                    if (environment.getPtr(idx.object.identifier.name)) |variable| {
+                    if (environment.getPtr(idx.object.identifier.name_id)) |variable| {
                         if (variable.value == .array) try self.cowField(variable);
                     }
                 }
@@ -2728,7 +2768,7 @@ pub const Evaluator = struct {
         // 如果目标是标识符且持有 Atomic 值，使用原子 fetch 操作
         switch (ca.target.*) {
             .identifier => |id| {
-                if (environment.getPtr(id.name)) |variable| {
+                if (environment.getPtr(id.name_id)) |variable| {
                     if (variable.value == .atomic_val) {
                         const av = variable.value.atomic_val;
                         const operand = value.valueToAtomicRaw(val, av.type_tag);
@@ -2817,7 +2857,7 @@ pub const Evaluator = struct {
         // 赋值新值
         switch (ca.target.*) {
             .identifier => |id| {
-                environment.set(id.name, result) catch |err| {
+                environment.set(id.name_id, result) catch |err| {
                     if (err == error.ImmutableAssignment) {
                         self.setErrMsg("cannot assign to immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{id.name}, "cannot assign to immutable binding");
                     }
@@ -3452,7 +3492,7 @@ pub const Evaluator = struct {
                             }
                             break :blk current_args[i];
                         } else current_args[i];
-                        try call_env.define(param.name, arg_val, param.is_var);
+                        try call_env.define(param.name_id, arg_val, param.is_var);
                         // castValue 可能新建一个 owned 值（如 str 注解 → valueToString 新 dupe）。
                         // define 已 clone 自留，本处新建的临时若不归还则泄漏（churn 下无界）。
                         // 判据：arg_val 与原 current_args[i] 不是同一引用（cast 产生了新值）时 release。
@@ -3567,7 +3607,7 @@ pub const Evaluator = struct {
         // 需要获取原始 Atomic/Channel/Sender/Receiver 值作为方法接收者
         const object = switch (mc.object.*) {
             .identifier => |id| raw_val: {
-                if (environment.get(id.name)) |v| {
+                if (environment.get(id.name_id)) |v| {
                     // 对并发原语类型，直接返回原始值（不做透明解包）
                     if (v.value == .atomic_val or v.value == .channel_val or v.value == .sender_val or v.value == .receiver_val or v.value == .spawn_val) {
                         break :raw_val v.value;
@@ -3845,7 +3885,10 @@ pub const Evaluator = struct {
             return switch (object) {
                 .array_iterator => |ai| {
                     if (ai.index < ai.array.len) {
-                        const val = ai.array[ai.index].retain(); // borrow→owned：元素由迭代器底层数组持有
+                        // borrow→owned：元素由迭代器底层数组持有。retainOwned 对 string
+                        // dupe 出独立 owned（retain 对 string 是 no-op，返回借用 slice，
+                        // 调用方 release 会摧毁数组里的原 string → double-free）。
+                        const val = try self.retainOwned(ai.array[ai.index]);
                         ai.index += 1;
                         return val;
                     }
@@ -4449,7 +4492,7 @@ pub const Evaluator = struct {
             const b = mc.bindings[i];
             // fun(b.name) { acc }
             const params = try self.allocator.alloc(ast.Param, 1);
-            params[0] = ast.Param{ .location = loc, .name = b.name, .type_annotation = null, .is_var = false };
+            params[0] = ast.Param{ .location = loc, .name = b.name, .type_annotation = null, .is_var = false, .name_id = self.internName(b.name) };
             const lambda = try self.allocator.create(ast.Expr);
             lambda.* = ast.Expr{ .lambda = .{ .location = loc, .params = params, .body = .{ .expression = acc } } };
             // @bind(b.expr, lambda)
@@ -4458,15 +4501,17 @@ pub const Evaluator = struct {
 
         // 子环境绑定 @bind/@pure 到解析出的闭包，再求值合成 AST
         const child = try environment.createChild();
-        try child.define("@bind", Value{ .closure = bind_closure }, false);
-        try child.define("@pure", Value{ .closure = pure_closure }, false);
+        try child.define(self.id_bind, Value{ .closure = bind_closure }, false);
+        try child.define(self.id_pure, Value{ .closure = pure_closure }, false);
         return self.evalExpr(acc, child);
     }
 
     /// 合成 identifier 表达式（用于 monad 脱糖）
     fn makeIdentExpr(self: *Evaluator, name: []const u8, loc: ast.SourceLocation) !*ast.Expr {
         const e = try self.allocator.create(ast.Expr);
-        e.* = ast.Expr{ .identifier = .{ .location = loc, .name = name } };
+        // 合成标识符在求值期创建（monad @ 脱糖），其 name_id 必须当场 intern——
+        // 否则默认 INVALID，environment.get 必失败。这些脱糖不在 spawn 并发路径上。
+        e.* = ast.Expr{ .identifier = .{ .location = loc, .name = name, .name_id = self.internName(name) } };
         return e;
     }
 
@@ -5067,8 +5112,8 @@ pub const Evaluator = struct {
                     const ch = try getChannelFromExpr(self, recv_arm.channel_expr, environment);
                     // 非阻塞尝试接收
                     if (ch.tryRecv()) |val| {
-                        if (recv_arm.binding) |binding_name| {
-                            try environment.define(binding_name, val, true);
+                        if (recv_arm.binding) |_| {
+                            try environment.define(recv_arm.binding_id, val, true);
                         }
                         return self.evalExpr(recv_arm.body, environment);
                     }
@@ -5094,8 +5139,8 @@ pub const Evaluator = struct {
                     const ch = try getChannelFromExpr(self, recv_arm.channel_expr, environment);
                     const val = ch.recv();
                     if (val) |v| {
-                        if (recv_arm.binding) |binding_name| {
-                            try environment.define(binding_name, v, true);
+                        if (recv_arm.binding) |_| {
+                            try environment.define(recv_arm.binding_id, v, true);
                         }
                         return self.evalExpr(recv_arm.body, environment);
                     }
@@ -5129,13 +5174,13 @@ pub const Evaluator = struct {
                 // RHS 为 owned（阶段A 保证 evalExpr/DeclRhs 返 owned）。define clone(=retain)
                 // 出 env 自己一份；本函数持有的 owned 引用绑定后 release，使 fresh 值
                 // (rc=1) 不会停在 rc=2 而泄漏。阶段A 后 RHS 已非 borrow，release 不再误伤。
-                try environment.defineWithVisibility(vd.name, val, false, vd.visibility == .public);
+                try environment.defineWithVisibility(vd.name_id, val, false, vd.visibility == .public);
                 // 续14/闭包转换 letrec：`val f = fun(){...f...}`（含 `fun f(){}` 语法糖）。
                 // 闭包 capture_env 在 f 绑定前快照、不含 f。绑定后补一条弱自引用进闭包 capture_env，
                 // 使递归可解析；弱引用避免 closure→capture_env→closure 成环。
                 if (val == .closure) {
                     const cap: *Environment = @ptrCast(@alignCast(val.closure.env));
-                    cap.defineWeak(vd.name, val) catch {};
+                    cap.defineWeak(vd.name_id, val) catch {};
                 }
                 val.release(self.value_allocator);
                 return null;
@@ -5153,7 +5198,7 @@ pub const Evaluator = struct {
                         else => {},
                     }
                 }
-                try environment.defineWithVisibility(vd.name, val, true, vd.visibility == .public);
+                try environment.defineWithVisibility(vd.name_id, val, true, vd.visibility == .public);
                 val.release(self.value_allocator);
                 return null;
             },
@@ -5161,7 +5206,7 @@ pub const Evaluator = struct {
                 const val = try self.evalExpr(asgn.value, environment);
                 switch (asgn.target.*) {
                     .identifier => |id| {
-                        environment.set(id.name, val) catch |err| {
+                        environment.set(id.name_id, val) catch |err| {
                             if (err == error.ImmutableAssignment) {
                                 self.setErrMsg("cannot assign to immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{id.name}, "cannot assign to immutable binding");
                             }
@@ -5172,7 +5217,7 @@ pub const Evaluator = struct {
                         // 处理 object.field = value 形式的赋值
                         switch (fa.object.*) {
                             .identifier => |id| {
-                                if (environment.getPtr(id.name)) |variable| {
+                                if (environment.getPtr(id.name_id)) |variable| {
                                     if (!variable.*.is_mutable) {
                                         self.setErrMsg("cannot assign to field '{s}' of immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{ fa.field, id.name }, "cannot assign to field of immutable binding");
                                         return error.ImmutableAssignment;
@@ -5207,7 +5252,7 @@ pub const Evaluator = struct {
                     },
                     .index => |idx| {
                         if (idx.object.* == .identifier) {
-                            if (environment.getPtr(idx.object.identifier.name)) |variable| {
+                            if (environment.getPtr(idx.object.identifier.name_id)) |variable| {
                                 if (variable.value == .array) try self.cowField(variable);
                             }
                         }
@@ -5243,7 +5288,7 @@ pub const Evaluator = struct {
                 // 如果对象是标识符，直接修改环境中的变量
                 switch (fa.object.*) {
                     .identifier => |id| {
-                        if (environment.getPtr(id.name)) |variable| {
+                        if (environment.getPtr(id.name_id)) |variable| {
                             // 不可变绑定（val / 普通参数）不允许改字段。
                             if (!variable.*.is_mutable) {
                                 self.setErrMsg("cannot assign to field '{s}' of immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{ fa.field, id.name }, "cannot assign to field of immutable binding");
@@ -5351,7 +5396,7 @@ pub const Evaluator = struct {
                 // 如果目标是标识符且持有 Atomic 值，使用原子 fetch 操作
                 switch (ca.target.*) {
                     .identifier => |id| {
-                        if (environment.getPtr(id.name)) |variable| {
+                        if (environment.getPtr(id.name_id)) |variable| {
                             if (variable.value == .atomic_val) {
                                 const av = variable.value.atomic_val;
                                 const operand = value.valueToAtomicRaw(val, av.type_tag);
@@ -5440,7 +5485,7 @@ pub const Evaluator = struct {
                 // 赋值
                 switch (ca.target.*) {
                     .identifier => |id| {
-                        environment.set(id.name, result) catch |err| {
+                        environment.set(id.name_id, result) catch |err| {
                             if (err == error.ImmutableAssignment) {
                                 self.setErrMsg("cannot assign to immutable binding '{s}' (val bindings and parameters are immutable; use a var)", .{id.name}, "cannot assign to immutable binding");
                             }
@@ -5592,7 +5637,7 @@ pub const Evaluator = struct {
 
             const loop_env = try environment.createChild();
             // define clone(=retain) 出 env 自己一份；next_val 的 owned 引用绑定后 release。
-            try loop_env.define(fs.name, next_val, false);
+            try loop_env.define(fs.name_id, next_val, false);
             next_val.release(self.value_allocator);
 
             const body_val = self.evalExpr(fs.body, loop_env) catch |err| switch (err) {

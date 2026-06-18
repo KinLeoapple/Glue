@@ -186,6 +186,8 @@ pub const Pattern = union(enum) {
     variable: struct {
         location: SourceLocation,
         name: []const u8,
+        /// resolve 预pass 填充的 intern id（见 src/intern.zig）。
+        name_id: u32 = 0xFFFF_FFFF,
     },
 
     /// 构造器模式：Name(patterns) — ADT 构造器模式
@@ -252,6 +254,8 @@ pub const Param = struct {
     type_annotation: ?*TypeNode,
     /// 是否为 var 参数（默认 val）
     is_var: bool,
+    /// resolve 预pass 填充的 intern id（运行时环境用整数键，见 src/intern.zig）。
+    name_id: u32 = 0xFFFF_FFFF,
 };
 
 /// 类型参数
@@ -330,6 +334,8 @@ pub const SelectArm = union(enum) {
         binding: ?[]const u8,
         /// 分支体
         body: *Expr,
+        /// resolve 预pass 填充的绑定变量 intern id（见 src/intern.zig）。
+        binding_id: u32 = 0xFFFF_FFFF,
     },
     /// 超时分支：timeout(ms) => body
     timeout: struct {
@@ -517,6 +523,8 @@ pub const Expr = union(enum) {
     identifier: struct {
         location: SourceLocation,
         name: []const u8,
+        /// resolve 预pass 填充的 intern id（见 src/intern.zig）。引用点用整数键查环境。
+        name_id: u32 = 0xFFFF_FFFF,
     },
 
     /// 赋值表达式：target = value（用于 defer 等上下文中）
@@ -749,6 +757,8 @@ pub const Stmt = union(enum) {
         value: *Expr,
         /// 可见性
         visibility: Visibility = .private,
+        /// resolve 预pass 填充的 intern id（见 src/intern.zig）。
+        name_id: u32 = 0xFFFF_FFFF,
     },
 
     /// 可变绑定：var name [: Type] = expr
@@ -759,6 +769,8 @@ pub const Stmt = union(enum) {
         value: *Expr,
         /// 可见性
         visibility: Visibility = .private,
+        /// resolve 预pass 填充的 intern id（见 src/intern.zig）。
+        name_id: u32 = 0xFFFF_FFFF,
     },
 
     /// 赋值语句：target = value
@@ -834,6 +846,8 @@ pub const Stmt = union(enum) {
         iterable: *Expr,
         /// 循环体
         body: *Expr,
+        /// resolve 预pass 填充的 intern id（见 src/intern.zig）。
+        name_id: u32 = 0xFFFF_FFFF,
     },
 
     /// while 循环：while condition { body }
@@ -887,6 +901,8 @@ pub const Decl = union(enum) {
         /// Trait 约束（with Bounds）
         bounds: []TraitBound,
         body: *Expr,
+        /// resolve 预pass 填充的 intern id（函数名定义进 env 用整数键，见 src/intern.zig）。
+        name_id: u32 = 0xFFFF_FFFF,
     },
 
     /// 类型声明：type Name<T> = ...

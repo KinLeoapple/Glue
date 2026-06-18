@@ -24,6 +24,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const intern_module = b.createModule(.{
+        .root_source_file = b.path("src/intern.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const lexer_module = b.createModule(.{
         .root_source_file = b.path("src/lexer.zig"),
         .target = target,
@@ -112,6 +118,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     env_module.addImport("value", value_module);
+    env_module.addImport("intern", intern_module);
 
     const pattern_module = b.createModule(.{
         .root_source_file = b.path("src/eval/pattern.zig"),
@@ -121,6 +128,7 @@ pub fn build(b: *std.Build) void {
     pattern_module.addImport("ast", ast_module);
     pattern_module.addImport("value", value_module);
     pattern_module.addImport("env", env_module);
+    pattern_module.addImport("intern", intern_module);
 
     const throw_module = b.createModule(.{
         .root_source_file = b.path("src/eval/throw.zig"),
@@ -137,6 +145,7 @@ pub fn build(b: *std.Build) void {
     module_eval_module.addImport("ast", ast_module);
     module_eval_module.addImport("value", value_module);
     module_eval_module.addImport("env", env_module);
+    module_eval_module.addImport("intern", intern_module);
 
     // ============================================================
     // sema/ sub-modules
@@ -198,6 +207,14 @@ pub fn build(b: *std.Build) void {
     });
     module_check_module.addImport("ast", ast_module);
 
+    const resolve_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/resolve.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    resolve_module.addImport("ast", ast_module);
+    resolve_module.addImport("intern", intern_module);
+
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
     type_check_module.addImport("throw_check", throw_check_module);
@@ -251,6 +268,7 @@ pub fn build(b: *std.Build) void {
     eval_module.addImport("ast", ast_module);
     eval_module.addImport("value", value_module);
     eval_module.addImport("env", env_module);
+    eval_module.addImport("intern", intern_module);
     eval_module.addImport("pattern", pattern_module);
     eval_module.addImport("throw_mod", throw_module);
     eval_module.addImport("module_eval", module_eval_module);
@@ -267,6 +285,7 @@ pub fn build(b: *std.Build) void {
     eval_module.addImport("trait_resolve", trait_resolve_module);
     eval_module.addImport("gadt_check", gadt_check_module);
     eval_module.addImport("module_check", module_check_module);
+    eval_module.addImport("resolve", resolve_module);
     eval_module.addImport("scheduler", scheduler_module);
     eval_module.addImport("gc", gc_module);
     eval_module.addImport("channel", channel_module);
@@ -344,6 +363,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_stdlib_unit_tests = b.addRunArtifact(stdlib_unit_tests);
 
+    const intern_unit_tests = b.addTest(.{
+        .root_module = intern_module,
+    });
+    const run_intern_unit_tests = b.addRunArtifact(intern_unit_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_eval_unit_tests.step);
     test_step.dependOn(&run_lexer_unit_tests.step);
@@ -352,4 +376,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_module_check_unit_tests.step);
     test_step.dependOn(&run_slab_pool_unit_tests.step);
     test_step.dependOn(&run_stdlib_unit_tests.step);
+    test_step.dependOn(&run_intern_unit_tests.step);
 }

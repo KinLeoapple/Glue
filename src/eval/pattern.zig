@@ -51,8 +51,8 @@ pub fn matchPattern(pattern: *const ast.Pattern, val: value.Value, environment: 
                 }
                 return false;
             }
-            // 小写开头：变量绑定，始终匹配
-            try environment.define(v.name, val, false);
+            // 小写开头：变量绑定，始终匹配。name_id 由 resolve 预pass 填充（整数键）。
+            try environment.define(v.name_id, val, false);
             return true;
         },
         .constructor => |con| matchConstructorPattern(con, val, environment, guard_eval),
@@ -257,15 +257,14 @@ fn matchRecordPattern(rec: @TypeOf(@as(ast.Pattern, undefined).record), val: val
 fn rollbackEnvironment(environment: *env.Environment, saved_count: usize) void {
     while (environment.values.count() > saved_count) {
         var iter = environment.values.iterator();
-        // 找到最后插入的条目并移除
-        var last_key: ?[]const u8 = null;
+        // 找到最后插入的条目并移除。key 现为 u32 id（无所有权，不再 free）。
+        var last_key: ?env.NameId = null;
         while (iter.next()) |entry| {
             last_key = entry.key_ptr.*;
         }
         if (last_key) |key| {
-            if (environment.values.fetchRemove(key)) |removed| {
-                environment.allocator.free(removed.key);
-                // 注意：不 deinit removed.value.value，因为值可能被其他引用共享
+            if (environment.values.fetchRemove(key)) |_| {
+                // 注意：不 release removed.value.value，因为值可能被其他引用共享
             }
         } else break;
     }

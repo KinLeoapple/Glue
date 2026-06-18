@@ -2443,7 +2443,10 @@ pub const TypeInferencer = struct {
                     self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "cannot redefine built-in name '{s}'", .{vd.name});
                 } else {
                     const val_ty = try self.inferExpr(vd.value, env);
-                    // 验证类型注解
+                    // 验证类型注解；有标注时以标注类型作为绑定类型（标注优先于推断，
+                    // 与 val_decl 一致：`var acc: i64 = 0` 中 acc 的类型是 i64 而非字面量
+                    // 推断出的 i32，否则绑定类型会丢失标注宽度污染后续推断）。
+                    var bind_ty = val_ty;
                     if (vd.type_annotation) |ta| {
                         const annot_ty = self.typeFromAstWithParams(ta, null) catch null;
                         if (annot_ty) |at| {
@@ -2454,13 +2457,14 @@ pub const TypeInferencer = struct {
                                     self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "annotation does not match value in var declaration", .{});
                                 };
                             }
+                            bind_ty = at;
                         }
                     }
                     // 文档 §3.3.3: Spawn 线性类型追踪
                     if (self.isSpawnType(val_ty)) {
                         self.registerLinearVar(vd.name, vd.location.line, vd.location.column);
                     }
-                    const scheme = try self.generalize(env, val_ty);
+                    const scheme = try self.generalize(env, bind_ty);
                     if (!(try env.defineOrReport(vd.name, scheme))) {
                         self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                     }
