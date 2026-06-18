@@ -2890,6 +2890,23 @@ pub const TypeInferencer = struct {
                     if (f.visibility != .public) continue;
                     self.recordExportSymbol(module_name, f.name, env);
                 },
+                .type_decl => |t| {
+                    // pub type 的构造器作为值符号导出（如 List 的 Nil/Cons），
+                    // 使 use List 后可在表达式位置直接用 Nil/Cons。类型本身经
+                    // adt_types 跨模块持久化（见 checkDecl 的 type_decl 分支）。
+                    if (t.visibility != .public) continue;
+                    switch (t.def) {
+                        .adt => |adt_def| {
+                            for (adt_def.constructors) |con| {
+                                self.recordExportSymbol(module_name, con.name, env);
+                            }
+                        },
+                        .newtype => |nt| {
+                            self.recordExportSymbol(module_name, nt.name, env);
+                        },
+                        else => {},
+                    }
+                },
                 .use_decl => |ud| {
                     // pub use Mod.{a, b} — 把再导出符号也登记在当前模块名下
                     if (ud.visibility != .public) continue;

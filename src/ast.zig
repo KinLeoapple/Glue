@@ -926,6 +926,9 @@ pub const Decl = union(enum) {
         associated_type_defs: []AssociatedTypeDef,
         /// 方法实现
         methods: []MethodDecl,
+        /// 条件约束（参数化条件实现）：impl Show<Box<T>> with Show<T>
+        /// 头部泛型实参中的自由类型变量须满足这些 bound。空表示无条件 impl。
+        bounds: []TraitBound = &[_]TraitBound{},
         /// 可见性
         visibility: Visibility = .private,
     },

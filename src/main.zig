@@ -157,6 +157,35 @@ fn parseManifest(source: []const u8) Manifest {
 // glue init
 // ============================================================
 
+/// 检查目标目录状态，用于 init 的空目录约束。
+const DirState = enum {
+    /// 目录不存在（可创建）
+    missing,
+    /// 目录存在且为空
+    empty,
+    /// 目录存在但非空（无 glue.toml）
+    non_empty,
+    /// 目录存在且含 glue.toml（已是项目）
+    is_project,
+};
+
+/// 检查 path 指向的目录状态。path 为空串表示当前目录。
+fn checkDirState(io: std.Io, path: []const u8) DirState {
+    const cwd = std.Io.Dir.cwd();
+    const open_path = if (path.len == 0) "." else path;
+    var dir = cwd.openDir(io, open_path, .{ .iterate = true }) catch {
+        return .missing; // 打不开（多半不存在）→ 视为可创建
+    };
+    defer dir.close(io);
+    var it = dir.iterate();
+    var empty = true;
+    while (it.next(io) catch null) |entry| {
+        if (std.mem.eql(u8, entry.name, MANIFEST_NAME)) return .is_project;
+        empty = false;
+    }
+    return if (empty) .empty else .non_empty;
+}
+
 fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
     const cwd = std.Io.Dir.cwd();
 
@@ -170,15 +199,26 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
     // 项目名：有 name 用 name，否则用 "app"。
     const proj_name = name orelse "app";
 
+    // init 只在空目录初始化：先检查目标目录状态。
+    // 目标目录 = name（或当前目录）；非空且非已存在项目 → 拒绝。
+    const target_dir = name orelse "";
+    switch (checkDirState(io, target_dir)) {
+        .is_project => {
+            const shown = if (target_dir.len == 0) "current directory" else target_dir;
+            printErr(io, "error: already a Glue project ({s} contains {s})\n", .{ shown, MANIFEST_NAME });
+            std.process.exit(1);
+        },
+        .non_empty => {
+            const shown = if (target_dir.len == 0) "current directory" else target_dir;
+            printErr(io, "error: {s} is not an empty directory\n", .{shown});
+            std.process.exit(1);
+        },
+        .missing, .empty => {}, // 可初始化
+    }
+
     // 清单路径
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_prefix, MANIFEST_NAME });
     defer allocator.free(manifest_path);
-
-    // 已存在则拒绝覆盖
-    if (cwd.access(io, manifest_path, .{})) {
-        printErr(io, "error: already a Glue project ({s} exists)\n", .{manifest_path});
-        std.process.exit(1);
-    } else |_| {}
 
     // 创建目录：<prefix>src/
     const src_dir = try std.fmt.allocPrint(allocator, "{s}src", .{dir_prefix});

@@ -506,6 +506,32 @@ pub fn checkTraitDecl(
     inferencer.trait_defining_modules.put(mod_key, mod_val) catch return;
 }
 
+/// 收集 impl 头部泛型实参中的自由类型变量，登记为 fresh type var。
+/// 如 `Show<Box<T>>` 的 type_arg 是 `Box<T>`，递归到裸名 `T`——若 T 不是
+/// 已知 ADT/内建类型构造器，就是自由类型变量，绑一个 fresh var 供方法体解析。
+fn collectImplHeadTypeParams(
+    inferencer: *TypeInferencer,
+    node: *const ast.TypeNode,
+    map: *std.StringHashMap(*Type),
+) void {
+    switch (node.*) {
+        .named => |n| {
+            if (map.contains(n.name)) return;
+            // 已知类型构造器/ADT 名不是自由变量（如 Box、i64）
+            if (inferencer.adt_types.contains(n.name)) return;
+            if (isBuiltinTypeName(n.name)) return;
+            const tv = inferencer.freshTypeVar() catch return;
+            map.put(n.name, tv) catch {};
+        },
+        .generic => |g| {
+            for (g.args) |arg| collectImplHeadTypeParams(inferencer, arg, map);
+        },
+        .nullable => |nl| collectImplHeadTypeParams(inferencer, nl.inner, map),
+        .array => |a| collectImplHeadTypeParams(inferencer, a.element_type, map),
+        else => {},
+    }
+}
+
 /// impl_decl 声明的处理逻辑
 pub fn checkImplDecl(
     inferencer: *TypeInferencer,
@@ -526,6 +552,18 @@ pub fn checkImplDecl(
     defer impl_type_param_map.deinit();
     if (inferencer.trait_types.getPtr(id.trait_name)) |trait_info| {
         _ = trait_info;
+    }
+    // 参数化条件实现（impl Show<Box<T>> with Show<T>）：把头部泛型实参中的
+    // 自由类型变量（如 Box<T> 的 T、Pair<A,B> 的 A/B）登记为 fresh type var，
+    // 使方法体里 self.value（类型 T）的字段访问/方法调用能解析。
+    for (id.type_args) |arg| {
+        collectImplHeadTypeParams(inferencer, arg, &impl_type_param_map);
+    }
+    // 校验 with 约束引用的 trait 已定义（与 checkTraitBound 一致的 best-effort）。
+    for (id.bounds) |bound| {
+        if (!inferencer.trait_types.contains(bound.trait_name)) {
+            inferencer.addErrorAt(.unsatisfied_bound, id.location.line, id.location.column, "trait '{s}' is not defined", .{bound.trait_name});
+        }
     }
     // 将关联类型定义加入类型参数映射
     for (id.associated_type_defs) |atd| {

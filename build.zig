@@ -230,6 +230,16 @@ pub fn build(b: *std.Build) void {
     });
 
     // ============================================================
+    // 内嵌标准库（@embedFile stdlib/*.glue）
+    // ============================================================
+
+    const stdlib_module = b.createModule(.{
+        .root_source_file = b.path("src/stdlib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ============================================================
     // eval module (core — depends on everything)
     // ============================================================
 
@@ -249,6 +259,7 @@ pub fn build(b: *std.Build) void {
     eval_module.addImport("sema", type_check_module);
     eval_module.addImport("module_resolver", module_resolver_module);
     eval_module.addImport("dependency_graph", dependency_graph_module);
+    eval_module.addImport("stdlib", stdlib_module);
     eval_module.addImport("kind_check", kind_check_module);
     eval_module.addImport("throw_check", throw_check_module);
     eval_module.addImport("subtype_check", subtype_check_module);
@@ -328,6 +339,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_slab_pool_unit_tests = b.addRunArtifact(slab_pool_unit_tests);
 
+    const stdlib_unit_tests = b.addTest(.{
+        .root_module = stdlib_module,
+    });
+    const run_stdlib_unit_tests = b.addRunArtifact(stdlib_unit_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_eval_unit_tests.step);
     test_step.dependOn(&run_lexer_unit_tests.step);
@@ -335,4 +351,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_type_check_unit_tests.step);
     test_step.dependOn(&run_module_check_unit_tests.step);
     test_step.dependOn(&run_slab_pool_unit_tests.step);
+    test_step.dependOn(&run_stdlib_unit_tests.step);
 }

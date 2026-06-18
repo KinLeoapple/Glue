@@ -25,9 +25,15 @@ const module_eval = @import("module_eval");
 const sema = @import("sema");
 const vtable_rt = @import("vtable_rt");
 const module_resolver = @import("module_resolver");
+const stdlib = @import("stdlib");
 const gc_mod = @import("gc");
 const scheduler_mod = @import("scheduler");
 const zio = @import("zio");
+
+/// 内嵌 stdlib 模块的合成 source_path 目录前缀。既用于报错显示，也作"正在
+/// stdlib 内"的标记——其依赖据此走内嵌表而非文件系统（避免把含 `<>` 的合成
+/// 路径传给 cwd.access，Windows 上会 OBJECT_NAME_INVALID panic）。
+const STDLIB_DIR_MARKER = "<stdlib>";
 
 // ============================================================
 // 便捷重导出
@@ -5461,18 +5467,48 @@ pub const Evaluator = struct {
         const allocator = self.allocator;
         const io = self.io orelse return error.FileNotFound;
 
-        // 使用 ModuleResolver 解析路径
+        // 当前模块来自内嵌 stdlib 时（source_dir 是合成标记），其依赖也优先走内嵌表，
+        // 不碰文件系统——合成路径含 `<>` 等字符，传给 cwd.access 在 Windows 上是
+        // OBJECT_NAME_INVALID（Zig 视为不可捕获的 programmer bug 直接 panic）。
+        const in_stdlib = if (self.current_source_dir) |d| std.mem.eql(u8, d, STDLIB_DIR_MARKER) else false;
+        if (in_stdlib and module_path.len == 1) {
+            if (stdlib.lookup(module_path[0])) |source| {
+                const synthetic_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}.glue", .{ STDLIB_DIR_MARKER, std.fs.path.sep, module_path[0] });
+                try self.retained_sources.append(self.allocator, synthetic_path);
+                try self.evalSourceModule(source, module_path[0], synthetic_path);
+                return;
+            }
+        }
+
+        // 使用 ModuleResolver 解析路径（项目内文件优先，允许用户覆盖同名 stdlib）
         self.resolver.setSourceDir(self.current_source_dir orelse ".") catch {};
-        const resolved_path = try self.resolver.resolvePath(io, module_path) orelse return error.FileNotFound;
-        defer allocator.free(resolved_path);
+        const resolved_path = self.resolver.resolvePath(io, module_path) catch null;
 
-        // 使用 ModuleResolver 加载源代码
-        // 注意：source 不能在此释放——导入函数的闭包会切片引用它（整数字面量
-        // raw、标识符名等）。交给 retained_sources 持有到求值器 deinit。
-        const source = try self.resolver.loadSource(io, resolved_path);
-        try self.retained_sources.append(self.allocator, source);
+        if (resolved_path) |path| {
+            defer allocator.free(path);
+            // 使用 ModuleResolver 加载源代码
+            // 注意：source 不能在此释放——导入函数的闭包会切片引用它（整数字面量
+            // raw、标识符名等）。交给 retained_sources 持有到求值器 deinit。
+            const source = try self.resolver.loadSource(io, path);
+            try self.retained_sources.append(self.allocator, source);
+            try self.evalSourceModule(source, module_path[0], path);
+            return;
+        }
 
-        try self.evalSourceModule(source, module_path[0], resolved_path);
+        // 项目内找不到 → 回退到内嵌标准库（@embedFile，文档 D67、与 cwd 无关）。
+        // 内嵌源码是二进制内的 []const u8 字面量，寿命等同进程，无需 dupe/retain。
+        // 合成 source_path 仅供报错显示；其目录前缀 STDLIB_DIR_MARKER 又用于
+        // 标记"正在 stdlib 内"，使其依赖（如 List use Compare）走上面的内嵌分支。
+        if (module_path.len == 1) {
+            if (stdlib.lookup(module_path[0])) |source| {
+                const synthetic_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}.glue", .{ STDLIB_DIR_MARKER, std.fs.path.sep, module_path[0] });
+                try self.retained_sources.append(self.allocator, synthetic_path);
+                try self.evalSourceModule(source, module_path[0], synthetic_path);
+                return;
+            }
+        }
+
+        return error.FileNotFound;
     }
 
     /// 解析并求值源代码作为模块

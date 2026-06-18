@@ -982,6 +982,13 @@ pub const Parser = struct {
             }
         }
 
+        // 条件约束 with Bounds（参数化条件实现）：impl Show<Box<T>> with Show<T>
+        // 与 parseFunDecl 同构，复用 parseTraitBoundList。
+        var bounds = std.ArrayList(ast.TraitBound).empty;
+        if (self.matchToken(.kw_with)) {
+            try self.parseTraitBoundList(&bounds);
+        }
+
         var assoc_type_defs = std.ArrayList(ast.AssociatedTypeDef).empty;
         var methods = std.ArrayList(ast.MethodDecl).empty;
         _ = self.expect(.l_brace, "expected '{'") catch {};
@@ -1012,6 +1019,7 @@ pub const Parser = struct {
                 .type_args = try type_args.toOwnedSlice(self.allocator),
                 .associated_type_defs = try assoc_type_defs.toOwnedSlice(self.allocator),
                 .methods = try methods.toOwnedSlice(self.allocator),
+                .bounds = try bounds.toOwnedSlice(self.allocator),
                 .visibility = visibility,
             },
         };
@@ -1229,23 +1237,30 @@ pub const Parser = struct {
     }
 
     fn parseFunctionType(self: *Parser) ParserError!*ast.TypeNode {
-        // 特例：`()` 开头的函数类型表示零参数（文档把 scanln 记为 `() -> str?`）。
-        // 普通 `(field: T, ...)` 是记录类型，由 parsePrimaryType 处理；这里仅当
-        // 看到紧挨的 `(` `)` `->` 时，才解释为零参数函数类型。
-        if (self.check(.l_paren) and
-            self.current + 2 < self.tokens.len and
-            self.tokens[self.current + 1].type == .r_paren and
-            self.tokens[self.current + 2].type == .minus_gt)
-        {
+        // 文档 §2.8.2 函数类型语法：
+        //   A -> B            单参数（由下方 left -> ret 处理）
+        //   () -> C           零参数
+        //   (A, B) -> C       多参数（语法糖，flat fn_type）
+        // 普通 `(field: T, ...)` 是记录类型，由 parsePrimaryType 处理。
+        // 仅当 `(` ... 匹配的 `)` 后紧跟 `->` 时，才把括号组解释为函数类型形参列表。
+        if (self.check(.l_paren) and self.parenGroupFollowedByArrow()) {
             const loc = tokenLoc(self.peek());
             _ = self.advance(); // (
-            _ = self.advance(); // )
-            _ = self.advance(); // ->
+            var params = std.ArrayList(*ast.TypeNode).empty;
+            if (!self.check(.r_paren)) {
+                try params.append(self.allocator, try self.parseType());
+                while (self.matchToken(.comma)) {
+                    if (self.check(.r_paren)) break;
+                    try params.append(self.allocator, try self.parseType());
+                }
+            }
+            _ = self.expect(.r_paren, "expected ')'") catch {};
+            _ = self.expect(.minus_gt, "expected '->'") catch {};
             const ret = try self.parseType();
             return self.allocType(ast.TypeNode{
                 .function = .{
                     .location = loc,
-                    .params = &[_]*ast.TypeNode{},
+                    .params = try params.toOwnedSlice(self.allocator),
                     .return_type = ret,
                 },
             });
@@ -1265,6 +1280,30 @@ pub const Parser = struct {
             });
         }
         return left;
+    }
+
+    /// 从当前 `(` 向前扫描到与之匹配的 `)`，判断其后是否紧跟 `->`。
+    /// 用于在类型位置区分函数类型 `(A, B) -> C` 与记录类型 `(name: T, ...)`。
+    /// 只看括号配平，不解析内容；嵌套括号/尖括号一并计入深度。
+    fn parenGroupFollowedByArrow(self: *Parser) bool {
+        var i = self.current;
+        if (i >= self.tokens.len or self.tokens[i].type != .l_paren) return false;
+        var depth: usize = 0;
+        while (i < self.tokens.len) : (i += 1) {
+            switch (self.tokens[i].type) {
+                .l_paren => depth += 1,
+                .r_paren => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        const next = i + 1;
+                        return next < self.tokens.len and self.tokens[next].type == .minus_gt;
+                    }
+                },
+                .eof => return false,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn parseNullableType(self: *Parser) ParserError!*ast.TypeNode {
