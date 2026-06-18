@@ -1,0 +1,103 @@
+// Edge cases: arithmetic, integer widths, overflow boundaries, conversions
+
+fun main() {
+    // ---- signed min/max boundaries per width ----
+    println(127i8)
+    println(-128i8)
+    println(32767i16)
+    println(-32768i16)
+    println(2147483647i32)
+    println(-2147483648i32)
+    println(9223372036854775807i64)
+    println(-9223372036854775808i64)
+
+    // ---- unsigned max per width ----
+    println(255u8)
+    println(65535u16)
+    println(4294967295u32)
+    println(18446744073709551615u64)
+
+    // ---- arithmetic at boundary that stays in range ----
+    val a: i8 = 100
+    val b: i8 = 27
+    println(a + b)          // 127, exactly max
+
+    val c: u8 = 200
+    val d: u8 = 55
+    println(c + d)          // 255, exactly max
+
+    // ---- division and modulo with negatives (truncated: rem follows dividend) ----
+    println(-7 / 2)         // -3 (truncation toward zero)
+    println(-7 % 2)         // -1 (sign of dividend)
+    println(7 % -2)         // 1
+    println(-7 % -2)        // -1
+    println(7 / -2)         // -3
+
+    // ---- modulo identity: (a/b)*b + a%b == a ----
+    val x = -17
+    val y = 5
+    println((x / y) * y + (x % y))   // -17
+
+    // ---- bitwise on full-width patterns ----
+    println(0xFF & 0x0F)    // 15
+    println(0xF0 | 0x0F)    // 255
+    println(0xAA ^ 0xFF)    // 85
+    println(0b1100 & 0b1010) // 8
+
+    // ---- mixed-base literals with underscores ----
+    println(1_000_000)
+    println(0xDEAD_BEEFu32)
+    println(0o7_5_5)
+    println(0b1010_1010)
+
+    // ---- narrowing conversions in valid range ----
+    val big: i64 = 1000
+    println(i8(i64(100)))   // 100
+    println(i16(big))       // 1000
+    println(u8(big % 256))  // 232
+
+    // ---- widening conversions ----
+    val small: i8 = -5
+    println(i64(small))     // -5
+    println(i32(small))     // -5
+
+    // ---- int -> float and back ----
+    println(f64(42))        // 42
+    println(i32(f64(42)))   // 42
+    println(f64(-128i8))    // -128
+
+    // ---- float precision boundaries ----
+    val pi: f64 = 3.141592653589793
+    println(pi)
+    val tiny: f64 = 0.000001
+    println(tiny)
+    val huge: f64 = 1000000000.0
+    println(huge)
+
+    // ---- float arithmetic ----
+    println(0.1 + 0.2)      // 0.30000000000000004 (IEEE 754)
+    println(1.0 / 3.0)
+    println(10.0 % 3.0)     // 1.0
+
+    // ---- negation edge: negating zero ----
+    println(-0)
+    println(-(5 - 5))
+
+    // ---- comparison chains ----
+    println(1 < 2)
+    println(2 <= 2)
+    println(3 > 2)
+    println(3 >= 3)
+    println(5 == 5)
+    println(5 != 6)
+
+    // ---- operator precedence ----
+    println(2 + 3 * 4)      // 14
+    println((2 + 3) * 4)    // 20
+    println(2 * 3 + 4 * 5)  // 26
+    println(10 - 2 - 3)     // 5 (left assoc)
+    println(100 / 10 / 2)   // 5 (left assoc)
+    println(2 + 3 > 4 && 1 < 2)  // true
+
+    println("edge_arithmetic: All tests passed!")
+}

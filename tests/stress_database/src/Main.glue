@@ -1,0 +1,150 @@
+// 端到端压力测试 3：内存 KV 数据库 + 查询/聚合流水线
+// 综合压测：泛型关联列表、Option/nullable、高阶函数、fold/map/filter、记录变换、字符串
+
+// ============================================================
+// 泛型 List 与核心高阶函数
+// ============================================================
+type List<T> =
+    | Nil
+    | Cons(T, List<T>)
+
+fun len<T>(l: List<T>): i32 {
+    match l { Nil => 0, Cons(_, t) => 1 + len(t) }
+}
+
+fun mapL<T, U>(l: List<T>, f): List<U> {
+    match l { Nil => Nil, Cons(x, t) => Cons(f(x), mapL(t, f)) }
+}
+
+fun filterL<T>(l: List<T>, pred): List<T> {
+    match l {
+        Nil => Nil
+        Cons(x, t) => {
+            val rest = filterL(t, pred)
+            if (pred(x)) { Cons(x, rest) } else { rest }
+        }
+    }
+}
+
+fun foldL<T, A>(l: List<T>, init: A, f): A {
+    match l { Nil => init, Cons(x, t) => foldL(t, f(init, x), f) }
+}
+
+fun appendL<T>(a: List<T>, b: List<T>): List<T> {
+    match a { Nil => b, Cons(x, t) => Cons(x, appendL(t, b)) }
+}
+
+// ============================================================
+// 员工记录 + 关联式数据库（按 id 索引）
+// ============================================================
+type Emp = Emp(id: i32, name: str, dept: str, salary: i32)
+
+type Db = Db(rows: List<Emp>)
+
+fun emptyDb(): Db { Db(Nil) }
+
+fun insert(db: Db, e: Emp): Db {
+    match db { Db(rows) => Db(Cons(e, rows)) }
+}
+
+// 按 id 查找，返回 Emp?（nullable）
+fun findById(db: Db, id: i32): Emp? {
+    match db {
+        Db(rows) => {
+            fun go(l: List<Emp>): Emp? {
+                match l {
+                    Nil => null
+                    Cons(e, t) => {
+                        match e { Emp(eid, _, _, _) => if (eid == id) { e } else { go(t) } }
+                    }
+                }
+            }
+            go(rows)
+        }
+    }
+}
+
+fun allRows(db: Db): List<Emp> {
+    match db { Db(rows) => rows }
+}
+
+// ============================================================
+// 查询：按部门过滤、加薪、统计
+// ============================================================
+fun empSalary(e: Emp): i32 { match e { Emp(_, _, _, s) => s } }
+fun empDept(e: Emp): str { match e { Emp(_, _, d, _) => d } }
+fun empName(e: Emp): str { match e { Emp(_, n, _, _) => n } }
+
+fun byDept(db: Db, dept: str): List<Emp> {
+    filterL(allRows(db), fun(e) { empDept(e) == dept })
+}
+
+fun totalSalary(emps: List<Emp>): i32 {
+    foldL(emps, 0, fun(acc, e) { acc + empSalary(e) })
+}
+
+fun maxSalary(emps: List<Emp>): i32 {
+    foldL(emps, 0, fun(acc, e) { if (empSalary(e) > acc) { empSalary(e) } else { acc } })
+}
+
+// 给某部门所有人加薪 pct%，返回新 Db
+fun raiseSalary(db: Db, dept: str, pct: i32): Db {
+    val updated = mapL(allRows(db), fun(e) {
+        match e {
+            Emp(id, n, d, s) => if (d == dept) { Emp(id, n, d, s + s * pct / 100) } else { e }
+        }
+    })
+    Db(updated)
+}
+
+fun showEmps(emps: List<Emp>): str {
+    foldL(emps, "", fun(acc, e) { acc + empName(e) + "(" + str(empSalary(e)) + ") " })
+}
+
+fun main() {
+    var db = emptyDb()
+    db = insert(db, Emp(1, "Alice", "eng", 100))
+    db = insert(db, Emp(2, "Bob", "eng", 120))
+    db = insert(db, Emp(3, "Carol", "sales", 90))
+    db = insert(db, Emp(4, "Dave", "sales", 80))
+    db = insert(db, Emp(5, "Eve", "eng", 150))
+
+    println(len(allRows(db)))                          // 5
+
+    // 按 id 查找（命中 + 未命中）
+    val found = findById(db, 3)
+    println(match found {
+        null => "?"
+        Emp(_, n, _, _) => n
+    })                                                  // Carol
+    val missing = findById(db, 99)
+    println(match missing {
+        null => "none"
+        Emp(_, n, _, _) => n
+    })                                                  // none
+
+    // 部门查询 + 聚合
+    val eng = byDept(db, "eng")
+    println(len(eng))                                  // 3
+    println(totalSalary(eng))                          // 370
+    println(maxSalary(eng))                            // 150
+
+    val sales = byDept(db, "sales")
+    println(totalSalary(sales))                        // 170
+
+    // 全员薪资
+    println(totalSalary(allRows(db)))                  // 540
+
+    // eng 部门加薪 10%
+    val db2 = raiseSalary(db, "eng", 10)
+    val eng2 = byDept(db2, "eng")
+    println(totalSalary(eng2))                         // 370 + 37 = 407
+    // sales 不变
+    println(totalSalary(byDept(db2, "sales")))         // 170
+
+    // 高薪过滤（>= 100）
+    val highPaid = filterL(allRows(db), fun(e) { empSalary(e) >= 100 })
+    println(len(highPaid))                             // 3 (Alice100, Bob120, Eve150)
+
+    println("stress3: All tests passed!")
+}

@@ -1,0 +1,198 @@
+// 端到端压力测试 4：有向图 — 邻接表、BFS/DFS、路径查找、可达性
+// 综合压测：泛型 List、递归、nullable、高阶函数、记录、访问标记、队列/栈模拟
+
+// ============================================================
+// 泛型 List + 工具
+// ============================================================
+type List<T> =
+    | Nil
+    | Cons(T, List<T>)
+
+fun len<T>(l: List<T>): i32 {
+    match l { Nil => 0, Cons(_, t) => 1 + len(t) }
+}
+
+fun appendL<T>(a: List<T>, b: List<T>): List<T> {
+    match a { Nil => b, Cons(x, t) => Cons(x, appendL(t, b)) }
+}
+
+fun reverseL<T>(l: List<T>): List<T> {
+    fun go(rem: List<T>, acc: List<T>): List<T> {
+        match rem { Nil => acc, Cons(x, t) => go(t, Cons(x, acc)) }
+    }
+    go(l, Nil)
+}
+
+fun containsI(l: List<i32>, x: i32): bool {
+    match l { Nil => false, Cons(h, t) => if (h == x) { true } else { containsI(t, x) } }
+}
+
+fun showI(l: List<i32>): str {
+    match l { Nil => "", Cons(h, t) => str(h) + " " + showI(t) }
+}
+
+// ============================================================
+// 图：节点用 i32，邻接表是 (from, to) 边的列表
+// ============================================================
+type Edge = Edge(from: i32, to: i32)
+type Graph = Graph(edges: List<Edge>, n: i32)
+
+fun emptyGraph(n: i32): Graph { Graph(Nil, n) }
+
+fun addEdge(g: Graph, a: i32, b: i32): Graph {
+    match g { Graph(es, n) => Graph(Cons(Edge(a, b), es), n) }
+}
+
+// 取某节点的所有邻居
+fun neighbors(g: Graph, node: i32): List<i32> {
+    match g {
+        Graph(es, _) => {
+            fun go(l: List<Edge>): List<i32> {
+                match l {
+                    Nil => Nil
+                    Cons(e, t) => {
+                        match e {
+                            Edge(f, to) => if (f == node) { Cons(to, go(t)) } else { go(t) }
+                        }
+                    }
+                }
+            }
+            go(es)
+        }
+    }
+}
+
+// ============================================================
+// DFS：从 start 出发，返回可达节点列表（访问顺序）
+// ============================================================
+fun dfs(g: Graph, start: i32): List<i32> {
+    fun go(stack: List<i32>, visited: List<i32>): List<i32> {
+        match stack {
+            Nil => reverseL(visited)
+            Cons(node, rest) => {
+                if (containsI(visited, node)) {
+                    go(rest, visited)
+                } else {
+                    val nbrs = neighbors(g, node)
+                    go(appendL(nbrs, rest), Cons(node, visited))
+                }
+            }
+        }
+    }
+    go(Cons(start, Nil), Nil)
+}
+
+// ============================================================
+// BFS：队列用 List 模拟（尾部入队 = append）
+// ============================================================
+fun bfs(g: Graph, start: i32): List<i32> {
+    fun go(queue: List<i32>, visited: List<i32>): List<i32> {
+        match queue {
+            Nil => reverseL(visited)
+            Cons(node, rest) => {
+                if (containsI(visited, node)) {
+                    go(rest, visited)
+                } else {
+                    val nbrs = neighbors(g, node)
+                    go(appendL(rest, nbrs), Cons(node, visited))
+                }
+            }
+        }
+    }
+    go(Cons(start, Nil), Nil)
+}
+
+// ============================================================
+// 路径查找：start 能否到达 target（DFS 可达性）
+// ============================================================
+fun reachable(g: Graph, start: i32, target: i32): bool {
+    containsI(dfs(g, start), target)
+}
+
+// 找一条 start -> target 的路径（返回 List<i32>?，找不到为 null）
+fun findPath(g: Graph, start: i32, target: i32): List<i32>? {
+    fun go(node: i32, visited: List<i32>): List<i32>? {
+        if (node == target) {
+            Cons(node, Nil)
+        } else if (containsI(visited, node)) {
+            null
+        } else {
+            fun tryNbrs(nbrs: List<i32>): List<i32>? {
+                match nbrs {
+                    Nil => null
+                    Cons(nb, rest) => {
+                        val sub = go(nb, Cons(node, visited))
+                        match sub {
+                            null => tryNbrs(rest)
+                            path => Cons(node, path)
+                        }
+                    }
+                }
+            }
+            tryNbrs(neighbors(g, node))
+        }
+    }
+    go(start, Nil)
+}
+
+// 入度统计：某节点有多少条入边
+fun inDegree(g: Graph, node: i32): i32 {
+    match g {
+        Graph(es, _) => {
+            fun go(l: List<Edge>): i32 {
+                match l {
+                    Nil => 0
+                    Cons(e, t) => match e { Edge(_, to) => if (to == node) { 1 + go(t) } else { go(t) } }
+                }
+            }
+            go(es)
+        }
+    }
+}
+
+fun showPathOpt(p: List<i32>?): str {
+    match p {
+        null => "no path"
+        path => showI(path)
+    }
+}
+
+fun main() {
+    // 构图:  0 -> 1 -> 2 -> 3
+    //        0 -> 2
+    //        1 -> 3
+    //        4 (孤立)
+    var g = emptyGraph(5)
+    g = addEdge(g, 0, 1)
+    g = addEdge(g, 1, 2)
+    g = addEdge(g, 2, 3)
+    g = addEdge(g, 0, 2)
+    g = addEdge(g, 1, 3)
+
+    // 邻居
+    println(showI(neighbors(g, 0)))      // 0 的邻居 (注意边是逆序加的)
+    println(len(neighbors(g, 0)))        // 2
+
+    // DFS / BFS 可达节点数
+    val dfsOrder = dfs(g, 0)
+    println(len(dfsOrder))               // 4 (0,1,2,3 可达)
+    val bfsOrder = bfs(g, 0)
+    println(len(bfsOrder))               // 4
+
+    // 可达性
+    println(reachable(g, 0, 3))          // true
+    println(reachable(g, 0, 4))          // false (4 孤立)
+    println(reachable(g, 3, 0))          // false (有向)
+
+    // 路径查找
+    println(showPathOpt(findPath(g, 0, 3)))   // 一条 0->...->3 路径
+    println(showPathOpt(findPath(g, 0, 4)))   // no path
+    println(showPathOpt(findPath(g, 3, 3)))   // 3 (起点即终点)
+
+    // 入度
+    println(inDegree(g, 3))              // 2 (2->3, 1->3)
+    println(inDegree(g, 2))              // 2 (1->2, 0->2)
+    println(inDegree(g, 0))              // 0 (源点)
+
+    println("stress4: All tests passed!")
+}

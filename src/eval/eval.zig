@@ -665,6 +665,9 @@ pub const Evaluator = struct {
                     }
                 }
             },
+            .cell_val => |c| {
+                if (gc.markObject(@intFromPtr(c))) self.traceValue(c.inner);
+            },
         }
     }
 
@@ -1037,6 +1040,10 @@ pub const Evaluator = struct {
                     if (lz_ptr.*.cached) |*c| self.evacuateValue(c);
                 }
             },
+            .cell_val => |*c_ptr| {
+                // 续14/闭包转换：cell 用 self.allocator 分配（非 nursery）；疏散内值。
+                self.evacuateValue(&c_ptr.*.inner);
+            },
         }
     }
 
@@ -1401,9 +1408,9 @@ pub const Evaluator = struct {
             return error.WrongArity;
         }
         var buf = std.ArrayList(u8).empty;
-        errdefer buf.deinit(self.allocator);
-        args[0].format(&buf, self.allocator, false) catch return error.OutOfMemory;
-        return Value{ .string = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory };
+        errdefer buf.deinit(self.value_allocator);
+        args[0].format(&buf, self.value_allocator, false) catch return error.OutOfMemory;
+        return Value{ .string = buf.toOwnedSlice(self.value_allocator) catch return error.OutOfMemory };
     }
 
     /// type(x) — 返回 x 的运行时类型名（str）。文档 §2.15。
@@ -1685,8 +1692,10 @@ pub const Evaluator = struct {
                 }
                 stderr_writer.flush() catch {};
             }
-            // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值
-            return;
+            // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值。
+            // 返回 TypeCheckFailed（错误已打印）使 main 知道失败：不再 callMain（否则
+            // 模块体未求值 → main 未注册 → 误报 "undefined entry point"），且以非零码退出。
+            return error.TypeCheckFailed;
         }
 
         // 收集 pub 声明名称
@@ -1824,14 +1833,24 @@ pub const Evaluator = struct {
         switch (decl) {
             .fun_decl => |f| {
                 const closure = try self.allocator.create(value.Closure);
+                // 续14/闭包转换：闭包持 capture_env（快照可见作用域）而非定义帧 → 断环。
+                // env_release_fn 使闭包 rc 归零时释放 capture_env（否则捕获值/cell 泄漏）。
+                // 不再 append self.closures——闭包改 RC 管理，归零即释放（在 self.closures 里会被
+                // deinit 二次 destroy → double-free，且永不释放 capture_env）。
+                const cap_env = try environment.buildCaptureEnv();
                 closure.* = value.Closure{
                     .params = f.params,
                     .body = .{ .block = f.body },
-                    .env = @ptrCast(environment.retain()),
+                    .env = @ptrCast(cap_env),
                     .allocator = self.allocator,
+                    .env_release_fn = Environment.releaseEnvOpaque,
                 };
-                try self.closures.append(self.allocator, closure);
-                try environment.defineWithVisibility(f.name, Value{ .closure = closure }, false, f.visibility == .public);
+                // 先补 letrec 弱自引用进 cap_env（在 define clone 之前/之后均可，cap_env 是闭包私有）。
+                // define 会 clone（rc→2）；创建时的 rc=1 那份在 define 后 release 归还，使绑定独占。
+                const cv = Value{ .closure = closure };
+                try environment.defineWithVisibility(f.name, cv, false, f.visibility == .public);
+                try cap_env.defineWeak(f.name, cv);
+                cv.release(self.value_allocator); // 归还创建时的 rc=1（binding clone 已持一份）
             },
             .type_decl => |td| {
                 switch (td.def) {
@@ -2448,7 +2467,7 @@ pub const Evaluator = struct {
             .float_literal => |lit| self.evalFloatLiteral(lit),
             .bool_literal => |lit| Value{ .boolean = lit.value },
             .char_literal => |lit| Value{ .char_val = lit.value },
-            .string_literal => |lit| Value{ .string = try self.allocator.dupe(u8, lit.value) },
+            .string_literal => |lit| Value{ .string = try self.value_allocator.dupe(u8, lit.value) },
             .string_interpolation => |interp| self.evalStringInterpolation(interp, environment),
             .null_literal => Value.null_val,
             .unit_literal => Value.unit,
@@ -2561,12 +2580,12 @@ pub const Evaluator = struct {
 
     fn evalStringInterpolation(self: *Evaluator, interp: @TypeOf(@as(ast.Expr, undefined).string_interpolation), environment: *Environment) EvalResult!Value {
         var result = std.ArrayList(u8).empty;
-        errdefer result.deinit(self.allocator);
+        errdefer result.deinit(self.value_allocator);
 
         for (interp.parts) |part| {
             switch (part) {
                 .literal => |text| {
-                    try result.appendSlice(self.allocator, text);
+                    try result.appendSlice(self.value_allocator, text);
                 },
                 .expression => |expr| {
                     const val = try self.evalExpr(expr, environment);
@@ -2576,12 +2595,12 @@ pub const Evaluator = struct {
                     var buf = std.ArrayList(u8).empty;
                     defer buf.deinit(self.allocator);
                     try val.format(&buf, self.allocator, false);
-                    try result.appendSlice(self.allocator, buf.items);
+                    try result.appendSlice(self.value_allocator, buf.items);
                 },
             }
         }
 
-        return Value{ .string = try result.toOwnedSlice(self.allocator) };
+        return Value{ .string = try result.toOwnedSlice(self.value_allocator) };
     }
 
     /// 求值 val/var 声明的右侧。
@@ -2613,6 +2632,17 @@ pub const Evaluator = struct {
         return result.retain();
     }
 
+    /// borrow→owned：从容器/绑定借用一个值并转为独立 owned 引用。
+    /// boxed 值(adt/array/record/newtype/closure/cell)走 rc retain(共享箱体)；
+    /// string 无 rc，retain 是 no-op → 必须 dupe 出独立字节，否则调用方 release(free)
+    /// 会摧毁原持有者(record/env 绑定)的 string。dupe 走 value_allocator(与 release 同源)。
+    fn retainOwned(self: *Evaluator, val: Value) EvalResult!Value {
+        if (val == .string) {
+            return Value{ .string = try self.value_allocator.dupe(u8, val.string) };
+        }
+        return val.retain();
+    }
+
     fn evalIdentifier(self: *Evaluator, id: @TypeOf(@as(ast.Expr, undefined).identifier), environment: *Environment) EvalResult!Value {
         if (environment.get(id.name)) |v| {
             // Atomic<T> 透明操作：读取时使用 atomic_load
@@ -2623,8 +2653,13 @@ pub const Evaluator = struct {
             if (v.value == .lazy_val) {
                 return self.forceLazy(v.value.lazy_val);
             }
+            // 续14/闭包转换：被捕获 var 的 cell 透明读取——返回 cell.inner 的 owned 副本。
+            if (v.value == .cell_val) {
+                return self.retainOwned(v.value.cell_val.inner);
+            }
             // owned 模型：标识符读取是 borrow（绑定仍由 env 持有），retain 成 owned 返回。
-            return v.value.retain();
+            // string 无 rc，retainOwned 对 string dupe 出独立 owned（否则调用方 release 摧毁绑定）。
+            return self.retainOwned(v.value);
         }
         // 构建包含变量名的错误消息（需要分配以超过 panic_message 的生命周期）
         var buf = std.ArrayList(u8).empty;
@@ -2970,9 +3005,9 @@ pub const Evaluator = struct {
         }
         if (left == .string and right == .string) {
             var result = std.ArrayList(u8).empty;
-            try result.appendSlice(self.allocator, left.string);
-            try result.appendSlice(self.allocator, right.string);
-            return Value{ .string = try result.toOwnedSlice(self.allocator) };
+            try result.appendSlice(self.value_allocator, left.string);
+            try result.appendSlice(self.value_allocator, right.string);
+            return Value{ .string = try result.toOwnedSlice(self.value_allocator) };
         }
         return self.gluePanicFmt("operator '+' cannot be applied to operands of type '{s}' and '{s}'", .{ typeNameOf(left), typeNameOf(right) }, "type error: invalid operands for '+'");
     }
@@ -3297,6 +3332,10 @@ pub const Evaluator = struct {
             // 跳过本函数 defer 的 release，避免双重释放。
             const owned_args = try self.value_allocator.dupe(Value, args.items);
             moved_to_tail = true;
+            // 续14/闭包转换：闭包句柄也移交 tail_call——retain 一份，使其在 trampoline
+            // releaseEnv 释放本帧 `callee` 绑定后仍存活（否则 cap_env 随绑定 rc 归零被释放，
+            // trampoline 用 tc.closure 即 UAF）。由 trampoline 在轮转/退出时 release。
+            _ = (Value{ .closure = callee.closure }).retain();
             self.tail_call = TailCall{
                 .closure = callee.closure,
                 .args = owned_args,
@@ -3377,11 +3416,16 @@ pub const Evaluator = struct {
                 // moved_to_tail)，丢弃一批时必须先逐元素 release 再释放 slice，否则尾递归累积的
                 // fresh 复合实参 +1 永不归零 → 泄漏C。
                 var args_owned: ?[]const Value = null;
+                // 续14/闭包转换：trampoline 当前轮持有的 owned 闭包句柄（来自 TailCall 的 retain）。
+                // 初始闭包 callee 由 evalCall 持有、非本循环所有，故为 null。每次轮转/退出释放，
+                // 使尾调用闭包的 cap_env 在用完后即时回收（否则泄漏；用前提前释放则 UAF）。
+                var closure_owned: ?*value.Closure = null;
                 defer {
                     if (args_owned) |owned| {
                         for (owned) |a| a.release(self.value_allocator);
                         self.value_allocator.free(owned);
                     }
+                    if (closure_owned) |c| (Value{ .closure = c }).release(self.value_allocator);
                 }
 
                 while (true) {
@@ -3403,6 +3447,13 @@ pub const Evaluator = struct {
                             break :blk current_args[i];
                         } else current_args[i];
                         try call_env.define(param.name, arg_val, param.is_var);
+                        // castValue 可能新建一个 owned 值（如 str 注解 → valueToString 新 dupe）。
+                        // define 已 clone 自留，本处新建的临时若不归还则泄漏（churn 下无界）。
+                        // 判据：arg_val 与原 current_args[i] 不是同一引用（cast 产生了新值）时 release。
+                        // 原 current_args[i] 由 evalCall 持有并在调用返回后 release，不在此处理。
+                        if (!arg_val.identityEquals(current_args[i])) {
+                            arg_val.release(self.value_allocator);
+                        }
                     }
 
                     // 清除尾调用标记
@@ -3437,10 +3488,14 @@ pub const Evaluator = struct {
                                 args_owned = null;
                             }
                             call_env.releaseEnv(); // 尾调用不保留本帧
+                            // 释放上一轮持有的 owned 闭包句柄（其 cap_env 已用完）。初始轮为 null。
+                            if (closure_owned) |c| (Value{ .closure = c }).release(self.value_allocator);
                             current_closure = tc.closure;
                             current_args = tc.args;
                             // tc.args 是 evalCall 中 toOwnedSlice 转移的，需要在此释放
                             args_owned = tc.args;
+                            // tc.closure 已在 evalCall retain 一份移交；本轮持有，下轮/退出释放。
+                            closure_owned = tc.closure;
                             continue;
                         },
                         error.ThrowValue => {
@@ -3600,6 +3655,7 @@ pub const Evaluator = struct {
             .receiver_val => "Receiver",
             .trait_value => |tv| if (tv.trait_name.len > 0) tv.trait_name else "trait",
             .lazy_val => "Lazy",
+            .cell_val => |c| valueTypeName(c.inner), // 续14/闭包转换：透明——返回内值类型
         };
     }
 
@@ -4099,7 +4155,7 @@ pub const Evaluator = struct {
         switch (object) {
             .record => |rec| {
                 if (rec.fields.get(field)) |val| {
-                    return val.retain(); // borrow→owned：字段值仍由 record 持有
+                    return self.retainOwned(val); // borrow→owned：字段值仍由 record 持有
                 }
                 return self.gluePanicFmt("no field '{s}' on type 'record'", .{field}, "no such field");
             },
@@ -4108,7 +4164,7 @@ pub const Evaluator = struct {
                 for (av.fields) |f| {
                     if (f.name) |n| {
                         if (std.mem.eql(u8, n, field)) {
-                            return f.value.retain(); // borrow→owned
+                            return self.retainOwned(f.value); // borrow→owned
                         }
                     }
                 }
@@ -4118,7 +4174,7 @@ pub const Evaluator = struct {
                 // 文档 §4.6.2: 模块值/Trait 值的成员访问——限定名 `Store.Memory`、
                 // `Module.member`（子模块或导出函数）。在 vtable/成员表中查找。
                 if (tv.methods.get(field)) |member| {
-                    return member.retain(); // borrow→owned
+                    return self.retainOwned(member); // borrow→owned
                 }
                 return self.gluePanicFmt("no member '{s}' on trait value '{s}'", .{ field, if (tv.trait_name.len > 0) tv.trait_name else "trait" }, "no such member");
             },
@@ -4127,7 +4183,7 @@ pub const Evaluator = struct {
                 // val e = Error("not found")
                 // e.message    // "not found"
                 if (std.mem.eql(u8, field, "message")) {
-                    return Value{ .string = try self.allocator.dupe(u8, e.message) };
+                    return Value{ .string = try self.value_allocator.dupe(u8, e.message) };
                 }
                 return self.gluePanicFmt("no field '{s}' on type 'Error' (only 'message' is available)", .{field}, "no such field");
             },
@@ -4137,7 +4193,7 @@ pub const Evaluator = struct {
                 switch (tv.*) {
                     .err => |e| {
                         if (std.mem.eql(u8, field, "message")) {
-                            return Value{ .string = try self.allocator.dupe(u8, e.message) };
+                            return Value{ .string = try self.value_allocator.dupe(u8, e.message) };
                         }
                     },
                     .ok => {},
@@ -4232,7 +4288,7 @@ pub const Evaluator = struct {
                 if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
                     return self.gluePanicFmt("index {d} out of bounds for length {d}", .{ i, arr.elements.len }, "index out of bounds");
                 }
-                return arr.elements[@as(usize, @intCast(i))].retain(); // borrow→owned
+                return self.retainOwned(arr.elements[@as(usize, @intCast(i))]); // borrow→owned
             },
             .string => |s| {
                 const i_val = switch (index_val) {
@@ -4333,13 +4389,17 @@ pub const Evaluator = struct {
 
     fn evalLambda(self: *Evaluator, lam: @TypeOf(@as(ast.Expr, undefined).lambda), environment: *Environment) EvalResult!Value {
         const closure = try self.allocator.create(value.Closure);
+        // 续14/闭包转换：lambda 持 capture_env（快照可见作用域）而非定义帧 → 断环。
+        // RC 管理：返回 owned rc=1，不进 self.closures。env_release_fn 归零时释放 capture_env。
+        // lambda 匿名无自引用；letrec 自引用由外层 val_decl 在绑定后补（见 evalStmt val_decl）。
+        const cap_env = try environment.buildCaptureEnv();
         closure.* = value.Closure{
             .params = lam.params,
             .body = lam.body,
-            .env = @ptrCast(environment.retain()),
+            .env = @ptrCast(cap_env),
             .allocator = self.allocator,
+            .env_release_fn = Environment.releaseEnvOpaque,
         };
-        try self.closures.append(self.allocator, closure);
         return Value{ .closure = closure };
     }
 
@@ -4519,6 +4579,9 @@ pub const Evaluator = struct {
         self.in_tail_position = false;
         const scrutinee = try self.evalExpr(m.scrutinee, environment);
         self.in_tail_position = saved_tail;
+        // scrutinee 为 owned 临时。pattern.matchPattern 经 define(clone=retain) 把需要的子值
+        // 绑进 match_env 自己一份，故匹配/绑定后本函数持有的 owned 引用可安全 release。
+        defer scrutinee.release(self.value_allocator);
 
         // 守卫条件求值回调，将 evalExpr 传入 pattern.zig
         const guard_eval_ctx = pattern.GuardEvalCtx{
@@ -4533,21 +4596,39 @@ pub const Evaluator = struct {
         };
 
         for (m.arms) |arm| {
-            // Phase 1: 不 deinit match_env，因为闭包可能引用它
+            // 续14/闭包转换：闭包改 buildCaptureEnv 快照捕获（不再持 match_env 指针），
+            // 故 match_env 可在 arm 处理完即时 releaseEnv 回收（pool 分配，不回收即无界泄漏）。
             const match_env = try environment.createChild();
 
             const matched = pattern.matchPattern(arm.pattern, scrutinee, match_env, guard_eval_ctx) catch |err| {
+                match_env.releaseEnv();
                 return err;
             };
 
             if (matched) {
                 // 检查 arm 级别守卫条件
                 if (arm.guard) |guard| {
-                    const guard_val = try self.evalExpr(guard, match_env);
-                    if (!guard_val.isTruthy()) continue;
+                    const guard_val = self.evalExpr(guard, match_env) catch |err| {
+                        match_env.releaseEnv();
+                        return err;
+                    };
+                    const truthy = guard_val.isTruthy();
+                    guard_val.release(self.value_allocator);
+                    if (!truthy) {
+                        match_env.releaseEnv(); // 守卫不通过，丢弃本 arm 帧
+                        continue;
+                    }
                 }
-                return self.evalExpr(arm.body, match_env);
+                const result = self.evalExpr(arm.body, match_env) catch |err| {
+                    match_env.releaseEnv();
+                    return err;
+                };
+                // body 结果为 owned(+1)；releaseEnv 仅释放 match_env 的模式绑定（各持独立 rc），
+                // 不影响 result。若 result 别名某绑定，evalIdentifier 已 retain 出独立 owned。
+                match_env.releaseEnv();
+                return result;
             }
+            match_env.releaseEnv(); // 不匹配，丢弃本 arm 帧
         }
 
         return self.gluePanic("non-exhaustive match: no pattern matched the scrutinee value");
@@ -4697,9 +4778,9 @@ pub const Evaluator = struct {
 
     fn valueToString(self: *Evaluator, val: Value) EvalResult!Value {
         var buf = std.ArrayList(u8).empty;
-        errdefer buf.deinit(self.allocator);
-        try val.format(&buf, self.allocator, false);
-        return Value{ .string = try buf.toOwnedSlice(self.allocator) };
+        errdefer buf.deinit(self.value_allocator);
+        try val.format(&buf, self.value_allocator, false);
+        return Value{ .string = try buf.toOwnedSlice(self.value_allocator) };
     }
 
     // ============================================================
@@ -5043,6 +5124,13 @@ pub const Evaluator = struct {
                 // 出 env 自己一份；本函数持有的 owned 引用绑定后 release，使 fresh 值
                 // (rc=1) 不会停在 rc=2 而泄漏。阶段A 后 RHS 已非 borrow，release 不再误伤。
                 try environment.defineWithVisibility(vd.name, val, false, vd.visibility == .public);
+                // 续14/闭包转换 letrec：`val f = fun(){...f...}`（含 `fun f(){}` 语法糖）。
+                // 闭包 capture_env 在 f 绑定前快照、不含 f。绑定后补一条弱自引用进闭包 capture_env，
+                // 使递归可解析；弱引用避免 closure→capture_env→closure 成环。
+                if (val == .closure) {
+                    const cap: *Environment = @ptrCast(@alignCast(val.closure.env));
+                    cap.defineWeak(vd.name, val) catch {};
+                }
                 val.release(self.value_allocator);
                 return null;
             },
@@ -5596,6 +5684,7 @@ fn structuralEquals(a: Value, b: Value) bool {
         .receiver_val => |rv| rv == b.receiver_val, // 引用相等
         .trait_value => |tv| tv == b.trait_value, // 引用相等
         .lazy_val => |lz| lz == b.lazy_val, // 引用相等
+        .cell_val => |c| structuralEquals(c.inner, b.cell_val.inner), // 续14：透明比较内值
     };
 }
 

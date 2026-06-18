@@ -249,6 +249,25 @@ pub fn inferMethodCall(
     env: *TypeEnv,
 ) SemaError!*Type {
     const obj_ty = inferencer.inferExpr(mc.object, env) catch return inferencer.freshTypeVar() catch unreachable;
+    // 文档 §2.3.5：使用可空值前必须消除空值可能性。对 nullable 接收者直接调方法非法——
+    // 必须先用 ?.（安全调用）、!（非空断言）或 if x != null narrowing 消除 null。
+    // narrowing 后绑定已收窄为非 null（applyNarrowing），故此处只拦真正的 nullable。
+    {
+        const robj = inferencer.resolve(obj_ty);
+        if (robj.* == .nullable_type) {
+            // 字段路径 narrowing：若接收者路径（如 "u.addr"）已在 narrowed_paths 中
+            // （处于 `if (u.addr != null)` 的 then 分支），视为已收窄，放行。
+            var narrowed = false;
+            if (inferencer.exprPath(mc.object)) |op| {
+                defer inferencer.allocator.free(op);
+                narrowed = inferencer.narrowed_paths.contains(op);
+            }
+            if (!narrowed) {
+                inferencer.addErrorAt(.type_mismatch, mc.location.line, mc.location.column, "cannot call method '{s}' on nullable type; use '?.', '!', or narrow with 'if x != null' first", .{mc.method});
+                return inferencer.freshTypeVar() catch unreachable;
+            }
+        }
+    }
     // 查找 trait 方法签名
     var trait_iter = inferencer.trait_types.iterator();
     while (trait_iter.next()) |entry| {

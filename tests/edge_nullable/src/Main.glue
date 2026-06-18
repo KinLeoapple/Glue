@@ -1,0 +1,134 @@
+// Edge cases: nullable chains, ?? coalescing, ? propagation, error subtyping
+
+type Addr = Addr(city: str, zip: i32)
+type User = User(name: str, addr: Addr?)
+type Account = Account(owner: User?, balance: i32)
+
+type NotFound = Error("not found")
+type Timeout = Error("timeout")
+type Denied = Error("denied")
+
+// deep optional chaining through 3 levels
+fun cityOf(a: Account?): str? {
+    a?.owner?.addr?.city
+}
+
+// ?? coalescing chains, right-associative
+fun firstNonNull(a: i32?, b: i32?, c: i32?): i32 {
+    a ?? b ?? c ?? -1
+}
+
+// ? propagation on nullable inside nullable-returning fn
+fun addNullable(a: i32?, b: i32?): i32? {
+    val x = a?
+    val y = b?
+    x + y
+}
+
+// ? propagation on Throw inside Throw-returning fn
+fun safeDivChain(a: i32, b: i32, c: i32): Throw<i32, Error> {
+    val r1 = checkedDiv(a, b)?
+    val r2 = checkedDiv(r1, c)?
+    Ok(r2)
+}
+
+fun checkedDiv(a: i32, b: i32): Throw<i32, Error> {
+    if (b == 0) { throw Error("division by zero") }
+    Ok(a / b)
+}
+
+// error subtype: specific errors flow into Throw<_, Error>
+fun lookup(id: i32): Throw<str, Error> {
+    if (id < 0) { throw NotFound("id " + str(id)) }
+    if (id == 0) { throw Timeout("slow") }
+    if (id > 100) { throw Denied("forbidden") }
+    Ok("user-" + str(id))
+}
+
+// non-null assertion on a known-non-null value
+fun forceVal(x: i32?): i32 {
+    x!
+}
+
+// nullable in record field, extracted via ??
+fun zipOr(u: User): i32 {
+    u.addr?.zip ?? 0
+}
+
+// mixing ?. and ?? and !
+fun combo(a: Account?): i32 {
+    a?.balance ?? -1
+}
+
+fun main() {
+    val acc1 = Account(User("Alice", Addr("Beijing", 100000)), 500)
+    val acc2 = Account(User("Bob", null), 300)
+    val acc3 = Account(null, 0)
+    val accNull: Account? = null
+
+    // deep chaining
+    println(cityOf(acc1) ?? "no-city")    // Beijing
+    println(cityOf(acc2) ?? "no-city")    // no-city (addr is null)
+    println(cityOf(acc3) ?? "no-city")    // no-city (owner is null)
+    println(cityOf(accNull) ?? "no-city") // no-city (account is null)
+
+    // ?? chains
+    println(firstNonNull(null, null, 7))  // 7
+    println(firstNonNull(null, 5, 7))     // 5
+    println(firstNonNull(1, 5, 7))        // 1
+    println(firstNonNull(null, null, null)) // -1
+
+    // ? on nullable
+    println(addNullable(3, 4) ?? -1)      // 7
+    println(addNullable(null, 4) ?? -1)   // -1
+    println(addNullable(3, null) ?? -1)   // -1
+
+    // ? on Throw chain
+    val d1 = match safeDivChain(100, 5, 2) {
+        Ok(v) => v
+        Error(e) => -1
+    }
+    println(d1)   // 10
+
+    val d2 = match safeDivChain(100, 0, 2) {
+        Ok(v) => v
+        Error(e) => -1
+    }
+    println(d2)   // -1 (first div by zero)
+
+    val d3 = match safeDivChain(100, 5, 0) {
+        Ok(v) => v
+        Error(e) => -1
+    }
+    println(d3)   // -1 (second div by zero)
+
+    // error subtyping
+    val results = [lookup(-1), lookup(0), lookup(50), lookup(200)]
+    for r in results {
+        val msg = match r {
+            Ok(v) => v
+            Error(e) => "err:" + e.message
+        }
+        println(msg)
+    }
+
+    // non-null assertion
+    println(forceVal(42))   // 42
+
+    // nullable record field
+    println(zipOr(User("Carol", Addr("Shanghai", 200000)))) // 200000
+    println(zipOr(User("Dave", null)))                       // 0
+
+    // combo
+    println(combo(acc1))     // 500
+    println(combo(accNull))  // -1
+
+    // nested nullable: i32?? collapses semantics
+    val nn1: i32? = 5
+    val nn2: i32? = null
+    println(nn1 ?? 0)   // 5
+    println(nn2 ?? 0)   // 0
+    println(nn1!)       // 5
+
+    println("edge_nullable: All tests passed!")
+}

@@ -1,0 +1,59 @@
+// 值语义 + 写时拷贝（COW）回归：共享绑定下别名必须互不影响
+
+type Pair = Pair(a: i32, b: i32)
+
+fun takesRec(p: (x: i32, y: i32)): i32 { p.x + p.y }
+
+fun main() {
+    // ---- 记录：val 别名 + var 改字段，原值不变 ----
+    val a = (x: 1, y: 2)
+    var b = a
+    b.x = 99
+    println(a.x)        // 1 (未被串改)
+    println(b.x)        // 99
+
+    // ---- 数组：别名 + 改元素，原数组不变 ----
+    var arr = [1, 2, 3]
+    var c = arr
+    c[0] = 99
+    println(arr[0])     // 1
+    println(c[0])       // 99
+    println(arr[1])     // 2
+
+    // ---- 自身改字段正常 ----
+    var r = (x: 5, y: 6)
+    r.x = 50
+    println(r.x)        // 50
+    println(r.y)        // 6 (其它字段不变)
+
+    // ---- 记录传参：函数内不改，外部原样 ----
+    val pt = (x: 3, y: 4, z: 9)
+    println(takesRec(pt))   // 7
+    println(pt.x)           // 3
+
+    // ---- 多层别名链 ----
+    val base = (k: 1)
+    val x1 = base
+    val x2 = x1
+    var x3 = x2
+    x3.k = 100
+    println(base.k)     // 1
+    println(x1.k)       // 1
+    println(x2.k)       // 1
+    println(x3.k)       // 100
+
+    // ---- 数组里的记录元素（嵌套共享）----
+    val rec = (n: 7)
+    var lst = [rec, rec]
+    lst[0] = (n: 70)
+    println(rec.n)      // 7 (原记录不变)
+
+    // ---- 记录更新 spread 不影响源 ----
+    val src = (p: 1, q: 2, s: 3)
+    val upd = (...src, q: 20)
+    println(src.q)      // 2
+    println(upd.q)      // 20
+    println(upd.p)      // 1
+
+    println("edge_value_semantics: All tests passed!")
+}

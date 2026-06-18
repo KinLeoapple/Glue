@@ -1,0 +1,2 @@
+// 文档 §4.2-4.3: 目录模块入口。pub pack 声明公开子模块。
+pub pack Memory

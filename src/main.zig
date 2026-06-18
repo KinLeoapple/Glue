@@ -36,6 +36,36 @@ fn printRuntimeDiag(iface: anytype, filename: []const u8, loc: ?ast.SourceLocati
     }
 }
 
+/// 项目清单（glue.toml）解析结果。
+const Manifest = struct {
+    name: []const u8,
+    version: []const u8,
+    /// 入口文件相对项目根的路径，缺省 "src/Main.glue"。
+    entry: []const u8,
+};
+
+const MANIFEST_NAME = "glue.toml";
+const DEFAULT_ENTRY = "src/Main.glue";
+
+fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    w.interface.print(fmt, args) catch {};
+    w.flush() catch {};
+}
+
+fn printUsage(io: std.Io) void {
+    printErr(io,
+        \\Glue v0.1.0 — project-based language runtime
+        \\
+        \\Usage:
+        \\  glue init [name]   Scaffold a new Glue project (in ./name or current dir)
+        \\  glue run           Build and run the current project
+        \\  glue debug         Run with diagnostics (memory checking + runtime trace)
+        \\
+    , .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     // Windows 控制台默认使用 GBK 编码，需设置为 UTF-8 以正确输出非 ASCII 字符
     if (builtin.os.tag == .windows) {
@@ -47,76 +77,197 @@ pub fn main(init: std.process.Init) !void {
 
     const args_slice = try std.process.Args.toSlice(init.minimal.args, init.arena.allocator());
 
-    // 内存诊断标志 --gpa：用 DebugAllocator 替代 arena，检测 double-free/泄漏。
-    var gpa_mode = false;
-    var file_arg: ?[]const u8 = null;
-    for (args_slice[1..]) |a| {
-        if (std.mem.eql(u8, a, "--gpa")) {
-            gpa_mode = true;
-        } else if (file_arg == null) {
-            file_arg = a;
-        }
+    if (args_slice.len < 2) {
+        printUsage(io);
+        std.process.exit(1);
     }
 
-    if (file_arg) |fname| {
-        try runFile(allocator, io, fname, gpa_mode);
+    const cmd = args_slice[1];
+    if (std.mem.eql(u8, cmd, "init")) {
+        const name: ?[]const u8 = if (args_slice.len >= 3) args_slice[2] else null;
+        try cmdInit(allocator, io, name);
+    } else if (std.mem.eql(u8, cmd, "run")) {
+        try runProject(allocator, io, false);
+    } else if (std.mem.eql(u8, cmd, "debug")) {
+        try runProject(allocator, io, true);
     } else {
-        try runRepl(allocator, io);
+        printErr(io, "error: unknown command '{s}'\n\n", .{cmd});
+        printUsage(io);
+        std.process.exit(1);
     }
 }
 
-fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8, gpa_mode: bool) !void {
+// ============================================================
+// 项目根定位 + 清单解析
+// ============================================================
+
+/// 从 cwd 向上逐级查找 glue.toml，返回项目根的相对路径前缀（"" 表示当前目录）。
+/// 找不到返回 null。最多上溯 64 级（防御）。
+fn findProjectRoot(allocator: std.mem.Allocator, io: std.Io) !?[]const u8 {
     const cwd = std.Io.Dir.cwd();
-    const source = cwd.readFileAlloc(io, filename, allocator, .unlimited) catch |err| {
-        var err_buf: [4096]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-        stderr_writer.interface.print("{s}: error: could not read file: {s}\n", .{ filename, @errorName(err) }) catch {};
-        stderr_writer.flush() catch {};
-        return;
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(allocator);
+    var level: usize = 0;
+    while (level < 64) : (level += 1) {
+        // 拼出 <prefix>glue.toml 检测
+        const candidate = if (prefix.items.len == 0)
+            try allocator.dupe(u8, MANIFEST_NAME)
+        else
+            try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix.items, MANIFEST_NAME });
+        defer allocator.free(candidate);
+        if (cwd.access(io, candidate, .{})) {
+            return try allocator.dupe(u8, prefix.items);
+        } else |_| {}
+        // 上溯一级：prefix 追加 "../"
+        try prefix.appendSlice(allocator, ".." ++ [_]u8{std.fs.path.sep});
+    }
+    return null;
+}
+
+/// 极简 TOML 子集解析：逐行认 `key = "value"`（或裸值），忽略空行与 `#` 注释。
+/// 仅取 name/version/entry 三个键；entry 缺省 src/Main.glue。返回的字符串借用 source（不分配）。
+fn parseManifest(source: []const u8) Manifest {
+    var name: []const u8 = "app";
+    var version: []const u8 = "0.0.0";
+    var entry: []const u8 = DEFAULT_ENTRY;
+
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        var val = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        // 剥去成对引号
+        if (val.len >= 2 and val[0] == '"' and val[val.len - 1] == '"') {
+            val = val[1 .. val.len - 1];
+        }
+        if (std.mem.eql(u8, key, "name")) {
+            name = val;
+        } else if (std.mem.eql(u8, key, "version")) {
+            version = val;
+        } else if (std.mem.eql(u8, key, "entry")) {
+            if (val.len > 0) entry = val;
+        }
+    }
+    return .{ .name = name, .version = version, .entry = entry };
+}
+
+// ============================================================
+// glue init
+// ============================================================
+
+fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+
+    // 目标目录前缀：有 name 则 "name/"，否则当前目录 ""。
+    const dir_prefix = if (name) |n|
+        try std.fmt.allocPrint(allocator, "{s}{c}", .{ n, std.fs.path.sep })
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(dir_prefix);
+
+    // 项目名：有 name 用 name，否则用 "app"。
+    const proj_name = name orelse "app";
+
+    // 清单路径
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_prefix, MANIFEST_NAME });
+    defer allocator.free(manifest_path);
+
+    // 已存在则拒绝覆盖
+    if (cwd.access(io, manifest_path, .{})) {
+        printErr(io, "error: already a Glue project ({s} exists)\n", .{manifest_path});
+        std.process.exit(1);
+    } else |_| {}
+
+    // 创建目录：<prefix>src/
+    const src_dir = try std.fmt.allocPrint(allocator, "{s}src", .{dir_prefix});
+    defer allocator.free(src_dir);
+    cwd.createDirPath(io, src_dir) catch |err| {
+        printErr(io, "error: could not create directory '{s}': {s}\n", .{ src_dir, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    // 写清单
+    const manifest_content = try std.fmt.allocPrint(allocator,
+        \\name = "{s}"
+        \\version = "0.1.0"
+        \\entry = "{s}"
+        \\
+    , .{ proj_name, DEFAULT_ENTRY });
+    defer allocator.free(manifest_content);
+    cwd.writeFile(io, .{ .sub_path = manifest_path, .data = manifest_content }) catch |err| {
+        printErr(io, "error: could not write '{s}': {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    // 写入口 src/Main.glue
+    const main_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_prefix, DEFAULT_ENTRY });
+    defer allocator.free(main_path);
+    const main_content =
+        \\fun main() {
+        \\    println("Hello, Glue!")
+        \\}
+        \\
+    ;
+    cwd.writeFile(io, .{ .sub_path = main_path, .data = main_content }) catch |err| {
+        printErr(io, "error: could not write '{s}': {s}\n", .{ main_path, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    var out_buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(io, &out_buf);
+    w.interface.print("Created Glue project '{s}'\n  {s}\n  {s}\n", .{ proj_name, manifest_path, main_path }) catch {};
+    w.flush() catch {};
+}
+
+// ============================================================
+// glue run / glue debug
+// ============================================================
+
+/// 运行当前项目。diagnostic=true 走 DebugAllocator 诊断模式（glue debug）。
+fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void {
+    const cwd = std.Io.Dir.cwd();
+
+    const root = (try findProjectRoot(allocator, io)) orelse {
+        printErr(io, "error: not a Glue project (no {s} found); run 'glue init' first\n", .{MANIFEST_NAME});
+        std.process.exit(1);
+    };
+    defer allocator.free(root);
+
+    // 读清单
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ root, MANIFEST_NAME });
+    defer allocator.free(manifest_path);
+    const manifest_src = cwd.readFileAlloc(io, manifest_path, allocator, .unlimited) catch |err| {
+        printErr(io, "error: could not read {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer allocator.free(manifest_src);
+    const manifest = parseManifest(manifest_src);
+
+    // 入口文件路径 = root + entry
+    const entry_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ root, manifest.entry });
+    defer allocator.free(entry_path);
+
+    const source = cwd.readFileAlloc(io, entry_path, allocator, .unlimited) catch |err| {
+        printErr(io, "error: could not read entry '{s}': {s}\n", .{ entry_path, @errorName(err) });
+        std.process.exit(1);
     };
     defer allocator.free(source);
 
-    // 内存诊断模式（--gpa）：用 DebugAllocator 取代 arena，精确检测 double-free 与泄漏。
-    // 默认仍用 arena（快、整体释放）。诊断模式专供 refcount 攻坚定位释放点。
-    if (gpa_mode) {
-        var dbg: std.heap.DebugAllocator(.{}) = .init;
-        const dbg_alloc = dbg.allocator();
-        {
-            // 全程用 DebugAllocator：检测整程序的 double-free / 泄漏（含编译期数据）。
-            // 编译期数据本就活到退出会被报为 leak，但 double-free / invalid-free 会立即 panic，
-            // 这正是 refcount 攻坚要抓的——优先消除 invalid-free，再逐步降低 leak。
-            // value_allocator 走 SlabPool（backing=dbg_alloc），运行期 Value 箱体/载荷的
-            // pool 归还若与 release 记账不一致，DebugAllocator 会立即 panic 定位。
-            var pool = slab_pool.SlabPool.init(dbg_alloc);
-            defer pool.deinit();
-            var ev = eval.Evaluator.initWithIo(dbg_alloc, io);
-            ev.value_allocator = pool.allocator();
-            ev.global_env.value_allocator = ev.value_allocator;
-            defer ev.deinit();
-            const had_err = executeSource(dbg_alloc, &ev, io, source, filename);
-            if (!had_err) {
-                _ = ev.callMain() catch {};
-            }
-        }
-        const leaked = dbg.deinit();
-        var err_buf: [256]u8 = undefined;
-        var w = std.Io.File.stderr().writerStreaming(io, &err_buf);
-        if (leaked == .leak) {
-            w.interface.print("[GLUE_GPA] LEAK detected\n", .{}) catch {};
-        } else {
-            w.interface.print("[GLUE_GPA] clean (no leak / no double-free)\n", .{}) catch {};
-        }
-        w.flush() catch {};
-        return;
+    if (diagnostic) {
+        try runDiagnostic(allocator, io, source, entry_path);
+    } else {
+        try runNormal(allocator, io, source, entry_path);
     }
+}
 
-    // 使用 ArenaAllocator 管理解析和求值的所有临时分配（编译期/全程数据）。
+/// 普通运行（arena 快路径 + SlabPool）。出错以非零码退出。
+fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    // 运行期 Value（adt/record/array/newtype 箱体及载荷）走 SlabPool。
-    // backing = 底层 gpa（非 arena）：空 slab 归还才真正还给 OS，内存随死对象回落。
     var pool = slab_pool.SlabPool.init(allocator);
     defer pool.deinit();
 
@@ -125,77 +276,78 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, filename: []const u8, gpa_m
     ev.global_env.value_allocator = ev.value_allocator;
     defer ev.deinit();
 
-    const has_error = executeSource(arena_alloc, &ev, io, source, filename);
+    const has_error = executeSource(arena_alloc, &ev, io, source, entry_path);
 
-    // 文件模式下，查找并调用 main 入口函数
-    // 文档 D13: 入口点默认 Main.main，约定优于配置
+    var run_failed = has_error;
     if (!has_error) {
-        _ = ev.callMain() catch |err| switch (err) {
-            error.MissingMain => {
-                var err_buf: [4096]u8 = undefined;
-                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                stderr_writer.interface.print("{s}: error: undefined entry point\n", .{filename}) catch {};
-                stderr_writer.flush() catch {};
-            },
-            error.GluePanic => {
-                var err_buf: [4096]u8 = undefined;
-                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                const msg = ev.panic_message orelse "unknown error";
-                printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime panic", msg);
-                stderr_writer.flush() catch {};
-                ev.panic_message = null;
-            },
-            else => {
-                var err_buf: [4096]u8 = undefined;
-                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
-                stderr_writer.flush() catch {};
-            },
-        };
+        run_failed = invokeMain(&ev, io, entry_path, false);
+    }
+
+    if (run_failed) {
+        ev.deinit();
+        arena.deinit();
+        pool.deinit();
+        std.process.exit(1);
     }
 }
 
-fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
-    var out_buf: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
-    const stdout = &stdout_writer.interface;
-
-    var in_buf: [4096]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().readerStreaming(io, &in_buf);
-    const stdin = &stdin_reader.interface;
-
-    try stdout.print("Glue v0.1.0 -- Interactive REPL\n", .{});
-    try stdout_writer.flush();
-    try stdout.print("Enter expressions to evaluate, type :quit to exit\n\n", .{});
-    try stdout_writer.flush();
-
-    var ev = eval.Evaluator.initWithIo(allocator, io);
-    defer ev.deinit();
-
-    while (true) {
-        try stdout.print("> ", .{});
-        try stdout_writer.flush();
-
-        const line = stdin.takeDelimiter('\n') catch |err| {
-            if (err == error.EndOfStream) break;
-            try stdout.print("<repl>: error: failed to read input: {s}\n", .{@errorName(err)});
-            try stdout_writer.flush();
-            continue;
-        };
-
-        if (line) |l| {
-            const trimmed = std.mem.trim(u8, l, " \t\r\n");
-            if (trimmed.len == 0) continue;
-            if (std.mem.eql(u8, trimmed, ":quit") or std.mem.eql(u8, trimmed, ":q")) break;
-
-            _ = executeSource(allocator, &ev, io, trimmed, "<repl>");
-        } else {
-            break;
+/// 诊断运行（glue debug）：全程 DebugAllocator + SlabPool(backing=dbg) 检测 double-free/泄漏，
+/// trace=true 输出更详细的运行时错误位置链。结束报告 [GLUE_GPA] LEAK/clean。
+fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
+    _ = allocator;
+    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    const dbg_alloc = dbg.allocator();
+    {
+        var pool = slab_pool.SlabPool.init(dbg_alloc);
+        defer pool.deinit();
+        var ev = eval.Evaluator.initWithIo(dbg_alloc, io);
+        ev.value_allocator = pool.allocator();
+        ev.global_env.value_allocator = ev.value_allocator;
+        defer ev.deinit();
+        const had_err = executeSource(dbg_alloc, &ev, io, source, entry_path);
+        if (!had_err) {
+            _ = invokeMain(&ev, io, entry_path, true);
         }
     }
+    const leaked = dbg.deinit();
+    if (leaked == .leak) {
+        printErr(io, "[GLUE_GPA] LEAK detected\n", .{});
+    } else {
+        printErr(io, "[GLUE_GPA] clean (no leak / no double-free)\n", .{});
+    }
+}
 
-    try stdout.print("\nBye!\n", .{});
-    try stdout_writer.flush();
+/// 调用 main 入口，统一错误诊断。返回 true 表示运行失败。
+/// trace=true 时（debug 模式）panic 额外打印位置链。
+fn invokeMain(ev: *eval.Evaluator, io: std.Io, entry_path: []const u8, trace: bool) bool {
+    _ = ev.callMain() catch |err| switch (err) {
+        error.MissingMain => {
+            printErr(io, "{s}: error: undefined entry point (no 'fun main')\n", .{entry_path});
+            return true;
+        },
+        error.GluePanic => {
+            var err_buf: [4096]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+            const msg = ev.panic_message orelse "unknown error";
+            printRuntimeDiag(&stderr_writer.interface, entry_path, ev.panic_location, "runtime panic", msg);
+            if (trace) {
+                if (ev.panic_location) |l| {
+                    stderr_writer.interface.print("  at {s}:{d}:{d}\n", .{ entry_path, l.line, l.column }) catch {};
+                }
+            }
+            stderr_writer.flush() catch {};
+            ev.panic_message = null;
+            return true;
+        },
+        else => {
+            var err_buf: [4096]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+            printRuntimeDiag(&stderr_writer.interface, entry_path, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
+            stderr_writer.flush() catch {};
+            return true;
+        },
+    };
+    return false;
 }
 
 fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, source: []const u8, filename: []const u8) bool {
@@ -308,6 +460,9 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             stderr_writer.flush() catch {};
             return true;
         },
+        // 类型检查失败：错误已在 evalModule 内打印到 stderr，这里只需标记失败
+        // （返回 true → 不调 callMain，避免 "undefined entry point" 误报）。
+        error.TypeCheckFailed => return true,
         error.AmbiguousModule => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);

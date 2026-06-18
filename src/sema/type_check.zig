@@ -355,6 +355,9 @@ pub const AdtInfo = struct {
     /// 每个构造器的字段类型注解（与 constructor_names 对齐），
     /// 用于模式匹配时把模式变量绑定到真实字段类型 + GADT 类型细化。
     ctor_field_types: []const []const *Type = &[_][]const *Type{},
+    /// 每个构造器的字段名（与 ctor_field_types 对齐，位置参数为 null）。
+    /// 用于命名字段访问 `adtValue.field` 的类型推断（找到字段名→返回其类型）。
+    ctor_field_names: []const []const ?[]const u8 = &[_][]const ?[]const u8{},
     /// 每个构造器的 GADT 返回类型注解（无注解为 null，与 constructor_names 对齐）。
     ctor_return_types: []const ?*Type = &[_]?*Type{},
 };
@@ -587,6 +590,11 @@ pub const TypeInferencer = struct {
     builtin_names: std.StringHashMap(void),
     /// 用于 analyzeNullCheck 中翻转 is_non_null 的临时缓冲
     narrowing_buf: [4]NarrowingInfo = undefined,
+    /// 字段路径 narrowing 集合（flow typing 扩展）：当前激活的「已收窄为非空」字段路径串，
+    /// 如 `if (u.addr != null) { ... }` 的 then 分支里存 "u.addr"。标识符 narrowing 仍走
+    /// env 子作用域重定义（天然支持嵌套/遮蔽）；字段路径无法重定义到 env，故单独用此集合，
+    /// 在 if 分支推断前 put、推断后 remove。field_access/method_call 据此剥接收者的 nullable。
+    narrowed_paths: std.StringHashMap(void),
     /// 当前正在推断的函数信息（用于多态递归检测）
     current_fn_info: ?CurrentFnInfo = null,
 
@@ -627,6 +635,7 @@ pub const TypeInferencer = struct {
             .known_modules = std.StringHashMap(void).init(allocator),
             .builtin_names = std.StringHashMap(void).init(allocator),
             .linear_scope_stack = std.ArrayList(std.ArrayList(LinearVarInfo)).empty,
+            .narrowed_paths = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -726,6 +735,13 @@ pub const TypeInferencer = struct {
             scope.deinit(self.allocator);
         }
         self.linear_scope_stack.deinit(self.allocator);
+        // narrowed_paths 的 key 在 if 分支退出时已 free 并 remove；正常退出时应为空。
+        // 兜底：若有残留（异常路径未清），free 其 key 再 deinit。
+        {
+            var it = self.narrowed_paths.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+            self.narrowed_paths.deinit();
+        }
     }
 
     /// 添加类型错误到错误列表
@@ -1475,13 +1491,15 @@ pub const TypeInferencer = struct {
                         // expr != null → then 分支中 expr 非空
                         if (self.isNullLiteral(bin.right)) {
                             if (self.getIdentifierName(bin.left)) |name| {
-                                return &[_]NarrowingInfo{.{ .name = name, .is_non_null = true }};
+                                self.narrowing_buf[0] = .{ .name = name, .is_non_null = true };
+                                return self.narrowing_buf[0..1];
                             }
                         }
                         // null != expr → 同上
                         if (self.isNullLiteral(bin.left)) {
                             if (self.getIdentifierName(bin.right)) |name| {
-                                return &[_]NarrowingInfo{.{ .name = name, .is_non_null = true }};
+                                self.narrowing_buf[0] = .{ .name = name, .is_non_null = true };
+                                return self.narrowing_buf[0..1];
                             }
                         }
                     },
@@ -1489,13 +1507,15 @@ pub const TypeInferencer = struct {
                         // expr == null → else 分支中 expr 非空
                         if (self.isNullLiteral(bin.right)) {
                             if (self.getIdentifierName(bin.left)) |name| {
-                                return &[_]NarrowingInfo{.{ .name = name, .is_non_null = false }};
+                                self.narrowing_buf[0] = .{ .name = name, .is_non_null = false };
+                                return self.narrowing_buf[0..1];
                             }
                         }
                         // null == expr → 同上
                         if (self.isNullLiteral(bin.left)) {
                             if (self.getIdentifierName(bin.right)) |name| {
-                                return &[_]NarrowingInfo{.{ .name = name, .is_non_null = false }};
+                                self.narrowing_buf[0] = .{ .name = name, .is_non_null = false };
+                                return self.narrowing_buf[0..1];
                             }
                         }
                     },
@@ -1550,6 +1570,60 @@ pub const TypeInferencer = struct {
             .identifier => |id| id.name,
             else => null,
         };
+    }
+
+    /// 把 identifier / field_access 链序列化成点分路径串（如 `u.addr.city`）。
+    /// 仅对纯字段访问链有效（含中间不能有方法调用/下标等不稳定环节）；其余返回 null。
+    /// 返回的 slice 由调用方拥有，需 free。用于字段路径 narrowing 的 key。
+    pub fn exprPath(self: *TypeInferencer, expr: *const ast.Expr) ?[]const u8 {
+        switch (expr.*) {
+            .identifier => |id| return self.allocator.dupe(u8, id.name) catch null,
+            .field_access => |fa| {
+                const base = self.exprPath(fa.object) orelse return null;
+                defer self.allocator.free(base);
+                return std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ base, fa.field }) catch null;
+            },
+            else => return null,
+        }
+    }
+
+    /// 分析条件是否为字段路径的 null 检查（`x.y != null` / `x.y == null`）。
+    /// 命中则把路径串写入 out_path（调用方负责 free）、把「非空成立于 then 分支」写入 out_then。
+    /// 仅处理字段路径（field_access 链）；简单标识符走 analyzeNullCheck/env 机制，此处忽略。
+    fn fieldPathNullCheck(self: *TypeInferencer, cond: *const ast.Expr, out_path: *?[]const u8, out_then: *bool) void {
+        if (cond.* != .binary) return;
+        const bin = cond.binary;
+        const is_neq = bin.op == .not_eq;
+        const is_eq = bin.op == .eq;
+        if (!is_neq and !is_eq) return;
+        // 找出非 null 那一侧的表达式
+        const operand: ?*const ast.Expr =
+            if (self.isNullLiteral(bin.right)) bin.left else if (self.isNullLiteral(bin.left)) bin.right else null;
+        const op = operand orelse return;
+        // 只接字段路径（field_access 链）；简单标识符交给现有机制
+        if (op.* != .field_access) return;
+        if (self.exprPath(op)) |p| {
+            out_path.* = p;
+            out_then.* = is_neq; // != null → then 非空；== null → else 非空
+        }
+    }
+
+    /// 把字段路径加入 narrowed_paths（dupe key）。已存在则不重复加，返回 false（不需 pop）。
+    fn pushNarrowedPath(self: *TypeInferencer, path: []const u8) bool {
+        if (self.narrowed_paths.contains(path)) return false;
+        const key = self.allocator.dupe(u8, path) catch return false;
+        self.narrowed_paths.put(key, {}) catch {
+            self.allocator.free(key);
+            return false;
+        };
+        return true;
+    }
+
+    /// 从 narrowed_paths 移除字段路径并 free 其 key。
+    fn popNarrowedPath(self: *TypeInferencer, path: []const u8) void {
+        if (self.narrowed_paths.fetchRemove(path)) |kv| {
+            self.allocator.free(kv.key);
+        }
     }
 
     /// 在子环境中应用收窄：将 T? 绑定收窄为 T
@@ -1850,14 +1924,27 @@ pub const TypeInferencer = struct {
                 const cond_ty = try self.inferExpr(ie.condition, env);
                 try self.unify(cond_ty, try self.makeType(.bool_type));
 
-                // 分析条件中的 null 检查，获取收窄信息
+                // 分析条件中的 null 检查，获取收窄信息（标识符走 env 重定义）
                 const narrowings = self.analyzeNullCheck(ie.condition);
+
+                // 字段路径 narrowing：`x.y != null`/`x.y == null` 提取路径串 + 非空成立的分支。
+                // path_for_then=true 表示路径在 then 分支非空（!= null），false 表示在 else 分支（== null）。
+                var narrow_path: ?[]const u8 = null;
+                var path_non_null_in_then = true;
+                self.fieldPathNullCheck(ie.condition, &narrow_path, &path_non_null_in_then);
+                defer if (narrow_path) |p| self.allocator.free(p);
 
                 // Then 分支：应用 is_non_null == true 的收窄
                 const then_env = try env.createChild();
                 self.applyNarrowing(then_env, narrowings, true);
                 self.pushLinearScope();
+                // 字段路径在 then 分支非空时，临时加入 narrowed_paths
+                const added_then = if (narrow_path != null and path_non_null_in_then)
+                    self.pushNarrowedPath(narrow_path.?)
+                else
+                    false;
                 const then_ty = try self.inferExpr(ie.then_branch, then_env);
+                if (added_then) self.popNarrowedPath(narrow_path.?);
                 self.popLinearScope();
 
                 if (ie.else_branch) |else_br| {
@@ -1865,7 +1952,13 @@ pub const TypeInferencer = struct {
                     const else_env = try env.createChild();
                     self.applyNarrowing(else_env, narrowings, false);
                     self.pushLinearScope();
+                    // 字段路径在 else 分支非空时（条件是 == null），临时加入
+                    const added_else = if (narrow_path != null and !path_non_null_in_then)
+                        self.pushNarrowedPath(narrow_path.?)
+                    else
+                        false;
                     const else_ty = try self.inferExpr(else_br, else_env);
+                    if (added_else) self.popNarrowedPath(narrow_path.?);
                     self.popLinearScope();
                     // 发散分支处理：若某一分支体只含 throw（或 return/break/continue），
                     // 其类型为 unit，不应强行与另一分支的真实值类型统一。此时整个 if
@@ -2047,7 +2140,24 @@ pub const TypeInferencer = struct {
                     return self.freshTypeVar() catch unreachable;
                 }
                 const resolved = self.resolve(obj_ty);
-                switch (resolved.*) {
+                // 文档 §2.3.5：对 nullable 接收者直接取字段非法——必须先用 ?.（安全访问）、
+                // !（非空断言）或 if x != null narrowing 消除 null。narrowing 后绑定已收窄为非 null。
+                var eff_resolved = resolved;
+                if (eff_resolved.* == .nullable_type) {
+                    // 字段路径 narrowing：若对象路径（如 "u.addr"）已在 narrowed_paths 中
+                    // （处于 `if (u.addr != null)` 的 then 分支），剥一层 nullable 当非空处理。
+                    if (self.exprPath(fa.object)) |op| {
+                        defer self.allocator.free(op);
+                        if (self.narrowed_paths.contains(op)) {
+                            eff_resolved = self.resolve(eff_resolved.nullable_type);
+                        }
+                    }
+                }
+                if (eff_resolved.* == .nullable_type) {
+                    self.addErrorAt(.type_mismatch, fa.location.line, fa.location.column, "cannot access field '{s}' on nullable type; use '?.', '!', or narrow with 'if x != null' first", .{fa.field});
+                    return self.freshTypeVar() catch unreachable;
+                }
+                switch (eff_resolved.*) {
                     .record_type => |rt| {
                         for (rt.fields) |field| {
                             if (std.mem.eql(u8, field.name, fa.field)) {
@@ -2055,6 +2165,27 @@ pub const TypeInferencer = struct {
                             }
                         }
                         self.addErrorAt(.type_mismatch, fa.location.line, fa.location.column, "record type has no field named '{s}'", .{fa.field});
+                        return self.freshTypeVar() catch unreachable;
+                    },
+                    // ADT 命名字段访问（如 `user.addr`，user: User，User(addr: Addr?)）。
+                    // 在各构造器的命名字段里查 fa.field，返回其声明类型——使 nullable 字段
+                    // （addr: Addr?）能被上面的 nullable 检查捕获，堵住 `user.addr.city` 漏洞。
+                    // 泛型 ADT（type_param_names>0，字段类型含类型参数）需类型实参替换，
+                    // 此处暂回退 fresh（不误报、不强制），仅对非泛型/具体 ADT 精确建模。
+                    .adt_type => |at| {
+                        if (self.adt_types.get(at.name)) |info| {
+                            if (info.type_param_names.len == 0) {
+                                for (info.ctor_field_names, 0..) |fns, ci| {
+                                    for (fns, 0..) |fname_opt, fi| {
+                                        if (fname_opt) |fname| {
+                                            if (std.mem.eql(u8, fname, fa.field)) {
+                                                return info.ctor_field_types[ci][fi];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         return self.freshTypeVar() catch unreachable;
                     },
                     else => return self.freshTypeVar() catch unreachable,
@@ -3460,14 +3591,18 @@ pub const TypeInferencer = struct {
                         // 文档 §2.13: 计算每个构造器的字段类型与 GADT 返回类型，
                         // 检测是否为 GADT（任一构造器带 `: ReturnType` 注解）。
                         const ctor_field_types = self.allocator.alloc([]const *Type, adt_def.constructors.len) catch return;
+                        const ctor_field_names = self.allocator.alloc([]const ?[]const u8, adt_def.constructors.len) catch return;
                         const ctor_return_types = self.allocator.alloc(?*Type, adt_def.constructors.len) catch return;
                         var is_gadt = false;
                         for (adt_def.constructors, 0..) |con, ci| {
                             const fts = self.allocator.alloc(*Type, con.fields.len) catch return;
+                            const fns = self.allocator.alloc(?[]const u8, con.fields.len) catch return;
                             for (con.fields, 0..) |field, fi| {
                                 fts[fi] = self.typeFromAstWithParams(field.ty, &type_param_map) catch (self.freshTypeVar() catch return);
+                                fns[fi] = field.name;
                             }
                             ctor_field_types[ci] = fts;
+                            ctor_field_names[ci] = fns;
                             if (con.return_type) |rt| {
                                 is_gadt = true;
                                 ctor_return_types[ci] = self.typeFromAstWithParams(rt, &type_param_map) catch null;
@@ -3480,6 +3615,7 @@ pub const TypeInferencer = struct {
                             if (self.adt_types.getPtr(td.name)) |info| {
                                 info.is_gadt = is_gadt;
                                 info.ctor_field_types = ctor_field_types;
+                                info.ctor_field_names = ctor_field_names;
                                 info.ctor_return_types = ctor_return_types;
                             }
                         }

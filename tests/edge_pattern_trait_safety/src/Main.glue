@@ -1,0 +1,57 @@
+// Pattern matching type safety + trait dispatch on numeric types
+
+type Ord = | Lt | Eq | Gt
+
+trait Comparable { fun compare(a, b): Ord }
+impl Comparable<i32> {
+    fun compare(a, b): Ord {
+        if (a < b) { Lt } else if (a == b) { Eq } else { Gt }
+    }
+}
+
+// trait with default method, impl on i32
+trait Greet {
+    fun name(self): str
+    fun hi(self): str { "hi " + self.name() }
+}
+impl Greet<i32> {
+    fun name(self): str { "num" }
+}
+
+fun classify(n: i32): str {
+    match n {
+        0 => "zero"
+        x if x > 0 => "pos"
+        _ => "neg"
+    }
+}
+
+fun main() {
+    // ---- guard with bool condition (valid) ----
+    println(classify(0))    // zero
+    println(classify(5))    // pos
+    println(classify(-3))   // neg
+
+    // ---- literal patterns matching scrutinee type ----
+    val s = match "hi" {
+        "hi" => 1
+        "bye" => 2
+        _ => 0
+    }
+    println(s)              // 1
+
+    // ---- trait method dispatch on numeric literal (i8) finds i32 impl ----
+    // (literals infer smallest type; dispatch is width-tolerant)
+    println((5).name())     // num
+    println((5).hi())       // hi num (default method)
+
+    // ---- trait bound via with-clause ----
+    println(mx(3, 7))       // 7
+    println(mx(10, 2))      // 10
+
+    println("edge_pattern_trait_safety: All tests passed!")
+}
+
+fun mx(a: i32, b: i32): i32 with Comparable {
+    match compare(a, b) { Lt => b, _ => a }
+}

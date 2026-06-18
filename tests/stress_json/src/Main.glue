@@ -1,0 +1,233 @@
+// 端到端压力测试 5：JSON 解析器（递归下降）
+// 综合压测：嵌套 ADT、递归数据结构、字符串索引、Throw/?、记录携带解析状态、泛型 List
+
+// ============================================================
+// 泛型 List
+// ============================================================
+type List<T> =
+    | Nil
+    | Cons(T, List<T>)
+
+fun lenL<T>(l: List<T>): i32 {
+    match l { Nil => 0, Cons(_, t) => 1 + lenL(t) }
+}
+
+fun reverseL<T>(l: List<T>): List<T> {
+    fun go(rem: List<T>, acc: List<T>): List<T> {
+        match rem { Nil => acc, Cons(x, t) => go(t, Cons(x, acc)) }
+    }
+    go(l, Nil)
+}
+
+// ============================================================
+// JSON 值的 ADT 表示
+// ============================================================
+type Json =
+    | JNull
+    | JBool(bool)
+    | JNum(i32)
+    | JStr(str)
+    | JArr(List<Json>)
+    | JObj(List<Member>)
+
+type Member = Member(key: str, value: Json)
+
+// ============================================================
+// 解析状态：源串 + 当前位置，用记录携带 (json结果, 下一位置)
+// ============================================================
+type ParseError = Error("parse error")
+
+fun isDigit(c: char): bool { c >= '0' && c <= '9' }
+fun digitVal(c: char): i32 {
+    match c {
+        '0' => 0, '1' => 1, '2' => 2, '3' => 3, '4' => 4,
+        '5' => 5, '6' => 6, '7' => 7, '8' => 8, '9' => 9, _ => 0
+    }
+}
+
+// 跳过空白，返回下一个非空白位置
+fun skipWs(s: str, i: i32): i32 {
+    if (i >= s.len()) { i }
+    else {
+        val c = s[i]
+        if (c == ' ' || c == '\n' || c == '\t') { skipWs(s, i + 1) } else { i }
+    }
+}
+
+// 解析数字
+fun parseNum(s: str, i: i32): Throw<(value: i32, next: i32), Error> {
+    fun go(j: i32, acc: i32): (value: i32, next: i32) {
+        if (j >= s.len()) { (value: acc, next: j) }
+        else {
+            val c = s[j]
+            if (isDigit(c)) { go(j + 1, acc * 10 + digitVal(c)) } else { (value: acc, next: j) }
+        }
+    }
+    val r = go(i, 0)
+    Ok((value: r.value, next: r.next))
+}
+
+// 解析字符串字面量（已在引号后），返回内容到下一个引号
+fun parseStr(s: str, i: i32): Throw<(value: str, next: i32), Error> {
+    fun go(j: i32, acc: str): (value: str, next: i32) {
+        if (j >= s.len()) { (value: acc, next: j) }
+        else {
+            val c = s[j]
+            if (c == '"') { (value: acc, next: j + 1) }
+            else { go(j + 1, acc + str(c)) }
+        }
+    }
+    val r = go(i, "")
+    Ok((value: r.value, next: r.next))
+}
+
+// 主解析：解析一个 JSON 值，返回 (json, next)
+fun parseValue(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
+    val i = skipWs(s, i0)
+    if (i >= s.len()) { throw ParseError("unexpected end") }
+    else {
+        val c = s[i]
+        if (c == 'n') {
+            // null
+            Ok((value: JNull, next: i + 4))
+        } else if (c == 't') {
+            Ok((value: JBool(true), next: i + 4))
+        } else if (c == 'f') {
+            Ok((value: JBool(false), next: i + 5))
+        } else if (c == '"') {
+            val r = parseStr(s, i + 1)?
+            Ok((value: JStr(r.value), next: r.next))
+        } else if (isDigit(c)) {
+            val r = parseNum(s, i)?
+            Ok((value: JNum(r.value), next: r.next))
+        } else if (c == '[') {
+            parseArray(s, i + 1)
+        } else if (c == '{') {
+            parseObject(s, i + 1)
+        } else {
+            throw ParseError("unexpected char")
+        }
+    }
+}
+
+// 解析数组（已在 '[' 后）
+fun parseArray(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
+    fun go(i: i32, acc: List<Json>): Throw<(value: Json, next: i32), Error> {
+        val j = skipWs(s, i)
+        if (j >= s.len()) { throw ParseError("unterminated array") }
+        else {
+            val c = s[j]
+            if (c == ']') {
+                Ok((value: JArr(reverseL(acc)), next: j + 1))
+            } else if (c == ',') {
+                go(j + 1, acc)
+            } else {
+                val r = parseValue(s, j)?
+                go(r.next, Cons(r.value, acc))
+            }
+        }
+    }
+    go(i0, Nil)
+}
+
+// 解析对象（已在 '{' 后）
+fun parseObject(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
+    fun go(i: i32, acc: List<Member>): Throw<(value: Json, next: i32), Error> {
+        val j = skipWs(s, i)
+        if (j >= s.len()) { throw ParseError("unterminated object") }
+        else {
+            val c = s[j]
+            if (c == '}') {
+                Ok((value: JObj(reverseL(acc)), next: j + 1))
+            } else if (c == ',') {
+                go(j + 1, acc)
+            } else if (c == '"') {
+                // key
+                val k = parseStr(s, j + 1)?
+                val afterKey = skipWs(s, k.next)
+                // 期望 ':'
+                if (afterKey >= s.len()) { throw ParseError("expected colon") }
+                else {
+                    val colon = s[afterKey]
+                    if (colon == ':') {
+                        val v = parseValue(s, afterKey + 1)?
+                        go(v.next, Cons(Member(k.value, v.value), acc))
+                    } else {
+                        throw ParseError("expected colon")
+                    }
+                }
+            } else {
+                throw ParseError("unexpected char in object")
+            }
+        }
+    }
+    go(i0, Nil)
+}
+
+// ============================================================
+// JSON 序列化（验证往返）
+// ============================================================
+fun showJson(j: Json): str {
+    match j {
+        JNull => "null"
+        JBool(b) => if (b) { "true" } else { "false" }
+        JNum(n) => str(n)
+        JStr(s) => "\"" + s + "\""
+        JArr(items) => "[" + showArr(items) + "]"
+        JObj(members) => "{{" + showObj(members) + "}}"
+    }
+}
+
+fun showArr(items: List<Json>): str {
+    match items {
+        Nil => ""
+        Cons(x, Nil) => showJson(x)
+        Cons(x, rest) => showJson(x) + "," + showArr(rest)
+    }
+}
+
+fun showObj(members: List<Member>): str {
+    match members {
+        Nil => ""
+        Cons(m, Nil) => match m { Member(k, v) => "\"" + k + "\":" + showJson(v) }
+        Cons(m, rest) => match m { Member(k, v) => "\"" + k + "\":" + showJson(v) + "," + showObj(rest) }
+    }
+}
+
+fun parse(s: str): str {
+    match parseValue(s, 0) {
+        Ok(r) => showJson(r.value)
+        Error(e) => "ERR: " + e.message
+    }
+}
+
+fun main() {
+    // 基本值
+    println(parse("null"))                          // null
+    println(parse("true"))                          // true
+    println(parse("false"))                         // false
+    println(parse("42"))                            // 42
+    println(parse("\"hello\""))                     // "hello"
+
+    // 数组
+    println(parse("[1,2,3]"))                       // [1,2,3]
+    println(parse("[]"))                            // []
+    println(parse("[1, 2, 3]"))                     // [1,2,3] (含空白)
+    println(parse("[[1,2],[3,4]]"))                 // 嵌套数组
+
+    // 对象 — 注意：Glue 字符串里 `{`/`}` 需写成 `{{`/`}}`（否则触发插值），
+    // 实际传给 parse 的内容是单括号 JSON。
+    println(parse("{{\"a\":1}}"))                   // {"a":1}
+    println(parse("{{\"x\":1,\"y\":2}}"))           // {"x":1,"y":2}
+    println(parse("{{ \"k\" : \"v\" }}"))           // {"k":"v"} (含空白)
+
+    // 嵌套混合
+    println(parse("{{\"nums\":[1,2,3],\"ok\":true}}"))
+    println(parse("[{{\"a\":1}},{{\"b\":2}}]"))
+
+    // 错误
+    println(parse(""))                              // ERR: unexpected end
+    println(parse("@"))                             // ERR: unexpected char
+
+    println("stress5: All tests passed!")
+}

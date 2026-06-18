@@ -1,0 +1,219 @@
+// 端到端压力测试 2：一个手写 tokenizer + 递归下降解析器 + 求值器
+// 综合压测：字符串索引/迭代、ADT、深度递归、Throw、可空、记录、泛型 List、高阶
+
+// ============================================================
+// 泛型 List
+// ============================================================
+type List<T> =
+    | Nil
+    | Cons(T, List<T>)
+
+fun lenL<T>(l: List<T>): i32 {
+    match l { Nil => 0, Cons(_, t) => 1 + lenL(t) }
+}
+
+fun reverseL<T>(l: List<T>): List<T> {
+    fun go(rem: List<T>, acc: List<T>): List<T> {
+        match rem { Nil => acc, Cons(x, t) => go(t, Cons(x, acc)) }
+    }
+    go(l, Nil)
+}
+
+// ============================================================
+// Token 类型
+// ============================================================
+type Token =
+    | TNum(i32)
+    | TPlus
+    | TMinus
+    | TStar
+    | TSlash
+    | TLParen
+    | TRParen
+
+fun showTok(t: Token): str {
+    match t {
+        TNum(n) => "Num(" + str(n) + ")"
+        TPlus => "+"
+        TMinus => "-"
+        TStar => "*"
+        TSlash => "/"
+        TLParen => "("
+        TRParen => ")"
+    }
+}
+
+// ============================================================
+// Tokenizer：扫描字符串，产出 token 列表
+// 仅支持数字、+ - * / ( ) 和空格
+// ============================================================
+fun isDigit(c: char): bool {
+    c >= '0' && c <= '9'
+}
+
+fun digitVal(c: char): i32 {
+    match c {
+        '0' => 0
+        '1' => 1
+        '2' => 2
+        '3' => 3
+        '4' => 4
+        '5' => 5
+        '6' => 6
+        '7' => 7
+        '8' => 8
+        '9' => 9
+        _ => 0
+    }
+}
+
+type LexError = Error("lex error")
+
+// 从位置 i 开始扫描一个整数，返回 (值, 下一个位置)
+fun scanNum(s: str, i: i32, acc: i32): (value: i32, next: i32) {
+    if (i >= s.len()) {
+        (value: acc, next: i)
+    } else {
+        val c = s[i]
+        if (isDigit(c)) {
+            scanNum(s, i + 1, acc * 10 + digitVal(c))
+        } else {
+            (value: acc, next: i)
+        }
+    }
+}
+
+fun tokenize(s: str): Throw<List<Token>, Error> {
+    fun go(i: i32, acc: List<Token>): Throw<List<Token>, Error> {
+        if (i >= s.len()) {
+            Ok(reverseL(acc))
+        } else {
+            val c = s[i]
+            if (c == ' ') {
+                go(i + 1, acc)
+            } else if (isDigit(c)) {
+                val r = scanNum(s, i, 0)
+                go(r.next, Cons(TNum(r.value), acc))
+            } else if (c == '+') {
+                go(i + 1, Cons(TPlus, acc))
+            } else if (c == '-') {
+                go(i + 1, Cons(TMinus, acc))
+            } else if (c == '*') {
+                go(i + 1, Cons(TStar, acc))
+            } else if (c == '/') {
+                go(i + 1, Cons(TSlash, acc))
+            } else if (c == '(') {
+                go(i + 1, Cons(TLParen, acc))
+            } else if (c == ')') {
+                go(i + 1, Cons(TRParen, acc))
+            } else {
+                throw LexError("unexpected char")
+            }
+        }
+    }
+    go(0, Nil)
+}
+
+// ============================================================
+// 求值：直接在 token 流上做递归下降 (expr = term (+|-) term, term = factor (*|/) factor)
+// 用记录携带 (剩余 token, 计算结果)
+// ============================================================
+type ParseError = Error("parse error")
+
+// factor = number | ( expr )
+fun parseFactor(toks: List<Token>): Throw<(value: i32, rest: List<Token>), Error> {
+    match toks {
+        Nil => throw ParseError("unexpected end")
+        Cons(TNum(n), rest) => Ok((value: n, rest: rest))
+        Cons(TLParen, rest) => {
+            val inner = parseExpr(rest)?
+            match inner.rest {
+                Cons(TRParen, rest2) => Ok((value: inner.value, rest: rest2))
+                _ => throw ParseError("expected )")
+            }
+        }
+        _ => throw ParseError("expected factor")
+    }
+}
+
+// term = factor ((* | /) factor)*
+fun parseTerm(toks: List<Token>): Throw<(value: i32, rest: List<Token>), Error> {
+    val first = parseFactor(toks)?
+    parseTermLoop(first.value, first.rest)
+}
+
+fun parseTermLoop(acc: i32, toks: List<Token>): Throw<(value: i32, rest: List<Token>), Error> {
+    match toks {
+        Cons(TStar, rest) => {
+            val f = parseFactor(rest)?
+            parseTermLoop(acc * f.value, f.rest)
+        }
+        Cons(TSlash, rest) => {
+            val f = parseFactor(rest)?
+            if (f.value == 0) { throw ParseError("division by zero") }
+            else { parseTermLoop(acc / f.value, f.rest) }
+        }
+        _ => Ok((value: acc, rest: toks))
+    }
+}
+
+// expr = term ((+ | -) term)*
+fun parseExpr(toks: List<Token>): Throw<(value: i32, rest: List<Token>), Error> {
+    val first = parseTerm(toks)?
+    parseExprLoop(first.value, first.rest)
+}
+
+fun parseExprLoop(acc: i32, toks: List<Token>): Throw<(value: i32, rest: List<Token>), Error> {
+    match toks {
+        Cons(TPlus, rest) => {
+            val t = parseTerm(rest)?
+            parseExprLoop(acc + t.value, t.rest)
+        }
+        Cons(TMinus, rest) => {
+            val t = parseTerm(rest)?
+            parseExprLoop(acc - t.value, t.rest)
+        }
+        _ => Ok((value: acc, rest: toks))
+    }
+}
+
+fun calc(s: str): Throw<i32, Error> {
+    val toks = tokenize(s)?
+    val r = parseExpr(toks)?
+    match r.rest {
+        Nil => Ok(r.value)
+        _ => throw ParseError("trailing tokens")
+    }
+}
+
+fun run(s: str): str {
+    match calc(s) {
+        Ok(v) => s + " = " + str(v)
+        Error(e) => s + " => " + e.message
+    }
+}
+
+fun main() {
+    // tokenizer 单测
+    val toks = match tokenize("12 + 34") {
+        Ok(ts) => ts
+        Error(e) => Nil
+    }
+    println(lenL(toks))                         // 3
+
+    // 计算器端到端
+    println(run("1 + 2 + 3"))                   // = 6
+    println(run("2 * 3 + 4"))                   // = 10
+    println(run("2 + 3 * 4"))                   // = 14 (优先级)
+    println(run("(2 + 3) * 4"))                 // = 20
+    println(run("100 / 5 / 2"))                 // = 10
+    println(run("10 - 2 - 3"))                  // = 5 (左结合)
+    println(run("((1 + 2) * (3 + 4))"))         // = 21
+    println(run("2 * (3 + 4) - 5"))             // = 9
+    println(run("1000 / 0"))                    // div by zero
+    println(run("1 + "))                        // parse error: unexpected end
+    println(run("1 2 3"))                       // trailing tokens
+    println(run("42"))                          // = 42
+
+    println("stress2: All tests passed!")
+}

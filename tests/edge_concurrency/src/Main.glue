@@ -1,0 +1,102 @@
+// Edge cases: concurrency — spawn isolation, atomic ops, channel buffer/close, select
+
+fun main() {
+    // ---- multiple spawns, independent results ----
+    val s1 = spawn { 10 * 10 }
+    val s2 = spawn { 20 + 5 }
+    val s3 = spawn { 100 - 1 }
+    println(s1.await())   // 100
+    println(s2.await())   // 25
+    println(s3.await())   // 99
+
+    // ---- spawn captures by deep copy: outer var unchanged ----
+    var x = 0
+    val s4 = spawn { x + 50 }
+    println(s4.await())   // 50
+    println(x)            // 0 (unchanged)
+
+    // ---- atomic shared across spawn ----
+    var counter = atomic 0
+    val a1 = spawn { counter = counter + 1 }
+    a1.await()
+    val a2 = spawn { counter = counter + 1 }
+    a2.await()
+    println(counter)      // 2
+
+    // ---- atomic swap and cas ----
+    var atm = atomic 10
+    println(atm.swap(20))   // 10 (old value)
+    println(atm)            // 20
+    println(atm.cas(20, 30)) // true
+    println(atm)            // 30
+    println(atm.cas(99, 40)) // false
+    println(atm)            // 30 (unchanged)
+
+    // ---- channel: buffered send/recv ordering (FIFO) ----
+    val ch = channel(10)
+    ch.send(1)
+    ch.send(2)
+    ch.send(3)
+    println(ch.recv())    // 1
+    println(ch.recv())    // 2
+    println(ch.recv())    // 3
+
+    // ---- channel: close, then drain buffer, then null ----
+    val ch2 = channel(10)
+    ch2.send(100)
+    ch2.send(200)
+    ch2.sender.close()
+    println(ch2.recv())   // 100
+    println(ch2.recv())   // 200
+    println(ch2.recv())   // null (closed + drained)
+
+    // ---- channel: sender/receiver split ----
+    val ch3 = channel(10)
+    val tx = ch3.sender
+    val rx = ch3.receiver
+    tx.send(42)
+    tx.send(43)
+    println(rx.recv())    // 42
+    println(rx.recv())    // 43
+    tx.close()
+
+    // ---- select with ready channel ----
+    val cha = channel(10)
+    val chb = channel(10)
+    chb.send(999)
+    select {
+        cha.recv() => println("from-a")
+        chb.recv() => println("from-b")
+    }
+
+    // ---- select binding the received value (ch.recv() => name => body) ----
+    val chc = channel(10)
+    chc.send(7)
+    select {
+        chc.recv() => v => println("got " + str(v))
+    }
+
+    // ---- spawn computing into channel ----
+    val result_ch = channel(10)
+    val producer = spawn { result_ch.send(12345) }
+    producer.await()
+    println(result_ch.recv())   // 12345
+
+    // ---- many atomic increments via sequential spawns ----
+    var acc = atomic 0
+    var i = 0
+    while i < 10 {
+        val sp = spawn { acc = acc + 1 }
+        sp.await()
+        i = i + 1
+    }
+    println(acc)   // 10
+
+    // ---- spawn status query ----
+    val s5 = spawn { 7 * 7 }
+    val r5 = s5.await()
+    println(s5.status())   // completed/done status
+    println(r5)            // 49
+
+    println("edge_concurrency: All tests passed!")
+}

@@ -1,0 +1,40 @@
+// Concurrency under real parallel contention + generic-array types
+
+fun main() {
+    // ---- 100 spawns incrementing a shared atomic in parallel ----
+    var counter = atomic 0
+    var handles: Spawn<()>[] = []
+    for i in 1..=100 {
+        val c = counter
+        handles = handles ++ [spawn { c += 1 }]
+    }
+    for h in handles { h.await() }
+    println(counter)          // 100 (no lost updates)
+
+    // ---- mixed add/sub nets to zero ----
+    var sum = atomic 0
+    var hs: Spawn<()>[] = []
+    for i in 1..=50 {
+        val s = sum
+        hs = hs ++ [spawn { s += 2 }]
+    }
+    for i in 1..=50 {
+        val s = sum
+        hs = hs ++ [spawn { s -= 2 }]
+    }
+    for h in hs { h.await() }
+    println(sum)              // 0
+
+    // ---- generic-typed array of spawn handles parses and works ----
+    var results: Spawn<i32>[] = []
+    for i in 1..=5 {
+        results = results ++ [spawn { 7 }]
+    }
+    var total = 0
+    for r in results {
+        total = total + r.await()
+    }
+    println(total)            // 35
+
+    println("edge_concurrency_race: All tests passed!")
+}

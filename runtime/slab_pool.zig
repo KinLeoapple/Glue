@@ -110,6 +110,9 @@ pub const SlabPool = struct {
     const LargeObj = struct {
         ptr: [*]u8,
         len: usize,
+        /// 确保时的实际对齐（= max(请求对齐, SLOT_ALIGNMENT)）。deinit/free 必须按此对齐
+        /// rawFree，否则 backing.free(slice) 用 u8 自然对齐 1 → DebugAllocator 报对齐不匹配。
+        alignment: usize,
     };
 
     pub fn init(backing: std.mem.Allocator) SlabPool {
@@ -153,7 +156,8 @@ pub const SlabPool = struct {
             e = nxt;
         }
         for (self.large_objects.items) |obj| {
-            self.backing.free(obj.ptr[0..obj.len]);
+            // 按确保时的对齐 rawFree（backing.free 会用 u8 自然对齐 1 → 对齐不匹配崩溃）。
+            self.backing.rawFree(obj.ptr[0..obj.len], std.mem.Alignment.fromByteUnits(obj.alignment), @returnAddress());
         }
         self.large_objects.deinit(self.backing);
         self.* = undefined;
@@ -269,7 +273,7 @@ fn vtAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: 
     if (len >= LARGE_THRESHOLD or alignment.toByteUnits() > SLOT_ALIGNMENT) {
         const a = @max(alignment.toByteUnits(), SLOT_ALIGNMENT);
         const raw = self.backing.rawAlloc(len, std.mem.Alignment.fromByteUnits(a), @returnAddress()) orelse return null;
-        self.large_objects.append(self.backing, .{ .ptr = raw, .len = len }) catch {
+        self.large_objects.append(self.backing, .{ .ptr = raw, .len = len, .alignment = a }) catch {
             self.backing.rawFree(raw[0..len], std.mem.Alignment.fromByteUnits(a), @returnAddress());
             return null;
         };
@@ -305,10 +309,10 @@ fn vtFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: us
 
     // 大对象：线性查登记表归还。
     if (len >= LARGE_THRESHOLD or alignment.toByteUnits() > SLOT_ALIGNMENT) {
-        const a = @max(alignment.toByteUnits(), SLOT_ALIGNMENT);
         for (self.large_objects.items, 0..) |obj, i| {
             if (obj.ptr == buf.ptr) {
-                self.backing.rawFree(buf.ptr[0..obj.len], std.mem.Alignment.fromByteUnits(a), @returnAddress());
+                // 按确保时记录的对齐 rawFree（free 调用方传入的 alignment 可能与 alloc 不同）。
+                self.backing.rawFree(buf.ptr[0..obj.len], std.mem.Alignment.fromByteUnits(obj.alignment), @returnAddress());
                 self.reserved_bytes -= obj.len;
                 self.live_bytes -= obj.len;
                 _ = self.large_objects.swapRemove(i);

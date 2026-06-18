@@ -1,0 +1,147 @@
+// Edge cases: records (width subtyping, update/extend), generic ADTs, trait dispatch, GADT
+
+type Ordering = | Lt | Eq | Gt
+
+// generic ADT with two type params
+type Pair<A, B> = Pair(first: A, second: B)
+
+// generic recursive ADT
+type Lst<T> = | Nil | Cons(T, Lst<T>)
+
+// trait with default method
+trait Greet {
+    fun name(self): str
+    fun hello(self): str {
+        "Hello, " + self.name()
+    }
+}
+
+impl Greet<Ordering> {
+    fun name(self): str {
+        match self {
+            Lt => "less"
+            Eq => "equal"
+            Gt => "greater"
+        }
+    }
+}
+
+// trait dispatched by receiver type (two impls, same method name)
+trait Sizeable {
+    fun sz(self): i32
+}
+
+impl Sizeable<Ordering> {
+    fun sz(self): i32 { 1 }
+}
+
+type Color = | Red | Green | Blue
+impl Sizeable<Color> {
+    fun sz(self): i32 { 3 }
+}
+
+// generic functions over Lst
+fun len<T>(l: Lst<T>): i32 {
+    match l {
+        Nil => 0
+        Cons(_, tail) => 1 + len(tail)
+    }
+}
+
+fun mapLst<T, U>(l: Lst<T>, f): Lst<U> {
+    match l {
+        Nil => Nil
+        Cons(x, tail) => Cons(f(x), mapLst(tail, f))
+    }
+}
+
+fun sumLst(l: Lst<i32>): i32 {
+    match l {
+        Nil => 0
+        Cons(x, tail) => x + sumLst(tail)
+    }
+}
+
+// record width subtyping: param needs subset of fields
+fun describe(p: (name: str, age: i32)): str {
+    p.name + " is " + str(p.age)
+}
+
+// nested record update
+fun birthday(u: (name: str, age: i32, city: str)): (name: str, age: i32, city: str) {
+    (...u, age: u.age + 1)
+}
+
+fun main() {
+    // ---- record width subtyping: extra fields allowed ----
+    val full = (name: "Alice", age: 30, email: "a@x.com", city: "NYC")
+    println(describe(full))   // Alice is 30
+
+    val exact = (name: "Bob", age: 25)
+    println(describe(exact))  // Bob is 25
+
+    // ---- record update preserves other fields ----
+    val u = (name: "Carol", age: 40, city: "LA")
+    val older = birthday(u)
+    println(older.name)   // Carol
+    println(older.age)    // 41
+    println(older.city)   // LA
+
+    // ---- record extend adds new field ----
+    val base = (x: 1, y: 2)
+    val ext = (...base, z: 3)
+    println(ext.x)   // 1
+    println(ext.y)   // 2
+    println(ext.z)   // 3
+
+    // ---- chained record updates ----
+    val s1 = (a: 1, b: 2, c: 3)
+    val s2 = (...s1, b: 20)
+    val s3 = (...s2, c: 30)
+    println(s3.a)   // 1
+    println(s3.b)   // 20
+    println(s3.c)   // 30
+
+    // ---- nested records ----
+    val nested = (outer: (inner: (deep: 42)))
+    println(nested.outer.inner.deep)   // 42
+
+    // ---- generic Pair with mixed types ----
+    val p1 = Pair(1, "one")
+    val p2 = Pair(true, 3.14)
+    println(p1.first)    // 1
+    println(p1.second)   // one
+    println(p2.first)    // true
+    println(p2.second)   // 3.14
+
+    // ---- generic Lst ----
+    val nums = Cons(1, Cons(2, Cons(3, Cons(4, Nil))))
+    println(len(nums))      // 4
+    println(sumLst(nums))   // 10
+
+    val doubled = mapLst(nums, fun(x) { x * 2 })
+    println(sumLst(doubled))  // 20
+
+    val strs = Cons("a", Cons("b", Nil))
+    println(len(strs))   // 2
+
+    // ---- empty generic list ----
+    println(len(Nil))    // 0
+    println(sumLst(Nil)) // 0
+
+    // ---- trait default method ----
+    println(Lt.hello())   // Hello, less
+    println(Eq.hello())   // Hello, equal
+    println(Gt.name())    // greater
+
+    // ---- trait dispatch by receiver type ----
+    println(Lt.sz())      // 1
+    println(Red.sz())     // 3
+    println(Blue.sz())    // 3
+
+    // ---- deeply nested generic ----
+    val pairList = Cons(Pair(1, 2), Cons(Pair(3, 4), Nil))
+    println(len(pairList))   // 2
+
+    println("edge_records_traits: All tests passed!")
+}

@@ -30,6 +30,8 @@ pub const EvalError = error{
     CircularDependency,
     FileNotFound,
     MissingMain,
+    /// 类型检查失败 — 错误已打印到 stderr，阻止后续求值/callMain（文档 D45 先检查后求值）。
+    TypeCheckFailed,
 };
 
 /// 控制流信号 — 使用 Zig error 机制实现非局部跳转
@@ -170,11 +172,29 @@ pub const NewtypeValue = struct {
 // 闭包
 // ============================================================
 
+/// 续14/闭包转换：被闭包捕获的可变变量（var）的共享 cell。
+/// 帧绑定与所有捕获该 var 的闭包都指向同一 *Cell，使可变状态在帧与闭包间共享，
+/// 且 cell 寿命独立于定义帧（escaped 闭包捕获的 var 在帧返回后仍存活，见 makeCounter）。
+/// rc：帧 + 各捕获闭包联合持有，归零才释放。透明语义：读经 .inner、写经 setCell，
+/// 与 atomic_val 的透明 load/store 同构（但非原子，per-heap 单线程）。
+pub const Cell = struct {
+    inner: Value,
+    rc: u32 = 1,
+};
+
+
 pub const Closure = struct {
     params: []ast.Param,
     body: ast.LambdaBody,
-    env: *anyopaque, // *Environment — 使用不透明指针避免循环依赖
+    env: *anyopaque, // *Environment（capture_env）— 不透明指针避免循环依赖
     allocator: std.mem.Allocator,
+    /// 续14/闭包转换：引用计数。闭包现持 capture_env（快照的自由变量 val + 共享 cell），
+    /// 归零时须 releaseEnv 该 capture_env（否则捕获的值/cell 泄漏，如 len 内 go 捕获的大列表）。
+    /// 装箱 rc：闭包值经 clone/retain 复制句柄时 +1，release 时 -1，归零释放 capture_env + 箱体。
+    rc: u32 = 1,
+    /// capture_env 的释放回调（env.zig 设置，避免 value→env 循环依赖）。归零时调用 env_release_fn(env)。
+    /// null 时不释放 env（如旧式 retain 的 env、或无 capture 的场景）。
+    env_release_fn: ?*const fn (*anyopaque) void = null,
 };
 
 // ============================================================
@@ -613,6 +633,10 @@ pub const Value = union(enum) {
     /// Lazy<T> 值（Phase 7，文档 §6.10）：延迟求值 + 首次访问缓存
     lazy_val: *LazyValue,
 
+    /// 续14/闭包转换：被捕获 var 的共享可变 cell。透明语义——读经 evalIdentifier 解包、
+    /// 写经 env.set 转发到 cell.inner。帧与捕获闭包共享同一 *Cell（rc 联合持有）。
+    cell_val: *Cell,
+
     /// 装箱构造：分配一个 rc=1 的数组值。
     pub fn makeArray(allocator: std.mem.Allocator, elements: []Value, fixed_size: ?u64) !Value {
         const p = try allocator.create(ArrayValue);
@@ -635,6 +659,8 @@ pub const Value = union(enum) {
             .newtype => |p| p.rc += 1,
             .array => |p| p.rc += 1,
             .record => |p| p.rc += 1,
+            .cell_val => |p| p.rc += 1, // 续14/闭包转换：cell 帧+闭包联合持有
+            .closure => |p| p.rc += 1, // 续14/闭包转换：闭包 rc，归零释放 capture_env
             else => {},
         }
         return self;
@@ -670,6 +696,22 @@ pub const Value = union(enum) {
                 p.fields.deinit();
                 allocator.destroy(p);
             },
+            .cell_val => |p| {
+                // 续14/闭包转换：归零才释放 cell + 其内值（帧与捕获闭包联合持有）。
+                if (p.rc > 1) { p.rc -= 1; return; }
+                p.inner.release(allocator);
+                allocator.destroy(p);
+            },
+            .closure => |p| {
+                // 续14/闭包转换：归零才释放 capture_env（经 env_release_fn）+ 箱体。
+                // capture_env 持有快照的 val 值 + 共享 cell；不释放会泄漏（如 go 捕获的大列表）。
+                if (p.rc > 1) { p.rc -= 1; return; }
+                if (p.env_release_fn) |f| f(p.env);
+                p.allocator.destroy(p);
+            },
+            // string 字节由 owned 持有者各自 dupe（生成点 + 借用点 retainOwned 均走 value_allocator）。
+            // release 即归还字节。SlabPool 魔数守卫兜底：误传 arena 字节时掩码反查 magic 不符会安全忽略。
+            .string => |s| allocator.free(s),
             else => {},
         }
     }
@@ -761,8 +803,11 @@ pub const Value = union(enum) {
             .string => |s| Value{ .string = try allocator.dupe(u8, s) },
             .array => self.retain(),
             .record => self.retain(),
-            // §5.2 规则 5: 闭包 — 同 Heap 内浅拷贝；跨 Heap 时由 deepCloneValue 深拷贝环境
-            .closure => self,
+            // §5.2 规则 5: 闭包 — 同 Heap 内浅拷贝（rc+1 共享 capture_env）；跨 Heap 由 deepCloneValue 处理
+            .closure => |c| {
+                c.rc += 1;
+                return Value{ .closure = c };
+            },
             // §5.2 规则 2: 不可变数据结构 — 深拷贝
             .partial => |pa| {
                 const new_pa = try allocator.create(PartialApplication);
@@ -808,6 +853,12 @@ pub const Value = union(enum) {
             .array_iterator => |ai| Value{ .array_iterator = ai },
             .string_iterator => |si| Value{ .string_iterator = si },
             .range_iterator => |ri| Value{ .range_iterator = ri },
+            // 续14/闭包转换：cell — 共享浅拷贝（retain）。clone 用于绑定/传参，cell 的共享
+            // 可变语义要求所有持有者指向同一 *Cell，故仅 rc+1，绝不深拷。
+            .cell_val => |c| {
+                c.rc += 1;
+                return Value{ .cell_val = c };
+            },
             // §5.2 规则 6: Atomic<T> — 浅拷贝（原子增加引用计数）
             .atomic_val => |av| {
                 av.ref();
@@ -947,6 +998,7 @@ pub const Value = union(enum) {
             .string_iterator => try buf.appendSlice(allocator, "<string_iterator>"),
             .range_iterator => try buf.appendSlice(allocator, "<range_iterator>"),
             .atomic_val => try buf.appendSlice(allocator, "<atomic>"),
+            .cell_val => |c| try c.inner.format(buf, allocator, debug), // 透明：显示内值
             .spawn_val => try buf.appendSlice(allocator, "<spawn>"),
             .channel_val => try buf.appendSlice(allocator, "<channel>"),
             .sender_val => try buf.appendSlice(allocator, "<sender>"),
@@ -966,6 +1018,25 @@ pub const Value = union(enum) {
                 }
             },
         }
+    }
+
+    /// 身份相等：是否引用同一底层内存（区别于语义相等 equals）。
+    /// 用于判断 castValue 等是否产生了新值——string 比较 slice 指针，boxed 比较箱体指针，
+    /// 标量按值。tag 不同即不同身份。callFunction 用它决定 cast 出的临时是否需要 release。
+    pub fn identityEquals(self: Value, other: Value) bool {
+        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
+        return switch (self) {
+            .string => |s| s.ptr == other.string.ptr and s.len == other.string.len,
+            .array => |a| a == other.array,
+            .record => |r| r == other.record,
+            .adt => |p| p == other.adt,
+            .newtype => |p| p == other.newtype,
+            .closure => |c| c == other.closure,
+            .cell_val => |c| c == other.cell_val,
+            .partial => |p| p == other.partial,
+            .throw_val => |t| t == other.throw_val,
+            else => self.equals(other), // 标量/无堆载荷：按值
+        };
     }
 
     pub fn equals(self: Value, other: Value) bool {
@@ -995,6 +1066,7 @@ pub const Value = union(enum) {
             .string_iterator => |si| si == other.string_iterator, // 引用相等
             .range_iterator => |ri| ri == other.range_iterator, // 引用相等
             .atomic_val => |av| av == other.atomic_val, // 引用相等
+            .cell_val => |c| c == other.cell_val, // 引用相等（透明解包在使用点完成，此处不应到达）
             .spawn_val => |sh| sh == other.spawn_val, // 引用相等
             .channel_val => |cv| cv == other.channel_val, // 引用相等
             .sender_val => |sv| sv == other.sender_val, // 引用相等

@@ -1,0 +1,140 @@
+// 端到端压力测试 6：正则匹配器（Thompson NFA 风格的递归回溯匹配）
+// 支持: 字面字符、. (任意)、* (零或多)、+ (一或多)、? (可选)、| (或)、() 分组
+// 综合压测：递归 ADT、回溯、字符串索引、nullable、高阶、深递归
+
+// ============================================================
+// 正则 AST
+// ============================================================
+type Regex =
+    | Empty                       // 空匹配
+    | Lit(char)                   // 字面字符
+    | AnyChar                     // .
+    | Star(Regex)                 // r*
+    | Plus(Regex)                 // r+
+    | Opt(Regex)                  // r?
+    | Seq(Regex, Regex)           // r1 r2
+    | Alt(Regex, Regex)           // r1 | r2
+
+// ============================================================
+// 匹配引擎：continuation-passing 风格回溯
+// matchHere(re, s, pos, k): 尝试在 pos 处匹配 re，成功后用剩余位置调用续延 k；
+// k 返回 bool（最终是否到达接受态）。返回 bool。
+// 用 i32 位置 + 闭包续延模拟 CPS。
+// ============================================================
+fun strLen(s: str): i32 { s.len() }
+
+fun matchRe(re: Regex, s: str, pos: i32, k): bool {
+    match re {
+        Empty => k(pos)
+        Lit(ch) => {
+            if (pos < s.len() && s[pos] == ch) { k(pos + 1) } else { false }
+        }
+        AnyChar => {
+            if (pos < s.len()) { k(pos + 1) } else { false }
+        }
+        Seq(r1, r2) => {
+            // 匹配 r1，其续延是"匹配 r2 然后调 k"
+            matchRe(r1, s, pos, fun(p2) { matchRe(r2, s, p2, k) })
+        }
+        Alt(r1, r2) => {
+            if (matchRe(r1, s, pos, k)) { true } else { matchRe(r2, s, pos, k) }
+        }
+        Opt(r) => {
+            // 先试匹配 r，失败则跳过
+            if (matchRe(r, s, pos, k)) { true } else { k(pos) }
+        }
+        Star(r) => {
+            matchStar(r, s, pos, k)
+        }
+        Plus(r) => {
+            // r+ = r r*
+            matchRe(r, s, pos, fun(p2) { matchStar(r, s, p2, k) })
+        }
+    }
+}
+
+// r* 的贪婪回溯：尝试匹配尽量多的 r，每步都可回退到调 k
+fun matchStar(r: Regex, s: str, pos: i32, k): bool {
+    // 先尝试再匹配一个 r（要求消费至少一个字符以避免空循环），
+    // 失败或不前进则用当前 pos 调 k
+    val advanced = matchRe(r, s, pos, fun(p2) {
+        if (p2 > pos) { matchStar(r, s, p2, k) } else { false }
+    })
+    if (advanced) { true } else { k(pos) }
+}
+
+// 完整匹配：从 0 开始，要求续延检查是否到串尾
+fun fullMatch(re: Regex, s: str): bool {
+    matchRe(re, s, 0, fun(p) { p == s.len() })
+}
+
+// ============================================================
+// 一些正则构造助手
+// ============================================================
+fun lit(c: char): Regex { Lit(c) }
+
+fun seqOf(a: Regex, b: Regex): Regex { Seq(a, b) }
+
+// 把字符串变成字面序列： "ab" -> Seq(Lit('a'), Lit('b'))
+fun literal(s: str): Regex {
+    fun go(i: i32): Regex {
+        if (i >= s.len()) { Empty }
+        else if (i == s.len() - 1) { Lit(s[i]) }
+        else { Seq(Lit(s[i]), go(i + 1)) }
+    }
+    if (s.len() == 0) { Empty } else { go(0) }
+}
+
+fun yn(b: bool): str { if (b) { "yes" } else { "no" } }
+
+fun main() {
+    // 字面串 "abc"
+    val abc = literal("abc")
+    println(yn(fullMatch(abc, "abc")))      // yes
+    println(yn(fullMatch(abc, "ab")))       // no
+    println(yn(fullMatch(abc, "abcd")))     // no
+
+    // a* : 零或多个 a
+    val aStar = Star(Lit('a'))
+    println(yn(fullMatch(aStar, "")))       // yes
+    println(yn(fullMatch(aStar, "aaaa")))   // yes
+    println(yn(fullMatch(aStar, "aaab")))   // no
+
+    // a+ : 一或多个 a
+    val aPlus = Plus(Lit('a'))
+    println(yn(fullMatch(aPlus, "")))       // no
+    println(yn(fullMatch(aPlus, "a")))      // yes
+    println(yn(fullMatch(aPlus, "aaa")))    // yes
+
+    // a? b : 可选 a 后跟 b
+    val optAB = Seq(Opt(Lit('a')), Lit('b'))
+    println(yn(fullMatch(optAB, "ab")))     // yes
+    println(yn(fullMatch(optAB, "b")))      // yes
+    println(yn(fullMatch(optAB, "aab")))    // no
+
+    // (a|b)* : a 和 b 的任意组合
+    val abStar = Star(Alt(Lit('a'), Lit('b')))
+    println(yn(fullMatch(abStar, "")))      // yes
+    println(yn(fullMatch(abStar, "abba")))  // yes
+    println(yn(fullMatch(abStar, "abc")))   // no
+
+    // a.c : a 任意 c
+    val adotc = Seq(Lit('a'), Seq(AnyChar, Lit('c')))
+    println(yn(fullMatch(adotc, "axc")))    // yes
+    println(yn(fullMatch(adotc, "abc")))    // yes
+    println(yn(fullMatch(adotc, "ac")))     // no
+
+    // 复杂: a*b (贪婪后回溯)
+    val aStarB = Seq(Star(Lit('a')), Lit('b'))
+    println(yn(fullMatch(aStarB, "aaab")))  // yes
+    println(yn(fullMatch(aStarB, "b")))     // yes
+    println(yn(fullMatch(aStarB, "aaa")))   // no
+
+    // 复杂: (ab)+ : 一或多个 "ab"
+    val abPlus = Plus(Seq(Lit('a'), Lit('b')))
+    println(yn(fullMatch(abPlus, "ab")))    // yes
+    println(yn(fullMatch(abPlus, "abab")))  // yes
+    println(yn(fullMatch(abPlus, "aba")))   // no
+
+    println("stress6: All tests passed!")
+}

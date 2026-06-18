@@ -1,0 +1,54 @@
+// ++ array/list concatenation operator
+
+fun main() {
+    // ---- basic concat ----
+    val a = [1, 2, 3]
+    val b = [4, 5, 6]
+    println(a ++ b)          // [1, 2, 3, 4, 5, 6]
+    println((a ++ b).len())  // 6
+
+    // ---- chained, left-associative ----
+    println([1] ++ [2] ++ [3])   // [1, 2, 3]
+
+    // ---- empty operands ----
+    println([] ++ [1, 2])    // [1, 2]
+    println([1, 2] ++ [])    // [1, 2]
+    println([] ++ [])        // []
+
+    // ---- append-one idiom ----
+    var acc = []
+    for i in 1..=5 {
+        acc = acc ++ [i]
+    }
+    println(acc)             // [1, 2, 3, 4, 5]
+    println(acc.len())       // 5
+
+    // ---- arrays of strings ----
+    println(["a"] ++ ["b", "c"])   // [a, b, c]
+
+    // ---- + still means string concat (not affected by ++) ----
+    println("foo" + "bar")   // foobar
+
+    // ---- originals are unchanged (immutable, deep-copied) ----
+    val x = [10, 20]
+    val y = [30]
+    val z = x ++ y
+    println(x)   // [10, 20]
+    println(y)   // [30]
+    println(z)   // [10, 20, 30]
+
+    // ---- concat result is a normal array: indexable, iterable ----
+    val merged = [1, 2] ++ [3, 4]
+    println(merged[0])       // 1
+    println(merged[3])       // 4
+    var sum = 0
+    for n in merged {
+        sum = sum + n
+    }
+    println(sum)             // 10
+
+    // ---- type() of concat result ----
+    println(type([1] ++ [2]))   // array
+
+    println("array_concat: All tests passed!")
+}

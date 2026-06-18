@@ -294,18 +294,6 @@ pub fn build(b: *std.Build) void {
     // Install executable to output directory
     b.installArtifact(exe);
 
-    // Create run command: zig build run
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    // Allow passing arguments to the program via --
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    const run_step = b.step("run", "Run the Glue interpreter");
-    run_step.dependOn(&run_cmd.step);
-
     // ============================================================
     // Tests
     // ============================================================

@@ -1,0 +1,61 @@
+// type() builtin — returns the runtime type name of any value
+
+type Color = | Red | Green | Blue
+type UserId = UserId(i32)
+type Point = Point(x: i32, y: i32)
+
+fun main() {
+    // ---- primitives: smallest-type inference for unannotated int literals ----
+    println(type(42))         // i8
+    println(type(200))        // u8
+    println(type(100000))     // i32
+    println(type(3.14))       // f128 (smallest float that round-trips)
+
+    // ---- suffix overrides ----
+    println(type(42i32))      // i32
+    println(type(42u64))      // u64
+    println(type(3.14f32))    // f32
+
+    // ---- annotation overrides ----
+    val a: i32 = 42
+    val b: u8 = 200
+    val c: f64 = 1.5
+    println(type(a))          // i32
+    println(type(b))          // u8
+    println(type(c))          // f64
+
+    // ---- other primitives ----
+    println(type("hello"))    // str
+    println(type(true))       // bool
+    println(type('x'))        // char
+
+    // ---- composite ----
+    println(type([1, 2, 3]))      // array
+    println(type((x: 1, y: 2)))   // record
+
+    // ---- user types ----
+    println(type(Red))            // Color
+    println(type(Green))          // Color
+    println(type(UserId(7)))      // UserId
+    println(type(Point(1, 2)))    // Point
+
+    // ---- throw / ok / error ----
+    println(type(Ok(5)))          // Throw
+    println(type(Error("e")))     // Throw
+
+    // ---- functions ----
+    println(type(fun(x) { x }))   // function
+
+    // ---- type() result is a str, usable in interpolation and concat ----
+    val t = type(42)
+    println("kind=" + t)          // kind=i8
+    println("the type is {type(true)}")  // the type is bool
+    println(type(t))              // str (type of a type-name is str)
+
+    // ---- type() inside match / comparison ----
+    val x = 5
+    val desc = if (type(x) == "i8") { "small int" } else { "other" }
+    println(desc)                 // small int
+
+    println("type_builtin: All tests passed!")
+}

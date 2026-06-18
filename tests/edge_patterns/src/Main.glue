@@ -1,0 +1,165 @@
+// Edge cases: pattern matching — nesting, or-patterns, guards, exhaustiveness, literals
+
+type Tree =
+    | Leaf
+    | Node(i32, Tree, Tree)
+
+type Shape =
+    | Circle(f64)
+    | Rect(f64, f64)
+    | Triangle(f64, f64, f64)
+
+type Pt = Pt(x: i32, y: i32)
+type Seg = Seg(a: Pt, b: Pt)
+
+// deeply nested constructor destructuring
+fun deepNest(t: Tree): i32 {
+    match t {
+        Node(_, Node(x, _, _), Node(y, _, _)) => x + y
+        Node(v, Leaf, Leaf) => v
+        Node(v, _, _) => v * 100
+        Leaf => -1
+    }
+}
+
+// or-patterns combined with guards
+fun classify(n: i32): str {
+    match n {
+        0 | 1 | 2 => "small"
+        n if n < 0 => "negative"
+        n if n % 2 == 0 => "even"
+        _ => "odd"
+    }
+}
+
+// nested record destructuring through two levels
+fun segLen(s: Seg): i32 {
+    match s {
+        Seg(Pt(x1, y1), Pt(x2, y2)) => (x2 - x1) + (y2 - y1)
+    }
+}
+
+// literal patterns across types
+fun litMatch(s: str): i32 {
+    match s {
+        "a" | "b" | "c" => 1
+        "" => 0
+        _ => -1
+    }
+}
+
+// char patterns
+fun vowel(c: char): bool {
+    match c {
+        'a' | 'e' | 'i' | 'o' | 'u' => true
+        _ => false
+    }
+}
+
+// nullable patterns with literal and binding
+fun nullableMatch(n: i32?): str {
+    match n {
+        null => "none"
+        0 => "zero"
+        x if x < 0 => "neg"
+        x => "pos:" + str(x)
+    }
+}
+
+// guard that references multiple bound vars
+fun quadrant(p: Pt): str {
+    match p {
+        Pt(0, 0) => "origin"
+        Pt(x, 0) => "x-axis"
+        Pt(0, y) => "y-axis"
+        Pt(x, y) if x > 0 && y > 0 => "Q1"
+        Pt(x, y) if x < 0 && y > 0 => "Q2"
+        Pt(x, y) if x < 0 && y < 0 => "Q3"
+        _ => "Q4"
+    }
+}
+
+// wildcard fields in constructor
+fun shapeKind(s: Shape): str {
+    match s {
+        Circle(_) => "circle"
+        Rect(_, _) => "rect"
+        Triangle(_, _, _) => "triangle"
+    }
+}
+
+// match returning a block expression
+fun areaInt(s: Shape): i32 {
+    match s {
+        Circle(r) => {
+            val rr = r * r
+            i32(3.14 * rr)
+        }
+        Rect(w, h) => i32(w * h)
+        Triangle(a, b, c) => {
+            val s2 = (a + b + c) / 2.0
+            i32(s2)
+        }
+    }
+}
+
+// nested match inside match arm
+fun pairKind(a: i32?, b: i32?): str {
+    match a {
+        null => match b {
+            null => "both-null"
+            _ => "a-null"
+        }
+        _ => match b {
+            null => "b-null"
+            _ => "both-set"
+        }
+    }
+}
+
+fun main() {
+    val t = Node(5, Node(3, Leaf, Leaf), Node(8, Leaf, Leaf))
+    println(deepNest(t))                  // 11
+    println(deepNest(Node(7, Leaf, Leaf))) // 7
+    println(deepNest(Leaf))               // -1
+
+    println(classify(1))    // small
+    println(classify(-3))   // negative
+    println(classify(8))    // even
+    println(classify(7))    // odd
+
+    println(segLen(Seg(Pt(0, 0), Pt(3, 4)))) // 7
+
+    println(litMatch("a"))  // 1
+    println(litMatch(""))   // 0
+    println(litMatch("z"))  // -1
+
+    println(vowel('e'))     // true
+    println(vowel('x'))     // false
+
+    println(nullableMatch(null)) // none
+    println(nullableMatch(0))    // zero
+    println(nullableMatch(-5))   // neg
+    println(nullableMatch(42))   // pos:42
+
+    println(quadrant(Pt(0, 0)))   // origin
+    println(quadrant(Pt(5, 0)))   // x-axis
+    println(quadrant(Pt(0, 3)))   // y-axis
+    println(quadrant(Pt(2, 3)))   // Q1
+    println(quadrant(Pt(-2, 3)))  // Q2
+    println(quadrant(Pt(-2, -3))) // Q3
+    println(quadrant(Pt(2, -3)))  // Q4
+
+    println(shapeKind(Circle(1.0)))        // circle
+    println(shapeKind(Rect(2.0, 3.0)))     // rect
+    println(shapeKind(Triangle(3.0, 4.0, 5.0))) // triangle
+
+    println(areaInt(Rect(4.0, 5.0)))   // 20
+
+    println(pairKind(null, null)) // both-null
+    println(pairKind(null, 1))    // a-null
+    println(pairKind(1, null))    // b-null
+    println(pairKind(1, 2))       // both-set
+
+    println("edge_patterns: All tests passed!")
+}

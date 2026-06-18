@@ -1,0 +1,59 @@
+// Throw propagation + record width subtyping edges (regression)
+
+// guard-and-throw: bare value branch + throw branch
+fun checked(x: i32): Throw<i32, Error> {
+    if (x >= 0) { x } else { throw Error("negative") }
+}
+
+// plain return type with throw branch
+fun mustPos(x: i32): i32 {
+    if (x > 0) { x } else { throw Error("not positive") }
+}
+
+// ? propagation chain
+fun chain(a: i32, b: i32): Throw<i32, Error> {
+    val x = checked(a)?
+    val y = checked(b)?
+    Ok(x + y)
+}
+
+// record width: param needs subset of fields
+fun fullName(p: (first: str, last: str)): str {
+    p.first + " " + p.last
+}
+
+fun main() {
+    // ---- guard-and-throw in Throw fn ----
+    println(match checked(5) { Ok(v) => str(v), Error(e) => "err:" + e.message })   // 5
+    println(match checked(-1) { Ok(v) => str(v), Error(e) => "err:" + e.message })  // err:negative
+
+    // ---- guard-and-throw in plain fn ----
+    println(mustPos(7))    // 7
+
+    // ---- ? propagation chain ----
+    println(match chain(3, 4) { Ok(v) => v, Error(e) => -1 })   // 7
+    println(match chain(3, -1) { Ok(v) => v, Error(e) => -1 })  // -1
+
+    // ---- record width subtyping: extra fields ok ----
+    val person = (first: "Ada", last: "Lovelace", age: 36, city: "London")
+    println(fullName(person))   // Ada Lovelace
+
+    // ---- var record field mutation allowed ----
+    var pt = (x: 1, y: 2)
+    pt.x = 100
+    println(pt.x)          // 100
+    println(pt.y)          // 2
+
+    // ---- record update preserves width ----
+    val base = (a: 1, b: 2, c: 3)
+    val updated = (...base, b: 20)
+    println(updated.a)     // 1
+    println(updated.b)     // 20
+    println(updated.c)     // 3
+
+    // ---- nested record width ----
+    val nested = (inner: (x: 1, y: 2, z: 3), tag: "t")
+    println(nested.inner.x)  // 1
+
+    println("edge_throw_records: All tests passed!")
+}

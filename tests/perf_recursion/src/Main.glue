@@ -1,0 +1,39 @@
+// 性能/大输入压测（手动跑，不纳入回归全绿集）
+// 观察点：尾递归深度（O(n)、TCO 不爆栈）、数组大输入
+
+type List<T> = | Nil | Cons(T, List<T>)
+
+// 尾递归深度计数（TCO，O(n)，常数栈）
+fun countDown(n: i32): i32 {
+    if (n == 0) { 0 } else { countDown(n - 1) }
+}
+
+fun main() {
+    // 1. 深尾递归 100 万次：验证 TCO 不爆栈、O(n) 快速
+    println(countDown(1000000))          // 0
+
+    // 2. 大数组累加（数组 push/读取，避开链表值语义 O(n^2)）
+    var arr: i32[] = []
+    var i: i32 = 0
+    while i < 10000 {
+        arr = arr.push(i)
+        i = i + 1
+    }
+    println(arr.len())                   // 10000
+    var sum: i64 = 0
+    for x in arr {
+        sum = sum + i64(x)
+    }
+    println(sum)                         // 49995000
+
+    // 3. 大字符串构建
+    var s = ""
+    var j: i32 = 0
+    while j < 2000 {
+        s = s + "x"
+        j = j + 1
+    }
+    println(s.len())                     // 2000
+
+    println("perf: done")
+}
