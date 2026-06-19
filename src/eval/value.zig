@@ -197,6 +197,23 @@ pub const Closure = struct {
     env_release_fn: ?*const fn (*anyopaque) void = null,
 };
 
+/// 字节码 VM 的闭包值（M1b）。与树遍历器 `Closure`（AST 形态）平行：
+/// 这里 func 指向编译后的 `chunk.Function`，以 `*const anyopaque` 存储以打破
+/// value↔chunk 循环依赖（chunk.zig import value，故 value 不能 import chunk）。
+/// VM 内 @ptrCast 还原为 *const Function。
+/// 默认柯里化也由本结构承载（不复用 eval 的 GC 管理的 PartialApplication，避免双重内存模型）：
+///   bound_args = 已预绑定的实参；arity 是函数总形参数。
+///   bound_args.len + 新实参 == arity → 调用；< → 产生 bound_args 更长的新 vm_closure；> → WrongArity。
+/// M1b-1：upvalues 恒空（仅顶层函数作一等值）。M1b-2 起填充捕获的自由变量（含共享 *Cell）。
+pub const VmClosure = struct {
+    func: *const anyopaque, // *const chunk.Function
+    arity: u8,
+    upvalues: []Value = &.{},
+    bound_args: []Value = &.{}, // 默认柯里化预绑定实参（owned，归零时 release）
+    rc: u32 = 1,
+    allocator: std.mem.Allocator,
+};
+
 // ============================================================
 // 一等 Trait 值（Phase 7）
 // ============================================================
@@ -595,6 +612,10 @@ pub const Value = union(enum) {
     // 闭包
     closure: *Closure,
 
+    /// 字节码 VM 闭包（M1b）：编译后函数 + 捕获的 upvalues。与 closure 并存，
+    /// 由 VM 产生/消费；eval 不构造它（但 retain/release/clone 等需识别以保正确性）。
+    vm_closure: *VmClosure,
+
     // 部分应用（默认柯里化）
     partial: *PartialApplication,
 
@@ -661,6 +682,7 @@ pub const Value = union(enum) {
             .record => |p| p.rc += 1,
             .cell_val => |p| p.rc += 1, // 续14/闭包转换：cell 帧+闭包联合持有
             .closure => |p| p.rc += 1, // 续14/闭包转换：闭包 rc，归零释放 capture_env
+            .vm_closure => |p| p.rc += 1, // M1b：VM 闭包 rc，归零释放 upvalues
             else => {},
         }
         return self;
@@ -707,6 +729,16 @@ pub const Value = union(enum) {
                 // capture_env 持有快照的 val 值 + 共享 cell；不释放会泄漏（如 go 捕获的大列表）。
                 if (p.rc > 1) { p.rc -= 1; return; }
                 if (p.env_release_fn) |f| f(p.env);
+                p.allocator.destroy(p);
+            },
+            .vm_closure => |p| {
+                // M1b：归零才释放捕获的 upvalues + bound_args + slice + 箱体。func 指向 Program
+                // 持有的 Function，不在此释放。
+                if (p.rc > 1) { p.rc -= 1; return; }
+                for (p.upvalues) |uv| uv.release(allocator);
+                if (p.upvalues.len > 0) p.allocator.free(p.upvalues);
+                for (p.bound_args) |ba| ba.release(allocator);
+                if (p.bound_args.len > 0) p.allocator.free(p.bound_args);
                 p.allocator.destroy(p);
             },
             // string 字节由 owned 持有者各自 dupe（生成点 + 借用点 retainOwned 均走 value_allocator）。
@@ -807,6 +839,11 @@ pub const Value = union(enum) {
             .closure => |c| {
                 c.rc += 1;
                 return Value{ .closure = c };
+            },
+            // M1b：VM 闭包同 Heap 内浅拷贝（rc+1 共享 upvalues）。
+            .vm_closure => |c| {
+                c.rc += 1;
+                return Value{ .vm_closure = c };
             },
             // §5.2 规则 2: 不可变数据结构 — 深拷贝
             .partial => |pa| {
@@ -960,6 +997,7 @@ pub const Value = union(enum) {
                 try buf.appendSlice(allocator, ")");
             },
             .closure => try buf.appendSlice(allocator, "<closure>"),
+            .vm_closure => try buf.appendSlice(allocator, "<fn>"),
             .partial => try buf.appendSlice(allocator, "<partial>"),
             .builtin => try buf.appendSlice(allocator, "<builtin>"),
             .adt => |av| {
@@ -1032,6 +1070,7 @@ pub const Value = union(enum) {
             .adt => |p| p == other.adt,
             .newtype => |p| p == other.newtype,
             .closure => |c| c == other.closure,
+            .vm_closure => |c| c == other.vm_closure,
             .cell_val => |c| c == other.cell_val,
             .partial => |p| p == other.partial,
             .throw_val => |t| t == other.throw_val,
@@ -1058,6 +1097,7 @@ pub const Value = union(enum) {
             .adt => |av| av == other.adt, // 引用相等
             .newtype => |nv| nv == other.newtype, // 引用相等
             .closure => |c| c == other.closure,
+            .vm_closure => |c| c == other.vm_closure,
             .partial => |pa| pa == other.partial,
             .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,
             .error_val => |e| std.mem.eql(u8, e.type_name, other.error_val.type_name) and std.mem.eql(u8, e.message, other.error_val.message),

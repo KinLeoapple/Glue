@@ -148,6 +148,22 @@ pub fn build(b: *std.Build) void {
     module_eval_module.addImport("intern", intern_module);
 
     // ============================================================
+    // vm/ sub-modules（字节码 VM — docs/bytecode-vm-plan.md）
+    // ============================================================
+    // 依赖图顶点是 compiler.zig（它 @import vm.zig / disasm.zig / chunk.zig / opcode.zig）。
+    // 只需注册一个模块，relative @import 拉起其余文件；外部依赖经 import 表注入。
+
+    const vm_module = b.createModule(.{
+        .root_source_file = b.path("src/vm/compiler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vm_module.addImport("ast", ast_module);
+    vm_module.addImport("value", value_module);
+    vm_module.addImport("lexer", lexer_module);
+    vm_module.addImport("parser", parser_module);
+
+    // ============================================================
     // sema/ sub-modules
     // ============================================================
 
@@ -324,6 +340,22 @@ pub fn build(b: *std.Build) void {
     // Install executable to output directory
     b.installArtifact(exe);
 
+    // VM bench 驱动：编译并在字节码 VM 上端到端跑 lookup 基准（含 main + println）。
+    // root = src/vm/bench_main.zig，import "compiler"（= vm_module，再导出 vm/Program/lexer/parser）。
+    const bench_vm_module = b.createModule(.{
+        .root_source_file = b.path("src/vm/bench_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_vm_module.addImport("compiler", vm_module);
+    const bench_vm_exe = b.addExecutable(.{
+        .name = "bench_vm_lookup",
+        .root_module = bench_vm_module,
+    });
+    const run_bench_vm = b.addRunArtifact(bench_vm_exe);
+    const bench_vm_step = b.step("bench-vm", "Run lookup/record bench on the bytecode VM (exe arg: lookup|record)");
+    bench_vm_step.dependOn(&run_bench_vm.step);
+
     // ============================================================
     // Tests
     // ============================================================
@@ -368,6 +400,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_intern_unit_tests = b.addRunArtifact(intern_unit_tests);
 
+    const vm_unit_tests = b.addTest(.{
+        .root_module = vm_module,
+    });
+    const run_vm_unit_tests = b.addRunArtifact(vm_unit_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_eval_unit_tests.step);
     test_step.dependOn(&run_lexer_unit_tests.step);
@@ -377,4 +414,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_slab_pool_unit_tests.step);
     test_step.dependOn(&run_stdlib_unit_tests.step);
     test_step.dependOn(&run_intern_unit_tests.step);
+    test_step.dependOn(&run_vm_unit_tests.step);
 }

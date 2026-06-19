@@ -445,6 +445,10 @@ pub const Environment = struct {
             // 3. 递归深拷贝闭包内部环境会导致循环引用栈溢出
             .closure => val,
 
+            // VM 专用闭包：树遍历器跨 heap 路径不产生 vm_closure（仅字节码 VM 持有）。
+            // 防御性按引用共享（绝不在 eval 路径出现）。
+            .vm_closure => val,
+
             // §5.2 规则 2: 不可变数据结构 — 深拷贝到目标 heap
             // string, array, record, adt, newtype, error_val, throw_val, partial
             // 这些类型在跨 Heap 时必须完整深拷贝，确保目标 heap 拥有独立副本

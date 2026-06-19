@@ -695,6 +695,8 @@ pub const Evaluator = struct {
             .cell_val => |c| {
                 if (gc.markObject(@intFromPtr(c))) self.traceValue(c.inner);
             },
+            // VM 专用闭包：树遍历器 GC 不管理（仅字节码 VM 持有，refcount 自管）。
+            .vm_closure => {},
         }
     }
 
@@ -1071,6 +1073,8 @@ pub const Evaluator = struct {
                 // 续14/闭包转换：cell 用 self.allocator 分配（非 nursery）；疏散内值。
                 self.evacuateValue(&c_ptr.*.inner);
             },
+            // VM 专用闭包：树遍历器 GC 不疏散（仅字节码 VM 持有）。
+            .vm_closure => {},
         }
     }
 
@@ -3717,6 +3721,7 @@ pub const Evaluator = struct {
             .error_val => |e| e.type_name,
             .throw_val => "Throw",
             .closure, .builtin => null,
+            .vm_closure => null, // VM 专用闭包：树遍历器分派路径不出现
             .partial => "partial",
             .array_iterator => "array_iterator",
             .string_iterator => "string_iterator",
@@ -5773,6 +5778,7 @@ fn structuralEquals(a: Value, b: Value) bool {
             return true;
         },
         .closure => |c| c == b.closure,
+        .vm_closure => |c| c == b.vm_closure, // VM 专用闭包：身份比较（树遍历器路径不产生）
         .partial => |pa| pa == b.partial, // 引用相等
         .builtin => |b_val| b_val.fn_ptr == b.builtin.fn_ptr and b_val.user_ctx == b.builtin.user_ctx,
         .error_val => |e| std.mem.eql(u8, e.type_name, b.error_val.type_name) and std.mem.eql(u8, e.message, b.error_val.message),

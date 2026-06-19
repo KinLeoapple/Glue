@@ -103,3 +103,58 @@ done
 ```
 
 正确性参考值: fib=2178309, lookup=410780000, record=666666666666000000
+
+---
+
+## 字节码 VM 对比（M1b 完成后，2026-06-19）
+
+lookup 基准首次在字节码 VM 上端到端跑通（含 `main` + `println`），输出 `410780000` 与树遍历器一致。
+
+| Benchmark | 树遍历器 (ReleaseFast) | 字节码 VM (ReleaseFast) | 提速 |
+|---|---|---|---|
+| lookup | ~44000ms | **~2030ms** | **~22×** |
+
+测量：均 ReleaseFast，取多次热运行稳定值。VM 数同时含编译（lex+parse+compile）+ 执行；
+编译占比极小（程序仅 ~30 行），主体是 500 万次内层迭代的执行。
+
+### 跑法
+```
+zig build bench-vm -Doptimize=ReleaseFast   # 编译 lookup → VM 执行 → 打印 410780000
+```
+驱动源：`src/vm/bench_main.zig`（内嵌类型后缀版 lookup，因 M1 VM 不跑 type_check，
+用 `i64` 后缀锁字面量类型 —— 与树遍历器等价工作量）。
+
+### 解读
+- ~22× 来自：局部变量是栈 slot 数组索引（vs 树遍历器的父链 AutoHashMap 查找，即便 #3 intern 后
+  仍 pointer-chase 父链）；无 per-call Environment 建/销；指令分派替代 AST 节点递归 + 类型 switch。
+- 这正是 #2 De Bruijn 想要但在树遍历器表示下拿不到的收益 —— VM 的扁平 slot 模型从根上消除了父链 walk。
+- 注：VM 仍缺 type_check 集成、复合值（array/record/adt）、match、并发等；lookup 只压算术+变量查找+
+  调用+循环这条已落地的热路径。fib/record 待 VM 补函数调用 churn / 复合值后再对比。
+
+---
+
+## M2a — record bench 在字节码 VM 上跑通（2026-06-19）
+
+ADT 构造 + 命名字段访问 + 单构造器 match 落地后，record bench 端到端在 VM 跑通，
+输出 `666666666666000000` 与树遍历器/门禁值一致。
+
+| Benchmark | 树遍历器 (ReleaseFast) | 字节码 VM (ReleaseFast) | 提速 |
+|---|---|---|---|
+| lookup | ~44000ms | ~2030ms | ~22× |
+| record | ~7350ms | **~710ms** | **~10×** |
+
+### 跑法
+```
+zig build bench-vm -Doptimize=ReleaseFast   # 构建 bench_vm_lookup 驱动
+<exe> lookup    # 410780000
+<exe> record    # 666666666666000000
+```
+驱动源：`src/vm/bench_main.zig`（argv[1] 选 lookup/record；内嵌类型后缀版，VM 不跑 type_check）。
+
+### 解读
+- record 提速 ~10× < lookup ~22×，**与计划 §10 预期一致**：record 受 Value 宽度（64B）+ refcount
+  churn 主导（瓶颈 4 未动），VM 收益相对小；lookup 是纯变量查找 + 算术，slot 数组索引收益最大。
+- M2a 覆盖：`type T = Ctor(field: T,...)` ADT 声明 → 构造器登记；`Ctor(args)` → OP_MAKE_ADT；
+  `obj.field` → OP_GET_FIELD（命名）；单构造器 `match`（constructor + variable + wildcard 子模式，
+  OP_TEST_CTOR + OP_GET_ADT_FIELD 位置绑定）。literal/or/record/guard 模式 + 数组/记录字面量 + 索引
+  留 M2b/M2c。
