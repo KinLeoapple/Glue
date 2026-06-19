@@ -245,6 +245,27 @@ pub const PatternRecordField = struct {
 // 通用结构
 // ============================================================
 
+/// De Bruijn 词法地址引用种类（任务#2）。
+pub const RefKind = enum(u8) {
+    /// 未解析 —— 求值器回退到 name_id 哈希查找（默认，自动安全）。
+    unresolved,
+    /// 局部变量 —— 在到最近函数边界为止的帧内，走 (depth, slot) 数组快路径。
+    local,
+    /// 自由变量（跨函数边界捕获）—— 运行时已被 buildCaptureEnv 压平进 capture_env，按 id 哈希查。
+    upvalue,
+    /// 顶层/全局（函数/类型/构造器/内建）—— id 哈希查（落到 global_env）。
+    global,
+};
+
+/// De Bruijn 词法地址。仅 kind==.local 时 depth/slot 有意义。
+pub const ResolvedRef = struct {
+    kind: RefKind = .unresolved,
+    /// 向上走的 createChild 帧数（0=当前帧）。
+    depth: u16 = 0,
+    /// 该帧 slots 数组的索引。
+    slot: u16 = 0,
+};
+
 /// 函数参数
 pub const Param = struct {
     location: SourceLocation,
@@ -256,6 +277,8 @@ pub const Param = struct {
     is_var: bool,
     /// resolve 预pass 填充的 intern id（运行时环境用整数键，见 src/intern.zig）。
     name_id: u32 = 0xFFFF_FFFF,
+    /// 任务#2:参数在 call_env slots 数组中的索引（= 参数位置）。
+    slot: u16 = 0,
 };
 
 /// 类型参数
@@ -525,6 +548,9 @@ pub const Expr = union(enum) {
         name: []const u8,
         /// resolve 预pass 填充的 intern id（见 src/intern.zig）。引用点用整数键查环境。
         name_id: u32 = 0xFFFF_FFFF,
+        /// De Bruijn 词法地址（任务#2）。resolve 对可证明正确的局部变量填 .local + (depth,slot)，
+        /// 求值器走数组快路径;其余留 .unresolved（自动回退到 name_id 哈希查找）。
+        resolved: ResolvedRef = .{},
     },
 
     /// 赋值表达式：target = value（用于 defer 等上下文中）
@@ -675,6 +701,8 @@ pub const Expr = union(enum) {
         statements: []*Stmt,
         /// 尾表达式（块的返回值），null 表示块无返回值
         trailing_expr: ?*Expr,
+        /// 块内 val/var 声明数（任务#2）。resolve 预pass 填充，createChild 据此预分配 slot 数组。
+        slot_count: u16 = 0,
     },
 
     /// match 表达式：match expr { patterns => body, ... }
@@ -759,6 +787,8 @@ pub const Stmt = union(enum) {
         visibility: Visibility = .private,
         /// resolve 预pass 填充的 intern id（见 src/intern.zig）。
         name_id: u32 = 0xFFFF_FFFF,
+        /// 任务#2:在所属 block_env slots 数组中的索引（= 块内 val/var 声明顺序）。
+        slot: u16 = 0,
     },
 
     /// 可变绑定：var name [: Type] = expr
@@ -771,6 +801,8 @@ pub const Stmt = union(enum) {
         visibility: Visibility = .private,
         /// resolve 预pass 填充的 intern id（见 src/intern.zig）。
         name_id: u32 = 0xFFFF_FFFF,
+        /// 任务#2:在所属 block_env slots 数组中的索引（= 块内 val/var 声明顺序）。
+        slot: u16 = 0,
     },
 
     /// 赋值语句：target = value

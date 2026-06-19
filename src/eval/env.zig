@@ -23,6 +23,9 @@ pub const Variable = struct {
     /// 闭包的 capture_env 里指向闭包自己，若 retain 则成环。weak=true 时 release/teardown
     /// 跳过 value 的 release，避免环 + 避免悬空 double-free。
     is_weak: bool = false,
+    /// 任务#2:该绑定的名字 id（= map 的 key）。用于 slot 快路径的调试断言
+    /// （getLocal 校验 slots[slot] 指向的 Variable.name_id == 期望 id，把寻址错配变成响亮 panic）。
+    name_id: NameId = 0xFFFF_FFFF,
 };
 
 /// 变量环境（词法作用域）
@@ -43,6 +46,15 @@ pub const Environment = struct {
     /// 续14/闭包转换：是否为闭包 capture_env。capture_env 的 parent(global_env) 是非拥有
     /// 引用（不 retain、不在 parent.children），releaseEnv 时不 detach、不 release parent。
     is_capture: bool = false,
+    /// 任务#2:slot 快路径。slots[i] 指向 map 中第 i 个 define 的 Variable。
+    /// map 用 ensureTotalCapacity 预分配（不 rehash），故指针在帧存活期稳定。
+    /// map 仍是唯一存储（buildCaptureEnv/rollback/deepCopy/set 全读 map）;slots 只是
+    /// "免哈希直达指针"的旁路。createChildSized 才分配 slots,普通 createChild 为空。
+    slots: []*Variable = &[_]*Variable{},
+    /// 已 defineSlot 的 slot 数（下一个 slot 索引 = slot_len）。
+    slot_len: u16 = 0,
+    /// slots 是否本帧拥有（createChildSized 分配 → true,需在销毁时 free;复用/默认 → false）。
+    owns_slots: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Environment {
         return Environment{
@@ -82,6 +94,8 @@ pub const Environment = struct {
             if (!entry.value_ptr.is_weak) entry.value_ptr.value.release(self.value_allocator);
         }
         self.values.deinit();
+        // 任务#2:释放 slot 数组（仅本帧拥有时）。slots 只存指针,不拥有 Variable。
+        if (self.owns_slots and self.slots.len > 0) self.allocator.free(self.slots);
     }
 
     /// 作用域退出/闭包销毁时调用：rc-1。归零则从父链摘除、release 所有绑定与残留子环境、销毁自身。
@@ -111,6 +125,8 @@ pub const Environment = struct {
             if (!entry.value_ptr.is_weak) entry.value_ptr.value.release(self.value_allocator);
         }
         self.values.deinit();
+        // 任务#2:释放 slot 数组（仅本帧拥有时）。slots 只存指针,不拥有 Variable。
+        if (self.owns_slots and self.slots.len > 0) self.allocator.free(self.slots);
         // 残留子环境（理论上此时应为空或仍被引用）：对每个调用 releaseEnv
         const saved_parent = self.parent;
         var ci: usize = self.children.items.len;
@@ -171,6 +187,39 @@ pub const Environment = struct {
             return p.getPtr(id);
         }
         return null;
+    }
+
+    /// 任务#2:slot 快路径绑定。把绑定写进 map（getOrPut，不 fetchRemove,保持 map 条目地址稳定），
+    /// 再把该条目的 *Variable 存进 slots[slot]。要求帧由 createChildSized 预分配且容量足够。
+    pub fn defineSlot(self: *Environment, slot: u16, id: NameId, val: value.Value, is_mutable: bool) !void {
+        const cloned_val = try val.clone(self.value_allocator);
+        const gop = try self.values.getOrPut(id);
+        if (gop.found_existing) {
+            // 同名重定义（resolver 对这种块已降级 unresolved,理论上不会从 slot 路径来;
+            // 兜底:释放旧值，原地覆盖,保持指针稳定）。
+            if (!gop.value_ptr.is_weak) gop.value_ptr.value.release(self.value_allocator);
+        }
+        gop.value_ptr.* = Variable{ .value = cloned_val, .is_mutable = is_mutable, .is_public = false, .name_id = id };
+        if (slot < self.slots.len) {
+            self.slots[slot] = gop.value_ptr;
+            if (slot + 1 > self.slot_len) self.slot_len = slot + 1;
+        }
+    }
+
+    /// 任务#2:走 depth 层 parent 后按 slot 取 *Variable。无哈希。
+    /// **自校验**:slot 指向的 Variable.name_id 必须等于期望 id。不符则返回 null,
+    /// 调用方回退到 map 查找（不静默损坏）——所有构建模式都校验,把"寻址错配"这一整类
+    /// 风险变成"偶尔走慢路径"而非 ReleaseFast 下静默读错变量。depth/slot 越界也返回 null。
+    pub fn getLocal(self: *Environment, depth: u16, slot: u16, expected_id: NameId) ?*Variable {
+        var e: *Environment = self;
+        var d = depth;
+        while (d > 0) : (d -= 1) {
+            e = e.parent orelse return null;
+        }
+        if (slot >= e.slots.len) return null;
+        const v = e.slots[slot];
+        if (v.name_id != expected_id) return null; // 错配 → 回退
+        return v;
     }
 
     pub fn set(self: *Environment, id: NameId, val: value.Value) !void {
@@ -293,6 +342,19 @@ pub const Environment = struct {
         };
         try self.children.append(self.allocator, child);
         _ = self.retain(); // 子持有父：父在子存活期间不被回收
+        return child;
+    }
+
+    /// 任务#2:createChild + 预分配 n 个 slot 的快路径帧。
+    /// 关键:对 map `ensureTotalCapacity(n)` —— 后续 n 次 defineSlot 的 getOrPut 不再 rehash,
+    /// 故 slots 里缓存的 *Variable 在帧存活期保持有效（rehash 会移动 map 条目使指针悬空）。
+    pub fn createChildSized(self: *Environment, n: u16) !*Environment {
+        const child = try self.createChild();
+        if (n > 0) {
+            try child.values.ensureTotalCapacity(n);
+            child.slots = try child.allocator.alloc(*Variable, n);
+            child.owns_slots = true;
+        }
         return child;
     }
 

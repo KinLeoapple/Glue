@@ -1,0 +1,12 @@
+// Benchmark 1: 非尾递归函数调用密集
+// 目标:量每次调用的固有成本(createChild + define + 变量查找)。
+// fib 是非尾递归,无法 TCO,每次调用都新建一帧 → 直击调用开销。
+// fib(32) = 2178309,约 700 万次调用。
+
+fun fib(n: i64): i64 {
+    if (n < 2) { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fun main() {
+    println(fib(32))
+}

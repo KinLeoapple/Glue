@@ -144,6 +144,9 @@ pub const Evaluator = struct {
     /// 预 intern 的合成名字 id（monad @ 脱糖用，运行时按 id define，不在 spawn 期 intern）。
     id_bind: u32 = intern.INVALID,
     id_pure: u32 = intern.INVALID,
+    /// 任务#2:De Bruijn 词法地址快路径开关。默认关（evalIdentifier 忽略 resolved，走 map）。
+    /// resolve 填好且验证通过后由主求值器开启。零成本 A/B + 即时回退。
+    use_lexical_addressing: bool = false,
     io: ?std.Io = null,
     /// Work-stealing 调度器（基于 Zio Runtime）
     /// 文档 §3.7: M:N 调度，少量 OS 线程上运行大量轻量级协程
@@ -536,11 +539,15 @@ pub const Evaluator = struct {
     /// 将临时 Value 压入 shadow stack，保护其不被 GC 回收
     /// 在跨分配点持有 Value 时调用
     pub fn pushRoot(self: *Evaluator, val: Value) void {
+        // shadow_stack 仅为复制式 GC 的根集服务。主求值器 gc==null（GC 不运行），
+        // 此时 push/pop 是纯浪费（每个二元运算/调用都做 ArrayList append+pop）。短路。
+        if (self.gc == null) return;
         self.shadow_stack.append(self.allocator, val) catch {};
     }
 
     /// 弹出一个 shadow stack 条目
     pub fn popRoot(self: *Evaluator) void {
+        if (self.gc == null) return;
         if (self.shadow_stack.items.len > 0) {
             _ = self.shadow_stack.pop();
         }
@@ -548,6 +555,7 @@ pub const Evaluator = struct {
 
     /// 弹出 n 个 shadow stack 条目
     pub fn popRoots(self: *Evaluator, n: usize) void {
+        if (self.gc == null) return;
         if (n <= self.shadow_stack.items.len) {
             self.shadow_stack.shrinkRetainingCapacity(self.shadow_stack.items.len - n);
         }
@@ -2690,7 +2698,18 @@ pub const Evaluator = struct {
     }
 
     fn evalIdentifier(self: *Evaluator, id: @TypeOf(@as(ast.Expr, undefined).identifier), environment: *Environment) EvalResult!Value {
-        if (environment.get(id.name_id)) |v| {
+        // 任务#2:局部变量走 (depth, slot) 数组快路径（免父链哈希探测）。
+        // 仅 flag 开 + resolve 标 .local 时;其余回退到 map 查找（现有逻辑）。
+        // 任务#2:局部变量走 (depth, slot) 数组快路径（免父链哈希探测）。
+        // getLocal 自校验 name_id,错配/越界返回 null → 回退 map（绝不静默读错变量）。
+        var var_ptr: ?*env.Variable = null;
+        if (self.use_lexical_addressing and id.resolved.kind == .local) {
+            var_ptr = environment.getLocal(id.resolved.depth, id.resolved.slot, id.name_id);
+        }
+        if (var_ptr == null) {
+            var_ptr = environment.getPtr(id.name_id);
+        }
+        if (var_ptr) |v| {
             // Atomic<T> 透明操作：读取时使用 atomic_load
             if (v.value == .atomic_val) {
                 return v.value.atomic_val.load();
@@ -3477,7 +3496,12 @@ pub const Evaluator = struct {
                 while (true) {
                     // 从 *anyopaque 恢复 *Environment
                     const closure_env: *Environment = @ptrCast(@alignCast(current_closure.env));
-                    const call_env = try closure_env.createChild();
+                    // 任务#2:词法地址开启时用 createChildSized + defineSlot(参数帧 slot 快路径)。
+                    const lex = self.use_lexical_addressing;
+                    const call_env = if (lex)
+                        try closure_env.createChildSized(@intCast(current_closure.params.len))
+                    else
+                        try closure_env.createChild();
 
                     for (current_closure.params, 0..) |param, i| {
                         // 如果参数有类型注解，将实参转换为目标类型
@@ -3492,7 +3516,10 @@ pub const Evaluator = struct {
                             }
                             break :blk current_args[i];
                         } else current_args[i];
-                        try call_env.define(param.name_id, arg_val, param.is_var);
+                        if (lex)
+                            try call_env.defineSlot(param.slot, param.name_id, arg_val, param.is_var)
+                        else
+                            try call_env.define(param.name_id, arg_val, param.is_var);
                         // castValue 可能新建一个 owned 值（如 str 注解 → valueToString 新 dupe）。
                         // define 已 clone 自留，本处新建的临时若不归还则泄漏（churn 下无界）。
                         // 判据：arg_val 与原 current_args[i] 不是同一引用（cast 产生了新值）时 release。
@@ -4541,7 +4568,11 @@ pub const Evaluator = struct {
 
     fn evalBlock(self: *Evaluator, blk: @TypeOf(@as(ast.Expr, undefined).block), environment: *Environment) EvalResult!Value {
         // Phase 1: 不 deinit block_env，因为闭包可能引用它
-        const block_env = try environment.createChild();
+        // 任务#2:词法地址开启时按块内 val/var 声明数预分配 slot 数组（block_env slot 快路径）。
+        const block_env = if (self.use_lexical_addressing and blk.slot_count > 0)
+            try environment.createChildSized(blk.slot_count)
+        else
+            try environment.createChild();
 
         var defer_stack = std.ArrayList(*const ast.Expr).empty;
         defer defer_stack.deinit(self.allocator);
@@ -5174,7 +5205,10 @@ pub const Evaluator = struct {
                 // RHS 为 owned（阶段A 保证 evalExpr/DeclRhs 返 owned）。define clone(=retain)
                 // 出 env 自己一份；本函数持有的 owned 引用绑定后 release，使 fresh 值
                 // (rc=1) 不会停在 rc=2 而泄漏。阶段A 后 RHS 已非 borrow，release 不再误伤。
-                try environment.defineWithVisibility(vd.name_id, val, false, vd.visibility == .public);
+                if (self.use_lexical_addressing and vd.visibility != .public)
+                    try environment.defineSlot(vd.slot, vd.name_id, val, false)
+                else
+                    try environment.defineWithVisibility(vd.name_id, val, false, vd.visibility == .public);
                 // 续14/闭包转换 letrec：`val f = fun(){...f...}`（含 `fun f(){}` 语法糖）。
                 // 闭包 capture_env 在 f 绑定前快照、不含 f。绑定后补一条弱自引用进闭包 capture_env，
                 // 使递归可解析；弱引用避免 closure→capture_env→closure 成环。
@@ -5198,7 +5232,10 @@ pub const Evaluator = struct {
                         else => {},
                     }
                 }
-                try environment.defineWithVisibility(vd.name_id, val, true, vd.visibility == .public);
+                if (self.use_lexical_addressing and vd.visibility != .public)
+                    try environment.defineSlot(vd.slot, vd.name_id, val, true)
+                else
+                    try environment.defineWithVisibility(vd.name_id, val, true, vd.visibility == .public);
                 val.release(self.value_allocator);
                 return null;
             },

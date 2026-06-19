@@ -1,0 +1,22 @@
+// Benchmark 3: 记录字段访问 + ADT 构造/匹配
+// 目标:量字段访问(accessField)、记录构造装箱、模式匹配的成本。
+// 复合值 churn(构造 + 读取 + 丢弃)走 refcount/COW + SlabPool 路径。
+
+type Point = Point(x: i64, y: i64)
+
+fun dist2(p: Point): i64 {
+    match p {
+        Point(x, y) => x * x + y * y
+    }
+}
+
+fun main() {
+    var sum: i64 = 0
+    var i: i64 = 0
+    while i < 1000000 {
+        val p = Point(i, i + 1)
+        sum = sum + dist2(p) + p.x - p.y
+        i = i + 1
+    }
+    println(sum)
+}

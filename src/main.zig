@@ -314,6 +314,7 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
     var ev = eval.Evaluator.initWithIo(arena_alloc, io);
     ev.value_allocator = pool.allocator();
     ev.global_env.value_allocator = ev.value_allocator;
+    ev.use_lexical_addressing = true; // 任务#2:De Bruijn 局部变量数组快路径(自校验回退,绝不静默损坏)
     defer ev.deinit();
 
     const has_error = executeSource(arena_alloc, &ev, io, source, entry_path);
@@ -343,6 +344,7 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
         var ev = eval.Evaluator.initWithIo(dbg_alloc, io);
         ev.value_allocator = pool.allocator();
         ev.global_env.value_allocator = ev.value_allocator;
+        ev.use_lexical_addressing = true; // 任务#2:开启(debug 路径同样)
         defer ev.deinit();
         const had_err = executeSource(dbg_alloc, &ev, io, source, entry_path);
         if (!had_err) {

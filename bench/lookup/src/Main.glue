@@ -1,0 +1,31 @@
+// Benchmark 2: 变量查找密集(多层作用域 + 多局部变量)
+// 目标:量 environment.get 沿父链 StringHashMap 查找的成本。
+// 词法地址解析(De Bruijn)应在此负载上收益最大。
+// 内层循环大量引用外层与本层变量,制造深查找链。
+
+fun compute(seed: i64): i64 {
+    val a: i64 = seed + 1
+    val b: i64 = seed + 2
+    val c: i64 = seed + 3
+    val d: i64 = seed + 4
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < 1000 {
+        // 每轮引用 a/b/c/d/acc/i —— 多变量、跨作用域查找
+        // 取模避免数值累积溢出(本基准关注查找成本,非算术)
+        val t: i64 = (a + b + c + d + i) % 1024
+        acc = (acc + t) % 1048576
+        i = i + 1
+    }
+    acc
+}
+
+fun main() {
+    var total: i64 = 0
+    var k: i64 = 0
+    while k < 5000 {
+        total = (total + compute(k)) % 1073741824
+        k = k + 1
+    }
+    println(total)
+}
