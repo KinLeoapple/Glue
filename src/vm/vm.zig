@@ -12,6 +12,8 @@ const ast = @import("ast");
 const value = @import("value");
 const opcode = @import("opcode.zig");
 const chunk_mod = @import("chunk.zig");
+const cast = @import("cast.zig");
+const method = @import("method.zig");
 
 const OpCode = opcode.OpCode;
 const Chunk = chunk_mod.Chunk;
@@ -20,6 +22,71 @@ const Program = chunk_mod.Program;
 const Value = value.Value;
 const IntValue = value.IntValue;
 const FloatValue = value.FloatValue;
+const SpawnHandle = value.SpawnHandle;
+
+/// M4c：spawn 协程上下文。每个 spawn 起一个 OS 线程跑子 VM；子 VM 用 per-spawn arena
+/// （page_allocator 裸打底）分配，与父 VM 内存隔离（VM 纯 refcount，array/record 非原子 rc
+/// 跨线程不安全 → 必须隔离堆）。结果存 handle.result（在 arena 内），await 时父线程深拷回父 allocator。
+/// 生命周期：worker 退出前置 handle.finished；VM.deinit 自旋等待后 arena.deinit + 释放 handle。
+const SpawnCtx = struct {
+    handle: *SpawnHandle,
+    program: *const Program,
+    func: *const Function, // spawn body 编译成的零参 Function（在共享 program 内）
+    captures: []Value, // 捕获快照（已深拷进 arena），按 func 的 upvalue 顺序
+    arena: *std.heap.ArenaAllocator, // per-spawn 堆（子 VM 全部分配走这里）
+    io: ?std.Io,
+    thread: ?std.Thread = null,
+};
+
+/// 子 VM 线程入口：用 arena 起独立 VM，把 captures 包成 cell upvalues，跑 func，结果存 handle。
+fn spawnThreadEntry(ctx: *SpawnCtx) void {
+    const handle = ctx.handle;
+    defer handle.finished.store(true, .seq_cst); // 最后置位，VM.deinit 凭此安全回收
+    const alloc = ctx.arena.allocator();
+
+    // captures → cell upvalues（子 VM 帧的 upvalues 需 *Cell）。
+    var ups: []Value = &.{};
+    if (ctx.captures.len > 0) {
+        ups = alloc.alloc(Value, ctx.captures.len) catch {
+            spawnFail(handle, "out of memory in spawned task");
+            return;
+        };
+        for (ctx.captures, 0..) |cap, i| {
+            const cell = alloc.create(value.Cell) catch {
+                spawnFail(handle, "out of memory in spawned task");
+                return;
+            };
+            cell.* = .{ .inner = cap, .rc = 1 };
+            ups[i] = Value{ .cell_val = cell };
+        }
+    }
+
+    var child = VM.init(alloc);
+    child.io = ctx.io;
+    child.program = ctx.program;
+    defer child.deinit();
+
+    const result = child.callClosureBody(ctx.program, ctx.func, ups) catch {
+        const msg = if (child.err_msg) |m| m else "spawned task failed";
+        spawnFail(handle, msg);
+        return;
+    };
+
+    handle.mutex.lockUncancelable();
+    handle.result = result; // 在 arena 内；await 深拷回父 allocator 后由 arena.deinit 回收
+    handle.status.store(.Completed, .seq_cst);
+    handle.condition.broadcast();
+    handle.mutex.unlock();
+}
+
+fn spawnFail(handle: *SpawnHandle, msg: []const u8) void {
+    handle.mutex.lockUncancelable();
+    // panic_message 用 page_allocator（独立于 arena，await 后由父释放）。
+    handle.panic_message = std.heap.page_allocator.dupe(u8, msg) catch null;
+    handle.status.store(.Failed, .seq_cst);
+    handle.condition.broadcast();
+    handle.mutex.unlock();
+}
 
 pub const VMError = error{
     OutOfMemory,
@@ -30,6 +97,8 @@ pub const VMError = error{
     WrongArity,
     StackOverflow,
     Unsupported,
+    NonNullAssertFailed,
+    SpawnFailed,
 };
 
 /// 调用帧（M1a/M1b）。局部变量住操作数栈 slot_base..slot_base+slot_count-1。
@@ -77,6 +146,14 @@ pub const VM = struct {
     err_msg: ?[]const u8 = null,
     /// IO 句柄（原生 println/print 输出到 stdout）；null 时回退 std.debug.print。
     io: ?std.Io = null,
+    /// M4c：本 VM spawn 出的协程上下文（每个含 OS 线程 + per-spawn arena + handle）。
+    /// VM.deinit 时自旋等待各 worker finished，再释放 arena/handle —— 避免 detached 线程写已释放内存。
+    spawns: std.ArrayListUnmanaged(*SpawnCtx) = .empty,
+    /// 当前 program（OP_SPAWN 需把 program 指针传给子 VM —— functions/constants 不可变跨线程共享）。
+    program: ?*const Program = null,
+    /// M4d：嵌套运行停止深度。runLoop 在 frames 弹回此深度时返回（默认 0 = 入口帧）。
+    /// force lazy thunk 时临时抬高，使 thunk RETURN 在其帧弹出即返回，不continue 外层。
+    stop_depth: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) VM {
         return .{ .allocator = allocator };
@@ -87,10 +164,113 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
+        // M4c：等待所有 spawn worker 彻底结束（join 线程），再释放 arena/handle/ctx。
+        // join 保证 worker 不再触碰 handle/arena —— 无 use-after-free。
+        for (self.spawns.items) |ctx| {
+            if (ctx.thread) |t| t.join();
+            // 平衡 deepCopyAcross 给捕获的共享原语（atomic/channel）加的 ref。子 VM 的 upvalue cell
+            // 是 arena 分配（arena.deinit 回收内存），但 cell.inner 持的共享对象（父 allocator 所有）
+            // ref_count 不会随 arena 释放而递减 → 须显式 unref。标量/字符串是 arena 自有，无需处理。
+            for (ctx.captures) |cap| self.releaseCapture(cap);
+            if (ctx.handle.panic_message) |msg| std.heap.page_allocator.free(msg);
+            self.allocator.destroy(ctx.handle);
+            ctx.arena.deinit(); // 释放子 VM 全部分配（含 result、cell、sender/receiver 包装）
+            self.allocator.destroy(ctx.arena);
+            self.allocator.destroy(ctx);
+        }
+        self.spawns.deinit(self.allocator);
         // 退出时栈上残留值 release（正常执行后栈应为空或仅留结果）。
-        for (self.stack.items) |v| v.release(self.allocator);
+        for (self.stack.items) |v| v.releaseVM(self.allocator);
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
+    }
+
+    /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
+    fn channelOf(self: *VM, v: Value) ?*value.ChannelValue {
+        _ = self;
+        return switch (v) {
+            .channel_val => |cv| cv,
+            .sender_val => |sv| sv.channel,
+            .receiver_val => |rv| rv.channel,
+            else => null,
+        };
+    }
+
+    /// M4d：建 vm_owned trait 值。栈顶 count 个 [name(string), closure] 对（顺序压栈 → 逆序弹）。
+    /// vtable: name(dupe) -> vm_closure（接管所有权）。data=null（内联 trait 无 receiver）。
+    fn doMakeTrait(self: *VM, count: u8, loc: ast.SourceLocation) VMError!void {
+        const tv = self.allocator.create(value.TraitValue) catch return error.OutOfMemory;
+        var methods = std.StringHashMap(Value).init(self.allocator);
+        errdefer {
+            var it = methods.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                e.value_ptr.*.releaseVM(self.allocator);
+            }
+            methods.deinit();
+            self.allocator.destroy(tv);
+        }
+        // 逆序弹：栈顶是最后一对的 closure。每对 [name, closure] → 先弹 closure 再弹 name。
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const closure = self.pop();
+            const name_v = self.pop();
+            if (name_v != .string) {
+                closure.releaseVM(self.allocator);
+                name_v.releaseVM(self.allocator);
+                return self.fail(loc, "trait method name must be a string", error.TypeMismatch);
+            }
+            // name_v.string 是 retainOwned 出的 owned 副本 —— 直接作为 key（移交），不再 dupe。
+            const gop = methods.getOrPut(name_v.string) catch return error.OutOfMemory;
+            if (gop.found_existing) {
+                // 重名（override）：释放旧实现与重复 key 字节，覆盖。
+                gop.value_ptr.*.releaseVM(self.allocator);
+                self.allocator.free(name_v.string);
+            } else {
+                gop.key_ptr.* = name_v.string;
+            }
+            gop.value_ptr.* = closure;
+        }
+        tv.* = .{
+            .trait_name = "",
+            .methods = methods,
+            .data = null,
+            .allocator = self.allocator,
+            .vm_owned = true,
+            .rc = 1,
+        };
+        try self.push(Value{ .trait_value = tv });
+    }
+
+    /// M4c：平衡 spawn 捕获快照对共享原语加的 ref。仅处理内建原子 ref_count 的类型：
+    /// atomic/channel unref 归零则 deinit+destroy（父 allocator 所有）；sender/receiver 仅 unref 其
+    /// channel（包装本身是子 arena 所有，由 arena.deinit 回收，绝不在此 destroy）。其它（标量/字符串/
+    /// 数组/record）是子 arena 自有，arena.deinit 统一回收，此处不碰。
+    fn releaseCapture(self: *VM, cap: Value) void {
+        switch (cap) {
+            .atomic_val => |av| {
+                if (av.unref()) self.allocator.destroy(av);
+            },
+            .channel_val => |ch| {
+                if (ch.unref()) {
+                    ch.deinit();
+                    self.allocator.destroy(ch);
+                }
+            },
+            .sender_val => |sv| {
+                if (sv.channel.unref()) {
+                    sv.channel.deinit();
+                    self.allocator.destroy(sv.channel);
+                }
+            },
+            .receiver_val => |rv| {
+                if (rv.channel.unref()) {
+                    rv.channel.deinit();
+                    self.allocator.destroy(rv.channel);
+                }
+            },
+            else => {},
+        }
     }
 
     fn push(self: *VM, v: Value) VMError!void {
@@ -108,6 +288,62 @@ pub const VM = struct {
     /// string 须 dupe 独立 owned（retain 对 string 是 no-op，见 §6.3）。
     fn retainOwned(self: *VM, v: Value) VMError!Value {
         if (v == .string) return Value{ .string = try self.allocator.dupe(u8, v.string) };
+        // M4a：atomic_val 共享语义 —— 原子 ref_count +1，返回别名（与 releaseVM unref 平衡）。
+        if (v == .atomic_val) {
+            v.atomic_val.ref();
+            return v;
+        }
+        // M4b：channel_val 共享语义 —— ref +1 返回别名。
+        if (v == .channel_val) {
+            v.channel_val.ref();
+            return v;
+        }
+        // M4d：VM 模式 lazy —— rc+1 共享 thunk/缓存（与 releaseVM 平衡）。eval 模式（vm_thunk==null）no-op。
+        if (v == .lazy_val and v.lazy_val.vm_thunk != null) {
+            v.lazy_val.rc += 1;
+            return v;
+        }
+        // M4d：VM 模式 trait 值 —— rc+1 共享 vtable（与 releaseVM 平衡）。eval 模式（vm_owned==false）no-op。
+        if (v == .trait_value and v.trait_value.vm_owned) {
+            v.trait_value.rc += 1;
+            return v;
+        }
+        // M4b：sender/receiver 轻包装 —— ref channel + 新分配包装（与 releaseVM destroy 包装平衡）。
+        if (v == .sender_val) {
+            v.sender_val.channel.ref();
+            const sv = self.allocator.create(value.SenderValue) catch return error.OutOfMemory;
+            sv.* = .{ .channel = v.sender_val.channel };
+            return Value{ .sender_val = sv };
+        }
+        if (v == .receiver_val) {
+            v.receiver_val.channel.ref();
+            const rv = self.allocator.create(value.ReceiverValue) catch return error.OutOfMemory;
+            rv.* = .{ .channel = v.receiver_val.channel };
+            return Value{ .receiver_val = rv };
+        }
+        // M3c：throw_val/error_val 在 eval 走 GC（retain 为 no-op）；VM 纯 refcount 用值语义——
+        // 深拷壳 + 错误字符串，嵌套值仍走 retainOwned（rc+1，与 releaseVM 平衡）。
+        if (v == .error_val) return Value{ .error_val = .{
+            .type_name = try self.allocator.dupe(u8, v.error_val.type_name),
+            .message = try self.allocator.dupe(u8, v.error_val.message),
+            .is_error_subtype = v.error_val.is_error_subtype,
+        } };
+        if (v == .throw_val) {
+            const new_tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
+            switch (v.throw_val.*) {
+                .ok => |inner| {
+                    const cloned = self.allocator.create(Value) catch return error.OutOfMemory;
+                    cloned.* = try self.retainOwned(inner.*);
+                    new_tv.* = .{ .ok = cloned };
+                },
+                .err => |e| new_tv.* = .{ .err = .{
+                    .type_name = try self.allocator.dupe(u8, e.type_name),
+                    .message = try self.allocator.dupe(u8, e.message),
+                    .is_error_subtype = e.is_error_subtype,
+                } },
+            }
+            return Value{ .throw_val = new_tv };
+        }
         return v.retain();
     }
 
@@ -123,6 +359,7 @@ pub const VM = struct {
     pub fn call(self: *VM, program: *const Program, entry: u16, args: []const Value) VMError!Value {
         const f = &program.functions.items[entry];
         if (args.len != f.arity) return self.fail(.{ .line = 0, .column = 0 }, "wrong number of arguments", error.WrongArity);
+        self.program = program; // M4c：OP_SPAWN 需 program 指针传子 VM。
         // 建立入口帧：实参占 slot 0..arity-1，其余局部槽补 unit 占位。
         const slot_base = self.stack.items.len;
         for (args) |a| try self.push(a); // 所有权移交栈（slot）
@@ -130,6 +367,42 @@ pub const VM = struct {
         while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
         try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = slot_base, .frame_base = slot_base });
         return self.runLoop(program);
+    }
+
+    /// M4c：执行 spawn body —— 零参 Function + 给定 upvalues（cell）。建入口帧（带 upvalues）跑到 RETURN。
+    fn callClosureBody(self: *VM, program: *const Program, f: *const Function, upvalues: []const Value) VMError!Value {
+        self.program = program;
+        const slot_base = self.stack.items.len;
+        var s: u16 = 0;
+        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = slot_base, .frame_base = slot_base, .upvalues = upvalues });
+        return self.runLoop(program);
+    }
+
+    /// M4d：force VM 模式 lazy。已 forced → 返回缓存的 owned 副本；否则跑 thunk（零参闭包）到完成，
+    /// 缓存结果。用 stop_depth 边界：临时设为当前帧深度，thunk 帧 RETURN 即返回（不 continue 外层 dispatch）。
+    /// thunk 内的嵌套调用压更深帧，其 RETURN 深度 > stop_depth → 不误触发返回，语义正确。
+    fn forceLazyVM(self: *VM, lz: *value.LazyValue, loc: ast.SourceLocation) VMError!Value {
+        if (lz.forced) return try self.retainOwned(lz.cached.?);
+        const thunk: *value.VmClosure = @ptrCast(@alignCast(lz.vm_thunk.?));
+        const f: *const Function = @ptrCast(@alignCast(thunk.func));
+        // 建 thunk 入口帧（零参 + upvalues），边界设当前深度。
+        const saved_depth = self.stop_depth;
+        const base = self.stack.items.len;
+        var s: u16 = 0;
+        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = base, .frame_base = base, .upvalues = thunk.upvalues });
+        self.stop_depth = self.frames.items.len - 1; // thunk 帧弹出即停
+        const result = self.runLoop(self.program.?) catch |e| {
+            self.stop_depth = saved_depth;
+            return e;
+        };
+        self.stop_depth = saved_depth;
+        _ = loc;
+        // result 既缓存（thunk 持有）又返回 owned 副本。
+        lz.cached = result;
+        lz.forced = true;
+        return try self.retainOwned(result);
     }
 
     /// 主 dispatch 循环。从当前帧（frames 顶）取码执行，CALL 压帧、RETURN 弹帧。
@@ -159,7 +432,15 @@ pub const VM = struct {
                     const cur = self.stack.items[frame.slot_base + slot];
                     // 透明解 cell：被闭包捕获的 local 已就地 box 成 *Cell，读其 inner。
                     const v = if (cur == .cell_val) cur.cell_val.inner else cur;
-                    try self.push(try self.retainOwned(v));
+                    // M4a：Atomic<T> 透明读取 —— 一般读取 load 出当前标量（方法接收者走 OP_GET_LOCAL_RAW）。
+                    if (v == .atomic_val) {
+                        try self.push(v.atomic_val.load());
+                    } else if (v == .lazy_val and v.lazy_val.vm_thunk != null) {
+                        // M4d：Lazy<T> 透明读取 —— 首次 force 跑 thunk 缓存，返回缓存的 owned 副本。
+                        try self.push(try self.forceLazyVM(v.lazy_val, loc));
+                    } else {
+                        try self.push(try self.retainOwned(v));
+                    }
                 },
                 .op_set_local => {
                     const slot = opcode.readU16(code, frame.ip);
@@ -169,10 +450,10 @@ pub const VM = struct {
                     const cur = self.stack.items[dst];
                     if (cur == .cell_val) {
                         // 透明写 cell：mutation 对共享该 cell 的闭包可见。
-                        cur.cell_val.inner.release(self.allocator);
+                        cur.cell_val.inner.releaseVM(self.allocator);
                         cur.cell_val.inner = v;
                     } else {
-                        cur.release(self.allocator); // 释放旧值
+                        cur.releaseVM(self.allocator); // 释放旧值
                         self.stack.items[dst] = v; // 所有权从栈转移到 slot
                     }
                 },
@@ -180,39 +461,46 @@ pub const VM = struct {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const cell = frame.upvalues[idx].cell_val;
-                    try self.push(try self.retainOwned(cell.inner));
+                    // M4a：Atomic<T> 透明读取（方法接收者走 OP_GET_UPVALUE_RAW）。
+                    if (cell.inner == .atomic_val) {
+                        try self.push(cell.inner.atomic_val.load());
+                    } else if (cell.inner == .lazy_val and cell.inner.lazy_val.vm_thunk != null) {
+                        try self.push(try self.forceLazyVM(cell.inner.lazy_val, loc));
+                    } else {
+                        try self.push(try self.retainOwned(cell.inner));
+                    }
                 },
                 .op_set_upvalue => {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const v = self.pop();
                     const cell = frame.upvalues[idx].cell_val;
-                    cell.inner.release(self.allocator);
+                    cell.inner.releaseVM(self.allocator);
                     cell.inner = v;
                 },
 
                 .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_bit_and, .op_bit_or, .op_bit_xor => {
                     const right = self.pop();
                     const left = self.pop();
-                    defer left.release(self.allocator);
-                    defer right.release(self.allocator);
+                    defer left.releaseVM(self.allocator);
+                    defer right.releaseVM(self.allocator);
                     try self.push(try self.arith(op, left, right, loc));
                 },
                 .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge => {
                     const right = self.pop();
                     const left = self.pop();
-                    defer left.release(self.allocator);
-                    defer right.release(self.allocator);
+                    defer left.releaseVM(self.allocator);
+                    defer right.releaseVM(self.allocator);
                     try self.push(try self.compare(op, left, right, loc));
                 },
                 .op_neg => {
                     const v = self.pop();
-                    defer v.release(self.allocator);
+                    defer v.releaseVM(self.allocator);
                     try self.push(try self.negate(v, loc));
                 },
                 .op_not => {
                     const v = self.pop();
-                    defer v.release(self.allocator);
+                    defer v.releaseVM(self.allocator);
                     const b = v.asBoolean() catch return self.fail(loc, "'!' requires boolean operand", error.TypeMismatch);
                     try self.push(Value{ .boolean = !b });
                 },
@@ -234,13 +522,24 @@ pub const VM = struct {
                     const cond = self.peek(0).asBoolean() catch return self.fail(loc, "condition must be boolean", error.TypeMismatch);
                     if (cond) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
                 },
+                // M3c：`??` 短路 —— peek 栈顶非 null 则跳转（保留 left）。
+                .op_jump_if_not_null => {
+                    const off = opcode.readI32(code, frame.ip);
+                    frame.ip += 4;
+                    if (!self.peek(0).isNull()) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
+                },
+                .op_jump_if_null => {
+                    const off = opcode.readI32(code, frame.ip);
+                    frame.ip += 4;
+                    if (self.peek(0).isNull()) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
+                },
 
-                .op_pop => self.pop().release(self.allocator),
+                .op_pop => self.pop().releaseVM(self.allocator),
                 .op_pop_n => {
                     const n = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     var k: u16 = 0;
-                    while (k < n) : (k += 1) self.pop().release(self.allocator);
+                    while (k < n) : (k += 1) self.pop().releaseVM(self.allocator);
                 },
                 .op_dup => try self.push(try self.retainOwned(self.peek(0))),
 
@@ -323,7 +622,7 @@ pub const VM = struct {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const obj = self.pop();
-                    defer obj.release(self.allocator);
+                    defer obj.releaseVM(self.allocator);
                     if (obj != .adt or idx >= obj.adt.fields.len)
                         return self.fail(loc, "OP_GET_ADT_FIELD on non-adt or out-of-range", error.TypeMismatch);
                     try self.push(try self.retainOwned(obj.adt.fields[idx].value));
@@ -333,7 +632,7 @@ pub const VM = struct {
                     frame.ip += 2;
                     const want = func.chunk.constants.items[name_idx].string;
                     const obj = self.pop();
-                    defer obj.release(self.allocator);
+                    defer obj.releaseVM(self.allocator);
                     const matched = obj == .adt and std.mem.eql(u8, obj.adt.constructor, want);
                     try self.push(Value{ .boolean = matched });
                 },
@@ -357,9 +656,9 @@ pub const VM = struct {
                 },
                 .op_index => {
                     const index_val = self.pop();
-                    defer index_val.release(self.allocator);
+                    defer index_val.releaseVM(self.allocator);
                     const object = self.pop();
-                    defer object.release(self.allocator);
+                    defer object.releaseVM(self.allocator);
                     try self.doIndex(object, index_val, loc);
                 },
 
@@ -369,7 +668,7 @@ pub const VM = struct {
                     frame.ip += 2;
                     const pat = func.chunk.constants.items[cidx];
                     const obj = self.pop();
-                    defer obj.release(self.allocator);
+                    defer obj.releaseVM(self.allocator);
                     try self.push(Value{ .boolean = literalPatternEq(pat, obj) });
                 },
                 .op_record_extend => {
@@ -390,38 +689,259 @@ pub const VM = struct {
                     frame.ip += 2;
                     const want = func.chunk.constants.items[name_idx].string;
                     const obj = self.pop();
-                    defer obj.release(self.allocator);
+                    defer obj.releaseVM(self.allocator);
                     const matched = obj == .newtype and std.mem.eql(u8, obj.newtype.type_name, want);
                     try self.push(Value{ .boolean = matched });
                 },
                 .op_get_newtype_inner => {
                     const obj = self.pop();
-                    defer obj.release(self.allocator);
+                    defer obj.releaseVM(self.allocator);
                     if (obj != .newtype) return self.fail(loc, "OP_GET_NEWTYPE_INNER on non-newtype", error.TypeMismatch);
                     try self.push(try self.retainOwned(obj.newtype.inner));
                 },
 
+                // M3a：字符串插值 —— 弹栈顶 n 段值，依次 format 拼接成新 string 压栈。
+                .op_interp => {
+                    const n = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    try self.doInterp(n);
+                },
+                // M3a：类型转换 —— 弹值，按常量池目标类型名转换，压结果。
+                .op_cast => {
+                    const name_idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const tname = func.chunk.constants.items[name_idx].string;
+                    try self.doCast(tname, loc);
+                },
+                // M3b：字段赋值 —— [record, val] → [new_record]（COW），写回由 SET_LOCAL 完成。
+                .op_set_field => {
+                    const name_idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const field = func.chunk.constants.items[name_idx].string;
+                    try self.doSetField(field, loc);
+                },
+
                 .op_return => {
                     const result = self.pop();
-                    // 释放本帧局部槽（slot_base..slot_base+slot_count-1）。
-                    const base = frame.slot_base;
-                    var s: u16 = 0;
-                    while (s < frame.func.slot_count) : (s += 1) self.stack.items[base + s].release(self.allocator);
-                    const fbase = frame.frame_base;
-                    // OP_CALL_VALUE 帧：frame_base 下方是 callee 值，须 release。
-                    if (fbase < base) {
-                        var i = fbase;
-                        while (i < base) : (i += 1) self.stack.items[i].release(self.allocator);
+                    if (try self.frameReturn(result)) |entry_result| return entry_result;
+                },
+                // M3c：非空断言 `!` —— peek 栈顶，null → panic，否则原样保留。
+                .op_non_null => {
+                    if (self.stack.items[self.stack.items.len - 1].isNull()) {
+                        return self.fail(loc, "non-null assertion failed on null value", error.NonNullAssertFailed);
                     }
-                    self.stack.shrinkRetainingCapacity(fbase); // 弹掉本帧 [callee?, 局部槽]
-                    _ = self.frames.pop();
-                    if (self.frames.items.len == 0) {
-                        return result; // 入口帧返回：结果交给调用方
+                },
+                // M3c：传播 `?` —— null/err 提前返回，ok 解包，其它原样。
+                .op_propagate => {
+                    const top = self.stack.items[self.stack.items.len - 1];
+                    if (top.isNull()) {
+                        _ = self.pop(); // 弹 null（基础值，release 无副作用）
+                        if (try self.frameReturn(Value.null_val)) |entry_result| return entry_result;
+                    } else if (top == .throw_val) {
+                        switch (top.throw_val.*) {
+                            .ok => |inner| {
+                                const unwrapped = try self.retainOwned(inner.*);
+                                _ = self.pop();
+                                top.releaseVM(self.allocator);
+                                try self.push(unwrapped);
+                            },
+                            .err => {
+                                const tv = self.pop(); // 接管 owned，作返回值移交
+                                if (try self.frameReturn(tv)) |entry_result| return entry_result;
+                            },
+                        }
                     }
-                    try self.push(result); // 返回值压回调用者栈（所有权移交）
+                    // 其它值：原样留栈顶。
+                },
+                // M3c：throw —— 弹 throw 值作为函数返回值（等价 OP_RETURN，Glue 无 try/catch）。
+                .op_throw => {
+                    const result = self.pop();
+                    if (try self.frameReturn(result)) |entry_result| return entry_result;
+                },
+                // M3c：match Ok/Error 测试 —— 弹 throw_val，want_ok=1 测 .ok / =0 测 .err，压 bool。
+                .op_test_throw => {
+                    const want_ok = code[frame.ip];
+                    frame.ip += 1;
+                    const obj = self.pop();
+                    defer obj.releaseVM(self.allocator);
+                    const matched = obj == .throw_val and switch (obj.throw_val.*) {
+                        .ok => want_ok == 1,
+                        .err => want_ok == 0,
+                    };
+                    try self.push(Value{ .boolean = matched });
+                },
+                // M3c：match Ok(v) 绑定 —— 弹 throw_val，retainOwned 其 .ok 内值压栈。
+                .op_get_throw_ok => {
+                    const obj = self.pop();
+                    defer obj.releaseVM(self.allocator);
+                    if (obj != .throw_val or obj.throw_val.* != .ok) return self.fail(loc, "OP_GET_THROW_OK on non-Ok", error.TypeMismatch);
+                    try self.push(try self.retainOwned(obj.throw_val.ok.*));
+                },
+                // M3c：match Error(e) 绑定 —— 弹 throw_val，把 .err 包成 error_val 压栈。
+                .op_get_throw_err => {
+                    const obj = self.pop();
+                    defer obj.releaseVM(self.allocator);
+                    if (obj != .throw_val or obj.throw_val.* != .err) return self.fail(loc, "OP_GET_THROW_ERR on non-Error", error.TypeMismatch);
+                    const e = obj.throw_val.err;
+                    try self.push(Value{ .error_val = .{
+                        .type_name = self.allocator.dupe(u8, e.type_name) catch return error.OutOfMemory,
+                        .message = self.allocator.dupe(u8, e.message) catch return error.OutOfMemory,
+                        .is_error_subtype = e.is_error_subtype,
+                    } });
+                },
+                // M3d：方法调用 —— 弹 argc 实参 + receiver，查内建方法表，压结果。
+                .op_call_method => {
+                    const name_idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const argc = code[frame.ip];
+                    frame.ip += 1;
+                    try self.doCallMethod(func, name_idx, argc, loc);
+                },
+                // M3d：构造 range —— 弹 [start,end]，压 range 值。
+                .op_make_range => {
+                    const inclusive = code[frame.ip] == 1;
+                    frame.ip += 1;
+                    const end_v = self.pop();
+                    defer end_v.releaseVM(self.allocator);
+                    const start_v = self.pop();
+                    defer start_v.releaseVM(self.allocator);
+                    if (start_v != .integer or end_v != .integer) return self.fail(loc, "range bounds must be integers", error.TypeMismatch);
+                    const start: i128 = if (start_v.integer.type_tag.isSigned()) start_v.integer.signedValue() else @intCast(start_v.integer.value);
+                    const end: i128 = if (end_v.integer.type_tag.isSigned()) end_v.integer.signedValue() else @intCast(end_v.integer.value);
+                    try self.push(Value{ .range = .{ .start = start, .end = end, .inclusive = inclusive } });
+                },
+                // M4a：构造 atomic —— 弹值，包成 AtomicValue（ref_count=1），压 atomic_val。
+                .op_make_atomic => {
+                    const v = self.pop();
+                    defer v.releaseVM(self.allocator);
+                    const av = self.allocator.create(value.AtomicValue) catch return error.OutOfMemory;
+                    switch (v) {
+                        .integer => |iv| av.* = value.AtomicValue.initInt(@bitCast(iv.value), value.intTypeToAtomicType(iv.type_tag)),
+                        .float => |fv| av.* = value.AtomicValue.initFloat(fv.value, switch (fv.type_tag) {
+                            .f16 => .f16, .f32 => .f32, .f64 => .f64, .f128 => .f128,
+                        }),
+                        .boolean => |b| av.* = value.AtomicValue.initBool(b),
+                        .char_val => |c| av.* = value.AtomicValue.initChar(c),
+                        else => {
+                            self.allocator.destroy(av);
+                            return self.fail(loc, "atomic: unsupported type", error.TypeMismatch);
+                        },
+                    }
+                    try self.push(Value{ .atomic_val = av });
+                },
+                // M4a：方法接收者用的原始 local 读取 —— 不对 atomic_val 透明 load（仍解 cell）。
+                .op_get_local_raw => {
+                    const slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const cur = self.stack.items[frame.slot_base + slot];
+                    const v = if (cur == .cell_val) cur.cell_val.inner else cur;
+                    try self.push(try self.retainOwned(v));
+                },
+                .op_get_upvalue_raw => {
+                    const idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const cell = frame.upvalues[idx].cell_val;
+                    try self.push(try self.retainOwned(cell.inner));
+                },
+                // M4a：Atomic 透明复合赋值 —— slot 持 atomic → 原子 fetch<op>（不重写 slot）；否则常规读改写。
+                .op_compound_local => {
+                    const slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const arith_op: OpCode = @enumFromInt(code[frame.ip]);
+                    frame.ip += 1;
+                    try self.doCompoundLocal(frame, slot, arith_op, loc);
+                },
+                // M4c：Atomic 透明复合赋值（upvalue）—— cell.inner 持 atomic → 原子 fetch<op>；否则常规读改写 cell.inner。
+                .op_compound_upvalue => {
+                    const idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const arith_op: OpCode = @enumFromInt(code[frame.ip]);
+                    frame.ip += 1;
+                    try self.doCompoundUpvalue(frame, idx, arith_op, loc);
+                },
+                // M4c：spawn —— 弹零参 vm_closure（spawn body），深拷捕获进 arena，起线程跑子 VM。
+                .op_spawn => {
+                    try self.doSpawn(loc);
+                },
+                // M4d：lazy —— 弹零参 vm_closure（lazy expr），包成 lazy_val（vm_thunk 模式）压栈。
+                .op_make_lazy => {
+                    const callee = self.pop();
+                    if (callee != .vm_closure) return self.fail(loc, "lazy body must be a closure", error.TypeMismatch);
+                    const lz = self.allocator.create(value.LazyValue) catch return error.OutOfMemory;
+                    lz.* = .{
+                        .expr = undefined, // VM 模式占位（无 AST）
+                        .env = undefined, // VM 模式占位（无 Environment）
+                        .cached = null,
+                        .forced = false,
+                        .allocator = self.allocator,
+                        .vm_thunk = @ptrCast(callee.vm_closure),
+                        .rc = 1,
+                    };
+                    try self.push(Value{ .lazy_val = lz });
+                },
+                // M4d：select 支撑 —— 非阻塞 tryRecv。就绪压 [value, true]；否则压 [unit, false]。
+                .op_try_recv => {
+                    const chv = self.pop();
+                    defer chv.releaseVM(self.allocator);
+                    const ch = self.channelOf(chv) orelse return self.fail(loc, "select: not a channel", error.TypeMismatch);
+                    if (ch.tryRecv()) |v| {
+                        try self.push(v); // tryRecv 移交所有权
+                        try self.push(Value{ .boolean = true });
+                    } else {
+                        try self.push(Value.unit);
+                        try self.push(Value{ .boolean = false });
+                    }
+                },
+                // M4d：select 阻塞兜底 —— 阻塞 recv。压 value（关闭则压 unit）。
+                .op_recv => {
+                    const chv = self.pop();
+                    defer chv.releaseVM(self.allocator);
+                    const ch = self.channelOf(chv) orelse return self.fail(loc, "select: not a channel", error.TypeMismatch);
+                    if (ch.recv()) |v| {
+                        try self.push(v);
+                    } else {
+                        try self.push(Value.unit);
+                    }
+                },
+                // M4d：inline trait 值 —— 弹 count 个 [name, closure] 对建 vm_owned trait_value（vtable）。
+                .op_make_trait => {
+                    const count = code[frame.ip];
+                    frame.ip += 1;
+                    try self.doMakeTrait(count, loc);
+                },
+                // M3d：for 循环步进 —— iter_slot 持 array/range/string，idx_slot 持索引；
+                // 耗尽跳 exit_off，否则压当前元素 + idx 自增。
+                .op_for_next => {
+                    const iter_slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const idx_slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const exit_off = opcode.readI32(code, frame.ip);
+                    frame.ip += 4;
+                    try self.doForNext(frame, iter_slot, idx_slot, exit_off, loc);
                 },
             }
         }
+    }
+
+    /// 帧返回公共逻辑（OP_RETURN / OP_THROW / OP_PROPAGATE 提前返回共用）。
+    /// 释放本帧局部槽 + callee box（若 OP_CALL_VALUE 帧），弹帧，把 result 移交调用方。
+    /// 返回非 null：入口帧返回，结果交给 VM 调用者；返回 null：已压回调用者栈，继续主循环。
+    fn frameReturn(self: *VM, result: Value) VMError!?Value {
+        const frame = &self.frames.items[self.frames.items.len - 1];
+        const base = frame.slot_base;
+        var s: u16 = 0;
+        while (s < frame.func.slot_count) : (s += 1) self.stack.items[base + s].releaseVM(self.allocator);
+        const fbase = frame.frame_base;
+        if (fbase < base) {
+            var i = fbase;
+            while (i < base) : (i += 1) self.stack.items[i].releaseVM(self.allocator);
+        }
+        self.stack.shrinkRetainingCapacity(fbase);
+        _ = self.frames.pop();
+        if (self.frames.items.len == self.stop_depth) return result; // 入口帧 / 嵌套运行边界返回
+        try self.push(result); // 返回值压回调用者栈（所有权移交）
+        return null;
     }
 
     /// 执行一次 OP_CALL（M1a 快路径）：argc 个实参已在栈顶，callee 不在栈上。
@@ -468,11 +988,11 @@ pub const VM = struct {
         while (i < argc) : (i += 1) argbuf[i] = self.stack.items[args_start + i];
         // 2) 释放本帧局部槽（slot_base..slot_base+slot_count）。args 在其上方，不在此列。
         var s: u16 = 0;
-        while (s < frame.func.slot_count) : (s += 1) self.stack.items[sbase + s].release(self.allocator);
+        while (s < frame.func.slot_count) : (s += 1) self.stack.items[sbase + s].releaseVM(self.allocator);
         // 3) OP_CALL_VALUE 帧：frame_base..slot_base 之间是 callee box，须 release。
         if (fbase < sbase) {
             var k = fbase;
-            while (k < sbase) : (k += 1) self.stack.items[k].release(self.allocator);
+            while (k < sbase) : (k += 1) self.stack.items[k].releaseVM(self.allocator);
         }
         // 4) 回退栈到 frame_base，写回 args（接管 owned），补 unit 到 slot_count。
         self.stack.shrinkRetainingCapacity(fbase);
@@ -495,7 +1015,7 @@ pub const VM = struct {
             .println, .print => {
                 if (argc != 1) return self.fail(loc, "println/print expects 1 argument", error.WrongArity);
                 const v = self.pop();
-                defer v.release(self.allocator);
+                defer v.releaseVM(self.allocator);
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.allocator);
                 v.format(&buf, self.allocator, false) catch return error.OutOfMemory;
@@ -509,6 +1029,41 @@ pub const VM = struct {
                     std.debug.print("{s}", .{buf.items});
                 }
                 try self.push(Value.unit);
+            },
+            // M3c：Ok(v) → throw_val.ok。inner 用 retainOwned（rc+1/字符串 dupe），与 releaseVM 平衡。
+            .ok => {
+                if (argc != 1) return self.fail(loc, "Ok expects 1 argument", error.WrongArity);
+                const v = self.pop();
+                defer v.releaseVM(self.allocator);
+                const inner = self.allocator.create(Value) catch return error.OutOfMemory;
+                inner.* = try self.retainOwned(v);
+                const tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
+                tv.* = .{ .ok = inner };
+                try self.push(Value{ .throw_val = tv });
+            },
+            // M3c：Error(msg) → throw_val.err{type_name="Error", message}（msg dupe 进 ErrorValue）。
+            .err => {
+                if (argc != 1) return self.fail(loc, "Error expects 1 argument", error.WrongArity);
+                const v = self.pop();
+                defer v.releaseVM(self.allocator);
+                if (v != .string) return self.fail(loc, "Error expects a str argument", error.TypeMismatch);
+                const tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
+                tv.* = .{ .err = .{
+                    .type_name = self.allocator.dupe(u8, "Error") catch return error.OutOfMemory,
+                    .message = self.allocator.dupe(u8, v.string) catch return error.OutOfMemory,
+                } };
+                try self.push(Value{ .throw_val = tv });
+            },
+            // M4b：channel(cap) —— 弹整数容量，建 ChannelValue（ref_count=1），压 channel_val。
+            .channel => {
+                if (argc != 1) return self.fail(loc, "channel expects 1 argument", error.WrongArity);
+                const v = self.pop();
+                defer v.releaseVM(self.allocator);
+                if (v != .integer) return self.fail(loc, "channel expects an integer capacity", error.TypeMismatch);
+                const cap: usize = @intCast(if (v.integer.type_tag.isSigned()) v.integer.signedValue() else @as(i128, @intCast(v.integer.value)));
+                const ch = self.allocator.create(value.ChannelValue) catch return error.OutOfMemory;
+                ch.* = value.ChannelValue.init(self.allocator, cap);
+                try self.push(Value{ .channel_val = ch });
             },
         }
     }
@@ -531,10 +1086,46 @@ pub const VM = struct {
         try self.push(Value{ .adt = av });
     }
 
+    /// 执行 OP_INTERP：弹栈顶 n 段值（先压的是第一段），依次 format 拼接成新 string 压栈，各段 release。
+    fn doInterp(self: *VM, n: u16) VMError!void {
+        const base = self.stack.items.len - n;
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            self.stack.items[base + i].format(&buf, self.allocator, false) catch return error.OutOfMemory;
+        }
+        // 拼接完成后再 release 各段（format 借用其内容，须在 format 后释放）。
+        i = 0;
+        while (i < n) : (i += 1) self.stack.items[base + i].releaseVM(self.allocator);
+        self.stack.shrinkRetainingCapacity(base);
+        const owned = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+        try self.push(Value{ .string = owned });
+    }
+
+    /// 执行 OP_CAST：弹值，按目标类型名转换，压结果。str→format；数值互转 cast.zig；溢出→panic。
+    fn doCast(self: *VM, type_name: []const u8, loc: ast.SourceLocation) VMError!void {
+        const v = self.pop();
+        defer v.releaseVM(self.allocator);
+        if (std.mem.eql(u8, type_name, "str")) {
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(self.allocator);
+            v.format(&buf, self.allocator, false) catch return error.OutOfMemory;
+            const owned = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+            try self.push(Value{ .string = owned });
+            return;
+        }
+        const result = cast.castNumeric(v, type_name) catch |e| switch (e) {
+            error.CastOverflow => return self.fail(loc, "arithmetic overflow: narrowing conversion out of range", error.ArithmeticOverflow),
+            error.CastTypeMismatch => return self.fail(loc, "invalid type conversion", error.TypeMismatch),
+        };
+        try self.push(result);
+    }
+
     /// 执行 OP_GET_FIELD：弹对象，按名读 adt/record 字段，retainOwned 压栈，release 对象。
     fn doGetField(self: *VM, field: []const u8, loc: ast.SourceLocation) VMError!void {
         const obj = self.pop();
-        defer obj.release(self.allocator);
+        defer obj.releaseVM(self.allocator);
         switch (obj) {
             .adt => |av| {
                 for (av.fields) |f| {
@@ -554,8 +1145,75 @@ pub const VM = struct {
                 }
                 return self.fail(loc, "no such field on record", error.TypeMismatch);
             },
+            // M3c：error_val.message / .type_name（match Error(e) 绑定后访问）。
+            .error_val => |e| {
+                if (std.mem.eql(u8, field, "message")) {
+                    try self.push(Value{ .string = self.allocator.dupe(u8, e.message) catch return error.OutOfMemory });
+                    return;
+                }
+                if (std.mem.eql(u8, field, "type_name")) {
+                    try self.push(Value{ .string = self.allocator.dupe(u8, e.type_name) catch return error.OutOfMemory });
+                    return;
+                }
+                return self.fail(loc, "no such field on error", error.TypeMismatch);
+            },
+            // M4b：Channel 方向类型字段 —— ch.sender / ch.receiver（各 ref channel + 新包装）。
+            .channel_val => |cv| {
+                if (std.mem.eql(u8, field, "sender")) {
+                    cv.ref();
+                    const sv = self.allocator.create(value.SenderValue) catch return error.OutOfMemory;
+                    sv.* = .{ .channel = cv };
+                    try self.push(Value{ .sender_val = sv });
+                    return;
+                }
+                if (std.mem.eql(u8, field, "receiver")) {
+                    cv.ref();
+                    const rv = self.allocator.create(value.ReceiverValue) catch return error.OutOfMemory;
+                    rv.* = .{ .channel = cv };
+                    try self.push(Value{ .receiver_val = rv });
+                    return;
+                }
+                return self.fail(loc, "no such field on Channel (only 'sender'/'receiver')", error.TypeMismatch);
+            },
             else => return self.fail(loc, "field access on non-record/adt", error.TypeMismatch),
         }
+    }
+
+    /// 执行 OP_SET_FIELD：栈 [record, val] → [new_record]。
+    /// record COW（rc>1 时浅拷分裂），写字段（旧值 release，val owned move 入槽），压结果 record。
+    /// 镜像 eval field_assignment 的 record 分支（cowField + map 覆盖）。
+    fn doSetField(self: *VM, field: []const u8, loc: ast.SourceLocation) VMError!void {
+        const val = self.pop(); // 接管 owned
+        const obj = self.pop();
+        if (obj != .record) {
+            val.releaseVM(self.allocator);
+            obj.releaseVM(self.allocator);
+            return self.fail(loc, "cannot assign field on non-record", error.TypeMismatch);
+        }
+        var rec = obj.record;
+        // COW：共享（rc>1）时浅拷一份独占体，原体 rc-1。
+        if (rec.rc > 1) {
+            var new_map = std.StringHashMap(Value).init(self.allocator);
+            var it = rec.fields.iterator();
+            while (it.next()) |e| {
+                const key = self.allocator.dupe(u8, e.key_ptr.*) catch return error.OutOfMemory;
+                new_map.put(key, try self.retainOwned(e.value_ptr.*)) catch return error.OutOfMemory;
+            }
+            rec.rc -= 1;
+            // type_name 是借用 slice（release 不释放它）；复用原 slice，不 dupe（dupe 会泄漏）。
+            const new_rec = value.Value.makeRecord(self.allocator, rec.type_name, new_map) catch return error.OutOfMemory;
+            rec = new_rec.record;
+        }
+        // 写字段：必须已存在（对齐 eval：不存在 → panic）。
+        if (rec.fields.getPtr(field)) |existing| {
+            existing.*.releaseVM(self.allocator);
+            existing.* = val; // owned move
+        } else {
+            val.releaseVM(self.allocator);
+            (Value{ .record = rec }).releaseVM(self.allocator);
+            return self.fail(loc, "no such field on record", error.TypeMismatch);
+        }
+        try self.push(Value{ .record = rec });
     }
 
     /// 执行 OP_MAKE_RECORD：弹栈顶 n 个值（n=shape.field_names.len），建 RecordValue（key dupe，
@@ -568,7 +1226,7 @@ pub const VM = struct {
             var it = map.iterator();
             while (it.next()) |e| {
                 self.allocator.free(e.key_ptr.*);
-                e.value_ptr.*.release(self.allocator);
+                e.value_ptr.*.releaseVM(self.allocator);
             }
             map.deinit();
         }
@@ -580,7 +1238,7 @@ pub const VM = struct {
             const gop = map.getOrPut(key) catch return error.OutOfMemory;
             if (gop.found_existing) {
                 self.allocator.free(key);
-                gop.value_ptr.*.release(self.allocator);
+                gop.value_ptr.*.releaseVM(self.allocator);
             }
             gop.value_ptr.* = self.stack.items[base + i];
         }
@@ -603,7 +1261,7 @@ pub const VM = struct {
             var it = map.iterator();
             while (it.next()) |e| {
                 self.allocator.free(e.key_ptr.*);
-                e.value_ptr.*.release(self.allocator);
+                e.value_ptr.*.releaseVM(self.allocator);
             }
             map.deinit();
         }
@@ -620,13 +1278,13 @@ pub const VM = struct {
             const gop = map.getOrPut(key) catch return error.OutOfMemory;
             if (gop.found_existing) {
                 self.allocator.free(key);
-                gop.value_ptr.*.release(self.allocator); // 释放被覆盖的 base 字段拷贝
+                gop.value_ptr.*.releaseVM(self.allocator); // 释放被覆盖的 base 字段拷贝
             }
             gop.value_ptr.* = self.stack.items[ubase + i];
         }
         // 弹 n 个 update + base（base 用完 release）。
         self.stack.shrinkRetainingCapacity(ubase - 1);
-        base_val.release(self.allocator);
+        base_val.releaseVM(self.allocator);
         const rec = value.Value.makeRecord(self.allocator, "", map) catch return error.OutOfMemory;
         try self.push(rec);
     }
@@ -660,6 +1318,284 @@ pub const VM = struct {
             },
             else => return self.fail(loc, "cannot index into this type", error.TypeMismatch),
         }
+    }
+
+    /// M3d：执行 OP_CALL_METHOD。栈布局 [receiver, arg0..arg_{argc-1}]，receiver 在 args 下方。
+    /// 弹实参 + receiver（均 owned，方法分派后 releaseVM），压 fresh owned 结果。
+    fn doCallMethod(self: *VM, func: *const Function, name_idx: u16, argc: u8, loc: ast.SourceLocation) VMError!void {
+        const name = func.chunk.constants.items[name_idx].string;
+        const args_start = self.stack.items.len - argc;
+        const args = self.stack.items[args_start..][0..argc];
+        const receiver = self.stack.items[args_start - 1];
+        // M4c：spawn_val 的 await/cancel 需 VM 级处理（等待 + 结果跨线程深拷回父 allocator）。
+        if (receiver == .spawn_val) {
+            return self.doSpawnMethod(receiver.spawn_val, name, args, args_start, loc);
+        }
+        // M4d：inline trait 值方法分派 —— vtable 查 name 得 vm_closure，以 args 调用（无 data receiver）。
+        if (receiver == .trait_value and receiver.trait_value.vm_owned) {
+            return self.doTraitMethod(receiver.trait_value, name, argc, args_start, loc);
+        }
+        const result = method.dispatch(self.allocator, receiver, name, args) catch |err| switch (err) {
+            error.NoSuchMethod => return self.fail(loc, "no such method on this type", error.TypeMismatch),
+            error.WrongArity => return self.fail(loc, "method called with wrong number of arguments", error.WrongArity),
+            error.TypeMismatch => return self.fail(loc, "method not available on this type", error.TypeMismatch),
+            error.ChannelClosed => return self.fail(loc, "channel: send on closed channel", error.TypeMismatch),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        // 释放实参 + receiver（分派已 retainOwned 需要的元素到结果）。
+        for (args) |a| a.releaseVM(self.allocator);
+        receiver.releaseVM(self.allocator);
+        self.stack.shrinkRetainingCapacity(args_start - 1);
+        try self.push(result);
+    }
+
+    /// M4c：Spawn<T> 方法。await() 挂起等待 worker 完成，把结果**跨线程深拷**回父 allocator
+    /// （子结果在 arena 内，await 后 arena 仍由 VM.deinit 持有，故拷贝安全且独立）；Failed → panic。
+    /// cancel() 标记取消。栈：[spawn_val, args...] → 弹掉换成结果。
+    fn doSpawnMethod(self: *VM, handle: *SpawnHandle, name: []const u8, args: []const Value, args_start: usize, loc: ast.SourceLocation) VMError!void {
+        const receiver = self.stack.items[args_start - 1];
+        if (std.mem.eql(u8, name, "await")) {
+            if (args.len != 0) return self.fail(loc, "await expects 0 arguments", error.WrongArity);
+            handle.mutex.lockUncancelable();
+            while (handle.status.load(.seq_cst) == .Pending or handle.status.load(.seq_cst) == .Running) {
+                handle.condition.waitUncancelable(&handle.mutex);
+            }
+            const child_result = handle.result;
+            handle.consumed.store(true, .seq_cst);
+            const failed = handle.status.load(.seq_cst) == .Failed;
+            handle.mutex.unlock();
+            if (failed) {
+                const msg = handle.panic_message orelse "spawn: coroutine failed";
+                return self.fail(loc, msg, error.SpawnFailed);
+            }
+            // 跨线程深拷结果进父 allocator（子结果在 arena，独立于父 refcount 堆）。
+            const owned = if (child_result) |r| (r.deepCopyAcross(self.allocator) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return self.fail(loc, "spawn: result type not supported across threads", error.TypeMismatch),
+            }) else Value.unit;
+            for (args) |a| a.releaseVM(self.allocator);
+            receiver.releaseVM(self.allocator);
+            self.stack.shrinkRetainingCapacity(args_start - 1);
+            try self.push(owned);
+            return;
+        }
+        if (std.mem.eql(u8, name, "cancel")) {
+            if (args.len != 0) return self.fail(loc, "cancel expects 0 arguments", error.WrongArity);
+            handle.mutex.lockUncancelable();
+            handle.status.store(.Cancelled, .seq_cst);
+            handle.consumed.store(true, .seq_cst);
+            handle.condition.broadcast();
+            handle.mutex.unlock();
+            for (args) |a| a.releaseVM(self.allocator);
+            receiver.releaseVM(self.allocator);
+            self.stack.shrinkRetainingCapacity(args_start - 1);
+            try self.push(Value.unit);
+            return;
+        }
+        return self.fail(loc, "no such method on Spawn", error.TypeMismatch);
+    }
+
+    /// M4d：inline trait 值方法分派。栈：[trait_value, arg0..arg_{argc-1}]（args_start 指向 arg0）。
+    /// vtable 查 name → vm_closure。把 receiver 槽替换为该 closure（retainOwned，vtable 仍持母本），
+    /// 释放原 receiver，再 enterClosure + 边界 runLoop 跑到返回，结果压栈（替换 [closure,args] → result）。
+    fn doTraitMethod(self: *VM, tv: *value.TraitValue, name: []const u8, argc: u8, args_start: usize, loc: ast.SourceLocation) VMError!void {
+        const impl = tv.methods.get(name) orelse
+            return self.fail(loc, "no such method on trait value", error.TypeMismatch);
+        if (impl != .vm_closure) return self.fail(loc, "trait method is not callable", error.TypeMismatch);
+        const callee_idx = args_start - 1;
+        const receiver = self.stack.items[callee_idx];
+        // 替换 receiver 槽为方法闭包（retainOwned：vtable 持母本，调用结束帧 release 此槽）。
+        self.stack.items[callee_idx] = try self.retainOwned(impl);
+        receiver.releaseVM(self.allocator); // 释放 trait_value receiver（rc-1）
+        // 边界嵌套运行：enterClosure 建帧，runLoop 在帧弹回当前深度即返回。
+        const vc = impl.vm_closure;
+        const total = vc.bound_args.len + argc;
+        if (total != vc.arity) return self.fail(loc, "trait method called with wrong number of arguments", error.WrongArity);
+        const saved_depth = self.stop_depth;
+        try self.enterClosure(vc, callee_idx, argc, loc);
+        self.stop_depth = self.frames.items.len - 1;
+        const result = self.runLoop(self.program.?) catch |e| {
+            self.stop_depth = saved_depth;
+            return e;
+        };
+        self.stop_depth = saved_depth;
+        // enterClosure 的帧 RETURN 经 frameReturn 已 shrink 到 callee_idx 并释放槽。结果压回。
+        try self.push(result);
+    }
+
+    /// M4a：执行 OP_COMPOUND_LOCAL。slot 持 atomic_val → 原子 fetch<op>（add/sub/and/or 直接；
+    /// mul/div/mod 走 CAS 循环），不重写 slot；否则常规 slot_val arith rhs 写回 slot。
+    fn doCompoundLocal(self: *VM, frame: *CallFrame, slot: u16, arith_op: OpCode, loc: ast.SourceLocation) VMError!void {
+        const rhs = self.pop();
+        defer rhs.releaseVM(self.allocator);
+        const dst = frame.slot_base + slot;
+        const cur = self.stack.items[dst];
+        const target = if (cur == .cell_val) cur.cell_val.inner else cur;
+        if (target == .atomic_val) {
+            const av = target.atomic_val;
+            const operand = value.valueToAtomicRaw(rhs, av.type_tag);
+            switch (arith_op) {
+                .op_add => _ = av.fetchAdd(operand),
+                .op_sub => _ = av.fetchSub(operand),
+                .op_mul => _ = av.fetchMul(operand),
+                .op_bit_and => _ = av.fetchAnd(operand),
+                .op_bit_or => _ = av.fetchOr(operand),
+                .op_div, .op_mod => {
+                    // CAS 循环：原子读改写（div/mod 无专用原子指令）。
+                    while (true) {
+                        const current = av.data.load(.seq_cst);
+                        const cur_val = av.load();
+                        const result = try self.arith(arith_op, cur_val, rhs, loc);
+                        const new_raw = value.valueToAtomicRaw(result, av.type_tag);
+                        if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst) == null) break;
+                    }
+                },
+                else => return self.fail(loc, "unsupported atomic compound op", error.TypeMismatch),
+            }
+            return; // atomic 就地更新，slot 不变
+        }
+        // 非 atomic：常规读改写。
+        const result = try self.arith(arith_op, target, rhs, loc);
+        if (cur == .cell_val) {
+            cur.cell_val.inner.releaseVM(self.allocator);
+            cur.cell_val.inner = result;
+        } else {
+            cur.releaseVM(self.allocator);
+            self.stack.items[dst] = result;
+        }
+    }
+
+    /// M4c：执行 OP_COMPOUND_UPVALUE。upvalue 是 *Cell；cell.inner 持 atomic → 原子 fetch<op>（不重写 inner）；
+    /// 否则常规 inner arith rhs 写回 inner。镜像 doCompoundLocal 的 cell 分支，作用于捕获变量。
+    fn doCompoundUpvalue(self: *VM, frame: *CallFrame, idx: u16, arith_op: OpCode, loc: ast.SourceLocation) VMError!void {
+        const rhs = self.pop();
+        defer rhs.releaseVM(self.allocator);
+        const cell = frame.upvalues[idx].cell_val;
+        const target = cell.inner;
+        if (target == .atomic_val) {
+            const av = target.atomic_val;
+            const operand = value.valueToAtomicRaw(rhs, av.type_tag);
+            switch (arith_op) {
+                .op_add => _ = av.fetchAdd(operand),
+                .op_sub => _ = av.fetchSub(operand),
+                .op_mul => _ = av.fetchMul(operand),
+                .op_bit_and => _ = av.fetchAnd(operand),
+                .op_bit_or => _ = av.fetchOr(operand),
+                .op_div, .op_mod => {
+                    while (true) {
+                        const current = av.data.load(.seq_cst);
+                        const cur_val = av.load();
+                        const result = try self.arith(arith_op, cur_val, rhs, loc);
+                        const new_raw = value.valueToAtomicRaw(result, av.type_tag);
+                        if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst) == null) break;
+                    }
+                },
+                else => return self.fail(loc, "unsupported atomic compound op", error.TypeMismatch),
+            }
+            return; // atomic 就地更新，inner 不变
+        }
+        const result = try self.arith(arith_op, target, rhs, loc);
+        cell.inner.releaseVM(self.allocator);
+        cell.inner = result;
+    }
+
+    /// M4c：执行 OP_SPAWN。栈顶是 spawn body 编译成的零参 vm_closure（upvalues = 父帧捕获的 cell）。
+    /// 深拷各 upvalue 的当前值进 per-spawn arena（隔离堆），起 OS 线程跑子 VM，压 spawn_val 句柄。
+    /// 失败时仍压 handle（status=Failed，await 传播 panic），保证线性 Spawn<T> 语义不破。
+    fn doSpawn(self: *VM, loc: ast.SourceLocation) VMError!void {
+        const callee = self.pop();
+        defer callee.releaseVM(self.allocator);
+        if (callee != .vm_closure) return self.fail(loc, "spawn body must be a closure", error.TypeMismatch);
+        const vc = callee.vm_closure;
+        // io 仅用于填充 handle（VM await 路径用 std.Thread.Futex，不依赖 io）；未设则用线程化默认。
+        const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
+
+        // per-spawn arena（page_allocator 裸打底，与父/兄弟协程内存隔离）。
+        const arena = self.allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+        arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer {
+            arena.deinit();
+            self.allocator.destroy(arena);
+        }
+        const aalloc = arena.allocator();
+
+        // 深拷捕获快照：upvalue 是 *Cell，取 inner 当前值跨线程深拷进 arena。
+        const caps = aalloc.alloc(Value, vc.upvalues.len) catch return error.OutOfMemory;
+        for (vc.upvalues, 0..) |uv, i| {
+            const inner = uv.cell_val.inner;
+            caps[i] = inner.deepCopyAcross(aalloc) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return self.fail(loc, "spawn: captured value type not supported across threads", error.TypeMismatch),
+            };
+        }
+
+        // handle 用父 allocator（await 在父线程读，arena 释放后仍需存活直到 handle 释放）。
+        const handle = self.allocator.create(SpawnHandle) catch return error.OutOfMemory;
+        handle.* = SpawnHandle.init(self.allocator, io);
+        handle.status.store(.Running, .seq_cst);
+
+        const ctx = self.allocator.create(SpawnCtx) catch return error.OutOfMemory;
+        ctx.* = .{
+            .handle = handle,
+            .program = self.program.?,
+            .func = @ptrCast(@alignCast(vc.func)),
+            .captures = caps,
+            .arena = arena,
+            .io = io,
+        };
+        self.spawns.append(self.allocator, ctx) catch return error.OutOfMemory;
+
+        // 起 OS 线程（真并行；channel 阻塞点走 futex 回退）。
+        ctx.thread = std.Thread.spawn(.{}, spawnThreadEntry, .{ctx}) catch {
+            spawnFail(handle, "spawn: failed to create thread");
+            try self.push(Value{ .spawn_val = handle });
+            return;
+        };
+        try self.push(Value{ .spawn_val = handle });
+    }
+
+    /// M3d：执行 OP_FOR_NEXT。iter_slot 持 array/range/string，idx_slot 持索引（i64）。
+    /// 耗尽 → ip += exit_off（不压元素）；否则压当前元素（retainOwned）+ idx 自增。
+    fn doForNext(self: *VM, frame: *CallFrame, iter_slot: u16, idx_slot: u16, exit_off: i32, loc: ast.SourceLocation) VMError!void {
+        const iter = self.stack.items[frame.slot_base + iter_slot];
+        const idx_v = self.stack.items[frame.slot_base + idx_slot];
+        const idx: i64 = @intCast(idx_v.integer.value);
+        switch (iter) {
+            .array => |arr| {
+                if (idx >= arr.elements.len) {
+                    frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + exit_off);
+                    return;
+                }
+                try self.push(try self.retainOwned(arr.elements[@intCast(idx)]));
+            },
+            .range => |r| {
+                const cur = r.start + idx;
+                const past = if (r.inclusive) cur > r.end else cur >= r.end;
+                if (past) {
+                    frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + exit_off);
+                    return;
+                }
+                try self.push(Value{ .integer = .{ .value = @bitCast(@as(i128, cur)), .type_tag = .i64 } });
+            },
+            .string => |s| {
+                // 按码点迭代：idx 是码点序号，线性扫描到第 idx 个（字符串迭代通常短）。
+                const view = std.unicode.Utf8View.init(s) catch return self.fail(loc, "invalid UTF-8 string", error.TypeMismatch);
+                var it = view.iterator();
+                var ci: i64 = 0;
+                while (it.nextCodepoint()) |cp| : (ci += 1) {
+                    if (ci == idx) {
+                        try self.push(Value{ .char_val = @intCast(cp) });
+                        break;
+                    }
+                } else {
+                    frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + exit_off);
+                    return;
+                }
+            },
+            else => return self.fail(loc, "for: value is not iterable", error.TypeMismatch),
+        }
+        // idx++（仅在未耗尽时到达此处）。
+        self.stack.items[frame.slot_base + idx_slot] = Value{ .integer = .{ .value = @intCast(idx + 1), .type_tag = .i64 } };
     }
 
     /// 执行一次 OP_CALL_VALUE（M1b）：栈布局 [callee, arg0..]，callee 在 args 下方。默认柯里化：
@@ -725,7 +1661,7 @@ pub const VM = struct {
         const nvc = try self.allocator.create(value.VmClosure);
         nvc.* = .{ .func = vc.func, .arity = vc.arity, .upvalues = new_uv, .bound_args = new_bound, .rc = 1, .allocator = self.allocator };
         // 弹掉 [callee, args..]（callee release，args 所有权已转入 new_bound 不 release），压入新闭包。
-        self.stack.items[callee_idx].release(self.allocator);
+        self.stack.items[callee_idx].releaseVM(self.allocator);
         self.stack.shrinkRetainingCapacity(callee_idx);
         try self.push(Value{ .vm_closure = nvc });
     }
@@ -861,7 +1797,7 @@ test "vm arithmetic: (2 + 3) * 4 = 20" {
     var vm = VM.init(allocator);
     defer vm.deinit();
     const result = try runChunkForTest(&vm, allocator, chunk, 0);
-    defer result.release(allocator);
+    defer result.releaseVM(allocator);
     try std.testing.expectEqual(@as(u128, 20), result.integer.value);
 }
 
@@ -887,7 +1823,7 @@ test "vm local variable: slot store + load" {
     var vm = VM.init(allocator);
     defer vm.deinit();
     const result = try runChunkForTest(&vm, allocator, chunk, 1); // 1 个局部槽
-    defer result.release(allocator);
+    defer result.releaseVM(allocator);
     try std.testing.expectEqual(@as(u128, 15), result.integer.value);
 }
 
@@ -912,7 +1848,7 @@ test "vm jump: if false skips" {
     var vm = VM.init(allocator);
     defer vm.deinit();
     const result = try runChunkForTest(&vm, allocator, chunk, 0);
-    defer result.release(allocator);
+    defer result.releaseVM(allocator);
     try std.testing.expectEqual(@as(u128, 7), result.integer.value);
 }
 

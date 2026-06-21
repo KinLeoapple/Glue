@@ -231,6 +231,11 @@ pub const TraitValue = struct {
     /// data 载荷（receiver）；内联 trait 值为 null
     data: ?*Value = null,
     allocator: std.mem.Allocator,
+    /// M4d：VM 模式标记。true 表示由 VM 构造（方法为 vm_closure，纯 refcount）；releaseVM 归零时
+    /// 释放 methods（key + vm_closure）+ 箱体。eval 模式（false）由 GC 管理，releaseVM no-op。
+    vm_owned: bool = false,
+    /// VM 模式 ref_count。
+    rc: u32 = 1,
 };
 
 // ============================================================
@@ -249,6 +254,11 @@ pub const LazyValue = struct {
     /// 是否已求值（区分 cached 为 null_val 的合法缓存）
     forced: bool = false,
     allocator: std.mem.Allocator,
+    /// M4d：VM 模式 thunk —— 编译后的零参闭包（*VmClosure，不透明避免循环）。非空表示由 VM 构造，
+    /// force 走 VM 执行（而非 evalExpr）；此时 expr/env 是占位（VM 无 AST/Environment）。
+    vm_thunk: ?*anyopaque = null,
+    /// VM 模式 ref_count（eval 模式的 lazy 由 GC/lazy_values 列表管理，rc 不用）。
+    rc: u32 = 1,
 };
 
 // ============================================================
@@ -748,6 +758,112 @@ pub const Value = union(enum) {
         }
     }
 
+    /// 字节码 VM 专用释放（纯 refcount 模型）。仅 VM 调用；eval 永远走 release（对 throw_val/
+    /// error_val 是 no-op，因 eval 的 GC 疏散管理它们）。VM 无 GC，故对这两类用值语义深释放：
+    /// 释放壳 + 错误字符串，嵌套值递归 releaseVM（与 retainOwned 的 rc+1 平衡）。其它类型委托 release。
+    pub fn releaseVM(self: Value, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .error_val => |e| {
+                allocator.free(e.type_name);
+                allocator.free(e.message);
+            },
+            // M4a：atomic_val 内建原子 ref_count；归零销毁（协程间共享安全）。
+            .atomic_val => |av| {
+                if (av.unref()) allocator.destroy(av);
+            },
+            // M4b：channel/sender/receiver 内建原子 ref_count。channel 归零 deinit+destroy；
+            // sender/receiver 是轻包装（各持一个 channel ref + 自身分配）——unref channel 后销毁包装。
+            .channel_val => |ch| {
+                if (ch.unref()) {
+                    ch.deinit();
+                    allocator.destroy(ch);
+                }
+            },
+            .sender_val => |sv| {
+                if (sv.channel.unref()) {
+                    sv.channel.deinit();
+                    allocator.destroy(sv.channel);
+                }
+                allocator.destroy(sv);
+            },
+            .receiver_val => |rv| {
+                if (rv.channel.unref()) {
+                    rv.channel.deinit();
+                    allocator.destroy(rv.channel);
+                }
+                allocator.destroy(rv);
+            },
+            .throw_val => |tv| {
+                switch (tv.*) {
+                    .ok => |v| {
+                        v.*.releaseVM(allocator);
+                        allocator.destroy(v);
+                    },
+                    .err => |e| {
+                        allocator.free(e.type_name);
+                        allocator.free(e.message);
+                    },
+                }
+                allocator.destroy(tv);
+            },
+            // M4c：cell/vm_closure 必须递归 releaseVM（非 release）——否则嵌套的 atomic/channel
+            // 走 release no-op，ref_count 不递减而泄漏。归零才深释放内层。
+            .cell_val => |c| {
+                if (c.rc > 1) {
+                    c.rc -= 1;
+                    return;
+                }
+                c.inner.releaseVM(allocator);
+                allocator.destroy(c);
+            },
+            .vm_closure => |p| {
+                if (p.rc > 1) {
+                    p.rc -= 1;
+                    return;
+                }
+                for (p.upvalues) |uv| uv.releaseVM(allocator);
+                if (p.upvalues.len > 0) p.allocator.free(p.upvalues);
+                for (p.bound_args) |ba| ba.releaseVM(allocator);
+                if (p.bound_args.len > 0) p.allocator.free(p.bound_args);
+                p.allocator.destroy(p);
+            },
+            // M4d：VM 模式 lazy —— 归零才释放 thunk 闭包 + 缓存值 + 箱体。eval 模式 lazy（vm_thunk==null）
+            // 由 GC/lazy_values 列表管理，此处 no-op（不 destroy，避免双释放）。
+            .lazy_val => |lz| {
+                if (lz.vm_thunk == null) return; // eval 模式：交给 GC
+                if (lz.rc > 1) {
+                    lz.rc -= 1;
+                    return;
+                }
+                const thunk: *VmClosure = @ptrCast(@alignCast(lz.vm_thunk.?));
+                (Value{ .vm_closure = thunk }).releaseVM(allocator);
+                if (lz.cached) |c| c.releaseVM(allocator);
+                allocator.destroy(lz);
+            },
+            // M4d：VM 模式 trait 值 —— 归零才释放 methods（key + vm_closure）+ data + 箱体。
+            // eval 模式（vm_owned==false）由 GC 管理，no-op。
+            .trait_value => |tv| {
+                if (!tv.vm_owned) return;
+                if (tv.rc > 1) {
+                    tv.rc -= 1;
+                    return;
+                }
+                var it = tv.methods.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.*.releaseVM(allocator);
+                }
+                tv.methods.deinit();
+                if (tv.data) |d| {
+                    d.releaseVM(allocator);
+                    allocator.destroy(d);
+                }
+                allocator.destroy(tv);
+            },
+            else => self.release(allocator),
+        }
+    }
+
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .array => |arr| {
@@ -819,8 +935,7 @@ pub const Value = union(enum) {
     /// - Channel (channel_val/sender_val/receiver_val): 引用传递（ref count）✓
     /// - 函数/闭包 (closure): 此处浅拷贝，跨 Heap 时由 deepCloneValue 深拷贝环境
     /// - Atomic<T> (atomic_val): 浅拷贝（ref count）✓
-    pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {
-        return switch (self) {
+    pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {        return switch (self) {
             // §5.2 规则 1: 基础类型 — 值拷贝
             .integer => self,
             .float => self,
@@ -941,6 +1056,82 @@ pub const Value = union(enum) {
             },
             // Lazy<T>：thunk 引用语义共享（保留缓存一致性）
             .lazy_val => self,
+        };
+    }
+
+    /// M4c：跨 allocator / 跨线程**完整**深拷贝（VM spawn 用）。
+    /// 与 clone 不同：array/record 不走 retain（非原子 rc 跨线程不安全），而是按目标 allocator
+    /// 重新分配并递归深拷。基础类型值拷；string dupe；atomic/channel/sender/receiver **共享**
+    /// （内建原子 ref_count，跨线程安全）—— spawn 深拷捕获 + Atomic/Channel 浅拷语义。
+    /// 闭包/trait/lazy/iterator 暂不支持跨线程（返回 error.Unsupported），spawn body 捕获到这些则回退。
+    pub fn deepCopyAcross(self: Value, allocator: std.mem.Allocator) !Value {
+        return switch (self) {
+            .integer, .float, .boolean, .char_val, .null_val, .unit, .range => self,
+            .string => |s| Value{ .string = try allocator.dupe(u8, s) },
+            .array => |arr| {
+                const new_elems = try allocator.alloc(Value, arr.elements.len);
+                errdefer allocator.free(new_elems);
+                for (arr.elements, 0..) |e, i| new_elems[i] = try e.deepCopyAcross(allocator);
+                return try makeArray(allocator, new_elems, arr.fixed_size);
+            },
+            .record => |rec| {
+                const new_rec = try allocator.create(RecordValue);
+                var new_fields = std.StringHashMap(Value).init(allocator);
+                var it = rec.fields.iterator();
+                while (it.next()) |entry| {
+                    const key = try allocator.dupe(u8, entry.key_ptr.*);
+                    try new_fields.put(key, try entry.value_ptr.*.deepCopyAcross(allocator));
+                }
+                new_rec.* = RecordValue{
+                    .type_name = if (rec.type_name.len > 0) try allocator.dupe(u8, rec.type_name) else "",
+                    .fields = new_fields,
+                    .rc = 1,
+                };
+                return Value{ .record = new_rec };
+            },
+            // 并发原语：内建原子 ref_count，跨线程共享安全（spawn 浅拷语义）。
+            .atomic_val => |av| {
+                av.ref();
+                return Value{ .atomic_val = av };
+            },
+            .channel_val => |cv| {
+                cv.ref();
+                return Value{ .channel_val = cv };
+            },
+            .sender_val => |sv| {
+                sv.channel.ref();
+                const ns = try allocator.create(SenderValue);
+                ns.* = .{ .channel = sv.channel };
+                return Value{ .sender_val = ns };
+            },
+            .receiver_val => |rv| {
+                rv.channel.ref();
+                const nr = try allocator.create(ReceiverValue);
+                nr.* = .{ .channel = rv.channel };
+                return Value{ .receiver_val = nr };
+            },
+            .error_val => |e| Value{ .error_val = ErrorValue{
+                .type_name = try allocator.dupe(u8, e.type_name),
+                .message = try allocator.dupe(u8, e.message),
+                .is_error_subtype = e.is_error_subtype,
+            } },
+            .throw_val => |tv| {
+                const new_tv = try allocator.create(ThrowValue);
+                switch (tv.*) {
+                    .ok => |v| {
+                        const cp = try allocator.create(Value);
+                        cp.* = try v.deepCopyAcross(allocator);
+                        new_tv.* = ThrowValue{ .ok = cp };
+                    },
+                    .err => |e| new_tv.* = ThrowValue{ .err = ErrorValue{
+                        .type_name = try allocator.dupe(u8, e.type_name),
+                        .message = try allocator.dupe(u8, e.message),
+                        .is_error_subtype = e.is_error_subtype,
+                    } },
+                }
+                return Value{ .throw_val = new_tv };
+            },
+            else => error.Unsupported, // closure/trait/lazy/iterator 等暂不支持跨线程 spawn
         };
     }
 

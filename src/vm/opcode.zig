@@ -139,6 +139,81 @@ pub const OpCode = enum(u8) {
     /// OP_GET_NEWTYPE_INNER：弹 newtype 对象，retainOwned 其 inner 压栈，release 对象。
     op_get_newtype_inner,
 
+    // ── M3a：字符串插值 / 类型转换 ──
+    /// OP_INTERP <u16 n>：弹栈顶 n 段值（先压的是第一段，literal 文本段也压成 string 常量），
+    /// 依次 Value.format 拼接成新 string 压栈，各段 release。
+    op_interp,
+    /// OP_CAST <u16 type_name_const_idx>：弹值，按常量池字符串目标类型名转换（cast.zig），
+    /// 压结果。str→format；int/float 互转 clamp + type_tag；narrowing 溢出 → VM panic。
+    op_cast,
+
+    // ── M3b：字段赋值（控制流补全的复合赋值/break/continue/loop 均无新 opcode）──
+    /// OP_SET_FIELD <u16 name_const_idx>：栈布局 [obj, val]，弹 val 写入 obj 的命名字段
+    /// （record COW；不可变绑定/非 record → panic），弹 obj release，压 unit。
+    op_set_field,
+
+    // ── M3c：异常 / 传播 / 非空断言 / elvis ──
+    /// OP_JUMP_IF_NOT_NULL <i32 off>：peek 栈顶，非 null 则相对跳转（不弹）。供 `??` 短路。
+    op_jump_if_not_null,
+    /// OP_JUMP_IF_NULL <i32 off>：peek 栈顶，null 则相对跳转（不弹）。供 `?.` 安全访问短路。
+    op_jump_if_null,
+    /// OP_NON_NULL：peek 栈顶，null → VM panic（断言失败）；否则原样保留（T? 与 T 同表示）。供 `!`。
+    op_non_null,
+    /// OP_PROPAGATE：peek 栈顶。null → 提前返回 null；throw_val.err → 提前返回该 throw_val；
+    /// throw_val.ok → 弹并解包 inner 压栈（retainOwned）；其它 → 原样。供 `?`。
+    op_propagate,
+    /// OP_THROW：弹 throw 值（throw_val.err 或 error_val 自动包装），作为函数返回值
+    /// （等价 OP_RETURN，Glue 无 try/catch，throw 即返回 Throw<T,E> 的 Error 分支）。
+    op_throw,
+    /// OP_TEST_THROW <u8 want_ok>：弹栈顶 throw_val，want_ok=1 测 .ok / =0 测 .err，压 bool。
+    /// 供 match 的 Ok(v)/Error(e) 模式（配合 OP_JUMP_IF_FALSE）。
+    op_test_throw,
+    /// OP_GET_THROW_OK：弹 throw_val，retainOwned 其 .ok 内值压栈。供 match Ok(v) 字段绑定。
+    op_get_throw_ok,
+    /// OP_GET_THROW_ERR：弹 throw_val，把其 .err（ErrorValue）包成 error_val 压栈。供 match Error(e) 绑定。
+    op_get_throw_err,
+
+    // ── M3d：方法调用 + for 循环 ──
+    /// OP_CALL_METHOD <u16 name_const><u8 argc>：栈布局 [receiver, arg0..arg_{argc-1}]，
+    /// 按 receiver 类型查内建方法表（method.zig），弹 receiver + 实参，压结果。未知方法 → panic。
+    op_call_method,
+    /// OP_FOR_NEXT <u16 iter_slot><u16 idx_slot><i32 exit_off>：iter_slot 持 array/range/string，
+    /// idx_slot 持当前索引（i64）。若耗尽 → 跳 exit_off（不压元素）；否则压当前元素 + idx 自增。
+    op_for_next,
+    /// OP_MAKE_RANGE <u8 inclusive>：弹 [start, end]（两整数），压 range 值。供 `..`(0) / `..=`(1)。
+    op_make_range,
+
+    // ── M4a：atomic（运行时不变，VM 纯 refcount 用 AtomicValue 内建原子 ref_count）──
+    /// OP_MAKE_ATOMIC：弹栈顶值（int/float/bool/char），包成 AtomicValue（ref_count=1），压 atomic_val。供 `atomic e`。
+    op_make_atomic,
+    /// OP_GET_LOCAL_RAW <u16 slot>：同 OP_GET_LOCAL 但**不**对 atomic_val 透明 load
+    /// （仍透明解 cell）。供方法调用接收者（cas/swap 需原始 Atomic，不是 load 出的标量）。
+    op_get_local_raw,
+    /// OP_GET_UPVALUE_RAW <u16 idx>：同 OP_GET_UPVALUE 但不透明 load atomic_val。供方法调用接收者。
+    op_get_upvalue_raw,
+    /// OP_COMPOUND_LOCAL <u16 slot><u8 arith_op>：弹 rhs。slot 持 atomic_val → 原子 fetch<op>（不重写 slot）；
+    /// 否则 slot_val arith rhs 写回 slot。arith_op 为 OpCode 整数值（op_add/op_sub/...）。供 Atomic 透明复合赋值。
+    op_compound_local,
+    /// OP_COMPOUND_UPVALUE <u16 idx><u8 arith_op>：同 OP_COMPOUND_LOCAL 但作用于 upvalue cell（spawn body
+    /// 捕获的 Atomic 复合赋值必经此路——cell.inner 持 atomic 时原子 fetch<op>，不可退化为标量覆盖）。
+    op_compound_upvalue,
+
+    // ── M4c：spawn（运行时不变，VM 协程内起独立执行上下文）──
+    /// OP_SPAWN：弹栈顶 vm_closure（spawn body 编译成的零参闭包），深拷捕获快照进 per-spawn arena，
+    /// 起 OS 线程跑子 VM 执行 body，压 spawn_val 句柄。await 时取结果（深拷回父 allocator）。
+    op_spawn,
+    /// OP_MAKE_LAZY：弹栈顶 vm_closure（lazy expr 编译成的零参闭包），包成 lazy_val（vm_thunk 模式）压栈。
+    /// 首次透明读取（OP_GET_LOCAL/UPVALUE 见 lazy）时 force：跑 thunk 缓存结果。
+    op_make_lazy,
+    // ── M4d：select 多路复用（镜像 eval：poll 各 recv arm 取首个就绪；否则首个 timeout body；否则阻塞首 arm）──
+    /// OP_TRY_RECV：弹栈顶 channel/sender/receiver，非阻塞 tryRecv。就绪压 [value, true]；否则压 [unit, false]。
+    op_try_recv,
+    /// OP_RECV：弹栈顶 channel/sender/receiver，阻塞 recv。压 value（关闭则压 unit）。
+    op_recv,
+    /// OP_MAKE_TRAIT <u8 count>：弹栈顶 count 个 [name(string), closure] 对（顺序压栈，逆序弹），
+    /// 建 vm_owned trait_value（vtable: name->vm_closure，data=null）压栈。供内联 trait 值。
+    op_make_trait,
+
     pub fn name(self: OpCode) []const u8 {
         return @tagName(self);
     }
@@ -148,10 +223,16 @@ pub const OpCode = enum(u8) {
 pub const Native = enum(u8) {
     println,
     print,
+    ok,
+    err,
+    channel,
 
     pub fn fromName(s: []const u8) ?Native {
         if (std.mem.eql(u8, s, "println")) return .println;
         if (std.mem.eql(u8, s, "print")) return .print;
+        if (std.mem.eql(u8, s, "Ok")) return .ok;
+        if (std.mem.eql(u8, s, "Error")) return .err;
+        if (std.mem.eql(u8, s, "channel")) return .channel;
         return null;
     }
 };

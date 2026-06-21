@@ -49,6 +49,16 @@ const Upvalue = struct {
     is_local: bool,
 };
 
+/// 循环上下文（M3b）：break/continue 跳转回填。
+/// continue_target：continue 回跳的绝对地址（while=条件起点，loop=体起点）。
+/// breaks：本循环内所有 break 的 OP_JUMP 占位待回填到循环末尾。
+const LoopCtx = struct {
+    continue_target: usize,
+    breaks: std.ArrayListUnmanaged(usize) = .empty,
+    /// 进入循环时的 defer 作用域深度。break/continue 须重放循环体内（深度 ≥ 此值）的 defer。
+    defer_depth: usize = 0,
+};
+
 /// 顶层函数名 → func_idx 映射（编译期识别 call 的 callee）。arity 用于尾调用合格性判定。
 const FnEntry = struct {
     name: []const u8,
@@ -196,6 +206,11 @@ const FnCompiler = struct {
     enclosing: ?*FnCompiler = null,
     /// 本函数捕获的 upvalue（clox 静态解析；运行时 OP_CLOSURE 据此 box/共享 cell）。
     upvalues: std.ArrayListUnmanaged(Upvalue) = .empty,
+    /// 循环上下文栈（break/continue 跳转回填）。嵌套循环 push/pop。
+    loops: std.ArrayListUnmanaged(LoopCtx) = .empty,
+    /// defer 作用域栈（M3c-defer）：每个含 defer 的 block push 一层，存本层 defer 表达式（按出现顺序）。
+    /// block 退出（正常/return/throw）按 LIFO 重放。每层 defer 体内联发射（读当前 slot，见当前局部值）。
+    defer_scopes: std.ArrayListUnmanaged(std.ArrayListUnmanaged(*const Expr)) = .empty,
 
     fn init(allocator: std.mem.Allocator, module: *ModuleCompiler) FnCompiler {
         return .{ .chunk = Chunk.init(allocator), .allocator = allocator, .module = module };
@@ -204,6 +219,9 @@ const FnCompiler = struct {
     fn deinit(self: *FnCompiler) void {
         self.locals.deinit(self.allocator);
         self.upvalues.deinit(self.allocator);
+        self.loops.deinit(self.allocator);
+        for (self.defer_scopes.items) |*s| s.deinit(self.allocator);
+        self.defer_scopes.deinit(self.allocator);
         // 拥有 chunk：正常路径下 compileFunction 已把真 chunk 移走并置空 chunk（deinit 释放空壳）；
         // 错误路径（emit 中途 Unsupported/OOM）下释放半成品 chunk，防泄漏。
         self.chunk.deinit();
@@ -266,6 +284,30 @@ const FnCompiler = struct {
             .bool_literal => |lit| try self.chunk.writeOp(if (lit.value) .op_true else .op_false, loc),
             .null_literal => try self.chunk.writeOp(.op_null, loc),
             .unit_literal => try self.chunk.writeOp(.op_unit, loc),
+            // M3a：字符串字面量 → 常量池（dupe owned），OP_CONST。
+            .string_literal => |lit| {
+                const s = Value{ .string = try self.allocator.dupe(u8, lit.value) };
+                try self.emitConst(try self.chunk.addConstant(s), loc);
+            },
+            // M3a：字符字面量 → 常量池，OP_CONST。
+            .char_literal => |lit| {
+                try self.emitConst(try self.chunk.addConstant(Value{ .char_val = lit.value }), loc);
+            },
+            // M3a：字符串插值 → 各段（literal 文本压 string 常量、expression 求值）压栈 + OP_INTERP <n>。
+            .string_interpolation => |interp| {
+                if (interp.parts.len > 65535) return error.Unsupported;
+                for (interp.parts) |part| {
+                    switch (part) {
+                        .literal => |txt| {
+                            const s = Value{ .string = try self.allocator.dupe(u8, txt) };
+                            try self.emitConst(try self.chunk.addConstant(s), loc);
+                        },
+                        .expression => |e| try self.emitExpr(e),
+                    }
+                }
+                try self.chunk.writeOp(.op_interp, loc);
+                try self.chunk.writeU16(@intCast(interp.parts.len));
+            },
             .identifier => |id| {
                 if (self.resolveLocal(id.name)) |slot| {
                     try self.chunk.writeOp(.op_get_local, loc);
@@ -305,6 +347,39 @@ const FnCompiler = struct {
                 try self.chunk.writeOp(.op_get_field, loc);
                 try self.chunk.writeU16(name_const);
             },
+            // M3d：方法调用 obj.m(args) → 压 receiver + 实参 + OP_CALL_METHOD <name><argc>。
+            .method_call => |mc| {
+                if (mc.arguments.len > 255) return error.Unsupported;
+                // M4a：方法接收者若是 identifier，用 raw 读取（不透明 load atomic，cas/swap 需原始 Atomic）。
+                try self.emitMethodReceiver(mc.object);
+                for (mc.arguments) |arg| try self.emitExpr(arg);
+                const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, mc.method) });
+                try self.chunk.writeOp(.op_call_method, loc);
+                try self.chunk.writeU16(name_const);
+                try self.chunk.writeByte(@intCast(mc.arguments.len));
+            },
+            // M3d：安全字段访问 obj?.field —— receiver null 短路返回 null，否则 OP_GET_FIELD。
+            .safe_access => |sa| {
+                try self.emitExpr(sa.object);
+                // peek：null → 跳过字段访问（栈顶 null 即结果）；非 null → 弹后取字段。
+                const skip = try self.chunk.emitJump(.op_jump_if_null, loc);
+                const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, sa.field) });
+                try self.chunk.writeOp(.op_get_field, loc);
+                try self.chunk.writeU16(name_const);
+                self.chunk.patchJump(skip); // null 分支落点：栈顶仍是 null
+            },
+            // M3d：安全方法调用 obj?.m(args) —— receiver null 短路返回 null，否则正常方法调用。
+            .safe_method_call => |smc| {
+                if (smc.arguments.len > 255) return error.Unsupported;
+                try self.emitExpr(smc.object);
+                const skip = try self.chunk.emitJump(.op_jump_if_null, loc);
+                for (smc.arguments) |arg| try self.emitExpr(arg);
+                const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, smc.method) });
+                try self.chunk.writeOp(.op_call_method, loc);
+                try self.chunk.writeU16(name_const);
+                try self.chunk.writeByte(@intCast(smc.arguments.len));
+                self.chunk.patchJump(skip); // null 分支落点：栈顶仍是 null
+            },
             .match => |m| try self.emitMatch(m, loc),
             // M2b：数组字面量 [a, b, ...] → 各元素压栈 + OP_MAKE_ARRAY <n>。
             .array_literal => |al| {
@@ -342,6 +417,64 @@ const FnCompiler = struct {
                 try self.chunk.writeOp(.op_record_extend, loc);
                 try self.chunk.writeU16(shape_idx);
             },
+            // M3a：类型转换 Type(expr) → 求值 expr + OP_CAST <type_name 常量>。
+            .type_cast => |tc| {
+                const tname = switch (tc.target_type.*) {
+                    .named => |n| n.name,
+                    else => return error.Unsupported,
+                };
+                try self.emitExpr(tc.expr);
+                const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, tname) });
+                try self.chunk.writeOp(.op_cast, loc);
+                try self.chunk.writeU16(name_const);
+            },
+            // M3c：非空断言 expr! —— 求值 + OP_NON_NULL（null→panic，否则原样）。
+            .non_null_assert => |nna| {
+                try self.emitExpr(nna.expr);
+                try self.chunk.writeOp(.op_non_null, nna.location);
+            },
+            // M3c：传播 expr? —— 求值 + OP_PROPAGATE（null/err 提前返回，ok 解包）。
+            .propagate => |prop| {
+                // 早退在 OP_PROPAGATE 内部完成，绕过 defer 重放。有活跃 defer 时退回 eval（正确性优先）。
+                if (self.defer_scopes.items.len > 0) return error.Unsupported;
+                try self.emitExpr(prop.expr);
+                try self.chunk.writeOp(.op_propagate, prop.location);
+            },
+            // M3c-defer：赋值表达式（defer x = v 解析为此）。求值 v→写 local/upvalue→留 v 在栈顶。
+            .assignment_expr => |a| {
+                if (a.target.* != .identifier) return error.Unsupported;
+                const name = a.target.identifier.name;
+                try self.emitExpr(a.value); // 栈顶：v
+                try self.chunk.writeOp(.op_dup, a.location); // 复制 v（一份写回，一份作表达式值）
+                if (self.resolveLocal(name)) |slot| {
+                    try self.chunk.writeOp(.op_set_local, a.location);
+                    try self.chunk.writeU16(slot);
+                } else if (try self.resolveUpvalue(name)) |uv_idx| {
+                    try self.chunk.writeOp(.op_set_upvalue, a.location);
+                    try self.chunk.writeU16(uv_idx);
+                } else return error.Unsupported;
+            },
+            // M4a：atomic e —— 求值 e + OP_MAKE_ATOMIC（包成 AtomicValue）。
+            .atomic_expr => |ae| {
+                try self.emitExpr(ae.value);
+                try self.chunk.writeOp(.op_make_atomic, ae.location);
+            },
+            // M4c：spawn { body } —— body 编译成零参闭包（自动捕获），OP_SPAWN 起协程。
+            .spawn => |sp| {
+                try self.emitSpawn(sp);
+            },
+            // M4d：lazy expr —— expr 编译成零参闭包（自动捕获），OP_MAKE_LAZY 包成 thunk，透明 force。
+            .lazy => |lz| {
+                try self.emitLazy(lz);
+            },
+            // M4d：select 多路复用 —— 镜像 eval：poll 各 recv arm 取首个就绪；否则首 timeout body；否则阻塞首 arm。
+            .select => |sel| {
+                try self.emitSelect(sel, expr.select.location);
+            },
+            // M4d：inline trait 值 —— 各方法体编译成闭包，OP_MAKE_TRAIT 建 vtable。
+            .inline_trait_value => |itv| {
+                try self.emitInlineTrait(itv, expr.inline_trait_value.location);
+            },
             else => return error.Unsupported,
         }
     }
@@ -377,6 +510,188 @@ const FnCompiler = struct {
             try self.chunk.writeByte(if (uv.is_local) 1 else 0);
             try self.chunk.writeU16(uv.index);
         }
+    }
+
+    /// M4c：spawn { body } —— body 编译成零参 Function（自动捕获 enclosing 变量为 upvalue），
+    /// 发 OP_CLOSURE 在本帧实例化（捕获当前 local/upvalue），再 OP_SPAWN 弹闭包起协程压 spawn_val。
+    fn emitSpawn(self: *FnCompiler, sp: @TypeOf(@as(Expr, undefined).spawn)) CompileError!void {
+        var sub = FnCompiler.init(self.allocator, self.module);
+        sub.enclosing = self;
+        defer sub.deinit();
+        try sub.emitExpr(sp.body);
+        try sub.chunk.writeOp(.op_return, sp.location);
+        const f = Function{
+            .chunk = sub.chunk,
+            .arity = 0,
+            .slot_count = sub.slot_count,
+            .name = "<spawn>",
+        };
+        sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
+        const func_idx = try self.module.program.addFunction(f);
+        try self.chunk.writeOp(.op_closure, sp.location);
+        try self.chunk.writeU16(@intCast(func_idx));
+        try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
+        for (sub.upvalues.items) |uv| {
+            try self.chunk.writeByte(if (uv.is_local) 1 else 0);
+            try self.chunk.writeU16(uv.index);
+        }
+        try self.chunk.writeOp(.op_spawn, sp.location);
+    }
+
+    /// M4d：lazy expr —— expr 编译成零参 Function（自动捕获 enclosing 变量为 upvalue），
+    /// 发 OP_CLOSURE 实例化 + OP_MAKE_LAZY 包成 thunk。镜像 emitSpawn 结构。
+    fn emitLazy(self: *FnCompiler, lz: @TypeOf(@as(Expr, undefined).lazy)) CompileError!void {
+        var sub = FnCompiler.init(self.allocator, self.module);
+        sub.enclosing = self;
+        defer sub.deinit();
+        try sub.emitExpr(lz.expr);
+        try sub.chunk.writeOp(.op_return, lz.location);
+        const f = Function{
+            .chunk = sub.chunk,
+            .arity = 0,
+            .slot_count = sub.slot_count,
+            .name = "<lazy>",
+        };
+        sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
+        const func_idx = try self.module.program.addFunction(f);
+        try self.chunk.writeOp(.op_closure, lz.location);
+        try self.chunk.writeU16(@intCast(func_idx));
+        try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
+        for (sub.upvalues.items) |uv| {
+            try self.chunk.writeByte(if (uv.is_local) 1 else 0);
+            try self.chunk.writeU16(uv.index);
+        }
+        try self.chunk.writeOp(.op_make_lazy, lz.location);
+    }
+
+    /// M4d：从 recv arm 的 channel_expr 发射出 channel 操作数到栈顶。`ch.recv()` 取 object（ch），
+    /// 否则直接求值（期望 channel/sender/receiver）。镜像 eval 的 getChannelFromExpr。
+    fn emitChannelOperand(self: *FnCompiler, channel_expr: *Expr) CompileError!void {
+        if (channel_expr.* == .method_call) {
+            const mc = channel_expr.method_call;
+            if (std.mem.eql(u8, mc.method, "recv")) {
+                try self.emitExpr(mc.object);
+                return;
+            }
+        }
+        try self.emitExpr(channel_expr);
+    }
+
+    /// M4d：编译 select。镜像 eval 三段式：① poll 各 recv arm（非阻塞），首个就绪绑定+执行 body；
+    /// ② 无就绪则首个 timeout arm 的 body；③ 无 timeout 则阻塞 recv 首个 recv arm。结果留栈顶。
+    fn emitSelect(self: *FnCompiler, sel: @TypeOf(@as(Expr, undefined).select), loc: ast.SourceLocation) CompileError!void {
+        var end_jumps = std.ArrayListUnmanaged(usize).empty;
+        defer end_jumps.deinit(self.allocator);
+
+        // ① poll 各 recv arm。
+        for (sel.arms) |arm| {
+            switch (arm) {
+                .receive => |ra| {
+                    try self.emitChannelOperand(ra.channel_expr);
+                    try self.chunk.writeOp(.op_try_recv, ra.location); // → [value, flag]
+                    const not_ready = try self.chunk.emitJump(.op_jump_if_false, ra.location);
+                    // 就绪：弹 flag，绑定/丢弃 value，执行 body。
+                    try self.chunk.writeOp(.op_pop, ra.location); // 弹 flag
+                    const saved = self.locals.items.len;
+                    if (ra.binding) |bname| {
+                        const slot = try self.declareLocal(bname, false);
+                        try self.chunk.writeOp(.op_set_local, ra.location); // value → slot
+                        try self.chunk.writeU16(slot);
+                    } else {
+                        try self.chunk.writeOp(.op_pop, ra.location); // 丢弃 value
+                    }
+                    try self.emitExpr(ra.body); // → result
+                    self.locals.shrinkRetainingCapacity(saved);
+                    const ej = try self.chunk.emitJump(.op_jump, ra.location);
+                    try end_jumps.append(self.allocator, ej);
+                    // 未就绪落点：弹 flag + value，继续下一 arm。
+                    self.chunk.patchJump(not_ready);
+                    try self.chunk.writeOp(.op_pop, ra.location); // 弹 flag
+                    try self.chunk.writeOp(.op_pop, ra.location); // 弹 value(unit)
+                },
+                .timeout => {},
+            }
+        }
+
+        // ② 无就绪：首个 timeout arm 的 body。
+        var has_timeout = false;
+        for (sel.arms) |arm| {
+            if (arm == .timeout) {
+                // duration 表达式求值并丢弃（语义占位：VM 无定时器，超时即默认分支）。
+                try self.emitExpr(arm.timeout.duration);
+                try self.chunk.writeOp(.op_pop, arm.timeout.location);
+                try self.emitExpr(arm.timeout.body);
+                has_timeout = true;
+                break;
+            }
+        }
+
+        // ③ 无 timeout：阻塞 recv 首个 recv arm。
+        if (!has_timeout) {
+            var blocked = false;
+            for (sel.arms) |arm| {
+                if (arm == .receive) {
+                    const ra = arm.receive;
+                    try self.emitChannelOperand(ra.channel_expr);
+                    try self.chunk.writeOp(.op_recv, ra.location); // → value
+                    const saved = self.locals.items.len;
+                    if (ra.binding) |bname| {
+                        const slot = try self.declareLocal(bname, false);
+                        try self.chunk.writeOp(.op_set_local, ra.location);
+                        try self.chunk.writeU16(slot);
+                    } else {
+                        try self.chunk.writeOp(.op_pop, ra.location);
+                    }
+                    try self.emitExpr(ra.body);
+                    self.locals.shrinkRetainingCapacity(saved);
+                    blocked = true;
+                    break;
+                }
+            }
+            if (!blocked) try self.chunk.writeOp(.op_unit, loc); // 空 select：unit
+        }
+
+        // 收束所有就绪分支跳转。
+        for (end_jumps.items) |ej| self.chunk.patchJump(ej);
+    }
+
+    /// M4d：编译 inline trait 值 `trait { fun m(p) { ... } ... }`。每个有 body 的方法编成带 arity 的
+    /// Function（自动捕获 enclosing 变量为 upvalue），按 [name(const), OP_CLOSURE] 顺序压栈，
+    /// 末尾 OP_MAKE_TRAIT <count> 建 vtable。抽象方法（body==null）跳过。
+    fn emitInlineTrait(self: *FnCompiler, itv: @TypeOf(@as(Expr, undefined).inline_trait_value), loc: ast.SourceLocation) CompileError!void {
+        var count: u8 = 0;
+        for (itv.methods) |method| {
+            const body = method.body orelse continue;
+            if (method.params.len > 255) return error.Unsupported;
+            // 方法名常量。
+            const name_v = Value{ .string = try self.allocator.dupe(u8, method.name) };
+            try self.emitConst(try self.chunk.addConstant(name_v), method.location);
+            // 方法体编成带 arity 的 Function（params 占 slot 0..；自动捕获 enclosing）。
+            var sub = FnCompiler.init(self.allocator, self.module);
+            sub.enclosing = self;
+            defer sub.deinit();
+            for (method.params) |p| _ = try sub.declareLocal(p.name, p.is_var);
+            try sub.emitExpr(body);
+            try sub.chunk.writeOp(.op_return, method.location);
+            const f = Function{
+                .chunk = sub.chunk,
+                .arity = @intCast(method.params.len),
+                .slot_count = sub.slot_count,
+                .name = method.name,
+            };
+            sub.chunk = Chunk.init(self.allocator);
+            const func_idx = try self.module.program.addFunction(f);
+            try self.chunk.writeOp(.op_closure, method.location);
+            try self.chunk.writeU16(@intCast(func_idx));
+            try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
+            for (sub.upvalues.items) |uv| {
+                try self.chunk.writeByte(if (uv.is_local) 1 else 0);
+                try self.chunk.writeU16(uv.index);
+            }
+            count += 1;
+        }
+        try self.chunk.writeOp(.op_make_trait, loc);
+        try self.chunk.writeByte(count);
     }
 
     fn emitConst(self: *FnCompiler, k: u16, loc: ast.SourceLocation) CompileError!void {
@@ -419,10 +734,20 @@ const FnCompiler = struct {
             },
             .block => |blk| {
                 const saved = self.locals.items.len;
+                const has_defer = blockHasDefer(blk);
+                if (has_defer) try self.defer_scopes.append(self.allocator, .empty);
                 for (blk.statements) |stmt| try self.emitStmt(stmt);
                 if (blk.trailing_expr) |te| {
-                    try self.emitTail(te);
+                    if (has_defer) {
+                        // 有 defer：禁尾调用，求值结果 + 重放本层 defer + RETURN（结果在栈顶下方不受扰）。
+                        try self.emitExpr(te);
+                        try self.replayTopDeferScope(loc);
+                        try self.chunk.writeOp(.op_return, loc);
+                    } else {
+                        try self.emitTail(te);
+                    }
                 } else {
+                    if (has_defer) try self.replayTopDeferScope(loc);
                     try self.chunk.writeOp(.op_unit, loc);
                     try self.chunk.writeOp(.op_return, loc);
                 }
@@ -448,6 +773,24 @@ const FnCompiler = struct {
         try self.chunk.writeU16(entry.idx);
         try self.chunk.writeByte(@intCast(c.arguments.len));
         return true;
+    }
+
+    /// M4a：方法接收者求值 —— identifier（local/upvalue）用 raw 读取，避免对 atomic 透明 load
+    /// （cas/swap 等需原始 Atomic 值；标量方法 len/push 等 raw 与普通读取等价）。其它表达式照常。
+    fn emitMethodReceiver(self: *FnCompiler, obj: *Expr) CompileError!void {
+        if (obj.* == .identifier) {
+            const name = obj.identifier.name;
+            if (self.resolveLocal(name)) |slot| {
+                try self.chunk.writeOp(.op_get_local_raw, obj.identifier.location);
+                try self.chunk.writeU16(slot);
+                return;
+            } else if (try self.resolveUpvalue(name)) |uv| {
+                try self.chunk.writeOp(.op_get_upvalue_raw, obj.identifier.location);
+                try self.chunk.writeU16(uv);
+                return;
+            }
+        }
+        try self.emitExpr(obj);
     }
 
     fn emitCall(self: *FnCompiler, c: @TypeOf(@as(Expr, undefined).call), loc: ast.SourceLocation) CompileError!void {
@@ -517,6 +860,30 @@ const FnCompiler = struct {
                 self.chunk.patchJump(j);
                 return;
             },
+            // M3c：elvis `??` —— left 非 null 则用 left（短路），否则弹 left 求值 right。
+            .elvis => {
+                try self.emitExpr(bin.left);
+                const j = try self.chunk.emitJump(.op_jump_if_not_null, loc);
+                try self.chunk.writeOp(.op_pop, loc); // 弹 left(null)
+                try self.emitExpr(bin.right);
+                self.chunk.patchJump(j);
+                return;
+            },
+            // M3d：范围 `a..b` / `a..=b` —— 压 start,end + OP_MAKE_RANGE <inclusive>。
+            .range => {
+                try self.emitExpr(bin.left);
+                try self.emitExpr(bin.right);
+                try self.chunk.writeOp(.op_make_range, loc);
+                try self.chunk.writeByte(0);
+                return;
+            },
+            .range_inclusive => {
+                try self.emitExpr(bin.left);
+                try self.emitExpr(bin.right);
+                try self.chunk.writeOp(.op_make_range, loc);
+                try self.chunk.writeByte(1);
+                return;
+            },
             else => {},
         }
         try self.emitExpr(bin.left);
@@ -557,15 +924,70 @@ const FnCompiler = struct {
         self.chunk.patchJump(end_jump);
     }
 
+    /// 重放深度 ≥ from_depth 的所有活跃 defer 作用域（LIFO），不弹出（break/continue 用）。
+    fn replayDefersFrom(self: *FnCompiler, from_depth: usize, loc: ast.SourceLocation) CompileError!void {
+        var s: usize = self.defer_scopes.items.len;
+        while (s > from_depth) {
+            s -= 1;
+            const scope = self.defer_scopes.items[s];
+            var i: usize = scope.items.len;
+            while (i > 0) {
+                i -= 1;
+                try self.emitExpr(scope.items[i]);
+                try self.chunk.writeOp(.op_pop, loc);
+            }
+        }
+    }
+
     fn emitBlock(self: *FnCompiler, blk: @TypeOf(@as(Expr, undefined).block), loc: ast.SourceLocation) CompileError!void {
         const saved = self.locals.items.len;
+        const has_defer = blockHasDefer(blk);
+        if (has_defer) try self.defer_scopes.append(self.allocator, .empty);
         for (blk.statements) |stmt| try self.emitStmt(stmt);
         if (blk.trailing_expr) |te| {
             try self.emitExpr(te);
         } else {
             try self.chunk.writeOp(.op_unit, loc);
         }
+        // 正常退出：LIFO 重放本层 defer（结果在栈顶下方，defer 体 push+pop 平衡，不扰动结果）。
+        if (has_defer) try self.replayTopDeferScope(loc);
         self.locals.shrinkRetainingCapacity(saved);
+    }
+
+    /// block 是否（直接，非嵌套）含 defer 语句。嵌套 block 由各自 emitBlock 处理。
+    fn blockHasDefer(blk: @TypeOf(@as(Expr, undefined).block)) bool {
+        for (blk.statements) |stmt| {
+            if (stmt.* == .defer_stmt) return true;
+        }
+        return false;
+    }
+
+    /// 重放并弹出最顶层 defer 作用域（LIFO）。用于 block 正常退出。
+    fn replayTopDeferScope(self: *FnCompiler, loc: ast.SourceLocation) CompileError!void {
+        var scope = self.defer_scopes.pop().?;
+        defer scope.deinit(self.allocator);
+        var i: usize = scope.items.len;
+        while (i > 0) {
+            i -= 1;
+            try self.emitExpr(scope.items[i]);
+            try self.chunk.writeOp(.op_pop, loc); // defer 体结果丢弃
+        }
+    }
+
+    /// 重放所有活跃 defer 作用域（LIFO，从内到外），不弹出（提前退出 return/throw 用）。
+    /// 退出后栈顶返回值不受扰（defer 体 push+pop 平衡）。
+    fn replayAllDefers(self: *FnCompiler, loc: ast.SourceLocation) CompileError!void {
+        var s: usize = self.defer_scopes.items.len;
+        while (s > 0) {
+            s -= 1;
+            const scope = self.defer_scopes.items[s];
+            var i: usize = scope.items.len;
+            while (i > 0) {
+                i -= 1;
+                try self.emitExpr(scope.items[i]);
+                try self.chunk.writeOp(.op_pop, loc);
+            }
+        }
     }
 
     /// 编译 match（M2c：全模式）：scrutinee 存隐藏 slot；逐 arm 递归测试 + 绑定 + 体。
@@ -638,7 +1060,25 @@ const FnCompiler = struct {
                 try self.chunk.writeOp(.op_pop, loc); // 命中：弹 true
             },
             .constructor => |ctor| {
-                if (self.module.lookupNewtype(ctor.name)) |_| {
+                if (std.mem.eql(u8, ctor.name, "Ok") or std.mem.eql(u8, ctor.name, "Error")) {
+                    // M3c：Throw 的 Ok(v)/Error(e) 模式 —— OP_TEST_THROW + 解包绑定。
+                    if (ctor.patterns.len != 1) return error.Unsupported;
+                    const want_ok: u8 = if (ctor.name[0] == 'O') 1 else 0;
+                    try self.chunk.writeOp(.op_get_local, loc);
+                    try self.chunk.writeU16(scrut_slot);
+                    try self.chunk.writeOp(.op_test_throw, loc);
+                    try self.chunk.writeByte(want_ok);
+                    try fail_jumps.append(self.allocator, try self.chunk.emitJump(.op_jump_if_false, loc));
+                    try self.chunk.writeOp(.op_pop, loc); // 命中：弹 true
+                    // 解包内值（Ok→inner / Error→error_val）进临时 slot 递归。
+                    const tmp = try self.declareLocal("$thr", false);
+                    try self.chunk.writeOp(.op_get_local, loc);
+                    try self.chunk.writeU16(scrut_slot);
+                    try self.chunk.writeOp(if (want_ok == 1) .op_get_throw_ok else .op_get_throw_err, loc);
+                    try self.chunk.writeOp(.op_set_local, loc);
+                    try self.chunk.writeU16(tmp);
+                    try self.emitPatternMatch(ctor.patterns[0], tmp, fail_jumps, loc);
+                } else if (self.module.lookupNewtype(ctor.name)) |_| {
                     // newtype 构造器模式 Handle(p)：测 type_name + 解 inner 递归。
                     if (ctor.patterns.len != 1) return error.Unsupported;
                     try self.chunk.writeOp(.op_get_local, loc);
@@ -780,20 +1220,57 @@ const FnCompiler = struct {
             },
             .return_stmt => |r| {
                 if (r.value) |v| {
-                    try self.emitTail(v); // emitTail 自带 OP_RETURN / OP_TAIL_CALL
+                    if (self.defer_scopes.items.len > 0) {
+                        // 有活跃 defer：禁尾调用（defer 须在返回前跑），求值 + 重放所有 defer + RETURN。
+                        try self.emitExpr(v);
+                        try self.replayAllDefers(r.location);
+                        try self.chunk.writeOp(.op_return, r.location);
+                    } else {
+                        try self.emitTail(v); // emitTail 自带 OP_RETURN / OP_TAIL_CALL
+                    }
                 } else {
+                    if (self.defer_scopes.items.len > 0) try self.replayAllDefers(r.location);
                     try self.chunk.writeOp(.op_unit, r.location);
                     try self.chunk.writeOp(.op_return, r.location);
                 }
             },
             .while_stmt => |w| try self.emitWhile(w),
-            else => return error.Unsupported,
+            .loop_stmt => |l| try self.emitLoop(l),
+            .for_stmt => |f| try self.emitFor(f),
+            .break_stmt => |b| {
+                if (self.loops.items.len == 0) return error.Unsupported;
+                const lc = &self.loops.items[self.loops.items.len - 1];
+                try self.replayDefersFrom(lc.defer_depth, b.location); // 重放循环体内 defer
+                const j = try self.chunk.emitJump(.op_jump, b.location);
+                try lc.breaks.append(self.allocator, j);
+            },
+            .continue_stmt => |c| {
+                if (self.loops.items.len == 0) return error.Unsupported;
+                const lc = self.loops.items[self.loops.items.len - 1];
+                try self.replayDefersFrom(lc.defer_depth, c.location); // 重放循环体内 defer
+                try self.emitLoopBack(lc.continue_target, c.location);
+            },
+            .compound_assignment => |ca| try self.emitCompoundAssign(ca),
+            .field_assignment => |fa| try self.emitFieldAssign(fa),
+            // M3c-defer：登记 defer 体到当前作用域（emitBlock 已为含 defer 的 block push 了层）。
+            .defer_stmt => |def| {
+                if (self.defer_scopes.items.len == 0) return error.Unsupported; // 顶层 defer 暂不支持
+                try self.defer_scopes.items[self.defer_scopes.items.len - 1].append(self.allocator, def.expr);
+            },
+            // M3c：throw e —— 重放所有活跃 defer + 求值 e（throw_val.err / error_val）+ OP_THROW。
+            .throw_stmt => |t| {
+                try self.emitExpr(t.expr);
+                try self.replayAllDefers(t.location);
+                try self.chunk.writeOp(.op_throw, t.location);
+            },
         }
     }
 
     fn emitWhile(self: *FnCompiler, w: @TypeOf(@as(Stmt, undefined).while_stmt)) CompileError!void {
         // loop_start: cond; jump_if_false->end; pop cond(true); body; pop body; jump loop_start; end: pop cond(false)
         const loop_start = self.chunk.here();
+        // continue 回跳到条件重新求值处（loop_start）。
+        try self.loops.append(self.allocator, .{ .continue_target = loop_start, .defer_depth = self.defer_scopes.items.len });
         try self.emitExpr(w.condition);
         const exit_jump = try self.chunk.emitJump(.op_jump_if_false, w.location);
         try self.chunk.writeOp(.op_pop, w.location); // 弹 cond(true)
@@ -802,6 +1279,134 @@ const FnCompiler = struct {
         try self.emitLoopBack(loop_start, w.location);
         self.chunk.patchJump(exit_jump);
         try self.chunk.writeOp(.op_pop, w.location); // 弹 cond(false)
+        // break 跳到此处（cond 已弹，栈平衡）。
+        var lc = self.loops.pop().?;
+        defer lc.breaks.deinit(self.allocator);
+        for (lc.breaks.items) |j| self.chunk.patchJump(j);
+    }
+
+    /// for x in iter { body }（M3d）：iter 求值存隐藏 slot，index slot 初始化 0；
+    /// loop_start(=continue 目标): OP_FOR_NEXT iter,idx,exit → 耗尽跳 exit；否则压元素 → 绑 x → body → 弹 → 回跳。
+    /// iter 支持 array/range/string（VM doForNext 运行时分派）。复用 break/continue 机制。
+    fn emitFor(self: *FnCompiler, f: @TypeOf(@as(Stmt, undefined).for_stmt)) CompileError!void {
+        const loc = f.location;
+        const saved = self.locals.items.len;
+        // 隐藏 slot：iterable 值 + index（i64，初始 0）。
+        try self.emitExpr(f.iterable);
+        const iter_slot = try self.declareLocal("$iter", false);
+        try self.chunk.writeOp(.op_set_local, loc);
+        try self.chunk.writeU16(iter_slot);
+        const idx_const = try self.chunk.addConstant(Value{ .integer = .{ .value = 0, .type_tag = .i64 } });
+        try self.emitConst(idx_const, loc);
+        const idx_slot = try self.declareLocal("$idx", true);
+        try self.chunk.writeOp(.op_set_local, loc);
+        try self.chunk.writeU16(idx_slot);
+        // 循环变量 slot（每轮 OP_FOR_NEXT 压元素后 set_local 绑定）。
+        const var_slot = try self.declareLocal(f.name, true);
+
+        const loop_start = self.chunk.here();
+        try self.loops.append(self.allocator, .{ .continue_target = loop_start, .defer_depth = self.defer_scopes.items.len });
+        // OP_FOR_NEXT <iter_slot><idx_slot><i32 exit_off>：耗尽跳 exit；否则压当前元素 + idx++。
+        try self.chunk.writeOp(.op_for_next, loc);
+        try self.chunk.writeU16(iter_slot);
+        try self.chunk.writeU16(idx_slot);
+        const exit_at = self.chunk.here();
+        try self.chunk.writeI32(0); // 占位，循环末回填
+        // 绑定循环变量（弹元素写 var_slot）。
+        try self.chunk.writeOp(.op_set_local, loc);
+        try self.chunk.writeU16(var_slot);
+        // 循环体（值丢弃）。
+        try self.emitExpr(f.body);
+        try self.chunk.writeOp(.op_pop, loc);
+        try self.emitLoopBack(loop_start, loc);
+        // exit 落点：FOR_NEXT 耗尽跳到此（未压元素，栈平衡）。
+        self.chunk.patchJump(exit_at);
+        var lc = self.loops.pop().?;
+        defer lc.breaks.deinit(self.allocator);
+        for (lc.breaks.items) |j| self.chunk.patchJump(j);
+        self.locals.shrinkRetainingCapacity(saved);
+    }
+
+    /// loop { body }：无限循环，仅 break 退出。
+    /// loop_start: body; pop body; jump loop_start; end:(break 落点)
+    fn emitLoop(self: *FnCompiler, l: @TypeOf(@as(Stmt, undefined).loop_stmt)) CompileError!void {
+        const loop_start = self.chunk.here();
+        try self.loops.append(self.allocator, .{ .continue_target = loop_start, .defer_depth = self.defer_scopes.items.len });
+        try self.emitExpr(l.body);
+        try self.chunk.writeOp(.op_pop, l.location); // 弹 body 值
+        try self.emitLoopBack(loop_start, l.location);
+        var lc = self.loops.pop().?;
+        defer lc.breaks.deinit(self.allocator);
+        for (lc.breaks.items) |j| self.chunk.patchJump(j);
+    }
+
+    /// 复合赋值 x op= v → x = x op v（local/upvalue target）。Atomic 透明操作留 M4。
+    fn emitCompoundAssign(self: *FnCompiler, ca: @TypeOf(@as(Stmt, undefined).compound_assignment)) CompileError!void {
+        if (ca.target.* != .identifier) return error.Unsupported;
+        const name = ca.target.identifier.name;
+        const bin_op: ast.BinaryOp = switch (ca.op) {
+            .add_assign => .add,
+            .sub_assign => .sub,
+            .mul_assign => .mul,
+            .div_assign => .div,
+            .mod_assign => .mod,
+            .bit_and_assign => .bit_and,
+            .bit_or_assign => .bit_or,
+        };
+        const arith: OpCode = switch (bin_op) {
+            .add => .op_add, .sub => .op_sub, .mul => .op_mul, .div => .op_div, .mod => .op_mod,
+            .bit_and => .op_bit_and, .bit_or => .op_bit_or, else => unreachable,
+        };
+        if (self.resolveLocal(name)) |slot| {
+            // M4a：OP_COMPOUND_LOCAL 运行时分派 —— slot 持 atomic 则原子 fetch<op>，否则常规读改写。
+            try self.emitExpr(ca.value); // rhs
+            try self.chunk.writeOp(.op_compound_local, ca.location);
+            try self.chunk.writeU16(slot);
+            try self.chunk.writeByte(@intFromEnum(arith));
+        } else if (try self.resolveUpvalue(name)) |uv| {
+            // M4c：OP_COMPOUND_UPVALUE 运行时分派 —— cell.inner 持 atomic 则原子 fetch<op>，否则常规读改写。
+            // spawn body 捕获的 Atomic 复合赋值（counter += 1）必经此路，不可退化为标量覆盖。
+            try self.emitExpr(ca.value); // rhs
+            try self.chunk.writeOp(.op_compound_upvalue, ca.location);
+            try self.chunk.writeU16(uv);
+            try self.chunk.writeByte(@intFromEnum(arith));
+        } else return error.Unsupported;
+    }
+
+    /// 字段赋值 obj.f = v。镜像 eval：identifier 目标 COW 后写回绑定槽。
+    /// OP_SET_FIELD 栈效果 [record, val] → [new_record]（COW 产新 record 或原地改）。
+    /// identifier target：GET_LOCAL → val → SET_FIELD → SET_LOCAL 写回。
+    /// 其它（临时对象）：obj → val → SET_FIELD → POP 丢弃。
+    fn emitFieldAssign(self: *FnCompiler, fa: @TypeOf(@as(Stmt, undefined).field_assignment)) CompileError!void {
+        const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, fa.field) });
+        if (fa.object.* == .identifier) {
+            const oname = fa.object.identifier.name;
+            if (self.resolveLocal(oname)) |slot| {
+                try self.chunk.writeOp(.op_get_local, fa.location);
+                try self.chunk.writeU16(slot);
+                try self.emitExpr(fa.value);
+                try self.chunk.writeOp(.op_set_field, fa.location);
+                try self.chunk.writeU16(name_const);
+                try self.chunk.writeOp(.op_set_local, fa.location);
+                try self.chunk.writeU16(slot);
+                return;
+            } else if (try self.resolveUpvalue(oname)) |uv| {
+                try self.chunk.writeOp(.op_get_upvalue, fa.location);
+                try self.chunk.writeU16(uv);
+                try self.emitExpr(fa.value);
+                try self.chunk.writeOp(.op_set_field, fa.location);
+                try self.chunk.writeU16(name_const);
+                try self.chunk.writeOp(.op_set_upvalue, fa.location);
+                try self.chunk.writeU16(uv);
+                return;
+            }
+        }
+        // 临时对象：改动随即丢弃（与 eval else 分支语义一致）。
+        try self.emitExpr(fa.object);
+        try self.emitExpr(fa.value);
+        try self.chunk.writeOp(.op_set_field, fa.location);
+        try self.chunk.writeU16(name_const);
+        try self.chunk.writeOp(.op_pop, fa.location);
     }
 
     /// 回跳到 target（已知地址，在当前指令之前）的无条件 jump。
@@ -908,6 +1513,7 @@ const vm_mod = @import("vm.zig");
 
 test {
     std.testing.refAllDecls(@import("disasm.zig"));
+    std.testing.refAllDecls(@import("cast.zig"));
 }
 
 /// 测试 harness：source → 解析 → 编译 → 调用 entry_name(args)，返回结果整数值。
@@ -933,7 +1539,9 @@ fn compileAndCall(allocator: std.mem.Allocator, source: []const u8, entry_name: 
     var vm = vm_mod.VM.init(allocator);
     defer vm.deinit();
     const result = try vm.call(&mc.program, idx, args);
-    defer result.release(allocator);
+    defer result.releaseVM(allocator);
+    // bool 结果（contains/is_empty 等）coerce 为 1/0，便于测试统一用 u128 断言。
+    if (result == .boolean) return if (result.boolean) 1 else 0;
     return result.integer.value;
 }
 
@@ -1455,3 +2063,1302 @@ test "M2c match churn under leak-checked allocator" {
     try std.testing.expectEqual(@as(u128, @intCast(expected)), try compileAndCall(allocator, src, "run", &.{}));
 }
 
+
+// ── M3a：字符串插值 / 类型转换 ──
+
+/// 测试 harness（字符串结果版）：返回 entry 的字符串返回值（调用方持有，须 free）。
+fn compileAndCallStr(allocator: std.mem.Allocator, source: []const u8, entry_name: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var lex = lexer.Lexer.init(aa, source);
+    const tokens = try lex.tokenize();
+    var p = parser.Parser.init(aa, tokens);
+    var module = try p.parseModule("test");
+    var mc = ModuleCompiler.init(allocator);
+    defer mc.deinit();
+    defer mc.program.deinit();
+    try mc.compileModule(&module);
+    const idx = mc.lookupFn(entry_name) orelse return error.MissingFunction;
+    var vm = vm_mod.VM.init(allocator);
+    defer vm.deinit();
+    const result = try vm.call(&mc.program, idx, &.{});
+    defer result.releaseVM(allocator);
+    if (result != .string) return error.NotAString;
+    return allocator.dupe(u8, result.string);
+}
+
+test "M3a string literal returned" {
+    const allocator = std.testing.allocator;
+    const s = try compileAndCallStr(allocator, "fun run(): str { \"hello\" }", "run");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("hello", s);
+}
+
+test "M3a string interpolation: int + text" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): str { val x: i64 = 42i64; "value is {x}!" }
+    ;
+    const s = try compileAndCallStr(allocator, src, "run");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("value is 42!", s);
+}
+
+test "M3a string interpolation: multiple exprs" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): str { val a: i64 = 3i64; val b: i64 = 4i64; "{a} + {b} = {a + b}" }
+    ;
+    const s = try compileAndCallStr(allocator, src, "run");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("3 + 4 = 7", s);
+}
+
+test "M3a type_cast int widening i32->i64 (value preserved)" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val x: i32 = 100i32; i64(x) }
+    ;
+    try std.testing.expectEqual(@as(u128, 100), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3a type_cast float->int truncates" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val x: f64 = 3.9f64; i64(x) }
+    ;
+    try std.testing.expectEqual(@as(u128, 3), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3a type_cast int->str" {
+    const allocator = std.testing.allocator;
+    const s = try compileAndCallStr(allocator, "fun run(): str { str(255i64) }", "run");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("255", s);
+}
+
+test "M3a type_cast narrowing overflow panics" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): u8 { val x: i64 = 300i64; u8(x) }
+    ;
+    try std.testing.expectError(error.ArithmeticOverflow, compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3a string interpolation churn under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var i: i64 = 0i64
+        \\    while i < 1000i64 {
+        \\        val s: str = "iter {i} of many"
+        \\        i = i + 1i64
+        \\    }
+        \\    i
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 1000), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M3b：break/continue/loop + 复合赋值 + 字段赋值 ──
+
+test "M3b while + break: stop at 5" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var i: i64 = 0i64
+        \\    while i < 100i64 {
+        \\        if (i == 5i64) { break }
+        \\        i = i + 1i64
+        \\    }
+        \\    i
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3b while + continue: sum evens 0..9 = 20" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var i: i64 = 0i64
+        \\    var sum: i64 = 0i64
+        \\    while i < 10i64 {
+        \\        i = i + 1i64
+        \\        if ((i - 1i64) % 2i64 == 1i64) { continue }
+        \\        sum = sum + (i - 1i64)
+        \\    }
+        \\    sum
+        \\}
+    ;
+    // i-1 over 0..9; add when even → 0+2+4+6+8 = 20
+    try std.testing.expectEqual(@as(u128, 20), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3b loop + break: count to 7" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var i: i64 = 0i64
+        \\    loop {
+        \\        i = i + 1i64
+        \\        if (i == 7i64) { break }
+        \\    }
+        \\    i
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3b nested loops with break" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var total: i64 = 0i64
+        \\    var i: i64 = 0i64
+        \\    while i < 5i64 {
+        \\        var j: i64 = 0i64
+        \\        while j < 100i64 {
+        \\            if (j == 3i64) { break }
+        \\            total = total + 1i64
+        \\            j = j + 1i64
+        \\        }
+        \\        i = i + 1i64
+        \\    }
+        \\    total
+        \\}
+    ;
+    // inner adds 3 per outer iter (j=0,1,2), 5 outer → 15
+    try std.testing.expectEqual(@as(u128, 15), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3b compound assign += -= *= %=" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var x: i64 = 10i64
+        \\    x += 5i64
+        \\    x -= 2i64
+        \\    x *= 3i64
+        \\    x %= 7i64
+        \\    x
+        \\}
+    ;
+    // ((10+5-2)*3) % 7 = 39 % 7 = 4
+    try std.testing.expectEqual(@as(u128, 4), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3b field assignment on record" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var p = (x: 1i64, y: 2i64)
+        \\    p.x = 100i64
+        \\    p.x + p.y
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 102), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3b field assignment value semantics (COW)" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var a = (x: 1i64, y: 2i64)
+        \\    var b = a
+        \\    b.x = 99i64
+        \\    a.x + b.x
+        \\}
+    ;
+    // a.x stays 1 (COW), b.x = 99 → 100
+    try std.testing.expectEqual(@as(u128, 100), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3b loop churn under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var i: i64 = 0i64
+        \\    var hits: i64 = 0i64
+        \\    while i < 1000i64 {
+        \\        var p = (x: i, y: i)
+        \\        p.x = i + 1i64
+        \\        hits += p.x
+        \\        i += 1i64
+        \\    }
+        \\    hits
+        \\}
+    ;
+    var expected: i128 = 0;
+    var i: i128 = 0;
+    while (i < 1000) : (i += 1) expected += i + 1;
+    try std.testing.expectEqual(@as(u128, @intCast(expected)), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M3c：异常 / 传播 / 非空断言 / elvis ──
+
+test "M3c elvis ?? on null/non-null" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val a: i64? = null; a ?? 42i64 }
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c elvis ?? non-null uses left" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val a: i64? = 7i64; a ?? 42i64 }
+    ;
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c elvis chain right-assoc" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val a: i64? = null; val b: i64? = null; a ?? b ?? 9i64 }
+    ;
+    try std.testing.expectEqual(@as(u128, 9), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c non-null assert on non-null" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val a: i64? = 5i64; a! }
+    ;
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c non-null assert on null panics" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val a: i64? = null; a! }
+    ;
+    try std.testing.expectError(error.NonNullAssertFailed, compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c Ok + match unwraps value" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun mk(): Throw<i64, Error> { Ok(99i64) }
+        \\fun run(): i64 { match mk() { Ok(v) => v, Error(e) => -1i64 } }
+    ;
+    try std.testing.expectEqual(@as(u128, 99), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c throw + match Error branch" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun mk(): Throw<i64, Error> { throw Error("boom") }
+        \\fun run(): i64 { match mk() { Ok(v) => v, Error(e) => -1i64 } }
+    ;
+    // -1 as u64 bit pattern
+    const r = try compileAndCall(allocator, src, "run", &.{});
+    try std.testing.expectEqual(@as(i64, -1), @as(i64, @bitCast(@as(u64, @truncate(r)))));
+}
+
+test "M3c conditional throw: Ok path" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun checkedDiv(a: i64, b: i64): Throw<i64, Error> {
+        \\    if (b == 0i64) { throw Error("div by zero") }
+        \\    Ok(a / b)
+        \\}
+        \\fun run(): i64 { match checkedDiv(20i64, 4i64) { Ok(v) => v, Error(e) => -1i64 } }
+    ;
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c propagate ? chains through Ok, short-circuits Error" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun checkedDiv(a: i64, b: i64): Throw<i64, Error> {
+        \\    if (b == 0i64) { throw Error("div by zero") }
+        \\    Ok(a / b)
+        \\}
+        \\fun chain(a: i64, b: i64, c: i64): Throw<i64, Error> {
+        \\    val r1 = checkedDiv(a, b)?
+        \\    val r2 = checkedDiv(r1, c)?
+        \\    Ok(r2)
+        \\}
+        \\fun run(): i64 { match chain(100i64, 5i64, 2i64) { Ok(v) => v, Error(e) => -1i64 } }
+    ;
+    // 100/5=20, 20/2=10
+    try std.testing.expectEqual(@as(u128, 10), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c propagate ? short-circuits on first Error" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun checkedDiv(a: i64, b: i64): Throw<i64, Error> {
+        \\    if (b == 0i64) { throw Error("div by zero") }
+        \\    Ok(a / b)
+        \\}
+        \\fun chain(a: i64, b: i64, c: i64): Throw<i64, Error> {
+        \\    val r1 = checkedDiv(a, b)?
+        \\    val r2 = checkedDiv(r1, c)?
+        \\    Ok(r2)
+        \\}
+        \\fun run(): i64 { match chain(100i64, 0i64, 2i64) { Ok(v) => v, Error(e) => -1i64 } }
+    ;
+    const r = try compileAndCall(allocator, src, "run", &.{});
+    try std.testing.expectEqual(@as(i64, -1), @as(i64, @bitCast(@as(u64, @truncate(r)))));
+}
+
+test "M3c match Error binds message via field access" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun mk(): Throw<i64, Error> { throw Error("not found") }
+        \\fun run(): str { match mk() { Ok(v) => "ok", Error(e) => e.message } }
+    ;
+    const s = try compileAndCallStr(allocator, src, "run");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("not found", s);
+}
+
+test "M3c Ok/Error churn under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun checkedDiv(a: i64, b: i64): Throw<i64, Error> {
+        \\    if (b == 0i64) { throw Error("div by zero") }
+        \\    Ok(a / b)
+        \\}
+        \\fun run(): i64 {
+        \\    var i: i64 = 1i64
+        \\    var sum: i64 = 0i64
+        \\    while i < 1000i64 {
+        \\        val r = match checkedDiv(1000i64, i) { Ok(v) => v, Error(e) => 0i64 }
+        \\        sum = sum + r
+        \\        i = i + 1i64
+        \\    }
+        \\    sum
+        \\}
+    ;
+    var expected: i128 = 0;
+    var i: i128 = 1;
+    while (i < 1000) : (i += 1) expected += @divTrunc(1000, i);
+    try std.testing.expectEqual(@as(u128, @intCast(expected)), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M3c-defer：block 作用域 / LIFO / 见当前值 / return / throw / 循环 ──
+
+test "M3c-defer runs on normal block exit" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var result: i64 = 0i64
+        \\    {
+        \\        defer result = result + 10i64
+        \\        result = 5i64
+        \\    }
+        \\    result
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 15), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c-defer sees current value at exit (not snapshot)" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var x: i64 = 1i64
+        \\    var seen: i64 = 0i64
+        \\    {
+        \\        defer seen = x
+        \\        x = 2i64
+        \\    }
+        \\    seen
+        \\}
+    ;
+    // defer 读 x 在退出时 = 2（非登记时的 1）
+    try std.testing.expectEqual(@as(u128, 2), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c-defer LIFO order" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var r: i64 = 0i64
+        \\    {
+        \\        defer r = r * 2i64
+        \\        defer r = r + 3i64
+        \\    }
+        \\    r
+        \\}
+    ;
+    // LIFO：先 r=0+3=3，再 r=3*2=6
+    try std.testing.expectEqual(@as(u128, 6), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c-defer runs before function return" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var flag: i64 = 0i64
+        \\    defer flag = 100i64
+        \\    return flag
+        \\}
+    ;
+    // return 求值 flag(0) 后跑 defer（flag=100），返回的是已求值的 0
+    try std.testing.expectEqual(@as(u128, 0), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c-defer function-body scope normal exit" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var r: i64 = 1i64
+        \\    defer r = r + 41i64
+        \\    r = 0i64
+        \\    r
+        \\}
+    ;
+    // trailing expr r 求值=0，defer 跑（r=41），但返回值是已求值的 0
+    try std.testing.expectEqual(@as(u128, 0), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c-defer runs on throw path" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun mk(flag_holder: i64): Throw<i64, Error> {
+        \\    var local: i64 = flag_holder
+        \\    defer local = 99i64
+        \\    throw Error("x")
+        \\}
+        \\fun run(): i64 { match mk(0i64) { Ok(v) => v, Error(e) => 7i64 } }
+    ;
+    // defer 在 throw 前执行（局部副作用不可观测于外，但验证编译/运行不崩、throw 仍生效）
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c-defer in loop body runs each iteration" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var total: i64 = 0i64
+        \\    var i: i64 = 0i64
+        \\    while i < 5i64 {
+        \\        defer total = total + 1i64
+        \\        i = i + 1i64
+        \\    }
+        \\    total
+        \\}
+    ;
+    // 每轮 block 退出跑一次 defer → total=5
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3c-defer churn under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var sum: i64 = 0i64
+        \\    var i: i64 = 0i64
+        \\    while i < 1000i64 {
+        \\        {
+        \\            defer sum = sum + 2i64
+        \\            defer sum = sum + 1i64
+        \\        }
+        \\        i = i + 1i64
+        \\    }
+        \\    sum
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 3000), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M3d：方法调用 + safe access + for 循环 ──
+
+test "M3d array len method" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val a = [10i64, 20i64, 30i64]; a.len() }
+    ;
+    try std.testing.expectEqual(@as(u128, 3), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d string len counts codepoints" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val s = "héllo"; s.len() }
+    ;
+    // h é l l o = 5 码点
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d array push returns new array" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var a = [1i64, 2i64]
+        \\    a = a.push(3i64)
+        \\    a.len()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 3), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d array contains" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): bool { val a = [1i64, 2i64, 3i64]; a.contains(2i64) }
+    ;
+    try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d array is_empty false" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): bool { val a = [1i64]; a.is_empty() }
+    ;
+    try std.testing.expectEqual(@as(u128, 0), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d chained methods drop_last then len" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val a = [1i64, 2i64, 3i64, 4i64]; a.drop_last().len() }
+    ;
+    try std.testing.expectEqual(@as(u128, 3), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d unknown method panics" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val a = [1i64]; a.bogus() }
+    ;
+    try std.testing.expectError(error.TypeMismatch, compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d for-in-array sums elements" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var sum: i64 = 0i64
+        \\    for x in [10i64, 20i64, 30i64] { sum = sum + x }
+        \\    sum
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 60), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d for-in-range exclusive" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var sum: i64 = 0i64
+        \\    for i in 0i64..5i64 { sum = sum + i }
+        \\    sum
+        \\}
+    ;
+    // 0+1+2+3+4 = 10
+    try std.testing.expectEqual(@as(u128, 10), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d for-in-range inclusive" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var sum: i64 = 0i64
+        \\    for i in 1i64..=5i64 { sum = sum + i }
+        \\    sum
+        \\}
+    ;
+    // 1+2+3+4+5 = 15
+    try std.testing.expectEqual(@as(u128, 15), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d for with break" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var sum: i64 = 0i64
+        \\    for i in 0i64..100i64 {
+        \\        if (i == 5i64) { break }
+        \\        sum = sum + i
+        \\    }
+        \\    sum
+        \\}
+    ;
+    // 0+1+2+3+4 = 10
+    try std.testing.expectEqual(@as(u128, 10), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d for with continue" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var sum: i64 = 0i64
+        \\    for i in 0i64..6i64 {
+        \\        if (i % 2i64 == 0i64) { continue }
+        \\        sum = sum + i
+        \\    }
+        \\    sum
+        \\}
+    ;
+    // 1+3+5 = 9
+    try std.testing.expectEqual(@as(u128, 9), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d nested for loops" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var count: i64 = 0i64
+        \\    for i in 0i64..3i64 {
+        \\        for j in 0i64..3i64 { count = count + 1i64 }
+        \\    }
+        \\    count
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 9), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d safe access on non-null record" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 { val p = (x: 7i64, y: 2i64); p?.x }
+    ;
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d safe access on null short-circuits" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val p: i64? = null
+        \\    val r = p?.x ?? 99i64
+        \\    r
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 99), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M3d for-in-array churn under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var total: i64 = 0i64
+        \\    var n: i64 = 0i64
+        \\    while n < 500i64 {
+        \\        for x in [1i64, 2i64, 3i64] { total = total + x }
+        \\        n = n + 1i64
+        \\    }
+        \\    total
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 3000), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M4a：atomic（构造 + 透明读取 + 复合赋值 + cas/swap）──
+
+test "M4a atomic read transparency loads scalar" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val c = atomic 42i64
+        \\    c
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4a atomic compound add in place" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var c = atomic 0i64
+        \\    c += 5i64
+        \\    c += 3i64
+        \\    c
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 8), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4a atomic compound sub" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var c = atomic 100i64
+        \\    c -= 30i64
+        \\    c
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 70), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4a atomic cas success" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): bool {
+        \\    val c = atomic 10i64
+        \\    c.cas(10i64, 20i64)
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4a atomic cas failure" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): bool {
+        \\    val c = atomic 10i64
+        \\    c.cas(99i64, 20i64)
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 0), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4a atomic swap returns old value" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val c = atomic 7i64
+        \\    c.swap(99i64)
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4a atomic cas then read new value" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var c = atomic 10i64
+        \\    val ok = c.cas(10i64, 55i64)
+        \\    c
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 55), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4a atomic in loop churn under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var c = atomic 0i64
+        \\    var n: i64 = 0i64
+        \\    while n < 1000i64 {
+        \\        c += 1i64
+        \\        n = n + 1i64
+        \\    }
+        \\    c
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 1000), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M4b：channel（构造 + send/recv/close + sender/receiver 方向类型）──
+
+test "M4b buffered channel send then recv" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(4)
+        \\    ch.send(42i64)
+        \\    ch.recv()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4b channel FIFO order" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(4)
+        \\    ch.send(1i64)
+        \\    ch.send(2i64)
+        \\    ch.send(3i64)
+        \\    val a = ch.recv()
+        \\    val b = ch.recv()
+        \\    val c = ch.recv()
+        \\    a * 100i64 + b * 10i64 + c
+        \\}
+    ;
+    // 1,2,3 → 123
+    try std.testing.expectEqual(@as(u128, 123), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4b recv on closed empty channel returns null" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(2)
+        \\    ch.sender.close()
+        \\    val v = ch.recv() ?? -1i64
+        \\    v
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, @bitCast(@as(i128, -1))), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4b sender.send and receiver.recv" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(4)
+        \\    val tx = ch.sender
+        \\    val rx = ch.receiver
+        \\    tx.send(7i64)
+        \\    rx.recv()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4b drain buffered channel after close" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(4)
+        \\    ch.send(10i64)
+        \\    ch.send(20i64)
+        \\    ch.sender.close()
+        \\    val a = ch.recv()
+        \\    val b = ch.recv()
+        \\    a + b
+        \\}
+    ;
+    // 关闭后仍可排空缓冲区：10+20 = 30
+    try std.testing.expectEqual(@as(u128, 30), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4b string channel under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(4)
+        \\    ch.send("hello")
+        \\    val s = ch.recv()
+        \\    s.len()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4b channel churn does not leak" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var total: i64 = 0i64
+        \\    var n: i64 = 0i64
+        \\    while n < 500i64 {
+        \\        val ch = channel(2)
+        \\        ch.send(n)
+        \\        total = total + ch.recv()
+        \\        n = n + 1i64
+        \\    }
+        \\    total
+        \\}
+    ;
+    // 0+1+...+499 = 124750
+    try std.testing.expectEqual(@as(u128, 124750), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4b dropped channel with unconsumed buffer does not leak" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(4)
+        \\    ch.send(1i64)
+        \\    ch.send(2i64)
+        \\    99i64
+        \\}
+    ;
+    // ch 离开作用域时缓冲区仍有 2 个未消费元素 —— releaseVM → deinit 须清理无泄漏。
+    try std.testing.expectEqual(@as(u128, 99), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M4c：spawn（协程隔离 + await + 捕获快照 + atomic 共享）──
+
+test "M4c spawn pure compute and await" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val s = spawn { 10i64 * 10i64 }
+        \\    s.await()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 100), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4c multiple independent spawns" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val s1 = spawn { 10i64 * 10i64 }
+        \\    val s2 = spawn { 20i64 + 5i64 }
+        \\    val s3 = spawn { 100i64 - 1i64 }
+        \\    s1.await() + s2.await() + s3.await()
+        \\}
+    ;
+    // 100 + 25 + 99 = 224
+    try std.testing.expectEqual(@as(u128, 224), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4c spawn captures local by deep-copy snapshot" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val base: i64 = 7i64
+        \\    val s = spawn { base * 6i64 }
+        \\    s.await()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4c spawn shares atomic across threads" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val counter = atomic 0i64
+        \\    val s1 = spawn { counter.swap(counter.swap(0i64)) }
+        \\    s1.await()
+        \\    counter += 100i64
+        \\    val s2 = spawn { counter.cas(100i64, 200i64) }
+        \\    s2.await()
+        \\    counter
+        \\}
+    ;
+    // s1 no-op churn; counter += 100 → 100; s2 cas(100→200); 读 200
+    try std.testing.expectEqual(@as(u128, 200), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4c spawn atomic concurrent increment" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun worker(c: i64): i64 {
+        \\    var n: i64 = 0i64
+        \\    n
+        \\}
+        \\fun run(): i64 {
+        \\    val counter = atomic 0i64
+        \\    val s1 = spawn {
+        \\        var i: i64 = 0i64
+        \\        while i < 1000i64 { counter += 1i64; i = i + 1i64 }
+        \\        0i64
+        \\    }
+        \\    val s2 = spawn {
+        \\        var j: i64 = 0i64
+        \\        while j < 1000i64 { counter += 1i64; j = j + 1i64 }
+        \\        0i64
+        \\    }
+        \\    s1.await()
+        \\    s2.await()
+        \\    counter
+        \\}
+    ;
+    // 两协程各 +1000，原子操作无丢失 → 2000
+    try std.testing.expectEqual(@as(u128, 2000), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4c spawn string result deep-copied across threads" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val s = spawn { "hello world" }
+        \\    val r = s.await()
+        \\    r.len()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 11), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4c spawn churn under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var total: i64 = 0i64
+        \\    var n: i64 = 0i64
+        \\    while n < 50i64 {
+        \\        val s = spawn { 3i64 }
+        \\        total = total + s.await()
+        \\        n = n + 1i64
+        \\    }
+        \\    total
+        \\}
+    ;
+    // 50 * 3 = 150
+    try std.testing.expectEqual(@as(u128, 150), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4c spawn through channel handoff" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(1)
+        \\    val tx = ch.sender
+        \\    val producer = spawn {
+        \\        tx.send(77i64)
+        \\        0i64
+        \\    }
+        \\    val v = ch.recv()
+        \\    producer.await()
+        \\    v
+        \\}
+    ;
+    // 真并行：producer 线程 send，主线程 recv → 77
+    try std.testing.expectEqual(@as(u128, 77), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M4d：lazy（透明 force + 缓存）──
+
+test "M4d lazy forces on read" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val x = lazy { 6i64 * 7i64 }
+        \\    x
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d lazy caches — thunk runs once" {
+    const allocator = std.testing.allocator;
+    // counter 捕获进 thunk；每次 force +1。读两次 x，若缓存则 counter 只 +1。
+    const src =
+        \\fun run(): i64 {
+        \\    val counter = atomic 0i64
+        \\    val x = lazy { counter += 1i64; 5i64 }
+        \\    val a = x
+        \\    val b = x
+        \\    counter
+        \\}
+    ;
+    // 缓存生效：thunk 仅首次 force 跑一次 → counter == 1
+    try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d lazy value used in arithmetic" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val a = lazy { 10i64 + 5i64 }
+        \\    val b = lazy { 100i64 }
+        \\    a + b + a
+        \\}
+    ;
+    // a=15 (cached), b=100 → 15 + 100 + 15 = 130
+    try std.testing.expectEqual(@as(u128, 130), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d lazy captures local by reference snapshot" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val base: i64 = 9i64
+        \\    val x = lazy { base * base }
+        \\    x
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 81), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d lazy never forced — no leak" {
+    const allocator = std.testing.allocator;
+    // x 从不读取；leak-checked allocator 须无泄漏（thunk 闭包 + 箱体 release 干净）。
+    const src =
+        \\fun run(): i64 {
+        \\    val x = lazy { 999i64 }
+        \\    7i64
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d lazy churn under leak-checked allocator" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var total: i64 = 0i64
+        \\    var n: i64 = 0i64
+        \\    while n < 50i64 {
+        \\        val x = lazy { 2i64 }
+        \\        total = total + x
+        \\        n = n + 1i64
+        \\    }
+        \\    total
+        \\}
+    ;
+    // 50 * 2 = 100
+    try std.testing.expectEqual(@as(u128, 100), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M4d：select 多路复用 ──
+
+test "M4d select picks ready channel" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(2)
+        \\    val tx = ch.sender
+        \\    tx.send(42i64)
+        \\    select {
+        \\        ch.recv() => v => v
+        \\    }
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d select dual channel — first ready wins" {
+    const allocator = std.testing.allocator;
+    // 仅 ch2 有数据 → 命中第二 arm。
+    const src =
+        \\fun run(): i64 {
+        \\    val ch1 = channel(1)
+        \\    val ch2 = channel(1)
+        \\    val tx2 = ch2.sender
+        \\    tx2.send(99i64)
+        \\    select {
+        \\        ch1.recv() => a => a + 1i64
+        \\        ch2.recv() => b => b + 2i64
+        \\    }
+        \\}
+    ;
+    // ch1 空，ch2=99 就绪 → 99 + 2 = 101
+    try std.testing.expectEqual(@as(u128, 101), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d select timeout when none ready" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(1)
+        \\    select {
+        \\        ch.recv() => v => v
+        \\        timeout(100i64) => 7i64
+        \\    }
+        \\}
+    ;
+    // ch 空，无就绪 → timeout body → 7
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d select blocks on spawn producer" {
+    const allocator = std.testing.allocator;
+    // 无 timeout，主线程阻塞 recv；spawn 的 producer 送值解除阻塞。
+    const src =
+        \\fun run(): i64 {
+        \\    val ch = channel(1)
+        \\    val tx = ch.sender
+        \\    val producer = spawn {
+        \\        tx.send(55i64)
+        \\        0i64
+        \\    }
+        \\    val r = select {
+        \\        ch.recv() => v => v * 2i64
+        \\    }
+        \\    producer.await()
+        \\    r
+        \\}
+    ;
+    // producer 送 55，select 阻塞 recv → 55 * 2 = 110
+    try std.testing.expectEqual(@as(u128, 110), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d select first ready among two both-ready" {
+    const allocator = std.testing.allocator;
+    // 两通道都就绪 → 取第一 arm（确定性，镜像 eval 顺序 poll）。
+    const src =
+        \\fun run(): i64 {
+        \\    val ch1 = channel(1)
+        \\    val ch2 = channel(1)
+        \\    val tx1 = ch1.sender
+        \\    val tx2 = ch2.sender
+        \\    tx1.send(10i64)
+        \\    tx2.send(20i64)
+        \\    val first = select {
+        \\        ch1.recv() => a => a
+        \\        ch2.recv() => b => b
+        \\    }
+        \\    val second = ch2.recv()
+        \\    first + second
+        \\}
+    ;
+    // ch1 先就绪 → first=10；ch2 仍有 20 → second=20 → 30
+    try std.testing.expectEqual(@as(u128, 30), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+// ── M4d：inline trait 值（方法分派）──
+
+test "M4d inline trait method dispatch" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val obj = trait {
+        \\        fun add(a: i64, b: i64): i64 { a + b }
+        \\    }
+        \\    obj.add(3i64, 4i64)
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d inline trait multiple methods" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val m = trait {
+        \\        fun double(x: i64): i64 { x * 2i64 }
+        \\        fun triple(x: i64): i64 { x * 3i64 }
+        \\    }
+        \\    m.double(5i64) + m.triple(5i64)
+        \\}
+    ;
+    // 10 + 15 = 25
+    try std.testing.expectEqual(@as(u128, 25), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d inline trait captures enclosing local" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val base: i64 = 100i64
+        \\    val obj = trait {
+        \\        fun bumped(x: i64): i64 { x + base }
+        \\    }
+        \\    obj.bumped(7i64)
+        \\}
+    ;
+    // 7 + 100 = 107
+    try std.testing.expectEqual(@as(u128, 107), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d inline trait churn — no leak" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var total: i64 = 0i64
+        \\    var n: i64 = 0i64
+        \\    while n < 30i64 {
+        \\        val o = trait { fun id(x: i64): i64 { x } }
+        \\        total = total + o.id(2i64)
+        \\        n = n + 1i64
+        \\    }
+        \\    total
+        \\}
+    ;
+    // 30 * 2 = 60
+    try std.testing.expectEqual(@as(u128, 60), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M4d inline trait repeated calls with capture" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val k: i64 = 5i64
+        \\    val o = trait {
+        \\        fun f(x: i64): i64 { x * x + k }
+        \\    }
+        \\    o.f(3i64) + o.f(4i64)
+        \\}
+    ;
+    // (9+5)+(16+5) = 35
+    try std.testing.expectEqual(@as(u128, 35), try compileAndCall(allocator, src, "run", &.{}));
+}

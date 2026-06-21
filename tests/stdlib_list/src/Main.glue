@@ -1,0 +1,42 @@
+// 回归：内嵌标准库 List（@embedFile，文档 D67）。
+// 验证 use List 加载内嵌模块 + map/filter/foldl/foldr/length/reverse/append/elem/from_array。
+// 结果用 Panic 自断言，错误即非零退出，run_tests.sh 据此判失败。
+use List
+
+fun check(cond: bool, label: str): Unit {
+    if (!cond) { Panic("assertion failed: " + label) } else { println("ok: " + label) }
+}
+
+fun main() {
+    val xs = from_array([1, 2, 3, 4, 5])
+
+    check(length(xs) == 5, "length")
+    check(!is_empty(xs), "is_empty false")
+    check(is_empty(Nil), "is_empty true")
+    check((head(xs) ?? 0) == 1, "head")
+    check(length(tail(xs)) == 4, "tail")
+
+    val doubled = map((x) => x * 2, xs)
+    check(foldl((a, x) => a + x, 0, doubled) == 30, "map + foldl")
+
+    val evens = filter((x) => x % 2 == 0, xs)
+    check(length(evens) == 2, "filter")
+
+    check(foldr((x, a) => x + a, 0, xs) == 15, "foldr")
+
+    val rev = reverse(xs)
+    check((head(rev) ?? 0) == 5, "reverse")
+
+    val joined = append(from_array([1, 2]), from_array([3, 4]))
+    check(length(joined) == 4, "append")
+
+    check(elem(3, xs), "elem present")
+    check(!elem(99, xs), "elem absent")
+
+    check(length(prepend(0, xs)) == 6, "prepend")
+
+    // 条件实现 Show<List<T>>（List 模块内 impl，T: Show）
+    check(eq(from_array([1, 2, 3]).show(), "1 :: 2 :: 3 :: []"), "Show<List<i64>>")
+
+    println("stdlib List: all tests passed")
+}

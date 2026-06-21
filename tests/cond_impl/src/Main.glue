@@ -1,0 +1,36 @@
+// 回归：参数化条件实现（impl Show<Box<T>> with Show<T>）。
+// 验证条件 impl 解析 + 头部自由变量 + 嵌套/多参数分派 + 与 stdlib 配合。
+use Compare
+
+type Box<T> = Box(value: T)
+type Pair<A, B> = Pair(first: A, second: B)
+
+// 条件 impl：T 满足 Show 时，Box<T> 也满足 Show。
+impl Show<Box<T>> with Show<T> {
+    fun show(self): str { "Box(" + self.value.show() + ")" }
+}
+
+// 多参数条件 impl：A、B 都满足 Show 时，Pair<A,B> 满足 Show。
+impl Show<Pair<A, B>> with Show<A>, Show<B> {
+    fun show(self): str { "(" + self.first.show() + ", " + self.second.show() + ")" }
+}
+
+fun check(cond: bool, label: str): Unit {
+    if (!cond) { Panic("assertion failed: " + label) } else { println("ok: " + label) }
+}
+
+fun main() {
+    // 单层 Box，内层 i64 用 stdlib 的 impl Show<i64>
+    check(eq(Box(42).show(), "Box(42)"), "Box<i64>")
+
+    // 嵌套 Box（递归走条件 impl 自身）
+    check(eq(Box(Box(7)).show(), "Box(Box(7))"), "Box<Box<i64>>")
+
+    // 多参数 Pair
+    check(eq(Pair(1, 2).show(), "(1, 2)"), "Pair<i64, i64>")
+
+    // Pair 嵌套 Box
+    check(eq(Pair(Box(1), 2).show(), "(Box(1), 2)"), "Pair<Box<i64>, i64>")
+
+    println("conditional impl: all tests passed")
+}

@@ -1,0 +1,38 @@
+// 回归：内嵌标准库 Compare（Eq / Ord / Show 类型类）。
+// 验证 use Compare 加载内嵌模块 + 对内建类型 i64/f64/bool/str/char 的 trait 实现。
+use Compare
+
+fun check(cond: bool, label: str): Unit {
+    if (!cond) { Panic("assertion failed: " + label) } else { println("ok: " + label) }
+}
+
+fun main() {
+    // Show
+    check(eq((42).show(), "42"), "show i64")
+    check(eq(true.show(), "true"), "show bool")
+    check(eq("hi".show(), "hi"), "show str")
+    check(eq((3.5).show(), "3.5"), "show f64")
+    check(eq('A'.show(), "A"), "show char")
+
+    // Eq
+    check((3).equals(3), "eq i64 true")
+    check(!(3).equals(4), "eq i64 false")
+    check("a".equals("a"), "eq str true")
+    check(!"a".equals("b"), "eq str false")
+    check((3.5).equals(3.5), "eq f64")
+    check(true.equals(true), "eq bool")
+    check('x'.equals('x'), "eq char")
+
+    // Ord
+    check((3).compare(8) == -1, "ord i64 lt")
+    check((5).compare(5) == 0, "ord i64 eq")
+    check((9).compare(5) == 1, "ord i64 gt")
+    check((1.0).compare(2.0) == -1, "ord f64 lt")
+    check('a'.compare('b') == -1, "ord char lt")
+    check("apple".compare("banana") == -1, "ord str lt")
+    check("same".compare("same") == 0, "ord str eq")
+    check("zoo".compare("apple") == 1, "ord str gt")
+
+    println("stdlib Compare: all tests passed")
+}
+
