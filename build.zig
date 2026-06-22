@@ -325,6 +325,8 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("eval", eval_module);
     root_module.addImport("slab_pool", slab_pool_module);
     root_module.addImport("zio", zio_module);
+    // M5：字节码 VM 接入 glue run（vm_module 再导出 VM/Program/ModuleCompiler/lexer/parser）。
+    root_module.addImport("vm", vm_module);
 
     // Zio 在 Windows 上需要 ws2_32（Winsock2，IOCP 后端依赖）
     if (target.result.os.tag == .windows) {

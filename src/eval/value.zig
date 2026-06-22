@@ -212,6 +212,9 @@ pub const VmClosure = struct {
     bound_args: []Value = &.{}, // 默认柯里化预绑定实参（owned，归零时 release）
     rc: u32 = 1,
     allocator: std.mem.Allocator,
+    /// M5c：letrec 自引用 upvalue 索引（-1 = 无）。该 upvalue 指向闭包自身的 cell（递归局部
+    /// 函数捕获自身），为**弱引用**：retain/release 都跳过它，避免 cell↔closure 循环泄漏。
+    self_upvalue_idx: i32 = -1,
 };
 
 // ============================================================
@@ -821,7 +824,12 @@ pub const Value = union(enum) {
                     p.rc -= 1;
                     return;
                 }
-                for (p.upvalues) |uv| uv.releaseVM(allocator);
+                for (p.upvalues, 0..) |uv, i| {
+                    // M5c：跳过 letrec 弱自引用 upvalue（指向自身 cell，不持计数 → 不释放，避免
+                    // 在本闭包正被该 cell 释放时反向再释放 cell 造成 use-after-free）。
+                    if (p.self_upvalue_idx >= 0 and i == @as(usize, @intCast(p.self_upvalue_idx))) continue;
+                    uv.releaseVM(allocator);
+                }
                 if (p.upvalues.len > 0) p.allocator.free(p.upvalues);
                 for (p.bound_args) |ba| ba.releaseVM(allocator);
                 if (p.bound_args.len > 0) p.allocator.free(p.bound_args);

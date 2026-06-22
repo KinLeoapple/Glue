@@ -116,6 +116,9 @@ pub const AdtCtorDesc = struct {
     ctor_name: []const u8,
     /// 各字段名（位置字段为 null）；len == arity。建 AdtValue 时填 fields[i].name。
     field_names: []const ?[]const u8,
+    /// M5c：各字段声明类型名（builtin 数值类型才非 null），用于 OP_MAKE_ADT 隐式定型
+    /// （如 Emp(.., salary: i32) 把 i8 实参 100 协调成 i32，避免后续算术溢出）。len == arity。
+    field_types: []const ?[]const u8,
     arity: u8,
 };
 
@@ -154,7 +157,10 @@ pub const Program = struct {
         for (self.functions.items) |*f| f.deinit();
         self.functions.deinit(self.allocator);
         // field_names 切片由 addAdtCtor alloc，释放外层数组（内含字符串借用 AST，不释放）。
-        for (self.adt_ctors.items) |d| self.allocator.free(d.field_names);
+        for (self.adt_ctors.items) |d| {
+            self.allocator.free(d.field_names);
+            self.allocator.free(d.field_types);
+        }
         self.adt_ctors.deinit(self.allocator);
         for (self.record_shapes.items) |s| self.allocator.free(s.field_names);
         self.record_shapes.deinit(self.allocator);
@@ -170,13 +176,15 @@ pub const Program = struct {
 
     /// 登记一个 ADT 构造器，返回其 ctor_idx。field_names 由本函数 dupe 进 Program 持有的数组
     /// （内含的字符串仍借用 AST）。
-    pub fn addAdtCtor(self: *Program, type_name: []const u8, ctor_name: []const u8, field_names: []const ?[]const u8) !u16 {
+    pub fn addAdtCtor(self: *Program, type_name: []const u8, ctor_name: []const u8, field_names: []const ?[]const u8, field_types: []const ?[]const u8) !u16 {
         const idx = self.adt_ctors.items.len;
         const fn_copy = try self.allocator.dupe(?[]const u8, field_names);
+        const ft_copy = try self.allocator.dupe(?[]const u8, field_types);
         try self.adt_ctors.append(self.allocator, .{
             .type_name = type_name,
             .ctor_name = ctor_name,
             .field_names = fn_copy,
+            .field_types = ft_copy,
             .arity = @intCast(field_names.len),
         });
         return @intCast(idx);

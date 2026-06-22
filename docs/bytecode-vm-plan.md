@@ -394,6 +394,97 @@ spawn/atomic/channel/select、lazy、monad comprehension、inline trait value、
 树遍历核心（保留被 VM 复用的 helper：callMethod 分派、castValue、内建函数、pattern 判定）。
 更新 docs/language-design.md（§7.2 执行模型）、BASELINE.md（VM 后新基线）、本计划标"已完成"。
 
+**M5a — VM 接入 glue run（脚手架 + 回退 + 整数定型）✅ 已完成**
+关键发现：M1–M4 的「flag 后并存 + 回退」脚手架（§9）**从未存在**——VM 只被 bench_main.zig
+与单测驱动，33 个回归项目全走树遍历器；M1–M4 单测用手写单模块源，跳过 type_check 与跨文件 use。
+本片把 VM 真正接入 `glue run`：
+
+- **拆分 evalModule**（src/eval/eval.zig）：抽出 `prepareModuleInner`（use 预加载 + checkModule +
+  resolveModule），新增 `prepareModuleForVm`（VM 准备）与 `evalModulePrepared`（回退时跳过重复
+  准备——类型注册表不随 resetForNextModule 清空，二次 checkModule 会误报 duplicate type）。
+- **main.zig 调度**：`tryRunOnVM` 先 `vmEligible` 预扫描（仅 fun + adt/newtype + 无副作用裸表达式
+  的模块进 VM；use/trait/impl/pack/顶层 val/record 整体回退——因 compileModule 对这些是静默
+  `else=>{}`，不预扫描会编出残缺 Program）。VM 编译期 Unsupported / 无 main → 回退树遍历器。
+  三态 ExecOutcome（ran_main / needs_main / failed）+ VmOutcome（含 fell_back_prepared）。
+  `GLUE_VM=0` 关闭、`GLUE_VM_TRACE=1` 打印 ran-VM/fell-back（覆盖率度量）。build.zig：root 导入 vm_module。
+- **整数定型（核心修复）**：VM 不跑 type_check，原先按 inferIntType 取最小容纳类型 → 形参/绑定
+  注解的 i32/i64 宽度丢失 → 算术溢出 panic（whole-module 编译下，eligibility 不蕴含语义等价，
+  编译期回退兜不住运行期分歧）。修复 = 镜像 eval 在形参/val/var 注解处的隐式 castValue：
+  - 新增 `OP_COERCE <type_name>`（best-effort：仅 int/float→builtin 数值类型协调 type_tag，
+    溢出/非数值/泛型类型名原样保留，**绝不 panic**，区别于会 panic 的 OP_CAST）。
+  - 编译器：函数/lambda 入口对带 builtin 数值注解的形参发 GET_LOCAL+COERCE+SET_LOCAL；
+    val/var 注解在 RHS 后发 COERCE（compiler.zig `emitParamCoercions`/`emitCoerceFromAnnotation`）。
+  - 连带修 VM `compare` 的 ==/!=：原用 tag-strict `Value.equals`，协调后操作数 tag 不同
+    （i32 形参 vs i8 字面量）→ `n==0` 恒 false 死循环；改为按值比较（promoteIntTypes 后），镜像 eval。
+- **顺带补齐 VM 运行时**（让 eligible 项目真跑通，非新特性）：`arith` 的 `s + t` 字符串拼接、
+  `compare` 的字符串字典序、Spawn `status()`（建 SpawnStatus ADT）、match `Ok(v)` 接受裸值
+  （非 throw_val 视作 Ok 载荷，镜像 eval pattern.zig）。
+- **门禁全绿**：zig build test（+6 M5 单测，leak-checked allocator）；run_tests.sh 33/33（Debug，
+  VM 默认开）；ReleaseFast 33/33；GLUE_VM=0 33/33（回退路径 == 旧路径，零漂移）；VM 覆盖 **9/33**
+  端到端真跑 VM（edge_arithmetic/concurrency/patterns/recursion_methods/strings_closures/
+  throw_records/perf_recursion/phase4/phase6），其余 24 编译期回退（use/trait/impl/HKT/record）；
+  perf_recursion VM 2.15s vs 树遍历器 5.14s ≈ **2.4×**（确认 VM 在 run 路径生效非静默全回退）。
+  glue debug 的 LEAK 为既存（树遍历器同样报，与 M5 无关）。
+
+**M5 剩余（未做）**：默认开启已达成（M5a），但「删除树遍历器」需先把回退的 24 个项目搬上 VM
+——即在 VM 编译器实现 trait/impl 运行时分派、跨文件 use 导入、HKT `@`/monad、GADT、record/顶层
+val。这是 M3/M4 级工作量（被早期里程碑记账却从未抵达 run 路径），应单列里程碑，不在 M5a 范围。
+
+**M5b — VM 覆盖扩展（9→14）✅ 已完成**
+在 M5a 基础上补齐若干 VM 缺口，把真跑 VM 的项目从 9/33 提到 **14/33**（array_concat / edge_closures
+/ edge_iterators / edge_concurrency_race / type_builtin 新增），全程 33/33 不回归：
+- **`++` 数组拼接**：新增 `OP_CONCAT_LIST`（弹两数组、元素各 retainOwned 拼新数组），编译器
+  `concat_list` 分支发射。解锁 array_concat / edge_iterators。
+- **`type()` 内建**：新增 Native `type_of` + `vmValueTypeName`（镜像 eval valueTypeName，纯
+  value→name）。解锁 type_builtin / array_concat（输出与树遍历器逐行一致）。
+- **alias 类型 eligible**：`type X = () -> i32` 等别名无运行时效果（编译器忽略），加入 vmEligible
+  的 type_decl 白名单。解锁 edge_closures。
+- **atomic 引用别名修复（并发正确性）**：`val c = counter`（counter 是 atomic）原经 `op_get_local`
+  透明 load 成标量 → c 丢引用 → `spawn { c += 1 }` 累加丢失（VM 印 0，树遍历器印 1）。修复：
+  新增 `emitBindingRhs`——val/var 的 RHS 是裸 identifier 时用 raw 读取保留 atomic 引用（镜像 eval
+  把 atomic 当引用类型绑定）。连带让 `op_get_local_raw`/`op_get_upvalue_raw` 仍透明 force lazy
+  （raw 只保留 atomic 引用、不跳过 lazy force，保持 lazy 绑定即 force 语义）。
+- **for 循环变量被闭包捕获（cell-box）**：`doForNext` 原直接读 idx/iter slot 的 `.integer`，但
+  循环体内闭包/spawn 捕获使 slot 就地 box 成 *Cell → "access integer while cell_val active" 崩溃。
+  修复：doForNext 透明解包 idx/iter 的 cell，idx++ 写回 cell.inner。解锁 edge_concurrency_race。
+- 门禁：zig build test（+M5b 单测：++ 长度 / atomic 别名 / for 闭包捕获）；Debug VM-on 33/33；
+  Debug VM-off 33/33；ReleaseFast 33/33。
+
+**M5c — letrec / ADT 字段定型（14→17）✅ 已完成**
+把真跑 VM 的项目从 14/33 提到 **17/33**（stress_graph / stress_database / stress_regex 新增），
+全程 33/33 + 单测无泄漏：
+- **递归局部函数（letrec）**：嵌套 `fun go(){...go()...}` 解析为 val_decl(lambda)。修复：①val_decl
+  RHS 是 lambda 时**先声明 slot**（lambda 体内可解析自身为 upvalue）；②emitCall 的 callee 标识符
+  被 local **或 upvalue** 遮蔽时走通用 op_call_value（原仅查 local，upvalue 自引用漏判→Unsupported）。
+- **letrec 循环引用（弱自引用）**：cell↔closure 互持→纯 refcount 泄漏。新增 `OP_SET_LOCAL_LETREC`
+  + VmClosure.self_upvalue_idx：闭包捕获自身 cell 的 upvalue 标记为弱（cell.rc-=1 抵消 op_closure
+  retain，releaseVM 跳过该 upvalue 不反向释放 cell），断环且无 use-after-free。镜像 eval defineWeak。
+- **ADT 字段隐式定型**：`Emp(.., salary: i32)` 构造时实参 100（推断 i8）未协调→后续 `s*pct` 溢出 i8。
+  AdtCtorDesc 增 field_types，OP_MAKE_ADT 对 builtin 数值字段 best-effort castNumeric（镜像 eval
+  构造器 castValue）。
+- 门禁：zig build test（+M5c 单测：letrec 递归 / ADT 字段定型，std.testing.allocator 无泄漏）；
+  Debug VM-on/off 33/33；ReleaseFast 33/33；三新增项目 VM vs 树遍历器输出逐行一致。
+
+**M5d — 内置函数补齐 ✅ 已完成**
+VM 原仅 6 个 Native（println/print/Ok/Error/channel/type）。核查 eval 共注册 13 个内置函数，
+本片补齐全部缺口，VM 内置函数集**完整**（覆盖率维持 17/33——缺的内置非覆盖瓶颈，瓶颈是
+trait/impl/use/HKT）：
+- **eq(a,b)**：结构深相等（递归 array/record/adt/newtype），新增 `vmStructuralEquals`（镜像 eval
+  structuralEquals）。区别于 VM `Value.equals` 的引用相等。
+- **Panic(v)**：格式化 v 后触发 VM panic（经 fail 报告，main.zig 已统一映射为 runtime panic）。
+- **eprint/eprintln**：写 stderr（镜像 eval builtinEprint/Eprintln）。
+- **scan/scanln**：stdin token/行读取。新增 VM.scan_line_buf/scan_line_pos/stdin_state（持久 reader）
+  + doScan/doScanln/readNextLine/ensureStdinReader，逐条镜像 eval（含跨行 token、当前行剩余、
+  CRLF 去尾、EOF→null）。VM.deinit 释放行缓冲 + reader。
+- **str**：早已支持（解析为 type_cast，走 op_cast 的 str 分支）。
+- 门禁：zig build test（+eq 结构相等单测）；Debug VM-on/off 33/33；ReleaseFast 33/33；
+  scan/scanln/eq/Panic/eprintln 端到端 VM vs 树遍历器输出一致（含管道 stdin、EOF）。
+
+**VM 基础能力现状**：所有基本类型（整数全宽 + 浮点全宽 + bool/char/str/null/unit + 数组/记录/
+ADT/newtype/range/atomic/channel/spawn/lazy）+ 全部 13 个内置函数 + 整数/浮点字面量推断与
+注解定型，均已完整支持。剩余回退仅因 trait/impl 运行时分派 / 跨文件 use / HKT / GADT / record
+顶层声明等成块特性未实现。
+
 ---
 
 ## 10. 性能预期与后续优化（VM 之后）

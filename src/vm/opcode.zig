@@ -25,6 +25,10 @@ pub const OpCode = enum(u8) {
     op_get_local,
     /// OP_SET_LOCAL <u16 slot>：弹栈顶写入 slot（先 release 旧值）
     op_set_local,
+    /// OP_SET_LOCAL_LETREC <u16 slot>（M5c）：letrec 自绑定——弹闭包写入 slot 的 cell.inner，
+    /// 并断开自引用循环：若闭包某 upvalue 正是该 slot 的 cell（递归局部函数捕获自身），
+    /// 对该 cell 少持一份 ref（自引用变弱），避免 cell↔closure 循环泄漏（镜像 eval defineWeak）。
+    op_set_local_letrec,
 
     // —— 算术（pop 2，push 1）——
     op_add,
@@ -146,6 +150,14 @@ pub const OpCode = enum(u8) {
     /// OP_CAST <u16 type_name_const_idx>：弹值，按常量池字符串目标类型名转换（cast.zig），
     /// 压结果。str→format；int/float 互转 clamp + type_tag；narrowing 溢出 → VM panic。
     op_cast,
+    /// OP_COERCE <u16 type_name_const_idx>：隐式数值类型协调（M5：VM 整数定型）。
+    /// 镜像 eval 的 `castValue(...) catch val` best-effort 语义：仅当栈顶是 int/float 且目标是
+    /// builtin 数值类型时按 cast.zig 协调 type_tag（如形参 i32 把 i8 实参拓宽成 i32）；
+    /// 溢出/类型不符/非数值/泛型类型名 → **原样保留**（绝不 panic，区别于 op_cast）。
+    op_coerce,
+    /// OP_CONCAT_LIST（无操作数）：弹 [left, right] 两数组，拼接成新数组（元素 retainOwned 各自一份），
+    /// 压结果。镜像 eval evalConcatList（`++`）。非数组操作数 → panic。
+    op_concat_list,
 
     // ── M3b：字段赋值（控制流补全的复合赋值/break/continue/loop 均无新 opcode）──
     /// OP_SET_FIELD <u16 name_const_idx>：栈布局 [obj, val]，弹 val 写入 obj 的命名字段
@@ -226,6 +238,13 @@ pub const Native = enum(u8) {
     ok,
     err,
     channel,
+    type_of,
+    eq,
+    panic,
+    eprintln,
+    eprint,
+    scan,
+    scanln,
 
     pub fn fromName(s: []const u8) ?Native {
         if (std.mem.eql(u8, s, "println")) return .println;
@@ -233,6 +252,13 @@ pub const Native = enum(u8) {
         if (std.mem.eql(u8, s, "Ok")) return .ok;
         if (std.mem.eql(u8, s, "Error")) return .err;
         if (std.mem.eql(u8, s, "channel")) return .channel;
+        if (std.mem.eql(u8, s, "type")) return .type_of;
+        if (std.mem.eql(u8, s, "eq")) return .eq;
+        if (std.mem.eql(u8, s, "Panic")) return .panic;
+        if (std.mem.eql(u8, s, "eprintln")) return .eprintln;
+        if (std.mem.eql(u8, s, "eprint")) return .eprint;
+        if (std.mem.eql(u8, s, "scan")) return .scan;
+        if (std.mem.eql(u8, s, "scanln")) return .scanln;
         return null;
     }
 };

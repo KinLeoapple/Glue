@@ -148,8 +148,14 @@ pub const ModuleCompiler = struct {
                                 // 收集字段名（位置字段 name=null）。借用 AST 字节。
                                 var fnames = try self.allocator.alloc(?[]const u8, con.fields.len);
                                 defer self.allocator.free(fnames);
-                                for (con.fields, 0..) |f, i| fnames[i] = f.name;
-                                const cidx = try self.program.addAdtCtor(td.name, con.name, fnames);
+                                // M5c：收集字段的 builtin 数值类型名（用于 OP_MAKE_ADT 隐式定型）。
+                                var ftypes = try self.allocator.alloc(?[]const u8, con.fields.len);
+                                defer self.allocator.free(ftypes);
+                                for (con.fields, 0..) |f, i| {
+                                    fnames[i] = f.name;
+                                    ftypes[i] = builtinNumericTypeOf(f.ty);
+                                }
+                                const cidx = try self.program.addAdtCtor(td.name, con.name, fnames, ftypes);
                                 try self.ctor_table.append(self.allocator, .{ .name = con.name, .idx = cidx, .arity = @intCast(con.fields.len) });
                             }
                         },
@@ -179,6 +185,8 @@ pub const ModuleCompiler = struct {
         defer fc.deinit();
         // 参数占 slot 0..arity-1。
         for (fd.params) |p| _ = try fc.declareLocal(p.name, p.is_var);
+        // M5：对带 builtin 数值注解的形参，入口处把实参协调到声明类型（i8 实参→i32 形参）。
+        try fc.emitParamCoercions(fd.params, ast.exprLocation(fd.body));
         try fc.emitTail(fd.body); // 函数体在尾位置：尾调用→OP_TAIL_CALL，否则 emitExpr+OP_RETURN
         // 移交 chunk 所有权给 Function；fc.deinit 只清 locals。
         const f = Function{
@@ -492,6 +500,7 @@ const FnCompiler = struct {
             .block => |b| b,
             .expression => |e| e,
         };
+        try sub.emitParamCoercions(lam.params, loc); // M5：lambda 形参数值注解协调
         try sub.emitExpr(body_expr);
         try sub.chunk.writeOp(.op_return, loc);
         const f = Function{
@@ -699,6 +708,43 @@ const FnCompiler = struct {
         try self.chunk.writeU16(k);
     }
 
+    /// M5：按类型注解发射隐式数值定型（OP_COERCE）。仅当注解是 builtin 数值类型名（i*/u*/f*）
+    /// 时发射；str/bool/泛型/用户类型/无注解 → 不发射（隐式协调只管数值宽度，镜像 eval 在形参/
+    /// val/var 绑定处对 builtin 数值类型调 castValue 的行为）。作用于栈顶值（就地协调）。
+    fn emitCoerceFromAnnotation(self: *FnCompiler, ann: ?*const ast.TypeNode, loc: ast.SourceLocation) CompileError!void {
+        const ta = ann orelse return;
+        const tname = switch (ta.*) {
+            .named => |n| n.name,
+            else => return, // 泛型/可空/函数类型等：不隐式协调
+        };
+        if (!isBuiltinNumericType(tname)) return; // str/bool/用户类型：不协调
+        const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, tname) });
+        try self.chunk.writeOp(.op_coerce, loc);
+        try self.chunk.writeU16(name_const);
+    }
+
+    /// M5：在函数/lambda 入口为带 builtin 数值注解的形参发射 OP_GET_LOCAL+COERCE+SET_LOCAL，
+    /// 把传入实参（可能是 inferIntType 的最小类型）协调到声明类型（如 i32）。
+    /// 镜像 eval callFunction 在绑定形参时对 param.type_annotation 调 castValue 的逻辑。
+    fn emitParamCoercions(self: *FnCompiler, params: []const ast.Param, loc: ast.SourceLocation) CompileError!void {
+        for (params) |p| {
+            const ta = p.type_annotation orelse continue;
+            const tname = switch (ta.*) {
+                .named => |n| n.name,
+                else => continue,
+            };
+            if (!isBuiltinNumericType(tname)) continue;
+            const slot = self.resolveLocal(p.name).?; // 刚 declareLocal，必存在
+            const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, tname) });
+            try self.chunk.writeOp(.op_get_local, loc);
+            try self.chunk.writeU16(slot);
+            try self.chunk.writeOp(.op_coerce, loc);
+            try self.chunk.writeU16(name_const);
+            try self.chunk.writeOp(.op_set_local, loc);
+            try self.chunk.writeU16(slot);
+        }
+    }
+
     /// 调用派发（M1b）：
     /// - callee 是顶层函数名（非 local）：OP_CALL func_idx 快路径（M1a，callee 不上栈）。
     /// - 其它（local 标识符 / 柯里化结果 / 任意求值出函数的表达式）：求值 callee 上栈 + OP_CALL_VALUE。
@@ -775,6 +821,26 @@ const FnCompiler = struct {
         return true;
     }
 
+    /// M5：变量绑定（val/var）的 RHS 发射。RHS 是裸 identifier 时用 raw 读取，保留 atomic/lazy
+    /// **引用**（不透明 load/force），镜像 eval 把 atomic 当引用类型绑定的语义：`val c = counter`
+    /// 后 c 与 counter 共享同一 atomic，`spawn { c += 1 }` 的累加对 counter 可见。
+    /// 非引用类型（int/array/record 等）raw 与普通读取等价；非 identifier RHS 照常 emitExpr。
+    fn emitBindingRhs(self: *FnCompiler, expr: *const Expr) CompileError!void {
+        if (expr.* == .identifier) {
+            const name = expr.identifier.name;
+            if (self.resolveLocal(name)) |slot| {
+                try self.chunk.writeOp(.op_get_local_raw, expr.identifier.location);
+                try self.chunk.writeU16(slot);
+                return;
+            } else if (try self.resolveUpvalue(name)) |uv| {
+                try self.chunk.writeOp(.op_get_upvalue_raw, expr.identifier.location);
+                try self.chunk.writeU16(uv);
+                return;
+            }
+        }
+        try self.emitExpr(expr);
+    }
+
     /// M4a：方法接收者求值 —— identifier（local/upvalue）用 raw 读取，避免对 atomic 透明 load
     /// （cas/swap 等需原始 Atomic 值；标量方法 len/push 等 raw 与普通读取等价）。其它表达式照常。
     fn emitMethodReceiver(self: *FnCompiler, obj: *Expr) CompileError!void {
@@ -796,10 +862,13 @@ const FnCompiler = struct {
     fn emitCall(self: *FnCompiler, c: @TypeOf(@as(Expr, undefined).call), loc: ast.SourceLocation) CompileError!void {
         if (c.arguments.len > 255) return error.Unsupported;
         const argc: u8 = @intCast(c.arguments.len);
-        // 快路径：直接具名顶层函数（且非被 local 遮蔽）。
+        // 快路径：直接具名顶层函数（且非被 local/upvalue 遮蔽）。
         if (c.callee.* == .identifier) {
             const name = c.callee.identifier.name;
-            if (self.resolveLocal(name) == null) {
+            // 被 local 或 upvalue 绑定遮蔽（如递归局部函数 go 在自身体内是 upvalue）→ 走通用
+            // op_call_value 路径，不当顶层函数/构造器/内建处理。
+            const shadowed = self.resolveLocal(name) != null or (try self.resolveUpvalue(name)) != null;
+            if (!shadowed) {
                 if (self.module.lookupFn(name)) |func_idx| {
                     for (c.arguments) |arg| try self.emitExpr(arg);
                     try self.chunk.writeOp(.op_call, loc);
@@ -882,6 +951,13 @@ const FnCompiler = struct {
                 try self.emitExpr(bin.right);
                 try self.chunk.writeOp(.op_make_range, loc);
                 try self.chunk.writeByte(1);
+                return;
+            },
+            // M5：数组拼接 `++` —— 压 left,right + OP_CONCAT_LIST（镜像 eval evalConcatList）。
+            .concat_list => {
+                try self.emitExpr(bin.left);
+                try self.emitExpr(bin.right);
+                try self.chunk.writeOp(.op_concat_list, loc);
                 return;
             },
             else => {},
@@ -1190,13 +1266,29 @@ const FnCompiler = struct {
     fn emitStmt(self: *FnCompiler, stmt: *const Stmt) CompileError!void {
         switch (stmt.*) {
             .val_decl => |d| {
-                try self.emitExpr(d.value);
-                const slot = try self.declareLocal(d.name, false);
-                try self.chunk.writeOp(.op_set_local, d.location);
-                try self.chunk.writeU16(slot);
+                // M5c：letrec —— RHS 是 lambda 时先声明 slot，使 lambda 体内可引用自身（递归
+                // 局部函数 fun go(){...go()...}）。slot 先置 unit 占位并 box 成 cell，lambda 经
+                // OP_CLOSURE is_local 捕获同一 cell；随后 set_local 写 cell.inner=闭包，递归调用
+                // 经 upvalue 读到该 cell 即得闭包本身（镜像 eval 的 letrec 弱自引用）。
+                if (d.value.* == .lambda) {
+                    const slot = try self.declareLocal(d.name, false);
+                    try self.chunk.writeOp(.op_unit, d.location);
+                    try self.chunk.writeOp(.op_set_local, d.location);
+                    try self.chunk.writeU16(slot);
+                    try self.emitExpr(d.value); // lambda 可解析到 slot（已声明）
+                    try self.chunk.writeOp(.op_set_local_letrec, d.location);
+                    try self.chunk.writeU16(slot);
+                } else {
+                    try self.emitBindingRhs(d.value);
+                    try self.emitCoerceFromAnnotation(d.type_annotation, d.location); // M5：val a: i32 = ...
+                    const slot = try self.declareLocal(d.name, false);
+                    try self.chunk.writeOp(.op_set_local, d.location);
+                    try self.chunk.writeU16(slot);
+                }
             },
             .var_decl => |d| {
-                try self.emitExpr(d.value);
+                try self.emitBindingRhs(d.value);
+                try self.emitCoerceFromAnnotation(d.type_annotation, d.location); // M5：var a: i32 = ...
                 const slot = try self.declareLocal(d.name, true);
                 try self.chunk.writeOp(.op_set_local, d.location);
                 try self.chunk.writeU16(slot);
@@ -1441,6 +1533,29 @@ fn parseFloatLiteral(lit: @TypeOf(@as(Expr, undefined).float_literal)) ?Value {
         return Value{ .float = .{ .value = fv, .type_tag = t } };
     }
     return Value{ .float = .{ .value = fv, .type_tag = value.inferFloatType(fv) } };
+}
+
+/// M5：builtin 数值类型名判定（隐式定型只协调这些）。bool/str 不在内——它们不参与整数宽度
+/// 推断/算术提升，且 castNumeric 不处理；eval 对 bool/str 的隐式协调亦无数值语义影响。
+fn isBuiltinNumericType(name: []const u8) bool {
+    const nums = [_][]const u8{
+        "i8", "i16", "i32", "i64", "i128",
+        "u8", "u16", "u32", "u64", "u128",
+        "f16", "f32", "f64", "f128",
+    };
+    for (nums) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
+/// M5c：若 TypeNode 是 builtin 数值类型，返回其名（借用 AST 字节）；否则 null。
+/// 供 ADT 字段隐式定型用（仅数值字段需协调 type_tag）。
+fn builtinNumericTypeOf(ty: *const ast.TypeNode) ?[]const u8 {
+    return switch (ty.*) {
+        .named => |n| if (isBuiltinNumericType(n.name)) n.name else null,
+        else => null,
+    };
 }
 
 /// 模式字面量 → Value 常量（供 OP_TEST_LIT 比较）。int 用 u128 位模式（负数 bitcast，
@@ -2356,6 +2471,179 @@ test "M3c throw + match Error branch" {
     // -1 as u64 bit pattern
     const r = try compileAndCall(allocator, src, "run", &.{});
     try std.testing.expectEqual(@as(i64, -1), @as(i64, @bitCast(@as(u64, @truncate(r)))));
+}
+
+test "M5 implicit param coercion: i8 literal arg -> i32 param (no overflow loop)" {
+    const allocator = std.testing.allocator;
+    // countDown 终止依赖 n==0：n 协调成 i32，字面量 0 是 i8，== 须按值比较（非 tag-strict）。
+    const src =
+        \\fun countDown(n: i32): i32 {
+        \\    if (n == 0) { 0 } else { countDown(n - 1) }
+        \\}
+    ;
+    const arg = Value{ .integer = .{ .value = 100, .type_tag = .i8 } };
+    try std.testing.expectEqual(@as(u128, 0), try compileAndCall(allocator, src, "countDown", &.{arg}));
+}
+
+test "M5 val annotation coercion widens to i64" {
+    const allocator = std.testing.allocator;
+    // 大数累加：若 sum 不协调成 i64 会在 i8/i16 溢出 panic。
+    const src =
+        \\fun run(): i64 {
+        \\    var sum: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 1000 { sum = sum + i; i = i + 1 }
+        \\    sum
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 499500), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5 string concatenation with +" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): str { "foo" + "bar" }
+    ;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var lx = lexer.Lexer.init(aa, src);
+    const toks = try lx.tokenize();
+    var p = parser.Parser.init(aa, toks);
+    var module = try p.parseModule("t");
+    var mc = ModuleCompiler.init(allocator);
+    defer mc.deinit();
+    defer mc.program.deinit();
+    try mc.compileModule(&module);
+    const idx = mc.lookupFn("run").?;
+    var vm = vm_mod.VM.init(allocator);
+    defer vm.deinit();
+    const result = try vm.call(&mc.program, idx, &.{});
+    defer result.releaseVM(allocator);
+    try std.testing.expect(result == .string);
+    try std.testing.expectEqualStrings("foobar", result.string);
+}
+
+test "M5 string ordering comparison" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): bool { "apple" < "banana" }
+    ;
+    try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5 bare value matches Ok pattern (implicit Throw)" {
+    const allocator = std.testing.allocator;
+    // checked 返回裸值 5（非 Ok 包装），match Ok(v) 须绑定裸值本身（镜像 eval）。
+    const src =
+        \\fun checked(x: i32): Throw<i32, Error> { if (x >= 0) { x } else { throw Error("neg") } }
+        \\fun run(): i32 { match checked(5) { Ok(v) => v, Error(e) => -1 } }
+    ;
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5b array concat ++ length" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    val a = [1i64, 2i64]
+        \\    val b = [3i64, 4i64, 5i64]
+        \\    val c = a ++ b
+        \\    c.len()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5b atomic aliased via val binding preserves reference" {
+    const allocator = std.testing.allocator;
+    // val c = counter 须保留 atomic 引用：c += 1 对 counter 可见（镜像 eval atomic 引用语义）。
+    const src =
+        \\fun run(): i64 {
+        \\    var counter = atomic 0i64
+        \\    val c = counter
+        \\    c += 1i64
+        \\    counter
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5b for-loop var captured by closure (cell-boxed idx)" {
+    const allocator = std.testing.allocator;
+    // 循环体内闭包捕获使 slot box 成 cell；doForNext 须透明解包 idx/iter。
+    const src =
+        \\fun run(): i64 {
+        \\    var sum = atomic 0i64
+        \\    for i in 1..=5 {
+        \\        val s = sum
+        \\        val f = fun() { s += 1i64 }
+        \\        f()
+        \\    }
+        \\    sum
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 5), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5c recursive local function (letrec)" {
+    const allocator = std.testing.allocator;
+    // 嵌套 fun go 递归求和 1..=n；go 在自身体内是 upvalue，须经 letrec 自引用解析。
+    const src =
+        \\fun sumTo(n: i64): i64 {
+        \\    fun go(i: i64, acc: i64): i64 {
+        \\        if (i == 0i64) { acc } else { go(i - 1i64, acc + i) }
+        \\    }
+        \\    go(n, 0i64)
+        \\}
+    ;
+    const arg = Value{ .integer = .{ .value = 10, .type_tag = .i64 } };
+    try std.testing.expectEqual(@as(u128, 55), try compileAndCall(allocator, src, "sumTo", &.{arg}));
+}
+
+test "M5c ADT field coercion widens i8 literal to declared i32" {
+    const allocator = std.testing.allocator;
+    // Emp(.., salary: i32)：实参 100 推断成 i8，构造时须协调成 i32，否则 s*pct 溢出 i8。
+    const src =
+        \\type Emp = Emp(id: i32, salary: i32)
+        \\fun raise(e: Emp): i32 { match e { Emp(_, s) => s + s * 50 / 100 } }
+        \\fun run(): i32 { raise(Emp(1, 100)) }
+    ;
+    try std.testing.expectEqual(@as(u128, 150), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5b type() builtin returns runtime type name" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): str { type(42i32) }
+    ;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var lx = lexer.Lexer.init(aa, src);
+    const toks = try lx.tokenize();
+    var p = parser.Parser.init(aa, toks);
+    var module = try p.parseModule("t");
+    var mc = ModuleCompiler.init(allocator);
+    defer mc.deinit();
+    defer mc.program.deinit();
+    try mc.compileModule(&module);
+    const idx = mc.lookupFn("run").?;
+    var vm = vm_mod.VM.init(allocator);
+    defer vm.deinit();
+    const result = try vm.call(&mc.program, idx, &.{});
+    defer result.releaseVM(allocator);
+    try std.testing.expect(result == .string);
+    try std.testing.expectEqualStrings("i32", result.string);
+}
+
+test "M5d eq structural equality on arrays" {
+    const allocator = std.testing.allocator;
+    // eq 深比较：两独立数组结构相等 → true（VM Value.equals 是引用相等，eq 须深比较）。
+    const src =
+        \\fun run(): bool { eq([1i64, 2i64, 3i64], [1i64, 2i64, 3i64]) }
+    ;
+    try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
 }
 
 test "M3c conditional throw: Ok path" {

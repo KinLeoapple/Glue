@@ -134,6 +134,94 @@ fn literalPatternEq(pat: Value, obj: Value) bool {
     };
 }
 
+/// M5b：运行时类型名（镜像 eval.valueTypeName，纯 value→name）。供 type() native 用。
+fn vmValueTypeName(val: Value) []const u8 {
+    return switch (val) {
+        .integer => |iv| @tagName(iv.type_tag),
+        .float => |fv| @tagName(fv.type_tag),
+        .boolean => "bool",
+        .char_val => "char",
+        .string => "str",
+        .null_val => "null",
+        .unit => "unit",
+        .array => "array",
+        .record => "record",
+        .adt => |av| av.type_name,
+        .newtype => |nv| nv.type_name,
+        .range => "range",
+        .error_val => |e| e.type_name,
+        .throw_val => "Throw",
+        .partial => "partial",
+        .array_iterator => "array_iterator",
+        .string_iterator => "string_iterator",
+        .range_iterator => "range_iterator",
+        .atomic_val => "Atomic",
+        .spawn_val => "Spawn",
+        .channel_val => "Channel",
+        .sender_val => "Sender",
+        .receiver_val => "Receiver",
+        .trait_value => |tv| if (tv.trait_name.len > 0) tv.trait_name else "trait",
+        .lazy_val => "Lazy",
+        .cell_val => |c| vmValueTypeName(c.inner),
+        .closure, .builtin, .vm_closure => "function",
+    };
+}
+
+/// M5d：结构相等（深比较 array/record/adt/newtype），镜像 eval structuralEquals。供 eq() native 用。
+fn vmStructuralEquals(a: Value, b: Value) bool {
+    const at = std.meta.activeTag(a);
+    const bt = std.meta.activeTag(b);
+    if (at != bt) return false;
+    return switch (a) {
+        .integer => |iv| iv.value == b.integer.value,
+        .float => |fv| fv.value == b.float.value and fv.type_tag == b.float.type_tag,
+        .boolean => |bo| bo == b.boolean,
+        .char_val => |c| c == b.char_val,
+        .string => |s| std.mem.eql(u8, s, b.string),
+        .null_val => true,
+        .unit => true,
+        .range => |r| r.start == b.range.start and r.end == b.range.end and r.inclusive == b.range.inclusive,
+        .array => |arr| {
+            if (arr.elements.len != b.array.elements.len) return false;
+            for (arr.elements, b.array.elements) |x, y| {
+                if (!vmStructuralEquals(x, y)) return false;
+            }
+            return true;
+        },
+        .record => |rec| {
+            var it = rec.fields.iterator();
+            while (it.next()) |e| {
+                const bv = b.record.fields.get(e.key_ptr.*) orelse return false;
+                if (!vmStructuralEquals(e.value_ptr.*, bv)) return false;
+            }
+            var bit = b.record.fields.iterator();
+            while (bit.next()) |e| {
+                if (rec.fields.get(e.key_ptr.*) == null) return false;
+            }
+            return true;
+        },
+        .adt => |av| {
+            if (!std.mem.eql(u8, av.type_name, b.adt.type_name)) return false;
+            if (!std.mem.eql(u8, av.constructor, b.adt.constructor)) return false;
+            if (av.fields.len != b.adt.fields.len) return false;
+            for (av.fields, b.adt.fields) |fa, fb| {
+                if (!vmStructuralEquals(fa.value, fb.value)) return false;
+            }
+            return true;
+        },
+        .newtype => |nv| std.mem.eql(u8, nv.type_name, b.newtype.type_name) and vmStructuralEquals(nv.inner, b.newtype.inner),
+        .error_val => |e| std.mem.eql(u8, e.type_name, b.error_val.type_name) and std.mem.eql(u8, e.message, b.error_val.message),
+        // 其余（闭包/原语/迭代器等）引用相等。
+        else => a.equals(b),
+    };
+}
+
+/// M5d：scan/scanln 的持久 stdin reader 状态（镜像 eval StdinState）。
+const StdinState = struct {
+    buffer: [8192]u8 = undefined,
+    reader: std.Io.File.Reader,
+};
+
 pub const VM = struct {
     /// 操作数栈：局部变量也住这里（slot_base + slot 索引）。
     stack: std.ArrayListUnmanaged(Value) = .empty,
@@ -154,6 +242,10 @@ pub const VM = struct {
     /// M4d：嵌套运行停止深度。runLoop 在 frames 弹回此深度时返回（默认 0 = 入口帧）。
     /// force lazy thunk 时临时抬高，使 thunk RETURN 在其帧弹出即返回，不continue 外层。
     stop_depth: usize = 0,
+    /// M5d：scan/scanln 的 stdin 行缓冲 + 持久 reader（镜像 eval scan_line_buf/scan_line_pos/stdin_state）。
+    scan_line_buf: std.ArrayListUnmanaged(u8) = .empty,
+    scan_line_pos: usize = 0,
+    stdin_state: ?*StdinState = null,
 
     pub fn init(allocator: std.mem.Allocator) VM {
         return .{ .allocator = allocator };
@@ -183,6 +275,9 @@ pub const VM = struct {
         for (self.stack.items) |v| v.releaseVM(self.allocator);
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
+        // M5d：释放 scan 行缓冲 + stdin reader 状态。
+        self.scan_line_buf.deinit(self.allocator);
+        if (self.stdin_state) |state| self.allocator.destroy(state);
     }
 
     /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
@@ -457,6 +552,38 @@ pub const VM = struct {
                         self.stack.items[dst] = v; // 所有权从栈转移到 slot
                     }
                 },
+                // M5c：letrec 自绑定。写闭包进 slot 的 cell.inner；若闭包捕获了该 cell（自引用），
+                // 对 cell 少持一份 ref，断开 cell↔closure 循环（镜像 eval 弱自引用）。
+                .op_set_local_letrec => {
+                    const slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const v = self.pop();
+                    const dst = frame.slot_base + slot;
+                    const cur = self.stack.items[dst];
+                    // letrec 路径保证 slot 已 box 成 cell（先 op_unit + op_set_local 占位）。
+                    if (cur == .cell_val) {
+                        const cell = cur.cell_val;
+                        cell.inner.releaseVM(self.allocator); // 释放占位 unit
+                        cell.inner = v; // cell 持有闭包（强）
+                        // 断环：闭包的 upvalue 若指向本 cell（递归自捕获），op_closure 已 retain 过
+                        // 该 cell（rc+1）。标记该 upvalue 为弱（self_upvalue_idx），并 cell.rc-=1
+                        // 抵消 op_closure 的 retain。此后 cell↔closure 无循环计数：cell 归零释放
+                        // closure，closure 释放时跳过弱自引用（不反向释放 cell）。
+                        if (v == .vm_closure) {
+                            const vc = v.vm_closure;
+                            for (vc.upvalues, 0..) |uv, i| {
+                                if (uv == .cell_val and uv.cell_val == cell) {
+                                    vc.self_upvalue_idx = @intCast(i);
+                                    cell.rc -= 1;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        cur.releaseVM(self.allocator);
+                        self.stack.items[dst] = v;
+                    }
+                },
                 .op_get_upvalue => {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
@@ -649,6 +776,23 @@ pub const VM = struct {
                     const arr = value.Value.makeArray(self.allocator, elems, null) catch return error.OutOfMemory;
                     try self.push(arr);
                 },
+                // M5：数组拼接 `++` —— 弹 [left,right] 数组，拼新数组（元素各 retainOwned），压结果。
+                .op_concat_list => {
+                    const right = self.pop();
+                    defer right.releaseVM(self.allocator);
+                    const left = self.pop();
+                    defer left.releaseVM(self.allocator);
+                    if (left != .array or right != .array) {
+                        return self.fail(loc, "operator '++' requires array operands", error.TypeMismatch);
+                    }
+                    const la = left.array.elements;
+                    const ra = right.array.elements;
+                    const elems = self.allocator.alloc(Value, la.len + ra.len) catch return error.OutOfMemory;
+                    for (la, 0..) |e, i| elems[i] = try self.retainOwned(e);
+                    for (ra, 0..) |e, i| elems[la.len + i] = try self.retainOwned(e);
+                    const arr = value.Value.makeArray(self.allocator, elems, null) catch return error.OutOfMemory;
+                    try self.push(arr);
+                },
                 .op_make_record => {
                     const shape_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
@@ -713,6 +857,14 @@ pub const VM = struct {
                     const tname = func.chunk.constants.items[name_idx].string;
                     try self.doCast(tname, loc);
                 },
+                // M5：隐式数值定型（best-effort）。仅 int/float 且目标 builtin 数值类型时协调，
+                // 溢出/不符/非数值原样保留（不 panic）。镜像 eval `castValue catch val`。
+                .op_coerce => {
+                    const name_idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const tname = func.chunk.constants.items[name_idx].string;
+                    self.doCoerce(tname);
+                },
                 // M3b：字段赋值 —— [record, val] → [new_record]（COW），写回由 SET_LOCAL 完成。
                 .op_set_field => {
                     const name_idx = opcode.readU16(code, frame.ip);
@@ -764,18 +916,29 @@ pub const VM = struct {
                     frame.ip += 1;
                     const obj = self.pop();
                     defer obj.releaseVM(self.allocator);
-                    const matched = obj == .throw_val and switch (obj.throw_val.*) {
-                        .ok => want_ok == 1,
-                        .err => want_ok == 0,
-                    };
+                    // 镜像 eval pattern.zig：throw_val 按 ok/err 分支；非 throw_val 的裸值
+                    // 视作 Ok 载荷（Ok(v) 匹配裸值绑定 v 本身），故 want_ok==1 时裸值也命中。
+                    const matched = if (obj == .throw_val)
+                        switch (obj.throw_val.*) {
+                            .ok => want_ok == 1,
+                            .err => want_ok == 0,
+                        }
+                    else
+                        want_ok == 1;
                     try self.push(Value{ .boolean = matched });
                 },
                 // M3c：match Ok(v) 绑定 —— 弹 throw_val，retainOwned 其 .ok 内值压栈。
+                // 裸值（非 throw_val）直接作为 Ok 载荷压回（镜像 eval matchConstructorPattern）。
                 .op_get_throw_ok => {
                     const obj = self.pop();
-                    defer obj.releaseVM(self.allocator);
-                    if (obj != .throw_val or obj.throw_val.* != .ok) return self.fail(loc, "OP_GET_THROW_OK on non-Ok", error.TypeMismatch);
-                    try self.push(try self.retainOwned(obj.throw_val.ok.*));
+                    if (obj != .throw_val) {
+                        // 裸值即 Ok 载荷：所有权直接转回栈（不 release、不 retain）。
+                        try self.push(obj);
+                    } else {
+                        defer obj.releaseVM(self.allocator);
+                        if (obj.throw_val.* != .ok) return self.fail(loc, "OP_GET_THROW_OK on non-Ok", error.TypeMismatch);
+                        try self.push(try self.retainOwned(obj.throw_val.ok.*));
+                    }
                 },
                 // M3c：match Error(e) 绑定 —— 弹 throw_val，把 .err 包成 error_val 压栈。
                 .op_get_throw_err => {
@@ -835,13 +998,24 @@ pub const VM = struct {
                     frame.ip += 2;
                     const cur = self.stack.items[frame.slot_base + slot];
                     const v = if (cur == .cell_val) cur.cell_val.inner else cur;
-                    try self.push(try self.retainOwned(v));
+                    // raw 保留 atomic 引用（cas/swap 与 val 别名需要），但仍透明 force lazy
+                    // （lazy 绑定语义与 eval 一致：bind 即 force；lazy 无方法，受者位置 force 亦正确）。
+                    if (v == .lazy_val and v.lazy_val.vm_thunk != null) {
+                        try self.push(try self.forceLazyVM(v.lazy_val, loc));
+                    } else {
+                        try self.push(try self.retainOwned(v));
+                    }
                 },
                 .op_get_upvalue_raw => {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const cell = frame.upvalues[idx].cell_val;
-                    try self.push(try self.retainOwned(cell.inner));
+                    const v = cell.inner;
+                    if (v == .lazy_val and v.lazy_val.vm_thunk != null) {
+                        try self.push(try self.forceLazyVM(v.lazy_val, loc));
+                    } else {
+                        try self.push(try self.retainOwned(v));
+                    }
                 },
                 // M4a：Atomic 透明复合赋值 —— slot 持 atomic → 原子 fetch<op>（不重写 slot）；否则常规读改写。
                 .op_compound_local => {
@@ -1065,7 +1239,129 @@ pub const VM = struct {
                 ch.* = value.ChannelValue.init(self.allocator, cap);
                 try self.push(Value{ .channel_val = ch });
             },
+            // M5b：type(v) —— 返回运行时类型名字符串（镜像 eval builtinTypeName/valueTypeName）。
+            .type_of => {
+                if (argc != 1) return self.fail(loc, "type expects 1 argument", error.WrongArity);
+                const v = self.pop();
+                defer v.releaseVM(self.allocator);
+                const name = vmValueTypeName(v);
+                try self.push(Value{ .string = self.allocator.dupe(u8, name) catch return error.OutOfMemory });
+            },
+            // M5d：eq(a, b) —— 结构相等（深比较 array/record/adt/newtype），镜像 eval structuralEquals。
+            .eq => {
+                if (argc != 2) return self.fail(loc, "eq expects 2 arguments", error.WrongArity);
+                const b = self.pop();
+                defer b.releaseVM(self.allocator);
+                const a = self.pop();
+                defer a.releaseVM(self.allocator);
+                try self.push(Value{ .boolean = vmStructuralEquals(a, b) });
+            },
+            // M5d：Panic(v) —— 格式化 v 后触发 VM panic（镜像 eval builtinPanic）。
+            .panic => {
+                if (argc != 1) return self.fail(loc, "Panic expects 1 argument", error.WrongArity);
+                const v = self.pop();
+                defer v.releaseVM(self.allocator);
+                var buf = std.ArrayList(u8).empty;
+                defer buf.deinit(self.allocator);
+                v.format(&buf, self.allocator, false) catch {};
+                // 拷进 err_msg（VM panic 报告读取）；用 allocator 持有（与 fail 一致，进程退出不回收）。
+                const msg = self.allocator.dupe(u8, buf.items) catch "panic";
+                return self.fail(loc, msg, error.Unsupported);
+            },
+            // M5d：eprintln/eprint —— 写 stderr（镜像 eval builtinEprintln/builtinEprint）。
+            .eprintln, .eprint => {
+                if (argc != 1) return self.fail(loc, "eprintln/eprint expects 1 argument", error.WrongArity);
+                const v = self.pop();
+                defer v.releaseVM(self.allocator);
+                var buf = std.ArrayList(u8).empty;
+                defer buf.deinit(self.allocator);
+                v.format(&buf, self.allocator, false) catch return error.OutOfMemory;
+                if (nat == .eprintln) buf.append(self.allocator, '\n') catch {};
+                if (self.io) |io| {
+                    var err_buf: [4096]u8 = undefined;
+                    var w = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                    w.interface.print("{s}", .{buf.items}) catch {};
+                    w.flush() catch {};
+                } else {
+                    std.debug.print("{s}", .{buf.items});
+                }
+                try self.push(Value.unit);
+            },
+            // M5d：scan() —— 读下一个空白分隔 token（跨行），EOF 返回 null（镜像 eval builtinScan）。
+            .scan => {
+                if (argc != 0) return self.fail(loc, "scan expects 0 arguments", error.WrongArity);
+                try self.push(try self.doScan(loc));
+            },
+            // M5d：scanln() —— 读当前行剩余内容（或下一整行），EOF 返回 null（镜像 eval builtinScanln）。
+            .scanln => {
+                if (argc != 0) return self.fail(loc, "scanln expects 0 arguments", error.WrongArity);
+                try self.push(try self.doScanln(loc));
+            },
         }
+    }
+
+    /// M5d：scan token 提取 + 跨行读取（镜像 eval builtinScan）。
+    fn doScan(self: *VM, loc: ast.SourceLocation) VMError!Value {
+        while (true) {
+            if (self.scan_line_pos < self.scan_line_buf.items.len) {
+                const remaining = self.scan_line_buf.items[self.scan_line_pos..];
+                var start: usize = 0;
+                while (start < remaining.len and (remaining[start] == ' ' or remaining[start] == '\t' or remaining[start] == '\r')) start += 1;
+                if (start < remaining.len) {
+                    var end = start + 1;
+                    while (end < remaining.len and remaining[end] != ' ' and remaining[end] != '\t' and remaining[end] != '\r') end += 1;
+                    const token = remaining[start..end];
+                    self.scan_line_pos += end;
+                    return Value{ .string = self.allocator.dupe(u8, token) catch return error.OutOfMemory };
+                }
+            }
+            const has_line = try self.readNextLine(loc);
+            if (!has_line) return Value.null_val;
+        }
+    }
+
+    /// M5d：scanln —— 当前行剩余 / 下一整行 / EOF→null（镜像 eval builtinScanln）。
+    fn doScanln(self: *VM, loc: ast.SourceLocation) VMError!Value {
+        if (self.scan_line_pos < self.scan_line_buf.items.len) {
+            const remaining = self.scan_line_buf.items[self.scan_line_pos..];
+            const owned = self.allocator.dupe(u8, remaining) catch return error.OutOfMemory;
+            self.scan_line_pos = self.scan_line_buf.items.len;
+            return Value{ .string = owned };
+        }
+        const has_line = try self.readNextLine(loc);
+        if (!has_line) return Value.null_val;
+        const owned = self.allocator.dupe(u8, self.scan_line_buf.items) catch return error.OutOfMemory;
+        self.scan_line_pos = self.scan_line_buf.items.len;
+        return Value{ .string = owned };
+    }
+
+    /// M5d：读 stdin 一行到 scan_line_buf（去尾部 CR），EOF 返回 false（镜像 eval readNextLine）。
+    fn readNextLine(self: *VM, loc: ast.SourceLocation) VMError!bool {
+        const reader = try self.ensureStdinReader(loc);
+        self.scan_line_buf.clearRetainingCapacity();
+        const line = reader.takeDelimiter('\n') catch {
+            return self.fail(loc, "scan: IO error", error.Unsupported);
+        };
+        if (line) |l| {
+            const trimmed = if (l.len > 0 and l[l.len - 1] == '\r') l[0 .. l.len - 1] else l;
+            self.scan_line_buf.appendSlice(self.allocator, trimmed) catch return error.OutOfMemory;
+            self.scan_line_pos = 0;
+            return true;
+        }
+        return false;
+    }
+
+    /// M5d：惰性建持久 stdin reader（镜像 eval ensureStdinReader）。
+    fn ensureStdinReader(self: *VM, loc: ast.SourceLocation) VMError!*std.Io.Reader {
+        if (self.stdin_state) |state| return &state.reader.interface;
+        const io = self.io orelse return self.fail(loc, "scan: no IO context", error.Unsupported);
+        const state = self.allocator.create(StdinState) catch return error.OutOfMemory;
+        state.* = .{
+            .buffer = undefined,
+            .reader = std.Io.File.Reader.initStreaming(std.Io.File.stdin(), io, &state.buffer),
+        };
+        self.stdin_state = state;
+        return &state.reader.interface;
     }
 
     /// 执行 OP_MAKE_ADT：弹栈顶 argc 个字段值（owned，接管），按 program.adt_ctors[ctor_idx]
@@ -1078,7 +1374,17 @@ pub const VM = struct {
         const base = self.stack.items.len - argc;
         var i: usize = 0;
         while (i < argc) : (i += 1) {
-            fields[i] = .{ .name = desc.field_names[i], .value = self.stack.items[base + i] };
+            var fv = self.stack.items[base + i];
+            // M5c：字段隐式数值定型（如 salary: i32 把 i8 实参 100 协调成 i32）。best-effort，
+            // 仅 int/float + builtin 数值类型名时协调；失败原样。数值是内联值，无 rc 影响。
+            if (desc.field_types[i]) |tn| {
+                if (fv == .integer or fv == .float) {
+                    if (cast.castNumeric(fv, tn)) |coerced| {
+                        fv = coerced;
+                    } else |_| {}
+                }
+            }
+            fields[i] = .{ .name = desc.field_names[i], .value = fv };
         }
         self.stack.shrinkRetainingCapacity(base);
         const av = self.allocator.create(value.AdtValue) catch return error.OutOfMemory;
@@ -1120,6 +1426,18 @@ pub const VM = struct {
             error.CastTypeMismatch => return self.fail(loc, "invalid type conversion", error.TypeMismatch),
         };
         try self.push(result);
+    }
+
+    /// M5：隐式数值定型（OP_COERCE）。栈顶 peek，仅当为 int/float 且目标为 builtin 数值类型时
+    /// 用 cast.castNumeric 协调 type_tag（拓宽/收窄），替换栈顶；任何失败（溢出/类型不符/非数值/
+    /// 泛型类型名）原样保留——绝不 panic。镜像 eval 的 `castValue(...) catch val` best-effort 隐式协调。
+    /// 注意：与 doCast 不同，不处理 str（隐式协调不做 to-string，保持值语义）。
+    fn doCoerce(self: *VM, type_name: []const u8) void {
+        const top = &self.stack.items[self.stack.items.len - 1];
+        if (top.* != .integer and top.* != .float) return; // 非数值：原样
+        const result = cast.castNumeric(top.*, type_name) catch return; // 溢出/不符：原样
+        // 数值是内联值类型（无 rc / 无分配），直接替换栈顶，无需 release 旧值。
+        top.* = result;
     }
 
     /// 执行 OP_GET_FIELD：弹对象，按名读 adt/record 字段，retainOwned 压栈，release 对象。
@@ -1392,6 +1710,25 @@ pub const VM = struct {
             try self.push(Value.unit);
             return;
         }
+        // M5：status() —— 返回 SpawnStatus ADT 值（无字段构造器），镜像 eval makeSpawnStatus。
+        if (std.mem.eql(u8, name, "status")) {
+            if (args.len != 0) return self.fail(loc, "status expects 0 arguments", error.WrongArity);
+            const s = handle.status.load(.seq_cst);
+            const ctor: []const u8 = switch (s) {
+                .Pending => "Pending",
+                .Running => "Running",
+                .Completed => "Completed",
+                .Cancelled => "Cancelled",
+                .Failed => "Failed",
+            };
+            const av = self.allocator.create(value.AdtValue) catch return error.OutOfMemory;
+            av.* = .{ .type_name = "SpawnStatus", .constructor = ctor, .fields = &[_]value.AdtField{}, .rc = 1 };
+            for (args) |a| a.releaseVM(self.allocator);
+            receiver.releaseVM(self.allocator);
+            self.stack.shrinkRetainingCapacity(args_start - 1);
+            try self.push(Value{ .adt = av });
+            return;
+        }
         return self.fail(loc, "no such method on Spawn", error.TypeMismatch);
     }
 
@@ -1557,8 +1894,11 @@ pub const VM = struct {
     /// M3d：执行 OP_FOR_NEXT。iter_slot 持 array/range/string，idx_slot 持索引（i64）。
     /// 耗尽 → ip += exit_off（不压元素）；否则压当前元素（retainOwned）+ idx 自增。
     fn doForNext(self: *VM, frame: *CallFrame, iter_slot: u16, idx_slot: u16, exit_off: i32, loc: ast.SourceLocation) VMError!void {
-        const iter = self.stack.items[frame.slot_base + iter_slot];
-        const idx_v = self.stack.items[frame.slot_base + idx_slot];
+        const iter_raw = self.stack.items[frame.slot_base + iter_slot];
+        const idx_raw = self.stack.items[frame.slot_base + idx_slot];
+        // 闭包捕获可能把 iter/idx slot 就地 box 成 *Cell（如循环体内 spawn 捕获循环变量）；透明解包。
+        const iter = if (iter_raw == .cell_val) iter_raw.cell_val.inner else iter_raw;
+        const idx_v = if (idx_raw == .cell_val) idx_raw.cell_val.inner else idx_raw;
         const idx: i64 = @intCast(idx_v.integer.value);
         switch (iter) {
             .array => |arr| {
@@ -1594,8 +1934,13 @@ pub const VM = struct {
             },
             else => return self.fail(loc, "for: value is not iterable", error.TypeMismatch),
         }
-        // idx++（仅在未耗尽时到达此处）。
-        self.stack.items[frame.slot_base + idx_slot] = Value{ .integer = .{ .value = @intCast(idx + 1), .type_tag = .i64 } };
+        // idx++（仅在未耗尽时到达此处）。若 idx slot 被 box 成 cell，写 cell.inner。
+        const new_idx = Value{ .integer = .{ .value = @intCast(idx + 1), .type_tag = .i64 } };
+        if (idx_raw == .cell_val) {
+            idx_raw.cell_val.inner = new_idx; // inner 是 i64 内联值，无需 release
+        } else {
+            self.stack.items[frame.slot_base + idx_slot] = new_idx;
+        }
     }
 
     /// 执行一次 OP_CALL_VALUE（M1b）：栈布局 [callee, arg0..]，callee 在 args 下方。默认柯里化：
@@ -1706,6 +2051,14 @@ pub const VM = struct {
             if (!result_type.inRange(result)) return self.fail(loc, "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
             return Value{ .integer = .{ .value = result, .type_tag = result_type } };
         }
+        // M5：字符串拼接 s + t（镜像 eval.evalAdd 的 string+string 分支）。
+        if (op == .op_add and left == .string and right == .string) {
+            var result = std.ArrayList(u8).empty;
+            result.appendSlice(self.allocator, left.string) catch return error.OutOfMemory;
+            result.appendSlice(self.allocator, right.string) catch return error.OutOfMemory;
+            const owned = result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+            return Value{ .string = owned };
+        }
         return self.arithFloat(op, left, right, loc);
     }
 
@@ -1737,8 +2090,24 @@ pub const VM = struct {
 
     /// 比较：== != < > <= >=。返回 bool。
     fn compare(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
-        if (op == .op_eq) return Value{ .boolean = left.equals(right) };
-        if (op == .op_neq) return Value{ .boolean = !left.equals(right) };
+        // == / !=：数值按 promoteIntTypes 后**按值**比较（忽略 type_tag），镜像 eval evalBinary .eq/.not_eq。
+        // 关键：隐式定型（OP_COERCE）后操作数 tag 可能不同（如 i32 形参 vs i8 字面量），
+        // 不能用 tag-strict 的 Value.equals，否则 `n == 0` 恒 false（M5 整数定型回归）。
+        if (op == .op_eq or op == .op_neq) {
+            if (left == .integer and right == .integer) {
+                const rt = value.promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
+                const lv: i128 = if (rt.isSigned()) @bitCast(left.integer.value) else @intCast(left.integer.value);
+                const rv: i128 = if (rt.isSigned()) @bitCast(right.integer.value) else @intCast(right.integer.value);
+                const eq = lv == rv;
+                return Value{ .boolean = if (op == .op_eq) eq else !eq };
+            }
+            if (left == .float and right == .float) {
+                const eq = left.float.value == right.float.value;
+                return Value{ .boolean = if (op == .op_eq) eq else !eq };
+            }
+            const eq = left.equals(right);
+            return Value{ .boolean = if (op == .op_eq) eq else !eq };
+        }
         if (left == .integer and right == .integer) {
             const result_type = value.promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
             const lv: i128 = if (result_type.isSigned()) @bitCast(left.integer.value) else @intCast(left.integer.value);
@@ -1749,6 +2118,17 @@ pub const VM = struct {
             const lf: f128 = if (left == .float) left.float.value else intToFloat(left.integer);
             const rf: f128 = if (right == .float) right.float.value else intToFloat(right.integer);
             return Value{ .boolean = ordCmp(op, lf, rf) };
+        }
+        // M5：字符串字典序比较（镜像 eval evalLt/Gt/Le/Ge 的 string 分支，std.mem.order）。
+        if (left == .string and right == .string) {
+            const ord = std.mem.order(u8, left.string, right.string);
+            return Value{ .boolean = switch (op) {
+                .op_lt => ord == .lt,
+                .op_gt => ord == .gt,
+                .op_le => ord != .gt,
+                .op_ge => ord != .lt,
+                else => unreachable,
+            } };
         }
         return self.fail(loc, "comparison requires numeric operands", error.TypeMismatch);
     }

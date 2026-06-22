@@ -5,6 +5,7 @@ const parser = @import("parser");
 const ast = @import("ast");
 const eval = @import("eval");
 const slab_pool = @import("slab_pool");
+const vm = @import("vm");
 
 /// 把求值器错误映射为专业英文消息（Go/Java 风格）。
 /// 若求值器已经设置了带上下文的 panic_message（如 "no method 'x' on type 'array'"），
@@ -47,6 +48,30 @@ const Manifest = struct {
 const MANIFEST_NAME = "glue.toml";
 const DEFAULT_ENTRY = "src/Main.glue";
 
+// ============================================================
+// M5：字节码 VM 接入开关（进程级，main 启动时从环境变量初始化一次）
+// ============================================================
+
+/// VM 路径默认开启（回退兜底保证正确）。`GLUE_VM=0` 关闭，全程走树遍历器。
+var vm_enabled: bool = true;
+/// `GLUE_VM_TRACE=1`：向 stderr 打印每个模块是 ran-VM 还是 fell-back（覆盖率度量）。
+var vm_trace: bool = false;
+
+fn vmEnabled() bool {
+    return vm_enabled;
+}
+
+/// 从环境变量初始化 VM 开关。env 为 null（无 environ）时保持默认。
+fn initVmFlags(env: ?*std.process.Environ.Map) void {
+    const e = env orelse return;
+    if (e.get("GLUE_VM")) |v| {
+        if (std.mem.eql(u8, v, "0")) vm_enabled = false;
+    }
+    if (e.get("GLUE_VM_TRACE")) |v| {
+        if (std.mem.eql(u8, v, "1")) vm_trace = true;
+    }
+}
+
 fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writerStreaming(io, &buf);
@@ -74,6 +99,8 @@ pub fn main(init: std.process.Init) !void {
 
     const allocator = init.gpa;
     const io = init.io;
+
+    initVmFlags(init.environ_map);
 
     const args_slice = try std.process.Args.toSlice(init.minimal.args, init.arena.allocator());
 
@@ -317,10 +344,11 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
     ev.use_lexical_addressing = true; // 任务#2:De Bruijn 局部变量数组快路径(自校验回退,绝不静默损坏)
     defer ev.deinit();
 
-    const has_error = executeSource(arena_alloc, &ev, io, source, entry_path);
+    const outcome = executeSource(arena_alloc, &ev, io, source, entry_path);
 
-    var run_failed = has_error;
-    if (!has_error) {
+    // ran_main：VM 已执行 main，无需 invokeMain。needs_main：树遍历器跑入口。failed：直接失败。
+    var run_failed = outcome == .failed;
+    if (outcome == .needs_main) {
         run_failed = invokeMain(&ev, io, entry_path, false);
     }
 
@@ -346,8 +374,8 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
         ev.global_env.value_allocator = ev.value_allocator;
         ev.use_lexical_addressing = true; // 任务#2:开启(debug 路径同样)
         defer ev.deinit();
-        const had_err = executeSource(dbg_alloc, &ev, io, source, entry_path);
-        if (!had_err) {
+        const outcome = executeSource(dbg_alloc, &ev, io, source, entry_path);
+        if (outcome == .needs_main) {
             _ = invokeMain(&ev, io, entry_path, true);
         }
     }
@@ -392,7 +420,114 @@ fn invokeMain(ev: *eval.Evaluator, io: std.Io, entry_path: []const u8, trace: bo
     return false;
 }
 
-fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, source: []const u8, filename: []const u8) bool {
+// ============================================================
+// M5：字节码 VM 执行路径 + 树遍历器回退
+// ============================================================
+
+/// tryRunOnVM 的结果。
+/// - ran_main：VM 已编译并执行 main（含 println 等副作用），调用方跳过 invokeMain。
+/// - fell_back：模块未尝试 VM（不 eligible），准备阶段未跑，调用方走完整 evalModule。
+/// - fell_back_prepared：VM eligible 但编译/运行不支持；prepareModuleForVm 已跑完准备阶段，
+///   调用方须走 evalModulePrepared（跳过重复准备，否则类型检查器误报 duplicate type）。
+/// - failed：准备阶段（类型检查）失败或 VM 运行期 panic（已报告），调用方非零退出。
+const VmOutcome = enum { ran_main, fell_back, fell_back_prepared, failed };
+
+/// 保守的 VM 资格预扫描：仅当所有顶层声明都是 VM 编译器能完整处理的种类时才尝试 VM。
+/// `compileModule` 对 use/trait/impl/pack/顶层 val/record 等是**静默跳过**（else => {}），
+/// 若不预扫描，这些模块会编出残缺 Program（如顶层 val 副作用丢失、main 引用导入名失败）。
+/// 预扫描确保只有 fun + adt/newtype + 无副作用裸表达式构成的模块进 VM，其余整体回退。
+fn vmEligible(module: ast.Module) bool {
+    var has_main = false;
+    for (module.declarations) |decl| {
+        switch (decl) {
+            .fun_decl => |f| {
+                if (std.mem.eql(u8, f.name, "main")) has_main = true;
+            },
+            .type_decl => |td| switch (td.def) {
+                // VM 编译器登记 adt/newtype 构造器；alias 无运行时效果（仅类型注解用，
+                // 编译器忽略）→ 安全 eligible。record/gadt/error_newtype 未支持 → 回退。
+                .adt, .newtype, .alias => {},
+                else => return false,
+            },
+            // 裸表达式语句（无 stmt）在模块级不执行（文档 D13），VM 与树遍历器一致跳过 → 安全。
+            // 但带 stmt 的（顶层 val/var）VM 不处理 → 回退。
+            .expr_decl => |ed| if (ed.stmt != null) return false,
+            // use/trait/impl/pack：VM 无对应运行时 → 回退。
+            else => return false,
+        }
+    }
+    return has_main;
+}
+
+/// 尝试在字节码 VM 上整体编译并执行模块（含 main）。
+/// value_alloc 与树遍历器 value_allocator 同源，使 glue debug 的 DebugAllocator 能检测 VM 路径泄漏。
+fn tryRunOnVM(
+    allocator: std.mem.Allocator,
+    ev: *eval.Evaluator,
+    io: std.Io,
+    module: ast.Module,
+    filename: []const u8,
+) VmOutcome {
+    if (!vmEligible(module)) {
+        if (vm_trace) printErr(io, "[vm] {s}: fell back (unsupported top-level decl)\n", .{filename});
+        return .fell_back;
+    }
+
+    // 准备阶段：use 预加载（此处无 use）+ 类型检查 + resolve。与树遍历器同一逻辑。
+    ev.prepareModuleForVm(module) catch |err| switch (err) {
+        // 类型检查失败：错误已打印；同树遍历器路径以非零退出，不回退（回退也会同样失败）。
+        error.TypeCheckFailed => return .failed,
+        error.CircularDependency => {
+            printErr(io, "{s}: error: circular module dependency\n", .{filename});
+            return .failed;
+        },
+        else => {
+            // 准备阶段其它错误（OOM 等）→ 回退树遍历器，让其走完整错误处理。
+            if (vm_trace) printErr(io, "[vm] {s}: fell back (prepare error: {s})\n", .{ filename, @errorName(err) });
+            return .fell_back;
+        },
+    };
+
+    // 编译模块 → Program。任何 Unsupported → 回退（准备阶段已完成 → fell_back_prepared）。
+    var mc = vm.ModuleCompiler.init(allocator);
+    defer mc.deinit();
+    defer mc.program.deinit();
+    mc.compileModule(&module) catch |err| {
+        if (vm_trace) printErr(io, "[vm] {s}: fell back (compile: {s})\n", .{ filename, @errorName(err) });
+        return .fell_back_prepared;
+    };
+
+    const entry = mc.lookupFn("main") orelse {
+        if (vm_trace) printErr(io, "[vm] {s}: fell back (no main)\n", .{filename});
+        return .fell_back_prepared;
+    };
+
+    // 执行：main arity 0。值分配器与树遍历器同源（leak 检测可达 VM 路径）。
+    var machine = vm.VM.initWithIo(ev.value_allocator, io);
+    defer machine.deinit();
+    const result = machine.call(&mc.program, entry, &.{}) catch |err| {
+        // VM 运行期错误：用 err_loc/err_msg 报告（同 invokeMain 的 runtime panic 风格）。
+        const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
+        const loc: ?ast.SourceLocation = if (machine.err_loc.line > 0) machine.err_loc else null;
+        var err_buf: [4096]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+        printRuntimeDiag(&stderr_writer.interface, filename, loc, "runtime panic", msg);
+        stderr_writer.flush() catch {};
+        return .failed;
+    };
+    result.releaseVM(ev.value_allocator);
+
+    if (vm_trace) printErr(io, "[vm] {s}: ran on VM\n", .{filename});
+    return .ran_main;
+}
+
+/// executeSource 的三态结果（M5）.
+/// - failed：出错（已报告），调用方以非零码退出，不再 callMain。
+/// - needs_main：模块声明已求值（树遍历器），调用方需 invokeMain 跑入口。
+/// - ran_main：VM 已整体编译并执行 main，调用方跳过 invokeMain。
+const ExecOutcome = enum { failed, needs_main, ran_main };
+
+fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, source: []const u8, filename: []const u8) ExecOutcome {
     // 词法分析
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
@@ -402,7 +537,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         stderr_writer.interface.print("{s}: lexer error: {s}\n", .{ filename, @errorName(err) }) catch {};
         stderr_writer.flush() catch {};
-        return true;
+        return .failed;
     };
     defer allocator.free(tokens);
 
@@ -423,10 +558,10 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
                     stderr_writer.interface.print("{s}:{d}:{d}: parse error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
                 }
                 stderr_writer.flush() catch {};
-                return true;
+                return .failed;
             };
             _ = expr_fallback;
-            return true;
+            return .failed;
         };
         defer allocator.free(module_errors);
 
@@ -443,7 +578,7 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
                 stderr_writer.interface.print("{s}:{d}:{d}: parse error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
             }
             stderr_writer.flush() catch {};
-            return true;
+            return .failed;
         };
 
         // 求值表达式
@@ -455,14 +590,14 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
                 printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "panic", msg);
                 stderr_writer.flush() catch {};
                 ev.panic_message = null;
-                return true;
+                return .failed;
             },
             else => {
                 var err_buf: [4096]u8 = undefined;
                 var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
                 printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
                 stderr_writer.flush() catch {};
-                return true;
+                return .failed;
             },
         };
 
@@ -470,14 +605,14 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         if (result != .unit) {
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(allocator);
-            result.format(&buf, allocator, false) catch return true;
+            result.format(&buf, allocator, false) catch return .failed;
             buf.append(allocator, '\n') catch {};
             var out_buf: [4096]u8 = undefined;
             var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
             stdout_writer.interface.print("{s}", .{buf.items}) catch {};
             stdout_writer.flush() catch {};
         }
-        return false;
+        return .needs_main;
     };
 
     // 求值模块
@@ -485,7 +620,25 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
     // （文档 §4.5）。否则从父目录运行 `glue dir/Main.glue` 时基目录误为 `.`。
     var entry_module = module;
     entry_module.source_path = filename;
-    ev.evalModule(entry_module) catch |err| switch (err) {
+
+    // M5：先尝试字节码 VM 路径（VM-eligible 模块整体编译+执行；含 main）。
+    // 不支持的特性（use/trait/impl/顶层 val/HKT/...）整体回退树遍历器，语义不变。
+    var skip_prepare = false; // 回退时是否跳过准备阶段（VM 已 prepareModuleForVm）。
+    if (vmEnabled()) {
+        switch (tryRunOnVM(allocator, ev, io, entry_module, filename)) {
+            .ran_main => return .ran_main, // VM 已执行 main，调用方跳过 invokeMain
+            .failed => return .failed, // VM 运行期 panic / 类型检查失败（已报告）
+            .fell_back => {}, // 未尝试 VM：走完整 evalModule（含准备阶段）
+            .fell_back_prepared => skip_prepare = true, // VM 已准备：走 evalModulePrepared
+        }
+    }
+
+    const eval_result = if (skip_prepare)
+        ev.evalModulePrepared(entry_module)
+    else
+        ev.evalModule(entry_module);
+
+    eval_result catch |err| switch (err) {
         error.GluePanic => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
@@ -493,34 +646,34 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
             printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime panic", msg);
             stderr_writer.flush() catch {};
             ev.panic_message = null;
-            return true;
+            return .failed;
         },
         error.CircularDependency => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
             stderr_writer.interface.print("{s}: error: circular module dependency\n", .{filename}) catch {};
             stderr_writer.flush() catch {};
-            return true;
+            return .failed;
         },
         // 类型检查失败：错误已在 evalModule 内打印到 stderr，这里只需标记失败
         // （返回 true → 不调 callMain，避免 "undefined entry point" 误报）。
-        error.TypeCheckFailed => return true,
+        error.TypeCheckFailed => return .failed,
         error.AmbiguousModule => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
             stderr_writer.interface.print("{s}: error: ambiguous module — both a flat file 'Mod.glue' and a directory module 'Mod/pack.glue' exist; remove one\n", .{filename}) catch {};
             stderr_writer.flush() catch {};
-            return true;
+            return .failed;
         },
         else => {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
             printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
             stderr_writer.flush() catch {};
-            return true;
+            return .failed;
         },
     };
-    return false;
+    return .needs_main;
 }
 
 fn setWindowsConsoleUtf8() void {

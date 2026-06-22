@@ -1656,6 +1656,17 @@ pub const Evaluator = struct {
     // ============================================================
 
     pub fn evalModule(self: *Evaluator, module: ast.Module) !void {
+        return self.evalModuleImpl(module, false);
+    }
+
+    /// M5：VM 回退入口。VM 路径已调用 prepareModuleForVm（use 预加载 + 类型检查 + resolve），
+    /// 类型检查器的 adt_types/trait 注册表不随 resetForNextModule 清空，再跑一次会误报 duplicate。
+    /// 故回退时跳过准备阶段，只求值声明体。
+    pub fn evalModulePrepared(self: *Evaluator, module: ast.Module) !void {
+        return self.evalModuleImpl(module, true);
+    }
+
+    fn evalModuleImpl(self: *Evaluator, module: ast.Module, skip_prepare: bool) !void {
         const module_name = module.name;
 
         // 循环依赖检测：如果模块正在加载中，说明存在循环依赖
@@ -1695,64 +1706,14 @@ pub const Evaluator = struct {
             }
         }
 
-        // 跨模块导入预加载（文档 §4.5 use）：在类型检查本模块之前，
-        // 先加载并检查所有 use 依赖。这样依赖模块的导出函数 scheme 会被
-        // 注册到 type_inferencer.exported_schemes，本模块的类型检查才能
-        // 解析这些导入名字。依赖的运行时值也会在此一并求值（共享 global_env），
-        // 后续本模块求值时 use_decl 只是从导出表引用已存在的值。
-        // loading_modules 已包含本模块名，依赖若反向 use 本模块会触发循环依赖错误。
-        for (module.declarations) |decl| {
-            if (decl == .use_decl) {
-                const ud = decl.use_decl;
-                if (ud.module_path.len == 0) continue;
-                if (self.loaded_modules.contains(ud.module_path[0])) continue;
-                if (self.loading_modules.contains(ud.module_path[0])) return error.CircularDependency;
-                self.loadModuleFromFile(ud.module_path) catch |err| switch (err) {
-                    error.FileNotFound => {}, // 内建模块或尚未实现，跳过
-                    else => return err,
-                };
-            }
+        // 准备阶段：use 预加载 + 类型检查 + resolve（不求值声明）。
+        // 提取为 prepareModuleInner，供树遍历器（本函数）与 VM 路径（prepareModuleForVm）共用，
+        // 避免预加载/检查/报错逻辑两处漂移（M5：VM 接入 glue run）。
+        // skip_prepare=true（VM 回退）：准备已在 prepareModuleForVm 完成，跳过避免重复类型检查
+        // （类型注册表不清空 → 重复 checkModule 误报 duplicate type definition）。
+        if (!skip_prepare) {
+            try self.prepareModuleInner(module, module_name);
         }
-
-        // 先检查后求值：运行 Hindley-Milner 类型推断
-        // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值
-        self.type_inferencer.checkModule(&module);
-
-        // 报告类型推断错误到 stderr
-        if (self.type_inferencer.errors.items.len > 0) {
-            if (self.io) |io| {
-                var err_buf: [4096]u8 = undefined;
-                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                for (self.type_inferencer.errors.items) |err| {
-                    const kind_str = switch (err.kind) {
-                        .type_mismatch => "type error",
-                        .unbound_variable => "scope error",
-                        .arity_mismatch => "arity error",
-                        .occurs_check_failed => "type error",
-                        .missing_implementation => "impl error",
-                        .recursive_type => "type error",
-                        .non_exhaustive_match => "match error",
-                        .propagate_cross_type => "type error",
-                        .unsatisfied_bound => "bound error",
-                        .unconsumed_spawn => "linear type error",
-                    };
-                    if (err.line > 0) {
-                        stderr_writer.interface.print("{s}:{d}:{d}: {s}: {s}\n", .{ module_name, err.line, err.column, kind_str, err.message }) catch {};
-                    } else {
-                        stderr_writer.interface.print("{s}: {s}: {s}\n", .{ module_name, kind_str, err.message }) catch {};
-                    }
-                }
-                stderr_writer.flush() catch {};
-            }
-            // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值。
-            // 返回 TypeCheckFailed（错误已打印）使 main 知道失败：不再 callMain（否则
-            // 模块体未求值 → main 未注册 → 误报 "undefined entry point"），且以非零码退出。
-            return error.TypeCheckFailed;
-        }
-
-        // Resolve 预pass：intern 所有名字到 AST 的 name_id（单线程，求值前）。
-        // 求值器随后用整数键查环境；spawn 并发求值期 interner 只读，无竞争。
-        resolve.resolveModule(&module, &self.interner) catch {};
 
         // 收集 pub 声明名称
         var pub_names = std.ArrayList(u8).empty;
@@ -1834,6 +1795,104 @@ pub const Evaluator = struct {
         // 标记模块为"已加载完成"
         const loaded_name = try self.allocator.dupe(u8, module_name);
         try self.loaded_modules.put(loaded_name, {});
+    }
+
+    /// 模块准备阶段（不求值声明）：use 依赖预加载 → 类型检查（报错则 TypeCheckFailed）→ resolve。
+    /// 由 evalModule（树遍历器）与 prepareModuleForVm（VM 路径）共用，确保两路径准备逻辑零漂移。
+    /// 调用方须已设置 current_source_dir 与 loading_modules 标记（见 evalModule / prepareModuleForVm）。
+    fn prepareModuleInner(self: *Evaluator, module: ast.Module, module_name: []const u8) !void {
+        // 跨模块导入预加载（文档 §4.5 use）：在类型检查本模块之前，
+        // 先加载并检查所有 use 依赖。这样依赖模块的导出函数 scheme 会被
+        // 注册到 type_inferencer.exported_schemes，本模块的类型检查才能
+        // 解析这些导入名字。依赖的运行时值也会在此一并求值（共享 global_env），
+        // 后续本模块求值时 use_decl 只是从导出表引用已存在的值。
+        // loading_modules 已包含本模块名，依赖若反向 use 本模块会触发循环依赖错误。
+        for (module.declarations) |decl| {
+            if (decl == .use_decl) {
+                const ud = decl.use_decl;
+                if (ud.module_path.len == 0) continue;
+                if (self.loaded_modules.contains(ud.module_path[0])) continue;
+                if (self.loading_modules.contains(ud.module_path[0])) return error.CircularDependency;
+                self.loadModuleFromFile(ud.module_path) catch |err| switch (err) {
+                    error.FileNotFound => {}, // 内建模块或尚未实现，跳过
+                    else => return err,
+                };
+            }
+        }
+
+        // 先检查后求值：运行 Hindley-Milner 类型推断
+        // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值
+        self.type_inferencer.checkModule(&module);
+
+        // 报告类型推断错误到 stderr
+        if (self.type_inferencer.errors.items.len > 0) {
+            if (self.io) |io| {
+                var err_buf: [4096]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                for (self.type_inferencer.errors.items) |err| {
+                    const kind_str = switch (err.kind) {
+                        .type_mismatch => "type error",
+                        .unbound_variable => "scope error",
+                        .arity_mismatch => "arity error",
+                        .occurs_check_failed => "type error",
+                        .missing_implementation => "impl error",
+                        .recursive_type => "type error",
+                        .non_exhaustive_match => "match error",
+                        .propagate_cross_type => "type error",
+                        .unsatisfied_bound => "bound error",
+                        .unconsumed_spawn => "linear type error",
+                    };
+                    if (err.line > 0) {
+                        stderr_writer.interface.print("{s}:{d}:{d}: {s}: {s}\n", .{ module_name, err.line, err.column, kind_str, err.message }) catch {};
+                    } else {
+                        stderr_writer.interface.print("{s}: {s}: {s}\n", .{ module_name, kind_str, err.message }) catch {};
+                    }
+                }
+                stderr_writer.flush() catch {};
+            }
+            // 文档 D45: 先检查后求值 — 类型检查不通过则阻止求值。
+            // 返回 TypeCheckFailed（错误已打印）使 main 知道失败：不再 callMain（否则
+            // 模块体未求值 → main 未注册 → 误报 "undefined entry point"），且以非零码退出。
+            return error.TypeCheckFailed;
+        }
+
+        // Resolve 预pass：intern 所有名字到 AST 的 name_id（单线程，求值前）。
+        // 求值器随后用整数键查环境；spawn 并发求值期 interner 只读，无竞争。
+        resolve.resolveModule(&module, &self.interner) catch {};
+    }
+
+    /// M5：VM 路径的模块准备。等价于 evalModule 的「准备阶段」（use 预加载 + 类型检查 + resolve），
+    /// 但**不**求值声明体——声明由 VM 编译后执行（VM-eligible）或由调用方回退 evalModule（不支持）。
+    /// 复用 evalModule 头部的 current_source_dir 设置与 loading_modules 标记 bookkeeping。
+    /// 注意：loaded_modules 在此**不**登记（入口模块由 VM 跑，不应被后续误判已加载）；
+    /// 回退时 evalModule 会自行完成全部登记（其循环依赖/已加载判定对入口模块均不触发）。
+    pub fn prepareModuleForVm(self: *Evaluator, module: ast.Module) !void {
+        const module_name = module.name;
+
+        // 设置当前模块的源文件目录（与 evalModule 头部一致）
+        const saved_source_dir = self.current_source_dir;
+        if (module.source_path) |sp| {
+            if (std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep)) |idx| {
+                self.current_source_dir = try self.allocator.dupe(u8, sp[0..idx]);
+            } else if (std.mem.lastIndexOfScalar(u8, sp, '/')) |idx| {
+                self.current_source_dir = try self.allocator.dupe(u8, sp[0..idx]);
+            }
+        }
+        defer {
+            if (saved_source_dir) |dir| self.allocator.free(dir);
+            self.current_source_dir = saved_source_dir;
+        }
+
+        // 标记"正在加载"（依赖预加载期的循环依赖检测需要），结束即移除。
+        const owned_name = try self.allocator.dupe(u8, module_name);
+        try self.loading_modules.put(owned_name, {});
+        defer {
+            if (self.loading_modules.fetchRemove(module_name)) |entry| {
+                self.allocator.free(entry.key);
+            }
+        }
+
+        try self.prepareModuleInner(module, module_name);
     }
 
     /// 构建模块值并绑定到 global_env 与 module_values 注册表。
