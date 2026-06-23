@@ -97,6 +97,9 @@ pub const ModuleCompiler = struct {
     /// trait/impl 方法名集合（M5i，第一遍登记）：用于把裸名调用 `compare(a,b)`（with-clause 约束的
     /// trait 方法作自由函数）解析为 receiver=arg0 的 OP_CALL_METHOD 分派。
     method_names: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// 零参 trait/impl 方法表（M5k）：`zero()` 无 receiver 无法按类型分派，按名字直接解析到 impl 函数
+    /// （name → func_idx，首个 impl 生效）。供 emitCall 的 argc==0 裸名调用。
+    nullary_methods: std.ArrayListUnmanaged(struct { name: []const u8, func_idx: u16 }) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
         return .{ .program = Program.init(allocator), .allocator = allocator };
@@ -109,6 +112,7 @@ pub const ModuleCompiler = struct {
         self.error_table.deinit(self.allocator);
         self.global_table.deinit(self.allocator);
         self.method_names.deinit(self.allocator);
+        self.nullary_methods.deinit(self.allocator);
         // program 所有权移交调用方；此处不 deinit。
     }
 
@@ -189,11 +193,27 @@ pub const ModuleCompiler = struct {
         // 第二遍：编译所有模块的函数体 + impl/trait 方法。
         for (deps) |*dep| try self.compileBodies(dep);
         try self.compileBodies(module);
+        // M5k：检测同一 (type_name, method_name) 多个 impl —— 触发 trait 冲突消解/override 语义
+        //（文档 §2.7.2），VM 扁平表只取首个 → 语义不符。整体回退树遍历器，避免静默错误输出。
+        try self.checkNoConflictingImpls();
         // M5g：仅入口模块的顶层 val/var 进全局初始化（依赖 stdlib 无顶层 val/var）。
         if (self.global_table.items.len > 0) {
             try self.compileGlobalsInit(module);
         }
         if (self.lookupFn("main")) |m| self.program.entry = m;
+    }
+
+    /// M5k：若任意 (type_name, method_name) 对出现多次（同类型同方法多 impl），说明依赖 trait 组合/
+    /// override 冲突消解（VM 未实现，扁平 impl 表只取首个匹配）→ Unsupported，整体回退。
+    fn checkNoConflictingImpls(self: *ModuleCompiler) CompileError!void {
+        const items = self.program.impl_methods.items;
+        for (items, 0..) |a, i| {
+            for (items[i + 1 ..]) |b| {
+                if (std.mem.eql(u8, a.method_name, b.method_name) and
+                    std.mem.eql(u8, a.type_name, b.type_name))
+                    return error.Unsupported;
+            }
+        }
     }
 
     /// 第一遍：登记一个模块的顶层函数（预占 program 槽）/ADT·newtype·error 构造器/全局 val·var/方法名。
@@ -255,18 +275,19 @@ pub const ModuleCompiler = struct {
         }
     }
 
-    /// 第二遍：编译一个模块的函数体（覆盖预占槽）+ impl/trait 方法体。
+    /// 第二遍：编译一个模块的 impl/trait 方法体（先，使裸名/nullary 方法表就绪）+ 函数体。
     fn compileBodies(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
+        // impl/trait 方法先编译：填 nullary_methods 表，使后续 fun 体（含 main）的 `zero()` 裸名可解析。
         for (module.declarations) |decl| {
             switch (decl) {
-                .fun_decl => |fd| try self.compileFunction(fd),
+                .impl_decl => |id| try self.compileImplMethods(id),
+                .trait_decl => |td| try self.compileTraitDefaults(td),
                 else => {},
             }
         }
         for (module.declarations) |decl| {
             switch (decl) {
-                .impl_decl => |id| try self.compileImplMethods(id),
-                .trait_decl => |td| try self.compileTraitDefaults(td),
+                .fun_decl => |fd| try self.compileFunction(fd),
                 else => {},
             }
         }
@@ -279,7 +300,36 @@ pub const ModuleCompiler = struct {
             const body = m.body orelse continue;
             const func_idx = try self.compileMethodBody(m, body);
             try self.program.addImplMethod(id.type_name, m.name, id.trait_name, func_idx);
+            // M5k：零参方法（self 也无，如 `fun zero(): i32`）无 receiver，登记按名直接解析（首个生效）。
+            if (m.params.len == 0) try self.registerNullaryMethod(m.name, func_idx);
         }
+    }
+
+    /// M5k：登记一个零参方法名 → func_idx（首个 impl 生效，去重）。
+    fn registerNullaryMethod(self: *ModuleCompiler, name: []const u8, func_idx: u16) CompileError!void {
+        for (self.nullary_methods.items) |e| if (std.mem.eql(u8, e.name, name)) return;
+        try self.nullary_methods.append(self.allocator, .{ .name = name, .func_idx = func_idx });
+    }
+
+    /// M5k：查零参方法名 → func_idx。
+    pub fn lookupNullaryMethod(self: *ModuleCompiler, name: []const u8) ?u16 {
+        for (self.nullary_methods.items) |e| if (std.mem.eql(u8, e.name, name)) return e.func_idx;
+        return null;
+    }
+
+    /// M5k：若某方法名在 program.impl_methods 中**恰有一个** impl，返回其 func_idx（用于自由函数式
+    /// trait 方法调用 `compare(a,b)`——单 impl 时直接调用，镜像 eval 把 impl 方法注册为环境函数的动态
+    /// 类型语义，不受 receiver 类型限制）。多 impl（如 stdlib show 覆盖 i64/f64/...）返回 null → 退回
+    /// receiver 类型分派。
+    pub fn uniqueImplMethod(self: *ModuleCompiler, name: []const u8) ?u16 {
+        var found: ?u16 = null;
+        for (self.program.impl_methods.items) |d| {
+            if (std.mem.eql(u8, d.method_name, name)) {
+                if (found != null) return null; // 多 impl → 不唯一
+                found = d.func_idx;
+            }
+        }
+        return found;
     }
 
     /// M5i：编译 trait 块中带默认 body 的方法，登记进 program.trait_defaults（impl 未覆写时回退）。
@@ -291,7 +341,7 @@ pub const ModuleCompiler = struct {
         }
     }
 
-    /// M5i：把一个方法（self+params）编成顶层零捕获 Function，返回 func_idx。
+    /// M5k：把一个方法（self+params）编成顶层零捕获 Function，返回 func_idx。
     /// 顶层 impl/trait 方法不在词法闭包内，故 enclosing=null（自由变量解析为顶层函数/全局/构造器）。
     fn compileMethodBody(self: *ModuleCompiler, m: ast.MethodDecl, body: *ast.Expr) CompileError!u16 {
         if (m.params.len > 255) return error.Unsupported;
@@ -311,8 +361,30 @@ pub const ModuleCompiler = struct {
         return try self.program.addFunction(f);
     }
 
-    /// M5g：编译全局初始化函数（零参，追加到 program 末尾，记入 program.globals_init）。
-    /// 按声明顺序求值每个顶层 val/var 的 RHS，写入对应 global 槽（支持前向引用顶层函数，
+    /// M5k：合成一个 arity 参的「构造器包装」Function：取各参数 slot 压栈 + OP_MAKE_ADT + RETURN。
+    /// 供有参构造器作一等值（`val mk = Circle`；mk(5.0) 即 Circle(5.0)）。返回 func_idx。
+    fn ctorWrapperFunc(self: *ModuleCompiler, ctor_idx: u16, arity: u8, name: []const u8, loc: ast.SourceLocation) CompileError!u16 {
+        var fc = FnCompiler.init(self.allocator, self);
+        defer fc.deinit();
+        var i: u8 = 0;
+        while (i < arity) : (i += 1) {
+            fc.slot_count = @max(fc.slot_count, @as(u16, i) + 1);
+            try fc.chunk.writeOp(.op_get_local, loc);
+            try fc.chunk.writeU16(i);
+        }
+        try fc.chunk.writeOp(.op_make_adt, loc);
+        try fc.chunk.writeU16(ctor_idx);
+        try fc.chunk.writeByte(arity);
+        try fc.chunk.writeOp(.op_return, loc);
+        const f = Function{
+            .chunk = fc.chunk,
+            .arity = arity,
+            .slot_count = fc.slot_count,
+            .name = name,
+        };
+        fc.chunk = Chunk.init(self.allocator);
+        return try self.program.addFunction(f);
+    }
     /// 但不支持引用尚未初始化的后续全局——镜像 eval 的顺序求值语义）。
     fn compileGlobalsInit(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
         var fc = FnCompiler.init(self.allocator, self);
@@ -495,10 +567,18 @@ const FnCompiler = struct {
                     try self.chunk.writeByte(0); // n_upvalues=0
                 } else if (self.module.lookupCtor(id.name)) |ce| {
                     // 裸名 nullary ADT 构造器（如 Red/Green/Nil）作为值 → OP_MAKE_ADT argc=0。
-                    if (ce.arity != 0) return error.Unsupported; // 有参构造器须带实参调用
-                    try self.chunk.writeOp(.op_make_adt, loc);
-                    try self.chunk.writeU16(ce.idx);
-                    try self.chunk.writeByte(0);
+                    if (ce.arity == 0) {
+                        try self.chunk.writeOp(.op_make_adt, loc);
+                        try self.chunk.writeU16(ce.idx);
+                        try self.chunk.writeByte(0);
+                    } else {
+                        // M5k：有参构造器作一等值（`val mk = Circle`）→ 合成 arity 参的包装 Function
+                        //（取各参数 slot + OP_MAKE_ADT），OP_CLOSURE 压栈。调用时即构造 ADT。
+                        const wrap_idx = try self.module.ctorWrapperFunc(ce.idx, ce.arity, id.name, loc);
+                        try self.chunk.writeOp(.op_closure, loc);
+                        try self.chunk.writeU16(wrap_idx);
+                        try self.chunk.writeByte(0); // n_upvalues=0
+                    }
                 } else if (self.module.lookupGlobal(id.name)) |ge| {
                     // M5g：顶层 val/var 全局变量读 → OP_GET_GLOBAL。
                     try self.chunk.writeOp(.op_get_global, loc);
@@ -1085,6 +1165,15 @@ const FnCompiler = struct {
                 // M5i：裸名 trait 方法调用（with-clause 约束的自由函数式 trait 方法，如 `compare(a,b)`）→
                 // 以 arg0 为 receiver 发 OP_CALL_METHOD（argc 减 1，receiver 在 args 下方）。
                 if (self.module.isMethodName(name) and argc >= 1) {
+                    // 单 impl 方法：直接调用其函数（镜像 eval 动态类型语义，不受 receiver 类型限制，
+                    // 如 `compare(1.5,2.5)` 调用唯一的 Comparable<i32> impl）。多 impl → receiver 类型分派。
+                    if (self.module.uniqueImplMethod(name)) |fidx| {
+                        for (c.arguments) |arg| try self.emitExpr(arg);
+                        try self.chunk.writeOp(.op_call, loc);
+                        try self.chunk.writeU16(fidx);
+                        try self.chunk.writeByte(argc);
+                        return;
+                    }
                     const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, name) });
                     for (c.arguments) |arg| try self.emitExpr(arg); // [recv, rest...]
                     try self.chunk.writeOp(.op_call_method, loc);
@@ -1092,7 +1181,19 @@ const FnCompiler = struct {
                     try self.chunk.writeByte(argc - 1);
                     return;
                 }
-                return error.Unsupported; // 未知裸名
+                // M5k：零参 trait 方法裸名调用（`zero()`）→ 无 receiver 不能按类型分派，直接解析到
+                // 登记的 impl 函数（OP_CALL func_idx，argc=0）。返回类型导向分派在 VM 不可得，单 impl 即解析。
+                if (argc == 0) {
+                    if (self.module.lookupNullaryMethod(name)) |fidx| {
+                        try self.chunk.writeOp(.op_call, loc);
+                        try self.chunk.writeU16(fidx);
+                        try self.chunk.writeByte(0);
+                        return;
+                    }
+                }
+                // M5k：裸名是顶层全局（持函数/构造器闭包值，如 `val mk = Circle; mk(7.0)`）→ 不报错，
+                // 落到下方通用 op_call_value 路径（求值 callee 全局 + 实参 + 动态调用）。
+                if (self.module.lookupGlobal(name) == null) return error.Unsupported; // 未知裸名
             }
         }
         // 通用路径：先压 callee（求值出 vm_closure），再压实参，OP_CALL_VALUE。
@@ -4135,4 +4236,43 @@ test "M5j cross-module use: dep impl + fn merged into Program" {
     ;
     // 5*10 + (4+1) = 55
     try std.testing.expectEqual(@as(u128, 55), try compileAndCallWithDep(allocator, dep, entry, "run"));
+}
+
+test "M5k nullary trait method called as free function" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\trait Numeric { fun zero() }
+        \\impl Numeric<i64> {
+        \\    fun zero(): i64 { 0i64 }
+        \\}
+        \\fun run(): i64 { zero() + 7i64 }
+    ;
+    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5k constructor as first-class value" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\type Box = Box(n: i64)
+        \\fun run(): i64 {
+        \\    val mk = Box
+        \\    val b = mk(33i64)
+        \\    b.n
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 33), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5k conflicting impls (same type+method) -> Unsupported fallback" {
+    const allocator = std.testing.allocator;
+    // 同一 (Box, dup) 两个 impl → trait 冲突消解，VM 回退（compileModule 报 Unsupported）。
+    const src =
+        \\type Box = Box(n: i64)
+        \\trait A { fun dup(self): i64 }
+        \\trait B { fun dup(self): i64 }
+        \\impl A<Box> { fun dup(self): i64 { self.n } }
+        \\impl B<Box> { fun dup(self): i64 { self.n * 2i64 } }
+        \\fun run(): i64 { 0i64 }
+    ;
+    try std.testing.expectError(error.Unsupported, compileAndCall(allocator, src, "run", &.{}));
 }
