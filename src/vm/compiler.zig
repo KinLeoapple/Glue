@@ -173,27 +173,46 @@ pub const ModuleCompiler = struct {
 
     /// 编译整个模块。返回的 Program（self.program）持有所有函数；调用方取走。
     pub fn compileModule(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
-        // 第一遍：给每个 fun_decl 预占一个 func_idx + 在 program.functions 预留同索引的占位槽。
-        // 关键：lambda 在编译期经 addFunction 追加到 program.functions 末尾，会插在顶层函数之间，
-        // 故顶层函数必须**预占** program 槽位，使 fn_table.idx == program.functions 索引一致
-        // （否则 entry/OP_CALL 的 func_idx 指向错误的函数，如把 lambda 当成 run 执行）。
+        return self.compileModuleWithDeps(module, &.{});
+    }
+
+    /// M5j：编译入口模块 + 其 `use` 依赖模块（已解析 AST，定义先于使用顺序）。依赖的顶层函数/
+    /// impl/trait/类型/构造器**合并进同一 Program**（VM 按名字字符串解析，扁平 impl 表，天然合并）。
+    /// 注册顺序：先依赖后入口（入口可前向引用，但同名时入口的 fn_table 在后——lookupFn 取首个匹配，
+    /// 故依赖优先；stdlib 名字不与用户 main 冲突，无歧义）。顶层 val/var 仅入口模块支持（依赖 stdlib
+    /// 是纯 trait/impl/fun，无顶层 val/var）。
+    pub fn compileModuleWithDeps(self: *ModuleCompiler, module: *const ast.Module, deps: []const ast.Module) CompileError!void {
+        // 第一遍：登记所有模块（依赖在前）的顶层函数/构造器/方法名/全局。
+        for (deps) |*dep| try self.registerDecls(dep);
+        try self.registerDecls(module);
+        self.program.global_count = @intCast(self.global_table.items.len);
+        // 第二遍：编译所有模块的函数体 + impl/trait 方法。
+        for (deps) |*dep| try self.compileBodies(dep);
+        try self.compileBodies(module);
+        // M5g：仅入口模块的顶层 val/var 进全局初始化（依赖 stdlib 无顶层 val/var）。
+        if (self.global_table.items.len > 0) {
+            try self.compileGlobalsInit(module);
+        }
+        if (self.lookupFn("main")) |m| self.program.entry = m;
+    }
+
+    /// 第一遍：登记一个模块的顶层函数（预占 program 槽）/ADT·newtype·error 构造器/全局 val·var/方法名。
+    fn registerDecls(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
         for (module.declarations) |decl| {
             switch (decl) {
                 .fun_decl => |fd| {
+                    // 同名顶层函数已登记（如依赖与入口重名）→ 跳过重复预占（首个生效）。
+                    if (self.lookupFn(fd.name) != null) continue;
                     const idx: u16 = @intCast(self.fn_table.items.len);
                     try self.fn_table.append(self.allocator, .{ .name = fd.name, .idx = idx, .arity = @intCast(fd.params.len) });
-                    // 预留占位（空 chunk）；第二遍用真正编译结果覆盖。
                     _ = try self.program.addFunction(.{ .chunk = Chunk.init(self.allocator), .arity = 0, .slot_count = 0, .name = fd.name });
                 },
-                // M2a：登记 ADT 构造器（type T = Ctor(field: T, ...) | ...）。
                 .type_decl => |td| {
                     switch (td.def) {
                         .adt => |a| {
                             for (a.constructors) |con| {
-                                // 收集字段名（位置字段 name=null）。借用 AST 字节。
                                 var fnames = try self.allocator.alloc(?[]const u8, con.fields.len);
                                 defer self.allocator.free(fnames);
-                                // M5c：收集字段的 builtin 数值类型名（用于 OP_MAKE_ADT 隐式定型）。
                                 var ftypes = try self.allocator.alloc(?[]const u8, con.fields.len);
                                 defer self.allocator.free(ftypes);
                                 for (con.fields, 0..) |f, i| {
@@ -205,20 +224,16 @@ pub const ModuleCompiler = struct {
                             }
                         },
                         .newtype => |nt| {
-                            // type Handle = Handle(i32)：构造器名 == type_name，arity 1。
                             const ntidx = try self.program.addNewtypeCtor(td.name);
                             try self.newtype_table.append(self.allocator, .{ .name = nt.name, .idx = ntidx, .arity = 1 });
                         },
                         .error_newtype => |en| {
-                            // type FileError = Error("file error")：构造器名 == type_name，arity 1（str 消息）。
                             const eidx = try self.program.addErrorCtor(td.name, en.message);
                             try self.error_table.append(self.allocator, .{ .name = td.name, .idx = eidx, .arity = 1 });
                         },
-                        else => {}, // record/alias/gadt 等留后续片
+                        else => {},
                     }
                 },
-                // M5g：登记顶层 val/var 全局变量（expr_decl 携带 val_decl/var_decl stmt）。
-                // 裸表达式语句（stmt==null）不执行（文档 D13），不登记。
                 .expr_decl => |ed| {
                     if (ed.stmt) |s| {
                         const idx: u16 = @intCast(self.global_table.items.len);
@@ -229,25 +244,25 @@ pub const ModuleCompiler = struct {
                         }
                     }
                 },
-                // M5i：登记 impl/trait 方法名（裸名调用作自由函数 trait 方法分派用）。
                 .impl_decl => |id| {
                     for (id.methods) |m| try self.registerMethodName(m.name);
                 },
                 .trait_decl => |td| {
                     for (td.methods) |m| try self.registerMethodName(m.name);
                 },
-                else => {}, // use/pack 等不处理（遇到引用时 Unsupported）
+                else => {},
             }
         }
-        self.program.global_count = @intCast(self.global_table.items.len);
-        // 第二遍：逐个编译函数体，覆盖预留槽（idx 对齐）。lambda 追加到末尾（idx ≥ 顶层函数数）。
+    }
+
+    /// 第二遍：编译一个模块的函数体（覆盖预占槽）+ impl/trait 方法体。
+    fn compileBodies(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
         for (module.declarations) |decl| {
             switch (decl) {
                 .fun_decl => |fd| try self.compileFunction(fd),
                 else => {},
             }
         }
-        // M5i：编译 impl 方法 + trait 默认方法（编成顶层 Function，self 占 slot 0，登记进 program 表）。
         for (module.declarations) |decl| {
             switch (decl) {
                 .impl_decl => |id| try self.compileImplMethods(id),
@@ -255,11 +270,6 @@ pub const ModuleCompiler = struct {
                 else => {},
             }
         }
-        // M5g：若有顶层 val/var，编译一个全局初始化函数（按声明顺序求值 RHS → OP_SET_GLOBAL）。
-        if (self.global_table.items.len > 0) {
-            try self.compileGlobalsInit(module);
-        }
-        if (self.lookupFn("main")) |m| self.program.entry = m;
     }
 
     /// M5i：编译一个 impl 块的所有方法体（有 body 的）。每个编成顶层 Function（self+params 占
@@ -1910,6 +1920,36 @@ fn compileAndCall(allocator: std.mem.Allocator, source: []const u8, entry_name: 
     const result = try vm.call(&mc.program, idx, args);
     defer result.releaseVM(allocator);
     // bool 结果（contains/is_empty 等）coerce 为 1/0，便于测试统一用 u128 断言。
+    if (result == .boolean) return if (result.boolean) 1 else 0;
+    return result.integer.value;
+}
+
+/// M5j：编译入口源 + 一个依赖源（依赖在前注册），跑 entry_name，返回整数结果。
+fn compileAndCallWithDep(allocator: std.mem.Allocator, dep_source: []const u8, entry_source: []const u8, entry_name: []const u8) !u128 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var dlex = lexer.Lexer.init(aa, dep_source);
+    const dtokens = try dlex.tokenize();
+    var dp = parser.Parser.init(aa, dtokens);
+    const dep_module = try dp.parseModule("Dep");
+
+    var elex = lexer.Lexer.init(aa, entry_source);
+    const etokens = try elex.tokenize();
+    var ep = parser.Parser.init(aa, etokens);
+    var entry_module = try ep.parseModule("test");
+
+    var mc = ModuleCompiler.init(allocator);
+    defer mc.deinit();
+    defer mc.program.deinit();
+    try mc.compileModuleWithDeps(&entry_module, &.{dep_module});
+
+    const idx = mc.lookupFn(entry_name) orelse return error.MissingFunction;
+    var vm = vm_mod.VM.init(allocator);
+    defer vm.deinit();
+    const result = try vm.call(&mc.program, idx, &.{});
+    defer result.releaseVM(allocator);
     if (result == .boolean) return if (result.boolean) 1 else 0;
     return result.integer.value;
 }
@@ -4075,4 +4115,24 @@ test "M5i trait method as free function dispatches on first arg" {
         \\}
     ;
     try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5j cross-module use: dep impl + fn merged into Program" {
+    const allocator = std.testing.allocator;
+    const dep =
+        \\trait Show { fun show(self): i64 }
+        \\impl Show<i64> {
+        \\    fun show(self): i64 { self * 10i64 }
+        \\}
+        \\fun helper(x: i64): i64 { x + 1i64 }
+    ;
+    const entry =
+        \\use Dep
+        \\fun run(): i64 {
+        \\    val a = (5i64).show()
+        \\    a + helper(4i64)
+        \\}
+    ;
+    // 5*10 + (4+1) = 55
+    try std.testing.expectEqual(@as(u128, 55), try compileAndCallWithDep(allocator, dep, entry, "run"));
 }

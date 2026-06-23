@@ -226,6 +226,8 @@ pub const Evaluator = struct {
     /// 都是对模块 source 的切片。因此依赖模块的 source 必须存活到
     /// 求值器 deinit，否则被导入函数体在调用时会读到悬垂内存。
     retained_sources: std.ArrayList([]const u8),
+    /// M5j：VM 依赖模块解析产出的 token 集合（AST 标识符名等借用 token 文本），持有到 deinit。
+    retained_token_sets: std.ArrayList([]@import("lexer").Token) = .empty,
 
     /// 模块路径解析器
     resolver: module_resolver.ModuleResolver,
@@ -472,6 +474,11 @@ pub const Evaluator = struct {
             self.allocator.free(src);
         }
         self.retained_sources.deinit(self.allocator);
+        // M5j：释放 VM 依赖模块的 token 集合。
+        for (self.retained_token_sets.items) |toks| {
+            self.allocator.free(toks);
+        }
+        self.retained_token_sets.deinit(self.allocator);
         // 释放模块解析器
         self.resolver.deinit();
     }
@@ -5655,6 +5662,62 @@ pub const Evaluator = struct {
         }
 
         return error.FileNotFound;
+    }
+
+    /// M5j：为 VM 路径收集 `use` 依赖模块的**已解析 AST**（不求值）。递归处理传递依赖
+    /// （如 List use Compare），按模块名去重。源码与 token 用 self.allocator 分配并交 retained_sources
+    /// 持有到 deinit（AST 子切片借用源字节 + token，须存活到 Program 执行完）。
+    /// 仅解析，不类型检查/不 resolve——VM 编译器用名字字符串解析，且 intern 由入口模块的 resolve 覆盖
+    /// 不到依赖；VM 编译器自包含按名字解析，无需 name_id。失败（找不到模块等）返回 error，调用方回退。
+    pub fn collectUseDependencies(self: *Evaluator, module: ast.Module, out: *std.ArrayList(ast.Module), seen: *std.StringHashMap(void)) anyerror!void {
+        for (module.declarations) |decl| {
+            if (decl != .use_decl) continue;
+            const ud = decl.use_decl;
+            if (ud.module_path.len != 1) return error.UnsupportedUsePath; // 仅单段模块名（stdlib / 同目录）
+            const mod_name = ud.module_path[0];
+            if (seen.contains(mod_name)) continue;
+            try seen.put(try self.allocator.dupe(u8, mod_name), {});
+
+            // 解析依赖源码（项目内文件优先，回退内嵌 stdlib），镜像 loadModuleFromFile 的解析。
+            const source = try self.loadDependencySource(ud.module_path);
+            const dep_module = try self.parseDependencyModule(source, mod_name);
+            // 先递归收集**依赖的依赖**（保证 Compare 在 List 之前进 out，符合定义先于使用）。
+            try self.collectUseDependencies(dep_module, out, seen);
+            try out.append(self.allocator, dep_module);
+        }
+    }
+
+    /// M5j：解析一个依赖模块名到源码（项目内文件优先，回退内嵌 stdlib）。源交 retained_sources。
+    fn loadDependencySource(self: *Evaluator, module_path: [][]const u8) anyerror![]const u8 {
+        const io = self.io orelse return error.FileNotFound;
+        self.resolver.setSourceDir(self.current_source_dir orelse ".") catch {};
+        if (self.resolver.resolvePath(io, module_path) catch null) |path| {
+            defer self.allocator.free(path);
+            const source = try self.resolver.loadSource(io, path);
+            try self.retained_sources.append(self.allocator, source);
+            return source;
+        }
+        if (module_path.len == 1) {
+            if (stdlib.lookup(module_path[0])) |source| return source; // 内嵌源寿命=进程，无需 retain
+        }
+        return error.FileNotFound;
+    }
+
+    /// M5j：词法+语法解析依赖源码为 Module（token 交 retained——AST 借用）。
+    fn parseDependencyModule(self: *Evaluator, source: []const u8, module_name: []const u8) anyerror!ast.Module {
+        const lexer_mod = @import("lexer");
+        const parser_mod = @import("parser");
+        var lex = lexer_mod.Lexer.init(self.allocator, source);
+        defer lex.deinit();
+        const tokens = try lex.tokenize();
+        // token 不释放：parseModule 产出的 AST 标识符名等切片借用 token 文本。交 retained_sources 风格
+        // 的持有——这里直接 leak 到 deinit 不便，改为追加进一个 token 持有列表。复用 retained_sources
+        // 不合适（那是 []const u8 源）。简单起见：tokens 由 arena 思路——但 eval 无 arena。
+        // 解法：把 tokens 也登记进 retained_token_sets 释放列表。
+        try self.retained_token_sets.append(self.allocator, tokens);
+        var p = parser_mod.Parser.init(self.allocator, tokens);
+        defer p.deinit();
+        return try p.parseModule(module_name);
     }
 
     /// 解析并求值源代码作为模块

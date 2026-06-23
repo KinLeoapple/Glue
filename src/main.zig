@@ -462,9 +462,10 @@ fn vmEligible(module: ast.Module) bool {
             // 含 impl 的模块仍由 impl_decl 触发回退（下方 else）。
             .trait_decl => {},
             // M5i：impl 块由 VM 编译为方法函数 + 注册进 program.impl_methods（OP_CALL_METHOD 分派）。
-            // 但跨文件 use（导入其它模块的 trait/impl，如 stdlib Compare）VM 无对应运行时 → 仍回退。
             .impl_decl => {},
-            // use/pack：VM 无对应运行时 → 回退。
+            // M5j：单段 use 导入（stdlib / 同目录模块）由 VM 编译依赖模块进同一 Program。多段路径回退。
+            .use_decl => |ud| if (ud.module_path.len != 1) return false,
+            // pack：VM 无对应运行时 → 回退。
             else => return false,
         }
     }
@@ -504,7 +505,22 @@ fn tryRunOnVM(
     var mc = vm.ModuleCompiler.init(allocator);
     defer mc.deinit();
     defer mc.program.deinit();
-    mc.compileModule(&module) catch |err| {
+
+    // M5j：收集 `use` 依赖模块的已解析 AST（递归传递依赖，定义先于使用），编进同一 Program。
+    var deps = std.ArrayList(ast.Module).empty;
+    defer deps.deinit(allocator);
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen.deinit();
+    }
+    ev.collectUseDependencies(module, &deps, &seen) catch |err| {
+        if (vm_trace) printErr(io, "[vm] {s}: fell back (use deps: {s})\n", .{ filename, @errorName(err) });
+        return .fell_back_prepared;
+    };
+
+    mc.compileModuleWithDeps(&module, deps.items) catch |err| {
         if (vm_trace) printErr(io, "[vm] {s}: fell back (compile: {s})\n", .{ filename, @errorName(err) });
         return .fell_back_prepared;
     };
