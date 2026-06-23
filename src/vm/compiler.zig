@@ -204,16 +204,28 @@ pub const ModuleCompiler = struct {
     }
 
     /// M5k：若任意 (type_name, method_name) 对出现多次（同类型同方法多 impl），说明依赖 trait 组合/
-    /// override 冲突消解（VM 未实现，扁平 impl 表只取首个匹配）→ Unsupported，整体回退。
+    /// override 冲突消解。M5n：VM 现已实现组合分派——若该 method 被某组合 Trait 用 override/委托消解
+    /// （在 trait_resolves 中），则放行（组合分派会在扁平查找前选出正确实现）。否则仍 Unsupported 回退
+    /// （扁平表只取首个匹配，与 eval 的 first-match 一致性无保证）。
     fn checkNoConflictingImpls(self: *ModuleCompiler) CompileError!void {
         const items = self.program.impl_methods.items;
         for (items, 0..) |a, i| {
             for (items[i + 1 ..]) |b| {
                 if (std.mem.eql(u8, a.method_name, b.method_name) and
                     std.mem.eql(u8, a.type_name, b.type_name))
-                    return error.Unsupported;
+                {
+                    if (!self.methodResolvedByComposition(a.method_name)) return error.Unsupported;
+                }
             }
         }
+    }
+
+    /// M5n：method 是否被某组合 Trait 用 override/委托消解（trait_resolves 含该方法名）。
+    fn methodResolvedByComposition(self: *ModuleCompiler, method_name: []const u8) bool {
+        for (self.program.trait_resolves.items) |r| {
+            if (std.mem.eql(u8, r.method_name, method_name)) return true;
+        }
+        return false;
     }
 
     /// 第一遍：登记一个模块的顶层函数（预占 program 槽）/ADT·newtype·error 构造器/全局 val·var/方法名。
@@ -343,11 +355,39 @@ pub const ModuleCompiler = struct {
     }
 
     /// M5i：编译 trait 块中带默认 body 的方法，登记进 program.trait_defaults（impl 未覆写时回退）。
+    /// M5n：组合 Trait（有 parents）的冲突消解——override 方法体编译后登记 trait_resolves（override_func），
+    /// 委托方法登记 trait_resolves（delegate_trait/method），父关系登记 trait_parents，trait 名入 trait_order。
+    /// override/委托方法**不**进 trait_defaults（它们经组合分派触发，非普通默认回退）。
     fn compileTraitDefaults(self: *ModuleCompiler, td: @TypeOf(@as(ast.Decl, undefined).trait_decl)) CompileError!void {
+        const is_composed = td.parents.len > 0;
+        if (is_composed) {
+            try self.program.addTraitOrder(td.name);
+            for (td.parents) |parent| try self.program.addTraitParent(td.name, parent.trait_name);
+        }
         for (td.methods) |m| {
+            // 委托方法：fun to_string(self): str = Serializable.to_string（无 body）。
+            if (m.delegate) |del| {
+                if (is_composed) try self.program.addTraitResolve(.{
+                    .trait_name = td.name,
+                    .method_name = m.name,
+                    .delegate_trait = del.trait_name,
+                    .delegate_method = del.method_name,
+                });
+                continue;
+            }
             const body = m.body orelse continue;
             const func_idx = try self.compileMethodBody(m, body);
-            try self.program.addTraitDefault(td.name, m.name, func_idx);
+            if (is_composed and m.is_override) {
+                // override 方法：组合分派调用其体，覆盖父 Trait impl。不进普通默认表。
+                try self.program.addTraitResolve(.{
+                    .trait_name = td.name,
+                    .method_name = m.name,
+                    .override_func = func_idx,
+                });
+            } else {
+                // 普通默认方法（含非组合 Trait 的默认体）：impl 未覆写时回退。
+                try self.program.addTraitDefault(td.name, m.name, func_idx);
+            }
         }
     }
 
@@ -4368,4 +4408,40 @@ test "M5l monad comprehension desugars to bind/pure (Box monad, multi-binding)" 
         \\}
     ;
     try std.testing.expectEqual(@as(u128, 105), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5n composed trait override wins over parent impls (last-defined trait)" {
+    const allocator = std.testing.allocator;
+    // Ordering 同时 impl Serializable + DebugTrait（都有 to_string）。组合 Trait Overridden
+    // override to_string → 组合分派调 override 体（返回 99），覆盖父 impl（返回 1/2）。
+    const src =
+        \\type Ordering = | Lt | Eq | Gt
+        \\trait Serializable { fun to_string(self): i64 }
+        \\trait DebugTrait { fun to_string(self): i64 }
+        \\impl Serializable<Ordering> { fun to_string(self): i64 { 1i64 } }
+        \\impl DebugTrait<Ordering> { fun to_string(self): i64 { 2i64 } }
+        \\trait Overridden(Serializable, DebugTrait) {
+        \\    override fun to_string(self): i64 { 99i64 }
+        \\}
+        \\fun run(): i64 { Lt.to_string() }
+    ;
+    try std.testing.expectEqual(@as(u128, 99), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5n composed trait delegate dispatches to named parent impl" {
+    const allocator = std.testing.allocator;
+    // 委托 to_string = Serializable.to_string → 组合分派查 (Serializable, to_string) 的父 impl
+    //（返回 1），而非 DebugTrait 的（返回 2）。
+    const src =
+        \\type Ordering = | Lt | Eq | Gt
+        \\trait Serializable { fun to_string(self): i64 }
+        \\trait DebugTrait { fun to_string(self): i64 }
+        \\impl Serializable<Ordering> { fun to_string(self): i64 { 1i64 } }
+        \\impl DebugTrait<Ordering> { fun to_string(self): i64 { 2i64 } }
+        \\trait Combined(Serializable, DebugTrait) {
+        \\    fun to_string(self): i64 = Serializable.to_string
+        \\}
+        \\fun run(): i64 { Lt.to_string() }
+    ;
+    try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
 }

@@ -209,6 +209,61 @@ fn findTraitDefault(program: *const Program, method_name: []const u8) ?u16 {
     return null;
 }
 
+/// M5n：接收者类型 recv_type 是否对组合 Trait trait_name 的**所有**父 Trait 都有 impl
+/// （镜像 eval hasAllParentImpls）。组合分派仅在父 impl 齐备时生效。
+fn hasAllParentImpls(program: *const Program, trait_name: []const u8, recv_type: []const u8) bool {
+    var any_parent = false;
+    for (program.trait_parents.items) |tp| {
+        if (!std.mem.eql(u8, tp.trait_name, trait_name)) continue;
+        any_parent = true;
+        var found = false;
+        for (program.impl_methods.items) |im| {
+            if (std.mem.eql(u8, im.trait_name, tp.parent_name) and implTypeMatches(recv_type, im.type_name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return any_parent;
+}
+
+/// M5n：在组合 Trait trait_name 内查方法 m 的消解描述（override/委托）。
+fn findTraitResolve(program: *const Program, trait_name: []const u8, m: []const u8) ?chunk_mod.TraitResolveDesc {
+    for (program.trait_resolves.items) |r| {
+        if (std.mem.eql(u8, r.trait_name, trait_name) and std.mem.eql(u8, r.method_name, m)) return r;
+    }
+    return null;
+}
+
+/// M5n：查委托目标 (trait, method) 对应接收者类型 recv_type 的父 impl func_idx。
+fn findImplMethodByTrait(program: *const Program, recv_type: []const u8, trait_name: []const u8, m: []const u8) ?u16 {
+    for (program.impl_methods.items) |im| {
+        if (std.mem.eql(u8, im.trait_name, trait_name) and std.mem.eql(u8, im.method_name, m) and
+            implTypeMatches(recv_type, im.type_name)) return im.func_idx;
+    }
+    return null;
+}
+
+/// M5n：组合 Trait 分派（文档 §2.7.2）。按定义顺序遍历组合 Trait，对接收者类型父 impl 齐备的
+/// 组合 Trait，若其消解了 m（override/委托），记为候选；**后定义的覆盖先定义的**（镜像 eval
+/// trait_definition_order 遍历 + best_result 后写覆盖）。返回最终命中的 func_idx（override 体或委托
+/// 目标父 impl），无命中返回 null（落回扁平 impl 查找）。
+fn resolveComposedMethod(program: *const Program, recv_type: []const u8, m: []const u8) ?u16 {
+    var best: ?u16 = null;
+    for (program.trait_order.items) |trait_name| {
+        if (!hasAllParentImpls(program, trait_name, recv_type)) continue;
+        const r = findTraitResolve(program, trait_name, m) orelse continue;
+        if (r.override_func) |fidx| {
+            best = fidx; // override：调用 override 方法体
+        } else if (r.delegate_trait) |dt| {
+            // 委托：实现来自父 impl (delegate_trait, delegate_method)，按接收者类型查。
+            if (findImplMethodByTrait(program, recv_type, dt, r.delegate_method.?)) |fidx| best = fidx;
+        }
+    }
+    return best;
+}
+
 /// M5d：结构相等（深比较 array/record/adt/newtype），镜像 eval structuralEquals。供 eq() native 用。
 fn vmStructuralEquals(a: Value, b: Value) bool {
     const at = std.meta.activeTag(a);
@@ -1863,7 +1918,13 @@ pub const VM = struct {
         // M5i：用户 impl 方法分派 —— 据 receiver 类型名 + 方法名查 program.impl_methods（数值宽度互通），
         // 命中则把 [receiver, args...] 作为方法 slot 跑方法体。未命中查 trait 默认方法；再未命中走 native。
         if (self.program) |prog| {
-            if (findImplMethod(prog, vmValueTypeName(receiver), name)) |fidx| {
+            // M5n：组合 Trait 冲突消解优先（文档 §2.7.2）——override/委托覆盖父 Trait impl，
+            // 在扁平 impl 查找之前。镜像 eval：组合分派 > 扁平 impl > trait 默认。
+            const recv_type = vmValueTypeName(receiver);
+            if (resolveComposedMethod(prog, recv_type, name)) |fidx| {
+                return self.invokeMethodBody(prog, fidx, argc, args_start, loc);
+            }
+            if (findImplMethod(prog, recv_type, name)) |fidx| {
                 return self.invokeMethodBody(prog, fidx, argc, args_start, loc);
             }
             if (findTraitDefault(prog, name)) |fidx| {

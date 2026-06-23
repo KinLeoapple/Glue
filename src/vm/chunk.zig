@@ -161,6 +161,29 @@ pub const TraitDefaultDesc = struct {
     func_idx: u16,
 };
 
+/// 组合 Trait 的冲突消解描述（M5n）：`trait Combined(P1, P2) { ... }`。文档 §2.7.2。
+/// 当多个父 Trait 有同名方法时，组合 Trait 须用 override / 委托(=) 显式消解。VM 据此在
+/// 扁平 impl 查找**之前**做组合分派：若接收者类型对所有 parents 都有 impl，则按本描述
+/// 解析方法（override→调 override_func；delegate→查 (delegate_trait, method) 的父 impl）。
+/// 多个组合 Trait 同时匹配时，按定义顺序后者覆盖前者（镜像 eval trait_definition_order 遍历）。
+pub const TraitParentDesc = struct {
+    /// 组合 Trait 名（借用 AST）。
+    trait_name: []const u8,
+    /// 父 Trait 名（借用 AST）。
+    parent_name: []const u8,
+};
+
+/// 组合 Trait 内一个被消解的方法（M5n）。borrow AST 的名字。
+pub const TraitResolveDesc = struct {
+    trait_name: []const u8,
+    method_name: []const u8,
+    /// override：调用此 func_idx（override 方法体，self 占 slot 0）。否则 null。
+    override_func: ?u16 = null,
+    /// 委托：方法实现来自 (delegate_trait, delegate_method) 的父 impl（运行时按接收者类型查）。
+    delegate_trait: ?[]const u8 = null,
+    delegate_method: ?[]const u8 = null,
+};
+
 /// 整个编译单元：一组顶层函数 + 入口索引（main）。
 /// OP_CALL <func_idx> 索引进 functions。Program 持有所有 Function 的所有权。
 pub const Program = struct {
@@ -185,6 +208,12 @@ pub const Program = struct {
     impl_methods: std.ArrayListUnmanaged(ImplMethodDesc) = .empty,
     /// trait 默认方法表（M5i）：impl 未覆写时回退。
     trait_defaults: std.ArrayListUnmanaged(TraitDefaultDesc) = .empty,
+    /// 组合 Trait 的父 Trait 关系（M5n）：(组合 Trait, 父 Trait) 对，按定义顺序追加。
+    trait_parents: std.ArrayListUnmanaged(TraitParentDesc) = .empty,
+    /// 组合 Trait 内被 override/委托消解的方法（M5n）。
+    trait_resolves: std.ArrayListUnmanaged(TraitResolveDesc) = .empty,
+    /// 组合 Trait 名按定义顺序（M5n）：组合分派遍历此序，后者覆盖前者（镜像 eval trait_definition_order）。
+    trait_order: std.ArrayListUnmanaged([]const u8) = .empty,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -206,6 +235,9 @@ pub const Program = struct {
         self.error_ctors.deinit(self.allocator);
         self.impl_methods.deinit(self.allocator);
         self.trait_defaults.deinit(self.allocator);
+        self.trait_parents.deinit(self.allocator);
+        self.trait_resolves.deinit(self.allocator);
+        self.trait_order.deinit(self.allocator);
     }
 
     /// 追加一个函数，返回其索引。
@@ -271,5 +303,21 @@ pub const Program = struct {
             .method_name = method_name,
             .func_idx = func_idx,
         });
+    }
+
+    /// 登记一个组合 Trait 的父 Trait 关系（M5n）。借用 AST。
+    pub fn addTraitParent(self: *Program, trait_name: []const u8, parent_name: []const u8) !void {
+        try self.trait_parents.append(self.allocator, .{ .trait_name = trait_name, .parent_name = parent_name });
+    }
+
+    /// 登记一个组合 Trait 内被消解的方法（M5n）。借用 AST。
+    pub fn addTraitResolve(self: *Program, desc: TraitResolveDesc) !void {
+        try self.trait_resolves.append(self.allocator, desc);
+    }
+
+    /// 把一个组合 Trait 名追加到定义顺序（M5n，去重——跨模块同名 trait 只记首个）。
+    pub fn addTraitOrder(self: *Program, trait_name: []const u8) !void {
+        for (self.trait_order.items) |t| if (std.mem.eql(u8, t, trait_name)) return;
+        try self.trait_order.append(self.allocator, trait_name);
     }
 };
