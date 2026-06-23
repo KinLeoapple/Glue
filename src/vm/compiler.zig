@@ -73,6 +73,13 @@ const CtorEntry = struct {
     arity: u8,
 };
 
+/// 顶层全局变量登记项（M5g）：name → globals 数组索引 + 可变性（var 可重新赋值，val 不可）。
+const GlobalEntry = struct {
+    name: []const u8,
+    idx: u16,
+    is_mutable: bool,
+};
+
 /// 模块编译器：消费 ast.Module，产出 Program（持有所有 Function）。
 pub const ModuleCompiler = struct {
     program: Program,
@@ -83,6 +90,10 @@ pub const ModuleCompiler = struct {
     ctor_table: std.ArrayListUnmanaged(CtorEntry) = .empty,
     /// Newtype 构造器表（第一遍登记）：构造器名 == type_name，arity 恒 1。
     newtype_table: std.ArrayListUnmanaged(CtorEntry) = .empty,
+    /// 自定义错误类型构造器表（M5e，第一遍登记）：构造器名 == type_name，arity 恒 1（str 消息）。
+    error_table: std.ArrayListUnmanaged(CtorEntry) = .empty,
+    /// 顶层全局变量表（M5g，第一遍登记）：name → globals 数组索引 + 是否可变（var）。
+    global_table: std.ArrayListUnmanaged(GlobalEntry) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
         return .{ .program = Program.init(allocator), .allocator = allocator };
@@ -92,6 +103,8 @@ pub const ModuleCompiler = struct {
         self.fn_table.deinit(self.allocator);
         self.ctor_table.deinit(self.allocator);
         self.newtype_table.deinit(self.allocator);
+        self.error_table.deinit(self.allocator);
+        self.global_table.deinit(self.allocator);
         // program 所有权移交调用方；此处不 deinit。
     }
 
@@ -113,6 +126,22 @@ pub const ModuleCompiler = struct {
     /// 查 newtype 构造器登记（裸名 newtype 构造 / match newtype pattern 用）。
     pub fn lookupNewtype(self: *ModuleCompiler, name: []const u8) ?CtorEntry {
         for (self.newtype_table.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e;
+        }
+        return null;
+    }
+
+    /// 查自定义错误类型构造器登记（裸名 ErrorType("msg") 调用用）。
+    pub fn lookupError(self: *ModuleCompiler, name: []const u8) ?CtorEntry {
+        for (self.error_table.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e;
+        }
+        return null;
+    }
+
+    /// 查顶层全局变量登记（自由标识符 / 赋值目标解析用）。
+    pub fn lookupGlobal(self: *ModuleCompiler, name: []const u8) ?GlobalEntry {
+        for (self.global_table.items) |e| {
             if (std.mem.eql(u8, e.name, name)) return e;
         }
         return null;
@@ -164,12 +193,30 @@ pub const ModuleCompiler = struct {
                             const ntidx = try self.program.addNewtypeCtor(td.name);
                             try self.newtype_table.append(self.allocator, .{ .name = nt.name, .idx = ntidx, .arity = 1 });
                         },
+                        .error_newtype => |en| {
+                            // type FileError = Error("file error")：构造器名 == type_name，arity 1（str 消息）。
+                            const eidx = try self.program.addErrorCtor(td.name, en.message);
+                            try self.error_table.append(self.allocator, .{ .name = td.name, .idx = eidx, .arity = 1 });
+                        },
                         else => {}, // record/alias/gadt 等留后续片
+                    }
+                },
+                // M5g：登记顶层 val/var 全局变量（expr_decl 携带 val_decl/var_decl stmt）。
+                // 裸表达式语句（stmt==null）不执行（文档 D13），不登记。
+                .expr_decl => |ed| {
+                    if (ed.stmt) |s| {
+                        const idx: u16 = @intCast(self.global_table.items.len);
+                        switch (s.*) {
+                            .val_decl => |vd| try self.global_table.append(self.allocator, .{ .name = vd.name, .idx = idx, .is_mutable = false }),
+                            .var_decl => |vd| try self.global_table.append(self.allocator, .{ .name = vd.name, .idx = idx, .is_mutable = true }),
+                            else => {},
+                        }
                     }
                 },
                 else => {}, // trait/impl/use 等 M2a 不处理（遇到引用时 Unsupported）
             }
         }
+        self.program.global_count = @intCast(self.global_table.items.len);
         // 第二遍：逐个编译函数体，覆盖预留槽（idx 对齐）。lambda 追加到末尾（idx ≥ 顶层函数数）。
         for (module.declarations) |decl| {
             switch (decl) {
@@ -177,7 +224,45 @@ pub const ModuleCompiler = struct {
                 else => {},
             }
         }
+        // M5g：若有顶层 val/var，编译一个全局初始化函数（按声明顺序求值 RHS → OP_SET_GLOBAL）。
+        if (self.global_table.items.len > 0) {
+            try self.compileGlobalsInit(module);
+        }
         if (self.lookupFn("main")) |m| self.program.entry = m;
+    }
+
+    /// M5g：编译全局初始化函数（零参，追加到 program 末尾，记入 program.globals_init）。
+    /// 按声明顺序求值每个顶层 val/var 的 RHS，写入对应 global 槽（支持前向引用顶层函数，
+    /// 但不支持引用尚未初始化的后续全局——镜像 eval 的顺序求值语义）。
+    fn compileGlobalsInit(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
+        var fc = FnCompiler.init(self.allocator, self);
+        defer fc.deinit();
+        for (module.declarations) |decl| {
+            if (decl != .expr_decl) continue;
+            const ed = decl.expr_decl;
+            const s = ed.stmt orelse continue;
+            const gv: struct { name: []const u8, value: *ast.Expr, ann: ?*ast.TypeNode } = switch (s.*) {
+                .val_decl => |vd| .{ .name = vd.name, .value = vd.value, .ann = vd.type_annotation },
+                .var_decl => |vd| .{ .name = vd.name, .value = vd.value, .ann = vd.type_annotation },
+                else => continue,
+            };
+            const ge = self.lookupGlobal(gv.name).?;
+            try fc.emitExpr(gv.value);
+            // 注解隐式定型（i8 字面量 → i32 全局），镜像形参/局部协调。
+            try fc.emitCoerceFromAnnotation(gv.ann, ed.location);
+            try fc.chunk.writeOp(.op_set_global, ed.location);
+            try fc.chunk.writeU16(ge.idx);
+        }
+        try fc.chunk.writeOp(.op_unit, .{ .line = 0, .column = 0 });
+        try fc.chunk.writeOp(.op_return, .{ .line = 0, .column = 0 });
+        const f = Function{
+            .chunk = fc.chunk,
+            .arity = 0,
+            .slot_count = fc.slot_count,
+            .name = "<globals_init>",
+        };
+        fc.chunk = Chunk.init(self.allocator);
+        self.program.globals_init = try self.program.addFunction(f);
     }
 
     fn compileFunction(self: *ModuleCompiler, fd: @TypeOf(@as(ast.Decl, undefined).fun_decl)) CompileError!void {
@@ -334,6 +419,10 @@ const FnCompiler = struct {
                     try self.chunk.writeOp(.op_make_adt, loc);
                     try self.chunk.writeU16(ce.idx);
                     try self.chunk.writeByte(0);
+                } else if (self.module.lookupGlobal(id.name)) |ge| {
+                    // M5g：顶层 val/var 全局变量读 → OP_GET_GLOBAL。
+                    try self.chunk.writeOp(.op_get_global, loc);
+                    try self.chunk.writeU16(ge.idx);
                 } else return error.Unsupported;
             },
             .unary => |un| {
@@ -448,7 +537,7 @@ const FnCompiler = struct {
                 try self.emitExpr(prop.expr);
                 try self.chunk.writeOp(.op_propagate, prop.location);
             },
-            // M3c-defer：赋值表达式（defer x = v 解析为此）。求值 v→写 local/upvalue→留 v 在栈顶。
+            // M3c-defer：赋值表达式（defer x = v 解析为此）。求值 v→写 local/upvalue/global→留 v 在栈顶。
             .assignment_expr => |a| {
                 if (a.target.* != .identifier) return error.Unsupported;
                 const name = a.target.identifier.name;
@@ -460,6 +549,10 @@ const FnCompiler = struct {
                 } else if (try self.resolveUpvalue(name)) |uv_idx| {
                     try self.chunk.writeOp(.op_set_upvalue, a.location);
                     try self.chunk.writeU16(uv_idx);
+                } else if (self.module.lookupGlobal(name)) |ge| {
+                    // M5g：赋值表达式写顶层 var 全局。
+                    try self.chunk.writeOp(.op_set_global, a.location);
+                    try self.chunk.writeU16(ge.idx);
                 } else return error.Unsupported;
             },
             // M4a：atomic e —— 求值 e + OP_MAKE_ATOMIC（包成 AtomicValue）。
@@ -893,6 +986,14 @@ const FnCompiler = struct {
                     try self.chunk.writeU16(ne.idx);
                     return;
                 }
+                // M5e：自定义错误类型构造器裸名调用 → OP_MAKE_ERROR（arity 恒 1，str 消息）。
+                if (self.module.lookupError(name)) |ee| {
+                    if (argc != 1) return error.Unsupported;
+                    try self.emitExpr(c.arguments[0]);
+                    try self.chunk.writeOp(.op_make_error, loc);
+                    try self.chunk.writeU16(ee.idx);
+                    return;
+                }
                 // 原生内建（println/print 等）：bench 驱动端到端跑完整 main。
                 if (opcode.Native.fromName(name)) |nat| {
                     for (c.arguments) |arg| try self.emitExpr(arg);
@@ -1298,6 +1399,11 @@ const FnCompiler = struct {
                 try self.chunk.writeOp(.op_pop, e.location);
             },
             .assignment => |a| {
+                // M5f：index 目标 arr[i] = v —— 镜像 eval：identifier 数组目标 COW 后写回绑定槽。
+                if (a.target.* == .index) {
+                    try self.emitIndexAssign(a.target.index, a.value, a.location);
+                    return;
+                }
                 if (a.target.* != .identifier) return error.Unsupported;
                 const name = a.target.identifier.name;
                 if (self.resolveLocal(name)) |slot| {
@@ -1308,6 +1414,11 @@ const FnCompiler = struct {
                     try self.emitExpr(a.value);
                     try self.chunk.writeOp(.op_set_upvalue, a.location);
                     try self.chunk.writeU16(uv_idx);
+                } else if (self.module.lookupGlobal(name)) |ge| {
+                    // M5g：顶层 var 重新赋值 → OP_SET_GLOBAL（val 不可变性由 type_check 保证）。
+                    try self.emitExpr(a.value);
+                    try self.chunk.writeOp(.op_set_global, a.location);
+                    try self.chunk.writeU16(ge.idx);
                 } else return error.Unsupported;
             },
             .return_stmt => |r| {
@@ -1462,6 +1573,14 @@ const FnCompiler = struct {
             try self.chunk.writeOp(.op_compound_upvalue, ca.location);
             try self.chunk.writeU16(uv);
             try self.chunk.writeByte(@intFromEnum(arith));
+        } else if (self.module.lookupGlobal(name)) |ge| {
+            // M5g：顶层 var 复合赋值 g op= v → g = g op v（读改写，无 atomic 透明：顶层全局非 spawn 捕获）。
+            try self.chunk.writeOp(.op_get_global, ca.location);
+            try self.chunk.writeU16(ge.idx);
+            try self.emitExpr(ca.value);
+            try self.chunk.writeOp(arith, ca.location);
+            try self.chunk.writeOp(.op_set_global, ca.location);
+            try self.chunk.writeU16(ge.idx);
         } else return error.Unsupported;
     }
 
@@ -1491,6 +1610,16 @@ const FnCompiler = struct {
                 try self.chunk.writeOp(.op_set_upvalue, fa.location);
                 try self.chunk.writeU16(uv);
                 return;
+            } else if (self.module.lookupGlobal(oname)) |ge| {
+                // M5g：顶层 var 记录字段赋值 g.f = v（COW 写回全局槽）。
+                try self.chunk.writeOp(.op_get_global, fa.location);
+                try self.chunk.writeU16(ge.idx);
+                try self.emitExpr(fa.value);
+                try self.chunk.writeOp(.op_set_field, fa.location);
+                try self.chunk.writeU16(name_const);
+                try self.chunk.writeOp(.op_set_global, fa.location);
+                try self.chunk.writeU16(ge.idx);
+                return;
             }
         }
         // 临时对象：改动随即丢弃（与 eval else 分支语义一致）。
@@ -1499,6 +1628,51 @@ const FnCompiler = struct {
         try self.chunk.writeOp(.op_set_field, fa.location);
         try self.chunk.writeU16(name_const);
         try self.chunk.writeOp(.op_pop, fa.location);
+    }
+
+    /// 索引赋值 arr[i] = v。镜像 eval assignment 的 .index 分支：identifier 数组目标 COW 后写回绑定槽。
+    /// OP_SET_INDEX 栈效果 [array, index, val] → [new_array]（COW 产新 array 或原地改）。
+    /// identifier target：GET_LOCAL → index → val → SET_INDEX → SET_LOCAL 写回。
+    /// 其它（临时对象）：obj → index → val → SET_INDEX → POP 丢弃。
+    fn emitIndexAssign(self: *FnCompiler, idx: @TypeOf(@as(Expr, undefined).index), rhs: *Expr, loc: ast.SourceLocation) CompileError!void {
+        if (idx.object.* == .identifier) {
+            const oname = idx.object.identifier.name;
+            if (self.resolveLocal(oname)) |slot| {
+                try self.chunk.writeOp(.op_get_local, loc);
+                try self.chunk.writeU16(slot);
+                try self.emitExpr(idx.index);
+                try self.emitExpr(rhs);
+                try self.chunk.writeOp(.op_set_index, loc);
+                try self.chunk.writeOp(.op_set_local, loc);
+                try self.chunk.writeU16(slot);
+                return;
+            } else if (try self.resolveUpvalue(oname)) |uv| {
+                try self.chunk.writeOp(.op_get_upvalue, loc);
+                try self.chunk.writeU16(uv);
+                try self.emitExpr(idx.index);
+                try self.emitExpr(rhs);
+                try self.chunk.writeOp(.op_set_index, loc);
+                try self.chunk.writeOp(.op_set_upvalue, loc);
+                try self.chunk.writeU16(uv);
+                return;
+            } else if (self.module.lookupGlobal(oname)) |ge| {
+                // M5g：顶层 var 数组元素赋值 g[i] = v（COW 写回全局槽）。
+                try self.chunk.writeOp(.op_get_global, loc);
+                try self.chunk.writeU16(ge.idx);
+                try self.emitExpr(idx.index);
+                try self.emitExpr(rhs);
+                try self.chunk.writeOp(.op_set_index, loc);
+                try self.chunk.writeOp(.op_set_global, loc);
+                try self.chunk.writeU16(ge.idx);
+                return;
+            }
+        }
+        // 临时对象：改动随即丢弃。
+        try self.emitExpr(idx.object);
+        try self.emitExpr(idx.index);
+        try self.emitExpr(rhs);
+        try self.chunk.writeOp(.op_set_index, loc);
+        try self.chunk.writeOp(.op_pop, loc);
     }
 
     /// 回跳到 target（已知地址，在当前指令之前）的无条件 jump。
@@ -1658,6 +1832,26 @@ fn compileAndCall(allocator: std.mem.Allocator, source: []const u8, entry_name: 
     // bool 结果（contains/is_empty 等）coerce 为 1/0，便于测试统一用 u128 断言。
     if (result == .boolean) return if (result.boolean) 1 else 0;
     return result.integer.value;
+}
+
+/// M5e：编译并执行 entry，返回原始 Value（调用方负责 releaseVM）。供检查 throw_val/string 等
+/// 非整数结果的测试。arena 在返回前 deinit，故结果不可借用 AST 字节（error_newtype 走 dupe 安全）。
+fn compileAndValue(allocator: std.mem.Allocator, program_out: *Program, source: []const u8, entry_name: []const u8) !Value {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var lex = lexer.Lexer.init(aa, source);
+    const tokens = try lex.tokenize();
+    var p = parser.Parser.init(aa, tokens);
+    var module = try p.parseModule("test");
+    var mc = ModuleCompiler.init(allocator);
+    defer mc.deinit();
+    try mc.compileModule(&module);
+    program_out.* = mc.program; // 移交 program 所有权给调用方（持有 error_ctors 等借用 AST 的描述）
+    const idx = mc.lookupFn(entry_name) orelse return error.MissingFunction;
+    var vm = vm_mod.VM.init(allocator);
+    defer vm.deinit();
+    return try vm.call(program_out, idx, &.{});
 }
 
 test "M1a fib(10) = 55" {
@@ -3649,4 +3843,106 @@ test "M4d inline trait repeated calls with capture" {
     ;
     // (9+5)+(16+5) = 35
     try std.testing.expectEqual(@as(u128, 35), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5e error_newtype: FileError(msg) -> throw_val.err with prefixed message" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\type FileError = Error("file error")
+        \\fun run() {
+        \\    FileError("config.json missing")
+        \\}
+    ;
+    var program: Program = undefined;
+    const result = try compileAndValue(allocator, &program, src, "run");
+    defer program.deinit();
+    defer result.releaseVM(allocator);
+    try std.testing.expect(result == .throw_val);
+    try std.testing.expect(result.throw_val.* == .err);
+    const e = result.throw_val.err;
+    try std.testing.expectEqualStrings("FileError", e.type_name);
+    try std.testing.expectEqualStrings("file error: config.json missing", e.message);
+    try std.testing.expect(e.is_error_subtype);
+}
+
+test "M5e error_newtype: .message field access" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\type NetworkError = Error("network error")
+        \\fun run(): str {
+        \\    val ne = NetworkError("timeout")
+        \\    ne.message
+        \\}
+    ;
+    var program: Program = undefined;
+    const result = try compileAndValue(allocator, &program, src, "run");
+    defer program.deinit();
+    defer result.releaseVM(allocator);
+    try std.testing.expect(result == .string);
+    try std.testing.expectEqualStrings("network error: timeout", result.string);
+}
+
+test "M5f index assign: arr[i] = v then read" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var arr = [10i64, 20i64, 30i64]
+        \\    arr[1] = 99i64
+        \\    arr[0] + arr[1] + arr[2]
+        \\}
+    ;
+    // 10 + 99 + 30 = 139
+    try std.testing.expectEqual(@as(u128, 139), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5f index assign COW: aliased array unaffected" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun run(): i64 {
+        \\    var arr = [1i64, 2i64, 3i64]
+        \\    var c = arr
+        \\    c[0] = 99i64
+        \\    arr[0] + c[0]
+        \\}
+    ;
+    // 别名独立：arr[0] 仍 1，c[0] 改 99 → 1 + 99 = 100
+    try std.testing.expectEqual(@as(u128, 100), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5g global val read from function" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\val base: i64 = 100i64
+        \\fun run(): i64 { base + 5i64 }
+    ;
+    try std.testing.expectEqual(@as(u128, 105), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5g global var mutated across calls" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\var counter: i64 = 0i64
+        \\fun bump() { counter = counter + 1i64 }
+        \\fun run(): i64 {
+        \\    bump()
+        \\    bump()
+        \\    bump()
+        \\    counter
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 3), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5g global var compound assignment" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\var total: i64 = 10i64
+        \\fun run(): i64 {
+        \\    total += 5i64
+        \\    total *= 2i64
+        \\    total
+        \\}
+    ;
+    // (10+5)*2 = 30
+    try std.testing.expectEqual(@as(u128, 30), try compileAndCall(allocator, src, "run", &.{}));
 }

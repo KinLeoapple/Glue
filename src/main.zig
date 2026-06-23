@@ -444,14 +444,23 @@ fn vmEligible(module: ast.Module) bool {
                 if (std.mem.eql(u8, f.name, "main")) has_main = true;
             },
             .type_decl => |td| switch (td.def) {
-                // VM 编译器登记 adt/newtype 构造器；alias 无运行时效果（仅类型注解用，
-                // 编译器忽略）→ 安全 eligible。record/gadt/error_newtype 未支持 → 回退。
-                .adt, .newtype, .alias => {},
+                // VM 编译器登记 adt/newtype/error_newtype 构造器；alias 无运行时效果（仅类型注解用，
+                // 编译器忽略）→ 安全 eligible。record/gadt 未支持 → 回退。
+                .adt, .newtype, .alias, .error_newtype => {},
                 else => return false,
             },
             // 裸表达式语句（无 stmt）在模块级不执行（文档 D13），VM 与树遍历器一致跳过 → 安全。
-            // 但带 stmt 的（顶层 val/var）VM 不处理 → 回退。
-            .expr_decl => |ed| if (ed.stmt != null) return false,
+            // M5g：带 stmt 的顶层 val/var 现由 VM 全局变量支持 → eligible。
+            .expr_decl => |ed| {
+                if (ed.stmt) |s| switch (s.*) {
+                    .val_decl, .var_decl => {},
+                    else => return false,
+                };
+            },
+            // M5h：顶层 trait 声明无运行时效果（VM 编译器忽略；inline trait 值自带 vtable，
+            // 不依赖 trait 注册表）。无 impl 时 trait 默认方法不可达 → 安全 eligible。
+            // 含 impl 的模块仍由 impl_decl 触发回退（下方 else）。
+            .trait_decl => {},
             // use/trait/impl/pack：VM 无对应运行时 → 回退。
             else => return false,
         }

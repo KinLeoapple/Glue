@@ -142,6 +142,9 @@ pub const OpCode = enum(u8) {
     op_test_newtype,
     /// OP_GET_NEWTYPE_INNER：弹 newtype 对象，retainOwned 其 inner 压栈，release 对象。
     op_get_newtype_inner,
+    /// OP_MAKE_ERROR <u16 err_idx>：弹 str 消息（owned，接管），按 program.error_ctors[err_idx]
+    /// 建 throw_val.err{type_name, message=prefix+": "+msg, is_error_subtype=true} 压栈。
+    op_make_error,
 
     // ── M3a：字符串插值 / 类型转换 ──
     /// OP_INTERP <u16 n>：弹栈顶 n 段值（先压的是第一段，literal 文本段也压成 string 常量），
@@ -163,6 +166,13 @@ pub const OpCode = enum(u8) {
     /// OP_SET_FIELD <u16 name_const_idx>：栈布局 [obj, val]，弹 val 写入 obj 的命名字段
     /// （record COW；不可变绑定/非 record → panic），弹 obj release，压 unit。
     op_set_field,
+    /// OP_SET_INDEX：栈布局 [array, index, val]，弹三者，array[index] = val（array COW；
+    /// 越界/非数组/非整数索引 → panic），压回 new_array（写回由 SET_LOCAL 完成，镜像 SET_FIELD）。
+    op_set_index,
+    /// OP_GET_GLOBAL <u16 idx>：读 VM globals[idx]，retainOwned 后压栈（顶层 val/var 跨函数读）。
+    op_get_global,
+    /// OP_SET_GLOBAL <u16 idx>：弹栈顶 owned 值写入 globals[idx]（旧值 release）。全局初始化 + var 赋值用。
+    op_set_global,
 
     // ── M3c：异常 / 传播 / 非空断言 / elvis ──
     /// OP_JUMP_IF_NOT_NULL <i32 off>：peek 栈顶，非 null 则相对跳转（不弹）。供 `??` 短路。

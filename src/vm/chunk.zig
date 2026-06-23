@@ -134,6 +134,15 @@ pub const NewtypeCtorDesc = struct {
     type_name: []const u8,
 };
 
+/// 自定义错误类型构造器描述（M5e）：OP_MAKE_ERROR <err_idx> 索引进 program.error_ctors。
+/// type FileError = Error("file error") → FileError("msg") 产 throw_val.err{
+///   type_name="FileError", message="file error: msg", is_error_subtype=true}。
+/// type_name / default_prefix 借用 AST 字节（不持有）。
+pub const ErrorCtorDesc = struct {
+    type_name: []const u8,
+    default_prefix: []const u8,
+};
+
 /// 整个编译单元：一组顶层函数 + 入口索引（main）。
 /// OP_CALL <func_idx> 索引进 functions。Program 持有所有 Function 的所有权。
 pub const Program = struct {
@@ -147,6 +156,13 @@ pub const Program = struct {
     record_shapes: std.ArrayListUnmanaged(RecordShape) = .empty,
     /// Newtype 构造器表（M2c）：OP_MAKE_NEWTYPE <nt_idx> 索引进此。
     newtype_ctors: std.ArrayListUnmanaged(NewtypeCtorDesc) = .empty,
+    /// 自定义错误类型构造器表（M5e）：OP_MAKE_ERROR <err_idx> 索引进此。
+    error_ctors: std.ArrayListUnmanaged(ErrorCtorDesc) = .empty,
+    /// 顶层全局变量数（M5g）：VM 据此预留 globals 数组。OP_GET_GLOBAL/OP_SET_GLOBAL <u16 idx> 索引进此。
+    global_count: u16 = 0,
+    /// 全局初始化函数索引（M5g）：在 entry(main) 之前运行，求值顶层 val/var 的 RHS 写入 globals。
+    /// null 表示无顶层 val/var（不需初始化）。
+    globals_init: ?u16 = null,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -165,6 +181,7 @@ pub const Program = struct {
         for (self.record_shapes.items) |s| self.allocator.free(s.field_names);
         self.record_shapes.deinit(self.allocator);
         self.newtype_ctors.deinit(self.allocator);
+        self.error_ctors.deinit(self.allocator);
     }
 
     /// 追加一个函数，返回其索引。
@@ -203,6 +220,13 @@ pub const Program = struct {
     pub fn addNewtypeCtor(self: *Program, type_name: []const u8) !u16 {
         const idx = self.newtype_ctors.items.len;
         try self.newtype_ctors.append(self.allocator, .{ .type_name = type_name });
+        return @intCast(idx);
+    }
+
+    /// 登记一个自定义错误类型构造器，返回其 err_idx。type_name/default_prefix 借用 AST。
+    pub fn addErrorCtor(self: *Program, type_name: []const u8, default_prefix: []const u8) !u16 {
+        const idx = self.error_ctors.items.len;
+        try self.error_ctors.append(self.allocator, .{ .type_name = type_name, .default_prefix = default_prefix });
         return @intCast(idx);
     }
 };

@@ -246,6 +246,9 @@ pub const VM = struct {
     scan_line_buf: std.ArrayListUnmanaged(u8) = .empty,
     scan_line_pos: usize = 0,
     stdin_state: ?*StdinState = null,
+    /// M5g：顶层全局变量槽（OP_GET_GLOBAL/OP_SET_GLOBAL <idx> 索引）。call 时按 program.global_count
+    /// 分配并以 unit 初始化；deinit 时 release 各槽。
+    globals: std.ArrayListUnmanaged(Value) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) VM {
         return .{ .allocator = allocator };
@@ -278,6 +281,9 @@ pub const VM = struct {
         // M5d：释放 scan 行缓冲 + stdin reader 状态。
         self.scan_line_buf.deinit(self.allocator);
         if (self.stdin_state) |state| self.allocator.destroy(state);
+        // M5g：release 全局变量槽。
+        for (self.globals.items) |v| v.releaseVM(self.allocator);
+        self.globals.deinit(self.allocator);
     }
 
     /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
@@ -452,9 +458,19 @@ pub const VM = struct {
     /// 返回该函数的返回值（owned，调用方负责 release）。
     /// M1a：跨帧 CALL/RETURN，callee 用 func_idx 立即数（无一等函数值）。
     pub fn call(self: *VM, program: *const Program, entry: u16, args: []const Value) VMError!Value {
+        self.program = program; // M4c：OP_SPAWN 需 program 指针传子 VM。
+        // M5g：预留全局槽（unit 占位），运行全局初始化函数（顶层 val/var 的 RHS）。
+        if (self.globals.items.len < program.global_count) {
+            const need = program.global_count - self.globals.items.len;
+            var k: usize = 0;
+            while (k < need) : (k += 1) try self.globals.append(self.allocator, Value.unit);
+        }
+        if (program.globals_init) |init_idx| {
+            const init_result = try self.callNoArgs(program, init_idx);
+            init_result.releaseVM(self.allocator); // 初始化函数返回 unit，丢弃
+        }
         const f = &program.functions.items[entry];
         if (args.len != f.arity) return self.fail(.{ .line = 0, .column = 0 }, "wrong number of arguments", error.WrongArity);
-        self.program = program; // M4c：OP_SPAWN 需 program 指针传子 VM。
         // 建立入口帧：实参占 slot 0..arity-1，其余局部槽补 unit 占位。
         const slot_base = self.stack.items.len;
         for (args) |a| try self.push(a); // 所有权移交栈（slot）
@@ -462,6 +478,23 @@ pub const VM = struct {
         while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
         try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = slot_base, .frame_base = slot_base });
         return self.runLoop(program);
+    }
+
+    /// M5g：运行一个零参顶层函数到完成，返回其 owned 结果（用 stop_depth 边界使其 RETURN 即返回）。
+    fn callNoArgs(self: *VM, program: *const Program, func_idx: u16) VMError!Value {
+        const f = &program.functions.items[func_idx];
+        const saved_depth = self.stop_depth;
+        const base = self.stack.items.len;
+        var s: u16 = 0;
+        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = base, .frame_base = base });
+        self.stop_depth = self.frames.items.len - 1;
+        const result = self.runLoop(program) catch |e| {
+            self.stop_depth = saved_depth;
+            return e;
+        };
+        self.stop_depth = saved_depth;
+        return result;
     }
 
     /// M4c：执行 spawn body —— 零参 Function + 给定 upvalues（cell）。建入口帧（带 upvalues）跑到 RETURN。
@@ -843,6 +876,28 @@ pub const VM = struct {
                     if (obj != .newtype) return self.fail(loc, "OP_GET_NEWTYPE_INNER on non-newtype", error.TypeMismatch);
                     try self.push(try self.retainOwned(obj.newtype.inner));
                 },
+                // M5e：自定义错误类型构造 —— 弹 str 消息，产 throw_val.err。镜像 eval error_newtype 构造器：
+                //   FileError("msg") → err{type_name="FileError", message="file error: msg", is_error_subtype=true}。
+                .op_make_error => {
+                    const err_idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const desc = program.error_ctors.items[err_idx];
+                    const v = self.pop();
+                    defer v.releaseVM(self.allocator);
+                    if (v != .string) return self.fail(loc, "error constructor expects a str argument", error.TypeMismatch);
+                    var msg: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer msg.deinit(self.allocator);
+                    try msg.appendSlice(self.allocator, desc.default_prefix);
+                    try msg.appendSlice(self.allocator, ": ");
+                    try msg.appendSlice(self.allocator, v.string);
+                    const tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
+                    tv.* = .{ .err = .{
+                        .type_name = self.allocator.dupe(u8, desc.type_name) catch return error.OutOfMemory,
+                        .message = try msg.toOwnedSlice(self.allocator),
+                        .is_error_subtype = true, // 文档 2.4.3: FileError <: Error
+                    } };
+                    try self.push(Value{ .throw_val = tv });
+                },
 
                 // M3a：字符串插值 —— 弹栈顶 n 段值，依次 format 拼接成新 string 压栈。
                 .op_interp => {
@@ -871,6 +926,24 @@ pub const VM = struct {
                     frame.ip += 2;
                     const field = func.chunk.constants.items[name_idx].string;
                     try self.doSetField(field, loc);
+                },
+                // M5f：索引赋值 —— [array, index, val] → [new_array]（COW），写回由 SET_LOCAL 完成。
+                .op_set_index => {
+                    try self.doSetIndex(loc);
+                },
+                // M5g：全局读 —— retainOwned globals[idx] 压栈。
+                .op_get_global => {
+                    const idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    try self.push(try self.retainOwned(self.globals.items[idx]));
+                },
+                // M5g：全局写 —— 弹 owned 值写入 globals[idx]（旧值 release）。
+                .op_set_global => {
+                    const idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const v = self.pop(); // 接管 owned
+                    self.globals.items[idx].releaseVM(self.allocator);
+                    self.globals.items[idx] = v;
                 },
 
                 .op_return => {
@@ -1475,6 +1548,24 @@ pub const VM = struct {
                 }
                 return self.fail(loc, "no such field on error", error.TypeMismatch);
             },
+            // M5e：throw_val.err 的 .message / .type_name 访问（自定义错误类型 FileError("..").message）。
+            // 镜像 eval accessField throw_val 分支（文档 2.4.7）。
+            .throw_val => |tv| {
+                switch (tv.*) {
+                    .err => |e| {
+                        if (std.mem.eql(u8, field, "message")) {
+                            try self.push(Value{ .string = self.allocator.dupe(u8, e.message) catch return error.OutOfMemory });
+                            return;
+                        }
+                        if (std.mem.eql(u8, field, "type_name")) {
+                            try self.push(Value{ .string = self.allocator.dupe(u8, e.type_name) catch return error.OutOfMemory });
+                            return;
+                        }
+                    },
+                    .ok => {},
+                }
+                return self.fail(loc, "no such field on Throw", error.TypeMismatch);
+            },
             // M4b：Channel 方向类型字段 —— ch.sender / ch.receiver（各 ref channel + 新包装）。
             .channel_val => |cv| {
                 if (std.mem.eql(u8, field, "sender")) {
@@ -1532,6 +1623,46 @@ pub const VM = struct {
             return self.fail(loc, "no such field on record", error.TypeMismatch);
         }
         try self.push(Value{ .record = rec });
+    }
+
+    /// array COW（rc>1 时浅拷分裂），写元素（旧值 release，val owned move 入槽），压结果 array。
+    /// 镜像 eval assignment 的 .index/.array 分支（cowField + 元素覆盖）。
+    /// 栈布局 [array, index, val] → [new_array]。
+    fn doSetIndex(self: *VM, loc: ast.SourceLocation) VMError!void {
+        const val = self.pop(); // 接管 owned
+        const index_val = self.pop();
+        defer index_val.releaseVM(self.allocator);
+        const obj = self.pop();
+        if (obj != .array) {
+            val.releaseVM(self.allocator);
+            obj.releaseVM(self.allocator);
+            return self.fail(loc, "cannot index-assign on non-array", error.TypeMismatch);
+        }
+        if (index_val != .integer) {
+            val.releaseVM(self.allocator);
+            obj.releaseVM(self.allocator);
+            return self.fail(loc, "array index must be an integer", error.TypeMismatch);
+        }
+        const iv = index_val.integer;
+        const i: i128 = if (iv.type_tag.isSigned()) iv.signedValue() else @intCast(iv.value);
+        var arr = obj.array;
+        if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
+            val.releaseVM(self.allocator);
+            obj.releaseVM(self.allocator);
+            return self.fail(loc, "index out of bounds", error.TypeMismatch);
+        }
+        // COW：共享（rc>1）时浅拷一份独占体，原体 rc-1。
+        if (arr.rc > 1) {
+            const new_elems = self.allocator.alloc(Value, arr.elements.len) catch return error.OutOfMemory;
+            for (arr.elements, 0..) |e, k| new_elems[k] = self.retainOwned(e) catch return error.OutOfMemory;
+            arr.rc -= 1;
+            const new_arr = value.Value.makeArray(self.allocator, new_elems, arr.fixed_size) catch return error.OutOfMemory;
+            arr = new_arr.array;
+        }
+        const slot = &arr.elements[@intCast(i)];
+        slot.*.releaseVM(self.allocator);
+        slot.* = val; // owned move
+        try self.push(Value{ .array = arr });
     }
 
     /// 执行 OP_MAKE_RECORD：弹栈顶 n 个值（n=shape.field_names.len），建 RecordValue（key dupe，
@@ -2129,6 +2260,10 @@ pub const VM = struct {
                 .op_ge => ord != .lt,
                 else => unreachable,
             } };
+        }
+        // M5e：char 序比较（镜像 eval evalLt/Gt/Le/Ge 的 char_val 分支）。
+        if (left == .char_val and right == .char_val) {
+            return Value{ .boolean = ordCmp(op, @as(u32, left.char_val), @as(u32, right.char_val)) };
         }
         return self.fail(loc, "comparison requires numeric operands", error.TypeMismatch);
     }

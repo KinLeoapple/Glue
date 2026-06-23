@@ -37,7 +37,7 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
     const op: OpCode = @enumFromInt(code[offset]);
     switch (op) {
         // 无操作数
-        .op_null, .op_unit, .op_true, .op_false, .op_pop, .op_dup, .op_return, .op_match_fail, .op_index, .op_get_newtype_inner, .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge, .op_bit_and, .op_bit_or, .op_bit_xor, .op_neg, .op_not, .op_non_null, .op_propagate, .op_throw, .op_get_throw_ok, .op_get_throw_err, .op_make_atomic, .op_spawn, .op_make_lazy, .op_try_recv, .op_recv, .op_concat_list => {
+        .op_null, .op_unit, .op_true, .op_false, .op_pop, .op_dup, .op_return, .op_match_fail, .op_index, .op_set_index, .op_get_newtype_inner, .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge, .op_bit_and, .op_bit_or, .op_bit_xor, .op_neg, .op_not, .op_non_null, .op_propagate, .op_throw, .op_get_throw_ok, .op_get_throw_err, .op_make_atomic, .op_spawn, .op_make_lazy, .op_try_recv, .op_recv, .op_concat_list => {
             try print(buf, allocator, "{s}\n", .{op.name()});
             return offset + 1;
         },
@@ -76,7 +76,7 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             return offset + 9;
         },
         // u16 操作数
-        .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_local_raw, .op_get_upvalue_raw => {
+        .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_make_error, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_global, .op_set_global, .op_get_local_raw, .op_get_upvalue_raw => {
             const arg = opcode.readU16(code, offset + 1);
             try print(buf, allocator, "{s} {d}\n", .{ op.name(), arg });
             return offset + 3;
