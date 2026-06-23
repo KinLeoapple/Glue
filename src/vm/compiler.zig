@@ -94,6 +94,9 @@ pub const ModuleCompiler = struct {
     error_table: std.ArrayListUnmanaged(CtorEntry) = .empty,
     /// 顶层全局变量表（M5g，第一遍登记）：name → globals 数组索引 + 是否可变（var）。
     global_table: std.ArrayListUnmanaged(GlobalEntry) = .empty,
+    /// trait/impl 方法名集合（M5i，第一遍登记）：用于把裸名调用 `compare(a,b)`（with-clause 约束的
+    /// trait 方法作自由函数）解析为 receiver=arg0 的 OP_CALL_METHOD 分派。
+    method_names: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
         return .{ .program = Program.init(allocator), .allocator = allocator };
@@ -105,6 +108,7 @@ pub const ModuleCompiler = struct {
         self.newtype_table.deinit(self.allocator);
         self.error_table.deinit(self.allocator);
         self.global_table.deinit(self.allocator);
+        self.method_names.deinit(self.allocator);
         // program 所有权移交调用方；此处不 deinit。
     }
 
@@ -145,6 +149,18 @@ pub const ModuleCompiler = struct {
             if (std.mem.eql(u8, e.name, name)) return e;
         }
         return null;
+    }
+
+    /// M5i：登记一个 trait/impl 方法名（去重）。
+    fn registerMethodName(self: *ModuleCompiler, name: []const u8) CompileError!void {
+        for (self.method_names.items) |n| if (std.mem.eql(u8, n, name)) return;
+        try self.method_names.append(self.allocator, name);
+    }
+
+    /// M5i：name 是否为已知 trait/impl 方法名（裸名调用作自由函数 trait 方法分派判定用）。
+    pub fn isMethodName(self: *ModuleCompiler, name: []const u8) bool {
+        for (self.method_names.items) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
     }
 
     /// 查顶层函数的 (idx, arity)，供尾调用合格性判定（argc==arity 才发 OP_TAIL_CALL）。
@@ -213,7 +229,14 @@ pub const ModuleCompiler = struct {
                         }
                     }
                 },
-                else => {}, // trait/impl/use 等 M2a 不处理（遇到引用时 Unsupported）
+                // M5i：登记 impl/trait 方法名（裸名调用作自由函数 trait 方法分派用）。
+                .impl_decl => |id| {
+                    for (id.methods) |m| try self.registerMethodName(m.name);
+                },
+                .trait_decl => |td| {
+                    for (td.methods) |m| try self.registerMethodName(m.name);
+                },
+                else => {}, // use/pack 等不处理（遇到引用时 Unsupported）
             }
         }
         self.program.global_count = @intCast(self.global_table.items.len);
@@ -224,11 +247,58 @@ pub const ModuleCompiler = struct {
                 else => {},
             }
         }
+        // M5i：编译 impl 方法 + trait 默认方法（编成顶层 Function，self 占 slot 0，登记进 program 表）。
+        for (module.declarations) |decl| {
+            switch (decl) {
+                .impl_decl => |id| try self.compileImplMethods(id),
+                .trait_decl => |td| try self.compileTraitDefaults(td),
+                else => {},
+            }
+        }
         // M5g：若有顶层 val/var，编译一个全局初始化函数（按声明顺序求值 RHS → OP_SET_GLOBAL）。
         if (self.global_table.items.len > 0) {
             try self.compileGlobalsInit(module);
         }
         if (self.lookupFn("main")) |m| self.program.entry = m;
+    }
+
+    /// M5i：编译一个 impl 块的所有方法体（有 body 的）。每个编成顶层 Function（self+params 占
+    /// slot 0..），登记进 program.impl_methods（type_name + method_name 分派键）。镜像 eval impl_decl。
+    fn compileImplMethods(self: *ModuleCompiler, id: @TypeOf(@as(ast.Decl, undefined).impl_decl)) CompileError!void {
+        for (id.methods) |m| {
+            const body = m.body orelse continue;
+            const func_idx = try self.compileMethodBody(m, body);
+            try self.program.addImplMethod(id.type_name, m.name, id.trait_name, func_idx);
+        }
+    }
+
+    /// M5i：编译 trait 块中带默认 body 的方法，登记进 program.trait_defaults（impl 未覆写时回退）。
+    fn compileTraitDefaults(self: *ModuleCompiler, td: @TypeOf(@as(ast.Decl, undefined).trait_decl)) CompileError!void {
+        for (td.methods) |m| {
+            const body = m.body orelse continue;
+            const func_idx = try self.compileMethodBody(m, body);
+            try self.program.addTraitDefault(td.name, m.name, func_idx);
+        }
+    }
+
+    /// M5i：把一个方法（self+params）编成顶层零捕获 Function，返回 func_idx。
+    /// 顶层 impl/trait 方法不在词法闭包内，故 enclosing=null（自由变量解析为顶层函数/全局/构造器）。
+    fn compileMethodBody(self: *ModuleCompiler, m: ast.MethodDecl, body: *ast.Expr) CompileError!u16 {
+        if (m.params.len > 255) return error.Unsupported;
+        var fc = FnCompiler.init(self.allocator, self);
+        defer fc.deinit();
+        for (m.params) |p| _ = try fc.declareLocal(p.name, p.is_var);
+        // 形参隐式定型（i8 实参 → i32 形参），镜像 compileFunction。
+        try fc.emitParamCoercions(m.params, ast.exprLocation(body));
+        try fc.emitTail(body);
+        const f = Function{
+            .chunk = fc.chunk,
+            .arity = @intCast(m.params.len),
+            .slot_count = fc.slot_count,
+            .name = m.name,
+        };
+        fc.chunk = Chunk.init(self.allocator);
+        return try self.program.addFunction(f);
     }
 
     /// M5g：编译全局初始化函数（零参，追加到 program 末尾，记入 program.globals_init）。
@@ -1000,6 +1070,16 @@ const FnCompiler = struct {
                     try self.chunk.writeOp(.op_call_native, loc);
                     try self.chunk.writeByte(@intFromEnum(nat));
                     try self.chunk.writeByte(argc);
+                    return;
+                }
+                // M5i：裸名 trait 方法调用（with-clause 约束的自由函数式 trait 方法，如 `compare(a,b)`）→
+                // 以 arg0 为 receiver 发 OP_CALL_METHOD（argc 减 1，receiver 在 args 下方）。
+                if (self.module.isMethodName(name) and argc >= 1) {
+                    const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, name) });
+                    for (c.arguments) |arg| try self.emitExpr(arg); // [recv, rest...]
+                    try self.chunk.writeOp(.op_call_method, loc);
+                    try self.chunk.writeU16(name_const);
+                    try self.chunk.writeByte(argc - 1);
                     return;
                 }
                 return error.Unsupported; // 未知裸名
@@ -3945,4 +4025,54 @@ test "M5g global var compound assignment" {
     ;
     // (10+5)*2 = 30
     try std.testing.expectEqual(@as(u128, 30), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5i impl method dispatch on ADT receiver" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\type Box = Box(n: i64)
+        \\trait Show { fun get(self): i64 }
+        \\impl Show<Box> {
+        \\    fun get(self): i64 { self.n * 2i64 }
+        \\}
+        \\fun run(): i64 {
+        \\    val b = Box(21i64)
+        \\    b.get()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5i trait default method falls through when impl omits it" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\type Box = Box(n: i64)
+        \\trait Doubler {
+        \\    fun base(self): i64
+        \\    fun doubled(self): i64 { self.base() + self.base() }
+        \\}
+        \\impl Doubler<Box> {
+        \\    fun base(self): i64 { self.n }
+        \\}
+        \\fun run(): i64 {
+        \\    val b = Box(15i64)
+        \\    b.doubled()
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 30), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5i trait method as free function dispatches on first arg" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\type Wrap = Wrap(v: i64)
+        \\trait Pick { fun pick(a, b): i64 }
+        \\impl Pick<Wrap> {
+        \\    fun pick(a, b): i64 { a.v + b }
+        \\}
+        \\fun run(): i64 {
+        \\    pick(Wrap(40i64), 2i64)
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCall(allocator, src, "run", &.{}));
 }

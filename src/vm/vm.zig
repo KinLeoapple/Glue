@@ -167,6 +167,48 @@ fn vmValueTypeName(val: Value) []const u8 {
     };
 }
 
+/// M5i：数值类型名（i8/u32/f64 等）。impl 数值宽度互通用。
+fn implIsNumericTypeName(name: []const u8) bool {
+    const nums = [_][]const u8{
+        "i8", "i16", "i32", "i64", "i128",
+        "u8", "u16", "u32", "u64", "u128",
+        "f16", "f32", "f64", "f128",
+    };
+    for (nums) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
+/// M5i：两个数值类型名是否同类（都整数或都浮点）。镜像 eval numericKindMatches。
+fn implNumericKindMatches(a: []const u8, b: []const u8) bool {
+    const a_float = a.len > 0 and a[0] == 'f';
+    const b_float = b.len > 0 and b[0] == 'f';
+    return a_float == b_float;
+}
+
+/// M5i：receiver 类型名是否匹配 impl 目标类型名。精确匹配，或数值同类宽度互通
+/// （字面量推断最小类型 5→i8，用户惯写 impl<i32>，故放宽，镜像 eval callMethod）。
+fn implTypeMatches(recv: []const u8, impl_ty: []const u8) bool {
+    if (impl_ty.len == 0) return true; // 未指定类型：按方法名匹配（向后兼容）
+    if (std.mem.eql(u8, recv, impl_ty)) return true;
+    return implIsNumericTypeName(recv) and implIsNumericTypeName(impl_ty) and implNumericKindMatches(recv, impl_ty);
+}
+
+/// M5i：在 program.impl_methods 查 (receiver 类型, 方法名) 对应的方法 func_idx。
+fn findImplMethod(program: *const Program, recv_type: []const u8, method_name: []const u8) ?u16 {
+    for (program.impl_methods.items) |d| {
+        if (std.mem.eql(u8, d.method_name, method_name) and implTypeMatches(recv_type, d.type_name)) return d.func_idx;
+    }
+    return null;
+}
+
+/// M5i：在 program.trait_defaults 查方法名对应的默认方法 func_idx（impl 未覆写时回退）。
+fn findTraitDefault(program: *const Program, method_name: []const u8) ?u16 {
+    for (program.trait_defaults.items) |d| {
+        if (std.mem.eql(u8, d.method_name, method_name)) return d.func_idx;
+    }
+    return null;
+}
+
 /// M5d：结构相等（深比较 array/record/adt/newtype），镜像 eval structuralEquals。供 eq() native 用。
 fn vmStructuralEquals(a: Value, b: Value) bool {
     const at = std.meta.activeTag(a);
@@ -1784,6 +1826,16 @@ pub const VM = struct {
         if (receiver == .trait_value and receiver.trait_value.vm_owned) {
             return self.doTraitMethod(receiver.trait_value, name, argc, args_start, loc);
         }
+        // M5i：用户 impl 方法分派 —— 据 receiver 类型名 + 方法名查 program.impl_methods（数值宽度互通），
+        // 命中则把 [receiver, args...] 作为方法 slot 跑方法体。未命中查 trait 默认方法；再未命中走 native。
+        if (self.program) |prog| {
+            if (findImplMethod(prog, vmValueTypeName(receiver), name)) |fidx| {
+                return self.invokeMethodBody(prog, fidx, argc, args_start, loc);
+            }
+            if (findTraitDefault(prog, name)) |fidx| {
+                return self.invokeMethodBody(prog, fidx, argc, args_start, loc);
+            }
+        }
         const result = method.dispatch(self.allocator, receiver, name, args) catch |err| switch (err) {
             error.NoSuchMethod => return self.fail(loc, "no such method on this type", error.TypeMismatch),
             error.WrongArity => return self.fail(loc, "method called with wrong number of arguments", error.WrongArity),
@@ -1795,6 +1847,30 @@ pub const VM = struct {
         for (args) |a| a.releaseVM(self.allocator);
         receiver.releaseVM(self.allocator);
         self.stack.shrinkRetainingCapacity(args_start - 1);
+        try self.push(result);
+    }
+
+    /// M5i：以栈上 [receiver, arg0..arg_{argc-1}]（共 argc+1 个，起于 args_start-1）作为方法体的
+    /// slot 0..argc，建帧跑方法体到 RETURN，结果压回 args_start-1。用 stop_depth 边界使方法体
+    /// RETURN 即返回（不 continue 外层 dispatch），镜像 forceLazyVM/callNoArgs。
+    fn invokeMethodBody(self: *VM, program: *const Program, func_idx: u16, argc: u8, args_start: usize, loc: ast.SourceLocation) VMError!void {
+        const f = &program.functions.items[func_idx];
+        const total_args = argc + 1; // receiver + 显式实参
+        if (total_args != f.arity) return self.fail(loc, "method called with wrong number of arguments", error.WrongArity);
+        if (self.frames.items.len >= MAX_FRAMES) return self.fail(loc, "stack overflow: call depth exceeded", error.StackOverflow);
+        // receiver+args 已在栈顶 total_args 个槽（起于 args_start-1），正好作 slot 0..arity-1。
+        const slot_base = args_start - 1;
+        var s: u16 = f.arity;
+        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        const saved_depth = self.stop_depth;
+        try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = slot_base, .frame_base = slot_base });
+        self.stop_depth = self.frames.items.len - 1; // 方法帧弹出即停
+        const result = self.runLoop(program) catch |e| {
+            self.stop_depth = saved_depth;
+            return e;
+        };
+        self.stop_depth = saved_depth;
+        // 方法帧 RETURN 已释放 slot（含 receiver/args）并 shrink 到 slot_base；结果压回。
         try self.push(result);
     }
 

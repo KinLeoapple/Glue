@@ -143,6 +143,24 @@ pub const ErrorCtorDesc = struct {
     default_prefix: []const u8,
 };
 
+/// impl 方法描述（M5i）：`impl Trait<Type> { fun m(self, ..) {..} }` 编出的方法函数。
+/// OP_CALL_METHOD 据 receiver 的类型名 + 方法名查此表分派。type_name/method_name/trait_name 借用 AST。
+/// func_idx 指向 program.functions 中编译好的方法体（self 占 slot 0）。
+pub const ImplMethodDesc = struct {
+    type_name: []const u8,
+    method_name: []const u8,
+    trait_name: []const u8,
+    func_idx: u16,
+};
+
+/// trait 默认方法描述（M5i）：`trait T { fun m(self) {..默认..} }`，impl 未覆写时回退此体。
+/// trait_name/method_name 借用 AST；func_idx 指向编译好的默认方法体。
+pub const TraitDefaultDesc = struct {
+    trait_name: []const u8,
+    method_name: []const u8,
+    func_idx: u16,
+};
+
 /// 整个编译单元：一组顶层函数 + 入口索引（main）。
 /// OP_CALL <func_idx> 索引进 functions。Program 持有所有 Function 的所有权。
 pub const Program = struct {
@@ -163,6 +181,10 @@ pub const Program = struct {
     /// 全局初始化函数索引（M5g）：在 entry(main) 之前运行，求值顶层 val/var 的 RHS 写入 globals。
     /// null 表示无顶层 val/var（不需初始化）。
     globals_init: ?u16 = null,
+    /// impl 方法表（M5i）：OP_CALL_METHOD 据 receiver 类型名 + 方法名查此分派到用户 impl。
+    impl_methods: std.ArrayListUnmanaged(ImplMethodDesc) = .empty,
+    /// trait 默认方法表（M5i）：impl 未覆写时回退。
+    trait_defaults: std.ArrayListUnmanaged(TraitDefaultDesc) = .empty,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -182,6 +204,8 @@ pub const Program = struct {
         self.record_shapes.deinit(self.allocator);
         self.newtype_ctors.deinit(self.allocator);
         self.error_ctors.deinit(self.allocator);
+        self.impl_methods.deinit(self.allocator);
+        self.trait_defaults.deinit(self.allocator);
     }
 
     /// 追加一个函数，返回其索引。
@@ -228,5 +252,24 @@ pub const Program = struct {
         const idx = self.error_ctors.items.len;
         try self.error_ctors.append(self.allocator, .{ .type_name = type_name, .default_prefix = default_prefix });
         return @intCast(idx);
+    }
+
+    /// 登记一个 impl 方法（M5i）。type_name/method_name/trait_name 借用 AST。
+    pub fn addImplMethod(self: *Program, type_name: []const u8, method_name: []const u8, trait_name: []const u8, func_idx: u16) !void {
+        try self.impl_methods.append(self.allocator, .{
+            .type_name = type_name,
+            .method_name = method_name,
+            .trait_name = trait_name,
+            .func_idx = func_idx,
+        });
+    }
+
+    /// 登记一个 trait 默认方法（M5i）。trait_name/method_name 借用 AST。
+    pub fn addTraitDefault(self: *Program, trait_name: []const u8, method_name: []const u8, func_idx: u16) !void {
+        try self.trait_defaults.append(self.allocator, .{
+            .trait_name = trait_name,
+            .method_name = method_name,
+            .func_idx = func_idx,
+        });
     }
 };

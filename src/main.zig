@@ -461,7 +461,10 @@ fn vmEligible(module: ast.Module) bool {
             // 不依赖 trait 注册表）。无 impl 时 trait 默认方法不可达 → 安全 eligible。
             // 含 impl 的模块仍由 impl_decl 触发回退（下方 else）。
             .trait_decl => {},
-            // use/trait/impl/pack：VM 无对应运行时 → 回退。
+            // M5i：impl 块由 VM 编译为方法函数 + 注册进 program.impl_methods（OP_CALL_METHOD 分派）。
+            // 但跨文件 use（导入其它模块的 trait/impl，如 stdlib Compare）VM 无对应运行时 → 仍回退。
+            .impl_decl => {},
+            // use/pack：VM 无对应运行时 → 回退。
             else => return false,
         }
     }
