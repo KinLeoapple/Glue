@@ -29,6 +29,10 @@ pub const OpCode = enum(u8) {
     /// 并断开自引用循环：若闭包某 upvalue 正是该 slot 的 cell（递归局部函数捕获自身），
     /// 对该 cell 少持一份 ref（自引用变弱），避免 cell↔closure 循环泄漏（镜像 eval defineWeak）。
     op_set_local_letrec,
+    /// OP_SET_LOCAL_ASSIGN <u16 slot>（M5m）：assignment-to-local（非绑定）。与 op_set_local 区别：
+    /// slot/cell 持 Atomic<T> 时透明 atomic store（保持共享身份，写对捕获该原子的 spawn 可见）。
+    /// 绑定（val/var/match/temp）仍用 op_set_local 纯覆写——slot 复用残留 atomic 不可误 store-through。
+    op_set_local_assign,
 
     // —— 算术（pop 2，push 1）——
     op_add,

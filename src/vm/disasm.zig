@@ -76,7 +76,7 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             return offset + 9;
         },
         // u16 操作数
-        .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_make_error, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_global, .op_set_global, .op_get_local_raw, .op_get_upvalue_raw => {
+        .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_set_local_assign, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_make_error, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_global, .op_set_global, .op_get_local_raw, .op_get_upvalue_raw => {
             const arg = opcode.readU16(code, offset + 1);
             try print(buf, allocator, "{s} {d}\n", .{ op.name(), arg });
             return offset + 3;

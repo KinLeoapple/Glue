@@ -618,13 +618,39 @@ pub const VM = struct {
                     const v = self.pop();
                     const dst = frame.slot_base + slot;
                     const cur = self.stack.items[dst];
+                    // M5m：绑定语义（val/var/match/temp/循环变量）——总是纯覆写，建立**新**绑定。
+                    // 不写穿残留 cell：上一轮循环若有闭包捕获了该 slot，op_closure 已就地 box 成 cell
+                    // 并 retain（rc=2：slot+闭包）；此处 release slot 那一份（rc→1，逃逸闭包仍持旧值，
+                    // 语义冻结），新值落槽。下一轮捕获再 box 成**新** cell → 每轮闭包各捕获独立 cell，
+                    // 镜像 eval 每轮 fresh scope。早期写穿 cell.inner 致所有闭包共享一格（edge_closures
+                    // 循环捕获印 3,3,3 而非 1,2,3）。assignment 走 op_set_local_assign（保留写穿+atomic）。
+                    cur.releaseVM(self.allocator);
+                    self.stack.items[dst] = v;
+                },
+                // M5m：assignment-to-local（非绑定）。镜像 eval env.set：slot/cell 持 Atomic<T> 时
+                // 透明 atomic store（保持共享 atomic 身份，写对捕获该原子的 spawn 可见），不重写 inner。
+                // 与 op_set_local 的区别：op_set_local 用于绑定（val/var/match/temp，slot 复用须纯覆写，
+                // 否则栈复用残留的 atomic 会被误 store-through——见 edge_concurrency_race 的 $idx 槽复用崩溃）。
+                .op_set_local_assign => {
+                    const slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const v = self.pop();
+                    const dst = frame.slot_base + slot;
+                    const cur = self.stack.items[dst];
                     if (cur == .cell_val) {
-                        // 透明写 cell：mutation 对共享该 cell 的闭包可见。
-                        cur.cell_val.inner.releaseVM(self.allocator);
-                        cur.cell_val.inner = v;
+                        if (cur.cell_val.inner == .atomic_val) {
+                            cur.cell_val.inner.atomic_val.store(v);
+                            v.releaseVM(self.allocator); // 标量，no-op
+                        } else {
+                            cur.cell_val.inner.releaseVM(self.allocator);
+                            cur.cell_val.inner = v;
+                        }
+                    } else if (cur == .atomic_val) {
+                        cur.atomic_val.store(v);
+                        v.releaseVM(self.allocator); // 标量，no-op
                     } else {
-                        cur.releaseVM(self.allocator); // 释放旧值
-                        self.stack.items[dst] = v; // 所有权从栈转移到 slot
+                        cur.releaseVM(self.allocator);
+                        self.stack.items[dst] = v;
                     }
                 },
                 // M5c：letrec 自绑定。写闭包进 slot 的 cell.inner；若闭包捕获了该 cell（自引用），
@@ -677,8 +703,16 @@ pub const VM = struct {
                     frame.ip += 2;
                     const v = self.pop();
                     const cell = frame.upvalues[idx].cell_val;
-                    cell.inner.releaseVM(self.allocator);
-                    cell.inner = v;
+                    // M5m：cell 持 Atomic<T> → 透明 atomic store（保持共享 atomic 身份，写对父/兄弟
+                    // 协程可见），不重写 inner。镜像 eval env.set 的 atomic_val 分支（env.zig:231）。
+                    // 早期直接 inner=v 把共享 atomic 覆写成子线程本地标量 → 累加丢失（edge_concurrency/phase4）。
+                    if (cell.inner == .atomic_val) {
+                        cell.inner.atomic_val.store(v);
+                        v.releaseVM(self.allocator); // v 是标量（atomic 只存原始位），release 即 no-op
+                    } else {
+                        cell.inner.releaseVM(self.allocator);
+                        cell.inner = v;
+                    }
                 },
 
                 .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_bit_and, .op_bit_or, .op_bit_xor => {
