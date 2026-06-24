@@ -1150,11 +1150,10 @@ pub const VM = struct {
                     defer obj.releaseVM(self.allocator);
                     if (obj != .throw_val or obj.throw_val.* != .err) return self.fail(loc, "OP_GET_THROW_ERR on non-Error", error.TypeMismatch);
                     const e = obj.throw_val.err;
-                    try self.push(Value{ .error_val = .{
-                        .type_name = self.allocator.dupe(u8, e.type_name) catch return error.OutOfMemory,
-                        .message = self.allocator.dupe(u8, e.message) catch return error.OutOfMemory,
-                        .is_error_subtype = e.is_error_subtype,
-                    } });
+                    // 文档 §2.4: Error(msg) 模式解构时，msg 绑定为消息字符串
+                    // 而不是 ErrorValue 对象，这样 println(msg) 输出 "error" 而非 Error("error")
+                    const msg = self.allocator.dupe(u8, e.message) catch return error.OutOfMemory;
+                    try self.push(Value{ .string = msg });
                 },
                 // M3d：方法调用 —— 弹 argc 实参 + receiver，查内建方法表，压结果。
                 .op_call_method => {

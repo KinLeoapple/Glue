@@ -1861,15 +1861,30 @@ const FnCompiler = struct {
             },
             // M3c：throw e —— 重放所有活跃 defer + 求值 e（throw_val.err / error_val）+ OP_THROW。
             .throw_stmt => |t| {
-                try self.emitExpr(t.expr);
                 // 文档 §2.4.5: throw 只能抛出满足 Error trait 的值
-                // Error(msg) 是内建构造器，创建 throw_val.err
-                // 查找 Error 内建函数
-                if (self.module.lookupFn("Error")) |err_idx| {
-                    try self.chunk.writeOp(.op_call, t.location);
-                    try self.chunk.writeU16(err_idx);
-                    try self.chunk.writeByte(1); // argc = 1
+                // throw "error" 等价于 throw Error("error")
+                // Error 是 Native 内建，通过 emitCall 逻辑会发射 OP_CALL_NATIVE
+
+                // 检查表达式是否已经是 Error 调用
+                const needs_wrap = t.expr.* != .call or
+                    t.expr.call.callee.* != .identifier or
+                    !std.mem.eql(u8, t.expr.call.callee.identifier.name, "Error");
+
+                if (needs_wrap) {
+                    // 包装为 Error(expr)：先压 expr，再发 OP_CALL_NATIVE Error
+                    try self.emitExpr(t.expr);
+                    if (opcode.Native.fromName("Error")) |nat| {
+                        try self.chunk.writeOp(.op_call_native, t.location);
+                        try self.chunk.writeByte(@intFromEnum(nat));
+                        try self.chunk.writeByte(1); // argc = 1
+                    } else {
+                        return error.Unsupported;
+                    }
+                } else {
+                    // 已经是 Error(...) 调用，直接求值
+                    try self.emitExpr(t.expr);
                 }
+
                 try self.replayAllDefers(t.location);
                 try self.chunk.writeOp(.op_throw, t.location);
             },
