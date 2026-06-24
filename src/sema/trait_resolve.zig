@@ -703,9 +703,12 @@ pub fn checkTypeTraitImplementations(
             if (trait_info.method_schemes.get(mname)) |method_scheme| {
                 // 将方法注册到类型环境中
                 const method_key = std.fmt.allocPrint(inferencer.allocator, "{s}.{s}", .{ td.name, mname }) catch continue;
-                defer inferencer.allocator.free(method_key);
-
-                env.bindings.put(method_key, method_scheme) catch continue;
+                // 不要 defer free，因为 TypeEnv 会拥有这个键
+                // 使用 put 是安全的，因为 method_key 已经是新分配的
+                env.bindings.put(method_key, method_scheme) catch {
+                    inferencer.allocator.free(method_key);
+                    continue;
+                };
             }
         }
     }

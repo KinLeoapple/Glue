@@ -670,6 +670,13 @@ pub const TypeInferencer = struct {
                 self.allocator.free(entry.key_ptr.*);
                 self.allocator.free(entry.value_ptr.associated_type_names);
                 self.allocator.free(entry.value_ptr.method_names);
+                // 释放 method_schemes HashMap 中的键
+                var ms_iter = entry.value_ptr.method_schemes.iterator();
+                while (ms_iter.next()) |ms_entry| {
+                    self.allocator.free(ms_entry.key_ptr.*);
+                    self.allocator.free(ms_entry.value_ptr.quantified_vars);
+                }
+                entry.value_ptr.method_schemes.deinit();
             }
             self.trait_types.deinit();
         }
@@ -696,8 +703,21 @@ pub const TypeInferencer = struct {
             }
             self.registered_impls.deinit();
         }
-        self.fn_bounds.deinit();
-        self.predeclared_fns.deinit();
+        {
+            var iter = self.fn_bounds.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            self.fn_bounds.deinit();
+        }
+        {
+            var iter = self.predeclared_fns.keyIterator();
+            while (iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+            self.predeclared_fns.deinit();
+        }
         {
             var it = self.exported_schemes.keyIterator();
             while (it.next()) |k| self.allocator.free(k.*);
