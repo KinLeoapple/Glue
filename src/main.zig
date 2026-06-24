@@ -507,6 +507,13 @@ fn tryRunOnVM(
     defer mc.program.deinit();
 
     // M5j：收集 `use` 依赖模块的已解析 AST（递归传递依赖，定义先于使用），编进同一 Program。
+    // M5o：依赖收集前设置 current_source_dir（prepareModuleForVm 的 defer 已将其清空），使
+    // 目录模块的 pub pack 子模块（Store/Memory.glue）能按入口文件目录解析。
+    if (module.source_path) |sp| {
+        const sep_idx = std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep) orelse
+            std.mem.lastIndexOfScalar(u8, sp, '/');
+        if (sep_idx) |idx| ev.setSourceDirForVm(sp[0..idx]) catch {};
+    }
     var deps = std.ArrayList(ast.Module).empty;
     defer deps.deinit(allocator);
     var seen = std.StringHashMap(void).init(allocator);

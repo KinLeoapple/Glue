@@ -5683,7 +5683,39 @@ pub const Evaluator = struct {
             const dep_module = try self.parseDependencyModule(source, mod_name);
             // 先递归收集**依赖的依赖**（保证 Compare 在 List 之前进 out，符合定义先于使用）。
             try self.collectUseDependencies(dep_module, out, seen);
+            // M5o：目录模块（pack.glue）的 pub pack 子模块——加载 <dep>/<Sub>.glue，子模块**先于**父模块
+            // 进 out（父模块值构造时按名引用子模块值，须定义先于使用）。镜像 eval pack_decl 的子模块加载。
+            try self.collectPackSubmodules(dep_module, ud.module_path[0], out, seen);
             try out.append(self.allocator, dep_module);
+        }
+    }
+
+    /// M5o：为 VM 依赖收集设置源目录（prepareModuleForVm 的 defer 已清空 current_source_dir，
+    /// 而 collectUseDependencies 在其后调用，需重设，使目录模块子模块按入口文件目录解析）。
+    pub fn setSourceDirForVm(self: *Evaluator, dir: []const u8) !void {
+        if (self.current_source_dir) |d| self.allocator.free(d);
+        self.current_source_dir = try self.allocator.dupe(u8, dir);
+    }
+
+    /// M5o：收集一个目录模块的 pub pack 子模块依赖（VM 路径）。父模块名 parent_name 用于拼接子模块
+    /// 路径 <parent>/<Sub>.glue。每个子模块解析后递归收集其自身依赖+子模块，再 append（子模块先于父）。
+    fn collectPackSubmodules(self: *Evaluator, dep_module: ast.Module, parent_name: []const u8, out: *std.ArrayList(ast.Module), seen: *std.StringHashMap(void)) anyerror!void {
+        for (dep_module.declarations) |sub_decl| {
+            if (sub_decl != .pack_decl) continue;
+            const pd = sub_decl.pack_decl;
+            if (pd.visibility != .public) continue;
+            if (seen.contains(pd.name)) continue;
+            try seen.put(try self.allocator.dupe(u8, pd.name), {});
+            // 子模块路径 <parent>/<Sub>.glue（两段 module_path → resolver 拼成目录下文件）。
+            const sub_path = try self.allocator.alloc([]const u8, 2);
+            defer self.allocator.free(sub_path);
+            sub_path[0] = parent_name;
+            sub_path[1] = pd.name;
+            const sub_source = try self.loadDependencySource(sub_path);
+            const sub_module = try self.parseDependencyModule(sub_source, pd.name);
+            try self.collectUseDependencies(sub_module, out, seen);
+            try self.collectPackSubmodules(sub_module, pd.name, out, seen);
+            try out.append(self.allocator, sub_module);
         }
     }
 

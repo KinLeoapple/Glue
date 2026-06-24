@@ -100,6 +100,11 @@ pub const ModuleCompiler = struct {
     /// 零参 trait/impl 方法表（M5k）：`zero()` 无 receiver 无法按类型分派，按名字直接解析到 impl 函数
     /// （name → func_idx，首个 impl 生效）。供 emitCall 的 argc==0 裸名调用。
     nullary_methods: std.ArrayListUnmanaged(struct { name: []const u8, func_idx: u16 }) = .empty,
+    /// 模块值表（M5o，文档 §4.6.2）：需构建为运行时模块值（trait_value vtable）的依赖模块。
+    /// 仅目录模块（有 pub pack）及其 pub pack 子模块——扁平 stdlib（List/Compare 等）不入，避免与
+    /// 类型名抢全局。module_decls 借 deps AST（构造 init 时遍历其 pub fun/pub pack）。global_idx 是
+    /// 该模块值在 globals 数组的槽位。
+    module_values: std.ArrayListUnmanaged(struct { name: []const u8, global_idx: u16, decls: []const ast.Decl }) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
         return .{ .program = Program.init(allocator), .allocator = allocator };
@@ -113,6 +118,7 @@ pub const ModuleCompiler = struct {
         self.global_table.deinit(self.allocator);
         self.method_names.deinit(self.allocator);
         self.nullary_methods.deinit(self.allocator);
+        self.module_values.deinit(self.allocator);
         // program 所有权移交调用方；此处不 deinit。
     }
 
@@ -189,6 +195,9 @@ pub const ModuleCompiler = struct {
         // 第一遍：登记所有模块（依赖在前）的顶层函数/构造器/方法名/全局。
         for (deps) |*dep| try self.registerDecls(dep);
         try self.registerDecls(module);
+        // M5o：登记模块值全局（文档 §4.6.2）——目录模块（有 pub pack）及其 pub pack 子模块需构建为
+        // 运行时模块值（trait_value vtable）。在 global_count 定稿前登记，使模块名标识符解析到全局。
+        try self.registerModuleValues(deps);
         self.program.global_count = @intCast(self.global_table.items.len);
         // 第二遍：编译所有模块的函数体 + impl/trait 方法。
         for (deps) |*dep| try self.compileBodies(dep);
@@ -197,10 +206,61 @@ pub const ModuleCompiler = struct {
         //（文档 §2.7.2），VM 扁平表只取首个 → 语义不符。整体回退树遍历器，避免静默错误输出。
         try self.checkNoConflictingImpls();
         // M5g：仅入口模块的顶层 val/var 进全局初始化（依赖 stdlib 无顶层 val/var）。
-        if (self.global_table.items.len > 0) {
+        // M5o：模块值构造也在全局初始化函数里（在 main 前运行）。
+        if (self.global_table.items.len > 0 or self.module_values.items.len > 0) {
             try self.compileGlobalsInit(module);
         }
         if (self.lookupFn("main")) |m| self.program.entry = m;
+    }
+
+    /// M5o：登记需构建模块值的依赖模块（文档 §4.6.2）。判定：模块自身有 pub pack（目录模块如 Store）
+    /// 或被某模块 pub pack 指名（子模块如 Memory）。为每个分配 globals 槽，子模块**先于**父模块登记
+    /// （槽位更低 → 父模块值构造时可 OP_GET_GLOBAL 引用已建好的子模块值）。扁平 stdlib 不入此表。
+    fn registerModuleValues(self: *ModuleCompiler, deps: []const ast.Module) CompileError!void {
+        // 收集所有 pub pack 子模块名（被指名者需模块值）。
+        var pack_targets = std.ArrayListUnmanaged([]const u8).empty;
+        defer pack_targets.deinit(self.allocator);
+        for (deps) |dep| {
+            for (dep.declarations) |d| {
+                if (d == .pack_decl and d.pack_decl.visibility == .public)
+                    try pack_targets.append(self.allocator, d.pack_decl.name);
+            }
+        }
+        // 子模块（pack 目标）先登记，父模块（含 pub pack）后登记 —— 保证子模块全局槽位在前。
+        for (deps) |dep| {
+            if (self.isPackTarget(pack_targets.items, dep.name) and !self.hasModuleValue(dep.name))
+                try self.addModuleValue(dep);
+        }
+        for (deps) |dep| {
+            if (self.declaresPubPack(dep) and !self.hasModuleValue(dep.name))
+                try self.addModuleValue(dep);
+        }
+    }
+
+    fn isPackTarget(self: *ModuleCompiler, targets: []const []const u8, name: []const u8) bool {
+        _ = self;
+        for (targets) |t| if (std.mem.eql(u8, t, name)) return true;
+        return false;
+    }
+
+    fn declaresPubPack(self: *ModuleCompiler, dep: ast.Module) bool {
+        _ = self;
+        for (dep.declarations) |d|
+            if (d == .pack_decl and d.pack_decl.visibility == .public) return true;
+        return false;
+    }
+
+    fn hasModuleValue(self: *ModuleCompiler, name: []const u8) bool {
+        for (self.module_values.items) |mv| if (std.mem.eql(u8, mv.name, name)) return true;
+        return false;
+    }
+
+    fn addModuleValue(self: *ModuleCompiler, dep: ast.Module) CompileError!void {
+        const idx: u16 = @intCast(self.global_table.items.len);
+        // 模块名绑定为不可变全局（限定访问 Module.member 入口）。同名已存在则不重复（首个生效）。
+        if (self.lookupGlobal(dep.name) != null) return;
+        try self.global_table.append(self.allocator, .{ .name = dep.name, .idx = idx, .is_mutable = false });
+        try self.module_values.append(self.allocator, .{ .name = dep.name, .global_idx = idx, .decls = dep.declarations });
     }
 
     /// M5k：若任意 (type_name, method_name) 对出现多次（同类型同方法多 impl），说明依赖 trait 组合/
@@ -439,6 +499,11 @@ pub const ModuleCompiler = struct {
     fn compileGlobalsInit(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
         var fc = FnCompiler.init(self.allocator, self);
         defer fc.deinit();
+        // M5o：先构建模块值（文档 §4.6.2）——按登记顺序（子模块先于父模块），每个建 trait_value
+        // vtable 写入其全局槽。父模块值的 pub pack 成员 OP_GET_GLOBAL 引用已建好的子模块值。
+        for (self.module_values.items) |mv| {
+            try self.emitModuleValue(&fc, mv.decls, mv.global_idx);
+        }
         for (module.declarations) |decl| {
             if (decl != .expr_decl) continue;
             const ed = decl.expr_decl;
@@ -465,6 +530,43 @@ pub const ModuleCompiler = struct {
         };
         fc.chunk = Chunk.init(self.allocator);
         self.program.globals_init = try self.program.addFunction(f);
+    }
+
+    /// M5o：发射一个模块值构造（文档 §4.6.2）。pub fun → [name 常量, OP_CLOSURE func_idx]（零捕获
+    /// 顶层函数）；pub pack → [name 常量, OP_GET_GLOBAL 子模块值槽]。末尾 OP_MAKE_TRAIT <count> 建
+    /// vtable，OP_SET_GLOBAL 写入模块全局槽。镜像 eval buildAndBindModuleValue。
+    fn emitModuleValue(self: *ModuleCompiler, fc: *FnCompiler, decls: []const ast.Decl, global_idx: u16) CompileError!void {
+        const loc = ast.SourceLocation{ .line = 0, .column = 0 };
+        var count: u16 = 0;
+        for (decls) |d| {
+            switch (d) {
+                .fun_decl => |f| {
+                    if (f.visibility != .public) continue;
+                    const fn_idx = self.lookupFn(f.name) orelse continue;
+                    const name_v = Value{ .string = try self.allocator.dupe(u8, f.name) };
+                    try fc.emitConst(try fc.chunk.addConstant(name_v), loc);
+                    try fc.chunk.writeOp(.op_closure, loc);
+                    try fc.chunk.writeU16(fn_idx);
+                    try fc.chunk.writeByte(0); // 零捕获（顶层函数）
+                    count += 1;
+                },
+                .pack_decl => |pd| {
+                    if (pd.visibility != .public) continue;
+                    const sub = self.lookupGlobal(pd.name) orelse continue; // 子模块值全局（已登记）
+                    const name_v = Value{ .string = try self.allocator.dupe(u8, pd.name) };
+                    try fc.emitConst(try fc.chunk.addConstant(name_v), loc);
+                    try fc.chunk.writeOp(.op_get_global, loc);
+                    try fc.chunk.writeU16(sub.idx);
+                    count += 1;
+                },
+                else => {},
+            }
+        }
+        if (count > 255) return error.Unsupported;
+        try fc.chunk.writeOp(.op_make_trait, loc);
+        try fc.chunk.writeByte(@intCast(count));
+        try fc.chunk.writeOp(.op_set_global, loc);
+        try fc.chunk.writeU16(global_idx);
     }
 
     fn compileFunction(self: *ModuleCompiler, fd: @TypeOf(@as(ast.Decl, undefined).fun_decl)) CompileError!void {
@@ -2161,7 +2263,49 @@ fn compileAndCallWithDep(allocator: std.mem.Allocator, dep_source: []const u8, e
     return result.integer.value;
 }
 
-/// M5e：编译并执行 entry，返回原始 Value（调用方负责 releaseVM）。供检查 throw_val/string 等
+/// M5o：编译入口 + 父依赖模块 + 其 pub pack 子模块（均显式传入，模拟 collectUseDependencies
+/// 加载目录模块 + 子模块的结果，子模块先于父）。跑 entry_name 返回整数。供模块值测试。
+fn compileAndCallWithPackDep(
+    allocator: std.mem.Allocator,
+    parent_name: []const u8,
+    parent_source: []const u8,
+    sub_name: []const u8,
+    sub_source: []const u8,
+    entry_source: []const u8,
+    entry_name: []const u8,
+) !u128 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var slex = lexer.Lexer.init(aa, sub_source);
+    var sp = parser.Parser.init(aa, try slex.tokenize());
+    const sub_module = try sp.parseModule(sub_name);
+
+    var plex = lexer.Lexer.init(aa, parent_source);
+    var pp = parser.Parser.init(aa, try plex.tokenize());
+    const parent_module = try pp.parseModule(parent_name);
+
+    var elex = lexer.Lexer.init(aa, entry_source);
+    var ep = parser.Parser.init(aa, try elex.tokenize());
+    var entry_module = try ep.parseModule("test");
+
+    var mc = ModuleCompiler.init(allocator);
+    defer mc.deinit();
+    defer mc.program.deinit();
+    // 子模块先于父（collectUseDependencies 的顺序：子模块值定义先于父引用）。
+    try mc.compileModuleWithDeps(&entry_module, &.{ sub_module, parent_module });
+
+    const idx = mc.lookupFn(entry_name) orelse return error.MissingFunction;
+    var vm = vm_mod.VM.init(allocator);
+    defer vm.deinit();
+    const result = try vm.call(&mc.program, idx, &.{});
+    defer result.releaseVM(allocator);
+    if (result == .boolean) return if (result.boolean) 1 else 0;
+    return result.integer.value;
+}
+
+
 /// 非整数结果的测试。arena 在返回前 deinit，故结果不可借用 AST 字节（error_newtype 走 dupe 安全）。
 fn compileAndValue(allocator: std.mem.Allocator, program_out: *Program, source: []const u8, entry_name: []const u8) !Value {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -4444,4 +4588,56 @@ test "M5n composed trait delegate dispatches to named parent impl" {
         \\fun run(): i64 { Lt.to_string() }
     ;
     try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
+}
+
+test "M5o module-value: qualified access Store.Memory dispatches to submodule vtable" {
+    const allocator = std.testing.allocator;
+    // 目录模块 Store（pub pack Memory）+ 子模块 Memory（pub fun get 返回 42）。
+    // 入口：Store.Memory.get() → 限定访问子模块值 + 方法调用 → 42。
+    const memory_src =
+        \\pub fun get(): i64 { 42i64 }
+    ;
+    const store_src =
+        \\pub pack Memory
+    ;
+    const entry_src =
+        \\use Store
+        \\fun run(): i64 { Store.Memory.get() }
+    ;
+    try std.testing.expectEqual(@as(u128, 42), try compileAndCallWithPackDep(
+        allocator,
+        "Store",
+        store_src,
+        "Memory",
+        memory_src,
+        entry_src,
+        "run",
+    ));
+}
+
+test "M5o module-value: pass module-value as trait param (structural match)" {
+    const allocator = std.testing.allocator;
+    // Memory 有 pub fun put（零参，返回 99），Store 含 pub pack Memory。入口定义 trait KVStore { fun put() }，
+    // 调 run(Store.Memory)，run 内 s.put() → 委托到 Memory.put 返回 99。结构化匹配模块值（§4.6.2）。
+    const memory_src =
+        \\pub fun put(): i64 { 99i64 }
+    ;
+    const store_src =
+        \\pub pack Memory
+    ;
+    const entry_src =
+        \\use Store
+        \\trait KVStore { fun put(): i64 }
+        \\fun run(s: KVStore): i64 { s.put() }
+        \\fun main(): i64 { run(Store.Memory) }
+    ;
+    try std.testing.expectEqual(@as(u128, 99), try compileAndCallWithPackDep(
+        allocator,
+        "Store",
+        store_src,
+        "Memory",
+        memory_src,
+        entry_src,
+        "main",
+    ));
 }

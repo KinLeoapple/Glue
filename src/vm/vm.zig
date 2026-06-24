@@ -1667,6 +1667,15 @@ pub const VM = struct {
                 }
                 return self.fail(loc, "no such field on record", error.TypeMismatch);
             },
+            // M5o：模块值（trait_value）字段访问 —— Store.Memory（子模块）/ Module.member。
+            // vtable 查 field → retainOwned 压栈。镜像 eval accessField trait_value 分支（§4.6.2）。
+            .trait_value => |tv| {
+                if (tv.methods.get(field)) |v| {
+                    try self.push(try self.retainOwned(v));
+                    return;
+                }
+                return self.fail(loc, "no such member on module value", error.TypeMismatch);
+            },
             // M3c：error_val.message / .type_name（match Error(e) 绑定后访问）。
             .error_val => |e| {
                 if (std.mem.eql(u8, field, "message")) {
