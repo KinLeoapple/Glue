@@ -337,13 +337,8 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
 
     const outcome = executeSource(arena_alloc, &ev, io, source, entry_path);
 
-    // ran_main：VM 已执行 main，无需 invokeMain。needs_main：树遍历器跑入口。failed：直接失败。
-    var run_failed = outcome == .failed;
-    if (outcome == .needs_main) {
-        run_failed = invokeMain(&ev, io, entry_path, false);
-    }
-
-    if (run_failed) {
+    // VM 已执行 main 或失败
+    if (outcome == .failed) {
         ev.deinit();
         arena.deinit();
         pool.deinit();
@@ -365,10 +360,7 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
         ev.global_env.value_allocator = ev.value_allocator;
         ev.use_lexical_addressing = true; // 任务#2:开启(debug 路径同样)
         defer ev.deinit();
-        const outcome = executeSource(dbg_alloc, &ev, io, source, entry_path);
-        if (outcome == .needs_main) {
-            _ = invokeMain(&ev, io, entry_path, true);
-        }
+        _ = executeSource(dbg_alloc, &ev, io, source, entry_path);
     }
     const leaked = dbg.deinit();
     if (leaked == .leak) {
@@ -376,39 +368,6 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
     } else {
         printErr(io, "[GLUE_GPA] clean (no leak / no double-free)\n", .{});
     }
-}
-
-/// 调用 main 入口，统一错误诊断。返回 true 表示运行失败。
-/// trace=true 时（debug 模式）panic 额外打印位置链。
-fn invokeMain(ev: *eval.Evaluator, io: std.Io, entry_path: []const u8, trace: bool) bool {
-    _ = ev.callMain() catch |err| switch (err) {
-        error.MissingMain => {
-            printErr(io, "{s}: error: undefined entry point (no 'fun main')\n", .{entry_path});
-            return true;
-        },
-        error.GluePanic => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            const msg = ev.panic_message orelse "unknown error";
-            printRuntimeDiag(&stderr_writer.interface, entry_path, ev.panic_location, "runtime panic", msg);
-            if (trace) {
-                if (ev.panic_location) |l| {
-                    stderr_writer.interface.print("  at {s}:{d}:{d}\n", .{ entry_path, l.line, l.column }) catch {};
-                }
-            }
-            stderr_writer.flush() catch {};
-            ev.panic_message = null;
-            return true;
-        },
-        else => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            printRuntimeDiag(&stderr_writer.interface, entry_path, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
-            stderr_writer.flush() catch {};
-            return true;
-        },
-    };
-    return false;
 }
 
 // ============================================================
@@ -513,11 +472,10 @@ fn tryRunOnVM(
     return .ran_main;
 }
 
-/// executeSource 的三态结果（M5）.
-/// - failed：出错（已报告），调用方以非零码退出，不再 callMain。
-/// - needs_main：模块声明已求值（树遍历器），调用方需 invokeMain 跑入口。
-/// - ran_main：VM 已整体编译并执行 main，调用方跳过 invokeMain。
-const ExecOutcome = enum { failed, needs_main, ran_main };
+/// executeSource 的结果。
+/// - failed：出错（已报告），调用方以非零码退出。
+/// - ran_main：VM 已编译并执行 main。
+const ExecOutcome = enum { failed, ran_main };
 
 fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, source: []const u8, filename: []const u8) ExecOutcome {
     // 词法分析
@@ -533,78 +491,19 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
     };
     defer allocator.free(tokens);
 
-    // 语法分析 — 尝试解析为模块（顶层声明）
+    // 语法分析 — 只支持模块（顶层声明）
     var p = parser.Parser.init(allocator, tokens);
     defer p.deinit();
 
     const module = p.parseModule(filename) catch {
-        // 模块解析失败，保存错误信息
-        const module_errors = allocator.dupe(parser.ParseError, p.errors.items) catch {
-            // 内存不足，直接报告表达式解析错误
-            p.errors.clearRetainingCapacity();
-            p.current = 0;
-            const expr_fallback = p.parseExpr() catch {
-                var err_buf: [4096]u8 = undefined;
-                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                for (p.errors.items) |e| {
-                    stderr_writer.interface.print("{s}:{d}:{d}: parse error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
-                }
-                stderr_writer.flush() catch {};
-                return .failed;
-            };
-            _ = expr_fallback;
-            return .failed;
-        };
-        defer allocator.free(module_errors);
-
-        // 尝试解析为表达式
-        p.errors.clearRetainingCapacity();
-        p.current = 0;
-
-        const expr = p.parseExpr() catch {
-            // 表达式解析也失败，报告所有模块解析错误
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            const errors_to_report = if (module_errors.len > 0) module_errors else p.errors.items;
-            for (errors_to_report) |e| {
-                stderr_writer.interface.print("{s}:{d}:{d}: parse error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
-            }
-            stderr_writer.flush() catch {};
-            return .failed;
-        };
-
-        // 求值表达式
-        const result = ev.evalExpr(expr, &ev.global_env) catch |err| switch (err) {
-            error.GluePanic => {
-                var err_buf: [4096]u8 = undefined;
-                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                const msg = ev.panic_message orelse "unknown panic";
-                printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "panic", msg);
-                stderr_writer.flush() catch {};
-                ev.panic_message = null;
-                return .failed;
-            },
-            else => {
-                var err_buf: [4096]u8 = undefined;
-                var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-                printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
-                stderr_writer.flush() catch {};
-                return .failed;
-            },
-        };
-
-        // 打印结果
-        if (result != .unit) {
-            var buf = std.ArrayList(u8).empty;
-            defer buf.deinit(allocator);
-            result.format(&buf, allocator, false) catch return .failed;
-            buf.append(allocator, '\n') catch {};
-            var out_buf: [4096]u8 = undefined;
-            var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
-            stdout_writer.interface.print("{s}", .{buf.items}) catch {};
-            stdout_writer.flush() catch {};
+        // 模块解析失败，报告错误
+        var err_buf: [4096]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+        for (p.errors.items) |e| {
+            stderr_writer.interface.print("{s}:{d}:{d}: parse error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
         }
-        return .needs_main;
+        stderr_writer.flush() catch {};
+        return .failed;
     };
 
     // 求值模块
