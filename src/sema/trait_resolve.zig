@@ -248,7 +248,7 @@ pub fn inferMethodCall(
     mc: @TypeOf(@as(ast.Expr, undefined).method_call),
     env: *TypeEnv,
 ) SemaError!*Type {
-    const obj_ty = inferencer.inferExpr(mc.object, env) catch return inferencer.freshTypeVar() catch unreachable;
+    const obj_ty = inferencer.inferExpr(mc.object, env, null) catch return inferencer.freshTypeVar() catch unreachable;
     // 文档 §2.3.5：使用可空值前必须消除空值可能性。对 nullable 接收者直接调方法非法——
     // 必须先用 ?.（安全调用）、!（非空断言）或 if x != null narrowing 消除 null。
     // narrowing 后绑定已收窄为非 null（applyNarrowing），故此处只拦真正的 nullable。
@@ -294,7 +294,7 @@ pub fn inferSafeMethodCall(
     smc: @TypeOf(@as(ast.Expr, undefined).safe_method_call),
     env: *TypeEnv,
 ) SemaError!*Type {
-    const obj_ty = inferencer.inferExpr(smc.object, env) catch return inferencer.freshTypeVar() catch unreachable;
+    const obj_ty = inferencer.inferExpr(smc.object, env, null) catch return inferencer.freshTypeVar() catch unreachable;
     // Try to find the method in registered traits (similar to method_call)
     var trait_iter = inferencer.trait_types.iterator();
     while (trait_iter.next()) |entry| {

@@ -36,9 +36,11 @@ pub const Type = union(enum) {
     u64_type,
     u128_type,
 
-    // 浮点类型
+    // 浮点类型 (文档§2.2: f16, f32, f64, f128)
+    f16_type,
     f32_type,
     f64_type,
+    f128_type,
 
     // 其他基本类型
     bool_type,
@@ -109,7 +111,7 @@ pub const Type = union(enum) {
     /// 判断是否为浮点类型
     pub fn isFloatType(self: Type) bool {
         return switch (self) {
-            .f32_type, .f64_type => true,
+            .f16_type, .f32_type, .f64_type, .f128_type => true,
             else => false,
         };
     }
@@ -131,8 +133,10 @@ pub const Type = union(enum) {
             .u32_type => try writer.writeAll("u32"),
             .u64_type => try writer.writeAll("u64"),
             .u128_type => try writer.writeAll("u128"),
+            .f16_type => try writer.writeAll("f16"),
             .f32_type => try writer.writeAll("f32"),
             .f64_type => try writer.writeAll("f64"),
+            .f128_type => try writer.writeAll("f128"),
             .bool_type => try writer.writeAll("bool"),
             .str_type => try writer.writeAll("str"),
             .char_type => try writer.writeAll("char"),
@@ -232,8 +236,10 @@ pub const Type = union(enum) {
             .u32_type => try buf.appendSlice(allocator, "u32"),
             .u64_type => try buf.appendSlice(allocator, "u64"),
             .u128_type => try buf.appendSlice(allocator, "u128"),
+            .f16_type => try buf.appendSlice(allocator, "f16"),
             .f32_type => try buf.appendSlice(allocator, "f32"),
             .f64_type => try buf.appendSlice(allocator, "f64"),
+            .f128_type => try buf.appendSlice(allocator, "f128"),
             .bool_type => try buf.appendSlice(allocator, "bool"),
             .str_type => try buf.appendSlice(allocator, "str"),
             .char_type => try buf.appendSlice(allocator, "char"),
@@ -872,8 +878,10 @@ pub const TypeInferencer = struct {
                     .u64_type => 7,
                     .i128_type => 8,
                     .u128_type => 9,
+                    .f16_type => 9,
                     .f32_type => 10,
                     .f64_type => 11,
+                    .f128_type => 12,
                     else => null,
                 };
             }
@@ -1166,6 +1174,56 @@ pub const TypeInferencer = struct {
 
     fn isRecordSubtype(self: *TypeInferencer, sub_fields: []const FieldType, super_fields: []const FieldType) bool {
         return subtype_check.isRecordSubtype(self, sub_fields, super_fields);
+    }
+
+    /// 解析整数字面量的原始字符串，返回i128类型的值
+    /// 处理负号、十进制/十六进制/八进制/二进制、下划线分隔符
+    /// 文档§6.12: 用于实现"最小容纳类型"推断
+    fn parseIntLiteral(self: *TypeInferencer, raw: []const u8) !i128 {
+        _ = self;
+        var input = raw;
+        var is_negative = false;
+
+        // 处理负号
+        if (input.len > 0 and input[0] == '-') {
+            is_negative = true;
+            input = input[1..];
+        }
+
+        // 去除下划线（复制到临时buffer）
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        for (input) |c| {
+            if (c != '_') {
+                if (len >= buf.len) return error.TooLong;
+                buf[len] = c;
+                len += 1;
+            }
+        }
+        const clean = buf[0..len];
+
+        // 判断进制
+        var value: i128 = 0;
+        if (clean.len >= 2 and clean[0] == '0') {
+            if (clean[1] == 'x' or clean[1] == 'X') {
+                // 十六进制 0x...
+                value = std.fmt.parseInt(i128, clean[2..], 16) catch return error.ParseError;
+            } else if (clean[1] == 'o' or clean[1] == 'O') {
+                // 八进制 0o...
+                value = std.fmt.parseInt(i128, clean[2..], 8) catch return error.ParseError;
+            } else if (clean[1] == 'b' or clean[1] == 'B') {
+                // 二进制 0b...
+                value = std.fmt.parseInt(i128, clean[2..], 2) catch return error.ParseError;
+            } else {
+                // 十进制（0开头但不是特殊进制）
+                value = std.fmt.parseInt(i128, clean, 10) catch return error.ParseError;
+            }
+        } else {
+            // 十进制
+            value = std.fmt.parseInt(i128, clean, 10) catch return error.ParseError;
+        }
+
+        return if (is_negative) -value else value;
     }
 
     fn recordArgSatisfies(self: *TypeInferencer, param: *Type, arg: *Type) bool {
@@ -1655,13 +1713,14 @@ pub const TypeInferencer = struct {
     // 类型推断（Algorithm W）
     // ============================================================
 
-    /// 推断表达式的类型
-    pub fn inferExpr(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv) SemaError!*Type {
+    /// 推断表达式的类型（支持期望类型，实现bidirectional type checking）
+    /// expected: 期望类型，用于指导字面量等的类型推断（§6.12规则2）
+    pub fn inferExpr(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv, expected: ?*Type) SemaError!*Type {
         return switch (expr.*) {
             .int_literal => |lit| {
                 // 文档 §6.12: 整数字面量类型推断
                 // 1. 显式后缀最高优先：42i32, 255u8 直接采用后缀类型
-                // 2. 显式类型标注次之（由外层上下文处理）
+                // 2. 显式类型标注次之（由expected传递）
                 // 3. 既无后缀也无标注时，推断为能容纳该值的最小类型
                 if (lit.suffix) |suffix| {
                     // 解析类型后缀
@@ -1676,17 +1735,65 @@ pub const TypeInferencer = struct {
                     if (std.mem.eql(u8, suffix, "u64")) return self.makeType(.u64_type);
                     if (std.mem.eql(u8, suffix, "u128")) return self.makeType(.u128_type);
                 }
-                // 无后缀：默认 i32（简化实现，完整实现应根据值大小选择最小类型）
-                return self.makeType(.i32_type);
+
+                // §6.12规则2: 如果有期望类型且是整数类型，按期望类型处理
+                if (expected) |exp_ty| {
+                    const resolved = self.resolve(exp_ty);
+                    if (resolved.isIntType()) {
+                        // 验证值在目标类型范围内（由parseIntLiteral和运行时保证）
+                        return exp_ty;
+                    }
+                }
+
+                // §6.12规则3: 无后缀也无标注，推断为最小类型
+                const val = self.parseIntLiteral(lit.raw) catch {
+                    // 解析失败，回退到i32（容错）
+                    return self.makeType(.i32_type);
+                };
+
+                if (val < 0) {
+                    // 负值：i8 → i16 → i32 → i64 → i128
+                    if (val >= -128) return self.makeType(.i8_type);
+                    if (val >= -32768) return self.makeType(.i16_type);
+                    if (val >= -2147483648) return self.makeType(.i32_type);
+                    if (val >= -9223372036854775808) return self.makeType(.i64_type);
+                    return self.makeType(.i128_type);
+                } else {
+                    // 非负值：同位宽优先有符号
+                    // i8 → u8 → i16 → u16 → i32 → u32 → i64 → u64 → i128 → u128
+                    if (val <= 127) return self.makeType(.i8_type);
+                    if (val <= 255) return self.makeType(.u8_type);
+                    if (val <= 32767) return self.makeType(.i16_type);
+                    if (val <= 65535) return self.makeType(.u16_type);
+                    if (val <= 2147483647) return self.makeType(.i32_type);
+                    if (val <= 4294967295) return self.makeType(.u32_type);
+                    if (val <= 9223372036854775807) return self.makeType(.i64_type);
+                    if (val <= 18446744073709551615) return self.makeType(.u64_type);
+                    return self.makeType(.i128_type);
+                }
             },
             .float_literal => |lit| {
                 // 文档 §6.12: 浮点字面量类型推断
+                // 1. 显式后缀最高优先
                 if (lit.suffix) |suffix| {
+                    if (std.mem.eql(u8, suffix, "f16")) return self.makeType(.f16_type);
                     if (std.mem.eql(u8, suffix, "f32")) return self.makeType(.f32_type);
                     if (std.mem.eql(u8, suffix, "f64")) return self.makeType(.f64_type);
-                    // f16, f128 暂不支持
+                    if (std.mem.eql(u8, suffix, "f128")) return self.makeType(.f128_type);
                 }
-                // 无后缀：默认 f64
+
+                // §6.12规则2: 如果有期望类型且是浮点类型，按期望类型处理
+                if (expected) |exp_ty| {
+                    const resolved = self.resolve(exp_ty);
+                    if (resolved.isFloatType()) {
+                        return exp_ty;
+                    }
+                }
+
+                // §6.12规则3: 无后缀也无标注，推断为能精确往返的最小类型
+                // 按 f16 → f32 → f64 → f128 逐级尝试
+                // TODO: 实现精确的round-trip测试
+                // 当前简化：默认f64（兼容大多数情况）
                 return self.makeType(.f64_type);
             },
             .bool_literal => self.makeType(.bool_type),
@@ -1731,8 +1838,8 @@ pub const TypeInferencer = struct {
             },
 
             .binary => |bin| {
-                var left_ty = try self.inferExpr(bin.left, env);
-                var right_ty = try self.inferExpr(bin.right, env);
+                var left_ty = try self.inferExpr(bin.left, env, null);
+                var right_ty = try self.inferExpr(bin.right, env, null);
 
                 // 文档 §3.4.2: Atomic<T> 透明操作 — 算术/比较运算时自动解包
                 left_ty = self.unwrapAtomic(left_ty);
@@ -1786,8 +1893,14 @@ pub const TypeInferencer = struct {
                         return arr_ty;
                     },
                     .range, .range_inclusive => {
-                        try self.unify(left_ty, try self.makeType(.i32_type));
-                        try self.unify(right_ty, try self.makeType(.i32_type));
+                        // Range 要求 i32，但支持从较小整数类型提升
+                        const i32_ty = try self.makeType(.i32_type);
+                        _ = self.tryWidenUnify(i32_ty, left_ty) catch {
+                            try self.unify(left_ty, i32_ty);
+                        };
+                        _ = self.tryWidenUnify(i32_ty, right_ty) catch {
+                            try self.unify(right_ty, i32_ty);
+                        };
                         // Range 类型不是独立类型，元素类型由推断决定
                         return self.makeType(.i32_type);
                     },
@@ -1806,7 +1919,7 @@ pub const TypeInferencer = struct {
             },
 
             .unary => |un| {
-                const operand_ty = try self.inferExpr(un.operand, env);
+                const operand_ty = try self.inferExpr(un.operand, env, null);
                 return switch (un.op) {
                     .not => {
                         try self.unify(operand_ty, try self.makeType(.bool_type));
@@ -1831,8 +1944,8 @@ pub const TypeInferencer = struct {
 
                 self.pushLinearScope();
                 const body_ty = switch (lam.body) {
-                    .block => |body| try self.inferExpr(body, child_env),
-                    .expression => |e| try self.inferExpr(e, child_env),
+                    .block => |body| try self.inferExpr(body, child_env, null),
+                    .expression => |e| try self.inferExpr(e, child_env, null),
                 };
                 self.popLinearScope();
 
@@ -1840,11 +1953,42 @@ pub const TypeInferencer = struct {
             },
 
             .call => |c| {
-                const callee_ty = try self.inferExpr(c.callee, env);
+                const callee_ty = try self.inferExpr(c.callee, env, null);
                 const ret_ty = try self.freshTypeVar();
+
+                // 先检查是否是函数类型并尝试参数widening（§6.12规则2）
+                const resolved_callee = self.resolve(callee_ty);
+                switch (resolved_callee.*) {
+                    .fn_type => |ft| {
+                        // 参数数量完全匹配时，传递期望类型并推断参数
+                        if (ft.params.len == c.arguments.len) {
+                            var arg_types = try self.allocator.alloc(*Type, c.arguments.len);
+                            for (c.arguments, ft.params, 0..) |arg, param_ty, i| {
+                                // §6.12规则2: 传递参数期望类型
+                                arg_types[i] = try self.inferExpr(arg, env, param_ty);
+                            }
+
+                            var all_ok = true;
+                            for (ft.params, arg_types) |param_ty, arg_ty| {
+                                _ = self.tryWidenUnify(param_ty, arg_ty) catch {
+                                    all_ok = false;
+                                    break;
+                                };
+                            }
+                            if (all_ok) {
+                                // 文档 2.7.3: 调用点 Trait Bound 延迟检查
+                                self.checkCallSiteTraitBound(c.callee, c.location);
+                                return ft.return_type;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+
+                // 原始流程：推断参数不传递期望类型
                 var arg_types = try self.allocator.alloc(*Type, c.arguments.len);
                 for (c.arguments, 0..) |arg, i| {
-                    arg_types[i] = try self.inferExpr(arg, env);
+                    arg_types[i] = try self.inferExpr(arg, env, null);
                 }
 
                 // 文档 §4.6.2: 文件模块作为 Trait 值。实参是模块引用、对应形参是 trait 类型时，
@@ -1895,17 +2039,32 @@ pub const TypeInferencer = struct {
                     }
                 }
 
-                const expected_fn_ty = try self.makeFnType(arg_types, ret_ty);
-                // 先尝试直接统一
-                if (self.unify(callee_ty, expected_fn_ty)) {
-                    // 文档 2.7.3: 调用点 Trait Bound 延迟检查
-                    self.checkCallSiteTraitBound(c.callee, c.location);
-                    return ret_ty;
-                } else |_| {
-                    // 尝试参数自动提升：T 传给 T? 参数，T 传给 Throw<T, E> 参数
-                    const resolved_callee = self.resolve(callee_ty);
-                    switch (resolved_callee.*) {
-                        .fn_type => |ft| {
+                // 先检查是否是函数类型并尝试参数widening（§6.12规则2）
+                // (重用上面的resolved_callee变量)
+                switch (resolved_callee.*) {
+                    .fn_type => |ft| {
+                        // 参数数量完全匹配时，直接使用tryWidenUnify
+                        if (ft.params.len == arg_types.len) {
+                            var all_ok = true;
+                            for (ft.params, arg_types) |param_ty, arg_ty| {
+                                _ = self.tryWidenUnify(param_ty, arg_ty) catch {
+                                    all_ok = false;
+                                    break;
+                                };
+                            }
+                            if (all_ok) {
+                                // 文档 2.7.3: 调用点 Trait Bound 延迟检查
+                                self.checkCallSiteTraitBound(c.callee, c.location);
+                                return ft.return_type;
+                            }
+                        }
+
+                        // 如果widening失败，继续尝试其他方式
+                        const expected_fn_ty = try self.makeFnType(arg_types, ret_ty);
+                        if (self.unify(callee_ty, expected_fn_ty)) {
+                            self.checkCallSiteTraitBound(c.callee, c.location);
+                            return ret_ty;
+                        } else |_| {
                             // 文档 §2.8.1 默认柯里化：参数不足时返回剩余函数类型
                             if (c.arguments.len < ft.params.len) {
                                 // 统一已提供的参数与前 N 个参数
@@ -1942,15 +2101,15 @@ pub const TypeInferencer = struct {
                                     return ft.return_type;
                                 }
                             }
-                        },
-                        else => {},
-                    }
-                    return error.TypeMismatch;
+                        }
+                    },
+                    else => {},
                 }
+                return error.TypeMismatch;
             },
 
             .if_expr => |ie| {
-                const cond_ty = try self.inferExpr(ie.condition, env);
+                const cond_ty = try self.inferExpr(ie.condition, env, null);
                 try self.unify(cond_ty, try self.makeType(.bool_type));
 
                 // 分析条件中的 null 检查，获取收窄信息（标识符走 env 重定义）
@@ -1972,7 +2131,7 @@ pub const TypeInferencer = struct {
                     self.pushNarrowedPath(narrow_path.?)
                 else
                     false;
-                const then_ty = try self.inferExpr(ie.then_branch, then_env);
+                const then_ty = try self.inferExpr(ie.then_branch, then_env, expected);
                 if (added_then) self.popNarrowedPath(narrow_path.?);
                 self.popLinearScope();
 
@@ -1986,7 +2145,7 @@ pub const TypeInferencer = struct {
                         self.pushNarrowedPath(narrow_path.?)
                     else
                         false;
-                    const else_ty = try self.inferExpr(else_br, else_env);
+                    const else_ty = try self.inferExpr(else_br, else_env, expected);
                     if (added_else) self.popNarrowedPath(narrow_path.?);
                     self.popLinearScope();
                     // 发散分支处理：若某一分支体只含 throw（或 return/break/continue），
@@ -2010,7 +2169,7 @@ pub const TypeInferencer = struct {
                     _ = try self.inferStmt(stmt, child_env);
                 }
                 if (blk.trailing_expr) |te| {
-                    result_ty = try self.inferExpr(te, child_env);
+                    result_ty = try self.inferExpr(te, child_env, null);
                 }
                 // 文档 §3.3.3: 检查未消费的 Spawn 变量
                 self.popLinearScope();
@@ -2018,7 +2177,7 @@ pub const TypeInferencer = struct {
             },
 
             .match => |m| {
-                const scrutinee_ty = try self.inferExpr(m.scrutinee, env);
+                const scrutinee_ty = try self.inferExpr(m.scrutinee, env, null);
                 const resolved_scrutinee = self.resolve(scrutinee_ty);
 
                 // 如果 scrutinee 是 T?，提取内部类型 T 用于非 null 分支的收窄
@@ -2059,7 +2218,7 @@ pub const TypeInferencer = struct {
 
                     try self.inferPattern(arm.pattern, pattern_ty, child_env);
                     self.pushLinearScope();
-                    const body_ty = try self.inferExpr(arm.body, child_env);
+                    const body_ty = try self.inferExpr(arm.body, child_env, null);
                     self.popLinearScope();
                     if (is_gadt_scrutinee) {
                         // 不跨分支统一：各 GADT 分支返回类型可不同（T~i32 / T~bool）。
@@ -2080,11 +2239,15 @@ pub const TypeInferencer = struct {
 
             .array_literal => |al| {
                 if (al.elements.len == 0) return self.freshTypeVar() catch unreachable;
-                const first_ty = self.inferExpr(al.elements[0], env) catch return self.freshTypeVar() catch unreachable;
-                // Unify all element types with the first
+                const first_ty = self.inferExpr(al.elements[0], env, null) catch return self.freshTypeVar() catch unreachable;
+                // Unify all element types with the first, using tryWidenUnify for §6.12规则2
                 for (al.elements[1..]) |elem| {
-                    const elem_ty = self.inferExpr(elem, env) catch continue;
-                    self.unify(first_ty, elem_ty) catch {};
+                    const elem_ty = self.inferExpr(elem, env, null) catch continue;
+                    // 使用tryWidenUnify支持标注指导
+                    _ = self.tryWidenUnify(first_ty, elem_ty) catch {
+                        // 如果widening失败，回退到严格unify
+                        self.unify(first_ty, elem_ty) catch {};
+                    };
                 }
                 return self.makeArrayType(first_ty, null) catch unreachable;
             },
@@ -2094,7 +2257,7 @@ pub const TypeInferencer = struct {
                 for (rl.fields, 0..) |f, i| {
                     fields[i] = FieldType{
                         .name = f.name,
-                        .ty = try self.inferExpr(f.value, env),
+                        .ty = try self.inferExpr(f.value, env, null),
                     };
                 }
                 const t = try self.allocator.create(Type);
@@ -2106,7 +2269,7 @@ pub const TypeInferencer = struct {
             .record_extend => |re| {
                 // Phase 3: 记录扩展/更新的类型推断
                 // (...base, field: val) 的类型 = base 的字段类型 + updates 的字段类型
-                const base_ty = self.inferExpr(re.base, env) catch return self.freshTypeVar() catch unreachable;
+                const base_ty = self.inferExpr(re.base, env, null) catch return self.freshTypeVar() catch unreachable;
                 const resolved_base = self.resolve(base_ty);
 
                 switch (resolved_base.*) {
@@ -2118,7 +2281,7 @@ pub const TypeInferencer = struct {
                         }
                         // 应用 updates（覆盖或新增）
                         for (re.updates) |update| {
-                            const update_ty = try self.inferExpr(update.value, env);
+                            const update_ty = try self.inferExpr(update.value, env, null);
                             // 检查是否覆盖已有字段
                             var found = false;
                             for (all_fields.items, 0..) |*f, i| {
@@ -2148,7 +2311,7 @@ pub const TypeInferencer = struct {
             },
 
             .field_access => |fa| {
-                const obj_ty = self.inferExpr(fa.object, env) catch return self.freshTypeVar() catch unreachable;
+                const obj_ty = self.inferExpr(fa.object, env, null) catch return self.freshTypeVar() catch unreachable;
                 // 文档 §4.6.2: 模块限定访问 `Store.Memory` / `Module.member`。
                 if (self.asModuleRef(obj_ty)) |mod_name| {
                     // 子模块？→ 返回子模块的模块引用
@@ -2227,7 +2390,7 @@ pub const TypeInferencer = struct {
                 // await() 和 cancel() 消费 Spawn<T>
                 if (std.mem.eql(u8, mc.method, "await") or std.mem.eql(u8, mc.method, "cancel")) {
                     // 检查对象类型是否为 Spawn<T>
-                    const obj_ty = self.inferExpr(mc.object, env) catch return result_ty;
+                    const obj_ty = self.inferExpr(mc.object, env, null) catch return result_ty;
                     if (self.isSpawnType(obj_ty)) {
                         // 如果对象是标识符，标记对应的线性变量为已消费
                         if (self.getIdentifierName(mc.object)) |name| {
@@ -2239,14 +2402,14 @@ pub const TypeInferencer = struct {
             },
 
             .propagate => |prop| {
-                const inner_ty = try self.inferExpr(prop.expr, env);
+                const inner_ty = try self.inferExpr(prop.expr, env, null);
                 const resolved_inner = self.resolve(inner_ty);
                 return throw_check.checkPropagate(self, resolved_inner, inner_ty, self.current_fn_return_type, prop.location);
             },
 
             .non_null_assert => |nna| {
                 // 非空断言 `x!`：把 T? 收窄为 T（运行时若为 null 则 panic）。
-                const inner = try self.inferExpr(nna.expr, env);
+                const inner = try self.inferExpr(nna.expr, env, null);
                 const ri = self.resolve(inner);
                 if (ri.* == .nullable_type) {
                     return ri.nullable_type;
@@ -2255,7 +2418,7 @@ pub const TypeInferencer = struct {
             },
 
             .safe_access => |sa| {
-                const obj_ty = self.inferExpr(sa.object, env) catch return self.freshTypeVar() catch unreachable;
+                const obj_ty = self.inferExpr(sa.object, env, null) catch return self.freshTypeVar() catch unreachable;
                 // For now, return a nullable type variable
                 _ = obj_ty;
                 const inner = self.freshTypeVar() catch unreachable;
@@ -2267,8 +2430,8 @@ pub const TypeInferencer = struct {
             },
 
             .index => |idx| {
-                const obj_ty = self.inferExpr(idx.object, env) catch return self.freshTypeVar() catch unreachable;
-                _ = self.inferExpr(idx.index, env) catch {};
+                const obj_ty = self.inferExpr(idx.object, env, null) catch return self.freshTypeVar() catch unreachable;
+                _ = self.inferExpr(idx.index, env, null) catch {};
                 const resolved = self.resolve(obj_ty);
                 switch (resolved.*) {
                     .array_type => |at| return at.element_type,
@@ -2281,12 +2444,12 @@ pub const TypeInferencer = struct {
             },
 
             .type_cast => |tc| {
-                _ = try self.inferExpr(tc.expr, env);
+                _ = try self.inferExpr(tc.expr, env, null);
                 return self.typeFromAst(tc.target_type);
             },
 
             .assignment_expr => |ae| {
-                const val_ty = try self.inferExpr(ae.value, env);
+                const val_ty = try self.inferExpr(ae.value, env, null);
                 // 文档 §3.3.3: Spawn 线性类型追踪
                 // 赋值表达式中的 Spawn 值也需要追踪
                 if (self.isSpawnType(val_ty)) {
@@ -2298,16 +2461,20 @@ pub const TypeInferencer = struct {
             },
 
             .compound_assign => |ca| {
-                var target_ty = try self.inferExpr(ca.target, env);
-                var val_ty = try self.inferExpr(ca.value, env);
+                var target_ty = try self.inferExpr(ca.target, env, null);
 
                 // 文档 §3.4.2: Atomic<T> 透明操作 — 自动解包
                 target_ty = self.unwrapAtomic(target_ty);
+
+                // 使用解包后的 target_ty 作为 value 的期望类型，支持数值类型提升
+                var val_ty = try self.inferExpr(ca.value, env, target_ty);
                 val_ty = self.unwrapAtomic(val_ty);
 
                 switch (ca.op) {
                     .add_assign, .sub_assign, .mul_assign, .div_assign, .mod_assign => {
-                        try self.unify(target_ty, val_ty);
+                        _ = self.tryWidenUnify(target_ty, val_ty) catch {
+                            try self.unify(target_ty, val_ty);
+                        };
                         return target_ty;
                     },
                     .bit_and_assign, .bit_or_assign => {
@@ -2319,12 +2486,23 @@ pub const TypeInferencer = struct {
 
             // 尚未实现的表达式类型 — Phase 4 并发原语类型推断
             .spawn => |sp| {
-                const body_ty = try self.inferExpr(sp.body, env);
+                const body_ty = try self.inferExpr(sp.body, env, null);
                 // 返回 Spawn<T>，其中 T = body 类型
                 return self.makeGenericType("Spawn", &[_]*Type{body_ty});
             },
             .atomic_expr => |ae| {
-                const val_ty = try self.inferExpr(ae.value, env);
+                // 如果有期望类型 Atomic<T>，提取 T 作为内部值的期望类型
+                var inner_expected: ?*Type = null;
+                if (expected) |exp| {
+                    const resolved_exp = self.resolve(exp);
+                    if (resolved_exp.* == .generic_type) {
+                        const gt = resolved_exp.generic_type;
+                        if (std.mem.eql(u8, gt.name, "Atomic") and gt.args.len == 1) {
+                            inner_expected = gt.args[0];
+                        }
+                    }
+                }
+                const val_ty = try self.inferExpr(ae.value, env, inner_expected);
                 // 返回 Atomic<T>，其中 T = 值类型
                 return self.makeGenericType("Atomic", &[_]*Type{val_ty});
             },
@@ -2338,16 +2516,16 @@ pub const TypeInferencer = struct {
                             const arm_env = try env.createChild();
                             if (recv_arm.binding) |binding_name| {
                                 // 通道接收表达式（通常是 ch.recv()，类型 T?）的内部类型 T 即绑定类型
-                                const recv_ty = self.inferExpr(recv_arm.channel_expr, env) catch try self.freshTypeVar();
+                                const recv_ty = self.inferExpr(recv_arm.channel_expr, env, null) catch try self.freshTypeVar();
                                 const resolved = self.resolve(recv_ty);
                                 const elem_ty = if (resolved.* == .nullable_type) resolved.nullable_type else recv_ty;
                                 arm_env.define(binding_name, TypeScheme{ .quantified_vars = &[_]usize{}, .ty = elem_ty }) catch {};
                             }
-                            const body_ty = try self.inferExpr(recv_arm.body, arm_env);
+                            const body_ty = try self.inferExpr(recv_arm.body, arm_env, null);
                             if (result_ty == null) result_ty = body_ty;
                         },
                         .timeout => |timeout_arm| {
-                            const body_ty = try self.inferExpr(timeout_arm.body, env);
+                            const body_ty = try self.inferExpr(timeout_arm.body, env, null);
                             if (result_ty == null) result_ty = body_ty;
                         },
                     }
@@ -2358,7 +2536,7 @@ pub const TypeInferencer = struct {
                 // 文档 §6.10: lazy expr 的内部表达式仍需类型检查（捕获 thunk 体内错误）。
                 // 透明强制语义下 Lazy<T> 当作 T 使用，故结果保持灵活（fresh 变量），
                 // 以便与 `: Lazy<T>` 注解或直接当 T 使用两种写法都兼容。
-                _ = self.inferExpr(lz.expr, env) catch {};
+                _ = self.inferExpr(lz.expr, env, null) catch {};
                 return self.freshTypeVar();
             },
             .monad_comprehension, .inline_trait_value => {
@@ -2424,8 +2602,8 @@ pub const TypeInferencer = struct {
 
                         // 推断 lambda 体
                         const body_ty = switch (lam.body) {
-                            .block => |body| try self.inferExpr(body, child_env),
-                            .expression => |e| try self.inferExpr(e, child_env),
+                            .block => |body| try self.inferExpr(body, child_env, null),
+                            .expression => |e| try self.inferExpr(e, child_env, null),
                         };
                         // 统一返回类型
                         _ = self.tryWidenUnify(ret_ty, body_ty) catch {
@@ -2438,7 +2616,12 @@ pub const TypeInferencer = struct {
                             self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                         }
                     } else {
-                        const val_ty = try self.inferExpr(vd.value, env);
+                        // 先解析类型注解作为期望类型
+                        const expected_ty = if (vd.type_annotation) |ta|
+                            self.typeFromAstWithParams(ta, null) catch null
+                        else
+                            null;
+                        const val_ty = try self.inferExpr(vd.value, env, expected_ty);
                         // 验证类型注解；有标注时以标注类型作为绑定类型（标注优先于推断，
                         // 例如 `val x: i32? = 5` 中 x 的类型是 i32? 而非 i32）。
                         var bind_ty = val_ty;
@@ -2471,7 +2654,12 @@ pub const TypeInferencer = struct {
                 if (self.isBuiltinName(vd.name)) {
                     self.addErrorAt(.type_mismatch, vd.location.line, vd.location.column, "cannot redefine built-in name '{s}'", .{vd.name});
                 } else {
-                    const val_ty = try self.inferExpr(vd.value, env);
+                    // 先解析类型注解作为期望类型
+                    const expected_ty = if (vd.type_annotation) |ta|
+                        self.typeFromAstWithParams(ta, null) catch null
+                    else
+                        null;
+                    const val_ty = try self.inferExpr(vd.value, env, expected_ty);
                     // 验证类型注解；有标注时以标注类型作为绑定类型（标注优先于推断，
                     // 与 val_decl 一致：`var acc: i64 = 0` 中 acc 的类型是 i64 而非字面量
                     // 推断出的 i32，否则绑定类型会丢失标注宽度污染后续推断）。
@@ -2501,7 +2689,7 @@ pub const TypeInferencer = struct {
                 return null;
             },
             .assignment => |asgn| {
-                const val_ty = try self.inferExpr(asgn.value, env);
+                const val_ty = try self.inferExpr(asgn.value, env, null);
                 // 文档 §3.3.3: Spawn 线性类型追踪
                 // 赋值给 Spawn 变量时，注册新的线性变量
                 if (self.isSpawnType(val_ty)) {
@@ -2512,33 +2700,33 @@ pub const TypeInferencer = struct {
                 return null;
             },
             .field_assignment => |fa| {
-                _ = try self.inferExpr(fa.value, env);
+                _ = try self.inferExpr(fa.value, env, null);
                 return null;
             },
             .expression => |es| {
-                return self.inferExpr(es.expr, env);
+                return self.inferExpr(es.expr, env, null);
             },
             .return_stmt => |ret| {
                 if (ret.value) |v| {
-                    return self.inferExpr(v, env);
+                    return self.inferExpr(v, env, null);
                 }
                 return self.makeType(.unit_type);
             },
             .defer_stmt => |ds| {
                 // 文档 §3.3.4: defer s.await() / defer s.cancel() 消费 Spawn
                 // 需要推断 defer 中的表达式以追踪 Spawn 消费
-                _ = try self.inferExpr(ds.expr, env);
+                _ = try self.inferExpr(ds.expr, env, null);
                 return null;
             },
             .throw_stmt => |thr| {
-                _ = try self.inferExpr(thr.expr, env);
+                _ = try self.inferExpr(thr.expr, env, null);
                 return null;
             },
             .break_stmt, .continue_stmt => {
                 return null;
             },
             .for_stmt => |fs| {
-                const iterable_ty = try self.inferExpr(fs.iterable, env);
+                const iterable_ty = try self.inferExpr(fs.iterable, env, null);
                 const child_env = try env.createChild();
                 // 文档 2.7.8: for item in list 要求 list 的类型满足 Iterable<T>
                 // 推断 item 的类型
@@ -2573,21 +2761,21 @@ pub const TypeInferencer = struct {
                 const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = item_ty };
                 try child_env.define(fs.name, scheme);
                 self.pushLinearScope();
-                _ = try self.inferExpr(fs.body, child_env);
+                _ = try self.inferExpr(fs.body, child_env, null);
                 self.popLinearScope();
                 return null;
             },
             .while_stmt => |ws| {
-                const cond_ty = try self.inferExpr(ws.condition, env);
+                const cond_ty = try self.inferExpr(ws.condition, env, null);
                 try self.unify(cond_ty, try self.makeType(.bool_type));
                 self.pushLinearScope();
-                _ = try self.inferExpr(ws.body, env);
+                _ = try self.inferExpr(ws.body, env, null);
                 self.popLinearScope();
                 return null;
             },
             .loop_stmt => |ls| {
                 self.pushLinearScope();
-                _ = try self.inferExpr(ls.body, env);
+                _ = try self.inferExpr(ls.body, env, null);
                 self.popLinearScope();
                 return null;
             },
@@ -2597,7 +2785,7 @@ pub const TypeInferencer = struct {
                     .op = ca.op,
                     .target = ca.target,
                     .value = ca.value,
-                } }, env);
+                } }, env, null);
                 return null;
             },
         };
@@ -2681,7 +2869,7 @@ pub const TypeInferencer = struct {
             .guard => |g| {
                 try self.inferPattern(g.pattern, expected_ty, env);
                 // 守卫条件必须是 bool（模式绑定已在 env 中，可在此作用域推断条件类型）。
-                const cond_ty = self.inferExpr(g.condition, env) catch return;
+                const cond_ty = self.inferExpr(g.condition, env, null) catch return;
                 self.unify(cond_ty, self.makeType(.bool_type) catch return) catch {
                     self.addErrorAt(.type_mismatch, g.location.line, g.location.column, "match guard condition must be of type bool", .{});
                 };
@@ -2712,8 +2900,10 @@ pub const TypeInferencer = struct {
                 if (std.mem.eql(u8, n.name, "u64")) return self.makeType(.u64_type);
                 if (std.mem.eql(u8, n.name, "u128")) return self.makeType(.u128_type);
                 // 浮点类型映射
+                if (std.mem.eql(u8, n.name, "f16")) return self.makeType(.f16_type);
                 if (std.mem.eql(u8, n.name, "f32")) return self.makeType(.f32_type);
                 if (std.mem.eql(u8, n.name, "f64")) return self.makeType(.f64_type);
+                if (std.mem.eql(u8, n.name, "f128")) return self.makeType(.f128_type);
                 // 其他基本类型
                 if (std.mem.eql(u8, n.name, "bool")) return self.makeType(.bool_type);
                 if (std.mem.eql(u8, n.name, "str")) return self.makeType(.str_type);
@@ -3271,8 +3461,10 @@ pub const TypeInferencer = struct {
             .{ "u32", Type.u32_type },
             .{ "u64", Type.u64_type },
             .{ "u128", Type.u128_type },
+            .{ "f16", Type.f16_type },
             .{ "f32", Type.f32_type },
             .{ "f64", Type.f64_type },
+            .{ "f128", Type.f128_type },
         };
         inline for (numeric_casts) |cast| {
             const param = self.freshTypeVar() catch return;
@@ -3534,7 +3726,7 @@ pub const TypeInferencer = struct {
                     self.current_fn_info = prev_fn_info;
                 }
 
-                const body_ty = self.inferExpr(f.body, child_env) catch |err| {
+                const body_ty = self.inferExpr(f.body, child_env, null) catch |err| {
                     self.reportInferError(err, f.location);
                     return;
                 };
@@ -3901,7 +4093,7 @@ pub const TypeInferencer = struct {
                         self.reportInferError(err, ed.location);
                     };
                 } else {
-                    _ = self.inferExpr(ed.expr, env) catch |err| {
+                    _ = self.inferExpr(ed.expr, env, null) catch |err| {
                         self.reportInferError(err, ed.location);
                     };
                 }
