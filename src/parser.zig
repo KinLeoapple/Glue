@@ -197,7 +197,7 @@ pub const Parser = struct {
                 .kw_type,
                 .kw_trait,
                 .kw_impl,
-                .kw_use,
+                .kw_import,
                 .kw_pack,
                 .kw_pub,
                 .kw_val,
@@ -275,7 +275,7 @@ pub const Parser = struct {
             // 如缺前导 `|` 的枚举在真正诊断后再报一次 "expected expression"）。
             const at_decl_kw = self.check(.kw_fun) or self.check(.kw_type) or
                 self.check(.kw_trait) or self.check(.kw_impl) or
-                self.check(.kw_use) or self.check(.kw_pack) or self.check(.kw_pub);
+                self.check(.kw_import) or self.check(.kw_pack) or self.check(.kw_pub);
 
             // 先尝试解析为声明
             if (self.tryParseDecl()) |decl| {
@@ -369,7 +369,7 @@ pub const Parser = struct {
         if (self.check(.kw_impl)) {
             return self.parseImplDecl(visibility) catch return null;
         }
-        if (self.check(.kw_use)) {
+        if (self.check(.kw_import)) {
             return self.parseUseDecl(visibility) catch return null;
         }
         if (self.check(.kw_pack)) {
@@ -448,7 +448,7 @@ pub const Parser = struct {
         if (self.check(.kw_impl)) {
             return self.parseImplDecl(visibility);
         }
-        if (self.check(.kw_use)) {
+        if (self.check(.kw_import)) {
             return self.parseUseDecl(visibility);
         }
         if (self.check(.kw_pack)) {
@@ -532,7 +532,7 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析类型声明：type Name<T> = ...
+    /// 解析类型声明：type Name<T>: Trait1, Trait2 = ... with T: ConcreteType { methods }
     fn parseTypeDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const type_tok = self.advance(); // 消费 type
         const name_tok = try self.expect(.identifier, "expected type name");
@@ -542,6 +542,12 @@ pub const Parser = struct {
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
             self.expectCloseAngle("expected '>' to close type parameter list") catch {};
+        }
+
+        // 实现的 trait 列表：: Trait1, Trait2
+        var implemented_traits = std.ArrayList(ast.TraitBound).empty;
+        if (self.matchToken(.colon)) {
+            try self.parseTraitBoundList(&implemented_traits);
         }
 
         _ = self.expect(.eq, "expected '=' to define type body") catch {};
@@ -554,13 +560,29 @@ pub const Parser = struct {
             def.error_newtype.name = name_tok.lexeme;
         }
 
+        // 类型特化约束：with T: ConcreteType
+        var type_constraints = std.ArrayList(ast.TypeConstraint).empty;
+        if (self.matchToken(.kw_with)) {
+            try self.parseTypeConstraints(&type_constraints);
+        }
+
+        // 方法块：{ methods }
+        var methods = std.ArrayList(ast.MethodDecl).empty;
+        if (self.matchToken(.l_brace)) {
+            try self.parseMethodBlock(&methods);
+            _ = self.expect(.r_brace, "expected '}' to close method block") catch {};
+        }
+
         return ast.Decl{
             .type_decl = .{
                 .location = tokenLoc(type_tok),
                 .visibility = visibility,
                 .name = name_tok.lexeme,
                 .type_params = try type_params.toOwnedSlice(self.allocator),
+                .implemented_traits = try implemented_traits.toOwnedSlice(self.allocator),
+                .type_constraints = try type_constraints.toOwnedSlice(self.allocator),
                 .def = def,
+                .methods = try methods.toOwnedSlice(self.allocator),
             },
         };
     }
@@ -1039,18 +1061,18 @@ pub const Parser = struct {
             try module_path.append(self.allocator, part.lexeme);
         }
 
-        var items: ?[]ast.UseItem = null;
+        var items: ?[]ast.ImportItem = null;
         // `use Mod.{...}` 进入 brace 列表前的 `.` 已被上面的 while 消费，
         // 此时 previous() 是 `.`、当前是 `{`；`use Mod.Sub.{...}` 同理。
         // 因此条件是「当前已在 `{`」或「再吃一个 `.` 后是 `{`」。
         if (self.check(.l_brace) or self.matchToken(.dot)) {
             _ = self.expect(.l_brace, "expected '{'") catch {};
-            var item_list = std.ArrayList(ast.UseItem).empty;
+            var item_list = std.ArrayList(ast.ImportItem).empty;
             if (!self.check(.r_brace)) {
-                try item_list.append(self.allocator, try self.parseUseItem());
+                try item_list.append(self.allocator, try self.parseImportItem());
                 while (self.matchToken(.comma)) {
                     if (self.check(.r_brace)) break;
-                    try item_list.append(self.allocator, try self.parseUseItem());
+                    try item_list.append(self.allocator, try self.parseImportItem());
                 }
             }
             _ = self.expect(.r_brace, "expected '}'") catch {};
@@ -1058,7 +1080,7 @@ pub const Parser = struct {
         }
 
         return ast.Decl{
-            .use_decl = .{
+            .import_decl = .{
                 .location = tokenLoc(use_tok),
                 .module_path = try module_path.toOwnedSlice(self.allocator),
                 .items = items,
@@ -1068,14 +1090,14 @@ pub const Parser = struct {
     }
 
     /// 解析单个 use 导入项
-    fn parseUseItem(self: *Parser) ParserError!ast.UseItem {
+    fn parseImportItem(self: *Parser) ParserError!ast.ImportItem {
         const name = try self.expect(.identifier, "expected import item name");
         var alias: ?[]const u8 = null;
         if (self.matchToken(.kw_as)) {
             const alias_tok = try self.expect(.identifier, "expected alias");
             alias = alias_tok.lexeme;
         }
-        return ast.UseItem{
+        return ast.ImportItem{
             .name = name.lexeme,
             .alias = alias,
         };
@@ -1177,6 +1199,8 @@ pub const Parser = struct {
         }
 
         const name_tok = try self.expect(.identifier, "expected parameter name");
+        // 复制参数名以确保生命周期独立于源代码
+        const name_copy = try self.allocator.dupe(u8, name_tok.lexeme);
 
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
@@ -1189,7 +1213,7 @@ pub const Parser = struct {
 
         return ast.Param{
             .location = tokenLoc(name_tok),
-            .name = name_tok.lexeme,
+            .name = name_copy,
             .type_annotation = type_annotation,
             .is_var = is_var,
         };
@@ -1219,6 +1243,35 @@ pub const Parser = struct {
             .trait_name = name_tok.lexeme,
             .type_args = try type_args.toOwnedSlice(self.allocator),
         };
+    }
+
+    /// 解析类型特化约束：with T: ConcreteType, U: AnotherType
+    fn parseTypeConstraints(self: *Parser, constraints: *std.ArrayList(ast.TypeConstraint)) ParserError!void {
+        try constraints.append(self.allocator, try self.parseTypeConstraint());
+        while (self.matchToken(.comma)) {
+            try constraints.append(self.allocator, try self.parseTypeConstraint());
+        }
+    }
+
+    /// 解析单个类型约束：T: ConcreteType
+    fn parseTypeConstraint(self: *Parser) ParserError!ast.TypeConstraint {
+        const type_param_tok = try self.expect(.identifier, "expected type parameter name");
+        _ = try self.expect(.colon, "expected ':' after type parameter");
+        const concrete_type = try self.parseType();
+
+        return ast.TypeConstraint{
+            .type_param = type_param_tok.lexeme,
+            .concrete_type = concrete_type,
+        };
+    }
+
+    /// 解析方法块：{ fun method1() { ... } fun method2() { ... } }
+    fn parseMethodBlock(self: *Parser, methods: *std.ArrayList(ast.MethodDecl)) ParserError!void {
+        while (!self.check(.r_brace) and !self.isAtEnd()) {
+            // 解析方法声明
+            const method = try self.parseMethodDecl();
+            try methods.append(self.allocator, method);
+        }
     }
 
     fn parseTypeArgList(self: *Parser, type_args: *std.ArrayList(*ast.TypeNode)) ParserError!void {
@@ -3591,6 +3644,7 @@ fn tokenLoc(token: lexer.Token) ast.SourceLocation {
 fn getTypeNodeLocation(ty: *const ast.TypeNode) ast.SourceLocation {
     return switch (ty.*) {
         .named => |n| n.location,
+        .self_type => |s| s.location,
         .generic => |g| g.location,
         .nullable => |n| n.location,
         .function => |f| f.location,

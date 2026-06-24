@@ -129,6 +129,11 @@ pub const TypeNode = union(enum) {
         name: []const u8,
     },
 
+    /// Self 类型：在 trait 或 type 方法中指代当前类型
+    self_type: struct {
+        location: SourceLocation,
+    },
+
     /// 泛型类型：List<T>, Map<K,V>, Throw<T,E>
     generic: struct {
         location: SourceLocation,
@@ -300,6 +305,14 @@ pub const TraitBound = struct {
     type_args: []*TypeNode,
 };
 
+/// 类型特化约束（用于 with T: ConcreteType 语法）
+pub const TypeConstraint = struct {
+    /// 被约束的类型参数名
+    type_param: []const u8,
+    /// 约束为的具体类型
+    concrete_type: *TypeNode,
+};
+
 /// 记录字段类型（用于类型注解）
 pub const RecordFieldType = struct {
     name: []const u8,
@@ -378,11 +391,11 @@ pub const MonadBinding = struct {
     expr: *Expr,
 };
 
-/// use 导入项
-pub const UseItem = struct {
+/// import 导入项
+pub const ImportItem = struct {
     /// 导入名称
     name: []const u8,
-    /// 别名（use X.{Y as Z} 中的 Z）
+    /// 别名（import X.{Y as Z} 中的 Z）
     alias: ?[]const u8,
 };
 
@@ -937,14 +950,21 @@ pub const Decl = union(enum) {
         name_id: u32 = 0xFFFF_FFFF,
     },
 
-    /// 类型声明：type Name<T> = ...
+    /// 类型声明：type Name<T>: Trait1, Trait2 = ... { methods }
     /// 涵盖 ADT、记录、别名、newtype、GADT、错误 newtype
+    /// 现在支持在定义时实现 trait
     type_decl: struct {
         location: SourceLocation,
         visibility: Visibility,
         name: []const u8,
         type_params: []TypeParam,
+        /// 实现的 trait 列表（新增）
+        implemented_traits: []TraitBound,
+        /// 类型特化约束（新增）：with T: ConcreteType
+        type_constraints: []TypeConstraint,
         def: TypeDef,
+        /// 方法实现块（新增）
+        methods: []MethodDecl,
     },
 
     /// Trait 声明：trait Name<Params>(Parents) { methods }
@@ -961,7 +981,9 @@ pub const Decl = union(enum) {
         methods: []MethodDecl,
     },
 
-    /// Impl 假明：impl TraitName<Type> { methods }
+    /// [DEPRECATED] Impl 声明：impl TraitName<Type> { methods }
+    /// 已废弃：现在 trait 实现应该在 type 定义时完成
+    /// 保留此定义以便解析器可以报告友好的错误信息
     impl_decl: struct {
         location: SourceLocation,
         /// Trait 名称
@@ -986,13 +1008,13 @@ pub const Decl = union(enum) {
     /// use Collections.Map                     — 导入整个模块
     /// use Collections.{Map as CMap}           — 别名导入
     /// pub use Collections.{Map}               — 公开再导出
-    use_decl: struct {
+    import_decl: struct {
         location: SourceLocation,
         /// 模块路径，如 ["Collections"] 或 ["Collections", "Map"]
         module_path: [][]const u8,
         /// 导入项列表（null 表示导入整个模块）
-        items: ?[]UseItem,
-        /// 可见性（pub use 表示公开再导出）
+        items: ?[]ImportItem,
+        /// 可见性（pub import 表示公开再导出）
         visibility: Visibility = .private,
     },
 

@@ -1,6 +1,6 @@
 // 回归：内嵌标准库 Compare（Eq / Ord / Show 类型类）。
 // 验证 use Compare 加载内嵌模块 + 对内建类型 i64/f64/bool/str/char 的 trait 实现。
-use Compare
+import Compare
 
 fun check(cond: bool, label: str): Unit {
     if (!cond) { Panic("assertion failed: " + label) } else { println("ok: " + label) }

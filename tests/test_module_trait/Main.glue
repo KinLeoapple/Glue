@@ -4,7 +4,7 @@
 // 关键点：trait 名（KVStore，契约）与模块名（Store，实现目录）刻意取不同名字，
 // 以体现「文件模块作为 Trait 值」靠的是结构化匹配（§2.12.2），二者无名义绑定——
 // Store.Memory 模块并未 `impl KVStore`，只是结构上提供了 KVStore 要求的全部方法。
-use Store
+import Store
 
 // KVStore trait：要求 put / get（Store.Memory 模块结构化满足之）。
 trait KVStore {

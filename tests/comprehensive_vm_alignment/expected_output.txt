@@ -1,0 +1,90 @@
+=== Glue VM与Tree Walker全面对齐测试 ===
+
+【测试1】基础类型与字面量
+  整数: i8=127 i16=32767 i32=2147483647
+  无符号: u8=255 u16=65535
+  浮点: f32=3.14 f64=2.718281828
+  其他: bool=true char=G
+  字符串: Hello, Glue!
+  推断: int=42 float=3.14
+  类型名: type(42)=i8 type(3.14)=f128
+  ✓ 基础类型测试通过
+【测试2】运算符
+  算术: 10+5=15 10-5=5 10*5=50 10/5=2 10%3=1
+  比较: 5==5=true 5!=3=true 3<5=true 5>3=true
+  逻辑: true&&true=true false||true=true !false=true
+  位运算: 12&10=8 12|10=14 12^10=6
+  字符串拼接: Hello World
+  数组拼接: [1,2,3]++[4,5,6] 长度=6
+  范围: 1..4 求和=6
+  Elvis: 42??0=42 null??99=99
+  ✓ 运算符测试通过
+【测试3】Nullable类型
+  安全调用: [1,2,3]?.len()=3
+  match收窄: got 42
+  if收窄: n2 is null
+  扁平化: i32??=42 unwrap=42
+  ✓ Nullable测试通过
+【测试4】Throw类型
+  10/2 = 5
+  10/0 捕获错误，返回: -999
+  自定义错误: FileError创建成功
+  ✓ Throw测试通过
+【测试5】控制流
+  if表达式: x=10 => positive
+  loop+break: 计数到 4
+  while: 计数到 3
+  for+continue: 奇数和(0..10) = 25
+  early_return(5) = 10
+  ✓ 控制流测试通过
+【测试6】函数与闭包
+  函数调用: add(3,4) = 7
+  柯里化: multiply(5)(3) = 15
+  闭包: counter() => 1, 2, 3
+  递归: factorial(5) = 120
+  尾递归: sum(1..100) = 5050
+  Lambda: double(7) = 14
+  ✓ 函数与闭包测试通过
+【测试7】ADT与模式匹配
+  Shape: Circle(5.0)面积=78.5 Rectangle(4.0,3.0)面积=12
+  枚举: Lt => less
+  List: Cons(1,Cons(2,Cons(3,Nil))) 长度=3
+  守卫: classify(5) => small
+  或模式: 3 in {1,2,3} => true
+  ✓ ADT与模式匹配测试通过
+【测试8】记录类型
+  记录构造: name=Alice age=30
+  记录匹配: Hello Alice, age 30
+  nullable字段: Bob has_email=false
+  ✓ 记录类型测试通过
+【测试9】类型转换
+  Widening: i8(42) -> i16 -> i32 -> i64 = 42
+  整数->浮点: i32(100) -> f64 = 100
+  Narrowing (范围内): i64(42) -> i32 = 42
+  str()转换: 42->42 true->true 'X'->X
+  type(): 42->i8 "hello"->str true->bool
+  ✓ 类型转换测试通过
+【测试10】内置函数
+  println: 输出正常
+  eq: [1,2,3] eq [1,2,3] = true
+  type: 已在类型转换中测试
+  str: 已在类型转换中测试
+  Ok/Error: Ok(42) unwrap = 42
+  ✓ 内置函数测试通过
+【测试11】defer与异常
+  defer: 预期1，实际=1 (defer在return后执行)
+  propagate: 成功传播 = 42
+  ✓ defer与异常测试通过
+【测试12】迭代器
+  数组迭代: [10,20,30] 求和 = 60
+  字符串迭代: "ABC" 字符数 = 3
+  范围迭代: 1..5 乘积 = 24
+  闭区间: 1..=3 求和 = 6
+  ✓ 迭代器测试通过
+【测试13】并发原语
+  spawn+await: 结果=10, 3
+  Atomic: 并发计数 = 2
+  Channel: 接收 100, 200
+  ✓ 并发原语测试通过
+
+=== 所有测试通过 ===

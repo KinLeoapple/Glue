@@ -57,6 +57,10 @@ pub fn checkTypeNode(
                 inferencer.addErrorAt(.type_mismatch, n.location.line, n.location.column, "kind mismatch: type constructor '{s}' expects {d} type argument(s) but is used as a concrete type", .{ n.name, arity });
             }
         },
+        .self_type => {
+            // Self 类型在方法中总是具体类型
+            return;
+        },
         .generic => |g| {
             // Throw/内建/用户构造器：实参个数必须等于 arity
             if (!isTypeParam(g.name, type_param_names)) {
@@ -133,6 +137,7 @@ pub fn checkImplKinds(
 fn typeNodeLoc(node: *const ast.TypeNode) ast.SourceLocation {
     return switch (node.*) {
         .named => |n| n.location,
+        .self_type => |s| s.location,
         .generic => |g| g.location,
         .nullable => |nl| typeNodeLoc(nl.inner),
         .function => |f| f.location,

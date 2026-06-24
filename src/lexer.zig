@@ -48,8 +48,8 @@ pub const TokenType = enum {
     kw_pack,
     /// pub
     kw_pub,
-    /// use
-    kw_use,
+    /// import
+    kw_import,
     /// with
     kw_with,
     /// as
@@ -1220,7 +1220,7 @@ fn keywordType(text: []const u8) TokenType {
     if (std.mem.eql(u8, text, "override")) return .kw_override;
     if (std.mem.eql(u8, text, "pack")) return .kw_pack;
     if (std.mem.eql(u8, text, "pub")) return .kw_pub;
-    if (std.mem.eql(u8, text, "use")) return .kw_use;
+    if (std.mem.eql(u8, text, "import")) return .kw_import;
     if (std.mem.eql(u8, text, "with")) return .kw_with;
     if (std.mem.eql(u8, text, "as")) return .kw_as;
     if (std.mem.eql(u8, text, "val")) return .kw_val;

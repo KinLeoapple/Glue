@@ -1,0 +1,13 @@
+type Point {
+    x: i32
+    y: i32
+
+    fun distance(self) -> i32 {
+        self.x + self.y
+    }
+}
+
+fun main() {
+    let p = Point { x: 3, y: 4 }
+    print(p.distance())
+}

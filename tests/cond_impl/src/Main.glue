@@ -1,17 +1,12 @@
-// 回归：参数化条件实现（impl Show<Box<T>> with Show<T>）。
+// 回归：参数化条件实现（type Box<T>: Show with Show<T>）。
 // 验证条件 impl 解析 + 头部自由变量 + 嵌套/多参数分派 + 与 stdlib 配合。
-use Compare
+import Compare
 
-type Box<T> = Box(value: T)
-type Pair<A, B> = Pair(first: A, second: B)
-
-// 条件 impl：T 满足 Show 时，Box<T> 也满足 Show。
-impl Show<Box<T>> with Show<T> {
+type Box<T>: Show = Box(value: T) with Show<T> {
     fun show(self): str { "Box(" + self.value.show() + ")" }
 }
 
-// 多参数条件 impl：A、B 都满足 Show 时，Pair<A,B> 满足 Show。
-impl Show<Pair<A, B>> with Show<A>, Show<B> {
+type Pair<A, B>: Show = Pair(first: A, second: B) with Show<A>, Show<B> {
     fun show(self): str { "(" + self.first.show() + ", " + self.second.show() + ")" }
 }
 

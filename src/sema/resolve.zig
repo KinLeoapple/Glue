@@ -118,7 +118,7 @@ fn resolveDecl(r: *Resolver, decl: *ast.Decl) !void {
                 if (m.body) |b| try resolveFnLike(r, m.params, b);
             }
         },
-        .type_decl, .use_decl, .pack_decl => {},
+        .type_decl, .import_decl, .pack_decl => {},
         .expr_decl => |ed| {
             try resolveExpr(r, ed.expr);
             if (ed.stmt) |s| try resolveStmt(r, s);

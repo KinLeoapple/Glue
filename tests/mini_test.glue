@@ -1,0 +1,8 @@
+fun test_ops() {
+    val bit_and = 12 & 10
+    println(str(bit_and))
+}
+
+fun main() {
+    test_ops()
+}

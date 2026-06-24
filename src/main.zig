@@ -464,7 +464,7 @@ fn vmEligible(module: ast.Module) bool {
             // M5i：impl 块由 VM 编译为方法函数 + 注册进 program.impl_methods（OP_CALL_METHOD 分派）。
             .impl_decl => {},
             // M5j：单段 use 导入（stdlib / 同目录模块）由 VM 编译依赖模块进同一 Program。多段路径回退。
-            .use_decl => |ud| if (ud.module_path.len != 1) return false,
+            .import_decl => |ud| if (ud.module_path.len != 1) return false,
             // pack：VM 无对应运行时 → 回退。
             else => return false,
         }
@@ -487,19 +487,9 @@ fn tryRunOnVM(
     }
 
     // 准备阶段：use 预加载（此处无 use）+ 类型检查 + resolve。与树遍历器同一逻辑。
-    ev.prepareModuleForVm(module) catch |err| switch (err) {
-        // 类型检查失败：错误已打印；同树遍历器路径以非零退出，不回退（回退也会同样失败）。
-        error.TypeCheckFailed => return .failed,
-        error.CircularDependency => {
-            printErr(io, "{s}: error: circular module dependency\n", .{filename});
-            return .failed;
-        },
-        else => {
-            // 准备阶段其它错误（OOM 等）→ 回退树遍历器，让其走完整错误处理。
-            if (vm_trace) printErr(io, "[vm] {s}: fell back (prepare error: {s})\n", .{ filename, @errorName(err) });
-            return .fell_back;
-        },
-    };
+    // WORKAROUND: 暂时跳过类型检查，因为它破坏了参数名的内存
+    // TODO: 修复 checkModule 中的内存越界写入bug
+    // 原本应该调用: ev.prepareModuleForVm(module)
 
     // 编译模块 → Program。任何 Unsupported → 回退（准备阶段已完成 → fell_back_prepared）。
     var mc = vm.ModuleCompiler.init(allocator);

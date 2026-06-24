@@ -349,11 +349,12 @@ pub const ModuleCompiler = struct {
 
     /// 第二遍：编译一个模块的 impl/trait 方法体（先，使裸名/nullary 方法表就绪）+ 函数体。
     fn compileBodies(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
-        // impl/trait 方法先编译：填 nullary_methods 表，使后续 fun 体（含 main）的 `zero()` 裸名可解析。
+        // impl/trait/type 方法先编译：填 nullary_methods 表，使后续 fun 体（含 main）的 `zero()` 裸名可解析。
         for (module.declarations) |decl| {
             switch (decl) {
                 .impl_decl => |id| try self.compileImplMethods(id),
                 .trait_decl => |td| try self.compileTraitDefaults(td),
+                .type_decl => |td| try self.compileTypeMethods(td),
                 else => {},
             }
         }
@@ -373,6 +374,31 @@ pub const ModuleCompiler = struct {
             const func_idx = try self.compileMethodBody(m, body);
             try self.program.addImplMethod(id.type_name, m.name, id.trait_name, func_idx);
             // M5k：零参方法（self 也无，如 `fun zero(): i32`）无 receiver，登记按名直接解析（首个生效）。
+            if (m.params.len == 0) try self.registerNullaryMethod(m.name, func_idx);
+        }
+    }
+
+    /// 编译 type 声明中的方法体（新语法）。
+    /// 类似 compileImplMethods，但从 type_decl 中提取类型名和 trait 信息。
+    fn compileTypeMethods(self: *ModuleCompiler, td: @TypeOf(@as(ast.Decl, undefined).type_decl)) CompileError!void {
+        if (td.methods.len == 0) return;
+
+        // 为每个实现的 trait 注册方法
+        for (td.methods) |m| {
+            const body = m.body orelse continue;
+            const func_idx = try self.compileMethodBody(m, body);
+
+            // 为每个实现的 trait 注册此方法
+            for (td.implemented_traits) |trait_bound| {
+                try self.program.addImplMethod(td.name, m.name, trait_bound.trait_name, func_idx);
+            }
+
+            // 如果没有实现任何 trait，也注册方法（作为类型的固有方法）
+            if (td.implemented_traits.len == 0) {
+                try self.program.addImplMethod(td.name, m.name, "", func_idx);
+            }
+
+            // M5k：零参方法（self 也无）无 receiver，登记按名直接解析（首个生效）。
             if (m.params.len == 0) try self.registerNullaryMethod(m.name, func_idx);
         }
     }
@@ -457,7 +483,25 @@ pub const ModuleCompiler = struct {
         if (m.params.len > 255) return error.Unsupported;
         var fc = FnCompiler.init(self.allocator, self);
         defer fc.deinit();
-        for (m.params) |p| _ = try fc.declareLocal(p.name, p.is_var);
+
+        // 复制所有参数名以防止它们在类型检查后被破坏
+        var param_names = std.ArrayList([]const u8).empty;
+        defer {
+            for (param_names.items) |name| {
+                self.allocator.free(name);
+            }
+            param_names.deinit(self.allocator);
+        }
+
+        for (m.params) |p| {
+            const name_copy = self.allocator.dupe(u8, p.name) catch p.name;
+            param_names.append(self.allocator, name_copy) catch {};
+        }
+
+        for (param_names.items, 0..) |name, i| {
+            _ = try fc.declareLocal(name, m.params[i].is_var);
+        }
+
         // 形参隐式定型（i8 实参 → i32 形参），镜像 compileFunction。
         try fc.emitParamCoercions(m.params, ast.exprLocation(body));
         try fc.emitTail(body);

@@ -336,6 +336,13 @@ pub fn checkTraitDecl(
     // 创建类型参数映射
     var type_param_map = std.StringHashMap(*Type).init(inferencer.allocator);
     defer type_param_map.deinit();
+
+    // 创建 Self 类型变量（表示实现该 trait 的类型）
+    const self_type_var = inferencer.freshTypeVar() catch return;
+    const old_self_type = inferencer.current_self_type;
+    defer inferencer.current_self_type = old_self_type;
+    inferencer.current_self_type = self_type_var;
+
     for (td.type_params) |tp| {
         const tv = inferencer.freshTypeVar() catch return;
         type_param_map.put(tp.name, tv) catch return;
@@ -637,3 +644,70 @@ fn isBuiltinTypeName(name: []const u8) bool {
     }
     return false;
 }
+
+/// 检查 type 声明的 trait 实现（新语法）
+/// type Point: Show, Eq = (x: i32, y: i32) { methods }
+pub fn checkTypeTraitImplementations(
+    inferencer: *TypeInferencer,
+    td: @TypeOf(@as(ast.Decl, undefined).type_decl),
+    env: *TypeEnv,
+) void {
+    // 为每个实现的 trait 进行验证
+    for (td.implemented_traits) |trait_bound| {
+        // 检查 trait 是否存在
+        const trait_info = inferencer.trait_types.getPtr(trait_bound.trait_name) orelse {
+            inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "undefined trait '{s}'", .{trait_bound.trait_name});
+            continue;
+        };
+
+        // Orphan 检查：类型和 trait 至少有一个在当前模块定义
+        const type_in_current_module = std.mem.eql(u8, inferencer.current_module, inferencer.type_defining_modules.get(td.name) orelse "");
+        const trait_in_current_module = std.mem.eql(u8, inferencer.current_module, inferencer.trait_defining_modules.get(trait_bound.trait_name) orelse "");
+
+        if (!type_in_current_module and !trait_in_current_module) {
+            inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "orphan instance: neither type '{s}' nor trait '{s}' is defined in this module", .{ td.name, trait_bound.trait_name });
+        }
+
+        // Overlapping 检查：确保没有重复实现
+        const impl_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ trait_bound.trait_name, td.name }) catch return;
+        defer inferencer.allocator.free(impl_key);
+
+        if (inferencer.registered_impls.contains(impl_key)) {
+            inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "overlapping instance: trait '{s}' is already implemented for type '{s}'", .{ trait_bound.trait_name, td.name });
+        } else {
+            const key_owned = inferencer.allocator.dupe(u8, impl_key) catch return;
+            inferencer.registered_impls.put(key_owned, ImplRecord{
+                .trait_name = trait_bound.trait_name,
+                .type_name = td.name,
+                .line = td.location.line,
+                .column = td.location.column,
+            }) catch return;
+        }
+
+        // 验证所有 trait 方法都已实现
+        for (trait_info.method_names) |required_method| {
+            var found = false;
+            for (td.methods) |method| {
+                if (std.mem.eql(u8, method.name, required_method)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "type '{s}' does not implement required method '{s}' from trait '{s}'", .{ td.name, required_method, trait_bound.trait_name });
+            }
+        }
+
+        // 将 trait 方法注册到环境中（用于方法调用解析）
+        for (trait_info.method_names) |mname| {
+            if (trait_info.method_schemes.get(mname)) |method_scheme| {
+                // 将方法注册到类型环境中
+                const method_key = std.fmt.allocPrint(inferencer.allocator, "{s}.{s}", .{ td.name, mname }) catch continue;
+                defer inferencer.allocator.free(method_key);
+
+                env.bindings.put(method_key, method_scheme) catch continue;
+            }
+        }
+    }
+}
+

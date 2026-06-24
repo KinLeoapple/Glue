@@ -1733,7 +1733,7 @@ pub const Evaluator = struct {
                 .trait_decl => |t| t.visibility,
                 .pack_decl => |p| p.visibility,
                 .impl_decl => |i| i.visibility,
-                .use_decl => |u| u.visibility,
+                .import_decl => |u| u.visibility,
                 .expr_decl => |ed| blk: {
                     if (ed.stmt) |s| {
                         break :blk switch (s.*) {
@@ -1751,7 +1751,7 @@ pub const Evaluator = struct {
                 .trait_decl => |t| t.name,
                 .pack_decl => |p| p.name,
                 .impl_decl => |i| i.trait_name,
-                .use_decl => null,
+                .import_decl => null,
                 .expr_decl => |ed| blk: {
                     if (ed.stmt) |s| {
                         break :blk switch (s.*) {
@@ -1812,11 +1812,11 @@ pub const Evaluator = struct {
         // 先加载并检查所有 use 依赖。这样依赖模块的导出函数 scheme 会被
         // 注册到 type_inferencer.exported_schemes，本模块的类型检查才能
         // 解析这些导入名字。依赖的运行时值也会在此一并求值（共享 global_env），
-        // 后续本模块求值时 use_decl 只是从导出表引用已存在的值。
+        // 后续本模块求值时 import_decl 只是从导出表引用已存在的值。
         // loading_modules 已包含本模块名，依赖若反向 use 本模块会触发循环依赖错误。
         for (module.declarations) |decl| {
-            if (decl == .use_decl) {
-                const ud = decl.use_decl;
+            if (decl == .import_decl) {
+                const ud = decl.import_decl;
                 if (ud.module_path.len == 0) continue;
                 if (self.loaded_modules.contains(ud.module_path[0])) continue;
                 if (self.loading_modules.contains(ud.module_path[0])) return error.CircularDependency;
@@ -2433,7 +2433,7 @@ pub const Evaluator = struct {
                     }
                 }
             },
-            .use_decl => |ud| {
+            .import_decl => |ud| {
                 // 模块循环依赖检测
                 if (ud.module_path.len > 0) {
                     const target_module = ud.module_path[0];
@@ -5671,8 +5671,8 @@ pub const Evaluator = struct {
     /// 不到依赖；VM 编译器自包含按名字解析，无需 name_id。失败（找不到模块等）返回 error，调用方回退。
     pub fn collectUseDependencies(self: *Evaluator, module: ast.Module, out: *std.ArrayList(ast.Module), seen: *std.StringHashMap(void)) anyerror!void {
         for (module.declarations) |decl| {
-            if (decl != .use_decl) continue;
-            const ud = decl.use_decl;
+            if (decl != .import_decl) continue;
+            const ud = decl.import_decl;
             if (ud.module_path.len != 1) return error.UnsupportedUsePath; // 仅单段模块名（stdlib / 同目录）
             const mod_name = ud.module_path[0];
             if (seen.contains(mod_name)) continue;

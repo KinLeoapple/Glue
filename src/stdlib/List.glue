@@ -1,11 +1,22 @@
 // Glue 标准库：函数式链表 List<T>
 //
 // 文档 D67：List 属于 std 库，核心语言只提供 T[]。本模块用 Glue 自身实现，
-// 经 @embedFile 内嵌进解释器二进制，`use List` 即可导入（零安装、与 cwd 无关）。
+// 经 @embedFile 内嵌进解释器二进制，`import List` 即可导入（零安装、与 cwd 无关）。
 //
 // 所有算子均为递归实现（已验证递归泛型 ADT + 高阶函数参数可用）。
 
-pub type List<T> = | Nil | Cons(T, List<T>)
+// Show trait 来自 Compare 模块；List 类型在本模块定义，故不违反 orphan 规则。
+import Compare
+
+// 条件实现：元素满足 Show 时，List<T> 也满足 Show（参数化条件实现）。
+pub type List<T>: Show = | Nil | Cons(T, List<T>) with Show<T> {
+    fun show(self): str {
+        match self {
+            Nil => "[]"
+            Cons(h, t) => h.show() + " :: " + t.show()
+        }
+    }
+}
 
 // 链表长度。
 pub fun length<T>(l: List<T>): i64 {
@@ -107,19 +118,6 @@ fun from_array_at<T>(a: T[], i: i64): List<T> {
         Nil
     } else {
         Cons(a[i], from_array_at(a, i + 1))
-    }
-}
-
-// 条件实现：元素满足 Show 时，List<T> 也满足 Show（参数化条件 impl）。
-// Show trait 来自 Compare 模块；List 类型在本模块定义，故不违反 orphan 规则。
-use Compare
-
-pub impl Show<List<T>> with Show<T> {
-    fun show(self): str {
-        match self {
-            Nil => "[]"
-            Cons(h, t) => h.show() + " :: " + t.show()
-        }
     }
 }
 

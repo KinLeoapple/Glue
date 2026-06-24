@@ -1,0 +1,14 @@
+trait Greet {
+    fun hello(self): str
+}
+
+type Cat: Greet = Cat(name: str) {
+    fun hello(self): str {
+        self.name
+    }
+}
+
+fun main() {
+    val c = Cat("Whiskers")
+    println(c.hello())
+}

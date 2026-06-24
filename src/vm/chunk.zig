@@ -233,6 +233,12 @@ pub const Program = struct {
         self.record_shapes.deinit(self.allocator);
         self.newtype_ctors.deinit(self.allocator);
         self.error_ctors.deinit(self.allocator);
+        // 释放 impl_methods 中复制的字符串
+        for (self.impl_methods.items) |m| {
+            self.allocator.free(m.type_name);
+            self.allocator.free(m.method_name);
+            self.allocator.free(m.trait_name);
+        }
         self.impl_methods.deinit(self.allocator);
         self.trait_defaults.deinit(self.allocator);
         self.trait_parents.deinit(self.allocator);
@@ -288,10 +294,15 @@ pub const Program = struct {
 
     /// 登记一个 impl 方法（M5i）。type_name/method_name/trait_name 借用 AST。
     pub fn addImplMethod(self: *Program, type_name: []const u8, method_name: []const u8, trait_name: []const u8, func_idx: u16) !void {
+        // 复制字符串以确保生命周期独立于源代码
+        const type_name_copy = try self.allocator.dupe(u8, type_name);
+        const method_name_copy = try self.allocator.dupe(u8, method_name);
+        const trait_name_copy = try self.allocator.dupe(u8, trait_name);
+
         try self.impl_methods.append(self.allocator, .{
-            .type_name = type_name,
-            .method_name = method_name,
-            .trait_name = trait_name,
+            .type_name = type_name_copy,
+            .method_name = method_name_copy,
+            .trait_name = trait_name_copy,
             .func_idx = func_idx,
         });
     }

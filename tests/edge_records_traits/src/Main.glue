@@ -1,6 +1,16 @@
 // Edge cases: records (width subtyping, update/extend), generic ADTs, trait dispatch, GADT
 
-type Ordering = | Lt | Eq | Gt
+type Ordering: Greet, Sizeable = | Lt | Eq | Gt {
+    fun name(self): str {
+        match self {
+            Lt => "less"
+            Eq => "equal"
+            Gt => "greater"
+        }
+    }
+
+    fun sz(self): i32 { 1 }
+}
 
 // generic ADT with two type params
 type Pair<A, B> = Pair(first: A, second: B)
@@ -16,27 +26,12 @@ trait Greet {
     }
 }
 
-impl Greet<Ordering> {
-    fun name(self): str {
-        match self {
-            Lt => "less"
-            Eq => "equal"
-            Gt => "greater"
-        }
-    }
-}
-
 // trait dispatched by receiver type (two impls, same method name)
 trait Sizeable {
     fun sz(self): i32
 }
 
-impl Sizeable<Ordering> {
-    fun sz(self): i32 { 1 }
-}
-
-type Color = | Red | Green | Blue
-impl Sizeable<Color> {
+type Color: Sizeable = | Red | Green | Blue {
     fun sz(self): i32 { 3 }
 }
 

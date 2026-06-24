@@ -561,6 +561,8 @@ pub const TypeInferencer = struct {
     /// 作为回退，使内层 `fun go(x: List<T>)` 中的 T 绑定到外层泛型函数的同一类型变量，
     /// 而非被当成未知 ADT。仅在检查泛型函数体期间非 null。
     current_type_params: ?*const std.StringHashMap(*Type) = null,
+    /// 当前正在检查的类型（用于 Self 类型解析）
+    current_self_type: ?*Type = null,
     /// 当前模块名（用于 Orphan 检查）
     current_module: []const u8 = "",
     /// Trait 定义模块记录（trait_name -> 定义它的模块名）
@@ -2930,6 +2932,15 @@ pub const TypeInferencer = struct {
                 // 未知命名类型，返回 ADT 类型占位
                 return self.makeAdtType(n.name, &[_]*Type{});
             },
+            .self_type => |s| {
+                // Self 类型：在 trait 或 type 方法中指代当前类型
+                if (self.current_self_type) |self_ty| {
+                    return self_ty;
+                }
+                // 如果不在类型或 trait 方法上下文中使用 Self，报错
+                self.addErrorAt(.type_mismatch, s.location.line, s.location.column, "Self type can only be used within type or trait methods", .{});
+                return self.makeType(.unit_type);
+            },
             .generic => |g| {
                 var args = try self.allocator.alloc(*Type, g.args.len);
                 for (g.args, 0..) |arg, i| {
@@ -3045,8 +3056,8 @@ pub const TypeInferencer = struct {
         // （由 evalModule 在检查本模块前预加载依赖来保证），其导出 scheme
         // 存于 self.exported_schemes。
         for (module.declarations) |decl| {
-            if (decl == .use_decl) {
-                self.importUseDecl(decl.use_decl, &env);
+            if (decl == .import_decl) {
+                self.importUseDecl(decl.import_decl, &env);
             }
         }
         // 文档 §2.16: 同层级禁止重复定义——val/var/fun/type/trait 不允许同名。
@@ -3130,7 +3141,7 @@ pub const TypeInferencer = struct {
                         else => {},
                     }
                 },
-                .use_decl => |ud| {
+                .import_decl => |ud| {
                     // pub use Mod.{a, b} — 把再导出符号也登记在当前模块名下
                     if (ud.visibility != .public) continue;
                     if (ud.items) |items| {
@@ -4074,6 +4085,92 @@ pub const TypeInferencer = struct {
                         }
                     },
                 }
+
+                // 检查 type 中定义的方法（新语法）
+                if (td.methods.len > 0) {
+                    // 获取或创建此类型的 Type 对象
+                    const self_type = if (self.adt_types.get(td.name)) |info| info.ty else null;
+
+                    if (self_type) |st| {
+                        // 保存旧的 current_self_type
+                        const old_self_type = self.current_self_type;
+                        defer self.current_self_type = old_self_type;
+
+                        // 设置当前 Self 类型
+                        self.current_self_type = st;
+
+                        // 检查每个方法
+                        for (td.methods) |method| {
+                            // 创建类型参数映射
+                            var type_param_map = std.StringHashMap(*Type).init(self.allocator);
+                            defer type_param_map.deinit();
+
+                            // 添加类型的类型参数
+                            for (td.type_params) |tp| {
+                                const tv = self.freshTypeVar() catch continue;
+                                type_param_map.put(tp.name, tv) catch continue;
+                            }
+
+                            // 添加方法的类型参数
+                            for (method.type_params) |tp| {
+                                const tv = self.freshTypeVar() catch continue;
+                                type_param_map.put(tp.name, tv) catch continue;
+                            }
+
+                            // 保存旧的 current_type_params
+                            const old_type_params = self.current_type_params;
+                            defer self.current_type_params = old_type_params;
+                            self.current_type_params = &type_param_map;
+
+                            // 检查方法体（如果有）
+                            if (method.body) |body| {
+                                // 创建方法的环境
+                                var method_env = TypeEnv.init(self.allocator);
+                                defer method_env.deinit();
+
+                                // 添加参数到环境
+                                for (method.params) |param| {
+                                    const param_ty = if (param.type_annotation) |ty|
+                                        self.typeFromAstWithParams(ty, &type_param_map) catch self.freshTypeVar() catch continue
+                                    else
+                                        self.freshTypeVar() catch continue;
+                                    const scheme = TypeScheme{
+                                        .quantified_vars = &[_]usize{},
+                                        .ty = param_ty,
+                                        .bounds = &[_]BoundInfo{},
+                                    };
+                                    method_env.bindings.put(param.name, scheme) catch continue;
+                                }
+
+                                // 设置返回类型
+                                const return_ty = if (method.return_type) |rt|
+                                    self.typeFromAstWithParams(rt, &type_param_map) catch self.freshTypeVar() catch continue
+                                else
+                                    self.freshTypeVar() catch continue;
+
+                                const old_return_type = self.current_fn_return_type;
+                                defer self.current_fn_return_type = old_return_type;
+                                self.current_fn_return_type = return_ty;
+
+                                // 推断方法体类型
+                                const body_ty = self.inferExpr(body, &method_env, return_ty) catch |err| {
+                                    self.reportInferError(err, method.location);
+                                    continue;
+                                };
+
+                                // 统一方法体类型和返回类型
+                                self.unify(body_ty, return_ty) catch |err| {
+                                    self.reportInferError(err, method.location);
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // 检查 trait 实现（新语法）
+                if (td.implemented_traits.len > 0) {
+                    trait_resolve.checkTypeTraitImplementations(self, td, env);
+                }
             },
             .trait_decl => |td| {
                 trait_resolve.checkTraitDecl(self, td);
@@ -4081,7 +4178,7 @@ pub const TypeInferencer = struct {
             .impl_decl => |id| {
                 trait_resolve.checkImplDecl(self, id, env);
             },
-            .use_decl => {
+            .import_decl => {
                 // use 声明：类型检查在模块加载时处理
             },
             .pack_decl => {

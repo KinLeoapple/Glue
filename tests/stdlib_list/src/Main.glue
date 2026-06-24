@@ -1,7 +1,7 @@
 // 回归：内嵌标准库 List（@embedFile，文档 D67）。
 // 验证 use List 加载内嵌模块 + map/filter/foldl/foldr/length/reverse/append/elem/from_array。
 // 结果用 Panic 自断言，错误即非零退出，run_tests.sh 据此判失败。
-use List
+import List
 
 fun check(cond: bool, label: str): Unit {
     if (!cond) { Panic("assertion failed: " + label) } else { println("ok: " + label) }
