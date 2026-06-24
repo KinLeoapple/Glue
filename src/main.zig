@@ -49,24 +49,15 @@ const MANIFEST_NAME = "glue.toml";
 const DEFAULT_ENTRY = "src/Main.glue";
 
 // ============================================================
-// M5：字节码 VM 接入开关（进程级，main 启动时从环境变量初始化一次）
+// VM 追踪开关（用于调试）
 // ============================================================
 
-/// VM 路径默认开启（回退兜底保证正确）。`GLUE_VM=0` 关闭，全程走树遍历器。
-var vm_enabled: bool = true;
-/// `GLUE_VM_TRACE=1`：向 stderr 打印每个模块是 ran-VM 还是 fell-back（覆盖率度量）。
+/// `GLUE_VM_TRACE=1`：向 stderr 打印 VM 执行信息（调试用）。
 var vm_trace: bool = false;
 
-fn vmEnabled() bool {
-    return vm_enabled;
-}
-
-/// 从环境变量初始化 VM 开关。env 为 null（无 environ）时保持默认。
+/// 从环境变量初始化 VM 追踪开关。env 为 null（无 environ）时保持默认。
 fn initVmFlags(env: ?*std.process.Environ.Map) void {
     const e = env orelse return;
-    if (e.get("GLUE_VM")) |v| {
-        if (std.mem.eql(u8, v, "0")) vm_enabled = false;
-    }
     if (e.get("GLUE_VM_TRACE")) |v| {
         if (std.mem.eql(u8, v, "1")) vm_trace = true;
     }
@@ -425,51 +416,22 @@ fn invokeMain(ev: *eval.Evaluator, io: std.Io, entry_path: []const u8, trace: bo
 // ============================================================
 
 /// tryRunOnVM 的结果。
-/// - ran_main：VM 已编译并执行 main（含 println 等副作用），调用方跳过 invokeMain。
-/// - fell_back：模块未尝试 VM（不 eligible），准备阶段未跑，调用方走完整 evalModule。
-/// - fell_back_prepared：VM eligible 但编译/运行不支持；prepareModuleForVm 已跑完准备阶段，
-///   调用方须走 evalModulePrepared（跳过重复准备，否则类型检查器误报 duplicate type）。
-/// - failed：准备阶段（类型检查）失败或 VM 运行期 panic（已报告），调用方非零退出。
-const VmOutcome = enum { ran_main, fell_back, fell_back_prepared, failed };
+/// - ran_main：VM 已编译并执行 main（含 println 等副作用）。
+/// - failed：准备阶段（类型检查）失败或 VM 运行期 panic（已报告）。
+const VmOutcome = enum { ran_main, failed };
 
-/// 保守的 VM 资格预扫描：仅当所有顶层声明都是 VM 编译器能完整处理的种类时才尝试 VM。
-/// `compileModule` 对 use/trait/impl/pack/顶层 val/record 等是**静默跳过**（else => {}），
-/// 若不预扫描，这些模块会编出残缺 Program（如顶层 val 副作用丢失、main 引用导入名失败）。
-/// 预扫描确保只有 fun + adt/newtype + 无副作用裸表达式构成的模块进 VM，其余整体回退。
+/// VM 资格检查：确保模块有 main 函数
+/// VM 编译器现在处理所有声明类型，不再需要保守的预扫描
 fn vmEligible(module: ast.Module) bool {
-    var has_main = false;
     for (module.declarations) |decl| {
         switch (decl) {
             .fun_decl => |f| {
-                if (std.mem.eql(u8, f.name, "main")) has_main = true;
+                if (std.mem.eql(u8, f.name, "main")) return true;
             },
-            .type_decl => |td| switch (td.def) {
-                // VM 编译器登记 adt/newtype/error_newtype 构造器；alias 无运行时效果（仅类型注解用，
-                // 编译器忽略）→ 安全 eligible。record/gadt 未支持 → 回退。
-                .adt, .newtype, .alias, .error_newtype => {},
-                else => return false,
-            },
-            // 裸表达式语句（无 stmt）在模块级不执行（文档 D13），VM 与树遍历器一致跳过 → 安全。
-            // M5g：带 stmt 的顶层 val/var 现由 VM 全局变量支持 → eligible。
-            .expr_decl => |ed| {
-                if (ed.stmt) |s| switch (s.*) {
-                    .val_decl, .var_decl => {},
-                    else => return false,
-                };
-            },
-            // M5h：顶层 trait 声明无运行时效果（VM 编译器忽略；inline trait 值自带 vtable，
-            // 不依赖 trait 注册表）。无 impl 时 trait 默认方法不可达 → 安全 eligible。
-            // 含 impl 的模块仍由 impl_decl 触发回退（下方 else）。
-            .trait_decl => {},
-            // M5i：impl 块由 VM 编译为方法函数 + 注册进 program.impl_methods（OP_CALL_METHOD 分派）。
-            .impl_decl => {},
-            // M5j：单段 use 导入（stdlib / 同目录模块）由 VM 编译依赖模块进同一 Program。多段路径回退。
-            .import_decl => |ud| if (ud.module_path.len != 1) return false,
-            // pack：VM 无对应运行时 → 回退。
-            else => return false,
+            else => {},
         }
     }
-    return has_main;
+    return false;
 }
 
 /// 尝试在字节码 VM 上整体编译并执行模块（含 main）。
@@ -482,33 +444,29 @@ fn tryRunOnVM(
     filename: []const u8,
 ) VmOutcome {
     if (!vmEligible(module)) {
-        if (vm_trace) printErr(io, "[vm] {s}: fell back (unsupported top-level decl)\n", .{filename});
-        return .fell_back;
+        printErr(io, "{s}: error: no 'main' function found\n", .{filename});
+        return .failed;
     }
 
-    // 准备阶段：use 预加载（此处无 use）+ 类型检查 + resolve。与树遍历器同一逻辑。
+    // 准备阶段：use 预加载 + 类型检查 + resolve
     ev.prepareModuleForVm(module) catch |err| switch (err) {
-        // 类型检查失败：错误已打印；同树遍历器路径以非零退出，不回退（回退也会同样失败）。
         error.TypeCheckFailed => return .failed,
         error.CircularDependency => {
             printErr(io, "{s}: error: circular module dependency\n", .{filename});
             return .failed;
         },
         else => {
-            // 准备阶段其它错误（OOM 等）→ 回退树遍历器，让其走完整错误处理。
-            if (vm_trace) printErr(io, "[vm] {s}: fell back (prepare error: {s})\n", .{ filename, @errorName(err) });
-            return .fell_back;
+            printErr(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
+            return .failed;
         },
     };
 
-    // 编译模块 → Program。任何 Unsupported → 回退（准备阶段已完成 → fell_back_prepared）。
+    // 编译模块 → Program
     var mc = vm.ModuleCompiler.init(allocator);
     defer mc.deinit();
     defer mc.program.deinit();
 
-    // M5j：收集 `use` 依赖模块的已解析 AST（递归传递依赖，定义先于使用），编进同一 Program。
-    // M5o：依赖收集前设置 current_source_dir（prepareModuleForVm 的 defer 已将其清空），使
-    // 目录模块的 pub pack 子模块（Store/Memory.glue）能按入口文件目录解析。
+    // 收集 use 依赖模块
     if (module.source_path) |sp| {
         const sep_idx = std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep) orelse
             std.mem.lastIndexOfScalar(u8, sp, '/');
@@ -523,25 +481,24 @@ fn tryRunOnVM(
         seen.deinit();
     }
     ev.collectUseDependencies(module, &deps, &seen) catch |err| {
-        if (vm_trace) printErr(io, "[vm] {s}: fell back (use deps: {s})\n", .{ filename, @errorName(err) });
-        return .fell_back_prepared;
+        printErr(io, "{s}: error: dependency collection failed: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
     };
 
     mc.compileModuleWithDeps(&module, deps.items) catch |err| {
-        if (vm_trace) printErr(io, "[vm] {s}: fell back (compile: {s})\n", .{ filename, @errorName(err) });
-        return .fell_back_prepared;
+        printErr(io, "{s}: error: compilation failed: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
     };
 
     const entry = mc.lookupFn("main") orelse {
-        if (vm_trace) printErr(io, "[vm] {s}: fell back (no main)\n", .{filename});
-        return .fell_back_prepared;
+        printErr(io, "{s}: error: 'main' function not found after compilation\n", .{filename});
+        return .failed;
     };
 
-    // 执行：main arity 0。值分配器与树遍历器同源（leak 检测可达 VM 路径）。
+    // 执行 main
     var machine = vm.VM.initWithIo(ev.value_allocator, io);
     defer machine.deinit();
     const result = machine.call(&mc.program, entry, &.{}) catch |err| {
-        // VM 运行期错误：用 err_loc/err_msg 报告（同 invokeMain 的 runtime panic 风格）。
         const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
         const loc: ?ast.SourceLocation = if (machine.err_loc.line > 0) machine.err_loc else null;
         var err_buf: [4096]u8 = undefined;
@@ -656,59 +613,11 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
     var entry_module = module;
     entry_module.source_path = filename;
 
-    // M5：先尝试字节码 VM 路径（VM-eligible 模块整体编译+执行；含 main）。
-    // 不支持的特性（use/trait/impl/顶层 val/HKT/...）整体回退树遍历器，语义不变。
-    var skip_prepare = false; // 回退时是否跳过准备阶段（VM 已 prepareModuleForVm）。
-    if (vmEnabled()) {
-        switch (tryRunOnVM(allocator, ev, io, entry_module, filename)) {
-            .ran_main => return .ran_main, // VM 已执行 main，调用方跳过 invokeMain
-            .failed => return .failed, // VM 运行期 panic / 类型检查失败（已报告）
-            .fell_back => {}, // 未尝试 VM：走完整 evalModule（含准备阶段）
-            .fell_back_prepared => skip_prepare = true, // VM 已准备：走 evalModulePrepared
-        }
+    // VM-only路径：直接在字节码VM上编译并执行模块
+    switch (tryRunOnVM(allocator, ev, io, entry_module, filename)) {
+        .ran_main => return .ran_main,
+        .failed => return .failed,
     }
-
-    const eval_result = if (skip_prepare)
-        ev.evalModulePrepared(entry_module)
-    else
-        ev.evalModule(entry_module);
-
-    eval_result catch |err| switch (err) {
-        error.GluePanic => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            const msg = ev.panic_message orelse "unknown error";
-            printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime panic", msg);
-            stderr_writer.flush() catch {};
-            ev.panic_message = null;
-            return .failed;
-        },
-        error.CircularDependency => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("{s}: error: circular module dependency\n", .{filename}) catch {};
-            stderr_writer.flush() catch {};
-            return .failed;
-        },
-        // 类型检查失败：错误已在 evalModule 内打印到 stderr，这里只需标记失败
-        // （返回 true → 不调 callMain，避免 "undefined entry point" 误报）。
-        error.TypeCheckFailed => return .failed,
-        error.AmbiguousModule => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("{s}: error: ambiguous module — both a flat file 'Mod.glue' and a directory module 'Mod/pack.glue' exist; remove one\n", .{filename}) catch {};
-            stderr_writer.flush() catch {};
-            return .failed;
-        },
-        else => {
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            printRuntimeDiag(&stderr_writer.interface, filename, ev.panic_location, "runtime error", runtimeErrorMessage(err, ev.panic_message));
-            stderr_writer.flush() catch {};
-            return .failed;
-        },
-    };
-    return .needs_main;
 }
 
 fn setWindowsConsoleUtf8() void {
