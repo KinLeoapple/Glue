@@ -63,19 +63,11 @@ pub fn tryWidenUnify(inferencer: *TypeInferencer, t1: *Type, t2: *Type) SemaErro
     if (inferencer.unify(r1, r2)) {
         return r1;
     } else |_| {
-        // Try integer/float widening
+        // 文档 §2.15: 类型转换必须显式，数值类型之间无隐式转换
+        // widening（低位转高位）和 narrowing（高位转低位）都需要显式 Type(value) 语法
+        // 移除了自动数值类型提升逻辑，确保类型严格匹配
         if (r1.isNumericType() and r2.isNumericType()) {
-            // 数值类型之间的 widening
-            // 如果 t1 是更宽的类型（目标类型注解），t2 是更窄的类型（推断类型），允许
-            if (inferencer.isWidening(r1, r2)) {
-                return r1;
-            }
-            // 反方向也允许（推断类型更宽，注解类型更窄 — narrowing 需要运行时检查）
-            // 在 Sema 层面，我们只做类型兼容性检查，narrowing 由求值器处理
-            if (inferencer.isWidening(r2, r1)) {
-                return r2;
-            }
-            // 两个数值类型之间没有 widening 关系
+            // 数值类型不匹配，必须显式转换
             return error.TypeMismatch;
         }
         // Try auto-widening for nullable/throw

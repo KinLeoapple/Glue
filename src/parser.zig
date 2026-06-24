@@ -2979,10 +2979,10 @@ pub const Parser = struct {
     }
 
     fn parseOrPattern(self: *Parser) ParserError!*ast.Pattern {
-        var left = try self.parseGuardPattern();
+        var left = try self.parsePrimaryPattern();
         while (self.matchToken(.pipe)) {
             const pipe_tok = self.previous();
-            const right = try self.parseGuardPattern();
+            const right = try self.parsePrimaryPattern();
             left = try self.allocPattern(ast.Pattern{
                 .or_pattern = .{
                     .location = tokenLoc(pipe_tok),

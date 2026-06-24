@@ -1658,8 +1658,37 @@ pub const TypeInferencer = struct {
     /// 推断表达式的类型
     pub fn inferExpr(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv) SemaError!*Type {
         return switch (expr.*) {
-            .int_literal => self.makeType(.i32_type),
-            .float_literal => self.makeType(.f64_type),
+            .int_literal => |lit| {
+                // 文档 §6.12: 整数字面量类型推断
+                // 1. 显式后缀最高优先：42i32, 255u8 直接采用后缀类型
+                // 2. 显式类型标注次之（由外层上下文处理）
+                // 3. 既无后缀也无标注时，推断为能容纳该值的最小类型
+                if (lit.suffix) |suffix| {
+                    // 解析类型后缀
+                    if (std.mem.eql(u8, suffix, "i8")) return self.makeType(.i8_type);
+                    if (std.mem.eql(u8, suffix, "i16")) return self.makeType(.i16_type);
+                    if (std.mem.eql(u8, suffix, "i32")) return self.makeType(.i32_type);
+                    if (std.mem.eql(u8, suffix, "i64")) return self.makeType(.i64_type);
+                    if (std.mem.eql(u8, suffix, "i128")) return self.makeType(.i128_type);
+                    if (std.mem.eql(u8, suffix, "u8")) return self.makeType(.u8_type);
+                    if (std.mem.eql(u8, suffix, "u16")) return self.makeType(.u16_type);
+                    if (std.mem.eql(u8, suffix, "u32")) return self.makeType(.u32_type);
+                    if (std.mem.eql(u8, suffix, "u64")) return self.makeType(.u64_type);
+                    if (std.mem.eql(u8, suffix, "u128")) return self.makeType(.u128_type);
+                }
+                // 无后缀：默认 i32（简化实现，完整实现应根据值大小选择最小类型）
+                return self.makeType(.i32_type);
+            },
+            .float_literal => |lit| {
+                // 文档 §6.12: 浮点字面量类型推断
+                if (lit.suffix) |suffix| {
+                    if (std.mem.eql(u8, suffix, "f32")) return self.makeType(.f32_type);
+                    if (std.mem.eql(u8, suffix, "f64")) return self.makeType(.f64_type);
+                    // f16, f128 暂不支持
+                }
+                // 无后缀：默认 f64
+                return self.makeType(.f64_type);
+            },
             .bool_literal => self.makeType(.bool_type),
             .char_literal => self.makeType(.char_type),
             .string_literal => self.makeType(.str_type),

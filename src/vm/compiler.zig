@@ -1862,6 +1862,14 @@ const FnCompiler = struct {
             // M3c：throw e —— 重放所有活跃 defer + 求值 e（throw_val.err / error_val）+ OP_THROW。
             .throw_stmt => |t| {
                 try self.emitExpr(t.expr);
+                // 文档 §2.4.5: throw 只能抛出满足 Error trait 的值
+                // Error(msg) 是内建构造器，创建 throw_val.err
+                // 查找 Error 内建函数
+                if (self.module.lookupFn("Error")) |err_idx| {
+                    try self.chunk.writeOp(.op_call, t.location);
+                    try self.chunk.writeU16(err_idx);
+                    try self.chunk.writeByte(1); // argc = 1
+                }
                 try self.replayAllDefers(t.location);
                 try self.chunk.writeOp(.op_throw, t.location);
             },
