@@ -1648,20 +1648,18 @@ pub const Evaluator = struct {
     /// 仅在文件模式下调用（REPL 不调用）。
     /// 如果未找到 main，返回 error.MissingMain。
     /// 如果找到但不可调用，返回 error.TypeMismatch。
-    pub fn callMain(self: *Evaluator) EvalResult!Value {
-        const main_var = self.global_env.get(self.internName("main")) orelse return error.MissingMain;
-        switch (main_var.value) {
-            .closure, .builtin, .partial => {
-                return self.callFunction(main_var.value, &[_]Value{}, null);
-            },
-            else => return error.TypeMismatch,
-        }
-    }
-
     // ============================================================
-    // 模块求值
+    // 模块求值（Tree Walker - 已废弃，VM-only架构）
     // ============================================================
+    // 注意：以下 evalModule* 函数是 Tree Walker 执行函数，现已被 VM 替代。
+    // 这些函数仍被 prepareModuleForVm 的依赖加载路径间接使用（通过 evalSourceModule），
+    // 但实际执行路径（声明求值）不再被调用。
+    //
+    // TODO: 未来重构将这些函数拆分为：
+    //   - 模块加载器（解析+类型检查，VM需要）
+    //   - Tree Walker执行代码（可以移除）
 
+    /// DEPRECATED: Tree Walker 模块执行入口（VM-only架构不再使用）
     pub fn evalModule(self: *Evaluator, module: ast.Module) !void {
         return self.evalModuleImpl(module, false);
     }
@@ -1669,10 +1667,13 @@ pub const Evaluator = struct {
     /// M5：VM 回退入口。VM 路径已调用 prepareModuleForVm（use 预加载 + 类型检查 + resolve），
     /// 类型检查器的 adt_types/trait 注册表不随 resetForNextModule 清空，再跑一次会误报 duplicate。
     /// 故回退时跳过准备阶段，只求值声明体。
+    /// DEPRECATED: Tree Walker 模块执行入口（VM-only架构不再使用）
     pub fn evalModulePrepared(self: *Evaluator, module: ast.Module) !void {
         return self.evalModuleImpl(module, true);
     }
 
+    /// DEPRECATED: Tree Walker 模块执行实现（VM-only架构不再使用）
+    /// 注意：此函数仍被 evalSourceModule 调用用于依赖加载，但只执行类型检查部分
     fn evalModuleImpl(self: *Evaluator, module: ast.Module, skip_prepare: bool) !void {
         const module_name = module.name;
 
@@ -1951,6 +1952,11 @@ pub const Evaluator = struct {
         }
     }
 
+    // ============================================================
+    // 声明求值（Tree Walker - 已废弃，VM-only架构）
+    // ============================================================
+
+    /// DEPRECATED: Tree Walker 声明执行（VM-only架构不再使用）
     pub fn evalDecl(self: *Evaluator, decl: ast.Decl, environment: *Environment) !void {
         switch (decl) {
             .fun_decl => |f| {
@@ -2561,9 +2567,10 @@ pub const Evaluator = struct {
     }
 
     // ============================================================
-    // 表达式求值
+    // 表达式求值（Tree Walker - 已废弃，VM-only架构）
     // ============================================================
 
+    /// DEPRECATED: Tree Walker 表达式执行（VM-only架构不再使用）
     pub fn evalExpr(self: *Evaluator, expr: *const ast.Expr, environment: *Environment) EvalResult!Value {
         // 记录当前表达式位置（覆盖式）。panic 发生时，最近一次更新即最内层正在求值的
         // 表达式，用于运行时错误报告行列。
@@ -5255,9 +5262,10 @@ pub const Evaluator = struct {
     }
 
     // ============================================================
-    // 语句执行
+    // 语句执行（Tree Walker - 已废弃，VM-only架构）
     // ============================================================
 
+    /// DEPRECATED: Tree Walker 语句执行（VM-only架构不再使用）
     pub fn evalStmt(self: *Evaluator, stmt: *const ast.Stmt, environment: *Environment, defer_stack: ?*std.ArrayList(*const ast.Expr)) EvalResult!?Value {
         return switch (stmt.*) {
             .val_decl => |vd| {
@@ -6109,6 +6117,8 @@ fn floatToInt(val: f128, comptime T: type) EvalResult!Value {
 // ============================================================
 
 /// 解析并求值表达式字符串
+/// DEPRECATED: Tree Walker 源码执行（VM-only架构不再使用）
+/// 仅供测试使用
 pub fn evalSource(allocator: std.mem.Allocator, source: []const u8) !Value {
     const lexer_mod = @import("lexer");
     const parser_mod = @import("parser");
