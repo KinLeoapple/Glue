@@ -1,14 +1,34 @@
 trait Greet {
     fun hello(self): str
+    fun greet(self, name: str): str
 }
 
 type Cat: Greet = Cat(name: str) {
     fun hello(self): str {
         self.name
     }
+
+    fun greet(self, greeting: str): str {
+        greeting + ", " + self.name
+    }
+}
+
+type Dog: Greet = Dog(name: str, age: i32) {
+    fun hello(self): str {
+        self.name + " (age: " + str(self.age) + ")"
+    }
+
+    fun greet(self, greeting: str): str {
+        greeting + ", I'm " + self.name
+    }
 }
 
 fun main() {
-    val c = Cat("Whiskers")
-    println(c.hello())
+    val cat = Cat("Whiskers")
+    println(cat.hello())
+    println(cat.greet("Hello"))
+
+    val dog = Dog("Buddy", 5)
+    println(dog.hello())
+    println(dog.greet("Hi"))
 }

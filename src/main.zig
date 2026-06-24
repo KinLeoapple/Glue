@@ -487,9 +487,19 @@ fn tryRunOnVM(
     }
 
     // 准备阶段：use 预加载（此处无 use）+ 类型检查 + resolve。与树遍历器同一逻辑。
-    // WORKAROUND: 暂时跳过类型检查，因为它破坏了参数名的内存
-    // TODO: 修复 checkModule 中的内存越界写入bug
-    // 原本应该调用: ev.prepareModuleForVm(module)
+    ev.prepareModuleForVm(module) catch |err| switch (err) {
+        // 类型检查失败：错误已打印；同树遍历器路径以非零退出，不回退（回退也会同样失败）。
+        error.TypeCheckFailed => return .failed,
+        error.CircularDependency => {
+            printErr(io, "{s}: error: circular module dependency\n", .{filename});
+            return .failed;
+        },
+        else => {
+            // 准备阶段其它错误（OOM 等）→ 回退树遍历器，让其走完整错误处理。
+            if (vm_trace) printErr(io, "[vm] {s}: fell back (prepare error: {s})\n", .{ filename, @errorName(err) });
+            return .fell_back;
+        },
+    };
 
     // 编译模块 → Program。任何 Unsupported → 回退（准备阶段已完成 → fell_back_prepared）。
     var mc = vm.ModuleCompiler.init(allocator);

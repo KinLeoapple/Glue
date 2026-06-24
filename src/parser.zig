@@ -1199,8 +1199,6 @@ pub const Parser = struct {
         }
 
         const name_tok = try self.expect(.identifier, "expected parameter name");
-        // 复制参数名以确保生命周期独立于源代码
-        const name_copy = try self.allocator.dupe(u8, name_tok.lexeme);
 
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
@@ -1213,7 +1211,7 @@ pub const Parser = struct {
 
         return ast.Param{
             .location = tokenLoc(name_tok),
-            .name = name_copy,
+            .name = name_tok.lexeme,
             .type_annotation = type_annotation,
             .is_var = is_var,
         };

@@ -4139,7 +4139,8 @@ pub const TypeInferencer = struct {
                                         .ty = param_ty,
                                         .bounds = &[_]BoundInfo{},
                                     };
-                                    method_env.bindings.put(param.name, scheme) catch continue;
+                                    // 使用 define 而不是直接 put，以确保复制键
+                                    method_env.define(param.name, scheme) catch continue;
                                 }
 
                                 // 设置返回类型

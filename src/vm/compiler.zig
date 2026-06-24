@@ -484,22 +484,8 @@ pub const ModuleCompiler = struct {
         var fc = FnCompiler.init(self.allocator, self);
         defer fc.deinit();
 
-        // 复制所有参数名以防止它们在类型检查后被破坏
-        var param_names = std.ArrayList([]const u8).empty;
-        defer {
-            for (param_names.items) |name| {
-                self.allocator.free(name);
-            }
-            param_names.deinit(self.allocator);
-        }
-
         for (m.params) |p| {
-            const name_copy = self.allocator.dupe(u8, p.name) catch p.name;
-            param_names.append(self.allocator, name_copy) catch {};
-        }
-
-        for (param_names.items, 0..) |name, i| {
-            _ = try fc.declareLocal(name, m.params[i].is_var);
+            _ = try fc.declareLocal(p.name, p.is_var);
         }
 
         // 形参隐式定型（i8 实参 → i32 形参），镜像 compileFunction。
