@@ -1,0 +1,93 @@
+=== VM 与 Tree Walker 全面对齐验证 ===
+临时目录: /tmp/tmp.xm7bwWUngU
+
+=== §2.1 基本类型和字面量 ===
+[int-literals] ✓ (TW+VM)
+[float-literals] ✓ (TW+VM)
+[bool-literals] ✓ (TW+VM)
+[string-escape] ✓ (TW+VM)
+
+=== §2.2 变量绑定 ===
+[val-immutable] ✓ (TW+VM)
+[var-mutable] ✓ (TW+VM)
+[shadowing] ✓ (TW+VM)
+
+=== §2.3 Nullable 类型 ===
+[nullable-some] ✓ (TW+VM)
+[nullable-none] ✓ (TW+VM)
+[nullable-propagate] ✓ (TW+VM)
+[nullable-coalesce] ✓ (TW+VM)
+[nullable-coalesce-some] ✓ (TW+VM)
+
+=== §2.4 Throw 类型 ===
+[throw-error] ✓ (TW+VM)
+[throw-ok] ✓ (TW+VM)
+[throw-propagate] ✓ (TW+VM)
+[throw-ok-unwrap] ✓ (TW+VM)
+
+=== §2.5 ADT 类型 ===
+[adt-enum-simple] ✓ (TW+VM)
+[adt-enum-with-data] ✓ (TW+VM)
+[adt-tuple-type] ✓ (TW+VM)
+[adt-nested-pattern] ✓ (TW+VM)
+
+=== §2.6 模式匹配 ===
+[pattern-literal] ✓ (TW+VM)
+[pattern-wildcard] ✓ (TW+VM)
+[pattern-guard] ✓ (TW+VM)
+
+=== §2.7 Trait 系统 ===
+[trait-basic] ✓ (TW+VM)
+[trait-default-impl] ✓ (TW+VM)
+[trait-override] ✓ (TW+VM)
+
+=== §2.8 泛型 ===
+[generic-function] ✓ (TW+VM)
+[generic-type] ✓ (TW+VM)
+
+=== §2.15 类型转换 ===
+[explicit-cast-widen] ✓ (TW+VM)
+[explicit-cast-narrow] ✓ (TW+VM)
+[no-implicit-convert] ✓ (TW+VM)
+
+=== §3 并发特性 ===
+[spawn-basic] ✓ (TW+VM)
+[spawn-snapshot] ✓ (TW+VM)
+[atomic-basic] ✓ (TW+VM)
+[atomic-spawn] ✓ (TW+VM)
+[channel-send-recv] ✓ (TW+VM)
+
+=== §4 函数特性 ===
+[function-basic] ✓ (TW+VM)
+[function-expression-body] ✗ (TW✗ VM✗)
+[closure-capture] ✓ (TW+VM)
+[closure-parameter] ✓ (TW+VM)
+
+=== §6 控制流 ===
+[if-else] ✓ (TW+VM)
+[if-expression] ✓ (TW+VM)
+[loop-while] ✓ (TW+VM)
+[loop-for-range] ✓ (TW+VM)
+[loop-capture-independent] ✓ (TW+VM)
+[defer-basic] ✓ (TW+VM)
+[defer-lifo] ✓ (TW+VM)
+
+=== §6.11 运算符 ===
+[arithmetic-ops] ✓ (TW+VM)
+[comparison-ops] ✓ (TW+VM)
+[logical-ops] ✓ (TW+VM)
+[bitwise-ops] ✓ (TW+VM)
+[string-concat] ✓ (TW+VM)
+[list-concat] ✓ (TW+VM)
+
+=== 综合测试 ===
+[fibonacci-recursive] ✓ (TW+VM)
+[list-operations] ✓ (TW+VM)
+
+=== 验证结果 ===
+Tree Walker: 通过 54, 失败 1
+VM:          通过 54, 失败 1
+不一致:      0 项
+总计:        55 项测试
+
+⚠ 部分测试失败（但VM与TW行为一致）
