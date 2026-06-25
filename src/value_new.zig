@@ -973,6 +973,9 @@ pub const BoxedValue = struct {
             .string => {
                 allocator.free(self.payload.string);
             },
+            .float128 => {
+                // f128值类型，无需释放
+            },
             .array => {
                 for (self.payload.array.elements) |*e| e.release(allocator);
                 allocator.free(self.payload.array.elements);
@@ -1847,27 +1850,27 @@ test "Float128 boxing" {
 
 test "FloatValue round-trip with type preservation" {
     const allocator = testing.allocator;
-    
+
     // f16
     const fv16 = FloatValue{ .value = 3.14, .type_tag = .f16 };
     const v16 = try Value.fromFloatValue(allocator, fv16);
     const recovered16 = v16.asFloatValue();
     try testing.expectEqual(FloatType.f16, recovered16.type_tag);
-    
+
     // f32
     const fv32 = FloatValue{ .value = 3.14159, .type_tag = .f32 };
     const v32 = try Value.fromFloatValue(allocator, fv32);
     const recovered32 = v32.asFloatValue();
     try testing.expectEqual(FloatType.f32, recovered32.type_tag);
-    
+
     // f64
     const fv64 = FloatValue{ .value = 0.1, .type_tag = .f64 };
     const v64 = try Value.fromFloatValue(allocator, fv64);
     const recovered64 = v64.asFloatValue();
     try testing.expectEqual(FloatType.f64, recovered64.type_tag);
-    
+
     // f128
-    const fv128 = FloatValue{ .value = 1e100, .type_tag = .f128 };
+    const fv128 = FloatValue{ .value = @as(f128, 1e100), .type_tag = .f128 };
     const v128 = try Value.fromFloatValue(allocator, fv128);
     defer v128.release(allocator);
     const recovered128 = v128.asFloatValue();
