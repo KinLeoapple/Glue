@@ -438,29 +438,49 @@ val e = Error("not found")
 e.message    // "not found"
 ```
 
-`Error` 是所有错误类型的基类型。自定义错误类型（通过 `type X = Error("msg")` 定义）都是 `Error` 的子类型。
+`Error` 是所有错误类型的基类型。自定义错误类型都是 `Error` 的子类型。
 
 #### 2.4.2 自定义错误类型
 
-使用 newtype 语法创建自定义错误类型，自动满足 Error trait。
+使用 OOP 风格语法创建自定义错误类型，通过 `: Error` 声明实现 Error trait：
 
 ```glue
-type FileError = Error("file error")
-type NetworkError = Error("network error")
-type ParseError = Error("parse error")
+type FileError: Error = FileError(msg: str) {
+    override fun prefix(self): str {
+        "file error"
+    }
+}
+
+type NetworkError: Error = NetworkError(msg: str) {
+    override fun prefix(self): str {
+        "network error"
+    }
+}
+
+type ParseError: Error = ParseError(msg: str) {
+    override fun prefix(self): str {
+        "parse error"
+    }
+}
 ```
 
-语法：`type Name = Error("默认前缀")`
+语法：`type Name: Error = Name(msg: str) { override fun prefix(self): str { "前缀" } }`
 
 语义：
-1. 创建 newtype `Name`，包装一个 `str` message
-2. 自动实现 Error trait
-3. `"默认前缀"` 是 message 的默认前缀
-4. **`Name` 是 `Error` 的子类型**——`FileError <: Error`
+1. 声明 `Name` 实现 Error trait（`: Error`）
+2. 定义构造器参数 `msg: str`
+3. 通过 `override fun prefix` 定义错误前缀
+4. Error trait 提供内置方法：`message(self): str` 和 `type_name(self): str`
+5. **`Name` 是 `Error` 的子类型**——`FileError <: Error`
 
 ```glue
 throw FileError("config.json not found")
+// 错误消息通过 message() 方法获取
+val e = FileError("test")
+println(e.message())  // "file error: test"
+
 throw NetworkError("connection refused")
+// 错误消息: "network error: connection refused"
 ```
 
 #### 2.4.3 Error 子类型关系

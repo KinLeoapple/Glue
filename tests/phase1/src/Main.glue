@@ -709,14 +709,14 @@ fun test2(): () {
 // 11. Error.message 属性访问
 // ============================================================
 val e = Error("not found")
-println(e.message)
+println(e.message())
 
 // ============================================================
 // 12. match Error 中访问 .message
 // ============================================================
 val r2 = match Error("disk full") {
     Ok(v) => "ok"
-    Error(err) => err.message
+    Error(err) => err.message()
 }
 println(r2)
 
@@ -726,7 +726,7 @@ println(r2)
 val fe2 = FileError("read failed")
 val msg = match fe2 {
     Ok(v) => "ok"
-    Error(err) => err.message
+    Error(err) => err.message()
 }
 println(msg)
 
@@ -1097,7 +1097,7 @@ println(user2 ?? "unknown")
 
 val r3 = match findOrError(-1) {
     Ok(v) => v ?? "null value"
-    Error(e) => "error: " + e.message
+    Error(e) => "error: " + e.message()
 }
 println(r3)
 
@@ -1734,7 +1734,7 @@ println(mnr2)
 val dbe = DbError("connection timeout")
 val dbe_msg = match dbe {
     Ok(v) => "ok"
-    Error(e) => e.message
+    Error(e) => e.message()
 }
 println(dbe_msg)
 

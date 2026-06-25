@@ -344,6 +344,9 @@ pub const ModuleCompiler = struct {
                             }
                             const eidx = try self.program.addErrorCtor(td.name, prefix);
                             try self.error_table.append(self.allocator, .{ .name = td.name, .idx = eidx, .arity = 1 });
+
+                            // 注册 Error trait 的内置方法：message() 和 type_name()
+                            try self.registerErrorTraitMethods(td.name);
                         },
                         else => {},
                     }
@@ -476,6 +479,20 @@ pub const ModuleCompiler = struct {
                 return d.func_idx;
         }
         return null;
+    }
+
+    /// 为 Error 类型注册内置方法：message() 和 type_name()
+    /// 这些方法作为 Error trait 的一部分，由 VM 在运行时提供实现
+    fn registerErrorTraitMethods(self: *ModuleCompiler, type_name: []const u8) CompileError!void {
+        _ = type_name;
+        // 注册 message() 方法
+        try self.registerMethodName("message");
+
+        // 注册 type_name() 方法
+        try self.registerMethodName("type_name");
+
+        // 注意：这些方法不需要 func_idx，因为它们由 VM 的 OP_CALL_METHOD 特殊处理
+        // VM 会检查是否是 Error 类型的 message/type_name 调用，并直接返回对应的字段值
     }
 
     /// M5i：编译 trait 块中带默认 body 的方法，登记进 program.trait_defaults（impl 未覆写时回退）。
@@ -3456,11 +3473,11 @@ test "M3c propagate ? short-circuits on first Error" {
     try std.testing.expectEqual(@as(i64, -1), @as(i64, @bitCast(@as(u64, @truncate(r)))));
 }
 
-test "M3c match Error binds message via field access" {
+test "M3c match Error binds message via method call" {
     const allocator = std.testing.allocator;
     const src =
         \\fun mk(): Throw<i64, Error> { throw Error("not found") }
-        \\fun run(): str { match mk() { Ok(v) => "ok", Error(e) => e.message } }
+        \\fun run(): str { match mk() { Ok(v) => "ok", Error(e) => e.message() } }
     ;
     const s = try compileAndCallStr(allocator, src, "run");
     defer allocator.free(s);
@@ -4438,7 +4455,7 @@ test "M5e error_newtype: FileError(msg) -> throw_val.err with prefixed message" 
     try std.testing.expect(e.is_error_subtype);
 }
 
-test "M5e error_newtype: .message field access" {
+test "M5e error_newtype: .message() method call" {
     const allocator = std.testing.allocator;
     const src =
         \\type NetworkError: Error = NetworkError(msg: str) {
@@ -4448,7 +4465,7 @@ test "M5e error_newtype: .message field access" {
         \\}
         \\fun run(): str {
         \\    val ne = NetworkError("timeout")
-        \\    ne.message
+        \\    ne.message()
         \\}
     ;
     var program: Program = undefined;

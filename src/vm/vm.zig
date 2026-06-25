@@ -1679,35 +1679,13 @@ pub const VM = struct {
                 }
                 return self.fail(loc, "no such member on module value", error.TypeMismatch);
             },
-            // M3c：error_val.message / .type_name（match Error(e) 绑定后访问）。
-            .error_val => |e| {
-                if (std.mem.eql(u8, field, "message")) {
-                    try self.push(Value{ .string = self.allocator.dupe(u8, e.message) catch return error.OutOfMemory });
-                    return;
-                }
-                if (std.mem.eql(u8, field, "type_name")) {
-                    try self.push(Value{ .string = self.allocator.dupe(u8, e.type_name) catch return error.OutOfMemory });
-                    return;
-                }
-                return self.fail(loc, "no such field on error", error.TypeMismatch);
+            // M3c：error_val 不再支持字段访问，必须使用方法调用 e.message() / e.type_name()
+            .error_val => {
+                return self.fail(loc, "Error trait methods must be called as methods, use .message() or .type_name()", error.TypeMismatch);
             },
-            // M5e：throw_val.err 的 .message / .type_name 访问（自定义错误类型 FileError("..").message）。
-            // 镜像 eval accessField throw_val 分支（文档 2.4.7）。
-            .throw_val => |tv| {
-                switch (tv.*) {
-                    .err => |e| {
-                        if (std.mem.eql(u8, field, "message")) {
-                            try self.push(Value{ .string = self.allocator.dupe(u8, e.message) catch return error.OutOfMemory });
-                            return;
-                        }
-                        if (std.mem.eql(u8, field, "type_name")) {
-                            try self.push(Value{ .string = self.allocator.dupe(u8, e.type_name) catch return error.OutOfMemory });
-                            return;
-                        }
-                    },
-                    .ok => {},
-                }
-                return self.fail(loc, "no such field on Throw", error.TypeMismatch);
+            // M5e：throw_val 不再支持字段访问
+            .throw_val => {
+                return self.fail(loc, "Error trait methods must be called as methods, use .message() or .type_name()", error.TypeMismatch);
             },
             // M4b：Channel 方向类型字段 —— ch.sender / ch.receiver（各 ref channel + 新包装）。
             .channel_val => |cv| {
@@ -1919,6 +1897,34 @@ pub const VM = struct {
         const args_start = self.stack.items.len - argc;
         const args = self.stack.items[args_start..][0..argc];
         const receiver = self.stack.items[args_start - 1];
+
+        // M5e：Error trait 内置方法：message() 和 type_name()
+        // 这些方法直接从 error_val 或 throw_val.err 中提取字段值
+        if (std.mem.eql(u8, name, "message") or std.mem.eql(u8, name, "type_name")) {
+            if (argc != 0) return self.fail(loc, "Error trait method expects 0 arguments", error.WrongArity);
+            const result = switch (receiver) {
+                .error_val => |e| blk: {
+                    const field_value = if (std.mem.eql(u8, name, "message")) e.message else e.type_name;
+                    break :blk Value{ .string = try self.allocator.dupe(u8, field_value) };
+                },
+                .throw_val => |tv| blk: {
+                    if (tv.* == .err) {
+                        const field_value = if (std.mem.eql(u8, name, "message")) tv.err.message else tv.err.type_name;
+                        break :blk Value{ .string = try self.allocator.dupe(u8, field_value) };
+                    } else {
+                        return self.fail(loc, "cannot call Error method on Ok value", error.TypeMismatch);
+                    }
+                },
+                else => null,
+            };
+            if (result) |r| {
+                receiver.releaseVM(self.allocator);
+                self.stack.shrinkRetainingCapacity(args_start - 1);
+                try self.push(r);
+                return;
+            }
+        }
+
         // M4c：spawn_val 的 await/cancel 需 VM 级处理（等待 + 结果跨线程深拷回父 allocator）。
         if (receiver == .spawn_val) {
             return self.doSpawnMethod(receiver.spawn_val, name, args, args_start, loc);
