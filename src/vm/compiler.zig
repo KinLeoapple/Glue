@@ -2170,9 +2170,12 @@ fn parseFloatLiteral(lit: @TypeOf(@as(Expr, undefined).float_literal)) ?Value {
     if (std.math.isNan(fv) or std.math.isInf(fv)) return null;
     if (lit.suffix) |s| {
         const t = value.FloatType.fromName(s) orelse return null;
+        if (!t.inRange(fv)) return null;
         return Value{ .float = .{ .value = fv, .type_tag = t } };
     }
-    return Value{ .float = .{ .value = fv, .type_tag = value.inferFloatType(fv) } };
+    const t = value.inferFloatType(fv);
+    if (!t.inRange(fv)) return null;
+    return Value{ .float = .{ .value = fv, .type_tag = t } };
 }
 
 /// M5：builtin 数值类型名判定（隐式定型只协调这些）。bool/str 不在内——它们不参与整数宽度

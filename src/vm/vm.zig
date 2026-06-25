@@ -2398,7 +2398,7 @@ pub const VM = struct {
                 .op_mod => @rem(lf, rf),
                 else => return self.fail(loc, "bitwise op requires integer operands", error.TypeMismatch),
             };
-            if (std.math.isNan(result) or std.math.isInf(result)) return self.fail(loc, "arithmetic overflow: floating-point operation out of range", error.ArithmeticOverflow);
+            if (!tag.inRange(result)) return self.fail(loc, "arithmetic overflow: floating-point operation out of range", error.ArithmeticOverflow);
             return Value{ .float = .{ .value = result, .type_tag = tag } };
         }
         return self.fail(loc, "arithmetic requires numeric operands", error.TypeMismatch);
@@ -2475,7 +2475,12 @@ pub const VM = struct {
             if (!t.inRange(result)) return self.fail(loc, "arithmetic overflow: integer negation out of range", error.ArithmeticOverflow);
             return Value{ .integer = .{ .value = result, .type_tag = t } };
         }
-        if (v == .float) return Value{ .float = .{ .value = -v.float.value, .type_tag = v.float.type_tag } };
+        if (v == .float) {
+            const t = v.float.type_tag;
+            const result: f128 = -v.float.value;
+            if (!t.inRange(result)) return self.fail(loc, "arithmetic overflow: floating-point negation out of range", error.ArithmeticOverflow);
+            return Value{ .float = .{ .value = result, .type_tag = t } };
+        }
         return self.fail(loc, "'-' requires numeric operand", error.TypeMismatch);
     }
 };

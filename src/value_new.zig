@@ -209,6 +209,31 @@ pub const FloatType = enum {
             .f128 => 128,
         };
     }
+
+    pub fn minFloat(self: FloatType) f128 {
+        return switch (self) {
+            .f16 => -std.math.floatMax(f16),
+            .f32 => -std.math.floatMax(f32),
+            .f64 => -std.math.floatMax(f64),
+            .f128 => -std.math.floatMax(f128),
+        };
+    }
+
+    pub fn maxFloat(self: FloatType) f128 {
+        return switch (self) {
+            .f16 => std.math.floatMax(f16),
+            .f32 => std.math.floatMax(f32),
+            .f64 => std.math.floatMax(f64),
+            .f128 => std.math.floatMax(f128),
+        };
+    }
+
+    pub fn inRange(self: FloatType, val: f128) bool {
+        if (std.math.isNan(val) or std.math.isInf(val)) return false;
+        const min = self.minFloat();
+        const max = self.maxFloat();
+        return val >= min and val <= max;
+    }
 };
 
 pub const IntValue = struct {
@@ -486,6 +511,157 @@ pub const Value = struct {
         return .{ .tag = tag, .payload = @intFromPtr(ptr) };
     }
 
+    /// 构造 ADT 值
+    pub fn makeAdt(allocator: std.mem.Allocator, type_name: []const u8, constructor: []const u8, fields: []AdtField) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .adt,
+            .rc = 1,
+            .payload = .{
+                .adt = .{
+                    .type_name = type_name,
+                    .constructor = constructor,
+                    .fields = fields,
+                    .rc = 1,
+                },
+            },
+        };
+        return .{ .tag = .adt, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Newtype 值
+    pub fn makeNewtype(allocator: std.mem.Allocator, type_name: []const u8, inner: Value) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .newtype,
+            .rc = 1,
+            .payload = .{
+                .newtype = .{
+                    .type_name = type_name,
+                    .inner = inner,
+                    .rc = 1,
+                },
+            },
+        };
+        return .{ .tag = .newtype, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Cell 值（用于可变捕获）
+    pub fn makeCell(allocator: std.mem.Allocator, inner: Value) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .cell_val,
+            .rc = 1,
+            .payload = .{
+                .cell_val = .{
+                    .inner = inner,
+                    .rc = 1,
+                },
+            },
+        };
+        return .{ .tag = .cell_val, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Range 值
+    pub fn makeRange(allocator: std.mem.Allocator, start: i128, end: i128, inclusive: bool) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .range,
+            .rc = 1,
+            .payload = .{
+                .range = .{
+                    .start = start,
+                    .end = end,
+                    .inclusive = inclusive,
+                },
+            },
+        };
+        return .{ .tag = .range, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 VmClosure 值
+    pub fn makeVmClosure(
+        allocator: std.mem.Allocator,
+        func: *const anyopaque,
+        arity: u8,
+        upvalues: []Value,
+        bound_args: []Value,
+    ) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .vm_closure,
+            .rc = 1,
+            .payload = .{
+                .vm_closure = .{
+                    .func = func,
+                    .arity = arity,
+                    .upvalues = upvalues,
+                    .bound_args = bound_args,
+                    .rc = 1,
+                    .allocator = allocator,
+                },
+            },
+        };
+        return .{ .tag = .vm_closure, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Partial Application 值
+    pub fn makePartial(allocator: std.mem.Allocator, func: Value, bound_args: []Value, remaining_arity: u8) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .partial,
+            .rc = 1,
+            .payload = .{
+                .partial = .{
+                    .func = func,
+                    .bound_args = bound_args,
+                    .remaining_arity = remaining_arity,
+                    .rc = 1,
+                },
+            },
+        };
+        return .{ .tag = .partial, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 ErrorValue
+    pub fn makeError(allocator: std.mem.Allocator, type_name: []const u8, message: []const u8, is_error_subtype: bool) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .error_val,
+            .rc = 1,
+            .payload = .{
+                .error_val = .{
+                    .type_name = type_name,
+                    .message = message,
+                    .is_error_subtype = is_error_subtype,
+                },
+            },
+        };
+        return .{ .tag = .error_val, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 ThrowValue
+    pub fn makeThrow(allocator: std.mem.Allocator, throw_val: ThrowValue) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .throw_val,
+            .rc = 1,
+            .payload = .{ .throw_val = throw_val },
+        };
+        return .{ .tag = .throw_val, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Builtin 值
+    pub fn makeBuiltin(allocator: std.mem.Allocator, builtin: Builtin) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .builtin,
+            .rc = 1,
+            .payload = .{ .builtin = builtin },
+        };
+        return .{ .tag = .builtin, .payload = @intFromPtr(box) };
+    }
+
     // ============================================================
     // 解码函数（提取值）
     // ============================================================
@@ -712,11 +888,55 @@ pub const BoxedValue = struct {
                 for (closure.bound_args) |ba| ba.release(allocator);
                 if (closure.bound_args.len > 0) closure.allocator.free(closure.bound_args);
             },
+            .partial => {
+                self.payload.partial.func.release(allocator);
+                for (self.payload.partial.bound_args) |ba| ba.release(allocator);
+                if (self.payload.partial.bound_args.len > 0) allocator.free(self.payload.partial.bound_args);
+            },
+            .throw_val => {
+                switch (self.payload.throw_val) {
+                    .ok => |ptr| {
+                        ptr.release(allocator);
+                        allocator.destroy(ptr);
+                    },
+                    .err => {},
+                }
+            },
+            .trait_value => {
+                var it = self.payload.trait_value.methods.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.*.release(allocator);
+                }
+                self.payload.trait_value.methods.deinit();
+                if (self.payload.trait_value.data) |data_ptr| {
+                    data_ptr.release(allocator);
+                    allocator.destroy(data_ptr);
+                }
+            },
+            .lazy_val => {
+                if (self.payload.lazy_val.cached) |cached| {
+                    cached.release(allocator);
+                }
+                // expr/env 由外部管理，不在此释放
+            },
+            .array_iterator => {
+                // 迭代器不拥有数组，无需释放
+            },
+            .string_iterator => {
+                // 迭代器不拥有字符串，无需释放
+            },
+            .range_iterator => {
+                // 值类型，无需释放
+            },
+            .atomic_val, .spawn_val, .channel_val, .sender_val, .receiver_val => {
+                // 并发原语由外部运行时管理
+            },
             .big_int, .range, .builtin, .error_val => {
                 // 值类型，无需递归释放
             },
             else => {
-                // 其他类型暂时简化处理（TODO: 完整实现）
+                // 其他类型（如果有遗漏）
             },
         }
     }
@@ -907,4 +1127,169 @@ test "retainOwned - string duplicates" {
     const ptr2 = v2.asBoxed().payload.string.ptr;
     try testing.expect(ptr1 != ptr2);
     try testing.expectEqualStrings(v1.asBoxed().payload.string, v2.asBoxed().payload.string);
+}
+
+// ============================================================
+// 新增单元测试（Day2）
+// ============================================================
+
+test "makeAdt - ADT construction" {
+    const allocator = testing.allocator;
+
+    var fields = try allocator.alloc(AdtField, 2);
+    fields[0] = .{ .name = "x", .value = Value.fromSmallInt(10) };
+    fields[1] = .{ .name = "y", .value = Value.fromSmallInt(20) };
+
+    const v = try Value.makeAdt(allocator, "Point", "Point", fields);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.adt, v.tag);
+
+    const adt = v.asBoxed().payload.adt;
+    try testing.expectEqualStrings("Point", adt.type_name);
+    try testing.expectEqualStrings("Point", adt.constructor);
+    try testing.expectEqual(@as(usize, 2), adt.fields.len);
+}
+
+test "makeNewtype - Newtype construction" {
+    const allocator = testing.allocator;
+
+    const inner = Value.fromSmallInt(42);
+    const v = try Value.makeNewtype(allocator, "UserId", inner);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.newtype, v.tag);
+
+    const newtype = v.asBoxed().payload.newtype;
+    try testing.expectEqualStrings("UserId", newtype.type_name);
+    try testing.expectEqual(@as(i48, 42), newtype.inner.asSmallInt());
+}
+
+test "makeCell - Cell construction" {
+    const allocator = testing.allocator;
+
+    const inner = Value.fromSmallInt(100);
+    const v = try Value.makeCell(allocator, inner);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.cell_val, v.tag);
+
+    const cell = v.asBoxed().payload.cell_val;
+    try testing.expectEqual(@as(i48, 100), cell.inner.asSmallInt());
+}
+
+test "makeRange - Range construction" {
+    const allocator = testing.allocator;
+
+    const v = try Value.makeRange(allocator, 0, 10, false);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.range, v.tag);
+
+    const range = v.asBoxed().payload.range;
+    try testing.expectEqual(@as(i128, 0), range.start);
+    try testing.expectEqual(@as(i128, 10), range.end);
+    try testing.expect(!range.inclusive);
+}
+
+test "makeError - ErrorValue construction" {
+    const allocator = testing.allocator;
+
+    const v = try Value.makeError(allocator, "FileError", "file not found", true);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.error_val, v.tag);
+
+    const err = v.asBoxed().payload.error_val;
+    try testing.expectEqualStrings("FileError", err.type_name);
+    try testing.expectEqualStrings("file not found", err.message);
+    try testing.expect(err.is_error_subtype);
+}
+
+test "ADT with nested values" {
+    const allocator = testing.allocator;
+
+    // 构造嵌套 ADT: Some(Some(42))
+    const inner_fields = try allocator.alloc(AdtField, 1);
+    inner_fields[0] = .{ .name = null, .value = Value.fromSmallInt(42) };
+
+    const inner = try Value.makeAdt(allocator, "Option", "Some", inner_fields);
+
+    const outer_fields = try allocator.alloc(AdtField, 1);
+    outer_fields[0] = .{ .name = null, .value = inner };
+
+    const outer = try Value.makeAdt(allocator, "Option", "Some", outer_fields);
+    defer outer.release(allocator);
+
+    try testing.expect(outer.isBoxed());
+    const outer_adt = outer.asBoxed().payload.adt;
+    try testing.expectEqual(@as(usize, 1), outer_adt.fields.len);
+
+    // 验证嵌套结构
+    const nested = outer_adt.fields[0].value;
+    try testing.expectEqual(ValueTag.adt, nested.tag);
+}
+
+test "record with mixed value types" {
+    const allocator = testing.allocator;
+
+    var fields = std.StringHashMap(Value).init(allocator);
+
+    const name_key = try allocator.dupe(u8, "name");
+    const age_key = try allocator.dupe(u8, "age");
+    const active_key = try allocator.dupe(u8, "active");
+
+    try fields.put(name_key, try Value.fromString(allocator, try allocator.dupe(u8, "Alice")));
+    try fields.put(age_key, Value.fromSmallInt(30));
+    try fields.put(active_key, Value.fromBool(true));
+
+    const v = try Value.makeRecord(allocator, "Person", fields);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    const record = v.asBoxed().payload.record;
+    try testing.expectEqual(@as(usize, 3), record.fields.count());
+}
+
+test "Cell refcount with multiple references" {
+    const allocator = testing.allocator;
+
+    const inner = Value.fromSmallInt(42);
+    const cell = try Value.makeCell(allocator, inner);
+
+    const ref1 = cell.retain();
+    const ref2 = cell.retain();
+
+    const box = cell.asBoxed();
+    try testing.expectEqual(@as(u32, 3), box.rc);
+
+    ref2.release(allocator);
+    try testing.expectEqual(@as(u32, 2), box.rc);
+
+    ref1.release(allocator);
+    try testing.expectEqual(@as(u32, 1), box.rc);
+
+    cell.release(allocator);
+}
+
+test "Newtype wrapping complex value" {
+    const allocator = testing.allocator;
+
+    // Newtype 包装数组
+    var arr_elements = try allocator.alloc(Value, 3);
+    arr_elements[0] = Value.fromSmallInt(1);
+    arr_elements[1] = Value.fromSmallInt(2);
+    arr_elements[2] = Value.fromSmallInt(3);
+
+    const arr = try Value.makeArray(allocator, arr_elements, null);
+    const newtype = try Value.makeNewtype(allocator, "IntList", arr);
+    defer newtype.release(allocator);
+
+    const nt = newtype.asBoxed().payload.newtype;
+    try testing.expectEqual(ValueTag.array, nt.inner.tag);
 }

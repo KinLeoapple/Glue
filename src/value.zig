@@ -501,6 +501,31 @@ pub const FloatType = enum {
             .f128 => 128,
         };
     }
+
+    pub fn minFloat(self: FloatType) f128 {
+        return switch (self) {
+            .f16 => -std.math.floatMax(f16),
+            .f32 => -std.math.floatMax(f32),
+            .f64 => -std.math.floatMax(f64),
+            .f128 => -std.math.floatMax(f128),
+        };
+    }
+
+    pub fn maxFloat(self: FloatType) f128 {
+        return switch (self) {
+            .f16 => std.math.floatMax(f16),
+            .f32 => std.math.floatMax(f32),
+            .f64 => std.math.floatMax(f64),
+            .f128 => std.math.floatMax(f128),
+        };
+    }
+
+    pub fn inRange(self: FloatType, val: f128) bool {
+        if (std.math.isNan(val) or std.math.isInf(val)) return false;
+        const min = self.minFloat();
+        const max = self.maxFloat();
+        return val >= min and val <= max;
+    }
 };
 
 /// 浮点字面量自动推断：使用往返检查确定最小适用类型
