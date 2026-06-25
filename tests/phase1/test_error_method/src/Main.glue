@@ -1,0 +1,10 @@
+type FileError: Error = FileError(msg: str) {
+    override fun prefix(self): str {
+        "file error"
+    }
+}
+
+fun main() {
+    val e = FileError("test")
+    println(e.message())
+}
