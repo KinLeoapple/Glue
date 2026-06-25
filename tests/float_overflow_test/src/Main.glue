@@ -1,0 +1,13 @@
+// Test float type inference - boundary cases
+
+fun main() {
+    // Test 1: f32 range limit (max ~3.4e38)
+    val a = 1.0e38
+    println(a)
+
+    // Test 2: Just over f32, needs f64
+    val b = 1.0e39
+    println(b)
+
+    println("Boundary tests passed!")
+}

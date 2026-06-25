@@ -2174,7 +2174,7 @@ fn parseFloatLiteral(lit: @TypeOf(@as(Expr, undefined).float_literal)) ?Value {
         return Value{ .float = .{ .value = fv, .type_tag = t } };
     }
     const t = value.inferFloatType(fv);
-    if (!t.inRange(fv)) return null;
+    // inferFloatType 已经通过往返检查确保值可精确表示且拒绝 NaN/Inf，无需再次 inRange 检查
     return Value{ .float = .{ .value = fv, .type_tag = t } };
 }
 

@@ -1293,3 +1293,108 @@ test "Newtype wrapping complex value" {
     const nt = newtype.asBoxed().payload.newtype;
     try testing.expectEqual(ValueTag.array, nt.inner.tag);
 }
+// Day3 新增测试 - VmClosure
+test "VmClosure construction and refcount" {
+    const allocator = testing.allocator;
+
+    const func: *const anyopaque = @ptrFromInt(0x1000);
+    var upvalues = try allocator.alloc(Value, 2);
+    upvalues[0] = Value.fromSmallInt(10);
+    upvalues[1] = Value.fromSmallInt(20);
+
+    var bound = try allocator.alloc(Value, 1);
+    bound[0] = Value.fromSmallInt(30);
+
+    const v = try Value.makeVmClosure(allocator, func, 3, upvalues, bound);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.vm_closure, v.tag);
+
+    const closure = v.asBoxed().payload.vm_closure;
+    try testing.expectEqual(@as(u8, 3), closure.arity);
+    try testing.expectEqual(@as(usize, 2), closure.upvalues.len);
+    try testing.expectEqual(@as(usize, 1), closure.bound_args.len);
+}
+
+test "Partial application construction" {
+    const allocator = testing.allocator;
+
+    const func = Value.fromSmallInt(42);
+    var bound = try allocator.alloc(Value, 2);
+    bound[0] = Value.fromSmallInt(1);
+    bound[1] = Value.fromSmallInt(2);
+
+    const v = try Value.makePartial(allocator, func, bound, 3);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.partial, v.tag);
+
+    const partial = v.asBoxed().payload.partial;
+    try testing.expectEqual(@as(u8, 3), partial.remaining_arity);
+    try testing.expectEqual(@as(usize, 2), partial.bound_args.len);
+}
+
+test "Range operations" {
+    const allocator = testing.allocator;
+
+    const excl = try Value.makeRange(allocator, 0, 10, false);
+    defer excl.release(allocator);
+
+    const incl = try Value.makeRange(allocator, 0, 10, true);
+    defer incl.release(allocator);
+
+    const r1 = excl.asBoxed().payload.range;
+    const r2 = incl.asBoxed().payload.range;
+
+    try testing.expectEqual(@as(i128, 10), r1.len());
+    try testing.expectEqual(@as(i128, 11), r2.len());
+    try testing.expect(r1.contains(5));
+    try testing.expect(!r1.contains(10));
+    try testing.expect(r2.contains(10));
+}
+
+test "Deep nested release" {
+    const allocator = testing.allocator;
+
+    const cell = try Value.makeCell(allocator, Value.fromSmallInt(42));
+    const newtype = try Value.makeNewtype(allocator, "UserId", cell);
+
+    var adt_fields = try allocator.alloc(AdtField, 1);
+    adt_fields[0] = .{ .name = "value", .value = newtype };
+    const adt = try Value.makeAdt(allocator, "Wrapper", "Wrap", adt_fields);
+
+    var record_fields = std.StringHashMap(Value).init(allocator);
+    try record_fields.put(try allocator.dupe(u8, "x"), adt);
+    const record = try Value.makeRecord(allocator, "Container", record_fields);
+
+    var arr_elements = try allocator.alloc(Value, 1);
+    arr_elements[0] = record;
+    const array = try Value.makeArray(allocator, arr_elements, null);
+
+    array.release(allocator);
+}
+
+test "Value equality basic types" {
+    try testing.expect(Value.fromNull().equals(Value.fromNull()));
+    try testing.expect(Value.fromUnit().equals(Value.fromUnit()));
+    try testing.expect(Value.fromBool(true).equals(Value.fromBool(true)));
+    try testing.expect(!Value.fromBool(true).equals(Value.fromBool(false)));
+
+    const int1 = Value.fromSmallInt(42);
+    const int2 = Value.fromSmallInt(42);
+    try testing.expect(int1.equals(int2));
+}
+
+test "Smart int boundary" {
+    const allocator = testing.allocator;
+
+    const max_i48 = std.math.maxInt(i48);
+    const v_max = try Value.fromInt(allocator, .{ .value = @bitCast(@as(i128, max_i48)), .type_tag = .i64 });
+    try testing.expect(v_max.isInline());
+
+    const over = try Value.fromInt(allocator, .{ .value = @bitCast(@as(i128, max_i48) + 1), .type_tag = .i64 });
+    defer over.release(allocator);
+    try testing.expect(over.isBoxed());
+}
