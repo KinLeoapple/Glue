@@ -245,8 +245,10 @@ pub const IntValue = struct {
     }
 };
 
+/// 带类型标签的浮点值
+/// value 使用 f128 存储，可表示所有浮点类型
 pub const FloatValue = struct {
-    value: f64,
+    value: f128,
     type_tag: FloatType = .f64,
 };
 
@@ -1870,7 +1872,7 @@ test "FloatValue round-trip with type preservation" {
     try testing.expectEqual(FloatType.f64, recovered64.type_tag);
 
     // f128
-    const fv128 = FloatValue{ .value = @as(f128, 1e100), .type_tag = .f128 };
+    const fv128 = FloatValue{ .value = 1.23456789e50, .type_tag = .f128 };
     const v128 = try Value.fromFloatValue(allocator, fv128);
     defer v128.release(allocator);
     const recovered128 = v128.asFloatValue();
