@@ -383,14 +383,6 @@ pub const SelectArm = union(enum) {
     },
 };
 
-/// Monad 绑定（用于 @ 上下文表达式）
-pub const MonadBinding = struct {
-    /// 绑定变量名
-    name: []const u8,
-    /// 绑定表达式（<- 右侧）
-    expr: *Expr,
-};
-
 /// import 导入项
 pub const ImportItem = struct {
     /// 导入名称
@@ -766,18 +758,6 @@ pub const Expr = union(enum) {
         arms: []SelectArm,
     },
 
-    /// Monad 上下文表达式（@ 语法糖）：
-    /// @List { x <- [1,2,3]; y <- [4,5,6]; x + y }
-    monad_comprehension: struct {
-        location: SourceLocation,
-        /// Monad 类型名，如 List
-        monad_type: []const u8,
-        /// 绑定列表（x <- expr）
-        bindings: []MonadBinding,
-        /// 结果表达式
-        result: *Expr,
-    },
-
     /// 内联 Trait 值：trait { methods }
     /// 如 val logger : Logger = trait { fun log(msg) { ... } }
     inline_trait_value: struct {
@@ -1090,7 +1070,6 @@ pub fn exprLocation(expr: *const Expr) SourceLocation {
         .atomic_expr => |e| e.location,
         .lazy => |e| e.location,
         .select => |e| e.location,
-        .monad_comprehension => |e| e.location,
         .inline_trait_value => |e| e.location,
         .compound_assign => |e| e.location,
     };

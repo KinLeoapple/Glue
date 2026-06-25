@@ -351,10 +351,6 @@ fn resolveExpr(r: *Resolver, expr: *ast.Expr) anyerror!void {
                 }
             }
         },
-        .monad_comprehension => |mc| {
-            for (mc.bindings) |b| try resolveExpr(r, b.expr);
-            try resolveExpr(r, mc.result);
-        },
         .inline_trait_value => |itv| {
             for (itv.methods) |m| {
                 if (m.body) |b| try resolveFnLike(r, m.params, b);

@@ -252,7 +252,7 @@ pub const Native = enum(u8) {
     ok,
     err,
     channel,
-    type_of,
+    type,
     eq,
     panic,
     eprintln,
@@ -266,7 +266,7 @@ pub const Native = enum(u8) {
         if (std.mem.eql(u8, s, "Ok")) return .ok;
         if (std.mem.eql(u8, s, "Error")) return .err;
         if (std.mem.eql(u8, s, "channel")) return .channel;
-        if (std.mem.eql(u8, s, "type")) return .type_of;
+        if (std.mem.eql(u8, s, "type")) return .type;
         if (std.mem.eql(u8, s, "eq")) return .eq;
         if (std.mem.eql(u8, s, "Panic")) return .panic;
         if (std.mem.eql(u8, s, "eprintln")) return .eprintln;

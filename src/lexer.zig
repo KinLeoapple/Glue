@@ -206,10 +206,6 @@ pub const TokenType = enum {
     /// |
     pipe,
 
-    // --- Monad ---
-    /// @ (Monad 上下文表达式前缀)
-    at,
-
     // --- 特殊 ---
     /// 文件结束
     eof,
@@ -556,7 +552,6 @@ pub const Lexer = struct {
             '^' => try self.addToken(.caret, start, start_line, start_col),
 
             // @ (Monad 上下文表达式)
-            '@' => try self.addToken(.at, start, start_line, start_col),
 
             // 字符字面量
             '\'' => try self.scanChar(start, start_line, start_col),

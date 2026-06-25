@@ -2141,10 +2141,6 @@ pub const Parser = struct {
             return self.parseSelectExpr();
         }
 
-        if (self.matchToken(.at)) {
-            return self.parseMonadExpr();
-        }
-
         // 内联 Trait 值 trait { methods }
         if (self.check(.kw_trait)) {
             if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_brace) {
@@ -2703,51 +2699,6 @@ pub const Parser = struct {
                 .body = body,
             },
         };
-    }
-
-    fn parseMonadExpr(self: *Parser) ParserError!*ast.Expr {
-        const at_tok = self.previous();
-        const type_tok = try self.expect(.identifier, "expected monad type name");
-        _ = self.expect(.l_brace, "expected '{'") catch {};
-
-        // 文档 §2.11.2: @M { x <- e1  y <- e2  result }
-        // 解析零或多个绑定 `name <- expr`，最后一个非绑定表达式是 result。
-        // 绑定的判定：标识符紧跟 `<-`。
-        var bindings = std.ArrayList(ast.MonadBinding).empty;
-        var result: ?*ast.Expr = null;
-        while (!self.check(.r_brace) and !self.isAtEnd()) {
-            if (self.check(.identifier) and
-                self.current + 1 < self.tokens.len and
-                self.tokens[self.current + 1].type == .lt_minus)
-            {
-                const name_tok = self.advance(); // 标识符
-                _ = self.advance(); // <-
-                const bind_expr = try self.parseExpr();
-                try bindings.append(self.allocator, ast.MonadBinding{
-                    .name = name_tok.lexeme,
-                    .expr = bind_expr,
-                });
-            } else {
-                // 非绑定：作为 result 表达式（应是块内最后一个表达式）
-                result = try self.parseExpr();
-                break;
-            }
-        }
-        _ = self.expect(.r_brace, "expected '}'") catch {};
-
-        const result_expr = result orelse blk: {
-            // 没有显式 result：用 unit 占位（理论上 monad 块应以结果表达式结尾）
-            break :blk try self.allocExpr(ast.Expr{ .unit_literal = tokenLoc(at_tok) });
-        };
-
-        return self.allocExpr(ast.Expr{
-            .monad_comprehension = .{
-                .location = tokenLoc(at_tok),
-                .monad_type = type_tok.lexeme,
-                .bindings = try bindings.toOwnedSlice(self.allocator),
-                .result = result_expr,
-            },
-        });
     }
 
     fn parseInlineTraitValue(self: *Parser) ParserError!*ast.Expr {

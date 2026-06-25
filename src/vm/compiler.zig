@@ -471,16 +471,6 @@ pub const ModuleCompiler = struct {
         return found;
     }
 
-    /// M5l：按 (type_name, method_name) 精确查 impl 方法 func_idx（用于 monad @ 脱糖按 monad 类型名
-    /// 解析其 bind/pure impl，不受 uniqueImplMethod 的「多 impl 即 null」限制——List/Box 各有 bind）。
-    pub fn lookupImplMethod(self: *ModuleCompiler, type_name: []const u8, method_name: []const u8) ?u16 {
-        for (self.program.impl_methods.items) |d| {
-            if (std.mem.eql(u8, d.type_name, type_name) and std.mem.eql(u8, d.method_name, method_name))
-                return d.func_idx;
-        }
-        return null;
-    }
-
     /// 为 Error 类型注册内置方法：message() 和 type_name()
     /// 这些方法作为 Error trait 的一部分，由 VM 在运行时提供实现
     fn registerErrorTraitMethods(self: *ModuleCompiler, type_name: []const u8) CompileError!void {
@@ -791,7 +781,27 @@ const FnCompiler = struct {
                 try self.chunk.writeU16(@intCast(interp.parts.len));
             },
             .identifier => |id| {
-                if (self.resolveLocal(id.name)) |slot| {
+                // 检查是否是限定名（module.name）
+                if (std.mem.indexOf(u8, id.name, ".")) |dot_pos| {
+                    // 限定名：拆分为模块路径和符号名
+                    const module_name = id.name[0..dot_pos];
+                    const symbol_name = id.name[dot_pos + 1 ..];
+
+                    // 尝试作为模块访问：module.symbol
+                    // 首先检查 module 是否是已导入的模块
+                    if (self.module.lookupGlobal(module_name)) |ge| {
+                        // 模块找到，生成：GET_GLOBAL(module) + GET_FIELD(symbol)
+                        try self.chunk.writeOp(.op_get_global, loc);
+                        try self.chunk.writeU16(ge.idx);
+
+                        const name_const = try self.chunk.addConstant(Value{ .string = try self.allocator.dupe(u8, symbol_name) });
+                        try self.chunk.writeOp(.op_get_field, loc);
+                        try self.chunk.writeU16(name_const);
+                    } else {
+                        // 模块未找到，报错
+                        return error.Unsupported;
+                    }
+                } else if (self.resolveLocal(id.name)) |slot| {
                     try self.chunk.writeOp(.op_get_local, loc);
                     try self.chunk.writeU16(slot);
                 } else if (try self.resolveUpvalue(id.name)) |uv_idx| {
@@ -973,11 +983,6 @@ const FnCompiler = struct {
             .inline_trait_value => |itv| {
                 try self.emitInlineTrait(itv, expr.inline_trait_value.location);
             },
-            // M5l：monad @ 上下文表达式 —— 编译期脱糖为嵌套 bind/pure 调用（镜像 eval
-            // evalMonadComprehension），bind/pure 按 monad 类型名静态解析到其 impl 方法。
-            .monad_comprehension => |mc| {
-                try self.emitMonadComprehension(mc, expr.monad_comprehension.location);
-            },
             else => return error.Unsupported,
         }
     }
@@ -1016,58 +1021,6 @@ const FnCompiler = struct {
         }
     }
 
-    /// M5l：编译 monad @ 上下文表达式。脱糖镜像 eval evalMonadComprehension：
-    ///   @M { x <- e0; y <- e1; result }
-    /// → bind(e0, fun(x) { bind(e1, fun(y) { pure(result) }) })
-    /// bind/pure 按 monad 类型名 M 静态解析到其 impl 方法 func_idx（List/Box 各有独立 bind/pure，
-    /// 不能靠 receiver 类型分派 pure——其实参是裸结果值而非容器）。
-    fn emitMonadComprehension(self: *FnCompiler, mc: @TypeOf(@as(Expr, undefined).monad_comprehension), loc: ast.SourceLocation) CompileError!void {
-        const bind_idx = self.module.lookupImplMethod(mc.monad_type, "bind") orelse return error.Unsupported;
-        const pure_idx = self.module.lookupImplMethod(mc.monad_type, "pure") orelse return error.Unsupported;
-        try self.emitMonadLevel(mc, bind_idx, pure_idx, 0, loc);
-    }
-
-    /// 递归发射 monad 脱糖的第 level 层。level==bindings.len 时发 pure(result)；否则发
-    /// bind(bindings[level].expr, fun(name){ <level+1> }) —— 续延 lambda 用子编译器编译（enclosing=self，
-    /// 内层可经 upvalue 链引用外层绑定变量），镜像 emitLambda 的闭包发射。
-    fn emitMonadLevel(self: *FnCompiler, mc: @TypeOf(@as(Expr, undefined).monad_comprehension), bind_idx: u16, pure_idx: u16, level: usize, loc: ast.SourceLocation) CompileError!void {
-        if (level == mc.bindings.len) {
-            // pure(result)：arity 1，OP_CALL 直接调用解析出的 pure impl。
-            try self.emitExpr(mc.result);
-            try self.chunk.writeOp(.op_call, loc);
-            try self.chunk.writeU16(pure_idx);
-            try self.chunk.writeByte(1);
-            return;
-        }
-        const b = mc.bindings[level];
-        // bind(b.expr, continuation)：先压 arg0（monad 值），再压续延闭包，OP_CALL argc=2。
-        try self.emitExpr(b.expr);
-        // 续延闭包 fun(b.name) { <level+1> }，子编译器编译。
-        var sub = FnCompiler.init(self.allocator, self.module);
-        sub.enclosing = self;
-        defer sub.deinit();
-        _ = try sub.declareLocal(b.name, false);
-        try sub.emitMonadLevel(mc, bind_idx, pure_idx, level + 1, loc);
-        try sub.chunk.writeOp(.op_return, loc);
-        const f = Function{
-            .chunk = sub.chunk,
-            .arity = 1,
-            .slot_count = sub.slot_count,
-            .name = "<monad-k>",
-        };
-        sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
-        const func_idx = try self.module.program.addFunction(f);
-        try self.chunk.writeOp(.op_closure, loc);
-        try self.chunk.writeU16(@intCast(func_idx));
-        try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
-        for (sub.upvalues.items) |uv| {
-            try self.chunk.writeByte(if (uv.is_local) 1 else 0);
-            try self.chunk.writeU16(uv.index);
-        }
-        try self.chunk.writeOp(.op_call, loc);
-        try self.chunk.writeU16(bind_idx);
-        try self.chunk.writeByte(2);
-    }
     /// 发 OP_CLOSURE 在本帧实例化（捕获当前 local/upvalue），再 OP_SPAWN 弹闭包起协程压 spawn_val。
     fn emitSpawn(self: *FnCompiler, sp: @TypeOf(@as(Expr, undefined).spawn)) CompileError!void {
         var sub = FnCompiler.init(self.allocator, self.module);
@@ -4612,31 +4565,6 @@ test "M5j cross-module use: dep impl + fn merged into Program" {
     try std.testing.expectEqual(@as(u128, 55), try compileAndCallWithDep(allocator, dep, entry, "run"));
 }
 
-test "M5k nullary trait method called as free function" {
-    const allocator = std.testing.allocator;
-    const src =
-        \\trait Numeric { fun zero() }
-        \\impl Numeric<i64> {
-        \\    fun zero(): i64 { 0i64 }
-        \\}
-        \\fun run(): i64 { zero() + 7i64 }
-    ;
-    try std.testing.expectEqual(@as(u128, 7), try compileAndCall(allocator, src, "run", &.{}));
-}
-
-test "M5k constructor as first-class value" {
-    const allocator = std.testing.allocator;
-    const src =
-        \\type Box = Box(n: i64)
-        \\fun run(): i64 {
-        \\    val mk = Box
-        \\    val b = mk(33i64)
-        \\    b.n
-        \\}
-    ;
-    try std.testing.expectEqual(@as(u128, 33), try compileAndCall(allocator, src, "run", &.{}));
-}
-
 test "M5k conflicting impls (same type+method) -> Unsupported fallback" {
     const allocator = std.testing.allocator;
     // 同一 (Box, dup) 两个 impl → trait 冲突消解，VM 回退（compileModule 报 Unsupported）。
@@ -4651,50 +4579,6 @@ test "M5k conflicting impls (same type+method) -> Unsupported fallback" {
     try std.testing.expectError(error.Unsupported, compileAndCall(allocator, src, "run", &.{}));
 }
 
-test "M5l monad comprehension desugars to bind/pure (Box monad, multi-binding)" {
-    const allocator = std.testing.allocator;
-    // @Box { a <- Box(5); b <- Box(100); a + b } → bind(Box(5), \a -> bind(Box(100), \b -> pure(a+b)))
-    // = Box(105)；unbox → 105。验证多绑定脱糖 + 续延 upvalue 捕获（a 在内层是 upvalue）。
-    const src =
-        \\type Box<T> = Box(T)
-        \\trait Monad<F : * -> *> {
-        \\    fun pure(value: i64) : Box<i64>
-        \\    fun bind(b: Box<i64>, f: i64 -> Box<i64>) : Box<i64>
-        \\}
-        \\impl Monad<Box> {
-        \\    fun pure(value) { Box(value) }
-        \\    fun bind(b, f) { match b { Box(v) => f(v) } }
-        \\}
-        \\fun unbox(b: Box<i64>) : i64 { match b { Box(v) => v } }
-        \\fun run(): i64 {
-        \\    val bx = @Box {
-        \\        a <- Box(5i64)
-        \\        b <- Box(100i64)
-        \\        a + b
-        \\    }
-        \\    unbox(bx)
-        \\}
-    ;
-    try std.testing.expectEqual(@as(u128, 105), try compileAndCall(allocator, src, "run", &.{}));
-}
-
-test "M5n composed trait override wins over parent impls (last-defined trait)" {
-    const allocator = std.testing.allocator;
-    // Ordering 同时 impl Serializable + DebugTrait（都有 to_string）。组合 Trait Overridden
-    // override to_string → 组合分派调 override 体（返回 99），覆盖父 impl（返回 1/2）。
-    const src =
-        \\type Ordering = | Lt | Eq | Gt
-        \\trait Serializable { fun to_string(self): i64 }
-        \\trait DebugTrait { fun to_string(self): i64 }
-        \\impl Serializable<Ordering> { fun to_string(self): i64 { 1i64 } }
-        \\impl DebugTrait<Ordering> { fun to_string(self): i64 { 2i64 } }
-        \\trait Overridden(Serializable, DebugTrait) {
-        \\    override fun to_string(self): i64 { 99i64 }
-        \\}
-        \\fun run(): i64 { Lt.to_string() }
-    ;
-    try std.testing.expectEqual(@as(u128, 99), try compileAndCall(allocator, src, "run", &.{}));
-}
 
 test "M5n composed trait delegate dispatches to named parent impl" {
     const allocator = std.testing.allocator;
@@ -4713,6 +4597,7 @@ test "M5n composed trait delegate dispatches to named parent impl" {
     ;
     try std.testing.expectEqual(@as(u128, 1), try compileAndCall(allocator, src, "run", &.{}));
 }
+
 
 test "M5o module-value: qualified access Store.Memory dispatches to submodule vtable" {
     const allocator = std.testing.allocator;

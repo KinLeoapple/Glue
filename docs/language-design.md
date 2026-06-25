@@ -1069,46 +1069,6 @@ Kind        含义             示例
 *           具体类型         i32, str, bool
 * -> *      一阶类型构造器   List, Vec, Tree
 * -> * -> * 二阶类型构造器   Map, Throw
-(* -> *) -> *  高阶类型构造器  Functor, Monad
-```
-
-```glue
-trait Functor<F : * -> *> {
-    fun map<T, U>(ft: F<T>, f: T -> U) : F<U>
-}
-
-trait Monad<F : * -> *>(Functor<F>) {
-    fun pure<A>(a: A) : F<A>
-    fun bind<A, B>(fa: F<A>, f: A -> F<B>) : F<B>
-}
-```
-
-#### 2.11.2 Monad 组合
-
-```glue
-trait Monad {
-    type M
-    fun pure(value: Self.M): Self
-    fun bind(self, f: Self.M -> Self): Self
-}
-
-type List: Monad = List(...) {
-    type M = i32  // 示例
-    fun pure(value: i32): List { Cons(value, Nil) }
-    fun bind(self, f: i32 -> List): List { 
-        concat_map(self, f) 
-    }
-}
-
-// 通用 @ 上下文表达式（语法糖）
-fun compute(): List<i32> {
-    @List {
-        x <- [1, 2, 3]
-        y <- [4, 5, 6]
-        x + y
-    }
-}
-// => [5, 6, 7, 6, 7, 8, 7, 8, 9]
 ```
 
 ### 2.12 子类型关系
@@ -2515,8 +2475,7 @@ glue/
 |---|---|
 | Kind 系统 | `*`、`* -> *`、`* -> * -> *` 等 |
 | Kind 推断 | 自动推导 |
-| Trait HKT | Functor、Monad 等高阶 trait |
-| Monad `@` 语法 | 上下文表达式语法糖 |
+| Trait HKT | 高阶抽象，增强表达力 |
 
 #### Phase 6：GADT
 

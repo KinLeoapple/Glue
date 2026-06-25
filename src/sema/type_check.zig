@@ -2615,7 +2615,7 @@ pub const TypeInferencer = struct {
                 _ = self.inferExpr(lz.expr, env, null) catch {};
                 return self.freshTypeVar();
             },
-            .monad_comprehension, .inline_trait_value => {
+            .inline_trait_value => {
                 return self.freshTypeVar();
             },
         };

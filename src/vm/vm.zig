@@ -1447,7 +1447,7 @@ pub const VM = struct {
                 try self.push(Value{ .channel_val = ch });
             },
             // M5b：type(v) —— 返回运行时类型名字符串（镜像 eval builtinTypeName/valueTypeName）。
-            .type_of => {
+            .type => {
                 if (argc != 1) return self.fail(loc, "type expects 1 argument", error.WrongArity);
                 const v = self.pop();
                 defer v.releaseVM(self.allocator);
