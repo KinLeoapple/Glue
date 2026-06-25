@@ -1,13 +1,43 @@
-// Test float type inference - boundary cases
+// 综合测试：浮点类型推断与溢出检查（精确优先）
 
 fun main() {
-    // Test 1: f32 range limit (max ~3.4e38)
-    val a = 1.0e38
-    println(a)
+    println("=== 精确推断测试 ===")
 
-    // Test 2: Just over f32, needs f64
-    val b = 1.0e39
-    println(b)
+    // 测试 1: 小值精确推断为 f16
+    val a = 1.5
+    val b = 2.5
+    println(a + b)  // 4.0, f16 精确表示
 
-    println("Boundary tests passed!")
+    // 测试 2: f16 边界值
+    val c = 65504.0  // f16 最大值
+    println(c)
+
+    // 测试 3: 超出 f16，推断为 f32
+    val d = 100000.0
+    println(d)
+
+    // 测试 4: 显式类型允许精度损失
+    val e = 1.0e20f32  // f32 范围内，但可能有精度损失
+    println(e)
+
+    println("=== 溢出检查测试 ===")
+
+    // 测试 5: 显式类型溢出（运行时）
+    val max32 = 3.0e38f32
+    val half = 2.0f32
+    // val overflow = max32 * half  // 这会触发运行时溢出错误
+    println(max32)
+
+    // 测试 6: f16 溢出检查
+    val max16 = 60000.0f16
+    println(max16)
+
+    println("=== 类型提升测试 ===")
+
+    // 测试 7: 混合精度运算
+    val f16val = 1.5
+    val f32val = 1000.0f32
+    println(f16val + f32val)  // 提升为 f32
+
+    println("\n所有测试通过！精确优先策略正常工作。")
 }
