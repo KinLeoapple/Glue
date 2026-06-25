@@ -405,21 +405,26 @@ pub const ValueTag = enum(u8) {
     boolean = 2,      // payload: 0=false, 1=true
     small_int = 3,    // payload: i48 有符号整数
     char_val = 4,     // payload: u21 Unicode 码点
-    float_val = 5,    // payload: f64 位模式
+
+    // 浮点类型（多精度支持）
+    float16 = 5,      // payload: u16 位模式
+    float32 = 6,      // payload: u32 位模式
+    float64 = 7,      // payload: f64 位模式
 
     // 装箱类型（payload 存指针，指向 BoxedValue）
     big_int = 10,     // i64/i128/u64/u128 超出 i48 范围
-    string = 11,
-    array = 12,
-    record = 13,
-    adt = 14,
-    newtype = 15,
-    range = 16,
-    vm_closure = 17,
-    partial = 18,
-    builtin = 19,
-    error_val = 20,
-    throw_val = 21,
+    float128 = 11,    // f128 超出 8字节
+    string = 12,
+    array = 13,
+    record = 14,
+    adt = 15,
+    newtype = 16,
+    range = 17,
+    vm_closure = 18,
+    partial = 19,
+    builtin = 20,
+    error_val = 21,
+    throw_val = 22,
 
     // 迭代器
     array_iterator = 30,
@@ -492,8 +497,58 @@ pub const Value = struct {
         return .{ .tag = .char_val, .payload = c };
     }
 
+    /// 多精度浮点编码（根据FloatValue的type_tag选择）
+    pub fn fromFloatValue(allocator: std.mem.Allocator, float_val: FloatValue) !Value {
+        return switch (float_val.type_tag) {
+            .f16 => {
+                const f16_val: f16 = @floatCast(float_val.value);
+                const u16_val: u16 = @bitCast(f16_val);
+                return .{ .tag = .float16, .payload = u16_val };
+            },
+            .f32 => {
+                const f32_val: f32 = @floatCast(float_val.value);
+                const u32_val: u32 = @bitCast(f32_val);
+                return .{ .tag = .float32, .payload = u32_val };
+            },
+            .f64 => {
+                const f64_val: f64 = @floatCast(float_val.value);
+                return .{ .tag = .float64, .payload = @bitCast(f64_val) };
+            },
+            .f128 => try fromFloat128(allocator, float_val.value),
+        };
+    }
+
+    /// f16 编码（2字节内联）
+    pub inline fn fromFloat16(f: f16) Value {
+        const u16_val: u16 = @bitCast(f);
+        return .{ .tag = .float16, .payload = u16_val };
+    }
+
+    /// f32 编码（4字节内联）
+    pub inline fn fromFloat32(f: f32) Value {
+        const u32_val: u32 = @bitCast(f);
+        return .{ .tag = .float32, .payload = u32_val };
+    }
+
+    /// f64 编码（8字节内联）
+    pub inline fn fromFloat64(f: f64) Value {
+        return .{ .tag = .float64, .payload = @bitCast(f) };
+    }
+
+    /// f128 编码（16字节装箱）
+    pub fn fromFloat128(allocator: std.mem.Allocator, f: f128) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .float128,
+            .rc = 1,
+            .payload = .{ .float128 = f },
+        };
+        return .{ .tag = .float128, .payload = @intFromPtr(box) };
+    }
+
+    /// 向后兼容：统一浮点编码（默认f64）
     pub inline fn fromFloat(f: f64) Value {
-        return .{ .tag = .float_val, .payload = @bitCast(f) };
+        return fromFloat64(f);
     }
 
     pub inline fn fromString(allocator: std.mem.Allocator, s: []const u8) !Value {
@@ -690,9 +745,60 @@ pub const Value = struct {
         return @intCast(self.payload);
     }
 
-    pub inline fn asFloat(self: Value) f64 {
-        std.debug.assert(self.tag == .float_val);
+    /// 多精度浮点解码（返回FloatValue保留类型信息）
+    pub fn asFloatValue(self: Value) FloatValue {
+        return switch (self.tag) {
+            .float16 => {
+                const u16_val: u16 = @intCast(self.payload);
+                const f16_val: f16 = @bitCast(u16_val);
+                return .{ .value = @floatCast(f16_val), .type_tag = .f16 };
+            },
+            .float32 => {
+                const u32_val: u32 = @intCast(self.payload);
+                const f32_val: f32 = @bitCast(u32_val);
+                return .{ .value = @floatCast(f32_val), .type_tag = .f32 };
+            },
+            .float64 => {
+                const f64_val: f64 = @bitCast(self.payload);
+                return .{ .value = @floatCast(f64_val), .type_tag = .f64 };
+            },
+            .float128 => {
+                const box = self.asBoxed();
+                return .{ .value = box.payload.float128, .type_tag = .f128 };
+            },
+            else => unreachable,
+        };
+    }
+
+    /// f16 解码
+    pub inline fn asFloat16(self: Value) f16 {
+        std.debug.assert(self.tag == .float16);
+        const u16_val: u16 = @intCast(self.payload);
+        return @bitCast(u16_val);
+    }
+
+    /// f32 解码
+    pub inline fn asFloat32(self: Value) f32 {
+        std.debug.assert(self.tag == .float32);
+        const u32_val: u32 = @intCast(self.payload);
+        return @bitCast(u32_val);
+    }
+
+    /// f64 解码
+    pub inline fn asFloat64(self: Value) f64 {
+        std.debug.assert(self.tag == .float64);
         return @bitCast(self.payload);
+    }
+
+    /// f128 解码
+    pub inline fn asFloat128(self: Value) f128 {
+        std.debug.assert(self.tag == .float128);
+        return self.asBoxed().payload.float128;
+    }
+
+    /// 向后兼容：统一浮点解码（默认f64）
+    pub inline fn asFloat(self: Value) f64 {
+        return self.asFloat64();
     }
 
     pub inline fn asBoxed(self: Value) *BoxedValue {
@@ -730,6 +836,11 @@ pub const Value = struct {
 
     pub inline fn isInteger(self: Value) bool {
         return self.tag == .small_int or self.tag == .big_int;
+    }
+
+    pub inline fn isFloat(self: Value) bool {
+        return self.tag == .float16 or self.tag == .float32 or
+               self.tag == .float64 or self.tag == .float128;
     }
 
     // ============================================================
@@ -815,7 +926,9 @@ pub const Value = struct {
             .boolean => self.asBool() == other.asBool(),
             .small_int => self.asSmallInt() == other.asSmallInt(),
             .char_val => self.asChar() == other.asChar(),
-            .float_val => self.asFloat() == other.asFloat(),
+            .float16 => self.asFloat16() == other.asFloat16(),
+            .float32 => self.asFloat32() == other.asFloat32(),
+            .float64 => self.asFloat64() == other.asFloat64(),
             else => self.payload == other.payload, // 指针相等
         };
     }
@@ -830,6 +943,7 @@ pub const BoxedValue = struct {
     rc: u32,
     payload: union {
         big_int: IntValue,
+        float128: f128,      // 新增f128装箱
         string: []const u8,
         array: ArrayValue,
         record: RecordValue,
@@ -992,7 +1106,7 @@ test "char value" {
 test "float value" {
     const v = Value.fromFloat(3.14159);
     try testing.expectApproxEqRel(3.14159, v.asFloat(), 0.00001);
-    try testing.expectEqual(ValueTag.float_val, v.tag);
+    try testing.expectEqual(ValueTag.float64, v.tag);
 }
 
 test "small int - positive" {
@@ -1678,4 +1792,100 @@ test "Integer type in range checks" {
     const u8_type = IntType.u8;
     try testing.expect(u8_type.inRange(255));
     try testing.expect(!u8_type.inRange(256));
+}
+
+// Day4+ 多精度浮点测试
+
+test "Float16 encoding and decoding" {
+    const f16_val: f16 = 3.14;
+    const v = Value.fromFloat16(f16_val);
+    
+    try testing.expectEqual(ValueTag.float16, v.tag);
+    try testing.expect(v.isInline());
+    try testing.expect(v.isFloat());
+    
+    const recovered = v.asFloat16();
+    try testing.expectApproxEqRel(f16_val, recovered, 0.01);
+}
+
+test "Float32 encoding and decoding" {
+    const f32_val: f32 = 3.141592;
+    const v = Value.fromFloat32(f32_val);
+    
+    try testing.expectEqual(ValueTag.float32, v.tag);
+    try testing.expect(v.isInline());
+    
+    const recovered = v.asFloat32();
+    try testing.expectApproxEqRel(f32_val, recovered, 0.00001);
+}
+
+test "Float64 encoding and decoding" {
+    const f64_val: f64 = 3.141592653589793;
+    const v = Value.fromFloat64(f64_val);
+    
+    try testing.expectEqual(ValueTag.float64, v.tag);
+    try testing.expect(v.isInline());
+    
+    const recovered = v.asFloat64();
+    try testing.expectEqual(f64_val, recovered);
+}
+
+test "Float128 boxing" {
+    const allocator = testing.allocator;
+    
+    const f128_val: f128 = 3.14159265358979323846264338327950288;
+    const v = try Value.fromFloat128(allocator, f128_val);
+    defer v.release(allocator);
+    
+    try testing.expectEqual(ValueTag.float128, v.tag);
+    try testing.expect(v.isBoxed());
+    try testing.expect(v.isFloat());
+    
+    const recovered = v.asFloat128();
+    try testing.expectEqual(f128_val, recovered);
+}
+
+test "FloatValue round-trip with type preservation" {
+    const allocator = testing.allocator;
+    
+    // f16
+    const fv16 = FloatValue{ .value = 3.14, .type_tag = .f16 };
+    const v16 = try Value.fromFloatValue(allocator, fv16);
+    const recovered16 = v16.asFloatValue();
+    try testing.expectEqual(FloatType.f16, recovered16.type_tag);
+    
+    // f32
+    const fv32 = FloatValue{ .value = 3.14159, .type_tag = .f32 };
+    const v32 = try Value.fromFloatValue(allocator, fv32);
+    const recovered32 = v32.asFloatValue();
+    try testing.expectEqual(FloatType.f32, recovered32.type_tag);
+    
+    // f64
+    const fv64 = FloatValue{ .value = 0.1, .type_tag = .f64 };
+    const v64 = try Value.fromFloatValue(allocator, fv64);
+    const recovered64 = v64.asFloatValue();
+    try testing.expectEqual(FloatType.f64, recovered64.type_tag);
+    
+    // f128
+    const fv128 = FloatValue{ .value = 1e100, .type_tag = .f128 };
+    const v128 = try Value.fromFloatValue(allocator, fv128);
+    defer v128.release(allocator);
+    const recovered128 = v128.asFloatValue();
+    try testing.expectEqual(FloatType.f128, recovered128.type_tag);
+}
+
+test "isFloat type check" {
+    const allocator = testing.allocator;
+    
+    try testing.expect(Value.fromFloat16(1.0).isFloat());
+    try testing.expect(Value.fromFloat32(1.0).isFloat());
+    try testing.expect(Value.fromFloat64(1.0).isFloat());
+    
+    const f128_v = try Value.fromFloat128(allocator, 1.0);
+    defer f128_v.release(allocator);
+    try testing.expect(f128_v.isFloat());
+    
+    // 非浮点值
+    try testing.expect(!Value.fromSmallInt(42).isFloat());
+    try testing.expect(!Value.fromBool(true).isFloat());
 }
