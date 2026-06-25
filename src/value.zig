@@ -182,21 +182,6 @@ pub const Cell = struct {
     rc: u32 = 1,
 };
 
-
-pub const Closure = struct {
-    params: []ast.Param,
-    body: ast.LambdaBody,
-    env: *anyopaque, // *Environment（capture_env）— 不透明指针避免循环依赖
-    allocator: std.mem.Allocator,
-    /// 续14/闭包转换：引用计数。闭包现持 capture_env（快照的自由变量 val + 共享 cell），
-    /// 归零时须 releaseEnv 该 capture_env（否则捕获的值/cell 泄漏，如 len 内 go 捕获的大列表）。
-    /// 装箱 rc：闭包值经 clone/retain 复制句柄时 +1，release 时 -1，归零释放 capture_env + 箱体。
-    rc: u32 = 1,
-    /// capture_env 的释放回调（env.zig 设置，避免 value→env 循环依赖）。归零时调用 env_release_fn(env)。
-    /// null 时不释放 env（如旧式 retain 的 env、或无 capture 的场景）。
-    env_release_fn: ?*const fn (*anyopaque) void = null,
-};
-
 /// 字节码 VM 的闭包值（M1b）。与树遍历器 `Closure`（AST 形态）平行：
 /// 这里 func 指向编译后的 `chunk.Function`，以 `*const anyopaque` 存储以打破
 /// value↔chunk 循环依赖（chunk.zig import value，故 value 不能 import chunk）。
@@ -622,11 +607,7 @@ pub const Value = union(enum) {
     // 范围
     range: Range,
 
-    // 闭包
-    closure: *Closure,
-
-    /// 字节码 VM 闭包（M1b）：编译后函数 + 捕获的 upvalues。与 closure 并存，
-    /// 由 VM 产生/消费；eval 不构造它（但 retain/release/clone 等需识别以保正确性）。
+    /// 字节码 VM 闭包（M1b）：编译后函数 + 捕获的 upvalues。
     vm_closure: *VmClosure,
 
     // 部分应用（默认柯里化）
@@ -694,7 +675,6 @@ pub const Value = union(enum) {
             .array => |p| p.rc += 1,
             .record => |p| p.rc += 1,
             .cell_val => |p| p.rc += 1, // 续14/闭包转换：cell 帧+闭包联合持有
-            .closure => |p| p.rc += 1, // 续14/闭包转换：闭包 rc，归零释放 capture_env
             .vm_closure => |p| p.rc += 1, // M1b：VM 闭包 rc，归零释放 upvalues
             else => {},
         }
@@ -736,13 +716,6 @@ pub const Value = union(enum) {
                 if (p.rc > 1) { p.rc -= 1; return; }
                 p.inner.release(allocator);
                 allocator.destroy(p);
-            },
-            .closure => |p| {
-                // 续14/闭包转换：归零才释放 capture_env（经 env_release_fn）+ 箱体。
-                // capture_env 持有快照的 val 值 + 共享 cell；不释放会泄漏（如 go 捕获的大列表）。
-                if (p.rc > 1) { p.rc -= 1; return; }
-                if (p.env_release_fn) |f| f(p.env);
-                p.allocator.destroy(p);
             },
             .vm_closure => |p| {
                 // M1b：归零才释放捕获的 upvalues + bound_args + slice + 箱体。func 指向 Program
@@ -958,11 +931,6 @@ pub const Value = union(enum) {
             .string => |s| Value{ .string = try allocator.dupe(u8, s) },
             .array => self.retain(),
             .record => self.retain(),
-            // §5.2 规则 5: 闭包 — 同 Heap 内浅拷贝（rc+1 共享 capture_env）；跨 Heap 由 deepCloneValue 处理
-            .closure => |c| {
-                c.rc += 1;
-                return Value{ .closure = c };
-            },
             // M1b：VM 闭包同 Heap 内浅拷贝（rc+1 共享 upvalues）。
             .vm_closure => |c| {
                 c.rc += 1;
@@ -1195,7 +1163,6 @@ pub const Value = union(enum) {
                 }
                 try buf.appendSlice(allocator, ")");
             },
-            .closure => try buf.appendSlice(allocator, "<closure>"),
             .vm_closure => try buf.appendSlice(allocator, "<fn>"),
             .partial => try buf.appendSlice(allocator, "<partial>"),
             .builtin => try buf.appendSlice(allocator, "<builtin>"),
@@ -1295,7 +1262,6 @@ pub const Value = union(enum) {
             .record => |r| @intFromPtr(&r) == @intFromPtr(&other.record),
             .adt => |av| av == other.adt, // 引用相等
             .newtype => |nv| nv == other.newtype, // 引用相等
-            .closure => |c| c == other.closure,
             .vm_closure => |c| c == other.vm_closure,
             .partial => |pa| pa == other.partial,
             .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,

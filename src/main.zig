@@ -5,7 +5,6 @@ const parser = @import("parser");
 const ast = @import("ast");
 const module_loader = @import("module_loader");
 const value = @import("value");
-const env = @import("env");
 const slab_pool = @import("slab_pool");
 const vm = @import("vm");
 

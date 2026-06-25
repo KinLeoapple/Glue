@@ -88,11 +88,11 @@ pub fn build(b: *std.Build) void {
     });
 
     // ============================================================
-    // runtime/ modules - 运行时值表示
+    // value module - 核心值表示层（与 ast 同级）
     // ============================================================
 
     const value_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/value.zig"),
+        .root_source_file = b.path("src/value.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -105,14 +105,6 @@ pub fn build(b: *std.Build) void {
     channel_module.addImport("value", value_module);
     spawn_module.addImport("value", value_module);
     vtable_module.addImport("value", value_module);
-
-    const env_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/env.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    env_module.addImport("value", value_module);
-    env_module.addImport("intern", intern_module);
 
     // ============================================================
     // sema/ modules - 语义分析（类型检查、trait解析等）
@@ -261,7 +253,6 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("parser", parser_module);
     root_module.addImport("module_loader", module_loader_module);
     root_module.addImport("value", value_module);
-    root_module.addImport("env", env_module);
     root_module.addImport("slab_pool", slab_pool_module);
     root_module.addImport("zio", zio_module);
     // M5：字节码 VM 接入 glue run（vm_module 再导出 VM/Program/ModuleCompiler/lexer/parser）。

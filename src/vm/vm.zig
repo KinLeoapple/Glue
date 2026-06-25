@@ -163,7 +163,7 @@ fn vmValueTypeName(val: Value) []const u8 {
         .trait_value => |tv| if (tv.trait_name.len > 0) tv.trait_name else "trait",
         .lazy_val => "Lazy",
         .cell_val => |c| vmValueTypeName(c.inner),
-        .closure, .builtin, .vm_closure => "function",
+        .builtin, .vm_closure => "function",
     };
 }
 
