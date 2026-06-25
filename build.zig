@@ -5,16 +5,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ============================================================
-    // Zio dependency (stackful coroutine runtime)
-    // ============================================================
-
-    const zio_dep = b.dependency("zio", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const zio_module = zio_dep.module("zio");
-
-    // ============================================================
     // Shared base modules
     // ============================================================
 
@@ -48,15 +38,14 @@ pub fn build(b: *std.Build) void {
     // runtime/ sub-modules
     // ============================================================
 
-    const scheduler_module = b.createModule(.{
-        .root_source_file = b.path("runtime/scheduler.zig"),
+    const slab_pool_module = b.createModule(.{
+        .root_source_file = b.path("runtime/slab_pool.zig"),
         .target = target,
         .optimize = optimize,
     });
-    scheduler_module.addImport("zio", zio_module);
 
-    const slab_pool_module = b.createModule(.{
-        .root_source_file = b.path("runtime/slab_pool.zig"),
+    const sync_module = b.createModule(.{
+        .root_source_file = b.path("runtime/sync.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -66,14 +55,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    channel_module.addImport("zio", zio_module);
 
     const spawn_module = b.createModule(.{
         .root_source_file = b.path("runtime/spawn.zig"),
         .target = target,
         .optimize = optimize,
     });
-    spawn_module.addImport("zio", zio_module);
 
     const atomic_module = b.createModule(.{
         .root_source_file = b.path("runtime/atomic.zig"),
@@ -103,7 +90,9 @@ pub fn build(b: *std.Build) void {
     value_module.addImport("spawn", spawn_module);
     atomic_module.addImport("value", value_module);
     channel_module.addImport("value", value_module);
+    channel_module.addImport("sync", sync_module);
     spawn_module.addImport("value", value_module);
+    spawn_module.addImport("sync", sync_module);
     vtable_module.addImport("value", value_module);
 
     // ============================================================
@@ -254,14 +243,8 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("module_loader", module_loader_module);
     root_module.addImport("value", value_module);
     root_module.addImport("slab_pool", slab_pool_module);
-    root_module.addImport("zio", zio_module);
     // M5：字节码 VM 接入 glue run（vm_module 再导出 VM/Program/ModuleCompiler/lexer/parser）。
     root_module.addImport("vm", vm_module);
-
-    // Zio 在 Windows 上需要 ws2_32（Winsock2，IOCP 后端依赖）
-    if (target.result.os.tag == .windows) {
-        root_module.linkSystemLibrary("ws2_32", .{});
-    }
 
     // Create glue executable
     const exe = b.addExecutable(.{

@@ -15,6 +15,40 @@ const kind_check = @import("kind_check");
 const gadt_check = @import("gadt_check");
 const module_check = @import("module_check");
 
+/// 测试浮点值能否在指定类型中精确往返（f64 → T → f64）
+fn canRoundTripFloat(comptime T: type, val: f64) bool {
+    // 特殊值总是可以表示
+    if (std.math.isNan(val) or std.math.isInf(val) or val == 0.0) {
+        return true;
+    }
+
+    // 检查是否在范围内
+    const abs_val = @abs(val);
+    const max_val: f64 = switch (T) {
+        f16 => 65504.0,
+        f32 => 3.4028234663852886e38,
+        f64 => std.math.floatMax(f64),
+        f128 => std.math.floatMax(f64), // f64 → f128 总是精确
+        else => @compileError("Unsupported float type"),
+    };
+
+    if (abs_val > max_val) {
+        return false;
+    }
+
+    // 测试往返精度：f64 → T → f64
+    const converted: T = @floatCast(val);
+    const back: f64 = @floatCast(converted);
+
+    // 检查往返后是否相等（允许极小的浮点误差）
+    const epsilon = std.math.floatEps(f64);
+    const diff = @abs(back - val);
+    const relative_error = if (abs_val > 0.0) diff / abs_val else diff;
+
+    return relative_error < epsilon * 10.0;
+}
+
+
 // ============================================================
 // 类型表示
 // ============================================================
@@ -1814,9 +1848,29 @@ pub const TypeInferencer = struct {
 
                 // §6.12规则3: 无后缀也无标注，推断为能精确往返的最小类型
                 // 按 f16 → f32 → f64 → f128 逐级尝试
-                // TODO: 实现精确的round-trip测试
-                // 当前简化：默认f64（兼容大多数情况）
-                return self.makeType(.f64_type);
+                // 解析原始字符串为 f64
+                const float_val = std.fmt.parseFloat(f64, lit.raw) catch {
+                    // 解析失败，默认 f64
+                    return self.makeType(.f64_type);
+                };
+
+                // f16: ±65504, 精度 ~3位小数
+                if (canRoundTripFloat(f16, float_val)) {
+                    return self.makeType(.f16_type);
+                }
+
+                // f32: ±3.4e38, 精度 ~7位小数
+                if (canRoundTripFloat(f32, float_val)) {
+                    return self.makeType(.f32_type);
+                }
+
+                // f64: ±1.7e308, 精度 ~15位小数
+                if (canRoundTripFloat(f64, float_val)) {
+                    return self.makeType(.f64_type);
+                }
+
+                // f128: 回退（极大范围和精度）
+                return self.makeType(.f128_type);
             },
             .bool_literal => self.makeType(.bool_type),
             .char_literal => self.makeType(.char_type),

@@ -164,8 +164,8 @@ pub const ModuleLoader = struct {
             }
         }
 
-        // TODO: 添加文件系统加载逻辑
-        // 目前只支持 stdlib 模块
+        // 文件系统加载：TODO - 需要实现跨平台的文件打开
+        // 当前暂时禁用，只支持 stdlib
 
         // 回退到 stdlib 查找
         if (module_path.len == 1) {

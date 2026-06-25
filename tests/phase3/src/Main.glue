@@ -9,10 +9,20 @@ fun greet(user: (name: str)) : str {
 // 3. 记录更新
 
 // 4. Error 子类型
-type FileError = Error("file error")
-type NetworkError = Error("network error")
+type FileError: Error = FileError(msg: str) {
+    override fun prefix(self): str {
+        "file error"
+    }
+}
+
+type NetworkError: Error = NetworkError(msg: str) {
+    override fun prefix(self): str {
+        "network error"
+    }
+}
 
 fun read_file(path: str) : Throw<str, FileError> {
+
     throw FileError(path + " not found")
 }
 
@@ -25,7 +35,11 @@ fun handle_error(result: Throw<str, Error>) : str {
 }
 
 // 7. 多种错误类型
-type ParseError = Error("parse error")
+type ParseError: Error = ParseError(msg: str) {
+    override fun prefix(self): str {
+        "parse error"
+    }
+}
 
 fun parse_int(s: str) : Throw<i32, ParseError> {
     throw ParseError("invalid integer: " + s)

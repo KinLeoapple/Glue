@@ -2,19 +2,14 @@
 //!
 //! 文档 §3.5: 通过 channel 通信，不通过共享内存通信
 //! 文档 §5.2: Channel 位于调度器 heap 中，两端只持有引用
-//!
-//! 使用 Zio 协程级同步原语（zio.Mutex/zio.Condition）：
-//! - 在 Zio 协程上下文中：lock/wait 挂起当前协程让出执行权（M:N 调度友好）
-//! - 在非协程上下文中（主线程/std.Thread）：自动回退到 futex 阻塞
-//! - Zio Waiter 内部通过 getCurrentTaskOrNull() 检测上下文，自动选择挂起策略
 
 const std = @import("std");
-const zio = @import("zio");
 const value = @import("value");
+const sync = @import("sync");
 
 const Value = value.Value;
-const ZioMutex = zio.Mutex;
-const ZioCondition = zio.Condition;
+const Mutex = sync.Mutex;
+const Condition = sync.Condition;
 
 /// Channel 值 — CSP 通信通道
 /// 文档 §3.5: 通过 channel 通信，不通过共享内存通信
@@ -25,13 +20,12 @@ pub const ChannelValue = struct {
     capacity: usize,
     /// 是否已关闭
     closed: bool,
-    /// Zio 协程级互斥锁 — 保护缓冲区和关闭状态
-    /// 在协程中挂起协程让出执行权，在非协程中回退到 futex
-    mutex: ZioMutex,
-    /// Zio 协程级条件变量 — recv 等待数据
-    not_empty: ZioCondition,
-    /// Zio 协程级条件变量 — send 等待空间
-    not_full: ZioCondition,
+    /// 互斥锁 — 保护缓冲区和关闭状态
+    mutex: Mutex,
+    /// 条件变量 — recv 等待数据
+    not_empty: Condition,
+    /// 条件变量 — send 等待空间
+    not_full: Condition,
     /// 分配器
     allocator: std.mem.Allocator,
     /// 引用计数
@@ -42,9 +36,9 @@ pub const ChannelValue = struct {
             .buffer = std.ArrayList(Value).empty,
             .capacity = cap,
             .closed = false,
-            .mutex = ZioMutex.init,
-            .not_empty = ZioCondition.init,
-            .not_full = ZioCondition.init,
+            .mutex = .{},
+            .not_empty = .{},
+            .not_full = .{},
             .allocator = allocator,
             .ref_count = std.atomic.Value(usize).init(1),
         };
@@ -61,7 +55,7 @@ pub const ChannelValue = struct {
     /// 发送值到通道
     /// 关闭后返回 false
     pub fn send(self: *ChannelValue, val: Value) !bool {
-        self.mutex.lockUncancelable();
+        self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.closed) return false;
@@ -74,7 +68,7 @@ pub const ChannelValue = struct {
         } else {
             while (self.buffer.items.len >= self.capacity) {
                 if (self.closed) return false;
-                self.not_empty.waitUncancelable(&self.mutex);
+                self.not_full.wait(&self.mutex);
             }
             try self.buffer.append(self.allocator, val);
             self.not_empty.signal();
@@ -85,12 +79,12 @@ pub const ChannelValue = struct {
     /// 从通道接收值
     /// 缓冲区耗尽且已关闭返回 null
     pub fn recv(self: *ChannelValue) ?Value {
-        self.mutex.lockUncancelable();
+        self.mutex.lock();
         defer self.mutex.unlock();
 
         while (self.buffer.items.len == 0) {
             if (self.closed) return null;
-            self.not_empty.waitUncancelable(&self.mutex);
+            self.not_empty.wait(&self.mutex);
         }
 
         const val = self.buffer.orderedRemove(0);
@@ -101,7 +95,7 @@ pub const ChannelValue = struct {
     /// 非阻塞接收 — 用于 select
     /// 无数据时返回 null（不区分关闭和空缓冲）
     pub fn tryRecv(self: *ChannelValue) ?Value {
-        self.mutex.lockUncancelable();
+        self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.buffer.items.len == 0) return null;
@@ -112,7 +106,7 @@ pub const ChannelValue = struct {
 
     /// 关闭通道（仅 Sender 可调用）
     pub fn close(self: *ChannelValue) void {
-        self.mutex.lockUncancelable();
+        self.mutex.lock();
         self.closed = true;
         self.mutex.unlock();
         self.not_empty.broadcast();

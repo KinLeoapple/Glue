@@ -9,10 +9,29 @@
 // ============================================================
 
 // 自定义错误类型（Error 子类型）
-type FileError = Error("file error")
-type NetworkError = Error("network error")
-type ParseError = Error("parse error")
-type DbError = Error("database error")
+type FileError: Error = FileError(msg: str) {
+    override fun prefix(self): str {
+        "file error"
+    }
+}
+
+type NetworkError: Error = NetworkError(msg: str) {
+    override fun prefix(self): str {
+        "network error"
+    }
+}
+
+type ParseError: Error = ParseError(msg: str) {
+    override fun prefix(self): str {
+        "parse error"
+    }
+}
+
+type DbError: Error = DbError(msg: str) {
+    override fun prefix(self): str {
+        "database error"
+    }
+}
 
 // Newtype — 零开销包装
 type UserId = UserId(i32)

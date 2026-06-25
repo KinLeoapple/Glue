@@ -441,12 +441,14 @@ pub const TypeDef = union(enum) {
     },
 
     /// 错误 newtype（自定义错误类型）：
-    /// type FileError = Error("file error")
+    /// type FileError: Error = FileError(msg: str) { override fun prefix(self): str { "file error" } }
     error_newtype: struct {
-        /// 错误类型名称
+        /// 构造器名称（与类型名相同）
         name: []const u8,
-        /// 默认消息前缀
-        message: []const u8,
+        /// 构造器参数（通常是 msg: str）
+        params: []Param,
+        /// 方法体（override 的方法，如 prefix）
+        methods: []MethodDecl,
     },
 };
 

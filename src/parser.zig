@@ -546,13 +546,21 @@ pub const Parser = struct {
 
         // 实现的 trait 列表：: Trait1, Trait2
         var implemented_traits = std.ArrayList(ast.TraitBound).empty;
+        var has_error_trait = false;
         if (self.matchToken(.colon)) {
             try self.parseTraitBoundList(&implemented_traits);
+            // 检查是否实现了 Error trait
+            for (implemented_traits.items) |trait_bound| {
+                if (std.mem.eql(u8, trait_bound.trait_name, "Error")) {
+                    has_error_trait = true;
+                    break;
+                }
+            }
         }
 
         _ = self.expect(.eq, "expected '=' to define type body") catch {};
 
-        var def = try self.parseTypeDef();
+        var def = try self.parseTypeDef(has_error_trait);
 
         // 修正 error_newtype 的 name：文档语法 type FileError = Error("msg")
         // 中 FileError 才是类型名，Error("msg") 只是定义体
@@ -571,6 +579,11 @@ pub const Parser = struct {
         if (self.matchToken(.l_brace)) {
             try self.parseMethodBlock(&methods);
             _ = self.expect(.r_brace, "expected '}' to close method block") catch {};
+
+            // 如果是 error_newtype，将方法附加到其定义中
+            if (def == .error_newtype) {
+                def.error_newtype.methods = try methods.toOwnedSlice(self.allocator);
+            }
         }
 
         return ast.Decl{
@@ -582,13 +595,13 @@ pub const Parser = struct {
                 .implemented_traits = try implemented_traits.toOwnedSlice(self.allocator),
                 .type_constraints = try type_constraints.toOwnedSlice(self.allocator),
                 .def = def,
-                .methods = try methods.toOwnedSlice(self.allocator),
+                .methods = if (def == .error_newtype) &.{} else try methods.toOwnedSlice(self.allocator),
             },
         };
     }
 
     /// 解析类型定义体
-    fn parseTypeDef(self: *Parser) ParserError!ast.TypeDef {
+    fn parseTypeDef(self: *Parser, has_error_trait: bool) ParserError!ast.TypeDef {
         // 检查 ADT：以 | 开头
         if (self.matchToken(.pipe)) {
             return self.parseAdtBody();
@@ -603,23 +616,66 @@ pub const Parser = struct {
             self.current = saved;
         }
 
-        // 检查 error newtype：Error("message")
-        if (self.checkIdentifier("Error")) {
-            const saved = self.current;
-            if (self.tryParseErrorNewtype()) |def| {
-                return def;
-            }
-            self.current = saved;
-        }
-
-        // 检查单构造器 ADT：Name(field: Type, ...) 或 Name(Type, ...)
-        // type Pair = Pair(first: i32, second: i32)
-        // type Handle = Handle(i32)
+        // 检查 error newtype 或构造器：Name(params)
         if (self.check(.identifier)) {
             const saved = self.current;
-            if (self.tryParseSingleCtorAdt()) |def| {
-                return def;
+            const name_tok = self.advance();
+
+            // 如果有参数列表，尝试解析
+            if (self.check(.l_paren)) {
+                _ = self.advance(); // 消费 (
+
+                // 解析参数列表
+                var params = std.ArrayList(ast.Param).empty;
+                if (!self.check(.r_paren)) {
+                    // 检查是否是命名参数 (msg: str)
+                    const saved2 = self.current;
+                    if (self.check(.identifier)) {
+                        _ = self.advance(); // 检查下一个 token
+                        if (self.check(.colon)) {
+                            // 命名参数，回退并解析
+                            self.current = saved2;
+                            try self.parseParamList(&params);
+                            _ = self.expect(.r_paren, "expected ')'") catch {
+                                self.current = saved;
+                                const target = try self.parseType();
+                                return ast.TypeDef{ .alias = .{ .target = target } };
+                            };
+
+                            // 只有在实现了 Error trait 时才是 error newtype
+                            if (has_error_trait) {
+                                return ast.TypeDef{
+                                    .error_newtype = .{
+                                        .name = name_tok.lexeme,
+                                        .params = try params.toOwnedSlice(self.allocator),
+                                        .methods = &.{},
+                                    },
+                                };
+                            }
+
+                            // 否则是单构造器 ADT
+                            self.current = saved;
+                            if (self.tryParseSingleCtorAdt()) |def| {
+                                return def;
+                            }
+                            self.current = saved;
+                        }
+                        self.current = saved2;
+                    }
+
+                    // 回退，可能是单构造器 ADT
+                    self.current = saved;
+                    if (self.tryParseSingleCtorAdt()) |def| {
+                        return def;
+                    }
+                    self.current = saved;
+                } else {
+                    // 空参数列表，检查是否跟随 { 方法块
+                    // 这种情况可能是 Error newtype 但还没实现
+                }
             }
+
+            // 回退
             self.current = saved;
         }
 
@@ -767,24 +823,6 @@ pub const Parser = struct {
             }
         }
         return null;
-    }
-
-    /// 尝试解析错误 newtype：Error("message")
-    fn tryParseErrorNewtype(self: *Parser) ?ast.TypeDef {
-        _ = self.advance(); // 消费 Error
-        if (!self.check(.l_paren)) return null;
-        _ = self.advance(); // 消费 (
-        if (!self.check(.string_literal)) return null;
-        const msg = self.advance();
-        _ = self.expect(.r_paren, "expected ')'") catch return null;
-        // 去除字符串字面量的引号
-        const raw_msg = if (msg.lexeme.len >= 2) msg.lexeme[1 .. msg.lexeme.len - 1] else msg.lexeme;
-        return ast.TypeDef{
-            .error_newtype = .{
-                .name = "Error",
-                .message = raw_msg,
-            },
-        };
     }
 
     /// 解析 ADT 体：| Constructor(fields) | ...

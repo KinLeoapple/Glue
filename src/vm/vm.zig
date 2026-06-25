@@ -72,7 +72,7 @@ fn spawnThreadEntry(ctx: *SpawnCtx) void {
         return;
     };
 
-    handle.mutex.lockUncancelable();
+    handle.mutex.lock();
     handle.result = result; // 在 arena 内；await 深拷回父 allocator 后由 arena.deinit 回收
     handle.status.store(.Completed, .seq_cst);
     handle.condition.broadcast();
@@ -80,7 +80,7 @@ fn spawnThreadEntry(ctx: *SpawnCtx) void {
 }
 
 fn spawnFail(handle: *SpawnHandle, msg: []const u8) void {
-    handle.mutex.lockUncancelable();
+    handle.mutex.lock();
     // panic_message 用 page_allocator（独立于 arena，await 后由父释放）。
     handle.panic_message = std.heap.page_allocator.dupe(u8, msg) catch null;
     handle.status.store(.Failed, .seq_cst);
@@ -1988,9 +1988,9 @@ pub const VM = struct {
         const receiver = self.stack.items[args_start - 1];
         if (std.mem.eql(u8, name, "await")) {
             if (args.len != 0) return self.fail(loc, "await expects 0 arguments", error.WrongArity);
-            handle.mutex.lockUncancelable();
+            handle.mutex.lock();
             while (handle.status.load(.seq_cst) == .Pending or handle.status.load(.seq_cst) == .Running) {
-                handle.condition.waitUncancelable(&handle.mutex);
+                handle.condition.wait(&handle.mutex);
             }
             const child_result = handle.result;
             handle.consumed.store(true, .seq_cst);
@@ -2013,7 +2013,7 @@ pub const VM = struct {
         }
         if (std.mem.eql(u8, name, "cancel")) {
             if (args.len != 0) return self.fail(loc, "cancel expects 0 arguments", error.WrongArity);
-            handle.mutex.lockUncancelable();
+            handle.mutex.lock();
             handle.status.store(.Cancelled, .seq_cst);
             handle.consumed.store(true, .seq_cst);
             handle.condition.broadcast();
@@ -2182,7 +2182,7 @@ pub const VM = struct {
 
         // handle 用父 allocator（await 在父线程读，arena 释放后仍需存活直到 handle 释放）。
         const handle = self.allocator.create(SpawnHandle) catch return error.OutOfMemory;
-        handle.* = SpawnHandle.init(self.allocator, io);
+        handle.* = SpawnHandle.init(self.allocator);
         handle.status.store(.Running, .seq_cst);
 
         const ctx = self.allocator.create(SpawnCtx) catch return error.OutOfMemory;

@@ -320,7 +320,29 @@ pub const ModuleCompiler = struct {
                             try self.newtype_table.append(self.allocator, .{ .name = nt.name, .idx = ntidx, .arity = 1 });
                         },
                         .error_newtype => |en| {
-                            const eidx = try self.program.addErrorCtor(td.name, en.message);
+                            // 从 prefix 方法中提取前缀字符串
+                            var prefix: []const u8 = td.name;
+                            if (en.methods.len > 0) {
+                                for (en.methods) |m| {
+                                    if (std.mem.eql(u8, m.name, "prefix") and m.body != null) {
+                                        // 尝试从方法体中提取字符串字面量
+                                        const body = m.body.?;
+                                        // 方法体可能是 block { "string" } 或直接是 string_literal
+                                        if (body.* == .block and body.block.statements.len == 0 and body.block.trailing_expr != null) {
+                                            // { "string" } 形式
+                                            const expr = body.block.trailing_expr.?;
+                                            if (expr.* == .string_literal) {
+                                                prefix = expr.string_literal.value;
+                                            }
+                                        } else if (body.* == .string_literal) {
+                                            // 直接字符串字面量
+                                            prefix = body.string_literal.value;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            const eidx = try self.program.addErrorCtor(td.name, prefix);
                             try self.error_table.append(self.allocator, .{ .name = td.name, .idx = eidx, .arity = 1 });
                         },
                         else => {},
@@ -381,6 +403,22 @@ pub const ModuleCompiler = struct {
     /// 编译 type 声明中的方法体（新语法）。
     /// 类似 compileImplMethods，但从 type_decl 中提取类型名和 trait 信息。
     fn compileTypeMethods(self: *ModuleCompiler, td: @TypeOf(@as(ast.Decl, undefined).type_decl)) CompileError!void {
+        // 检查是否是 error_newtype 并且有方法
+        if (td.def == .error_newtype and td.def.error_newtype.methods.len > 0) {
+            // 编译 error_newtype 的方法
+            for (td.def.error_newtype.methods) |m| {
+                const body = m.body orelse continue;
+                const func_idx = try self.compileMethodBody(m, body);
+
+                // 为 Error trait 注册此方法
+                try self.program.addImplMethod(td.name, m.name, "Error", func_idx);
+
+                // 零参方法也注册
+                if (m.params.len == 0) try self.registerNullaryMethod(m.name, func_idx);
+            }
+            return;
+        }
+
         if (td.methods.len == 0) return;
 
         // 为每个实现的 trait 注册方法
@@ -1360,6 +1398,15 @@ const FnCompiler = struct {
             // op_call_value 路径，不当顶层函数/构造器/内建处理。
             const shadowed = self.resolveLocal(name) != null or (try self.resolveUpvalue(name)) != null;
             if (!shadowed) {
+                // 先检查自定义错误类型（优先级高于 Native）
+                if (self.module.lookupError(name)) |ee| {
+                    if (argc != 1) return error.Unsupported;
+                    try self.emitExpr(c.arguments[0]);
+                    try self.chunk.writeOp(.op_make_error, loc);
+                    try self.chunk.writeU16(ee.idx);
+                    return;
+                }
+
                 if (self.module.lookupFn(name)) |func_idx| {
                     for (c.arguments) |arg| try self.emitExpr(arg);
                     try self.chunk.writeOp(.op_call, loc);
@@ -1382,14 +1429,6 @@ const FnCompiler = struct {
                     try self.emitExpr(c.arguments[0]);
                     try self.chunk.writeOp(.op_make_newtype, loc);
                     try self.chunk.writeU16(ne.idx);
-                    return;
-                }
-                // M5e：自定义错误类型构造器裸名调用 → OP_MAKE_ERROR（arity 恒 1，str 消息）。
-                if (self.module.lookupError(name)) |ee| {
-                    if (argc != 1) return error.Unsupported;
-                    try self.emitExpr(c.arguments[0]);
-                    try self.chunk.writeOp(.op_make_error, loc);
-                    try self.chunk.writeU16(ee.idx);
                     return;
                 }
                 // 原生内建（println/print 等）：bench 驱动端到端跑完整 main。
@@ -1893,14 +1932,19 @@ const FnCompiler = struct {
             .throw_stmt => |t| {
                 // 文档 §2.4.5: throw 只能抛出满足 Error trait 的值
                 // throw "error" 等价于 throw Error("error")
-                // Error 是 Native 内建，通过 emitCall 逻辑会发射 OP_CALL_NATIVE
 
-                // 检查表达式是否已经是 Error 调用
-                const needs_wrap = t.expr.* != .call or
-                    t.expr.call.callee.* != .identifier or
-                    !std.mem.eql(u8, t.expr.call.callee.identifier.name, "Error");
+                // 检查表达式是否已经是 Error/自定义错误 调用
+                const is_error_call = blk: {
+                    if (t.expr.* != .call) break :blk false;
+                    if (t.expr.call.callee.* != .identifier) break :blk false;
+                    const name = t.expr.call.callee.identifier.name;
+                    // Error 或自定义错误类型（FileError, NetworkError 等）
+                    if (std.mem.eql(u8, name, "Error")) break :blk true;
+                    if (self.module.lookupError(name) != null) break :blk true;
+                    break :blk false;
+                };
 
-                if (needs_wrap) {
+                if (!is_error_call) {
                     // 包装为 Error(expr)：先压 expr，再发 OP_CALL_NATIVE Error
                     try self.emitExpr(t.expr);
                     if (opcode.Native.fromName("Error")) |nat| {
@@ -1911,7 +1955,7 @@ const FnCompiler = struct {
                         return error.Unsupported;
                     }
                 } else {
-                    // 已经是 Error(...) 调用，直接求值
+                    // 已经是 Error(...) 或 FileError(...) 调用，直接求值
                     try self.emitExpr(t.expr);
                 }
 
@@ -4372,7 +4416,11 @@ test "M4d inline trait repeated calls with capture" {
 test "M5e error_newtype: FileError(msg) -> throw_val.err with prefixed message" {
     const allocator = std.testing.allocator;
     const src =
-        \\type FileError = Error("file error")
+        \\type FileError: Error = FileError(msg: str) {
+        \\    override fun prefix(self): str {
+        \\        "file error"
+        \\    }
+        \\}
         \\fun run() {
         \\    FileError("config.json missing")
         \\}
@@ -4385,6 +4433,7 @@ test "M5e error_newtype: FileError(msg) -> throw_val.err with prefixed message" 
     try std.testing.expect(result.throw_val.* == .err);
     const e = result.throw_val.err;
     try std.testing.expectEqualStrings("FileError", e.type_name);
+    // 编译器从 prefix() 方法体中静态提取字符串字面量
     try std.testing.expectEqualStrings("file error: config.json missing", e.message);
     try std.testing.expect(e.is_error_subtype);
 }
@@ -4392,7 +4441,11 @@ test "M5e error_newtype: FileError(msg) -> throw_val.err with prefixed message" 
 test "M5e error_newtype: .message field access" {
     const allocator = std.testing.allocator;
     const src =
-        \\type NetworkError = Error("network error")
+        \\type NetworkError: Error = NetworkError(msg: str) {
+        \\    override fun prefix(self): str {
+        \\        "network error"
+        \\    }
+        \\}
         \\fun run(): str {
         \\    val ne = NetworkError("timeout")
         \\    ne.message
@@ -4403,6 +4456,7 @@ test "M5e error_newtype: .message field access" {
     defer program.deinit();
     defer result.releaseVM(allocator);
     try std.testing.expect(result == .string);
+    // 编译器从 prefix() 方法体中静态提取字符串字面量
     try std.testing.expectEqualStrings("network error: timeout", result.string);
 }
 

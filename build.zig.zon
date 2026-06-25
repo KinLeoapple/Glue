@@ -3,15 +3,10 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xa9e83a868f7270c0,
-    .dependencies = .{
-        .zio = .{
-            .path = "vendor/zio",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "src",
         "runtime",
-        "vendor",
         "build.zig",
     },
 }
