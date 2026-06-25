@@ -1398,3 +1398,284 @@ test "Smart int boundary" {
     defer over.release(allocator);
     try testing.expect(over.isBoxed());
 }
+// Day4 新增测试 - 并发原语、Trait、迭代器、压力测试
+
+test "Array with 100 elements stress test" {
+    const allocator = testing.allocator;
+
+    const elements = try allocator.alloc(Value, 100);
+    for (elements, 0..) |*e, i| {
+        e.* = Value.fromSmallInt(@intCast(i));
+    }
+
+    const v = try Value.makeArray(allocator, elements, null);
+    defer v.release(allocator);
+
+    const arr = v.asBoxed().payload.array;
+    try testing.expectEqual(@as(usize, 100), arr.elements.len);
+    try testing.expectEqual(@as(i48, 0), arr.elements[0].asSmallInt());
+    try testing.expectEqual(@as(i48, 99), arr.elements[99].asSmallInt());
+}
+
+test "Record with 20 fields" {
+    const allocator = testing.allocator;
+
+    var fields = std.StringHashMap(Value).init(allocator);
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        // 使用简短静态键名
+        const keys = [_][]const u8{"a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t"};
+        const key = try allocator.dupe(u8, keys[i]);
+        try fields.put(key, Value.fromSmallInt(@intCast(i)));
+    }
+
+    const v = try Value.makeRecord(allocator, "LargeRecord", fields);
+    defer v.release(allocator);
+
+    const record = v.asBoxed().payload.record;
+    try testing.expectEqual(@as(usize, 20), record.fields.count());
+}
+
+test "Deeply nested 8 layers" {
+    const allocator = testing.allocator;
+
+    // Layer 1: Cell
+    var val = try Value.makeCell(allocator, Value.fromSmallInt(42));
+
+    // Layer 2-7: Newtype wrapping
+    var layer: usize = 2;
+    while (layer <= 7) : (layer += 1) {
+        // 注意：type_name 将由 Newtype 的 release 管理，这里不需要单独释放
+        // 但为了测试，我们使用静态字符串
+        val = try Value.makeNewtype(allocator, "Layer", val);
+    }
+
+    // Layer 8: Array
+    const arr = try allocator.alloc(Value, 1);
+    arr[0] = val;
+    const final = try Value.makeArray(allocator, arr, null);
+
+    // Single release should handle all 8 layers
+    final.release(allocator);
+}
+
+test "Multiple retain and release cycles" {
+    const allocator = testing.allocator;
+
+    const s = try allocator.dupe(u8, "test");
+    const v = try Value.fromString(allocator, s);
+
+    // Cycle 1
+    _ = v.retain();
+    v.release(allocator);
+
+    // Cycle 2
+    _ = v.retain();
+    _ = v.retain();
+    v.release(allocator);
+    v.release(allocator);
+
+    // Final release
+    v.release(allocator);
+}
+
+test "ADT with 10 fields" {
+    const allocator = testing.allocator;
+
+    const fields = try allocator.alloc(AdtField, 10);
+    for (fields, 0..) |*f, i| {
+        // 使用静态字段名避免内存管理复杂性
+        f.* = .{ .name = "field", .value = Value.fromSmallInt(@intCast(i)) };
+    }
+
+    const v = try Value.makeAdt(allocator, "BigADT", "Ctor", fields);
+    defer v.release(allocator);
+
+    const adt = v.asBoxed().payload.adt;
+    try testing.expectEqual(@as(usize, 10), adt.fields.len);
+}
+
+test "Range negative values" {
+    const allocator = testing.allocator;
+
+    const r = try Value.makeRange(allocator, -10, -1, true);
+    defer r.release(allocator);
+
+    const range = r.asBoxed().payload.range;
+    try testing.expectEqual(@as(i128, -10), range.start);
+    try testing.expectEqual(@as(i128, -1), range.end);
+    try testing.expect(range.contains(-5));
+    try testing.expect(!range.contains(0));
+    try testing.expectEqual(@as(i128, 10), range.len());
+}
+
+test "Range large values" {
+    const allocator = testing.allocator;
+
+    const r = try Value.makeRange(allocator, 0, 1000000, false);
+    defer r.release(allocator);
+
+    const range = r.asBoxed().payload.range;
+    try testing.expectEqual(@as(i128, 1000000), range.len());
+    try testing.expect(range.contains(500000));
+    try testing.expect(!range.contains(1000000));
+}
+
+test "ErrorValue with long message" {
+    const allocator = testing.allocator;
+
+    const long_msg = "This is a very long error message that tests string handling in ErrorValue construction and release";
+    const v = try Value.makeError(allocator, "TestError", long_msg, true);
+    defer v.release(allocator);
+
+    const err = v.asBoxed().payload.error_val;
+    try testing.expectEqualStrings(long_msg, err.message);
+}
+
+test "Builtin function with context" {
+    const allocator = testing.allocator;
+
+    const dummy_fn: BuiltinFn = struct {
+        fn call(_: *anyopaque, _: ?*anyopaque, _: []const Value) anyerror!Value {
+            return Value.fromSmallInt(999);
+        }
+    }.call;
+
+    var ctx: u32 = 12345;
+    const builtin = Builtin{ .fn_ptr = dummy_fn, .user_ctx = @ptrCast(&ctx) };
+    const v = try Value.makeBuiltin(allocator, builtin);
+    defer v.release(allocator);
+
+    const b = v.asBoxed().payload.builtin;
+    try testing.expect(b.user_ctx != null);
+}
+
+test "Array fixed size constraint" {
+    const allocator = testing.allocator;
+
+    const elements = try allocator.alloc(Value, 5);
+    for (elements, 0..) |*e, i| {
+        e.* = Value.fromSmallInt(@intCast(i));
+    }
+
+    const v = try Value.makeArray(allocator, elements, 5);
+    defer v.release(allocator);
+
+    const arr = v.asBoxed().payload.array;
+    try testing.expectEqual(@as(?u64, 5), arr.fixed_size);
+    try testing.expectEqual(@as(usize, 5), arr.elements.len);
+}
+
+test "Cell with null inner value" {
+    const allocator = testing.allocator;
+
+    const cell = try Value.makeCell(allocator, Value.fromNull());
+    defer cell.release(allocator);
+
+    const c = cell.asBoxed().payload.cell_val;
+    try testing.expect(c.inner.isNull());
+}
+
+test "Cell with unit inner value" {
+    const allocator = testing.allocator;
+
+    const cell = try Value.makeCell(allocator, Value.fromUnit());
+    defer cell.release(allocator);
+
+    const c = cell.asBoxed().payload.cell_val;
+    try testing.expect(c.inner.isUnit());
+}
+
+test "Newtype wrapping null" {
+    const allocator = testing.allocator;
+
+    const nt = try Value.makeNewtype(allocator, "Optional", Value.fromNull());
+    defer nt.release(allocator);
+
+    const newtype = nt.asBoxed().payload.newtype;
+    try testing.expect(newtype.inner.isNull());
+}
+
+test "Partial with zero bound args" {
+    const allocator = testing.allocator;
+
+    const func = Value.fromSmallInt(100);
+    const empty = try allocator.alloc(Value, 0);
+
+    const p = try Value.makePartial(allocator, func, empty, 5);
+    defer p.release(allocator);
+
+    const partial = p.asBoxed().payload.partial;
+    try testing.expectEqual(@as(usize, 0), partial.bound_args.len);
+    try testing.expectEqual(@as(u8, 5), partial.remaining_arity);
+}
+
+test "VmClosure with zero upvalues" {
+    const allocator = testing.allocator;
+
+    const func: *const anyopaque = @ptrFromInt(0x2000);
+    const empty_uv = try allocator.alloc(Value, 0);
+    const empty_ba = try allocator.alloc(Value, 0);
+
+    const vc = try Value.makeVmClosure(allocator, func, 2, empty_uv, empty_ba);
+    defer vc.release(allocator);
+
+    const closure = vc.asBoxed().payload.vm_closure;
+    try testing.expectEqual(@as(usize, 0), closure.upvalues.len);
+    try testing.expectEqual(@as(usize, 0), closure.bound_args.len);
+    try testing.expectEqual(@as(u8, 2), closure.arity);
+}
+
+test "Record empty fields" {
+    const allocator = testing.allocator;
+
+    const fields = std.StringHashMap(Value).init(allocator);
+    const v = try Value.makeRecord(allocator, "Empty", fields);
+    defer v.release(allocator);
+
+    const record = v.asBoxed().payload.record;
+    try testing.expectEqual(@as(usize, 0), record.fields.count());
+}
+
+test "ADT empty fields" {
+    const allocator = testing.allocator;
+
+    const empty = try allocator.alloc(AdtField, 0);
+    const v = try Value.makeAdt(allocator, "Unit", "Unit", empty);
+    defer v.release(allocator);
+
+    const adt = v.asBoxed().payload.adt;
+    try testing.expectEqual(@as(usize, 0), adt.fields.len);
+}
+
+test "Float special values" {
+    const pos_inf = Value.fromFloat(std.math.inf(f64));
+    const neg_inf = Value.fromFloat(-std.math.inf(f64));
+    const nan = Value.fromFloat(std.math.nan(f64));
+
+    try testing.expect(std.math.isInf(pos_inf.asFloat()));
+    try testing.expect(std.math.isInf(neg_inf.asFloat()));
+    try testing.expect(std.math.isNan(nan.asFloat()));
+}
+
+test "Integer type promotion examples" {
+    const i8_type = IntType.i8;
+    const i32_type = IntType.i32;
+    const u8_type = IntType.u8;
+
+    const promoted = promoteIntTypes(i8_type, i32_type);
+    try testing.expectEqual(IntType.i32, promoted);
+
+    const mixed = promoteIntTypes(i8_type, u8_type);
+    try testing.expectEqual(IntType.i16, mixed);
+}
+
+test "Integer type in range checks" {
+    const i8_type = IntType.i8;
+    try testing.expect(i8_type.inRange(100));
+    try testing.expect(!i8_type.inRange(200));
+
+    const u8_type = IntType.u8;
+    try testing.expect(u8_type.inRange(255));
+    try testing.expect(!u8_type.inRange(256));
+}
