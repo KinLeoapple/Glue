@@ -831,13 +831,16 @@ test "refcount - retain increments" {
 
     const s = try allocator.dupe(u8, "test");
     const v = try Value.fromString(allocator, s);
-    defer v.release(allocator);
 
     const box = v.asBoxed();
     try testing.expectEqual(@as(u32, 1), box.rc);
 
     _ = v.retain();
     try testing.expectEqual(@as(u32, 2), box.rc);
+
+    // 释放所有引用
+    v.release(allocator); // rc = 1
+    v.release(allocator); // rc = 0, freed
 }
 
 test "refcount - inline no-op" {

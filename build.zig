@@ -95,6 +95,17 @@ pub fn build(b: *std.Build) void {
     spawn_module.addImport("sync", sync_module);
     vtable_module.addImport("value", value_module);
 
+    // value_new module - 16B Value 优化版本（阶段1开发）
+    const value_new_module = b.createModule(.{
+        .root_source_file = b.path("src/value_new.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    value_new_module.addImport("ast", ast_module);
+    value_new_module.addImport("atomic", atomic_module);
+    value_new_module.addImport("channel", channel_module);
+    value_new_module.addImport("spawn", spawn_module);
+
     // ============================================================
     // sema/ modules - 语义分析（类型检查、trait解析等）
     // ============================================================
@@ -315,6 +326,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_vm_unit_tests = b.addRunArtifact(vm_unit_tests);
 
+    // value_new 单元测试（阶段1）
+    const value_new_unit_tests = b.addTest(.{
+        .root_module = value_new_module,
+    });
+    const run_value_new_unit_tests = b.addRunArtifact(value_new_unit_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lexer_unit_tests.step);
     test_step.dependOn(&run_parser_unit_tests.step);
@@ -324,4 +341,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_stdlib_unit_tests.step);
     test_step.dependOn(&run_intern_unit_tests.step);
     test_step.dependOn(&run_vm_unit_tests.step);
+    test_step.dependOn(&run_value_new_unit_tests.step); // 新增
 }
