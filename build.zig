@@ -55,12 +55,6 @@ pub fn build(b: *std.Build) void {
     });
     scheduler_module.addImport("zio", zio_module);
 
-    const gc_module = b.createModule(.{
-        .root_source_file = b.path("runtime/gc.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const slab_pool_module = b.createModule(.{
         .root_source_file = b.path("runtime/slab_pool.zig"),
         .target = target,
@@ -94,11 +88,11 @@ pub fn build(b: *std.Build) void {
     });
 
     // ============================================================
-    // eval/ sub-modules
+    // runtime/ modules - 运行时值表示
     // ============================================================
 
     const value_module = b.createModule(.{
-        .root_source_file = b.path("src/eval/value.zig"),
+        .root_source_file = b.path("src/runtime/value.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -113,58 +107,15 @@ pub fn build(b: *std.Build) void {
     vtable_module.addImport("value", value_module);
 
     const env_module = b.createModule(.{
-        .root_source_file = b.path("src/eval/env.zig"),
+        .root_source_file = b.path("src/runtime/env.zig"),
         .target = target,
         .optimize = optimize,
     });
     env_module.addImport("value", value_module);
     env_module.addImport("intern", intern_module);
 
-    const pattern_module = b.createModule(.{
-        .root_source_file = b.path("src/eval/pattern.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    pattern_module.addImport("ast", ast_module);
-    pattern_module.addImport("value", value_module);
-    pattern_module.addImport("env", env_module);
-    pattern_module.addImport("intern", intern_module);
-
-    const throw_module = b.createModule(.{
-        .root_source_file = b.path("src/eval/throw.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    throw_module.addImport("value", value_module);
-
-    const module_eval_module = b.createModule(.{
-        .root_source_file = b.path("src/eval/module_eval.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    module_eval_module.addImport("ast", ast_module);
-    module_eval_module.addImport("value", value_module);
-    module_eval_module.addImport("env", env_module);
-    module_eval_module.addImport("intern", intern_module);
-
     // ============================================================
-    // vm/ sub-modules（字节码 VM — docs/bytecode-vm-plan.md）
-    // ============================================================
-    // 依赖图顶点是 compiler.zig（它 @import vm.zig / disasm.zig / chunk.zig / opcode.zig）。
-    // 只需注册一个模块，relative @import 拉起其余文件；外部依赖经 import 表注入。
-
-    const vm_module = b.createModule(.{
-        .root_source_file = b.path("src/vm/compiler.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    vm_module.addImport("ast", ast_module);
-    vm_module.addImport("value", value_module);
-    vm_module.addImport("lexer", lexer_module);
-    vm_module.addImport("parser", parser_module);
-
-    // ============================================================
-    // sema/ sub-modules
+    // sema/ modules - 语义分析（类型检查、trait解析等）
     // ============================================================
 
     const type_check_module = b.createModule(.{
@@ -202,13 +153,6 @@ pub fn build(b: *std.Build) void {
     });
     kind_check_module.addImport("ast", ast_module);
 
-    const variance_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/variance.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    variance_module.addImport("ast", ast_module);
-
     const gadt_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/gadt_check.zig"),
         .target = target,
@@ -230,6 +174,49 @@ pub fn build(b: *std.Build) void {
     });
     resolve_module.addImport("ast", ast_module);
     resolve_module.addImport("intern", intern_module);
+
+    // ============================================================
+    // stdlib module
+    // ============================================================
+
+    const stdlib_module = b.createModule(.{
+        .root_source_file = b.path("src/stdlib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ============================================================
+    // loader/ modules - 模块加载器
+    // ============================================================
+
+    const module_loader_module = b.createModule(.{
+        .root_source_file = b.path("src/loader/module_loader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module_loader_module.addImport("ast", ast_module);
+    module_loader_module.addImport("lexer", lexer_module);
+    module_loader_module.addImport("parser", parser_module);
+    module_loader_module.addImport("sema", type_check_module);
+    module_loader_module.addImport("resolve", resolve_module);
+    module_loader_module.addImport("intern", intern_module);
+    module_loader_module.addImport("stdlib", stdlib_module);
+
+    // ============================================================
+    // vm/ sub-modules（字节码 VM — docs/bytecode-vm-plan.md）
+    // ============================================================
+    // 依赖图顶点是 compiler.zig（它 @import vm.zig / disasm.zig / chunk.zig / opcode.zig）。
+    // 只需注册一个模块，relative @import 拉起其余文件；外部依赖经 import 表注入。
+
+    const vm_module = b.createModule(.{
+        .root_source_file = b.path("src/vm/compiler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vm_module.addImport("ast", ast_module);
+    vm_module.addImport("value", value_module);
+    vm_module.addImport("lexer", lexer_module);
+    vm_module.addImport("parser", parser_module);
 
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -256,59 +243,9 @@ pub fn build(b: *std.Build) void {
     });
     module_resolver_module.addImport("ast", ast_module);
 
-    const dependency_graph_module = b.createModule(.{
-        .root_source_file = b.path("src/module/graph.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // ============================================================
     // 内嵌标准库（@embedFile stdlib/*.glue）
     // ============================================================
-
-    const stdlib_module = b.createModule(.{
-        .root_source_file = b.path("src/stdlib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // ============================================================
-    // eval module (core — depends on everything)
-    // ============================================================
-
-    const eval_module = b.createModule(.{
-        .root_source_file = b.path("src/eval/eval.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    eval_module.addImport("ast", ast_module);
-    eval_module.addImport("value", value_module);
-    eval_module.addImport("env", env_module);
-    eval_module.addImport("intern", intern_module);
-    eval_module.addImport("pattern", pattern_module);
-    eval_module.addImport("throw_mod", throw_module);
-    eval_module.addImport("module_eval", module_eval_module);
-    eval_module.addImport("lexer", lexer_module);
-    eval_module.addImport("parser", parser_module);
-    eval_module.addImport("sema", type_check_module);
-    eval_module.addImport("module_resolver", module_resolver_module);
-    eval_module.addImport("dependency_graph", dependency_graph_module);
-    eval_module.addImport("stdlib", stdlib_module);
-    eval_module.addImport("kind_check", kind_check_module);
-    eval_module.addImport("throw_check", throw_check_module);
-    eval_module.addImport("subtype_check", subtype_check_module);
-    eval_module.addImport("variance", variance_module);
-    eval_module.addImport("trait_resolve", trait_resolve_module);
-    eval_module.addImport("gadt_check", gadt_check_module);
-    eval_module.addImport("module_check", module_check_module);
-    eval_module.addImport("resolve", resolve_module);
-    eval_module.addImport("scheduler", scheduler_module);
-    eval_module.addImport("gc", gc_module);
-    eval_module.addImport("channel", channel_module);
-    eval_module.addImport("spawn", spawn_module);
-    eval_module.addImport("atomic", atomic_module);
-    eval_module.addImport("vtable_rt", vtable_module);
-    eval_module.addImport("zio", zio_module);
 
     // ============================================================
     // Root module
@@ -322,7 +259,9 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("ast", ast_module);
     root_module.addImport("lexer", lexer_module);
     root_module.addImport("parser", parser_module);
-    root_module.addImport("eval", eval_module);
+    root_module.addImport("module_loader", module_loader_module);
+    root_module.addImport("value", value_module);
+    root_module.addImport("env", env_module);
     root_module.addImport("slab_pool", slab_pool_module);
     root_module.addImport("zio", zio_module);
     // M5：字节码 VM 接入 glue run（vm_module 再导出 VM/Program/ModuleCompiler/lexer/parser）。
@@ -361,11 +300,6 @@ pub fn build(b: *std.Build) void {
     // ============================================================
     // Tests
     // ============================================================
-
-    const eval_unit_tests = b.addTest(.{
-        .root_module = eval_module,
-    });
-    const run_eval_unit_tests = b.addRunArtifact(eval_unit_tests);
 
     const lexer_unit_tests = b.addTest(.{
         .root_module = lexer_module,
@@ -408,7 +342,6 @@ pub fn build(b: *std.Build) void {
     const run_vm_unit_tests = b.addRunArtifact(vm_unit_tests);
 
     const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&run_eval_unit_tests.step);
     test_step.dependOn(&run_lexer_unit_tests.step);
     test_step.dependOn(&run_parser_unit_tests.step);
     test_step.dependOn(&run_type_check_unit_tests.step);

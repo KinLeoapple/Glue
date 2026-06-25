@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const lexer = @import("lexer");
 const parser = @import("parser");
 const ast = @import("ast");
-const eval = @import("eval");
+const module_loader = @import("module_loader");
+const value = @import("value");
+const env = @import("env");
 const slab_pool = @import("slab_pool");
 const vm = @import("vm");
 
@@ -55,9 +57,9 @@ const DEFAULT_ENTRY = "src/Main.glue";
 /// `GLUE_VM_TRACE=1`：向 stderr 打印 VM 执行信息（调试用）。
 var vm_trace: bool = false;
 
-/// 从环境变量初始化 VM 追踪开关。env 为 null（无 environ）时保持默认。
-fn initVmFlags(env: ?*std.process.Environ.Map) void {
-    const e = env orelse return;
+/// 从环境变量初始化 VM 追踪开关。environ_map 为 null（无 environ）时保持默认。
+fn initVmFlags(environ_map: ?*std.process.Environ.Map) void {
+    const e = environ_map orelse return;
     if (e.get("GLUE_VM_TRACE")) |v| {
         if (std.mem.eql(u8, v, "1")) vm_trace = true;
     }
@@ -328,18 +330,16 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
 
     var pool = slab_pool.SlabPool.init(allocator);
     defer pool.deinit();
+    const value_allocator = pool.allocator();
 
-    var ev = eval.Evaluator.initWithIo(arena_alloc, io);
-    ev.value_allocator = pool.allocator();
-    ev.global_env.value_allocator = ev.value_allocator;
-    ev.use_lexical_addressing = true; // 任务#2:De Bruijn 局部变量数组快路径(自校验回退,绝不静默损坏)
-    defer ev.deinit();
+    var loader = module_loader.ModuleLoader.init(arena_alloc, io);
+    defer loader.deinit();
 
-    const outcome = executeSource(arena_alloc, &ev, io, source, entry_path);
+    const outcome = executeSource(arena_alloc, &loader, value_allocator, io, source, entry_path);
 
     // VM 已执行 main 或失败
     if (outcome == .failed) {
-        ev.deinit();
+        loader.deinit();
         arena.deinit();
         pool.deinit();
         std.process.exit(1);
@@ -355,12 +355,12 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
     {
         var pool = slab_pool.SlabPool.init(dbg_alloc);
         defer pool.deinit();
-        var ev = eval.Evaluator.initWithIo(dbg_alloc, io);
-        ev.value_allocator = pool.allocator();
-        ev.global_env.value_allocator = ev.value_allocator;
-        ev.use_lexical_addressing = true; // 任务#2:开启(debug 路径同样)
-        defer ev.deinit();
-        _ = executeSource(dbg_alloc, &ev, io, source, entry_path);
+        const value_allocator = pool.allocator();
+
+        var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
+        defer loader.deinit();
+
+        _ = executeSource(dbg_alloc, &loader, value_allocator, io, source, entry_path);
     }
     const leaked = dbg.deinit();
     if (leaked == .leak) {
@@ -394,10 +394,10 @@ fn vmEligible(module: ast.Module) bool {
 }
 
 /// 尝试在字节码 VM 上整体编译并执行模块（含 main）。
-/// value_alloc 与树遍历器 value_allocator 同源，使 glue debug 的 DebugAllocator 能检测 VM 路径泄漏。
 fn tryRunOnVM(
     allocator: std.mem.Allocator,
-    ev: *eval.Evaluator,
+    loader: *module_loader.ModuleLoader,
+    value_allocator: std.mem.Allocator,
     io: std.Io,
     module: ast.Module,
     filename: []const u8,
@@ -408,7 +408,7 @@ fn tryRunOnVM(
     }
 
     // 准备阶段：use 预加载 + 类型检查 + resolve
-    ev.prepareModuleForVm(module) catch |err| switch (err) {
+    loader.prepareModule(module) catch |err| switch (err) {
         error.TypeCheckFailed => return .failed,
         error.CircularDependency => {
             printErr(io, "{s}: error: circular module dependency\n", .{filename});
@@ -429,7 +429,7 @@ fn tryRunOnVM(
     if (module.source_path) |sp| {
         const sep_idx = std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep) orelse
             std.mem.lastIndexOfScalar(u8, sp, '/');
-        if (sep_idx) |idx| ev.setSourceDirForVm(sp[0..idx]) catch {};
+        if (sep_idx) |idx| loader.setSourceDir(sp[0..idx]) catch {};
     }
     var deps = std.ArrayList(ast.Module).empty;
     defer deps.deinit(allocator);
@@ -439,7 +439,7 @@ fn tryRunOnVM(
         while (it.next()) |k| allocator.free(k.*);
         seen.deinit();
     }
-    ev.collectUseDependencies(module, &deps, &seen) catch |err| {
+    loader.collectDependencies(module, &deps, &seen) catch |err| {
         printErr(io, "{s}: error: dependency collection failed: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
@@ -455,7 +455,7 @@ fn tryRunOnVM(
     };
 
     // 执行 main
-    var machine = vm.VM.initWithIo(ev.value_allocator, io);
+    var machine = vm.VM.initWithIo(value_allocator, io);
     defer machine.deinit();
     const result = machine.call(&mc.program, entry, &.{}) catch |err| {
         const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
@@ -466,7 +466,7 @@ fn tryRunOnVM(
         stderr_writer.flush() catch {};
         return .failed;
     };
-    result.releaseVM(ev.value_allocator);
+    result.releaseVM(value_allocator);
 
     if (vm_trace) printErr(io, "[vm] {s}: ran on VM\n", .{filename});
     return .ran_main;
@@ -477,7 +477,14 @@ fn tryRunOnVM(
 /// - ran_main：VM 已编译并执行 main。
 const ExecOutcome = enum { failed, ran_main };
 
-fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, source: []const u8, filename: []const u8) ExecOutcome {
+fn executeSource(
+    allocator: std.mem.Allocator,
+    loader: *module_loader.ModuleLoader,
+    value_allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    filename: []const u8,
+) ExecOutcome {
     // 词法分析
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
@@ -506,14 +513,14 @@ fn executeSource(allocator: std.mem.Allocator, ev: *eval.Evaluator, io: std.Io, 
         return .failed;
     };
 
-    // 求值模块
-    // 入口文件路径作为 source_path，使 current_source_dir 能正确解析相对 use 依赖
+    // 设置入口模块的源文件路径
+    // 入口文件路径作为 source_path，使模块加载器能正确解析相对 use 依赖
     // （文档 §4.5）。否则从父目录运行 `glue dir/Main.glue` 时基目录误为 `.`。
     var entry_module = module;
     entry_module.source_path = filename;
 
     // VM-only路径：直接在字节码VM上编译并执行模块
-    switch (tryRunOnVM(allocator, ev, io, entry_module, filename)) {
+    switch (tryRunOnVM(allocator, loader, value_allocator, io, entry_module, filename)) {
         .ran_main => return .ran_main,
         .failed => return .failed,
     }
