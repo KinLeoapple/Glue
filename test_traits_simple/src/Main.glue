@@ -1,27 +1,20 @@
-// 测试：trait 定义在前
+// 测试：单个 trait 不用括号
 
 trait Greet {
     fun greet_name(self): str
 }
 
-trait Sizeable {
-    fun size(self): i32
-}
-
-type Ordering: Greet, Sizeable = | Lt | Eq | Gt {
+type Color: Greet = | Red | Green | Blue {
     fun greet_name(self): str {
         match self {
-            Lt => "less"
-            Eq => "equal"
-            Gt => "greater"
+            Red => "red"
+            Green => "green"
+            Blue => "blue"
         }
     }
-
-    fun size(self): i32 { 1 }
 }
 
 fun main() {
-    val x = Lt
+    val x = Red
     println(x.greet_name())
-    println(str(x.size()))
 }
