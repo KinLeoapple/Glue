@@ -1181,12 +1181,31 @@ pub const Parser = struct {
         const name_tok = try self.expect(.identifier, "expected type parameter name");
 
         var kind: ?*ast.Kind = null;
+        var bounds = std.ArrayList(ast.TraitBound).empty;
+
         if (self.matchToken(.colon)) {
-            kind = try self.parseKind();
+            // 检查是否是 trait bound 还是 kind
+            // trait bound: <T: Trait> 或 <T: (Trait1, Trait2)>
+            // kind: <F: * -> *>
+            if (self.check(.identifier)) {
+                // 解析 trait bound: T: Trait 或 T: (Trait1, Trait2)
+                const has_paren = self.check(.l_paren);
+                if (has_paren) {
+                    _ = self.advance(); // 消耗 (
+                }
+                try self.parseTraitBoundListInner(&bounds);
+                if (has_paren) {
+                    _ = self.expect(.r_paren, "expected ')' after trait list") catch {};
+                }
+            } else {
+                // 解析 kind
+                kind = try self.parseKind();
+            }
         }
 
-        var bounds = std.ArrayList(ast.TraitBound).empty;
+        // with 用于类型特化，不是 trait bound
         if (self.matchToken(.kw_with)) {
+            // with 后面应该跟类型特化，但为了兼容性暂时保留
             try self.parseTraitBoundListInner(&bounds);
         }
 

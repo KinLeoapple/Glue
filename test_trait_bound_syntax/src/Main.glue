@@ -1,0 +1,19 @@
+// 测试新的 <T: Trait> 语法
+
+trait Show {
+    fun show(self): str
+}
+
+fun display<T: Show>(x: T): str {
+    x.show()
+}
+
+type Box<T: Show> = Box(value: T) {
+    fun show_box(self): str {
+        "Box(" + self.value.show() + ")"
+    }
+}
+
+fun main() {
+    println("Trait bound syntax test")
+}

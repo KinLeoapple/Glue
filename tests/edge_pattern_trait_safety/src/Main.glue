@@ -52,6 +52,6 @@ fun main() {
     println("edge_pattern_trait_safety: All tests passed!")
 }
 
-fun mx(a: i32, b: i32): i32 with Comparable {
+fun mx(a: i32, b: i32): i32 {
     match compare(a, b) { Lt => b, _ => a }
 }

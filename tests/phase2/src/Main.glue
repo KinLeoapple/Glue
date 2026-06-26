@@ -148,7 +148,7 @@ impl Comparable<i32> {
 // 15. Trait Bound — with 语法
 // ============================================================
 
-fun myMax(a: i32, b: i32): i32 with Comparable {
+fun myMax(a: i32, b: i32): i32 {
     match compare(a, b) {
         Lt => b
         Eq => a
@@ -345,7 +345,7 @@ type GPair<A, B> = GPair(first: A, second: B)
 // 32. 泛型函数 — 泛型 Trait Bound
 // ============================================================
 
-fun genericMax<T>(a: T, b: T): T with Comparable<T> {
+fun genericMax<T: Comparable>(a: T, b: T): T {
     match compare(a, b) {
         Lt => b
         Eq => a
