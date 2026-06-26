@@ -24,8 +24,8 @@ fun fullName(p: (first: str, last: str)): str {
 
 fun main() {
     // ---- guard-and-throw in Throw fn ----
-    println(match checked(5) { Ok(v) => str(v), Error(e) => "err:" + e.message })   // 5
-    println(match checked(-1) { Ok(v) => str(v), Error(e) => "err:" + e.message })  // err:negative
+    println(match checked(5) { Ok(v) => str(v), Error(e) => "err:" + e.message() })   // 5
+    println(match checked(-1) { Ok(v) => str(v), Error(e) => "err:" + e.message() })  // err:negative
 
     // ---- guard-and-throw in plain fn ----
     println(mustPos(7))    // 7

@@ -315,6 +315,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_vm_unit_tests = b.addRunArtifact(vm_unit_tests);
 
+    // value_new 单元测试（阶段1）
+    // const value_new_unit_tests = b.addTest(.{
+    //     .root_module = value_new_module,
+    // });
+    // const run_value_new_unit_tests = b.addRunArtifact(value_new_unit_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lexer_unit_tests.step);
     test_step.dependOn(&run_parser_unit_tests.step);
@@ -324,4 +330,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_stdlib_unit_tests.step);
     test_step.dependOn(&run_intern_unit_tests.step);
     test_step.dependOn(&run_vm_unit_tests.step);
+    // test_step.dependOn(&run_value_new_unit_tests.step); // 新增
 }

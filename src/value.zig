@@ -1,12 +1,12 @@
-//! Glue 语言运行时值表示
+//! Glue 语言运行时值表示 - 16B Value 优化版本
 //!
-//! 定义求值过程中的所有运行时值类型，包括：
-//! - 求值错误和控制流信号
-//! - 范围值 (Range)
-//! - 错误值 (ErrorValue)
-//! - 内建函数类型 (BuiltinFn)
-//! - 闭包 (Closure)
-//! - 运行时值 (Value) — 所有求值结果的核心联合类型
+//! 重大变更：Value 从 64 字节缩减到 16 字节
+//! - 策略：Tag + Payload 分离（Tagged Union）
+//! - 小值内联（int/float/bool/char/null/unit）
+//! - 大值装箱（指针统一经 BoxedValue 包装）
+//! - 引用计数统一在 BoxedValue 头部
+//!
+//! 设计文档：docs/value16-implementation-plan.md
 
 const std = @import("std");
 const ast = @import("ast");
@@ -15,7 +15,7 @@ const channel_mod = @import("channel");
 const spawn_mod = @import("spawn");
 
 // ============================================================
-// 求值错误
+// 错误与控制流（保持不变）
 // ============================================================
 
 pub const EvalError = error{
@@ -30,33 +30,28 @@ pub const EvalError = error{
     CircularDependency,
     FileNotFound,
     MissingMain,
-    /// 类型检查失败 — 错误已打印到 stderr，阻止后续求值/callMain（文档 D45 先检查后求值）。
     TypeCheckFailed,
 };
 
-/// 控制流信号 — 使用 Zig error 机制实现非局部跳转
 pub const ControlFlow = error{
     ReturnValue,
     ThrowValue,
     BreakSignal,
     ContinueSignal,
-    /// Glue panic — 不可捕获，但允许 defer 执行
     GluePanic,
-    /// 尾调用信号 — TCO trampoline 使用
     TailCall,
 };
 
-/// 合并的求值错误集
 pub const EvalResult = EvalError || ControlFlow;
 
 // ============================================================
-// 范围值
+// 辅助结构（保持不变）
 // ============================================================
 
 pub const Range = struct {
     start: i128,
     end: i128,
-    inclusive: bool, // true = ..=, false = ..
+    inclusive: bool,
 
     pub fn contains(self: Range, val: i128) bool {
         if (self.inclusive) {
@@ -75,238 +70,32 @@ pub const Range = struct {
     }
 };
 
-// ============================================================
-// 错误值
-// ============================================================
-
 pub const ErrorValue = struct {
-    /// 错误类型名（如 "Error"、"FileError"）
     type_name: []const u8,
     message: []const u8,
-    /// 是否为 Error 的子类型（文档 2.4.3: FileError <: Error）
-    /// 自定义错误类型（type X = Error("...")）自动是 Error 的子类型
     is_error_subtype: bool = false,
 };
 
-// ============================================================
-// Throw 值（Throw<T, E> 的运行时表示）
-// ============================================================
-
-/// Throw<T, E> 的运行时值
-/// 文档 2.4.4: Throw<T, E> 的值有两种状态：
-/// - Ok(value) — 成功，持有 T 类型的值
-/// - Error(message) — 失败，持有错误信息
 pub const ThrowValue = union(enum) {
-    /// Ok(value) — 成功状态
     ok: *Value,
-    /// Error(message) — 失败状态
     err: ErrorValue,
 };
 
-// ============================================================
-// 内建函数类型
-// ============================================================
-/// 内建函数指针类型
-///
-/// 使用 *anyopaque 作为上下文指针以避免与 Evaluator 的循环依赖。
-/// 在 eval.zig 中注册内建函数时，将 *Evaluator 转换为 *anyopaque；
-/// 调用时，内建函数的 wrapper 将 *anyopaque 转换回 *Evaluator。
 pub const BuiltinFn = *const fn (*anyopaque, ?*anyopaque, []const Value) anyerror!Value;
 
-/// 内建函数（带用户上下文）
-///
-/// ctx: *Evaluator（通过 @ptrCast 传递）
-/// user_ctx: 可选的用户上下文指针（如 ErrorNewtypeCtx）
 pub const Builtin = struct {
     fn_ptr: BuiltinFn,
     user_ctx: ?*anyopaque = null,
 };
 
 // ============================================================
-// ADT 值（代数数据类型的运行时表示）
+// 整数与浮点类型（保持不变）
 // ============================================================
 
-/// ADT 构造器字段
-pub const AdtField = struct {
-    /// 字段名（位置参数为 null）
-    name: ?[]const u8,
-    value: Value,
-};
-
-/// ADT 值 — 代数数据类型构造器的运行时实例
-///
-/// 如 `Circle(3.14)` 创建 AdtValue{ .type_name = "Shape", .constructor = "Circle", .fields = [...] }
-/// 如 `Cons(1, Nil)` 创建 AdtValue{ .type_name = "List", .constructor = "Cons", .fields = [...] }
-/// 如 `Lt` 创建 AdtValue{ .type_name = "Ordering", .constructor = "Lt", .fields = [] }
-pub const AdtValue = struct {
-    /// 类型名（如 Shape, List, Ordering）
-    type_name: []const u8,
-    /// 构造器名（如 Circle, Cons, Lt）
-    constructor: []const u8,
-    /// 构造器字段值
-    fields: []AdtField,
-    /// 引用计数（共享 + 写时拷贝；阶段 0 仅就位，未接入释放）
-    rc: u32 = 1,
-};
-
-// ============================================================
-// Newtype 值（零开销包装类型的运行时表示）
-// ============================================================
-
-/// Newtype 值 — 单字段 ADT，创建语义不同但运行时零开销的新类型
-///
-/// 如 `type UserId = UserId(i32)` 声明后，`UserId(42)` 创建
-/// NewtypeValue{ .type_name = "UserId", .inner = Value{ .integer = IntValue{ .value = 42 } } }
-///
-/// 文档 2.14: Newtype — 创建新类型，运行时零开销
-/// 术语表: Newtype — 单字段 ADT，创建语义不同但运行时无开销的新类型
-pub const NewtypeValue = struct {
-    /// 类型名（如 UserId, Celsius）
-    type_name: []const u8,
-    /// 内部被包装的值
-    inner: Value,
-    rc: u32 = 1,
-};
-
-// ============================================================
-// 闭包
-// ============================================================
-
-/// 续14/闭包转换：被闭包捕获的可变变量（var）的共享 cell。
-/// 帧绑定与所有捕获该 var 的闭包都指向同一 *Cell，使可变状态在帧与闭包间共享，
-/// 且 cell 寿命独立于定义帧（escaped 闭包捕获的 var 在帧返回后仍存活，见 makeCounter）。
-/// rc：帧 + 各捕获闭包联合持有，归零才释放。透明语义：读经 .inner、写经 setCell，
-/// 与 atomic_val 的透明 load/store 同构（但非原子，per-heap 单线程）。
-pub const Cell = struct {
-    inner: Value,
-    rc: u32 = 1,
-};
-
-/// 字节码 VM 的闭包值（M1b）。与树遍历器 `Closure`（AST 形态）平行：
-/// 这里 func 指向编译后的 `chunk.Function`，以 `*const anyopaque` 存储以打破
-/// value↔chunk 循环依赖（chunk.zig import value，故 value 不能 import chunk）。
-/// VM 内 @ptrCast 还原为 *const Function。
-/// 默认柯里化也由本结构承载（不复用 eval 的 GC 管理的 PartialApplication，避免双重内存模型）：
-///   bound_args = 已预绑定的实参；arity 是函数总形参数。
-///   bound_args.len + 新实参 == arity → 调用；< → 产生 bound_args 更长的新 vm_closure；> → WrongArity。
-/// M1b-1：upvalues 恒空（仅顶层函数作一等值）。M1b-2 起填充捕获的自由变量（含共享 *Cell）。
-pub const VmClosure = struct {
-    func: *const anyopaque, // *const chunk.Function
-    arity: u8,
-    upvalues: []Value = &.{},
-    bound_args: []Value = &.{}, // 默认柯里化预绑定实参（owned，归零时 release）
-    rc: u32 = 1,
-    allocator: std.mem.Allocator,
-    /// M5c：letrec 自引用 upvalue 索引（-1 = 无）。该 upvalue 指向闭包自身的 cell（递归局部
-    /// 函数捕获自身），为**弱引用**：retain/release 都跳过它，避免 cell↔closure 循环泄漏。
-    self_upvalue_idx: i32 = -1,
-};
-
-// ============================================================
-// 一等 Trait 值（Phase 7）
-// ============================================================
-
-/// 一等 Trait 值的运行时表示（文档 §4.7）。
-/// 概念上是 vtable 指针 + data 载荷的胖指针；这里以方法名 -> 闭包的映射
-/// 表示 vtable（接口函数指针），data 以可选 receiver 值表示。
-/// - 内联 trait 值 `trait { fun log(msg){...} }`：data 为 null，方法是自由闭包。
-/// - 文件模块作为 trait 值：data 为模块记录，方法绑定到模块。
-pub const TraitValue = struct {
-    /// Trait 名（用于诊断与方法分派校验，可空）
-    trait_name: []const u8 = "",
-    /// vtable：方法名 -> 实现闭包
-    methods: std.StringHashMap(Value),
-    /// data 载荷（receiver）；内联 trait 值为 null
-    data: ?*Value = null,
-    allocator: std.mem.Allocator,
-    /// M4d：VM 模式标记。true 表示由 VM 构造（方法为 vm_closure，纯 refcount）；releaseVM 归零时
-    /// 释放 methods（key + vm_closure）+ 箱体。eval 模式（false）由 GC 管理，releaseVM no-op。
-    vm_owned: bool = false,
-    /// VM 模式 ref_count。
-    rc: u32 = 1,
-};
-
-// ============================================================
-// Lazy 值（Phase 7）— 显式惰性求值
-// ============================================================
-
-/// 文档 §6.10: `Lazy<T>` 延迟求值，首次访问时计算并缓存。
-/// thunk 持有未求值表达式与其闭包环境；cached 持有首次求值后的结果。
-pub const LazyValue = struct {
-    /// 未求值的表达式（thunk body）
-    expr: *ast.Expr,
-    /// 求值时所需的环境（*Environment，不透明指针避免循环依赖）
-    env: *anyopaque,
-    /// 缓存的结果；null 表示尚未求值
-    cached: ?Value = null,
-    /// 是否已求值（区分 cached 为 null_val 的合法缓存）
-    forced: bool = false,
-    allocator: std.mem.Allocator,
-    /// M4d：VM 模式 thunk —— 编译后的零参闭包（*VmClosure，不透明避免循环）。非空表示由 VM 构造，
-    /// force 走 VM 执行（而非 evalExpr）；此时 expr/env 是占位（VM 无 AST/Environment）。
-    vm_thunk: ?*anyopaque = null,
-    /// VM 模式 ref_count（eval 模式的 lazy 由 GC/lazy_values 列表管理，rc 不用）。
-    rc: u32 = 1,
-};
-
-// ============================================================
-// 并发原语值（Phase 4）— 从 runtime 模块 re-export
-// ============================================================
-
-pub const AtomicValue = atomic_mod.AtomicValue;
-pub const AtomicType = atomic_mod.AtomicValue.AtomicType;
-pub const atomicTypeToIntType = atomic_mod.atomicTypeToIntType;
-pub const intTypeToAtomicType = atomic_mod.intTypeToAtomicType;
-pub const valueToAtomicRaw = atomic_mod.valueToAtomicRaw;
-
-pub const SpawnStatus = spawn_mod.SpawnStatus;
-pub const SpawnHandle = spawn_mod.SpawnHandle;
-
-pub const ChannelValue = channel_mod.ChannelValue;
-pub const SenderValue = channel_mod.SenderValue;
-pub const ReceiverValue = channel_mod.ReceiverValue;
-
-// ============================================================
-// 迭代器值（Iterable/Iterator 协议的运行时表示）
-// ============================================================
-
-/// 数组迭代器
-pub const ArrayIterator = struct {
-    array: []Value,
-    index: usize,
-};
-
-/// 字符串迭代器（UTF-8 码点）
-pub const StringIterator = struct {
-    string: []const u8,
-    byte_offset: usize,
-};
-
-/// 范围迭代器
-pub const RangeIterator = struct {
-    current: i128,
-    end: i128,
-    inclusive: bool,
-};
-
-// ============================================================
-// 整数类型标签
-// ============================================================
-
-/// 整数具体类型标签，用于运行时溢出检查
 pub const IntType = enum {
-    i8,
-    i16,
-    i32,
-    i64,
-    i128,
-    u8,
-    u16,
-    u32,
-    u64,
-    u128,
+    i8, i16, i32, i64, i128,
+    u8, u16, u32, u64, u128,
 
-    /// 该类型是否为有符号整数
     pub fn isSigned(self: IntType) bool {
         return switch (self) {
             .i8, .i16, .i32, .i64, .i128 => true,
@@ -314,7 +103,6 @@ pub const IntType = enum {
         };
     }
 
-    /// 返回该整数类型的最小值（u128 存储，有符号类型使用二补数表示）
     pub fn minInt(self: IntType) u128 {
         return switch (self) {
             .i8 => @as(u128, @bitCast(@as(i128, std.math.minInt(i8)))),
@@ -326,7 +114,6 @@ pub const IntType = enum {
         };
     }
 
-    /// 返回该整数类型的最大值
     pub fn maxInt(self: IntType) u128 {
         return switch (self) {
             .i8 => @as(u128, std.math.maxInt(i8)),
@@ -342,9 +129,6 @@ pub const IntType = enum {
         };
     }
 
-    /// 检查值是否在该类型的范围内
-    /// 有符号类型：将 u128 解释为 i128 进行有符号比较
-    /// 无符号类型：直接与 maxInt 比较
     pub fn inRange(self: IntType, val: u128) bool {
         return switch (self) {
             inline .i8, .i16, .i32, .i64, .i128 => |tag| {
@@ -381,7 +165,6 @@ pub const IntType = enum {
         };
     }
 
-    /// 从类型名称字符串解析
     pub fn fromName(name: []const u8) ?IntType {
         if (std.mem.eql(u8, name, "i8")) return .i8;
         if (std.mem.eql(u8, name, "i16")) return .i16;
@@ -396,7 +179,6 @@ pub const IntType = enum {
         return null;
     }
 
-    /// 返回该整数类型的位宽
     pub fn bitWidth(self: IntType) usize {
         return switch (self) {
             .i8, .u8 => 8,
@@ -408,29 +190,71 @@ pub const IntType = enum {
     }
 };
 
-/// 带类型标签的整数值
-/// value 使用 u128 存储，可表示 u128::MAX
-/// 有符号类型的负值以二补数形式存储，通过 type_tag 区分解释方式
+pub const FloatType = enum {
+    f16, f32, f64, f128,
+
+    pub fn fromName(name: []const u8) ?FloatType {
+        if (std.mem.eql(u8, name, "f16")) return .f16;
+        if (std.mem.eql(u8, name, "f32")) return .f32;
+        if (std.mem.eql(u8, name, "f64")) return .f64;
+        if (std.mem.eql(u8, name, "f128")) return .f128;
+        return null;
+    }
+
+    pub fn bitWidth(self: FloatType) usize {
+        return switch (self) {
+            .f16 => 16,
+            .f32 => 32,
+            .f64 => 64,
+            .f128 => 128,
+        };
+    }
+
+    pub fn minFloat(self: FloatType) f128 {
+        return switch (self) {
+            .f16 => -std.math.floatMax(f16),
+            .f32 => -std.math.floatMax(f32),
+            .f64 => -std.math.floatMax(f64),
+            .f128 => -std.math.floatMax(f128),
+        };
+    }
+
+    pub fn maxFloat(self: FloatType) f128 {
+        return switch (self) {
+            .f16 => std.math.floatMax(f16),
+            .f32 => std.math.floatMax(f32),
+            .f64 => std.math.floatMax(f64),
+            .f128 => std.math.floatMax(f128),
+        };
+    }
+
+    pub fn inRange(self: FloatType, val: f128) bool {
+        if (std.math.isNan(val) or std.math.isInf(val)) return false;
+        const min = self.minFloat();
+        const max = self.maxFloat();
+        return val >= min and val <= max;
+    }
+};
+
 pub const IntValue = struct {
     value: u128,
     type_tag: IntType = .i32,
 
-    /// 获取有符号整数值（仅用于有符号类型）
     pub fn signedValue(self: IntValue) i128 {
         return @bitCast(self.value);
     }
 };
 
-/// 整数字面量自动推断：返回能容纳该值的最小整数类型
-/// 推断顺序：i8 → u8 → i16 → u16 → i32 → u32 → i64 → u64 → i128 → u128
-/// 负值只考虑有符号类型
+/// 带类型标签的浮点值
+/// value 使用 f128 存储，可表示所有浮点类型
+pub const FloatValue = struct {
+    value: f128,
+    type_tag: FloatType = .f64,
+};
+
 pub fn inferIntType(val: u128) IntType {
-    // 文档 §6.12: 无类型后缀、且无显式类型标注的整数字面量，推断为「能容纳该值
-    // 的最小类型」。带标注时由声明/形参处的 castValue 按标注类型转换（覆盖此默认）；
-    // 带后缀时由 evalIntLiteral 直接采用后缀类型，均不经过本函数。
     const signed_val: i128 = @bitCast(val);
     if (signed_val >= 0) {
-        // 非负值：同位宽优先有符号，再无符号，逐级加宽取最小可容纳类型
         if (val <= std.math.maxInt(i8)) return .i8;
         if (val <= std.math.maxInt(u8)) return .u8;
         if (val <= std.math.maxInt(i16)) return .i16;
@@ -442,7 +266,6 @@ pub fn inferIntType(val: u128) IntType {
         if (val <= @as(u128, @bitCast(@as(i128, std.math.maxInt(i128))))) return .i128;
         return .u128;
     } else {
-        // 负值：只考虑有符号类型，取最小可容纳位宽
         if (signed_val >= std.math.minInt(i8)) return .i8;
         if (signed_val >= std.math.minInt(i16)) return .i16;
         if (signed_val >= std.math.minInt(i32)) return .i32;
@@ -451,14 +274,11 @@ pub fn inferIntType(val: u128) IntType {
     }
 }
 
-/// 整数算术类型提升：返回两个整数类型中较大的类型
-/// 规则：较大位宽优先；同位宽不同符号时，提升为有符号类型
 pub fn promoteIntTypes(left: IntType, right: IntType) IntType {
     const left_bits = left.bitWidth();
     const right_bits = right.bitWidth();
     if (left_bits > right_bits) return left;
     if (right_bits > left_bits) return right;
-    // 同位宽：如果有任一是无符号，提升为下一级有符号类型
     if (!left.isSigned() or !right.isSigned()) {
         return switch (left_bits) {
             8 => .i16,
@@ -473,855 +293,1877 @@ pub fn promoteIntTypes(left: IntType, right: IntType) IntType {
 }
 
 // ============================================================
-// 浮点类型标签
+// 复合值结构（保持不变，将被装箱）
 // ============================================================
 
-/// 浮点具体类型标签，用于运行时精度检查
-/// 文档 §2.2: f16/f32/f64/f128
-pub const FloatType = enum {
-    f16,
-    f32,
-    f64,
-    f128,
-
-    pub fn fromName(name: []const u8) ?FloatType {
-        if (std.mem.eql(u8, name, "f16")) return .f16;
-        if (std.mem.eql(u8, name, "f32")) return .f32;
-        if (std.mem.eql(u8, name, "f64")) return .f64;
-        if (std.mem.eql(u8, name, "f128")) return .f128;
-        return null;
-    }
-
-    /// 返回该浮点类型的位宽
-    pub fn bitWidth(self: FloatType) usize {
-        return switch (self) {
-            .f16 => 16,
-            .f32 => 32,
-            .f64 => 64,
-            .f128 => 128,
-        };
-    }
+pub const AdtField = struct {
+    name: ?[]const u8,
+    value: Value,
 };
 
-/// 浮点字面量自动推断：使用往返检查确定最小适用类型
-/// 推断顺序：f16 → f32 → f64 → f128
-/// 将 f128 值依次尝试转换为 f16/f32/f64 再转回 f128，若相等则该类型可精确表示
-pub fn inferFloatType(val: f128) FloatType {
-    // 尝试 f16
-    const f16_val: f16 = @floatCast(val);
-    const f16_rt: f128 = @floatCast(f16_val);
-    if (f16_rt == val and !std.math.isNan(f16_val) and !std.math.isInf(f16_val)) return .f16;
-    // 尝试 f32
-    const f32_val: f32 = @floatCast(val);
-    const f32_rt: f128 = @floatCast(f32_val);
-    if (f32_rt == val and !std.math.isNan(f32_val) and !std.math.isInf(f32_val)) return .f32;
-    // 尝试 f64
-    const f64_val: f64 = @floatCast(val);
-    const f64_rt: f128 = @floatCast(f64_val);
-    if (f64_rt == val and !std.math.isNan(f64_val) and !std.math.isInf(f64_val)) return .f64;
-    // 使用 f128
-    return .f128;
-}
-
-/// 浮点算术类型提升：返回两个浮点类型中较大的类型
-pub fn promoteFloatTypes(left: FloatType, right: FloatType) FloatType {
-    if (left.bitWidth() >= right.bitWidth()) return left;
-    return right;
-}
-
-/// 带类型标签的浮点值
-/// value 统一使用 f128 存储（所有浮点类型均可精确表示在 f128 中）
-/// type_tag 区分 f16/f32/f64/f128，用于：
-/// - 类型名推断（valueTypeName）
-/// - 精度范围检查（f16/f32 运算结果需验证在对应精度范围内）
-/// - impl 方法分派
-/// - Atomic<T> 类型标签
-pub const FloatValue = struct {
-    value: f128,
-    type_tag: FloatType = .f64,
+pub const AdtValue = struct {
+    type_name: []const u8,
+    constructor: []const u8,
+    fields: []AdtField,
+    rc: u32 = 1,
 };
 
-// ============================================================
-// 运行时值
-// ============================================================
+pub const NewtypeValue = struct {
+    type_name: []const u8,
+    inner: Value,
+    rc: u32 = 1,
+};
 
-/// 记录值（积类型 / Product Type）
-/// 文档 §2.5.2：记录类型是匿名的，基于结构化匹配
-/// type_name 存储创建时的类型名（如 "User"），用于构造器模式匹配
+pub const ArrayValue = struct {
+    elements: []Value,
+    fixed_size: ?u64 = null,
+    rc: u32 = 1,
+};
+
 pub const RecordValue = struct {
-    type_name: []const u8, // 创建时的类型名，匿名记录字面量为 ""
+    type_name: []const u8,
     fields: std.StringHashMap(Value),
     rc: u32 = 1,
 };
 
-/// 部分应用值 — 默认柯里化的运行时表示
-/// 文档 §2.8.1: fun add(a: i32, b: i32) : i32 { a + b }
-///   val add5 = add(5)  // 部分应用，返回 PartialApplication
-///   add5(3)            // => 8
-pub const PartialApplication = struct {
-    /// 原始函数（闭包或内置函数）
-    func: Value,
-    /// 已绑定的参数
-    bound_args: []Value,
-    /// 剩余需要的参数数量
-    remaining: usize,
-    /// 分配器
-    allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *PartialApplication) void {
-        for (self.bound_args) |arg| {
-            var v = arg;
-            v.deinit(self.allocator);
-        }
-        self.allocator.free(self.bound_args);
-    }
-};
-
-/// 数组值
-pub const ArrayValue = struct {
-    elements: []Value,
-    fixed_size: ?u64, // null = 动态 T[], non-null = 固定大小 T[N]
+pub const Cell = struct {
+    inner: Value,
     rc: u32 = 1,
 };
 
-pub const Value = union(enum) {
-    // 基本类型
-    integer: IntValue,
-    float: FloatValue,
-    boolean: bool,
-    char_val: u21,
+pub const VmClosure = struct {
+    func: *const anyopaque,
+    arity: u8,
+    upvalues: []Value = &.{},
+    bound_args: []Value = &.{},
+    rc: u32 = 1,
+    allocator: std.mem.Allocator,
+    self_upvalue_idx: i32 = -1,
+};
+
+pub const PartialApplication = struct {
+    func: Value,
+    bound_args: []Value,
+    remaining_arity: u8,
+    rc: u32 = 1,
+};
+
+pub const TraitValue = struct {
+    trait_name: []const u8 = "",
+    methods: std.StringHashMap(Value),
+    data: ?*Value = null,
+    allocator: std.mem.Allocator,
+    vm_owned: bool = false,
+    rc: u32 = 1,
+};
+
+pub const LazyValue = struct {
+    expr: *ast.Expr,
+    env: *anyopaque,
+    cached: ?Value = null,
+    forced: bool = false,
+    allocator: std.mem.Allocator,
+    vm_thunk: ?*anyopaque = null,
+    rc: u32 = 1,
+};
+
+pub const ArrayIterator = struct {
+    array: []Value,
+    index: usize,
+};
+
+pub const StringIterator = struct {
     string: []const u8,
-    null_val,
-    unit,
+    byte_offset: usize,
+};
 
-    // 复合类型（装箱为指针以支持引用计数共享 + 写时拷贝）
-    array: *ArrayValue,
-    record: *RecordValue,
+pub const RangeIterator = struct {
+    current: i128,
+    end: i128,
+    inclusive: bool,
+};
 
-    // ADT 值（代数数据类型构造器实例）
-    adt: *AdtValue,
+// 并发原语（re-export）
+pub const AtomicValue = atomic_mod.AtomicValue;
+pub const AtomicType = atomic_mod.AtomicValue.AtomicType;
+pub const atomicTypeToIntType = atomic_mod.atomicTypeToIntType;
+pub const intTypeToAtomicType = atomic_mod.intTypeToAtomicType;
+pub const valueToAtomicRaw = atomic_mod.valueToAtomicRaw;
+pub const SpawnStatus = spawn_mod.SpawnStatus;
+pub const SpawnHandle = spawn_mod.SpawnHandle;
+pub const ChannelValue = channel_mod.ChannelValue;
+pub const SenderValue = channel_mod.SenderValue;
+pub const ReceiverValue = channel_mod.ReceiverValue;
 
-    // Newtype 值（零开销包装类型实例）
-    newtype: *NewtypeValue,
+// ============================================================
+// 16B Value 核心结构
+// ============================================================
 
-    // 范围
-    range: Range,
+/// 类型标签（8位，256种类型）
+pub const ValueTag = enum(u8) {
+    // 内联类型（payload 直接存值，无需堆分配）
+    null_val = 0,
+    unit = 1,
+    boolean = 2,      // payload: 0=false, 1=true
+    small_int = 3,    // payload: i48 有符号整数
+    char_val = 4,     // payload: u21 Unicode 码点
 
-    /// 字节码 VM 闭包（M1b）：编译后函数 + 捕获的 upvalues。
-    vm_closure: *VmClosure,
+    // 浮点类型（多精度支持）
+    float16 = 5,      // payload: u16 位模式
+    float32 = 6,      // payload: u32 位模式
+    float64 = 7,      // payload: f64 位模式
 
-    // 部分应用（默认柯里化）
-    partial: *PartialApplication,
+    // 装箱类型（payload 存指针，指向 BoxedValue）
+    big_int = 10,     // i64/i128/u64/u128 超出 i48 范围
+    float128 = 11,    // f128 超出 8字节
+    string = 12,
+    array = 13,
+    record = 14,
+    adt = 15,
+    newtype = 16,
+    range = 17,
+    vm_closure = 18,
+    partial = 19,
+    builtin = 20,
+    error_val = 21,
+    throw_val = 22,
 
-    // 内建函数
-    builtin: Builtin,
+    // 迭代器
+    array_iterator = 30,
+    string_iterator = 31,
+    range_iterator = 32,
 
-    // 错误值（用于 throw 传播）
-    error_val: ErrorValue,
+    // 并发原语
+    atomic_val = 40,
+    spawn_val = 41,
+    channel_val = 42,
+    sender_val = 43,
+    receiver_val = 44,
 
-    // Throw 值（Throw<T, E> 的运行时表示）
-    throw_val: *ThrowValue,
+    // 高级特性
+    trait_value = 50,
+    lazy_val = 51,
+    cell_val = 52,
+};
 
-    // 迭代器（Iterable/Iterator 协议的运行时表示）
-    /// 数组迭代器
-    array_iterator: *ArrayIterator,
-    /// 字符串迭代器（UTF-8 码点）
-    string_iterator: *StringIterator,
-    /// 范围迭代器
-    range_iterator: *RangeIterator,
+/// 16B Value：tag + payload 分离
+pub const Value = struct {
+    tag: ValueTag,
+    _pad: [7]u8 = undefined, // 对齐到 8 字节边界
+    payload: u64,
 
-    // 并发原语值（Phase 4）
-    /// Atomic<T> — 跨协程共享原子状态
-    atomic_val: *AtomicValue,
-    /// Spawn<T> — 协程句柄（线性类型）
-    spawn_val: *SpawnHandle,
-    /// Channel<T> — CSP 通信通道
-    channel_val: *ChannelValue,
-    /// Sender<T> — Channel 发送端
-    sender_val: *SenderValue,
-    /// Receiver<T> — Channel 接收端
-    receiver_val: *ReceiverValue,
+    // ============================================================
+    // 编码函数（构造 Value）
+    // ============================================================
 
-    /// 一等 Trait 值（Phase 7，文档 §4.6/§4.7）：vtable + data 胖指针
-    trait_value: *TraitValue,
-
-    /// Lazy<T> 值（Phase 7，文档 §6.10）：延迟求值 + 首次访问缓存
-    lazy_val: *LazyValue,
-
-    /// 续14/闭包转换：被捕获 var 的共享可变 cell。透明语义——读经 evalIdentifier 解包、
-    /// 写经 env.set 转发到 cell.inner。帧与捕获闭包共享同一 *Cell（rc 联合持有）。
-    cell_val: *Cell,
-
-    /// 装箱构造：分配一个 rc=1 的数组值。
-    pub fn makeArray(allocator: std.mem.Allocator, elements: []Value, fixed_size: ?u64) !Value {
-        const p = try allocator.create(ArrayValue);
-        p.* = ArrayValue{ .elements = elements, .fixed_size = fixed_size, .rc = 1 };
-        return Value{ .array = p };
+    pub inline fn fromNull() Value {
+        return .{ .tag = .null_val, .payload = 0 };
     }
 
-    /// 装箱构造：分配一个 rc=1 的记录值。
-    pub fn makeRecord(allocator: std.mem.Allocator, type_name: []const u8, fields: std.StringHashMap(Value)) !Value {
-        const p = try allocator.create(RecordValue);
-        p.* = RecordValue{ .type_name = type_name, .fields = fields, .rc = 1 };
-        return Value{ .record = p };
+    pub inline fn fromUnit() Value {
+        return .{ .tag = .unit, .payload = 0 };
     }
 
-    /// 引用计数 +1（用于共享绑定/传参，替代深拷贝）。返回自身便于链式。
-    /// 仅对带 rc 的堆值有效；基础类型/无 rc 类型原样返回。
+    pub inline fn fromBool(b: bool) Value {
+        return .{ .tag = .boolean, .payload = if (b) 1 else 0 };
+    }
+
+    /// 小整数（-2^47 ~ 2^47-1）直接内联
+    pub inline fn fromSmallInt(i: i48) Value {
+        return .{ .tag = .small_int, .payload = @bitCast(@as(i64, i)) };
+    }
+
+    /// 大整数需要装箱（通过 BoxedValue）
+    pub fn fromBigInt(allocator: std.mem.Allocator, int_val: IntValue) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .big_int,
+            .rc = 1,
+            .payload = .{ .big_int = int_val },
+        };
+        return .{ .tag = .big_int, .payload = @intFromPtr(box) };
+    }
+
+    /// 智能整数编码：小整数内联，大整数装箱
+    pub fn fromInt(allocator: std.mem.Allocator, int_val: IntValue) !Value {
+        // 检查是否在 i48 范围内
+        const signed_val: i128 = @bitCast(int_val.value);
+        if (signed_val >= std.math.minInt(i48) and signed_val <= std.math.maxInt(i48)) {
+            return fromSmallInt(@intCast(signed_val));
+        } else {
+            return fromBigInt(allocator, int_val);
+        }
+    }
+
+    pub inline fn fromChar(c: u21) Value {
+        return .{ .tag = .char_val, .payload = c };
+    }
+
+    /// 多精度浮点编码（根据FloatValue的type_tag选择）
+    pub fn fromFloatValue(allocator: std.mem.Allocator, float_val: FloatValue) !Value {
+        return switch (float_val.type_tag) {
+            .f16 => {
+                const f16_val: f16 = @floatCast(float_val.value);
+                const u16_val: u16 = @bitCast(f16_val);
+                return .{ .tag = .float16, .payload = u16_val };
+            },
+            .f32 => {
+                const f32_val: f32 = @floatCast(float_val.value);
+                const u32_val: u32 = @bitCast(f32_val);
+                return .{ .tag = .float32, .payload = u32_val };
+            },
+            .f64 => {
+                const f64_val: f64 = @floatCast(float_val.value);
+                return .{ .tag = .float64, .payload = @bitCast(f64_val) };
+            },
+            .f128 => try fromFloat128(allocator, float_val.value),
+        };
+    }
+
+    /// f16 编码（2字节内联）
+    pub inline fn fromFloat16(f: f16) Value {
+        const u16_val: u16 = @bitCast(f);
+        return .{ .tag = .float16, .payload = u16_val };
+    }
+
+    /// f32 编码（4字节内联）
+    pub inline fn fromFloat32(f: f32) Value {
+        const u32_val: u32 = @bitCast(f);
+        return .{ .tag = .float32, .payload = u32_val };
+    }
+
+    /// f64 编码（8字节内联）
+    pub inline fn fromFloat64(f: f64) Value {
+        return .{ .tag = .float64, .payload = @bitCast(f) };
+    }
+
+    /// f128 编码（16字节装箱）
+    pub fn fromFloat128(allocator: std.mem.Allocator, f: f128) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .float128,
+            .rc = 1,
+            .payload = .{ .float128 = f },
+        };
+        return .{ .tag = .float128, .payload = @intFromPtr(box) };
+    }
+
+    /// 向后兼容：统一浮点编码（默认f64）
+    pub inline fn fromFloat(f: f64) Value {
+        return fromFloat64(f);
+    }
+
+    pub inline fn fromString(allocator: std.mem.Allocator, s: []const u8) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .string,
+            .rc = 1,
+            .payload = .{ .string = s },
+        };
+        return .{ .tag = .string, .payload = @intFromPtr(box) };
+    }
+
+    /// 通用装箱函数（用于复合类型）
+    pub inline fn fromBoxed(tag: ValueTag, ptr: *anyopaque) Value {
+        return .{ .tag = tag, .payload = @intFromPtr(ptr) };
+    }
+
+    /// 构造 ADT 值
+    pub fn makeAdt(allocator: std.mem.Allocator, type_name: []const u8, constructor: []const u8, fields: []AdtField) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .adt,
+            .rc = 1,
+            .payload = .{
+                .adt = .{
+                    .type_name = type_name,
+                    .constructor = constructor,
+                    .fields = fields,
+                    .rc = 1,
+                },
+            },
+        };
+        return .{ .tag = .adt, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Newtype 值
+    pub fn makeNewtype(allocator: std.mem.Allocator, type_name: []const u8, inner: Value) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .newtype,
+            .rc = 1,
+            .payload = .{
+                .newtype = .{
+                    .type_name = type_name,
+                    .inner = inner,
+                    .rc = 1,
+                },
+            },
+        };
+        return .{ .tag = .newtype, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Cell 值（用于可变捕获）
+    pub fn makeCell(allocator: std.mem.Allocator, inner: Value) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .cell_val,
+            .rc = 1,
+            .payload = .{
+                .cell_val = .{
+                    .inner = inner,
+                    .rc = 1,
+                },
+            },
+        };
+        return .{ .tag = .cell_val, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Range 值
+    pub fn makeRange(allocator: std.mem.Allocator, start: i128, end: i128, inclusive: bool) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .range,
+            .rc = 1,
+            .payload = .{
+                .range = .{
+                    .start = start,
+                    .end = end,
+                    .inclusive = inclusive,
+                },
+            },
+        };
+        return .{ .tag = .range, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 VmClosure 值
+    pub fn makeVmClosure(
+        allocator: std.mem.Allocator,
+        func: *const anyopaque,
+        arity: u8,
+        upvalues: []Value,
+        bound_args: []Value,
+    ) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .vm_closure,
+            .rc = 1,
+            .payload = .{
+                .vm_closure = .{
+                    .func = func,
+                    .arity = arity,
+                    .upvalues = upvalues,
+                    .bound_args = bound_args,
+                    .rc = 1,
+                    .allocator = allocator,
+                },
+            },
+        };
+        return .{ .tag = .vm_closure, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Partial Application 值
+    pub fn makePartial(allocator: std.mem.Allocator, func: Value, bound_args: []Value, remaining_arity: u8) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .partial,
+            .rc = 1,
+            .payload = .{
+                .partial = .{
+                    .func = func,
+                    .bound_args = bound_args,
+                    .remaining_arity = remaining_arity,
+                    .rc = 1,
+                },
+            },
+        };
+        return .{ .tag = .partial, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 ErrorValue
+    pub fn makeError(allocator: std.mem.Allocator, type_name: []const u8, message: []const u8, is_error_subtype: bool) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .error_val,
+            .rc = 1,
+            .payload = .{
+                .error_val = .{
+                    .type_name = type_name,
+                    .message = message,
+                    .is_error_subtype = is_error_subtype,
+                },
+            },
+        };
+        return .{ .tag = .error_val, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Sender 值
+    pub fn fromSender(allocator: std.mem.Allocator, sv: *SenderValue) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .sender_val,
+            .rc = 1,
+            .payload = .{ .sender_val = sv },
+        };
+        return .{ .tag = .sender_val, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Receiver 值
+    pub fn fromReceiver(allocator: std.mem.Allocator, rv: *ReceiverValue) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .receiver_val,
+            .rc = 1,
+            .payload = .{ .receiver_val = rv },
+        };
+        return .{ .tag = .receiver_val, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 ThrowValue
+    pub fn makeThrow(allocator: std.mem.Allocator, throw_val: ThrowValue) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .throw_val,
+            .rc = 1,
+            .payload = .{ .throw_val = throw_val },
+        };
+        return .{ .tag = .throw_val, .payload = @intFromPtr(box) };
+    }
+
+    /// 构造 Builtin 值
+    pub fn makeBuiltin(allocator: std.mem.Allocator, builtin: Builtin) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .builtin,
+            .rc = 1,
+            .payload = .{ .builtin = builtin },
+        };
+        return .{ .tag = .builtin, .payload = @intFromPtr(box) };
+    }
+
+    // ============================================================
+    // 解码函数（提取值）
+    // ============================================================
+
+    pub inline fn isNull(self: Value) bool {
+        return self.tag == .null_val;
+    }
+
+    pub inline fn isUnit(self: Value) bool {
+        return self.tag == .unit;
+    }
+
+    pub inline fn asBool(self: Value) bool {
+        std.debug.assert(self.tag == .boolean);
+        return self.payload != 0;
+    }
+
+    pub inline fn asSmallInt(self: Value) i48 {
+        std.debug.assert(self.tag == .small_int);
+        const i64_val: i64 = @bitCast(self.payload);
+        return @intCast(i64_val);
+    }
+
+    pub inline fn asChar(self: Value) u21 {
+        std.debug.assert(self.tag == .char_val);
+        return @intCast(self.payload);
+    }
+
+    /// 多精度浮点解码（返回FloatValue保留类型信息）
+    pub fn asFloatValue(self: Value) FloatValue {
+        return switch (self.tag) {
+            .float16 => {
+                const u16_val: u16 = @intCast(self.payload);
+                const f16_val: f16 = @bitCast(u16_val);
+                return .{ .value = @floatCast(f16_val), .type_tag = .f16 };
+            },
+            .float32 => {
+                const u32_val: u32 = @intCast(self.payload);
+                const f32_val: f32 = @bitCast(u32_val);
+                return .{ .value = @floatCast(f32_val), .type_tag = .f32 };
+            },
+            .float64 => {
+                const f64_val: f64 = @bitCast(self.payload);
+                return .{ .value = @floatCast(f64_val), .type_tag = .f64 };
+            },
+            .float128 => {
+                const box = self.asBoxed();
+                return .{ .value = box.payload.float128, .type_tag = .f128 };
+            },
+            else => unreachable,
+        };
+    }
+
+    /// f16 解码
+    pub inline fn asFloat16(self: Value) f16 {
+        std.debug.assert(self.tag == .float16);
+        const u16_val: u16 = @intCast(self.payload);
+        return @bitCast(u16_val);
+    }
+
+    /// f32 解码
+    pub inline fn asFloat32(self: Value) f32 {
+        std.debug.assert(self.tag == .float32);
+        const u32_val: u32 = @intCast(self.payload);
+        return @bitCast(u32_val);
+    }
+
+    /// f64 解码
+    pub inline fn asFloat64(self: Value) f64 {
+        std.debug.assert(self.tag == .float64);
+        return @bitCast(self.payload);
+    }
+
+    /// f128 解码
+    pub inline fn asFloat128(self: Value) f128 {
+        std.debug.assert(self.tag == .float128);
+        return self.asBoxed().payload.float128;
+    }
+
+    /// 向后兼容：统一浮点解码（默认f64）
+    pub inline fn asFloat(self: Value) f64 {
+        return self.asFloat64();
+    }
+
+    pub inline fn asBoxed(self: Value) *BoxedValue {
+        std.debug.assert(self.isBoxed());
+        return @ptrFromInt(self.payload);
+    }
+
+    pub inline fn asPointer(self: Value, comptime T: type) *T {
+        return @ptrFromInt(self.payload);
+    }
+
+    /// 智能整数解码：小整数直接取值，大整数从箱体提取
+    pub fn asInt(self: Value) IntValue {
+        return switch (self.tag) {
+            .small_int => {
+                const i48_val = self.asSmallInt();
+                return .{ .value = @bitCast(@as(i128, i48_val)), .type_tag = .i32 };
+            },
+            .big_int => self.asBoxed().payload.big_int,
+            else => unreachable,
+        };
+    }
+
+    // ============================================================
+    // 类型检查
+    // ============================================================
+
+    pub inline fn isInline(self: Value) bool {
+        return @intFromEnum(self.tag) < 10;
+    }
+
+    pub inline fn isBoxed(self: Value) bool {
+        return @intFromEnum(self.tag) >= 10;
+    }
+
+    pub inline fn isInteger(self: Value) bool {
+        return self.tag == .small_int or self.tag == .big_int;
+    }
+
+    pub inline fn isFloat(self: Value) bool {
+        return self.tag == .float16 or self.tag == .float32 or
+               self.tag == .float64 or self.tag == .float128;
+    }
+
+    // ============================================================
+    // 引用计数
+    // ============================================================
+
     pub fn retain(self: Value) Value {
-        switch (self) {
-            .adt => |p| p.rc += 1,
-            .newtype => |p| p.rc += 1,
-            .array => |p| p.rc += 1,
-            .record => |p| p.rc += 1,
-            .cell_val => |p| p.rc += 1, // 续14/闭包转换：cell 帧+闭包联合持有
-            .vm_closure => |p| p.rc += 1, // M1b：VM 闭包 rc，归零释放 upvalues
-            else => {},
+        if (self.isBoxed()) {
+            const box: *BoxedValue = @ptrFromInt(self.payload);
+            box.rc += 1;
         }
         return self;
     }
 
-    /// 引用计数 -1；归零则递归 release 子值并释放箱体。
     pub fn release(self: Value, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .adt => |p| {
-                if (p.rc > 1) { p.rc -= 1; return; }
-                for (p.fields) |*f| f.value.release(allocator);
-                allocator.free(p.fields);
-                allocator.destroy(p);
-            },
-            .newtype => |p| {
-                if (p.rc > 1) { p.rc -= 1; return; }
-                p.inner.release(allocator);
-                allocator.destroy(p);
-            },
-            .array => |p| {
-                if (p.rc > 1) { p.rc -= 1; return; }
-                for (p.elements) |*e| e.release(allocator);
-                allocator.free(p.elements);
-                allocator.destroy(p);
-            },
-            .record => |p| {
-                if (p.rc > 1) { p.rc -= 1; return; }
-                var it = p.fields.iterator();
-                while (it.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    entry.value_ptr.*.release(allocator);
-                }
-                p.fields.deinit();
-                allocator.destroy(p);
-            },
-            .cell_val => |p| {
-                // 续14/闭包转换：归零才释放 cell + 其内值（帧与捕获闭包联合持有）。
-                if (p.rc > 1) { p.rc -= 1; return; }
-                p.inner.release(allocator);
-                allocator.destroy(p);
-            },
-            .vm_closure => |p| {
-                // M1b：归零才释放捕获的 upvalues + bound_args + slice + 箱体。func 指向 Program
-                // 持有的 Function，不在此释放。
-                if (p.rc > 1) { p.rc -= 1; return; }
-                for (p.upvalues) |uv| uv.release(allocator);
-                if (p.upvalues.len > 0) p.allocator.free(p.upvalues);
-                for (p.bound_args) |ba| ba.release(allocator);
-                if (p.bound_args.len > 0) p.allocator.free(p.bound_args);
-                p.allocator.destroy(p);
-            },
-            // string 字节由 owned 持有者各自 dupe（生成点 + 借用点 retainOwned 均走 value_allocator）。
-            // release 即归还字节。SlabPool 魔数守卫兜底：误传 arena 字节时掩码反查 magic 不符会安全忽略。
-            .string => |s| allocator.free(s),
-            else => {},
+        if (self.isBoxed()) {
+            const box: *BoxedValue = @ptrFromInt(self.payload);
+            if (box.rc > 1) {
+                box.rc -= 1;
+            } else {
+                // 归零：释放 payload + 箱体
+                box.releasePayload(allocator);
+                allocator.destroy(box);
+            }
         }
     }
 
-    /// 字节码 VM 专用释放（纯 refcount 模型）。仅 VM 调用；eval 永远走 release（对 throw_val/
-    /// error_val 是 no-op，因 eval 的 GC 疏散管理它们）。VM 无 GC，故对这两类用值语义深释放：
-    /// 释放壳 + 错误字符串，嵌套值递归 releaseVM（与 retainOwned 的 rc+1 平衡）。其它类型委托 release。
-    pub fn releaseVM(self: Value, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .error_val => |e| {
-                allocator.free(e.type_name);
-                allocator.free(e.message);
-            },
-            // M4a：atomic_val 内建原子 ref_count；归零销毁（协程间共享安全）。
-            .atomic_val => |av| {
-                if (av.unref()) allocator.destroy(av);
-            },
-            // M4b：channel/sender/receiver 内建原子 ref_count。channel 归零 deinit+destroy；
-            // sender/receiver 是轻包装（各持一个 channel ref + 自身分配）——unref channel 后销毁包装。
-            .channel_val => |ch| {
-                if (ch.unref()) {
-                    ch.deinit();
-                    allocator.destroy(ch);
-                }
-            },
-            .sender_val => |sv| {
-                if (sv.channel.unref()) {
-                    sv.channel.deinit();
-                    allocator.destroy(sv.channel);
-                }
-                allocator.destroy(sv);
-            },
-            .receiver_val => |rv| {
-                if (rv.channel.unref()) {
-                    rv.channel.deinit();
-                    allocator.destroy(rv.channel);
-                }
-                allocator.destroy(rv);
-            },
-            .throw_val => |tv| {
-                switch (tv.*) {
-                    .ok => |v| {
-                        v.*.releaseVM(allocator);
-                        allocator.destroy(v);
-                    },
-                    .err => |e| {
-                        allocator.free(e.type_name);
-                        allocator.free(e.message);
-                    },
-                }
-                allocator.destroy(tv);
-            },
-            // M4c：cell/vm_closure 必须递归 releaseVM（非 release）——否则嵌套的 atomic/channel
-            // 走 release no-op，ref_count 不递减而泄漏。归零才深释放内层。
-            .cell_val => |c| {
-                if (c.rc > 1) {
-                    c.rc -= 1;
-                    return;
-                }
-                c.inner.releaseVM(allocator);
-                allocator.destroy(c);
-            },
-            .vm_closure => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                    return;
-                }
-                for (p.upvalues, 0..) |uv, i| {
-                    // M5c：跳过 letrec 弱自引用 upvalue（指向自身 cell，不持计数 → 不释放，避免
-                    // 在本闭包正被该 cell 释放时反向再释放 cell 造成 use-after-free）。
-                    if (p.self_upvalue_idx >= 0 and i == @as(usize, @intCast(p.self_upvalue_idx))) continue;
-                    uv.releaseVM(allocator);
-                }
-                if (p.upvalues.len > 0) p.allocator.free(p.upvalues);
-                for (p.bound_args) |ba| ba.releaseVM(allocator);
-                if (p.bound_args.len > 0) p.allocator.free(p.bound_args);
-                p.allocator.destroy(p);
-            },
-            // M4d：VM 模式 lazy —— 归零才释放 thunk 闭包 + 缓存值 + 箱体。eval 模式 lazy（vm_thunk==null）
-            // 由 GC/lazy_values 列表管理，此处 no-op（不 destroy，避免双释放）。
-            .lazy_val => |lz| {
-                if (lz.vm_thunk == null) return; // eval 模式：交给 GC
-                if (lz.rc > 1) {
-                    lz.rc -= 1;
-                    return;
-                }
-                const thunk: *VmClosure = @ptrCast(@alignCast(lz.vm_thunk.?));
-                (Value{ .vm_closure = thunk }).releaseVM(allocator);
-                if (lz.cached) |c| c.releaseVM(allocator);
-                allocator.destroy(lz);
-            },
-            // M4d：VM 模式 trait 值 —— 归零才释放 methods（key + vm_closure）+ data + 箱体。
-            // eval 模式（vm_owned==false）由 GC 管理，no-op。
-            .trait_value => |tv| {
-                if (!tv.vm_owned) return;
-                if (tv.rc > 1) {
-                    tv.rc -= 1;
-                    return;
-                }
-                var it = tv.methods.iterator();
-                while (it.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    entry.value_ptr.*.releaseVM(allocator);
-                }
-                tv.methods.deinit();
-                if (tv.data) |d| {
-                    d.releaseVM(allocator);
-                    allocator.destroy(d);
-                }
-                allocator.destroy(tv);
-            },
-            else => self.release(allocator),
-        }
-    }
+    /// retainOwned：用于需要独立所有权的场景（string/数组元素等）
+    /// 跨线程深拷贝：创建一个新的 Value，所有堆数据都复制到新的 allocator
+    /// 用于将 Value 从一个线程的 arena 传递到另一个线程
+    pub fn retainOwned(self: Value, allocator: std.mem.Allocator) !Value {
+        return switch (self.tag) {
+            // 简单类型：直接返回
+            .null_val, .unit, .boolean, .small_int, .char_val, .float16, .float32, .float64 => self,
 
-    pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .array => |arr| {
-                for (arr.elements) |*item| {
-                    item.deinit(allocator);
-                }
-                allocator.free(arr.elements);
+            // 字符串：需要深拷贝
+            .string => {
+                const s = self.asBoxed().payload.string;
+                const duped = try allocator.dupe(u8, s);
+                return try fromString(allocator, duped);
             },
-            .record => |rv| {
-                if (rv.type_name.len > 0) {
-                    allocator.free(rv.type_name);
-                }
-                var iter = rv.fields.iterator();
-                while (iter.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    var val = entry.value_ptr.*;
-                    val.deinit(allocator);
-                }
-                rv.fields.deinit();
-            },
-            .string => |s| {
-                allocator.free(s);
-            },
-            .error_val => |e| {
-                allocator.free(e.type_name);
-                allocator.free(e.message);
-            },
-            .throw_val => |tv| {
-                switch (tv.*) {
-                    .ok => |v| {
-                        v.deinit(allocator);
-                        allocator.destroy(v);
-                    },
-                    .err => |e| {
-                        allocator.free(e.type_name);
-                        allocator.free(e.message);
-                    },
-                }
-                allocator.destroy(tv);
-            },
-            .adt => {
-                // ADT 值由 Evaluator 统一管理（通过 arena allocator），
-                // 不在此释放，避免同一 *AdtValue 被多个 Value 引用导致 double-free
-            },
-            .newtype => {
-                // Newtype 值由 Evaluator 统一管理，不在此释放
-            },
-            .partial => |pa| {
-                pa.deinit();
-                allocator.destroy(pa);
-            },
-            .array_iterator, .string_iterator, .range_iterator => {
-                // 迭代器由 Evaluator 统一管理，不在此释放
-            },
-            else => {},
-        }
-    }
 
-    /// 克隆值 — 用于同 Heap 内的值复制
-    ///
-    /// 注意：此方法用于同 Heap 内的值复制（如 Environment.define 深拷贝）。
-    /// 跨 Heap 传递（spawn 闭包捕获）应使用 env.deepCloneValue，
-    /// 它严格按照文档 §5.2 六类规则处理每种类型。
-    ///
-    /// §5.2 跨 Heap 传递规则对照：
-    /// - 基础类型 (integer/float/boolean/char_val/null_val/unit/range): 值拷贝 ✓
-    /// - 不可变数据结构 (string/array/record/adt/newtype/error_val/throw_val/partial): 深拷贝 ✓
-    /// - 一等 Trait 值: vtable 共享 + data 深拷贝（Phase 7 实现，builtin 视为简化 Trait 值）
-    /// - Channel (channel_val/sender_val/receiver_val): 引用传递（ref count）✓
-    /// - 函数/闭包 (closure): 此处浅拷贝，跨 Heap 时由 deepCloneValue 深拷贝环境
-    /// - Atomic<T> (atomic_val): 浅拷贝（ref count）✓
-    pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {        return switch (self) {
-            // §5.2 规则 1: 基础类型 — 值拷贝
-            .integer => self,
-            .float => self,
-            .boolean => self,
-            .char_val => self,
-            .null_val => self,
-            .unit => self,
-            .builtin => self,
-            .range => self,
-            // §5.2 规则 2: 不可变数据结构 — 同 Heap 内共享（retain），写时拷贝(COW)保证别名安全。
-            // 这把绑定/传参从 O(size) 深拷贝降为 O(1) retain，链表累加从 O(n^2) 变 O(n)。
-            .string => |s| Value{ .string = try allocator.dupe(u8, s) },
-            .array => self.retain(),
-            .record => self.retain(),
-            // M1b：VM 闭包同 Heap 内浅拷贝（rc+1 共享 upvalues）。
-            .vm_closure => |c| {
-                c.rc += 1;
-                return Value{ .vm_closure = c };
+            // 大整数：深拷贝
+            .big_int => {
+                const int_val = self.asBoxed().payload.big_int;
+                return try fromBigInt(allocator, int_val);
             },
-            // §5.2 规则 2: 不可变数据结构 — 深拷贝
-            .partial => |pa| {
-                const new_pa = try allocator.create(PartialApplication);
-                const new_args = try allocator.alloc(Value, pa.bound_args.len);
-                for (pa.bound_args, 0..) |arg, i| {
-                    new_args[i] = try arg.clone(allocator);
-                }
-                new_pa.* = PartialApplication{
-                    .func = try pa.func.clone(allocator),
-                    .bound_args = new_args,
-                    .remaining = pa.remaining,
-                    .allocator = allocator,
-                };
-                return Value{ .partial = new_pa };
-            },
-            .adt => self.retain(),
-            .newtype => self.retain(),
-            .error_val => |e| Value{ .error_val = ErrorValue{
-                .type_name = try allocator.dupe(u8, e.type_name),
-                .message = try allocator.dupe(u8, e.message),
-                .is_error_subtype = e.is_error_subtype,
-            } },
-            .throw_val => |tv| {
-                const new_tv = try allocator.create(ThrowValue);
-                switch (tv.*) {
-                    .ok => |v| {
-                        const cloned_val = try v.clone(allocator);
-                        const cloned_ptr = try allocator.create(Value);
-                        cloned_ptr.* = cloned_val;
-                        new_tv.* = ThrowValue{ .ok = cloned_ptr };
-                    },
-                    .err => |e| {
-                        new_tv.* = ThrowValue{ .err = ErrorValue{
-                            .type_name = try allocator.dupe(u8, e.type_name),
-                            .message = try allocator.dupe(u8, e.message),
-                            .is_error_subtype = e.is_error_subtype,
-                        } };
-                    },
-                }
-                return Value{ .throw_val = new_tv };
-            },
-            // 迭代器：引用语义
-            .array_iterator => |ai| Value{ .array_iterator = ai },
-            .string_iterator => |si| Value{ .string_iterator = si },
-            .range_iterator => |ri| Value{ .range_iterator = ri },
-            // 续14/闭包转换：cell — 共享浅拷贝（retain）。clone 用于绑定/传参，cell 的共享
-            // 可变语义要求所有持有者指向同一 *Cell，故仅 rc+1，绝不深拷。
-            .cell_val => |c| {
-                c.rc += 1;
-                return Value{ .cell_val = c };
-            },
-            // §5.2 规则 6: Atomic<T> — 浅拷贝（原子增加引用计数）
-            .atomic_val => |av| {
-                av.ref();
-                return Value{ .atomic_val = av };
-            },
-            // Spawn<T> 线性类型：clone 不增加副本
-            .spawn_val => self,
-            // §5.2 规则 4: Channel — 调度器 heap 中，两端只持有引用
-            .channel_val => |cv| {
-                cv.ref();
-                return Value{ .channel_val = cv };
-            },
-            .sender_val => |sv| {
-                sv.ref();
-                return Value{ .sender_val = sv };
-            },
-            .receiver_val => |rv| {
-                rv.ref();
-                return Value{ .receiver_val = rv };
-            },
-            // §5.2 规则 3: 一等 Trait 值 — vtable 共享（方法表浅拷贝），data 深拷贝
-            .trait_value => |tv| {
-                const new_tv = try allocator.create(TraitValue);
-                var new_methods = std.StringHashMap(Value).init(allocator);
-                var it = tv.methods.iterator();
-                while (it.next()) |entry| {
-                    const key = try allocator.dupe(u8, entry.key_ptr.*);
-                    try new_methods.put(key, try entry.value_ptr.*.clone(allocator));
-                }
-                var new_data: ?*Value = null;
-                if (tv.data) |d| {
-                    const dc = try allocator.create(Value);
-                    dc.* = try d.clone(allocator);
-                    new_data = dc;
-                }
-                new_tv.* = TraitValue{
-                    .trait_name = if (tv.trait_name.len > 0) try allocator.dupe(u8, tv.trait_name) else "",
-                    .methods = new_methods,
-                    .data = new_data,
-                    .allocator = allocator,
-                };
-                return Value{ .trait_value = new_tv };
-            },
-            // Lazy<T>：thunk 引用语义共享（保留缓存一致性）
-            .lazy_val => self,
-        };
-    }
 
-    /// M4c：跨 allocator / 跨线程**完整**深拷贝（VM spawn 用）。
-    /// 与 clone 不同：array/record 不走 retain（非原子 rc 跨线程不安全），而是按目标 allocator
-    /// 重新分配并递归深拷。基础类型值拷；string dupe；atomic/channel/sender/receiver **共享**
-    /// （内建原子 ref_count，跨线程安全）—— spawn 深拷捕获 + Atomic/Channel 浅拷语义。
-    /// 闭包/trait/lazy/iterator 暂不支持跨线程（返回 error.Unsupported），spawn body 捕获到这些则回退。
-    pub fn deepCopyAcross(self: Value, allocator: std.mem.Allocator) !Value {
-        return switch (self) {
-            .integer, .float, .boolean, .char_val, .null_val, .unit, .range => self,
-            .string => |s| Value{ .string = try allocator.dupe(u8, s) },
-            .array => |arr| {
-                const new_elems = try allocator.alloc(Value, arr.elements.len);
-                errdefer allocator.free(new_elems);
-                for (arr.elements, 0..) |e, i| new_elems[i] = try e.deepCopyAcross(allocator);
-                return try makeArray(allocator, new_elems, arr.fixed_size);
+            // 浮点数：深拷贝
+            .float128 => {
+                const f = self.asBoxed().payload.float128;
+                return try fromFloat128(allocator, f);
             },
-            .record => |rec| {
-                const new_rec = try allocator.create(RecordValue);
+
+            // 数组：递归深拷贝所有元素
+            .array => {
+                const arr = self.asBoxed().payload.array;
+                const new_elements = try allocator.alloc(Value, arr.elements.len);
+                errdefer allocator.free(new_elements);
+                for (arr.elements, 0..) |elem, i| {
+                    new_elements[i] = try elem.retainOwned(allocator);
+                }
+                return try makeArray(allocator, new_elements, arr.fixed_size);
+            },
+
+            // 记录：递归深拷贝所有字段
+            .record => {
+                const rec = self.asBoxed().payload.record;
                 var new_fields = std.StringHashMap(Value).init(allocator);
+                errdefer {
+                    var it = new_fields.iterator();
+                    while (it.next()) |entry| {
+                        entry.value_ptr.release(allocator);
+                    }
+                    new_fields.deinit();
+                }
                 var it = rec.fields.iterator();
                 while (it.next()) |entry| {
-                    const key = try allocator.dupe(u8, entry.key_ptr.*);
-                    try new_fields.put(key, try entry.value_ptr.*.deepCopyAcross(allocator));
+                    const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+                    const val_copy = try entry.value_ptr.retainOwned(allocator);
+                    try new_fields.put(key_copy, val_copy);
                 }
-                new_rec.* = RecordValue{
-                    .type_name = if (rec.type_name.len > 0) try allocator.dupe(u8, rec.type_name) else "",
-                    .fields = new_fields,
-                    .rc = 1,
-                };
-                return Value{ .record = new_rec };
+                const type_name_copy = try allocator.dupe(u8, rec.type_name);
+                return try makeRecord(allocator, type_name_copy, new_fields);
             },
-            // 并发原语：内建原子 ref_count，跨线程共享安全（spawn 浅拷语义）。
-            .atomic_val => |av| {
-                av.ref();
-                return Value{ .atomic_val = av };
-            },
-            .channel_val => |cv| {
-                cv.ref();
-                return Value{ .channel_val = cv };
-            },
-            .sender_val => |sv| {
-                sv.channel.ref();
-                const ns = try allocator.create(SenderValue);
-                ns.* = .{ .channel = sv.channel };
-                return Value{ .sender_val = ns };
-            },
-            .receiver_val => |rv| {
-                rv.channel.ref();
-                const nr = try allocator.create(ReceiverValue);
-                nr.* = .{ .channel = rv.channel };
-                return Value{ .receiver_val = nr };
-            },
-            .error_val => |e| Value{ .error_val = ErrorValue{
-                .type_name = try allocator.dupe(u8, e.type_name),
-                .message = try allocator.dupe(u8, e.message),
-                .is_error_subtype = e.is_error_subtype,
-            } },
-            .throw_val => |tv| {
-                const new_tv = try allocator.create(ThrowValue);
-                switch (tv.*) {
-                    .ok => |v| {
-                        const cp = try allocator.create(Value);
-                        cp.* = try v.deepCopyAcross(allocator);
-                        new_tv.* = ThrowValue{ .ok = cp };
-                    },
-                    .err => |e| new_tv.* = ThrowValue{ .err = ErrorValue{
-                        .type_name = try allocator.dupe(u8, e.type_name),
-                        .message = try allocator.dupe(u8, e.message),
-                        .is_error_subtype = e.is_error_subtype,
-                    } },
+
+            // ADT：递归深拷贝所有字段
+            .adt => {
+                const adt = self.asBoxed().payload.adt;
+                const new_fields = try allocator.alloc(AdtField, adt.fields.len);
+                errdefer allocator.free(new_fields);
+                for (adt.fields, 0..) |field, i| {
+                    new_fields[i] = .{
+                        .name = if (field.name) |n| try allocator.dupe(u8, n) else null,
+                        .value = try field.value.retainOwned(allocator),
+                    };
                 }
-                return Value{ .throw_val = new_tv };
+                const type_name_copy = try allocator.dupe(u8, adt.type_name);
+                const constructor_copy = try allocator.dupe(u8, adt.constructor);
+                return try makeAdt(allocator, type_name_copy, constructor_copy, new_fields);
             },
-            else => error.Unsupported, // closure/trait/lazy/iterator 等暂不支持跨线程 spawn
+
+            // Newtype：递归深拷贝内部值
+            .newtype => {
+                const nt = self.asBoxed().payload.newtype;
+                const type_name_copy = try allocator.dupe(u8, nt.type_name);
+                const inner_copy = try nt.inner.retainOwned(allocator);
+                return try makeNewtype(allocator, type_name_copy, inner_copy);
+            },
+
+            // Range：深拷贝
+            .range => {
+                const r = self.asBoxed().payload.range;
+                return try makeRange(allocator, r.start, r.end, r.inclusive);
+            },
+
+            // Cell：深拷贝内部值
+            .cell_val => {
+                const cell = self.asBoxed().payload.cell_val;
+                const inner_copy = try cell.inner.retainOwned(allocator);
+                return try makeCell(allocator, inner_copy);
+            },
+
+            // Error：深拷贝
+            .error_val => {
+                const err = self.asBoxed().payload.error_val;
+                const type_name_copy = try allocator.dupe(u8, err.type_name);
+                const message_copy = try allocator.dupe(u8, err.message);
+                return try makeError(allocator, type_name_copy, message_copy, err.is_error_subtype);
+            },
+
+            // 这些类型不能跨线程传递，只增加引用计数
+            // 注意：闭包、部分应用、builtin 等包含函数指针，理论上可以跨线程
+            // 但它们的捕获可能需要深拷贝
+            .vm_closure, .partial, .builtin => self.retain(),
+
+            // 这些类型是线程相关的，不应该跨线程传递
+            // 返回错误或者只增加引用计数（根据实际需求）
+            .throw_val, .array_iterator, .string_iterator, .range_iterator,
+            .atomic_val, .spawn_val, .channel_val, .sender_val, .receiver_val,
+            .trait_value, .lazy_val => self.retain(),
         };
     }
 
-    /// debug=false: display 模式（顶层字符串无引号，用户友好）
-    /// debug=true: repr 模式（字符串带引号，结构化表示）
-    pub fn format(self: Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator, debug: bool) !void {
-        switch (self) {
-            .integer => |iv| {
-                if (iv.type_tag.isSigned()) {
-                    try buf.print(allocator, "{}", .{@as(i128, @bitCast(iv.value))});
-                } else {
-                    try buf.print(allocator, "{}", .{iv.value});
-                }
+    // ============================================================
+    // 辅助函数（向后兼容）
+    // ============================================================
+
+    pub fn makeArray(allocator: std.mem.Allocator, elements: []Value, fixed_size: ?u64) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .array,
+            .rc = 1,
+            .payload = .{
+                .array = .{
+                    .elements = elements,
+                    .fixed_size = fixed_size,
+                    .rc = 1,
+                },
             },
-            .float => |fv| try buf.print(allocator, "{d}", .{fv.value}),
-            .boolean => |b| try buf.print(allocator, "{}", .{b}),
-            .char_val => |c| try buf.print(allocator, "{u}", .{c}),
-            .string => |s| if (debug) {
-                try buf.print(allocator, "\"{s}\"", .{s});
-            } else {
-                try buf.print(allocator, "{s}", .{s});
+        };
+        return .{ .tag = .array, .payload = @intFromPtr(box) };
+    }
+
+    pub fn makeRecord(allocator: std.mem.Allocator, type_name: []const u8, fields: std.StringHashMap(Value)) !Value {
+        const box = try allocator.create(BoxedValue);
+        box.* = .{
+            .tag = .record,
+            .rc = 1,
+            .payload = .{
+                .record = .{
+                    .type_name = type_name,
+                    .fields = fields,
+                    .rc = 1,
+                },
             },
+        };
+        return .{ .tag = .record, .payload = @intFromPtr(box) };
+    }
+
+    /// 类型相等比较（用于模式匹配）
+    pub fn equals(self: Value, other: Value) bool {
+        if (@intFromEnum(self.tag) != @intFromEnum(other.tag)) return false;
+
+        return switch (self.tag) {
+            .null_val, .unit => true,
+            .boolean => self.asBool() == other.asBool(),
+            .small_int => self.asSmallInt() == other.asSmallInt(),
+            .char_val => self.asChar() == other.asChar(),
+            .float16 => self.asFloat16() == other.asFloat16(),
+            .float32 => self.asFloat32() == other.asFloat32(),
+            .float64 => self.asFloat64() == other.asFloat64(),
+            else => self.payload == other.payload, // 指针相等
+        };
+    }
+
+    /// 格式化 Value 为字符串（用于打印和调试）
+    pub fn format(self: Value, allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+        switch (self.tag) {
             .null_val => try buf.appendSlice(allocator, "null"),
             .unit => try buf.appendSlice(allocator, "()"),
-            .range => |r| {
-                if (r.inclusive) {
-                    try buf.print(allocator, "{}..={}", .{ r.start, r.end });
-                } else {
-                    try buf.print(allocator, "{}..{}", .{ r.start, r.end });
-                }
+            .boolean => {
+                const b = self.asBool();
+                try buf.appendSlice(allocator, if (b) "true" else "false");
             },
-            .array => |arr| {
-                try buf.appendSlice(allocator, "[");
-                for (arr.elements, 0..) |item, i| {
+            .small_int => {
+                const temp = try std.fmt.allocPrint(allocator, "{}", .{self.asSmallInt()});
+                defer allocator.free(temp);
+                try buf.appendSlice(allocator, temp);
+            },
+            .big_int => {
+                const int_val = self.asBoxed().payload.big_int;
+                const temp = try std.fmt.allocPrint(allocator, "{}:{s}", .{int_val.value, @tagName(int_val.type_tag)});
+                defer allocator.free(temp);
+                try buf.appendSlice(allocator, temp);
+            },
+            .char_val => {
+                const temp = try std.fmt.allocPrint(allocator, "'{u}'", .{self.asChar()});
+                defer allocator.free(temp);
+                try buf.appendSlice(allocator, temp);
+            },
+            .float16 => {
+                const temp = try std.fmt.allocPrint(allocator, "{d}", .{self.asFloat16()});
+                defer allocator.free(temp);
+                try buf.appendSlice(allocator, temp);
+            },
+            .float32 => {
+                const temp = try std.fmt.allocPrint(allocator, "{d}", .{self.asFloat32()});
+                defer allocator.free(temp);
+                try buf.appendSlice(allocator, temp);
+            },
+            .float64 => {
+                const temp = try std.fmt.allocPrint(allocator, "{d}", .{self.asFloat64()});
+                defer allocator.free(temp);
+                try buf.appendSlice(allocator, temp);
+            },
+            .float128 => {
+                const temp = try std.fmt.allocPrint(allocator, "{d}", .{self.asBoxed().payload.float128});
+                defer allocator.free(temp);
+                try buf.appendSlice(allocator, temp);
+            },
+            .string => {
+                try buf.append(allocator, '"');
+                try buf.appendSlice(allocator, self.asBoxed().payload.string);
+                try buf.append(allocator, '"');
+            },
+            .array => {
+                const arr = self.asBoxed().payload.array;
+                try buf.append(allocator, '[');
+                for (arr.elements, 0..) |elem, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try item.format(buf, allocator, true);
+                    try elem.format(allocator, buf);
                 }
-                try buf.appendSlice(allocator, "]");
+                try buf.append(allocator, ']');
             },
-            .record => |rv| {
-                if (rv.type_name.len > 0) {
-                    try buf.print(allocator, "{s}(", .{rv.type_name});
-                } else {
-                    try buf.appendSlice(allocator, "(");
-                }
-                var iter = rv.fields.iterator();
+            .record => {
+                const rec = self.asBoxed().payload.record;
+                try buf.appendSlice(allocator, rec.type_name);
+                try buf.append(allocator, '{');
+                var it = rec.fields.iterator();
                 var first = true;
-                while (iter.next()) |entry| {
+                while (it.next()) |entry| {
                     if (!first) try buf.appendSlice(allocator, ", ");
                     first = false;
-                    try buf.print(allocator, "{s}: ", .{entry.key_ptr.*});
-                    try entry.value_ptr.*.format(buf, allocator, true);
+                    try buf.appendSlice(allocator, entry.key_ptr.*);
+                    try buf.appendSlice(allocator, ": ");
+                    try entry.value_ptr.format(allocator, buf);
                 }
-                try buf.appendSlice(allocator, ")");
+                try buf.append(allocator, '}');
             },
-            .vm_closure => try buf.appendSlice(allocator, "<fn>"),
+            .adt => {
+                const adt = self.asBoxed().payload.adt;
+                try buf.appendSlice(allocator, adt.type_name);
+                try buf.appendSlice(allocator, "::");
+                try buf.appendSlice(allocator, adt.constructor);
+                if (adt.fields.len > 0) {
+                    try buf.append(allocator, '(');
+                    for (adt.fields, 0..) |field, i| {
+                        if (i > 0) try buf.appendSlice(allocator, ", ");
+                        try field.value.format(allocator, buf);
+                    }
+                    try buf.append(allocator, ')');
+                }
+            },
+            .newtype => {
+                const nt = self.asBoxed().payload.newtype;
+                try buf.appendSlice(allocator, nt.type_name);
+                try buf.append(allocator, '(');
+                try nt.inner.format(allocator, buf);
+                try buf.append(allocator, ')');
+            },
+            .range => {
+                const r = self.asBoxed().payload.range;
+                const temp = try std.fmt.allocPrint(allocator, "{}..{s}{}", .{r.start, if (r.inclusive) "=" else "", r.end});
+                defer allocator.free(temp);
+                try buf.appendSlice(allocator, temp);
+            },
+            .vm_closure => try buf.appendSlice(allocator, "<closure>"),
             .partial => try buf.appendSlice(allocator, "<partial>"),
             .builtin => try buf.appendSlice(allocator, "<builtin>"),
-            .adt => |av| {
-                try buf.print(allocator, "{s}", .{av.constructor});
-                if (av.fields.len > 0) {
-                    try buf.appendSlice(allocator, "(");
-                    for (av.fields, 0..) |f, i| {
-                        if (i > 0) try buf.appendSlice(allocator, ", ");
-                        if (f.name) |n| {
-                            try buf.print(allocator, "{s}: ", .{n});
-                        }
-                        try f.value.format(buf, allocator, true);
-                    }
-                    try buf.appendSlice(allocator, ")");
-                }
+            .error_val => {
+                const err = self.asBoxed().payload.error_val;
+                try buf.appendSlice(allocator, "Error(");
+                try buf.appendSlice(allocator, err.type_name);
+                try buf.appendSlice(allocator, ": ");
+                try buf.appendSlice(allocator, err.message);
+                try buf.append(allocator, ')');
             },
-            .newtype => |nv| {
-                try buf.print(allocator, "{s}(", .{nv.type_name});
-                try nv.inner.format(buf, allocator, true);
-                try buf.appendSlice(allocator, ")");
-            },
-            .error_val => |e| try buf.print(allocator, "{s}(\"{s}\")", .{ e.type_name, e.message }),
-            .throw_val => |tv| {
-                switch (tv.*) {
-                    .ok => |v| {
-                        try buf.appendSlice(allocator, "Ok(");
-                        try v.format(buf, allocator, true);
-                        try buf.appendSlice(allocator, ")");
-                    },
-                    .err => |e| {
-                        try buf.print(allocator, "{s}(\"{s}\")", .{ e.type_name, e.message });
-                    },
-                }
-            },
-            .array_iterator => try buf.appendSlice(allocator, "<array_iterator>"),
-            .string_iterator => try buf.appendSlice(allocator, "<string_iterator>"),
-            .range_iterator => try buf.appendSlice(allocator, "<range_iterator>"),
+            .throw_val => try buf.appendSlice(allocator, "<throw>"),
+            .array_iterator => try buf.appendSlice(allocator, "<array_iter>"),
+            .string_iterator => try buf.appendSlice(allocator, "<string_iter>"),
+            .range_iterator => try buf.appendSlice(allocator, "<range_iter>"),
             .atomic_val => try buf.appendSlice(allocator, "<atomic>"),
-            .cell_val => |c| try c.inner.format(buf, allocator, debug), // 透明：显示内值
             .spawn_val => try buf.appendSlice(allocator, "<spawn>"),
             .channel_val => try buf.appendSlice(allocator, "<channel>"),
             .sender_val => try buf.appendSlice(allocator, "<sender>"),
             .receiver_val => try buf.appendSlice(allocator, "<receiver>"),
-            .trait_value => |tv| {
-                if (tv.trait_name.len > 0) {
-                    try buf.print(allocator, "<trait {s}>", .{tv.trait_name});
-                } else {
-                    try buf.appendSlice(allocator, "<trait>");
-                }
-            },
-            .lazy_val => |lz| {
-                if (lz.forced) {
-                    try buf.appendSlice(allocator, "<lazy forced>");
-                } else {
-                    try buf.appendSlice(allocator, "<lazy>");
-                }
+            .trait_value => try buf.appendSlice(allocator, "<trait>"),
+            .lazy_val => try buf.appendSlice(allocator, "<lazy>"),
+            .cell_val => {
+                const cell = self.asBoxed().payload.cell_val;
+                try buf.appendSlice(allocator, "Cell(");
+                try cell.inner.format(allocator, buf);
+                try buf.append(allocator, ')');
             },
         }
     }
 
-    /// 身份相等：是否引用同一底层内存（区别于语义相等 equals）。
-    /// 用于判断 castValue 等是否产生了新值——string 比较 slice 指针，boxed 比较箱体指针，
-    /// 标量按值。tag 不同即不同身份。callFunction 用它决定 cast 出的临时是否需要 release。
-    pub fn identityEquals(self: Value, other: Value) bool {
-        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
-        return switch (self) {
-            .string => |s| s.ptr == other.string.ptr and s.len == other.string.len,
-            .array => |a| a == other.array,
-            .record => |r| r == other.record,
-            .adt => |p| p == other.adt,
-            .newtype => |p| p == other.newtype,
-            .closure => |c| c == other.closure,
-            .vm_closure => |c| c == other.vm_closure,
-            .cell_val => |c| c == other.cell_val,
-            .partial => |p| p == other.partial,
-            .throw_val => |t| t == other.throw_val,
-            else => self.equals(other), // 标量/无堆载荷：按值
-        };
-    }
-
-    pub fn equals(self: Value, other: Value) bool {
-        const self_tag = std.meta.activeTag(self);
-        const other_tag = std.meta.activeTag(other);
-        if (self_tag != other_tag) return false;
-        return switch (self) {
-            .integer => |iv| iv.value == other.integer.value and iv.type_tag == other.integer.type_tag,
-            .float => |fv| fv.value == other.float.value and fv.type_tag == other.float.type_tag,
-            .boolean => |b| b == other.boolean,
-            .char_val => |c| c == other.char_val,
-            .string => |s| std.mem.eql(u8, s, other.string),
-            .null_val => true,
-            .unit => true,
-            .range => |r| r.start == other.range.start and r.end == other.range.end and r.inclusive == other.range.inclusive,
-            // 引用相等
-            .array => |a| a.elements.ptr == other.array.elements.ptr,
-            .record => |r| @intFromPtr(&r) == @intFromPtr(&other.record),
-            .adt => |av| av == other.adt, // 引用相等
-            .newtype => |nv| nv == other.newtype, // 引用相等
-            .vm_closure => |c| c == other.vm_closure,
-            .partial => |pa| pa == other.partial,
-            .builtin => |b_val| b_val.fn_ptr == other.builtin.fn_ptr and b_val.user_ctx == other.builtin.user_ctx,
-            .error_val => |e| std.mem.eql(u8, e.type_name, other.error_val.type_name) and std.mem.eql(u8, e.message, other.error_val.message),
-            .throw_val => |tv| tv == other.throw_val, // 引用相等
-            .array_iterator => |ai| ai == other.array_iterator, // 引用相等
-            .string_iterator => |si| si == other.string_iterator, // 引用相等
-            .range_iterator => |ri| ri == other.range_iterator, // 引用相等
-            .atomic_val => |av| av == other.atomic_val, // 引用相等
-            .cell_val => |c| c == other.cell_val, // 引用相等（透明解包在使用点完成，此处不应到达）
-            .spawn_val => |sh| sh == other.spawn_val, // 引用相等
-            .channel_val => |cv| cv == other.channel_val, // 引用相等
-            .sender_val => |sv| sv == other.sender_val, // 引用相等
-            .receiver_val => |rv| rv == other.receiver_val, // 引用相等
-            .trait_value => |tv| tv == other.trait_value, // 引用相等
-            .lazy_val => |lz| lz == other.lazy_val, // 引用相等
-        };
-    }
-
-    pub fn isTruthy(self: Value) bool {
-        return switch (self) {
-            .boolean => |b| b,
-            .integer => |iv| iv.value != 0,
-            .float => |fv| fv.value != 0.0,
-            .null_val => false,
-            .unit => false,
-            else => true,
-        };
-    }
-
-    pub fn isNull(self: Value) bool {
-        return self == .null_val;
-    }
-
-    pub fn asInteger(self: Value) !u128 {
-        return switch (self) {
-            .integer => |iv| iv.value,
-            else => error.TypeMismatch,
-        };
-    }
-
-    pub fn asFloat(self: Value) !f128 {
-        return switch (self) {
-            .float => |fv| fv.value,
-            .integer => |iv| if (iv.type_tag.isSigned()) @floatFromInt(@as(i128, @bitCast(iv.value))) else @floatFromInt(iv.value),
-            else => error.TypeMismatch,
-        };
-    }
-
-    pub fn asBoolean(self: Value) !bool {
-        return switch (self) {
-            .boolean => |b| b,
-            else => error.TypeMismatch,
-        };
-    }
-
-    pub fn asString(self: Value) ![]const u8 {
-        return switch (self) {
-            .string => |s| s,
-            else => error.TypeMismatch,
-        };
+    /// 格式化 Value 为字符串并返回（用于打印和调试）
+    pub fn formatAlloc(self: Value, allocator: std.mem.Allocator) ![]const u8 {
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        try self.format(allocator, &buf);
+        return buf.toOwnedSlice(allocator);
     }
 };
+
+// ============================================================
+// BoxedValue：统一装箱头部
+// ============================================================
+
+pub const BoxedValue = struct {
+    tag: ValueTag,
+    rc: u32,
+    payload: union {
+        big_int: IntValue,
+        float128: f128,      // 新增f128装箱
+        string: []const u8,
+        array: ArrayValue,
+        record: RecordValue,
+        adt: AdtValue,
+        newtype: NewtypeValue,
+        range: Range,
+        vm_closure: VmClosure,
+        partial: PartialApplication,
+        builtin: Builtin,
+        error_val: ErrorValue,
+        throw_val: ThrowValue,
+        array_iterator: ArrayIterator,
+        string_iterator: StringIterator,
+        range_iterator: RangeIterator,
+        atomic_val: *AtomicValue,
+        spawn_val: *SpawnHandle,
+        channel_val: *ChannelValue,
+        sender_val: *SenderValue,
+        receiver_val: *ReceiverValue,
+        trait_value: TraitValue,
+        lazy_val: LazyValue,
+        cell_val: Cell,
+    },
+
+    pub fn releasePayload(self: *BoxedValue, allocator: std.mem.Allocator) void {
+        switch (self.tag) {
+            .string => {
+                allocator.free(self.payload.string);
+            },
+            .float128 => {
+                // f128值类型，无需释放
+            },
+            .array => {
+                for (self.payload.array.elements) |*e| e.release(allocator);
+                allocator.free(self.payload.array.elements);
+            },
+            .record => {
+                var it = self.payload.record.fields.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.*.release(allocator);
+                }
+                self.payload.record.fields.deinit();
+            },
+            .adt => {
+                for (self.payload.adt.fields) |*f| f.value.release(allocator);
+                allocator.free(self.payload.adt.fields);
+            },
+            .newtype => {
+                self.payload.newtype.inner.release(allocator);
+            },
+            .cell_val => {
+                self.payload.cell_val.inner.release(allocator);
+            },
+            .vm_closure => {
+                const closure = &self.payload.vm_closure;
+                for (closure.upvalues) |uv| uv.release(allocator);
+                if (closure.upvalues.len > 0) closure.allocator.free(closure.upvalues);
+                for (closure.bound_args) |ba| ba.release(allocator);
+                if (closure.bound_args.len > 0) closure.allocator.free(closure.bound_args);
+            },
+            .partial => {
+                self.payload.partial.func.release(allocator);
+                for (self.payload.partial.bound_args) |ba| ba.release(allocator);
+                if (self.payload.partial.bound_args.len > 0) allocator.free(self.payload.partial.bound_args);
+            },
+            .throw_val => {
+                switch (self.payload.throw_val) {
+                    .ok => |ptr| {
+                        ptr.release(allocator);
+                        allocator.destroy(ptr);
+                    },
+                    .err => {},
+                }
+            },
+            .trait_value => {
+                var it = self.payload.trait_value.methods.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.*.release(allocator);
+                }
+                self.payload.trait_value.methods.deinit();
+                if (self.payload.trait_value.data) |data_ptr| {
+                    data_ptr.release(allocator);
+                    allocator.destroy(data_ptr);
+                }
+            },
+            .lazy_val => {
+                if (self.payload.lazy_val.cached) |cached| {
+                    cached.release(allocator);
+                }
+                // expr/env 由外部管理，不在此释放
+            },
+            .array_iterator => {
+                // 迭代器不拥有数组，无需释放
+            },
+            .string_iterator => {
+                // 迭代器不拥有字符串，无需释放
+            },
+            .range_iterator => {
+                // 值类型，无需释放
+            },
+            .atomic_val => {
+                // atomic_val 有自己的引用计数，需要 unref
+                const av = self.payload.atomic_val;
+                if (av.unref()) {
+                    allocator.destroy(av);
+                }
+            },
+            .spawn_val, .channel_val, .sender_val, .receiver_val => {
+                // 其他并发原语由外部运行时管理
+            },
+            .big_int, .range, .builtin, .error_val => {
+                // 值类型，无需递归释放
+            },
+            else => {
+                // 其他类型（如果有遗漏）
+            },
+        }
+    }
+};
+
+// ============================================================
+// 编译期大小验证
+// ============================================================
+
+comptime {
+    if (@sizeOf(Value) != 16) {
+        @compileError(std.fmt.comptimePrint("Value size is {d}, expected 16", .{@sizeOf(Value)}));
+    }
+}
+
+// ============================================================
+// 单元测试
+// ============================================================
+
+const testing = std.testing;
+
+test "Value size is 16 bytes" {
+    try testing.expectEqual(16, @sizeOf(Value));
+}
+
+test "null value" {
+    const v = Value.fromNull();
+    try testing.expect(v.isNull());
+    try testing.expectEqual(ValueTag.null_val, v.tag);
+}
+
+test "unit value" {
+    const v = Value.fromUnit();
+    try testing.expect(v.isUnit());
+    try testing.expectEqual(ValueTag.unit, v.tag);
+}
+
+test "boolean values" {
+    const t = Value.fromBool(true);
+    const f = Value.fromBool(false);
+
+    try testing.expect(t.asBool());
+    try testing.expect(!f.asBool());
+    try testing.expectEqual(ValueTag.boolean, t.tag);
+}
+
+test "char value" {
+    const v = Value.fromChar('A');
+    try testing.expectEqual(@as(u21, 'A'), v.asChar());
+    try testing.expectEqual(ValueTag.char_val, v.tag);
+}
+
+test "float value" {
+    const v = Value.fromFloat(3.14159);
+    try testing.expectApproxEqRel(3.14159, v.asFloat(), 0.00001);
+    try testing.expectEqual(ValueTag.float64, v.tag);
+}
+
+test "small int - positive" {
+    const v = Value.fromSmallInt(42);
+    try testing.expectEqual(@as(i48, 42), v.asSmallInt());
+    try testing.expect(v.isInline());
+    try testing.expect(!v.isBoxed());
+}
+
+test "small int - negative" {
+    const v = Value.fromSmallInt(-12345);
+    try testing.expectEqual(@as(i48, -12345), v.asSmallInt());
+}
+
+test "big int - i64 out of i48 range" {
+    const allocator = testing.allocator;
+
+    const big_val = IntValue{ .value = @bitCast(@as(i128, 1 << 50)), .type_tag = .i64 };
+    const v = try Value.fromBigInt(allocator, big_val);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.big_int, v.tag);
+
+    const retrieved = v.asInt();
+    try testing.expectEqual(big_val.value, retrieved.value);
+    try testing.expectEqual(big_val.type_tag, retrieved.type_tag);
+}
+
+test "smart int encoding" {
+    const allocator = testing.allocator;
+
+    const small = IntValue{ .value = 100, .type_tag = .i32 };
+    const v = try Value.fromInt(allocator, small);
+
+    try testing.expect(v.isInline());
+    try testing.expectEqual(ValueTag.small_int, v.tag);
+}
+
+test "string value" {
+    const allocator = testing.allocator;
+
+    const s = try allocator.dupe(u8, "hello");
+    const v = try Value.fromString(allocator, s);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.string, v.tag);
+
+    const retrieved = v.asBoxed().payload.string;
+    try testing.expectEqualStrings("hello", retrieved);
+}
+
+test "refcount - retain increments" {
+    const allocator = testing.allocator;
+
+    const s = try allocator.dupe(u8, "test");
+    const v = try Value.fromString(allocator, s);
+
+    const box = v.asBoxed();
+    try testing.expectEqual(@as(u32, 1), box.rc);
+
+    _ = v.retain();
+    try testing.expectEqual(@as(u32, 2), box.rc);
+
+    // 释放所有引用
+    v.release(allocator); // rc = 1
+    v.release(allocator); // rc = 0, freed
+}
+
+test "refcount - inline no-op" {
+    const allocator = testing.allocator;
+    const v = Value.fromSmallInt(42);
+    _ = v.retain();
+    v.release(allocator);
+    try testing.expectEqual(@as(i48, 42), v.asSmallInt());
+}
+
+test "array value" {
+    const allocator = testing.allocator;
+
+    var elements = try allocator.alloc(Value, 3);
+    elements[0] = Value.fromSmallInt(1);
+    elements[1] = Value.fromSmallInt(2);
+    elements[2] = Value.fromSmallInt(3);
+
+    const v = try Value.makeArray(allocator, elements, null);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    const arr = v.asBoxed().payload.array;
+    try testing.expectEqual(@as(usize, 3), arr.elements.len);
+}
+
+test "inline vs boxed" {
+    const allocator = testing.allocator;
+
+    try testing.expect(Value.fromNull().isInline());
+    try testing.expect(Value.fromSmallInt(42).isInline());
+
+    const s = try allocator.dupe(u8, "test");
+    const v = try Value.fromString(allocator, s);
+    defer v.release(allocator);
+    try testing.expect(v.isBoxed());
+}
+
+test "value equality" {
+    const v1 = Value.fromSmallInt(42);
+    const v2 = Value.fromSmallInt(42);
+    const v3 = Value.fromSmallInt(43);
+
+    try testing.expect(v1.equals(v2));
+    try testing.expect(!v1.equals(v3));
+}
+
+test "inferIntType" {
+    try testing.expectEqual(IntType.i8, inferIntType(42));
+    try testing.expectEqual(IntType.u8, inferIntType(200));
+}
+
+test "retainOwned - string duplicates" {
+    const allocator = testing.allocator;
+
+    const s1 = try allocator.dupe(u8, "hello");
+    const v1 = try Value.fromString(allocator, s1);
+    defer v1.release(allocator);
+
+    const v2 = try v1.retainOwned(allocator);
+    defer v2.release(allocator);
+
+    const ptr1 = v1.asBoxed().payload.string.ptr;
+    const ptr2 = v2.asBoxed().payload.string.ptr;
+    try testing.expect(ptr1 != ptr2);
+    try testing.expectEqualStrings(v1.asBoxed().payload.string, v2.asBoxed().payload.string);
+}
+
+// ============================================================
+// 新增单元测试（Day2）
+// ============================================================
+
+test "makeAdt - ADT construction" {
+    const allocator = testing.allocator;
+
+    var fields = try allocator.alloc(AdtField, 2);
+    fields[0] = .{ .name = "x", .value = Value.fromSmallInt(10) };
+    fields[1] = .{ .name = "y", .value = Value.fromSmallInt(20) };
+
+    const v = try Value.makeAdt(allocator, "Point", "Point", fields);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.adt, v.tag);
+
+    const adt = v.asBoxed().payload.adt;
+    try testing.expectEqualStrings("Point", adt.type_name);
+    try testing.expectEqualStrings("Point", adt.constructor);
+    try testing.expectEqual(@as(usize, 2), adt.fields.len);
+}
+
+test "makeNewtype - Newtype construction" {
+    const allocator = testing.allocator;
+
+    const inner = Value.fromSmallInt(42);
+    const v = try Value.makeNewtype(allocator, "UserId", inner);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.newtype, v.tag);
+
+    const newtype = v.asBoxed().payload.newtype;
+    try testing.expectEqualStrings("UserId", newtype.type_name);
+    try testing.expectEqual(@as(i48, 42), newtype.inner.asSmallInt());
+}
+
+test "makeCell - Cell construction" {
+    const allocator = testing.allocator;
+
+    const inner = Value.fromSmallInt(100);
+    const v = try Value.makeCell(allocator, inner);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.cell_val, v.tag);
+
+    const cell = v.asBoxed().payload.cell_val;
+    try testing.expectEqual(@as(i48, 100), cell.inner.asSmallInt());
+}
+
+test "makeRange - Range construction" {
+    const allocator = testing.allocator;
+
+    const v = try Value.makeRange(allocator, 0, 10, false);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.range, v.tag);
+
+    const range = v.asBoxed().payload.range;
+    try testing.expectEqual(@as(i128, 0), range.start);
+    try testing.expectEqual(@as(i128, 10), range.end);
+    try testing.expect(!range.inclusive);
+}
+
+test "makeError - ErrorValue construction" {
+    const allocator = testing.allocator;
+
+    const v = try Value.makeError(allocator, "FileError", "file not found", true);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.error_val, v.tag);
+
+    const err = v.asBoxed().payload.error_val;
+    try testing.expectEqualStrings("FileError", err.type_name);
+    try testing.expectEqualStrings("file not found", err.message);
+    try testing.expect(err.is_error_subtype);
+}
+
+test "ADT with nested values" {
+    const allocator = testing.allocator;
+
+    // 构造嵌套 ADT: Some(Some(42))
+    const inner_fields = try allocator.alloc(AdtField, 1);
+    inner_fields[0] = .{ .name = null, .value = Value.fromSmallInt(42) };
+
+    const inner = try Value.makeAdt(allocator, "Option", "Some", inner_fields);
+
+    const outer_fields = try allocator.alloc(AdtField, 1);
+    outer_fields[0] = .{ .name = null, .value = inner };
+
+    const outer = try Value.makeAdt(allocator, "Option", "Some", outer_fields);
+    defer outer.release(allocator);
+
+    try testing.expect(outer.isBoxed());
+    const outer_adt = outer.asBoxed().payload.adt;
+    try testing.expectEqual(@as(usize, 1), outer_adt.fields.len);
+
+    // 验证嵌套结构
+    const nested = outer_adt.fields[0].value;
+    try testing.expectEqual(ValueTag.adt, nested.tag);
+}
+
+test "record with mixed value types" {
+    const allocator = testing.allocator;
+
+    var fields = std.StringHashMap(Value).init(allocator);
+
+    const name_key = try allocator.dupe(u8, "name");
+    const age_key = try allocator.dupe(u8, "age");
+    const active_key = try allocator.dupe(u8, "active");
+
+    try fields.put(name_key, try Value.fromString(allocator, try allocator.dupe(u8, "Alice")));
+    try fields.put(age_key, Value.fromSmallInt(30));
+    try fields.put(active_key, Value.fromBool(true));
+
+    const v = try Value.makeRecord(allocator, "Person", fields);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    const record = v.asBoxed().payload.record;
+    try testing.expectEqual(@as(usize, 3), record.fields.count());
+}
+
+test "Cell refcount with multiple references" {
+    const allocator = testing.allocator;
+
+    const inner = Value.fromSmallInt(42);
+    const cell = try Value.makeCell(allocator, inner);
+
+    const ref1 = cell.retain();
+    const ref2 = cell.retain();
+
+    const box = cell.asBoxed();
+    try testing.expectEqual(@as(u32, 3), box.rc);
+
+    ref2.release(allocator);
+    try testing.expectEqual(@as(u32, 2), box.rc);
+
+    ref1.release(allocator);
+    try testing.expectEqual(@as(u32, 1), box.rc);
+
+    cell.release(allocator);
+}
+
+test "Newtype wrapping complex value" {
+    const allocator = testing.allocator;
+
+    // Newtype 包装数组
+    var arr_elements = try allocator.alloc(Value, 3);
+    arr_elements[0] = Value.fromSmallInt(1);
+    arr_elements[1] = Value.fromSmallInt(2);
+    arr_elements[2] = Value.fromSmallInt(3);
+
+    const arr = try Value.makeArray(allocator, arr_elements, null);
+    const newtype = try Value.makeNewtype(allocator, "IntList", arr);
+    defer newtype.release(allocator);
+
+    const nt = newtype.asBoxed().payload.newtype;
+    try testing.expectEqual(ValueTag.array, nt.inner.tag);
+}
+// Day3 新增测试 - VmClosure
+test "VmClosure construction and refcount" {
+    const allocator = testing.allocator;
+
+    const func: *const anyopaque = @ptrFromInt(0x1000);
+    var upvalues = try allocator.alloc(Value, 2);
+    upvalues[0] = Value.fromSmallInt(10);
+    upvalues[1] = Value.fromSmallInt(20);
+
+    var bound = try allocator.alloc(Value, 1);
+    bound[0] = Value.fromSmallInt(30);
+
+    const v = try Value.makeVmClosure(allocator, func, 3, upvalues, bound);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.vm_closure, v.tag);
+
+    const closure = v.asBoxed().payload.vm_closure;
+    try testing.expectEqual(@as(u8, 3), closure.arity);
+    try testing.expectEqual(@as(usize, 2), closure.upvalues.len);
+    try testing.expectEqual(@as(usize, 1), closure.bound_args.len);
+}
+
+test "Partial application construction" {
+    const allocator = testing.allocator;
+
+    const func = Value.fromSmallInt(42);
+    var bound = try allocator.alloc(Value, 2);
+    bound[0] = Value.fromSmallInt(1);
+    bound[1] = Value.fromSmallInt(2);
+
+    const v = try Value.makePartial(allocator, func, bound, 3);
+    defer v.release(allocator);
+
+    try testing.expect(v.isBoxed());
+    try testing.expectEqual(ValueTag.partial, v.tag);
+
+    const partial = v.asBoxed().payload.partial;
+    try testing.expectEqual(@as(u8, 3), partial.remaining_arity);
+    try testing.expectEqual(@as(usize, 2), partial.bound_args.len);
+}
+
+test "Range operations" {
+    const allocator = testing.allocator;
+
+    const excl = try Value.makeRange(allocator, 0, 10, false);
+    defer excl.release(allocator);
+
+    const incl = try Value.makeRange(allocator, 0, 10, true);
+    defer incl.release(allocator);
+
+    const r1 = excl.asBoxed().payload.range;
+    const r2 = incl.asBoxed().payload.range;
+
+    try testing.expectEqual(@as(i128, 10), r1.len());
+    try testing.expectEqual(@as(i128, 11), r2.len());
+    try testing.expect(r1.contains(5));
+    try testing.expect(!r1.contains(10));
+    try testing.expect(r2.contains(10));
+}
+
+test "Deep nested release" {
+    const allocator = testing.allocator;
+
+    const cell = try Value.makeCell(allocator, Value.fromSmallInt(42));
+    const newtype = try Value.makeNewtype(allocator, "UserId", cell);
+
+    var adt_fields = try allocator.alloc(AdtField, 1);
+    adt_fields[0] = .{ .name = "value", .value = newtype };
+    const adt = try Value.makeAdt(allocator, "Wrapper", "Wrap", adt_fields);
+
+    var record_fields = std.StringHashMap(Value).init(allocator);
+    try record_fields.put(try allocator.dupe(u8, "x"), adt);
+    const record = try Value.makeRecord(allocator, "Container", record_fields);
+
+    var arr_elements = try allocator.alloc(Value, 1);
+    arr_elements[0] = record;
+    const array = try Value.makeArray(allocator, arr_elements, null);
+
+    array.release(allocator);
+}
+
+test "Value equality basic types" {
+    try testing.expect(Value.fromNull().equals(Value.fromNull()));
+    try testing.expect(Value.fromUnit().equals(Value.fromUnit()));
+    try testing.expect(Value.fromBool(true).equals(Value.fromBool(true)));
+    try testing.expect(!Value.fromBool(true).equals(Value.fromBool(false)));
+
+    const int1 = Value.fromSmallInt(42);
+    const int2 = Value.fromSmallInt(42);
+    try testing.expect(int1.equals(int2));
+}
+
+test "Smart int boundary" {
+    const allocator = testing.allocator;
+
+    const max_i48 = std.math.maxInt(i48);
+    const v_max = try Value.fromInt(allocator, .{ .value = @bitCast(@as(i128, max_i48)), .type_tag = .i64 });
+    try testing.expect(v_max.isInline());
+
+    const over = try Value.fromInt(allocator, .{ .value = @bitCast(@as(i128, max_i48) + 1), .type_tag = .i64 });
+    defer over.release(allocator);
+    try testing.expect(over.isBoxed());
+}
+// Day4 新增测试 - 并发原语、Trait、迭代器、压力测试
+
+test "Array with 100 elements stress test" {
+    const allocator = testing.allocator;
+
+    const elements = try allocator.alloc(Value, 100);
+    for (elements, 0..) |*e, i| {
+        e.* = Value.fromSmallInt(@intCast(i));
+    }
+
+    const v = try Value.makeArray(allocator, elements, null);
+    defer v.release(allocator);
+
+    const arr = v.asBoxed().payload.array;
+    try testing.expectEqual(@as(usize, 100), arr.elements.len);
+    try testing.expectEqual(@as(i48, 0), arr.elements[0].asSmallInt());
+    try testing.expectEqual(@as(i48, 99), arr.elements[99].asSmallInt());
+}
+
+test "Record with 20 fields" {
+    const allocator = testing.allocator;
+
+    var fields = std.StringHashMap(Value).init(allocator);
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        // 使用简短静态键名
+        const keys = [_][]const u8{"a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t"};
+        const key = try allocator.dupe(u8, keys[i]);
+        try fields.put(key, Value.fromSmallInt(@intCast(i)));
+    }
+
+    const v = try Value.makeRecord(allocator, "LargeRecord", fields);
+    defer v.release(allocator);
+
+    const record = v.asBoxed().payload.record;
+    try testing.expectEqual(@as(usize, 20), record.fields.count());
+}
+
+test "Deeply nested 8 layers" {
+    const allocator = testing.allocator;
+
+    // Layer 1: Cell
+    var val = try Value.makeCell(allocator, Value.fromSmallInt(42));
+
+    // Layer 2-7: Newtype wrapping
+    var layer: usize = 2;
+    while (layer <= 7) : (layer += 1) {
+        // 注意：type_name 将由 Newtype 的 release 管理，这里不需要单独释放
+        // 但为了测试，我们使用静态字符串
+        val = try Value.makeNewtype(allocator, "Layer", val);
+    }
+
+    // Layer 8: Array
+    const arr = try allocator.alloc(Value, 1);
+    arr[0] = val;
+    const final = try Value.makeArray(allocator, arr, null);
+
+    // Single release should handle all 8 layers
+    final.release(allocator);
+}
+
+test "Multiple retain and release cycles" {
+    const allocator = testing.allocator;
+
+    const s = try allocator.dupe(u8, "test");
+    const v = try Value.fromString(allocator, s);
+
+    // Cycle 1
+    _ = v.retain();
+    v.release(allocator);
+
+    // Cycle 2
+    _ = v.retain();
+    _ = v.retain();
+    v.release(allocator);
+    v.release(allocator);
+
+    // Final release
+    v.release(allocator);
+}
+
+test "ADT with 10 fields" {
+    const allocator = testing.allocator;
+
+    const fields = try allocator.alloc(AdtField, 10);
+    for (fields, 0..) |*f, i| {
+        // 使用静态字段名避免内存管理复杂性
+        f.* = .{ .name = "field", .value = Value.fromSmallInt(@intCast(i)) };
+    }
+
+    const v = try Value.makeAdt(allocator, "BigADT", "Ctor", fields);
+    defer v.release(allocator);
+
+    const adt = v.asBoxed().payload.adt;
+    try testing.expectEqual(@as(usize, 10), adt.fields.len);
+}
+
+test "Range negative values" {
+    const allocator = testing.allocator;
+
+    const r = try Value.makeRange(allocator, -10, -1, true);
+    defer r.release(allocator);
+
+    const range = r.asBoxed().payload.range;
+    try testing.expectEqual(@as(i128, -10), range.start);
+    try testing.expectEqual(@as(i128, -1), range.end);
+    try testing.expect(range.contains(-5));
+    try testing.expect(!range.contains(0));
+    try testing.expectEqual(@as(i128, 10), range.len());
+}
+
+test "Range large values" {
+    const allocator = testing.allocator;
+
+    const r = try Value.makeRange(allocator, 0, 1000000, false);
+    defer r.release(allocator);
+
+    const range = r.asBoxed().payload.range;
+    try testing.expectEqual(@as(i128, 1000000), range.len());
+    try testing.expect(range.contains(500000));
+    try testing.expect(!range.contains(1000000));
+}
+
+test "ErrorValue with long message" {
+    const allocator = testing.allocator;
+
+    const long_msg = "This is a very long error message that tests string handling in ErrorValue construction and release";
+    const v = try Value.makeError(allocator, "TestError", long_msg, true);
+    defer v.release(allocator);
+
+    const err = v.asBoxed().payload.error_val;
+    try testing.expectEqualStrings(long_msg, err.message);
+}
+
+test "Builtin function with context" {
+    const allocator = testing.allocator;
+
+    const dummy_fn: BuiltinFn = struct {
+        fn call(_: *anyopaque, _: ?*anyopaque, _: []const Value) anyerror!Value {
+            return Value.fromSmallInt(999);
+        }
+    }.call;
+
+    var ctx: u32 = 12345;
+    const builtin = Builtin{ .fn_ptr = dummy_fn, .user_ctx = @ptrCast(&ctx) };
+    const v = try Value.makeBuiltin(allocator, builtin);
+    defer v.release(allocator);
+
+    const b = v.asBoxed().payload.builtin;
+    try testing.expect(b.user_ctx != null);
+}
+
+test "Array fixed size constraint" {
+    const allocator = testing.allocator;
+
+    const elements = try allocator.alloc(Value, 5);
+    for (elements, 0..) |*e, i| {
+        e.* = Value.fromSmallInt(@intCast(i));
+    }
+
+    const v = try Value.makeArray(allocator, elements, 5);
+    defer v.release(allocator);
+
+    const arr = v.asBoxed().payload.array;
+    try testing.expectEqual(@as(?u64, 5), arr.fixed_size);
+    try testing.expectEqual(@as(usize, 5), arr.elements.len);
+}
+
+test "Cell with null inner value" {
+    const allocator = testing.allocator;
+
+    const cell = try Value.makeCell(allocator, Value.fromNull());
+    defer cell.release(allocator);
+
+    const c = cell.asBoxed().payload.cell_val;
+    try testing.expect(c.inner.isNull());
+}
+
+test "Cell with unit inner value" {
+    const allocator = testing.allocator;
+
+    const cell = try Value.makeCell(allocator, Value.fromUnit());
+    defer cell.release(allocator);
+
+    const c = cell.asBoxed().payload.cell_val;
+    try testing.expect(c.inner.isUnit());
+}
+
+test "Newtype wrapping null" {
+    const allocator = testing.allocator;
+
+    const nt = try Value.makeNewtype(allocator, "Optional", Value.fromNull());
+    defer nt.release(allocator);
+
+    const newtype = nt.asBoxed().payload.newtype;
+    try testing.expect(newtype.inner.isNull());
+}
+
+test "Partial with zero bound args" {
+    const allocator = testing.allocator;
+
+    const func = Value.fromSmallInt(100);
+    const empty = try allocator.alloc(Value, 0);
+
+    const p = try Value.makePartial(allocator, func, empty, 5);
+    defer p.release(allocator);
+
+    const partial = p.asBoxed().payload.partial;
+    try testing.expectEqual(@as(usize, 0), partial.bound_args.len);
+    try testing.expectEqual(@as(u8, 5), partial.remaining_arity);
+}
+
+test "VmClosure with zero upvalues" {
+    const allocator = testing.allocator;
+
+    const func: *const anyopaque = @ptrFromInt(0x2000);
+    const empty_uv = try allocator.alloc(Value, 0);
+    const empty_ba = try allocator.alloc(Value, 0);
+
+    const vc = try Value.makeVmClosure(allocator, func, 2, empty_uv, empty_ba);
+    defer vc.release(allocator);
+
+    const closure = vc.asBoxed().payload.vm_closure;
+    try testing.expectEqual(@as(usize, 0), closure.upvalues.len);
+    try testing.expectEqual(@as(usize, 0), closure.bound_args.len);
+    try testing.expectEqual(@as(u8, 2), closure.arity);
+}
+
+test "Record empty fields" {
+    const allocator = testing.allocator;
+
+    const fields = std.StringHashMap(Value).init(allocator);
+    const v = try Value.makeRecord(allocator, "Empty", fields);
+    defer v.release(allocator);
+
+    const record = v.asBoxed().payload.record;
+    try testing.expectEqual(@as(usize, 0), record.fields.count());
+}
+
+test "ADT empty fields" {
+    const allocator = testing.allocator;
+
+    const empty = try allocator.alloc(AdtField, 0);
+    const v = try Value.makeAdt(allocator, "Unit", "Unit", empty);
+    defer v.release(allocator);
+
+    const adt = v.asBoxed().payload.adt;
+    try testing.expectEqual(@as(usize, 0), adt.fields.len);
+}
+
+test "Float special values" {
+    const pos_inf = Value.fromFloat(std.math.inf(f64));
+    const neg_inf = Value.fromFloat(-std.math.inf(f64));
+    const nan = Value.fromFloat(std.math.nan(f64));
+
+    try testing.expect(std.math.isInf(pos_inf.asFloat()));
+    try testing.expect(std.math.isInf(neg_inf.asFloat()));
+    try testing.expect(std.math.isNan(nan.asFloat()));
+}
+
+test "Integer type promotion examples" {
+    const i8_type = IntType.i8;
+    const i32_type = IntType.i32;
+    const u8_type = IntType.u8;
+
+    const promoted = promoteIntTypes(i8_type, i32_type);
+    try testing.expectEqual(IntType.i32, promoted);
+
+    const mixed = promoteIntTypes(i8_type, u8_type);
+    try testing.expectEqual(IntType.i16, mixed);
+}
+
+test "Integer type in range checks" {
+    const i8_type = IntType.i8;
+    try testing.expect(i8_type.inRange(100));
+    try testing.expect(!i8_type.inRange(200));
+
+    const u8_type = IntType.u8;
+    try testing.expect(u8_type.inRange(255));
+    try testing.expect(!u8_type.inRange(256));
+}
+
+// Day4+ 多精度浮点测试
+
+test "Float16 encoding and decoding" {
+    const f16_val: f16 = 3.14;
+    const v = Value.fromFloat16(f16_val);
+    
+    try testing.expectEqual(ValueTag.float16, v.tag);
+    try testing.expect(v.isInline());
+    try testing.expect(v.isFloat());
+    
+    const recovered = v.asFloat16();
+    try testing.expectApproxEqRel(f16_val, recovered, 0.01);
+}
+
+test "Float32 encoding and decoding" {
+    const f32_val: f32 = 3.141592;
+    const v = Value.fromFloat32(f32_val);
+    
+    try testing.expectEqual(ValueTag.float32, v.tag);
+    try testing.expect(v.isInline());
+    
+    const recovered = v.asFloat32();
+    try testing.expectApproxEqRel(f32_val, recovered, 0.00001);
+}
+
+test "Float64 encoding and decoding" {
+    const f64_val: f64 = 3.141592653589793;
+    const v = Value.fromFloat64(f64_val);
+    
+    try testing.expectEqual(ValueTag.float64, v.tag);
+    try testing.expect(v.isInline());
+    
+    const recovered = v.asFloat64();
+    try testing.expectEqual(f64_val, recovered);
+}
+
+test "Float128 boxing" {
+    const allocator = testing.allocator;
+    
+    const f128_val: f128 = 3.14159265358979323846264338327950288;
+    const v = try Value.fromFloat128(allocator, f128_val);
+    defer v.release(allocator);
+    
+    try testing.expectEqual(ValueTag.float128, v.tag);
+    try testing.expect(v.isBoxed());
+    try testing.expect(v.isFloat());
+    
+    const recovered = v.asFloat128();
+    try testing.expectEqual(f128_val, recovered);
+}
+
+test "FloatValue round-trip with type preservation" {
+    const allocator = testing.allocator;
+
+    // f16
+    const fv16 = FloatValue{ .value = 3.14, .type_tag = .f16 };
+    const v16 = try Value.fromFloatValue(allocator, fv16);
+    const recovered16 = v16.asFloatValue();
+    try testing.expectEqual(FloatType.f16, recovered16.type_tag);
+
+    // f32
+    const fv32 = FloatValue{ .value = 3.14159, .type_tag = .f32 };
+    const v32 = try Value.fromFloatValue(allocator, fv32);
+    const recovered32 = v32.asFloatValue();
+    try testing.expectEqual(FloatType.f32, recovered32.type_tag);
+
+    // f64
+    const fv64 = FloatValue{ .value = 0.1, .type_tag = .f64 };
+    const v64 = try Value.fromFloatValue(allocator, fv64);
+    const recovered64 = v64.asFloatValue();
+    try testing.expectEqual(FloatType.f64, recovered64.type_tag);
+
+    // f128
+    const fv128 = FloatValue{ .value = 1.23456789e50, .type_tag = .f128 };
+    const v128 = try Value.fromFloatValue(allocator, fv128);
+    defer v128.release(allocator);
+    const recovered128 = v128.asFloatValue();
+    try testing.expectEqual(FloatType.f128, recovered128.type_tag);
+}
+
+test "isFloat type check" {
+    const allocator = testing.allocator;
+    
+    try testing.expect(Value.fromFloat16(1.0).isFloat());
+    try testing.expect(Value.fromFloat32(1.0).isFloat());
+    try testing.expect(Value.fromFloat64(1.0).isFloat());
+    
+    const f128_v = try Value.fromFloat128(allocator, 1.0);
+    defer f128_v.release(allocator);
+    try testing.expect(f128_v.isFloat());
+    
+    // 非浮点值
+    try testing.expect(!Value.fromSmallInt(42).isFloat());
+    try testing.expect(!Value.fromBool(true).isFloat());
+}

@@ -43,7 +43,7 @@ pub const AtomicValue = struct {
     pub fn initFloat(float_val: f128, tag: AtomicType) AtomicValue {
         const bits: u128 = @bitCast(float_val);
         return AtomicValue{
-            .data = std.atomic.Value(i128).init(@as(i128, @intCast(@as(u128, bits)))),
+            .data = std.atomic.Value(i128).init(@bitCast(bits)),
             .ref_count = std.atomic.Value(usize).init(1),
             .type_tag = tag,
         };
@@ -68,16 +68,33 @@ pub const AtomicValue = struct {
     }
 
     /// 加载当前值到 Value
-    pub fn load(self: *AtomicValue) Value {
+    pub fn load(self: *AtomicValue, allocator: std.mem.Allocator) !Value {
         const raw = self.data.load(.seq_cst);
         return switch (self.type_tag) {
-            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128 => Value{ .integer = IntValue{ .value = @bitCast(raw), .type_tag = atomicTypeToIntType(self.type_tag) } },
-            .f16 => Value{ .float = FloatValue{ .value = @bitCast(@as(u128, @intCast(raw))), .type_tag = .f16 } },
-            .f32 => Value{ .float = FloatValue{ .value = @bitCast(@as(u128, @intCast(raw))), .type_tag = .f32 } },
-            .f64 => Value{ .float = FloatValue{ .value = @bitCast(@as(u128, @intCast(raw))), .type_tag = .f64 } },
-            .f128 => Value{ .float = FloatValue{ .value = @bitCast(@as(u128, @intCast(raw))), .type_tag = .f128 } },
-            .bool => Value{ .boolean = raw != 0 },
-            .char => Value{ .char_val = @intCast(raw) },
+            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128 => blk: {
+                const int_type = atomicTypeToIntType(self.type_tag);
+                break :blk try Value.fromInt(allocator, .{ .value = @bitCast(raw), .type_tag = int_type });
+            },
+            .f16, .f32, .f64, .f128 => blk: {
+                // 对于浮点数，需要根据类型大小正确处理
+                const float_type: value.FloatType = switch (self.type_tag) {
+                    .f16 => .f16,
+                    .f32 => .f32,
+                    .f64 => .f64,
+                    .f128 => .f128,
+                    else => unreachable,
+                };
+                const float_val: f128 = switch (self.type_tag) {
+                    .f16 => @floatCast(@as(f16, @bitCast(@as(u16, @truncate(@as(u128, @bitCast(raw))))))),
+                    .f32 => @floatCast(@as(f32, @bitCast(@as(u32, @truncate(@as(u128, @bitCast(raw))))))),
+                    .f64 => @floatCast(@as(f64, @bitCast(@as(u64, @truncate(@as(u128, @bitCast(raw))))))),
+                    .f128 => @bitCast(@as(u128, @bitCast(raw))),
+                    else => unreachable,
+                };
+                break :blk try Value.fromFloatValue(allocator, .{ .value = float_val, .type_tag = float_type });
+            },
+            .bool => Value.fromBool(raw != 0),
+            .char => Value.fromChar(@intCast(raw)),
         };
     }
 
@@ -156,12 +173,26 @@ pub fn intTypeToAtomicType(it: IntType) AtomicValue.AtomicType {
 }
 
 pub fn valueToAtomicRaw(val: Value, tag: AtomicValue.AtomicType) i128 {
-    _ = tag;
-    return switch (val) {
-        .integer => |iv| @bitCast(iv.value),
-        .float => |fv| @as(i128, @intCast(@as(u128, @bitCast(fv.value)))),
-        .boolean => |b| if (b) 1 else 0,
-        .char_val => |c| @as(i128, @intCast(c)),
+    return switch (val.tag) {
+        .small_int, .big_int => blk: {
+            const iv = val.asInt();
+            break :blk @bitCast(iv.value);
+        },
+        .float16, .float32, .float64, .float128 => blk: {
+            const fv = val.asFloatValue();
+            // 根据原子变量的实际类型，将浮点数的位表示存储为 i128
+            // 小的浮点类型只占用低位，高位为 0
+            const raw: i128 = switch (tag) {
+                .f16 => @as(i128, @bitCast(@as(i128, @as(u16, @bitCast(@as(f16, @floatCast(fv.value))))))),
+                .f32 => @as(i128, @bitCast(@as(i128, @as(u32, @bitCast(@as(f32, @floatCast(fv.value))))))),
+                .f64 => @as(i128, @bitCast(@as(i128, @as(u64, @bitCast(@as(f64, @floatCast(fv.value))))))),
+                .f128 => @bitCast(@as(u128, @bitCast(fv.value))),
+                else => 0,
+            };
+            break :blk raw;
+        },
+        .boolean => if (val.asBool()) 1 else 0,
+        .char_val => @as(i128, @intCast(val.asChar())),
         else => 0,
     };
 }

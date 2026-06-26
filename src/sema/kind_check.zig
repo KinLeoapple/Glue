@@ -113,27 +113,6 @@ pub fn kindArityOfTypeNode(inferencer: *TypeInferencer, node: *const ast.TypeNod
     }
 }
 
-/// 文档 §2.11.1: 检查 impl 头部类型实参的 kind 是否匹配 trait 声明的类型参数 kind。
-/// 例如 `trait Functor<F : * -> *>` 要求实参 kind 为 `* -> *`：
-///   impl Functor<List>       ✓（List 是 * -> *）
-///   impl Functor<List<i32>>  ✗（List<i32> 是 *）
-pub fn checkImplKinds(
-    inferencer: *TypeInferencer,
-    id: @TypeOf(@as(ast.Decl, undefined).impl_decl),
-) void {
-    const trait_info = inferencer.trait_types.getPtr(id.trait_name) orelse return;
-    const expected = trait_info.type_param_kind_arities;
-    if (expected.len == 0) return; // trait 未记录 kind（无类型参数或无标注），跳过
-    for (id.type_args, 0..) |arg, i| {
-        if (i >= expected.len) break;
-        const actual = kindArityOfTypeNode(inferencer, arg);
-        if (actual != expected[i]) {
-            const loc = typeNodeLoc(arg);
-            inferencer.addErrorAt(.type_mismatch, loc.line, loc.column, "kind mismatch: trait '{s}' type parameter expects kind arity {d} but argument has kind arity {d}", .{ id.trait_name, expected[i], actual });
-        }
-    }
-}
-
 fn typeNodeLoc(node: *const ast.TypeNode) ast.SourceLocation {
     return switch (node.*) {
         .named => |n| n.location,

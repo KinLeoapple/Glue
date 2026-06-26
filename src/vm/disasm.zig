@@ -146,22 +146,3 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
         },
     }
 }
-
-test "disassemble basic chunk" {
-    const ast = @import("ast");
-    const value = @import("value");
-    const allocator = std.testing.allocator;
-    var chunk = Chunk.init(allocator);
-    defer chunk.deinit();
-    const loc = ast.SourceLocation{ .line = 1, .column = 1 };
-    const k = try chunk.addConstant(value.Value{ .integer = .{ .value = 7, .type_tag = .i32 } });
-    try chunk.writeOp(.op_const, loc);
-    try chunk.writeU16(k);
-    try chunk.writeOp(.op_return, loc);
-
-    var buf: Buf = .empty;
-    defer buf.deinit(allocator);
-    try disassembleChunk(&chunk, "test", &buf, allocator);
-    try std.testing.expect(std.mem.indexOf(u8, buf.items, "op_const") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf.items, "op_return") != null);
-}

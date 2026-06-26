@@ -108,11 +108,6 @@ fn resolveDecl(r: *Resolver, decl: *ast.Decl) !void {
             f.name_id = try r.interner.intern(f.name);
             try resolveFnLike(r, f.params, f.body);
         },
-        .impl_decl => |id| {
-            for (id.methods) |m| {
-                if (m.body) |b| try resolveFnLike(r, m.params, b);
-            }
-        },
         .trait_decl => |td| {
             for (td.methods) |m| {
                 if (m.body) |b| try resolveFnLike(r, m.params, b);

@@ -20,7 +20,11 @@ fn structEq(a: Value, b: Value) bool {
 /// retainOwned 语义：string dupe；array/record/adt/newtype rc+1；基础值原样。
 /// 与 vm.zig retainOwned 一致（此处无 throw_val/error_val，方法不返回它们的内值）。
 fn retainOwned(allocator: std.mem.Allocator, v: Value) MethodError!Value {
-    if (v == .string) return Value{ .string = try allocator.dupe(u8, v.string) };
+    if (v.tag == .string) {
+        const s = v.asBoxed().payload.string;
+        const new_s = try allocator.dupe(u8, s);
+        return try Value.fromString(allocator, new_s);
+    }
     return v.retain();
 }
 
@@ -30,147 +34,138 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
     // len()：string → Unicode 标量数；array → 元素数。
     if (std.mem.eql(u8, method, "len")) {
         if (args.len != 0) return error.WrongArity;
-        return switch (receiver) {
-            .string => |s| Value{ .integer = .{ .value = utf8Len(s), .type_tag = .i64 } },
-            .array => |arr| Value{ .integer = .{ .value = @intCast(arr.elements.len), .type_tag = .i64 } },
+        return switch (receiver.tag) {
+            .string => Value.fromSmallInt(@intCast(utf8Len(receiver.asBoxed().payload.string))),
+            .array => Value.fromSmallInt(@intCast(receiver.asBoxed().payload.array.elements.len)),
             else => error.TypeMismatch,
         };
     }
     // is_empty()：string/array。
     if (std.mem.eql(u8, method, "is_empty")) {
         if (args.len != 0) return error.WrongArity;
-        return switch (receiver) {
-            .string => |s| Value{ .boolean = s.len == 0 },
-            .array => |arr| Value{ .boolean = arr.elements.len == 0 },
+        return switch (receiver.tag) {
+            .string => Value.fromBool(receiver.asBoxed().payload.string.len == 0),
+            .array => Value.fromBool(receiver.asBoxed().payload.array.elements.len == 0),
             else => error.TypeMismatch,
         };
     }
     // push(v)：array → 追加后的新数组（值语义；用法 arr = arr.push(x)）。
     if (std.mem.eql(u8, method, "push")) {
         if (args.len != 1) return error.WrongArity;
-        return switch (receiver) {
-            .array => |arr| {
-                const new_elems = try allocator.alloc(Value, arr.elements.len + 1);
-                for (arr.elements, 0..) |e, i| new_elems[i] = try retainOwned(allocator, e);
-                new_elems[arr.elements.len] = try retainOwned(allocator, args[0]);
-                return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
-            },
-            else => error.TypeMismatch,
-        };
+        if (receiver.tag != .array) return error.TypeMismatch;
+        const arr = &receiver.asBoxed().payload.array;
+        const new_elems = try allocator.alloc(Value, arr.elements.len + 1);
+        for (arr.elements, 0..) |e, i| new_elems[i] = try retainOwned(allocator, e);
+        new_elems[arr.elements.len] = try retainOwned(allocator, args[0]);
+        return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
     }
     // pop()：array → 最后一个元素（T?），空数组 → null。
     if (std.mem.eql(u8, method, "pop")) {
         if (args.len != 0) return error.WrongArity;
-        return switch (receiver) {
-            .array => |arr| if (arr.elements.len == 0) Value.null_val else try retainOwned(allocator, arr.elements[arr.elements.len - 1]),
-            else => error.TypeMismatch,
-        };
+        if (receiver.tag != .array) return error.TypeMismatch;
+        const arr = &receiver.asBoxed().payload.array;
+        if (arr.elements.len == 0) return Value.fromNull();
+        return try retainOwned(allocator, arr.elements[arr.elements.len - 1]);
     }
     // first()/last()：array → 首/末元素（T?），空 → null。
     if (std.mem.eql(u8, method, "first")) {
         if (args.len != 0) return error.WrongArity;
-        return switch (receiver) {
-            .array => |arr| if (arr.elements.len == 0) Value.null_val else try retainOwned(allocator, arr.elements[0]),
-            else => error.TypeMismatch,
-        };
+        if (receiver.tag != .array) return error.TypeMismatch;
+        const arr = &receiver.asBoxed().payload.array;
+        if (arr.elements.len == 0) return Value.fromNull();
+        return try retainOwned(allocator, arr.elements[0]);
     }
     if (std.mem.eql(u8, method, "last")) {
         if (args.len != 0) return error.WrongArity;
-        return switch (receiver) {
-            .array => |arr| if (arr.elements.len == 0) Value.null_val else try retainOwned(allocator, arr.elements[arr.elements.len - 1]),
-            else => error.TypeMismatch,
-        };
+        if (receiver.tag != .array) return error.TypeMismatch;
+        const arr = &receiver.asBoxed().payload.array;
+        if (arr.elements.len == 0) return Value.fromNull();
+        return try retainOwned(allocator, arr.elements[arr.elements.len - 1]);
     }
     // contains(v)：array → 结构相等查找，压 bool。
     if (std.mem.eql(u8, method, "contains")) {
         if (args.len != 1) return error.WrongArity;
-        return switch (receiver) {
-            .array => |arr| {
-                for (arr.elements) |item| {
-                    if (structEq(item, args[0])) return Value{ .boolean = true };
-                }
-                return Value{ .boolean = false };
-            },
-            else => error.TypeMismatch,
-        };
+        if (receiver.tag != .array) return error.TypeMismatch;
+        const arr = &receiver.asBoxed().payload.array;
+        for (arr.elements) |item| {
+            if (structEq(item, args[0])) return Value.fromBool(true);
+        }
+        return Value.fromBool(false);
     }
     // drop_last()：array → 去掉末元素的新数组（空数组返回空数组拷贝）。
     if (std.mem.eql(u8, method, "drop_last")) {
         if (args.len != 0) return error.WrongArity;
-        return switch (receiver) {
-            .array => |arr| {
-                const n = if (arr.elements.len == 0) 0 else arr.elements.len - 1;
-                const new_elems = try allocator.alloc(Value, n);
-                for (arr.elements[0..n], 0..) |e, i| new_elems[i] = try retainOwned(allocator, e);
-                return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
-            },
-            else => error.TypeMismatch,
-        };
+        if (receiver.tag != .array) return error.TypeMismatch;
+        const arr = &receiver.asBoxed().payload.array;
+        const n = if (arr.elements.len == 0) 0 else arr.elements.len - 1;
+        const new_elems = try allocator.alloc(Value, n);
+        for (arr.elements[0..n], 0..) |e, i| new_elems[i] = try retainOwned(allocator, e);
+        return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
     }
     // M4a：Atomic<T> 方法 —— cas(expected, new) → bool；swap(new) → 旧值。
-    if (receiver == .atomic_val) {
-        const av = receiver.atomic_val;
+    if (receiver.tag == .atomic_val) {
+        const av = &receiver.asBoxed().payload.atomic_val;
         if (std.mem.eql(u8, method, "cas")) {
             if (args.len != 2) return error.WrongArity;
-            if (args[0] != .integer or args[1] != .integer) return error.TypeMismatch;
-            const expected: i128 = @bitCast(args[0].integer.value);
-            const new_val: i128 = @bitCast(args[1].integer.value);
-            return Value{ .boolean = av.cas(expected, new_val) };
+            if (!args[0].isInteger() or !args[1].isInteger()) return error.TypeMismatch;
+            const expected: i128 = @bitCast(args[0].asInt().value);
+            const new_val: i128 = @bitCast(args[1].asInt().value);
+            return Value.fromBool(av.*.cas(expected, new_val));
         }
         if (std.mem.eql(u8, method, "swap")) {
             if (args.len != 1) return error.WrongArity;
-            if (args[0] != .integer) return error.TypeMismatch;
-            const new_val: i128 = @bitCast(args[0].integer.value);
-            const old_raw = av.xchg(new_val);
-            return Value{ .integer = .{ .value = @bitCast(old_raw), .type_tag = value.atomicTypeToIntType(av.type_tag) } };
+            if (!args[0].isInteger()) return error.TypeMismatch;
+            const new_val: i128 = @bitCast(args[0].asInt().value);
+            const old_raw = av.*.xchg(new_val);
+            return try Value.fromInt(allocator, .{ .value = @bitCast(old_raw), .type_tag = value.atomicTypeToIntType(av.*.type_tag) });
         }
         return error.NoSuchMethod;
     }
     // M4b：Channel<T> 方法 —— send(v) → unit（关闭则 ChannelClosed）；recv() → T?（关闭且空 → null）。
     // close 仅 Sender 可用。所有权：send 把值 retainOwned 进缓冲（调用方随后 release 实参）；
     // recv 把缓冲值所有权转出（不再 retain）。
-    if (receiver == .channel_val) {
-        const ch = receiver.channel_val;
+    if (receiver.tag == .channel_val) {
+        const ch = receiver.asBoxed().payload.channel_val;
         if (std.mem.eql(u8, method, "send")) {
             if (args.len != 1) return error.WrongArity;
             const owned = try retainOwned(allocator, args[0]);
             const ok = ch.send(owned) catch return error.OutOfMemory;
             if (!ok) {
-                owned.releaseVM(allocator);
+                owned.release(allocator);
                 return error.ChannelClosed;
             }
-            return Value.unit;
+            return Value.fromUnit();
         }
         if (std.mem.eql(u8, method, "recv")) {
             if (args.len != 0) return error.WrongArity;
-            return ch.recv() orelse Value.null_val;
+            return ch.recv() orelse Value.fromNull();
         }
         return error.NoSuchMethod;
     }
-    if (receiver == .sender_val) {
-        const sv = receiver.sender_val;
+    if (receiver.tag == .sender_val) {
+        const sv = receiver.asBoxed().payload.sender_val;
         if (std.mem.eql(u8, method, "send")) {
             if (args.len != 1) return error.WrongArity;
             const owned = try retainOwned(allocator, args[0]);
             const ok = sv.channel.send(owned) catch return error.OutOfMemory;
             if (!ok) {
-                owned.releaseVM(allocator);
+                owned.release(allocator);
                 return error.ChannelClosed;
             }
-            return Value.unit;
+            return Value.fromUnit();
         }
         if (std.mem.eql(u8, method, "close")) {
             if (args.len != 0) return error.WrongArity;
             sv.channel.close();
-            return Value.unit;
+            return Value.fromUnit();
         }
         return error.NoSuchMethod;
     }
-    if (receiver == .receiver_val) {
-        const rv = receiver.receiver_val;
+    if (receiver.tag == .receiver_val) {
+        const rv = receiver.asBoxed().payload.receiver_val;
         if (std.mem.eql(u8, method, "recv")) {
             if (args.len != 0) return error.WrongArity;
-            return rv.channel.recv() orelse Value.null_val;
+            return rv.channel.recv() orelse Value.fromNull();
         }
         return error.NoSuchMethod;
     }

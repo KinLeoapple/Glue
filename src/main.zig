@@ -467,20 +467,20 @@ fn tryRunOnVM(
     };
 
     // 检查是否有未捕获的 throw
-    if (result == .throw_val) {
-        const throw_val = result.throw_val.*;
-        if (throw_val == .err) {
-            const e = throw_val.err;
-            var err_buf: [4096]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-            stderr_writer.interface.print("Uncaught error: {s}\n", .{e.message}) catch {};
-            stderr_writer.flush() catch {};
+    if (result.tag == .throw_val) {
+        const boxed = result.asBoxed();
+        const throw_val = boxed.payload.throw_val;
+        switch (throw_val) {
+            .err => |e| {
+                std.debug.print("Uncaught error: {s}\n", .{e.message});
+            },
+            .ok => {},
         }
-        result.releaseVM(value_allocator);
+        result.release(value_allocator);
         return .failed;
     }
 
-    result.releaseVM(value_allocator);
+    result.release(value_allocator);
 
     if (vm_trace) printErr(io, "[vm] {s}: ran on VM\n", .{filename});
     return .ran_main;

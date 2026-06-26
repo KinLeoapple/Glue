@@ -3681,18 +3681,6 @@ pub const TypeInferencer = struct {
         return ty;
     }
 
-    /// 文档 2.7.6: Orphan Instance 禁止
-    /// 文档 2.7.7: Overlapping Instances 禁止
-    fn checkImplOrphanAndOverlapping(self: *TypeInferencer, id: @TypeOf(@as(ast.Decl, undefined).impl_decl)) void {
-        trait_resolve.checkImplOrphanAndOverlapping(self, id);
-    }
-
-    /// 文档 2.7.4: 关联类型验证
-    /// impl 必须定义 Trait 中声明的所有关联类型
-    fn checkImplAssociatedTypes(self: *TypeInferencer, id: @TypeOf(@as(ast.Decl, undefined).impl_decl)) void {
-        trait_resolve.checkImplAssociatedTypes(self, id);
-    }
-
     /// 文档 2.7.2: 递归注册父 Trait 的方法到类型环境
     /// impl Child<T> 会自动满足所有父 Trait 的 bound
     fn registerParentTraitMethods(self: *TypeInferencer, env: *TypeEnv, trait_name: []const u8, overridden: *std.StringHashMap(void)) void {
@@ -4249,9 +4237,6 @@ pub const TypeInferencer = struct {
             },
             .trait_decl => |td| {
                 trait_resolve.checkTraitDecl(self, td);
-            },
-            .impl_decl => |id| {
-                trait_resolve.checkImplDecl(self, id, env);
             },
             .import_decl => {
                 // use 声明：类型检查在模块加载时处理

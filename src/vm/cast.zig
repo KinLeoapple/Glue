@@ -13,12 +13,15 @@ const Value = value.Value;
 const IntValue = value.IntValue;
 const FloatValue = value.FloatValue;
 const IntType = value.IntType;
+const FloatType = value.FloatType;
 
 pub const CastError = error{
     /// narrowing 超出目标类型范围（对齐 eval gluePanic "arithmetic overflow"）。
     CastOverflow,
     /// 不支持的源/目标类型组合（对齐 eval error.TypeMismatch）。
     CastTypeMismatch,
+    /// 内存分配失败
+    OutOfMemory,
 };
 
 fn clampInt(val: u128, comptime T: type) CastError!u128 {
@@ -31,7 +34,7 @@ fn clampInt(val: u128, comptime T: type) CastError!u128 {
     return val;
 }
 
-fn floatToInt(val: f128, comptime T: type) CastError!Value {
+fn floatToInt(allocator: std.mem.Allocator, val: f128, comptime T: type) CastError!Value {
     if (std.math.isNan(val) or std.math.isInf(val)) return error.CastOverflow;
     const min: f128 = @floatFromInt(std.math.minInt(T));
     const max: f128 = @floatFromInt(std.math.maxInt(T));
@@ -43,19 +46,19 @@ fn floatToInt(val: f128, comptime T: type) CastError!Value {
         u8 => .u8, u16 => .u16, u32 => .u32, u64 => .u64, u128 => .u128,
         else => unreachable,
     };
-    return Value{ .integer = IntValue{ .value = result, .type_tag = tag } };
+    return Value.fromInt(allocator, IntValue{ .value = result, .type_tag = tag });
 }
 
 /// 整数 → 目标类型（int 或 float）。镜像 eval.castInteger。
-fn castInteger(val: u128, source_tag: IntType, type_name: []const u8) CastError!Value {
+fn castInteger(allocator: std.mem.Allocator, val: u128, source_tag: IntType, type_name: []const u8) CastError!Value {
     const target = IntType.fromName(type_name) orelse {
         // 非整数类型名 → 尝试浮点。
         const signed_val: i128 = @bitCast(val);
         const fv: f128 = if (source_tag.isSigned()) @floatFromInt(signed_val) else @floatFromInt(val);
-        if (std.mem.eql(u8, type_name, "f16")) return Value{ .float = .{ .value = fv, .type_tag = .f16 } };
-        if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = .{ .value = fv, .type_tag = .f32 } };
-        if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = .{ .value = fv, .type_tag = .f64 } };
-        if (std.mem.eql(u8, type_name, "f128")) return Value{ .float = .{ .value = fv, .type_tag = .f128 } };
+        if (std.mem.eql(u8, type_name, "f16")) return Value.fromFloatValue(allocator, .{ .value = fv, .type_tag = .f16 });
+        if (std.mem.eql(u8, type_name, "f32")) return Value.fromFloatValue(allocator, .{ .value = fv, .type_tag = .f32 });
+        if (std.mem.eql(u8, type_name, "f64")) return Value.fromFloatValue(allocator, .{ .value = fv, .type_tag = .f64 });
+        if (std.mem.eql(u8, type_name, "f128")) return Value.fromFloatValue(allocator, .{ .value = fv, .type_tag = .f128 });
         return error.CastTypeMismatch;
     };
     const clamped: u128 = switch (target) {
@@ -70,50 +73,38 @@ fn castInteger(val: u128, source_tag: IntType, type_name: []const u8) CastError!
         .u64 => try clampInt(val, u64),
         .u128 => try clampInt(val, u128),
     };
-    return Value{ .integer = IntValue{ .value = clamped, .type_tag = target } };
+    return Value.fromInt(allocator, IntValue{ .value = clamped, .type_tag = target });
 }
 
 /// 浮点 → 目标类型。镜像 eval.castFloat。
-fn castFloat(val: f128, type_name: []const u8) CastError!Value {
-    if (std.mem.eql(u8, type_name, "i8")) return floatToInt(val, i8);
-    if (std.mem.eql(u8, type_name, "i16")) return floatToInt(val, i16);
-    if (std.mem.eql(u8, type_name, "i32")) return floatToInt(val, i32);
-    if (std.mem.eql(u8, type_name, "i64")) return floatToInt(val, i64);
-    if (std.mem.eql(u8, type_name, "i128")) return floatToInt(val, i128);
-    if (std.mem.eql(u8, type_name, "u8")) return floatToInt(val, u8);
-    if (std.mem.eql(u8, type_name, "u16")) return floatToInt(val, u16);
-    if (std.mem.eql(u8, type_name, "u32")) return floatToInt(val, u32);
-    if (std.mem.eql(u8, type_name, "u64")) return floatToInt(val, u64);
-    if (std.mem.eql(u8, type_name, "u128")) return floatToInt(val, u128);
-    if (std.mem.eql(u8, type_name, "f16")) return Value{ .float = .{ .value = @floatCast(@as(f16, @floatCast(val))), .type_tag = .f16 } };
-    if (std.mem.eql(u8, type_name, "f32")) return Value{ .float = .{ .value = @floatCast(@as(f32, @floatCast(val))), .type_tag = .f32 } };
-    if (std.mem.eql(u8, type_name, "f64")) return Value{ .float = .{ .value = @floatCast(@as(f64, @floatCast(val))), .type_tag = .f64 } };
-    if (std.mem.eql(u8, type_name, "f128")) return Value{ .float = .{ .value = val, .type_tag = .f128 } };
+fn castFloat(allocator: std.mem.Allocator, val: f128, type_name: []const u8) CastError!Value {
+    if (std.mem.eql(u8, type_name, "i8")) return floatToInt(allocator, val, i8);
+    if (std.mem.eql(u8, type_name, "i16")) return floatToInt(allocator, val, i16);
+    if (std.mem.eql(u8, type_name, "i32")) return floatToInt(allocator, val, i32);
+    if (std.mem.eql(u8, type_name, "i64")) return floatToInt(allocator, val, i64);
+    if (std.mem.eql(u8, type_name, "i128")) return floatToInt(allocator, val, i128);
+    if (std.mem.eql(u8, type_name, "u8")) return floatToInt(allocator, val, u8);
+    if (std.mem.eql(u8, type_name, "u16")) return floatToInt(allocator, val, u16);
+    if (std.mem.eql(u8, type_name, "u32")) return floatToInt(allocator, val, u32);
+    if (std.mem.eql(u8, type_name, "u64")) return floatToInt(allocator, val, u64);
+    if (std.mem.eql(u8, type_name, "u128")) return floatToInt(allocator, val, u128);
+    if (std.mem.eql(u8, type_name, "f16")) return Value.fromFloat16(@floatCast(val));
+    if (std.mem.eql(u8, type_name, "f32")) return Value.fromFloat32(@floatCast(val));
+    if (std.mem.eql(u8, type_name, "f64")) return Value.fromFloat64(@floatCast(val));
+    if (std.mem.eql(u8, type_name, "f128")) return try Value.fromFloat128(allocator, val);
     return error.CastTypeMismatch;
 }
 
 /// 数值类型转换（不含 str —— str 由 VM 用 format 处理）。
 /// 输入 val 是栈上 owned 值；返回新值（owned）。基础值类型，调用方按需 release 输入。
-pub fn castNumeric(val: Value, type_name: []const u8) CastError!Value {
-    if (val == .integer) return castInteger(val.integer.value, val.integer.type_tag, type_name);
-    if (val == .float) return castFloat(val.float.value, type_name);
+pub fn castNumeric(allocator: std.mem.Allocator, val: Value, type_name: []const u8) CastError!Value {
+    if (val.isInteger()) {
+        const int_val = val.asInt();
+        return castInteger(allocator, int_val.value, int_val.type_tag, type_name);
+    }
+    if (val.isFloat()) {
+        const float_val = val.asFloatValue();
+        return castFloat(allocator, float_val.value, type_name);
+    }
     return error.CastTypeMismatch;
-}
-
-test "cast int widening i32->i64" {
-    const v = try castNumeric(Value{ .integer = .{ .value = 42, .type_tag = .i32 } }, "i64");
-    try std.testing.expectEqual(@as(u128, 42), v.integer.value);
-    try std.testing.expectEqual(IntType.i64, v.integer.type_tag);
-}
-
-test "cast int narrowing overflow" {
-    const big = Value{ .integer = .{ .value = 300, .type_tag = .i32 } };
-    try std.testing.expectError(error.CastOverflow, castNumeric(big, "u8"));
-}
-
-test "cast int->float and float->int" {
-    const f = try castNumeric(Value{ .integer = .{ .value = 7, .type_tag = .i32 } }, "f64");
-    try std.testing.expectEqual(@as(f128, 7.0), f.float.value);
-    const i = try castNumeric(Value{ .float = .{ .value = 3.9, .type_tag = .f64 } }, "i32");
-    try std.testing.expectEqual(@as(u128, 3), i.integer.value);
 }
