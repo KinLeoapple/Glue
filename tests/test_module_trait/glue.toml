@@ -1,3 +1,2 @@
+[project]
 name = "module_trait"
-version = "0.1.0"
-entry = "Main.glue"
