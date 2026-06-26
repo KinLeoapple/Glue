@@ -1087,22 +1087,22 @@ pub const Value = struct {
                 try buf.appendSlice(allocator, temp);
             },
             .float16 => {
-                const temp = try std.fmt.allocPrint(allocator, "{}f16", .{self.asFloat16()});
+                const temp = try std.fmt.allocPrint(allocator, "{d}", .{self.asFloat16()});
                 defer allocator.free(temp);
                 try buf.appendSlice(allocator, temp);
             },
             .float32 => {
-                const temp = try std.fmt.allocPrint(allocator, "{}f32", .{self.asFloat32()});
+                const temp = try std.fmt.allocPrint(allocator, "{d}", .{self.asFloat32()});
                 defer allocator.free(temp);
                 try buf.appendSlice(allocator, temp);
             },
             .float64 => {
-                const temp = try std.fmt.allocPrint(allocator, "{}f64", .{self.asFloat64()});
+                const temp = try std.fmt.allocPrint(allocator, "{d}", .{self.asFloat64()});
                 defer allocator.free(temp);
                 try buf.appendSlice(allocator, temp);
             },
             .float128 => {
-                const temp = try std.fmt.allocPrint(allocator, "{}f128", .{self.asBoxed().payload.float128});
+                const temp = try std.fmt.allocPrint(allocator, "{d}", .{self.asBoxed().payload.float128});
                 defer allocator.free(temp);
                 try buf.appendSlice(allocator, temp);
             },

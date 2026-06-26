@@ -1802,6 +1802,14 @@ pub const VM = struct {
         const v = self.pop();
         defer v.release(self.allocator);
         if (std.mem.eql(u8, type_name, "str")) {
+            // 特殊处理 char: 返回不带引号的字符
+            if (v.tag == .char_val) {
+                const c = v.asChar();
+                const buf = try self.allocator.alloc(u8, 1);
+                buf[0] = @intCast(c);
+                try self.push(try Value.fromString(self.allocator, buf));
+                return;
+            }
             const owned = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
             try self.push(try Value.fromString(self.allocator, owned));
             return;
