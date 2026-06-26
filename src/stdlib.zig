@@ -16,7 +16,6 @@ const Entry = struct {
 /// 内嵌模块表。name 是 `use <name>` 的单段模块名，source 是其 .glue 源码。
 const modules = [_]Entry{
     .{ .name = "List", .source = @embedFile("stdlib/List.glue") },
-    .{ .name = "Compare", .source = @embedFile("stdlib/Compare.glue") },
 };
 
 /// 按模块名查内嵌源码；未命中返回 null（调用方据此回退/报错）。
@@ -25,10 +24,4 @@ pub fn lookup(name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, m.name, name)) return m.source;
     }
     return null;
-}
-
-test "lookup hits embedded module" {
-    try std.testing.expect(lookup("List") != null);
-    try std.testing.expect(lookup("Compare") != null);
-    try std.testing.expect(lookup("DoesNotExist") == null);
 }

@@ -963,28 +963,6 @@ pub const Decl = union(enum) {
         methods: []MethodDecl,
     },
 
-    /// [DEPRECATED] Impl 声明：impl TraitName<Type> { methods }
-    /// 已废弃：现在 trait 实现应该在 type 定义时完成
-    /// 保留此定义以便解析器可以报告友好的错误信息
-    impl_decl: struct {
-        location: SourceLocation,
-        /// Trait 名称
-        trait_name: []const u8,
-        /// impl 的目标类型名（如 impl Comparable<i32> 中的 "i32"）
-        type_name: []const u8 = "",
-        /// Trait 的类型参数
-        type_args: []*TypeNode,
-        /// 关联类型定义（如 type Item = i32）
-        associated_type_defs: []AssociatedTypeDef,
-        /// 方法实现
-        methods: []MethodDecl,
-        /// 条件约束（参数化条件实现）：impl Show<Box<T>> with Show<T>
-        /// 头部泛型实参中的自由类型变量须满足这些 bound。空表示无条件 impl。
-        bounds: []TraitBound = &[_]TraitBound{},
-        /// 可见性
-        visibility: Visibility = .private,
-    },
-
     /// use 声明：use Module.{items}
     /// use Collections.{Map, insert, empty}  — 选择性导入
     /// use Collections.Map                     — 导入整个模块

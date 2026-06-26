@@ -364,9 +364,6 @@ pub const ModuleCompiler = struct {
                         }
                     }
                 },
-                .impl_decl => |id| {
-                    for (id.methods) |m| try self.registerMethodName(m.name);
-                },
                 .trait_decl => |td| {
                     for (td.methods) |m| try self.registerMethodName(m.name);
                 },
@@ -377,10 +374,9 @@ pub const ModuleCompiler = struct {
 
     /// 第二遍：编译一个模块的 impl/trait 方法体（先，使裸名/nullary 方法表就绪）+ 函数体。
     fn compileBodies(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
-        // impl/trait/type 方法先编译：填 nullary_methods 表，使后续 fun 体（含 main）的 `zero()` 裸名可解析。
+        // trait/type 方法先编译：填 nullary_methods 表，使后续 fun 体（含 main）的 `zero()` 裸名可解析。
         for (module.declarations) |decl| {
             switch (decl) {
-                .impl_decl => |id| try self.compileImplMethods(id),
                 .trait_decl => |td| try self.compileTraitDefaults(td),
                 .type_decl => |td| try self.compileTypeMethods(td),
                 else => {},
@@ -396,16 +392,6 @@ pub const ModuleCompiler = struct {
 
     /// M5i：编译一个 impl 块的所有方法体（有 body 的）。每个编成顶层 Function（self+params 占
     /// slot 0..），登记进 program.impl_methods（type_name + method_name 分派键）。镜像 eval impl_decl。
-    fn compileImplMethods(self: *ModuleCompiler, id: @TypeOf(@as(ast.Decl, undefined).impl_decl)) CompileError!void {
-        for (id.methods) |m| {
-            const body = m.body orelse continue;
-            const func_idx = try self.compileMethodBody(m, body);
-            try self.program.addImplMethod(id.type_name, m.name, id.trait_name, func_idx);
-            // M5k：零参方法（self 也无，如 `fun zero(): i32`）无 receiver，登记按名直接解析（首个生效）。
-            if (m.params.len == 0) try self.registerNullaryMethod(m.name, func_idx);
-        }
-    }
-
     /// 编译 type 声明中的方法体（新语法）。
     /// 类似 compileImplMethods，但从 type_decl 中提取类型名和 trait 信息。
     fn compileTypeMethods(self: *ModuleCompiler, td: @TypeOf(@as(ast.Decl, undefined).type_decl)) CompileError!void {

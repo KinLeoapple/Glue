@@ -196,7 +196,6 @@ pub const Parser = struct {
                 .kw_fun,
                 .kw_type,
                 .kw_trait,
-                .kw_impl,
                 .kw_import,
                 .kw_pack,
                 .kw_pub,
@@ -274,7 +273,7 @@ pub const Parser = struct {
             // 不回退到 parseExpr（否则会对声明残余 token 产生误导性次生错误，
             // 如缺前导 `|` 的枚举在真正诊断后再报一次 "expected expression"）。
             const at_decl_kw = self.check(.kw_fun) or self.check(.kw_type) or
-                self.check(.kw_trait) or self.check(.kw_impl) or
+                self.check(.kw_trait) or
                 self.check(.kw_import) or self.check(.kw_pack) or self.check(.kw_pub);
 
             // 先尝试解析为声明
@@ -366,9 +365,6 @@ pub const Parser = struct {
         if (self.check(.kw_trait)) {
             return self.parseTraitDecl(visibility) catch return null;
         }
-        if (self.check(.kw_impl)) {
-            return self.parseImplDecl(visibility) catch return null;
-        }
         if (self.check(.kw_import)) {
             return self.parseUseDecl(visibility) catch return null;
         }
@@ -444,9 +440,6 @@ pub const Parser = struct {
         }
         if (self.check(.kw_trait)) {
             return self.parseTraitDecl(visibility);
-        }
-        if (self.check(.kw_impl)) {
-            return self.parseImplDecl(visibility);
         }
         if (self.check(.kw_import)) {
             return self.parseUseDecl(visibility);
@@ -1033,69 +1026,6 @@ pub const Parser = struct {
     }
 
     /// 解析 Impl 声明：impl TraitName<Type> { methods }
-    fn parseImplDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
-        const impl_tok = self.advance(); // 消费 impl
-        const name_tok = try self.expect(.identifier, "expected trait name");
-
-        var type_args = std.ArrayList(*ast.TypeNode).empty;
-        if (self.matchToken(.lt)) {
-            try self.parseTypeArgList(&type_args);
-            self.expectCloseAngle("expected '>'") catch {};
-        }
-
-        // 提取目标类型名（如 impl Comparable<i32> 中的 "i32"）
-        var type_name: []const u8 = "";
-        if (type_args.items.len > 0) {
-            switch (type_args.items[0].*) {
-                .named => |n| type_name = n.name,
-                .generic => |g| type_name = g.name,
-                else => {},
-            }
-        }
-
-        // 条件约束 with Bounds（参数化条件实现）：impl Show<Box<T>> with Show<T>
-        // 与 parseFunDecl 同构，复用 parseTraitBoundList。
-        var bounds = std.ArrayList(ast.TraitBound).empty;
-        if (self.matchToken(.kw_with)) {
-            try self.parseTraitBoundList(&bounds);
-        }
-
-        var assoc_type_defs = std.ArrayList(ast.AssociatedTypeDef).empty;
-        var methods = std.ArrayList(ast.MethodDecl).empty;
-        _ = self.expect(.l_brace, "expected '{'") catch {};
-        while (!self.check(.r_brace) and !self.isAtEnd()) {
-            // 解析关联类型定义：type Item = i32
-            if (self.check(.kw_type)) {
-                const type_tok = self.advance();
-                const assoc_name = try self.expect(.identifier, "expected associated type name");
-                if (self.matchToken(.eq)) {
-                    const actual_type = try self.parseType();
-                    try assoc_type_defs.append(self.allocator, ast.AssociatedTypeDef{
-                        .location = tokenLoc(type_tok),
-                        .name = assoc_name.lexeme,
-                        .actual_type = actual_type,
-                    });
-                }
-            } else {
-                try methods.append(self.allocator, try self.parseMethodDecl());
-            }
-        }
-        _ = self.expect(.r_brace, "expected '}'") catch {};
-
-        return ast.Decl{
-            .impl_decl = .{
-                .location = tokenLoc(impl_tok),
-                .trait_name = name_tok.lexeme,
-                .type_name = type_name,
-                .type_args = try type_args.toOwnedSlice(self.allocator),
-                .associated_type_defs = try assoc_type_defs.toOwnedSlice(self.allocator),
-                .methods = try methods.toOwnedSlice(self.allocator),
-                .bounds = try bounds.toOwnedSlice(self.allocator),
-                .visibility = visibility,
-            },
-        };
-    }
-
     /// 解析 use 声明：use Module.{items}
     fn parseUseDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const use_tok = self.advance(); // 消费 use
