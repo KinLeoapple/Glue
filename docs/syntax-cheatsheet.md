@@ -73,16 +73,17 @@ trait Printable {
 }
 ```
 
-### 实现（两种方式）
+### 实现 Trait
+
 ```glue
-// 方式一：type 定义时内联实现
+// type 定义时内联实现
 type MyInt: Show = MyInt(value: i32) {
     fun show(self): str { str(self.value) }
 }
 
-// 方式二：独立 impl 块
-impl Show<Ordering> {
-    fun show(self): str { ... }
+// 条件实现（类型参数有 trait 约束）
+type Box<T: Show>: Show = Box(value: T) {
+    fun show(self): str { "Box(" + self.value.show() + ")" }
 }
 ```
 
