@@ -1,4 +1,4 @@
-// 测试：多个 trait 不用括号（原始语法）
+// 测试：多个 trait 用括号（符合文档）
 
 trait Greet {
     fun greet_name(self): str
@@ -8,7 +8,7 @@ trait Sizeable {
     fun size(self): i32
 }
 
-type Ordering: Greet, Sizeable = | Lt | Eq | Gt {
+type Ordering: (Greet, Sizeable) = | Lt | Eq | Gt {
     fun greet_name(self): str {
         match self {
             Lt => "less"

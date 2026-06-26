@@ -544,11 +544,22 @@ pub const Parser = struct {
             self.expectCloseAngle("expected '>' to close type parameter list") catch {};
         }
 
-        // 实现的 trait 列表：: Trait1, Trait2
+        // 实现的 trait 列表：: Trait1 或 : (Trait1, Trait2)
         var implemented_traits = std.ArrayList(ast.TraitBound).empty;
         var has_error_trait = false;
         if (self.matchToken(.colon)) {
+            // 检查是否有括号（多个 trait）
+            const has_paren = self.check(.l_paren);
+            if (has_paren) {
+                _ = self.advance(); // 消耗 (
+            }
+
             try self.parseTraitBoundList(&implemented_traits);
+
+            if (has_paren) {
+                _ = self.expect(.r_paren, "expected ')' after trait list") catch {};
+            }
+
             // 检查是否实现了 Error trait
             for (implemented_traits.items) |trait_bound| {
                 if (std.mem.eql(u8, trait_bound.trait_name, "Error")) {

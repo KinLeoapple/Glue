@@ -1,6 +1,6 @@
 // Edge cases: records (width subtyping, update/extend), generic ADTs, trait dispatch, GADT
 
-type Ordering: Greet, Sizeable = | Lt | Eq | Gt {
+type Ordering: (Greet, Sizeable) = | Lt | Eq | Gt {
     fun name(self): str {
         match self {
             Lt => "less"
