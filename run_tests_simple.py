@@ -26,7 +26,10 @@ def run_test(test_dir):
         return False, "Exception"
 
 def main():
-    test_dirs = sorted([d for d in TESTS_DIR.iterdir() if d.is_dir() and (d / "glue.toml").exists()])
+    test_dirs = sorted([d for d in TESTS_DIR.iterdir()
+                        if d.is_dir()
+                        and (d / "glue.toml").exists()
+                        and not d.name.endswith('.deprecated')])
 
     passed = []
     failed = []
