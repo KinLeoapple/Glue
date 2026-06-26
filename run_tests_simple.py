@@ -29,7 +29,8 @@ def main():
     test_dirs = sorted([d for d in TESTS_DIR.iterdir()
                         if d.is_dir()
                         and (d / "glue.toml").exists()
-                        and not d.name.endswith('.deprecated')])
+                        and not d.name.endswith('.deprecated')
+                        and not d.name.endswith('.pending')])
 
     passed = []
     failed = []
