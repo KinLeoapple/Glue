@@ -14,8 +14,11 @@ fun main() {
     var sum: i64 = 0
     var i: i64 = 0
     while i < 1000000 {
-        val p = Point(i, i + 1)
-        sum = sum + dist2(p) + p.x - p.y
+        // 取模限制输入范围,避免 dist2 中间值过大
+        val v = i % 10000
+        val p = Point(v, v + 1)
+        // 取模避免数值累积溢出(本基准关注记录操作成本,非算术)
+        sum = (sum + dist2(p) + p.x - p.y) % 1073741824
         i = i + 1
     }
     println(sum)
