@@ -63,7 +63,9 @@ type Expr =
     | Mul(Expr, Expr)
     | Div(Expr, Expr)
 
-type EvalError = Error("eval error")
+type EvalError: Error = EvalError(msg: str) {
+    override fun prefix(self): str { "eval error" }
+}
 
 fun evalExpr(e: Expr): Throw<i32, Error> {
     match e {
@@ -159,11 +161,11 @@ fun main() {
 
     // --- 表达式求值: 100 / (5 - 5) => div by zero ---
     val e2 = Div(Num(100), Sub(Num(5), Num(5)))
-    println(match evalExpr(e2) { Ok(v) => str(v), Error(err) => "err:" + err.message })  // err:eval error: division by zero
+    println(match evalExpr(e2) { Ok(v) => str(v), Error(err) => "err:" + err.message() })  // err:eval error: division by zero
 
     // --- 嵌套表达式: ((10 - 2) * 3) / 4 = 6 ---
     val e3 = Div(Mul(Sub(Num(10), Num(2)), Num(3)), Num(4))
-    println(match evalExpr(e3) { Ok(v) => str(v), Error(err) => "err:" + err.message })  // 6
+    println(match evalExpr(e3) { Ok(v) => str(v), Error(err) => "err:" + err.message() })  // 6
 
     // --- BST: 插入乱序 → 中序得有序 ---
     var tree = Leaf

@@ -35,7 +35,9 @@ type Member = Member(key: str, value: Json)
 // ============================================================
 // 解析状态：源串 + 当前位置，用记录携带 (json结果, 下一位置)
 // ============================================================
-type ParseError = Error("parse error")
+type ParseError: Error = ParseError(msg: str) {
+    override fun prefix(self): str { "parse error" }
+}
 
 fun isDigit(c: char): bool { c >= '0' && c <= '9' }
 fun digitVal(c: char): i32 {
@@ -197,7 +199,7 @@ fun showObj(members: List<Member>): str {
 fun parse(s: str): str {
     match parseValue(s, 0) {
         Ok(r) => showJson(r.value)
-        Error(e) => "ERR: " + e.message
+        Error(e) => "ERR: " + e.message()
     }
 }
 

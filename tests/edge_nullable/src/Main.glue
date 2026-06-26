@@ -4,9 +4,15 @@ type Addr = Addr(city: str, zip: i32)
 type User = User(name: str, addr: Addr?)
 type Account = Account(owner: User?, balance: i32)
 
-type NotFound = Error("not found")
-type Timeout = Error("timeout")
-type Denied = Error("denied")
+type NotFound: Error = NotFound(msg: str) {
+    override fun prefix(self): str { "not found" }
+}
+type Timeout: Error = Timeout(msg: str) {
+    override fun prefix(self): str { "timeout" }
+}
+type Denied: Error = Denied(msg: str) {
+    override fun prefix(self): str { "denied" }
+}
 
 // deep optional chaining through 3 levels
 fun cityOf(a: Account?): str? {
@@ -107,7 +113,7 @@ fun main() {
     for r in results {
         val msg = match r {
             Ok(v) => v
-            Error(e) => "err:" + e.message
+            Error(e) => "err:" + e.message()
         }
         println(msg)
     }

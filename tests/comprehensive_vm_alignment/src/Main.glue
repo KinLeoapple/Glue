@@ -191,8 +191,12 @@ fun test_nullable() {
 
 // ============ 第四部分：Throw类型 ============
 
-type FileError = Error("file error")
-type NetworkError = Error("network error")
+type FileError: Error = FileError(msg: str) {
+    override fun prefix(self): str { "file error" }
+}
+type NetworkError: Error = NetworkError(msg: str) {
+    override fun prefix(self): str { "network error" }
+}
 
 fun risky_div(a: i32, b: i32) : Throw<i32, Error> {
     if b == 0 {
