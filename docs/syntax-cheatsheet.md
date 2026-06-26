@@ -21,9 +21,9 @@ fun add(a: i32, b: i32): i32 { a + b }      // 块尾表达式即返回值
 fun double(x: i32): i32 { return x * 2 }     // 显式 return（提前返回）
 fun modify(data: var i32): i32 { data + 1 }  // var 参数
 
-// Lambda
+// Lambda（匿名函数）
 fun(x) { x + 1 }
-(x) => x + 1
+fun(x: i32) { x * 2 }       // 带类型标注
 ```
 
 ---
