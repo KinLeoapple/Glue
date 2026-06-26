@@ -47,7 +47,7 @@ pub const ChannelValue = struct {
     pub fn deinit(self: *ChannelValue) void {
         for (self.buffer.items) |v| {
             var val = v;
-            val.deinit(self.allocator);
+            val.release(self.allocator);
         }
         self.buffer.deinit(self.allocator);
     }

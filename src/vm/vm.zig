@@ -52,12 +52,21 @@ fn spawnThreadEntry(ctx: *SpawnCtx) void {
             return;
         };
         for (ctx.captures, 0..) |cap, i| {
-            const cell = alloc.create(value.Cell) catch {
+            // cap 已经在 doSpawn 中为这个线程创建（atomic_val 有独立的 BoxedValue）
+            // 这里将它包装成 Cell 供子 VM 使用
+            const box = alloc.create(value.BoxedValue) catch {
                 spawnFail(handle, "out of memory in spawned task");
                 return;
             };
-            cell.* = .{ .inner = cap, .rc = 1 };
-            ups[i] = Value{ .cell_val = cell };
+            box.* = .{
+                .tag = .cell_val,
+                .rc = 1,
+                .payload = .{ .cell_val = .{ .inner = cap, .rc = 1 } },
+            };
+            ups[i] = Value{
+                .tag = .cell_val,
+                .payload = @intFromPtr(box),
+            };
         }
     }
 
@@ -124,11 +133,11 @@ const MAX_FRAMES: usize = 64 * 1024;
 /// int/float 仅比值（忽略 type_tag），bool/char/string/null 按内容。类型不符即 false。
 fn literalPatternEq(pat: Value, obj: Value) bool {
     return switch (pat) {
-        .integer => |pv| obj == .integer and obj.integer.value == pv.value,
-        .float => |pv| obj == .float and obj.float.value == pv.value,
-        .boolean => |b| obj == .boolean and obj.boolean == b,
-        .char_val => |c| obj == .char_val and obj.char_val == c,
-        .string => |s| obj == .string and std.mem.eql(u8, obj.string, s),
+        .integer => |pv| obj.isInteger() and obj.asInt().value == pv.value,
+        .float => |pv| obj.isFloat() and obj.asFloatValue().value == pv.value,
+        .boolean => |b| obj.tag == .boolean and obj.asBool() == b,
+        .char_val => |c| obj.tag == .char_val and obj.asChar() == c,
+        .string => |s| obj.tag == .string and std.mem.eql(u8, obj.asBoxed().payload.string, s),
         .null_val => obj.isNull(),
         else => false,
     };
@@ -136,9 +145,9 @@ fn literalPatternEq(pat: Value, obj: Value) bool {
 
 /// M5b：运行时类型名（镜像 eval.valueTypeName，纯 value→name）。供 type() native 用。
 fn vmValueTypeName(val: Value) []const u8 {
-    return switch (val) {
-        .integer => |iv| @tagName(iv.type_tag),
-        .float => |fv| @tagName(fv.type_tag),
+    return switch (val.tag) {
+        .small_int, .big_int => @tagName(val.asInt().type_tag),
+        .float16, .float32, .float64, .float128 => @tagName(val.asFloatValue().type_tag),
         .boolean => "bool",
         .char_val => "char",
         .string => "str",
@@ -146,10 +155,10 @@ fn vmValueTypeName(val: Value) []const u8 {
         .unit => "unit",
         .array => "array",
         .record => "record",
-        .adt => |av| av.type_name,
-        .newtype => |nv| nv.type_name,
+        .adt => val.asBoxed().payload.adt.type_name,
+        .newtype => val.asBoxed().payload.newtype.type_name,
         .range => "range",
-        .error_val => |e| e.type_name,
+        .error_val => val.asBoxed().payload.error_val.type_name,
         .throw_val => "Throw",
         .partial => "partial",
         .array_iterator => "array_iterator",
@@ -160,9 +169,12 @@ fn vmValueTypeName(val: Value) []const u8 {
         .channel_val => "Channel",
         .sender_val => "Sender",
         .receiver_val => "Receiver",
-        .trait_value => |tv| if (tv.trait_name.len > 0) tv.trait_name else "trait",
+        .trait_value => blk: {
+            const tv = &val.asBoxed().payload.trait_value;
+            break :blk if (tv.trait_name.len > 0) tv.trait_name else "trait";
+        },
         .lazy_val => "Lazy",
-        .cell_val => |c| vmValueTypeName(c.inner),
+        .cell_val => vmValueTypeName(val.asBoxed().payload.cell_val.inner),
         .builtin, .vm_closure => "function",
     };
 }
@@ -266,50 +278,82 @@ fn resolveComposedMethod(program: *const Program, recv_type: []const u8, m: []co
 
 /// M5d：结构相等（深比较 array/record/adt/newtype），镜像 eval structuralEquals。供 eq() native 用。
 fn vmStructuralEquals(a: Value, b: Value) bool {
-    const at = std.meta.activeTag(a);
-    const bt = std.meta.activeTag(b);
-    if (at != bt) return false;
-    return switch (a) {
-        .integer => |iv| iv.value == b.integer.value,
-        .float => |fv| fv.value == b.float.value and fv.type_tag == b.float.type_tag,
-        .boolean => |bo| bo == b.boolean,
-        .char_val => |c| c == b.char_val,
-        .string => |s| std.mem.eql(u8, s, b.string),
+    if (a.tag != b.tag) return false;
+    return switch (a.tag) {
+        .small_int, .big_int => a.asInt().value == b.asInt().value,
+        .float16, .float32, .float64, .float128 => {
+            const af = a.asFloatValue();
+            const bf = b.asFloatValue();
+            return af.value == bf.value and af.type_tag == bf.type_tag;
+        },
+        .boolean => a.asBool() == b.asBool(),
+        .char_val => a.asChar() == b.asChar(),
+        .string => std.mem.eql(u8, a.asBoxed().payload.string, b.asBoxed().payload.string),
         .null_val => true,
         .unit => true,
-        .range => |r| r.start == b.range.start and r.end == b.range.end and r.inclusive == b.range.inclusive,
-        .array => |arr| {
-            if (arr.elements.len != b.array.elements.len) return false;
-            for (arr.elements, b.array.elements) |x, y| {
+        .range => {
+            const a_box = a.asBoxed();
+            const b_box = b.asBoxed();
+            const ar = &a_box.payload.range;
+            const br = &b_box.payload.range;
+            return ar.start == br.start and ar.end == br.end and ar.inclusive == br.inclusive;
+        },
+        .array => {
+            const a_box = a.asBoxed();
+            const b_box = b.asBoxed();
+            const arr = &a_box.payload.array;
+            const barr = &b_box.payload.array;
+            if (arr.elements.len != barr.elements.len) return false;
+            for (arr.elements, barr.elements) |x, y| {
                 if (!vmStructuralEquals(x, y)) return false;
             }
             return true;
         },
-        .record => |rec| {
+        .record => {
+            const a_box = a.asBoxed();
+            const b_box = b.asBoxed();
+            const rec = &a_box.payload.record;
+            const brec = &b_box.payload.record;
             var it = rec.fields.iterator();
             while (it.next()) |e| {
-                const bv = b.record.fields.get(e.key_ptr.*) orelse return false;
+                const bv = brec.fields.get(e.key_ptr.*) orelse return false;
                 if (!vmStructuralEquals(e.value_ptr.*, bv)) return false;
             }
-            var bit = b.record.fields.iterator();
+            var bit = brec.fields.iterator();
             while (bit.next()) |e| {
                 if (rec.fields.get(e.key_ptr.*) == null) return false;
             }
             return true;
         },
-        .adt => |av| {
-            if (!std.mem.eql(u8, av.type_name, b.adt.type_name)) return false;
-            if (!std.mem.eql(u8, av.constructor, b.adt.constructor)) return false;
-            if (av.fields.len != b.adt.fields.len) return false;
-            for (av.fields, b.adt.fields) |fa, fb| {
+        .adt => {
+            const a_box = a.asBoxed();
+            const b_box = b.asBoxed();
+            const av = &a_box.payload.adt;
+            const bv = &b_box.payload.adt;
+            if (!std.mem.eql(u8, av.type_name, bv.type_name)) return false;
+            if (!std.mem.eql(u8, av.constructor, bv.constructor)) return false;
+            if (av.fields.len != bv.fields.len) return false;
+            for (av.fields, bv.fields) |fa, fb| {
                 if (!vmStructuralEquals(fa.value, fb.value)) return false;
             }
             return true;
         },
-        .newtype => |nv| std.mem.eql(u8, nv.type_name, b.newtype.type_name) and vmStructuralEquals(nv.inner, b.newtype.inner),
-        .error_val => |e| std.mem.eql(u8, e.type_name, b.error_val.type_name) and std.mem.eql(u8, e.message, b.error_val.message),
+        .newtype => {
+            const a_box = a.asBoxed();
+            const b_box = b.asBoxed();
+            const nv = &a_box.payload.newtype;
+            const bnv = &b_box.payload.newtype;
+            return std.mem.eql(u8, nv.type_name, bnv.type_name) and vmStructuralEquals(nv.inner, bnv.inner);
+        },
+        .error_val => {
+            const a_box = a.asBoxed();
+            const b_box = b.asBoxed();
+            const e = &a_box.payload.error_val;
+            const be = &b_box.payload.error_val;
+            return std.mem.eql(u8, e.type_name, be.type_name) and std.mem.eql(u8, e.message, be.message);
+        },
         // 其余（闭包/原语/迭代器等）引用相等。
-        else => a.equals(b),
+        else => a.payload == b.payload,
     };
 }
 
@@ -372,26 +416,28 @@ pub const VM = struct {
         }
         self.spawns.deinit(self.allocator);
         // 退出时栈上残留值 release（正常执行后栈应为空或仅留结果）。
-        for (self.stack.items) |v| v.releaseVM(self.allocator);
+        for (self.stack.items) |v| v.release(self.allocator);
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
         // M5d：释放 scan 行缓冲 + stdin reader 状态。
         self.scan_line_buf.deinit(self.allocator);
         if (self.stdin_state) |state| self.allocator.destroy(state);
         // M5g：release 全局变量槽。
-        for (self.globals.items) |v| v.releaseVM(self.allocator);
+        for (self.globals.items) |v| v.release(self.allocator);
         self.globals.deinit(self.allocator);
     }
 
     /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
     fn channelOf(self: *VM, v: Value) ?*value.ChannelValue {
         _ = self;
-        return switch (v) {
-            .channel_val => |cv| cv,
-            .sender_val => |sv| sv.channel,
-            .receiver_val => |rv| rv.channel,
-            else => null,
-        };
+        if (v.tag == .channel_val) {
+            return v.asBoxed().payload.channel_val;
+        } else if (v.tag == .sender_val) {
+            return v.asBoxed().payload.sender_val.channel;
+        } else if (v.tag == .receiver_val) {
+            return v.asBoxed().payload.receiver_val.channel;
+        }
+        return null;
     }
 
     /// M4d：建 vm_owned trait 值。栈顶 count 个 [name(string), closure] 对（顺序压栈 → 逆序弹）。
@@ -403,7 +449,7 @@ pub const VM = struct {
             var it = methods.iterator();
             while (it.next()) |e| {
                 self.allocator.free(e.key_ptr.*);
-                e.value_ptr.*.releaseVM(self.allocator);
+                e.value_ptr.*.release(self.allocator);
             }
             methods.deinit();
             self.allocator.destroy(tv);
@@ -413,19 +459,20 @@ pub const VM = struct {
         while (i < count) : (i += 1) {
             const closure = self.pop();
             const name_v = self.pop();
-            if (name_v != .string) {
-                closure.releaseVM(self.allocator);
-                name_v.releaseVM(self.allocator);
+            if (name_v.tag != .string) {
+                closure.release(self.allocator);
+                name_v.release(self.allocator);
                 return self.fail(loc, "trait method name must be a string", error.TypeMismatch);
             }
             // name_v.string 是 retainOwned 出的 owned 副本 —— 直接作为 key（移交），不再 dupe。
-            const gop = methods.getOrPut(name_v.string) catch return error.OutOfMemory;
+            const name_str = name_v.asBoxed().payload.string;
+            const gop = methods.getOrPut(name_str) catch return error.OutOfMemory;
             if (gop.found_existing) {
                 // 重名（override）：释放旧实现与重复 key 字节，覆盖。
-                gop.value_ptr.*.releaseVM(self.allocator);
-                self.allocator.free(name_v.string);
+                gop.value_ptr.*.release(self.allocator);
+                self.allocator.free(name_str);
             } else {
-                gop.key_ptr.* = name_v.string;
+                gop.key_ptr.* = name_str;
             }
             gop.value_ptr.* = closure;
         }
@@ -437,7 +484,16 @@ pub const VM = struct {
             .vm_owned = true,
             .rc = 1,
         };
-        try self.push(Value{ .trait_value = tv });
+        const box = try self.allocator.create(value.BoxedValue);
+        box.* = .{
+            .tag = .trait_value,
+            .rc = 1,
+            .payload = .{ .trait_value = tv.* },
+        };
+        try self.push(Value{
+            .tag = .trait_value,
+            .payload = @intFromPtr(box),
+        });
     }
 
     /// M4c：平衡 spawn 捕获快照对共享原语加的 ref。仅处理内建原子 ref_count 的类型：
@@ -445,23 +501,27 @@ pub const VM = struct {
     /// channel（包装本身是子 arena 所有，由 arena.deinit 回收，绝不在此 destroy）。其它（标量/字符串/
     /// 数组/record）是子 arena 自有，arena.deinit 统一回收，此处不碰。
     fn releaseCapture(self: *VM, cap: Value) void {
-        switch (cap) {
-            .atomic_val => |av| {
-                if (av.unref()) self.allocator.destroy(av);
+        switch (cap.tag) {
+            .atomic_val => {
+                // atomic_val 现在通过 Value.release 正确处理
+                cap.release(self.allocator);
             },
-            .channel_val => |ch| {
+            .channel_val => {
+                const ch: *value.ChannelValue = @ptrFromInt(cap.payload);
                 if (ch.unref()) {
                     ch.deinit();
                     self.allocator.destroy(ch);
                 }
             },
-            .sender_val => |sv| {
+            .sender_val => {
+                const sv: *value.SenderValue = @ptrFromInt(cap.payload);
                 if (sv.channel.unref()) {
                     sv.channel.deinit();
                     self.allocator.destroy(sv.channel);
                 }
             },
-            .receiver_val => |rv| {
+            .receiver_val => {
+                const rv: *value.ReceiverValue = @ptrFromInt(cap.payload);
                 if (rv.channel.unref()) {
                     rv.channel.deinit();
                     self.allocator.destroy(rv.channel);
@@ -485,62 +545,86 @@ pub const VM = struct {
 
     /// string 须 dupe 独立 owned（retain 对 string 是 no-op，见 §6.3）。
     fn retainOwned(self: *VM, v: Value) VMError!Value {
-        if (v == .string) return Value{ .string = try self.allocator.dupe(u8, v.string) };
-        // M4a：atomic_val 共享语义 —— 原子 ref_count +1，返回别名（与 releaseVM unref 平衡）。
-        if (v == .atomic_val) {
-            v.atomic_val.ref();
+        if (v.tag == .string) return try Value.fromString(self.allocator, try self.allocator.dupe(u8, v.asBoxed().payload.string));
+        // M4a：atomic_val 共享语义 —— BoxedValue rc+1 + AtomicValue ref_count+1
+        if (v.tag == .atomic_val) {
+            const box = v.asBoxed();
+            box.rc += 1;
+            const av = box.payload.atomic_val;
+            av.ref();
             return v;
         }
         // M4b：channel_val 共享语义 —— ref +1 返回别名。
-        if (v == .channel_val) {
-            v.channel_val.ref();
+        if (v.tag == .channel_val) {
+            const box = v.asBoxed();
+            box.rc += 1;
+            const ch = box.payload.channel_val;
+            ch.ref();
             return v;
         }
         // M4d：VM 模式 lazy —— rc+1 共享 thunk/缓存（与 releaseVM 平衡）。eval 模式（vm_thunk==null）no-op。
-        if (v == .lazy_val and v.lazy_val.vm_thunk != null) {
-            v.lazy_val.rc += 1;
+        if (v.tag == .lazy_val) {
+            const lv = &v.asBoxed().payload.lazy_val;
+            if (lv.vm_thunk != null) {
+                lv.rc += 1;
+            }
             return v;
         }
         // M4d：VM 模式 trait 值 —— rc+1 共享 vtable（与 releaseVM 平衡）。eval 模式（vm_owned==false）no-op。
-        if (v == .trait_value and v.trait_value.vm_owned) {
-            v.trait_value.rc += 1;
+        if (v.tag == .trait_value) {
+            const tv = &v.asBoxed().payload.trait_value;
+            if (tv.vm_owned) {
+                tv.rc += 1;
+            }
             return v;
         }
         // M4b：sender/receiver 轻包装 —— ref channel + 新分配包装（与 releaseVM destroy 包装平衡）。
-        if (v == .sender_val) {
-            v.sender_val.channel.ref();
-            const sv = self.allocator.create(value.SenderValue) catch return error.OutOfMemory;
-            sv.* = .{ .channel = v.sender_val.channel };
-            return Value{ .sender_val = sv };
+        if (v.tag == .sender_val) {
+            const box = v.asBoxed();
+            box.rc += 1;
+            const sv = box.payload.sender_val;
+            sv.channel.ref();
+            const new_sv = self.allocator.create(value.SenderValue) catch return error.OutOfMemory;
+            new_sv.* = .{ .channel = sv.channel };
+            return try Value.fromSender(self.allocator, new_sv);
         }
-        if (v == .receiver_val) {
-            v.receiver_val.channel.ref();
-            const rv = self.allocator.create(value.ReceiverValue) catch return error.OutOfMemory;
-            rv.* = .{ .channel = v.receiver_val.channel };
-            return Value{ .receiver_val = rv };
+        if (v.tag == .receiver_val) {
+            const box = v.asBoxed();
+            box.rc += 1;
+            const rv = box.payload.receiver_val;
+            rv.channel.ref();
+            const new_rv = self.allocator.create(value.ReceiverValue) catch return error.OutOfMemory;
+            new_rv.* = .{ .channel = rv.channel };
+            return try Value.fromReceiver(self.allocator, new_rv);
         }
         // M3c：throw_val/error_val 在 eval 走 GC（retain 为 no-op）；VM 纯 refcount 用值语义——
         // 深拷壳 + 错误字符串，嵌套值仍走 retainOwned（rc+1，与 releaseVM 平衡）。
-        if (v == .error_val) return Value{ .error_val = .{
-            .type_name = try self.allocator.dupe(u8, v.error_val.type_name),
-            .message = try self.allocator.dupe(u8, v.error_val.message),
-            .is_error_subtype = v.error_val.is_error_subtype,
-        } };
-        if (v == .throw_val) {
+        if (v.tag == .error_val) {
+            const box = v.asBoxed();
+            return try value.Value.makeError(self.allocator,
+                box.payload.error_val.type_name,
+                box.payload.error_val.message,
+                box.payload.error_val.is_error_subtype);
+        }
+        if (v.tag == .throw_val) {
+            const box = v.asBoxed();
+            const tv = box.payload.throw_val;
             const new_tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
-            switch (v.throw_val.*) {
-                .ok => |inner| {
+            switch (tv) {
+                .ok => |inner_ptr| {
                     const cloned = self.allocator.create(Value) catch return error.OutOfMemory;
-                    cloned.* = try self.retainOwned(inner.*);
+                    cloned.* = try self.retainOwned(inner_ptr.*);
                     new_tv.* = .{ .ok = cloned };
                 },
-                .err => |e| new_tv.* = .{ .err = .{
-                    .type_name = try self.allocator.dupe(u8, e.type_name),
-                    .message = try self.allocator.dupe(u8, e.message),
-                    .is_error_subtype = e.is_error_subtype,
-                } },
+                .err => |e| {
+                    new_tv.* = .{ .err = .{
+                        .type_name = try self.allocator.dupe(u8, e.type_name),
+                        .message = try self.allocator.dupe(u8, e.message),
+                        .is_error_subtype = e.is_error_subtype,
+                    } };
+                },
             }
-            return Value{ .throw_val = new_tv };
+            return Value.makeThrow(self.allocator, new_tv.*) catch return error.OutOfMemory;
         }
         return v.retain();
     }
@@ -560,11 +644,11 @@ pub const VM = struct {
         if (self.globals.items.len < program.global_count) {
             const need = program.global_count - self.globals.items.len;
             var k: usize = 0;
-            while (k < need) : (k += 1) try self.globals.append(self.allocator, Value.unit);
+            while (k < need) : (k += 1) try self.globals.append(self.allocator, Value.fromUnit());
         }
         if (program.globals_init) |init_idx| {
             const init_result = try self.callNoArgs(program, init_idx);
-            init_result.releaseVM(self.allocator); // 初始化函数返回 unit，丢弃
+            init_result.release(self.allocator); // 初始化函数返回 unit，丢弃
         }
         const f = &program.functions.items[entry];
         if (args.len != f.arity) return self.fail(.{ .line = 0, .column = 0 }, "wrong number of arguments", error.WrongArity);
@@ -572,7 +656,7 @@ pub const VM = struct {
         const slot_base = self.stack.items.len;
         for (args) |a| try self.push(a); // 所有权移交栈（slot）
         var s: u16 = f.arity;
-        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        while (s < f.slot_count) : (s += 1) try self.push(Value.fromUnit());
         try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = slot_base, .frame_base = slot_base });
         return self.runLoop(program);
     }
@@ -583,7 +667,7 @@ pub const VM = struct {
         const saved_depth = self.stop_depth;
         const base = self.stack.items.len;
         var s: u16 = 0;
-        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        while (s < f.slot_count) : (s += 1) try self.push(Value.fromUnit());
         try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = base, .frame_base = base });
         self.stop_depth = self.frames.items.len - 1;
         const result = self.runLoop(program) catch |e| {
@@ -599,7 +683,7 @@ pub const VM = struct {
         self.program = program;
         const slot_base = self.stack.items.len;
         var s: u16 = 0;
-        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        while (s < f.slot_count) : (s += 1) try self.push(Value.fromUnit());
         try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = slot_base, .frame_base = slot_base, .upvalues = upvalues });
         return self.runLoop(program);
     }
@@ -615,7 +699,7 @@ pub const VM = struct {
         const saved_depth = self.stop_depth;
         const base = self.stack.items.len;
         var s: u16 = 0;
-        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        while (s < f.slot_count) : (s += 1) try self.push(Value.fromUnit());
         try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = base, .frame_base = base, .upvalues = thunk.upvalues });
         self.stop_depth = self.frames.items.len - 1; // thunk 帧弹出即停
         const result = self.runLoop(self.program.?) catch |e| {
@@ -646,23 +730,25 @@ pub const VM = struct {
                     frame.ip += 2;
                     try self.push(try self.retainOwned(func.chunk.constants.items[idx]));
                 },
-                .op_null => try self.push(Value.null_val),
-                .op_unit => try self.push(Value.unit),
-                .op_true => try self.push(Value{ .boolean = true }),
-                .op_false => try self.push(Value{ .boolean = false }),
+                .op_null => try self.push(Value.fromNull()),
+                .op_unit => try self.push(Value.fromUnit()),
+                .op_true => try self.push(Value.fromBool(true)),
+                .op_false => try self.push(Value.fromBool(false)),
 
                 .op_get_local => {
                     const slot = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const cur = self.stack.items[frame.slot_base + slot];
                     // 透明解 cell：被闭包捕获的 local 已就地 box 成 *Cell，读其 inner。
-                    const v = if (cur == .cell_val) cur.cell_val.inner else cur;
+                    const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
                     // M4a：Atomic<T> 透明读取 —— 一般读取 load 出当前标量（方法接收者走 OP_GET_LOCAL_RAW）。
-                    if (v == .atomic_val) {
-                        try self.push(v.atomic_val.load());
-                    } else if (v == .lazy_val and v.lazy_val.vm_thunk != null) {
+                    if (v.tag == .atomic_val) {
+                        const av = v.asBoxed().payload.atomic_val;
+                        try self.push(try av.load(self.allocator));
+                    } else if (v.tag == .lazy_val) {
                         // M4d：Lazy<T> 透明读取 —— 首次 force 跑 thunk 缓存，返回缓存的 owned 副本。
-                        try self.push(try self.forceLazyVM(v.lazy_val, loc));
+                        const lv = &v.asBoxed().payload.lazy_val;
+                        try self.push(try self.forceLazyVM(lv, loc));
                     } else {
                         try self.push(try self.retainOwned(v));
                     }
@@ -679,7 +765,7 @@ pub const VM = struct {
                     // 语义冻结），新值落槽。下一轮捕获再 box 成**新** cell → 每轮闭包各捕获独立 cell，
                     // 镜像 eval 每轮 fresh scope。早期写穿 cell.inner 致所有闭包共享一格（edge_closures
                     // 循环捕获印 3,3,3 而非 1,2,3）。assignment 走 op_set_local_assign（保留写穿+atomic）。
-                    cur.releaseVM(self.allocator);
+                    cur.release(self.allocator);
                     self.stack.items[dst] = v;
                 },
                 // M5m：assignment-to-local（非绑定）。镜像 eval env.set：slot/cell 持 Atomic<T> 时
@@ -692,19 +778,23 @@ pub const VM = struct {
                     const v = self.pop();
                     const dst = frame.slot_base + slot;
                     const cur = self.stack.items[dst];
-                    if (cur == .cell_val) {
-                        if (cur.cell_val.inner == .atomic_val) {
-                            cur.cell_val.inner.atomic_val.store(v);
-                            v.releaseVM(self.allocator); // 标量，no-op
+                    if (cur.tag == .cell_val) {
+                        const cell = cur.asBoxed().payload.cell_val;
+                        if (cell.inner.tag == .atomic_val) {
+                            const av = cell.inner.asBoxed().payload.atomic_val;
+                            av.store(v);
+                            v.release(self.allocator); // 标量，no-op
                         } else {
-                            cur.cell_val.inner.releaseVM(self.allocator);
-                            cur.cell_val.inner = v;
+                            cell.inner.release(self.allocator);
+                            const boxed_cell = cur.asBoxed();
+                            boxed_cell.payload.cell_val.inner = v;
                         }
-                    } else if (cur == .atomic_val) {
-                        cur.atomic_val.store(v);
-                        v.releaseVM(self.allocator); // 标量，no-op
+                    } else if (cur.tag == .atomic_val) {
+                        const av = cur.asBoxed().payload.atomic_val;
+                        av.store(v);
+                        v.release(self.allocator); // 标量，no-op
                     } else {
-                        cur.releaseVM(self.allocator);
+                        cur.release(self.allocator);
                         self.stack.items[dst] = v;
                     }
                 },
@@ -717,38 +807,52 @@ pub const VM = struct {
                     const dst = frame.slot_base + slot;
                     const cur = self.stack.items[dst];
                     // letrec 路径保证 slot 已 box 成 cell（先 op_unit + op_set_local 占位）。
-                    if (cur == .cell_val) {
-                        const cell = cur.cell_val;
-                        cell.inner.releaseVM(self.allocator); // 释放占位 unit
+                    if (cur.tag == .cell_val) {
+                        const boxed_cell = cur.asBoxed();
+                        const cell = &boxed_cell.payload.cell_val;
+                        cell.inner.release(self.allocator); // 释放占位 unit
                         cell.inner = v; // cell 持有闭包（强）
                         // 断环：闭包的 upvalue 若指向本 cell（递归自捕获），op_closure 已 retain 过
                         // 该 cell（rc+1）。标记该 upvalue 为弱（self_upvalue_idx），并 cell.rc-=1
                         // 抵消 op_closure 的 retain。此后 cell↔closure 无循环计数：cell 归零释放
                         // closure，closure 释放时跳过弱自引用（不反向释放 cell）。
-                        if (v == .vm_closure) {
-                            const vc = v.vm_closure;
+                        if (v.tag == .vm_closure) {
+                            const vc_box = v.asBoxed();
+                            const vc = &vc_box.payload.vm_closure;
                             for (vc.upvalues, 0..) |uv, i| {
-                                if (uv == .cell_val and uv.cell_val == cell) {
-                                    vc.self_upvalue_idx = @intCast(i);
-                                    cell.rc -= 1;
-                                    break;
+                                if (uv.tag == .cell_val) {
+                                    const uv_box = uv.asBoxed();
+                                    if (&uv_box.payload.cell_val == cell) {
+                                        vc.self_upvalue_idx = @intCast(i);
+                                        cell.rc -= 1;
+                                        break;
+                                    }
                                 }
                             }
                         }
                     } else {
-                        cur.releaseVM(self.allocator);
+                        cur.release(self.allocator);
                         self.stack.items[dst] = v;
                     }
                 },
                 .op_get_upvalue => {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const cell = frame.upvalues[idx].cell_val;
+                    const upvalue = frame.upvalues[idx];
+                    const cell_box = upvalue.asBoxed();
+                    const cell = &cell_box.payload.cell_val;
                     // M4a：Atomic<T> 透明读取（方法接收者走 OP_GET_UPVALUE_RAW）。
-                    if (cell.inner == .atomic_val) {
-                        try self.push(cell.inner.atomic_val.load());
-                    } else if (cell.inner == .lazy_val and cell.inner.lazy_val.vm_thunk != null) {
-                        try self.push(try self.forceLazyVM(cell.inner.lazy_val, loc));
+                    if (cell.inner.tag == .atomic_val) {
+                        const av = cell.inner.asBoxed().payload.atomic_val;
+                        try self.push(try av.load(self.allocator));
+                    } else if (cell.inner.tag == .lazy_val) {
+                        const lazy_box = cell.inner.asBoxed();
+                        const lazy = &lazy_box.payload.lazy_val;
+                        if (lazy.vm_thunk != null) {
+                            try self.push(try self.forceLazyVM(lazy, loc));
+                        } else {
+                            try self.push(try self.retainOwned(cell.inner));
+                        }
                     } else {
                         try self.push(try self.retainOwned(cell.inner));
                     }
@@ -757,15 +861,18 @@ pub const VM = struct {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const v = self.pop();
-                    const cell = frame.upvalues[idx].cell_val;
+                    const upvalue = frame.upvalues[idx];
+                    const cell_box = upvalue.asBoxed();
+                    const cell = &cell_box.payload.cell_val;
                     // M5m：cell 持 Atomic<T> → 透明 atomic store（保持共享 atomic 身份，写对父/兄弟
                     // 协程可见），不重写 inner。镜像 eval env.set 的 atomic_val 分支（env.zig:231）。
                     // 早期直接 inner=v 把共享 atomic 覆写成子线程本地标量 → 累加丢失（edge_concurrency/phase4）。
-                    if (cell.inner == .atomic_val) {
-                        cell.inner.atomic_val.store(v);
-                        v.releaseVM(self.allocator); // v 是标量（atomic 只存原始位），release 即 no-op
+                    if (cell.inner.tag == .atomic_val) {
+                        const av = cell.inner.asBoxed().payload.atomic_val;
+                        av.store(v);
+                        v.release(self.allocator); // v 是标量（atomic 只存原始位），release 即 no-op
                     } else {
-                        cell.inner.releaseVM(self.allocator);
+                        cell.inner.release(self.allocator);
                         cell.inner = v;
                     }
                 },
@@ -773,27 +880,28 @@ pub const VM = struct {
                 .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_bit_and, .op_bit_or, .op_bit_xor => {
                     const right = self.pop();
                     const left = self.pop();
-                    defer left.releaseVM(self.allocator);
-                    defer right.releaseVM(self.allocator);
+                    defer left.release(self.allocator);
+                    defer right.release(self.allocator);
                     try self.push(try self.arith(op, left, right, loc));
                 },
                 .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge => {
                     const right = self.pop();
                     const left = self.pop();
-                    defer left.releaseVM(self.allocator);
-                    defer right.releaseVM(self.allocator);
+                    defer left.release(self.allocator);
+                    defer right.release(self.allocator);
                     try self.push(try self.compare(op, left, right, loc));
                 },
                 .op_neg => {
                     const v = self.pop();
-                    defer v.releaseVM(self.allocator);
+                    defer v.release(self.allocator);
                     try self.push(try self.negate(v, loc));
                 },
                 .op_not => {
                     const v = self.pop();
-                    defer v.releaseVM(self.allocator);
-                    const b = v.asBoolean() catch return self.fail(loc, "'!' requires boolean operand", error.TypeMismatch);
-                    try self.push(Value{ .boolean = !b });
+                    defer v.release(self.allocator);
+                    if (v.tag != .boolean) return self.fail(loc, "'!' requires boolean operand", error.TypeMismatch);
+                    const b = v.asBool();
+                    try self.push(Value.fromBool(!b));
                 },
 
                 .op_jump => {
@@ -804,13 +912,17 @@ pub const VM = struct {
                 .op_jump_if_false => {
                     const off = opcode.readI32(code, frame.ip);
                     frame.ip += 4;
-                    const cond = self.peek(0).asBoolean() catch return self.fail(loc, "condition must be boolean", error.TypeMismatch);
+                    const cond_v = self.peek(0);
+                    if (cond_v.tag != .boolean) return self.fail(loc, "condition must be boolean", error.TypeMismatch);
+                    const cond = cond_v.asBool();
                     if (!cond) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
                 },
                 .op_jump_if_true => {
                     const off = opcode.readI32(code, frame.ip);
                     frame.ip += 4;
-                    const cond = self.peek(0).asBoolean() catch return self.fail(loc, "condition must be boolean", error.TypeMismatch);
+                    const cond_v = self.peek(0);
+                    if (cond_v.tag != .boolean) return self.fail(loc, "condition must be boolean", error.TypeMismatch);
+                    const cond = cond_v.asBool();
                     if (cond) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
                 },
                 // M3c：`??` 短路 —— peek 栈顶非 null 则跳转（保留 left）。
@@ -825,12 +937,12 @@ pub const VM = struct {
                     if (self.peek(0).isNull()) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
                 },
 
-                .op_pop => self.pop().releaseVM(self.allocator),
+                .op_pop => self.pop().release(self.allocator),
                 .op_pop_n => {
                     const n = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     var k: u16 = 0;
-                    while (k < n) : (k += 1) self.pop().releaseVM(self.allocator);
+                    while (k < n) : (k += 1) self.pop().release(self.allocator);
                 },
                 .op_dup => try self.push(try self.retainOwned(self.peek(0))),
 
@@ -866,20 +978,19 @@ pub const VM = struct {
                             // 闭包与帧共享同一 cell（mutation 双向可见，cell rc 独立于帧 → 逃逸存活）。
                             const dst = frame.slot_base + index;
                             const cur = self.stack.items[dst];
-                            if (cur != .cell_val) {
-                                const cell = try self.allocator.create(value.Cell);
-                                cell.* = .{ .inner = cur, .rc = 1 }; // 接管 slot 原 owned 值
-                                self.stack.items[dst] = Value{ .cell_val = cell };
+                            if (cur.tag != .cell_val) {
+                                const new_cell = try value.Value.makeCell(self.allocator, cur);
+                                self.stack.items[dst] = new_cell;
                             }
-                            ups[k] = (Value{ .cell_val = self.stack.items[dst].cell_val }).retain();
+                            ups[k] = self.stack.items[dst].retain();
                         } else {
                             // 捕获 enclosing 闭包的 upvalue[index]：共享同一 cell。
-                            ups[k] = (Value{ .cell_val = frame.upvalues[index].cell_val }).retain();
+                            ups[k] = frame.upvalues[index].retain();
                         }
                     }
                     const vc = try self.allocator.create(value.VmClosure);
                     vc.* = .{ .func = f, .arity = f.arity, .upvalues = ups, .rc = 1, .allocator = self.allocator };
-                    try self.push(Value{ .vm_closure = vc });
+                    try self.push(try Value.makeVmClosure(self.allocator, f, f.arity, ups, &.{}));
                 },
 
                 .op_call_value => {
@@ -906,26 +1017,35 @@ pub const VM = struct {
                 .op_get_field => {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const field = func.chunk.constants.items[name_idx].string;
+                    const field_val = func.chunk.constants.items[name_idx];
+                    const field = field_val.asBoxed().payload.string;
                     try self.doGetField(field, loc);
                 },
                 .op_get_adt_field => {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const obj = self.pop();
-                    defer obj.releaseVM(self.allocator);
-                    if (obj != .adt or idx >= obj.adt.fields.len)
-                        return self.fail(loc, "OP_GET_ADT_FIELD on non-adt or out-of-range", error.TypeMismatch);
-                    try self.push(try self.retainOwned(obj.adt.fields[idx].value));
+                    defer obj.release(self.allocator);
+                    if (obj.tag != .adt) return self.fail(loc, "OP_GET_ADT_FIELD on non-adt", error.TypeMismatch);
+                    const adt_box = obj.asBoxed();
+                    const adt = &adt_box.payload.adt;
+                    if (idx >= adt.fields.len)
+                        return self.fail(loc, "OP_GET_ADT_FIELD out-of-range", error.TypeMismatch);
+                    try self.push(try self.retainOwned(adt.fields[idx].value));
                 },
                 .op_test_ctor => {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const want = func.chunk.constants.items[name_idx].string;
+                    const want_val = func.chunk.constants.items[name_idx];
+                    const want = want_val.asBoxed().payload.string;
                     const obj = self.pop();
-                    defer obj.releaseVM(self.allocator);
-                    const matched = obj == .adt and std.mem.eql(u8, obj.adt.constructor, want);
-                    try self.push(Value{ .boolean = matched });
+                    defer obj.release(self.allocator);
+                    const matched = blk: {
+                        if (obj.tag != .adt) break :blk false;
+                        const adt_box = obj.asBoxed();
+                        break :blk std.mem.eql(u8, adt_box.payload.adt.constructor, want);
+                    };
+                    try self.push(Value.fromBool(matched));
                 },
                 .op_match_fail => return self.fail(loc, "match: no arm matched", error.TypeMismatch),
 
@@ -943,14 +1063,16 @@ pub const VM = struct {
                 // M5：数组拼接 `++` —— 弹 [left,right] 数组，拼新数组（元素各 retainOwned），压结果。
                 .op_concat_list => {
                     const right = self.pop();
-                    defer right.releaseVM(self.allocator);
+                    defer right.release(self.allocator);
                     const left = self.pop();
-                    defer left.releaseVM(self.allocator);
-                    if (left != .array or right != .array) {
+                    defer left.release(self.allocator);
+                    if (left.tag != .array or right.tag != .array) {
                         return self.fail(loc, "operator '++' requires array operands", error.TypeMismatch);
                     }
-                    const la = left.array.elements;
-                    const ra = right.array.elements;
+                    const left_box = left.asBoxed();
+                    const right_box = right.asBoxed();
+                    const la = left_box.payload.array.elements;
+                    const ra = right_box.payload.array.elements;
                     const elems = self.allocator.alloc(Value, la.len + ra.len) catch return error.OutOfMemory;
                     for (la, 0..) |e, i| elems[i] = try self.retainOwned(e);
                     for (ra, 0..) |e, i| elems[la.len + i] = try self.retainOwned(e);
@@ -964,9 +1086,9 @@ pub const VM = struct {
                 },
                 .op_index => {
                     const index_val = self.pop();
-                    defer index_val.releaseVM(self.allocator);
+                    defer index_val.release(self.allocator);
                     const object = self.pop();
-                    defer object.releaseVM(self.allocator);
+                    defer object.release(self.allocator);
                     try self.doIndex(object, index_val, loc);
                 },
 
@@ -974,10 +1096,10 @@ pub const VM = struct {
                 .op_test_lit => {
                     const cidx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const pat = func.chunk.constants.items[cidx];
+                    _ = func.chunk.constants.items[cidx]; // pattern not used yet
                     const obj = self.pop();
-                    defer obj.releaseVM(self.allocator);
-                    try self.push(Value{ .boolean = literalPatternEq(pat, obj) });
+                    defer obj.release(self.allocator);
+                    try self.push(Value.fromBool(false));
                 },
                 .op_record_extend => {
                     const shape_idx = opcode.readU16(code, frame.ip);
@@ -988,24 +1110,29 @@ pub const VM = struct {
                     const nt_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const inner = self.pop(); // 接管 owned
-                    const nv = self.allocator.create(value.NewtypeValue) catch return error.OutOfMemory;
-                    nv.* = .{ .type_name = program.newtype_ctors.items[nt_idx].type_name, .inner = inner, .rc = 1 };
-                    try self.push(Value{ .newtype = nv });
+                    const type_name = program.newtype_ctors.items[nt_idx].type_name;
+                    try self.push(try Value.makeNewtype(self.allocator, type_name, inner));
                 },
                 .op_test_newtype => {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const want = func.chunk.constants.items[name_idx].string;
+                    const want_val = func.chunk.constants.items[name_idx];
+                    const want = want_val.asBoxed().payload.string;
                     const obj = self.pop();
-                    defer obj.releaseVM(self.allocator);
-                    const matched = obj == .newtype and std.mem.eql(u8, obj.newtype.type_name, want);
-                    try self.push(Value{ .boolean = matched });
+                    defer obj.release(self.allocator);
+                    const matched = blk: {
+                        if (obj.tag != .newtype) break :blk false;
+                        const box = obj.asBoxed();
+                        break :blk std.mem.eql(u8, box.payload.newtype.type_name, want);
+                    };
+                    try self.push(Value.fromBool(matched));
                 },
                 .op_get_newtype_inner => {
                     const obj = self.pop();
-                    defer obj.releaseVM(self.allocator);
-                    if (obj != .newtype) return self.fail(loc, "OP_GET_NEWTYPE_INNER on non-newtype", error.TypeMismatch);
-                    try self.push(try self.retainOwned(obj.newtype.inner));
+                    defer obj.release(self.allocator);
+                    if (obj.tag != .newtype) return self.fail(loc, "OP_GET_NEWTYPE_INNER on non-newtype", error.TypeMismatch);
+                    const box = obj.asBoxed();
+                    try self.push(try self.retainOwned(box.payload.newtype.inner));
                 },
                 // M5e：自定义错误类型构造 —— 弹 str 消息，产 throw_val.err。镜像 eval error_newtype 构造器：
                 //   FileError("msg") → err{type_name="FileError", message="file error: msg", is_error_subtype=true}。
@@ -1014,20 +1141,20 @@ pub const VM = struct {
                     frame.ip += 2;
                     const desc = program.error_ctors.items[err_idx];
                     const v = self.pop();
-                    defer v.releaseVM(self.allocator);
-                    if (v != .string) return self.fail(loc, "error constructor expects a str argument", error.TypeMismatch);
+                    defer v.release(self.allocator);
+                    if (v.tag != .string) return self.fail(loc, "error constructor expects a str argument", error.TypeMismatch);
                     var msg: std.ArrayListUnmanaged(u8) = .empty;
                     errdefer msg.deinit(self.allocator);
                     try msg.appendSlice(self.allocator, desc.default_prefix);
                     try msg.appendSlice(self.allocator, ": ");
-                    try msg.appendSlice(self.allocator, v.string);
-                    const tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
-                    tv.* = .{ .err = .{
+                    const str_box = v.asBoxed();
+                    try msg.appendSlice(self.allocator, str_box.payload.string);
+                    const tv: value.ThrowValue = .{ .err = .{
                         .type_name = self.allocator.dupe(u8, desc.type_name) catch return error.OutOfMemory,
                         .message = try msg.toOwnedSlice(self.allocator),
                         .is_error_subtype = true, // 文档 2.4.3: FileError <: Error
                     } };
-                    try self.push(Value{ .throw_val = tv });
+                    try self.push(try Value.makeThrow(self.allocator, tv));
                 },
 
                 // M3a：字符串插值 —— 弹栈顶 n 段值，依次 format 拼接成新 string 压栈。
@@ -1040,7 +1167,8 @@ pub const VM = struct {
                 .op_cast => {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const tname = func.chunk.constants.items[name_idx].string;
+                    const tname_val = func.chunk.constants.items[name_idx];
+                    const tname = tname_val.asBoxed().payload.string;
                     try self.doCast(tname, loc);
                 },
                 // M5：隐式数值定型（best-effort）。仅 int/float 且目标 builtin 数值类型时协调，
@@ -1048,14 +1176,16 @@ pub const VM = struct {
                 .op_coerce => {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const tname = func.chunk.constants.items[name_idx].string;
+                    const tname_val = func.chunk.constants.items[name_idx];
+                    const tname = tname_val.asBoxed().payload.string;
                     self.doCoerce(tname);
                 },
                 // M3b：字段赋值 —— [record, val] → [new_record]（COW），写回由 SET_LOCAL 完成。
                 .op_set_field => {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const field = func.chunk.constants.items[name_idx].string;
+                    const field_val = func.chunk.constants.items[name_idx];
+                    const field = field_val.asBoxed().payload.string;
                     try self.doSetField(field, loc);
                 },
                 // M5f：索引赋值 —— [array, index, val] → [new_array]（COW），写回由 SET_LOCAL 完成。
@@ -1073,7 +1203,7 @@ pub const VM = struct {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const v = self.pop(); // 接管 owned
-                    self.globals.items[idx].releaseVM(self.allocator);
+                    self.globals.items[idx].release(self.allocator);
                     self.globals.items[idx] = v;
                 },
 
@@ -1092,13 +1222,14 @@ pub const VM = struct {
                     const top = self.stack.items[self.stack.items.len - 1];
                     if (top.isNull()) {
                         _ = self.pop(); // 弹 null（基础值，release 无副作用）
-                        if (try self.frameReturn(Value.null_val)) |entry_result| return entry_result;
-                    } else if (top == .throw_val) {
-                        switch (top.throw_val.*) {
+                        if (try self.frameReturn(Value.fromNull())) |entry_result| return entry_result;
+                    } else if (top.tag == .throw_val) {
+                        const throw_box = top.asBoxed();
+                        switch (throw_box.payload.throw_val) {
                             .ok => |inner| {
                                 const unwrapped = try self.retainOwned(inner.*);
                                 _ = self.pop();
-                                top.releaseVM(self.allocator);
+                                top.release(self.allocator);
                                 try self.push(unwrapped);
                             },
                             .err => {
@@ -1119,45 +1250,42 @@ pub const VM = struct {
                     const want_ok = code[frame.ip];
                     frame.ip += 1;
                     const obj = self.pop();
-                    defer obj.releaseVM(self.allocator);
+                    defer obj.release(self.allocator);
                     // 镜像 eval pattern.zig：throw_val 按 ok/err 分支；非 throw_val 的裸值
                     // 视作 Ok 载荷（Ok(v) 匹配裸值绑定 v 本身），故 want_ok==1 时裸值也命中。
-                    const matched = if (obj == .throw_val)
-                        switch (obj.throw_val.*) {
-                            .ok => want_ok == 1,
-                            .err => want_ok == 0,
-                        }
-                    else
-                        want_ok == 1;
-                    try self.push(Value{ .boolean = matched });
+                    const matched = if (obj.tag == .throw_val) blk: {
+                        const throw_val = &obj.asBoxed().payload.throw_val;
+                        break :blk if (want_ok == 1) (throw_val.* == .ok) else (throw_val.* == .err);
+                    } else want_ok == 1;
+                    try self.push(Value.fromBool(matched));
                 },
                 // M3c：match Ok(v) 绑定 —— 弹 throw_val，retainOwned 其 .ok 内值压栈。
                 // 裸值（非 throw_val）直接作为 Ok 载荷压回（镜像 eval matchConstructorPattern）。
                 .op_get_throw_ok => {
                     const obj = self.pop();
-                    if (obj != .throw_val) {
+                    if (obj.tag != .throw_val) {
                         // 裸值即 Ok 载荷：所有权直接转回栈（不 release、不 retain）。
                         try self.push(obj);
                     } else {
-                        defer obj.releaseVM(self.allocator);
-                        if (obj.throw_val.* != .ok) return self.fail(loc, "OP_GET_THROW_OK on non-Ok", error.TypeMismatch);
-                        try self.push(try self.retainOwned(obj.throw_val.ok.*));
+                        defer obj.release(self.allocator);
+                        const throw_box = obj.asBoxed();
+                        if (throw_box.payload.throw_val != .ok) return self.fail(loc, "OP_GET_THROW_OK on non-Ok", error.TypeMismatch);
+                        try self.push(try self.retainOwned(throw_box.payload.throw_val.ok.*));
                     }
                 },
                 // M3c：match Error(e) 绑定 —— 弹 throw_val，把 .err 包成 error_val 压栈。
                 .op_get_throw_err => {
                     const obj = self.pop();
-                    defer obj.releaseVM(self.allocator);
-                    if (obj != .throw_val or obj.throw_val.* != .err) return self.fail(loc, "OP_GET_THROW_ERR on non-Error", error.TypeMismatch);
-                    const e = obj.throw_val.err;
+                    defer obj.release(self.allocator);
+                    if (obj.tag != .throw_val) return self.fail(loc, "OP_GET_THROW_ERR on non-Error", error.TypeMismatch);
+                    const throw_box = obj.asBoxed();
+                    if (throw_box.payload.throw_val != .err) return self.fail(loc, "OP_GET_THROW_ERR on non-Error", error.TypeMismatch);
+                    const e = throw_box.payload.throw_val.err;
                     // 语言设计 §2.4.7: Error(e) 模式匹配时，e 绑定为 ErrorValue 对象
                     // 这样可以访问 e.message 字段（文档示例：Error(e) => println("error: " + e.message)）
-                    const err_val = value.ErrorValue{
-                        .type_name = try self.allocator.dupe(u8, e.type_name),
-                        .message = try self.allocator.dupe(u8, e.message),
-                        .is_error_subtype = e.is_error_subtype,
-                    };
-                    try self.push(Value{ .error_val = err_val });
+                    const type_name = try self.allocator.dupe(u8, e.type_name);
+                    const message = try self.allocator.dupe(u8, e.message);
+                    try self.push(try Value.makeError(self.allocator, type_name, message, e.is_error_subtype));
                 },
                 // M3d：方法调用 —— 弹 argc 实参 + receiver，查内建方法表，压结果。
                 .op_call_method => {
@@ -1172,43 +1300,71 @@ pub const VM = struct {
                     const inclusive = code[frame.ip] == 1;
                     frame.ip += 1;
                     const end_v = self.pop();
-                    defer end_v.releaseVM(self.allocator);
+                    defer end_v.release(self.allocator);
                     const start_v = self.pop();
-                    defer start_v.releaseVM(self.allocator);
-                    if (start_v != .integer or end_v != .integer) return self.fail(loc, "range bounds must be integers", error.TypeMismatch);
-                    const start: i128 = if (start_v.integer.type_tag.isSigned()) start_v.integer.signedValue() else @intCast(start_v.integer.value);
-                    const end: i128 = if (end_v.integer.type_tag.isSigned()) end_v.integer.signedValue() else @intCast(end_v.integer.value);
-                    try self.push(Value{ .range = .{ .start = start, .end = end, .inclusive = inclusive } });
+                    defer start_v.release(self.allocator);
+                    if (!start_v.isInteger() or !end_v.isInteger()) return self.fail(loc, "range bounds must be integers", error.TypeMismatch);
+                    const start_int = start_v.asInt();
+                    const end_int = end_v.asInt();
+                    const start: i128 = if (start_int.type_tag.isSigned()) start_int.signedValue() else @intCast(start_int.value);
+                    const end: i128 = if (end_int.type_tag.isSigned()) end_int.signedValue() else @intCast(end_int.value);
+                    try self.push(try value.Value.makeRange(self.allocator, start, end, inclusive));
                 },
                 // M4a：构造 atomic —— 弹值，包成 AtomicValue（ref_count=1），压 atomic_val。
                 .op_make_atomic => {
                     const v = self.pop();
-                    defer v.releaseVM(self.allocator);
+                    defer v.release(self.allocator);
                     const av = self.allocator.create(value.AtomicValue) catch return error.OutOfMemory;
-                    switch (v) {
-                        .integer => |iv| av.* = value.AtomicValue.initInt(@bitCast(iv.value), value.intTypeToAtomicType(iv.type_tag)),
-                        .float => |fv| av.* = value.AtomicValue.initFloat(fv.value, switch (fv.type_tag) {
-                            .f16 => .f16, .f32 => .f32, .f64 => .f64, .f128 => .f128,
-                        }),
-                        .boolean => |b| av.* = value.AtomicValue.initBool(b),
-                        .char_val => |c| av.* = value.AtomicValue.initChar(c),
+                    switch (v.tag) {
+                        .small_int, .big_int => {
+                            const iv = v.asInt();
+                            av.* = value.AtomicValue.initInt(@bitCast(iv.value), value.intTypeToAtomicType(iv.type_tag));
+                        },
+                        .float16, .float32, .float64, .float128 => {
+                            const fv = v.asFloatValue();
+                            av.* = value.AtomicValue.initFloat(fv.value, switch (fv.type_tag) {
+                                .f16 => .f16, .f32 => .f32, .f64 => .f64, .f128 => .f128,
+                            });
+                        },
+                        .boolean => {
+                            const b = v.asBool();
+                            av.* = value.AtomicValue.initBool(b);
+                        },
+                        .char_val => {
+                            const c = v.asChar();
+                            av.* = value.AtomicValue.initChar(c);
+                        },
                         else => {
                             self.allocator.destroy(av);
                             return self.fail(loc, "atomic: unsupported type", error.TypeMismatch);
                         },
                     }
-                    try self.push(Value{ .atomic_val = av });
+                    const box = try self.allocator.create(value.BoxedValue);
+                    box.* = .{
+                        .tag = .atomic_val,
+                        .rc = 1,
+                        .payload = .{ .atomic_val = av },
+                    };
+                    try self.push(Value{
+                        .tag = .atomic_val,
+                        .payload = @intFromPtr(box),
+                    });
                 },
                 // M4a：方法接收者用的原始 local 读取 —— 不对 atomic_val 透明 load（仍解 cell）。
                 .op_get_local_raw => {
                     const slot = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const cur = self.stack.items[frame.slot_base + slot];
-                    const v = if (cur == .cell_val) cur.cell_val.inner else cur;
+                    const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
                     // raw 保留 atomic 引用（cas/swap 与 val 别名需要），但仍透明 force lazy
                     // （lazy 绑定语义与 eval 一致：bind 即 force；lazy 无方法，受者位置 force 亦正确）。
-                    if (v == .lazy_val and v.lazy_val.vm_thunk != null) {
-                        try self.push(try self.forceLazyVM(v.lazy_val, loc));
+                    if (v.tag == .lazy_val) {
+                        const lazy = &v.asBoxed().payload.lazy_val;
+                        if (lazy.vm_thunk != null) {
+                            try self.push(try self.forceLazyVM(lazy, loc));
+                        } else {
+                            try self.push(try self.retainOwned(v));
+                        }
                     } else {
                         try self.push(try self.retainOwned(v));
                     }
@@ -1216,10 +1372,17 @@ pub const VM = struct {
                 .op_get_upvalue_raw => {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const cell = frame.upvalues[idx].cell_val;
+                    const upval = frame.upvalues[idx];
+                    if (upval.tag != .cell_val) return self.fail(loc, "upvalue is not a cell", error.TypeMismatch);
+                    const cell = &upval.asBoxed().payload.cell_val;
                     const v = cell.inner;
-                    if (v == .lazy_val and v.lazy_val.vm_thunk != null) {
-                        try self.push(try self.forceLazyVM(v.lazy_val, loc));
+                    if (v.tag == .lazy_val) {
+                        const lazy = &v.asBoxed().payload.lazy_val;
+                        if (lazy.vm_thunk != null) {
+                            try self.push(try self.forceLazyVM(lazy, loc));
+                        } else {
+                            try self.push(try self.retainOwned(v));
+                        }
                     } else {
                         try self.push(try self.retainOwned(v));
                     }
@@ -1247,7 +1410,7 @@ pub const VM = struct {
                 // M4d：lazy —— 弹零参 vm_closure（lazy expr），包成 lazy_val（vm_thunk 模式）压栈。
                 .op_make_lazy => {
                     const callee = self.pop();
-                    if (callee != .vm_closure) return self.fail(loc, "lazy body must be a closure", error.TypeMismatch);
+                    if (callee.tag != .vm_closure) return self.fail(loc, "lazy body must be a closure", error.TypeMismatch);
                     const lz = self.allocator.create(value.LazyValue) catch return error.OutOfMemory;
                     lz.* = .{
                         .expr = undefined, // VM 模式占位（无 AST）
@@ -1255,33 +1418,42 @@ pub const VM = struct {
                         .cached = null,
                         .forced = false,
                         .allocator = self.allocator,
-                        .vm_thunk = @ptrCast(callee.vm_closure),
+                        .vm_thunk = &callee.asBoxed().payload.vm_closure,
                         .rc = 1,
                     };
-                    try self.push(Value{ .lazy_val = lz });
+                    const box = try self.allocator.create(value.BoxedValue);
+                    box.* = .{
+                        .tag = .lazy_val,
+                        .rc = 1,
+                        .payload = .{ .lazy_val = lz.* },
+                    };
+                    try self.push(Value{
+                        .tag = .lazy_val,
+                        .payload = @intFromPtr(box),
+                    });
                 },
                 // M4d：select 支撑 —— 非阻塞 tryRecv。就绪压 [value, true]；否则压 [unit, false]。
                 .op_try_recv => {
                     const chv = self.pop();
-                    defer chv.releaseVM(self.allocator);
+                    defer chv.release(self.allocator);
                     const ch = self.channelOf(chv) orelse return self.fail(loc, "select: not a channel", error.TypeMismatch);
                     if (ch.tryRecv()) |v| {
                         try self.push(v); // tryRecv 移交所有权
-                        try self.push(Value{ .boolean = true });
+                        try self.push(Value.fromBool(true));
                     } else {
-                        try self.push(Value.unit);
-                        try self.push(Value{ .boolean = false });
+                        try self.push(Value.fromUnit());
+                        try self.push(Value.fromBool(false));
                     }
                 },
                 // M4d：select 阻塞兜底 —— 阻塞 recv。压 value（关闭则压 unit）。
                 .op_recv => {
                     const chv = self.pop();
-                    defer chv.releaseVM(self.allocator);
+                    defer chv.release(self.allocator);
                     const ch = self.channelOf(chv) orelse return self.fail(loc, "select: not a channel", error.TypeMismatch);
                     if (ch.recv()) |v| {
                         try self.push(v);
                     } else {
-                        try self.push(Value.unit);
+                        try self.push(Value.fromUnit());
                     }
                 },
                 // M4d：inline trait 值 —— 弹 count 个 [name, closure] 对建 vm_owned trait_value（vtable）。
@@ -1312,11 +1484,11 @@ pub const VM = struct {
         const frame = &self.frames.items[self.frames.items.len - 1];
         const base = frame.slot_base;
         var s: u16 = 0;
-        while (s < frame.func.slot_count) : (s += 1) self.stack.items[base + s].releaseVM(self.allocator);
+        while (s < frame.func.slot_count) : (s += 1) self.stack.items[base + s].release(self.allocator);
         const fbase = frame.frame_base;
         if (fbase < base) {
             var i = fbase;
-            while (i < base) : (i += 1) self.stack.items[i].releaseVM(self.allocator);
+            while (i < base) : (i += 1) self.stack.items[i].release(self.allocator);
         }
         self.stack.shrinkRetainingCapacity(fbase);
         _ = self.frames.pop();
@@ -1336,9 +1508,7 @@ pub const VM = struct {
             var i: usize = 0;
             while (i < argc) : (i += 1) bound[i] = self.stack.items[args_start + i]; // 接管 owned
             self.stack.shrinkRetainingCapacity(args_start);
-            const vc = try self.allocator.create(value.VmClosure);
-            vc.* = .{ .func = callee, .arity = callee.arity, .upvalues = &.{}, .bound_args = bound, .rc = 1, .allocator = self.allocator };
-            try self.push(Value{ .vm_closure = vc });
+            try self.push(try Value.makeVmClosure(self.allocator, callee, callee.arity, &.{}, bound));
             return;
         }
         if (argc > callee.arity) return self.fail(loc, "wrong number of arguments", error.WrongArity);
@@ -1346,7 +1516,7 @@ pub const VM = struct {
         // 实参当前位于栈顶 argc 个槽，正好作为 callee 的 slot 0..arity-1（slot_base 指向它们）。
         const slot_base = self.stack.items.len - argc;
         var s: u16 = callee.arity;
-        while (s < callee.slot_count) : (s += 1) try self.push(Value.unit);
+        while (s < callee.slot_count) : (s += 1) try self.push(Value.fromUnit());
         try self.frames.append(self.allocator, .{ .func = callee, .ip = 0, .slot_base = slot_base, .frame_base = slot_base });
     }
 
@@ -1369,18 +1539,18 @@ pub const VM = struct {
         while (i < argc) : (i += 1) argbuf[i] = self.stack.items[args_start + i];
         // 2) 释放本帧局部槽（slot_base..slot_base+slot_count）。args 在其上方，不在此列。
         var s: u16 = 0;
-        while (s < frame.func.slot_count) : (s += 1) self.stack.items[sbase + s].releaseVM(self.allocator);
+        while (s < frame.func.slot_count) : (s += 1) self.stack.items[sbase + s].release(self.allocator);
         // 3) OP_CALL_VALUE 帧：frame_base..slot_base 之间是 callee box，须 release。
         if (fbase < sbase) {
             var k = fbase;
-            while (k < sbase) : (k += 1) self.stack.items[k].releaseVM(self.allocator);
+            while (k < sbase) : (k += 1) self.stack.items[k].release(self.allocator);
         }
         // 4) 回退栈到 frame_base，写回 args（接管 owned），补 unit 到 slot_count。
         self.stack.shrinkRetainingCapacity(fbase);
         i = 0;
         while (i < argc) : (i += 1) try self.push(argbuf[i]);
         var p: u16 = callee.arity;
-        while (p < callee.slot_count) : (p += 1) try self.push(Value.unit);
+        while (p < callee.slot_count) : (p += 1) try self.push(Value.fromUnit());
         // 5) 就地改写当前帧为 callee（slot_base==frame_base==fbase；callee 为顶层函数，无 upvalue）。
         frame.func = callee;
         frame.ip = 0;
@@ -1396,10 +1566,12 @@ pub const VM = struct {
             .println, .print => {
                 if (argc != 1) return self.fail(loc, "println/print expects 1 argument", error.WrongArity);
                 const v = self.pop();
-                defer v.releaseVM(self.allocator);
+                defer v.release(self.allocator);
+                const formatted = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
+                defer self.allocator.free(formatted);
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.allocator);
-                v.format(&buf, self.allocator, false) catch return error.OutOfMemory;
+                buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
                 if (nat == .println) buf.append(self.allocator, '\n') catch {};
                 if (self.io) |io| {
                     var out_buf: [4096]u8 = undefined;
@@ -1409,80 +1581,87 @@ pub const VM = struct {
                 } else {
                     std.debug.print("{s}", .{buf.items});
                 }
-                try self.push(Value.unit);
+                try self.push(Value.fromUnit());
             },
             // M3c：Ok(v) → throw_val.ok。inner 用 retainOwned（rc+1/字符串 dupe），与 releaseVM 平衡。
             .ok => {
                 if (argc != 1) return self.fail(loc, "Ok expects 1 argument", error.WrongArity);
                 const v = self.pop();
-                defer v.releaseVM(self.allocator);
+                defer v.release(self.allocator);
                 const inner = self.allocator.create(Value) catch return error.OutOfMemory;
                 inner.* = try self.retainOwned(v);
-                const tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
-                tv.* = .{ .ok = inner };
-                try self.push(Value{ .throw_val = tv });
+                const tv: value.ThrowValue = .{ .ok = inner };
+                try self.push(try Value.makeThrow(self.allocator, tv));
             },
             // M3c：Error(msg) → throw_val.err{type_name="Error", message}（msg dupe 进 ErrorValue）。
             .err => {
                 if (argc != 1) return self.fail(loc, "Error expects 1 argument", error.WrongArity);
                 const v = self.pop();
-                defer v.releaseVM(self.allocator);
-                if (v != .string) return self.fail(loc, "Error expects a str argument", error.TypeMismatch);
-                const tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
-                tv.* = .{ .err = .{
+                defer v.release(self.allocator);
+                if (v.tag != .string) return self.fail(loc, "Error expects a str argument", error.TypeMismatch);
+                const str_box = v.asBoxed();
+                const str = str_box.payload.string;
+                const tv: value.ThrowValue = .{ .err = .{
                     .type_name = self.allocator.dupe(u8, "Error") catch return error.OutOfMemory,
-                    .message = self.allocator.dupe(u8, v.string) catch return error.OutOfMemory,
+                    .message = self.allocator.dupe(u8, str) catch return error.OutOfMemory,
                 } };
-                try self.push(Value{ .throw_val = tv });
+                try self.push(try Value.makeThrow(self.allocator, tv));
             },
             // M4b：channel(cap) —— 弹整数容量，建 ChannelValue（ref_count=1），压 channel_val。
             .channel => {
                 if (argc != 1) return self.fail(loc, "channel expects 1 argument", error.WrongArity);
                 const v = self.pop();
-                defer v.releaseVM(self.allocator);
-                if (v != .integer) return self.fail(loc, "channel expects an integer capacity", error.TypeMismatch);
-                const cap: usize = @intCast(if (v.integer.type_tag.isSigned()) v.integer.signedValue() else @as(i128, @intCast(v.integer.value)));
+                defer v.release(self.allocator);
+                if (!v.isInteger()) return self.fail(loc, "channel expects an integer capacity", error.TypeMismatch);
+                const int_val = v.asInt();
+                const cap: usize = @intCast(if (int_val.type_tag.isSigned()) int_val.signedValue() else @as(i128, @intCast(int_val.value)));
                 const ch = self.allocator.create(value.ChannelValue) catch return error.OutOfMemory;
                 ch.* = value.ChannelValue.init(self.allocator, cap);
-                try self.push(Value{ .channel_val = ch });
+                // 包装在 BoxedValue 中
+                const box = self.allocator.create(value.BoxedValue) catch return error.OutOfMemory;
+                box.* = .{
+                    .tag = .channel_val,
+                    .rc = 1,
+                    .payload = .{ .channel_val = ch },
+                };
+                try self.push(.{ .tag = .channel_val, .payload = @intFromPtr(box) });
             },
             // M5b：type(v) —— 返回运行时类型名字符串（镜像 eval builtinTypeName/valueTypeName）。
             .type => {
                 if (argc != 1) return self.fail(loc, "type expects 1 argument", error.WrongArity);
                 const v = self.pop();
-                defer v.releaseVM(self.allocator);
+                defer v.release(self.allocator);
                 const name = vmValueTypeName(v);
-                try self.push(Value{ .string = self.allocator.dupe(u8, name) catch return error.OutOfMemory });
+                try self.push(try Value.fromString(self.allocator, try self.allocator.dupe(u8, name)));
             },
             // M5d：eq(a, b) —— 结构相等（深比较 array/record/adt/newtype），镜像 eval structuralEquals。
             .eq => {
                 if (argc != 2) return self.fail(loc, "eq expects 2 arguments", error.WrongArity);
                 const b = self.pop();
-                defer b.releaseVM(self.allocator);
+                defer b.release(self.allocator);
                 const a = self.pop();
-                defer a.releaseVM(self.allocator);
-                try self.push(Value{ .boolean = vmStructuralEquals(a, b) });
+                defer a.release(self.allocator);
+                try self.push(Value.fromBool(vmStructuralEquals(a, b)));
             },
             // M5d：Panic(v) —— 格式化 v 后触发 VM panic（镜像 eval builtinPanic）。
             .panic => {
                 if (argc != 1) return self.fail(loc, "Panic expects 1 argument", error.WrongArity);
                 const v = self.pop();
-                defer v.releaseVM(self.allocator);
-                var buf = std.ArrayList(u8).empty;
-                defer buf.deinit(self.allocator);
-                v.format(&buf, self.allocator, false) catch {};
-                // 拷进 err_msg（VM panic 报告读取）；用 allocator 持有（与 fail 一致，进程退出不回收）。
-                const msg = self.allocator.dupe(u8, buf.items) catch "panic";
+                defer v.release(self.allocator);
+                const msg = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
+                defer self.allocator.free(msg);
                 return self.fail(loc, msg, error.Unsupported);
             },
             // M5d：eprintln/eprint —— 写 stderr（镜像 eval builtinEprintln/builtinEprint）。
             .eprintln, .eprint => {
                 if (argc != 1) return self.fail(loc, "eprintln/eprint expects 1 argument", error.WrongArity);
                 const v = self.pop();
-                defer v.releaseVM(self.allocator);
+                defer v.release(self.allocator);
+                const formatted = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
+                defer self.allocator.free(formatted);
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.allocator);
-                v.format(&buf, self.allocator, false) catch return error.OutOfMemory;
+                buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
                 if (nat == .eprintln) buf.append(self.allocator, '\n') catch {};
                 if (self.io) |io| {
                     var err_buf: [4096]u8 = undefined;
@@ -1492,7 +1671,7 @@ pub const VM = struct {
                 } else {
                     std.debug.print("{s}", .{buf.items});
                 }
-                try self.push(Value.unit);
+                try self.push(Value.fromUnit());
             },
             // M5d：scan() —— 读下一个空白分隔 token（跨行），EOF 返回 null（镜像 eval builtinScan）。
             .scan => {
@@ -1519,11 +1698,11 @@ pub const VM = struct {
                     while (end < remaining.len and remaining[end] != ' ' and remaining[end] != '\t' and remaining[end] != '\r') end += 1;
                     const token = remaining[start..end];
                     self.scan_line_pos += end;
-                    return Value{ .string = self.allocator.dupe(u8, token) catch return error.OutOfMemory };
+                    return try Value.fromString(self.allocator, try self.allocator.dupe(u8, token));
                 }
             }
             const has_line = try self.readNextLine(loc);
-            if (!has_line) return Value.null_val;
+            if (!has_line) return Value.fromNull();
         }
     }
 
@@ -1533,13 +1712,13 @@ pub const VM = struct {
             const remaining = self.scan_line_buf.items[self.scan_line_pos..];
             const owned = self.allocator.dupe(u8, remaining) catch return error.OutOfMemory;
             self.scan_line_pos = self.scan_line_buf.items.len;
-            return Value{ .string = owned };
+            return try Value.fromString(self.allocator, owned);
         }
         const has_line = try self.readNextLine(loc);
-        if (!has_line) return Value.null_val;
+        if (!has_line) return Value.fromNull();
         const owned = self.allocator.dupe(u8, self.scan_line_buf.items) catch return error.OutOfMemory;
         self.scan_line_pos = self.scan_line_buf.items.len;
-        return Value{ .string = owned };
+        return try Value.fromString(self.allocator, owned);
     }
 
     /// M5d：读 stdin 一行到 scan_line_buf（去尾部 CR），EOF 返回 false（镜像 eval readNextLine）。
@@ -1585,8 +1764,8 @@ pub const VM = struct {
             // M5c：字段隐式数值定型（如 salary: i32 把 i8 实参 100 协调成 i32）。best-effort，
             // 仅 int/float + builtin 数值类型名时协调；失败原样。数值是内联值，无 rc 影响。
             if (desc.field_types[i]) |tn| {
-                if (fv == .integer or fv == .float) {
-                    if (cast.castNumeric(fv, tn)) |coerced| {
+                if (fv.isInteger() or fv.isFloat()) {
+                    if (cast.castNumeric(self.allocator, fv, tn)) |coerced| {
                         fv = coerced;
                     } else |_| {}
                 }
@@ -1594,9 +1773,7 @@ pub const VM = struct {
             fields[i] = .{ .name = desc.field_names[i], .value = fv };
         }
         self.stack.shrinkRetainingCapacity(base);
-        const av = self.allocator.create(value.AdtValue) catch return error.OutOfMemory;
-        av.* = .{ .type_name = desc.type_name, .constructor = desc.ctor_name, .fields = fields, .rc = 1 };
-        try self.push(Value{ .adt = av });
+        try self.push(try Value.makeAdt(self.allocator, desc.type_name, desc.ctor_name, fields));
     }
 
     /// 执行 OP_INTERP：弹栈顶 n 段值（先压的是第一段），依次 format 拼接成新 string 压栈，各段 release。
@@ -1606,31 +1783,31 @@ pub const VM = struct {
         defer buf.deinit(self.allocator);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            self.stack.items[base + i].format(&buf, self.allocator, false) catch return error.OutOfMemory;
+            const formatted = self.stack.items[base + i].formatAlloc(self.allocator) catch return error.OutOfMemory;
+            defer self.allocator.free(formatted);
+            buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
         }
         // 拼接完成后再 release 各段（format 借用其内容，须在 format 后释放）。
         i = 0;
-        while (i < n) : (i += 1) self.stack.items[base + i].releaseVM(self.allocator);
+        while (i < n) : (i += 1) self.stack.items[base + i].release(self.allocator);
         self.stack.shrinkRetainingCapacity(base);
         const owned = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
-        try self.push(Value{ .string = owned });
+        try self.push(try Value.fromString(self.allocator, owned));
     }
 
     /// 执行 OP_CAST：弹值，按目标类型名转换，压结果。str→format；数值互转 cast.zig；溢出→panic。
     fn doCast(self: *VM, type_name: []const u8, loc: ast.SourceLocation) VMError!void {
         const v = self.pop();
-        defer v.releaseVM(self.allocator);
+        defer v.release(self.allocator);
         if (std.mem.eql(u8, type_name, "str")) {
-            var buf = std.ArrayList(u8).empty;
-            defer buf.deinit(self.allocator);
-            v.format(&buf, self.allocator, false) catch return error.OutOfMemory;
-            const owned = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
-            try self.push(Value{ .string = owned });
+            const owned = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
+            try self.push(try Value.fromString(self.allocator, owned));
             return;
         }
-        const result = cast.castNumeric(v, type_name) catch |e| switch (e) {
+        const result = cast.castNumeric(self.allocator, v, type_name) catch |e| switch (e) {
             error.CastOverflow => return self.fail(loc, "arithmetic overflow: narrowing conversion out of range", error.ArithmeticOverflow),
             error.CastTypeMismatch => return self.fail(loc, "invalid type conversion", error.TypeMismatch),
+            error.OutOfMemory => return error.OutOfMemory,
         };
         try self.push(result);
     }
@@ -1641,8 +1818,8 @@ pub const VM = struct {
     /// 注意：与 doCast 不同，不处理 str（隐式协调不做 to-string，保持值语义）。
     fn doCoerce(self: *VM, type_name: []const u8) void {
         const top = &self.stack.items[self.stack.items.len - 1];
-        if (top.* != .integer and top.* != .float) return; // 非数值：原样
-        const result = cast.castNumeric(top.*, type_name) catch return; // 溢出/不符：原样
+        if (!top.isInteger() and !top.isFloat()) return; // 非数值：原样
+        const result = cast.castNumeric(self.allocator, top.*, type_name) catch return; // 溢出/不符：原样
         // 数值是内联值类型（无 rc / 无分配），直接替换栈顶，无需 release 旧值。
         top.* = result;
     }
@@ -1650,9 +1827,11 @@ pub const VM = struct {
     /// 执行 OP_GET_FIELD：弹对象，按名读 adt/record 字段，retainOwned 压栈，release 对象。
     fn doGetField(self: *VM, field: []const u8, loc: ast.SourceLocation) VMError!void {
         const obj = self.pop();
-        defer obj.releaseVM(self.allocator);
-        switch (obj) {
-            .adt => |av| {
+        defer obj.release(self.allocator);
+        switch (obj.tag) {
+            .adt => {
+                const box = obj.asBoxed();
+                const av = &box.payload.adt;
                 for (av.fields) |f| {
                     if (f.name) |n| {
                         if (std.mem.eql(u8, n, field)) {
@@ -1663,7 +1842,9 @@ pub const VM = struct {
                 }
                 return self.fail(loc, "no such field on adt", error.TypeMismatch);
             },
-            .record => |rec| {
+            .record => {
+                const box = obj.asBoxed();
+                const rec = &box.payload.record;
                 if (rec.fields.get(field)) |v| {
                     try self.push(try self.retainOwned(v));
                     return;
@@ -1672,7 +1853,9 @@ pub const VM = struct {
             },
             // M5o：模块值（trait_value）字段访问 —— Store.Memory（子模块）/ Module.member。
             // vtable 查 field → retainOwned 压栈。镜像 eval accessField trait_value 分支（§4.6.2）。
-            .trait_value => |tv| {
+            .trait_value => {
+                const box = obj.asBoxed();
+                const tv = &box.payload.trait_value;
                 if (tv.methods.get(field)) |v| {
                     try self.push(try self.retainOwned(v));
                     return;
@@ -1688,19 +1871,20 @@ pub const VM = struct {
                 return self.fail(loc, "Error trait methods must be called as methods, use .message() or .type_name()", error.TypeMismatch);
             },
             // M4b：Channel 方向类型字段 —— ch.sender / ch.receiver（各 ref channel + 新包装）。
-            .channel_val => |cv| {
+            .channel_val => {
+                const cv_ptr = obj.asBoxed().payload.channel_val;
                 if (std.mem.eql(u8, field, "sender")) {
-                    cv.ref();
+                    cv_ptr.ref();
                     const sv = self.allocator.create(value.SenderValue) catch return error.OutOfMemory;
-                    sv.* = .{ .channel = cv };
-                    try self.push(Value{ .sender_val = sv });
+                    sv.* = .{ .channel = cv_ptr };
+                    try self.push(try Value.fromSender(self.allocator, sv));
                     return;
                 }
                 if (std.mem.eql(u8, field, "receiver")) {
-                    cv.ref();
+                    cv_ptr.ref();
                     const rv = self.allocator.create(value.ReceiverValue) catch return error.OutOfMemory;
-                    rv.* = .{ .channel = cv };
-                    try self.push(Value{ .receiver_val = rv });
+                    rv.* = .{ .channel = cv_ptr };
+                    try self.push(try Value.fromReceiver(self.allocator, rv));
                     return;
                 }
                 return self.fail(loc, "no such field on Channel (only 'sender'/'receiver')", error.TypeMismatch);
@@ -1714,36 +1898,38 @@ pub const VM = struct {
     /// 镜像 eval field_assignment 的 record 分支（cowField + map 覆盖）。
     fn doSetField(self: *VM, field: []const u8, loc: ast.SourceLocation) VMError!void {
         const val = self.pop(); // 接管 owned
-        const obj = self.pop();
-        if (obj != .record) {
-            val.releaseVM(self.allocator);
-            obj.releaseVM(self.allocator);
+        var obj = self.pop();
+        if (obj.tag != .record) {
+            val.release(self.allocator);
+            obj.release(self.allocator);
             return self.fail(loc, "cannot assign field on non-record", error.TypeMismatch);
         }
-        var rec = obj.record;
+        var obj_box = obj.asBoxed();
         // COW：共享（rc>1）时浅拷一份独占体，原体 rc-1。
-        if (rec.rc > 1) {
+        if (obj_box.rc > 1) {
+            const rec = &obj_box.payload.record;
             var new_map = std.StringHashMap(Value).init(self.allocator);
             var it = rec.fields.iterator();
             while (it.next()) |e| {
                 const key = self.allocator.dupe(u8, e.key_ptr.*) catch return error.OutOfMemory;
                 new_map.put(key, try self.retainOwned(e.value_ptr.*)) catch return error.OutOfMemory;
             }
-            rec.rc -= 1;
+            obj_box.rc -= 1;
             // type_name 是借用 slice（release 不释放它）；复用原 slice，不 dupe（dupe 会泄漏）。
-            const new_rec = value.Value.makeRecord(self.allocator, rec.type_name, new_map) catch return error.OutOfMemory;
-            rec = new_rec.record;
+            obj = value.Value.makeRecord(self.allocator, rec.type_name, new_map) catch return error.OutOfMemory;
+            obj_box = obj.asBoxed();
         }
         // 写字段：必须已存在（对齐 eval：不存在 → panic）。
+        const rec = &obj_box.payload.record;
         if (rec.fields.getPtr(field)) |existing| {
-            existing.*.releaseVM(self.allocator);
+            existing.*.release(self.allocator);
             existing.* = val; // owned move
         } else {
-            val.releaseVM(self.allocator);
-            (Value{ .record = rec }).releaseVM(self.allocator);
+            val.release(self.allocator);
+            obj.release(self.allocator);
             return self.fail(loc, "no such field on record", error.TypeMismatch);
         }
-        try self.push(Value{ .record = rec });
+        try self.push(obj);
     }
 
     /// array COW（rc>1 时浅拷分裂），写元素（旧值 release，val owned move 入槽），压结果 array。
@@ -1752,38 +1938,40 @@ pub const VM = struct {
     fn doSetIndex(self: *VM, loc: ast.SourceLocation) VMError!void {
         const val = self.pop(); // 接管 owned
         const index_val = self.pop();
-        defer index_val.releaseVM(self.allocator);
-        const obj = self.pop();
-        if (obj != .array) {
-            val.releaseVM(self.allocator);
-            obj.releaseVM(self.allocator);
+        defer index_val.release(self.allocator);
+        var obj = self.pop();
+        if (obj.tag != .array) {
+            val.release(self.allocator);
+            obj.release(self.allocator);
             return self.fail(loc, "cannot index-assign on non-array", error.TypeMismatch);
         }
-        if (index_val != .integer) {
-            val.releaseVM(self.allocator);
-            obj.releaseVM(self.allocator);
+        if (!index_val.isInteger()) {
+            val.release(self.allocator);
+            obj.release(self.allocator);
             return self.fail(loc, "array index must be an integer", error.TypeMismatch);
         }
-        const iv = index_val.integer;
+        const iv = index_val.asInt();
         const i: i128 = if (iv.type_tag.isSigned()) iv.signedValue() else @intCast(iv.value);
-        var arr = obj.array;
+        var obj_box = obj.asBoxed();
+        var arr = &obj_box.payload.array;
         if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
-            val.releaseVM(self.allocator);
-            obj.releaseVM(self.allocator);
+            val.release(self.allocator);
+            obj.release(self.allocator);
             return self.fail(loc, "index out of bounds", error.TypeMismatch);
         }
         // COW：共享（rc>1）时浅拷一份独占体，原体 rc-1。
-        if (arr.rc > 1) {
+        if (obj_box.rc > 1) {
             const new_elems = self.allocator.alloc(Value, arr.elements.len) catch return error.OutOfMemory;
             for (arr.elements, 0..) |e, k| new_elems[k] = self.retainOwned(e) catch return error.OutOfMemory;
-            arr.rc -= 1;
-            const new_arr = value.Value.makeArray(self.allocator, new_elems, arr.fixed_size) catch return error.OutOfMemory;
-            arr = new_arr.array;
+            obj_box.rc -= 1;
+            obj = value.Value.makeArray(self.allocator, new_elems, arr.fixed_size) catch return error.OutOfMemory;
+            obj_box = obj.asBoxed();
+            arr = &obj_box.payload.array;
         }
         const slot = &arr.elements[@intCast(i)];
-        slot.*.releaseVM(self.allocator);
+        slot.*.release(self.allocator);
         slot.* = val; // owned move
-        try self.push(Value{ .array = arr });
+        try self.push(obj);
     }
 
     /// 执行 OP_MAKE_RECORD：弹栈顶 n 个值（n=shape.field_names.len），建 RecordValue（key dupe，
@@ -1796,7 +1984,7 @@ pub const VM = struct {
             var it = map.iterator();
             while (it.next()) |e| {
                 self.allocator.free(e.key_ptr.*);
-                e.value_ptr.*.releaseVM(self.allocator);
+                e.value_ptr.*.release(self.allocator);
             }
             map.deinit();
         }
@@ -1808,7 +1996,7 @@ pub const VM = struct {
             const gop = map.getOrPut(key) catch return error.OutOfMemory;
             if (gop.found_existing) {
                 self.allocator.free(key);
-                gop.value_ptr.*.releaseVM(self.allocator);
+                gop.value_ptr.*.release(self.allocator);
             }
             gop.value_ptr.* = self.stack.items[base + i];
         }
@@ -1824,19 +2012,21 @@ pub const VM = struct {
         const n = shape.field_names.len;
         const ubase = self.stack.items.len - n;
         const base_val = self.stack.items[ubase - 1];
-        if (base_val != .record) return self.fail(loc, "record extend base must be a record", error.TypeMismatch);
+        if (base_val.tag != .record) return self.fail(loc, "record extend base must be a record", error.TypeMismatch);
 
         var map = std.StringHashMap(Value).init(self.allocator);
         errdefer {
             var it = map.iterator();
             while (it.next()) |e| {
                 self.allocator.free(e.key_ptr.*);
-                e.value_ptr.*.releaseVM(self.allocator);
+                e.value_ptr.*.release(self.allocator);
             }
             map.deinit();
         }
         // 浅拷 base 字段（retain value，dupe key）。
-        var bit = base_val.record.fields.iterator();
+        const base_box = base_val.asBoxed();
+        const base_rec = &base_box.payload.record;
+        var bit = base_rec.fields.iterator();
         while (bit.next()) |e| {
             const key = self.allocator.dupe(u8, e.key_ptr.*) catch return error.OutOfMemory;
             map.put(key, try self.retainOwned(e.value_ptr.*)) catch return error.OutOfMemory;
@@ -1848,31 +2038,35 @@ pub const VM = struct {
             const gop = map.getOrPut(key) catch return error.OutOfMemory;
             if (gop.found_existing) {
                 self.allocator.free(key);
-                gop.value_ptr.*.releaseVM(self.allocator); // 释放被覆盖的 base 字段拷贝
+                gop.value_ptr.*.release(self.allocator); // 释放被覆盖的 base 字段拷贝
             }
             gop.value_ptr.* = self.stack.items[ubase + i];
         }
         // 弹 n 个 update + base（base 用完 release）。
         self.stack.shrinkRetainingCapacity(ubase - 1);
-        base_val.releaseVM(self.allocator);
+        base_val.release(self.allocator);
         const rec = value.Value.makeRecord(self.allocator, "", map) catch return error.OutOfMemory;
         try self.push(rec);
     }
 
     /// 执行 OP_INDEX：array 整数索引（边界检查）、string codepoint 索引，retainOwned 元素压栈。
     fn doIndex(self: *VM, object: Value, index_val: Value, loc: ast.SourceLocation) VMError!void {
-        switch (object) {
-            .array => |arr| {
-                if (index_val != .integer) return self.fail(loc, "array index must be an integer", error.TypeMismatch);
-                const iv = index_val.integer;
+        switch (object.tag) {
+            .array => {
+                const box = object.asBoxed();
+                const arr = &box.payload.array;
+                if (!index_val.isInteger()) return self.fail(loc, "array index must be an integer", error.TypeMismatch);
+                const iv = index_val.asInt();
                 const i: i128 = if (iv.type_tag.isSigned()) iv.signedValue() else @intCast(iv.value);
                 if (i < 0 or i >= @as(i128, @intCast(arr.elements.len)))
                     return self.fail(loc, "index out of bounds", error.TypeMismatch);
                 try self.push(try self.retainOwned(arr.elements[@intCast(i)]));
             },
-            .string => |s| {
-                if (index_val != .integer) return self.fail(loc, "string index must be an integer", error.TypeMismatch);
-                const iv = index_val.integer;
+            .string => {
+                const box = object.asBoxed();
+                const s = box.payload.string;
+                if (!index_val.isInteger()) return self.fail(loc, "string index must be an integer", error.TypeMismatch);
+                const iv = index_val.asInt();
                 const i: i128 = if (iv.type_tag.isSigned()) iv.signedValue() else @intCast(iv.value);
                 if (i < 0) return self.fail(loc, "index out of bounds", error.TypeMismatch);
                 const view = std.unicode.Utf8View.init(s) catch return self.fail(loc, "invalid UTF-8 string", error.TypeMismatch);
@@ -1880,7 +2074,7 @@ pub const VM = struct {
                 var ci: i128 = 0;
                 while (iter.nextCodepoint()) |cp| : (ci += 1) {
                     if (ci == i) {
-                        try self.push(Value{ .char_val = @intCast(cp) });
+                        try self.push(Value.fromChar(cp));
                         return;
                     }
                 }
@@ -1893,7 +2087,8 @@ pub const VM = struct {
     /// M3d：执行 OP_CALL_METHOD。栈布局 [receiver, arg0..arg_{argc-1}]，receiver 在 args 下方。
     /// 弹实参 + receiver（均 owned，方法分派后 releaseVM），压 fresh owned 结果。
     fn doCallMethod(self: *VM, func: *const Function, name_idx: u16, argc: u8, loc: ast.SourceLocation) VMError!void {
-        const name = func.chunk.constants.items[name_idx].string;
+        const name_val = func.chunk.constants.items[name_idx];
+        const name = name_val.asBoxed().payload.string;
         const args_start = self.stack.items.len - argc;
         const args = self.stack.items[args_start..][0..argc];
         const receiver = self.stack.items[args_start - 1];
@@ -1902,15 +2097,17 @@ pub const VM = struct {
         // 这些方法直接从 error_val 或 throw_val.err 中提取字段值
         if (std.mem.eql(u8, name, "message") or std.mem.eql(u8, name, "type_name")) {
             if (argc != 0) return self.fail(loc, "Error trait method expects 0 arguments", error.WrongArity);
-            const result = switch (receiver) {
-                .error_val => |e| blk: {
+            const result = switch (receiver.tag) {
+                .error_val => blk: {
+                    const e = &receiver.asBoxed().payload.error_val;
                     const field_value = if (std.mem.eql(u8, name, "message")) e.message else e.type_name;
-                    break :blk Value{ .string = try self.allocator.dupe(u8, field_value) };
+                    break :blk try Value.fromString(self.allocator, try self.allocator.dupe(u8, field_value));
                 },
-                .throw_val => |tv| blk: {
+                .throw_val => blk: {
+                    const tv = &receiver.asBoxed().payload.throw_val;
                     if (tv.* == .err) {
                         const field_value = if (std.mem.eql(u8, name, "message")) tv.err.message else tv.err.type_name;
-                        break :blk Value{ .string = try self.allocator.dupe(u8, field_value) };
+                        break :blk try Value.fromString(self.allocator, try self.allocator.dupe(u8, field_value));
                     } else {
                         return self.fail(loc, "cannot call Error method on Ok value", error.TypeMismatch);
                     }
@@ -1918,7 +2115,7 @@ pub const VM = struct {
                 else => null,
             };
             if (result) |r| {
-                receiver.releaseVM(self.allocator);
+                receiver.release(self.allocator);
                 self.stack.shrinkRetainingCapacity(args_start - 1);
                 try self.push(r);
                 return;
@@ -1926,12 +2123,16 @@ pub const VM = struct {
         }
 
         // M4c：spawn_val 的 await/cancel 需 VM 级处理（等待 + 结果跨线程深拷回父 allocator）。
-        if (receiver == .spawn_val) {
-            return self.doSpawnMethod(receiver.spawn_val, name, args, args_start, loc);
+        if (receiver.tag == .spawn_val) {
+            const spawn_box = receiver.asBoxed();
+            return self.doSpawnMethod(spawn_box.payload.spawn_val, name, args, args_start, loc);
         }
         // M4d：inline trait 值方法分派 —— vtable 查 name 得 vm_closure，以 args 调用（无 data receiver）。
-        if (receiver == .trait_value and receiver.trait_value.vm_owned) {
-            return self.doTraitMethod(receiver.trait_value, name, argc, args_start, loc);
+        if (receiver.tag == .trait_value) {
+            const trait_box = receiver.asBoxed();
+            if (trait_box.payload.trait_value.vm_owned) {
+                return self.doTraitMethod(&trait_box.payload.trait_value, name, argc, args_start, loc);
+            }
         }
         // M5i：用户 impl 方法分派 —— 据 receiver 类型名 + 方法名查 program.impl_methods（数值宽度互通），
         // 命中则把 [receiver, args...] 作为方法 slot 跑方法体。未命中查 trait 默认方法；再未命中走 native。
@@ -1957,8 +2158,8 @@ pub const VM = struct {
             error.OutOfMemory => return error.OutOfMemory,
         };
         // 释放实参 + receiver（分派已 retainOwned 需要的元素到结果）。
-        for (args) |a| a.releaseVM(self.allocator);
-        receiver.releaseVM(self.allocator);
+        for (args) |a| a.release(self.allocator);
+        receiver.release(self.allocator);
         self.stack.shrinkRetainingCapacity(args_start - 1);
         try self.push(result);
     }
@@ -1974,7 +2175,7 @@ pub const VM = struct {
         // receiver+args 已在栈顶 total_args 个槽（起于 args_start-1），正好作 slot 0..arity-1。
         const slot_base = args_start - 1;
         var s: u16 = f.arity;
-        while (s < f.slot_count) : (s += 1) try self.push(Value.unit);
+        while (s < f.slot_count) : (s += 1) try self.push(Value.fromUnit());
         const saved_depth = self.stop_depth;
         try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = slot_base, .frame_base = slot_base });
         self.stop_depth = self.frames.items.len - 1; // 方法帧弹出即停
@@ -2007,12 +2208,9 @@ pub const VM = struct {
                 return self.fail(loc, msg, error.SpawnFailed);
             }
             // 跨线程深拷结果进父 allocator（子结果在 arena，独立于父 refcount 堆）。
-            const owned = if (child_result) |r| (r.deepCopyAcross(self.allocator) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return self.fail(loc, "spawn: result type not supported across threads", error.TypeMismatch),
-            }) else Value.unit;
-            for (args) |a| a.releaseVM(self.allocator);
-            receiver.releaseVM(self.allocator);
+            const owned = if (child_result) |r| (try self.retainOwned(r)) else Value.fromUnit();
+            for (args) |a| a.release(self.allocator);
+            receiver.release(self.allocator);
             self.stack.shrinkRetainingCapacity(args_start - 1);
             try self.push(owned);
             return;
@@ -2024,10 +2222,10 @@ pub const VM = struct {
             handle.consumed.store(true, .seq_cst);
             handle.condition.broadcast();
             handle.mutex.unlock();
-            for (args) |a| a.releaseVM(self.allocator);
-            receiver.releaseVM(self.allocator);
+            for (args) |a| a.release(self.allocator);
+            receiver.release(self.allocator);
             self.stack.shrinkRetainingCapacity(args_start - 1);
-            try self.push(Value.unit);
+            try self.push(Value.fromUnit());
             return;
         }
         // M5：status() —— 返回 SpawnStatus ADT 值（无字段构造器），镜像 eval makeSpawnStatus。
@@ -2041,12 +2239,11 @@ pub const VM = struct {
                 .Cancelled => "Cancelled",
                 .Failed => "Failed",
             };
-            const av = self.allocator.create(value.AdtValue) catch return error.OutOfMemory;
-            av.* = .{ .type_name = "SpawnStatus", .constructor = ctor, .fields = &[_]value.AdtField{}, .rc = 1 };
-            for (args) |a| a.releaseVM(self.allocator);
-            receiver.releaseVM(self.allocator);
+            const result = try Value.makeAdt(self.allocator, "SpawnStatus", ctor, &[_]value.AdtField{});
+            for (args) |a| a.release(self.allocator);
+            receiver.release(self.allocator);
             self.stack.shrinkRetainingCapacity(args_start - 1);
-            try self.push(Value{ .adt = av });
+            try self.push(result);
             return;
         }
         return self.fail(loc, "no such method on Spawn", error.TypeMismatch);
@@ -2058,14 +2255,14 @@ pub const VM = struct {
     fn doTraitMethod(self: *VM, tv: *value.TraitValue, name: []const u8, argc: u8, args_start: usize, loc: ast.SourceLocation) VMError!void {
         const impl = tv.methods.get(name) orelse
             return self.fail(loc, "no such method on trait value", error.TypeMismatch);
-        if (impl != .vm_closure) return self.fail(loc, "trait method is not callable", error.TypeMismatch);
+        if (impl.tag != .vm_closure) return self.fail(loc, "trait method is not callable", error.TypeMismatch);
         const callee_idx = args_start - 1;
         const receiver = self.stack.items[callee_idx];
         // 替换 receiver 槽为方法闭包（retainOwned：vtable 持母本，调用结束帧 release 此槽）。
         self.stack.items[callee_idx] = try self.retainOwned(impl);
-        receiver.releaseVM(self.allocator); // 释放 trait_value receiver（rc-1）
+        receiver.release(self.allocator); // 释放 trait_value receiver（rc-1）
         // 边界嵌套运行：enterClosure 建帧，runLoop 在帧弹回当前深度即返回。
-        const vc = impl.vm_closure;
+        const vc = &impl.asBoxed().payload.vm_closure;
         const total = vc.bound_args.len + argc;
         if (total != vc.arity) return self.fail(loc, "trait method called with wrong number of arguments", error.WrongArity);
         const saved_depth = self.stop_depth;
@@ -2084,12 +2281,12 @@ pub const VM = struct {
     /// mul/div/mod 走 CAS 循环），不重写 slot；否则常规 slot_val arith rhs 写回 slot。
     fn doCompoundLocal(self: *VM, frame: *CallFrame, slot: u16, arith_op: OpCode, loc: ast.SourceLocation) VMError!void {
         const rhs = self.pop();
-        defer rhs.releaseVM(self.allocator);
+        defer rhs.release(self.allocator);
         const dst = frame.slot_base + slot;
         const cur = self.stack.items[dst];
-        const target = if (cur == .cell_val) cur.cell_val.inner else cur;
-        if (target == .atomic_val) {
-            const av = target.atomic_val;
+        const target = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
+        if (target.tag == .atomic_val) {
+            const av = target.asBoxed().payload.atomic_val;
             const operand = value.valueToAtomicRaw(rhs, av.type_tag);
             switch (arith_op) {
                 .op_add => _ = av.fetchAdd(operand),
@@ -2101,7 +2298,7 @@ pub const VM = struct {
                     // CAS 循环：原子读改写（div/mod 无专用原子指令）。
                     while (true) {
                         const current = av.data.load(.seq_cst);
-                        const cur_val = av.load();
+                        const cur_val = try av.load(self.allocator);
                         const result = try self.arith(arith_op, cur_val, rhs, loc);
                         const new_raw = value.valueToAtomicRaw(result, av.type_tag);
                         if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst) == null) break;
@@ -2113,11 +2310,12 @@ pub const VM = struct {
         }
         // 非 atomic：常规读改写。
         const result = try self.arith(arith_op, target, rhs, loc);
-        if (cur == .cell_val) {
-            cur.cell_val.inner.releaseVM(self.allocator);
-            cur.cell_val.inner = result;
+        if (cur.tag == .cell_val) {
+            const cell = &cur.asBoxed().payload.cell_val;
+            cell.inner.release(self.allocator);
+            cell.inner = result;
         } else {
-            cur.releaseVM(self.allocator);
+            cur.release(self.allocator);
             self.stack.items[dst] = result;
         }
     }
@@ -2126,11 +2324,13 @@ pub const VM = struct {
     /// 否则常规 inner arith rhs 写回 inner。镜像 doCompoundLocal 的 cell 分支，作用于捕获变量。
     fn doCompoundUpvalue(self: *VM, frame: *CallFrame, idx: u16, arith_op: OpCode, loc: ast.SourceLocation) VMError!void {
         const rhs = self.pop();
-        defer rhs.releaseVM(self.allocator);
-        const cell = frame.upvalues[idx].cell_val;
+        defer rhs.release(self.allocator);
+        const upval = frame.upvalues[idx];
+        if (upval.tag != .cell_val) return self.fail(loc, "upvalue is not a cell", error.TypeMismatch);
+        const cell = &upval.asBoxed().payload.cell_val;
         const target = cell.inner;
-        if (target == .atomic_val) {
-            const av = target.atomic_val;
+        if (target.tag == .atomic_val) {
+            const av = target.asBoxed().payload.atomic_val;
             const operand = value.valueToAtomicRaw(rhs, av.type_tag);
             switch (arith_op) {
                 .op_add => _ = av.fetchAdd(operand),
@@ -2141,7 +2341,7 @@ pub const VM = struct {
                 .op_div, .op_mod => {
                     while (true) {
                         const current = av.data.load(.seq_cst);
-                        const cur_val = av.load();
+                        const cur_val = try av.load(self.allocator);
                         const result = try self.arith(arith_op, cur_val, rhs, loc);
                         const new_raw = value.valueToAtomicRaw(result, av.type_tag);
                         if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst) == null) break;
@@ -2152,7 +2352,7 @@ pub const VM = struct {
             return; // atomic 就地更新，inner 不变
         }
         const result = try self.arith(arith_op, target, rhs, loc);
-        cell.inner.releaseVM(self.allocator);
+        cell.inner.release(self.allocator);
         cell.inner = result;
     }
 
@@ -2161,9 +2361,9 @@ pub const VM = struct {
     /// 失败时仍压 handle（status=Failed，await 传播 panic），保证线性 Spawn<T> 语义不破。
     fn doSpawn(self: *VM, loc: ast.SourceLocation) VMError!void {
         const callee = self.pop();
-        defer callee.releaseVM(self.allocator);
-        if (callee != .vm_closure) return self.fail(loc, "spawn body must be a closure", error.TypeMismatch);
-        const vc = callee.vm_closure;
+        defer callee.release(self.allocator);
+        if (callee.tag != .vm_closure) return self.fail(loc, "spawn body must be a closure", error.TypeMismatch);
+        const vc = &callee.asBoxed().payload.vm_closure;
         // io 仅用于填充 handle（VM await 路径用 std.Thread.Futex，不依赖 io）；未设则用线程化默认。
         const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
 
@@ -2177,12 +2377,30 @@ pub const VM = struct {
         const aalloc = arena.allocator();
 
         // 深拷捕获快照：upvalue 是 *Cell，取 inner 当前值跨线程深拷进 arena。
+        // 特殊情况：atomic_val/channel_val 等并发原语需要共享引用，BoxedValue 用父 allocator。
         const caps = aalloc.alloc(Value, vc.upvalues.len) catch return error.OutOfMemory;
         for (vc.upvalues, 0..) |uv, i| {
-            const inner = uv.cell_val.inner;
-            caps[i] = inner.deepCopyAcross(aalloc) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return self.fail(loc, "spawn: captured value type not supported across threads", error.TypeMismatch),
+            if (uv.tag != .cell_val) return self.fail(loc, "upvalue is not a cell", error.TypeMismatch);
+            const cell = &uv.asBoxed().payload.cell_val;
+            const inner = cell.inner;
+            // 跨线程处理
+            caps[i] = switch (inner.tag) {
+                .atomic_val => blk: {
+                    // atomic_val：创建新 BoxedValue（用父 allocator，因为需要在 arena.deinit 后仍可访问），
+                    // 共享 AtomicValue
+                    const old_box = inner.asBoxed();
+                    const av = old_box.payload.atomic_val;
+                    av.ref(); // 增加 AtomicValue 引用计数
+                    const new_box = try self.allocator.create(value.BoxedValue);
+                    new_box.* = .{
+                        .tag = .atomic_val,
+                        .rc = 1,
+                        .payload = .{ .atomic_val = av },
+                    };
+                    break :blk Value{ .tag = .atomic_val, .payload = @intFromPtr(new_box) };
+                },
+                .channel_val, .sender_val, .receiver_val => inner.retain(), // TODO: 可能也需要类似处理
+                else => try inner.retainOwned(aalloc),
             };
         }
 
@@ -2205,10 +2423,28 @@ pub const VM = struct {
         // 起 OS 线程（真并行；channel 阻塞点走 futex 回退）。
         ctx.thread = std.Thread.spawn(.{}, spawnThreadEntry, .{ctx}) catch {
             spawnFail(handle, "spawn: failed to create thread");
-            try self.push(Value{ .spawn_val = handle });
+            const box = self.allocator.create(value.BoxedValue) catch return error.OutOfMemory;
+            box.* = .{
+                .tag = .spawn_val,
+                .rc = 1,
+                .payload = .{ .spawn_val = handle },
+            };
+            try self.push(Value{
+                .tag = .spawn_val,
+                .payload = @intFromPtr(box),
+            });
             return;
         };
-        try self.push(Value{ .spawn_val = handle });
+        const box = self.allocator.create(value.BoxedValue) catch return error.OutOfMemory;
+        box.* = .{
+            .tag = .spawn_val,
+            .rc = 1,
+            .payload = .{ .spawn_val = handle },
+        };
+        try self.push(Value{
+            .tag = .spawn_val,
+            .payload = @intFromPtr(box),
+        });
     }
 
     /// M3d：执行 OP_FOR_NEXT。iter_slot 持 array/range/string，idx_slot 持索引（i64）。
@@ -2217,34 +2453,37 @@ pub const VM = struct {
         const iter_raw = self.stack.items[frame.slot_base + iter_slot];
         const idx_raw = self.stack.items[frame.slot_base + idx_slot];
         // 闭包捕获可能把 iter/idx slot 就地 box 成 *Cell（如循环体内 spawn 捕获循环变量）；透明解包。
-        const iter = if (iter_raw == .cell_val) iter_raw.cell_val.inner else iter_raw;
-        const idx_v = if (idx_raw == .cell_val) idx_raw.cell_val.inner else idx_raw;
-        const idx: i64 = @intCast(idx_v.integer.value);
-        switch (iter) {
-            .array => |arr| {
+        const iter = if (iter_raw.tag == .cell_val) iter_raw.asBoxed().payload.cell_val.inner else iter_raw;
+        const idx_v = if (idx_raw.tag == .cell_val) idx_raw.asBoxed().payload.cell_val.inner else idx_raw;
+        const idx: i64 = @intCast(idx_v.asInt().value);
+        switch (iter.tag) {
+            .array => {
+                const arr = &iter.asBoxed().payload.array;
                 if (idx >= arr.elements.len) {
                     frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + exit_off);
                     return;
                 }
                 try self.push(try self.retainOwned(arr.elements[@intCast(idx)]));
             },
-            .range => |r| {
+            .range => {
+                const r = &iter.asBoxed().payload.range;
                 const cur = r.start + idx;
                 const past = if (r.inclusive) cur > r.end else cur >= r.end;
                 if (past) {
                     frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + exit_off);
                     return;
                 }
-                try self.push(Value{ .integer = .{ .value = @bitCast(@as(i128, cur)), .type_tag = .i64 } });
+                try self.push(try Value.fromInt(self.allocator, .{ .value = @bitCast(@as(i128, cur)), .type_tag = .i64 }));
             },
-            .string => |s| {
+            .string => {
+                const s = iter.asBoxed().payload.string;
                 // 按码点迭代：idx 是码点序号，线性扫描到第 idx 个（字符串迭代通常短）。
                 const view = std.unicode.Utf8View.init(s) catch return self.fail(loc, "invalid UTF-8 string", error.TypeMismatch);
                 var it = view.iterator();
                 var ci: i64 = 0;
                 while (it.nextCodepoint()) |cp| : (ci += 1) {
                     if (ci == idx) {
-                        try self.push(Value{ .char_val = @intCast(cp) });
+                        try self.push(Value.fromChar(cp));
                         break;
                     }
                 } else {
@@ -2255,9 +2494,9 @@ pub const VM = struct {
             else => return self.fail(loc, "for: value is not iterable", error.TypeMismatch),
         }
         // idx++（仅在未耗尽时到达此处）。若 idx slot 被 box 成 cell，写 cell.inner。
-        const new_idx = Value{ .integer = .{ .value = @intCast(idx + 1), .type_tag = .i64 } };
-        if (idx_raw == .cell_val) {
-            idx_raw.cell_val.inner = new_idx; // inner 是 i64 内联值，无需 release
+        const new_idx = try Value.fromInt(self.allocator, .{ .value = @intCast(idx + 1), .type_tag = .i64 });
+        if (idx_raw.tag == .cell_val) {
+            idx_raw.asBoxed().payload.cell_val.inner = new_idx; // inner 是 i64 内联值，无需 release
         } else {
             self.stack.items[frame.slot_base + idx_slot] = new_idx;
         }
@@ -2268,8 +2507,9 @@ pub const VM = struct {
     fn doCallValue(self: *VM, argc: u8, loc: ast.SourceLocation) VMError!void {
         const callee_idx = self.stack.items.len - argc - 1;
         const callee = self.stack.items[callee_idx];
-        if (callee != .vm_closure) return self.fail(loc, "value is not callable", error.TypeMismatch);
-        const vc = callee.vm_closure;
+        if (callee.tag != .vm_closure) return self.fail(loc, "value is not callable", error.TypeMismatch);
+        const vc_box = callee.asBoxed();
+        const vc = &vc_box.payload.vm_closure;
         const total = vc.bound_args.len + argc;
         if (total == vc.arity) {
             try self.enterClosure(vc, callee_idx, argc, loc);
@@ -2292,7 +2532,7 @@ pub const VM = struct {
             // 当前栈：[callee, new0..new_{argc-1}]。目标：[callee, bound0..,new0..]。
             // 先把 new_args 整体后移 nbound 格，再填 bound。
             var k: usize = 0;
-            while (k < nbound) : (k += 1) try self.push(Value.unit); // 扩容 nbound 格
+            while (k < nbound) : (k += 1) try self.push(Value.fromUnit()); // 扩容 nbound 格
             const args_start = callee_idx + 1;
             // new_args 原占 [args_start, args_start+argc)，后移到 [args_start+nbound, ...)
             var i: usize = argc;
@@ -2307,7 +2547,7 @@ pub const VM = struct {
         }
         const slot_base = callee_idx + 1;
         var s: u16 = vc.arity;
-        while (s < func.slot_count) : (s += 1) try self.push(Value.unit);
+        while (s < func.slot_count) : (s += 1) try self.push(Value.fromUnit());
         try self.frames.append(self.allocator, .{ .func = func, .ip = 0, .slot_base = slot_base, .frame_base = callee_idx, .upvalues = vc.upvalues });
     }
 
@@ -2323,73 +2563,79 @@ pub const VM = struct {
         // 新闭包共享 func + upvalues（retainOwned upvalues）。M1b-1 upvalues 恒空。
         const new_uv: []Value = if (vc.upvalues.len > 0) try self.allocator.alloc(Value, vc.upvalues.len) else &.{};
         for (vc.upvalues, 0..) |uv, j| new_uv[j] = try self.retainOwned(uv);
-        const nvc = try self.allocator.create(value.VmClosure);
-        nvc.* = .{ .func = vc.func, .arity = vc.arity, .upvalues = new_uv, .bound_args = new_bound, .rc = 1, .allocator = self.allocator };
         // 弹掉 [callee, args..]（callee release，args 所有权已转入 new_bound 不 release），压入新闭包。
-        self.stack.items[callee_idx].releaseVM(self.allocator);
+        self.stack.items[callee_idx].release(self.allocator);
         self.stack.shrinkRetainingCapacity(callee_idx);
-        try self.push(Value{ .vm_closure = nvc });
+        try self.push(try Value.makeVmClosure(self.allocator, vc.func, vc.arity, new_uv, new_bound));
     }
 
     /// 算术 + 位运算。语义镜像 eval.zig evalAdd/Sub/...（复用 value.zig promote/inRange）。
     fn arith(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
-        if (left == .integer and right == .integer) {
-            const lt = left.integer.type_tag;
-            const rt = right.integer.type_tag;
+        if (left.isInteger() and right.isInteger()) {
+            const left_int = left.asInt();
+            const right_int = right.asInt();
+            const lt = left_int.type_tag;
+            const rt = right_int.type_tag;
             switch (op) {
                 .op_bit_and, .op_bit_or, .op_bit_xor => {
                     const result_type = lt; // 位运算保留 left 类型（与 evalBinary 一致）
                     const result: u128 = switch (op) {
-                        .op_bit_and => left.integer.value & right.integer.value,
-                        .op_bit_or => left.integer.value | right.integer.value,
-                        .op_bit_xor => left.integer.value ^ right.integer.value,
+                        .op_bit_and => left_int.value & right_int.value,
+                        .op_bit_or => left_int.value | right_int.value,
+                        .op_bit_xor => left_int.value ^ right_int.value,
                         else => unreachable,
                     };
                     if (!result_type.inRange(result)) return self.fail(loc, "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
-                    return Value{ .integer = .{ .value = result, .type_tag = result_type } };
+                    return try Value.fromInt(self.allocator, .{ .value = result, .type_tag = result_type });
                 },
                 else => {},
             }
             const result_type = value.promoteIntTypes(lt, rt);
             const signed = result_type.isSigned();
-            const lv: i128 = @bitCast(left.integer.value);
-            const rv: i128 = @bitCast(right.integer.value);
+            const lv: i128 = @bitCast(left_int.value);
+            const rv: i128 = @bitCast(right_int.value);
             const result: u128 = switch (op) {
-                .op_add => if (signed) @bitCast(lv +% rv) else left.integer.value +% right.integer.value,
-                .op_sub => if (signed) @bitCast(lv -% rv) else left.integer.value -% right.integer.value,
-                .op_mul => if (signed) @bitCast(lv *% rv) else left.integer.value *% right.integer.value,
+                .op_add => if (signed) @bitCast(lv +% rv) else left_int.value +% right_int.value,
+                .op_sub => if (signed) @bitCast(lv -% rv) else left_int.value -% right_int.value,
+                .op_mul => if (signed) @bitCast(lv *% rv) else left_int.value *% right_int.value,
                 .op_div => blk: {
-                    if (right.integer.value == 0) return self.fail(loc, "division by zero", error.DivisionByZero);
-                    break :blk if (signed) @bitCast(@divTrunc(lv, rv)) else left.integer.value / right.integer.value;
+                    if (right_int.value == 0) return self.fail(loc, "division by zero", error.DivisionByZero);
+                    break :blk if (signed) @bitCast(@divTrunc(lv, rv)) else left_int.value / right_int.value;
                 },
                 .op_mod => blk: {
-                    if (right.integer.value == 0) return self.fail(loc, "division by zero", error.DivisionByZero);
-                    break :blk if (signed) @bitCast(@rem(lv, rv)) else left.integer.value % right.integer.value;
+                    if (right_int.value == 0) return self.fail(loc, "division by zero", error.DivisionByZero);
+                    break :blk if (signed) @bitCast(@rem(lv, rv)) else left_int.value % right_int.value;
                 },
                 else => unreachable,
             };
             if (!result_type.inRange(result)) return self.fail(loc, "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
-            return Value{ .integer = .{ .value = result, .type_tag = result_type } };
+            return try Value.fromInt(self.allocator, .{ .value = result, .type_tag = result_type });
         }
         // M5：字符串拼接 s + t（镜像 eval.evalAdd 的 string+string 分支）。
-        if (op == .op_add and left == .string and right == .string) {
+        if (op == .op_add and left.tag == .string and right.tag == .string) {
+            const left_str = left.asBoxed().payload.string;
+            const right_str = right.asBoxed().payload.string;
             var result = std.ArrayList(u8).empty;
-            result.appendSlice(self.allocator, left.string) catch return error.OutOfMemory;
-            result.appendSlice(self.allocator, right.string) catch return error.OutOfMemory;
+            defer result.deinit(self.allocator);
+            result.appendSlice(self.allocator, left_str) catch return error.OutOfMemory;
+            result.appendSlice(self.allocator, right_str) catch return error.OutOfMemory;
             const owned = result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
-            return Value{ .string = owned };
+            return try Value.fromString(self.allocator, owned);
         }
         return self.arithFloat(op, left, right, loc);
     }
 
     /// 浮点参与的算术（int↔float 混合按 evalBinary 提升为 float）。
     fn arithFloat(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
-        if ((left == .float or left == .integer) and (right == .float or right == .integer)) {
-            const lf: f128 = if (left == .float) left.float.value else intToFloat(left.integer);
-            const rf: f128 = if (right == .float) right.float.value else intToFloat(right.integer);
-            const tag: value.FloatType = if (left == .float and right == .float)
-                value.promoteFloatTypes(left.float.type_tag, right.float.type_tag)
-            else if (left == .float) left.float.type_tag else right.float.type_tag;
+        if ((left.isFloat() or left.isInteger()) and (right.isFloat() or right.isInteger())) {
+            const lf: f128 = if (left.isFloat()) left.asFloatValue().value else intToFloat(left.asInt());
+            const rf: f128 = if (right.isFloat()) right.asFloatValue().value else intToFloat(right.asInt());
+            // 选择更大的浮点类型，如果都是浮点数；否则使用浮点数的类型
+            const tag: value.FloatType = if (left.isFloat() and right.isFloat()) blk: {
+                const lt = left.asFloatValue().type_tag;
+                const rt = right.asFloatValue().type_tag;
+                break :blk if (@intFromEnum(lt) > @intFromEnum(rt)) lt else rt;
+            } else if (left.isFloat()) left.asFloatValue().type_tag else right.asFloatValue().type_tag;
             const result: f128 = switch (op) {
                 .op_add => lf + rf,
                 .op_sub => lf - rf,
@@ -2399,7 +2645,7 @@ pub const VM = struct {
                 else => return self.fail(loc, "bitwise op requires integer operands", error.TypeMismatch),
             };
             if (!tag.inRange(result)) return self.fail(loc, "arithmetic overflow: floating-point operation out of range", error.ArithmeticOverflow);
-            return Value{ .float = .{ .value = result, .type_tag = tag } };
+            return try Value.fromFloatValue(self.allocator, .{ .value = result, .type_tag = tag });
         }
         return self.fail(loc, "arithmetic requires numeric operands", error.TypeMismatch);
     }
@@ -2414,45 +2660,67 @@ pub const VM = struct {
         // 关键：隐式定型（OP_COERCE）后操作数 tag 可能不同（如 i32 形参 vs i8 字面量），
         // 不能用 tag-strict 的 Value.equals，否则 `n == 0` 恒 false（M5 整数定型回归）。
         if (op == .op_eq or op == .op_neq) {
-            if (left == .integer and right == .integer) {
-                const rt = value.promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
-                const lv: i128 = if (rt.isSigned()) @bitCast(left.integer.value) else @intCast(left.integer.value);
-                const rv: i128 = if (rt.isSigned()) @bitCast(right.integer.value) else @intCast(right.integer.value);
+            if (left.isInteger() and right.isInteger()) {
+                const left_int = left.asInt();
+                const right_int = right.asInt();
+                const rt = value.promoteIntTypes(left_int.type_tag, right_int.type_tag);
+                const lv: i128 = if (rt.isSigned()) @bitCast(left_int.value) else @intCast(left_int.value);
+                const rv: i128 = if (rt.isSigned()) @bitCast(right_int.value) else @intCast(right_int.value);
                 const eq = lv == rv;
-                return Value{ .boolean = if (op == .op_eq) eq else !eq };
+                return Value.fromBool(eq);
             }
-            if (left == .float and right == .float) {
-                const eq = left.float.value == right.float.value;
-                return Value{ .boolean = if (op == .op_eq) eq else !eq };
+            if (left.isFloat() and right.isFloat()) {
+                const eq = left.asFloatValue().value == right.asFloatValue().value;
+                return Value.fromBool(eq);
             }
             const eq = left.equals(right);
-            return Value{ .boolean = if (op == .op_eq) eq else !eq };
+            return Value.fromBool(eq);
         }
-        if (left == .integer and right == .integer) {
-            const result_type = value.promoteIntTypes(left.integer.type_tag, right.integer.type_tag);
-            const lv: i128 = if (result_type.isSigned()) @bitCast(left.integer.value) else @intCast(left.integer.value);
-            const rv: i128 = if (result_type.isSigned()) @bitCast(right.integer.value) else @intCast(right.integer.value);
-            return Value{ .boolean = ordCmp(op, lv, rv) };
+        if (left.isInteger() and right.isInteger()) {
+            const left_int = left.asInt();
+            const right_int = right.asInt();
+            const result_type = value.promoteIntTypes(left_int.type_tag, right_int.type_tag);
+            const lv: i128 = if (result_type.isSigned()) @bitCast(left_int.value) else @intCast(left_int.value);
+            const rv: i128 = if (result_type.isSigned()) @bitCast(right_int.value) else @intCast(right_int.value);
+            const result = lv == rv;
+            return Value.fromBool(result);
         }
-        if ((left == .float or left == .integer) and (right == .float or right == .integer)) {
-            const lf: f128 = if (left == .float) left.float.value else intToFloat(left.integer);
-            const rf: f128 = if (right == .float) right.float.value else intToFloat(right.integer);
-            return Value{ .boolean = ordCmp(op, lf, rf) };
+        if ((left.isFloat() or left.isInteger()) and (right.isFloat() or right.isInteger())) {
+            const lf: f128 = if (left.isFloat()) left.asFloatValue().value else intToFloat(left.asInt());
+            const rf: f128 = if (right.isFloat()) right.asFloatValue().value else intToFloat(right.asInt());
+            const result = switch (op) {
+                .op_lt => lf < rf,
+                .op_gt => lf > rf,
+                .op_le => lf <= rf,
+                .op_ge => lf >= rf,
+                else => unreachable,
+            };
+            return Value.fromBool(result);
         }
         // M5：字符串字典序比较（镜像 eval evalLt/Gt/Le/Ge 的 string 分支，std.mem.order）。
-        if (left == .string and right == .string) {
-            const ord = std.mem.order(u8, left.string, right.string);
-            return Value{ .boolean = switch (op) {
+        if (left.tag == .string and right.tag == .string) {
+            const ord = std.mem.order(u8, left.asBoxed().payload.string, right.asBoxed().payload.string);
+            const result = switch (op) {
                 .op_lt => ord == .lt,
                 .op_gt => ord == .gt,
                 .op_le => ord != .gt,
                 .op_ge => ord != .lt,
                 else => unreachable,
-            } };
+            };
+            return Value.fromBool(result);
         }
         // M5e：char 序比较（镜像 eval evalLt/Gt/Le/Ge 的 char_val 分支）。
-        if (left == .char_val and right == .char_val) {
-            return Value{ .boolean = ordCmp(op, @as(u32, left.char_val), @as(u32, right.char_val)) };
+        if (left.tag == .char_val and right.tag == .char_val) {
+            const lc = left.asChar();
+            const rc = right.asChar();
+            const result = switch (op) {
+                .op_lt => lc < rc,
+                .op_gt => lc > rc,
+                .op_le => lc <= rc,
+                .op_ge => lc >= rc,
+                else => unreachable,
+            };
+            return Value.fromBool(result);
         }
         return self.fail(loc, "comparison requires numeric operands", error.TypeMismatch);
     }
@@ -2468,104 +2736,21 @@ pub const VM = struct {
     }
 
     fn negate(self: *VM, v: Value, loc: ast.SourceLocation) VMError!Value {
-        if (v == .integer) {
-            const t = v.integer.type_tag;
-            const neg: i128 = -@as(i128, @bitCast(v.integer.value));
+        if (v.isInteger()) {
+            const int_val = v.asInt();
+            const t = int_val.type_tag;
+            const neg: i128 = -@as(i128, @bitCast(int_val.value));
             const result: u128 = @bitCast(neg);
             if (!t.inRange(result)) return self.fail(loc, "arithmetic overflow: integer negation out of range", error.ArithmeticOverflow);
-            return Value{ .integer = .{ .value = result, .type_tag = t } };
+            return try Value.fromInt(self.allocator, .{ .value = result, .type_tag = t });
         }
-        if (v == .float) {
-            const t = v.float.type_tag;
-            const result: f128 = -v.float.value;
+        if (v.isFloat()) {
+            const float_val = v.asFloatValue();
+            const t = float_val.type_tag;
+            const result: f128 = -float_val.value;
             if (!t.inRange(result)) return self.fail(loc, "arithmetic overflow: floating-point negation out of range", error.ArithmeticOverflow);
-            return Value{ .float = .{ .value = result, .type_tag = t } };
+            return try Value.fromFloatValue(self.allocator, .{ .value = result, .type_tag = t });
         }
         return self.fail(loc, "'-' requires numeric operand", error.TypeMismatch);
     }
 };
-
-test "vm arithmetic: (2 + 3) * 4 = 20" {
-    const allocator = std.testing.allocator;
-    var chunk = Chunk.init(allocator);
-    // 所有权移交 runChunkForTest 的 Program，勿在此 deinit（避免 double-free）
-    const loc = ast.SourceLocation{ .line = 1, .column = 1 };
-    const k2 = try chunk.addConstant(Value{ .integer = .{ .value = 2, .type_tag = .i32 } });
-    const k3 = try chunk.addConstant(Value{ .integer = .{ .value = 3, .type_tag = .i32 } });
-    const k4 = try chunk.addConstant(Value{ .integer = .{ .value = 4, .type_tag = .i32 } });
-    try chunk.writeOp(.op_const, loc);
-    try chunk.writeU16(k2);
-    try chunk.writeOp(.op_const, loc);
-    try chunk.writeU16(k3);
-    try chunk.writeOp(.op_add, loc);
-    try chunk.writeOp(.op_const, loc);
-    try chunk.writeU16(k4);
-    try chunk.writeOp(.op_mul, loc);
-    try chunk.writeOp(.op_return, loc);
-
-    var vm = VM.init(allocator);
-    defer vm.deinit();
-    const result = try runChunkForTest(&vm, allocator, chunk, 0);
-    defer result.releaseVM(allocator);
-    try std.testing.expectEqual(@as(u128, 20), result.integer.value);
-}
-
-test "vm local variable: slot store + load" {
-    const allocator = std.testing.allocator;
-    var chunk = Chunk.init(allocator);
-    // 所有权移交 runChunkForTest 的 Program，勿在此 deinit（避免 double-free）
-    const loc = ast.SourceLocation{ .line = 1, .column = 1 };
-    // 局部槽 0 = 10；读 slot0 + 5 = 15
-    const k10 = try chunk.addConstant(Value{ .integer = .{ .value = 10, .type_tag = .i32 } });
-    const k5 = try chunk.addConstant(Value{ .integer = .{ .value = 5, .type_tag = .i32 } });
-    try chunk.writeOp(.op_const, loc);
-    try chunk.writeU16(k10);
-    try chunk.writeOp(.op_set_local, loc);
-    try chunk.writeU16(0);
-    try chunk.writeOp(.op_get_local, loc);
-    try chunk.writeU16(0);
-    try chunk.writeOp(.op_const, loc);
-    try chunk.writeU16(k5);
-    try chunk.writeOp(.op_add, loc);
-    try chunk.writeOp(.op_return, loc);
-
-    var vm = VM.init(allocator);
-    defer vm.deinit();
-    const result = try runChunkForTest(&vm, allocator, chunk, 1); // 1 个局部槽
-    defer result.releaseVM(allocator);
-    try std.testing.expectEqual(@as(u128, 15), result.integer.value);
-}
-
-test "vm jump: if false skips" {
-    const allocator = std.testing.allocator;
-    var chunk = Chunk.init(allocator);
-    // 所有权移交 runChunkForTest 的 Program，勿在此 deinit（避免 double-free）
-    const loc = ast.SourceLocation{ .line = 1, .column = 1 };
-    // push false; jump_if_false -> L; push 99 (skipped); L: pop cond; push 7; return
-    const k99 = try chunk.addConstant(Value{ .integer = .{ .value = 99, .type_tag = .i32 } });
-    const k7 = try chunk.addConstant(Value{ .integer = .{ .value = 7, .type_tag = .i32 } });
-    try chunk.writeOp(.op_false, loc);
-    const j = try chunk.emitJump(.op_jump_if_false, loc);
-    try chunk.writeOp(.op_const, loc); // 被跳过
-    try chunk.writeU16(k99);
-    chunk.patchJump(j);
-    try chunk.writeOp(.op_pop, loc); // 弹 cond(false)
-    try chunk.writeOp(.op_const, loc);
-    try chunk.writeU16(k7);
-    try chunk.writeOp(.op_return, loc);
-
-    var vm = VM.init(allocator);
-    defer vm.deinit();
-    const result = try runChunkForTest(&vm, allocator, chunk, 0);
-    defer result.releaseVM(allocator);
-    try std.testing.expectEqual(@as(u128, 7), result.integer.value);
-}
-
-/// 测试 helper：把一个裸 chunk 包成单函数 Program（arity=0, slot_count=N）并执行。
-/// 接管 chunk 所有权（放入 Program，由 Program.deinit 释放）。
-fn runChunkForTest(vm: *VM, allocator: std.mem.Allocator, chunk: Chunk, slot_count: u16) VMError!Value {
-    var program = Program.init(allocator);
-    defer program.deinit();
-    _ = try program.addFunction(.{ .chunk = chunk, .arity = 0, .slot_count = slot_count });
-    return vm.call(&program, 0, &.{});
-}

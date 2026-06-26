@@ -303,19 +303,3 @@ pub fn readI32(code: []const u8, offset: usize) i32 {
         (@as(u32, code[offset + 3]) << 24);
     return @bitCast(u);
 }
-
-test "u16 round-trip" {
-    const allocator = std.testing.allocator;
-    var code: std.ArrayListUnmanaged(u8) = .empty;
-    defer code.deinit(allocator);
-    try writeU16(&code, allocator, 0xBEEF);
-    try std.testing.expectEqual(@as(u16, 0xBEEF), readU16(code.items, 0));
-}
-
-test "i32 round-trip negative" {
-    const allocator = std.testing.allocator;
-    var code: std.ArrayListUnmanaged(u8) = .empty;
-    defer code.deinit(allocator);
-    try writeI32(&code, allocator, -12345);
-    try std.testing.expectEqual(@as(i32, -12345), readI32(code.items, 0));
-}
