@@ -1098,10 +1098,11 @@ pub const VM = struct {
                 .op_test_lit => {
                     const cidx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    _ = func.chunk.constants.items[cidx]; // pattern not used yet
+                    const pattern = func.chunk.constants.items[cidx];
                     const obj = self.pop();
                     defer obj.release(self.allocator);
-                    try self.push(Value.fromBool(false));
+                    const matches = obj.equals(pattern);
+                    try self.push(Value.fromBool(matches));
                 },
                 .op_record_extend => {
                     const shape_idx = opcode.readU16(code, frame.ip);
