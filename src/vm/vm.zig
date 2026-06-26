@@ -2678,14 +2678,17 @@ pub const VM = struct {
                 const lv: i128 = if (rt.isSigned()) @bitCast(left_int.value) else @intCast(left_int.value);
                 const rv: i128 = if (rt.isSigned()) @bitCast(right_int.value) else @intCast(right_int.value);
                 const eq = lv == rv;
-                return Value.fromBool(eq);
+                const result = if (op == .op_eq) eq else !eq;
+                return Value.fromBool(result);
             }
             if (left.isFloat() and right.isFloat()) {
                 const eq = left.asFloatValue().value == right.asFloatValue().value;
-                return Value.fromBool(eq);
+                const result = if (op == .op_eq) eq else !eq;
+                return Value.fromBool(result);
             }
             const eq = left.equals(right);
-            return Value.fromBool(eq);
+            const result = if (op == .op_eq) eq else !eq;
+            return Value.fromBool(result);
         }
         if (left.isInteger() and right.isInteger()) {
             const left_int = left.asInt();
