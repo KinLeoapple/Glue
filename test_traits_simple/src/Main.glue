@@ -1,0 +1,27 @@
+// 测试：trait 定义在前
+
+trait Greet {
+    fun greet_name(self): str
+}
+
+trait Sizeable {
+    fun size(self): i32
+}
+
+type Ordering: Greet, Sizeable = | Lt | Eq | Gt {
+    fun greet_name(self): str {
+        match self {
+            Lt => "less"
+            Eq => "equal"
+            Gt => "greater"
+        }
+    }
+
+    fun size(self): i32 { 1 }
+}
+
+fun main() {
+    val x = Lt
+    println(x.greet_name())
+    println(str(x.size()))
+}
