@@ -271,8 +271,11 @@ pub const ModuleCompiler = struct {
         const items = self.program.impl_methods.items;
         for (items, 0..) |a, i| {
             for (items[i + 1 ..]) |b| {
+                // 修复：检查应该包含 trait_name，只有三者都相同时才是真正的冲突
+                // 多个 trait 实现时，同一个方法会为每个 trait 注册一次（trait_name 不同）
                 if (std.mem.eql(u8, a.method_name, b.method_name) and
-                    std.mem.eql(u8, a.type_name, b.type_name))
+                    std.mem.eql(u8, a.type_name, b.type_name) and
+                    std.mem.eql(u8, a.trait_name, b.trait_name))
                 {
                     if (!self.methodResolvedByComposition(a.method_name)) return error.Unsupported;
                 }
