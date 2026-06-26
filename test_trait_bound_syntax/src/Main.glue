@@ -1,19 +1,15 @@
-// 测试新的 <T: Trait> 语法
+// 测试多个类型参数的 trait bound
 
 trait Show {
     fun show(self): str
 }
 
-fun display<T: Show>(x: T): str {
-    x.show()
-}
-
-type Box<T: Show> = Box(value: T) {
-    fun show_box(self): str {
-        "Box(" + self.value.show() + ")"
+type Pair<A: Show, B: Show> = Pair(first: A, second: B) {
+    fun show_pair(self): str {
+        "(" + self.first.show() + ", " + self.second.show() + ")"
     }
 }
 
 fun main() {
-    println("Trait bound syntax test")
+    println("Multi-param trait bound test")
 }

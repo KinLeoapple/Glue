@@ -1193,8 +1193,23 @@ pub const Parser = struct {
                 if (has_paren) {
                     _ = self.advance(); // 消耗 (
                 }
-                try self.parseTraitBoundListInner(&bounds);
+
+                // 解析第一个 trait
+                const trait_name_tok = try self.expect(.identifier, "expected trait name");
+                try bounds.append(self.allocator, ast.TraitBound{
+                    .trait_name = trait_name_tok.lexeme,
+                    .type_args = &[_]*ast.TypeNode{},
+                });
+
+                // 如果有括号，继续解析更多 trait
                 if (has_paren) {
+                    while (self.matchToken(.comma)) {
+                        const next_trait = try self.expect(.identifier, "expected trait name");
+                        try bounds.append(self.allocator, ast.TraitBound{
+                            .trait_name = next_trait.lexeme,
+                            .type_args = &[_]*ast.TypeNode{},
+                        });
+                    }
                     _ = self.expect(.r_paren, "expected ')' after trait list") catch {};
                 }
             } else {
