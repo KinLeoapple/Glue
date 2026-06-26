@@ -564,17 +564,19 @@ pub const VM = struct {
         }
         // M4d：VM 模式 lazy —— rc+1 共享 thunk/缓存（与 releaseVM 平衡）。eval 模式（vm_thunk==null）no-op。
         if (v.tag == .lazy_val) {
-            const lv = &v.asBoxed().payload.lazy_val;
+            const box = v.asBoxed();
+            const lv = &box.payload.lazy_val;
             if (lv.vm_thunk != null) {
-                lv.rc += 1;
+                box.rc += 1;
             }
             return v;
         }
         // M4d：VM 模式 trait 值 —— rc+1 共享 vtable（与 releaseVM 平衡）。eval 模式（vm_owned==false）no-op。
         if (v.tag == .trait_value) {
-            const tv = &v.asBoxed().payload.trait_value;
+            const box = v.asBoxed();
+            const tv = &box.payload.trait_value;
             if (tv.vm_owned) {
-                tv.rc += 1;
+                box.rc += 1;
             }
             return v;
         }
@@ -2083,6 +2085,7 @@ pub const VM = struct {
             else => return self.fail(loc, "cannot index into this type", error.TypeMismatch),
         }
     }
+    
 
     /// M3d：执行 OP_CALL_METHOD。栈布局 [receiver, arg0..arg_{argc-1}]，receiver 在 args 下方。
     /// 弹实参 + receiver（均 owned，方法分派后 releaseVM），压 fresh owned 结果。
@@ -2682,7 +2685,13 @@ pub const VM = struct {
             const result_type = value.promoteIntTypes(left_int.type_tag, right_int.type_tag);
             const lv: i128 = if (result_type.isSigned()) @bitCast(left_int.value) else @intCast(left_int.value);
             const rv: i128 = if (result_type.isSigned()) @bitCast(right_int.value) else @intCast(right_int.value);
-            const result = lv == rv;
+            const result = switch (op) {
+                .op_lt => lv < rv,
+                .op_gt => lv > rv,
+                .op_le => lv <= rv,
+                .op_ge => lv >= rv,
+                else => unreachable,
+            };
             return Value.fromBool(result);
         }
         if ((left.isFloat() or left.isInteger()) and (right.isFloat() or right.isInteger())) {
