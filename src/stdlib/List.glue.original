@@ -4,15 +4,19 @@
 // 经 @embedFile 内嵌进解释器二进制，`import List` 即可导入（零安装、与 cwd 无关）。
 //
 // 所有算子均为递归实现（已验证递归泛型 ADT + 高阶函数参数可用）。
-//
-// 简化版本：移除了条件实现语法 (with Show<T>)，保留所有核心功能。
 
 // Show trait 来自 Compare 模块；List 类型在本模块定义，故不违反 orphan 规则。
 import Compare
 
-// 简化版本：移除 : Show 和 with Show<T>
-// 如果需要 show 功能，用户可以手动实现或使用 str() 内建函数
-pub type List<T> = | Nil | Cons(T, List<T>)
+// 条件实现：元素满足 Show 时，List<T> 也满足 Show（参数化条件实现）。
+pub type List<T>: Show = | Nil | Cons(T, List<T>) with Show<T> {
+    fun show(self): str {
+        match self {
+            Nil => "[]"
+            Cons(h, t) => h.show() + " :: " + t.show()
+        }
+    }
+}
 
 // 链表长度。
 pub fun length<T>(l: List<T>): i64 {
@@ -117,11 +121,3 @@ fun from_array_at<T>(a: T[], i: i64): List<T> {
     }
 }
 
-// 辅助：将 List 转换为字符串（用于调试和打印）
-// 注意：这是一个独立函数，不是 Show trait 的实现
-pub fun list_to_string<T>(l: List<T>, show_fn: (T) -> str): str {
-    match l {
-        Nil => "[]"
-        Cons(h, t) => show_fn(h) + " :: " + list_to_string(t, show_fn)
-    }
-}
