@@ -133,6 +133,17 @@ pub const ModuleLoader = struct {
 
                 try self.loadModule(ud.module_path);
             }
+            // 处理 pack 声明：pub pack Memory 需要加载子模块
+            if (decl == .pack_decl) {
+                const pd = decl.pack_decl;
+                if (self.loaded_modules.contains(pd.name)) continue;
+
+                // 子模块路径相对于当前模块所在目录
+                var sub_path = [_][]const u8{pd.name};
+                self.loadModule(&sub_path) catch {
+                    // 子模块加载失败不致命，继续
+                };
+            }
         }
 
         // 类型检查
@@ -164,8 +175,62 @@ pub const ModuleLoader = struct {
             }
         }
 
-        // 文件系统加载：TODO - 需要实现跨平台的文件打开
-        // 当前暂时禁用，只支持 stdlib
+        // 文件系统加载（使用 std.Io.Dir API）
+        if (self.io) |io| {
+            if (self.current_source_dir) |source_dir| {
+                if (!std.mem.eql(u8, source_dir, STDLIB_DIR_MARKER)) {
+                    // 拼接基础路径：source_dir/component1/component2/...
+                    var file_path = std.ArrayList(u8).empty;
+                    defer file_path.deinit(self.allocator);
+                    try file_path.appendSlice(self.allocator, source_dir);
+                    for (module_path) |component| {
+                        try file_path.append(self.allocator, std.fs.path.sep);
+                        try file_path.appendSlice(self.allocator, component);
+                    }
+
+                    const cwd = std.Io.Dir.cwd();
+
+                    // 尝试扁平文件模块：base/path/module.glue
+                    const flat_path = try std.fmt.allocPrint(self.allocator, "{s}.glue", .{file_path.items});
+                    defer self.allocator.free(flat_path);
+
+                    // 尝试目录模块：base/path/module/pack.glue
+                    const pack_path = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}{c}pack.glue",
+                        .{ file_path.items, std.fs.path.sep },
+                    );
+                    defer self.allocator.free(pack_path);
+
+                    const flat_exists = if (cwd.access(io, flat_path, .{})) true else |_| false;
+                    const dir_exists = if (cwd.access(io, pack_path, .{})) true else |_| false;
+
+                    // 确定要加载的文件路径
+                    const resolved_path: ?[]const u8 = if (flat_exists)
+                        flat_path
+                    else if (dir_exists)
+                        pack_path
+                    else
+                        null;
+
+                    if (resolved_path) |path| {
+                        // 读取文件内容
+                        const source = cwd.readFileAlloc(io, path, self.allocator, .unlimited) catch {
+                            return error.FileNotFound;
+                        };
+                        try self.retained_sources.append(self.allocator, source);
+
+                        // 保存完整路径用于子模块解析
+                        const full_path = try self.allocator.dupe(u8, path);
+                        try self.retained_sources.append(self.allocator, full_path);
+
+                        // 解析并准备模块
+                        try self.parseAndPrepare(source, module_path[0], full_path);
+                        return;
+                    }
+                }
+            }
+        }
 
         // 回退到 stdlib 查找
         if (module_path.len == 1) {
@@ -245,6 +310,25 @@ pub const ModuleLoader = struct {
         out: *std.ArrayList(ast.Module),
         seen: *std.StringHashMap(void),
     ) !void {
+        // 设置当前模块的源目录（用于解析相对的 pack 子模块）
+        const saved_source_dir = self.current_source_dir;
+        var dir_changed = false;
+        if (module.source_path) |sp| {
+            if (std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep)) |idx| {
+                self.current_source_dir = try self.allocator.dupe(u8, sp[0..idx]);
+                dir_changed = true;
+            } else if (std.mem.lastIndexOfScalar(u8, sp, '/')) |idx| {
+                self.current_source_dir = try self.allocator.dupe(u8, sp[0..idx]);
+                dir_changed = true;
+            }
+        }
+        defer {
+            if (dir_changed) {
+                if (self.current_source_dir) |dir| self.allocator.free(dir);
+                self.current_source_dir = saved_source_dir;
+            }
+        }
+
         for (module.declarations) |decl| {
             if (decl == .import_decl) {
                 const ud = decl.import_decl;
@@ -263,6 +347,24 @@ pub const ModuleLoader = struct {
 
                 // 添加到输出列表
                 try out.append(self.allocator, dep_module);
+            }
+            // 处理 pack 声明：pub pack Memory 需要收集子模块
+            if (decl == .pack_decl) {
+                const pd = decl.pack_decl;
+                if (seen.contains(pd.name)) continue;
+
+                // 加载子模块（current_source_dir 已设为当前模块目录）
+                var sub_path = [_][]const u8{pd.name};
+                self.loadModule(&sub_path) catch continue;
+
+                const sub_module = self.loaded_modules.get(pd.name) orelse continue;
+                try seen.put(try self.allocator.dupe(u8, pd.name), {});
+
+                // 递归收集子模块的传递依赖
+                try self.collectDependencies(sub_module, out, seen);
+
+                // 添加到输出列表
+                try out.append(self.allocator, sub_module);
             }
         }
     }
