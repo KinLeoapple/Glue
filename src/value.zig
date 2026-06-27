@@ -857,7 +857,7 @@ pub const Value = struct {
     // 引用计数
     // ============================================================
 
-    pub fn retain(self: Value) Value {
+    pub inline fn retain(self: Value) Value {
         if (self.isBoxed()) {
             const box: *BoxedValue = @ptrFromInt(self.payload);
             box.rc += 1;
@@ -865,7 +865,7 @@ pub const Value = struct {
         return self;
     }
 
-    pub fn release(self: Value, allocator: std.mem.Allocator) void {
+    pub inline fn release(self: Value, allocator: std.mem.Allocator) void {
         if (self.isBoxed()) {
             const box: *BoxedValue = @ptrFromInt(self.payload);
             if (box.rc > 1) {

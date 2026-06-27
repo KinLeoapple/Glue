@@ -158,7 +158,7 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             return offset + 3;
         },
         // i32 跳转偏移：同时打印解码后的绝对目标，便于核对回填
-        .op_jump, .op_jump_if_false, .op_jump_if_true, .op_jump_if_not_null, .op_jump_if_null => {
+        .op_jump, .op_jump_if_false, .op_jump_if_true, .op_jump_if_false_pop, .op_jump_if_not_null, .op_jump_if_null => {
             const rel = opcode.readI32(code, offset + 1);
             const after = offset + 5;
             const target: i64 = @as(i64, @intCast(after)) + rel;

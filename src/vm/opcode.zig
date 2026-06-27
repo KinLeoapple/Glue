@@ -75,6 +75,10 @@ pub const OpCode = enum(u8) {
     op_jump_if_false,
     /// OP_JUMP_IF_TRUE <i32 off>：peek 栈顶，true 则跳转（不弹）
     op_jump_if_true,
+    /// OP_JUMP_IF_FALSE_POP <i32 off>（superinstruction）：合并 `op_jump_if_false + op_pop` ——
+    /// 弹栈顶 cond（release），false 则跳转。用于 if 语句（cond 总是消费，区别于 && 短路保留 cond）。
+    /// 省一次 dispatch + 一次 pop。由编译器在 emitIf/emitTail.if 显式发射。
+    op_jump_if_false_pop,
 
     // —— 栈操作 ——
     /// 弹栈顶并 release

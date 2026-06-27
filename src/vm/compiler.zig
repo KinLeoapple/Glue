@@ -1289,12 +1289,11 @@ const FnCompiler = struct {
             },
             .if_expr => |ie| {
                 try self.emitExpr(ie.condition);
-                const else_jump = try self.chunk.emitJump(.op_jump_if_false, loc);
-                try self.chunk.writeOp(.op_pop, loc); // then：弹 cond
+                // op_jump_if_false_pop 合并 jump+pop：if 语句 cond 总是消费（区别于 && 短路保留 cond）。
+                const else_jump = try self.chunk.emitJump(.op_jump_if_false_pop, loc);
                 try self.emitTail(ie.then_branch); // 分支尾自带 RETURN/TAIL_CALL
                 // then 分支已 RETURN，无需 end_jump 跳过 else。
                 self.chunk.patchJump(else_jump);
-                try self.chunk.writeOp(.op_pop, loc); // else：弹 cond
                 if (ie.else_branch) |eb| {
                     try self.emitTail(eb);
                 } else {
@@ -1561,12 +1560,11 @@ const FnCompiler = struct {
 
     fn emitIf(self: *FnCompiler, ie: @TypeOf(@as(Expr, undefined).if_expr), loc: ast.SourceLocation) CompileError!void {
         try self.emitExpr(ie.condition);
-        const else_jump = try self.chunk.emitJump(.op_jump_if_false, loc);
-        try self.chunk.writeOp(.op_pop, loc); // then：弹 cond
+        // op_jump_if_false_pop 合并 jump+pop：if 语句 cond 总是消费（区别于 && 短路保留 cond）。
+        const else_jump = try self.chunk.emitJump(.op_jump_if_false_pop, loc);
         try self.emitExpr(ie.then_branch);
         const end_jump = try self.chunk.emitJump(.op_jump, loc);
         self.chunk.patchJump(else_jump);
-        try self.chunk.writeOp(.op_pop, loc); // else：弹 cond
         if (ie.else_branch) |eb| {
             try self.emitExpr(eb);
         } else {

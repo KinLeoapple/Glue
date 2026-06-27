@@ -531,11 +531,11 @@ pub const VM = struct {
         }
     }
 
-    fn push(self: *VM, v: Value) VMError!void {
+    inline fn push(self: *VM, v: Value) VMError!void {
         try self.stack.append(self.allocator, v);
     }
 
-    fn pop(self: *VM) Value {
+    inline fn pop(self: *VM) Value {
         return self.stack.pop().?;
     }
 
@@ -543,8 +543,24 @@ pub const VM = struct {
         return self.stack.items[self.stack.items.len - 1 - distance];
     }
 
+    /// inline fast path：内联值（非 boxed）直接 push，省 retainOwned 函数调用。
+    /// boxed 值走 retainOwned（深拷贝 string / rc+1 等）。
+    /// 用于 op_get_local_const 等高频指令（内联值占绝大多数）。
+    inline fn pushRetain(self: *VM, v: Value) VMError!void {
+        if (!v.isBoxed()) {
+            try self.push(v);
+        } else {
+            try self.push(try self.retainOwned(v));
+        }
+    }
+
     /// string 须 dupe 独立 owned（retain 对 string 是 no-op，见 §6.3）。
+    /// 注意：throw 分支递归调用本函数，故不能加 inline（Zig 禁止 inline 递归）。
+    /// fast path（isBoxed 检查）由热点指令手动内联（见 op_get_local_const 等）。
     fn retainOwned(self: *VM, v: Value) VMError!Value {
+        // 内联值 fast path：null/bool/small_int/char/float 等无堆分配，retainOwned 是 no-op。
+        // 单次 isBoxed 比较替代下方 9 个 tag 分支，op_get_local/op_const（最高频路径）显著加速。
+        if (!v.isBoxed()) return v;
         if (v.tag == .string) return try Value.fromString(self.allocator, try self.allocator.dupe(u8, v.asBoxed().payload.string));
         // M4a：atomic_val 共享语义 —— BoxedValue rc+1 + AtomicValue ref_count+1
         if (v.tag == .atomic_val) {
@@ -714,10 +730,13 @@ pub const VM = struct {
     /// 主 dispatch 循环。从当前帧（frames 顶）取码执行，CALL 压帧、RETURN 弹帧。
     /// 当入口帧 RETURN（frames 清空）时返回其结果。
     fn runLoop(self: *VM, program: *const Program) VMError!Value {
+        // Dispatch loop 瘦身：frame/func/code 缓存到局部变量，避免每条指令重取。
+        // 仅在修改 frames 的指令（call/return 系列）后刷新。call/return 频率远低于
+        // 总指令数（perf_recursion 中 op_call 占 ~3%），绝大多数指令直接命中缓存。
+        var frame = &self.frames.items[self.frames.items.len - 1];
+        var func = frame.func;
+        var code = func.chunk.code.items;
         while (true) {
-            const frame = &self.frames.items[self.frames.items.len - 1];
-            const func = frame.func;
-            const code = func.chunk.code.items;
             const op: OpCode = @enumFromInt(code[frame.ip]);
             const loc = func.chunk.lines.items[frame.ip];
             frame.ip += 1;
@@ -745,10 +764,10 @@ pub const VM = struct {
                         const lv = &v.asBoxed().payload.lazy_val;
                         try self.push(try self.forceLazyVM(lv, loc));
                     } else {
-                        try self.push(try self.retainOwned(v));
+                        try self.pushRetain(v);
                     }
                     // 压常量
-                    try self.push(try self.retainOwned(func.chunk.constants.items[idx]));
+                    try self.pushRetain(func.chunk.constants.items[idx]);
                 },
                 .op_null => try self.push(Value.fromNull()),
                 .op_unit => try self.push(Value.fromUnit()),
@@ -770,7 +789,7 @@ pub const VM = struct {
                         const lv = &v.asBoxed().payload.lazy_val;
                         try self.push(try self.forceLazyVM(lv, loc));
                     } else {
-                        try self.push(try self.retainOwned(v));
+                        try self.pushRetain(v);
                     }
                 },
                 .op_set_local => {
@@ -979,6 +998,16 @@ pub const VM = struct {
                     const cond = cond_v.asBool();
                     if (cond) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
                 },
+                // Superinstruction：合并 op_jump_if_false + op_pop。if 语句 cond 总是消费。
+                // pop+release（boolean 内联，release 是 no-op）+ check + jump。
+                .op_jump_if_false_pop => {
+                    const off = opcode.readI32(code, frame.ip);
+                    frame.ip += 4;
+                    const cond_v = self.pop();
+                    cond_v.release(self.allocator);
+                    if (cond_v.tag != .boolean) return self.fail(loc, "condition must be boolean", error.TypeMismatch);
+                    if (!cond_v.asBool()) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
+                },
                 // M3c：`??` 短路 —— peek 栈顶非 null 则跳转（保留 left）。
                 .op_jump_if_not_null => {
                     const off = opcode.readI32(code, frame.ip);
@@ -1005,7 +1034,10 @@ pub const VM = struct {
                     const argc = code[frame.ip + 2];
                     frame.ip += 3;
                     try self.doCall(program, func_idx, argc, loc);
-                    // doCall 压入新帧；下轮循环自然切换到 callee（frame 指针失效，循环顶部重取）。
+                    // doCall 压入新帧，刷新缓存切换到 callee。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
                 },
 
                 .op_call_rec => {
@@ -1016,6 +1048,10 @@ pub const VM = struct {
                     const argc = code[frame.ip + 2];
                     frame.ip += 3;
                     try self.doCallRec(program, func_idx, argc, loc);
+                    // doCallRec 压入新帧，刷新缓存。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
                 },
 
                 .op_tail_call => {
@@ -1023,7 +1059,10 @@ pub const VM = struct {
                     const argc = code[frame.ip + 2];
                     frame.ip += 3;
                     try self.doTailCall(program, func_idx, argc, loc);
-                    // 复用当前帧（不增 frames）；下轮循环顶部重取 frame（已就地改写）。
+                    // tail_call 复用当前帧但切换 func，刷新 func/code。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
                 },
 
                 .op_closure => {
@@ -1061,7 +1100,10 @@ pub const VM = struct {
                     const argc = code[frame.ip];
                     frame.ip += 1;
                     try self.doCallValue(argc, loc);
-                    // 足参→压新帧（下轮切换）；不足→partial 已压栈，继续本帧。
+                    // 足参→压新帧（刷新缓存）；不足→partial 已压栈，继续本帧（刷新无害）。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
                 },
 
                 .op_call_native => {
@@ -1069,6 +1111,10 @@ pub const VM = struct {
                     const argc = code[frame.ip + 1];
                     frame.ip += 2;
                     try self.doCallNative(@enumFromInt(nid), argc, loc);
+                    // doCallNative 可能压新帧，刷新缓存。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
                 },
 
                 // M2a：复合值 / 模式匹配。
@@ -1294,6 +1340,10 @@ pub const VM = struct {
                 .op_return => {
                     const result = self.pop();
                     if (try self.frameReturn(result)) |entry_result| return entry_result;
+                    // frameReturn 弹帧，刷新缓存切换到调用者帧。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
                 },
                 // M3c：非空断言 `!` —— peek 栈顶，null → panic，否则原样保留。
                 .op_non_null => {
@@ -1307,6 +1357,10 @@ pub const VM = struct {
                     if (top.isNull()) {
                         _ = self.pop(); // 弹 null（基础值，release 无副作用）
                         if (try self.frameReturn(Value.fromNull())) |entry_result| return entry_result;
+                        // frameReturn 弹帧，刷新缓存。
+                        frame = &self.frames.items[self.frames.items.len - 1];
+                        func = frame.func;
+                        code = func.chunk.code.items;
                     } else if (top.tag == .throw_val) {
                         const throw_box = top.asBoxed();
                         switch (throw_box.payload.throw_val) {
@@ -1319,6 +1373,10 @@ pub const VM = struct {
                             .err => {
                                 const tv = self.pop(); // 接管 owned，作返回值移交
                                 if (try self.frameReturn(tv)) |entry_result| return entry_result;
+                                // frameReturn 弹帧，刷新缓存。
+                                frame = &self.frames.items[self.frames.items.len - 1];
+                                func = frame.func;
+                                code = func.chunk.code.items;
                             },
                         }
                     }
@@ -1328,6 +1386,10 @@ pub const VM = struct {
                 .op_throw => {
                     const result = self.pop();
                     if (try self.frameReturn(result)) |entry_result| return entry_result;
+                    // frameReturn 弹帧，刷新缓存。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
                 },
                 // M3c：match Ok/Error 测试 —— 弹 throw_val，want_ok=1 测 .ok / =0 测 .err，压 bool。
                 .op_test_throw => {
@@ -1378,6 +1440,10 @@ pub const VM = struct {
                     const argc = code[frame.ip];
                     frame.ip += 1;
                     try self.doCallMethod(func, name_idx, argc, loc);
+                    // doCallMethod 可能压新帧，刷新缓存（func 局部变量已被 doCallMethod 使用完毕）。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
                 },
                 // M3d：构造 range —— 弹 [start,end]，压 range 值。
                 .op_make_range => {
@@ -1664,11 +1730,17 @@ pub const VM = struct {
                 if (argc != 1) return self.fail(loc, "println/print expects 1 argument", error.WrongArity);
                 const v = self.pop();
                 defer v.release(self.allocator);
-                const formatted = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
-                defer self.allocator.free(formatted);
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.allocator);
-                buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+                // 顶层字符串直接输出内容（不加引号），与 Python/Rust/JS 的 println 一致；
+                // 其它类型走 format（字符串在数组/记录内仍加引号，保持 debug 显示风格）。
+                if (v.tag == .string) {
+                    buf.appendSlice(self.allocator, v.asBoxed().payload.string) catch return error.OutOfMemory;
+                } else {
+                    const formatted = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
+                    defer self.allocator.free(formatted);
+                    buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+                }
                 if (nat == .println) buf.append(self.allocator, '\n') catch {};
                 if (self.io) |io| {
                     var out_buf: [4096]u8 = undefined;
@@ -1745,7 +1817,11 @@ pub const VM = struct {
                 if (argc != 1) return self.fail(loc, "Panic expects 1 argument", error.WrongArity);
                 const v = self.pop();
                 defer v.release(self.allocator);
-                const msg = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
+                // 字符串参数直接用作错误消息（不加引号），与 println 一致。
+                const msg = if (v.tag == .string)
+                    self.allocator.dupe(u8, v.asBoxed().payload.string) catch return error.OutOfMemory
+                else
+                    v.formatAlloc(self.allocator) catch return error.OutOfMemory;
                 defer self.allocator.free(msg);
                 return self.fail(loc, msg, error.Unsupported);
             },
@@ -1754,11 +1830,16 @@ pub const VM = struct {
                 if (argc != 1) return self.fail(loc, "eprintln/eprint expects 1 argument", error.WrongArity);
                 const v = self.pop();
                 defer v.release(self.allocator);
-                const formatted = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
-                defer self.allocator.free(formatted);
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.allocator);
-                buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+                // 顶层字符串直接输出内容（与 println 一致）。
+                if (v.tag == .string) {
+                    buf.appendSlice(self.allocator, v.asBoxed().payload.string) catch return error.OutOfMemory;
+                } else {
+                    const formatted = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
+                    defer self.allocator.free(formatted);
+                    buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+                }
                 if (nat == .eprintln) buf.append(self.allocator, '\n') catch {};
                 if (self.io) |io| {
                     var err_buf: [4096]u8 = undefined;
@@ -1880,9 +1961,16 @@ pub const VM = struct {
         defer buf.deinit(self.allocator);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const formatted = self.stack.items[base + i].formatAlloc(self.allocator) catch return error.OutOfMemory;
-            defer self.allocator.free(formatted);
-            buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+            const seg = self.stack.items[base + i];
+            // 字符串段直接输出内容（不加引号），与多数语言插值语义一致；
+            // 其它类型走 format（数组/记录内的字符串仍加引号，保持 debug 显示风格）。
+            if (seg.tag == .string) {
+                buf.appendSlice(self.allocator, seg.asBoxed().payload.string) catch return error.OutOfMemory;
+            } else {
+                const formatted = seg.formatAlloc(self.allocator) catch return error.OutOfMemory;
+                defer self.allocator.free(formatted);
+                buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+            }
         }
         // 拼接完成后再 release 各段（format 借用其内容，须在 format 后释放）。
         i = 0;
@@ -1903,6 +1991,12 @@ pub const VM = struct {
                 const buf = try self.allocator.alloc(u8, 1);
                 buf[0] = @intCast(c);
                 try self.push(try Value.fromString(self.allocator, buf));
+                return;
+            }
+            // 字符串→str 直接返回内容副本（不加引号），与 println/interp 一致。
+            if (v.tag == .string) {
+                const duped = self.allocator.dupe(u8, v.asBoxed().payload.string) catch return error.OutOfMemory;
+                try self.push(try Value.fromString(self.allocator, duped));
                 return;
             }
             const owned = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
