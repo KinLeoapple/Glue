@@ -1,7 +1,9 @@
-# Glue 语言设计规范
+# Glue 语言当前状态总览
 
 > 版本: 0.9.0-draft
-> 最后更新: 2026-06-15
+> 最后更新: 2026-06-27
+
+本文档是 Glue 语言的权威参考，涵盖设计、语法、类型系统、并发模型、模块系统与字节码 VM 实现的当前真实状态。历史进展记录已废弃，本文档仅描述当前代码库的实际能力。
 
 ---
 
@@ -13,7 +15,10 @@
 4. [模块系统](#4-模块系统)
 5. [运行时与垃圾回收](#5-运行时与垃圾回收)
 6. [语法设计](#6-语法设计)
-7. [解释器架构与实现路线图](#7-解释器架构与实现路线图)
+7. [字节码 VM 架构](#7-字节码-vm-架构)
+8. [当前实现状态](#8-当前实现状态)
+9. [设计决策记录](#9-设计决策记录)
+10. [术语表](#10-术语表)
 
 ---
 
@@ -63,6 +68,7 @@ Glue 是一门通用编程语言，核心目标是让并行编程变得安全、
 | 类型转换 | 显式 `Type(value)` 语法，widening 合法 narrowing 运行时检查 |
 | 运算符 | 内建不可重载 |
 | 字符串 | UTF-8 编码，迭代产生 `char` |
+| 执行后端 | 字节码栈式 VM（树遍历求值器已废弃） |
 
 ---
 
@@ -389,18 +395,7 @@ type NullableInt: Show = NullableInt(value: i32?) {
 }
 ```
 
-#### 2.3.12 Nullable 与泛型
-
-```glue
-fun first<T>(list: List<T>) : T? {
-    match list {
-        Nil => null,
-        Cons(x, _) => x,
-    }
-}
-```
-
-#### 2.3.13 Nullable 与并发
+#### 2.3.12 Nullable 与并发
 
 ```glue
 fun producer(ch: Sender<i32?>) : Unit {
@@ -417,7 +412,7 @@ fun consumer(ch: Receiver<i32?>) : Unit {
 }
 ```
 
-#### 2.3.14 Nullable 不是副作用
+#### 2.3.13 Nullable 不是副作用
 
 null 是类型系统追踪的属性，不是运行时副作用。访问可空值、处理 null 不涉及 Effect。
 
@@ -2073,7 +2068,9 @@ type IntList = List<i32>
 type UserId = UserId(i32)
 
 // 自定义错误
-type FileError = Error("file error")
+type FileError: Error = FileError(msg: str) {
+    override fun prefix(self): str { "file error" }
+}
 ```
 
 ### 6.6 错误处理
@@ -2279,7 +2276,7 @@ true  false  null
 2. **显式类型标注**次之：`val x: i64 = 5` 中字面量按标注类型 `i64` 处理（声明 / 形参处转换）。
 3. **既无后缀也无标注**时，推断为**能容纳该值的最小类型**：非负值按 `i8 → u8 → i16 → u16 → i32 → u32 → i64 → u64 → i128 → u128` 逐级取首个可容纳者（同位宽优先有符号），负值按 `i8 → i16 → i32 → i64 → i128`。例如 `42` 为 `i8`、`200` 为 `u8`、`-200` 为 `i16`、`100000` 为 `i32`。
 
-> 注意：在“最小类型”规则下，无标注字面量参与算术时按各自的最小类型做范围检查。
+> 注意：在"最小类型"规则下，无标注字面量参与算术时按各自的最小类型做范围检查。
 > 例如 `100 + 100`：两操作数均为 `i8`（最大 127），结果 `200` 超出 `i8` 范围会触发
 > 算术溢出 panic。需要更大范围时请加后缀（`100i32 + 100`）或标注变量类型
 > （`val a: i32 = 100`）。
@@ -2331,191 +2328,221 @@ val raw = "{{not interpolated}}"         // "{not interpolated}"
 
 ---
 
-## 7. 解释器架构与实现路线图
+## 7. 字节码 VM 架构
 
-### 7.1 解释器流水线
+Glue 当前以**字节码栈式 VM**作为唯一执行后端（树遍历求值器已废弃）。本节描述 VM 的实际架构与运行机制。
 
-```
-源代码 → Lexer → Token → Parser → AST → Sema → 求值器 (Evaluator)
-```
-
-#### Sema（语义分析）
-
-- 类型推断 (Hindley-Milner)
-- Kind 推断与检查
-- Throw 类型检查
-- Trait 解析与 bound 检查
-- 子类型检查
-- 变异性推导
-- GADT 类型细化与穷举检查
-- Nullable 类型收窄
-- Pattern matching 穷举检查
-- 模块类型结构化匹配
-- 类型转换合法性检查
-
-#### 求值器 (Evaluator)
-
-AST 树遍历求值器，采用**先检查后求值**策略——类型检查不通过则阻止求值：
-- 环境 (Environment)：词法作用域的变量绑定链
-- Throw 处理：`throw` 通过栈展开传播
-- 并发求值：`spawn` 创建协程，`channel` 委托运行时
-- defer 执行：作用域退出时 LIFO 顺序执行
-- 类型转换：`Type(value)` 显式转换
-
-### 7.2 解释器组件结构
+### 7.1 流水线
 
 ```
-glue/
-├── src/
-│   ├── main.zig              // 解释器入口(项目模式 CLI: init/run/debug)
-│   ├── lexer.zig             // 词法分析
-│   ├── parser.zig            // 语法分析
-│   ├── ast.zig               // AST 定义
-│   ├── sema/
-│   │   ├── type_check.zig    // 类型检查与推断
-│   │   ├── kind_check.zig    // Kind 检查与推断
-│   │   ├── throw_check.zig   // Throw 类型检查
-│   │   ├── subtype_check.zig // 子类型检查
-│   │   ├── variance.zig      // 变异性推导
-│   │   ├── trait_resolve.zig // Trait 解析
-│   │   ├── gadt_check.zig    // GADT 类型细化
-│   │   └── module_check.zig  // 模块类型匹配
-│   ├── eval/
-│   │   ├── value.zig         // 运行时值表示
-│   │   ├── env.zig           // 环境
-│   │   ├── eval.zig          // 核心求值器
-│   │   ├── pattern.zig       // Pattern matching 求值
-│   │   ├── throw.zig         // Throw 运行时处理
-│   │   └── module_eval.zig   // 一等 Trait 值求值
-│   └── module/
-│       ├── resolver.zig      // 模块解析
-│       └── graph.zig         // 依赖图
-├── runtime/
-│   ├── scheduler.zig         // 基于 Zio 的调度器封装
-│   ├── gc.zig                // Per-heap GC（ArenaAllocator）
-│   ├── channel.zig           // Channel 实现
-│   ├── spawn.zig             // Spawn<T> 实现（std.Thread + Per-heap GC + Panic 隔离）
-│   ├── atomic.zig            // Atomic<T> 原子操作
-│   └── vtable.zig            // 一等 Trait 值 vtable 支持
-├── vendor/
-│   └── zio/                  // Zio 异步 I/O 框架（stackful coroutine + io_uring/IOCP）
-└── build.zig                 // Zig 构建脚本
+源代码 → Lexer → Token → Parser → AST → Sema(type_check 等) → resolve(intern)
+                          ↓
+                  VM Compiler (src/vm/compiler.zig)
+                          ↓
+                  Chunk / Function / Program（字节码 + 常量池 + 调试信息）
+                          ↓
+                  VM (src/vm/vm.zig) ── 执行 ──> Value
 ```
 
-### 7.3 实现阶段
+- **Lexer**（`src/lexer.zig`）：源码 → Token 流
+- **Parser**（`src/parser.zig`）：Token → AST（不构造符号表，纯语法）
+- **Sema**（`src/sema/`）：类型推断 / Kind 检查 / Throw 检查 / Trait 解析 / 子类型 / 变异性 / GADT 细化 / 模块结构化匹配。**完全在编译前完成，VM 信任类型信息**
+- **resolve**（`src/sema/resolve.zig`）：name intern，作用域解析前端
+- **VM Compiler**（`src/vm/compiler.zig`）：AST → 字节码 + 常量池
+- **VM**（`src/vm/vm.zig`）：栈式字节码执行引擎
 
-#### Phase 1：语言基础
+### 7.2 栈所有权不变式
 
-| 目标 | 产出 |
+栈上每个 `Value` 持有一份 owned 引用：
+- 压栈即 +1（retain/retainOwned）
+- 弹栈消费即 -1（release）
+- 局部变量住在操作数栈 `slot_base + slot` 处
+
+这套不变式使得 RC（引用计数）天然集成到字节码栈操作中，无需 GC root 扫描。
+
+### 7.3 Value 表示
+
+`Value` 为 16 字节紧凑表示（`src/value.zig`）：
+
+```
+tag: u8          // 1 字节类型标签
+_pad: [7]u8      // 7 字节对齐填充
+payload: u64     // 8 字节载荷
+```
+
+- **小值内联**：bool/char/i8..i64/u8..u64/f32 等直接放进 payload
+- **大值装箱**：i128/u128/f64/f128/str/array/record/ADT/closure/trait 等通过 `*BoxedValue` 指针引用堆
+
+### 7.4 指令集
+
+指令编码：每条指令 = 1 字节 opcode + 0 或多个立即数。立即数宽度固定（u16 用于 idx/slot，i32 用于跳转偏移），小端序。完整指令集见 `src/vm/opcode.zig`，按功能分组：
+
+| 组 | 主要 opcode |
 |---|---|
-| Lexer | Token 流 |
-| Parser | AST |
-| 求值器 | 可执行基本表达式 |
-| 基础类型 | i8..i128, u8..u128, f32, f64, bool, char |
-| I/O | `println`/`print`/`eprintln`/`eprint` 输出，`scanln`/`scan` 输入（`str?`，EOF 返回 null，错误 panic） |
-| Nullable | `T?`、`null`、`?.`、`??`、`!`、类型收窄、`?` 传播 |
-| Throw | `Throw<T, E>`、`throw`、`?` 传播、`Ok/Error` 模式匹配 |
-| `?` 不跨 Nullable/Throw | `?` 严格按类型匹配 |
-| Error | 内建 Error trait、自定义错误类型、Error 子类型 |
-| Type Alias + Newtype | 类型别名与零开销包装 |
-| 类型转换 | 显式 `Type(value)`，widening 合法 narrowing 运行时检查 |
-| 相等性 | `==` 引用相等，`eq` 结构相等 |
-| Panic | 不可捕获，`Panic()` 构造器，协程隔离 |
-| defer | LIFO 顺序，覆盖正常返回/throw/panic |
-| 整数溢出 | Debug + Release 均 panic，无 wrapping |
-| 浮点数 | 无 NaN/Infinity，除零 panic |
-| Channel 关闭 | 仅 Sender 可关闭，关闭后缓冲数据可读 |
-| spawn 捕获 | spawn 时深拷贝，Atomic<T> 浅拷贝 |
-| 闭包捕获 | 普通闭包引用捕获，spawn 闭包深拷贝 |
-| var 与值语义 | 支持重新赋值和原地修改 |
-| main 签名 | `fun main()` 无参数，缺失报错，顶层裸表达式不执行 |
-| 数组 | 固定大小 `T[N]`，动态 `T[]`，动态集合后续由 std 的 List 提供 |
-| 模块依赖 | 循环依赖编译错误 |
-| Range | 非独立类型，元素类型由推断决定 |
-| 字符串插值 | `{expr}` 插值，`{{`/`}}` 转义 |
-| 函数参数 | 默认 val，`var` 标注才可修改 |
-| 尾调用优化 | 保证 TCO |
-| 元组 | 无匿名元组，记录必须有命名字段 |
-| 项目 CLI | `glue init`/`run`/`debug`，`glue.toml` 项目清单 |
+| 常量/字面量 | `OP_CONST`、`OP_NULL`、`OP_UNIT`、`OP_TRUE`、`OP_FALSE` |
+| 局部变量 | `OP_GET_LOCAL`、`OP_SET_LOCAL`、`OP_SET_LOCAL_LETREC`、`OP_SET_LOCAL_ASSIGN`、`OP_GET_GLOBAL`、`OP_SET_GLOBAL` |
+| 算术/比较/位/一元 | `OP_ADD/SUB/MUL/DIV/MOD`、`OP_EQ/NEQ/LT/GT/LE/GE`、`OP_BIT_AND/OR/XOR`、`OP_NEG/NOT` |
+| 跳转 | `OP_JUMP`、`OP_JUMP_IF_FALSE/TRUE` |
+| 栈操作 | `OP_POP`、`OP_POP_N`、`OP_DUP` |
+| 调用/返回 | `OP_CALL`（顶层快路径）、`OP_CALL_VALUE`（栈上闭包）、`OP_TAIL_CALL`（TCO）、`OP_CALL_NATIVE`（内建）、`OP_RETURN` |
+| 闭包/upvalue | `OP_CLOSURE`、`OP_GET_UPVALUE`、`OP_SET_UPVALUE`、`OP_GET_UPVALUE_RAW` |
+| 复合值/match | `OP_MAKE_ADT`、`OP_GET_FIELD`、`OP_GET_ADT_FIELD`、`OP_TEST_CTOR`、`OP_MATCH_FAIL`、`OP_MAKE_ARRAY`、`OP_MAKE_RECORD`、`OP_INDEX`、`OP_TEST_LIT`、`OP_RECORD_EXTEND`、`OP_MAKE_NEWTYPE`、`OP_TEST_NEWTYPE`、`OP_GET_NEWTYPE_INNER`、`OP_MAKE_ERROR` |
+| 字符串/转换 | `OP_INTERP`、`OP_CAST`、`OP_COERCE`、`OP_CONCAT_LIST` |
+| 字段/索引赋值 | `OP_SET_FIELD`、`OP_SET_INDEX` |
+| 异常/Nullable | `OP_JUMP_IF_NOT_NULL/NULL`、`OP_NON_NULL`、`OP_PROPAGATE`、`OP_THROW`、`OP_TEST_THROW`、`OP_GET_THROW_OK/ERR` |
+| 方法调用/for | `OP_CALL_METHOD`、`OP_FOR_NEXT`、`OP_MAKE_RANGE` |
+| Atomic | `OP_MAKE_ATOMIC`、`OP_GET_LOCAL_RAW`、`OP_COMPOUND_LOCAL/UPVALUE` |
+| 并发/Lazy/Trait | `OP_SPAWN`、`OP_MAKE_LAZY`、`OP_TRY_RECV`、`OP_RECV`、`OP_MAKE_TRAIT` |
 
-#### Phase 2：顺序语义完善
+### 7.5 编译器
 
-| 目标 | 产出 |
+`ModuleCompiler`（`src/vm/compiler.zig`）采用两遍编译：
+
+1. **第一遍（registerDecls）**：登记所有顶层声明到对应表（`fun_table`/`adt_table`/`newtype_table`/`error_table`/`global_table`/`trait_method_table` 等），建立全局符号索引。`trait_decl` 与无方法的 `type_decl` 在此遍后即完成（无运行时效果）。
+2. **第二遍（compileBodies）**：编译每个函数体、trait 方法体、全局初始化器为字节码。`type_decl` 的内联 trait 方法被编成顶层零捕获 Function，登记进 `program.trait_methods`（TraitMethodDesc：`type_name`/`method_name`/`trait_name`/`func_idx`）。
+
+### 7.6 Program 结构
+
+`Program`（`src/vm/chunk.zig`）聚合所有编译产物：
+
+| 字段 | 含义 |
 |---|---|
-| ADT | 代数数据类型 + Pattern Matching |
-| 类型推断 | Hindley-Milner |
-| Trait | 定义、实现、bound |
-| Iterable/Iterator | `for` 循环脱糖 |
-| 模块系统 | 文件即模块 + pack.glue + import |
+| `functions` | 顶层函数（含 trait 方法编成的零捕获 Function） |
+| `adt_ctors` | ADT 构造器描述（字段名、类型名、构造器名） |
+| `newtype_ctors` | Newtype 构造器描述 |
+| `error_ctors` | Error 子类型构造器描述 |
+| `record_shapes` | 记录字段名集合（用于 `OP_MAKE_RECORD`/`OP_RECORD_EXTEND`） |
+| `trait_methods` | Trait 方法表（运行时按 receiver 类型名 + 方法名分派） |
+| `trait_defaults` | Trait 默认方法表 |
+| `trait_infos` | Trait 声明信息（含父 trait、关联类型、override/delegate 集合） |
+| `globals` / `global_count` | 顶层 val/var 全局变量槽 |
+| `globals_init` | 全局初始化函数 idx |
 
-#### Phase 3：子类型与记录操作
+### 7.7 运行时分派
 
-| 目标 | 产出 |
-|---|---|
-| 记录宽度子类型 | 字段更多是更少的子类型 |
-| Trait 结构化子类型 | 方法更多是更少的子类型 |
-| Error 子类型 | FileError <: Error |
-| 记录操作 | 扩展、更新、模式匹配 |
+#### 7.7.1 函数调用
 
-#### Phase 4：并发原语
+- **顶层函数快路径**：`OP_CALL <func_idx> <argc>` 直接索引 `program.functions[func_idx]`，无哈希查找。
+- **栈上闭包**：`OP_CALL_VALUE <argc>` 处理 `vm_closure`（部分应用、嵌套函数、一等函数值）。
+- **尾调用**：`OP_TAIL_CALL` 复用当前帧，保证 TCO。
 
-| 目标 | 产出 |
-|---|---|
-| 运行时调度器 | Work-stealing scheduler |
-| Channel | 创建、发送、接收、方向类型 |
-| spawn | 协程创建，返回 Spawn<T> |
-| Spawn<T>.await() | 阻塞等待协程结果 |
-| Per-heap GC | 隔离垃圾回收 |
-| select | 多路复用 |
-| Atomic<T> | 透明原子操作，跨协程共享 |
+#### 7.7.2 方法调用（`OP_CALL_METHOD`）
 
-#### Phase 5：HKT
+分派优先级（在 `vm.zig` 的 `doCallMethod` 中实现）：
 
-| 目标 | 产出 |
-|---|---|
-| Kind 系统 | `*`、`* -> *`、`* -> * -> *` 等 |
-| Kind 推断 | 自动推导 |
-| Trait HKT | 高阶抽象，增强表达力 |
+1. **内建方法表**（`src/vm/method.zig`）：按 receiver 类型 + 方法名查找内建方法（如 `str.len()`、`array.append()`、`Atomic.cas()`、`Spawn.await()` 等）。
+2. **用户 trait 方法表**（`program.trait_methods`）：按 receiver 运行时类型名 + 方法名查找。**数值宽度互通**——字面量 `5`（i8）匹配 `i32` 类型的 trait 实现（镜像 eval 语义）。
+3. **Trait 默认方法**（`program.trait_defaults`）：当 trait 声明了默认方法且类型未提供具体实现时回退。
 
-#### Phase 6：GADT
+未命中以上三层的 `OP_CALL_METHOD` 触发 panic。
 
-| 目标 | 产出 |
-|---|---|
-| GADT 定义 | `:` 语法标注构造器返回类型 |
-| 类型细化 | GADT match 中的类型等式推导 |
-| GADT 穷举检查 | 考虑类型约束 |
+#### 7.7.3 自由函数式 trait 方法
 
-#### Phase 7：一等 Trait 值与高级特性
+带 `with` 约束的自由函数（如 `compare(a, b)`，receiver 是第一个参数）经编译器识别后，`OP_CALL` 裸名命中且 argc≥1 时改发 `OP_CALL_METHOD`，receiver=arg0，argc-1，复用方法分派机制。
 
-| 目标 | 产出 |
-|---|---|
-| 一等 Trait 值 | Trait 作为运行时值传递 |
-| 结构化匹配 | 文件模块自动满足 Trait |
-| 内联 Trait 值 | `trait { ... }` 匿名实现 |
-| vtable 生成 | 运行时多态分派 |
-| Lazy | 显式惰性求值 |
+### 7.8 跨文件 use 依赖
 
-#### Phase 8：优化与生态
+`compileModuleWithDeps`（`compiler.zig`）支持单段 `use` 跨文件导入：
 
-| 目标 | 产出 |
-|---|---|
-| 优化器 | 内联、常量折叠、死代码消除 |
-| 标准库 | 集合、IO、网络、JSON 等（首批：List 集合 + Eq/Ord/Show 类型类，见 §4.9） |
-| 包管理器 | 依赖管理与分发 |
-| LSP | 语言服务器协议支持 |
-| 自举 | 用 Glue 实现 Glue |
+- `collectUseDependencies`（递归传递依赖，按模块名去重，依赖先于入口入列表）
+- 依赖模块先注册+编译（stdlib 的 trait/fn 合并进同一 Program，扁平 trait 方法表天然合并）
+- 入口模块最后编译
+- 多段路径 `use` 仍回退到树遍历器（保留兼容）
 
-### 7.4 实现语言
+### 7.9 并发集成
 
-解释器和运行时使用 **Zig 0.16** 实现。
-- 精确控制内存布局，适合实现 GC 和 Atomic
-- 内建原子操作，适合实现调度器
-- 无隐藏分配，行为可预测
-- 交叉编译支持
+VM 与运行时协同（`src/vm/vm.zig` + `runtime/`）：
+
+- **spawn**：`OP_SPAWN` 弹闭包，深拷捕获快照进 per-spawn arena（`std.heap.ArenaAllocator` + `page_allocator` 裸打底），起 OS 线程跑子 VM 执行 body。await 时取结果（深拷回父 allocator）。子 VM 与父 VM 内存完全隔离（VM 纯 refcount，array/record 非原子 rc 跨线程不安全 → 必须隔离堆）。
+- **channel**：`OP_RECV` 阻塞 recv、`OP_TRY_RECV` 非阻塞 tryRecv（select 多路复用）。
+- **Atomic**：`OP_MAKE_ATOMIC` 包装标量为 `AtomicValue`；`OP_COMPOUND_LOCAL/UPVALUE` 透明翻译为原子 fetch<op>；slot 持 atomic 时 `OP_SET_LOCAL_ASSIGN` 透明 atomic store（保持共享身份）。
+- **Lazy**：`OP_MAKE_LAZY` 包装闭包为 `lazy_val`，首次透明读取（`OP_GET_LOCAL/UPVALUE`）时 force，缓存结果。
+- **一等 Trait 值**：`OP_MAKE_TRAIT` 弹 count 个 [name(string), closure] 对，建 `vm_owned` trait_value（vtable: name→vm_closure）。
+
+### 7.10 vmEligible 资格检查
+
+VM 当前已支持全部语言特性，`vmEligible`（`src/main.zig`）仅检查模块是否含 `fun main()`——所有声明类型（type/trait/fun/val/var/use）均能被 VM 编译器处理，无需保守预扫描。
+
+### 7.11 VM 模块结构
+
+```
+src/vm/
+├── compiler.zig    // ModuleCompiler：AST → 字节码
+├── vm.zig          // VM 执行引擎 + Spawn 上下文
+├── chunk.zig       // Program / Function / Chunk / TraitMethodDesc / TraitInfo 等数据结构
+├── opcode.zig      // OpCode 枚举 + Native 内建函数 id
+├── method.zig      // 内建方法表（按 receiver 类型 + 方法名分派）
+├── cast.zig        // 类型转换实现（OP_CAST / OP_COERCE）
+└── disasm.zig      // 反汇编（调试用）
+
+runtime/
+├── slab_pool.zig   // Slab 分配器
+├── sync.zig        // 同步原语
+├── channel.zig     // Channel 实现
+├── spawn.zig       // SpawnHandle 实现（std.Thread + Per-heap GC + Panic 隔离）
+├── atomic.zig      // AtomicValue 原子操作
+└── vtable.zig      // 一等 Trait 值 vtable 数据结构（DelegateEntry / TraitInfo / TraitMethodEntry / TraitRegistration）
+```
 
 ---
 
-## 附录 A：设计决策记录
+## 8. 当前实现状态
+
+### 8.1 已实现的语言特性
+
+| 类别 | 特性 |
+|---|---|
+| **基础类型** | i8..i128、u8..u128、f16/f32/f64/f128、bool、char、str、Unit |
+| **字面量** | 整数（最小类型推断 + 后缀 + 标注）、浮点（round-trip 最小类型）、十六进制/八进制/二进制、下划线分隔、char、字符串插值、数组、记录 |
+| **运算符** | 算术、比较、逻辑、位、Nullable（`?.`/`??`/`!`/`?`）、范围（`..`/`..=`）、数组拼接（`++`） |
+| **变量绑定** | `val`/`var`、类型收窄、嵌套遮蔽 |
+| **函数** | 命名函数、Lambda、默认柯里化、var 参数、禁止链式调用、TCO |
+| **类型** | 枚举、记录、递归类型、抽象类型、Type Alias、Newtype |
+| **ADT** | Pattern Matching（含守卫/或模式/构造器/记录/字面量/newtype/Throw 模式）、穷举检查 |
+| **Nullable** | `T?`、`null`、`?.`、`??`、`!`、`?` 传播、双重可空扁平化、协变 |
+| **Throw** | `Throw<T, E>`、`throw`、`?` 传播、`Ok/Error` 模式匹配、Error 子类型、自定义错误类型 |
+| **Trait** | 定义、type 内联实现、多 trait（括号）、默认方法、override、组合（父 trait + 冲突消解）、关联类型、Self 类型、类型参数约束、类型特化（`with`） |
+| **HKT** | Kind 系统、`*`/`* -> *`/`* -> * -> *` |
+| **GADT** | `:` 构造器返回类型标注、match 中类型细化 |
+| **变异性** | 自动推导（协变/逆变/不变） |
+| **子类型** | 记录宽度子类型、Trait 结构化子类型、Error 子类型 |
+| **控制流** | `if`/`else`（表达式）、`loop`、`while`、`for`、`break`/`continue`、`return`、`defer` |
+| **并发** | `spawn`、`Spawn<T>.await()/cancel()/status()/result()`、`channel`、`Sender`/`Receiver`、`select`、`Atomic<T>` |
+| **惰性** | `Lazy<T>` + `lazy` 表达式 |
+| **一等 Trait 值** | 文件模块作为 Trait 值、内联 `trait { ... }` 值、vtable 分派 |
+| **模块** | 文件即模块、`pack.glue`、`import`（选择性/整体/别名/通配）、`pub` 可见性、抽象类型、循环依赖检测 |
+| **内嵌标准库** | `List`（含 `Show` 实现）、`Compare`（`Eq`/`Ord`/`Show` 覆盖内建类型） |
+| **项目 CLI** | `glue init`/`run`/`debug`、`glue.toml` 清单 |
+| **I/O 内建** | `println`/`print`/`eprintln`/`eprint`/`scanln`/`scan` |
+
+### 8.2 已实现的 VM 能力
+
+| 类别 | 覆盖范围 |
+|---|---|
+| **指令集** | M0-M5 全套 opcode（见 §7.4） |
+| **执行模型** | 栈式 + 引用计数 + 栈所有权不变式 |
+| **调用** | 顶层快路径、栈上闭包、TCO、Native 内建、部分应用 |
+| **复合值** | ADT 构造/解构、记录字面量/扩展/更新、Newtype、数组、索引 |
+| **字符串** | 插值、`str()` 转换、UTF-8 codepoint 索引 |
+| **类型转换** | `OP_CAST`（widening/narrowing 运行时检查）、`OP_COERCE`（best-effort 数值协调） |
+| **赋值** | 字段赋值（COW）、索引赋值（COW）、复合赋值、全局变量读写 |
+| **异常/Nullable** | `?.`/`??`/`!`/`?`/`throw`/Ok-Error 模式匹配 |
+| **方法分派** | 内建方法表、用户 trait 方法表（数值宽度互通）、trait 默认方法、自由函数式 trait 方法 |
+| **Trait 值** | 内联 `trait { ... }` 构造、vtable 分派 |
+| **Atomic** | 透明原子读写、复合赋值、cas/swap |
+| **spawn** | OS 线程 + per-spawn arena + 深拷捕获 + Panic 隔离 |
+| **channel** | send/recv、方向类型、关闭语义、select 多路复用 |
+| **Lazy** | 透明 force + 缓存 |
+| **跨文件 use** | 单段 use 依赖收集 + 多模块合并编译 |
+| **全局变量** | 顶层 val/var、globals_init 初始化函数 |
+
+### 8.3 VM 资格
+
+VM 当前可处理所有合法 Glue 程序。`vmEligible`（`src/main.zig`）仅要求模块含 `fun main()`。
+
+---
+
+## 9. 设计决策记录
 
 | 编号 | 决策 | 理由 | 替代方案 |
 |---|---|---|---|
@@ -2557,12 +2584,12 @@ glue/
 | D36 | GADT 用 `:` 标注返回类型 | 简洁 | where / returns |
 | D37 | `Throw<T, E>` 双参数形式 | 支持穷举错误匹配 | 单参数 / 异常 |
 | D38 | Error 是内建 Trait | 类型安全 | 任意类型可 throw |
-| D39 | `type X = Error("msg")` | newtype 语法简洁，X <: Error | 手动实现 Error trait |
+| D39 | `type X: Error = X(msg: str)` + override prefix | newtype 语法简洁，X <: Error | 手动实现 Error trait |
 | D40 | `?` 统一 Nullable 和 Throw 传播 | 语法统一 | 不同操作符 |
 | D41 | `?` 在非 Throw/非 Nullable 函数中编译错误 | 强制显式处理 | 允许自动传播 |
 | D42 | Throw + Nullable 双机制 | 互补而非互斥 | 统一为一个 |
 | D43 | 无 try/catch/finally | `?` + 模式匹配覆盖主要场景 | 保留 try/catch |
-| D44 | AST 树遍历解释器 | 实现简单，适合早期迭代 | 字节码 VM / LLVM |
+| D44 | 字节码 VM（替代树遍历器） | 数量级提速，单热循环分发 | 树遍历 / LLVM JIT |
 | D45 | 先检查后求值 | 类型检查不通过则阻止求值，求值器信任类型信息 | 求值器内嵌类型检查 |
 | D46 | 显式类型转换 | widening 合法 narrowing 运行时检查 | 隐式提升 / 截断 |
 | D47 | str 用 UTF-8 | 内存高效 | UTF-16 / char[] |
@@ -2585,7 +2612,7 @@ glue/
 | D64 | 普通闭包引用捕获 | spawn 闭包深拷贝 | 统一引用/深拷贝 |
 | D65 | Range 非独立类型 | 元素类型由推断决定 | Range<T> 独立类型 |
 | D66 | 字符串插值 | `{expr}` 插值，调用 `str()`（内建类型转换） | 无插值 |
-| D67 | List 属于 std 库 | Phase 8 标准库提供，核心语言只提供 T[] | List 内建 |
+| D67 | List 属于 std 库 | 标准库提供，核心语言只提供 T[] | List 内建 |
 | D68 | 函数参数默认 val | 安全默认 | 默认 var |
 | D69 | 禁止链式调用 `f(a)(b)` | 可读性差，易与嵌套调用混淆，显式绑定更清晰 | 允许链式调用 |
 | D70 | 尾调用优化 | 保证 TCO，含相互递归 | 不保证 TCO |
@@ -2593,8 +2620,14 @@ glue/
 | D72 | 去掉 Agent | spawn+channel 已足够，减少概念 | 保留 Agent |
 | D73 | Atomic<T> 替代 Arc<T> | 透明原子操作更安全简洁，无数据竞争 | 保留 Arc<T> |
 | D74 | Throw 构造器简化为 Ok/Error | 消除 Err(Error(...)) 双重包装冗余，Error() 直接创建 ThrowValue.err | 保留 Err + Error 双层构造 |
+| D75 | Trait 实现内联进 type 声明 | 消除独立 trait 实现声明形式，简化语法，type 定义即完整契约 | 保留独立 trait 实现块声明 |
+| D76 | Value 16 字节紧凑表示 | tag + payload 双字，小值内联大值装箱，栈拷贝廉价 | 64 字节 union(enum) 按值拷贝 |
+| D77 | 栈式 VM（非寄存器式） | 与表达式求值天然契合，编译器实现量小 | 寄存器式 VM |
+| D78 | 现编译现执行（无磁盘字节码缓存） | 编译耗时相对运行时可忽略 | JIT / 字节码缓存到磁盘 |
 
-## 附录 B：术语表
+---
+
+## 10. 术语表
 
 | 术语 | 英文 | 含义 |
 |---|---|---|
@@ -2628,8 +2661,9 @@ glue/
 | 可迭代 | Iterable | 提供 `iterator()` 方法的 Trait |
 | 协程 | Coroutine | 轻量级并发执行单元，由运行时调度 |
 | Atomic<T> | Atomic<T> | 透明原子操作，跨协程共享原子状态 |
-| 求值器 | Evaluator | AST 树遍历求值器 |
-| 先检查后求值 | Check-then-eval | Sema 先完成类型检查，类型错误阻止求值；求值器信任类型信息 |
+| 字节码 VM | Bytecode VM | 将 AST 编译为线性字节码后由栈式执行引擎运行 |
+| Chunk | Chunk | 字节码指令序列 + 立即数编码 |
+| 先检查后求值 | Check-then-eval | Sema 先完成类型检查，类型错误阻止求值；VM 信任类型信息 |
 | 引用相等 | Reference Equality | `==` 比较内存地址（ADT）或值（基础类型） |
 | 结构相等 | Structural Equality | `eq` 方法逐字段比较 |
 | Panic | Panic | 不可恢复的 bug，不可捕获，协程级隔离 |
@@ -2641,3 +2675,4 @@ glue/
 | 原地修改 | In-place Mutation | var 绑定支持重新赋值和字段修改 |
 | 尾调用优化 | Tail Call Optimization | 保证 TCO，尾递归不栈溢出 |
 | 值语义深拷贝 | Value Semantics Deep Copy | 赋值和传参均深拷贝，两个变量完全独立 |
+| 栈所有权不变式 | Stack Ownership Invariant | 栈上每个 Value 持有一份 owned 引用，压栈 +1 弹栈 -1 |

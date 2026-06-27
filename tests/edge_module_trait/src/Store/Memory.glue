@@ -1,0 +1,12 @@
+// Store.Memory 子模块：结构化满足 KVStore trait 契约（put/get/delete）
+pub fun put(key: str, value: str): Unit {
+    println("put " + key + "=" + value)
+}
+
+pub fun get(key: str): str {
+    "world"
+}
+
+pub fun delete(key: str): Unit {
+    println("delete " + key)
+}

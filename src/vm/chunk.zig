@@ -143,17 +143,17 @@ pub const ErrorCtorDesc = struct {
     default_prefix: []const u8,
 };
 
-/// impl 方法描述（M5i）：`impl Trait<Type> { fun m(self, ..) {..} }` 编出的方法函数。
+/// trait 方法描述（M5i）：`type T: Trait { fun m(self, ..) {..} }` 编出的方法函数。
 /// OP_CALL_METHOD 据 receiver 的类型名 + 方法名查此表分派。type_name/method_name/trait_name 借用 AST。
 /// func_idx 指向 program.functions 中编译好的方法体（self 占 slot 0）。
-pub const ImplMethodDesc = struct {
+pub const TraitMethodDesc = struct {
     type_name: []const u8,
     method_name: []const u8,
     trait_name: []const u8,
     func_idx: u16,
 };
 
-/// trait 默认方法描述（M5i）：`trait T { fun m(self) {..默认..} }`，impl 未覆写时回退此体。
+/// trait 默认方法描述（M5i）：`trait T { fun m(self) {..默认..} }`，类型未覆写时回退此体。
 /// trait_name/method_name 借用 AST；func_idx 指向编译好的默认方法体。
 pub const TraitDefaultDesc = struct {
     trait_name: []const u8,
@@ -163,8 +163,8 @@ pub const TraitDefaultDesc = struct {
 
 /// 组合 Trait 的冲突消解描述（M5n）：`trait Combined(P1, P2) { ... }`。文档 §2.7.2。
 /// 当多个父 Trait 有同名方法时，组合 Trait 须用 override / 委托(=) 显式消解。VM 据此在
-/// 扁平 impl 查找**之前**做组合分派：若接收者类型对所有 parents 都有 impl，则按本描述
-/// 解析方法（override→调 override_func；delegate→查 (delegate_trait, method) 的父 impl）。
+/// 扁平 trait 方法查找**之前**做组合分派：若接收者类型对所有 parents 都有 trait 实现，则按本描述
+/// 解析方法（override→调 override_func；delegate→查 (delegate_trait, method) 的父 trait 实现）。
 /// 多个组合 Trait 同时匹配时，按定义顺序后者覆盖前者（镜像 eval trait_definition_order 遍历）。
 pub const TraitParentDesc = struct {
     /// 组合 Trait 名（借用 AST）。
@@ -179,7 +179,7 @@ pub const TraitResolveDesc = struct {
     method_name: []const u8,
     /// override：调用此 func_idx（override 方法体，self 占 slot 0）。否则 null。
     override_func: ?u16 = null,
-    /// 委托：方法实现来自 (delegate_trait, delegate_method) 的父 impl（运行时按接收者类型查）。
+    /// 委托：方法实现来自 (delegate_trait, delegate_method) 的父 trait 实现（运行时按接收者类型查）。
     delegate_trait: ?[]const u8 = null,
     delegate_method: ?[]const u8 = null,
 };
@@ -204,9 +204,9 @@ pub const Program = struct {
     /// 全局初始化函数索引（M5g）：在 entry(main) 之前运行，求值顶层 val/var 的 RHS 写入 globals。
     /// null 表示无顶层 val/var（不需初始化）。
     globals_init: ?u16 = null,
-    /// impl 方法表（M5i）：OP_CALL_METHOD 据 receiver 类型名 + 方法名查此分派到用户 impl。
-    impl_methods: std.ArrayListUnmanaged(ImplMethodDesc) = .empty,
-    /// trait 默认方法表（M5i）：impl 未覆写时回退。
+    /// trait 方法表（M5i）：OP_CALL_METHOD 据 receiver 类型名 + 方法名查此分派到类型的 trait 实现。
+    trait_methods: std.ArrayListUnmanaged(TraitMethodDesc) = .empty,
+    /// trait 默认方法表（M5i）：类型未覆写时回退。
     trait_defaults: std.ArrayListUnmanaged(TraitDefaultDesc) = .empty,
     /// 组合 Trait 的父 Trait 关系（M5n）：(组合 Trait, 父 Trait) 对，按定义顺序追加。
     trait_parents: std.ArrayListUnmanaged(TraitParentDesc) = .empty,
@@ -233,13 +233,13 @@ pub const Program = struct {
         self.record_shapes.deinit(self.allocator);
         self.newtype_ctors.deinit(self.allocator);
         self.error_ctors.deinit(self.allocator);
-        // 释放 impl_methods 中复制的字符串
-        for (self.impl_methods.items) |m| {
+        // 释放 trait_methods 中复制的字符串
+        for (self.trait_methods.items) |m| {
             self.allocator.free(m.type_name);
             self.allocator.free(m.method_name);
             self.allocator.free(m.trait_name);
         }
-        self.impl_methods.deinit(self.allocator);
+        self.trait_methods.deinit(self.allocator);
         self.trait_defaults.deinit(self.allocator);
         self.trait_parents.deinit(self.allocator);
         self.trait_resolves.deinit(self.allocator);
@@ -292,14 +292,14 @@ pub const Program = struct {
         return @intCast(idx);
     }
 
-    /// 登记一个 impl 方法（M5i）。type_name/method_name/trait_name 借用 AST。
-    pub fn addImplMethod(self: *Program, type_name: []const u8, method_name: []const u8, trait_name: []const u8, func_idx: u16) !void {
+    /// 登记一个 trait 方法（M5i）。type_name/method_name/trait_name 借用 AST。
+    pub fn addTraitMethod(self: *Program, type_name: []const u8, method_name: []const u8, trait_name: []const u8, func_idx: u16) !void {
         // 复制字符串以确保生命周期独立于源代码
         const type_name_copy = try self.allocator.dupe(u8, type_name);
         const method_name_copy = try self.allocator.dupe(u8, method_name);
         const trait_name_copy = try self.allocator.dupe(u8, trait_name);
 
-        try self.impl_methods.append(self.allocator, .{
+        try self.trait_methods.append(self.allocator, .{
             .type_name = type_name_copy,
             .method_name = method_name_copy,
             .trait_name = trait_name_copy,

@@ -167,10 +167,10 @@ pub const SlabPool = struct {
         return std.mem.Allocator{
             .ptr = self,
             .vtable = &.{
-                .alloc = vtAlloc,
-                .resize = vtResize,
-                .remap = vtRemap,
-                .free = vtFree,
+                .alloc = vtableAlloc,
+                .resize = vtableResize,
+                .remap = vtableRemap,
+                .free = vtableFree,
             },
         };
     }
@@ -265,7 +265,7 @@ pub const SlabPool = struct {
 
 // ── vtable ──
 
-fn vtAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+fn vtableAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
     _ = ret_addr;
     const self: *SlabPool = @ptrCast(@alignCast(ctx));
 
@@ -302,7 +302,7 @@ fn vtAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: 
     return ptr;
 }
 
-fn vtFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+fn vtableFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
     _ = ret_addr;
     const self: *SlabPool = @ptrCast(@alignCast(ctx));
     const len = buf.len;
@@ -346,7 +346,7 @@ fn vtFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: us
     }
 }
 
-fn vtResize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+fn vtableResize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
     _ = ctx;
     _ = ret_addr;
     // 大对象不支持原地 resize。
@@ -358,7 +358,7 @@ fn vtResize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: u
     return new_len <= SIZE_CLASSES[slab.class_idx];
 }
 
-fn vtRemap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+fn vtableRemap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
     _ = ctx;
     _ = buf;
     _ = alignment;

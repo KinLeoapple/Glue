@@ -402,8 +402,8 @@ pub const AdtInfo = struct {
     ctor_return_types: []const ?*Type = &[_]?*Type{},
 };
 
-/// Impl 记录（用于 Overlapping 检查）
-pub const ImplRecord = struct {
+/// Trait 实现记录（用于 Overlapping 检查）
+pub const TraitEntry = struct {
     trait_name: []const u8,
     type_name: []const u8,
     line: u32,
@@ -423,7 +423,7 @@ pub const TraitInfo = struct {
     defining_module: []const u8 = "",
     /// 文档 §2.11.1: 每个类型参数声明的 kind 的 arity（`->` 个数）。
     /// `F : * -> *` → 1，`* -> * -> *` → 2，未标注/`*` → 0。
-    /// 用于 impl 头部类型实参的 kind 检查。
+    /// 用于 trait 实现头部类型实参的 kind 检查。
     type_param_kind_arities: []const usize = &[_]usize{},
 };
 
@@ -502,8 +502,8 @@ pub const TypeEnv = struct {
         return true;
     }
 
-    /// 重新定义绑定：允许覆盖已有定义（用于 impl 方法覆盖内建函数）
-    /// 文档 2.7.1: impl 方法允许与内建函数同名（如 eq、compare），通过接收者类型分派
+    /// 重新定义绑定：允许覆盖已有定义（用于 trait 方法覆盖内建函数）
+    /// 文档 2.7.1: trait 方法允许与内建函数同名（如 eq、compare），通过接收者类型分派
     pub fn redefine(self: *TypeEnv, name: []const u8, scheme: TypeScheme) !void {
         const key = try self.allocator.dupe(u8, name);
         try self.bindings.put(key, scheme);
@@ -603,9 +603,9 @@ pub const TypeInferencer = struct {
     trait_defining_modules: std.StringHashMap([]const u8),
     /// Type 定义模块记录（type_name -> 定义它的模块名）
     type_defining_modules: std.StringHashMap([]const u8),
-    /// 已注册的 impl 记录（用于 Overlapping 检查）
-    /// key: "trait_name::type_name"，value: impl 的位置信息
-    registered_impls: std.StringHashMap(ImplRecord),
+    /// 已注册的 trait 实现记录（用于 Overlapping 检查）
+    /// key: "trait_name::type_name"，value: trait 实现的位置信息
+    registered_traits: std.StringHashMap(TraitEntry),
     /// 文档 2.7.3: 函数 Trait Bound 记录（函数名 -> bounds）
     /// 用于在调用点验证泛型 Trait Bound
     fn_bounds: std.StringHashMap([]ast.TraitBound),
@@ -668,7 +668,7 @@ pub const TypeInferencer = struct {
             .current_module = "",
             .trait_defining_modules = std.StringHashMap([]const u8).init(allocator),
             .type_defining_modules = std.StringHashMap([]const u8).init(allocator),
-            .registered_impls = std.StringHashMap(ImplRecord).init(allocator),
+            .registered_traits = std.StringHashMap(TraitEntry).init(allocator),
             .fn_bounds = std.StringHashMap([]ast.TraitBound).init(allocator),
             .predeclared_fns = std.StringHashMap(void).init(allocator),
             .exported_schemes = std.StringHashMap(TypeScheme).init(allocator),
@@ -731,11 +731,11 @@ pub const TypeInferencer = struct {
             self.type_defining_modules.deinit();
         }
         {
-            var iter = self.registered_impls.keyIterator();
+            var iter = self.registered_traits.keyIterator();
             while (iter.next()) |key| {
                 self.allocator.free(key.*);
             }
-            self.registered_impls.deinit();
+            self.registered_traits.deinit();
         }
         {
             var iter = self.fn_bounds.iterator();
@@ -2808,7 +2808,7 @@ pub const TypeInferencer = struct {
                 // 推断 item 的类型
                 const item_ty = try self.freshTypeVar();
 
-                // 验证可迭代类型：检查是否有 Iterable<T> 的 impl 或是内建可迭代类型
+                // 验证可迭代类型：检查是否有 Iterable<T> 的 trait 实现或是内建可迭代类型
                 const resolved_iterable = self.resolve(iterable_ty);
                 const is_builtin_iterable = switch (resolved_iterable.*) {
                     .array_type => true,
@@ -2816,19 +2816,19 @@ pub const TypeInferencer = struct {
                     else => false,
                 };
                 if (!is_builtin_iterable) {
-                    // 检查是否有 Iterable<T> 的 impl
+                    // 检查是否有 Iterable<T> 的 trait 实现
                     const iterable_type_name: ?[]const u8 = switch (resolved_iterable.*) {
                         .adt_type => |adt| adt.name,
                         .generic_type => |g| g.name,
                         else => null,
                     };
                     if (iterable_type_name) |tn| {
-                        const impl_key = std.fmt.allocPrint(self.allocator, "Iterable::{s}", .{tn}) catch "";
+                        const trait_key = std.fmt.allocPrint(self.allocator, "Iterable::{s}", .{tn}) catch "";
                         defer {
-                            if (impl_key.len > 0) self.allocator.free(impl_key);
+                            if (trait_key.len > 0) self.allocator.free(trait_key);
                         }
-                        if (impl_key.len > 0 and !self.registered_impls.contains(impl_key)) {
-                            // 没有找到 Iterable 的 impl，但不阻止推断
+                        if (trait_key.len > 0 and !self.registered_traits.contains(trait_key)) {
+                            // 没有找到 Iterable 的 trait 实现，但不阻止推断
                             // （运行时会尝试 callMethod 分派）
                         }
                     }
@@ -3571,7 +3571,7 @@ pub const TypeInferencer = struct {
             iterable_method_names[0] = "iterator";
             // 文档 §2.7.8 / §2.17: Iterable<T> 用泛型参数表达元素类型，
             // 不使用关联类型。故 associated_type_names 为空——否则
-            // impl Iterable<T> 会被要求提供 `type Item`。
+            // 类型实现 Iterable<T> 会被要求提供 `type Item`。
             const iterable_assoc_names = &[_][]const u8{};
             // 注册方法签名：fun iterator(self: Iterable<T>) : Iterator<T>
             var iterable_method_schemes = std.StringHashMap(TypeScheme).init(self.allocator);
@@ -3611,7 +3611,7 @@ pub const TypeInferencer = struct {
             iterator_method_names[0] = "next";
             // 文档 §2.7.8 / §2.17: Iterator<T> 用泛型参数表达元素类型，
             // 不使用关联类型。故 associated_type_names 为空——否则
-            // impl Iterator<i32> 会被要求提供 `type Item`。
+            // 类型实现 Iterator<i32> 会被要求提供 `type Item`。
             const iterator_assoc_names = &[_][]const u8{};
             // 注册方法签名：fun next(self: Iterator<T>) : T?
             var iterator_method_schemes = std.StringHashMap(TypeScheme).init(self.allocator);
@@ -3682,13 +3682,13 @@ pub const TypeInferencer = struct {
     }
 
     /// 文档 2.7.2: 递归注册父 Trait 的方法到类型环境
-    /// impl Child<T> 会自动满足所有父 Trait 的 bound
+    /// 类型实现 Child<T> 会自动满足所有父 Trait 的 bound
     fn registerParentTraitMethods(self: *TypeInferencer, env: *TypeEnv, trait_name: []const u8, overridden: *std.StringHashMap(void)) void {
         trait_resolve.registerParentTraitMethods(self, env, trait_name, overridden);
     }
 
     /// 将类型中的所有类型变量替换为具体类型
-    /// 用于 impl 方法的类型实例化（如 impl Ord<i32> 中 T -> i32）
+    /// 用于 trait 方法的类型实例化（如类型实现 Ord<i32> 中 T -> i32）
     fn instantiateWithConcreteType(self: *TypeInferencer, ty: *Type, concrete: *Type) SemaError!*Type {
         return trait_resolve.instantiateWithConcreteType(self, ty, concrete);
     }
@@ -3819,8 +3819,8 @@ pub const TypeInferencer = struct {
                 else
                     self.generalize(env, fn_ty) catch return;
                 if (self.isBuiltinName(f.name)) {
-                    // 文档 2.7.1: impl 方法允许与内建函数同名（通过接收者类型分派）
-                    // eq、compare、str 等方法名在 impl 中常见，允许覆盖
+                    // 文档 2.7.1: trait 方法允许与内建函数同名（通过接收者类型分派）
+                    // eq、compare、str 等方法名在 trait 实现中常见，允许覆盖
                     if (!std.mem.eql(u8, f.name, "eq") and !std.mem.eql(u8, f.name, "compare") and !std.mem.eql(u8, f.name, "str")) {
                         self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "cannot redefine built-in name '{s}'", .{f.name});
                     } else {
@@ -4495,7 +4495,7 @@ pub const TypeInferencer = struct {
     }
 
     /// 文档 2.7.3: Trait Bound `with` 验证
-    /// 检查声明的 Trait bound 是否有对应的 trait 定义和 impl 实现
+    /// 检查声明的 Trait bound 是否有对应的 trait 定义和 trait 实现
     fn checkTraitBound(self: *TypeInferencer, bound: ast.TraitBound, location: ast.SourceLocation) void {
         trait_resolve.checkTraitBound(self, bound, location);
     }

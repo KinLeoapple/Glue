@@ -444,7 +444,7 @@ pub const TypeDef = union(enum) {
     },
 };
 
-/// 方法声明（Trait 和 Impl 中使用）
+/// 方法声明（Trait 声明与类型实现中使用）
 pub const MethodDecl = struct {
     location: SourceLocation,
     /// 方法名
@@ -484,7 +484,7 @@ pub const AssociatedType = struct {
     kind: ?*Kind,
 };
 
-/// impl 中的关联类型定义（如 type Item = i32）
+/// trait 中的关联类型定义（如 type Item = i32）
 pub const AssociatedTypeDef = struct {
     location: SourceLocation,
     /// 关联类型名称

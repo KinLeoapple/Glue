@@ -1,0 +1,24 @@
+// 文件模块作为 Trait 值（结构化匹配，§4.6.2）
+// Store.Memory 模块结构上提供 KVStore 要求的全部方法，从而可作 Trait 值传入。
+import Store
+
+trait KVStore {
+    fun put(key: str, value: str): Unit
+    fun get(key: str): str
+}
+
+// 一等 Trait 值作为运行时参数：vtable 分派到 Store.Memory 模块的函数。
+fun run(s: KVStore): Unit {
+    s.put("hello", "world")
+    println(s.get("hello"))
+}
+
+fun main() {
+    // 文件模块 Store.Memory 自动转换为 Trait 值传入。
+    run(Store.Memory)
+
+    // 限定访问子模块：直接调用其方法。
+    Store.Memory.delete("hello")
+
+    println("edge_module_trait: All tests passed!")
+}

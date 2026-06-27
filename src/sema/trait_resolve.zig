@@ -13,13 +13,13 @@ pub const TypeScheme = type_check.TypeScheme;
 pub const BoundInfo = type_check.BoundInfo;
 pub const TypeEnv = type_check.TypeEnv;
 pub const TraitInfo = type_check.TraitInfo;
-pub const ImplRecord = type_check.ImplRecord;
+pub const TraitEntry = type_check.TraitEntry;
 pub const TypeErrorKind = type_check.TypeErrorKind;
 pub const SemaError = type_check.SemaError;
 pub const TypeInferencer = type_check.TypeInferencer;
 
 /// 文档 2.7.2: 递归注册父 Trait 的方法到类型环境
-/// impl Child<T> 会自动满足所有父 Trait 的 bound
+/// 类型实现 Child<T> 会自动满足所有父 Trait 的 bound
 pub fn registerParentTraitMethods(
     inferencer: *TypeInferencer,
     env: *TypeEnv,
@@ -40,7 +40,7 @@ pub fn registerParentTraitMethods(
 }
 
 /// 将类型中的所有类型变量替换为具体类型
-/// 用于 impl 方法的类型实例化（如 impl Ord<i32> 中 T -> i32）
+/// 用于 trait 方法的类型实例化（如类型实现 Ord<i32> 中 T -> i32）
 pub fn instantiateWithConcreteType(
     inferencer: *TypeInferencer,
     ty: *Type,
@@ -96,17 +96,17 @@ pub fn checkCallSiteTraitBound(
                 else => continue,
             };
             if (isBuiltinTypeName(tp_name)) {
-                const impl_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
-                defer inferencer.allocator.free(impl_key);
-                if (!inferencer.registered_impls.contains(impl_key)) {
-                    inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
+                const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
+                defer inferencer.allocator.free(trait_key);
+                if (!inferencer.registered_traits.contains(trait_key)) {
+                    inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
                 }
             }
             if (inferencer.type_defining_modules.contains(tp_name)) {
-                const impl_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
-                defer inferencer.allocator.free(impl_key);
-                if (!inferencer.registered_impls.contains(impl_key)) {
-                    inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
+                const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
+                defer inferencer.allocator.free(trait_key);
+                if (!inferencer.registered_traits.contains(trait_key)) {
+                    inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
                 }
             }
         }
@@ -132,10 +132,10 @@ pub fn checkInstantiatedBounds(
                     else => null,
                 };
                 if (type_name) |tn| {
-                    const impl_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tn }) catch return;
-                    defer inferencer.allocator.free(impl_key);
-                    if (!inferencer.registered_impls.contains(impl_key)) {
-                        inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for {s}<{s}>", .{ bound.trait_name, tn });
+                    const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tn }) catch return;
+                    defer inferencer.allocator.free(trait_key);
+                    if (!inferencer.registered_traits.contains(trait_key)) {
+                        inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for {s}<{s}>", .{ bound.trait_name, tn });
                     }
                 }
                 break;
@@ -145,7 +145,7 @@ pub fn checkInstantiatedBounds(
 }
 
 /// 文档 2.7.3: Trait Bound `with` 验证
-/// 检查声明的 Trait bound 是否有对应的 trait 定义和 impl 实现
+/// 检查声明的 Trait bound 是否有对应的 trait 定义和 trait 实现
 pub fn checkTraitBound(
     inferencer: *TypeInferencer,
     bound: ast.TraitBound,
@@ -159,20 +159,20 @@ pub fn checkTraitBound(
                     .generic => |g| g.name,
                     else => continue,
                 };
-                const impl_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
-                defer inferencer.allocator.free(impl_key);
-                if (!inferencer.registered_impls.contains(impl_key)) {
+                const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
+                defer inferencer.allocator.free(trait_key);
+                if (!inferencer.registered_traits.contains(trait_key)) {
                     if (isBuiltinTypeName(tp_name)) {
-                        inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for trait {s}<{s}>", .{ bound.trait_name, tp_name });
+                        inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}>", .{ bound.trait_name, tp_name });
                     }
                     if (inferencer.type_defining_modules.contains(tp_name)) {
-                        inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no impl found for trait {s}<{s}>", .{ bound.trait_name, tp_name });
+                        inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}>", .{ bound.trait_name, tp_name });
                     }
                 }
             }
         } else {
-            const impl_key = std.fmt.allocPrint(inferencer.allocator, "{s}::", .{bound.trait_name}) catch return;
-            defer inferencer.allocator.free(impl_key);
+            const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::", .{bound.trait_name}) catch return;
+            defer inferencer.allocator.free(trait_key);
         }
 
         if (trait_info.associated_type_names.len > 0 and bound.type_args.len == 0) {
@@ -428,7 +428,7 @@ pub fn checkTraitDecl(
     const meth_names = meth_names_list.toOwnedSlice(inferencer.allocator) catch return;
 
     // 文档 §2.11.1: 计算每个类型参数声明的 kind arity（`->` 个数），
-    // 供 impl 头部的类型实参 kind 检查使用。
+    // 供 trait 实现头部的类型实参 kind 检查使用。
     const kind_arities = inferencer.allocator.alloc(usize, td.type_params.len) catch return;
     for (td.type_params, 0..) |tp, i| {
         kind_arities[i] = if (tp.kind) |k| kindArrowArity(k) else 0;
@@ -491,14 +491,14 @@ pub fn checkTypeTraitImplementations(
         }
 
         // Overlapping 检查：确保没有重复实现
-        const impl_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ trait_bound.trait_name, td.name }) catch return;
-        defer inferencer.allocator.free(impl_key);
+        const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ trait_bound.trait_name, td.name }) catch return;
+        defer inferencer.allocator.free(trait_key);
 
-        if (inferencer.registered_impls.contains(impl_key)) {
+        if (inferencer.registered_traits.contains(trait_key)) {
             inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "overlapping instance: trait '{s}' is already implemented for type '{s}'", .{ trait_bound.trait_name, td.name });
         } else {
-            const key_owned = inferencer.allocator.dupe(u8, impl_key) catch return;
-            inferencer.registered_impls.put(key_owned, ImplRecord{
+            const key_owned = inferencer.allocator.dupe(u8, trait_key) catch return;
+            inferencer.registered_traits.put(key_owned, TraitEntry{
                 .trait_name = trait_bound.trait_name,
                 .type_name = td.name,
                 .line = td.location.line,

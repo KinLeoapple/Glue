@@ -1,0 +1,67 @@
+// 方法分派边缘测试：内建方法、trait 方法、方法链、字段访问后调用
+
+trait Label {
+    fun label(self): str
+}
+
+type Pt: Label = Pt(x: i32, y: i32) {
+    fun label(self): str {
+        "Pt(" + str(self.x) + "," + str(self.y) + ")"
+    }
+}
+
+type Box: Label = Box(items: i32[]) {
+    fun label(self): str {
+        "Box(" + str(self.items.len()) + " items)"
+    }
+}
+
+fun main() {
+    // ---- 内建方法：数组 ----
+    val arr = [1, 2, 3, 4, 5]
+    println(arr.len())           // 5
+    println(arr.contains(3))     // true
+    println(arr.contains(99))    // false
+    println(arr.is_empty())      // false
+    println(arr.first() ?? -1)   // 1
+    println(arr.last() ?? -1)    // 5
+
+    // ---- 内建方法：字符串 ----
+    val s = "hello"
+    println(s.len())             // 5
+    println(s.is_empty())        // false
+    println(s[0])                // h
+    println(s[4])                // o
+
+    // ---- trait 方法（用户定义，按接收者类型分派）----
+    val p = Pt(3, 4)
+    println(p.label())           // Pt(3,4)
+
+    val b = Box([10, 20, 30])
+    println(b.label())           // Box(3 items)
+
+    // ---- 方法链：内建方法返回值再调用方法 ----
+    val chain1 = [1, 2, 3].push(4).push(5)
+    println(chain1.len())        // 5
+    println(chain1.last() ?? -1) // 5
+
+    // ---- 字段访问后调用方法（用中间绑定降低风险）----
+    val nested = (pt: Pt(1, 2), name: "origin")
+    val innerPt = nested.pt
+    println(innerPt.label())     // Pt(1,2)
+    val innerName = nested.name
+    println(innerName.len())     // 6 (origin)
+
+    // ---- 数组元素解构后调用 ----
+    val boxes = [Box([1]), Box([2, 3]), Box([4, 5, 6])]
+    var totalItems = 0
+    for bx in boxes {
+        val n = match bx {
+            Box(items) => items.len()
+        }
+        totalItems = totalItems + n
+    }
+    println(totalItems)          // 6
+
+    println("edge_method_dispatch: All tests passed!")
+}

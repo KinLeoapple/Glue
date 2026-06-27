@@ -2,7 +2,7 @@
 //!
 //! 将 Token 流转换为 AST，支持：
 //! - 完整的运算符优先级解析
-//! - 顶层声明（fun/type/trait/impl/use/pack）
+//! - 顶层声明（fun/type/trait/use/pack）
 //! - 表达式（字面量、二元/一元/后缀运算、Lambda、if/match/spawn/lazy/select 等）
 //! - 语句（val/var/赋值/return/defer/throw/break/continue/for/while/loop）
 //! - 类型注解和模式
@@ -468,7 +468,7 @@ pub const Parser = struct {
             };
         }
 
-        try self.reportError("expected top-level declaration (fun/type/trait/impl/use/pack/val/var)");
+        try self.reportError("expected top-level declaration (fun/type/trait/use/pack/val/var)");
         return error.UnexpectedToken;
     }
 
@@ -1025,7 +1025,6 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析 Impl 声明：impl TraitName<Type> { methods }
     /// 解析 use 声明：use Module.{items}
     fn parseUseDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const use_tok = self.advance(); // 消费 use

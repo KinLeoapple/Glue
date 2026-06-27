@@ -40,8 +40,6 @@ pub const TokenType = enum {
     kw_type,
     /// trait
     kw_trait,
-    /// impl
-    kw_impl,
     /// override
     kw_override,
     /// pack
@@ -1211,7 +1209,6 @@ fn keywordType(text: []const u8) TokenType {
     if (std.mem.eql(u8, text, "fun")) return .kw_fun;
     if (std.mem.eql(u8, text, "type")) return .kw_type;
     if (std.mem.eql(u8, text, "trait")) return .kw_trait;
-    if (std.mem.eql(u8, text, "impl")) return .kw_impl;
     if (std.mem.eql(u8, text, "override")) return .kw_override;
     if (std.mem.eql(u8, text, "pack")) return .kw_pack;
     if (std.mem.eql(u8, text, "pub")) return .kw_pub;

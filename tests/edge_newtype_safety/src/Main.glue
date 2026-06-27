@@ -1,0 +1,80 @@
+// Newtype 类型安全边缘测试：模式匹配解包、不同 newtype 即使底层相同也不互通
+
+type Celsius = Celsius(f64)
+type Fahrenheit = Fahrenheit(f64)
+type UserId = UserId(i64)
+type Email = Email(str)
+type Meters = Meters(f64)
+
+// newtype 模式匹配解包 + 重建
+fun toF(c: Celsius): Fahrenheit {
+    match c {
+        Celsius(v) => Fahrenheit(v * 9.0 / 5.0 + 32.0)
+    }
+}
+
+fun toC(f: Fahrenheit): Celsius {
+    match f {
+        Fahrenheit(v) => Celsius((v - 32.0) * 5.0 / 9.0)
+    }
+}
+
+// newtype 作为函数参数（类型隔离：不能误传裸 f64）
+fun areaM(m: Meters): f64 {
+    match m {
+        Meters(v) => v * v
+    }
+}
+
+// newtype 解包为裸值后参与运算
+fun celsiusRaw(c: Celsius): f64 {
+    match c {
+        Celsius(v) => v
+    }
+}
+
+fun main() {
+    // newtype 解包与重建（温度转换）
+    val c = Celsius(100.0)
+    val f = toF(c)
+    match f {
+        Fahrenheit(v) => println(v)   // 212
+    }
+
+    val f2 = Fahrenheit(32.0)
+    val c2 = toC(f2)
+    match c2 {
+        Celsius(v) => println(v)      // 0
+    }
+
+    // 不同 newtype 解包（底层类型不同：i64 / str / f64）
+    val uid = UserId(42)
+    match uid {
+        UserId(v) => println(v)       // 42
+    }
+
+    val em = Email("a@b.com")
+    match em {
+        Email(v) => println(v)        // a@b.com
+    }
+
+    // newtype 作为函数参数
+    println(areaM(Meters(3.0)))       // 9
+
+    // newtype 数组迭代 + 解包求和
+    val temps = [Celsius(0.0), Celsius(25.0), Celsius(100.0)]
+    var sumC = 0.0
+    for t in temps {
+        sumC = sumC + celsiusRaw(t)
+    }
+    println(sumC)                     // 125
+
+    // newtype 解包后做算术
+    val m1 = Meters(3.0)
+    val m2 = Meters(4.0)
+    val total = celsiusRaw(Celsius(0.0)) + areaM(m1) + areaM(m2)
+    // 0 + 9 + 16 = 25
+    println(total)                    // 25
+
+    println("edge_newtype_safety: All tests passed!")
+}

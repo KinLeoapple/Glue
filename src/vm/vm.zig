@@ -129,22 +129,8 @@ pub const CallFrame = struct {
 /// 调用深度上限（防爆栈 / 无限递归）。
 const MAX_FRAMES: usize = 64 * 1024;
 
-/// 字面量模式比较（OP_TEST_LIT 语义，对齐树遍历器 matchLiteralPattern）：
-/// int/float 仅比值（忽略 type_tag），bool/char/string/null 按内容。类型不符即 false。
-fn literalPatternEq(pat: Value, obj: Value) bool {
-    return switch (pat) {
-        .integer => |pv| obj.isInteger() and obj.asInt().value == pv.value,
-        .float => |pv| obj.isFloat() and obj.asFloatValue().value == pv.value,
-        .boolean => |b| obj.tag == .boolean and obj.asBool() == b,
-        .char_val => |c| obj.tag == .char_val and obj.asChar() == c,
-        .string => |s| obj.tag == .string and std.mem.eql(u8, obj.asBoxed().payload.string, s),
-        .null_val => obj.isNull(),
-        else => false,
-    };
-}
-
 /// M5b：运行时类型名（镜像 eval.valueTypeName，纯 value→name）。供 type() native 用。
-fn vmValueTypeName(val: Value) []const u8 {
+fn valueTypeName(val: Value) []const u8 {
     return switch (val.tag) {
         .small_int, .big_int => @tagName(val.asInt().type_tag),
         .float16, .float32, .float64, .float128 => @tagName(val.asFloatValue().type_tag),
@@ -174,13 +160,13 @@ fn vmValueTypeName(val: Value) []const u8 {
             break :blk if (tv.trait_name.len > 0) tv.trait_name else "trait";
         },
         .lazy_val => "Lazy",
-        .cell_val => vmValueTypeName(val.asBoxed().payload.cell_val.inner),
+        .cell_val => valueTypeName(val.asBoxed().payload.cell_val.inner),
         .builtin, .vm_closure => "function",
     };
 }
 
-/// M5i：数值类型名（i8/u32/f64 等）。impl 数值宽度互通用。
-fn implIsNumericTypeName(name: []const u8) bool {
+/// M5i：数值类型名（i8/u32/f64 等）。trait 方法数值宽度互通用。
+fn isNumericTypeName(name: []const u8) bool {
     const nums = [_][]const u8{
         "i8", "i16", "i32", "i64", "i128",
         "u8", "u16", "u32", "u64", "u128",
@@ -190,30 +176,30 @@ fn implIsNumericTypeName(name: []const u8) bool {
     return false;
 }
 
-/// M5i：两个数值类型名是否同类（都整数或都浮点）。镜像 eval numericKindMatches。
-fn implNumericKindMatches(a: []const u8, b: []const u8) bool {
+/// M5i：两个数值类型名是否同类（都整数或都浮点）。
+fn numericKindMatches(a: []const u8, b: []const u8) bool {
     const a_float = a.len > 0 and a[0] == 'f';
     const b_float = b.len > 0 and b[0] == 'f';
     return a_float == b_float;
 }
 
-/// M5i：receiver 类型名是否匹配 impl 目标类型名。精确匹配，或数值同类宽度互通
-/// （字面量推断最小类型 5→i8，用户惯写 impl<i32>，故放宽，镜像 eval callMethod）。
-fn implTypeMatches(recv: []const u8, impl_ty: []const u8) bool {
-    if (impl_ty.len == 0) return true; // 未指定类型：按方法名匹配（向后兼容）
-    if (std.mem.eql(u8, recv, impl_ty)) return true;
-    return implIsNumericTypeName(recv) and implIsNumericTypeName(impl_ty) and implNumericKindMatches(recv, impl_ty);
+/// M5i：receiver 类型名是否匹配 trait 方法的目标类型名。精确匹配，或数值同类宽度互通
+/// （字面量推断最小类型 5→i8，用户惯写 `type T: Trait<i32>`，故放宽）。
+fn traitTypeMatches(recv: []const u8, target_ty: []const u8) bool {
+    if (target_ty.len == 0) return true; // 未指定类型：按方法名匹配（向后兼容）
+    if (std.mem.eql(u8, recv, target_ty)) return true;
+    return isNumericTypeName(recv) and isNumericTypeName(target_ty) and numericKindMatches(recv, target_ty);
 }
 
-/// M5i：在 program.impl_methods 查 (receiver 类型, 方法名) 对应的方法 func_idx。
-fn findImplMethod(program: *const Program, recv_type: []const u8, method_name: []const u8) ?u16 {
-    for (program.impl_methods.items) |d| {
-        if (std.mem.eql(u8, d.method_name, method_name) and implTypeMatches(recv_type, d.type_name)) return d.func_idx;
+/// M5i：在 program.trait_methods 查 (receiver 类型, 方法名) 对应的方法 func_idx。
+fn findTraitMethod(program: *const Program, recv_type: []const u8, method_name: []const u8) ?u16 {
+    for (program.trait_methods.items) |d| {
+        if (std.mem.eql(u8, d.method_name, method_name) and traitTypeMatches(recv_type, d.type_name)) return d.func_idx;
     }
     return null;
 }
 
-/// M5i：在 program.trait_defaults 查方法名对应的默认方法 func_idx（impl 未覆写时回退）。
+/// M5i：在 program.trait_defaults 查方法名对应的默认方法 func_idx（类型未覆写时回退）。
 fn findTraitDefault(program: *const Program, method_name: []const u8) ?u16 {
     for (program.trait_defaults.items) |d| {
         if (std.mem.eql(u8, d.method_name, method_name)) return d.func_idx;
@@ -221,16 +207,16 @@ fn findTraitDefault(program: *const Program, method_name: []const u8) ?u16 {
     return null;
 }
 
-/// M5n：接收者类型 recv_type 是否对组合 Trait trait_name 的**所有**父 Trait 都有 impl
-/// （镜像 eval hasAllParentImpls）。组合分派仅在父 impl 齐备时生效。
-fn hasAllParentImpls(program: *const Program, trait_name: []const u8, recv_type: []const u8) bool {
+/// M5n：接收者类型 recv_type 是否对组合 Trait trait_name 的**所有**父 Trait 都有 trait 实现。
+/// 组合分派仅在父实现齐备时生效。
+fn hasAllParentTraits(program: *const Program, trait_name: []const u8, recv_type: []const u8) bool {
     var any_parent = false;
     for (program.trait_parents.items) |tp| {
         if (!std.mem.eql(u8, tp.trait_name, trait_name)) continue;
         any_parent = true;
         var found = false;
-        for (program.impl_methods.items) |im| {
-            if (std.mem.eql(u8, im.trait_name, tp.parent_name) and implTypeMatches(recv_type, im.type_name)) {
+        for (program.trait_methods.items) |im| {
+            if (std.mem.eql(u8, im.trait_name, tp.parent_name) and traitTypeMatches(recv_type, im.type_name)) {
                 found = true;
                 break;
             }
@@ -248,36 +234,35 @@ fn findTraitResolve(program: *const Program, trait_name: []const u8, m: []const 
     return null;
 }
 
-/// M5n：查委托目标 (trait, method) 对应接收者类型 recv_type 的父 impl func_idx。
-fn findImplMethodByTrait(program: *const Program, recv_type: []const u8, trait_name: []const u8, m: []const u8) ?u16 {
-    for (program.impl_methods.items) |im| {
+/// M5n：查委托目标 (trait, method) 对应接收者类型 recv_type 的父 trait 实现 func_idx。
+fn findParentTraitMethod(program: *const Program, recv_type: []const u8, trait_name: []const u8, m: []const u8) ?u16 {
+    for (program.trait_methods.items) |im| {
         if (std.mem.eql(u8, im.trait_name, trait_name) and std.mem.eql(u8, im.method_name, m) and
-            implTypeMatches(recv_type, im.type_name)) return im.func_idx;
+            traitTypeMatches(recv_type, im.type_name)) return im.func_idx;
     }
     return null;
 }
 
-/// M5n：组合 Trait 分派（文档 §2.7.2）。按定义顺序遍历组合 Trait，对接收者类型父 impl 齐备的
-/// 组合 Trait，若其消解了 m（override/委托），记为候选；**后定义的覆盖先定义的**（镜像 eval
-/// trait_definition_order 遍历 + best_result 后写覆盖）。返回最终命中的 func_idx（override 体或委托
-/// 目标父 impl），无命中返回 null（落回扁平 impl 查找）。
+/// M5n：组合 Trait 分派（文档 §2.7.2）。按定义顺序遍历组合 Trait，对接收者类型父实现齐备的
+/// 组合 Trait，若其消解了 m（override/委托），记为候选；**后定义的覆盖先定义的**。返回最终命中的
+/// func_idx（override 体或委托目标父实现），无命中返回 null（落回扁平 trait 方法查找）。
 fn resolveComposedMethod(program: *const Program, recv_type: []const u8, m: []const u8) ?u16 {
     var best: ?u16 = null;
     for (program.trait_order.items) |trait_name| {
-        if (!hasAllParentImpls(program, trait_name, recv_type)) continue;
+        if (!hasAllParentTraits(program, trait_name, recv_type)) continue;
         const r = findTraitResolve(program, trait_name, m) orelse continue;
         if (r.override_func) |fidx| {
             best = fidx; // override：调用 override 方法体
         } else if (r.delegate_trait) |dt| {
-            // 委托：实现来自父 impl (delegate_trait, delegate_method)，按接收者类型查。
-            if (findImplMethodByTrait(program, recv_type, dt, r.delegate_method.?)) |fidx| best = fidx;
+            // 委托：实现来自父 trait 实现 (delegate_trait, delegate_method)，按接收者类型查。
+            if (findParentTraitMethod(program, recv_type, dt, r.delegate_method.?)) |fidx| best = fidx;
         }
     }
     return best;
 }
 
 /// M5d：结构相等（深比较 array/record/adt/newtype），镜像 eval structuralEquals。供 eq() native 用。
-fn vmStructuralEquals(a: Value, b: Value) bool {
+fn structuralEquals(a: Value, b: Value) bool {
     if (a.tag != b.tag) return false;
     return switch (a.tag) {
         .small_int, .big_int => a.asInt().value == b.asInt().value,
@@ -305,7 +290,7 @@ fn vmStructuralEquals(a: Value, b: Value) bool {
             const barr = &b_box.payload.array;
             if (arr.elements.len != barr.elements.len) return false;
             for (arr.elements, barr.elements) |x, y| {
-                if (!vmStructuralEquals(x, y)) return false;
+                if (!structuralEquals(x, y)) return false;
             }
             return true;
         },
@@ -317,7 +302,7 @@ fn vmStructuralEquals(a: Value, b: Value) bool {
             var it = rec.fields.iterator();
             while (it.next()) |e| {
                 const bv = brec.fields.get(e.key_ptr.*) orelse return false;
-                if (!vmStructuralEquals(e.value_ptr.*, bv)) return false;
+                if (!structuralEquals(e.value_ptr.*, bv)) return false;
             }
             var bit = brec.fields.iterator();
             while (bit.next()) |e| {
@@ -334,7 +319,7 @@ fn vmStructuralEquals(a: Value, b: Value) bool {
             if (!std.mem.eql(u8, av.constructor, bv.constructor)) return false;
             if (av.fields.len != bv.fields.len) return false;
             for (av.fields, bv.fields) |fa, fb| {
-                if (!vmStructuralEquals(fa.value, fb.value)) return false;
+                if (!structuralEquals(fa.value, fb.value)) return false;
             }
             return true;
         },
@@ -343,7 +328,7 @@ fn vmStructuralEquals(a: Value, b: Value) bool {
             const b_box = b.asBoxed();
             const nv = &a_box.payload.newtype;
             const bnv = &b_box.payload.newtype;
-            return std.mem.eql(u8, nv.type_name, bnv.type_name) and vmStructuralEquals(nv.inner, bnv.inner);
+            return std.mem.eql(u8, nv.type_name, bnv.type_name) and structuralEquals(nv.inner, bnv.inner);
         },
         .error_val => {
             const a_box = a.asBoxed();
@@ -391,6 +376,12 @@ pub const VM = struct {
     /// 分配并以 unit 初始化；deinit 时 release 各槽。
     globals: std.ArrayListUnmanaged(Value) = .empty,
 
+    /// VM profile：环境变量 GLUE_VM_PROFILE=1 开启。统计 opcode 执行频率，
+    /// 供后续优化（superinstructions / inline caching 候选识别）决策。覆盖所有嵌套 runLoop
+    /// 调用（含 forceLazy / invokeMethodBody / call）。墙钟耗时用外部 time 命令测量更准确。
+    profile_enabled: bool = false,
+    profile_counts: [@typeInfo(OpCode).@"enum".fields.len]u64 = .{0} ** @typeInfo(OpCode).@"enum".fields.len,
+
     pub fn init(allocator: std.mem.Allocator) VM {
         return .{ .allocator = allocator };
     }
@@ -427,8 +418,46 @@ pub const VM = struct {
         self.globals.deinit(self.allocator);
     }
 
+    /// 输出 VM profile 报告到 stderr（GLUE_VM_PROFILE=1 时调用）。统计 opcode 频率，
+    /// 按计数降序输出，供 superinstructions / inline caching 候选识别。
+    /// 墙钟耗时请用外部 `time` 命令测量（避免 profile overhead 干扰）。
+    pub fn dumpProfile(self: *VM, io: std.Io) void {
+        if (!self.profile_enabled) return;
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        const wr = &w.interface;
+
+        var total: u64 = 0;
+        for (self.profile_counts) |c| total += c;
+
+        wr.print("\n[VM PROFILE]\n", .{}) catch {};
+        wr.print("total instructions: {d}\n", .{total}) catch {};
+
+        // 按计数降序排序输出。
+        const Entry = struct { idx: u8, count: u64 };
+        var entries: [@typeInfo(OpCode).@"enum".fields.len]Entry = undefined;
+        for (self.profile_counts, 0..) |c, i| entries[i] = .{ .idx = @intCast(i), .count = c };
+        std.mem.sort(Entry, &entries, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                return a.count > b.count;
+            }
+        }.lt);
+
+        wr.print("\nopcode counts (sorted desc):\n", .{}) catch {};
+        for (entries) |e| {
+            if (e.count == 0) continue;
+            const op_name = (@as(OpCode, @enumFromInt(e.idx))).name();
+            const pct: f64 = if (total > 0)
+                (@as(f64, @floatFromInt(e.count)) * 100.0) / @as(f64, @floatFromInt(total))
+            else
+                0;
+            wr.print("  {s}: {d} ({d:.1}%)\n", .{ op_name, e.count, pct }) catch {};
+        }
+        w.flush() catch {};
+    }
+
     /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
-    fn channelOf(self: *VM, v: Value) ?*value.ChannelValue {
+    fn asChannel(self: *VM, v: Value) ?*value.ChannelValue {
         _ = self;
         if (v.tag == .channel_val) {
             return v.asBoxed().payload.channel_val;
@@ -726,6 +755,7 @@ pub const VM = struct {
             const op: OpCode = @enumFromInt(code[frame.ip]);
             const loc = func.chunk.lines.items[frame.ip];
             frame.ip += 1;
+            if (self.profile_enabled) self.profile_counts[@intFromEnum(op)] += 1;
             switch (op) {
                 .op_const => {
                     const idx = opcode.readU16(code, frame.ip);
@@ -884,19 +914,19 @@ pub const VM = struct {
                     const left = self.pop();
                     defer left.release(self.allocator);
                     defer right.release(self.allocator);
-                    try self.push(try self.arith(op, left, right, loc));
+                    try self.push(try self.doArith(op, left, right, loc));
                 },
                 .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge => {
                     const right = self.pop();
                     const left = self.pop();
                     defer left.release(self.allocator);
                     defer right.release(self.allocator);
-                    try self.push(try self.compare(op, left, right, loc));
+                    try self.push(try self.doCompare(op, left, right, loc));
                 },
                 .op_neg => {
                     const v = self.pop();
                     defer v.release(self.allocator);
-                    try self.push(try self.negate(v, loc));
+                    try self.push(try self.doNegate(v, loc));
                 },
                 .op_not => {
                     const v = self.pop();
@@ -1439,7 +1469,7 @@ pub const VM = struct {
                 .op_try_recv => {
                     const chv = self.pop();
                     defer chv.release(self.allocator);
-                    const ch = self.channelOf(chv) orelse return self.fail(loc, "select: not a channel", error.TypeMismatch);
+                    const ch = self.asChannel(chv) orelse return self.fail(loc, "select: not a channel", error.TypeMismatch);
                     if (ch.tryRecv()) |v| {
                         try self.push(v); // tryRecv 移交所有权
                         try self.push(Value.fromBool(true));
@@ -1452,7 +1482,7 @@ pub const VM = struct {
                 .op_recv => {
                     const chv = self.pop();
                     defer chv.release(self.allocator);
-                    const ch = self.channelOf(chv) orelse return self.fail(loc, "select: not a channel", error.TypeMismatch);
+                    const ch = self.asChannel(chv) orelse return self.fail(loc, "select: not a channel", error.TypeMismatch);
                     if (ch.recv()) |v| {
                         try self.push(v);
                     } else {
@@ -1634,7 +1664,7 @@ pub const VM = struct {
                 if (argc != 1) return self.fail(loc, "type expects 1 argument", error.WrongArity);
                 const v = self.pop();
                 defer v.release(self.allocator);
-                const name = vmValueTypeName(v);
+                const name = valueTypeName(v);
                 try self.push(try Value.fromString(self.allocator, try self.allocator.dupe(u8, name)));
             },
             // M5d：eq(a, b) —— 结构相等（深比较 array/record/adt/newtype），镜像 eval structuralEquals。
@@ -1644,7 +1674,7 @@ pub const VM = struct {
                 defer b.release(self.allocator);
                 const a = self.pop();
                 defer a.release(self.allocator);
-                try self.push(Value.fromBool(vmStructuralEquals(a, b)));
+                try self.push(Value.fromBool(structuralEquals(a, b)));
             },
             // M5d：Panic(v) —— 格式化 v 后触发 VM panic（镜像 eval builtinPanic）。
             .panic => {
@@ -2146,16 +2176,16 @@ pub const VM = struct {
                 return self.doTraitMethod(&trait_box.payload.trait_value, name, argc, args_start, loc);
             }
         }
-        // M5i：用户 impl 方法分派 —— 据 receiver 类型名 + 方法名查 program.impl_methods（数值宽度互通），
+        // M5i：用户 trait 方法分派 —— 据 receiver 类型名 + 方法名查 program.trait_methods（数值宽度互通），
         // 命中则把 [receiver, args...] 作为方法 slot 跑方法体。未命中查 trait 默认方法；再未命中走 native。
         if (self.program) |prog| {
-            // M5n：组合 Trait 冲突消解优先（文档 §2.7.2）——override/委托覆盖父 Trait impl，
-            // 在扁平 impl 查找之前。镜像 eval：组合分派 > 扁平 impl > trait 默认。
-            const recv_type = vmValueTypeName(receiver);
+            // M5n：组合 Trait 冲突消解优先（文档 §2.7.2）——override/委托覆盖父 trait 实现，
+            // 在扁平 trait 方法查找之前。镜像 eval：组合分派 > 扁平 trait 方法 > trait 默认。
+            const recv_type = valueTypeName(receiver);
             if (resolveComposedMethod(prog, recv_type, name)) |fidx| {
                 return self.invokeMethodBody(prog, fidx, argc, args_start, loc);
             }
-            if (findImplMethod(prog, recv_type, name)) |fidx| {
+            if (findTraitMethod(prog, recv_type, name)) |fidx| {
                 return self.invokeMethodBody(prog, fidx, argc, args_start, loc);
             }
             if (findTraitDefault(prog, name)) |fidx| {
@@ -2265,16 +2295,16 @@ pub const VM = struct {
     /// vtable 查 name → vm_closure。把 receiver 槽替换为该 closure（retainOwned，vtable 仍持母本），
     /// 释放原 receiver，再 enterClosure + 边界 runLoop 跑到返回，结果压栈（替换 [closure,args] → result）。
     fn doTraitMethod(self: *VM, tv: *value.TraitValue, name: []const u8, argc: u8, args_start: usize, loc: ast.SourceLocation) VMError!void {
-        const impl = tv.methods.get(name) orelse
+        const method_val = tv.methods.get(name) orelse
             return self.fail(loc, "no such method on trait value", error.TypeMismatch);
-        if (impl.tag != .vm_closure) return self.fail(loc, "trait method is not callable", error.TypeMismatch);
+        if (method_val.tag != .vm_closure) return self.fail(loc, "trait method is not callable", error.TypeMismatch);
         const callee_idx = args_start - 1;
         const receiver = self.stack.items[callee_idx];
         // 替换 receiver 槽为方法闭包（retainOwned：vtable 持母本，调用结束帧 release 此槽）。
-        self.stack.items[callee_idx] = try self.retainOwned(impl);
+        self.stack.items[callee_idx] = try self.retainOwned(method_val);
         receiver.release(self.allocator); // 释放 trait_value receiver（rc-1）
         // 边界嵌套运行：enterClosure 建帧，runLoop 在帧弹回当前深度即返回。
-        const vc = &impl.asBoxed().payload.vm_closure;
+        const vc = &method_val.asBoxed().payload.vm_closure;
         const total = vc.bound_args.len + argc;
         if (total != vc.arity) return self.fail(loc, "trait method called with wrong number of arguments", error.WrongArity);
         const saved_depth = self.stop_depth;
@@ -2311,7 +2341,7 @@ pub const VM = struct {
                     while (true) {
                         const current = av.data.load(.seq_cst);
                         const cur_val = try av.load(self.allocator);
-                        const result = try self.arith(arith_op, cur_val, rhs, loc);
+                        const result = try self.doArith(arith_op, cur_val, rhs, loc);
                         const new_raw = value.valueToAtomicRaw(result, av.type_tag);
                         if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst) == null) break;
                     }
@@ -2321,7 +2351,7 @@ pub const VM = struct {
             return; // atomic 就地更新，slot 不变
         }
         // 非 atomic：常规读改写。
-        const result = try self.arith(arith_op, target, rhs, loc);
+        const result = try self.doArith(arith_op, target, rhs, loc);
         if (cur.tag == .cell_val) {
             const cell = &cur.asBoxed().payload.cell_val;
             cell.inner.release(self.allocator);
@@ -2333,7 +2363,7 @@ pub const VM = struct {
     }
 
     /// M4c：执行 OP_COMPOUND_UPVALUE。upvalue 是 *Cell；cell.inner 持 atomic → 原子 fetch<op>（不重写 inner）；
-    /// 否则常规 inner arith rhs 写回 inner。镜像 doCompoundLocal 的 cell 分支，作用于捕获变量。
+    /// 否则常规 inner doArith rhs 写回 inner。镜像 doCompoundLocal 的 cell 分支，作用于捕获变量。
     fn doCompoundUpvalue(self: *VM, frame: *CallFrame, idx: u16, arith_op: OpCode, loc: ast.SourceLocation) VMError!void {
         const rhs = self.pop();
         defer rhs.release(self.allocator);
@@ -2354,7 +2384,7 @@ pub const VM = struct {
                     while (true) {
                         const current = av.data.load(.seq_cst);
                         const cur_val = try av.load(self.allocator);
-                        const result = try self.arith(arith_op, cur_val, rhs, loc);
+                        const result = try self.doArith(arith_op, cur_val, rhs, loc);
                         const new_raw = value.valueToAtomicRaw(result, av.type_tag);
                         if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst) == null) break;
                     }
@@ -2363,7 +2393,7 @@ pub const VM = struct {
             }
             return; // atomic 就地更新，inner 不变
         }
-        const result = try self.arith(arith_op, target, rhs, loc);
+        const result = try self.doArith(arith_op, target, rhs, loc);
         cell.inner.release(self.allocator);
         cell.inner = result;
     }
@@ -2582,7 +2612,7 @@ pub const VM = struct {
     }
 
     /// 算术 + 位运算。语义镜像 eval.zig evalAdd/Sub/...（复用 value.zig promote/inRange）。
-    fn arith(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
+    fn doArith(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         if (left.isInteger() and right.isInteger()) {
             const left_int = left.asInt();
             const right_int = right.asInt();
@@ -2634,11 +2664,11 @@ pub const VM = struct {
             const owned = result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
             return try Value.fromString(self.allocator, owned);
         }
-        return self.arithFloat(op, left, right, loc);
+        return self.doArithFloat(op, left, right, loc);
     }
 
     /// 浮点参与的算术（int↔float 混合按 evalBinary 提升为 float）。
-    fn arithFloat(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
+    fn doArithFloat(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         if ((left.isFloat() or left.isInteger()) and (right.isFloat() or right.isInteger())) {
             const lf: f128 = if (left.isFloat()) left.asFloatValue().value else intToFloat(left.asInt());
             const rf: f128 = if (right.isFloat()) right.asFloatValue().value else intToFloat(right.asInt());
@@ -2667,7 +2697,7 @@ pub const VM = struct {
     }
 
     /// 比较：== != < > <= >=。返回 bool。
-    fn compare(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
+    fn doCompare(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         // == / !=：数值按 promoteIntTypes 后**按值**比较（忽略 type_tag），镜像 eval evalBinary .eq/.not_eq。
         // 关键：隐式定型（OP_COERCE）后操作数 tag 可能不同（如 i32 形参 vs i8 字面量），
         // 不能用 tag-strict 的 Value.equals，否则 `n == 0` 恒 false（M5 整数定型回归）。
@@ -2746,17 +2776,7 @@ pub const VM = struct {
         return self.fail(loc, "comparison requires numeric operands", error.TypeMismatch);
     }
 
-    fn ordCmp(op: OpCode, l: anytype, r: anytype) bool {
-        return switch (op) {
-            .op_lt => l < r,
-            .op_gt => l > r,
-            .op_le => l <= r,
-            .op_ge => l >= r,
-            else => unreachable,
-        };
-    }
-
-    fn negate(self: *VM, v: Value, loc: ast.SourceLocation) VMError!Value {
+    fn doNegate(self: *VM, v: Value, loc: ast.SourceLocation) VMError!Value {
         if (v.isInteger()) {
             const int_val = v.asInt();
             const t = int_val.type_tag;

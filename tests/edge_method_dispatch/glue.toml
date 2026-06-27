@@ -1,3 +1,3 @@
-name = "phase2"
+name = "edge_method_dispatch"
 version = "0.1.0"
 entry = "src/Main.glue"

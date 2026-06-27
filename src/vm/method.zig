@@ -13,7 +13,7 @@ const Value = value.Value;
 pub const MethodError = error{ OutOfMemory, NoSuchMethod, TypeMismatch, WrongArity, ChannelClosed };
 
 /// 结构相等（contains 用）。复用 value.zig 的 equals（深比较基础/数组/记录）。
-fn structEq(a: Value, b: Value) bool {
+fn structEquals(a: Value, b: Value) bool {
     return a.equals(b);
 }
 
@@ -88,7 +88,7 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         if (receiver.tag != .array) return error.TypeMismatch;
         const arr = &receiver.asBoxed().payload.array;
         for (arr.elements) |item| {
-            if (structEq(item, args[0])) return Value.fromBool(true);
+            if (structEquals(item, args[0])) return Value.fromBool(true);
         }
         return Value.fromBool(false);
     }

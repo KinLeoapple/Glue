@@ -1,0 +1,76 @@
+// Trait 内联实现边缘测试：多 trait 组合、默认方法、按接收者类型分派
+
+trait Greet {
+    fun name(self): str
+    fun hello(self): str {
+        "Hello, " + self.name()
+    }
+}
+
+trait Sizeable {
+    fun sz(self): i32
+}
+
+trait Show {
+    fun show(self): str
+}
+
+// 单 ADT 实现多 trait（内联进 type 声明）
+type Ordering: (Greet, Sizeable, Show) = | Lt | Eq | Gt {
+    fun name(self): str {
+        match self {
+            Lt => "less"
+            Eq => "equal"
+            Gt => "greater"
+        }
+    }
+
+    fun sz(self): i32 {
+        match self {
+            Lt => -1
+            Eq => 0
+            Gt => 1
+        }
+    }
+
+    fun show(self): str {
+        "Ordering." + self.name()
+    }
+}
+
+// 不同类型实现同一 trait，按接收者类型分派同名方法
+type Color: Sizeable = | Red | Green | Blue {
+    fun sz(self): i32 { 3 }
+}
+
+type Pt: (Sizeable, Show) = Pt(x: i32, y: i32) {
+    fun sz(self): i32 { 2 }
+    fun show(self): str {
+        "Pt(" + str(self.x) + "," + str(self.y) + ")"
+    }
+}
+
+fun main() {
+    // 默认方法（trait 提供默认实现，type 不覆盖即可用）
+    println(Lt.hello())   // Hello, less
+    println(Eq.hello())   // Hello, equal
+    println(Gt.name())    // greater
+
+    // 多 trait 方法共存于同一类型
+    println(Lt.sz())      // -1
+    println(Lt.show())    // Ordering.less
+    println(Eq.sz())      // 0
+    println(Gt.show())    // Ordering.greater
+
+    // 按接收者类型分派同名方法 sz
+    println(Lt.sz())      // -1
+    println(Red.sz())     // 3
+    println(Blue.sz())    // 3
+    println(Pt(1, 2).sz()) // 2
+
+    // Show trait 在不同类型上的实现
+    println(Pt(3, 4).show()) // Pt(3,4)
+    println(Lt.show())       // Ordering.less
+
+    println("edge_traits: All tests passed!")
+}

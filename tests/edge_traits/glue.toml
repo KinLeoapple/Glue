@@ -1,3 +1,3 @@
-name = "edge_records_traits"
+name = "edge_traits"
 version = "0.1.0"
 entry = "src/Main.glue"

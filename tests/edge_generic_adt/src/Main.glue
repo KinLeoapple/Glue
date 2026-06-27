@@ -1,0 +1,90 @@
+// 泛型 ADT 边缘测试：多参数、递归、泛型高阶函数（map/foldl/tree）
+
+type Pair<A, B> = Pair(first: A, second: B)
+
+type Lst<T> = | Nil | Cons(T, Lst<T>)
+
+type Tree<T> = | Leaf | Node(T, Tree<T>, Tree<T>)
+
+fun len<T>(l: Lst<T>): i32 {
+    match l {
+        Nil => 0
+        Cons(_, t) => 1 + len(t)
+    }
+}
+
+fun map<T, U>(l: Lst<T>, f): Lst<U> {
+    match l {
+        Nil => Nil
+        Cons(x, t) => Cons(f(x), map(t, f))
+    }
+}
+
+fun foldl<T, A>(l: Lst<T>, init: A, f): A {
+    match l {
+        Nil => init
+        Cons(x, t) => foldl(t, f(init, x), f)
+    }
+}
+
+fun treeSum(t: Tree<i32>): i32 {
+    match t {
+        Leaf => 0
+        Node(v, l, r) => v + treeSum(l) + treeSum(r)
+    }
+}
+
+fun max(a: i32, b: i32): i32 {
+    if a > b { a } else { b }
+}
+
+fun treeDepth<T>(t: Tree<T>): i32 {
+    match t {
+        Leaf => 0
+        Node(_, l, r) => 1 + max(treeDepth(l), treeDepth(r))
+    }
+}
+
+fun main() {
+    // Pair 混合类型
+    val p1 = Pair(1, "one")
+    val p2 = Pair(true, 3.14)
+    println(p1.first)     // 1
+    println(p1.second)    // one
+    println(p2.first)     // true
+    println(p2.second)    // 3.14
+
+    // Lst 构造与长度
+    val nums = Cons(1, Cons(2, Cons(3, Cons(4, Nil))))
+    println(len(nums))    // 4
+
+    // 空 Lst
+    println(len(Nil))     // 0
+
+    // map：Lst<i32> -> Lst<i32>
+    val doubled = map(nums, fun(x) { x * 2 })
+    println(len(doubled)) // 4
+    // 验证内容：foldl 求和
+    val dsum = foldl(doubled, 0, fun(acc, x) { acc + x })
+    println(dsum)         // 20 (2+4+6+8)
+
+    // foldl 求和
+    val sum = foldl(nums, 0, fun(acc, x) { acc + x })
+    println(sum)          // 10
+
+    // foldl 拼接字符串：Lst<str> -> str
+    val strs = Cons("a", Cons("b", Cons("c", Nil)))
+    val concat = foldl(strs, "", fun(acc, x) { acc + x })
+    println(concat)       // abc
+
+    // Tree 求和与深度
+    val t = Node(1, Node(2, Leaf, Leaf), Node(3, Node(4, Leaf, Leaf), Leaf))
+    println(treeSum(t))      // 10
+    println(treeDepth(t))    // 3
+
+    // 深层泛型：Lst of Pair
+    val pl = Cons(Pair(1, 2), Cons(Pair(3, 4), Nil))
+    println(len(pl))         // 2
+
+    println("edge_generic_adt: All tests passed!")
+}

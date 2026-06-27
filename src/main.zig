@@ -56,15 +56,21 @@ const DEFAULT_ENTRY = "src/Main.glue";
 /// `GLUE_VM_TRACE=1`：向 stderr 打印 VM 执行信息（调试用）。
 var vm_trace: bool = false;
 
+/// `GLUE_VM_PROFILE=1`：统计 opcode 频率 + 墙钟耗时，结束后输出 profile 报告。
+var vm_profile: bool = false;
+
 /// 从环境变量初始化 VM 追踪开关。environ_map 为 null（无 environ）时保持默认。
 fn initVmFlags(environ_map: ?*std.process.Environ.Map) void {
     const e = environ_map orelse return;
     if (e.get("GLUE_VM_TRACE")) |v| {
         if (std.mem.eql(u8, v, "1")) vm_trace = true;
     }
+    if (e.get("GLUE_VM_PROFILE")) |v| {
+        if (std.mem.eql(u8, v, "1")) vm_profile = true;
+    }
 }
 
-fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+fn printError(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writerStreaming(io, &buf);
     w.interface.print(fmt, args) catch {};
@@ -72,13 +78,17 @@ fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
 }
 
 fn printUsage(io: std.Io) void {
-    printErr(io,
+    printError(io,
         \\Glue v0.1.0 — project-based language runtime
         \\
         \\Usage:
         \\  glue init [name]   Scaffold a new Glue project (in ./name or current dir)
         \\  glue run           Build and run the current project
         \\  glue debug         Run with diagnostics (memory checking + runtime trace)
+        \\
+        \\Environment:
+        \\  GLUE_VM_TRACE=1    Enable VM execution trace to stderr
+        \\  GLUE_VM_PROFILE=1  Dump opcode frequency + wall-clock profile after run
         \\
     , .{});
 }
@@ -110,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "debug")) {
         try runProject(allocator, io, true);
     } else {
-        printErr(io, "error: unknown command '{s}'\n\n", .{cmd});
+        printError(io, "error: unknown command '{s}'\n\n", .{cmd});
         printUsage(io);
         std.process.exit(1);
     }
@@ -224,12 +234,12 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
     switch (checkDirState(io, target_dir)) {
         .is_project => {
             const shown = if (target_dir.len == 0) "current directory" else target_dir;
-            printErr(io, "error: already a Glue project ({s} contains {s})\n", .{ shown, MANIFEST_NAME });
+            printError(io, "error: already a Glue project ({s} contains {s})\n", .{ shown, MANIFEST_NAME });
             std.process.exit(1);
         },
         .non_empty => {
             const shown = if (target_dir.len == 0) "current directory" else target_dir;
-            printErr(io, "error: {s} is not an empty directory\n", .{shown});
+            printError(io, "error: {s} is not an empty directory\n", .{shown});
             std.process.exit(1);
         },
         .missing, .empty => {}, // 可初始化
@@ -243,7 +253,7 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
     const src_dir = try std.fmt.allocPrint(allocator, "{s}src", .{dir_prefix});
     defer allocator.free(src_dir);
     cwd.createDirPath(io, src_dir) catch |err| {
-        printErr(io, "error: could not create directory '{s}': {s}\n", .{ src_dir, @errorName(err) });
+        printError(io, "error: could not create directory '{s}': {s}\n", .{ src_dir, @errorName(err) });
         std.process.exit(1);
     };
 
@@ -256,7 +266,7 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
     , .{ proj_name, DEFAULT_ENTRY });
     defer allocator.free(manifest_content);
     cwd.writeFile(io, .{ .sub_path = manifest_path, .data = manifest_content }) catch |err| {
-        printErr(io, "error: could not write '{s}': {s}\n", .{ manifest_path, @errorName(err) });
+        printError(io, "error: could not write '{s}': {s}\n", .{ manifest_path, @errorName(err) });
         std.process.exit(1);
     };
 
@@ -270,7 +280,7 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
         \\
     ;
     cwd.writeFile(io, .{ .sub_path = main_path, .data = main_content }) catch |err| {
-        printErr(io, "error: could not write '{s}': {s}\n", .{ main_path, @errorName(err) });
+        printError(io, "error: could not write '{s}': {s}\n", .{ main_path, @errorName(err) });
         std.process.exit(1);
     };
 
@@ -289,7 +299,7 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
     const cwd = std.Io.Dir.cwd();
 
     const root = (try findProjectRoot(allocator, io)) orelse {
-        printErr(io, "error: not a Glue project (no {s} found); run 'glue init' first\n", .{MANIFEST_NAME});
+        printError(io, "error: not a Glue project (no {s} found); run 'glue init' first\n", .{MANIFEST_NAME});
         std.process.exit(1);
     };
     defer allocator.free(root);
@@ -298,7 +308,7 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ root, MANIFEST_NAME });
     defer allocator.free(manifest_path);
     const manifest_src = cwd.readFileAlloc(io, manifest_path, allocator, .unlimited) catch |err| {
-        printErr(io, "error: could not read {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        printError(io, "error: could not read {s}: {s}\n", .{ manifest_path, @errorName(err) });
         std.process.exit(1);
     };
     defer allocator.free(manifest_src);
@@ -309,7 +319,7 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
     defer allocator.free(entry_path);
 
     const source = cwd.readFileAlloc(io, entry_path, allocator, .unlimited) catch |err| {
-        printErr(io, "error: could not read entry '{s}': {s}\n", .{ entry_path, @errorName(err) });
+        printError(io, "error: could not read entry '{s}': {s}\n", .{ entry_path, @errorName(err) });
         std.process.exit(1);
     };
     defer allocator.free(source);
@@ -363,9 +373,9 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
     }
     const leaked = dbg.deinit();
     if (leaked == .leak) {
-        printErr(io, "[GLUE_GPA] LEAK detected\n", .{});
+        printError(io, "[GLUE_GPA] LEAK detected\n", .{});
     } else {
-        printErr(io, "[GLUE_GPA] clean (no leak / no double-free)\n", .{});
+        printError(io, "[GLUE_GPA] clean (no leak / no double-free)\n", .{});
     }
 }
 
@@ -402,7 +412,7 @@ fn tryRunOnVM(
     filename: []const u8,
 ) VmOutcome {
     if (!vmEligible(module)) {
-        printErr(io, "{s}: error: no 'main' function found\n", .{filename});
+        printError(io, "{s}: error: no 'main' function found\n", .{filename});
         return .failed;
     }
 
@@ -410,11 +420,11 @@ fn tryRunOnVM(
     loader.prepareModule(module) catch |err| switch (err) {
         error.TypeCheckFailed => return .failed,
         error.CircularDependency => {
-            printErr(io, "{s}: error: circular module dependency\n", .{filename});
+            printError(io, "{s}: error: circular module dependency\n", .{filename});
             return .failed;
         },
         else => {
-            printErr(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
+            printError(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
             return .failed;
         },
     };
@@ -439,23 +449,25 @@ fn tryRunOnVM(
         seen.deinit();
     }
     loader.collectDependencies(module, &deps, &seen) catch |err| {
-        printErr(io, "{s}: error: dependency collection failed: {s}\n", .{ filename, @errorName(err) });
+        printError(io, "{s}: error: dependency collection failed: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
 
     mc.compileModuleWithDeps(&module, deps.items) catch |err| {
-        printErr(io, "{s}: error: compilation failed: {s}\n", .{ filename, @errorName(err) });
+        printError(io, "{s}: error: compilation failed: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
 
     const entry = mc.lookupFn("main") orelse {
-        printErr(io, "{s}: error: 'main' function not found after compilation\n", .{filename});
+        printError(io, "{s}: error: 'main' function not found after compilation\n", .{filename});
         return .failed;
     };
 
     // 执行 main
     var machine = vm.VM.initWithIo(value_allocator, io);
+    machine.profile_enabled = vm_profile;
     defer machine.deinit();
+    defer machine.dumpProfile(io); // 先于 deinit 执行（LIFO），读取未释放的 profile 数据
     const result = machine.call(&mc.program, entry, &.{}) catch |err| {
         const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
         const loc: ?ast.SourceLocation = if (machine.err_loc.line > 0) machine.err_loc else null;
@@ -482,7 +494,7 @@ fn tryRunOnVM(
 
     result.release(value_allocator);
 
-    if (vm_trace) printErr(io, "[vm] {s}: ran on VM\n", .{filename});
+    if (vm_trace) printError(io, "[vm] {s}: ran on VM\n", .{filename});
     return .ran_main;
 }
 

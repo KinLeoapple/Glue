@@ -94,11 +94,11 @@ pub const ModuleCompiler = struct {
     error_table: std.ArrayListUnmanaged(CtorEntry) = .empty,
     /// 顶层全局变量表（M5g，第一遍登记）：name → globals 数组索引 + 是否可变（var）。
     global_table: std.ArrayListUnmanaged(GlobalEntry) = .empty,
-    /// trait/impl 方法名集合（M5i，第一遍登记）：用于把裸名调用 `compare(a,b)`（with-clause 约束的
+    /// trait 方法名集合（M5i，第一遍登记）：用于把裸名调用 `compare(a,b)`（with-clause 约束的
     /// trait 方法作自由函数）解析为 receiver=arg0 的 OP_CALL_METHOD 分派。
     method_names: std.ArrayListUnmanaged([]const u8) = .empty,
-    /// 零参 trait/impl 方法表（M5k）：`zero()` 无 receiver 无法按类型分派，按名字直接解析到 impl 函数
-    /// （name → func_idx，首个 impl 生效）。供 emitCall 的 argc==0 裸名调用。
+    /// 零参 trait 方法表（M5k）：`zero()` 无 receiver 无法按类型分派，按名字直接解析到 trait 方法函数
+    /// （name → func_idx，首个生效）。供 emitCall 的 argc==0 裸名调用。
     nullary_methods: std.ArrayListUnmanaged(struct { name: []const u8, func_idx: u16 }) = .empty,
     /// 模块值表（M5o，文档 §4.6.2）：需构建为运行时模块值（trait_value vtable）的依赖模块。
     /// 仅目录模块（有 pub pack）及其 pub pack 子模块——扁平 stdlib（List/Compare 等）不入，避免与
@@ -161,13 +161,13 @@ pub const ModuleCompiler = struct {
         return null;
     }
 
-    /// M5i：登记一个 trait/impl 方法名（去重）。
+    /// M5i：登记一个 trait 方法名（去重）。
     fn registerMethodName(self: *ModuleCompiler, name: []const u8) CompileError!void {
         for (self.method_names.items) |n| if (std.mem.eql(u8, n, name)) return;
         try self.method_names.append(self.allocator, name);
     }
 
-    /// M5i：name 是否为已知 trait/impl 方法名（裸名调用作自由函数 trait 方法分派判定用）。
+    /// M5i：name 是否为已知 trait 方法名（裸名调用作自由函数 trait 方法分派判定用）。
     pub fn isMethodName(self: *ModuleCompiler, name: []const u8) bool {
         for (self.method_names.items) |n| if (std.mem.eql(u8, n, name)) return true;
         return false;
@@ -187,10 +187,10 @@ pub const ModuleCompiler = struct {
     }
 
     /// M5j：编译入口模块 + 其 `use` 依赖模块（已解析 AST，定义先于使用顺序）。依赖的顶层函数/
-    /// impl/trait/类型/构造器**合并进同一 Program**（VM 按名字字符串解析，扁平 impl 表，天然合并）。
+    /// trait/类型/构造器**合并进同一 Program**（VM 按名字字符串解析，扁平 trait 方法表，天然合并）。
     /// 注册顺序：先依赖后入口（入口可前向引用，但同名时入口的 fn_table 在后——lookupFn 取首个匹配，
     /// 故依赖优先；stdlib 名字不与用户 main 冲突，无歧义）。顶层 val/var 仅入口模块支持（依赖 stdlib
-    /// 是纯 trait/impl/fun，无顶层 val/var）。
+    /// 是纯 trait/fun，无顶层 val/var）。
     pub fn compileModuleWithDeps(self: *ModuleCompiler, module: *const ast.Module, deps: []const ast.Module) CompileError!void {
         // 第一遍：登记所有模块（依赖在前）的顶层函数/构造器/方法名/全局。
         for (deps) |*dep| try self.registerDecls(dep);
@@ -199,12 +199,12 @@ pub const ModuleCompiler = struct {
         // 运行时模块值（trait_value vtable）。在 global_count 定稿前登记，使模块名标识符解析到全局。
         try self.registerModuleValues(deps);
         self.program.global_count = @intCast(self.global_table.items.len);
-        // 第二遍：编译所有模块的函数体 + impl/trait 方法。
+        // 第二遍：编译所有模块的函数体 + trait 方法。
         for (deps) |*dep| try self.compileBodies(dep);
         try self.compileBodies(module);
-        // M5k：检测同一 (type_name, method_name) 多个 impl —— 触发 trait 冲突消解/override 语义
+        // M5k：检测同一 (type_name, method_name) 多个 trait 方法 —— 触发 trait 冲突消解/override 语义
         //（文档 §2.7.2），VM 扁平表只取首个 → 语义不符。整体回退树遍历器，避免静默错误输出。
-        try self.checkNoConflictingImpls();
+        try self.checkNoConflictingTraitMethods();
         // M5g：仅入口模块的顶层 val/var 进全局初始化（依赖 stdlib 无顶层 val/var）。
         // M5o：模块值构造也在全局初始化函数里（在 main 前运行）。
         if (self.global_table.items.len > 0 or self.module_values.items.len > 0) {
@@ -263,12 +263,12 @@ pub const ModuleCompiler = struct {
         try self.module_values.append(self.allocator, .{ .name = dep.name, .global_idx = idx, .decls = dep.declarations });
     }
 
-    /// M5k：若任意 (type_name, method_name) 对出现多次（同类型同方法多 impl），说明依赖 trait 组合/
+    /// M5k：若任意 (type_name, method_name) 对出现多次（同类型同方法多 trait 实现），说明依赖 trait 组合/
     /// override 冲突消解。M5n：VM 现已实现组合分派——若该 method 被某组合 Trait 用 override/委托消解
     /// （在 trait_resolves 中），则放行（组合分派会在扁平查找前选出正确实现）。否则仍 Unsupported 回退
     /// （扁平表只取首个匹配，与 eval 的 first-match 一致性无保证）。
-    fn checkNoConflictingImpls(self: *ModuleCompiler) CompileError!void {
-        const items = self.program.impl_methods.items;
+    fn checkNoConflictingTraitMethods(self: *ModuleCompiler) CompileError!void {
+        const items = self.program.trait_methods.items;
         for (items, 0..) |a, i| {
             for (items[i + 1 ..]) |b| {
                 // 修复：检查应该包含 trait_name，只有三者都相同时才是真正的冲突
@@ -372,7 +372,7 @@ pub const ModuleCompiler = struct {
         }
     }
 
-    /// 第二遍：编译一个模块的 impl/trait 方法体（先，使裸名/nullary 方法表就绪）+ 函数体。
+    /// 第二遍：编译一个模块的 trait 方法体（先，使裸名/nullary 方法表就绪）+ 函数体。
     fn compileBodies(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
         // trait/type 方法先编译：填 nullary_methods 表，使后续 fun 体（含 main）的 `zero()` 裸名可解析。
         for (module.declarations) |decl| {
@@ -390,10 +390,8 @@ pub const ModuleCompiler = struct {
         }
     }
 
-    /// M5i：编译一个 impl 块的所有方法体（有 body 的）。每个编成顶层 Function（self+params 占
-    /// slot 0..），登记进 program.impl_methods（type_name + method_name 分派键）。镜像 eval impl_decl。
-    /// 编译 type 声明中的方法体（新语法）。
-    /// 类似 compileImplMethods，但从 type_decl 中提取类型名和 trait 信息。
+    /// M5i：编译 type 声明中所有带 body 的方法体。每个编成顶层 Function（self+params 占
+    /// slot 0..），登记进 program.trait_methods（type_name + method_name 分派键）。
     fn compileTypeMethods(self: *ModuleCompiler, td: @TypeOf(@as(ast.Decl, undefined).type_decl)) CompileError!void {
         // 检查是否是 error_newtype 并且有方法
         if (td.def == .error_newtype and td.def.error_newtype.methods.len > 0) {
@@ -403,7 +401,7 @@ pub const ModuleCompiler = struct {
                 const func_idx = try self.compileMethodBody(m, body);
 
                 // 为 Error trait 注册此方法
-                try self.program.addImplMethod(td.name, m.name, "Error", func_idx);
+                try self.program.addTraitMethod(td.name, m.name, "Error", func_idx);
 
                 // 零参方法也注册
                 if (m.params.len == 0) try self.registerNullaryMethod(m.name, func_idx);
@@ -420,12 +418,12 @@ pub const ModuleCompiler = struct {
 
             // 为每个实现的 trait 注册此方法
             for (td.implemented_traits) |trait_bound| {
-                try self.program.addImplMethod(td.name, m.name, trait_bound.trait_name, func_idx);
+                try self.program.addTraitMethod(td.name, m.name, trait_bound.trait_name, func_idx);
             }
 
             // 如果没有实现任何 trait，也注册方法（作为类型的固有方法）
             if (td.implemented_traits.len == 0) {
-                try self.program.addImplMethod(td.name, m.name, "", func_idx);
+                try self.program.addTraitMethod(td.name, m.name, "", func_idx);
             }
 
             // M5k：零参方法（self 也无）无 receiver，登记按名直接解析（首个生效）。
@@ -433,7 +431,7 @@ pub const ModuleCompiler = struct {
         }
     }
 
-    /// M5k：登记一个零参方法名 → func_idx（首个 impl 生效，去重）。
+    /// M5k：登记一个零参方法名 → func_idx（首个生效，去重）。
     fn registerNullaryMethod(self: *ModuleCompiler, name: []const u8, func_idx: u16) CompileError!void {
         for (self.nullary_methods.items) |e| if (std.mem.eql(u8, e.name, name)) return;
         try self.nullary_methods.append(self.allocator, .{ .name = name, .func_idx = func_idx });
@@ -445,15 +443,15 @@ pub const ModuleCompiler = struct {
         return null;
     }
 
-    /// M5k：若某方法名在 program.impl_methods 中**恰有一个** impl，返回其 func_idx（用于自由函数式
-    /// trait 方法调用 `compare(a,b)`——单 impl 时直接调用，镜像 eval 把 impl 方法注册为环境函数的动态
-    /// 类型语义，不受 receiver 类型限制）。多 impl（如 stdlib show 覆盖 i64/f64/...）返回 null → 退回
+    /// M5k：若某方法名在 program.trait_methods 中**恰有一个** trait 实现，返回其 func_idx（用于自由函数式
+    /// trait 方法调用 `compare(a,b)`——单实现时直接调用，镜像 eval 把 trait 方法注册为环境函数的动态
+    /// 类型语义，不受 receiver 类型限制）。多实现（如 stdlib show 覆盖 i64/f64/...）返回 null → 退回
     /// receiver 类型分派。
-    pub fn uniqueImplMethod(self: *ModuleCompiler, name: []const u8) ?u16 {
+    pub fn uniqueTraitMethod(self: *ModuleCompiler, name: []const u8) ?u16 {
         var found: ?u16 = null;
-        for (self.program.impl_methods.items) |d| {
+        for (self.program.trait_methods.items) |d| {
             if (std.mem.eql(u8, d.method_name, name)) {
-                if (found != null) return null; // 多 impl → 不唯一
+                if (found != null) return null; // 多实现 → 不唯一
                 found = d.func_idx;
             }
         }
@@ -474,7 +472,7 @@ pub const ModuleCompiler = struct {
         // VM 会检查是否是 Error 类型的 message/type_name 调用，并直接返回对应的字段值
     }
 
-    /// M5i：编译 trait 块中带默认 body 的方法，登记进 program.trait_defaults（impl 未覆写时回退）。
+    /// M5i：编译 trait 块中带默认 body 的方法，登记进 program.trait_defaults（类型未覆写时回退）。
     /// M5n：组合 Trait（有 parents）的冲突消解——override 方法体编译后登记 trait_resolves（override_func），
     /// 委托方法登记 trait_resolves（delegate_trait/method），父关系登记 trait_parents，trait 名入 trait_order。
     /// override/委托方法**不**进 trait_defaults（它们经组合分派触发，非普通默认回退）。
@@ -498,21 +496,21 @@ pub const ModuleCompiler = struct {
             const body = m.body orelse continue;
             const func_idx = try self.compileMethodBody(m, body);
             if (is_composed and m.is_override) {
-                // override 方法：组合分派调用其体，覆盖父 Trait impl。不进普通默认表。
+                // override 方法：组合分派调用其体，覆盖父 Trait 实现。不进普通默认表。
                 try self.program.addTraitResolve(.{
                     .trait_name = td.name,
                     .method_name = m.name,
                     .override_func = func_idx,
                 });
             } else {
-                // 普通默认方法（含非组合 Trait 的默认体）：impl 未覆写时回退。
+                // 普通默认方法（含非组合 Trait 的默认体）：类型未覆写时回退。
                 try self.program.addTraitDefault(td.name, m.name, func_idx);
             }
         }
     }
 
     /// M5k：把一个方法（self+params）编成顶层零捕获 Function，返回 func_idx。
-    /// 顶层 impl/trait 方法不在词法闭包内，故 enclosing=null（自由变量解析为顶层函数/全局/构造器）。
+    /// 顶层 trait 方法不在词法闭包内，故 enclosing=null（自由变量解析为顶层函数/全局/构造器）。
     fn compileMethodBody(self: *ModuleCompiler, m: ast.MethodDecl, body: *ast.Expr) CompileError!u16 {
         if (m.params.len > 255) return error.Unsupported;
         var fc = FnCompiler.init(self.allocator, self);
@@ -1401,9 +1399,9 @@ const FnCompiler = struct {
                 // M5i：裸名 trait 方法调用（with-clause 约束的自由函数式 trait 方法，如 `compare(a,b)`）→
                 // 以 arg0 为 receiver 发 OP_CALL_METHOD（argc 减 1，receiver 在 args 下方）。
                 if (self.module.isMethodName(name) and argc >= 1) {
-                    // 单 impl 方法：直接调用其函数（镜像 eval 动态类型语义，不受 receiver 类型限制，
-                    // 如 `compare(1.5,2.5)` 调用唯一的 Comparable<i32> impl）。多 impl → receiver 类型分派。
-                    if (self.module.uniqueImplMethod(name)) |fidx| {
+                    // 单 trait 实现：直接调用其函数（镜像 eval 动态类型语义，不受 receiver 类型限制，
+                    // 如 `compare(1.5,2.5)` 调用唯一的 Comparable<i32> 实现）。多实现 → receiver 类型分派。
+                    if (self.module.uniqueTraitMethod(name)) |fidx| {
                         for (c.arguments) |arg| try self.emitExpr(arg);
                         try self.chunk.writeOp(.op_call, loc);
                         try self.chunk.writeU16(fidx);
@@ -1418,7 +1416,7 @@ const FnCompiler = struct {
                     return;
                 }
                 // M5k：零参 trait 方法裸名调用（`zero()`）→ 无 receiver 不能按类型分派，直接解析到
-                // 登记的 impl 函数（OP_CALL func_idx，argc=0）。返回类型导向分派在 VM 不可得，单 impl 即解析。
+                // 登记的 trait 方法函数（OP_CALL func_idx，argc=0）。返回类型导向分派在 VM 不可得，单实现即解析。
                 if (argc == 0) {
                     if (self.module.lookupNullaryMethod(name)) |fidx| {
                         try self.chunk.writeOp(.op_call, loc);
