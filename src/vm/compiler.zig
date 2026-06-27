@@ -670,6 +670,12 @@ const FnCompiler = struct {
     /// defer 作用域栈（M3c-defer）：每个含 defer 的 block push 一层，存本层 defer 表达式（按出现顺序）。
     /// block 退出（正常/return/throw）按 LIFO 重放。每层 defer 体内联发射（读当前 slot，见当前局部值）。
     defer_scopes: std.ArrayListUnmanaged(std.ArrayListUnmanaged(*const Expr)) = .empty,
+    /// letrec 自递归名字（val f = fun(){...f()...}）：编译 lambda 体时设为 f。
+    /// emitCall 遇 callee.name == rec_name → emit OP_CALL_REC（不走 cell + upvalue，断循环引用）。
+    /// 值位置引用 rec_name 仍走 upvalue（罕见，退化到原 letrec 路径）。
+    rec_name: ?[]const u8 = null,
+    /// letrec lambda 在 program.functions 中的索引（先占位再覆盖），供 OP_CALL_REC 使用。
+    rec_func_idx: u16 = 0,
 
     fn init(allocator: std.mem.Allocator, module: *ModuleCompiler) FnCompiler {
         return .{ .chunk = Chunk.init(allocator), .allocator = allocator, .module = module };
@@ -830,7 +836,7 @@ const FnCompiler = struct {
             .if_expr => |ie| try self.emitIf(ie, loc),
             .block => |blk| try self.emitBlock(blk, loc),
             .call => |c| try self.emitCall(c, loc),
-            .lambda => |lam| try self.emitLambda(lam, loc),
+            .lambda => |lam| _ = try self.emitLambda(lam, loc, null),
             // M2a：字段访问 p.x → OP_GET_FIELD <字段名常量>。
             .field_access => |fa| {
                 try self.emitExpr(fa.object);
@@ -977,11 +983,28 @@ const FnCompiler = struct {
     /// 编译 lambda 为新 Function（append 进 program），再发 OP_CLOSURE func_idx + upvalue 描述符。
     /// upvalue 在子编译器编译体时静态解析（resolveUpvalue 沿 enclosing 链），运行时 OP_CLOSURE
     /// 据描述符 box/共享 cell。
-    fn emitLambda(self: *FnCompiler, lam: @TypeOf(@as(Expr, undefined).lambda), loc: ast.SourceLocation) CompileError!void {
+    /// rec_name 非 null 时为 letrec 自递归 lambda：先注册占位 Function 拿 func_idx 供体内
+    /// OP_CALL_REC 引用，编译完成后再覆盖占位为真实 chunk。
+    /// 返回 true 若 lambda 体内值位置引用了 rec_name（产生 self-upvalue），调用方据此选择
+    /// OP_SET_LOCAL_LETREC（断环）或 OP_SET_LOCAL（无循环）。
+    fn emitLambda(self: *FnCompiler, lam: @TypeOf(@as(Expr, undefined).lambda), loc: ast.SourceLocation, rec_name: ?[]const u8) CompileError!bool {
         if (lam.params.len > 255) return error.Unsupported;
         var sub = FnCompiler.init(self.allocator, self.module);
         sub.enclosing = self;
+        sub.rec_name = rec_name;
         defer sub.deinit();
+        // letrec 自递归：先占位注册 Function 拿 func_idx，供体内 OP_CALL_REC 引用。
+        var placeholder_idx: ?u16 = null;
+        if (rec_name != null) {
+            const placeholder = Function{
+                .chunk = Chunk.init(self.allocator),
+                .arity = @intCast(lam.params.len),
+                .slot_count = 0,
+                .name = rec_name.?,
+            };
+            placeholder_idx = try self.module.program.addFunction(placeholder);
+            sub.rec_func_idx = placeholder_idx.?;
+        }
         for (lam.params) |p| _ = try sub.declareLocal(p.name, p.is_var);
         const body_expr = switch (lam.body) {
             .block => |b| b,
@@ -990,14 +1013,29 @@ const FnCompiler = struct {
         try sub.emitParamCoercions(lam.params, loc); // M5：lambda 形参数值注解协调
         try sub.emitExpr(body_expr);
         try sub.chunk.writeOp(.op_return, loc);
+        // 检测值位置自引用：rec_name 出现在 upvalues 中（非 call 位置）→ 需要 cell 路径断环。
+        var has_self_uv = false;
+        if (rec_name) |rn| {
+            for (sub.upvalues.items) |uv| {
+                if (std.mem.eql(u8, uv.name, rn)) {
+                    has_self_uv = true;
+                    break;
+                }
+            }
+        }
         const f = Function{
             .chunk = sub.chunk,
             .arity = @intCast(lam.params.len),
             .slot_count = sub.slot_count,
-            .name = "<lambda>",
+            .name = if (rec_name) |n| n else "<lambda>",
         };
         sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
-        const func_idx = try self.module.program.addFunction(f);
+        // letrec：覆盖占位 Function；普通：append 新 Function。
+        const func_idx = if (placeholder_idx) |idx| blk: {
+            self.module.program.functions.items[idx].deinit();
+            self.module.program.functions.items[idx] = f;
+            break :blk idx;
+        } else try self.module.program.addFunction(f);
         // 发 OP_CLOSURE + 描述符。注意：描述符在 *本* 函数(enclosing)上下文展开。
         try self.chunk.writeOp(.op_closure, loc);
         try self.chunk.writeU16(@intCast(func_idx));
@@ -1006,6 +1044,7 @@ const FnCompiler = struct {
             try self.chunk.writeByte(if (uv.is_local) 1 else 0);
             try self.chunk.writeU16(uv.index);
         }
+        return has_self_uv;
     }
 
     /// 发 OP_CLOSURE 在本帧实例化（捕获当前 local/upvalue），再 OP_SPAWN 弹闭包起协程压 spawn_val。
@@ -1222,12 +1261,11 @@ const FnCompiler = struct {
             if (!isBuiltinNumericType(tname)) continue;
             const slot = self.resolveLocal(p.name).?; // 刚 declareLocal，必存在
             const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, tname)));
-            try self.chunk.writeOp(.op_get_local, loc);
+            // Superinstruction op_coerce_local：合并 get_local + coerce + set_local，
+            // 直接 in-place 修改 slot（数值内联无 rc），省 push/pop + 2 dispatch。
+            try self.chunk.writeOp(.op_coerce_local, loc);
             try self.chunk.writeU16(slot);
-            try self.chunk.writeOp(.op_coerce, loc);
             try self.chunk.writeU16(name_const);
-            try self.chunk.writeOp(.op_set_local, loc);
-            try self.chunk.writeU16(slot);
         }
     }
 
@@ -1351,6 +1389,17 @@ const FnCompiler = struct {
         // 快路径：直接具名顶层函数（且非被 local/upvalue 遮蔽）。
         if (c.callee.* == .identifier) {
             const name = c.callee.identifier.name;
+            // letrec 自递归快路径：callee 是当前 lambda 的 letrec 名字 → emit OP_CALL_REC。
+            // 必须在 resolveUpvalue 之前判断，否则 rec_name 被加入 upvalues 形成 cell 循环引用。
+            if (self.rec_name) |rn| {
+                if (std.mem.eql(u8, rn, name)) {
+                    for (c.arguments) |arg| try self.emitExpr(arg);
+                    try self.chunk.writeOp(.op_call_rec, loc);
+                    try self.chunk.writeU16(self.rec_func_idx);
+                    try self.chunk.writeByte(argc);
+                    return;
+                }
+            }
             // 被 local 或 upvalue 绑定遮蔽（如递归局部函数 go 在自身体内是 upvalue）→ 走通用
             // op_call_value 路径，不当顶层函数/构造器/内建处理。
             const shadowed = self.resolveLocal(name) != null or (try self.resolveUpvalue(name)) != null;
@@ -1793,16 +1842,21 @@ const FnCompiler = struct {
         switch (stmt.*) {
             .val_decl => |d| {
                 // M5c：letrec —— RHS 是 lambda 时先声明 slot，使 lambda 体内可引用自身（递归
-                // 局部函数 fun go(){...go()...}）。slot 先置 unit 占位并 box 成 cell，lambda 经
-                // OP_CLOSURE is_local 捕获同一 cell；随后 set_local 写 cell.inner=闭包，递归调用
-                // 经 upvalue 读到该 cell 即得闭包本身（镜像 eval 的 letrec 弱自引用）。
+                // 局部函数 fun go(){...go()...}）。slot 先置 unit 占位并 box 成 cell。
+                // 方案 A：emitLambda 传 rec_name=d.name，编译期识别 f() 自递归调用 → OP_CALL_REC
+                // （不走 cell + upvalue，从根本消除循环引用）。仅当 lambda 体内值位置引用了
+                // rec_name（has_self_uv=true）才退回原 letrec 路径（op_set_local_letrec 断环）。
                 if (d.value.* == .lambda) {
                     const slot = try self.declareLocal(d.name, false);
                     try self.chunk.writeOp(.op_unit, d.location);
                     try self.chunk.writeOp(.op_set_local, d.location);
                     try self.chunk.writeU16(slot);
-                    try self.emitExpr(d.value); // lambda 可解析到 slot（已声明）
-                    try self.chunk.writeOp(.op_set_local_letrec, d.location);
+                    const has_self_uv = try self.emitLambda(d.value.lambda, d.location, d.name);
+                    if (has_self_uv) {
+                        try self.chunk.writeOp(.op_set_local_letrec, d.location);
+                    } else {
+                        try self.chunk.writeOp(.op_set_local, d.location);
+                    }
                     try self.chunk.writeU16(slot);
                 } else {
                     try self.emitBindingRhs(d.value);

@@ -75,6 +75,27 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             try print(buf, allocator, "{s} iter={d} idx={d} exit={d} (-> {d})\n", .{ op.name(), iter_slot, idx_slot, rel, target });
             return offset + 9;
         },
+        // OP_GET_LOCAL_CONST <u16 slot> <u16 const_idx>（superinstruction：2×u16 操作数）
+        .op_get_local_const => {
+            const slot = opcode.readU16(code, offset + 1);
+            const idx = opcode.readU16(code, offset + 3);
+            try print(buf, allocator, "{s} slot={d} const={d}\n", .{ op.name(), slot, idx });
+            return offset + 5;
+        },
+        // OP_GET_LOCAL_CONST_EQ <u16 slot> <u16 const_idx>（superinstruction，链式合并）
+        .op_get_local_const_eq => {
+            const slot = opcode.readU16(code, offset + 1);
+            const idx = opcode.readU16(code, offset + 3);
+            try print(buf, allocator, "{s} slot={d} const={d}\n", .{ op.name(), slot, idx });
+            return offset + 5;
+        },
+        // OP_COERCE_LOCAL <u16 slot> <u16 type_name_const_idx>（superinstruction）
+        .op_coerce_local => {
+            const slot = opcode.readU16(code, offset + 1);
+            const name_idx = opcode.readU16(code, offset + 3);
+            try print(buf, allocator, "{s} slot={d} type#{d}\n", .{ op.name(), slot, name_idx });
+            return offset + 5;
+        },
         // u16 操作数
         .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_set_local_assign, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_make_error, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_global, .op_set_global, .op_get_local_raw, .op_get_upvalue_raw => {
             const arg = opcode.readU16(code, offset + 1);
@@ -102,8 +123,8 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             try print(buf, allocator, "{s} ctor#{d} argc={d}\n", .{ op.name(), ctor_idx, argc });
             return offset + 4;
         },
-        // OP_CALL / OP_TAIL_CALL <u16 func_idx> <u8 argc>
-        .op_call, .op_tail_call => {
+        // OP_CALL / OP_TAIL_CALL / OP_CALL_REC <u16 func_idx> <u8 argc>
+        .op_call, .op_tail_call, .op_call_rec => {
             const func_idx = opcode.readU16(code, offset + 1);
             const argc = code[offset + 3];
             try print(buf, allocator, "{s} fn#{d} argc={d}\n", .{ op.name(), func_idx, argc });

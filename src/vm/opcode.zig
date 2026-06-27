@@ -14,6 +14,11 @@ pub const OpCode = enum(u8) {
     // —— 常量 / 字面量 ——
     /// OP_CONST <u16 idx>：常量池[idx] retain 后压栈
     op_const,
+    /// OP_GET_LOCAL_CONST <u16 slot> <u16 const_idx>（superinstruction）：
+    /// 合并 `op_get_local(slot); op_const(idx)` —— 读 slot 压栈 + 常量压栈，省一次 dispatch。
+    /// 由 Chunk.writeOp peephole 自动生成（编译器仍 emit get_local+const，Chunk 回看合并）。
+    /// 安全性：get_local; const 是一个表达式的连续两部分，中间无 jump 指向 const 起点。
+    op_get_local_const,
     /// 压入单例字面量（无操作数）
     op_null,
     op_unit,
@@ -43,6 +48,11 @@ pub const OpCode = enum(u8) {
 
     // —— 比较（pop 2，push bool）——
     op_eq,
+    /// OP_GET_LOCAL_CONST_EQ <u16 slot> <u16 const_idx>（superinstruction，链式合并）：
+    /// 合并 `op_get_local(slot); op_const(idx); op_eq` —— 读 slot + 常量压栈后直接比较压 bool。
+    /// 链式：先 op_get_local_const 合并 get_local+const，再本指令合并 +eq。
+    /// 高频模式 `n == 0` / `i < 10000`（eq 特化，其他比较不合并）。
+    op_get_local_const_eq,
     op_neq,
     op_lt,
     op_gt,
@@ -93,6 +103,11 @@ pub const OpCode = enum(u8) {
     /// argc==arity 建帧调用；argc<arity 产生部分应用；argc>arity → WrongArity。
     /// 返回后整段 [callee..args] 被替换为单个返回值。
     op_call_value,
+    /// OP_CALL_REC <u16 func_idx> <u8 argc>（letrec 自递归快路径）：
+    /// 直接调用 program.functions[func_idx]，callee 不在栈上，upvalues 继承当前帧。
+    /// 用于 val f = fun(){...f()...} 的自递归调用——编译期识别 f 是当前 letrec 名字，
+    /// 不走 cell + upvalue 捕获，从根本消除循环引用。要求 argc==callee.arity。
+    op_call_rec,
     /// OP_TAIL_CALL <u16 func_idx> <u8 argc>（M1b-3）：尾位置调用顶层 program.functions[func_idx]。
     /// 与 OP_CALL 同编码，但**复用当前帧**（释放本帧局部 → args 落到 frame_base → ip=0），不压新帧。
     /// 仅编译器在尾位置且 argc==callee.arity 时发射；否则退回 OP_CALL+OP_RETURN。
@@ -162,6 +177,11 @@ pub const OpCode = enum(u8) {
     /// builtin 数值类型时按 cast.zig 协调 type_tag（如形参 i32 把 i8 实参拓宽成 i32）；
     /// 溢出/类型不符/非数值/泛型类型名 → **原样保留**（绝不 panic，区别于 op_cast）。
     op_coerce,
+    /// OP_COERCE_LOCAL <u16 slot> <u16 type_name_const_idx>（superinstruction）：
+    /// 合并 `op_get_local(slot); op_coerce(name); op_set_local(slot)` —— 函数入口形参数值协调。
+    /// 直接 in-place 修改 slot（数值内联无 rc），省 push/pop + 2 dispatch。由 emitParamCoercions 直接发射。
+    /// 高频热路径：每个带数值注解形参的函数调用都执行（如 countDown(n: i32) 入口）。
+    op_coerce_local,
     /// OP_CONCAT_LIST（无操作数）：弹 [left, right] 两数组，拼接成新数组（元素 retainOwned 各自一份），
     /// 压结果。镜像 eval evalConcatList（`++`）。非数组操作数 → panic。
     op_concat_list,

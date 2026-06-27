@@ -1252,7 +1252,13 @@ pub const BoxedValue = struct {
             },
             .vm_closure => {
                 const closure = &self.payload.vm_closure;
-                for (closure.upvalues) |uv| uv.release(allocator);
+                // 弱自引用跳过：op_set_local_letrec 断环时已 cell.rc -= 1 抵消强引用，
+                // 此 upvalue 不再持 cell 的 rc，release 时必须跳过，否则 cell 被二次释放（rc 下溢）。
+                const self_idx = closure.self_upvalue_idx;
+                for (closure.upvalues, 0..) |uv, i| {
+                    if (self_idx >= 0 and i == @as(usize, @intCast(self_idx))) continue;
+                    uv.release(allocator);
+                }
                 if (closure.upvalues.len > 0) closure.allocator.free(closure.upvalues);
                 for (closure.bound_args) |ba| ba.release(allocator);
                 if (closure.bound_args.len > 0) closure.allocator.free(closure.bound_args);

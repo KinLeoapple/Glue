@@ -728,6 +728,28 @@ pub const VM = struct {
                     frame.ip += 2;
                     try self.push(try self.retainOwned(func.chunk.constants.items[idx]));
                 },
+                // Superinstruction：合并 op_get_local(slot) + op_const(idx)。
+                // 读 slot 压栈 + 常量压栈，省一次 dispatch。语义等同两条原指令顺序执行。
+                .op_get_local_const => {
+                    const slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    // 读 local（透明解 cell / atomic / lazy，与 op_get_local 一致）
+                    const cur = self.stack.items[frame.slot_base + slot];
+                    const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
+                    if (v.tag == .atomic_val) {
+                        const av = v.asBoxed().payload.atomic_val;
+                        try self.push(try av.load(self.allocator));
+                    } else if (v.tag == .lazy_val) {
+                        const lv = &v.asBoxed().payload.lazy_val;
+                        try self.push(try self.forceLazyVM(lv, loc));
+                    } else {
+                        try self.push(try self.retainOwned(v));
+                    }
+                    // 压常量
+                    try self.push(try self.retainOwned(func.chunk.constants.items[idx]));
+                },
                 .op_null => try self.push(Value.fromNull()),
                 .op_unit => try self.push(Value.fromUnit()),
                 .op_true => try self.push(Value.fromBool(true)),
@@ -889,6 +911,40 @@ pub const VM = struct {
                     defer right.release(self.allocator);
                     try self.push(try self.doCompare(op, left, right, loc));
                 },
+                // Superinstruction：链式合并 op_get_local + op_const + op_eq。
+                // 快速路径：small_int/bool 直接比 payload，省 2 push + 2 pop + retainOwned（高频 n==0）。
+                .op_get_local_const_eq => {
+                    const slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const cur = self.stack.items[frame.slot_base + slot];
+                    const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
+                    const c = func.chunk.constants.items[idx];
+                    // 快速路径：small_int/boolean 直接比 payload（i48 bitcast 同符号扩展，值比较等价 i128 比较）
+                    if ((v.tag == .small_int and c.tag == .small_int) or
+                        (v.tag == .boolean and c.tag == .boolean))
+                    {
+                        try self.push(Value.fromBool(v.payload == c.payload));
+                    } else {
+                        // 回退：透明解 atomic/lazy 后走完整 doCompare（与 op_get_local 一致）
+                        if (v.tag == .atomic_val) {
+                            const av = v.asBoxed().payload.atomic_val;
+                            try self.push(try av.load(self.allocator));
+                        } else if (v.tag == .lazy_val) {
+                            const lv = &v.asBoxed().payload.lazy_val;
+                            try self.push(try self.forceLazyVM(lv, loc));
+                        } else {
+                            try self.push(try self.retainOwned(v));
+                        }
+                        try self.push(try self.retainOwned(c));
+                        const right = self.pop();
+                        const left = self.pop();
+                        defer left.release(self.allocator);
+                        defer right.release(self.allocator);
+                        try self.push(try self.doCompare(.op_eq, left, right, loc));
+                    }
+                },
                 .op_neg => {
                     const v = self.pop();
                     defer v.release(self.allocator);
@@ -950,6 +1006,16 @@ pub const VM = struct {
                     frame.ip += 3;
                     try self.doCall(program, func_idx, argc, loc);
                     // doCall 压入新帧；下轮循环自然切换到 callee（frame 指针失效，循环顶部重取）。
+                },
+
+                .op_call_rec => {
+                    // letrec 自递归快路径：直接调用 program.functions[func_idx]，callee 不在栈上。
+                    // upvalues 继承当前帧（首次进入经 OP_CALL_VALUE+enterClosure 设置 vc.upvalues，
+                    // 自递归调用透传）——绕开 cell + upvalue 捕获，从根本消除循环引用。
+                    const func_idx = opcode.readU16(code, frame.ip);
+                    const argc = code[frame.ip + 2];
+                    frame.ip += 3;
+                    try self.doCallRec(program, func_idx, argc, loc);
                 },
 
                 .op_tail_call => {
@@ -1178,6 +1244,25 @@ pub const VM = struct {
                     const tname_val = func.chunk.constants.items[name_idx];
                     const tname = tname_val.asBoxed().payload.string;
                     self.doCoerce(tname);
+                },
+                // Superinstruction：合并 op_get_local(slot) + op_coerce(name) + op_set_local(slot)。
+                // 函数入口形参数值协调：直接 in-place 修改 slot（数值内联无 rc），省 push/pop + 2 dispatch。
+                .op_coerce_local => {
+                    const slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const name_idx = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const tname = func.chunk.constants.items[name_idx].asBoxed().payload.string;
+                    const dst = frame.slot_base + slot;
+                    const cur = self.stack.items[dst];
+                    // 与 doCoerce 一致：仅数值协调，非数值原样。数值内联值无 rc，直接覆盖无需 release。
+                    if (cur.isInteger() or cur.isFloat()) {
+                        if (cast.castNumeric(self.allocator, cur, tname)) |result| {
+                            self.stack.items[dst] = result;
+                        } else |_| {
+                            // 溢出/不符：原样
+                        }
+                    }
                 },
                 // M3b：字段赋值 —— [record, val] → [new_record]（COW），写回由 SET_LOCAL 完成。
                 .op_set_field => {
@@ -1516,6 +1601,20 @@ pub const VM = struct {
         var s: u16 = callee.arity;
         while (s < callee.slot_count) : (s += 1) try self.push(Value.fromUnit());
         try self.frames.append(self.allocator, .{ .func = callee, .ip = 0, .slot_base = slot_base, .frame_base = slot_base });
+    }
+
+    /// 执行 OP_CALL_REC：letrec 自递归快路径。与 doCall 区别仅在新帧 upvalues 继承当前帧
+    /// （letrec 函数体的 upvalues 与本帧相同——首次进入经 OP_CALL_VALUE+enterClosure 设置
+    /// vc.upvalues，自递归调用透传）。编译器保证仅在 callee == 当前 letrec 名字且 argc==arity 时发射。
+    fn doCallRec(self: *VM, program: *const Program, func_idx: u16, argc: u8, loc: ast.SourceLocation) VMError!void {
+        const callee = &program.functions.items[func_idx];
+        if (argc != callee.arity) return self.fail(loc, "wrong number of arguments", error.WrongArity);
+        if (self.frames.items.len >= MAX_FRAMES) return self.fail(loc, "stack overflow: call depth exceeded", error.StackOverflow);
+        const slot_base = self.stack.items.len - argc;
+        var s: u16 = callee.arity;
+        while (s < callee.slot_count) : (s += 1) try self.push(Value.fromUnit());
+        const cur_upvalues = self.frames.items[self.frames.items.len - 1].upvalues;
+        try self.frames.append(self.allocator, .{ .func = callee, .ip = 0, .slot_base = slot_base, .frame_base = slot_base, .upvalues = cur_upvalues });
     }
 
     /// 执行 OP_TAIL_CALL：复用当前帧调用顶层 program.functions[func_idx]，不压新帧。
