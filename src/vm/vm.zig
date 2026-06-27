@@ -67,7 +67,7 @@ fn spawnThreadEntry(ctx: *SpawnCtx) void {
             box.* = .{
                 .tag = .cell_val,
                 .rc = 1,
-                .payload = .{ .cell_val = .{ .inner = cap, .rc = 1 } },
+                .payload = .{ .cell_val = .{ .inner = cap } },
             };
             ups[i] = Value{
                 .tag = .cell_val,
@@ -483,7 +483,6 @@ pub const VM = struct {
             .data = null,
             .allocator = self.allocator,
             .vm_owned = true,
-            .rc = 1,
         };
         const box = try self.allocator.create(value.BoxedValue);
         box.* = .{
@@ -612,22 +611,17 @@ pub const VM = struct {
         if (v.tag == .throw_val) {
             const box = v.asBoxed();
             const tv = box.payload.throw_val;
-            const new_tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
-            switch (tv) {
-                .ok => |inner_ptr| {
-                    const cloned = self.allocator.create(Value) catch return error.OutOfMemory;
-                    cloned.* = try self.retainOwned(inner_ptr.*);
-                    new_tv.* = .{ .ok = cloned };
-                },
-                .err => |e| {
-                    new_tv.* = .{ .err = .{
-                        .type_name = try self.allocator.dupe(u8, e.type_name),
-                        .message = try self.allocator.dupe(u8, e.message),
-                        .is_error_subtype = e.is_error_subtype,
-                    } };
-                },
-            }
-            return Value.makeThrow(self.allocator, new_tv.*) catch return error.OutOfMemory;
+            // ThrowValue.ok 已内联 Value（非 *Value），无需为 ok 分配外层 Value 箱体；
+            // ThrowValue 本身按值传给 makeThrow（其内部装箱到 BoxedValue），也无需堆分配。
+            const new_tv: value.ThrowValue = switch (tv) {
+                .ok => |inner_val| .{ .ok = try self.retainOwned(inner_val) },
+                .err => |e| .{ .err = .{
+                    .type_name = try self.allocator.dupe(u8, e.type_name),
+                    .message = try self.allocator.dupe(u8, e.message),
+                    .is_error_subtype = e.is_error_subtype,
+                } },
+            };
+            return Value.makeThrow(self.allocator, new_tv) catch return error.OutOfMemory;
         }
         return v.retain();
     }
@@ -817,9 +811,9 @@ pub const VM = struct {
                         cell.inner.release(self.allocator); // 释放占位 unit
                         cell.inner = v; // cell 持有闭包（强）
                         // 断环：闭包的 upvalue 若指向本 cell（递归自捕获），op_closure 已 retain 过
-                        // 该 cell（rc+1）。标记该 upvalue 为弱（self_upvalue_idx），并 cell.rc-=1
-                        // 抵消 op_closure 的 retain。此后 cell↔closure 无循环计数：cell 归零释放
-                        // closure，closure 释放时跳过弱自引用（不反向释放 cell）。
+                        // 该 cell（box.rc+1）。标记该 upvalue 为弱（self_upvalue_idx），并抵消那次
+                        // retain（box.rc-1）。此后 cell↔closure 无循环计数：cell 归零释放 closure，
+                        // closure 释放时跳过弱自引用（不反向释放 cell）。
                         if (v.tag == .vm_closure) {
                             const vc_box = v.asBoxed();
                             const vc = &vc_box.payload.vm_closure;
@@ -828,7 +822,7 @@ pub const VM = struct {
                                     const uv_box = uv.asBoxed();
                                     if (&uv_box.payload.cell_val == cell) {
                                         vc.self_upvalue_idx = @intCast(i);
-                                        cell.rc -= 1;
+                                        uv_box.rc -= 1;
                                         break;
                                     }
                                 }
@@ -993,7 +987,7 @@ pub const VM = struct {
                         }
                     }
                     const vc = try self.allocator.create(value.VmClosure);
-                    vc.* = .{ .func = f, .arity = f.arity, .upvalues = ups, .rc = 1, .allocator = self.allocator };
+                    vc.* = .{ .func = f, .arity = f.arity, .upvalues = ups, .allocator = self.allocator };
                     try self.push(try Value.makeVmClosure(self.allocator, f, f.arity, ups, &.{}));
                 },
 
@@ -1232,7 +1226,7 @@ pub const VM = struct {
                         const throw_box = top.asBoxed();
                         switch (throw_box.payload.throw_val) {
                             .ok => |inner| {
-                                const unwrapped = try self.retainOwned(inner.*);
+                                const unwrapped = try self.retainOwned(inner);
                                 _ = self.pop();
                                 top.release(self.allocator);
                                 try self.push(unwrapped);
@@ -1275,7 +1269,7 @@ pub const VM = struct {
                         defer obj.release(self.allocator);
                         const throw_box = obj.asBoxed();
                         if (throw_box.payload.throw_val != .ok) return self.fail(loc, "OP_GET_THROW_OK on non-Ok", error.TypeMismatch);
-                        try self.push(try self.retainOwned(throw_box.payload.throw_val.ok.*));
+                        try self.push(try self.retainOwned(throw_box.payload.throw_val.ok));
                     }
                 },
                 // M3c：match Error(e) 绑定 —— 弹 throw_val，把 .err 包成 error_val 压栈。
@@ -1424,7 +1418,6 @@ pub const VM = struct {
                         .forced = false,
                         .allocator = self.allocator,
                         .vm_thunk = &callee.asBoxed().payload.vm_closure,
-                        .rc = 1,
                     };
                     const box = try self.allocator.create(value.BoxedValue);
                     box.* = .{
@@ -1593,8 +1586,8 @@ pub const VM = struct {
                 if (argc != 1) return self.fail(loc, "Ok expects 1 argument", error.WrongArity);
                 const v = self.pop();
                 defer v.release(self.allocator);
-                const inner = self.allocator.create(Value) catch return error.OutOfMemory;
-                inner.* = try self.retainOwned(v);
+                // ThrowValue.ok 已内联 Value：直接保留后填入，省一次堆分配。
+                const inner = try self.retainOwned(v);
                 const tv: value.ThrowValue = .{ .ok = inner };
                 try self.push(try Value.makeThrow(self.allocator, tv));
             },

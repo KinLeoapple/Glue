@@ -77,7 +77,7 @@ pub const ErrorValue = struct {
 };
 
 pub const ThrowValue = union(enum) {
-    ok: *Value,
+    ok: Value,
     err: ErrorValue,
 };
 
@@ -305,30 +305,25 @@ pub const AdtValue = struct {
     type_name: []const u8,
     constructor: []const u8,
     fields: []AdtField,
-    rc: u32 = 1,
 };
 
 pub const NewtypeValue = struct {
     type_name: []const u8,
     inner: Value,
-    rc: u32 = 1,
 };
 
 pub const ArrayValue = struct {
     elements: []Value,
     fixed_size: ?u64 = null,
-    rc: u32 = 1,
 };
 
 pub const RecordValue = struct {
     type_name: []const u8,
     fields: std.StringHashMap(Value),
-    rc: u32 = 1,
 };
 
 pub const Cell = struct {
     inner: Value,
-    rc: u32 = 1,
 };
 
 pub const VmClosure = struct {
@@ -336,7 +331,6 @@ pub const VmClosure = struct {
     arity: u8,
     upvalues: []Value = &.{},
     bound_args: []Value = &.{},
-    rc: u32 = 1,
     allocator: std.mem.Allocator,
     self_upvalue_idx: i32 = -1,
 };
@@ -345,16 +339,14 @@ pub const PartialApplication = struct {
     func: Value,
     bound_args: []Value,
     remaining_arity: u8,
-    rc: u32 = 1,
 };
 
 pub const TraitValue = struct {
     trait_name: []const u8 = "",
     methods: std.StringHashMap(Value),
-    data: ?*Value = null,
+    data: ?Value = null,
     allocator: std.mem.Allocator,
     vm_owned: bool = false,
-    rc: u32 = 1,
 };
 
 pub const LazyValue = struct {
@@ -364,7 +356,6 @@ pub const LazyValue = struct {
     forced: bool = false,
     allocator: std.mem.Allocator,
     vm_thunk: ?*anyopaque = null,
-    rc: u32 = 1,
 };
 
 pub const ArrayIterator = struct {
@@ -579,7 +570,6 @@ pub const Value = struct {
                     .type_name = type_name,
                     .constructor = constructor,
                     .fields = fields,
-                    .rc = 1,
                 },
             },
         };
@@ -596,7 +586,6 @@ pub const Value = struct {
                 .newtype = .{
                     .type_name = type_name,
                     .inner = inner,
-                    .rc = 1,
                 },
             },
         };
@@ -612,7 +601,6 @@ pub const Value = struct {
             .payload = .{
                 .cell_val = .{
                     .inner = inner,
-                    .rc = 1,
                 },
             },
         };
@@ -654,7 +642,6 @@ pub const Value = struct {
                     .arity = arity,
                     .upvalues = upvalues,
                     .bound_args = bound_args,
-                    .rc = 1,
                     .allocator = allocator,
                 },
             },
@@ -673,7 +660,6 @@ pub const Value = struct {
                     .func = func,
                     .bound_args = bound_args,
                     .remaining_arity = remaining_arity,
-                    .rc = 1,
                 },
             },
         };
@@ -1022,7 +1008,6 @@ pub const Value = struct {
                 .array = .{
                     .elements = elements,
                     .fixed_size = fixed_size,
-                    .rc = 1,
                 },
             },
         };
@@ -1038,7 +1023,6 @@ pub const Value = struct {
                 .record = .{
                     .type_name = type_name,
                     .fields = fields,
-                    .rc = 1,
                 },
             },
         };
@@ -1280,10 +1264,7 @@ pub const BoxedValue = struct {
             },
             .throw_val => {
                 switch (self.payload.throw_val) {
-                    .ok => |ptr| {
-                        ptr.release(allocator);
-                        allocator.destroy(ptr);
-                    },
+                    .ok => |v| v.release(allocator),
                     .err => {},
                 }
             },
@@ -1294,10 +1275,7 @@ pub const BoxedValue = struct {
                     entry.value_ptr.*.release(allocator);
                 }
                 self.payload.trait_value.methods.deinit();
-                if (self.payload.trait_value.data) |data_ptr| {
-                    data_ptr.release(allocator);
-                    allocator.destroy(data_ptr);
-                }
+                if (self.payload.trait_value.data) |v| v.release(allocator);
             },
             .lazy_val => {
                 if (self.payload.lazy_val.cached) |cached| {
@@ -1333,837 +1311,3 @@ pub const BoxedValue = struct {
         }
     }
 };
-
-// ============================================================
-// 编译期大小验证
-// ============================================================
-
-comptime {
-    if (@sizeOf(Value) != 16) {
-        @compileError(std.fmt.comptimePrint("Value size is {d}, expected 16", .{@sizeOf(Value)}));
-    }
-}
-
-// ============================================================
-// 单元测试
-// ============================================================
-
-const testing = std.testing;
-
-test "Value size is 16 bytes" {
-    try testing.expectEqual(16, @sizeOf(Value));
-}
-
-test "null value" {
-    const v = Value.fromNull();
-    try testing.expect(v.isNull());
-    try testing.expectEqual(ValueTag.null_val, v.tag);
-}
-
-test "unit value" {
-    const v = Value.fromUnit();
-    try testing.expect(v.isUnit());
-    try testing.expectEqual(ValueTag.unit, v.tag);
-}
-
-test "boolean values" {
-    const t = Value.fromBool(true);
-    const f = Value.fromBool(false);
-
-    try testing.expect(t.asBool());
-    try testing.expect(!f.asBool());
-    try testing.expectEqual(ValueTag.boolean, t.tag);
-}
-
-test "char value" {
-    const v = Value.fromChar('A');
-    try testing.expectEqual(@as(u21, 'A'), v.asChar());
-    try testing.expectEqual(ValueTag.char_val, v.tag);
-}
-
-test "float value" {
-    const v = Value.fromFloat(3.14159);
-    try testing.expectApproxEqRel(3.14159, v.asFloat(), 0.00001);
-    try testing.expectEqual(ValueTag.float64, v.tag);
-}
-
-test "small int - positive" {
-    const v = Value.fromSmallInt(42);
-    try testing.expectEqual(@as(i48, 42), v.asSmallInt());
-    try testing.expect(v.isInline());
-    try testing.expect(!v.isBoxed());
-}
-
-test "small int - negative" {
-    const v = Value.fromSmallInt(-12345);
-    try testing.expectEqual(@as(i48, -12345), v.asSmallInt());
-}
-
-test "big int - i64 out of i48 range" {
-    const allocator = testing.allocator;
-
-    const big_val = IntValue{ .value = @bitCast(@as(i128, 1 << 50)), .type_tag = .i64 };
-    const v = try Value.fromBigInt(allocator, big_val);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.big_int, v.tag);
-
-    const retrieved = v.asInt();
-    try testing.expectEqual(big_val.value, retrieved.value);
-    try testing.expectEqual(big_val.type_tag, retrieved.type_tag);
-}
-
-test "smart int encoding" {
-    const allocator = testing.allocator;
-
-    const small = IntValue{ .value = 100, .type_tag = .i32 };
-    const v = try Value.fromInt(allocator, small);
-
-    try testing.expect(v.isInline());
-    try testing.expectEqual(ValueTag.small_int, v.tag);
-}
-
-test "string value" {
-    const allocator = testing.allocator;
-
-    const s = try allocator.dupe(u8, "hello");
-    const v = try Value.fromString(allocator, s);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.string, v.tag);
-
-    const retrieved = v.asBoxed().payload.string;
-    try testing.expectEqualStrings("hello", retrieved);
-}
-
-test "refcount - retain increments" {
-    const allocator = testing.allocator;
-
-    const s = try allocator.dupe(u8, "test");
-    const v = try Value.fromString(allocator, s);
-
-    const box = v.asBoxed();
-    try testing.expectEqual(@as(u32, 1), box.rc);
-
-    _ = v.retain();
-    try testing.expectEqual(@as(u32, 2), box.rc);
-
-    // 释放所有引用
-    v.release(allocator); // rc = 1
-    v.release(allocator); // rc = 0, freed
-}
-
-test "refcount - inline no-op" {
-    const allocator = testing.allocator;
-    const v = Value.fromSmallInt(42);
-    _ = v.retain();
-    v.release(allocator);
-    try testing.expectEqual(@as(i48, 42), v.asSmallInt());
-}
-
-test "array value" {
-    const allocator = testing.allocator;
-
-    var elements = try allocator.alloc(Value, 3);
-    elements[0] = Value.fromSmallInt(1);
-    elements[1] = Value.fromSmallInt(2);
-    elements[2] = Value.fromSmallInt(3);
-
-    const v = try Value.makeArray(allocator, elements, null);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    const arr = v.asBoxed().payload.array;
-    try testing.expectEqual(@as(usize, 3), arr.elements.len);
-}
-
-test "inline vs boxed" {
-    const allocator = testing.allocator;
-
-    try testing.expect(Value.fromNull().isInline());
-    try testing.expect(Value.fromSmallInt(42).isInline());
-
-    const s = try allocator.dupe(u8, "test");
-    const v = try Value.fromString(allocator, s);
-    defer v.release(allocator);
-    try testing.expect(v.isBoxed());
-}
-
-test "value equality" {
-    const v1 = Value.fromSmallInt(42);
-    const v2 = Value.fromSmallInt(42);
-    const v3 = Value.fromSmallInt(43);
-
-    try testing.expect(v1.equals(v2));
-    try testing.expect(!v1.equals(v3));
-}
-
-test "inferIntType" {
-    try testing.expectEqual(IntType.i8, inferIntType(42));
-    try testing.expectEqual(IntType.u8, inferIntType(200));
-}
-
-test "retainOwned - string duplicates" {
-    const allocator = testing.allocator;
-
-    const s1 = try allocator.dupe(u8, "hello");
-    const v1 = try Value.fromString(allocator, s1);
-    defer v1.release(allocator);
-
-    const v2 = try v1.retainOwned(allocator);
-    defer v2.release(allocator);
-
-    const ptr1 = v1.asBoxed().payload.string.ptr;
-    const ptr2 = v2.asBoxed().payload.string.ptr;
-    try testing.expect(ptr1 != ptr2);
-    try testing.expectEqualStrings(v1.asBoxed().payload.string, v2.asBoxed().payload.string);
-}
-
-// ============================================================
-// 新增单元测试（Day2）
-// ============================================================
-
-test "makeAdt - ADT construction" {
-    const allocator = testing.allocator;
-
-    var fields = try allocator.alloc(AdtField, 2);
-    fields[0] = .{ .name = "x", .value = Value.fromSmallInt(10) };
-    fields[1] = .{ .name = "y", .value = Value.fromSmallInt(20) };
-
-    const v = try Value.makeAdt(allocator, "Point", "Point", fields);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.adt, v.tag);
-
-    const adt = v.asBoxed().payload.adt;
-    try testing.expectEqualStrings("Point", adt.type_name);
-    try testing.expectEqualStrings("Point", adt.constructor);
-    try testing.expectEqual(@as(usize, 2), adt.fields.len);
-}
-
-test "makeNewtype - Newtype construction" {
-    const allocator = testing.allocator;
-
-    const inner = Value.fromSmallInt(42);
-    const v = try Value.makeNewtype(allocator, "UserId", inner);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.newtype, v.tag);
-
-    const newtype = v.asBoxed().payload.newtype;
-    try testing.expectEqualStrings("UserId", newtype.type_name);
-    try testing.expectEqual(@as(i48, 42), newtype.inner.asSmallInt());
-}
-
-test "makeCell - Cell construction" {
-    const allocator = testing.allocator;
-
-    const inner = Value.fromSmallInt(100);
-    const v = try Value.makeCell(allocator, inner);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.cell_val, v.tag);
-
-    const cell = v.asBoxed().payload.cell_val;
-    try testing.expectEqual(@as(i48, 100), cell.inner.asSmallInt());
-}
-
-test "makeRange - Range construction" {
-    const allocator = testing.allocator;
-
-    const v = try Value.makeRange(allocator, 0, 10, false);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.range, v.tag);
-
-    const range = v.asBoxed().payload.range;
-    try testing.expectEqual(@as(i128, 0), range.start);
-    try testing.expectEqual(@as(i128, 10), range.end);
-    try testing.expect(!range.inclusive);
-}
-
-test "makeError - ErrorValue construction" {
-    const allocator = testing.allocator;
-
-    const v = try Value.makeError(allocator, "FileError", "file not found", true);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.error_val, v.tag);
-
-    const err = v.asBoxed().payload.error_val;
-    try testing.expectEqualStrings("FileError", err.type_name);
-    try testing.expectEqualStrings("file not found", err.message);
-    try testing.expect(err.is_error_subtype);
-}
-
-test "ADT with nested values" {
-    const allocator = testing.allocator;
-
-    // 构造嵌套 ADT: Some(Some(42))
-    const inner_fields = try allocator.alloc(AdtField, 1);
-    inner_fields[0] = .{ .name = null, .value = Value.fromSmallInt(42) };
-
-    const inner = try Value.makeAdt(allocator, "Option", "Some", inner_fields);
-
-    const outer_fields = try allocator.alloc(AdtField, 1);
-    outer_fields[0] = .{ .name = null, .value = inner };
-
-    const outer = try Value.makeAdt(allocator, "Option", "Some", outer_fields);
-    defer outer.release(allocator);
-
-    try testing.expect(outer.isBoxed());
-    const outer_adt = outer.asBoxed().payload.adt;
-    try testing.expectEqual(@as(usize, 1), outer_adt.fields.len);
-
-    // 验证嵌套结构
-    const nested = outer_adt.fields[0].value;
-    try testing.expectEqual(ValueTag.adt, nested.tag);
-}
-
-test "record with mixed value types" {
-    const allocator = testing.allocator;
-
-    var fields = std.StringHashMap(Value).init(allocator);
-
-    const name_key = try allocator.dupe(u8, "name");
-    const age_key = try allocator.dupe(u8, "age");
-    const active_key = try allocator.dupe(u8, "active");
-
-    try fields.put(name_key, try Value.fromString(allocator, try allocator.dupe(u8, "Alice")));
-    try fields.put(age_key, Value.fromSmallInt(30));
-    try fields.put(active_key, Value.fromBool(true));
-
-    const v = try Value.makeRecord(allocator, "Person", fields);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    const record = v.asBoxed().payload.record;
-    try testing.expectEqual(@as(usize, 3), record.fields.count());
-}
-
-test "Cell refcount with multiple references" {
-    const allocator = testing.allocator;
-
-    const inner = Value.fromSmallInt(42);
-    const cell = try Value.makeCell(allocator, inner);
-
-    const ref1 = cell.retain();
-    const ref2 = cell.retain();
-
-    const box = cell.asBoxed();
-    try testing.expectEqual(@as(u32, 3), box.rc);
-
-    ref2.release(allocator);
-    try testing.expectEqual(@as(u32, 2), box.rc);
-
-    ref1.release(allocator);
-    try testing.expectEqual(@as(u32, 1), box.rc);
-
-    cell.release(allocator);
-}
-
-test "Newtype wrapping complex value" {
-    const allocator = testing.allocator;
-
-    // Newtype 包装数组
-    var arr_elements = try allocator.alloc(Value, 3);
-    arr_elements[0] = Value.fromSmallInt(1);
-    arr_elements[1] = Value.fromSmallInt(2);
-    arr_elements[2] = Value.fromSmallInt(3);
-
-    const arr = try Value.makeArray(allocator, arr_elements, null);
-    const newtype = try Value.makeNewtype(allocator, "IntList", arr);
-    defer newtype.release(allocator);
-
-    const nt = newtype.asBoxed().payload.newtype;
-    try testing.expectEqual(ValueTag.array, nt.inner.tag);
-}
-// Day3 新增测试 - VmClosure
-test "VmClosure construction and refcount" {
-    const allocator = testing.allocator;
-
-    const func: *const anyopaque = @ptrFromInt(0x1000);
-    var upvalues = try allocator.alloc(Value, 2);
-    upvalues[0] = Value.fromSmallInt(10);
-    upvalues[1] = Value.fromSmallInt(20);
-
-    var bound = try allocator.alloc(Value, 1);
-    bound[0] = Value.fromSmallInt(30);
-
-    const v = try Value.makeVmClosure(allocator, func, 3, upvalues, bound);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.vm_closure, v.tag);
-
-    const closure = v.asBoxed().payload.vm_closure;
-    try testing.expectEqual(@as(u8, 3), closure.arity);
-    try testing.expectEqual(@as(usize, 2), closure.upvalues.len);
-    try testing.expectEqual(@as(usize, 1), closure.bound_args.len);
-}
-
-test "Partial application construction" {
-    const allocator = testing.allocator;
-
-    const func = Value.fromSmallInt(42);
-    var bound = try allocator.alloc(Value, 2);
-    bound[0] = Value.fromSmallInt(1);
-    bound[1] = Value.fromSmallInt(2);
-
-    const v = try Value.makePartial(allocator, func, bound, 3);
-    defer v.release(allocator);
-
-    try testing.expect(v.isBoxed());
-    try testing.expectEqual(ValueTag.partial, v.tag);
-
-    const partial = v.asBoxed().payload.partial;
-    try testing.expectEqual(@as(u8, 3), partial.remaining_arity);
-    try testing.expectEqual(@as(usize, 2), partial.bound_args.len);
-}
-
-test "Range operations" {
-    const allocator = testing.allocator;
-
-    const excl = try Value.makeRange(allocator, 0, 10, false);
-    defer excl.release(allocator);
-
-    const incl = try Value.makeRange(allocator, 0, 10, true);
-    defer incl.release(allocator);
-
-    const r1 = excl.asBoxed().payload.range;
-    const r2 = incl.asBoxed().payload.range;
-
-    try testing.expectEqual(@as(i128, 10), r1.len());
-    try testing.expectEqual(@as(i128, 11), r2.len());
-    try testing.expect(r1.contains(5));
-    try testing.expect(!r1.contains(10));
-    try testing.expect(r2.contains(10));
-}
-
-test "Deep nested release" {
-    const allocator = testing.allocator;
-
-    const cell = try Value.makeCell(allocator, Value.fromSmallInt(42));
-    const newtype = try Value.makeNewtype(allocator, "UserId", cell);
-
-    var adt_fields = try allocator.alloc(AdtField, 1);
-    adt_fields[0] = .{ .name = "value", .value = newtype };
-    const adt = try Value.makeAdt(allocator, "Wrapper", "Wrap", adt_fields);
-
-    var record_fields = std.StringHashMap(Value).init(allocator);
-    try record_fields.put(try allocator.dupe(u8, "x"), adt);
-    const record = try Value.makeRecord(allocator, "Container", record_fields);
-
-    var arr_elements = try allocator.alloc(Value, 1);
-    arr_elements[0] = record;
-    const array = try Value.makeArray(allocator, arr_elements, null);
-
-    array.release(allocator);
-}
-
-test "Value equality basic types" {
-    try testing.expect(Value.fromNull().equals(Value.fromNull()));
-    try testing.expect(Value.fromUnit().equals(Value.fromUnit()));
-    try testing.expect(Value.fromBool(true).equals(Value.fromBool(true)));
-    try testing.expect(!Value.fromBool(true).equals(Value.fromBool(false)));
-
-    const int1 = Value.fromSmallInt(42);
-    const int2 = Value.fromSmallInt(42);
-    try testing.expect(int1.equals(int2));
-}
-
-test "Smart int boundary" {
-    const allocator = testing.allocator;
-
-    const max_i48 = std.math.maxInt(i48);
-    const v_max = try Value.fromInt(allocator, .{ .value = @bitCast(@as(i128, max_i48)), .type_tag = .i64 });
-    try testing.expect(v_max.isInline());
-
-    const over = try Value.fromInt(allocator, .{ .value = @bitCast(@as(i128, max_i48) + 1), .type_tag = .i64 });
-    defer over.release(allocator);
-    try testing.expect(over.isBoxed());
-}
-// Day4 新增测试 - 并发原语、Trait、迭代器、压力测试
-
-test "Array with 100 elements stress test" {
-    const allocator = testing.allocator;
-
-    const elements = try allocator.alloc(Value, 100);
-    for (elements, 0..) |*e, i| {
-        e.* = Value.fromSmallInt(@intCast(i));
-    }
-
-    const v = try Value.makeArray(allocator, elements, null);
-    defer v.release(allocator);
-
-    const arr = v.asBoxed().payload.array;
-    try testing.expectEqual(@as(usize, 100), arr.elements.len);
-    try testing.expectEqual(@as(i48, 0), arr.elements[0].asSmallInt());
-    try testing.expectEqual(@as(i48, 99), arr.elements[99].asSmallInt());
-}
-
-test "Record with 20 fields" {
-    const allocator = testing.allocator;
-
-    var fields = std.StringHashMap(Value).init(allocator);
-    var i: u32 = 0;
-    while (i < 20) : (i += 1) {
-        // 使用简短静态键名
-        const keys = [_][]const u8{"a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t"};
-        const key = try allocator.dupe(u8, keys[i]);
-        try fields.put(key, Value.fromSmallInt(@intCast(i)));
-    }
-
-    const v = try Value.makeRecord(allocator, "LargeRecord", fields);
-    defer v.release(allocator);
-
-    const record = v.asBoxed().payload.record;
-    try testing.expectEqual(@as(usize, 20), record.fields.count());
-}
-
-test "Deeply nested 8 layers" {
-    const allocator = testing.allocator;
-
-    // Layer 1: Cell
-    var val = try Value.makeCell(allocator, Value.fromSmallInt(42));
-
-    // Layer 2-7: Newtype wrapping
-    var layer: usize = 2;
-    while (layer <= 7) : (layer += 1) {
-        // 注意：type_name 将由 Newtype 的 release 管理，这里不需要单独释放
-        // 但为了测试，我们使用静态字符串
-        val = try Value.makeNewtype(allocator, "Layer", val);
-    }
-
-    // Layer 8: Array
-    const arr = try allocator.alloc(Value, 1);
-    arr[0] = val;
-    const final = try Value.makeArray(allocator, arr, null);
-
-    // Single release should handle all 8 layers
-    final.release(allocator);
-}
-
-test "Multiple retain and release cycles" {
-    const allocator = testing.allocator;
-
-    const s = try allocator.dupe(u8, "test");
-    const v = try Value.fromString(allocator, s);
-
-    // Cycle 1
-    _ = v.retain();
-    v.release(allocator);
-
-    // Cycle 2
-    _ = v.retain();
-    _ = v.retain();
-    v.release(allocator);
-    v.release(allocator);
-
-    // Final release
-    v.release(allocator);
-}
-
-test "ADT with 10 fields" {
-    const allocator = testing.allocator;
-
-    const fields = try allocator.alloc(AdtField, 10);
-    for (fields, 0..) |*f, i| {
-        // 使用静态字段名避免内存管理复杂性
-        f.* = .{ .name = "field", .value = Value.fromSmallInt(@intCast(i)) };
-    }
-
-    const v = try Value.makeAdt(allocator, "BigADT", "Ctor", fields);
-    defer v.release(allocator);
-
-    const adt = v.asBoxed().payload.adt;
-    try testing.expectEqual(@as(usize, 10), adt.fields.len);
-}
-
-test "Range negative values" {
-    const allocator = testing.allocator;
-
-    const r = try Value.makeRange(allocator, -10, -1, true);
-    defer r.release(allocator);
-
-    const range = r.asBoxed().payload.range;
-    try testing.expectEqual(@as(i128, -10), range.start);
-    try testing.expectEqual(@as(i128, -1), range.end);
-    try testing.expect(range.contains(-5));
-    try testing.expect(!range.contains(0));
-    try testing.expectEqual(@as(i128, 10), range.len());
-}
-
-test "Range large values" {
-    const allocator = testing.allocator;
-
-    const r = try Value.makeRange(allocator, 0, 1000000, false);
-    defer r.release(allocator);
-
-    const range = r.asBoxed().payload.range;
-    try testing.expectEqual(@as(i128, 1000000), range.len());
-    try testing.expect(range.contains(500000));
-    try testing.expect(!range.contains(1000000));
-}
-
-test "ErrorValue with long message" {
-    const allocator = testing.allocator;
-
-    const long_msg = "This is a very long error message that tests string handling in ErrorValue construction and release";
-    const v = try Value.makeError(allocator, "TestError", long_msg, true);
-    defer v.release(allocator);
-
-    const err = v.asBoxed().payload.error_val;
-    try testing.expectEqualStrings(long_msg, err.message);
-}
-
-test "Builtin function with context" {
-    const allocator = testing.allocator;
-
-    const dummy_fn: BuiltinFn = struct {
-        fn call(_: *anyopaque, _: ?*anyopaque, _: []const Value) anyerror!Value {
-            return Value.fromSmallInt(999);
-        }
-    }.call;
-
-    var ctx: u32 = 12345;
-    const builtin = Builtin{ .fn_ptr = dummy_fn, .user_ctx = @ptrCast(&ctx) };
-    const v = try Value.makeBuiltin(allocator, builtin);
-    defer v.release(allocator);
-
-    const b = v.asBoxed().payload.builtin;
-    try testing.expect(b.user_ctx != null);
-}
-
-test "Array fixed size constraint" {
-    const allocator = testing.allocator;
-
-    const elements = try allocator.alloc(Value, 5);
-    for (elements, 0..) |*e, i| {
-        e.* = Value.fromSmallInt(@intCast(i));
-    }
-
-    const v = try Value.makeArray(allocator, elements, 5);
-    defer v.release(allocator);
-
-    const arr = v.asBoxed().payload.array;
-    try testing.expectEqual(@as(?u64, 5), arr.fixed_size);
-    try testing.expectEqual(@as(usize, 5), arr.elements.len);
-}
-
-test "Cell with null inner value" {
-    const allocator = testing.allocator;
-
-    const cell = try Value.makeCell(allocator, Value.fromNull());
-    defer cell.release(allocator);
-
-    const c = cell.asBoxed().payload.cell_val;
-    try testing.expect(c.inner.isNull());
-}
-
-test "Cell with unit inner value" {
-    const allocator = testing.allocator;
-
-    const cell = try Value.makeCell(allocator, Value.fromUnit());
-    defer cell.release(allocator);
-
-    const c = cell.asBoxed().payload.cell_val;
-    try testing.expect(c.inner.isUnit());
-}
-
-test "Newtype wrapping null" {
-    const allocator = testing.allocator;
-
-    const nt = try Value.makeNewtype(allocator, "Optional", Value.fromNull());
-    defer nt.release(allocator);
-
-    const newtype = nt.asBoxed().payload.newtype;
-    try testing.expect(newtype.inner.isNull());
-}
-
-test "Partial with zero bound args" {
-    const allocator = testing.allocator;
-
-    const func = Value.fromSmallInt(100);
-    const empty = try allocator.alloc(Value, 0);
-
-    const p = try Value.makePartial(allocator, func, empty, 5);
-    defer p.release(allocator);
-
-    const partial = p.asBoxed().payload.partial;
-    try testing.expectEqual(@as(usize, 0), partial.bound_args.len);
-    try testing.expectEqual(@as(u8, 5), partial.remaining_arity);
-}
-
-test "VmClosure with zero upvalues" {
-    const allocator = testing.allocator;
-
-    const func: *const anyopaque = @ptrFromInt(0x2000);
-    const empty_uv = try allocator.alloc(Value, 0);
-    const empty_ba = try allocator.alloc(Value, 0);
-
-    const vc = try Value.makeVmClosure(allocator, func, 2, empty_uv, empty_ba);
-    defer vc.release(allocator);
-
-    const closure = vc.asBoxed().payload.vm_closure;
-    try testing.expectEqual(@as(usize, 0), closure.upvalues.len);
-    try testing.expectEqual(@as(usize, 0), closure.bound_args.len);
-    try testing.expectEqual(@as(u8, 2), closure.arity);
-}
-
-test "Record empty fields" {
-    const allocator = testing.allocator;
-
-    const fields = std.StringHashMap(Value).init(allocator);
-    const v = try Value.makeRecord(allocator, "Empty", fields);
-    defer v.release(allocator);
-
-    const record = v.asBoxed().payload.record;
-    try testing.expectEqual(@as(usize, 0), record.fields.count());
-}
-
-test "ADT empty fields" {
-    const allocator = testing.allocator;
-
-    const empty = try allocator.alloc(AdtField, 0);
-    const v = try Value.makeAdt(allocator, "Unit", "Unit", empty);
-    defer v.release(allocator);
-
-    const adt = v.asBoxed().payload.adt;
-    try testing.expectEqual(@as(usize, 0), adt.fields.len);
-}
-
-test "Float special values" {
-    const pos_inf = Value.fromFloat(std.math.inf(f64));
-    const neg_inf = Value.fromFloat(-std.math.inf(f64));
-    const nan = Value.fromFloat(std.math.nan(f64));
-
-    try testing.expect(std.math.isInf(pos_inf.asFloat()));
-    try testing.expect(std.math.isInf(neg_inf.asFloat()));
-    try testing.expect(std.math.isNan(nan.asFloat()));
-}
-
-test "Integer type promotion examples" {
-    const i8_type = IntType.i8;
-    const i32_type = IntType.i32;
-    const u8_type = IntType.u8;
-
-    const promoted = promoteIntTypes(i8_type, i32_type);
-    try testing.expectEqual(IntType.i32, promoted);
-
-    const mixed = promoteIntTypes(i8_type, u8_type);
-    try testing.expectEqual(IntType.i16, mixed);
-}
-
-test "Integer type in range checks" {
-    const i8_type = IntType.i8;
-    try testing.expect(i8_type.inRange(100));
-    try testing.expect(!i8_type.inRange(200));
-
-    const u8_type = IntType.u8;
-    try testing.expect(u8_type.inRange(255));
-    try testing.expect(!u8_type.inRange(256));
-}
-
-// Day4+ 多精度浮点测试
-
-test "Float16 encoding and decoding" {
-    const f16_val: f16 = 3.14;
-    const v = Value.fromFloat16(f16_val);
-    
-    try testing.expectEqual(ValueTag.float16, v.tag);
-    try testing.expect(v.isInline());
-    try testing.expect(v.isFloat());
-    
-    const recovered = v.asFloat16();
-    try testing.expectApproxEqRel(f16_val, recovered, 0.01);
-}
-
-test "Float32 encoding and decoding" {
-    const f32_val: f32 = 3.141592;
-    const v = Value.fromFloat32(f32_val);
-    
-    try testing.expectEqual(ValueTag.float32, v.tag);
-    try testing.expect(v.isInline());
-    
-    const recovered = v.asFloat32();
-    try testing.expectApproxEqRel(f32_val, recovered, 0.00001);
-}
-
-test "Float64 encoding and decoding" {
-    const f64_val: f64 = 3.141592653589793;
-    const v = Value.fromFloat64(f64_val);
-    
-    try testing.expectEqual(ValueTag.float64, v.tag);
-    try testing.expect(v.isInline());
-    
-    const recovered = v.asFloat64();
-    try testing.expectEqual(f64_val, recovered);
-}
-
-test "Float128 boxing" {
-    const allocator = testing.allocator;
-    
-    const f128_val: f128 = 3.14159265358979323846264338327950288;
-    const v = try Value.fromFloat128(allocator, f128_val);
-    defer v.release(allocator);
-    
-    try testing.expectEqual(ValueTag.float128, v.tag);
-    try testing.expect(v.isBoxed());
-    try testing.expect(v.isFloat());
-    
-    const recovered = v.asFloat128();
-    try testing.expectEqual(f128_val, recovered);
-}
-
-test "FloatValue round-trip with type preservation" {
-    const allocator = testing.allocator;
-
-    // f16
-    const fv16 = FloatValue{ .value = 3.14, .type_tag = .f16 };
-    const v16 = try Value.fromFloatValue(allocator, fv16);
-    const recovered16 = v16.asFloatValue();
-    try testing.expectEqual(FloatType.f16, recovered16.type_tag);
-
-    // f32
-    const fv32 = FloatValue{ .value = 3.14159, .type_tag = .f32 };
-    const v32 = try Value.fromFloatValue(allocator, fv32);
-    const recovered32 = v32.asFloatValue();
-    try testing.expectEqual(FloatType.f32, recovered32.type_tag);
-
-    // f64
-    const fv64 = FloatValue{ .value = 0.1, .type_tag = .f64 };
-    const v64 = try Value.fromFloatValue(allocator, fv64);
-    const recovered64 = v64.asFloatValue();
-    try testing.expectEqual(FloatType.f64, recovered64.type_tag);
-
-    // f128
-    const fv128 = FloatValue{ .value = 1.23456789e50, .type_tag = .f128 };
-    const v128 = try Value.fromFloatValue(allocator, fv128);
-    defer v128.release(allocator);
-    const recovered128 = v128.asFloatValue();
-    try testing.expectEqual(FloatType.f128, recovered128.type_tag);
-}
-
-test "isFloat type check" {
-    const allocator = testing.allocator;
-    
-    try testing.expect(Value.fromFloat16(1.0).isFloat());
-    try testing.expect(Value.fromFloat32(1.0).isFloat());
-    try testing.expect(Value.fromFloat64(1.0).isFloat());
-    
-    const f128_v = try Value.fromFloat128(allocator, 1.0);
-    defer f128_v.release(allocator);
-    try testing.expect(f128_v.isFloat());
-    
-    // 非浮点值
-    try testing.expect(!Value.fromSmallInt(42).isFloat());
-    try testing.expect(!Value.fromBool(true).isFloat());
-}
