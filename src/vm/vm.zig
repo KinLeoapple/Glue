@@ -14,6 +14,7 @@ const opcode = @import("opcode.zig");
 const chunk_mod = @import("chunk.zig");
 const cast = @import("cast.zig");
 const method = @import("method.zig");
+const profiler_mod = @import("profiler");
 
 const OpCode = opcode.OpCode;
 const Chunk = chunk_mod.Chunk;
@@ -23,6 +24,11 @@ const Value = value.Value;
 const IntValue = value.IntValue;
 const FloatValue = value.FloatValue;
 const SpawnHandle = value.SpawnHandle;
+
+/// profiler 回调：u8 opcode 索引 → 可读名。注入 Profiler 供 dump 输出用（profiler 模块不依赖 OpCode）。
+fn opcodeNameCb(idx: u8) []const u8 {
+    return (@as(OpCode, @enumFromInt(idx))).name();
+}
 
 /// M4c：spawn 协程上下文。每个 spawn 起一个 OS 线程跑子 VM；子 VM 用 per-spawn arena
 /// （page_allocator 裸打底）分配，与父 VM 内存隔离（VM 纯 refcount，array/record 非原子 rc
@@ -376,11 +382,15 @@ pub const VM = struct {
     /// 分配并以 unit 初始化；deinit 时 release 各槽。
     globals: std.ArrayListUnmanaged(Value) = .empty,
 
-    /// VM profile：环境变量 GLUE_VM_PROFILE=1 开启。统计 opcode 执行频率，
-    /// 供后续优化（superinstructions / inline caching 候选识别）决策。覆盖所有嵌套 runLoop
-    /// 调用（含 forceLazy / invokeMethodBody / call）。墙钟耗时用外部 time 命令测量更准确。
-    profile_enabled: bool = false,
-    profile_counts: [@typeInfo(OpCode).@"enum".fields.len]u64 = .{0} ** @typeInfo(OpCode).@"enum".fields.len,
+    /// VM profile：指向外部 Profiler（由 main.zig 创建并注入）。null 时不统计。
+    /// opcode 计数覆盖所有嵌套 runLoop（含 forceLazy / invokeMethodBody / call）。
+    profiler: ?*profiler_mod.Profiler = null,
+
+    /// 注入 profiler 并注册 opcode 名字回调（profiler 独立模块，不依赖 OpCode）。
+    pub fn setProfiler(self: *VM, p: *profiler_mod.Profiler) void {
+        self.profiler = p;
+        p.setOpcodeNameFn(&opcodeNameCb);
+    }
 
     pub fn init(allocator: std.mem.Allocator) VM {
         return .{ .allocator = allocator };
@@ -416,44 +426,6 @@ pub const VM = struct {
         // M5g：release 全局变量槽。
         for (self.globals.items) |v| v.release(self.allocator);
         self.globals.deinit(self.allocator);
-    }
-
-    /// 输出 VM profile 报告到 stderr（GLUE_VM_PROFILE=1 时调用）。统计 opcode 频率，
-    /// 按计数降序输出，供 superinstructions / inline caching 候选识别。
-    /// 墙钟耗时请用外部 `time` 命令测量（避免 profile overhead 干扰）。
-    pub fn dumpProfile(self: *VM, io: std.Io) void {
-        if (!self.profile_enabled) return;
-        var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writerStreaming(io, &buf);
-        const wr = &w.interface;
-
-        var total: u64 = 0;
-        for (self.profile_counts) |c| total += c;
-
-        wr.print("\n[VM PROFILE]\n", .{}) catch {};
-        wr.print("total instructions: {d}\n", .{total}) catch {};
-
-        // 按计数降序排序输出。
-        const Entry = struct { idx: u8, count: u64 };
-        var entries: [@typeInfo(OpCode).@"enum".fields.len]Entry = undefined;
-        for (self.profile_counts, 0..) |c, i| entries[i] = .{ .idx = @intCast(i), .count = c };
-        std.mem.sort(Entry, &entries, {}, struct {
-            fn lt(_: void, a: Entry, b: Entry) bool {
-                return a.count > b.count;
-            }
-        }.lt);
-
-        wr.print("\nopcode counts (sorted desc):\n", .{}) catch {};
-        for (entries) |e| {
-            if (e.count == 0) continue;
-            const op_name = (@as(OpCode, @enumFromInt(e.idx))).name();
-            const pct: f64 = if (total > 0)
-                (@as(f64, @floatFromInt(e.count)) * 100.0) / @as(f64, @floatFromInt(total))
-            else
-                0;
-            wr.print("  {s}: {d} ({d:.1}%)\n", .{ op_name, e.count, pct }) catch {};
-        }
-        w.flush() catch {};
     }
 
     /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
@@ -755,7 +727,7 @@ pub const VM = struct {
             const op: OpCode = @enumFromInt(code[frame.ip]);
             const loc = func.chunk.lines.items[frame.ip];
             frame.ip += 1;
-            if (self.profile_enabled) self.profile_counts[@intFromEnum(op)] += 1;
+            if (self.profiler) |p| p.recordOpcode(@intFromEnum(op));
             switch (op) {
                 .op_const => {
                     const idx = opcode.readU16(code, frame.ip);

@@ -44,6 +44,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // profiler 模块：全管线 profiling（阶段计时 + 内存统计 + opcode 频率）。独立无依赖，
+    // vm 与 root 共享（VM 计数 opcode，main 埋点阶段 + 注入 SlabPool 统计 + dump）。
+    const profiler_module = b.createModule(.{
+        .root_source_file = b.path("src/profiling/profiler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const sync_module = b.createModule(.{
         .root_source_file = b.path("runtime/sync.zig"),
         .target = target,
@@ -198,6 +206,7 @@ pub fn build(b: *std.Build) void {
     vm_module.addImport("value", value_module);
     vm_module.addImport("lexer", lexer_module);
     vm_module.addImport("parser", parser_module);
+    vm_module.addImport("profiler", profiler_module);
 
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -243,6 +252,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("module_loader", module_loader_module);
     root_module.addImport("value", value_module);
     root_module.addImport("slab_pool", slab_pool_module);
+    root_module.addImport("profiler", profiler_module);
     // M5：字节码 VM 接入 glue run（vm_module 再导出 VM/Program/ModuleCompiler/lexer/parser）。
     root_module.addImport("vm", vm_module);
 

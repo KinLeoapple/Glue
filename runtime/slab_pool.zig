@@ -103,9 +103,15 @@ pub const SlabPool = struct {
     empty_slabs: ?*Slab,
     empty_count: usize,
 
-    // ── 统计（碎片率 = 1 - live_bytes/reserved_bytes）──
+    // ── 统计（碎片率 = 1 - live_peak_bytes/peak_bytes，基于峰值时刻）──
     live_bytes: usize,
     reserved_bytes: usize,
+    /// reserved_bytes 的历史峰值（向 backing 申请的最多字节数）。profiler 读取反映内存表现。
+    peak_bytes: usize,
+    /// live_bytes 的历史峰值（同时存活对象的最大字节数）。用于算真实碎片率：
+    /// 程序结束时 live_bytes=0（对象都已 release）但 reserved 还缓存着 slab，
+    /// 用结束时刻算会得到误导的 100%；用峰值时刻才反映真实分配效率。
+    live_peak_bytes: usize,
 
     const LargeObj = struct {
         ptr: [*]u8,
@@ -125,6 +131,8 @@ pub const SlabPool = struct {
             .empty_count = 0,
             .live_bytes = 0,
             .reserved_bytes = 0,
+            .peak_bytes = 0,
+            .live_peak_bytes = 0,
         };
         for (&pool.classes, 0..) |*c, i| {
             c.* = SizeClass{ .slot_size = SIZE_CLASSES[i] };
@@ -182,6 +190,13 @@ pub const SlabPool = struct {
         self.backing.rawFree(block, SLAB_ALIGN, @returnAddress());
     }
 
+    /// 增加 n 字节活对象统计，同时刷新 live_peak_bytes。所有 live_bytes 自增点经此走，
+    /// 保证峰值不漏（profiler 用 live_peak_bytes / peak_bytes 算真实碎片率）。
+    fn addLive(self: *SlabPool, n: usize) void {
+        self.live_bytes += n;
+        if (self.live_bytes > self.live_peak_bytes) self.live_peak_bytes = self.live_bytes;
+    }
+
     /// 申请一个 64KB 对齐块并初始化为 class i 的 slab。优先复用全局空 slab 缓存。
     fn newSlab(self: *SlabPool, class_idx: usize) ?*Slab {
         var slab: *Slab = undefined;
@@ -195,6 +210,7 @@ pub const SlabPool = struct {
             slab = @ptrCast(@alignCast(block.ptr));
             slab.block = block;
             self.reserved_bytes += SLAB_SIZE;
+            if (self.reserved_bytes > self.peak_bytes) self.peak_bytes = self.reserved_bytes;
         }
         const hdr = std.mem.alignForward(usize, @sizeOf(Slab), SLOT_ALIGNMENT);
         const slot_size = SIZE_CLASSES[class_idx];
@@ -278,7 +294,8 @@ fn vtableAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_ad
             return null;
         };
         self.reserved_bytes += len;
-        self.live_bytes += len;
+        if (self.reserved_bytes > self.peak_bytes) self.peak_bytes = self.reserved_bytes;
+        self.addLive(len);
         return raw;
     }
 
@@ -289,7 +306,7 @@ fn vtableAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_ad
     if (c.partial) |slab| {
         const ptr = SlabPool.slabTake(slab);
         if (!SlabPool.slabHasRoom(slab)) SlabPool.partialRemove(c, slab); // 满了摘除
-        self.live_bytes += len;
+        self.addLive(len);
         return ptr;
     }
 
@@ -298,7 +315,7 @@ fn vtableAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_ad
     SlabPool.partialPush(c, slab);
     const ptr = SlabPool.slabTake(slab);
     if (!SlabPool.slabHasRoom(slab)) SlabPool.partialRemove(c, slab);
-    self.live_bytes += len;
+    self.addLive(len);
     return ptr;
 }
 

@@ -7,6 +7,7 @@ const module_loader = @import("module_loader");
 const value = @import("value");
 const slab_pool = @import("slab_pool");
 const vm = @import("vm");
+const profiler = @import("profiler");
 
 /// 把求值器错误映射为专业英文消息（Go/Java 风格）。
 /// 若求值器已经设置了带上下文的 panic_message（如 "no method 'x' on type 'array'"），
@@ -50,25 +51,14 @@ const MANIFEST_NAME = "glue.toml";
 const DEFAULT_ENTRY = "src/Main.glue";
 
 // ============================================================
-// VM 追踪开关（用于调试）
+// 运行选项（命令行 flag）
 // ============================================================
 
-/// `GLUE_VM_TRACE=1`：向 stderr 打印 VM 执行信息（调试用）。
-var vm_trace: bool = false;
+/// `--profile`：全管线 profiling（阶段计时 + 内存统计 + opcode 频率），结束后输出报告。
+var profiler_enabled: bool = false;
 
-/// `GLUE_VM_PROFILE=1`：统计 opcode 频率 + 墙钟耗时，结束后输出 profile 报告。
-var vm_profile: bool = false;
-
-/// 从环境变量初始化 VM 追踪开关。environ_map 为 null（无 environ）时保持默认。
-fn initVmFlags(environ_map: ?*std.process.Environ.Map) void {
-    const e = environ_map orelse return;
-    if (e.get("GLUE_VM_TRACE")) |v| {
-        if (std.mem.eql(u8, v, "1")) vm_trace = true;
-    }
-    if (e.get("GLUE_VM_PROFILE")) |v| {
-        if (std.mem.eql(u8, v, "1")) vm_profile = true;
-    }
-}
+/// 全局 profiler 实例（runNormal/runDiagnostic 入口设置 io，各阶段埋点写入，结束 dump）。
+var prof: profiler.Profiler = .{};
 
 fn printError(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
@@ -86,9 +76,8 @@ fn printUsage(io: std.Io) void {
         \\  glue run           Build and run the current project
         \\  glue debug         Run with diagnostics (memory checking + runtime trace)
         \\
-        \\Environment:
-        \\  GLUE_VM_TRACE=1    Enable VM execution trace to stderr
-        \\  GLUE_VM_PROFILE=1  Dump opcode frequency + wall-clock profile after run
+        \\Options:
+        \\  --profile          Dump full pipeline profile (phases + memory + opcodes) after run
         \\
     , .{});
 }
@@ -102,8 +91,6 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    initVmFlags(init.environ_map);
-
     const args_slice = try std.process.Args.toSlice(init.minimal.args, init.arena.allocator());
 
     if (args_slice.len < 2) {
@@ -112,13 +99,22 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cmd = args_slice[1];
+
     if (std.mem.eql(u8, cmd, "init")) {
         const name: ?[]const u8 = if (args_slice.len >= 3) args_slice[2] else null;
         try cmdInit(allocator, io, name);
-    } else if (std.mem.eql(u8, cmd, "run")) {
-        try runProject(allocator, io, false);
-    } else if (std.mem.eql(u8, cmd, "debug")) {
-        try runProject(allocator, io, true);
+    } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "debug")) {
+        // 运行选项（命令行 flag）：扫描命令之后的参数。--profile 对 run/debug 均生效。
+        for (args_slice[2..]) |arg| {
+            if (std.mem.eql(u8, arg, "--profile")) {
+                profiler_enabled = true;
+            } else {
+                printError(io, "error: unknown option '{s}'\n\n", .{arg});
+                printUsage(io);
+                std.process.exit(1);
+            }
+        }
+        try runProject(allocator, io, std.mem.eql(u8, cmd, "debug"));
     } else {
         printError(io, "error: unknown command '{s}'\n\n", .{cmd});
         printUsage(io);
@@ -344,7 +340,16 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
     var loader = module_loader.ModuleLoader.init(arena_alloc, io);
     defer loader.deinit();
 
+    // profiler：初始化（io 用于单调时钟）。SlabPool 统计在 executeSource 返回后注入（pool 未 deinit）。
+    prof = profiler.Profiler.init(profiler_enabled, io);
+
     const outcome = executeSource(arena_alloc, &loader, value_allocator, io, source, entry_path);
+
+    // 注入 SlabPool 内存统计 + 输出 profile 报告（pool.deinit 前读取准确统计）。
+    if (profiler_enabled) {
+        prof.recordSlabStats(pool.live_bytes, pool.reserved_bytes, pool.live_peak_bytes, pool.peak_bytes);
+        prof.dump(io);
+    }
 
     // VM 已执行 main 或失败
     if (outcome == .failed) {
@@ -369,7 +374,15 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
         var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
         defer loader.deinit();
 
+        // profiler：诊断模式同样支持 profiling。
+        prof = profiler.Profiler.init(profiler_enabled, io);
+
         _ = executeSource(dbg_alloc, &loader, value_allocator, io, source, entry_path);
+
+        if (profiler_enabled) {
+            prof.recordSlabStats(pool.live_bytes, pool.reserved_bytes, pool.live_peak_bytes, pool.peak_bytes);
+            prof.dump(io);
+        }
     }
     const leaked = dbg.deinit();
     if (leaked == .leak) {
@@ -417,17 +430,24 @@ fn tryRunOnVM(
     }
 
     // 准备阶段：use 预加载 + 类型检查 + resolve
+    prof.phaseBegin(.type_check);
     loader.prepareModule(module) catch |err| switch (err) {
-        error.TypeCheckFailed => return .failed,
+        error.TypeCheckFailed => {
+            prof.phaseEnd();
+            return .failed;
+        },
         error.CircularDependency => {
+            prof.phaseEnd();
             printError(io, "{s}: error: circular module dependency\n", .{filename});
             return .failed;
         },
         else => {
+            prof.phaseEnd();
             printError(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
             return .failed;
         },
     };
+    prof.phaseEnd();
 
     // 编译模块 → Program
     var mc = vm.ModuleCompiler.init(allocator);
@@ -453,10 +473,13 @@ fn tryRunOnVM(
         return .failed;
     };
 
+    prof.phaseBegin(.compile);
     mc.compileModuleWithDeps(&module, deps.items) catch |err| {
+        prof.phaseEnd();
         printError(io, "{s}: error: compilation failed: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
+    prof.phaseEnd();
 
     const entry = mc.lookupFn("main") orelse {
         printError(io, "{s}: error: 'main' function not found after compilation\n", .{filename});
@@ -465,10 +488,11 @@ fn tryRunOnVM(
 
     // 执行 main
     var machine = vm.VM.initWithIo(value_allocator, io);
-    machine.profile_enabled = vm_profile;
     defer machine.deinit();
-    defer machine.dumpProfile(io); // 先于 deinit 执行（LIFO），读取未释放的 profile 数据
+    if (profiler_enabled) machine.setProfiler(&prof);
+    prof.phaseBegin(.vm);
     const result = machine.call(&mc.program, entry, &.{}) catch |err| {
+        prof.phaseEnd();
         const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
         const loc: ?ast.SourceLocation = if (machine.err_loc.line > 0) machine.err_loc else null;
         var err_buf: [4096]u8 = undefined;
@@ -477,6 +501,7 @@ fn tryRunOnVM(
         stderr_writer.flush() catch {};
         return .failed;
     };
+    prof.phaseEnd();
 
     // 检查是否有未捕获的 throw
     if (result.tag == .throw_val) {
@@ -494,7 +519,6 @@ fn tryRunOnVM(
 
     result.release(value_allocator);
 
-    if (vm_trace) printError(io, "[vm] {s}: ran on VM\n", .{filename});
     return .ran_main;
 }
 
@@ -515,20 +539,25 @@ fn executeSource(
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
 
+    prof.phaseBegin(.lex);
     const tokens = lex.tokenize() catch |err| {
+        prof.phaseEnd();
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         stderr_writer.interface.print("{s}: lexer error: {s}\n", .{ filename, @errorName(err) }) catch {};
         stderr_writer.flush() catch {};
         return .failed;
     };
+    prof.phaseEnd();
     defer allocator.free(tokens);
 
     // 语法分析 — 只支持模块（顶层声明）
     var p = parser.Parser.init(allocator, tokens);
     defer p.deinit();
 
+    prof.phaseBegin(.parse);
     const module = p.parseModule(filename) catch {
+        prof.phaseEnd();
         // 模块解析失败，报告错误
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
@@ -538,6 +567,7 @@ fn executeSource(
         stderr_writer.flush() catch {};
         return .failed;
     };
+    prof.phaseEnd();
 
     // 设置入口模块的源文件路径
     // 入口文件路径作为 source_path，使模块加载器能正确解析相对 use 依赖
