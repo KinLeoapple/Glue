@@ -314,6 +314,7 @@ pub const NewtypeValue = struct {
 
 pub const ArrayValue = struct {
     elements: []Value,
+    capacity: usize = 0,
     fixed_size: ?u64 = null,
 };
 
@@ -1007,6 +1008,7 @@ pub const Value = struct {
             .payload = .{
                 .array = .{
                     .elements = elements,
+                    .capacity = elements.len,
                     .fixed_size = fixed_size,
                 },
             },

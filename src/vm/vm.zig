@@ -545,7 +545,7 @@ pub const VM = struct {
 
     /// inline fast path：内联值（非 boxed）直接 push，省 retainOwned 函数调用。
     /// boxed 值走 retainOwned（深拷贝 string / rc+1 等）。
-    /// 用于 op_get_local_const 等高频指令（内联值占绝大多数）。
+    /// 用于 op_get_local 等高频指令（内联值占绝大多数）。
     inline fn pushRetain(self: *VM, v: Value) VMError!void {
         if (!v.isBoxed()) {
             try self.push(v);
@@ -556,7 +556,7 @@ pub const VM = struct {
 
     /// string 须 dupe 独立 owned（retain 对 string 是 no-op，见 §6.3）。
     /// 注意：throw 分支递归调用本函数，故不能加 inline（Zig 禁止 inline 递归）。
-    /// fast path（isBoxed 检查）由热点指令手动内联（见 op_get_local_const 等）。
+    /// fast path（isBoxed 检查）由热点指令手动内联（见 op_get_local 等）。
     fn retainOwned(self: *VM, v: Value) VMError!Value {
         // 内联值 fast path：null/bool/small_int/char/float 等无堆分配，retainOwned 是 no-op。
         // 单次 isBoxed 比较替代下方 9 个 tag 分支，op_get_local/op_const（最高频路径）显著加速。
@@ -730,12 +730,15 @@ pub const VM = struct {
     /// 主 dispatch 循环。从当前帧（frames 顶）取码执行，CALL 压帧、RETURN 弹帧。
     /// 当入口帧 RETURN（frames 清空）时返回其结果。
     fn runLoop(self: *VM, program: *const Program) VMError!Value {
-        // Dispatch loop 瘦身：frame/func/code 缓存到局部变量，避免每条指令重取。
+        // Dispatch loop 瘦身：frame/func/code/slot_base 缓存到局部变量，避免每条指令重取。
         // 仅在修改 frames 的指令（call/return 系列）后刷新。call/return 频率远低于
         // 总指令数（perf_recursion 中 op_call 占 ~3%），绝大多数指令直接命中缓存。
+        // slot_base 缓存：编译器无法证明 push 不修改 frame.slot_base，故每次 push 后
+        // 都会重新加载。缓存为局部变量后，push 间无需重载（仅在 call/return 刷新点更新）。
         var frame = &self.frames.items[self.frames.items.len - 1];
         var func = frame.func;
         var code = func.chunk.code.items;
+        var slot_base = frame.slot_base;
         while (true) {
             const op: OpCode = @enumFromInt(code[frame.ip]);
             const loc = func.chunk.lines.items[frame.ip];
@@ -747,28 +750,6 @@ pub const VM = struct {
                     frame.ip += 2;
                     try self.push(try self.retainOwned(func.chunk.constants.items[idx]));
                 },
-                // Superinstruction：合并 op_get_local(slot) + op_const(idx)。
-                // 读 slot 压栈 + 常量压栈，省一次 dispatch。语义等同两条原指令顺序执行。
-                .op_get_local_const => {
-                    const slot = opcode.readU16(code, frame.ip);
-                    frame.ip += 2;
-                    const idx = opcode.readU16(code, frame.ip);
-                    frame.ip += 2;
-                    // 读 local（透明解 cell / atomic / lazy，与 op_get_local 一致）
-                    const cur = self.stack.items[frame.slot_base + slot];
-                    const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
-                    if (v.tag == .atomic_val) {
-                        const av = v.asBoxed().payload.atomic_val;
-                        try self.push(try av.load(self.allocator));
-                    } else if (v.tag == .lazy_val) {
-                        const lv = &v.asBoxed().payload.lazy_val;
-                        try self.push(try self.forceLazyVM(lv, loc));
-                    } else {
-                        try self.pushRetain(v);
-                    }
-                    // 压常量
-                    try self.pushRetain(func.chunk.constants.items[idx]);
-                },
                 .op_null => try self.push(Value.fromNull()),
                 .op_unit => try self.push(Value.fromUnit()),
                 .op_true => try self.push(Value.fromBool(true)),
@@ -777,7 +758,7 @@ pub const VM = struct {
                 .op_get_local => {
                     const slot = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const cur = self.stack.items[frame.slot_base + slot];
+                    const cur = self.stack.items[slot_base + slot];
                     // 透明解 cell：被闭包捕获的 local 已就地 box 成 *Cell，读其 inner。
                     const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
                     // M4a：Atomic<T> 透明读取 —— 一般读取 load 出当前标量（方法接收者走 OP_GET_LOCAL_RAW）。
@@ -789,14 +770,19 @@ pub const VM = struct {
                         const lv = &v.asBoxed().payload.lazy_val;
                         try self.push(try self.forceLazyVM(lv, loc));
                     } else {
-                        try self.pushRetain(v);
+                        // inline fast path（内联值占绝大多数，省 retainOwned 调用）。
+                        if (!v.isBoxed()) {
+                            try self.push(v);
+                        } else {
+                            try self.push(try self.retainOwned(v));
+                        }
                     }
                 },
                 .op_set_local => {
                     const slot = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const v = self.pop();
-                    const dst = frame.slot_base + slot;
+                    const dst = slot_base + slot;
                     const cur = self.stack.items[dst];
                     // M5m：绑定语义（val/var/match/temp/循环变量）——总是纯覆写，建立**新**绑定。
                     // 不写穿残留 cell：上一轮循环若有闭包捕获了该 slot，op_closure 已就地 box 成 cell
@@ -815,7 +801,7 @@ pub const VM = struct {
                     const slot = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const v = self.pop();
-                    const dst = frame.slot_base + slot;
+                    const dst = slot_base + slot;
                     const cur = self.stack.items[dst];
                     if (cur.tag == .cell_val) {
                         const cell = cur.asBoxed().payload.cell_val;
@@ -843,7 +829,7 @@ pub const VM = struct {
                     const slot = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const v = self.pop();
-                    const dst = frame.slot_base + slot;
+                    const dst = slot_base + slot;
                     const cur = self.stack.items[dst];
                     // letrec 路径保证 slot 已 box 成 cell（先 op_unit + op_set_local 占位）。
                     if (cur.tag == .cell_val) {
@@ -930,40 +916,6 @@ pub const VM = struct {
                     defer right.release(self.allocator);
                     try self.push(try self.doCompare(op, left, right, loc));
                 },
-                // Superinstruction：链式合并 op_get_local + op_const + op_eq。
-                // 快速路径：small_int/bool 直接比 payload，省 2 push + 2 pop + retainOwned（高频 n==0）。
-                .op_get_local_const_eq => {
-                    const slot = opcode.readU16(code, frame.ip);
-                    frame.ip += 2;
-                    const idx = opcode.readU16(code, frame.ip);
-                    frame.ip += 2;
-                    const cur = self.stack.items[frame.slot_base + slot];
-                    const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
-                    const c = func.chunk.constants.items[idx];
-                    // 快速路径：small_int/boolean 直接比 payload（i48 bitcast 同符号扩展，值比较等价 i128 比较）
-                    if ((v.tag == .small_int and c.tag == .small_int) or
-                        (v.tag == .boolean and c.tag == .boolean))
-                    {
-                        try self.push(Value.fromBool(v.payload == c.payload));
-                    } else {
-                        // 回退：透明解 atomic/lazy 后走完整 doCompare（与 op_get_local 一致）
-                        if (v.tag == .atomic_val) {
-                            const av = v.asBoxed().payload.atomic_val;
-                            try self.push(try av.load(self.allocator));
-                        } else if (v.tag == .lazy_val) {
-                            const lv = &v.asBoxed().payload.lazy_val;
-                            try self.push(try self.forceLazyVM(lv, loc));
-                        } else {
-                            try self.push(try self.retainOwned(v));
-                        }
-                        try self.push(try self.retainOwned(c));
-                        const right = self.pop();
-                        const left = self.pop();
-                        defer left.release(self.allocator);
-                        defer right.release(self.allocator);
-                        try self.push(try self.doCompare(.op_eq, left, right, loc));
-                    }
-                },
                 .op_neg => {
                     const v = self.pop();
                     defer v.release(self.allocator);
@@ -998,16 +950,6 @@ pub const VM = struct {
                     const cond = cond_v.asBool();
                     if (cond) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
                 },
-                // Superinstruction：合并 op_jump_if_false + op_pop。if 语句 cond 总是消费。
-                // pop+release（boolean 内联，release 是 no-op）+ check + jump。
-                .op_jump_if_false_pop => {
-                    const off = opcode.readI32(code, frame.ip);
-                    frame.ip += 4;
-                    const cond_v = self.pop();
-                    cond_v.release(self.allocator);
-                    if (cond_v.tag != .boolean) return self.fail(loc, "condition must be boolean", error.TypeMismatch);
-                    if (!cond_v.asBool()) frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + off);
-                },
                 // M3c：`??` 短路 —— peek 栈顶非 null 则跳转（保留 left）。
                 .op_jump_if_not_null => {
                     const off = opcode.readI32(code, frame.ip);
@@ -1038,6 +980,7 @@ pub const VM = struct {
                     frame = &self.frames.items[self.frames.items.len - 1];
                     func = frame.func;
                     code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
                 },
 
                 .op_call_rec => {
@@ -1052,6 +995,7 @@ pub const VM = struct {
                     frame = &self.frames.items[self.frames.items.len - 1];
                     func = frame.func;
                     code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
                 },
 
                 .op_tail_call => {
@@ -1063,6 +1007,7 @@ pub const VM = struct {
                     frame = &self.frames.items[self.frames.items.len - 1];
                     func = frame.func;
                     code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
                 },
 
                 .op_closure => {
@@ -1079,7 +1024,7 @@ pub const VM = struct {
                         if (is_local) {
                             // 捕获 enclosing(当前)帧的 local[index]：就地 box 成 *Cell（若尚非 cell），
                             // 闭包与帧共享同一 cell（mutation 双向可见，cell rc 独立于帧 → 逃逸存活）。
-                            const dst = frame.slot_base + index;
+                            const dst = slot_base + index;
                             const cur = self.stack.items[dst];
                             if (cur.tag != .cell_val) {
                                 const new_cell = try value.Value.makeCell(self.allocator, cur);
@@ -1104,6 +1049,7 @@ pub const VM = struct {
                     frame = &self.frames.items[self.frames.items.len - 1];
                     func = frame.func;
                     code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
                 },
 
                 .op_call_native => {
@@ -1115,6 +1061,7 @@ pub const VM = struct {
                     frame = &self.frames.items[self.frames.items.len - 1];
                     func = frame.func;
                     code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
                 },
 
                 // M2a：复合值 / 模式匹配。
@@ -1291,25 +1238,6 @@ pub const VM = struct {
                     const tname = tname_val.asBoxed().payload.string;
                     self.doCoerce(tname);
                 },
-                // Superinstruction：合并 op_get_local(slot) + op_coerce(name) + op_set_local(slot)。
-                // 函数入口形参数值协调：直接 in-place 修改 slot（数值内联无 rc），省 push/pop + 2 dispatch。
-                .op_coerce_local => {
-                    const slot = opcode.readU16(code, frame.ip);
-                    frame.ip += 2;
-                    const name_idx = opcode.readU16(code, frame.ip);
-                    frame.ip += 2;
-                    const tname = func.chunk.constants.items[name_idx].asBoxed().payload.string;
-                    const dst = frame.slot_base + slot;
-                    const cur = self.stack.items[dst];
-                    // 与 doCoerce 一致：仅数值协调，非数值原样。数值内联值无 rc，直接覆盖无需 release。
-                    if (cur.isInteger() or cur.isFloat()) {
-                        if (cast.castNumeric(self.allocator, cur, tname)) |result| {
-                            self.stack.items[dst] = result;
-                        } else |_| {
-                            // 溢出/不符：原样
-                        }
-                    }
-                },
                 // M3b：字段赋值 —— [record, val] → [new_record]（COW），写回由 SET_LOCAL 完成。
                 .op_set_field => {
                     const name_idx = opcode.readU16(code, frame.ip);
@@ -1344,6 +1272,7 @@ pub const VM = struct {
                     frame = &self.frames.items[self.frames.items.len - 1];
                     func = frame.func;
                     code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
                 },
                 // M3c：非空断言 `!` —— peek 栈顶，null → panic，否则原样保留。
                 .op_non_null => {
@@ -1361,6 +1290,7 @@ pub const VM = struct {
                         frame = &self.frames.items[self.frames.items.len - 1];
                         func = frame.func;
                         code = func.chunk.code.items;
+                        slot_base = frame.slot_base;
                     } else if (top.tag == .throw_val) {
                         const throw_box = top.asBoxed();
                         switch (throw_box.payload.throw_val) {
@@ -1377,6 +1307,7 @@ pub const VM = struct {
                                 frame = &self.frames.items[self.frames.items.len - 1];
                                 func = frame.func;
                                 code = func.chunk.code.items;
+                                slot_base = frame.slot_base;
                             },
                         }
                     }
@@ -1390,6 +1321,7 @@ pub const VM = struct {
                     frame = &self.frames.items[self.frames.items.len - 1];
                     func = frame.func;
                     code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
                 },
                 // M3c：match Ok/Error 测试 —— 弹 throw_val，want_ok=1 测 .ok / =0 测 .err，压 bool。
                 .op_test_throw => {
@@ -1444,6 +1376,40 @@ pub const VM = struct {
                     frame = &self.frames.items[self.frames.items.len - 1];
                     func = frame.func;
                     code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
+                },
+                // OP_PUSH_INPLACE <u16 slot>：arr = arr.push(x) 模式优化。
+                // 弹栈顶 arg。读 slot 的数组 v（不 retain）。rc==1 时原地扩容，否则 fallback 通用 push。
+                .op_push_inplace => {
+                    const slot = opcode.readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const arg = self.pop();
+                    const cur = self.stack.items[slot_base + slot];
+                    const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
+                    if (v.tag == .array and v.asBoxed().rc == 1) {
+                        const arr = &v.asBoxed().payload.array;
+                        const old_len = arr.elements.len;
+                        if (arr.capacity > old_len) {
+                            arr.elements = arr.elements.ptr[0..old_len + 1];
+                        } else {
+                            const new_cap = @max(arr.capacity * 2, old_len + 1, 8);
+                            const new_mem = try self.allocator.alloc(Value, new_cap);
+                            @memcpy(new_mem[0..old_len], arr.elements);
+                            self.allocator.free(arr.elements);
+                            arr.elements = new_mem[0..old_len + 1];
+                            arr.capacity = new_cap;
+                        }
+                        arr.elements[old_len] = try self.retainOwned(arg);
+                        arg.release(self.allocator);
+                        try self.push(v.retain());
+                    } else {
+                        const result = method.dispatch(self.allocator, v, "push", &.{arg}) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return self.fail(loc, "push failed", error.TypeMismatch),
+                        };
+                        arg.release(self.allocator);
+                        try self.push(result);
+                    }
                 },
                 // M3d：构造 range —— 弹 [start,end]，压 range 值。
                 .op_make_range => {
@@ -1504,7 +1470,7 @@ pub const VM = struct {
                 .op_get_local_raw => {
                     const slot = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    const cur = self.stack.items[frame.slot_base + slot];
+                    const cur = self.stack.items[slot_base + slot];
                     const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
                     // raw 保留 atomic 引用（cas/swap 与 val 别名需要），但仍透明 force lazy
                     // （lazy 绑定语义与 eval 一致：bind 即 force；lazy 无方法，受者位置 force 亦正确）。
@@ -1631,9 +1597,22 @@ pub const VM = struct {
     /// 返回非 null：入口帧返回，结果交给 VM 调用者；返回 null：已压回调用者栈，继续主循环。
     fn frameReturn(self: *VM, result: Value) VMError!?Value {
         const frame = &self.frames.items[self.frames.items.len - 1];
+        const slot_count = frame.func.slot_count;
+        const mask = frame.func.release_mask;
         const base = frame.slot_base;
-        var s: u16 = 0;
-        while (s < frame.func.slot_count) : (s += 1) self.stack.items[base + s].release(self.allocator);
+        if (slot_count <= 64) {
+            if (mask != 0) {
+                var m = mask;
+                while (m != 0) {
+                    const s = @ctz(m);
+                    self.stack.items[base + s].release(self.allocator);
+                    m &= m - 1;
+                }
+            }
+        } else {
+            var s: u16 = 0;
+            while (s < slot_count) : (s += 1) self.stack.items[base + s].release(self.allocator);
+        }
         const fbase = frame.frame_base;
         if (fbase < base) {
             var i = fbase;
@@ -1664,8 +1643,13 @@ pub const VM = struct {
         if (self.frames.items.len >= MAX_FRAMES) return self.fail(loc, "stack overflow: call depth exceeded", error.StackOverflow);
         // 实参当前位于栈顶 argc 个槽，正好作为 callee 的 slot 0..arity-1（slot_base 指向它们）。
         const slot_base = self.stack.items.len - argc;
-        var s: u16 = callee.arity;
-        while (s < callee.slot_count) : (s += 1) try self.push(Value.fromUnit());
+        const fill_count = callee.slot_count - callee.arity;
+        if (fill_count > 0) {
+            try self.stack.ensureUnusedCapacity(self.allocator, fill_count);
+            const fill_start = self.stack.items.len;
+            self.stack.items.len += fill_count;
+            @memset(self.stack.items[fill_start..fill_start + fill_count], Value.fromUnit());
+        }
         try self.frames.append(self.allocator, .{ .func = callee, .ip = 0, .slot_base = slot_base, .frame_base = slot_base });
     }
 
@@ -1677,8 +1661,13 @@ pub const VM = struct {
         if (argc != callee.arity) return self.fail(loc, "wrong number of arguments", error.WrongArity);
         if (self.frames.items.len >= MAX_FRAMES) return self.fail(loc, "stack overflow: call depth exceeded", error.StackOverflow);
         const slot_base = self.stack.items.len - argc;
-        var s: u16 = callee.arity;
-        while (s < callee.slot_count) : (s += 1) try self.push(Value.fromUnit());
+        const fill_count = callee.slot_count - callee.arity;
+        if (fill_count > 0) {
+            try self.stack.ensureUnusedCapacity(self.allocator, fill_count);
+            const fill_start = self.stack.items.len;
+            self.stack.items.len += fill_count;
+            @memset(self.stack.items[fill_start..fill_start + fill_count], Value.fromUnit());
+        }
         const cur_upvalues = self.frames.items[self.frames.items.len - 1].upvalues;
         try self.frames.append(self.allocator, .{ .func = callee, .ip = 0, .slot_base = slot_base, .frame_base = slot_base, .upvalues = cur_upvalues });
     }
@@ -1701,8 +1690,21 @@ pub const VM = struct {
         var i: usize = 0;
         while (i < argc) : (i += 1) argbuf[i] = self.stack.items[args_start + i];
         // 2) 释放本帧局部槽（slot_base..slot_base+slot_count）。args 在其上方，不在此列。
-        var s: u16 = 0;
-        while (s < frame.func.slot_count) : (s += 1) self.stack.items[sbase + s].release(self.allocator);
+        const slot_count = frame.func.slot_count;
+        const mask = frame.func.release_mask;
+        if (slot_count <= 64) {
+            if (mask != 0) {
+                var m = mask;
+                while (m != 0) {
+                    const s = @ctz(m);
+                    self.stack.items[sbase + s].release(self.allocator);
+                    m &= m - 1;
+                }
+            }
+        } else {
+            var s: u16 = 0;
+            while (s < slot_count) : (s += 1) self.stack.items[sbase + s].release(self.allocator);
+        }
         // 3) OP_CALL_VALUE 帧：frame_base..slot_base 之间是 callee box，须 release。
         if (fbase < sbase) {
             var k = fbase;
@@ -1712,8 +1714,13 @@ pub const VM = struct {
         self.stack.shrinkRetainingCapacity(fbase);
         i = 0;
         while (i < argc) : (i += 1) try self.push(argbuf[i]);
-        var p: u16 = callee.arity;
-        while (p < callee.slot_count) : (p += 1) try self.push(Value.fromUnit());
+        const fill_count = callee.slot_count - callee.arity;
+        if (fill_count > 0) {
+            try self.stack.ensureUnusedCapacity(self.allocator, fill_count);
+            const fill_start = self.stack.items.len;
+            self.stack.items.len += fill_count;
+            @memset(self.stack.items[fill_start..fill_start + fill_count], Value.fromUnit());
+        }
         // 5) 就地改写当前帧为 callee（slot_base==frame_base==fbase；callee 为顶层函数，无 upvalue）。
         frame.func = callee;
         frame.ip = 0;

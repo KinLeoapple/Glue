@@ -14,11 +14,6 @@ pub const OpCode = enum(u8) {
     // —— 常量 / 字面量 ——
     /// OP_CONST <u16 idx>：常量池[idx] retain 后压栈
     op_const,
-    /// OP_GET_LOCAL_CONST <u16 slot> <u16 const_idx>（superinstruction）：
-    /// 合并 `op_get_local(slot); op_const(idx)` —— 读 slot 压栈 + 常量压栈，省一次 dispatch。
-    /// 由 Chunk.writeOp peephole 自动生成（编译器仍 emit get_local+const，Chunk 回看合并）。
-    /// 安全性：get_local; const 是一个表达式的连续两部分，中间无 jump 指向 const 起点。
-    op_get_local_const,
     /// 压入单例字面量（无操作数）
     op_null,
     op_unit,
@@ -48,11 +43,6 @@ pub const OpCode = enum(u8) {
 
     // —— 比较（pop 2，push bool）——
     op_eq,
-    /// OP_GET_LOCAL_CONST_EQ <u16 slot> <u16 const_idx>（superinstruction，链式合并）：
-    /// 合并 `op_get_local(slot); op_const(idx); op_eq` —— 读 slot + 常量压栈后直接比较压 bool。
-    /// 链式：先 op_get_local_const 合并 get_local+const，再本指令合并 +eq。
-    /// 高频模式 `n == 0` / `i < 10000`（eq 特化，其他比较不合并）。
-    op_get_local_const_eq,
     op_neq,
     op_lt,
     op_gt,
@@ -75,10 +65,6 @@ pub const OpCode = enum(u8) {
     op_jump_if_false,
     /// OP_JUMP_IF_TRUE <i32 off>：peek 栈顶，true 则跳转（不弹）
     op_jump_if_true,
-    /// OP_JUMP_IF_FALSE_POP <i32 off>（superinstruction）：合并 `op_jump_if_false + op_pop` ——
-    /// 弹栈顶 cond（release），false 则跳转。用于 if 语句（cond 总是消费，区别于 && 短路保留 cond）。
-    /// 省一次 dispatch + 一次 pop。由编译器在 emitIf/emitTail.if 显式发射。
-    op_jump_if_false_pop,
 
     // —— 栈操作 ——
     /// 弹栈顶并 release
@@ -181,11 +167,6 @@ pub const OpCode = enum(u8) {
     /// builtin 数值类型时按 cast.zig 协调 type_tag（如形参 i32 把 i8 实参拓宽成 i32）；
     /// 溢出/类型不符/非数值/泛型类型名 → **原样保留**（绝不 panic，区别于 op_cast）。
     op_coerce,
-    /// OP_COERCE_LOCAL <u16 slot> <u16 type_name_const_idx>（superinstruction）：
-    /// 合并 `op_get_local(slot); op_coerce(name); op_set_local(slot)` —— 函数入口形参数值协调。
-    /// 直接 in-place 修改 slot（数值内联无 rc），省 push/pop + 2 dispatch。由 emitParamCoercions 直接发射。
-    /// 高频热路径：每个带数值注解形参的函数调用都执行（如 countDown(n: i32) 入口）。
-    op_coerce_local,
     /// OP_CONCAT_LIST（无操作数）：弹 [left, right] 两数组，拼接成新数组（元素 retainOwned 各自一份），
     /// 压结果。镜像 eval evalConcatList（`++`）。非数组操作数 → panic。
     op_concat_list,
@@ -263,6 +244,10 @@ pub const OpCode = enum(u8) {
     /// OP_MAKE_TRAIT <u8 count>：弹栈顶 count 个 [name(string), closure] 对（顺序压栈，逆序弹），
     /// 建 vm_owned trait_value（vtable: name->vm_closure，data=null）压栈。供内联 trait 值。
     op_make_trait,
+    /// OP_PUSH_INPLACE <u16 slot>：弹栈顶 arg。读 slot 的数组 v（不 retain）。
+    /// 若 v 是 array 且 v.rc==1：原地扩容（capacity 倍增），写入 arg，push v.retain()。
+    /// 否则 fallback 到通用 push（method.dispatch）。供 `arr = arr.push(x)` 模式。
+    op_push_inplace,
 
     pub fn name(self: OpCode) []const u8 {
         return @tagName(self);

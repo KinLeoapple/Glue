@@ -23,13 +23,6 @@ pub const Chunk = struct {
     lines: std.ArrayListUnmanaged(SourceLocation) = .empty,
     allocator: std.mem.Allocator,
 
-    // ── Peephole 优化追踪 ──
-    /// 最近一条 writeOp 提交的 opcode（writeU16/writeByte 不更新此字段）。
-    /// 用于回看合并：如 op_const 紧跟完整 op_get_local → 合并为 op_get_local_const。
-    last_op: OpCode = .op_return,
-    /// last_op 的 op 字节在 code 中的偏移。配合 last_op 判断"上一条 op 是否紧邻当前且操作数已完整"。
-    last_op_start: usize = 0,
-
     pub fn init(allocator: std.mem.Allocator) Chunk {
         return .{ .allocator = allocator };
     }
@@ -43,37 +36,9 @@ pub const Chunk = struct {
     }
 
     /// 写一字节 opcode，并登记其源位置。
-    /// Peephole 回看合并：识别高频指令对，原地合并为 superinstruction（省 1 字节 + 1 次 dispatch）。
-    /// 安全性前提：被合并的指令对是同一表达式的连续部分，中间无 jump 指向第二条起点；合并后起点不变。
     pub fn writeOp(self: *Chunk, op: OpCode, loc: SourceLocation) !void {
-        const code_len = self.code.items.len;
-
-        // 1. op_const 紧跟完整 op_get_local(3B) → op_get_local_const
-        //    原 [op_get_local][slot 2B] + [op_const][idx 2B] = 6B → [op_get_local_const][slot 2B][idx 2B] = 5B
-        if (op == .op_const and self.last_op == .op_get_local and
-            self.last_op_start == code_len - 3)
-        {
-            self.code.items[self.last_op_start] = @intFromEnum(OpCode.op_get_local_const);
-            self.last_op = .op_get_local_const;
-            return; // 调用方 writeU16(idx) 追加 idx 2B + 2 lines
-        }
-
-        // 2. op_eq 紧跟完整 op_get_local_const(5B) → op_get_local_const_eq（链式合并）
-        //    原 [op_get_local_const][slot 2B][const 2B] + [op_eq] = 6B → [op_get_local_const_eq][slot 2B][const 2B] = 5B
-        //    eq 无操作数，合并时不 append；code/lines 各少 1，仍等长。
-        if (op == .op_eq and self.last_op == .op_get_local_const and
-            self.last_op_start == code_len - 5)
-        {
-            self.code.items[self.last_op_start] = @intFromEnum(OpCode.op_get_local_const_eq);
-            self.last_op = .op_get_local_const_eq;
-            return; // eq 无操作数，不 append
-        }
-
-        // 默认：正常 append op 字节 + loc
         try self.code.append(self.allocator, @intFromEnum(op));
         try self.lines.append(self.allocator, loc);
-        self.last_op = op;
-        self.last_op_start = self.code.items.len - 1;
     }
 
     /// 写一个裸字节（立即数）。立即数不单独登记位置，复用其 opcode 的位置。
@@ -135,6 +100,9 @@ pub const Function = struct {
     chunk: Chunk,
     arity: u8 = 0,
     slot_count: u16 = 0,
+    /// bit i=1 表示 slot i 可能持 boxed 值需 release；mask==0 跳过整个 release 循环。
+    /// slot_count > 64 时 u64 无法覆盖，回退到全 release。
+    release_mask: u64 = 0,
     name_id: u32 = 0xFFFF_FFFF,
     /// 诊断/反汇编用的函数名（借用 AST 的字节，不持有所有权）。
     name: []const u8 = "",

@@ -75,29 +75,8 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             try print(buf, allocator, "{s} iter={d} idx={d} exit={d} (-> {d})\n", .{ op.name(), iter_slot, idx_slot, rel, target });
             return offset + 9;
         },
-        // OP_GET_LOCAL_CONST <u16 slot> <u16 const_idx>（superinstruction：2×u16 操作数）
-        .op_get_local_const => {
-            const slot = opcode.readU16(code, offset + 1);
-            const idx = opcode.readU16(code, offset + 3);
-            try print(buf, allocator, "{s} slot={d} const={d}\n", .{ op.name(), slot, idx });
-            return offset + 5;
-        },
-        // OP_GET_LOCAL_CONST_EQ <u16 slot> <u16 const_idx>（superinstruction，链式合并）
-        .op_get_local_const_eq => {
-            const slot = opcode.readU16(code, offset + 1);
-            const idx = opcode.readU16(code, offset + 3);
-            try print(buf, allocator, "{s} slot={d} const={d}\n", .{ op.name(), slot, idx });
-            return offset + 5;
-        },
-        // OP_COERCE_LOCAL <u16 slot> <u16 type_name_const_idx>（superinstruction）
-        .op_coerce_local => {
-            const slot = opcode.readU16(code, offset + 1);
-            const name_idx = opcode.readU16(code, offset + 3);
-            try print(buf, allocator, "{s} slot={d} type#{d}\n", .{ op.name(), slot, name_idx });
-            return offset + 5;
-        },
         // u16 操作数
-        .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_set_local_assign, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_make_error, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_global, .op_set_global, .op_get_local_raw, .op_get_upvalue_raw => {
+        .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_set_local_assign, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_make_error, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_global, .op_set_global, .op_get_local_raw, .op_get_upvalue_raw, .op_push_inplace => {
             const arg = opcode.readU16(code, offset + 1);
             try print(buf, allocator, "{s} {d}\n", .{ op.name(), arg });
             return offset + 3;
@@ -158,7 +137,7 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             return offset + 3;
         },
         // i32 跳转偏移：同时打印解码后的绝对目标，便于核对回填
-        .op_jump, .op_jump_if_false, .op_jump_if_true, .op_jump_if_false_pop, .op_jump_if_not_null, .op_jump_if_null => {
+        .op_jump, .op_jump_if_false, .op_jump_if_true, .op_jump_if_not_null, .op_jump_if_null => {
             const rel = opcode.readI32(code, offset + 1);
             const after = offset + 5;
             const target: i64 = @as(i64, @intCast(after)) + rel;

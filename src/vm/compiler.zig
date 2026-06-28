@@ -39,6 +39,7 @@ const Local = struct {
     name: []const u8,
     slot: u16,
     is_var: bool,
+    builtin_type: ?[]const u8 = null,
 };
 
 /// 闭包 upvalue 描述符（clox 风格静态解析）。
@@ -64,6 +65,7 @@ const FnEntry = struct {
     name: []const u8,
     idx: u16,
     arity: u16,
+    param_types: []const ?[]const u8 = &.{},
 };
 
 /// ADT 构造器名 → (program.adt_ctors 索引, arity)。编译期识别裸名构造器调用 + match 校验。
@@ -299,7 +301,8 @@ pub const ModuleCompiler = struct {
                     // 同名顶层函数已登记（如依赖与入口重名）→ 跳过重复预占（首个生效）。
                     if (self.lookupFn(fd.name) != null) continue;
                     const idx: u16 = @intCast(self.fn_table.items.len);
-                    try self.fn_table.append(self.allocator, .{ .name = fd.name, .idx = idx, .arity = @intCast(fd.params.len) });
+                    const param_types = try extractParamTypes(self.allocator, fd.params);
+                    try self.fn_table.append(self.allocator, .{ .name = fd.name, .idx = idx, .arity = @intCast(fd.params.len), .param_types = param_types });
                     _ = try self.program.addFunction(.{ .chunk = Chunk.init(self.allocator), .arity = 0, .slot_count = 0, .name = fd.name });
                 },
                 .type_decl => |td| {
@@ -517,16 +520,15 @@ pub const ModuleCompiler = struct {
         defer fc.deinit();
 
         for (m.params) |p| {
-            _ = try fc.declareLocal(p.name, p.is_var);
+            _ = try fc.declareLocal(p.name, p.is_var, typeNeedsRelease(p.type_annotation), builtinTypeOf(p.type_annotation));
         }
 
-        // 形参隐式定型（i8 实参 → i32 形参），镜像 compileFunction。
-        try fc.emitParamCoercions(m.params, ast.exprLocation(body));
         try fc.emitTail(body);
         const f = Function{
             .chunk = fc.chunk,
             .arity = @intCast(m.params.len),
             .slot_count = fc.slot_count,
+            .release_mask = fc.release_mask,
             .name = m.name,
         };
         fc.chunk = Chunk.init(self.allocator);
@@ -552,6 +554,7 @@ pub const ModuleCompiler = struct {
             .chunk = fc.chunk,
             .arity = arity,
             .slot_count = fc.slot_count,
+            .release_mask = fc.release_mask,
             .name = name,
         };
         fc.chunk = Chunk.init(self.allocator);
@@ -578,7 +581,7 @@ pub const ModuleCompiler = struct {
             const ge = self.lookupGlobal(gv.name).?;
             try fc.emitExpr(gv.value);
             // 注解隐式定型（i8 字面量 → i32 全局），镜像形参/局部协调。
-            try fc.emitCoerceFromAnnotation(gv.ann, ed.location);
+            try fc.emitCoerceFromAnnotation(gv.ann, gv.value, ed.location);
             try fc.chunk.writeOp(.op_set_global, ed.location);
             try fc.chunk.writeU16(ge.idx);
         }
@@ -588,6 +591,7 @@ pub const ModuleCompiler = struct {
             .chunk = fc.chunk,
             .arity = 0,
             .slot_count = fc.slot_count,
+            .release_mask = fc.release_mask,
             .name = "<globals_init>",
         };
         fc.chunk = Chunk.init(self.allocator);
@@ -635,15 +639,14 @@ pub const ModuleCompiler = struct {
         var fc = FnCompiler.init(self.allocator, self);
         defer fc.deinit();
         // 参数占 slot 0..arity-1。
-        for (fd.params) |p| _ = try fc.declareLocal(p.name, p.is_var);
-        // M5：对带 builtin 数值注解的形参，入口处把实参协调到声明类型（i8 实参→i32 形参）。
-        try fc.emitParamCoercions(fd.params, ast.exprLocation(fd.body));
+        for (fd.params) |p| _ = try fc.declareLocal(p.name, p.is_var, typeNeedsRelease(p.type_annotation), builtinTypeOf(p.type_annotation));
         try fc.emitTail(fd.body); // 函数体在尾位置：尾调用→OP_TAIL_CALL，否则 emitExpr+OP_RETURN
         // 移交 chunk 所有权给 Function；fc.deinit 只清 locals。
         const f = Function{
             .chunk = fc.chunk,
             .arity = @intCast(fd.params.len),
             .slot_count = fc.slot_count,
+            .release_mask = fc.release_mask,
             .name = fd.name,
         };
         fc.chunk = Chunk.init(self.allocator); // 移走真 chunk 后置空壳：fc.deinit 释放空壳（无分配）
@@ -661,6 +664,8 @@ const FnCompiler = struct {
     module: *ModuleCompiler,
     locals: std.ArrayListUnmanaged(Local) = .empty,
     slot_count: u16 = 0,
+    /// bit i=1 表示 slot i 可能持 boxed 值需 release。declareLocal 时根据类型注解置位。
+    release_mask: u64 = 0,
     /// 外层函数编译器（嵌套 lambda 用于 upvalue 解析）；顶层函数为 null。
     enclosing: ?*FnCompiler = null,
     /// 本函数捕获的 upvalue（clox 静态解析；运行时 OP_CLOSURE 据此 box/共享 cell）。
@@ -692,10 +697,11 @@ const FnCompiler = struct {
         self.chunk.deinit();
     }
 
-    fn declareLocal(self: *FnCompiler, name: []const u8, is_var: bool) CompileError!u16 {
+    fn declareLocal(self: *FnCompiler, name: []const u8, is_var: bool, needs_release: bool, builtin_type: ?[]const u8) CompileError!u16 {
         const slot: u16 = @intCast(self.locals.items.len);
-        try self.locals.append(self.allocator, .{ .name = name, .slot = slot, .is_var = is_var });
+        try self.locals.append(self.allocator, .{ .name = name, .slot = slot, .is_var = is_var, .builtin_type = builtin_type });
         if (self.locals.items.len > self.slot_count) self.slot_count = @intCast(self.locals.items.len);
+        if (slot < 64 and needs_release) self.release_mask |= (@as(u64, 1) << @intCast(slot));
         return slot;
     }
 
@@ -1005,12 +1011,11 @@ const FnCompiler = struct {
             placeholder_idx = try self.module.program.addFunction(placeholder);
             sub.rec_func_idx = placeholder_idx.?;
         }
-        for (lam.params) |p| _ = try sub.declareLocal(p.name, p.is_var);
+        for (lam.params) |p| _ = try sub.declareLocal(p.name, p.is_var, typeNeedsRelease(p.type_annotation), builtinTypeOf(p.type_annotation));
         const body_expr = switch (lam.body) {
             .block => |b| b,
             .expression => |e| e,
         };
-        try sub.emitParamCoercions(lam.params, loc); // M5：lambda 形参数值注解协调
         try sub.emitExpr(body_expr);
         try sub.chunk.writeOp(.op_return, loc);
         // 检测值位置自引用：rec_name 出现在 upvalues 中（非 call 位置）→ 需要 cell 路径断环。
@@ -1027,6 +1032,7 @@ const FnCompiler = struct {
             .chunk = sub.chunk,
             .arity = @intCast(lam.params.len),
             .slot_count = sub.slot_count,
+            .release_mask = sub.release_mask,
             .name = if (rec_name) |n| n else "<lambda>",
         };
         sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
@@ -1058,6 +1064,7 @@ const FnCompiler = struct {
             .chunk = sub.chunk,
             .arity = 0,
             .slot_count = sub.slot_count,
+            .release_mask = sub.release_mask,
             .name = "<spawn>",
         };
         sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
@@ -1084,6 +1091,7 @@ const FnCompiler = struct {
             .chunk = sub.chunk,
             .arity = 0,
             .slot_count = sub.slot_count,
+            .release_mask = sub.release_mask,
             .name = "<lazy>",
         };
         sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
@@ -1128,7 +1136,7 @@ const FnCompiler = struct {
                     try self.chunk.writeOp(.op_pop, ra.location); // 弹 flag
                     const saved = self.locals.items.len;
                     if (ra.binding) |bname| {
-                        const slot = try self.declareLocal(bname, false);
+                        const slot = try self.declareLocal(bname, false, true, null);
                         try self.chunk.writeOp(.op_set_local, ra.location); // value → slot
                         try self.chunk.writeU16(slot);
                     } else {
@@ -1170,7 +1178,7 @@ const FnCompiler = struct {
                     try self.chunk.writeOp(.op_recv, ra.location); // → value
                     const saved = self.locals.items.len;
                     if (ra.binding) |bname| {
-                        const slot = try self.declareLocal(bname, false);
+                        const slot = try self.declareLocal(bname, false, true, null);
                         try self.chunk.writeOp(.op_set_local, ra.location);
                         try self.chunk.writeU16(slot);
                     } else {
@@ -1204,13 +1212,14 @@ const FnCompiler = struct {
             var sub = FnCompiler.init(self.allocator, self.module);
             sub.enclosing = self;
             defer sub.deinit();
-            for (method.params) |p| _ = try sub.declareLocal(p.name, p.is_var);
+            for (method.params) |p| _ = try sub.declareLocal(p.name, p.is_var, typeNeedsRelease(p.type_annotation), builtinTypeOf(p.type_annotation));
             try sub.emitExpr(body);
             try sub.chunk.writeOp(.op_return, method.location);
             const f = Function{
                 .chunk = sub.chunk,
                 .arity = @intCast(method.params.len),
                 .slot_count = sub.slot_count,
+                .release_mask = sub.release_mask,
                 .name = method.name,
             };
             sub.chunk = Chunk.init(self.allocator);
@@ -1233,40 +1242,45 @@ const FnCompiler = struct {
         try self.chunk.writeU16(k);
     }
 
-    /// M5：按类型注解发射隐式数值定型（OP_COERCE）。仅当注解是 builtin 数值类型名（i*/u*/f*）
-    /// 时发射；str/bool/泛型/用户类型/无注解 → 不发射（隐式协调只管数值宽度，镜像 eval 在形参/
-    /// val/var 绑定处对 builtin 数值类型调 castValue 的行为）。作用于栈顶值（就地协调）。
-    fn emitCoerceFromAnnotation(self: *FnCompiler, ann: ?*const ast.TypeNode, loc: ast.SourceLocation) CompileError!void {
-        const ta = ann orelse return;
-        const tname = switch (ta.*) {
-            .named => |n| n.name,
-            else => return, // 泛型/可空/函数类型等：不隐式协调
+    /// 推断表达式的基础类型名（int/float/bool/char literal + identifier 可推断；binary/unary 算术递归左操作数；其他返回 null）。
+    fn exprBuiltinType(self: *FnCompiler, expr: *const Expr) ?[]const u8 {
+        return switch (expr.*) {
+            .int_literal => |il| blk: {
+                if (il.suffix) |s| break :blk s;
+                const int_val = std.fmt.parseInt(u128, il.raw, 0) catch break :blk null;
+                break :blk @tagName(value.inferIntType(int_val));
+            },
+            .float_literal => |fl| if (fl.suffix) |s| s else "f64",
+            .bool_literal => "bool",
+            .char_literal => "char",
+            .identifier => |id| if (self.resolveLocal(id.name)) |slot|
+                self.locals.items[slot].builtin_type
+            else
+                null,
+            .binary => |bin| if (isArithmeticOp(bin.op)) self.exprBuiltinType(bin.left) else null,
+            .unary => |u| self.exprBuiltinType(u.operand),
+            else => null,
         };
-        if (!isBuiltinNumericType(tname)) return; // str/bool/用户类型：不协调
+    }
+
+    /// 发射 op_coerce 到指定类型名（栈顶值协调）。仅对数值类型有效（bool/char 的 op_coerce 是 no-op）。
+    fn emitCoerceForType(self: *FnCompiler, tname: []const u8, loc: ast.SourceLocation) CompileError!void {
         const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, tname)));
         try self.chunk.writeOp(.op_coerce, loc);
         try self.chunk.writeU16(name_const);
     }
 
-    /// M5：在函数/lambda 入口为带 builtin 数值注解的形参发射 OP_GET_LOCAL+COERCE+SET_LOCAL，
-    /// 把传入实参（可能是 inferIntType 的最小类型）协调到声明类型（如 i32）。
-    /// 镜像 eval callFunction 在绑定形参时对 param.type_annotation 调 castValue 的逻辑。
-    fn emitParamCoercions(self: *FnCompiler, params: []const ast.Param, loc: ast.SourceLocation) CompileError!void {
-        for (params) |p| {
-            const ta = p.type_annotation orelse continue;
-            const tname = switch (ta.*) {
-                .named => |n| n.name,
-                else => continue,
-            };
-            if (!isBuiltinNumericType(tname)) continue;
-            const slot = self.resolveLocal(p.name).?; // 刚 declareLocal，必存在
-            const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, tname)));
-            // Superinstruction op_coerce_local：合并 get_local + coerce + set_local，
-            // 直接 in-place 修改 slot（数值内联无 rc），省 push/pop + 2 dispatch。
-            try self.chunk.writeOp(.op_coerce_local, loc);
-            try self.chunk.writeU16(slot);
-            try self.chunk.writeU16(name_const);
+    /// M5：按类型注解发射隐式数值定型（OP_COERCE）。仅当注解是 builtin 数值类型名（i*/u*/f*）
+    /// 时发射；str/bool/泛型/用户类型/无注解 → 不发射（隐式协调只管数值宽度，镜像 eval 在形参/
+    /// val/var 绑定处对 builtin 数值类型调 castValue 的行为）。作用于栈顶值（就地协调）。
+    /// caller-side 优化：若 RHS 表达式推断类型与注解匹配，跳过 op_coerce 发射。
+    fn emitCoerceFromAnnotation(self: *FnCompiler, ann: ?*const ast.TypeNode, expr: *const Expr, loc: ast.SourceLocation) CompileError!void {
+        const tname = builtinTypeOf(ann) orelse return;
+        if (!isBuiltinNumericType(tname)) return; // bool/char/用户类型：不协调
+        if (self.exprBuiltinType(expr)) |rt| {
+            if (std.mem.eql(u8, rt, tname)) return; // 类型匹配，跳过
         }
+        try self.emitCoerceForType(tname, loc);
     }
 
     /// 调用派发（M1b）：
@@ -1289,11 +1303,13 @@ const FnCompiler = struct {
             },
             .if_expr => |ie| {
                 try self.emitExpr(ie.condition);
-                // op_jump_if_false_pop 合并 jump+pop：if 语句 cond 总是消费（区别于 && 短路保留 cond）。
-                const else_jump = try self.chunk.emitJump(.op_jump_if_false_pop, loc);
+                // if 语句 cond 总是消费：false 跳 else，两条路径各 pop。
+                const else_jump = try self.chunk.emitJump(.op_jump_if_false, loc);
+                try self.chunk.writeOp(.op_pop, loc); // true 路径 pop cond
                 try self.emitTail(ie.then_branch); // 分支尾自带 RETURN/TAIL_CALL
                 // then 分支已 RETURN，无需 end_jump 跳过 else。
                 self.chunk.patchJump(else_jump);
+                try self.chunk.writeOp(.op_pop, loc); // false 路径 pop cond
                 if (ie.else_branch) |eb| {
                     try self.emitTail(eb);
                 } else {
@@ -1337,7 +1353,17 @@ const FnCompiler = struct {
         if (self.resolveLocal(name) != null) return false; // 被 local 遮蔽 → 非顶层
         const entry = self.module.lookupFnEntry(name) orelse return false;
         if (entry.arity != c.arguments.len) return false; // 仅足参直调可复用帧
-        for (c.arguments) |arg| try self.emitExpr(arg);
+        for (c.arguments, 0..) |arg, i| {
+            try self.emitExpr(arg);
+            if (i < entry.param_types.len) {
+                if (entry.param_types[i]) |pt| {
+                    if (isBuiltinNumericType(pt)) {
+                        const at = self.exprBuiltinType(arg);
+                        if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                    }
+                }
+            }
+        }
         try self.chunk.writeOp(.op_tail_call, loc);
         try self.chunk.writeU16(entry.idx);
         try self.chunk.writeByte(@intCast(c.arguments.len));
@@ -1392,7 +1418,18 @@ const FnCompiler = struct {
             // 必须在 resolveUpvalue 之前判断，否则 rec_name 被加入 upvalues 形成 cell 循环引用。
             if (self.rec_name) |rn| {
                 if (std.mem.eql(u8, rn, name)) {
-                    for (c.arguments) |arg| try self.emitExpr(arg);
+                    for (c.arguments, 0..) |arg, i| {
+                        try self.emitExpr(arg);
+                        // caller-side coerce：比对实参类型与形参类型（形参是 self.locals 的前 N 项）
+                        if (i < self.locals.items.len) {
+                            if (self.locals.items[i].builtin_type) |pt| {
+                                if (isBuiltinNumericType(pt)) {
+                                    const at = self.exprBuiltinType(arg);
+                                    if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                                }
+                            }
+                        }
+                    }
                     try self.chunk.writeOp(.op_call_rec, loc);
                     try self.chunk.writeU16(self.rec_func_idx);
                     try self.chunk.writeByte(argc);
@@ -1413,7 +1450,18 @@ const FnCompiler = struct {
                 }
 
                 if (self.module.lookupFn(name)) |func_idx| {
-                    for (c.arguments) |arg| try self.emitExpr(arg);
+                    const entry = self.module.lookupFnEntry(name).?;
+                    for (c.arguments, 0..) |arg, i| {
+                        try self.emitExpr(arg);
+                        if (i < entry.param_types.len) {
+                            if (entry.param_types[i]) |pt| {
+                                if (isBuiltinNumericType(pt)) {
+                                    const at = self.exprBuiltinType(arg);
+                                    if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                                }
+                            }
+                        }
+                    }
                     try self.chunk.writeOp(.op_call, loc);
                     try self.chunk.writeU16(func_idx);
                     try self.chunk.writeByte(argc);
@@ -1560,11 +1608,13 @@ const FnCompiler = struct {
 
     fn emitIf(self: *FnCompiler, ie: @TypeOf(@as(Expr, undefined).if_expr), loc: ast.SourceLocation) CompileError!void {
         try self.emitExpr(ie.condition);
-        // op_jump_if_false_pop 合并 jump+pop：if 语句 cond 总是消费（区别于 && 短路保留 cond）。
-        const else_jump = try self.chunk.emitJump(.op_jump_if_false_pop, loc);
+        // if 语句 cond 总是消费：false 跳 else，两条路径各 pop。
+        const else_jump = try self.chunk.emitJump(.op_jump_if_false, loc);
+        try self.chunk.writeOp(.op_pop, loc); // true 路径 pop cond
         try self.emitExpr(ie.then_branch);
         const end_jump = try self.chunk.emitJump(.op_jump, loc);
         self.chunk.patchJump(else_jump);
+        try self.chunk.writeOp(.op_pop, loc); // false 路径 pop cond
         if (ie.else_branch) |eb| {
             try self.emitExpr(eb);
         } else {
@@ -1646,7 +1696,7 @@ const FnCompiler = struct {
     fn emitMatch(self: *FnCompiler, m: @TypeOf(@as(Expr, undefined).match), loc: ast.SourceLocation) CompileError!void {
         try self.emitExpr(m.scrutinee);
         const saved_scrut = self.locals.items.len;
-        const scrut_slot = try self.declareLocal("$scrut", false);
+        const scrut_slot = try self.declareLocal("$scrut", false, true, null);
         try self.chunk.writeOp(.op_set_local, loc);
         try self.chunk.writeU16(scrut_slot);
 
@@ -1691,7 +1741,7 @@ const FnCompiler = struct {
                     try self.emitCtorTest(scrut_slot, v.name, fail_jumps, loc);
                 } else {
                     // 小写：变量绑定，恒匹配。
-                    const slot = try self.declareLocal(v.name, false);
+                    const slot = try self.declareLocal(v.name, false, true, null);
                     try self.chunk.writeOp(.op_get_local, loc);
                     try self.chunk.writeU16(scrut_slot);
                     try self.chunk.writeOp(.op_set_local, loc);
@@ -1720,7 +1770,7 @@ const FnCompiler = struct {
                     try fail_jumps.append(self.allocator, try self.chunk.emitJump(.op_jump_if_false, loc));
                     try self.chunk.writeOp(.op_pop, loc); // 命中：弹 true
                     // 解包内值（Ok→inner / Error→error_val）进临时 slot 递归。
-                    const tmp = try self.declareLocal("$thr", false);
+                    const tmp = try self.declareLocal("$thr", false, true, null);
                     try self.chunk.writeOp(.op_get_local, loc);
                     try self.chunk.writeU16(scrut_slot);
                     try self.chunk.writeOp(if (want_ok == 1) .op_get_throw_ok else .op_get_throw_err, loc);
@@ -1738,7 +1788,7 @@ const FnCompiler = struct {
                     try fail_jumps.append(self.allocator, try self.chunk.emitJump(.op_jump_if_false, loc));
                     try self.chunk.writeOp(.op_pop, loc);
                     // 解 inner 进临时 slot 递归。
-                    const tmp = try self.declareLocal("$nt", false);
+                    const tmp = try self.declareLocal("$nt", false, true, null);
                     try self.chunk.writeOp(.op_get_local, loc);
                     try self.chunk.writeU16(scrut_slot);
                     try self.chunk.writeOp(.op_get_newtype_inner, loc);
@@ -1749,7 +1799,7 @@ const FnCompiler = struct {
                     // ADT 构造器模式：测构造器名 + 按位置解字段递归。
                     try self.emitCtorTest(scrut_slot, ctor.name, fail_jumps, loc);
                     for (ctor.patterns, 0..) |sub, i| {
-                        const tmp = try self.declareLocal("$fld", false);
+                        const tmp = try self.declareLocal("$fld", false, true, null);
                         try self.chunk.writeOp(.op_get_local, loc);
                         try self.chunk.writeU16(scrut_slot);
                         try self.chunk.writeOp(.op_get_adt_field, loc);
@@ -1763,7 +1813,7 @@ const FnCompiler = struct {
             .record => |rec| {
                 // 记录模式：无标签测试，按名解字段递归绑定。
                 for (rec.fields) |f| {
-                    const tmp = try self.declareLocal("$rf", false);
+                    const tmp = try self.declareLocal("$rf", false, true, null);
                     try self.chunk.writeOp(.op_get_local, loc);
                     try self.chunk.writeU16(scrut_slot);
                     const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, f.name)));
@@ -1845,7 +1895,7 @@ const FnCompiler = struct {
                 // （不走 cell + upvalue，从根本消除循环引用）。仅当 lambda 体内值位置引用了
                 // rec_name（has_self_uv=true）才退回原 letrec 路径（op_set_local_letrec 断环）。
                 if (d.value.* == .lambda) {
-                    const slot = try self.declareLocal(d.name, false);
+                    const slot = try self.declareLocal(d.name, false, true, null);
                     try self.chunk.writeOp(.op_unit, d.location);
                     try self.chunk.writeOp(.op_set_local, d.location);
                     try self.chunk.writeU16(slot);
@@ -1858,16 +1908,16 @@ const FnCompiler = struct {
                     try self.chunk.writeU16(slot);
                 } else {
                     try self.emitBindingRhs(d.value);
-                    try self.emitCoerceFromAnnotation(d.type_annotation, d.location); // M5：val a: i32 = ...
-                    const slot = try self.declareLocal(d.name, false);
+                    try self.emitCoerceFromAnnotation(d.type_annotation, d.value, d.location); // M5：val a: i32 = ...
+                    const slot = try self.declareLocal(d.name, false, typeNeedsRelease(d.type_annotation), builtinTypeOf(d.type_annotation));
                     try self.chunk.writeOp(.op_set_local, d.location);
                     try self.chunk.writeU16(slot);
                 }
             },
             .var_decl => |d| {
                 try self.emitBindingRhs(d.value);
-                try self.emitCoerceFromAnnotation(d.type_annotation, d.location); // M5：var a: i32 = ...
-                const slot = try self.declareLocal(d.name, true);
+                try self.emitCoerceFromAnnotation(d.type_annotation, d.value, d.location); // M5：var a: i32 = ...
+                const slot = try self.declareLocal(d.name, true, typeNeedsRelease(d.type_annotation), builtinTypeOf(d.type_annotation));
                 try self.chunk.writeOp(.op_set_local, d.location);
                 try self.chunk.writeU16(slot);
             },
@@ -1883,6 +1933,20 @@ const FnCompiler = struct {
                 }
                 if (a.target.* != .identifier) return error.Unsupported;
                 const name = a.target.identifier.name;
+                // op_push_inplace 优化：arr = arr.push(expr) 模式（仅 local，rc==1 时 VM 原地扩容）
+                if (a.value.* == .method_call) blk: {
+                    const mc = a.value.method_call;
+                    if (!(std.mem.eql(u8, mc.method, "push") and mc.arguments.len == 1)) break :blk;
+                    if (mc.object.* != .identifier) break :blk;
+                    if (!std.mem.eql(u8, mc.object.identifier.name, name)) break :blk;
+                    const slot = self.resolveLocal(name) orelse break :blk;
+                    try self.emitExpr(mc.arguments[0]);
+                    try self.chunk.writeOp(.op_push_inplace, a.location);
+                    try self.chunk.writeU16(slot);
+                    try self.chunk.writeOp(.op_set_local_assign, a.location);
+                    try self.chunk.writeU16(slot);
+                    return;
+                }
                 if (self.resolveLocal(name)) |slot| {
                     try self.emitExpr(a.value);
                     try self.chunk.writeOp(.op_set_local_assign, a.location);
@@ -2001,16 +2065,16 @@ const FnCompiler = struct {
         const saved = self.locals.items.len;
         // 隐藏 slot：iterable 值 + index（i64，初始 0）。
         try self.emitExpr(f.iterable);
-        const iter_slot = try self.declareLocal("$iter", false);
+        const iter_slot = try self.declareLocal("$iter", false, true, null);
         try self.chunk.writeOp(.op_set_local, loc);
         try self.chunk.writeU16(iter_slot);
         const idx_const = try self.chunk.addConstant(try Value.fromInt(self.allocator, .{ .value = 0, .type_tag = .i64 }));
         try self.emitConst(idx_const, loc);
-        const idx_slot = try self.declareLocal("$idx", true);
+        const idx_slot = try self.declareLocal("$idx", true, false, null);
         try self.chunk.writeOp(.op_set_local, loc);
         try self.chunk.writeU16(idx_slot);
         // 循环变量 slot（每轮 OP_FOR_NEXT 压元素后 set_local 绑定）。
-        const var_slot = try self.declareLocal(f.name, true);
+        const var_slot = try self.declareLocal(f.name, true, true, null);
 
         const loop_start = self.chunk.here();
         try self.loops.append(self.allocator, .{ .continue_target = loop_start, .defer_depth = self.defer_scopes.items.len });
@@ -2228,6 +2292,52 @@ fn isBuiltinNumericType(name: []const u8) bool {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;
+}
+
+/// 判断类型名是否为 Glue 基础类型（数值 + bool + char）。
+fn isBuiltinType(name: []const u8) bool {
+    if (isBuiltinNumericType(name)) return true;
+    return std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "char");
+}
+
+/// 从类型注解提取基础类型名（非基础类型/无注解返回 null）。
+fn builtinTypeOf(ta: ?*const ast.TypeNode) ?[]const u8 {
+    const t = ta orelse return null;
+    return switch (t.*) {
+        .named => |n| if (isBuiltinType(n.name)) n.name else null,
+        else => null,
+    };
+}
+
+/// 从形参列表提取基础类型名数组。
+fn extractParamTypes(allocator: std.mem.Allocator, params: []const ast.Param) ![]const ?[]const u8 {
+    const result = try allocator.alloc(?[]const u8, params.len);
+    for (params, 0..) |p, i| result[i] = builtinTypeOf(p.type_annotation);
+    return result;
+}
+
+/// 判断二元运算符是否为算术运算（结果类型 = 左操作数类型）。
+fn isArithmeticOp(op: ast.BinaryOp) bool {
+    return switch (op) {
+        .add, .sub, .mul, .div, .mod => true,
+        else => false,
+    };
+}
+
+/// 判断类型注解对应的值是否需要 release（boxed）。
+/// null（无注解）→ true（保守）；builtin 数值/bool/char/unit → false（内联）；其他 → true。
+fn typeNeedsRelease(ty: ?*const ast.TypeNode) bool {
+    const t = ty orelse return true;
+    return switch (t.*) {
+        .named => |n| blk: {
+            if (isBuiltinNumericType(n.name)) break :blk false;
+            if (std.mem.eql(u8, n.name, "bool")) break :blk false;
+            if (std.mem.eql(u8, n.name, "char")) break :blk false;
+            if (std.mem.eql(u8, n.name, "unit")) break :blk false;
+            break :blk true;
+        },
+        .self_type, .generic, .nullable, .function, .record, .array, .kind_annotated => true,
+    };
 }
 
 /// M5c：若 TypeNode 是 builtin 数值类型，返回其名（借用 AST 字节）；否则 null。
