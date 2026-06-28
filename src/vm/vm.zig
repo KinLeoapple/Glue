@@ -748,7 +748,13 @@ pub const VM = struct {
                 .op_const => {
                     const idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
-                    try self.push(try self.retainOwned(func.chunk.constants.items[idx]));
+                    const cv = func.chunk.constants.items[idx];
+                    // fast path：内联值直接 push，省 retainOwned 函数调用
+                    if (!cv.isBoxed()) {
+                        try self.push(cv);
+                    } else {
+                        try self.push(try self.retainOwned(cv));
+                    }
                 },
                 .op_null => try self.push(Value.fromNull()),
                 .op_unit => try self.push(Value.fromUnit()),
@@ -759,19 +765,20 @@ pub const VM = struct {
                     const slot = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const cur = self.stack.items[slot_base + slot];
-                    // 透明解 cell：被闭包捕获的 local 已就地 box 成 *Cell，读其 inner。
-                    const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
-                    // M4a：Atomic<T> 透明读取 —— 一般读取 load 出当前标量（方法接收者走 OP_GET_LOCAL_RAW）。
-                    if (v.tag == .atomic_val) {
-                        const av = v.asBoxed().payload.atomic_val;
-                        try self.push(try av.load(self.allocator));
-                    } else if (v.tag == .lazy_val) {
-                        // M4d：Lazy<T> 透明读取 —— 首次 force 跑 thunk 缓存，返回缓存的 owned 副本。
-                        const lv = &v.asBoxed().payload.lazy_val;
-                        try self.push(try self.forceLazyVM(lv, loc));
+                    // fast path：内联值（非 boxed）直接 push，省 cell/atomic/lazy/retainOwned 检查。
+                    // cell_val(52)/atomic_val(40)/lazy_val(51) 都是 boxed，走 slow path。
+                    if (!cur.isBoxed()) {
+                        try self.push(cur);
                     } else {
-                        // inline fast path（内联值占绝大多数，省 retainOwned 调用）。
-                        if (!v.isBoxed()) {
+                        // slow path：透明解 cell → atomic/lazy/boxed retainOwned
+                        const v = if (cur.tag == .cell_val) cur.asBoxed().payload.cell_val.inner else cur;
+                        if (v.tag == .atomic_val) {
+                            const av = v.asBoxed().payload.atomic_val;
+                            try self.push(try av.load(self.allocator));
+                        } else if (v.tag == .lazy_val) {
+                            const lv = &v.asBoxed().payload.lazy_val;
+                            try self.push(try self.forceLazyVM(lv, loc));
+                        } else if (!v.isBoxed()) {
                             try self.push(v);
                         } else {
                             try self.push(try self.retainOwned(v));
@@ -803,7 +810,10 @@ pub const VM = struct {
                     const v = self.pop();
                     const dst = slot_base + slot;
                     const cur = self.stack.items[dst];
-                    if (cur.tag == .cell_val) {
+                    // fast path：内联值（非 boxed）直接覆写，省 cell/atomic 检查 + release no-op
+                    if (!cur.isBoxed()) {
+                        self.stack.items[dst] = v;
+                    } else if (cur.tag == .cell_val) {
                         const cell = cur.asBoxed().payload.cell_val;
                         if (cell.inner.tag == .atomic_val) {
                             const av = cell.inner.asBoxed().payload.atomic_val;
@@ -2778,6 +2788,39 @@ pub const VM = struct {
 
     /// 算术 + 位运算。语义镜像 eval.zig evalAdd/Sub/...（复用 value.zig promote/inRange）。
     fn doArith(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
+        // small_int fast path：add/sub/bit/div/mod 运算直接 i64，跳过 asInt/promoteIntTypes/i128
+        // mul 不走 fast path：i48*i48 可能溢出 i64（2^47*2^47=2^94）
+        if (left.tag == .small_int and right.tag == .small_int) {
+            const lv: i64 = @bitCast(left.payload);
+            const rv: i64 = @bitCast(right.payload);
+            if (op == .op_add or op == .op_sub or op == .op_bit_and or op == .op_bit_or or op == .op_bit_xor) {
+                const result: i64 = switch (op) {
+                    .op_add => lv +% rv,
+                    .op_sub => lv -% rv,
+                    .op_bit_and => lv & rv,
+                    .op_bit_or => lv | rv,
+                    .op_bit_xor => lv ^ rv,
+                    else => unreachable,
+                };
+                // i32 范围检查（与通用路径 small_int asInt 返回 type_tag=.i32 一致）
+                if (result >= std.math.minInt(i32) and result <= std.math.maxInt(i32)) {
+                    return Value.fromSmallInt(@truncate(result));
+                }
+                // 超出 i32 范围 → 继续原逻辑（会报溢出）
+            } else if (op == .op_div or op == .op_mod) {
+                if (rv == 0) return self.fail(loc, "division by zero", error.DivisionByZero);
+                const result: i64 = switch (op) {
+                    .op_div => @divTrunc(lv, rv),
+                    .op_mod => @rem(lv, rv),
+                    else => unreachable,
+                };
+                if (result >= std.math.minInt(i32) and result <= std.math.maxInt(i32)) {
+                    return Value.fromSmallInt(@truncate(result));
+                }
+                // 超出 i32 范围 → 继续原逻辑（会报溢出）
+            }
+            // mul → 继续原逻辑（i48*i48 可能溢出 i64）
+        }
         if (left.isInteger() and right.isInteger()) {
             const left_int = left.asInt();
             const right_int = right.asInt();
@@ -2863,6 +2906,24 @@ pub const VM = struct {
 
     /// 比较：== != < > <= >=。返回 bool。
     fn doCompare(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
+        // small_int fast path：直接 i64 payload 比较，跳过 asInt/promoteIntTypes/i128。
+        // small_int asInt() 返回 type_tag=.i32，promoteIntTypes(.i32,.i32)=.i32，
+        // i128 比较等价于 i64 比较（small_int 在 i48 范围内，i64 足够）。
+        if (left.tag == .small_int and right.tag == .small_int) {
+            const lv: i64 = @bitCast(left.payload);
+            const rv: i64 = @bitCast(right.payload);
+            if (op == .op_eq or op == .op_neq) {
+                const eq = lv == rv;
+                return Value.fromBool(if (op == .op_eq) eq else !eq);
+            }
+            return Value.fromBool(switch (op) {
+                .op_lt => lv < rv,
+                .op_gt => lv > rv,
+                .op_le => lv <= rv,
+                .op_ge => lv >= rv,
+                else => return self.fail(loc, "comparison requires numeric operands", error.TypeMismatch),
+            });
+        }
         // == / !=：数值按 promoteIntTypes 后**按值**比较（忽略 type_tag），镜像 eval evalBinary .eq/.not_eq。
         // 关键：隐式定型（OP_COERCE）后操作数 tag 可能不同（如 i32 形参 vs i8 字面量），
         // 不能用 tag-strict 的 Value.equals，否则 `n == 0` 恒 false（M5 整数定型回归）。
