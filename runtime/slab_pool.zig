@@ -4,10 +4,10 @@
 //!
 //! 设计要点：
 //! - 段式 size class：同一桶内所有 slot 等大，永不分裂/合并 → 外部碎片 = 0。
-//! - size class 表低段 8B 步进精确贴合 Value 箱体（实测 Value=64/Array=40/Adt=56/
-//!   Record=64/AdtField=80/Newtype=96/Partial=112/Lazy=128），定长箱体内部碎片≈0；
+//! - size class 表低段 8B 步进精确贴合 Glue 装箱类型（实测 Cell≈32 / ArrayValue≈48 /
+//!   NewtypeValue≈48 / AdtValue≈56 / RecordValue≈56 / Range≈64），定长箱体内部碎片≈0；
 //!   高段 ~1.25× 几何步进，内部碎片 ≤ ~12.5%。
-//! - slot 全部 16 对齐（满足 Value 的 @alignOf=16）。
+//! - slot 全部 8 对齐（所有装箱 struct 首字段 rc:u32 + 指针切片，@alignOf 均为 8）。
 //! - slab 块按 SLAB_SIZE(64KB) 对齐，头部内嵌于块首：free 时用指针掩码
 //!   `ptr & ~(SLAB_SIZE-1)` O(1) 反查所属 slab。
 //! - 每 slab 独立 free_list + bump + used 计数：empty slab 归还 O(1)，无需扫描全局链。
@@ -26,14 +26,13 @@ const SLAB_SIZE: usize = 16 * 1024;
 const SLAB_MASK: usize = ~(SLAB_SIZE - 1);
 const SLAB_ALIGN: std.mem.Alignment = .fromByteUnits(SLAB_SIZE);
 
-/// slot 最小对齐（= Value 的 @alignOf）。
-const SLOT_ALIGNMENT: usize = 16;
+/// slot 最小对齐（= 装箱 struct 的 @alignOf，均为 8：首字段 rc:u32 + 指针切片）。
+const SLOT_ALIGNMENT: usize = 8;
 
 /// ≥ 此阈值的分配直通 backing（大对象，不进 slab）。
 const LARGE_THRESHOLD: usize = 4096;
 
-/// size class 表（字节）。全部 16 的倍数。
-/// 低段 8 步进贴箱体；中段 16 步进；高段 ~1.25× 几何。
+/// size class 表（字节）。低段 8 步进贴箱体；中段 16 步进；高段 ~1.25× 几何。
 const SIZE_CLASSES = [_]u32{
     // 低段：8 步进，精确命中 40/56/64/80/96/112/128 等箱体
     16,   24,   32,   40,   48,   56,   64,   72,
@@ -393,8 +392,8 @@ test "basic alloc/free roundtrip, size classes" {
     defer pool.deinit();
     const a = pool.allocator();
 
-    // 各箱体大小都应成功分配且 16 对齐。
-    const sizes = [_]usize{ 16, 40, 56, 64, 80, 96, 112, 128, 200, 512, 1024, 4095 };
+    // 各箱体大小都应成功分配且 8 对齐。
+    const sizes = [_]usize{ 16, 32, 40, 48, 56, 64, 80, 96, 112, 128, 200, 512, 1024, 4095 };
     for (sizes) |sz| {
         const buf = a.alloc(u8, sz) catch unreachable;
         try testing.expect(@intFromPtr(buf.ptr) % SLOT_ALIGNMENT == 0);
@@ -459,8 +458,8 @@ test "fragmentation stays low under churn" {
     }
     var seed: u64 = 12345;
     var i: usize = 0;
-    // 贴近 Glue 真实分配：聚集在箱体大小（40/56/64/80/96/112/128）。
-    const box_sizes = [_]usize{ 40, 56, 64, 64, 80, 96, 112, 128 };
+    // 贴近 Glue 真实分配：聚集在新装箱类型大小（Cell=32 / ArrayValue=48 / AdtValue=56 / Range=64）。
+    const box_sizes = [_]usize{ 32, 48, 48, 56, 56, 64, 80, 96 };
     while (i < 40000) : (i += 1) {
         seed = seed *% 6364136223846793005 +% 1442695040888963407;
         const sz: usize = box_sizes[(seed >> 33) % box_sizes.len];

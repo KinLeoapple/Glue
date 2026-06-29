@@ -77,8 +77,6 @@ pub const SpawnHandle = runtime_bridge.SpawnHandle;
 pub const ChannelValue = runtime_bridge.ChannelValue;
 pub const SenderValue = runtime_bridge.SenderValue;
 pub const ReceiverValue = runtime_bridge.ReceiverValue;
-pub const atomicTypeToIntType = runtime_bridge.atomicTypeToIntType;
-pub const intTypeToAtomicType = runtime_bridge.intTypeToAtomicType;
 
 // ============================================================
 // 错误与控制流（与旧 value.zig 一致）

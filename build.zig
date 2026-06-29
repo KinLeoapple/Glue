@@ -76,12 +76,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const vtable_module = b.createModule(.{
-        .root_source_file = b.path("runtime/vtable.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // ============================================================
     // value module - 核心值表示层（与 ast 同级）
     // ============================================================
@@ -97,11 +91,11 @@ pub fn build(b: *std.Build) void {
     value_module.addImport("channel", channel_module);
     value_module.addImport("spawn", spawn_module);
     atomic_module.addImport("value", value_module);
+    atomic_module.addImport("sync", sync_module);
     channel_module.addImport("value", value_module);
     channel_module.addImport("sync", sync_module);
     spawn_module.addImport("value", value_module);
     spawn_module.addImport("sync", sync_module);
-    vtable_module.addImport("value", value_module);
 
     // ============================================================
     // sema/ modules - 语义分析（类型检查、trait解析等）

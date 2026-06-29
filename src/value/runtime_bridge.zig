@@ -18,5 +18,3 @@ pub const ChannelValue = channel_mod.ChannelValue;
 pub const SenderValue = channel_mod.SenderValue;
 pub const ReceiverValue = channel_mod.ReceiverValue;
 
-pub const atomicTypeToIntType = atomic_mod.atomicTypeToIntType;
-pub const intTypeToAtomicType = atomic_mod.intTypeToAtomicType;

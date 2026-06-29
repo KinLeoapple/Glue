@@ -263,28 +263,6 @@ fn structuralEquals(a: Value, b: Value) bool {
     return value.equals(a, b);
 }
 
-/// M4a：把 Value 转成 AtomicValue 用的 i128 原始位表示（镜像 runtime/atomic.zig valueToAtomicRaw）。
-/// 新 value 模块未导出此函数，故在此本地复制。
-fn valueToAtomicRaw(val: Value, tag: value.AtomicValue.AtomicType) i128 {
-    return switch (val) {
-        .int => @bitCast(val.asInt().toNative(u128)),
-        .float => blk: {
-            const fv: f128 = val.asFloat().asF128();
-            const raw: i128 = switch (tag) {
-                .f16 => @as(i128, @bitCast(@as(i128, @as(u16, @bitCast(@as(f16, @floatCast(fv))))))),
-                .f32 => @as(i128, @bitCast(@as(i128, @as(u32, @bitCast(@as(f32, @floatCast(fv))))))),
-                .f64 => @as(i128, @bitCast(@as(i128, @as(u64, @bitCast(@as(f64, @floatCast(fv))))))),
-                .f128 => @bitCast(@as(u128, @bitCast(fv))),
-                else => 0,
-            };
-            break :blk raw;
-        },
-        .boolean => if (val.asBool()) 1 else 0,
-        .char => @as(i128, @intCast(val.asChar().toNative())),
-        else => 0,
-    };
-}
-
 /// M5d：scan/scanln 的持久 stdin reader 状态（镜像 eval StdinState）。
 const StdinState = struct {
     buffer: [8192]u8 = undefined,
@@ -617,7 +595,7 @@ pub const VM = struct {
                         const v = if (cur == .cell) cur.cell.inner else cur;
                         if (v == .atomic_val) {
                             const av = v.atomic_val;
-                            try self.push(try av.load(self.allocator));
+                            try self.push(av.load());
                         } else if (v == .lazy_val) {
                             const lv = v.lazy_val;
                             try self.push(try self.forceLazyVM(lv, loc));
@@ -715,7 +693,7 @@ pub const VM = struct {
                     // M4a：Atomic<T> 透明读取（方法接收者走 OP_GET_UPVALUE_RAW）。
                     if (cell.inner == .atomic_val) {
                         const av = cell.inner.atomic_val;
-                        try self.push(try av.load(self.allocator));
+                        try self.push(av.load());
                     } else if (cell.inner == .lazy_val) {
                         const lazy = cell.inner.lazy_val;
                         if (lazy.vm_thunk != null) {
@@ -1264,29 +1242,7 @@ pub const VM = struct {
                     defer v.release(self.allocator);
                     const av = self.allocator.create(value.AtomicValue) catch return error.OutOfMemory;
                     switch (v) {
-                        .int => {
-                            const iv = v.asInt();
-                            const raw: i128 = @bitCast(iv.toNative(u128));
-                            av.* = value.AtomicValue.initInt(raw, value.intTypeToAtomicType(iv.type));
-                        },
-                        .float => {
-                            const fv = v.asFloat();
-                            av.* = value.AtomicValue.initFloat(fv.asF128(), switch (fv.type) {
-                                .f16 => .f16, .f32 => .f32, .f64 => .f64, .f128 => .f128,
-                                .f8 => {
-                                    self.allocator.destroy(av);
-                                    return self.fail(loc, "atomic: unsupported float type f8", error.TypeMismatch);
-                                },
-                            });
-                        },
-                        .boolean => {
-                            const b = v.asBool();
-                            av.* = value.AtomicValue.initBool(b);
-                        },
-                        .char => {
-                            const c = v.asChar();
-                            av.* = value.AtomicValue.initChar(c.toNative());
-                        },
+                        .int, .float, .boolean, .char => av.* = value.AtomicValue.init(v),
                         else => {
                             self.allocator.destroy(av);
                             return self.fail(loc, "atomic: unsupported type", error.TypeMismatch);
@@ -2293,8 +2249,8 @@ pub const VM = struct {
         try self.push(result);
     }
 
-    /// M4a：执行 OP_COMPOUND_LOCAL。slot 持 atomic_val → 原子 fetch<op>（add/sub/and/or 直接；
-    /// mul/div/mod 走 CAS 循环），不重写 slot；否则常规 slot_val arith rhs 写回 slot。
+    /// M4a：执行 OP_COMPOUND_LOCAL。slot 持 atomic_val → 原子 fetch<op>（add/sub/mul/and/or 直接；
+    /// div/mod 走 fetchDiv/fetchMod，内部 lock+Int 运算），不重写 slot；否则常规 slot_val arith rhs 写回 slot。
     fn doCompoundLocal(self: *VM, frame: *CallFrame, slot: u16, arith_op: OpCode, loc: ast.SourceLocation) VMError!void {
         const rhs = self.pop();
         defer rhs.release(self.allocator);
@@ -2303,23 +2259,14 @@ pub const VM = struct {
         const target = if (cur == .cell) cur.cell.inner else cur;
         if (target == .atomic_val) {
             const av = target.atomic_val;
-            const operand = valueToAtomicRaw(rhs, av.type_tag);
             switch (arith_op) {
-                .op_add => _ = av.fetchAdd(operand),
-                .op_sub => _ = av.fetchSub(operand),
-                .op_mul => _ = av.fetchMul(operand),
-                .op_bit_and => _ = av.fetchAnd(operand),
-                .op_bit_or => _ = av.fetchOr(operand),
-                .op_div, .op_mod => {
-                    // CAS 循环：原子读改写（div/mod 无专用原子指令）。
-                    while (true) {
-                        const current = av.data.load(.seq_cst);
-                        const cur_val = try av.load(self.allocator);
-                        const result = try self.doArith(arith_op, cur_val, rhs, loc);
-                        const new_raw = valueToAtomicRaw(result, av.type_tag);
-                        if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst) == null) break;
-                    }
-                },
+                .op_add => av.fetchAdd(rhs),
+                .op_sub => av.fetchSub(rhs),
+                .op_mul => av.fetchMul(rhs),
+                .op_bit_and => av.fetchAnd(rhs),
+                .op_bit_or => av.fetchOr(rhs),
+                .op_div => av.fetchDiv(rhs) catch return self.fail(loc, "division by zero", error.DivisionByZero),
+                .op_mod => av.fetchMod(rhs) catch return self.fail(loc, "division by zero", error.DivisionByZero),
                 else => return self.fail(loc, "unsupported atomic compound op", error.TypeMismatch),
             }
             return; // atomic 就地更新，slot 不变
@@ -2347,22 +2294,14 @@ pub const VM = struct {
         const target = cell.inner;
         if (target == .atomic_val) {
             const av = target.atomic_val;
-            const operand = valueToAtomicRaw(rhs, av.type_tag);
             switch (arith_op) {
-                .op_add => _ = av.fetchAdd(operand),
-                .op_sub => _ = av.fetchSub(operand),
-                .op_mul => _ = av.fetchMul(operand),
-                .op_bit_and => _ = av.fetchAnd(operand),
-                .op_bit_or => _ = av.fetchOr(operand),
-                .op_div, .op_mod => {
-                    while (true) {
-                        const current = av.data.load(.seq_cst);
-                        const cur_val = try av.load(self.allocator);
-                        const result = try self.doArith(arith_op, cur_val, rhs, loc);
-                        const new_raw = valueToAtomicRaw(result, av.type_tag);
-                        if (av.data.cmpxchgStrong(current, new_raw, .seq_cst, .seq_cst) == null) break;
-                    }
-                },
+                .op_add => av.fetchAdd(rhs),
+                .op_sub => av.fetchSub(rhs),
+                .op_mul => av.fetchMul(rhs),
+                .op_bit_and => av.fetchAnd(rhs),
+                .op_bit_or => av.fetchOr(rhs),
+                .op_div => av.fetchDiv(rhs) catch return self.fail(loc, "division by zero", error.DivisionByZero),
+                .op_mod => av.fetchMod(rhs) catch return self.fail(loc, "division by zero", error.DivisionByZero),
                 else => return self.fail(loc, "unsupported atomic compound op", error.TypeMismatch),
             }
             return; // atomic 就地更新，inner 不变

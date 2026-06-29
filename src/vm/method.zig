@@ -99,21 +99,26 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
     }
     // M4a：Atomic<T> 方法 —— cas(expected, new) → bool；swap(new) → 旧值。
+    // 直接传 Value（atomic 内部 std.meta.eql 做位精确比较），仅校验实参是标量。
     if (receiver == .atomic_val) {
         const av = receiver.atomic_val;
+        const isScalar = struct {
+            fn check(v: Value) bool {
+                return switch (v) {
+                    .int, .float, .boolean, .char => true,
+                    else => false,
+                };
+            }
+        };
         if (std.mem.eql(u8, method, "cas")) {
             if (args.len != 2) return error.WrongArity;
-            if (!args[0].isInteger() or !args[1].isInteger()) return error.TypeMismatch;
-            const expected: i128 = args[0].asInt().toNative(i128);
-            const new_val: i128 = args[1].asInt().toNative(i128);
-            return Value.fromBool(av.cas(expected, new_val));
+            if (!isScalar.check(args[0]) or !isScalar.check(args[1])) return error.TypeMismatch;
+            return Value.fromBool(av.cas(args[0], args[1]));
         }
         if (std.mem.eql(u8, method, "swap")) {
             if (args.len != 1) return error.WrongArity;
-            if (!args[0].isInteger()) return error.TypeMismatch;
-            const new_val: i128 = args[0].asInt().toNative(i128);
-            const old_raw = av.xchg(new_val);
-            return Value.fromInt(Int.fromNative(value.atomicTypeToIntType(av.type_tag), old_raw));
+            if (!isScalar.check(args[0])) return error.TypeMismatch;
+            return av.xchg(args[0]);
         }
         return error.NoSuchMethod;
     }
