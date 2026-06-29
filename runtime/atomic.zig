@@ -6,9 +6,7 @@ const std = @import("std");
 const value = @import("value");
 
 const Value = value.Value;
-const IntValue = value.IntValue;
 const IntType = value.IntType;
-const FloatValue = value.FloatValue;
 
 /// Atomic<T> 值 — 跨协程共享原子状态
 /// 文档 §3.4: Atomic<T> 是引用类型，atomic expr 创建堆上原子值
@@ -69,11 +67,12 @@ pub const AtomicValue = struct {
 
     /// 加载当前值到 Value
     pub fn load(self: *AtomicValue, allocator: std.mem.Allocator) !Value {
+        _ = allocator;
         const raw = self.data.load(.seq_cst);
         return switch (self.type_tag) {
             .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128 => blk: {
                 const int_type = atomicTypeToIntType(self.type_tag);
-                break :blk try Value.fromInt(allocator, .{ .value = @bitCast(raw), .type_tag = int_type });
+                break :blk Value.fromInt(value.Int.fromNative(int_type, raw));
             },
             .f16, .f32, .f64, .f128 => blk: {
                 // 对于浮点数，需要根据类型大小正确处理
@@ -91,10 +90,10 @@ pub const AtomicValue = struct {
                     .f128 => @bitCast(@as(u128, @bitCast(raw))),
                     else => unreachable,
                 };
-                break :blk try Value.fromFloatValue(allocator, .{ .value = float_val, .type_tag = float_type });
+                break :blk Value.fromFloat(value.Float.fromNative(.f128, float_val).toFloatType(float_type));
             },
             .bool => Value.fromBool(raw != 0),
-            .char => Value.fromChar(@intCast(raw)),
+            .char => Value.fromChar(value.Char.fromNative(@intCast(raw)) catch unreachable),
         };
     }
 
@@ -173,26 +172,25 @@ pub fn intTypeToAtomicType(it: IntType) AtomicValue.AtomicType {
 }
 
 pub fn valueToAtomicRaw(val: Value, tag: AtomicValue.AtomicType) i128 {
-    return switch (val.tag) {
-        .small_int, .big_int => blk: {
-            const iv = val.asInt();
-            break :blk @bitCast(iv.value);
+    return switch (val) {
+        .int => blk: {
+            break :blk @bitCast(val.asInt().toNative(u128));
         },
-        .float16, .float32, .float64, .float128 => blk: {
-            const fv = val.asFloatValue();
+        .float => blk: {
+            const fv: f128 = val.asFloat().asF128();
             // 根据原子变量的实际类型，将浮点数的位表示存储为 i128
             // 小的浮点类型只占用低位，高位为 0
             const raw: i128 = switch (tag) {
-                .f16 => @as(i128, @bitCast(@as(i128, @as(u16, @bitCast(@as(f16, @floatCast(fv.value))))))),
-                .f32 => @as(i128, @bitCast(@as(i128, @as(u32, @bitCast(@as(f32, @floatCast(fv.value))))))),
-                .f64 => @as(i128, @bitCast(@as(i128, @as(u64, @bitCast(@as(f64, @floatCast(fv.value))))))),
-                .f128 => @bitCast(@as(u128, @bitCast(fv.value))),
+                .f16 => @as(i128, @bitCast(@as(i128, @as(u16, @bitCast(@as(f16, @floatCast(fv))))))),
+                .f32 => @as(i128, @bitCast(@as(i128, @as(u32, @bitCast(@as(f32, @floatCast(fv))))))),
+                .f64 => @as(i128, @bitCast(@as(i128, @as(u64, @bitCast(@as(f64, @floatCast(fv))))))),
+                .f128 => @bitCast(@as(u128, @bitCast(fv))),
                 else => 0,
             };
             break :blk raw;
         },
         .boolean => if (val.asBool()) 1 else 0,
-        .char_val => @as(i128, @intCast(val.asChar())),
+        .char => @as(i128, @intCast(val.asChar().toNative())),
         else => 0,
     };
 }

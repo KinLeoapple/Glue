@@ -504,9 +504,8 @@ fn tryRunOnVM(
     prof.phaseEnd();
 
     // 检查是否有未捕获的 throw
-    if (result.tag == .throw_val) {
-        const boxed = result.asBoxed();
-        const throw_val = boxed.payload.throw_val;
+    if (result == .throw_val) {
+        const throw_val = result.throw_val.payload;
         switch (throw_val) {
             .err => |e| {
                 std.debug.print("Uncaught error: {s}\n", .{e.message});

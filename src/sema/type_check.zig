@@ -746,10 +746,7 @@ pub const TypeInferencer = struct {
             self.fn_bounds.deinit();
         }
         {
-            var iter = self.predeclared_fns.keyIterator();
-            while (iter.next()) |key| {
-                self.allocator.free(key.*);
-            }
+            // key 借用 AST（fun_decl.name），非本 allocator 分配，不释放
             self.predeclared_fns.deinit();
         }
         {

@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
     // ============================================================
 
     const value_module = b.createModule(.{
-        .root_source_file = b.path("src/value.zig"),
+        .root_source_file = b.path("src/value/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -325,11 +325,33 @@ pub fn build(b: *std.Build) void {
     });
     const run_vm_unit_tests = b.addRunArtifact(vm_unit_tests);
 
-    // value_new 单元测试（阶段1）
-    // const value_new_unit_tests = b.addTest(.{
-    //     .root_module = value_new_module,
-    // });
-    // const run_value_new_unit_tests = b.addRunArtifact(value_new_unit_tests);
+    // ============================================================
+    // value_new 模块（自定义基础类型，独立 standalone）
+    // ============================================================
+
+    const value_new_module = b.createModule(.{
+        .root_source_file = b.path("src/value/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const value_new_unit_tests = b.addTest(.{
+        .root_module = value_new_module,
+    });
+    const run_value_new_unit_tests = b.addRunArtifact(value_new_unit_tests);
+
+    const bench_value_module = b.createModule(.{
+        .root_source_file = b.path("src/value/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_value_exe = b.addExecutable(.{
+        .name = "bench_value",
+        .root_module = bench_value_module,
+    });
+    const run_bench_value = b.addRunArtifact(bench_value_exe);
+    const bench_value_step = b.step("bench-value", "Run custom types vs native bench");
+    bench_value_step.dependOn(&run_bench_value.step);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lexer_unit_tests.step);
@@ -340,5 +362,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_stdlib_unit_tests.step);
     test_step.dependOn(&run_intern_unit_tests.step);
     test_step.dependOn(&run_vm_unit_tests.step);
-    // test_step.dependOn(&run_value_new_unit_tests.step); // 新增
+    test_step.dependOn(&run_value_new_unit_tests.step);
 }

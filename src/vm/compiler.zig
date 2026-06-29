@@ -609,7 +609,7 @@ pub const ModuleCompiler = struct {
                 .fun_decl => |f| {
                     if (f.visibility != .public) continue;
                     const fn_idx = self.lookupFn(f.name) orelse continue;
-                    const name_v = try Value.fromString(self.allocator, try self.allocator.dupe(u8, f.name));
+                    const name_v = try Value.fromStringBytes(self.allocator, f.name);
                     try fc.emitConst(try fc.chunk.addConstant(name_v), loc);
                     try fc.chunk.writeOp(.op_closure, loc);
                     try fc.chunk.writeU16(fn_idx);
@@ -619,7 +619,7 @@ pub const ModuleCompiler = struct {
                 .pack_decl => |pd| {
                     if (pd.visibility != .public) continue;
                     const sub = self.lookupGlobal(pd.name) orelse continue; // 子模块值全局（已登记）
-                    const name_v = try Value.fromString(self.allocator, try self.allocator.dupe(u8, pd.name));
+                    const name_v = try Value.fromStringBytes(self.allocator, pd.name);
                     try fc.emitConst(try fc.chunk.addConstant(name_v), loc);
                     try fc.chunk.writeOp(.op_get_global, loc);
                     try fc.chunk.writeU16(sub.idx);
@@ -757,12 +757,12 @@ const FnCompiler = struct {
             .unit_literal => try self.chunk.writeOp(.op_unit, loc),
             // M3a：字符串字面量 → 常量池（dupe owned），OP_CONST。
             .string_literal => |lit| {
-                const s = try Value.fromString(self.allocator, try self.allocator.dupe(u8, lit.value));
+                const s = try Value.fromStringBytes(self.allocator, lit.value);
                 try self.emitConst(try self.chunk.addConstant(s), loc);
             },
             // M3a：字符字面量 → 常量池，OP_CONST。
             .char_literal => |lit| {
-                try self.emitConst(try self.chunk.addConstant(Value.fromChar(lit.value)), loc);
+                try self.emitConst(try self.chunk.addConstant(Value.fromChar(value.Char.fromNative(lit.value) catch unreachable)), loc);
             },
             // M3a：字符串插值 → 各段（literal 文本压 string 常量、expression 求值）压栈 + OP_INTERP <n>。
             .string_interpolation => |interp| {
@@ -770,7 +770,7 @@ const FnCompiler = struct {
                 for (interp.parts) |part| {
                     switch (part) {
                         .literal => |txt| {
-                            const s = try Value.fromString(self.allocator, try self.allocator.dupe(u8, txt));
+                            const s = try Value.fromStringBytes(self.allocator, txt);
                             try self.emitConst(try self.chunk.addConstant(s), loc);
                         },
                         .expression => |e| try self.emitExpr(e),
@@ -793,7 +793,7 @@ const FnCompiler = struct {
                         try self.chunk.writeOp(.op_get_global, loc);
                         try self.chunk.writeU16(ge.idx);
 
-                        const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, symbol_name)));
+                        const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, symbol_name));
                         try self.chunk.writeOp(.op_get_field, loc);
                         try self.chunk.writeU16(name_const);
                     } else {
@@ -846,7 +846,7 @@ const FnCompiler = struct {
             // M2a：字段访问 p.x → OP_GET_FIELD <字段名常量>。
             .field_access => |fa| {
                 try self.emitExpr(fa.object);
-                const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, fa.field)));
+                const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, fa.field));
                 try self.chunk.writeOp(.op_get_field, loc);
                 try self.chunk.writeU16(name_const);
             },
@@ -856,7 +856,7 @@ const FnCompiler = struct {
                 // M4a：方法接收者若是 identifier，用 raw 读取（不透明 load atomic，cas/swap 需原始 Atomic）。
                 try self.emitMethodReceiver(mc.object);
                 for (mc.arguments) |arg| try self.emitExpr(arg);
-                const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, mc.method)));
+                const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, mc.method));
                 try self.chunk.writeOp(.op_call_method, loc);
                 try self.chunk.writeU16(name_const);
                 try self.chunk.writeByte(@intCast(mc.arguments.len));
@@ -866,7 +866,7 @@ const FnCompiler = struct {
                 try self.emitExpr(sa.object);
                 // peek：null → 跳过字段访问（栈顶 null 即结果）；非 null → 弹后取字段。
                 const skip = try self.chunk.emitJump(.op_jump_if_null, loc);
-                const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, sa.field)));
+                const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, sa.field));
                 try self.chunk.writeOp(.op_get_field, loc);
                 try self.chunk.writeU16(name_const);
                 self.chunk.patchJump(skip); // null 分支落点：栈顶仍是 null
@@ -877,7 +877,7 @@ const FnCompiler = struct {
                 try self.emitExpr(smc.object);
                 const skip = try self.chunk.emitJump(.op_jump_if_null, loc);
                 for (smc.arguments) |arg| try self.emitExpr(arg);
-                const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, smc.method)));
+                const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, smc.method));
                 try self.chunk.writeOp(.op_call_method, loc);
                 try self.chunk.writeU16(name_const);
                 try self.chunk.writeByte(@intCast(smc.arguments.len));
@@ -927,7 +927,7 @@ const FnCompiler = struct {
                     else => return error.Unsupported,
                 };
                 try self.emitExpr(tc.expr);
-                const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, tname)));
+                const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, tname));
                 try self.chunk.writeOp(.op_cast, loc);
                 try self.chunk.writeU16(name_const);
             },
@@ -1206,7 +1206,7 @@ const FnCompiler = struct {
             const body = method.body orelse continue;
             if (method.params.len > 255) return error.Unsupported;
             // 方法名常量。
-            const name_v = try Value.fromString(self.allocator, try self.allocator.dupe(u8, method.name));
+            const name_v = try Value.fromStringBytes(self.allocator, method.name);
             try self.emitConst(try self.chunk.addConstant(name_v), method.location);
             // 方法体编成带 arity 的 Function（params 占 slot 0..；自动捕获 enclosing）。
             var sub = FnCompiler.init(self.allocator, self.module);
@@ -1265,7 +1265,7 @@ const FnCompiler = struct {
 
     /// 发射 op_coerce 到指定类型名（栈顶值协调）。仅对数值类型有效（bool/char 的 op_coerce 是 no-op）。
     fn emitCoerceForType(self: *FnCompiler, tname: []const u8, loc: ast.SourceLocation) CompileError!void {
-        const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, tname)));
+        const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, tname));
         try self.chunk.writeOp(.op_coerce, loc);
         try self.chunk.writeU16(name_const);
     }
@@ -1504,7 +1504,7 @@ const FnCompiler = struct {
                         try self.chunk.writeByte(argc);
                         return;
                     }
-                    const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, name)));
+                    const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, name));
                     for (c.arguments) |arg| try self.emitExpr(arg); // [recv, rest...]
                     try self.chunk.writeOp(.op_call_method, loc);
                     try self.chunk.writeU16(name_const);
@@ -1782,7 +1782,7 @@ const FnCompiler = struct {
                     if (ctor.patterns.len != 1) return error.Unsupported;
                     try self.chunk.writeOp(.op_get_local, loc);
                     try self.chunk.writeU16(scrut_slot);
-                    const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, ctor.name)));
+                    const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, ctor.name));
                     try self.chunk.writeOp(.op_test_newtype, loc);
                     try self.chunk.writeU16(name_const);
                     try fail_jumps.append(self.allocator, try self.chunk.emitJump(.op_jump_if_false, loc));
@@ -1816,7 +1816,7 @@ const FnCompiler = struct {
                     const tmp = try self.declareLocal("$rf", false, true, null);
                     try self.chunk.writeOp(.op_get_local, loc);
                     try self.chunk.writeU16(scrut_slot);
-                    const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, f.name)));
+                    const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, f.name));
                     try self.chunk.writeOp(.op_get_field, loc);
                     try self.chunk.writeU16(name_const);
                     try self.chunk.writeOp(.op_set_local, loc);
@@ -1844,7 +1844,7 @@ const FnCompiler = struct {
     fn emitCtorTest(self: *FnCompiler, scrut_slot: u16, name: []const u8, fail_jumps: *std.ArrayListUnmanaged(usize), loc: ast.SourceLocation) CompileError!void {
         try self.chunk.writeOp(.op_get_local, loc);
         try self.chunk.writeU16(scrut_slot);
-        const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, name)));
+        const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, name));
         try self.chunk.writeOp(.op_test_ctor, loc);
         try self.chunk.writeU16(name_const);
         try fail_jumps.append(self.allocator, try self.chunk.emitJump(.op_jump_if_false, loc));
@@ -1868,7 +1868,7 @@ const FnCompiler = struct {
                 if (v.name.len > 0 and v.name[0] >= 'A' and v.name[0] <= 'Z') {
                     try self.chunk.writeOp(.op_get_local, loc);
                     try self.chunk.writeU16(scrut_slot);
-                    const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, v.name)));
+                    const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, v.name));
                     try self.chunk.writeOp(.op_test_ctor, loc);
                     try self.chunk.writeU16(name_const);
                 } else return error.Unsupported; // 或模式中的绑定变量不支持
@@ -2068,7 +2068,7 @@ const FnCompiler = struct {
         const iter_slot = try self.declareLocal("$iter", false, true, null);
         try self.chunk.writeOp(.op_set_local, loc);
         try self.chunk.writeU16(iter_slot);
-        const idx_const = try self.chunk.addConstant(try Value.fromInt(self.allocator, .{ .value = 0, .type_tag = .i64 }));
+        const idx_const = try self.chunk.addConstant(Value.fromInt(value.Int.fromNative(.i64, @as(i64, 0))));
         try self.emitConst(idx_const, loc);
         const idx_slot = try self.declareLocal("$idx", true, false, null);
         try self.chunk.writeOp(.op_set_local, loc);
@@ -2158,7 +2158,7 @@ const FnCompiler = struct {
     /// identifier target：GET_LOCAL → val → SET_FIELD → SET_LOCAL 写回。
     /// 其它（临时对象）：obj → val → SET_FIELD → POP 丢弃。
     fn emitFieldAssign(self: *FnCompiler, fa: @TypeOf(@as(Stmt, undefined).field_assignment)) CompileError!void {
-        const name_const = try self.chunk.addConstant(try Value.fromString(self.allocator, try self.allocator.dupe(u8, fa.field)));
+        const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, fa.field));
         if (fa.object.* == .identifier) {
             const oname = fa.object.identifier.name;
             if (self.resolveLocal(oname)) |slot| {
@@ -2256,28 +2256,31 @@ const FnCompiler = struct {
 
 /// 解析整数字面量为 Value（镜像 eval.zig evalIntLiteral 的默认最小类型推断）。
 fn parseIntLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefined).int_literal)) !?Value {
+    _ = allocator;
     const int_val: u128 = std.fmt.parseInt(u128, lit.raw, 0) catch
         @bitCast(std.fmt.parseInt(i128, lit.raw, 0) catch return null);
     if (lit.suffix) |s| {
         const t = value.IntType.fromName(s) orelse return null;
         if (!t.inRange(int_val)) return null;
-        return try Value.fromInt(allocator, .{ .value = int_val, .type_tag = t });
+        return Value.fromInt(value.Int.fromNative(t, int_val));
     }
     const t = value.inferIntType(int_val);
     if (!t.inRange(int_val)) return null;
-    return try Value.fromInt(allocator, .{ .value = int_val, .type_tag = t });
+    return Value.fromInt(value.Int.fromNative(t, int_val));
 }
 
 fn parseFloatLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefined).float_literal)) !?Value {
+    _ = allocator;
     const fv = std.fmt.parseFloat(f128, lit.raw) catch return null;
     if (std.math.isNan(fv) or std.math.isInf(fv)) return null;
     if (lit.suffix) |s| {
         const t = value.FloatType.fromName(s) orelse return null;
-        if (!t.inRange(fv)) return null;
-        return try Value.fromFloatValue(allocator, .{ .value = fv, .type_tag = t });
+        const result = value.Float.fromNative(.f128, fv).toFloatType(t);
+        if (result.isInfinite()) return null; // 溢出
+        return Value.fromFloat(result);
     }
     // 默认使用 f64
-    return try Value.fromFloatValue(allocator, .{ .value = fv, .type_tag = .f64 });
+    return Value.fromFloat(value.Float.fromNative(.f128, fv).toFloatType(.f64));
 }
 
 /// M5：builtin 数值类型名判定（隐式定型只协调这些）。bool/str 不在内——它们不参与整数宽度
@@ -2357,16 +2360,16 @@ fn patternLiteralToValue(allocator: std.mem.Allocator, lit: ast.PatternLiteral) 
     return switch (lit) {
         .int => |raw| blk: {
             const iv = parsePatternInt(raw) orelse break :blk null;
-            break :blk try Value.fromInt(allocator, .{ .value = iv, .type_tag = .i64 });
+            break :blk Value.fromInt(value.Int.fromNative(.i64, iv));
         },
         .float => |raw| blk: {
             const end = floatBodyEnd(raw);
             const fv = std.fmt.parseFloat(f64, raw[0..end]) catch break :blk null;
-            break :blk Value.fromFloat64(fv);
+            break :blk Value.fromFloat(value.Float.fromNative(.f64, fv));
         },
         .bool => |b| Value.fromBool(b),
-        .char => |c| Value.fromChar(c),
-        .string => |s| try Value.fromString(allocator, try allocator.dupe(u8, s)),
+        .char => |c| Value.fromChar(value.Char.fromNative(c) catch unreachable),
+        .string => |s| try Value.fromStringBytes(allocator, s),
         .null => Value.fromNull(),
     };
 }
@@ -2447,8 +2450,8 @@ fn compileAndCall(allocator: std.mem.Allocator, source: []const u8, entry_name: 
     const result = try vm.call(&mc.program, idx, args);
     defer result.release(allocator);
     // bool 结果（contains/is_empty 等）coerce 为 1/0，便于测试统一用 u128 断言。
-    if (result.tag == .boolean) return if (result.asBool()) 1 else 0;
-    return result.asInt().value;
+    if (result == .boolean) return if (result.asBool()) 1 else 0;
+    return result.asInt().toNative(u128);
 }
 
 /// M5j：编译入口源 + 一个依赖源（依赖在前注册），跑 entry_name，返回整数结果。
