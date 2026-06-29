@@ -144,7 +144,7 @@ pub const Profiler = struct {
         wr.print("  {s: <14}: {d:>8.3} ms\n", .{ "total", total_ms }) catch {};
 
         // 内存统计
-        wr.print("\nmemory (SlabPool — Value 箱体分配器):\n", .{}) catch {};
+        wr.print("\nmemory:\n", .{}) catch {};
         wr.print("  peak live     : {s}\n", .{formatBytes(self.slab_live_peak_bytes)}) catch {};
         wr.print("  peak reserved : {s}\n", .{formatBytes(self.slab_peak_bytes)}) catch {};
         // 碎片率基于峰值时刻：1 - live_peak/peak_reserved。

@@ -9,7 +9,21 @@
 //! 命名规范：方法名全部使用完整单词，不使用缩写。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ByteArray = @import("byte_array.zig").ByteArray;
+
+// x86_64 汇编 extern 声明（符号定义在 arch/x86_64/int.S；大写 S 走 C 预处理器）
+extern fn glue_cmp_bytes(a: [*]const u8, b: [*]const u8, len: u8, signed: bool) i8;
+extern fn glue_add_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8, signed: bool) u8;
+extern fn glue_sub_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8, signed: bool) u8;
+extern fn glue_mul_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8, signed: bool) u8;
+extern fn glue_divmod_bytes(out_q: [*]u8, out_r: [*]u8, a: [*]const u8, b: [*]const u8, len: u8, signed: bool) u8;
+extern fn glue_and_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) void;
+extern fn glue_or_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) void;
+extern fn glue_xor_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) void;
+extern fn glue_not_bytes(out: [*]u8, a: [*]const u8, len: u8) void;
+extern fn glue_shl_bytes(out: [*]u8, a: [*]const u8, len: u8, n: u8) void;
+extern fn glue_shr_bytes(out: [*]u8, a: [*]const u8, len: u8, signed: bool, n: u8) void;
 
 /// 整数类型枚举：10 个变体
 pub const Type = enum {
@@ -166,7 +180,26 @@ pub const Int = struct {
     }
 
     /// 比较两个 Int（要求 self.type == other.type）
+    /// 架构分派：x86_64 走汇编 glue_cmp_bytes，其他走 portable 软件实现
     pub fn compare(self: Int, other: Int) std.math.Order {
+        return switch (builtin.cpu.arch) {
+            .x86_64 => switch (glue_cmp_bytes(
+                self.bytes.slice().ptr,
+                other.bytes.slice().ptr,
+                self.type.byteLength(),
+                self.type.isSigned(),
+            )) {
+                -1 => .lt,
+                0 => .eq,
+                1 => .gt,
+                else => unreachable,
+            },
+            else => comparePortable(self, other),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn comparePortable(self: Int, other: Int) std.math.Order {
         const signed = self.type.isSigned();
         const a = self.bytes.slice();
         const b = other.bytes.slice();
@@ -207,10 +240,22 @@ pub const Int = struct {
 
     // —— 算术（S3-S5 实现）——
 
-    /// 加法（补码逐字节进位链）。要求 self.type == other.type，结果 type 同。
-    /// 溢出判定：无符号看最高字节进位输出；有符号看"同号得异号"。
+    /// 加法。要求 self.type == other.type，结果 type 同。
+    /// 架构分派：x86_64 走汇编 glue_add_bytes，其他走 addPortable。
     pub fn add(self: Int, other: Int) struct { result: Int, overflow: bool } {
         std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                const status = glue_add_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength(), self.type.isSigned());
+                break :blk .{ .result = Int.packFromBuffer(self.type, &r16), .overflow = status != 0 };
+            },
+            else => addPortable(self, other),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn addPortable(self: Int, other: Int) struct { result: Int, overflow: bool } {
         const t = self.type;
         const a = self.bytes.slice();
         const b = other.bytes.slice();
@@ -237,10 +282,22 @@ pub const Int = struct {
         };
     }
 
-    /// 减法（a - b = a + ~b + 1，复用进位链）。要求 self.type == other.type，结果 type 同。
-    /// 溢出判定：无符号看借位（carry==0 表示 a<b）；有符号看"异号得非 a 号"。
+    /// 减法。要求 self.type == other.type，结果 type 同。
+    /// 架构分派：x86_64 走汇编 glue_sub_bytes，其他走 subtractPortable。
     pub fn subtract(self: Int, other: Int) struct { result: Int, overflow: bool } {
         std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                const status = glue_sub_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength(), self.type.isSigned());
+                break :blk .{ .result = Int.packFromBuffer(self.type, &r16), .overflow = status != 0 };
+            },
+            else => subtractPortable(self, other),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn subtractPortable(self: Int, other: Int) struct { result: Int, overflow: bool } {
         const t = self.type;
         const a = self.bytes.slice();
         const b = other.bytes.slice();
@@ -290,11 +347,22 @@ pub const Int = struct {
         return Int.packFromBuffer(self.type, &r16);
     }
 
-    /// 乘法（schoolbook 逐字节乘法 + 绝对值法）。
-    /// 有符号：取绝对值相乘得 magnitude，结果按符号修正；溢出判定基于 magnitude 与 2^(8N-1) 比较。
-    /// 无符号：直接相乘，高位非零即溢出。
+    /// 乘法。要求 self.type == other.type，结果 type 同。
+    /// 架构分派：x86_64 走汇编 glue_mul_bytes，其他走 multiplyPortable。
     pub fn multiply(self: Int, other: Int) struct { result: Int, overflow: bool } {
         std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                const status = glue_mul_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength(), self.type.isSigned());
+                break :blk .{ .result = Int.packFromBuffer(self.type, &r16), .overflow = status != 0 };
+            },
+            else => multiplyPortable(self, other),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn multiplyPortable(self: Int, other: Int) struct { result: Int, overflow: bool } {
         const t = self.type;
         const n = t.byteLength();
         const signed = t.isSigned();
@@ -357,7 +425,8 @@ pub const Int = struct {
     }
 
     /// 内部：同时返回 quotient 和 remainder。
-    /// 算法：取绝对值做无符号恢复式长除法，再按符号修正商/余数。
+    /// 架构分派：x86_64 走汇编 glue_divmod_bytes，其他走 divideWithRemainderPortable。
+    /// minInt/-1 和除零在分派前统一拦截（≤64位 idiv 会 #DE）。
     fn divideWithRemainder(self: Int, other: Int) error{DivideByZero}!struct { quotient: Int, remainder: Int } {
         std.debug.assert(self.type == other.type);
         const t = self.type;
@@ -368,12 +437,11 @@ pub const Int = struct {
         if (isAllZero(other.bytes.slice())) return error.DivideByZero;
 
         // minInt / -1 边界：返回 minInt（商），0（余数），与 Zig @divTrunc/@mod 一致
+        // 必须在调用汇编前拦截（≤64位 idiv 会 #DE）
         if (signed) {
-            // 检测 other == -1（所有字节 0xFF）
             var neg_one_buf: [16]u8 = [_]u8{0} ** 16;
             @memset(neg_one_buf[0..n], 0xFF);
             const other_is_neg_one = (compareBytes(other.bytes.slice(), neg_one_buf[0..n]) == .eq);
-            // 检测 self == minInt（最高字节 0x80，其余 0x00）
             var min_int_buf: [16]u8 = [_]u8{0} ** 16;
             min_int_buf[n - 1] = 0x80;
             const self_is_min_int = (compareBytes(self.bytes.slice(), min_int_buf[0..n]) == .eq);
@@ -381,6 +449,26 @@ pub const Int = struct {
                 return .{ .quotient = self, .remainder = Int.zero(t) };
             }
         }
+
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var q16: [16]u8 = undefined;
+                var r16: [16]u8 = undefined;
+                _ = glue_divmod_bytes(&q16, &r16, self.bytes.slice().ptr, other.bytes.slice().ptr, n, signed);
+                break :blk .{
+                    .quotient = Int.packFromBuffer(t, &q16),
+                    .remainder = Int.packFromBuffer(t, &r16),
+                };
+            },
+            else => divideWithRemainderPortable(self, other),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn divideWithRemainderPortable(self: Int, other: Int) struct { quotient: Int, remainder: Int } {
+        const t = self.type;
+        const n = t.byteLength();
+        const signed = t.isSigned();
 
         // 取绝对值
         var abs_a_buf: [16]u8 = [_]u8{0} ** 16;
@@ -414,46 +502,78 @@ pub const Int = struct {
     // —— 位运算（S6 实现）——
 
     /// 按位与。要求 self.type == other.type。
+    /// 架构分派：x86_64 走汇编 glue_and_bytes，其他走 bitwisePortable。
     pub fn bitwiseAnd(self: Int, other: Int) Int {
         std.debug.assert(self.type == other.type);
-        const t = self.type;
-        const n = t.byteLength();
-        const a = self.bytes.slice();
-        const b = other.bytes.slice();
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        var i: usize = 0;
-        while (i < n) : (i += 1) r16[i] = a[i] & b[i];
-        return Int.packFromBuffer(t, &r16);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                glue_and_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
+                break :blk Int.packFromBuffer(self.type, &r16);
+            },
+            else => bitwisePortable(self, other, .and_op),
+        };
     }
 
     /// 按位或。要求 self.type == other.type。
     pub fn bitwiseOr(self: Int, other: Int) Int {
         std.debug.assert(self.type == other.type);
-        const t = self.type;
-        const n = t.byteLength();
-        const a = self.bytes.slice();
-        const b = other.bytes.slice();
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        var i: usize = 0;
-        while (i < n) : (i += 1) r16[i] = a[i] | b[i];
-        return Int.packFromBuffer(t, &r16);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                glue_or_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
+                break :blk Int.packFromBuffer(self.type, &r16);
+            },
+            else => bitwisePortable(self, other, .or_op),
+        };
     }
 
     /// 按位异或。要求 self.type == other.type。
     pub fn bitwiseXor(self: Int, other: Int) Int {
         std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                glue_xor_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
+                break :blk Int.packFromBuffer(self.type, &r16);
+            },
+            else => bitwisePortable(self, other, .xor_op),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn bitwisePortable(self: Int, other: Int, op: enum { and_op, or_op, xor_op }) Int {
         const t = self.type;
         const n = t.byteLength();
         const a = self.bytes.slice();
         const b = other.bytes.slice();
         var r16: [16]u8 = [_]u8{0} ** 16;
         var i: usize = 0;
-        while (i < n) : (i += 1) r16[i] = a[i] ^ b[i];
+        while (i < n) : (i += 1) {
+            r16[i] = switch (op) {
+                .and_op => a[i] & b[i],
+                .or_op => a[i] | b[i],
+                .xor_op => a[i] ^ b[i],
+            };
+        }
         return Int.packFromBuffer(t, &r16);
     }
 
     /// 按位取反（逐字节 ~）。对有符号类型等价于 -x - 1。
+    /// 架构分派：x86_64 走汇编 glue_not_bytes，其他走 bitwiseNotPortable。
     pub fn bitwiseNot(self: Int) Int {
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                glue_not_bytes(&r16, self.bytes.slice().ptr, self.type.byteLength());
+                break :blk Int.packFromBuffer(self.type, &r16);
+            },
+            else => bitwiseNotPortable(self),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn bitwiseNotPortable(self: Int) Int {
         const t = self.type;
         const n = t.byteLength();
         const a = self.bytes.slice();
@@ -465,7 +585,20 @@ pub const Int = struct {
 
     /// 逻辑左移 n 位（无符号与有符号语义一致，低位补 0）。
     /// n >= bitWidth 时返回 zero。
+    /// 架构分派：x86_64 走汇编 glue_shl_bytes，其他走 shiftLeftPortable。
     pub fn shiftLeft(self: Int, n: u8) Int {
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                glue_shl_bytes(&r16, self.bytes.slice().ptr, self.type.byteLength(), n);
+                break :blk Int.packFromBuffer(self.type, &r16);
+            },
+            else => shiftLeftPortable(self, n),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn shiftLeftPortable(self: Int, n: u8) Int {
         const t = self.type;
         const bit_width = t.bitWidth();
         if (n >= bit_width) return Int.zero(t);
@@ -490,7 +623,20 @@ pub const Int = struct {
 
     /// 右移 n 位。无符号类型为逻辑右移（高位补 0）；有符号类型为算术右移（高位补符号位）。
     /// n >= bitWidth 时：无符号返回 zero；有符号返回 0（正数）或 -1（负数）。
+    /// 架构分派：x86_64 走汇编 glue_shr_bytes，其他走 shiftRightPortable。
     pub fn shiftRight(self: Int, n: u8) Int {
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                glue_shr_bytes(&r16, self.bytes.slice().ptr, self.type.byteLength(), self.type.isSigned(), n);
+                break :blk Int.packFromBuffer(self.type, &r16);
+            },
+            else => shiftRightPortable(self, n),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn shiftRightPortable(self: Int, n: u8) Int {
         const t = self.type;
         const bit_width = t.bitWidth();
         const nbytes = t.byteLength();

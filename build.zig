@@ -86,6 +86,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     value_module.addImport("ast", ast_module);
+    // x86_64 汇编注入（单文件 int.S 用 #ifdef _WIN32 切换 ABI；大写 S 走 C 预处理器）
+    if (target.result.cpu.arch == .x86_64) {
+        value_module.addAssemblyFile(b.path("src/value/arch/x86_64/int.S"));
+    }
     // value ↔ runtime: 循环依赖（value re-export runtime 类型，runtime 引用 Value）
     value_module.addImport("atomic", atomic_module);
     value_module.addImport("channel", channel_module);
@@ -328,24 +332,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // x86_64 汇编注入（测试模块同样需要；大写 S 走 C 预处理器）
+    if (target.result.cpu.arch == .x86_64) {
+        value_new_module.addAssemblyFile(b.path("src/value/arch/x86_64/int.S"));
+    }
 
     const value_new_unit_tests = b.addTest(.{
         .root_module = value_new_module,
     });
     const run_value_new_unit_tests = b.addRunArtifact(value_new_unit_tests);
-
-    const bench_value_module = b.createModule(.{
-        .root_source_file = b.path("src/value/bench.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const bench_value_exe = b.addExecutable(.{
-        .name = "bench_value",
-        .root_module = bench_value_module,
-    });
-    const run_bench_value = b.addRunArtifact(bench_value_exe);
-    const bench_value_step = b.step("bench-value", "Run custom types vs native bench");
-    bench_value_step.dependOn(&run_bench_value.step);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lexer_unit_tests.step);
