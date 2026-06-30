@@ -13,8 +13,17 @@
 //! 命名规范：方法名全部使用完整单词，不使用缩写。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ByteArray = @import("byte_array.zig").ByteArray;
 const int = @import("int.zig");
+
+// x86_64 汇编 extern 声明（符号定义在 arch/x86_64/float.S；大写 S 走 C 预处理器）
+// 状态码: 0=finite, 1=NaN, 2=Inf
+extern fn glue_cmp_float(a: [*]const u8, b: [*]const u8, len: u8) i8;
+extern fn glue_add_float(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) u8;
+extern fn glue_sub_float(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) u8;
+extern fn glue_mul_float(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) u8;
+extern fn glue_div_float(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) u8;
 
 /// 浮点类型枚举：5 个变体（f8 采用 e5m2 编码，与 f16 共享 5 位指数和 bias=15，有 inf/NaN 标准 IEEE 754 语义）
 pub const Type = enum {
@@ -251,8 +260,26 @@ pub const Float = struct {
     /// IEEE 754 totalOrder 比较：
     /// -NaN < -Inf < ... < -0 < +0 < ... < +Inf < +NaN
     /// 同号 NaN：quiet NaN > signaling NaN（简化为按尾数比较）
+    /// 架构分派：x86_64 走汇编 glue_cmp_float，其他走 comparePortable
     pub fn compare(self: Float, other: Float) std.math.Order {
         std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => switch (glue_cmp_float(
+                self.bytes.slice().ptr,
+                other.bytes.slice().ptr,
+                self.type.byteLength(),
+            )) {
+                -1 => .lt,
+                0 => .eq,
+                1 => .gt,
+                else => unreachable,
+            },
+            else => comparePortable(self, other),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn comparePortable(self: Float, other: Float) std.math.Order {
         const a = self.bytes.slice();
         const b = other.bytes.slice();
 
@@ -352,8 +379,22 @@ pub const Float = struct {
         return result;
     }
 
-    /// 加法（全软件 IEEE 754）。要求 self.type == other.type。
+    /// 加法（x86_64 走汇编，其他架构走 addPortable）。
+    /// NaN/Inf 结果触发 @panic（项目约束：浮点运算不得产生 NaN/Infinity）。
     pub fn add(self: Float, other: Float) Float {
+        std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                const status = glue_add_float(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
+                break :blk checkStatus(status, packFromBuffer(self.type, &r16));
+            },
+            else => checkResult(addPortable(self, other)),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径；保留 NaN/Inf 传播用于算法测试）
+    fn addPortable(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         const t = self.type;
 
@@ -418,13 +459,41 @@ pub const Float = struct {
         return compose(t, sr, da.exp, mr);
     }
 
-    /// 减法（等价于 self.add(other.negate())）
+    /// 减法（x86_64 走汇编，其他架构走 subtractPortable）。
+    /// NaN/Inf 结果触发 @panic。
     pub fn subtract(self: Float, other: Float) Float {
-        return self.add(other.negate());
+        std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                const status = glue_sub_float(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
+                break :blk checkStatus(status, packFromBuffer(self.type, &r16));
+            },
+            else => checkResult(subtractPortable(self, other)),
+        };
     }
 
-    /// 乘法（全软件 IEEE 754）。要求 self.type == other.type。
+    /// 便携软件实现（等价于 addPortable(other.negate())）
+    fn subtractPortable(self: Float, other: Float) Float {
+        return self.addPortable(other.negate());
+    }
+
+    /// 乘法（x86_64 走汇编，其他架构走 multiplyPortable）。
+    /// NaN/Inf 结果触发 @panic。
     pub fn multiply(self: Float, other: Float) Float {
+        std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                const status = glue_mul_float(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
+                break :blk checkStatus(status, packFromBuffer(self.type, &r16));
+            },
+            else => checkResult(multiplyPortable(self, other)),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径；保留 NaN/Inf 传播用于算法测试）
+    fn multiplyPortable(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         const t = self.type;
         const p: u32 = t.mantissaBits();
@@ -497,9 +566,23 @@ pub const Float = struct {
         return compose(t, result_sign, result_exp, result_mant);
     }
 
-    /// 除法（全软件 IEEE 754）。要求 self.type == other.type。
-    /// 除零不报错：finite/0 = Inf，0/0 = NaN（IEEE 754 语义）。
+    /// 除法（x86_64 走汇编，其他架构走 dividePortable）。
+    /// NaN/Inf 结果触发 @panic（含 finite/0=Inf、0/0=NaN）。
     pub fn divide(self: Float, other: Float) Float {
+        std.debug.assert(self.type == other.type);
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var r16: [16]u8 = undefined;
+                const status = glue_div_float(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
+                break :blk checkStatus(status, packFromBuffer(self.type, &r16));
+            },
+            else => checkResult(dividePortable(self, other)),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径；保留 NaN/Inf 传播用于算法测试）
+    /// 除零不报错：finite/0 = Inf，0/0 = NaN（IEEE 754 语义）。
+    fn dividePortable(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         const t = self.type;
         const p: u32 = t.mantissaBits();
@@ -694,6 +777,38 @@ pub const Float = struct {
         return self.negate().nextUp().negate();
     }
 };
+
+// —— 汇编分派辅助函数 ——
+
+/// 从 [16]u8 缓冲区打包回 union（截取前 N 字节）
+fn packFromBuffer(t: Type, buf: *const [16]u8) Float {
+    const nbytes = t.byteLength();
+    return .{ .type = t, .bytes = switch (nbytes) {
+        1 => .{ .b1 = buf[0..1].* },
+        2 => .{ .b2 = buf[0..2].* },
+        4 => .{ .b4 = buf[0..4].* },
+        8 => .{ .b8 = buf[0..8].* },
+        16 => .{ .b16 = buf[0..16].* },
+        else => unreachable,
+    } };
+}
+
+/// 检查汇编返回的状态码，NaN/Inf 触发 @panic
+fn checkStatus(status: u8, result: Float) Float {
+    return switch (status) {
+        0 => result,
+        1 => @panic("float operation produced NaN"),
+        2 => @panic("float operation produced Infinity"),
+        else => unreachable,
+    };
+}
+
+/// 检查软件实现的结果，NaN/Inf 触发 @panic（非 x86_64 架构执行路径）
+fn checkResult(result: Float) Float {
+    if (result.isNan()) @panic("float operation produced NaN");
+    if (result.isInfinite()) @panic("float operation produced Infinity");
+    return result;
+}
 
 // —— 加减法辅助函数（S9 实现）——
 
@@ -1102,11 +1217,18 @@ test "Float.add f16 strategic" {
             const b = Float.fromNative(.f16, b_native);
 
             const native_result = a_native + b_native;
-            const custom_result = a.add(b);
 
-            if (std.math.isNan(native_result)) {
-                try std.testing.expect(custom_result.isNan());
+            if (std.math.isNan(native_result) or std.math.isInf(native_result)) {
+                // NaN/Inf 结果走 addPortable（算法正确性），add 会 panic
+                const custom_result = a.addPortable(b);
+                if (std.math.isNan(native_result)) {
+                    try std.testing.expect(custom_result.isNan());
+                } else {
+                    try std.testing.expect(custom_result.isInfinite());
+                }
             } else {
+                // 有限结果走 add（x86_64 汇编路径）
+                const custom_result = a.add(b);
                 const native_bits: u16 = @bitCast(native_result);
                 const custom_bits: u16 = @bitCast(custom_result.toNative(f16));
                 try std.testing.expectEqual(native_bits, custom_bits);
@@ -1120,31 +1242,38 @@ test "Float.add f32 boundary" {
     const max = std.math.floatMax(f32);
     const min_sub: f32 = std.math.floatTrueMin(f32);
 
-    const TestCase = struct { a: f32, b: f32, expect_nan: bool };
+    const TestCase = struct { a: f32, b: f32 };
     const cases = [_]TestCase{
-        .{ .a = inf, .b = inf, .expect_nan = false },
-        .{ .a = inf, .b = -inf, .expect_nan = true },
-        .{ .a = -inf, .b = inf, .expect_nan = true },
-        .{ .a = 0.0, .b = -0.0, .expect_nan = false },
-        .{ .a = -0.0, .b = -0.0, .expect_nan = false },
-        .{ .a = 1.0, .b = -1.0, .expect_nan = false },
-        .{ .a = max, .b = max, .expect_nan = false },
-        .{ .a = max, .b = 1.0, .expect_nan = false },
-        .{ .a = min_sub, .b = min_sub, .expect_nan = false },
-        .{ .a = min_sub, .b = 0.0, .expect_nan = false },
-        .{ .a = -max, .b = -max, .expect_nan = false },
-        .{ .a = 1.0, .b = min_sub, .expect_nan = false },
+        .{ .a = inf, .b = inf },
+        .{ .a = inf, .b = -inf },
+        .{ .a = -inf, .b = inf },
+        .{ .a = 0.0, .b = -0.0 },
+        .{ .a = -0.0, .b = -0.0 },
+        .{ .a = 1.0, .b = -1.0 },
+        .{ .a = max, .b = max },
+        .{ .a = max, .b = 1.0 },
+        .{ .a = min_sub, .b = min_sub },
+        .{ .a = min_sub, .b = 0.0 },
+        .{ .a = -max, .b = -max },
+        .{ .a = 1.0, .b = min_sub },
     };
 
     for (cases) |c| {
         const a = Float.fromNative(.f32, c.a);
         const b = Float.fromNative(.f32, c.b);
-        const r = a.add(b);
         const native = c.a + c.b;
-        if (c.expect_nan) {
-            try std.testing.expect(r.isNan());
-            try std.testing.expect(std.math.isNan(native));
+
+        if (std.math.isNan(native) or std.math.isInf(native)) {
+            // NaN/Inf 结果走 addPortable（算法正确性）
+            const r = a.addPortable(b);
+            if (std.math.isNan(native)) {
+                try std.testing.expect(r.isNan());
+            } else {
+                try std.testing.expect(r.isInfinite());
+            }
         } else {
+            // 有限结果走 add（x86_64 汇编路径）
+            const r = a.add(b);
             try std.testing.expectEqual(@as(u32, @bitCast(native)), @as(u32, @bitCast(r.toNative(f32))));
         }
     }
@@ -1154,13 +1283,13 @@ test "Float.subtract f32" {
     const inf = std.math.inf(f32);
     const max = std.math.floatMax(f32);
 
-    // inf - inf = NaN
+    // inf - inf = NaN（走 subtractPortable，subtract 会 panic）
     {
         const a = Float.fromNative(.f32, inf);
         const b = Float.fromNative(.f32, inf);
-        try std.testing.expect(a.subtract(b).isNan());
+        try std.testing.expect(a.subtractPortable(b).isNan());
     }
-    // 1.0 - 1.0 = +0
+    // 1.0 - 1.0 = +0（有限结果走 subtract）
     {
         const a = Float.fromNative(.f32, @as(f32, 1.0));
         const b = Float.fromNative(.f32, @as(f32, 1.0));
@@ -1181,11 +1310,11 @@ test "Float.subtract f32" {
         const r = a.subtract(b);
         try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(r.toNative(f32))));
     }
-    // max - (-max) = inf
+    // max - (-max) = inf（走 subtractPortable）
     {
         const a = Float.fromNative(.f32, max);
         const b = Float.fromNative(.f32, -max);
-        const r = a.subtract(b);
+        const r = a.subtractPortable(b);
         try std.testing.expect(r.isInfinite());
         try std.testing.expect(!r.isNegative());
     }
@@ -1214,11 +1343,16 @@ test "Float.add f64 sample" {
     for (cases) |c| {
         const a = Float.fromNative(.f64, c.a);
         const b = Float.fromNative(.f64, c.b);
-        const r = a.add(b);
         const native = c.a + c.b;
-        if (std.math.isNan(native)) {
-            try std.testing.expect(r.isNan());
+        if (std.math.isNan(native) or std.math.isInf(native)) {
+            const r = a.addPortable(b);
+            if (std.math.isNan(native)) {
+                try std.testing.expect(r.isNan());
+            } else {
+                try std.testing.expect(r.isInfinite());
+            }
         } else {
+            const r = a.add(b);
             try std.testing.expectEqual(@as(u64, @bitCast(native)), @as(u64, @bitCast(r.toNative(f64))));
         }
     }
@@ -1241,11 +1375,16 @@ test "Float.add f128 sample" {
     for (cases) |c| {
         const a = Float.fromNative(.f128, c.a);
         const b = Float.fromNative(.f128, c.b);
-        const r = a.add(b);
         const native = c.a + c.b;
-        if (std.math.isNan(native)) {
-            try std.testing.expect(r.isNan());
+        if (std.math.isNan(native) or std.math.isInf(native)) {
+            const r = a.addPortable(b);
+            if (std.math.isNan(native)) {
+                try std.testing.expect(r.isNan());
+            } else {
+                try std.testing.expect(r.isInfinite());
+            }
         } else {
+            const r = a.add(b);
             try std.testing.expectEqual(@as(u128, @bitCast(native)), @as(u128, @bitCast(r.toNative(f128))));
         }
     }
@@ -1271,11 +1410,16 @@ test "Float.multiply f16 strategic" {
             const b = Float.fromNative(.f16, b_native);
 
             const native_result = a_native * b_native;
-            const custom_result = a.multiply(b);
 
-            if (std.math.isNan(native_result)) {
-                try std.testing.expect(custom_result.isNan());
+            if (std.math.isNan(native_result) or std.math.isInf(native_result)) {
+                const custom_result = a.multiplyPortable(b);
+                if (std.math.isNan(native_result)) {
+                    try std.testing.expect(custom_result.isNan());
+                } else {
+                    try std.testing.expect(custom_result.isInfinite());
+                }
             } else {
+                const custom_result = a.multiply(b);
                 const native_bits: u16 = @bitCast(native_result);
                 const custom_bits: u16 = @bitCast(custom_result.toNative(f16));
                 try std.testing.expectEqual(native_bits, custom_bits);
@@ -1289,29 +1433,33 @@ test "Float.multiply f32 boundary" {
     const max = std.math.floatMax(f32);
     const min_sub: f32 = std.math.floatTrueMin(f32);
 
-    const TestCase = struct { a: f32, b: f32, expect_nan: bool };
+    const TestCase = struct { a: f32, b: f32 };
     const cases = [_]TestCase{
-        .{ .a = 1.0, .b = 2.0, .expect_nan = false },
-        .{ .a = max, .b = 2.0, .expect_nan = false },
-        .{ .a = max, .b = max, .expect_nan = false },
-        .{ .a = min_sub, .b = 2.0, .expect_nan = false },
-        .{ .a = 0.0, .b = inf, .expect_nan = true },
-        .{ .a = inf, .b = 0.0, .expect_nan = true },
-        .{ .a = inf, .b = inf, .expect_nan = false },
-        .{ .a = -1.0, .b = 1.0, .expect_nan = false },
-        .{ .a = -max, .b = -max, .expect_nan = false },
-        .{ .a = 1e-38, .b = 1e38, .expect_nan = false },
+        .{ .a = 1.0, .b = 2.0 },
+        .{ .a = max, .b = 2.0 },
+        .{ .a = max, .b = max },
+        .{ .a = min_sub, .b = 2.0 },
+        .{ .a = 0.0, .b = inf },
+        .{ .a = inf, .b = 0.0 },
+        .{ .a = inf, .b = inf },
+        .{ .a = -1.0, .b = 1.0 },
+        .{ .a = -max, .b = -max },
+        .{ .a = 1e-38, .b = 1e38 },
     };
 
     for (cases) |c| {
         const a = Float.fromNative(.f32, c.a);
         const b = Float.fromNative(.f32, c.b);
-        const r = a.multiply(b);
         const native = c.a * c.b;
-        if (c.expect_nan) {
-            try std.testing.expect(r.isNan());
-            try std.testing.expect(std.math.isNan(native));
+        if (std.math.isNan(native) or std.math.isInf(native)) {
+            const r = a.multiplyPortable(b);
+            if (std.math.isNan(native)) {
+                try std.testing.expect(r.isNan());
+            } else {
+                try std.testing.expect(r.isInfinite());
+            }
         } else {
+            const r = a.multiply(b);
             try std.testing.expectEqual(@as(u32, @bitCast(native)), @as(u32, @bitCast(r.toNative(f32))));
         }
     }
@@ -1337,15 +1485,17 @@ test "Float.divide f16 strategic" {
             const b = Float.fromNative(.f16, b_native);
 
             const native_result = a_native / b_native;
-            const custom_result = a.divide(b);
 
-            if (std.math.isNan(native_result)) {
-                try std.testing.expect(custom_result.isNan());
-            } else if (std.math.isInf(native_result)) {
-                try std.testing.expect(custom_result.isInfinite());
-                // 符号一致
-                try std.testing.expectEqual(std.math.signbit(native_result), custom_result.isNegative());
+            if (std.math.isNan(native_result) or std.math.isInf(native_result)) {
+                const custom_result = a.dividePortable(b);
+                if (std.math.isNan(native_result)) {
+                    try std.testing.expect(custom_result.isNan());
+                } else {
+                    try std.testing.expect(custom_result.isInfinite());
+                    try std.testing.expectEqual(std.math.signbit(native_result), custom_result.isNegative());
+                }
             } else {
+                const custom_result = a.divide(b);
                 const native_bits: u16 = @bitCast(native_result);
                 const custom_bits: u16 = @bitCast(custom_result.toNative(f16));
                 try std.testing.expectEqual(native_bits, custom_bits);
@@ -1359,29 +1509,33 @@ test "Float.divide f32 boundary" {
     const max = std.math.floatMax(f32);
     const min_sub: f32 = std.math.floatTrueMin(f32);
 
-    const TestCase = struct { a: f32, b: f32, expect_nan: bool };
+    const TestCase = struct { a: f32, b: f32 };
     const cases = [_]TestCase{
-        .{ .a = 1.0, .b = 2.0, .expect_nan = false },
-        .{ .a = 1.0, .b = 0.0, .expect_nan = false },
-        .{ .a = -1.0, .b = 0.0, .expect_nan = false },
-        .{ .a = 0.0, .b = 0.0, .expect_nan = true },
-        .{ .a = inf, .b = inf, .expect_nan = true },
-        .{ .a = inf, .b = 1.0, .expect_nan = false },
-        .{ .a = 1.0, .b = inf, .expect_nan = false },
-        .{ .a = max, .b = max, .expect_nan = false },
-        .{ .a = max, .b = min_sub, .expect_nan = false },
-        .{ .a = 1e38, .b = 1e-38, .expect_nan = false },
+        .{ .a = 1.0, .b = 2.0 },
+        .{ .a = 1.0, .b = 0.0 },
+        .{ .a = -1.0, .b = 0.0 },
+        .{ .a = 0.0, .b = 0.0 },
+        .{ .a = inf, .b = inf },
+        .{ .a = inf, .b = 1.0 },
+        .{ .a = 1.0, .b = inf },
+        .{ .a = max, .b = max },
+        .{ .a = max, .b = min_sub },
+        .{ .a = 1e38, .b = 1e-38 },
     };
 
     for (cases) |c| {
         const a = Float.fromNative(.f32, c.a);
         const b = Float.fromNative(.f32, c.b);
-        const r = a.divide(b);
         const native = c.a / c.b;
-        if (c.expect_nan) {
-            try std.testing.expect(r.isNan());
-            try std.testing.expect(std.math.isNan(native));
+        if (std.math.isNan(native) or std.math.isInf(native)) {
+            const r = a.dividePortable(b);
+            if (std.math.isNan(native)) {
+                try std.testing.expect(r.isNan());
+            } else {
+                try std.testing.expect(r.isInfinite());
+            }
         } else {
+            const r = a.divide(b);
             try std.testing.expectEqual(@as(u32, @bitCast(native)), @as(u32, @bitCast(r.toNative(f32))));
         }
     }
@@ -1399,11 +1553,16 @@ test "Float.multiply/divide f64/f128 sample" {
         for (cases) |c| {
             const a = Float.fromNative(.f64, c.a);
             const b = Float.fromNative(.f64, c.b);
-            const r = a.multiply(b);
             const native = c.a * c.b;
-            if (std.math.isNan(native)) {
-                try std.testing.expect(r.isNan());
+            if (std.math.isNan(native) or std.math.isInf(native)) {
+                const r = a.multiplyPortable(b);
+                if (std.math.isNan(native)) {
+                    try std.testing.expect(r.isNan());
+                } else {
+                    try std.testing.expect(r.isInfinite());
+                }
             } else {
+                const r = a.multiply(b);
                 try std.testing.expectEqual(@as(u64, @bitCast(native)), @as(u64, @bitCast(r.toNative(f64))));
             }
         }
@@ -1428,11 +1587,16 @@ test "Float.multiply/divide f64/f128 sample" {
         for (cases) |c| {
             const a = Float.fromNative(.f128, c.a);
             const b = Float.fromNative(.f128, c.b);
-            const r = a.multiply(b);
             const native = c.a * c.b;
-            if (std.math.isNan(native)) {
-                try std.testing.expect(r.isNan());
+            if (std.math.isNan(native) or std.math.isInf(native)) {
+                const r = a.multiplyPortable(b);
+                if (std.math.isNan(native)) {
+                    try std.testing.expect(r.isNan());
+                } else {
+                    try std.testing.expect(r.isInfinite());
+                }
             } else {
+                const r = a.multiply(b);
                 try std.testing.expectEqual(@as(u128, @bitCast(native)), @as(u128, @bitCast(r.toNative(f128))));
             }
         }
@@ -1798,7 +1962,7 @@ test "Float f8 add" {
     const neg_one = Float.fromNative(.f8, @as(u8, 0xBC));
     const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
 
-    // 1.0 + 1.0 = 2.0
+    // 1.0 + 1.0 = 2.0（有限结果走 add）
     try std.testing.expectEqual(@as(u8, 0x40), one.add(one).toNative(u8));
     // 1.0 + 0.5 = 1.5
     try std.testing.expectEqual(@as(u8, 0x3E), one.add(half).toNative(u8));
@@ -1807,19 +1971,19 @@ test "Float f8 add" {
     // 1.0 + 0 = 1.0
     try std.testing.expectEqual(@as(u8, 0x3C), one.add(pos_zero).toNative(u8));
 
-    // inf + inf = inf
+    // inf + inf = inf（NaN/Inf 走 addPortable，add 会 panic）
     const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-    try std.testing.expect(pos_inf.add(pos_inf).isInfinite());
+    try std.testing.expect(pos_inf.addPortable(pos_inf).isInfinite());
     // inf + (-inf) = NaN
     const neg_inf = Float.fromNative(.f8, @as(u8, 0xFC));
-    try std.testing.expect(pos_inf.add(neg_inf).isNan());
+    try std.testing.expect(pos_inf.addPortable(neg_inf).isNan());
 }
 
 test "Float f8 subtract" {
     const one = Float.fromNative(.f8, @as(u8, 0x3C));
     const half = Float.fromNative(.f8, @as(u8, 0x38));
 
-    // 1.0 - 0.5 = 0.5
+    // 1.0 - 0.5 = 0.5（有限结果走 subtract）
     try std.testing.expectEqual(@as(u8, 0x38), one.subtract(half).toNative(u8));
     // 1.0 - 1.0 = +0
     try std.testing.expectEqual(@as(u8, 0x00), one.subtract(one).toNative(u8));
@@ -1831,18 +1995,18 @@ test "Float f8 multiply" {
     const one_point_five = Float.fromNative(.f8, @as(u8, 0x3E));
     const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
 
-    // 2.0 × 2.0 = 4.0 (0x44)
+    // 2.0 × 2.0 = 4.0 (0x44)（有限结果走 multiply）
     try std.testing.expectEqual(@as(u8, 0x44), two.multiply(two).toNative(u8));
     // 1.0 × 1.5 = 1.5
     try std.testing.expectEqual(@as(u8, 0x3E), one.multiply(one_point_five).toNative(u8));
     // 1.0 × 0 = +0
     try std.testing.expectEqual(@as(u8, 0x00), one.multiply(pos_zero).toNative(u8));
 
-    // inf × 0 = NaN
+    // inf × 0 = NaN（NaN/Inf 走 multiplyPortable）
     const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-    try std.testing.expect(pos_inf.multiply(pos_zero).isNan());
+    try std.testing.expect(pos_inf.multiplyPortable(pos_zero).isNan());
     // inf × inf = inf
-    try std.testing.expect(pos_inf.multiply(pos_inf).isInfinite());
+    try std.testing.expect(pos_inf.multiplyPortable(pos_inf).isInfinite());
 }
 
 test "Float f8 divide" {
@@ -1850,18 +2014,18 @@ test "Float f8 divide" {
     const two = Float.fromNative(.f8, @as(u8, 0x40));
     const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
 
-    // 1.0 / 2.0 = 0.5 (0x38)
+    // 1.0 / 2.0 = 0.5 (0x38)（有限结果走 divide）
     try std.testing.expectEqual(@as(u8, 0x38), one.divide(two).toNative(u8));
     // 2.0 / 2.0 = 1.0
     try std.testing.expectEqual(@as(u8, 0x3C), two.divide(two).toNative(u8));
-    // 1.0 / 0.0 = +inf
-    try std.testing.expectEqual(@as(u8, 0x7C), one.divide(pos_zero).toNative(u8));
+    // 1.0 / 0.0 = +inf（NaN/Inf 走 dividePortable）
+    try std.testing.expectEqual(@as(u8, 0x7C), one.dividePortable(pos_zero).toNative(u8));
     // 0.0 / 0.0 = NaN
-    try std.testing.expect(pos_zero.divide(pos_zero).isNan());
+    try std.testing.expect(pos_zero.dividePortable(pos_zero).isNan());
 
     // inf / inf = NaN
     const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-    try std.testing.expect(pos_inf.divide(pos_inf).isNan());
+    try std.testing.expect(pos_inf.dividePortable(pos_inf).isNan());
 }
 
 test "Float f8 toFloatType f8->f16 widen" {

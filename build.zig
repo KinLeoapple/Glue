@@ -86,9 +86,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     value_module.addImport("ast", ast_module);
-    // x86_64 汇编注入（单文件 int.S 用 #ifdef _WIN32 切换 ABI；大写 S 走 C 预处理器）
+    // x86_64 汇编注入（单文件 int.S/float.S 用 #ifdef _WIN32 切换 ABI；大写 S 走 C 预处理器）
     if (target.result.cpu.arch == .x86_64) {
         value_module.addAssemblyFile(b.path("src/value/arch/x86_64/int.S"));
+        value_module.addAssemblyFile(b.path("src/value/arch/x86_64/float.S"));
     }
     // value ↔ runtime: 循环依赖（value re-export runtime 类型，runtime 引用 Value）
     value_module.addImport("atomic", atomic_module);
@@ -335,6 +336,7 @@ pub fn build(b: *std.Build) void {
     // x86_64 汇编注入（测试模块同样需要；大写 S 走 C 预处理器）
     if (target.result.cpu.arch == .x86_64) {
         value_new_module.addAssemblyFile(b.path("src/value/arch/x86_64/int.S"));
+        value_new_module.addAssemblyFile(b.path("src/value/arch/x86_64/float.S"));
     }
 
     const value_new_unit_tests = b.addTest(.{
