@@ -45,29 +45,14 @@ pub const Str = struct {
         return .{ .bytes = buf, .allocator = self.allocator };
     }
 
-    /// 字典序逐字节比较
+    /// 字典序逐字节比较（ReleaseFast 下 std.mem.order 走 SIMD 加速）
     pub fn compare(self: Str, other: Str) std.math.Order {
-        const a = self.bytes;
-        const b = other.bytes;
-        const min_len = if (a.len < b.len) a.len else b.len;
-        var i: usize = 0;
-        while (i < min_len) : (i += 1) {
-            if (a[i] < b[i]) return .lt;
-            if (a[i] > b[i]) return .gt;
-        }
-        if (a.len < b.len) return .lt;
-        if (a.len > b.len) return .gt;
-        return .eq;
+        return std.mem.order(u8, self.bytes, other.bytes);
     }
 
-    /// 相等
+    /// 相等（ReleaseFast 下 std.mem.eql 走 SIMD 加速）
     pub fn equals(self: Str, other: Str) bool {
-        if (self.bytes.len != other.bytes.len) return false;
-        var i: usize = 0;
-        while (i < self.bytes.len) : (i += 1) {
-            if (self.bytes[i] != other.bytes[i]) return false;
-        }
-        return true;
+        return std.mem.eql(u8, self.bytes, other.bytes);
     }
 };
 

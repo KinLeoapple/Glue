@@ -86,12 +86,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     value_module.addImport("ast", ast_module);
-    // x86_64 汇编注入（单文件 int.S/float.S/char.S 用 #ifdef _WIN32 切换 ABI；大写 S 走 C 预处理器）
-    if (target.result.cpu.arch == .x86_64) {
-        value_module.addAssemblyFile(b.path("src/value/arch/x86_64/int.S"));
-        value_module.addAssemblyFile(b.path("src/value/arch/x86_64/float.S"));
-        value_module.addAssemblyFile(b.path("src/value/arch/x86_64/char.S"));
-    }
     // value ↔ runtime: 循环依赖（value re-export runtime 类型，runtime 引用 Value）
     value_module.addImport("atomic", atomic_module);
     value_module.addImport("channel", channel_module);
@@ -253,7 +247,6 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("value", value_module);
     root_module.addImport("slab_pool", slab_pool_module);
     root_module.addImport("profiler", profiler_module);
-    // M5：字节码 VM 接入 glue run（vm_module 再导出 VM/Program/ModuleCompiler/lexer/parser）。
     root_module.addImport("vm", vm_module);
 
     // Create glue executable
@@ -264,22 +257,6 @@ pub fn build(b: *std.Build) void {
 
     // Install executable to output directory
     b.installArtifact(exe);
-
-    // VM bench 驱动：编译并在字节码 VM 上端到端跑 lookup 基准（含 main + println）。
-    // root = src/vm/bench_main.zig，import "compiler"（= vm_module，再导出 vm/Program/lexer/parser）。
-    const bench_vm_module = b.createModule(.{
-        .root_source_file = b.path("src/vm/bench_main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    bench_vm_module.addImport("compiler", vm_module);
-    const bench_vm_exe = b.addExecutable(.{
-        .name = "bench_vm_lookup",
-        .root_module = bench_vm_module,
-    });
-    const run_bench_vm = b.addRunArtifact(bench_vm_exe);
-    const bench_vm_step = b.step("bench-vm", "Run lookup/record bench on the bytecode VM (exe arg: lookup|record)");
-    bench_vm_step.dependOn(&run_bench_vm.step);
 
     // ============================================================
     // Tests
@@ -334,12 +311,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // x86_64 汇编注入（测试模块同样需要；大写 S 走 C 预处理器）
-    if (target.result.cpu.arch == .x86_64) {
-        value_new_module.addAssemblyFile(b.path("src/value/arch/x86_64/int.S"));
-        value_new_module.addAssemblyFile(b.path("src/value/arch/x86_64/float.S"));
-        value_new_module.addAssemblyFile(b.path("src/value/arch/x86_64/char.S"));
-    }
 
     const value_new_unit_tests = b.addTest(.{
         .root_module = value_new_module,
