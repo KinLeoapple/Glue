@@ -6,6 +6,15 @@
 //! 命名规范：方法名全部使用完整单词，不使用缩写。
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// x86_64 汇编 extern 声明（符号定义在 arch/x86_64/char.S；大写 S 走 C 预处理器）
+extern fn glue_cmp_char(a: [*]const u8, b: [*]const u8) i8;
+extern fn glue_succ_char(out: [*]u8, a: [*]const u8) void;
+extern fn glue_pred_char(out: [*]u8, a: [*]const u8) void;
+extern fn glue_is_ascii_char(a: [*]const u8) u8;
+extern fn glue_is_digit_char(a: [*]const u8) u8;
+extern fn glue_is_alpha_char(a: [*]const u8) u8;
 
 /// 单个 Unicode 字符（UTF-32 小端存储）
 pub const Char = struct {
@@ -47,7 +56,21 @@ pub const Char = struct {
     }
 
     /// 按码点数值比较
+    /// 架构分派：x86_64 走汇编 glue_cmp_char，其他走 comparePortable。
     pub fn compare(self: Char, other: Char) std.math.Order {
+        return switch (builtin.cpu.arch) {
+            .x86_64 => switch (glue_cmp_char(&self.bytes, &other.bytes)) {
+                -1 => .lt,
+                0 => .eq,
+                1 => .gt,
+                else => unreachable,
+            },
+            else => comparePortable(self, other),
+        };
+    }
+
+    /// 便携软件实现（非 x86_64 架构回退路径）
+    fn comparePortable(self: Char, other: Char) std.math.Order {
         const a = self.toCodePoint();
         const b = other.toCodePoint();
         if (a < b) return .lt;
@@ -56,56 +79,90 @@ pub const Char = struct {
     }
 
     /// 相等
+    /// 架构分派：x86_64 复用 glue_cmp_char == 0，其他走码点比较。
     pub fn equals(self: Char, other: Char) bool {
-        return self.toCodePoint() == other.toCodePoint();
+        return switch (builtin.cpu.arch) {
+            .x86_64 => glue_cmp_char(&self.bytes, &other.bytes) == 0,
+            else => self.toCodePoint() == other.toCodePoint(),
+        };
     }
 
     /// 后继字符（码点 +1，字节进位运算，不校验，调用方负责语义）
+    /// 架构分派：x86_64 走汇编 glue_succ_char，其他走字节循环。
     pub fn successor(self: Char) Char {
-        var result = self;
-        var carry: u16 = 1;
-        var i: usize = 0;
-        while (i < 4) : (i += 1) {
-            const sum: u16 = @as(u16, result.bytes[i]) + carry;
-            result.bytes[i] = @truncate(sum);
-            carry = sum >> 8;
+        var result: Char = undefined;
+        switch (builtin.cpu.arch) {
+            .x86_64 => glue_succ_char(&result.bytes, &self.bytes),
+            else => {
+                result = self;
+                var carry: u16 = 1;
+                var i: usize = 0;
+                while (i < 4) : (i += 1) {
+                    const sum: u16 = @as(u16, result.bytes[i]) + carry;
+                    result.bytes[i] = @truncate(sum);
+                    carry = sum >> 8;
+                }
+            },
         }
         return result;
     }
 
     /// 前驱字符（码点 -1，字节借位运算，不校验，调用方负责语义）
+    /// 架构分派：x86_64 走汇编 glue_pred_char，其他走字节循环。
     pub fn predecessor(self: Char) Char {
-        var result = self;
-        var borrow: u16 = 1;
-        var i: usize = 0;
-        while (i < 4) : (i += 1) {
-            const v: u16 = @as(u16, result.bytes[i]);
-            if (v >= borrow) {
-                result.bytes[i] = @truncate(v - borrow);
-                borrow = 0;
-            } else {
-                result.bytes[i] = @truncate(256 - borrow + v);
-                borrow = 1;
-            }
+        var result: Char = undefined;
+        switch (builtin.cpu.arch) {
+            .x86_64 => glue_pred_char(&result.bytes, &self.bytes),
+            else => {
+                result = self;
+                var borrow: u16 = 1;
+                var i: usize = 0;
+                while (i < 4) : (i += 1) {
+                    const v: u16 = @as(u16, result.bytes[i]);
+                    if (v >= borrow) {
+                        result.bytes[i] = @truncate(v - borrow);
+                        borrow = 0;
+                    } else {
+                        result.bytes[i] = @truncate(256 - borrow + v);
+                        borrow = 1;
+                    }
+                }
+            },
         }
         return result;
     }
 
     /// 是否 ASCII（码点 ≤ 0x7F）
+    /// 架构分派：x86_64 走汇编 glue_is_ascii_char，其他走码点比较。
     pub fn isAscii(self: Char) bool {
-        return self.toCodePoint() <= 0x7F;
+        return switch (builtin.cpu.arch) {
+            .x86_64 => glue_is_ascii_char(&self.bytes) != 0,
+            else => self.toCodePoint() <= 0x7F,
+        };
     }
 
     /// 是否十进制数字 ('0'..'9')
+    /// 架构分派：x86_64 走汇编 glue_is_digit_char，其他走码点范围检查。
     pub fn isDigit(self: Char) bool {
-        const cp = self.toCodePoint();
-        return cp >= '0' and cp <= '9';
+        return switch (builtin.cpu.arch) {
+            .x86_64 => glue_is_digit_char(&self.bytes) != 0,
+            else => blk: {
+                const cp = self.toCodePoint();
+                break :blk cp >= '0' and cp <= '9';
+            },
+        };
     }
 
     /// 是否 ASCII 字母 ('a'..'z' 或 'A'..'Z')
+    /// 架构分派：x86_64 走汇编 glue_is_alpha_char，其他走码点范围检查。
     pub fn isAlpha(self: Char) bool {
-        const cp = self.toCodePoint();
-        return (cp >= 'a' and cp <= 'z') or (cp >= 'A' and cp <= 'Z');
+        return switch (builtin.cpu.arch) {
+            .x86_64 => glue_is_alpha_char(&self.bytes) != 0,
+            else => blk: {
+                const cp = self.toCodePoint();
+                break :blk (cp >= 'a' and cp <= 'z') or (cp >= 'A' and cp <= 'Z');
+            },
+        };
     }
 };
 
