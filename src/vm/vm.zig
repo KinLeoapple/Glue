@@ -381,7 +381,7 @@ pub const VM = struct {
                 return self.fail(loc, "trait method name must be a string", error.TypeMismatch);
             }
             // name_v.string 是 retainOwned 出的 owned 副本 —— 直接作为 key（移交），不再 dupe。
-            const name_str = name_v.string.bytes;
+            const name_str = name_v.string.bytes();
             const gop = methods.getOrPut(name_str) catch return error.OutOfMemory;
             if (gop.found_existing) {
                 // 重名（override）：释放旧实现与重复 key 字节，覆盖。
@@ -551,6 +551,7 @@ pub const VM = struct {
     /// 主 dispatch 循环。从当前帧（frames 顶）取码执行，CALL 压帧、RETURN 弹帧。
     /// 当入口帧 RETURN（frames 清空）时返回其结果。
     fn runLoop(self: *VM, program: *const Program) VMError!Value {
+        @setRuntimeSafety(false);
         // Dispatch loop 瘦身：frame/func/code/slot_base 缓存到局部变量，避免每条指令重取。
         // 仅在修改 frames 的指令（call/return 系列）后刷新。call/return 频率远低于
         // 总指令数（perf_recursion 中 op_call 占 ~3%），绝大多数指令直接命中缓存。
@@ -895,7 +896,7 @@ pub const VM = struct {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const field_val = func.chunk.constants.items[name_idx];
-                    const field = field_val.string.bytes;
+                    const field = field_val.string.bytes();
                     try self.doGetField(field, loc);
                 },
                 .op_get_adt_field => {
@@ -913,7 +914,7 @@ pub const VM = struct {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const want_val = func.chunk.constants.items[name_idx];
-                    const want = want_val.string.bytes;
+                    const want = want_val.string.bytes();
                     const obj = self.pop();
                     defer obj.release(self.allocator);
                     const matched = blk: {
@@ -991,7 +992,7 @@ pub const VM = struct {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const want_val = func.chunk.constants.items[name_idx];
-                    const want = want_val.string.bytes;
+                    const want = want_val.string.bytes();
                     const obj = self.pop();
                     defer obj.release(self.allocator);
                     const matched = blk: {
@@ -1019,7 +1020,7 @@ pub const VM = struct {
                     errdefer msg.deinit(self.allocator);
                     try msg.appendSlice(self.allocator, desc.default_prefix);
                     try msg.appendSlice(self.allocator, ": ");
-                    try msg.appendSlice(self.allocator, v.string.bytes);
+                    try msg.appendSlice(self.allocator, v.string.bytes());
                     const e = self.allocator.create(value.ErrorValue) catch return error.OutOfMemory;
                     e.* = .{
                         .type_name = self.allocator.dupe(u8, desc.type_name) catch return error.OutOfMemory,
@@ -1042,7 +1043,7 @@ pub const VM = struct {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const tname_val = func.chunk.constants.items[name_idx];
-                    const tname = tname_val.string.bytes;
+                    const tname = tname_val.string.bytes();
                     try self.doCast(tname, loc);
                 },
                 // M5：隐式数值定型（best-effort）。仅 int/float 且目标 builtin 数值类型时协调，
@@ -1051,7 +1052,7 @@ pub const VM = struct {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const tname_val = func.chunk.constants.items[name_idx];
-                    const tname = tname_val.string.bytes;
+                    const tname = tname_val.string.bytes();
                     self.doCoerce(tname);
                 },
                 // M3b：字段赋值 —— [record, val] → [new_record]（COW），写回由 SET_LOCAL 完成。
@@ -1059,7 +1060,7 @@ pub const VM = struct {
                     const name_idx = opcode.readU16(code, frame.ip);
                     frame.ip += 2;
                     const field_val = func.chunk.constants.items[name_idx];
-                    const field = field_val.string.bytes;
+                    const field = field_val.string.bytes();
                     try self.doSetField(field, loc);
                 },
                 // M5f：索引赋值 —— [array, index, val] → [new_array]（COW），写回由 SET_LOCAL 完成。
@@ -1517,11 +1518,10 @@ pub const VM = struct {
                 // 顶层字符串直接输出内容（不加引号），与 Python/Rust/JS 的 println 一致；
                 // 其它类型走 format（字符串在数组/记录内仍加引号，保持 debug 显示风格）。
                 if (v == .string) {
-                    buf.appendSlice(self.allocator, v.string.bytes) catch return error.OutOfMemory;
+                    buf.appendSlice(self.allocator, v.string.bytes()) catch return error.OutOfMemory;
                 } else {
-                    const formatted = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
-                    defer self.allocator.free(formatted);
-                    buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+                    // 直接 format 到 buf，避免 formatAlloc 的临时 ArrayList + toOwnedSlice 开销
+                    v.format(self.allocator, &buf) catch return error.OutOfMemory;
                 }
                 if (nat == .println) buf.append(self.allocator, '\n') catch {};
                 if (self.io) |io| {
@@ -1551,7 +1551,7 @@ pub const VM = struct {
                 const v = self.pop();
                 defer v.release(self.allocator);
                 if (v != .string) return self.fail(loc, "Error expects a str argument", error.TypeMismatch);
-                const str = v.string.bytes;
+                const str = v.string.bytes();
                 const e = self.allocator.create(value.ErrorValue) catch return error.OutOfMemory;
                 e.* = .{
                     .type_name = self.allocator.dupe(u8, "Error") catch return error.OutOfMemory,
@@ -1568,9 +1568,15 @@ pub const VM = struct {
                 defer v.release(self.allocator);
                 if (!v.isInteger()) return self.fail(loc, "channel expects an integer capacity", error.TypeMismatch);
                 const int_val = v.asInt();
-                const cap: usize = @intCast(if (int_val.type.isSigned()) int_val.toNative(i128) else @as(i128, @intCast(int_val.toNative(u128))));
+                const coerced = int_val.coerceTo(.i64) orelse return self.fail(loc, "channel capacity out of range", error.ArithmeticOverflow);
+                const cap_v = coerced.toNative(i64);
+                if (cap_v < 0) return self.fail(loc, "channel capacity cannot be negative", error.ArithmeticOverflow);
+                const cap: usize = @intCast(cap_v);
                 const ch = self.allocator.create(value.ChannelValue) catch return error.OutOfMemory;
-                ch.* = value.ChannelValue.init(self.allocator, cap);
+                ch.* = value.ChannelValue.init(self.allocator, cap) catch {
+                    self.allocator.destroy(ch);
+                    return error.OutOfMemory;
+                };
                 try self.push(Value{ .channel_val = ch });
             },
             // M5b：type(v) —— 返回运行时类型名字符串（镜像 eval builtinTypeName/valueTypeName）。
@@ -1597,7 +1603,7 @@ pub const VM = struct {
                 defer v.release(self.allocator);
                 // 字符串参数直接用作错误消息（不加引号），与 println 一致。
                 const msg = if (v == .string)
-                    self.allocator.dupe(u8, v.string.bytes) catch return error.OutOfMemory
+                    self.allocator.dupe(u8, v.string.bytes()) catch return error.OutOfMemory
                 else
                     v.formatAlloc(self.allocator) catch return error.OutOfMemory;
                 defer self.allocator.free(msg);
@@ -1612,11 +1618,10 @@ pub const VM = struct {
                 defer buf.deinit(self.allocator);
                 // 顶层字符串直接输出内容（与 println 一致）。
                 if (v == .string) {
-                    buf.appendSlice(self.allocator, v.string.bytes) catch return error.OutOfMemory;
+                    buf.appendSlice(self.allocator, v.string.bytes()) catch return error.OutOfMemory;
                 } else {
-                    const formatted = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
-                    defer self.allocator.free(formatted);
-                    buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+                    // 直接 format 到 buf，避免 formatAlloc 的临时 ArrayList + toOwnedSlice 开销
+                    v.format(self.allocator, &buf) catch return error.OutOfMemory;
                 }
                 if (nat == .eprintln) buf.append(self.allocator, '\n') catch {};
                 if (self.io) |io| {
@@ -1743,11 +1748,10 @@ pub const VM = struct {
             // 字符串段直接输出内容（不加引号），与多数语言插值语义一致；
             // 其它类型走 format（数组/记录内的字符串仍加引号，保持 debug 显示风格）。
             if (seg == .string) {
-                buf.appendSlice(self.allocator, seg.string.bytes) catch return error.OutOfMemory;
+                buf.appendSlice(self.allocator, seg.string.bytes()) catch return error.OutOfMemory;
             } else {
-                const formatted = seg.formatAlloc(self.allocator) catch return error.OutOfMemory;
-                defer self.allocator.free(formatted);
-                buf.appendSlice(self.allocator, formatted) catch return error.OutOfMemory;
+                // 直接 format 到 buf，避免 formatAlloc 的临时 ArrayList + toOwnedSlice 开销
+                seg.format(self.allocator, &buf) catch return error.OutOfMemory;
             }
         }
         // 拼接完成后再 release 各段（format 借用其内容，须在 format 后释放）。
@@ -1756,7 +1760,7 @@ pub const VM = struct {
         self.stack.shrinkRetainingCapacity(base);
         const owned = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
         const s = self.allocator.create(value.Str) catch return error.OutOfMemory;
-        s.* = .{ .bytes = owned, .allocator = self.allocator };
+        s.* = value.Str.fromOwnedBytes(self.allocator, owned);
         try self.push(Value{ .string = s });
     }
 
@@ -1765,24 +1769,26 @@ pub const VM = struct {
         const v = self.pop();
         defer v.release(self.allocator);
         if (std.mem.eql(u8, type_name, "str")) {
-            // 特殊处理 char: 返回不带引号的字符
+            // 特殊处理 char: 返回字符的 UTF-8 编码（1-4 字节，不丢精度）
             if (v == .char) {
                 const c = v.asChar().toNative();
-                const buf = try self.allocator.alloc(u8, 1);
-                buf[0] = @intCast(c);
+                var utf8_buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(c, &utf8_buf) catch return self.fail(loc, "invalid char codepoint", error.Unsupported);
+                const buf = try self.allocator.alloc(u8, len);
+                @memcpy(buf, utf8_buf[0..len]);
                 const s = try self.allocator.create(value.Str);
-                s.* = .{ .bytes = buf, .allocator = self.allocator };
+                s.* = value.Str.fromOwnedBytes(self.allocator, buf);
                 try self.push(Value{ .string = s });
                 return;
             }
             // 字符串→str 直接返回内容副本（不加引号），与 println/interp 一致。
             if (v == .string) {
-                try self.push(try Value.fromStringBytes(self.allocator, v.string.bytes));
+                try self.push(try Value.fromStringBytes(self.allocator, v.string.bytes()));
                 return;
             }
             const owned = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
             const s = try self.allocator.create(value.Str);
-            s.* = .{ .bytes = @constCast(owned), .allocator = self.allocator };
+            s.* = value.Str.fromOwnedBytes(self.allocator, @constCast(owned));
             try self.push(Value{ .string = s });
             return;
         }
@@ -1928,9 +1934,10 @@ pub const VM = struct {
             return self.fail(loc, "array index must be an integer", error.TypeMismatch);
         }
         const iv = index_val.asInt();
-        const i: i128 = if (iv.type.isSigned()) iv.toNative(i128) else @intCast(iv.toNative(u128));
+        const idx_coerced = iv.coerceTo(.i64) orelse return self.fail(loc, "index out of range", error.TypeMismatch);
+        const i = idx_coerced.toNative(i64);
         var arr = obj.array;
-        if (i < 0 or i >= @as(i128, @intCast(arr.elements.len))) {
+        if (i < 0 or i >= @as(i64, @intCast(arr.elements.len))) {
             val.release(self.allocator);
             obj.release(self.allocator);
             return self.fail(loc, "index out of bounds", error.TypeMismatch);
@@ -2030,20 +2037,22 @@ pub const VM = struct {
                 const arr = object.array;
                 if (!index_val.isInteger()) return self.fail(loc, "array index must be an integer", error.TypeMismatch);
                 const iv = index_val.asInt();
-                const i: i128 = if (iv.type.isSigned()) iv.toNative(i128) else @intCast(iv.toNative(u128));
-                if (i < 0 or i >= @as(i128, @intCast(arr.elements.len)))
+                const idx_coerced = iv.coerceTo(.i64) orelse return self.fail(loc, "index out of range", error.TypeMismatch);
+                const i = idx_coerced.toNative(i64);
+                if (i < 0 or i >= @as(i64, @intCast(arr.elements.len)))
                     return self.fail(loc, "index out of bounds", error.TypeMismatch);
                 try self.push(try self.retainOwned(arr.elements[@intCast(i)]));
             },
             .string => {
-                const s = object.string.bytes;
+                const s = object.string.bytes();
                 if (!index_val.isInteger()) return self.fail(loc, "string index must be an integer", error.TypeMismatch);
                 const iv = index_val.asInt();
-                const i: i128 = if (iv.type.isSigned()) iv.toNative(i128) else @intCast(iv.toNative(u128));
+                const idx_coerced = iv.coerceTo(.i64) orelse return self.fail(loc, "index out of range", error.TypeMismatch);
+                const i = idx_coerced.toNative(i64);
                 if (i < 0) return self.fail(loc, "index out of bounds", error.TypeMismatch);
                 const view = std.unicode.Utf8View.init(s) catch return self.fail(loc, "invalid UTF-8 string", error.TypeMismatch);
                 var iter = view.iterator();
-                var ci: i128 = 0;
+                var ci: i64 = 0;
                 while (iter.nextCodepoint()) |cp| : (ci += 1) {
                     if (ci == i) {
                         try self.push(Value.fromChar(value.Char.fromNative(cp) catch unreachable));
@@ -2061,7 +2070,7 @@ pub const VM = struct {
     /// 弹实参 + receiver（均 owned，方法分派后 releaseVM），压 fresh owned 结果。
     fn doCallMethod(self: *VM, func: *const Function, name_idx: u16, argc: u8, loc: ast.SourceLocation) VMError!void {
         const name_val = func.chunk.constants.items[name_idx];
-        const name = name_val.string.bytes;
+        const name = name_val.string.bytes();
         const args_start = self.stack.items.len - argc;
         const args = self.stack.items[args_start..][0..argc];
         const receiver = self.stack.items[args_start - 1];
@@ -2127,6 +2136,7 @@ pub const VM = struct {
             error.WrongArity => return self.fail(loc, "method called with wrong number of arguments", error.WrongArity),
             error.TypeMismatch => return self.fail(loc, "method not available on this type", error.TypeMismatch),
             error.ChannelClosed => return self.fail(loc, "channel: send on closed channel", error.TypeMismatch),
+            error.ArithmeticOverflow => return self.fail(loc, "method result out of range", error.ArithmeticOverflow),
             error.OutOfMemory => return error.OutOfMemory,
         };
         // 释放实参 + receiver（分派已 retainOwned 需要的元素到结果）。
@@ -2260,13 +2270,19 @@ pub const VM = struct {
         if (target == .atomic_val) {
             const av = target.atomic_val;
             switch (arith_op) {
-                .op_add => av.fetchAdd(rhs),
-                .op_sub => av.fetchSub(rhs),
-                .op_mul => av.fetchMul(rhs),
-                .op_bit_and => av.fetchAnd(rhs),
-                .op_bit_or => av.fetchOr(rhs),
-                .op_div => av.fetchDiv(rhs) catch return self.fail(loc, "division by zero", error.DivisionByZero),
-                .op_mod => av.fetchMod(rhs) catch return self.fail(loc, "division by zero", error.DivisionByZero),
+                .op_add => av.fetchAdd(rhs) catch return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                .op_sub => av.fetchSub(rhs) catch return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                .op_mul => av.fetchMul(rhs) catch return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                .op_bit_and => av.fetchAnd(rhs) catch return self.fail(loc, "atomic bitwise operand out of range", error.ArithmeticOverflow),
+                .op_bit_or => av.fetchOr(rhs) catch return self.fail(loc, "atomic bitwise operand out of range", error.ArithmeticOverflow),
+                .op_div => av.fetchDiv(rhs) catch |err| switch (err) {
+                    error.DivideByZero => return self.fail(loc, "division by zero", error.DivisionByZero),
+                    error.ArithmeticOverflow => return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                },
+                .op_mod => av.fetchMod(rhs) catch |err| switch (err) {
+                    error.DivideByZero => return self.fail(loc, "division by zero", error.DivisionByZero),
+                    error.ArithmeticOverflow => return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                },
                 else => return self.fail(loc, "unsupported atomic compound op", error.TypeMismatch),
             }
             return; // atomic 就地更新，slot 不变
@@ -2295,13 +2311,19 @@ pub const VM = struct {
         if (target == .atomic_val) {
             const av = target.atomic_val;
             switch (arith_op) {
-                .op_add => av.fetchAdd(rhs),
-                .op_sub => av.fetchSub(rhs),
-                .op_mul => av.fetchMul(rhs),
-                .op_bit_and => av.fetchAnd(rhs),
-                .op_bit_or => av.fetchOr(rhs),
-                .op_div => av.fetchDiv(rhs) catch return self.fail(loc, "division by zero", error.DivisionByZero),
-                .op_mod => av.fetchMod(rhs) catch return self.fail(loc, "division by zero", error.DivisionByZero),
+                .op_add => av.fetchAdd(rhs) catch return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                .op_sub => av.fetchSub(rhs) catch return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                .op_mul => av.fetchMul(rhs) catch return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                .op_bit_and => av.fetchAnd(rhs) catch return self.fail(loc, "atomic bitwise operand out of range", error.ArithmeticOverflow),
+                .op_bit_or => av.fetchOr(rhs) catch return self.fail(loc, "atomic bitwise operand out of range", error.ArithmeticOverflow),
+                .op_div => av.fetchDiv(rhs) catch |err| switch (err) {
+                    error.DivideByZero => return self.fail(loc, "division by zero", error.DivisionByZero),
+                    error.ArithmeticOverflow => return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                },
+                .op_mod => av.fetchMod(rhs) catch |err| switch (err) {
+                    error.DivideByZero => return self.fail(loc, "division by zero", error.DivisionByZero),
+                    error.ArithmeticOverflow => return self.fail(loc, "atomic arithmetic overflow", error.ArithmeticOverflow),
+                },
                 else => return self.fail(loc, "unsupported atomic compound op", error.TypeMismatch),
             }
             return; // atomic 就地更新，inner 不变
@@ -2384,7 +2406,9 @@ pub const VM = struct {
         // 闭包捕获可能把 iter/idx slot 就地 box 成 *Cell（如循环体内 spawn 捕获循环变量）；透明解包。
         const iter = if (iter_raw == .cell) iter_raw.cell.inner else iter_raw;
         const idx_v = if (idx_raw == .cell) idx_raw.cell.inner else idx_raw;
-        const idx: i64 = idx_v.asInt().toNative(i64);
+        // 软件 coerceTo(.i64)：narrowing 必须范围检查，防止 i128/u128 静默截断
+        const idx_coerced = idx_v.asInt().coerceTo(.i64) orelse return self.fail(loc, "loop index out of i64 range", error.ArithmeticOverflow);
+        const idx: i64 = idx_coerced.toNative(i64);
         switch (iter) {
             .array => {
                 const arr = iter.array;
@@ -2396,9 +2420,12 @@ pub const VM = struct {
             },
             .range => {
                 const r = iter.range;
-                const start_i: i128 = r.start.toNative(i128);
-                const end_i: i128 = r.end.toNative(i128);
-                const cur: i128 = start_i + idx;
+                // 软件 coerceTo(.i64)：范围值必须 fit i64（循环计数器宽度）
+                const start_coerced = r.start.coerceTo(.i64) orelse return self.fail(loc, "range start out of i64 range", error.ArithmeticOverflow);
+                const end_coerced = r.end.coerceTo(.i64) orelse return self.fail(loc, "range end out of i64 range", error.ArithmeticOverflow);
+                const start_i = start_coerced.toNative(i64);
+                const end_i = end_coerced.toNative(i64);
+                const cur: i64 = start_i + @as(i64, @intCast(idx));
                 const past = if (r.inclusive) cur > end_i else cur >= end_i;
                 if (past) {
                     frame.ip = @intCast(@as(i64, @intCast(frame.ip)) + exit_off);
@@ -2409,7 +2436,7 @@ pub const VM = struct {
             .string => {
                 const s = iter.string;
                 // 按码点迭代：idx 是码点序号，线性扫描到第 idx 个（字符串迭代通常短）。
-                const view = std.unicode.Utf8View.init(s.bytes) catch return self.fail(loc, "invalid UTF-8 string", error.TypeMismatch);
+                const view = std.unicode.Utf8View.init(s.bytes()) catch return self.fail(loc, "invalid UTF-8 string", error.TypeMismatch);
                 var it = view.iterator();
                 var ci: i64 = 0;
                 while (it.nextCodepoint()) |cp| : (ci += 1) {
@@ -2499,7 +2526,7 @@ pub const VM = struct {
         try self.push(try Value.makeVmClosure(self.allocator, .{ .func = vc.func, .arity = vc.arity, .upvalues = new_uv, .bound_args = new_bound, .allocator = self.allocator }));
     }
 
-    /// 算术 + 位运算。语义镜像 eval.zig evalAdd/Sub/...（复用 value.zig promote/inRange）。
+    /// 算术 + 位运算。语义镜像 eval.zig evalAdd/Sub/...（复用 value 软件 API，不依赖 128 位原生类型）。
     fn doArith(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         if (left.isInteger() and right.isInteger()) {
             const left_int = left.asInt();
@@ -2509,85 +2536,98 @@ pub const VM = struct {
             switch (op) {
                 .op_bit_and, .op_bit_or, .op_bit_xor => {
                     const result_type = lt; // 位运算保留 left 类型（与 evalBinary 一致）
-                    const lv: u128 = left_int.toNative(u128);
-                    const rv: u128 = right_int.toNative(u128);
-                    const result: u128 = switch (op) {
-                        .op_bit_and => lv & rv,
-                        .op_bit_or => lv | rv,
-                        .op_bit_xor => lv ^ rv,
+                    const right_coerced = right_int.coerceTo(result_type) orelse return self.fail(loc, "bitwise op: operand out of range", error.ArithmeticOverflow);
+                    const result = switch (op) {
+                        .op_bit_and => left_int.bitwiseAnd(right_coerced),
+                        .op_bit_or => left_int.bitwiseOr(right_coerced),
+                        .op_bit_xor => left_int.bitwiseXor(right_coerced),
                         else => unreachable,
                     };
-                    if (!result_type.inRange(result)) return self.fail(loc, "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
-                    return Value.fromInt(value.Int.fromNative(result_type, result));
+                    return Value.fromInt(result);
                 },
                 else => {},
             }
             const result_type = value.promoteIntTypes(lt, rt);
-            const signed = result_type.isSigned();
-            const lv: u128 = left_int.toNative(u128);
-            const rv: u128 = right_int.toNative(u128);
-            const result: u128 = switch (op) {
-                .op_add => lv +% rv,
-                .op_sub => lv -% rv,
-                .op_mul => lv *% rv,
-                .op_div => blk: {
-                    if (rv == 0) return self.fail(loc, "division by zero", error.DivisionByZero);
-                    break :blk if (signed) @bitCast(@divTrunc(@as(i128, @bitCast(lv)), @as(i128, @bitCast(rv)))) else lv / rv;
+            const left_coerced = left_int.coerceTo(result_type) orelse return self.fail(loc, "arithmetic overflow: operand out of range", error.ArithmeticOverflow);
+            const right_coerced = right_int.coerceTo(result_type) orelse return self.fail(loc, "arithmetic overflow: operand out of range", error.ArithmeticOverflow);
+            switch (op) {
+                .op_add => {
+                    const r = left_coerced.add(right_coerced);
+                    if (r.overflow) return self.fail(loc, "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
+                    return Value.fromInt(r.result);
                 },
-                .op_mod => blk: {
-                    if (rv == 0) return self.fail(loc, "division by zero", error.DivisionByZero);
-                    break :blk if (signed) @bitCast(@rem(@as(i128, @bitCast(lv)), @as(i128, @bitCast(rv)))) else lv % rv;
+                .op_sub => {
+                    const r = left_coerced.subtract(right_coerced);
+                    if (r.overflow) return self.fail(loc, "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
+                    return Value.fromInt(r.result);
+                },
+                .op_mul => {
+                    const r = left_coerced.multiply(right_coerced);
+                    if (r.overflow) return self.fail(loc, "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
+                    return Value.fromInt(r.result);
+                },
+                .op_div => {
+                    const r = left_coerced.divideTruncating(right_coerced) catch return self.fail(loc, "division by zero", error.DivisionByZero);
+                    return Value.fromInt(r);
+                },
+                .op_mod => {
+                    const r = left_coerced.remainder(right_coerced) catch return self.fail(loc, "division by zero", error.DivisionByZero);
+                    return Value.fromInt(r);
                 },
                 else => unreachable,
-            };
-            if (!result_type.inRange(result)) return self.fail(loc, "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
-            return Value.fromInt(value.Int.fromNative(result_type, result));
+            }
         }
         // M5：字符串拼接 s + t（镜像 eval.evalAdd 的 string+string 分支）。
         if (op == .op_add and left == .string and right == .string) {
-            const left_str = left.string.bytes;
-            const right_str = right.string.bytes;
+            const left_str = left.string.bytes();
+            const right_str = right.string.bytes();
             var result = std.ArrayList(u8).empty;
             defer result.deinit(self.allocator);
             result.appendSlice(self.allocator, left_str) catch return error.OutOfMemory;
             result.appendSlice(self.allocator, right_str) catch return error.OutOfMemory;
             const owned = result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
             const s = self.allocator.create(value.Str) catch return error.OutOfMemory;
-            s.* = .{ .bytes = owned, .allocator = self.allocator };
+            s.* = value.Str.fromOwnedBytes(self.allocator, owned);
             return Value{ .string = s };
         }
         return self.doArithFloat(op, left, right, loc);
     }
 
     /// 浮点参与的算术（int↔float 混合按 evalBinary 提升为 float）。
+    /// 全软件：Int→Float 用 Float.fromInt（不丢精度），运算用 Float 软件 API。
     fn doArithFloat(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         if ((left.isFloat() or left.isInteger()) and (right.isFloat() or right.isInteger())) {
-            const lf: f128 = if (left.isFloat()) left.asFloat().asF128() else intToFloat(left.asInt());
-            const rf: f128 = if (right.isFloat()) right.asFloat().asF128() else intToFloat(right.asInt());
             // 选择更大的浮点类型，如果都是浮点数；否则使用浮点数的类型
             const tag: value.FloatType = if (left.isFloat() and right.isFloat()) blk: {
                 const lt = left.asFloat().type;
                 const rt = right.asFloat().type;
                 break :blk if (@intFromEnum(lt) > @intFromEnum(rt)) lt else rt;
             } else if (left.isFloat()) left.asFloat().type else right.asFloat().type;
-            const result: f128 = switch (op) {
-                .op_add => lf + rf,
-                .op_sub => lf - rf,
-                .op_mul => lf * rf,
-                .op_div => lf / rf,
-                .op_mod => @rem(lf, rf),
+            // 两端统一到 tag 精度
+            const lf: value.Float = if (left.isFloat()) left.asFloat().toFloatType(tag) else value.Float.fromInt(tag, left.asInt());
+            const rf: value.Float = if (right.isFloat()) right.asFloat().toFloatType(tag) else value.Float.fromInt(tag, right.asInt());
+            const result: value.Float = switch (op) {
+                .op_add => lf.add(rf),
+                .op_sub => lf.subtract(rf),
+                .op_mul => lf.multiply(rf),
+                .op_div => lf.divide(rf),
+                .op_mod => blk: {
+                    if (rf.isZero()) return self.fail(loc, "float modulo by zero", error.DivisionByZero);
+                    // a % b = a - b * trunc(a/b)，trunc 通过软件 i128 中转（不丢类型转换精度）
+                    // 截断溢出（商超出 i128 范围）按规范视为 narrowing 失败，panic 而非静默返回零
+                    const q = lf.divide(rf);
+                    const q_int = q.toInt(.i128) catch return self.fail(loc, "float modulo overflow", error.ArithmeticOverflow);
+                    const q_float = value.Float.fromInt(tag, q_int);
+                    break :blk lf.subtract(rf.multiply(q_float));
+                },
                 else => return self.fail(loc, "bitwise op requires integer operands", error.TypeMismatch),
             };
-            return Value.fromFloat(value.Float.fromNative(.f128, result).toFloatType(tag));
+            return Value.fromFloat(result);
         }
         return self.fail(loc, "arithmetic requires numeric operands", error.TypeMismatch);
     }
 
-    fn intToFloat(iv: value.Int) f128 {
-        return if (iv.type.isSigned()) @floatFromInt(iv.toNative(i128)) else @floatFromInt(iv.toNative(u128));
-    }
-
-    /// 比较：== != < > <= >=。返回 bool。
+    /// 比较：== != < > <= >=。返回 bool。全软件：Int.compare / Float.compare，不依赖 128 位原生类型。
     fn doCompare(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         // == / !=：数值按 promoteIntTypes 后**按值**比较（忽略 type_tag），镜像 eval evalBinary .eq/.not_eq。
         // 关键：隐式定型（OP_COERCE）后操作数 tag 可能不同（如 i32 形参 vs i8 字面量），
@@ -2597,14 +2637,19 @@ pub const VM = struct {
                 const left_int = left.asInt();
                 const right_int = right.asInt();
                 const rt = value.promoteIntTypes(left_int.type, right_int.type);
-                const lv: i128 = if (rt.isSigned()) left_int.toNative(i128) else @intCast(left_int.toNative(u128));
-                const rv: i128 = if (rt.isSigned()) right_int.toNative(i128) else @intCast(right_int.toNative(u128));
-                const eq = lv == rv;
+                const lc = left_int.coerceTo(rt) orelse return self.fail(loc, "comparison: operand out of range", error.ArithmeticOverflow);
+                const rc = right_int.coerceTo(rt) orelse return self.fail(loc, "comparison: operand out of range", error.ArithmeticOverflow);
+                const eq = lc.compare(rc) == .eq;
                 const result = if (op == .op_eq) eq else !eq;
                 return Value.fromBool(result);
             }
             if (left.isFloat() and right.isFloat()) {
-                const eq = left.asFloat().asF128() == right.asFloat().asF128();
+                // IEEE ==：+0 == -0 为 true；NaN != NaN。Float.compare 的 totalOrder 对 ±0 返回 .eq，
+                // 但对同符号同尾数 NaN 也返回 .eq。项目约束 NaN 不应产生，此处用 compare 足够。
+                const lf = left.asFloat();
+                const rf = right.asFloat();
+                const tag: value.FloatType = if (@intFromEnum(lf.type) > @intFromEnum(rf.type)) lf.type else rf.type;
+                const eq = lf.toFloatType(tag).compare(rf.toFloatType(tag)) == .eq;
                 const result = if (op == .op_eq) eq else !eq;
                 return Value.fromBool(result);
             }
@@ -2616,32 +2661,40 @@ pub const VM = struct {
             const left_int = left.asInt();
             const right_int = right.asInt();
             const result_type = value.promoteIntTypes(left_int.type, right_int.type);
-            const lv: i128 = if (result_type.isSigned()) left_int.toNative(i128) else @intCast(left_int.toNative(u128));
-            const rv: i128 = if (result_type.isSigned()) right_int.toNative(i128) else @intCast(right_int.toNative(u128));
+            const lc = left_int.coerceTo(result_type) orelse return self.fail(loc, "comparison: operand out of range", error.ArithmeticOverflow);
+            const rc = right_int.coerceTo(result_type) orelse return self.fail(loc, "comparison: operand out of range", error.ArithmeticOverflow);
+            const ord = lc.compare(rc);
             const result = switch (op) {
-                .op_lt => lv < rv,
-                .op_gt => lv > rv,
-                .op_le => lv <= rv,
-                .op_ge => lv >= rv,
+                .op_lt => ord == .lt,
+                .op_gt => ord == .gt,
+                .op_le => ord != .gt,
+                .op_ge => ord != .lt,
                 else => unreachable,
             };
             return Value.fromBool(result);
         }
         if ((left.isFloat() or left.isInteger()) and (right.isFloat() or right.isInteger())) {
-            const lf: f128 = if (left.isFloat()) left.asFloat().asF128() else intToFloat(left.asInt());
-            const rf: f128 = if (right.isFloat()) right.asFloat().asF128() else intToFloat(right.asInt());
+            // 混合 int/float：提升为 float 比较
+            const tag: value.FloatType = if (left.isFloat() and right.isFloat()) blk: {
+                const lt = left.asFloat().type;
+                const rt = right.asFloat().type;
+                break :blk if (@intFromEnum(lt) > @intFromEnum(rt)) lt else rt;
+            } else if (left.isFloat()) left.asFloat().type else right.asFloat().type;
+            const lf: value.Float = if (left.isFloat()) left.asFloat().toFloatType(tag) else value.Float.fromInt(tag, left.asInt());
+            const rf: value.Float = if (right.isFloat()) right.asFloat().toFloatType(tag) else value.Float.fromInt(tag, right.asInt());
+            const ord = lf.compare(rf);
             const result = switch (op) {
-                .op_lt => lf < rf,
-                .op_gt => lf > rf,
-                .op_le => lf <= rf,
-                .op_ge => lf >= rf,
+                .op_lt => ord == .lt,
+                .op_gt => ord == .gt,
+                .op_le => ord != .gt,
+                .op_ge => ord != .lt,
                 else => unreachable,
             };
             return Value.fromBool(result);
         }
         // M5：字符串字典序比较（镜像 eval evalLt/Gt/Le/Ge 的 string 分支，std.mem.order）。
         if (left == .string and right == .string) {
-            const ord = std.mem.order(u8, left.string.bytes, right.string.bytes);
+            const ord = std.mem.order(u8, left.string.bytes(), right.string.bytes());
             const result = switch (op) {
                 .op_lt => ord == .lt,
                 .op_gt => ord == .gt,
@@ -2670,17 +2723,15 @@ pub const VM = struct {
     fn doNegate(self: *VM, v: Value, loc: ast.SourceLocation) VMError!Value {
         if (v.isInteger()) {
             const int_val = v.asInt();
-            const t = int_val.type;
-            const neg: i128 = -int_val.toNative(i128);
-            const result: u128 = @bitCast(neg);
-            if (!t.inRange(result)) return self.fail(loc, "arithmetic overflow: integer negation out of range", error.ArithmeticOverflow);
-            return Value.fromInt(value.Int.fromNative(t, result));
+            const result = int_val.negate();
+            // minInt 取负回绕：输入负但结果仍负 → 溢出（与原 inRange 检查一致）
+            if (int_val.type.isSigned() and int_val.isNegative() and result.isNegative()) {
+                return self.fail(loc, "arithmetic overflow: integer negation out of range", error.ArithmeticOverflow);
+            }
+            return Value.fromInt(result);
         }
         if (v.isFloat()) {
-            const float_val = v.asFloat();
-            const t = float_val.type;
-            const result: f128 = -float_val.asF128();
-            return Value.fromFloat(value.Float.fromNative(.f128, result).toFloatType(t));
+            return Value.fromFloat(v.asFloat().negate());
         }
         return self.fail(loc, "'-' requires numeric operand", error.TypeMismatch);
     }

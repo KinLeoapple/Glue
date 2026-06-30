@@ -28,22 +28,18 @@ pub const CastError = error{
 };
 
 /// 整数 → 目标类型（int 或 float）。镜像 eval.castInteger。
+/// 全软件：int→int 用 coerceTo（字节级范围检查）；int→float 用 Float.fromInt（不丢精度）。
 fn castInteger(allocator: std.mem.Allocator, val: Int, type_name: []const u8) CastError!Value {
     _ = allocator;
-    const u128_val = val.toNative(u128);
 
-    // 整数目标：范围检查 + 截取构造
+    // 整数目标：字节级类型转换，溢出返回 null
     if (IntType.fromName(type_name)) |target| {
-        if (!target.inRange(u128_val)) return error.CastOverflow;
-        return Value.fromInt(Int.fromNative(target, u128_val));
+        return Value.fromInt(val.coerceTo(target) orelse return error.CastOverflow);
     }
 
-    // 浮点目标：i128 → f128 → toFloatType（正确精度转换，含 f8）
+    // 浮点目标：软件 Int→Float 转换（全精度，含 f8）
     if (FloatType.fromName(type_name)) |target| {
-        const signed_val: i128 = if (val.type.isSigned()) val.toNative(i128) else @bitCast(u128_val);
-        const f128_val: f128 = @floatFromInt(signed_val);
-        const f128_float = Float.fromNative(.f128, f128_val);
-        return Value.fromFloat(f128_float.toFloatType(target));
+        return Value.fromFloat(Float.fromInt(target, val));
     }
 
     return error.CastTypeMismatch;

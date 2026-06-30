@@ -11,7 +11,7 @@ const value = @import("value");
 const Value = value.Value;
 const Int = value.Int;
 
-pub const MethodError = error{ OutOfMemory, NoSuchMethod, TypeMismatch, WrongArity, ChannelClosed };
+pub const MethodError = error{ OutOfMemory, NoSuchMethod, TypeMismatch, WrongArity, ChannelClosed, ArithmeticOverflow };
 
 /// 结构相等（contains 用）。复用 value.equals（深比较基础/数组/记录）。
 fn structEquals(a: Value, b: Value) bool {
@@ -28,11 +28,20 @@ fn retainOwned(allocator: std.mem.Allocator, v: Value) MethodError!Value {
 /// 未知方法 → NoSuchMethod；类型不符 → TypeMismatch；参数数错 → WrongArity。
 pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u8, args: []const Value) MethodError!Value {
     // len()：string → Unicode 标量数；array → 元素数。
+    // usize/u64 → i32 为 narrowing（大转小），必须范围检查；超范围返回 ArithmeticOverflow。
     if (std.mem.eql(u8, method, "len")) {
         if (args.len != 0) return error.WrongArity;
         return switch (receiver) {
-            .string => Value.fromInt(Int.fromNative(.i32, @as(i32, @intCast(utf8Len(receiver.string.bytes))))),
-            .array => Value.fromInt(Int.fromNative(.i32, @as(i32, @intCast(receiver.array.elements.len)))),
+            .string => blk: {
+                const n = utf8Len(receiver.string.bytes());
+                const len_i32 = std.math.cast(i32, n) orelse return error.ArithmeticOverflow;
+                break :blk Value.fromInt(Int.fromNative(.i32, len_i32));
+            },
+            .array => blk: {
+                const n = receiver.array.elements.len;
+                const len_i32 = std.math.cast(i32, n) orelse return error.ArithmeticOverflow;
+                break :blk Value.fromInt(Int.fromNative(.i32, len_i32));
+            },
             else => error.TypeMismatch,
         };
     }
@@ -40,7 +49,7 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
     if (std.mem.eql(u8, method, "is_empty")) {
         if (args.len != 0) return error.WrongArity;
         return switch (receiver) {
-            .string => Value.fromBool(receiver.string.bytes.len == 0),
+            .string => Value.fromBool(receiver.string.bytes().len == 0),
             .array => Value.fromBool(receiver.array.elements.len == 0),
             else => error.TypeMismatch,
         };
@@ -174,10 +183,107 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
 }
 
 /// UTF-8 字符串的 Unicode 标量值（码点）个数；非法 UTF-8 退化为字节数。
-fn utf8Len(s: []const u8) u128 {
+fn utf8Len(s: []const u8) u64 {
     const view = std.unicode.Utf8View.init(s) catch return @intCast(s.len);
-    var count: u128 = 0;
+    var count: u64 = 0;
     var it = view.iterator();
     while (it.nextCodepoint() != null) count += 1;
     return count;
+}
+
+// ============================================================
+// 测试：支撑 §2.15 类型转换规范 + F6 len() narrowing 范围检查
+// ============================================================
+
+const testing = std.testing;
+
+/// 释放 string Value（绕过 Value.release 对 SSO 字符串的 rc 处理缺陷）。
+/// SSO 字符串 rc 字段编码了 SSO 标志（bit31）+ 长度（bits 0-4），
+/// Value.release 的 `rc > 1` 检查对 SSO 字符串恒为 true，导致永不释放。
+fn freeStringVal(allocator: std.mem.Allocator, v: Value) void {
+    v.string.deinit(allocator);
+    allocator.destroy(v.string);
+}
+
+test "len() string ASCII returns codepoint count" {
+    const allocator = testing.allocator;
+    const s = try Value.fromStringBytes(allocator, "hello");
+    defer freeStringVal(allocator, s);
+    const result = try dispatch(allocator, s, "len", &.{});
+    try testing.expectEqual(@as(i32, 5), result.asInt().toNative(i32));
+}
+
+test "len() string multi-byte UTF-8 returns codepoint count not byte count" {
+    const allocator = testing.allocator;
+    // "你好世界" = 4 个汉字，每个 3 字节 UTF-8 → 12 字节，但 len() 应返回 4
+    const s = try Value.fromStringBytes(allocator, "你好世界");
+    defer freeStringVal(allocator, s);
+    const result = try dispatch(allocator, s, "len", &.{});
+    try testing.expectEqual(@as(i32, 4), result.asInt().toNative(i32));
+}
+
+test "len() string with emoji (4-byte UTF-8)" {
+    const allocator = testing.allocator;
+    // "a😀b" = 3 个码点（'a', U+1F600, 'b'），字节数 = 1+4+1 = 6
+    const s = try Value.fromStringBytes(allocator, "a😀b");
+    defer freeStringVal(allocator, s);
+    const result = try dispatch(allocator, s, "len", &.{});
+    try testing.expectEqual(@as(i32, 3), result.asInt().toNative(i32));
+}
+
+test "len() empty string returns 0" {
+    const allocator = testing.allocator;
+    const s = try Value.fromStringBytes(allocator, "");
+    defer freeStringVal(allocator, s);
+    const result = try dispatch(allocator, s, "len", &.{});
+    try testing.expectEqual(@as(i32, 0), result.asInt().toNative(i32));
+}
+
+test "len() array returns element count" {
+    const allocator = testing.allocator;
+    // 注意：makeArray 接管 elems 所有权，deinit 时会 free(elements)。
+    // 所以不要 defer allocator.free(elems)——那会导致 double-free。
+    const elems = try allocator.alloc(Value, 3);
+    elems[0] = Value.fromInt(Int.fromNative(.i32, @as(i32, 10)));
+    elems[1] = Value.fromInt(Int.fromNative(.i32, @as(i32, 20)));
+    elems[2] = Value.fromInt(Int.fromNative(.i32, @as(i32, 30)));
+    const arr = try Value.makeArray(allocator, elems, null);
+    defer arr.release(allocator);
+    const result = try dispatch(allocator, arr, "len", &.{});
+    try testing.expectEqual(@as(i32, 3), result.asInt().toNative(i32));
+}
+
+test "len() empty array returns 0" {
+    const allocator = testing.allocator;
+    const empty_elems = try allocator.alloc(Value, 0);
+    const arr = try Value.makeArray(allocator, empty_elems, null);
+    // deinit 不 free 空 slice（len==0），需手动 free（LIFO：先 release 后 free）
+    defer allocator.free(empty_elems);
+    defer arr.release(allocator);
+    const result = try dispatch(allocator, arr, "len", &.{});
+    try testing.expectEqual(@as(i32, 0), result.asInt().toNative(i32));
+}
+
+test "len() wrong type returns TypeMismatch" {
+    const allocator = testing.allocator;
+    const v = Value.fromInt(Int.fromNative(.i32, @as(i32, 42)));
+    try testing.expectError(error.TypeMismatch, dispatch(allocator, v, "len", &.{}));
+}
+
+test "len() with args returns WrongArity" {
+    const allocator = testing.allocator;
+    const s = try Value.fromStringBytes(allocator, "hi");
+    defer freeStringVal(allocator, s);
+    const arg = Value.fromInt(Int.fromNative(.i32, @as(i32, 1)));
+    try testing.expectError(error.WrongArity, dispatch(allocator, s, "len", &.{arg}));
+}
+
+test "len() result type is i32 (narrowing target)" {
+    // F6: 验证 len() 返回 i32 类型（usize→i32 narrowing 的目标类型）
+    const allocator = testing.allocator;
+    const s = try Value.fromStringBytes(allocator, "test");
+    defer freeStringVal(allocator, s);
+    const result = try dispatch(allocator, s, "len", &.{});
+    try testing.expect(result == .int);
+    try testing.expectEqual(value.IntType.i32, result.asInt().type);
 }

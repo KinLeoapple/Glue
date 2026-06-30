@@ -1243,7 +1243,7 @@ var x = 3       // ✗ duplicate definition: 'x' is already defined in this scop
 |------|------|
 | I/O | `println`, `print`, `eprintln`, `eprint`, `scanln`, `scan` |
 | 工具 | `Panic`, `eq`, `type` |
-| 类型转换 | `str`, `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`, `f32`, `f64` |
+| 类型转换 | `str`, `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`, `f8`, `f16`, `f32`, `f64` |
 | 错误处理 | `Error`, `Ok` |
 
 ```glue

@@ -1,19 +1,20 @@
 //! Glue 语言运行时值表示 - 新统一 Value（union(enum) 24B）
 //!
 //! 根本动机：规避 LLVM 在 Linux 上 i128/u128/f128 的 codegen bug。
-//! - 数值用 [N]u8 软件实现（Int/Float 内联在 Value union，无装箱）
+//! - 数值用 [16]u8 定长缓冲软件实现（Int/Float 内联在 Value union，无装箱）；
+//!   有效字节数由 type.byteLength() 决定，已移除冗余的 ByteArray union tag。
 //! - 复合类型每类型独立 struct（首字段 rc:u32），Value 持 *T 指针
 //! - 旧 BoxedValue 统一装箱头部废弃，每 struct 自管 rc + deinit
 //!
-//! 物理布局：union(enum) 24B 定长，最大 payload = Int/Float = 18B，
+//! 物理布局：union(enum) 24B 定长，最大 payload = Int/Float = 17B，
 //! 对齐 8 → 24B，tag 落入 padding。平凡可拷贝（POD + 指针）。
 //!
 //! 文件结构：
-//! - byte_array.zig: ByteArray union（b1/b2/b4/b8/b16）
+//! - byte_array.zig: 字节 IO 原语（loadWord/storeWord/loadU128/storeU128）+ 保留的 ByteArray union
 //! - int.zig:   Type 枚举 + Int 结构体（含加减乘除/位运算/位移/取负/inRange/fromName）
 //! - float.zig: Type 枚举 + Float 结构体（f8/f16/f32/f64/f128 全软件 IEEE 754）
 //! - char.zig:  Char 结构体（[4]u8 UTF-32 码点存储）
-//! - str.zig:   Str 结构体（[]u8 UTF-8 + rc + allocator 管理）
+//! - str.zig:   Str 结构体（[]u8 UTF-8 + rc 管理）
 //! - composite.zig:    ArrayValue/RecordValue/AdtValue/AdtField/NewtypeValue/Cell/Range
 //! - callable.zig:     VmClosure/PartialApplication/Builtin/TraitValue/LazyValue
 //! - control.zig:      ErrorValue/ThrowValue
@@ -38,6 +39,9 @@ pub const float = @import("float.zig");
 pub const FloatType = float.Type;
 pub const FloatUnpacked = float.Unpacked;
 pub const Float = float.Float;
+
+pub const wide = @import("wide.zig");
+pub const U128 = wide.U128;
 
 pub const char_mod = @import("char.zig");
 pub const Char = char_mod.Char;
@@ -330,50 +334,34 @@ pub const Value = union(enum) {
     // ============================================================
 
     /// retain：增加引用计数，返回 self
-    /// 内联变体原样返回；装箱变体 ptr.rc += 1；runtime 类型（atomic/channel/sender/receiver）调对应 ref()
+    /// 内联变体原样返回；rc 自管的装箱变体 ptr.rc += 1；runtime 类型（atomic/channel/sender/receiver）调对应 ref()
+    /// 17 个 rc 自管变体用 inline prong 去重；4 个 runtime 变体同法合并。
     pub inline fn retain(self: Value) Value {
         switch (self) {
-            .null_val, .unit, .boolean, .char, .int, .float => {},
-            .string => |p| p.rc += 1,
-            .array => |p| p.rc += 1,
-            .record => |p| p.rc += 1,
-            .adt => |p| p.rc += 1,
-            .newtype => |p| p.rc += 1,
-            .cell => |p| p.rc += 1,
-            .range => |p| p.rc += 1,
-            .vm_closure => |p| p.rc += 1,
-            .partial => |p| p.rc += 1,
-            .builtin => |p| p.rc += 1,
-            .error_val => |p| p.rc += 1,
-            .throw_val => |p| p.rc += 1,
-            .array_iterator => |p| p.rc += 1,
-            .string_iterator => |p| p.rc += 1,
-            .range_iterator => |p| p.rc += 1,
-            .atomic_val => |p| p.ref(),
-            .spawn_val => {},
-            .channel_val => |p| p.ref(),
-            .sender_val => |p| p.ref(),
-            .receiver_val => |p| p.ref(),
-            .trait_value => |p| p.rc += 1,
-            .lazy_val => |p| p.rc += 1,
+            .null_val, .unit, .boolean, .char, .int, .float, .spawn_val => {},
+            inline .string, .array, .record, .adt, .newtype, .cell, .range,
+                .vm_closure, .partial, .builtin, .error_val, .throw_val,
+                .array_iterator, .string_iterator, .range_iterator,
+                .trait_value, .lazy_val => |p| {
+                p.rc += 1;
+            },
+            inline .atomic_val, .channel_val, .sender_val, .receiver_val => |p| {
+                p.ref();
+            },
         }
         return self;
     }
 
     /// release：减少引用计数，归零则 deinit + destroy
-    /// 内联变体 noop；装箱变体 if rc>1 rc-=1 else { ptr.deinit(alloc); alloc.destroy(ptr) }
+    /// 内联变体 noop；rc 自管变体 if rc>1 rc-=1 else { ptr.deinit(alloc); alloc.destroy(ptr) }；
+    /// runtime 变体 if unref() destroy。17 + 4 个分支用 inline prong 各合并为 1 个。
     pub fn release(self: Value, allocator: std.mem.Allocator) void {
         switch (self) {
-            .null_val, .unit, .boolean, .char, .int, .float => {},
-            .string => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit();
-                    allocator.destroy(p);
-                }
-            },
-            .array => |p| {
+            .null_val, .unit, .boolean, .char, .int, .float, .spawn_val => {},
+            inline .string, .array, .record, .adt, .newtype, .cell, .range,
+                .vm_closure, .partial, .builtin, .error_val, .throw_val,
+                .array_iterator, .string_iterator, .range_iterator,
+                .trait_value, .lazy_val => |p| {
                 if (p.rc > 1) {
                     p.rc -= 1;
                 } else {
@@ -381,138 +369,8 @@ pub const Value = union(enum) {
                     allocator.destroy(p);
                 }
             },
-            .record => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .adt => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .newtype => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .cell => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .range => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .vm_closure => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .partial => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .builtin => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .error_val => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .throw_val => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .array_iterator => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .string_iterator => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .range_iterator => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .atomic_val => |p| {
+            inline .atomic_val, .channel_val, .sender_val, .receiver_val => |p| {
                 if (p.unref()) allocator.destroy(p);
-            },
-            .spawn_val => {},
-            .channel_val => |p| {
-                if (p.unref()) allocator.destroy(p);
-            },
-            .sender_val => |p| {
-                if (p.unref()) allocator.destroy(p);
-            },
-            .receiver_val => |p| {
-                if (p.unref()) allocator.destroy(p);
-            },
-            .trait_value => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            .lazy_val => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
             },
         }
     }
@@ -527,27 +385,26 @@ pub const Value = union(enum) {
             .unit => try buf.appendSlice(allocator, "()"),
             .boolean => try buf.appendSlice(allocator, if (self.boolean) "true" else "false"),
             .char => {
-                const temp = try std.fmt.allocPrint(allocator, "'{u}'", .{self.char.toNative()});
-                defer allocator.free(temp);
-                try buf.appendSlice(allocator, temp);
+                // 栈缓冲打印：u21 码点格式化最多 ~5 字节，加两引号 ≤ 7，16 字节足够。
+                var temp: [16]u8 = undefined;
+                const s = std.fmt.bufPrint(&temp, "'{u}'", .{self.char.toNative()}) catch unreachable;
+                try buf.appendSlice(allocator, s);
             },
             .int => {
-                // 退化：用 toNative(i128) + {d}（对超出 i128 范围的 u128 会 truncate，后续完善）
-                const iv = self.int.toNative(i128);
-                const temp = try std.fmt.allocPrint(allocator, "{d}", .{iv});
-                defer allocator.free(temp);
-                try buf.appendSlice(allocator, temp);
+                // 软件十进制格式化（不依赖 i128/u128，不丢精度）
+                var temp: [64]u8 = undefined;
+                const s = self.int.formatDecimal(&temp);
+                try buf.appendSlice(allocator, s);
             },
             .float => {
-                // 退化：用 toNative(f64) + {d}（损失精度，后续软件转十进制）
-                const fv = self.float.toNative(f64);
-                const temp = try std.fmt.allocPrint(allocator, "{d}", .{fv});
-                defer allocator.free(temp);
-                try buf.appendSlice(allocator, temp);
+                // 软件十进制格式化（f8/f16/f32/f64 无损宽化 f64；f128 软件分解，不丢精度）
+                var temp: [80]u8 = undefined;
+                const s = self.float.formatDecimal(&temp);
+                try buf.appendSlice(allocator, s);
             },
             .string => {
                 try buf.append(allocator, '"');
-                try buf.appendSlice(allocator, self.string.bytes);
+                try buf.appendSlice(allocator, self.string.bytes());
                 try buf.append(allocator, '"');
             },
             .array => {
@@ -600,12 +457,15 @@ pub const Value = union(enum) {
                 try buf.append(allocator, ')');
             },
             .range => {
+                // 软件十进制格式化（不依赖 i128/u128，不丢精度）
                 const r = self.range;
-                const start_iv = r.start.toNative(i128);
-                const end_iv = r.end.toNative(i128);
-                const temp = try std.fmt.allocPrint(allocator, "{d}..{s}{d}", .{ start_iv, if (r.inclusive) "=" else "", end_iv });
-                defer allocator.free(temp);
-                try buf.appendSlice(allocator, temp);
+                var start_buf: [41]u8 = undefined;
+                var end_buf: [41]u8 = undefined;
+                const start_str = r.start.formatDecimal(&start_buf);
+                const end_str = r.end.formatDecimal(&end_buf);
+                var temp: [128]u8 = undefined;
+                const s = std.fmt.bufPrint(&temp, "{s}..{s}{s}", .{ start_str, if (r.inclusive) "=" else "", end_str }) catch unreachable;
+                try buf.appendSlice(allocator, s);
             },
             .vm_closure => try buf.appendSlice(allocator, "<closure>"),
             .partial => try buf.appendSlice(allocator, "<partial>"),
@@ -656,7 +516,7 @@ pub fn equals(a: Value, b: Value) bool {
         },
         .boolean => a.asBool() == b.asBool(),
         .char => a.asChar().equals(b.asChar()),
-        .string => std.mem.eql(u8, a.string.bytes, b.string.bytes),
+        .string => std.mem.eql(u8, a.string.bytes(), b.string.bytes()),
         .null_val, .unit => true,
         .range => {
             const ar = a.range;
@@ -747,6 +607,34 @@ pub fn inferIntType(val: u128) IntType {
         if (signed_val >= std.math.minInt(i32)) return .i32;
         if (signed_val >= std.math.minInt(i64)) return .i64;
         return .i128;
+    }
+}
+
+/// 字节级整数类型推断（不依赖 u128/i128，全软件 U128 比较）。
+/// buf: 16 字节小端无符号幅值；negative: 是否为负数。
+/// 正数按 i8/u8/i16/.../u128 升序选最小容纳类型；负数按 i8/i16/i32/i64/i128。
+pub fn inferIntTypeBytes(buf: *const [16]u8, negative: bool) IntType {
+    const val = U128.load(buf);
+    if (negative) {
+        // 负数：幅值 <= 2^(n-1) 选 n 位有符号类型
+        if (val.compare(U128.fromU64(1 << 7)) != .gt) return .i8;
+        if (val.compare(U128.fromU64(1 << 15)) != .gt) return .i16;
+        if (val.compare(U128.fromU64(1 << 31)) != .gt) return .i32;
+        if (val.compare(U128.fromU64(1 << 63)) != .gt) return .i64;
+        return .i128;
+    } else {
+        if (val.compare(U128.fromU64(std.math.maxInt(i8))) != .gt) return .i8;
+        if (val.compare(U128.fromU64(std.math.maxInt(u8))) != .gt) return .u8;
+        if (val.compare(U128.fromU64(std.math.maxInt(i16))) != .gt) return .i16;
+        if (val.compare(U128.fromU64(std.math.maxInt(u16))) != .gt) return .u16;
+        if (val.compare(U128.fromU64(std.math.maxInt(i32))) != .gt) return .i32;
+        if (val.compare(U128.fromU64(std.math.maxInt(u32))) != .gt) return .u32;
+        if (val.compare(U128.fromU64(std.math.maxInt(i64))) != .gt) return .i64;
+        if (val.compare(U128.fromU64(std.math.maxInt(u64))) != .gt) return .u64;
+        // i128 max = 2^127 - 1 = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+        const i128_max = U128.fromU64Pair(0x7FFFFFFFFFFFFFFF, ~@as(u64, 0));
+        if (val.compare(i128_max) != .gt) return .i128;
+        return .u128;
     }
 }
 

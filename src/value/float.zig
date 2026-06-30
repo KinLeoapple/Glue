@@ -13,17 +13,13 @@
 //! 命名规范：方法名全部使用完整单词，不使用缩写。
 
 const std = @import("std");
-const builtin = @import("builtin");
-const ByteArray = @import("byte_array.zig").ByteArray;
+const byte_array = @import("byte_array.zig");
+const wide_lib = @import("wide.zig");
+const U128 = wide_lib.U128;
+const U256 = wide_lib.U256;
+const loadU128 = byte_array.loadU128;
+const storeU128 = byte_array.storeU128;
 const int = @import("int.zig");
-
-// x86_64 汇编 extern 声明（符号定义在 arch/x86_64/float.S；大写 S 走 C 预处理器）
-// 状态码: 0=finite, 1=NaN, 2=Inf
-extern fn glue_cmp_float(a: [*]const u8, b: [*]const u8, len: u8) i8;
-extern fn glue_add_float(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) u8;
-extern fn glue_sub_float(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) u8;
-extern fn glue_mul_float(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) u8;
-extern fn glue_div_float(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) u8;
 
 /// 浮点类型枚举：5 个变体（f8 采用 e5m2 编码，与 f16 共享 5 位指数和 bias=15，有 inf/NaN 标准 IEEE 754 语义）
 pub const Type = enum {
@@ -103,7 +99,7 @@ pub const Type = enum {
 pub const Unpacked = struct {
     sign: u1, // 0=正，1=负
     exp: u32, // 原始指数字段值（0 = 零/次正规，max = inf/nan）
-    mantissa: u128, // 尾数（不含隐含位；正规数调用方需自行补 1）
+    mantissa: U128, // 尾数（不含隐含位；正规数调用方需自行补 1）
     is_nan: bool,
     is_infinite: bool,
 };
@@ -118,7 +114,7 @@ pub const Unpacked = struct {
 const Decomposed = struct {
     sign: u1,
     exp: i32, // unbiased
-    mantissa: u128,
+    mantissa: U128,
     is_nan: bool,
     is_infinite: bool,
     is_zero: bool,
@@ -129,12 +125,12 @@ const Decomposed = struct {
     /// 乘除法在运算前调用，保证乘积 implicit 落在 2p+6、compose 无需左移（sticky 不被移走）。
     pub fn normalize(self: *Decomposed, p: u32) void {
         if (self.is_zero or self.is_nan or self.is_infinite) return;
-        const implicit_bit: u128 = @as(u128, 1) << @intCast(p + 3);
-        if (self.mantissa == 0 or self.mantissa >= implicit_bit) return;
-        const clz: u32 = @intCast(@clz(self.mantissa));
+        const implicit_bit = U128.fromU64(1).shiftLeft(@intCast(p + 3));
+        if (self.mantissa.isZero() or self.mantissa.compare(implicit_bit) != .lt) return;
+        const clz: u32 = self.mantissa.clz();
         const target_clz: u32 = 128 - (p + 4);
         const sh: u32 = clz - target_clz;
-        self.mantissa <<= @intCast(sh);
+        self.mantissa = self.mantissa.shiftLeft(@intCast(sh));
         self.exp -= @as(i32, @intCast(sh));
     }
 };
@@ -142,18 +138,21 @@ const Decomposed = struct {
 /// 单一 Float 结构体：type + bytes + 运算方法
 pub const Float = struct {
     type: Type,
-    bytes: ByteArray,
+    bytes: [16]u8,
+
+    /// 有效字节切片（只读）。长度由 type.byteLength() 决定。
+    pub inline fn slice(self: *const Float) []const u8 {
+        return self.bytes[0..self.type.byteLength()];
+    }
+
+    /// 有效字节切片（可变）
+    pub inline fn sliceMutable(self: *Float) []u8 {
+        return self.bytes[0..self.type.byteLength()];
+    }
 
     /// +0.0
     pub fn zero(t: Type) Float {
-        return .{ .type = t, .bytes = switch (t.byteLength()) {
-            1 => .{ .b1 = [_]u8{0} },
-            2 => .{ .b2 = [_]u8{0} ** 2 },
-            4 => .{ .b4 = [_]u8{0} ** 4 },
-            8 => .{ .b8 = [_]u8{0} ** 8 },
-            16 => .{ .b16 = [_]u8{0} ** 16 },
-            else => unreachable,
-        } };
+        return .{ .type = t, .bytes = [_]u8{0} ** 16 };
     }
 
     /// 从原生浮点构造（内存拷贝，不触发原生算术 codegen）
@@ -161,21 +160,16 @@ pub const Float = struct {
     pub fn fromNative(t: Type, v: anytype) Float {
         const nbytes = t.byteLength();
         const src: [*]const u8 = @ptrCast(&v);
-        return .{ .type = t, .bytes = switch (nbytes) {
-            1 => .{ .b1 = src[0..1].* },
-            2 => .{ .b2 = src[0..2].* },
-            4 => .{ .b4 = src[0..4].* },
-            8 => .{ .b8 = src[0..8].* },
-            16 => .{ .b16 = src[0..16].* },
-            else => unreachable,
-        } };
+        var result: Float = .{ .type = t, .bytes = [_]u8{0} ** 16 };
+        @memcpy(result.bytes[0..nbytes], src[0..nbytes]);
+        return result;
     }
 
     /// 转为原生浮点（内存拷贝）
     pub fn toNative(self: Float, comptime T: type) T {
         var result: T = undefined;
         const dst: [*]u8 = @ptrCast(&result);
-        const src = self.bytes.slice();
+        const src = self.slice();
         @memcpy(dst[0..src.len], src);
         return result;
     }
@@ -188,7 +182,7 @@ pub const Float = struct {
 
     /// 符号位：true = 负数/负零
     pub fn isNegative(self: Float) bool {
-        const a = self.bytes.slice();
+        const a = self.slice();
         return (a[a.len - 1] & 0x80) != 0;
     }
 
@@ -207,19 +201,19 @@ pub const Float = struct {
     /// 是否为 0（指数 == 0 且尾数 == 0，含 +0 与 -0）
     pub fn isZero(self: Float) bool {
         const u = self.unpack();
-        return u.exp == 0 and u.mantissa == 0;
+        return u.exp == 0 and u.mantissa.isZero();
     }
 
     /// 是否为次正规数（指数 == 0 且尾数 != 0）
     pub fn isSubnormal(self: Float) bool {
         const u = self.unpack();
-        return u.exp == 0 and u.mantissa != 0;
+        return u.exp == 0 and (!u.mantissa.isZero());
     }
 
     /// 解包 IEEE 754 字段
     pub fn unpack(self: Float) Unpacked {
         const t = self.type;
-        const a = self.bytes.slice();
+        const a = self.slice();
         const exp_bits = t.exponentBits();
         const mant_bits = t.mantissaBits();
         const bias = t.bias();
@@ -227,25 +221,21 @@ pub const Float = struct {
         // 提取符号位（最高位）
         const sign: u1 = @intCast((a[a.len - 1] >> 7) & 1);
 
-        // 把整个字节序列读为 u128（小端）
-        var raw: u128 = 0;
-        var i: usize = 0;
-        while (i < a.len) : (i += 1) {
-            raw |= @as(u128, a[i]) << @intCast(i * 8);
-        }
+        // 把整个字节序列读为 U128（小端，不足 16 字节高位补 0）
+        const raw = loadU128(a);
 
         // 清除符号位
-        const sign_bit: u128 = @as(u128, 1) << @intCast(a.len * 8 - 1);
-        const without_sign = raw & ~sign_bit;
+        const sign_bit = U128.fromU64(1).shiftLeft(@intCast(a.len * 8 - 1));
+        const without_sign = raw.and_(sign_bit.bitwiseNot());
 
         // 提取指数（紧接符号位后的 exp_bits 位）
-        const mant_mask: u128 = (@as(u128, 1) << @intCast(mant_bits)) - 1;
-        const mantissa: u128 = without_sign & mant_mask;
-        const exp_field: u32 = @intCast(without_sign >> @intCast(mant_bits));
+        const mant_mask = U128.mask(@intCast(mant_bits));
+        const mantissa = without_sign.and_(mant_mask);
+        const exp_field: u32 = @intCast(without_sign.shiftRight(@intCast(mant_bits), false).lo);
 
         const max_exp: u32 = (@as(u32, 1) << @intCast(exp_bits)) - 1;
-        const is_nan = (exp_field == max_exp) and (mantissa != 0);
-        const is_infinite = (exp_field == max_exp) and (mantissa == 0);
+        const is_nan = (exp_field == max_exp) and (!mantissa.isZero());
+        const is_infinite = (exp_field == max_exp) and (mantissa.isZero());
 
         _ = bias;
         return .{
@@ -260,28 +250,14 @@ pub const Float = struct {
     /// IEEE 754 totalOrder 比较：
     /// -NaN < -Inf < ... < -0 < +0 < ... < +Inf < +NaN
     /// 同号 NaN：quiet NaN > signaling NaN（简化为按尾数比较）
-    /// 架构分派：x86_64 走汇编 glue_cmp_float，其他走 comparePortable
     pub fn compare(self: Float, other: Float) std.math.Order {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => switch (glue_cmp_float(
-                self.bytes.slice().ptr,
-                other.bytes.slice().ptr,
-                self.type.byteLength(),
-            )) {
-                -1 => .lt,
-                0 => .eq,
-                1 => .gt,
-                else => unreachable,
-            },
-            else => comparePortable(self, other),
-        };
+        return comparePortable(self, other);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
     fn comparePortable(self: Float, other: Float) std.math.Order {
-        const a = self.bytes.slice();
-        const b = other.bytes.slice();
+        const a = self.slice();
+        const b = other.slice();
 
         const ua = self.unpack();
         const ub = other.unpack();
@@ -291,8 +267,8 @@ pub const Float = struct {
             if (ua.is_nan and ub.is_nan) {
                 // 同为 NaN：负号在前；同号按尾数（quiet > signaling 简化为尾数大小）
                 if (ua.sign != ub.sign) return if (ua.sign == 1) .lt else .gt;
-                if (ua.mantissa < ub.mantissa) return .lt;
-                if (ua.mantissa > ub.mantissa) return .gt;
+                if (ua.mantissa.compare(ub.mantissa) == .lt) return .lt;
+                if (ua.mantissa.compare(ub.mantissa) == .gt) return .gt;
                 return .eq;
             }
             // 单边 NaN：非 NaN 视为有符号数，NaN 视为最大正数（若 sign=0）或最小负数（若 sign=1）
@@ -318,24 +294,17 @@ pub const Float = struct {
         // 同号非零：把字节序列当作无符号整数比较，但需翻转符号位
         // 对正数：翻转最高位（让 0x00... 变成 0x80...，正数越大整数越大）
         // 对负数：全部取反（让 0xFF... 变成 0x00...，负数越大整数越小）
-        var va: u128 = 0;
-        var vb: u128 = 0;
-        var i: usize = 0;
-        while (i < a.len) : (i += 1) {
-            va |= @as(u128, a[i]) << @intCast(i * 8);
-            vb |= @as(u128, b[i]) << @intCast(i * 8);
-        }
+        var va = loadU128(a);
+        var vb = loadU128(b);
         if (ua.sign == 1) {
-            va = ~va;
-            vb = ~vb;
+            va = va.bitwiseNot();
+            vb = vb.bitwiseNot();
         } else {
-            const sign_bit: u128 = @as(u128, 1) << @intCast(a.len * 8 - 1);
-            va ^= sign_bit;
-            vb ^= sign_bit;
+            const sign_bit = U128.fromU64(1).shiftLeft(@intCast(a.len * 8 - 1));
+            va = va.xor_(sign_bit);
+            vb = vb.xor_(sign_bit);
         }
-        if (va < vb) return .lt;
-        if (va > vb) return .gt;
-        return .eq;
+        return va.compare(vb);
     }
 
     // —— 加减法（S9 实现）——
@@ -348,52 +317,44 @@ pub const Float = struct {
         const bias: i32 = @intCast(t.bias());
 
         if (u.is_nan) {
-            return .{ .sign = u.sign, .exp = 0, .mantissa = 0, .is_nan = true, .is_infinite = false, .is_zero = false };
+            return .{ .sign = u.sign, .exp = 0, .mantissa = U128.zero(), .is_nan = true, .is_infinite = false, .is_zero = false };
         }
         if (u.is_infinite) {
-            return .{ .sign = u.sign, .exp = 0, .mantissa = 0, .is_nan = false, .is_infinite = true, .is_zero = false };
+            return .{ .sign = u.sign, .exp = 0, .mantissa = U128.zero(), .is_nan = false, .is_infinite = true, .is_zero = false };
         }
-        if (u.exp == 0 and u.mantissa == 0) {
-            return .{ .sign = u.sign, .exp = 0, .mantissa = 0, .is_nan = false, .is_infinite = false, .is_zero = true };
+        if (u.exp == 0 and u.mantissa.isZero()) {
+            return .{ .sign = u.sign, .exp = 0, .mantissa = U128.zero(), .is_nan = false, .is_infinite = false, .is_zero = true };
         }
 
-        var m: u128 = u.mantissa;
+        var m: U128 = u.mantissa;
         var e: i32 = 0;
         if (u.exp == 0) {
             // 次正规数：无隐含位，exp = 1 - bias
             e = 1 - bias;
         } else {
             // 正规数：补隐含位，exp = exp_field - bias
-            m |= @as(u128, 1) << @intCast(p);
+            m = m.orBit(p);
             e = @as(i32, @intCast(u.exp)) - bias;
         }
-        m <<= 3; // 左移 3 位预留 GRS
+        m = m.shiftLeft(3); // 左移 3 位预留 GRS
         return .{ .sign = u.sign, .exp = e, .mantissa = m, .is_nan = false, .is_infinite = false, .is_zero = false };
     }
 
     /// 取负（翻转符号位）。NaN 的符号位也翻转。
     pub fn negate(self: Float) Float {
         var result = self;
-        const a = result.bytes.sliceMutable();
+        const a = result.sliceMutable();
         a[a.len - 1] ^= 0x80;
         return result;
     }
 
-    /// 加法（x86_64 走汇编，其他架构走 addPortable）。
+    /// 加法。
     /// NaN/Inf 结果触发 @panic（项目约束：浮点运算不得产生 NaN/Infinity）。
     pub fn add(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                const status = glue_add_float(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
-                break :blk checkStatus(status, packFromBuffer(self.type, &r16));
-            },
-            else => checkResult(addPortable(self, other)),
-        };
+        return checkResult(addPortable(self, other));
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径；保留 NaN/Inf 传播用于算法测试）
     fn addPortable(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         const t = self.type;
@@ -413,8 +374,8 @@ pub const Float = struct {
         if (ub.is_infinite) return other;
 
         // Zero 处理
-        const a_zero = (ua.exp == 0 and ua.mantissa == 0);
-        const b_zero = (ub.exp == 0 and ub.mantissa == 0);
+        const a_zero = (ua.exp == 0 and ua.mantissa.isZero());
+        const b_zero = (ub.exp == 0 and ub.mantissa.isZero());
         if (a_zero and b_zero) {
             if (ua.sign == ub.sign) return makeZero(t, ua.sign);
             return makeZero(t, 0); // +0 + -0 = +0
@@ -435,64 +396,49 @@ pub const Float = struct {
 
         // 对阶：右移 db.mantissa
         const shift: u32 = @intCast(da.exp - db.exp);
-        db.mantissa = shiftRightWithSticky(db.mantissa, shift);
+        db.mantissa = db.mantissa.shiftRightWithSticky(shift);
 
         // 尾数加减
-        var mr: u128 = undefined;
+        var mr: U128 = undefined;
         var sr: u1 = undefined;
         if (da.sign == db.sign) {
-            mr = da.mantissa + db.mantissa;
+            mr = da.mantissa.add(db.mantissa).sum;
             sr = da.sign;
         } else {
-            if (da.mantissa >= db.mantissa) {
-                mr = da.mantissa - db.mantissa;
+            if (da.mantissa.compare(db.mantissa) != .lt) {
+                mr = da.mantissa.sub(db.mantissa).diff;
                 sr = da.sign;
             } else {
-                mr = db.mantissa - da.mantissa;
+                mr = db.mantissa.sub(da.mantissa).diff;
                 sr = db.sign;
             }
         }
 
         // x + (-x) = +0（RNE 模式下零结果恒为 +0）
-        if (mr == 0) return makeZero(t, 0);
+        if (mr.isZero()) return makeZero(t, 0);
 
         return compose(t, sr, da.exp, mr);
     }
 
-    /// 减法（x86_64 走汇编，其他架构走 subtractPortable）。
+    /// 减法。
     /// NaN/Inf 结果触发 @panic。
     pub fn subtract(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                const status = glue_sub_float(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
-                break :blk checkStatus(status, packFromBuffer(self.type, &r16));
-            },
-            else => checkResult(subtractPortable(self, other)),
-        };
+        return checkResult(subtractPortable(self, other));
     }
 
-    /// 便携软件实现（等价于 addPortable(other.negate())）
+    /// 等价于 addPortable(other.negate())
     fn subtractPortable(self: Float, other: Float) Float {
         return self.addPortable(other.negate());
     }
 
-    /// 乘法（x86_64 走汇编，其他架构走 multiplyPortable）。
+    /// 乘法。
     /// NaN/Inf 结果触发 @panic。
     pub fn multiply(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                const status = glue_mul_float(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
-                break :blk checkStatus(status, packFromBuffer(self.type, &r16));
-            },
-            else => checkResult(multiplyPortable(self, other)),
-        };
+        return checkResult(multiplyPortable(self, other));
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径；保留 NaN/Inf 传播用于算法测试）
     fn multiplyPortable(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         const t = self.type;
@@ -506,8 +452,8 @@ pub const Float = struct {
 
         const a_inf = ua.is_infinite;
         const b_inf = ub.is_infinite;
-        const a_zero = (ua.exp == 0 and ua.mantissa == 0);
-        const b_zero = (ub.exp == 0 and ub.mantissa == 0);
+        const a_zero = (ua.exp == 0 and ua.mantissa.isZero());
+        const b_zero = (ub.exp == 0 and ub.mantissa.isZero());
         const result_sign: u1 = ua.sign ^ ub.sign;
 
         // Inf 处理
@@ -529,58 +475,36 @@ pub const Float = struct {
         var result_exp: i32 = da.exp + db.exp;
 
         // 256 位乘积：da.mantissa × db.mantissa
-        var hi: u128 = undefined;
-        var lo: u128 = undefined;
-        {
-            const product = multiply128To256(da.mantissa, db.mantissa);
-            hi = product.hi;
-            lo = product.lo;
-        }
+        const product: U256 = da.mantissa.multiply(db.mantissa);
 
         // 乘积 implicit 在 bit 2p+6；检查进位 bit 2p+7
         const carry_pos: u32 = 2 * p + 7;
-        var carry_set = false;
-        if (carry_pos < 128) {
-            carry_set = (lo & (@as(u128, 1) << @intCast(carry_pos))) != 0;
-        } else {
-            carry_set = (hi & (@as(u128, 1) << @intCast(carry_pos - 128))) != 0;
-        }
-        if (carry_set) {
+        var shifted = product;
+        if (shifted.bit(carry_pos)) {
             // {hi, lo} 整体右移 1，最低位 OR 进 sticky
-            const lost: u1 = @truncate(lo);
-            lo = (lo >> 1) | (hi << 127);
-            hi = hi >> 1;
-            if (lost == 1) lo |= 1;
+            shifted = shifted.shiftRight1WithSticky();
             result_exp += 1;
         }
 
         // 提取 bits [p+3, 2p+6) 到 mant：implicit 落在 p+3
         // mant = (product >> (p+3)) 的低 128 位
         const low_width: u32 = p + 3; // ≤ 115 < 128
-        const mant: u128 = (lo >> @intCast(low_width)) | (hi << @intCast(128 - low_width));
-        // sticky：product bits [0, p+3) 非 0（均在 lo 中）
-        const low_mask: u128 = (@as(u128, 1) << @intCast(low_width)) - 1;
+        const mant: U128 = shifted.extractU128(low_width);
+        // sticky：product bits [0, p+3) 非 0
+        const low_bits_nonzero = shifted.lo.lowBitsNonZero(low_width);
         var result_mant = mant;
-        if ((lo & low_mask) != 0) result_mant |= 1;
+        if (low_bits_nonzero) result_mant = result_mant.orBit(0);
 
         return compose(t, result_sign, result_exp, result_mant);
     }
 
-    /// 除法（x86_64 走汇编，其他架构走 dividePortable）。
+    /// 除法。
     /// NaN/Inf 结果触发 @panic（含 finite/0=Inf、0/0=NaN）。
     pub fn divide(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                const status = glue_div_float(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
-                break :blk checkStatus(status, packFromBuffer(self.type, &r16));
-            },
-            else => checkResult(dividePortable(self, other)),
-        };
+        return checkResult(dividePortable(self, other));
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径；保留 NaN/Inf 传播用于算法测试）
     /// 除零不报错：finite/0 = Inf，0/0 = NaN（IEEE 754 语义）。
     fn dividePortable(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
@@ -595,8 +519,8 @@ pub const Float = struct {
 
         const a_inf = ua.is_infinite;
         const b_inf = ub.is_infinite;
-        const a_zero = (ua.exp == 0 and ua.mantissa == 0);
-        const b_zero = (ub.exp == 0 and ub.mantissa == 0);
+        const a_zero = (ua.exp == 0 and ua.mantissa.isZero());
+        const b_zero = (ub.exp == 0 and ub.mantissa.isZero());
         const result_sign: u1 = ua.sign ^ ub.sign;
 
         // Inf 处理
@@ -618,22 +542,21 @@ pub const Float = struct {
 
         // 被除数 = da.mantissa << (p+3)，256 位
         const shift: u32 = p + 3; // < 128
-        const dividend_lo: u128 = da.mantissa << @intCast(shift);
-        const dividend_hi: u128 = da.mantissa >> @intCast(128 - shift);
+        const dividend: U256 = da.mantissa.shiftLeftWide(@intCast(shift));
 
-        const div_result = divide256By128(dividend_hi, dividend_lo, db.mantissa);
-        var quotient: u128 = div_result.quotient;
-        const remainder: u128 = div_result.remainder;
+        const div_result = dividend.divideByU128(db.mantissa);
+        var quotient: U128 = div_result.quotient;
+        const remainder: U128 = div_result.remainder;
 
         // 商范围 [2^(p+2), 2^(p+4))；若 < 2^(p+3)（implicit 在 p+2）：左移 1，exp -= 1
-        const implicit_bit: u128 = @as(u128, 1) << @intCast(p + 3);
-        if (quotient < implicit_bit) {
-            quotient <<= 1;
+        const implicit_bit: U128 = U128.fromU64(1).shiftLeft(@intCast(p + 3));
+        if (quotient.compare(implicit_bit) == .lt) {
+            quotient = quotient.shiftLeft(1);
             result_exp -= 1;
         }
 
         // sticky：余数非 0 → bit 0
-        if (remainder != 0) quotient |= 1;
+        if (!remainder.isZero()) quotient = quotient.orBit(0);
 
         return compose(t, result_sign, result_exp, quotient);
     }
@@ -645,7 +568,7 @@ pub const Float = struct {
         const u = self.unpack();
         if (u.is_nan) return makeNan(target);
         if (u.is_infinite) return makeInf(target, u.sign);
-        if (u.exp == 0 and u.mantissa == 0) return makeZero(target, u.sign);
+        if (u.exp == 0 and u.mantissa.isZero()) return makeZero(target, u.sign);
 
         const p_self: u32 = self.type.mantissaBits();
         const p_target: u32 = target.mantissaBits();
@@ -656,9 +579,9 @@ pub const Float = struct {
         // 对齐 implicit 至 p_target+3：value = m × 2^(exp - (p+3))，移位不改变 exp
         var m = da.mantissa;
         if (p_self > p_target) {
-            m = shiftRightWithSticky(m, p_self - p_target);
+            m = m.shiftRightWithSticky(p_self - p_target);
         } else if (p_target > p_self) {
-            m <<= @intCast(p_target - p_self);
+            m = m.shiftLeft(@intCast(p_target - p_self));
         }
         return compose(target, da.sign, da.exp, m);
     }
@@ -669,7 +592,7 @@ pub const Float = struct {
         const t = self.type;
         const u = self.unpack();
         if (u.is_nan or u.is_infinite) return error.Overflow;
-        if (u.exp == 0 and u.mantissa == 0) return int.Int.zero(target);
+        if (u.exp == 0 and u.mantissa.isZero()) return int.Int.zero(target);
 
         const p: u32 = t.mantissaBits();
         var da = self.decompose();
@@ -677,57 +600,168 @@ pub const Float = struct {
 
         // |value| = da.mantissa × 2^frac_shift，向零截断 = floor(|value|)
         const frac_shift: i32 = da.exp - @as(i32, @intCast(p + 3));
-        var mag: u128 = da.mantissa;
+        var mag: U128 = da.mantissa;
 
         if (frac_shift >= 0) {
             const sh: u32 = @intCast(frac_shift);
             if (sh >= 128) return error.Overflow;
             if (sh > 0) {
-                if ((mag >> @intCast(128 - sh)) != 0) return error.Overflow; // 左移会溢出 u128
-                mag <<= @intCast(sh);
+                // 检查高 sh 位是否非零（左移会溢出 U128）
+                if (!mag.shiftRight(@intCast(128 - sh), false).isZero()) return error.Overflow;
+                mag = mag.shiftLeft(@intCast(sh));
             }
         } else {
             const sh: u32 = @intCast(-frac_shift);
             if (sh >= 128) {
-                mag = 0;
+                mag = U128.zero();
             } else {
-                mag >>= @intCast(sh);
+                mag = mag.shiftRight(@intCast(sh), false);
             }
         }
 
         const bits: u32 = target.bitWidth();
         if (da.sign == 0) {
             // 正数
-            const max_mag: u128 = if (target.isSigned())
-                (@as(u128, 1) << @intCast(bits - 1)) - 1
+            const max_mag: U128 = if (target.isSigned())
+                U128.mask(@intCast(bits - 1))
             else if (bits == 128)
-                std.math.maxInt(u128)
+                U128.mask(128)
             else
-                (@as(u128, 1) << @intCast(bits)) - 1;
-            if (mag > max_mag) return error.Overflow;
-            return int.Int.fromNative(target, mag);
+                U128.mask(@intCast(bits));
+            if (mag.compare(max_mag) == .gt) return error.Overflow;
+            return int.Int.fromU128Unchecked(target, mag);
         } else {
-            // 负数：两补 = 0 -% mag
+            // 负数：两补 = -mag
             if (!target.isSigned()) return error.Overflow;
-            const max_mag: u128 = @as(u128, 1) << @intCast(bits - 1);
-            if (mag > max_mag) return error.Overflow;
-            const neg: u128 = 0 -% mag;
-            return int.Int.fromNative(target, neg);
+            const max_mag: U128 = U128.fromU64(1).shiftLeft(@intCast(bits - 1));
+            if (mag.compare(max_mag) == .gt) return error.Overflow;
+            const neg: U128 = mag.negate();
+            return int.Int.fromU128Unchecked(target, neg);
         }
+    }
+
+    /// 从整数构造浮点数（全软件，不丢精度）。
+    /// 整数值 = magnitude × 2^0，规格化为 1.xxx × 2^bit_pos 后用 compose 打包。
+    /// 对阶时左移不丢精度（低位本就是 0），右移用 shiftRightWithSticky 保留舍入信息。
+    /// 大整数转低精度浮点（如 i128→f32）会按 RNE 舍入，这是正确的语义行为。
+    pub fn fromInt(target: Type, iv: int.Int) Float {
+        const is_neg = iv.isNegative();
+
+        // 符号扩展到 16 字节后加载为 U128，负数取绝对值（U128 两补 negate）
+        var buf: [16]u8 = [_]u8{0} ** 16;
+        const src = iv.slice();
+        @memcpy(buf[0..src.len], src);
+        if (iv.type.isSigned() and (src[src.len - 1] & 0x80) != 0) {
+            @memset(buf[src.len..16], 0xFF);
+        }
+        var mag = U128.load(buf[0..16]);
+        if (is_neg) mag = mag.negate();
+        if (mag.isZero()) return makeZero(target, 0);
+
+        const sign: u1 = if (is_neg) 1 else 0;
+        const p: u32 = target.mantissaBits();
+        const leading_zeros: u32 = mag.clz();
+        const bit_pos: i32 = 127 - @as(i32, @intCast(leading_zeros));
+
+        // 对齐尾数：隐含位需在 bit (p+3)，GRS 在 bit 0-2
+        const target_pos: i32 = @as(i32, @intCast(p)) + 3;
+        var mantissa = mag;
+        if (bit_pos < target_pos) {
+            const sh: u8 = @intCast(target_pos - bit_pos);
+            mantissa = mantissa.shiftLeft(sh);
+        } else if (bit_pos > target_pos) {
+            const sh: u32 = @intCast(bit_pos - target_pos);
+            mantissa = mantissa.shiftRightWithSticky(sh);
+        }
+
+        return compose(target, sign, bit_pos, mantissa);
     }
 
     /// 绝对值（清符号位）。NaN 符号位也清零（与 Zig @abs 一致）。
     pub fn abs(self: Float) Float {
         var result = self;
-        const a = result.bytes.sliceMutable();
+        const a = result.sliceMutable();
         a[a.len - 1] &= ~@as(u8, 0x80);
         return result;
+    }
+
+    /// 十进制格式化：将 self 写入 buf，返回写入的切片。
+    /// 全软件：f8/f16/f32/f64 无损宽化到 f64 后用原生 {d}（shortest round-trip，不丢精度）；
+    /// f128 软件分解整数/小数部分格式化（不丢精度）。
+    /// buf 需至少 80 字节（符号 + 整数 39 位 + 小数点 + 小数 34 位）。
+    pub fn formatDecimal(self: Float, buf: []u8) []const u8 {
+        const t = self.type;
+
+        // 特殊值
+        if (self.isNan()) return "nan";
+        if (self.isInfinite()) return if (self.isNegative()) "-inf" else "inf";
+        if (self.isZero()) return if (self.isNegative()) "-0" else "0";
+
+        // 非 f128：无损宽化到 f64 后用原生 {d}（不丢精度）
+        if (t != .f128) {
+            const fv = self.toFloatType(.f64).toNative(f64);
+            return std.fmt.bufPrint(buf, "{d}", .{fv}) catch unreachable;
+        }
+
+        // f128 软件格式化
+        const neg = self.isNegative();
+        const abs_val = if (neg) self.negate() else self;
+        const sign_str: []const u8 = if (neg) "-" else "";
+
+        // 整数部分（溢出 → 十六进制科学计数法）
+        const int_part = abs_val.toInt(.i128) catch {
+            const u = abs_val.unpack();
+            const unbiased: i32 = @as(i32, @intCast(u.exp)) - @as(i32, @intCast(t.bias()));
+            const p: u32 = t.mantissaBits();
+            const hex_digits: usize = (p + 3) / 4;
+            var mant_hex: [32]u8 = undefined;
+            var m = u.mantissa.orBit(@intCast(p));
+            var i: usize = hex_digits;
+            while (i > 0) : (i -= 1) {
+                const digit: u8 = @truncate(m.lo & 0xF);
+                mant_hex[i - 1] = if (digit < 10) '0' + digit else 'a' + (digit - 10);
+                m = m.shiftRight(4, false);
+            }
+            var exp_buf: [16]u8 = undefined;
+            const exp_str = std.fmt.bufPrint(&exp_buf, "{d}", .{unbiased}) catch unreachable;
+            return std.fmt.bufPrint(buf, "{s}0x1.{s}p{s}", .{ sign_str, mant_hex[0..hex_digits], exp_str }) catch unreachable;
+        };
+
+        // 格式化整数部分
+        var int_buf: [41]u8 = undefined;
+        const int_str = int_part.formatDecimal(&int_buf);
+
+        // 计算小数部分：remainder = abs_val - fromInt(int_part)
+        const int_float = Float.fromInt(.f128, int_part);
+        var remainder = abs_val.subtract(int_float);
+        if (remainder.isNegative()) remainder = remainder.negate();
+
+        if (remainder.isZero()) {
+            return std.fmt.bufPrint(buf, "{s}{s}", .{ sign_str, int_str }) catch unreachable;
+        }
+
+        // 反复乘 10 提取小数位（f128 约 34 位有效十进制）
+        var frac_buf: [40]u8 = undefined;
+        var frac_pos: usize = 0;
+        const ten = Float.fromInt(.f128, int.Int.fromNative(.i64, @as(i64, 10)));
+        while (frac_pos < 34 and !remainder.isZero()) {
+            remainder = remainder.multiply(ten);
+            const digit_int = remainder.toInt(.i8) catch break;
+            const d: u8 = digit_int.toNative(u8);
+            frac_buf[frac_pos] = '0' + d;
+            frac_pos += 1;
+            const digit_float = Float.fromInt(.f128, int.Int.fromNative(.i8, @as(i8, @bitCast(d))));
+            remainder = remainder.subtract(digit_float);
+            if (remainder.isNegative()) remainder = remainder.negate();
+        }
+
+        return std.fmt.bufPrint(buf, "{s}{s}.{s}", .{ sign_str, int_str, frac_buf[0..frac_pos] }) catch unreachable;
     }
 
     /// 复制符号位：返回 |self| 带 other 的符号。
     pub fn copySign(self: Float, other: Float) Float {
         var result = self;
-        const a = result.bytes.sliceMutable();
+        const a = result.sliceMutable();
         const other_sign: u8 = if (other.isNegative()) 0x80 else 0x00;
         a[a.len - 1] = (a[a.len - 1] & ~@as(u8, 0x80)) | other_sign;
         return result;
@@ -746,27 +780,23 @@ pub const Float = struct {
             const exp_bits = t.exponentBits();
             const max_exp: u32 = (@as(u32, 1) << @intCast(exp_bits)) - 1;
             const p = t.mantissaBits();
-            const max_frac: u128 = (@as(u128, 1) << @intCast(p)) - 1;
+            const max_frac: U128 = U128.mask(@intCast(p));
             return packBytes(t, 1, max_exp - 1, max_frac);
         }
 
-        const a = self.bytes.slice();
-        var bits: u128 = 0;
-        var i: usize = 0;
-        while (i < a.len) : (i += 1) {
-            bits |= @as(u128, a[i]) << @intCast(i * 8);
-        }
-        const sign_bit: u128 = @as(u128, 1) << @intCast(a.len * 8 - 1);
+        const a = self.slice();
+        var bits: U128 = loadU128(a);
+        const sign_bit: U128 = U128.fromU64(1).shiftLeft(@intCast(a.len * 8 - 1));
 
         // ±0 → +min_subnormal
-        if (bits == 0 or bits == sign_bit) {
-            return packBytes(t, 0, 0, 1);
+        if (bits.isZero() or bits.equals(sign_bit)) {
+            return packBytes(t, 0, 0, U128.fromU64(1));
         }
 
         if (u.sign == 0) {
-            bits +%= 1; // 正数 +1 ulp
+            bits = bits.add(U128.fromU64(1)).sum; // 正数 +1 ulp
         } else {
-            bits -%= 1; // 负数 -1 ulp（向 0，值变大）
+            bits = bits.sub(U128.fromU64(1)).diff; // 负数 -1 ulp（向 0，值变大）
         }
         return packRawBits(t, bits);
     }
@@ -778,55 +808,18 @@ pub const Float = struct {
     }
 };
 
-// —— 汇编分派辅助函数 ——
-
-/// 从 [16]u8 缓冲区打包回 union（截取前 N 字节）
-fn packFromBuffer(t: Type, buf: *const [16]u8) Float {
-    const nbytes = t.byteLength();
-    return .{ .type = t, .bytes = switch (nbytes) {
-        1 => .{ .b1 = buf[0..1].* },
-        2 => .{ .b2 = buf[0..2].* },
-        4 => .{ .b4 = buf[0..4].* },
-        8 => .{ .b8 = buf[0..8].* },
-        16 => .{ .b16 = buf[0..16].* },
-        else => unreachable,
-    } };
-}
-
-/// 检查汇编返回的状态码，NaN/Inf 触发 @panic
-fn checkStatus(status: u8, result: Float) Float {
-    return switch (status) {
-        0 => result,
-        1 => @panic("float operation produced NaN"),
-        2 => @panic("float operation produced Infinity"),
-        else => unreachable,
-    };
-}
-
-/// 检查软件实现的结果，NaN/Inf 触发 @panic（非 x86_64 架构执行路径）
+/// 检查软件实现的结果，NaN/Inf 触发 @panic
 fn checkResult(result: Float) Float {
     if (result.isNan()) @panic("float operation produced NaN");
     if (result.isInfinite()) @panic("float operation produced Infinity");
     return result;
 }
 
-// —— 加减法辅助函数（S9 实现）——
-
-/// 右移并保留 sticky（丢失的位 OR 到 bit 0）
-fn shiftRightWithSticky(m: u128, shift: u32) u128 {
-    if (shift == 0) return m;
-    if (shift >= 128) return if (m != 0) 1 else 0;
-    const mask: u128 = (@as(u128, 1) << @intCast(shift)) - 1;
-    const lost = m & mask;
-    const shifted = m >> @intCast(shift);
-    return shifted | (if (lost != 0) @as(u128, 1) else 0);
-}
-
 /// 构造零（指定符号）
 fn makeZero(t: Type, sign: u1) Float {
     var f = Float.zero(t);
     if (sign == 1) {
-        const a = f.bytes.sliceMutable();
+        const a = f.sliceMutable();
         a[a.len - 1] |= 0x80;
     }
     return f;
@@ -836,62 +829,41 @@ fn makeZero(t: Type, sign: u1) Float {
 fn makeInf(t: Type, sign: u1) Float {
     const exp_bits = t.exponentBits();
     const max_exp: u32 = (@as(u32, 1) << @intCast(exp_bits)) - 1;
-    return packBytes(t, sign, max_exp, 0);
+    return packBytes(t, sign, max_exp, U128.zero());
 }
 
 /// 构造 NaN（canonical quiet NaN：sign=0, exp=全1, mantissa=1）
 fn makeNan(t: Type) Float {
     const exp_bits = t.exponentBits();
     const max_exp: u32 = (@as(u32, 1) << @intCast(exp_bits)) - 1;
-    return packBytes(t, 0, max_exp, 1);
+    return packBytes(t, 0, max_exp, U128.fromU64(1));
 }
 
-/// 从 sign/stored_exp/fraction 打包为 Float
-fn packBytes(t: Type, sign: u1, stored_exp: u32, fraction: u128) Float {
+/// 从 sign/stored_exp/fraction 打包为 Float（直写定长缓冲前 N 字节）
+fn packBytes(t: Type, sign: u1, stored_exp: u32, fraction: U128) Float {
     const p = t.mantissaBits();
     const nbytes = t.byteLength();
-    var raw: u128 = 0;
-    raw |= fraction;
-    raw |= @as(u128, stored_exp) << @intCast(p);
+    var raw: U128 = fraction;
+    raw = raw.or_(U128.fromU64(stored_exp).shiftLeft(@intCast(p)));
     if (sign == 1) {
-        raw |= @as(u128, 1) << @intCast(nbytes * 8 - 1);
+        raw = raw.orBit(@intCast(nbytes * 8 - 1));
     }
     var bytes: [16]u8 = [_]u8{0} ** 16;
-    var i: usize = 0;
-    while (i < nbytes) : (i += 1) {
-        bytes[i] = @truncate(raw >> @intCast(i * 8));
-    }
-    return .{ .type = t, .bytes = switch (nbytes) {
-        1 => .{ .b1 = bytes[0..1].* },
-        2 => .{ .b2 = bytes[0..2].* },
-        4 => .{ .b4 = bytes[0..4].* },
-        8 => .{ .b8 = bytes[0..8].* },
-        16 => .{ .b16 = bytes[0..16].* },
-        else => unreachable,
-    } };
+    storeU128(bytes[0..nbytes], raw);
+    return .{ .type = t, .bytes = bytes };
 }
 
-/// 从原始位模式（u128，低 nbytes 字节有效）打包为 Float
-fn packRawBits(t: Type, bits: u128) Float {
+/// 从原始位模式（U128，低 nbytes 字节有效）打包为 Float（直写定长缓冲前 N 字节）
+fn packRawBits(t: Type, bits: U128) Float {
     const nbytes = t.byteLength();
     var bytes: [16]u8 = [_]u8{0} ** 16;
-    var i: usize = 0;
-    while (i < nbytes) : (i += 1) {
-        bytes[i] = @truncate(bits >> @intCast(i * 8));
-    }
-    return .{ .type = t, .bytes = switch (nbytes) {
-        1 => .{ .b1 = bytes[0..1].* },
-        2 => .{ .b2 = bytes[0..2].* },
-        4 => .{ .b4 = bytes[0..4].* },
-        8 => .{ .b8 = bytes[0..8].* },
-        16 => .{ .b16 = bytes[0..16].* },
-        else => unreachable,
-    } };
+    storeU128(bytes[0..nbytes], bits);
+    return .{ .type = t, .bytes = bytes };
 }
 
 /// 从 sign/unbiased exp/含 GRS 的尾数 打包为 Float
 /// 处理规格化 + RNE 舍入 + 范围判定（上溢→Inf，下溢→次正规/零）
-fn compose(t: Type, sign: u1, exp: i32, mantissa: u128) Float {
+fn compose(t: Type, sign: u1, exp: i32, mantissa: U128) Float {
     const p: u32 = t.mantissaBits();
     const bias: i32 = @intCast(t.bias());
     const exp_bits = t.exponentBits();
@@ -900,24 +872,24 @@ fn compose(t: Type, sign: u1, exp: i32, mantissa: u128) Float {
     var m = mantissa;
     var e = exp;
 
-    if (m == 0) return makeZero(t, sign);
+    if (m.isZero()) return makeZero(t, sign);
 
-    const implicit_bit: u128 = @as(u128, 1) << @intCast(p + 3);
-    const carry_bit: u128 = @as(u128, 1) << @intCast(p + 4);
+    const implicit_bit: U128 = U128.fromU64(1).shiftLeft(@intCast(p + 3));
+    const carry_bit: U128 = U128.fromU64(1).shiftLeft(@intCast(p + 4));
 
     // 处理加法进位（bit p+4 置位）
-    if (m >= carry_bit) {
-        m = shiftRightWithSticky(m, 1);
+    if (m.compare(carry_bit) != .lt) {
+        m = m.shiftRightWithSticky(1);
         e += 1;
     }
 
     // 规格化：左移至 bit (p+3) 置位
-    if (m != 0 and m < implicit_bit) {
-        const clz_m: u32 = @intCast(@clz(m));
-        const target_clz: u32 = 128 - p - 4;
-        const shift_amt = clz_m - target_clz;
-        m <<= @intCast(shift_amt);
-        e -= @as(i32, @intCast(shift_amt));
+    if (!m.isZero() and m.compare(implicit_bit) == .lt) {
+        const clz_m: u8 = m.clz();
+        const target_clz: u8 = @intCast(128 - p - 4);
+        const shift_amt: u8 = clz_m - target_clz;
+        m = m.shiftLeft(shift_amt);
+        e -= @as(i32, shift_amt);
     }
 
     // 上溢检查
@@ -933,36 +905,34 @@ fn compose(t: Type, sign: u1, exp: i32, mantissa: u128) Float {
     } else {
         // 次正规数：右移对齐到次正规位置（effective exp = 1 - bias）
         const shift: u32 = @intCast(1 - bias - e);
-        m = shiftRightWithSticky(m, shift);
+        m = m.shiftRightWithSticky(shift);
         stored_exp = 0;
     }
 
     // RNE 舍入（round-to-nearest-even）
-    const lsb_bit: u128 = @as(u128, 1) << 3;
-    const guard_bit: u128 = @as(u128, 1) << 2;
-    const round_bit: u128 = @as(u128, 1) << 1;
+    // GRS 位布局：bit 3 = LSB（保留位），bit 2 = guard，bit 1 = round，bit 0 = sticky
+    const g = m.testBit(2);
+    const r = m.testBit(1);
+    const s = m.testBit(0);
+    const lsb_set = m.testBit(3);
 
-    const g = (m & guard_bit) != 0;
-    const r = (m & round_bit) != 0;
-    const s = (m & 1) != 0;
-    const lsb_set = (m & lsb_bit) != 0;
-
-    var rounded = m & ~@as(u128, 7);
+    // 清除低 3 位（GRS）
+    var rounded = m.and_(U128.fromU64(7).bitwiseNot());
     if (g and (r or s or lsb_set)) {
-        rounded +%= lsb_bit;
+        rounded = rounded.add(U128.fromU64(8)).sum;
     }
     m = rounded;
 
     // 舍入后溢出检查
     if (stored_exp == 0) {
         // 次正规：舍入后若 bit (p+3) 置位 → 升格为最小正规数
-        if (m & implicit_bit != 0) {
+        if (m.testBit(@intCast(p + 3))) {
             stored_exp = 1;
         }
     } else {
         // 正规：舍入后若 bit (p+4) 置位 → 右移 + stored_exp+1
-        if (m & carry_bit != 0) {
-            m >>= 1;
+        if (m.testBit(@intCast(p + 4))) {
+            m = m.shiftRight(1, false);
             stored_exp += 1;
             if (stored_exp >= max_exp_field) {
                 return makeInf(t, sign);
@@ -970,87 +940,10 @@ fn compose(t: Type, sign: u1, exp: i32, mantissa: u128) Float {
         }
     }
 
-    const fraction_mask: u128 = (@as(u128, 1) << @intCast(p)) - 1;
-    const fraction = (m >> 3) & fraction_mask;
+    const fraction_mask: U128 = U128.mask(@intCast(p));
+    const fraction: U128 = m.shiftRight(3, false).and_(fraction_mask);
 
     return packBytes(t, sign, @intCast(stored_exp), fraction);
-}
-
-// —— 256 位算术辅助函数（S10 乘除法用）——
-
-/// 128×128 → 256 位乘法
-/// 分裂为 4 个 u64×u64 → u128 部分积，进位链组合
-fn multiply128To256(a: u128, b: u128) struct { hi: u128, lo: u128 } {
-    const a_lo: u64 = @truncate(a);
-    const a_hi: u64 = @truncate(a >> 64);
-    const b_lo: u64 = @truncate(b);
-    const b_hi: u64 = @truncate(b >> 64);
-
-    const ll: u128 = @as(u128, a_lo) * @as(u128, b_lo);
-    const lh: u128 = @as(u128, a_lo) * @as(u128, b_hi);
-    const hl: u128 = @as(u128, a_hi) * @as(u128, b_lo);
-    const hh: u128 = @as(u128, a_hi) * @as(u128, b_hi);
-
-    const ll_lo: u64 = @truncate(ll);
-    const ll_hi: u64 = @truncate(ll >> 64);
-    const lh_lo: u64 = @truncate(lh);
-    const lh_hi: u64 = @truncate(lh >> 64);
-    const hl_lo: u64 = @truncate(hl);
-    const hl_hi: u64 = @truncate(hl >> 64);
-    const hh_lo: u64 = @truncate(hh);
-    const hh_hi: u64 = @truncate(hh >> 64);
-
-    const p0: u64 = ll_lo;
-
-    const p1: u128 = @as(u128, ll_hi) + @as(u128, lh_lo) + @as(u128, hl_lo);
-    const p1_lo: u64 = @truncate(p1);
-    const c1: u64 = @truncate(p1 >> 64);
-
-    const p2: u128 = @as(u128, hh_lo) + @as(u128, lh_hi) + @as(u128, hl_hi) + @as(u128, c1);
-    const p2_lo: u64 = @truncate(p2);
-    const c2: u64 = @truncate(p2 >> 64);
-
-    const p3: u128 = @as(u128, hh_hi) + @as(u128, c2);
-    const p3_lo: u64 = @truncate(p3);
-
-    const lo: u128 = @as(u128, p0) | (@as(u128, p1_lo) << 64);
-    const hi: u128 = @as(u128, p2_lo) | (@as(u128, p3_lo) << 64);
-
-    return .{ .hi = hi, .lo = lo };
-}
-
-/// 256 位 / 128 位 → 128 位商 + 128 位余数
-/// shift-subtract 长除法，256 次迭代。要求商不超过 128 位（调用方保证）。
-fn divide256By128(dividend_hi: u128, dividend_lo: u128, divisor: u128) struct { quotient: u128, remainder: u128 } {
-    var dh = dividend_hi;
-    var dl = dividend_lo;
-    var rem: u128 = 0;
-    var rem_carry: u1 = 0;
-    var quot_lo: u128 = 0;
-    var quot_hi: u128 = 0;
-
-    var i: u32 = 0;
-    while (i < 256) : (i += 1) {
-        const bit: u1 = @truncate(dh >> 127);
-        dh = (dh << 1) | (dl >> 127);
-        dl = dl << 1;
-
-        rem_carry = @truncate(rem >> 127);
-        rem = (rem << 1) | bit;
-
-        if (rem_carry == 1 or rem >= divisor) {
-            rem = rem -% divisor;
-            rem_carry = 0;
-            if (i < 128) {
-                quot_hi = quot_hi | (@as(u128, 1) << @intCast(127 - i));
-            } else {
-                quot_lo = quot_lo | (@as(u128, 1) << @intCast(255 - i));
-            }
-        }
-    }
-
-    std.debug.assert(quot_hi == 0);
-    return .{ .quotient = quot_lo, .remainder = rem };
 }
 
 test "Type.byteLength/bitWidth/exponentBits/mantissaBits/bias" {
@@ -1227,7 +1120,6 @@ test "Float.add f16 strategic" {
                     try std.testing.expect(custom_result.isInfinite());
                 }
             } else {
-                // 有限结果走 add（x86_64 汇编路径）
                 const custom_result = a.add(b);
                 const native_bits: u16 = @bitCast(native_result);
                 const custom_bits: u16 = @bitCast(custom_result.toNative(f16));
@@ -1272,7 +1164,6 @@ test "Float.add f32 boundary" {
                 try std.testing.expect(r.isInfinite());
             }
         } else {
-            // 有限结果走 add（x86_64 汇编路径）
             const r = a.add(b);
             try std.testing.expectEqual(@as(u32, @bitCast(native)), @as(u32, @bitCast(r.toNative(f32))));
         }
@@ -1710,6 +1601,49 @@ test "Float.toInt unsigned and narrow boundary" {
     }
 }
 
+test "Float.toInt i128 truncation and overflow" {
+    // F5: doArithFloat 浮点取模溢出检测依赖 Float.toInt(.i128) 在商超出 i128 范围时返回 Overflow。
+    // 此测试验证该路径：极大商（1e50 / 1.0 = 1e50）超出 i128 max (~1.7e38)。
+
+    // 正常范围：1e10 截断为 i128
+    {
+        const v = Float.fromNative(.f64, @as(f64, 1e10));
+        const r = try v.toInt(.i128);
+        try std.testing.expectEqual(@as(i128, 10_000_000_000), r.toNative(i128));
+    }
+    // 负数正常范围
+    {
+        const v = Float.fromNative(.f64, @as(f64, -1e10));
+        const r = try v.toInt(.i128);
+        try std.testing.expectEqual(@as(i128, -10_000_000_000), r.toNative(i128));
+    }
+    // i128 边界内（接近 max，i128 max ≈ 1.7e38）
+    // 不用 @intFromFloat 对照以避免 LLVM i128 codegen bug
+    {
+        const v = Float.fromNative(.f64, @as(f64, 1e38));
+        const r = try v.toInt(.i128);
+        try std.testing.expect(!r.isNegative());
+    }
+    // 超出 i128 范围 → Overflow（F5 核心场景：取模商溢出）
+    {
+        const v = Float.fromNative(.f64, @as(f64, 1e50));
+        try std.testing.expectError(error.Overflow, v.toInt(.i128));
+    }
+    {
+        const v = Float.fromNative(.f64, @as(f64, -1e50));
+        try std.testing.expectError(error.Overflow, v.toInt(.i128));
+    }
+    // Inf/NaN → Overflow
+    {
+        const v = Float.fromNative(.f64, std.math.inf(f64));
+        try std.testing.expectError(error.Overflow, v.toInt(.i128));
+    }
+    {
+        const v = Float.fromNative(.f64, std.math.nan(f64));
+        try std.testing.expectError(error.Overflow, v.toInt(.i128));
+    }
+}
+
 test "Float.abs/copySign f32" {
     const inf = std.math.inf(f32);
     const nan = std.math.nan(f32);
@@ -1899,7 +1833,7 @@ test "Float f8 unpack fields" {
     const u = one.unpack();
     try std.testing.expectEqual(@as(u1, 0), u.sign);
     try std.testing.expectEqual(@as(u32, 15), u.exp); // bias=15, unbiased=0
-    try std.testing.expectEqual(@as(u128, 0), u.mantissa);
+    try std.testing.expect(u.mantissa.isZero());
     try std.testing.expect(!u.is_nan);
     try std.testing.expect(!u.is_infinite);
 
@@ -1917,7 +1851,7 @@ test "Float f8 unpack fields" {
     const un2 = pos_nan.unpack();
     try std.testing.expectEqual(@as(u32, 31), un2.exp);
     try std.testing.expect(un2.is_nan);
-    try std.testing.expectEqual(@as(u128, 1), un2.mantissa);
+    try std.testing.expect(un2.mantissa.equals(U128.fromU64(1)));
 }
 
 test "Float f8 compare" {

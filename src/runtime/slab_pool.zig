@@ -8,12 +8,12 @@
 //!   NewtypeValue≈48 / AdtValue≈56 / RecordValue≈56 / Range≈64），定长箱体内部碎片≈0；
 //!   高段 ~1.25× 几何步进，内部碎片 ≤ ~12.5%。
 //! - slot 全部 8 对齐（所有装箱 struct 首字段 rc:u32 + 指针切片，@alignOf 均为 8）。
-//! - slab 块按 SLAB_SIZE(64KB) 对齐，头部内嵌于块首：free 时用指针掩码
+//! - slab 块按 SLAB_SIZE(16KB) 对齐，头部内嵌于块首：free 时用指针掩码
 //!   `ptr & ~(SLAB_SIZE-1)` O(1) 反查所属 slab。
 //! - 每 slab 独立 free_list + bump + used 计数：empty slab 归还 O(1)，无需扫描全局链。
 //! - 空 slab 归还：每 class 保留 1 个空 slab 作 buffer 防抖动，第 2 个起立即归还
 //!   backing → 内存随死对象真回落，不焊在峰值。
-//! - alloc/free 均 O(1)：freelist push/pop + 查表取整。
+//! - alloc/free 均 O(1)：freelist push/pop + 查表取整；大对象 free 经 ptr→meta 哈希表 O(1)。
 //!
 //! 用途：替代 gc.zig 的 OldGenAllocator（first-fit + 分裂，碎片源）；
 //! 作为主求值器的 value_allocator（运行期 Value 箱体/载荷），rc 归零 release 即还桶。
@@ -54,7 +54,8 @@ const FreeNode = struct {
     next: ?*FreeNode,
 };
 
-/// 一个 slab：专属单一 size class，切成等大 slot。头部内嵌于 64KB 对齐块首。
+/// 一个 slab：专属单一 size class，切成等大 slot。头部内嵌于 16KB 对齐块首。
+/// slab 头即块首，block 指针 = @ptrCast(slab)，块长恒为 SLAB_SIZE，无需单独存储。
 const Slab = struct {
     /// 魔数：校验掩码反查到的确实是本 pool 的 slab 头。混合分配器阶段，
     /// 非本 pool 分配的指针（arena 内存）被误 free 时，掩码反查会落到非 slab
@@ -71,8 +72,6 @@ const Slab = struct {
     slots_offset: u32,
     /// 本 slab 自己的空闲 slot 链。
     free_list: ?*FreeNode,
-    /// backing 原始块（用于归还）。按 SLAB_ALIGN 对齐分配，free 须经 freeBlock。
-    block: []u8,
     /// class 的 partial 双向链（有空位的 slab）。
     next: ?*Slab,
     prev: ?*Slab,
@@ -87,7 +86,7 @@ const SizeClass = struct {
     partial: ?*Slab = null,
 };
 
-/// 全局空 slab 缓存上限：空 64KB 块可重切给任意 class，故跨 class 共享一个池。
+/// 全局空 slab 缓存上限：空 16KB 块可重切给任意 class，故跨 class 共享一个池。
 /// 偏速度的平衡：保留少量块防抖动，超限立即归还 backing → 内存随死对象回落。
 const MAX_EMPTY_SLABS: usize = 4;
 
@@ -96,8 +95,8 @@ pub const SlabPool = struct {
     classes: [NUM_CLASSES]SizeClass,
     /// size → class_idx 查表。索引 = (len+7)/8。
     class_lookup: [LOOKUP_LEN]u8,
-    /// 大对象（≥ LARGE_THRESHOLD）登记。
-    large_objects: std.ArrayList(LargeObj),
+    /// 大对象（≥ LARGE_THRESHOLD）登记：ptr 地址 → 元信息。free 时 O(1) 查表。
+    large_objects: std.AutoHashMap(usize, LargeObjMeta),
     /// 全局空 slab 缓存（单链栈，复用 Slab.next）。
     empty_slabs: ?*Slab,
     empty_count: usize,
@@ -112,8 +111,8 @@ pub const SlabPool = struct {
     /// 用结束时刻算会得到误导的 100%；用峰值时刻才反映真实分配效率。
     live_peak_bytes: usize,
 
-    const LargeObj = struct {
-        ptr: [*]u8,
+    /// 大对象元信息（ptr 地址作为 hash map key，故不存 ptr）。
+    const LargeObjMeta = struct {
         len: usize,
         /// 确保时的实际对齐（= max(请求对齐, SLOT_ALIGNMENT)）。deinit/free 必须按此对齐
         /// rawFree，否则 backing.free(slice) 用 u8 自然对齐 1 → DebugAllocator 报对齐不匹配。
@@ -125,7 +124,7 @@ pub const SlabPool = struct {
             .backing = backing,
             .classes = undefined,
             .class_lookup = undefined,
-            .large_objects = std.ArrayList(LargeObj).empty,
+            .large_objects = std.AutoHashMap(usize, LargeObjMeta).init(backing),
             .empty_slabs = null,
             .empty_count = 0,
             .live_bytes = 0,
@@ -152,21 +151,24 @@ pub const SlabPool = struct {
             var cur = c.partial;
             while (cur) |s| {
                 const nxt = s.next;
-                self.freeBlock(s.block);
+                self.freeBlock(s);
                 cur = nxt;
             }
         }
         var e = self.empty_slabs;
         while (e) |s| {
             const nxt = s.next;
-            self.freeBlock(s.block);
+            self.freeBlock(s);
             e = nxt;
         }
-        for (self.large_objects.items) |obj| {
-            // 按确保时的对齐 rawFree（backing.free 会用 u8 自然对齐 1 → 对齐不匹配崩溃）。
-            self.backing.rawFree(obj.ptr[0..obj.len], std.mem.Alignment.fromByteUnits(obj.alignment), @returnAddress());
+        // 释放所有大对象登记项
+        var it = self.large_objects.iterator();
+        while (it.next()) |entry| {
+            const meta = entry.value_ptr.*;
+            const ptr: [*]u8 = @ptrFromInt(entry.key_ptr.*);
+            self.backing.rawFree(ptr[0..meta.len], std.mem.Alignment.fromByteUnits(meta.alignment), @returnAddress());
         }
-        self.large_objects.deinit(self.backing);
+        self.large_objects.deinit();
         self.* = undefined;
     }
 
@@ -184,9 +186,10 @@ pub const SlabPool = struct {
 
     // ── 内部 ──
 
-    /// 归还一个 slab 的 backing 块，带回 SLAB_ALIGN 对齐（否则 DebugAllocator 报对齐不匹配）。
-    fn freeBlock(self: *SlabPool, block: []u8) void {
-        self.backing.rawFree(block, SLAB_ALIGN, @returnAddress());
+    /// 归还一个 slab 的 backing 块。块首即 slab 头，块长恒为 SLAB_SIZE。
+    fn freeBlock(self: *SlabPool, slab: *Slab) void {
+        const block_ptr: [*]u8 = @ptrCast(slab);
+        self.backing.rawFree(block_ptr[0..SLAB_SIZE], SLAB_ALIGN, @returnAddress());
     }
 
     /// 增加 n 字节活对象统计，同时刷新 live_peak_bytes。所有 live_bytes 自增点经此走，
@@ -196,7 +199,7 @@ pub const SlabPool = struct {
         if (self.live_bytes > self.live_peak_bytes) self.live_peak_bytes = self.live_bytes;
     }
 
-    /// 申请一个 64KB 对齐块并初始化为 class i 的 slab。优先复用全局空 slab 缓存。
+    /// 申请一个 16KB 对齐块并初始化为 class i 的 slab。优先复用全局空 slab 缓存。
     fn newSlab(self: *SlabPool, class_idx: usize) ?*Slab {
         var slab: *Slab = undefined;
         if (self.empty_slabs) |cached| {
@@ -207,14 +210,12 @@ pub const SlabPool = struct {
         } else {
             const block = self.backing.alignedAlloc(u8, SLAB_ALIGN, SLAB_SIZE) catch return null;
             slab = @ptrCast(@alignCast(block.ptr));
-            slab.block = block;
             self.reserved_bytes += SLAB_SIZE;
             if (self.reserved_bytes > self.peak_bytes) self.peak_bytes = self.reserved_bytes;
         }
         const hdr = std.mem.alignForward(usize, @sizeOf(Slab), SLOT_ALIGNMENT);
         const slot_size = SIZE_CLASSES[class_idx];
         const total: u32 = @intCast((SLAB_SIZE - hdr) / slot_size);
-        const block = slab.block;
         slab.* = Slab{
             .magic = SLAB_MAGIC,
             .class_idx = @intCast(class_idx),
@@ -223,7 +224,6 @@ pub const SlabPool = struct {
             .bump = 0,
             .slots_offset = @intCast(hdr),
             .free_list = null,
-            .block = block,
             .next = null,
             .prev = null,
         };
@@ -238,8 +238,8 @@ pub const SlabPool = struct {
             self.empty_slabs = slab;
             self.empty_count += 1;
         } else {
-            self.reserved_bytes -= slab.block.len;
-            self.freeBlock(slab.block);
+            self.reserved_bytes -= SLAB_SIZE;
+            self.freeBlock(slab);
         }
     }
 
@@ -288,7 +288,7 @@ fn vtableAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_ad
     if (len >= LARGE_THRESHOLD or alignment.toByteUnits() > SLOT_ALIGNMENT) {
         const a = @max(alignment.toByteUnits(), SLOT_ALIGNMENT);
         const raw = self.backing.rawAlloc(len, std.mem.Alignment.fromByteUnits(a), @returnAddress()) orelse return null;
-        self.large_objects.append(self.backing, .{ .ptr = raw, .len = len, .alignment = a }) catch {
+        self.large_objects.put(@intFromPtr(raw), .{ .len = len, .alignment = a }) catch {
             self.backing.rawFree(raw[0..len], std.mem.Alignment.fromByteUnits(a), @returnAddress());
             return null;
         };
@@ -323,17 +323,14 @@ fn vtableFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr
     const self: *SlabPool = @ptrCast(@alignCast(ctx));
     const len = buf.len;
 
-    // 大对象：线性查登记表归还。
+    // 大对象：哈希表 O(1) 查登记项归还。
     if (len >= LARGE_THRESHOLD or alignment.toByteUnits() > SLOT_ALIGNMENT) {
-        for (self.large_objects.items, 0..) |obj, i| {
-            if (obj.ptr == buf.ptr) {
-                // 按确保时记录的对齐 rawFree（free 调用方传入的 alignment 可能与 alloc 不同）。
-                self.backing.rawFree(buf.ptr[0..obj.len], std.mem.Alignment.fromByteUnits(obj.alignment), @returnAddress());
-                self.reserved_bytes -= obj.len;
-                self.live_bytes -= obj.len;
-                _ = self.large_objects.swapRemove(i);
-                return;
-            }
+        if (self.large_objects.fetchRemove(@intFromPtr(buf.ptr))) |entry| {
+            const meta = entry.value;
+            // 按确保时记录的对齐 rawFree（free 调用方传入的 alignment 可能与 alloc 不同）。
+            self.backing.rawFree(buf.ptr[0..meta.len], std.mem.Alignment.fromByteUnits(meta.alignment), @returnAddress());
+            self.reserved_bytes -= meta.len;
+            self.live_bytes -= meta.len;
         }
         return; // 未登记：忽略（不属于本 pool）
     }
@@ -439,9 +436,9 @@ test "large objects bypass slabs" {
     const a = pool.allocator();
 
     const big = a.alloc(u8, 100 * 1024) catch unreachable;
-    try testing.expectEqual(@as(usize, 1), pool.large_objects.items.len);
+    try testing.expectEqual(@as(usize, 1), pool.large_objects.count());
     a.free(big);
-    try testing.expectEqual(@as(usize, 0), pool.large_objects.items.len);
+    try testing.expectEqual(@as(usize, 0), pool.large_objects.count());
     try testing.expectEqual(@as(usize, 0), pool.live_bytes);
 }
 

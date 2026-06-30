@@ -1247,8 +1247,8 @@ const FnCompiler = struct {
         return switch (expr.*) {
             .int_literal => |il| blk: {
                 if (il.suffix) |s| break :blk s;
-                const int_val = std.fmt.parseInt(u128, il.raw, 0) catch break :blk null;
-                break :blk @tagName(value.inferIntType(int_val));
+                const parsed = parseIntSoftware(il.raw) orelse break :blk null;
+                break :blk @tagName(parsed.type);
             },
             .float_literal => |fl| if (fl.suffix) |s| s else "f64",
             .bool_literal => "bool",
@@ -2254,33 +2254,239 @@ const FnCompiler = struct {
     }
 };
 
+/// 软件解析整数字面量字符串 → Int（不依赖 u128/i128）。
+/// 支持符号（+/-）、进制前缀（0x/0o/0b）、下划线。不处理类型后缀。
+fn parseIntSoftware(raw: []const u8) ?value.Int {
+    var s = raw;
+    var negative = false;
+    if (s.len > 0 and (s[0] == '-' or s[0] == '+')) {
+        negative = s[0] == '-';
+        s = s[1..];
+    }
+    var base: u8 = 10;
+    if (s.len > 2 and s[0] == '0') {
+        switch (s[1]) {
+            'x', 'X' => { base = 16; s = s[2..]; },
+            'o', 'O' => { base = 8; s = s[2..]; },
+            'b', 'B' => { base = 2; s = s[2..]; },
+            else => {},
+        }
+    }
+    var digits: [128]u8 = undefined;
+    var n: usize = 0;
+    for (s) |c| {
+        if (c == '_') continue;
+        if (n >= digits.len) return null;
+        digits[n] = c;
+        n += 1;
+    }
+    if (n == 0) return null;
+
+    var buf: [16]u8 = undefined;
+    _ = value.int.parseUnsignedBytes(&buf, digits[0..n], base) orelse return null;
+
+    const t = value.inferIntTypeBytes(&buf, negative);
+
+    if (negative) {
+        // 补码取负：~buf + 1（16 字节全量，自动符号扩展）
+        var carry: u16 = 1;
+        for (buf[0..16]) |*b| {
+            const inv: u16 = ~b.*;
+            const sum = inv + carry;
+            b.* = @truncate(sum);
+            carry = sum >> 8;
+        }
+    }
+
+    return value.Int.fromBytes(t, &buf);
+}
+
 /// 解析整数字面量为 Value（镜像 eval.zig evalIntLiteral 的默认最小类型推断）。
+/// 全软件：用 parseIntSoftware（不依赖 u128/i128）。
 fn parseIntLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefined).int_literal)) !?Value {
     _ = allocator;
-    const int_val: u128 = std.fmt.parseInt(u128, lit.raw, 0) catch
-        @bitCast(std.fmt.parseInt(i128, lit.raw, 0) catch return null);
+
     if (lit.suffix) |s| {
-        const t = value.IntType.fromName(s) orelse return null;
-        if (!t.inRange(int_val)) return null;
-        return Value.fromInt(value.Int.fromNative(t, int_val));
+        const target = value.IntType.fromName(s) orelse return null;
+        // 有后缀：解析后用 coerceTo 检查范围
+        const parsed = parseIntSoftware(lit.raw) orelse return null;
+        const coerced = parsed.coerceTo(target) orelse return null;
+        return Value.fromInt(coerced);
     }
-    const t = value.inferIntType(int_val);
-    if (!t.inRange(int_val)) return null;
-    return Value.fromInt(value.Int.fromNative(t, int_val));
+
+    // 无后缀：类型推断
+    const parsed = parseIntSoftware(lit.raw) orelse return null;
+    return Value.fromInt(parsed);
+}
+
+/// 软件解析浮点字面量字符串 → Float(.f128)（不依赖 f128 原生算术）。
+/// 支持符号、小数点、十进制指数（e/E）、下划线。
+/// 算法：解析为 digits + decimal_exp，digits 解析为 u128 Int，fromInt 转 f128，
+/// 再用快速幂乘/除 10^|decimal_exp|，最后应用符号。全精度，不丢精度。
+fn parseFloatSoftware(raw: []const u8) ?value.Float {
+    var s = raw;
+    var negative = false;
+    if (s.len > 0 and (s[0] == '-' or s[0] == '+')) {
+        negative = s[0] == '-';
+        s = s[1..];
+    }
+    if (s.len == 0) return null;
+
+    // 找 e/E 分割尾数和指数
+    var e_pos: usize = s.len;
+    for (s, 0..) |c, i| {
+        if (c == 'e' or c == 'E') {
+            e_pos = i;
+            break;
+        }
+    }
+    const mantissa_str = s[0..e_pos];
+    const exp_str = if (e_pos < s.len) s[e_pos + 1 ..] else "";
+
+    // 解析十进制指数
+    var exp: i32 = 0;
+    if (exp_str.len > 0) {
+        exp = std.fmt.parseInt(i32, exp_str, 10) catch return null;
+    }
+
+    // 分割整数/小数部分
+    var int_part: []const u8 = "";
+    var frac_part: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, mantissa_str, '.')) |dot_pos| {
+        int_part = mantissa_str[0..dot_pos];
+        frac_part = mantissa_str[dot_pos + 1 ..];
+    } else {
+        int_part = mantissa_str;
+    }
+
+    // 合并数字（去除下划线），记录小数位数
+    var digits_buf: [128]u8 = undefined;
+    var digits_len: usize = 0;
+    var frac_digit_count: i32 = 0;
+    for (int_part) |c| {
+        if (c == '_') continue;
+        if (c < '0' or c > '9') return null;
+        if (digits_len >= digits_buf.len) return null;
+        digits_buf[digits_len] = c;
+        digits_len += 1;
+    }
+    for (frac_part) |c| {
+        if (c == '_') continue;
+        if (c < '0' or c > '9') return null;
+        if (digits_len >= digits_buf.len) return null;
+        digits_buf[digits_len] = c;
+        digits_len += 1;
+        frac_digit_count += 1;
+    }
+
+    if (digits_len == 0) return null;
+
+    // 十进制指数 = 字面指数 - 小数位数
+    var decimal_exp = exp - frac_digit_count;
+
+    // 去除前导零（不影响 decimal_exp）
+    var start: usize = 0;
+    while (start < digits_len and digits_buf[start] == '0') start += 1;
+    if (start == digits_len) {
+        // 全零：值为 0
+        var z = value.Float.zero(.f128);
+        if (negative) z = z.negate();
+        return z;
+    }
+
+    // 去除尾随零（每去一个，decimal_exp += 1）
+    var end: usize = digits_len;
+    while (end > start and digits_buf[end - 1] == '0') {
+        end -= 1;
+        decimal_exp += 1;
+    }
+
+    const digits = digits_buf[start..end];
+
+    // 解析 digits 为 Int(.u128)（u128 最大 39 位十进制）
+    // 如果 digits 太长，截断到 39 位并四舍五入（f128 也只能保留 ~34 位有效十进制）
+    var int_val: value.Int = undefined;
+    if (digits.len <= 39) {
+        var buf: [16]u8 = undefined;
+        _ = value.int.parseUnsignedBytes(&buf, digits, 10) orelse return null;
+        int_val = value.Int.fromBytes(.u128, &buf);
+    } else {
+        const trunc_len: usize = 39;
+        var trunc_digits: [39]u8 = undefined;
+        @memcpy(&trunc_digits, digits[0..trunc_len]);
+        // 四舍五入：第 40 位 >= '5' 则进位
+        if (digits[trunc_len] >= '5') {
+            var i: usize = trunc_len;
+            while (i > 0) {
+                i -= 1;
+                if (trunc_digits[i] < '9') {
+                    trunc_digits[i] += 1;
+                    break;
+                }
+                trunc_digits[i] = '0';
+            }
+            if (i == 0 and trunc_digits[0] == '0') {
+                // 全进位：999...9 + 1 = 1000...0
+                trunc_digits[0] = '1';
+                decimal_exp += 1;
+            }
+        }
+        var buf: [16]u8 = undefined;
+        _ = value.int.parseUnsignedBytes(&buf, &trunc_digits, 10) orelse return null;
+        int_val = value.Int.fromBytes(.u128, &buf);
+        decimal_exp += @as(i32, @intCast(digits.len - trunc_len));
+    }
+
+    // 转换为 f128
+    var result = value.Float.fromInt(.f128, int_val);
+
+    // 应用十进制指数（快速幂）
+    if (decimal_exp != 0) {
+        result = applyDecimalExp(result, decimal_exp);
+        if (result.isInfinite() or result.isNan()) return null;
+    }
+
+    // 应用符号
+    if (negative) result = result.negate();
+
+    return result;
+}
+
+/// 计算 float × 10^exp（快速幂，软件 f128 乘除法，不依赖 f128 原生算术）。
+fn applyDecimalExp(base: value.Float, exp: i32) value.Float {
+    if (exp == 0) return base;
+    const ten = value.Float.fromInt(.f128, value.Int.fromNative(.i8, @as(i8, 10)));
+    const abs_e: u32 = @intCast(if (exp < 0) -exp else exp);
+
+    // 快速幂计算 10^abs_e
+    var ten_pow = value.Float.fromInt(.f128, value.Int.fromNative(.i8, @as(i8, 1)));
+    var factor = ten;
+    var bits = abs_e;
+    while (bits > 0) {
+        if (bits & 1 == 1) ten_pow = ten_pow.multiply(factor);
+        bits >>= 1;
+        if (bits > 0) factor = factor.multiply(factor);
+    }
+
+    if (exp > 0) {
+        return base.multiply(ten_pow);
+    } else {
+        return base.divide(ten_pow);
+    }
 }
 
 fn parseFloatLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefined).float_literal)) !?Value {
     _ = allocator;
-    const fv = std.fmt.parseFloat(f128, lit.raw) catch return null;
-    if (std.math.isNan(fv) or std.math.isInf(fv)) return null;
+    const fv = parseFloatSoftware(lit.raw) orelse return null;
+    if (fv.isNan() or fv.isInfinite()) return null;
     if (lit.suffix) |s| {
         const t = value.FloatType.fromName(s) orelse return null;
-        const result = value.Float.fromNative(.f128, fv).toFloatType(t);
+        const result = fv.toFloatType(t);
         if (result.isInfinite()) return null; // 溢出
         return Value.fromFloat(result);
     }
     // 默认使用 f64
-    return Value.fromFloat(value.Float.fromNative(.f128, fv).toFloatType(.f64));
+    return Value.fromFloat(fv.toFloatType(.f64));
 }
 
 /// M5：builtin 数值类型名判定（隐式定型只协调这些）。bool/str 不在内——它们不参与整数宽度
@@ -2352,15 +2558,15 @@ fn builtinNumericTypeOf(ty: *const ast.TypeNode) ?[]const u8 {
     };
 }
 
-/// 模式字面量 → Value 常量（供 OP_TEST_LIT 比较）。int 用 u128 位模式（负数 bitcast，
-/// 与 OP_TEST_LIT 仅比值忽略 tag 一致）。string 须 dupe（常量池随 chunk deinit 释放）。
+/// 模式字面量 → Value 常量（供 OP_TEST_LIT 比较）。int 软件解析存为 i64
+/// （与 OP_TEST_LIT 仅比值忽略 tag 一致）。string 须 dupe（常量池随 chunk deinit 释放）。
 /// 不支持的字面量（解析失败）返回 null → 调用方 Unsupported（回退树遍历器）。
 /// 注：pattern 的 int/float 原始文本含类型后缀（如 "1i64"/"2.0f32"），须剥离后再 parse。
 fn patternLiteralToValue(allocator: std.mem.Allocator, lit: ast.PatternLiteral) CompileError!?Value {
     return switch (lit) {
         .int => |raw| blk: {
             const iv = parsePatternInt(raw) orelse break :blk null;
-            break :blk Value.fromInt(value.Int.fromNative(.i64, iv));
+            break :blk Value.fromInt(iv);
         },
         .float => |raw| blk: {
             const end = floatBodyEnd(raw);
@@ -2383,165 +2589,27 @@ fn floatBodyEnd(raw: []const u8) usize {
     return end;
 }
 
-/// 解析 pattern 整数字面量（含进制前缀 0x/0o/0b、i/u 类型后缀、下划线），返回 u128 位模式。
-fn parsePatternInt(raw: []const u8) ?u128 {
-    var i: usize = 0;
-    var base: u8 = 10;
-    if (raw.len > 2 and raw[0] == '0') {
-        switch (raw[1]) {
-            'x', 'X' => { base = 16; i = 2; },
-            'o', 'O' => { base = 8; i = 2; },
-            'b', 'B' => { base = 2; i = 2; },
-            else => {},
-        }
-    }
-    // 剥离 i/u 类型后缀（仅 i/u 后跟十进制数字，避免误剥十六进制 A–F）。
+/// 解析 pattern 整数字面量（含进制前缀 0x/0o/0b、i/u 类型后缀、下划线），返回 i64 Int。
+/// 全软件：用 parseIntSoftware（不依赖 u128/i128）。
+fn parsePatternInt(raw: []const u8) ?value.Int {
+    // 剥离 i/u 类型后缀（仅 i/u 后跟十进制数字，避免误剥十六进制 A–F）
     var end = raw.len;
     var j = end;
-    while (j > i and raw[j - 1] >= '0' and raw[j - 1] <= '9') j -= 1;
-    if (j > i and j < end and (raw[j - 1] == 'i' or raw[j - 1] == 'u' or raw[j - 1] == 'I' or raw[j - 1] == 'U')) end = j - 1;
-    var buf: [64]u8 = undefined;
-    var n: usize = 0;
-    while (i < end) : (i += 1) {
-        if (raw[i] == '_') continue;
-        if (n >= buf.len) return null;
-        buf[n] = raw[i];
-        n += 1;
+    while (j > 0 and raw[j - 1] >= '0' and raw[j - 1] <= '9') j -= 1;
+    if (j > 0 and j < end and (raw[j - 1] == 'i' or raw[j - 1] == 'u' or raw[j - 1] == 'I' or raw[j - 1] == 'U')) {
+        end = j - 1;
     }
-    if (n == 0) return 0;
-    if (std.fmt.parseInt(u128, buf[0..n], base)) |v| return v else |_| {}
-    if (std.fmt.parseInt(i128, buf[0..n], base)) |v| return @bitCast(v) else |_| {}
-    return null;
+    const parsed = parseIntSoftware(raw[0..end]) orelse return null;
+    // Pattern ints 存为 i64（截取低 8 字节，与旧代码行为一致）
+    return value.Int.fromBytes(.i64, &parsed.bytes);
 }
 
 // ============================================================
 // 测试
 // ============================================================
 
-const vm_mod = @import("vm.zig");
-
 test {
     std.testing.refAllDecls(@import("disasm.zig"));
     std.testing.refAllDecls(@import("cast.zig"));
-}
-
-/// 测试 harness：source → 解析 → 编译 → 调用 entry_name(args)，返回结果整数值。
-/// 解析用 arena（与 main.zig 真实管线一致：AST 节点/子切片一次性释放）。
-/// Program/VM 用传入 allocator（值字节走 refcount，须精确配对，验证无泄漏）。
-fn compileAndCall(allocator: std.mem.Allocator, source: []const u8, entry_name: []const u8, args: []const Value) !u128 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
-    var lex = lexer.Lexer.init(aa, source);
-    const tokens = try lex.tokenize();
-
-    var p = parser.Parser.init(aa, tokens);
-    var module = try p.parseModule("test");
-
-    var mc = ModuleCompiler.init(allocator);
-    defer mc.deinit();
-    defer mc.program.deinit();
-    try mc.compileModule(&module);
-
-    const idx = mc.lookupFn(entry_name) orelse return error.MissingFunction;
-    var vm = vm_mod.VM.init(allocator);
-    defer vm.deinit();
-    const result = try vm.call(&mc.program, idx, args);
-    defer result.release(allocator);
-    // bool 结果（contains/is_empty 等）coerce 为 1/0，便于测试统一用 u128 断言。
-    if (result == .boolean) return if (result.asBool()) 1 else 0;
-    return result.asInt().toNative(u128);
-}
-
-/// M5j：编译入口源 + 一个依赖源（依赖在前注册），跑 entry_name，返回整数结果。
-fn compileAndCallWithDep(allocator: std.mem.Allocator, dep_source: []const u8, entry_source: []const u8, entry_name: []const u8) !u128 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
-    var dlex = lexer.Lexer.init(aa, dep_source);
-    const dtokens = try dlex.tokenize();
-    var dp = parser.Parser.init(aa, dtokens);
-    const dep_module = try dp.parseModule("Dep");
-
-    var elex = lexer.Lexer.init(aa, entry_source);
-    const etokens = try elex.tokenize();
-    var ep = parser.Parser.init(aa, etokens);
-    var entry_module = try ep.parseModule("test");
-
-    var mc = ModuleCompiler.init(allocator);
-    defer mc.deinit();
-    defer mc.program.deinit();
-    try mc.compileModuleWithDeps(&entry_module, &.{dep_module});
-
-    const idx = mc.lookupFn(entry_name) orelse return error.MissingFunction;
-    var vm = vm_mod.VM.init(allocator);
-    defer vm.deinit();
-    const result = try vm.call(&mc.program, idx, &.{});
-    defer result.release(allocator);
-    if (result == .boolean) return if (result.boolean) 1 else 0;
-    return result.integer.value;
-}
-
-/// M5o：编译入口 + 父依赖模块 + 其 pub pack 子模块（均显式传入，模拟 collectUseDependencies
-/// 加载目录模块 + 子模块的结果，子模块先于父）。跑 entry_name 返回整数。供模块值测试。
-fn compileAndCallWithPackDep(
-    allocator: std.mem.Allocator,
-    parent_name: []const u8,
-    parent_source: []const u8,
-    sub_name: []const u8,
-    sub_source: []const u8,
-    entry_source: []const u8,
-    entry_name: []const u8,
-) !u128 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
-    var slex = lexer.Lexer.init(aa, sub_source);
-    var sp = parser.Parser.init(aa, try slex.tokenize());
-    const sub_module = try sp.parseModule(sub_name);
-
-    var plex = lexer.Lexer.init(aa, parent_source);
-    var pp = parser.Parser.init(aa, try plex.tokenize());
-    const parent_module = try pp.parseModule(parent_name);
-
-    var elex = lexer.Lexer.init(aa, entry_source);
-    var ep = parser.Parser.init(aa, try elex.tokenize());
-    var entry_module = try ep.parseModule("test");
-
-    var mc = ModuleCompiler.init(allocator);
-    defer mc.deinit();
-    defer mc.program.deinit();
-    // 子模块先于父（collectUseDependencies 的顺序：子模块值定义先于父引用）。
-    try mc.compileModuleWithDeps(&entry_module, &.{ sub_module, parent_module });
-
-    const idx = mc.lookupFn(entry_name) orelse return error.MissingFunction;
-    var vm = vm_mod.VM.init(allocator);
-    defer vm.deinit();
-    const result = try vm.call(&mc.program, idx, &.{});
-    defer result.release(allocator);
-    if (result == .boolean) return if (result.boolean) 1 else 0;
-    return result.integer.value;
-}
-
-
-/// 非整数结果的测试。arena 在返回前 deinit，故结果不可借用 AST 字节（error_newtype 走 dupe 安全）。
-fn compileAndValue(allocator: std.mem.Allocator, program_out: *Program, source: []const u8, entry_name: []const u8) !Value {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-    var lex = lexer.Lexer.init(aa, source);
-    const tokens = try lex.tokenize();
-    var p = parser.Parser.init(aa, tokens);
-    var module = try p.parseModule("test");
-    var mc = ModuleCompiler.init(allocator);
-    defer mc.deinit();
-    try mc.compileModule(&module);
-    program_out.* = mc.program; // 移交 program 所有权给调用方（持有 error_ctors 等借用 AST 的描述）
-    const idx = mc.lookupFn(entry_name) orelse return error.MissingFunction;
-    var vm = vm_mod.VM.init(allocator);
-    defer vm.deinit();
-    return try vm.call(program_out, idx, &.{});
+    std.testing.refAllDecls(@import("method.zig"));
 }

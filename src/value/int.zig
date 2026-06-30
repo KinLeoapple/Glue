@@ -1,29 +1,23 @@
 //! 自定义整数类型——Type 枚举 + Int 结构体
 //!
-//! 用 [N]u8 小端补码字节数组存储所有整数类型（i8/i16/i32/i64/i128, u8/u16/u32/u64/u128）。
-//! 同一位宽的 signed/unsigned 共用同一 ByteArray union 变体，符号性由 Type 字段区分。
-//! 运算时解包到 [16]u8 固定缓冲区统一处理，避免 5×5 union 组合 switch 嵌套。
+//! 用 [16]u8 小端补码字节数组（定长）存储所有整数类型（i8/i16/i32/i64/i128,
+//! u8/u16/u32/u64/u128）。同一位宽的 signed/unsigned 共用同一 [16]u8 缓冲，
+//! 符号性由 Type 字段区分；有效字节数 = type.byteLength()，高位字节不参与运算
+//! （构造时清零，读取只取前 N 字节）。运算时解包到同一 [16]u8 缓冲统一处理。
 //!
-//! ByteArray 定义在 byte_array.zig（与 float.zig 共用）。
+//! 注：原 ByteArray union(tag + 变长 [N]u8) 与 Type 字段冗余编码位宽，已移除；
+//! byte_array.zig 仅保留字节 IO 原语（loadWord/storeWord/loadU128/storeU128）。
 //!
 //! 命名规范：方法名全部使用完整单词，不使用缩写。
 
 const std = @import("std");
-const builtin = @import("builtin");
-const ByteArray = @import("byte_array.zig").ByteArray;
-
-// x86_64 汇编 extern 声明（符号定义在 arch/x86_64/int.S；大写 S 走 C 预处理器）
-extern fn glue_cmp_bytes(a: [*]const u8, b: [*]const u8, len: u8, signed: bool) i8;
-extern fn glue_add_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8, signed: bool) u8;
-extern fn glue_sub_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8, signed: bool) u8;
-extern fn glue_mul_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8, signed: bool) u8;
-extern fn glue_divmod_bytes(out_q: [*]u8, out_r: [*]u8, a: [*]const u8, b: [*]const u8, len: u8, signed: bool) u8;
-extern fn glue_and_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) void;
-extern fn glue_or_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) void;
-extern fn glue_xor_bytes(out: [*]u8, a: [*]const u8, b: [*]const u8, len: u8) void;
-extern fn glue_not_bytes(out: [*]u8, a: [*]const u8, len: u8) void;
-extern fn glue_shl_bytes(out: [*]u8, a: [*]const u8, len: u8, n: u8) void;
-extern fn glue_shr_bytes(out: [*]u8, a: [*]const u8, len: u8, signed: bool, n: u8) void;
+const byte_array = @import("byte_array.zig");
+const wide = @import("wide.zig");
+const U128 = wide.U128;
+const loadWord = wide.loadWord;
+const storeWord = wide.storeWord;
+const mulU64ToU128 = wide.mulU64ToU128;
+const multiplyU64Schoolbook = wide.multiplyU64Schoolbook;
 
 /// 整数类型枚举：10 个变体
 pub const Type = enum {
@@ -107,6 +101,25 @@ pub const Type = enum {
         };
     }
 
+    /// 字节级范围检查：16 字节缓冲（已符号/零扩展）是否落在 self 类型范围内。
+    /// 不依赖 Zig 128 位类型，纯字节比较。
+    /// 有符号类型：高位填充字节必须与符号扩展一致（负数 0xFF / 正数 0x00）。
+    /// 无符号类型：高位填充字节必须全为 0x00（值非负且不超出 n 字节表示范围）。
+    pub fn inRangeBytes(self: Type, buf: *const [16]u8) bool {
+        const n = self.byteLength();
+        if (self.isSigned()) {
+            const sign_byte: u8 = if ((buf[n - 1] & 0x80) != 0) 0xFF else 0x00;
+            for (buf[n..16]) |b| {
+                if (b != sign_byte) return false;
+            }
+        } else {
+            for (buf[n..16]) |b| {
+                if (b != 0x00) return false;
+            }
+        }
+        return true;
+    }
+
     /// 从类型名构造（"i8"/"i16"/.../"u128"），不匹配返回 null
     pub fn fromName(name: []const u8) ?Type {
         if (std.mem.eql(u8, name, "i8")) return .i8;
@@ -123,26 +136,31 @@ pub const Type = enum {
     }
 };
 
+/// 加减乘结果（命名结构体，避免各函数匿名结构体类型不匹配）
+pub const OverflowResult = struct { result: Int, overflow: bool };
+
+/// 除法结果（命名结构体，避免各函数匿名结构体类型不匹配）
+pub const DivModResult = struct { quotient: Int, remainder: Int };
+
 /// 单一 Int 结构体：type + bytes + 运算方法
-///
-/// 所有算术/位运算内部统一走"解包到 [16]u8 → 字节运算 → 打包回 union"三步：
-/// - unpackToBuffer: 把 union 变体拷到 buf 前 N 字节，剩余 16-N 字节按符号扩展或零扩展填满
-/// - 运算: 基于 [16]u8 + 有效字节数 + 符号性，逐字节进位链/schoolbook/位移长除法
-/// - packFromBuffer: 按 type.byteLength() 截取前 N 字节构造对应 union 变体
 pub const Int = struct {
     type: Type,
-    bytes: ByteArray,
+    bytes: [16]u8,
+
+    /// 有效字节切片（只读）。长度由 type.byteLength() 决定，等价于旧的 ByteArray.slice()
+    /// 但无 union tag 分派，直接取定长缓冲的前 N 字节。
+    pub inline fn slice(self: *const Int) []const u8 {
+        return self.bytes[0..self.type.byteLength()];
+    }
+
+    /// 有效字节切片（可变）
+    pub inline fn sliceMutable(self: *Int) []u8 {
+        return self.bytes[0..self.type.byteLength()];
+    }
 
     /// 全零值
     pub fn zero(t: Type) Int {
-        return .{ .type = t, .bytes = switch (t.byteLength()) {
-            1 => .{ .b1 = [_]u8{0} },
-            2 => .{ .b2 = [_]u8{0} ** 2 },
-            4 => .{ .b4 = [_]u8{0} ** 4 },
-            8 => .{ .b8 = [_]u8{0} ** 8 },
-            16 => .{ .b16 = [_]u8{0} ** 16 },
-            else => unreachable,
-        } };
+        return .{ .type = t, .bytes = [_]u8{0} ** 16 };
     }
 
     /// 从原生值构造（内存拷贝，不触发原生算术 codegen）
@@ -150,14 +168,17 @@ pub const Int = struct {
     pub fn fromNative(t: Type, v: anytype) Int {
         const nbytes = t.byteLength();
         const src: [*]const u8 = @ptrCast(&v);
-        return .{ .type = t, .bytes = switch (nbytes) {
-            1 => .{ .b1 = src[0..1].* },
-            2 => .{ .b2 = src[0..2].* },
-            4 => .{ .b4 = src[0..4].* },
-            8 => .{ .b8 = src[0..8].* },
-            16 => .{ .b16 = src[0..16].* },
-            else => unreachable,
-        } };
+        var result: Int = .{ .type = t, .bytes = [_]u8{0} ** 16 };
+        @memcpy(result.bytes[0..nbytes], src[0..nbytes]);
+        return result;
+    }
+
+    /// 从 U128 构造（零拷贝：直接写入定长缓冲，截取低 t.byteLength() 字节）
+    /// 供 Float.toInt 使用，绕过 u128 形参的 IO 边界例外
+    pub fn fromU128Unchecked(t: Type, val: U128) Int {
+        var result = Int.zero(t);
+        byte_array.storeU128(result.bytes[0..t.byteLength()], val);
+        return result;
     }
 
     /// 转为原生值（内存拷贝 + 符号/零扩展）
@@ -165,7 +186,7 @@ pub const Int = struct {
     pub fn toNative(self: Int, comptime T: type) T {
         var result: T = std.mem.zeroes(T);
         const dst: [*]u8 = @ptrCast(&result);
-        const src = self.bytes.slice();
+        const src = self.slice();
         const n = src.len;
         const sz = @sizeOf(T);
         if (n <= sz) {
@@ -180,29 +201,14 @@ pub const Int = struct {
     }
 
     /// 比较两个 Int（要求 self.type == other.type）
-    /// 架构分派：x86_64 走汇编 glue_cmp_bytes，其他走 portable 软件实现
     pub fn compare(self: Int, other: Int) std.math.Order {
-        return switch (builtin.cpu.arch) {
-            .x86_64 => switch (glue_cmp_bytes(
-                self.bytes.slice().ptr,
-                other.bytes.slice().ptr,
-                self.type.byteLength(),
-                self.type.isSigned(),
-            )) {
-                -1 => .lt,
-                0 => .eq,
-                1 => .gt,
-                else => unreachable,
-            },
-            else => comparePortable(self, other),
-        };
+        return comparePortable(self, other);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
     fn comparePortable(self: Int, other: Int) std.math.Order {
         const signed = self.type.isSigned();
-        const a = self.bytes.slice();
-        const b = other.bytes.slice();
+        const a = self.slice();
+        const b = other.slice();
 
         if (signed) {
             const a_neg = (a[a.len - 1] & 0x80) != 0;
@@ -218,151 +224,141 @@ pub const Int = struct {
     /// 返回有效字节数
     fn unpackToBuffer(self: Int, buf: *[16]u8) u8 {
         const nbytes = self.type.byteLength();
-        const src = self.bytes.slice();
+        const src = self.slice();
         @memcpy(buf[0..nbytes], src);
         const fill: u8 = if (self.type.isSigned() and (src[nbytes - 1] & 0x80) != 0) 0xFF else 0x00;
         @memset(buf[nbytes..16], fill);
         return nbytes;
     }
 
-    /// 从 [16]u8 缓冲区打包回 union（截取前 N 字节）
+    /// 从 [16]u8 缓冲区打包回 Int（拷贝全 16 字节；仅前 N 字节有效）
+    pub fn fromBytes(t: Type, buf: *const [16]u8) Int {
+        return .{ .type = t, .bytes = buf.* };
+    }
+
+    /// 从 [16]u8 缓冲区打包回 Int（内部别名，向后兼容）
     fn packFromBuffer(t: Type, buf: *const [16]u8) Int {
-        const nbytes = t.byteLength();
-        return .{ .type = t, .bytes = switch (nbytes) {
-            1 => .{ .b1 = buf[0..1].* },
-            2 => .{ .b2 = buf[0..2].* },
-            4 => .{ .b4 = buf[0..4].* },
-            8 => .{ .b8 = buf[0..8].* },
-            16 => .{ .b16 = buf[0..16].* },
-            else => unreachable,
-        } };
+        return fromBytes(t, buf);
     }
 
     // —— 算术（S3-S5 实现）——
 
     /// 加法。要求 self.type == other.type，结果 type 同。
-    /// 架构分派：x86_64 走汇编 glue_add_bytes，其他走 addPortable。
-    pub fn add(self: Int, other: Int) struct { result: Int, overflow: bool } {
+    pub fn add(self: Int, other: Int) OverflowResult {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                const status = glue_add_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength(), self.type.isSigned());
-                break :blk .{ .result = Int.packFromBuffer(self.type, &r16), .overflow = status != 0 };
-            },
-            else => addPortable(self, other),
-        };
+        return addPortable(self, other);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
-    fn addPortable(self: Int, other: Int) struct { result: Int, overflow: bool } {
+    fn addPortable(self: Int, other: Int) OverflowResult {
         const t = self.type;
-        const a = self.bytes.slice();
-        const b = other.bytes.slice();
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        var carry: u16 = 0;
-        var i: usize = 0;
-        while (i < a.len) : (i += 1) {
-            const sum: u16 = @as(u16, a[i]) + @as(u16, b[i]) + carry;
-            r16[i] = @truncate(sum);
-            carry = sum >> 8;
-        }
-        const unsigned_overflow = carry != 0;
         const signed = t.isSigned();
-        var signed_overflow = false;
+        var result_bytes: [16]u8 = [_]u8{0} ** 16;
+        const a = self.slice();
+        const b = other.slice();
+        const r = result_bytes[0..t.byteLength()];
+
+        const unsigned_overflow = switch (t.byteLength()) {
+            1 => addWordN(u8, r, a, b),
+            2 => addWordN(u16, r, a, b),
+            4 => addWordN(u32, r, a, b),
+            8 => addWordN(u64, r, a, b),
+            16 => blk: {
+                const av = U128.load(a);
+                const bv = U128.load(b);
+                const result = av.add(bv);
+                result.sum.store(r);
+                break :blk result.carry != 0;
+            },
+            else => unreachable,
+        };
+
         if (signed) {
             const a_sign = (a[a.len - 1] & 0x80) != 0;
             const b_sign = (b[b.len - 1] & 0x80) != 0;
-            const r_sign = (r16[a.len - 1] & 0x80) != 0;
-            signed_overflow = (a_sign == b_sign) and (r_sign != a_sign);
+            const r_sign = (r[r.len - 1] & 0x80) != 0;
+            return .{
+                .result = .{ .type = t, .bytes = result_bytes },
+                .overflow = (a_sign == b_sign) and (r_sign != a_sign),
+            };
         }
-        return .{
-            .result = Int.packFromBuffer(t, &r16),
-            .overflow = if (signed) signed_overflow else unsigned_overflow,
-        };
+        return .{ .result = .{ .type = t, .bytes = result_bytes }, .overflow = unsigned_overflow };
     }
 
     /// 减法。要求 self.type == other.type，结果 type 同。
-    /// 架构分派：x86_64 走汇编 glue_sub_bytes，其他走 subtractPortable。
-    pub fn subtract(self: Int, other: Int) struct { result: Int, overflow: bool } {
+    pub fn subtract(self: Int, other: Int) OverflowResult {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                const status = glue_sub_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength(), self.type.isSigned());
-                break :blk .{ .result = Int.packFromBuffer(self.type, &r16), .overflow = status != 0 };
-            },
-            else => subtractPortable(self, other),
-        };
+        return subtractPortable(self, other);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
-    fn subtractPortable(self: Int, other: Int) struct { result: Int, overflow: bool } {
+    fn subtractPortable(self: Int, other: Int) OverflowResult {
         const t = self.type;
-        const a = self.bytes.slice();
-        const b = other.bytes.slice();
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        var carry: u16 = 1; // +1 完成补码取反
-        var i: usize = 0;
-        while (i < a.len) : (i += 1) {
-            const inv_b: u8 = ~b[i];
-            const sum: u16 = @as(u16, a[i]) + @as(u16, inv_b) + carry;
-            r16[i] = @truncate(sum);
-            carry = sum >> 8;
-        }
-        const unsigned_overflow = (carry == 0);
         const signed = t.isSigned();
-        var signed_overflow = false;
+        var result_bytes: [16]u8 = [_]u8{0} ** 16;
+        const a = self.slice();
+        const b = other.slice();
+        const r = result_bytes[0..t.byteLength()];
+
+        const unsigned_overflow = switch (t.byteLength()) {
+            1 => subWordN(u8, r, a, b),
+            2 => subWordN(u16, r, a, b),
+            4 => subWordN(u32, r, a, b),
+            8 => subWordN(u64, r, a, b),
+            16 => blk: {
+                const av = U128.load(a);
+                const bv = U128.load(b);
+                const result = av.sub(bv);
+                result.diff.store(r);
+                break :blk result.borrow != 0;
+            },
+            else => unreachable,
+        };
+
         if (signed) {
             const a_sign = (a[a.len - 1] & 0x80) != 0;
             const b_sign = (b[b.len - 1] & 0x80) != 0;
-            const r_sign = (r16[a.len - 1] & 0x80) != 0;
-            signed_overflow = (a_sign != b_sign) and (r_sign != a_sign);
+            const r_sign = (r[r.len - 1] & 0x80) != 0;
+            return .{
+                .result = .{ .type = t, .bytes = result_bytes },
+                .overflow = (a_sign != b_sign) and (r_sign != a_sign),
+            };
         }
-        return .{
-            .result = Int.packFromBuffer(t, &r16),
-            .overflow = if (signed) signed_overflow else unsigned_overflow,
-        };
+        return .{ .result = .{ .type = t, .bytes = result_bytes }, .overflow = unsigned_overflow };
     }
 
     /// 是否为负数（无符号类型恒为 false）
     pub fn isNegative(self: Int) bool {
         if (!self.type.isSigned()) return false;
-        const a = self.bytes.slice();
+        const a = self.slice();
         return (a[a.len - 1] & 0x80) != 0;
     }
 
     /// 取负（补码取反加一）。minInt 取负溢出返回自身（two's complement 回绕）。
+    /// 字块化：用 u8/u16/u32/u64/U128 替代逐字节循环。
     pub fn negate(self: Int) Int {
-        const a = self.bytes.slice();
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        var carry: u16 = 1;
-        var i: usize = 0;
-        while (i < a.len) : (i += 1) {
-            const inv: u8 = ~a[i];
-            const sum: u16 = @as(u16, inv) + carry;
-            r16[i] = @truncate(sum);
-            carry = sum >> 8;
+        var result_bytes: [16]u8 = [_]u8{0} ** 16;
+        const a = self.slice();
+        const r = result_bytes[0..self.type.byteLength()];
+        switch (self.type.byteLength()) {
+            1 => negateWordN(u8, r, a),
+            2 => negateWordN(u16, r, a),
+            4 => negateWordN(u32, r, a),
+            8 => negateWordN(u64, r, a),
+            16 => {
+                const av = U128.load(a);
+                av.negate().store(r);
+            },
+            else => unreachable,
         }
-        return Int.packFromBuffer(self.type, &r16);
+        return .{ .type = self.type, .bytes = result_bytes };
     }
 
     /// 乘法。要求 self.type == other.type，结果 type 同。
-    /// 架构分派：x86_64 走汇编 glue_mul_bytes，其他走 multiplyPortable。
-    pub fn multiply(self: Int, other: Int) struct { result: Int, overflow: bool } {
+    pub fn multiply(self: Int, other: Int) OverflowResult {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                const status = glue_mul_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength(), self.type.isSigned());
-                break :blk .{ .result = Int.packFromBuffer(self.type, &r16), .overflow = status != 0 };
-            },
-            else => multiplyPortable(self, other),
-        };
+        return multiplyPortable(self, other);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
-    fn multiplyPortable(self: Int, other: Int) struct { result: Int, overflow: bool } {
+    fn multiplyPortable(self: Int, other: Int) OverflowResult {
         const t = self.type;
         const n = t.byteLength();
         const signed = t.isSigned();
@@ -370,19 +366,52 @@ pub const Int = struct {
         // 绝对值（无符号即自身）
         var abs_a_buf: [16]u8 = [_]u8{0} ** 16;
         var abs_b_buf: [16]u8 = [_]u8{0} ** 16;
-        @memcpy(abs_a_buf[0..n], self.bytes.slice());
-        @memcpy(abs_b_buf[0..n], other.bytes.slice());
+        @memcpy(abs_a_buf[0..n], self.slice());
+        @memcpy(abs_b_buf[0..n], other.slice());
         if (signed and self.isNegative()) negateBytesInPlace(abs_a_buf[0..n]);
         if (signed and other.isNegative()) negateBytesInPlace(abs_b_buf[0..n]);
 
-        var magnitude: [32]u8 = undefined;
-        schoolbookMultiply(abs_a_buf[0..n], abs_b_buf[0..n], magnitude[0 .. n * 2]);
+        // 完整乘积（2N 字节，用于溢出判定）
+        var magnitude: [32]u8 = [_]u8{0} ** 32;
+        const a = abs_a_buf[0..n];
+        const b = abs_b_buf[0..n];
+        const m = magnitude[0 .. n * 2];
 
-        // 结果 = magnitude 低 N 字节；有符号且结果为负时取负
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        @memcpy(r16[0..n], magnitude[0..n]);
+        switch (n) {
+            1 => {
+                const prod: u16 = @as(u16, a[0]) * @as(u16, b[0]);
+                m[0] = @truncate(prod);
+                m[1] = @truncate(prod >> 8);
+            },
+            2 => {
+                const av: u16 = loadWord(u16, a);
+                const bv: u16 = loadWord(u16, b);
+                const prod: u32 = @as(u32, av) * @as(u32, bv);
+                storeWord(u32, m, prod);
+            },
+            4 => {
+                const av: u32 = loadWord(u32, a);
+                const bv: u32 = loadWord(u32, b);
+                const prod: u64 = @as(u64, av) * @as(u64, bv);
+                storeWord(u64, m, prod);
+            },
+            8 => {
+                const av: u64 = loadWord(u64, a);
+                const bv: u64 = loadWord(u64, b);
+                const prod = mulU64ToU128(av, bv);
+                storeWord(u64, m[0..8], prod.lo);
+                storeWord(u64, m[8..16], prod.hi);
+            },
+            16 => multiplyU64Schoolbook(m, a, b),
+            else => unreachable,
+        }
+
+        // 结果容器（直接写入定长缓冲前 N 字节）
+        var result_bytes: [16]u8 = [_]u8{0} ** 16;
+        const r = result_bytes[0..n];
+        @memcpy(r, magnitude[0..n]);
         const result_sign = signed and (self.isNegative() != other.isNegative());
-        if (result_sign) negateBytesInPlace(r16[0..n]);
+        if (result_sign) negateBytesInPlace(r);
 
         // 溢出判定
         var overflow = false;
@@ -407,7 +436,7 @@ pub const Int = struct {
             }
         }
 
-        return .{ .result = Int.packFromBuffer(t, &r16), .overflow = overflow };
+        return .{ .result = .{ .type = t, .bytes = result_bytes }, .overflow = overflow };
     }
 
     /// 截断除法（商向零取整，余数符号同被除数）。
@@ -425,47 +454,34 @@ pub const Int = struct {
     }
 
     /// 内部：同时返回 quotient 和 remainder。
-    /// 架构分派：x86_64 走汇编 glue_divmod_bytes，其他走 divideWithRemainderPortable。
     /// minInt/-1 和除零在分派前统一拦截（≤64位 idiv 会 #DE）。
-    fn divideWithRemainder(self: Int, other: Int) error{DivideByZero}!struct { quotient: Int, remainder: Int } {
+    fn divideWithRemainder(self: Int, other: Int) error{DivideByZero}!DivModResult {
         std.debug.assert(self.type == other.type);
         const t = self.type;
         const n = t.byteLength();
         const signed = t.isSigned();
 
         // 除零检测
-        if (isAllZero(other.bytes.slice())) return error.DivideByZero;
+        if (isAllZero(other.slice())) return error.DivideByZero;
 
         // minInt / -1 边界：返回 minInt（商），0（余数），与 Zig @divTrunc/@mod 一致
         // 必须在调用汇编前拦截（≤64位 idiv 会 #DE）
         if (signed) {
             var neg_one_buf: [16]u8 = [_]u8{0} ** 16;
             @memset(neg_one_buf[0..n], 0xFF);
-            const other_is_neg_one = (compareBytes(other.bytes.slice(), neg_one_buf[0..n]) == .eq);
+            const other_is_neg_one = (compareBytes(other.slice(), neg_one_buf[0..n]) == .eq);
             var min_int_buf: [16]u8 = [_]u8{0} ** 16;
             min_int_buf[n - 1] = 0x80;
-            const self_is_min_int = (compareBytes(self.bytes.slice(), min_int_buf[0..n]) == .eq);
+            const self_is_min_int = (compareBytes(self.slice(), min_int_buf[0..n]) == .eq);
             if (other_is_neg_one and self_is_min_int) {
                 return .{ .quotient = self, .remainder = Int.zero(t) };
             }
         }
 
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var q16: [16]u8 = undefined;
-                var r16: [16]u8 = undefined;
-                _ = glue_divmod_bytes(&q16, &r16, self.bytes.slice().ptr, other.bytes.slice().ptr, n, signed);
-                break :blk .{
-                    .quotient = Int.packFromBuffer(t, &q16),
-                    .remainder = Int.packFromBuffer(t, &r16),
-                };
-            },
-            else => divideWithRemainderPortable(self, other),
-        };
+        return divideWithRemainderPortable(self, other);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
-    fn divideWithRemainderPortable(self: Int, other: Int) struct { quotient: Int, remainder: Int } {
+    fn divideWithRemainderPortable(self: Int, other: Int) DivModResult {
         const t = self.type;
         const n = t.byteLength();
         const signed = t.isSigned();
@@ -473,204 +489,248 @@ pub const Int = struct {
         // 取绝对值
         var abs_a_buf: [16]u8 = [_]u8{0} ** 16;
         var abs_b_buf: [16]u8 = [_]u8{0} ** 16;
-        @memcpy(abs_a_buf[0..n], self.bytes.slice());
-        @memcpy(abs_b_buf[0..n], other.bytes.slice());
+        @memcpy(abs_a_buf[0..n], self.slice());
+        @memcpy(abs_b_buf[0..n], other.slice());
         const a_neg = signed and self.isNegative();
         const b_neg = signed and other.isNegative();
         if (a_neg) negateBytesInPlace(abs_a_buf[0..n]);
         if (b_neg) negateBytesInPlace(abs_b_buf[0..n]);
 
-        // 无符号恢复式长除法
-        var quotient_buf: [16]u8 = [_]u8{0} ** 16;
-        var remainder_buf: [17]u8 = [_]u8{0} ** 17; // 多 1 字节防左移溢出
-        unsignedDivide(abs_a_buf[0..n], abs_b_buf[0..n], quotient_buf[0..n], remainder_buf[0 .. n + 1]);
+        const a = abs_a_buf[0..n];
+        const b = abs_b_buf[0..n];
 
-        // 修正符号
-        // 截断除法：商符号 = 异号；余数符号 = 同被除数
-        const quotient_neg = a_neg != b_neg;
-        if (quotient_neg) negateBytesInPlace(quotient_buf[0..n]);
-        if (a_neg) negateBytesInPlace(remainder_buf[0..n]);
+        // 结果容器（直接写入定长缓冲前 N 字节）
+        var quotient_bytes: [16]u8 = [_]u8{0} ** 16;
+        var remainder_bytes: [16]u8 = [_]u8{0} ** 16;
+        const q = quotient_bytes[0..n];
+        const r = remainder_bytes[0..n];
 
-        var rem16: [16]u8 = [_]u8{0} ** 16;
-        @memcpy(rem16[0..n], remainder_buf[0..n]);
+        switch (n) {
+            1 => {
+                const av: u8 = a[0];
+                const bv: u8 = b[0];
+                q[0] = av / bv;
+                r[0] = av % bv;
+            },
+            2 => {
+                const av: u16 = loadWord(u16, a);
+                const bv: u16 = loadWord(u16, b);
+                storeWord(u16, q, av / bv);
+                storeWord(u16, r, av % bv);
+            },
+            4 => {
+                const av: u32 = loadWord(u32, a);
+                const bv: u32 = loadWord(u32, b);
+                storeWord(u32, q, av / bv);
+                storeWord(u32, r, av % bv);
+            },
+            8 => {
+                const av: u64 = loadWord(u64, a);
+                const bv: u64 = loadWord(u64, b);
+                storeWord(u64, q, av / bv);
+                storeWord(u64, r, av % bv);
+            },
+            16 => {
+                // u128/u128：unsignedDivide128 直接写入 q/r（均 16 字节），无需临时缓冲。
+                // 快路径（除数 fit u64）走 2 次原生 u64 除法，慢路径走 U128 位级长除法。
+                unsignedDivide128(a, b, q, r);
+            },
+            else => unreachable,
+        }
+
+        // 修正符号（截断除法：商符号 = 异号；余数符号 = 同被除数）
+        if (a_neg != b_neg) negateBytesInPlace(q);
+        if (a_neg) negateBytesInPlace(r);
+
         return .{
-            .quotient = Int.packFromBuffer(t, &quotient_buf),
-            .remainder = Int.packFromBuffer(t, &rem16),
+            .quotient = .{ .type = t, .bytes = quotient_bytes },
+            .remainder = .{ .type = t, .bytes = remainder_bytes },
         };
     }
 
     // —— 位运算（S6 实现）——
 
     /// 按位与。要求 self.type == other.type。
-    /// 架构分派：x86_64 走汇编 glue_and_bytes，其他走 bitwisePortable。
     pub fn bitwiseAnd(self: Int, other: Int) Int {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                glue_and_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
-                break :blk Int.packFromBuffer(self.type, &r16);
-            },
-            else => bitwisePortable(self, other, .and_op),
-        };
+        return bitwisePortable(self, other, .and_op);
     }
 
     /// 按位或。要求 self.type == other.type。
     pub fn bitwiseOr(self: Int, other: Int) Int {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                glue_or_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
-                break :blk Int.packFromBuffer(self.type, &r16);
-            },
-            else => bitwisePortable(self, other, .or_op),
-        };
+        return bitwisePortable(self, other, .or_op);
     }
 
     /// 按位异或。要求 self.type == other.type。
     pub fn bitwiseXor(self: Int, other: Int) Int {
         std.debug.assert(self.type == other.type);
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                glue_xor_bytes(&r16, self.bytes.slice().ptr, other.bytes.slice().ptr, self.type.byteLength());
-                break :blk Int.packFromBuffer(self.type, &r16);
-            },
-            else => bitwisePortable(self, other, .xor_op),
-        };
+        return bitwisePortable(self, other, .xor_op);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
-    fn bitwisePortable(self: Int, other: Int, op: enum { and_op, or_op, xor_op }) Int {
+    fn bitwisePortable(self: Int, other: Int, op: BitwiseOp) Int {
         const t = self.type;
-        const n = t.byteLength();
-        const a = self.bytes.slice();
-        const b = other.bytes.slice();
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            r16[i] = switch (op) {
-                .and_op => a[i] & b[i],
-                .or_op => a[i] | b[i],
-                .xor_op => a[i] ^ b[i],
-            };
+        var result_bytes: [16]u8 = [_]u8{0} ** 16;
+        const a = self.slice();
+        const b = other.slice();
+        const r = result_bytes[0..t.byteLength()];
+        switch (t.byteLength()) {
+            1 => bitwiseWordN(u8, r, a, b, op),
+            2 => bitwiseWordN(u16, r, a, b, op),
+            4 => bitwiseWordN(u32, r, a, b, op),
+            8 => bitwiseWordN(u64, r, a, b, op),
+            16 => {
+                const av = U128.load(a);
+                const bv = U128.load(b);
+                const result = switch (op) {
+                    .and_op => U128{ .hi = av.hi & bv.hi, .lo = av.lo & bv.lo },
+                    .or_op => U128{ .hi = av.hi | bv.hi, .lo = av.lo | bv.lo },
+                    .xor_op => U128{ .hi = av.hi ^ bv.hi, .lo = av.lo ^ bv.lo },
+                };
+                result.store(r);
+            },
+            else => unreachable,
         }
-        return Int.packFromBuffer(t, &r16);
+        return .{ .type = t, .bytes = result_bytes };
     }
 
     /// 按位取反（逐字节 ~）。对有符号类型等价于 -x - 1。
-    /// 架构分派：x86_64 走汇编 glue_not_bytes，其他走 bitwiseNotPortable。
     pub fn bitwiseNot(self: Int) Int {
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                glue_not_bytes(&r16, self.bytes.slice().ptr, self.type.byteLength());
-                break :blk Int.packFromBuffer(self.type, &r16);
-            },
-            else => bitwiseNotPortable(self),
-        };
+        return bitwiseNotPortable(self);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
     fn bitwiseNotPortable(self: Int) Int {
         const t = self.type;
-        const n = t.byteLength();
-        const a = self.bytes.slice();
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        var i: usize = 0;
-        while (i < n) : (i += 1) r16[i] = ~a[i];
-        return Int.packFromBuffer(t, &r16);
+        var result_bytes: [16]u8 = [_]u8{0} ** 16;
+        const a = self.slice();
+        const r = result_bytes[0..t.byteLength()];
+        switch (t.byteLength()) {
+            1 => notWordN(u8, r, a),
+            2 => notWordN(u16, r, a),
+            4 => notWordN(u32, r, a),
+            8 => notWordN(u64, r, a),
+            16 => {
+                const av = U128.load(a);
+                const not_av = U128{ .hi = ~av.hi, .lo = ~av.lo };
+                not_av.store(r);
+            },
+            else => unreachable,
+        }
+        return .{ .type = t, .bytes = result_bytes };
     }
 
     /// 逻辑左移 n 位（无符号与有符号语义一致，低位补 0）。
     /// n >= bitWidth 时返回 zero。
-    /// 架构分派：x86_64 走汇编 glue_shl_bytes，其他走 shiftLeftPortable。
     pub fn shiftLeft(self: Int, n: u8) Int {
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                glue_shl_bytes(&r16, self.bytes.slice().ptr, self.type.byteLength(), n);
-                break :blk Int.packFromBuffer(self.type, &r16);
-            },
-            else => shiftLeftPortable(self, n),
-        };
+        return shiftLeftPortable(self, n);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
     fn shiftLeftPortable(self: Int, n: u8) Int {
         const t = self.type;
         const bit_width = t.bitWidth();
         if (n >= bit_width) return Int.zero(t);
         const nbytes = t.byteLength();
-        const a = self.bytes.slice();
-        var r16: [16]u8 = [_]u8{0} ** 16;
-        const byte_shift: usize = n / 8;
-        const bit_shift: u3 = @intCast(n % 8);
-        var i: usize = 0;
-        while (i < nbytes) : (i += 1) {
-            const dst = i + byte_shift;
-            if (dst >= nbytes) break;
-            const v: u16 = @as(u16, a[i]) << bit_shift;
-            r16[dst] |= @truncate(v);
-            // 高位部分进入下一字节
-            if (bit_shift != 0 and dst + 1 < nbytes) {
-                r16[dst + 1] |= @truncate(v >> 8);
-            }
+        var result_bytes: [16]u8 = [_]u8{0} ** 16;
+        const a = self.slice();
+        const r = result_bytes[0..nbytes];
+        switch (nbytes) {
+            1 => shiftLeftWordN(u8, r, a, n),
+            2 => shiftLeftWordN(u16, r, a, n),
+            4 => shiftLeftWordN(u32, r, a, n),
+            8 => shiftLeftWordN(u64, r, a, n),
+            16 => {
+                const av = U128.load(a);
+                av.shiftLeft(n).store(r);
+            },
+            else => unreachable,
         }
-        return Int.packFromBuffer(t, &r16);
+        return .{ .type = t, .bytes = result_bytes };
     }
 
     /// 右移 n 位。无符号类型为逻辑右移（高位补 0）；有符号类型为算术右移（高位补符号位）。
     /// n >= bitWidth 时：无符号返回 zero；有符号返回 0（正数）或 -1（负数）。
-    /// 架构分派：x86_64 走汇编 glue_shr_bytes，其他走 shiftRightPortable。
     pub fn shiftRight(self: Int, n: u8) Int {
-        return switch (builtin.cpu.arch) {
-            .x86_64 => blk: {
-                var r16: [16]u8 = undefined;
-                glue_shr_bytes(&r16, self.bytes.slice().ptr, self.type.byteLength(), self.type.isSigned(), n);
-                break :blk Int.packFromBuffer(self.type, &r16);
-            },
-            else => shiftRightPortable(self, n),
-        };
+        return shiftRightPortable(self, n);
     }
 
-    /// 便携软件实现（非 x86_64 架构回退路径）
     fn shiftRightPortable(self: Int, n: u8) Int {
         const t = self.type;
-        const bit_width = t.bitWidth();
-        const nbytes = t.byteLength();
-        const a = self.bytes.slice();
+        const signed = t.isSigned();
+        var result_bytes: [16]u8 = [_]u8{0} ** 16;
+        const a = self.slice();
+        const r = result_bytes[0..t.byteLength()];
+        switch (t.byteLength()) {
+            1 => shiftRightWordN(u8, r, a, n, signed),
+            2 => shiftRightWordN(u16, r, a, n, signed),
+            4 => shiftRightWordN(u32, r, a, n, signed),
+            8 => shiftRightWordN(u64, r, a, n, signed),
+            16 => {
+                const av = U128.load(a);
+                av.shiftRight(n, signed).store(r);
+            },
+            else => unreachable,
+        }
+        return .{ .type = t, .bytes = result_bytes };
+    }
 
-        if (n >= bit_width) {
-            if (t.isSigned() and (a[nbytes - 1] & 0x80) != 0) {
-                // 负数算术右移 >= 位宽 → 全 1（-1）
-                var r16: [16]u8 = [_]u8{0} ** 16;
-                @memset(r16[0..nbytes], 0xFF);
-                return Int.packFromBuffer(t, &r16);
-            }
-            return Int.zero(t);
+    /// 类型转换：将 self 转为 target 类型表示。
+    /// 全软件字节级：先符号/零扩展到 16 字节，再用 inRangeBytes 检查是否在目标范围内，
+    /// 最后截取低 target.byteLength() 字节打包。超出范围返回 null（调用方处理溢出）。
+    /// 同类型直接返回 self；宽化总是成功；窄化仅在值落在目标范围内时成功。
+    pub fn coerceTo(self: Int, target: Type) ?Int {
+        if (self.type == target) return self;
+        var buf: [16]u8 = [_]u8{0} ** 16;
+        _ = self.unpackToBuffer(&buf);
+        if (!target.inRangeBytes(&buf)) return null;
+        return packFromBuffer(target, &buf);
+    }
+
+    /// 是否为零（全字节为 0）
+    pub fn isZero(self: Int) bool {
+        return isAllZero(self.slice());
+    }
+
+    /// 十进制格式化：将 self 写入 buf，返回写入的切片。
+    /// 全软件字节级：负数取绝对值后，反复除以 10 收集余数（数字），最后反转。
+    /// 不依赖 Zig 原生 i128/u128，不丢失精度。
+    /// buf 需至少 41 字节（u128 最大 39 位 + 符号 + 空终止余量）。
+    pub fn formatDecimal(self: Int, buf: []u8) []const u8 {
+        const a = self.slice();
+        if (isAllZero(a)) {
+            buf[0] = '0';
+            return buf[0..1];
         }
 
-        const byte_shift: usize = n / 8;
-        const bit_shift: u3 = @intCast(n % 8);
-        const fill: u8 = if (t.isSigned() and (a[nbytes - 1] & 0x80) != 0) 0xFF else 0x00;
-        var r16: [16]u8 = [_]u8{0} ** 16;
-
-        var i: usize = 0;
-        while (i < nbytes) : (i += 1) {
-            const src_idx = i + byte_shift;
-            const src_byte: u8 = if (src_idx < nbytes) a[src_idx] else fill;
-            const next_byte: u8 = if (src_idx + 1 < nbytes) a[src_idx + 1] else fill;
-            if (bit_shift == 0) {
-                r16[i] = src_byte;
-            } else {
-                const low: u16 = @as(u16, src_byte) >> bit_shift;
-                const high: u16 = @as(u16, next_byte) << @intCast(8 - @as(u8, bit_shift));
-                r16[i] = @truncate(low | high);
-            }
+        // 提取绝对值到可变缓冲
+        var mag: [16]u8 = [_]u8{0} ** 16;
+        const n = a.len;
+        @memcpy(mag[0..n], a);
+        var negative = false;
+        if (self.type.isSigned() and (mag[n - 1] & 0x80) != 0) {
+            negative = true;
+            negateBytesInPlace(mag[0..n]);
         }
-        return Int.packFromBuffer(t, &r16);
+
+        // 反复除以 10，收集数字（逆序）
+        var pos: usize = 0;
+        while (!isAllZero(mag[0..n])) {
+            var rem: u16 = 0;
+            var i: usize = n;
+            while (i > 0) {
+                i -= 1;
+                const val: u16 = @as(u16, rem) * 256 + @as(u16, mag[i]);
+                mag[i] = @truncate(val / 10);
+                rem = val % 10;
+            }
+            buf[pos] = '0' + @as(u8, @intCast(rem));
+            pos += 1;
+        }
+        if (negative) {
+            buf[pos] = '-';
+            pos += 1;
+        }
+        std.mem.reverse(u8, buf[0..pos]);
+        return buf[0..pos];
     }
 
     // —— 浮点尾数运算辅助（S8+ 实现，供 float.zig 委托）——
@@ -679,112 +739,271 @@ pub const Int = struct {
     // fn leastSignificantBit(self: Int) u8
 };
 
-/// 从高位到低位逐字节比较（无符号语义，要求等长）
+// —— 字块化运算辅助（用 u8/u16/u32/u64 作为字块替代逐字节循环）——
+// loadWord/storeWord/mulU64ToU128/multiplyU64Schoolbook/U128 等基础原语从 wide.zig 导入。
+
+/// 字块加法：r = a + b，返回 carry（1=无符号溢出）
+fn addWordN(comptime Word: type, r: []u8, a: []const u8, b: []const u8) bool {
+    const av = loadWord(Word, a);
+    const bv = loadWord(Word, b);
+    const sum, const carry = @addWithOverflow(av, bv);
+    storeWord(Word, r, sum);
+    return carry != 0;
+}
+
+/// 字块减法：r = a - b，返回 borrow（1=无符号下溢）
+fn subWordN(comptime Word: type, r: []u8, a: []const u8, b: []const u8) bool {
+    const av = loadWord(Word, a);
+    const bv = loadWord(Word, b);
+    const diff, const borrow = @subWithOverflow(av, bv);
+    storeWord(Word, r, diff);
+    return borrow != 0;
+}
+
+/// 字块取负：r = -a（补码取反加一，0 - a）
+fn negateWordN(comptime Word: type, r: []u8, a: []const u8) void {
+    const av = loadWord(Word, a);
+    storeWord(Word, r, ~av +% 1);
+}
+
+/// 位运算种类（命名枚举，供 bitwisePortable / bitwiseWordN 共用，避免匿名枚举类型不匹配）
+const BitwiseOp = enum { and_op, or_op, xor_op };
+
+/// 字块位运算：r = a op b
+fn bitwiseWordN(comptime Word: type, r: []u8, a: []const u8, b: []const u8, op: BitwiseOp) void {
+    const av = loadWord(Word, a);
+    const bv = loadWord(Word, b);
+    storeWord(Word, r, switch (op) {
+        .and_op => av & bv,
+        .or_op => av | bv,
+        .xor_op => av ^ bv,
+    });
+}
+
+/// 字块取反：r = ~a
+fn notWordN(comptime Word: type, r: []u8, a: []const u8) void {
+    const av = loadWord(Word, a);
+    storeWord(Word, r, ~av);
+}
+
+/// 字块左移：r = a << n（n >= bit_width 时 r = 0）
+fn shiftLeftWordN(comptime Word: type, r: []u8, a: []const u8, n: u8) void {
+    const av = loadWord(Word, a);
+    const bit_width: u8 = @intCast(@bitSizeOf(Word));
+    if (n >= bit_width) {
+        storeWord(Word, r, 0);
+        return;
+    }
+    const ShiftType = std.math.Log2Int(Word);
+    storeWord(Word, r, av << @as(ShiftType, @intCast(n)));
+}
+
+/// 字块右移：r = a >> n。
+/// arithmetic=true 时按补码符号位填充高位（算术右移），否则补 0（逻辑右移）。
+/// n >= bit_width 时：算术右移且符号位为 1 → 全 1；否则全 0。
+fn shiftRightWordN(comptime Word: type, r: []u8, a: []const u8, n: u8, arithmetic: bool) void {
+    const av = loadWord(Word, a);
+    const bit_width: u8 = @intCast(@bitSizeOf(Word));
+    const sign_bit_set = (av >> @intCast(bit_width - 1)) != 0;
+    if (n >= bit_width) {
+        const fill: Word = if (arithmetic and sign_bit_set) ~@as(Word, 0) else 0;
+        storeWord(Word, r, fill);
+        return;
+    }
+    const ShiftType = std.math.Log2Int(Word);
+    const sh: ShiftType = @intCast(n);
+    const shifted = av >> sh;
+    if (arithmetic and sign_bit_set and n > 0) {
+        // 高 n 位填充符号位 1（n=0 时无需填充，shifted 已是原值）
+        const fill_mask: Word = ~@as(Word, 0) << @intCast(bit_width - n);
+        storeWord(Word, r, shifted | fill_mask);
+        return;
+    }
+    storeWord(Word, r, shifted);
+}
+
+/// u64×u64→u128 与 u128*u128→u256 的 schoolbook 乘法基础原语从 wide.zig 导入。
+/// multiplyPortable 使用 multiplyU64Schoolbook 完成 u128*u128→u256（4 次 64×64 部分积累加）。
+/// mulU64ToU128 用 32 位半字 schoolbook，避免依赖 Zig u128 平台行为。
+
+/// 从高位到低位比较（无符号语义，要求等长）。u64 字块化：每次比较 8 字节，
+/// 命中差异立即返回；剩余不足 8 字节退化为逐字节。
 fn compareBytes(a: []const u8, b: []const u8) std.math.Order {
+    std.debug.assert(a.len == b.len);
     var i = a.len;
+    while (i >= 8) {
+        i -= 8;
+        const av = loadWord(u64, a[i..][0..8]);
+        const bv = loadWord(u64, b[i..][0..8]);
+        if (av != bv) return if (av < bv) .lt else .gt;
+    }
     while (i > 0) {
         i -= 1;
-        if (a[i] < b[i]) return .lt;
-        if (a[i] > b[i]) return .gt;
+        if (a[i] != b[i]) return if (a[i] < b[i]) .lt else .gt;
     }
     return .eq;
 }
 
-/// 检查所有字节是否为 0
+/// 检查所有字节是否为 0。u64 字块化：每次检查 8 字节，命中非零立即返回。
 fn isAllZero(s: []const u8) bool {
-    for (s) |b| {
-        if (b != 0) return false;
+    var i: usize = 0;
+    while (i + 8 <= s.len) : (i += 8) {
+        if (loadWord(u64, s[i..][0..8]) != 0) return false;
+    }
+    while (i < s.len) : (i += 1) {
+        if (s[i] != 0) return false;
     }
     return true;
 }
 
-/// 原地左移一位（带跨字节进位）
-fn shiftLeftOneBit(s: []u8) void {
-    var carry: u8 = 0;
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        const new_byte: u8 = (s[i] << 1) | carry;
-        carry = s[i] >> 7;
-        s[i] = new_byte;
-    }
-}
+/// 将无符号整数字符串解析为 [16]u8 小端缓冲（软件乘加，不依赖 u128/i128）。
+/// 输入：纯数字字符串（已去除符号、进制前缀、类型后缀、下划线）。
+/// 返回有效字节数（1-16），溢出（>128 位）或解析失败返回 null。
+/// buf 由调用方提供，函数内清零后写入。
+pub fn parseUnsignedBytes(buf: *[16]u8, raw: []const u8, base: u8) ?u8 {
+    @memset(buf, 0);
+    if (raw.len == 0) return null;
 
-/// 原地无符号减法 a -= b（假定 a >= b，调用方负责保证）。b 不足 a.len 的高位按 0 处理。
-fn subtractBytesInPlace(a: []u8, b: []const u8) void {
-    var borrow: i16 = 0;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        const bi: u16 = if (i < b.len) b[i] else 0;
-        const diff: i16 = @as(i16, a[i]) - @as(i16, @intCast(bi)) - borrow;
-        if (diff < 0) {
-            a[i] = @intCast(diff + 256);
-            borrow = 1;
-        } else {
-            a[i] = @intCast(diff);
-            borrow = 0;
+    for (raw) |c| {
+        const digit: u64 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => return null,
+        };
+        if (digit >= base) return null;
+
+        // buf = buf * base + digit（u64 字块乘加）
+        var carry: u64 = digit;
+        var i: usize = 0;
+        while (i < 16) : (i += 8) {
+            const word = loadWord(u64, buf[i..][0..8]);
+            const product = mulU64ToU128(word, @as(u64, base));
+            const sum_lo, const c1 = @addWithOverflow(product.lo, carry);
+            storeWord(u64, buf[i..][0..8], sum_lo);
+            carry = product.hi +% c1;
         }
+        if (carry != 0) return null; // 超出 128 位
     }
+
+    // 计算有效字节数
+    var n: u8 = 16;
+    while (n > 1 and buf[n - 1] == 0) n -= 1;
+    return n;
 }
 
-/// 无符号恢复式长除法：a / b = quotient ... remainder。
-/// quotient 长度 = a.len；remainder 长度须为 a.len + 1（防左移溢出）。
-/// 调用前 quotient/remainder 会被清零。
-fn unsignedDivide(a: []const u8, b: []const u8, quotient: []u8, remainder: []u8) void {
-    @memset(quotient, 0);
-    @memset(remainder, 0);
+/// 128/64 无符号除法：(hi:lo) / d → (quot, rem)。
+/// 要求 d != 0 且 hi < d（保证商 ≤ u64 最大值）且 hi < 2^32（保证 (hi<<32)|... 不溢出 u64）。
+/// 用 2 次原生 u64 除法实现（高 32 位 / 低 32 位 各一次），仅用于 d ≤ 2^32 的快路径。
+fn divmod128by64(hi: u64, lo: u64, d: u64) struct { quot: u64, rem: u64 } {
+    std.debug.assert(d != 0);
+    std.debug.assert(hi < d);
+    std.debug.assert(hi < 0x100000000); // hi < 2^32，保证 (hi << 32) | ... 不溢出
+    // 高 32 位字块：combined_hi = (hi << 32) | (lo >> 32)，因 hi < 2^32 故 combined_hi < 2^64
+    const combined_hi: u64 = (hi << 32) | (lo >> 32);
+    const q_hi32: u64 = combined_hi / d;
+    const r2: u64 = combined_hi % d;
+    // 低 32 位字块：combined_lo = (r2 << 32) | (lo & 0xFFFFFFFF)，因 r2 < d ≤ 2^32 故 r2 < 2^32
+    const combined_lo: u64 = (r2 << 32) | (lo & 0xFFFFFFFF);
+    const q_lo32: u64 = combined_lo / d;
+    const r_final: u64 = combined_lo % d;
+    return .{ .quot = (q_hi32 << 32) | q_lo32, .rem = r_final };
+}
 
-    const total_bits = a.len * 8;
-    var bit: usize = total_bits;
+/// 无符号 128/128 除法：a / b = quotient ... remainder（均 16 字节小端）。
+/// 三条路径（按除数大小）：
+///   1) b.hi != 0（除数 > 64 位）：U128 位级长除法，128 次迭代，每次 ~3 次 u64 操作。
+///   2) b.hi == 0 且 d ≤ 2^32：2 次原生 u64 除法（divmod128by64），约 10 次 u64 操作。最快。
+///   3) b.hi == 0 且 d > 2^32：位级长除法（64 次迭代，u64 操作），约 256 次 u64 操作。
+/// 调用方保证 b != 0（除零由 divideWithRemainder 拦截）。
+fn unsignedDivide128(a: []const u8, b: []const u8, quotient: []u8, remainder: []u8) void {
+    std.debug.assert(a.len == 16 and b.len == 16);
+    std.debug.assert(quotient.len == 16 and remainder.len >= 16);
+    @memset(quotient, 0);
+    @memset(remainder[0..16], 0);
+
+    const av = U128.load(a);
+    const bv = U128.load(b);
+    std.debug.assert(!bv.isZero());
+
+    // 路径 2/3：除数 fit u64（bv.hi == 0）
+    if (bv.hi == 0) {
+        const d: u64 = bv.lo;
+        // 高 64 位：av.hi / d（av.hi 可能 ≥ d，q_hi 拿到 av.hi / d，余数 rem < d）
+        const q_hi: u64 = av.hi / d;
+        const rem: u64 = av.hi % d; // rem < d
+
+        var q_lo: u64 = 0;
+        var r_final: u64 = undefined;
+        if (d <= 0x100000000) {
+            // 路径 2：d ≤ 2^32，rem < d ≤ 2^32，divmod128by64 前置条件满足
+            const result = divmod128by64(rem, av.lo, d);
+            q_lo = result.quot;
+            r_final = result.rem;
+        } else {
+            // 路径 3：d > 2^32，rem 可能 ≥ 2^32，位级长除法处理低 64 位（64 次迭代）
+            r_final = rem;
+            var bit: u8 = 64;
+            while (bit > 0) {
+                bit -= 1;
+                const shift_amt: u6 = @intCast(bit);
+                const a_bit: u1 = @truncate((av.lo >> shift_amt) & 1);
+                // 检测 rem<<1 是否溢出（bit 63 在移位前是否为 1）
+                const overflow = (r_final >> 63) != 0;
+                r_final = (r_final << 1) | a_bit;
+                // overflow 时真值 = r_final + 2^64 ≥ d 必减；否则比较 r_final 与 d
+                // wrapping sub 在两种情形都给出正确的 u64 余数
+                if (overflow or r_final >= d) {
+                    r_final -%= d;
+                    q_lo |= (@as(u64, 1) << shift_amt);
+                }
+            }
+        }
+
+        storeWord(u64, quotient[0..8], q_lo);
+        storeWord(u64, quotient[8..16], q_hi);
+        storeWord(u64, remainder[0..8], r_final);
+        return;
+    }
+
+    // 路径 1：除数 > 64 位 → U128 位级二进制长除法（128 次迭代）
+    var rem = U128.zero();
+    var quot = U128.zero();
+    var bit: u8 = 128;
     while (bit > 0) {
         bit -= 1;
-        // remainder 左移 1 位
-        shiftLeftOneBit(remainder);
-        // 把 a 的 bit 位拉到 remainder 的 LSB
-        const byte_idx = bit / 8;
-        const bit_idx: u3 = @intCast(bit % 8);
-        if ((a[byte_idx] >> bit_idx) & 1 != 0) {
-            remainder[0] |= 1;
-        }
-        // 试减：若 remainder >= b 则减，quotient 对应位置 1
-        // remainder 用前 b.len 字节与 b 比较（高位 remainder[b.len..] 在 remainder < 2*b 的过程中最多进位 1 字节）
-        if (compareBytes(remainder[0..b.len], b) != .lt) {
-            subtractBytesInPlace(remainder[0..b.len], b);
-            quotient[byte_idx] |= (@as(u8, 1) << bit_idx);
+        // rem 左移 1 位，最低位填入 a 的 bit 位
+        const a_bit: u1 = if (av.testBit(bit)) 1 else 0;
+        const shifted = rem.shiftLeft1WithBit(a_bit);
+        rem = shifted.result;
+        // 若 rem >= b：rem -= b，quotient 对应位置 1
+        if (rem.compare(bv) != .lt) {
+            const sub_result = rem.sub(bv);
+            rem = sub_result.diff;
+            quot = quot.orBit(bit);
         }
     }
+    quot.store(quotient);
+    rem.store(remainder);
 }
 
-/// 原地补码取负（取反加一）
+/// 原地补码取负（取反加一）。u64 字块化：每次处理 8 字节，跨字块用 u64 carry；
+/// 剩余不足 8 字节退化为逐字节。
 fn negateBytesInPlace(s: []u8) void {
-    var carry: u16 = 1;
+    var carry: u64 = 1;
     var i: usize = 0;
+    while (i + 8 <= s.len) : (i += 8) {
+        const av = loadWord(u64, s[i..][0..8]);
+        const inv = ~av;
+        const sum, const overflow = @addWithOverflow(inv, carry);
+        storeWord(u64, s[i..][0..8], sum);
+        carry = overflow;
+    }
     while (i < s.len) : (i += 1) {
         const inv: u8 = ~s[i];
-        const sum: u16 = @as(u16, inv) + carry;
-        s[i] = @truncate(sum);
-        carry = sum >> 8;
-    }
-}
-
-/// schoolbook 逐字节乘法。out 长度须为 a.len + b.len，写入前清零由本函数完成。
-fn schoolbookMultiply(a: []const u8, b: []const u8, out: []u8) void {
-    @memset(out, 0);
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        var carry: u16 = 0;
-        var j: usize = 0;
-        while (j < b.len) : (j += 1) {
-            const prod: u16 = @as(u16, a[i]) * @as(u16, b[j]) + @as(u16, out[i + j]) + carry;
-            out[i + j] = @truncate(prod);
-            carry = prod >> 8;
-        }
-        // 把剩余 carry 向高位传播
-        var k: usize = i + b.len;
-        while (carry != 0 and k < out.len) : (k += 1) {
-            const sum: u16 = @as(u16, out[k]) + carry;
-            out[k] = @truncate(sum);
-            carry = sum >> 8;
-        }
+        const sum, const overflow = @addWithOverflow(inv, @as(u8, @truncate(carry)));
+        s[i] = sum;
+        carry = overflow;
     }
 }
 
@@ -836,27 +1055,6 @@ test "Type.fromName" {
     try std.testing.expectEqual(@as(?Type, .u64), Type.fromName("u64"));
     try std.testing.expectEqual(@as(?Type, null), Type.fromName("f32"));
     try std.testing.expectEqual(@as(?Type, null), Type.fromName("xyz"));
-}
-
-test "ByteArray.byteLength" {
-    const b1 = ByteArray{ .b1 = [_]u8{0} };
-    const b2 = ByteArray{ .b2 = [_]u8{ 0, 0 } };
-    const b4 = ByteArray{ .b4 = [_]u8{ 0, 0, 0, 0 } };
-    const b8 = ByteArray{ .b8 = [_]u8{0} ** 8 };
-    const b16 = ByteArray{ .b16 = [_]u8{0} ** 16 };
-    try std.testing.expectEqual(@as(u8, 1), b1.byteLength());
-    try std.testing.expectEqual(@as(u8, 2), b2.byteLength());
-    try std.testing.expectEqual(@as(u8, 4), b4.byteLength());
-    try std.testing.expectEqual(@as(u8, 8), b8.byteLength());
-    try std.testing.expectEqual(@as(u8, 16), b16.byteLength());
-}
-
-test "ByteArray.slice" {
-    var ba = ByteArray{ .b4 = [_]u8{ 0x01, 0x02, 0x03, 0x04 } };
-    const s = ba.slice();
-    try std.testing.expectEqual(@as(usize, 4), s.len);
-    try std.testing.expectEqual(@as(u8, 0x01), s[0]);
-    try std.testing.expectEqual(@as(u8, 0x04), s[3]);
 }
 
 test "Int.fromNative/toNative roundtrip" {
@@ -1250,6 +1448,64 @@ test "Int.divideTruncating/remainder divide by zero" {
     try std.testing.expectError(error.DivideByZero, Int.fromNative(.u128, @as(u128, std.math.maxInt(u128))).divideTruncating(Int.fromNative(.u128, @as(u128, 0))));
 }
 
+test "Int.divideTruncating i128 covers unsignedDivide128 three paths" {
+    // 路径 2：除数 fit u64 且 d ≤ 2^32（divmod128by64 2 次原生除法）
+    // 覆盖 i128 正/负被除数 × 正/负除数 四种符号组合，确保符号修正后仍命中路径 2。
+    {
+        const cases = [_]struct { a: i128, b: i128 }{
+            .{ .a = std.math.maxInt(i128), .b = 7 },
+            .{ .a = std.math.minInt(i128) + 1, .b = 7 },
+            .{ .a = std.math.maxInt(i128), .b = -7 },
+            .{ .a = std.math.minInt(i128) + 1, .b = -7 },
+            .{ .a = std.math.maxInt(i128), .b = 1 }, // d=1，边界
+            .{ .a = std.math.maxInt(i128), .b = 0x100000000 }, // d=2^32，路径 2 上界
+        };
+        for (cases) |c| {
+            const a = Int.fromNative(.i128, @as(i128, c.a));
+            const b = Int.fromNative(.i128, @as(i128, c.b));
+            const q = try a.divideTruncating(b);
+            const r = try a.remainder(b);
+            try std.testing.expectEqual(@divTrunc(@as(i128, c.a), @as(i128, c.b)), q.toNative(i128));
+            try std.testing.expectEqual(@rem(@as(i128, c.a), @as(i128, c.b)), r.toNative(i128));
+        }
+    }
+    // 路径 3：除数 fit u64 且 d > 2^32（位级长除法 64 次迭代）
+    {
+        const cases = [_]struct { a: i128, b: i128 }{
+            .{ .a = std.math.maxInt(i128), .b = @as(i128, 1) << 60 }, // d=2^60
+            .{ .a = std.math.minInt(i128) + 1, .b = @as(i128, 1) << 60 },
+            .{ .a = std.math.maxInt(i128), .b = -(@as(i128, 1) << 60) },
+            .{ .a = std.math.minInt(i128) + 1, .b = -(@as(i128, 1) << 60) },
+            .{ .a = std.math.maxInt(i128), .b = @as(i128, 1) << 33 }, // d=2^33，路径 3 下界
+        };
+        for (cases) |c| {
+            const a = Int.fromNative(.i128, @as(i128, c.a));
+            const b = Int.fromNative(.i128, @as(i128, c.b));
+            const q = try a.divideTruncating(b);
+            const r = try a.remainder(b);
+            try std.testing.expectEqual(@divTrunc(@as(i128, c.a), @as(i128, c.b)), q.toNative(i128));
+            try std.testing.expectEqual(@rem(@as(i128, c.a), @as(i128, c.b)), r.toNative(i128));
+        }
+    }
+    // 路径 1：除数 > 64 位（U128 位级长除法 128 次迭代）
+    {
+        const cases = [_]struct { a: u128, b: u128 }{
+            .{ .a = std.math.maxInt(u128), .b = @as(u128, 1) << 100 },
+            .{ .a = std.math.maxInt(u128), .b = @as(u128, 1) << 127 }, // 仅最高位
+            .{ .a = std.math.maxInt(u128), .b = std.math.maxInt(u128) }, // 商=1
+            .{ .a = std.math.maxInt(u128) - 1, .b = std.math.maxInt(u128) }, // 商=0
+        };
+        for (cases) |c| {
+            const a = Int.fromNative(.u128, @as(u128, c.a));
+            const b = Int.fromNative(.u128, @as(u128, c.b));
+            const q = try a.divideTruncating(b);
+            const r = try a.remainder(b);
+            try std.testing.expectEqual(@divTrunc(@as(u128, c.a), @as(u128, c.b)), q.toNative(u128));
+            try std.testing.expectEqual(@rem(@as(u128, c.a), @as(u128, c.b)), r.toNative(u128));
+        }
+    }
+}
+
 test "Int.bitwiseAnd/Or/Xor/Not match native" {
     const i8_cases = [_]i8{ 0, 1, -1, 5, -5, 85, -86, 127, -128 };
     for (i8_cases) |av| {
@@ -1373,5 +1629,125 @@ test "Int.shiftRight matches native >> (arithmetic for signed, logical for unsig
     {
         try std.testing.expectEqual(@as(u128, std.math.maxInt(u128)) >> 100, Int.fromNative(.u128, @as(u128, std.math.maxInt(u128))).shiftRight(100).toNative(u128));
         try std.testing.expectEqual(@as(u128, 0), Int.fromNative(.u128, @as(u128, std.math.maxInt(u128))).shiftRight(128).toNative(u128));
+    }
+}
+
+// ============================================================
+// coerceTo 测试：支撑 §2.15 类型转换规范（widening 总是成功，narrowing 范围检查）
+// ============================================================
+
+test "Int.coerceTo same type returns self" {
+    const v = Int.fromNative(.i32, @as(i32, 42));
+    const r = v.coerceTo(.i32).?;
+    try std.testing.expectEqual(@as(i32, 42), r.toNative(i32));
+}
+
+test "Int.coerceTo widening always succeeds" {
+    // 有符号 widening：i8 → i16/i32/i64/i128
+    {
+        const v = Int.fromNative(.i8, @as(i8, -1));
+        try std.testing.expectEqual(@as(i16, -1), v.coerceTo(.i16).?.toNative(i16));
+        try std.testing.expectEqual(@as(i32, -1), v.coerceTo(.i32).?.toNative(i32));
+        try std.testing.expectEqual(@as(i64, -1), v.coerceTo(.i64).?.toNative(i64));
+        try std.testing.expectEqual(@as(i128, -1), v.coerceTo(.i128).?.toNative(i128));
+    }
+    // 无符号 widening：u8 → u16/u32/u64/u128
+    {
+        const v = Int.fromNative(.u8, @as(u8, 200));
+        try std.testing.expectEqual(@as(u16, 200), v.coerceTo(.u16).?.toNative(u16));
+        try std.testing.expectEqual(@as(u32, 200), v.coerceTo(.u32).?.toNative(u32));
+        try std.testing.expectEqual(@as(u64, 200), v.coerceTo(.u64).?.toNative(u64));
+        try std.testing.expectEqual(@as(u128, 200), v.coerceTo(.u128).?.toNative(u128));
+    }
+    // 边界值 widening：i8 max/min → i16
+    {
+        try std.testing.expectEqual(@as(i16, 127), Int.fromNative(.i8, @as(i8, 127)).coerceTo(.i16).?.toNative(i16));
+        try std.testing.expectEqual(@as(i16, -128), Int.fromNative(.i8, @as(i8, -128)).coerceTo(.i16).?.toNative(i16));
+    }
+    // u8 max → u16
+    {
+        try std.testing.expectEqual(@as(u16, 255), Int.fromNative(.u8, @as(u8, 255)).coerceTo(.u16).?.toNative(u16));
+    }
+}
+
+test "Int.coerceTo narrowing in-range succeeds" {
+    // i32 → i8，值在 i8 范围内
+    {
+        const v = Int.fromNative(.i32, @as(i32, 100));
+        try std.testing.expectEqual(@as(i8, 100), v.coerceTo(.i8).?.toNative(i8));
+    }
+    // i32 → i8 边界值
+    {
+        try std.testing.expectEqual(@as(i8, 127), Int.fromNative(.i32, @as(i32, 127)).coerceTo(.i8).?.toNative(i8));
+        try std.testing.expectEqual(@as(i8, -128), Int.fromNative(.i32, @as(i32, -128)).coerceTo(.i8).?.toNative(i8));
+    }
+    // i64 → i32
+    {
+        const v = Int.fromNative(.i64, @as(i64, 1_000_000));
+        try std.testing.expectEqual(@as(i32, 1_000_000), v.coerceTo(.i32).?.toNative(i32));
+    }
+    // u32 → u8
+    {
+        const v = Int.fromNative(.u32, @as(u32, 200));
+        try std.testing.expectEqual(@as(u8, 200), v.coerceTo(.u8).?.toNative(u8));
+    }
+}
+
+test "Int.coerceTo narrowing out-of-range returns null" {
+    // i32 → i8 超范围
+    {
+        const v = Int.fromNative(.i32, @as(i32, 128));
+        try std.testing.expect(v.coerceTo(.i8) == null);
+    }
+    {
+        const v = Int.fromNative(.i32, @as(i32, -129));
+        try std.testing.expect(v.coerceTo(.i8) == null);
+    }
+    // i64 → i32 超范围
+    {
+        const v = Int.fromNative(.i64, @as(i64, std.math.maxInt(i32) + 1));
+        try std.testing.expect(v.coerceTo(.i32) == null);
+    }
+    // u32 → u8 超范围
+    {
+        const v = Int.fromNative(.u32, @as(u32, 256));
+        try std.testing.expect(v.coerceTo(.u8) == null);
+    }
+    // i128 → i64 超范围（F4 场景：doForNext 索引 narrowing）
+    {
+        const v = Int.fromNative(.i128, @as(i128, std.math.maxInt(i64) + 1));
+        try std.testing.expect(v.coerceTo(.i64) == null);
+    }
+    {
+        const v = Int.fromNative(.i128, @as(i128, std.math.minInt(i64) - 1));
+        try std.testing.expect(v.coerceTo(.i64) == null);
+    }
+    // u128 → i64 超范围（无符号大值 → 有符号窄类型）
+    {
+        const v = Int.fromNative(.u128, @as(u128, std.math.maxInt(i64) + 1));
+        try std.testing.expect(v.coerceTo(.i64) == null);
+    }
+}
+
+test "Int.coerceTo cross-sign narrowing" {
+    // 负数 i → u：返回 null（负值不在无符号范围内）
+    {
+        const v = Int.fromNative(.i32, @as(i32, -1));
+        try std.testing.expect(v.coerceTo(.u32) == null);
+    }
+    // 正数 i → u：在范围内成功
+    {
+        const v = Int.fromNative(.i32, @as(i32, 42));
+        try std.testing.expectEqual(@as(u32, 42), v.coerceTo(.u32).?.toNative(u32));
+    }
+    // 大 u → i：超范围返回 null
+    {
+        const v = Int.fromNative(.u32, @as(u32, std.math.maxInt(i32) + 1));
+        try std.testing.expect(v.coerceTo(.i32) == null);
+    }
+    // u → i：在范围内成功
+    {
+        const v = Int.fromNative(.u32, @as(u32, 100));
+        try std.testing.expectEqual(@as(i32, 100), v.coerceTo(.i32).?.toNative(i32));
     }
 }
