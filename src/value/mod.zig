@@ -313,19 +313,19 @@ pub const Value = union(enum) {
         };
     }
 
-    pub fn isInteger(self: Value) bool {
+    pub inline fn isInteger(self: Value) bool {
         return self == .int;
     }
 
-    pub fn isFloat(self: Value) bool {
+    pub inline fn isFloat(self: Value) bool {
         return self == .float;
     }
 
-    pub fn isNumeric(self: Value) bool {
+    pub inline fn isNumeric(self: Value) bool {
         return self == .int or self == .float;
     }
 
-    pub fn isString(self: Value) bool {
+    pub inline fn isString(self: Value) bool {
         return self == .string;
     }
 
@@ -339,7 +339,11 @@ pub const Value = union(enum) {
     pub inline fn retain(self: Value) Value {
         switch (self) {
             .null_val, .unit, .boolean, .char, .int, .float, .spawn_val => {},
-            inline .string, .array, .record, .adt, .newtype, .cell, .range,
+            .string => |p| {
+                // SSO 字符串 rc 字段编码 SSO 标志(bit31)+长度(bits 0-4)，不可增减
+                if (!p.isSso()) p.rc += 1;
+            },
+            inline .array, .record, .adt, .newtype, .cell, .range,
                 .vm_closure, .partial, .builtin, .error_val, .throw_val,
                 .array_iterator, .string_iterator, .range_iterator,
                 .trait_value, .lazy_val => |p| {
@@ -358,7 +362,17 @@ pub const Value = union(enum) {
     pub fn release(self: Value, allocator: std.mem.Allocator) void {
         switch (self) {
             .null_val, .unit, .boolean, .char, .int, .float, .spawn_val => {},
-            inline .string, .array, .record, .adt, .newtype, .cell, .range,
+            .string => |p| {
+                // SSO 字符串无堆分配，无需释放
+                if (p.isSso()) return;
+                if (p.rc > 1) {
+                    p.rc -= 1;
+                } else {
+                    p.deinit(allocator);
+                    allocator.destroy(p);
+                }
+            },
+            inline .array, .record, .adt, .newtype, .cell, .range,
                 .vm_closure, .partial, .builtin, .error_val, .throw_val,
                 .array_iterator, .string_iterator, .range_iterator,
                 .trait_value, .lazy_val => |p| {

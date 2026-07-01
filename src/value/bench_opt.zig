@@ -550,18 +550,17 @@ fn benchSliceDispatch(w: anytype) !void {
         try printCycleResult(w, "slice() legacy (ByteArray switch)", end - start, Iterations);
     }
 
-    // —— New: [16]u8 直接切片 ——
+    // —— New: {lo, hi} 直接字段访问 ——
     {
         var sum: usize = 0;
         const start = rdtscStart();
         for (0..Iterations) |i| {
             const idx = i & 0xF;
-            const s = new_vals[idx].slice();
-            sum += s[0];
+            sum += @as(u8, @truncate(new_vals[idx].lo));
         }
         const end = rdtscEnd();
         std.mem.doNotOptimizeAway(sum);
-        try printCycleResult(w, "slice() new ([16]u8 direct)", end - start, Iterations);
+        try printCycleResult(w, "field access new ({lo,hi} direct)", end - start, Iterations);
     }
 
     try w.interface.print("\n", .{});
@@ -585,12 +584,11 @@ fn benchSliceDispatch(w: anytype) !void {
         const start = rdtscStart();
         for (0..Iterations) |i| {
             const idx = i & 0xF;
-            const s = new_vals[idx].sliceMutable();
-            sum += s[0];
+            sum += @as(u8, @truncate(new_vals[idx].lo));
         }
         const end = rdtscEnd();
         std.mem.doNotOptimizeAway(sum);
-        try printCycleResult(w, "sliceMutable() new", end - start, Iterations);
+        try printCycleResult(w, "field access new (mutable)", end - start, Iterations);
     }
 
     try w.interface.print("\n", .{});
@@ -918,17 +916,11 @@ fn benchIntArith(w: anytype, io: std.Io) !void {
         const start = std.Io.Clock.awake.now(io);
         while (i < Iterations) : (i += 1) {
             const other = Int.fromNative(.i64, @as(i64, i));
-            const a = acc.slice();
-            const b = other.slice();
-            var result: [16]u8 = [_]u8{0} ** 16;
-            @memcpy(result[0..a.len], a);
-            for (0..a.len) |j| result[j] +%= b[j];
-            const dst = acc.sliceMutable();
-            @memcpy(dst[0..a.len], result[0..a.len]);
+            acc = acc.add(other).result;
         }
         const end = std.Io.Clock.awake.now(io);
         std.mem.doNotOptimizeAway(acc);
-        try printThroughput(w, "i64 add (new [16]u8)", start.durationTo(end).nanoseconds, Iterations);
+        try printThroughput(w, "i64 add (new u64 native)", start.durationTo(end).nanoseconds, Iterations);
     }
 
     try w.interface.print("\n", .{});
@@ -960,17 +952,11 @@ fn benchIntArith(w: anytype, io: std.Io) !void {
         const start = std.Io.Clock.awake.now(io);
         while (i < Iterations) : (i += 1) {
             const other = Int.fromNative(.i128, @as(i128, i));
-            const a = acc.slice();
-            const b = other.slice();
-            var result: [16]u8 = [_]u8{0} ** 16;
-            @memcpy(result[0..a.len], a);
-            for (0..a.len) |j| result[j] +%= b[j];
-            const dst = acc.sliceMutable();
-            @memcpy(dst[0..a.len], result[0..a.len]);
+            acc = acc.add(other).result;
         }
         const end = std.Io.Clock.awake.now(io);
         std.mem.doNotOptimizeAway(acc);
-        try printThroughput(w, "i128 add (new [16]u8)", start.durationTo(end).nanoseconds, Iterations);
+        try printThroughput(w, "i128 add (new U128 word-level)", start.durationTo(end).nanoseconds, Iterations);
     }
 
     try w.interface.print("\n", .{});
@@ -1078,15 +1064,19 @@ fn benchIntHelpers(w: anytype, io: std.Io) !void {
             const a = vals[i % n_vals];
             const b = vals[(i + 1) % n_vals];
             // 旧实现：逐字节 compareBytes（复制 int.zig 优化前逻辑）
-            const a_slice = a.slice();
-            const b_slice = b.slice();
-            const a_neg = a.type.isSigned() and (a_slice[a_slice.len - 1] & 0x80) != 0;
-            const b_neg = b.type.isSigned() and (b_slice[b_slice.len - 1] & 0x80) != 0;
+            var a_buf: [16]u8 = undefined;
+            var b_buf: [16]u8 = undefined;
+            a.toBytes(&a_buf);
+            b.toBytes(&b_buf);
+            const a_len: usize = a.type.byteLength();
+            const b_len: usize = b.type.byteLength();
+            const a_neg = a.type.isSigned() and (a_buf[a_len - 1] & 0x80) != 0;
+            const b_neg = b.type.isSigned() and (b_buf[b_len - 1] & 0x80) != 0;
             var ord: std.math.Order = .eq;
             if (a_neg != b_neg) {
                 ord = if (a_neg) .lt else .gt;
             } else {
-                ord = legacyCompareBytes(a_slice, b_slice);
+                ord = legacyCompareBytes(a_buf[0..a_len], b_buf[0..b_len]);
             }
             sum +%= @intFromEnum(ord);
         }
@@ -1119,8 +1109,8 @@ fn benchIntHelpers(w: anytype, io: std.Io) !void {
             // 旧实现：逐字节 negate + schoolbook + 逐字节 overflow 判定
             var abs_a: [16]u8 = [_]u8{0} ** 16;
             var abs_b: [16]u8 = [_]u8{0} ** 16;
-            @memcpy(abs_a[0..16], a.slice());
-            @memcpy(abs_b[0..16], b.slice());
+            a.toBytes(&abs_a);
+            b.toBytes(&abs_b);
             if (a.type.isSigned() and a.isNegative()) legacyNegateBytesInPlace(abs_a[0..16]);
             if (b.type.isSigned() and b.isNegative()) legacyNegateBytesInPlace(abs_b[0..16]);
             // 简化：只跑 16 字节 schoolbook 等价的逐字节乘积累加（模拟优化前开销）
@@ -1159,7 +1149,7 @@ fn benchIntHelpers(w: anytype, io: std.Io) !void {
             const a = vals[i % n_vals];
             const b = vals[(i + 1) % n_vals];
             const r = a.multiply(b);
-            @memcpy(acc[0..16], r.result.bytes[0..16]);
+            r.result.toBytes(&acc);
         }
         const end = std.Io.Clock.awake.now(io);
         std.mem.doNotOptimizeAway(acc);
@@ -1179,7 +1169,7 @@ fn benchIntHelpers(w: anytype, io: std.Io) !void {
         for (0..DivIters) |i| {
             const a = vals[i % n_vals];
             const q = a.divideTruncating(small_div) catch continue;
-            sum +%= q.bytes[0];
+            sum +%= @as(u8, @truncate(q.lo));
         }
         const end = std.Io.Clock.awake.now(io);
         std.mem.doNotOptimizeAway(sum);
@@ -1192,7 +1182,7 @@ fn benchIntHelpers(w: anytype, io: std.Io) !void {
         for (0..DivIters) |i| {
             const a = vals[i % n_vals];
             const q = a.divideTruncating(mid_div) catch continue;
-            sum +%= q.bytes[0];
+            sum +%= @as(u8, @truncate(q.lo));
         }
         const end = std.Io.Clock.awake.now(io);
         std.mem.doNotOptimizeAway(sum);
@@ -1207,7 +1197,7 @@ fn benchIntHelpers(w: anytype, io: std.Io) !void {
             // a 是 i128，强转为 u128 语义：直接用 divideTruncating 测大除数路径
             // 对负数 a，divideTruncating 会先取绝对值；用 large_div（u128）需类型匹配
             const q = a.divideTruncating(Int.fromNative(.i128, @as(i128, @bitCast(@as(u128, 1) << 100)))) catch continue;
-            sum +%= q.bytes[0];
+            sum +%= @as(u8, @truncate(q.lo));
         }
         const end = std.Io.Clock.awake.now(io);
         std.mem.doNotOptimizeAway(sum);
@@ -1221,7 +1211,7 @@ fn benchIntHelpers(w: anytype, io: std.Io) !void {
             const a = vals[i % n_vals];
             // 取绝对值
             var abs_a: [16]u8 = [_]u8{0} ** 16;
-            @memcpy(abs_a[0..16], a.slice());
+            a.toBytes(&abs_a);
             if (a.type.isSigned() and a.isNegative()) legacyNegateBytesInPlace(abs_a[0..16]);
             // 旧除数：用 7（与路径 2 对比，体现算法差异而非除数大小差异）
             var abs_b: [16]u8 = [_]u8{0} ** 16;

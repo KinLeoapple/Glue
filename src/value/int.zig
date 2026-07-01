@@ -1,23 +1,21 @@
 //! 自定义整数类型——Type 枚举 + Int 结构体
 //!
-//! 用 [16]u8 小端补码字节数组（定长）存储所有整数类型（i8/i16/i32/i64/i128,
-//! u8/u16/u32/u64/u128）。同一位宽的 signed/unsigned 共用同一 [16]u8 缓冲，
-//! 符号性由 Type 字段区分；有效字节数 = type.byteLength()，高位字节不参与运算
-//! （构造时清零，读取只取前 N 字节）。运算时解包到同一 [16]u8 缓冲统一处理。
+//! 存储布局：{type: Type, lo: u64, hi: u64}
+//! - ≤64 位类型（i8..i64, u8..u64）：lo 持符号/零扩展后的值，hi = 0
+//! - 128 位类型（i128, u128）：{lo, hi} 作为 U128（小端：lo = 低 64 位，hi = 高 64 位）
 //!
-//! 注：原 ByteArray union(tag + 变长 [N]u8) 与 Type 字段冗余编码位宽，已移除；
-//! byte_array.zig 仅保留字节 IO 原语（loadWord/storeWord/loadU128/storeU128）。
+//! 核心优化：≤64 位算术直接用原生 u64 wrapping 指令（@addWithOverflow 等），
+//! 绕过旧的 [16]u8 字节缓冲 + loadWord/storeWord 字节拼装开销。
+//! 128 位算术委托给 wide.zig 的 U128 软件实现。
+//!
+//! 不变量：构造后 lo 始终保持正确的符号/零扩展。算术结果通过 canonicalize() 重新规范化。
 //!
 //! 命名规范：方法名全部使用完整单词，不使用缩写。
 
 const std = @import("std");
-const byte_array = @import("byte_array.zig");
 const wide = @import("wide.zig");
 const U128 = wide.U128;
-const loadWord = wide.loadWord;
-const storeWord = wide.storeWord;
 const mulU64ToU128 = wide.mulU64ToU128;
-const multiplyU64Schoolbook = wide.multiplyU64Schoolbook;
 
 /// 整数类型枚举：10 个变体
 pub const Type = enum {
@@ -142,214 +140,255 @@ pub const OverflowResult = struct { result: Int, overflow: bool };
 /// 除法结果（命名结构体，避免各函数匿名结构体类型不匹配）
 pub const DivModResult = struct { quotient: Int, remainder: Int };
 
-/// 单一 Int 结构体：type + bytes + 运算方法
+/// 将 lo 重新规范化为类型 t 的正确符号/零扩展表示。
+/// ≤64 位类型：截断到类型位宽，然后符号/零扩展到 u64。
+/// 128 位类型：无操作（lo 是完整的 u64）。
+inline fn canonicalize(lo: u64, t: Type) u64 {
+    return switch (t) {
+        .i8 => signExtend(lo, 8),
+        .i16 => signExtend(lo, 16),
+        .i32 => signExtend(lo, 32),
+        .i64 => lo,
+        .i128 => lo,
+        .u8 => @as(u64, @as(u8, @truncate(lo))),
+        .u16 => @as(u64, @as(u16, @truncate(lo))),
+        .u32 => @as(u64, @as(u32, @truncate(lo))),
+        .u64 => lo,
+        .u128 => lo,
+    };
+}
+
+/// 将 lo 的低 `bits` 位符号扩展到 u64。
+/// 原理：左移 (64-bits) 使符号位到 bit63，转 i64 后算术右移回原位置，自动填充符号位。
+inline fn signExtend(lo: u64, bits: u8) u64 {
+    const shift_u8: u8 = 64 - bits;
+    const shift: u6 = @intCast(shift_u8);
+    const shifted: u64 = lo << shift;
+    const signed: i64 = @bitCast(shifted);
+    const extended: i64 = signed >> shift;
+    return @bitCast(extended);
+}
+
+/// 单一 Int 结构体：type + {lo, hi} + 运算方法
 pub const Int = struct {
     type: Type,
-    bytes: [16]u8,
-
-    /// 有效字节切片（只读）。长度由 type.byteLength() 决定，等价于旧的 ByteArray.slice()
-    /// 但无 union tag 分派，直接取定长缓冲的前 N 字节。
-    pub inline fn slice(self: *const Int) []const u8 {
-        return self.bytes[0..self.type.byteLength()];
-    }
-
-    /// 有效字节切片（可变）
-    pub inline fn sliceMutable(self: *Int) []u8 {
-        return self.bytes[0..self.type.byteLength()];
-    }
+    lo: u64,
+    hi: u64,
 
     /// 全零值
-    pub fn zero(t: Type) Int {
-        return .{ .type = t, .bytes = [_]u8{0} ** 16 };
+    pub inline fn zero(t: Type) Int {
+        return .{ .type = t, .lo = 0, .hi = 0 };
     }
 
-    /// 从原生值构造（内存拷贝，不触发原生算术 codegen）
+    /// 从原生值构造（≤64 位用 comptime 分支按 v 的符号性取位模式，再 canonicalize 规范化）
     /// 要求 @sizeOf(@TypeOf(v)) >= t.byteLength()
     pub fn fromNative(t: Type, v: anytype) Int {
         const nbytes = t.byteLength();
-        const src: [*]const u8 = @ptrCast(&v);
-        var result: Int = .{ .type = t, .bytes = [_]u8{0} ** 16 };
-        @memcpy(result.bytes[0..nbytes], src[0..nbytes]);
-        return result;
+        if (nbytes <= 8) {
+            // comptime 分支按 v 自身的符号性取位模式，避免 @as 跨符号性失败
+            const V = @TypeOf(v);
+            const v_signed = @typeInfo(V) == .int and @typeInfo(V).int.signedness == .signed;
+            const lo: u64 = if (v_signed)
+                @bitCast(@as(i64, @intCast(v)))
+            else
+                @as(u64, @intCast(v));
+            return .{ .type = t, .lo = canonicalize(lo, t), .hi = 0 };
+        } else {
+            // 128 位：memcpy 避免 LLVM i128 codegen bug
+            var result: Int = .{ .type = t, .lo = 0, .hi = 0 };
+            const src: [*]const u8 = @ptrCast(&v);
+            @memcpy(@as([*]u8, @ptrCast(&result.lo))[0..8], src[0..8]);
+            @memcpy(@as([*]u8, @ptrCast(&result.hi))[0..8], src[8..16]);
+            return result;
+        }
     }
 
-    /// 从 U128 构造（零拷贝：直接写入定长缓冲，截取低 t.byteLength() 字节）
+    /// 从 U128 构造（截取低 t.byteLength() 字节，≤64 位规范化）
     /// 供 Float.toInt 使用，绕过 u128 形参的 IO 边界例外
     pub fn fromU128Unchecked(t: Type, val: U128) Int {
-        var result = Int.zero(t);
-        byte_array.storeU128(result.bytes[0..t.byteLength()], val);
-        return result;
+        if (t.byteLength() <= 8) {
+            return .{ .type = t, .lo = canonicalize(val.lo, t), .hi = 0 };
+        }
+        return .{ .type = t, .lo = val.lo, .hi = val.hi };
     }
 
-    /// 转为原生值（内存拷贝 + 符号/零扩展）
-    /// 匹配类型时直接拷贝；宽化时按 signedness 扩展高位；窄化时截断低位。
+    /// 转为原生值（≤64 位截断 lo 到 T 位宽，128 位 memcpy）
     pub fn toNative(self: Int, comptime T: type) T {
-        var result: T = std.mem.zeroes(T);
-        const dst: [*]u8 = @ptrCast(&result);
-        const src = self.slice();
-        const n = src.len;
         const sz = @sizeOf(T);
-        if (n <= sz) {
-            @memcpy(dst[0..n], src);
-            if (n < sz and self.type.isSigned() and (src[n - 1] & 0x80) != 0) {
-                @memset(dst[n..sz], 0xFF);
-            }
+        if (sz <= 8) {
+            // ≤64 位：lo 已符号/零扩展，截断到 T 的无符号等价再 @bitCast 回 T
+            const UT = std.meta.Int(.unsigned, @bitSizeOf(T));
+            const truncated: UT = @truncate(self.lo);
+            return @bitCast(truncated);
         } else {
-            @memcpy(dst[0..sz], src[0..sz]);
+            // 128 位：memcpy
+            var result: T = undefined;
+            const dst: [*]u8 = @ptrCast(&result);
+            @memcpy(dst[0..8], @as([*]const u8, @ptrCast(&self.lo))[0..8]);
+            @memcpy(dst[8..16], @as([*]const u8, @ptrCast(&self.hi))[0..8]);
+            return result;
         }
-        return result;
+    }
+
+    /// 写入 16 字节小端缓冲区（符号/零扩展填满 16 字节）。
+    /// 供 coerceTo / 外部字节级代码使用。
+    pub fn toBytes(self: Int, buf: *[16]u8) void {
+        const n = self.type.byteLength();
+        if (n <= 8) {
+            // ≤64 位：写 lo 到前 8 字节，符号/零扩展填满 16 字节
+            std.mem.writeInt(u64, buf[0..8], self.lo, .little);
+            const fill: u8 = if (self.type.isSigned() and (self.lo >> 63) & 1 == 1) 0xFF else 0x00;
+            @memset(buf[8..16], fill);
+        } else {
+            // 128 位：lo → [0..8], hi → [8..16]
+            std.mem.writeInt(u64, buf[0..8], self.lo, .little);
+            std.mem.writeInt(u64, buf[8..16], self.hi, .little);
+        }
+    }
+
+    /// 从 16 字节小端缓冲区构造（≤64 位规范化，保证不变量）
+    pub fn fromBytes(t: Type, buf: *const [16]u8) Int {
+        const lo = std.mem.readInt(u64, buf[0..8], .little);
+        const hi = std.mem.readInt(u64, buf[8..16], .little);
+        if (t.byteLength() <= 8) {
+            return .{ .type = t, .lo = canonicalize(lo, t), .hi = 0 };
+        }
+        return .{ .type = t, .lo = lo, .hi = hi };
     }
 
     /// 比较两个 Int（要求 self.type == other.type）
-    pub fn compare(self: Int, other: Int) std.math.Order {
-        return comparePortable(self, other);
-    }
-
-    fn comparePortable(self: Int, other: Int) std.math.Order {
-        const signed = self.type.isSigned();
-        const a = self.slice();
-        const b = other.slice();
-
-        if (signed) {
-            const a_neg = (a[a.len - 1] & 0x80) != 0;
-            const b_neg = (b[b.len - 1] & 0x80) != 0;
-            if (a_neg != b_neg) {
-                return if (a_neg) .lt else .gt;
+    pub inline fn compare(self: Int, other: Int) std.math.Order {
+        const t = self.type;
+        const signed = t.isSigned();
+        if (t.byteLength() <= 8) {
+            if (signed) {
+                const a: i64 = @bitCast(self.lo);
+                const b: i64 = @bitCast(other.lo);
+                if (a < b) return .lt;
+                if (a > b) return .gt;
+                return .eq;
+            } else {
+                if (self.lo < other.lo) return .lt;
+                if (self.lo > other.lo) return .gt;
+                return .eq;
             }
+        } else {
+            const av = U128{ .hi = self.hi, .lo = self.lo };
+            const bv = U128{ .hi = other.hi, .lo = other.lo };
+            if (signed) {
+                const a_neg = (self.hi >> 63) != 0;
+                const b_neg = (other.hi >> 63) != 0;
+                if (a_neg != b_neg) return if (a_neg) .lt else .gt;
+            }
+            return av.compare(bv);
         }
-        return compareBytes(a, b);
     }
 
-    /// 解包到 [16]u8 固定缓冲区（高位按符号扩展或零扩展填满）
-    /// 返回有效字节数
-    fn unpackToBuffer(self: Int, buf: *[16]u8) u8 {
-        const nbytes = self.type.byteLength();
-        const src = self.slice();
-        @memcpy(buf[0..nbytes], src);
-        const fill: u8 = if (self.type.isSigned() and (src[nbytes - 1] & 0x80) != 0) 0xFF else 0x00;
-        @memset(buf[nbytes..16], fill);
-        return nbytes;
-    }
-
-    /// 从 [16]u8 缓冲区打包回 Int（拷贝全 16 字节；仅前 N 字节有效）
-    pub fn fromBytes(t: Type, buf: *const [16]u8) Int {
-        return .{ .type = t, .bytes = buf.* };
-    }
-
-    /// 从 [16]u8 缓冲区打包回 Int（内部别名，向后兼容）
-    fn packFromBuffer(t: Type, buf: *const [16]u8) Int {
-        return fromBytes(t, buf);
-    }
-
-    // —— 算术（S3-S5 实现）——
+    // —— 算术 ——
 
     /// 加法。要求 self.type == other.type，结果 type 同。
-    pub fn add(self: Int, other: Int) OverflowResult {
+    pub inline fn add(self: Int, other: Int) OverflowResult {
         std.debug.assert(self.type == other.type);
         return addPortable(self, other);
     }
 
-    fn addPortable(self: Int, other: Int) OverflowResult {
+    inline fn addPortable(self: Int, other: Int) OverflowResult {
         const t = self.type;
         const signed = t.isSigned();
-        var result_bytes: [16]u8 = [_]u8{0} ** 16;
-        const a = self.slice();
-        const b = other.slice();
-        const r = result_bytes[0..t.byteLength()];
 
-        const unsigned_overflow = switch (t.byteLength()) {
-            1 => addWordN(u8, r, a, b),
-            2 => addWordN(u16, r, a, b),
-            4 => addWordN(u32, r, a, b),
-            8 => addWordN(u64, r, a, b),
-            16 => blk: {
-                const av = U128.load(a);
-                const bv = U128.load(b);
-                const result = av.add(bv);
-                result.sum.store(r);
-                break :blk result.carry != 0;
-            },
-            else => unreachable,
-        };
-
-        if (signed) {
-            const a_sign = (a[a.len - 1] & 0x80) != 0;
-            const b_sign = (b[b.len - 1] & 0x80) != 0;
-            const r_sign = (r[r.len - 1] & 0x80) != 0;
-            return .{
-                .result = .{ .type = t, .bytes = result_bytes },
-                .overflow = (a_sign == b_sign) and (r_sign != a_sign),
-            };
+        if (t.byteLength() <= 8) {
+            const sum, const carry = @addWithOverflow(self.lo, other.lo);
+            const canon = canonicalize(sum, t);
+            const sign_sh: u6 = @intCast(t.bitWidth() - 1);
+            var overflow: bool = undefined;
+            if (signed) {
+                const a_sign = (self.lo >> sign_sh) & 1;
+                const b_sign = (other.lo >> sign_sh) & 1;
+                const r_sign = (canon >> sign_sh) & 1;
+                overflow = (a_sign == b_sign) and (r_sign != a_sign);
+            } else {
+                // u64 carry 检测 u64 溢出；sum != canon 检测 u8/u16/u32 截断溢出
+                overflow = (carry != 0) or (sum != canon);
+            }
+            return .{ .result = .{ .type = t, .lo = canon, .hi = 0 }, .overflow = overflow };
+        } else {
+            const av = U128{ .hi = self.hi, .lo = self.lo };
+            const bv = U128{ .hi = other.hi, .lo = other.lo };
+            const result = av.add(bv);
+            var overflow: bool = undefined;
+            if (signed) {
+                const a_sign = (self.hi >> 63) & 1;
+                const b_sign = (other.hi >> 63) & 1;
+                const r_sign = (result.sum.hi >> 63) & 1;
+                overflow = (a_sign == b_sign) and (r_sign != a_sign);
+            } else {
+                overflow = result.carry != 0;
+            }
+            return .{ .result = .{ .type = t, .lo = result.sum.lo, .hi = result.sum.hi }, .overflow = overflow };
         }
-        return .{ .result = .{ .type = t, .bytes = result_bytes }, .overflow = unsigned_overflow };
     }
 
     /// 减法。要求 self.type == other.type，结果 type 同。
-    pub fn subtract(self: Int, other: Int) OverflowResult {
+    pub inline fn subtract(self: Int, other: Int) OverflowResult {
         std.debug.assert(self.type == other.type);
         return subtractPortable(self, other);
     }
 
-    fn subtractPortable(self: Int, other: Int) OverflowResult {
+    inline fn subtractPortable(self: Int, other: Int) OverflowResult {
         const t = self.type;
         const signed = t.isSigned();
-        var result_bytes: [16]u8 = [_]u8{0} ** 16;
-        const a = self.slice();
-        const b = other.slice();
-        const r = result_bytes[0..t.byteLength()];
 
-        const unsigned_overflow = switch (t.byteLength()) {
-            1 => subWordN(u8, r, a, b),
-            2 => subWordN(u16, r, a, b),
-            4 => subWordN(u32, r, a, b),
-            8 => subWordN(u64, r, a, b),
-            16 => blk: {
-                const av = U128.load(a);
-                const bv = U128.load(b);
-                const result = av.sub(bv);
-                result.diff.store(r);
-                break :blk result.borrow != 0;
-            },
-            else => unreachable,
-        };
-
-        if (signed) {
-            const a_sign = (a[a.len - 1] & 0x80) != 0;
-            const b_sign = (b[b.len - 1] & 0x80) != 0;
-            const r_sign = (r[r.len - 1] & 0x80) != 0;
-            return .{
-                .result = .{ .type = t, .bytes = result_bytes },
-                .overflow = (a_sign != b_sign) and (r_sign != a_sign),
-            };
+        if (t.byteLength() <= 8) {
+            const diff, const borrow = @subWithOverflow(self.lo, other.lo);
+            const canon = canonicalize(diff, t);
+            const sign_sh: u6 = @intCast(t.bitWidth() - 1);
+            var overflow: bool = undefined;
+            if (signed) {
+                const a_sign = (self.lo >> sign_sh) & 1;
+                const b_sign = (other.lo >> sign_sh) & 1;
+                const r_sign = (canon >> sign_sh) & 1;
+                overflow = (a_sign != b_sign) and (r_sign != a_sign);
+            } else {
+                overflow = borrow != 0;
+            }
+            return .{ .result = .{ .type = t, .lo = canon, .hi = 0 }, .overflow = overflow };
+        } else {
+            const av = U128{ .hi = self.hi, .lo = self.lo };
+            const bv = U128{ .hi = other.hi, .lo = other.lo };
+            const result = av.sub(bv);
+            var overflow: bool = undefined;
+            if (signed) {
+                const a_sign = (self.hi >> 63) & 1;
+                const b_sign = (other.hi >> 63) & 1;
+                const r_sign = (result.diff.hi >> 63) & 1;
+                overflow = (a_sign != b_sign) and (r_sign != a_sign);
+            } else {
+                overflow = result.borrow != 0;
+            }
+            return .{ .result = .{ .type = t, .lo = result.diff.lo, .hi = result.diff.hi }, .overflow = overflow };
         }
-        return .{ .result = .{ .type = t, .bytes = result_bytes }, .overflow = unsigned_overflow };
     }
 
     /// 是否为负数（无符号类型恒为 false）
-    pub fn isNegative(self: Int) bool {
+    pub inline fn isNegative(self: Int) bool {
         if (!self.type.isSigned()) return false;
-        const a = self.slice();
-        return (a[a.len - 1] & 0x80) != 0;
+        if (self.type.byteLength() <= 8) {
+            const sign_sh: u6 = @intCast(self.type.bitWidth() - 1);
+            return (self.lo >> sign_sh) & 1 == 1;
+        }
+        return (self.hi >> 63) & 1 == 1;
     }
 
     /// 取负（补码取反加一）。minInt 取负溢出返回自身（two's complement 回绕）。
-    /// 字块化：用 u8/u16/u32/u64/U128 替代逐字节循环。
-    pub fn negate(self: Int) Int {
-        var result_bytes: [16]u8 = [_]u8{0} ** 16;
-        const a = self.slice();
-        const r = result_bytes[0..self.type.byteLength()];
-        switch (self.type.byteLength()) {
-            1 => negateWordN(u8, r, a),
-            2 => negateWordN(u16, r, a),
-            4 => negateWordN(u32, r, a),
-            8 => negateWordN(u64, r, a),
-            16 => {
-                const av = U128.load(a);
-                av.negate().store(r);
-            },
-            else => unreachable,
+    pub inline fn negate(self: Int) Int {
+        const t = self.type;
+        if (t.byteLength() <= 8) {
+            // 0 -% lo：wrapping subtract 实现两补取负
+            return .{ .type = t, .lo = canonicalize(0 -% self.lo, t), .hi = 0 };
         }
-        return .{ .type = self.type, .bytes = result_bytes };
+        const av = U128{ .hi = self.hi, .lo = self.lo };
+        const neg = av.negate();
+        return .{ .type = t, .lo = neg.lo, .hi = neg.hi };
     }
 
     /// 乘法。要求 self.type == other.type，结果 type 同。
@@ -360,83 +399,61 @@ pub const Int = struct {
 
     fn multiplyPortable(self: Int, other: Int) OverflowResult {
         const t = self.type;
-        const n = t.byteLength();
-        const signed = t.isSigned();
 
-        // 绝对值（无符号即自身）
-        var abs_a_buf: [16]u8 = [_]u8{0} ** 16;
-        var abs_b_buf: [16]u8 = [_]u8{0} ** 16;
-        @memcpy(abs_a_buf[0..n], self.slice());
-        @memcpy(abs_b_buf[0..n], other.slice());
-        if (signed and self.isNegative()) negateBytesInPlace(abs_a_buf[0..n]);
-        if (signed and other.isNegative()) negateBytesInPlace(abs_b_buf[0..n]);
-
-        // 完整乘积（2N 字节，用于溢出判定）
-        var magnitude: [32]u8 = [_]u8{0} ** 32;
-        const a = abs_a_buf[0..n];
-        const b = abs_b_buf[0..n];
-        const m = magnitude[0 .. n * 2];
-
-        switch (n) {
-            1 => {
-                const prod: u16 = @as(u16, a[0]) * @as(u16, b[0]);
-                m[0] = @truncate(prod);
-                m[1] = @truncate(prod >> 8);
-            },
-            2 => {
-                const av: u16 = loadWord(u16, a);
-                const bv: u16 = loadWord(u16, b);
-                const prod: u32 = @as(u32, av) * @as(u32, bv);
-                storeWord(u32, m, prod);
-            },
-            4 => {
-                const av: u32 = loadWord(u32, a);
-                const bv: u32 = loadWord(u32, b);
-                const prod: u64 = @as(u64, av) * @as(u64, bv);
-                storeWord(u64, m, prod);
-            },
-            8 => {
-                const av: u64 = loadWord(u64, a);
-                const bv: u64 = loadWord(u64, b);
-                const prod = mulU64ToU128(av, bv);
-                storeWord(u64, m[0..8], prod.lo);
-                storeWord(u64, m[8..16], prod.hi);
-            },
-            16 => multiplyU64Schoolbook(m, a, b),
-            else => unreachable,
-        }
-
-        // 结果容器（直接写入定长缓冲前 N 字节）
-        var result_bytes: [16]u8 = [_]u8{0} ** 16;
-        const r = result_bytes[0..n];
-        @memcpy(r, magnitude[0..n]);
-        const result_sign = signed and (self.isNegative() != other.isNegative());
-        if (result_sign) negateBytesInPlace(r);
-
-        // 溢出判定
-        var overflow = false;
-        if (signed) {
-            // 阈值 2^(8N-1)：byte[n-1]=0x80，其余 0（在 2N 字节缓冲区中）
-            var threshold: [32]u8 = [_]u8{0} ** 32;
-            threshold[n - 1] = 0x80;
-            const cmp = compareBytes(magnitude[0 .. n * 2], threshold[0 .. n * 2]);
-            if (result_sign) {
-                // 负结果：|minInt| = 2^(8N-1)，magnitude > 阈值 才溢出
-                overflow = (cmp == .gt);
-            } else {
-                // 正结果：maxInt = 2^(8N-1)-1，magnitude >= 阈值 即溢出
-                overflow = (cmp != .lt);
-            }
-        } else {
-            for (magnitude[n .. n * 2]) |byte| {
-                if (byte != 0) {
-                    overflow = true;
-                    break;
-                }
+        // ≤64 位：用 inline for 展开各原生类型，entry.T 为 comptime 已知类型
+        const Entry = struct { t: Type, T: type, signed: bool };
+        const entries = [_]Entry{
+            .{ .t = .i8, .T = i8, .signed = true },
+            .{ .t = .i16, .T = i16, .signed = true },
+            .{ .t = .i32, .T = i32, .signed = true },
+            .{ .t = .i64, .T = i64, .signed = true },
+            .{ .t = .u8, .T = u8, .signed = false },
+            .{ .t = .u16, .T = u16, .signed = false },
+            .{ .t = .u32, .T = u32, .signed = false },
+            .{ .t = .u64, .T = u64, .signed = false },
+        };
+        inline for (entries) |entry| {
+            if (t == entry.t) {
+                const UT = std.meta.Int(.unsigned, @bitSizeOf(entry.T));
+                const a: entry.T = @bitCast(@as(UT, @truncate(self.lo)));
+                const b: entry.T = @bitCast(@as(UT, @truncate(other.lo)));
+                const prod, const ovf = @mulWithOverflow(a, b);
+                const lo: u64 = if (entry.signed) @bitCast(@as(i64, prod)) else @as(u64, prod);
+                return .{ .result = .{ .type = t, .lo = lo, .hi = 0 }, .overflow = ovf != 0 };
             }
         }
 
-        return .{ .result = .{ .type = t, .bytes = result_bytes }, .overflow = overflow };
+        // 128 位：U128 路径
+        if (t == .i128) {
+            const av = U128{ .hi = self.hi, .lo = self.lo };
+            const bv = U128{ .hi = other.hi, .lo = other.lo };
+            const a_neg = (self.hi >> 63) != 0;
+            const b_neg = (other.hi >> 63) != 0;
+            const result_neg = a_neg != b_neg;
+
+            const abs_a = if (a_neg) av.negate() else av;
+            const abs_b = if (b_neg) bv.negate() else bv;
+            const product: wide.U256 = abs_a.multiply(abs_b);
+
+            // 溢出判定：bit 127 of product (256-bit)
+            const bit_127_set = (product.lo.hi >> 63) != 0;
+            const lower_nonzero = (product.lo.hi & 0x7FFFFFFFFFFFFFFF) != 0 or product.lo.lo != 0;
+
+            const overflow = if (result_neg)
+                bit_127_set and lower_nonzero
+            else
+                bit_127_set;
+
+            const final = if (result_neg) product.lo.negate() else product.lo;
+            return .{ .result = .{ .type = t, .lo = final.lo, .hi = final.hi }, .overflow = overflow };
+        }
+
+        // u128
+        const av = U128{ .hi = self.hi, .lo = self.lo };
+        const bv = U128{ .hi = other.hi, .lo = other.lo };
+        const product: wide.U256 = av.multiply(bv);
+        const overflow = !product.hi.isZero();
+        return .{ .result = .{ .type = t, .lo = product.lo.lo, .hi = product.lo.hi }, .overflow = overflow };
     }
 
     /// 截断除法（商向零取整，余数符号同被除数）。
@@ -458,22 +475,30 @@ pub const Int = struct {
     fn divideWithRemainder(self: Int, other: Int) error{DivideByZero}!DivModResult {
         std.debug.assert(self.type == other.type);
         const t = self.type;
-        const n = t.byteLength();
         const signed = t.isSigned();
 
         // 除零检测
-        if (isAllZero(other.slice())) return error.DivideByZero;
+        if (other.lo == 0 and (t.byteLength() > 8) and other.hi == 0) return error.DivideByZero;
+        if (t.byteLength() <= 8 and other.lo == 0) return error.DivideByZero;
 
-        // minInt / -1 边界：返回 minInt（商），0（余数），与 Zig @divTrunc/@mod 一致
-        // 必须在调用汇编前拦截（≤64位 idiv 会 #DE）
+        // minInt / -1 边界：返回 minInt（商），0（余数）
         if (signed) {
-            var neg_one_buf: [16]u8 = [_]u8{0} ** 16;
-            @memset(neg_one_buf[0..n], 0xFF);
-            const other_is_neg_one = (compareBytes(other.slice(), neg_one_buf[0..n]) == .eq);
-            var min_int_buf: [16]u8 = [_]u8{0} ** 16;
-            min_int_buf[n - 1] = 0x80;
-            const self_is_min_int = (compareBytes(self.slice(), min_int_buf[0..n]) == .eq);
-            if (other_is_neg_one and self_is_min_int) {
+            const is_min_int = if (t.byteLength() <= 8) blk: {
+                const sign_sh: u6 = @intCast(t.bitWidth() - 1);
+                // minInt: sign bit set, all others 0
+                const min_lo: u64 = @as(u64, 1) << sign_sh;
+                break :blk self.lo == min_lo;
+            } else blk: {
+                break :blk self.hi == 0x8000000000000000 and self.lo == 0;
+            };
+            const is_neg_one = if (t.byteLength() <= 8) blk: {
+                const sign_sh: u6 = @intCast(t.bitWidth() - 1);
+                const neg_one: u64 = ~@as(u64, 0) << sign_sh | ((@as(u64, 1) << sign_sh) - 1);
+                break :blk other.lo == neg_one and other.hi == 0;
+            } else blk: {
+                break :blk other.lo == ~@as(u64, 0) and other.hi == ~@as(u64, 0);
+            };
+            if (is_min_int and is_neg_one) {
                 return .{ .quotient = self, .remainder = Int.zero(t) };
             }
         }
@@ -483,72 +508,73 @@ pub const Int = struct {
 
     fn divideWithRemainderPortable(self: Int, other: Int) DivModResult {
         const t = self.type;
-        const n = t.byteLength();
-        const signed = t.isSigned();
 
-        // 取绝对值
-        var abs_a_buf: [16]u8 = [_]u8{0} ** 16;
-        var abs_b_buf: [16]u8 = [_]u8{0} ** 16;
-        @memcpy(abs_a_buf[0..n], self.slice());
-        @memcpy(abs_b_buf[0..n], other.slice());
-        const a_neg = signed and self.isNegative();
-        const b_neg = signed and other.isNegative();
-        if (a_neg) negateBytesInPlace(abs_a_buf[0..n]);
-        if (b_neg) negateBytesInPlace(abs_b_buf[0..n]);
-
-        const a = abs_a_buf[0..n];
-        const b = abs_b_buf[0..n];
-
-        // 结果容器（直接写入定长缓冲前 N 字节）
-        var quotient_bytes: [16]u8 = [_]u8{0} ** 16;
-        var remainder_bytes: [16]u8 = [_]u8{0} ** 16;
-        const q = quotient_bytes[0..n];
-        const r = remainder_bytes[0..n];
-
-        switch (n) {
-            1 => {
-                const av: u8 = a[0];
-                const bv: u8 = b[0];
-                q[0] = av / bv;
-                r[0] = av % bv;
-            },
-            2 => {
-                const av: u16 = loadWord(u16, a);
-                const bv: u16 = loadWord(u16, b);
-                storeWord(u16, q, av / bv);
-                storeWord(u16, r, av % bv);
-            },
-            4 => {
-                const av: u32 = loadWord(u32, a);
-                const bv: u32 = loadWord(u32, b);
-                storeWord(u32, q, av / bv);
-                storeWord(u32, r, av % bv);
-            },
-            8 => {
-                const av: u64 = loadWord(u64, a);
-                const bv: u64 = loadWord(u64, b);
-                storeWord(u64, q, av / bv);
-                storeWord(u64, r, av % bv);
-            },
-            16 => {
-                // u128/u128：unsignedDivide128 直接写入 q/r（均 16 字节），无需临时缓冲。
-                // 快路径（除数 fit u64）走 2 次原生 u64 除法，慢路径走 U128 位级长除法。
-                unsignedDivide128(a, b, q, r);
-            },
-            else => unreachable,
+        // ≤64 位：用 inline for 展开各原生类型
+        const Entry = struct { t: Type, T: type, signed: bool };
+        const entries = [_]Entry{
+            .{ .t = .i8, .T = i8, .signed = true },
+            .{ .t = .i16, .T = i16, .signed = true },
+            .{ .t = .i32, .T = i32, .signed = true },
+            .{ .t = .i64, .T = i64, .signed = true },
+            .{ .t = .u8, .T = u8, .signed = false },
+            .{ .t = .u16, .T = u16, .signed = false },
+            .{ .t = .u32, .T = u32, .signed = false },
+            .{ .t = .u64, .T = u64, .signed = false },
+        };
+        inline for (entries) |entry| {
+            if (t == entry.t) {
+                const UT = std.meta.Int(.unsigned, @bitSizeOf(entry.T));
+                const a: entry.T = @bitCast(@as(UT, @truncate(self.lo)));
+                const b: entry.T = @bitCast(@as(UT, @truncate(other.lo)));
+                if (entry.signed) {
+                    const q = @divTrunc(a, b);
+                    const r = @rem(a, b);
+                    return .{
+                        .quotient = .{ .type = t, .lo = @bitCast(@as(i64, q)), .hi = 0 },
+                        .remainder = .{ .type = t, .lo = @bitCast(@as(i64, r)), .hi = 0 },
+                    };
+                } else {
+                    const q = a / b;
+                    const r = a % b;
+                    return .{
+                        .quotient = .{ .type = t, .lo = @as(u64, q), .hi = 0 },
+                        .remainder = .{ .type = t, .lo = @as(u64, r), .hi = 0 },
+                    };
+                }
+            }
         }
 
-        // 修正符号（截断除法：商符号 = 异号；余数符号 = 同被除数）
-        if (a_neg != b_neg) negateBytesInPlace(q);
-        if (a_neg) negateBytesInPlace(r);
+        // 128 位：U128 路径
+        if (t == .i128) {
+            const av = U128{ .hi = self.hi, .lo = self.lo };
+            const bv = U128{ .hi = other.hi, .lo = other.lo };
+            const a_neg = (self.hi >> 63) != 0;
+            const b_neg = (other.hi >> 63) != 0;
+            const q_neg = a_neg != b_neg;
+            const r_neg = a_neg;
 
+            const abs_a = if (a_neg) av.negate() else av;
+            const abs_b = if (b_neg) bv.negate() else bv;
+            const div_result = unsignedDivide128(abs_a, abs_b);
+            const final_q = if (q_neg) div_result.quotient.negate() else div_result.quotient;
+            const final_r = if (r_neg) div_result.remainder.negate() else div_result.remainder;
+            return .{
+                .quotient = .{ .type = t, .lo = final_q.lo, .hi = final_q.hi },
+                .remainder = .{ .type = t, .lo = final_r.lo, .hi = final_r.hi },
+            };
+        }
+
+        // u128
+        const av = U128{ .hi = self.hi, .lo = self.lo };
+        const bv = U128{ .hi = other.hi, .lo = other.lo };
+        const div_result = unsignedDivide128(av, bv);
         return .{
-            .quotient = .{ .type = t, .bytes = quotient_bytes },
-            .remainder = .{ .type = t, .bytes = remainder_bytes },
+            .quotient = .{ .type = t, .lo = div_result.quotient.lo, .hi = div_result.quotient.hi },
+            .remainder = .{ .type = t, .lo = div_result.remainder.lo, .hi = div_result.remainder.hi },
         };
     }
 
-    // —— 位运算（S6 实现）——
+    // —— 位运算 ——
 
     /// 按位与。要求 self.type == other.type。
     pub fn bitwiseAnd(self: Int, other: Int) Int {
@@ -570,159 +596,144 @@ pub const Int = struct {
 
     fn bitwisePortable(self: Int, other: Int, op: BitwiseOp) Int {
         const t = self.type;
-        var result_bytes: [16]u8 = [_]u8{0} ** 16;
-        const a = self.slice();
-        const b = other.slice();
-        const r = result_bytes[0..t.byteLength()];
-        switch (t.byteLength()) {
-            1 => bitwiseWordN(u8, r, a, b, op),
-            2 => bitwiseWordN(u16, r, a, b, op),
-            4 => bitwiseWordN(u32, r, a, b, op),
-            8 => bitwiseWordN(u64, r, a, b, op),
-            16 => {
-                const av = U128.load(a);
-                const bv = U128.load(b);
-                const result = switch (op) {
-                    .and_op => U128{ .hi = av.hi & bv.hi, .lo = av.lo & bv.lo },
-                    .or_op => U128{ .hi = av.hi | bv.hi, .lo = av.lo | bv.lo },
-                    .xor_op => U128{ .hi = av.hi ^ bv.hi, .lo = av.lo ^ bv.lo },
-                };
-                result.store(r);
-            },
-            else => unreachable,
+        if (t.byteLength() <= 8) {
+            const result_lo = switch (op) {
+                .and_op => self.lo & other.lo,
+                .or_op => self.lo | other.lo,
+                .xor_op => self.lo ^ other.lo,
+            };
+            return .{ .type = t, .lo = canonicalize(result_lo, t), .hi = 0 };
         }
-        return .{ .type = t, .bytes = result_bytes };
+        const result = switch (op) {
+            .and_op => U128{ .hi = self.hi & other.hi, .lo = self.lo & other.lo },
+            .or_op => U128{ .hi = self.hi | other.hi, .lo = self.lo | other.lo },
+            .xor_op => U128{ .hi = self.hi ^ other.hi, .lo = self.lo ^ other.lo },
+        };
+        return .{ .type = t, .lo = result.lo, .hi = result.hi };
     }
 
     /// 按位取反（逐字节 ~）。对有符号类型等价于 -x - 1。
     pub fn bitwiseNot(self: Int) Int {
-        return bitwiseNotPortable(self);
-    }
-
-    fn bitwiseNotPortable(self: Int) Int {
         const t = self.type;
-        var result_bytes: [16]u8 = [_]u8{0} ** 16;
-        const a = self.slice();
-        const r = result_bytes[0..t.byteLength()];
-        switch (t.byteLength()) {
-            1 => notWordN(u8, r, a),
-            2 => notWordN(u16, r, a),
-            4 => notWordN(u32, r, a),
-            8 => notWordN(u64, r, a),
-            16 => {
-                const av = U128.load(a);
-                const not_av = U128{ .hi = ~av.hi, .lo = ~av.lo };
-                not_av.store(r);
-            },
-            else => unreachable,
+        if (t.byteLength() <= 8) {
+            return .{ .type = t, .lo = canonicalize(~self.lo, t), .hi = 0 };
         }
-        return .{ .type = t, .bytes = result_bytes };
+        return .{ .type = t, .lo = ~self.lo, .hi = ~self.hi };
     }
 
     /// 逻辑左移 n 位（无符号与有符号语义一致，低位补 0）。
     /// n >= bitWidth 时返回 zero。
     pub fn shiftLeft(self: Int, n: u8) Int {
-        return shiftLeftPortable(self, n);
-    }
-
-    fn shiftLeftPortable(self: Int, n: u8) Int {
         const t = self.type;
         const bit_width = t.bitWidth();
         if (n >= bit_width) return Int.zero(t);
-        const nbytes = t.byteLength();
-        var result_bytes: [16]u8 = [_]u8{0} ** 16;
-        const a = self.slice();
-        const r = result_bytes[0..nbytes];
-        switch (nbytes) {
-            1 => shiftLeftWordN(u8, r, a, n),
-            2 => shiftLeftWordN(u16, r, a, n),
-            4 => shiftLeftWordN(u32, r, a, n),
-            8 => shiftLeftWordN(u64, r, a, n),
-            16 => {
-                const av = U128.load(a);
-                av.shiftLeft(n).store(r);
-            },
-            else => unreachable,
+        if (t.byteLength() <= 8) {
+            const sh: u6 = @intCast(n);
+            return .{ .type = t, .lo = canonicalize(self.lo << sh, t), .hi = 0 };
         }
-        return .{ .type = t, .bytes = result_bytes };
+        const av = U128{ .hi = self.hi, .lo = self.lo };
+        const result = av.shiftLeft(n);
+        return .{ .type = t, .lo = result.lo, .hi = result.hi };
     }
 
     /// 右移 n 位。无符号类型为逻辑右移（高位补 0）；有符号类型为算术右移（高位补符号位）。
     /// n >= bitWidth 时：无符号返回 zero；有符号返回 0（正数）或 -1（负数）。
     pub fn shiftRight(self: Int, n: u8) Int {
-        return shiftRightPortable(self, n);
-    }
-
-    fn shiftRightPortable(self: Int, n: u8) Int {
         const t = self.type;
         const signed = t.isSigned();
-        var result_bytes: [16]u8 = [_]u8{0} ** 16;
-        const a = self.slice();
-        const r = result_bytes[0..t.byteLength()];
-        switch (t.byteLength()) {
-            1 => shiftRightWordN(u8, r, a, n, signed),
-            2 => shiftRightWordN(u16, r, a, n, signed),
-            4 => shiftRightWordN(u32, r, a, n, signed),
-            8 => shiftRightWordN(u64, r, a, n, signed),
-            16 => {
-                const av = U128.load(a);
-                av.shiftRight(n, signed).store(r);
-            },
-            else => unreachable,
+        const bit_width = t.bitWidth();
+
+        if (n >= bit_width) {
+            if (signed) {
+                if (t.byteLength() <= 8) {
+                    const sign_sh: u6 = @intCast(bit_width - 1);
+                    const sign = (self.lo >> sign_sh) & 1;
+                    const fill: u64 = if (sign == 1) ~@as(u64, 0) else 0;
+                    return .{ .type = t, .lo = canonicalize(fill, t), .hi = 0 };
+                }
+                if ((self.hi >> 63) & 1 == 1) return .{ .type = t, .lo = ~@as(u64, 0), .hi = ~@as(u64, 0) };
+                return Int.zero(t);
+            }
+            return Int.zero(t);
         }
-        return .{ .type = t, .bytes = result_bytes };
+
+        if (t.byteLength() <= 8) {
+            const sh: u6 = @intCast(n);
+            if (signed) {
+                const val: i64 = @bitCast(self.lo);
+                const shifted: i64 = val >> sh;
+                return .{ .type = t, .lo = canonicalize(@bitCast(shifted), t), .hi = 0 };
+            }
+            return .{ .type = t, .lo = canonicalize(self.lo >> sh, t), .hi = 0 };
+        }
+        const av = U128{ .hi = self.hi, .lo = self.lo };
+        const result = av.shiftRight(n, signed);
+        return .{ .type = t, .lo = result.lo, .hi = result.hi };
     }
 
     /// 类型转换：将 self 转为 target 类型表示。
-    /// 全软件字节级：先符号/零扩展到 16 字节，再用 inRangeBytes 检查是否在目标范围内，
-    /// 最后截取低 target.byteLength() 字节打包。超出范围返回 null（调用方处理溢出）。
     /// 同类型直接返回 self；宽化总是成功；窄化仅在值落在目标范围内时成功。
-    pub fn coerceTo(self: Int, target: Type) ?Int {
+    /// 超出范围返回 null（调用方处理溢出）。
+    pub inline fn coerceTo(self: Int, target: Type) ?Int {
         if (self.type == target) return self;
-        var buf: [16]u8 = [_]u8{0} ** 16;
-        _ = self.unpackToBuffer(&buf);
+        // 用 toBytes + inRangeBytes 做字节级范围检查（正确处理跨符号情况）
+        var buf: [16]u8 = undefined;
+        self.toBytes(&buf);
         if (!target.inRangeBytes(&buf)) return null;
-        return packFromBuffer(target, &buf);
+        return fromBytes(target, &buf);
     }
 
-    /// 是否为零（全字节为 0）
-    pub fn isZero(self: Int) bool {
-        return isAllZero(self.slice());
+    /// 是否为零
+    pub inline fn isZero(self: Int) bool {
+        if (self.type.byteLength() <= 8) return self.lo == 0;
+        return self.lo == 0 and self.hi == 0;
     }
 
     /// 十进制格式化：将 self 写入 buf，返回写入的切片。
-    /// 全软件字节级：负数取绝对值后，反复除以 10 收集余数（数字），最后反转。
-    /// 不依赖 Zig 原生 i128/u128，不丢失精度。
+    /// ≤64 位用原生 u64 除以 10；128 位用 U128 除法。
     /// buf 需至少 41 字节（u128 最大 39 位 + 符号 + 空终止余量）。
     pub fn formatDecimal(self: Int, buf: []u8) []const u8 {
-        const a = self.slice();
-        if (isAllZero(a)) {
+        if (self.type.byteLength() <= 8) {
+            if (self.lo == 0) {
+                buf[0] = '0';
+                return buf[0..1];
+            }
+            var val: u64 = self.lo;
+            var negative = false;
+            if (self.type.isSigned() and (self.lo >> 63) & 1 == 1) {
+                negative = true;
+                val = 0 -% val;
+            }
+            var pos: usize = 0;
+            while (val != 0) {
+                buf[pos] = '0' + @as(u8, @intCast(val % 10));
+                val /= 10;
+                pos += 1;
+            }
+            if (negative) {
+                buf[pos] = '-';
+                pos += 1;
+            }
+            std.mem.reverse(u8, buf[0..pos]);
+            return buf[0..pos];
+        }
+        // 128 位
+        if (self.lo == 0 and self.hi == 0) {
             buf[0] = '0';
             return buf[0..1];
         }
-
-        // 提取绝对值到可变缓冲
-        var mag: [16]u8 = [_]u8{0} ** 16;
-        const n = a.len;
-        @memcpy(mag[0..n], a);
+        var mag = U128{ .hi = self.hi, .lo = self.lo };
         var negative = false;
-        if (self.type.isSigned() and (mag[n - 1] & 0x80) != 0) {
+        if (self.type.isSigned() and (self.hi >> 63) & 1 == 1) {
             negative = true;
-            negateBytesInPlace(mag[0..n]);
+            mag = mag.negate();
         }
-
-        // 反复除以 10，收集数字（逆序）
+        const ten = U128.fromU64(10);
         var pos: usize = 0;
-        while (!isAllZero(mag[0..n])) {
-            var rem: u16 = 0;
-            var i: usize = n;
-            while (i > 0) {
-                i -= 1;
-                const val: u16 = @as(u16, rem) * 256 + @as(u16, mag[i]);
-                mag[i] = @truncate(val / 10);
-                rem = val % 10;
-            }
-            buf[pos] = '0' + @as(u8, @intCast(rem));
+        while (!mag.isZero()) {
+            const result = unsignedDivide128(mag, ten);
+            buf[pos] = '0' + @as(u8, @intCast(result.remainder.lo));
+            mag = result.quotient;
             pos += 1;
         }
         if (negative) {
@@ -732,129 +743,10 @@ pub const Int = struct {
         std.mem.reverse(u8, buf[0..pos]);
         return buf[0..pos];
     }
-
-    // —— 浮点尾数运算辅助（S8+ 实现，供 float.zig 委托）——
-    // fn addExtended(self: Int, other: Int) struct { result: Int, carry: bool }
-    // fn addOne(self: Int) Int
-    // fn leastSignificantBit(self: Int) u8
 };
 
-// —— 字块化运算辅助（用 u8/u16/u32/u64 作为字块替代逐字节循环）——
-// loadWord/storeWord/mulU64ToU128/multiplyU64Schoolbook/U128 等基础原语从 wide.zig 导入。
-
-/// 字块加法：r = a + b，返回 carry（1=无符号溢出）
-fn addWordN(comptime Word: type, r: []u8, a: []const u8, b: []const u8) bool {
-    const av = loadWord(Word, a);
-    const bv = loadWord(Word, b);
-    const sum, const carry = @addWithOverflow(av, bv);
-    storeWord(Word, r, sum);
-    return carry != 0;
-}
-
-/// 字块减法：r = a - b，返回 borrow（1=无符号下溢）
-fn subWordN(comptime Word: type, r: []u8, a: []const u8, b: []const u8) bool {
-    const av = loadWord(Word, a);
-    const bv = loadWord(Word, b);
-    const diff, const borrow = @subWithOverflow(av, bv);
-    storeWord(Word, r, diff);
-    return borrow != 0;
-}
-
-/// 字块取负：r = -a（补码取反加一，0 - a）
-fn negateWordN(comptime Word: type, r: []u8, a: []const u8) void {
-    const av = loadWord(Word, a);
-    storeWord(Word, r, ~av +% 1);
-}
-
-/// 位运算种类（命名枚举，供 bitwisePortable / bitwiseWordN 共用，避免匿名枚举类型不匹配）
+/// 位运算种类（命名枚举，供 bitwisePortable 共用）
 const BitwiseOp = enum { and_op, or_op, xor_op };
-
-/// 字块位运算：r = a op b
-fn bitwiseWordN(comptime Word: type, r: []u8, a: []const u8, b: []const u8, op: BitwiseOp) void {
-    const av = loadWord(Word, a);
-    const bv = loadWord(Word, b);
-    storeWord(Word, r, switch (op) {
-        .and_op => av & bv,
-        .or_op => av | bv,
-        .xor_op => av ^ bv,
-    });
-}
-
-/// 字块取反：r = ~a
-fn notWordN(comptime Word: type, r: []u8, a: []const u8) void {
-    const av = loadWord(Word, a);
-    storeWord(Word, r, ~av);
-}
-
-/// 字块左移：r = a << n（n >= bit_width 时 r = 0）
-fn shiftLeftWordN(comptime Word: type, r: []u8, a: []const u8, n: u8) void {
-    const av = loadWord(Word, a);
-    const bit_width: u8 = @intCast(@bitSizeOf(Word));
-    if (n >= bit_width) {
-        storeWord(Word, r, 0);
-        return;
-    }
-    const ShiftType = std.math.Log2Int(Word);
-    storeWord(Word, r, av << @as(ShiftType, @intCast(n)));
-}
-
-/// 字块右移：r = a >> n。
-/// arithmetic=true 时按补码符号位填充高位（算术右移），否则补 0（逻辑右移）。
-/// n >= bit_width 时：算术右移且符号位为 1 → 全 1；否则全 0。
-fn shiftRightWordN(comptime Word: type, r: []u8, a: []const u8, n: u8, arithmetic: bool) void {
-    const av = loadWord(Word, a);
-    const bit_width: u8 = @intCast(@bitSizeOf(Word));
-    const sign_bit_set = (av >> @intCast(bit_width - 1)) != 0;
-    if (n >= bit_width) {
-        const fill: Word = if (arithmetic and sign_bit_set) ~@as(Word, 0) else 0;
-        storeWord(Word, r, fill);
-        return;
-    }
-    const ShiftType = std.math.Log2Int(Word);
-    const sh: ShiftType = @intCast(n);
-    const shifted = av >> sh;
-    if (arithmetic and sign_bit_set and n > 0) {
-        // 高 n 位填充符号位 1（n=0 时无需填充，shifted 已是原值）
-        const fill_mask: Word = ~@as(Word, 0) << @intCast(bit_width - n);
-        storeWord(Word, r, shifted | fill_mask);
-        return;
-    }
-    storeWord(Word, r, shifted);
-}
-
-/// u64×u64→u128 与 u128*u128→u256 的 schoolbook 乘法基础原语从 wide.zig 导入。
-/// multiplyPortable 使用 multiplyU64Schoolbook 完成 u128*u128→u256（4 次 64×64 部分积累加）。
-/// mulU64ToU128 用 32 位半字 schoolbook，避免依赖 Zig u128 平台行为。
-
-/// 从高位到低位比较（无符号语义，要求等长）。u64 字块化：每次比较 8 字节，
-/// 命中差异立即返回；剩余不足 8 字节退化为逐字节。
-fn compareBytes(a: []const u8, b: []const u8) std.math.Order {
-    std.debug.assert(a.len == b.len);
-    var i = a.len;
-    while (i >= 8) {
-        i -= 8;
-        const av = loadWord(u64, a[i..][0..8]);
-        const bv = loadWord(u64, b[i..][0..8]);
-        if (av != bv) return if (av < bv) .lt else .gt;
-    }
-    while (i > 0) {
-        i -= 1;
-        if (a[i] != b[i]) return if (a[i] < b[i]) .lt else .gt;
-    }
-    return .eq;
-}
-
-/// 检查所有字节是否为 0。u64 字块化：每次检查 8 字节，命中非零立即返回。
-fn isAllZero(s: []const u8) bool {
-    var i: usize = 0;
-    while (i + 8 <= s.len) : (i += 8) {
-        if (loadWord(u64, s[i..][0..8]) != 0) return false;
-    }
-    while (i < s.len) : (i += 1) {
-        if (s[i] != 0) return false;
-    }
-    return true;
-}
 
 /// 将无符号整数字符串解析为 [16]u8 小端缓冲（软件乘加，不依赖 u128/i128）。
 /// 输入：纯数字字符串（已去除符号、进制前缀、类型后缀、下划线）。
@@ -877,10 +769,10 @@ pub fn parseUnsignedBytes(buf: *[16]u8, raw: []const u8, base: u8) ?u8 {
         var carry: u64 = digit;
         var i: usize = 0;
         while (i < 16) : (i += 8) {
-            const word = loadWord(u64, buf[i..][0..8]);
+            const word = std.mem.readInt(u64, buf[i..][0..8], .little);
             const product = mulU64ToU128(word, @as(u64, base));
             const sum_lo, const c1 = @addWithOverflow(product.lo, carry);
-            storeWord(u64, buf[i..][0..8], sum_lo);
+            std.mem.writeInt(u64, buf[i..][0..8], sum_lo, .little);
             carry = product.hi +% c1;
         }
         if (carry != 0) return null; // 超出 128 位
@@ -910,34 +802,26 @@ fn divmod128by64(hi: u64, lo: u64, d: u64) struct { quot: u64, rem: u64 } {
     return .{ .quot = (q_hi32 << 32) | q_lo32, .rem = r_final };
 }
 
-/// 无符号 128/128 除法：a / b = quotient ... remainder（均 16 字节小端）。
+/// 无符号 128/128 除法：a / b = quotient ... remainder。
 /// 三条路径（按除数大小）：
-///   1) b.hi != 0（除数 > 64 位）：U128 位级长除法，128 次迭代，每次 ~3 次 u64 操作。
-///   2) b.hi == 0 且 d ≤ 2^32：2 次原生 u64 除法（divmod128by64），约 10 次 u64 操作。最快。
-///   3) b.hi == 0 且 d > 2^32：位级长除法（64 次迭代，u64 操作），约 256 次 u64 操作。
-/// 调用方保证 b != 0（除零由 divideWithRemainder 拦截）。
-fn unsignedDivide128(a: []const u8, b: []const u8, quotient: []u8, remainder: []u8) void {
-    std.debug.assert(a.len == 16 and b.len == 16);
-    std.debug.assert(quotient.len == 16 and remainder.len >= 16);
-    @memset(quotient, 0);
-    @memset(remainder[0..16], 0);
+///   1) b.hi != 0（除数 > 64 位）：U128 位级长除法，128 次迭代。
+///   2) b.hi == 0 且 d ≤ 2^32：2 次原生 u64 除法（divmod128by64）。最快。
+///   3) b.hi == 0 且 d > 2^32：位级长除法（64 次迭代）。约 256 次 u64 操作。
+/// 调用方保证 b != 0。
+fn unsignedDivide128(a: U128, b: U128) struct { quotient: U128, remainder: U128 } {
+    std.debug.assert(!b.isZero());
 
-    const av = U128.load(a);
-    const bv = U128.load(b);
-    std.debug.assert(!bv.isZero());
-
-    // 路径 2/3：除数 fit u64（bv.hi == 0）
-    if (bv.hi == 0) {
-        const d: u64 = bv.lo;
-        // 高 64 位：av.hi / d（av.hi 可能 ≥ d，q_hi 拿到 av.hi / d，余数 rem < d）
-        const q_hi: u64 = av.hi / d;
-        const rem: u64 = av.hi % d; // rem < d
+    // 路径 2/3：除数 fit u64（b.hi == 0）
+    if (b.hi == 0) {
+        const d: u64 = b.lo;
+        const q_hi: u64 = a.hi / d;
+        const rem: u64 = a.hi % d; // rem < d
 
         var q_lo: u64 = 0;
         var r_final: u64 = undefined;
         if (d <= 0x100000000) {
             // 路径 2：d ≤ 2^32，rem < d ≤ 2^32，divmod128by64 前置条件满足
-            const result = divmod128by64(rem, av.lo, d);
+            const result = divmod128by64(rem, a.lo, d);
             q_lo = result.quot;
             r_final = result.rem;
         } else {
@@ -947,12 +831,9 @@ fn unsignedDivide128(a: []const u8, b: []const u8, quotient: []u8, remainder: []
             while (bit > 0) {
                 bit -= 1;
                 const shift_amt: u6 = @intCast(bit);
-                const a_bit: u1 = @truncate((av.lo >> shift_amt) & 1);
-                // 检测 rem<<1 是否溢出（bit 63 在移位前是否为 1）
+                const a_bit: u1 = @truncate((a.lo >> shift_amt) & 1);
                 const overflow = (r_final >> 63) != 0;
                 r_final = (r_final << 1) | a_bit;
-                // overflow 时真值 = r_final + 2^64 ≥ d 必减；否则比较 r_final 与 d
-                // wrapping sub 在两种情形都给出正确的 u64 余数
                 if (overflow or r_final >= d) {
                     r_final -%= d;
                     q_lo |= (@as(u64, 1) << shift_amt);
@@ -960,10 +841,10 @@ fn unsignedDivide128(a: []const u8, b: []const u8, quotient: []u8, remainder: []
             }
         }
 
-        storeWord(u64, quotient[0..8], q_lo);
-        storeWord(u64, quotient[8..16], q_hi);
-        storeWord(u64, remainder[0..8], r_final);
-        return;
+        return .{
+            .quotient = .{ .lo = q_lo, .hi = q_hi },
+            .remainder = .{ .lo = r_final, .hi = 0 },
+        };
     }
 
     // 路径 1：除数 > 64 位 → U128 位级二进制长除法（128 次迭代）
@@ -973,39 +854,22 @@ fn unsignedDivide128(a: []const u8, b: []const u8, quotient: []u8, remainder: []
     while (bit > 0) {
         bit -= 1;
         // rem 左移 1 位，最低位填入 a 的 bit 位
-        const a_bit: u1 = if (av.testBit(bit)) 1 else 0;
+        const a_bit: u1 = if (a.testBit(bit)) 1 else 0;
         const shifted = rem.shiftLeft1WithBit(a_bit);
         rem = shifted.result;
         // 若 rem >= b：rem -= b，quotient 对应位置 1
-        if (rem.compare(bv) != .lt) {
-            const sub_result = rem.sub(bv);
+        if (rem.compare(b) != .lt) {
+            const sub_result = rem.sub(b);
             rem = sub_result.diff;
             quot = quot.orBit(bit);
         }
     }
-    quot.store(quotient);
-    rem.store(remainder);
+    return .{ .quotient = quot, .remainder = rem };
 }
 
-/// 原地补码取负（取反加一）。u64 字块化：每次处理 8 字节，跨字块用 u64 carry；
-/// 剩余不足 8 字节退化为逐字节。
-fn negateBytesInPlace(s: []u8) void {
-    var carry: u64 = 1;
-    var i: usize = 0;
-    while (i + 8 <= s.len) : (i += 8) {
-        const av = loadWord(u64, s[i..][0..8]);
-        const inv = ~av;
-        const sum, const overflow = @addWithOverflow(inv, carry);
-        storeWord(u64, s[i..][0..8], sum);
-        carry = overflow;
-    }
-    while (i < s.len) : (i += 1) {
-        const inv: u8 = ~s[i];
-        const sum, const overflow = @addWithOverflow(inv, @as(u8, @truncate(carry)));
-        s[i] = sum;
-        carry = overflow;
-    }
-}
+// ============================================================
+// 测试
+// ============================================================
 
 test "Type.isSigned" {
     try std.testing.expect(Type.i8.isSigned());
@@ -1127,41 +991,41 @@ test "Int.zero" {
     try std.testing.expectEqual(.eq, Int.zero(.u128).compare(Int.fromNative(.u128, @as(u128, 0))));
 }
 
-test "Int.unpackToBuffer/packFromBuffer roundtrip" {
+test "Int.toBytes/fromBytes roundtrip" {
     // i32 -1：符号扩展填满 0xFF
     {
         var buf: [16]u8 = undefined;
         const v = Int.fromNative(.i32, @as(i32, -1));
-        const n = v.unpackToBuffer(&buf);
-        try std.testing.expectEqual(@as(u8, 4), n);
+        v.toBytes(&buf);
+        try std.testing.expectEqual(@as(u8, 4), v.type.byteLength());
         for (buf) |b| try std.testing.expectEqual(@as(u8, 0xFF), b);
-        const back = Int.packFromBuffer(.i32, &buf);
+        const back = Int.fromBytes(.i32, &buf);
         try std.testing.expectEqual(.eq, v.compare(back));
     }
     // u32 0xDEADBEEF：零扩展填满 0x00
     {
         var buf: [16]u8 = undefined;
         const v = Int.fromNative(.u32, @as(u32, 0xDEADBEEF));
-        const n = v.unpackToBuffer(&buf);
-        try std.testing.expectEqual(@as(u8, 4), n);
+        v.toBytes(&buf);
+        try std.testing.expectEqual(@as(u8, 4), v.type.byteLength());
         try std.testing.expectEqual(@as(u8, 0xEF), buf[0]);
         try std.testing.expectEqual(@as(u8, 0xBE), buf[1]);
         try std.testing.expectEqual(@as(u8, 0xAD), buf[2]);
         try std.testing.expectEqual(@as(u8, 0xDE), buf[3]);
         for (buf[4..16]) |b| try std.testing.expectEqual(@as(u8, 0x00), b);
-        const back = Int.packFromBuffer(.u32, &buf);
+        const back = Int.fromBytes(.u32, &buf);
         try std.testing.expectEqual(.eq, v.compare(back));
     }
     // i128 边界：16 字节无填充
     {
         var buf: [16]u8 = undefined;
         const v = Int.fromNative(.i128, @as(i128, std.math.minInt(i128)));
-        const n = v.unpackToBuffer(&buf);
-        try std.testing.expectEqual(@as(u8, 16), n);
+        v.toBytes(&buf);
+        try std.testing.expectEqual(@as(u8, 16), v.type.byteLength());
         // minInt(i128)：低 15 字节 0x00，高字节 0x80
         for (buf[0..15]) |b| try std.testing.expectEqual(@as(u8, 0x00), b);
         try std.testing.expectEqual(@as(u8, 0x80), buf[15]);
-        const back = Int.packFromBuffer(.i128, &buf);
+        const back = Int.fromBytes(.i128, &buf);
         try std.testing.expectEqual(.eq, v.compare(back));
     }
 }
@@ -1450,7 +1314,6 @@ test "Int.divideTruncating/remainder divide by zero" {
 
 test "Int.divideTruncating i128 covers unsignedDivide128 three paths" {
     // 路径 2：除数 fit u64 且 d ≤ 2^32（divmod128by64 2 次原生除法）
-    // 覆盖 i128 正/负被除数 × 正/负除数 四种符号组合，确保符号修正后仍命中路径 2。
     {
         const cases = [_]struct { a: i128, b: i128 }{
             .{ .a = std.math.maxInt(i128), .b = 7 },

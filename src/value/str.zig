@@ -28,7 +28,7 @@ pub const Str = extern struct {
     /// SSO 最大字节数
     pub const SSO_MAX: usize = 20;
 
-    fn isSso(self: *const Str) bool {
+    pub inline fn isSso(self: *const Str) bool {
         return (self.rc & SSO_FLAG) != 0;
     }
 
@@ -83,7 +83,7 @@ pub const Str = extern struct {
     }
 
     /// 返回字节切片（只读）。SSO 模式返回内联数据，堆模式返回堆切片。
-    pub fn bytes(self: *const Str) []const u8 {
+    pub inline fn bytes(self: *const Str) []const u8 {
         if (self.isSso()) {
             const len = self.ssoLen();
             const ptr: [*]const u8 = @ptrCast(self);
@@ -94,7 +94,7 @@ pub const Str = extern struct {
     }
 
     /// UTF-8 字节数
-    pub fn byteLength(self: Str) usize {
+    pub inline fn byteLength(self: Str) usize {
         if (self.isSso()) {
             return self.ssoLen();
         }

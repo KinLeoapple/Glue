@@ -1804,7 +1804,7 @@ pub const VM = struct {
     /// 用 cast.castNumeric 协调 type_tag（拓宽/收窄），替换栈顶；任何失败（溢出/类型不符/非数值/
     /// 泛型类型名）原样保留——绝不 panic。镜像 eval 的 `castValue(...) catch val` best-effort 隐式协调。
     /// 注意：与 doCast 不同，不处理 str（隐式协调不做 to-string，保持值语义）。
-    fn doCoerce(self: *VM, type_name: []const u8) void {
+    inline fn doCoerce(self: *VM, type_name: []const u8) void {
         const top = &self.stack.items[self.stack.items.len - 1];
         if (!top.isInteger() and !top.isFloat()) return; // 非数值：原样
         const result = cast.castNumeric(self.allocator, top.*, type_name) catch return; // 溢出/不符：原样
@@ -2527,7 +2527,7 @@ pub const VM = struct {
     }
 
     /// 算术 + 位运算。语义镜像 eval.zig evalAdd/Sub/...（复用 value 软件 API，不依赖 128 位原生类型）。
-    fn doArith(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
+    inline fn doArith(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         if (left.isInteger() and right.isInteger()) {
             const left_int = left.asInt();
             const right_int = right.asInt();
@@ -2595,6 +2595,7 @@ pub const VM = struct {
 
     /// 浮点参与的算术（int↔float 混合按 evalBinary 提升为 float）。
     /// 全软件：Int→Float 用 Float.fromInt（不丢精度），运算用 Float 软件 API。
+    /// 注：不标 inline——函数体较大，内联入 doArith 会超出 comptime 分支配额。
     fn doArithFloat(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         if ((left.isFloat() or left.isInteger()) and (right.isFloat() or right.isInteger())) {
             // 选择更大的浮点类型，如果都是浮点数；否则使用浮点数的类型
@@ -2628,7 +2629,7 @@ pub const VM = struct {
     }
 
     /// 比较：== != < > <= >=。返回 bool。全软件：Int.compare / Float.compare，不依赖 128 位原生类型。
-    fn doCompare(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
+    inline fn doCompare(self: *VM, op: OpCode, left: Value, right: Value, loc: ast.SourceLocation) VMError!Value {
         // == / !=：数值按 promoteIntTypes 后**按值**比较（忽略 type_tag），镜像 eval evalBinary .eq/.not_eq。
         // 关键：隐式定型（OP_COERCE）后操作数 tag 可能不同（如 i32 形参 vs i8 字面量），
         // 不能用 tag-strict 的 Value.equals，否则 `n == 0` 恒 false（M5 整数定型回归）。
@@ -2720,7 +2721,7 @@ pub const VM = struct {
         return self.fail(loc, "comparison requires numeric operands", error.TypeMismatch);
     }
 
-    fn doNegate(self: *VM, v: Value, loc: ast.SourceLocation) VMError!Value {
+    inline fn doNegate(self: *VM, v: Value, loc: ast.SourceLocation) VMError!Value {
         if (v.isInteger()) {
             const int_val = v.asInt();
             const result = int_val.negate();

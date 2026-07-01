@@ -2601,7 +2601,7 @@ fn parsePatternInt(raw: []const u8) ?value.Int {
     }
     const parsed = parseIntSoftware(raw[0..end]) orelse return null;
     // Pattern ints 存为 i64（截取低 8 字节，与旧代码行为一致）
-    return value.Int.fromBytes(.i64, &parsed.bytes);
+    return .{ .type = .i64, .lo = parsed.lo, .hi = 0 };
 }
 
 // ============================================================

@@ -1,160 +1,353 @@
-# Glue 性能优化基线 (ReleaseFast)
+# Glue 性能基线 (ReleaseFast)
 
-测量环境: Windows 11, ReleaseFast 构建, 取多次运行最快值。
-测量日期: 2026-06-19。基线 commit: 6b06c16 (master) + var 注解修复。
+测量环境: Windows 11, Zig 0.16.0, ReleaseFast 构建, 取 3 次运行最佳值。
+测量日期: 2026-07-02。后端: 字节码栈式 VM。
 
 ## 基线数字
 
-| Benchmark | 负载 | 最快墙钟 | 单位成本估算 |
-|---|---|---|---|
-| fib    | fib(32),约 700 万次非尾递归调用 | **65697ms** | ~9.4µs/调用 |
-| lookup | 5000×1000=500 万次内层循环,多变量跨作用域查找 | **91654ms** | ~18µs/内层迭代 |
-| record | 100 万次记录构造+match+字段访问 | **25539ms** | ~25µs/轮 |
+| Benchmark | 负载 | 最快墙钟 | 指令数 | 吞吐 |
+|---|---|---|---|---|
+| fib    | fib(32), 约 700 万次非尾递归调用 | **948.75 ms** | 77.5M | 81.3 M instr/s |
+| lookup | 5000×1000=500 万次内层循环, 多变量跨作用域查找 | **2183.58 ms** | 150.2M | 67.5 M instr/s |
+| record | 100 万次记录构造+match+字段访问 | **804.16 ms** | 60.0M | 75.0 M instr/s |
+| float  | Newton-Raphson sqrt, 10万数×10次迭代 | **1321.38 ms** | 33.1M | 25.7 M instr/s |
+| string | 拼接2000次+迭代+索引+比较1万次+SSO 5万次 | **66.64 ms** | 1.79M | 48.0 M instr/s |
+| closure | 计数器5万+柯里化10万+三层5万+构造5万 | **100.67 ms** | 6.35M | 92.1 M instr/s |
+| array  | push构造5000+迭代+索引+拼接+churn 1000 | **47.08 ms** | 1.83M | 98.9 M instr/s |
+| tailcall | 尾递归求和10万+阶乘+交替和+mutual+密集1万 | **209.01 ms** | 17.3M | 96.2 M instr/s |
 
-## 解读
+## 各基准 opcode 频率 (前 8, --profile)
 
-- fib ~9.4µs/调用:确认瓶颈在每次调用的固有成本(createChild 新建 StringHashMap +
-  define 时 dupe 参数名 + 变量查找沿父链 HashMap)。与记忆续12 实测 ~4.5µs 同量级
-  (那次是尾递归 countDown,这里 fib 非尾递归无 TCO,每次真建帧故更慢)。
-- lookup 最慢:每轮内层引用 a/b/c/d/acc/i 六个变量,每个都走 environment.get 沿父链
-  StringHashMap 查找。词法地址解析(De Bruijn)应在此负载收益最大。
-- record:复合值 churn 走 refcount/COW + SlabPool,单位成本最高(装箱+rc+模式匹配)。
+### fib(32)
+| opcode | 次数 | 占比 |
+|---|---|---|
+| op_get_local | 17,622,887 | 22.7% |
+| op_const | 14,098,310 | 18.2% |
+| op_return | 7,049,156 | 9.1% |
+| op_lt | 7,049,155 | 9.1% |
+| op_jump_if_false | 7,049,155 | 9.1% |
+| op_pop | 7,049,155 | 9.1% |
+| op_call | 7,049,155 | 9.1% |
+| op_sub | 7,049,154 | 9.1% |
+| op_add | 3,524,577 | 4.5% |
 
-## 优化目标顺序(对应任务 #1-4)
+### lookup (5000×1000)
+| opcode | 次数 | 占比 |
+|---|---|---|
+| op_get_local | 45,050,002 | 30.0% |
+| op_add | 30,030,000 | 20.0% |
+| op_const | 20,050,003 | 13.3% |
+| op_pop | 10,015,001 | 6.7% |
+| op_set_local_assign | 10,010,000 | 6.7% |
+| op_mod | 10,005,000 | 6.7% |
+| op_set_local | 5,030,002 | 3.3% |
+| op_lt | 5,010,001 | 3.3% |
 
-1. ✅ 建 benchmark + 量基线(本文件)
-2. 词法地址解析(De Bruijn):evalIdentifier 从 HashMap 查找改数组索引 — lookup 收益最大
-3. ✅ 名字 intern + 整数键环境:消除每次 define 的 dupe/free + 每次 lookup 的字符串哈希
-4. 帧池化复用 + 小整数缓存:freelist 复用帧,小整数避免重复装箱
+### record (1M)
+| opcode | 次数 | 占比 |
+|---|---|---|
+| op_get_local | 19,000,002 | 31.7% |
+| op_set_local | 7,000,002 | 11.7% |
+| op_const | 5,000,003 | 8.3% |
+| op_add | 5,000,000 | 8.3% |
+| op_pop | 3,000,001 | 5.0% |
+| op_jump_if_false | 2,000,001 | 3.3% |
+| op_set_local_assign | 2,000,000 | 3.3% |
+| op_mul | 2,000,000 | 3.3% |
+| op_get_field | 2,000,000 | 3.3% |
+| op_get_adt_field | 2,000,000 | 3.3% |
 
-每层优化后重跑这三个 bench 对照,验证真实收益。
+### float (Newton-Raphson sqrt)
+| opcode | 次数 | 占比 |
+|---|---|---|
+| op_get_local | 9,879,484 | 29.8% |
+| op_pop | 4,487,334 | 13.5% |
+| op_const | 2,595,117 | 7.8% |
+| op_jump_if_false | 2,295,118 | 6.9% |
+| op_add | 2,195,118 | 6.6% |
+| op_unit | 2,192,216 | 6.6% |
+| op_set_local_assign | 2,192,216 | 6.6% |
+| op_div | 2,098,021 | 6.3% |
 
-## 优化结果
+### string (拼接+迭代+索引+比较+SSO)
+| opcode | 次数 | 占比 |
+|---|---|---|
+| op_const | 341,163 | 19.1% |
+| op_pop | 251,154 | 14.1% |
+| op_get_local | 218,877 | 12.3% |
+| op_add | 181,144 | 10.1% |
+| op_set_local_assign | 131,144 | 7.3% |
+| op_unit | 127,572 | 7.1% |
+| op_jump | 127,572 | 7.1% |
+| op_jump_if_false | 123,578 | 6.9% |
 
-### 任务 #3:名字 intern + 整数键环境(2026-06-19 完成)
+### closure (计数器+柯里化+构造)
+| opcode | 次数 | 占比 |
+|---|---|---|
+| op_get_local | 1,500,008 | 23.6% |
+| op_add | 700,000 | 11.0% |
+| op_const | 650,015 | 10.2% |
+| op_pop | 500,007 | 7.9% |
+| op_set_local_assign | 500,000 | 7.9% |
+| op_get_upvalue | 350,000 | 5.5% |
+| op_return | 300,004 | 4.7% |
+| op_unit | 300,000 | 4.7% |
 
-变量名 intern 成 u32 id,Environment 从 StringHashMap 改 AutoHashMap(u32)。
-消除每次 define 的 key dupe/free + 每次 lookup 的字符串哈希。
+### array (push+迭代+索引+拼接+churn)
+| opcode | 次数 | 占比 |
+|---|---|---|
+| op_get_local | 453,056 | 24.7% |
+| op_pop | 227,641 | 12.4% |
+| op_set_local_assign | 224,627 | 12.3% |
+| op_add | 117,597 | 6.4% |
+| op_unit | 115,830 | 6.3% |
+| op_jump | 115,830 | 6.3% |
+| op_const | 114,927 | 6.3% |
+| op_jump_if_false | 111,806 | 6.1% |
 
-| Benchmark | 基线 | intern 后 | 提速 |
-|---|---|---|---|
-| fib    | 65697ms | **31883ms** | **2.06×** |
-| lookup | 91654ms | **44137ms** | **2.08×** |
-| record | 25539ms | **7475ms**  | **3.42×** |
+### tailcall (尾递归求和+阶乘+交替+mutual)
+| opcode | 次数 | 占比 |
+|---|---|---|
+| op_get_local | 5,350,084 | 31.0% |
+| op_const | 3,050,052 | 17.7% |
+| op_pop | 1,530,029 | 8.9% |
+| op_jump_if_false | 1,520,024 | 8.8% |
+| op_eq | 1,510,003 | 8.7% |
+| op_sub | 1,400,018 | 8.1% |
+| op_tail_call | 1,400,018 | 8.1% |
+| op_add | 1,220,000 | 7.1% |
 
-调用/查找吞吐翻倍;record churn 3.4×(热路径无 per-define 字符串 dupe/free)。
-连带修复一个既存 string 数组迭代 double-free(array_iterator next 用 retain 而非 retainOwned)。
+## 内存统计 (SlabPool)
 
-### 任务 #4:帧池化复用(2026-06-19,负结果,已还原)
+| Benchmark | peak live | peak reserved | fragmentation@peak | final live |
+|---|---|---|---|---|
+| fib    | 3.9 KB | 48.0 KB | 91.9% | 0 B |
+| lookup | 792 B  | 32.0 KB | 97.6% | 0 B |
+| record | 781 B  | 64.0 KB | 98.8% | 0 B |
+| float  | 707 B  | 48.0 KB | 98.6% | 0 B |
+| string | 1.15 MB | 1.23 MB | 6.7% | 1.15 MB |
+| closure | 1.53 MB | 1.63 MB | 6.0% | 1.53 MB |
+| array  | 903.5 KB | 413.8 KB | -118.4%* | 656.7 KB |
+| tailcall | 660 B | 48.0 KB | 98.7% | 0 B |
 
-试图池化退出作用域的 Environment 帧(freelist + clearRetainingCapacity 保留 map/list 后备),
-免去每次 createChild 的 AutoHashMap 后备分配+rehash。**实测零提速**(fib 31.9→32.1s、
-lookup/record 持平,均在噪声内)。根因:SlabPool 已让帧 create/destroy 成 O(1) freelist,
-且小帧的 AutoHashMap 首次 put 才分配单个小 slab——SlabPool 本就廉价回收,clearRetainingCapacity
-省的那点被淹没。**已还原**(零收益不值得给最脆弱的 releaseEnv 加「池化活帧」的静默损坏风险面)。
-教训:小整数缓存也作废(IntValue 是 union 内联值类型,整数创建不分配)。
+> 注：fragmentation% 在 live 极小时段会偏高（reserved slab 尚未归还），并不反映分配效率问题；
+> final live=0 表示无泄漏。fib/lookup/record/float/tailcall 均为纯算术/小记录 churn，内存非瓶颈。
+> string/closure 的 final live 接近 peak live 是因为闭包/字符串在 main 作用域内全程持有，非泄漏。
+> *array 的 fragmentation 为负值（peak reserved < peak live），疑似 SlabPool 统计口径在 array churn 场景下不一致，待排查。
 
-性能下一步只剩 De Bruijn(#2,词法地址),但那是高风险大改(需扁平数组环境+闭包 upvalue 两层方案)。
+## 热点解读与优化机会
 
-### 任务 #2:De Bruijn 词法地址(2026-06-19,负结果,默认关闭/休眠)
+### 1. op_get_local 是头号热点 (12-31%)
+在 8 个 benchmark 中 7 个排第 1（仅 string 例外，被 op_const 超过）。已有 fast path（非 boxed 值直接 push），但仍可继续优化：
+- 栈访问 `self.stack.items[slot_base + slot]` 经 ArrayListUnmanaged 间接寻址，可缓存 `stack.ptr`。
+- 编译期 slot 多在 u8 范围内，目前统一用 u16 立即数（2 字节解码），可在编译器分析后窄化为 u8（1 字节，减解码开销）。
 
-局部变量 (depth,slot) 数组寻址替代父链哈希查找。完整实现(resolve scope 栈 + env slot 数组 +
-identifier.resolved 三级引用 local/upvalue/global + 自校验回退)。**实测 lookup 44.1→43.2s(~2%,
-噪声内),fib/record 持平**。根因同 #4:#3 的 intern 把 key 换成 u32 后哈希探测已近免费,De Bruijn
-省的那点 + 两条路径都仍 pointer-chase 父链,收益被淹没。
-**安全已解决**:getLocal 自校验 slot 的 name_id,错配/越界返回 null → 回退 map(所有构建模式,
-非仅 Debug 断言),即使 resolver 有 bug 也只是走慢路径、绝不静默读错变量。
-**决策**:默认关闭(use_lexical_addressing=false),休眠代码零成本(flag 关时 evalIdentifier 走 map)。
-保留代码以便日后若改底层表示(消除父链 walk)再重开。
+### 2. 整数算术调用链过深 (op_add 在 lookup 占 20%)
+**约束：完全使用自实现类型（Int/Float + [16]u8 字节模拟 + U128 字块），不回退 Zig 原生 i128 旁路。**
+最内层 `addWordN` 已用 u64 `@addWithOverflow`（自实现类型内部合法，wide.zig 设计如此）。
+开销在 7 层非内联函数调用：`doArith → asInt×2 → promoteIntTypes → coerceTo×2 → add → addPortable → addWordN`。
+- 标记 `doArith`/`add`/`addPortable`/`subtract`/`multiply`/`coerceTo`/`divideTruncating`/`remainder` 为 `inline`，
+  让编译器展平调用栈、消除 prologue/epilogue。
+- `add` 是 `addPortable` 的纯转发包装，内联后零成本。
+- `coerceTo` 在类型已匹配时 `return self`（已是短路），内联后消除调用开销。
+- Int 结构体 (type + [16]u8，对齐 24B) 的按值拷贝经内联后可被编译器在寄存器中传递。
 
-**性能优化链结论**:唯一真实收益来自 #3 名字 intern(2-3.4×)。#4 帧池化、#2 De Bruijn 均负结果
-(intern 后底层已足够快)。树遍历解释器的下一个数量级需字节码 VM(另立项)。
+### 3. op_const 占 13-18%
+常量池索引取 `func.chunk.constants.items[idx]` 再判 isBoxed 决定 retainOwned。
+小整数常量可走内联值快路径（已部分实现），但常见的小整数（0/1/-1）可考虑专用 OP_SMALL_INT 单字节编码。
 
-### 续:热路径剖析 + B1 shadow_stack 短路(2026-06-19,第三个负结果)
+### 4. 调度循环本身
+- 当前 `switch (op)` 分支分派。可评估 computed-goto（Zig `@setBranchHint(.cold)` + 跳转表）降低分支预测 miss。
+- `frame.ip` 每条指令重取 `code[frame.ip]`；可缓存 `ip_ptr: [*]const u8` 指针直接推进。
 
-剖析隔离实验(均 ReleaseFast):
-- **P1**(全 depth-0 本块变量)42.4s vs **P2**(原 lookup,引用 depth-1)43.2s → **父链 walk 不是瓶颈(<2%)**。
-- **Q1**(每轮~2 二元运算,3000万轮)122s vs **Q2**(每轮~8 个)190s → **每个二元运算 ~2.3µs**。
+### 5. 内存管理：SlabPool 已高效，非当前瓶颈
+SlabPool 设计完善（段式 size class、侵入式 freelist、O(1) 掩码反查、空 slab 缓存）。
+当前基准峰值 live <4KB，内存层不是瓶颈。对象重用空间在于：
+- 小整数缓存（i64 范围内常用值预分配，省反复构造 Int + Value.fromInt）。
+- 记录/ADT 构造的 cell 复用（record bench 中 Point 每轮构造+丢弃，freelist 命中率高）。
 
-读码定位 2.3µs:evalBinary 每个运算做 pushRoot/popRoot(给**主路径恒 null 的 GC** 的 shadow_stack
-做 ArrayList append+pop)+ 两次 release(整数 no-op 但仍 tag switch)+ 两次递归 evalExpr 分发。
+### 6. 排序算法
+当前代码库无内建排序（用户层 List 仅有递归算子）。若引入数组排序，应直接用 std.sort（Zig 标准库的 pdqsort），
+编译期特化比较器，避免运行时函数指针间接调用。
 
-**B1:pushRoot/popRoot/popRoots 在 gc==null 时短路**(主求值器 gc 恒 null;spawn 协程 gc 非 null 行为不变)。
-实测三 bench **全部持平**(fib 复测 31.9s 排除噪声)。**第三个负结果**。B1 保留(正确的死代码清理,
-33/33 + 并发正常,主路径不再对死 GC 做 ArrayList 操作),只是不提速。
+### 7. Float 软件算术路径吞吐最低 (float bench 仅 25.7 M instr/s)
+float benchmark 吞吐远低于其他 bench（其他 48-99 M instr/s），根因是软件 IEEE 754 的 add/div/compare 每次都走
+unpack→decompose→对阶→尾数运算→round→pack 全路径。op_div 占 6.3%、op_add 占 6.6%，但每条指令的 CPU 开销远高于整数。
+- Float.add/sub/mul/div 的 *Portable 函数体较大（~60 行），不宜 inline，但可考虑常见类型（f64）的快速路径。
+- Float.compare 走 comparePortable（~50 行），可考虑同号同类型时直接按字节序列比较（已实现，但 NaN 检查仍走 unpack）。
 
-**最终实证结论**:2.3µs/节点不在变量查找/帧分配/shadow_stack(全排除),在**树遍历本身不可削减的机制**:
-每节点递归 evalExpr 调用 + ~40 分支 union-tag switch + EvalResult try 传播 + 64 字节 Value 按值拷贝。
-**增量优化在 intern 后彻底到顶,下一数量级只能靠字节码 VM(AST→线性 IR→switch-threaded VM,重写求值器核心)。**
+### 8. Upvalue 访问 (closure bench op_get_upvalue 5.5%)
+closure benchmark 中 op_get_upvalue 占 5.5%，每次访问需解 Cell 指针→读 inner Value。
+- upvalue 多为可变捕获（Cell），读路径比 op_get_local 多一次指针解引用。
+- 若编译器能证明 upvalue 不会被多个闭包共享，可考虑内联化（直接拷贝值而非 Cell 间接）。
 
+### 9. 字符串循环拼接 O(n²) (string bench op_add 10.1%)
+string benchmark 中循环拼接 `s = s + "ab"` 每次 `+` 都分配新 Str 并拷贝全部历史内容，O(n²) 复杂度。
+- 可引入 StringBuilder / rope 结构，延迟拼接到最终消费时。
+- 或在 VM 层对 `s = s + literal` 模式做就地追加优化（当 refcount==1 时 realloc 而非新建）。
 
+## 复现方法
 
-
-
-## 重跑命令
-
-```bash
-GLUE=./zig-out/bin/glue.exe
+```powershell
 zig build -Doptimize=ReleaseFast
-for b in fib lookup record; do
-  s=$(date +%s%N); (cd bench/$b && "$GLUE" run >/dev/null 2>&1); e=$(date +%s%N)
-  echo "$b: $(( (e-s)/1000000 ))ms"
-done
+foreach ($b in @("fib","lookup","record","float","string","closure","array","tailcall")) {
+    Push-Location "bench\$b"
+    & "..\..\zig-out\bin\glue.exe" run --profile   # 带详细 opcode/内存统计
+    # 或计时: Measure-Command { & "..\..\zig-out\bin\glue.exe" run | Out-Default }
+    Pop-Location
+}
 ```
 
-正确性参考值: fib=2178309, lookup=410780000, record=666666666666000000
+## 后续优化验证流程
 
----
+每项优化完成后重跑全部 8 个 bench，对照本表数字验证真实收益（非 --profile 计时取最佳值，
+--profile 用于确认热点已迁移）。重点指标：吞吐 (M instr/s) 与 单次调用/迭代成本。
+float benchmark 对 Float 软件算术路径最敏感；string/closure/array 覆盖堆分配与 RC 路径；
+tailcall 验证 TCO 是否生效（op_tail_call 计数应与尾递归调用次数一致）。
 
-## 字节码 VM 对比（M1b 完成后，2026-06-19）
+## 优化记录
 
-lookup 基准首次在字节码 VM 上端到端跑通（含 `main` + `println`），输出 `410780000` 与树遍历器一致。
+### O1: 算术调用链内联 (2026-07-02)
+**约束**：完全使用自实现类型（Int/Float + [16]u8 字节模拟 + U128 字块），不回退 Zig 原生 i128 旁路。
+**改动**：将自实现类型的热点算术/比较函数标记为 `inline`，让 ReleaseFast 展平 7 层调用栈。
+- [src/value/int.zig](file:///d:/Projects/Zig/Glue/src/value/int.zig): `add`/`addPortable`/`subtract`/`subtractPortable`/`compare`/`comparePortable`/`negate`/`coerceTo` + `addWordN`/`subWordN`/`negateWordN`/`bitwiseWordN`
+- [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `doArith`/`doCompare`
 
-| Benchmark | 树遍历器 (ReleaseFast) | 字节码 VM (ReleaseFast) | 提速 |
+**收益**（3 次取最佳，ReleaseFast）：
+
+| Benchmark | 基线 | 优化后 | 提升 |
 |---|---|---|---|
-| lookup | ~44000ms | **~2030ms** | **~22×** |
+| fib    | 948.75 ms  | **844.06 ms**  | **-11.0%** |
+| lookup | 2183.58 ms | **1957.93 ms** | **-10.3%** |
+| record | 804.16 ms  | **773.49 ms**  | **-3.8%**  |
 
-测量：均 ReleaseFast，取多次热运行稳定值。VM 数同时含编译（lex+parse+compile）+ 执行；
-编译占比极小（程序仅 ~30 行），主体是 500 万次内层迭代的执行。
+**验证**：`zig build test` 全通过；33 个集成测试全通过。
+**无行为变更**：纯内联，热点从 `op_add 20%` 经 `--profile` 确认频率分布不变。
 
-### 跑法
-```
-zig build bench-vm -Doptimize=ReleaseFast   # 编译 lookup → VM 执行 → 打印 410780000
-```
-驱动源：`src/vm/bench_main.zig`（内嵌类型后缀版 lookup，因 M1 VM 不跑 type_check，
-用 `i64` 后缀锁字面量类型 —— 与树遍历器等价工作量）。
+### B1: 修复 SSO 字符串 retain/release 破坏长度字段 (2026-07-02)
+**症状**：`stress_calculator` 中 `s.len()` 返回错误值（"12 + 34" 长度 7 返回 9），导致 `s[i]` 越界读垃圾字节、
+tokenizer 抛 "unexpected char"、最终 `Utf8View.init` panic "invalid UTF-8 string"。
+**根因**：SSO 字符串的 `rc` 字段同时编码 SSO 标志(bit31)+长度(bits 0-4)，但 [Value.retain](file:///d:/Projects/Zig/Glue/src/value/mod.zig#L339)/[Value.release](file:///d:/Projects/Zig/Glue/src/value/mod.zig#L362)
+把 `rc` 当普通引用计数增减——每次 retain 使 SSO 长度 +1，每次 release 使其 -1。
+**修复**：将 `.string` 从 boxed 类型的 inline prong 拆出，retain/release 前先 `if (p.isSso())` 跳过（SSO 无堆分配，无需 RC）。
+- [src/value/str.zig](file:///d:/Projects/Zig/Glue/src/value/str.zig#L31): `isSso()` 改为 `pub`
+- [src/value/mod.zig](file:///d:/Projects/Zig/Glue/src/value/mod.zig#L339): `retain`/`release` 对 SSO 字符串跳过 RC 操作
+**验证**：`stress_calculator: All tests passed!`；33 个集成测试全通过；`zig build test` 全通过。
+基准性能中性（fib/lookup/record 均不重度使用字符串，±1% 噪声范围）。
 
-### 解读
-- ~22× 来自：局部变量是栈 slot 数组索引（vs 树遍历器的父链 AutoHashMap 查找，即便 #3 intern 后
-  仍 pointer-chase 父链）；无 per-call Environment 建/销；指令分派替代 AST 节点递归 + 类型 switch。
-- 这正是 #2 De Bruijn 想要但在树遍历器表示下拿不到的收益 —— VM 的扁平 slot 模型从根上消除了父链 walk。
-- 注：VM 仍缺 type_check 集成、复合值（array/record/adt）、match、并发等；lookup 只压算术+变量查找+
-  调用+循环这条已落地的热路径。fib/record 待 VM 补函数调用 churn / 复合值后再对比。
+### O2: 全面类型内联 (2026-07-02)
+**目标**：将 O1 的 Int 算术内联策略推广到所有自实现类型（Float/Char/Str）及 Value 谓词，实现通用且全面的优化。
+**约束**：继续遵守自实现类型约束（Int/Float + [16]u8 字节模拟 + U128 字块），不回退原生类型。
 
----
+**改动**（仅标记小函数/包装器为 `inline`，大函数保持 `fn` 避免 icache 膨胀）：
+- [src/value/float.zig](file:///d:/Projects/Zig/Glue/src/value/float.zig): `isNegative`/`isNan`/`isInfinite`/`isZero`/`isSubnormal`/`compare`/`negate`/`add`/`subtract`/`multiply`/`divide`/`toFloatType` → `inline`；`comparePortable` 保持 `fn`（~50 行，comptime 求值会超 1000 分支配额）
+- [src/value/char.zig](file:///d:/Projects/Zig/Glue/src/value/char.zig): `fromNativeUnchecked`/`toCodePoint`/`toNative`/`compare`/`equals`/`successor`/`predecessor`/`isAscii`/`isDigit`/`isAlpha` → `inline`
+- [src/value/str.zig](file:///d:/Projects/Zig/Glue/src/value/str.zig): `isSso`/`bytes`/`byteLength` → `inline`
+- [src/value/mod.zig](file:///d:/Projects/Zig/Glue/src/value/mod.zig): `isInteger`/`isFloat`/`isNumeric`/`isString` → `inline`（每次算术/比较都调用的谓词）
+- [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `doNegate`/`doCoerce` → `inline`（小函数）；`doArithFloat`/`doCompoundLocal`/`doCompoundUpvalue` 保持 `fn`（体积大，内联入 doArith 会超 comptime 分支配额）
 
-## M2a — record bench 在字节码 VM 上跑通（2026-06-19）
+**收益**（3 次取最佳，ReleaseFast）：
 
-ADT 构造 + 命名字段访问 + 单构造器 match 落地后，record bench 端到端在 VM 跑通，
-输出 `666666666666000000` 与树遍历器/门禁值一致。
+| Benchmark | 基线 | O1 | O2 | O2 vs O1 | O2 vs 基线 |
+|---|---|---|---|---|---|
+| fib    | 948.75 ms  | 844.06 ms  | **833.92 ms**  | -1.2%  | **-12.1%** |
+| lookup | 2183.58 ms | 1957.93 ms | **1972.57 ms** | +0.7%  | **-9.7%**  |
+| record | 804.16 ms  | 773.49 ms  | **796.08 ms**  | +2.9%  | -1.0%      |
 
-| Benchmark | 树遍历器 (ReleaseFast) | 字节码 VM (ReleaseFast) | 提速 |
-|---|---|---|---|
-| lookup | ~44000ms | ~2030ms | ~22× |
-| record | ~7350ms | **~710ms** | **~10×** |
+**分析**：
+- fib 进一步提升 -1.2%（Float/Char 谓词内联减少了 op_lt 比较路径开销）
+- lookup 中性 +0.7%（纯整数算术为主，O1 已捕获主要收益，本轮在噪声范围内）
+- record 轻微回退 +2.9%（record 操作以字段访问为主，不使用数值谓词；额外内联的谓词代码增大 dispatch switch 体积，可能导致 icache 压力。相对基线仍 -1.0%，在可接受范围）
 
-### 跑法
-```
-zig build bench-vm -Doptimize=ReleaseFast   # 构建 bench_vm_lookup 驱动
-<exe> lookup    # 410780000
-<exe> record    # 666666666666000000
-```
-驱动源：`src/vm/bench_main.zig`（argv[1] 选 lookup/record；内嵌类型后缀版，VM 不跑 type_check）。
+**验证**：`zig build test` 全通过；33 个集成测试全通过。
+**无行为变更**：纯内联标记，语义不变。
 
-### 解读
-- record 提速 ~10× < lookup ~22×，**与计划 §10 预期一致**：record 受 Value 宽度（64B）+ refcount
-  churn 主导（瓶颈 4 未动），VM 收益相对小；lookup 是纯变量查找 + 算术，slot 数组索引收益最大。
-- M2a 覆盖：`type T = Ctor(field: T,...)` ADT 声明 → 构造器登记；`Ctor(args)` → OP_MAKE_ADT；
-  `obj.field` → OP_GET_FIELD（命名）；单构造器 `match`（constructor + variable + wildcard 子模式，
-  OP_TEST_CTOR + OP_GET_ADT_FIELD 位置绑定）。literal/or/record/guard 模式 + 数组/记录字面量 + 索引
-  留 M2b/M2c。
+**教训**：
+1. `inline for` 在多层 inline 调用链中会被推入 comptime 求值，可能超出 1000 backward branch 配额。大函数（如 `doArithFloat` ~30 行、`comparePortable` ~50 行）不应标 inline。
+2. 全面内联并非纯收益——对非数值密集型负载（如 record 字段访问），代码膨胀的 icache 负面影响可能超过消除调用开销的正面收益。
+3. 小谓词（1-3 行的 `isXxx`）内联始终安全且有益，因为分支预测器能很好地处理短分支。
+
+### O3: 存储布局重写——Int/Float/Char 字段化 (2026-07-02)
+**目标**：消除 ≤64 位类型的字节级拼装开销（loadWord/storeWord/loadU128/storeU128），改为原生 u64 字段直接运算。
+**约束**：继续遵守自实现类型约束——不使用原生 i128/u128/f128 codegen（LLVM bug）。仅使用原生 u64 wrapping/位运算（与 wide.zig 的 U128 软件实现一致）。
+
+**存储布局变更**：
+- **Int**: `{type: Type, bytes: [16]u8}` → `{type: Type, lo: u64, hi: u64}`
+  - ≤64 位：lo 持符号/零扩展值，hi=0；算术直接用 `@addWithOverflow` 等 u64 wrapping
+  - 128 位：{lo, hi} 作为 U128（小端），委托 wide.zig
+- **Float**: `{type: Type, bytes: [16]u8}` → `{type: Type, bits: u64, extra: u64}`
+  - ≤64 位：bits 持 IEEE 754 位模式（右对齐），extra=0；符号位判断/negate/compare 直接 u64 位运算
+  - f128：bits=低 64 位，extra=高 64 位（符号位在 extra bit 63）
+- **Char**: `{bytes: [4]u8}` → `{codepoint: u32}`；消除 loadWord(u32)/storeWord(u32)
+
+**核心改动**：
+- [src/value/int.zig](file:///d:/Projects/Zig/Glue/src/value/int.zig): 全部算术/比较/转换函数重写
+  - `canonicalize()`/`signExtend()`: ≤64 位规范化用算术移位实现分支less符号扩展
+  - `fromNative()`/`toNative()`/`fromBytes()`/`toBytes()`: 字段直接读写，≤64 位无需 memcpy
+  - `addPortable`/`subtractPortable`/`multiplyPortable`/`divideWithRemainderPortable`: ≤64 位用 `inline for` 展开到原生类型 `@addWithOverflow`/`@subWithOverflow`/`@mulWithOverflow`/`@divTrunc`
+  - `shiftLeft`/`shiftRight`/`isNegative`/`negate`/`bitwiseNot`: ≤64 位直接 u64 位运算
+- [src/value/float.zig](file:///d:/Projects/Zig/Glue/src/value/float.zig): `isNegative`/`unpack`/`comparePortable`/`negate`/`abs`/`copySign`/`nextUp`/`makeZero`/`packBytes` 改为 bits/extra 字段直读
+- [src/value/char.zig](file:///d:/Projects/Zig/Glue/src/value/char.zig): 全部方法改为 codepoint 字段直读
+- [src/vm/compiler.zig](file:///d:/Projects/Zig/Glue/src/vm/compiler.zig): 整数字面量构造改为直接写 lo 字段
+
+**Zig 0.16 兼容性修复**：
+1. `@as` 不支持跨符号性转换 → 用 `@bitCast` + `@intCast` 组合
+2. `@bitCast` 要求源/目标等位宽 → 先 `@truncate` 到无符号等价类型再 `@bitCast`
+3. `@truncate` 不支持混合符号性 → 用 `std.meta.Int(.unsigned, @bitSizeOf(T))` 取无符号等价
+4. `inline switch` 不是语句 → 用 `inline for` 遍历 comptime 类型数组实现类型分派
+5. `u6` 移位量溢出（64 位类型 bitWidth=64 不满足 u6）→ 预计算 `bitWidth - 1` 作为 u6
+6. 无符号 add 溢出检测：u64 carry 仅检测 u64 溢出，需额外 `sum != canon` 检测 u8/u16/u32 截断溢出
+
+**收益**（3 次取最佳，ReleaseFast）：
+
+墙钟时间（Measure-Command，含进程启动开销 ~35ms）：
+
+| Benchmark | 基线 | O2 | O3 | O3 vs O2 | O3 vs 基线 |
+|---|---|---|---|---|---|
+| fib    | 948.75 ms  | 833.92 ms  | **596.96 ms**  | **-28.4%** | **-37.1%** |
+| lookup | 2183.58 ms | 1972.57 ms | **1118.97 ms** | **-43.3%** | **-48.8%** |
+| record | 804.16 ms  | 796.08 ms  | **641.00 ms**  | **-19.5%** | **-20.3%** |
+| float  | 1321.38 ms | —          | **1094.16 ms** | —          | **-17.2%** |
+| string | 66.64 ms   | —          | 71.72 ms       | —          | +7.6% *†*  |
+| closure | 100.67 ms | —          | **80.35 ms**   | —          | **-20.2%** |
+| array  | 47.08 ms   | —          | 51.87 ms       | —          | +10.2% *†* |
+| tailcall | 209.01 ms | —          | **151.06 ms**  | —          | **-27.7%** |
+
+> *†* string/array 墙钟含 ~35ms 进程启动开销（占总时间 50-63%），±5ms 波动即制造 ±7-10% 假回退。应以 VM 阶段吞吐为准（见下表）。
+
+VM 阶段吞吐（`--profile`，指令数 / vm 阶段时间，排除进程启动开销）：
+
+| Benchmark | 基线吞吐 (M/s) | O3 吞吐 (M/s) | 提升 | O3 VM 时间 (ms) |
+|---|---|---|---|---|
+| fib    | 81.3  | **110.52** | **+36.0%** | 701.6 |
+| lookup | 67.5  | **122.92** | **+82.1%** | 1222.2 |
+| record | 75.0  | **93.04**  | **+24.1%** | 644.9 |
+| float  | 25.7  | **30.55**  | **+18.9%** | 1084.3 |
+| string | 48.0  | **52.35**  | **+9.1%**  | 34.1 |
+| closure | 92.1 | **118.57** | **+28.7%** | 53.6 |
+| array  | 98.9  | 94.01     | -4.9%      | 19.5 |
+| tailcall | 96.2 | **146.28** | **+52.1%** | 118.1 |
+
+> 注：`--profile` 自身有 ~10-15% 开销（opcode 计数），故 VM 时间高于非 profile 运行。基线与 O3 均用 `--profile` 测量，开销一致，吞吐对比公平。
+
+**分析**：
+- **fib +36% / lookup +82% / tailcall +52%**：整数算术密集型基准获得最大收益。存储重写消除了每次 add/sub/mul/div 的 loadWord/storeWord 字节拼装（~5 次 u8 读写 + 移位），改为单次 u64 wrapping 指令。lookup 中 op_add 占 20%，fib 中 op_add+op_sub 占 13.6%，tailcall 中 op_add+op_sub 占 15.2%，这些指令的执行时间大幅缩短。
+- **record +24%**：记录构造/字段访问中含整数算术（op_add 8.3%、op_mul 3.3%），同样受益于算术路径加速。
+- **float +19%**：Float 存储重写使 isNegative/unpack/compare 等从字节拼装改为 u64 位运算，Newton-Raphson sqrt 的比较/取负路径加速。
+- **closure +29%**：闭包计数器累加（op_add 11%）受益于算术加速。
+- **string +9%**：VM 吞吐实际提升。墙钟的 +7.6% "回退"是测量假象——string VM 仅 34ms，进程启动开销 ~36ms 占总量 50%，±5ms 进程开销波动制造了假回退。
+- **array -4.9%**：唯一的真实 VM 微回退（+0.82ms）。array 吞吐极高（94 M/s），对 dispatch 循环代码体积敏感——`inline for` 展开的 8 份算术特化代码增大了 dispatch 循环，对高吞吐非算术负载造成轻微 icache 压力。墙钟的 +10.2% 被进程开销噪声放大。
+
+**测量假象说明**：string（VM 34ms）和 array（VM 19ms）的 VM 执行时间远短于进程启动开销（~35ms）。Measure-Command 墙钟 = 进程启动 + VM 执行，进程启动占比 50-63%，±5ms 波动即制造 ±7-10% 假回退。对 VM 时间 <100ms 的基准，必须用 `--profile` 的 VM 阶段吞吐评估真实性能，不能用墙钟。
+
+**验证**：`zig build test` 全通过（130/130）；33 个集成测试全通过。
+**无行为变更**：存储布局变更对外透明（toBytes/fromBytes 保持字节级兼容），所有算术语义不变（与原生 `@addWithOverflow`/`@divTrunc` 等对照测试验证）。
+
+**教训**：
+1. Zig 0.16 的 `@as`/`@bitCast`/`@truncate` 对符号性和位宽有严格限制，跨类型转换需通过 `std.meta.Int(.unsigned, @bitSizeOf(T))` + `@truncate` + `@bitCast` 三步链完成。
+2. `u6` 移位类型上限 63，对 64 位类型（bitWidth=64）的 `@intCast` 会运行时 panic；需预计算 `bitWidth - 1` 作为 u6。
+3. 无符号加法溢出检测不能仅依赖 u64 carry（对 u8/u16/u32 无效，因输入已零扩展到 u64 不会触发 u64 溢出），需额外比较 `sum != canon` 检测截断。
+4. `inline for` + comptime 类型数组是 Zig 0.16 实现"运行时类型分派到原生操作"的有效模式（替代不支持的 `inline switch`）。
+5. 存储布局重写对算术密集型负载收益巨大（fib +36%、lookup +82%），对高吞吐非算术负载（array 94 M/s）可能因 `inline for` 代码膨胀造成 -5% icache 微回退。
+6. **短基准（VM <100ms）的墙钟不可靠**——进程启动开销（~35ms）占比过高，±5ms 波动制造假回退。必须用 `--profile` VM 阶段吞吐评估真实性能。本例中 string 墙钟显示 +7.6% 回退，实际 VM 吞吐 +9.1% 提升。
+

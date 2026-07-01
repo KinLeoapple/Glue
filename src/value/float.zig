@@ -1,6 +1,13 @@
 //! 自定义浮点类型——Type 枚举 + Float 结构体（全软件 IEEE 754）
 //!
-//! 用 [N]u8 字节数组存储所有浮点类型（f8/f16/f32/f64/f128）。
+//! 存储布局：{type: Type, bits: u64, extra: u64}
+//! - ≤64 位类型（f8/f16/f32/f64）：bits 持 IEEE 754 位模式（右对齐），extra = 0
+//! - f128：bits = 128 位模式的低 64 位，extra = 高 64 位（符号位在 extra 的 bit 63）
+//!
+//! 核心优化：≤64 位类型的符号位判断、negate、abs、compare 等直接用原生 u64 位运算，
+//! 绕过旧的 [16]u8 字节缓冲 + loadU128/storeU128 字节拼装开销。
+//! f128 委托给 wide.zig 的 U128 软件实现。
+//!
 //! 完全自实现，不使用任何原生浮点算术 codegen（仅 fromNative/toNative 用内存拷贝取放原生值用于测试对照）。
 //!
 //! IEEE 754 编码参数：
@@ -13,12 +20,9 @@
 //! 命名规范：方法名全部使用完整单词，不使用缩写。
 
 const std = @import("std");
-const byte_array = @import("byte_array.zig");
 const wide_lib = @import("wide.zig");
 const U128 = wide_lib.U128;
 const U256 = wide_lib.U256;
-const loadU128 = byte_array.loadU128;
-const storeU128 = byte_array.storeU128;
 const int = @import("int.zig");
 
 /// 浮点类型枚举：5 个变体（f8 采用 e5m2 编码，与 f16 共享 5 位指数和 bias=15，有 inf/NaN 标准 IEEE 754 语义）
@@ -135,42 +139,48 @@ const Decomposed = struct {
     }
 };
 
-/// 单一 Float 结构体：type + bytes + 运算方法
+/// 单一 Float 结构体：type + {bits, extra} + 运算方法
 pub const Float = struct {
     type: Type,
-    bytes: [16]u8,
-
-    /// 有效字节切片（只读）。长度由 type.byteLength() 决定。
-    pub inline fn slice(self: *const Float) []const u8 {
-        return self.bytes[0..self.type.byteLength()];
-    }
-
-    /// 有效字节切片（可变）
-    pub inline fn sliceMutable(self: *Float) []u8 {
-        return self.bytes[0..self.type.byteLength()];
-    }
+    bits: u64,
+    extra: u64,
 
     /// +0.0
     pub fn zero(t: Type) Float {
-        return .{ .type = t, .bytes = [_]u8{0} ** 16 };
+        return .{ .type = t, .bits = 0, .extra = 0 };
     }
 
     /// 从原生浮点构造（内存拷贝，不触发原生算术 codegen）
     /// 要求 @sizeOf(@TypeOf(v)) == t.byteLength()
     pub fn fromNative(t: Type, v: anytype) Float {
         const nbytes = t.byteLength();
-        const src: [*]const u8 = @ptrCast(&v);
-        var result: Float = .{ .type = t, .bytes = [_]u8{0} ** 16 };
-        @memcpy(result.bytes[0..nbytes], src[0..nbytes]);
-        return result;
+        if (nbytes <= 8) {
+            // ≤64 位：拷贝到 bits 的低字节，高字节为 0
+            var result: Float = .{ .type = t, .bits = 0, .extra = 0 };
+            const src: [*]const u8 = @ptrCast(&v);
+            @memcpy(@as([*]u8, @ptrCast(&result.bits))[0..nbytes], src[0..nbytes]);
+            return result;
+        } else {
+            // f128：memcpy 避免 LLVM i128 codegen bug
+            var result: Float = .{ .type = t, .bits = 0, .extra = 0 };
+            const src: [*]const u8 = @ptrCast(&v);
+            @memcpy(@as([*]u8, @ptrCast(&result.bits))[0..8], src[0..8]);
+            @memcpy(@as([*]u8, @ptrCast(&result.extra))[0..8], src[8..16]);
+            return result;
+        }
     }
 
     /// 转为原生浮点（内存拷贝）
     pub fn toNative(self: Float, comptime T: type) T {
         var result: T = undefined;
         const dst: [*]u8 = @ptrCast(&result);
-        const src = self.slice();
-        @memcpy(dst[0..src.len], src);
+        const nbytes = self.type.byteLength();
+        if (nbytes <= 8) {
+            @memcpy(dst[0..nbytes], @as([*]const u8, @ptrCast(&self.bits))[0..nbytes]);
+        } else {
+            @memcpy(dst[0..8], @as([*]const u8, @ptrCast(&self.bits))[0..8]);
+            @memcpy(dst[8..16], @as([*]const u8, @ptrCast(&self.extra))[0..8]);
+        }
         return result;
     }
 
@@ -181,31 +191,34 @@ pub const Float = struct {
     }
 
     /// 符号位：true = 负数/负零
-    pub fn isNegative(self: Float) bool {
-        const a = self.slice();
-        return (a[a.len - 1] & 0x80) != 0;
+    pub inline fn isNegative(self: Float) bool {
+        if (self.type.byteLength() <= 8) {
+            const sh: u6 = @intCast(self.type.bitWidth() - 1);
+            return (self.bits >> sh) & 1 == 1;
+        }
+        return (self.extra >> 63) & 1 == 1;
     }
 
     /// 是否为 NaN（指数字段全 1 且尾数字段非 0）
-    pub fn isNan(self: Float) bool {
+    pub inline fn isNan(self: Float) bool {
         const u = self.unpack();
         return u.is_nan;
     }
 
     /// 是否为无穷（指数字段全 1 且尾数字段 == 0）
-    pub fn isInfinite(self: Float) bool {
+    pub inline fn isInfinite(self: Float) bool {
         const u = self.unpack();
         return u.is_infinite;
     }
 
     /// 是否为 0（指数 == 0 且尾数 == 0，含 +0 与 -0）
-    pub fn isZero(self: Float) bool {
+    pub inline fn isZero(self: Float) bool {
         const u = self.unpack();
         return u.exp == 0 and u.mantissa.isZero();
     }
 
     /// 是否为次正规数（指数 == 0 且尾数 != 0）
-    pub fn isSubnormal(self: Float) bool {
+    pub inline fn isSubnormal(self: Float) bool {
         const u = self.unpack();
         return u.exp == 0 and (!u.mantissa.isZero());
     }
@@ -213,52 +226,58 @@ pub const Float = struct {
     /// 解包 IEEE 754 字段
     pub fn unpack(self: Float) Unpacked {
         const t = self.type;
-        const a = self.slice();
         const exp_bits = t.exponentBits();
         const mant_bits = t.mantissaBits();
-        const bias = t.bias();
+        const total_bits = t.bitWidth();
+        const max_exp: u32 = (@as(u32, 1) << @intCast(exp_bits)) - 1;
 
-        // 提取符号位（最高位）
-        const sign: u1 = @intCast((a[a.len - 1] >> 7) & 1);
+        if (total_bits <= 64) {
+            // ≤64 位：直接在 u64 上操作，避免 U128 开销
+            const sh: u6 = @intCast(total_bits - 1);
+            const mb: u6 = @intCast(mant_bits);
+            const sign: u1 = @intCast((self.bits >> sh) & 1);
+            const sign_mask: u64 = @as(u64, 1) << sh;
+            const without_sign = self.bits & ~sign_mask;
+            const mant_mask: u64 = if (mant_bits == 64) ~@as(u64, 0) else (@as(u64, 1) << mb) - 1;
+            const mantissa_lo = without_sign & mant_mask;
+            const exp_field: u32 = @intCast(without_sign >> mb);
+            return .{
+                .sign = sign,
+                .exp = exp_field,
+                .mantissa = U128.fromU64(mantissa_lo),
+                .is_nan = (exp_field == max_exp) and (mantissa_lo != 0),
+                .is_infinite = (exp_field == max_exp) and (mantissa_lo == 0),
+            };
+        }
 
-        // 把整个字节序列读为 U128（小端，不足 16 字节高位补 0）
-        const raw = loadU128(a);
-
-        // 清除符号位
-        const sign_bit = U128.fromU64(1).shiftLeft(@intCast(a.len * 8 - 1));
+        // f128：用 U128
+        const raw = U128.fromU64Pair(self.extra, self.bits);
+        const sign: u1 = @intCast((self.extra >> 63) & 1);
+        const sign_bit = U128.fromU64(1).shiftLeft(127);
         const without_sign = raw.and_(sign_bit.bitwiseNot());
-
-        // 提取指数（紧接符号位后的 exp_bits 位）
         const mant_mask = U128.mask(@intCast(mant_bits));
         const mantissa = without_sign.and_(mant_mask);
         const exp_field: u32 = @intCast(without_sign.shiftRight(@intCast(mant_bits), false).lo);
-
-        const max_exp: u32 = (@as(u32, 1) << @intCast(exp_bits)) - 1;
-        const is_nan = (exp_field == max_exp) and (!mantissa.isZero());
-        const is_infinite = (exp_field == max_exp) and (mantissa.isZero());
-
-        _ = bias;
         return .{
             .sign = sign,
             .exp = exp_field,
             .mantissa = mantissa,
-            .is_nan = is_nan,
-            .is_infinite = is_infinite,
+            .is_nan = (exp_field == max_exp) and (!mantissa.isZero()),
+            .is_infinite = (exp_field == max_exp) and (mantissa.isZero()),
         };
     }
 
     /// IEEE 754 totalOrder 比较：
     /// -NaN < -Inf < ... < -0 < +0 < ... < +Inf < +NaN
     /// 同号 NaN：quiet NaN > signaling NaN（简化为按尾数比较）
-    pub fn compare(self: Float, other: Float) std.math.Order {
+    pub inline fn compare(self: Float, other: Float) std.math.Order {
         std.debug.assert(self.type == other.type);
         return comparePortable(self, other);
     }
 
+    /// 注：不标 inline——体积较大（~50 行含 NaN/Inf/符号分支），且测试用 comptime 已知参数
+    /// 调用 compare 时会触发全链 comptime 求值超出 1000 分支配额。与 addPortable 等保持一致。
     fn comparePortable(self: Float, other: Float) std.math.Order {
-        const a = self.slice();
-        const b = other.slice();
-
         const ua = self.unpack();
         const ub = other.unpack();
 
@@ -291,16 +310,36 @@ pub const Float = struct {
             return if (ua.sign == 1) .lt else .gt;
         }
 
-        // 同号非零：把字节序列当作无符号整数比较，但需翻转符号位
+        // 同号非零：把位模式当作无符号整数比较，但需翻转符号位
         // 对正数：翻转最高位（让 0x00... 变成 0x80...，正数越大整数越大）
         // 对负数：全部取反（让 0xFF... 变成 0x00...，负数越大整数越小）
-        var va = loadU128(a);
-        var vb = loadU128(b);
+        const total_bits = self.type.bitWidth();
+        if (total_bits <= 64) {
+            // ≤64 位：直接 u64 比较
+            const sh: u6 = @intCast(total_bits - 1);
+            const sign_bit: u64 = @as(u64, 1) << sh;
+            var va = self.bits;
+            var vb = other.bits;
+            if (ua.sign == 1) {
+                va = ~va;
+                vb = ~vb;
+            } else {
+                va ^= sign_bit;
+                vb ^= sign_bit;
+            }
+            if (va < vb) return .lt;
+            if (va > vb) return .gt;
+            return .eq;
+        }
+
+        // f128：用 U128
+        var va = U128.fromU64Pair(self.extra, self.bits);
+        var vb = U128.fromU64Pair(other.extra, other.bits);
         if (ua.sign == 1) {
             va = va.bitwiseNot();
             vb = vb.bitwiseNot();
         } else {
-            const sign_bit = U128.fromU64(1).shiftLeft(@intCast(a.len * 8 - 1));
+            const sign_bit = U128.fromU64(1).shiftLeft(127);
             va = va.xor_(sign_bit);
             vb = vb.xor_(sign_bit);
         }
@@ -341,16 +380,20 @@ pub const Float = struct {
     }
 
     /// 取负（翻转符号位）。NaN 的符号位也翻转。
-    pub fn negate(self: Float) Float {
+    pub inline fn negate(self: Float) Float {
         var result = self;
-        const a = result.sliceMutable();
-        a[a.len - 1] ^= 0x80;
+        if (self.type.byteLength() <= 8) {
+            const sh: u6 = @intCast(self.type.bitWidth() - 1);
+            result.bits ^= (@as(u64, 1) << sh);
+        } else {
+            result.extra ^= (@as(u64, 1) << 63);
+        }
         return result;
     }
 
     /// 加法。
     /// NaN/Inf 结果触发 @panic（项目约束：浮点运算不得产生 NaN/Infinity）。
-    pub fn add(self: Float, other: Float) Float {
+    pub inline fn add(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         return checkResult(addPortable(self, other));
     }
@@ -422,7 +465,7 @@ pub const Float = struct {
 
     /// 减法。
     /// NaN/Inf 结果触发 @panic。
-    pub fn subtract(self: Float, other: Float) Float {
+    pub inline fn subtract(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         return checkResult(subtractPortable(self, other));
     }
@@ -434,7 +477,7 @@ pub const Float = struct {
 
     /// 乘法。
     /// NaN/Inf 结果触发 @panic。
-    pub fn multiply(self: Float, other: Float) Float {
+    pub inline fn multiply(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         return checkResult(multiplyPortable(self, other));
     }
@@ -500,7 +543,7 @@ pub const Float = struct {
 
     /// 除法。
     /// NaN/Inf 结果触发 @panic（含 finite/0=Inf、0/0=NaN）。
-    pub fn divide(self: Float, other: Float) Float {
+    pub inline fn divide(self: Float, other: Float) Float {
         std.debug.assert(self.type == other.type);
         return checkResult(dividePortable(self, other));
     }
@@ -563,7 +606,7 @@ pub const Float = struct {
 
     /// 转换到另一精度的 Float（如 f32 → f64）。全软件：解包 → 重新打包。
     /// NaN/Inf 用目标类型重建；零/次正规/正规走 decompose → 对齐 → compose。
-    pub fn toFloatType(self: Float, target: Type) Float {
+    pub inline fn toFloatType(self: Float, target: Type) Float {
         if (target == self.type) return self;
         const u = self.unpack();
         if (u.is_nan) return makeNan(target);
@@ -647,14 +690,19 @@ pub const Float = struct {
     pub fn fromInt(target: Type, iv: int.Int) Float {
         const is_neg = iv.isNegative();
 
-        // 符号扩展到 16 字节后加载为 U128，负数取绝对值（U128 两补 negate）
-        var buf: [16]u8 = [_]u8{0} ** 16;
-        const src = iv.slice();
-        @memcpy(buf[0..src.len], src);
-        if (iv.type.isSigned() and (src[src.len - 1] & 0x80) != 0) {
-            @memset(buf[src.len..16], 0xFF);
+        // 构造 128 位补码值，负数取绝对值（U128 两补 negate）
+        var mag: U128 = undefined;
+        if (iv.type.byteLength() <= 8) {
+            // ≤64 位：lo 已符号/零扩展到 u64。负数需把 hi 补为全 1 以构成 128 位补码
+            if (iv.type.isSigned() and (iv.lo >> 63) & 1 == 1) {
+                mag = U128.fromU64Pair(0xFFFFFFFFFFFFFFFF, iv.lo);
+            } else {
+                mag = U128.fromU64(iv.lo);
+            }
+        } else {
+            // 128 位：{hi, lo} 直接构成 U128
+            mag = U128.fromU64Pair(iv.hi, iv.lo);
         }
-        var mag = U128.load(buf[0..16]);
         if (is_neg) mag = mag.negate();
         if (mag.isZero()) return makeZero(target, 0);
 
@@ -680,8 +728,12 @@ pub const Float = struct {
     /// 绝对值（清符号位）。NaN 符号位也清零（与 Zig @abs 一致）。
     pub fn abs(self: Float) Float {
         var result = self;
-        const a = result.sliceMutable();
-        a[a.len - 1] &= ~@as(u8, 0x80);
+        if (self.type.byteLength() <= 8) {
+            const sh: u6 = @intCast(self.type.bitWidth() - 1);
+            result.bits &= ~(@as(u64, 1) << sh);
+        } else {
+            result.extra &= ~(@as(u64, 1) << 63);
+        }
         return result;
     }
 
@@ -761,9 +813,15 @@ pub const Float = struct {
     /// 复制符号位：返回 |self| 带 other 的符号。
     pub fn copySign(self: Float, other: Float) Float {
         var result = self;
-        const a = result.sliceMutable();
-        const other_sign: u8 = if (other.isNegative()) 0x80 else 0x00;
-        a[a.len - 1] = (a[a.len - 1] & ~@as(u8, 0x80)) | other_sign;
+        const other_neg = other.isNegative();
+        if (self.type.byteLength() <= 8) {
+            const sh: u6 = @intCast(self.type.bitWidth() - 1);
+            const sign_bit: u64 = @as(u64, 1) << sh;
+            result.bits = (result.bits & ~sign_bit) | (if (other_neg) sign_bit else 0);
+        } else {
+            const sign_bit: u64 = @as(u64, 1) << 63;
+            result.extra = (result.extra & ~sign_bit) | (if (other_neg) sign_bit else 0);
+        }
         return result;
     }
 
@@ -784,15 +842,31 @@ pub const Float = struct {
             return packBytes(t, 1, max_exp - 1, max_frac);
         }
 
-        const a = self.slice();
-        var bits: U128 = loadU128(a);
-        const sign_bit: U128 = U128.fromU64(1).shiftLeft(@intCast(a.len * 8 - 1));
+        const total_bits = t.bitWidth();
+        if (total_bits <= 64) {
+            // ≤64 位：直接 u64 运算
+            const sh: u6 = @intCast(total_bits - 1);
+            const sign_bit: u64 = @as(u64, 1) << sh;
+            // ±0 → +min_subnormal
+            if (self.bits == 0 or self.bits == sign_bit) {
+                return packBytes(t, 0, 0, U128.fromU64(1));
+            }
+            var b = self.bits;
+            if (u.sign == 0) {
+                b +%= 1; // 正数 +1 ulp
+            } else {
+                b -%= 1; // 负数 -1 ulp（向 0，值变大）
+            }
+            return .{ .type = t, .bits = b, .extra = 0 };
+        }
 
+        // f128：用 U128
+        var bits = U128.fromU64Pair(self.extra, self.bits);
+        const sign_bit = U128.fromU64(1).shiftLeft(127);
         // ±0 → +min_subnormal
         if (bits.isZero() or bits.equals(sign_bit)) {
             return packBytes(t, 0, 0, U128.fromU64(1));
         }
-
         if (u.sign == 0) {
             bits = bits.add(U128.fromU64(1)).sum; // 正数 +1 ulp
         } else {
@@ -817,12 +891,13 @@ fn checkResult(result: Float) Float {
 
 /// 构造零（指定符号）
 fn makeZero(t: Type, sign: u1) Float {
-    var f = Float.zero(t);
-    if (sign == 1) {
-        const a = f.sliceMutable();
-        a[a.len - 1] |= 0x80;
+    if (t.byteLength() <= 8) {
+        const sh: u6 = @intCast(t.bitWidth() - 1);
+        const bits: u64 = if (sign == 1) @as(u64, 1) << sh else 0;
+        return .{ .type = t, .bits = bits, .extra = 0 };
     }
-    return f;
+    const extra: u64 = if (sign == 1) @as(u64, 1) << 63 else 0;
+    return .{ .type = t, .bits = 0, .extra = extra };
 }
 
 /// 构造无穷（指定符号）
@@ -839,26 +914,31 @@ fn makeNan(t: Type) Float {
     return packBytes(t, 0, max_exp, U128.fromU64(1));
 }
 
-/// 从 sign/stored_exp/fraction 打包为 Float（直写定长缓冲前 N 字节）
+/// 从 sign/stored_exp/fraction 打包为 Float
 fn packBytes(t: Type, sign: u1, stored_exp: u32, fraction: U128) Float {
     const p = t.mantissaBits();
-    const nbytes = t.byteLength();
+    const total_bits = t.bitWidth();
+    if (total_bits <= 64) {
+        // ≤64 位：直接在 u64 上拼装
+        const sh: u6 = @intCast(total_bits - 1);
+        const mb: u6 = @intCast(p);
+        var raw: u64 = fraction.lo | (@as(u64, stored_exp) << mb);
+        if (sign == 1) raw |= (@as(u64, 1) << sh);
+        return .{ .type = t, .bits = raw, .extra = 0 };
+    }
+    // f128
     var raw: U128 = fraction;
     raw = raw.or_(U128.fromU64(stored_exp).shiftLeft(@intCast(p)));
-    if (sign == 1) {
-        raw = raw.orBit(@intCast(nbytes * 8 - 1));
-    }
-    var bytes: [16]u8 = [_]u8{0} ** 16;
-    storeU128(bytes[0..nbytes], raw);
-    return .{ .type = t, .bytes = bytes };
+    if (sign == 1) raw = raw.orBit(127);
+    return .{ .type = t, .bits = raw.lo, .extra = raw.hi };
 }
 
-/// 从原始位模式（U128，低 nbytes 字节有效）打包为 Float（直写定长缓冲前 N 字节）
+/// 从原始位模式（U128）打包为 Float
 fn packRawBits(t: Type, bits: U128) Float {
-    const nbytes = t.byteLength();
-    var bytes: [16]u8 = [_]u8{0} ** 16;
-    storeU128(bytes[0..nbytes], bits);
-    return .{ .type = t, .bytes = bytes };
+    if (t.byteLength() <= 8) {
+        return .{ .type = t, .bits = bits.lo, .extra = 0 };
+    }
+    return .{ .type = t, .bits = bits.lo, .extra = bits.hi };
 }
 
 /// 从 sign/unbiased exp/含 GRS 的尾数 打包为 Float

@@ -1,0 +1,30 @@
+// Benchmark 4: 浮点算术密集
+// 目标:量 Float 软件 IEEE 754 路径（add/sub/mul/div/compare）的开销。
+// Newton-Raphson 平方根近似:对 1..N 每个数用 10 次迭代求 sqrt，
+// 每轮含 1 次 div + 1 次 add + 1 次 mul + 1 次 compare，纯浮点热路径。
+// 同时覆盖 int→float 转换（f64(i)）与 float 比较。
+
+fun newtonSqrt(x: f64, iters: i32): f64 {
+    var guess: f64 = x / 2.0
+    if (guess == 0.0) { return 0.0 }
+    var i: i32 = 0
+    while i < iters {
+        val next: f64 = (guess + x / guess) / 2.0
+        // 收敛检查（比较走 Float.compare 软件路径）
+        if (next == guess) { return next }
+        guess = next
+        i = i + 1
+    }
+    guess
+}
+
+fun main() {
+    var sum: f64 = 0.0
+    var i: i64 = 1
+    while i < 100000 {
+        // f64(i) 触发 int→float 转换；newtonSqrt 内 10 次迭代走 mul/div/add/compare
+        sum = sum + newtonSqrt(f64(i), 10)
+        i = i + 1
+    }
+    println(sum)
+}
