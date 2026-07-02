@@ -14,6 +14,7 @@ const throw_check = @import("throw_check");
 const kind_check = @import("kind_check");
 const gadt_check = @import("gadt_check");
 const module_check = @import("module_check");
+const type_table_mod = @import("type_table");
 
 /// 测试浮点值能否在指定类型中精确往返（f64 → T → f64）
 fn canRoundTripFloat(comptime T: type, val: f64) bool {
@@ -630,6 +631,10 @@ pub const TypeInferencer = struct {
     known_modules: std.StringHashMap(void),
     /// 内建函数/构造器名称集合（用于禁止用户遮蔽内建定义）
     builtin_names: std.StringHashMap(void),
+    /// 【JIT Phase 1】类型表：表达式指针 → TypeKind。
+    /// 在 inferExpr 推断二元操作数类型时记录，供编译器查询做类型特化。
+    /// 不在 resetForNextModule 中清空——AST 指针跨模块唯一，编译在全部类型检查后进行。
+    type_table: type_table_mod.TypeTable,
     /// 用于 analyzeNullCheck 中翻转 is_non_null 的临时缓冲
     narrowing_buf: [4]NarrowingInfo = undefined,
     /// 字段路径 narrowing 集合（flow typing 扩展）：当前激活的「已收窄为非空」字段路径串，
@@ -678,6 +683,7 @@ pub const TypeInferencer = struct {
             .builtin_names = std.StringHashMap(void).init(allocator),
             .linear_scope_stack = std.ArrayList(std.ArrayList(LinearVarInfo)).empty,
             .narrowed_paths = std.StringHashMap(void).init(allocator),
+            .type_table = type_table_mod.TypeTable.init(allocator),
         };
     }
 
@@ -800,6 +806,20 @@ pub const TypeInferencer = struct {
             var it = self.narrowed_paths.keyIterator();
             while (it.next()) |k| self.allocator.free(k.*);
             self.narrowed_paths.deinit();
+        }
+        // 【JIT Phase 1】释放类型表
+        self.type_table.deinit();
+    }
+
+    /// 【JIT Phase 1】记录表达式的类型种类到 type_table。
+    /// 仅记录 int/float（other 不特化，省表大小）。resolve 后判断，处理类型变量。
+    fn recordTypeKind(self: *TypeInferencer, expr: *const ast.Expr, ty: *Type) void {
+        const resolved = self.resolve(ty);
+        const kind: ?type_table_mod.TypeKind = if (resolved.isIntType()) .int
+            else if (resolved.isFloatType()) .float
+            else null;
+        if (kind) |k| {
+            self.type_table.put(expr, k) catch {};
         }
     }
 
@@ -1918,6 +1938,11 @@ pub const TypeInferencer = struct {
                 left_ty = self.unwrapAtomic(left_ty);
                 right_ty = self.unwrapAtomic(right_ty);
 
+                // 【JIT Phase 1】记录操作数类型到 type_table，供编译器做算术特化。
+                // 递归的 inferExpr 调用已记录子表达式的类型，这里记录直接操作数。
+                self.recordTypeKind(bin.left, left_ty);
+                self.recordTypeKind(bin.right, right_ty);
+
                 switch (bin.op) {
                     .add, .sub, .mul, .div, .mod => {
                         // 求值器对整数算术做宽度提升（promoteIntTypes），故两个具体整数
@@ -1993,6 +2018,8 @@ pub const TypeInferencer = struct {
 
             .unary => |un| {
                 const operand_ty = try self.inferExpr(un.operand, env, null);
+                // 【JIT Phase 1】记录一元操作数类型（用于 op_neg_int/op_neg_float 特化）
+                self.recordTypeKind(un.operand, operand_ty);
                 return switch (un.op) {
                     .not => {
                         try self.unify(operand_ty, try self.makeType(.bool_type));

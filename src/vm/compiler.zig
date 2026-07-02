@@ -15,6 +15,7 @@ const ast = @import("ast");
 const value = @import("value");
 const opcode = @import("opcode.zig");
 const chunk_mod = @import("chunk.zig");
+const type_table_mod = @import("type_table");
 
 /// 公开再导出，供 bench 驱动 / 外部入口通过本模块拿到 VM 与 Program（避免新建 build 图模块）。
 pub const VM = @import("vm.zig").VM;
@@ -107,6 +108,9 @@ pub const ModuleCompiler = struct {
     /// 类型名抢全局。module_decls 借 deps AST（构造 init 时遍历其 pub fun/pub pack）。global_idx 是
     /// 该模块值在 globals 数组的槽位。
     module_values: std.ArrayListUnmanaged(struct { name: []const u8, global_idx: u16, decls: []const ast.Decl }) = .empty,
+    /// 【JIT Phase 1】类型表引用（null = 禁用特化，发射通用 opcode）。
+    /// 由 main.zig 在编译前从 TypeInferencer.type_table 设置。
+    type_table: ?*const type_table_mod.TypeTable = null,
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
         return .{ .program = Program.init(allocator), .allocator = allocator };
@@ -834,7 +838,7 @@ const FnCompiler = struct {
             .unary => |un| {
                 try self.emitExpr(un.operand);
                 try self.chunk.writeOp(switch (un.op) {
-                    .neg => .op_neg,
+                    .neg => self.pickSpecOp(un.operand, .op_neg_int, .op_neg_float, .op_neg),
                     .not => .op_not,
                 }, loc);
             },
@@ -1586,24 +1590,36 @@ const FnCompiler = struct {
         }
         try self.emitExpr(bin.left);
         try self.emitExpr(bin.right);
+        // JIT Phase 1: type_table driven opcode specialization
         const op: OpCode = switch (bin.op) {
-            .add => .op_add,
-            .sub => .op_sub,
-            .mul => .op_mul,
-            .div => .op_div,
-            .mod => .op_mod,
-            .eq => .op_eq,
-            .not_eq => .op_neq,
-            .lt => .op_lt,
-            .gt => .op_gt,
-            .lt_eq => .op_le,
-            .gt_eq => .op_ge,
+            .add => self.pickSpecOp(bin.left, .op_add_int, .op_add_float, .op_add),
+            .sub => self.pickSpecOp(bin.left, .op_sub_int, .op_sub_float, .op_sub),
+            .mul => self.pickSpecOp(bin.left, .op_mul_int, .op_mul_float, .op_mul),
+            .div => self.pickSpecOp(bin.left, .op_div_int, .op_div_float, .op_div),
+            .mod => self.pickSpecOp(bin.left, .op_mod_int, null, .op_mod),
+            .eq => self.pickSpecOp(bin.left, .op_eq_int, .op_eq_float, .op_eq),
+            .not_eq => self.pickSpecOp(bin.left, .op_neq_int, .op_neq_float, .op_neq),
+            .lt => self.pickSpecOp(bin.left, .op_lt_int, .op_lt_float, .op_lt),
+            .gt => self.pickSpecOp(bin.left, .op_gt_int, .op_gt_float, .op_gt),
+            .lt_eq => self.pickSpecOp(bin.left, .op_le_int, .op_le_float, .op_le),
+            .gt_eq => self.pickSpecOp(bin.left, .op_ge_int, .op_ge_float, .op_ge),
             .bit_and => .op_bit_and,
             .bit_or => .op_bit_or,
             .bit_xor => .op_bit_xor,
             else => return error.Unsupported,
         };
         try self.chunk.writeOp(op, loc);
+    }
+
+    /// JIT Phase 1: pick specialized opcode by type_table annotation.
+    fn pickSpecOp(self: *FnCompiler, expr: *const ast.Expr, int_op: OpCode, float_op: ?OpCode, fallback: OpCode) OpCode {
+        if (self.module.type_table) |tt| {
+            if (tt.isInt(expr)) return int_op;
+            if (tt.isFloat(expr)) {
+                if (float_op) |fo| return fo;
+            }
+        }
+        return fallback;
     }
 
     fn emitIf(self: *FnCompiler, ie: @TypeOf(@as(Expr, undefined).if_expr), loc: ast.SourceLocation) CompileError!void {

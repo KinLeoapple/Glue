@@ -101,12 +101,22 @@ pub fn build(b: *std.Build) void {
     // sema/ modules - 语义分析（类型检查、trait解析等）
     // ============================================================
 
+    // type_table 模块：表达式 → TypeKind 映射，供 type_check 填充、vm 消费做特化。
+    // 独立于 type_check（仅依赖 ast），避免 type_check ↔ vm 循环依赖。
+    const type_table_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/static_analysis/type_table.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    type_table_module.addImport("ast", ast_module);
+
     const type_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/type_check.zig"),
         .target = target,
         .optimize = optimize,
     });
     type_check_module.addImport("ast", ast_module);
+    type_check_module.addImport("type_table", type_table_module);
 
     const subtype_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/subtype_check.zig"),
@@ -201,6 +211,7 @@ pub fn build(b: *std.Build) void {
     vm_module.addImport("lexer", lexer_module);
     vm_module.addImport("parser", parser_module);
     vm_module.addImport("profiler", profiler_module);
+    vm_module.addImport("type_table", type_table_module);
 
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -307,6 +318,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_atomic_unit_tests = b.addRunArtifact(atomic_unit_tests);
 
+    const type_table_unit_tests = b.addTest(.{
+        .root_module = type_table_module,
+    });
+    const run_type_table_unit_tests = b.addRunArtifact(type_table_unit_tests);
+
     // ============================================================
     // value_new 模块（自定义基础类型，独立 standalone）
     // ============================================================
@@ -332,6 +348,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_intern_unit_tests.step);
     test_step.dependOn(&run_vm_unit_tests.step);
     test_step.dependOn(&run_atomic_unit_tests.step);
+    test_step.dependOn(&run_type_table_unit_tests.step);
     test_step.dependOn(&run_value_new_unit_tests.step);
 
     // ============================================================

@@ -800,6 +800,129 @@ pub const VM = struct {
                     stack_ptr[stack_len] = try self.doArith(op, left, right, func.chunk.locAt(op_off));
                     stack_len += 1;
                 },
+                // 【JIT Phase 1】类型特化整数算术：跳过 doArith 的 isInteger 标签检查 + 字符串/浮点 fallback。
+                // 仍需 promoteIntTypes + coerceTo（操作数宽度可能不同，如 i32 + i64）。
+                .op_add_int, .op_sub_int, .op_mul_int, .op_div_int, .op_mod_int => {
+                    const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    defer left.release(self.allocator);
+                    defer right.release(self.allocator);
+                    const li = left.asInt();
+                    const ri = right.asInt();
+                    const rt = value.promoteIntTypes(li.type, ri.type);
+                    const lc = li.coerceTo(rt) orelse return self.fail(func.chunk.locAt(op_off), "arithmetic overflow: operand out of range", error.ArithmeticOverflow);
+                    const rc = ri.coerceTo(rt) orelse return self.fail(func.chunk.locAt(op_off), "arithmetic overflow: operand out of range", error.ArithmeticOverflow);
+                    stack_ptr[stack_len] = switch (op) {
+                        .op_add_int => blk: {
+                            const r = lc.add(rc);
+                            if (r.overflow) return self.fail(func.chunk.locAt(op_off), "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
+                            break :blk Value.fromInt(r.result);
+                        },
+                        .op_sub_int => blk: {
+                            const r = lc.subtract(rc);
+                            if (r.overflow) return self.fail(func.chunk.locAt(op_off), "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
+                            break :blk Value.fromInt(r.result);
+                        },
+                        .op_mul_int => blk: {
+                            const r = lc.multiply(rc);
+                            if (r.overflow) return self.fail(func.chunk.locAt(op_off), "arithmetic overflow: integer operation out of range", error.ArithmeticOverflow);
+                            break :blk Value.fromInt(r.result);
+                        },
+                        .op_div_int => blk: {
+                            const r = lc.divideTruncating(rc) catch return self.fail(func.chunk.locAt(op_off), "division by zero", error.DivisionByZero);
+                            break :blk Value.fromInt(r);
+                        },
+                        .op_mod_int => blk: {
+                            const r = lc.remainder(rc) catch return self.fail(func.chunk.locAt(op_off), "division by zero", error.DivisionByZero);
+                            break :blk Value.fromInt(r);
+                        },
+                        else => unreachable,
+                    };
+                    stack_len += 1;
+                },
+                // 【JIT Phase 1】类型特化浮点算术：跳过 doArith 的 isFloat 标签检查。
+                .op_add_float, .op_sub_float, .op_mul_float, .op_div_float => {
+                    const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    defer left.release(self.allocator);
+                    defer right.release(self.allocator);
+                    const lf = left.asFloat();
+                    const rf = right.asFloat();
+                    const tag: value.FloatType = if (@intFromEnum(lf.type) > @intFromEnum(rf.type)) lf.type else rf.type;
+                    const lc = lf.toFloatType(tag);
+                    const rc = rf.toFloatType(tag);
+                    const result: value.Float = switch (op) {
+                        .op_add_float => lc.add(rc),
+                        .op_sub_float => lc.subtract(rc),
+                        .op_mul_float => lc.multiply(rc),
+                        .op_div_float => lc.divide(rc),
+                        else => unreachable,
+                    };
+                    stack_ptr[stack_len] = Value.fromFloat(result);
+                    stack_len += 1;
+                },
+                // 【JIT Phase 1】类型特化整数比较：跳过 doCompare 的标签分派。
+                .op_eq_int, .op_neq_int, .op_lt_int, .op_gt_int, .op_le_int, .op_ge_int => {
+                    const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    defer left.release(self.allocator);
+                    defer right.release(self.allocator);
+                    const li = left.asInt();
+                    const ri = right.asInt();
+                    const rt = value.promoteIntTypes(li.type, ri.type);
+                    const lc = li.coerceTo(rt) orelse return self.fail(func.chunk.locAt(op_off), "comparison: operand out of range", error.ArithmeticOverflow);
+                    const rc = ri.coerceTo(rt) orelse return self.fail(func.chunk.locAt(op_off), "comparison: operand out of range", error.ArithmeticOverflow);
+                    const ord = lc.compare(rc);
+                    stack_ptr[stack_len] = Value.fromBool(switch (op) {
+                        .op_eq_int => ord == .eq,
+                        .op_neq_int => ord != .eq,
+                        .op_lt_int => ord == .lt,
+                        .op_gt_int => ord == .gt,
+                        .op_le_int => ord != .gt,
+                        .op_ge_int => ord != .lt,
+                        else => unreachable,
+                    });
+                    stack_len += 1;
+                },
+                // 【JIT Phase 1】类型特化浮点比较：跳过 doCompare 的标签分派。
+                .op_eq_float, .op_neq_float, .op_lt_float, .op_gt_float, .op_le_float, .op_ge_float => {
+                    const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    defer left.release(self.allocator);
+                    defer right.release(self.allocator);
+                    const lf = left.asFloat();
+                    const rf = right.asFloat();
+                    const tag: value.FloatType = if (@intFromEnum(lf.type) > @intFromEnum(rf.type)) lf.type else rf.type;
+                    const ord = lf.toFloatType(tag).compare(rf.toFloatType(tag));
+                    stack_ptr[stack_len] = Value.fromBool(switch (op) {
+                        .op_eq_float => ord == .eq,
+                        .op_neq_float => ord != .eq,
+                        .op_lt_float => ord == .lt,
+                        .op_gt_float => ord == .gt,
+                        .op_le_float => ord != .gt,
+                        .op_ge_float => ord != .lt,
+                        else => unreachable,
+                    });
+                    stack_len += 1;
+                },
+                // 【JIT Phase 1】类型特化一元取负：跳过 doNegate 的标签检查。
+                .op_neg_int => {
+                    const v = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    defer v.release(self.allocator);
+                    const iv = v.asInt();
+                    const result = iv.negate();
+                    if (iv.type.isSigned() and iv.isNegative() and result.isNegative()) {
+                        return self.fail(func.chunk.locAt(op_off), "arithmetic overflow: integer negation out of range", error.ArithmeticOverflow);
+                    }
+                    stack_ptr[stack_len] = Value.fromInt(result);
+                    stack_len += 1;
+                },
+                .op_neg_float => {
+                    const v = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    defer v.release(self.allocator);
+                    stack_ptr[stack_len] = Value.fromFloat(v.asFloat().negate());
+                    stack_len += 1;
+                },
                 .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge => {
                     const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };

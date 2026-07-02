@@ -37,7 +37,9 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
     const op: OpCode = @enumFromInt(code[offset]);
     switch (op) {
         // 无操作数
-        .op_null, .op_unit, .op_true, .op_false, .op_pop, .op_dup, .op_return, .op_match_fail, .op_index, .op_set_index, .op_get_newtype_inner, .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge, .op_bit_and, .op_bit_or, .op_bit_xor, .op_neg, .op_not, .op_non_null, .op_propagate, .op_throw, .op_get_throw_ok, .op_get_throw_err, .op_make_atomic, .op_spawn, .op_make_lazy, .op_try_recv, .op_recv, .op_concat_list => {
+        .op_null, .op_unit, .op_true, .op_false, .op_pop, .op_dup, .op_return, .op_match_fail, .op_index, .op_set_index, .op_get_newtype_inner, .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge, .op_bit_and, .op_bit_or, .op_bit_xor, .op_neg, .op_not, .op_non_null, .op_propagate, .op_throw, .op_get_throw_ok, .op_get_throw_err, .op_make_atomic, .op_spawn, .op_make_lazy, .op_try_recv, .op_recv, .op_concat_list,
+        // 【JIT Phase 1】类型特化 opcode（均无操作数）
+        .op_add_int, .op_add_float, .op_sub_int, .op_sub_float, .op_mul_int, .op_mul_float, .op_div_int, .op_div_float, .op_mod_int, .op_neg_int, .op_neg_float, .op_eq_int, .op_eq_float, .op_neq_int, .op_neq_float, .op_lt_int, .op_lt_float, .op_gt_int, .op_gt_float, .op_le_int, .op_le_float, .op_ge_int, .op_ge_float => {
             try print(buf, allocator, "{s}\n", .{op.name()});
             return offset + 1;
         },

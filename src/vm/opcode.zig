@@ -249,6 +249,23 @@ pub const OpCode = enum(u8) {
     /// 否则 fallback 到通用 push（method.dispatch）。供 `arr = arr.push(x)` 模式。
     op_push_inplace,
 
+    // —— 【JIT Phase 1】类型特化算术（跳过 doArith 运行时类型分派）——
+    // 操作数类型已由编译器静态证明，VM 直接调 Int/Float 运算，省去 Value tag 分派。
+    op_add_int, op_add_float,
+    op_sub_int, op_sub_float,
+    op_mul_int, op_mul_float,
+    op_div_int, op_div_float,
+    op_mod_int,
+    // —— 【JIT Phase 1】类型特化一元 ——
+    op_neg_int, op_neg_float,
+    // —— 【JIT Phase 1】类型特化比较（pop 2，push bool）——
+    op_eq_int, op_eq_float,
+    op_neq_int, op_neq_float,
+    op_lt_int, op_lt_float,
+    op_gt_int, op_gt_float,
+    op_le_int, op_le_float,
+    op_ge_int, op_ge_float,
+
     pub fn name(self: OpCode) []const u8 {
         return @tagName(self);
     }
