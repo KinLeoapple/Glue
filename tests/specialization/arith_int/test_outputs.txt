@@ -1,0 +1,12 @@
+30
+30
+42
+14
+2
+true
+false
+4
+true
+false
+arith_int: All tests passed!
+[exit=0]

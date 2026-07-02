@@ -1,0 +1,48 @@
+// tests/specialization/arith_int/src/Main.glue
+// 验证类型特化算术语义正确性（int + float 全覆盖）
+
+fun add(a: i32, b: i32): i32 {
+    return a + b
+}
+
+fun sub(a: i32, b: i32): i32 {
+    return a - b
+}
+
+fun mul(a: i32, b: i32): i32 {
+    return a * b
+}
+
+fun div(a: i32, b: i32): i32 {
+    return a / b
+}
+
+fun mod_fn(a: i32, b: i32): i32 {
+    return a % b
+}
+
+fun compare(a: i32, b: i32): bool {
+    return a < b
+}
+
+fun float_add(a: f64, b: f64): f64 {
+    return a + b
+}
+
+fun float_compare(a: f64, b: f64): bool {
+    return a < b
+}
+
+fun main() {
+    println(add(10, 20))
+    println(sub(50, 20))
+    println(mul(6, 7))
+    println(div(100, 7))
+    println(mod_fn(100, 7))
+    println(compare(10, 20))
+    println(compare(20, 10))
+    println(float_add(1.5, 2.5))
+    println(float_compare(1.0, 2.0))
+    println(float_compare(3.0, 2.0))
+    println("arith_int: All tests passed!")
+}
