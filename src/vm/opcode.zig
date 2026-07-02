@@ -312,3 +312,23 @@ pub fn readI32(code: []const u8, offset: usize) i32 {
         (@as(u32, code[offset + 3]) << 24);
     return @bitCast(u);
 }
+
+/// 指针版立即数解码：从 [*]const u8 直接读取，省去基址+偏移加法。
+/// 供 VM dispatch 循环的 ip_ptr 缓存路径使用。
+pub inline fn readU16Ptr(ptr: [*]const u8) u16 {
+    return @as(u16, ptr[0]) | (@as(u16, ptr[1]) << 8);
+}
+
+pub inline fn readI32Ptr(ptr: [*]const u8) i32 {
+    const u: u32 = @as(u32, ptr[0]) |
+        (@as(u32, ptr[1]) << 8) |
+        (@as(u32, ptr[2]) << 16) |
+        (@as(u32, ptr[3]) << 24);
+    return @bitCast(u);
+}
+
+/// 指针跳转：ip_ptr 前进 off 字节（off 可为负）。用 wrapping 加法支持回退。
+pub inline fn jumpPtr(ptr: [*]const u8, off: i32) [*]const u8 {
+    const off_isize: isize = @intCast(off);
+    return @ptrFromInt(@intFromPtr(ptr) +% @as(usize, @bitCast(off_isize)));
+}

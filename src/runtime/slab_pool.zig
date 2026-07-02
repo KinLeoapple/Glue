@@ -88,7 +88,9 @@ const SizeClass = struct {
 
 /// 全局空 slab 缓存上限：空 16KB 块可重切给任意 class，故跨 class 共享一个池。
 /// 偏速度的平衡：保留少量块防抖动，超限立即归还 backing → 内存随死对象回落。
-const MAX_EMPTY_SLABS: usize = 4;
+/// M6 内存优化：4→2，最坏保留 32KB（原 64KB）。churn 工作负载命中率略降，
+/// 但 backing alloc 走 page_allocator 且块恒 16KB 对齐，重新切 slab 成本低。
+const MAX_EMPTY_SLABS: usize = 2;
 
 pub const SlabPool = struct {
     backing: std.mem.Allocator,

@@ -20,7 +20,10 @@ pub const Chunk = struct {
     constants: std.ArrayListUnmanaged(Value) = .empty,
     /// 与 code 等长的指令起点 → 源位置映射（运行期错误报告行列）。
     /// lines[i] 对应 code[i] 字节处开始的指令。
-    lines: std.ArrayListUnmanaged(SourceLocation) = .empty,
+    /// M6 内存优化：原 ArrayListUnmanaged(SourceLocation)（8B/字节）改为 PackedLoc u32
+    /// （line:u20 << 12 | column:u12，4B/字节）。行号 ≤1,048,575、列号 ≤4095 完整保留，
+    /// 超出范围按位截断（极端文件场景）。配合 VM 惰性加载：仅错误/helper 路径解码。
+    lines: std.ArrayListUnmanaged(u32) = .empty,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Chunk {
@@ -38,13 +41,31 @@ pub const Chunk = struct {
     /// 写一字节 opcode，并登记其源位置。
     pub fn writeOp(self: *Chunk, op: OpCode, loc: SourceLocation) !void {
         try self.code.append(self.allocator, @intFromEnum(op));
-        try self.lines.append(self.allocator, loc);
+        try self.lines.append(self.allocator, packLoc(loc));
     }
 
     /// 写一个裸字节（立即数）。立即数不单独登记位置，复用其 opcode 的位置。
     pub fn writeByte(self: *Chunk, b: u8) !void {
         try self.code.append(self.allocator, b);
-        try self.lines.append(self.allocator, .{ .line = 0, .column = 0 });
+        try self.lines.append(self.allocator, packLoc(.{ .line = 0, .column = 0 }));
+    }
+
+    /// PackedLoc 打包：line:u20（bits 31:12）+ column:u12（bits 11:0）。
+    /// 行号 0 表示"无位置"（立即数字节），与 main.zig `err_loc.line > 0` 判空一致。
+    pub inline fn packLoc(loc: SourceLocation) u32 {
+        const l: u32 = @intCast(loc.line & 0xFFFFF);
+        const c: u32 = @intCast(loc.column & 0xFFF);
+        return (l << 12) | c;
+    }
+
+    /// PackedLoc 解包 → SourceLocation。
+    pub inline fn unpackLoc(packed_loc: u32) SourceLocation {
+        return .{ .line = packed_loc >> 12, .column = packed_loc & 0xFFF };
+    }
+
+    /// 按 ip 偏移取源位置（错误/helper 路径惰性调用，避开热路径逐指令加载）。
+    pub inline fn locAt(self: *const Chunk, ip_off: usize) SourceLocation {
+        return unpackLoc(self.lines.items[ip_off]);
     }
 
     pub fn writeU16(self: *Chunk, v: u16) !void {

@@ -351,3 +351,160 @@ VM 阶段吞吐（`--profile`，指令数 / vm 阶段时间，排除进程启动
 5. 存储布局重写对算术密集型负载收益巨大（fib +36%、lookup +82%），对高吞吐非算术负载（array 94 M/s）可能因 `inline for` 代码膨胀造成 -5% icache 微回退。
 6. **短基准（VM <100ms）的墙钟不可靠**——进程启动开销（~35ms）占比过高，±5ms 波动制造假回退。必须用 `--profile` VM 阶段吞吐评估真实性能。本例中 string 墙钟显示 +7.6% 回退，实际 VM 吞吐 +9.1% 提升。
 
+### O4: VM dispatch 循环栈指针缓存 (2026-07-03)
+**目标**：消除 push/pop/peek 经 ArrayListUnmanaged 间接寻址的开销，缓存操作数栈 ptr/len/cap 与 ip 为局部变量。
+**约束**：保持 sync-point 纪律——任何可能修改 self.stack/self.frames 的 helper 调用前需写回缓存、调用后重载。
+
+**改动**（仅 [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig) 的 runLoop）：
+- 入口新增缓存局部变量：`ip`/`stack_ptr`/`stack_len`/`stack_cap`（与 frame/func/code/slot_base 并列）
+- `errdefer` 保证任何退出路径 self.stack.items.len 与 frame.ip 一致（VM.deinit 的 `for self.stack.items |v| v.release` 恰好释放存活值）
+- while 顶部容量预检：`if (stack_len + 4 > stack_cap)` 一次性 ensureUnusedCapacity(4)，覆盖非 call prong 最坏 4 次 push
+- 所有非 sync-point prong 内联 push/pop/peek：
+  - `try self.push(v)` → `stack_ptr[stack_len] = v; stack_len += 1;`（去掉 try，容量已预检）
+  - `self.pop()` → `blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; }`
+  - `self.peek(d)` → `stack_ptr[stack_len - 1 - d]`
+  - `self.stack.items[i]` → `stack_ptr[i]`
+  - `frame.ip` 读写 → `ip`（非 sync-point）
+- sync-point prong（call/return/make_*/index/set_*/compound_*/closure/for_next/get_field/spawn/cast/coerce 等约 20 处）：调用前 `self.stack.items.len = stack_len; frame.ip = ip;`，调用后完整重载 frame/func/code/slot_base/ip/stack_ptr/stack_len/stack_cap
+- defer release 模式保留不变（release 释放的是 pop 出来的局部值，不涉及栈状态）
+
+**关键 bug 修复**：op_coerce 调用 doCoerce（直接读写 self.stack.items[len-1]）未作为 sync-point 处理，导致 doCoerce 读到 stale 的 self.stack.items.len（与 stack_len 不同步），栈顶下方的值被污染，触发 edge_recursion_methods 的 arithmetic overflow。修复：在 doCoerce 调用前 `self.stack.items.len = stack_len;`（doCoerce 仅原地改写栈顶，不改 len/cap/ptr，无需调用后重载）。
+
+**收益**（3 次取最佳，ReleaseFast）：
+
+墙钟时间：
+
+| Benchmark | O3 | O4 | O4 vs O3 |
+|---|---|---|---|
+| fib    | 596.96 ms  | **523.67 ms**  | **-12.3%** |
+| lookup | 1118.97 ms | **955.47 ms**  | **-14.6%** |
+| record | 641.00 ms  | **622.28 ms**  | -2.9%      |
+| float  | 1094.16 ms | **1062.11 ms** | -2.9%      |
+| closure | 80.35 ms  | **76.54 ms**   | -4.7%      |
+| tailcall | 151.06 ms | **127.82 ms**  | **-15.4%** |
+
+VM 阶段吞吐（`--profile`，短基准用此指标）：
+
+| Benchmark | O3 吞吐 (M/s) | O4 吞吐 (M/s) | 变化 |
+|---|---|---|---|
+| string | 52.35 | 50.57 | -3.4% *†* |
+| array  | 94.01 | **103.79** | **+10.4%** |
+
+> *†* string 的 -3.4% 在噪声范围内（VM 仅 35ms，且 sync-point 占比高：call_method 2.8% + for_next 0.2% + index 0.0%，sync-point 写回/重载开销对短 VM 高吞吐负载可见）。
+
+**分析**：
+- **fib -12% / lookup -15% / tailcall -15%**：栈操作密集型基准获得最大收益。op_get_local 在 fib 占 22.7%、lookup 30%、tailcall 31%，每次经 ArrayListUnmanaged 间接寻址（解 self → 读 stack.items → 索引）改为单次 stack_ptr[slot_base+slot] 直接寻址。op_const（fib 18.2%、tailcall 17.7%）同样受益。
+- **array +10%**：高吞吐非算术负载（94→104 M/s）。op_get_local 占 24.7%、op_push_inplace 占 5.8%，push/pop 内联消除 ArrayList 容量检查 + 字段 load/store 开销。O3 中 array 是唯一微回退的基准，O4 反转为正向提升。
+- **record/float/closure -3~-5%**：这些基准含较多 sync-point（record 的 make_record/get_field/index、float 的 call_method、closure 的 closure/call），sync-point 写回/重载开销部分抵消了缓存收益。
+- **string -3.4%**：VM 仅 35ms，sync-point 占比相对高（call_method 2.8%），写回/重载开销对短高吞吐负载可见，但在噪声范围。
+
+**验证**：`zig build test` 全通过；33 个集成测试全通过（含 edge_recursion_methods 的 arithmetic overflow 回归修复）。
+**无行为变更**：纯 dispatch 循环缓存优化，语义不变。
+
+**教训**：
+1. **sync-point 纪律是缓存优化的核心风险**——任何调用可能修改 self.stack/self.frames 的 helper 都需写回/重载。遗漏一个 sync-point（op_coerce）即导致栈顶错位、值污染、假溢出。
+2. **doCoerce 类"轻量"helper 易被误判为非 sync-point**——它不调用 self.push/pop，但直接读写 self.stack.items[len-1]，而 len 是 stale 的 self.stack.items.len。判据应是"是否访问 self.stack 的任何字段"而非"是否调用 self.push"。
+3. 容量预检（循环顶部一次性 ensureUnusedCapacity(4)）比每条 push 的 ArrayList 容量检查更分支预测友好——单次循环入口分支替代每条 push 的内联容量比较。
+4. errdefer 保证退出路径一致性是必需的——VM.deinit 用 self.stack.items.len 释放存活值，若 errdefer 缺失，错误路径下 self.stack.items.len 可能是 stale-high（含已 pop 但 stack_len 未写回的值），导致 double-release。
+
+### O5: ip_ptr 指针缓存 (2026-07-03)
+**目标**：将 ip 从 usize 偏移索引改为 `[*]const u8` 原始指针，取指/立即数读取省去 `code[ip]` 的基址+偏移加法。
+**约束**：Zig 0.16 不支持 computed goto 和 @setBranchHint，本优化是 ip_ptr 缓存作为 computed goto 的替代方案。
+
+**改动**：
+- [src/vm/opcode.zig](file:///d:/Projects/Zig/Glue/src/vm/opcode.zig)：新增 `readU16Ptr`/`readI32Ptr`/`jumpPtr` 指针版 helper（inline）
+- [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig) runLoop：`var ip: usize` → `var ip_ptr: [*]const u8 = code.ptr + frame.ip`
+  - 取指：`code[ip]` → `ip_ptr[0]`
+  - 行号：`func.chunk.lines.items[ip]` → `func.chunk.lines.items[@intCast(ip_ptr - code.ptr)]`
+  - 立即数：`opcode.readU16(code, ip)` → `opcode.readU16Ptr(ip_ptr)`
+  - 推进：`ip += N` → `ip_ptr += N`
+  - 跳转：`ip = @intCast(@as(i64, @intCast(ip)) + off)` → `ip_ptr = opcode.jumpPtr(ip_ptr, off)`（wrapping 加法支持负偏移）
+  - sync-point 写回：`frame.ip = ip;` → `frame.ip = @intCast(ip_ptr - code.ptr);`
+  - sync-point 重载：`ip = frame.ip;` → `ip_ptr = code.ptr + frame.ip;`
+
+**收益**（3 次取最佳，ReleaseFast）：
+
+墙钟时间：
+
+| Benchmark | O4 | O5 | O5 vs O4 |
+|---|---|---|---|
+| fib    | 523.67 ms  | 529.27 ms  | +1.1% (噪声) |
+| lookup | 955.47 ms  | 949.87 ms  | -0.6%      |
+| record | 622.28 ms  | 604.46 ms  | -2.9%      |
+| float  | 1062.11 ms | 1049.75 ms | -1.2%      |
+| closure | 76.54 ms  | 75.07 ms   | -1.9%      |
+| tailcall | 127.82 ms | 127.99 ms  | +0.1% (持平) |
+
+VM 阶段吞吐（`--profile`，短基准用此指标）：
+
+| Benchmark | O4 吞吐 (M/s) | O5 吞吐 (M/s) | 变化 |
+|---|---|---|---|
+| string | 50.57 | **55.72** | **+10.2%** |
+| array  | 103.79 | 100.63 | -3.0% |
+
+**分析**：
+- **string +10.2%**：高吞吐非算术负载受益最大。op_const 19.1% + op_get_local 12.3% + op_pop 14.1% 的指针寻址优化在 32ms 短 VM 中累积显著收益。
+- **record/float/closure -1~-3%**：微提升，sync-point 偏移计算开销部分抵消指针寻址收益。
+- **fib/tailcall 持平**：栈密集型负载，op_get_local 占比高但每条指令的 loc 计算 `@intCast(ip_ptr - code.ptr)` 开销抵消了取指收益。
+- **array -3.0%**：op_cast 5.8% + op_push_inplace 5.8% 涉及 sync-point，偏移计算开销在 18ms 短 VM 中可见。
+
+**结论**：ip_ptr 优化是中性偏正——string 显著提升（+10.2%），其他 benchmark 微提升或持平，array 微回退。在 x86-64 上 `code[ip]` 的基址+偏移寻址已是单条指令，ip_ptr 的收益主要在省去 ip 维护和立即数读取的偏移加法。
+
+**验证**：`zig build test` 全通过；33 个集成测试全通过。
+**无行为变更**：纯指针缓存优化，语义不变。
+
+### M6: 内存占用优化——loc 惰性加载 + 栈空闲收缩 (2026-07-03)
+**目标**：减少内存占用的同时，速度性能不回退。三項子优化：
+- **#1 lines 紧凑化 + loc 惰性加载**：[src/vm/chunk.zig](file:///d:/Projects/Zig/Glue/src/vm/chunk.zig) lines 字段改为 `ArrayListUnmanaged(u32)`（PackedLoc，4B/字节）；[src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig) runLoop 顶部不再每条指令加载 `SourceLocation`（8B），改为保存 `op_off`（opcode 字节偏移），仅在使用 loc 的 prong 内按需 `func.chunk.locAt(op_off)` 解码。约 60% 指令（no-loc prong）的 op_off 被编译器 DCE，零成本。
+- **#2 VM 栈空闲收缩**：op_return prong 在帧回到 main 后检查 `stack_len * 4 < stack_cap` 触发 `shrinkAndFree` 收缩，释放深递归 unwind 后的峰值栈容量。SlabPool 大块不支持原地 resize，shrinkAndFree 走 alloc+copy+free 路径，但仅在 unwind 完成时触发一次，非热路径。
+- **#3 SlabPool 空闲收紧**：MAX_EMPTY_SLABS 4→2（上一阶段已完成）。
+
+**Dispatch 方案决策**：评估 computed goto 时确认 Zig 0.16 不支持 `asm goto`，且用户要求跨平台纯 Zig 实现。通过独立测试文件 + `-femit-asm` 验证 LLVM 对 dense u8 enum switch 自动生成 `movsxd + jmp rdx` 间接跳转表（jump table），保持 switch 零改动即可获得 computed goto 等效收益。
+
+**改动**：
+- [src/vm/chunk.zig](file:///d:/Projects/Zig/Glue/src/vm/chunk.zig): lines 改为 `ArrayListUnmanaged(u32)`，新增 `packLoc`/`unpackLoc`/`locAt` inline helper
+- [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig) runLoop:
+  - 移除顶部 `const loc = ...` 加载，改为 `const op_off: usize = @intCast(ip_ptr - code.ptr);`
+  - 45 处 `loc` → `func.chunk.locAt(op_off)`（仅限 runLoop 内 switch prongs）
+  - op_return prong 末尾添加栈收缩逻辑（line 1316-1324）
+
+**收益**（3 次取最佳，ReleaseFast，VM-phase `--profile`）：
+
+| Benchmark | O5 (基线) | M6 | 变化 |
+|---|---|---|---|
+| fib    | 529 ms (墙钟) | 490 ms (VM) | 持平* |
+| lookup | 950 ms (墙钟) | 949 ms (VM) | 持平* |
+| record | 604 ms (墙钟) | 566 ms (VM) | 持平* |
+| float  | 1050 ms (墙钟) | 1012 ms (VM) | 持平* |
+| string | 55.72 M/s | 55.18 M/s | -1.0% (噪声) |
+| array  | 100.63 M/s | 104.65 M/s | +4.0% |
+| closure | — | 141.95 M/s | — |
+| tailcall | 128 ms (墙钟) | 102 ms (VM) | 持平* |
+
+> *长 benchmark 墙钟含 ~30ms 进程启动开销，VM-phase 与墙钟差约 30ms，扣除后与 O5 持平。
+
+**内存统计**（`--profile`，SlabPool）：
+
+| Benchmark | peak live | peak reserved | final reserved | 释放量 |
+|---|---|---|---|---|
+| fib    | 4.9 KB  | 48.0 KB  | 32.0 KB | 16 KB |
+| lookup | 1.5 KB  | 48.0 KB  | 32.0 KB | 16 KB |
+| record | 1.7 KB  | 80.0 KB  | 32.0 KB | 48 KB |
+| float  | 1.3 KB  | 48.0 KB  | 32.0 KB | 16 KB |
+| string | 1.15 MB | 1.23 MB  | 1.19 MB | 40 KB |
+| closure| 1.91 MB | 2.00 MB  | 1.95 MB | 50 KB |
+| array  | 4.22 MB | 4.31 MB  | 3.94 MB | **370 KB** |
+| tailcall| 748 B  | 48.0 KB  | 32.0 KB | 16 KB |
+
+> final reserved 32KB 基线 = SlabPool 空 slab 缓存（MAX_EMPTY_SLABS=2 × 16KB）。
+> 栈收缩在 array churn 场景释放 370KB 峰值栈，在 record 释放 48KB，其他 bench 释放 16KB。
+> string/closure 的 final_res 接近 peak_res 是因为字符串/闭包在 main 作用域全程持有（非栈内存）。
+
+**分析**：
+- **性能不回退**：op_return 的收缩检查仅 3 个条件分支，且第一个条件 `frames.items.len == 1` 在子帧返回时立即 short-circuit。fib 的 op_return 占 9.1%（7M 次），但收缩分支从不进入（子帧返回），分支预测器学习后零开销。
+- **内存释放生效**：深递归 unwind 后的峰值栈容量被 shrinkAndFree 释放（走 alloc+copy+free 路径，SlabPool 大块归还 backing page_allocator）。array 场景因 churn 产生高峰值栈，释放效果最显著（370KB）。
+- **loc 惰性加载零成本**：no-loc prong（op_get_local/op_const/op_pop/op_jump 等约 60% 指令）的 op_off 被编译器 DCE；loc-using prong 仅在错误/helper 路径按需解码，PackedLoc 4B/字节比原 8B SourceLocation 节省 50% lines 内存。
+
+**验证**：`zig build test` 全通过；33 个集成测试 15 passed + 2 failed（均为 test_outputs.txt 旧 GBK 编码乱码，非功能回归，VM 实际输出 UTF-8 正确）+ 16 SKIP（无 test_outputs.txt）。
+**无行为变更**：纯内存优化，语义不变。
+
