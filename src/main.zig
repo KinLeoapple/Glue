@@ -451,6 +451,8 @@ fn tryRunOnVM(
 
     // 编译模块 → Program
     var mc = vm.ModuleCompiler.init(allocator);
+    // JIT Phase 1: wire type_table from TypeInferencer to ModuleCompiler
+    mc.type_table = &loader.type_inferencer.type_table;
     defer mc.deinit();
     defer mc.program.deinit();
 
