@@ -57,6 +57,9 @@ const DEFAULT_ENTRY = "src/Main.glue";
 /// `--profile`：全管线 profiling（阶段计时 + 内存统计 + opcode 频率），结束后输出报告。
 var profiler_enabled: bool = false;
 
+/// `--no-specialize`：禁用 JIT Phase 1 类型特化 opcode，全部回退到通用 opcode（A/B 对比用）。
+var no_specialize: bool = false;
+
 /// 全局 profiler 实例（runNormal/runDiagnostic 入口设置 io，各阶段埋点写入，结束 dump）。
 var prof: profiler.Profiler = .{};
 
@@ -78,6 +81,7 @@ fn printUsage(io: std.Io) void {
         \\
         \\Options:
         \\  --profile          Dump full pipeline profile (phases + memory + opcodes) after run
+        \\  --no-specialize    Disable JIT Phase 1 type-specialized opcodes (A/B comparison)
         \\
     , .{});
 }
@@ -108,6 +112,8 @@ pub fn main(init: std.process.Init) !void {
         for (args_slice[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--profile")) {
                 profiler_enabled = true;
+            } else if (std.mem.eql(u8, arg, "--no-specialize")) {
+                no_specialize = true;
             } else {
                 printError(io, "error: unknown option '{s}'\n\n", .{arg});
                 printUsage(io);
@@ -452,7 +458,10 @@ fn tryRunOnVM(
     // 编译模块 → Program
     var mc = vm.ModuleCompiler.init(allocator);
     // JIT Phase 1: wire type_table from TypeInferencer to ModuleCompiler
-    mc.type_table = &loader.type_inferencer.type_table;
+    // --no-specialize 时留空（null），编译器全部回退到通用 opcode
+    if (!no_specialize) {
+        mc.type_table = &loader.type_inferencer.type_table;
+    }
     defer mc.deinit();
     defer mc.program.deinit();
 
