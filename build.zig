@@ -127,6 +127,7 @@ pub fn build(b: *std.Build) void {
     });
     type_check_module.addImport("ast", ast_module);
     type_check_module.addImport("type_table", type_table_module);
+    // 注：cache_module 在 cache_module 定义后 addImport
 
     const subtype_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/subtype_check.zig"),
@@ -210,7 +211,7 @@ pub fn build(b: *std.Build) void {
     // vm/ sub-modules（字节码 VM — docs/bytecode-vm-plan.md）
     // ============================================================
     // 依赖图顶点是 compiler.zig（它 @import vm.zig / disasm.zig / chunk.zig / opcode.zig）。
-    // 只需注册一个模块，relative @import 拉起其余文件；外部依赖经 import 表注入。
+    // 只需注册一个模块，外部依赖经 import 表注入。
 
     const vm_module = b.createModule(.{
         .root_source_file = b.path("src/vm/compiler.zig"),
@@ -224,6 +225,24 @@ pub fn build(b: *std.Build) void {
     vm_module.addImport("profiler", profiler_module);
     vm_module.addImport("type_table", type_table_module);
     vm_module.addImport("analysis_db", analysis_db_module);
+
+    // ============================================================
+    // cache/ module - 字节码缓存 + 符号级增量编译
+    // ============================================================
+    // 依赖 vm（chunk/Function/Desc 类型）、value（Value 序列化）、ast（Module 接口提取）
+    const cache_module = b.createModule(.{
+        .root_source_file = b.path("src/cache/cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cache_module.addImport("ast", ast_module);
+    cache_module.addImport("vm", vm_module);
+    cache_module.addImport("value", value_module);
+    cache_module.addImport("type_check", type_check_module);
+    // cache ↔ type_check / module_loader / vm / root 反向依赖
+    type_check_module.addImport("cache", cache_module);
+    module_loader_module.addImport("cache", cache_module);
+    vm_module.addImport("cache", cache_module);
 
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -271,6 +290,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("slab_pool", slab_pool_module);
     root_module.addImport("profiler", profiler_module);
     root_module.addImport("vm", vm_module);
+    root_module.addImport("cache", cache_module);
 
     // Create glue executable
     const exe = b.addExecutable(.{
@@ -340,6 +360,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_analysis_db_unit_tests = b.addRunArtifact(analysis_db_unit_tests);
 
+    const cache_unit_tests = b.addTest(.{
+        .root_module = cache_module,
+    });
+    const run_cache_unit_tests = b.addRunArtifact(cache_unit_tests);
+
     // ============================================================
     // value_new 模块（自定义基础类型，独立 standalone）
     // ============================================================
@@ -368,4 +393,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_type_table_unit_tests.step);
     test_step.dependOn(&run_analysis_db_unit_tests.step);
     test_step.dependOn(&run_value_new_unit_tests.step);
+    test_step.dependOn(&run_cache_unit_tests.step);
 }

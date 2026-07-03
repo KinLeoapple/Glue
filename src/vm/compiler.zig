@@ -17,9 +17,11 @@ const opcode = @import("opcode.zig");
 const chunk_mod = @import("chunk.zig");
 const type_table_mod = @import("type_table");
 const analysis_db_mod = @import("analysis_db");
+const cache_reloc = @import("cache").reloc;
 
 /// 公开再导出，供 bench 驱动 / 外部入口通过本模块拿到 VM 与 Program（避免新建 build 图模块）。
 pub const VM = @import("vm.zig").VM;
+pub const chunk = chunk_mod;
 pub const lexer = @import("lexer");
 pub const parser = @import("parser");
 
@@ -121,6 +123,9 @@ pub const ModuleCompiler = struct {
     /// 【JIT Phase 3】memoization slot 分配计数器。
     /// 每个发射的 op_call_memoized 调用点分配唯一 slot，VM 用此索引 memo_cache。
     next_memo_slot: u16 = 0,
+    /// 【缓存】模块级重定位表（记录所有函数 chunk 中 func/ctor/global idx 引用位置）。
+    /// null = 缓存禁用（默认），编译行为与原先完全一致。
+    reloc_table: ?*cache_reloc.RelocTable = null,
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
         return .{ .program = Program.init(allocator), .allocator = allocator };
@@ -617,8 +622,17 @@ pub const ModuleCompiler = struct {
     /// M5k：合成一个 arity 参的「构造器包装」Function：取各参数 slot 压栈 + OP_MAKE_ADT + RETURN。
     /// 供有参构造器作一等值（`val mk = Circle`；mk(5.0) 即 Circle(5.0)）。返回 func_idx。
     fn ctorWrapperFunc(self: *ModuleCompiler, ctor_idx: u16, arity: u8, name: []const u8, loc: ast.SourceLocation) CompileError!u16 {
+        // 【缓存】预占位拿 func_idx
+        const placeholder = Function{
+            .chunk = Chunk.init(self.allocator),
+            .arity = arity,
+            .slot_count = 0,
+            .name = name,
+        };
+        const placeholder_idx = try self.program.addFunction(placeholder);
         var fc = FnCompiler.init(self.allocator, self);
         defer fc.deinit();
+        fc.func_idx = placeholder_idx;
         var i: u8 = 0;
         while (i < arity) : (i += 1) {
             fc.slot_count = @max(fc.slot_count, @as(u16, i) + 1);
@@ -626,6 +640,7 @@ pub const ModuleCompiler = struct {
             try fc.chunk.writeU16(i);
         }
         try fc.chunk.writeOp(.op_make_adt, loc);
+        try fc.recordIdx(.ctor, ctor_idx);
         try fc.chunk.writeU16(ctor_idx);
         try fc.chunk.writeByte(arity);
         try fc.chunk.writeOp(.op_return, loc);
@@ -637,12 +652,23 @@ pub const ModuleCompiler = struct {
             .name = name,
         };
         fc.chunk = Chunk.init(self.allocator);
-        return try self.program.addFunction(f);
+        self.program.functions.items[placeholder_idx].deinit();
+        self.program.functions.items[placeholder_idx] = f;
+        return placeholder_idx;
     }
     /// 但不支持引用尚未初始化的后续全局——镜像 eval 的顺序求值语义）。
     fn compileGlobalsInit(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
+        // 【缓存】预占位拿 func_idx（globals_init 在 functions 列表中的 idx）
+        const placeholder = Function{
+            .chunk = Chunk.init(self.allocator),
+            .arity = 0,
+            .slot_count = 0,
+            .name = "<globals_init>",
+        };
+        const placeholder_idx = try self.program.addFunction(placeholder);
         var fc = FnCompiler.init(self.allocator, self);
         defer fc.deinit();
+        fc.func_idx = placeholder_idx;
         // M5o：先构建模块值（文档 §4.6.2）——按登记顺序（子模块先于父模块），每个建 trait_value
         // vtable 写入其全局槽。父模块值的 pub pack 成员 OP_GET_GLOBAL 引用已建好的子模块值。
         for (self.module_values.items) |mv| {
@@ -662,6 +688,7 @@ pub const ModuleCompiler = struct {
             // 注解隐式定型（i8 字面量 → i32 全局），镜像形参/局部协调。
             try fc.emitCoerceFromAnnotation(gv.ann, gv.value, ed.location);
             try fc.chunk.writeOp(.op_set_global, ed.location);
+            try fc.recordIdx(.global, ge.idx);
             try fc.chunk.writeU16(ge.idx);
         }
         try fc.chunk.writeOp(.op_unit, .{ .line = 0, .column = 0 });
@@ -674,7 +701,9 @@ pub const ModuleCompiler = struct {
             .name = "<globals_init>",
         };
         fc.chunk = Chunk.init(self.allocator);
-        self.program.globals_init = try self.program.addFunction(f);
+        self.program.functions.items[placeholder_idx].deinit();
+        self.program.functions.items[placeholder_idx] = f;
+        self.program.globals_init = placeholder_idx;
     }
 
     /// M5o：发射一个模块值构造（文档 §4.6.2）。pub fun → [name 常量, OP_CLOSURE func_idx]（零捕获
@@ -691,6 +720,7 @@ pub const ModuleCompiler = struct {
                     const name_v = try Value.fromStringBytes(self.allocator, f.name);
                     try fc.emitConst(try fc.chunk.addConstant(name_v), loc);
                     try fc.chunk.writeOp(.op_closure, loc);
+                    try fc.recordIdx(.func, fn_idx);
                     try fc.chunk.writeU16(fn_idx);
                     try fc.chunk.writeByte(0); // 零捕获（顶层函数）
                     count += 1;
@@ -701,6 +731,7 @@ pub const ModuleCompiler = struct {
                     const name_v = try Value.fromStringBytes(self.allocator, pd.name);
                     try fc.emitConst(try fc.chunk.addConstant(name_v), loc);
                     try fc.chunk.writeOp(.op_get_global, loc);
+                    try fc.recordIdx(.global, sub.idx);
                     try fc.chunk.writeU16(sub.idx);
                     count += 1;
                 },
@@ -711,12 +742,15 @@ pub const ModuleCompiler = struct {
         try fc.chunk.writeOp(.op_make_trait, loc);
         try fc.chunk.writeByte(@intCast(count));
         try fc.chunk.writeOp(.op_set_global, loc);
+        try fc.recordIdx(.global, global_idx);
         try fc.chunk.writeU16(global_idx);
     }
 
     fn compileFunction(self: *ModuleCompiler, fd: @TypeOf(@as(ast.Decl, undefined).fun_decl)) CompileError!void {
         var fc = FnCompiler.init(self.allocator, self);
         defer fc.deinit();
+        // 【缓存】设置本函数的 func_idx（reloc 记录用）。第一遍已预留占位 idx。
+        fc.func_idx = self.lookupFn(fd.name).?;
         // 参数占 slot 0..arity-1。
         for (fd.params) |p| _ = try fc.declareLocal(p.name, p.is_var, typeNeedsRelease(p.type_annotation), builtinTypeOf(p.type_annotation));
         try fc.emitTail(fd.body); // 函数体在尾位置：尾调用→OP_TAIL_CALL，否则 emitExpr+OP_RETURN
@@ -817,9 +851,27 @@ const FnCompiler = struct {
     rec_name: ?[]const u8 = null,
     /// letrec lambda 在 program.functions 中的索引（先占位再覆盖），供 OP_CALL_REC 使用。
     rec_func_idx: u16 = 0,
+    /// 【缓存】本函数在 program.functions 中的索引（reloc 记录用）。
+    func_idx: u16 = 0,
+    /// 【缓存】模块级 reloc 表指针（null = 不记录）。继承自 ModuleCompiler。
+    reloc_table: ?*cache_reloc.RelocTable = null,
 
     fn init(allocator: std.mem.Allocator, module: *ModuleCompiler) FnCompiler {
-        return .{ .chunk = Chunk.init(allocator), .allocator = allocator, .module = module };
+        return .{
+            .chunk = Chunk.init(allocator),
+            .allocator = allocator,
+            .module = module,
+            .reloc_table = module.reloc_table,
+        };
+    }
+
+    /// 【缓存】记录一条 reloc 项（在 writeOp 之后、writeU16/writeByte 之前调用）。
+    /// code_offset 取当前 chunk.code.items.len，即 idx 立即数的起始位置。
+    inline fn recordIdx(self: *FnCompiler, kind: cache_reloc.RelocKind, local_idx: u32) !void {
+        if (self.reloc_table) |rt| {
+            const offset: u32 = @intCast(self.chunk.code.items.len);
+            try rt.add(self.func_idx, offset, kind, local_idx);
+        }
     }
 
     fn deinit(self: *FnCompiler) void {
@@ -927,6 +979,7 @@ const FnCompiler = struct {
                     if (self.module.lookupGlobal(module_name)) |ge| {
                         // 模块找到，生成：GET_GLOBAL(module) + GET_FIELD(symbol)
                         try self.chunk.writeOp(.op_get_global, loc);
+                        try self.recordIdx(.global, ge.idx);
                         try self.chunk.writeU16(ge.idx);
 
                         const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, symbol_name));
@@ -945,12 +998,14 @@ const FnCompiler = struct {
                 } else if (self.module.lookupFn(id.name)) |func_idx| {
                     // 顶层函数名出现在值位置（非直接 call）→ 包成 vm_closure 一等值。
                     try self.chunk.writeOp(.op_closure, loc);
+                    try self.recordIdx(.func, func_idx);
                     try self.chunk.writeU16(func_idx);
                     try self.chunk.writeByte(0); // n_upvalues=0
                 } else if (self.module.lookupCtor(id.name)) |ce| {
                     // 裸名 nullary ADT 构造器（如 Red/Green/Nil）作为值 → OP_MAKE_ADT argc=0。
                     if (ce.arity == 0) {
                         try self.chunk.writeOp(.op_make_adt, loc);
+                        try self.recordIdx(.ctor, ce.idx);
                         try self.chunk.writeU16(ce.idx);
                         try self.chunk.writeByte(0);
                     } else {
@@ -958,12 +1013,14 @@ const FnCompiler = struct {
                         //（取各参数 slot + OP_MAKE_ADT），OP_CLOSURE 压栈。调用时即构造 ADT。
                         const wrap_idx = try self.module.ctorWrapperFunc(ce.idx, ce.arity, id.name, loc);
                         try self.chunk.writeOp(.op_closure, loc);
+                        try self.recordIdx(.func, wrap_idx);
                         try self.chunk.writeU16(wrap_idx);
                         try self.chunk.writeByte(0); // n_upvalues=0
                     }
                 } else if (self.module.lookupGlobal(id.name)) |ge| {
                     // M5g：顶层 val/var 全局变量读 → OP_GET_GLOBAL。
                     try self.chunk.writeOp(.op_get_global, loc);
+                    try self.recordIdx(.global, ge.idx);
                     try self.chunk.writeU16(ge.idx);
                 } else return error.Unsupported;
             },
@@ -1036,6 +1093,7 @@ const FnCompiler = struct {
                 for (rl.fields) |f| try self.emitExpr(f.value);
                 const shape_idx = try self.module.program.addRecordShape(names);
                 try self.chunk.writeOp(.op_make_record, loc);
+                try self.recordIdx(.record_shape, shape_idx);
                 try self.chunk.writeU16(shape_idx);
             },
             // M2b：索引 a[i] → object 压栈 + index 压栈 + OP_INDEX。
@@ -1094,6 +1152,7 @@ const FnCompiler = struct {
                 } else if (self.module.lookupGlobal(name)) |ge| {
                     // M5g：赋值表达式写顶层 var 全局。
                     try self.chunk.writeOp(.op_set_global, a.location);
+                    try self.recordIdx(.global, ge.idx);
                     try self.chunk.writeU16(ge.idx);
                 } else return error.Unsupported;
             },
@@ -1135,18 +1194,16 @@ const FnCompiler = struct {
         sub.enclosing = self;
         sub.rec_name = rec_name;
         defer sub.deinit();
-        // letrec 自递归：先占位注册 Function 拿 func_idx，供体内 OP_CALL_REC 引用。
-        var placeholder_idx: ?u16 = null;
-        if (rec_name != null) {
-            const placeholder = Function{
-                .chunk = Chunk.init(self.allocator),
-                .arity = @intCast(lam.params.len),
-                .slot_count = 0,
-                .name = rec_name.?,
-            };
-            placeholder_idx = try self.module.program.addFunction(placeholder);
-            sub.rec_func_idx = placeholder_idx.?;
-        }
+        // 【缓存】预占位拿 func_idx：letrec 自递归引用 + reloc 记录均需编译前确定 idx。
+        const placeholder = Function{
+            .chunk = Chunk.init(self.allocator),
+            .arity = @intCast(lam.params.len),
+            .slot_count = 0,
+            .name = if (rec_name) |n| n else "<lambda>",
+        };
+        const placeholder_idx = try self.module.program.addFunction(placeholder);
+        sub.func_idx = placeholder_idx;
+        sub.rec_func_idx = placeholder_idx;
         for (lam.params) |p| _ = try sub.declareLocal(p.name, p.is_var, typeNeedsRelease(p.type_annotation), builtinTypeOf(p.type_annotation));
         const body_expr = switch (lam.body) {
             .block => |b| b,
@@ -1172,14 +1229,13 @@ const FnCompiler = struct {
             .name = if (rec_name) |n| n else "<lambda>",
         };
         sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
-        // letrec：覆盖占位 Function；普通：append 新 Function。
-        const func_idx = if (placeholder_idx) |idx| blk: {
-            self.module.program.functions.items[idx].deinit();
-            self.module.program.functions.items[idx] = f;
-            break :blk idx;
-        } else try self.module.program.addFunction(f);
+        // 覆盖占位 Function。
+        self.module.program.functions.items[placeholder_idx].deinit();
+        self.module.program.functions.items[placeholder_idx] = f;
+        const func_idx = placeholder_idx;
         // 发 OP_CLOSURE + 描述符。注意：描述符在 *本* 函数(enclosing)上下文展开。
         try self.chunk.writeOp(.op_closure, loc);
+        try self.recordIdx(.func, func_idx);
         try self.chunk.writeU16(@intCast(func_idx));
         try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
         for (sub.upvalues.items) |uv| {
@@ -1194,6 +1250,15 @@ const FnCompiler = struct {
         var sub = FnCompiler.init(self.allocator, self.module);
         sub.enclosing = self;
         defer sub.deinit();
+        // 【缓存】预占位拿 func_idx
+        const placeholder = Function{
+            .chunk = Chunk.init(self.allocator),
+            .arity = 0,
+            .slot_count = 0,
+            .name = "<spawn>",
+        };
+        const placeholder_idx = try self.module.program.addFunction(placeholder);
+        sub.func_idx = placeholder_idx;
         try sub.emitExpr(sp.body);
         try sub.chunk.writeOp(.op_return, sp.location);
         const f = Function{
@@ -1204,8 +1269,11 @@ const FnCompiler = struct {
             .name = "<spawn>",
         };
         sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
-        const func_idx = try self.module.program.addFunction(f);
+        self.module.program.functions.items[placeholder_idx].deinit();
+        self.module.program.functions.items[placeholder_idx] = f;
+        const func_idx = placeholder_idx;
         try self.chunk.writeOp(.op_closure, sp.location);
+        try self.recordIdx(.func, func_idx);
         try self.chunk.writeU16(@intCast(func_idx));
         try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
         for (sub.upvalues.items) |uv| {
@@ -1221,6 +1289,15 @@ const FnCompiler = struct {
         var sub = FnCompiler.init(self.allocator, self.module);
         sub.enclosing = self;
         defer sub.deinit();
+        // 【缓存】预占位拿 func_idx
+        const placeholder = Function{
+            .chunk = Chunk.init(self.allocator),
+            .arity = 0,
+            .slot_count = 0,
+            .name = "<lazy>",
+        };
+        const placeholder_idx = try self.module.program.addFunction(placeholder);
+        sub.func_idx = placeholder_idx;
         try sub.emitExpr(lz.expr);
         try sub.chunk.writeOp(.op_return, lz.location);
         const f = Function{
@@ -1231,8 +1308,11 @@ const FnCompiler = struct {
             .name = "<lazy>",
         };
         sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
-        const func_idx = try self.module.program.addFunction(f);
+        self.module.program.functions.items[placeholder_idx].deinit();
+        self.module.program.functions.items[placeholder_idx] = f;
+        const func_idx = placeholder_idx;
         try self.chunk.writeOp(.op_closure, lz.location);
+        try self.recordIdx(.func, func_idx);
         try self.chunk.writeU16(@intCast(func_idx));
         try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
         for (sub.upvalues.items) |uv| {
@@ -1348,6 +1428,15 @@ const FnCompiler = struct {
             var sub = FnCompiler.init(self.allocator, self.module);
             sub.enclosing = self;
             defer sub.deinit();
+            // 【缓存】预占位拿 func_idx
+            const placeholder = Function{
+                .chunk = Chunk.init(self.allocator),
+                .arity = @intCast(method.params.len),
+                .slot_count = 0,
+                .name = method.name,
+            };
+            const placeholder_idx = try self.module.program.addFunction(placeholder);
+            sub.func_idx = placeholder_idx;
             for (method.params) |p| _ = try sub.declareLocal(p.name, p.is_var, typeNeedsRelease(p.type_annotation), builtinTypeOf(p.type_annotation));
             try sub.emitExpr(body);
             try sub.chunk.writeOp(.op_return, method.location);
@@ -1359,8 +1448,11 @@ const FnCompiler = struct {
                 .name = method.name,
             };
             sub.chunk = Chunk.init(self.allocator);
-            const func_idx = try self.module.program.addFunction(f);
+            self.module.program.functions.items[placeholder_idx].deinit();
+            self.module.program.functions.items[placeholder_idx] = f;
+            const func_idx = placeholder_idx;
             try self.chunk.writeOp(.op_closure, method.location);
+            try self.recordIdx(.func, func_idx);
             try self.chunk.writeU16(@intCast(func_idx));
             try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
             for (sub.upvalues.items) |uv| {
@@ -1517,6 +1609,7 @@ const FnCompiler = struct {
             }
         }
         try self.chunk.writeOp(.op_tail_call, loc);
+        try self.recordIdx(.tail_func, entry.idx);
         try self.chunk.writeU16(entry.idx);
         try self.chunk.writeByte(@intCast(c.arguments.len));
         return true;
@@ -1585,11 +1678,13 @@ const FnCompiler = struct {
                     // JIT Phase 3: 纯递归函数 → op_call_memoized（自递归也受益）
                     if (self.module.getOrAssignMemoSlot(name)) |memo_slot| {
                         try self.chunk.writeOp(.op_call_memoized, loc);
+                        try self.recordIdx(.memo_func, self.rec_func_idx);
                         try self.chunk.writeU16(self.rec_func_idx);
                         try self.chunk.writeByte(argc);
                         try self.chunk.writeU16(memo_slot);
                     } else {
                         try self.chunk.writeOp(.op_call_rec, loc);
+                        try self.recordIdx(.func, self.rec_func_idx);
                         try self.chunk.writeU16(self.rec_func_idx);
                         try self.chunk.writeByte(argc);
                     }
@@ -1605,6 +1700,7 @@ const FnCompiler = struct {
                     if (argc != 1) return error.Unsupported;
                     try self.emitExpr(c.arguments[0]);
                     try self.chunk.writeOp(.op_make_error, loc);
+                    try self.recordIdx(.ctor, ee.idx);
                     try self.chunk.writeU16(ee.idx);
                     return;
                 }
@@ -1625,11 +1721,13 @@ const FnCompiler = struct {
                     // JIT Phase 3: 纯函数 → op_call_memoized
                     if (self.module.getOrAssignMemoSlot(name)) |memo_slot| {
                         try self.chunk.writeOp(.op_call_memoized, loc);
+                        try self.recordIdx(.memo_func, func_idx);
                         try self.chunk.writeU16(func_idx);
                         try self.chunk.writeByte(argc);
                         try self.chunk.writeU16(memo_slot);
                     } else {
                         try self.chunk.writeOp(.op_call, loc);
+                        try self.recordIdx(.func, func_idx);
                         try self.chunk.writeU16(func_idx);
                         try self.chunk.writeByte(argc);
                     }
@@ -1640,6 +1738,7 @@ const FnCompiler = struct {
                     if (ce.arity != argc) return error.Unsupported; // 柯里化构造器留后续
                     for (c.arguments) |arg| try self.emitExpr(arg);
                     try self.chunk.writeOp(.op_make_adt, loc);
+                    try self.recordIdx(.ctor, ce.idx);
                     try self.chunk.writeU16(ce.idx);
                     try self.chunk.writeByte(argc);
                     return;
@@ -1649,6 +1748,7 @@ const FnCompiler = struct {
                     if (argc != 1) return error.Unsupported;
                     try self.emitExpr(c.arguments[0]);
                     try self.chunk.writeOp(.op_make_newtype, loc);
+                    try self.recordIdx(.ctor, ne.idx);
                     try self.chunk.writeU16(ne.idx);
                     return;
                 }
@@ -1668,6 +1768,7 @@ const FnCompiler = struct {
                     if (self.module.uniqueTraitMethod(name)) |fidx| {
                         for (c.arguments) |arg| try self.emitExpr(arg);
                         try self.chunk.writeOp(.op_call, loc);
+                        try self.recordIdx(.func, fidx);
                         try self.chunk.writeU16(fidx);
                         try self.chunk.writeByte(argc);
                         return;
@@ -1684,6 +1785,7 @@ const FnCompiler = struct {
                 if (argc == 0) {
                     if (self.module.lookupNullaryMethod(name)) |fidx| {
                         try self.chunk.writeOp(.op_call, loc);
+                        try self.recordIdx(.func, fidx);
                         try self.chunk.writeU16(fidx);
                         try self.chunk.writeByte(0);
                         return;
@@ -2157,6 +2259,7 @@ const FnCompiler = struct {
                     // M5g：顶层 var 重新赋值 → OP_SET_GLOBAL（val 不可变性由 type_check 保证）。
                     try self.emitExpr(a.value);
                     try self.chunk.writeOp(.op_set_global, a.location);
+                    try self.recordIdx(.global, ge.idx);
                     try self.chunk.writeU16(ge.idx);
                 } else return error.Unsupported;
             },
@@ -2414,10 +2517,12 @@ const FnCompiler = struct {
         } else if (self.module.lookupGlobal(name)) |ge| {
             // M5g：顶层 var 复合赋值 g op= v → g = g op v（读改写，无 atomic 透明：顶层全局非 spawn 捕获）。
             try self.chunk.writeOp(.op_get_global, ca.location);
+            try self.recordIdx(.global, ge.idx);
             try self.chunk.writeU16(ge.idx);
             try self.emitExpr(ca.value);
             try self.chunk.writeOp(arith, ca.location);
             try self.chunk.writeOp(.op_set_global, ca.location);
+            try self.recordIdx(.global, ge.idx);
             try self.chunk.writeU16(ge.idx);
         } else return error.Unsupported;
     }
@@ -2451,11 +2556,13 @@ const FnCompiler = struct {
             } else if (self.module.lookupGlobal(oname)) |ge| {
                 // M5g：顶层 var 记录字段赋值 g.f = v（COW 写回全局槽）。
                 try self.chunk.writeOp(.op_get_global, fa.location);
+                try self.recordIdx(.global, ge.idx);
                 try self.chunk.writeU16(ge.idx);
                 try self.emitExpr(fa.value);
                 try self.chunk.writeOp(.op_set_field, fa.location);
                 try self.chunk.writeU16(name_const);
                 try self.chunk.writeOp(.op_set_global, fa.location);
+                try self.recordIdx(.global, ge.idx);
                 try self.chunk.writeU16(ge.idx);
                 return;
             }
@@ -2496,11 +2603,13 @@ const FnCompiler = struct {
             } else if (self.module.lookupGlobal(oname)) |ge| {
                 // M5g：顶层 var 数组元素赋值 g[i] = v（COW 写回全局槽）。
                 try self.chunk.writeOp(.op_get_global, loc);
+                try self.recordIdx(.global, ge.idx);
                 try self.chunk.writeU16(ge.idx);
                 try self.emitExpr(idx.index);
                 try self.emitExpr(rhs);
                 try self.chunk.writeOp(.op_set_index, loc);
                 try self.chunk.writeOp(.op_set_global, loc);
+                try self.recordIdx(.global, ge.idx);
                 try self.chunk.writeU16(ge.idx);
                 return;
             }

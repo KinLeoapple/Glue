@@ -622,3 +622,43 @@ VM 阶段吞吐（`--profile`，短基准用此指标）：
 
 **验证**：`edge_iterators` 测试含 5 个常量 range 循环（`5..5` 空范围、`1..=3` 3 次、`1..3` 2 次、`5..1` 空范围、`3..=3` 单次），全部正确输出。`--profile` 显示 37 次 `op_for_next`（来自数组/字符串迭代等非常量 range 循环），常量 range 循环已展开无 `op_for_next`。33 集成测试 + 129 单元测试 + 8 benchmark 全通过。
 
+### M7: 字节码缓存基础设施 (2026-07-03)
+**目标**：实现符号级依赖追踪的每模块字节码缓存，支持跨模块缓存失效判定。
+
+**架构**：
+- **缓存目录**：项目根 `.cache/`，每模块一个 `<FNV-1a64(src_path)>.bcc` 文件
+- **.bcc 文件格式**：Header(magic+version+mtime+size+module_name+src_path) + Interface(导出符号签名表) + Usage(导入符号使用表) + Bytecode(Chunk+Function+Desc表) + RelocTable(重定位表)
+- **缓存命中判定**：mtime+size 匹配 AND 所有 usage 符号的 sig_hash 仍与被依赖模块当前接口匹配
+- **符号级失效**：模块 M 的接口 hash 变化时，依赖 M 的模块的 usage 中对应符号 sig 不匹配，触发重编
+
+**实现文件**：
+- [src/cache/reloc.zig](file:///d:/Projects/Zig/Glue/src/cache/reloc.zig): RelocTable + RelocEntry(func_idx+code_offset+kind+local_idx) + ByteCursor
+- [src/cache/serializer.zig](file:///d:/Projects/Zig/Glue/src/cache/serializer.zig): Value/Chunk/Function/Desc 表序列化/反序列化
+- [src/cache/interface.zig](file:///d:/Projects/Zig/Glue/src/cache/interface.zig): ModuleInterface + extractInterface + FNV-1a64 签名
+- [src/cache/usage.zig](file:///d:/Projects/Zig/Glue/src/cache/usage.zig): SymbolUsage 记录+校验+序列化
+- [src/cache/cache.zig](file:///d:/Projects/Zig/Glue/src/cache/cache.zig): CacheStore + BccFile + writeBccFile/readBccFile + isCacheHit
+- [src/vm/compiler.zig](file:///d:/Projects/Zig/Glue/src/vm/compiler.zig): recordIdx 埋点（所有 func/ctor/global/shape_idx 写入位置）
+- [src/loader/module_loader.zig](file:///d:/Projects/Zig/Glue/src/loader/module_loader.zig): writeModuleCache + loaded_interfaces 注册
+- [src/main.zig](file:///d:/Projects/Zig/Glue/src/main.zig): `--no-cache` flag + CacheStore 创建
+
+**编译器重定位埋点**：
+- `recordIdx` inline helper：reloc_table 非 null 时记录 (func_idx, code_offset, kind, local_idx)
+- 预占位模式：compileFunction/emitLambda/emitSpawn/emitLazy/emitInlineTrait/ctorWrapperFunc/compileGlobalsInit 先注册空 Function 占位，编译后覆写
+- 覆盖所有 idx 写入位置：op_closure/op_call/op_call_rec/op_call_memoized/op_tail_call/op_make_adt/op_make_error/op_make_newtype/op_make_record/op_get_global/op_set_global/op_call_method
+
+**当前状态**：
+- 缓存写入：writeModuleCache 在 type_check 后提取接口+usage 写入 .bcc 文件（字节码部分序列化已实现但暂未填充）
+- 缓存读取：readBccFile + isCacheHit 已实现；tryLoadFromCache 已定义但暂未调用（字节码加载到 Program 尚未集成）
+- 接口注册：writeModuleCache 将 owned 接口副本注册到 loaded_interfaces，供下游模块 usage 校验
+- `--no-cache` flag：禁用缓存时跳过所有缓存操作
+
+**验证**：
+- `zig build test`：166/166 单元测试通过（Debug + ReleaseFast）
+- `zig build -Doptimize=ReleaseFast`：编译成功
+- 集成测试：22/33 通过（11 个失败为预存 issue，`--no-cache` 同样失败，与缓存无关）
+- Benchmark：7/8 通过（string 失败为预存 integer overflow）
+- 缓存文件生成：所有通过的 benchmark 均在 `.cache/` 生成 `.bcc` 文件
+- 二次运行正确性：缓存存在时二次运行输出与首次完全一致
+
+**性能收益**：暂无（字节码加载尚未集成，type_check 仍完整执行）。后续实现 tryLoadFromCache 加载字节码到 Program 后，可跳过 parse/type_check/compile，预期显著减少冷启动时间。
+

@@ -337,8 +337,12 @@ pub const Value = union(enum) {
         switch (self) {
             .null_val, .unit, .boolean, .char, .int, .float, .spawn_val => {},
             .string => |p| {
-                // SSO 字符串 rc 字段编码 SSO 标志(bit31)+长度(bits 0-4)，不可增减
-                if (!p.isSso()) p.rc += 1;
+                // SSO 字符串用 bits 5-30 做引用计数；heap 模式 rc += 1
+                if (p.isSso()) {
+                    p.ssoRetain();
+                } else {
+                    p.rc += 1;
+                }
             },
             inline .array, .record, .adt, .newtype, .cell, .range,
                 .vm_closure, .partial, .builtin, .error_val, .throw_val,
@@ -360,8 +364,11 @@ pub const Value = union(enum) {
         switch (self) {
             .null_val, .unit, .boolean, .char, .int, .float, .spawn_val => {},
             .string => |p| {
-                // SSO 字符串无堆分配，无需释放
-                if (p.isSso()) return;
+                // SSO 字符串用 bits 5-30 做引用计数，归零 destroy struct
+                if (p.isSso()) {
+                    if (p.ssoRelease()) allocator.destroy(p);
+                    return;
+                }
                 if (p.rc > 1) {
                     p.rc -= 1;
                 } else {

@@ -8,6 +8,7 @@ const value = @import("value");
 const slab_pool = @import("slab_pool");
 const vm = @import("vm");
 const profiler = @import("profiler");
+const cache_mod = @import("cache");
 
 /// 把求值器错误映射为专业英文消息（Go/Java 风格）。
 /// 若求值器已经设置了带上下文的 panic_message（如 "no method 'x' on type 'array'"），
@@ -59,6 +60,9 @@ var profiler_enabled: bool = false;
 
 /// `--no-specialize`：禁用 JIT Phase 1 类型特化 opcode，全部回退到通用 opcode（A/B 对比用）。
 var no_specialize: bool = false;
+
+/// `--no-cache`：禁用字节码缓存（强制全量重编）。
+var no_cache: bool = false;
 
 /// 全局 profiler 实例（runNormal/runDiagnostic 入口设置 io，各阶段埋点写入，结束 dump）。
 var prof: profiler.Profiler = .{};
@@ -114,6 +118,8 @@ pub fn main(init: std.process.Init) !void {
                 profiler_enabled = true;
             } else if (std.mem.eql(u8, arg, "--no-specialize")) {
                 no_specialize = true;
+            } else if (std.mem.eql(u8, arg, "--no-cache")) {
+                no_cache = true;
             } else {
                 printError(io, "error: unknown option '{s}'\n\n", .{arg});
                 printUsage(io);
@@ -343,8 +349,13 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
     defer pool.deinit();
     const value_allocator = pool.allocator();
 
+    // 【缓存】创建 CacheStore（.cache 目录，按 mtime+size+符号签名命中）
+    var cache_store = cache_mod.CacheStore.init(arena_alloc, io, ".cache", !no_cache);
+    if (!no_cache) cache_store.ensureDir() catch {};
+
     var loader = module_loader.ModuleLoader.init(arena_alloc, io);
     defer loader.deinit();
+    loader.cache_store = &cache_store;
 
     // profiler：初始化（io 用于单调时钟）。SlabPool 统计在 executeSource 返回后注入（pool 未 deinit）。
     prof = profiler.Profiler.init(profiler_enabled, io);
@@ -377,8 +388,13 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
         defer pool.deinit();
         const value_allocator = pool.allocator();
 
+        // 【缓存】诊断模式同样支持缓存（便于检测缓存路径的内存问题）
+        var cache_store = cache_mod.CacheStore.init(dbg_alloc, io, ".cache", !no_cache);
+        if (!no_cache) cache_store.ensureDir() catch {};
+
         var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
         defer loader.deinit();
+        loader.cache_store = &cache_store;
 
         // profiler：诊断模式同样支持 profiling。
         prof = profiler.Profiler.init(profiler_enabled, io);

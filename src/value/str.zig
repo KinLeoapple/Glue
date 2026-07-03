@@ -21,10 +21,14 @@ pub const Str = extern struct {
     _word0: u64 = 0,
     _word1: u64 = 0,
     _word2: u32 = 0,
-    rc: u32 = SSO_FLAG, // 默认 SSO 模式，长度 0
+    rc: u32 = SSO_FLAG | SSO_REFCOUNT_INIT, // 默认 SSO 模式，长度 0，ref_count=1
 
     const SSO_FLAG: u32 = 0x80000000;
     const SSO_LEN_MASK: u32 = 0x1F; // bits 0-4, max 20
+    /// SSO 引用计数：bits 5-30（26 位，初始值 1）
+    const SSO_REFCOUNT_SHIFT: u5 = 5;
+    const SSO_REFCOUNT_MASK: u32 = 0x7FFFFFE0;
+    const SSO_REFCOUNT_INIT: u32 = 1 << SSO_REFCOUNT_SHIFT;
     /// SSO 最大字节数
     pub const SSO_MAX: usize = 20;
 
@@ -34,6 +38,20 @@ pub const Str = extern struct {
 
     fn ssoLen(self: *const Str) usize {
         return self.rc & SSO_LEN_MASK;
+    }
+
+    /// SSO 引用计数 +1
+    pub inline fn ssoRetain(self: *Str) void {
+        const count = (self.rc & SSO_REFCOUNT_MASK) >> SSO_REFCOUNT_SHIFT;
+        self.rc = (self.rc & ~SSO_REFCOUNT_MASK) | ((count + 1) << SSO_REFCOUNT_SHIFT);
+    }
+
+    /// SSO 引用计数 -1，归零返回 true（调用方应 destroy）
+    pub inline fn ssoRelease(self: *Str) bool {
+        const count = (self.rc & SSO_REFCOUNT_MASK) >> SSO_REFCOUNT_SHIFT;
+        if (count <= 1) return true;
+        self.rc = (self.rc & ~SSO_REFCOUNT_MASK) | ((count - 1) << SSO_REFCOUNT_SHIFT);
+        return false;
     }
 
     /// 从字面量构造（≤20 字节走 SSO 零字节堆分配，>20 字节走堆分配）
@@ -57,7 +75,7 @@ pub const Str = extern struct {
     }
 
     fn initSso(s: []const u8) Str {
-        var result = Str{ .rc = SSO_FLAG | @as(u32, @intCast(s.len)) };
+        var result = Str{ .rc = SSO_FLAG | SSO_REFCOUNT_INIT | @as(u32, @intCast(s.len)) };
         const dst: [*]u8 = @ptrCast(&result);
         @memcpy(dst[0..s.len], s);
         return result;
@@ -112,7 +130,7 @@ pub const Str = extern struct {
         const b_len = other.byteLength();
         const total = a_len + b_len;
         if (total <= SSO_MAX) {
-            var result = Str{ .rc = SSO_FLAG | @as(u32, @intCast(total)) };
+            var result = Str{ .rc = SSO_FLAG | SSO_REFCOUNT_INIT | @as(u32, @intCast(total)) };
             const dst: [*]u8 = @ptrCast(&result);
             @memcpy(dst[0..a_len], self.bytes());
             @memcpy(dst[a_len..total], other.bytes());

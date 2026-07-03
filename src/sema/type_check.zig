@@ -15,6 +15,8 @@ const kind_check = @import("kind_check");
 const gadt_check = @import("gadt_check");
 const module_check = @import("module_check");
 const type_table_mod = @import("type_table");
+const cache_usage = @import("cache").usage;
+const cache_interface = @import("cache").interface;
 
 /// 测试浮点值能否在指定类型中精确往返（f64 → T → f64）
 fn canRoundTripFloat(comptime T: type, val: f64) bool {
@@ -600,6 +602,10 @@ pub const TypeInferencer = struct {
     current_self_type: ?*Type = null,
     /// 当前模块名（用于 Orphan 检查）
     current_module: []const u8 = "",
+    /// 【缓存】符号使用跟踪器（借用引用，由 ModuleLoader 设置）
+    symbol_usage: ?*cache_usage.SymbolUsage = null,
+    /// 【缓存】当前可用的模块接口表（借用引用，用于查 sig_hash）
+    current_interfaces: ?*const std.StringHashMap(cache_interface.ModuleInterface) = null,
     /// Trait 定义模块记录（trait_name -> 定义它的模块名）
     trait_defining_modules: std.StringHashMap([]const u8),
     /// Type 定义模块记录（type_name -> 定义它的模块名）
@@ -685,6 +691,29 @@ pub const TypeInferencer = struct {
             .narrowed_paths = std.StringHashMap(void).init(allocator),
             .type_table = type_table_mod.TypeTable.init(allocator),
         };
+    }
+
+    /// 【缓存】设置符号使用跟踪器（ModuleLoader 在编译每模块前调用）
+    pub fn setSymbolUsageTracker(self: *TypeInferencer, tracker: ?*cache_usage.SymbolUsage) void {
+        self.symbol_usage = tracker;
+    }
+
+    /// 【缓存】设置当前可用模块接口表（用于查 sig_hash）
+    pub fn setCurrentInterfaces(self: *TypeInferencer, ifaces: ?*const std.StringHashMap(cache_interface.ModuleInterface)) void {
+        self.current_interfaces = ifaces;
+    }
+
+    /// 【缓存】记录一次符号使用（去重，dupe 字符串）
+    fn recordSymbolUsage(self: *TypeInferencer, module_path: []const u8, symbol_name: []const u8, kind: cache_interface.SymbolKind) void {
+        const tracker = self.symbol_usage orelse return;
+        // 从当前模块接口缓存查 sig_hash
+        const sig_hash: u64 = if (self.current_interfaces) |ifaces| blk: {
+            if (ifaces.get(module_path)) |iface| {
+                break :blk iface.lookupHash(symbol_name, kind) orelse 0;
+            }
+            break :blk 0;
+        } else 0;
+        tracker.record(module_path, symbol_name, kind, sig_hash) catch {};
     }
 
     pub fn deinit(self: *TypeInferencer) void {
@@ -3196,6 +3225,8 @@ pub const TypeInferencer = struct {
                 if (self.exported_schemes.get(key)) |scheme| {
                     const import_name = item.alias orelse item.name;
                     env.redefine(import_name, scheme) catch {};
+                    // 【缓存】记录符号使用
+                    self.recordSymbolUsage(mod, item.name, .function);
                 }
             }
         } else {
@@ -3207,6 +3238,8 @@ pub const TypeInferencer = struct {
                 if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
                     const sym = entry.key_ptr.*[prefix.len..];
                     env.redefine(sym, entry.value_ptr.*) catch {};
+                    // 【缓存】记录符号使用
+                    self.recordSymbolUsage(mod, sym, .function);
                 }
             }
         }
