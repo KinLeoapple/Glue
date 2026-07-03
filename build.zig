@@ -350,24 +350,4 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_atomic_unit_tests.step);
     test_step.dependOn(&run_type_table_unit_tests.step);
     test_step.dependOn(&run_value_new_unit_tests.step);
-
-    // ============================================================
-    // bench-opt：value 优化前后对比基准
-    // ============================================================
-
-    const bench_opt_module = b.createModule(.{
-        .root_source_file = b.path("src/value/bench_opt.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    bench_opt_module.addImport("value", value_module);
-
-    const bench_opt_exe = b.addExecutable(.{
-        .name = "bench-opt",
-        .root_module = bench_opt_module,
-    });
-    b.installArtifact(bench_opt_exe);
-    const run_bench_opt = b.addRunArtifact(bench_opt_exe);
-    const bench_opt_step = b.step("bench-opt", "Run value optimization before/after benchmark");
-    bench_opt_step.dependOn(&run_bench_opt.step);
 }

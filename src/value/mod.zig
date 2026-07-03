@@ -28,9 +28,6 @@ const ast = @import("ast");
 // 子模块再导出
 // ============================================================
 
-pub const byte_array = @import("byte_array.zig");
-pub const ByteArray = byte_array.ByteArray;
-
 pub const int = @import("int.zig");
 pub const IntType = int.Type;
 pub const Int = int.Int;
@@ -674,7 +671,6 @@ pub fn promoteIntTypes(left: IntType, right: IntType) IntType {
 
 test {
     // 引用所有子模块以确保它们的 test 被收集
-    std.testing.refAllDecls(byte_array);
     std.testing.refAllDecls(int);
     std.testing.refAllDecls(float);
     std.testing.refAllDecls(char_mod);
