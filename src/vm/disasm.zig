@@ -138,6 +138,14 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             try print(buf, allocator, "{s} {s} argc={d}\n", .{ op.name(), @tagName(nat), argc });
             return offset + 3;
         },
+        // OP_CALL_MEMOIZED <u16 func_idx> <u8 argc> <u16 memo_slot>
+        .op_call_memoized => {
+            const func_idx = opcode.readU16(code, offset + 1);
+            const argc = code[offset + 3];
+            const memo_slot = opcode.readU16(code, offset + 4);
+            try print(buf, allocator, "{s} fn#{d} argc={d} memo_slot={d}\n", .{ op.name(), func_idx, argc, memo_slot });
+            return offset + 6;
+        },
         // i32 跳转偏移：同时打印解码后的绝对目标，便于核对回填
         .op_jump, .op_jump_if_false, .op_jump_if_true, .op_jump_if_not_null, .op_jump_if_null => {
             const rel = opcode.readI32(code, offset + 1);

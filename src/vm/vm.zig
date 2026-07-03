@@ -121,10 +121,26 @@ pub const CallFrame = struct {
     slot_base: usize,
     frame_base: usize,
     upvalues: []const Value = &.{},
+    /// 【JIT Phase 3】memoization slot（0xFFFF = 非.memoized 调用）。
+    /// op_call_memoized 建帧时填入，op_return 检查以决定是否缓存返回值。
+    memo_slot: u16 = 0xFFFF,
+    /// 【JIT Phase 3】缓存 key（参数 hash）。与 memo_slot 配对使用。
+    memo_arg_hash: u64 = 0,
 };
 
 /// 调用深度上限（防爆栈 / 无限递归）。
 const MAX_FRAMES: usize = 64 * 1024;
+
+/// 【JIT Phase 3】memoization 缓存条目。每个 op_call_memoized 调用点对应一个 slot。
+/// 【JIT Phase 3】memoization 缓存键：(memo_slot, arg_hash) 组合。
+/// memo_slot 标识函数（编译期分配），arg_hash 标识该函数的参数组合。
+const MemoKey = struct {
+    slot: u16,
+    arg_hash: u64,
+};
+
+/// 无效 memo_slot 标记（CallFrame.memo_slot 的默认值，表示非 memoized 调用）。
+const MEMO_SLOT_NONE: u16 = 0xFFFF;
 
 /// M5b：运行时类型名（镜像 eval.valueTypeName，纯 value→name）。供 type() native 用。
 fn valueTypeName(val: Value) []const u8 {
@@ -297,6 +313,10 @@ pub const VM = struct {
     /// 分配并以 unit 初始化；deinit 时 release 各槽。
     globals: std.ArrayListUnmanaged(Value) = .empty,
 
+    /// 【JIT Phase 3】memoization 缓存表。key = (memo_slot, arg_hash)，value = 缓存返回值。
+    /// 每个纯函数的每组唯一参数组合对应一个条目。deinit 时 release 所有缓存值。
+    memo_cache: std.AutoHashMapUnmanaged(MemoKey, Value) = .empty,
+
     /// VM profile：指向外部 Profiler（由 main.zig 创建并注入）。null 时不统计。
     /// opcode 计数覆盖所有嵌套 runLoop（含 forceLazy / invokeMethodBody / call）。
     profiler: ?*profiler_mod.Profiler = null,
@@ -341,6 +361,12 @@ pub const VM = struct {
         // M5g：release 全局变量槽。
         for (self.globals.items) |v| v.release(self.allocator);
         self.globals.deinit(self.allocator);
+        // JIT Phase 3：release memo_cache 中缓存的值（额外持有的引用）。
+        var memo_it = self.memo_cache.iterator();
+        while (memo_it.next()) |entry| {
+            entry.value_ptr.*.release(self.allocator);
+        }
+        self.memo_cache.deinit(self.allocator);
     }
 
     /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
@@ -1023,6 +1049,26 @@ pub const VM = struct {
                     stack_cap = self.stack.capacity;
                 },
 
+                // JIT Phase 3：memoized 纯函数调用。
+                .op_call_memoized => {
+                    const func_idx = opcode.readU16Ptr(ip_ptr);
+                    const argc = ip_ptr[2];
+                    const memo_slot = opcode.readU16Ptr(ip_ptr + 3);
+                    ip_ptr += 5;
+                    self.stack.items.len = stack_len;
+                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    try self.doCallMemoized(program, func_idx, argc, memo_slot, func.chunk.locAt(op_off));
+                    // doCallMemoized 缓存命中时不压新帧（结果已 push），未命中压新帧。两种情况都刷新缓存。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
+                    ip_ptr = code.ptr + frame.ip;
+                    stack_ptr = self.stack.items.ptr;
+                    stack_len = self.stack.items.len;
+                    stack_cap = self.stack.capacity;
+                },
+
                 // M2a：复合值 / 模式匹配。
                 .op_make_adt => {
                     const ctor_idx = opcode.readU16Ptr(ip_ptr);
@@ -1330,6 +1376,15 @@ pub const VM = struct {
                     const result = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     self.stack.items.len = stack_len;
                     frame.ip = @intCast(ip_ptr - code.ptr);
+                    // JIT Phase 3：若当前帧是 memoized 调用，缓存返回值（额外 retain 一份）。
+                    if (frame.memo_slot != MEMO_SLOT_NONE) {
+                        const key = MemoKey{ .slot = frame.memo_slot, .arg_hash = frame.memo_arg_hash };
+                        // 若已有旧缓存值，先 release
+                        if (self.memo_cache.fetchRemove(key)) |kv| {
+                            kv.value.release(self.allocator);
+                        }
+                        try self.memo_cache.put(self.allocator, key, result.retain());
+                    }
                     if (try self.frameReturn(result)) |entry_result| return entry_result;
                     // frameReturn 弹帧，刷新缓存切换到调用者帧。
                     frame = &self.frames.items[self.frames.items.len - 1];
@@ -1813,6 +1868,95 @@ pub const VM = struct {
         }
         const cur_upvalues = self.frames.items[self.frames.items.len - 1].upvalues;
         try self.frames.append(self.allocator, .{ .func = callee, .ip = 0, .slot_base = slot_base, .frame_base = slot_base, .upvalues = cur_upvalues });
+    }
+
+    /// 【JIT Phase 3】计算栈上 [stack_base..stack_base+argc) 个参数的 hash。
+    /// 纯函数的参数应为不可变值（Int/Float/Bool/Char/String 等）。
+    /// hash 策略：tag + 类型特化载荷（Int 的 lo/hi，Float 的 bits，String 的字节内容等）。
+    fn hashArgs(self: *const VM, argc: u8, stack_base: usize) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        var i: usize = 0;
+        while (i < argc) : (i += 1) {
+            const v = self.stack.items[stack_base + i];
+            // 先 hash tag（区分类型）
+            const tag = @intFromEnum(v);
+            hasher.update(std.mem.asBytes(&tag));
+            switch (v) {
+                .int => {
+                    // Int = {type, lo, hi}，hash lo+hi（type 已含在 tag 中足够区分）
+                    hasher.update(std.mem.asBytes(&v.int.lo));
+                    hasher.update(std.mem.asBytes(&v.int.hi));
+                },
+                .float => {
+                    // Float = {type, bits, extra}
+                    hasher.update(std.mem.asBytes(&v.float.bits));
+                    hasher.update(std.mem.asBytes(&v.float.extra));
+                },
+                .boolean => hasher.update(std.mem.asBytes(&v.boolean)),
+                .char => {
+                    const cp = v.char.codepoint;
+                    hasher.update(std.mem.asBytes(&cp));
+                },
+                .string => {
+                    // hash 字节内容（纯函数的字符串参数应不可变）
+                    hasher.update(v.string.bytes());
+                },
+                .null_val, .unit => {},
+                // 装箱复合类型：hash 整个 Value 的字节表示（含 union tag + 指针载荷）。
+                // padding 字节可能未初始化，但对于相同构造路径的值通常一致——保守安全。
+                else => hasher.update(std.mem.asBytes(&v)),
+            }
+        }
+        return hasher.final();
+    }
+
+    /// 【JIT Phase 3】执行 OP_CALL_MEMOIZED：纯函数调用，支持结果缓存。
+    /// 缓存命中 → 弹参数压缓存值，跳过函数体。
+    /// 缓存未命中 → 复用 doCall 建帧，在帧上记录 memo_slot + arg_hash 供 op_return 缓存。
+    fn doCallMemoized(
+        self: *VM,
+        program: *const Program,
+        func_idx: u16,
+        argc: u8,
+        memo_slot: u16,
+        loc: ast.SourceLocation,
+    ) VMError!void {
+        const callee = &program.functions.items[func_idx];
+        if (argc != callee.arity) return self.fail(loc, "wrong number of arguments", error.WrongArity);
+        if (self.frames.items.len >= MAX_FRAMES) return self.fail(loc, "stack overflow: call depth exceeded", error.StackOverflow);
+
+        const stack_base = self.stack.items.len - argc;
+        const arg_hash = self.hashArgs(argc, stack_base);
+        const key = MemoKey{ .slot = memo_slot, .arg_hash = arg_hash };
+
+        if (self.memo_cache.get(key)) |cached_val| {
+            // 缓存命中：弹参数（release），压缓存值（retain）
+            var i: u8 = 0;
+            while (i < argc) : (i += 1) {
+                self.stack.items[self.stack.items.len - 1].release(self.allocator);
+                self.stack.shrinkRetainingCapacity(self.stack.items.len - 1);
+            }
+            try self.push(cached_val.retain());
+            return;
+        }
+
+        // 缓存未命中：建帧执行函数体（复用 doCall 的建帧逻辑）
+        const slot_base = self.stack.items.len - argc;
+        const fill_count = callee.slot_count - callee.arity;
+        if (fill_count > 0) {
+            try self.stack.ensureUnusedCapacity(self.allocator, fill_count);
+            const fill_start = self.stack.items.len;
+            self.stack.items.len += fill_count;
+            @memset(self.stack.items[fill_start..fill_start + fill_count], Value.fromUnit());
+        }
+        try self.frames.append(self.allocator, .{
+            .func = callee,
+            .ip = 0,
+            .slot_base = slot_base,
+            .frame_base = slot_base,
+            .memo_slot = memo_slot,
+            .memo_arg_hash = arg_hash,
+        });
     }
 
     /// 执行 OP_TAIL_CALL：复用当前帧调用顶层 program.functions[func_idx]，不压新帧。

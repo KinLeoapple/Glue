@@ -547,3 +547,78 @@ VM 阶段吞吐（`--profile`，短基准用此指标）：
 **验证**：`zig build test` 全通过；`tests/specialization/arith_int` 集成测试在特化/非特化模式下输出完全一致；`--profile` 确认 8 种特化 opcode 均被正确生成和执行。
 **无行为变更**：特化 opcode 归一化后语义与通用 opcode 完全一致。
 
+### JIT Phase 2-5: 静态分析驱动优化（Purity + ConstProp + BranchElim + LoopAnalysis）(2026-07-03)
+**目标**：Phase 1 类型特化仅能跳过 tag 检查（icache 负收益已回退）。Phase 2-5 改为**减少指令数**：memoization 跳过整个调用帧、常量折叠消除算术 dispatch、死分支消除移除条件跳转。这是解释器唯一安全的优化策略。
+
+**架构**（5 个分析 pass + AnalysisDB 聚合 + 编译器查询）：
+- [src/sema/static_analysis/purity.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/purity.zig): PurityPass 不动点迭代标记纯/不纯函数（impure 内建：println/print/spawn/send/recv 等）
+- [src/sema/static_analysis/call_graph.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/call_graph.zig): CallGraphPass 构建 caller→callee 边（去重，callsTransitively 递归检测）
+- [src/sema/static_analysis/const_prop.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/const_prop.zig): ConstPropPass 函数内前向数据流，追踪 val 绑定的常量值（int/float/bool），evalBinary/evalUnary 编译期求值
+- [src/sema/static_analysis/branch_reach.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/branch_reach.zig): BranchReachPass 查询 ConstTable，标记 if_expr 条件为 always_true/always_false/runtime
+- [src/sema/static_analysis/loop_invariant.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/loop_invariant.zig): LoopInvariantPass 估计循环体指令数，标记 is_small（≤32 指令可展开）
+- [src/sema/static_analysis/analysis_db.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/analysis_db.zig): AnalysisDB 聚合所有 pass 结果，type_table 为借用引用
+- [src/loader/module_loader.zig](file:///d:/Projects/Zig/Glue/src/loader/module_loader.zig): prepareModuleInner 中按序运行 purity → const_prop → branch_reach → loop_invariant pass
+
+**Memoization 关键设计**（3 个 bug 修复）：
+1. **per-function memo_slot**（非 per-call-site）：`FnEntry.memo_slot` 字段懒分配，`getOrAssignMemoSlot` 保证同一函数所有调用点共享 slot。早期 per-call-site 实现导致 fib 的 `fib(n-1)` 和 `fib(n-2)` 用不同 slot，0 cache hit。
+2. **HashMap 缓存（非单 entry）**：`AutoHashMapUnmanaged(MemoKey, Value)`，key=(memo_slot, arg_hash)。早期单 MemoEntry per slot 导致 fib(5) 返回后被 fib(4) 覆盖，无法 hit。
+3. **类型安全 memoize**：`allParamsMemoizable` 仅当所有参数为基础类型（i8-i128/u8-u128/f16-f128/bool/char/str）时分配 slot。ADT/record/array 参数因 hashArgs 按指针 hash 不安全（record bench 曾因 Point 装箱指针 recycled 产生 false hit 返回错误结果 2000000 vs 正确 183631488）。
+
+**编译器改动**：
+- [src/vm/compiler.zig](file:///d:/Projects/Zig/Glue/src/vm/compiler.zig):
+  - `getOrAssignMemoSlot`: 纯函数 + 安全参数 → 分配 memo_slot，emit `op_call_memoized <func_idx> <argc> <memo_slot>`
+  - `branchInfo`: 查询 BranchTable，emitIf/emitTail 在 always_true 时只编译 then 分支，always_false 时只编译 else 分支（跳过 cond 求值 + jump + pop + 死分支体）
+- [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig):
+  - `MemoKey{slot, arg_hash}` + `memo_cache: AutoHashMapUnmanaged(MemoKey, Value)`
+  - `doCallMemoized`: hashArgs 计算 arg_hash，HashMap 查找命中则弹参数压缓存值（retain），未命中则建帧执行（frame.memo_slot/arg_hash 记录）
+  - `op_return`: 若 frame.memo_slot != NONE，缓存返回值（额外 retain，旧值 fetchRemove + release）
+  - `hashArgs`: Int(lo,hi) / Float(bits,extra) / Bool / Char(codepoint) / Str(bytes()) 按值 hash
+
+**收益**（ReleaseFast，VM-phase `--profile`，对比 Phase 1 特化基线）：
+
+| Benchmark | Phase 1 (基线) | Phase 2-5 (memo) | Delta | 备注 |
+|---|---|---|---|---|
+| fib    | 515.60 ms  150.39 M/s | **0.076 ms**  6.35 M/s | **-99.99%** ⚡ | memoization 把 O(2^n) 转 O(n)，63 次 op_call_memoized 全命中 |
+| tailcall | 97.46 ms  177.20 M/s | **30.71 ms**  169.37 M/s | **-68.5%** | 纯递归 helper memoize（10005 op_call_memoized） |
+| lookup | 927.81 ms  161.93 M/s | 925.01 ms  162.42 M/s | -0.3% (噪声) | 无纯函数可 memoize，无死分支 |
+| record | 585.37 ms  102.50 M/s | 584.03 ms  102.74 M/s | -0.2% (噪声) | ADT 参数被拒 memoize（正确性） |
+| float  | 1019.64 ms  32.49 M/s | 1013.44 ms  32.69 M/s | -0.6% (噪声) | 无纯函数可 memoize |
+| string | 32.81 ms  54.44 M/s | 31.91 ms  55.98 M/s | +2.8% | 微小常量折叠收益 |
+| closure | 45.74 ms  138.83 M/s | 45.37 ms  139.98 M/s | +0.8% (噪声) | 3 次 op_call_memoized |
+| array  | 18.02 ms  101.70 M/s | 18.09 ms  101.33 M/s | +0.4% (噪声) | 无纯函数 |
+
+**fib 深度分析**：
+- Phase 1 基线：77.5M 指令，515ms（O(2^n) 指数爆炸，7M 次 op_call）
+- Phase 2-5：484 指令，0.076ms（memoization 后仅 63 次 op_call_memoized 全命中，线性复杂度）
+- **指令数减少 99.9994%**（77.5M → 484），这是解释器优化的根本——减少指令数而非加速单指令
+
+**tailcall 分析**：
+- 纯递归 helper（如 `sumTo(n)`）被 memoize，10005 次 op_call_memoized 大量命中
+- 主循环仍走 op_tail_call（400118 次），memoization 仅作用于纯递归路径
+
+**正确性验证**：8 个 benchmark 结果全部正确（fib=2178309, tailcall=50500000, record=183631488, closure=17891650000, array=135, float=21081710.653035957, lookup=410780000, string=50000）。
+
+**验证**：`zig build test` 全通过（129 tests）；`zig build` Debug + ReleaseFast 均通过。
+**无行为变更**：memoization 仅对纯函数 + 基础类型参数生效，语义等价；死分支消除仅移除编译期不可达代码。
+
+### JIT Phase 4 补完: 常量 range 小循环展开 (2026-07-03)
+**目标**：Phase 4 的 LoopInvariantPass 已就位（标记 is_small），但编译器未消费。补完 `tryUnrollFor` 消费 LoopTable + ConstTable，对编译期已知迭代次数的小循环做完全展开，消除 `op_for_next` / 循环跳转 / index 递增开销。
+
+**实现**：
+- [src/vm/compiler.zig](file:///d:/Projects/Zig/Glue/src/vm/compiler.zig) `tryUnrollFor`：
+  1. 查询 `loopInfo(stmt)` 确认 `is_small`（≤32 估计指令）
+  2. 检查 iterable 为 `.binary` 且 op 为 `.range` / `.range_inclusive`
+  3. 查询 `constValue(bin.left/bin.right)` 获取上下界编译期整常量
+  4. 计算迭代次数（0 次直接跳过 body；>8 次回退标准循环）
+  5. `exprHasBreakOrContinue` 递归检测 body 无 break/continue（展开后跳转语义不兼容）
+  6. 逐轮发射 `const <i> → set_local var_slot → body → pop`
+- 辅助函数 `exprHasBreakOrContinue` / `stmtHasBreakOrContinue`：递归扫描 AST，不深入嵌套 for/while/loop（其 break/continue 属于嵌套循环）和 lambda（独立作用域）
+
+**展开条件**（全部满足才展开，否则回退标准 emitFor）：
+- iterable 为 `a..b` / `a..=b`，a/b 均为编译期整常量
+- 循环体估计指令数 ≤ 32
+- 迭代次数 1..=8（0 次 = 空循环直接消除）
+- body 无 break/continue
+
+**验证**：`edge_iterators` 测试含 5 个常量 range 循环（`5..5` 空范围、`1..=3` 3 次、`1..3` 2 次、`5..1` 空范围、`3..=3` 单次），全部正确输出。`--profile` 显示 37 次 `op_for_next`（来自数组/字符串迭代等非常量 range 循环），常量 range 循环已展开无 `op_for_next`。33 集成测试 + 129 单元测试 + 8 benchmark 全通过。
+

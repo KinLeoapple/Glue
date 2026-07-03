@@ -16,6 +16,7 @@ const value = @import("value");
 const opcode = @import("opcode.zig");
 const chunk_mod = @import("chunk.zig");
 const type_table_mod = @import("type_table");
+const analysis_db_mod = @import("analysis_db");
 
 /// 公开再导出，供 bench 驱动 / 外部入口通过本模块拿到 VM 与 Program（避免新建 build 图模块）。
 pub const VM = @import("vm.zig").VM;
@@ -67,6 +68,9 @@ const FnEntry = struct {
     idx: u16,
     arity: u16,
     param_types: []const ?[]const u8 = &.{},
+    /// 【JIT Phase 3】该纯函数的 memoization slot。
+    /// 0xFFFF = 未分配（非纯函数或尚未调用）；纯函数首次被调用时懒分配，所有调用点共享。
+    memo_slot: u16 = 0xFFFF,
 };
 
 /// ADT 构造器名 → (program.adt_ctors 索引, arity)。编译期识别裸名构造器调用 + match 校验。
@@ -111,6 +115,12 @@ pub const ModuleCompiler = struct {
     /// 【JIT Phase 1】类型表引用（null = 禁用特化，发射通用 opcode）。
     /// 由 main.zig 在编译前从 TypeInferencer.type_table 设置。
     type_table: ?*const type_table_mod.TypeTable = null,
+    /// 【JIT Phase 2】分析数据库引用（null = 禁用所有优化）。
+    /// 优先使用 analysis_db，type_table 作为 Phase 1 向后兼容回退。
+    analysis_db: ?*const analysis_db_mod.AnalysisDB = null,
+    /// 【JIT Phase 3】memoization slot 分配计数器。
+    /// 每个发射的 op_call_memoized 调用点分配唯一 slot，VM 用此索引 memo_cache。
+    next_memo_slot: u16 = 0,
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
         return .{ .program = Program.init(allocator), .allocator = allocator };
@@ -183,6 +193,71 @@ pub const ModuleCompiler = struct {
     pub fn lookupFnEntry(self: *ModuleCompiler, name: []const u8) ?FnEntry {
         for (self.fn_table.items) |e| {
             if (std.mem.eql(u8, e.name, name)) return e;
+        }
+        return null;
+    }
+
+    /// 【JIT Phase 2】查询表达式类型种类（优先从 analysis_db，回退到 type_table）
+    pub fn exprTypeKind(self: *const ModuleCompiler, expr: *const ast.Expr) ?type_table_mod.TypeKind {
+        if (self.analysis_db) |db| {
+            if (db.type_table) |tt| return tt.lookup(expr);
+        }
+        if (self.type_table) |tt| return tt.lookup(expr);
+        return null;
+    }
+
+    /// 【JIT Phase 2】查询函数是否纯（用于 memoization 决策）
+    pub fn isPureFn(self: *const ModuleCompiler, name: []const u8) bool {
+        if (self.analysis_db) |db| {
+            return db.purity.isPure(name);
+        }
+        return false;
+    }
+
+    /// 【JIT Phase 5】查询 if_expr 的分支可达性信息。
+    /// 返回 always_true/always_false 时编译器可跳过死分支（减少指令数）。
+    /// 返回 null 或 runtime 时按常规双分支发射。
+    pub fn branchInfo(self: *const ModuleCompiler, if_expr: *const ast.Expr) ?analysis_db_mod.BranchInfo {
+        if (self.analysis_db) |db| {
+            return db.branch_reach.lookup(if_expr);
+        }
+        return null;
+    }
+
+    /// 【JIT Phase 4】查询循环语句的大小信息（is_small/est_size）。
+    /// 用于决定是否展开循环体。
+    pub fn loopInfo(self: *const ModuleCompiler, stmt: *const ast.Stmt) ?analysis_db_mod.LoopInfo {
+        if (self.analysis_db) |db| {
+            return db.loop_invariant.lookup(stmt);
+        }
+        return null;
+    }
+
+    /// 【JIT Phase 4】查询表达式的常量值（从 ConstPropPass 结果）。
+    /// 用于循环展开时获取 range 上下界的编译期值。
+    pub fn constValue(self: *const ModuleCompiler, expr: *const ast.Expr) ?analysis_db_mod.ConstValue {
+        if (self.analysis_db) |db| {
+            return db.const_prop.lookup(expr);
+        }
+        return null;
+    }
+
+    /// 【JIT Phase 3】获取或分配纯函数的 memo_slot（per-function，所有调用点共享）。
+    /// 返回 null 表示该函数不是纯函数、未注册、或参数含非原始类型（不可安全 memoize）。
+    /// 仅当所有参数类型为基础类型（数值/bool/char/str）时才分配 slot，
+    /// 因为 hashArgs 对装箱复合类型（ADT/record/array）按指针 hash，会导致错误命中。
+    pub fn getOrAssignMemoSlot(self: *ModuleCompiler, name: []const u8) ?u16 {
+        if (!self.isPureFn(name)) return null;
+        for (self.fn_table.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                // 安全检查：所有参数必须为基础类型（可按值 hash）
+                if (!allParamsMemoizable(entry.param_types)) return null;
+                if (entry.memo_slot == 0xFFFF) {
+                    entry.memo_slot = self.next_memo_slot;
+                    self.next_memo_slot += 1;
+                }
+                return entry.memo_slot;
+            }
         }
         return null;
     }
@@ -661,6 +736,63 @@ pub const ModuleCompiler = struct {
     }
 };
 
+/// 【JIT Phase 4】递归检测表达式是否含 break/continue（属于当前循环上下文）。
+/// 不深入嵌套 for/while/loop（其 break/continue 属于嵌套循环）和 lambda（独立作用域）。
+fn exprHasBreakOrContinue(expr: *const ast.Expr) bool {
+    switch (expr.*) {
+        .block => |b| {
+            for (b.statements) |s| {
+                if (stmtHasBreakOrContinue(s)) return true;
+            }
+            if (b.trailing_expr) |te| return exprHasBreakOrContinue(te);
+            return false;
+        },
+        .if_expr => |i| {
+            if (exprHasBreakOrContinue(i.condition)) return true;
+            if (exprHasBreakOrContinue(i.then_branch)) return true;
+            if (i.else_branch) |e| return exprHasBreakOrContinue(e);
+            return false;
+        },
+        .binary => |bn| return exprHasBreakOrContinue(bn.left) or exprHasBreakOrContinue(bn.right),
+        .unary => |u| return exprHasBreakOrContinue(u.operand),
+        .call => |c| {
+            if (exprHasBreakOrContinue(c.callee)) return true;
+            for (c.arguments) |a| {
+                if (exprHasBreakOrContinue(a)) return true;
+            }
+            return false;
+        },
+        .match => |m| {
+            if (exprHasBreakOrContinue(m.scrutinee)) return true;
+            for (m.arms) |arm| {
+                if (arm.guard) |g| if (exprHasBreakOrContinue(g)) return true;
+                if (exprHasBreakOrContinue(arm.body)) return true;
+            }
+            return false;
+        },
+        // lambda 体是独立作用域，其中的 break/continue 不属于当前循环
+        .lambda => return false,
+        else => return false,
+    }
+}
+
+fn stmtHasBreakOrContinue(stmt: *const ast.Stmt) bool {
+    switch (stmt.*) {
+        .break_stmt, .continue_stmt => return true,
+        .val_decl => |v| return exprHasBreakOrContinue(v.value),
+        .var_decl => |v| return exprHasBreakOrContinue(v.value),
+        .assignment => |a| return exprHasBreakOrContinue(a.value),
+        .field_assignment => |fa| return exprHasBreakOrContinue(fa.value),
+        .compound_assignment => |ca| return exprHasBreakOrContinue(ca.value),
+        .expression => |e| return exprHasBreakOrContinue(e.expr),
+        .return_stmt => |r| if (r.value) |v| return exprHasBreakOrContinue(v) else return false,
+        .defer_stmt => |d| return exprHasBreakOrContinue(d.expr),
+        .throw_stmt => |t| return exprHasBreakOrContinue(t.expr),
+        // 嵌套循环：break/continue 属于嵌套循环本身，不属于当前循环
+        .for_stmt, .while_stmt, .loop_stmt => return false,
+    }
+}
+
 /// 单函数编译器：编译一个函数体到一个 Chunk。
 const FnCompiler = struct {
     chunk: Chunk,
@@ -843,7 +975,7 @@ const FnCompiler = struct {
                 }, loc);
             },
             .binary => |bin| try self.emitBinary(bin, loc),
-            .if_expr => |ie| try self.emitIf(ie, loc),
+            .if_expr => |ie| try self.emitIf(ie, expr, loc),
             .block => |blk| try self.emitBlock(blk, loc),
             .call => |c| try self.emitCall(c, loc),
             .lambda => |lam| _ = try self.emitLambda(lam, loc, null),
@@ -1306,6 +1438,22 @@ const FnCompiler = struct {
                 try self.chunk.writeOp(.op_return, loc);
             },
             .if_expr => |ie| {
+                // JIT Phase 5：尾位置也查询分支可达性，跳过死分支。
+                if (self.module.branchInfo(expr)) |info| {
+                    if (info == .always_true) {
+                        try self.emitTail(ie.then_branch);
+                        return;
+                    }
+                    if (info == .always_false) {
+                        if (ie.else_branch) |eb| {
+                            try self.emitTail(eb);
+                        } else {
+                            try self.chunk.writeOp(.op_unit, loc);
+                            try self.chunk.writeOp(.op_return, loc);
+                        }
+                        return;
+                    }
+                }
                 try self.emitExpr(ie.condition);
                 // if 语句 cond 总是消费：false 跳 else，两条路径各 pop。
                 const else_jump = try self.chunk.emitJump(.op_jump_if_false, loc);
@@ -1434,9 +1582,17 @@ const FnCompiler = struct {
                             }
                         }
                     }
-                    try self.chunk.writeOp(.op_call_rec, loc);
-                    try self.chunk.writeU16(self.rec_func_idx);
-                    try self.chunk.writeByte(argc);
+                    // JIT Phase 3: 纯递归函数 → op_call_memoized（自递归也受益）
+                    if (self.module.getOrAssignMemoSlot(name)) |memo_slot| {
+                        try self.chunk.writeOp(.op_call_memoized, loc);
+                        try self.chunk.writeU16(self.rec_func_idx);
+                        try self.chunk.writeByte(argc);
+                        try self.chunk.writeU16(memo_slot);
+                    } else {
+                        try self.chunk.writeOp(.op_call_rec, loc);
+                        try self.chunk.writeU16(self.rec_func_idx);
+                        try self.chunk.writeByte(argc);
+                    }
                     return;
                 }
             }
@@ -1466,9 +1622,17 @@ const FnCompiler = struct {
                             }
                         }
                     }
-                    try self.chunk.writeOp(.op_call, loc);
-                    try self.chunk.writeU16(func_idx);
-                    try self.chunk.writeByte(argc);
+                    // JIT Phase 3: 纯函数 → op_call_memoized
+                    if (self.module.getOrAssignMemoSlot(name)) |memo_slot| {
+                        try self.chunk.writeOp(.op_call_memoized, loc);
+                        try self.chunk.writeU16(func_idx);
+                        try self.chunk.writeByte(argc);
+                        try self.chunk.writeU16(memo_slot);
+                    } else {
+                        try self.chunk.writeOp(.op_call, loc);
+                        try self.chunk.writeU16(func_idx);
+                        try self.chunk.writeByte(argc);
+                    }
                     return;
                 }
                 // M2a：ADT 构造器裸名调用 → OP_MAKE_ADT。
@@ -1622,7 +1786,25 @@ const FnCompiler = struct {
         return fallback;
     }
 
-    fn emitIf(self: *FnCompiler, ie: @TypeOf(@as(Expr, undefined).if_expr), loc: ast.SourceLocation) CompileError!void {
+    fn emitIf(self: *FnCompiler, ie: @TypeOf(@as(Expr, undefined).if_expr), if_expr_ptr: *const Expr, loc: ast.SourceLocation) CompileError!void {
+        // JIT Phase 5：查询分支可达性，若条件为编译期常量则跳过死分支。
+        if (self.module.branchInfo(if_expr_ptr)) |info| {
+            if (info == .always_true) {
+                // 条件恒真：只编译 then 分支（不发射 cond/jump/else）
+                try self.emitExpr(ie.then_branch);
+                return;
+            }
+            if (info == .always_false) {
+                // 条件恒假：只编译 else 分支（或 unit）
+                if (ie.else_branch) |eb| {
+                    try self.emitExpr(eb);
+                } else {
+                    try self.chunk.writeOp(.op_unit, loc);
+                }
+                return;
+            }
+        }
+        // 运行时分支：常规双分支发射
         try self.emitExpr(ie.condition);
         // if 语句 cond 总是消费：false 跳 else，两条路径各 pop。
         const else_jump = try self.chunk.emitJump(.op_jump_if_false, loc);
@@ -1996,7 +2178,7 @@ const FnCompiler = struct {
             },
             .while_stmt => |w| try self.emitWhile(w),
             .loop_stmt => |l| try self.emitLoop(l),
-            .for_stmt => |f| try self.emitFor(f),
+            .for_stmt => |f| try self.emitFor(f, stmt),
             .break_stmt => |b| {
                 if (self.loops.items.len == 0) return error.Unsupported;
                 const lc = &self.loops.items[self.loops.items.len - 1];
@@ -2076,7 +2258,11 @@ const FnCompiler = struct {
     /// for x in iter { body }（M3d）：iter 求值存隐藏 slot，index slot 初始化 0；
     /// loop_start(=continue 目标): OP_FOR_NEXT iter,idx,exit → 耗尽跳 exit；否则压元素 → 绑 x → body → 弹 → 回跳。
     /// iter 支持 array/range/string（VM doForNext 运行时分派）。复用 break/continue 机制。
-    fn emitFor(self: *FnCompiler, f: @TypeOf(@as(Stmt, undefined).for_stmt)) CompileError!void {
+    fn emitFor(self: *FnCompiler, f: @TypeOf(@as(Stmt, undefined).for_stmt), stmt: *const Stmt) CompileError!void {
+        // JIT Phase 4：小循环 + 常量 range → 展开（消除 op_for_next / 循环跳转开销）
+        if (self.tryUnrollFor(f, stmt)) |_| {
+            return;
+        } else |_| {}
         const loc = f.location;
         const saved = self.locals.items.len;
         // 隐藏 slot：iterable 值 + index（i64，初始 0）。
@@ -2113,6 +2299,73 @@ const FnCompiler = struct {
         defer lc.breaks.deinit(self.allocator);
         for (lc.breaks.items) |j| self.chunk.patchJump(j);
         self.locals.shrinkRetainingCapacity(saved);
+    }
+
+    /// 【JIT Phase 4】尝试展开常量 range 小循环。
+    /// 条件：iterable 为 a..b / a..=b 且 a,b 均为编译期整常量；
+    ///       循环体 is_small（≤32 估计指令）；迭代次数 1..=8；无 break/continue。
+    /// 成功展开返回，失败返回 error.SkipUnroll（调用方回退到标准 emitFor）。
+    const UnrollError = error{ SkipUnroll, OutOfMemory, Unsupported };
+
+    fn tryUnrollFor(self: *FnCompiler, f: @TypeOf(@as(Stmt, undefined).for_stmt), stmt: *const Stmt) UnrollError!void {
+        // 1. 检查循环体是否小到可展开
+        const info = self.module.loopInfo(stmt) orelse return error.SkipUnroll;
+        if (!info.is_small) return error.SkipUnroll;
+
+        // 2. 检查 iterable 是否为 range / range_inclusive 二元表达式
+        if (f.iterable.* != .binary) return error.SkipUnroll;
+        const bin = f.iterable.binary;
+        const is_inclusive = switch (bin.op) {
+            .range => false,
+            .range_inclusive => true,
+            else => return error.SkipUnroll,
+        };
+
+        // 3. 查询上下界的常量值（必须为整常量）
+        const start_cv = self.module.constValue(bin.left) orelse return error.SkipUnroll;
+        const end_cv = self.module.constValue(bin.right) orelse return error.SkipUnroll;
+        if (start_cv != .int_val or end_cv != .int_val) return error.SkipUnroll;
+
+        // 4. 转为 i64 并计算迭代次数
+        const start_i128 = start_cv.int_val;
+        const end_i128 = end_cv.int_val;
+        // 拒绝超出 i64 范围的常量（保守）
+        if (start_i128 < std.math.minInt(i64) or start_i128 > std.math.maxInt(i64)) return error.SkipUnroll;
+        if (end_i128 < std.math.minInt(i64) or end_i128 > std.math.maxInt(i64)) return error.SkipUnroll;
+        const start: i64 = @intCast(start_i128);
+        const end: i64 = @intCast(end_i128);
+
+        const count: u64 = if (is_inclusive)
+            if (end < start) 0 else @intCast(end - start + 1)
+        else
+            if (end <= start) 0 else @intCast(end - start);
+
+        // 5. 安全限制：1..=8 次迭代（0 次 = 空循环直接跳过 body）
+        if (count == 0) return; // 空循环：不发射任何指令（常量 range 无副作用）
+        if (count > 8) return error.SkipUnroll;
+
+        // 6. 检查 body 不含 break/continue（展开后跳转语义不兼容）
+        if (exprHasBreakOrContinue(f.body)) return error.SkipUnroll;
+
+        // 7. 展开：声明循环变量 slot，逐轮发射 const + set_local + body + pop
+        const loc = f.location;
+        const saved = self.locals.items.len;
+        defer self.locals.shrinkRetainingCapacity(saved);
+        const var_slot = try self.declareLocal(f.name, true, true, null);
+
+        var i: i64 = start;
+        const last: i64 = if (is_inclusive) end else end - 1;
+        while (i <= last) : (i += 1) {
+            // 绑定循环变量 = i
+            const val = Value.fromInt(value.Int.fromNative(.i64, i));
+            const cidx = try self.chunk.addConstant(val);
+            try self.emitConst(cidx, loc);
+            try self.chunk.writeOp(.op_set_local, loc);
+            try self.chunk.writeU16(var_slot);
+            // 循环体（值丢弃）
+            try self.emitExpr(f.body);
+            try self.chunk.writeOp(.op_pop, loc);
+        }
     }
 
     /// loop { body }：无限循环，仅 break 退出。
@@ -2523,6 +2776,22 @@ fn isBuiltinNumericType(name: []const u8) bool {
 fn isBuiltinType(name: []const u8) bool {
     if (isBuiltinNumericType(name)) return true;
     return std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "char");
+}
+
+/// 【JIT Phase 3】判断类型名是否可安全 memoize（按值 hash，不含指针）。
+/// 基础类型 + str（String 的 bytes() 内容 hash）均为安全。
+fn isMemoizableType(name: []const u8) bool {
+    return isBuiltinType(name) or std.mem.eql(u8, name, "str");
+}
+
+/// 【JIT Phase 3】检查函数所有参数类型是否均可安全 memoize。
+/// param_types[i] 为 null 表示无类型注解（动态类型），保守视为不安全。
+fn allParamsMemoizable(param_types: []const ?[]const u8) bool {
+    for (param_types) |pt| {
+        const t = pt orelse return false;
+        if (!isMemoizableType(t)) return false;
+    }
+    return true;
 }
 
 /// 从类型注解提取基础类型名（非基础类型/无注解返回 null）。

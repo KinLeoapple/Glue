@@ -457,10 +457,11 @@ fn tryRunOnVM(
 
     // 编译模块 → Program
     var mc = vm.ModuleCompiler.init(allocator);
-    // JIT Phase 1: wire type_table from TypeInferencer to ModuleCompiler
+    // JIT Phase 2: wire AnalysisDB (含 type_table 引用) from ModuleLoader to ModuleCompiler
     // --no-specialize 时留空（null），编译器全部回退到通用 opcode
     if (!no_specialize) {
-        mc.type_table = &loader.type_inferencer.type_table;
+        loader.analysis_db.type_table = &loader.type_inferencer.type_table;
+        mc.analysis_db = &loader.analysis_db;
     }
     defer mc.deinit();
     defer mc.program.deinit();

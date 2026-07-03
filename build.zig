@@ -110,6 +110,16 @@ pub fn build(b: *std.Build) void {
     });
     type_table_module.addImport("ast", ast_module);
 
+    // analysis_db 模块：JIT 静态分析数据库（purity/call_graph/const_prop 等）。
+    // 依赖 type_table（借用引用）和 ast。供 vm/compiler 和 loader 查询优化决策。
+    const analysis_db_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/static_analysis/analysis_db.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    analysis_db_module.addImport("ast", ast_module);
+    analysis_db_module.addImport("type_table", type_table_module);
+
     const type_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/type_check.zig"),
         .target = target,
@@ -194,6 +204,7 @@ pub fn build(b: *std.Build) void {
     module_loader_module.addImport("resolve", resolve_module);
     module_loader_module.addImport("intern", intern_module);
     module_loader_module.addImport("stdlib", stdlib_module);
+    module_loader_module.addImport("analysis_db", analysis_db_module);
 
     // ============================================================
     // vm/ sub-modules（字节码 VM — docs/bytecode-vm-plan.md）
@@ -212,6 +223,7 @@ pub fn build(b: *std.Build) void {
     vm_module.addImport("parser", parser_module);
     vm_module.addImport("profiler", profiler_module);
     vm_module.addImport("type_table", type_table_module);
+    vm_module.addImport("analysis_db", analysis_db_module);
 
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -323,6 +335,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_type_table_unit_tests = b.addRunArtifact(type_table_unit_tests);
 
+    const analysis_db_unit_tests = b.addTest(.{
+        .root_module = analysis_db_module,
+    });
+    const run_analysis_db_unit_tests = b.addRunArtifact(analysis_db_unit_tests);
+
     // ============================================================
     // value_new 模块（自定义基础类型，独立 standalone）
     // ============================================================
@@ -349,5 +366,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_vm_unit_tests.step);
     test_step.dependOn(&run_atomic_unit_tests.step);
     test_step.dependOn(&run_type_table_unit_tests.step);
+    test_step.dependOn(&run_analysis_db_unit_tests.step);
     test_step.dependOn(&run_value_new_unit_tests.step);
 }

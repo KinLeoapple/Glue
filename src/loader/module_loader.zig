@@ -19,6 +19,7 @@ const type_check = @import("sema");
 const resolve = @import("resolve");
 const intern_mod = @import("intern");
 const stdlib = @import("stdlib");
+const analysis_db_mod = @import("analysis_db");
 
 /// stdlib 目录的合成标记
 const STDLIB_DIR_MARKER = "<stdlib>";
@@ -30,6 +31,9 @@ pub const ModuleLoader = struct {
 
     /// 类型推断器（负责类型检查）
     type_inferencer: type_check.TypeInferencer,
+
+    /// JIT 分析数据库（Phase 2+：purity/call_graph/const_prop 等）
+    analysis_db: analysis_db_mod.AnalysisDB,
 
     /// 字符串内部化器
     interner: intern_mod.Interner,
@@ -51,6 +55,7 @@ pub const ModuleLoader = struct {
             .allocator = allocator,
             .io = io,
             .type_inferencer = type_check.TypeInferencer.init(allocator),
+            .analysis_db = analysis_db_mod.AnalysisDB.init(allocator),
             .interner = intern_mod.Interner.init(allocator),
             .current_source_dir = null,
             .loading_modules = std.StringHashMap(void).init(allocator),
@@ -87,6 +92,7 @@ pub const ModuleLoader = struct {
 
         // 清理类型检查器和相关组件
         self.type_inferencer.deinit();
+        self.analysis_db.deinit();
         self.interner.deinit();
     }
 
@@ -151,6 +157,61 @@ pub const ModuleLoader = struct {
 
         // Resolve (处理标识符解析)
         try resolve.resolveModule(&module, &self.interner);
+
+        // JIT Phase 2: 运行纯度分析 pass
+        {
+            var purity_pass = analysis_db_mod.purity.PurityPass.init(self.allocator);
+            defer purity_pass.deinit();
+            purity_pass.analyzeModule(&module) catch {};
+
+            // 合并结果到 analysis_db.purity
+            var it = purity_pass.table.entries.iterator();
+            while (it.next()) |entry| {
+                self.analysis_db.purity.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+        }
+
+        // JIT Phase 3: 运行常量传播 pass
+        {
+            var cp_pass = analysis_db_mod.const_prop.ConstPropPass.init(self.allocator);
+            defer cp_pass.deinit();
+            cp_pass.analyzeModule(&module) catch {};
+
+            // 合并结果到 analysis_db.const_prop
+            var it = cp_pass.table.entries.iterator();
+            while (it.next()) |entry| {
+                self.analysis_db.const_prop.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+        }
+
+        // JIT Phase 5: 运行分支可达性 pass（查询 const_prop 结果）
+        {
+            var br_pass = analysis_db_mod.branch_reach.BranchReachPass.init(
+                self.allocator,
+                &self.analysis_db.const_prop,
+            );
+            defer br_pass.deinit();
+            br_pass.analyzeModule(&module) catch {};
+
+            // 合并结果到 analysis_db.branch_reach
+            var it = br_pass.table.entries.iterator();
+            while (it.next()) |entry| {
+                self.analysis_db.branch_reach.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+        }
+
+        // JIT Phase 4: 运行循环不变量 pass（估计循环体大小，标记可展开）
+        {
+            var li_pass = analysis_db_mod.loop_invariant.LoopInvariantPass.init(self.allocator);
+            defer li_pass.deinit();
+            li_pass.analyzeModule(&module) catch {};
+
+            // 合并结果到 analysis_db.loop_invariant
+            var it = li_pass.table.entries.iterator();
+            while (it.next()) |entry| {
+                self.analysis_db.loop_invariant.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+        }
     }
 
     /// 从文件或 stdlib 加载模块

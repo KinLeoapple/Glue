@@ -106,6 +106,12 @@ pub const OpCode = enum(u8) {
     /// argc 个实参在栈顶；分派后整段实参被替换为单个返回值（多数内建返回 unit）。
     /// native_id 见 Native 枚举。M1 仅接 println/print 以驱动 bench 端到端。
     op_call_native,
+    /// OP_CALL_MEMOIZED <u16 func_idx> <u8 argc> <u16 memo_slot>（JIT Phase 3）：
+    /// 调用纯函数，结果缓存在 memo_cache[memo_slot]。
+    /// 首次调用：执行函数体，返回时缓存结果。
+    /// 后续调用：若参数 hash 命中缓存，直接返回缓存值（跳过整个函数体）。
+    /// 仅编译器对纯函数发射。memo_slot 由编译器分配，每个调用点唯一。
+    op_call_memoized,
     /// 弹返回值，结束当前帧：释放本帧局部槽，弹 CallFrame，把返回值压回调用者栈。
     op_return,
 
