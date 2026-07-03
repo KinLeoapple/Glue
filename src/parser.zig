@@ -36,12 +36,10 @@ pub const Parser = struct {
     tokens: []lexer.Token,
     current: usize,
     allocator: std.mem.Allocator,
+    /// 【优化】AST 节点 arena：所有 allocExpr/allocStmt/allocType/allocPattern/allocKind
+    /// 从此 arena 分配，deinit 时一次性释放，避免数百次逐个 destroy + 追踪 ArrayList 开销。
+    arena: std.heap.ArenaAllocator,
     errors: std.ArrayList(ParseError),
-    allocated_exprs: std.ArrayList(*ast.Expr),
-    allocated_stmts: std.ArrayList(*ast.Stmt),
-    allocated_types: std.ArrayList(*ast.TypeNode),
-    allocated_patterns: std.ArrayList(*ast.Pattern),
-    allocated_kinds: std.ArrayList(*ast.Kind),
     /// 是否拥有 tokens 缓冲（init 复制以便就地拆分 `>=`/`>>`，deinit 释放）
     owns_tokens: bool,
 
@@ -55,12 +53,8 @@ pub const Parser = struct {
             .tokens = owned orelse @constCast(tokens),
             .current = 0,
             .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
             .errors = .empty,
-            .allocated_exprs = .empty,
-            .allocated_stmts = .empty,
-            .allocated_types = .empty,
-            .allocated_patterns = .empty,
-            .allocated_kinds = .empty,
             .owns_tokens = owned != null,
         };
     }
@@ -69,26 +63,7 @@ pub const Parser = struct {
     pub fn deinit(self: *Parser) void {
         if (self.owns_tokens) self.allocator.free(self.tokens);
         self.errors.deinit(self.allocator);
-        for (self.allocated_exprs.items) |ptr| {
-            self.allocator.destroy(ptr);
-        }
-        self.allocated_exprs.deinit(self.allocator);
-        for (self.allocated_stmts.items) |ptr| {
-            self.allocator.destroy(ptr);
-        }
-        self.allocated_stmts.deinit(self.allocator);
-        for (self.allocated_types.items) |ptr| {
-            self.allocator.destroy(ptr);
-        }
-        self.allocated_types.deinit(self.allocator);
-        for (self.allocated_patterns.items) |ptr| {
-            self.allocator.destroy(ptr);
-        }
-        self.allocated_patterns.deinit(self.allocator);
-        for (self.allocated_kinds.items) |ptr| {
-            self.allocator.destroy(ptr);
-        }
-        self.allocated_kinds.deinit(self.allocator);
+        self.arena.deinit();
     }
 
     // --------------------------------------------------------
@@ -225,37 +200,32 @@ pub const Parser = struct {
     // --------------------------------------------------------
 
     fn allocExpr(self: *Parser, expr: ast.Expr) ParserError!*ast.Expr {
-        const ptr = try self.allocator.create(ast.Expr);
+        const ptr = try self.arena.allocator().create(ast.Expr);
         ptr.* = expr;
-        self.allocated_exprs.append(self.allocator, ptr) catch {};
         return ptr;
     }
 
     fn allocStmt(self: *Parser, stmt: ast.Stmt) ParserError!*ast.Stmt {
-        const ptr = try self.allocator.create(ast.Stmt);
+        const ptr = try self.arena.allocator().create(ast.Stmt);
         ptr.* = stmt;
-        self.allocated_stmts.append(self.allocator, ptr) catch {};
         return ptr;
     }
 
     fn allocType(self: *Parser, ty: ast.TypeNode) ParserError!*ast.TypeNode {
-        const ptr = try self.allocator.create(ast.TypeNode);
+        const ptr = try self.arena.allocator().create(ast.TypeNode);
         ptr.* = ty;
-        self.allocated_types.append(self.allocator, ptr) catch {};
         return ptr;
     }
 
     fn allocPattern(self: *Parser, pat: ast.Pattern) ParserError!*ast.Pattern {
-        const ptr = try self.allocator.create(ast.Pattern);
+        const ptr = try self.arena.allocator().create(ast.Pattern);
         ptr.* = pat;
-        self.allocated_patterns.append(self.allocator, ptr) catch {};
         return ptr;
     }
 
     fn allocKind(self: *Parser, kind: ast.Kind) ParserError!*ast.Kind {
-        const ptr = try self.allocator.create(ast.Kind);
+        const ptr = try self.arena.allocator().create(ast.Kind);
         ptr.* = kind;
-        self.allocated_kinds.append(self.allocator, ptr) catch {};
         return ptr;
     }
 

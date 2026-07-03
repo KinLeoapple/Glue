@@ -73,6 +73,8 @@ pub const BranchReachPass = struct {
 
     /// 遍历模块所有 if_expr，查询条件是否为常量布尔
     pub fn analyzeModule(self: *BranchReachPass, module: *const ast.Module) !void {
+        // 【优化】const_table 为空时所有 if 条件必然非常量，跳过整个遍历
+        if (self.const_table.isEmpty()) return;
         for (module.declarations) |decl| {
             if (decl != .fun_decl) continue;
             try self.analyzeExpr(decl.fun_decl.body);

@@ -278,7 +278,7 @@ pub const Lexer = struct {
 
     /// 初始化词法分析器
     pub fn init(allocator: std.mem.Allocator, source: []const u8) Lexer {
-        return Lexer{
+        var lexer = Lexer{
             .source = source,
             .position = 0,
             .line = 1,
@@ -286,6 +286,10 @@ pub const Lexer = struct {
             .tokens = .empty,
             .allocator = allocator,
         };
+        // 【优化】按 source.len / 5 预分配 tokens 容量（平均 token ~5 字节），避免多次 2x 增长
+        const est_tokens = source.len / 5 + 16;
+        lexer.tokens.ensureTotalCapacity(allocator, est_tokens) catch {};
+        return lexer;
     }
 
     /// 释放词法分析器资源
@@ -1204,40 +1208,43 @@ fn isIdentifierContinue(ch: u8) bool {
     return isIdentifierStart(ch) or isDigit(ch);
 }
 
-/// 关键字映射表
+/// 关键字映射表（StaticStringMap 完美哈希，O(1) 查找）
+const KEYWORDS = std.StaticStringMap(TokenType).initComptime(.{
+    .{ "fun", .kw_fun },
+    .{ "type", .kw_type },
+    .{ "trait", .kw_trait },
+    .{ "override", .kw_override },
+    .{ "pack", .kw_pack },
+    .{ "pub", .kw_pub },
+    .{ "import", .kw_import },
+    .{ "with", .kw_with },
+    .{ "as", .kw_as },
+    .{ "val", .kw_val },
+    .{ "var", .kw_var },
+    .{ "match", .kw_match },
+    .{ "if", .kw_if },
+    .{ "else", .kw_else },
+    .{ "spawn", .kw_spawn },
+    .{ "channel", .kw_channel },
+    .{ "select", .kw_select },
+    .{ "atomic", .kw_atomic },
+    .{ "loop", .kw_loop },
+    .{ "for", .kw_for },
+    .{ "in", .kw_in },
+    .{ "while", .kw_while },
+    .{ "break", .kw_break },
+    .{ "continue", .kw_continue },
+    .{ "true", .true_literal },
+    .{ "false", .false_literal },
+    .{ "null", .null_literal },
+    .{ "return", .kw_return },
+    .{ "throw", .kw_throw },
+    .{ "lazy", .kw_lazy },
+    .{ "defer", .kw_defer },
+});
+
 fn keywordType(text: []const u8) TokenType {
-    if (std.mem.eql(u8, text, "fun")) return .kw_fun;
-    if (std.mem.eql(u8, text, "type")) return .kw_type;
-    if (std.mem.eql(u8, text, "trait")) return .kw_trait;
-    if (std.mem.eql(u8, text, "override")) return .kw_override;
-    if (std.mem.eql(u8, text, "pack")) return .kw_pack;
-    if (std.mem.eql(u8, text, "pub")) return .kw_pub;
-    if (std.mem.eql(u8, text, "import")) return .kw_import;
-    if (std.mem.eql(u8, text, "with")) return .kw_with;
-    if (std.mem.eql(u8, text, "as")) return .kw_as;
-    if (std.mem.eql(u8, text, "val")) return .kw_val;
-    if (std.mem.eql(u8, text, "var")) return .kw_var;
-    if (std.mem.eql(u8, text, "match")) return .kw_match;
-    if (std.mem.eql(u8, text, "if")) return .kw_if;
-    if (std.mem.eql(u8, text, "else")) return .kw_else;
-    if (std.mem.eql(u8, text, "spawn")) return .kw_spawn;
-    if (std.mem.eql(u8, text, "channel")) return .kw_channel;
-    if (std.mem.eql(u8, text, "select")) return .kw_select;
-    if (std.mem.eql(u8, text, "atomic")) return .kw_atomic;
-    if (std.mem.eql(u8, text, "loop")) return .kw_loop;
-    if (std.mem.eql(u8, text, "for")) return .kw_for;
-    if (std.mem.eql(u8, text, "in")) return .kw_in;
-    if (std.mem.eql(u8, text, "while")) return .kw_while;
-    if (std.mem.eql(u8, text, "break")) return .kw_break;
-    if (std.mem.eql(u8, text, "continue")) return .kw_continue;
-    if (std.mem.eql(u8, text, "true")) return .true_literal;
-    if (std.mem.eql(u8, text, "false")) return .false_literal;
-    if (std.mem.eql(u8, text, "null")) return .null_literal;
-    if (std.mem.eql(u8, text, "return")) return .kw_return;
-    if (std.mem.eql(u8, text, "throw")) return .kw_throw;
-    if (std.mem.eql(u8, text, "lazy")) return .kw_lazy;
-    if (std.mem.eql(u8, text, "defer")) return .kw_defer;
-    return .identifier;
+    return KEYWORDS.get(text) orelse .identifier;
 }
 
 /// 判断是否为有效的整数类型后缀

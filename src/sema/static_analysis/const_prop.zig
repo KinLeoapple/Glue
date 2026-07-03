@@ -54,6 +54,48 @@ pub const ConstTable = struct {
     }
 };
 
+/// 【优化 #11】链式常量环境：block 嵌套时 child 仅存本地绑定，查找沿 parent 链回溯。
+/// 原实现每进 block 都把父 env 全量复制到 child（O(N) per block，深嵌套 O(depth²)）；
+/// 链式实现 O(1) 进出 block，查找 O(depth)，整体更优。
+pub const ConstEnv = struct {
+    parent: ?*ConstEnv,
+    locals: std.StringHashMap(ConstValue),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, parent: ?*ConstEnv) ConstEnv {
+        return .{
+            .parent = parent,
+            .locals = std.StringHashMap(ConstValue).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *ConstEnv) void {
+        self.locals.deinit();
+    }
+
+    /// 沿父链查找；本地优先（shadow 父级同名绑定）。
+    pub fn get(self: *const ConstEnv, name: []const u8) ?ConstValue {
+        var cur: ?*const ConstEnv = self;
+        while (cur) |e| {
+            if (e.locals.get(name)) |v| return v;
+            cur = e.parent;
+        }
+        return null;
+    }
+
+    /// 写入本地层（shadow 父级同名绑定）。
+    pub fn put(self: *ConstEnv, name: []const u8, val: ConstValue) !void {
+        try self.locals.put(name, val);
+    }
+
+    /// 仅删本地层绑定；var 赋值后不再视为常量。父级同名绑定（若有）不受影响——
+    /// 但 val 不可变，故父级绝不会出现同名的常量绑定被赋值的情况，逻辑等价于原实现。
+    pub fn remove(self: *ConstEnv, name: []const u8) void {
+        _ = self.locals.remove(name);
+    }
+};
+
 /// Pass 1：常量传播分析器
 pub const ConstPropPass = struct {
     table: ConstTable,
@@ -74,13 +116,13 @@ pub const ConstPropPass = struct {
         for (module.declarations) |decl| {
             if (decl != .fun_decl) continue;
             // 每个函数独立分析（不跨函数传播）
-            var env = std.StringHashMap(ConstValue).init(self.allocator);
+            var env = ConstEnv.init(self.allocator, null);
             defer env.deinit();
             try self.analyzeExpr(decl.fun_decl.body, &env);
         }
     }
 
-    fn analyzeExpr(self: *ConstPropPass, expr: *const ast.Expr, env: *std.StringHashMap(ConstValue)) anyerror!void {
+    fn analyzeExpr(self: *ConstPropPass, expr: *const ast.Expr, env: *ConstEnv) anyerror!void {
         switch (expr.*) {
             .int_literal => |il| {
                 const val = parseIntLiteral(self.allocator, il.raw) orelse ConstValue.unknown;
@@ -125,14 +167,10 @@ pub const ConstPropPass = struct {
                 if (i.else_branch) |e| try self.analyzeExpr(e, env);
             },
             .block => |b| {
-                // 块内 val 绑定加入 child env（不污染父环境）
-                var child_env = std.StringHashMap(ConstValue).init(self.allocator);
+                // 【优化 #11】链式 env：child 仅存本地绑定，沿 parent 链回溯查找，
+                // 不再全量复制父 env。O(1) 进出 block，深嵌套从 O(depth²) 降至 O(depth)。
+                var child_env = ConstEnv.init(self.allocator, env);
                 defer child_env.deinit();
-                // 继承父环境
-                var it = env.iterator();
-                while (it.next()) |entry| {
-                    try child_env.put(entry.key_ptr.*, entry.value_ptr.*);
-                }
                 for (b.statements) |s| {
                     try self.analyzeStmt(s, &child_env);
                 }
@@ -147,7 +185,7 @@ pub const ConstPropPass = struct {
         }
     }
 
-    fn analyzeStmt(self: *ConstPropPass, stmt: *const ast.Stmt, env: *std.StringHashMap(ConstValue)) anyerror!void {
+    fn analyzeStmt(self: *ConstPropPass, stmt: *const ast.Stmt, env: *ConstEnv) anyerror!void {
         switch (stmt.*) {
             .val_decl => |v| {
                 try self.analyzeExpr(v.value, env);

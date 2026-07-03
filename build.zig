@@ -291,6 +291,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("profiler", profiler_module);
     root_module.addImport("vm", vm_module);
     root_module.addImport("cache", cache_module);
+    root_module.addImport("sema", type_check_module);
 
     // Create glue executable
     const exe = b.addExecutable(.{

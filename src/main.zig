@@ -9,6 +9,7 @@ const slab_pool = @import("slab_pool");
 const vm = @import("vm");
 const profiler = @import("profiler");
 const cache_mod = @import("cache");
+const type_check = @import("sema");
 
 /// 把求值器错误映射为专业英文消息（Go/Java 风格）。
 /// 若求值器已经设置了带上下文的 panic_message（如 "no method 'x' on type 'array'"），
@@ -451,6 +452,22 @@ fn tryRunOnVM(
         return .failed;
     }
 
+    // 【whole-program cache】尝试从缓存加载合并后 Program（命中则跳过 prepareModule + compile）
+    if (loader.cache_store) |store| {
+        if (store.enabled) {
+            if (tryLoadWholeProgram(allocator, store, io, module, filename)) |cached_program| {
+                // 缓存命中：直接执行
+                var program = cached_program;
+                defer program.deinit();
+                const entry = program.entry orelse {
+                    printError(io, "{s}: error: cached program has no entry\n", .{filename});
+                    return .failed;
+                };
+                return runProgram(allocator, value_allocator, io, &program, entry, filename);
+            }
+        }
+    }
+
     // 准备阶段：use 预加载 + 类型检查 + resolve
     prof.phaseBegin(.type_check);
     loader.prepareModule(module) catch |err| switch (err) {
@@ -514,12 +531,168 @@ fn tryRunOnVM(
         return .failed;
     };
 
+    // 【whole-program cache】编译成功后写入缓存（包含合并后 Program + 依赖列表 + usage）
+    if (loader.cache_store) |store| {
+        if (store.enabled) {
+            writeWholeProgram(allocator, store, io, module, deps.items, &mc.program, &loader.type_inferencer) catch {};
+        }
+    }
+
+    return runProgram(allocator, value_allocator, io, &mc.program, entry, filename);
+}
+
+/// 【whole-program cache】尝试从缓存加载合并后 Program。
+/// 命中返回 owned Program（调用方 deinit），未命中返回 null。
+fn tryLoadWholeProgram(
+    allocator: std.mem.Allocator,
+    store: *const cache_mod.CacheStore,
+    io: std.Io,
+    module: ast.Module,
+    filename: []const u8,
+) ?vm.chunk.Program {
+    // 入口 src_path（stdlib 合成路径无缓存）
+    const src_path = module.source_path orelse return null;
+    if (std.mem.startsWith(u8, src_path, "<stdlib>")) return null;
+
+    // stat 入口文件
+    const cwd = std.Io.Dir.cwd();
+    const stat = cwd.statFile(io, src_path, .{}) catch return null;
+    const key = cache_mod.CacheKey{
+        .src_path = src_path,
+        .mtime = @as(i128, stat.mtime.nanoseconds),
+        .size = stat.size,
+    };
+
+    // 读 .bcc 文件
+    const bcc_name = store.bccFilename(src_path) catch return null;
+    defer allocator.free(bcc_name);
+
+    var bcc = cache_mod.readBccFile(allocator, io, store, bcc_name) catch return null;
+    defer bcc.deinit();
+
+    // 命中校验：入口 mtime+size + 所有依赖 mtime+size
+    // （usage/接口签名校验在 mtime+size 匹配时冗余——接口由源码决定，源码未变则接口未变）
+    // 直接调用简化校验（跳过 usage 校验，whole-program 模式下依赖 mtime+size 足够）
+    if (!cache_mod.isCacheHitWholeProgramSimple(&bcc, key, io)) {
+        return null;
+    }
+    _ = filename;
+
+    // 命中：从 BccFile 构造 Program（转移所有权）
+    const program = cache_mod.bccFileToProgram(&bcc) catch return null;
+    return program;
+}
+
+/// 【whole-program cache】序列化合并后 Program + 依赖列表 + usage 到 .bcc 文件。
+fn writeWholeProgram(
+    allocator: std.mem.Allocator,
+    store: *const cache_mod.CacheStore,
+    io: std.Io,
+    module: ast.Module,
+    deps: []const ast.Module,
+    program: *const vm.chunk.Program,
+    inferencer: *const type_check.TypeInferencer,
+) !void {
+    const src_path = module.source_path orelse return;
+    if (std.mem.startsWith(u8, src_path, "<stdlib>")) return;
+
+    const cwd = std.Io.Dir.cwd();
+    const stat = cwd.statFile(io, src_path, .{}) catch return;
+
+    // 构造 BccFile
+    var bcc = cache_mod.BccFile.init(allocator, .{
+        .magic = cache_mod.CACHE_MAGIC,
+        .version = cache_mod.CACHE_VERSION,
+        .src_mtime = @as(i128, stat.mtime.nanoseconds),
+        .src_size = stat.size,
+        .module_name = try allocator.dupe(u8, module.name),
+        .src_path = try allocator.dupe(u8, src_path),
+    });
+    defer bcc.deinit();
+
+    // 收集依赖列表（src_path + module_name + mtime + size）
+    for (deps) |dep| {
+        const dep_path = dep.source_path orelse continue;
+        if (std.mem.startsWith(u8, dep_path, "<stdlib>")) continue; // stdlib 合成路径跳过
+        const dep_stat = cwd.statFile(io, dep_path, .{}) catch continue;
+        try bcc.deps.append(allocator, .{
+            .src_path = try allocator.dupe(u8, dep_path),
+            .module_name = try allocator.dupe(u8, dep.name),
+            .mtime = @as(i128, dep_stat.mtime.nanoseconds),
+            .size = dep_stat.size,
+        });
+    }
+
+    // 提取入口模块接口（供下游模块缓存命中校验，whole-program 模式下冗余但保留）
+    var iface = cache_mod.interface.extractInterface(allocator, &module, inferencer) catch return;
+    defer iface.deinit();
+    for (iface.symbols.items) |s| {
+        try bcc.iface.addSymbol(s.name, s.kind, s.sig_hash);
+    }
+
+    // 复制 usage（type_check 期间记录的导入符号使用）
+    // 注意：whole-program 模式下 usage 主要用于调试，命中校验依赖 mtime+size
+    if (inferencer.symbol_usage) |tracker| {
+        for (tracker.entries.items) |e| {
+            try bcc.usage.record(e.module_path, e.symbol_name, e.kind, e.sig_hash);
+        }
+    }
+
+    // 字节码部分：直接从 Program 转移（BccFile 持有引用，writeBytes 时序列化）
+    bcc.entry = program.entry;
+    bcc.global_count = program.global_count;
+    bcc.globals_init = program.globals_init;
+    // functions / Desc 表 / trait_order 借用 Program（writeBytes 只读，不转移所有权）
+    bcc.functions = @constCast(program).functions;
+    bcc.adt_ctors = @constCast(program).adt_ctors;
+    bcc.record_shapes = @constCast(program).record_shapes;
+    bcc.newtype_ctors = @constCast(program).newtype_ctors;
+    bcc.error_ctors = @constCast(program).error_ctors;
+    bcc.trait_methods = @constCast(program).trait_methods;
+    bcc.trait_defaults = @constCast(program).trait_defaults;
+    bcc.trait_parents = @constCast(program).trait_parents;
+    bcc.trait_resolves = @constCast(program).trait_resolves;
+    bcc.trait_order = @constCast(program).trait_order;
+    // 清空 bcc 的这些字段标记，防止 bcc.deinit 释放它们（所有权仍属于 Program）
+    // —— 但 BccFile.deinit 会调 freeAdtCtor 等！需用 flag 控制。
+    // 简化：writeBytes 后立即清空 bcc 的字节码字段（避免 deinit 释放）
+    defer {
+        bcc.functions = .empty;
+        bcc.adt_ctors = .empty;
+        bcc.record_shapes = .empty;
+        bcc.newtype_ctors = .empty;
+        bcc.error_ctors = .empty;
+        bcc.trait_methods = .empty;
+        bcc.trait_defaults = .empty;
+        bcc.trait_parents = .empty;
+        bcc.trait_resolves = .empty;
+        bcc.trait_order = .empty;
+    }
+
+    // reloc_table：whole-program cache 不需要重定位（已合并为绝对 idx）
+    // 留空（bcc.reloc_table 已在 init 中初始化为空）
+
+    const bcc_name = try store.bccFilename(src_path);
+    defer allocator.free(bcc_name);
+    cache_mod.writeBccFile(io, store, &bcc, bcc_name) catch return;
+}
+
+/// 【whole-program cache】执行已编译的 Program（缓存命中路径与正常路径共用）。
+fn runProgram(
+    allocator: std.mem.Allocator,
+    value_allocator: std.mem.Allocator,
+    io: std.Io,
+    program: *vm.chunk.Program,
+    entry: u16,
+    filename: []const u8,
+) VmOutcome {
+    _ = allocator;
     // 执行 main
     var machine = vm.VM.initWithIo(value_allocator, io);
     defer machine.deinit();
     if (profiler_enabled) machine.setProfiler(&prof);
     prof.phaseBegin(.vm);
-    const result = machine.call(&mc.program, entry, &.{}) catch |err| {
+    const result = machine.call(program, entry, &.{}) catch |err| {
         prof.phaseEnd();
         const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
         const loc: ?ast.SourceLocation = if (machine.err_loc.line > 0) machine.err_loc else null;
@@ -545,7 +718,6 @@ fn tryRunOnVM(
     }
 
     result.release(value_allocator);
-
     return .ran_main;
 }
 

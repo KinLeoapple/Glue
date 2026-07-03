@@ -245,96 +245,10 @@ pub const ModuleLoader = struct {
             }
         }
 
-        // 【缓存】编译完成后提取接口并写入缓存
-        self.writeModuleCache(&module, module_name, &symbol_usage) catch {};
-    }
-
-    /// 【缓存】尝试从缓存加载：成功则注册接口返回 true，失败返回 error
-    fn tryLoadFromCache(self: *ModuleLoader, module: *const ast.Module, module_name: []const u8) !void {
-        const store = self.cache_store orelse return error.CacheDisabled;
-        if (!store.enabled) return error.CacheDisabled;
-        const io = self.io orelse return error.CacheDisabled;
-        const src_path = module.source_path orelse return error.NoSourcePath;
-        // stdlib 合成路径无法 stat（无真实文件），跳过缓存
-        if (std.mem.startsWith(u8, src_path, STDLIB_DIR_MARKER)) return error.NoSourcePath;
-
-        const cwd = std.Io.Dir.cwd();
-        const stat = cwd.statFile(io, src_path, .{}) catch return error.StatFailed;
-        const key = cache_mod.CacheKey{
-            .src_path = src_path,
-            .mtime = @as(i128, stat.mtime.nanoseconds),
-            .size = stat.size,
-        };
-
-        const bcc_name = try store.bccFilename(src_path);
-        defer self.allocator.free(bcc_name);
-
-        var bcc = cache_mod.readBccFile(self.allocator, io, store, bcc_name) catch return error.CacheMiss;
-        defer bcc.deinit();
-
-        if (!cache_mod.isCacheHit(&bcc, key, &self.loaded_interfaces)) return error.CacheMiss;
-
-        // 缓存命中：迁移接口到 loaded_interfaces（key 和 value 均 owned）
-        const owned_key = try self.allocator.dupe(u8, module_name);
-        // 把 bcc.iface 迁移出来（避免 deinit 释放）
-        const owned_iface = bcc.iface;
-        // 防止 bcc.deinit 释放已迁移的 iface（设为空壳）
-        bcc.iface = cache_mod.interface.ModuleInterface.init(self.allocator, "");
-        // 释放 readBytes dupe 的 symbol names（迁移时只保留结构，名字已转移到 owned_iface）
-        // 注意：owned_iface.symbols 中的 name 指针是 owned（readBytes dupe），迁移后由 loaded_interfaces 释放
-        // 但 bcc.deinit 会尝试释放 iface.symbols（现空壳），无影响
-        try self.loaded_interfaces.put(owned_key, owned_iface);
-    }
-
-    /// 【缓存】提取接口 + usage 写入缓存
-    fn writeModuleCache(self: *ModuleLoader, module: *const ast.Module, module_name: []const u8, symbol_usage: *const cache_mod.usage.SymbolUsage) !void {
-        const store = self.cache_store orelse return;
-        if (!store.enabled) return;
-        const io = self.io orelse return;
-        const src_path = module.source_path orelse return;
-        if (std.mem.startsWith(u8, src_path, STDLIB_DIR_MARKER)) return;
-
-        const cwd = std.Io.Dir.cwd();
-        const stat = cwd.statFile(io, src_path, .{}) catch return;
-
-        // 提取接口
-        var iface = cache_mod.interface.extractInterface(self.allocator, module, &self.type_inferencer) catch return;
-        defer iface.deinit();
-
-        // 构造 BccFile（仅 header + iface + usage，字节码部分暂不填充——Task 10 完整集成时补充）
-        var bcc = cache_mod.BccFile.init(self.allocator, .{
-            .magic = cache_mod.CACHE_MAGIC,
-            .version = cache_mod.CACHE_VERSION,
-            .src_mtime = @as(i128, stat.mtime.nanoseconds),
-            .src_size = stat.size,
-            .module_name = module_name,
-            .src_path = src_path,
-        });
-        defer bcc.deinit();
-
-        // 复制接口符号
-        for (iface.symbols.items) |s| {
-            try bcc.iface.addSymbol(s.name, s.kind, s.sig_hash);
-        }
-        // 复制 usage
-        for (symbol_usage.entries.items) |e| {
-            try bcc.usage.record(e.module_path, e.symbol_name, e.kind, e.sig_hash);
-        }
-
-        const bcc_name = try store.bccFilename(src_path);
-        defer self.allocator.free(bcc_name);
-        cache_mod.writeBccFile(io, store, &bcc, bcc_name) catch return;
-
-        // 同时把接口注册到 loaded_interfaces（供下游模块缓存命中校验）
-        // module_name 和 symbol name 均 dupe 为 owned（loaded_interfaces.deinit 时 freeOwned 释放）
-        const owned_key = try self.allocator.dupe(u8, module_name);
-        const owned_mod_name = try self.allocator.dupe(u8, module_name);
-        var owned_iface = cache_mod.interface.ModuleInterface.init(self.allocator, owned_mod_name);
-        for (iface.symbols.items) |s| {
-            const owned_sym_name = try self.allocator.dupe(u8, s.name);
-            try owned_iface.addSymbol(owned_sym_name, s.kind, s.sig_hash);
-        }
-        try self.loaded_interfaces.put(owned_key, owned_iface);
+        // 【缓存】whole-program cache 已迁移至 main.zig 的 writeWholeProgram/tryLoadWholeProgram，
+        // 此处不再做单模块缓存写入（原 writeModuleCache/tryLoadFromCache 已删除）。
+        // loaded_interfaces 仍保留供 type_check 跨模块符号解析使用，但不再用于缓存命中校验。
+        _ = module_name;
     }
 
     /// 从文件或 stdlib 加载模块

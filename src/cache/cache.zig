@@ -24,7 +24,8 @@ pub const reloc = @import("reloc.zig");
 /// 缓存文件魔数（升级 Zig/Glue 后旧缓存自动失效）
 pub const CACHE_MAGIC: [8]u8 = .{ 'G', 'L', 'U', 'E', 'B', 'C', '0', '1' };
 /// 缓存格式版本（BccFile 结构变化时递增）
-pub const CACHE_VERSION: u32 = 1;
+/// v2: 添加 deps 字段（whole-program cache 依赖列表）
+pub const CACHE_VERSION: u32 = 2;
 
 /// 缓存键：源文件路径 + mtime + size
 pub const CacheKey = struct {
@@ -99,9 +100,21 @@ pub const BccHeader = struct {
     src_path: []const u8,
 };
 
-/// .bcc 文件完整内容（header + interface + usage + bytecode + reloc）
+/// 依赖模块条目（whole-program cache 命中校验用）
+/// src_path / module_name 为 owned（readBytes dupe）
+pub const DepEntry = struct {
+    src_path: []const u8,
+    module_name: []const u8,
+    mtime: i128,
+    size: u64,
+};
+
+/// .bcc 文件完整内容（header + deps + interface + usage + bytecode + reloc）
 pub const BccFile = struct {
     header: BccHeader,
+    /// 【whole-program cache】依赖模块列表（入口模块的 use 依赖 + 传递依赖）
+    /// 命中校验：每个依赖的 mtime+size 必须与磁盘当前状态匹配
+    deps: std.ArrayListUnmanaged(DepEntry) = .empty,
     iface: interface.ModuleInterface,
     usage: usage.SymbolUsage,
     // 字节码部分（对应 vm.chunk.Program 的字段）
@@ -138,6 +151,12 @@ pub const BccFile = struct {
         // header: module_name + src_path 是 owned
         self.allocator.free(self.header.module_name);
         self.allocator.free(self.header.src_path);
+        // deps: src_path + module_name 均 owned
+        for (self.deps.items) |d| {
+            self.allocator.free(d.src_path);
+            self.allocator.free(d.module_name);
+        }
+        self.deps.deinit(self.allocator);
         self.usage.deinit();
         for (self.functions.items) |*f| f.deinit();
         self.functions.deinit(self.allocator);
@@ -163,7 +182,7 @@ pub const BccFile = struct {
         self.reloc_table.deinit();
     }
 
-    /// 序列化到 buffer（header + iface + usage + bytecode + reloc）
+    /// 序列化到 buffer（header + deps + iface + usage + bytecode + reloc）
     pub fn writeBytes(self: *const BccFile, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
         // Header
         try buf.appendSlice(allocator, &self.header.magic);
@@ -172,6 +191,16 @@ pub const BccFile = struct {
         try buf.appendSlice(allocator, std.mem.asBytes(&self.header.src_size));
         try writeOwnedStr(buf, allocator, self.header.module_name);
         try writeOwnedStr(buf, allocator, self.header.src_path);
+
+        // Deps（whole-program cache 依赖列表）
+        const deps_count: u32 = @intCast(self.deps.items.len);
+        try buf.appendSlice(allocator, std.mem.asBytes(&deps_count));
+        for (self.deps.items) |d| {
+            try writeOwnedStr(buf, allocator, d.src_path);
+            try writeOwnedStr(buf, allocator, d.module_name);
+            try buf.appendSlice(allocator, std.mem.asBytes(&d.mtime));
+            try buf.appendSlice(allocator, std.mem.asBytes(&d.size));
+        }
 
         // Interface
         try self.iface.writeBytes(buf, allocator);
@@ -233,6 +262,26 @@ pub const BccFile = struct {
             .src_path = src_path,
         });
         errdefer file.deinit();
+
+        // Deps（whole-program cache 依赖列表）
+        var deps_count: u32 = undefined;
+        try cur.read(std.mem.asBytes(&deps_count));
+        try file.deps.ensureTotalCapacity(allocator, deps_count);
+        var di: u32 = 0;
+        while (di < deps_count) : (di += 1) {
+            const dep_src_path = try readOwnedStr(allocator, cur);
+            const dep_module_name = try readOwnedStr(allocator, cur);
+            var dep_mtime: i128 = undefined;
+            var dep_size: u64 = undefined;
+            try cur.read(std.mem.asBytes(&dep_mtime));
+            try cur.read(std.mem.asBytes(&dep_size));
+            try file.deps.append(allocator, .{
+                .src_path = dep_src_path,
+                .module_name = dep_module_name,
+                .mtime = dep_mtime,
+                .size = dep_size,
+            });
+        }
 
         // Interface（readBytes 会 dupe module_name，但 BccFile.init 已用 header.module_name；
         // 这里读出的 iface.module_name 是 owned，需释放以避免泄漏。我们让 iface 复用 header 的 module_name）
@@ -332,7 +381,7 @@ fn readDescSlice(
     }
 }
 
-/// 判定缓存是否命中
+/// 判定缓存是否命中（单模块模式，向后兼容）
 /// key: 当前文件的 mtime+size
 /// interfaces: 已加载的被依赖模块接口
 pub fn isCacheHit(file: *const BccFile, key: CacheKey, interfaces: *const std.StringHashMap(interface.ModuleInterface)) bool {
@@ -341,6 +390,54 @@ pub fn isCacheHit(file: *const BccFile, key: CacheKey, interfaces: *const std.St
     if (file.header.src_size != key.size) return false;
     // 2. usage 中所有符号 sig 仍匹配
     if (!file.usage.verifyAll(interfaces)) return false;
+    return true;
+}
+
+/// 【whole-program cache】判定缓存命中：
+/// 1. 入口模块 mtime+size 匹配
+/// 2. 所有依赖模块 mtime+size 与磁盘当前状态匹配
+/// 3. usage 中所有符号 sig 仍匹配（接口签名稳定性）
+/// io / cwd 用于 stat 依赖文件
+pub fn isCacheHitWholeProgram(
+    file: *const BccFile,
+    key: CacheKey,
+    io: std.Io,
+    interfaces: *const std.StringHashMap(interface.ModuleInterface),
+) bool {
+    // 1. 入口模块 mtime + size 匹配
+    if (file.header.src_mtime != key.mtime) return false;
+    if (file.header.src_size != key.size) return false;
+    // 2. 所有依赖模块 mtime + size 与磁盘当前状态匹配
+    const cwd = std.Io.Dir.cwd();
+    for (file.deps.items) |d| {
+        const stat = cwd.statFile(io, d.src_path, .{}) catch return false;
+        if (@as(i128, stat.mtime.nanoseconds) != d.mtime) return false;
+        if (stat.size != d.size) return false;
+    }
+    // 3. usage 中所有符号 sig 仍匹配
+    if (!file.usage.verifyAll(interfaces)) return false;
+    return true;
+}
+
+/// 【whole-program cache】简化命中判定（跳过 usage 校验）：
+/// 1. 入口模块 mtime+size 匹配
+/// 2. 所有依赖模块 mtime+size 与磁盘当前状态匹配
+/// 依赖 mtime+size 匹配即说明源码未变，接口签名必然未变，usage 校验冗余。
+pub fn isCacheHitWholeProgramSimple(
+    file: *const BccFile,
+    key: CacheKey,
+    io: std.Io,
+) bool {
+    // 1. 入口模块 mtime + size 匹配
+    if (file.header.src_mtime != key.mtime) return false;
+    if (file.header.src_size != key.size) return false;
+    // 2. 所有依赖模块 mtime + size 与磁盘当前状态匹配
+    const cwd = std.Io.Dir.cwd();
+    for (file.deps.items) |d| {
+        const stat = cwd.statFile(io, d.src_path, .{}) catch return false;
+        if (@as(i128, stat.mtime.nanoseconds) != d.mtime) return false;
+        if (stat.size != d.size) return false;
+    }
     return true;
 }
 
@@ -368,6 +465,44 @@ pub fn readBccFile(allocator: std.mem.Allocator, io: std.Io, store: *const Cache
 
     var cur = reloc_mod.ByteCursor{ .data = data };
     return try BccFile.readBytes(allocator, &cur);
+}
+
+/// 【whole-program cache】从 BccFile 构造 Program，转移所有权（functions / Desc 表 / trait_order）。
+/// 调用后 BccFile 的对应字段被清空（避免 double-free），调用方拥有返回的 Program。
+/// 注意：BccFile.deinit 仍需调用以释放 header/deps/iface/usage/reloc_table。
+/// 返回的 Program.owns_desc_strings = true（所有字符串 owned，deinit 时释放）。
+pub fn bccFileToProgram(file: *BccFile) !vm.chunk.Program {
+    var program = vm.chunk.Program.init(file.allocator);
+    program.entry = file.entry;
+    program.global_count = file.global_count;
+    program.globals_init = file.globals_init;
+    program.owns_desc_strings = true; // cache 路径：所有字符串 owned
+
+    // 转移 functions 所有权
+    program.functions = file.functions;
+    file.functions = .empty;
+
+    // 转移 Desc 表所有权（字符串均为 owned，由 BccFile 反序列化时 dupe）
+    program.adt_ctors = file.adt_ctors;
+    file.adt_ctors = .empty;
+    program.record_shapes = file.record_shapes;
+    file.record_shapes = .empty;
+    program.newtype_ctors = file.newtype_ctors;
+    file.newtype_ctors = .empty;
+    program.error_ctors = file.error_ctors;
+    file.error_ctors = .empty;
+    program.trait_methods = file.trait_methods;
+    file.trait_methods = .empty;
+    program.trait_defaults = file.trait_defaults;
+    file.trait_defaults = .empty;
+    program.trait_parents = file.trait_parents;
+    file.trait_parents = .empty;
+    program.trait_resolves = file.trait_resolves;
+    file.trait_resolves = .empty;
+    program.trait_order = file.trait_order;
+    file.trait_order = .empty;
+
+    return program;
 }
 
 test "CacheStore bccFilename 稳定 hash" {

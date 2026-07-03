@@ -103,6 +103,13 @@ pub const ModuleCompiler = struct {
     error_table: std.ArrayListUnmanaged(CtorEntry) = .empty,
     /// 顶层全局变量表（M5g，第一遍登记）：name → globals 数组索引 + 是否可变（var）。
     global_table: std.ArrayListUnmanaged(GlobalEntry) = .empty,
+    /// 【优化】符号查找索引：name → fn_table 中的下标。registerDecls 末尾一次性构建。
+    fn_map: std.StringHashMap(u16),
+    ctor_map: std.StringHashMap(u16),
+    newtype_map: std.StringHashMap(u16),
+    error_map: std.StringHashMap(u16),
+    global_map: std.StringHashMap(u16),
+    method_name_set: std.StringHashMap(void),
     /// trait 方法名集合（M5i，第一遍登记）：用于把裸名调用 `compare(a,b)`（with-clause 约束的
     /// trait 方法作自由函数）解析为 receiver=arg0 的 OP_CALL_METHOD 分派。
     method_names: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -128,7 +135,16 @@ pub const ModuleCompiler = struct {
     reloc_table: ?*cache_reloc.RelocTable = null,
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
-        return .{ .program = Program.init(allocator), .allocator = allocator };
+        return .{
+            .program = Program.init(allocator),
+            .allocator = allocator,
+            .fn_map = std.StringHashMap(u16).init(allocator),
+            .ctor_map = std.StringHashMap(u16).init(allocator),
+            .newtype_map = std.StringHashMap(u16).init(allocator),
+            .error_map = std.StringHashMap(u16).init(allocator),
+            .global_map = std.StringHashMap(u16).init(allocator),
+            .method_name_set = std.StringHashMap(void).init(allocator),
+        };
     }
 
     pub fn deinit(self: *ModuleCompiler) void {
@@ -140,65 +156,59 @@ pub const ModuleCompiler = struct {
         self.method_names.deinit(self.allocator);
         self.nullary_methods.deinit(self.allocator);
         self.module_values.deinit(self.allocator);
+        self.fn_map.deinit();
+        self.ctor_map.deinit();
+        self.newtype_map.deinit();
+        self.error_map.deinit();
+        self.global_map.deinit();
+        self.method_name_set.deinit();
         // program 所有权移交调用方；此处不 deinit。
     }
 
     pub fn lookupFn(self: *ModuleCompiler, name: []const u8) ?u16 {
-        for (self.fn_table.items) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e.idx;
-        }
+        if (self.fn_map.get(name)) |idx| return self.fn_table.items[idx].idx;
         return null;
     }
 
     /// 查 ADT 构造器登记（裸名构造器调用 / match constructor pattern 用）。
     pub fn lookupCtor(self: *ModuleCompiler, name: []const u8) ?CtorEntry {
-        for (self.ctor_table.items) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e;
-        }
+        if (self.ctor_map.get(name)) |idx| return self.ctor_table.items[idx];
         return null;
     }
 
     /// 查 newtype 构造器登记（裸名 newtype 构造 / match newtype pattern 用）。
     pub fn lookupNewtype(self: *ModuleCompiler, name: []const u8) ?CtorEntry {
-        for (self.newtype_table.items) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e;
-        }
+        if (self.newtype_map.get(name)) |idx| return self.newtype_table.items[idx];
         return null;
     }
 
     /// 查自定义错误类型构造器登记（裸名 ErrorType("msg") 调用用）。
     pub fn lookupError(self: *ModuleCompiler, name: []const u8) ?CtorEntry {
-        for (self.error_table.items) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e;
-        }
+        if (self.error_map.get(name)) |idx| return self.error_table.items[idx];
         return null;
     }
 
     /// 查顶层全局变量登记（自由标识符 / 赋值目标解析用）。
     pub fn lookupGlobal(self: *ModuleCompiler, name: []const u8) ?GlobalEntry {
-        for (self.global_table.items) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e;
-        }
+        if (self.global_map.get(name)) |idx| return self.global_table.items[idx];
         return null;
     }
 
     /// M5i：登记一个 trait 方法名（去重）。
     fn registerMethodName(self: *ModuleCompiler, name: []const u8) CompileError!void {
-        for (self.method_names.items) |n| if (std.mem.eql(u8, n, name)) return;
+        if (self.method_name_set.contains(name)) return;
+        try self.method_name_set.put(name, {});
         try self.method_names.append(self.allocator, name);
     }
 
     /// M5i：name 是否为已知 trait 方法名（裸名调用作自由函数 trait 方法分派判定用）。
     pub fn isMethodName(self: *ModuleCompiler, name: []const u8) bool {
-        for (self.method_names.items) |n| if (std.mem.eql(u8, n, name)) return true;
-        return false;
+        return self.method_name_set.contains(name);
     }
 
     /// 查顶层函数的 (idx, arity)，供尾调用合格性判定（argc==arity 才发 OP_TAIL_CALL）。
     pub fn lookupFnEntry(self: *ModuleCompiler, name: []const u8) ?FnEntry {
-        for (self.fn_table.items) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e;
-        }
+        if (self.fn_map.get(name)) |idx| return self.fn_table.items[idx];
         return null;
     }
 
@@ -346,6 +356,7 @@ pub const ModuleCompiler = struct {
         // 模块名绑定为不可变全局（限定访问 Module.member 入口）。同名已存在则不重复（首个生效）。
         if (self.lookupGlobal(dep.name) != null) return;
         try self.global_table.append(self.allocator, .{ .name = dep.name, .idx = idx, .is_mutable = false });
+        try self.global_map.put(dep.name, idx);
         try self.module_values.append(self.allocator, .{ .name = dep.name, .global_idx = idx, .decls = dep.declarations });
     }
 
@@ -383,10 +394,11 @@ pub const ModuleCompiler = struct {
             switch (decl) {
                 .fun_decl => |fd| {
                     // 同名顶层函数已登记（如依赖与入口重名）→ 跳过重复预占（首个生效）。
-                    if (self.lookupFn(fd.name) != null) continue;
+                    if (self.fn_map.contains(fd.name)) continue;
                     const idx: u16 = @intCast(self.fn_table.items.len);
                     const param_types = try extractParamTypes(self.allocator, fd.params);
                     try self.fn_table.append(self.allocator, .{ .name = fd.name, .idx = idx, .arity = @intCast(fd.params.len), .param_types = param_types });
+                    try self.fn_map.put(fd.name, idx);
                     _ = try self.program.addFunction(.{ .chunk = Chunk.init(self.allocator), .arity = 0, .slot_count = 0, .name = fd.name });
                 },
                 .type_decl => |td| {
@@ -402,12 +414,16 @@ pub const ModuleCompiler = struct {
                                     ftypes[i] = builtinNumericTypeOf(f.ty);
                                 }
                                 const cidx = try self.program.addAdtCtor(td.name, con.name, fnames, ftypes);
+                                const local_idx: u16 = @intCast(self.ctor_table.items.len);
                                 try self.ctor_table.append(self.allocator, .{ .name = con.name, .idx = cidx, .arity = @intCast(con.fields.len) });
+                                try self.ctor_map.put(con.name, local_idx);
                             }
                         },
                         .newtype => |nt| {
                             const ntidx = try self.program.addNewtypeCtor(td.name);
+                            const local_idx: u16 = @intCast(self.newtype_table.items.len);
                             try self.newtype_table.append(self.allocator, .{ .name = nt.name, .idx = ntidx, .arity = 1 });
+                            try self.newtype_map.put(nt.name, local_idx);
                         },
                         .error_newtype => |en| {
                             // 从 prefix 方法中提取前缀字符串
@@ -433,7 +449,9 @@ pub const ModuleCompiler = struct {
                                 }
                             }
                             const eidx = try self.program.addErrorCtor(td.name, prefix);
+                            const local_idx: u16 = @intCast(self.error_table.items.len);
                             try self.error_table.append(self.allocator, .{ .name = td.name, .idx = eidx, .arity = 1 });
+                            try self.error_map.put(td.name, local_idx);
 
                             // 注册 Error trait 的内置方法：message() 和 type_name()
                             try self.registerErrorTraitMethods(td.name);
@@ -445,8 +463,14 @@ pub const ModuleCompiler = struct {
                     if (ed.stmt) |s| {
                         const idx: u16 = @intCast(self.global_table.items.len);
                         switch (s.*) {
-                            .val_decl => |vd| try self.global_table.append(self.allocator, .{ .name = vd.name, .idx = idx, .is_mutable = false }),
-                            .var_decl => |vd| try self.global_table.append(self.allocator, .{ .name = vd.name, .idx = idx, .is_mutable = true }),
+                            .val_decl => |vd| {
+                                try self.global_table.append(self.allocator, .{ .name = vd.name, .idx = idx, .is_mutable = false });
+                                try self.global_map.put(vd.name, idx);
+                            },
+                            .var_decl => |vd| {
+                                try self.global_table.append(self.allocator, .{ .name = vd.name, .idx = idx, .is_mutable = true });
+                                try self.global_map.put(vd.name, idx);
+                            },
                             else => {},
                         }
                     }
@@ -857,12 +881,16 @@ const FnCompiler = struct {
     reloc_table: ?*cache_reloc.RelocTable = null,
 
     fn init(allocator: std.mem.Allocator, module: *ModuleCompiler) FnCompiler {
-        return .{
+        var fc = FnCompiler{
             .chunk = Chunk.init(allocator),
             .allocator = allocator,
             .module = module,
             .reloc_table = module.reloc_table,
         };
+        // 【优化】预分配字节码容量，避免典型函数 ~100 字节码的多次 2x 增长 + memcpy
+        fc.chunk.code.ensureTotalCapacity(allocator, 128) catch {};
+        fc.chunk.lines.ensureTotalCapacity(allocator, 128) catch {};
+        return fc;
     }
 
     /// 【缓存】记录一条 reloc 项（在 writeOp 之后、writeU16/writeByte 之前调用）。

@@ -59,6 +59,39 @@ fn canRoundTripFloat(comptime T: type, val: f64) bool {
 /// 类型 ID（用于类型变量的唯一标识）
 var next_type_id: usize = 0;
 
+/// 【优化 #5】单例类型缓存容量：20 个无 payload 的基本类型 tag。
+/// i8/i16/i32/i64/i128, u8/u16/u32/u64/u128, f16/f32/f64/f128,
+/// bool/str/char/null/unit/unknown
+const SINGLETON_COUNT: usize = 20;
+
+/// 单例 tag → 缓存索引。非单例 tag 返回 SINGLETON_COUNT（越界，表示不缓存）。
+/// 在 makeType 中 comptime 求值，无运行时开销。
+fn singletonIdx(tag: Type) usize {
+    return switch (tag) {
+        .i8_type => 0,
+        .i16_type => 1,
+        .i32_type => 2,
+        .i64_type => 3,
+        .i128_type => 4,
+        .u8_type => 5,
+        .u16_type => 6,
+        .u32_type => 7,
+        .u64_type => 8,
+        .u128_type => 9,
+        .f16_type => 10,
+        .f32_type => 11,
+        .f64_type => 12,
+        .f128_type => 13,
+        .bool_type => 14,
+        .str_type => 15,
+        .char_type => 16,
+        .null_type => 17,
+        .unit_type => 18,
+        .unknown_type => 19,
+        else => SINGLETON_COUNT,
+    };
+}
+
 /// 类型节点
 pub const Type = union(enum) {
     // 整数类型（方案 B：12 个独立 tag）
@@ -655,6 +688,12 @@ pub const TypeInferencer = struct {
     /// 作用域栈 — 每个元素是当前作用域中的线性变量列表
     linear_scope_stack: std.ArrayList(std.ArrayList(LinearVarInfo)),
 
+    /// 【优化 #5】单例类型缓存：18 个无 payload 的基本类型 tag（int/float/bool/str/char/unit）
+    /// 全局唯一共享 *Type，避免每次 makeType 都 malloc + 追加 types ArrayList。
+    /// 这些 tag 的 Type 是不可变的，共享安全（无任何 t.* = ... 写入）。
+    /// null_type / unknown_type 也并入缓存以备将来扩展。
+    singleton_cache: [SINGLETON_COUNT]?*Type = [_]?*Type{null} ** SINGLETON_COUNT,
+
     /// 当前正在推断的函数信息
     const CurrentFnInfo = struct {
         /// 函数名
@@ -1007,7 +1046,18 @@ pub const TypeInferencer = struct {
     }
 
     /// 创建基本类型（void tag，如 .i32_type, .bool_type 等）
+    /// 【优化 #5】无 payload 的基本类型走单例缓存，避免重复 malloc + ArrayList 追加。
+    /// 单例 Type 不可变，跨模块跨函数共享安全。非单例 tag 回退到原路径。
     pub fn makeType(self: *TypeInferencer, comptime tag: @TypeOf(Type.i32_type)) !*Type {
+        const idx = comptime singletonIdx(tag);
+        if (idx < SINGLETON_COUNT) {
+            if (self.singleton_cache[idx]) |cached| return cached;
+            const t = try self.allocator.create(Type);
+            t.* = tag;
+            try self.types.append(self.allocator, t);
+            self.singleton_cache[idx] = t;
+            return t;
+        }
         const t = try self.allocator.create(Type);
         t.* = tag;
         try self.types.append(self.allocator, t);
@@ -3184,7 +3234,17 @@ pub const TypeInferencer = struct {
         // 存于 self.exported_schemes。
         for (module.declarations) |decl| {
             if (decl == .import_decl) {
-                self.importUseDecl(decl.import_decl, &env);
+                const ud = decl.import_decl;
+                self.importUseDecl(ud, &env);
+                // 【优化 #10】pub use Mod.{a, b} 再导出符号内联记录，避免 recordExports 二次遍历。
+                if (ud.visibility == .public) {
+                    if (ud.items) |items| {
+                        for (items) |item| {
+                            const local = item.alias orelse item.name;
+                            self.recordExportSymbol(module_name, local, &env);
+                        }
+                    }
+                }
             }
         }
         // 文档 §2.16: 同层级禁止重复定义——val/var/fun/type/trait 不允许同名。
@@ -3209,8 +3269,9 @@ pub const TypeInferencer = struct {
         }
         self.popLinearScope();
 
-        // 记录本模块导出的 pub 顶层函数 scheme，供其它模块 use 时解析。
-        self.recordExports(module, module_name, &env);
+        // 【优化 #10】pub 导出 scheme 已在 checkDeclCollecting / importUseDecl 内联记录，
+        // 此处仅做模块结构（pub 方法签名 + pub pack 子模块）单次扫描。
+        self.recordModuleStructure(module, module_name);
     }
 
     /// 把一条 use 声明导入的符号（pub 函数）从导出注册表注入到 env。
@@ -3248,47 +3309,10 @@ pub const TypeInferencer = struct {
     /// 记录本模块的 pub 导出 scheme 到 exported_schemes：
     /// - pub 顶层函数
     /// - pub use 再导出的符号（文档 §4.4.5: pub use 可被再导出）
-    fn recordExports(self: *TypeInferencer, module: *const ast.Module, module_name: []const u8, env: *TypeEnv) void {
-        for (module.declarations) |decl| {
-            switch (decl) {
-                .fun_decl => |f| {
-                    if (f.visibility != .public) continue;
-                    self.recordExportSymbol(module_name, f.name, env);
-                },
-                .type_decl => |t| {
-                    // pub type 的构造器作为值符号导出（如 List 的 Nil/Cons），
-                    // 使 use List 后可在表达式位置直接用 Nil/Cons。类型本身经
-                    // adt_types 跨模块持久化（见 checkDecl 的 type_decl 分支）。
-                    if (t.visibility != .public) continue;
-                    switch (t.def) {
-                        .adt => |adt_def| {
-                            for (adt_def.constructors) |con| {
-                                self.recordExportSymbol(module_name, con.name, env);
-                            }
-                        },
-                        .newtype => |nt| {
-                            self.recordExportSymbol(module_name, nt.name, env);
-                        },
-                        else => {},
-                    }
-                },
-                .import_decl => |ud| {
-                    // pub use Mod.{a, b} — 把再导出符号也登记在当前模块名下
-                    if (ud.visibility != .public) continue;
-                    if (ud.items) |items| {
-                        for (items) |item| {
-                            const local = item.alias orelse item.name;
-                            self.recordExportSymbol(module_name, local, env);
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-        // 文档 §4.6.2: 记录本模块结构（pub 方法签名 + pub pack 子模块），
-        // 供「文件模块作为 Trait 值」的结构化匹配与 `Module.Sub` 限定访问使用。
-        self.recordModuleStructure(module, module_name);
-    }
+    /// 【优化 #10】原 recordExports 已删除——pub 导出 scheme 现在在
+    /// checkDeclCollecting 内联记录（fun_decl / type_decl / newtype），
+    /// pub use 再导出在 importUseDecl 调用后内联记录。模块结构由
+    /// recordModuleStructure 单独扫描（pub 方法签名 + pub pack 子模块）。
 
     /// 文档 §2.16: 检测顶层声明的**跨种类**同名冲突。聚焦 fun/type/trait 三种具名顶层
     /// 声明之间的冲突（如 trait Foo + fun Foo）。同种类重复（两个同名 fun、两个同名
@@ -3892,6 +3916,11 @@ pub const TypeInferencer = struct {
                     self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "duplicate definition: '{s}' is already defined in this scope", .{f.name});
                 }
 
+                // 【优化 #10】pub 函数导出 scheme 内联记录，避免 recordExports 二次遍历。
+                if (f.visibility == .public) {
+                    self.recordExportSymbol(self.current_module, f.name, env);
+                }
+
                 // 文档 2.7.3: Trait Bound `with` 验证
                 for (f.bounds) |bound| {
                     self.checkTraitBound(bound, f.location);
@@ -4018,6 +4047,12 @@ pub const TypeInferencer = struct {
                                 if (!(env.defineOrReport(con.name, scheme) catch false)) {
                                     self.addErrorAt(.type_mismatch, con.location.line, con.location.column, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
                                 }
+                            }
+                        }
+                        // 【优化 #10】pub type 的构造器作为值符号导出，内联记录避免二次遍历。
+                        if (td.visibility == .public) {
+                            for (adt_def.constructors) |con| {
+                                self.recordExportSymbol(self.current_module, con.name, env);
                             }
                         }
                     },
@@ -4175,6 +4210,10 @@ pub const TypeInferencer = struct {
                             self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{nt.name});
                         } else if (!(env.defineOrReport(nt.name, scheme) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{nt.name});
+                        }
+                        // 【优化 #10】pub newtype 构造器作为值符号导出，内联记录。
+                        if (td.visibility == .public) {
+                            self.recordExportSymbol(self.current_module, nt.name, env);
                         }
                     },
                     .error_newtype => |en| {

@@ -45,9 +45,10 @@ pub const Chunk = struct {
     }
 
     /// 写一个裸字节（立即数）。立即数不单独登记位置，复用其 opcode 的位置。
+    /// 【优化 #9】packLoc(.{0,0}) == 0，直接写字面量 0 避免函数调用与位运算。
     pub fn writeByte(self: *Chunk, b: u8) !void {
         try self.code.append(self.allocator, b);
-        try self.lines.append(self.allocator, packLoc(.{ .line = 0, .column = 0 }));
+        try self.lines.append(self.allocator, 0);
     }
 
     /// PackedLoc 打包：line:u20（bits 31:12）+ column:u12（bits 11:0）。
@@ -68,17 +69,30 @@ pub const Chunk = struct {
         return unpackLoc(self.lines.items[ip_off]);
     }
 
+    /// 【优化 #9】批量预扩容：2 字节只需 2 次 capacity 检查（原 4 次）。
     pub fn writeU16(self: *Chunk, v: u16) !void {
-        try self.writeByte(@intCast(v & 0xFF));
-        try self.writeByte(@intCast((v >> 8) & 0xFF));
+        try self.code.ensureUnusedCapacity(self.allocator, 2);
+        try self.lines.ensureUnusedCapacity(self.allocator, 2);
+        self.code.appendAssumeCapacity(@intCast(v & 0xFF));
+        self.code.appendAssumeCapacity(@intCast((v >> 8) & 0xFF));
+        self.lines.appendAssumeCapacity(0);
+        self.lines.appendAssumeCapacity(0);
     }
 
+    /// 【优化 #9】批量预扩容：4 字节只需 2 次 capacity 检查（原 8 次）。
+    /// 跳转指令（emitJump / patchJump）高频路径，提升明显。
     pub fn writeI32(self: *Chunk, v: i32) !void {
         const u: u32 = @bitCast(v);
-        try self.writeByte(@intCast(u & 0xFF));
-        try self.writeByte(@intCast((u >> 8) & 0xFF));
-        try self.writeByte(@intCast((u >> 16) & 0xFF));
-        try self.writeByte(@intCast((u >> 24) & 0xFF));
+        try self.code.ensureUnusedCapacity(self.allocator, 4);
+        try self.lines.ensureUnusedCapacity(self.allocator, 4);
+        self.code.appendAssumeCapacity(@intCast(u & 0xFF));
+        self.code.appendAssumeCapacity(@intCast((u >> 8) & 0xFF));
+        self.code.appendAssumeCapacity(@intCast((u >> 16) & 0xFF));
+        self.code.appendAssumeCapacity(@intCast((u >> 24) & 0xFF));
+        self.lines.appendAssumeCapacity(0);
+        self.lines.appendAssumeCapacity(0);
+        self.lines.appendAssumeCapacity(0);
+        self.lines.appendAssumeCapacity(0);
     }
 
     /// 向常量池追加一个常量，返回其索引。常量池取得该值所有权。
@@ -238,6 +252,9 @@ pub const Program = struct {
     trait_resolves: std.ArrayListUnmanaged(TraitResolveDesc) = .empty,
     /// 组合 Trait 名按定义顺序（M5n）：组合分派遍历此序，后者覆盖前者（镜像 eval trait_definition_order）。
     trait_order: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// 【cache】Desc 表字符串所有权标记。true = 从 .bcc 反序列化，所有字符串 owned，deinit 释放；
+    /// false（默认）= 编译路径产出，field_names 外层数组 owned，内含字符串借用 AST 不释放。
+    owns_desc_strings: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -247,27 +264,78 @@ pub const Program = struct {
     pub fn deinit(self: *Program) void {
         for (self.functions.items) |*f| f.deinit();
         self.functions.deinit(self.allocator);
-        // field_names 切片由 addAdtCtor alloc，释放外层数组（内含字符串借用 AST，不释放）。
-        for (self.adt_ctors.items) |d| {
-            self.allocator.free(d.field_names);
-            self.allocator.free(d.field_types);
+        if (self.owns_desc_strings) {
+            // cache 路径：所有字符串 owned（含 field_names 内层 + type_name 等）
+            for (self.adt_ctors.items) |*d| {
+                for (d.field_names) |opt| if (opt) |s| self.allocator.free(s);
+                self.allocator.free(d.field_names);
+                for (d.field_types) |opt| if (opt) |s| self.allocator.free(s);
+                self.allocator.free(d.field_types);
+                self.allocator.free(d.type_name);
+                self.allocator.free(d.ctor_name);
+            }
+            self.adt_ctors.deinit(self.allocator);
+            for (self.record_shapes.items) |*s| {
+                for (s.field_names) |n| self.allocator.free(n);
+                self.allocator.free(s.field_names);
+            }
+            self.record_shapes.deinit(self.allocator);
+            for (self.newtype_ctors.items) |*n| self.allocator.free(n.type_name);
+            self.newtype_ctors.deinit(self.allocator);
+            for (self.error_ctors.items) |*e| {
+                self.allocator.free(e.type_name);
+                self.allocator.free(e.default_prefix);
+            }
+            self.error_ctors.deinit(self.allocator);
+            for (self.trait_methods.items) |*m| {
+                self.allocator.free(m.type_name);
+                self.allocator.free(m.method_name);
+                self.allocator.free(m.trait_name);
+            }
+            self.trait_methods.deinit(self.allocator);
+            for (self.trait_defaults.items) |*d| {
+                self.allocator.free(d.trait_name);
+                self.allocator.free(d.method_name);
+            }
+            self.trait_defaults.deinit(self.allocator);
+            for (self.trait_parents.items) |*p| {
+                self.allocator.free(p.trait_name);
+                self.allocator.free(p.parent_name);
+            }
+            self.trait_parents.deinit(self.allocator);
+            for (self.trait_resolves.items) |*r| {
+                self.allocator.free(r.trait_name);
+                self.allocator.free(r.method_name);
+                if (r.delegate_trait) |dt| self.allocator.free(dt);
+                if (r.delegate_method) |dm| self.allocator.free(dm);
+            }
+            self.trait_resolves.deinit(self.allocator);
+            for (self.trait_order.items) |s| self.allocator.free(s);
+            self.trait_order.deinit(self.allocator);
+        } else {
+            // 编译路径：field_names 外层数组 owned，内含字符串借用 AST 不释放
+            for (self.adt_ctors.items) |d| {
+                self.allocator.free(d.field_names);
+                self.allocator.free(d.field_types);
+            }
+            self.adt_ctors.deinit(self.allocator);
+            for (self.record_shapes.items) |s| self.allocator.free(s.field_names);
+            self.record_shapes.deinit(self.allocator);
+            self.newtype_ctors.deinit(self.allocator);
+            self.error_ctors.deinit(self.allocator);
+            // trait_methods 字符串是 addTraitMethod 复制的（owned）
+            for (self.trait_methods.items) |m| {
+                self.allocator.free(m.type_name);
+                self.allocator.free(m.method_name);
+                self.allocator.free(m.trait_name);
+            }
+            self.trait_methods.deinit(self.allocator);
+            // trait_defaults/parents/resolves/order 借用 AST，不释放字符串
+            self.trait_defaults.deinit(self.allocator);
+            self.trait_parents.deinit(self.allocator);
+            self.trait_resolves.deinit(self.allocator);
+            self.trait_order.deinit(self.allocator);
         }
-        self.adt_ctors.deinit(self.allocator);
-        for (self.record_shapes.items) |s| self.allocator.free(s.field_names);
-        self.record_shapes.deinit(self.allocator);
-        self.newtype_ctors.deinit(self.allocator);
-        self.error_ctors.deinit(self.allocator);
-        // 释放 trait_methods 中复制的字符串
-        for (self.trait_methods.items) |m| {
-            self.allocator.free(m.type_name);
-            self.allocator.free(m.method_name);
-            self.allocator.free(m.trait_name);
-        }
-        self.trait_methods.deinit(self.allocator);
-        self.trait_defaults.deinit(self.allocator);
-        self.trait_parents.deinit(self.allocator);
-        self.trait_resolves.deinit(self.allocator);
-        self.trait_order.deinit(self.allocator);
     }
 
     /// 追加一个函数，返回其索引。
