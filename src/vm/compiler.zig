@@ -78,6 +78,11 @@ const FnEntry = struct {
     /// 【JIT Phase 3】该纯函数的 memoization slot。
     /// 0xFFFF = 未分配（非纯函数或尚未调用）；纯函数首次被调用时懒分配，所有调用点共享。
     memo_slot: u16 = 0xFFFF,
+    /// 【内联】函数 body AST（borrow），null = 不可内联（lambda/递归/过大）。
+    /// 仅顶层 fun_decl 可内联；canInline 在注册时判断（arity ≤ 4 + 节点数 ≤ 32 + 无 nested lambda）。
+    body: ?*const ast.Expr = null,
+    /// 【内联】形参 AST（borrow），内联展开时绑定参数名到临时 local。
+    params: []const ast.Param = &.{},
 };
 
 /// ADT 构造器名 → (program.adt_ctors 索引, arity)。编译期识别裸名构造器调用 + match 校验。
@@ -411,7 +416,16 @@ pub const ModuleCompiler = struct {
                     if (self.fn_map.contains(fd.name)) continue;
                     const idx: u16 = @intCast(self.fn_table.items.len);
                     const param_types = try extractParamTypes(self.allocator, fd.params);
-                    try self.fn_table.append(self.allocator, .{ .name = fd.name, .idx = idx, .arity = @intCast(fd.params.len), .param_types = param_types });
+                    // 【内联】判断可内联性：arity ≤ 4 + body 节点数 ≤ 32 + 无 nested lambda/spawn + 非递归
+                    const can_inline = canInlineFn(fd.name, fd.params.len, fd.body);
+                    try self.fn_table.append(self.allocator, .{
+                        .name = fd.name,
+                        .idx = idx,
+                        .arity = @intCast(fd.params.len),
+                        .param_types = param_types,
+                        .body = if (can_inline) fd.body else null,
+                        .params = if (can_inline) fd.params else &.{},
+                    });
                     try self.fn_map.put(fd.name, idx);
                     _ = try self.program.addFunction(.{ .chunk = Chunk.init(self.allocator), .arity = 0, .slot_count = 0, .name = fd.name });
                 },
@@ -914,6 +928,8 @@ const FnCompiler = struct {
     rec_func_idx: u16 = 0,
     /// 【缓存】本函数在 program.functions 中的索引（reloc 记录用）。
     func_idx: u16 = 0,
+    /// 【内联】当前内联展开深度（0 = 非内联上下文）。限制 ≤ 3 防止无限展开。
+    inline_depth: u8 = 0,
     /// 【缓存】模块级 reloc 表指针（null = 不记录）。继承自 ModuleCompiler。
     reloc_table: ?*cache_reloc.RelocTable = null,
 
@@ -1307,8 +1323,9 @@ const FnCompiler = struct {
             .block => |b| b,
             .expression => |e| e,
         };
-        try sub.emitExpr(body_expr);
-        try sub.chunk.writeOp(.op_return, loc);
+        // 用 emitTail 编译 body：lambda body 本身就是尾位置，emitTail 能识别 match/if/block/call
+        // 的尾位置发 TCO（op_tail_call / op_tail_call_rec），避免深度递归栈溢出 + 帧建立开销。
+        try sub.emitTail(body_expr);
         // 检测值位置自引用：rec_name 出现在 upvalues 中（非 call 位置）→ 需要 cell 路径断环。
         var has_self_uv = false;
         if (rec_name) |rn| {
@@ -1624,6 +1641,10 @@ const FnCompiler = struct {
         switch (expr.*) {
             .call => |c| {
                 if (try self.tryEmitTailCall(c, loc)) return;
+                // letrec 自递归尾调用 TCO：callee 是当前 letrec 名字 → emit OP_TAIL_CALL_REC。
+                // 复用当前帧（upvalues 保留），避免深度递归栈溢出 + 帧建立开销。
+                // 通用方案：任何 letrec lambda 在尾位置自递归都受益（match/if/block 尾位置均经 emitTail）。
+                if (try self.tryEmitTailCallRec(c, loc)) return;
                 try self.emitExpr(expr);
                 try self.chunk.writeOp(.op_return, loc);
             },
@@ -1680,6 +1701,7 @@ const FnCompiler = struct {
                 }
                 self.locals.shrinkRetainingCapacity(saved);
             },
+            .match => |m| try self.emitMatchTail(m, loc),
             else => {
                 try self.emitExpr(expr);
                 try self.chunk.writeOp(.op_return, loc);
@@ -1710,6 +1732,84 @@ const FnCompiler = struct {
         try self.recordIdx(.tail_func, entry.idx);
         try self.chunk.writeU16(entry.idx);
         try self.chunk.writeByte(@intCast(c.arguments.len));
+        return true;
+    }
+
+    /// letrec 自递归尾调用 TCO：callee 是当前 lambda 的 letrec 名字 → emit OP_TAIL_CALL_REC。
+    /// 与 tryEmitTailCall（顶层函数）对称，复用当前帧但 upvalues 保留（letrec 闭包继承）。
+    /// 失败返回 false（调用方退回 emitExpr+RETURN，走 op_call_rec/op_call_value 建帧）。
+    fn tryEmitTailCallRec(self: *FnCompiler, c: @TypeOf(@as(Expr, undefined).call), loc: ast.SourceLocation) CompileError!bool {
+        if (c.arguments.len > 255) return false;
+        if (c.callee.* != .identifier) return false;
+        const name = c.callee.identifier.name;
+        const rn = self.rec_name orelse return false;
+        if (!std.mem.eql(u8, rn, name)) return false;
+        // callee 是 letrec 自递归名。发实参 + caller-side coerce + OP_TAIL_CALL_REC。
+        // coerce 逻辑与 emitCall 的 letrec 路径一致（比对 self.locals 前 N 项的 builtin_type）。
+        for (c.arguments, 0..) |arg, i| {
+            try self.emitExpr(arg);
+            if (i < self.locals.items.len) {
+                if (self.locals.items[i].builtin_type) |pt| {
+                    if (isBuiltinNumericType(pt)) {
+                        const at = self.exprBuiltinType(arg);
+                        if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                    }
+                }
+            }
+        }
+        // JIT Phase 3: 纯递归函数仍走 op_call_memoized（memo 优先于 TCO，命中缓存省整个函数体）
+        if (self.module.getOrAssignMemoSlot(name)) |memo_slot| {
+            try self.chunk.writeOp(.op_call_memoized, loc);
+            try self.recordIdx(.memo_func, self.rec_func_idx);
+            try self.chunk.writeU16(self.rec_func_idx);
+            try self.chunk.writeByte(@intCast(c.arguments.len));
+            try self.chunk.writeU16(memo_slot);
+        } else {
+            try self.chunk.writeOp(.op_tail_call_rec, loc);
+            try self.recordIdx(.func, self.rec_func_idx);
+            try self.chunk.writeU16(self.rec_func_idx);
+            try self.chunk.writeByte(@intCast(c.arguments.len));
+        }
+        return true;
+    }
+
+    /// 【内联】尝试在调用点展开小函数 body。成功返回 true（已发射，调用方 return）。
+    /// 通用方案：任何 canInlineFn 的顶层 fun_decl 都可内联，非特例。
+    /// 语义：求值实参 → 绑定参数名到临时 local → emitExpr(body) → shrink locals。
+    /// body 是 Expr（无 return 语句），内联安全。深度限制 ≤ 3 防止互递归无限展开。
+    fn tryEmitInlineCall(self: *FnCompiler, c: @TypeOf(@as(Expr, undefined).call), entry: FnEntry, loc: ast.SourceLocation) CompileError!bool {
+        if (entry.body == null) return false;
+        if (entry.arity != c.arguments.len) return false;
+        if (self.inline_depth >= 3) return false; // 深度限制
+        // 尾位置的内联：尾调用优化优先于内联（TCO 省 50000 帧 > 内联省 1 帧）
+        // 但非尾位置的调用内联收益更大（省帧建立 + return）
+
+        const saved_locals = self.locals.items.len;
+        const saved_inline_depth = self.inline_depth;
+        defer self.locals.shrinkRetainingCapacity(saved_locals);
+        defer self.inline_depth = saved_inline_depth;
+
+        self.inline_depth += 1;
+
+        // 求值实参 + 绑定参数名到临时 local（caller-side coerce 同 emitCall 顶层路径）
+        for (c.arguments, 0..) |arg, i| {
+            try self.emitExpr(arg);
+            if (i < entry.param_types.len) {
+                if (entry.param_types[i]) |pt| {
+                    if (isBuiltinNumericType(pt)) {
+                        const at = self.exprBuiltinType(arg);
+                        if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                    }
+                }
+            }
+            const param = entry.params[i];
+            const slot = try self.declareLocal(param.name, param.is_var, typeNeedsRelease(param.type_annotation), builtinTypeOf(param.type_annotation));
+            try self.chunk.writeOp(.op_set_local, loc);
+            try self.chunk.writeU16(slot);
+        }
+
+        // 展开 body：body 中的 identifier(param_name) 会 resolveLocal 找到临时 slot
+        try self.emitExpr(entry.body.?);
         return true;
     }
 
@@ -1805,6 +1905,8 @@ const FnCompiler = struct {
 
                 if (self.module.lookupFn(name)) |func_idx| {
                     const entry = self.module.lookupFnEntry(name).?;
+                    // 【内联】可内联小函数 → 在调用点展开 body（省 op_call + 帧 + return）
+                    if (try self.tryEmitInlineCall(c, entry, loc)) return;
                     for (c.arguments, 0..) |arg, i| {
                         try self.emitExpr(arg);
                         if (i < entry.param_types.len) {
@@ -2179,6 +2281,41 @@ const FnCompiler = struct {
         }
         try self.chunk.writeOp(.op_match_fail, loc);
         for (end_jumps.items) |j| self.chunk.patchJump(j);
+        self.locals.shrinkRetainingCapacity(saved_scrut);
+    }
+
+    /// 尾位置 match 发射：与 emitMatch 区别在于 arm body 走 emitTail（自带 RETURN/TAIL_CALL），
+    /// 无需 end_jump 跳到 match end。arm body 若是 call 会经 tryEmitTailCall 发 OP_TAIL_CALL，
+    /// 复用当前帧避免栈增长。通用方案：任何 match 在尾位置都受益，非特例。
+    /// 控制流：pattern 成功 → emitTail(body) → return（函数退出）；pattern 失败 → fail_label → pop → 下个 arm。
+    fn emitMatchTail(self: *FnCompiler, m: @TypeOf(@as(Expr, undefined).match), loc: ast.SourceLocation) CompileError!void {
+        try self.emitExpr(m.scrutinee);
+        const saved_scrut = self.locals.items.len;
+        const scrut_slot = try self.declareLocal("$scrut", false, true, null);
+        try self.chunk.writeOp(.op_set_local, loc);
+        try self.chunk.writeU16(scrut_slot);
+
+        for (m.arms) |arm| {
+            const arm_base = self.locals.items.len;
+            var fail_jumps = std.ArrayListUnmanaged(usize).empty;
+            defer fail_jumps.deinit(self.allocator);
+
+            try self.emitPatternMatch(arm.pattern, scrut_slot, &fail_jumps, loc);
+            if (arm.guard) |guard| {
+                try self.emitExpr(guard);
+                try fail_jumps.append(self.allocator, try self.chunk.emitJump(.op_jump_if_false, loc));
+                try self.chunk.writeOp(.op_pop, loc);
+            }
+            // 尾位置：arm body 走 emitTail（发 RETURN 或 TAIL_CALL，函数退出/复用帧）
+            try self.emitTail(arm.body);
+            // fail 落点：弹残留 false bool（emitTail 后代码不可达，fail_jumps 跳到这里）
+            if (fail_jumps.items.len > 0) {
+                for (fail_jumps.items) |j| self.chunk.patchJump(j);
+                try self.chunk.writeOp(.op_pop, loc);
+            }
+            self.locals.shrinkRetainingCapacity(arm_base);
+        }
+        try self.chunk.writeOp(.op_match_fail, loc);
         self.locals.shrinkRetainingCapacity(saved_scrut);
     }
 
@@ -3072,6 +3209,203 @@ fn extractParamTypes(allocator: std.mem.Allocator, params: []const ast.Param) ![
     const result = try allocator.alloc(?[]const u8, params.len);
     for (params, 0..) |p, i| result[i] = builtinTypeOf(p.type_annotation);
     return result;
+}
+
+/// 【内联】统计 Expr 的 AST 节点数（递归，用于判断可内联性）。
+/// 阈值 32：覆盖简单算术/match/字段访问，排除复杂函数体。
+fn countExprNodes(expr: *const ast.Expr) u32 {
+    return switch (expr.*) {
+        .int_literal, .float_literal, .bool_literal, .char_literal, .string_literal, .string_interpolation, .identifier => 1,
+        .lambda, .spawn, .atomic_expr, .lazy, .select => 99, // 闭包/协程/并发原语不可内联
+        .binary => |b| 1 + countExprNodes(b.left) + countExprNodes(b.right),
+        .unary => |u| 1 + countExprNodes(u.operand),
+        .call => |c| 1 + countExprNodes(c.callee) + blk: {
+            var n: u32 = 0;
+            for (c.arguments) |a| n += countExprNodes(a);
+            break :blk n;
+        },
+        .if_expr => |ie| 1 + countExprNodes(ie.condition) + countExprNodes(ie.then_branch) + (if (ie.else_branch) |eb| countExprNodes(eb) else 0),
+        .match => |m| blk: {
+            var n: u32 = 1;
+            n += countExprNodes(m.scrutinee);
+            for (m.arms) |arm| n += countExprNodes(arm.body) + (if (arm.guard) |g| countExprNodes(g) else 0);
+            break :blk n;
+        },
+        .block => |blk| blk: {
+            var n: u32 = 1;
+            for (blk.statements) |s| n += countStmtNodes(s);
+            if (blk.trailing_expr) |te| n += countExprNodes(te);
+            break :blk n;
+        },
+        .field_access => |fa| 1 + countExprNodes(fa.object),
+        .method_call => |mc| blk: {
+            var n: u32 = 1 + countExprNodes(mc.object);
+            for (mc.arguments) |a| n += countExprNodes(a);
+            break :blk n;
+        },
+        .index => |ix| 1 + countExprNodes(ix.object) + countExprNodes(ix.index),
+        .type_cast => |tc| 1 + countExprNodes(tc.expr),
+        .non_null_assert => |nna| 1 + countExprNodes(nna.expr),
+        .safe_access => |sa| 1 + countExprNodes(sa.object),
+        .safe_method_call => |smc| blk: {
+            var n: u32 = 1 + countExprNodes(smc.object);
+            for (smc.arguments) |a| n += countExprNodes(a);
+            break :blk n;
+        },
+        .record_extend => |re| blk: {
+            var n: u32 = 1 + countExprNodes(re.base);
+            for (re.updates) |u| n += countExprNodes(u.value);
+            break :blk n;
+        },
+        .propagate => |p| 1 + countExprNodes(p.expr),
+        else => 99, // 未覆盖的变体保守视为不可内联
+    };
+}
+
+fn countStmtNodes(stmt: *const ast.Stmt) u32 {
+    return switch (stmt.*) {
+        .val_decl => |d| 1 + countExprNodes(d.value),
+        .expression => |e| 1 + countExprNodes(e.expr),
+        .assignment => |a| 1 + countExprNodes(a.value),
+        else => 1, // return/throw/break/continue/defer 等控制流：保守计 1
+    };
+}
+
+/// 【内联】判断函数是否可内联：arity ≤ 4 + body 节点数 ≤ 32 + 非递归 + 无控制流。
+/// 控制流（return/throw/break/continue/propagate）跨函数边界内联会改变语义，必须排除。
+fn canInlineFn(name: []const u8, arity: usize, body: *const ast.Expr) bool {
+    if (arity > 4) return false;
+    if (countExprNodes(body) > 32) return false;
+    if (hasControlFlow(body)) return false;
+    return !callsSelf(body, name);
+}
+
+/// 【内联】检查 Expr 是否含控制流 Stmt（return/throw/break/continue）或 propagate 表达式。
+/// 这些跨函数边界内联会改变异常传播/返回语义，必须排除。
+fn hasControlFlow(expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        .propagate => true,
+        .binary => |b| hasControlFlow(b.left) or hasControlFlow(b.right),
+        .unary => |u| hasControlFlow(u.operand),
+        .call => |c| blk: {
+            if (hasControlFlow(c.callee)) break :blk true;
+            for (c.arguments) |a| if (hasControlFlow(a)) break :blk true;
+            break :blk false;
+        },
+        .if_expr => |ie| hasControlFlow(ie.condition) or hasControlFlow(ie.then_branch) or (if (ie.else_branch) |eb| hasControlFlow(eb) else false),
+        .match => |m| blk: {
+            if (hasControlFlow(m.scrutinee)) break :blk true;
+            for (m.arms) |arm| {
+                if (hasControlFlow(arm.body)) break :blk true;
+                if (arm.guard) |g| if (hasControlFlow(g)) break :blk true;
+            }
+            break :blk false;
+        },
+        .block => |blk| blk: {
+            for (blk.statements) |s| if (hasControlFlowStmt(s)) break :blk true;
+            if (blk.trailing_expr) |te| if (hasControlFlow(te)) break :blk true;
+            break :blk false;
+        },
+        .field_access => |fa| hasControlFlow(fa.object),
+        .method_call => |mc| blk: {
+            if (hasControlFlow(mc.object)) break :blk true;
+            for (mc.arguments) |a| if (hasControlFlow(a)) break :blk true;
+            break :blk false;
+        },
+        .index => |ix| hasControlFlow(ix.object) or hasControlFlow(ix.index),
+        .type_cast => |tc| hasControlFlow(tc.expr),
+        .non_null_assert => |nna| hasControlFlow(nna.expr),
+        .safe_access => |sa| hasControlFlow(sa.object),
+        .safe_method_call => |smc| blk: {
+            if (hasControlFlow(smc.object)) break :blk true;
+            for (smc.arguments) |a| if (hasControlFlow(a)) break :blk true;
+            break :blk false;
+        },
+        .record_extend => |re| blk: {
+            if (hasControlFlow(re.base)) break :blk true;
+            for (re.updates) |u| if (hasControlFlow(u.value)) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn hasControlFlowStmt(stmt: *const ast.Stmt) bool {
+    return switch (stmt.*) {
+        .return_stmt, .throw_stmt, .break_stmt, .continue_stmt => true,
+        .val_decl => |d| hasControlFlow(d.value),
+        .expression => |e| hasControlFlow(e.expr),
+        .assignment => |a| hasControlFlow(a.value),
+        else => false,
+    };
+}
+
+/// 【内联】检查 Expr 是否调用指定函数名（递归）。null name 时检查所有 call（保守起见见下方）。
+fn callsSelf(expr: *const ast.Expr, name: ?[]const u8) bool {
+    return switch (expr.*) {
+        .call => |c| blk: {
+            if (c.callee.* == .identifier) {
+                if (name) |n| {
+                    if (std.mem.eql(u8, n, c.callee.identifier.name)) break :blk true;
+                }
+            }
+            // 检查 callee + args
+            if (callsSelf(c.callee, name)) break :blk true;
+            for (c.arguments) |a| {
+                if (callsSelf(a, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .binary => |b| callsSelf(b.left, name) or callsSelf(b.right, name),
+        .unary => |u| callsSelf(u.operand, name),
+        .if_expr => |ie| callsSelf(ie.condition, name) or callsSelf(ie.then_branch, name) or (if (ie.else_branch) |eb| callsSelf(eb, name) else false),
+        .match => |m| blk: {
+            if (callsSelf(m.scrutinee, name)) break :blk true;
+            for (m.arms) |arm| {
+                if (callsSelf(arm.body, name)) break :blk true;
+                if (arm.guard) |g| if (callsSelf(g, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .block => |blk| blk: {
+            for (blk.statements) |s| {
+                if (callsSelfStmt(s, name)) break :blk true;
+            }
+            if (blk.trailing_expr) |te| if (callsSelf(te, name)) break :blk true;
+            break :blk false;
+        },
+        .field_access => |fa| callsSelf(fa.object, name),
+        .method_call => |mc| blk: {
+            if (callsSelf(mc.object, name)) break :blk true;
+            for (mc.arguments) |a| if (callsSelf(a, name)) break :blk true;
+            break :blk false;
+        },
+        .index => |ix| callsSelf(ix.object, name) or callsSelf(ix.index, name),
+        .type_cast => |tc| callsSelf(tc.expr, name),
+        .non_null_assert => |nna| callsSelf(nna.expr, name),
+        .safe_access => |sa| callsSelf(sa.object, name),
+        .safe_method_call => |smc| blk: {
+            if (callsSelf(smc.object, name)) break :blk true;
+            for (smc.arguments) |a| if (callsSelf(a, name)) break :blk true;
+            break :blk false;
+        },
+        .record_extend => |re| blk: {
+            if (callsSelf(re.base, name)) break :blk true;
+            for (re.updates) |u| if (callsSelf(u.value, name)) break :blk true;
+            break :blk false;
+        },
+        .propagate => |p| callsSelf(p.expr, name),
+        else => false,
+    };
+}
+
+fn callsSelfStmt(stmt: *const ast.Stmt, name: ?[]const u8) bool {
+    return switch (stmt.*) {
+        .val_decl => |d| callsSelf(d.value, name),
+        .expression => |e| callsSelf(e.expr, name),
+        .assignment => |a| callsSelf(a.value, name),
+        else => false,
+    };
 }
 
 /// 判断二元运算符是否为算术运算（结果类型 = 左操作数类型）。

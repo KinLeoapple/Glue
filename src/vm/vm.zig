@@ -984,6 +984,26 @@ pub const VM = struct {
                     stack_cap = self.stack.capacity;
                 },
 
+                .op_tail_call_rec => {
+                    // letrec 自递归尾调用 TCO：复用当前帧（同 op_tail_call），但 callee==当前 func
+                    // （自递归），upvalues 保留。用于尾位置的 match/if letrec 自递归，避免栈增长。
+                    const func_idx = opcode.readU16Ptr(ip_ptr);
+                    const argc = ip_ptr[2];
+                    ip_ptr += 3;
+                    self.stack.items.len = stack_len;
+                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    try self.doTailCallRec(program, func_idx, argc, func.chunk.locAt(op_off));
+                    // tail_call_rec 复用当前帧，func 理论不变（自递归），但刷新以保持一致。
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                    func = frame.func;
+                    code = func.chunk.code.items;
+                    slot_base = frame.slot_base;
+                    ip_ptr = code.ptr + frame.ip;
+                    stack_ptr = self.stack.items.ptr;
+                    stack_len = self.stack.items.len;
+                    stack_cap = self.stack.capacity;
+                },
+
                 .op_closure => {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const n = ip_ptr[2];
@@ -2014,6 +2034,60 @@ pub const VM = struct {
         frame.slot_base = fbase;
         frame.frame_base = fbase;
         frame.upvalues = &.{};
+    }
+
+    /// 执行 OP_TAIL_CALL_REC：letrec 自递归尾调用 TCO。
+    /// 与 doTailCall 区别：callee 是当前 letrec lambda（func 不变），upvalues 保留当前帧的 upvalues。
+    /// 用于尾位置的 letrec 自递归（match/if 分支的 go(...) 调用），避免深度递归栈溢出 + 帧建立开销。
+    fn doTailCallRec(self: *VM, program: *const Program, func_idx: u16, argc: u8, loc: ast.SourceLocation) VMError!void {
+        const callee = &program.functions.items[func_idx];
+        if (argc != callee.arity) return self.fail(loc, "wrong number of arguments", error.WrongArity);
+        const frame = &self.frames.items[self.frames.items.len - 1];
+        const fbase = frame.frame_base;
+        const sbase = frame.slot_base;
+        // 1) 暂存栈顶 argc 个实参（owned）到定长缓冲（argc ≤ 255）。
+        var argbuf: [256]Value = undefined;
+        const args_start = self.stack.items.len - argc;
+        var i: usize = 0;
+        while (i < argc) : (i += 1) argbuf[i] = self.stack.items[args_start + i];
+        // 2) 释放本帧局部槽（slot_base..slot_base+slot_count）。args 在其上方，不在此列。
+        const slot_count = frame.func.slot_count;
+        const mask = frame.func.release_mask;
+        if (slot_count <= 64) {
+            if (mask != 0) {
+                var m = mask;
+                while (m != 0) {
+                    const s = @ctz(m);
+                    self.stack.items[sbase + s].release(self.allocator);
+                    m &= m - 1;
+                }
+            }
+        } else {
+            var s: u16 = 0;
+            while (s < slot_count) : (s += 1) self.stack.items[sbase + s].release(self.allocator);
+        }
+        // 3) OP_CALL_VALUE 帧：frame_base..slot_base 之间是 callee box，须 release。
+        if (fbase < sbase) {
+            var k = fbase;
+            while (k < sbase) : (k += 1) self.stack.items[k].release(self.allocator);
+        }
+        // 4) 回退栈到 frame_base，写回 args（接管 owned），补 unit 到 slot_count。
+        self.stack.shrinkRetainingCapacity(fbase);
+        i = 0;
+        while (i < argc) : (i += 1) try self.push(argbuf[i]);
+        const fill_count = callee.slot_count - callee.arity;
+        if (fill_count > 0) {
+            try self.stack.ensureUnusedCapacity(self.allocator, fill_count);
+            const fill_start = self.stack.items.len;
+            self.stack.items.len += fill_count;
+            @memset(self.stack.items[fill_start..fill_start + fill_count], Value.fromUnit());
+        }
+        // 5) 就地改写当前帧：callee == 自递归 func（func 不变，upvalues 保留当前帧的 letrec upvalues）。
+        frame.func = callee;
+        frame.ip = 0;
+        frame.slot_base = fbase;
+        frame.frame_base = fbase;
+        // frame.upvalues 不变（letrec 自递归继承当前帧 upvalues）
     }
 
     /// 执行 OP_CALL_NATIVE：弹 argc 个实参，按 native_id 分派内建，压返回值（多数为 unit）。

@@ -104,8 +104,8 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             try print(buf, allocator, "{s} ctor#{d} argc={d}\n", .{ op.name(), ctor_idx, argc });
             return offset + 4;
         },
-        // OP_CALL / OP_TAIL_CALL / OP_CALL_REC <u16 func_idx> <u8 argc>
-        .op_call, .op_tail_call, .op_call_rec => {
+        // OP_CALL / OP_TAIL_CALL / OP_CALL_REC / OP_TAIL_CALL_REC <u16 func_idx> <u8 argc>
+        .op_call, .op_tail_call, .op_call_rec, .op_tail_call_rec => {
             const func_idx = opcode.readU16(code, offset + 1);
             const argc = code[offset + 3];
             try print(buf, allocator, "{s} fn#{d} argc={d}\n", .{ op.name(), func_idx, argc });

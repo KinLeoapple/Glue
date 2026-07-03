@@ -102,6 +102,11 @@ pub const OpCode = enum(u8) {
     /// 与 OP_CALL 同编码，但**复用当前帧**（释放本帧局部 → args 落到 frame_base → ip=0），不压新帧。
     /// 仅编译器在尾位置且 argc==callee.arity 时发射；否则退回 OP_CALL+OP_RETURN。
     op_tail_call,
+    /// OP_TAIL_CALL_REC <u16 func_idx> <u8 argc>（letrec 自递归尾调用 TCO）：
+    /// 语义同 OP_CALL_REC（callee 是当前 letrec lambda，upvalues 继承），但**复用当前帧**（同 OP_TAIL_CALL）。
+    /// 用于尾位置的 letrec 自递归（如 fun go(){...match{=>go()}...}），避免深度递归栈溢出 + 帧建立开销。
+    /// callee.func_idx == 当前帧 func（自递归），故 func 不变，仅 ip=0 + slot_base=frame_base。
+    op_tail_call_rec,
     /// OP_CALL_NATIVE <u8 native_id> <u8 argc>（bench 驱动）：调用内建原生函数（println/print 等）。
     /// argc 个实参在栈顶；分派后整段实参被替换为单个返回值（多数内建返回 unit）。
     /// native_id 见 Native 枚举。M1 仅接 println/print 以驱动 bench 端到端。
