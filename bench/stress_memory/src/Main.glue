@@ -1,0 +1,181 @@
+// 压力基准 S2: 内存密集 — 大规模数据结构 + churn
+// 目标: 把 SlabPool 分配/回收、COW 复制、字符串堆切换、ADT 装箱路径推到极限
+//
+// 测试维度:
+// - arrayPush(50000): O(n²) COW 复制（每次 push 复制整个数组，~1.25B 元素拷贝）
+// - arrayConcatChurn(500x concat 5K+5K): 大数组拼接 churn
+// - stringBuild(15000): O(n²) 字符串拼接（30000 字符串，~112M 字节拷贝）
+// - linkedList(50000): 尾递归 cons 50K 节点 + 尾递归遍历（TCO 无栈增长）
+// - bstInsert(10000): ADT 模式匹配 + 树构造 10K 节点
+// - recordChurn(5000000): Point 构造+match+字段访问+丢弃 5M 次
+
+// ============================================================
+// 1. 数组 push — O(n²) COW 复制
+// ============================================================
+fun arrayPush(n: i32): i64[] {
+    var arr: i64[] = []
+    var i: i32 = 0
+    while i < n {
+        arr = arr.push(i64(i))
+        i = i + 1
+    }
+    arr
+}
+
+// ============================================================
+// 2. 数组拼接 churn — 大数组 + + +
+// ============================================================
+fun arrayConcatChurn(iters: i32, a: i64[], b: i64[]): i64 {
+    var total: i64 = 0
+    var i: i32 = 0
+    while i < iters {
+        var merged = a ++ b
+        total = total + merged.len()
+        i = i + 1
+    }
+    total
+}
+
+// ============================================================
+// 3. 字符串拼接 — O(n²) 堆分配
+// ============================================================
+fun stringBuild(n: i32): str {
+    var s: str = ""
+    var i: i32 = 0
+    while i < n {
+        s = s + "ab"
+        i = i + 1
+    }
+    s
+}
+
+// ============================================================
+// 4. 函数式链表 — 尾递归 cons（TCO 无栈增长）
+// ============================================================
+type LList =
+    | LNil
+    | LCons(i64, LList)
+
+fun buildLList(n: i32): LList {
+    fun go(i: i32, acc: LList): LList {
+        if (i <= 0) { acc } else { go(i - 1, LCons(i64(i), acc)) }
+    }
+    go(n, LNil)
+}
+
+// 尾递归遍历 — go 在尾位置，TCO 复用帧，50K 节点无栈溢出
+fun sumLList(l: LList): i64 {
+    fun go(l: LList, acc: i64): i64 {
+        match l {
+            LNil => acc
+            LCons(h, t) => go(t, acc + h)
+        }
+    }
+    go(l, 0)
+}
+
+fun lenLList(l: LList): i64 {
+    fun go(l: LList, acc: i64): i64 {
+        match l {
+            LNil => acc
+            LCons(_, t) => go(t, acc + 1)
+        }
+    }
+    go(l, 0)
+}
+
+// ============================================================
+// 5. BST — ADT 模式匹配 + 树构造（递归深度 = 树高 ~28）
+// ============================================================
+type BST =
+    | BLeaf
+    | BNode(i64, BST, BST)
+
+fun bstInsert(t: BST, v: i64): BST {
+    match t {
+        BLeaf => BNode(v, BLeaf, BLeaf)
+        BNode(n, lo, hi) => {
+            if (v < n) { BNode(n, bstInsert(lo, v), hi) }
+            else if (v > n) { BNode(n, lo, bstInsert(hi, v)) }
+            else { t }
+        }
+    }
+}
+
+fun bstHeight(t: BST): i32 {
+    match t {
+        BLeaf => 0
+        BNode(_, lo, hi) => {
+            val lh = bstHeight(lo)
+            val rh = bstHeight(hi)
+            1 + (if (lh > rh) { lh } else { rh })
+        }
+    }
+}
+
+fun bstSum(t: BST): i64 {
+    match t {
+        BLeaf => 0
+        BNode(n, lo, hi) => n + bstSum(lo) + bstSum(hi)
+    }
+}
+
+// ============================================================
+// 6. 记录 churn — Point 构造 + match + 丢弃
+// ============================================================
+type Point = Point(x: i64, y: i64)
+
+fun dist2(p: Point): i64 {
+    match p {
+        Point(x, y) => x * x + y * y
+    }
+}
+
+fun recordChurn(iters: i32): i64 {
+    var sum: i64 = 0
+    var i: i32 = 0
+    while i < iters {
+        val v = i % 10000
+        val p = Point(i64(v), i64(v + 1))
+        sum = (sum + dist2(p) + p.x - p.y) % 1073741824
+        i = i + 1
+    }
+    sum
+}
+
+fun main() {
+    // --- 数组 push 50000: O(n²) COW 复制 ---
+    val bigArr = arrayPush(50000)
+    println(bigArr.len())
+    println(bigArr[bigArr.len() - 1])
+
+    // --- 数组拼接 churn: 500 次 concat 两个 5K 数组 ---
+    val a = arrayPush(5000)
+    val b = arrayPush(5000)
+    println(arrayConcatChurn(500, a, b))
+
+    // --- 字符串拼接 15000 次: 产出 30000 字符串 ---
+    val bigStr = stringBuild(15000)
+    println(bigStr.len())
+
+    // --- 链表 50000 节点（尾递归构造 + 遍历）---
+    val list = buildLList(50000)
+    println(sumLList(list))
+    println(lenLList(list))
+
+    // --- BST 插入 10000 节点（i64 算术避免溢出）---
+    var tree = BLeaf
+    var k: i64 = 0
+    while k < 10000 {
+        val v = (k * 7919 + 1) % 100000
+        tree = bstInsert(tree, v)
+        k = k + 1
+    }
+    println(bstHeight(tree))
+    println(bstSum(tree))
+
+    // --- 记录 churn 5000000 次 ---
+    println(recordChurn(5000000))
+
+    println("stress_memory: done")
+}

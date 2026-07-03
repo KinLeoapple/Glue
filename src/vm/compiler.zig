@@ -44,6 +44,9 @@ const Local = struct {
     slot: u16,
     is_var: bool,
     builtin_type: ?[]const u8 = null,
+    /// letrec lambda 绑定时存的形参基础类型（borrow AST），供 op_call_value 路径 caller-side coerce。
+    /// null 表示非闭包或无注解；元素 null 表示该参数无注解。
+    closure_param_types: ?[]const ?[]const u8 = null,
 };
 
 /// 闭包 upvalue 描述符（clox 风格静态解析）。
@@ -52,6 +55,8 @@ const Upvalue = struct {
     name: []const u8,
     index: u16,
     is_local: bool,
+    /// letrec lambda 绑定时存的形参基础类型（borrow AST），供 op_call_value 路径 caller-side coerce。
+    closure_param_types: ?[]const ?[]const u8 = null,
 };
 
 /// 循环上下文（M3b）：break/continue 跳转回填。
@@ -938,22 +943,24 @@ const FnCompiler = struct {
     fn resolveUpvalue(self: *FnCompiler, name: []const u8) CompileError!?u16 {
         const enc = self.enclosing orelse return null;
         if (enc.resolveLocal(name)) |slot| {
-            return try self.addUpvalue(name, slot, true);
+            const cpt = if (slot < enc.locals.items.len) enc.locals.items[slot].closure_param_types else null;
+            return try self.addUpvalue(name, slot, true, cpt);
         }
         if (try enc.resolveUpvalue(name)) |uv_idx| {
-            return try self.addUpvalue(name, uv_idx, false);
+            const cpt = if (uv_idx < enc.upvalues.items.len) enc.upvalues.items[uv_idx].closure_param_types else null;
+            return try self.addUpvalue(name, uv_idx, false, cpt);
         }
         return null;
     }
 
     /// 登记一个 upvalue（去重）。返回其在 upvalues 列表中的索引。
-    fn addUpvalue(self: *FnCompiler, name: []const u8, index: u16, is_local: bool) CompileError!u16 {
+    fn addUpvalue(self: *FnCompiler, name: []const u8, index: u16, is_local: bool, cpt: ?[]const ?[]const u8) CompileError!u16 {
         for (self.upvalues.items, 0..) |uv, i| {
             if (uv.index == index and uv.is_local == is_local) return @intCast(i);
         }
         if (self.upvalues.items.len >= 255) return error.Unsupported;
         const idx: u16 = @intCast(self.upvalues.items.len);
-        try self.upvalues.append(self.allocator, .{ .name = name, .index = index, .is_local = is_local });
+        try self.upvalues.append(self.allocator, .{ .name = name, .index = index, .is_local = is_local, .closure_param_types = cpt });
         return idx;
     }
 
@@ -1826,7 +1833,32 @@ const FnCompiler = struct {
         }
         // 通用路径：先压 callee（求值出 vm_closure），再压实参，OP_CALL_VALUE。
         try self.emitExpr(c.callee);
-        for (c.arguments) |arg| try self.emitExpr(arg);
+        // caller-side coerce：若 callee 是已知 letrec lambda（local/upvalue），按形参类型协调实参。
+        // 修复 i8 字面量传入 i64 形参未 coerce 导致的算术溢出（op_call_value 路径原本缺失此步骤）。
+        const callee_param_types: ?[]const ?[]const u8 = blk: {
+            if (c.callee.* == .identifier) {
+                const cn = c.callee.identifier.name;
+                if (self.resolveLocal(cn)) |slot| {
+                    if (slot < self.locals.items.len) break :blk self.locals.items[slot].closure_param_types;
+                } else if (try self.resolveUpvalue(cn)) |uv_idx| {
+                    if (uv_idx < self.upvalues.items.len) break :blk self.upvalues.items[uv_idx].closure_param_types;
+                }
+            }
+            break :blk null;
+        };
+        for (c.arguments, 0..) |arg, i| {
+            try self.emitExpr(arg);
+            if (callee_param_types) |pts| {
+                if (i < pts.len) {
+                    if (pts[i]) |pt| {
+                        if (isBuiltinNumericType(pt)) {
+                            const at = self.exprBuiltinType(arg);
+                            if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                        }
+                    }
+                }
+            }
+        }
         try self.chunk.writeOp(.op_call_value, loc);
         try self.chunk.writeByte(argc);
     }
@@ -2224,6 +2256,8 @@ const FnCompiler = struct {
                 // rec_name（has_self_uv=true）才退回原 letrec 路径（op_set_local_letrec 断环）。
                 if (d.value.* == .lambda) {
                     const slot = try self.declareLocal(d.name, false, true, null);
+                    // 存形参类型，供 op_call_value 路径 caller-side coerce（修复 i8 字面量传入 i64 形参未 coerce 的 bug）
+                    self.locals.items[slot].closure_param_types = try extractParamTypes(self.allocator, d.value.lambda.params);
                     try self.chunk.writeOp(.op_unit, d.location);
                     try self.chunk.writeOp(.op_set_local, d.location);
                     try self.chunk.writeU16(slot);

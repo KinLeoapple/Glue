@@ -1,0 +1,26 @@
+type LList =
+    | LNil
+    | LCons(i64, LList)
+
+fun buildLList(n: i32): LList {
+    fun go(i: i32, acc: LList): LList {
+        if (i <= 0) { acc } else { go(i - 1, LCons(i64(i), acc)) }
+    }
+    go(n, LNil)
+}
+
+fun lenLList(l: LList): i64 {
+    fun go(l: LList, acc: i64): i64 {
+        match l {
+            LNil => acc
+            LCons(_, t) => go(t, acc + 1)
+        }
+    }
+    go(l, 0)
+}
+
+fun main() {
+    val list = buildLList(50000)
+    println(lenLList(list))
+    println("done")
+}

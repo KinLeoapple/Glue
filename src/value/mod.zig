@@ -360,36 +360,68 @@ pub const Value = union(enum) {
     /// release：减少引用计数，归零则 deinit + destroy
     /// 内联变体 noop；rc 自管变体 if rc>1 rc-=1 else { ptr.deinit(alloc); alloc.destroy(ptr) }；
     /// runtime 变体 if unref() destroy。17 + 4 个分支用 inline prong 各合并为 1 个。
+    /// ADT 类型做迭代处理：当 rc==1 的 ADT 字段存在时，迭代释放避免深度链表递归栈溢出。
     pub fn release(self: Value, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .null_val, .unit, .boolean, .char, .int, .float, .spawn_val => {},
-            .string => |p| {
-                // SSO 字符串用 bits 5-30 做引用计数，归零 destroy struct
-                if (p.isSso()) {
-                    if (p.ssoRelease()) allocator.destroy(p);
+        var current = self;
+        while (true) {
+            switch (current) {
+                .null_val, .unit, .boolean, .char, .int, .float, .spawn_val => return,
+                .string => |p| {
+                    // SSO 字符串用 bits 5-30 做引用计数，归零 destroy struct
+                    if (p.isSso()) {
+                        if (p.ssoRelease()) allocator.destroy(p);
+                        return;
+                    }
+                    if (p.rc > 1) {
+                        p.rc -= 1;
+                    } else {
+                        p.deinit(allocator);
+                        allocator.destroy(p);
+                    }
                     return;
-                }
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
+                },
+                .adt => |p| {
+                    if (p.rc > 1) {
+                        p.rc -= 1;
+                        return;
+                    }
+                    // 迭代释放：对 rc==1 的 ADT 字段做尾递归优化，避免深度链表栈溢出。
+                    // 多个 rc==1 ADT 字段时（如 BNode(n, lo, hi) 两侧均 rc==1），
+                    // 只迭代最后一个，其余递归 release（树状结构深度 O(log n)，安全）。
+                    var next_adt: ?Value = null;
+                    for (p.fields) |*f| {
+                        if (f.value == .adt and f.value.adt.rc == 1) {
+                            if (next_adt) |n| n.release(allocator);
+                            next_adt = f.value;
+                        } else {
+                            f.value.release(allocator);
+                        }
+                    }
+                    if (p.fields.len > 0) allocator.free(p.fields);
                     allocator.destroy(p);
-                }
-            },
-            inline .array, .record, .adt, .newtype, .cell, .range,
-                .vm_closure, .partial, .builtin, .error_val, .throw_val,
-                .array_iterator, .string_iterator, .range_iterator,
-                .trait_value, .lazy_val => |p| {
-                if (p.rc > 1) {
-                    p.rc -= 1;
-                } else {
-                    p.deinit(allocator);
-                    allocator.destroy(p);
-                }
-            },
-            inline .atomic_val, .channel_val, .sender_val, .receiver_val => |p| {
-                if (p.unref()) allocator.destroy(p);
-            },
+                    if (next_adt) |n| {
+                        current = n;
+                        continue;
+                    }
+                    return;
+                },
+                inline .array, .record, .newtype, .cell, .range,
+                    .vm_closure, .partial, .builtin, .error_val, .throw_val,
+                    .array_iterator, .string_iterator, .range_iterator,
+                    .trait_value, .lazy_val => |p| {
+                    if (p.rc > 1) {
+                        p.rc -= 1;
+                    } else {
+                        p.deinit(allocator);
+                        allocator.destroy(p);
+                    }
+                    return;
+                },
+                inline .atomic_val, .channel_val, .sender_val, .receiver_val => |p| {
+                    if (p.unref()) allocator.destroy(p);
+                    return;
+                },
+            }
         }
     }
 

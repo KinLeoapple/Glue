@@ -1,0 +1,281 @@
+// 压力基准 S3: 复合维度 — 闭包 + trait + ADT 协同压测
+// 目标: 把 upvalue 读写、闭包构造、trait 方法分派、ADT 模式匹配、
+//       高阶函数组合路径同时压满，测综合吞吐
+//
+// 测试维度:
+// - counterClosure(1000000): 1M 次 upvalue 读改写
+// - closureChurn(500000): 闭包构造 + 立即调用 500K 次
+// - traitDispatch(2000000): trait 方法分派 2M 次
+// - bstBuild(10000) + bstSum/bstHeight: ADT 递归（深度 = 树高 ~28）
+// - iListBuild(50000) + sumIList: 尾递归 ADT 构造 + TCO 遍历
+// - listMapFilterFold(15000 元素): 高阶函数组合
+// - interpreter(5000x buildExpr(10)): ADT 递归 + Throw 错误传播
+
+// ============================================================
+// 1. 计数器闭包 — upvalue 读改写密集
+// ============================================================
+fun makeCounter(start: i64): () -> i64 {
+    var n: i64 = start
+    fun() {
+        n = n + 1
+        n
+    }
+}
+
+// ============================================================
+// 2. 闭包构造 churn — 循环内构造并立即调用
+// ============================================================
+fun closureChurn(iters: i32): i64 {
+    var sum: i64 = 0
+    var i: i32 = 0
+    while i < iters {
+        val f = fun(x: i64) { x * x + i64(i) }
+        sum = sum + f(i64(i % 1000))
+        i = i + 1
+    }
+    sum
+}
+
+// ============================================================
+// 3. Trait 方法分派 — 内联 trait 实现 + 密集调用
+// ============================================================
+trait Shape {
+    fun area(self): i64
+    fun name(self): str
+}
+
+type Rect: Shape = Rect(w: i32, h: i32) {
+    fun area(self): i64 { i64(self.w * self.h) }
+    fun name(self): str { "rect" }
+}
+
+type Square: Shape = Square(side: i32) {
+    fun area(self): i64 { i64(self.side * self.side) }
+    fun name(self): str { "square" }
+}
+
+type Tri: Shape = Tri(base: i32, hgt: i32) {
+    fun area(self): i64 { i64(self.base * self.hgt / 2) }
+    fun name(self): str { "tri" }
+}
+
+fun traitDispatch(iters: i32): i64 {
+    var sum: i64 = 0
+    var i: i32 = 0
+    while i < iters {
+        val r = Rect(i % 100 + 1, i % 50 + 1)
+        val s = Square(i % 70 + 1)
+        val t = Tri(i % 80 + 1, i % 40 + 1)
+        sum = (sum + r.area() + s.area() + t.area()) % 1073741824
+        i = i + 1
+    }
+    sum
+}
+
+// ============================================================
+// 4. BST — ADT 递归（深度 = 树高，非节点数）
+// ============================================================
+type Tree =
+    | Leaf
+    | Node(i64, Tree, Tree)
+
+fun tInsert(t: Tree, v: i64): Tree {
+    match t {
+        Leaf => Node(v, Leaf, Leaf)
+        Node(n, lo, hi) => {
+            if (v < n) { Node(n, tInsert(lo, v), hi) }
+            else if (v > n) { Node(n, lo, tInsert(hi, v)) }
+            else { t }
+        }
+    }
+}
+
+fun bstHeight(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(_, lo, hi) => {
+            val lh = bstHeight(lo)
+            val rh = bstHeight(hi)
+            1 + (if (lh > rh) { lh } else { rh })
+        }
+    }
+}
+
+fun bstSum(t: Tree): i64 {
+    match t {
+        Leaf => 0
+        Node(n, lo, hi) => n + bstSum(lo) + bstSum(hi)
+    }
+}
+
+// ============================================================
+// 5. 函数式链表 — 尾递归构造 + TCO 遍历（无栈溢出）
+// ============================================================
+type IList =
+    | INil
+    | ICons(i64, IList)
+
+fun buildIList(n: i32): IList {
+    fun go(i: i32, acc: IList): IList {
+        if (i <= 0) { acc } else { go(i - 1, ICons(i64(i), acc)) }
+    }
+    go(n, INil)
+}
+
+fun sumIList(l: IList): i64 {
+    fun go(l: IList, acc: i64): i64 {
+        match l {
+            INil => acc
+            ICons(h, t) => go(t, acc + h)
+        }
+    }
+    go(l, 0)
+}
+
+// ============================================================
+// 6. 高阶函数组合 — map + filter + fold 链式
+// ============================================================
+fun buildRange(n: i32): i64[] {
+    var arr: i64[] = []
+    var i: i32 = 0
+    while i < n {
+        arr = arr.push(i64(i))
+        i = i + 1
+    }
+    arr
+}
+
+fun arrMap(arr: i64[], f): i64[] {
+    var out: i64[] = []
+    var i: i32 = 0
+    while i < arr.len() {
+        out = out.push(f(arr[i]))
+        i = i + 1
+    }
+    out
+}
+
+fun arrFilter(arr: i64[], p): i64[] {
+    var out: i64[] = []
+    var i: i32 = 0
+    while i < arr.len() {
+        if (p(arr[i])) {
+            out = out.push(arr[i])
+        }
+        i = i + 1
+    }
+    out
+}
+
+fun arrFold(arr: i64[], init: i64, f): i64 {
+    var acc: i64 = init
+    var i: i32 = 0
+    while i < arr.len() {
+        acc = f(acc, arr[i])
+        i = i + 1
+    }
+    acc
+}
+
+// ============================================================
+// 7. 表达式解释器 — ADT 递归 + Throw 错误传播
+// ============================================================
+type Expr =
+    | ENum(i64)
+    | EAdd(Expr, Expr)
+    | ESub(Expr, Expr)
+    | EMul(Expr, Expr)
+    | EDiv(Expr, Expr)
+
+type EvalErr: Error = EvalErr(msg: str) {
+    override fun prefix(self): str { "eval" }
+}
+
+fun evalExpr(e: Expr): Throw<i64, Error> {
+    match e {
+        ENum(n) => Ok(n)
+        EAdd(a, b) => {
+            val x = evalExpr(a)?
+            val y = evalExpr(b)?
+            Ok(x + y)
+        }
+        ESub(a, b) => {
+            val x = evalExpr(a)?
+            val y = evalExpr(b)?
+            Ok(x - y)
+        }
+        EMul(a, b) => {
+            val x = evalExpr(a)?
+            val y = evalExpr(b)?
+            Ok(x * y)
+        }
+        EDiv(a, b) => {
+            val x = evalExpr(a)?
+            val y = evalExpr(b)?
+            if (y == 0) { throw EvalErr("div0") } else { Ok(x / y) }
+        }
+    }
+}
+
+// 构造嵌套表达式树（深度 d → ~2^d 节点）
+fun buildExpr(depth: i32): Expr {
+    if (depth <= 0) { return ENum(1) }
+    val inner = buildExpr(depth - 1)
+    EAdd(EMul(ENum(2), inner), ESub(inner, ENum(1)))
+}
+
+fun main() {
+    // --- 计数器闭包: 1M 次 upvalue 读改写 ---
+    val counter = makeCounter(0)
+    var cSum: i64 = 0
+    var i: i32 = 0
+    while i < 1000000 {
+        cSum = cSum + counter()
+        i = i + 1
+    }
+    println(cSum)
+
+    // --- 闭包构造 churn: 500K 次 ---
+    println(closureChurn(500000))
+
+    // --- Trait 方法分派: 2M 次（3 种类型 × 2 方法）---
+    println(traitDispatch(2000000))
+
+    // --- BST 插入 10000 节点（i64 算术避免溢出）---
+    var tree = Leaf
+    var k: i64 = 0
+    while k < 10000 {
+        val v = (k * 7919 + 1) % 100000
+        tree = tInsert(tree, v)
+        k = k + 1
+    }
+    println(bstHeight(tree))
+    println(bstSum(tree))
+
+    // --- 函数式链表 50000 节点（尾递归构造 + TCO 遍历）---
+    val list = buildIList(50000)
+    println(sumIList(list))
+
+    // --- 高阶函数组合: 15K 元素 map + filter + fold ---
+    val src = buildRange(15000)
+    val mapped = arrMap(src, fun(x) { x * x })
+    val filtered = arrFilter(mapped, fun(x) { x % 2 == 0 })
+    val total = arrFold(filtered, 0, fun(acc, x) { acc + x })
+    println(filtered.len())
+    println(total)
+
+    // --- 表达式解释器: 深度 10 的嵌套表达式 × 5000 次 ---
+    var eSum: i64 = 0
+    var m: i32 = 0
+    while m < 5000 {
+        val e = buildExpr(10)
+        val r = evalExpr(e)
+        // 解包 Throw: 成功累加，失败当 0（buildExpr 不含除法，不会失败）
+        val v = match r { Ok(v) => v, Error(_) => 0 }
+        eSum = (eSum + v) % 1073741824
+        m = m + 1
+    }
+    println(eSum)
+
+    println("stress_composite: done")
+}
