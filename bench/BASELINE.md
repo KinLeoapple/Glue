@@ -508,3 +508,42 @@ VM 阶段吞吐（`--profile`，短基准用此指标）：
 **验证**：`zig build test` 全通过；33 个集成测试 15 passed + 2 failed（均为 test_outputs.txt 旧 GBK 编码乱码，非功能回归，VM 实际输出 UTF-8 正确）+ 16 SKIP（无 test_outputs.txt）。
 **无行为变更**：纯内存优化，语义不变。
 
+### JIT Phase 1: 类型特化 opcode 基础设施 (2026-07-03)
+**目标**：建立类型特化基础设施——编译器消费 type_check 推断结果，生成类型特化 opcode（op_add_int/op_add_float 等），为后续 JIT 机器码生成阶段铺路。Phase 1 不生成机器码，仍走 VM 解释执行。
+
+**架构**：
+- [src/sema/static_analysis/type_table.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/type_table.zig): TypeTable（`*const ast.Expr → TypeKind` 指针哈希），零侵入 AST
+- [src/sema/type_check.zig](file:///d:/Projects/Zig/Glue/src/sema/type_check.zig): TypeInferencer 新增 `type_table` 字段，`inferExpr` 的 binary/unary prong 中 `recordTypeKind` 记录操作数类型；跨模块持久化（不在 `resetForNextModule` 清空，AST 指针跨模块唯一）
+- [src/vm/opcode.zig](file:///d:/Projects/Zig/Glue/src/vm/opcode.zig): 新增 24 个特化 opcode（算术 5×2+1、一元 2、比较 6×2）
+- [src/vm/compiler.zig](file:///d:/Projects/Zig/Glue/src/vm/compiler.zig): `pickSpecOp` 按 type_table 标注选择特化 opcode，fallback 到通用 opcode
+- [src/main.zig](file:///d:/Projects/Zig/Glue/src/main.zig): `--no-specialize` flag 用于 A/B 对比（留空 type_table，编译器全部回退通用 opcode）
+- [tests/specialization/arith_int/](file:///d:/Projects/Zig/Glue/tests/specialization/arith_int): 集成测试验证 int/float 算术+比较特化 opcode 语义正确性
+
+**关键设计决策——prong 合并**：
+最初实现为 24 个特化 opcode 各建独立 prong（~120 行），benchmark 显示**全 8 项回退 -1.8%~-14.1%**（lookup 最严重 -14.1%）。根因：dispatch switch 增加 24 个 case label 导致 L1 icache 压力，抵消了跳过类型分派的收益。
+
+**修复**：将特化 opcode 合并到通用 prong 的同一 case 列表中，归一化为通用 opcode 后走 doArith/doCompare/doNegate（内含 isInteger/isFloat 快速路径）。消除 6 个独立 prong（96 行），dispatch switch 恢复原体积。
+
+**收益**（3 次取最佳，ReleaseFast，VM-phase `--profile`，特化 vs 非特化 A/B 对比）：
+
+| Benchmark | 特化 | 非特化 | Delta |
+|---|---|---|---|
+| fib    | 515.60 ms  150.39 M/s | 503.76 ms  153.93 M/s | -2.3% thpt |
+| lookup | 927.81 ms  161.93 M/s | 933.46 ms  160.95 M/s | +0.6% thpt |
+| record | 585.37 ms  102.50 M/s | 578.76 ms  103.67 M/s | -1.1% thpt |
+| float  | 1019.64 ms  32.49 M/s | 1030.89 ms  32.13 M/s | +1.1% thpt |
+| string | 32.81 ms  54.44 M/s | 32.73 ms  54.57 M/s | -0.2% thpt |
+| closure | 45.74 ms  138.83 M/s | 45.77 ms  138.73 M/s | +0.1% thpt |
+| array  | 18.02 ms  101.70 M/s | 17.96 ms  102.04 M/s | -0.3% thpt |
+| tailcall | 97.46 ms  177.20 M/s | 98.47 ms  175.40 M/s | +1.0% thpt |
+
+**分析**：合并后特化 vs 非特化在 ±2.3% 噪声范围内（4 项微赢 / 4 项微输），性能中性。Phase 1 的价值在于基础设施（type_table + 编译器 emit + 特化 opcode 定义），为后续 JIT 机器码生成阶段提供类型标注输入。当前特化 opcode 经归一化后走与通用 opcode 完全相同的 doArith/doCompare/doNegate 路径，零额外开销。
+
+**教训**：
+1. dispatch switch 的 case label 数量直接影响 L1 icache 命中率——24 个额外 prong（~120 行代码）足以导致 -14% 回退
+2. 当 doArith 内部已有 isInteger/isFloat 快速路径时，特化 opcode 跳过的仅是 2 次 tag 比较（~2-5ns），远不足以抵消 icache miss 开销（~10-40ns）
+3. 类型特化的真正收益需要 JIT 机器码生成（跳过整个 dispatch + tag 检查），解释执行阶段应保持 switch 紧凑
+
+**验证**：`zig build test` 全通过；`tests/specialization/arith_int` 集成测试在特化/非特化模式下输出完全一致；`--profile` 确认 8 种特化 opcode 均被正确生成和执行。
+**无行为变更**：特化 opcode 归一化后语义与通用 opcode 完全一致。
+
