@@ -138,6 +138,11 @@ pub const ModuleCompiler = struct {
     /// 【缓存】模块级重定位表（记录所有函数 chunk 中 func/ctor/global idx 引用位置）。
     /// null = 缓存禁用（默认），编译行为与原先完全一致。
     reloc_table: ?*cache_reloc.RelocTable = null,
+    /// func_idx → 形参基础类型数组（borrow AST 字节，外层数组 owned）。
+    /// 仅存 trait 方法/默认方法的 param_types（顶层函数的 param_types 已在 fn_table 中）。
+    /// 供 uniqueTraitMethod / op_call_method 路径 caller-side coerce，修复 i8 字面量传入
+    /// 宽类型形参未 coerce 导致的算术溢出（与 op_call_value 路径对称）。
+    func_param_types: std.AutoHashMapUnmanaged(u16, []const ?[]const u8) = .{},
 
     pub fn init(allocator: std.mem.Allocator) ModuleCompiler {
         return .{
@@ -153,6 +158,10 @@ pub const ModuleCompiler = struct {
     }
 
     pub fn deinit(self: *ModuleCompiler) void {
+        // 释放 trait 方法 param_types 外层数组（内含字符串借用 AST 不释放）
+        var it = self.func_param_types.valueIterator();
+        while (it.next()) |pts| self.allocator.free(pts.*);
+        self.func_param_types.deinit(self.allocator);
         self.fn_table.deinit(self.allocator);
         self.ctor_table.deinit(self.allocator);
         self.newtype_table.deinit(self.allocator);
@@ -574,6 +583,24 @@ pub const ModuleCompiler = struct {
         return found;
     }
 
+    /// 取 trait 方法的形参基础类型数组（borrow AST 字节）。
+    /// 同一 trait 方法名的所有实现应共享相同形参签名（trait 声明约束），
+    /// 故取首个匹配实现即可。供 op_call_method 路径 caller-side coerce。
+    /// 查找顺序：trait_methods → trait_defaults。
+    pub fn traitMethodParamTypes(self: *ModuleCompiler, method_name: []const u8) ?[]const ?[]const u8 {
+        for (self.program.trait_methods.items) |d| {
+            if (std.mem.eql(u8, d.method_name, method_name)) {
+                if (self.func_param_types.get(d.func_idx)) |pt| return pt;
+            }
+        }
+        for (self.program.trait_defaults.items) |d| {
+            if (std.mem.eql(u8, d.method_name, method_name)) {
+                if (self.func_param_types.get(d.func_idx)) |pt| return pt;
+            }
+        }
+        return null;
+    }
+
     /// 为 Error 类型注册内置方法：message() 和 type_name()
     /// 这些方法作为 Error trait 的一部分，由 VM 在运行时提供实现
     fn registerErrorTraitMethods(self: *ModuleCompiler, type_name: []const u8) CompileError!void {
@@ -645,7 +672,12 @@ pub const ModuleCompiler = struct {
             .name = m.name,
         };
         fc.chunk = Chunk.init(self.allocator);
-        return try self.program.addFunction(f);
+        const func_idx = try self.program.addFunction(f);
+        // 存形参类型，供 uniqueTraitMethod / op_call_method 路径 caller-side coerce
+        // （修复 i8 字面量传入宽类型形参未 coerce 导致的算术溢出，与 op_call_value 路径对称）
+        const param_types = try extractParamTypes(self.allocator, m.params);
+        try self.func_param_types.put(self.allocator, func_idx, param_types);
+        return func_idx;
     }
 
     /// M5k：合成一个 arity 参的「构造器包装」Function：取各参数 slot 压栈 + OP_MAKE_ADT + RETURN。
@@ -1083,7 +1115,23 @@ const FnCompiler = struct {
                 if (mc.arguments.len > 255) return error.Unsupported;
                 // M4a：方法接收者若是 identifier，用 raw 读取（不透明 load atomic，cas/swap 需原始 Atomic）。
                 try self.emitMethodReceiver(mc.object);
-                for (mc.arguments) |arg| try self.emitExpr(arg);
+                // caller-side coerce：按 trait 方法形参类型协调实参。param_types[0]=self（通常非数值跳过），
+                // param_types[i+1]=explicit arg i。修复 i8 字面量传入宽类型形参未 coerce 导致的算术溢出。
+                const callee_pts = self.module.traitMethodParamTypes(mc.method);
+                for (mc.arguments, 0..) |arg, i| {
+                    try self.emitExpr(arg);
+                    if (callee_pts) |pts| {
+                        const pi = i + 1;
+                        if (pi < pts.len) {
+                            if (pts[pi]) |pt| {
+                                if (isBuiltinNumericType(pt)) {
+                                    const at = self.exprBuiltinType(arg);
+                                    if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                                }
+                            }
+                        }
+                    }
+                }
                 const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, mc.method));
                 try self.chunk.writeOp(.op_call_method, loc);
                 try self.chunk.writeU16(name_const);
@@ -1104,7 +1152,22 @@ const FnCompiler = struct {
                 if (smc.arguments.len > 255) return error.Unsupported;
                 try self.emitExpr(smc.object);
                 const skip = try self.chunk.emitJump(.op_jump_if_null, loc);
-                for (smc.arguments) |arg| try self.emitExpr(arg);
+                // caller-side coerce：同 .method_call 路径（null 检查后、OP_CALL_METHOD 前协调实参）。
+                const callee_pts = self.module.traitMethodParamTypes(smc.method);
+                for (smc.arguments, 0..) |arg, i| {
+                    try self.emitExpr(arg);
+                    if (callee_pts) |pts| {
+                        const pi = i + 1;
+                        if (pi < pts.len) {
+                            if (pts[pi]) |pt| {
+                                if (isBuiltinNumericType(pt)) {
+                                    const at = self.exprBuiltinType(arg);
+                                    if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                                }
+                            }
+                        }
+                    }
+                }
                 const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, smc.method));
                 try self.chunk.writeOp(.op_call_method, loc);
                 try self.chunk.writeU16(name_const);
@@ -1801,15 +1864,45 @@ const FnCompiler = struct {
                     // 单 trait 实现：直接调用其函数（镜像 eval 动态类型语义，不受 receiver 类型限制，
                     // 如 `compare(1.5,2.5)` 调用唯一的 Comparable<i32> 实现）。多实现 → receiver 类型分派。
                     if (self.module.uniqueTraitMethod(name)) |fidx| {
-                        for (c.arguments) |arg| try self.emitExpr(arg);
+                        // caller-side coerce：按 trait 方法形参类型协调实参（含 receiver=arg0，self 通常非数值跳过）。
+                        // 修复 i8 字面量传入宽类型形参未 coerce 导致的算术溢出，与 op_call/op_call_value 路径对称。
+                        const callee_pts = self.module.func_param_types.get(fidx);
+                        for (c.arguments, 0..) |arg, i| {
+                            try self.emitExpr(arg);
+                            if (callee_pts) |pts| {
+                                if (i < pts.len) {
+                                    if (pts[i]) |pt| {
+                                        if (isBuiltinNumericType(pt)) {
+                                            const at = self.exprBuiltinType(arg);
+                                            if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         try self.chunk.writeOp(.op_call, loc);
                         try self.recordIdx(.func, fidx);
                         try self.chunk.writeU16(fidx);
                         try self.chunk.writeByte(argc);
                         return;
                     }
+                    // 多实现 → receiver 类型分派。同一 trait 方法名的实现共享相同形参签名，
+                    // 取首个匹配实现的 param_types 做 caller-side coerce（best-effort，无则跳过）。
+                    const callee_pts = self.module.traitMethodParamTypes(name);
                     const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, name));
-                    for (c.arguments) |arg| try self.emitExpr(arg); // [recv, rest...]
+                    for (c.arguments, 0..) |arg, i| {
+                        try self.emitExpr(arg); // [recv, rest...]
+                        if (callee_pts) |pts| {
+                            if (i < pts.len) {
+                                if (pts[i]) |pt| {
+                                    if (isBuiltinNumericType(pt)) {
+                                        const at = self.exprBuiltinType(arg);
+                                        if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     try self.chunk.writeOp(.op_call_method, loc);
                     try self.chunk.writeU16(name_const);
                     try self.chunk.writeByte(argc - 1);
