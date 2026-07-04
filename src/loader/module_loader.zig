@@ -190,33 +190,21 @@ pub const ModuleLoader = struct {
         // Resolve (处理标识符解析)
         try resolve.resolveModule(&module, &self.interner);
 
-        // JIT Phase 2: 运行纯度分析 pass
+        // 融合静态分析：单次 AST 遍历同时填充 purity / const_prop / loop_invariant，
+        // 并用基于调用图的 fixpoint 替代 purity 的多轮 AST 重递归。
+        // 语义与原 4 个独立 pass 完全一致，仅合并遍历顺序（详见 fused_analysis.zig）。
         {
-            var purity_pass = analysis_db_mod.purity.PurityPass.init(self.allocator);
-            defer purity_pass.deinit();
-            purity_pass.analyzeModule(&module) catch {};
-
-            // 合并结果到 analysis_db.purity
-            var it = purity_pass.table.entries.iterator();
-            while (it.next()) |entry| {
-                self.analysis_db.purity.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
-            }
+            var fused = analysis_db_mod.FusedAnalysis.init(
+                self.allocator,
+                &self.analysis_db.const_prop,
+                &self.analysis_db.loop_invariant,
+                &self.analysis_db.purity,
+            );
+            defer fused.deinit();
+            fused.analyzeModule(&module) catch {};
         }
 
-        // JIT Phase 3: 运行常量传播 pass
-        {
-            var cp_pass = analysis_db_mod.const_prop.ConstPropPass.init(self.allocator);
-            defer cp_pass.deinit();
-            cp_pass.analyzeModule(&module) catch {};
-
-            // 合并结果到 analysis_db.const_prop
-            var it = cp_pass.table.entries.iterator();
-            while (it.next()) |entry| {
-                self.analysis_db.const_prop.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
-            }
-        }
-
-        // JIT Phase 5: 运行分支可达性 pass（查询 const_prop 结果）
+        // 分支可达性 pass 依赖 const_prop 完成，保持独立轻量遍历（仅查 if 条件）。
         {
             var br_pass = analysis_db_mod.branch_reach.BranchReachPass.init(
                 self.allocator,
@@ -229,19 +217,6 @@ pub const ModuleLoader = struct {
             var it = br_pass.table.entries.iterator();
             while (it.next()) |entry| {
                 self.analysis_db.branch_reach.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
-            }
-        }
-
-        // JIT Phase 4: 运行循环不变量 pass（估计循环体大小，标记可展开）
-        {
-            var li_pass = analysis_db_mod.loop_invariant.LoopInvariantPass.init(self.allocator);
-            defer li_pass.deinit();
-            li_pass.analyzeModule(&module) catch {};
-
-            // 合并结果到 analysis_db.loop_invariant
-            var it = li_pass.table.entries.iterator();
-            while (it.next()) |entry| {
-                self.analysis_db.loop_invariant.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
             }
         }
 

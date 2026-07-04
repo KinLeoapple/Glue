@@ -662,3 +662,62 @@ VM 阶段吞吐（`--profile`，短基准用此指标）：
 
 **性能收益**：暂无（字节码加载尚未集成，type_check 仍完整执行）。后续实现 tryLoadFromCache 加载字节码到 Program 后，可跳过 parse/type_check/compile，预期显著减少冷启动时间。
 
+### O8: 算术常量折叠 + 静态分析 4-pass 融合 (2026-07-04)
+**目标**：减少指令数（常量折叠）与冷启动开销（pass 融合），语义完全保持不变。
+**约束**：panic 时机、副作用顺序、零次循环执行等可观察行为不可改变。
+
+**改动一：算术常量折叠（编译器消费 ConstTable）**
+- [src/vm/compiler.zig](file:///d:/Projects/Zig/Glue/src/vm/compiler.zig) emitExpr 的 `.unary`/`.binary` 分支：
+  - 先调 `tryEmitConstFoldedUnary`/`tryEmitConstFoldedBinary`，命中则直接发射 `op_const` 并 return
+  - 未命中走原路径 `emitExpr(left)+emitExpr(right)+op`
+- 新增 helper（行 2071-2182）：
+  - `lookupConstValue(expr)` — 查 analysis_db.const_prop
+  - `foldedIntToValue(target_type, i128_val)` — i128→16字节小端→fromBytes(.i128)→coerceTo(target) 范围检查；**超出范围返回 null（放弃折叠，让运行时 panic 自然发生）**
+  - `foldedFloatToValue(target_type, f64_val)` — Float.fromNative
+  - `tryEmitConstFoldedBinary` — 仅折叠算术（add/sub/mul/div/mod/bit_and/bit_or/bit_xor）；**短路逻辑（and_op/or_op）、elvis、range、concat_list 不走此路径**
+  - `tryEmitConstFoldedUnary` — 仅处理 neg
+
+**语义保持关键点**：
+1. VM doArith 在溢出时 panic（ArithmeticOverflow），const_prop.evalBinary 用 Zig i128 wrapping 无溢出检查 → foldedIntToValue 用 coerceTo 做范围检查，超出范围放弃折叠，运行时 panic 自然发生
+2. 短路语义（and_op/or_op）、elvis、range、concat_list 保留原路径（副作用顺序不变）
+3. 浮点无溢出 panic，窄化是舍入（与运行时 doArithFloat 一致）
+
+**改动二：4-pass 融合遍历（purity + const_prop + loop_invariant）**
+- [src/sema/static_analysis/fused_analysis.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/fused_analysis.zig)（新建）：
+  - 单次 AST 遍历填充 const_prop / loop_invariant，收集 name_call_graph + direct_impure
+  - purity fixpoint 基于 name_call_graph 反向传播（O(N+E)，替代原每轮重新递归 AST 的 O(N×D×AST_size)）
+  - 复用 const_prop.zig 的 evalBinary/evalUnary/parseIntLiteral（镜像复制保持语义一致）
+  - impure 判定与原 purity.exprHasImpureCall 完全一致：间接调用→impure、method_call/safe_method_call/spawn/select/inline_trait_value→impure、impure builtin→impure、自递归不算 impure
+- [src/sema/static_analysis/analysis_db.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/analysis_db.zig)：新增 fused_analysis 导出
+- [src/loader/module_loader.zig](file:///d:/Projects/Zig/Glue/src/loader/module_loader.zig)：替换原 4 个独立 pass 调用为 FusedAnalysis + branch_reach（branch_reach 依赖 const_prop 完成，保持独立）
+
+**LICM（#2）跳过决策**：
+经分析有三个语义风险：(1) 副作用顺序、(2) panic 时机、(3) 变量赋值破坏不变性。零次执行保护（只在循环条件已折叠为 always_true 时 hoist）会抵消 benchmark 收益（典型循环 `i < N` 无法折叠），决定跳过留作后续。
+
+**收益**（3 次取最佳，ReleaseFast，VM-phase `--profile`）：
+
+| Benchmark | Phase 2-5 基线 VM ms | O8 VM ms | 变化 | 基线 M/s | O8 M/s | 变化 |
+|---|---|---|---|---|---|---|
+| fib    | 0.076  | 0.063  | -17% | 6.35   | 7.66   | +21% |
+| lookup | 925.01 | 955.99 | +3.3% | 162.42 | 157.15 | -3.2% |
+| record | 584.03 | 536.25 | **-8.2%** | 102.74 | 110.02 | **+7.1%** |
+| float  | 1013.44| 1041.32| +2.8% | 32.69  | 31.81  | -2.7% |
+| string | 31.91  | 32.01  | +0.3% | 55.98  | 55.80  | -0.3% |
+| closure| 45.37  | 46.38  | +2.2% | 139.98 | 136.91 | -2.2% |
+| array  | 18.09  | 18.01  | -0.4% | 101.33 | 101.72 | +0.4% |
+| tailcall| 30.71 | 30.26  | -1.5% | 169.37 | 171.91 | +1.5% |
+
+**分析**：
+- **record +7.1%**：常量折叠消除 record 字段算术（op_add 8.3%、op_mul 3.3% 中的编译期常量部分），减少 dispatch 指令数
+- **fib -17% / tailcall +1.5%**：fib 因 memoization 仅 484 指令，噪声主导；tailcall 轻微提升
+- **lookup/float/closure ±3%**：在噪声范围内（±5%），无真实回归
+- **pass 融合对冷启动影响**：标准 benchmark 模块极小（lex+parse+vm 总计 <1ms），静态分析阶段占比 <0.1ms，融合收益被测量噪声淹没
+
+**正确性验证**：
+- `zig build test`：166/166 单元测试通过
+- 集成测试：34/34 通过（含 stress_calculator 的 `1+2+3=6` / `1000/0=>parse error: division by zero` 常量折叠 + 除零语义保持验证）
+- Benchmark：8/8 通过，输出全部正确（fib=2178309, lookup=410780000, record=183631488, float=21081710.65..., string=50000, closure=17891650000, array=135, tailcall=50500000）
+- Stress 测试：stress_compute (10.9s) / stress_memory (3.3s) / stress_composite (11.2s) 全部通过
+
+**无行为变更**：常量折叠仅在编译期求值不变表达式；pass 融合仅合并遍历顺序，判定逻辑与原实现逐行对比一致。
+

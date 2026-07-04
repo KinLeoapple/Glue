@@ -14,6 +14,7 @@ pub const call_graph = @import("call_graph.zig");
 pub const const_prop = @import("const_prop.zig");
 pub const branch_reach = @import("branch_reach.zig");
 pub const loop_invariant = @import("loop_invariant.zig");
+pub const fused_analysis = @import("fused_analysis.zig");
 
 pub const TypeKind = type_table_mod.TypeKind;
 pub const TypeTable = type_table_mod.TypeTable;
@@ -31,6 +32,7 @@ pub const BranchReachPass = branch_reach.BranchReachPass;
 pub const LoopInfo = loop_invariant.LoopInfo;
 pub const LoopTable = loop_invariant.LoopTable;
 pub const LoopInvariantPass = loop_invariant.LoopInvariantPass;
+pub const FusedAnalysis = fused_analysis.FusedAnalysis;
 
 /// 分析数据库
 pub const AnalysisDB = struct {
