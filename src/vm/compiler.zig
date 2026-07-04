@@ -901,6 +901,69 @@ fn stmtHasBreakOrContinue(stmt: *const ast.Stmt) bool {
     }
 }
 
+/// 【指令融合】递归检测表达式是否无副作用（可安全消除）。
+/// 无副作用的表达式：字面量、变量读取、算术、比较、逻辑、字段访问、if（纯分支）、block（纯语句）。
+/// 有副作用的表达式：调用（call/method_call）、赋值、throw、spawn、lazy、赋值类二元（concat_list 中的 COW）。
+/// 注意：field_access 在 record 上是纯读取（COW 下不修改原值），但 record 本身可能触发 retain。
+/// 为安全起见，仅对"值产生"类表达式返回 true，排除所有可能分配/释放/IO/异常的表达式。
+fn exprHasNoSideEffects(expr: *const ast.Expr) bool {
+    switch (expr.*) {
+        .int_literal, .float_literal, .bool_literal, .char_literal,
+        .string_literal, .null_literal, .unit_literal,
+        => return true,
+
+        .identifier => return true,
+
+        .unary => |u| return exprHasNoSideEffects(u.operand),
+
+        .binary => |b| {
+            // concat_list (++ 数组) 和 range 涉及分配，视为有副作用
+            switch (b.op) {
+                .concat_list, .range, .range_inclusive => return false,
+                .and_op, .or_op, .elvis => {}, // 短路求值，本身无副作用
+                else => {},
+            }
+            return exprHasNoSideEffects(b.left) and exprHasNoSideEffects(b.right);
+        },
+
+        .if_expr => |i| {
+            if (!exprHasNoSideEffects(i.condition)) return false;
+            if (!exprHasNoSideEffects(i.then_branch)) return false;
+            if (i.else_branch) |e| if (!exprHasNoSideEffects(e)) return false;
+            return true;
+        },
+
+        .block => |b| {
+            for (b.statements) |s| {
+                if (!stmtHasNoSideEffects(s)) return false;
+            }
+            if (b.trailing_expr) |te| return exprHasNoSideEffects(te);
+            return true;
+        },
+
+        .field_access => |fa| return exprHasNoSideEffects(fa.object),
+        .safe_access => |sa| return exprHasNoSideEffects(sa.object),
+
+        // 有副作用或可能抛异常/分配的表达式
+        .call, .method_call, .safe_method_call, .string_interpolation,
+        .index, .record_literal, .record_extend, .array_literal,
+        .lambda, .match, .select, .spawn, .lazy,
+        .assignment_expr, .compound_assign, .propagate, .non_null_assert,
+        .atomic_expr, .type_cast, .inline_trait_value,
+        => return false,
+    }
+}
+
+fn stmtHasNoSideEffects(stmt: *const ast.Stmt) bool {
+    switch (stmt.*) {
+        .expression => |e| return exprHasNoSideEffects(e.expr),
+        .val_decl => |v| return exprHasNoSideEffects(v.value),
+        .var_decl => |v| return exprHasNoSideEffects(v.value),
+        // 赋值/返回/break/continue/throw/defer 都有副作用
+        else => return false,
+    }
+}
+
 /// 单函数编译器：编译一个函数体到一个 Chunk。
 const FnCompiler = struct {
     chunk: Chunk,
@@ -2609,6 +2672,8 @@ const FnCompiler = struct {
                 try self.emitSlotOp(.op_set_local, slot, d.location);
             },
             .expression => |e| {
+                // 指令融合 DCE：表达式无副作用时，完全消除（不发射 emitExpr + op_pop）
+                if (exprHasNoSideEffects(e.expr)) return;
                 try self.emitExpr(e.expr);
                 try self.chunk.writeOp(.op_pop, e.location);
             },
@@ -2663,7 +2728,13 @@ const FnCompiler = struct {
                     try self.chunk.writeOp(.op_return, r.location);
                 }
             },
-            .while_stmt => |w| try self.emitWhile(w),
+            .while_stmt => |w| {
+                // 常量边界 while 循环完全展开（`while i < N { ...; i = i + 1 }` 模式）
+                if (self.tryUnrollWhile(w, stmt)) |_| {
+                    return;
+                } else |_| {}
+                try self.emitWhile(w);
+            },
             .loop_stmt => |l| try self.emitLoop(l),
             .for_stmt => |f| try self.emitFor(f, stmt),
             .break_stmt => |b| {
@@ -2824,9 +2895,9 @@ const FnCompiler = struct {
         else
             if (end <= start) 0 else @intCast(end - start);
 
-        // 5. 安全限制：1..=8 次迭代（0 次 = 空循环直接跳过 body）
+        // 5. 安全限制：1..=16 次迭代（0 次 = 空循环直接跳过 body）
         if (count == 0) return; // 空循环：不发射任何指令（常量 range 无副作用）
-        if (count > 8) return error.SkipUnroll;
+        if (count > 16) return error.SkipUnroll;
 
         // 6. 检查 body 不含 break/continue（展开后跳转语义不兼容）
         if (exprHasBreakOrContinue(f.body)) return error.SkipUnroll;
@@ -2848,6 +2919,102 @@ const FnCompiler = struct {
             // 循环体（值丢弃）
             try self.emitExpr(f.body);
             try self.chunk.writeOp(.op_pop, loc);
+        }
+    }
+
+    /// 常量边界 while 循环完全展开。
+    /// 识别模式：`while i < N { body; i = i + 1 }` 或 `while i <= N { body; i = i + 1 }`
+    /// 其中 i 是 local identifier，初始值和 N 都是编译期整常量，步长 1。
+    /// 迭代次数 ≤ 16 时完全展开；body 无 break/continue。
+    /// 语义保持：循环变量 i 在展开每轮被设置为对应常量值，与运行时 `i = i + 1` 等价。
+    fn tryUnrollWhile(self: *FnCompiler, w: @TypeOf(@as(Stmt, undefined).while_stmt), stmt: *const Stmt) UnrollError!void {
+        // 1. 检查循环体是否小到可展开
+        const info = self.module.loopInfo(stmt) orelse return error.SkipUnroll;
+        if (!info.is_small) return error.SkipUnroll;
+
+        // 2. 条件必须是 binary 比较运算 i < N 或 i <= N
+        if (w.condition.* != .binary) return error.SkipUnroll;
+        const cond_bin = w.condition.binary;
+        const is_inclusive: bool = switch (cond_bin.op) {
+            .lt => false,
+            .lt_eq => true,
+            else => return error.SkipUnroll,
+        };
+
+        // 3. 左操作数必须是 identifier（循环变量）
+        if (cond_bin.left.* != .identifier) return error.SkipUnroll;
+        const var_name = cond_bin.left.identifier.name;
+        const var_slot = self.resolveLocal(var_name) orelse return error.SkipUnroll;
+
+        // 4. 右操作数 N 必须是编译期整常量
+        const n_cv = self.module.constValue(cond_bin.right) orelse return error.SkipUnroll;
+        if (n_cv != .int_val) return error.SkipUnroll;
+        if (n_cv.int_val < std.math.minInt(i64) or n_cv.int_val > std.math.maxInt(i64)) return error.SkipUnroll;
+        const n_val: i64 = @intCast(n_cv.int_val);
+
+        // 5. 循环变量 i 的初始值必须是编译期整常量（查 ConstTable 中 identifier 的值）
+        const init_cv = self.module.constValue(cond_bin.left) orelse return error.SkipUnroll;
+        if (init_cv != .int_val) return error.SkipUnroll;
+        if (init_cv.int_val < std.math.minInt(i64) or init_cv.int_val > std.math.maxInt(i64)) return error.SkipUnroll;
+        const init_val: i64 = @intCast(init_cv.int_val);
+
+        // 6. 循环体必须是 block，且最后一个语句是 `i = i + 1`（步长 1 的自增）
+        if (w.body.* != .block) return error.SkipUnroll;
+        const body_block = w.body.block;
+        if (body_block.statements.len == 0) return error.SkipUnroll;
+        const last_stmt = body_block.statements[body_block.statements.len - 1];
+        if (last_stmt.* != .assignment) return error.SkipUnroll;
+        const last_assign = last_stmt.assignment;
+        if (last_assign.target.* != .identifier) return error.SkipUnroll;
+        if (!std.mem.eql(u8, last_assign.target.identifier.name, var_name)) return error.SkipUnroll;
+        if (last_assign.value.* != .binary) return error.SkipUnroll;
+        const step_bin = last_assign.value.binary;
+        if (step_bin.op != .add) return error.SkipUnroll;
+        // RHS 必须是整常量 1
+        const step_cv = self.module.constValue(step_bin.right) orelse return error.SkipUnroll;
+        if (step_cv != .int_val or step_cv.int_val != 1) return error.SkipUnroll;
+        // LHS 必须是同一 identifier
+        if (step_bin.left.* != .identifier) return error.SkipUnroll;
+        if (!std.mem.eql(u8, step_bin.left.identifier.name, var_name)) return error.SkipUnroll;
+
+        // 7. 计算迭代次数
+        const count: u64 = if (is_inclusive)
+            if (n_val < init_val) 0 else @intCast(n_val - init_val + 1)
+        else
+            if (n_val <= init_val) 0 else @intCast(n_val - init_val);
+
+        if (count == 0) return; // 空循环：不发射任何指令
+        if (count > 16) return error.SkipUnroll;
+
+        // 8. body 不含 break/continue（步长语句本身的 assignment 不含）
+        // 检查 body 除最后一句外的部分 + 最后一句
+        if (exprHasBreakOrContinue(w.body)) return error.SkipUnroll;
+
+        // 9. 展开：每轮设置 i = 当前值，执行 body（除最后一句自增），最后 pop body 值
+        const loc = w.location;
+        // body 去掉最后一句自增后的"有效部分"——直接逐轮发射
+        var iter: i64 = init_val;
+        const last_iter: i64 = if (is_inclusive) n_val else n_val - 1;
+        while (iter <= last_iter) : (iter += 1) {
+            // 绑定循环变量 = iter
+            const val = Value.fromInt(value.Int.fromNative(.i64, iter));
+            const cidx = try self.chunk.addConstant(val);
+            try self.emitConst(cidx, loc);
+            try self.emitSlotOp(.op_set_local, var_slot, loc);
+            // 执行 body 中除最后一句自增外的所有语句
+            for (body_block.statements[0 .. body_block.statements.len - 1]) |s| {
+                try self.emitStmt(s);
+            }
+            // body 的 trailing_expr（若有）求值后丢弃
+            if (body_block.trailing_expr) |te| {
+                try self.emitExpr(te);
+                try self.chunk.writeOp(.op_pop, loc);
+            } else {
+                // block 无 trailing_expr：最后一个语句若是表达式语句已自带 pop；
+                // 否则 block 值为 unit，需补 push unit 保持栈平衡（while 体值丢弃）
+                try self.chunk.writeOp(.op_unit, loc);
+                try self.chunk.writeOp(.op_pop, loc);
+            }
         }
     }
 

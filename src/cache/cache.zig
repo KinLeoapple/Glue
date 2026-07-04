@@ -25,7 +25,7 @@ pub const reloc = @import("reloc.zig");
 pub const CACHE_MAGIC: [8]u8 = .{ 'G', 'L', 'U', 'E', 'B', 'C', '0', '1' };
 /// 缓存格式版本（BccFile 结构变化时递增）
 /// v2: 添加 deps 字段（whole-program cache 依赖列表）
-pub const CACHE_VERSION: u32 = 2;
+pub const CACHE_VERSION: u32 = 3;
 
 /// 缓存键：源文件路径 + mtime + size
 pub const CacheKey = struct {
