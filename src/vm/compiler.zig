@@ -1,4 +1,4 @@
-//! Glue 字节码 VM — 编译器（M1a：模块级 AST → Program）
+﻿//! Glue 字节码 VM — 编译器（M1a：模块级 AST → Program）
 //!
 //! 设计见 docs/bytecode-vm-plan.md §5。M1a 覆盖：
 //! - 模块编译：两遍——先给每个顶层 fun_decl 分配 func_idx 建函数表，再逐个编译函数体。
@@ -711,7 +711,7 @@ pub const ModuleCompiler = struct {
         var i: u8 = 0;
         while (i < arity) : (i += 1) {
             fc.slot_count = @max(fc.slot_count, @as(u16, i) + 1);
-            try fc.emitSlotOp(.op_get_local_u8, .op_get_local, i, loc);
+            try fc.emitSlotOp(.op_get_local, i, loc);
         }
         try fc.chunk.writeOp(.op_make_adt, loc);
         try fc.recordIdx(.ctor, ctor_idx);
@@ -954,13 +954,9 @@ const FnCompiler = struct {
         }
     }
 
-    /// 【O9】slot/idx 立即数窄化发射：slot ≤ 255 时发射 u8 变体（1 字节立即数），
-    /// 否则回退 u16 变体（2 字节立即数）。仅用于局部变量 slot/upvalue idx 指令——
-    /// 这些指令不记录 reloc（slot 是帧内局部，不跨模块），u8 编码不影响 reloc 表。
-    /// op_u8/op_u16 为同一指令的两个变体，VM dispatch 合并到同一 prong。
-    inline fn emitSlotOp(self: *FnCompiler, op_u8: OpCode, op_u16: OpCode, slot: u16, loc: ast.SourceLocation) !void {
-        _ = op_u8; // 暂时禁用 u8 窄化：合并 prong 内 if-else 导致回归，待改独立 prong
-        try self.chunk.writeOp(op_u16, loc);
+    /// 发射 slot/idx 立即数指令（writeOp + writeU16）。
+    inline fn emitSlotOp(self: *FnCompiler, op: OpCode, slot: u16, loc: ast.SourceLocation) !void {
+        try self.chunk.writeOp(op, loc);
         try self.chunk.writeU16(slot);
     }
 
@@ -1082,9 +1078,9 @@ const FnCompiler = struct {
                         return error.Unsupported;
                     }
                 } else if (self.resolveLocal(id.name)) |slot| {
-                    try self.emitSlotOp(.op_get_local_u8, .op_get_local, slot, loc);
+                    try self.emitSlotOp(.op_get_local, slot, loc);
                 } else if (try self.resolveUpvalue(id.name)) |uv_idx| {
-                    try self.emitSlotOp(.op_get_upvalue_u8, .op_get_upvalue, uv_idx, loc);
+                    try self.emitSlotOp(.op_get_upvalue, uv_idx, loc);
                 } else if (self.module.lookupFn(id.name)) |func_idx| {
                     // 顶层函数名出现在值位置（非直接 call）→ 包成 vm_closure 一等值。
                     try self.chunk.writeOp(.op_closure, loc);
@@ -1271,9 +1267,9 @@ const FnCompiler = struct {
                 try self.emitExpr(a.value); // 栈顶：v
                 try self.chunk.writeOp(.op_dup, a.location); // 复制 v（一份写回，一份作表达式值）
                 if (self.resolveLocal(name)) |slot| {
-                    try self.emitSlotOp(.op_set_local_assign_u8, .op_set_local_assign, slot, a.location);
+                    try self.emitSlotOp(.op_set_local_assign, slot, a.location);
                 } else if (try self.resolveUpvalue(name)) |uv_idx| {
-                    try self.emitSlotOp(.op_set_upvalue_u8, .op_set_upvalue, uv_idx, a.location);
+                    try self.emitSlotOp(.op_set_upvalue, uv_idx, a.location);
                 } else if (self.module.lookupGlobal(name)) |ge| {
                     // M5g：赋值表达式写顶层 var 全局。
                     try self.chunk.writeOp(.op_set_global, a.location);
@@ -1479,7 +1475,7 @@ const FnCompiler = struct {
                     const saved = self.locals.items.len;
                     if (ra.binding) |bname| {
                         const slot = try self.declareLocal(bname, false, true, null);
-                        try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, ra.location); // value → slot
+                        try self.emitSlotOp(.op_set_local, slot, ra.location); // value → slot
                     } else {
                         try self.chunk.writeOp(.op_pop, ra.location); // 丢弃 value
                     }
@@ -1520,7 +1516,7 @@ const FnCompiler = struct {
                     const saved = self.locals.items.len;
                     if (ra.binding) |bname| {
                         const slot = try self.declareLocal(bname, false, true, null);
-                        try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, ra.location);
+                        try self.emitSlotOp(.op_set_local, slot, ra.location);
                     } else {
                         try self.chunk.writeOp(.op_pop, ra.location);
                     }
@@ -1813,7 +1809,7 @@ const FnCompiler = struct {
             }
             const param = entry.params[i];
             const slot = try self.declareLocal(param.name, param.is_var, typeNeedsRelease(param.type_annotation), builtinTypeOf(param.type_annotation));
-            try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, loc);
+            try self.emitSlotOp(.op_set_local, slot, loc);
         }
 
         // 展开 body：body 中的 identifier(param_name) 会 resolveLocal 找到临时 slot
@@ -1829,10 +1825,10 @@ const FnCompiler = struct {
         if (expr.* == .identifier) {
             const name = expr.identifier.name;
             if (self.resolveLocal(name)) |slot| {
-                try self.emitSlotOp(.op_get_local_raw_u8, .op_get_local_raw, slot, expr.identifier.location);
+                try self.emitSlotOp(.op_get_local_raw, slot, expr.identifier.location);
                 return;
             } else if (try self.resolveUpvalue(name)) |uv| {
-                try self.emitSlotOp(.op_get_upvalue_raw_u8, .op_get_upvalue_raw, uv, expr.identifier.location);
+                try self.emitSlotOp(.op_get_upvalue_raw, uv, expr.identifier.location);
                 return;
             }
         }
@@ -1845,10 +1841,10 @@ const FnCompiler = struct {
         if (obj.* == .identifier) {
             const name = obj.identifier.name;
             if (self.resolveLocal(name)) |slot| {
-                try self.emitSlotOp(.op_get_local_raw_u8, .op_get_local_raw, slot, obj.identifier.location);
+                try self.emitSlotOp(.op_get_local_raw, slot, obj.identifier.location);
                 return;
             } else if (try self.resolveUpvalue(name)) |uv| {
-                try self.emitSlotOp(.op_get_upvalue_raw_u8, .op_get_upvalue_raw, uv, obj.identifier.location);
+                try self.emitSlotOp(.op_get_upvalue_raw, uv, obj.identifier.location);
                 return;
             }
         }
@@ -2373,7 +2369,7 @@ const FnCompiler = struct {
         try self.emitExpr(m.scrutinee);
         const saved_scrut = self.locals.items.len;
         const scrut_slot = try self.declareLocal("$scrut", false, true, null);
-        try self.emitSlotOp(.op_set_local_u8, .op_set_local, scrut_slot, loc);
+        try self.emitSlotOp(.op_set_local, scrut_slot, loc);
 
         var end_jumps = std.ArrayListUnmanaged(usize).empty;
         defer end_jumps.deinit(self.allocator);
@@ -2412,7 +2408,7 @@ const FnCompiler = struct {
         try self.emitExpr(m.scrutinee);
         const saved_scrut = self.locals.items.len;
         const scrut_slot = try self.declareLocal("$scrut", false, true, null);
-        try self.emitSlotOp(.op_set_local_u8, .op_set_local, scrut_slot, loc);
+        try self.emitSlotOp(.op_set_local, scrut_slot, loc);
 
         for (m.arms) |arm| {
             const arm_base = self.locals.items.len;
@@ -2451,14 +2447,14 @@ const FnCompiler = struct {
                 } else {
                     // 小写：变量绑定，恒匹配。
                     const slot = try self.declareLocal(v.name, false, true, null);
-                    try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
-                    try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, loc);
+                    try self.emitSlotOp(.op_get_local, scrut_slot, loc);
+                    try self.emitSlotOp(.op_set_local, slot, loc);
                 }
             },
             .literal => |lit| {
                 const v = (try patternLiteralToValue(self.allocator, lit)) orelse return error.Unsupported;
                 const cidx = try self.chunk.addConstant(v);
-                try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                 try self.chunk.writeOp(.op_test_lit, loc);
                 try self.chunk.writeU16(cidx);
                 try fail_jumps.append(self.allocator, try self.chunk.emitJump(.op_jump_if_false, loc));
@@ -2469,21 +2465,21 @@ const FnCompiler = struct {
                     // M3c：Throw 的 Ok(v)/Error(e) 模式 —— OP_TEST_THROW + 解包绑定。
                     if (ctor.patterns.len != 1) return error.Unsupported;
                     const want_ok: u8 = if (ctor.name[0] == 'O') 1 else 0;
-                    try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                    try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                     try self.chunk.writeOp(.op_test_throw, loc);
                     try self.chunk.writeByte(want_ok);
                     try fail_jumps.append(self.allocator, try self.chunk.emitJump(.op_jump_if_false, loc));
                     try self.chunk.writeOp(.op_pop, loc); // 命中：弹 true
                     // 解包内值（Ok→inner / Error→error_val）进临时 slot 递归。
                     const tmp = try self.declareLocal("$thr", false, true, null);
-                    try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                    try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                     try self.chunk.writeOp(if (want_ok == 1) .op_get_throw_ok else .op_get_throw_err, loc);
-                    try self.emitSlotOp(.op_set_local_u8, .op_set_local, tmp, loc);
+                    try self.emitSlotOp(.op_set_local, tmp, loc);
                     try self.emitPatternMatch(ctor.patterns[0], tmp, fail_jumps, loc);
                 } else if (self.module.lookupNewtype(ctor.name)) |_| {
                     // newtype 构造器模式 Handle(p)：测 type_name + 解 inner 递归。
                     if (ctor.patterns.len != 1) return error.Unsupported;
-                    try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                    try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                     const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, ctor.name));
                     try self.chunk.writeOp(.op_test_newtype, loc);
                     try self.chunk.writeU16(name_const);
@@ -2491,19 +2487,19 @@ const FnCompiler = struct {
                     try self.chunk.writeOp(.op_pop, loc);
                     // 解 inner 进临时 slot 递归。
                     const tmp = try self.declareLocal("$nt", false, true, null);
-                    try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                    try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                     try self.chunk.writeOp(.op_get_newtype_inner, loc);
-                    try self.emitSlotOp(.op_set_local_u8, .op_set_local, tmp, loc);
+                    try self.emitSlotOp(.op_set_local, tmp, loc);
                     try self.emitPatternMatch(ctor.patterns[0], tmp, fail_jumps, loc);
                 } else {
                     // ADT 构造器模式：测构造器名 + 按位置解字段递归。
                     try self.emitCtorTest(scrut_slot, ctor.name, fail_jumps, loc);
                     for (ctor.patterns, 0..) |sub, i| {
                         const tmp = try self.declareLocal("$fld", false, true, null);
-                        try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                        try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                         try self.chunk.writeOp(.op_get_adt_field, loc);
                         try self.chunk.writeU16(@intCast(i));
-                        try self.emitSlotOp(.op_set_local_u8, .op_set_local, tmp, loc);
+                        try self.emitSlotOp(.op_set_local, tmp, loc);
                         try self.emitPatternMatch(sub, tmp, fail_jumps, loc);
                     }
                 }
@@ -2512,11 +2508,11 @@ const FnCompiler = struct {
                 // 记录模式：无标签测试，按名解字段递归绑定。
                 for (rec.fields) |f| {
                     const tmp = try self.declareLocal("$rf", false, true, null);
-                    try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                    try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                     const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, f.name));
                     try self.chunk.writeOp(.op_get_field, loc);
                     try self.chunk.writeU16(name_const);
-                    try self.emitSlotOp(.op_set_local_u8, .op_set_local, tmp, loc);
+                    try self.emitSlotOp(.op_set_local, tmp, loc);
                     try self.emitPatternMatch(f.pattern, tmp, fail_jumps, loc);
                 }
             },
@@ -2538,7 +2534,7 @@ const FnCompiler = struct {
 
     /// 发 nullary/有参 ADT 构造器名测试：get scrut → OP_TEST_CTOR → jump_if_false 进 fail → pop true。
     fn emitCtorTest(self: *FnCompiler, scrut_slot: u16, name: []const u8, fail_jumps: *std.ArrayListUnmanaged(usize), loc: ast.SourceLocation) CompileError!void {
-        try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+        try self.emitSlotOp(.op_get_local, scrut_slot, loc);
         const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, name));
         try self.chunk.writeOp(.op_test_ctor, loc);
         try self.chunk.writeU16(name_const);
@@ -2554,13 +2550,13 @@ const FnCompiler = struct {
             .literal => |lit| {
                 const v = (try patternLiteralToValue(self.allocator, lit)) orelse return error.Unsupported;
                 const cidx = try self.chunk.addConstant(v);
-                try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                 try self.chunk.writeOp(.op_test_lit, loc);
                 try self.chunk.writeU16(cidx);
             },
             .variable => |v| {
                 if (v.name.len > 0 and v.name[0] >= 'A' and v.name[0] <= 'Z') {
-                    try self.emitSlotOp(.op_get_local_u8, .op_get_local, scrut_slot, loc);
+                    try self.emitSlotOp(.op_get_local, scrut_slot, loc);
                     const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, v.name));
                     try self.chunk.writeOp(.op_test_ctor, loc);
                     try self.chunk.writeU16(name_const);
@@ -2592,25 +2588,25 @@ const FnCompiler = struct {
                     // 存形参类型，供 op_call_value 路径 caller-side coerce（修复 i8 字面量传入 i64 形参未 coerce 的 bug）
                     self.locals.items[slot].closure_param_types = try extractParamTypes(self.allocator, d.value.lambda.params);
                     try self.chunk.writeOp(.op_unit, d.location);
-                    try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, d.location);
+                    try self.emitSlotOp(.op_set_local, slot, d.location);
                     const has_self_uv = try self.emitLambda(d.value.lambda, d.location, d.name);
                     if (has_self_uv) {
-                        try self.emitSlotOp(.op_set_local_letrec_u8, .op_set_local_letrec, slot, d.location);
+                        try self.emitSlotOp(.op_set_local_letrec, slot, d.location);
                     } else {
-                        try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, d.location);
+                        try self.emitSlotOp(.op_set_local, slot, d.location);
                     }
                 } else {
                     try self.emitBindingRhs(d.value);
                     try self.emitCoerceFromAnnotation(d.type_annotation, d.value, d.location); // M5：val a: i32 = ...
                     const slot = try self.declareLocal(d.name, false, typeNeedsRelease(d.type_annotation), builtinTypeOf(d.type_annotation));
-                    try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, d.location);
+                    try self.emitSlotOp(.op_set_local, slot, d.location);
                 }
             },
             .var_decl => |d| {
                 try self.emitBindingRhs(d.value);
                 try self.emitCoerceFromAnnotation(d.type_annotation, d.value, d.location); // M5：var a: i32 = ...
                 const slot = try self.declareLocal(d.name, true, typeNeedsRelease(d.type_annotation), builtinTypeOf(d.type_annotation));
-                try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, d.location);
+                try self.emitSlotOp(.op_set_local, slot, d.location);
             },
             .expression => |e| {
                 try self.emitExpr(e.expr);
@@ -2634,15 +2630,15 @@ const FnCompiler = struct {
                     try self.emitExpr(mc.arguments[0]);
                     try self.chunk.writeOp(.op_push_inplace, a.location);
                     try self.chunk.writeU16(slot);
-                    try self.emitSlotOp(.op_set_local_assign_u8, .op_set_local_assign, slot, a.location);
+                    try self.emitSlotOp(.op_set_local_assign, slot, a.location);
                     return;
                 }
                 if (self.resolveLocal(name)) |slot| {
                     try self.emitExpr(a.value);
-                    try self.emitSlotOp(.op_set_local_assign_u8, .op_set_local_assign, slot, a.location);
+                    try self.emitSlotOp(.op_set_local_assign, slot, a.location);
                 } else if (try self.resolveUpvalue(name)) |uv_idx| {
                     try self.emitExpr(a.value);
-                    try self.emitSlotOp(.op_set_upvalue_u8, .op_set_upvalue, uv_idx, a.location);
+                    try self.emitSlotOp(.op_set_upvalue, uv_idx, a.location);
                 } else if (self.module.lookupGlobal(name)) |ge| {
                     // M5g：顶层 var 重新赋值 → OP_SET_GLOBAL（val 不可变性由 type_check 保证）。
                     try self.emitExpr(a.value);
@@ -2759,11 +2755,11 @@ const FnCompiler = struct {
         // 隐藏 slot：iterable 值 + index（i64，初始 0）。
         try self.emitExpr(f.iterable);
         const iter_slot = try self.declareLocal("$iter", false, true, null);
-        try self.emitSlotOp(.op_set_local_u8, .op_set_local, iter_slot, loc);
+        try self.emitSlotOp(.op_set_local, iter_slot, loc);
         const idx_const = try self.chunk.addConstant(Value.fromInt(value.Int.fromNative(.i64, @as(i64, 0))));
         try self.emitConst(idx_const, loc);
         const idx_slot = try self.declareLocal("$idx", true, false, null);
-        try self.emitSlotOp(.op_set_local_u8, .op_set_local, idx_slot, loc);
+        try self.emitSlotOp(.op_set_local, idx_slot, loc);
         // 循环变量 slot（每轮 OP_FOR_NEXT 压元素后 set_local 绑定）。
         const var_slot = try self.declareLocal(f.name, true, true, null);
 
@@ -2776,7 +2772,7 @@ const FnCompiler = struct {
         const exit_at = self.chunk.here();
         try self.chunk.writeI32(0); // 占位，循环末回填
         // 绑定循环变量（弹元素写 var_slot）。
-        try self.emitSlotOp(.op_set_local_u8, .op_set_local, var_slot, loc);
+        try self.emitSlotOp(.op_set_local, var_slot, loc);
         // 循环体（值丢弃）。
         try self.emitExpr(f.body);
         try self.chunk.writeOp(.op_pop, loc);
@@ -2848,7 +2844,7 @@ const FnCompiler = struct {
             const val = Value.fromInt(value.Int.fromNative(.i64, i));
             const cidx = try self.chunk.addConstant(val);
             try self.emitConst(cidx, loc);
-            try self.emitSlotOp(.op_set_local_u8, .op_set_local, var_slot, loc);
+            try self.emitSlotOp(.op_set_local, var_slot, loc);
             // 循环体（值丢弃）
             try self.emitExpr(f.body);
             try self.chunk.writeOp(.op_pop, loc);
@@ -2920,18 +2916,18 @@ const FnCompiler = struct {
         if (fa.object.* == .identifier) {
             const oname = fa.object.identifier.name;
             if (self.resolveLocal(oname)) |slot| {
-                try self.emitSlotOp(.op_get_local_u8, .op_get_local, slot, fa.location);
+                try self.emitSlotOp(.op_get_local, slot, fa.location);
                 try self.emitExpr(fa.value);
                 try self.chunk.writeOp(.op_set_field, fa.location);
                 try self.chunk.writeU16(name_const);
-                try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, fa.location);
+                try self.emitSlotOp(.op_set_local, slot, fa.location);
                 return;
             } else if (try self.resolveUpvalue(oname)) |uv| {
-                try self.emitSlotOp(.op_get_upvalue_u8, .op_get_upvalue, uv, fa.location);
+                try self.emitSlotOp(.op_get_upvalue, uv, fa.location);
                 try self.emitExpr(fa.value);
                 try self.chunk.writeOp(.op_set_field, fa.location);
                 try self.chunk.writeU16(name_const);
-                try self.emitSlotOp(.op_set_upvalue_u8, .op_set_upvalue, uv, fa.location);
+                try self.emitSlotOp(.op_set_upvalue, uv, fa.location);
                 return;
             } else if (self.module.lookupGlobal(oname)) |ge| {
                 // M5g：顶层 var 记录字段赋值 g.f = v（COW 写回全局槽）。
@@ -2963,18 +2959,18 @@ const FnCompiler = struct {
         if (idx.object.* == .identifier) {
             const oname = idx.object.identifier.name;
             if (self.resolveLocal(oname)) |slot| {
-                try self.emitSlotOp(.op_get_local_u8, .op_get_local, slot, loc);
+                try self.emitSlotOp(.op_get_local, slot, loc);
                 try self.emitExpr(idx.index);
                 try self.emitExpr(rhs);
                 try self.chunk.writeOp(.op_set_index, loc);
-                try self.emitSlotOp(.op_set_local_u8, .op_set_local, slot, loc);
+                try self.emitSlotOp(.op_set_local, slot, loc);
                 return;
             } else if (try self.resolveUpvalue(oname)) |uv| {
-                try self.emitSlotOp(.op_get_upvalue_u8, .op_get_upvalue, uv, loc);
+                try self.emitSlotOp(.op_get_upvalue, uv, loc);
                 try self.emitExpr(idx.index);
                 try self.emitExpr(rhs);
                 try self.chunk.writeOp(.op_set_index, loc);
-                try self.emitSlotOp(.op_set_upvalue_u8, .op_set_upvalue, uv, loc);
+                try self.emitSlotOp(.op_set_upvalue, uv, loc);
                 return;
             } else if (self.module.lookupGlobal(oname)) |ge| {
                 // M5g：顶层 var 数组元素赋值 g[i] = v（COW 写回全局槽）。
