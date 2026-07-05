@@ -24,6 +24,11 @@ pub const Chunk = struct {
     /// （line:u20 << 12 | column:u12，4B/字节）。行号 ≤1,048,575、列号 ≤4095 完整保留，
     /// 超出范围按位截断（极端文件场景）。配合 VM 惰性加载：仅错误/helper 路径解码。
     lines: std.ArrayListUnmanaged(u32) = .empty,
+    /// 【常量池去重】仅对内联标量（null/unit/bool/char/int/float）和 string 去重。
+    /// 复合值（array/record/adt 等）每次都新建 slot（罕见且所有权复杂）。
+    /// key = Value，value = constants 中的索引。addConstant 命中时 release 新传入的 v（caller 期望
+    /// addConstant 取得所有权），返回已存在的 idx。
+    const_dedup: std.HashMapUnmanaged(Value, u16, ConstDedupContext, std.hash_map.default_max_load_percentage) = .{},
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Chunk {
@@ -36,6 +41,7 @@ pub const Chunk = struct {
         for (self.constants.items) |c| c.release(self.allocator);
         self.constants.deinit(self.allocator);
         self.lines.deinit(self.allocator);
+        self.const_dedup.deinit(self.allocator);
     }
 
     /// 写一字节 opcode，并登记其源位置。
@@ -96,7 +102,21 @@ pub const Chunk = struct {
     }
 
     /// 向常量池追加一个常量，返回其索引。常量池取得该值所有权。
+    /// 【常量池去重】对标量（null/unit/bool/char/int/float）和 string 做去重：
+    /// 命中已存在的等值常量时，release 新传入的 v（保持"addConstant 取得所有权"契约），
+    /// 返回已存在的 idx。复合值（array/record/adt 等）不去重，每次新建 slot。
     pub fn addConstant(self: *Chunk, v: Value) !u16 {
+        if (ConstDedupContext.isDedupable(v)) {
+            if (self.const_dedup.get(v)) |existing_idx| {
+                // 命中：release 新 v（caller 期望所有权转移，此处等价于"转移给已存在的常量"）
+                v.release(self.allocator);
+                return existing_idx;
+            }
+            const idx: u16 = @intCast(self.constants.items.len);
+            try self.constants.append(self.allocator, v);
+            try self.const_dedup.put(self.allocator, v, idx);
+            return idx;
+        }
         const idx = self.constants.items.len;
         try self.constants.append(self.allocator, v);
         return @intCast(idx);
@@ -126,6 +146,44 @@ pub const Chunk = struct {
         self.code.items[operand_at + 1] = @intCast((u >> 8) & 0xFF);
         self.code.items[operand_at + 2] = @intCast((u >> 16) & 0xFF);
         self.code.items[operand_at + 3] = @intCast((u >> 24) & 0xFF);
+    }
+};
+
+/// 【常量池去重】HashMap context：仅对内联标量 + string 做去重；
+/// 复合值（array/record/adt 等）isDedupable 返回 false，跳过去重。
+/// hash 基于值内容（int 的 type+lo+hi，string 的 bytes），eql 委托 value.equals。
+const ConstDedupContext = struct {
+    pub fn hash(_: ConstDedupContext, v: Value) u64 {
+        return switch (v) {
+            .null_val => 0x9E37_79B9_7E37_79B9,
+            .unit => 0xD6E8_FEB8_6659_EF73,
+            .boolean => |b| if (b) 0x3C1F_8C29_A7B4_D5E6 else 0x6F4A_2D71_B8E0_9C35,
+            .char => |c| @as(u64, 0x55A5_55A5) +% @as(u64, c.codepoint),
+            .int => |i| hashInt(i.type, i.lo, i.hi),
+            .float => |f| hashInt(f.type, f.bits, f.extra),
+            .string => |s| std.hash.Wyhash.hash(0, s.bytes()),
+            else => unreachable, // isDedupable 保证不会走到这里
+        };
+    }
+
+    pub fn eql(_: ConstDedupContext, a: Value, b: Value) bool {
+        return value.equals(a, b);
+    }
+
+    /// 是否可去重：内联标量 + string（string 不可变，可安全共享）。
+    /// 复合值不去重（所有权复杂、常量池中罕见）。
+    pub fn isDedupable(v: Value) bool {
+        return switch (v) {
+            .null_val, .unit, .boolean, .char, .int, .float, .string => true,
+            else => false,
+        };
+    }
+
+    fn hashInt(t: anytype, lo: u64, hi: u64) u64 {
+        var h: u64 = @intFromEnum(t);
+        h = h *% 0x1000_0000_1B3 +% lo;
+        h = h *% 0x1000_0000_1B3 +% hi;
+        return h;
     }
 };
 
@@ -252,9 +310,6 @@ pub const Program = struct {
     trait_resolves: std.ArrayListUnmanaged(TraitResolveDesc) = .empty,
     /// 组合 Trait 名按定义顺序（M5n）：组合分派遍历此序，后者覆盖前者（镜像 eval trait_definition_order）。
     trait_order: std.ArrayListUnmanaged([]const u8) = .empty,
-    /// 【cache】Desc 表字符串所有权标记。true = 从 .bcc 反序列化，所有字符串 owned，deinit 释放；
-    /// false（默认）= 编译路径产出，field_names 外层数组 owned，内含字符串借用 AST 不释放。
-    owns_desc_strings: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Program {
@@ -264,78 +319,28 @@ pub const Program = struct {
     pub fn deinit(self: *Program) void {
         for (self.functions.items) |*f| f.deinit();
         self.functions.deinit(self.allocator);
-        if (self.owns_desc_strings) {
-            // cache 路径：所有字符串 owned（含 field_names 内层 + type_name 等）
-            for (self.adt_ctors.items) |*d| {
-                for (d.field_names) |opt| if (opt) |s| self.allocator.free(s);
-                self.allocator.free(d.field_names);
-                for (d.field_types) |opt| if (opt) |s| self.allocator.free(s);
-                self.allocator.free(d.field_types);
-                self.allocator.free(d.type_name);
-                self.allocator.free(d.ctor_name);
-            }
-            self.adt_ctors.deinit(self.allocator);
-            for (self.record_shapes.items) |*s| {
-                for (s.field_names) |n| self.allocator.free(n);
-                self.allocator.free(s.field_names);
-            }
-            self.record_shapes.deinit(self.allocator);
-            for (self.newtype_ctors.items) |*n| self.allocator.free(n.type_name);
-            self.newtype_ctors.deinit(self.allocator);
-            for (self.error_ctors.items) |*e| {
-                self.allocator.free(e.type_name);
-                self.allocator.free(e.default_prefix);
-            }
-            self.error_ctors.deinit(self.allocator);
-            for (self.trait_methods.items) |*m| {
-                self.allocator.free(m.type_name);
-                self.allocator.free(m.method_name);
-                self.allocator.free(m.trait_name);
-            }
-            self.trait_methods.deinit(self.allocator);
-            for (self.trait_defaults.items) |*d| {
-                self.allocator.free(d.trait_name);
-                self.allocator.free(d.method_name);
-            }
-            self.trait_defaults.deinit(self.allocator);
-            for (self.trait_parents.items) |*p| {
-                self.allocator.free(p.trait_name);
-                self.allocator.free(p.parent_name);
-            }
-            self.trait_parents.deinit(self.allocator);
-            for (self.trait_resolves.items) |*r| {
-                self.allocator.free(r.trait_name);
-                self.allocator.free(r.method_name);
-                if (r.delegate_trait) |dt| self.allocator.free(dt);
-                if (r.delegate_method) |dm| self.allocator.free(dm);
-            }
-            self.trait_resolves.deinit(self.allocator);
-            for (self.trait_order.items) |s| self.allocator.free(s);
-            self.trait_order.deinit(self.allocator);
-        } else {
-            // 编译路径：field_names 外层数组 owned，内含字符串借用 AST 不释放
-            for (self.adt_ctors.items) |d| {
-                self.allocator.free(d.field_names);
-                self.allocator.free(d.field_types);
-            }
-            self.adt_ctors.deinit(self.allocator);
-            for (self.record_shapes.items) |s| self.allocator.free(s.field_names);
-            self.record_shapes.deinit(self.allocator);
-            self.newtype_ctors.deinit(self.allocator);
-            self.error_ctors.deinit(self.allocator);
-            // trait_methods 字符串是 addTraitMethod 复制的（owned）
-            for (self.trait_methods.items) |m| {
-                self.allocator.free(m.type_name);
-                self.allocator.free(m.method_name);
-                self.allocator.free(m.trait_name);
-            }
-            self.trait_methods.deinit(self.allocator);
-            // trait_defaults/parents/resolves/order 借用 AST，不释放字符串
-            self.trait_defaults.deinit(self.allocator);
-            self.trait_parents.deinit(self.allocator);
-            self.trait_resolves.deinit(self.allocator);
-            self.trait_order.deinit(self.allocator);
+        // 编译路径：field_names 外层数组 owned，内含字符串借用 AST 不释放
+        for (self.adt_ctors.items) |d| {
+            self.allocator.free(d.field_names);
+            self.allocator.free(d.field_types);
         }
+        self.adt_ctors.deinit(self.allocator);
+        for (self.record_shapes.items) |s| self.allocator.free(s.field_names);
+        self.record_shapes.deinit(self.allocator);
+        self.newtype_ctors.deinit(self.allocator);
+        self.error_ctors.deinit(self.allocator);
+        // trait_methods 字符串是 addTraitMethod 复制的（owned）
+        for (self.trait_methods.items) |m| {
+            self.allocator.free(m.type_name);
+            self.allocator.free(m.method_name);
+            self.allocator.free(m.trait_name);
+        }
+        self.trait_methods.deinit(self.allocator);
+        // trait_defaults/parents/resolves/order 借用 AST，不释放字符串
+        self.trait_defaults.deinit(self.allocator);
+        self.trait_parents.deinit(self.allocator);
+        self.trait_resolves.deinit(self.allocator);
+        self.trait_order.deinit(self.allocator);
     }
 
     /// 追加一个函数，返回其索引。

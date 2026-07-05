@@ -15,6 +15,7 @@ const chunk_mod = @import("chunk.zig");
 const cast = @import("cast.zig");
 const method = @import("method.zig");
 const profiler_mod = @import("profiler");
+const heap_mod = @import("heap");
 
 const OpCode = opcode.OpCode;
 const Chunk = chunk_mod.Chunk;
@@ -28,25 +29,25 @@ fn opcodeNameCb(idx: u8) []const u8 {
     return (@as(OpCode, @enumFromInt(idx))).name();
 }
 
-/// M4c：spawn 协程上下文。每个 spawn 起一个 OS 线程跑子 VM；子 VM 用 per-spawn arena
+/// M4c：spawn 协程上下文。每个 spawn 起一个 OS 线程跑子 VM；子 VM 用 per-spawn HeapAllocator
 /// （page_allocator 裸打底）分配，与父 VM 内存隔离（VM 纯 refcount，array/record 非原子 rc
-/// 跨线程不安全 → 必须隔离堆）。结果存 handle.result（在 arena 内），await 时父线程深拷回父 allocator。
-/// 生命周期：worker 退出前置 handle.finished；VM.deinit 自旋等待后 arena.deinit + 释放 handle。
+/// 跨线程不安全 → 必须隔离堆）。结果存 handle.result（在 per-spawn 堆内），await 时父线程深拷回父 allocator。
+/// 生命周期：worker 退出前置 handle.finished；VM.deinit 自旋等待后 heap.deinit + 释放 handle。
 const SpawnCtx = struct {
     handle: *SpawnHandle,
     program: *const Program,
     func: *const Function, // spawn body 编译成的零参 Function（在共享 program 内）
-    captures: []Value, // 捕获快照（已深拷进 arena），按 func 的 upvalue 顺序
-    arena: *std.heap.ArenaAllocator, // per-spawn 堆（子 VM 全部分配走这里）
+    captures: []Value, // 捕获快照（已深拷进 per-spawn 堆），按 func 的 upvalue 顺序
+    spawn_heap: *heap_mod.HeapAllocator, // per-spawn 堆（子 VM 全部分配走这里）
     io: ?std.Io,
     thread: ?std.Thread = null,
 };
 
-/// 子 VM 线程入口：用 arena 起独立 VM，把 captures 包成 cell upvalues，跑 func，结果存 handle。
+/// 子 VM 线程入口：用 per-spawn HeapAllocator 起独立 VM，把 captures 包成 cell upvalues，跑 func，结果存 handle。
 fn spawnThreadEntry(ctx: *SpawnCtx) void {
     const handle = ctx.handle;
     defer handle.finished.store(true, .seq_cst); // 最后置位，VM.deinit 凭此安全回收
-    const alloc = ctx.arena.allocator();
+    const alloc = ctx.spawn_heap.allocator();
 
     // captures → cell upvalues（子 VM 帧的 upvalues 需 *Cell）。
     var ups: []Value = &.{};
@@ -79,7 +80,7 @@ fn spawnThreadEntry(ctx: *SpawnCtx) void {
     };
 
     handle.mutex.lock();
-    handle.result = result; // 在 arena 内；await 深拷回父 allocator 后由 arena.deinit 回收
+    handle.result = result; // 在 per-spawn 堆内；await 深拷回父 allocator 后由 heap.deinit 回收
     handle.status.store(.Completed, .seq_cst);
     handle.condition.broadcast();
     handle.mutex.unlock();
@@ -87,7 +88,7 @@ fn spawnThreadEntry(ctx: *SpawnCtx) void {
 
 fn spawnFail(handle: *SpawnHandle, msg: []const u8) void {
     handle.mutex.lock();
-    // panic_message 用 page_allocator（独立于 arena，await 后由父释放）。
+    // panic_message 用 page_allocator（独立于 per-spawn 堆，await 后由父释放）。
     handle.panic_message = std.heap.page_allocator.dupe(u8, msg) catch null;
     handle.status.store(.Failed, .seq_cst);
     handle.condition.broadcast();
@@ -297,8 +298,8 @@ pub const VM = struct {
     err_msg: ?[]const u8 = null,
     /// IO 句柄（原生 println/print 输出到 stdout）；null 时回退 std.debug.print。
     io: ?std.Io = null,
-    /// M4c：本 VM spawn 出的协程上下文（每个含 OS 线程 + per-spawn arena + handle）。
-    /// VM.deinit 时自旋等待各 worker finished，再释放 arena/handle —— 避免 detached 线程写已释放内存。
+    /// M4c：本 VM spawn 出的协程上下文（每个含 OS 线程 + per-spawn HeapAllocator + handle）。
+    /// VM.deinit 时自旋等待各 worker finished，再释放 per-spawn 堆/handle —— 避免 detached 线程写已释放内存。
     spawns: std.ArrayListUnmanaged(*SpawnCtx) = .empty,
     /// 当前 program（OP_SPAWN 需把 program 指针传给子 VM —— functions/constants 不可变跨线程共享）。
     program: ?*const Program = null,
@@ -336,18 +337,18 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
-        // M4c：等待所有 spawn worker 彻底结束（join 线程），再释放 arena/handle/ctx。
-        // join 保证 worker 不再触碰 handle/arena —— 无 use-after-free。
+        // M4c：等待所有 spawn worker 彻底结束（join 线程），再释放 per-spawn 堆/handle/ctx。
+        // join 保证 worker 不再触碰 handle/heap —— 无 use-after-free。
         for (self.spawns.items) |ctx| {
             if (ctx.thread) |t| t.join();
             // 平衡 deepCopyAcross 给捕获的共享原语（atomic/channel）加的 ref。子 VM 的 upvalue cell
-            // 是 arena 分配（arena.deinit 回收内存），但 cell.inner 持的共享对象（父 allocator 所有）
-            // ref_count 不会随 arena 释放而递减 → 须显式 unref。标量/字符串是 arena 自有，无需处理。
+            // 是 per-spawn 堆分配（heap.deinit 回收内存），但 cell.inner 持的共享对象（父 allocator 所有）
+            // ref_count 不会随 heap 释放而递减 → 须显式 unref。标量/字符串是 per-spawn 堆自有，无需处理。
             for (ctx.captures) |cap| self.releaseCapture(cap);
             if (ctx.handle.panic_message) |msg| std.heap.page_allocator.free(msg);
             self.allocator.destroy(ctx.handle);
-            ctx.arena.deinit(); // 释放子 VM 全部分配（含 result、cell、sender/receiver 包装）
-            self.allocator.destroy(ctx.arena);
+            ctx.spawn_heap.deinit(); // 释放子 VM 全部分配（含 result、cell、sender/receiver 包装）
+            self.allocator.destroy(ctx.spawn_heap);
             self.allocator.destroy(ctx);
         }
         self.spawns.deinit(self.allocator);
@@ -430,8 +431,8 @@ pub const VM = struct {
 
     /// M4c：平衡 spawn 捕获快照对共享原语加的 ref。仅处理内建原子 ref_count 的类型：
     /// atomic/channel unref 归零则 deinit+destroy（父 allocator 所有）；sender/receiver 仅 unref 其
-    /// channel（包装本身是子 arena 所有，由 arena.deinit 回收，绝不在此 destroy）。其它（标量/字符串/
-    /// 数组/record）是子 arena 自有，arena.deinit 统一回收，此处不碰。
+    /// channel（包装本身是子 per-spawn 堆所有，由 heap.deinit 回收，绝不在此 destroy）。其它（标量/字符串/
+    /// 数组/record）是子 per-spawn 堆自有，heap.deinit 统一回收，此处不碰。
     fn releaseCapture(self: *VM, cap: Value) void {
         switch (cap) {
             .atomic_val => |p| {
@@ -574,6 +575,44 @@ pub const VM = struct {
         return try self.retainOwned(result);
     }
 
+    /// Sync-point 写回：将缓存局部变量同步回 VM 状态（self.stack.items.len + frame.ip）。
+    /// 所有可能修改 stack/frames 的 helper 调用前必须调用，保证 helper 看到一致的栈长度与 ip。
+    inline fn syncWriteback(self: *VM, frame: *CallFrame, ip_ptr: [*]const u8, code_ptr: [*]const u8, stack_len: usize) void {
+        self.stack.items.len = stack_len;
+        frame.ip = @intCast(ip_ptr - code_ptr);
+    }
+
+    /// Sync-point 重载（仅栈）：helper 调用后重载 stack_ptr/stack_len/stack_cap。
+    /// 用于不切换帧的 helper（如 forceLazyVM、make_*、index 等）。
+    inline fn reloadStack(self: *VM, stack_ptr: *[*]Value, stack_len: *usize, stack_cap: *usize) void {
+        stack_ptr.* = self.stack.items.ptr;
+        stack_len.* = self.stack.items.len;
+        stack_cap.* = self.stack.capacity;
+    }
+
+    /// Sync-point 重载（帧+栈）：helper 调用后重载全部缓存（frame/func/code/slot_base/ip_ptr + stack）。
+    /// 用于切换帧的 helper（如 doCall/doTailCall/doReturn 等）。
+    inline fn reloadFrame(
+        self: *VM,
+        frame: **CallFrame,
+        func: **const Function,
+        code: *[]u8,
+        slot_base: *usize,
+        ip_ptr: *[*]const u8,
+        stack_ptr: *[*]Value,
+        stack_len: *usize,
+        stack_cap: *usize,
+    ) void {
+        frame.* = &self.frames.items[self.frames.items.len - 1];
+        func.* = frame.*.func;
+        code.* = func.*.chunk.code.items;
+        slot_base.* = frame.*.slot_base;
+        ip_ptr.* = code.*.ptr + frame.*.ip;
+        stack_ptr.* = self.stack.items.ptr;
+        stack_len.* = self.stack.items.len;
+        stack_cap.* = self.stack.capacity;
+    }
+
     /// 主 dispatch 循环。从当前帧（frames 顶）取码执行，CALL 压帧、RETURN 弹帧。
     /// 当入口帧 RETURN（frames 清空）时返回其结果。
     fn runLoop(self: *VM, program: *const Program) VMError!Value {
@@ -602,8 +641,7 @@ pub const VM = struct {
         // 以便 VM.deinit 的 `for self.stack.items |v| v.release` 恰好释放存活值。
         // errdefer 覆盖错误返回；正常 return 路径在下方显式写回。
         errdefer {
-            self.stack.items.len = stack_len;
-            frame.ip = @intCast(ip_ptr - code.ptr);
+            self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
         }
         while (true) {
             // 容量预检：保证本条 dispatch 最多可能 push 的次数。非 call opcode 中
@@ -611,8 +649,7 @@ pub const VM = struct {
             // call 族 opcode 在 helper 后刷新缓存，故仅需在 switch 前覆盖最坏情况——
             // 4 次 push 对所有非 call prong 是安全上界。
             if (stack_len + 4 > stack_cap) {
-                self.stack.items.len = stack_len;
-                frame.ip = @intCast(ip_ptr - code.ptr);
+                self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                 try self.stack.ensureUnusedCapacity(self.allocator, 4);
                 stack_ptr = self.stack.items.ptr;
                 stack_cap = self.stack.capacity;
@@ -673,12 +710,9 @@ pub const VM = struct {
                             stack_len += 1;
                         } else if (v == .lazy_val) {
                             const lv = v.lazy_val;
-                            self.stack.items.len = stack_len;
-                            frame.ip = @intCast(ip_ptr - code.ptr);
+                            self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                             const forced = try self.forceLazyVM(lv, func.chunk.locAt(op_off));
-                            stack_ptr = self.stack.items.ptr;
-                            stack_len = self.stack.items.len;
-                            stack_cap = self.stack.capacity;
+                            self.reloadStack(&stack_ptr, &stack_len, &stack_cap);
                             stack_ptr[stack_len] = forced;
                             stack_len += 1;
                         } else if (!v.isBoxed()) {
@@ -782,12 +816,9 @@ pub const VM = struct {
                     } else if (cell.inner == .lazy_val) {
                         const lazy = cell.inner.lazy_val;
                         if (lazy.vm_thunk != null) {
-                            self.stack.items.len = stack_len;
-                            frame.ip = @intCast(ip_ptr - code.ptr);
+                            self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                             const forced = try self.forceLazyVM(lazy, func.chunk.locAt(op_off));
-                            stack_ptr = self.stack.items.ptr;
-                            stack_len = self.stack.items.len;
-                            stack_cap = self.stack.capacity;
+                            self.reloadStack(&stack_ptr, &stack_len, &stack_cap);
                             stack_ptr[stack_len] = forced;
                             stack_len += 1;
                         } else {
@@ -818,50 +849,23 @@ pub const VM = struct {
                     }
                 },
 
-                // JIT Phase 1: specialized opcodes merged into generic prong to avoid icache pressure.
-                // Specialized opcodes serve as type annotations; normalized to generic before doArith.
-                // doArith has inline isInteger/isFloat fast paths, so specialization adds zero overhead
-                // while avoiding 6 separate prongs (~120 lines) that caused -1.8%~-14.1% regression.
-                .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_bit_and, .op_bit_or, .op_bit_xor,
-                .op_add_int, .op_sub_int, .op_mul_int, .op_div_int, .op_mod_int,
-                .op_add_float, .op_sub_float, .op_mul_float, .op_div_float => {
+                .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_bit_and, .op_bit_or, .op_bit_xor => {
                     const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     defer left.release(self.allocator);
                     defer right.release(self.allocator);
-                    const generic_op: OpCode = switch (op) {
-                        .op_add_int, .op_add_float => .op_add,
-                        .op_sub_int, .op_sub_float => .op_sub,
-                        .op_mul_int, .op_mul_float => .op_mul,
-                        .op_div_int, .op_div_float => .op_div,
-                        .op_mod_int => .op_mod,
-                        else => op,
-                    };
-                    stack_ptr[stack_len] = try self.doArith(generic_op, left, right, func.chunk.locAt(op_off));
+                    stack_ptr[stack_len] = try self.doArith(op, left, right, func.chunk.locAt(op_off));
                     stack_len += 1;
                 },
-                // JIT Phase 1: specialized comparison opcodes merged into generic prong.
-                .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge,
-                .op_eq_int, .op_neq_int, .op_lt_int, .op_gt_int, .op_le_int, .op_ge_int,
-                .op_eq_float, .op_neq_float, .op_lt_float, .op_gt_float, .op_le_float, .op_ge_float => {
+                .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge => {
                     const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     defer left.release(self.allocator);
                     defer right.release(self.allocator);
-                    const generic_op: OpCode = switch (op) {
-                        .op_eq_int, .op_eq_float => .op_eq,
-                        .op_neq_int, .op_neq_float => .op_neq,
-                        .op_lt_int, .op_lt_float => .op_lt,
-                        .op_gt_int, .op_gt_float => .op_gt,
-                        .op_le_int, .op_le_float => .op_le,
-                        .op_ge_int, .op_ge_float => .op_ge,
-                        else => op,
-                    };
-                    stack_ptr[stack_len] = try self.doCompare(generic_op, left, right, func.chunk.locAt(op_off));
+                    stack_ptr[stack_len] = try self.doCompare(op, left, right, func.chunk.locAt(op_off));
                     stack_len += 1;
                 },
-                // JIT Phase 1: specialized negation opcodes merged into generic prong.
-                .op_neg, .op_neg_int, .op_neg_float => {
+                .op_neg => {
                     const v = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     defer v.release(self.allocator);
                     stack_ptr[stack_len] = try self.doNegate(v, func.chunk.locAt(op_off));
@@ -931,18 +935,10 @@ pub const VM = struct {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCall(program, func_idx, argc, func.chunk.locAt(op_off));
                     // doCall 压入新帧，刷新缓存切换到 callee。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
 
                 .op_call_rec => {
@@ -952,36 +948,20 @@ pub const VM = struct {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCallRec(program, func_idx, argc, func.chunk.locAt(op_off));
                     // doCallRec 压入新帧，刷新缓存。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
 
                 .op_tail_call => {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doTailCall(program, func_idx, argc, func.chunk.locAt(op_off));
                     // tail_call 复用当前帧但切换 func，刷新 func/code。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
 
                 .op_tail_call_rec => {
@@ -990,18 +970,10 @@ pub const VM = struct {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doTailCallRec(program, func_idx, argc, func.chunk.locAt(op_off));
                     // tail_call_rec 复用当前帧，func 理论不变（自递归），但刷新以保持一致。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
 
                 .op_closure => {
@@ -1037,36 +1009,20 @@ pub const VM = struct {
                 .op_call_value => {
                     const argc = ip_ptr[0];
                     ip_ptr += 1;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCallValue(argc, func.chunk.locAt(op_off));
                     // 足参→压新帧（刷新缓存）；不足→partial 已压栈，继续本帧（刷新无害）。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
 
                 .op_call_native => {
                     const nid = ip_ptr[0];
                     const argc = ip_ptr[1];
                     ip_ptr += 2;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCallNative(@enumFromInt(nid), argc, func.chunk.locAt(op_off));
                     // doCallNative 可能压新帧，刷新缓存。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
 
                 // JIT Phase 3：memoized 纯函数调用。
@@ -1075,18 +1031,10 @@ pub const VM = struct {
                     const argc = ip_ptr[2];
                     const memo_slot = opcode.readU16Ptr(ip_ptr + 3);
                     ip_ptr += 5;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCallMemoized(program, func_idx, argc, memo_slot, func.chunk.locAt(op_off));
                     // doCallMemoized 缓存命中时不压新帧（结果已 push），未命中压新帧。两种情况都刷新缓存。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
 
                 // M2a：复合值 / 模式匹配。
@@ -1094,34 +1042,18 @@ pub const VM = struct {
                     const ctor_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doMakeAdt(program, ctor_idx, argc, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 .op_get_field => {
                     const name_idx = opcode.readU16Ptr(ip_ptr);
                     ip_ptr += 2;
                     const field_val = func.chunk.constants.items[name_idx];
                     const field = field_val.string.bytes();
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doGetField(field, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 .op_get_adt_field => {
                     const idx = opcode.readU16Ptr(ip_ptr);
@@ -1184,34 +1116,18 @@ pub const VM = struct {
                 .op_make_record => {
                     const shape_idx = opcode.readU16Ptr(ip_ptr);
                     ip_ptr += 2;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doMakeRecord(program, shape_idx);
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 .op_index => {
                     const index_val = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     defer index_val.release(self.allocator);
                     const object = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     defer object.release(self.allocator);
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doIndex(object, index_val, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
 
                 // M2c：全模式 match / 记录扩展 / newtype。
@@ -1228,17 +1144,9 @@ pub const VM = struct {
                 .op_record_extend => {
                     const shape_idx = opcode.readU16Ptr(ip_ptr);
                     ip_ptr += 2;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doRecordExtend(program, shape_idx, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 .op_make_newtype => {
                     const nt_idx = opcode.readU16Ptr(ip_ptr);
@@ -1299,17 +1207,9 @@ pub const VM = struct {
                 .op_interp => {
                     const n = opcode.readU16Ptr(ip_ptr);
                     ip_ptr += 2;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doInterp(n);
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M3a：类型转换 —— 弹值，按常量池目标类型名转换，压结果。
                 .op_cast => {
@@ -1317,17 +1217,9 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const tname_val = func.chunk.constants.items[name_idx];
                     const tname = tname_val.string.bytes();
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCast(tname, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M5：隐式数值定型（best-effort）。仅 int/float 且目标 builtin 数值类型时协调，
                 // 溢出/不符/非数值原样保留（不 panic）。镜像 eval `castValue catch val`。
@@ -1350,31 +1242,15 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const field_val = func.chunk.constants.items[name_idx];
                     const field = field_val.string.bytes();
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doSetField(field, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M5f：索引赋值 —— [array, index, val] → [new_array]（COW），写回由 SET_LOCAL 完成。
                 .op_set_index => {
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doSetIndex(func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M5g：全局读 —— retainOwned globals[idx] 压栈。
                 .op_get_global => {
@@ -1394,8 +1270,7 @@ pub const VM = struct {
 
                 .op_return => {
                     const result = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     // JIT Phase 3：若当前帧是 memoized 调用，缓存返回值（额外 retain 一份）。
                     if (frame.memo_slot != MEMO_SLOT_NONE) {
                         const key = MemoKey{ .slot = frame.memo_slot, .arg_hash = frame.memo_arg_hash };
@@ -1407,14 +1282,7 @@ pub const VM = struct {
                     }
                     if (try self.frameReturn(result)) |entry_result| return entry_result;
                     // frameReturn 弹帧，刷新缓存切换到调用者帧。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                     // M6 #2：帧回到 main 后，若栈利用率极低则收缩（深递归 unwind 后释放峰值容量）。
                     // 触发条件：仅 main 帧（避免深递归中间帧无效收缩）+ 利用率 < 25%（避免频繁抖动）。
                     // shrinkAndFree 走 alloc+copy+free 路径（SlabPool 大块不支持原地 resize），
@@ -1436,18 +1304,10 @@ pub const VM = struct {
                     const top = stack_ptr[stack_len - 1];
                     if (top == .null_val) {
                         stack_len -= 1; // 弹 null（基础值，release 无副作用）
-                        self.stack.items.len = stack_len;
-                        frame.ip = @intCast(ip_ptr - code.ptr);
+                        self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                         if (try self.frameReturn(Value.fromNull())) |entry_result| return entry_result;
                         // frameReturn 弹帧，刷新缓存。
-                        frame = &self.frames.items[self.frames.items.len - 1];
-                        func = frame.func;
-                        code = func.chunk.code.items;
-                        slot_base = frame.slot_base;
-                        ip_ptr = code.ptr + frame.ip;
-                        stack_ptr = self.stack.items.ptr;
-                        stack_len = self.stack.items.len;
-                        stack_cap = self.stack.capacity;
+                        self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                     } else if (top == .throw_val) {
                         switch (top.throw_val.payload) {
                             .ok => |inner| {
@@ -1459,18 +1319,10 @@ pub const VM = struct {
                             },
                             .err => {
                                 const tv = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; }; // 接管 owned，作返回值移交
-                                self.stack.items.len = stack_len;
-                                frame.ip = @intCast(ip_ptr - code.ptr);
+                                self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                                 if (try self.frameReturn(tv)) |entry_result| return entry_result;
                                 // frameReturn 弹帧，刷新缓存。
-                                frame = &self.frames.items[self.frames.items.len - 1];
-                                func = frame.func;
-                                code = func.chunk.code.items;
-                                slot_base = frame.slot_base;
-                                ip_ptr = code.ptr + frame.ip;
-                                stack_ptr = self.stack.items.ptr;
-                                stack_len = self.stack.items.len;
-                                stack_cap = self.stack.capacity;
+                                self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                             },
                         }
                     }
@@ -1479,18 +1331,10 @@ pub const VM = struct {
                 // M3c：throw —— 弹 throw 值作为函数返回值（等价 OP_RETURN，Glue 无 try/catch）。
                 .op_throw => {
                     const result = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     if (try self.frameReturn(result)) |entry_result| return entry_result;
                     // frameReturn 弹帧，刷新缓存。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M3c：match Ok/Error 测试 —— 弹 throw_val，want_ok=1 测 .ok / =0 测 .err，压 bool。
                 .op_test_throw => {
@@ -1541,18 +1385,10 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const argc = ip_ptr[0];
                     ip_ptr += 1;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCallMethod(func, name_idx, argc, func.chunk.locAt(op_off));
                     // doCallMethod 可能压新帧，刷新缓存（func 局部变量已被 doCallMethod 使用完毕）。
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // OP_PUSH_INPLACE <u16 slot>：arr = arr.push(x) 模式优化。
                 // 弹栈顶 arg。读 slot 的数组 v（不 retain）。rc==1 时原地扩容，否则 fallback 通用 push。
@@ -1629,12 +1465,9 @@ pub const VM = struct {
                     if (v == .lazy_val) {
                         const lazy = v.lazy_val;
                         if (lazy.vm_thunk != null) {
-                            self.stack.items.len = stack_len;
-                            frame.ip = @intCast(ip_ptr - code.ptr);
+                            self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                             const forced = try self.forceLazyVM(lazy, func.chunk.locAt(op_off));
-                            stack_ptr = self.stack.items.ptr;
-                            stack_len = self.stack.items.len;
-                            stack_cap = self.stack.capacity;
+                            self.reloadStack(&stack_ptr, &stack_len, &stack_cap);
                             stack_ptr[stack_len] = forced;
                             stack_len += 1;
                         } else {
@@ -1656,12 +1489,9 @@ pub const VM = struct {
                     if (v == .lazy_val) {
                         const lazy = v.lazy_val;
                         if (lazy.vm_thunk != null) {
-                            self.stack.items.len = stack_len;
-                            frame.ip = @intCast(ip_ptr - code.ptr);
+                            self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                             const forced = try self.forceLazyVM(lazy, func.chunk.locAt(op_off));
-                            stack_ptr = self.stack.items.ptr;
-                            stack_len = self.stack.items.len;
-                            stack_cap = self.stack.capacity;
+                            self.reloadStack(&stack_ptr, &stack_len, &stack_cap);
                             stack_ptr[stack_len] = forced;
                             stack_len += 1;
                         } else {
@@ -1679,17 +1509,9 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const arith_op: OpCode = @enumFromInt(ip_ptr[0]);
                     ip_ptr += 1;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCompoundLocal(frame, slot, arith_op, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M4c：Atomic 透明复合赋值（upvalue）—— cell.inner 持 atomic → 原子 fetch<op>；否则常规读改写 cell.inner。
                 .op_compound_upvalue => {
@@ -1697,31 +1519,15 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const arith_op: OpCode = @enumFromInt(ip_ptr[0]);
                     ip_ptr += 1;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCompoundUpvalue(frame, idx, arith_op, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
-                // M4c：spawn —— 弹零参 vm_closure（spawn body），深拷捕获进 arena，起线程跑子 VM。
+                // M4c：spawn —— 弹零参 vm_closure（spawn body），深拷捕获进 per-spawn 堆，起线程跑子 VM。
                 .op_spawn => {
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doSpawn(func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M4d：lazy —— 弹零参 vm_closure（lazy expr），包成 lazy_val（vm_thunk 模式）压栈。
                 .op_make_lazy => {
@@ -1773,17 +1579,9 @@ pub const VM = struct {
                 .op_make_trait => {
                     const count = ip_ptr[0];
                     ip_ptr += 1;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doMakeTrait(count, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M3d：for 循环步进 —— iter_slot 持 array/range/string，idx_slot 持索引；
                 // 耗尽跳 exit_off，否则压当前元素 + idx 自增。
@@ -1794,17 +1592,9 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const exit_off = opcode.readI32Ptr(ip_ptr);
                     ip_ptr += 4;
-                    self.stack.items.len = stack_len;
-                    frame.ip = @intCast(ip_ptr - code.ptr);
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doForNext(frame, iter_slot, idx_slot, exit_off, func.chunk.locAt(op_off));
-                    frame = &self.frames.items[self.frames.items.len - 1];
-                    func = frame.func;
-                    code = func.chunk.code.items;
-                    slot_base = frame.slot_base;
-                    ip_ptr = code.ptr + frame.ip;
-                    stack_ptr = self.stack.items.ptr;
-                    stack_len = self.stack.items.len;
-                    stack_cap = self.stack.capacity;
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
             }
         }
@@ -1890,6 +1680,81 @@ pub const VM = struct {
         try self.frames.append(self.allocator, .{ .func = callee, .ip = 0, .slot_base = slot_base, .frame_base = slot_base, .upvalues = cur_upvalues });
     }
 
+    /// 【P1-6】递归按值 hash 一个 Value。
+    /// 标量类型按字段 hash；复合类型（array/record/adt/newtype）按内容递归 hash，
+    /// 使相同内容、不同指针的值产生相同 hash（memoization 缓存命中前提）。
+    /// 引用类型（cell/channel/spawn/atomic 等）走指针 hash（安全但低命中）。
+    /// 纯函数参数无循环引用（值不可变），递归安全。
+    fn hashValueRecursive(hasher: *std.hash.Wyhash, v: Value) void {
+        const tag = @intFromEnum(v);
+        hasher.update(std.mem.asBytes(&tag));
+        switch (v) {
+            .int => {
+                hasher.update(std.mem.asBytes(&v.int.lo));
+                hasher.update(std.mem.asBytes(&v.int.hi));
+            },
+            .float => {
+                hasher.update(std.mem.asBytes(&v.float.bits));
+                hasher.update(std.mem.asBytes(&v.float.extra));
+            },
+            .boolean => hasher.update(std.mem.asBytes(&v.boolean)),
+            .char => {
+                const cp = v.char.codepoint;
+                hasher.update(std.mem.asBytes(&cp));
+            },
+            .string => hasher.update(v.string.bytes()),
+            .null_val, .unit => {},
+            // 复合类型按值递归 hash
+            .array => {
+                const elems = v.array.elements;
+                hasher.update(std.mem.asBytes(&elems.len));
+                for (elems) |e| hashValueRecursive(hasher, e);
+            },
+            .record => {
+                hasher.update(v.record.type_name);
+                const map = &v.record.fields;
+                const n = map.count();
+                // StringHashMap 迭代顺序不确定（依赖 bucket 布局，受容量影响）。
+                // 为顺序无关性，收集 key 排序后按 sorted key 顺序 hash (key, value)。
+                // 字段数通常很少（<32）；超过则回退指针 hash（罕见，避免栈溢出）。
+                var keys_buf: [32][]const u8 = undefined;
+                if (n <= keys_buf.len) {
+                    var i: usize = 0;
+                    var it = map.iterator();
+                    while (it.next()) |entry| {
+                        keys_buf[i] = entry.key_ptr.*;
+                        i += 1;
+                    }
+                    std.mem.sort([]const u8, keys_buf[0..n], {}, struct {
+                        fn lt(_: void, a: []const u8, b: []const u8) bool {
+                            return std.mem.lessThan(u8, a, b);
+                        }
+                    }.lt);
+                    for (keys_buf[0..n]) |k| {
+                        hasher.update(k);
+                        hashValueRecursive(hasher, map.get(k).?);
+                    }
+                } else {
+                    hasher.update(std.mem.asBytes(&v.record));
+                }
+            },
+            .adt => {
+                hasher.update(v.adt.type_name);
+                hasher.update(v.adt.constructor);
+                for (v.adt.fields) |f| {
+                    if (f.name) |nm| hasher.update(nm);
+                    hashValueRecursive(hasher, f.value);
+                }
+            },
+            .newtype => {
+                hasher.update(v.newtype.type_name);
+                hashValueRecursive(hasher, v.newtype.inner);
+            },
+            // 引用类型 / 其他：指针 hash（含 union tag）
+            else => hasher.update(std.mem.asBytes(&v)),
+        }
+    }
+
     /// 【JIT Phase 3】计算栈上 [stack_base..stack_base+argc) 个参数的 hash。
     /// 纯函数的参数应为不可变值（Int/Float/Bool/Char/String 等）。
     /// hash 策略：tag + 类型特化载荷（Int 的 lo/hi，Float 的 bits，String 的字节内容等）。
@@ -1898,34 +1763,7 @@ pub const VM = struct {
         var i: usize = 0;
         while (i < argc) : (i += 1) {
             const v = self.stack.items[stack_base + i];
-            // 先 hash tag（区分类型）
-            const tag = @intFromEnum(v);
-            hasher.update(std.mem.asBytes(&tag));
-            switch (v) {
-                .int => {
-                    // Int = {type, lo, hi}，hash lo+hi（type 已含在 tag 中足够区分）
-                    hasher.update(std.mem.asBytes(&v.int.lo));
-                    hasher.update(std.mem.asBytes(&v.int.hi));
-                },
-                .float => {
-                    // Float = {type, bits, extra}
-                    hasher.update(std.mem.asBytes(&v.float.bits));
-                    hasher.update(std.mem.asBytes(&v.float.extra));
-                },
-                .boolean => hasher.update(std.mem.asBytes(&v.boolean)),
-                .char => {
-                    const cp = v.char.codepoint;
-                    hasher.update(std.mem.asBytes(&cp));
-                },
-                .string => {
-                    // hash 字节内容（纯函数的字符串参数应不可变）
-                    hasher.update(v.string.bytes());
-                },
-                .null_val, .unit => {},
-                // 装箱复合类型：hash 整个 Value 的字节表示（含 union tag + 指针载荷）。
-                // padding 字节可能未初始化，但对于相同构造路径的值通常一致——保守安全。
-                else => hasher.update(std.mem.asBytes(&v)),
-            }
+            hashValueRecursive(&hasher, v);
         }
         return hasher.final();
     }
@@ -2756,7 +2594,7 @@ pub const VM = struct {
     }
 
     /// M4c：Spawn<T> 方法。await() 挂起等待 worker 完成，把结果**跨线程深拷**回父 allocator
-    /// （子结果在 arena 内，await 后 arena 仍由 VM.deinit 持有，故拷贝安全且独立）；Failed → panic。
+    /// （子结果在 per-spawn 堆内，await 后 heap 仍由 VM.deinit 持有，故拷贝安全且独立）；Failed → panic。
     /// cancel() 标记取消。栈：[spawn_val, args...] → 弹掉换成结果。
     fn doSpawnMethod(self: *VM, handle: *SpawnHandle, name: []const u8, args: []const Value, args_start: usize, loc: ast.SourceLocation) VMError!void {
         const receiver = self.stack.items[args_start - 1];
@@ -2774,7 +2612,7 @@ pub const VM = struct {
                 const msg = handle.panic_message orelse "spawn: coroutine failed";
                 return self.fail(loc, msg, error.SpawnFailed);
             }
-            // 跨线程深拷结果进父 allocator（子结果在 arena，独立于父 refcount 堆）。
+            // 跨线程深拷结果进父 allocator（子结果在 per-spawn 堆，独立于父 refcount 堆）。
             const owned = if (child_result) |r| (try self.retainOwned(r)) else Value.fromUnit();
             for (args) |a| a.release(self.allocator);
             receiver.release(self.allocator);
@@ -2919,7 +2757,7 @@ pub const VM = struct {
     }
 
     /// M4c：执行 OP_SPAWN。栈顶是 spawn body 编译成的零参 vm_closure（upvalues = 父帧捕获的 cell）。
-    /// 深拷各 upvalue 的当前值进 per-spawn arena（隔离堆），起 OS 线程跑子 VM，压 spawn_val 句柄。
+    /// 深拷各 upvalue 的当前值进 per-spawn HeapAllocator（隔离堆），起 OS 线程跑子 VM，压 spawn_val 句柄。
     /// 失败时仍压 handle（status=Failed，await 传播 panic），保证线性 Spawn<T> 语义不破。
     fn doSpawn(self: *VM, loc: ast.SourceLocation) VMError!void {
         const callee = self.pop();
@@ -2929,16 +2767,16 @@ pub const VM = struct {
         // io 仅用于填充 handle（VM await 路径用 std.Thread.Futex，不依赖 io）；未设则用线程化默认。
         const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
 
-        // per-spawn arena（page_allocator 裸打底，与父/兄弟协程内存隔离）。
-        const arena = self.allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
-        arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        // per-spawn HeapAllocator（page_allocator 裸打底，与父/兄弟协程内存隔离）。
+        const spawn_heap = self.allocator.create(heap_mod.HeapAllocator) catch return error.OutOfMemory;
+        spawn_heap.* = heap_mod.HeapAllocator.init(std.heap.page_allocator);
         errdefer {
-            arena.deinit();
-            self.allocator.destroy(arena);
+            spawn_heap.deinit();
+            self.allocator.destroy(spawn_heap);
         }
-        const aalloc = arena.allocator();
+        const aalloc = spawn_heap.allocator();
 
-        // 深拷捕获快照：upvalue 是 *Cell，取 inner 当前值跨线程深拷进 arena。
+        // 深拷捕获快照：upvalue 是 *Cell，取 inner 当前值跨线程深拷进 per-spawn 堆。
         // 特殊情况：atomic_val/channel_val 等并发原语需要共享引用，用父 allocator。
         const caps = aalloc.alloc(Value, vc.upvalues.len) catch return error.OutOfMemory;
         for (vc.upvalues, 0..) |uv, i| {
@@ -2948,7 +2786,7 @@ pub const VM = struct {
             // 跨线程处理
             caps[i] = switch (inner) {
                 .atomic_val => blk: {
-                    // atomic_val：共享 AtomicValue（用父 allocator 的 ref，arena.deinit 后仍可访问）。
+                    // atomic_val：共享 AtomicValue（用父 allocator 的 ref，heap.deinit 后仍可访问）。
                     const av = inner.atomic_val;
                     av.ref(); // 增加 AtomicValue 引用计数
                     break :blk Value{ .atomic_val = av };
@@ -2958,7 +2796,7 @@ pub const VM = struct {
             };
         }
 
-        // handle 用父 allocator（await 在父线程读，arena 释放后仍需存活直到 handle 释放）。
+        // handle 用父 allocator（await 在父线程读，heap 释放后仍需存活直到 handle 释放）。
         const handle = self.allocator.create(SpawnHandle) catch return error.OutOfMemory;
         handle.* = SpawnHandle.init(self.allocator);
         handle.status.store(.Running, .seq_cst);
@@ -2969,7 +2807,7 @@ pub const VM = struct {
             .program = self.program.?,
             .func = @ptrCast(@alignCast(vc.func)),
             .captures = caps,
-            .arena = arena,
+            .spawn_heap = spawn_heap,
             .io = io,
         };
         self.spawns.append(self.allocator, ctx) catch return error.OutOfMemory;
@@ -3005,11 +2843,9 @@ pub const VM = struct {
             },
             .range => {
                 const r = iter.range;
-                // 软件 coerceTo(.i64)：范围值必须 fit i64（循环计数器宽度）
-                const start_coerced = r.start.coerceTo(.i64) orelse return self.fail(loc, "range start out of i64 range", error.ArithmeticOverflow);
-                const end_coerced = r.end.coerceTo(.i64) orelse return self.fail(loc, "range end out of i64 range", error.ArithmeticOverflow);
-                const start_i = start_coerced.toNative(i64);
-                const end_i = end_coerced.toNative(i64);
+                // 【P1-5】使用 makeRange 时预计算的 i64 缓存，省去每次迭代的 coerceTo + toNative
+                const start_i = r.start_i64 orelse return self.fail(loc, "range start out of i64 range", error.ArithmeticOverflow);
+                const end_i = r.end_i64 orelse return self.fail(loc, "range end out of i64 range", error.ArithmeticOverflow);
                 const cur: i64 = start_i + @as(i64, @intCast(idx));
                 const past = if (r.inclusive) cur > end_i else cur >= end_i;
                 if (past) {

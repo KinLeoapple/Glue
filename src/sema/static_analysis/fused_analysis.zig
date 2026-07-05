@@ -1,7 +1,7 @@
 //! 融合静态分析 pass：单次 AST 遍历同时填充 const_prop / loop_invariant / purity。
 //!
-//! 原实现中 4 个 pass（purity / const_prop / branch_reach / loop_invariant）各自独立遍历
-//! 所有 fun_decl 体，purity 还有 fixpoint 迭代（每轮重新递归 AST），总计 N×D + 3 次完整遍历。
+//! 原实现中 3 个 pass（const_prop / branch_reach / loop_invariant）各自独立遍历
+//! 所有 fun_decl 体，总计 3 次完整遍历。purity pass 还额外多轮递归 AST。
 //!
 //! 融合策略：
 //! 1. 单次遍历每个函数体，同时收集：

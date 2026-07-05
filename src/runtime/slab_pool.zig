@@ -22,18 +22,18 @@ const std = @import("std");
 
 /// 单个 slab（span）大小：向 backing 整块申请，切成等大 slot。必须是 2 的幂（掩码反查）。
 /// 16KB：足够批量摊销 backing 调用，又不让欠占用的冷 class 浪费过多（每 class 最坏浪费 1 slab）。
-const SLAB_SIZE: usize = 16 * 1024;
-const SLAB_MASK: usize = ~(SLAB_SIZE - 1);
+pub const SLAB_SIZE: usize = 16 * 1024;
+pub const SLAB_MASK: usize = ~(SLAB_SIZE - 1);
 const SLAB_ALIGN: std.mem.Alignment = .fromByteUnits(SLAB_SIZE);
 
 /// slot 最小对齐（= 装箱 struct 的 @alignOf，均为 8：首字段 rc:u32 + 指针切片）。
-const SLOT_ALIGNMENT: usize = 8;
+pub const SLOT_ALIGNMENT: usize = 8;
 
 /// ≥ 此阈值的分配直通 backing（大对象，不进 slab）。
-const LARGE_THRESHOLD: usize = 4096;
+pub const LARGE_THRESHOLD: usize = 4096;
 
 /// size class 表（字节）。低段 8 步进贴箱体；中段 16 步进；高段 ~1.25× 几何。
-const SIZE_CLASSES = [_]u32{
+pub const SIZE_CLASSES = [_]u32{
     // 低段：8 步进，精确命中 40/56/64/80/96/112/128 等箱体
     16,   24,   32,   40,   48,   56,   64,   72,
     80,   88,   96,   104,  112,  120,  128,
@@ -46,11 +46,11 @@ const SIZE_CLASSES = [_]u32{
     2560, 3072, 3584, 4096,
 };
 
-const NUM_CLASSES = SIZE_CLASSES.len;
+pub const NUM_CLASSES = SIZE_CLASSES.len;
 const LOOKUP_LEN = LARGE_THRESHOLD / 8 + 1;
 
 /// 空闲 slot 内嵌的侵入式链表节点（复用 slot 空间，零额外内存）。
-const FreeNode = struct {
+pub const FreeNode = struct {
     next: ?*FreeNode,
 };
 
@@ -78,7 +78,7 @@ const Slab = struct {
 };
 
 /// slab 头魔数。
-const SLAB_MAGIC: u64 = 0x5142_5F4C_4F4F_50AB; // "SLB_LOOP" 变体
+pub const SLAB_MAGIC: u64 = 0x5142_5F4C_4F4F_50AB; // "SLB_LOOP" 变体
 
 const SizeClass = struct {
     slot_size: u32,

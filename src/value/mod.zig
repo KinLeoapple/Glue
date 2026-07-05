@@ -235,7 +235,10 @@ pub const Value = union(enum) {
 
     pub fn makeRange(allocator: std.mem.Allocator, start: Int, end: Int, inclusive: bool) !Value {
         const r = try allocator.create(Range);
-        r.* = .{ .start = start, .end = end, .inclusive = inclusive };
+        // 【P1-5】预计算 i64 缓存：一次性 coerceTo(.i64)，避免 doForNext 每次迭代重复 coerce
+        const start_i64 = if (start.coerceTo(.i64)) |s| s.toNative(i64) else null;
+        const end_i64 = if (end.coerceTo(.i64)) |e| e.toNative(i64) else null;
+        r.* = .{ .start = start, .end = end, .inclusive = inclusive, .start_i64 = start_i64, .end_i64 = end_i64 };
         return .{ .range = r };
     }
 

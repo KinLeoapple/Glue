@@ -20,7 +20,6 @@ const resolve = @import("resolve");
 const intern_mod = @import("intern");
 const stdlib = @import("stdlib");
 const analysis_db_mod = @import("analysis_db");
-const cache_mod = @import("cache");
 
 /// stdlib 目录的合成标记
 const STDLIB_DIR_MARKER = "<stdlib>";
@@ -51,11 +50,6 @@ pub const ModuleLoader = struct {
     /// 保留的源码（用于生命周期管理，AST 借用源字节）
     retained_sources: std.ArrayList([]const u8),
 
-    /// 【缓存】CacheStore 引用（null = 缓存禁用）
-    cache_store: ?*cache_mod.CacheStore = null,
-    /// 【缓存】已加载模块的接口（用于跨模块缓存命中校验）
-    loaded_interfaces: std.StringHashMap(cache_mod.interface.ModuleInterface),
-
     pub fn init(allocator: std.mem.Allocator, io: ?std.Io) ModuleLoader {
         return .{
             .allocator = allocator,
@@ -67,7 +61,6 @@ pub const ModuleLoader = struct {
             .loading_modules = std.StringHashMap(void).init(allocator),
             .loaded_modules = std.StringHashMap(ast.Module).init(allocator),
             .retained_sources = .{ .items = &.{}, .capacity = 0 },
-            .loaded_interfaces = std.StringHashMap(cache_mod.interface.ModuleInterface).init(allocator),
         };
     }
 
@@ -101,21 +94,6 @@ pub const ModuleLoader = struct {
         self.type_inferencer.deinit();
         self.analysis_db.deinit();
         self.interner.deinit();
-
-        // 【缓存】清理 loaded_interfaces（key owned；value 的 module_name 借用 AST 或 owned，symbol name 视来源）
-        // tryLoadFromCache 路径：symbol name + module_name 均 owned（readBytes dupe）→ 需 freeOwned
-        // writeModuleCache 路径：symbol name 借用 AST（arena/dbg 分配，loader.deinit 时仍有效），module_name 借用 → 仅 deinit
-        // 为安全起见，统一调 freeOwned（借用 AST 的 module_name 会被 free，但 AST 字符串是 arena 分配，free 是 no-op 或安全）
-        // 实际上 arena 分配的字符串不能用 allocator.free 释放（会 panic）。需区分两条路径。
-        // 简化：tryLoadFromCache 迁移时把 symbol name 标记为 owned；writeModuleCache 时 symbol name 借用 AST。
-        // 统一策略：loaded_interfaces 中的 module_name 和 symbol name 都按 owned 处理（writeModuleCache 时 dupe）。
-        var iface_it = self.loaded_interfaces.iterator();
-        while (iface_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.freeOwned();
-            entry.value_ptr.deinit();
-        }
-        self.loaded_interfaces.deinit();
     }
 
     /// 为 VM 准备模块：加载依赖 + 解析 + 类型检查
@@ -172,18 +150,6 @@ pub const ModuleLoader = struct {
             }
         }
 
-        // 【缓存】字节码加载尚未实现，暂不尝试缓存命中（writeModuleCache 仍写缓存+注册接口）
-
-        // 设置 symbol_usage 跟踪器（type_check 期间记录导入符号使用）
-        var symbol_usage = cache_mod.usage.SymbolUsage.init(self.allocator);
-        defer symbol_usage.deinit();
-        self.type_inferencer.setSymbolUsageTracker(&symbol_usage);
-        self.type_inferencer.setCurrentInterfaces(&self.loaded_interfaces);
-        defer {
-            self.type_inferencer.setSymbolUsageTracker(null);
-            self.type_inferencer.setCurrentInterfaces(null);
-        }
-
         // 类型检查
         self.type_inferencer.checkModule(&module);
 
@@ -220,9 +186,6 @@ pub const ModuleLoader = struct {
             }
         }
 
-        // 【缓存】whole-program cache 已迁移至 main.zig 的 writeWholeProgram/tryLoadWholeProgram，
-        // 此处不再做单模块缓存写入（原 writeModuleCache/tryLoadFromCache 已删除）。
-        // loaded_interfaces 仍保留供 type_check 跨模块符号解析使用，但不再用于缓存命中校验。
         _ = module_name;
     }
 

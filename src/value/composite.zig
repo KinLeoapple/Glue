@@ -87,6 +87,11 @@ pub const Range = struct {
     start: Int,
     end: Int,
     inclusive: bool,
+    /// 【P1-5 循环不变量提离】预计算的 i64 缓存，在 makeRange 时一次性 coerceTo(.i64)。
+    /// doForNext 每次迭代直接读取，省去 coerceTo + toNative 调用。
+    /// null 表示该值超出 i64 范围（迭代时报错）。
+    start_i64: ?i64 = null,
+    end_i64: ?i64 = null,
 
     pub fn deinit(self: *Range, allocator: std.mem.Allocator) void {
         _ = self;

@@ -200,25 +200,66 @@ pub const Float = struct {
     }
 
     /// 是否为 NaN（指数字段全 1 且尾数字段非 0）
+    /// 【优化】≤64 位直接 u64 位运算，避免 unpack 构造 U128 mantissa 开销。
     pub inline fn isNan(self: Float) bool {
-        const u = self.unpack();
-        return u.is_nan;
+        if (self.type.byteLength() <= 8) {
+            const mb: u6 = @intCast(self.type.mantissaBits());
+            const sign_sh: u6 = @intCast(self.type.bitWidth() - 1);
+            const sign_mask: u64 = @as(u64, 1) << sign_sh;
+            const without_sign = self.bits & ~sign_mask;
+            const mant_mask: u64 = if (mb == 64) ~@as(u64, 0) else (@as(u64, 1) << mb) - 1;
+            const mantissa_lo = without_sign & mant_mask;
+            const exp_field = without_sign >> mb;
+            const exp_bits = self.type.exponentBits();
+            const max_exp: u64 = (@as(u64, 1) << @intCast(exp_bits)) - 1;
+            return exp_field == max_exp and mantissa_lo != 0;
+        }
+        return self.unpack().is_nan;
     }
 
     /// 是否为无穷（指数字段全 1 且尾数字段 == 0）
+    /// 【优化】≤64 位直接 u64 位运算。
     pub inline fn isInfinite(self: Float) bool {
-        const u = self.unpack();
-        return u.is_infinite;
+        if (self.type.byteLength() <= 8) {
+            const mb: u6 = @intCast(self.type.mantissaBits());
+            const sign_sh: u6 = @intCast(self.type.bitWidth() - 1);
+            const sign_mask: u64 = @as(u64, 1) << sign_sh;
+            const without_sign = self.bits & ~sign_mask;
+            const mant_mask: u64 = if (mb == 64) ~@as(u64, 0) else (@as(u64, 1) << mb) - 1;
+            const mantissa_lo = without_sign & mant_mask;
+            const exp_field = without_sign >> mb;
+            const exp_bits = self.type.exponentBits();
+            const max_exp: u64 = (@as(u64, 1) << @intCast(exp_bits)) - 1;
+            return exp_field == max_exp and mantissa_lo == 0;
+        }
+        return self.unpack().is_infinite;
     }
 
     /// 是否为 0（指数 == 0 且尾数 == 0，含 +0 与 -0）
+    /// 【优化】≤64 位直接 u64 位运算：无符号位即全 0 判定。
     pub inline fn isZero(self: Float) bool {
+        if (self.type.byteLength() <= 8) {
+            const sign_sh: u6 = @intCast(self.type.bitWidth() - 1);
+            const sign_mask: u64 = @as(u64, 1) << sign_sh;
+            return (self.bits & ~sign_mask) == 0;
+        }
         const u = self.unpack();
         return u.exp == 0 and u.mantissa.isZero();
     }
 
     /// 是否为次正规数（指数 == 0 且尾数 != 0）
+    /// 【优化】≤64 位直接 u64 位运算。
     pub inline fn isSubnormal(self: Float) bool {
+        if (self.type.byteLength() <= 8) {
+            const mb: u6 = @intCast(self.type.mantissaBits());
+            const sign_sh: u6 = @intCast(self.type.bitWidth() - 1);
+            const sign_mask: u64 = @as(u64, 1) << sign_sh;
+            const without_sign = self.bits & ~sign_mask;
+            const mant_mask: u64 = if (mb == 64) ~@as(u64, 0) else (@as(u64, 1) << mb) - 1;
+            const mantissa_lo = without_sign & mant_mask;
+            const exp_field = without_sign >> mb;
+            return exp_field == 0 and mantissa_lo != 0;
+        }
         const u = self.unpack();
         return u.exp == 0 and (!u.mantissa.isZero());
     }
