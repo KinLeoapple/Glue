@@ -15,7 +15,7 @@ const chunk_mod = @import("chunk.zig");
 const cast = @import("cast.zig");
 const method = @import("method.zig");
 const profiler_mod = @import("profiler");
-const heap_mod = @import("heap");
+const slab_allocator = @import("slab_allocator");
 
 const OpCode = opcode.OpCode;
 const Chunk = chunk_mod.Chunk;
@@ -38,12 +38,12 @@ const SpawnCtx = struct {
     program: *const Program,
     func: *const Function, // spawn body 编译成的零参 Function（在共享 program 内）
     captures: []Value, // 捕获快照（已深拷进 per-spawn 堆），按 func 的 upvalue 顺序
-    spawn_heap: *heap_mod.HeapAllocator, // per-spawn 堆（子 VM 全部分配走这里）
+    spawn_heap: *slab_allocator.SlabAllocator, // per-spawn 堆（子 VM 全部分配走这里）
     io: ?std.Io,
     thread: ?std.Thread = null,
 };
 
-/// 子 VM 线程入口：用 per-spawn HeapAllocator 起独立 VM，把 captures 包成 cell upvalues，跑 func，结果存 handle。
+/// 子 VM 线程入口：用 per-spawn SlabAllocator 起独立 VM，把 captures 包成 cell upvalues，跑 func，结果存 handle。
 fn spawnThreadEntry(ctx: *SpawnCtx) void {
     const handle = ctx.handle;
     defer handle.finished.store(true, .seq_cst); // 最后置位，VM.deinit 凭此安全回收
@@ -293,6 +293,9 @@ pub const VM = struct {
     frames: std.ArrayListUnmanaged(CallFrame) = .empty,
     /// 值分配器（与求值器 value_allocator 同源，refcount 字节走这里）。
     allocator: std.mem.Allocator,
+    /// ThreadCache 指针（非空时 VM 热路径走 TypedPool acquire/release，绕过 vtable 间接调用）。
+    /// 主 VM 由 initWithCache 注入；spawn 子 VM 为 null（用 SlabAllocator.allocator() 直连）。
+    cache: ?*slab_allocator.ThreadCache = null,
     /// 运行期错误位置（panic 报告用）。
     err_loc: ast.SourceLocation = .{ .line = 0, .column = 0 },
     err_msg: ?[]const u8 = null,
@@ -334,6 +337,76 @@ pub const VM = struct {
 
     pub fn initWithIo(allocator: std.mem.Allocator, io: std.Io) VM {
         return .{ .allocator = allocator, .io = io };
+    }
+
+    /// 注入 ThreadCache 启用 TypedPool 热路径（绕过 vtable 间接调用 + CLASS_LOOKUP）。
+    /// 主 VM 用此构造；spawn 子 VM 用 init/initWithIo（cache=null，走 SlabAllocator.allocator()）。
+    pub fn initWithCache(cache: *slab_allocator.ThreadCache, io: std.Io) VM {
+        return .{ .allocator = cache.allocator(), .cache = cache, .io = io };
+    }
+
+    // ── 热路径 acquire helpers（cache 非空时走 TypedPool，否则回退 vtable）──
+    // Comptime 特化：class_idx 编译期已知，跳过 CLASS_LOOKUP + vtable 间接调用。
+    inline fn acquireCell(self: *VM) !*value.Cell {
+        if (self.cache) |c| return c.acquireTyped(value.Cell);
+        return self.allocator.create(value.Cell);
+    }
+    inline fn acquireArray(self: *VM) !*value.ArrayValue {
+        if (self.cache) |c| return c.acquireTyped(value.ArrayValue);
+        return self.allocator.create(value.ArrayValue);
+    }
+    inline fn acquireStr(self: *VM) !*value.Str {
+        if (self.cache) |c| return c.acquireTyped(value.Str);
+        return self.allocator.create(value.Str);
+    }
+    inline fn acquireClosure(self: *VM) !*value.VmClosure {
+        if (self.cache) |c| return c.acquireTyped(value.VmClosure);
+        return self.allocator.create(value.VmClosure);
+    }
+    inline fn acquireRecord(self: *VM) !*value.RecordValue {
+        if (self.cache) |c| return c.acquireTyped(value.RecordValue);
+        return self.allocator.create(value.RecordValue);
+    }
+    inline fn acquireAdt(self: *VM) !*value.AdtValue {
+        if (self.cache) |c| return c.acquireTyped(value.AdtValue);
+        return self.allocator.create(value.AdtValue);
+    }
+    inline fn acquireNewtype(self: *VM) !*value.NewtypeValue {
+        if (self.cache) |c| return c.acquireTyped(value.NewtypeValue);
+        return self.allocator.create(value.NewtypeValue);
+    }
+    inline fn acquireRange(self: *VM) !*value.Range {
+        if (self.cache) |c| return c.acquireTyped(value.Range);
+        return self.allocator.create(value.Range);
+    }
+
+    // ── 切片分配快路径（cache 非空时跳过 vtable 间接调用）──
+    // 用于 op_push_inplace 扩容等频繁的切片 alloc/free。
+    inline fn allocValueSlice(self: *VM, n: usize) ![]value.Value {
+        if (self.cache) |c| {
+            const size = n * @sizeOf(value.Value);
+            if (size < slab_allocator.LARGE_THRESHOLD) {
+                const ci = slab_allocator.CLASS_LOOKUP[(size + 7) / 8];
+                if (c.allocKnown(ci, size)) |raw| {
+                    return @as([*]value.Value, @ptrCast(@alignCast(raw)))[0..n];
+                }
+                return error.OutOfMemory;
+            }
+        }
+        return self.allocator.alloc(value.Value, n);
+    }
+
+    inline fn freeValueSlice(self: *VM, buf: []value.Value) void {
+        if (buf.len == 0) return; // 空切片不释放
+        if (self.cache) |c| {
+            const size = buf.len * @sizeOf(value.Value);
+            if (size < slab_allocator.LARGE_THRESHOLD) {
+                const ci = slab_allocator.CLASS_LOOKUP[(size + 7) / 8];
+                c.freeKnown(ci, @ptrCast(buf.ptr));
+                return;
+            }
+        }
+        self.allocator.free(buf);
     }
 
     pub fn deinit(self: *VM) void {
@@ -981,7 +1054,7 @@ pub const VM = struct {
                     const n = ip_ptr[2];
                     ip_ptr += 3;
                     const f = &program.functions.items[func_idx];
-                    const ups: []Value = if (n > 0) try self.allocator.alloc(Value, n) else &.{};
+                    const ups: []Value = if (n > 0) try self.allocValueSlice(n) else &.{};
                     var k: usize = 0;
                     while (k < n) : (k += 1) {
                         const is_local = ip_ptr[0] == 1;
@@ -993,8 +1066,9 @@ pub const VM = struct {
                             const dst = slot_base + index;
                             const cur = stack_ptr[dst];
                             if (cur != .cell) {
-                                const new_cell = try value.Value.makeCell(self.allocator, cur);
-                                stack_ptr[dst] = new_cell;
+                                const cell_ptr = try self.acquireCell();
+                                cell_ptr.* = .{ .inner = cur };
+                                stack_ptr[dst] = Value{ .cell = cell_ptr };
                             }
                             ups[k] = stack_ptr[dst].retain();
                         } else {
@@ -1002,7 +1076,9 @@ pub const VM = struct {
                             ups[k] = frame.upvalues[index].retain();
                         }
                     }
-                    stack_ptr[stack_len] = try Value.makeVmClosure(self.allocator, .{ .func = f, .arity = f.arity, .upvalues = ups, .allocator = self.allocator });
+                    const cl = try self.acquireClosure();
+                    cl.* = .{ .func = f, .arity = f.arity, .upvalues = ups, .allocator = self.allocator };
+                    stack_ptr[stack_len] = Value{ .vm_closure = cl };
                     stack_len += 1;
                 },
 
@@ -1087,12 +1163,13 @@ pub const VM = struct {
                 .op_make_array => {
                     const n = opcode.readU16Ptr(ip_ptr);
                     ip_ptr += 2;
-                    const elems = self.allocator.alloc(Value, n) catch return error.OutOfMemory;
+                    const elems = self.allocValueSlice(n) catch return error.OutOfMemory;
                     const base = stack_len - n;
                     @memcpy(elems, stack_ptr[base..][0..n]); // 接管 owned
                     stack_len = base;
-                    const arr = value.Value.makeArray(self.allocator, elems, null) catch return error.OutOfMemory;
-                    stack_ptr[stack_len] = arr;
+                    const arr_ptr = try self.acquireArray();
+                    arr_ptr.* = .{ .elements = elems, .capacity = elems.len, .fixed_size = null };
+                    stack_ptr[stack_len] = Value{ .array = arr_ptr };
                     stack_len += 1;
                 },
                 // M5：数组拼接 `++` —— 弹 [left,right] 数组，拼新数组（元素各 retainOwned），压结果。
@@ -1106,11 +1183,12 @@ pub const VM = struct {
                     }
                     const la = left.array.elements;
                     const ra = right.array.elements;
-                    const elems = self.allocator.alloc(Value, la.len + ra.len) catch return error.OutOfMemory;
+                    const elems = self.allocValueSlice(la.len + ra.len) catch return error.OutOfMemory;
                     for (la, 0..) |e, i| elems[i] = try self.retainOwned(e);
                     for (ra, 0..) |e, i| elems[la.len + i] = try self.retainOwned(e);
-                    const arr = value.Value.makeArray(self.allocator, elems, null) catch return error.OutOfMemory;
-                    stack_ptr[stack_len] = arr;
+                    const arr_ptr = try self.acquireArray();
+                    arr_ptr.* = .{ .elements = elems, .capacity = elems.len, .fixed_size = null };
+                    stack_ptr[stack_len] = Value{ .array = arr_ptr };
                     stack_len += 1;
                 },
                 .op_make_record => {
@@ -1153,7 +1231,9 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const inner = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; }; // 接管 owned
                     const type_name = program.newtype_ctors.items[nt_idx].type_name;
-                    stack_ptr[stack_len] = try Value.makeNewtype(self.allocator, type_name, inner);
+                    const nt_ptr = try self.acquireNewtype();
+                    nt_ptr.* = .{ .type_name = type_name, .inner = inner };
+                    stack_ptr[stack_len] = Value{ .newtype = nt_ptr };
                     stack_len += 1;
                 },
                 .op_test_newtype => {
@@ -1405,9 +1485,9 @@ pub const VM = struct {
                             arr.elements = arr.elements.ptr[0..old_len + 1];
                         } else {
                             const new_cap = @max(arr.capacity * 2, old_len + 1, 8);
-                            const new_mem = try self.allocator.alloc(Value, new_cap);
+                            const new_mem = try self.allocValueSlice(new_cap);
                             @memcpy(new_mem[0..old_len], arr.elements);
-                            self.allocator.free(arr.elements);
+                            self.freeValueSlice(arr.elements);
                             arr.elements = new_mem[0..old_len + 1];
                             arr.capacity = new_cap;
                         }
@@ -1436,7 +1516,12 @@ pub const VM = struct {
                     if (!start_v.isInteger() or !end_v.isInteger()) return self.fail(func.chunk.locAt(op_off), "range bounds must be integers", error.TypeMismatch);
                     const start_int = start_v.asInt();
                     const end_int = end_v.asInt();
-                    stack_ptr[stack_len] = try value.Value.makeRange(self.allocator, start_int, end_int, inclusive);
+                    // 【P1-5】预计算 i64 缓存：一次性 coerceTo(.i64)，避免 doForNext 每次迭代重复 coerce
+                    const start_i64 = if (start_int.coerceTo(.i64)) |s| s.toNative(i64) else null;
+                    const end_i64 = if (end_int.coerceTo(.i64)) |e| e.toNative(i64) else null;
+                    const r_ptr = try self.acquireRange();
+                    r_ptr.* = .{ .start = start_int, .end = end_int, .inclusive = inclusive, .start_i64 = start_i64, .end_i64 = end_i64 };
+                    stack_ptr[stack_len] = Value{ .range = r_ptr };
                     stack_len += 1;
                 },
                 // M4a：构造 atomic —— 弹值，包成 AtomicValue（ref_count=1），压 atomic_val。
@@ -1639,12 +1724,14 @@ pub const VM = struct {
         const callee = &program.functions.items[func_idx];
         if (argc < callee.arity) {
             // 不足参：收集栈顶 argc 个实参为 bound_args，建部分应用 vm_closure 压栈。
-            const bound = try self.allocator.alloc(Value, argc);
+            const bound = try self.allocValueSlice(argc);
             const args_start = self.stack.items.len - argc;
             var i: usize = 0;
             while (i < argc) : (i += 1) bound[i] = self.stack.items[args_start + i]; // 接管 owned
             self.stack.shrinkRetainingCapacity(args_start);
-            try self.push(try Value.makeVmClosure(self.allocator, .{ .func = @ptrCast(callee), .arity = callee.arity, .upvalues = &.{}, .bound_args = bound, .allocator = self.allocator }));
+            const cl2 = try self.acquireClosure();
+            cl2.* = .{ .func = @ptrCast(callee), .arity = callee.arity, .upvalues = &.{}, .bound_args = bound, .allocator = self.allocator };
+            try self.push(Value{ .vm_closure = cl2 });
             return;
         }
         if (argc > callee.arity) return self.fail(loc, "wrong number of arguments", error.WrongArity);
@@ -2157,7 +2244,9 @@ pub const VM = struct {
             fields[i] = .{ .name = desc.field_names[i], .value = fv };
         }
         self.stack.shrinkRetainingCapacity(base);
-        try self.push(try Value.makeAdt(self.allocator, desc.type_name, desc.ctor_name, fields));
+        const adt_ptr = try self.acquireAdt();
+        adt_ptr.* = .{ .type_name = desc.type_name, .constructor = desc.ctor_name, .fields = fields };
+        try self.push(Value{ .adt = adt_ptr });
     }
 
     /// 执行 OP_INTERP：弹栈顶 n 段值（先压的是第一段），依次 format 拼接成新 string 压栈，各段 release。
@@ -2182,7 +2271,7 @@ pub const VM = struct {
         while (i < n) : (i += 1) self.stack.items[base + i].release(self.allocator);
         self.stack.shrinkRetainingCapacity(base);
         const owned = buf.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
-        const s = self.allocator.create(value.Str) catch return error.OutOfMemory;
+        const s = try self.acquireStr();
         s.* = value.Str.fromOwnedBytes(self.allocator, owned);
         try self.push(Value{ .string = s });
     }
@@ -2199,18 +2288,21 @@ pub const VM = struct {
                 const len = std.unicode.utf8Encode(c, &utf8_buf) catch return self.fail(loc, "invalid char codepoint", error.Unsupported);
                 const buf = try self.allocator.alloc(u8, len);
                 @memcpy(buf, utf8_buf[0..len]);
-                const s = try self.allocator.create(value.Str);
+                const s = try self.acquireStr();
                 s.* = value.Str.fromOwnedBytes(self.allocator, buf);
                 try self.push(Value{ .string = s });
                 return;
             }
             // 字符串→str 直接返回内容副本（不加引号），与 println/interp 一致。
             if (v == .string) {
-                try self.push(try Value.fromStringBytes(self.allocator, v.string.bytes()));
+                const dup = try self.allocator.dupe(u8, v.string.bytes());
+                const s = try self.acquireStr();
+                s.* = value.Str.fromOwnedBytes(self.allocator, dup);
+                try self.push(Value{ .string = s });
                 return;
             }
             const owned = v.formatAlloc(self.allocator) catch return error.OutOfMemory;
-            const s = try self.allocator.create(value.Str);
+            const s = try self.acquireStr();
             s.* = value.Str.fromOwnedBytes(self.allocator, @constCast(owned));
             try self.push(Value{ .string = s });
             return;
@@ -2323,7 +2415,9 @@ pub const VM = struct {
             }
             old_rec.rc -= 1;
             // type_name 是借用 slice（release 不释放它）；复用原 slice，不 dupe（dupe 会泄漏）。
-            obj = value.Value.makeRecord(self.allocator, old_rec.type_name, new_map) catch return error.OutOfMemory;
+            const rec_ptr = try self.acquireRecord();
+            rec_ptr.* = .{ .type_name = old_rec.type_name, .fields = new_map };
+            obj = Value{ .record = rec_ptr };
         }
         // 写字段：必须已存在（对齐 eval：不存在 → panic）。
         const rec = obj.record;
@@ -2367,10 +2461,12 @@ pub const VM = struct {
         }
         // COW：共享（rc>1）时浅拷一份独占体，原体 rc-1。
         if (arr.rc > 1) {
-            const new_elems = self.allocator.alloc(Value, arr.elements.len) catch return error.OutOfMemory;
+            const new_elems = self.allocValueSlice(arr.elements.len) catch return error.OutOfMemory;
             for (arr.elements, 0..) |e, k| new_elems[k] = self.retainOwned(e) catch return error.OutOfMemory;
             arr.rc -= 1;
-            obj = value.Value.makeArray(self.allocator, new_elems, arr.fixed_size) catch return error.OutOfMemory;
+            const cow_arr = try self.acquireArray();
+            cow_arr.* = .{ .elements = new_elems, .capacity = new_elems.len, .fixed_size = arr.fixed_size };
+            obj = Value{ .array = cow_arr };
             arr = obj.array;
         }
         const slot = &arr.elements[@intCast(i)];
@@ -2406,8 +2502,9 @@ pub const VM = struct {
             gop.value_ptr.* = self.stack.items[base + i];
         }
         self.stack.shrinkRetainingCapacity(base);
-        const rec = value.Value.makeRecord(self.allocator, "", map) catch return error.OutOfMemory;
-        try self.push(rec);
+        const rec_ptr = try self.acquireRecord();
+        rec_ptr.* = .{ .type_name = "", .fields = map };
+        try self.push(Value{ .record = rec_ptr });
     }
 
     /// 执行 OP_RECORD_EXTEND：栈布局 [base, u0..u_{n-1}]（base 在 n 个 update 值之下）。
@@ -2449,8 +2546,9 @@ pub const VM = struct {
         // 弹 n 个 update + base（base 用完 release）。
         self.stack.shrinkRetainingCapacity(ubase - 1);
         base_val.release(self.allocator);
-        const rec = value.Value.makeRecord(self.allocator, "", map) catch return error.OutOfMemory;
-        try self.push(rec);
+        const rec_ptr = try self.acquireRecord();
+        rec_ptr.* = .{ .type_name = "", .fields = map };
+        try self.push(Value{ .record = rec_ptr });
     }
 
     /// 执行 OP_INDEX：array 整数索引（边界检查）、string codepoint 索引，retainOwned 元素压栈。
@@ -2757,7 +2855,7 @@ pub const VM = struct {
     }
 
     /// M4c：执行 OP_SPAWN。栈顶是 spawn body 编译成的零参 vm_closure（upvalues = 父帧捕获的 cell）。
-    /// 深拷各 upvalue 的当前值进 per-spawn HeapAllocator（隔离堆），起 OS 线程跑子 VM，压 spawn_val 句柄。
+    /// 深拷各 upvalue 的当前值进 per-spawn SlabAllocator（隔离堆），起 OS 线程跑子 VM，压 spawn_val 句柄。
     /// 失败时仍压 handle（status=Failed，await 传播 panic），保证线性 Spawn<T> 语义不破。
     fn doSpawn(self: *VM, loc: ast.SourceLocation) VMError!void {
         const callee = self.pop();
@@ -2767,9 +2865,11 @@ pub const VM = struct {
         // io 仅用于填充 handle（VM await 路径用 std.Thread.Futex，不依赖 io）；未设则用线程化默认。
         const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
 
-        // per-spawn HeapAllocator（page_allocator 裸打底，与父/兄弟协程内存隔离）。
-        const spawn_heap = self.allocator.create(heap_mod.HeapAllocator) catch return error.OutOfMemory;
-        spawn_heap.* = heap_mod.HeapAllocator.init(std.heap.page_allocator);
+        // per-spawn SlabAllocator（page_allocator 裸打底，与父/兄弟协程内存隔离）。
+        // 单线程隔离堆：仅由本 spawn 线程访问（父线程 join 后才 deinit），用 initSingleThreaded
+        // 跳过 atomic + Mutex 开销。
+        const spawn_heap = self.allocator.create(slab_allocator.SlabAllocator) catch return error.OutOfMemory;
+        spawn_heap.* = slab_allocator.SlabAllocator.initSingleThreaded(std.heap.page_allocator);
         errdefer {
             spawn_heap.deinit();
             self.allocator.destroy(spawn_heap);
@@ -2932,19 +3032,21 @@ pub const VM = struct {
     /// 不足参：产生 bound_args 更长的新 vm_closure，替换栈上 [callee, args..] 为单个新闭包。
     fn makeBoundClosure(self: *VM, vc: *value.VmClosure, callee_idx: usize, argc: u8) VMError!void {
         const nbound = vc.bound_args.len;
-        const new_bound = try self.allocator.alloc(Value, nbound + argc);
+        const new_bound = try self.allocValueSlice(nbound + argc);
         // 复制旧 bound（retainOwned）+ 新实参（直接接管栈上 owned）。
         for (vc.bound_args, 0..) |ba, j| new_bound[j] = try self.retainOwned(ba);
         const args_start = callee_idx + 1;
         var i: usize = 0;
         while (i < argc) : (i += 1) new_bound[nbound + i] = self.stack.items[args_start + i];
         // 新闭包共享 func + upvalues（retainOwned upvalues）。M1b-1 upvalues 恒空。
-        const new_uv: []Value = if (vc.upvalues.len > 0) try self.allocator.alloc(Value, vc.upvalues.len) else &.{};
+        const new_uv: []Value = if (vc.upvalues.len > 0) try self.allocValueSlice(vc.upvalues.len) else &.{};
         for (vc.upvalues, 0..) |uv, j| new_uv[j] = try self.retainOwned(uv);
         // 弹掉 [callee, args..]（callee release，args 所有权已转入 new_bound 不 release），压入新闭包。
         self.stack.items[callee_idx].release(self.allocator);
         self.stack.shrinkRetainingCapacity(callee_idx);
-        try self.push(try Value.makeVmClosure(self.allocator, .{ .func = vc.func, .arity = vc.arity, .upvalues = new_uv, .bound_args = new_bound, .allocator = self.allocator }));
+        const cl3 = try self.acquireClosure();
+        cl3.* = .{ .func = vc.func, .arity = vc.arity, .upvalues = new_uv, .bound_args = new_bound, .allocator = self.allocator };
+        try self.push(Value{ .vm_closure = cl3 });
     }
 
     /// 算术 + 位运算。语义镜像 eval.zig evalAdd/Sub/...（复用 value 软件 API，不依赖 128 位原生类型）。
@@ -3007,7 +3109,7 @@ pub const VM = struct {
             result.appendSlice(self.allocator, left_str) catch return error.OutOfMemory;
             result.appendSlice(self.allocator, right_str) catch return error.OutOfMemory;
             const owned = result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
-            const s = self.allocator.create(value.Str) catch return error.OutOfMemory;
+            const s = try self.acquireStr();
             s.* = value.Str.fromOwnedBytes(self.allocator, owned);
             return Value{ .string = s };
         }

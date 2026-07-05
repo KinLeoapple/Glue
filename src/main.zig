@@ -5,9 +5,7 @@ const parser = @import("parser");
 const ast = @import("ast");
 const module_loader = @import("module_loader");
 const value = @import("value");
-const slab_pool = @import("slab_pool");
-const heap = @import("heap");
-const magazine = @import("magazine");
+const slab_allocator = @import("slab_allocator");
 const vm = @import("vm");
 const profiler = @import("profiler");
 
@@ -329,61 +327,76 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
     }
 }
 
-/// 普通运行（HeapAllocator 跟踪式分配器 + MagazineAllocator）。出错以非零码退出。
+/// 普通运行（统一 SlabAllocator + ThreadCache，loader/value/spawn 全走此分配器）。出错以非零码退出。
 fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
-    var heap_alloc = heap.HeapAllocator.init(allocator);
-    defer heap_alloc.deinit();
-    const loader_alloc = heap_alloc.allocator();
-
-    // MagazineAllocator：三层架构 ThreadCache → SlabPool → page_allocator。
-    // VM value_allocator 走 ThreadCache 无锁缓存，纯指针 push/pop 无 partial 链操作。
-    var mag = magazine.MagazineAllocator.init(allocator);
-    defer mag.deinit();
-    const value_allocator = mag.allocator();
+    // SlabAllocator：通用多线程 slab 分配器（per-class Mutex + Comptime size class 表）。
+    // ThreadCache：per-thread 无锁快路径，纯指针 push/pop，避免 per-class lock 开销。
+    // VM 主线程单线程运行，用 initSingleThreaded 跳过 atomic + Mutex 开销；
+    // spawn 子 VM 创建自己独立的 SlabAllocator 实例（同样单线程隔离）。
+    //
+    var slab = slab_allocator.SlabAllocator.initSingleThreaded(allocator);
+    defer slab.deinit();
+    var cache = slab_allocator.ThreadCache.init(&slab);
+    defer cache.deinit();
+    const value_allocator = cache.allocator();
+    const loader_alloc = value_allocator;
 
     var loader = module_loader.ModuleLoader.init(loader_alloc, io);
     defer loader.deinit();
 
-    // profiler：初始化（io 用于单调时钟）。SlabPool 统计在 executeSource 返回后注入（mag.pool 未 deinit）。
+    // profiler：初始化（io 用于单调时钟）。SlabAllocator 统计在 executeSource 返回后注入（slab 未 deinit）。
     prof = profiler.Profiler.init(profiler_enabled, io);
 
-    const outcome = executeSource(loader_alloc, &loader, value_allocator, io, source, entry_path);
+    const outcome = executeSource(loader_alloc, &loader, value_allocator, &cache, io, source, entry_path);
 
-    // 注入 SlabPool 内存统计 + 输出 profile 报告（mag.deinit 前读取准确统计）。
+    // 注入 SlabAllocator 内存统计 + 输出 profile 报告（slab.deinit 前读取准确统计）。
     if (profiler_enabled) {
-        prof.recordSlabStats(mag.pool.live_bytes, mag.pool.reserved_bytes, mag.pool.live_peak_bytes, mag.pool.peak_bytes);
+        prof.recordSlabStats(
+            slab.live_bytes.load(.monotonic),
+            slab.reserved_bytes.load(.monotonic),
+            slab.live_peak_bytes.load(.monotonic),
+            slab.peak_bytes.load(.monotonic),
+        );
         prof.dump(io);
     }
 
     // VM 已执行 main 或失败
     if (outcome == .failed) {
         loader.deinit();
-        mag.deinit();
+        cache.deinit();
+        slab.deinit();
         std.process.exit(1);
     }
 }
 
-/// 诊断运行（glue debug）：全程 DebugAllocator + SlabPool(backing=dbg) 检测 double-free/泄漏，
+/// 诊断运行（glue debug）：全程 DebugAllocator + SlabAllocator(backing=dbg) 检测 double-free/泄漏，
 /// trace=true 输出更详细的运行时错误位置链。结束报告 [GLUE_GPA] LEAK/clean。
 fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
     _ = allocator;
     var dbg: std.heap.DebugAllocator(.{}) = .init;
     const dbg_alloc = dbg.allocator();
     {
-        var pool = slab_pool.SlabPool.init(dbg_alloc);
-        defer pool.deinit();
-        const value_allocator = pool.allocator();
+        var slab = slab_allocator.SlabAllocator.initSingleThreaded(dbg_alloc);
+        defer slab.deinit();
+        var cache = slab_allocator.ThreadCache.init(&slab);
+        defer cache.deinit();
+        const value_allocator = cache.allocator();
 
-        var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
+        var loader = module_loader.ModuleLoader.init(value_allocator, io);
         defer loader.deinit();
 
         // profiler：诊断模式同样支持 profiling。
         prof = profiler.Profiler.init(profiler_enabled, io);
 
-        _ = executeSource(dbg_alloc, &loader, value_allocator, io, source, entry_path);
+        _ = executeSource(value_allocator, &loader, value_allocator, &cache, io, source, entry_path);
 
         if (profiler_enabled) {
-            prof.recordSlabStats(pool.live_bytes, pool.reserved_bytes, pool.live_peak_bytes, pool.peak_bytes);
+            prof.recordSlabStats(
+                slab.live_bytes.load(.monotonic),
+                slab.reserved_bytes.load(.monotonic),
+                slab.live_peak_bytes.load(.monotonic),
+                slab.peak_bytes.load(.monotonic),
+            );
             prof.dump(io);
         }
     }
@@ -423,6 +436,7 @@ fn tryRunOnVM(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
     value_allocator: std.mem.Allocator,
+    cache: ?*slab_allocator.ThreadCache,
     io: std.Io,
     module: ast.Module,
     filename: []const u8,
@@ -491,13 +505,14 @@ fn tryRunOnVM(
         return .failed;
     };
 
-    return runProgram(allocator, value_allocator, io, &mc.program, entry, filename);
+    return runProgram(allocator, value_allocator, cache, io, &mc.program, entry, filename);
 }
 
 /// 执行已编译的 Program。
 fn runProgram(
     allocator: std.mem.Allocator,
     value_allocator: std.mem.Allocator,
+    cache: ?*slab_allocator.ThreadCache,
     io: std.Io,
     program: *vm.chunk.Program,
     entry: u16,
@@ -505,7 +520,9 @@ fn runProgram(
 ) VmOutcome {
     _ = allocator;
     // 执行 main
-    var machine = vm.VM.initWithIo(value_allocator, io);
+    // 主 VM 用 cache（注入 ThreadCache 启用 TypedPool 热路径，绕过 vtable 间接调用）。
+    // spawn 子 VM 用 init/initWithIo（cache=null，走 SlabAllocator.allocator() 直连）。
+    var machine = if (cache) |c| vm.VM.initWithCache(c, io) else vm.VM.initWithIo(value_allocator, io);
     defer machine.deinit();
     if (profiler_enabled) machine.setProfiler(&prof);
     prof.phaseBegin(.vm);
@@ -547,6 +564,7 @@ fn executeSource(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
     value_allocator: std.mem.Allocator,
+    cache: ?*slab_allocator.ThreadCache,
     io: std.Io,
     source: []const u8,
     filename: []const u8,
@@ -592,7 +610,7 @@ fn executeSource(
     entry_module.source_path = filename;
 
     // VM-only路径：直接在字节码VM上编译并执行模块
-    switch (tryRunOnVM(allocator, loader, value_allocator, io, entry_module, filename)) {
+    switch (tryRunOnVM(allocator, loader, value_allocator, cache, io, entry_module, filename)) {
         .ran_main => return .ran_main,
         .failed => return .failed,
     }

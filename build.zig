@@ -38,28 +38,16 @@ pub fn build(b: *std.Build) void {
     // runtime/ sub-modules
     // ============================================================
 
-    const slab_pool_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/slab_pool.zig"),
+    // slab_allocator_module：通用多线程 Slab 分配器（统一分配器，替代 HeapAllocator/MagazineAllocator/SlabPool）。
+    // 特性：Per-class Mutex + ThreadCache + Comptime 特化（SIZE_CLASSES 合并装箱类型 @sizeOf，
+    // TypedPool(T) 类型安全 acquire/release）。依赖 value（编译期收集装箱类型大小）。
+    // loader/AST/value/spawn 全部统一使用此分配器。
+    // 注：value_module 在下方定义，addImport 在 value_module 之后调用。
+    const slab_allocator_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/slab_allocator.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    // heap_module：跟踪式堆分配器（替代 ArenaAllocator，用于 loader/AST 路径）。
-    // 独立无依赖，提供 std.mem.Allocator 接口实现。
-    const heap_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/heap.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // magazine_module：三层分配器（ThreadCache → SlabPool → page_allocator）。
-    // 依赖 slab_pool（同目录文件 @import）。VM 的 value_allocator 用它实现 per-thread 无锁缓存。
-    const magazine_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/magazine.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    magazine_module.addImport("slab_pool", slab_pool_module);
 
     // profiler 模块：全管线 profiling（阶段计时 + 内存统计 + opcode 频率）。独立无依赖，
     // vm 与 root 共享（VM 计数 opcode，main 埋点阶段 + 注入 SlabPool 统计 + dump）。
@@ -113,6 +101,9 @@ pub fn build(b: *std.Build) void {
     channel_module.addImport("sync", sync_module);
     spawn_module.addImport("value", value_module);
     spawn_module.addImport("sync", sync_module);
+    // slab_allocator 依赖 value（编译期收集装箱类型 @sizeOf 生成 SIZE_CLASSES）
+    slab_allocator_module.addImport("value", value_module);
+    slab_allocator_module.addImport("sync", sync_module);
 
     // ============================================================
     // sema/ modules - 语义分析（类型检查、trait解析等）
@@ -229,7 +220,7 @@ pub fn build(b: *std.Build) void {
     vm_module.addImport("parser", parser_module);
     vm_module.addImport("profiler", profiler_module);
     vm_module.addImport("analysis_db", analysis_db_module);
-    vm_module.addImport("heap", heap_module);
+    vm_module.addImport("slab_allocator", slab_allocator_module);
 
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -274,9 +265,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("parser", parser_module);
     root_module.addImport("module_loader", module_loader_module);
     root_module.addImport("value", value_module);
-    root_module.addImport("slab_pool", slab_pool_module);
-    root_module.addImport("heap", heap_module);
-    root_module.addImport("magazine", magazine_module);
+    root_module.addImport("slab_allocator", slab_allocator_module);
     root_module.addImport("profiler", profiler_module);
     root_module.addImport("vm", vm_module);
     root_module.addImport("sema", type_check_module);
@@ -314,20 +303,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_module_check_unit_tests = b.addRunArtifact(module_check_unit_tests);
 
-    const slab_pool_unit_tests = b.addTest(.{
-        .root_module = slab_pool_module,
+    const slab_allocator_unit_tests = b.addTest(.{
+        .root_module = slab_allocator_module,
     });
-    const run_slab_pool_unit_tests = b.addRunArtifact(slab_pool_unit_tests);
-
-    const heap_unit_tests = b.addTest(.{
-        .root_module = heap_module,
-    });
-    const run_heap_unit_tests = b.addRunArtifact(heap_unit_tests);
-
-    const magazine_unit_tests = b.addTest(.{
-        .root_module = magazine_module,
-    });
-    const run_magazine_unit_tests = b.addRunArtifact(magazine_unit_tests);
+    const run_slab_allocator_unit_tests = b.addRunArtifact(slab_allocator_unit_tests);
 
     const stdlib_unit_tests = b.addTest(.{
         .root_module = stdlib_module,
@@ -374,9 +353,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parser_unit_tests.step);
     test_step.dependOn(&run_type_check_unit_tests.step);
     test_step.dependOn(&run_module_check_unit_tests.step);
-    test_step.dependOn(&run_slab_pool_unit_tests.step);
-    test_step.dependOn(&run_heap_unit_tests.step);
-    test_step.dependOn(&run_magazine_unit_tests.step);
+    test_step.dependOn(&run_slab_allocator_unit_tests.step);
     test_step.dependOn(&run_stdlib_unit_tests.step);
     test_step.dependOn(&run_intern_unit_tests.step);
     test_step.dependOn(&run_vm_unit_tests.step);

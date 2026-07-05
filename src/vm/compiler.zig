@@ -2313,6 +2313,33 @@ const FnCompiler = struct {
         self.locals.shrinkRetainingCapacity(saved);
     }
 
+    /// 求值表达式并丢弃结果（用于循环体、表达式语句等"值位置"上下文）。
+    /// 当 expr 是 block 时，镜像 emitBlock 逻辑但跳过无 trailing_expr 时的 op_unit 发射，
+    /// 省去 op_unit + op_pop 一对指令（循环体每次迭代浪费 2 条指令）。
+    /// 含 defer 的 block 仍正确重放 defer（defer 体 push+pop 平衡，不扰动栈）。
+    fn emitExprDiscard(self: *FnCompiler, expr: *const Expr) CompileError!void {
+        // DCE：无副作用表达式完全消除（含无 trailing_expr 且语句全纯的 block）
+        if (exprHasNoSideEffects(expr)) return;
+        const loc = ast.exprLocation(expr);
+        if (expr.* == .block) {
+            const blk = expr.block;
+            const saved = self.locals.items.len;
+            const has_defer = blockHasDefer(blk);
+            if (has_defer) try self.defer_scopes.append(self.allocator, .empty);
+            for (blk.statements) |stmt| try self.emitStmt(stmt);
+            if (blk.trailing_expr) |te| {
+                try self.emitExpr(te);
+                try self.chunk.writeOp(.op_pop, loc);
+            }
+            // 无 trailing_expr：省略 op_unit（结果丢弃，不入栈则无需 pop）
+            if (has_defer) try self.replayTopDeferScope(loc);
+            self.locals.shrinkRetainingCapacity(saved);
+        } else {
+            try self.emitExpr(expr);
+            try self.chunk.writeOp(.op_pop, loc);
+        }
+    }
+
     /// block 是否（直接，非嵌套）含 defer 语句。嵌套 block 由各自 emitBlock 处理。
     fn blockHasDefer(blk: @TypeOf(@as(Expr, undefined).block)) bool {
         for (blk.statements) |stmt| {
@@ -2597,10 +2624,8 @@ const FnCompiler = struct {
                 try self.emitSlotOp(.op_set_local, slot, d.location);
             },
             .expression => |e| {
-                // 指令融合 DCE：表达式无副作用时，完全消除（不发射 emitExpr + op_pop）
-                if (exprHasNoSideEffects(e.expr)) return;
-                try self.emitExpr(e.expr);
-                try self.chunk.writeOp(.op_pop, e.location);
+                // 求值并丢弃（DCE + block 无 trailing_expr 时省 op_unit+op_pop）
+                try self.emitExprDiscard(e.expr);
             },
             .assignment => |a| {
                 // M5f：index 目标 arr[i] = v —— 镜像 eval：identifier 数组目标 COW 后写回绑定槽。
@@ -2726,8 +2751,7 @@ const FnCompiler = struct {
         try self.emitExpr(w.condition);
         const exit_jump = try self.chunk.emitJump(.op_jump_if_false, w.location);
         try self.chunk.writeOp(.op_pop, w.location); // 弹 cond(true)
-        try self.emitExpr(w.body);
-        try self.chunk.writeOp(.op_pop, w.location); // 弹 body 值（while 体值丢弃）
+        try self.emitExprDiscard(w.body); // while 体值丢弃（block 无 trailing_expr 时省 op_unit+op_pop）
         try self.emitLoopBack(loop_start, w.location);
         self.chunk.patchJump(exit_jump);
         try self.chunk.writeOp(.op_pop, w.location); // 弹 cond(false)
@@ -2768,9 +2792,8 @@ const FnCompiler = struct {
         try self.chunk.writeI32(0); // 占位，循环末回填
         // 绑定循环变量（弹元素写 var_slot）。
         try self.emitSlotOp(.op_set_local, var_slot, loc);
-        // 循环体（值丢弃）。
-        try self.emitExpr(f.body);
-        try self.chunk.writeOp(.op_pop, loc);
+        // 循环体（值丢弃，block 无 trailing_expr 时省 op_unit+op_pop）。
+        try self.emitExprDiscard(f.body);
         try self.emitLoopBack(loop_start, loc);
         // exit 落点：FOR_NEXT 耗尽跳到此（未压元素，栈平衡）。
         self.chunk.patchJump(exit_at);
@@ -2840,9 +2863,8 @@ const FnCompiler = struct {
             const cidx = try self.chunk.addConstant(val);
             try self.emitConst(cidx, loc);
             try self.emitSlotOp(.op_set_local, var_slot, loc);
-            // 循环体（值丢弃）
-            try self.emitExpr(f.body);
-            try self.chunk.writeOp(.op_pop, loc);
+            // 循环体（值丢弃，block 无 trailing_expr 时省 op_unit+op_pop）
+            try self.emitExprDiscard(f.body);
         }
     }
 
@@ -2933,12 +2955,8 @@ const FnCompiler = struct {
             if (body_block.trailing_expr) |te| {
                 try self.emitExpr(te);
                 try self.chunk.writeOp(.op_pop, loc);
-            } else {
-                // block 无 trailing_expr：最后一个语句若是表达式语句已自带 pop；
-                // 否则 block 值为 unit，需补 push unit 保持栈平衡（while 体值丢弃）
-                try self.chunk.writeOp(.op_unit, loc);
-                try self.chunk.writeOp(.op_pop, loc);
             }
+            // 无 trailing_expr：省略 op_unit + op_pop（结果丢弃，不入栈则无需 pop）
         }
     }
 
@@ -2947,8 +2965,7 @@ const FnCompiler = struct {
     fn emitLoop(self: *FnCompiler, l: @TypeOf(@as(Stmt, undefined).loop_stmt)) CompileError!void {
         const loop_start = self.chunk.here();
         try self.loops.append(self.allocator, .{ .continue_target = loop_start, .defer_depth = self.defer_scopes.items.len });
-        try self.emitExpr(l.body);
-        try self.chunk.writeOp(.op_pop, l.location); // 弹 body 值
+        try self.emitExprDiscard(l.body); // 弹 body 值（block 无 trailing_expr 时省 op_unit+op_pop）
         try self.emitLoopBack(loop_start, l.location);
         var lc = self.loops.pop().?;
         defer lc.breaks.deinit(self.allocator);

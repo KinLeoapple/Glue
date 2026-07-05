@@ -1,3 +1,4 @@
-name = "bench_stress_compute"
+﻿name = "bench_stress_compute"
 version = "0.1.0"
 entry = "src/Main.glue"
+
