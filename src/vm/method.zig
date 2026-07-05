@@ -184,6 +184,25 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
 
 /// UTF-8 字符串的 Unicode 标量值（码点）个数；非法 UTF-8 退化为字节数。
 fn utf8Len(s: []const u8) u64 {
+    // ASCII fast path：所有字节 < 128 时码点数 = 字节数，O(1) 返回。
+    // SIMD 友好：每次 8 字节 OR 后检查高位。纯 ASCII 字符串（如 "abab..."）
+    // 命中率极高，避免 Utf8View 迭代的逐字节状态机开销。
+    var i: usize = 0;
+    while (i + 8 <= s.len) : (i += 8) {
+        const chunk = std.mem.readInt(u64, s[i..][0..8], .little);
+        if (chunk & 0x8080_8080_8080_8080 != 0) break; // 非 ASCII，转慢路径
+    }
+    if (i < s.len) {
+        // 检查尾部剩余字节（< 8）
+        var has_non_ascii = false;
+        for (s[i..]) |b| {
+            if (b >= 0x80) { has_non_ascii = true; break; }
+        }
+        if (!has_non_ascii) return @intCast(s.len);
+    } else {
+        return @intCast(s.len); // 全 ASCII（含 i==s.len 的对齐情况）
+    }
+    // slow path：含非 ASCII 字节，走 Utf8View 逐码点计数
     const view = std.unicode.Utf8View.init(s) catch return @intCast(s.len);
     var count: u64 = 0;
     var it = view.iterator();

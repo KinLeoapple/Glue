@@ -313,6 +313,18 @@ pub const Value = union(enum) {
         };
     }
 
+    /// 【Memoization】判断值是否可安全 memoize（按内容 hash，不含可变引用）。
+    /// 值类型（不可变）：标量 + 装箱复合（string/array/record/adt/newtype）+ range/error/throw。
+    /// 引用类型（可变/有状态）：cell/closure/channel/spawn/atomic/lazy/iterator/trait 等。
+    pub inline fn isMemoizableValue(self: Value) bool {
+        return switch (self) {
+            .null_val, .unit, .boolean, .char, .int, .float,
+            .string, .array, .record, .adt, .newtype,
+            .range, .error_val, .throw_val => true,
+            else => false,
+        };
+    }
+
     pub inline fn isInteger(self: Value) bool {
         return self == .int;
     }

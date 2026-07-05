@@ -76,10 +76,16 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             return offset + 9;
         },
         // u16 操作数
-        .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_set_local_assign, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_make_error, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_global, .op_set_global, .op_get_local_raw, .op_get_upvalue_raw, .op_push_inplace => {
+        .op_const, .op_get_local, .op_set_local, .op_set_local_letrec, .op_set_local_assign, .op_pop_n, .op_get_field, .op_get_adt_field, .op_test_ctor, .op_make_array, .op_make_record, .op_test_lit, .op_record_extend, .op_make_newtype, .op_make_error, .op_test_newtype, .op_interp, .op_cast, .op_coerce, .op_set_field, .op_get_global, .op_set_global, .op_get_local_raw, .op_get_upvalue_raw, .op_push_inplace, .op_push_inplace_set => {
             const arg = opcode.readU16(code, offset + 1);
             try print(buf, allocator, "{s} {d}\n", .{ op.name(), arg });
             return offset + 3;
+        },
+        // u8 窄变体操作数（op_const_u8/op_get_local_u8/op_set_local_u8/op_push_inplace_set_u8）
+        .op_const_u8, .op_get_local_u8, .op_set_local_u8, .op_push_inplace_set_u8 => {
+            const arg = code[offset + 1];
+            try print(buf, allocator, "{s} {d}\n", .{ op.name(), arg });
+            return offset + 2;
         },
         // OP_COMPOUND_LOCAL <u16 slot> <u8 arith_op>
         .op_compound_local => {

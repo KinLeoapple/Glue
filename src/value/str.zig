@@ -81,6 +81,23 @@ pub const Str = extern struct {
         return result;
     }
 
+    /// 拼接两段字节构造 SSO Str（仅当 a.len + b.len ≤ SSO_MAX 时调用）。
+    /// 零堆分配：直接内联数据到 Str 结构体。供 VM string+string 拼接 fast path 使用。
+    /// 调用方必须保证总长度 ≤ SSO_MAX，否则行为未定义。
+    pub fn concatSso(a: []const u8, b: []const u8) Str {
+        const total = a.len + b.len;
+        var result = Str{ .rc = SSO_FLAG | SSO_REFCOUNT_INIT | @as(u32, @intCast(total)) };
+        const dst: [*]u8 = @ptrCast(&result);
+        @memcpy(dst[0..a.len], a);
+        @memcpy(dst[a.len..total], b);
+        return result;
+    }
+
+    /// 判断两段字节拼接后是否可走 SSO 路径（总长 ≤ SSO_MAX）。
+    pub inline fn canConcatSso(a_len: usize, b_len: usize) bool {
+        return a_len + b_len <= SSO_MAX;
+    }
+
     fn initHeap(ptr: [*]u8, len: usize) Str {
         return .{
             ._word0 = @intFromPtr(ptr),

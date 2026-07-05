@@ -65,6 +65,9 @@ const LoopCtx = struct {
     breaks: std.ArrayListUnmanaged(usize) = .empty,
     /// 进入循环时的 defer 作用域深度。break/continue 须重放循环体内（深度 ≥ 此值）的 defer。
     defer_depth: usize = 0,
+    /// 【LICM】本循环 hoist 的表达式指针列表。退出循环时据此清理 hoisted_slots，
+    /// 防止循环外引用同名表达式时读到循环前的缓存值（其中变量可能已被修改）。
+    hoisted_exprs: std.ArrayListUnmanaged(*const ast.Expr) = .empty,
 };
 
 /// 顶层函数名 → func_idx 映射（编译期识别 call 的 callee）。arity 用于尾调用合格性判定。
@@ -234,15 +237,14 @@ pub const ModuleCompiler = struct {
     }
 
     /// 【JIT Phase 3】获取或分配纯函数的 memo_slot（per-function，所有调用点共享）。
-    /// 返回 null 表示该函数不是纯函数、未注册、或参数含非原始类型（不可安全 memoize）。
-    /// 仅当所有参数类型为基础类型（数值/bool/char/str）时才分配 slot，
-    /// 因为 hashArgs 对装箱复合类型（ADT/record/array）按指针 hash，会导致错误命中。
+    /// 返回 null 表示该函数不是纯函数或未注册。
+    /// hashValueRecursive 对所有值类型（含 ADT/record/array/newtype）按内容递归 hash，
+    /// 引用类型（cell/channel/spawn/atomic 等）在 VM 运行时守卫中跳过 memoization。
+    /// 无类型注解的参数也允许——hash 基于运行时 Value，与编译期类型无关。
     pub fn getOrAssignMemoSlot(self: *ModuleCompiler, name: []const u8) ?u16 {
         if (!self.isPureFn(name)) return null;
         for (self.fn_table.items) |*entry| {
             if (std.mem.eql(u8, entry.name, name)) {
-                // 安全检查：所有参数必须为基础类型（可按值 hash）
-                if (!allParamsMemoizable(entry.param_types)) return null;
                 if (entry.memo_slot == 0xFFFF) {
                     entry.memo_slot = self.next_memo_slot;
                     self.next_memo_slot += 1;
@@ -277,6 +279,15 @@ pub const ModuleCompiler = struct {
     pub fn constValue(self: *const ModuleCompiler, expr: *const ast.Expr) ?analysis_db_mod.ConstValue {
         if (self.analysis_db) |db| {
             return db.const_prop.lookup(expr);
+        }
+        return null;
+    }
+
+    /// 【LICM】查询表达式是否是某循环的已登记不变量。返回该循环 stmt 指针。
+    /// FnCompiler.emitHoistedInvariants 遍历 hoist_table 找出属于某循环的所有表达式。
+    pub fn hoistInfo(self: *const ModuleCompiler, expr: *const ast.Expr) ?*const ast.Stmt {
+        if (self.analysis_db) |db| {
+            return db.hoist_table.lookup(expr);
         }
         return null;
     }
@@ -966,6 +977,10 @@ const FnCompiler = struct {
     rec_func_idx: u16 = 0,
     /// 【内联】当前内联展开深度（0 = 非内联上下文）。限制 ≤ 3 防止无限展开。
     inline_depth: u8 = 0,
+    /// 【LICM】已 hoist 的表达式 → 临时 slot 映射。循环入口处求值一次并缓存，
+    /// 循环体内 emitExpr 命中此表则发 op_get_local 替代重算。
+    /// 退出循环时据 LoopCtx.hoisted_exprs 清理本循环的映射。
+    hoisted_slots: std.AutoHashMapUnmanaged(*const ast.Expr, u16) = .{},
 
     fn init(allocator: std.mem.Allocator, module: *ModuleCompiler) FnCompiler {
         var fc = FnCompiler{
@@ -980,7 +995,24 @@ const FnCompiler = struct {
     }
 
     /// 发射 slot/idx 立即数指令（writeOp + writeU16）。
+    /// slot < 256 时自动选择 u8 窄变体（op_get_local/op_set_local），
+    /// 省一字节立即数 + VM 解码省一次移位/或运算。绝大多数函数局部 < 256，命中率极高。
     inline fn emitSlotOp(self: *FnCompiler, op: OpCode, slot: u16, loc: ast.SourceLocation) !void {
+        if (slot < 256) {
+            switch (op) {
+                .op_get_local => {
+                    try self.chunk.writeOp(.op_get_local_u8, loc);
+                    try self.chunk.writeByte(@intCast(slot));
+                    return;
+                },
+                .op_set_local => {
+                    try self.chunk.writeOp(.op_set_local_u8, loc);
+                    try self.chunk.writeByte(@intCast(slot));
+                    return;
+                },
+                else => {},
+            }
+        }
         try self.chunk.writeOp(op, loc);
         try self.chunk.writeU16(slot);
     }
@@ -991,6 +1023,7 @@ const FnCompiler = struct {
         self.loops.deinit(self.allocator);
         for (self.defer_scopes.items) |*s| s.deinit(self.allocator);
         self.defer_scopes.deinit(self.allocator);
+        self.hoisted_slots.deinit(self.allocator);
         // 拥有 chunk：正常路径下 compileFunction 已把真 chunk 移走并置空 chunk（deinit 释放空壳）；
         // 错误路径（emit 中途 Unsupported/OOM）下释放半成品 chunk，防泄漏。
         self.chunk.deinit();
@@ -1044,6 +1077,11 @@ const FnCompiler = struct {
 
     fn emitExpr(self: *FnCompiler, expr: *const Expr) CompileError!void {
         const loc = ast.exprLocation(expr);
+        // 【LICM】如果是已 hoist 的循环不变量，直接读缓存 slot 替代重算
+        if (self.hoisted_slots.get(expr)) |slot| {
+            try self.emitSlotOp(.op_get_local, slot, loc);
+            return;
+        }
         switch (expr.*) {
             .int_literal => |lit| {
                 const v = try parseIntLiteral(self.allocator, lit) orelse return error.Unsupported;
@@ -1142,6 +1180,8 @@ const FnCompiler = struct {
             .binary => |bin| {
                 // 常量折叠：编译期求值二元算术/比较（命中则直接发射 op_const，跳过左右子树求值）
                 if (try self.tryEmitConstFoldedBinary(bin, expr, loc)) return;
+                // 指令融合：代数简化（x+0→x、x*1→x、x*0→0、x&&true→x 等）
+                if (try self.tryEmitAlgebraicSimplify(bin, loc)) return;
                 try self.emitBinary(bin, loc);
             },
             .if_expr => |ie| try self.emitIf(ie, expr, loc),
@@ -1596,8 +1636,15 @@ const FnCompiler = struct {
     }
 
     fn emitConst(self: *FnCompiler, k: u16, loc: ast.SourceLocation) CompileError!void {
-        try self.chunk.writeOp(.op_const, loc);
-        try self.chunk.writeU16(k);
+        // k < 256 时用 u8 窄变体，省一字节立即数 + VM 解码省一次移位/或运算。
+        // 常量池前 256 项多为高频字面量（0/1/空串/常用 int），命中率极高。
+        if (k < 256) {
+            try self.chunk.writeOp(.op_const_u8, loc);
+            try self.chunk.writeByte(@intCast(k));
+        } else {
+            try self.chunk.writeOp(.op_const, loc);
+            try self.chunk.writeU16(k);
+        }
     }
 
     /// 推断表达式的基础类型名（int/float/bool/char literal + identifier 可推断；binary/unary 算术递归左操作数；其他返回 null）。
@@ -2145,6 +2192,223 @@ const FnCompiler = struct {
         }
     }
 
+    /// 【指令融合】代数简化 peephole：识别 x op k 或 k op x 模式（k 为编译期常量），
+    /// 折叠为更简形式。命中返回 true（已发射），未命中返回 false。
+    ///
+    /// 安全性：
+    /// - 加法/乘法单位元（0/+，1/*，1//，0-）→ 仅 emit 另一操作数，无副作用问题
+    /// - 零化简（x*0 → 0）→ 仅当另一操作数是"纯表达式"才简化（避免丢副作用）
+    /// - 逻辑短路化简（x&&true → x，x||false → x）→ 仅 emit 另一操作数
+    /// - 逻辑恒值化简（x&&false → false，x||true → true）→ 仅当另一操作数是"纯表达式"
+    ///   （因为原 && / || 短路：若 x 假，x&&false 不求值右操作数；hoist 后右操作数仍不求值，
+    ///   但 x 必须求值——若 x 有副作用，化简为 false 会丢副作用，故要求 x 纯）
+    fn tryEmitAlgebraicSimplify(
+        self: *FnCompiler,
+        bin: @TypeOf(@as(Expr, undefined).binary),
+        loc: ast.SourceLocation,
+    ) CompileError!bool {
+        // 不处理字符串拼接 / 数组拼接 / range / elvis（语义不适用）
+        switch (bin.op) {
+            .add, .sub, .mul, .div, .bit_and, .bit_or, .bit_xor,
+            .and_op, .or_op => {},
+            else => return false,
+        }
+
+        // 查常量值（左右任一为常量即可）
+        const lv = self.lookupConstValue(bin.left);
+        const rv = self.lookupConstValue(bin.right);
+        if (lv == null and rv == null) return false;
+
+        // 辅助：判定操作数是否"纯"（无副作用）——字面量 + identifier 视为纯。
+        // 化简为常量时（如 x*0→0），另一操作数必须纯，否则丢副作用。
+        const isPure = struct {
+            fn check(e: *const Expr) bool {
+                return switch (e.*) {
+                    .int_literal, .float_literal, .bool_literal,
+                    .char_literal, .string_literal, .null_literal, .unit_literal,
+                    .identifier,
+                    => true,
+                    .unary => |u| check(u.operand),
+                    .binary => |b| check(b.left) and check(b.right),
+                    else => false,
+                };
+            }
+        }.check;
+
+        // 辅助：判定常量是否为整数 0 / 1 或浮点 0.0 / 1.0 或布尔 true / false
+        const isZero = struct {
+            fn check(cv: ?analysis_db_mod.ConstValue) bool {
+                if (cv) |v| return switch (v) {
+                    .int_val => |i| i == 0,
+                    .float_val => |f| f == 0.0,
+                    else => false,
+                };
+                return false;
+            }
+        }.check;
+        const isOne = struct {
+            fn check(cv: ?analysis_db_mod.ConstValue) bool {
+                if (cv) |v| return switch (v) {
+                    .int_val => |i| i == 1,
+                    .float_val => |f| f == 1.0,
+                    else => false,
+                };
+                return false;
+            }
+        }.check;
+        const isBool = struct {
+            fn check(cv: ?analysis_db_mod.ConstValue, want: bool) bool {
+                if (cv) |v| return switch (v) {
+                    .bool_val => |b| b == want,
+                    else => false,
+                };
+                return false;
+            }
+        }.check;
+
+        switch (bin.op) {
+            // x + 0 / 0 + x → x
+            .add => {
+                if (isZero(rv)) {
+                    try self.emitExpr(bin.left);
+                    return true;
+                }
+                if (isZero(lv)) {
+                    try self.emitExpr(bin.right);
+                    return true;
+                }
+            },
+            // x - 0 → x（注意：0 - x 不化简，因为 -x 是 neg）
+            .sub => {
+                if (isZero(rv)) {
+                    try self.emitExpr(bin.left);
+                    return true;
+                }
+            },
+            // x * 1 / 1 * x → x；x * 0 / 0 * x → 0（另一操作数须纯）
+            .mul => {
+                if (isOne(rv)) {
+                    try self.emitExpr(bin.left);
+                    return true;
+                }
+                if (isOne(lv)) {
+                    try self.emitExpr(bin.right);
+                    return true;
+                }
+                if (isZero(rv) and isPure(bin.left)) {
+                    try self.emitZeroConstant(bin.left, loc);
+                    return true;
+                }
+                if (isZero(lv) and isPure(bin.right)) {
+                    try self.emitZeroConstant(bin.right, loc);
+                    return true;
+                }
+            },
+            // x / 1 → x
+            .div => {
+                if (isOne(rv)) {
+                    try self.emitExpr(bin.left);
+                    return true;
+                }
+            },
+            // x & 0 → 0（位运算零化简，另一操作数须纯）；x & -1（全 1）不化简（需类型宽度信息）
+            .bit_and => {
+                if (isZero(rv) and isPure(bin.left)) {
+                    try self.emitZeroConstant(bin.left, loc);
+                    return true;
+                }
+                if (isZero(lv) and isPure(bin.right)) {
+                    try self.emitZeroConstant(bin.right, loc);
+                    return true;
+                }
+            },
+            // x | 0 → x（位运算单位元）
+            .bit_or => {
+                if (isZero(rv)) {
+                    try self.emitExpr(bin.left);
+                    return true;
+                }
+                if (isZero(lv)) {
+                    try self.emitExpr(bin.right);
+                    return true;
+                }
+            },
+            // x ^ 0 → x
+            .bit_xor => {
+                if (isZero(rv)) {
+                    try self.emitExpr(bin.left);
+                    return true;
+                }
+                if (isZero(lv)) {
+                    try self.emitExpr(bin.right);
+                    return true;
+                }
+            },
+            // x && true / true && x → x；x && false → false（x 须纯）；false && x → false（x 须纯）
+            .and_op => {
+                if (isBool(rv, true)) {
+                    try self.emitExpr(bin.left);
+                    return true;
+                }
+                if (isBool(lv, true)) {
+                    try self.emitExpr(bin.right);
+                    return true;
+                }
+                if (isBool(rv, false) and isPure(bin.left)) {
+                    try self.chunk.writeOp(.op_false, loc);
+                    return true;
+                }
+                if (isBool(lv, false) and isPure(bin.right)) {
+                    try self.chunk.writeOp(.op_false, loc);
+                    return true;
+                }
+            },
+            // x || false / false || x → x；x || true → true（x 须纯）；true || x → true（x 须纯）
+            .or_op => {
+                if (isBool(rv, false)) {
+                    try self.emitExpr(bin.left);
+                    return true;
+                }
+                if (isBool(lv, false)) {
+                    try self.emitExpr(bin.right);
+                    return true;
+                }
+                if (isBool(rv, true) and isPure(bin.left)) {
+                    try self.chunk.writeOp(.op_true, loc);
+                    return true;
+                }
+                if (isBool(lv, true) and isPure(bin.right)) {
+                    try self.chunk.writeOp(.op_true, loc);
+                    return true;
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    /// 辅助：发射与 `ty_expr` 同类型的零常量（int 0 / float 0.0）。
+    /// 用于 x*0 / x&0 等化简。ty_expr 仅用于类型推断。
+    fn emitZeroConstant(self: *FnCompiler, ty_expr: *const Expr, loc: ast.SourceLocation) CompileError!void {
+        // 优先用 ty_expr 的类型注解；int→0，float→0.0，否则退化到 i64 0
+        const tname = self.exprBuiltinType(ty_expr);
+        if (tname) |tn| {
+            if (value.IntType.fromName(tn)) |it| {
+                const v = Value.fromInt(value.Int.fromNative(it, 0));
+                try self.emitConst(try self.chunk.addConstant(v), loc);
+                return;
+            }
+            if (value.FloatType.fromName(tn)) |ft| {
+                const v = Value.fromFloat(value.Float.fromNative(ft, 0.0));
+                try self.emitConst(try self.chunk.addConstant(v), loc);
+                return;
+            }
+        }
+        // 默认 i64 0
+        const v = Value.fromInt(value.Int.fromNative(.i64, 0));
+        try self.emitConst(try self.chunk.addConstant(v), loc);
+    }
+
     /// 常量折叠一元运算（neg）。not 已由字面量 + op_not 处理，这里只处理 neg。
     fn tryEmitConstFoldedUnary(
         self: *FnCompiler,
@@ -2635,7 +2899,8 @@ const FnCompiler = struct {
                 }
                 if (a.target.* != .identifier) return error.Unsupported;
                 const name = a.target.identifier.name;
-                // op_push_inplace 优化：arr = arr.push(expr) 模式（仅 local，rc==1 时 VM 原地扩容）
+                // op_push_inplace_set 优化：arr = arr.push(expr) 融合指令
+                // 合并 op_push_inplace + op_set_local_assign，消除 fast path 的 retain+release 往返
                 if (a.value.* == .method_call) blk: {
                     const mc = a.value.method_call;
                     if (!(std.mem.eql(u8, mc.method, "push") and mc.arguments.len == 1)) break :blk;
@@ -2643,9 +2908,13 @@ const FnCompiler = struct {
                     if (!std.mem.eql(u8, mc.object.identifier.name, name)) break :blk;
                     const slot = self.resolveLocal(name) orelse break :blk;
                     try self.emitExpr(mc.arguments[0]);
-                    try self.chunk.writeOp(.op_push_inplace, a.location);
-                    try self.chunk.writeU16(slot);
-                    try self.emitSlotOp(.op_set_local_assign, slot, a.location);
+                    if (slot < 256) {
+                        try self.chunk.writeOp(.op_push_inplace_set_u8, a.location);
+                        try self.chunk.writeByte(@intCast(slot));
+                    } else {
+                        try self.chunk.writeOp(.op_push_inplace_set, a.location);
+                        try self.chunk.writeU16(slot);
+                    }
                     return;
                 }
                 if (self.resolveLocal(name)) |slot| {
@@ -2682,9 +2951,9 @@ const FnCompiler = struct {
                 if (self.tryUnrollWhile(w, stmt)) |_| {
                     return;
                 } else |_| {}
-                try self.emitWhile(w);
+                try self.emitWhile(w, stmt);
             },
-            .loop_stmt => |l| try self.emitLoop(l),
+            .loop_stmt => |l| try self.emitLoop(l, stmt),
             .for_stmt => |f| try self.emitFor(f, stmt),
             .break_stmt => |b| {
                 if (self.loops.items.len == 0) return error.Unsupported;
@@ -2743,11 +3012,39 @@ const FnCompiler = struct {
         }
     }
 
-    fn emitWhile(self: *FnCompiler, w: @TypeOf(@as(Stmt, undefined).while_stmt)) CompileError!void {
+    /// 【LICM】在循环入口前发射所有属于该循环的 hoist 不变量。
+    /// 遍历模块级 hoist_table，找出 owner_loop == stmt 的表达式，
+    /// 对每个：emitExpr 求值一次 → declareLocal 分配临时 slot → op_set_local 缓存 → 登记 hoisted_slots。
+    /// 登记的 expr* 记录到当前 LoopCtx.hoisted_exprs，供退出循环时清理。
+    /// 必须在 push LoopCtx 之后、loop_start 之前调用（hoist 代码在循环前执行一次，不在每轮重执行）。
+    fn emitHoistedInvariants(self: *FnCompiler, stmt: *const ast.Stmt, loc: ast.SourceLocation) CompileError!void {
+        const db = self.module.analysis_db orelse return;
+        if (db.hoist_table.isEmpty()) return;
+        if (self.loops.items.len == 0) return;
+        const lc = &self.loops.items[self.loops.items.len - 1];
+        var it = db.hoist_table.entries.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != stmt) continue;
+            const expr = entry.key_ptr.*;
+            // 求值不变量表达式（emitExpr 入口查 hoisted_slots，但此时还没登记，正常求值）
+            try self.emitExpr(expr);
+            // 分配临时 slot 缓存结果（needs_release=true：位运算/比较结果可能是 Value 引用）
+            const slot = try self.declareLocal("$hoist", false, true, null);
+            try self.emitSlotOp(.op_set_local, slot, loc);
+            try self.hoisted_slots.put(self.allocator, expr, slot);
+            try lc.hoisted_exprs.append(self.allocator, expr);
+        }
+    }
+
+    fn emitWhile(self: *FnCompiler, w: @TypeOf(@as(Stmt, undefined).while_stmt), stmt: *const Stmt) CompileError!void {
         // loop_start: cond; jump_if_false->end; pop cond(true); body; pop body; jump loop_start; end: pop cond(false)
+        // 先 push LoopCtx（emitHoistedInvariants 往 hoisted_exprs 登记），continue_target 暂设 0，loop_start 定了再修正
+        try self.loops.append(self.allocator, .{ .continue_target = 0, .defer_depth = self.defer_scopes.items.len });
+        // 【LICM】在 loop_start 之前 hoist 不变量（循环前执行一次）
+        try self.emitHoistedInvariants(stmt, w.location);
         const loop_start = self.chunk.here();
+        self.loops.items[self.loops.items.len - 1].continue_target = loop_start;
         // continue 回跳到条件重新求值处（loop_start）。
-        try self.loops.append(self.allocator, .{ .continue_target = loop_start, .defer_depth = self.defer_scopes.items.len });
         try self.emitExpr(w.condition);
         const exit_jump = try self.chunk.emitJump(.op_jump_if_false, w.location);
         try self.chunk.writeOp(.op_pop, w.location); // 弹 cond(true)
@@ -2758,7 +3055,10 @@ const FnCompiler = struct {
         // break 跳到此处（cond 已弹，栈平衡）。
         var lc = self.loops.pop().?;
         defer lc.breaks.deinit(self.allocator);
+        defer lc.hoisted_exprs.deinit(self.allocator);
         for (lc.breaks.items) |j| self.chunk.patchJump(j);
+        // 【LICM】清理本循环的 hoisted_slots 映射（循环外引用同名表达式时不应读循环前缓存值）
+        for (lc.hoisted_exprs.items) |e| _ = self.hoisted_slots.remove(e);
     }
 
     /// for x in iter { body }（M3d）：iter 求值存隐藏 slot，index slot 初始化 0；
@@ -2782,8 +3082,12 @@ const FnCompiler = struct {
         // 循环变量 slot（每轮 OP_FOR_NEXT 压元素后 set_local 绑定）。
         const var_slot = try self.declareLocal(f.name, true, true, null);
 
+        // 先 push LoopCtx（emitHoistedInvariants 往 hoisted_exprs 登记），continue_target 暂设 0
+        try self.loops.append(self.allocator, .{ .continue_target = 0, .defer_depth = self.defer_scopes.items.len });
+        // 【LICM】在 loop_start 之前 hoist 不变量（循环前执行一次）
+        try self.emitHoistedInvariants(stmt, loc);
         const loop_start = self.chunk.here();
-        try self.loops.append(self.allocator, .{ .continue_target = loop_start, .defer_depth = self.defer_scopes.items.len });
+        self.loops.items[self.loops.items.len - 1].continue_target = loop_start;
         // OP_FOR_NEXT <iter_slot><idx_slot><i32 exit_off>：耗尽跳 exit；否则压当前元素 + idx++。
         try self.chunk.writeOp(.op_for_next, loc);
         try self.chunk.writeU16(iter_slot);
@@ -2799,7 +3103,10 @@ const FnCompiler = struct {
         self.chunk.patchJump(exit_at);
         var lc = self.loops.pop().?;
         defer lc.breaks.deinit(self.allocator);
+        defer lc.hoisted_exprs.deinit(self.allocator);
         for (lc.breaks.items) |j| self.chunk.patchJump(j);
+        // 【LICM】清理 hoisted_slots 映射（须在 shrinkRetainingCapacity 前，避免 slot 被复用后误读）
+        for (lc.hoisted_exprs.items) |e| _ = self.hoisted_slots.remove(e);
         self.locals.shrinkRetainingCapacity(saved);
     }
 
@@ -2962,14 +3269,21 @@ const FnCompiler = struct {
 
     /// loop { body }：无限循环，仅 break 退出。
     /// loop_start: body; pop body; jump loop_start; end:(break 落点)
-    fn emitLoop(self: *FnCompiler, l: @TypeOf(@as(Stmt, undefined).loop_stmt)) CompileError!void {
+    fn emitLoop(self: *FnCompiler, l: @TypeOf(@as(Stmt, undefined).loop_stmt), stmt: *const Stmt) CompileError!void {
+        // 先 push LoopCtx（emitHoistedInvariants 往 hoisted_exprs 登记），continue_target 暂设 0
+        try self.loops.append(self.allocator, .{ .continue_target = 0, .defer_depth = self.defer_scopes.items.len });
+        // 【LICM】在 loop_start 之前 hoist 不变量（循环前执行一次）
+        try self.emitHoistedInvariants(stmt, l.location);
         const loop_start = self.chunk.here();
-        try self.loops.append(self.allocator, .{ .continue_target = loop_start, .defer_depth = self.defer_scopes.items.len });
+        self.loops.items[self.loops.items.len - 1].continue_target = loop_start;
         try self.emitExprDiscard(l.body); // 弹 body 值（block 无 trailing_expr 时省 op_unit+op_pop）
         try self.emitLoopBack(loop_start, l.location);
         var lc = self.loops.pop().?;
         defer lc.breaks.deinit(self.allocator);
+        defer lc.hoisted_exprs.deinit(self.allocator);
         for (lc.breaks.items) |j| self.chunk.patchJump(j);
+        // 【LICM】清理本循环的 hoisted_slots 映射
+        for (lc.hoisted_exprs.items) |e| _ = self.hoisted_slots.remove(e);
     }
 
     /// 复合赋值 x op= v → x = x op v（local/upvalue target）。Atomic 透明操作留 M4。
@@ -3355,22 +3669,11 @@ fn isBuiltinNumericType(name: []const u8) bool {
     return false;
 }
 
-/// 【JIT Phase 3】判断类型名是否可安全 memoize（按值 hash，不含指针）。
-/// 基础类型 + str 已安全；用户自定义类型（ADT/record/newtype/array）也安全：
-/// 纯函数不改变参数，按值 hash 正确反映内容差异。
-/// 引用类型（channel/spawn/atomic 等）的 hashArgs 走指针 hash，安全但低效（少命中）。
-fn isMemoizableType(name: []const u8) bool {
-    _ = name;
-    return true;
-}
-
-/// 【JIT Phase 3】检查函数所有参数类型是否均可安全 memoize。
-/// param_types[i] 为 null 表示无类型注解（动态类型），保守视为不安全。
+/// 【JIT Phase 3】检查函数所有参数是否可安全 memoize。
+/// 所有类型（含无类型注解的参数）均允许——hashValueRecursive 基于运行时 Value
+/// 按内容递归 hash，引用类型在 VM 运行时守卫中跳过。此函数保留为 noop，未来可加编译期过滤。
 fn allParamsMemoizable(param_types: []const ?[]const u8) bool {
-    for (param_types) |pt| {
-        const t = pt orelse return false;
-        if (!isMemoizableType(t)) return false;
-    }
+    _ = param_types;
     return true;
 }
 

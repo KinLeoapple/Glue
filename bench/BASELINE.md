@@ -442,16 +442,41 @@ VM 阶段吞吐（`--profile`，短基准用此指标）：
 | string | 50.57 | **55.72** | **+10.2%** |
 | array  | 103.79 | 100.63 | -3.0% |
 
-**分析**：
-- **string +10.2%**：高吞吐非算术负载受益最大。op_const 19.1% + op_get_local 12.3% + op_pop 14.1% 的指针寻址优化在 32ms 短 VM 中累积显著收益。
-- **record/float/closure -1~-3%**：微提升，sync-point 偏移计算开销部分抵消指针寻址收益。
-- **fib/tailcall 持平**：栈密集型负载，op_get_local 占比高但每条指令的 loc 计算 `@intCast(ip_ptr - code.ptr)` 开销抵消了取指收益。
-- **array -3.0%**：op_cast 5.8% + op_push_inplace 5.8% 涉及 sync-point，偏移计算开销在 18ms 短 VM 中可见。
+### M8: Memoization 扩展 + freeValueSlice size mismatch 修复 (2026-07-05)
 
-**结论**：ip_ptr 优化是中性偏正——string 显著提升（+10.2%），其他 benchmark 微提升或持平，array 微回退。在 x86-64 上 `code[ip]` 的基址+偏移寻址已是单条指令，ip_ptr 的收益主要在省去 ip 维护和立即数读取的偏移加法。
+**Memoization 扩展**（延续 M6/M7，进一步放宽适用范围）：
+- [src/vm/compiler.zig](file:///d:/Projects/Zig/Glue/src/vm/compiler.zig): `getOrAssignMemoSlot` 移除 `allParamsMemoizable` 类型注解限制——hash 基于运行时 Value，与编译期类型无关
+- [src/value/mod.zig](file:///d:/Projects/Zig/Glue/src/value/mod.zig): 新增 `isMemoizableValue` 运行时谓词——值类型（标量+装箱复合+range/error/throw）返回 true，引用类型（cell/closure/channel/spawn/atomic/lazy/iterator/trait）返回 false
+- [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `doCallMemoized` 添加三层运行时守卫：(1) disabled slot 检查（连续 miss 超阈值直接走 doCall），(2) 引用类型守卫（参数含可变引用走 doCall），(3) per-slot miss tracking（cache miss 递增计数，超阈值禁用 slot；hit 重置）
+- [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `hashValueRecursive` 添加 `depth` 参数（`MAX_HASH_DEPTH=256`），超过则回退指针 hash，防止 50000 节点 LList 等深层 ADT 递归 hash 栈溢出
+- [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `op_return` 缓存写入路径跳过 disabled slots；VM.deinit 清理 `memo_slot_misses` 与 `memo_disabled_slots`
+- 新增常量：`MEMO_MISS_THRESHOLD=64`（per-slot 连续 miss 阈值）、`MAX_HASH_DEPTH=256`（递归 hash 深度限制）
 
-**验证**：`zig build test` 全通过；33 个集成测试全通过。
-**无行为变更**：纯指针缓存优化，语义不变。
+**Pre-existing bug 修复**（stress_compute mergeSort 阶段崩溃）：
+- **根因**：`freeValueSlice` 用 `buf.len` 而非实际分配的 capacity 计算 size/ci。`op_push_inplace` 扩容后 `arr.elements` 是 `new_mem[0..old_len+1]` 切片，`len < capacity`。free 时 size 与分配时不匹配 → SlabPool free_list 污染 → 后续 alloc 返回错误大小的内存 → use-after-free
+- **触发条件**：小规模（≤2050 元素）不触发，大规模（≥2075）才触发，因需积累足够多的 size mismatch 才会污染到被复用的 slot
+- **修复**：
+  - [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): 新增 `freeValueSliceCap(ptr, cap)` 按 capacity 释放
+  - [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `op_push_inplace` 和 `op_push_inplace_set` 两处扩容路径改用 `freeValueSliceCap`，传入 `old_cap`
+  - [src/value/composite.zig](file:///d:/Projects/Zig/Glue/src/value/composite.zig): `ArrayValue.deinit` 用 `capacity` 释放底层内存
+
+**验证**：
+- `zig build test`：166/166 通过
+- 8 benchmark：全部正确，性能与之前一致（array 略有提升 13.3ms vs 14.46ms，因 slab 分配更高效）
+- 3 stress 测试（stress_compute / stress_memory / stress_composite）：全部通过，此前 stress_compute 在 mergeSort 阶段崩溃的问题已解决
+
+VM 阶段吞吐（`--profile`，best-of-5）：
+
+| Benchmark | VM ms | 吞吐 (M instr/s) | 指令数 |
+|---|---|---|---|
+| fib | 0.10 | 4.81 | 484 |
+| lookup | 864.18 | 163.30 | 140M |
+| record | 523.71 | 112.41 | 57M |
+| float | 997.87 | 31.80 | 30.9M |
+| string | 26.76 | 62.93 | 1.65M |
+| closure | 39.98 | 144.71 | 5.85M |
+| array | 13.30 | 103.40 | 1.50M |
+| tailcall | 28.65 | 184.07 | 5.18M |
 
 ### M6: 内存占用优化——loc 惰性加载 + 栈空闲收缩 (2026-07-03)
 **目标**：减少内存占用的同时，速度性能不回退。三項子优化：

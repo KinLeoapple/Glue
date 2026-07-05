@@ -23,11 +23,12 @@ const purity_mod = @import("purity.zig");
 const ConstValue = const_prop_mod.ConstValue;
 const ConstEnv = const_prop_mod.ConstEnv;
 const LoopInfo = loop_invariant_mod.LoopInfo;
+const HoistTable = loop_invariant_mod.HoistTable;
 const PurityInfo = purity_mod.PurityInfo;
 
 const UNROLL_THRESHOLD: u32 = 32;
 
-/// 融合分析器：单次遍历填充 const_prop / loop_invariant，并收集调用图用于 purity fixpoint。
+/// 融合分析器：单次遍历填充 const_prop / loop_invariant / hoist_table，并收集调用图用于 purity fixpoint。
 pub const FusedAnalysis = struct {
     /// 借用：写入 db.const_prop
     const_table: *const_prop_mod.ConstTable,
@@ -35,6 +36,8 @@ pub const FusedAnalysis = struct {
     loop_table: *loop_invariant_mod.LoopTable,
     /// 借用：写入 db.purity
     purity_table: *purity_mod.PurityTable,
+    /// 借用：写入 db.hoist_table（LICM 不变量提升表）
+    hoist_table: *loop_invariant_mod.HoistTable,
     allocator: std.mem.Allocator,
 
     /// 临时：函数名 → 它直接调用的函数名列表（仅顶层 fun_decl 之间的边）
@@ -49,11 +52,13 @@ pub const FusedAnalysis = struct {
         const_table: *const_prop_mod.ConstTable,
         loop_table: *loop_invariant_mod.LoopTable,
         purity_table: *purity_mod.PurityTable,
+        hoist_table: *loop_invariant_mod.HoistTable,
     ) FusedAnalysis {
         return .{
             .const_table = const_table,
             .loop_table = loop_table,
             .purity_table = purity_table,
+            .hoist_table = hoist_table,
             .allocator = allocator,
             .name_call_graph = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .direct_impure = std.StringHashMap(void).init(allocator),
@@ -273,6 +278,16 @@ pub const FusedAnalysis = struct {
                     .is_small = size <= UNROLL_THRESHOLD,
                     .est_size = size,
                 });
+                // 【LICM】收集循环体内可 hoist 的不变量子表达式
+                // for 循环变量每轮被赋值，算作 assigned
+                const for_assigned = [_][]const u8{f.name};
+                try loop_invariant_mod.collectHoistsInExpr(
+                    self.allocator,
+                    self.hoist_table,
+                    f.body,
+                    stmt,
+                    &for_assigned,
+                );
                 try self.analyzeExpr(f.body, env, current_fn);
             },
             .while_stmt => |w| {
@@ -282,6 +297,17 @@ pub const FusedAnalysis = struct {
                     .is_small = size <= UNROLL_THRESHOLD,
                     .est_size = size,
                 });
+                // 【LICM】while 无循环变量，assigned_vars 仅含循环体内 assignment target
+                var assigned: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer assigned.deinit(self.allocator);
+                try loop_invariant_mod.collectAssignedVars(self.allocator, w.body, &assigned);
+                try loop_invariant_mod.collectHoistsInExpr(
+                    self.allocator,
+                    self.hoist_table,
+                    w.body,
+                    stmt,
+                    assigned.items,
+                );
                 try self.analyzeExpr(w.body, env, current_fn);
             },
             .loop_stmt => |l| {
@@ -290,6 +316,17 @@ pub const FusedAnalysis = struct {
                     .is_small = size <= UNROLL_THRESHOLD,
                     .est_size = size,
                 });
+                // 【LICM】loop 同 while——无循环变量
+                var assigned: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer assigned.deinit(self.allocator);
+                try loop_invariant_mod.collectAssignedVars(self.allocator, l.body, &assigned);
+                try loop_invariant_mod.collectHoistsInExpr(
+                    self.allocator,
+                    self.hoist_table,
+                    l.body,
+                    stmt,
+                    assigned.items,
+                );
                 try self.analyzeExpr(l.body, env, current_fn);
             },
             .defer_stmt => |d| try self.analyzeExpr(d.expr, env, current_fn),

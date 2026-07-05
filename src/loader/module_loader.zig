@@ -156,7 +156,7 @@ pub const ModuleLoader = struct {
         // Resolve (处理标识符解析)
         try resolve.resolveModule(&module, &self.interner);
 
-        // 融合静态分析：单次 AST 遍历同时填充 purity / const_prop / loop_invariant，
+        // 融合静态分析：单次 AST 遍历同时填充 purity / const_prop / loop_invariant / hoist_table，
         // 并用基于调用图的 fixpoint 替代 purity 的多轮 AST 重递归。
         // 语义与原 4 个独立 pass 完全一致，仅合并遍历顺序（详见 fused_analysis.zig）。
         {
@@ -165,6 +165,7 @@ pub const ModuleLoader = struct {
                 &self.analysis_db.const_prop,
                 &self.analysis_db.loop_invariant,
                 &self.analysis_db.purity,
+                &self.analysis_db.hoist_table,
             );
             defer fused.deinit();
             fused.analyzeModule(&module) catch {};

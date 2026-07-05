@@ -14,6 +14,9 @@ pub const OpCode = enum(u8) {
     // —— 常量 / 字面量 ——
     /// OP_CONST <u16 idx>：常量池[idx] retain 后压栈
     op_const,
+    /// OP_CONST_U8 <u8 idx>：常量池 idx < 256 的窄变体（编译器自动选择）。
+    /// 省一字节立即数 + 解码省一次移位/或运算。热路径（字面量加载）高频命中。
+    op_const_u8,
     /// 压入单例字面量（无操作数）
     op_null,
     op_unit,
@@ -23,8 +26,14 @@ pub const OpCode = enum(u8) {
     // —— 局部变量（帧内 slot，M0 单帧）——
     /// OP_GET_LOCAL <u16 slot>：读 slot，retain 后压栈
     op_get_local,
+    /// OP_GET_LOCAL_U8 <u8 slot>：slot < 256 的窄变体（编译器自动选择）。
+    /// 省一字节立即数 + 解码省一次移位/或运算。局部变量读是最高频指令之一。
+    op_get_local_u8,
     /// OP_SET_LOCAL <u16 slot>：弹栈顶写入 slot（先 release 旧值）
     op_set_local,
+    /// OP_SET_LOCAL_U8 <u8 slot>：slot < 256 的窄变体（编译器自动选择）。
+    /// 省一字节立即数 + 解码省一次移位/或运算。循环变量更新/绑定写入高频命中。
+    op_set_local_u8,
     /// OP_SET_LOCAL_LETREC <u16 slot>（M5c）：letrec 自绑定——弹闭包写入 slot 的 cell.inner，
     /// 并断开自引用循环：若闭包某 upvalue 正是该 slot 的 cell（递归局部函数捕获自身），
     /// 对该 cell 少持一份 ref（自引用变弱），避免 cell↔closure 循环泄漏（镜像 eval defineWeak）。
@@ -259,6 +268,13 @@ pub const OpCode = enum(u8) {
     /// 若 v 是 array 且 v.rc==1：原地扩容（capacity 倍增），写入 arg，push v.retain()。
     /// 否则 fallback 到通用 push（method.dispatch）。供 `arr = arr.push(x)` 模式。
     op_push_inplace,
+    /// OP_PUSH_INPLACE_SET <u16 slot>：arr = arr.push(expr) 融合指令。
+    /// 合并 op_push_inplace + op_set_local_assign，消除 fast path 的 retain+release 往返。
+    /// fast path（rc==1）：in-place 追加，slot 已自动更新（v 指针不变），不压栈结果。
+    /// slow path：method.dispatch 返回新数组，写回 slot（release 旧值）。
+    op_push_inplace_set,
+    /// OP_PUSH_INPLACE_SET_U8 <u8 slot>：slot < 256 的窄变体。
+    op_push_inplace_set_u8,
 
     pub fn name(self: OpCode) []const u8 {
         return @tagName(self);

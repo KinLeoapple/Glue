@@ -143,6 +143,17 @@ const MemoKey = struct {
 /// 无效 memo_slot 标记（CallFrame.memo_slot 的默认值，表示非 memoized 调用）。
 const MEMO_SLOT_NONE: u16 = 0xFFFF;
 
+/// 【Memoization 扩展】per-slot 连续 miss 阈值。连续 miss 达此值 → 该 slot 加入
+/// memo_disabled_slots，后续调用直接走 doCall（跳过 hash + cache lookup + cache store）。
+/// 阈值 64：覆盖 newtonSqrt(x,10) 这类参数唯一场景（每次 x 不同 → 永不命中 → 浪费 hash）。
+/// cache hit 时计数重置为 0，故 "命中-未命中-命中" 不会累积误判。
+const MEMO_MISS_THRESHOLD: u32 = 64;
+
+/// 【Memoization 扩展】hashValueRecursive 最大递归深度。超过则回退指针 hash。
+/// 防止深层嵌套结构（如 50000 节点链表 LList、大 BST）导致 C 栈溢出。
+/// 256 层足以覆盖典型 record/adt/小数组；深链表等结构回退指针 hash（不命中缓存，但安全）。
+const MAX_HASH_DEPTH: u32 = 256;
+
 /// M5b：运行时类型名（镜像 eval.valueTypeName，纯 value→name）。供 type() native 用。
 fn valueTypeName(val: Value) []const u8 {
     return switch (val) {
@@ -321,6 +332,15 @@ pub const VM = struct {
     /// 每个纯函数的每组唯一参数组合对应一个条目。deinit 时 release 所有缓存值。
     memo_cache: std.AutoHashMapUnmanaged(MemoKey, Value) = .empty,
 
+    /// 【Memoization 扩展】per-slot 连续 miss 计数。cache hit 时重置为 0。
+    /// 连续 miss 超过阈值 → 该 slot 加入 memo_disabled_slots，后续调用直接走 doCall。
+    /// 消除唯一参数函数（如 newtonSqrt(x,10)，x 每次不同）的无用 hash/lookup 开销。
+    memo_slot_misses: std.AutoHashMapUnmanaged(u16, u32) = .empty,
+
+    /// 【Memoization 扩展】已禁用的 memo_slot 集合。doCallMemoized 检查此集合，
+    /// 命中则直接走 doCall（跳过 hash + cache lookup + cache store）。
+    memo_disabled_slots: std.AutoHashMapUnmanaged(u16, void) = .empty,
+
     /// VM profile：指向外部 Profiler（由 main.zig 创建并注入）。null 时不统计。
     /// opcode 计数覆盖所有嵌套 runLoop（含 forceLazy / invokeMethodBody / call）。
     profiler: ?*profiler_mod.Profiler = null,
@@ -409,6 +429,23 @@ pub const VM = struct {
         self.allocator.free(buf);
     }
 
+    /// 【Pre-existing 修复】按 capacity 释放 Value 切片。
+    /// op_push_inplace 扩容后 arr.elements 是 new_mem[0..old_len+1] 切片，len < capacity。
+    /// free 时必须用 capacity 计算 size/ci，否则 free 到错误的 slab size class，
+    /// 污染 free_list → 后续 alloc 返回错误大小的内存 → use-after-free。
+    inline fn freeValueSliceCap(self: *VM, ptr: [*]value.Value, cap: usize) void {
+        if (cap == 0) return;
+        if (self.cache) |c| {
+            const size = cap * @sizeOf(value.Value);
+            if (size < slab_allocator.LARGE_THRESHOLD) {
+                const ci = slab_allocator.CLASS_LOOKUP[(size + 7) / 8];
+                c.freeKnown(ci, @ptrCast(ptr));
+                return;
+            }
+        }
+        self.allocator.free(ptr[0..cap]);
+    }
+
     pub fn deinit(self: *VM) void {
         // M4c：等待所有 spawn worker 彻底结束（join 线程），再释放 per-spawn 堆/handle/ctx。
         // join 保证 worker 不再触碰 handle/heap —— 无 use-after-free。
@@ -441,6 +478,9 @@ pub const VM = struct {
             entry.value_ptr.*.release(self.allocator);
         }
         self.memo_cache.deinit(self.allocator);
+        // 【Memoization 扩展】清理 per-slot miss 跟踪表与禁用集合（无 owned 引用）。
+        self.memo_slot_misses.deinit(self.allocator);
+        self.memo_disabled_slots.deinit(self.allocator);
     }
 
     /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
@@ -655,6 +695,13 @@ pub const VM = struct {
         frame.ip = @intCast(ip_ptr - code_ptr);
     }
 
+    /// 释放值，内联值（int/bool/null/unit/char/float）跳过 no-op 调用。
+    /// 用于 defer 路径：被 inline 后内联值的 cleanup code 退化为单次 isBoxed 检查 + 跳转。
+    /// 比直接 defer v.release(allocator) 省 release 函数调用开销（release 非 inline）。
+    inline fn releaseValue(_: *VM, v: Value, allocator: std.mem.Allocator) void {
+        if (v.isBoxed()) v.release(allocator);
+    }
+
     /// Sync-point 重载（仅栈）：helper 调用后重载 stack_ptr/stack_len/stack_cap。
     /// 用于不切换帧的 helper（如 forceLazyVM、make_*、index 等）。
     inline fn reloadStack(self: *VM, stack_ptr: *[*]Value, stack_len: *usize, stack_cap: *usize) void {
@@ -748,6 +795,18 @@ pub const VM = struct {
                         stack_len += 1;
                     }
                 },
+                .op_const_u8 => {
+                    const idx: usize = ip_ptr[0];
+                    ip_ptr += 1;
+                    const cv = func.chunk.constants.items[idx];
+                    if (!cv.isBoxed()) {
+                        stack_ptr[stack_len] = cv;
+                        stack_len += 1;
+                    } else {
+                        stack_ptr[stack_len] = try self.retainOwned(cv);
+                        stack_len += 1;
+                    }
+                },
                 .op_null => {
                     stack_ptr[stack_len] = Value.fromNull();
                     stack_len += 1;
@@ -797,6 +856,37 @@ pub const VM = struct {
                         }
                     }
                 },
+                .op_get_local_u8 => {
+                    const slot: usize = ip_ptr[0];
+                    ip_ptr += 1;
+                    const cur = stack_ptr[slot_base + slot];
+                    // fast path：内联值（非 boxed）直接 push，省 cell/atomic/lazy/retainOwned 检查。
+                    if (!cur.isBoxed()) {
+                        stack_ptr[stack_len] = cur;
+                        stack_len += 1;
+                    } else {
+                        // slow path：透明解 cell → atomic/lazy/boxed retainOwned
+                        const v = if (cur == .cell) cur.cell.inner else cur;
+                        if (v == .atomic_val) {
+                            const av = v.atomic_val;
+                            stack_ptr[stack_len] = av.load();
+                            stack_len += 1;
+                        } else if (v == .lazy_val) {
+                            const lv = v.lazy_val;
+                            self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
+                            const forced = try self.forceLazyVM(lv, func.chunk.locAt(op_off));
+                            self.reloadStack(&stack_ptr, &stack_len, &stack_cap);
+                            stack_ptr[stack_len] = forced;
+                            stack_len += 1;
+                        } else if (!v.isBoxed()) {
+                            stack_ptr[stack_len] = v;
+                            stack_len += 1;
+                        } else {
+                            stack_ptr[stack_len] = try self.retainOwned(v);
+                            stack_len += 1;
+                        }
+                    }
+                },
                 .op_set_local => {
                     const slot = opcode.readU16Ptr(ip_ptr);
                     ip_ptr += 2;
@@ -809,8 +899,29 @@ pub const VM = struct {
                     // 语义冻结），新值落槽。下一轮捕获再 box 成**新** cell → 每轮闭包各捕获独立 cell，
                     // 镜像 eval 每轮 fresh scope。早期写穿 cell.inner 致所有闭包共享一格（edge_closures
                     // 循环捕获印 3,3,3 而非 1,2,3）。assignment 走 op_set_local_assign（保留写穿+atomic）。
-                    cur.release(self.allocator);
-                    stack_ptr[dst] = v;
+                    //
+                    // fast path：内联值（int/bool/null/unit/char/float）直接覆写，省 release no-op 调用。
+                    // 循环变量更新（i = i + 1 等）cur 多为内联值，命中率高。
+                    if (!cur.isBoxed()) {
+                        stack_ptr[dst] = v;
+                    } else {
+                        cur.release(self.allocator);
+                        stack_ptr[dst] = v;
+                    }
+                },
+                .op_set_local_u8 => {
+                    const slot: usize = ip_ptr[0];
+                    ip_ptr += 1;
+                    const v = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    const dst = slot_base + slot;
+                    const cur = stack_ptr[dst];
+                    // fast path：内联值（int/bool/null/unit/char/float）直接覆写，省 release no-op 调用。
+                    if (!cur.isBoxed()) {
+                        stack_ptr[dst] = v;
+                    } else {
+                        cur.release(self.allocator);
+                        stack_ptr[dst] = v;
+                    }
                 },
                 // M5m：assignment-to-local（非绑定）。镜像 eval env.set：slot/cell 持 Atomic<T> 时
                 // 透明 atomic store（保持共享 atomic 身份，写对捕获该原子的 spawn 可见），不重写 inner。
@@ -881,13 +992,18 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const upvalue = frame.upvalues[idx];
                     const cell = upvalue.cell;
-                    // M4a：Atomic<T> 透明读取（方法接收者走 OP_GET_UPVALUE_RAW）。
-                    if (cell.inner == .atomic_val) {
-                        const av = cell.inner.atomic_val;
+                    // fast path：内联值（int/bool/null/unit/char/float）直接 push，省 retainOwned 调用。
+                    // 闭包捕获的计数器 n 是 int，命中率极高。
+                    const inner = cell.inner;
+                    if (!inner.isBoxed()) {
+                        stack_ptr[stack_len] = inner;
+                        stack_len += 1;
+                    } else if (inner == .atomic_val) {
+                        const av = inner.atomic_val;
                         stack_ptr[stack_len] = av.load();
                         stack_len += 1;
-                    } else if (cell.inner == .lazy_val) {
-                        const lazy = cell.inner.lazy_val;
+                    } else if (inner == .lazy_val) {
+                        const lazy = inner.lazy_val;
                         if (lazy.vm_thunk != null) {
                             self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                             const forced = try self.forceLazyVM(lazy, func.chunk.locAt(op_off));
@@ -895,11 +1011,11 @@ pub const VM = struct {
                             stack_ptr[stack_len] = forced;
                             stack_len += 1;
                         } else {
-                            stack_ptr[stack_len] = try self.retainOwned(cell.inner);
+                            stack_ptr[stack_len] = try self.retainOwned(inner);
                             stack_len += 1;
                         }
                     } else {
-                        stack_ptr[stack_len] = try self.retainOwned(cell.inner);
+                        stack_ptr[stack_len] = try self.retainOwned(inner);
                         stack_len += 1;
                     }
                 },
@@ -909,15 +1025,18 @@ pub const VM = struct {
                     const v = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     const upvalue = frame.upvalues[idx];
                     const cell = upvalue.cell;
-                    // M5m：cell 持 Atomic<T> → 透明 atomic store（保持共享 atomic 身份，写对父/兄弟
-                    // 协程可见），不重写 inner。镜像 eval env.set 的 atomic_val 分支（env.zig:231）。
-                    // 早期直接 inner=v 把共享 atomic 覆写成子线程本地标量 → 累加丢失（edge_concurrency/phase4）。
-                    if (cell.inner == .atomic_val) {
-                        const av = cell.inner.atomic_val;
+                    const cur = cell.inner;
+                    // fast path：内联值（int/bool/null/unit/char/float）直接覆写，省 release no-op 调用。
+                    // 闭包捕获的计数器 n 是 int，每次 n = n + 1 都走此路径。
+                    if (!cur.isBoxed()) {
+                        cell.inner = v;
+                    } else if (cur == .atomic_val) {
+                        // cell 持 Atomic<T> → 透明 atomic store，不重写 inner
+                        const av = cur.atomic_val;
                         av.store(v);
-                        v.release(self.allocator); // v 是标量（atomic 只存原始位），release 即 no-op
+                        if (v.isBoxed()) v.release(self.allocator);
                     } else {
-                        cell.inner.release(self.allocator);
+                        cur.release(self.allocator);
                         cell.inner = v;
                     }
                 },
@@ -925,28 +1044,28 @@ pub const VM = struct {
                 .op_add, .op_sub, .op_mul, .op_div, .op_mod, .op_bit_and, .op_bit_or, .op_bit_xor => {
                     const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
-                    defer left.release(self.allocator);
-                    defer right.release(self.allocator);
+                    defer self.releaseValue(left, self.allocator);
+                    defer self.releaseValue(right, self.allocator);
                     stack_ptr[stack_len] = try self.doArith(op, left, right, func.chunk.locAt(op_off));
                     stack_len += 1;
                 },
                 .op_eq, .op_neq, .op_lt, .op_gt, .op_le, .op_ge => {
                     const right = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     const left = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
-                    defer left.release(self.allocator);
-                    defer right.release(self.allocator);
+                    defer self.releaseValue(left, self.allocator);
+                    defer self.releaseValue(right, self.allocator);
                     stack_ptr[stack_len] = try self.doCompare(op, left, right, func.chunk.locAt(op_off));
                     stack_len += 1;
                 },
                 .op_neg => {
                     const v = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
-                    defer v.release(self.allocator);
+                    defer self.releaseValue(v, self.allocator);
                     stack_ptr[stack_len] = try self.doNegate(v, func.chunk.locAt(op_off));
                     stack_len += 1;
                 },
                 .op_not => {
                     const v = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
-                    defer v.release(self.allocator);
+                    defer self.releaseValue(v, self.allocator);
                     if (v != .boolean) return self.fail(func.chunk.locAt(op_off), "'!' requires boolean operand", error.TypeMismatch);
                     const b = v.asBool();
                     stack_ptr[stack_len] = Value.fromBool(!b);
@@ -988,7 +1107,10 @@ pub const VM = struct {
 
                 .op_pop => {
                     stack_len -= 1;
-                    stack_ptr[stack_len].release(self.allocator);
+                    const v = stack_ptr[stack_len];
+                    // fast path：内联值（int/bool/null/unit/char/float）跳过 release no-op 调用。
+                    // op_pop 是最高频指令之一（fib 9.1%、lookup 6.7%），栈顶弹出的多为内联值。
+                    if (v.isBoxed()) v.release(self.allocator);
                 },
                 .op_pop_n => {
                     const n = opcode.readU16Ptr(ip_ptr);
@@ -996,11 +1118,19 @@ pub const VM = struct {
                     var k: u16 = 0;
                     while (k < n) : (k += 1) {
                         stack_len -= 1;
-                        stack_ptr[stack_len].release(self.allocator);
+                        const v = stack_ptr[stack_len];
+                        if (v.isBoxed()) v.release(self.allocator);
                     }
                 },
                 .op_dup => {
-                    stack_ptr[stack_len] = try self.retainOwned(stack_ptr[stack_len - 1]);
+                    const v = stack_ptr[stack_len - 1];
+                    // fast path：内联值直接复制，省 retainOwned 函数调用（retainOwned 是 non-inline）。
+                    // retain 本身 inline，但 retainOwned 调用开销仍存在。
+                    if (!v.isBoxed()) {
+                        stack_ptr[stack_len] = v;
+                    } else {
+                        stack_ptr[stack_len] = try self.retainOwned(v);
+                    }
                     stack_len += 1;
                 },
 
@@ -1200,9 +1330,9 @@ pub const VM = struct {
                 },
                 .op_index => {
                     const index_val = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
-                    defer index_val.release(self.allocator);
+                    defer self.releaseValue(index_val, self.allocator);
                     const object = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
-                    defer object.release(self.allocator);
+                    defer self.releaseValue(object, self.allocator);
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doIndex(object, index_val, func.chunk.locAt(op_off));
                     self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
@@ -1352,7 +1482,9 @@ pub const VM = struct {
                     const result = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     // JIT Phase 3：若当前帧是 memoized 调用，缓存返回值（额外 retain 一份）。
-                    if (frame.memo_slot != MEMO_SLOT_NONE) {
+                    // 【Memoization 扩展】跳过已禁用的 slot（避免向 disabled slot 写无用缓存，
+                    // 也避免 newtonSqrt 这类参数唯一场景的缓存膨胀）。
+                    if (frame.memo_slot != MEMO_SLOT_NONE and !self.memo_disabled_slots.contains(frame.memo_slot)) {
                         const key = MemoKey{ .slot = frame.memo_slot, .arg_hash = frame.memo_arg_hash };
                         // 若已有旧缓存值，先 release
                         if (self.memo_cache.fetchRemove(key)) |kv| {
@@ -1484,10 +1616,11 @@ pub const VM = struct {
                         if (arr.capacity > old_len) {
                             arr.elements = arr.elements.ptr[0..old_len + 1];
                         } else {
-                            const new_cap = @max(arr.capacity * 2, old_len + 1, 8);
+                            const old_cap = arr.capacity;
+                            const new_cap = @max(old_cap * 2, old_len + 1, 8);
                             const new_mem = try self.allocValueSlice(new_cap);
                             @memcpy(new_mem[0..old_len], arr.elements);
-                            self.freeValueSlice(arr.elements);
+                            self.freeValueSliceCap(arr.elements.ptr, old_cap);
                             arr.elements = new_mem[0..old_len + 1];
                             arr.capacity = new_cap;
                         }
@@ -1503,6 +1636,63 @@ pub const VM = struct {
                         arg.release(self.allocator);
                         stack_ptr[stack_len] = result;
                         stack_len += 1;
+                    }
+                },
+                // 融合指令：op_push_inplace + op_set_local_assign。
+                // fast path（rc==1）：in-place 追加，slot 已自动更新（v 指针不变），不压栈结果。
+                // 省掉 v.retain() + op_set_local_assign 弹栈 + release 旧值（rc 2→1）+ 写回。
+                // arg 通常是 int 内联值，fast path 跳过 retain/release no-op 调用。
+                .op_push_inplace_set, .op_push_inplace_set_u8 => {
+                    const slot: usize = if (op == .op_push_inplace_set_u8) blk: {
+                        const s = ip_ptr[0];
+                        ip_ptr += 1;
+                        break :blk s;
+                    } else blk: {
+                        const s = opcode.readU16Ptr(ip_ptr);
+                        ip_ptr += 2;
+                        break :blk s;
+                    };
+                    const arg = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
+                    const dst = slot_base + slot;
+                    const cur = stack_ptr[dst];
+                    const v = if (cur == .cell) cur.cell.inner else cur;
+                    if (v == .array and v.array.rc == 1) {
+                        // fast path：in-place 追加，slot 中的 v 指针不变（elements.len 增加）
+                        const arr = v.array;
+                        const old_len = arr.elements.len;
+                        if (arr.capacity > old_len) {
+                            arr.elements = arr.elements.ptr[0..old_len + 1];
+                        } else {
+                            const old_cap = arr.capacity;
+                            const new_cap = @max(old_cap * 2, old_len + 1, 8);
+                            const new_mem = try self.allocValueSlice(new_cap);
+                            @memcpy(new_mem[0..old_len], arr.elements);
+                            self.freeValueSliceCap(arr.elements.ptr, old_cap);
+                            arr.elements = new_mem[0..old_len + 1];
+                            arr.capacity = new_cap;
+                        }
+                        // arg 通常是 int 内联值，fast path 跳过 retain/release no-op
+                        if (!arg.isBoxed()) {
+                            arr.elements[old_len] = arg;
+                        } else {
+                            arr.elements[old_len] = try self.retainOwned(arg);
+                            arg.release(self.allocator);
+                        }
+                        // 不压栈结果，不写回 slot（v 指针不变，slot 已自动更新）
+                    } else {
+                        // slow path：method.dispatch 返回新数组，写回 slot
+                        const result = method.dispatch(self.allocator, v, "push", &.{arg}) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return self.fail(func.chunk.locAt(op_off), "push failed", error.TypeMismatch),
+                        };
+                        if (arg.isBoxed()) arg.release(self.allocator);
+                        // 写回 slot（release 旧值 cur，写回 result）
+                        if (!cur.isBoxed()) {
+                            stack_ptr[dst] = result;
+                        } else {
+                            cur.release(self.allocator);
+                            stack_ptr[dst] = result;
+                        }
                     }
                 },
                 // M3d：构造 range —— 弹 [start,end]，压 range 值。
@@ -1772,9 +1962,19 @@ pub const VM = struct {
     /// 使相同内容、不同指针的值产生相同 hash（memoization 缓存命中前提）。
     /// 引用类型（cell/channel/spawn/atomic 等）走指针 hash（安全但低命中）。
     /// 纯函数参数无循环引用（值不可变），递归安全。
-    fn hashValueRecursive(hasher: *std.hash.Wyhash, v: Value) void {
+    ///
+    /// 【Memoization 扩展】深度限制 MAX_HASH_DEPTH：对深层嵌套结构（如 50000 节点链表）
+    /// 超过阈值后回退指针 hash，避免递归栈溢出。浅结构（depth ≤ 256）仍按内容 hash。
+    /// 这意味着对同一内容不同指针的深结构不会命中缓存——但深结构 hash 成本 O(n) 本身
+    /// 就可能超过函数执行成本，回退指针 hash 反而更经济。
+    fn hashValueRecursive(hasher: *std.hash.Wyhash, v: Value, depth: u32) void {
         const tag = @intFromEnum(v);
         hasher.update(std.mem.asBytes(&tag));
+        // 深层嵌套结构回退指针 hash，避免栈溢出
+        if (depth >= MAX_HASH_DEPTH) {
+            hasher.update(std.mem.asBytes(&v));
+            return;
+        }
         switch (v) {
             .int => {
                 hasher.update(std.mem.asBytes(&v.int.lo));
@@ -1795,7 +1995,7 @@ pub const VM = struct {
             .array => {
                 const elems = v.array.elements;
                 hasher.update(std.mem.asBytes(&elems.len));
-                for (elems) |e| hashValueRecursive(hasher, e);
+                for (elems) |e| hashValueRecursive(hasher, e, depth + 1);
             },
             .record => {
                 hasher.update(v.record.type_name);
@@ -1819,7 +2019,7 @@ pub const VM = struct {
                     }.lt);
                     for (keys_buf[0..n]) |k| {
                         hasher.update(k);
-                        hashValueRecursive(hasher, map.get(k).?);
+                        hashValueRecursive(hasher, map.get(k).?, depth + 1);
                     }
                 } else {
                     hasher.update(std.mem.asBytes(&v.record));
@@ -1830,12 +2030,12 @@ pub const VM = struct {
                 hasher.update(v.adt.constructor);
                 for (v.adt.fields) |f| {
                     if (f.name) |nm| hasher.update(nm);
-                    hashValueRecursive(hasher, f.value);
+                    hashValueRecursive(hasher, f.value, depth + 1);
                 }
             },
             .newtype => {
                 hasher.update(v.newtype.type_name);
-                hashValueRecursive(hasher, v.newtype.inner);
+                hashValueRecursive(hasher, v.newtype.inner, depth + 1);
             },
             // 引用类型 / 其他：指针 hash（含 union tag）
             else => hasher.update(std.mem.asBytes(&v)),
@@ -1850,7 +2050,7 @@ pub const VM = struct {
         var i: usize = 0;
         while (i < argc) : (i += 1) {
             const v = self.stack.items[stack_base + i];
-            hashValueRecursive(&hasher, v);
+            hashValueRecursive(&hasher, v, 0);
         }
         return hasher.final();
     }
@@ -1858,6 +2058,12 @@ pub const VM = struct {
     /// 【JIT Phase 3】执行 OP_CALL_MEMOIZED：纯函数调用，支持结果缓存。
     /// 缓存命中 → 弹参数压缓存值，跳过函数体。
     /// 缓存未命中 → 复用 doCall 建帧，在帧上记录 memo_slot + arg_hash 供 op_return 缓存。
+    ///
+    /// 【Memoization 扩展】三层运行时守卫：
+    /// 1. disabled slot 检查：连续 miss 超阈值的 slot 直接走 doCall（避免无用 hash/lookup）
+    /// 2. 引用类型守卫：参数含可变引用（cell/channel/spawn/atomic 等）→ 走 doCall（不缓存，
+    ///    因引用类型按指针 hash，相同内容不同指针会 false miss，且引用可变导致结果不一致）
+    /// 3. per-slot miss tracking：cache miss 时递增计数，超阈值禁用 slot；hit 时重置
     fn doCallMemoized(
         self: *VM,
         program: *const Program,
@@ -1870,19 +2076,54 @@ pub const VM = struct {
         if (argc != callee.arity) return self.fail(loc, "wrong number of arguments", error.WrongArity);
         if (self.frames.items.len >= MAX_FRAMES) return self.fail(loc, "stack overflow: call depth exceeded", error.StackOverflow);
 
+        // 守卫 1：已禁用的 slot → 走 doCall（不缓存）。doCall 对 argc==arity 走建帧路径，
+        // 帧的 memo_slot 默认 MEMO_SLOT_NONE，op_return 不会写缓存。
+        if (self.memo_disabled_slots.contains(memo_slot)) {
+            return self.doCall(program, func_idx, argc, loc);
+        }
+
         const stack_base = self.stack.items.len - argc;
+
+        // 守卫 2：参数含引用类型 → 走 doCall（不缓存）。引用类型按指针 hash 不安全
+        //（同内容不同指针 false miss；引用可变导致同参数不同结果）。
+        {
+            var i: u8 = 0;
+            while (i < argc) : (i += 1) {
+                if (!self.stack.items[stack_base + i].isMemoizableValue()) {
+                    return self.doCall(program, func_idx, argc, loc);
+                }
+            }
+        }
+
         const arg_hash = self.hashArgs(argc, stack_base);
         const key = MemoKey{ .slot = memo_slot, .arg_hash = arg_hash };
 
         if (self.memo_cache.get(key)) |cached_val| {
-            // 缓存命中：弹参数（release），压缓存值（retain）
+            // 缓存命中：弹参数（release），压缓存值（retain）；重置 miss 计数。
             var i: u8 = 0;
             while (i < argc) : (i += 1) {
                 self.stack.items[self.stack.items.len - 1].release(self.allocator);
                 self.stack.shrinkRetainingCapacity(self.stack.items.len - 1);
             }
             try self.push(cached_val.retain());
+            _ = self.memo_slot_misses.remove(memo_slot);
             return;
+        }
+
+        // 守卫 3：cache miss → 递增 per-slot 连续 miss 计数；超阈值则禁用 slot。
+        // 注意：仍按原逻辑建帧执行并写缓存（保留首次结果以备后续重测），
+        // 但禁用后 *后续* 调用跳过 hash/lookup（在守卫 1 处短路）。
+        {
+            const gop = try self.memo_slot_misses.getOrPut(self.allocator, memo_slot);
+            if (gop.found_existing) {
+                gop.value_ptr.* += 1;
+                if (gop.value_ptr.* >= MEMO_MISS_THRESHOLD) {
+                    try self.memo_disabled_slots.put(self.allocator, memo_slot, {});
+                    _ = self.memo_slot_misses.remove(memo_slot);
+                }
+            } else {
+                gop.value_ptr.* = 1;
+            }
         }
 
         // 缓存未命中：建帧执行函数体（复用 doCall 的建帧逻辑）
@@ -3104,13 +3345,21 @@ pub const VM = struct {
         if (op == .op_add and left == .string and right == .string) {
             const left_str = left.string.bytes();
             const right_str = right.string.bytes();
-            var result = std.ArrayList(u8).empty;
-            defer result.deinit(self.allocator);
-            result.appendSlice(self.allocator, left_str) catch return error.OutOfMemory;
-            result.appendSlice(self.allocator, right_str) catch return error.OutOfMemory;
-            const owned = result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+            // fast path：结果 ≤ SSO_MAX（20 字节）时直接栈构造 SSO Str，
+            // 零堆分配（省 acquireStr + ArrayList + toOwnedSlice + fromOwnedBytes 的 alloc+free）。
+            // 短串拼接（"x"+"y"、"ab"+s 前期）命中率极高。
+            if (value.Str.canConcatSso(left_str.len, right_str.len)) {
+                const s = try self.acquireStr();
+                s.* = value.Str.concatSso(left_str, right_str);
+                return Value{ .string = s };
+            }
+            // slow path：结果 > 20 字节，需堆分配
+            const total = left_str.len + right_str.len;
+            const buf = self.allocator.alloc(u8, total) catch return error.OutOfMemory;
+            @memcpy(buf[0..left_str.len], left_str);
+            @memcpy(buf[left_str.len..total], right_str);
             const s = try self.acquireStr();
-            s.* = value.Str.fromOwnedBytes(self.allocator, owned);
+            s.* = value.Str.fromOwnedBytes(self.allocator, buf);
             return Value{ .string = s };
         }
         return self.doArithFloat(op, left, right, loc);
@@ -3168,10 +3417,18 @@ pub const VM = struct {
                 return Value.fromBool(result);
             }
             if (left.isFloat() and right.isFloat()) {
-                // IEEE ==：+0 == -0 为 true；NaN != NaN。Float.compare 的 totalOrder 对 ±0 返回 .eq，
-                // 但对同符号同尾数 NaN 也返回 .eq。项目约束 NaN 不应产生，此处用 compare 足够。
                 const lf = left.asFloat();
                 const rf = right.asFloat();
+                // fast path：同类型 float 且 bits 完全相同 → 直接判等，
+                // 省 comparePortable 的 NaN/Inf/符号分支（~50 行软件路径）。
+                // next == guess 收敛检查命中率极高（float benchmark 3.6% 指令）。
+                // 注：+0/-0 bits 不同会走 slow path，由 comparePortable 正确处理（totalOrder ±0=.eq）。
+                // 项目约束 NaN 不应产生，bits 相同的 NaN == NaN 返回 true 不影响正确性。
+                if (lf.type == rf.type and lf.bits == rf.bits and lf.extra == rf.extra) {
+                    const result = if (op == .op_eq) true else false;
+                    return Value.fromBool(result);
+                }
+                // slow path：类型不同或 bits 不同（含 +0/-0），走 comparePortable
                 const tag: value.FloatType = if (@intFromEnum(lf.type) > @intFromEnum(rf.type)) lf.type else rf.type;
                 const eq = lf.toFloatType(tag).compare(rf.toFloatType(tag)) == .eq;
                 const result = if (op == .op_eq) eq else !eq;

@@ -51,7 +51,14 @@ pub const ArrayValue = struct {
 
     pub fn deinit(self: *ArrayValue, allocator: std.mem.Allocator) void {
         for (self.elements) |*e| e.release(allocator);
-        if (self.elements.len > 0) allocator.free(self.elements);
+        // 【Pre-existing 修复】用 capacity 而非 elements.len 释放底层内存。
+        // op_push_inplace 扩容后 elements 是 [0..old_len+1] 切片，len < capacity。
+        // 若用 len 释放，size 与分配时不匹配，污染 slab free_list。
+        if (self.capacity > 0) {
+            allocator.free(self.elements.ptr[0..self.capacity]);
+        } else if (self.elements.len > 0) {
+            allocator.free(self.elements);
+        }
     }
 };
 

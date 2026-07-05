@@ -27,6 +27,7 @@ pub const BranchTable = branch_reach.BranchTable;
 pub const BranchReachPass = branch_reach.BranchReachPass;
 pub const LoopInfo = loop_invariant.LoopInfo;
 pub const LoopTable = loop_invariant.LoopTable;
+pub const HoistTable = loop_invariant.HoistTable;
 pub const LoopInvariantPass = loop_invariant.LoopInvariantPass;
 pub const FusedAnalysis = fused_analysis.FusedAnalysis;
 
@@ -37,6 +38,8 @@ pub const AnalysisDB = struct {
     const_prop: ConstTable,
     branch_reach: BranchTable,
     loop_invariant: LoopTable,
+    /// 【LICM】循环不变量提升表：表达式指针 → 所属循环 stmt 指针
+    hoist_table: HoistTable,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) AnalysisDB {
@@ -46,6 +49,7 @@ pub const AnalysisDB = struct {
             .const_prop = ConstTable.init(allocator),
             .branch_reach = BranchTable.init(allocator),
             .loop_invariant = LoopTable.init(allocator),
+            .hoist_table = HoistTable.init(allocator),
             .allocator = allocator,
         };
     }
@@ -56,6 +60,7 @@ pub const AnalysisDB = struct {
         self.const_prop.deinit();
         self.branch_reach.deinit();
         self.loop_invariant.deinit();
+        self.hoist_table.deinit();
     }
 };
 
