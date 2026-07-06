@@ -455,6 +455,10 @@ pub const VM = struct {
             // 是 per-spawn 堆分配（heap.deinit 回收内存），但 cell.inner 持的共享对象（父 allocator 所有）
             // ref_count 不会随 heap 释放而递减 → 须显式 unref。标量/字符串是 per-spawn 堆自有，无需处理。
             for (ctx.captures) |cap| self.releaseCapture(cap);
+            // handle.result 中的共享原语（atomic/channel/sender/receiver）由 worker retain，
+            // heap.deinit 不会递减它们的 rc → 须显式 releaseCapture 平衡。
+            // boxed 值（string/array/record 等）在 per-spawn 堆中，heap.deinit 统一回收。
+            if (ctx.handle.result) |r| self.releaseCapture(r);
             if (ctx.handle.panic_message) |msg| std.heap.page_allocator.free(msg);
             self.allocator.destroy(ctx.handle);
             ctx.spawn_heap.deinit(); // 释放子 VM 全部分配（含 result、cell、sender/receiver 包装）
@@ -2732,6 +2736,7 @@ pub const VM = struct {
     fn doMakeRecord(self: *VM, program: *const Program, shape_idx: u16) VMError!void {
         const shape = program.record_shapes.items[shape_idx];
         const n = shape.field_names.len;
+        const rec_ptr = self.acquireRecord() catch return error.OutOfMemory;
         var map = std.StringHashMap(Value).init(self.allocator);
         errdefer {
             var it = map.iterator();
@@ -2740,21 +2745,30 @@ pub const VM = struct {
                 e.value_ptr.*.release(self.allocator);
             }
             map.deinit();
+            self.allocator.destroy(rec_ptr);
         }
-        const base = self.stack.items.len - n;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const key = self.allocator.dupe(u8, shape.field_names[i]) catch return error.OutOfMemory;
-            // put 可能覆盖同名 key（重复字段）：释放旧值 + 复用旧 key，避免泄漏。
-            const gop = map.getOrPut(key) catch return error.OutOfMemory;
+        // 逆序弹栈顶 n 个值（先弹的是最后一个字段），与 field_names[i] 关联。
+        // pop 转移所有权：已弹出的值不再在栈上，errdefer 释放 map 中的值不会 double-release。
+        // 未弹出的值仍在栈上，由上层错误处理/VM.deinit 释放。
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            const val = self.pop();
+            const key = self.allocator.dupe(u8, shape.field_names[i]) catch {
+                val.release(self.allocator);
+                return error.OutOfMemory;
+            };
+            const gop = map.getOrPut(key) catch {
+                self.allocator.free(key);
+                val.release(self.allocator);
+                return error.OutOfMemory;
+            };
             if (gop.found_existing) {
                 self.allocator.free(key);
                 gop.value_ptr.*.release(self.allocator);
             }
-            gop.value_ptr.* = self.stack.items[base + i];
+            gop.value_ptr.* = val;
         }
-        self.stack.shrinkRetainingCapacity(base);
-        const rec_ptr = try self.acquireRecord();
         rec_ptr.* = .{ .type_name = "", .fields = map };
         try self.push(Value{ .record = rec_ptr });
     }
@@ -2768,7 +2782,21 @@ pub const VM = struct {
         const base_val = self.stack.items[ubase - 1];
         if (base_val != .record) return self.fail(loc, "record extend base must be a record", error.TypeMismatch);
 
+        // 先弹 update 值到临时数组 + 弹 base_val，转移所有权离栈。
+        // 这样 errdefer 释放 map 条目不会与栈清理 double-release。
+        const updates = self.allocator.alloc(Value, n) catch return error.OutOfMemory;
+        for (0..n) |i| updates[n - 1 - i] = self.pop();
+        _ = self.pop(); // base_val
+
+        const rec_ptr = self.acquireRecord() catch {
+            for (updates) |v| v.release(self.allocator);
+            self.allocator.free(updates);
+            base_val.release(self.allocator);
+            return error.OutOfMemory;
+        };
         var map = std.StringHashMap(Value).init(self.allocator);
+        var updates_consumed: usize = 0;
+        var base_released = false;
         errdefer {
             var it = map.iterator();
             while (it.next()) |e| {
@@ -2776,29 +2804,44 @@ pub const VM = struct {
                 e.value_ptr.*.release(self.allocator);
             }
             map.deinit();
+            self.allocator.destroy(rec_ptr);
+            for (updates[updates_consumed..]) |v| v.release(self.allocator);
+            self.allocator.free(updates);
+            if (!base_released) base_val.release(self.allocator);
         }
-        // 浅拷 base 字段（retain value，dupe key）。
+
+        // 浅拷 base 字段（retain value，dupe key），然后立即 release base_val。
+        // retainOwned 对字段值 rc+1；base_val.release → base_rec.deinit 对字段值 rc-1；
+        // 净效果 0，map 成为 retainOwned 副本的唯一引用者。
         const base_rec = base_val.record;
         var bit = base_rec.fields.iterator();
         while (bit.next()) |e| {
             const key = self.allocator.dupe(u8, e.key_ptr.*) catch return error.OutOfMemory;
             map.put(key, try self.retainOwned(e.value_ptr.*)) catch return error.OutOfMemory;
         }
-        // updates 覆盖/新增（接管栈上 owned 值）。
+        base_val.release(self.allocator);
+        base_released = true;
+
+        // updates 覆盖/新增（接管 temp 数组中的 owned 值）。
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const key = self.allocator.dupe(u8, shape.field_names[i]) catch return error.OutOfMemory;
-            const gop = map.getOrPut(key) catch return error.OutOfMemory;
+            const key = self.allocator.dupe(u8, shape.field_names[i]) catch {
+                updates_consumed = i;
+                return error.OutOfMemory;
+            };
+            const gop = map.getOrPut(key) catch {
+                self.allocator.free(key);
+                updates_consumed = i;
+                return error.OutOfMemory;
+            };
             if (gop.found_existing) {
                 self.allocator.free(key);
-                gop.value_ptr.*.release(self.allocator); // 释放被覆盖的 base 字段拷贝
+                gop.value_ptr.*.release(self.allocator);
             }
-            gop.value_ptr.* = self.stack.items[ubase + i];
+            gop.value_ptr.* = updates[i];
+            updates_consumed = i + 1;
         }
-        // 弹 n 个 update + base（base 用完 release）。
-        self.stack.shrinkRetainingCapacity(ubase - 1);
-        base_val.release(self.allocator);
-        const rec_ptr = try self.acquireRecord();
+        self.allocator.free(updates);
         rec_ptr.* = .{ .type_name = "", .fields = map };
         try self.push(Value{ .record = rec_ptr });
     }
@@ -2962,8 +3005,9 @@ pub const VM = struct {
                 const msg = handle.panic_message orelse "spawn: coroutine failed";
                 return self.fail(loc, msg, error.SpawnFailed);
             }
-            // 跨线程深拷结果进父 allocator（子结果在 per-spawn 堆，独立于父 refcount 堆）。
-            const owned = if (child_result) |r| (try self.retainOwned(r)) else Value.fromUnit();
+            // 跨线程深拷结果进父 allocator（子结果在 per-spawn 堆，retain 不足：指针仍指向子堆，
+            // heap.deinit 后悬垂；deepCopy 在父堆重建独立副本，与子堆生命周期解耦）。
+            const owned = if (child_result) |r| (try r.deepCopy(self.allocator)) else Value.fromUnit();
             for (args) |a| a.release(self.allocator);
             receiver.release(self.allocator);
             self.stack.shrinkRetainingCapacity(args_start - 1);
@@ -3143,8 +3187,10 @@ pub const VM = struct {
                     av.ref(); // 增加 AtomicValue 引用计数
                     break :blk Value{ .atomic_val = av };
                 },
-                .channel_val, .sender_val, .receiver_val => inner.retain(), // TODO: 可能也需要类似处理
-                else => inner.retain(),
+                .channel_val, .sender_val, .receiver_val => inner.retain(),
+                // 非共享类型（string/array/record/closure 等）跨堆深拷贝到 per-spawn 堆，
+                // 避免 retain 后指针仍指向父堆（父堆释放后子 VM 访问悬垂指针）。
+                else => try inner.deepCopy(aalloc),
             };
         }
 

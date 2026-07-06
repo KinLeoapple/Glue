@@ -1,4 +1,4 @@
-﻿//! Glue 字节码 VM — 编译器（M1a：模块级 AST → Program）
+//! Glue 字节码 VM — 编译器（M1a：模块级 AST → Program）
 //!
 //! 设计见 docs/bytecode-vm-plan.md §5。M1a 覆盖：
 //! - 模块编译：两遍——先给每个顶层 fun_decl 分配 func_idx 建函数表，再逐个编译函数体。
@@ -1179,9 +1179,13 @@ const FnCompiler = struct {
             },
             .binary => |bin| {
                 // 常量折叠：编译期求值二元算术/比较（命中则直接发射 op_const，跳过左右子树求值）
-                if (try self.tryEmitConstFoldedBinary(bin, expr, loc)) return;
+                if (try self.tryEmitConstFoldedBinary(bin, expr, loc)) {
+                    return;
+                }
                 // 指令融合：代数简化（x+0→x、x*1→x、x*0→0、x&&true→x 等）
-                if (try self.tryEmitAlgebraicSimplify(bin, loc)) return;
+                if (try self.tryEmitAlgebraicSimplify(bin, loc)) {
+                    return;
+                }
                 try self.emitBinary(bin, loc);
             },
             .if_expr => |ie| try self.emitIf(ie, expr, loc),

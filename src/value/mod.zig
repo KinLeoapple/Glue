@@ -372,6 +372,276 @@ pub const Value = union(enum) {
         return self;
     }
 
+    /// deepCopy：跨堆深拷贝 Value（spawn 捕获和 await 结果用）
+    /// - 内联标量：直接返回 self（值拷贝）
+    /// - 共享并发原语（atomic/spawn/channel/sender/receiver）：retain，不深拷（跨协程共享）
+    /// - 装箱复合/可调用/控制流：分配新结构体（rc=1），递归深拷贝子 Value；
+    ///   dupe owned 字节（ErrorValue.type_name/message、Record/Trait method key），
+    ///   借用 AST 字节（type_name/constructor/trait_name 等全局只读）
+    /// - 迭代器/lazy_val：retain（不跨堆使用，由调用方保证）
+    pub fn deepCopy(self: Value, allocator: std.mem.Allocator) !Value {
+        switch (self) {
+            // 内联标量：值拷贝
+            .null_val, .unit, .boolean, .char, .int, .float => return self,
+            // 共享并发原语：retain，不深拷（跨协程共享）
+            .spawn_val, .atomic_val, .channel_val, .sender_val, .receiver_val => {
+                return self.retain();
+            },
+            // string：dupe 字节，新建 *Str
+            .string => |p| {
+                return try Value.fromStringBytes(allocator, p.bytes());
+            },
+            // array：分配新 ArrayValue，深拷贝每个元素
+            .array => |p| {
+                const new_elems: []Value = if (p.elements.len > 0)
+                    try allocator.alloc(Value, p.elements.len)
+                else
+                    &.{};
+                errdefer if (new_elems.len > 0) allocator.free(new_elems);
+                var copied: usize = 0;
+                errdefer {
+                    for (new_elems[0..copied]) |e| e.release(allocator);
+                }
+                for (p.elements, 0..) |elem, i| {
+                    new_elems[i] = try elem.deepCopy(allocator);
+                    copied += 1;
+                }
+                const arr = try allocator.create(ArrayValue);
+                arr.* = .{
+                    .elements = new_elems,
+                    .capacity = new_elems.len,
+                    .fixed_size = p.fixed_size,
+                };
+                return .{ .array = arr };
+            },
+            // record：分配新 RecordValue，dupe key + 深拷 value（type_name 借用 AST 字节）
+            .record => |p| {
+                var new_fields = std.StringHashMap(Value).init(allocator);
+                errdefer {
+                    var it = new_fields.iterator();
+                    while (it.next()) |entry| {
+                        allocator.free(entry.key_ptr.*);
+                        entry.value_ptr.release(allocator);
+                    }
+                    new_fields.deinit();
+                }
+                var it = p.fields.iterator();
+                while (it.next()) |entry| {
+                    const dup_key = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(dup_key);
+                    const dup_val = try entry.value_ptr.deepCopy(allocator);
+                    errdefer dup_val.release(allocator);
+                    try new_fields.put(dup_key, dup_val);
+                }
+                const rec = try allocator.create(RecordValue);
+                rec.* = .{ .type_name = p.type_name, .fields = new_fields };
+                return .{ .record = rec };
+            },
+            // adt：分配新 AdtValue，深拷贝每个字段（type_name/constructor 借用 AST 字节，不 dupe）
+            .adt => |p| {
+                const new_fields: []AdtField = if (p.fields.len > 0)
+                    try allocator.alloc(AdtField, p.fields.len)
+                else
+                    &.{};
+                errdefer if (new_fields.len > 0) allocator.free(new_fields);
+                var copied: usize = 0;
+                errdefer {
+                    for (new_fields[0..copied]) |*f| f.value.release(allocator);
+                }
+                for (p.fields, 0..) |f, i| {
+                    new_fields[i] = .{
+                        .name = f.name,
+                        .value = try f.value.deepCopy(allocator),
+                    };
+                    copied += 1;
+                }
+                const adt = try allocator.create(AdtValue);
+                adt.* = .{
+                    .type_name = p.type_name,
+                    .constructor = p.constructor,
+                    .fields = new_fields,
+                };
+                return .{ .adt = adt };
+            },
+            // newtype：分配新 NewtypeValue，深拷贝 inner（type_name 借用 AST 字节）
+            .newtype => |p| {
+                const nt = try allocator.create(NewtypeValue);
+                nt.* = .{
+                    .type_name = p.type_name,
+                    .inner = try p.inner.deepCopy(allocator),
+                };
+                return .{ .newtype = nt };
+            },
+            // cell：分配新 Cell，深拷贝 inner
+            .cell => |p| {
+                const cell = try allocator.create(Cell);
+                cell.* = .{ .inner = try p.inner.deepCopy(allocator) };
+                return .{ .cell = cell };
+            },
+            // range：分配新 Range，拷贝 start/end/inclusive/i64 缓存（Int 是值类型）
+            .range => |p| {
+                const r = try allocator.create(Range);
+                r.* = .{
+                    .start = p.start,
+                    .end = p.end,
+                    .inclusive = p.inclusive,
+                    .start_i64 = p.start_i64,
+                    .end_i64 = p.end_i64,
+                };
+                return .{ .range = r };
+            },
+            // vm_closure：深拷贝 upvalues 和 bound_args；func 指针跨堆共享只读；
+            // self_upvalue_idx 拷贝；allocator 设为新 allocator
+            .vm_closure => |p| {
+                const new_upvalues: []Value = if (p.upvalues.len > 0)
+                    try allocator.alloc(Value, p.upvalues.len)
+                else
+                    &.{};
+                errdefer if (p.upvalues.len > 0) allocator.free(new_upvalues);
+                var uv_copied: usize = 0;
+                errdefer {
+                    for (new_upvalues[0..uv_copied]) |e| e.release(allocator);
+                }
+                for (p.upvalues, 0..) |uv, i| {
+                    new_upvalues[i] = try uv.deepCopy(allocator);
+                    uv_copied += 1;
+                }
+                const new_bound_args: []Value = if (p.bound_args.len > 0)
+                    try allocator.alloc(Value, p.bound_args.len)
+                else
+                    &.{};
+                errdefer if (p.bound_args.len > 0) allocator.free(new_bound_args);
+                var ba_copied: usize = 0;
+                errdefer {
+                    for (new_bound_args[0..ba_copied]) |e| e.release(allocator);
+                }
+                for (p.bound_args, 0..) |ba, i| {
+                    new_bound_args[i] = try ba.deepCopy(allocator);
+                    ba_copied += 1;
+                }
+                const c = try allocator.create(VmClosure);
+                c.* = .{
+                    .func = p.func,
+                    .arity = p.arity,
+                    .upvalues = new_upvalues,
+                    .bound_args = new_bound_args,
+                    .allocator = allocator,
+                    .self_upvalue_idx = p.self_upvalue_idx,
+                };
+                return .{ .vm_closure = c };
+            },
+            // partial：分配新 PartialApplication，深拷贝 func 和 bound_args
+            .partial => |p| {
+                const new_func = try p.func.deepCopy(allocator);
+                errdefer new_func.release(allocator);
+                const new_bound_args: []Value = if (p.bound_args.len > 0)
+                    try allocator.alloc(Value, p.bound_args.len)
+                else
+                    &.{};
+                errdefer if (p.bound_args.len > 0) allocator.free(new_bound_args);
+                var ba_copied: usize = 0;
+                errdefer {
+                    for (new_bound_args[0..ba_copied]) |e| e.release(allocator);
+                }
+                for (p.bound_args, 0..) |ba, i| {
+                    new_bound_args[i] = try ba.deepCopy(allocator);
+                    ba_copied += 1;
+                }
+                const pa = try allocator.create(PartialApplication);
+                pa.* = .{
+                    .func = new_func,
+                    .bound_args = new_bound_args,
+                    .remaining_arity = p.remaining_arity,
+                };
+                return .{ .partial = pa };
+            },
+            // builtin：拷贝 fn_ptr 和 user_ctx（函数指针跨堆共享）
+            .builtin => |p| {
+                const b = try allocator.create(Builtin);
+                b.* = .{ .fn_ptr = p.fn_ptr, .user_ctx = p.user_ctx };
+                return .{ .builtin = b };
+            },
+            // error_val：dupe type_name 和 message（owned 字节）
+            .error_val => |p| {
+                const e = try allocator.create(ErrorValue);
+                errdefer allocator.destroy(e);
+                const dup_type = try allocator.dupe(u8, p.type_name);
+                errdefer allocator.free(dup_type);
+                const dup_msg = try allocator.dupe(u8, p.message);
+                errdefer allocator.free(dup_msg);
+                e.* = .{
+                    .type_name = dup_type,
+                    .message = dup_msg,
+                    .is_error_subtype = p.is_error_subtype,
+                };
+                return .{ .error_val = e };
+            },
+            // throw_val：深拷贝 payload（ok 深拷 inner，err 深拷 error_val）
+            .throw_val => |p| {
+                const t = try allocator.create(ThrowValue);
+                errdefer allocator.destroy(t);
+                t.* = .{ .payload = switch (p.payload) {
+                    .ok => |v| .{ .ok = try v.deepCopy(allocator) },
+                    .err => |e| blk: {
+                        const dup_type = try allocator.dupe(u8, e.type_name);
+                        errdefer allocator.free(dup_type);
+                        const dup_msg = try allocator.dupe(u8, e.message);
+                        errdefer allocator.free(dup_msg);
+                        const new_e = try allocator.create(ErrorValue);
+                        errdefer allocator.destroy(new_e);
+                        new_e.* = .{
+                            .type_name = dup_type,
+                            .message = dup_msg,
+                            .is_error_subtype = e.is_error_subtype,
+                        };
+                        break :blk .{ .err = new_e };
+                    },
+                } };
+                return .{ .throw_val = t };
+            },
+            // 迭代器：retain（迭代器不拥有底层数据，不跨堆使用，由调用方保证）
+            .array_iterator, .string_iterator, .range_iterator => {
+                return self.retain();
+            },
+            // trait_value：vm_owned=true 深拷贝 methods+data；vm_owned=false retain（编译期全局只读）
+            .trait_value => |p| {
+                if (!p.vm_owned) return self.retain();
+                var new_methods = std.StringHashMap(Value).init(allocator);
+                errdefer {
+                    var it = new_methods.iterator();
+                    while (it.next()) |entry| {
+                        allocator.free(entry.key_ptr.*);
+                        entry.value_ptr.release(allocator);
+                    }
+                    new_methods.deinit();
+                }
+                var it = p.methods.iterator();
+                while (it.next()) |entry| {
+                    const dup_key = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(dup_key);
+                    const dup_val = try entry.value_ptr.deepCopy(allocator);
+                    errdefer dup_val.release(allocator);
+                    try new_methods.put(dup_key, dup_val);
+                }
+                const new_data: ?Value = if (p.data) |d| try d.deepCopy(allocator) else null;
+                errdefer if (new_data) |d| d.release(allocator);
+                const tv = try allocator.create(TraitValue);
+                tv.* = .{
+                    .trait_name = p.trait_name,
+                    .methods = new_methods,
+                    .data = new_data,
+                    .allocator = allocator,
+                    .vm_owned = true,
+                };
+                return .{ .trait_value = tv };
+            },
+            // lazy_val：retain（expr/env 借用外部管理，不应跨堆传递，由调用方保证）
+            .lazy_val => {
+                return self.retain();
+            },
+        }
+    }
+
     /// release：减少引用计数，归零则 deinit + destroy
     /// 内联变体 noop；rc 自管变体 if rc>1 rc-=1 else { ptr.deinit(alloc); alloc.destroy(ptr) }；
     /// runtime 变体 if unref() destroy。17 + 4 个分支用 inline prong 各合并为 1 个。

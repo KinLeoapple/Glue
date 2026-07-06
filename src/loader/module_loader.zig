@@ -50,6 +50,9 @@ pub const ModuleLoader = struct {
     /// 保留的源码（用于生命周期管理，AST 借用源字节）
     retained_sources: std.ArrayList([]const u8),
 
+    /// 保留的 parser arena（AST 节点从此分配，须存活到编译结束）
+    retained_arenas: std.ArrayList(std.heap.ArenaAllocator),
+
     pub fn init(allocator: std.mem.Allocator, io: ?std.Io) ModuleLoader {
         return .{
             .allocator = allocator,
@@ -61,6 +64,7 @@ pub const ModuleLoader = struct {
             .loading_modules = std.StringHashMap(void).init(allocator),
             .loaded_modules = std.StringHashMap(ast.Module).init(allocator),
             .retained_sources = .{ .items = &.{}, .capacity = 0 },
+            .retained_arenas = .{ .items = &.{}, .capacity = 0 },
         };
     }
 
@@ -85,6 +89,12 @@ pub const ModuleLoader = struct {
         }
         self.retained_sources.deinit(self.allocator);
 
+        // 清理保留的 parser arena（AST 节点内存）
+        for (self.retained_arenas.items) |*arena| {
+            arena.deinit();
+        }
+        self.retained_arenas.deinit(self.allocator);
+
         // 清理当前源目录
         if (self.current_source_dir) |dir| {
             self.allocator.free(dir);
@@ -98,20 +108,42 @@ pub const ModuleLoader = struct {
 
     /// 为 VM 准备模块：加载依赖 + 解析 + 类型检查
     pub fn prepareModule(self: *ModuleLoader, module: ast.Module) !void {
-        const module_name = module.name;
+        // 入口模块 name 规范化为裸名（词干）：main.zig 传给 parser 的 module_name 是完整
+        // 路径（如 "tests/.../Main.glue"），而 loadModule 用 module_path[0]（裸名 "Main"）
+        // 作为键放入 loading_modules/loaded_modules。若入口以路径为键，与依赖以裸名为键
+        // 的键空间不一致 → 回访入口时循环依赖检测漏检，入口被重复解析一次（浪费词法+
+        // 语法+AST arena）。这里从 source_path 提取词干，使入口与依赖用同一套规范化键。
+        var normalized_name: ?[]const u8 = null;
+        const module_name = blk: {
+            if (module.source_path) |sp| {
+                const stem = std.fs.path.stem(std.fs.path.basename(sp));
+                if (stem.len > 0) {
+                    const owned = try self.allocator.dupe(u8, stem);
+                    normalized_name = owned;
+                    break :blk owned;
+                }
+            }
+            break :blk module.name;
+        };
+        defer if (normalized_name) |n| self.allocator.free(n);
 
         // 设置当前模块的源文件目录
         const saved_source_dir = self.current_source_dir;
+        var dir_changed = false;
         if (module.source_path) |sp| {
             if (std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep)) |idx| {
                 self.current_source_dir = try self.allocator.dupe(u8, sp[0..idx]);
+                dir_changed = true;
             } else if (std.mem.lastIndexOfScalar(u8, sp, '/')) |idx| {
                 self.current_source_dir = try self.allocator.dupe(u8, sp[0..idx]);
+                dir_changed = true;
             }
         }
         defer {
-            if (saved_source_dir) |dir| self.allocator.free(dir);
-            self.current_source_dir = saved_source_dir;
+            if (dir_changed) {
+                if (self.current_source_dir) |dir| self.allocator.free(dir);
+                self.current_source_dir = saved_source_dir;
+            }
         }
 
         // 标记"正在加载"（循环依赖检测）
@@ -301,21 +333,27 @@ pub const ModuleLoader = struct {
 
         // 语法分析
         var p = parser_mod.Parser.init(self.allocator, tokens);
-        defer p.deinit();
+        var arena_retained = false;
+        errdefer if (!arena_retained) p.deinit();
         var module = try p.parseModule(source_path);
         module.name = module_name;
         module.source_path = source_path;
 
         // 设置源目录
         const saved_source_dir = self.current_source_dir;
+        var dir_changed = false;
         if (std.mem.lastIndexOfScalar(u8, source_path, std.fs.path.sep)) |idx| {
             self.current_source_dir = try self.allocator.dupe(u8, source_path[0..idx]);
+            dir_changed = true;
         } else if (std.mem.lastIndexOfScalar(u8, source_path, '/')) |idx| {
             self.current_source_dir = try self.allocator.dupe(u8, source_path[0..idx]);
+            dir_changed = true;
         }
         defer {
-            if (saved_source_dir) |dir| self.allocator.free(dir);
-            self.current_source_dir = saved_source_dir;
+            if (dir_changed) {
+                if (self.current_source_dir) |dir| self.allocator.free(dir);
+                self.current_source_dir = saved_source_dir;
+            }
         }
 
         // 循环依赖检测
@@ -335,9 +373,22 @@ pub const ModuleLoader = struct {
         // 准备模块（递归处理依赖 + 类型检查）
         try self.prepareModuleInner(module, module_name);
 
-        // 注册到已加载模块缓存
+        // 成功：先保留 parser arena（AST 节点内存须存活到编译结束），再注册到已加载模块缓存。
+        // 顺序很重要：若先 put 再 append，append 失败时 errdefer 会释放 arena，但 loaded_modules
+        // 已持指向该 arena 的 AST → UAF。先 append 失败则 put 未执行，状态干净。
+        try self.retained_arenas.append(self.allocator, p.arena);
+        arena_retained = true;
+        errdefer {
+            // append 成功但后续 put 失败：回滚 arena 保留
+            _ = self.retained_arenas.pop();
+            arena_retained = false;
+        }
         const registered_name = try self.allocator.dupe(u8, module_name);
         try self.loaded_modules.put(registered_name, module);
+
+        // 仅释放 tokens + errors（arena 已保留）
+        if (p.owns_tokens) self.allocator.free(p.tokens);
+        p.errors.deinit(self.allocator);
     }
 
     /// 收集模块的所有 use 依赖（递归，去重）
@@ -373,8 +424,10 @@ pub const ModuleLoader = struct {
                 const dep_name = ud.module_path[0];
                 if (seen.contains(dep_name)) continue;
 
-                // 加载依赖模块
-                try self.loadModule(ud.module_path);
+                // 加载依赖模块（已加载则跳过，避免重复解析覆盖 AST）
+                if (!self.loaded_modules.contains(dep_name)) {
+                    try self.loadModule(ud.module_path);
+                }
 
                 const dep_module = self.loaded_modules.get(dep_name) orelse continue;
                 try seen.put(try self.allocator.dupe(u8, dep_name), {});
@@ -390,9 +443,11 @@ pub const ModuleLoader = struct {
                 const pd = decl.pack_decl;
                 if (seen.contains(pd.name)) continue;
 
-                // 加载子模块（current_source_dir 已设为当前模块目录）
+                // 加载子模块（已加载则跳过，避免重复解析覆盖 AST）
                 var sub_path = [_][]const u8{pd.name};
-                self.loadModule(&sub_path) catch continue;
+                if (!self.loaded_modules.contains(pd.name)) {
+                    self.loadModule(&sub_path) catch continue;
+                }
 
                 const sub_module = self.loaded_modules.get(pd.name) orelse continue;
                 try seen.put(try self.allocator.dupe(u8, pd.name), {});

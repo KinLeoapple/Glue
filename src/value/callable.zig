@@ -97,6 +97,12 @@ pub const LazyValue = struct {
 
     pub fn deinit(self: *LazyValue, allocator: std.mem.Allocator) void {
         if (self.cached) |cached| cached.release(allocator);
+        // vm_thunk 是 op_make_lazy 从栈顶移交的 *VmClosure 引用（pop 不 release），
+        // 需在此 release 平衡 rc，否则闭包及其 upvalues/bound_args 泄漏。
+        if (self.vm_thunk) |thunk| {
+            const vc: *VmClosure = @ptrCast(@alignCast(thunk));
+            (Value{ .vm_closure = vc }).release(allocator);
+        }
         // expr/env 由外部管理，不在此释放
     }
 };

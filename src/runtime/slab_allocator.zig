@@ -498,10 +498,14 @@ pub const SlabAllocator = struct {
         if (slab.magic != SLAB_MAGIC) return;
         const ci = slab.class_idx;
         const c = &self.classes[ci];
-        const was_full = !SlabAllocator.slabHasRoom(slab);
 
         self.lockClass(c);
         defer self.unlockClass(c);
+
+        // was_full 必须在锁内读取：slabHasRoom 读 slab.free_list/bump，
+        // 与并发 allocSlot/freeSlot 修改这些字段必须串行化，
+        // 否则陈旧的 was_full 会导致 partial 链重复 push / 跳过 remove / 环。
+        const was_full = !SlabAllocator.slabHasRoom(slab);
 
         // 推回 slab 自己的 free_list
         const node: *FreeNode = @ptrCast(@alignCast(buf.ptr));
@@ -526,10 +530,12 @@ pub const SlabAllocator = struct {
     fn freeSlotKnown(self: *SlabAllocator, ci: usize, ptr: [*]u8) void {
         const c = &self.classes[ci];
         const slab: *Slab = @ptrFromInt(@intFromPtr(ptr) & SLAB_MASK);
-        const was_full = !SlabAllocator.slabHasRoom(slab);
 
         self.lockClass(c);
         defer self.unlockClass(c);
+
+        // was_full 必须在锁内读取（同 freeSlot，防止竞态导致 partial 链损坏）。
+        const was_full = !SlabAllocator.slabHasRoom(slab);
 
         // 推回 slab 自己的 free_list
         const node: *FreeNode = @ptrCast(@alignCast(ptr));
@@ -744,8 +750,11 @@ pub const ThreadCache = struct {
 
     /// free：大对象直通 SlabAllocator；小对象直接 push free_lists，过满则 drain。
     ///
-    /// 不校验 slab magic：项目已统一到单一 SlabAllocator，所有小对象指针必来自 slab，
-    /// magic 校验的跨 cache line 读取（slab 头与 slot 通常不在同一 cache line）是纯开销。
+    /// 从 slab 头读 class_idx 确定 size class（而非用 buf.len 反查 CLASS_LOOKUP）。
+    /// 这是为了正确处理 resize 后的场景：调用方可能通过 cacheVtableResize 改变了 buf.len，
+    /// 但 slot 实际所属的 size class 由 slab 元数据决定，不会随 resize 改变。
+    /// 若用 buf.len 反查，resize 后会查到错误的 size class，把 slot 推入错误的 free_list，
+    /// 导致后续 alloc 返回错误大小的内存 → 内存损坏。
     /// 大对象（len ≥ LARGE_THRESHOLD）走 SlabAllocator.freeLarge 路径，不进 free_lists。
     pub fn free(self: *ThreadCache, buf: []u8, alignment: std.mem.Alignment) void {
         const len = buf.len;
@@ -755,9 +764,25 @@ pub const ThreadCache = struct {
             return;
         }
 
-        const ci = CLASS_LOOKUP[(len + 7) / 8];
+        // 从 slab 头读 class_idx（与 SlabAllocator.freeSlot 一致），避免 resize 后 buf.len
+        // 不再对应原始 size class 的问题。
+        const slab_addr = @intFromPtr(buf.ptr) & SLAB_MASK;
+        const slab: *Slab = @ptrFromInt(slab_addr);
+        if (slab.magic != SLAB_MAGIC) {
+            // 非 slab 分配（理论不应发生），回退到 buf.len 反查以保持兼容
+            const ci = CLASS_LOOKUP[(len + 7) / 8];
+            const node: *FreeNode = @ptrCast(@alignCast(buf.ptr));
+            node.next = self.free_lists[ci];
+            self.free_lists[ci] = node;
+            self.free_counts[ci] += 1;
+            if (self.free_counts[ci] > MAX_CACHE_PER_CLASS) {
+                self.drainBatch(ci);
+            }
+            return;
+        }
+        const ci = slab.class_idx;
 
-        // push 到 free_lists（跳过 magic 校验：统一分配器下指针必来自 slab）
+        // push 到 free_lists
         const node: *FreeNode = @ptrCast(@alignCast(buf.ptr));
         node.next = self.free_lists[ci];
         self.free_lists[ci] = node;
@@ -868,12 +893,10 @@ fn cacheVtableResize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, n
     if (buf.len >= LARGE_THRESHOLD or new_len >= LARGE_THRESHOLD) return false;
     if (alignment.toByteUnits() > SLOT_ALIGNMENT) return false;
     // 委托 SlabAllocator 的 resize 逻辑：检查 slab magic + slot_size 容量
-    const slab_addr = @intFromPtr(buf.ptr) & SLAB_MASK;
-    const magic_ptr: *const u64 = @ptrFromInt(slab_addr);
-    if (magic_ptr.* != SLAB_MAGIC) return false;
-    // Slab.class_idx 在 magic 之后（u64 后第 9 字节）。读取 class_idx 查 slot_size。
-    const class_idx_ptr: *const u8 = @ptrFromInt(slab_addr + @sizeOf(u64));
-    return new_len <= SIZE_CLASSES[class_idx_ptr.*];
+    const slab: *const Slab = @ptrFromInt(@intFromPtr(buf.ptr) & SLAB_MASK);
+    if (slab.magic != SLAB_MAGIC) return false;
+    // 用 slot_size（由 slab 元数据决定，不受 resize 影响）判断是否可原地扩展
+    return new_len <= SIZE_CLASSES[slab.class_idx];
 }
 
 fn cacheVtableRemap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {

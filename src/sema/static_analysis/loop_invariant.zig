@@ -155,8 +155,15 @@ pub const LoopInvariantPass = struct {
                     .est_size = size,
                 });
                 try self.analyzeExpr(f.iterable);
-                // 【LICM】收集循环体内可 hoist 的不变量子表达式
-                try self.collectHoistsForLoop(f.body, stmt, &.{f.name});
+                // 【LICM】收集循环体内可 hoist 的不变量子表达式。
+                // assigned_vars 必须包含循环变量 f.name 和循环体内的赋值目标，
+                // 否则循环体内被赋值的变量（如 sum = sum + i 中的 sum）会被误判为不变量并 hoist，
+                // 导致循环读到旧值。
+                var assigned: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer assigned.deinit(self.allocator);
+                try assigned.append(self.allocator, f.name);
+                try collectAssignedVars(self.allocator, f.body, &assigned);
+                try self.collectHoistsForLoop(f.body, stmt, assigned.items);
                 try self.analyzeExpr(f.body);
             },
             .while_stmt => |w| {

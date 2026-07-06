@@ -59,10 +59,10 @@ pub const SpawnHandle = struct {
     pub fn deinit(self: *SpawnHandle) void {
         if (self.result) |r| {
             var v = r;
-            v.deinit(self.allocator);
+            v.release(self.allocator);
         }
         if (self.panic_message) |msg| {
-            self.allocator.free(msg);
+            std.heap.page_allocator.free(msg);
         }
     }
 };

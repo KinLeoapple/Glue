@@ -41,8 +41,11 @@ pub const Str = extern struct {
     }
 
     /// SSO 引用计数 +1
+    /// 26 位 refcount 上限 0x3FFFFFF（67,108,863）；溢出会触发 @panic，
+    /// 否则 count+1<<5 会写入 SSO_FLAG 位导致 refcount 静默归零 → UAF。
     pub inline fn ssoRetain(self: *Str) void {
         const count = (self.rc & SSO_REFCOUNT_MASK) >> SSO_REFCOUNT_SHIFT;
+        if (count == 0x3FFFFFF) @panic("Str.ssoRetain: SSO refcount overflow (26-bit limit)");
         self.rc = (self.rc & ~SSO_REFCOUNT_MASK) | ((count + 1) << SSO_REFCOUNT_SHIFT);
     }
 
