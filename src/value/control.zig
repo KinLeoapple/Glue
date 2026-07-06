@@ -1,7 +1,7 @@
 //! 控制流类型装箱 struct——ErrorValue/ThrowValue
 //!
 //! 每个 struct 首字段 rc:u32，Value union 持 *T 指针。
-//! ErrorValue.type_name/message 假设字面量（与旧 value.zig 一致，deinit 不释放）。
+//! ErrorValue.type_name/message 为 owned 字节（VM 构造时 dupe），deinit 释放。
 //! ThrowValue.payload.err 用 *ErrorValue 统一装箱语义。
 //!
 //! 命名规范：方法名全部使用完整单词，不使用缩写。
@@ -18,9 +18,8 @@ pub const ErrorValue = struct {
     is_error_subtype: bool = false,
 
     pub fn deinit(self: *ErrorValue, allocator: std.mem.Allocator) void {
-        _ = self;
-        _ = allocator;
-        // type_name/message 假设字面量（与旧 value.zig 一致）
+        allocator.free(self.type_name);
+        allocator.free(self.message);
     }
 };
 

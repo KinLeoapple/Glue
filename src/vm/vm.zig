@@ -520,15 +520,26 @@ pub const VM = struct {
                 name_v.release(self.allocator);
                 return self.fail(loc, "trait method name must be a string", error.TypeMismatch);
             }
-            // name_v.string 是 retainOwned 出的 owned 副本 —— 直接作为 key（移交），不再 dupe。
-            const name_str = name_v.string.bytes();
-            const gop = methods.getOrPut(name_str) catch return error.OutOfMemory;
+            // dupe 方法名作为 key：name_v.string 可能是 SSO（bytes() 返回结构体内部指针）
+            // 或堆模式（bytes() 返回堆缓冲）。两种情况下 bytes() 都不能转移所有权——
+            // SSO 的内部指针不是独立分配，堆缓冲仍被 *Str 持有。
+            // 同一 Chunk 内常量去重会使多个 trait 共享同一 *Str，直接用 bytes() 作 key
+            // 会导致 TraitValue.deinit 重复 free 同一指针（double-free）。
+            const name_str = self.allocator.dupe(u8, name_v.string.bytes()) catch {
+                closure.release(self.allocator);
+                name_v.release(self.allocator);
+                return error.OutOfMemory;
+            };
+            name_v.release(self.allocator);
+            const gop = methods.getOrPut(name_str) catch {
+                self.allocator.free(name_str);
+                closure.release(self.allocator);
+                return error.OutOfMemory;
+            };
             if (gop.found_existing) {
                 // 重名（override）：释放旧实现与重复 key 字节，覆盖。
                 gop.value_ptr.*.release(self.allocator);
                 self.allocator.free(name_str);
-            } else {
-                gop.key_ptr.* = name_str;
             }
             gop.value_ptr.* = closure;
         }

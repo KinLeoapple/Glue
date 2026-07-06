@@ -112,8 +112,11 @@ fn uniqueLen() usize {
 
 pub const NUM_CLASSES = SIZE_CLASSES.len;
 
-/// ≥ 此阈值的分配直通 backing（大对象，不进 slab）。
-pub const LARGE_THRESHOLD: usize = 4096;
+/// > 此阈值的分配直通 backing（大对象，不进 slab）。
+/// 必须严格大于 SIZE_CLASSES 最大值（4096），否则 4096 档位的 slot 在 free 时
+/// 会被 vtableFree 误判为 large 走 freeLarge（backing.free），但 slot 是 slab 内部指针，
+/// backing canary 不匹配 → panic。原 bug：LARGE_THRESHOLD=4096 == SIZE_CLASSES.max。
+pub const LARGE_THRESHOLD: usize = 4097;
 
 /// slot 最小对齐（= 装箱 struct 的 @alignOf，均为 8：首字段 rc:u32 + 指针切片）。
 pub const SLOT_ALIGNMENT: usize = 8;
@@ -557,6 +560,7 @@ pub const SlabAllocator = struct {
             const ptr = in[i] orelse continue;
             const slab: *Slab = @ptrFromInt(@intFromPtr(ptr) & SLAB_MASK);
             if (slab.magic != SLAB_MAGIC) continue;
+            if (slab.used == 0) continue;
             const was_full = !SlabAllocator.slabHasRoom(slab);
             const node: *FreeNode = @ptrCast(@alignCast(ptr));
             node.next = slab.free_list;
@@ -666,13 +670,18 @@ pub const ThreadCache = struct {
     }
 
     /// 将所有缓存的 slot 归还 SlabAllocator。deinit 前调用。
+    /// 走 freeSlotBatch 批量归还（一次 lock + 一次统计），比 vtableFree 逐个释放高效。
     pub fn deinit(self: *ThreadCache) void {
-        const a = self.pool.allocator();
+        var batch: [BATCH_SIZE]?[*]u8 = undefined;
         for (&self.free_lists, 0..) |*fl, ci| {
-            while (fl.*) |node| {
-                fl.* = node.next;
-                const ptr: [*]u8 = @ptrCast(node);
-                a.rawFree(ptr[0..SIZE_CLASSES[ci]], .fromByteUnits(SLOT_ALIGNMENT), @returnAddress());
+            while (fl.* != null) {
+                var n: u32 = 0;
+                while (n < BATCH_SIZE) : (n += 1) {
+                    const node = fl.* orelse break;
+                    fl.* = node.next;
+                    batch[n] = @ptrCast(node);
+                }
+                if (n > 0) self.pool.freeSlotBatch(ci, &batch, n);
             }
             self.free_counts[ci] = 0;
         }
