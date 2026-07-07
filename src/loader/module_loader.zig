@@ -16,10 +16,9 @@ const ast = @import("ast");
 const lexer_mod = @import("lexer");
 const parser_mod = @import("parser");
 const type_check = @import("sema");
-const resolve = @import("resolve");
-const intern_mod = @import("intern");
 const stdlib = @import("stdlib");
 const analysis_db_mod = @import("analysis_db");
+const arena_allocator = @import("arena_allocator");
 
 /// stdlib 目录的合成标记
 const STDLIB_DIR_MARKER = "<stdlib>";
@@ -35,9 +34,6 @@ pub const ModuleLoader = struct {
     /// JIT 分析数据库（Phase 2+：purity/call_graph/const_prop 等）
     analysis_db: analysis_db_mod.AnalysisDB,
 
-    /// 字符串内部化器
-    interner: intern_mod.Interner,
-
     /// 当前源文件目录（用于解析相对路径的 use 导入）
     current_source_dir: ?[]const u8,
 
@@ -51,7 +47,7 @@ pub const ModuleLoader = struct {
     retained_sources: std.ArrayList([]const u8),
 
     /// 保留的 parser arena（AST 节点从此分配，须存活到编译结束）
-    retained_arenas: std.ArrayList(std.heap.ArenaAllocator),
+    retained_arenas: std.ArrayList(arena_allocator.ArenaAllocator),
 
     pub fn init(allocator: std.mem.Allocator, io: ?std.Io) ModuleLoader {
         return .{
@@ -59,7 +55,6 @@ pub const ModuleLoader = struct {
             .io = io,
             .type_inferencer = type_check.TypeInferencer.init(allocator),
             .analysis_db = analysis_db_mod.AnalysisDB.init(allocator),
-            .interner = intern_mod.Interner.init(allocator),
             .current_source_dir = null,
             .loading_modules = std.StringHashMap(void).init(allocator),
             .loaded_modules = std.StringHashMap(ast.Module).init(allocator),
@@ -103,7 +98,6 @@ pub const ModuleLoader = struct {
         // 清理类型检查器和相关组件
         self.type_inferencer.deinit();
         self.analysis_db.deinit();
-        self.interner.deinit();
     }
 
     /// 为 VM 准备模块：加载依赖 + 解析 + 类型检查
@@ -184,9 +178,6 @@ pub const ModuleLoader = struct {
 
         // 类型检查
         self.type_inferencer.checkModule(&module);
-
-        // Resolve (处理标识符解析)
-        try resolve.resolveModule(&module, &self.interner);
 
         // 融合静态分析：单次 AST 遍历同时填充 purity / const_prop / loop_invariant / hoist_table，
         // 并用基于调用图的 fixpoint 替代 purity 的多轮 AST 重递归。

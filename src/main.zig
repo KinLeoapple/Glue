@@ -8,6 +8,7 @@ const value = @import("value");
 const slab_allocator = @import("slab_allocator");
 const vm = @import("vm");
 const profiler = @import("profiler");
+const debug_allocator = @import("debug_allocator");
 
 /// 把求值器错误映射为专业英文消息（Go/Java 风格）。
 /// 若求值器已经设置了带上下文的 panic_message（如 "no method 'x' on type 'array'"），
@@ -88,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
         setWindowsConsoleUtf8();
     }
 
-    const allocator = init.gpa;
+    const allocator = std.heap.c_allocator;
     const io = init.io;
 
     const args_slice = try std.process.Args.toSlice(init.minimal.args, init.arena.allocator());
@@ -336,6 +337,8 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
     //
     var slab = slab_allocator.SlabAllocator.initSingleThreaded(allocator);
     defer slab.deinit();
+    // idle 回收协程：缓存空闲 slab/大对象，超时未用（5s）则归还 backing，兼顾复用与紧凑。
+    slab.startIdleRecycler(5000, 1000);
     var cache = slab_allocator.ThreadCache.init(&slab);
     defer cache.deinit();
     const value_allocator = cache.allocator();
@@ -357,6 +360,18 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
             slab.live_peak_bytes.load(.monotonic),
             slab.peak_bytes.load(.monotonic),
         );
+        const cache_snap = slab.getCacheSnapshot();
+        const evict_stats = slab.getEvictStats();
+        prof.recordSlabCacheStats(
+            cache_snap.empty_count,
+            cache_snap.large_active,
+            cache_snap.large_cached,
+            evict_stats.slabs,
+            evict_stats.large,
+            evict_stats.scans,
+        );
+        const cache_stats = cache.getStats();
+        prof.recordCacheStats(cache_stats.hits, cache_stats.misses, cache_stats.refills, cache_stats.drains);
         prof.dump(io);
     }
 
@@ -373,11 +388,13 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
 /// trace=true 输出更详细的运行时错误位置链。结束报告 [GLUE_GPA] LEAK/clean。
 fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
     _ = allocator;
-    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    var dbg = debug_allocator.DebugAllocator.initSingleThreaded();
     const dbg_alloc = dbg.allocator();
     {
         var slab = slab_allocator.SlabAllocator.initSingleThreaded(dbg_alloc);
         defer slab.deinit();
+        // idle 回收协程：缓存空闲 slab/大对象，超时未用（5s）则归还 backing。
+        slab.startIdleRecycler(5000, 1000);
         var cache = slab_allocator.ThreadCache.init(&slab);
         defer cache.deinit();
         const value_allocator = cache.allocator();
@@ -397,6 +414,18 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
                 slab.live_peak_bytes.load(.monotonic),
                 slab.peak_bytes.load(.monotonic),
             );
+            const cache_snap = slab.getCacheSnapshot();
+            const evict_stats = slab.getEvictStats();
+            prof.recordSlabCacheStats(
+                cache_snap.empty_count,
+                cache_snap.large_active,
+                cache_snap.large_cached,
+                evict_stats.slabs,
+                evict_stats.large,
+                evict_stats.scans,
+            );
+            const cache_stats = cache.getStats();
+            prof.recordCacheStats(cache_stats.hits, cache_stats.misses, cache_stats.refills, cache_stats.drains);
             prof.dump(io);
         }
     }
@@ -534,9 +563,15 @@ fn runProgram(
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         printRuntimeDiag(&stderr_writer.interface, filename, loc, "runtime panic", msg);
         stderr_writer.flush() catch {};
+        if (profiler_enabled) {
+            prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
+        }
         return .failed;
     };
     prof.phaseEnd();
+    if (profiler_enabled) {
+        prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
+    }
 
     // 检查是否有未捕获的 throw
     if (result == .throw_val) {

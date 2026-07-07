@@ -14,12 +14,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const intern_module = b.createModule(.{
-        .root_source_file = b.path("src/intern.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const lexer_module = b.createModule(.{
         .root_source_file = b.path("src/lexer.zig"),
         .target = target,
@@ -80,6 +74,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // debug_allocator 模块：自实现 DebugAllocator（c_allocator + 泄漏/double-free 检测），
+    // 替代 std.heap.DebugAllocator。
+    const debug_allocator_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/debug_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    debug_allocator_module.addImport("sync", sync_module);
+
+    // arena_allocator 模块：自实现 ArenaAllocator（c_allocator backing + chunk 链表 bump 分配），
+    // 替代 std.heap.ArenaAllocator。
+    const arena_allocator_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/arena_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // parser 依赖 arena_allocator（替代 std.heap.ArenaAllocator）
+    parser_module.addImport("arena_allocator", arena_allocator_module);
 
     // ============================================================
     // value module - 核心值表示层（与 ast 同级）
@@ -167,14 +181,6 @@ pub fn build(b: *std.Build) void {
     });
     module_check_module.addImport("ast", ast_module);
 
-    const resolve_module = b.createModule(.{
-        .root_source_file = b.path("src/sema/resolve.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    resolve_module.addImport("ast", ast_module);
-    resolve_module.addImport("intern", intern_module);
-
     // ============================================================
     // stdlib module
     // ============================================================
@@ -198,10 +204,9 @@ pub fn build(b: *std.Build) void {
     module_loader_module.addImport("lexer", lexer_module);
     module_loader_module.addImport("parser", parser_module);
     module_loader_module.addImport("sema", type_check_module);
-    module_loader_module.addImport("resolve", resolve_module);
-    module_loader_module.addImport("intern", intern_module);
     module_loader_module.addImport("stdlib", stdlib_module);
     module_loader_module.addImport("analysis_db", analysis_db_module);
+    module_loader_module.addImport("arena_allocator", arena_allocator_module);
 
     // ============================================================
     // vm/ sub-modules（字节码 VM — docs/bytecode-vm-plan.md）
@@ -221,6 +226,8 @@ pub fn build(b: *std.Build) void {
     vm_module.addImport("profiler", profiler_module);
     vm_module.addImport("analysis_db", analysis_db_module);
     vm_module.addImport("slab_allocator", slab_allocator_module);
+    vm_module.addImport("debug_allocator", debug_allocator_module);
+    vm_module.addImport("arena_allocator", arena_allocator_module);
 
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -269,12 +276,17 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("profiler", profiler_module);
     root_module.addImport("vm", vm_module);
     root_module.addImport("sema", type_check_module);
+    root_module.addImport("debug_allocator", debug_allocator_module);
+    root_module.addImport("arena_allocator", arena_allocator_module);
 
     // Create glue executable
     const exe = b.addExecutable(.{
         .name = "glue",
         .root_module = root_module,
     });
+    // 链接 libc：底层 backing 使用 c_allocator（libc malloc，精确按需分配），
+    // 替代 Zig 原生 page_allocator / GeneralPurposeAllocator / DebugAllocator。
+    exe.root_module.linkSystemLibrary("c", .{});
 
     // Install executable to output directory
     b.installArtifact(exe);
@@ -313,11 +325,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_stdlib_unit_tests = b.addRunArtifact(stdlib_unit_tests);
 
-    const intern_unit_tests = b.addTest(.{
-        .root_module = intern_module,
-    });
-    const run_intern_unit_tests = b.addRunArtifact(intern_unit_tests);
-
     const vm_unit_tests = b.addTest(.{
         .root_module = vm_module,
     });
@@ -332,6 +339,16 @@ pub fn build(b: *std.Build) void {
         .root_module = analysis_db_module,
     });
     const run_analysis_db_unit_tests = b.addRunArtifact(analysis_db_unit_tests);
+
+    const debug_allocator_unit_tests = b.addTest(.{
+        .root_module = debug_allocator_module,
+    });
+    const run_debug_allocator_unit_tests = b.addRunArtifact(debug_allocator_unit_tests);
+
+    const arena_allocator_unit_tests = b.addTest(.{
+        .root_module = arena_allocator_module,
+    });
+    const run_arena_allocator_unit_tests = b.addRunArtifact(arena_allocator_unit_tests);
 
     // ============================================================
     // value_new 模块（自定义基础类型，独立 standalone）
@@ -348,6 +365,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_value_new_unit_tests = b.addRunArtifact(value_new_unit_tests);
 
+    // 测试同样需要链接 libc（c_allocator 依赖 libc malloc/free）。
+    lexer_unit_tests.root_module.linkSystemLibrary("c", .{});
+    parser_unit_tests.root_module.linkSystemLibrary("c", .{});
+    type_check_unit_tests.root_module.linkSystemLibrary("c", .{});
+    module_check_unit_tests.root_module.linkSystemLibrary("c", .{});
+    slab_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
+    stdlib_unit_tests.root_module.linkSystemLibrary("c", .{});
+    vm_unit_tests.root_module.linkSystemLibrary("c", .{});
+    atomic_unit_tests.root_module.linkSystemLibrary("c", .{});
+    analysis_db_unit_tests.root_module.linkSystemLibrary("c", .{});
+    value_new_unit_tests.root_module.linkSystemLibrary("c", .{});
+    debug_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
+    arena_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lexer_unit_tests.step);
     test_step.dependOn(&run_parser_unit_tests.step);
@@ -355,9 +386,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_module_check_unit_tests.step);
     test_step.dependOn(&run_slab_allocator_unit_tests.step);
     test_step.dependOn(&run_stdlib_unit_tests.step);
-    test_step.dependOn(&run_intern_unit_tests.step);
     test_step.dependOn(&run_vm_unit_tests.step);
     test_step.dependOn(&run_atomic_unit_tests.step);
     test_step.dependOn(&run_analysis_db_unit_tests.step);
     test_step.dependOn(&run_value_new_unit_tests.step);
+    test_step.dependOn(&run_debug_allocator_unit_tests.step);
+    test_step.dependOn(&run_arena_allocator_unit_tests.step);
 }

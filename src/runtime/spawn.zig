@@ -62,7 +62,7 @@ pub const SpawnHandle = struct {
             v.release(self.allocator);
         }
         if (self.panic_message) |msg| {
-            std.heap.page_allocator.free(msg);
+            std.heap.c_allocator.free(msg);
         }
     }
 };

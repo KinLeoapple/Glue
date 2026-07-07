@@ -88,8 +88,8 @@ fn spawnThreadEntry(ctx: *SpawnCtx) void {
 
 fn spawnFail(handle: *SpawnHandle, msg: []const u8) void {
     handle.mutex.lock();
-    // panic_message 用 page_allocator（独立于 per-spawn 堆，await 后由父释放）。
-    handle.panic_message = std.heap.page_allocator.dupe(u8, msg) catch null;
+    // panic_message 用 c_allocator（独立于 per-spawn 堆，await 后由父释放）。
+    handle.panic_message = std.heap.c_allocator.dupe(u8, msg) catch null;
     handle.status.store(.Failed, .seq_cst);
     handle.condition.broadcast();
     handle.mutex.unlock();
@@ -459,7 +459,7 @@ pub const VM = struct {
             // heap.deinit 不会递减它们的 rc → 须显式 releaseCapture 平衡。
             // boxed 值（string/array/record 等）在 per-spawn 堆中，heap.deinit 统一回收。
             if (ctx.handle.result) |r| self.releaseCapture(r);
-            if (ctx.handle.panic_message) |msg| std.heap.page_allocator.free(msg);
+            if (ctx.handle.panic_message) |msg| std.heap.c_allocator.free(msg);
             self.allocator.destroy(ctx.handle);
             ctx.spawn_heap.deinit(); // 释放子 VM 全部分配（含 result、cell、sender/receiver 包装）
             self.allocator.destroy(ctx.spawn_heap);
@@ -1153,6 +1153,7 @@ pub const VM = struct {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
+                    if (self.profiler) |p| p.recordCall();
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCall(program, func_idx, argc, func.chunk.locAt(op_off));
                     // doCall 压入新帧，刷新缓存切换到 callee。
@@ -1166,6 +1167,7 @@ pub const VM = struct {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
+                    if (self.profiler) |p| p.recordCall();
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCallRec(program, func_idx, argc, func.chunk.locAt(op_off));
                     // doCallRec 压入新帧，刷新缓存。
@@ -1176,6 +1178,7 @@ pub const VM = struct {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
+                    if (self.profiler) |p| p.recordTailCall();
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doTailCall(program, func_idx, argc, func.chunk.locAt(op_off));
                     // tail_call 复用当前帧但切换 func，刷新 func/code。
@@ -1188,6 +1191,7 @@ pub const VM = struct {
                     const func_idx = opcode.readU16Ptr(ip_ptr);
                     const argc = ip_ptr[2];
                     ip_ptr += 3;
+                    if (self.profiler) |p| p.recordTailCall();
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doTailCallRec(program, func_idx, argc, func.chunk.locAt(op_off));
                     // tail_call_rec 复用当前帧，func 理论不变（自递归），但刷新以保持一致。
@@ -1230,6 +1234,7 @@ pub const VM = struct {
                 .op_call_value => {
                     const argc = ip_ptr[0];
                     ip_ptr += 1;
+                    if (self.profiler) |p| p.recordCall();
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCallValue(argc, func.chunk.locAt(op_off));
                     // 足参→压新帧（刷新缓存）；不足→partial 已压栈，继续本帧（刷新无害）。
@@ -1612,6 +1617,7 @@ pub const VM = struct {
                     ip_ptr += 2;
                     const argc = ip_ptr[0];
                     ip_ptr += 1;
+                    if (self.profiler) |p| p.recordMethodCall();
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doCallMethod(func, name_idx, argc, func.chunk.locAt(op_off));
                     // doCallMethod 可能压新帧，刷新缓存（func 局部变量已被 doCallMethod 使用完毕）。
@@ -1815,6 +1821,7 @@ pub const VM = struct {
                 },
                 // M4c：spawn —— 弹零参 vm_closure（spawn body），深拷捕获进 per-spawn 堆，起线程跑子 VM。
                 .op_spawn => {
+                    if (self.profiler) |p| p.recordSpawn();
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doSpawn(func.chunk.locAt(op_off));
                     self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
@@ -2115,6 +2122,7 @@ pub const VM = struct {
 
         if (self.memo_cache.get(key)) |cached_val| {
             // 缓存命中：弹参数（release），压缓存值（retain）；重置 miss 计数。
+            if (self.profiler) |p| p.recordMemoHit();
             var i: u8 = 0;
             while (i < argc) : (i += 1) {
                 self.stack.items[self.stack.items.len - 1].release(self.allocator);
@@ -2129,6 +2137,7 @@ pub const VM = struct {
         // 注意：仍按原逻辑建帧执行并写缓存（保留首次结果以备后续重测），
         // 但禁用后 *后续* 调用跳过 hash/lookup（在守卫 1 处短路）。
         {
+            if (self.profiler) |p| p.recordMemoMiss();
             const gop = try self.memo_slot_misses.getOrPut(self.allocator, memo_slot);
             if (gop.found_existing) {
                 gop.value_ptr.* += 1;
@@ -2993,6 +3002,7 @@ pub const VM = struct {
         const receiver = self.stack.items[args_start - 1];
         if (std.mem.eql(u8, name, "await")) {
             if (args.len != 0) return self.fail(loc, "await expects 0 arguments", error.WrongArity);
+            if (self.profiler) |p| p.recordAwait();
             handle.mutex.lock();
             while (handle.status.load(.seq_cst) == .Pending or handle.status.load(.seq_cst) == .Running) {
                 handle.condition.wait(&handle.mutex);
@@ -3016,6 +3026,7 @@ pub const VM = struct {
         }
         if (std.mem.eql(u8, name, "cancel")) {
             if (args.len != 0) return self.fail(loc, "cancel expects 0 arguments", error.WrongArity);
+            if (self.profiler) |p| p.recordCancel();
             handle.mutex.lock();
             handle.status.store(.Cancelled, .seq_cst);
             handle.consumed.store(true, .seq_cst);
@@ -3161,11 +3172,11 @@ pub const VM = struct {
         // io 仅用于填充 handle（VM await 路径用 std.Thread.Futex，不依赖 io）；未设则用线程化默认。
         const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
 
-        // per-spawn SlabAllocator（page_allocator 裸打底，与父/兄弟协程内存隔离）。
+        // per-spawn SlabAllocator（c_allocator 裸打底，与父/兄弟协程内存隔离）。
         // 单线程隔离堆：仅由本 spawn 线程访问（父线程 join 后才 deinit），用 initSingleThreaded
         // 跳过 atomic + Mutex 开销。
         const spawn_heap = self.allocator.create(slab_allocator.SlabAllocator) catch return error.OutOfMemory;
-        spawn_heap.* = slab_allocator.SlabAllocator.initSingleThreaded(std.heap.page_allocator);
+        spawn_heap.* = slab_allocator.SlabAllocator.initSingleThreaded(std.heap.c_allocator);
         errdefer {
             spawn_heap.deinit();
             self.allocator.destroy(spawn_heap);

@@ -11,6 +11,7 @@
 const std = @import("std");
 const lexer = @import("lexer");
 const ast = @import("ast");
+const arena_allocator = @import("arena_allocator");
 
 // ============================================================
 // 解析错误
@@ -38,7 +39,7 @@ pub const Parser = struct {
     allocator: std.mem.Allocator,
     /// 【优化】AST 节点 arena：所有 allocExpr/allocStmt/allocType/allocPattern/allocKind
     /// 从此 arena 分配，deinit 时一次性释放，避免数百次逐个 destroy + 追踪 ArrayList 开销。
-    arena: std.heap.ArenaAllocator,
+    arena: arena_allocator.ArenaAllocator,
     errors: std.ArrayList(ParseError),
     /// 是否拥有 tokens 缓冲（init 复制以便就地拆分 `>=`/`>>`，deinit 释放）
     owns_tokens: bool,
@@ -53,7 +54,7 @@ pub const Parser = struct {
             .tokens = owned orelse @constCast(tokens),
             .current = 0,
             .allocator = allocator,
-            .arena = std.heap.ArenaAllocator.init(allocator),
+            .arena = arena_allocator.ArenaAllocator.init(allocator),
             .errors = .empty,
             .owns_tokens = owned != null,
         };
