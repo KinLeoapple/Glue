@@ -13,6 +13,8 @@ pub const const_prop = @import("const_prop.zig");
 pub const branch_reach = @import("branch_reach.zig");
 pub const loop_invariant = @import("loop_invariant.zig");
 pub const fused_analysis = @import("fused_analysis.zig");
+pub const dead_code = @import("dead_code.zig");
+pub const cse = @import("cse.zig");
 
 pub const PurityInfo = purity.PurityInfo;
 pub const PurityTable = purity.PurityTable;
@@ -30,6 +32,10 @@ pub const LoopTable = loop_invariant.LoopTable;
 pub const HoistTable = loop_invariant.HoistTable;
 pub const LoopInvariantPass = loop_invariant.LoopInvariantPass;
 pub const FusedAnalysis = fused_analysis.FusedAnalysis;
+pub const DeadTable = dead_code.DeadTable;
+pub const DeadCodePass = dead_code.DeadCodePass;
+pub const CseTable = cse.CseTable;
+pub const CsePass = cse.CsePass;
 
 /// 分析数据库
 pub const AnalysisDB = struct {
@@ -40,6 +46,10 @@ pub const AnalysisDB = struct {
     loop_invariant: LoopTable,
     /// 【LICM】循环不变量提升表：表达式指针 → 所属循环 stmt 指针
     hoist_table: HoistTable,
+    /// 【DCE】死代码表：被标记为 dead 的 val_decl/var_decl stmt 指针集合
+    dead_code: DeadTable,
+    /// 【CSE】公共子表达式表：redundant → canonical 映射 + canonical 集合
+    cse: CseTable,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) AnalysisDB {
@@ -50,6 +60,8 @@ pub const AnalysisDB = struct {
             .branch_reach = BranchTable.init(allocator),
             .loop_invariant = LoopTable.init(allocator),
             .hoist_table = HoistTable.init(allocator),
+            .dead_code = DeadTable.init(allocator),
+            .cse = CseTable.init(allocator),
             .allocator = allocator,
         };
     }
@@ -61,6 +73,8 @@ pub const AnalysisDB = struct {
         self.branch_reach.deinit();
         self.loop_invariant.deinit();
         self.hoist_table.deinit();
+        self.dead_code.deinit();
+        self.cse.deinit();
     }
 };
 

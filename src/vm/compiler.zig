@@ -292,6 +292,33 @@ pub const ModuleCompiler = struct {
         return null;
     }
 
+    /// 【DCE】查询 val_decl/var_decl stmt 是否被标记为 dead（未引用且 RHS 无副作用）。
+    /// emitStmt 命中则跳过整个声明（不分配 slot、不 emit RHS、不 emit set_local）。
+    pub fn isDeadDecl(self: *const ModuleCompiler, stmt: *const ast.Stmt) bool {
+        if (self.analysis_db) |db| {
+            return db.dead_code.isDead(stmt);
+        }
+        return false;
+    }
+
+    /// 【CSE】查询 expr 是否是 redundant（有对应的 canonical）。返回 canonical expr 指针。
+    /// emitExpr 的 .binary 分支命中则发 op_get_local 读 canonical 的缓存 slot。
+    pub fn cseCanonical(self: *const ModuleCompiler, expr: *const ast.Expr) ?*const ast.Expr {
+        if (self.analysis_db) |db| {
+            return db.cse.canonicalOf(expr);
+        }
+        return null;
+    }
+
+    /// 【CSE】查询 expr 是否是 canonical（有 redundant 指向它）。
+    /// emitExpr 的 .binary 分支命中则在 emit 后缓存结果到 slot 供后续 redundant 读取。
+    pub fn isCseCanonical(self: *const ModuleCompiler, expr: *const ast.Expr) bool {
+        if (self.analysis_db) |db| {
+            return db.cse.isCanonical(expr);
+        }
+        return false;
+    }
+
     /// 编译整个模块。返回的 Program（self.program）持有所有函数；调用方取走。
     pub fn compileModule(self: *ModuleCompiler, module: *const ast.Module) CompileError!void {
         return self.compileModuleWithDeps(module, &.{});
@@ -981,6 +1008,9 @@ const FnCompiler = struct {
     /// 循环体内 emitExpr 命中此表则发 op_get_local 替代重算。
     /// 退出循环时据 LoopCtx.hoisted_exprs 清理本循环的映射。
     hoisted_slots: std.AutoHashMapUnmanaged(*const ast.Expr, u16) = .{},
+    /// 【CSE】canonical 表达式 → 缓存 slot 映射。canonical emit 后 op_set_local 缓存结果，
+    /// redundant emitExpr 命中 cseCanonical 时读此表发 op_get_local 替代重算。
+    cse_slots: std.AutoHashMapUnmanaged(*const ast.Expr, u16) = .{},
 
     fn init(allocator: std.mem.Allocator, module: *ModuleCompiler) FnCompiler {
         var fc = FnCompiler{
@@ -1024,6 +1054,7 @@ const FnCompiler = struct {
         for (self.defer_scopes.items) |*s| s.deinit(self.allocator);
         self.defer_scopes.deinit(self.allocator);
         self.hoisted_slots.deinit(self.allocator);
+        self.cse_slots.deinit(self.allocator);
         // 拥有 chunk：正常路径下 compileFunction 已把真 chunk 移走并置空 chunk（deinit 释放空壳）；
         // 错误路径（emit 中途 Unsupported/OOM）下释放半成品 chunk，防泄漏。
         self.chunk.deinit();
@@ -1178,6 +1209,13 @@ const FnCompiler = struct {
                 }, loc);
             },
             .binary => |bin| {
+                // 【CSE】redundant 表达式：读 canonical 的缓存 slot 替代重算
+                if (self.module.cseCanonical(expr)) |canonical| {
+                    if (self.cse_slots.get(canonical)) |slot| {
+                        try self.emitSlotOp(.op_get_local, slot, loc);
+                        return;
+                    }
+                }
                 // 常量折叠：编译期求值二元算术/比较（命中则直接发射 op_const，跳过左右子树求值）
                 if (try self.tryEmitConstFoldedBinary(bin, expr, loc)) {
                     return;
@@ -1187,6 +1225,17 @@ const FnCompiler = struct {
                     return;
                 }
                 try self.emitBinary(bin, loc);
+                // 【CSE】canonical 表达式：emit 后缓存结果到 slot，供后续 redundant 读取
+                // 注意：op_set_local 会 pop 栈顶，但 binary 结果需留在栈上供父表达式使用。
+                // 故先 op_dup 复制栈顶，再 op_set_local pop 副本到 slot，原值留栈。
+                if (self.module.isCseCanonical(expr)) {
+                    if (!self.cse_slots.contains(expr)) {
+                        const slot = try self.declareLocal("$cse", false, true, null);
+                        try self.chunk.writeOp(.op_dup, loc);
+                        try self.emitSlotOp(.op_set_local, slot, loc);
+                        try self.cse_slots.put(self.allocator, expr, slot);
+                    }
+                }
             },
             .if_expr => |ie| try self.emitIf(ie, expr, loc),
             .block => |blk| try self.emitBlock(blk, loc),
@@ -2213,7 +2262,7 @@ const FnCompiler = struct {
     ) CompileError!bool {
         // 不处理字符串拼接 / 数组拼接 / range / elvis（语义不适用）
         switch (bin.op) {
-            .add, .sub, .mul, .div, .bit_and, .bit_or, .bit_xor,
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor,
             .and_op, .or_op => {},
             else => return false,
         }
@@ -2269,6 +2318,26 @@ const FnCompiler = struct {
                 return false;
             }
         }.check;
+        // 【Strength Reduction】判定常量是否为 2^k（k >= 1）。返回 k，用于 x%2^k → x&(2^k-1)。
+        const powerOfTwo = struct {
+            fn check(cv: ?analysis_db_mod.ConstValue) ?u7 {
+                if (cv) |v| return switch (v) {
+                    .int_val => |i| if (i > 1 and (i & (i - 1)) == 0)
+                        @intCast(std.math.log2_int(u128, @as(u128, @bitCast(i))))
+                    else
+                        null,
+                    else => null,
+                };
+                return null;
+            }
+        }.check;
+        // 【Strength Reduction】判定左右操作数是否是同一 identifier（用于 x-x→0、x^x→0）。
+        const isSameIdentifier = struct {
+            fn check(l: *const Expr, r: *const Expr) bool {
+                if (l.* != .identifier or r.* != .identifier) return false;
+                return std.mem.eql(u8, l.identifier.name, r.identifier.name);
+            }
+        }.check;
 
         switch (bin.op) {
             // x + 0 / 0 + x → x
@@ -2283,9 +2352,14 @@ const FnCompiler = struct {
                 }
             },
             // x - 0 → x（注意：0 - x 不化简，因为 -x 是 neg）
+            // x - x → 0（同一 identifier，纯）
             .sub => {
                 if (isZero(rv)) {
                     try self.emitExpr(bin.left);
+                    return true;
+                }
+                if (isSameIdentifier(bin.left, bin.right) and isPure(bin.left)) {
+                    try self.emitZeroConstant(bin.left, loc);
                     return true;
                 }
             },
@@ -2315,6 +2389,31 @@ const FnCompiler = struct {
                     return true;
                 }
             },
+            // 【Strength Reduction】
+            //   x % 1 → 0（须纯 x，整数）
+            //   x % 2^k → x & (2^k - 1)（须整数类型，k >= 1）
+            //   注意：浮点 % 不化简（浮点 mod 语义与位运算不同）
+            .mod => {
+                if (isOne(rv) and isPure(bin.left)) {
+                    try self.emitZeroConstant(bin.left, loc);
+                    return true;
+                }
+                if (powerOfTwo(rv)) |k| {
+                    // 仅对整数类型有效（位运算）
+                    const tname = self.exprBuiltinType(bin.left);
+                    if (tname) |tn| {
+                        if (value.IntType.fromName(tn)) |it| {
+                            try self.emitExpr(bin.left);
+                            const shift_amt: std.math.Log2Int(i128) = @intCast(k);
+                            const mask_val: i128 = (@as(i128, 1) << shift_amt) - 1;
+                            const mask = foldedIntToValue(it, mask_val) orelse return false;
+                            try self.emitConst(try self.chunk.addConstant(mask), loc);
+                            try self.chunk.writeOp(.op_bit_and, loc);
+                            return true;
+                        }
+                    }
+                }
+            },
             // x & 0 → 0（位运算零化简，另一操作数须纯）；x & -1（全 1）不化简（需类型宽度信息）
             .bit_and => {
                 if (isZero(rv) and isPure(bin.left)) {
@@ -2337,7 +2436,7 @@ const FnCompiler = struct {
                     return true;
                 }
             },
-            // x ^ 0 → x
+            // x ^ 0 → x；x ^ x → 0（同一 identifier，纯）
             .bit_xor => {
                 if (isZero(rv)) {
                     try self.emitExpr(bin.left);
@@ -2345,6 +2444,10 @@ const FnCompiler = struct {
                 }
                 if (isZero(lv)) {
                     try self.emitExpr(bin.right);
+                    return true;
+                }
+                if (isSameIdentifier(bin.left, bin.right) and isPure(bin.left)) {
+                    try self.emitZeroConstant(bin.left, loc);
                     return true;
                 }
             },
@@ -2861,6 +2964,8 @@ const FnCompiler = struct {
     fn emitStmt(self: *FnCompiler, stmt: *const Stmt) CompileError!void {
         switch (stmt.*) {
             .val_decl => |d| {
+                // 【DCE】未引用且 RHS 无副作用的 val_decl 跳过整个声明
+                if (self.module.isDeadDecl(stmt)) return;
                 // M5c：letrec —— RHS 是 lambda 时先声明 slot，使 lambda 体内可引用自身（递归
                 // 局部函数 fun go(){...go()...}）。slot 先置 unit 占位并 box 成 cell。
                 // 方案 A：emitLambda 传 rec_name=d.name，编译期识别 f() 自递归调用 → OP_CALL_REC
@@ -2879,6 +2984,27 @@ const FnCompiler = struct {
                         try self.emitSlotOp(.op_set_local, slot, d.location);
                     }
                 } else {
+                    // 【Copy Propagation】val x = y（y 是简单 identifier 且是当前函数的 val local）→
+                    // x 别名 y 的 slot，不发射任何指令（省 op_get_local + op_set_local）。
+                    // 仅当无类型注解时应用（有注解可能需 coerce，走正常路径）。
+                    if (d.type_annotation == null and d.value.* == .identifier) {
+                        const src_name = d.value.identifier.name;
+                        if (self.resolveLocal(src_name)) |src_slot| {
+                            if (src_slot < self.locals.items.len and !self.locals.items[src_slot].is_var) {
+                                const src = &self.locals.items[src_slot];
+                                try self.locals.append(self.allocator, .{
+                                    .name = d.name,
+                                    .slot = src_slot,
+                                    .is_var = false,
+                                    .builtin_type = src.builtin_type,
+                                    .closure_param_types = src.closure_param_types,
+                                });
+                                // slot_count 不变（复用已有 slot，不分配新 slot）
+                                // release_mask 不变（src_slot 的 bit 已由源声明设置）
+                                return;
+                            }
+                        }
+                    }
                     try self.emitBindingRhs(d.value);
                     try self.emitCoerceFromAnnotation(d.type_annotation, d.value, d.location); // M5：val a: i32 = ...
                     const slot = try self.declareLocal(d.name, false, typeNeedsRelease(d.type_annotation), builtinTypeOf(d.type_annotation));
@@ -2886,6 +3012,8 @@ const FnCompiler = struct {
                 }
             },
             .var_decl => |d| {
+                // 【DCE】未引用且 RHS 无副作用的 var_decl 跳过整个声明
+                if (self.module.isDeadDecl(stmt)) return;
                 try self.emitBindingRhs(d.value);
                 try self.emitCoerceFromAnnotation(d.type_annotation, d.value, d.location); // M5：var a: i32 = ...
                 const slot = try self.declareLocal(d.name, true, typeNeedsRelease(d.type_annotation), builtinTypeOf(d.type_annotation));

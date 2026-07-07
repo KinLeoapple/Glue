@@ -19,12 +19,18 @@ const ast = @import("ast");
 const const_prop_mod = @import("const_prop.zig");
 const loop_invariant_mod = @import("loop_invariant.zig");
 const purity_mod = @import("purity.zig");
+const dead_code_mod = @import("dead_code.zig");
+const cse_mod = @import("cse.zig");
 
 const ConstValue = const_prop_mod.ConstValue;
 const ConstEnv = const_prop_mod.ConstEnv;
 const LoopInfo = loop_invariant_mod.LoopInfo;
 const HoistTable = loop_invariant_mod.HoistTable;
 const PurityInfo = purity_mod.PurityInfo;
+const DeadTable = dead_code_mod.DeadTable;
+const DeadCodePass = dead_code_mod.DeadCodePass;
+const CseTable = cse_mod.CseTable;
+const CsePass = cse_mod.CsePass;
 
 const UNROLL_THRESHOLD: u32 = 32;
 
@@ -38,6 +44,10 @@ pub const FusedAnalysis = struct {
     purity_table: *purity_mod.PurityTable,
     /// 借用：写入 db.hoist_table（LICM 不变量提升表）
     hoist_table: *loop_invariant_mod.HoistTable,
+    /// 借用：写入 db.dead_code（DCE 死代码表）
+    dead_table: *DeadTable,
+    /// 借用：写入 db.cse（CSE 公共子表达式表）
+    cse_table: *CseTable,
     allocator: std.mem.Allocator,
 
     /// 临时：函数名 → 它直接调用的函数名列表（仅顶层 fun_decl 之间的边）
@@ -53,12 +63,16 @@ pub const FusedAnalysis = struct {
         loop_table: *loop_invariant_mod.LoopTable,
         purity_table: *purity_mod.PurityTable,
         hoist_table: *loop_invariant_mod.HoistTable,
+        dead_table: *DeadTable,
+        cse_table: *CseTable,
     ) FusedAnalysis {
         return .{
             .const_table = const_table,
             .loop_table = loop_table,
             .purity_table = purity_table,
             .hoist_table = hoist_table,
+            .dead_table = dead_table,
+            .cse_table = cse_table,
             .allocator = allocator,
             .name_call_graph = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .direct_impure = std.StringHashMap(void).init(allocator),
@@ -95,6 +109,14 @@ pub const FusedAnalysis = struct {
 
         // Pass 3: purity fixpoint（基于 name_call_graph，O(N+E)，不再递归 AST）
         try self.purityFixpoint();
+
+        // Pass 4: DCE（迭代到 fixpoint，标记未引用且无副作用的 val_decl/var_decl 为 dead）
+        var dce_pass = DeadCodePass.init(self.allocator, self.dead_table);
+        try dce_pass.analyzeModule(module);
+
+        // Pass 5: CSE（基本块级公共子表达式消除，标记 redundant → canonical）
+        var cse_pass = CsePass.init(self.allocator, self.cse_table);
+        try cse_pass.analyzeModule(module);
     }
 
     fn analyzeExpr(
