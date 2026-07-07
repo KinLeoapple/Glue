@@ -168,12 +168,6 @@ pub const CsePass = struct {
                 seen.clearRetainingCapacity();
             },
             .type_cast => |tc| try self.processExpr(tc.expr, seen),
-            .spawn => |sp| {
-                // spawn 体：新作用域
-                var body_seen = std.ArrayListUnmanaged(SeenEntry).empty;
-                defer body_seen.deinit(self.allocator);
-                try self.processExpr(sp.body, &body_seen);
-            },
             .atomic_expr => |ae| try self.processExpr(ae.value, seen),
             .lazy => |l| try self.processExpr(l.expr, seen),
             .field_access => |f| try self.processExpr(f.object, seen),

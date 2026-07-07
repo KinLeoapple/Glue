@@ -22,7 +22,6 @@
 //! - runtime_bridge.zig: re-export runtime/ 的 AtomicValue/SpawnHandle/ChannelValue/SenderValue/ReceiverValue
 
 const std = @import("std");
-const ast = @import("ast");
 
 // ============================================================
 // 子模块再导出
@@ -34,11 +33,10 @@ pub const Int = int.Int;
 
 pub const float = @import("float.zig");
 pub const FloatType = float.Type;
-pub const FloatUnpacked = float.Unpacked;
 pub const Float = float.Float;
 
 pub const wide = @import("wide.zig");
-pub const U128 = wide.U128;
+const U128 = wide.U128;
 
 pub const char_mod = @import("char.zig");
 pub const Char = char_mod.Char;
@@ -56,21 +54,21 @@ pub const Cell = composite.Cell;
 pub const Range = composite.Range;
 
 pub const callable = @import("callable.zig");
-pub const BuiltinFn = callable.BuiltinFn;
-pub const Builtin = callable.Builtin;
 pub const VmClosure = callable.VmClosure;
-pub const PartialApplication = callable.PartialApplication;
 pub const TraitValue = callable.TraitValue;
 pub const LazyValue = callable.LazyValue;
+const BuiltinFn = callable.BuiltinFn;
+const Builtin = callable.Builtin;
+const PartialApplication = callable.PartialApplication;
 
 pub const control = @import("control.zig");
 pub const ErrorValue = control.ErrorValue;
 pub const ThrowValue = control.ThrowValue;
 
 pub const iterator = @import("iterator.zig");
-pub const ArrayIterator = iterator.ArrayIterator;
-pub const StringIterator = iterator.StringIterator;
-pub const RangeIterator = iterator.RangeIterator;
+const ArrayIterator = iterator.ArrayIterator;
+const StringIterator = iterator.StringIterator;
+const RangeIterator = iterator.RangeIterator;
 
 pub const runtime_bridge = @import("runtime_bridge.zig");
 pub const AtomicValue = runtime_bridge.AtomicValue;
@@ -78,36 +76,6 @@ pub const SpawnHandle = runtime_bridge.SpawnHandle;
 pub const ChannelValue = runtime_bridge.ChannelValue;
 pub const SenderValue = runtime_bridge.SenderValue;
 pub const ReceiverValue = runtime_bridge.ReceiverValue;
-
-// ============================================================
-// 错误与控制流（与旧 value.zig 一致）
-// ============================================================
-
-pub const EvalError = error{
-    OutOfMemory,
-    TypeMismatch,
-    UndefinedVariable,
-    ImmutableAssignment,
-    NotCallable,
-    WrongArity,
-    IndexOutOfBounds,
-    UnsupportedOperation,
-    CircularDependency,
-    FileNotFound,
-    MissingMain,
-    TypeCheckFailed,
-};
-
-pub const ControlFlow = error{
-    ReturnValue,
-    ThrowValue,
-    BreakSignal,
-    ContinueSignal,
-    GluePanic,
-    TailCall,
-};
-
-pub const EvalResult = EvalError || ControlFlow;
 
 // ============================================================
 // 统一 Value union（24B 定长）
@@ -190,11 +158,6 @@ pub const Value = union(enum) {
     // ============================================================
     // 构造函数（装箱，需 allocator）
     // ============================================================
-
-    pub fn fromString(allocator: std.mem.Allocator, s: *Str) !Value {
-        _ = allocator;
-        return .{ .string = s };
-    }
 
     /// 从字节切片构造 string Value（创建 *Str，dupe 字节）
     pub fn fromStringBytes(allocator: std.mem.Allocator, bytes: []const u8) !Value {
@@ -919,30 +882,6 @@ pub fn equals(a: Value, b: Value) bool {
             else => unreachable,
         },
     };
-}
-
-/// 编译期整数类型推断（纯 u128/i128 算术，不触发运行时 codegen bug）
-/// 正数按 i8/u8/i16/.../u128 升序选最小容纳类型；负数按 i8/i16/i32/i64/i128
-pub fn inferIntType(val: u128) IntType {
-    const signed_val: i128 = @bitCast(val);
-    if (signed_val >= 0) {
-        if (val <= std.math.maxInt(i8)) return .i8;
-        if (val <= std.math.maxInt(u8)) return .u8;
-        if (val <= std.math.maxInt(i16)) return .i16;
-        if (val <= std.math.maxInt(u16)) return .u16;
-        if (val <= std.math.maxInt(i32)) return .i32;
-        if (val <= std.math.maxInt(u32)) return .u32;
-        if (val <= std.math.maxInt(i64)) return .i64;
-        if (val <= std.math.maxInt(u64)) return .u64;
-        if (val <= @as(u128, @bitCast(@as(i128, std.math.maxInt(i128))))) return .i128;
-        return .u128;
-    } else {
-        if (signed_val >= std.math.minInt(i8)) return .i8;
-        if (signed_val >= std.math.minInt(i16)) return .i16;
-        if (signed_val >= std.math.minInt(i32)) return .i32;
-        if (signed_val >= std.math.minInt(i64)) return .i64;
-        return .i128;
-    }
 }
 
 /// 字节级整数类型推断（不依赖 u128/i128，全软件 U128 比较）。

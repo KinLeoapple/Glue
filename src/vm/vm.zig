@@ -36,8 +36,9 @@ fn opcodeNameCb(idx: u8) []const u8 {
 const SpawnCtx = struct {
     handle: *SpawnHandle,
     program: *const Program,
-    func: *const Function, // spawn body 编译成的零参 Function（在共享 program 内）
+    func: *const Function, // async 函数体编译成的 Function（在共享 program 内）
     captures: []Value, // 捕获快照（已深拷进 per-spawn 堆），按 func 的 upvalue 顺序
+    args: []Value, // 实参快照（已深拷进 per-spawn 堆），按 func 形参顺序；零参 spawn 时为空
     spawn_heap: *slab_allocator.SlabAllocator, // per-spawn 堆（子 VM 全部分配走这里）
     io: ?std.Io,
     thread: ?std.Thread = null,
@@ -73,7 +74,7 @@ fn spawnThreadEntry(ctx: *SpawnCtx) void {
     child.program = ctx.program;
     defer child.deinit();
 
-    const result = child.callClosureBody(ctx.program, ctx.func, ups) catch {
+    const result = child.callClosureBody(ctx.program, ctx.func, ups, ctx.args) catch {
         const msg = if (child.err_msg) |m| m else "spawned task failed";
         spawnFail(handle, msg);
         return;
@@ -668,11 +669,16 @@ pub const VM = struct {
     }
 
     /// M4c：执行 spawn body —— 零参 Function + 给定 upvalues（cell）。建入口帧（带 upvalues）跑到 RETURN。
-    fn callClosureBody(self: *VM, program: *const Program, f: *const Function, upvalues: []const Value) VMError!Value {
+    fn callClosureBody(self: *VM, program: *const Program, f: *const Function, upvalues: []const Value, args: []const Value) VMError!Value {
         self.program = program;
         const slot_base = self.stack.items.len;
         var s: u16 = 0;
         while (s < f.slot_count) : (s += 1) try self.push(Value.fromUnit());
+        // 实参填入 slot 0..argc-1（与形参 slot 对齐，op_get_local 参数名即取这些 slot）
+        for (args, 0..) |a, i| {
+            if (i >= f.slot_count) break;
+            self.stack.items[slot_base + i] = a;
+        }
         try self.frames.append(self.allocator, .{ .func = f, .ip = 0, .slot_base = slot_base, .frame_base = slot_base, .upvalues = upvalues });
         return self.runLoop(program);
     }
@@ -1824,6 +1830,15 @@ pub const VM = struct {
                     if (self.profiler) |p| p.recordSpawn();
                     self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
                     try self.doSpawn(func.chunk.locAt(op_off));
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
+                },
+                // async 函数调用：弹 vm_closure + argc 个实参，深拷参数与捕获进 per-spawn 堆，起线程跑带参子 VM。
+                .op_spawn_arg => {
+                    const argc = ip_ptr[0];
+                    ip_ptr += 1;
+                    if (self.profiler) |p| p.recordSpawn();
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
+                    try self.doSpawnArg(argc, func.chunk.locAt(op_off));
                     self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
                 },
                 // M4d：lazy —— 弹零参 vm_closure（lazy expr），包成 lazy_val（vm_thunk 模式）压栈。
@@ -3161,7 +3176,7 @@ pub const VM = struct {
         cell.inner = result;
     }
 
-    /// M4c：执行 OP_SPAWN。栈顶是 spawn body 编译成的零参 vm_closure（upvalues = 父帧捕获的 cell）。
+    /// M4c：执行 OP_SPAWN。栈顶是零参 vm_closure（upvalues = 父帧捕获的 cell）。
     /// 深拷各 upvalue 的当前值进 per-spawn SlabAllocator（隔离堆），起 OS 线程跑子 VM，压 spawn_val 句柄。
     /// 失败时仍压 handle（status=Failed，await 传播 panic），保证线性 Spawn<T> 语义不破。
     fn doSpawn(self: *VM, loc: ast.SourceLocation) VMError!void {
@@ -3169,6 +3184,31 @@ pub const VM = struct {
         defer callee.release(self.allocator);
         if (callee != .vm_closure) return self.fail(loc, "spawn body must be a closure", error.TypeMismatch);
         const vc = callee.vm_closure;
+        try self.doSpawnCommon(vc, &.{}, loc);
+    }
+
+    /// 执行 OP_SPAWN_ARG <u8 argc>。栈顶是 vm_closure + argc 个实参（callee 在最下）。
+    /// 深拷实参与捕获快照进 per-spawn 堆，起 OS 线程跑子 VM 执行带参函数体，压 spawn_val 句柄。
+    fn doSpawnArg(self: *VM, argc: u8, loc: ast.SourceLocation) VMError!void {
+        // 弹 argc 个实参（栈顶到栈底：arg[argc-1] ... arg[0] callee）
+        const args_slice = self.stack.items[self.stack.items.len - argc .. self.stack.items.len];
+        // 深拷实参到 per-spawn 堆前，先取 callee（在 args 下方）
+        const callee_idx = self.stack.items.len - argc - 1;
+        const callee = self.stack.items[callee_idx];
+        defer callee.release(self.allocator);
+        if (callee != .vm_closure) return self.fail(loc, "async callee must be a closure", error.TypeMismatch);
+        const vc = callee.vm_closure;
+
+        // 先弹出实参（但暂不弹 callee，doSpawnCommon 内部不弹 callee）
+        // 注意：doSpawnCommon 不弹 callee，这里手动管理栈
+        self.stack.items.len -= @as(usize, argc) + 1; // 弹掉 argc 个实参 + callee
+
+        try self.doSpawnCommon(vc, args_slice, loc);
+    }
+
+    /// spawn 公共逻辑：深拷捕获 + 实参进 per-spawn 堆，建 SpawnCtx 起线程，压 spawn_val。
+    /// args 是父栈上的实参切片（调用方负责栈管理），captures 来自 vc.upvalues。
+    fn doSpawnCommon(self: *VM, vc: *value.VmClosure, args: []const Value, loc: ast.SourceLocation) VMError!void {
         // io 仅用于填充 handle（VM await 路径用 std.Thread.Futex，不依赖 io）；未设则用线程化默认。
         const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
 
@@ -3205,6 +3245,23 @@ pub const VM = struct {
             };
         }
 
+        // 深拷实参快照到 per-spawn 堆（与 captures 同样规则：并发原语共享，其余深拷）
+        const args_copy: []Value = if (args.len > 0)
+            aalloc.alloc(Value, args.len) catch return error.OutOfMemory
+        else
+            &.{};
+        for (args, 0..) |a, i| {
+            args_copy[i] = switch (a) {
+                .atomic_val => blk: {
+                    const av = a.atomic_val;
+                    av.ref();
+                    break :blk Value{ .atomic_val = av };
+                },
+                .channel_val, .sender_val, .receiver_val => a.retain(),
+                else => try a.deepCopy(aalloc),
+            };
+        }
+
         // handle 用父 allocator（await 在父线程读，heap 释放后仍需存活直到 handle 释放）。
         const handle = self.allocator.create(SpawnHandle) catch return error.OutOfMemory;
         handle.* = SpawnHandle.init(self.allocator);
@@ -3216,6 +3273,7 @@ pub const VM = struct {
             .program = self.program.?,
             .func = @ptrCast(@alignCast(vc.func)),
             .captures = caps,
+            .args = args_copy,
             .spawn_heap = spawn_heap,
             .io = io,
         };

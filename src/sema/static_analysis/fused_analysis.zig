@@ -209,9 +209,6 @@ pub const FusedAnalysis = struct {
             .safe_method_call => {
                 try self.direct_impure.put(current_fn, {});
             },
-            .spawn => {
-                try self.direct_impure.put(current_fn, {});
-            },
             .select => {
                 try self.direct_impure.put(current_fn, {});
             },

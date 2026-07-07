@@ -327,8 +327,15 @@ pub const Parser = struct {
             visibility = .public;
         }
 
+        // async fun name(...) { ... }
+        var is_async = false;
+        if (self.matchToken(.kw_async)) {
+            if (!self.check(.kw_fun)) return null;
+            is_async = true;
+        }
+
         if (self.check(.kw_fun)) {
-            return self.parseFunDecl(visibility) catch return null;
+            return self.parseFunDecl(visibility, is_async) catch return null;
         }
         if (self.check(.kw_type)) {
             return self.parseTypeDecl(visibility) catch return null;
@@ -403,8 +410,18 @@ pub const Parser = struct {
             visibility = .public;
         }
 
+        // async fun name(...) { ... } —— async 修饰顶层函数声明
+        var is_async = false;
+        if (self.matchToken(.kw_async)) {
+            if (!self.check(.kw_fun)) {
+                try self.reportError("expected 'fun' after 'async'");
+                return error.UnexpectedToken;
+            }
+            is_async = true;
+        }
+
         if (self.check(.kw_fun)) {
-            return self.parseFunDecl(visibility);
+            return self.parseFunDecl(visibility, is_async);
         }
         if (self.check(.kw_type)) {
             return self.parseTypeDecl(visibility);
@@ -444,7 +461,8 @@ pub const Parser = struct {
     }
 
     /// 解析函数声明：fun name<T>(params) : ReturnType with Bounds { body }
-    fn parseFunDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
+    /// is_async=true 时为 async fun，调用返回 Spawn<T>
+    fn parseFunDecl(self: *Parser, visibility: ast.Visibility, is_async: bool) ParserError!ast.Decl {
         const fun_tok = self.advance(); // 消费 fun
         const name_tok = try self.expect(.identifier, "expected function name");
 
@@ -492,6 +510,7 @@ pub const Parser = struct {
                 .return_type = return_type,
                 .bounds = try bounds.toOwnedSlice(self.allocator),
                 .body = body,
+                .is_async = is_async,
             },
         };
     }
@@ -2058,7 +2077,15 @@ pub const Parser = struct {
         // Lambda: fun(params) { body }
         if (self.check(.kw_fun)) {
             if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_paren) {
-                return self.parseLambdaFun();
+                return self.parseLambdaFun(false);
+            }
+        }
+
+        // async fun(params) { body } —— async lambda，调用返回 Spawn<T>
+        if (self.check(.kw_async)) {
+            if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .kw_fun) {
+                _ = self.advance(); // 消费 async
+                return self.parseLambdaFun(true);
             }
         }
 
@@ -2068,10 +2095,6 @@ pub const Parser = struct {
 
         if (self.matchToken(.kw_match)) {
             return self.parseMatchExpr();
-        }
-
-        if (self.matchToken(.kw_spawn)) {
-            return self.parseSpawnExpr();
         }
 
         if (self.matchToken(.kw_lazy)) {
@@ -2429,7 +2452,7 @@ pub const Parser = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
-    fn parseLambdaFun(self: *Parser) ParserError!*ast.Expr {
+    fn parseLambdaFun(self: *Parser, is_async: bool) ParserError!*ast.Expr {
         const fun_tok = self.advance(); // 消费 fun
         const location = tokenLoc(fun_tok);
 
@@ -2448,6 +2471,7 @@ pub const Parser = struct {
                 .location = location,
                 .params = try params.toOwnedSlice(self.allocator),
                 .body = body,
+                .is_async = is_async,
             },
         });
     }
@@ -2537,20 +2561,6 @@ pub const Parser = struct {
             .guard = guard,
             .body = body,
         };
-    }
-
-    fn parseSpawnExpr(self: *Parser) ParserError!*ast.Expr {
-        const spawn_tok = self.previous();
-        // spawn body 只解析一个基本表达式（通常是 block），
-        // 不贪婪消费后续的方法调用/字段访问（如 .await()）
-        const body = try self.parsePrimary();
-
-        return self.allocExpr(ast.Expr{
-            .spawn = .{
-                .location = tokenLoc(spawn_tok),
-                .body = body,
-            },
-        });
     }
 
     fn parseLazyExpr(self: *Parser) ParserError!*ast.Expr {

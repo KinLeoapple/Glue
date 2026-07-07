@@ -1,25 +1,34 @@
-// Edge cases: concurrency — spawn isolation, atomic ops, channel buffer/close, select
+// Edge cases: concurrency — async functions, atomic ops, channel buffer/close, select
+
+// async 函数：调用返回 Spawn<T>
+async fun mul10x10(): i64 { 10 * 10 }
+async fun add20x5(): i64 { 20 + 5 }
+async fun sub100x1(): i64 { 100 - 1 }
+async fun addX50(x: i64): i64 { x + 50 }
+async fun incrCounter(c: Atomic<i64>): Unit { c = c + 1 }
+async fun produceResult(ch: Channel<i64>): Unit { ch.send(12345) }
+async fun mul7x7(): i64 { 7 * 7 }
 
 fun main() {
-    // ---- multiple spawns, independent results ----
-    val s1 = spawn { 10 * 10 }
-    val s2 = spawn { 20 + 5 }
-    val s3 = spawn { 100 - 1 }
+    // ---- multiple async calls, independent results ----
+    val s1 = mul10x10()
+    val s2 = add20x5()
+    val s3 = sub100x1()
     println(s1.await())   // 100
     println(s2.await())   // 25
     println(s3.await())   // 99
 
-    // ---- spawn captures by deep copy: outer var unchanged ----
+    // ---- async captures by deep copy: outer var unchanged ----
     var x = 0
-    val s4 = spawn { x + 50 }
+    val s4 = addX50(x)
     println(s4.await())   // 50
     println(x)            // 0 (unchanged)
 
-    // ---- atomic shared across spawn ----
+    // ---- atomic shared across async ----
     var counter = atomic 0
-    val a1 = spawn { counter = counter + 1 }
+    val a1 = incrCounter(counter)
     a1.await()
-    val a2 = spawn { counter = counter + 1 }
+    val a2 = incrCounter(counter)
     a2.await()
     println(counter)      // 2
 
@@ -76,24 +85,24 @@ fun main() {
         chc.recv() => v => println("got " + str(v))
     }
 
-    // ---- spawn computing into channel ----
+    // ---- async computing into channel ----
     val result_ch = channel(10)
-    val producer = spawn { result_ch.send(12345) }
+    val producer = produceResult(result_ch)
     producer.await()
     println(result_ch.recv())   // 12345
 
-    // ---- many atomic increments via sequential spawns ----
+    // ---- many atomic increments via sequential async calls ----
     var acc = atomic 0
     var i = 0
     while i < 10 {
-        val sp = spawn { acc = acc + 1 }
+        val sp = incrCounter(acc)
         sp.await()
         i = i + 1
     }
     println(acc)   // 10
 
-    // ---- spawn status query ----
-    val s5 = spawn { 7 * 7 }
+    // ---- async status query ----
+    val s5 = mul7x7()
     val r5 = s5.await()
     println(s5.status())   // completed/done status
     println(r5)            // 49

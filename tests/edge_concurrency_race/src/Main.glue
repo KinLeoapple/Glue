@@ -1,12 +1,18 @@
 // Concurrency under real parallel contention + generic-array types
 
+// async 函数：调用返回 Spawn<T>，实参深拷贝；Atomic 实参共享底层内存
+async fun incrOne(c: Atomic<i32>): Unit { c += 1 }
+async fun addTwo(s: Atomic<i32>): Unit { s += 2 }
+async fun subTwo(s: Atomic<i32>): Unit { s -= 2 }
+async fun ret7(): i32 { 7 }
+
 fun main() {
-    // ---- 100 spawns incrementing a shared atomic in parallel ----
+    // ---- 100 async calls incrementing a shared atomic in parallel ----
     var counter = atomic 0
     var handles: Spawn<()>[] = []
     for i in 1..=100 {
         val c = counter
-        handles = handles ++ [spawn { c += 1 }]
+        handles = handles ++ [incrOne(c)]
     }
     for h in handles { h.await() }
     println(counter)          // 100 (no lost updates)
@@ -16,11 +22,11 @@ fun main() {
     var hs: Spawn<()>[] = []
     for i in 1..=50 {
         val s = sum
-        hs = hs ++ [spawn { s += 2 }]
+        hs = hs ++ [addTwo(s)]
     }
     for i in 1..=50 {
         val s = sum
-        hs = hs ++ [spawn { s -= 2 }]
+        hs = hs ++ [subTwo(s)]
     }
     for h in hs { h.await() }
     println(sum)              // 0
@@ -28,7 +34,7 @@ fun main() {
     // ---- generic-typed array of spawn handles parses and works ----
     var results: Spawn<i32>[] = []
     for i in 1..=5 {
-        results = results ++ [spawn { 7 }]
+        results = results ++ [ret7()]
     }
     var total = 0
     for r in results {

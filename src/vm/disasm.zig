@@ -134,6 +134,12 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             try print(buf, allocator, "{s} argc={d}\n", .{ op.name(), argc });
             return offset + 2;
         },
+        // OP_SPAWN_ARG <u8 argc>
+        .op_spawn_arg => {
+            const argc = code[offset + 1];
+            try print(buf, allocator, "{s} argc={d}\n", .{ op.name(), argc });
+            return offset + 2;
+        },
         // OP_CALL_NATIVE <u8 native_id> <u8 argc>
         .op_call_native => {
             const nid = code[offset + 1];

@@ -579,13 +579,16 @@ fun test_iterators() {
 
 // ============ 第十三部分：并发原语 ============
 
+// async 函数：调用返回 Spawn<T>，需 .await() 取结果
+async fun make10(): i32 { 10 }
+
 fun test_concurrency() {
     println("【测试13】并发原语")
 
-    // spawn与await - 简单常量
-    val s1 = spawn { 10 }
+    // async+await - 简单常量
+    val s1 = make10()
     val r1 = s1.await()
-    println("  spawn+await: 结果=" + str(r1))
+    println("  async+await: 结果=" + str(r1))
 
     // Atomic共享状态
     var counter: Atomic<i32> = atomic 0

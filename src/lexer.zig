@@ -62,8 +62,8 @@ pub const TokenType = enum {
     kw_if,
     /// else
     kw_else,
-    /// spawn
-    kw_spawn,
+    /// async
+    kw_async,
     /// channel
     kw_channel,
     /// select
@@ -1224,7 +1224,7 @@ const KEYWORDS = std.StaticStringMap(TokenType).initComptime(.{
     .{ "match", .kw_match },
     .{ "if", .kw_if },
     .{ "else", .kw_else },
-    .{ "spawn", .kw_spawn },
+    .{ "async", .kw_async },
     .{ "channel", .kw_channel },
     .{ "select", .kw_select },
     .{ "atomic", .kw_atomic },

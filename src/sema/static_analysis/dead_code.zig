@@ -115,7 +115,6 @@ pub const DeadCodePass = struct {
                 }
             },
             .type_cast => |tc| try self.collectReadsExpr(tc.expr, reads),
-            .spawn => |sp| try self.collectReadsExpr(sp.body, reads),
             .atomic_expr => |ae| try self.collectReadsExpr(ae.value, reads),
             .lazy => |l| try self.collectReadsExpr(l.expr, reads),
             .field_access => |f| try self.collectReadsExpr(f.object, reads),
@@ -230,7 +229,6 @@ pub const DeadCodePass = struct {
                 }
             },
             .type_cast => |tc| try self.collectAndMarkDeclsExpr(tc.expr, reads),
-            .spawn => |sp| try self.collectAndMarkDeclsExpr(sp.body, reads),
             .atomic_expr => |ae| try self.collectAndMarkDeclsExpr(ae.value, reads),
             .lazy => |l| try self.collectAndMarkDeclsExpr(l.expr, reads),
             .field_access => |f| try self.collectAndMarkDeclsExpr(f.object, reads),
@@ -344,7 +342,7 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
         // 有副作用或可能抛异常/分配
         .call, .method_call, .safe_method_call, .string_interpolation,
         .index, .record_literal, .record_extend, .array_literal,
-        .lambda, .match, .select, .spawn, .lazy,
+        .lambda, .match, .select, .lazy,
         .assignment_expr, .compound_assign, .propagate,
         .atomic_expr, .inline_trait_value,
         => false,

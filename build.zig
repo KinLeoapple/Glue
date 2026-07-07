@@ -240,19 +240,7 @@ pub fn build(b: *std.Build) void {
     throw_check_module.addImport("type_check", type_check_module);
     trait_resolve_module.addImport("type_check", type_check_module);
     kind_check_module.addImport("type_check", type_check_module);
-    trait_resolve_module.addImport("kind_check", kind_check_module);
     gadt_check_module.addImport("type_check", type_check_module);
-
-    // ============================================================
-    // module/ sub-modules
-    // ============================================================
-
-    const module_resolver_module = b.createModule(.{
-        .root_source_file = b.path("src/module/resolver.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    module_resolver_module.addImport("ast", ast_module);
 
     // ============================================================
     // 内嵌标准库（@embedFile stdlib/*.glue）

@@ -5,7 +5,6 @@
 //! 模块根文件：re-export 子模块，供外部通过 @import("analysis_db") 访问。
 
 const std = @import("std");
-const ast = @import("ast");
 
 pub const purity = @import("purity.zig");
 pub const call_graph = @import("call_graph.zig");
@@ -18,24 +17,17 @@ pub const cse = @import("cse.zig");
 
 pub const PurityInfo = purity.PurityInfo;
 pub const PurityTable = purity.PurityTable;
-pub const PurityPass = purity.PurityPass;
 pub const CallGraph = call_graph.CallGraph;
-pub const CallGraphPass = call_graph.CallGraphPass;
 pub const ConstValue = const_prop.ConstValue;
 pub const ConstTable = const_prop.ConstTable;
-pub const ConstPropPass = const_prop.ConstPropPass;
 pub const BranchInfo = branch_reach.BranchInfo;
 pub const BranchTable = branch_reach.BranchTable;
-pub const BranchReachPass = branch_reach.BranchReachPass;
 pub const LoopInfo = loop_invariant.LoopInfo;
 pub const LoopTable = loop_invariant.LoopTable;
 pub const HoistTable = loop_invariant.HoistTable;
-pub const LoopInvariantPass = loop_invariant.LoopInvariantPass;
 pub const FusedAnalysis = fused_analysis.FusedAnalysis;
 pub const DeadTable = dead_code.DeadTable;
-pub const DeadCodePass = dead_code.DeadCodePass;
 pub const CseTable = cse.CseTable;
-pub const CsePass = cse.CsePass;
 
 /// 分析数据库
 pub const AnalysisDB = struct {

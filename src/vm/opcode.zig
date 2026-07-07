@@ -253,6 +253,9 @@ pub const OpCode = enum(u8) {
     /// OP_SPAWN：弹栈顶 vm_closure（spawn body 编译成的零参闭包），深拷捕获快照进 per-spawn arena，
     /// 起 OS 线程跑子 VM 执行 body，压 spawn_val 句柄。await 时取结果（深拷回父 allocator）。
     op_spawn,
+    /// OP_SPAWN_ARG <u8 argc>：弹栈顶 vm_closure + argc 个实参，深拷参数与捕获快照进 per-spawn 堆，
+    /// 起 OS 线程跑子 VM 执行带参函数体，压 spawn_val 句柄。用于 async 函数调用。
+    op_spawn_arg,
     /// OP_MAKE_LAZY：弹栈顶 vm_closure（lazy expr 编译成的零参闭包），包成 lazy_val（vm_thunk 模式）压栈。
     /// 首次透明读取（OP_GET_LOCAL/UPVALUE 见 lazy）时 force：跑 thunk 缓存结果。
     op_make_lazy,

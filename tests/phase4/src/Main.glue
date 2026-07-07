@@ -3,27 +3,42 @@
 //   Atomic<T>、Spawn<T>、Channel、select、Per-Heap GC
 
 // ============================================================
-// 1. spawn + await 基本功能
+// 1. async 函数 + await 基本功能
 // ============================================================
 
+// async 函数：调用返回 Spawn<T>，需 .await() 取结果
+async fun make42(): i64 { 42 }
+
+// async 函数深拷贝捕获：内部修改不影响外部
+async fun incrCount(c: i64): i64 { c + 1 }
+
+// async 函数捕获 Atomic：共享底层内存
+async fun incrAtomic(counter: Atomic<i64>): Unit { counter = counter + 1 }
+
+// async 函数链式调用
+async fun mul42(): i64 { 7 * 6 }
+
+// async 函数：status 查询
+async fun make99(): i64 { 99 }
+
 fun main() {
-    // 1. spawn + await：spawn 创建协程，await 阻塞等待结果
-    val s1 = spawn { 42 }
+    // 1. async + await：async 函数调用返回 Spawn<T>，await 阻塞等待结果
+    val s1 = make42()
     val r1 = s1.await()
     println(r1)
 
-    // 2. spawn 深拷贝隔离性验证
-    // spawn 闭包深拷贝捕获环境，内部修改不影响外部
+    // 2. async 深拷贝隔离性验证
+    // async 函数实参深拷贝，内部修改不影响外部
     var count = 0
-    val s2 = spawn { count + 1 }
+    val s2 = incrCount(count)
     val r2 = s2.await()
     println(r2)
     println(count)
 
-    // 3. Atomic<T> 跨 spawn 共享
-    // Atomic 在 spawn 捕获时浅拷贝，共享底层内存
+    // 3. Atomic<T> 跨 async 共享
+    // Atomic 在实参传递时浅拷贝，共享底层内存
     var counter = atomic 0
-    val s3 = spawn { counter = counter + 1 }
+    val s3 = incrAtomic(counter)
     s3.await()
     println(counter)
 
@@ -60,7 +75,7 @@ fun main() {
     sender.close()
 
     // 7. SpawnStatus 查询
-    val s4 = spawn { 99 }
+    val s4 = make99()
     val status_before = s4.status()
     println(status_before)
     val r4 = s4.await()
@@ -91,8 +106,8 @@ fun main() {
         ch_b.recv() => println("from ch_b"),
     }
 
-    // 10. spawn 链式调用
-    val r5 = spawn { 7 * 6 }.await()
+    // 10. async 链式调用
+    val r5 = mul42().await()
     println(r5)
 
     println("Phase 4: All tests passed!")

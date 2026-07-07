@@ -81,180 +81,6 @@ pub const HoistTable = struct {
 /// 循环展开阈值（体指令数估计）
 const UNROLL_THRESHOLD: u32 = 32;
 
-/// Pass 4：循环不变量分析器
-pub const LoopInvariantPass = struct {
-    table: LoopTable,
-    /// 【LICM】循环不变量提升表（与 table 同生命周期）
-    hoist_table: HoistTable,
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) LoopInvariantPass {
-        return .{
-            .table = LoopTable.init(allocator),
-            .hoist_table = HoistTable.init(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *LoopInvariantPass) void {
-        self.table.deinit();
-        self.hoist_table.deinit();
-    }
-
-    pub fn analyzeModule(self: *LoopInvariantPass, module: *const ast.Module) !void {
-        for (module.declarations) |decl| {
-            if (decl != .fun_decl) continue;
-            try self.analyzeExpr(decl.fun_decl.body);
-        }
-    }
-
-    fn analyzeExpr(self: *LoopInvariantPass, expr: *const ast.Expr) anyerror!void {
-        switch (expr.*) {
-            .block => |b| {
-                for (b.statements) |s| try self.analyzeStmt(s);
-                if (b.trailing_expr) |te| try self.analyzeExpr(te);
-            },
-            .if_expr => |i| {
-                try self.analyzeExpr(i.condition);
-                try self.analyzeExpr(i.then_branch);
-                if (i.else_branch) |e| try self.analyzeExpr(e);
-            },
-            .binary => |bn| {
-                try self.analyzeExpr(bn.left);
-                try self.analyzeExpr(bn.right);
-            },
-            .unary => |u| try self.analyzeExpr(u.operand),
-            .call => |c| {
-                try self.analyzeExpr(c.callee);
-                for (c.arguments) |arg| try self.analyzeExpr(arg);
-            },
-            .match => |m| {
-                try self.analyzeExpr(m.scrutinee);
-                for (m.arms) |arm| {
-                    if (arm.guard) |g| try self.analyzeExpr(g);
-                    try self.analyzeExpr(arm.body);
-                }
-            },
-            .lambda => |l| switch (l.body) {
-                .block => |body_expr| try self.analyzeExpr(body_expr),
-                .expression => |body_expr| try self.analyzeExpr(body_expr),
-            },
-            .type_cast => |tc| try self.analyzeExpr(tc.expr),
-            .spawn => |sp| try self.analyzeExpr(sp.body),
-            .atomic_expr => |ae| try self.analyzeExpr(ae.value),
-            else => {},
-        }
-    }
-
-    fn analyzeStmt(self: *LoopInvariantPass, stmt: *const ast.Stmt) anyerror!void {
-        switch (stmt.*) {
-            .for_stmt => |f| {
-                const size = self.estimateSize(f.body);
-                try self.table.put(stmt, .{
-                    .is_small = size <= UNROLL_THRESHOLD,
-                    .est_size = size,
-                });
-                try self.analyzeExpr(f.iterable);
-                // 【LICM】收集循环体内可 hoist 的不变量子表达式。
-                // assigned_vars 必须包含循环变量 f.name 和循环体内的赋值目标，
-                // 否则循环体内被赋值的变量（如 sum = sum + i 中的 sum）会被误判为不变量并 hoist，
-                // 导致循环读到旧值。
-                var assigned: std.ArrayListUnmanaged([]const u8) = .empty;
-                defer assigned.deinit(self.allocator);
-                try assigned.append(self.allocator, f.name);
-                try collectAssignedVars(self.allocator, f.body, &assigned);
-                try self.collectHoistsForLoop(f.body, stmt, assigned.items);
-                try self.analyzeExpr(f.body);
-            },
-            .while_stmt => |w| {
-                const size = self.estimateSize(w.body);
-                try self.table.put(stmt, .{
-                    .is_small = size <= UNROLL_THRESHOLD,
-                    .est_size = size,
-                });
-                try self.analyzeExpr(w.condition);
-                // 【LICM】while 没有显式循环变量，assigned_vars 仅含循环体内的 assignment target
-                var assigned: std.ArrayListUnmanaged([]const u8) = .empty;
-                defer assigned.deinit(self.allocator);
-                try collectAssignedVars(self.allocator, w.body, &assigned);
-                try self.collectHoistsForLoop(w.body, stmt, assigned.items);
-                try self.analyzeExpr(w.body);
-            },
-            .loop_stmt => |l| {
-                const size = self.estimateSize(l.body);
-                try self.table.put(stmt, .{
-                    .is_small = size <= UNROLL_THRESHOLD,
-                    .est_size = size,
-                });
-                // 【LICM】loop 同 while——无循环变量
-                var assigned: std.ArrayListUnmanaged([]const u8) = .empty;
-                defer assigned.deinit(self.allocator);
-                try collectAssignedVars(self.allocator, l.body, &assigned);
-                try self.collectHoistsForLoop(l.body, stmt, assigned.items);
-                try self.analyzeExpr(l.body);
-            },
-            .val_decl => |v| try self.analyzeExpr(v.value),
-            .var_decl => |v| try self.analyzeExpr(v.value),
-            .assignment => |a| try self.analyzeExpr(a.value),
-            .expression => |e| try self.analyzeExpr(e.expr),
-            .return_stmt => |r| if (r.value) |v| try self.analyzeExpr(v),
-            .defer_stmt => |d| try self.analyzeExpr(d.expr),
-            .throw_stmt => |t| try self.analyzeExpr(t.expr),
-            else => {},
-        }
-    }
-
-    /// 【LICM】遍历循环体，找出可 hoist 的不变量 binary 子表达式，加入 hoist_table。
-    /// 可 hoist 条件：
-    ///   1. binary 的 op 是位运算（bit_and/bit_or/bit_xor）或比较（eq/not_eq/lt/gt/lt_eq/gt_eq）
-    ///      ——这些运算不会 panic，hoist 到循环前不改变 panic 时机
-    ///   2. 操作数是"循环不变量"——仅由字面量 + identifier(不在 assigned_vars) + nested hoistable binary 组成
-    ///   3. 不是赋值语句的 LHS
-    /// 策略：自顶向下递归，遇到可 hoist 的 binary 即登记并停止递归子树（避免子表达式重复登记）。
-    fn collectHoistsForLoop(
-        self: *LoopInvariantPass,
-        body: *const ast.Expr,
-        owner_loop: *const ast.Stmt,
-        assigned_vars: []const []const u8,
-    ) !void {
-        try collectHoistsInExpr(self.allocator, &self.hoist_table, body, owner_loop, assigned_vars);
-    }
-
-    /// 估计表达式的字节码指令数
-    fn estimateSize(self: *LoopInvariantPass, expr: *const ast.Expr) u32 {
-        return switch (expr.*) {
-            .int_literal, .float_literal, .bool_literal, .char_literal,
-            .string_literal, .null_literal, .unit_literal, .identifier,
-            => 1,
-            .binary => 3, // left + right + op
-            .unary => 2,
-            .call => |c| 1 + @as(u32, @intCast(c.arguments.len)),
-            .if_expr => |i| 5 + (if (i.else_branch != null) @as(u32, 1) else 0),
-            .block => |b| blk: {
-                var size: u32 = 0;
-                for (b.statements) |s| size += self.estimateStmtSize(s);
-                if (b.trailing_expr) |te| size += self.estimateSize(te);
-                break :blk size;
-            },
-            else => 5, // 保守估计
-        };
-    }
-
-    fn estimateStmtSize(self: *LoopInvariantPass, stmt: *const ast.Stmt) u32 {
-        return switch (stmt.*) {
-            .val_decl => |v| self.estimateSize(v.value) + 1,
-            .var_decl => |v| self.estimateSize(v.value) + 1,
-            .assignment => |a| self.estimateSize(a.value) + 1,
-            .expression => |e| self.estimateSize(e.expr),
-            .return_stmt => |r| if (r.value) |v| self.estimateSize(v) + 1 else 1,
-            .for_stmt => 5, // 保守
-            .while_stmt => 5,
-            .loop_stmt => 5,
-            else => 1,
-        };
-    }
-};
-
 // ============================================================
 // 【LICM】模块级辅助函数：循环不变量分析
 // ============================================================
@@ -304,7 +130,6 @@ fn collectAssignedVarsExpr(
         },
         .lambda => {},
         .type_cast => |tc| try collectAssignedVarsExpr(allocator, tc.expr, out),
-        .spawn => |sp| try collectAssignedVarsExpr(allocator, sp.body, out),
         .atomic_expr => |ae| try collectAssignedVarsExpr(allocator, ae.value, out),
         .field_access => |f| try collectAssignedVarsExpr(allocator, f.object, out),
         .safe_access => |f| try collectAssignedVarsExpr(allocator, f.object, out),
@@ -445,7 +270,6 @@ pub fn collectHoistsInExpr(
         },
         .type_cast => |tc| try collectHoistsInExpr(allocator, hoist_table, tc.expr, owner_loop, assigned_vars),
         .atomic_expr => |ae| try collectHoistsInExpr(allocator, hoist_table, ae.value, owner_loop, assigned_vars),
-        .spawn => |sp| try collectHoistsInExpr(allocator, hoist_table, sp.body, owner_loop, assigned_vars),
         .field_access => |f| try collectHoistsInExpr(allocator, hoist_table, f.object, owner_loop, assigned_vars),
         .safe_access => |f| try collectHoistsInExpr(allocator, hoist_table, f.object, owner_loop, assigned_vars),
         .index => |i| {

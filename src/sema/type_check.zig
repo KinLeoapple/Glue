@@ -2072,7 +2072,13 @@ pub const TypeInferencer = struct {
                 };
                 self.popLinearScope();
 
-                return self.makeFnType(param_types, body_ty);
+                // async lambda：返回类型为 Spawn<body_ty>，否则直接使用 body_ty
+                const ret_ty = if (lam.is_async)
+                    try self.makeGenericType("Spawn", &[_]*Type{body_ty})
+                else
+                    body_ty;
+
+                return self.makeFnType(param_types, ret_ty);
             },
 
             .call => |c| {
@@ -2607,12 +2613,6 @@ pub const TypeInferencer = struct {
                 }
             },
 
-            // 尚未实现的表达式类型 — Phase 4 并发原语类型推断
-            .spawn => |sp| {
-                const body_ty = try self.inferExpr(sp.body, env, null);
-                // 返回 Spawn<T>，其中 T = body 类型
-                return self.makeGenericType("Spawn", &[_]*Type{body_ty});
-            },
             .atomic_expr => |ae| {
                 // 如果有期望类型 Atomic<T>，提取 T 作为内部值的期望类型
                 var inner_expected: ?*Type = null;
@@ -3825,12 +3825,19 @@ pub const TypeInferencer = struct {
                     return;
                 };
 
+                // async 函数：无返回类型注解时，实际返回类型为 Spawn<body_ty>
+                // 有注解时按注解处理（用户应写 `: Spawn<T>`）
+                const effective_body_ty = if (f.is_async and f.return_type == null)
+                    self.makeGenericType("Spawn", &[_]*Type{body_ty}) catch return
+                else
+                    body_ty;
+
                 // 统一推断的返回类型与声明的返回类型
                 // 文档 2.3.9: ? 传播语义允许函数体返回 T 自动提升为 T? / Throw<T, E>
                 // 例如 fun useNullable(): i32? { val v = maybeNull()?; v + 1 }
                 // v + 1 推断为 i32，但函数返回 i32?，i32 应自动提升
-                self.unifyReturnType(ret_ty, body_ty) catch |err| {
-                    self.reportUnifyError(err, f.location, ret_ty, body_ty);
+                self.unifyReturnType(ret_ty, effective_body_ty) catch |err| {
+                    self.reportUnifyError(err, f.location, ret_ty, effective_body_ty);
                 };
 
                 // 同时注册到外层环境（供后续声明使用）

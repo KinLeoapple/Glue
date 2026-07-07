@@ -126,7 +126,6 @@ pub const BranchReachPass = struct {
                 .expression => |body_expr| try self.analyzeExpr(body_expr),
             },
             .type_cast => |tc| try self.analyzeExpr(tc.expr),
-            .spawn => |sp| try self.analyzeExpr(sp.body),
             .atomic_expr => |ae| try self.analyzeExpr(ae.value),
             else => {},
         }

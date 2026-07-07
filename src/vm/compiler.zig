@@ -20,8 +20,6 @@ const analysis_db_mod = @import("analysis_db");
 /// 公开再导出，供 bench 驱动 / 外部入口通过本模块拿到 VM 与 Program（避免新建 build 图模块）。
 pub const VM = @import("vm.zig").VM;
 pub const chunk = chunk_mod;
-pub const lexer = @import("lexer");
-pub const parser = @import("parser");
 
 const OpCode = opcode.OpCode;
 const Chunk = chunk_mod.Chunk;
@@ -45,6 +43,8 @@ const Local = struct {
     /// letrec lambda 绑定时存的形参基础类型（borrow AST），供 op_call_value 路径 caller-side coerce。
     /// null 表示非闭包或无注解；元素 null 表示该参数无注解。
     closure_param_types: ?[]const ?[]const u8 = null,
+    /// 标记该 local 绑定的是 async lambda，调用时走 op_spawn_arg 路径
+    is_async_closure: bool = false,
 };
 
 /// 闭包 upvalue 描述符（clox 风格静态解析）。
@@ -55,6 +55,8 @@ const Upvalue = struct {
     is_local: bool,
     /// letrec lambda 绑定时存的形参基础类型（borrow AST），供 op_call_value 路径 caller-side coerce。
     closure_param_types: ?[]const ?[]const u8 = null,
+    /// 标记该 upvalue 绑定的是 async lambda，调用时走 op_spawn_arg 路径
+    is_async_closure: bool = false,
 };
 
 /// 循环上下文（M3b）：break/continue 跳转回填。
@@ -84,6 +86,8 @@ const FnEntry = struct {
     body: ?*const ast.Expr = null,
     /// 【内联】形参 AST（borrow），内联展开时绑定参数名到临时 local。
     params: []const ast.Param = &.{},
+    /// async 函数：调用时返回 Spawn<T>，发射 op_spawn_arg 而非 op_call
+    is_async: bool = false,
 };
 
 /// ADT 构造器名 → (program.adt_ctors 索引, arity)。编译期识别裸名构造器调用 + match 校验。
@@ -439,8 +443,8 @@ pub const ModuleCompiler = struct {
                     if (self.fn_map.contains(fd.name)) continue;
                     const idx: u16 = @intCast(self.fn_table.items.len);
                     const param_types = try extractParamTypes(self.allocator, fd.params);
-                    // 【内联】判断可内联性：arity ≤ 4 + body 节点数 ≤ 32 + 无 nested lambda/spawn + 非递归
-                    const can_inline = canInlineFn(fd.name, fd.params.len, fd.body);
+                    // async 函数不可内联（调用需起协程）；其余按原判断：arity ≤ 4 + body 节点数 ≤ 32 + 无 nested lambda + 非递归
+                    const can_inline = !fd.is_async and canInlineFn(fd.name, fd.params.len, fd.body);
                     try self.fn_table.append(self.allocator, .{
                         .name = fd.name,
                         .idx = idx,
@@ -448,6 +452,7 @@ pub const ModuleCompiler = struct {
                         .param_types = param_types,
                         .body = if (can_inline) fd.body else null,
                         .params = if (can_inline) fd.params else &.{},
+                        .is_async = fd.is_async,
                     });
                     try self.fn_map.put(fd.name, idx);
                     _ = try self.program.addFunction(.{ .chunk = Chunk.init(self.allocator), .arity = 0, .slot_count = 0, .name = fd.name });
@@ -961,7 +966,7 @@ fn exprHasNoSideEffects(expr: *const ast.Expr) bool {
         // 有副作用或可能抛异常/分配的表达式
         .call, .method_call, .safe_method_call, .string_interpolation,
         .index, .record_literal, .record_extend, .array_literal,
-        .lambda, .match, .select, .spawn, .lazy,
+        .lambda, .match, .select, .lazy,
         .assignment_expr, .compound_assign, .propagate, .non_null_assert,
         .atomic_expr, .type_cast, .inline_trait_value,
         => return false,
@@ -1086,23 +1091,25 @@ const FnCompiler = struct {
         const enc = self.enclosing orelse return null;
         if (enc.resolveLocal(name)) |slot| {
             const cpt = if (slot < enc.locals.items.len) enc.locals.items[slot].closure_param_types else null;
-            return try self.addUpvalue(name, slot, true, cpt);
+            const is_async = if (slot < enc.locals.items.len) enc.locals.items[slot].is_async_closure else false;
+            return try self.addUpvalue(name, slot, true, cpt, is_async);
         }
         if (try enc.resolveUpvalue(name)) |uv_idx| {
             const cpt = if (uv_idx < enc.upvalues.items.len) enc.upvalues.items[uv_idx].closure_param_types else null;
-            return try self.addUpvalue(name, uv_idx, false, cpt);
+            const is_async = if (uv_idx < enc.upvalues.items.len) enc.upvalues.items[uv_idx].is_async_closure else false;
+            return try self.addUpvalue(name, uv_idx, false, cpt, is_async);
         }
         return null;
     }
 
     /// 登记一个 upvalue（去重）。返回其在 upvalues 列表中的索引。
-    fn addUpvalue(self: *FnCompiler, name: []const u8, index: u16, is_local: bool, cpt: ?[]const ?[]const u8) CompileError!u16 {
+    fn addUpvalue(self: *FnCompiler, name: []const u8, index: u16, is_local: bool, cpt: ?[]const ?[]const u8, is_async: bool) CompileError!u16 {
         for (self.upvalues.items, 0..) |uv, i| {
             if (uv.index == index and uv.is_local == is_local) return @intCast(i);
         }
         if (self.upvalues.items.len >= 255) return error.Unsupported;
         const idx: u16 = @intCast(self.upvalues.items.len);
-        try self.upvalues.append(self.allocator, .{ .name = name, .index = index, .is_local = is_local, .closure_param_types = cpt });
+        try self.upvalues.append(self.allocator, .{ .name = name, .index = index, .is_local = is_local, .closure_param_types = cpt, .is_async_closure = is_async });
         return idx;
     }
 
@@ -1257,16 +1264,13 @@ const FnCompiler = struct {
                 // param_types[i+1]=explicit arg i。修复 i8 字面量传入宽类型形参未 coerce 导致的算术溢出。
                 const callee_pts = self.module.traitMethodParamTypes(mc.method);
                 for (mc.arguments, 0..) |arg, i| {
-                    try self.emitExpr(arg);
-                    if (callee_pts) |pts| {
-                        const pi = i + 1;
-                        if (pi < pts.len) {
-                            if (pts[pi]) |pt| {
-                                if (isBuiltinNumericType(pt)) {
-                                    const at = self.exprBuiltinType(arg);
-                                    if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
-                                }
-                            }
+                    const pi = i + 1;
+                    const pt: ?[]const u8 = if (callee_pts) |pts| (if (pi < pts.len) pts[pi] else null) else null;
+                    try self.emitArgForType(arg, pt);
+                    if (pt) |ptn| {
+                        if (isBuiltinNumericType(ptn)) {
+                            const at = self.exprBuiltinType(arg);
+                            if (at == null or !std.mem.eql(u8, at.?, ptn)) try self.emitCoerceForType(ptn, loc);
                         }
                     }
                 }
@@ -1293,16 +1297,13 @@ const FnCompiler = struct {
                 // caller-side coerce：同 .method_call 路径（null 检查后、OP_CALL_METHOD 前协调实参）。
                 const callee_pts = self.module.traitMethodParamTypes(smc.method);
                 for (smc.arguments, 0..) |arg, i| {
-                    try self.emitExpr(arg);
-                    if (callee_pts) |pts| {
-                        const pi = i + 1;
-                        if (pi < pts.len) {
-                            if (pts[pi]) |pt| {
-                                if (isBuiltinNumericType(pt)) {
-                                    const at = self.exprBuiltinType(arg);
-                                    if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
-                                }
-                            }
+                    const pi = i + 1;
+                    const pt: ?[]const u8 = if (callee_pts) |pts| (if (pi < pts.len) pts[pi] else null) else null;
+                    try self.emitArgForType(arg, pt);
+                    if (pt) |ptn| {
+                        if (isBuiltinNumericType(ptn)) {
+                            const at = self.exprBuiltinType(arg);
+                            if (at == null or !std.mem.eql(u8, at.?, ptn)) try self.emitCoerceForType(ptn, loc);
                         }
                     }
                 }
@@ -1393,10 +1394,6 @@ const FnCompiler = struct {
                 try self.emitExpr(ae.value);
                 try self.chunk.writeOp(.op_make_atomic, ae.location);
             },
-            // M4c：spawn { body } —— body 编译成零参闭包（自动捕获），OP_SPAWN 起协程。
-            .spawn => |sp| {
-                try self.emitSpawn(sp);
-            },
             // M4d：lazy expr —— expr 编译成零参闭包（自动捕获），OP_MAKE_LAZY 包成 thunk，透明 force。
             .lazy => |lz| {
                 try self.emitLazy(lz);
@@ -1474,42 +1471,6 @@ const FnCompiler = struct {
             try self.chunk.writeU16(uv.index);
         }
         return has_self_uv;
-    }
-
-    /// 发 OP_CLOSURE 在本帧实例化（捕获当前 local/upvalue），再 OP_SPAWN 弹闭包起协程压 spawn_val。
-    fn emitSpawn(self: *FnCompiler, sp: @TypeOf(@as(Expr, undefined).spawn)) CompileError!void {
-        var sub = FnCompiler.init(self.allocator, self.module);
-        sub.enclosing = self;
-        defer sub.deinit();
-        // 【缓存】预占位拿 func_idx
-        const placeholder = Function{
-            .chunk = Chunk.init(self.allocator),
-            .arity = 0,
-            .slot_count = 0,
-            .name = "<spawn>",
-        };
-        const placeholder_idx = try self.module.program.addFunction(placeholder);
-        try sub.emitExpr(sp.body);
-        try sub.chunk.writeOp(.op_return, sp.location);
-        const f = Function{
-            .chunk = sub.chunk,
-            .arity = 0,
-            .slot_count = sub.slot_count,
-            .release_mask = sub.release_mask,
-            .name = "<spawn>",
-        };
-        sub.chunk = Chunk.init(self.allocator); // 防 deinit 误碰
-        self.module.program.functions.items[placeholder_idx].deinit();
-        self.module.program.functions.items[placeholder_idx] = f;
-        const func_idx = placeholder_idx;
-        try self.chunk.writeOp(.op_closure, sp.location);
-        try self.chunk.writeU16(@intCast(func_idx));
-        try self.chunk.writeByte(@intCast(sub.upvalues.items.len));
-        for (sub.upvalues.items) |uv| {
-            try self.chunk.writeByte(if (uv.is_local) 1 else 0);
-            try self.chunk.writeU16(uv.index);
-        }
-        try self.chunk.writeOp(.op_spawn, sp.location);
     }
 
     /// M4d：lazy expr —— expr 编译成零参 Function（自动捕获 enclosing 变量为 upvalue），
@@ -1907,13 +1868,12 @@ const FnCompiler = struct {
 
         // 求值实参 + 绑定参数名到临时 local（caller-side coerce 同 emitCall 顶层路径）
         for (c.arguments, 0..) |arg, i| {
-            try self.emitExpr(arg);
-            if (i < entry.param_types.len) {
-                if (entry.param_types[i]) |pt| {
-                    if (isBuiltinNumericType(pt)) {
-                        const at = self.exprBuiltinType(arg);
-                        if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
-                    }
+            const pt: ?[]const u8 = if (i < entry.param_types.len) entry.param_types[i] else null;
+            try self.emitArgForType(arg, pt);
+            if (pt) |ptn| {
+                if (isBuiltinNumericType(ptn)) {
+                    const at = self.exprBuiltinType(arg);
+                    if (at == null or !std.mem.eql(u8, at.?, ptn)) try self.emitCoerceForType(ptn, loc);
                 }
             }
             const param = entry.params[i];
@@ -1942,6 +1902,26 @@ const FnCompiler = struct {
             }
         }
         try self.emitExpr(expr);
+    }
+
+    /// 函数调用实参发射：当参数类型是并发原语引用类型（Atomic<T>/Channel<T>/Sender<T>/Receiver<T>）
+    /// 且实参是裸 identifier 时，用 raw 读取（op_get_local_raw/op_get_upvalue_raw）保留引用，
+    /// 避免 op_get_local 透明 load 把 atomic 解包成标量。其它情况照常 emitExpr。
+    /// 这保证 async/普通函数行为一致：传递 atomic 参数共享同一引用，函数内 fetchAdd 对调用方可见。
+    fn emitArgForType(self: *FnCompiler, arg: *const Expr, param_type: ?[]const u8) CompileError!void {
+        if (param_type) |pt| {
+            if (isConcurrentRefType(pt) and arg.* == .identifier) {
+                const name = arg.identifier.name;
+                if (self.resolveLocal(name)) |slot| {
+                    try self.emitSlotOp(.op_get_local_raw, slot, arg.identifier.location);
+                    return;
+                } else if (try self.resolveUpvalue(name)) |uv| {
+                    try self.emitSlotOp(.op_get_upvalue_raw, uv, arg.identifier.location);
+                    return;
+                }
+            }
+        }
+        try self.emitExpr(arg);
     }
 
     /// M4a：方法接收者求值 —— identifier（local/upvalue）用 raw 读取，避免对 atomic 透明 load
@@ -2011,16 +1991,36 @@ const FnCompiler = struct {
 
                 if (self.module.lookupFn(name)) |func_idx| {
                     const entry = self.module.lookupFnEntry(name).?;
+                    // async 函数：op_closure（实例化闭包，零捕获因顶层函数无 upvalue）→ 实参压栈 → op_spawn_arg <argc>
+                    // 不可内联、不可 memoize（起协程有副作用）
+                    if (entry.is_async) {
+                        // 顶层 async 函数无 upvalue，发零捕获 op_closure（先压 callee，再压 args）
+                        try self.chunk.writeOp(.op_closure, loc);
+                        try self.chunk.writeU16(func_idx);
+                        try self.chunk.writeByte(0); // 零 upvalue
+                        for (c.arguments, 0..) |arg, i| {
+                            const pt: ?[]const u8 = if (i < entry.param_types.len) entry.param_types[i] else null;
+                            try self.emitArgForType(arg, pt);
+                            if (pt) |ptn| {
+                                if (isBuiltinNumericType(ptn)) {
+                                    const at = self.exprBuiltinType(arg);
+                                    if (at == null or !std.mem.eql(u8, at.?, ptn)) try self.emitCoerceForType(ptn, loc);
+                                }
+                            }
+                        }
+                        try self.chunk.writeOp(.op_spawn_arg, loc);
+                        try self.chunk.writeByte(argc);
+                        return;
+                    }
                     // 【内联】可内联小函数 → 在调用点展开 body（省 op_call + 帧 + return）
                     if (try self.tryEmitInlineCall(c, entry, loc)) return;
                     for (c.arguments, 0..) |arg, i| {
-                        try self.emitExpr(arg);
-                        if (i < entry.param_types.len) {
-                            if (entry.param_types[i]) |pt| {
-                                if (isBuiltinNumericType(pt)) {
-                                    const at = self.exprBuiltinType(arg);
-                                    if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
-                                }
+                        const pt: ?[]const u8 = if (i < entry.param_types.len) entry.param_types[i] else null;
+                        try self.emitArgForType(arg, pt);
+                        if (pt) |ptn| {
+                            if (isBuiltinNumericType(ptn)) {
+                                const at = self.exprBuiltinType(arg);
+                                if (at == null or !std.mem.eql(u8, at.?, ptn)) try self.emitCoerceForType(ptn, loc);
                             }
                         }
                     }
@@ -2127,6 +2127,8 @@ const FnCompiler = struct {
             }
         }
         // 通用路径：先压 callee（求值出 vm_closure），再压实参，OP_CALL_VALUE。
+        // async lambda callee：走 op_spawn_arg 路径（实参 + callee 压栈后发 op_spawn_arg）
+        var callee_is_async = false;
         try self.emitExpr(c.callee);
         // caller-side coerce：若 callee 是已知 letrec lambda（local/upvalue），按形参类型协调实参。
         // 修复 i8 字面量传入 i64 形参未 coerce 导致的算术溢出（op_call_value 路径原本缺失此步骤）。
@@ -2134,28 +2136,37 @@ const FnCompiler = struct {
             if (c.callee.* == .identifier) {
                 const cn = c.callee.identifier.name;
                 if (self.resolveLocal(cn)) |slot| {
-                    if (slot < self.locals.items.len) break :blk self.locals.items[slot].closure_param_types;
+                    if (slot < self.locals.items.len) {
+                        callee_is_async = self.locals.items[slot].is_async_closure;
+                        break :blk self.locals.items[slot].closure_param_types;
+                    }
                 } else if (try self.resolveUpvalue(cn)) |uv_idx| {
-                    if (uv_idx < self.upvalues.items.len) break :blk self.upvalues.items[uv_idx].closure_param_types;
+                    if (uv_idx < self.upvalues.items.len) {
+                        callee_is_async = self.upvalues.items[uv_idx].is_async_closure;
+                        break :blk self.upvalues.items[uv_idx].closure_param_types;
+                    }
                 }
             }
             break :blk null;
         };
         for (c.arguments, 0..) |arg, i| {
-            try self.emitExpr(arg);
-            if (callee_param_types) |pts| {
-                if (i < pts.len) {
-                    if (pts[i]) |pt| {
-                        if (isBuiltinNumericType(pt)) {
-                            const at = self.exprBuiltinType(arg);
-                            if (at == null or !std.mem.eql(u8, at.?, pt)) try self.emitCoerceForType(pt, loc);
-                        }
-                    }
+            const pt: ?[]const u8 = if (callee_param_types) |pts| (if (i < pts.len) pts[i] else null) else null;
+            try self.emitArgForType(arg, pt);
+            if (pt) |ptn| {
+                if (isBuiltinNumericType(ptn)) {
+                    const at = self.exprBuiltinType(arg);
+                    if (at == null or !std.mem.eql(u8, at.?, ptn)) try self.emitCoerceForType(ptn, loc);
                 }
             }
         }
-        try self.chunk.writeOp(.op_call_value, loc);
-        try self.chunk.writeByte(argc);
+        if (callee_is_async) {
+            // async lambda 调用：栈顶是 vm_closure + argc 个实参，发 op_spawn_arg 起协程
+            try self.chunk.writeOp(.op_spawn_arg, loc);
+            try self.chunk.writeByte(argc);
+        } else {
+            try self.chunk.writeOp(.op_call_value, loc);
+            try self.chunk.writeByte(argc);
+        }
     }
 
     /// 常量折叠：查询表达式在 ConstTable 中的编译期常量值。
@@ -2975,6 +2986,7 @@ const FnCompiler = struct {
                     const slot = try self.declareLocal(d.name, false, true, null);
                     // 存形参类型，供 op_call_value 路径 caller-side coerce（修复 i8 字面量传入 i64 形参未 coerce 的 bug）
                     self.locals.items[slot].closure_param_types = try extractParamTypes(self.allocator, d.value.lambda.params);
+                    self.locals.items[slot].is_async_closure = d.value.lambda.is_async;
                     try self.chunk.writeOp(.op_unit, d.location);
                     try self.emitSlotOp(.op_set_local, slot, d.location);
                     const has_self_uv = try self.emitLambda(d.value.lambda, d.location, d.name);
@@ -2998,6 +3010,7 @@ const FnCompiler = struct {
                                     .is_var = false,
                                     .builtin_type = src.builtin_type,
                                     .closure_param_types = src.closure_param_types,
+                                    .is_async_closure = src.is_async_closure,
                                 });
                                 // slot_count 不变（复用已有 slot，不分配新 slot）
                                 // release_mask 不变（src_slot 的 bit 已由源声明设置）
@@ -3801,6 +3814,30 @@ fn isBuiltinNumericType(name: []const u8) bool {
     return false;
 }
 
+/// 判断类型名是否为并发原语引用类型（Atomic<T>/Channel<T>/Sender<T>/Receiver<T>）。
+/// 这些类型作为参数传递时需保留引用（用 op_get_local_raw），避免被 op_get_local
+/// 透明 load 解包成标量值，导致函数内的原子操作（fetchAdd 等）作用在副本上而非共享引用。
+/// 注意：paramTypeName 对 .generic 类型返回 base name（如 "Atomic"），所以这里匹配 base name。
+fn isConcurrentRefType(type_name: []const u8) bool {
+    const names = [_][]const u8{ "Atomic", "Channel", "Sender", "Receiver" };
+    for (names) |n| {
+        if (std.mem.eql(u8, type_name, n)) return true;
+    }
+    return false;
+}
+
+/// 从类型注解提取参数类型名（用于 param_types 数组）。
+/// 与 builtinTypeOf 不同，本函数也处理 .generic 类型（如 Atomic<i32> → "Atomic"），
+/// 因为并发原语参数需要通过类型名识别以保留引用。.generic 的 base name 足够判断并发原语。
+fn paramTypeName(ta: ?*const ast.TypeNode) ?[]const u8 {
+    const t = ta orelse return null;
+    return switch (t.*) {
+        .named => |n| n.name,
+        .generic => |g| g.name,
+        else => null,
+    };
+}
+
 /// 【JIT Phase 3】检查函数所有参数是否可安全 memoize。
 /// 所有类型（含无类型注解的参数）均允许——hashValueRecursive 基于运行时 Value
 /// 按内容递归 hash，引用类型在 VM 运行时守卫中跳过。此函数保留为 noop，未来可加编译期过滤。
@@ -3822,10 +3859,10 @@ fn builtinTypeOf(ta: ?*const ast.TypeNode) ?[]const u8 {
     };
 }
 
-/// 从形参列表提取基础类型名数组。
+/// 从形参列表提取参数类型名数组（含 .generic base name，用于并发原语识别）。
 fn extractParamTypes(allocator: std.mem.Allocator, params: []const ast.Param) ![]const ?[]const u8 {
     const result = try allocator.alloc(?[]const u8, params.len);
-    for (params, 0..) |p, i| result[i] = builtinTypeOf(p.type_annotation);
+    for (params, 0..) |p, i| result[i] = paramTypeName(p.type_annotation);
     return result;
 }
 
@@ -3834,7 +3871,7 @@ fn extractParamTypes(allocator: std.mem.Allocator, params: []const ast.Param) ![
 fn countExprNodes(expr: *const ast.Expr) u32 {
     return switch (expr.*) {
         .int_literal, .float_literal, .bool_literal, .char_literal, .string_literal, .string_interpolation, .identifier => 1,
-        .lambda, .spawn, .atomic_expr, .lazy, .select => 99, // 闭包/协程/并发原语不可内联
+        .lambda, .atomic_expr, .lazy, .select => 99, // 闭包/协程/并发原语不可内联
         .binary => |b| 1 + countExprNodes(b.left) + countExprNodes(b.right),
         .unary => |u| 1 + countExprNodes(u.operand),
         .call => |c| 1 + countExprNodes(c.callee) + blk: {
