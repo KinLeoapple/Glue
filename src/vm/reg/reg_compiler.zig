@@ -9,7 +9,10 @@ const value = @import("value");
 const reg_opcode = @import("reg_opcode.zig");
 const reg_chunk = @import("reg_chunk.zig");
 const reg_alloc = @import("reg_alloc.zig");
-const compiler = @import("../compiler.zig");
+const compiler = @import("vm");
+
+/// 再导出 reg_vm，使本模块作为 root_source_file 时 reg_vm.zig 可达
+pub const reg_vm = @import("reg_vm.zig");
 
 pub const CompileError = error{
     Unsupported,

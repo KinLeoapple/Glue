@@ -182,10 +182,11 @@ pub const RegProgram = struct {
     }
 };
 
-// 描述结构体复用栈式 chunk.zig 的定义（通过 re-export）
-pub const AdtCtorDesc = @import("../chunk.zig").AdtCtorDesc;
-pub const RecordShape = @import("../chunk.zig").RecordShape;
-pub const NewtypeCtorDesc = @import("../chunk.zig").NewtypeCtorDesc;
-pub const ErrorCtorDesc = @import("../chunk.zig").ErrorCtorDesc;
-pub const TraitMethodDesc = @import("../chunk.zig").TraitMethodDesc;
-pub const TraitDefaultDesc = @import("../chunk.zig").TraitDefaultDesc;
+// 描述结构体复用栈式 chunk.zig 的定义（通过 vm 模块 re-export）
+const vm_mod = @import("vm");
+pub const AdtCtorDesc = vm_mod.chunk.AdtCtorDesc;
+pub const RecordShape = vm_mod.chunk.RecordShape;
+pub const NewtypeCtorDesc = vm_mod.chunk.NewtypeCtorDesc;
+pub const ErrorCtorDesc = vm_mod.chunk.ErrorCtorDesc;
+pub const TraitMethodDesc = vm_mod.chunk.TraitMethodDesc;
+pub const TraitDefaultDesc = vm_mod.chunk.TraitDefaultDesc;
