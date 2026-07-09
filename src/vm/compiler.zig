@@ -710,6 +710,7 @@ pub const ModuleCompiler = struct {
             .chunk = fc.chunk,
             .arity = @intCast(m.params.len),
             .slot_count = fc.slot_count,
+            .ic_slot_count = fc.ic_slot_counter,
             .release_mask = fc.release_mask,
             .name = m.name,
         };
@@ -748,6 +749,7 @@ pub const ModuleCompiler = struct {
             .chunk = fc.chunk,
             .arity = arity,
             .slot_count = fc.slot_count,
+            .ic_slot_count = fc.ic_slot_counter,
             .release_mask = fc.release_mask,
             .name = name,
         };
@@ -795,6 +797,7 @@ pub const ModuleCompiler = struct {
             .chunk = fc.chunk,
             .arity = 0,
             .slot_count = fc.slot_count,
+            .ic_slot_count = fc.ic_slot_counter,
             .release_mask = fc.release_mask,
             .name = "<globals_init>",
         };
@@ -852,6 +855,7 @@ pub const ModuleCompiler = struct {
             .chunk = fc.chunk,
             .arity = @intCast(fd.params.len),
             .slot_count = fc.slot_count,
+            .ic_slot_count = fc.ic_slot_counter,
             .release_mask = fc.release_mask,
             .name = fd.name,
         };
@@ -1016,6 +1020,9 @@ const FnCompiler = struct {
     /// 【CSE】canonical 表达式 → 缓存 slot 映射。canonical emit 后 op_set_local 缓存结果，
     /// redundant emitExpr 命中 cseCanonical 时读此表发 op_get_local 替代重算。
     cse_slots: std.AutoHashMapUnmanaged(*const ast.Expr, u16) = .{},
+    /// 【方案 B：Inline Cache】本函数的 IC slot 计数器。每个 method_call call-site 分配一个。
+    /// 编译完成时写入 Function.ic_slot_count。
+    ic_slot_counter: u16 = 0,
 
     fn init(allocator: std.mem.Allocator, module: *ModuleCompiler) FnCompiler {
         var fc = FnCompiler{
@@ -1275,9 +1282,13 @@ const FnCompiler = struct {
                     }
                 }
                 const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, mc.method));
-                try self.chunk.writeOp(.op_call_method, loc);
+                // 【方案 B：Inline Cache】method_call 发射 op_call_method_ic 带 ic_slot
+                const ic_slot = self.ic_slot_counter;
+                self.ic_slot_counter += 1;
+                try self.chunk.writeOp(.op_call_method_ic, loc);
                 try self.chunk.writeU16(name_const);
                 try self.chunk.writeByte(@intCast(mc.arguments.len));
+                try self.chunk.writeU16(ic_slot);
             },
             // M3d：安全字段访问 obj?.field —— receiver null 短路返回 null，否则 OP_GET_FIELD。
             .safe_access => |sa| {
@@ -1308,9 +1319,13 @@ const FnCompiler = struct {
                     }
                 }
                 const name_const = try self.chunk.addConstant(try Value.fromStringBytes(self.allocator, smc.method));
-                try self.chunk.writeOp(.op_call_method, loc);
+                // 【方案 B：Inline Cache】safe_method_call 也发射 op_call_method_ic
+                const ic_slot = self.ic_slot_counter;
+                self.ic_slot_counter += 1;
+                try self.chunk.writeOp(.op_call_method_ic, loc);
                 try self.chunk.writeU16(name_const);
                 try self.chunk.writeByte(@intCast(smc.arguments.len));
+                try self.chunk.writeU16(ic_slot);
                 self.chunk.patchJump(skip); // null 分支落点：栈顶仍是 null
             },
             .match => |m| try self.emitMatch(m, loc),
@@ -2608,6 +2623,33 @@ const FnCompiler = struct {
             },
             else => {},
         }
+        // 【方案 C：指令融合】local ⊕ local → 融合指令（省 2 dispatch + 2 push/pop）
+        // 仅融合 add/sub/lt/gt/le/ge/eq/neq（算术比较热路径），不融合 div/mod（频率低）
+        // 不融合 bit_and/bit_or/bit_xor（避免 icache 压力，类型特化 opcode 教训）
+        // 融合指令直接读 slot（u16），不发射 op_get_local，结果直接压栈
+        if (bin.left.* == .identifier and bin.right.* == .identifier) {
+            const left_slot = self.resolveLocal(bin.left.identifier.name);
+            const right_slot = self.resolveLocal(bin.right.identifier.name);
+            if (left_slot != null and right_slot != null) {
+                const fused_op: ?OpCode = switch (bin.op) {
+                    .add => .op_add_local_local,
+                    .sub => .op_sub_local_local,
+                    .lt => .op_lt_local_local,
+                    .gt => .op_gt_local_local,
+                    .lt_eq => .op_le_local_local,
+                    .gt_eq => .op_ge_local_local,
+                    .eq => .op_eq_local_local,
+                    .not_eq => .op_neq_local_local,
+                    else => null,
+                };
+                if (fused_op) |fop| {
+                    try self.chunk.writeOp(fop, loc);
+                    try self.chunk.writeU16(left_slot.?);
+                    try self.chunk.writeU16(right_slot.?);
+                    return;
+                }
+            }
+        }
         try self.emitExpr(bin.left);
         try self.emitExpr(bin.right);
         const op: OpCode = switch (bin.op) {
@@ -3567,7 +3609,7 @@ const FnCompiler = struct {
 
 /// 软件解析整数字面量字符串 → Int（不依赖 u128/i128）。
 /// 支持符号（+/-）、进制前缀（0x/0o/0b）、下划线。不处理类型后缀。
-fn parseIntSoftware(raw: []const u8) ?value.Int {
+pub fn parseIntSoftware(raw: []const u8) ?value.Int {
     var s = raw;
     var negative = false;
     if (s.len > 0 and (s[0] == '-' or s[0] == '+')) {
@@ -3614,7 +3656,7 @@ fn parseIntSoftware(raw: []const u8) ?value.Int {
 
 /// 解析整数字面量为 Value（镜像 eval.zig evalIntLiteral 的默认最小类型推断）。
 /// 全软件：用 parseIntSoftware（不依赖 u128/i128）。
-fn parseIntLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefined).int_literal)) !?Value {
+pub fn parseIntLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefined).int_literal)) !?Value {
     _ = allocator;
 
     if (lit.suffix) |s| {
@@ -3634,7 +3676,7 @@ fn parseIntLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefine
 /// 支持符号、小数点、十进制指数（e/E）、下划线。
 /// 算法：解析为 digits + decimal_exp，digits 解析为 u128 Int，fromInt 转 f128，
 /// 再用快速幂乘/除 10^|decimal_exp|，最后应用符号。全精度，不丢精度。
-fn parseFloatSoftware(raw: []const u8) ?value.Float {
+pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
     var s = raw;
     var negative = false;
     if (s.len > 0 and (s[0] == '-' or s[0] == '+')) {
@@ -3786,7 +3828,7 @@ fn applyDecimalExp(base: value.Float, exp: i32) value.Float {
     }
 }
 
-fn parseFloatLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefined).float_literal)) !?Value {
+pub fn parseFloatLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(Expr, undefined).float_literal)) !?Value {
     _ = allocator;
     const fv = parseFloatSoftware(lit.raw) orelse return null;
     if (fv.isNan() or fv.isInfinite()) return null;
@@ -3930,7 +3972,8 @@ fn countStmtNodes(stmt: *const ast.Stmt) u32 {
 /// 控制流（return/throw/break/continue/propagate）跨函数边界内联会改变语义，必须排除。
 fn canInlineFn(name: []const u8, arity: usize, body: *const ast.Expr) bool {
     if (arity > 4) return false;
-    if (countExprNodes(body) > 32) return false;
+    // 【方案 E 增强】提高节点阈值 32→48，允许内联更多小函数
+    if (countExprNodes(body) > 48) return false;
     if (hasControlFlow(body)) return false;
     return !callsSelf(body, name);
 }
