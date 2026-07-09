@@ -1,0 +1,3 @@
+// Generated for Glue LLVM backend (Windows x64, LLVM 18.1.8)
+// Only X86 target is enabled for native codegen on this host.
+LLVM_TARGET(X86)
