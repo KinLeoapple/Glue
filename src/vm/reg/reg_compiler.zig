@@ -8,6 +8,8 @@ const ast = @import("ast");
 const value = @import("value");
 const reg_opcode = @import("reg_opcode.zig");
 const reg_chunk = @import("reg_chunk.zig");
+/// 再导出 reg_chunk，使外部模块（main.zig）可访问 RegProgram 等类型
+pub const reg_chunk_mod = reg_chunk;
 const reg_alloc = @import("reg_alloc.zig");
 const compiler = @import("vm");
 
@@ -30,6 +32,7 @@ const Local = struct {
     boxed: bool, // 是否持 boxed 值（用于 release_mask）
     def_inst: u32, // 该 local 的活跃区间起点（指令索引）
     last_use: u32, // 最后使用点（指令索引）
+    builtin_type: ?[]const u8 = null, // 声明类型名（用于 exprBuiltinType 推断）
 };
 
 const UpvalueInfo = struct {
@@ -65,6 +68,8 @@ pub const RegFnCompiler = struct {
     name: []const u8 = "",
     /// arity（参数数）
     arity: u8 = 0,
+    /// 所属模块编译器（用于函数名查找；null = 独立函数编译）
+    module: ?*RegModuleCompiler = null,
 
     pub fn init(allocator: std.mem.Allocator) RegFnCompiler {
         return .{
@@ -97,7 +102,7 @@ pub const RegFnCompiler = struct {
     }
 
     /// 声明局部变量
-    pub fn declareLocal(self: *RegFnCompiler, name: []const u8, is_var: bool, boxed: bool) !reg_alloc.VReg {
+    pub fn declareLocal(self: *RegFnCompiler, name: []const u8, is_var: bool, boxed: bool, builtin_type: ?[]const u8) !reg_alloc.VReg {
         const vreg = self.newVReg();
         const here: u32 = @intCast(self.chunk.here());
         try self.locals.append(self.allocator, .{
@@ -107,6 +112,7 @@ pub const RegFnCompiler = struct {
             .boxed = boxed,
             .def_inst = here,
             .last_use = here,
+            .builtin_type = builtin_type,
         });
         return vreg;
     }
@@ -119,6 +125,18 @@ pub const RegFnCompiler = struct {
             if (std.mem.eql(u8, self.locals.items[i].name, name)) {
                 self.locals.items[i].last_use = @intCast(self.chunk.here());
                 return self.locals.items[i].vreg;
+            }
+        }
+        return null;
+    }
+
+    /// 查找局部变量的声明类型名（用于 exprBuiltinType 推断）
+    pub fn resolveLocalType(self: *RegFnCompiler, name: []const u8) ?[]const u8 {
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.locals.items[i].name, name)) {
+                return self.locals.items[i].builtin_type;
             }
         }
         return null;
@@ -181,6 +199,60 @@ pub fn emitExpr(fc: *RegFnCompiler, expr: *const ast.Expr) CompileError!reg_allo
     };
 }
 
+// ── 类型推断 / 隐式定型（镜像栈式 compiler.zig 的 caller-side coerce）──
+
+/// 从类型注解提取参数类型名（.named/.generic 的 base name；其他 null）。
+fn paramTypeName(ta: ?*const ast.TypeNode) ?[]const u8 {
+    const t = ta orelse return null;
+    return switch (t.*) {
+        .named => |n| n.name,
+        .generic => |g| g.name,
+        else => null,
+    };
+}
+
+/// builtin 数值类型名判定（i*/u*/f*）。
+fn isBuiltinNumericType(name: []const u8) bool {
+    const nums = [_][]const u8{
+        "i8", "i16", "i32", "i64", "i128",
+        "u8", "u16", "u32", "u64", "u128",
+        "f16", "f32", "f64", "f128",
+    };
+    for (nums) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
+/// 推断表达式的 builtin 类型名（int/float/bool/char literal + identifier 可推断；
+/// binary/unary 算术递归左操作数；其他返回 null）。用于 caller-side coerce 判定。
+fn exprBuiltinType(fc: *RegFnCompiler, expr: *const ast.Expr) ?[]const u8 {
+    return switch (expr.*) {
+        .int_literal => |il| blk: {
+            if (il.suffix) |s| break :blk s;
+            const parsed = compiler.parseIntSoftware(il.raw) orelse break :blk null;
+            break :blk @tagName(parsed.type);
+        },
+        .float_literal => |fl| if (fl.suffix) |s| s else "f64",
+        .bool_literal => "bool",
+        .char_literal => "char",
+        .identifier => |id| blk: {
+            if (fc.resolveLocalType(id.name)) |bt| break :blk bt;
+            break :blk null;
+        },
+        .binary => |bin| if (isArithmeticOp(bin.op)) exprBuiltinType(fc, bin.left) else null,
+        .unary => |u| exprBuiltinType(fc, u.operand),
+        else => null,
+    };
+}
+
+fn isArithmeticOp(op: ast.BinaryOp) bool {
+    return switch (op) {
+        .add, .sub, .mul, .div, .mod => true,
+        else => false,
+    };
+}
+
 // ── 字面量发射 ──
 
 fn emitIntLiteral(fc: *RegFnCompiler, il: anytype, loc: ast.SourceLocation) !reg_alloc.VReg {
@@ -228,7 +300,7 @@ fn emitStringLiteral(fc: *RegFnCompiler, raw: []const u8, loc: ast.SourceLocatio
 
 fn emitCharLiteral(fc: *RegFnCompiler, codepoint: u21, loc: ast.SourceLocation) !reg_alloc.VReg {
     const dst = fc.newTemp();
-    const ch = try value.Char.fromCodePoint(codepoint);
+    const ch = value.Char.fromCodePoint(codepoint) catch return error.Unsupported;
     const k = try fc.chunk.addConstant(value.Value.fromChar(ch));
     try fc.chunk.writeABx(.load_const, @intCast(dst & 0xFF), k, loc);
     return dst;
@@ -396,17 +468,47 @@ fn emitBlock(fc: *RegFnCompiler, statements: []*ast.Stmt, trailing_expr: ?*const
 
 // ── call 发射 ──
 
-fn emitCall(fc: *RegFnCompiler, callee: *const ast.Expr, arguments: []*const ast.Expr, loc: ast.SourceLocation) !reg_alloc.VReg {
-    // 简化版：先支持命名函数调用
+fn emitCall(fc: *RegFnCompiler, callee: *const ast.Expr, arguments: []*ast.Expr, loc: ast.SourceLocation) !reg_alloc.VReg {
+    // 命名函数调用：通过 ModuleCompiler 查找 func_idx
     if (callee.* == .identifier) {
+        const name = callee.identifier.name;
         const dst = fc.newTemp();
+        // 内建函数（println/print 等）：先求值参数再 CALL_NATIVE
+        if (compiler.opcode_mod.Native.fromName(name)) |nat| {
+            for (arguments, 0..) |arg, i| {
+                const arg_vreg = try emitExpr(fc, arg);
+                try fc.chunk.writeABC(.move, @intCast((dst + 1 + i) & 0xFF), @intCast(arg_vreg & 0xFF), 0, loc);
+            }
+            try fc.chunk.writeABC(.call_native, @intCast(dst & 0xFF), @intFromEnum(nat), @intCast(arguments.len & 0xFF), loc);
+            return dst;
+        }
+        // 从 ModuleCompiler 查找函数索引
+        const func_idx: u16 = if (fc.module) |m|
+            (m.lookupFn(name) orelse return error.Unsupported)
+        else
+            return error.Unsupported;
+        // caller-side coerce：参数类型注解为 builtin 数值类型且与实参推断类型不符时发射 .coerce
+        const param_types: []const ?[]const u8 = if (fc.module) |m|
+            m.program.functions.items[func_idx].param_types
+        else
+            &.{};
         // 求值参数到连续寄存器 dst+1, dst+2, ...
         for (arguments, 0..) |arg, i| {
-            const arg_vreg = try emitExpr(fc, arg);
+            var arg_vreg = try emitExpr(fc, arg);
+            if (i < param_types.len) if (param_types[i]) |ptn| {
+                if (isBuiltinNumericType(ptn)) {
+                    const at = exprBuiltinType(fc, arg);
+                    if (at == null or !std.mem.eql(u8, at.?, ptn)) {
+                        const coerced = fc.newTemp();
+                        const type_k = try fc.chunk.addConstant(try value.Value.fromStringBytes(fc.allocator, ptn));
+                        try fc.chunk.writeABC(.coerce, @intCast(coerced & 0xFF), @intCast(arg_vreg & 0xFF), @intCast(type_k & 0xFF), loc);
+                        arg_vreg = coerced;
+                    }
+                }
+            };
             try fc.chunk.writeABC(.move, @intCast((dst + 1 + i) & 0xFF), @intCast(arg_vreg & 0xFF), 0, loc);
         }
-        // CALL dst, func_idx, argc — func_idx 需要 ModuleCompiler 查找，此处用占位 0
-        const func_idx: u16 = 0; // TODO: 从 ModuleCompiler 查找
+        // CALL A Bx — A=dst(结果寄存器), Bx=func_idx；argc 由 VM 从 callee.arity 读取
         try fc.chunk.writeABx(.call, @intCast(dst & 0xFF), func_idx, loc);
         return dst;
     }
@@ -435,7 +537,7 @@ fn emitFieldAccess(fc: *RegFnCompiler, object: *const ast.Expr, field: []const u
 
 // ── method_call ──
 
-fn emitMethodCall(fc: *RegFnCompiler, object: *const ast.Expr, method: []const u8, arguments: []*const ast.Expr, loc: ast.SourceLocation) !reg_alloc.VReg {
+fn emitMethodCall(fc: *RegFnCompiler, object: *const ast.Expr, method: []const u8, arguments: []*ast.Expr, loc: ast.SourceLocation) !reg_alloc.VReg {
     const recv_vreg = try emitExpr(fc, object);
     const dst = fc.newTemp();
     // receiver 放 dst，args 放 dst+1, dst+2...
@@ -452,7 +554,7 @@ fn emitMethodCall(fc: *RegFnCompiler, object: *const ast.Expr, method: []const u
 
 // ── array_literal ──
 
-fn emitArrayLiteral(fc: *RegFnCompiler, elements: []*const ast.Expr, loc: ast.SourceLocation) !reg_alloc.VReg {
+fn emitArrayLiteral(fc: *RegFnCompiler, elements: []*ast.Expr, loc: ast.SourceLocation) !reg_alloc.VReg {
     const dst = fc.newTemp();
     for (elements, 0..) |elem, i| {
         const elem_vreg = try emitExpr(fc, elem);
@@ -599,7 +701,7 @@ fn emitPatternTest(fc: *RegFnCompiler, pat: *const ast.Pattern, scrut_vreg: reg_
         .wildcard => null, // 通配符总是匹配
         .variable => |v| blk: {
             // 变量绑定：声明局部并 MOVE scrut → local
-            _ = try fc.declareLocal(v.name, false, false);
+            _ = try fc.declareLocal(v.name, false, false, null);
             const local_vreg = fc.resolveLocal(v.name).?;
             try fc.chunk.writeABC(.move, @intCast(local_vreg & 0xFF), @intCast(scrut_vreg & 0xFF), 0, loc);
             break :blk null;
@@ -628,7 +730,7 @@ fn addPatternLiteralConstant(fc: *RegFnCompiler, lit: ast.PatternLiteral) !u16 {
         },
         .bool => |b| try fc.chunk.addConstant(value.Value.fromBool(b)),
         .char => |c| blk: {
-            const ch = try value.Char.fromCodePoint(c);
+            const ch = value.Char.fromCodePoint(c) catch return error.Unsupported;
             break :blk try fc.chunk.addConstant(value.Value.fromChar(ch));
         },
         .string => |s| try fc.chunk.addConstant(try value.Value.fromStringBytes(fc.allocator, s)),
@@ -672,14 +774,14 @@ pub fn emitStmt(fc: *RegFnCompiler, stmt: *const ast.Stmt) CompileError!void {
 
 fn emitValDecl(fc: *RegFnCompiler, name: []const u8, val_expr: *const ast.Expr, loc: ast.SourceLocation) !void {
     const rhs_vreg = try emitExpr(fc, val_expr);
-    _ = try fc.declareLocal(name, false, false);
+    _ = try fc.declareLocal(name, false, false, null);
     const local_vreg = fc.resolveLocal(name).?;
     try fc.chunk.writeABC(.bind, @intCast(local_vreg & 0xFF), @intCast(rhs_vreg & 0xFF), 0, loc);
 }
 
 fn emitVarDecl(fc: *RegFnCompiler, name: []const u8, val_expr: *const ast.Expr, loc: ast.SourceLocation) !void {
     const rhs_vreg = try emitExpr(fc, val_expr);
-    _ = try fc.declareLocal(name, true, false);
+    _ = try fc.declareLocal(name, true, false, null);
     const local_vreg = fc.resolveLocal(name).?;
     try fc.chunk.writeABC(.bind, @intCast(local_vreg & 0xFF), @intCast(rhs_vreg & 0xFF), 0, loc);
 }
@@ -709,7 +811,7 @@ fn emitWhile(fc: *RegFnCompiler, condition: *const ast.Expr, body: *const ast.Ex
     // exit 落点
     fc.chunk.patchJump(exit_jump, fc.chunk.here());
     // patch breaks
-    const lc = fc.loops.pop();
+    var lc = fc.loops.pop() orelse return error.InvalidJump;
     for (lc.breaks.items) |br| fc.chunk.patchJump(br, fc.chunk.here());
     lc.breaks.deinit(fc.allocator);
 }
@@ -723,7 +825,7 @@ fn emitFor(fc: *RegFnCompiler, var_name: []const u8, iterable: *const ast.Expr, 
     try fc.chunk.writeABC(.load_null, @intCast(zero_vreg & 0xFF), 0, 0, loc);
     try fc.chunk.writeABC(.move, @intCast(idx_vreg & 0xFF), @intCast(zero_vreg & 0xFF), 0, loc);
     // 声明循环变量
-    _ = try fc.declareLocal(var_name, false, false);
+    _ = try fc.declareLocal(var_name, false, false, null);
     const var_vreg = fc.resolveLocal(var_name).?;
 
     const loop_start = fc.chunk.here();
@@ -740,7 +842,7 @@ fn emitFor(fc: *RegFnCompiler, var_name: []const u8, iterable: *const ast.Expr, 
     const offset: i32 = @intCast(@as(i64, @intCast(loop_start)) - @as(i64, @intCast(fc.chunk.here() + 1)));
     try fc.chunk.writesBx(.jump, 0, offset, loc);
     fc.chunk.patchJump(exit_jump, fc.chunk.here());
-    const lc = fc.loops.pop();
+    var lc = fc.loops.pop() orelse return error.InvalidJump;
     for (lc.breaks.items) |br| fc.chunk.patchJump(br, fc.chunk.here());
     lc.breaks.deinit(fc.allocator);
 }
@@ -757,7 +859,7 @@ fn emitLoop(fc: *RegFnCompiler, body: *const ast.Expr, loc: ast.SourceLocation) 
     const offset: i32 = @intCast(@as(i64, @intCast(loop_start)) - @as(i64, @intCast(fc.chunk.here() + 1)));
     try fc.chunk.writesBx(.jump, 0, offset, loc);
     // break 落点
-    const lc = fc.loops.pop();
+    var lc = fc.loops.pop() orelse return error.InvalidJump;
     for (lc.breaks.items) |br| fc.chunk.patchJump(br, fc.chunk.here());
     lc.breaks.deinit(fc.allocator);
 }
@@ -823,3 +925,124 @@ fn emitDefer(fc: *RegFnCompiler, expr: *const ast.Expr, loc: ast.SourceLocation)
     _ = try emitExpr(fc, expr);
     _ = loc;
 }
+
+// ============================================================
+// 模块级编译器：AST Module → RegProgram
+// ============================================================
+
+/// 模块编译器：消费 ast.Module，产出 RegProgram（持有所有 RegFunction）。
+/// 两遍编译：第一遍登记函数名→索引，第二遍编译函数体（使前向引用合法）。
+pub const RegModuleCompiler = struct {
+    program: reg_chunk.RegProgram,
+    allocator: std.mem.Allocator,
+    /// 顶层函数表：name → func_idx
+    fn_map: std.StringHashMap(u16),
+
+    pub fn init(allocator: std.mem.Allocator) RegModuleCompiler {
+        return .{
+            .program = reg_chunk.RegProgram.init(allocator),
+            .allocator = allocator,
+            .fn_map = std.StringHashMap(u16).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *RegModuleCompiler) void {
+        self.fn_map.deinit();
+        // program 所有权移交调用方；此处不 deinit。
+    }
+
+    /// 查找顶层函数索引
+    pub fn lookupFn(self: *RegModuleCompiler, name: []const u8) ?u16 {
+        return self.fn_map.get(name);
+    }
+
+    /// 编译入口模块 + 其 `use` 依赖模块。依赖在前，入口在后（入口可前向引用依赖）。
+    pub fn compileModuleWithDeps(self: *RegModuleCompiler, module: *const ast.Module, deps: []const ast.Module) CompileError!void {
+        // 第一遍：登记所有模块的顶层函数名
+        for (deps) |*dep| try self.registerDecls(dep);
+        try self.registerDecls(module);
+        // 第二遍：编译所有模块的函数体
+        for (deps) |*dep| try self.compileBodies(dep);
+        try self.compileBodies(module);
+        // 设置 entry
+        if (self.lookupFn("main")) |m| self.program.entry = m;
+    }
+
+    /// 第一遍：登记模块的顶层函数声明
+    fn registerDecls(self: *RegModuleCompiler, module: *const ast.Module) CompileError!void {
+        for (module.declarations) |decl| {
+            switch (decl) {
+                .fun_decl => |fd| {
+                    // 同名函数已登记（依赖与入口重名）→ 跳过（首个生效）
+                    if (self.fn_map.contains(fd.name)) continue;
+                    const idx: u16 = @intCast(self.program.functions.items.len);
+                    try self.fn_map.put(fd.name, idx);
+                    // 提取参数类型名（caller-side coerce 用；字符串借用 AST 生命周期）
+                    var ptypes: []?[]const u8 = &.{};
+                    if (fd.params.len > 0) {
+                        ptypes = self.program.allocator.alloc(?[]const u8, fd.params.len) catch return error.OutOfMemory;
+                        for (fd.params, 0..) |p, i| {
+                            ptypes[i] = paramTypeName(p.type_annotation);
+                        }
+                    }
+                    // 预占位：空 chunk，第二遍编译时覆盖
+                    try self.program.functions.append(self.allocator, .{
+                        .chunk = reg_chunk.RegChunk.init(self.allocator),
+                        .arity = @intCast(fd.params.len),
+                        .name = fd.name,
+                        .param_types = ptypes,
+                    });
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// 第二遍：编译模块的函数体
+    fn compileBodies(self: *RegModuleCompiler, module: *const ast.Module) CompileError!void {
+        for (module.declarations) |decl| {
+            switch (decl) {
+                .fun_decl => |fd| try self.compileFunction(fd),
+                else => {},
+            }
+        }
+    }
+
+    /// 编译单个函数体
+    fn compileFunction(self: *RegModuleCompiler, fd: anytype) CompileError!void {
+        var fc = RegFnCompiler.init(self.allocator);
+        fc.module = self;
+        fc.name = fd.name;
+        fc.arity = @intCast(fd.params.len);
+        defer fc.deinit();
+
+        // 声明参数为局部变量（占 VReg 0..arity-1，与 VM setupFrame 的参数布局一致）
+        for (fd.params) |p| {
+            _ = try fc.declareLocal(p.name, p.is_var, false, paramTypeName(p.type_annotation));
+        }
+
+        // 编译函数体（尾位置）
+        const loc = fd.location;
+        const body_vreg = try emitExpr(&fc, fd.body);
+        // 隐式 return（函数体无显式 return 时执行；有 return 时为死代码）
+        try fc.chunk.writeABC(.return_op, @intCast(body_vreg & 0xFF), 0, 0, loc);
+
+        // 覆盖第一遍预留的占位槽
+        const idx = self.lookupFn(fd.name).?;
+        self.program.functions.items[idx].chunk.deinit(); // 释放占位空 chunk
+        self.program.functions.items[idx].chunk = fc.chunk; // 移交所有权
+        self.program.functions.items[idx].arity = @intCast(fd.params.len);
+        self.program.functions.items[idx].register_count = @intCast(fc.next_vreg);
+        // release_mask：简化版 — 标记所有寄存器需 release（bit i=1）
+        // release(null/unit/int/float) 是安全的无操作，只有 boxed 值真正减引用计数
+        const nreg: u6 = @intCast(@min(fc.next_vreg, 64));
+        if (nreg == 64) {
+            self.program.functions.items[idx].release_mask = ~@as(u64, 0);
+        } else if (nreg > 0) {
+            self.program.functions.items[idx].release_mask = (@as(u64, 1) << nreg) - 1;
+        }
+
+        // 防止 fc.deinit 释放已移交的 chunk（置空壳）
+        fc.chunk = reg_chunk.RegChunk.init(self.allocator);
+    }
+};

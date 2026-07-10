@@ -298,6 +298,19 @@ const StdinState = struct {
     reader: std.Io.File.Reader,
 };
 
+/// 【方案 B：Inline Cache / PIC】单态内联缓存槽。
+/// 缓存 receiver 的 value tag（u8 active enum tag）+ method_id。
+/// 命中条件：receiver 的 active tag == cached_tag（monomorphic 假设）。
+/// 多态场景（receiver 类型频繁变化）会频繁 miss，但仍走 fallback 正确分派。
+const IcSlot = struct {
+    cached_tag: u8 = 0, // 0 = empty
+    method_id: method.MethodId = .unknown,
+    // 缓存内建方法命中结果的处理方式：
+    //   true  → 内建方法命中（dispatchById 返回非 null），直接走内建路径
+    //   false → 非内建方法（trait/用户方法），走 doCallMethod 完整路径
+    is_builtin: bool = false,
+};
+
 pub const VM = struct {
     /// 操作数栈：局部变量也住这里（slot_base + slot 索引）。
     stack: std.ArrayListUnmanaged(Value) = .empty,
@@ -305,6 +318,12 @@ pub const VM = struct {
     frames: std.ArrayListUnmanaged(CallFrame) = .empty,
     /// 值分配器（与求值器 value_allocator 同源，refcount 字节走这里）。
     allocator: std.mem.Allocator,
+
+    /// 【方案 B：Inline Cache / PIC】全局 IC slot 池。
+    /// 每个 call-site 对应一个 IcSlot，缓存 (receiver_tag, method_id)。
+    /// 命中时跳过 fromName 字符串比较 + dispatchById 的 switch 分派。
+    /// monomorphic IC：只缓存最近一次的 receiver 类型。
+    ic_slots: std.ArrayListUnmanaged(IcSlot) = .empty,
     /// ThreadCache 指针（非空时 VM 热路径走 TypedPool acquire/release，绕过 vtable 间接调用）。
     /// 主 VM 由 initWithCache 注入；spawn 子 VM 为 null（用 SlabAllocator.allocator() 直连）。
     cache: ?*slab_allocator.ThreadCache = null,
@@ -486,6 +505,8 @@ pub const VM = struct {
         // 【Memoization 扩展】清理 per-slot miss 跟踪表与禁用集合（无 owned 引用）。
         self.memo_slot_misses.deinit(self.allocator);
         self.memo_disabled_slots.deinit(self.allocator);
+        // 【方案 B：Inline Cache】清理 IC slot 池（无 owned 引用，仅清空数组）。
+        self.ic_slots.deinit(self.allocator);
     }
 
     /// M4d：从 channel/sender/receiver 值取底层 *ChannelValue（select arm 用）。其它类型返回 null。
@@ -1078,6 +1099,58 @@ pub const VM = struct {
                     stack_ptr[stack_len] = try self.doCompare(op, left, right, func.chunk.locAt(op_off));
                     stack_len += 1;
                 },
+                // 【方案 C：指令融合】local ⊕ local → 单条指令读两 slot + 运算 + 压结果
+                // 省 2 dispatch（get_local×2）+ 2 push/pop。仅处理 fast path（内联值），
+                // boxed 值（cell/atomic/lazy）走 slow path 透明解包。
+                .op_add_local_local, .op_sub_local_local, .op_lt_local_local, .op_gt_local_local,
+                .op_le_local_local, .op_ge_local_local, .op_eq_local_local, .op_neq_local_local => {
+                    const left_slot = opcode.readU16Ptr(ip_ptr);
+                    ip_ptr += 2;
+                    const right_slot = opcode.readU16Ptr(ip_ptr);
+                    ip_ptr += 2;
+                    const left_cur = stack_ptr[slot_base + left_slot];
+                    const right_cur = stack_ptr[slot_base + right_slot];
+                    // 透明解 cell + atomic（lazy 不支持透明 force 在融合路径，fallback 到 slow path）
+                    const left_val = if (left_cur == .cell) left_cur.cell.inner else left_cur;
+                    const right_val = if (right_cur == .cell) right_cur.cell.inner else right_cur;
+                    // 判断是算术还是比较
+                    const is_compare = op == .op_lt_local_local or op == .op_gt_local_local or
+                        op == .op_le_local_local or op == .op_ge_local_local or
+                        op == .op_eq_local_local or op == .op_neq_local_local;
+                    // 映射回通用 opcode
+                    const generic_op: OpCode = switch (op) {
+                        .op_add_local_local => .op_add,
+                        .op_sub_local_local => .op_sub,
+                        .op_lt_local_local => .op_lt,
+                        .op_gt_local_local => .op_gt,
+                        .op_le_local_local => .op_le,
+                        .op_ge_local_local => .op_ge,
+                        .op_eq_local_local => .op_eq,
+                        .op_neq_local_local => .op_neq,
+                        else => unreachable,
+                    };
+                    // fast path：两边都是内联值（int/float/bool/char，非 boxed）
+                    if (!left_val.isBoxed() and !right_val.isBoxed()) {
+                        const result = if (is_compare)
+                            try self.doCompare(generic_op, left_val, right_val, func.chunk.locAt(op_off))
+                        else
+                            try self.doArith(generic_op, left_val, right_val, func.chunk.locAt(op_off));
+                        stack_ptr[stack_len] = result;
+                        stack_len += 1;
+                    } else {
+                        // slow path：retainOwned 后走通用算术/比较（结果压栈，释放操作数）
+                        const left_owned = try self.retainOwned(left_val);
+                        const right_owned = try self.retainOwned(right_val);
+                        defer self.releaseValue(left_owned, self.allocator);
+                        defer self.releaseValue(right_owned, self.allocator);
+                        const result = if (is_compare)
+                            try self.doCompare(generic_op, left_owned, right_owned, func.chunk.locAt(op_off))
+                        else
+                            try self.doArith(generic_op, left_owned, right_owned, func.chunk.locAt(op_off));
+                        stack_ptr[stack_len] = result;
+                        stack_len += 1;
+                    }
+                },
                 .op_neg => {
                     const v = blk: { stack_len -= 1; break :blk stack_ptr[stack_len]; };
                     defer self.releaseValue(v, self.allocator);
@@ -1628,6 +1701,80 @@ pub const VM = struct {
                     try self.doCallMethod(func, name_idx, argc, func.chunk.locAt(op_off));
                     // doCallMethod 可能压新帧，刷新缓存（func 局部变量已被 doCallMethod 使用完毕）。
                     self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
+                },
+                // 【方案 B：Inline Cache / PIC】带 IC 的方法调用。
+                // 命中：跳过 fromName + dispatchById 的 switch，直接按缓存路径执行。
+                // miss：走 doCallMethod 完整路径，然后填充 IC slot。
+                .op_call_method_ic => {
+                    const name_idx = opcode.readU16Ptr(ip_ptr);
+                    ip_ptr += 2;
+                    const argc = ip_ptr[0];
+                    ip_ptr += 1;
+                    const ic_slot = opcode.readU16Ptr(ip_ptr);
+                    ip_ptr += 2;
+                    if (self.profiler) |p| p.recordMethodCall();
+
+                    // 确保 ic_slots 数组足够大
+                    if (ic_slot >= self.ic_slots.items.len) {
+                        try self.ic_slots.resize(self.allocator, ic_slot + 1);
+                        // 新增的 slot 自动初始化为 IcSlot 默认值（cached_tag=0=empty）
+                    }
+                    const slot_ptr = &self.ic_slots.items[ic_slot];
+                    const receiver = stack_ptr[stack_len - 1 - argc]; // receiver 在 args 下方
+                    const recv_tag: u8 = @intFromEnum(receiver);
+
+                    // IC 命中检查：tag 匹配 + method_id 匹配
+                    if (slot_ptr.cached_tag == recv_tag and slot_ptr.method_id != .unknown) {
+                        if (slot_ptr.is_builtin and recv_tag != @intFromEnum(Value.spawn_val) and recv_tag != @intFromEnum(Value.trait_value)) {
+                            // 内建方法命中：直接走 dispatchById fast path
+                            const args_start = stack_len - argc;
+                            const args = stack_ptr[args_start..][0..argc];
+                            const result_opt = method.dispatchById(self.allocator, receiver, slot_ptr.method_id, args) catch |err| switch (err) {
+                                error.NoSuchMethod => null,
+                                error.WrongArity => {
+                                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
+                                    return self.fail(func.chunk.locAt(op_off), "method called with wrong number of arguments", error.WrongArity);
+                                },
+                                error.TypeMismatch => {
+                                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
+                                    return self.fail(func.chunk.locAt(op_off), "method not available on this type", error.TypeMismatch);
+                                },
+                                error.ChannelClosed => {
+                                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
+                                    return self.fail(func.chunk.locAt(op_off), "channel: send on closed channel", error.TypeMismatch);
+                                },
+                                error.ArithmeticOverflow => {
+                                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
+                                    return self.fail(func.chunk.locAt(op_off), "method result out of range", error.ArithmeticOverflow);
+                                },
+                                error.OutOfMemory => return error.OutOfMemory,
+                            };
+                            if (result_opt) |result| {
+                                // 内建方法命中：释放实参 + receiver，压结果
+                                for (args) |a| a.release(self.allocator);
+                                receiver.release(self.allocator);
+                                stack_len = args_start - 1;
+                                stack_ptr[stack_len] = result;
+                                stack_len += 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // IC miss 或内建路径失败：走完整 doCallMethod
+                    self.syncWriteback(frame, ip_ptr, code.ptr, stack_len);
+                    try self.doCallMethod(func, name_idx, argc, func.chunk.locAt(op_off));
+                    self.reloadFrame(&frame, &func, &code, &slot_base, &ip_ptr, &stack_ptr, &stack_len, &stack_cap);
+
+                    // 填充 IC slot（doCallMethod 已释放 receiver，但我们仍知道其 tag）
+                    // 注意：doCallMethod 后栈已变，不能再用 receiver 变量
+                    // 用 method name 计算 method_id，判断是否内建
+                    const name_val = func.chunk.constants.items[name_idx];
+                    const name = name_val.string.bytes();
+                    const mid = method.MethodId.fromName(name);
+                    slot_ptr.cached_tag = recv_tag;
+                    slot_ptr.method_id = mid;
+                    slot_ptr.is_builtin = (mid != .unknown);
                 },
                 // OP_PUSH_INPLACE <u16 slot>：arr = arr.push(x) 模式优化。
                 // 弹栈顶 arg。读 slot 的数组 v（不 retain）。rc==1 时原地扩容，否则 fallback 通用 push。
@@ -2914,6 +3061,31 @@ pub const VM = struct {
         const args_start = self.stack.items.len - argc;
         const args = self.stack.items[args_start..][0..argc];
         const receiver = self.stack.items[args_start - 1];
+
+        // 【方案 A：方法分派 ID 化】先尝试内建方法 ID 分派（switch jump table，O(1)）
+        // 命中则直接返回；未命中（null）走 trait/用户方法路径
+        const method_id = method.MethodId.fromName(name);
+        if (method_id != .unknown) {
+            // spawn_val 的 await/cancel 需 VM 级处理，不走 dispatchById
+            if (receiver != .spawn_val and receiver != .trait_value) {
+                const result_opt = method.dispatchById(self.allocator, receiver, method_id, args) catch |err| switch (err) {
+                    error.NoSuchMethod => null, // 走下方 trait 路径
+                    error.WrongArity => return self.fail(loc, "method called with wrong number of arguments", error.WrongArity),
+                    error.TypeMismatch => return self.fail(loc, "method not available on this type", error.TypeMismatch),
+                    error.ChannelClosed => return self.fail(loc, "channel: send on closed channel", error.TypeMismatch),
+                    error.ArithmeticOverflow => return self.fail(loc, "method result out of range", error.ArithmeticOverflow),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                if (result_opt) |result| {
+                    // 内建方法命中：释放实参 + receiver，压结果
+                    for (args) |a| a.release(self.allocator);
+                    receiver.release(self.allocator);
+                    self.stack.shrinkRetainingCapacity(args_start - 1);
+                    try self.push(result);
+                    return;
+                }
+            }
+        }
 
         // M5e：Error trait 内置方法：message() 和 type_name()
         // 这些方法直接从 error_val 或 throw_val.err 中提取字段值

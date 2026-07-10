@@ -13,6 +13,235 @@ const Int = value.Int;
 
 pub const MethodError = error{ OutOfMemory, NoSuchMethod, TypeMismatch, WrongArity, ChannelClosed, ArithmeticOverflow };
 
+/// 【方案 A：方法分派 ID 化】
+/// 编译期内建方法名 → u8 id，运行时用 switch(id) 替代字符串比较链。
+/// unknown 表示非内建方法（需走 trait/用户方法分派路径）。
+pub const MethodId = enum(u8) {
+    unknown = 0,
+    len,
+    is_empty,
+    push,
+    pop,
+    first,
+    last,
+    contains,
+    drop_last,
+    cas,
+    swap,
+    send,
+    recv,
+    close,
+    message,
+    type_name,
+
+    pub fn fromName(name: []const u8) MethodId {
+        // 仍用字符串比较，但只在 call site 做一次，运行时分派走 switch(id)
+        if (name.len == 3) {
+            if (name[0] == 'l' and name[1] == 'e' and name[2] == 'n') return .len;
+            if (name[0] == 'p' and name[1] == 'o' and name[2] == 'p') return .pop;
+            if (name[0] == 'c' and name[1] == 'a' and name[2] == 's') return .cas;
+            return .unknown;
+        }
+        if (name.len == 4) {
+            if (name[0] == 's' and name[1] == 'e' and name[2] == 'n' and name[3] == 'd') return .send;
+            if (name[0] == 'r' and name[1] == 'e' and name[2] == 'c' and name[3] == 'v') return .recv;
+            return .unknown;
+        }
+        if (name.len == 5) {
+            if (name[0] == 'f' and name[1] == 'i' and name[2] == 'r' and name[3] == 's' and name[4] == 't') return .first;
+            if (name[0] == 'l' and name[1] == 'a' and name[2] == 's' and name[3] == 't') return .last;
+            if (name[0] == 'c' and name[1] == 'l' and name[2] == 'o' and name[3] == 's' and name[4] == 'e') return .close;
+            if (name[0] == 's' and name[1] == 'w' and name[2] == 'a' and name[3] == 'p') return .swap;
+            return .unknown;
+        }
+        if (name.len == 6) {
+            if (std.mem.eql(u8, name, "push")) return .push; // len 4, 不会到这
+            return .unknown;
+        }
+        if (name.len == 7) {
+            if (std.mem.eql(u8, name, "message")) return .message;
+            return .unknown;
+        }
+        if (name.len == 8) {
+            if (std.mem.eql(u8, name, "contains")) return .contains;
+            if (std.mem.eql(u8, name, "drop_last")) return .drop_last;
+            if (std.mem.eql(u8, name, "is_empty")) return .is_empty;
+            if (std.mem.eql(u8, name, "type_name")) return .type_name;
+            return .unknown;
+        }
+        return .unknown;
+    }
+};
+
+/// 【方案 A】按 MethodId 分派内建方法。
+/// 返回 null 表示非内建方法（调用方应走 trait/用户方法路径）。
+/// 返回 Value 表示内建方法已处理（调用方负责释放 receiver + args）。
+pub fn dispatchById(allocator: std.mem.Allocator, receiver: Value, method_id: MethodId, args: []const Value) MethodError!?Value {
+    switch (method_id) {
+        .unknown => return null,
+        .len => {
+            if (args.len != 0) return error.WrongArity;
+            return switch (receiver) {
+                .string => blk: {
+                    const n = utf8Len(receiver.string.bytes());
+                    const len_i32 = std.math.cast(i32, n) orelse return error.ArithmeticOverflow;
+                    break :blk Value.fromInt(Int.fromNative(.i32, len_i32));
+                },
+                .array => blk: {
+                    const n = receiver.array.elements.len;
+                    const len_i32 = std.math.cast(i32, n) orelse return error.ArithmeticOverflow;
+                    break :blk Value.fromInt(Int.fromNative(.i32, len_i32));
+                },
+                else => error.TypeMismatch,
+            };
+        },
+        .is_empty => {
+            if (args.len != 0) return error.WrongArity;
+            return switch (receiver) {
+                .string => Value.fromBool(receiver.string.bytes().len == 0),
+                .array => Value.fromBool(receiver.array.elements.len == 0),
+                else => error.TypeMismatch,
+            };
+        },
+        .push => {
+            if (args.len != 1) return error.WrongArity;
+            if (receiver != .array) return error.TypeMismatch;
+            const arr = receiver.array;
+            const new_elems = try allocator.alloc(Value, arr.elements.len + 1);
+            for (arr.elements, 0..) |e, i| new_elems[i] = try retainOwned(allocator, e);
+            new_elems[arr.elements.len] = try retainOwned(allocator, args[0]);
+            return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
+        },
+        .pop => {
+            if (args.len != 0) return error.WrongArity;
+            if (receiver != .array) return error.TypeMismatch;
+            const arr = receiver.array;
+            if (arr.elements.len == 0) return Value.fromNull();
+            return try retainOwned(allocator, arr.elements[arr.elements.len - 1]);
+        },
+        .first => {
+            if (args.len != 0) return error.WrongArity;
+            if (receiver != .array) return error.TypeMismatch;
+            const arr = receiver.array;
+            if (arr.elements.len == 0) return Value.fromNull();
+            return try retainOwned(allocator, arr.elements[0]);
+        },
+        .last => {
+            if (args.len != 0) return error.WrongArity;
+            if (receiver != .array) return error.TypeMismatch;
+            const arr = receiver.array;
+            if (arr.elements.len == 0) return Value.fromNull();
+            return try retainOwned(allocator, arr.elements[arr.elements.len - 1]);
+        },
+        .contains => {
+            if (args.len != 1) return error.WrongArity;
+            if (receiver != .array) return error.TypeMismatch;
+            const arr = receiver.array;
+            for (arr.elements) |item| {
+                if (structEquals(item, args[0])) return Value.fromBool(true);
+            }
+            return Value.fromBool(false);
+        },
+        .drop_last => {
+            if (args.len != 0) return error.WrongArity;
+            if (receiver != .array) return error.TypeMismatch;
+            const arr = receiver.array;
+            const n = if (arr.elements.len == 0) 0 else arr.elements.len - 1;
+            const new_elems = try allocator.alloc(Value, n);
+            for (arr.elements[0..n], 0..) |e, i| new_elems[i] = try retainOwned(allocator, e);
+            return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
+        },
+        .cas, .swap => {
+            // Atomic<T> 方法
+            if (receiver != .atomic_val) return null; // 非 Atomic，让上层处理
+            const av = receiver.atomic_val;
+            const isScalar = struct {
+                fn check(v: Value) bool {
+                    return switch (v) {
+                        .int, .float, .boolean, .char => true,
+                        else => false,
+                    };
+                }
+            };
+            switch (method_id) {
+                .cas => {
+                    if (args.len != 2) return error.WrongArity;
+                    if (!isScalar.check(args[0]) or !isScalar.check(args[1])) return error.TypeMismatch;
+                    return Value.fromBool(av.cas(args[0], args[1]));
+                },
+                .swap => {
+                    if (args.len != 1) return error.WrongArity;
+                    if (!isScalar.check(args[0])) return error.TypeMismatch;
+                    return av.xchg(args[0]);
+                },
+                else => unreachable,
+            }
+        },
+        .send, .recv, .close => {
+            // Channel<T>/Sender<T>/Receiver<T> 方法
+            return switch (receiver) {
+                .channel_val => blk: {
+                    const ch = receiver.channel_val;
+                    switch (method_id) {
+                        .send => {
+                            if (args.len != 1) return error.WrongArity;
+                            const owned = try retainOwned(allocator, args[0]);
+                            const ok = ch.send(owned) catch return error.OutOfMemory;
+                            if (!ok) {
+                                owned.release(allocator);
+                                return error.ChannelClosed;
+                            }
+                            break :blk Value.fromUnit();
+                        },
+                        .recv => {
+                            if (args.len != 0) return error.WrongArity;
+                            break :blk ch.recv() orelse Value.fromNull();
+                        },
+                        else => break :blk null, // close 仅 Sender
+                    }
+                },
+                .sender_val => blk: {
+                    const sv = receiver.sender_val;
+                    switch (method_id) {
+                        .send => {
+                            if (args.len != 1) return error.WrongArity;
+                            const owned = try retainOwned(allocator, args[0]);
+                            const ok = sv.channel.send(owned) catch return error.OutOfMemory;
+                            if (!ok) {
+                                owned.release(allocator);
+                                return error.ChannelClosed;
+                            }
+                            break :blk Value.fromUnit();
+                        },
+                        .close => {
+                            if (args.len != 0) return error.WrongArity;
+                            sv.channel.close();
+                            break :blk Value.fromUnit();
+                        },
+                        else => break :blk null,
+                    }
+                },
+                .receiver_val => blk: {
+                    const rv = receiver.receiver_val;
+                    switch (method_id) {
+                        .recv => {
+                            if (args.len != 0) return error.WrongArity;
+                            break :blk rv.channel.recv() orelse Value.fromNull();
+                        },
+                        else => break :blk null,
+                    }
+                },
+                else => null, // 非通道类型，让上层处理
+            };
+        },
+        .message, .type_name => {
+            // Error trait 内置方法 —— 这些在 doCallMethod 中已有特殊处理（需访问 error_val/throw_val 字段）
+            // 返回 null 让上层处理（避免重复逻辑）
+            return null;
+        },
+    }
+}
+
 /// 结构相等（contains 用）。复用 value.equals（深比较基础/数组/记录）。
 fn structEquals(a: Value, b: Value) bool {
     return value.equals(a, b);

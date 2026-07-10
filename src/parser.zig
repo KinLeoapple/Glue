@@ -3298,6 +3298,7 @@ pub const Parser = struct {
                     .location = tokenLoc(fun_tok),
                     .params = try params.toOwnedSlice(self.allocator),
                     .body = body,
+                    .return_type = return_type,
                 },
             });
 

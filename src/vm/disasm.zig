@@ -66,6 +66,22 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, buf: *Buf, all
             try print(buf, allocator, "{s} name#{d} argc={d}\n", .{ op.name(), name_idx, argc });
             return offset + 4;
         },
+        // 【方案 B】OP_CALL_METHOD_IC <u16 name_idx><u8 argc><u16 ic_slot>
+        .op_call_method_ic => {
+            const name_idx = opcode.readU16(code, offset + 1);
+            const argc = code[offset + 3];
+            const ic_slot = opcode.readU16(code, offset + 4);
+            try print(buf, allocator, "{s} name#{d} argc={d} ic={d}\n", .{ op.name(), name_idx, argc, ic_slot });
+            return offset + 6;
+        },
+        // 【方案 C】融合指令 <u16 left_slot><u16 right_slot>
+        .op_add_local_local, .op_sub_local_local, .op_lt_local_local, .op_gt_local_local,
+        .op_le_local_local, .op_ge_local_local, .op_eq_local_local, .op_neq_local_local => {
+            const left = opcode.readU16(code, offset + 1);
+            const right = opcode.readU16(code, offset + 3);
+            try print(buf, allocator, "{s} left={d} right={d}\n", .{ op.name(), left, right });
+            return offset + 5;
+        },
         // OP_FOR_NEXT <u16 iter_slot> <u16 idx_slot> <i32 exit_off>
         .op_for_next => {
             const iter_slot = opcode.readU16(code, offset + 1);

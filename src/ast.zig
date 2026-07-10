@@ -658,6 +658,9 @@ pub const Expr = union(enum) {
         body: LambdaBody,
         /// async lambda：调用时返回 Spawn<T> 而非直接执行
         is_async: bool = false,
+        /// 显式返回类型注解（`fun name(params): RetType { body }` 语法）
+        /// codegen 在 inferExprType 失败时（如 body 调用未注册的嵌套函数）回退到此类型
+        return_type: ?*TypeNode = null,
     },
 
     /// if 表达式：if condition { then } else { else }

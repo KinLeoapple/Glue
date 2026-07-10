@@ -4,6 +4,7 @@ const std = @import("std");
 const value = @import("value");
 const ast = @import("ast");
 const reg_opcode = @import("reg_opcode.zig");
+pub const reg_opcode_mod = reg_opcode;
 const Instruction = reg_opcode.Instruction;
 
 pub const RegChunk = struct {
@@ -141,10 +142,13 @@ pub const RegFunction = struct {
     ic_slot_count: u16 = 0,
     /// upvalue 描述符列表（闭包用）
     upvalue_specs: std.ArrayListUnmanaged(UpvalueSpec) = .empty,
+    /// 参数类型注解名（caller-side coerce 用；null = 无注解）。由 program.allocator 拥有。
+    param_types: []const ?[]const u8 = &.{},
 
     pub fn deinit(self: *RegFunction, allocator: std.mem.Allocator) void {
         self.chunk.deinit();
         self.upvalue_specs.deinit(allocator);
+        if (self.param_types.len > 0) allocator.free(self.param_types);
     }
 };
 

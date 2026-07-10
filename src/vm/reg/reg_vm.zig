@@ -11,6 +11,9 @@ const reg_opcode = @import("reg_opcode.zig");
 const reg_chunk = @import("reg_chunk.zig");
 const profiler_mod = @import("profiler");
 const slab_allocator = @import("slab_allocator");
+const vm_mod = @import("vm");
+const opcode = vm_mod.opcode_mod;
+const cast = vm_mod.cast_mod;
 
 pub const VMError = error{
     OutOfMemory,
@@ -26,6 +29,7 @@ pub const VMError = error{
     StackOverflow,
     InvalidSpawn,
     InvalidUpvalue,
+    Unsupported,
 } || std.mem.Allocator.Error;
 
 /// 全局寄存器池大小（1M 个 Value 槽）
@@ -54,6 +58,47 @@ const MemoKey = struct {
     arg_hash: u64,
 };
 
+/// 运行时类型名（镜像栈式 VM 的 valueTypeName）。
+fn regValueTypeName(val: value.Value) []const u8 {
+    return switch (val) {
+        .int => @tagName(val.asInt().type),
+        .float => @tagName(val.asFloat().type),
+        .boolean => "bool",
+        .char => "char",
+        .string => "str",
+        .null_val => "null",
+        .unit => "unit",
+        .array => "array",
+        .record => "record",
+        .adt => val.adt.type_name,
+        .newtype => val.newtype.type_name,
+        .range => "range",
+        .error_val => val.error_val.type_name,
+        .throw_val => "Throw",
+        .partial => "partial",
+        .array_iterator => "array_iterator",
+        .string_iterator => "string_iterator",
+        .range_iterator => "range_iterator",
+        .atomic_val => "Atomic",
+        .spawn_val => "Spawn",
+        .channel_val => "Channel",
+        .sender_val => "Sender",
+        .receiver_val => "Receiver",
+        .trait_value => blk: {
+            const tv = val.trait_value;
+            break :blk if (tv.trait_name.len > 0) tv.trait_name else "trait";
+        },
+        .lazy_val => "Lazy",
+        .cell => regValueTypeName(val.cell.inner),
+        .builtin, .vm_closure => "function",
+    };
+}
+
+/// 结构相等（镜像栈式 VM 的 structuralEquals，直接调用 value.equals）。
+fn regStructuralEquals(a: value.Value, b: value.Value) bool {
+    return value.equals(a, b);
+}
+
 /// 寄存器式 VM
 pub const RegVM = struct {
     allocator: std.mem.Allocator,
@@ -80,6 +125,8 @@ pub const RegVM = struct {
     err_loc: ast.SourceLocation = .{ .line = 0, .column = 0 },
     /// stop_depth（spawn 边界）
     stop_depth: usize = 0,
+    /// IO 接口（用于 println/print 等内建输出）
+    io: ?std.Io = null,
 
     const IcSlot = struct {
         cached_tag: u8 = 0,
@@ -97,13 +144,15 @@ pub const RegVM = struct {
     }
 
     pub fn initWithIo(allocator: std.mem.Allocator, io: std.Io) RegVM {
-        _ = io;
-        return init(allocator);
+        var vm = init(allocator);
+        vm.io = io;
+        return vm;
     }
 
     pub fn initWithCache(cache: *slab_allocator.ThreadCache, io: std.Io) RegVM {
-        _ = io;
-        return init(cache.allocator());
+        var vm = init(cache.allocator());
+        vm.io = io;
+        return vm;
     }
 
     pub fn setProfiler(self: *RegVM, p: *profiler_mod.Profiler) void {
@@ -240,6 +289,27 @@ pub const RegVM = struct {
                     self.reg_pool[base + a] = self.reg_pool[base + b].retain();
                 },
 
+                // ── 隐式数值定型（caller-side coerce）──
+                .coerce => {
+                    // COERCE A B C — R[A] = coerce(R[B], type_name_idx=C)
+                    const src = self.reg_pool[base + b];
+                    const tname = func.chunk.constants.items[c].string.bytes();
+                    if (src.isInteger() or src.isFloat()) {
+                        if (cast.castNumeric(self.allocator, src, tname)) |coerced| {
+                            self.reg_pool[base + a].release(self.allocator);
+                            self.reg_pool[base + a] = coerced;
+                        } else |_| {
+                            // 溢出/不符：原样 move（best-effort，镜像栈式 VM doCoerce）
+                            self.reg_pool[base + a].release(self.allocator);
+                            self.reg_pool[base + a] = src.retain();
+                        }
+                    } else {
+                        // 非数值：原样 move
+                        self.reg_pool[base + a].release(self.allocator);
+                        self.reg_pool[base + a] = src.retain();
+                    }
+                },
+
                 // ── 算术（二元）──
                 .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
                     const result_val = try self.doArith(op, self.reg_pool[base + b], self.reg_pool[base + c], loc);
@@ -295,36 +365,49 @@ pub const RegVM = struct {
                 // ── 调用 ──
                 .call => {
                     const func_idx = bx;
-                    const argc = c;
+                    const callee = &self.program.?.functions.items[func_idx];
+                    const argc = callee.arity;
                     // 参数在 [base+a+1, base+a+1+argc)
                     const args_slice = self.reg_pool[base + a + 1 ..][0..argc];
-                    const callee = &self.program.?.functions.items[func_idx];
                     // setupFrame 会 retain 参数，callee 帧持有独立引用
                     try self.setupFrame(callee, args_slice, base, a);
                 },
+                .call_native => {
+                    // CALL_NATIVE A B C — A=dst, B=native_id, C=argc；args 在 [base+a+1, base+a+1+C)
+                    const nat: opcode.Native = @enumFromInt(b);
+                    const argc: usize = c;
+                    const args_slice = self.reg_pool[base + a + 1 ..][0..argc];
+                    const result_val = try self.doCallNative(nat, argc, args_slice, loc);
+                    self.reg_pool[base + a].release(self.allocator);
+                    self.reg_pool[base + a] = result_val;
+                },
 
                 // ── 返回 ──
+                // return_base/return_reg 存储在被调用者帧（当前 frame）中，
+                // frameReturn() 会弹出该帧，故需在弹出前保存。
                 .return_op => {
                     const ret_val = self.reg_pool[base + a].retain();
+                    const ret_base = frame.return_base;
+                    const ret_reg = frame.return_reg;
                     try self.frameReturn();
                     if (self.frames.items.len < self.stop_depth) {
                         result = ret_val;
                         break;
                     }
-                    // 返回值放入调用者的目标寄存器
-                    const caller = &self.frames.items[self.frames.items.len - 1];
-                    self.reg_pool[caller.return_base + caller.return_reg].release(self.allocator);
-                    self.reg_pool[caller.return_base + caller.return_reg] = ret_val;
+                    // 返回值放入调用者指定的目标寄存器
+                    self.reg_pool[ret_base + ret_reg].release(self.allocator);
+                    self.reg_pool[ret_base + ret_reg] = ret_val;
                 },
                 .return_unit => {
+                    const ret_base = frame.return_base;
+                    const ret_reg = frame.return_reg;
                     try self.frameReturn();
                     if (self.frames.items.len < self.stop_depth) {
                         result = value.Value.fromUnit();
                         break;
                     }
-                    const caller = &self.frames.items[self.frames.items.len - 1];
-                    self.reg_pool[caller.return_base + caller.return_reg].release(self.allocator);
-                    self.reg_pool[caller.return_base + caller.return_reg] = value.Value.fromUnit();
+                    self.reg_pool[ret_base + ret_reg].release(self.allocator);
+                    self.reg_pool[ret_base + ret_reg] = value.Value.fromUnit();
                 },
 
                 // ── 显式释放 ──
@@ -373,6 +456,113 @@ pub const RegVM = struct {
         self.err_loc = loc;
         self.err_msg = msg;
         return e;
+    }
+
+    /// 内建函数分派（镜像栈式 VM 的 doCallNative，但操作数从 args 切片读取，结果返回而非压栈）。
+    /// args 不会被 retain（调用者寄存器仍持有引用），result 需是独立引用（retain 或新分配）。
+    fn doCallNative(self: *RegVM, nat: opcode.Native, argc: usize, args: []const value.Value, loc: ast.SourceLocation) VMError!value.Value {
+        switch (nat) {
+            .println, .print => {
+                if (argc != 1) return self.fail(loc, "println/print expects 1 argument", error.WrongArity);
+                const v = args[0];
+                var buf = std.ArrayList(u8).empty;
+                defer buf.deinit(self.allocator);
+                if (v == .string) {
+                    buf.appendSlice(self.allocator, v.string.bytes()) catch return error.OutOfMemory;
+                } else {
+                    v.format(self.allocator, &buf) catch return error.OutOfMemory;
+                }
+                if (nat == .println) buf.append(self.allocator, '\n') catch {};
+                if (self.io) |io| {
+                    var out_buf: [4096]u8 = undefined;
+                    var w = std.Io.File.stdout().writerStreaming(io, &out_buf);
+                    w.interface.print("{s}", .{buf.items}) catch {};
+                    w.flush() catch {};
+                } else {
+                    std.debug.print("{s}", .{buf.items});
+                }
+                return value.Value.fromUnit();
+            },
+            .eprintln, .eprint => {
+                if (argc != 1) return self.fail(loc, "eprintln/eprint expects 1 argument", error.WrongArity);
+                const v = args[0];
+                var buf = std.ArrayList(u8).empty;
+                defer buf.deinit(self.allocator);
+                if (v == .string) {
+                    buf.appendSlice(self.allocator, v.string.bytes()) catch return error.OutOfMemory;
+                } else {
+                    v.format(self.allocator, &buf) catch return error.OutOfMemory;
+                }
+                if (nat == .eprintln) buf.append(self.allocator, '\n') catch {};
+                if (self.io) |io| {
+                    var err_buf: [4096]u8 = undefined;
+                    var w = std.Io.File.stderr().writerStreaming(io, &err_buf);
+                    w.interface.print("{s}", .{buf.items}) catch {};
+                    w.flush() catch {};
+                } else {
+                    std.debug.print("{s}", .{buf.items});
+                }
+                return value.Value.fromUnit();
+            },
+            .type => {
+                if (argc != 1) return self.fail(loc, "type expects 1 argument", error.WrongArity);
+                const v = args[0];
+                const name = regValueTypeName(v);
+                return try value.Value.fromStringBytes(self.allocator, name);
+            },
+            .eq => {
+                if (argc != 2) return self.fail(loc, "eq expects 2 arguments", error.WrongArity);
+                return value.Value.fromBool(regStructuralEquals(args[0], args[1]));
+            },
+            .panic => {
+                if (argc != 1) return self.fail(loc, "Panic expects 1 argument", error.WrongArity);
+                const v = args[0];
+                const msg = if (v == .string)
+                    self.allocator.dupe(u8, v.string.bytes()) catch return error.OutOfMemory
+                else
+                    v.formatAlloc(self.allocator) catch return error.OutOfMemory;
+                defer self.allocator.free(msg);
+                return self.fail(loc, msg, error.Unsupported);
+            },
+            .ok => {
+                if (argc != 1) return self.fail(loc, "Ok expects 1 argument", error.WrongArity);
+                const inner = args[0].retain();
+                const tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
+                tv.* = .{ .payload = .{ .ok = inner } };
+                return value.Value{ .throw_val = tv };
+            },
+            .err => {
+                if (argc != 1) return self.fail(loc, "Error expects 1 argument", error.WrongArity);
+                const v = args[0];
+                if (v != .string) return self.fail(loc, "Error expects a str argument", error.TypeMismatch);
+                const str = v.string.bytes();
+                const e = self.allocator.create(value.ErrorValue) catch return error.OutOfMemory;
+                e.* = .{
+                    .type_name = self.allocator.dupe(u8, "Error") catch return error.OutOfMemory,
+                    .message = self.allocator.dupe(u8, str) catch return error.OutOfMemory,
+                };
+                const tv = self.allocator.create(value.ThrowValue) catch return error.OutOfMemory;
+                tv.* = .{ .payload = .{ .err = e } };
+                return value.Value{ .throw_val = tv };
+            },
+            .channel => {
+                if (argc != 1) return self.fail(loc, "channel expects 1 argument", error.WrongArity);
+                const v = args[0];
+                if (!v.isInteger()) return self.fail(loc, "channel expects an integer capacity", error.TypeMismatch);
+                const int_val = v.asInt();
+                const coerced = int_val.coerceTo(.i64) orelse return self.fail(loc, "channel capacity out of range", error.ArithmeticOverflow);
+                const cap_v = coerced.toNative(i64);
+                if (cap_v < 0) return self.fail(loc, "channel capacity cannot be negative", error.ArithmeticOverflow);
+                const cap: usize = @intCast(cap_v);
+                const ch = self.allocator.create(value.ChannelValue) catch return error.OutOfMemory;
+                ch.* = value.ChannelValue.init(self.allocator, cap) catch {
+                    self.allocator.destroy(ch);
+                    return error.OutOfMemory;
+                };
+                return value.Value{ .channel_val = ch };
+            },
+            .scan, .scanln => return self.fail(loc, "scan/scanln not supported in reg VM", error.Unsupported),
+        }
     }
 
     /// 算术运算（二元）。镜像栈式 VM 的 doArith，但操作数直接从寄存器读取。

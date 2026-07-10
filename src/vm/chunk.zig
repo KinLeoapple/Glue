@@ -199,6 +199,9 @@ pub const Function = struct {
     name_id: u32 = 0xFFFF_FFFF,
     /// 诊断/反汇编用的函数名（借用 AST 的字节，不持有所有权）。
     name: []const u8 = "",
+    /// 【方案 B：Inline Cache】本函数使用的 IC slot 数量（call-site 级缓存）。
+    /// VM 在建帧时按此分配 ic_slots 子数组。
+    ic_slot_count: u16 = 0,
 
     pub fn deinit(self: *Function) void {
         self.chunk.deinit();

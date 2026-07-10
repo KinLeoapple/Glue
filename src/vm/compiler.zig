@@ -20,6 +20,8 @@ const analysis_db_mod = @import("analysis_db");
 /// 公开再导出，供 bench 驱动 / 外部入口通过本模块拿到 VM 与 Program（避免新建 build 图模块）。
 pub const VM = @import("vm.zig").VM;
 pub const chunk = chunk_mod;
+pub const opcode_mod = opcode;
+pub const cast_mod = @import("cast.zig");
 
 const OpCode = opcode.OpCode;
 const Chunk = chunk_mod.Chunk;

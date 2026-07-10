@@ -279,6 +279,24 @@ pub const OpCode = enum(u8) {
     /// OP_PUSH_INPLACE_SET_U8 <u8 slot>：slot < 256 的窄变体。
     op_push_inplace_set_u8,
 
+    // ── 方案 B：Inline Cache / PIC ──
+    /// OP_CALL_METHOD_IC <u16 name_idx><u8 argc><u16 ic_slot>：
+    /// 带 inline cache 的方法调用。ic_slot 缓存上次命中的 (receiver_tag, method_id)。
+    /// 命中则跳过 fromName 查找 + dispatchById 的 switch；miss 则走完整路径后填充。
+    op_call_method_ic,
+
+    // ── 方案 C：指令融合 / Superoperator ──
+    // local ⊕ local → 单条指令读两 slot + 运算 + 压结果（省 2 dispatch + 2 push/pop）
+    // 仅融合算术比较热路径，避免 icache 压力（类型特化 opcode 教训）
+    op_add_local_local,
+    op_sub_local_local,
+    op_lt_local_local,
+    op_gt_local_local,
+    op_le_local_local,
+    op_ge_local_local,
+    op_eq_local_local,
+    op_neq_local_local,
+
     pub fn name(self: OpCode) []const u8 {
         return @tagName(self);
     }
