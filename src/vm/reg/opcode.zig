@@ -147,8 +147,10 @@ pub const Op = enum(u8) {
     make_record,
     /// MAKE_NEWTYPE A B — R[A] = makeNewtype(R[B])
     make_newtype,
-    /// MAKE_RANGE A B C — R[A] = makeRange(R[B], R[C], inclusive=A&1)
+    /// MAKE_RANGE A B C — R[A] = makeRange(R[B], R[C], inclusive=false)
     make_range,
+    /// MAKE_RANGE_INCL A B C — R[A] = makeRange(R[B], R[C], inclusive=true)
+    make_range_incl,
     /// MAKE_ATOMIC A B — R[A] = makeAtomic(R[B])
     make_atomic,
     /// MAKE_LAZY A B — R[A] = makeLazy(closure=R[B])

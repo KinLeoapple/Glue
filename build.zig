@@ -210,34 +210,24 @@ pub fn build(b: *std.Build) void {
     module_loader_module.addImport("arena_allocator", arena_allocator_module);
 
     // ============================================================
-    // vm/ sub-modules（字节码 VM — docs/bytecode-vm-plan.md）
+    // shared/ 模块（栈式/寄存器式 VM 公用资产：method/cast/native/descriptors/parse）
     // ============================================================
-    // 依赖图顶点是 compiler.zig（它 @import vm.zig / disasm.zig / chunk.zig / opcode.zig）。
-    // 只需注册一个模块，外部依赖经 import 表注入。
-
-    const vm_module = b.createModule(.{
-        .root_source_file = b.path("src/vm/compiler.zig"),
+    const shared_module = b.createModule(.{
+        .root_source_file = b.path("src/vm/shared/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
-    vm_module.addImport("ast", ast_module);
-    vm_module.addImport("value", value_module);
-    vm_module.addImport("lexer", lexer_module);
-    vm_module.addImport("parser", parser_module);
-    vm_module.addImport("profiler", profiler_module);
-    vm_module.addImport("analysis_db", analysis_db_module);
-    vm_module.addImport("slab_allocator", slab_allocator_module);
-    vm_module.addImport("debug_allocator", debug_allocator_module);
-    vm_module.addImport("arena_allocator", arena_allocator_module);
+    shared_module.addImport("ast", ast_module);
+    shared_module.addImport("value", value_module);
 
     // ============================================================
     // reg_vm/ sub-modules（寄存器式 VM — docs/superpowers/plans/2026-07-10-register-vm.md）
     // ============================================================
-    // root_source_file 为 reg_compiler.zig，它再导出 reg_vm.zig。
-    // 注入与 vm_module 相同的 imports。
+    // root_source_file 为 compiler.zig，它再导出 vm.zig。
+    // 依赖经 import 表注入（method/cast/native/descriptors/parse 走 shared 模块）。
 
     const reg_vm_module = b.createModule(.{
-        .root_source_file = b.path("src/vm/reg/reg_compiler.zig"),
+        .root_source_file = b.path("src/vm/reg/compiler.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -250,7 +240,7 @@ pub fn build(b: *std.Build) void {
     reg_vm_module.addImport("slab_allocator", slab_allocator_module);
     reg_vm_module.addImport("debug_allocator", debug_allocator_module);
     reg_vm_module.addImport("arena_allocator", arena_allocator_module);
-    reg_vm_module.addImport("vm", vm_module);
+    reg_vm_module.addImport("shared", shared_module);
 
     // sema 内部循环依赖：type_check ↔ subtype_check / throw_check / trait_resolve
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -285,7 +275,6 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("value", value_module);
     root_module.addImport("slab_allocator", slab_allocator_module);
     root_module.addImport("profiler", profiler_module);
-    root_module.addImport("vm", vm_module);
     root_module.addImport("reg_vm", reg_vm_module);
     root_module.addImport("sema", type_check_module);
     root_module.addImport("debug_allocator", debug_allocator_module);
@@ -337,11 +326,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_stdlib_unit_tests = b.addRunArtifact(stdlib_unit_tests);
 
-    const vm_unit_tests = b.addTest(.{
-        .root_module = vm_module,
-    });
-    const run_vm_unit_tests = b.addRunArtifact(vm_unit_tests);
-
     const reg_vm_unit_tests = b.addTest(.{
         .root_module = reg_vm_module,
     });
@@ -389,7 +373,6 @@ pub fn build(b: *std.Build) void {
     module_check_unit_tests.root_module.linkSystemLibrary("c", .{});
     slab_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
     stdlib_unit_tests.root_module.linkSystemLibrary("c", .{});
-    vm_unit_tests.root_module.linkSystemLibrary("c", .{});
     reg_vm_unit_tests.root_module.linkSystemLibrary("c", .{});
     atomic_unit_tests.root_module.linkSystemLibrary("c", .{});
     analysis_db_unit_tests.root_module.linkSystemLibrary("c", .{});
@@ -404,7 +387,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_module_check_unit_tests.step);
     test_step.dependOn(&run_slab_allocator_unit_tests.step);
     test_step.dependOn(&run_stdlib_unit_tests.step);
-    test_step.dependOn(&run_vm_unit_tests.step);
     test_step.dependOn(&run_reg_vm_unit_tests.step);
     test_step.dependOn(&run_atomic_unit_tests.step);
     test_step.dependOn(&run_analysis_db_unit_tests.step);

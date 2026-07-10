@@ -6,7 +6,6 @@ const ast = @import("ast");
 const module_loader = @import("module_loader");
 const value = @import("value");
 const slab_allocator = @import("slab_allocator");
-const vm = @import("vm");
 const reg_vm = @import("reg_vm");
 const profiler = @import("profiler");
 const debug_allocator = @import("debug_allocator");
@@ -59,10 +58,6 @@ const DEFAULT_ENTRY = "src/Main.glue";
 /// `--profile`：全管线 profiling（阶段计时 + 内存统计 + opcode 频率），结束后输出报告。
 var profiler_enabled: bool = false;
 
-/// `--vm=stack|reg`：VM 后端选择（栈式 / 寄存器式）。默认 stack。
-const VmBackend = enum { stack, reg };
-var vm_backend: VmBackend = .stack;
-
 /// 全局 profiler 实例（runNormal/runDiagnostic 入口设置 io，各阶段埋点写入，结束 dump）。
 var prof: profiler.Profiler = .{};
 
@@ -84,7 +79,6 @@ fn printUsage(io: std.Io) void {
         \\
         \\Options:
         \\  --profile          Dump full pipeline profile (phases + memory + opcodes) after run
-        \\  --vm=stack|reg     Select VM backend (stack=default, reg=register-based)
         \\
     , .{});
 }
@@ -111,21 +105,10 @@ pub fn main(init: std.process.Init) !void {
         const name: ?[]const u8 = if (args_slice.len >= 3) args_slice[2] else null;
         try cmdInit(allocator, io, name);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "debug")) {
-        // 运行选项（命令行 flag）：扫描命令之后的参数。--profile / --vm 对 run/debug 均生效。
+        // 运行选项（命令行 flag）：扫描命令之后的参数。--profile 对 run/debug 均生效。
         for (args_slice[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--profile")) {
                 profiler_enabled = true;
-            } else if (std.mem.startsWith(u8, arg, "--vm=")) {
-                const val = arg["--vm=".len..];
-                if (std.mem.eql(u8, val, "stack")) {
-                    vm_backend = .stack;
-                } else if (std.mem.eql(u8, val, "reg")) {
-                    vm_backend = .reg;
-                } else {
-                    printError(io, "error: invalid --vm value '{s}' (expected 'stack' or 'reg')\n\n", .{val});
-                    printUsage(io);
-                    std.process.exit(1);
-                }
             } else {
                 printError(io, "error: unknown option '{s}'\n\n", .{arg});
                 printUsage(io);
@@ -455,7 +438,7 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
 }
 
 // ============================================================
-// M5：字节码 VM 执行路径 + 树遍历器回退
+// 寄存器式 VM 执行路径
 // ============================================================
 
 /// tryRunOnVM 的结果。
@@ -477,7 +460,7 @@ fn vmEligible(module: ast.Module) bool {
     return false;
 }
 
-/// 尝试在字节码 VM 上整体编译并执行模块（含 main）。
+/// 尝试在寄存器式 VM 上整体编译并执行模块（含 main）。
 fn tryRunOnVM(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
@@ -490,11 +473,6 @@ fn tryRunOnVM(
     if (!vmEligible(module)) {
         printError(io, "{s}: error: no 'main' function found\n", .{filename});
         return .failed;
-    }
-
-    // 后端分发：--vm=reg 走寄存器式 VM
-    if (vm_backend == .reg) {
-        return tryRunOnVMReg(allocator, loader, value_allocator, cache, io, module, filename);
     }
 
     // 准备阶段：use 预加载 + 类型检查 + resolve
@@ -517,137 +495,9 @@ fn tryRunOnVM(
     };
     prof.phaseEnd();
 
-    // 编译模块 → Program
-    var mc = vm.ModuleCompiler.init(allocator);
-    // JIT Phase 2: wire AnalysisDB from ModuleLoader to ModuleCompiler
-    mc.analysis_db = &loader.analysis_db;
-    defer mc.deinit();
-    defer mc.program.deinit();
-
-    // 收集 use 依赖模块
-    if (module.source_path) |sp| {
-        const sep_idx = std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep) orelse
-            std.mem.lastIndexOfScalar(u8, sp, '/');
-        if (sep_idx) |idx| loader.setSourceDir(sp[0..idx]) catch {};
-    }
-    var deps = std.ArrayList(ast.Module).empty;
-    defer deps.deinit(allocator);
-    var seen = std.StringHashMap(void).init(allocator);
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |k| allocator.free(k.*);
-        seen.deinit();
-    }
-    loader.collectDependencies(module, &deps, &seen) catch |err| {
-        printError(io, "{s}: error: dependency collection failed: {s}\n", .{ filename, @errorName(err) });
-        return .failed;
-    };
-
-    prof.phaseBegin(.compile);
-    mc.compileModuleWithDeps(&module, deps.items) catch |err| {
-        prof.phaseEnd();
-        printError(io, "{s}: error: compilation failed: {s}\n", .{ filename, @errorName(err) });
-        return .failed;
-    };
-    prof.phaseEnd();
-
-    const entry = mc.lookupFn("main") orelse {
-        printError(io, "{s}: error: 'main' function not found after compilation\n", .{filename});
-        return .failed;
-    };
-
-    return runProgram(allocator, value_allocator, cache, io, &mc.program, entry, filename);
-}
-
-/// 执行已编译的 Program。
-fn runProgram(
-    allocator: std.mem.Allocator,
-    value_allocator: std.mem.Allocator,
-    cache: ?*slab_allocator.ThreadCache,
-    io: std.Io,
-    program: *vm.chunk.Program,
-    entry: u16,
-    filename: []const u8,
-) VmOutcome {
-    _ = allocator;
-    // 执行 main
-    // 主 VM 用 cache（注入 ThreadCache 启用 TypedPool 热路径，绕过 vtable 间接调用）。
-    // spawn 子 VM 用 init/initWithIo（cache=null，走 SlabAllocator.allocator() 直连）。
-    var machine = if (cache) |c| vm.VM.initWithCache(c, io) else vm.VM.initWithIo(value_allocator, io);
-    defer machine.deinit();
-    if (profiler_enabled) machine.setProfiler(&prof);
-    prof.phaseBegin(.vm);
-    const result = machine.call(program, entry, &.{}) catch |err| {
-        prof.phaseEnd();
-        const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
-        const loc: ?ast.SourceLocation = if (machine.err_loc.line > 0) machine.err_loc else null;
-        var err_buf: [4096]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-        printRuntimeDiag(&stderr_writer.interface, filename, loc, "runtime panic", msg);
-        stderr_writer.flush() catch {};
-        if (profiler_enabled) {
-            prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
-        }
-        return .failed;
-    };
-    prof.phaseEnd();
-    if (profiler_enabled) {
-        prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
-    }
-
-    // 检查是否有未捕获的 throw
-    if (result == .throw_val) {
-        const throw_val = result.throw_val.payload;
-        switch (throw_val) {
-            .err => |e| {
-                std.debug.print("Uncaught error: {s}\n", .{e.message});
-            },
-            .ok => {},
-        }
-        result.release(value_allocator);
-        return .failed;
-    }
-
-    result.release(value_allocator);
-    return .ran_main;
-}
-
-// ============================================================
-// 寄存器式 VM 执行路径（--vm=reg）
-// ============================================================
-
-/// 尝试在寄存器式 VM 上整体编译并执行模块（含 main）。
-fn tryRunOnVMReg(
-    allocator: std.mem.Allocator,
-    loader: *module_loader.ModuleLoader,
-    value_allocator: std.mem.Allocator,
-    cache: ?*slab_allocator.ThreadCache,
-    io: std.Io,
-    module: ast.Module,
-    filename: []const u8,
-) VmOutcome {
-    // 准备阶段：use 预加载 + 类型检查 + resolve（与栈式 VM 共享）
-    prof.phaseBegin(.type_check);
-    loader.prepareModule(module) catch |err| switch (err) {
-        error.TypeCheckFailed => {
-            prof.phaseEnd();
-            return .failed;
-        },
-        error.CircularDependency => {
-            prof.phaseEnd();
-            printError(io, "{s}: error: circular module dependency\n", .{filename});
-            return .failed;
-        },
-        else => {
-            prof.phaseEnd();
-            printError(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
-            return .failed;
-        },
-    };
-    prof.phaseEnd();
-
     // 编译模块 → RegProgram
     var rmc = reg_vm.RegModuleCompiler.init(allocator);
+    rmc.analysis_db = &loader.analysis_db;
     defer rmc.deinit();
     defer rmc.program.deinit();
 
@@ -683,11 +533,11 @@ fn tryRunOnVMReg(
         return .failed;
     };
 
-    return runProgramReg(value_allocator, cache, io, &rmc.program, entry, filename);
+    return runProgram(value_allocator, cache, io, &rmc.program, entry, filename);
 }
 
 /// 执行已编译的 RegProgram（寄存器式 VM）。
-fn runProgramReg(
+fn runProgram(
     value_allocator: std.mem.Allocator,
     cache: ?*slab_allocator.ThreadCache,
     io: std.Io,
@@ -717,17 +567,18 @@ fn runProgramReg(
         prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
     }
 
-    // 检查是否有未捕获的 throw
+    // 检查是否有未捕获的 throw：main 返回 Throw 值时，
+    // Ok(_) 视为正常退出，Err(_) 视为未捕获错误。
     if (result == .throw_val) {
         const throw_val = result.throw_val.payload;
         switch (throw_val) {
             .err => |e| {
                 std.debug.print("Uncaught error: {s}\n", .{e.message});
+                result.release(value_allocator);
+                return .failed;
             },
             .ok => {},
         }
-        result.release(value_allocator);
-        return .failed;
     }
 
     result.release(value_allocator);

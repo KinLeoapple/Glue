@@ -511,6 +511,7 @@ pub const Parser = struct {
                 .bounds = try bounds.toOwnedSlice(self.allocator),
                 .body = body,
                 .is_async = is_async,
+                .is_entry = std.mem.eql(u8, name_tok.lexeme, "main"),
             },
         };
     }
@@ -545,7 +546,7 @@ pub const Parser = struct {
 
             // 检查是否实现了 Error trait
             for (implemented_traits.items) |trait_bound| {
-                if (std.mem.eql(u8, trait_bound.trait_name, "Error")) {
+                if (std.mem.eql(u8, trait_bound.trait_name, ast.type_names.error_type)) {
                     has_error_trait = true;
                     break;
                 }

@@ -1,4 +1,4 @@
-//! M3d：字节码 VM 的内建方法分派（数组 / 字符串）。
+//! VM 共享：内建方法分派（数组 / 字符串 / Atomic / Channel）。
 //!
 //! 镜像 eval.zig callMethod 的数据方法子集（len/push/pop/contains/is_empty/first/last/drop_last），
 //! 但走 VM 纯 refcount 纪律：receiver 与实参均为栈上 owned，由调用方（OP_CALL_METHOD）释放；
@@ -33,6 +33,15 @@ pub const MethodId = enum(u8) {
     close,
     message,
     type_name,
+    // Spawn 方法
+    await_op,
+    cancel,
+    status,
+    // Channel 字段访问
+    sender,
+    receiver,
+    // error_newtype 方法
+    prefix,
 
     pub fn fromName(name: []const u8) MethodId {
         // 仍用字符串比较，但只在 call site 做一次，运行时分派走 switch(id)
@@ -45,28 +54,37 @@ pub const MethodId = enum(u8) {
         if (name.len == 4) {
             if (name[0] == 's' and name[1] == 'e' and name[2] == 'n' and name[3] == 'd') return .send;
             if (name[0] == 'r' and name[1] == 'e' and name[2] == 'c' and name[3] == 'v') return .recv;
+            if (name[0] == 'p' and name[1] == 'u' and name[2] == 's' and name[3] == 'h') return .push;
+            if (name[0] == 's' and name[1] == 'w' and name[2] == 'a' and name[3] == 'p') return .swap;
             return .unknown;
         }
         if (name.len == 5) {
             if (name[0] == 'f' and name[1] == 'i' and name[2] == 'r' and name[3] == 's' and name[4] == 't') return .first;
             if (name[0] == 'l' and name[1] == 'a' and name[2] == 's' and name[3] == 't') return .last;
             if (name[0] == 'c' and name[1] == 'l' and name[2] == 'o' and name[3] == 's' and name[4] == 'e') return .close;
-            if (name[0] == 's' and name[1] == 'w' and name[2] == 'a' and name[3] == 'p') return .swap;
+            if (name[0] == 'a' and name[1] == 'w' and name[2] == 'a' and name[3] == 'i' and name[4] == 't') return .await_op;
             return .unknown;
         }
         if (name.len == 6) {
-            if (std.mem.eql(u8, name, "push")) return .push; // len 4, 不会到这
+            if (name[0] == 's' and name[1] == 'e' and name[2] == 'n' and name[3] == 'd' and name[4] == 'e' and name[5] == 'r') return .sender;
+            if (name[0] == 'c' and name[1] == 'a' and name[2] == 'n' and name[3] == 'c' and name[4] == 'e' and name[5] == 'l') return .cancel;
+            if (name[0] == 's' and name[1] == 't' and name[2] == 'a' and name[3] == 't' and name[4] == 'u' and name[5] == 's') return .status;
+            if (name[0] == 'p' and name[1] == 'r' and name[2] == 'e' and name[3] == 'f' and name[4] == 'i' and name[5] == 'x') return .prefix;
             return .unknown;
         }
         if (name.len == 7) {
-            if (std.mem.eql(u8, name, "message")) return .message;
+            if (name[0] == 'm' and name[1] == 'e' and name[2] == 's' and name[3] == 's' and name[4] == 'a' and name[5] == 'g' and name[6] == 'e') return .message;
             return .unknown;
         }
         if (name.len == 8) {
-            if (std.mem.eql(u8, name, "contains")) return .contains;
-            if (std.mem.eql(u8, name, "drop_last")) return .drop_last;
-            if (std.mem.eql(u8, name, "is_empty")) return .is_empty;
-            if (std.mem.eql(u8, name, "type_name")) return .type_name;
+            if (name[0] == 'c' and name[1] == 'o' and name[2] == 'n' and name[3] == 't' and name[4] == 'a' and name[5] == 'i' and name[6] == 'n' and name[7] == 's') return .contains;
+            if (name[0] == 'i' and name[1] == 's' and name[2] == '_' and name[3] == 'e' and name[4] == 'm' and name[5] == 'p' and name[6] == 't' and name[7] == 'y') return .is_empty;
+            if (name[0] == 't' and name[1] == 'y' and name[2] == 'p' and name[3] == 'e' and name[4] == '_' and name[5] == 'n' and name[6] == 'a' and name[7] == 'm' and name[8 - 1] == 'e') return .type_name;
+            if (name[0] == 'r' and name[1] == 'e' and name[2] == 'c' and name[3] == 'e' and name[4] == 'i' and name[5] == 'v' and name[6] == 'e' and name[7] == 'r') return .receiver;
+            return .unknown;
+        }
+        if (name.len == 9) {
+            if (name[0] == 'd' and name[1] == 'r' and name[2] == 'o' and name[3] == 'p' and name[4] == '_' and name[5] == 'l' and name[6] == 'a' and name[7] == 's' and name[8] == 't') return .drop_last;
             return .unknown;
         }
         return .unknown;
@@ -239,6 +257,8 @@ pub fn dispatchById(allocator: std.mem.Allocator, receiver: Value, method_id: Me
             // 返回 null 让上层处理（避免重复逻辑）
             return null;
         },
+        // 以下方法由 reg_vm 专用路径处理（Spawn/Channel/error_newtype），此处不处理
+        .await_op, .cancel, .status, .sender, .receiver, .prefix => return null,
     }
 }
 

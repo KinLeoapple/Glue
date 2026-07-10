@@ -1,4 +1,4 @@
-//! Glue 字节码 VM — 类型转换（M3a）
+//! VM 共享：类型转换（M3a）。
 //!
 //! 重新实现 eval 的 castValue/castInteger/castFloat（纯 value→value，无 Evaluator 依赖）。
 //! 溢出（narrowing out of range）返回 error.CastOverflow，VM 将其映射为运行期 panic。

@@ -3,7 +3,7 @@
 const std = @import("std");
 const value = @import("value");
 const ast = @import("ast");
-const reg_opcode = @import("reg_opcode.zig");
+const reg_opcode = @import("opcode.zig");
 pub const reg_opcode_mod = reg_opcode;
 const Instruction = reg_opcode.Instruction;
 
@@ -144,6 +144,10 @@ pub const RegFunction = struct {
     upvalue_specs: std.ArrayListUnmanaged(UpvalueSpec) = .empty,
     /// 参数类型注解名（caller-side coerce 用；null = 无注解）。由 program.allocator 拥有。
     param_types: []const ?[]const u8 = &.{},
+    /// async 函数：调用时返回 Spawn<T>（发射 closure+spawn 而非 call）
+    is_async: bool = false,
+    /// memoization slot（0xFFFF = MEMO_SLOT_NONE = 非 memoized；否则为全局唯一 slot 索引）
+    memo_slot: u16 = 0xFFFF,
 
     pub fn deinit(self: *RegFunction, allocator: std.mem.Allocator) void {
         self.chunk.deinit();
@@ -181,16 +185,44 @@ pub const RegProgram = struct {
         self.record_shapes.deinit(self.allocator);
         self.newtype_ctors.deinit(self.allocator);
         self.error_ctors.deinit(self.allocator);
+        for (self.trait_methods.items) |m| {
+            self.allocator.free(m.type_name);
+            self.allocator.free(m.method_name);
+            self.allocator.free(m.trait_name);
+        }
         self.trait_methods.deinit(self.allocator);
+        for (self.trait_defaults.items) |m| {
+            self.allocator.free(m.trait_name);
+            self.allocator.free(m.method_name);
+        }
         self.trait_defaults.deinit(self.allocator);
+    }
+
+    /// 登记一个 trait 方法（字符串复制，生命周期独立于 AST）
+    pub fn addTraitMethod(self: *RegProgram, type_name: []const u8, method_name: []const u8, trait_name: []const u8, func_idx: u16) !void {
+        try self.trait_methods.append(self.allocator, .{
+            .type_name = try self.allocator.dupe(u8, type_name),
+            .method_name = try self.allocator.dupe(u8, method_name),
+            .trait_name = try self.allocator.dupe(u8, trait_name),
+            .func_idx = func_idx,
+        });
+    }
+
+    /// 登记一个 trait 默认方法（字符串复制）
+    pub fn addTraitDefault(self: *RegProgram, trait_name: []const u8, method_name: []const u8, func_idx: u16) !void {
+        try self.trait_defaults.append(self.allocator, .{
+            .trait_name = try self.allocator.dupe(u8, trait_name),
+            .method_name = try self.allocator.dupe(u8, method_name),
+            .func_idx = func_idx,
+        });
     }
 };
 
-// 描述结构体复用栈式 chunk.zig 的定义（通过 vm 模块 re-export）
-const vm_mod = @import("vm");
-pub const AdtCtorDesc = vm_mod.chunk.AdtCtorDesc;
-pub const RecordShape = vm_mod.chunk.RecordShape;
-pub const NewtypeCtorDesc = vm_mod.chunk.NewtypeCtorDesc;
-pub const ErrorCtorDesc = vm_mod.chunk.ErrorCtorDesc;
-pub const TraitMethodDesc = vm_mod.chunk.TraitMethodDesc;
-pub const TraitDefaultDesc = vm_mod.chunk.TraitDefaultDesc;
+// 描述结构体复用 shared/descriptors.zig 的定义
+const shared = @import("shared");
+pub const AdtCtorDesc = shared.descriptors_mod.AdtCtorDesc;
+pub const RecordShape = shared.descriptors_mod.RecordShape;
+pub const NewtypeCtorDesc = shared.descriptors_mod.NewtypeCtorDesc;
+pub const ErrorCtorDesc = shared.descriptors_mod.ErrorCtorDesc;
+pub const TraitMethodDesc = shared.descriptors_mod.TraitMethodDesc;
+pub const TraitDefaultDesc = shared.descriptors_mod.TraitDefaultDesc;

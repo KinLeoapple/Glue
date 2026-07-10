@@ -3029,7 +3029,7 @@ pub const TypeInferencer = struct {
                 if (std.mem.eql(u8, n.name, "f128")) return self.makeType(.f128_type);
                 // 其他基本类型
                 if (std.mem.eql(u8, n.name, "bool")) return self.makeType(.bool_type);
-                if (std.mem.eql(u8, n.name, "str")) return self.makeType(.str_type);
+                if (std.mem.eql(u8, n.name, ast.type_names.str_type)) return self.makeType(.str_type);
                 if (std.mem.eql(u8, n.name, "char")) return self.makeType(.char_type);
                 // Unit 类型注解（文档 §2.1）：`Unit` 与字面量 `()` 同一类型
                 if (std.mem.eql(u8, n.name, "Unit")) return self.makeType(.unit_type);
@@ -3484,8 +3484,8 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.str_type) catch return) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("str", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("str");
+            env.define(ast.type_names.str_type, TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName(ast.type_names.str_type);
         }
 
         // type : forall a. (a) -> str  —— 返回值的运行时类型名（文档 §2.15）
@@ -3501,8 +3501,8 @@ pub const TypeInferencer = struct {
         }
 
         // Error ADT 类型（用于 Throw<T, Error> 中的 Error 类型参数）
-        const error_adt_ty = self.makeAdtType("Error", &[_]*Type{}) catch return;
-        const error_adt_key = self.allocator.dupe(u8, "Error") catch return;
+        const error_adt_ty = self.makeAdtType(ast.type_names.error_type, &[_]*Type{}) catch return;
+        const error_adt_key = self.allocator.dupe(u8, ast.type_names.error_type) catch return;
         self.adt_types.put(error_adt_key, AdtInfo{ .ty = error_adt_ty, .constructor_names = &[_][]const u8{} }) catch return;
 
         // Error : forall a. (String) -> Throw<a, Error>
@@ -3516,8 +3516,8 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, throw_ty) catch return;
             const qvars = self.allocator.alloc(usize, 1) catch return;
             qvars[0] = val_ty.type_var.id;
-            env.define("Error", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("Error");
+            env.define(ast.type_names.error_type, TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            self.registerBuiltinName(ast.type_names.error_type);
         }
 
         // Ok : forall a. (a) -> Throw<a, Error>
@@ -4323,7 +4323,7 @@ pub const TypeInferencer = struct {
                         // 文档 2.4.2: FileError <: Error
                         // Error 模式覆盖所有 error newtype 的构造器
                         if (adt_info.is_error_newtype) {
-                            if (self.patternCoversConstructorNamed(arm.pattern, "Error")) {
+                            if (self.patternCoversConstructorNamed(arm.pattern, ast.type_names.error_type)) {
                                 for (0..covered.len) |i| {
                                     covered[i] = true;
                                 }
@@ -4389,7 +4389,7 @@ pub const TypeInferencer = struct {
                     if (self.patternCoversConstructorNamed(arm.pattern, "Ok")) {
                         has_ok = true;
                     }
-                    if (self.patternCoversConstructorNamed(arm.pattern, "Error")) {
+                    if (self.patternCoversConstructorNamed(arm.pattern, ast.type_names.error_type)) {
                         has_error = true;
                     }
                 }
@@ -4406,7 +4406,7 @@ pub const TypeInferencer = struct {
                     if (!first) {
                         missing_buf.appendSlice(self.allocator, ", ") catch return;
                     }
-                    missing_buf.appendSlice(self.allocator, "Error") catch return;
+                    missing_buf.appendSlice(self.allocator, ast.type_names.error_type) catch return;
                 }
                 if (!has_ok or !has_error) {
                     self.addErrorAt(.non_exhaustive_match, location.line, location.column, "non-exhaustive match: missing patterns: {s}", .{missing_buf.items});

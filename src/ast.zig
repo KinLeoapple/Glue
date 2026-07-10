@@ -881,6 +881,8 @@ pub const Decl = union(enum) {
         body: *Expr,
         /// async 函数：调用时返回 Spawn<T> 而非直接执行
         is_async: bool = false,
+        /// 是否为程序入口函数（parser 根据语言约定标记）
+        is_entry: bool = false,
     },
 
     /// 类型声明：type Name<T>: Trait1, Trait2 = ... { methods }
@@ -1002,3 +1004,18 @@ pub fn exprLocation(expr: *const Expr) SourceLocation {
         .compound_assign => |e| e.location,
     };
 }
+
+// ============================================================
+// 内建类型名常量
+// ============================================================
+
+/// Glue 语言内建类型名字符串（运行时值打标签 / 类型分派 / trait 注册 / 模式覆盖检查共用）。
+/// 集中定义避免各模块（vm/compiler/parser/sema）散落字面量导致不一致。
+pub const type_names = struct {
+    /// Error 类型名（error_newtype 构造的 ErrorValue.type_name、Error trait 注册、模式覆盖检查）
+    pub const error_type = "Error";
+    /// str 类型名（doCast 字符串转换分派、类型名查找、内建名注册）
+    pub const str_type = "str";
+    /// SpawnStatus ADT 类型名（spawn.status() 返回值打标签）
+    pub const spawn_status_type = "SpawnStatus";
+};

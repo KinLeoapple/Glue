@@ -112,7 +112,7 @@ pub fn recordArgSatisfies(inferencer: *TypeInferencer, param: *Type, arg: *Type)
 /// 文档 §2.12.3: 自定义错误类型是 Error 的子类型
 pub fn isErrorSubtype(inferencer: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
     // 检查 sub 是否是 Error 的子类型
-    if (std.mem.eql(u8, super_name, "Error")) {
+    if (std.mem.eql(u8, super_name, ast.type_names.error_type)) {
         if (inferencer.adt_types.get(sub_name)) |info| {
             if (info.is_error_newtype) return true;
         }

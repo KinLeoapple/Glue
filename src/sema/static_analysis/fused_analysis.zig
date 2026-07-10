@@ -298,14 +298,18 @@ pub const FusedAnalysis = struct {
                     .est_size = size,
                 });
                 // 【LICM】收集循环体内可 hoist 的不变量子表达式
-                // for 循环变量每轮被赋值，算作 assigned
-                const for_assigned = [_][]const u8{f.name};
+                // for 循环变量每轮被赋值，算作 assigned；
+                // 同时收集循环体内被赋值的变量（assignment/compound_assignment/val_decl/var_decl target）
+                var for_assigned: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer for_assigned.deinit(self.allocator);
+                try for_assigned.append(self.allocator, f.name);
+                try loop_invariant_mod.collectAssignedVars(self.allocator, f.body, &for_assigned);
                 try loop_invariant_mod.collectHoistsInExpr(
                     self.allocator,
                     self.hoist_table,
                     f.body,
                     stmt,
-                    &for_assigned,
+                    for_assigned.items,
                 );
                 try self.analyzeExpr(f.body, env, current_fn);
             },
