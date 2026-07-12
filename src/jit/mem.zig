@@ -31,7 +31,17 @@ pub const ExecMemory = struct {
     /// 释放底层内存。
     pub fn deinit(self: *ExecMemory) void {
         switch (builtin.os.tag) {
-            .windows => std.os.windows.VirtualFree(self.ptr, 0, std.os.windows.MEM_RELEASE),
+            .windows => {
+                const current_process = std.os.windows.GetCurrentProcess();
+                var base_addr: std.os.windows.PVOID = @ptrCast(@constCast(self.ptr));
+                var region_size: std.os.windows.SIZE_T = 0;
+                _ = std.os.windows.ntdll.NtFreeVirtualMemory(
+                    current_process,
+                    &base_addr,
+                    &region_size,
+                    .{ .RELEASE = true },
+                );
+            },
             else => {
                 // 使用整数地址绕过对齐类型检查（mmap 返回的指针总是页对齐的）
                 const addr = @intFromPtr(self.ptr);
@@ -57,8 +67,18 @@ pub const ExecMemory = struct {
     pub fn finalize(self: *ExecMemory) void {
         switch (builtin.os.tag) {
             .windows => {
-                var old_protect: std.os.windows.DWORD = 0;
-                std.os.windows.VirtualProtect(self.ptr, self.used, std.os.windows.PAGE_EXECUTE_READ, &old_protect);
+                const current_process = std.os.windows.GetCurrentProcess();
+                var base_addr: ?std.os.windows.PVOID = @ptrCast(@constCast(self.ptr));
+                var region_size: std.os.windows.SIZE_T = self.used;
+                var old_protect: std.os.windows.PAGE = .{};
+                const status = std.os.windows.ntdll.NtProtectVirtualMemory(
+                    current_process,
+                    &base_addr,
+                    &region_size,
+                    .{ .EXECUTE_READ = true },
+                    &old_protect,
+                );
+                std.debug.assert(status == .SUCCESS);
             },
             else => {
                 // POSIX: mprotect 要求页对齐地址
@@ -84,13 +104,19 @@ pub fn allocExec(size: usize) !ExecMemory {
 
     switch (builtin.os.tag) {
         .windows => {
-            const addr = std.os.windows.VirtualAlloc(
-                null,
-                alloc_size,
-                std.os.windows.MEM_COMMIT | std.os.windows.MEM_RESERVE,
-                std.os.windows.PAGE_READWRITE,
-            ) orelse return error.OutOfMemory;
-            return .{ .ptr = @ptrCast(addr), .len = alloc_size };
+            const current_process = std.os.windows.GetCurrentProcess();
+            var base_addr: ?std.os.windows.PVOID = null;
+            var region_size: std.os.windows.SIZE_T = alloc_size;
+            const status = std.os.windows.ntdll.NtAllocateVirtualMemory(
+                current_process,
+                @ptrCast(&base_addr),
+                0,
+                &region_size,
+                .{ .COMMIT = true, .RESERVE = true },
+                .{ .READWRITE = true },
+            );
+            if (status != .SUCCESS or base_addr == null) return error.OutOfMemory;
+            return .{ .ptr = @ptrCast(base_addr.?), .len = alloc_size };
         },
         else => {
             // mmap 分配 RW 内存，后续 finalize 时切换为 RX
