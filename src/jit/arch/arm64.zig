@@ -1619,6 +1619,171 @@ const FLOAT_TYPE_OFF: u32 = @intCast(runtime.FLOAT_TYPE_OFFSET); // 16
 const ARRAY_ELEMS_LEN_OFF: u32 = @intCast(runtime.ARRAY_ELEMENTS_LEN_OFFSET); // 8
 const ARRAY_ELEMS_PTR_OFF: u32 = @intCast(runtime.ARRAY_ELEMENTS_PTR_OFFSET); // 0
 
+// ════════════════════════════════════════════════════════════════════
+// FPR 缓存机制（桥接模式）
+// ════════════════════════════════════════════════════════════════════
+
+/// FPR 缓存池：d2-d5（调用者保存），用于缓存 f64 输入操作数。
+/// d0/d1 保留为 scratch（未知类型路径直接加载）。
+/// 缓存仅用于输入操作数；结果立即写回内存，避免 spill 机制覆盖 offset 0 的堆指针。
+const FPR_POOL = [_]u8{
+    FPR.d2, FPR.d3, FPR.d4, FPR.d5,
+};
+
+const FPR_NONE: i8 = -1;
+
+/// FPR 常驻状态：跟踪 reg_pool 槽位 → FPR 缓存池的映射。
+/// fpr_map[reg] = FPR_NONE 表示该 reg 的 f64 bits 仅在内存中；
+/// 否则值 = FPR_POOL 索引，对应 FPR 寄存器持有最新 bits。
+/// fpr_owner[pool_idx] = 持有该 FPR 的 reg 编号（0xFF=空闲）。
+const FprState = struct {
+    fpr_map: []i8, // reg_count × 1
+    fpr_owner: [FPR_POOL.len]u8, // pool_idx → reg（0xFF=空闲）
+
+    fn init(allocator: std.mem.Allocator, reg_count: usize) !FprState {
+        const m = try allocator.alloc(i8, reg_count);
+        @memset(m, FPR_NONE);
+        return .{ .fpr_map = m, .fpr_owner = [_]u8{0xFF} ** FPR_POOL.len };
+    }
+
+    fn deinit(self: *FprState, allocator: std.mem.Allocator) void {
+        allocator.free(self.fpr_map);
+    }
+
+    /// 判断 reg 是否常驻 FPR
+    fn isResident(self: *const FprState, reg: u8) bool {
+        return reg < self.fpr_map.len and self.fpr_map[reg] != FPR_NONE;
+    }
+
+    /// 获取 reg 对应的 FPR 编号；调用方需先 isResident 判断
+    fn getFpr(self: *const FprState, reg: u8) u8 {
+        const idx: usize = @intCast(self.fpr_map[reg]);
+        return FPR_POOL[idx];
+    }
+
+    /// 将 reg 标记为常驻到 pool_idx 对应的 FPR（替换原 owner）
+    fn setResident(self: *FprState, reg: u8, pool_idx: usize) void {
+        // 先驱逐原 owner（如果有）
+        const old_owner = self.fpr_owner[pool_idx];
+        if (old_owner != 0xFF and old_owner < self.fpr_map.len) {
+            self.fpr_map[old_owner] = FPR_NONE;
+        }
+        // 清除 reg 的旧映射（如果 reg 之前在其他 FPR）
+        if (reg < self.fpr_map.len and self.fpr_map[reg] != FPR_NONE) {
+            const old_idx: usize = @intCast(self.fpr_map[reg]);
+            self.fpr_owner[old_idx] = 0xFF;
+        }
+        self.fpr_map[reg] = @intCast(pool_idx);
+        self.fpr_owner[pool_idx] = reg;
+    }
+
+    /// 驱逐 reg（如果常驻），使其仅在内存
+    fn evict(self: *FprState, reg: u8) void {
+        if (reg >= self.fpr_map.len) return;
+        const idx = self.fpr_map[reg];
+        if (idx == FPR_NONE) return;
+        self.fpr_owner[@intCast(idx)] = 0xFF;
+        self.fpr_map[reg] = FPR_NONE;
+    }
+
+    /// 分配一个空闲 pool_idx；若无空闲返回 null
+    fn allocSlot(self: *const FprState) ?usize {
+        var i: usize = 0;
+        while (i < FPR_POOL.len) : (i += 1) {
+            if (self.fpr_owner[i] == 0xFF) return i;
+        }
+        return null;
+    }
+
+    /// 清空所有 FPR 映射（跳转目标/rt_step 调用前重置）
+    fn invalidateAll(self: *FprState) void {
+        @memset(self.fpr_map, FPR_NONE);
+        self.fpr_owner = [_]u8{0xFF} ** FPR_POOL.len;
+    }
+};
+
+/// 发射计算 frame base 的代码：x10 = reg_pool + base * 32
+/// reg_pool 指针从 [vm + REG_POOL_PTR_OFFSET] 加载（vm = x19, base = x20）。
+fn emitFrameBase(code: *std.ArrayListUnmanaged(u32), allocator: std.mem.Allocator) !void {
+    try code.append(allocator, encLdrImm(1, GPR.x9, GPR.x19, @intCast(REG_POOL_PTR_OFFSET / 8)));
+    try code.append(allocator, encAddLsl5(GPR.x10, GPR.x9, GPR.x20));
+}
+
+/// 确保 reg 的 f64 bits 加载到某个 FPR，返回 FPR 编号。
+/// 若已常驻直接返回；否则从内存加载并标记常驻（必要时驱逐一个非 protect_reg 的槽）。
+/// 调用前需已 emitFrameBase（x10 = frame base）。
+/// 仅用于编译时已知 f64 的路径；未知类型路径应使用 d0/d1 直接加载。
+/// protect_reg: 指定一个 reg 编号，其常驻 FPR 不允许被驱逐（传 0xFF 表示无保护）。
+fn emitEnsureFpr(
+    code: *std.ArrayListUnmanaged(u32),
+    allocator: std.mem.Allocator,
+    fpr: *FprState,
+    reg: u8,
+    protect_reg: u8,
+) !u8 {
+    if (fpr.isResident(reg)) return fpr.getFpr(reg);
+    // 分配空闲槽
+    const slot = fpr.allocSlot() orelse blk: {
+        // 池满：驱逐一个非 protect_reg 的槽
+        var evict_idx: usize = 0;
+        var found_evict = false;
+        var i: usize = 0;
+        while (i < FPR_POOL.len) : (i += 1) {
+            const owner = fpr.fpr_owner[i];
+            if (owner == 0xFF) continue;
+            if (owner == protect_reg) continue;
+            evict_idx = i;
+            found_evict = true;
+            break;
+        }
+        if (!found_evict) {
+            // 所有槽都是 protect_reg 或空闲（不应发生，因为 allocSlot 返回 null 说明无空闲）
+            // 强制驱逐 pool[0]
+            evict_idx = 0;
+        }
+        const victim = fpr.fpr_owner[evict_idx];
+        if (victim != 0xFF) {
+            // 仅驱逐缓存状态（不写回内存），因为缓存值来自内存加载，内存已有正确值
+            fpr.evict(victim);
+        }
+        break :blk evict_idx;
+    };
+    const fpr_reg = FPR_POOL[slot];
+    try code.append(allocator, encLdrF64(fpr_reg, GPR.x10, @intCast((@as(u32, reg) * 32 + FLOAT_BITS_OFF) / 8)));
+    fpr.setResident(reg, slot);
+    return fpr_reg;
+}
+
+/// 为结果 reg 分配一个常驻 FPR 槽，返回 pool_idx（FPR_POOL 索引）。
+/// 若池满，驱逐一个非 protect_b/protect_c 的槽。
+/// 调用前需已 emitFrameBase。
+fn emitAllocResultSlot(
+    fpr: *FprState,
+    protect_b: u8,
+    protect_c: u8,
+) usize {
+    if (fpr.allocSlot()) |free_slot| return free_slot;
+    // 池满：驱逐一个非 protect 的槽
+    var evict_idx: usize = 0;
+    var found_evict = false;
+    var i: usize = 0;
+    while (i < FPR_POOL.len) : (i += 1) {
+        const owner = fpr.fpr_owner[i];
+        if (owner == 0xFF) continue;
+        if (owner == protect_b or owner == protect_c) continue;
+        evict_idx = i;
+        found_evict = true;
+        break;
+    }
+    if (!found_evict) evict_idx = 0;
+    const victim = fpr.fpr_owner[evict_idx];
+    if (victim != 0xFF) {
+        // 仅驱逐缓存状态（不写回内存），因为缓存值来自内存加载
+        fpr.evict(victim);
+    }
+    return evict_idx;
+}
+
 /// 桥接模式编译：直接从字节码生成 ARM64 机器码。
 ///
 /// JIT 函数签名: fn(vm: *RegVM, base: usize) callconv(.c) void
@@ -1663,6 +1828,11 @@ pub fn compileBridge(
     var reg_types = try allocator.alloc(RegType, reg_count);
     defer allocator.free(reg_types);
     @memset(reg_types, .unknown);
+
+    // ── FPR 常驻状态（缓存 f64 输入操作数）──
+    var fpr_state = try FprState.init(allocator, reg_count);
+    defer fpr_state.deinit(allocator);
+
     // 从 param_types 初始化参数寄存器类型（仅在入口基本块有效）
     for (func.param_types, 0..) |pt, i| {
         if (i >= reg_count) break;
@@ -1770,9 +1940,10 @@ pub fn compileBridge(
         // 记录字节码 ip → 代码偏移
         try ip_to_code.put(ip, @intCast(code.items.len));
 
-        // 跳转目标处重置类型传播：不同控制流路径可能赋予寄存器不同类型
+        // 跳转目标处重置类型传播与 FPR 状态：不同控制流路径可能赋予寄存器不同类型
         if (ip > 0 and jump_targets.contains(ip)) {
             @memset(reg_types, .unknown);
+            fpr_state.invalidateAll();
         }
 
         const inst = instructions[ip];
@@ -1817,23 +1988,30 @@ pub fn compileBridge(
                     try emit(&code, allocator, encStrImm(1, GPR.x13, GPR.x10, @intCast((@as(u32, a) * 32 + INT_LO_OFF) / 8)));
                     reg_types[a] = .i64;
                 } else if (b_known_f64 and c_known_f64 and op != .mod) {
-                    // ── 类型已知 f64：跳过 tag 检查，直接浮点算术 ──
-                    try emit(&code, allocator, encLdrImm(1, GPR.x9, GPR.x19, @intCast(REG_POOL_PTR_OFFSET / 8)));
-                    try emit(&code, allocator, encAddLsl5(GPR.x10, GPR.x9, GPR.x20));
-                    try emit(&code, allocator, encLdrF64(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 8)));
-                    try emit(&code, allocator, encLdrF64(FPR.d1, GPR.x10, @intCast((@as(u32, c) * 32 + FLOAT_BITS_OFF) / 8)));
+                    // ── 类型已知 f64：用 FPR 池加载，跳过 tag 检查 ──
+                    try emitFrameBase(&code, allocator);
+                    // a 将被覆盖；若 a 常驻 FPR，先驱逐（防止 a==b/c 时数据丢失）
+                    fpr_state.evict(a);
+                    const fpr_b = try emitEnsureFpr(&code, allocator, &fpr_state, b, 0xFF);
+                    const fpr_c = try emitEnsureFpr(&code, allocator, &fpr_state, c, b);
+                    // d0 = fpr_b op fpr_c（直接计算，无需 fmov）
                     switch (op) {
-                        .add => try emit(&code, allocator, encFadd(FPR.d0, FPR.d0, FPR.d1)),
-                        .sub => try emit(&code, allocator, encFsub(FPR.d0, FPR.d0, FPR.d1)),
-                        .mul => try emit(&code, allocator, encFmul(FPR.d0, FPR.d0, FPR.d1)),
-                        .div => try emit(&code, allocator, encFdiv(FPR.d0, FPR.d0, FPR.d1)),
+                        .add => try emit(&code, allocator, encFadd(FPR.d0, fpr_b, fpr_c)),
+                        .sub => try emit(&code, allocator, encFsub(FPR.d0, fpr_b, fpr_c)),
+                        .mul => try emit(&code, allocator, encFmul(FPR.d0, fpr_b, fpr_c)),
+                        .div => try emit(&code, allocator, encFdiv(FPR.d0, fpr_b, fpr_c)),
                         else => unreachable,
                     }
+                    // 将结果写回内存
                     try emit(&code, allocator, encStrF64(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 8)));
+                    // 更新 tag/type（内存元数据需同步，供 cold 路径检查）
                     try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
                     try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
                     try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F64_VAL, 0));
                     try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+                    // 若 a==b 或 a==c，a 的内存已更新但 b/c 的 FPR 缓存已过时，需驱逐
+                    if (a == b) fpr_state.evict(b);
+                    if (a == c) fpr_state.evict(c);
                     reg_types[a] = .f64;
                 } else if (b_known_f32 and c_known_f32 and op != .mod) {
                     // ── 类型已知 f32：跳过 tag 检查，直接单精度浮点算术 ──
@@ -2027,6 +2205,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2067,14 +2246,16 @@ pub fn compileBridge(
                     try emit(&code, allocator, encStrImm(1, GPR.x13, GPR.x10, @intCast((@as(u32, a) * 32 + INT_LO_OFF) / 8)));
                     reg_types[a] = .i64;
                 } else if (b_known_f64) {
-                    // ── 类型已知 f64：直接浮点取反 ──
-                    try emit(&code, allocator, encLdrF64(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 8)));
-                    try emit(&code, allocator, encFneg(FPR.d0, FPR.d0));
+                    // ── 类型已知 f64：用 FPR 池加载，直接浮点取反 ──
+                    fpr_state.evict(a);
+                    const fpr_b = try emitEnsureFpr(&code, allocator, &fpr_state, b, 0xFF);
+                    try emit(&code, allocator, encFneg(FPR.d0, fpr_b));
                     try emit(&code, allocator, encStrF64(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 8)));
                     try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
                     try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
                     try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F64_VAL, 0));
                     try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+                    if (a == b) fpr_state.evict(b);
                     reg_types[a] = .f64;
                 } else if (b_known_f32) {
                     // ── 类型已知 f32：直接单精度浮点取反 ──
@@ -2187,6 +2368,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2232,13 +2414,11 @@ pub fn compileBridge(
                     try emit(&code, allocator, encStrb(GPR.x13, GPR.x10, @intCast(@as(u32, a) * 32 + PAYLOAD_OFF)));
                     reg_types[a] = .boolean;
                 } else if (b_known_f64 and c_known_f64) {
-                    // ── 类型已知 f64：跳过 tag 检查 ──
-                    try emit(&code, allocator, encLdrImm(1, GPR.x9, GPR.x19, @intCast(REG_POOL_PTR_OFFSET / 8)));
-                    try emit(&code, allocator, encAddLsl5(GPR.x10, GPR.x9, GPR.x20));
-
-                    try emit(&code, allocator, encLdrF64(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 8)));
-                    try emit(&code, allocator, encLdrF64(FPR.d1, GPR.x10, @intCast((@as(u32, c) * 32 + FLOAT_BITS_OFF) / 8)));
-                    try emit(&code, allocator, encFcmp(FPR.d0, FPR.d1));
+                    // ── 类型已知 f64：用 FPR 池加载，跳过 tag 检查 ──
+                    try emitFrameBase(&code, allocator);
+                    const fpr_b = try emitEnsureFpr(&code, allocator, &fpr_state, b, 0xFF);
+                    const fpr_c = try emitEnsureFpr(&code, allocator, &fpr_state, c, b);
+                    try emit(&code, allocator, encFcmp(fpr_b, fpr_c));
                     const cond: u4 = switch (op) {
                         .eq => Cond.EQ, .neq => Cond.NE, .lt => Cond.LT,
                         .gt => Cond.GT, .le => Cond.LE, .ge => Cond.GE,
@@ -2323,6 +2503,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2371,6 +2552,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2451,6 +2633,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2504,6 +2687,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 // rt_step 返回 true（函数已返回），跳到 exit
                 const b_exit: u32 = @intCast(code.items.len);
@@ -2561,6 +2745,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2630,6 +2815,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2673,6 +2859,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2716,6 +2903,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2759,6 +2947,7 @@ pub fn compileBridge(
                     if (ip > 0xFFFF) {
                         try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                     }
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encBlr(GPR.x21));
                     const cbnz_exit: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2813,6 +3002,7 @@ pub fn compileBridge(
                     if (ip > 0xFFFF) {
                         try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                     }
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encBlr(GPR.x21));
                     const cbnz_exit: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2883,6 +3073,7 @@ pub fn compileBridge(
                     if (ip > 0xFFFF) {
                         try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                     }
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encBlr(GPR.x21));
                     const cbnz_exit: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -2921,6 +3112,7 @@ pub fn compileBridge(
                 // x5 = return_reg = a
                 try emit(&code, allocator, encMovz(1, GPR.x5, @truncate(a), 0));
                 // blr x22 (rt_call_inline)
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x22));
                 // cbnz w0, exit（如果 rt_call_inline 返回 true，函数已返回）
                 const cbnz_exit: u32 = @intCast(code.items.len);
@@ -3007,6 +3199,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 const cbnz_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -3033,6 +3226,7 @@ pub fn compileBridge(
                     // x2 = dst_slot = base + a (same as recv)
                     try emit(&code, allocator, encAddImm(1, GPR.x2, GPR.x20, @intCast(@as(u32, a))));
                     // blr x24 (rt_array_len)
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encBlr(GPR.x24));
                     // 检查返回值: 非 0 → rt_step 回退
                     try emit(&code, allocator, encCmpImm(1, GPR.x0, 0));
@@ -3054,6 +3248,7 @@ pub fn compileBridge(
                     if (ip > 0xFFFF) {
                         try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                     }
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encBlr(GPR.x21));
                     const cbnz_exit: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -3073,6 +3268,7 @@ pub fn compileBridge(
                     // x3 = dst_slot = base + a
                     try emit(&code, allocator, encAddImm(1, GPR.x3, GPR.x20, @intCast(@as(u32, a))));
                     // blr x23 (rt_array_push)
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encBlr(GPR.x23));
                     // 检查返回值
                     try emit(&code, allocator, encCmpImm(1, GPR.x0, 0));
@@ -3094,6 +3290,7 @@ pub fn compileBridge(
                     if (ip > 0xFFFF) {
                         try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                     }
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encBlr(GPR.x21));
                     const cbnz_exit: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -3109,6 +3306,7 @@ pub fn compileBridge(
                     if (ip > 0xFFFF) {
                         try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                     }
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encBlr(GPR.x21));
                     const cbnz_exit: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encCbnz(1, GPR.x0));
@@ -3124,6 +3322,7 @@ pub fn compileBridge(
                 if (ip > 0xFFFF) {
                     try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
                 }
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encBlr(GPR.x21));
                 // cbnz w0, exit（如果 rt_step 返回 true，函数已返回）
                 const cbnz_exit: u32 = @intCast(code.items.len);

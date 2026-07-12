@@ -264,19 +264,87 @@ inline fn enc2R(opcode: u22, rd: u8, rj: u8) u32 {
         rd;
 }
 
+// ════════════════════════════════════════════════════════════════════
+// 跳转指令回填辅助函数（reenc 系列）
+// 从占位指令中解码寄存器/条件字段，用新偏移量重新编码整条指令。
+// 偏移量参数均为字节偏移，内部右移 2 转为指令索引差。
+// ════════════════════════════════════════════════════════════════════
+
+/// 从 I26-type 指令（B/BL）中提取 opcode 字段。
+inline fn i26Opcode(inst: u32) u6 {
+    return @truncate(inst >> 26);
+}
+
+/// 重新编码 I26-type 跳转指令（B/BL），保留 opcode，用新偏移量编码。
+/// delta 为字节偏移量（target - jump）。
+inline fn reencI26(inst: u32, delta: i32) u32 {
+    return encI26(i26Opcode(inst), @intCast(@as(i64, delta) >> 2));
+}
+
+/// 从 2RI16-type 指令（BEQ/BNE/BLT/BGE/BLTU/BGEU）中提取 opcode 字段。
+inline fn bccOpcode(inst: u32) u6 {
+    return @truncate(inst >> 26);
+}
+
+/// 从 2RI16-type 指令中提取 rj 字段。
+inline fn bccRj(inst: u32) u8 {
+    return @truncate((inst >> 5) & 0x1F);
+}
+
+/// 从 2RI16-type 指令中提取 rd 字段。
+inline fn bccRd(inst: u32) u8 {
+    return @truncate(inst & 0x1F);
+}
+
+/// 重新编码 2RI16-type 条件跳转指令（BEQ/BNE/BLT/BGE/BLTU/BGEU）。
+/// delta 为字节偏移量。
+inline fn reencBcc(inst: u32, delta: i32) u32 {
+    const off16: i16 = @intCast(@as(i64, delta) >> 2);
+    return enc2RI16(bccOpcode(inst), bccRd(inst), bccRj(inst), off16);
+}
+
+/// 从 1RI21-type 指令（BEQZ/BNEZ）中提取 opcode 字段。
+inline fn bzOpcode(inst: u32) u6 {
+    return @truncate(inst >> 26);
+}
+
+/// 从 1RI21-type 指令（BEQZ/BNEZ）中提取 rj 字段。
+inline fn bzRj(inst: u32) u8 {
+    return @truncate((inst >> 5) & 0x1F);
+}
+
+/// 重新编码 1RI21-type 跳转指令（BEQZ/BNEZ）。
+/// delta 为字节偏移量。
+inline fn reencBz(inst: u32, delta: i32) u32 {
+    const off21: i32 = @intCast(@as(i64, delta) >> 2);
+    return enc1RI21(bzOpcode(inst), bzRj(inst), off21);
+}
+
+/// 重新编码 BCEQZ/BCNEZ 指令（FCC 条件跳转）。
+/// BCEQZ: opcode[31:26]=010010 | offs21[15:0][25:10] | subop[9:8]=00 | cj[7:5] | offs21[20:16][4:0]
+/// BCNEZ: opcode[31:26]=010010 | offs21[15:0][25:10] | subop[9:8]=01 | cj[7:5] | offs21[20:16][4:0]
+/// delta 为字节偏移量。
+inline fn reencBcnez(inst: u32, delta: i32) u32 {
+    const off21: i32 = @intCast(@as(i64, delta) >> 2);
+    const uimm: u32 = @as(u32, @bitCast(off21)) & 0x1FFFFF;
+    // 保留 opcode[31:26] 和 subop[9:8] 和 cj[7:5]，替换 offs21 字段
+    const base: u32 = inst & ~(@as(u32, (0xFFFF << 10) | 0x1F));
+    return base | ((uimm & 0xFFFF) << 10) | ((uimm >> 16) & 0x1F);
+}
+
 /// 3R-type 操作码常量（bits[31:15]）。
 /// 指令 = opcode << 15 | (rk << 10) | (rj << 5) | rd
 const OP3R = struct {
     pub const ADD_D: u17 = 0b0000000000_01_00001; // 0x00108000 >> 15 = 0x21
     pub const SUB_D: u17 = 0b0000000000_01_00011; // 0x00118000 >> 15 = 0x23
-    pub const SLT: u17 = 0b0000000000_00_00100; // 0x00120000 >> 15 = 0x24
-    pub const SLTU: u17 = 0b0000000000_00_00101; // 0x00128000 >> 15 = 0x25
-    pub const NOR: u17 = 0b0000000000_00_01000; // 0x00140000 >> 15 = 0x28
-    pub const AND: u17 = 0b0000000000_00_01001; // 0x00148000 >> 15 = 0x29
-    pub const OR: u17 = 0b0000000000_00_01010; // 0x00150000 >> 15 = 0x2A
-    pub const XOR: u17 = 0b0000000000_00_01011; // 0x00158000 >> 15 = 0x2B
-    pub const ORN: u17 = 0b0000000000_00_01100; // 0x00160000 >> 15 = 0x2C
-    pub const ANDN: u17 = 0b0000000000_00_01101; // 0x00168000 >> 15 = 0x2D
+    pub const SLT: u17 = 0b0000000000_01_00100; // 0x00120000 >> 15 = 0x24
+    pub const SLTU: u17 = 0b0000000000_01_00101; // 0x00128000 >> 15 = 0x25
+    pub const NOR: u17 = 0b0000000000_01_01000; // 0x00140000 >> 15 = 0x28
+    pub const AND: u17 = 0b0000000000_01_01001; // 0x00148000 >> 15 = 0x29
+    pub const OR: u17 = 0b0000000000_01_01010; // 0x00150000 >> 15 = 0x2A
+    pub const XOR: u17 = 0b0000000000_01_01011; // 0x00158000 >> 15 = 0x2B
+    pub const ORN: u17 = 0b0000000000_01_01100; // 0x00160000 >> 15 = 0x2C
+    pub const ANDN: u17 = 0b0000000000_01_01101; // 0x00168000 >> 15 = 0x2D
     pub const SLL_D: u17 = 0b0000000000_01_10001; // 0x00188000 >> 15 = 0x31
     pub const SRL_D: u17 = 0b0000000000_01_10010; // 0x00190000 >> 15 = 0x32
     pub const SRA_D: u17 = 0b0000000000_01_10011; // 0x00198000 >> 15 = 0x33
@@ -340,26 +408,29 @@ const OPBR = struct {
 };
 
 /// 2R-type 浮点操作码常量（bits[31:10]）。
+/// 使用编译期算术确保正确性：opcode = full_encoding >> 10。
 const OP2R = struct {
-    pub const FMOV_D: u22 = 0b0001000101001011100000; // 0x01149800 >> 10
-    pub const FABS_D: u22 = 0b0001000101001010000010; // 0x01140800 >> 10
-    pub const FNEG_D: u22 = 0b0001000101001011000110; // 0x01141800 >> 10
-    pub const MOVGR2FR_D: u22 = 0b0001000101001010001010; // 0x0114a800 >> 10
-    pub const MOVFR2GR_D: u22 = 0b0001000101001011101010; // 0x0114b800 >> 10
-    pub const FFINT_D_L: u22 = 0b0001000111010010010000; // 0x011d2800 >> 10 (int64→double)
-    pub const FTINTRZ_W_D: u22 = 0b0001000110101000100010; // 0x011a8800 >> 10 (double→int32 trunc)
-    pub const FTINTRNE_W_D: u22 = 0b0001000110101100100010; // 0x011ac800 >> 10 (double→int32 round)
+    pub const FMOV_D: u22 = 0x01149800 >> 10;
+    pub const FABS_D: u22 = 0x01140800 >> 10;
+    pub const FNEG_D: u22 = 0x01141800 >> 10;
+    pub const MOVGR2FR_D: u22 = 0x0114A800 >> 10;
+    pub const MOVFR2GR_D: u22 = 0x0114B800 >> 10;
+    pub const FFINT_D_L: u22 = 0x011D2800 >> 10; // int64→double
+    pub const FTINTRZ_W_D: u22 = 0x011A8800 >> 10; // double→int32 trunc
+    pub const FTINTRNE_W_D: u22 = 0x011AC800 >> 10; // double→int32 round
+    pub const FTINTRZ_L_D: u22 = 0x011AA800 >> 10; // double→int64 trunc
 };
 
 /// 浮点 3R-type 操作码常量（bits[31:15]）。
+/// 使用编译期算术确保正确性：opcode = full_encoding >> 15。
 const OPF3R = struct {
-    pub const FADD_D: u17 = 0b0000000010000010_0; // 0x01010000 >> 15
-    pub const FSUB_D: u17 = 0b0000000010000110_0; // 0x01030000 >> 15
-    pub const FMUL_D: u17 = 0b0000000010001010_0; // 0x01050000 >> 15
-    pub const FDIV_D: u17 = 0b0000000010001110_0; // 0x01070000 >> 15
-    pub const FCMP_CEQ_D: u17 = 0b0000011000010010_0; // 0x0c220000 >> 15
-    pub const FCMP_CLT_D: u17 = 0b0000011000010001_0; // 0x0c210000 >> 15
-    pub const FCMP_CLE_D: u17 = 0b0000011000010011_0; // 0x0c230000 >> 15
+    pub const FADD_D: u17 = 0x01010000 >> 15; // 514
+    pub const FSUB_D: u17 = 0x01030000 >> 15; // 518
+    pub const FMUL_D: u17 = 0x01050000 >> 15; // 522
+    pub const FDIV_D: u17 = 0x01070000 >> 15; // 526
+    pub const FCMP_CEQ_D: u17 = 0x0c220000 >> 15; // 6212
+    pub const FCMP_CLT_D: u17 = 0x0c210000 >> 15; // 6210
+    pub const FCMP_CLE_D: u17 = 0x0c230000 >> 15; // 6214
 };
 
 /// 浮点 2RI12-type 操作码常量（bits[31:22]）。
@@ -666,6 +737,11 @@ const BridgeBuf = struct {
         try self.emit(enc2R(OP2R.FTINTRZ_W_D, fd, fj));
     }
 
+    /// ftintrz.l.d fd, fj (double → int64, 向零取整)
+    fn ftintrzLD(self: *BridgeBuf, fd: u8, fj: u8) !void {
+        try self.emit(enc2R(OP2R.FTINTRZ_L_D, fd, fj));
+    }
+
     // ── 伪指令 ──
 
     /// move rd, rj (等价于 or rd, rj, zero)
@@ -674,19 +750,24 @@ const BridgeBuf = struct {
     }
 
     /// 加载 64 位立即数到寄存器。
-    /// 使用 lu12i.w + lu32i.d + lu52i.d 三条指令。
+    /// 使用 lu12i.w + ori + lu32i.d + lu52i.d 四条指令。
+    /// lu12i.w 只设置 bits[31:12]，bits[11:0] 清零，需要 ori 补齐低 12 位。
     fn loadImm64(self: *BridgeBuf, rd: u8, val: u64) !void {
+        const lo12: u16 = @intCast(val & 0xFFF);
         const lo20: i32 = @intCast((val >> 12) & 0xFFFFF);
         const mid20: i32 = @intCast((val >> 32) & 0xFFFFF);
         const hi12: i16 = @intCast((val >> 52) & 0xFFF);
-        // lu12i.w rd, lo20 (bits[31:12] = lo20, 符号扩展到 64 位)
-        // 注意：imm20 是 bits[31:12] 的值，需要符号扩展
+        // lu12i.w rd, lo20 (bits[31:12] = lo20, 符号扩展到 64 位, bits[11:0] = 0)
         const lo20_signed: i32 = if (lo20 & 0x80000 != 0) lo20 - 0x100000 else lo20;
         try self.lu12iW(rd, lo20_signed);
-        // lu32i.d rd, mid20 (bits[51:32] = mid20)
+        // ori rd, rd, lo12 (bits[11:0] = lo12，零扩展立即数)
+        if (lo12 != 0) {
+            try self.ori(rd, rd, @intCast(lo12));
+        }
+        // lu32i.d rd, mid20 (bits[51:32] = mid20，保持 bits[31:0] 不变)
         const mid20_signed: i32 = if (mid20 & 0x80000 != 0) mid20 - 0x100000 else mid20;
         try self.lu32iD(rd, mid20_signed);
-        // lu52i.d rd, rd, hi12 (bits[63:52] = hi12)
+        // lu52i.d rd, rd, hi12 (bits[63:52] = hi12，保持 bits[51:0] 不变)
         try self.lu52iD(rd, rd, hi12);
     }
 
@@ -799,50 +880,6 @@ const BridgeBuf = struct {
         try self.ldD(rd, GPR.sp, offset);
     }
 
-    // ── 回填函数 ──
-
-    /// 回填 B/BL 跳转目标（I26-type）。
-    /// 偏移量 = (target_offset - jump_offset) >> 2，需为 4 字节对齐。
-    /// I26 编码: imm26[15:0] 在 bits[25:10], imm26[25:16] 在 bits[9:0]
-    fn patchB(code: []u8, jump_offset: u32, target_offset: u32) void {
-        const diff: i64 = @as(i64, target_offset) - @as(i64, jump_offset);
-        const off26: i32 = @intCast(diff >> 2);
-        const uimm: u32 = @as(u32, @bitCast(off26)) & 0x3FFFFFF;
-        // 读取当前指令
-        var inst: u32 = std.mem.readInt(u32, code[jump_offset..][0..4], .little);
-        // 清除 imm26 字段
-        inst &= ~((0xFFFF << 10) | 0x3FF);
-        // 设置新的 imm26
-        inst |= ((uimm & 0xFFFF) << 10) | ((uimm >> 16) & 0x3FF);
-        std.mem.writeInt(u32, code[jump_offset..][0..4], inst, .little);
-    }
-
-    /// 回填 BEQ/BNE/BLT/BGE/BLTU/BGEU 跳转目标（2RI16-type）。
-    /// 偏移量 = (target_offset - jump_offset) >> 2。
-    /// offs16 在 bits[25:10]。
-    fn patchBcc(code: []u8, jump_offset: u32, target_offset: u32) void {
-        const diff: i64 = @as(i64, target_offset) - @as(i64, jump_offset);
-        const off16: i32 = @intCast(diff >> 2);
-        const uimm: u32 = @as(u32, @bitCast(off16)) & 0xFFFF;
-        var inst: u32 = std.mem.readInt(u32, code[jump_offset..][0..4], .little);
-        inst &= ~(0xFFFF << 10);
-        inst |= uimm << 10;
-        std.mem.writeInt(u32, code[jump_offset..][0..4], inst, .little);
-    }
-
-    /// 回填 BEQZ/BNEZ 跳转目标（1RI21-type）。
-    /// 偏移量 = (target_offset - jump_offset) >> 2。
-    /// imm21[15:0] 在 bits[25:10], imm21[20:16] 在 bits[4:0]。
-    fn patchBz(code: []u8, jump_offset: u32, target_offset: u32) void {
-        const diff: i64 = @as(i64, target_offset) - @as(i64, jump_offset);
-        const off21: i32 = @intCast(diff >> 2);
-        const uimm: u32 = @as(u32, @bitCast(off21)) & 0x1FFFFF;
-        var inst: u32 = std.mem.readInt(u32, code[jump_offset..][0..4], .little);
-        // 清除 imm21 字段: bits[25:10] 和 bits[4:0]
-        inst &= ~((0xFFFF << 10) | 0x1F);
-        inst |= ((uimm & 0xFFFF) << 10) | ((uimm >> 16) & 0x1F);
-        std.mem.writeInt(u32, code[jump_offset..][0..4], inst, .little);
-    }
 };
 
 /// 待回填的跳转（桥接模式专用）。
@@ -855,15 +892,19 @@ const BridgeFixup = struct {
 /// 发射 rt_step 桥接调用代码。
 /// rt_step(vm, ip) — 返回 false=继续, true=函数已返回
 /// 调用后检查返回值，如果为 true 则跳转到 exit。
+/// rt_step 会 clobber 所有 caller-saved FPR，调用前需 invalidateAll。
 fn emitRtStepCall(
     buf: *BridgeBuf,
     ip: u32,
     pending_fixups: *std.ArrayListUnmanaged(BridgeFixup),
     allocator: std.mem.Allocator,
+    fpr: *FprState,
 ) !void {
     // 设置参数: a0 = vm (s0), a1 = ip
     try buf.moveReg(CARG0, BR_VM);
     try buf.loadImm64(CARG1, @intCast(ip));
+    // rt_step 会 clobber caller-saved FPR，缓存必须失效
+    fpr.invalidateAll();
     // jirl ra, s2, 0 (调用 rt_step)
     try buf.jirl(GPR.ra, BR_RT_STEP, 0);
     // beqz a0, next (如果返回 false=继续，跳过 exit)
@@ -872,7 +913,11 @@ fn emitRtStepCall(
     const b_pos = try buf.b();
     // next:
     const next_off = buf.len();
-    BridgeBuf.patchBz(buf.code.items, bz_pos, next_off);
+    {
+        const old_inst = std.mem.readInt(u32, buf.code.items[bz_pos..][0..4], .little);
+        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, bz_pos));
+        std.mem.writeInt(u32, buf.code.items[bz_pos..][0..4], reencBz(old_inst, delta), .little);
+    }
     // exit 跳转回填
     try pending_fixups.append(allocator, .{
         .code_offset = b_pos,
@@ -893,6 +938,187 @@ fn emitFrameBase2(buf: *BridgeBuf) !void {
     try buf.sllD(TMP4, BR_BASE, TMP4);
     // add.d TMP2, TMP3, TMP4      → TMP2 = frame base
     try buf.addD(TMP2, TMP3, TMP4);
+}
+
+/// 计算访问 reg_pool[slot].field_off 的基址和偏移。
+/// 2RI12 格式的 si12 字段为 12 位有符号立即数（范围 -2048 到 2047）。
+/// 当 slot * 32 + field_off 超出此范围时（slot >= 64），
+/// 将 slot * 32 加到 TMP4（scratch），返回 (TMP4, field_off)。
+/// 否则返回 (TMP2, slot * 32 + field_off)。
+/// 注意：调用 emitFrameBase2 后 TMP3/TMP4 可自由使用。
+const SlotAddr = struct { base: u8, off: i16 };
+
+fn emitSlotAddr(buf: *BridgeBuf, slot: u8, field_off: u32) !SlotAddr {
+    const total: i32 = @as(i32, slot) * 32 + @as(i32, @intCast(field_off));
+    if (total >= -2048 and total <= 2047) {
+        return .{ .base = TMP2, .off = @intCast(total) };
+    }
+    // 偏移量超出 si12 范围，用 TMP4 计算地址
+    const slot_off: i32 = @as(i32, slot) * 32;
+    try buf.loadImm64(TMP4, @bitCast(@as(i64, slot_off)));
+    try buf.addD(TMP4, TMP2, TMP4);
+    return .{ .base = TMP4, .off = @intCast(field_off) };
+}
+
+/// 安全的 fld.d：自动处理大偏移
+fn safeFldD(buf: *BridgeBuf, fd: u8, slot: u8, field_off: u32) !void {
+    const addr = try emitSlotAddr(buf, slot, field_off);
+    try buf.fldD(fd, addr.base, addr.off);
+}
+
+/// 安全的 fst.d：自动处理大偏移
+fn safeFstD(buf: *BridgeBuf, fd: u8, slot: u8, field_off: u32) !void {
+    const addr = try emitSlotAddr(buf, slot, field_off);
+    try buf.fstD(fd, addr.base, addr.off);
+}
+
+/// 安全的 ld.d：自动处理大偏移
+fn safeLdD(buf: *BridgeBuf, rd: u8, slot: u8, field_off: u32) !void {
+    const addr = try emitSlotAddr(buf, slot, field_off);
+    try buf.ldD(rd, addr.base, addr.off);
+}
+
+/// 安全的 st.d：自动处理大偏移
+fn safeStD(buf: *BridgeBuf, rd: u8, slot: u8, field_off: u32) !void {
+    const addr = try emitSlotAddr(buf, slot, field_off);
+    try buf.stD(rd, addr.base, addr.off);
+}
+
+/// 安全的 st.b：自动处理大偏移
+fn safeStB(buf: *BridgeBuf, rd: u8, slot: u8, field_off: u32) !void {
+    const addr = try emitSlotAddr(buf, slot, field_off);
+    try buf.stB(rd, addr.base, addr.off);
+}
+
+/// 安全的 ld.bu：自动处理大偏移
+fn safeLdBu(buf: *BridgeBuf, rd: u8, slot: u8, field_off: u32) !void {
+    const addr = try emitSlotAddr(buf, slot, field_off);
+    try buf.ldBu(rd, addr.base, addr.off);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// FPR 缓存层（与 x86_64/arm64/riscv64 对齐）
+// ════════════════════════════════════════════════════════════════════
+
+/// FPR 缓存池：用于已知 f64 路径的输入操作数缓存。
+/// 选择 ft2-ft5（caller-saved 临时寄存器），保留 ft0/ft1 作为未知类型路径的 scratch。
+const FPR_POOL = [_]u8{ FPR.ft2, FPR.ft3, FPR.ft4, FPR.ft5 };
+
+const FPR_NONE: i8 = -1;
+
+/// FPR 常驻状态：跟踪 reg_pool 槽位 → FPR 缓存池的映射。
+/// fpr_map[reg] = FPR_NONE 表示该 reg 的 f64 bits 仅在内存中；
+/// 否则值 = FPR_POOL 索引，对应 FPR 寄存器持有最新 bits。
+/// fpr_owner[pool_idx] = 持有该 FPR 的 reg 编号（0xFF=空闲）。
+const FprState = struct {
+    fpr_map: []i8, // reg_count × 1
+    fpr_owner: [FPR_POOL.len]u8, // pool_idx → reg（0xFF=空闲）
+
+    fn init(allocator: std.mem.Allocator, reg_count: usize) !FprState {
+        const m = try allocator.alloc(i8, reg_count);
+        @memset(m, FPR_NONE);
+        return .{ .fpr_map = m, .fpr_owner = [_]u8{0xFF} ** FPR_POOL.len };
+    }
+
+    fn deinit(self: *FprState, allocator: std.mem.Allocator) void {
+        allocator.free(self.fpr_map);
+    }
+
+    /// 判断 reg 是否常驻 FPR
+    fn isResident(self: *const FprState, reg: u8) bool {
+        return reg < self.fpr_map.len and self.fpr_map[reg] != FPR_NONE;
+    }
+
+    /// 获取 reg 对应的 FPR 编号；调用方需先 isResident 判断
+    fn getFpr(self: *const FprState, reg: u8) u8 {
+        const idx: usize = @intCast(self.fpr_map[reg]);
+        return FPR_POOL[idx];
+    }
+
+    /// 将 reg 标记为常驻到 pool_idx 对应的 FPR（替换原 owner）
+    fn setResident(self: *FprState, reg: u8, pool_idx: usize) void {
+        // 先驱逐原 owner（如果有）
+        const old_owner = self.fpr_owner[pool_idx];
+        if (old_owner != 0xFF and old_owner < self.fpr_map.len) {
+            self.fpr_map[old_owner] = FPR_NONE;
+        }
+        // 清除 reg 的旧映射（如果 reg 之前在其他 FPR）
+        if (reg < self.fpr_map.len and self.fpr_map[reg] != FPR_NONE) {
+            const old_idx: usize = @intCast(self.fpr_map[reg]);
+            self.fpr_owner[old_idx] = 0xFF;
+        }
+        self.fpr_map[reg] = @intCast(pool_idx);
+        self.fpr_owner[pool_idx] = reg;
+    }
+
+    /// 驱逐 reg（如果常驻），使其仅在内存
+    fn evict(self: *FprState, reg: u8) void {
+        if (reg >= self.fpr_map.len) return;
+        const idx = self.fpr_map[reg];
+        if (idx == FPR_NONE) return;
+        self.fpr_owner[@intCast(idx)] = 0xFF;
+        self.fpr_map[reg] = FPR_NONE;
+    }
+
+    /// 分配一个空闲 pool_idx；若无空闲返回 null
+    fn allocSlot(self: *const FprState) ?usize {
+        var i: usize = 0;
+        while (i < FPR_POOL.len) : (i += 1) {
+            if (self.fpr_owner[i] == 0xFF) return i;
+        }
+        return null;
+    }
+
+    /// 清空所有 FPR 映射（跳转目标/rt_step 调用前重置）
+    fn invalidateAll(self: *FprState) void {
+        @memset(self.fpr_map, FPR_NONE);
+        self.fpr_owner = [_]u8{0xFF} ** FPR_POOL.len;
+    }
+};
+
+/// 确保 reg 的 f64 bits 加载到某个 FPR，返回 FPR 编号。
+/// 若已常驻直接返回；否则从内存加载并标记常驻（必要时驱逐一个非 protect_reg 的槽）。
+/// 调用前需已 emitFrameBase2（TMP2 = frame base）。
+/// 仅用于编译时已知 f64 的路径；未知类型路径应使用 FT0/FT1 直接加载。
+/// protect_reg: 指定一个 reg 编号，其常驻 FPR 不允许被驱逐（传 0xFF 表示无保护）。
+fn emitEnsureFpr(
+    buf: *BridgeBuf,
+    fpr: *FprState,
+    reg: u8,
+    protect_reg: u8,
+) !u8 {
+    if (fpr.isResident(reg)) return fpr.getFpr(reg);
+    // 分配空闲槽
+    const slot = fpr.allocSlot() orelse blk: {
+        // 池满：驱逐一个非 protect_reg 的槽
+        var evict_idx: usize = 0;
+        var found_evict = false;
+        var i: usize = 0;
+        while (i < FPR_POOL.len) : (i += 1) {
+            const owner = fpr.fpr_owner[i];
+            if (owner == 0xFF) continue;
+            if (owner == protect_reg) continue;
+            evict_idx = i;
+            found_evict = true;
+            break;
+        }
+        if (!found_evict) {
+            // 所有槽都是 protect_reg 或空闲（不应发生，因为 allocSlot 返回 null 说明无空闲）
+            // 强制驱逐 pool[0]
+            evict_idx = 0;
+        }
+        const victim = fpr.fpr_owner[evict_idx];
+        if (victim != 0xFF) {
+            // 仅驱逐缓存状态（不写回内存），因为缓存值来自内存加载，内存已有正确值
+            fpr.evict(victim);
+        }
+        break :blk evict_idx;
+    };
+    const fpr_reg = FPR_POOL[slot];
+    // 从 frame_base(TMP2) 加载 reg.float.bits 到 fpr_reg（safeFldD 处理大偏移）
+    try safeFldD(buf, fpr_reg, reg, FLOAT_BITS_OFF);
+    fpr.setResident(reg, slot);
+    return fpr_reg;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -939,6 +1165,10 @@ pub fn compileBridge(
     var reg_types = try allocator.alloc(RegType, reg_count);
     defer allocator.free(reg_types);
     @memset(reg_types, .unknown);
+
+    // ── FPR 常驻状态（缓存 f64 输入操作数）──
+    var fpr_state = try FprState.init(allocator, reg_count);
+    defer fpr_state.deinit(allocator);
     for (func.param_types, 0..) |pt, i| {
         if (i >= reg_count) break;
         if (pt) |tname| {
@@ -1024,6 +1254,7 @@ pub fn compileBridge(
         // 跳转目标处重置类型传播
         if (ip > 0 and jump_targets.contains(ip)) {
             @memset(reg_types, .unknown);
+            fpr_state.invalidateAll();
         }
 
         const inst = instructions[ip];
@@ -1046,9 +1277,9 @@ pub fn compileBridge(
                     // ── i64 快速路径 ──
                     try emitFrameBase2(&buf);
                     // t0 = reg_pool[b].lo
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeLdD(&buf, TMP0, b, INT_LO_OFF);
                     // t3 = reg_pool[c].lo
-                    try buf.ldD(TMP3, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeLdD(&buf, TMP3, c, INT_LO_OFF);
                     switch (op) {
                         .add => try buf.addD(TMP0, TMP0, TMP3),
                         .sub => try buf.subD(TMP0, TMP0, TMP3),
@@ -1059,50 +1290,54 @@ pub fn compileBridge(
                     }
                     // 存储 tag = TAG_INT
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
                     // 存储 int type = I64
                     try buf.addiD(TMP1, GPR.zero, @intCast(INT_TYPE_I64_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)));
+                    try safeStB(&buf, TMP1, a, INT_TYPE_OFF);
                     // 存储 lo
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeStD(&buf, TMP0, a, INT_LO_OFF);
                     reg_types[a] = .i64;
                 } else if (b_known_f64 and c_known_f64 and op != .mod) {
-                    // ── f64 快速路径 ──
+                    // ── f64 快速路径：用 FPR 缓存池加载，跳过 tag 检查 ──
                     try emitFrameBase2(&buf);
-                    // ft0 = reg_pool[b].bits
-                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                    // ft1 = reg_pool[c].bits
-                    try buf.fldD(FT1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    // a 将被覆盖；若 a 常驻 FPR，先驱逐（防止 a==b/c 时数据丢失）
+                    fpr_state.evict(a);
+                    const fpr_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                    const fpr_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
+                    // FT0 = fpr_b op fpr_c（结果暂存 FT0，不占用缓存槽）
                     switch (op) {
-                        .add => try buf.faddD(FT0, FT0, FT1),
-                        .sub => try buf.fsubD(FT0, FT0, FT1),
-                        .mul => try buf.fmulD(FT0, FT0, FT1),
-                        .div => try buf.fdivD(FT0, FT0, FT1),
+                        .add => try buf.faddD(FT0, fpr_b, fpr_c),
+                        .sub => try buf.fsubD(FT0, fpr_b, fpr_c),
+                        .mul => try buf.fmulD(FT0, fpr_b, fpr_c),
+                        .div => try buf.fdivD(FT0, fpr_b, fpr_c),
                         else => unreachable,
                     }
                     // 存储 f64 结果
-                    try buf.fstD(FT0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try safeFstD(&buf, FT0, a, FLOAT_BITS_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try safeStB(&buf, TMP1, a, FLOAT_TYPE_OFF);
+                    // 若 a==b 或 a==c，a 的内存已更新但 b/c 的 FPR 缓存已过时，需驱逐
+                    if (a == b) fpr_state.evict(b);
+                    if (a == c) fpr_state.evict(c);
                     reg_types[a] = .f64;
                 } else {
                     // ── 未知类型：tag 检查通用路径 ──
                     try emitFrameBase2(&buf);
 
                     // 检查 b tag == TAG_INT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, b, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
                     const bne1_pos = try buf.bne(TMP0, TMP1);
 
                     // 检查 c tag == TAG_INT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, c, TAG_OFF);
                     const bne2_pos = try buf.bne(TMP0, TMP1);
 
                     // 加载 i64 值
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
-                    try buf.ldD(TMP3, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeLdD(&buf, TMP0, b, INT_LO_OFF);
+                    try safeLdD(&buf, TMP3, c, INT_LO_OFF);
 
                     switch (op) {
                         .add => try buf.addD(TMP0, TMP0, TMP3),
@@ -1115,43 +1350,51 @@ pub fn compileBridge(
 
                     // 存储 i64 结果
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(INT_TYPE_I64_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)));
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeStB(&buf, TMP1, a, INT_TYPE_OFF);
+                    try safeStD(&buf, TMP0, a, INT_LO_OFF);
 
                     const b_next = try buf.b();
 
                     // not_int 目标
                     const not_int_target = buf.len();
-                    BridgeBuf.patchBcc(code.items, bne1_pos, not_int_target);
-                    BridgeBuf.patchBcc(code.items, bne2_pos, not_int_target);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne1_pos..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, not_int_target) - @as(i64, bne1_pos));
+                        std.mem.writeInt(u32, code.items[bne1_pos..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne2_pos..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, not_int_target) - @as(i64, bne2_pos));
+                        std.mem.writeInt(u32, code.items[bne2_pos..][0..4], reencBcc(old_inst, delta), .little);
+                    }
 
                     var b_next2: u32 = 0;
 
                     // ── f64 快速路径（.mod 无浮点路径）──
                     if (op != .mod) {
                         // 检查 b tag == TAG_FLOAT
-                        try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                        try safeLdBu(&buf, TMP0, b, TAG_OFF);
                         try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
                         const jne_f1 = try buf.bne(TMP0, TMP1);
 
                         // 检查 c tag == TAG_FLOAT
-                        try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, TAG_OFF)));
+                        try safeLdBu(&buf, TMP0, c, TAG_OFF);
                         const jne_f2 = try buf.bne(TMP0, TMP1);
 
                         // 检查 b float type == F64
-                        try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                        try safeLdBu(&buf, TMP0, b, FLOAT_TYPE_OFF);
                         try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
                         const jne_f3 = try buf.bne(TMP0, TMP1);
 
                         // 检查 c float type == F64
-                        try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                        try safeLdBu(&buf, TMP0, c, FLOAT_TYPE_OFF);
                         const jne_f4 = try buf.bne(TMP0, TMP1);
 
                         // 加载 f64 bits
-                        try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                        try buf.fldD(FT1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                        try safeFldD(&buf, FT0, b, FLOAT_BITS_OFF);
+                        try safeFldD(&buf, FT1, c, FLOAT_BITS_OFF);
 
                         switch (op) {
                             .add => try buf.faddD(FT0, FT0, FT1),
@@ -1162,29 +1405,41 @@ pub fn compileBridge(
                         }
 
                         // 存储 f64 结果
-                        try buf.fstD(FT0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                        try safeFstD(&buf, FT0, a, FLOAT_BITS_OFF);
                         try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
-                        try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                        try safeStB(&buf, TMP1, a, TAG_OFF);
                         try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
-                        try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                        try safeStB(&buf, TMP1, a, FLOAT_TYPE_OFF);
 
                         b_next2 = try buf.b();
 
                         // cold 目标
                         const cold_off = buf.len();
                         inline for (.{ jne_f1, jne_f2, jne_f3, jne_f4 }) |jne_pos| {
-                            BridgeBuf.patchBcc(code.items, jne_pos, cold_off);
+                            {
+                                const old_inst = std.mem.readInt(u32, code.items[jne_pos..][0..4], .little);
+                                const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_pos));
+                                std.mem.writeInt(u32, code.items[jne_pos..][0..4], reencBcc(old_inst, delta), .little);
+                            }
                         }
                     }
 
                     // ── cold: rt_step 桥接 ──
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     // ── .next ──
                     const next_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_next, next_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                        std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                    }
                     if (op != .mod) {
-                        BridgeBuf.patchB(code.items, b_next2, next_off);
+                        {
+                            const old_inst = std.mem.readInt(u32, code.items[b_next2..][0..4], .little);
+                            const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next2));
+                            std.mem.writeInt(u32, code.items[b_next2..][0..4], reencI26(old_inst, delta), .little);
+                        }
                     }
                     reg_types[a] = .unknown;
                 }
@@ -1197,77 +1452,99 @@ pub fn compileBridge(
                 try emitFrameBase2(&buf);
 
                 if (b_known_i64) {
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeLdD(&buf, TMP0, b, INT_LO_OFF);
                     // sub.d t0, zero, t0 (negate)
                     try buf.subD(TMP0, GPR.zero, TMP0);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(INT_TYPE_I64_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)));
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeStB(&buf, TMP1, a, INT_TYPE_OFF);
+                    try safeStD(&buf, TMP0, a, INT_LO_OFF);
                     reg_types[a] = .i64;
                 } else if (b_known_f64) {
-                    // ── f64 快速路径 ──
-                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                    try buf.fnegD(FT0, FT0);
-                    try buf.fstD(FT0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    // ── f64 快速路径：用 FPR 缓存池加载，直接浮点取反 ──
+                    fpr_state.evict(a);
+                    const fpr_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                    try buf.fnegD(FT0, fpr_b);
+                    try safeFstD(&buf, FT0, a, FLOAT_BITS_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try safeStB(&buf, TMP1, a, FLOAT_TYPE_OFF);
+                    if (a == b) fpr_state.evict(b);
                     reg_types[a] = .f64;
                 } else {
                     // ── 未知类型：tag 检查 ──
                     // 检查 tag == TAG_INT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, b, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
                     const jne_cold = try buf.bne(TMP0, TMP1);
 
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeLdD(&buf, TMP0, b, INT_LO_OFF);
                     try buf.subD(TMP0, GPR.zero, TMP0);
 
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(INT_TYPE_I64_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)));
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeStB(&buf, TMP1, a, INT_TYPE_OFF);
+                    try safeStD(&buf, TMP0, a, INT_LO_OFF);
 
                     const b_next = try buf.b();
 
                     // not_int 目标：检查 f64
                     const not_int_target = buf.len();
-                    BridgeBuf.patchBcc(code.items, jne_cold, not_int_target);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_cold..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, not_int_target) - @as(i64, jne_cold));
+                        std.mem.writeInt(u32, code.items[jne_cold..][0..4], reencBcc(old_inst, delta), .little);
+                    }
 
                     // 检查 b tag == TAG_FLOAT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, b, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
                     const jne_f1 = try buf.bne(TMP0, TMP1);
 
                     // 检查 b float type == F64
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try safeLdBu(&buf, TMP0, b, FLOAT_TYPE_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
                     const jne_f2 = try buf.bne(TMP0, TMP1);
 
                     // f64 取反
-                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try safeFldD(&buf, FT0, b, FLOAT_BITS_OFF);
                     try buf.fnegD(FT0, FT0);
-                    try buf.fstD(FT0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try safeFstD(&buf, FT0, a, FLOAT_BITS_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try safeStB(&buf, TMP1, a, FLOAT_TYPE_OFF);
 
                     const b_next2 = try buf.b();
 
                     // cold 目标
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, jne_f1, cold_off);
-                    BridgeBuf.patchBcc(code.items, jne_f2, cold_off);
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f1..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f1));
+                        std.mem.writeInt(u32, code.items[jne_f1..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f2));
+                        std.mem.writeInt(u32, code.items[jne_f2..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_next, next_off);
-                    BridgeBuf.patchB(code.items, b_next2, next_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                        std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next2));
+                        std.mem.writeInt(u32, code.items[b_next2..][0..4], reencI26(old_inst, delta), .little);
+                    }
                     reg_types[a] = .unknown;
                 }
             },
@@ -1281,8 +1558,8 @@ pub fn compileBridge(
 
                 if (b_known_i64 and c_known_i64) {
                     try emitFrameBase2(&buf);
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
-                    try buf.ldD(TMP3, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeLdD(&buf, TMP0, b, INT_LO_OFF);
+                    try safeLdD(&buf, TMP3, c, INT_LO_OFF);
                     // slt/sltu 结果为 0/1
                     switch (op) {
                         .eq => {
@@ -1305,57 +1582,68 @@ pub fn compileBridge(
                             try buf.slt(TMP0, TMP0, TMP3);
                             try buf.xori(TMP0, TMP0, 1);
                         },
+                        else => unreachable,
                     }
                     // 存储布尔结果
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
-                    try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
+                    try safeStB(&buf, TMP0, a, PAYLOAD_OFF);
                     reg_types[a] = .boolean;
                 } else if (b_known_f64 and c_known_f64) {
+                    // ── f64 快速路径：用 FPR 缓存池加载，跳过 tag 检查 ──
                     try emitFrameBase2(&buf);
-                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                    try buf.fldD(FT1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    const fpr_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                    const fpr_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
                     // 使用 FCC0 进行浮点比较
                     // eq/lt/gt/le/ge: 条件为真时 FCC0 != 0 → BCNEZ
                     // neq: 条件为真时 FCC0 == 0 → BCEQZ (用 CEQ 然后 BCEQZ 取反)
                     switch (op) {
-                        .eq => try buf.fcmpCeqD(0, FT0, FT1),
-                        .neq => try buf.fcmpCeqD(0, FT0, FT1),
-                        .lt => try buf.fcmpCltD(0, FT0, FT1),
-                        .gt => try buf.fcmpCltD(0, FT1, FT0),
-                        .le => try buf.fcmpCleD(0, FT0, FT1),
-                        .ge => try buf.fcmpCleD(0, FT1, FT0),
+                        .eq => try buf.fcmpCeqD(0, fpr_b, fpr_c),
+                        .neq => try buf.fcmpCeqD(0, fpr_b, fpr_c),
+                        .lt => try buf.fcmpCltD(0, fpr_b, fpr_c),
+                        .gt => try buf.fcmpCltD(0, fpr_c, fpr_b),
+                        .le => try buf.fcmpCleD(0, fpr_b, fpr_c),
+                        .ge => try buf.fcmpCleD(0, fpr_c, fpr_b),
+                        else => unreachable,
                     }
                     // 模式: addi.d t0, zero, 0; [BCNEZ|BCEQZ] cj=0, set_true; b done; set_true: addi.d t0, zero, 1; done:
                     try buf.addiD(TMP0, GPR.zero, 0);
                     const bz_pos = if (op == .neq) try buf.bceqz(0) else try buf.bcnez(0);
                     const b_done = try buf.b();
                     const set_true_off = buf.len();
-                    BridgeBuf.patchBz(code.items, bz_pos, set_true_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bz_pos..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, set_true_off) - @as(i64, bz_pos));
+                        std.mem.writeInt(u32, code.items[bz_pos..][0..4], reencBcnez(old_inst, delta), .little);
+                    }
                     try buf.addiD(TMP0, GPR.zero, 1);
                     const done_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_done, done_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_done..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, done_off) - @as(i64, b_done));
+                        std.mem.writeInt(u32, code.items[b_done..][0..4], reencI26(old_inst, delta), .little);
+                    }
                     // 存储布尔结果
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
-                    try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
+                    try safeStB(&buf, TMP0, a, PAYLOAD_OFF);
                     reg_types[a] = .boolean;
                 } else {
                     // ── 未知类型：tag 检查 ──
                     try emitFrameBase2(&buf);
 
                     // 检查 b tag == TAG_INT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, b, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
                     const jne_cold1 = try buf.bne(TMP0, TMP1);
 
                     // 检查 c tag == TAG_INT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, c, TAG_OFF);
                     const jne_cold2 = try buf.bne(TMP0, TMP1);
 
                     // 加载 i64 值并比较
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
-                    try buf.ldD(TMP3, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeLdD(&buf, TMP0, b, INT_LO_OFF);
+                    try safeLdD(&buf, TMP3, c, INT_LO_OFF);
                     switch (op) {
                         .eq => {
                             try buf.xorReg(TMP0, TMP0, TMP3);
@@ -1376,40 +1664,49 @@ pub fn compileBridge(
                             try buf.slt(TMP0, TMP0, TMP3);
                             try buf.xori(TMP0, TMP0, 1);
                         },
+                        else => unreachable,
                     }
                     // 存储布尔结果
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
-                    try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
+                    try safeStB(&buf, TMP0, a, PAYLOAD_OFF);
 
                     const b_next = try buf.b();
 
                     // not_int 目标：检查 f64
                     const not_int_target = buf.len();
-                    BridgeBuf.patchBcc(code.items, jne_cold1, not_int_target);
-                    BridgeBuf.patchBcc(code.items, jne_cold2, not_int_target);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_cold1..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, not_int_target) - @as(i64, jne_cold1));
+                        std.mem.writeInt(u32, code.items[jne_cold1..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_cold2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, not_int_target) - @as(i64, jne_cold2));
+                        std.mem.writeInt(u32, code.items[jne_cold2..][0..4], reencBcc(old_inst, delta), .little);
+                    }
 
                     // 检查 b tag == TAG_FLOAT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, b, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
                     const jne_f1 = try buf.bne(TMP0, TMP1);
 
                     // 检查 c tag == TAG_FLOAT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, c, TAG_OFF);
                     const jne_f2 = try buf.bne(TMP0, TMP1);
 
                     // 检查 b float type == F64
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try safeLdBu(&buf, TMP0, b, FLOAT_TYPE_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
                     const jne_f3 = try buf.bne(TMP0, TMP1);
 
                     // 检查 c float type == F64
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try safeLdBu(&buf, TMP0, c, FLOAT_TYPE_OFF);
                     const jne_f4 = try buf.bne(TMP0, TMP1);
 
                     // 加载 f64 bits
-                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                    try buf.fldD(FT1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try safeFldD(&buf, FT0, b, FLOAT_BITS_OFF);
+                    try safeFldD(&buf, FT1, c, FLOAT_BITS_OFF);
 
                     // 浮点比较，结果写入 FCC0
                     switch (op) {
@@ -1419,6 +1716,7 @@ pub fn compileBridge(
                         .gt => try buf.fcmpCltD(0, FT1, FT0),
                         .le => try buf.fcmpCleD(0, FT0, FT1),
                         .ge => try buf.fcmpCleD(0, FT1, FT0),
+                        else => unreachable,
                     }
 
                     // 将 FCC0 转换为 0/1 布尔值
@@ -1426,29 +1724,61 @@ pub fn compileBridge(
                     const bz_pos = if (op == .neq) try buf.bceqz(0) else try buf.bcnez(0);
                     const b_done = try buf.b();
                     const set_true_off = buf.len();
-                    BridgeBuf.patchBz(code.items, bz_pos, set_true_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bz_pos..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, set_true_off) - @as(i64, bz_pos));
+                        std.mem.writeInt(u32, code.items[bz_pos..][0..4], reencBcnez(old_inst, delta), .little);
+                    }
                     try buf.addiD(TMP0, GPR.zero, 1);
                     const done_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_done, done_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_done..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, done_off) - @as(i64, b_done));
+                        std.mem.writeInt(u32, code.items[b_done..][0..4], reencI26(old_inst, delta), .little);
+                    }
 
                     // 存储布尔结果
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
-                    try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
+                    try safeStB(&buf, TMP0, a, PAYLOAD_OFF);
 
                     const b_next2 = try buf.b();
 
                     // cold 目标
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, jne_f1, cold_off);
-                    BridgeBuf.patchBcc(code.items, jne_f2, cold_off);
-                    BridgeBuf.patchBcc(code.items, jne_f3, cold_off);
-                    BridgeBuf.patchBcc(code.items, jne_f4, cold_off);
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f1..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f1));
+                        std.mem.writeInt(u32, code.items[jne_f1..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f2));
+                        std.mem.writeInt(u32, code.items[jne_f2..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f3..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f3));
+                        std.mem.writeInt(u32, code.items[jne_f3..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f4..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f4));
+                        std.mem.writeInt(u32, code.items[jne_f4..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_next, next_off);
-                    BridgeBuf.patchB(code.items, b_next2, next_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                        std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next2));
+                        std.mem.writeInt(u32, code.items[b_next2..][0..4], reencI26(old_inst, delta), .little);
+                    }
                     reg_types[a] = .boolean;
                 }
             },
@@ -1458,27 +1788,35 @@ pub fn compileBridge(
                 try emitFrameBase2(&buf);
 
                 // 检查 tag == TAG_BOOLEAN
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, b, TAG_OFF);
                 try buf.addiD(TMP1, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
                 const jne_cold = try buf.bne(TMP0, TMP1);
 
                 // 加载布尔值并取反: xori t0, t0, 1
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, PAYLOAD_OFF)));
+                try safeLdBu(&buf, TMP0, b, PAYLOAD_OFF);
                 try buf.xori(TMP0, TMP0, 1);
 
                 // 存储结果
                 try buf.addiD(TMP1, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
-                try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
-                try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)));
+                try safeStB(&buf, TMP1, a, TAG_OFF);
+                try safeStB(&buf, TMP0, a, PAYLOAD_OFF);
 
                 const b_next = try buf.b();
 
                 const cold_off = buf.len();
-                BridgeBuf.patchBcc(code.items, jne_cold, cold_off);
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[jne_cold..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_cold));
+                    std.mem.writeInt(u32, code.items[jne_cold..][0..4], reencBcc(old_inst, delta), .little);
+                }
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
-                BridgeBuf.patchB(code.items, b_next, next_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                    std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                }
             },
 
             // ── 无条件跳转 ──
@@ -1486,7 +1824,11 @@ pub fn compileBridge(
                 const target_ip: u32 = @intCast(@as(i64, @intCast(ip + 1)) + sbx);
                 if (ip_to_code.get(target_ip)) |target_off| {
                     const b_pos = try buf.b();
-                    BridgeBuf.patchB(code.items, b_pos, target_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_pos..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, target_off) - @as(i64, b_pos));
+                        std.mem.writeInt(u32, code.items[b_pos..][0..4], reencI26(old_inst, delta), .little);
+                    }
                 } else {
                     const b_pos = try buf.b();
                     try pending_fixups.append(allocator, .{
@@ -1503,19 +1845,23 @@ pub fn compileBridge(
                 try emitFrameBase2(&buf);
 
                 // 检查 tag == TAG_BOOLEAN
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, a, TAG_OFF);
                 try buf.addiD(TMP1, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
                 const jne_cold = try buf.bne(TMP0, TMP1);
 
                 // 加载布尔值
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)));
+                try safeLdBu(&buf, TMP0, a, PAYLOAD_OFF);
 
                 if (op == .jump_if_false) {
                     // jump_if_false: 如果值为 0 (false)，跳转到 target
                     // beq t0, zero, target
                     if (ip_to_code.get(target_ip)) |target_off| {
                         const beq_pos = try buf.beq(TMP0, GPR.zero);
-                        BridgeBuf.patchBcc(code.items, beq_pos, target_off);
+                        {
+                            const old_inst = std.mem.readInt(u32, code.items[beq_pos..][0..4], .little);
+                            const delta: i32 = @intCast(@as(i64, target_off) - @as(i64, beq_pos));
+                            std.mem.writeInt(u32, code.items[beq_pos..][0..4], reencBcc(old_inst, delta), .little);
+                        }
                     } else {
                         const beq_pos = try buf.beq(TMP0, GPR.zero);
                         try pending_fixups.append(allocator, .{
@@ -1529,7 +1875,11 @@ pub fn compileBridge(
                     // bne t0, zero, target
                     if (ip_to_code.get(target_ip)) |target_off| {
                         const bne_pos = try buf.bne(TMP0, GPR.zero);
-                        BridgeBuf.patchBcc(code.items, bne_pos, target_off);
+                        {
+                            const old_inst = std.mem.readInt(u32, code.items[bne_pos..][0..4], .little);
+                            const delta: i32 = @intCast(@as(i64, target_off) - @as(i64, bne_pos));
+                            std.mem.writeInt(u32, code.items[bne_pos..][0..4], reencBcc(old_inst, delta), .little);
+                        }
                     } else {
                         const bne_pos = try buf.bne(TMP0, GPR.zero);
                         try pending_fixups.append(allocator, .{
@@ -1544,11 +1894,19 @@ pub fn compileBridge(
 
                 // .cold
                 const cold_off = buf.len();
-                BridgeBuf.patchBcc(code.items, jne_cold, cold_off);
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[jne_cold..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_cold));
+                    std.mem.writeInt(u32, code.items[jne_cold..][0..4], reencBcc(old_inst, delta), .little);
+                }
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
-                BridgeBuf.patchB(code.items, b_next, next_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                    std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                }
                 reg_types[a] = .boolean;
             },
 
@@ -1558,13 +1916,17 @@ pub fn compileBridge(
                 try emitFrameBase2(&buf);
 
                 // 加载 tag 字节
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, a, TAG_OFF);
 
                 if (op == .jump_if_null) {
                     // TAG_NULL = 0
                     if (ip_to_code.get(target_ip)) |target_off| {
                         const beq_pos = try buf.beq(TMP0, GPR.zero);
-                        BridgeBuf.patchBcc(code.items, beq_pos, target_off);
+                        {
+                            const old_inst = std.mem.readInt(u32, code.items[beq_pos..][0..4], .little);
+                            const delta: i32 = @intCast(@as(i64, target_off) - @as(i64, beq_pos));
+                            std.mem.writeInt(u32, code.items[beq_pos..][0..4], reencBcc(old_inst, delta), .little);
+                        }
                     } else {
                         const beq_pos = try buf.beq(TMP0, GPR.zero);
                         try pending_fixups.append(allocator, .{
@@ -1577,7 +1939,11 @@ pub fn compileBridge(
                     // jump_if_not_null
                     if (ip_to_code.get(target_ip)) |target_off| {
                         const bne_pos = try buf.bne(TMP0, GPR.zero);
-                        BridgeBuf.patchBcc(code.items, bne_pos, target_off);
+                        {
+                            const old_inst = std.mem.readInt(u32, code.items[bne_pos..][0..4], .little);
+                            const delta: i32 = @intCast(@as(i64, target_off) - @as(i64, bne_pos));
+                            std.mem.writeInt(u32, code.items[bne_pos..][0..4], reencBcc(old_inst, delta), .little);
+                        }
                     } else {
                         const bne_pos = try buf.bne(TMP0, GPR.zero);
                         try pending_fixups.append(allocator, .{
@@ -1591,17 +1957,8 @@ pub fn compileBridge(
 
             // ── return_op / return_unit ──
             .return_op, .return_unit => {
-                // rt_step(vm, ip)
-                try buf.moveReg(CARG0, BR_VM);
-                try buf.loadImm64(CARG1, @intCast(ip));
-                try buf.jirl(GPR.ra, BR_RT_STEP, 0);
-                // rt_step 返回 true，跳到 exit
-                const b_pos = try buf.b();
-                try pending_fixups.append(allocator, .{
-                    .code_offset = b_pos,
-                    .target_ip = 0xFFFFFFFF,
-                    .kind = 4,
-                });
+                // 使用标准 rt_step 桥接（与 emitRtStepCall 相同的模式）
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
             },
 
             // ── load_const（标量快速路径）──
@@ -1613,7 +1970,7 @@ pub fn compileBridge(
                 try buf.loadImm64(TMP3, const_addr);
 
                 // 检查 dst(a) 是否标量：tag > MAX_SCALAR_TAG → cold
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, a, TAG_OFF);
                 try buf.addiD(TMP1, GPR.zero, @intCast(MAX_SCALAR_TAG));
                 try buf.sltu(TMP4, TMP1, TMP0); // t4 = (MAX_SCALAR_TAG < tag) ? 1 : 0
                 const bhi_cold1 = try buf.bne(TMP4, GPR.zero);
@@ -1626,20 +1983,32 @@ pub fn compileBridge(
                 // 快速路径：拷贝 32 字节
                 inline for (0..4) |i| {
                     try buf.ldD(TMP0, TMP3, @intCast(i * 8));
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, i * 8)));
+                    try safeStD(&buf, TMP0, a, i * 8);
                 }
 
                 const b_next = try buf.b();
 
                 // .cold
                 const cold_off = buf.len();
-                BridgeBuf.patchBcc(code.items, bhi_cold1, cold_off);
-                BridgeBuf.patchBcc(code.items, bhi_cold2, cold_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[bhi_cold1..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bhi_cold1));
+                    std.mem.writeInt(u32, code.items[bhi_cold1..][0..4], reencBcc(old_inst, delta), .little);
+                }
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[bhi_cold2..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bhi_cold2));
+                    std.mem.writeInt(u32, code.items[bhi_cold2..][0..4], reencBcc(old_inst, delta), .little);
+                }
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
-                BridgeBuf.patchB(code.items, b_next, next_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                    std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                }
 
                 // 类型传播
                 if (bx < func.chunk.constants.items.len) {
@@ -1657,61 +2026,53 @@ pub fn compileBridge(
                 try emitFrameBase2(&buf);
 
                 // 检查 src(b) 是否标量
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, b, TAG_OFF);
                 try buf.addiD(TMP1, GPR.zero, @intCast(MAX_SCALAR_TAG));
                 // sltu t4, t1, t0 → t4 = (MAX_SCALAR_TAG < tag) ? 1 : 0
                 try buf.sltu(TMP4, TMP1, TMP0);
                 const bhi_cold1 = try buf.bne(TMP4, GPR.zero);
 
                 // 检查 dst(a) 是否标量
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, a, TAG_OFF);
                 try buf.sltu(TMP4, TMP1, TMP0);
                 const bhi_cold2 = try buf.bne(TMP4, GPR.zero);
 
                 // 快速路径：拷贝 32 字节
                 inline for (0..4) |i| {
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, i * 8)));
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, i * 8)));
+                    try safeLdD(&buf, TMP0, b, i * 8);
+                    try safeStD(&buf, TMP0, a, i * 8);
                 }
 
                 const b_next = try buf.b();
 
                 const cold_off = buf.len();
-                BridgeBuf.patchBcc(code.items, bhi_cold1, cold_off);
-                BridgeBuf.patchBcc(code.items, bhi_cold2, cold_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[bhi_cold1..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bhi_cold1));
+                    std.mem.writeInt(u32, code.items[bhi_cold1..][0..4], reencBcc(old_inst, delta), .little);
+                }
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[bhi_cold2..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bhi_cold2));
+                    std.mem.writeInt(u32, code.items[bhi_cold2..][0..4], reencBcc(old_inst, delta), .little);
+                }
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
-                BridgeBuf.patchB(code.items, b_next, next_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                    std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                }
 
                 if (b < reg_count) reg_types[a] = reg_types[b];
             },
 
             // ── load_unit / load_null ──
             .load_unit, .load_null => {
-                try emitFrameBase2(&buf);
-
-                // 检查 dst 是否标量
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
-                try buf.addiD(TMP1, GPR.zero, @intCast(MAX_SCALAR_TAG));
-                try buf.sltu(TMP4, TMP1, TMP0);
-                const bhi_cold = try buf.bne(TMP4, GPR.zero);
-
-                // 快速路径：设置 tag
-                const tag_val: u8 = if (op == .load_unit) TAG_UNIT_VAL else TAG_NULL_VAL;
-                try buf.addiD(TMP0, GPR.zero, @intCast(tag_val));
-                try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
-
-                const b_next = try buf.b();
-
-                const cold_off = buf.len();
-                BridgeBuf.patchBcc(code.items, bhi_cold, cold_off);
-
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
-
-                const next_off = buf.len();
-                BridgeBuf.patchB(code.items, b_next, next_off);
+                // 简化为纯 rt_step 桥接（调试用）
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
             },
 
             // ── load_true / load_false ──
@@ -1719,27 +2080,35 @@ pub fn compileBridge(
                 try emitFrameBase2(&buf);
 
                 // 检查 dst 是否标量
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, a, TAG_OFF);
                 try buf.addiD(TMP1, GPR.zero, @intCast(MAX_SCALAR_TAG));
                 try buf.sltu(TMP4, TMP1, TMP0);
                 const bhi_cold = try buf.bne(TMP4, GPR.zero);
 
                 // 快速路径：设置 tag=BOOLEAN, payload=0/1
                 try buf.addiD(TMP0, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
-                try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                try safeStB(&buf, TMP0, a, TAG_OFF);
                 const payload_val: u8 = if (op == .load_true) 1 else 0;
                 try buf.addiD(TMP0, GPR.zero, @intCast(payload_val));
-                try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)));
+                try safeStB(&buf, TMP0, a, PAYLOAD_OFF);
 
                 const b_next = try buf.b();
 
                 const cold_off = buf.len();
-                BridgeBuf.patchBcc(code.items, bhi_cold, cold_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[bhi_cold..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bhi_cold));
+                    std.mem.writeInt(u32, code.items[bhi_cold..][0..4], reencBcc(old_inst, delta), .little);
+                }
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
-                BridgeBuf.patchB(code.items, b_next, next_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                    std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                }
                 reg_types[a] = .boolean;
             },
 
@@ -1759,6 +2128,8 @@ pub fn compileBridge(
                 // return_reg = a
                 try buf.addiD(CARG5, GPR.zero, @intCast(@as(u8, a))); // a5 = return_reg
 
+                // rt_call_inline 会 clobber caller-saved FPR，缓存必须失效
+                fpr_state.invalidateAll();
                 // jirl ra, s3, 0 (调用 rt_call_inline)
                 try buf.jirl(GPR.ra, BR_RT_CALL, 0);
 
@@ -1777,23 +2148,23 @@ pub fn compileBridge(
                 try emitFrameBase2(&buf);
 
                 // 检查 arr(b) tag == TAG_ARRAY
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, b, TAG_OFF);
                 try buf.addiD(TMP1, GPR.zero, @intCast(TAG_ARRAY_VAL));
                 const bne_cold1 = try buf.bne(TMP0, TMP1);
 
                 // 检查 idx(c) tag == TAG_INT
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, c, TAG_OFF);
                 try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
                 const bne_cold2 = try buf.bne(TMP0, TMP1);
 
                 // 检查 dst(a) 是标量
-                try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                try safeLdBu(&buf, TMP0, a, TAG_OFF);
                 try buf.addiD(TMP1, GPR.zero, @intCast(MAX_SCALAR_TAG));
                 try buf.sltu(TMP4, TMP1, TMP0);
                 const bhi_cold3 = try buf.bne(TMP4, GPR.zero);
 
                 // 加载 ArrayValue* from arr payload (offset 0)
-                try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, PAYLOAD_OFF))); // TMP0 = arr pointer
+                try safeLdD(&buf, TMP0, b, PAYLOAD_OFF); // TMP0 = arr pointer
 
                 // 加载 elements.ptr (offset 0) → TMP3
                 try buf.ldD(TMP3, TMP0, 0);
@@ -1801,7 +2172,7 @@ pub fn compileBridge(
                 try buf.ldD(TMP4, TMP0, 8);
 
                 // 加载 index (Int.lo, offset 0) → a0(TMP0)
-                try buf.ldD(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, INT_LO_OFF)));
+                try safeLdD(&buf, TMP0, c, INT_LO_OFF);
 
                 // 边界检查: index < len (unsigned): sltu t4, t0, t4; beq t4, zero, cold
                 try buf.sltu(TMP4, TMP0, TMP4);
@@ -1823,19 +2194,27 @@ pub fn compileBridge(
                 // 快速路径: 拷贝 32 字节
                 inline for (0..4) |i| {
                     try buf.ldD(TMP0, TMP3, @intCast(i * 8));
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, i * 8)));
+                    try safeStD(&buf, TMP0, a, i * 8);
                 }
 
                 const b_next = try buf.b();
 
                 const cold_off = buf.len();
                 inline for (.{ bne_cold1, bne_cold2, bhi_cold3, beq_cold4, bhi_cold5 }) |jcc_pos| {
-                    BridgeBuf.patchBcc(code.items, jcc_pos, cold_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jcc_pos..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jcc_pos));
+                        std.mem.writeInt(u32, code.items[jcc_pos..][0..4], reencBcc(old_inst, delta), .little);
+                    }
                 }
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
-                BridgeBuf.patchB(code.items, b_next, next_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                    std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                }
             },
 
             // ── call_method ──
@@ -1851,6 +2230,8 @@ pub fn compileBridge(
                     // dst_slot = base + a
                     try buf.addiD(CARG2, BR_BASE, @intCast(@as(u8, a)));
 
+                    // rt_array_len 会 clobber caller-saved FPR，缓存必须失效
+                    fpr_state.invalidateAll();
                     // jirl ra, s5, 0 (调用 rt_array_len)
                     try buf.jirl(GPR.ra, BR_RT_LEN, 0);
 
@@ -1860,11 +2241,19 @@ pub fn compileBridge(
                     const b_next = try buf.b();
 
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, bne_cold, cold_off);
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne_cold..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bne_cold));
+                        std.mem.writeInt(u32, code.items[bne_cold..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_next, next_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                        std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                    }
                 } else if (std.mem.eql(u8, mname, "push") and c == 1) {
                     // arr.push(elem) → rt_array_push(vm, recv_slot, arg_slot, dst_slot)
                     try buf.moveReg(CARG0, BR_VM); // vm
@@ -1875,6 +2264,8 @@ pub fn compileBridge(
                     // dst_slot = base + a
                     try buf.addiD(CARG3, BR_BASE, @intCast(@as(u8, a)));
 
+                    // rt_array_push 会 clobber caller-saved FPR，缓存必须失效
+                    fpr_state.invalidateAll();
                     // jirl ra, s4, 0 (调用 rt_array_push)
                     try buf.jirl(GPR.ra, BR_RT_PUSH, 0);
 
@@ -1884,14 +2275,22 @@ pub fn compileBridge(
                     const b_next = try buf.b();
 
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, bne_cold, cold_off);
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne_cold..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bne_cold));
+                        std.mem.writeInt(u32, code.items[bne_cold..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_next, next_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                        std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                    }
                 } else {
                     // 其他方法 → rt_step 桥接
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
                 }
             },
 
@@ -1918,7 +2317,7 @@ pub fn compileBridge(
                 };
 
                 if (int_target == null and float_target == null) {
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
                     continue;
                 }
 
@@ -1927,132 +2326,171 @@ pub fn compileBridge(
                 if (int_target) |it| {
                     // 目标是整数类型
                     // 检查 src(b) tag == TAG_INT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, b, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
                     const bne_cold1 = try buf.bne(TMP0, TMP1);
 
                     // 检查 dst(a) tag == TAG_INT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, a, TAG_OFF);
                     const bne_cold2 = try buf.bne(TMP0, TMP1);
 
                     // 快速路径：拷贝 lo/hi，设置 int type
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)));
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + 8)); // hi
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + 8));
+                    try safeLdD(&buf, TMP0, b, INT_LO_OFF);
+                    try safeStD(&buf, TMP0, a, INT_LO_OFF);
+                    try safeLdD(&buf, TMP0, b, 8); // hi
+                    try safeStD(&buf, TMP0, a, 8);
                     const type_byte: u8 = @intCast(@intFromEnum(it));
                     try buf.addiD(TMP0, GPR.zero, @intCast(type_byte));
-                    try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)));
+                    try safeStB(&buf, TMP0, a, INT_TYPE_OFF);
 
                     const b_next = try buf.b();
 
                     // not_int 目标：检查 f64→int 路径
                     const not_int_target = buf.len();
-                    BridgeBuf.patchBcc(code.items, bne_cold1, not_int_target);
-                    BridgeBuf.patchBcc(code.items, bne_cold2, not_int_target);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne_cold1..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, not_int_target) - @as(i64, bne_cold1));
+                        std.mem.writeInt(u32, code.items[bne_cold1..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne_cold2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, not_int_target) - @as(i64, bne_cold2));
+                        std.mem.writeInt(u32, code.items[bne_cold2..][0..4], reencBcc(old_inst, delta), .little);
+                    }
 
                     // 检查 src(b) tag == TAG_FLOAT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, b, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
                     const jne_f1 = try buf.bne(TMP0, TMP1);
 
                     // 检查 src(b) float type == F64
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try safeLdBu(&buf, TMP0, b, FLOAT_TYPE_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
                     const jne_f2 = try buf.bne(TMP0, TMP1);
 
                     // 检查 dst(a) tag == TAG_INT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
                     const jne_f3 = try buf.bne(TMP0, TMP1);
 
-                    // f64 → int32 截断（FTINTRZ.W.D）
-                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                    try buf.ftintrzWD(FT0, FT0); // double → int32，向零取整
+                    // f64 → int64 截断（FTINTRZ.L.D）
+                    try safeFldD(&buf, FT0, b, FLOAT_BITS_OFF);
+                    try buf.ftintrzLD(FT0, FT0); // double → int64，向零取整
                     try buf.movfr2grD(TMP0, FT0); // FPR → GPR
 
-                    // 符号扩展 32→64 位
-                    try buf.addiD(TMP3, GPR.zero, 32);
-                    try buf.sllD(TMP0, TMP0, TMP3);
-                    try buf.sraD(TMP0, TMP0, TMP3);
-
                     // 存储到 dst(a) 的 INT_LO_OFF
-                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeStD(&buf, TMP0, a, INT_LO_OFF);
                     // 存储 hi（符号扩展，用于 i128 兼容）
                     try buf.addiD(TMP3, GPR.zero, 63);
                     try buf.sraD(TMP3, TMP0, TMP3);
-                    try buf.stD(TMP3, TMP2, @intCast(@as(i32, a) * 32 + 8));
+                    try safeStD(&buf, TMP3, a, 8);
 
                     // 设置 tag = TAG_INT, int type = I64
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP1, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(INT_TYPE_I64_VAL));
-                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)));
+                    try safeStB(&buf, TMP1, a, INT_TYPE_OFF);
 
                     const b_next2 = try buf.b();
 
                     // cold 目标
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, jne_f1, cold_off);
-                    BridgeBuf.patchBcc(code.items, jne_f2, cold_off);
-                    BridgeBuf.patchBcc(code.items, jne_f3, cold_off);
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f1..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f1));
+                        std.mem.writeInt(u32, code.items[jne_f1..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f2));
+                        std.mem.writeInt(u32, code.items[jne_f2..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[jne_f3..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, jne_f3));
+                        std.mem.writeInt(u32, code.items[jne_f3..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_next, next_off);
-                    BridgeBuf.patchB(code.items, b_next2, next_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                        std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next2));
+                        std.mem.writeInt(u32, code.items[b_next2..][0..4], reencI26(old_inst, delta), .little);
+                    }
                 } else if (float_target) |ft| {
                     // 目标是浮点类型
                     // 检查 src(b) tag == TAG_INT（int→float）
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, b, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
                     const bne_cold1 = try buf.bne(TMP0, TMP1);
 
                     // 检查 src(b) int type == i64
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_TYPE_OFF)));
+                    try safeLdBu(&buf, TMP0, b, INT_TYPE_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(INT_TYPE_I64_VAL));
                     const bne_cold2 = try buf.bne(TMP0, TMP1);
 
                     // 检查 dst(a) tag == TAG_FLOAT
-                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeLdBu(&buf, TMP0, a, TAG_OFF);
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
                     const bne_cold3 = try buf.bne(TMP0, TMP1);
 
                     if (ft != .f64) {
-                        try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                        try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
                         continue;
                     }
 
                     // 加载 i64 → ffint.d.l ft0, t0
-                    try buf.ldD(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
+                    try safeLdD(&buf, TMP0, b, INT_LO_OFF);
                     try buf.movgr2frD(FT0, TMP0);
                     try buf.ffintDL(FT0, FT0); // int64 → double
                     // 存储 f64 bits 到 dst(a)
-                    try buf.fstD(FT0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try safeFstD(&buf, FT0, a, FLOAT_BITS_OFF);
                     // 设置 tag = FLOAT
                     try buf.addiD(TMP0, GPR.zero, @intCast(TAG_FLOAT_VAL));
-                    try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try safeStB(&buf, TMP0, a, TAG_OFF);
                     // 设置 float type = F64
                     try buf.addiD(TMP0, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
-                    try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try safeStB(&buf, TMP0, a, FLOAT_TYPE_OFF);
 
                     const b_next = try buf.b();
 
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, bne_cold1, cold_off);
-                    BridgeBuf.patchBcc(code.items, bne_cold2, cold_off);
-                    BridgeBuf.patchBcc(code.items, bne_cold3, cold_off);
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne_cold1..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bne_cold1));
+                        std.mem.writeInt(u32, code.items[bne_cold1..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne_cold2..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bne_cold2));
+                        std.mem.writeInt(u32, code.items[bne_cold2..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[bne_cold3..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, cold_off) - @as(i64, bne_cold3));
+                        std.mem.writeInt(u32, code.items[bne_cold3..][0..4], reencBcc(old_inst, delta), .little);
+                    }
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
-                    BridgeBuf.patchB(code.items, b_next, next_off);
+                    {
+                        const old_inst = std.mem.readInt(u32, code.items[b_next..][0..4], .little);
+                        const delta: i32 = @intCast(@as(i64, next_off) - @as(i64, b_next));
+                        std.mem.writeInt(u32, code.items[b_next..][0..4], reencI26(old_inst, delta), .little);
+                    }
                 }
                 reg_types[a] = if (int_target != null) .i64 else if (float_target != null) .f64 else .unknown;
             },
 
             // ── 所有其他 opcode：rt_step 桥接 ──
             else => {
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
             },
         }
     }
@@ -2085,23 +2523,39 @@ pub fn compileBridge(
     for (pending_fixups.items) |fixup| {
         if (fixup.kind == 4) {
             // exit 跳转 (B-type)
-            BridgeBuf.patchB(code.items, fixup.code_offset, exit_offset);
+            {
+                const old_inst = std.mem.readInt(u32, code.items[fixup.code_offset..][0..4], .little);
+                const delta: i32 = @intCast(@as(i64, exit_offset) - @as(i64, fixup.code_offset));
+                std.mem.writeInt(u32, code.items[fixup.code_offset..][0..4], reencI26(old_inst, delta), .little);
+            }
         } else if (fixup.kind == 2) {
             // exit 跳转 (Bcc-type, target_ip == 0xFFFFFFFF)
             if (fixup.target_ip == 0xFFFFFFFF) {
-                BridgeBuf.patchBcc(code.items, fixup.code_offset, exit_offset);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[fixup.code_offset..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, exit_offset) - @as(i64, fixup.code_offset));
+                    std.mem.writeInt(u32, code.items[fixup.code_offset..][0..4], reencBcc(old_inst, delta), .little);
+                }
             } else {
                 const target_off = ip_to_code.get(fixup.target_ip) orelse {
                     return error.JitMissingJumpTarget;
                 };
-                BridgeBuf.patchBcc(code.items, fixup.code_offset, target_off);
+                {
+                    const old_inst = std.mem.readInt(u32, code.items[fixup.code_offset..][0..4], .little);
+                    const delta: i32 = @intCast(@as(i64, target_off) - @as(i64, fixup.code_offset));
+                    std.mem.writeInt(u32, code.items[fixup.code_offset..][0..4], reencBcc(old_inst, delta), .little);
+                }
             }
         } else if (fixup.kind == 1) {
             // B-type 跳转
             const target_off = ip_to_code.get(fixup.target_ip) orelse {
                 return error.JitMissingJumpTarget;
             };
-            BridgeBuf.patchB(code.items, fixup.code_offset, target_off);
+            {
+                const old_inst = std.mem.readInt(u32, code.items[fixup.code_offset..][0..4], .little);
+                const delta: i32 = @intCast(@as(i64, target_off) - @as(i64, fixup.code_offset));
+                std.mem.writeInt(u32, code.items[fixup.code_offset..][0..4], reencI26(old_inst, delta), .little);
+            }
         }
     }
 
@@ -2209,19 +2663,19 @@ fn cgFdivD(fd: u8, fj: u8, fk: u8) u32 {
 }
 /// fadd.s fd, fj, fk
 fn cgFaddS(fd: u8, fj: u8, fk: u8) u32 {
-    return 0x01100000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+    return 0x01008000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
 }
 /// fsub.s fd, fj, fk
 fn cgFsubS(fd: u8, fj: u8, fk: u8) u32 {
-    return 0x01120000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+    return 0x01028000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
 }
 /// fmul.s fd, fj, fk
 fn cgFmulS(fd: u8, fj: u8, fk: u8) u32 {
-    return 0x01140000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+    return 0x01048000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
 }
 /// fdiv.s fd, fj, fk
 fn cgFdivS(fd: u8, fj: u8, fk: u8) u32 {
-    return 0x01160000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+    return 0x01068000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
 }
 
 /// fcmp.ceq.d cc, fj, fk (结果写入 FCC[cc])
@@ -2259,11 +2713,11 @@ fn cgFnegD(fd: u8, fj: u8) u32 {
 }
 /// fmov.s fd, fj
 fn cgFmovS(fd: u8, fj: u8) u32 {
-    return 0x01149000 | (@as(u32, fj) << 5) | fd;
+    return 0x01149400 | (@as(u32, fj) << 5) | fd;
 }
 /// fneg.s fd, fj
 fn cgFnegS(fd: u8, fj: u8) u32 {
-    return 0x01141000 | (@as(u32, fj) << 5) | fd;
+    return 0x01141400 | (@as(u32, fj) << 5) | fd;
 }
 /// movgr2fr.d fd, rj (GPR → FPR)
 fn cgMovgr2frD(fd: u8, rj: u8) u32 {
@@ -2279,23 +2733,23 @@ fn cgFfintDL(fd: u8, fj: u8) u32 {
 }
 /// ftintrz.l.d fd, fj (double → int64, trunc)
 fn cgFtintrzLD(fd: u8, fj: u8) u32 {
-    return 0x011B8800 | (@as(u32, fj) << 5) | fd;
+    return 0x011AA800 | (@as(u32, fj) << 5) | fd;
 }
 /// fcvt.s.d fd, fj (double → float)
 fn cgFcvtSD(fd: u8, fj: u8) u32 {
-    return 0x01198000 | (@as(u32, fj) << 5) | fd;
+    return 0x01191800 | (@as(u32, fj) << 5) | fd;
 }
 /// fcvt.d.s fd, fj (float → double)
 fn cgFcvtDS(fd: u8, fj: u8) u32 {
-    return 0x01190000 | (@as(u32, fj) << 5) | fd;
+    return 0x01192400 | (@as(u32, fj) << 5) | fd;
 }
 /// ffint.s.l fd, fj (int64 → float)
 fn cgFfintSL(fd: u8, fj: u8) u32 {
-    return 0x011D6800 | (@as(u32, fj) << 5) | fd;
+    return 0x011D1800 | (@as(u32, fj) << 5) | fd;
 }
 /// ftintrz.l.s fd, fj (float → int64, trunc)
 fn cgFtintrzLS(fd: u8, fj: u8) u32 {
-    return 0x011B9800 | (@as(u32, fj) << 5) | fd;
+    return 0x011AA400 | (@as(u32, fj) << 5) | fd;
 }
 /// fld.d fd, rj, imm12 (load double)
 fn cgFldD(fd: u8, rj: u8, imm12: i16) u32 {
@@ -2371,40 +2825,21 @@ const Codegen = struct {
 };
 
 /// 加载 64 位立即数到寄存器（IR 模式）。
-/// 使用 lu12i.w + lu32i.d + lu52i.d 三条指令。
+/// 使用 lu12i.w + ori + lu32i.d + lu52i.d 四条指令。
+/// lu12i.w 只设置 bits[31:12]，bits[11:0] 清零，需要 ori 补齐低 12 位。
 fn loadImm64Cg(cg: *Codegen, rd: u8, val: u64) !void {
+    const lo12: u16 = @intCast(val & 0xFFF);
     const lo20: i32 = @intCast((val >> 12) & 0xFFFFF);
     const mid20: i32 = @intCast((val >> 32) & 0xFFFFF);
     const hi12: i16 = @intCast((val >> 52) & 0xFFF);
     const lo20_signed: i32 = if (lo20 & 0x80000 != 0) lo20 - 0x100000 else lo20;
     const mid20_signed: i32 = if (mid20 & 0x80000 != 0) mid20 - 0x100000 else mid20;
     try cg.emit(enc1RI20(OP1RI20.LU12I_W, rd, lo20_signed));
+    if (lo12 != 0) {
+        try cg.emit(enc2RI12(OP2RI12.ORI, rd, rd, @intCast(lo12)));
+    }
     try cg.emit(enc1RI20(OP1RI20.LU32I_D, rd, mid20_signed));
     try cg.emit(enc2RI12(OP2RI12.LU52I_D, rd, rd, hi12));
-}
-
-/// 回填 B/BL 跳转目标（I26-type）。
-fn patchI26(code_item: *u32, jump_idx: u32, target_idx: u32) void {
-    const diff: i64 = @as(i64, target_idx) - @as(i64, jump_idx);
-    const off26: i32 = @intCast(diff);
-    const uimm: u32 = @as(u32, @bitCast(off26)) & 0x3FFFFFF;
-    code_item.* = (code_item.* & ~((0xFFFF << 10) | 0x3FF)) | ((uimm & 0xFFFF) << 10) | ((uimm >> 16) & 0x3FF);
-}
-
-/// 回填 BEQ/BNE/BLT/BGE/BLTU/BGEU 跳转目标（2RI16-type）。
-fn patchBcc(code_item: *u32, jump_idx: u32, target_idx: u32) void {
-    const diff: i64 = @as(i64, target_idx) - @as(i64, jump_idx);
-    const off16: i32 = @intCast(diff);
-    const uimm: u32 = @as(u32, @bitCast(off16)) & 0xFFFF;
-    code_item.* = (code_item.* & ~(0xFFFF << 10)) | (uimm << 10);
-}
-
-/// 回填 BEQZ/BNEZ/BCEQZ/BCNEZ 跳转目标（1RI21-type）。
-fn patchBz(code_item: *u32, jump_idx: u32, target_idx: u32) void {
-    const diff: i64 = @as(i64, target_idx) - @as(i64, jump_idx);
-    const off21: i32 = @intCast(diff);
-    const uimm: u32 = @as(u32, @bitCast(off21)) & 0x1FFFFF;
-    code_item.* = (code_item.* & ~((0xFFFF << 10) | 0x1F)) | ((uimm & 0xFFFF) << 10) | ((uimm >> 16) & 0x1F);
 }
 
 /// 编译 IR 函数为 LoongArch64 机器码。
@@ -2973,8 +3408,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .neq_f64 => {
                 const rd = cg.resolveReg(inst.dst);
@@ -2989,8 +3430,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .lt_f64 => {
                 const rd = cg.resolveReg(inst.dst);
@@ -3005,8 +3452,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .le_f64 => {
                 const rd = cg.resolveReg(inst.dst);
@@ -3021,8 +3474,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .gt_f64 => {
                 // gt(a,b) = lt(b,a)
@@ -3038,8 +3497,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .ge_f64 => {
                 // ge(a,b) = le(b,a)
@@ -3055,8 +3520,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
 
             // ════════ 浮点比较（f32）→ bool ════════
@@ -3073,8 +3544,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .neq_f32 => {
                 const rd = cg.resolveReg(inst.dst);
@@ -3089,8 +3566,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .lt_f32 => {
                 const rd = cg.resolveReg(inst.dst);
@@ -3105,8 +3588,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .le_f32 => {
                 const rd = cg.resolveReg(inst.dst);
@@ -3121,8 +3610,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .gt_f32 => {
                 const rd = cg.resolveReg(inst.dst);
@@ -3137,8 +3632,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
             .ge_f32 => {
                 const rd = cg.resolveReg(inst.dst);
@@ -3153,8 +3654,14 @@ pub fn compile(
                 const set_true_idx = cg.currentOffset();
                 try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
                 const done_idx = cg.currentOffset();
-                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
-                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+                {
+                    const delta: i32 = @intCast((@as(i64, set_true_idx) - @as(i64, bz_idx)) * 4);
+                    cg.code.items[bz_idx] = reencBcnez(cg.code.items[bz_idx], delta);
+                }
+                {
+                    const delta: i32 = @intCast((@as(i64, done_idx) - @as(i64, b_idx)) * 4);
+                    cg.code.items[b_idx] = reencI26(cg.code.items[b_idx], delta);
+                }
             },
         }
     }
@@ -3167,9 +3674,18 @@ pub fn compile(
         const current_offset = fixup.code_idx;
 
         switch (fixup.fixup_kind) {
-            1 => patchI26(&cg.code.items[fixup.code_idx], current_offset, target_offset),
-            2 => patchBcc(&cg.code.items[fixup.code_idx], current_offset, target_offset),
-            3 => patchBz(&cg.code.items[fixup.code_idx], current_offset, target_offset),
+            1 => {
+                const delta: i32 = @intCast((@as(i64, target_offset) - @as(i64, current_offset)) * 4);
+                cg.code.items[fixup.code_idx] = reencI26(cg.code.items[fixup.code_idx], delta);
+            },
+            2 => {
+                const delta: i32 = @intCast((@as(i64, target_offset) - @as(i64, current_offset)) * 4);
+                cg.code.items[fixup.code_idx] = reencBcc(cg.code.items[fixup.code_idx], delta);
+            },
+            3 => {
+                const delta: i32 = @intCast((@as(i64, target_offset) - @as(i64, current_offset)) * 4);
+                cg.code.items[fixup.code_idx] = reencBcnez(cg.code.items[fixup.code_idx], delta);
+            },
             else => return error.JitUnknownFixupKind,
         }
     }

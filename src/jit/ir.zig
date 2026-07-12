@@ -237,6 +237,15 @@ fn typeNameToIRType(name: []const u8) ?Type {
 /// 基于前向单遍扫描：寄存器类型由最近一次写入决定。
 fn inferRegTypes(func: *const reg_chunk.RegFunction, reg_types: []Type) Type {
     @memset(reg_types, .i64);
+    // 从 param_types 推断参数寄存器类型，确保 f64 参数分配到 FPR
+    for (0..@min(func.arity, func.param_types.len)) |arg_idx| {
+        if (arg_idx >= reg_types.len) break;
+        if (func.param_types[arg_idx]) |ptn| {
+            if (typeNameToIRType(ptn)) |ty| {
+                reg_types[arg_idx] = ty;
+            }
+        }
+    }
     var seen_return_op = false;
     var return_type: Type = .i64;
     const code = func.chunk.code.items;
@@ -247,6 +256,18 @@ fn inferRegTypes(func: *const reg_chunk.RegFunction, reg_types: []Type) Type {
         const b = reg_opcode.getB(inst);
         const c = reg_opcode.getC(inst);
         const bx = reg_opcode.getBx(inst);
+
+        // return 后的死代码不影响类型推断（编译器常在 return 后发射
+        // load_unit/load_const 作为默认返回值，会错误覆盖参数的浮点类型）
+        if (seen_return_op) {
+            switch (op) {
+                .return_op => {
+                    if (a < reg_types.len) return_type = reg_types[a];
+                },
+                else => {},
+            }
+            continue;
+        }
 
         switch (op) {
             .load_const => {
@@ -603,7 +624,7 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
                 const target_ty = typeNameToIRType(tname) orelse return .{ .unsupported = .cast };
                 const src_ty: Type = if (b < reg_types.len) reg_types[b] else .i64;
                 const dst = reg_map.items[a];
-                const src = .{ .vreg = reg_map.items[b] };
+                const src: Operand = .{ .vreg = reg_map.items[b] };
 
                 const ir_op: ?Opcode = blk: {
                     if (src_ty == target_ty) break :blk .move;

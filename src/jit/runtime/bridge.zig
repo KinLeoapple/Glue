@@ -32,9 +32,7 @@ pub export fn rt_step(vm: *RegVM, ip: usize) callconv(.c) bool {
     const initial_func = frame.func;
     const initial_base = frame.base;
 
-    _ = vm.jitStepOnce() catch {
-        return true;
-    };
+    _ = vm.jitStepOnce() catch return true;
 
     // 情况 1：函数返回（帧弹出，帧数减少）
     // return_op/return_unit/throw_op/propagate 始终写入返回槽位，无需补偿

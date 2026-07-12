@@ -238,7 +238,18 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
     });
     exe.root_module.linkSystemLibrary("c", .{});
-    b.installArtifact(exe);
+    // 按架构分目录安装，避免多架构交叉编译时互相覆盖
+    const arch_dir = switch (target.result.cpu.arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        .riscv64 => "riscv64",
+        .loongarch64 => "loongarch64",
+        else => "unknown",
+    };
+    const install_step = b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .{ .custom = arch_dir } },
+    });
+    b.getInstallStep().dependOn(&install_step.step);
 
     // ---- 单元测试：为每个需要测试的模块创建测试产物 ----
     const lexer_unit_tests = b.addTest(.{

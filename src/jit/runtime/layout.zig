@@ -67,3 +67,15 @@ pub const FLOAT_TYPE_F16: u8 = 1;
 pub const FLOAT_TYPE_F32: u8 = 2;
 pub const FLOAT_TYPE_F64: u8 = 3;
 pub const FLOAT_TYPE_F128: u8 = 4;
+
+test "Value 布局常量验证" {
+    const std = @import("std");
+    try std.testing.expectEqual(@as(usize, 0), INT_LO_OFFSET);
+    try std.testing.expectEqual(@as(usize, 8), INT_HI_OFFSET);
+    try std.testing.expectEqual(@as(usize, 16), INT_TYPE_OFFSET);
+    try std.testing.expectEqual(@as(usize, 24), TAG_OFFSET);
+    std.debug.print("\nValue size: {}\n", .{@sizeOf(value.Value)});
+    std.debug.print("Float.bits offset: {}\n", .{FLOAT_BITS_OFFSET});
+    std.debug.print("Float.type offset: {}\n", .{FLOAT_TYPE_OFFSET});
+    std.debug.print("Float.extra offset: {}\n", .{FLOAT_EXTRA_OFFSET});
+}

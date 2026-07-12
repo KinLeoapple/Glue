@@ -156,9 +156,8 @@ fn encS(imm12: i12, rs2: u8, rs1: u8, funct3: u3, opcode: u7) u32 {
 }
 
 /// B-type 编码: imm[12][31] imm[10:5][30:25] rs2[24:20] rs1[19:15] funct3[14:12] imm[4:1][11:8] imm[11][7] opcode[6:0]
-/// 参数 idx 为指令索引差（以 4 字节为单位），内部乘 4 转为字节偏移量。
-fn encB(idx: i32, rs1: u8, rs2: u8, funct3: u3, opcode: u7) u32 {
-    const imm13: i13 = @intCast(@as(i64, idx) * 4);
+/// 参数 imm13 为字节偏移量（遵循 RISC-V ISA 规范，立即数字段以字节为单位）。
+fn encB(imm13: i13, rs1: u8, rs2: u8, funct3: u3, opcode: u7) u32 {
     const imm: u13 = @bitCast(imm13);
     const b12: u1 = @truncate(imm >> 12);
     const b10_5: u6 = @truncate(imm >> 5);
@@ -183,9 +182,8 @@ fn encU(imm20: i20, rd: u8, opcode: u7) u32 {
 }
 
 /// J-type 编码: imm[20][31] imm[10:1][30:21] imm[11][20] imm[19:12][19:12] rd[11:7] opcode[6:0]
-/// 参数 idx 为指令索引差（以 4 字节为单位），内部乘 4 转为字节偏移量。
-fn encJtype(idx: i32, rd: u8, opcode: u7) u32 {
-    const imm21: i21 = @intCast(@as(i64, idx) * 4);
+/// 参数 imm21 为字节偏移量（遵循 RISC-V ISA 规范，立即数字段以字节为单位）。
+fn encJtype(imm21: i21, rd: u8, opcode: u7) u32 {
     const imm: u21 = @bitCast(imm21);
     const b20: u1 = @truncate(imm >> 20);
     const b10_1: u10 = @truncate(imm >> 1);
@@ -318,40 +316,40 @@ fn encSb(rs2: u8, rs1: u8, imm12: i12) u32 {
 // ── RV64I 分支指令 (B-type, opcode=0b1100011) ──
 
 /// BEQ rs1, rs2, imm13
-fn encBeq(rs1: u8, rs2: u8, idx: i32) u32 {
-    return encB(idx, rs1, rs2, 0b000, 0b1100011);
+fn encBeq(rs1: u8, rs2: u8, imm13: i13) u32 {
+    return encB(imm13, rs1, rs2, 0b000, 0b1100011);
 }
 
 /// BNE rs1, rs2, imm13
-fn encBne(rs1: u8, rs2: u8, idx: i32) u32 {
-    return encB(idx, rs1, rs2, 0b001, 0b1100011);
+fn encBne(rs1: u8, rs2: u8, imm13: i13) u32 {
+    return encB(imm13, rs1, rs2, 0b001, 0b1100011);
 }
 
 /// BLT rs1, rs2, imm13 (signed)
-fn encBlt(rs1: u8, rs2: u8, idx: i32) u32 {
-    return encB(idx, rs1, rs2, 0b100, 0b1100011);
+fn encBlt(rs1: u8, rs2: u8, imm13: i13) u32 {
+    return encB(imm13, rs1, rs2, 0b100, 0b1100011);
 }
 
 /// BGE rs1, rs2, imm13 (signed)
-fn encBge(rs1: u8, rs2: u8, idx: i32) u32 {
-    return encB(idx, rs1, rs2, 0b101, 0b1100011);
+fn encBge(rs1: u8, rs2: u8, imm13: i13) u32 {
+    return encB(imm13, rs1, rs2, 0b101, 0b1100011);
 }
 
 /// BLTU rs1, rs2, imm13 (unsigned)
-fn encBltu(rs1: u8, rs2: u8, idx: i32) u32 {
-    return encB(idx, rs1, rs2, 0b110, 0b1100011);
+fn encBltu(rs1: u8, rs2: u8, imm13: i13) u32 {
+    return encB(imm13, rs1, rs2, 0b110, 0b1100011);
 }
 
 /// BGEU rs1, rs2, imm13 (unsigned)
-fn encBgeu(rs1: u8, rs2: u8, idx: i32) u32 {
-    return encB(idx, rs1, rs2, 0b111, 0b1100011);
+fn encBgeu(rs1: u8, rs2: u8, imm13: i13) u32 {
+    return encB(imm13, rs1, rs2, 0b111, 0b1100011);
 }
 
 // ── RV64I 跳转指令 ──
 
 /// JAL rd, imm21 (opcode=0b1101111)
-fn encJal(rd: u8, idx: i32) u32 {
-    return encJtype(idx, rd, 0b1101111);
+fn encJal(rd: u8, imm21: i21) u32 {
+    return encJtype(imm21, rd, 0b1101111);
 }
 
 /// JALR rd, rs1, imm12 (opcode=0b1100111)
@@ -397,8 +395,8 @@ fn encSnez(rd: u8, rs: u8) u32 {
 }
 
 /// J imm21 = JAL x0, imm21 (无条件跳转)
-fn encJ(idx: i32) u32 {
-    return encJal(GPR.x0, idx);
+fn encJ(imm21: i21) u32 {
+    return encJal(GPR.x0, imm21);
 }
 
 // ── RV64D 浮点指令 (D extension) ──
@@ -612,40 +610,42 @@ fn encFmvDX(rd: u8, rs1: u8) u32 {
     return encR(0b1111001, rd, 0b000, rs1, 0, 0b1010011);
 }
 
+/// FMV.X.D rd, rs1 (FPR → GPR, 将 FPR 的 64 位 bit pattern 移到 GPR)
+/// R-type: funct7=0b1110000, rs2=0b00000, funct3=0b000, opcode=0b1010011
+/// 源 FPR 在 rs1 字段，rs2 必须为 0。
+fn encFmvXD(rd: u8, rs1: u8) u32 {
+    return encR(0b1110000, rd, 0b000, rs1, 0, 0b1010011);
+}
+
 /// FMV.W.X rd, rs1 (GPR → FPR, 单精度位移动)
 /// funct7=0b1111000, rs2=0b00000, funct3=0b000
 fn encFmvWX(rd: u8, rs1: u8) u32 {
     return encR(0b1111000, rd, 0b000, rs1, 0, 0b1010011);
 }
 
-// ── B-type / J-type 立即数回填辅助 ──
+// ── B-type / J-type 回填辅助 ──
+// 回填采用"解码 + 重新编码"方式：从占位指令中提取 rs1/rs2/funct3/opcode，
+// 再用 encB/encJtype 一次性生成正确的完整指令，无需保留位掩码。
 
-/// 回填 B-type 立即数（保留 rs1/rs2/funct3/opcode，仅替换立即数位）。
-/// 参数 idx 为指令索引差（以 4 字节为单位），内部乘 4 转为字节偏移量。
-fn patchB(inst: u32, idx: i32) u32 {
-    const new_imm13: i13 = @intCast(@as(i64, idx) * 4);
-    const imm: u13 = @bitCast(new_imm13);
-    const b12: u32 = @as(u32, @as(u1, @truncate(imm >> 12))) << 31;
-    const b10_5: u32 = @as(u32, @as(u6, @truncate(imm >> 5))) << 25;
-    const b4_1: u32 = @as(u32, @as(u4, @truncate(imm >> 1))) << 8;
-    const b11: u32 = @as(u32, @as(u1, @truncate(imm >> 11))) << 7;
-    const imm_mask = b12 | b10_5 | b4_1 | b11;
-    const keep_mask: u32 = ~((@as(u32, 1) << 31) | (@as(u32, 0x3F) << 25) | (@as(u32, 0xF) << 8) | (@as(u32, 1) << 7));
-    return (inst & keep_mask) | imm_mask;
+/// 从 B-type 指令中提取 funct3 字段。
+fn bFunct3(inst: u32) u3 {
+    return @truncate((inst >> 12) & 0x7);
 }
 
-/// 回填 J-type 立即数（保留 rd/opcode，仅替换立即数位）。
-/// 参数 idx 为指令索引差（以 4 字节为单位），内部乘 4 转为字节偏移量。
-fn patchJ(inst: u32, idx: i32) u32 {
-    const new_imm21: i21 = @intCast(@as(i64, idx) * 4);
-    const imm: u21 = @bitCast(new_imm21);
-    const b20: u32 = @as(u32, @as(u1, @truncate(imm >> 20))) << 31;
-    const b10_1: u32 = @as(u32, @as(u10, @truncate(imm >> 1))) << 21;
-    const b11: u32 = @as(u32, @as(u1, @truncate(imm >> 11))) << 20;
-    const b19_12: u32 = @as(u32, @as(u8, @truncate(imm >> 12))) << 12;
-    const imm_mask = b20 | b10_1 | b11 | b19_12;
-    const keep_mask: u32 = ~((@as(u32, 1) << 31) | (@as(u32, 0x3FF) << 21) | (@as(u32, 1) << 20) | (@as(u32, 0xFF) << 12));
-    return (inst & keep_mask) | imm_mask;
+/// 从 B-type 指令中提取 rs1 字段。
+fn bRs1(inst: u32) u8 {
+    return @truncate((inst >> 15) & 0x1F);
+}
+
+/// 从 B-type 指令中提取 rs2 字段。
+fn bRs2(inst: u32) u8 {
+    return @truncate((inst >> 20) & 0x1F);
+}
+
+/// 回填 B-type 跳转指令：解码占位指令的寄存器/功能位，用新偏移重新编码。
+/// 参数 imm13 为字节偏移量（遵循 RISC-V ISA 规范）。
+fn reencB(inst: u32, imm13: i13) u32 {
+    return encB(imm13, bRs1(inst), bRs2(inst), bFunct3(inst), 0b1100011);
 }
 
 // ── 立即数加载辅助 ──
@@ -832,11 +832,22 @@ pub fn compile(
     defer cg.deinit();
 
     // ════════ 函数 prologue ════════
-    // 保存 ra 和 fp(s0)，建立 16 字节栈帧
-    try cg.emit(encAddi(GPR.sp, GPR.sp, -16));
-    try cg.emit(encSd(GPR.ra, GPR.sp, 8));
-    try cg.emit(encSd(GPR.s0, GPR.sp, 0));
-    try cg.emit(encAddi(GPR.s0, GPR.sp, 16));
+    // 128 字节栈帧：96 字节保存 ra/s0/s2-s11 + 32 字节 scratch
+    // scratch 区用于 GPR↔FPR 转换（FMV.D.X/FMV.X.D 在 QEMU 中不可靠）
+    try cg.emit(encAddi(GPR.sp, GPR.sp, -128));
+    try cg.emit(encSd(GPR.ra, GPR.sp, 120));
+    try cg.emit(encSd(GPR.s0, GPR.sp, 112));
+    try cg.emit(encSd(GPR.s2, GPR.sp, 104));
+    try cg.emit(encSd(GPR.s3, GPR.sp, 96));
+    try cg.emit(encSd(GPR.s4, GPR.sp, 88));
+    try cg.emit(encSd(GPR.s5, GPR.sp, 80));
+    try cg.emit(encSd(GPR.s6, GPR.sp, 72));
+    try cg.emit(encSd(GPR.s7, GPR.sp, 64));
+    try cg.emit(encSd(GPR.s8, GPR.sp, 56));
+    try cg.emit(encSd(GPR.s9, GPR.sp, 48));
+    try cg.emit(encSd(GPR.s10, GPR.sp, 40));
+    try cg.emit(encSd(GPR.s11, GPR.sp, 32));
+    try cg.emit(encAddi(GPR.s0, GPR.sp, 128));
 
     // ════════ 函数体 ════════
     for (func.insts.items) |inst| {
@@ -852,10 +863,12 @@ pub fn compile(
             },
 
             .const_f64 => {
-                // 加载 imm64 到 GPR t0，再用 FMV.D.X 移到 FPR
+                // 加载 imm64 到 GPR t0，通过栈中转 (SD+FLD) 移到 FPR
+                // （FMV.D.X 在 QEMU 中不可靠，使用 FLD/FSD 替代）
                 const rd = cg.resolveReg(inst.dst); // FPR
                 try loadImm64Cg(&cg, GPR.t0, inst.imm);
-                try cg.emit(encFmvDX(rd, GPR.t0));
+                try cg.emit(encSd(GPR.t0, GPR.sp, 0));
+                try cg.emit(encFld(rd, GPR.sp, 0));
             },
 
             .const_f32 => {
@@ -1092,70 +1105,89 @@ pub fn compile(
 
             // ── 函数参数加载 ──
             .load_arg => {
-                // 整数参数在 a0-a7(x10-x17)，浮点参数在 fa0-fa7(f10-f17)
+                // 统一调用约定：参数通过 *const value.Value 数组指针(a0)传递
+                // Value 是 32 字节联合体，int.lo 和 float.bits 都在偏移 0
                 const arg_idx: u8 = @intCast(inst.imm);
                 const rd = cg.resolveReg(inst.dst);
                 const arg_ty = func.arg_types[arg_idx];
+                // Value 数组基址在 a0，每个 Value 32 字节
+                const arg_off: i12 = @intCast(@as(i64, arg_idx) * 32);
                 if (arg_ty.isFloat()) {
-                    const arg_reg: u8 = FPR.fa0 + arg_idx;
-                    if (rd != arg_reg) {
-                        if (arg_ty == .f32) {
-                            try cg.emit(encFmvS(rd, arg_reg));
-                        } else {
-                            try cg.emit(encFmvD(rd, arg_reg));
-                        }
-                    }
+                    // 从 Value[arg_idx].float.bits (偏移 0) 加载到 FPR
+                    try cg.emit(encFld(rd, GPR.a0, arg_off));
                 } else {
-                    const arg_reg: u8 = GPR.a0 + arg_idx;
-                    if (rd != arg_reg) {
-                        try cg.emit(encMv(rd, arg_reg));
-                    }
+                    // 从 Value[arg_idx].int.lo (偏移 0) 加载到 GPR
+                    try cg.emit(encLd(rd, GPR.a0, arg_off));
                 }
             },
 
             // ── 函数返回 ──
             .return_val => {
-                // 整数返回值在 a0(x10)，浮点返回值在 fa0(f10)
+                // 统一调用约定：返回值通过 a0 返回 u64
+                // 浮点返回值通过 FSD+LD 经栈中转（FMV.X.D 在 QEMU 中不可靠）
                 const rn = cg.resolveReg(inst.a.vreg);
                 if (inst.a.vreg.type.isFloat()) {
-                    if (rn != FPR.fa0) {
-                        if (inst.a.vreg.type == .f32) {
-                            try cg.emit(encFmvS(FPR.fa0, rn));
-                        } else {
-                            try cg.emit(encFmvD(FPR.fa0, rn));
-                        }
-                    }
+                    // FSD rn, 0(sp) — 存 FPR 到 scratch
+                    // LD a0, 0(sp)  — 从 scratch 加载到 GPR
+                    try cg.emit(encFsd(rn, GPR.sp, 0));
+                    try cg.emit(encLd(GPR.a0, GPR.sp, 0));
                 } else {
                     if (rn != GPR.a0) {
                         try cg.emit(encMv(GPR.a0, rn));
                     }
                 }
-                // 函数 epilogue
-                try cg.emit(encLd(GPR.ra, GPR.sp, 8));
-                try cg.emit(encLd(GPR.s0, GPR.sp, 0));
-                try cg.emit(encAddi(GPR.sp, GPR.sp, 16));
+                // 函数 epilogue：恢复 ra, s0, s2-s11
+                try cg.emit(encLd(GPR.ra, GPR.sp, 120));
+                try cg.emit(encLd(GPR.s0, GPR.sp, 112));
+                try cg.emit(encLd(GPR.s2, GPR.sp, 104));
+                try cg.emit(encLd(GPR.s3, GPR.sp, 96));
+                try cg.emit(encLd(GPR.s4, GPR.sp, 88));
+                try cg.emit(encLd(GPR.s5, GPR.sp, 80));
+                try cg.emit(encLd(GPR.s6, GPR.sp, 72));
+                try cg.emit(encLd(GPR.s7, GPR.sp, 64));
+                try cg.emit(encLd(GPR.s8, GPR.sp, 56));
+                try cg.emit(encLd(GPR.s9, GPR.sp, 48));
+                try cg.emit(encLd(GPR.s10, GPR.sp, 40));
+                try cg.emit(encLd(GPR.s11, GPR.sp, 32));
+                try cg.emit(encAddi(GPR.sp, GPR.sp, 128));
                 try cg.emit(encRet());
             },
             .return_void => {
-                // 函数 epilogue
-                try cg.emit(encLd(GPR.ra, GPR.sp, 8));
-                try cg.emit(encLd(GPR.s0, GPR.sp, 0));
-                try cg.emit(encAddi(GPR.sp, GPR.sp, 16));
+                // 统一调用约定：void 返回 a0=0
+                try cg.emit(encMv(GPR.a0, GPR.x0));
+                // 函数 epilogue：恢复 ra, s0, s2-s11
+                try cg.emit(encLd(GPR.ra, GPR.sp, 120));
+                try cg.emit(encLd(GPR.s0, GPR.sp, 112));
+                try cg.emit(encLd(GPR.s2, GPR.sp, 104));
+                try cg.emit(encLd(GPR.s3, GPR.sp, 96));
+                try cg.emit(encLd(GPR.s4, GPR.sp, 88));
+                try cg.emit(encLd(GPR.s5, GPR.sp, 80));
+                try cg.emit(encLd(GPR.s6, GPR.sp, 72));
+                try cg.emit(encLd(GPR.s7, GPR.sp, 64));
+                try cg.emit(encLd(GPR.s8, GPR.sp, 56));
+                try cg.emit(encLd(GPR.s9, GPR.sp, 48));
+                try cg.emit(encLd(GPR.s10, GPR.sp, 40));
+                try cg.emit(encLd(GPR.s11, GPR.sp, 32));
+                try cg.emit(encAddi(GPR.sp, GPR.sp, 128));
                 try cg.emit(encRet());
             },
 
             // ── 函数调用 ──
             .call => {
-                // JIT 内函数调用：JIT 不遵循标准 ABI，callee 不保存 callee-saved 寄存器，
-                // 因此 caller 必须保存所有 JIT 使用的寄存器 (s2-s11, ft0-ft7)。
+                // 统一调用约定：JIT 内函数调用也通过 Value 数组传递参数。
+                // caller 保存所有 JIT 使用的寄存器 (s2-s11, ft0-ft7)，
+                // 并在栈上构建 Value 数组供 callee 读取。
                 const target_idx = inst.call_target;
                 if (target_idx >= func_entries.len or func_entries[target_idx] == 0) {
                     return error.JitCallTargetNotCompiled;
                 }
                 const entry_addr = func_entries[target_idx];
 
-                // 保存 s2-s11, ft0-ft7 (18 个寄存器 = 144 字节，16 字节对齐)
-                try cg.emit(encAddi(GPR.sp, GPR.sp, -144));
+                // 保存 s2-s11, ft0-ft7 (18 个寄存器 = 144 字节)
+                // 额外分配 256 字节用于 Value 数组（最多 8 个参数 × 32 字节）
+                // 总共 144 + 256 = 400 字节，对齐到 416 字节（16 字节对齐）
+                const stack_size: i12 = 416;
+                try cg.emit(encAddi(GPR.sp, GPR.sp, -stack_size));
                 try cg.emit(encSd(GPR.s2, GPR.sp, 0));
                 try cg.emit(encSd(GPR.s3, GPR.sp, 8));
                 try cg.emit(encSd(GPR.s4, GPR.sp, 16));
@@ -1175,38 +1207,35 @@ pub fn compile(
                 try cg.emit(encFsd(FPR.ft6, GPR.sp, 128));
                 try cg.emit(encFsd(FPR.ft7, GPR.sp, 136));
 
-                // 移动参数到 a0-a7（整数）/ fa0-fa7（浮点）
+                // Value 数组起始偏移 144
+                const val_array_off: i12 = 144;
+
+                // 构建参数 Value 数组
                 const argc = inst.call_argc;
                 if (argc > 8) return error.JitTooManyArgs;
                 var i: u8 = 0;
                 while (i < argc) : (i += 1) {
                     const arg_vreg = inst.call_args[i];
                     const arg_reg = cg.resolveReg(arg_vreg);
+                    const slot_off: i12 = @intCast(@as(i64, val_array_off) + @as(i64, i) * 32);
                     if (arg_vreg.type.isFloat()) {
-                        const target_reg: u8 = FPR.fa0 + i;
-                        if (arg_reg != target_reg) {
-                            if (arg_vreg.type == .f32) {
-                                try cg.emit(encFmvS(target_reg, arg_reg));
-                            } else {
-                                try cg.emit(encFmvD(target_reg, arg_reg));
-                            }
-                        }
+                        // 浮点参数：存到 Value.float.bits (偏移 0)
+                        try cg.emit(encFsd(arg_reg, GPR.sp, slot_off));
                     } else {
-                        const target_reg: u8 = GPR.a0 + i;
-                        if (arg_reg != target_reg) {
-                            try cg.emit(encMv(target_reg, arg_reg));
-                        }
+                        // 整数参数：存到 Value.int.lo (偏移 0)
+                        try cg.emit(encSd(arg_reg, GPR.sp, slot_off));
                     }
                 }
 
-                // 加载目标入口地址到 t0
+                // a0 = sp + val_array_off (Value 数组指针)
+                try cg.emit(encAddi(GPR.a0, GPR.sp, val_array_off));
+
+                // 加载目标入口地址到 t0 并调用
                 const addr: u64 = @intCast(entry_addr);
                 try loadImm64Cg(&cg, GPR.t0, @bitCast(addr));
-
-                // JALR ra, t0, 0（调用函数，ra 保存返回地址）
                 try cg.emit(encJalr(GPR.ra, GPR.t0, 0));
 
-                // 恢复 s2-s11, ft0-ft7（在移动返回值之前）
+                // 恢复 callee-saved 寄存器
                 try cg.emit(encLd(GPR.s2, GPR.sp, 0));
                 try cg.emit(encLd(GPR.s3, GPR.sp, 8));
                 try cg.emit(encLd(GPR.s4, GPR.sp, 16));
@@ -1225,18 +1254,14 @@ pub fn compile(
                 try cg.emit(encFld(FPR.ft5, GPR.sp, 120));
                 try cg.emit(encFld(FPR.ft6, GPR.sp, 128));
                 try cg.emit(encFld(FPR.ft7, GPR.sp, 136));
-                try cg.emit(encAddi(GPR.sp, GPR.sp, 144));
+                try cg.emit(encAddi(GPR.sp, GPR.sp, stack_size));
 
-                // 移动返回值到目标寄存器（在恢复寄存器之后，避免被覆盖）
+                // 返回值在 a0（u64），根据目标类型转换
                 const dst = cg.resolveReg(inst.dst);
                 if (inst.dst.type.isFloat()) {
-                    if (dst != FPR.fa0) {
-                        if (inst.dst.type == .f32) {
-                            try cg.emit(encFmvS(dst, FPR.fa0));
-                        } else {
-                            try cg.emit(encFmvD(dst, FPR.fa0));
-                        }
-                    }
+                    // 通过栈中转 (SD+FLD) 将 GPR bit pattern 移到 FPR
+                    try cg.emit(encSd(GPR.a0, GPR.sp, 0));
+                    try cg.emit(encFld(dst, GPR.sp, 0));
                 } else {
                     if (dst != GPR.a0) {
                         try cg.emit(encMv(dst, GPR.a0));
@@ -1398,10 +1423,10 @@ pub fn compile(
 
         switch (fixup.fixup_kind) {
             1 => { // J-type (JAL x0, ...)
-                cg.code.items[fixup.code_idx] = encJ(@intCast(delta));
+                cg.code.items[fixup.code_idx] = encJ(@intCast(delta << 2));
             },
             2 => { // B-type (BNE/BEQ)
-                cg.code.items[fixup.code_idx] = patchB(cg.code.items[fixup.code_idx], @intCast(delta));
+                cg.code.items[fixup.code_idx] = reencB(cg.code.items[fixup.code_idx], @intCast(delta << 2));
             },
             else => return error.JitUnknownFixupKind,
         }
@@ -1462,10 +1487,142 @@ const ARRAY_ELEMS_PTR_OFF: u32 = @intCast(runtime.ARRAY_ELEMENTS_PTR_OFFSET); //
 // t4 (x29) = 临时（加载的值）
 // t5 (x30) = 临时（加载的值）
 // t6 (x31) = 临时（除法中间值/大偏移地址计算）
-// ft0(f0)  = 浮点临时 0
-// ft1(f1)  = 浮点临时 1
+// ft0(f0)  = 浮点临时 0（scratch，未知类型路径用）
+// ft1(f1)  = 浮点临时 1（scratch，未知类型路径用）
+// ft2-ft5  = FPR 缓存池（已知 f64 路径用，caller-saved）
 // a0 (x10) = C 调用参数 0 / 返回值
 // a1 (x11) = C 调用参数 1
+
+/// FPR 缓存池：用于已知 f64 路径的输入操作数缓存。
+/// 选择 ft2-ft5（caller-saved），保留 ft0/ft1 作为未知类型路径的 scratch。
+const FPR_POOL = [_]u8{
+    FPR.ft2, FPR.ft3, FPR.ft4, FPR.ft5,
+};
+
+const FPR_NONE: i8 = -1;
+
+/// FPR 常驻状态：跟踪 reg_pool 槽位 → FPR 缓存池的映射。
+/// fpr_map[reg] = FPR_NONE 表示该 reg 的 f64 bits 仅在内存中；
+/// 否则值 = FPR_POOL 索引，对应 FPR 寄存器持有最新 bits。
+/// fpr_owner[pool_idx] = 持有该 FPR 的 reg 编号（0xFF=空闲）。
+const FprState = struct {
+    fpr_map: []i8, // reg_count × 1
+    fpr_owner: [FPR_POOL.len]u8, // pool_idx → reg（0xFF=空闲）
+
+    fn init(allocator: std.mem.Allocator, reg_count: usize) !FprState {
+        const m = try allocator.alloc(i8, reg_count);
+        @memset(m, FPR_NONE);
+        return .{ .fpr_map = m, .fpr_owner = [_]u8{0xFF} ** FPR_POOL.len };
+    }
+
+    fn deinit(self: *FprState, allocator: std.mem.Allocator) void {
+        allocator.free(self.fpr_map);
+    }
+
+    /// 判断 reg 是否常驻 FPR
+    fn isResident(self: *const FprState, reg: u8) bool {
+        return reg < self.fpr_map.len and self.fpr_map[reg] != FPR_NONE;
+    }
+
+    /// 获取 reg 对应的 FPR 编号；调用方需先 isResident 判断
+    fn getFpr(self: *const FprState, reg: u8) u8 {
+        const idx: usize = @intCast(self.fpr_map[reg]);
+        return FPR_POOL[idx];
+    }
+
+    /// 将 reg 标记为常驻到 pool_idx 对应的 FPR（替换原 owner）
+    fn setResident(self: *FprState, reg: u8, pool_idx: usize) void {
+        // 先驱逐原 owner（如果有）
+        const old_owner = self.fpr_owner[pool_idx];
+        if (old_owner != 0xFF and old_owner < self.fpr_map.len) {
+            self.fpr_map[old_owner] = FPR_NONE;
+        }
+        // 清除 reg 的旧映射（如果 reg 之前在其他 FPR）
+        if (reg < self.fpr_map.len and self.fpr_map[reg] != FPR_NONE) {
+            const old_idx: usize = @intCast(self.fpr_map[reg]);
+            self.fpr_owner[old_idx] = 0xFF;
+        }
+        self.fpr_map[reg] = @intCast(pool_idx);
+        self.fpr_owner[pool_idx] = reg;
+    }
+
+    /// 驱逐 reg（如果常驻），使其仅在内存
+    fn evict(self: *FprState, reg: u8) void {
+        if (reg >= self.fpr_map.len) return;
+        const idx = self.fpr_map[reg];
+        if (idx == FPR_NONE) return;
+        self.fpr_owner[@intCast(idx)] = 0xFF;
+        self.fpr_map[reg] = FPR_NONE;
+    }
+
+    /// 分配一个空闲 pool_idx；若无空闲返回 null
+    fn allocSlot(self: *const FprState) ?usize {
+        var i: usize = 0;
+        while (i < FPR_POOL.len) : (i += 1) {
+            if (self.fpr_owner[i] == 0xFF) return i;
+        }
+        return null;
+    }
+
+    /// 清空所有 FPR 映射（跳转目标/rt_step 调用前重置）
+    fn invalidateAll(self: *FprState) void {
+        @memset(self.fpr_map, FPR_NONE);
+        self.fpr_owner = [_]u8{0xFF} ** FPR_POOL.len;
+    }
+};
+
+/// 确保 reg 的 f64 bits 加载到某个 FPR，返回 FPR 编号。
+/// 若已常驻直接返回；否则从内存加载并标记常驻（必要时驱逐一个非 protect_reg 的槽）。
+/// 调用前需已 loadFrameBase（t1 = frame base）。
+/// 仅用于编译时已知 f64 的路径；未知类型路径应使用 ft0/ft1 直接加载。
+/// protect_reg: 指定一个 reg 编号，其常驻 FPR 不允许被驱逐（传 0xFF 表示无保护）。
+fn emitEnsureFpr(
+    code: *std.ArrayListUnmanaged(u32),
+    allocator: std.mem.Allocator,
+    fpr: *FprState,
+    reg: u8,
+    protect_reg: u8,
+) !u8 {
+    if (fpr.isResident(reg)) return fpr.getFpr(reg);
+    // 分配空闲槽
+    const slot = fpr.allocSlot() orelse blk: {
+        // 池满：驱逐一个非 protect_reg 的槽
+        var evict_idx: usize = 0;
+        var found_evict = false;
+        var i: usize = 0;
+        while (i < FPR_POOL.len) : (i += 1) {
+            const owner = fpr.fpr_owner[i];
+            if (owner == 0xFF) continue;
+            if (owner == protect_reg) continue;
+            evict_idx = i;
+            found_evict = true;
+            break;
+        }
+        if (!found_evict) {
+            // 所有槽都是 protect_reg 或空闲（不应发生，因为 allocSlot 返回 null 说明无空闲）
+            // 强制驱逐 pool[0]
+            evict_idx = 0;
+        }
+        const victim = fpr.fpr_owner[evict_idx];
+        if (victim != 0xFF) {
+            // 仅驱逐缓存状态（不写回内存），因为缓存值来自内存加载，内存已有正确值
+            fpr.evict(victim);
+        }
+        break :blk evict_idx;
+    };
+    const fpr_reg = FPR_POOL[slot];
+    // 从 frame_base(t1) 加载 reg.float.bits 到 fpr_reg
+    const off: i32 = @intCast(@as(u32, reg) * 32 + FLOAT_BITS_OFF);
+    if (off >= -2048 and off <= 2047) {
+        try code.append(allocator, encFld(fpr_reg, GPR.t1, @intCast(off)));
+    } else {
+        try loadImm32(code, allocator, GPR.t6, off);
+        try code.append(allocator, encAdd(GPR.t6, GPR.t1, GPR.t6));
+        try code.append(allocator, encFld(fpr_reg, GPR.t6, 0));
+    }
+    fpr.setResident(reg, slot);
+    return fpr_reg;
+}
 
 /// 桥接模式编译：直接从字节码生成 RISC-V 64 机器码。
 ///
@@ -1505,6 +1662,10 @@ pub fn compileBridge(
     var reg_types = try allocator.alloc(RegType, reg_count);
     defer allocator.free(reg_types);
     @memset(reg_types, .unknown);
+
+    // ── FPR 常驻状态（缓存 f64 输入操作数）──
+    var fpr_state = try FprState.init(allocator, reg_count);
+    defer fpr_state.deinit(allocator);
     for (func.param_types, 0..) |pt, i| {
         if (i >= reg_count) break;
         if (pt) |tname| {
@@ -1651,12 +1812,15 @@ pub fn compileBridge(
     }.call;
 
     // ── 辅助：生成 cold 路径（rt_step 调用 + exit 检查）──
+    // rt_step 会 clobber 所有 caller-saved FPR，调用前需 invalidateAll。
     const emitCold = struct {
-        fn call(buf: *std.ArrayListUnmanaged(u32), alloc: std.mem.Allocator, pfixups: *std.ArrayListUnmanaged(Fixup), ip: u32) !void {
+        fn call(buf: *std.ArrayListUnmanaged(u32), alloc: std.mem.Allocator, pfixups: *std.ArrayListUnmanaged(Fixup), ip: u32, fpr: *FprState) !void {
             // a0 = vm
             try emit(buf, alloc, encMv(GPR.a0, GPR.s0));
             // a1 = ip
             try loadImm32(buf, alloc, GPR.a1, @intCast(ip));
+            // rt_step 会 clobber caller-saved FPR，缓存必须失效
+            fpr.invalidateAll();
             // JALR ra, s2, 0 (call rt_step)
             try emit(buf, alloc, encJalr(GPR.ra, GPR.s2, 0));
             // BNE a0, x0, exit (占位)
@@ -1697,6 +1861,7 @@ pub fn compileBridge(
 
         if (ip > 0 and jump_targets.contains(ip)) {
             @memset(reg_types, .unknown);
+            fpr_state.invalidateAll();
         }
 
         const inst = instructions[ip];
@@ -1738,21 +1903,29 @@ pub fn compileBridge(
                     try regSd(&code, allocator, GPR.t4, a, INT_LO_OFF);
                     reg_types[a] = .i64;
                 } else if (b_known_f64 and c_known_f64 and op != .mod) {
+                    // ── 类型已知 f64：用 FPR 缓存池加载，跳过 tag 检查 ──
                     try loadFrameBase(&code, allocator);
-                    try regFld(&code, allocator, FPR.ft0, b, FLOAT_BITS_OFF);
-                    try regFld(&code, allocator, FPR.ft1, c, FLOAT_BITS_OFF);
+                    // a 将被覆盖；若 a 常驻 FPR，先驱逐（防止 a==b/c 时数据丢失）
+                    fpr_state.evict(a);
+                    const fpr_b = try emitEnsureFpr(&code, allocator, &fpr_state, b, 0xFF);
+                    const fpr_c = try emitEnsureFpr(&code, allocator, &fpr_state, c, b);
+                    // ft0 = fpr_b op fpr_c（结果暂存 ft0，不占用缓存槽）
                     switch (op) {
-                        .add => try emit(&code, allocator, encFaddD(FPR.ft0, FPR.ft0, FPR.ft1)),
-                        .sub => try emit(&code, allocator, encFsubD(FPR.ft0, FPR.ft0, FPR.ft1)),
-                        .mul => try emit(&code, allocator, encFmulD(FPR.ft0, FPR.ft0, FPR.ft1)),
-                        .div => try emit(&code, allocator, encFdivD(FPR.ft0, FPR.ft0, FPR.ft1)),
+                        .add => try emit(&code, allocator, encFaddD(FPR.ft0, fpr_b, fpr_c)),
+                        .sub => try emit(&code, allocator, encFsubD(FPR.ft0, fpr_b, fpr_c)),
+                        .mul => try emit(&code, allocator, encFmulD(FPR.ft0, fpr_b, fpr_c)),
+                        .div => try emit(&code, allocator, encFdivD(FPR.ft0, fpr_b, fpr_c)),
                         else => unreachable,
                     }
+                    // 将结果写回内存
                     try regFsd(&code, allocator, FPR.ft0, a, FLOAT_BITS_OFF);
                     try loadImm32(&code, allocator, GPR.t2, TAG_FLOAT_VAL);
                     try regSb(&code, allocator, GPR.t2, a, TAG_OFF);
                     try loadImm32(&code, allocator, GPR.t2, FLOAT_TYPE_F64_VAL);
                     try regSb(&code, allocator, GPR.t2, a, FLOAT_TYPE_OFF);
+                    // 若 a==b 或 a==c，a 的内存已更新但 b/c 的 FPR 缓存已过时，需驱逐
+                    if (a == b) fpr_state.evict(b);
+                    if (a == c) fpr_state.evict(c);
                     reg_types[a] = .f64;
                 } else {
                     // ── 未知类型：带 tag 检查的通用路径 ──
@@ -1794,9 +1967,9 @@ pub fn compileBridge(
                     const not_int_target: u32 = @intCast(code.items.len);
                     {
                         const d1: i64 = @as(i64, not_int_target) - @as(i64, @intCast(bne_not_int1));
-                        code.items[bne_not_int1] = patchB(code.items[bne_not_int1], @intCast(d1));
+                        code.items[bne_not_int1] = reencB(code.items[bne_not_int1], @intCast(d1 << 2));
                         const d2: i64 = @as(i64, not_int_target) - @as(i64, @intCast(bne_not_int2));
-                        code.items[bne_not_int2] = patchB(code.items[bne_not_int2], @intCast(d2));
+                        code.items[bne_not_int2] = reencB(code.items[bne_not_int2], @intCast(d2 << 2));
                     }
 
                     var b_next2: u32 = 0;
@@ -1841,21 +2014,21 @@ pub fn compileBridge(
                         const cold_off: u32 = @intCast(code.items.len);
                         inline for (.{ bne_cold_f1, bne_cold_f2, bne_cold_f3, bne_cold_f4 }) |bne_off| {
                             const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
-                            code.items[bne_off] = patchB(code.items[bne_off], @intCast(d));
+                            code.items[bne_off] = reencB(code.items[bne_off], @intCast(d << 2));
                         }
                     }
 
                     // cold: rt_step 桥接
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                     const next_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                        code.items[b_next] = encJ(@intCast(d));
+                        code.items[b_next] = encJ(@intCast(d << 2));
                     }
                     if (op != .mod) {
                         const d2: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next2));
-                        code.items[b_next2] = encJ(@intCast(d2));
+                        code.items[b_next2] = encJ(@intCast(d2 << 2));
                     }
                     reg_types[a] = .unknown;
                 }
@@ -1877,14 +2050,16 @@ pub fn compileBridge(
                     try regSd(&code, allocator, GPR.t4, a, INT_LO_OFF);
                     reg_types[a] = .i64;
                 } else if (b_known_f64) {
-                    // 已知 f64 类型：直接用 FNEG.D 取反
-                    try regFld(&code, allocator, FPR.ft0, b, FLOAT_BITS_OFF);
-                    try emit(&code, allocator, encFnegD(FPR.ft0, FPR.ft0));
+                    // ── 类型已知 f64：用 FPR 缓存池加载，直接浮点取反 ──
+                    fpr_state.evict(a);
+                    const fpr_b = try emitEnsureFpr(&code, allocator, &fpr_state, b, 0xFF);
+                    try emit(&code, allocator, encFnegD(FPR.ft0, fpr_b));
                     try regFsd(&code, allocator, FPR.ft0, a, FLOAT_BITS_OFF);
                     try loadImm32(&code, allocator, GPR.t2, TAG_FLOAT_VAL);
                     try regSb(&code, allocator, GPR.t2, a, TAG_OFF);
                     try loadImm32(&code, allocator, GPR.t2, FLOAT_TYPE_F64_VAL);
                     try regSb(&code, allocator, GPR.t2, a, FLOAT_TYPE_OFF);
+                    if (a == b) fpr_state.evict(b);
                     reg_types[a] = .f64;
                 } else {
                     // ── 未知类型：i64 → f64 → cold 三层路径 ──
@@ -1908,7 +2083,7 @@ pub fn compileBridge(
                     const not_int_target: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, not_int_target) - @as(i64, @intCast(bne_not_int));
-                        code.items[bne_not_int] = patchB(code.items[bne_not_int], @intCast(d));
+                        code.items[bne_not_int] = reencB(code.items[bne_not_int], @intCast(d << 2));
                     }
 
                     // f64 快速路径：检查 b 的 tag == TAG_FLOAT 且 float_type == F64
@@ -1936,20 +2111,20 @@ pub fn compileBridge(
                     const cold_off: u32 = @intCast(code.items.len);
                     inline for (.{ bne_cold_f1, bne_cold_f2 }) |bne_off| {
                         const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
-                        code.items[bne_off] = patchB(code.items[bne_off], @intCast(d));
+                        code.items[bne_off] = reencB(code.items[bne_off], @intCast(d << 2));
                     }
 
                     // cold: rt_step 桥接
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                     const next_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                        code.items[b_next] = encJ(@intCast(d));
+                        code.items[b_next] = encJ(@intCast(d << 2));
                     }
                     {
                         const d2: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next2));
-                        code.items[b_next2] = encJ(@intCast(d2));
+                        code.items[b_next2] = encJ(@intCast(d2 << 2));
                     }
                     reg_types[a] = .unknown;
                 }
@@ -1980,16 +2155,17 @@ pub fn compileBridge(
                     try regSb(&code, allocator, GPR.t4, a, PAYLOAD_OFF);
                     reg_types[a] = .boolean;
                 } else if (b_known_f64 and c_known_f64) {
+                    // ── 类型已知 f64：用 FPR 缓存池加载，跳过 tag 检查 ──
                     try loadFrameBase(&code, allocator);
-                    try regFld(&code, allocator, FPR.ft0, b, FLOAT_BITS_OFF);
-                    try regFld(&code, allocator, FPR.ft1, c, FLOAT_BITS_OFF);
+                    const fpr_b = try emitEnsureFpr(&code, allocator, &fpr_state, b, 0xFF);
+                    const fpr_c = try emitEnsureFpr(&code, allocator, &fpr_state, c, b);
                     switch (op) {
-                        .eq => try emit(&code, allocator, encFeqD(GPR.t4, FPR.ft0, FPR.ft1)),
-                        .neq => { try emit(&code, allocator, encFeqD(GPR.t4, FPR.ft0, FPR.ft1)); try emit(&code, allocator, encXori(GPR.t4, GPR.t4, -1)); },
-                        .lt => try emit(&code, allocator, encFltD(GPR.t4, FPR.ft0, FPR.ft1)),
-                        .gt => try emit(&code, allocator, encFltD(GPR.t4, FPR.ft1, FPR.ft0)),
-                        .le => try emit(&code, allocator, encFleD(GPR.t4, FPR.ft0, FPR.ft1)),
-                        .ge => try emit(&code, allocator, encFleD(GPR.t4, FPR.ft1, FPR.ft0)),
+                        .eq => try emit(&code, allocator, encFeqD(GPR.t4, fpr_b, fpr_c)),
+                        .neq => { try emit(&code, allocator, encFeqD(GPR.t4, fpr_b, fpr_c)); try emit(&code, allocator, encXori(GPR.t4, GPR.t4, -1)); },
+                        .lt => try emit(&code, allocator, encFltD(GPR.t4, fpr_b, fpr_c)),
+                        .gt => try emit(&code, allocator, encFltD(GPR.t4, fpr_c, fpr_b)),
+                        .le => try emit(&code, allocator, encFleD(GPR.t4, fpr_b, fpr_c)),
+                        .ge => try emit(&code, allocator, encFleD(GPR.t4, fpr_c, fpr_b)),
                         else => unreachable,
                     }
                     try loadImm32(&code, allocator, GPR.t2, TAG_BOOLEAN_VAL);
@@ -2029,9 +2205,9 @@ pub fn compileBridge(
                     const not_int_target: u32 = @intCast(code.items.len);
                     {
                         const d1: i64 = @as(i64, not_int_target) - @as(i64, @intCast(bne_not_int1));
-                        code.items[bne_not_int1] = patchB(code.items[bne_not_int1], @intCast(d1));
+                        code.items[bne_not_int1] = reencB(code.items[bne_not_int1], @intCast(d1 << 2));
                         const d2: i64 = @as(i64, not_int_target) - @as(i64, @intCast(bne_not_int2));
-                        code.items[bne_not_int2] = patchB(code.items[bne_not_int2], @intCast(d2));
+                        code.items[bne_not_int2] = reencB(code.items[bne_not_int2], @intCast(d2 << 2));
                     }
 
                     // f64 快速路径：检查 b/c 的 tag == TAG_FLOAT 且 float_type == F64
@@ -2074,20 +2250,20 @@ pub fn compileBridge(
                     const cold_off: u32 = @intCast(code.items.len);
                     inline for (.{ bne_cold_f1, bne_cold_f2, bne_cold_f3, bne_cold_f4 }) |bne_off| {
                         const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
-                        code.items[bne_off] = patchB(code.items[bne_off], @intCast(d));
+                        code.items[bne_off] = reencB(code.items[bne_off], @intCast(d << 2));
                     }
 
                     // cold: rt_step 桥接
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                     const next_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                        code.items[b_next] = encJ(@intCast(d));
+                        code.items[b_next] = encJ(@intCast(d << 2));
                     }
                     {
                         const d2: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next2));
-                        code.items[b_next2] = encJ(@intCast(d2));
+                        code.items[b_next2] = encJ(@intCast(d2 << 2));
                     }
                     reg_types[a] = .boolean;
                 }
@@ -2113,14 +2289,14 @@ pub fn compileBridge(
                 const cold_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_cold));
-                    code.items[bne_cold] = patchB(code.items[bne_cold], @intCast(d));
+                    code.items[bne_cold] = reencB(code.items[bne_cold], @intCast(d << 2));
                 }
-                try emitCold(&code, allocator, &pending_fixups, ip);
+                try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                 const next_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                    code.items[b_next] = encJ(@intCast(d));
+                    code.items[b_next] = encJ(@intCast(d << 2));
                 }
             },
 
@@ -2129,7 +2305,7 @@ pub fn compileBridge(
                 const target_ip: u32 = @intCast(@as(i64, @intCast(ip + 1)) + sbx);
                 if (ip_to_code.get(target_ip)) |target_off| {
                     const delta: i64 = @as(i64, target_off) - @as(i64, @intCast(code.items.len));
-                    try emit(&code, allocator, encJ(@intCast(delta)));
+                    try emit(&code, allocator, encJ(@intCast(delta << 2)));
                 } else {
                     const idx: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encJ(0));
@@ -2153,7 +2329,7 @@ pub fn compileBridge(
                     try emit(&code, allocator, encBeq(GPR.t4, GPR.x0, 0));
                     if (ip_to_code.get(target_ip)) |target_off| {
                         const delta: i64 = @as(i64, target_off) - @as(i64, @intCast(beq_idx));
-                        code.items[beq_idx] = patchB(code.items[beq_idx], @intCast(delta));
+                        code.items[beq_idx] = reencB(code.items[beq_idx], @intCast(delta << 2));
                     } else {
                         try pending_fixups.append(allocator, .{ .code_idx = beq_idx, .target_ip = target_ip, .kind = 2 });
                     }
@@ -2162,7 +2338,7 @@ pub fn compileBridge(
                     try emit(&code, allocator, encBne(GPR.t4, GPR.x0, 0));
                     if (ip_to_code.get(target_ip)) |target_off| {
                         const delta: i64 = @as(i64, target_off) - @as(i64, @intCast(bne_idx));
-                        code.items[bne_idx] = patchB(code.items[bne_idx], @intCast(delta));
+                        code.items[bne_idx] = reencB(code.items[bne_idx], @intCast(delta << 2));
                     } else {
                         try pending_fixups.append(allocator, .{ .code_idx = bne_idx, .target_ip = target_ip, .kind = 2 });
                     }
@@ -2174,14 +2350,14 @@ pub fn compileBridge(
                 const cold_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_cold));
-                    code.items[bne_cold] = patchB(code.items[bne_cold], @intCast(d));
+                    code.items[bne_cold] = reencB(code.items[bne_cold], @intCast(d << 2));
                 }
-                try emitCold(&code, allocator, &pending_fixups, ip);
+                try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                 const next_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                    code.items[b_next] = encJ(@intCast(d));
+                    code.items[b_next] = encJ(@intCast(d << 2));
                 }
                 reg_types[a] = .boolean;
             },
@@ -2197,7 +2373,7 @@ pub fn compileBridge(
                     try emit(&code, allocator, encBeq(GPR.t2, GPR.x0, 0));
                     if (ip_to_code.get(target_ip)) |target_off| {
                         const delta: i64 = @as(i64, target_off) - @as(i64, @intCast(beq_idx));
-                        code.items[beq_idx] = patchB(code.items[beq_idx], @intCast(delta));
+                        code.items[beq_idx] = reencB(code.items[beq_idx], @intCast(delta << 2));
                     } else {
                         try pending_fixups.append(allocator, .{ .code_idx = beq_idx, .target_ip = target_ip, .kind = 2 });
                     }
@@ -2206,7 +2382,7 @@ pub fn compileBridge(
                     try emit(&code, allocator, encBne(GPR.t2, GPR.x0, 0));
                     if (ip_to_code.get(target_ip)) |target_off| {
                         const delta: i64 = @as(i64, target_off) - @as(i64, @intCast(bne_idx));
-                        code.items[bne_idx] = patchB(code.items[bne_idx], @intCast(delta));
+                        code.items[bne_idx] = reencB(code.items[bne_idx], @intCast(delta << 2));
                     } else {
                         try pending_fixups.append(allocator, .{ .code_idx = bne_idx, .target_ip = target_ip, .kind = 2 });
                     }
@@ -2217,6 +2393,7 @@ pub fn compileBridge(
             .return_op, .return_unit => {
                 try emit(&code, allocator, encMv(GPR.a0, GPR.s0));
                 try loadImm32(&code, allocator, GPR.a1, @intCast(ip));
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encJalr(GPR.ra, GPR.s2, 0));
                 const j_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encJ(0));
@@ -2257,14 +2434,14 @@ pub fn compileBridge(
                 const cold_off: u32 = @intCast(code.items.len);
                 inline for (.{ bhi_cold1, bhi_cold2 }) |bne_off| {
                     const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
-                    code.items[bne_off] = patchB(code.items[bne_off], @intCast(d));
+                    code.items[bne_off] = reencB(code.items[bne_off], @intCast(d << 2));
                 }
-                try emitCold(&code, allocator, &pending_fixups, ip);
+                try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                 const next_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                    code.items[b_next] = encJ(@intCast(d));
+                    code.items[b_next] = encJ(@intCast(d << 2));
                 }
                 if (bx < func.chunk.constants.items.len) {
                     reg_types[a] = switch (func.chunk.constants.items[bx]) {
@@ -2305,14 +2482,14 @@ pub fn compileBridge(
                 const cold_off: u32 = @intCast(code.items.len);
                 inline for (.{ bhi_cold1, bhi_cold2 }) |bne_off| {
                     const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
-                    code.items[bne_off] = patchB(code.items[bne_off], @intCast(d));
+                    code.items[bne_off] = reencB(code.items[bne_off], @intCast(d << 2));
                 }
-                try emitCold(&code, allocator, &pending_fixups, ip);
+                try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                 const next_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                    code.items[b_next] = encJ(@intCast(d));
+                    code.items[b_next] = encJ(@intCast(d << 2));
                 }
                 if (b < reg_count) reg_types[a] = reg_types[b];
             },
@@ -2335,14 +2512,14 @@ pub fn compileBridge(
                 const cold_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bhi_cold));
-                    code.items[bhi_cold] = patchB(code.items[bhi_cold], @intCast(d));
+                    code.items[bhi_cold] = reencB(code.items[bhi_cold], @intCast(d << 2));
                 }
-                try emitCold(&code, allocator, &pending_fixups, ip);
+                try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                 const next_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                    code.items[b_next] = encJ(@intCast(d));
+                    code.items[b_next] = encJ(@intCast(d << 2));
                 }
             },
 
@@ -2366,14 +2543,14 @@ pub fn compileBridge(
                 const cold_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bhi_cold));
-                    code.items[bhi_cold] = patchB(code.items[bhi_cold], @intCast(d));
+                    code.items[bhi_cold] = reencB(code.items[bhi_cold], @intCast(d << 2));
                 }
-                try emitCold(&code, allocator, &pending_fixups, ip);
+                try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                 const next_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                    code.items[b_next] = encJ(@intCast(d));
+                    code.items[b_next] = encJ(@intCast(d << 2));
                 }
                 reg_types[a] = .boolean;
             },
@@ -2401,7 +2578,7 @@ pub fn compileBridge(
                 };
 
                 if (int_target == null and float_target == null) {
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
                     continue;
                 }
 
@@ -2432,9 +2609,9 @@ pub fn compileBridge(
                     const not_int_target: u32 = @intCast(code.items.len);
                     {
                         const d1: i64 = @as(i64, not_int_target) - @as(i64, @intCast(bne_not_int1));
-                        code.items[bne_not_int1] = patchB(code.items[bne_not_int1], @intCast(d1));
+                        code.items[bne_not_int1] = reencB(code.items[bne_not_int1], @intCast(d1 << 2));
                         const d2: i64 = @as(i64, not_int_target) - @as(i64, @intCast(bne_not_int2));
-                        code.items[bne_not_int2] = patchB(code.items[bne_not_int2], @intCast(d2));
+                        code.items[bne_not_int2] = reencB(code.items[bne_not_int2], @intCast(d2 << 2));
                     }
 
                     // f64 → i64 路径：检查 b 的 tag == TAG_FLOAT 且 float_type == F64
@@ -2463,22 +2640,22 @@ pub fn compileBridge(
                     const cold_off: u32 = @intCast(code.items.len);
                     inline for (.{ bne_cold_f1, bne_cold_f2 }) |bne_off| {
                         const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
-                        code.items[bne_off] = patchB(code.items[bne_off], @intCast(d));
+                        code.items[bne_off] = reencB(code.items[bne_off], @intCast(d << 2));
                     }
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                     const next_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                        code.items[b_next] = encJ(@intCast(d));
+                        code.items[b_next] = encJ(@intCast(d << 2));
                     }
                     {
                         const d2: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next2));
-                        code.items[b_next2] = encJ(@intCast(d2));
+                        code.items[b_next2] = encJ(@intCast(d2 << 2));
                     }
                 } else if (float_target) |ft| {
                     if (ft != .f64) {
-                        try emitCold(&code, allocator, &pending_fixups, ip);
+                        try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
                         continue;
                     }
 
@@ -2512,14 +2689,14 @@ pub fn compileBridge(
                     const cold_off: u32 = @intCast(code.items.len);
                     inline for (.{ bne_cold1, bne_cold2, bne_cold3 }) |bne_off| {
                         const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
-                        code.items[bne_off] = patchB(code.items[bne_off], @intCast(d));
+                        code.items[bne_off] = reencB(code.items[bne_off], @intCast(d << 2));
                     }
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                     const next_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                        code.items[b_next] = encJ(@intCast(d));
+                        code.items[b_next] = encJ(@intCast(d << 2));
                     }
                 }
                 reg_types[a] = if (int_target != null) .i64 else if (float_target != null) .f64 else .unknown;
@@ -2535,6 +2712,7 @@ pub fn compileBridge(
                 try loadImm32(&code, allocator, GPR.a3, @intCast(callee_arity));
                 try emit(&code, allocator, encMv(GPR.a4, GPR.s1));
                 try loadImm32(&code, allocator, GPR.a5, @intCast(a));
+                fpr_state.invalidateAll();
                 try emit(&code, allocator, encJalr(GPR.ra, GPR.s3, 0));
                 const bne_exit: u32 = @intCast(code.items.len);
                 try emit(&code, allocator, encBne(GPR.a0, GPR.x0, 0));
@@ -2602,14 +2780,14 @@ pub fn compileBridge(
                 const cold_off: u32 = @intCast(code.items.len);
                 inline for (.{ bne_cold1, bne_cold2, bhi_cold3, bhs_cold4, bhi_cold5 }) |bne_off| {
                     const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
-                    code.items[bne_off] = patchB(code.items[bne_off], @intCast(d));
+                    code.items[bne_off] = reencB(code.items[bne_off], @intCast(d << 2));
                 }
-                try emitCold(&code, allocator, &pending_fixups, ip);
+                try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                 const next_off: u32 = @intCast(code.items.len);
                 {
                     const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                    code.items[b_next] = encJ(@intCast(d));
+                    code.items[b_next] = encJ(@intCast(d << 2));
                 }
             },
 
@@ -2623,6 +2801,7 @@ pub fn compileBridge(
                     try emit(&code, allocator, encMv(GPR.a0, GPR.s0));
                     try emit(&code, allocator, encAddi(GPR.a1, GPR.s1, @intCast(a)));
                     try emit(&code, allocator, encAddi(GPR.a2, GPR.s1, @intCast(a)));
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encJalr(GPR.ra, GPR.s5, 0));
                     const bne_cold1: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encBne(GPR.a0, GPR.x0, 0));
@@ -2633,14 +2812,14 @@ pub fn compileBridge(
                     const cold_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_cold1));
-                        code.items[bne_cold1] = patchB(code.items[bne_cold1], @intCast(d));
+                        code.items[bne_cold1] = reencB(code.items[bne_cold1], @intCast(d << 2));
                     }
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                     const next_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                        code.items[b_next] = encJ(@intCast(d));
+                        code.items[b_next] = encJ(@intCast(d << 2));
                     }
                 } else if (std.mem.eql(u8, mname, "push") and c == 1) {
                     // arr.push(elem) → rt_array_push(vm, recv_slot, arg_slot, dst_slot)
@@ -2648,6 +2827,7 @@ pub fn compileBridge(
                     try emit(&code, allocator, encAddi(GPR.a1, GPR.s1, @intCast(a)));
                     try emit(&code, allocator, encAddi(GPR.a2, GPR.s1, @intCast(@as(u32, a) + 1)));
                     try emit(&code, allocator, encAddi(GPR.a3, GPR.s1, @intCast(a)));
+                    fpr_state.invalidateAll();
                     try emit(&code, allocator, encJalr(GPR.ra, GPR.s4, 0));
                     const bne_cold1: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encBne(GPR.a0, GPR.x0, 0));
@@ -2658,22 +2838,22 @@ pub fn compileBridge(
                     const cold_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_cold1));
-                        code.items[bne_cold1] = patchB(code.items[bne_cold1], @intCast(d));
+                        code.items[bne_cold1] = reencB(code.items[bne_cold1], @intCast(d << 2));
                     }
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
 
                     const next_off: u32 = @intCast(code.items.len);
                     {
                         const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                        code.items[b_next] = encJ(@intCast(d));
+                        code.items[b_next] = encJ(@intCast(d << 2));
                     }
                 } else {
-                    try emitCold(&code, allocator, &pending_fixups, ip);
+                    try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
                 }
             },
 
             else => {
-                try emitCold(&code, allocator, &pending_fixups, ip);
+                try emitCold(&code, allocator, &pending_fixups, ip, &fpr_state);
             },
         }
     }
@@ -2702,10 +2882,10 @@ pub fn compileBridge(
                 const opcode = inst_val & 0x7F;
                 if (opcode == 0b1101111) {
                     // J-type (JAL x0, ...)
-                    code.items[fixup.code_idx] = patchJ(inst_val, @intCast(delta));
+                    code.items[fixup.code_idx] = encJ(@intCast(delta << 2));
                 } else {
                     // B-type (BNE/BEQ)
-                    code.items[fixup.code_idx] = patchB(inst_val, @intCast(delta));
+                    code.items[fixup.code_idx] = reencB(inst_val, @intCast(delta << 2));
                 }
             }
         } else {
@@ -2714,8 +2894,8 @@ pub fn compileBridge(
             };
             const delta: i64 = @as(i64, target_off) - @as(i64, @intCast(fixup.code_idx));
             switch (fixup.kind) {
-                1 => code.items[fixup.code_idx] = encJ(@intCast(delta)),
-                2 => code.items[fixup.code_idx] = patchB(code.items[fixup.code_idx], @intCast(delta)),
+                1 => code.items[fixup.code_idx] = encJ(@intCast(delta << 2)),
+                2 => code.items[fixup.code_idx] = reencB(code.items[fixup.code_idx], @intCast(delta << 2)),
                 else => {},
             }
         }
@@ -2758,6 +2938,12 @@ fn compileBridgeFn(
         return null;
     }
 
+    // 优先尝试 IR 模式（支持 FPR 跨指令寄存器分配）
+    if (compileIrFn(engine, func_idx, func)) |cfn_ptr| {
+        return cfn_ptr;
+    }
+
+    // IR 模式失败，回退桥接模式
     var exec_mem = mem.allocExec(32 * 1024) catch {
         engine.failed[func_idx] = true;
         return null;
@@ -2793,6 +2979,109 @@ fn compileBridgeFn(
         .return_type = 0xFF,
         .exec_mem = exec_mem,
         .bridge = true,
+    };
+
+    return @ptrCast(&engine.compiled[func_idx].?);
+}
+
+/// IR 模式编译：将字节码提升为 IR，经寄存器分配后编译为机器码。
+/// 成功返回编译结果指针，失败返回 null（调用方回退桥接模式）。
+fn compileIrFn(
+    engine: *@import("../mod.zig").JitEngine,
+    func_idx: u32,
+    func: *const reg_chunk.RegFunction,
+) ?*const anyopaque {
+    const jit_mod = @import("../mod.zig");
+
+    // 正在编译中（循环递归），入口地址已在 compiling map 中
+    if (engine.compiling.get(func_idx)) |_| {
+        return null;
+    }
+
+    // 第一遍：lift IR 确定函数是否可 JIT
+    const lift_result = ir.liftFromChunk(engine.allocator, func, engine.functions) catch {
+        return null;
+    };
+
+    if (lift_result == .unsupported) {
+        return null;
+    }
+
+    var ir_func = lift_result.success;
+    defer ir_func.deinit();
+
+    // 预分配可执行内存
+    var exec_mem = mem.allocExec(16 * 1024) catch {
+        return null;
+    };
+    errdefer exec_mem.deinit();
+
+    // 预计算入口地址并标记为正在编译
+    const entry_addr = @intFromPtr(exec_mem.ptr);
+    engine.compiling.put(func_idx, entry_addr) catch {
+        exec_mem.deinit();
+        return null;
+    };
+    defer _ = engine.compiling.remove(func_idx);
+
+    // 递归编译所有 call 目标函数
+    for (ir_func.insts.items) |inst| {
+        if (inst.op == .call) {
+            const target = inst.call_target;
+            if (target < engine.functions.len) {
+                _ = engine.compileFunction(target, &engine.functions[target]);
+            }
+        }
+    }
+
+    // 构建 func_entries 数组
+    var func_entries = engine.allocator.alloc(usize, engine.functions.len) catch {
+        exec_mem.deinit();
+        return null;
+    };
+    defer engine.allocator.free(func_entries);
+    @memset(func_entries, 0);
+    for (engine.compiled, 0..) |maybe_cfn, i| {
+        if (maybe_cfn) |cfn| {
+            if (i < func_entries.len) {
+                func_entries[i] = cfn.entry;
+            }
+        }
+    }
+    var compiling_it = engine.compiling.iterator();
+    while (compiling_it.next()) |entry| {
+        if (entry.key_ptr.* < func_entries.len) {
+            func_entries[entry.key_ptr.*] = entry.value_ptr.*;
+        }
+    }
+
+    // IR → 机器码
+    const entry = ir_backend_instance.compileFn(
+        &ir_backend_instance,
+        engine.allocator,
+        &ir_func,
+        &exec_mem,
+        func_entries,
+    ) catch {
+        exec_mem.deinit();
+        return null;
+    };
+
+    exec_mem.finalize();
+
+    // 映射 IR return_type 到 CompiledFn return_type
+    const ret_type: u8 = switch (ir_func.return_type) {
+        .f64, .f32 => 1,
+        .unit => 2,
+        else => 0,
+    };
+
+    engine.compiled[func_idx] = jit_mod.CompiledFn{
+        .entry = entry,
+        .arity = func.arity,
+        .return_type = ret_type,
+        .exec_mem = exec_mem,
+        .bridge = false,
     };
 
     return @ptrCast(&engine.compiled[func_idx].?);

@@ -1,6 +1,6 @@
 // minitest: basic smoke test for the Glue language runtime
 fun add(a: i32, b: i32): i32 {
-    a + b
+    return a + b
 }
 
 fun main() {

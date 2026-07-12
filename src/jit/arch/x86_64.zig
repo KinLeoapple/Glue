@@ -1667,9 +1667,7 @@ fn emitRtStepCall(
     allocator: std.mem.Allocator,
     fpr: *FprState,
 ) !void {
-    // 不使用 spillAll：spill 会把 xmm 的 8 字节写到 reg offset 0，
-    // 而字符串/数组等堆指针也存储在 offset 0，spill 会破坏指针。
-    // 只清空 FPR 常驻状态（rt_step 会修改 reg_pool，xmm 缓存失效）。
+    // 清空 FPR 常驻状态（rt_step 会修改 reg_pool，xmm 缓存失效）
     try emitFrameBase(buf);
     fpr.invalidateAll();
     // 设置参数: CARG0 = vm (r12), CARG1 = ip
@@ -1768,8 +1766,9 @@ const FprState = struct {
 };
 
 /// 确保 reg 的 f64 bits 加载到某个 xmm，返回 xmm 编号。
-/// 若已常驻直接返回；否则从内存加载（必要时驱逐一个非 protect_reg 的槽）。
+/// 若已常驻直接返回；否则从内存加载并标记常驻（必要时驱逐一个非 protect_reg 的槽）。
 /// 调用前需已 emitFrameBase。
+/// 仅用于编译时已知 f64 的路径；未知类型路径应使用 xmm6/xmm7 直接加载。
 /// protect_reg: 指定一个 reg 编号，其常驻 xmm 不允许被驱逐（传 0xFF 表示无保护）。
 fn emitEnsureFpr(buf: *BridgeBuf, fpr: *FprState, reg: u8, protect_reg: u8) !u8 {
     if (fpr.isResident(reg)) return fpr.getXmm(reg);
@@ -1794,7 +1793,6 @@ fn emitEnsureFpr(buf: *BridgeBuf, fpr: *FprState, reg: u8, protect_reg: u8) !u8 
         }
         const victim = fpr.fpr_owner[evict_idx];
         if (victim != 0xFF) {
-            try buf.movsdStore(TMP2, @intCast(@as(i32, victim) * 32 + @as(i32, FLOAT_BITS_OFF)), FPR_POOL[evict_idx]);
             fpr.evict(victim);
         }
         break :blk evict_idx;
@@ -1803,32 +1801,6 @@ fn emitEnsureFpr(buf: *BridgeBuf, fpr: *FprState, reg: u8, protect_reg: u8) !u8 
     try buf.movsdLoad(xmm, TMP2, @intCast(@as(i32, reg) * 32 + @as(i32, FLOAT_BITS_OFF)));
     fpr.setResident(reg, slot);
     return xmm;
-}
-
-/// 为结果 reg 分配一个常驻 xmm 槽，返回 pool_idx（FPR_POOL 索引）。
-/// 若池满，驱逐一个非 protect_b/protect_c 的槽（写回内存）。
-/// 调用前需已 emitFrameBase。
-fn emitAllocResultSlot(buf: *BridgeBuf, fpr: *FprState, protect_b: u8, protect_c: u8) !usize {
-    if (fpr.allocSlot()) |free_slot| return free_slot;
-    // 池满：驱逐一个非 protect 的槽
-    var evict_idx: usize = 0;
-    var found_evict = false;
-    var i: usize = 0;
-    while (i < FPR_POOL.len) : (i += 1) {
-        const owner = fpr.fpr_owner[i];
-        if (owner == 0xFF) continue;
-        if (owner == protect_b or owner == protect_c) continue;
-        evict_idx = i;
-        found_evict = true;
-        break;
-    }
-    if (!found_evict) evict_idx = 0;
-    const victim = fpr.fpr_owner[evict_idx];
-    if (victim != 0xFF) {
-        try buf.movsdStore(TMP2, @intCast(@as(i32, victim) * 32 + @as(i32, FLOAT_BITS_OFF)), FPR_POOL[evict_idx]);
-        fpr.evict(victim);
-    }
-    return evict_idx;
 }
 
 /// 桥接模式编译：直接从字节码生成 x86-64 机器码。
@@ -2013,12 +1985,11 @@ pub fn compileBridge(
                     try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
                     reg_types[a] = .i64;
                 } else if (b_known_f64 and c_known_f64 and op != .mod) {
-                    // ── 类型已知 f64：跳过 tag 检查，FPR 常驻路径 ──
+                    // ── 类型已知 f64：跳过 tag 检查，用 FPR 池加载 ──
                     try emitFrameBase(&buf);
-                    // a 已在开头 spill；确保 b、c 的 f64 bits 在 xmm 中
                     const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
                     const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
-                    // 将 b 的 bits 复制到 xmm0，运算结果存于 xmm0
+                    // xmm0 = xmm_b；xmm0 op= xmm_c
                     try buf.movsdReg(0, xmm_b);
                     switch (op) {
                         .add => try buf.addsd(0, xmm_c),
@@ -2027,15 +1998,14 @@ pub fn compileBridge(
                         .div => try buf.divsd(0, xmm_c),
                         else => unreachable,
                     }
-                    // 将结果常驻到 a 的 xmm（分配槽，保护 b、c 不被驱逐）
-                    const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, c);
-                    const xmm_a = FPR_POOL[a_slot];
-                    try buf.movsdReg(xmm_a, 0);
-                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
-                    fpr_state.setResident(a, a_slot);
+                    // 将结果写回内存
+                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), 0);
                     // 更新 tag/type（内存元数据需同步，供 cold 路径检查）
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
+                    // 若 a==b 或 a==c，a 的内存已更新但 b/c 的 xmm 缓存已过时，需失效
+                    if (a == b) fpr_state.evict(b);
+                    if (a == c) fpr_state.evict(c);
                     reg_types[a] = .f64;
                 } else {
                     // ── 未知类型：带 tag 检查的通用路径 ──
@@ -2103,26 +2073,22 @@ pub fn compileBridge(
                         try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
                         const jne_f4 = try buf.jccRel32(X86Cond.NE);
 
-                        // a 将被覆盖；若 a 常驻 FPR，先 spill 回内存
+                        // a 将被覆盖；若 a 常驻 FPR，先失效
                         fpr_state.evict(a);
-                        // 确保 b、c 的 f64 bits 在 xmm（FPR 常驻，保护 b 不被驱逐）
-                        const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
-                        const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
-                        // xmm0 = xmm_b；xmm0 op= xmm_c
-                        try buf.movsdReg(0, xmm_b);
+                        // 用 xmm6/xmm7 直接加载 b、c（不走 FPR 池，避免编译时状态污染）
+                        try buf.movsdLoad(FPR.xmm6, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                        try buf.movsdLoad(FPR.xmm7, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                        // xmm0 = xmm6；xmm0 op= xmm7
+                        try buf.movsdReg(0, FPR.xmm6);
                         switch (op) {
-                            .add => try buf.addsd(0, xmm_c),
-                            .sub => try buf.subsd(0, xmm_c),
-                            .mul => try buf.mulsd(0, xmm_c),
-                            .div => try buf.divsd(0, xmm_c),
+                            .add => try buf.addsd(0, FPR.xmm7),
+                            .sub => try buf.subsd(0, FPR.xmm7),
+                            .mul => try buf.mulsd(0, FPR.xmm7),
+                            .div => try buf.divsd(0, FPR.xmm7),
                             else => unreachable,
                         }
-                        // 将结果常驻到 a（保护 b、c 不被驱逐）
-                        const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, c);
-                        const xmm_a = FPR_POOL[a_slot];
-                        try buf.movsdReg(xmm_a, 0);
-                        try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
-                        fpr_state.setResident(a, a_slot);
+                        // 将结果写回 a 的内存
+                        try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), 0);
                         // 更新 tag/type
                         try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                         try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
@@ -2167,7 +2133,7 @@ pub fn compileBridge(
                     try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
                     reg_types[a] = .i64;
                 } else if (b_known_f64) {
-                    // 类型已知 f64：FPR 常驻路径，用 xorps 翻转符号位
+                    // 类型已知 f64：用 xorps 翻转符号位（FPR 池加载）
                     const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
                     // 复制 b 到 xmm0
                     try buf.movsdReg(0, xmm_b);
@@ -2177,15 +2143,13 @@ pub fn compileBridge(
                     try buf.movqGprToXmm(1, TMP0);
                     // xorps xmm0, xmm1（翻转符号位）
                     try buf.xorps(0, 1);
-                    // 将结果常驻到 a（保护 b 不被驱逐）
-                    const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, 0xFF);
-                    const xmm_a = FPR_POOL[a_slot];
-                    try buf.movsdReg(xmm_a, 0);
-                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
-                    fpr_state.setResident(a, a_slot);
+                    // 将结果写回内存
+                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), 0);
                     // 更新 tag/type
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
+                    // 若 a==b，b 的 xmm 缓存已过时
+                    if (a == b) fpr_state.evict(b);
                     reg_types[a] = .f64;
                 } else {
                     // 未知类型：先检查 TAG_INT，再检查 TAG_FLOAT
@@ -2211,17 +2175,13 @@ pub fn compileBridge(
                     try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
                     const jne_cold2 = try buf.jccRel32(X86Cond.NE);
 
-                    // f64 路径：用 xorps 翻转符号位
-                    const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
-                    try buf.movsdReg(0, xmm_b);
+                    // f64 路径：用 xorps 翻转符号位（xmm6 直接加载，不走 FPR 池）
+                    try buf.movsdLoad(FPR.xmm6, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.movsdReg(0, FPR.xmm6);
                     try buf.movImm64(TMP0, 0x8000000000000000);
                     try buf.movqGprToXmm(1, TMP0);
                     try buf.xorps(0, 1);
-                    const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, 0xFF);
-                    const xmm_a = FPR_POOL[a_slot];
-                    try buf.movsdReg(xmm_a, 0);
-                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
-                    fpr_state.setResident(a, a_slot);
+                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), 0);
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
 
@@ -2272,11 +2232,11 @@ pub fn compileBridge(
                     try buf.storeByte(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)), TMP0);
                     reg_types[a] = .boolean;
                 } else if (b_known_f64 and c_known_f64) {
-                    // ── 类型已知 f64：FPR 常驻路径 ──
+                    // ── 类型已知 f64：用 FPR 池加载 ──
                     try emitFrameBase(&buf);
                     const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
                     const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
-                    // ucomisd xmm_b, xmm_c（xmm0 作 scratch 以避免破坏常驻 xmm）
+                    // ucomisd xmm_b, xmm_c（xmm0 作 scratch）
                     try buf.movsdReg(0, xmm_b);
                     try buf.ucomisd(0, xmm_c);
                     const cc: u8 = switch (op) {
@@ -2346,11 +2306,11 @@ pub fn compileBridge(
                     try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
                     const jne_cold4 = try buf.jccRel32(X86Cond.NE);
 
-                    // f64 比较路径：ucomisd + setcc
-                    const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
-                    const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
-                    try buf.movsdReg(0, xmm_b);
-                    try buf.ucomisd(0, xmm_c);
+                    // f64 比较路径：ucomisd + setcc（xmm6/xmm7 直接加载，不走 FPR 池）
+                    try buf.movsdLoad(FPR.xmm6, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.movsdLoad(FPR.xmm7, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.movsdReg(0, FPR.xmm6);
+                    try buf.ucomisd(0, FPR.xmm7);
                     const cc_float: u8 = switch (op) {
                         .eq => X86Cond.E,
                         .neq => X86Cond.NE,
@@ -2561,8 +2521,6 @@ pub fn compileBridge(
                 try emitFrameBase(&buf);
                 // load_const 有 cold/fast 两条路径；cold 路径会 invalidateAll，
                 // 为保持两条路径后 FPR 状态一致，fast 路径前也 invalidateAll。
-                // 不使用 spillAll：spill 会把 xmm 的 8 字节写到 reg offset 0，
-                // 而字符串/数组等堆指针也存储在 offset 0，spill 会破坏指针。
                 fpr_state.invalidateAll();
 
                 // 加载常量池地址到 r11
@@ -2763,9 +2721,9 @@ pub fn compileBridge(
                         try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
                         const bne_cold_f3 = try buf.jccRel32(X86Cond.NE);
 
-                        // f64→i64：cvttsd2si
-                        const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
-                        try buf.cvttsd2si(TMP0, xmm_b);
+                        // f64→i64：cvttsd2si（xmm6 直接加载，不走 FPR 池）
+                        try buf.movsdLoad(FPR.xmm6, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                        try buf.cvttsd2si(TMP0, FPR.xmm6);
                         try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
                         try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)), INT_TYPE_I64_VAL);
                         try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
@@ -2818,12 +2776,8 @@ pub fn compileBridge(
                     try buf.loadMem(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
                     // cvtsi2sd xmm0, rax (i64 → f64)
                     try buf.cvtsi2sd(0, TMP0);
-                    // 将结果常驻到 a 的 xmm（a 已在 cast 开头 evict；b 是 int 无需保护）
-                    const a_slot = try emitAllocResultSlot(&buf, &fpr_state, 0xFF, 0xFF);
-                    const xmm_a = FPR_POOL[a_slot];
-                    try buf.movsdReg(xmm_a, 0);
-                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
-                    fpr_state.setResident(a, a_slot);
+                    // 将结果写回 a 的内存
+                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), 0);
                     // 设置 tag = FLOAT
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                     // 设置 float type = F64

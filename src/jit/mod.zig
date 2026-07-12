@@ -152,46 +152,44 @@ pub const JitEngine = struct {
 
     /// 尝试用 JIT 编译后的代码执行函数（IR 模式）。
     /// 成功返回 i64 结果，失败返回 null（调用方应回退到解释器）。
-    /// 参数为 value.Value 数组，内部提取 i64 值传给原生代码。
+    /// 参数为 value.Value 数组，通过统一 Value 数组调用约定传递。
     pub fn tryCall(self: *JitEngine, func_idx: u32, args: []const value.Value) ?i64 {
         if (func_idx >= self.compiled.len) return null;
         const cfn_opt = &self.compiled[func_idx];
         if (cfn_opt.*) |*cfn| {
-            return callCompiled(cfn, args);
+            const result = callCompiledValue(cfn, args);
+            return @bitCast(result);
         }
         return null;
     }
 };
 
-/// 调用 JIT 编译后的函数，从 value.Value 参数中提取 i64 值。
-/// 根据 arity 分派不同签名的函数指针。
-fn callCompiled(cfn: *const CompiledFn, args: []const value.Value) i64 {
-    // 提取 i64 参数（仅支持整数参数）
-    var i64_args: [6]i64 = .{ 0, 0, 0, 0, 0, 0 };
+/// 调用 IR 模式 JIT 函数（统一 Value 数组调用约定）。
+/// 参数通过 *const value.Value 数组传递，返回 u64。
+fn callCompiledValue(cfn: *const CompiledFn, args: []const value.Value) u64 {
+    var val_args: [6]value.Value = .{value.Value.fromUnit()} ** 6;
     const argc = @min(args.len, cfn.arity);
     for (args[0..argc], 0..) |val, i| {
-        i64_args[i] = extractI64(val);
+        val_args[i] = val;
     }
-    return callRaw(cfn.entry, cfn.arity, &i64_args);
+    return callRawValue(cfn.entry, &val_args);
 }
 
-/// 从 value.Value 提取 i64 值（仅支持整数类型）。
-inline fn extractI64(val: value.Value) i64 {
-    return switch (val) {
-        .int => |iv| blk: {
-            if (iv.coerceTo(.i64)) |native| {
-                break :blk native.toNative(i64);
-            }
-            break :blk @bitCast(iv.lo);
-        },
-        .boolean => |b| if (b) 1 else 0,
-        else => 0,
-    };
+/// 调用接收 *const value.Value 数组的 JIT 函数。
+fn callRawValue(entry: usize, args: *const [6]value.Value) u64 {
+    const F = *const fn (*const value.Value) callconv(.c) u64;
+    const f: F = @ptrFromInt(entry);
+    return f(@ptrCast(args));
 }
 
 /// 将 i64 结果包装为 value.Value。
 pub fn wrapI64Result(result: i64) value.Value {
     return value.Value.fromInt(value.Int.fromNative(.i64, result));
+}
+
+/// 将 f64 结果包装为 value.Value。
+pub fn wrapF64Result(result: f64) value.Value {
+    return value.Value.fromFloat(value.Float.fromNative(.f64, result));
 }
 
 /// 调用桥接模式 JIT 编译的函数。
@@ -223,60 +221,25 @@ pub fn invokeJit(
         const callee_base = vm.frames.items[vm.frames.items.len - 1].base;
         callBridge(vm, cfn.entry, callee_base);
     } else {
-        // IR 模式：提取 i64 参数，调用原生代码，返回值包装为 Value
-        const result = callCompiled(cfn, args);
+        // IR 模式：统一 Value 数组调用约定
         vm.reg_pool[return_base + return_reg].release(vm.allocator);
-        vm.reg_pool[return_base + return_reg] = wrapI64Result(result);
+        const result = callCompiledValue(cfn, args);
+        switch (cfn.return_type) {
+            1 => {
+                // f64 返回值：u64 bitcast 为 f64
+                const f64_result: f64 = @bitCast(result);
+                vm.reg_pool[return_base + return_reg] = wrapF64Result(f64_result);
+            },
+            2 => {
+                // void/unit 返回值
+                vm.reg_pool[return_base + return_reg] = value.Value.fromUnit();
+            },
+            else => {
+                // i64 返回值
+                vm.reg_pool[return_base + return_reg] = wrapI64Result(@bitCast(result));
+            },
+        }
     }
-}
-
-/// 根据参数数量调用对应的函数指针。
-/// 使用 C 调用约定：ARM64 用 x0-x7，x86-64 用 rdi-r9。
-fn callRaw(entry: usize, arity: u8, args: *const [6]i64) i64 {
-    const fn_ptr = entry;
-    return switch (arity) {
-        0 => blk: {
-            const F = *const fn () callconv(.c) i64;
-            const f: F = @ptrFromInt(fn_ptr);
-            break :blk f();
-        },
-        1 => blk: {
-            const F = *const fn (i64) callconv(.c) i64;
-            const f: F = @ptrFromInt(fn_ptr);
-            break :blk f(args[0]);
-        },
-        2 => blk: {
-            const F = *const fn (i64, i64) callconv(.c) i64;
-            const f: F = @ptrFromInt(fn_ptr);
-            break :blk f(args[0], args[1]);
-        },
-        3 => blk: {
-            const F = *const fn (i64, i64, i64) callconv(.c) i64;
-            const f: F = @ptrFromInt(fn_ptr);
-            break :blk f(args[0], args[1], args[2]);
-        },
-        4 => blk: {
-            const F = *const fn (i64, i64, i64, i64) callconv(.c) i64;
-            const f: F = @ptrFromInt(fn_ptr);
-            break :blk f(args[0], args[1], args[2], args[3]);
-        },
-        5 => blk: {
-            const F = *const fn (i64, i64, i64, i64, i64) callconv(.c) i64;
-            const f: F = @ptrFromInt(fn_ptr);
-            break :blk f(args[0], args[1], args[2], args[3], args[4]);
-        },
-        6 => blk: {
-            const F = *const fn (i64, i64, i64, i64, i64, i64) callconv(.c) i64;
-            const f: F = @ptrFromInt(fn_ptr);
-            break :blk f(args[0], args[1], args[2], args[3], args[4], args[5]);
-        },
-        else => blk: {
-            // 超过 6 个参数时回退到 0 参数调用（不应发生，JIT 限制 arity ≤ 6）
-            const F = *const fn () callconv(.c) i64;
-            const f: F = @ptrFromInt(fn_ptr);
-            break :blk f();
-        },
-    };
 }
 
 test "JIT 引擎基础" {
