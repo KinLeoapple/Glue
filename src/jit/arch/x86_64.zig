@@ -169,7 +169,7 @@ pub fn compile(
     exec_mem: *mem.ExecMemory,
     func_entries: []const usize,
 ) !usize {
-    var alloc_result = try regalloc.allocate(allocator, func, &AVAIL_GPRS);
+    var alloc_result = try regalloc.allocate(allocator, func, &AVAIL_GPRS, &AVAIL_FPRS);
     defer alloc_result.deinit();
 
     var cg = Codegen.init(allocator, &alloc_result);
@@ -190,7 +190,7 @@ pub fn compile(
                 try cg.label_offsets.put(inst.label, cg.currentOffset());
             },
 
-            .const_i64, .const_f64 => {
+            .const_i64 => {
                 // mov r64, imm64
                 const rd = cg.resolveReg(inst.dst);
                 try cg.emitRex(true, 0, 0, rd);
@@ -198,6 +198,31 @@ pub fn compile(
                 const val: i64 = inst.imm;
                 try cg.emitI32(@truncate(@as(u64, @bitCast(val))));
                 try cg.emitI32(@truncate(@as(u64, @bitCast(val)) >> 32));
+            },
+
+            .const_f64 => {
+                // 先加载 imm64 到 rax（GPR），再 movq 到 XMM
+                const rd = cg.resolveReg(inst.dst);
+                // mov rax, imm64
+                try cg.emitRex(true, 0, 0, GPR.rax);
+                try cg.emit(0xB8);
+                const val: i64 = inst.imm;
+                try cg.emitI32(@truncate(@as(u64, @bitCast(val))));
+                try cg.emitI32(@truncate(@as(u64, @bitCast(val)) >> 32));
+                // movq xmm_rd, rax（从 GPR 移动 64 位到 XMM）
+                try emitMovqGprToXmm(&cg, rd, GPR.rax);
+            },
+
+            .const_f32 => {
+                // 先加载 imm32 到 eax（GPR），再 movd 到 XMM
+                const rd = cg.resolveReg(inst.dst);
+                // mov eax, imm32
+                try cg.emitRex(false, 0, 0, GPR.rax);
+                try cg.emit(0xB8);
+                const val: u32 = @truncate(@as(u64, @bitCast(inst.imm)));
+                try cg.emitI32(@bitCast(val));
+                // movd xmm_rd, eax（从 GPR 移动 32 位到 XMM）
+                try emitMovdGprToXmm(&cg, rd, GPR.rax);
             },
 
             .const_bool => {
@@ -374,7 +399,16 @@ pub fn compile(
                 const rd = cg.resolveReg(inst.dst);
                 const rn = cg.resolveReg(inst.a.vreg);
                 if (rd != rn) {
-                    try emitMovReg(&cg, rd, rn);
+                    // 根据 vreg 类型选择移动指令
+                    if (inst.dst.type.isFloat()) {
+                        if (inst.dst.type == .f64) {
+                            try emitMovsdReg(&cg, rd, rn);
+                        } else {
+                            try emitMovssReg(&cg, rd, rn);
+                        }
+                    } else {
+                        try emitMovReg(&cg, rd, rn);
+                    }
                 }
             },
 
@@ -436,18 +470,38 @@ pub fn compile(
             },
 
             .load_arg => {
-                // System V 调用约定: rdi, rsi, rdx, rcx, r8, r9
-                const arg_regs = [_]u8{ GPR.rdi, GPR.rsi, GPR.rdx, GPR.rcx, GPR.r8, GPR.r9 };
+                // System V 调用约定: 整数参数 rdi, rsi, rdx, rcx, r8, r9；浮点参数 xmm0-xmm7
                 const arg_idx: u8 = @intCast(inst.imm);
-                if (arg_idx >= arg_regs.len) return error.JitTooManyArgs;
+                if (arg_idx >= 8) return error.JitTooManyArgs;
                 const rd = cg.resolveReg(inst.dst);
-                try emitMovReg(&cg, rd, arg_regs[arg_idx]);
+                if (inst.dst.type.isFloat()) {
+                    // 浮点参数从 xmm0-xmm7 加载
+                    if (inst.dst.type == .f64) {
+                        try emitMovsdReg(&cg, rd, arg_idx); // xmm{arg_idx}
+                    } else {
+                        try emitMovssReg(&cg, rd, arg_idx);
+                    }
+                } else {
+                    // 整数参数从 rdi, rsi, rdx, rcx, r8, r9 加载
+                    const arg_regs = [_]u8{ GPR.rdi, GPR.rsi, GPR.rdx, GPR.rcx, GPR.r8, GPR.r9 };
+                    if (arg_idx >= arg_regs.len) return error.JitTooManyArgs;
+                    try emitMovReg(&cg, rd, arg_regs[arg_idx]);
+                }
             },
 
             .return_val => {
                 const rn = cg.resolveReg(inst.a.vreg);
-                // mov rax, rn
-                try emitMovReg(&cg, GPR.rax, rn);
+                // 根据返回值类型选择返回寄存器：整数 rax，浮点 xmm0
+                if (inst.a.vreg.type.isFloat()) {
+                    if (inst.a.vreg.type == .f64) {
+                        try emitMovsdReg(&cg, FPR.xmm0, rn);
+                    } else {
+                        try emitMovssReg(&cg, FPR.xmm0, rn);
+                    }
+                } else {
+                    // mov rax, rn
+                    try emitMovReg(&cg, GPR.rax, rn);
+                }
                 // pop rbp
                 try cg.emit(0x5D);
                 // ret
@@ -462,7 +516,7 @@ pub fn compile(
             .call => {
                 // JIT 内函数调用 (x86-64 System V ABI)
                 // JIT 不遵循标准 ABI：callee 不保存 callee-saved 寄存器，
-                // 因此 caller 必须保存所有 JIT 使用的寄存器 (rbx, r10-r15)。
+                // 因此 caller 必须保存所有 JIT 使用的寄存器 (rbx, r10-r15, xmm0-xmm7)。
                 const target_idx = inst.call_target;
                 if (target_idx >= func_entries.len or func_entries[target_idx] == 0) {
                     return error.JitCallTargetNotCompiled;
@@ -471,9 +525,9 @@ pub fn compile(
 
                 const argc = inst.call_argc;
                 if (argc > 6) return error.JitTooManyArgs;
-                const arg_regs = [_]u8{ GPR.rdi, GPR.rsi, GPR.rdx, GPR.rcx, GPR.r8, GPR.r9 };
+                const int_arg_regs = [_]u8{ GPR.rdi, GPR.rsi, GPR.rdx, GPR.rcx, GPR.r8, GPR.r9 };
 
-                // 保存所有 JIT 寄存器 (rbx, r10-r15 = 7 个 = 56 字节)
+                // 保存所有 JIT GPR 寄存器 (rbx, r10-r15 = 7 个 = 56 字节)
                 // push rbx (reg 3, 无需 REX)
                 try cg.emit(0x50 | GPR.rbx);
                 // push r10-r15 (需要 REX.B)
@@ -489,17 +543,62 @@ pub fn compile(
                 try cg.emit(0x50 | (GPR.r14 & 7));
                 try cg.emitRex(false, 0, 0, GPR.r15);
                 try cg.emit(0x50 | (GPR.r15 & 7));
-                // sub rsp, 8 (对齐到 16 字节)
+
+                // 保存所有 JIT FPR 寄存器 (xmm0-xmm7 = 8 个 = 64 字节)
+                // sub rsp, 64
+                try cg.emit(0x48);
+                try cg.emit(0x83);
+                try cg.emit(0xEC);
+                try cg.emit(64);
+                // movsd [rsp + i*8], xmm_i（使用 SIB 字节，因为 base=rsp）
+                {
+                    var xi: u8 = 0;
+                    while (xi < 8) : (xi += 1) {
+                        try cg.emit(0xF2);
+                        try cg.emitRex(false, xi, 0, GPR.rsp);
+                        try cg.emit(0x0F);
+                        try cg.emit(0x11);
+                        try cg.emit(0x40 | ((xi & 7) << 3) | 4); // mod=01, reg=xmm_i, rm=4 (SIB)
+                        try cg.emit(0x24); // SIB: scale=0, index=none, base=rsp
+                        try cg.emit(xi * 8); // disp8
+                    }
+                }
+
+                // sub rsp, 8 (对齐到 16 字节：56 + 64 + 8 = 128 = 16 的倍数)
                 try cg.emit(0x48);
                 try cg.emit(0x83);
                 try cg.emit(0xEC);
                 try cg.emit(0x08);
 
                 // 移动参数到参数寄存器
+                // 整数参数和浮点参数独立编号：
+                // - 整数参数 → rdi, rsi, rdx, rcx, r8, r9
+                // - 浮点参数 → xmm0, xmm1, ..., xmm7
+                var int_arg_idx: u8 = 0;
+                var float_arg_idx: u8 = 0;
                 var i: u8 = 0;
                 while (i < argc) : (i += 1) {
-                    const src_reg = cg.resolveReg(inst.call_args[i]);
-                    try emitMovReg(&cg, arg_regs[i], src_reg);
+                    const arg_vreg = inst.call_args[i];
+                    if (arg_vreg.type.isFloat()) {
+                        // 浮点参数：从栈上保存的位置加载到 xmm{float_arg_idx}
+                        const src_xmm = cg.resolveReg(arg_vreg);
+                        // 源 XMM 保存在 [rsp + 8 (对齐) + src_xmm * 8]
+                        const disp: u8 = 8 + src_xmm * 8;
+                        // movsd xmm{float_arg_idx}, [rsp + disp]（使用 SIB 字节）
+                        try cg.emit(0xF2);
+                        try cg.emitRex(false, float_arg_idx, 0, GPR.rsp);
+                        try cg.emit(0x0F);
+                        try cg.emit(0x10);
+                        try cg.emit(0x40 | ((float_arg_idx & 7) << 3) | 4); // mod=01, rm=4 (SIB)
+                        try cg.emit(0x24); // SIB
+                        try cg.emit(disp);
+                        float_arg_idx += 1;
+                    } else {
+                        // 整数参数：从 GPR 移动到 int_arg_regs[int_arg_idx]
+                        const src_reg = cg.resolveReg(arg_vreg);
+                        try emitMovReg(&cg, int_arg_regs[int_arg_idx], src_reg);
+                        int_arg_idx += 1;
+                    }
                 }
 
                 // 加载目标入口地址到 rax 并调用
@@ -527,7 +626,26 @@ pub fn compile(
                 try cg.emit(0xC4);
                 try cg.emit(0x08);
 
-                // 恢复 JIT 寄存器（逆序，在移动返回值之前）
+                // 恢复 JIT FPR 寄存器（从栈加载 xmm0-xmm7）
+                {
+                    var xi: u8 = 0;
+                    while (xi < 8) : (xi += 1) {
+                        try cg.emit(0xF2);
+                        try cg.emitRex(false, xi, 0, GPR.rsp);
+                        try cg.emit(0x0F);
+                        try cg.emit(0x10);
+                        try cg.emit(0x40 | ((xi & 7) << 3) | 4); // mod=01, rm=4 (SIB)
+                        try cg.emit(0x24); // SIB
+                        try cg.emit(xi * 8); // disp8
+                    }
+                }
+                // add rsp, 64 (移除 XMM 保存区)
+                try cg.emit(0x48);
+                try cg.emit(0x83);
+                try cg.emit(0xC4);
+                try cg.emit(64);
+
+                // 恢复 JIT GPR 寄存器（逆序，在移动返回值之前）
                 try cg.emitRex(false, 0, 0, GPR.r15);
                 try cg.emit(0x58 | (GPR.r15 & 7));
                 try cg.emitRex(false, 0, 0, GPR.r14);
@@ -542,15 +660,201 @@ pub fn compile(
                 try cg.emit(0x58 | (GPR.r10 & 7));
                 try cg.emit(0x58 | GPR.rbx); // pop rbx (无需 REX)
 
-                // 移动返回值 rax 到目标寄存器（在恢复寄存器之后，避免被覆盖）
+                // 移动返回值到目标寄存器（在恢复寄存器之后，避免被覆盖）
+                // 整数返回值在 rax，浮点返回值在 xmm0
                 const dst = cg.resolveReg(inst.dst);
-                try emitMovReg(&cg, dst, GPR.rax);
+                if (inst.dst.type.isFloat()) {
+                    if (inst.dst.type == .f64) {
+                        try emitMovsdReg(&cg, dst, FPR.xmm0);
+                    } else {
+                        try emitMovssReg(&cg, dst, FPR.xmm0);
+                    }
+                } else {
+                    try emitMovReg(&cg, dst, GPR.rax);
+                }
             },
 
-            .add_f64, .sub_f64, .mul_f64, .div_f64, .neg_f64,
-            .eq_f64, .neq_f64, .lt_f64, .le_f64, .gt_f64, .ge_f64,
-            .i64_to_f64, .f64_to_i64,
-            => return error.JitFloatNotSupported,
+            // ════════ 浮点算术（f64）════════
+            .add_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitMovsdReg(&cg, rd, rn); // movsd rd, rn
+                try emitAddsd(&cg, rd, rm); // addsd rd, rm
+            },
+            .sub_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitMovsdReg(&cg, rd, rn);
+                try emitSubsd(&cg, rd, rm);
+            },
+            .mul_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitMovsdReg(&cg, rd, rn);
+                try emitMulsd(&cg, rd, rm);
+            },
+            .div_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitMovsdReg(&cg, rd, rn);
+                try emitDivsd(&cg, rd, rm);
+            },
+            .neg_f64 => {
+                // 翻转符号位：通过 GPR 中转异或 0x8000000000000000
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                // movq rax, xmm_rn（浮点位 → GPR）
+                try emitMovqXmmToGpr(&cg, GPR.rax, rn);
+                // mov rdx, 0x8000000000000000（符号位掩码）
+                try cg.emitRex(true, 0, 0, GPR.rdx);
+                try cg.emit(0xB8 | (GPR.rdx & 7));
+                try cg.emitI32(0x00000000);
+                try cg.emitI32(0x80000000);
+                // xor rax, rdx（翻转符号位）
+                try cg.emitRex(true, GPR.rdx, 0, GPR.rax);
+                try cg.emit(0x31);
+                try cg.emit(0xC0 | ((GPR.rdx & 7) << 3) | (GPR.rax & 7));
+                // movq xmm_rd, rax（GPR → 浮点位）
+                try emitMovqGprToXmm(&cg, rd, GPR.rax);
+            },
+
+            // ════════ 浮点比较（f64）→ bool ════════
+            // ucomisd 设置 ZF/CF，使用无符号条件码（B/BE/A/AE）
+            .eq_f64, .neq_f64, .lt_f64, .le_f64, .gt_f64, .ge_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                // ucomisd rn, rm（比较 xmm_a 和 xmm_b）
+                try emitUcomisd(&cg, rn, rm);
+                // setcc rd（浮点使用无符号条件码）
+                const setcc: u8 = switch (inst.op) {
+                    .eq_f64 => 0x94, // sete (ZF=1)
+                    .neq_f64 => 0x95, // setne (ZF=0)
+                    .lt_f64 => 0x92, // setb (CF=1)
+                    .le_f64 => 0x96, // setbe (CF=1 or ZF=1)
+                    .gt_f64 => 0x97, // seta (CF=0 and ZF=0)
+                    .ge_f64 => 0x93, // setae (CF=0)
+                    else => unreachable,
+                };
+                try cg.emitRex(false, 0, 0, rd);
+                try cg.emit(0x0F);
+                try cg.emit(setcc);
+                try cg.emit(0xC0 | (rd & 7));
+                // movzx rd, r8（零扩展）
+                try cg.emitRex(true, rd, 0, rd);
+                try cg.emit(0x0F);
+                try cg.emit(0xB6);
+                try cg.emit(0xC0 | ((rd & 7) << 3) | (rd & 7));
+            },
+
+            // ════════ 浮点算术（f32）════════
+            .add_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitMovssReg(&cg, rd, rn);
+                try emitAddss(&cg, rd, rm);
+            },
+            .sub_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitMovssReg(&cg, rd, rn);
+                try emitSubss(&cg, rd, rm);
+            },
+            .mul_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitMovssReg(&cg, rd, rn);
+                try emitMulss(&cg, rd, rm);
+            },
+            .div_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitMovssReg(&cg, rd, rn);
+                try emitDivss(&cg, rd, rm);
+            },
+            .neg_f32 => {
+                // 翻转符号位：通过 GPR 中转异或 0x80000000（32 位）
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                // movd eax, xmm_rn（浮点位 → GPR，32 位）
+                try emitMovdXmmToGpr(&cg, GPR.rax, rn);
+                // xor eax, 0x80000000（翻转 32 位符号位）
+                try cg.emit(0x35); // xor eax, imm32
+                try cg.emitI32(@bitCast(@as(u32, 0x80000000)));
+                // movd xmm_rd, eax（GPR → 浮点位，32 位）
+                try emitMovdGprToXmm(&cg, rd, GPR.rax);
+            },
+
+            // ════════ 浮点比较（f32）→ bool ════════
+            .eq_f32, .neq_f32, .lt_f32, .le_f32, .gt_f32, .ge_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try emitUcomiss(&cg, rn, rm);
+                const setcc: u8 = switch (inst.op) {
+                    .eq_f32 => 0x94,
+                    .neq_f32 => 0x95,
+                    .lt_f32 => 0x92,
+                    .le_f32 => 0x96,
+                    .gt_f32 => 0x97,
+                    .ge_f32 => 0x93,
+                    else => unreachable,
+                };
+                try cg.emitRex(false, 0, 0, rd);
+                try cg.emit(0x0F);
+                try cg.emit(setcc);
+                try cg.emit(0xC0 | (rd & 7));
+                try cg.emitRex(true, rd, 0, rd);
+                try cg.emit(0x0F);
+                try cg.emit(0xB6);
+                try cg.emit(0xC0 | ((rd & 7) << 3) | (rd & 7));
+            },
+
+            // ════════ 类型转换 ════════
+            .i64_to_f64 => {
+                // cvtsi2sd xmm_rd, r_rn（整数 → f64）
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                try emitCvtsi2sd64(&cg, rd, rn);
+            },
+            .f64_to_i64 => {
+                // cvttsd2si r_rd, xmm_rn（f64 → 整数，截断）
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                try emitCvttsd2si64(&cg, rd, rn);
+            },
+            .i64_to_f32 => {
+                // cvtsi2ss xmm_rd, r_rn（整数 → f32）
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                try emitCvtsi2ss64(&cg, rd, rn);
+            },
+            .f32_to_i64 => {
+                // cvttss2si r_rd, xmm_rn（f32 → 整数，截断）
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                try emitCvttss2si64(&cg, rd, rn);
+            },
+            .f32_to_f64 => {
+                // cvtss2sd xmm_rd, xmm_rn（f32 → f64，扩展精度）
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                try emitCvtss2sd(&cg, rd, rn);
+            },
+            .f64_to_f32 => {
+                // cvtsd2ss xmm_rd, xmm_rn（f64 → f32，截断精度）
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                try emitCvtsd2ss(&cg, rd, rn);
+            },
         }
     }
 
@@ -580,6 +884,239 @@ fn emitMovReg(cg: *Codegen, rd: u8, rs: u8) !void {
     try cg.emitRex(true, rs, 0, rd);
     try cg.emit(0x89);
     try cg.emit(0xC0 | ((rs & 7) << 3) | (rd & 7));
+}
+
+// ── SSE2 浮点指令编码（IR 后端专用）──
+
+/// ModRM 字节（mod=3 寄存器模式）。
+fn modrm3(reg: u8, rm: u8) u8 {
+    return 0xC0 | ((reg & 7) << 3) | (rm & 7);
+}
+
+/// movsd xmm, xmm (0xF2 [REX] 0x0F 0x10 /r) — 寄存器间移动低 64 位
+fn emitMovsdReg(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x10);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// movss xmm, xmm (0xF3 [REX] 0x0F 0x10 /r) — 寄存器间移动低 32 位
+fn emitMovssReg(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF3);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x10);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// addsd xmm, xmm (0xF2 [REX] 0x0F 0x58 /r)
+fn emitAddsd(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x58);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// subsd xmm, xmm (0xF2 [REX] 0x0F 0x5C /r)
+fn emitSubsd(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x5C);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// mulsd xmm, xmm (0xF2 [REX] 0x0F 0x59 /r)
+fn emitMulsd(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x59);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// divsd xmm, xmm (0xF2 [REX] 0x0F 0x5E /r)
+fn emitDivsd(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x5E);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// addss xmm, xmm (0xF3 [REX] 0x0F 0x58 /r)
+fn emitAddss(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF3);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x58);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// subss xmm, xmm (0xF3 [REX] 0x0F 0x5C /r)
+fn emitSubss(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF3);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x5C);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// mulss xmm, xmm (0xF3 [REX] 0x0F 0x59 /r)
+fn emitMulss(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF3);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x59);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// divss xmm, xmm (0xF3 [REX] 0x0F 0x5E /r)
+fn emitDivss(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF3);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x5E);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// ucomisd xmm, xmm (0x66 [REX] 0x0F 0x2E /r)
+fn emitUcomisd(cg: *Codegen, rn: u8, rm: u8) !void {
+    try cg.emit(0x66);
+    try cg.emitRex(false, rn, 0, rm);
+    try cg.emit(0x0F);
+    try cg.emit(0x2E);
+    try cg.emit(modrm3(rn, rm));
+}
+
+/// ucomiss xmm, xmm ([REX] 0x0F 0x2E /r)
+fn emitUcomiss(cg: *Codegen, rn: u8, rm: u8) !void {
+    try cg.emitRex(false, rn, 0, rm);
+    try cg.emit(0x0F);
+    try cg.emit(0x2E);
+    try cg.emit(modrm3(rn, rm));
+}
+
+/// cvtsi2sd xmm, r64 (0xF2 REX.W 0x0F 0x2A /r) — 整数转 f64
+fn emitCvtsi2sd64(cg: *Codegen, xmm: u8, rd: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(true, xmm, 0, rd);
+    try cg.emit(0x0F);
+    try cg.emit(0x2A);
+    try cg.emit(modrm3(xmm, rd));
+}
+
+/// cvttsd2si r64, xmm (0xF2 REX.W 0x0F 0x2C /r) — f64 转整数（截断）
+fn emitCvttsd2si64(cg: *Codegen, rd: u8, xmm: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(true, rd, 0, xmm);
+    try cg.emit(0x0F);
+    try cg.emit(0x2C);
+    try cg.emit(modrm3(rd, xmm));
+}
+
+/// cvtsi2ss xmm, r64 (0xF3 REX.W 0x0F 0x2A /r) — 整数转 f32
+fn emitCvtsi2ss64(cg: *Codegen, xmm: u8, rd: u8) !void {
+    try cg.emit(0xF3);
+    try cg.emitRex(true, xmm, 0, rd);
+    try cg.emit(0x0F);
+    try cg.emit(0x2A);
+    try cg.emit(modrm3(xmm, rd));
+}
+
+/// cvttss2si r64, xmm (0xF3 REX.W 0x0F 0x2C /r) — f32 转整数（截断）
+fn emitCvttss2si64(cg: *Codegen, rd: u8, xmm: u8) !void {
+    try cg.emit(0xF3);
+    try cg.emitRex(true, rd, 0, xmm);
+    try cg.emit(0x0F);
+    try cg.emit(0x2C);
+    try cg.emit(modrm3(rd, xmm));
+}
+
+/// cvtss2sd xmm, xmm (0xF3 [REX] 0x0F 0x5A /r) — f32 转 f64
+fn emitCvtss2sd(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF3);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x5A);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// cvtsd2ss xmm, xmm (0xF2 [REX] 0x0F 0x5A /r) — f64 转 f32
+fn emitCvtsd2ss(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x5A);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// movq xmm, r64 (0x66 REX.W 0x0F 0x6E /r) — 从 GPR 移动 64 位到 XMM
+fn emitMovqGprToXmm(cg: *Codegen, xmm: u8, rd: u8) !void {
+    try cg.emit(0x66);
+    try cg.emitRex(true, xmm, 0, rd);
+    try cg.emit(0x0F);
+    try cg.emit(0x6E);
+    try cg.emit(modrm3(xmm, rd));
+}
+
+/// movd xmm, r32 (0x66 [REX] 0x0F 0x6E /r) — 从 GPR 移动 32 位到 XMM
+fn emitMovdGprToXmm(cg: *Codegen, xmm: u8, rd: u8) !void {
+    try cg.emit(0x66);
+    try cg.emitRex(false, xmm, 0, rd);
+    try cg.emit(0x0F);
+    try cg.emit(0x6E);
+    try cg.emit(modrm3(xmm, rd));
+}
+
+/// movq r64, xmm (0x66 REX.W 0x0F 0x7E /r) — 从 XMM 移动 64 位到 GPR
+fn emitMovqXmmToGpr(cg: *Codegen, rd: u8, xmm: u8) !void {
+    try cg.emit(0x66);
+    try cg.emitRex(true, rd, 0, xmm);
+    try cg.emit(0x0F);
+    try cg.emit(0x7E);
+    try cg.emit(modrm3(rd, xmm));
+}
+
+/// movd r32, xmm (0x66 [REX] 0x0F 0x7E /r) — 从 XMM 移动 32 位到 GPR
+fn emitMovdXmmToGpr(cg: *Codegen, rd: u8, xmm: u8) !void {
+    try cg.emit(0x66);
+    try cg.emitRex(false, rd, 0, xmm);
+    try cg.emit(0x0F);
+    try cg.emit(0x7E);
+    try cg.emit(modrm3(rd, xmm));
+}
+
+/// xorps xmm, xmm ([REX] 0x0F 0x57 /r) — 按位异或
+fn emitXorps(cg: *Codegen, rd: u8, rs: u8) !void {
+    try cg.emitRex(false, rd, 0, rs);
+    try cg.emit(0x0F);
+    try cg.emit(0x57);
+    try cg.emit(modrm3(rd, rs));
+}
+
+/// movsd [r64 + disp8], xmm (0xF2 [REX] 0x0F 0x11 /r) — 存储 XMM 到内存
+fn emitMovsdStoreMem(cg: *Codegen, base: u8, disp: i8, xmm: u8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(false, xmm, 0, base);
+    try cg.emit(0x0F);
+    try cg.emit(0x11);
+    // ModRM: mod=01 (disp8), reg=xmm, rm=base
+    try cg.emit(0x40 | ((xmm & 7) << 3) | (base & 7));
+    try cg.emit(@bitCast(disp));
+}
+
+/// movsd xmm, [r64 + disp8] (0xF2 [REX] 0x0F 0x10 /r) — 从内存加载到 XMM
+fn emitMovsdLoadMem(cg: *Codegen, xmm: u8, base: u8, disp: i8) !void {
+    try cg.emit(0xF2);
+    try cg.emitRex(false, xmm, 0, base);
+    try cg.emit(0x0F);
+    try cg.emit(0x10);
+    try cg.emit(0x40 | ((xmm & 7) << 3) | (base & 7));
+    try cg.emit(@bitCast(disp));
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1041,6 +1578,35 @@ const BridgeBuf = struct {
         try self.append(modrm(3, xmm, rd));
     }
 
+    /// cvttsd2si r64, xmm (0xF2 0x0F 0x2C + ModRM(mod=3))
+    /// 浮点转整数（截断）
+    fn cvttsd2si(self: *BridgeBuf, rd: u8, xmm: u8) !void {
+        try self.append(0xF2);
+        try self.rex(true, rd, 0, xmm);
+        try self.append(0x0F);
+        try self.append(0x2C);
+        try self.append(modrm(3, rd, xmm));
+    }
+
+    /// movq xmm, r64 (0x66 REX.W 0x0F 0x6E + ModRM(mod=3))
+    /// 从 GPR 移动 64 位到 XMM
+    fn movqGprToXmm(self: *BridgeBuf, xmm: u8, rd: u8) !void {
+        try self.append(0x66);
+        try self.rex(true, xmm, 0, rd);
+        try self.append(0x0F);
+        try self.append(0x6E);
+        try self.append(modrm(3, xmm, rd));
+    }
+
+    /// xorps xmm, xmm (0x0F 0x57 + ModRM(mod=3))
+    /// 按位异或（用于翻转符号位）
+    fn xorps(self: *BridgeBuf, rd: u8, rs: u8) !void {
+        try self.rex(false, rd, 0, rs);
+        try self.append(0x0F);
+        try self.append(0x57);
+        try self.append(modrm(3, rd, rs));
+    }
+
     /// 回填 rel32 跳转目标。
     /// rel32 = target_offset - (rel32_pos + 4)
     fn patchRel32(code: []u8, rel32_pos: u32, target_offset: u32) void {
@@ -1101,9 +1667,11 @@ fn emitRtStepCall(
     allocator: std.mem.Allocator,
     fpr: *FprState,
 ) !void {
-    // spill 所有常驻 FPR（需 frame base）
+    // 不使用 spillAll：spill 会把 xmm 的 8 字节写到 reg offset 0，
+    // 而字符串/数组等堆指针也存储在 offset 0，spill 会破坏指针。
+    // 只清空 FPR 常驻状态（rt_step 会修改 reg_pool，xmm 缓存失效）。
     try emitFrameBase(buf);
-    try emitSpillAllFpr(buf, fpr);
+    fpr.invalidateAll();
     // 设置参数: CARG0 = vm (r12), CARG1 = ip
     try buf.movReg(CARG0, BR_VM);
     try buf.movImm64(CARG1, @intCast(ip));
@@ -1198,28 +1766,6 @@ const FprState = struct {
         self.fpr_owner = [_]u8{0xFF} ** FPR_POOL.len;
     }
 };
-
-/// 发射 spill 代码：若 reg 常驻 FPR，将其 xmm 写回 reg_pool[reg].bits。
-/// 调用前需已 emitFrameBase（TMP2 = frame base）。
-fn emitSpillFpr(buf: *BridgeBuf, fpr: *FprState, reg: u8) !void {
-    if (!fpr.isResident(reg)) return;
-    const xmm = fpr.getXmm(reg);
-    try buf.movsdStore(TMP2, @intCast(@as(i32, reg) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm);
-    fpr.evict(reg);
-}
-
-/// 发射 spill-all 代码：所有常驻 f64 写回内存（外部调用前）。
-fn emitSpillAllFpr(buf: *BridgeBuf, fpr: *FprState) !void {
-    // 需 frame base；调用方保证 TMP2 已加载
-    var i: usize = 0;
-    while (i < FPR_POOL.len) : (i += 1) {
-        const owner = fpr.fpr_owner[i];
-        if (owner == 0xFF) continue;
-        const xmm = FPR_POOL[i];
-        try buf.movsdStore(TMP2, @intCast(@as(i32, owner) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm);
-    }
-    fpr.invalidateAll();
-}
 
 /// 确保 reg 的 f64 bits 加载到某个 xmm，返回 xmm 编号。
 /// 若已常驻直接返回；否则从内存加载（必要时驱逐一个非 protect_reg 的槽）。
@@ -1433,7 +1979,7 @@ pub fn compileBridge(
                 // a 将被覆盖；若 a 常驻 FPR，先 spill 回内存（防止 a==b/c 时数据丢失）。
                 // i64/unknown 路径会覆盖 a 的内存字段，spill 是冗余但安全的。
                 try emitFrameBase(&buf);
-                try emitSpillFpr(&buf, &fpr_state, a);
+                fpr_state.evict(a);
 
                 if (b_known_i64 and c_known_i64) {
                     // ── 类型已知 i64：跳过 tag 检查，直接算术 ──
@@ -1485,6 +2031,7 @@ pub fn compileBridge(
                     const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, c);
                     const xmm_a = FPR_POOL[a_slot];
                     try buf.movsdReg(xmm_a, 0);
+                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
                     fpr_state.setResident(a, a_slot);
                     // 更新 tag/type（内存元数据需同步，供 cold 路径检查）
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
@@ -1557,7 +2104,7 @@ pub fn compileBridge(
                         const jne_f4 = try buf.jccRel32(X86Cond.NE);
 
                         // a 将被覆盖；若 a 常驻 FPR，先 spill 回内存
-                        try emitSpillFpr(&buf, &fpr_state, a);
+                        fpr_state.evict(a);
                         // 确保 b、c 的 f64 bits 在 xmm（FPR 常驻，保护 b 不被驱逐）
                         const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
                         const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
@@ -1574,6 +2121,7 @@ pub fn compileBridge(
                         const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, c);
                         const xmm_a = FPR_POOL[a_slot];
                         try buf.movsdReg(xmm_a, 0);
+                        try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
                         fpr_state.setResident(a, a_slot);
                         // 更新 tag/type
                         try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
@@ -1602,9 +2150,10 @@ pub fn compileBridge(
                 }
             },
 
-            // ── 热点 opcode：i64 取反 ──
+            // ── 热点 opcode：i64/f64 取反 ──
             .neg => {
                 const b_known_i64 = b < reg_count and reg_types[b] == .i64;
+                const b_known_f64 = b < reg_count and reg_types[b] == .f64;
                 try emitFrameBase(&buf);
                 // a 将被覆盖，失效其 FPR 常驻
                 fpr_state.evict(a);
@@ -1617,30 +2166,77 @@ pub fn compileBridge(
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)), INT_TYPE_I64_VAL);
                     try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
                     reg_types[a] = .i64;
+                } else if (b_known_f64) {
+                    // 类型已知 f64：FPR 常驻路径，用 xorps 翻转符号位
+                    const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                    // 复制 b 到 xmm0
+                    try buf.movsdReg(0, xmm_b);
+                    // 加载符号位掩码（仅最高位为 1）到 rax
+                    try buf.movImm64(TMP0, 0x8000000000000000);
+                    // movq xmm1, rax（掩码到 xmm1）
+                    try buf.movqGprToXmm(1, TMP0);
+                    // xorps xmm0, xmm1（翻转符号位）
+                    try buf.xorps(0, 1);
+                    // 将结果常驻到 a（保护 b 不被驱逐）
+                    const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, 0xFF);
+                    const xmm_a = FPR_POOL[a_slot];
+                    try buf.movsdReg(xmm_a, 0);
+                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
+                    fpr_state.setResident(a, a_slot);
+                    // 更新 tag/type
+                    try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
+                    try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
+                    reg_types[a] = .f64;
                 } else {
-                    // 检查源操作数 b 的 tag
+                    // 未知类型：先检查 TAG_INT，再检查 TAG_FLOAT
                     try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
-                    const jne_cold = try buf.jccRel32(X86Cond.NE);
+                    const jne_not_int = try buf.jccRel32(X86Cond.NE);
 
-                    // 加载 i64 值并取反
+                    // i64 路径
                     try buf.loadMem(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
                     try buf.negReg(TMP0);
-
-                    // 存储结果到 dst(a)
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)), INT_TYPE_I64_VAL);
                     try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
 
                     const b_next = try buf.jmpRel32();
 
+                    // not_int: 检查 TAG_FLOAT
+                    const not_int_off = buf.len();
+                    BridgeBuf.patchRel32(code.items, jne_not_int + 2, not_int_off);
+
+                    try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
+                    const jne_cold = try buf.jccRel32(X86Cond.NE);
+                    // 检查 float type == F64
+                    try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
+                    const jne_cold2 = try buf.jccRel32(X86Cond.NE);
+
+                    // f64 路径：用 xorps 翻转符号位
+                    const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                    try buf.movsdReg(0, xmm_b);
+                    try buf.movImm64(TMP0, 0x8000000000000000);
+                    try buf.movqGprToXmm(1, TMP0);
+                    try buf.xorps(0, 1);
+                    const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, 0xFF);
+                    const xmm_a = FPR_POOL[a_slot];
+                    try buf.movsdReg(xmm_a, 0);
+                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
+                    fpr_state.setResident(a, a_slot);
+                    try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
+                    try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
+
+                    const b_next2 = try buf.jmpRel32();
+
                     // .cold
                     const cold_off = buf.len();
                     BridgeBuf.patchRel32(code.items, jne_cold + 2, cold_off);
+                    BridgeBuf.patchRel32(code.items, jne_cold2 + 2, cold_off);
 
                     try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
+                    BridgeBuf.patchRel32(code.items, b_next2 + 1, next_off);
                     reg_types[a] = .unknown;
                 }
             },
@@ -1698,23 +2294,23 @@ pub fn compileBridge(
                     try buf.storeByte(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)), TMP0);
                     reg_types[a] = .boolean;
                 } else {
-                    // ── 未知类型：带 tag 检查 ──
+                    // ── 未知类型：带 tag 检查（INT + FLOAT 双路径）──
                     try emitFrameBase(&buf);
 
                     // 检查 b 的 tag == TAG_INT
                     try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
-                    const jne_cold1 = try buf.jccRel32(X86Cond.NE);
+                    const jne_not_int1 = try buf.jccRel32(X86Cond.NE);
 
                     // 检查 c 的 tag == TAG_INT
                     try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, c) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
-                    const jne_cold2 = try buf.jccRel32(X86Cond.NE);
+                    const jne_not_int2 = try buf.jccRel32(X86Cond.NE);
 
-                    // 加载 i64 值并比较
+                    // i64 比较路径
                     try buf.loadMem(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
                     try buf.loadMem(TMP1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, INT_LO_OFF)));
                     try buf.cmpReg(TMP0, TMP1);
 
-                    const cc: u8 = switch (op) {
+                    const cc_int: u8 = switch (op) {
                         .eq => X86Cond.E,
                         .neq => X86Cond.NE,
                         .lt => X86Cond.L,
@@ -1723,7 +2319,7 @@ pub fn compileBridge(
                         .ge => X86Cond.GE,
                         else => unreachable,
                     };
-                    try buf.setcc(TMP0, cc);
+                    try buf.setcc(TMP0, cc_int);
                     try buf.movzxR8(TMP0, TMP0);
 
                     // 存储布尔结果
@@ -1732,15 +2328,57 @@ pub fn compileBridge(
 
                     const b_next = try buf.jmpRel32();
 
+                    // not_int: 检查 TAG_FLOAT
+                    const not_int_off = buf.len();
+                    BridgeBuf.patchRel32(code.items, jne_not_int1 + 2, not_int_off);
+                    BridgeBuf.patchRel32(code.items, jne_not_int2 + 2, not_int_off);
+
+                    // 检查 b 的 tag == TAG_FLOAT
+                    try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
+                    const jne_cold1 = try buf.jccRel32(X86Cond.NE);
+                    // 检查 c 的 tag == TAG_FLOAT
+                    try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, c) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
+                    const jne_cold2 = try buf.jccRel32(X86Cond.NE);
+                    // 检查 b 的 float type == F64
+                    try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
+                    const jne_cold3 = try buf.jccRel32(X86Cond.NE);
+                    // 检查 c 的 float type == F64
+                    try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
+                    const jne_cold4 = try buf.jccRel32(X86Cond.NE);
+
+                    // f64 比较路径：ucomisd + setcc
+                    const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                    const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
+                    try buf.movsdReg(0, xmm_b);
+                    try buf.ucomisd(0, xmm_c);
+                    const cc_float: u8 = switch (op) {
+                        .eq => X86Cond.E,
+                        .neq => X86Cond.NE,
+                        .lt => X86Cond.B, // ucomisd: CF=1 表示小于
+                        .gt => X86Cond.A, // CF=0 && ZF=0 表示大于
+                        .le => X86Cond.BE,
+                        .ge => X86Cond.AE,
+                        else => unreachable,
+                    };
+                    try buf.setcc(TMP0, cc_float);
+                    try buf.movzxR8(TMP0, TMP0);
+                    try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_BOOLEAN_VAL);
+                    try buf.storeByte(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)), TMP0);
+
+                    const b_next2 = try buf.jmpRel32();
+
                     // .cold
                     const cold_off = buf.len();
                     BridgeBuf.patchRel32(code.items, jne_cold1 + 2, cold_off);
                     BridgeBuf.patchRel32(code.items, jne_cold2 + 2, cold_off);
+                    BridgeBuf.patchRel32(code.items, jne_cold3 + 2, cold_off);
+                    BridgeBuf.patchRel32(code.items, jne_cold4 + 2, cold_off);
 
                     try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
+                    BridgeBuf.patchRel32(code.items, b_next2 + 1, next_off);
                     reg_types[a] = .boolean;
                 }
             },
@@ -1922,8 +2560,10 @@ pub fn compileBridge(
             .load_const => {
                 try emitFrameBase(&buf);
                 // load_const 有 cold/fast 两条路径；cold 路径会 invalidateAll，
-                // 为保持两条路径后 FPR 状态一致，fast 路径前先 spillAll。
-                try emitSpillAllFpr(&buf, &fpr_state);
+                // 为保持两条路径后 FPR 状态一致，fast 路径前也 invalidateAll。
+                // 不使用 spillAll：spill 会把 xmm 的 8 字节写到 reg offset 0，
+                // 而字符串/数组等堆指针也存储在 offset 0，spill 会破坏指针。
+                fpr_state.invalidateAll();
 
                 // 加载常量池地址到 r11
                 const const_addr: u64 = @intFromPtr(func.chunk.constants.items.ptr) + @as(u64, bx) * @sizeOf(value.Value);
@@ -1971,7 +2611,7 @@ pub fn compileBridge(
             .move, .assign => {
                 try emitFrameBase(&buf);
                 // move 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
-                try emitSpillAllFpr(&buf, &fpr_state);
+                fpr_state.invalidateAll();
 
                 // 检查 src(b) 是否标量
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), MAX_SCALAR_TAG);
@@ -2006,7 +2646,7 @@ pub fn compileBridge(
             .load_unit, .load_null => {
                 try emitFrameBase(&buf);
                 // 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
-                try emitSpillAllFpr(&buf, &fpr_state);
+                fpr_state.invalidateAll();
 
                 // 检查 dst 是否标量
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), MAX_SCALAR_TAG);
@@ -2032,7 +2672,7 @@ pub fn compileBridge(
             .load_true, .load_false => {
                 try emitFrameBase(&buf);
                 // 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
-                try emitSpillAllFpr(&buf, &fpr_state);
+                fpr_state.invalidateAll();
 
                 // 检查 dst 是否标量
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), MAX_SCALAR_TAG);
@@ -2086,19 +2726,19 @@ pub fn compileBridge(
 
                 try emitFrameBase(&buf);
                 // cast 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
-                try emitSpillAllFpr(&buf, &fpr_state);
+                fpr_state.invalidateAll();
 
                 if (int_target) |it| {
                     // 目标是整数类型
                     // 检查 src(b) tag == TAG_INT
                     try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
-                    const bne_cold1 = try buf.jccRel32(X86Cond.NE);
+                    const bne_not_int = try buf.jccRel32(X86Cond.NE);
 
                     // 检查 dst(a) tag == TAG_INT
                     try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
                     const bne_cold2 = try buf.jccRel32(X86Cond.NE);
 
-                    // 快速路径：拷贝 src 的 lo/hi，设置目标 int type
+                    // int→int 快速路径：拷贝 src 的 lo/hi，设置目标 int type
                     try buf.loadMem(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
                     try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
                     try buf.loadMem(TMP0, TMP2, @intCast(@as(i32, b) * 32 + 8)); // hi at offset 8
@@ -2108,15 +2748,52 @@ pub fn compileBridge(
 
                     const b_next = try buf.jmpRel32();
 
-                    // .cold
-                    const cold_off = buf.len();
-                    BridgeBuf.patchRel32(code.items, bne_cold1 + 2, cold_off);
-                    BridgeBuf.patchRel32(code.items, bne_cold2 + 2, cold_off);
+                    // not_int: 检查 f64→i64 转换（仅 i64 目标支持）
+                    const not_int_off = buf.len();
+                    BridgeBuf.patchRel32(code.items, bne_not_int + 2, not_int_off);
 
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
+                    if (it == .i64) {
+                        // 检查 src(b) tag == TAG_FLOAT
+                        try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
+                        const bne_cold_f1 = try buf.jccRel32(X86Cond.NE);
+                        // 检查 src(b) float type == F64
+                        try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
+                        const bne_cold_f2 = try buf.jccRel32(X86Cond.NE);
+                        // 检查 dst(a) tag == TAG_INT
+                        try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
+                        const bne_cold_f3 = try buf.jccRel32(X86Cond.NE);
 
-                    const next_off = buf.len();
-                    BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
+                        // f64→i64：cvttsd2si
+                        const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                        try buf.cvttsd2si(TMP0, xmm_b);
+                        try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
+                        try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)), INT_TYPE_I64_VAL);
+                        try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
+
+                        const b_next2 = try buf.jmpRel32();
+
+                        // .cold
+                        const cold_off = buf.len();
+                        BridgeBuf.patchRel32(code.items, bne_cold2 + 2, cold_off);
+                        BridgeBuf.patchRel32(code.items, bne_cold_f1 + 2, cold_off);
+                        BridgeBuf.patchRel32(code.items, bne_cold_f2 + 2, cold_off);
+                        BridgeBuf.patchRel32(code.items, bne_cold_f3 + 2, cold_off);
+
+                        try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
+
+                        const next_off = buf.len();
+                        BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
+                        BridgeBuf.patchRel32(code.items, b_next2 + 1, next_off);
+                    } else {
+                        // 非 i64 目标：直接走 cold
+                        const cold_off = buf.len();
+                        BridgeBuf.patchRel32(code.items, bne_cold2 + 2, cold_off);
+
+                        try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
+
+                        const next_off = buf.len();
+                        BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
+                    }
                 } else if (float_target) |ft| {
                     // 目标是浮点类型
                     // 检查 src(b) tag == TAG_INT（int→float 转换）
@@ -2145,6 +2822,7 @@ pub fn compileBridge(
                     const a_slot = try emitAllocResultSlot(&buf, &fpr_state, 0xFF, 0xFF);
                     const xmm_a = FPR_POOL[a_slot];
                     try buf.movsdReg(xmm_a, 0);
+                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm_a);
                     fpr_state.setResident(a, a_slot);
                     // 设置 tag = FLOAT
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
@@ -2173,7 +2851,7 @@ pub fn compileBridge(
                 const func_idx_val = bx;
                 // spill 所有常驻 FPR（rt_call_inline 可能修改 reg_pool）
                 try emitFrameBase(&buf);
-                try emitSpillAllFpr(&buf, &fpr_state);
+                fpr_state.invalidateAll();
                 // rt_call_inline(vm, func_idx, args_base, argc, return_base, return_reg)
                 try buf.movReg(CARG0, BR_VM); // x0 = vm
                 try buf.movImm64(CARG1, @intCast(func_idx_val)); // x1 = func_idx
@@ -2198,8 +2876,8 @@ pub fn compileBridge(
                     try buf.storeMem(GPR.rsp, 40, TMP0);
                 } else {
                     // System V: 第 5/6 参数在 r8/r9
-                    try buf.movReg(CARG4.?, BR_BASE); // r8 = return_base
-                    try buf.movImm64(CARG5.?, @intCast(@as(u8, a))); // r9 = return_reg
+                    try buf.movReg(CARG4, BR_BASE); // r8 = return_base
+                    try buf.movImm64(CARG5, @intCast(@as(u8, a))); // r9 = return_reg
                 }
 
                 // call rt_call_inline (r15)
@@ -2221,7 +2899,7 @@ pub fn compileBridge(
             .index_op => {
                 try emitFrameBase(&buf);
                 // index_op 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
-                try emitSpillAllFpr(&buf, &fpr_state);
+                fpr_state.invalidateAll();
 
                 // 检查 arr(b) tag == TAG_ARRAY
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_ARRAY_VAL);
@@ -2294,7 +2972,7 @@ pub fn compileBridge(
                     // arr.len() → rt_array_len(vm, recv_slot, dst_slot)
                     // spill 所有常驻 FPR（rt_array_len 可能修改 reg_pool）
                     try emitFrameBase(&buf);
-                    try emitSpillAllFpr(&buf, &fpr_state);
+                    fpr_state.invalidateAll();
                     try buf.movReg(CARG0, BR_VM); // vm
                     // recv_slot = base + a
                     try buf.movReg(TMP0, BR_BASE);
@@ -2328,7 +3006,7 @@ pub fn compileBridge(
                     // arr.push(elem) → rt_array_push(vm, recv_slot, arg_slot, dst_slot)
                     // spill 所有常驻 FPR（rt_array_push 可能修改 reg_pool）
                     try emitFrameBase(&buf);
-                    try emitSpillAllFpr(&buf, &fpr_state);
+                    fpr_state.invalidateAll();
                     try buf.movReg(CARG0, BR_VM); // vm
                     // recv_slot = base + a
                     try buf.movReg(TMP0, BR_BASE);

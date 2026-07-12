@@ -34,11 +34,13 @@ pub const Allocation = struct {
 };
 
 /// 执行线性扫描寄存器分配。
-/// `avail_regs` 是可用于分配的物理寄存器列表。
+/// `avail_gprs` 是可用于分配的通用寄存器列表，`avail_fprs` 是浮点寄存器列表。
+/// 分配时根据 vreg.type 选择对应的寄存器种类（浮点类型 → FPR，其他 → GPR）。
 pub fn allocate(
     allocator: std.mem.Allocator,
     func: *const ir.IRFunction,
-    avail_regs: []const backend.PhysReg,
+    avail_gprs: []const backend.PhysReg,
+    avail_fprs: []const backend.PhysReg,
 ) !Allocation {
     // 1. 计算每个虚拟寄存器的活跃区间
     var intervals = std.AutoHashMap(u32, LiveInterval).init(allocator);
@@ -148,9 +150,12 @@ pub fn allocate(
             }
         }
 
+        // 根据 vreg 类型选择寄存器池
+        const pool: []const backend.PhysReg = if (interval.vreg.type.isFloat()) avail_fprs else avail_gprs;
+
         // 查找空闲物理寄存器
         var found_reg: ?backend.PhysReg = null;
-        for (avail_regs) |preg| {
+        for (pool) |preg| {
             var conflict = false;
             for (active.items) |act| {
                 if (act.assigned_reg) |ar| {

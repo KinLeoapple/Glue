@@ -108,7 +108,7 @@ const AVAIL_GPRS = [_]backend_mod.PhysReg{
     .{ .id = GPR.x28, .kind = .gpr },
 };
 
-/// 可用于分配的浮点寄存器（d0-d7, d16-d31，调用者保存）。
+/// 可用于分配的浮点寄存器（d0-d7, d16-d31，调用者保存；d8-d15 被调用方保存，不分配）。
 const AVAIL_FPRS = [_]backend_mod.PhysReg{
     .{ .id = FPR.d0, .kind = .fpr },
     .{ .id = FPR.d1, .kind = .fpr },
@@ -126,6 +126,14 @@ const AVAIL_FPRS = [_]backend_mod.PhysReg{
     .{ .id = FPR.d21, .kind = .fpr },
     .{ .id = FPR.d22, .kind = .fpr },
     .{ .id = FPR.d23, .kind = .fpr },
+    .{ .id = FPR.d24, .kind = .fpr },
+    .{ .id = FPR.d25, .kind = .fpr },
+    .{ .id = FPR.d26, .kind = .fpr },
+    .{ .id = FPR.d27, .kind = .fpr },
+    .{ .id = FPR.d28, .kind = .fpr },
+    .{ .id = FPR.d29, .kind = .fpr },
+    .{ .id = FPR.d30, .kind = .fpr },
+    .{ .id = FPR.d31, .kind = .fpr },
 };
 
 /// 代码生成器状态。
@@ -182,6 +190,14 @@ const Codegen = struct {
             return preg.id;
         }
         // 溢出到栈的情况暂不支持（prototype 阶段先断言）
+        @panic("JIT register spill not supported in prototype");
+    }
+
+    /// 解析虚拟寄存器到物理寄存器（含种类信息）。
+    fn resolvePhysReg(self: *const Codegen, vr: ir.VReg) backend_mod.PhysReg {
+        if (self.alloc.vreg_to_phys.get(vr.id)) |preg| {
+            return preg;
+        }
         @panic("JIT register spill not supported in prototype");
     }
 };
@@ -600,6 +616,119 @@ fn encFdiv(rd: u8, rn: u8, rm: u8) u32 {
         rd;
 }
 
+// ── f32 算术指令（ftype=00，bits[23:22]=00）──
+// 与 f64 版本仅 ftype 不同：f64 用 0b01，f32 用 0b00。
+
+/// FADD (single): s_d = s_n + s_m
+/// 00011110000 1 Rm 0010 10 Rn Rd
+fn encFaddS(rd: u8, rn: u8, rm: u8) u32 {
+    return (0b00011110000 << 21) |
+        (@as(u32, rm) << 16) |
+        (0b0010 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FSUB (single): s_d = s_n - s_m
+fn encFsubS(rd: u8, rn: u8, rm: u8) u32 {
+    return (0b00011110000 << 21) |
+        (@as(u32, rm) << 16) |
+        (0b0011 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FMUL (single): s_d = s_n * s_m
+fn encFmulS(rd: u8, rn: u8, rm: u8) u32 {
+    return (0b00011110000 << 21) |
+        (@as(u32, rm) << 16) |
+        (0b0000 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FDIV (single): s_d = s_n / s_m
+fn encFdivS(rd: u8, rn: u8, rm: u8) u32 {
+    return (0b00011110000 << 21) |
+        (@as(u32, rm) << 16) |
+        (0b0001 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FNEG (single): s_d = -s_n
+/// 00011110000 10000 0001 10 Rn Rd
+fn encFnegS(rd: u8, rn: u8) u32 {
+    return (0b00011110000 << 21) |
+        (0b10000 << 16) |
+        (0b0001 << 12) |
+        (1 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FSQRT (double): d_d = sqrt(d_n)
+/// 00011110011 110000 1 0 Rn Rd  (M=1, opcode=110000, type=01)
+fn encFsqrt(rd: u8, rn: u8) u32 {
+    return (0b00011110011 << 21) |
+        (0b110000 << 16) |
+        (1 << 14) |
+        (0b00 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FABS (double): d_d = |d_n|
+/// 00011110011 100001 1 0 Rn Rd  (M=1, opcode=100001)
+fn encFabs(rd: u8, rn: u8) u32 {
+    return (0b00011110011 << 21) |
+        (0b100001 << 16) |
+        (1 << 14) |
+        (0b00 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FMIN (double): d_d = min(d_n, d_m)
+/// 00011110011 1 Rm 0100 10 Rn Rd  (opcode=0100)
+fn encFmin(rd: u8, rn: u8, rm: u8) u32 {
+    return (0b00011110011 << 21) |
+        (@as(u32, rm) << 16) |
+        (0b0100 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FMAX (double): d_d = max(d_n, d_m)
+/// 00011110011 1 Rm 0101 10 Rn Rd  (opcode=0101)
+fn encFmax(rd: u8, rn: u8, rm: u8) u32 {
+    return (0b00011110011 << 21) |
+        (@as(u32, rm) << 16) |
+        (0b0101 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FRINTN (double): d_d = round(d_n) (round to nearest even)
+/// 00011110011 100100 1 0 Rn Rd  (M=1, opcode=100100)
+fn encFrintn(rd: u8, rn: u8) u32 {
+    return (0b00011110011 << 21) |
+        (0b100100 << 16) |
+        (1 << 14) |
+        (0b00 << 12) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
 /// FNEG: d_d = -d_n
 /// 00011110011 10000 0001 10 Rn Rd
 fn encFneg(rd: u8, rn: u8) u32 {
@@ -611,11 +740,20 @@ fn encFneg(rd: u8, rn: u8) u32 {
         rd;
 }
 
-/// FCMP: 比较 d_n 和 d_m，设置 flags
+/// FCMP (double): 比较 d_n 和 d_m，设置 flags
 /// ARM64 编码: 0001 1110 011 Rm 0 0 1 0 0 0 Rn 0 0000
 /// bit[13]=1 是 FCMP 指令的固定位
 fn encFcmp(rn: u8, rm: u8) u32 {
     return (0b00011110011 << 21) |
+        (@as(u32, rm) << 16) |
+        (1 << 13) |
+        (@as(u32, rn) << 5);
+}
+
+/// FCMP (single): 比较 s_n 和 s_m，设置 flags
+/// 与 double 版本仅 ftype 不同（type=00）
+fn encFcmpS(rn: u8, rm: u8) u32 {
+    return (0b00011110000 << 21) |
         (@as(u32, rm) << 16) |
         (1 << 13) |
         (@as(u32, rn) << 5);
@@ -629,6 +767,23 @@ fn encScvtf(rd: u8, rn: u8) u32 {
         (0b00 << 29) |
         (0b11110 << 24) |
         (0b01 << 22) |
+        (0 << 21) |
+        (0b00 << 19) |
+        (0b010 << 16) |
+        (1 << 15) |
+        (0 << 14) |
+        (0b0000 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// SCVTF (single): 整数转浮点 s_d = (f32) x_n (有符号 64 位 → float)
+/// sf=1, type=00(single), rmode=00, opcode=010
+fn encScvtfS(rd: u8, rn: u8) u32 {
+    return (1 << 31) |
+        (0b00 << 29) |
+        (0b11110 << 24) |
+        (0b00 << 22) |
         (0 << 21) |
         (0b00 << 19) |
         (0b010 << 16) |
@@ -657,11 +812,125 @@ fn encFcvtzs(rd: u8, rn: u8) u32 {
         rd;
 }
 
+/// FCVTZS (single): 浮点转整数 x_d = (i64) s_n (向零取整, float → 有符号 64 位)
+/// sf=1, type=00(single), rmode=00, opcode=000
+fn encFcvtzsS(rd: u8, rn: u8) u32 {
+    return (1 << 31) |
+        (0b00 << 29) |
+        (0b11110 << 24) |
+        (0b00 << 22) |
+        (0 << 21) |
+        (0b01 << 19) |
+        (0b000 << 16) |
+        (1 << 15) |
+        (0 << 14) |
+        (0b0000 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FCVT (single → double): d_d = (f64) s_n
+/// 00011110011 0 0 1 11 0 0 1 0 0 0 Rn Rd  (M=1, opcode=000100, type=01)
+fn encFcvtSToD(rd: u8, rn: u8) u32 {
+    return (0b00011110011 << 21) |
+        (0b000100 << 15) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FCVT (double → single): s_d = (f32) d_n
+/// 00011110000 0 0 1 11 0 0 1 0 0 0 Rn Rd  (M=1, opcode=000100, type=00)
+fn encFcvtDToS(rd: u8, rn: u8) u32 {
+    return (0b00011110000 << 21) |
+        (0b000100 << 15) |
+        (0b10 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
 /// FMOV: d_d = d_n (浮点寄存器间移动)
 /// 1-source 形式: 00011110011 000000 1 0000 Rn Rd  (M=1, opcode=000000, bit14=1)
+/// FMOV (register, double): d_d = d_n
+/// 0 00 11110 01 1 00 000 1 00000 Rn Rd
 fn encFmov(rd: u8, rn: u8) u32 {
     return (0b00011110011 << 21) |
-        (1 << 14) |
+        (1 << 15) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FMOV (register, single): s_d = s_n
+/// 0 00 11110 00 1 00 000 1 00000 Rn Rd
+fn encFmovS(rd: u8, rn: u8) u32 {
+    return (0b00011110000 << 21) |
+        (1 << 15) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FMOV (general, 64-bit): d_d = x_n (GPR → FPR，64 位比特搬运)
+/// sf=1 00 11110 type=01 1 00 111 000 1 0 Rn Rd  (rmode=00, opcode=111)
+fn encFmovGprToFpr64(rd: u8, rn: u8) u32 {
+    return (1 << 31) |
+        (0b00 << 29) |
+        (0b11110 << 24) |
+        (0b01 << 22) |
+        (1 << 21) |
+        (0b00 << 19) |
+        (0b111 << 16) |
+        (1 << 15) |
+        (0 << 14) |
+        (0b0000 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FMOV (general, 32-bit): s_d = w_n (GPR → FPR，32 位比特搬运)
+/// sf=0 00 11110 type=00 1 00 111 000 1 0 Rn Rd
+fn encFmovGprToFpr32(rd: u8, rn: u8) u32 {
+    return (0 << 31) |
+        (0b00 << 29) |
+        (0b11110 << 24) |
+        (0b00 << 22) |
+        (1 << 21) |
+        (0b00 << 19) |
+        (0b111 << 16) |
+        (1 << 15) |
+        (0 << 14) |
+        (0b0000 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FMOV (general, 64-bit): x_d = d_n (FPR → GPR，64 位比特搬运)
+fn encFmovFprToGpr64(rd: u8, rn: u8) u32 {
+    return (1 << 31) |
+        (0b00 << 29) |
+        (0b11110 << 24) |
+        (0b01 << 22) |
+        (1 << 21) |
+        (0b00 << 19) |
+        (0b110 << 16) |
+        (1 << 15) |
+        (0 << 14) |
+        (0b0000 << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
+/// FMOV (general, 32-bit): w_d = s_n (FPR → GPR，32 位比特搬运)
+fn encFmovFprToGpr32(rd: u8, rn: u8) u32 {
+    return (0 << 31) |
+        (0b00 << 29) |
+        (0b11110 << 24) |
+        (0b00 << 22) |
+        (1 << 21) |
+        (0b00 << 19) |
+        (0b110 << 16) |
+        (1 << 15) |
+        (0 << 14) |
+        (0b0000 << 10) |
         (@as(u32, rn) << 5) |
         rd;
 }
@@ -683,6 +952,28 @@ fn encStrF64(rt: u8, rn: u8, imm12: u12) u32 {
     return (0b11 << 30) |
         (0b111101 << 24) |
         (0b00 << 22) | // unsigned offset, store
+        (@as(u32, imm12) << 10) |
+        (@as(u32, rn) << 5) |
+        rt;
+}
+
+/// LDR (SIMD&FP, 32-bit unsigned offset): s_t = [x_n + #imm*4]
+/// 编码: size=10 111101 01 imm12 Rn Rt  (32-bit single)
+fn encLdrF32(rt: u8, rn: u8, imm12: u12) u32 {
+    return (0b10 << 30) |
+        (0b111101 << 24) |
+        (0b01 << 22) |
+        (@as(u32, imm12) << 10) |
+        (@as(u32, rn) << 5) |
+        rt;
+}
+
+/// STR (SIMD&FP, 32-bit unsigned offset): [x_n + #imm*4] = s_t
+/// 编码: size=10 111101 00 imm12 Rn Rt  (32-bit single)
+fn encStrF32(rt: u8, rn: u8, imm12: u12) u32 {
+    return (0b10 << 30) |
+        (0b111101 << 24) |
+        (0b00 << 22) |
         (@as(u32, imm12) << 10) |
         (@as(u32, rn) << 5) |
         rt;
@@ -760,8 +1051,8 @@ pub fn compile(
     exec_mem: *mem.ExecMemory,
     func_entries: []const usize,
 ) !usize {
-    // 寄存器分配
-    var alloc_result = try regalloc.allocate(allocator, func, &AVAIL_GPRS);
+    // 寄存器分配（GPR + FPR 类型感知）
+    var alloc_result = try regalloc.allocate(allocator, func, &AVAIL_GPRS, &AVAIL_FPRS);
     defer alloc_result.deinit();
 
     var cg = Codegen.init(allocator, exec_mem, &alloc_result);
@@ -781,9 +1072,23 @@ pub fn compile(
                 try cg.label_offsets.put(inst.label, cg.currentOffset());
             },
 
-            .const_i64, .const_f64 => {
+            .const_i64 => {
                 const rd = cg.resolveReg(inst.dst);
                 try loadImm64(&cg, rd, inst.imm);
+            },
+
+            .const_f64 => {
+                // 加载 imm64 到 GPR x9，再 FMOV (general) 到 FPR
+                const rd = cg.resolveReg(inst.dst); // FPR
+                try loadImm64(&cg, GPR.x9, inst.imm);
+                try cg.emit(encFmovGprToFpr64(rd, GPR.x9));
+            },
+
+            .const_f32 => {
+                // 加载 imm32 到 GPR x9，再 FMOV (general, 32-bit) 到 FPR
+                const rd = cg.resolveReg(inst.dst); // FPR
+                try loadImm64(&cg, GPR.x9, inst.imm);
+                try cg.emit(encFmovGprToFpr32(rd, GPR.x9));
             },
 
             .const_bool => {
@@ -871,7 +1176,16 @@ pub fn compile(
                 const rd = cg.resolveReg(inst.dst);
                 const rn = cg.resolveReg(inst.a.vreg);
                 if (rd != rn) {
-                    try cg.emit(encMovReg(1, rd, rn));
+                    if (inst.dst.type.isFloat()) {
+                        // FPR 间移动
+                        if (inst.dst.type == .f32) {
+                            try cg.emit(encFmovS(rd, rn));
+                        } else {
+                            try cg.emit(encFmov(rd, rn));
+                        }
+                    } else {
+                        try cg.emit(encMovReg(1, rd, rn));
+                    }
                 }
             },
 
@@ -952,19 +1266,42 @@ pub fn compile(
             },
 
             .load_arg => {
-                // 参数已在 x0-x7 中，移动到分配的寄存器
+                // 整数参数在 x0-x7，浮点参数在 d0-d7
                 const arg_idx: u8 = @intCast(inst.imm);
                 const rd = cg.resolveReg(inst.dst);
-                if (rd != arg_idx) {
-                    try cg.emit(encMovReg(1, rd, arg_idx));
+                const arg_ty = func.arg_types[arg_idx];
+                if (arg_ty.isFloat()) {
+                    // 浮点参数从 d(arg_idx) 加载到分配的 FPR
+                    if (rd != arg_idx) {
+                        if (arg_ty == .f32) {
+                            try cg.emit(encFmovS(rd, arg_idx));
+                        } else {
+                            try cg.emit(encFmov(rd, arg_idx));
+                        }
+                    }
+                } else {
+                    // 整数参数从 x(arg_idx) 加载到分配的 GPR
+                    if (rd != arg_idx) {
+                        try cg.emit(encMovReg(1, rd, arg_idx));
+                    }
                 }
             },
 
             .return_val => {
-                // 移动返回值到 x0
+                // 整数返回值在 x0，浮点返回值在 d0
                 const rn = cg.resolveReg(inst.a.vreg);
-                if (rn != GPR.x0) {
-                    try cg.emit(encMovReg(1, GPR.x0, rn));
+                if (inst.a.vreg.type.isFloat()) {
+                    if (rn != FPR.d0) {
+                        if (inst.a.vreg.type == .f32) {
+                            try cg.emit(encFmovS(FPR.d0, rn));
+                        } else {
+                            try cg.emit(encFmov(FPR.d0, rn));
+                        }
+                    }
+                } else {
+                    if (rn != GPR.x0) {
+                        try cg.emit(encMovReg(1, GPR.x0, rn));
+                    }
                 }
                 // 函数 epilogue
                 // ldp x29, x30, [sp], #16
@@ -1007,14 +1344,27 @@ pub fn compile(
                 // stp x28, xzr, [sp, #128]
                 try cg.emit(encStrPair(1, GPR.x28, 31, 31, 16));
 
-                // 移动参数到 x0-x7
+                // 移动参数到 x0-x7（整数）/ d0-d7（浮点）
                 const argc = inst.call_argc;
                 if (argc > 8) return error.JitTooManyArgs;
                 var i: u8 = 0;
                 while (i < argc) : (i += 1) {
-                    const arg_reg = cg.resolveReg(inst.call_args[i]);
-                    if (arg_reg != i) {
-                        try cg.emit(encMovReg(1, i, arg_reg));
+                    const arg_vreg = inst.call_args[i];
+                    const arg_reg = cg.resolveReg(arg_vreg);
+                    if (arg_vreg.type.isFloat()) {
+                        // 浮点参数 → d0-d7
+                        if (arg_reg != i) {
+                            if (arg_vreg.type == .f32) {
+                                try cg.emit(encFmovS(i, arg_reg));
+                            } else {
+                                try cg.emit(encFmov(i, arg_reg));
+                            }
+                        }
+                    } else {
+                        // 整数参数 → x0-x7
+                        if (arg_reg != i) {
+                            try cg.emit(encMovReg(1, i, arg_reg));
+                        }
                     }
                 }
 
@@ -1048,18 +1398,159 @@ pub fn compile(
                 // ldp x9, x10, [sp], #144
                 try cg.emit(encLdpPost(1, GPR.x9, 31, GPR.x10, 18));
 
-                // 移动返回值 x0 到目标寄存器（在恢复寄存器之后，避免被覆盖）
+                // 移动返回值到目标寄存器（在恢复寄存器之后，避免被覆盖）
+                // 整数返回值在 x0，浮点返回值在 d0
                 const dst = cg.resolveReg(inst.dst);
-                if (dst != GPR.x0) {
-                    try cg.emit(encMovReg(1, dst, GPR.x0));
+                if (inst.dst.type.isFloat()) {
+                    if (dst != FPR.d0) {
+                        if (inst.dst.type == .f32) {
+                            try cg.emit(encFmovS(dst, FPR.d0));
+                        } else {
+                            try cg.emit(encFmov(dst, FPR.d0));
+                        }
+                    }
+                } else {
+                    if (dst != GPR.x0) {
+                        try cg.emit(encMovReg(1, dst, GPR.x0));
+                    }
                 }
             },
 
-            // 浮点运算（prototype 阶段暂不支持，需要 FPR 寄存器分配）
-            .add_f64, .sub_f64, .mul_f64, .div_f64, .neg_f64,
-            .eq_f64, .neq_f64, .lt_f64, .le_f64, .gt_f64, .ge_f64,
-            .i64_to_f64, .f64_to_i64,
-            => return error.JitFloatNotSupported,
+            // ════════ 浮点算术（f64）════════
+            .add_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try cg.emit(encFadd(rd, rn, rm));
+            },
+            .sub_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try cg.emit(encFsub(rd, rn, rm));
+            },
+            .mul_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try cg.emit(encFmul(rd, rn, rm));
+            },
+            .div_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try cg.emit(encFdiv(rd, rn, rm));
+            },
+            .neg_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                try cg.emit(encFneg(rd, rn));
+            },
+
+            // ════════ 浮点算术（f32）════════
+            .add_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try cg.emit(encFaddS(rd, rn, rm));
+            },
+            .sub_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try cg.emit(encFsubS(rd, rn, rm));
+            },
+            .mul_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try cg.emit(encFmulS(rd, rn, rm));
+            },
+            .div_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                const rm = cg.resolveReg(inst.b.vreg);
+                try cg.emit(encFdivS(rd, rn, rm));
+            },
+            .neg_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rn = cg.resolveReg(inst.a.vreg);
+                try cg.emit(encFnegS(rd, rn));
+            },
+
+            // ════════ 浮点比较（f64）→ bool ════════
+            .eq_f64, .neq_f64, .lt_f64, .le_f64, .gt_f64, .ge_f64 => {
+                const rd = cg.resolveReg(inst.dst); // GPR (bool 结果)
+                const rn = cg.resolveReg(inst.a.vreg); // FPR
+                const rm = cg.resolveReg(inst.b.vreg); // FPR
+                try cg.emit(encFcmp(rn, rm));
+                const cond: u4 = switch (inst.op) {
+                    .eq_f64 => Cond.EQ,
+                    .neq_f64 => Cond.NE,
+                    .lt_f64 => Cond.LT,
+                    .le_f64 => Cond.LE,
+                    .gt_f64 => Cond.GT,
+                    .ge_f64 => Cond.GE,
+                    else => unreachable,
+                };
+                try cg.emit(encCset(rd, cond));
+            },
+
+            // ════════ 浮点比较（f32）→ bool ════════
+            .eq_f32, .neq_f32, .lt_f32, .le_f32, .gt_f32, .ge_f32 => {
+                const rd = cg.resolveReg(inst.dst); // GPR (bool 结果)
+                const rn = cg.resolveReg(inst.a.vreg); // FPR
+                const rm = cg.resolveReg(inst.b.vreg); // FPR
+                try cg.emit(encFcmpS(rn, rm));
+                const cond: u4 = switch (inst.op) {
+                    .eq_f32 => Cond.EQ,
+                    .neq_f32 => Cond.NE,
+                    .lt_f32 => Cond.LT,
+                    .le_f32 => Cond.LE,
+                    .gt_f32 => Cond.GT,
+                    .ge_f32 => Cond.GE,
+                    else => unreachable,
+                };
+                try cg.emit(encCset(rd, cond));
+            },
+
+            // ════════ 类型转换 ════════
+            .i64_to_f64 => {
+                // SCVTF (64-bit integer to double): d_d = (double)x_n
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const rn = cg.resolveReg(inst.a.vreg); // GPR
+                try cg.emit(encScvtf(rd, rn));
+            },
+            .f64_to_i64 => {
+                // FCVTZS (double to 64-bit integer): x_d = (int64)d_n
+                const rd = cg.resolveReg(inst.dst); // GPR
+                const rn = cg.resolveReg(inst.a.vreg); // FPR
+                try cg.emit(encFcvtzs(rd, rn));
+            },
+            .i64_to_f32 => {
+                // SCVTF (64-bit integer to single): s_d = (float)x_n
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const rn = cg.resolveReg(inst.a.vreg); // GPR
+                try cg.emit(encScvtfS(rd, rn));
+            },
+            .f32_to_i64 => {
+                // FCVTZS (single to 64-bit integer): x_d = (int64)s_n
+                const rd = cg.resolveReg(inst.dst); // GPR
+                const rn = cg.resolveReg(inst.a.vreg); // FPR
+                try cg.emit(encFcvtzsS(rd, rn));
+            },
+            .f32_to_f64 => {
+                // FCVT (single to double): d_d = (double)s_n
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const rn = cg.resolveReg(inst.a.vreg); // FPR
+                try cg.emit(encFcvtSToD(rd, rn));
+            },
+            .f64_to_f32 => {
+                // FCVT (double to single): s_d = (float)d_n
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const rn = cg.resolveReg(inst.a.vreg); // FPR
+                try cg.emit(encFcvtDToS(rd, rn));
+            },
         }
     }
 
@@ -1114,6 +1605,7 @@ const TAG_ARRAY_VAL: u8 = runtime.TAG_ARRAY;
 const INT_TYPE_I64_VAL: u8 = runtime.INT_TYPE_I64;
 const INT_TYPE_I32_VAL: u8 = runtime.INT_TYPE_I32;
 const FLOAT_TYPE_F64_VAL: u8 = runtime.FLOAT_TYPE_F64;
+const FLOAT_TYPE_F32_VAL: u8 = runtime.FLOAT_TYPE_F32;
 /// 最大标量 tag 值（float=5）。tag 0-5 为标量，无需引用计数。
 const MAX_SCALAR_TAG: u8 = runtime.TAG_FLOAT;
 
@@ -1166,7 +1658,7 @@ pub fn compileBridge(
     // 在单次前向遍历中，根据字节码推导寄存器类型。
     // 注意：类型传播仅在基本块内有效，跳转目标处需重置为 unknown，
     // 因为不同控制流路径可能赋予寄存器不同的类型。
-    const RegType = enum { unknown, i64, f64, boolean };
+    const RegType = enum { unknown, i64, f64, f32, boolean };
     const reg_count = func.register_count;
     var reg_types = try allocator.alloc(RegType, reg_count);
     defer allocator.free(reg_types);
@@ -1182,7 +1674,9 @@ pub fn compileBridge(
                 std.mem.eql(u8, tname, "i128") or std.mem.eql(u8, tname, "u128"))
             {
                 reg_types[i] = .i64;
-            } else if (std.mem.eql(u8, tname, "f16") or std.mem.eql(u8, tname, "f32") or
+            } else if (std.mem.eql(u8, tname, "f32")) {
+                reg_types[i] = .f32;
+            } else if (std.mem.eql(u8, tname, "f16") or
                 std.mem.eql(u8, tname, "f64") or std.mem.eql(u8, tname, "f128"))
             {
                 reg_types[i] = .f64;
@@ -1290,12 +1784,14 @@ pub fn compileBridge(
         const sbx = reg_opcode.getsBx(inst);
 
         switch (op) {
-            // ── 热点 opcode：i64/f64 算术 ──
+            // ── 热点 opcode：i64/f64/f32 算术 ──
             .add, .sub, .mul, .div, .mod => {
                 const b_known_i64 = b < reg_count and reg_types[b] == .i64;
                 const c_known_i64 = c < reg_count and reg_types[c] == .i64;
                 const b_known_f64 = b < reg_count and reg_types[b] == .f64;
                 const c_known_f64 = c < reg_count and reg_types[c] == .f64;
+                const b_known_f32 = b < reg_count and reg_types[b] == .f32;
+                const c_known_f32 = c < reg_count and reg_types[c] == .f32;
 
                 if (b_known_i64 and c_known_i64) {
                     // ── 类型已知 i64：跳过 tag 检查，直接算术 ──
@@ -1339,6 +1835,27 @@ pub fn compileBridge(
                     try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F64_VAL, 0));
                     try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
                     reg_types[a] = .f64;
+                } else if (b_known_f32 and c_known_f32 and op != .mod) {
+                    // ── 类型已知 f32：跳过 tag 检查，直接单精度浮点算术 ──
+                    try emit(&code, allocator, encLdrImm(1, GPR.x9, GPR.x19, @intCast(REG_POOL_PTR_OFFSET / 8)));
+                    try emit(&code, allocator, encAddLsl5(GPR.x10, GPR.x9, GPR.x20));
+                    // f32 bits 在 FLOAT_BITS_OFFSET 起始处（低 32 位）
+                    // encLdrF32 imm12 以 4 字节为单位
+                    try emit(&code, allocator, encLdrF32(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 4)));
+                    try emit(&code, allocator, encLdrF32(FPR.d1, GPR.x10, @intCast((@as(u32, c) * 32 + FLOAT_BITS_OFF) / 4)));
+                    switch (op) {
+                        .add => try emit(&code, allocator, encFaddS(FPR.d0, FPR.d0, FPR.d1)),
+                        .sub => try emit(&code, allocator, encFsubS(FPR.d0, FPR.d0, FPR.d1)),
+                        .mul => try emit(&code, allocator, encFmulS(FPR.d0, FPR.d0, FPR.d1)),
+                        .div => try emit(&code, allocator, encFdivS(FPR.d0, FPR.d0, FPR.d1)),
+                        else => unreachable,
+                    }
+                    try emit(&code, allocator, encStrF32(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 4)));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F32_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+                    reg_types[a] = .f32;
                 } else {
                 // ── 未知类型：带 tag 检查的通用路径 ──
                 // 加载 reg_pool 指针和 frame_base
@@ -1399,6 +1916,7 @@ pub fn compileBridge(
                 }
 
                 var b_next2: u32 = 0;
+                var b_next3: u32 = 0;
 
                 // ── f64 快速路径（.mod 无浮点路径，直接走 cold）──
                 if (op != .mod) {
@@ -1447,12 +1965,56 @@ pub fn compileBridge(
                     try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
 
                     b_next2 = @intCast(code.items.len);
+                    try emit(&code, allocator, encB(0)); // 跳过 f32 路径和 cold
+
+                    // ── f32 路径入口（从 f64 失败的 bne 跳转过来）──
+                    const f32_target: u32 = @intCast(code.items.len);
+                    // 回填 f64 bne 到 f32_target
+                    inline for (.{ bne_cold_f1, bne_cold_f2, bne_cold_f3, bne_cold_f4 }) |bne_off| {
+                        const d: i64 = @as(i64, f32_target) - @as(i64, @intCast(bne_off));
+                        const imm19: u19 = @truncate(@as(u32, @bitCast(@as(i32, @intCast(d)))));
+                        code.items[bne_off] = (code.items[bne_off] & ~(@as(u32, 0x7FFFF) << 5)) | (@as(u32, imm19) << 5);
+                    }
+
+                    // 检查 b 的 float type == F32
+                    try emit(&code, allocator, encLdrb(GPR.x13, GPR.x10, @intCast(@as(u32, b) * 32 + FLOAT_TYPE_OFF)));
+                    try emit(&code, allocator, encCmpImm(1, GPR.x13, FLOAT_TYPE_F32_VAL));
+                    const bne_cold_s1: u32 = @intCast(code.items.len);
+                    try emit(&code, allocator, encBcond(Cond.NE, 0));
+
+                    // 检查 c 的 float type == F32
+                    try emit(&code, allocator, encLdrb(GPR.x14, GPR.x10, @intCast(@as(u32, c) * 32 + FLOAT_TYPE_OFF)));
+                    try emit(&code, allocator, encCmpImm(1, GPR.x14, FLOAT_TYPE_F32_VAL));
+                    const bne_cold_s2: u32 = @intCast(code.items.len);
+                    try emit(&code, allocator, encBcond(Cond.NE, 0));
+
+                    // 加载 f32 bits 到 FPR
+                    try emit(&code, allocator, encLdrF32(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 4)));
+                    try emit(&code, allocator, encLdrF32(FPR.d1, GPR.x10, @intCast((@as(u32, c) * 32 + FLOAT_BITS_OFF) / 4)));
+
+                    // 执行单精度浮点运算
+                    switch (op) {
+                        .add => try emit(&code, allocator, encFaddS(FPR.d0, FPR.d0, FPR.d1)),
+                        .sub => try emit(&code, allocator, encFsubS(FPR.d0, FPR.d0, FPR.d1)),
+                        .mul => try emit(&code, allocator, encFmulS(FPR.d0, FPR.d0, FPR.d1)),
+                        .div => try emit(&code, allocator, encFdivS(FPR.d0, FPR.d0, FPR.d1)),
+                        else => unreachable,
+                    }
+
+                    // 存储 f32 结果到 dst(a)
+                    try emit(&code, allocator, encStrF32(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 4)));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F32_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+
+                    b_next3 = @intCast(code.items.len);
                     try emit(&code, allocator, encB(0)); // 跳过 cold
 
                     // cold 目标
                     const cold_off: u32 = @intCast(code.items.len);
-                    // 回填 float bne 到 cold
-                    inline for (.{ bne_cold_f1, bne_cold_f2, bne_cold_f3, bne_cold_f4 }) |bne_off| {
+                    // 回填 f32 bne 到 cold
+                    inline for (.{ bne_cold_s1, bne_cold_s2 }) |bne_off| {
                         const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
                         const imm19: u19 = @truncate(@as(u32, @bitCast(@as(i32, @intCast(d)))));
                         code.items[bne_off] = (code.items[bne_off] & ~(@as(u32, 0x7FFFF) << 5)) | (@as(u32, imm19) << 5);
@@ -1479,14 +2041,18 @@ pub fn compileBridge(
                 if (op != .mod) {
                     const d2: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next2));
                     code.items[b_next2] = encB(@intCast(d2));
+                    const d3: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next3));
+                    code.items[b_next3] = encB(@intCast(d3));
                 }
                 reg_types[a] = .unknown;
                 } // end else (unknown type path)
             },
 
-            // ── 热点 opcode：i64 取反 ──
+            // ── 热点 opcode：i64/f64/f32 取反 ──
             .neg => {
                 const b_known_i64 = b < reg_count and reg_types[b] == .i64;
+                const b_known_f64 = b < reg_count and reg_types[b] == .f64;
+                const b_known_f32 = b < reg_count and reg_types[b] == .f32;
                 try emit(&code, allocator, encLdrImm(1, GPR.x9, GPR.x19, @intCast(REG_POOL_PTR_OFFSET / 8)));
                 try emit(&code, allocator, encAddLsl5(GPR.x10, GPR.x9, GPR.x20));
 
@@ -1500,11 +2066,31 @@ pub fn compileBridge(
                     try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + INT_TYPE_OFF)));
                     try emit(&code, allocator, encStrImm(1, GPR.x13, GPR.x10, @intCast((@as(u32, a) * 32 + INT_LO_OFF) / 8)));
                     reg_types[a] = .i64;
+                } else if (b_known_f64) {
+                    // ── 类型已知 f64：直接浮点取反 ──
+                    try emit(&code, allocator, encLdrF64(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 8)));
+                    try emit(&code, allocator, encFneg(FPR.d0, FPR.d0));
+                    try emit(&code, allocator, encStrF64(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 8)));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F64_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+                    reg_types[a] = .f64;
+                } else if (b_known_f32) {
+                    // ── 类型已知 f32：直接单精度浮点取反 ──
+                    try emit(&code, allocator, encLdrF32(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 4)));
+                    try emit(&code, allocator, encFnegS(FPR.d0, FPR.d0));
+                    try emit(&code, allocator, encStrF32(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 4)));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F32_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+                    reg_types[a] = .f32;
                 } else {
                 // 检查源操作数 b 的 tag
                 try emit(&code, allocator, encLdrb(GPR.x11, GPR.x10, @intCast(@as(u32, b) * 32 + TAG_OFF)));
                 try emit(&code, allocator, encCmpImm(1, GPR.x11, TAG_INT_VAL));
-                const bne_cold = code.items.len;
+                const bne_not_int = code.items.len;
                 try emit(&code, allocator, encBcond(Cond.NE, 0)); // 占位
 
                 // 加载 i64 值并取反
@@ -1519,13 +2105,82 @@ pub fn compileBridge(
                 try emit(&code, allocator, encStrImm(1, GPR.x13, GPR.x10, @intCast((@as(u32, a) * 32 + INT_LO_OFF) / 8)));
 
                 const b_next: u32 = @intCast(code.items.len);
-                try emit(&code, allocator, encB(0)); // 占位
+                try emit(&code, allocator, encB(0)); // 跳过 float 路径和 cold
+
+                // .not_int: float 路径或 cold
+                const not_int_target: u32 = @intCast(code.items.len);
+                {
+                    const d: i64 = @as(i64, not_int_target) - @as(i64, @intCast(bne_not_int));
+                    const imm19: u19 = @truncate(@as(u32, @bitCast(@as(i32, @intCast(d)))));
+                    code.items[bne_not_int] = (code.items[bne_not_int] & ~(@as(u32, 0x7FFFF) << 5)) | (@as(u32, imm19) << 5);
+                }
+
+                var b_next2: u32 = 0;
+
+                // ── f64 取反路径 ──
+                // 检查 b 的 tag == TAG_FLOAT
+                try emit(&code, allocator, encLdrb(GPR.x11, GPR.x10, @intCast(@as(u32, b) * 32 + TAG_OFF)));
+                try emit(&code, allocator, encCmpImm(1, GPR.x11, TAG_FLOAT_VAL));
+                const bne_not_float = code.items.len;
+                try emit(&code, allocator, encBcond(Cond.NE, 0));
+
+                // 检查 b 的 float type == F64
+                try emit(&code, allocator, encLdrb(GPR.x13, GPR.x10, @intCast(@as(u32, b) * 32 + FLOAT_TYPE_OFF)));
+                try emit(&code, allocator, encCmpImm(1, GPR.x13, FLOAT_TYPE_F64_VAL));
+                const bne_not_f64 = code.items.len;
+                try emit(&code, allocator, encBcond(Cond.NE, 0));
+
+                try emit(&code, allocator, encLdrF64(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 8)));
+                try emit(&code, allocator, encFneg(FPR.d0, FPR.d0));
+                try emit(&code, allocator, encStrF64(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 8)));
+                try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
+                try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F64_VAL, 0));
+                try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+
+                b_next2 = @intCast(code.items.len);
+                try emit(&code, allocator, encB(0)); // 跳过 f32 路径和 cold
+
+                // ── f32 取反路径 ──
+                const f32_target: u32 = @intCast(code.items.len);
+                // 回填 bne_not_float 和 bne_not_f64 到 f32_target
+                inline for (.{ bne_not_float, bne_not_f64 }) |bne_off| {
+                    const d: i64 = @as(i64, f32_target) - @as(i64, @intCast(bne_off));
+                    const imm19: u19 = @truncate(@as(u32, @bitCast(@as(i32, @intCast(d)))));
+                    code.items[bne_off] = (code.items[bne_off] & ~(@as(u32, 0x7FFFF) << 5)) | (@as(u32, imm19) << 5);
+                }
+
+                // 检查 b 的 tag == TAG_FLOAT（f32 路径需要再次确认）
+                try emit(&code, allocator, encLdrb(GPR.x11, GPR.x10, @intCast(@as(u32, b) * 32 + TAG_OFF)));
+                try emit(&code, allocator, encCmpImm(1, GPR.x11, TAG_FLOAT_VAL));
+                const bne_cold_s1 = code.items.len;
+                try emit(&code, allocator, encBcond(Cond.NE, 0));
+
+                // 检查 b 的 float type == F32
+                try emit(&code, allocator, encLdrb(GPR.x13, GPR.x10, @intCast(@as(u32, b) * 32 + FLOAT_TYPE_OFF)));
+                try emit(&code, allocator, encCmpImm(1, GPR.x13, FLOAT_TYPE_F32_VAL));
+                const bne_cold_s2 = code.items.len;
+                try emit(&code, allocator, encBcond(Cond.NE, 0));
+
+                try emit(&code, allocator, encLdrF32(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 4)));
+                try emit(&code, allocator, encFnegS(FPR.d0, FPR.d0));
+                try emit(&code, allocator, encStrF32(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 4)));
+                try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
+                try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F32_VAL, 0));
+                try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+
+                const b_next3: u32 = @intCast(code.items.len);
+                try emit(&code, allocator, encB(0)); // 跳过 cold
 
                 // .cold
                 const cold_off: u32 = @intCast(code.items.len);
-                const d1: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_cold));
-                const imm19_1: u19 = @truncate(@as(u32, @bitCast(@as(i32, @intCast(d1)))));
-                code.items[bne_cold] = (code.items[bne_cold] & ~(@as(u32, 0x7FFFF) << 5)) | (@as(u32, imm19_1) << 5);
+                // 回填 f32 bne 到 cold
+                inline for (.{ bne_cold_s1, bne_cold_s2 }) |bne_off| {
+                    const d: i64 = @as(i64, cold_off) - @as(i64, @intCast(bne_off));
+                    const imm19: u19 = @truncate(@as(u32, @bitCast(@as(i32, @intCast(d)))));
+                    code.items[bne_off] = (code.items[bne_off] & ~(@as(u32, 0x7FFFF) << 5)) | (@as(u32, imm19) << 5);
+                }
 
                 try emit(&code, allocator, encMovReg(1, GPR.x0, GPR.x19));
                 try emit(&code, allocator, encMovz(1, GPR.x1, @truncate(ip), 0));
@@ -1538,18 +2193,26 @@ pub fn compileBridge(
                 try pending_fixups.append(allocator, .{ .code_idx = cbnz_exit, .target_ip = 0xFFFFFFFF, .kind = 3 });
 
                 const next_off: u32 = @intCast(code.items.len);
-                const d_next: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
-                code.items[b_next] = encB(@intCast(d_next));
+                {
+                    const d_next: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
+                    code.items[b_next] = encB(@intCast(d_next));
+                    const d_next2: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next2));
+                    code.items[b_next2] = encB(@intCast(d_next2));
+                    const d_next3: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next3));
+                    code.items[b_next3] = encB(@intCast(d_next3));
+                }
                 reg_types[a] = .unknown;
                 } // end else
             },
 
-            // ── 热点 opcode：i64 比较 ──
+            // ── 热点 opcode：i64/f64/f32 比较 ──
             .eq, .neq, .lt, .gt, .le, .ge => {
                 const b_known_i64 = b < reg_count and reg_types[b] == .i64;
                 const c_known_i64 = c < reg_count and reg_types[c] == .i64;
                 const b_known_f64 = b < reg_count and reg_types[b] == .f64;
                 const c_known_f64 = c < reg_count and reg_types[c] == .f64;
+                const b_known_f32 = b < reg_count and reg_types[b] == .f32;
+                const c_known_f32 = c < reg_count and reg_types[c] == .f32;
 
                 if (b_known_i64 and c_known_i64) {
                     // ── 类型已知 i64：跳过 tag 检查 ──
@@ -1576,6 +2239,24 @@ pub fn compileBridge(
                     try emit(&code, allocator, encLdrF64(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 8)));
                     try emit(&code, allocator, encLdrF64(FPR.d1, GPR.x10, @intCast((@as(u32, c) * 32 + FLOAT_BITS_OFF) / 8)));
                     try emit(&code, allocator, encFcmp(FPR.d0, FPR.d1));
+                    const cond: u4 = switch (op) {
+                        .eq => Cond.EQ, .neq => Cond.NE, .lt => Cond.LT,
+                        .gt => Cond.GT, .le => Cond.LE, .ge => Cond.GE,
+                        else => unreachable,
+                    };
+                    try emit(&code, allocator, encCset(GPR.x13, cond));
+                    try emit(&code, allocator, encMovz(1, GPR.x11, TAG_BOOLEAN_VAL, 0));
+                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                    try emit(&code, allocator, encStrb(GPR.x13, GPR.x10, @intCast(@as(u32, a) * 32 + PAYLOAD_OFF)));
+                    reg_types[a] = .boolean;
+                } else if (b_known_f32 and c_known_f32) {
+                    // ── 类型已知 f32：跳过 tag 检查，单精度比较 ──
+                    try emit(&code, allocator, encLdrImm(1, GPR.x9, GPR.x19, @intCast(REG_POOL_PTR_OFFSET / 8)));
+                    try emit(&code, allocator, encAddLsl5(GPR.x10, GPR.x9, GPR.x20));
+
+                    try emit(&code, allocator, encLdrF32(FPR.d0, GPR.x10, @intCast((@as(u32, b) * 32 + FLOAT_BITS_OFF) / 4)));
+                    try emit(&code, allocator, encLdrF32(FPR.d1, GPR.x10, @intCast((@as(u32, c) * 32 + FLOAT_BITS_OFF) / 4)));
+                    try emit(&code, allocator, encFcmpS(FPR.d0, FPR.d1));
                     const cond: u4 = switch (op) {
                         .eq => Cond.EQ, .neq => Cond.NE, .lt => Cond.LT,
                         .gt => Cond.GT, .le => Cond.LE, .ge => Cond.GE,
@@ -1892,7 +2573,10 @@ pub fn compileBridge(
                 if (bx < func.chunk.constants.items.len) {
                     reg_types[a] = switch (func.chunk.constants.items[bx]) {
                         .int => .i64,
-                        .float => .f64,
+                        .float => |f| switch (f.type) {
+                            .f32 => .f32,
+                            else => .f64,
+                        },
                         .boolean => .boolean,
                         else => .unknown,
                     };
@@ -2145,7 +2829,7 @@ pub fn compileBridge(
                     const bne_cold1: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encBcond(Cond.NE, 0));
 
-                    // 检查 src(b) int type == i64（仅支持 i64→f64 快速路径）
+                    // 检查 src(b) int type == i64（仅支持 i64 转换快速路径）
                     try emit(&code, allocator, encLdrb(GPR.x11, GPR.x10, @intCast(@as(u32, b) * 32 + INT_TYPE_OFF)));
                     try emit(&code, allocator, encCmpImm(1, GPR.x11, INT_TYPE_I64_VAL));
                     const bne_cold2: u32 = @intCast(code.items.len);
@@ -2157,33 +2841,32 @@ pub fn compileBridge(
                     const bne_cold3: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encBcond(Cond.NE, 0));
 
-                    // 仅支持 f64 目标
-                    if (ft != .f64) {
-                        // f32 目标走桥接
-                        try emit(&code, allocator, encMovReg(1, GPR.x0, GPR.x19));
-                        try emit(&code, allocator, encMovz(1, GPR.x1, @truncate(ip), 0));
-                        if (ip > 0xFFFF) {
-                            try emit(&code, allocator, encMovk(1, GPR.x1, @truncate(ip >> 16), 1));
-                        }
-                        try emit(&code, allocator, encBlr(GPR.x21));
-                        const cbnz_exit: u32 = @intCast(code.items.len);
-                        try emit(&code, allocator, encCbnz(1, GPR.x0));
-                        try pending_fixups.append(allocator, .{ .code_idx = cbnz_exit, .target_ip = 0xFFFFFFFF, .kind = 3 });
-                        continue;
-                    }
-
                     // 加载 i64 值到 GPR
                     try emit(&code, allocator, encLdrImm(1, GPR.x13, GPR.x10, @intCast(@as(u32, b) * 4)));
-                    // SCVTF d0, x13 (i64 → f64)
-                    try emit(&code, allocator, encScvtf(FPR.d0, GPR.x13));
-                    // 存储 f64 bits 到 dst(a)
-                    try emit(&code, allocator, encStrF64(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 8)));
-                    // 设置 tag = FLOAT
-                    try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
-                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
-                    // 设置 float type = F64
-                    try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F64_VAL, 0));
-                    try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+
+                    if (ft == .f64) {
+                        // SCVTF d0, x13 (i64 → f64)
+                        try emit(&code, allocator, encScvtf(FPR.d0, GPR.x13));
+                        // 存储 f64 bits 到 dst(a)
+                        try emit(&code, allocator, encStrF64(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 8)));
+                        // 设置 tag = FLOAT
+                        try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
+                        try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                        // 设置 float type = F64
+                        try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F64_VAL, 0));
+                        try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+                    } else {
+                        // SCVTF s0, x13 (i64 → f32)
+                        try emit(&code, allocator, encScvtfS(FPR.d0, GPR.x13));
+                        // 存储 f32 bits 到 dst(a)（低 32 位）
+                        try emit(&code, allocator, encStrF32(FPR.d0, GPR.x10, @intCast((@as(u32, a) * 32 + FLOAT_BITS_OFF) / 4)));
+                        // 设置 tag = FLOAT
+                        try emit(&code, allocator, encMovz(1, GPR.x11, TAG_FLOAT_VAL, 0));
+                        try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + TAG_OFF)));
+                        // 设置 float type = F32
+                        try emit(&code, allocator, encMovz(1, GPR.x11, FLOAT_TYPE_F32_VAL, 0));
+                        try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + FLOAT_TYPE_OFF)));
+                    }
 
                     const b_next: u32 = @intCast(code.items.len);
                     try emit(&code, allocator, encB(0)); // 跳过 cold
@@ -2210,7 +2893,10 @@ pub fn compileBridge(
                     code.items[b_next] = encB(@intCast(d_next));
                 }
                 // 类型传播：cast 结果类型由目标类型决定
-                reg_types[a] = if (int_target != null) .i64 else if (float_target != null) .f64 else .unknown;
+                reg_types[a] = if (int_target != null) .i64 else if (float_target) |ft| switch (ft) {
+                    .f32 => .f32,
+                    else => .f64,
+} else .unknown;
             },
 
             // ── 热点 opcode：call（通过 rt_call_inline 快速路径，跳过 jitStepOnce）──

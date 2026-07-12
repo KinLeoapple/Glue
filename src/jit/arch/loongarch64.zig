@@ -9,6 +9,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mem = @import("../mem.zig");
+const ir = @import("../ir.zig");
+const regalloc = @import("../regalloc.zig");
 const value = @import("value");
 const reg_vm_mod = @import("reg_vm");
 const reg_chunk = reg_vm_mod.reg_chunk_mod;
@@ -71,6 +73,68 @@ pub const FPR = struct {
     pub const ft5: u8 = 13; // $f13
     pub const ft6: u8 = 14; // $f14
     pub const ft7: u8 = 15; // $f15
+    pub const ft8: u8 = 16; // $f16, 临时
+    pub const ft9: u8 = 17; // $f17
+    pub const ft10: u8 = 18; // $f18
+    pub const ft11: u8 = 19; // $f19
+    pub const ft12: u8 = 20; // $f20
+    pub const ft13: u8 = 21; // $f21
+    pub const ft14: u8 = 22; // $f22
+    pub const ft15: u8 = 23; // $f23
+    pub const fs0: u8 = 24; // $f24, callee-saved
+    pub const fs1: u8 = 25; // $f25
+    pub const fs2: u8 = 26; // $f26
+    pub const fs3: u8 = 27; // $f27
+    pub const fs4: u8 = 28; // $f28
+    pub const fs5: u8 = 29; // $f29
+    pub const fs6: u8 = 30; // $f30
+    pub const fs7: u8 = 31; // $f31
+};
+
+/// 可用于分配的通用寄存器（IR 模式用，桥接模式不使用）。
+/// 使用 t0-t8（r12-r20，caller-saved）和 s0-s8（r23-r31，callee-saved）。
+/// 避开 r0（恒零）、r1（ra）、r2（tp）、r3（sp）、r4-r11（a0-a7 参数）、r21（保留）、r22（fp）。
+const AVAIL_GPRS = [_]backend_mod.PhysReg{
+    .{ .id = GPR.t0, .kind = .gpr },
+    .{ .id = GPR.t1, .kind = .gpr },
+    .{ .id = GPR.t2, .kind = .gpr },
+    .{ .id = GPR.t3, .kind = .gpr },
+    .{ .id = GPR.t4, .kind = .gpr },
+    .{ .id = GPR.t5, .kind = .gpr },
+    .{ .id = GPR.t6, .kind = .gpr },
+    .{ .id = GPR.t7, .kind = .gpr },
+    .{ .id = GPR.t8, .kind = .gpr },
+    .{ .id = GPR.s0, .kind = .gpr },
+    .{ .id = GPR.s1, .kind = .gpr },
+    .{ .id = GPR.s2, .kind = .gpr },
+    .{ .id = GPR.s3, .kind = .gpr },
+    .{ .id = GPR.s4, .kind = .gpr },
+    .{ .id = GPR.s5, .kind = .gpr },
+    .{ .id = GPR.s6, .kind = .gpr },
+    .{ .id = GPR.s7, .kind = .gpr },
+    .{ .id = GPR.s8, .kind = .gpr },
+};
+
+/// 可用于分配的浮点寄存器（IR 模式用）。
+/// 使用 ft0-ft7（f8-f15，caller-saved）和 ft8-ft15（f16-f23，caller-saved）。
+/// 避开 fa0-fa7（f0-f7，参数/返回值）和 fs0-fs7（f24-f31，callee-saved）。
+const AVAIL_FPRS = [_]backend_mod.PhysReg{
+    .{ .id = FPR.ft0, .kind = .fpr },
+    .{ .id = FPR.ft1, .kind = .fpr },
+    .{ .id = FPR.ft2, .kind = .fpr },
+    .{ .id = FPR.ft3, .kind = .fpr },
+    .{ .id = FPR.ft4, .kind = .fpr },
+    .{ .id = FPR.ft5, .kind = .fpr },
+    .{ .id = FPR.ft6, .kind = .fpr },
+    .{ .id = FPR.ft7, .kind = .fpr },
+    .{ .id = FPR.ft8, .kind = .fpr },
+    .{ .id = FPR.ft9, .kind = .fpr },
+    .{ .id = FPR.ft10, .kind = .fpr },
+    .{ .id = FPR.ft11, .kind = .fpr },
+    .{ .id = FPR.ft12, .kind = .fpr },
+    .{ .id = FPR.ft13, .kind = .fpr },
+    .{ .id = FPR.ft14, .kind = .fpr },
+    .{ .id = FPR.ft15, .kind = .fpr },
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -1126,9 +1190,10 @@ pub fn compileBridge(
                 }
             },
 
-            // ── i64 取反 ──
+            // ── i64/f64 取反 ──
             .neg => {
                 const b_known_i64 = b < reg_count and reg_types[b] == .i64;
+                const b_known_f64 = b < reg_count and reg_types[b] == .f64;
                 try emitFrameBase2(&buf);
 
                 if (b_known_i64) {
@@ -1141,7 +1206,18 @@ pub fn compileBridge(
                     try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)));
                     try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)));
                     reg_types[a] = .i64;
+                } else if (b_known_f64) {
+                    // ── f64 快速路径 ──
+                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.fnegD(FT0, FT0);
+                    try buf.fstD(FT0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
+                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
+                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    reg_types[a] = .f64;
                 } else {
+                    // ── 未知类型：tag 检查 ──
                     // 检查 tag == TAG_INT
                     try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
                     try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
@@ -1158,12 +1234,40 @@ pub fn compileBridge(
 
                     const b_next = try buf.b();
 
+                    // not_int 目标：检查 f64
+                    const not_int_target = buf.len();
+                    BridgeBuf.patchBcc(code.items, jne_cold, not_int_target);
+
+                    // 检查 b tag == TAG_FLOAT
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
+                    const jne_f1 = try buf.bne(TMP0, TMP1);
+
+                    // 检查 b float type == F64
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
+                    const jne_f2 = try buf.bne(TMP0, TMP1);
+
+                    // f64 取反
+                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.fnegD(FT0, FT0);
+                    try buf.fstD(FT0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
+                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
+                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+
+                    const b_next2 = try buf.b();
+
+                    // cold 目标
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, jne_cold, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f1, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f2, cold_off);
                     try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
 
                     const next_off = buf.len();
                     BridgeBuf.patchB(code.items, b_next, next_off);
+                    BridgeBuf.patchB(code.items, b_next2, next_off);
                     reg_types[a] = .unknown;
                 }
             },
@@ -1280,13 +1384,71 @@ pub fn compileBridge(
 
                     const b_next = try buf.b();
 
+                    // not_int 目标：检查 f64
+                    const not_int_target = buf.len();
+                    BridgeBuf.patchBcc(code.items, jne_cold1, not_int_target);
+                    BridgeBuf.patchBcc(code.items, jne_cold2, not_int_target);
+
+                    // 检查 b tag == TAG_FLOAT
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
+                    const jne_f1 = try buf.bne(TMP0, TMP1);
+
+                    // 检查 c tag == TAG_FLOAT
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, TAG_OFF)));
+                    const jne_f2 = try buf.bne(TMP0, TMP1);
+
+                    // 检查 b float type == F64
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
+                    const jne_f3 = try buf.bne(TMP0, TMP1);
+
+                    // 检查 c float type == F64
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    const jne_f4 = try buf.bne(TMP0, TMP1);
+
+                    // 加载 f64 bits
+                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.fldD(FT1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
+
+                    // 浮点比较，结果写入 FCC0
+                    switch (op) {
+                        .eq => try buf.fcmpCeqD(0, FT0, FT1),
+                        .neq => try buf.fcmpCeqD(0, FT0, FT1),
+                        .lt => try buf.fcmpCltD(0, FT0, FT1),
+                        .gt => try buf.fcmpCltD(0, FT1, FT0),
+                        .le => try buf.fcmpCleD(0, FT0, FT1),
+                        .ge => try buf.fcmpCleD(0, FT1, FT0),
+                    }
+
+                    // 将 FCC0 转换为 0/1 布尔值
+                    try buf.addiD(TMP0, GPR.zero, 0);
+                    const bz_pos = if (op == .neq) try buf.bceqz(0) else try buf.bcnez(0);
+                    const b_done = try buf.b();
+                    const set_true_off = buf.len();
+                    BridgeBuf.patchBz(code.items, bz_pos, set_true_off);
+                    try buf.addiD(TMP0, GPR.zero, 1);
+                    const done_off = buf.len();
+                    BridgeBuf.patchB(code.items, b_done, done_off);
+
+                    // 存储布尔结果
+                    try buf.addiD(TMP1, GPR.zero, @intCast(TAG_BOOLEAN_VAL));
+                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try buf.stB(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)));
+
+                    const b_next2 = try buf.b();
+
+                    // cold 目标
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, jne_cold1, cold_off);
-                    BridgeBuf.patchBcc(code.items, jne_cold2, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f1, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f2, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f3, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f4, cold_off);
                     try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
 
                     const next_off = buf.len();
                     BridgeBuf.patchB(code.items, b_next, next_off);
+                    BridgeBuf.patchB(code.items, b_next2, next_off);
                     reg_types[a] = .boolean;
                 }
             },
@@ -1784,13 +1946,61 @@ pub fn compileBridge(
 
                     const b_next = try buf.b();
 
+                    // not_int 目标：检查 f64→int 路径
+                    const not_int_target = buf.len();
+                    BridgeBuf.patchBcc(code.items, bne_cold1, not_int_target);
+                    BridgeBuf.patchBcc(code.items, bne_cold2, not_int_target);
+
+                    // 检查 src(b) tag == TAG_FLOAT
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(TAG_FLOAT_VAL));
+                    const jne_f1 = try buf.bne(TMP0, TMP1);
+
+                    // 检查 src(b) float type == F64
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_TYPE_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(FLOAT_TYPE_F64_VAL));
+                    const jne_f2 = try buf.bne(TMP0, TMP1);
+
+                    // 检查 dst(a) tag == TAG_INT
+                    try buf.ldBu(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
+                    const jne_f3 = try buf.bne(TMP0, TMP1);
+
+                    // f64 → int32 截断（FTINTRZ.W.D）
+                    try buf.fldD(FT0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    try buf.ftintrzWD(FT0, FT0); // double → int32，向零取整
+                    try buf.movfr2grD(TMP0, FT0); // FPR → GPR
+
+                    // 符号扩展 32→64 位
+                    try buf.addiD(TMP3, GPR.zero, 32);
+                    try buf.sllD(TMP0, TMP0, TMP3);
+                    try buf.sraD(TMP0, TMP0, TMP3);
+
+                    // 存储到 dst(a) 的 INT_LO_OFF
+                    try buf.stD(TMP0, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)));
+                    // 存储 hi（符号扩展，用于 i128 兼容）
+                    try buf.addiD(TMP3, GPR.zero, 63);
+                    try buf.sraD(TMP3, TMP0, TMP3);
+                    try buf.stD(TMP3, TMP2, @intCast(@as(i32, a) * 32 + 8));
+
+                    // 设置 tag = TAG_INT, int type = I64
+                    try buf.addiD(TMP1, GPR.zero, @intCast(TAG_INT_VAL));
+                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)));
+                    try buf.addiD(TMP1, GPR.zero, @intCast(INT_TYPE_I64_VAL));
+                    try buf.stB(TMP1, TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)));
+
+                    const b_next2 = try buf.b();
+
+                    // cold 目标
                     const cold_off = buf.len();
-                    BridgeBuf.patchBcc(code.items, bne_cold1, cold_off);
-                    BridgeBuf.patchBcc(code.items, bne_cold2, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f1, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f2, cold_off);
+                    BridgeBuf.patchBcc(code.items, jne_f3, cold_off);
                     try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
 
                     const next_off = buf.len();
                     BridgeBuf.patchB(code.items, b_next, next_off);
+                    BridgeBuf.patchB(code.items, b_next2, next_off);
                 } else if (float_target) |ft| {
                     // 目标是浮点类型
                     // 检查 src(b) tag == TAG_INT（int→float）
@@ -1970,4 +2180,1028 @@ fn compileBridgeFn(
     };
 
     return @ptrCast(&engine.compiled[func_idx].?);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// IR 模式代码生成器
+// ════════════════════════════════════════════════════════════════════
+
+/// 浮点指令编码辅助函数（IR 模式专用，直接使用 hex 值避免常量歧义）。
+/// LoongArch 浮点指令格式：
+///   3R-type: opcode[31:15] | fk[14:10] | fj[9:5] | fd[4:0]
+///   2R-type: opcode[31:10] | fj[9:5] | fd[4:0]
+
+/// fadd.d fd, fj, fk
+fn cgFaddD(fd: u8, fj: u8, fk: u8) u32 {
+    return 0x01010000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+}
+/// fsub.d fd, fj, fk
+fn cgFsubD(fd: u8, fj: u8, fk: u8) u32 {
+    return 0x01030000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+}
+/// fmul.d fd, fj, fk
+fn cgFmulD(fd: u8, fj: u8, fk: u8) u32 {
+    return 0x01050000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+}
+/// fdiv.d fd, fj, fk
+fn cgFdivD(fd: u8, fj: u8, fk: u8) u32 {
+    return 0x01070000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+}
+/// fadd.s fd, fj, fk
+fn cgFaddS(fd: u8, fj: u8, fk: u8) u32 {
+    return 0x01100000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+}
+/// fsub.s fd, fj, fk
+fn cgFsubS(fd: u8, fj: u8, fk: u8) u32 {
+    return 0x01120000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+}
+/// fmul.s fd, fj, fk
+fn cgFmulS(fd: u8, fj: u8, fk: u8) u32 {
+    return 0x01140000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+}
+/// fdiv.s fd, fj, fk
+fn cgFdivS(fd: u8, fj: u8, fk: u8) u32 {
+    return 0x01160000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | fd;
+}
+
+/// fcmp.ceq.d cc, fj, fk (结果写入 FCC[cc])
+fn cgFcmpCeqD(cc: u8, fj: u8, fk: u8) u32 {
+    return 0x0C220000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | (cc & 7);
+}
+/// fcmp.clt.d cc, fj, fk
+fn cgFcmpCltD(cc: u8, fj: u8, fk: u8) u32 {
+    return 0x0C210000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | (cc & 7);
+}
+/// fcmp.cle.d cc, fj, fk
+fn cgFcmpCleD(cc: u8, fj: u8, fk: u8) u32 {
+    return 0x0C230000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | (cc & 7);
+}
+/// fcmp.ceq.s cc, fj, fk
+fn cgFcmpCeqS(cc: u8, fj: u8, fk: u8) u32 {
+    return 0x0C120000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | (cc & 7);
+}
+/// fcmp.clt.s cc, fj, fk
+fn cgFcmpCltS(cc: u8, fj: u8, fk: u8) u32 {
+    return 0x0C110000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | (cc & 7);
+}
+/// fcmp.cle.s cc, fj, fk
+fn cgFcmpCleS(cc: u8, fj: u8, fk: u8) u32 {
+    return 0x0C130000 | (@as(u32, fk) << 10) | (@as(u32, fj) << 5) | (cc & 7);
+}
+
+/// fmov.d fd, fj
+fn cgFmovD(fd: u8, fj: u8) u32 {
+    return 0x01149800 | (@as(u32, fj) << 5) | fd;
+}
+/// fneg.d fd, fj
+fn cgFnegD(fd: u8, fj: u8) u32 {
+    return 0x01141800 | (@as(u32, fj) << 5) | fd;
+}
+/// fmov.s fd, fj
+fn cgFmovS(fd: u8, fj: u8) u32 {
+    return 0x01149000 | (@as(u32, fj) << 5) | fd;
+}
+/// fneg.s fd, fj
+fn cgFnegS(fd: u8, fj: u8) u32 {
+    return 0x01141000 | (@as(u32, fj) << 5) | fd;
+}
+/// movgr2fr.d fd, rj (GPR → FPR)
+fn cgMovgr2frD(fd: u8, rj: u8) u32 {
+    return 0x0114A800 | (@as(u32, rj) << 5) | fd;
+}
+/// movfr2gr.d rd, fj (FPR → GPR)
+fn cgMovfr2grD(rd: u8, fj: u8) u32 {
+    return 0x0114B800 | (@as(u32, fj) << 5) | rd;
+}
+/// ffint.d.l fd, fj (int64 → double)
+fn cgFfintDL(fd: u8, fj: u8) u32 {
+    return 0x011D2800 | (@as(u32, fj) << 5) | fd;
+}
+/// ftintrz.l.d fd, fj (double → int64, trunc)
+fn cgFtintrzLD(fd: u8, fj: u8) u32 {
+    return 0x011B8800 | (@as(u32, fj) << 5) | fd;
+}
+/// fcvt.s.d fd, fj (double → float)
+fn cgFcvtSD(fd: u8, fj: u8) u32 {
+    return 0x01198000 | (@as(u32, fj) << 5) | fd;
+}
+/// fcvt.d.s fd, fj (float → double)
+fn cgFcvtDS(fd: u8, fj: u8) u32 {
+    return 0x01190000 | (@as(u32, fj) << 5) | fd;
+}
+/// ffint.s.l fd, fj (int64 → float)
+fn cgFfintSL(fd: u8, fj: u8) u32 {
+    return 0x011D6800 | (@as(u32, fj) << 5) | fd;
+}
+/// ftintrz.l.s fd, fj (float → int64, trunc)
+fn cgFtintrzLS(fd: u8, fj: u8) u32 {
+    return 0x011B9800 | (@as(u32, fj) << 5) | fd;
+}
+/// fld.d fd, rj, imm12 (load double)
+fn cgFldD(fd: u8, rj: u8, imm12: i16) u32 {
+    return enc2RI12(OPF2RI12.FLD_D, fd, rj, imm12);
+}
+/// fst.d fd, rj, imm12 (store double)
+fn cgFstD(fd: u8, rj: u8, imm12: i16) u32 {
+    return enc2RI12(OPF2RI12.FST_D, fd, rj, imm12);
+}
+
+/// bceqz cj, offs21 (FCC[cj]==0 时跳转)
+fn cgBceqz(cj: u8) u32 {
+    return @as(u32, 0b010010) << 26 | (@as(u32, cj & 7) << 5);
+}
+/// bcnez cj, offs21 (FCC[cj]!=0 时跳转)
+fn cgBcnez(cj: u8) u32 {
+    return @as(u32, 0b010010) << 26 | (@as(u32, 0b01) << 8) | (@as(u32, cj & 7) << 5);
+}
+
+/// IR 模式代码生成器状态。
+const Codegen = struct {
+    /// 机器码缓冲区（u32 数组，LoongArch 每条指令 4 字节）。
+    code: std.ArrayListUnmanaged(u32) = .empty,
+    allocator: std.mem.Allocator,
+    /// 寄存器分配结果。
+    alloc: *const regalloc.Allocation,
+    /// 标签 → 代码偏移映射（以指令索引计）。
+    label_offsets: std.AutoHashMap(u32, u32),
+    /// 待修复的跳转指令（需要回填目标地址）。
+    pending_fixups: std.ArrayListUnmanaged(Fixup) = .empty,
+
+    const Fixup = struct {
+        /// 需要修复的代码索引（code 数组中的位置）。
+        code_idx: u32,
+        /// 目标标签 ID。
+        target_label: u32,
+        /// 跳转指令类型（1=B/I26, 2=Bcc/2RI16, 3=Bz/1RI21, 4=Bceqz/BCnez/1RI21）。
+        fixup_kind: u8,
+    };
+
+    fn init(allocator: std.mem.Allocator, alloc: *const regalloc.Allocation) Codegen {
+        return .{
+            .allocator = allocator,
+            .alloc = alloc,
+            .label_offsets = std.AutoHashMap(u32, u32).init(allocator),
+            .pending_fixups = .empty,
+        };
+    }
+
+    fn deinit(self: *Codegen) void {
+        self.code.deinit(self.allocator);
+        self.label_offsets.deinit();
+        self.pending_fixups.deinit(self.allocator);
+    }
+
+    /// 追加一条 LoongArch 指令。
+    fn emit(self: *Codegen, enc: u32) !void {
+        try self.code.append(self.allocator, enc);
+    }
+
+    /// 当前代码偏移（以指令数计）。
+    fn currentOffset(self: *const Codegen) u32 {
+        return @intCast(self.code.items.len);
+    }
+
+    /// 解析虚拟寄存器到物理寄存器编号。
+    fn resolveReg(self: *const Codegen, vr: ir.VReg) u8 {
+        if (self.alloc.vreg_to_phys.get(vr.id)) |preg| {
+            return preg.id;
+        }
+        @panic("JIT register spill not supported in prototype");
+    }
+};
+
+/// 加载 64 位立即数到寄存器（IR 模式）。
+/// 使用 lu12i.w + lu32i.d + lu52i.d 三条指令。
+fn loadImm64Cg(cg: *Codegen, rd: u8, val: u64) !void {
+    const lo20: i32 = @intCast((val >> 12) & 0xFFFFF);
+    const mid20: i32 = @intCast((val >> 32) & 0xFFFFF);
+    const hi12: i16 = @intCast((val >> 52) & 0xFFF);
+    const lo20_signed: i32 = if (lo20 & 0x80000 != 0) lo20 - 0x100000 else lo20;
+    const mid20_signed: i32 = if (mid20 & 0x80000 != 0) mid20 - 0x100000 else mid20;
+    try cg.emit(enc1RI20(OP1RI20.LU12I_W, rd, lo20_signed));
+    try cg.emit(enc1RI20(OP1RI20.LU32I_D, rd, mid20_signed));
+    try cg.emit(enc2RI12(OP2RI12.LU52I_D, rd, rd, hi12));
+}
+
+/// 回填 B/BL 跳转目标（I26-type）。
+fn patchI26(code_item: *u32, jump_idx: u32, target_idx: u32) void {
+    const diff: i64 = @as(i64, target_idx) - @as(i64, jump_idx);
+    const off26: i32 = @intCast(diff);
+    const uimm: u32 = @as(u32, @bitCast(off26)) & 0x3FFFFFF;
+    code_item.* = (code_item.* & ~((0xFFFF << 10) | 0x3FF)) | ((uimm & 0xFFFF) << 10) | ((uimm >> 16) & 0x3FF);
+}
+
+/// 回填 BEQ/BNE/BLT/BGE/BLTU/BGEU 跳转目标（2RI16-type）。
+fn patchBcc(code_item: *u32, jump_idx: u32, target_idx: u32) void {
+    const diff: i64 = @as(i64, target_idx) - @as(i64, jump_idx);
+    const off16: i32 = @intCast(diff);
+    const uimm: u32 = @as(u32, @bitCast(off16)) & 0xFFFF;
+    code_item.* = (code_item.* & ~(0xFFFF << 10)) | (uimm << 10);
+}
+
+/// 回填 BEQZ/BNEZ/BCEQZ/BCNEZ 跳转目标（1RI21-type）。
+fn patchBz(code_item: *u32, jump_idx: u32, target_idx: u32) void {
+    const diff: i64 = @as(i64, target_idx) - @as(i64, jump_idx);
+    const off21: i32 = @intCast(diff);
+    const uimm: u32 = @as(u32, @bitCast(off21)) & 0x1FFFFF;
+    code_item.* = (code_item.* & ~((0xFFFF << 10) | 0x1F)) | ((uimm & 0xFFFF) << 10) | ((uimm >> 16) & 0x1F);
+}
+
+/// 编译 IR 函数为 LoongArch64 机器码。
+pub fn compile(
+    allocator: std.mem.Allocator,
+    func: *const ir.IRFunction,
+    exec_mem: *mem.ExecMemory,
+    func_entries: []const usize,
+) !usize {
+    // 寄存器分配（GPR + FPR 类型感知）
+    var alloc_result = try regalloc.allocate(allocator, func, &AVAIL_GPRS, &AVAIL_FPRS);
+    defer alloc_result.deinit();
+
+    var cg = Codegen.init(allocator, &alloc_result);
+    defer cg.deinit();
+
+    // ════════ 函数 prologue ════════
+    // 保存 ra 和 fp，建立 16 字节栈帧
+    // addi.d sp, sp, -16
+    try cg.emit(enc2RI12(OP2RI12.ADDI_D, GPR.sp, GPR.sp, -16));
+    // st.d ra, sp, 8
+    try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.ra, GPR.sp, 8));
+    // st.d fp, sp, 0
+    try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.fp, GPR.sp, 0));
+    // addi.d fp, sp, 16
+    try cg.emit(enc2RI12(OP2RI12.ADDI_D, GPR.fp, GPR.sp, 16));
+
+    // ════════ 函数体 ════════
+    for (func.insts.items) |inst| {
+        switch (inst.op) {
+            .label => {
+                try cg.label_offsets.put(inst.label, cg.currentOffset());
+            },
+
+            .const_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const uval: u64 = @bitCast(inst.imm);
+                try loadImm64Cg(&cg, rd, uval);
+            },
+
+            .const_f64 => {
+                // 加载 imm64 到 GPR t0，再用 movgr2fr.d 移到 FPR
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const uval: u64 = @bitCast(inst.imm);
+                try loadImm64Cg(&cg, GPR.t0, uval);
+                try cg.emit(cgMovgr2frD(rd, GPR.t0));
+            },
+
+            .const_f32 => {
+                // 加载 imm32 到 GPR t0（高位补0），再用 movgr2fr.d 移到 FPR
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const uval: u64 = @bitCast(inst.imm);
+                try loadImm64Cg(&cg, GPR.t0, uval);
+                try cg.emit(cgMovgr2frD(rd, GPR.t0));
+            },
+
+            .const_bool => {
+                const rd = cg.resolveReg(inst.dst);
+                if (inst.imm != 0) {
+                    // addi.d rd, zero, 1
+                    try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                } else {
+                    // addi.d rd, zero, 0
+                    try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                }
+            },
+
+            // ── i64 算术 ──
+            .add_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.ADD_D, rd, rj, rk));
+            },
+            .sub_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.SUB_D, rd, rj, rk));
+            },
+            .mul_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.MUL_D, rd, rj, rk));
+            },
+            .div_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.DIV_D, rd, rj, rk));
+            },
+            .rem_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.MOD_D, rd, rj, rk));
+            },
+            .neg_i64 => {
+                // neg rd, rs = sub.d rd, zero, rs
+                const rd = cg.resolveReg(inst.dst);
+                const rs1 = cg.resolveReg(inst.a.vreg);
+                try cg.emit(enc3R(OP3R.SUB_D, rd, GPR.zero, rs1));
+            },
+
+            // ── i64 位运算 ──
+            .and_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.AND, rd, rj, rk));
+            },
+            .or_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.OR, rd, rj, rk));
+            },
+            .xor_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.XOR, rd, rj, rk));
+            },
+            .not_i64 => {
+                // not rd, rs = nor rd, rs, zero
+                const rd = cg.resolveReg(inst.dst);
+                const rs1 = cg.resolveReg(inst.a.vreg);
+                try cg.emit(enc3R(OP3R.NOR, rd, rs1, GPR.zero));
+            },
+
+            // ── i64 比较 → bool（结果为 0/1）──
+            .eq_i64 => {
+                // slt t0, zero, sub(rd=rj-rk); 但 LoongArch 没有 sub 后自动设置条件
+                // 用: sub.d t0, rj, rk; sltui rd, t0, 1 (rd = t0 < 1 ? 1:0 = t0==0 ? 1:0)
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.SUB_D, GPR.t0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.SLTUI, rd, GPR.t0, 1));
+            },
+            .neq_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.SUB_D, GPR.t0, rj, rk));
+                // sltu rd, zero, t0 (rd = 0 < t0 ? 1:0 = t0 != 0 ? 1:0)
+                try cg.emit(enc3R(OP3R.SLTU, rd, GPR.zero, GPR.t0));
+            },
+            .lt_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.SLT, rd, rj, rk));
+            },
+            .gt_i64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.SLT, rd, rk, rj));
+            },
+            .le_i64 => {
+                // le = !(a > b) = !(b < a): slt rd, rk, rj; xori rd, rd, 1
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.SLT, rd, rk, rj));
+                try cg.emit(enc2RI12(OP2RI12.XORI, rd, rd, 1));
+            },
+            .ge_i64 => {
+                // ge = !(a < b): slt rd, rj, rk; xori rd, rd, 1
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(enc3R(OP3R.SLT, rd, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.XORI, rd, rd, 1));
+            },
+
+            // ── 布尔逻辑 ──
+            .bool_not => {
+                // rd = rs ^ 1
+                const rd = cg.resolveReg(inst.dst);
+                const rs1 = cg.resolveReg(inst.a.vreg);
+                try cg.emit(enc2RI12(OP2RI12.XORI, rd, rs1, 1));
+            },
+
+            // ── 数据移动 ──
+            .move => {
+                const rd = cg.resolveReg(inst.dst);
+                const rs1 = cg.resolveReg(inst.a.vreg);
+                if (rd != rs1) {
+                    if (inst.dst.type.isFloat()) {
+                        if (inst.dst.type == .f32) {
+                            try cg.emit(cgFmovS(rd, rs1));
+                        } else {
+                            try cg.emit(cgFmovD(rd, rs1));
+                        }
+                    } else {
+                        // move rd, rs = or rd, rs, zero
+                        try cg.emit(enc3R(OP3R.OR, rd, rs1, GPR.zero));
+                    }
+                }
+            },
+
+            // ── 类型转换 ──
+            .i32_to_i64 => {
+                // 符号扩展：slli.d rd, rs, 32; sra.d rd, rd, 32
+                const rd = cg.resolveReg(inst.dst);
+                const rs1 = cg.resolveReg(inst.a.vreg);
+                // 加载 32 到 t0
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, GPR.t0, GPR.zero, 32));
+                try cg.emit(enc3R(OP3R.SLL_D, rd, rs1, GPR.t0));
+                try cg.emit(enc3R(OP3R.SRA_D, rd, rd, GPR.t0));
+            },
+            .i64_to_f64 => {
+                // ffint.d.l fd, rj (int64 → double)
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const rs1 = cg.resolveReg(inst.a.vreg); // GPR
+                try cg.emit(cgFfintDL(rd, rs1));
+            },
+            .f64_to_i64 => {
+                // ftintrz.l.d fd, fj (double → int64 trunc); movfr2gr.d rd, fd
+                const rd = cg.resolveReg(inst.dst); // GPR
+                const rs1 = cg.resolveReg(inst.a.vreg); // FPR
+                // ftintrz.l.d 结果在 FPR，需要 movfr2gr.d 移到 GPR
+                try cg.emit(cgFtintrzLD(FPR.ft0, rs1));
+                try cg.emit(cgMovfr2grD(rd, FPR.ft0));
+            },
+            .i64_to_f32 => {
+                // ffint.d.l + fcvt.s.d
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const rs1 = cg.resolveReg(inst.a.vreg); // GPR
+                try cg.emit(cgFfintDL(FPR.ft0, rs1));
+                try cg.emit(cgFcvtSD(rd, FPR.ft0));
+            },
+            .f32_to_i64 => {
+                // fcvt.d.s + ftintrz.l.d + movfr2gr.d
+                const rd = cg.resolveReg(inst.dst); // GPR
+                const rs1 = cg.resolveReg(inst.a.vreg); // FPR
+                try cg.emit(cgFcvtDS(FPR.ft0, rs1));
+                try cg.emit(cgFtintrzLD(FPR.ft0, FPR.ft0));
+                try cg.emit(cgMovfr2grD(rd, FPR.ft0));
+            },
+            .f32_to_f64 => {
+                // fcvt.d.s fd, fj
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const rs1 = cg.resolveReg(inst.a.vreg); // FPR
+                try cg.emit(cgFcvtDS(rd, rs1));
+            },
+            .f64_to_f32 => {
+                // fcvt.s.d fd, fj
+                const rd = cg.resolveReg(inst.dst); // FPR
+                const rs1 = cg.resolveReg(inst.a.vreg); // FPR
+                try cg.emit(cgFcvtSD(rd, rs1));
+            },
+
+            // ── 控制流 ──
+            .jump => {
+                // b offs26 → 待回填
+                const fixup_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0)); // 占位
+                try cg.pending_fixups.append(cg.allocator, .{
+                    .code_idx = fixup_idx,
+                    .target_label = inst.label,
+                    .fixup_kind = 1, // I26
+                });
+            },
+            .branch => {
+                // branch cond, true_label, false_label
+                // cond 为布尔值(0/1)，非零跳转到 true_label，否则跳转到 false_label
+                const cond_reg = cg.resolveReg(inst.a.vreg);
+                const false_label: u32 = @truncate(@as(u64, @bitCast(inst.imm)));
+
+                // bne cond, zero, true_label (待回填)
+                const fixup_true = cg.currentOffset();
+                // bne rj=cond, rd=zero, offs16
+                try cg.emit((@as(u32, OPBR.BNE) << 26) | (@as(u32, cond_reg) << 5) | GPR.zero);
+                try cg.pending_fixups.append(cg.allocator, .{
+                    .code_idx = fixup_true,
+                    .target_label = inst.label, // true_label
+                    .fixup_kind = 2, // Bcc
+                });
+
+                // b false_label (待回填)
+                const fixup_false = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0)); // 占位
+                try cg.pending_fixups.append(cg.allocator, .{
+                    .code_idx = fixup_false,
+                    .target_label = false_label,
+                    .fixup_kind = 1, // I26
+                });
+            },
+
+            // ── 函数参数加载 ──
+            .load_arg => {
+                // 整数参数在 a0-a7(r4-r11)，浮点参数在 fa0-fa7(f0-f7)
+                const arg_idx: u8 = @intCast(inst.imm);
+                const rd = cg.resolveReg(inst.dst);
+                const arg_ty = func.arg_types[arg_idx];
+                if (arg_ty.isFloat()) {
+                    const arg_reg: u8 = FPR.fa0 + arg_idx;
+                    if (rd != arg_reg) {
+                        if (arg_ty == .f32) {
+                            try cg.emit(cgFmovS(rd, arg_reg));
+                        } else {
+                            try cg.emit(cgFmovD(rd, arg_reg));
+                        }
+                    }
+                } else {
+                    const arg_reg: u8 = GPR.a0 + arg_idx;
+                    if (rd != arg_reg) {
+                        // move rd, arg = or rd, arg, zero
+                        try cg.emit(enc3R(OP3R.OR, rd, arg_reg, GPR.zero));
+                    }
+                }
+            },
+
+            // ── 函数返回 ──
+            .return_val => {
+                // 整数返回值在 a0(r4)，浮点返回值在 fa0(f0)
+                const rn = cg.resolveReg(inst.a.vreg);
+                if (inst.a.vreg.type.isFloat()) {
+                    if (rn != FPR.fa0) {
+                        if (inst.a.vreg.type == .f32) {
+                            try cg.emit(cgFmovS(FPR.fa0, rn));
+                        } else {
+                            try cg.emit(cgFmovD(FPR.fa0, rn));
+                        }
+                    }
+                } else {
+                    if (rn != GPR.a0) {
+                        try cg.emit(enc3R(OP3R.OR, GPR.a0, rn, GPR.zero));
+                    }
+                }
+                // 函数 epilogue
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.ra, GPR.sp, 8));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.fp, GPR.sp, 0));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, GPR.sp, GPR.sp, 16));
+                // jirl r0, ra, 0 (return)
+                try cg.emit(enc2RI16(OPBR.JIRL, GPR.zero, GPR.ra, 0));
+            },
+            .return_void => {
+                // 函数 epilogue
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.ra, GPR.sp, 8));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.fp, GPR.sp, 0));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, GPR.sp, GPR.sp, 16));
+                try cg.emit(enc2RI16(OPBR.JIRL, GPR.zero, GPR.ra, 0));
+            },
+
+            // ── 函数调用 ──
+            .call => {
+                // JIT 内函数调用：JIT 不遵循标准 ABI，callee 不保存 callee-saved 寄存器，
+                // 因此 caller 必须保存所有 JIT 使用的寄存器。
+                // AVAIL_GPRS: t0-t8(9) + s0-s8(9) = 18 个 GPR
+                // AVAIL_FPRS: ft0-ft15(16) = 16 个 FPR
+                // 共 34 个寄存器 × 8 字节 = 272 字节，16 字节对齐 = 288 字节
+                const target_idx = inst.call_target;
+                if (target_idx >= func_entries.len or func_entries[target_idx] == 0) {
+                    return error.JitCallTargetNotCompiled;
+                }
+                const entry_addr = func_entries[target_idx];
+
+                // 保存 t0-t8, s0-s8, ft0-ft15 (34 个寄存器 = 272 字节, 对齐到 288)
+                // 栈布局: sp+0..sp+71 = t0-t8(9), sp+72..sp+143 = s0-s8(9),
+                //         sp+144..sp+271 = ft0-ft15(16), sp+272..sp+287 = padding
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, GPR.sp, GPR.sp, -288));
+                // 保存 t0-t8 (r12-r20)
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t0, GPR.sp, 0));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t1, GPR.sp, 8));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t2, GPR.sp, 16));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t3, GPR.sp, 24));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t4, GPR.sp, 32));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t5, GPR.sp, 40));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t6, GPR.sp, 48));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t7, GPR.sp, 56));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.t8, GPR.sp, 64));
+                // 保存 s0-s8 (r23-r31)
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s0, GPR.sp, 72));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s1, GPR.sp, 80));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s2, GPR.sp, 88));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s3, GPR.sp, 96));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s4, GPR.sp, 104));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s5, GPR.sp, 112));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s6, GPR.sp, 120));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s7, GPR.sp, 128));
+                try cg.emit(enc2RI12(OP2RI12.ST_D, GPR.s8, GPR.sp, 136));
+                // 保存 ft0-ft15 (f8-f23)
+                try cg.emit(cgFstD(FPR.ft0, GPR.sp, 144));
+                try cg.emit(cgFstD(FPR.ft1, GPR.sp, 152));
+                try cg.emit(cgFstD(FPR.ft2, GPR.sp, 160));
+                try cg.emit(cgFstD(FPR.ft3, GPR.sp, 168));
+                try cg.emit(cgFstD(FPR.ft4, GPR.sp, 176));
+                try cg.emit(cgFstD(FPR.ft5, GPR.sp, 184));
+                try cg.emit(cgFstD(FPR.ft6, GPR.sp, 192));
+                try cg.emit(cgFstD(FPR.ft7, GPR.sp, 200));
+                try cg.emit(cgFstD(FPR.ft8, GPR.sp, 208));
+                try cg.emit(cgFstD(FPR.ft9, GPR.sp, 216));
+                try cg.emit(cgFstD(FPR.ft10, GPR.sp, 224));
+                try cg.emit(cgFstD(FPR.ft11, GPR.sp, 232));
+                try cg.emit(cgFstD(FPR.ft12, GPR.sp, 240));
+                try cg.emit(cgFstD(FPR.ft13, GPR.sp, 248));
+                try cg.emit(cgFstD(FPR.ft14, GPR.sp, 256));
+                try cg.emit(cgFstD(FPR.ft15, GPR.sp, 264));
+
+                // 移动参数到 a0-a7（整数）/ fa0-fa7（浮点）
+                const argc = inst.call_argc;
+                if (argc > 8) return error.JitTooManyArgs;
+                var i: u8 = 0;
+                while (i < argc) : (i += 1) {
+                    const arg_vreg = inst.call_args[i];
+                    const arg_reg = cg.resolveReg(arg_vreg);
+                    if (arg_vreg.type.isFloat()) {
+                        const target_reg: u8 = FPR.fa0 + i;
+                        if (arg_reg != target_reg) {
+                            if (arg_vreg.type == .f32) {
+                                try cg.emit(cgFmovS(target_reg, arg_reg));
+                            } else {
+                                try cg.emit(cgFmovD(target_reg, arg_reg));
+                            }
+                        }
+                    } else {
+                        const target_reg: u8 = GPR.a0 + i;
+                        if (arg_reg != target_reg) {
+                            try cg.emit(enc3R(OP3R.OR, target_reg, arg_reg, GPR.zero));
+                        }
+                    }
+                }
+
+                // 加载目标入口地址到 t0
+                const addr: u64 = @intCast(entry_addr);
+                try loadImm64Cg(&cg, GPR.t0, addr);
+
+                // jirl ra, t0, 0（调用函数，ra 保存返回地址）
+                try cg.emit(enc2RI16(OPBR.JIRL, GPR.ra, GPR.t0, 0));
+
+                // 恢复 t0-t8, s0-s8, ft0-ft15（在移动返回值之前）
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t0, GPR.sp, 0));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t1, GPR.sp, 8));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t2, GPR.sp, 16));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t3, GPR.sp, 24));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t4, GPR.sp, 32));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t5, GPR.sp, 40));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t6, GPR.sp, 48));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t7, GPR.sp, 56));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.t8, GPR.sp, 64));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s0, GPR.sp, 72));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s1, GPR.sp, 80));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s2, GPR.sp, 88));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s3, GPR.sp, 96));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s4, GPR.sp, 104));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s5, GPR.sp, 112));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s6, GPR.sp, 120));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s7, GPR.sp, 128));
+                try cg.emit(enc2RI12(OP2RI12.LD_D, GPR.s8, GPR.sp, 136));
+                try cg.emit(cgFldD(FPR.ft0, GPR.sp, 144));
+                try cg.emit(cgFldD(FPR.ft1, GPR.sp, 152));
+                try cg.emit(cgFldD(FPR.ft2, GPR.sp, 160));
+                try cg.emit(cgFldD(FPR.ft3, GPR.sp, 168));
+                try cg.emit(cgFldD(FPR.ft4, GPR.sp, 176));
+                try cg.emit(cgFldD(FPR.ft5, GPR.sp, 184));
+                try cg.emit(cgFldD(FPR.ft6, GPR.sp, 192));
+                try cg.emit(cgFldD(FPR.ft7, GPR.sp, 200));
+                try cg.emit(cgFldD(FPR.ft8, GPR.sp, 208));
+                try cg.emit(cgFldD(FPR.ft9, GPR.sp, 216));
+                try cg.emit(cgFldD(FPR.ft10, GPR.sp, 224));
+                try cg.emit(cgFldD(FPR.ft11, GPR.sp, 232));
+                try cg.emit(cgFldD(FPR.ft12, GPR.sp, 240));
+                try cg.emit(cgFldD(FPR.ft13, GPR.sp, 248));
+                try cg.emit(cgFldD(FPR.ft14, GPR.sp, 256));
+                try cg.emit(cgFldD(FPR.ft15, GPR.sp, 264));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, GPR.sp, GPR.sp, 288));
+
+                // 移动返回值到目标寄存器（在恢复寄存器之后，避免被覆盖）
+                const dst = cg.resolveReg(inst.dst);
+                if (inst.dst.type.isFloat()) {
+                    if (dst != FPR.fa0) {
+                        if (inst.dst.type == .f32) {
+                            try cg.emit(cgFmovS(dst, FPR.fa0));
+                        } else {
+                            try cg.emit(cgFmovD(dst, FPR.fa0));
+                        }
+                    }
+                } else {
+                    if (dst != GPR.a0) {
+                        try cg.emit(enc3R(OP3R.OR, dst, GPR.a0, GPR.zero));
+                    }
+                }
+            },
+
+            // ════════ 浮点算术（f64）════════
+            .add_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFaddD(rd, rj, rk));
+            },
+            .sub_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFsubD(rd, rj, rk));
+            },
+            .mul_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFmulD(rd, rj, rk));
+            },
+            .div_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFdivD(rd, rj, rk));
+            },
+            .neg_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rs1 = cg.resolveReg(inst.a.vreg);
+                try cg.emit(cgFnegD(rd, rs1));
+            },
+
+            // ════════ 浮点算术（f32）════════
+            .add_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFaddS(rd, rj, rk));
+            },
+            .sub_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFsubS(rd, rj, rk));
+            },
+            .mul_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFmulS(rd, rj, rk));
+            },
+            .div_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFdivS(rd, rj, rk));
+            },
+            .neg_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rs1 = cg.resolveReg(inst.a.vreg);
+                try cg.emit(cgFnegS(rd, rs1));
+            },
+
+            // ════════ 浮点比较（f64）→ bool ════════
+            // LoongArch FCMP 结果写入 FCC 寄存器，需要 BCEQZ/BCNEZ 转换为 GPR 0/1。
+            // 模式: addi.d rd, zero, 0; [BCNEZ|BCEQZ] cj=0, set_true; b done;
+            //      set_true: addi.d rd, zero, 1; done:
+            .eq_f64 => {
+                const rd = cg.resolveReg(inst.dst); // GPR
+                const rj = cg.resolveReg(inst.a.vreg); // FPR
+                const rk = cg.resolveReg(inst.b.vreg); // FPR
+                try cg.emit(cgFcmpCeqD(0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0)); // FCC0 != 0 → 条件为真
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0)); // 跳过 set_true
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .neq_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCeqD(0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBceqz(0)); // FCC0 == 0 → 不相等 → 条件为真
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .lt_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCltD(0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .le_f64 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCleD(0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .gt_f64 => {
+                // gt(a,b) = lt(b,a)
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCltD(0, rk, rj));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .ge_f64 => {
+                // ge(a,b) = le(b,a)
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCleD(0, rk, rj));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+
+            // ════════ 浮点比较（f32）→ bool ════════
+            .eq_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCeqS(0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .neq_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCeqS(0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBceqz(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .lt_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCltS(0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .le_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCleS(0, rj, rk));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .gt_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCltS(0, rk, rj));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+            .ge_f32 => {
+                const rd = cg.resolveReg(inst.dst);
+                const rj = cg.resolveReg(inst.a.vreg);
+                const rk = cg.resolveReg(inst.b.vreg);
+                try cg.emit(cgFcmpCleS(0, rk, rj));
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 0));
+                const bz_idx = cg.currentOffset();
+                try cg.emit(cgBcnez(0));
+                const b_idx = cg.currentOffset();
+                try cg.emit(encI26(OPBR.B, 0));
+                const set_true_idx = cg.currentOffset();
+                try cg.emit(enc2RI12(OP2RI12.ADDI_D, rd, GPR.zero, 1));
+                const done_idx = cg.currentOffset();
+                patchBz(&cg.code.items[bz_idx], bz_idx, set_true_idx);
+                patchI26(&cg.code.items[b_idx], b_idx, done_idx);
+            },
+        }
+    }
+
+    // ════════ 回填跳转目标 ════════
+    for (cg.pending_fixups.items) |fixup| {
+        const target_offset = cg.label_offsets.get(fixup.target_label) orelse {
+            return error.JitMissingLabel;
+        };
+        const current_offset = fixup.code_idx;
+
+        switch (fixup.fixup_kind) {
+            1 => patchI26(&cg.code.items[fixup.code_idx], current_offset, target_offset),
+            2 => patchBcc(&cg.code.items[fixup.code_idx], current_offset, target_offset),
+            3 => patchBz(&cg.code.items[fixup.code_idx], current_offset, target_offset),
+            else => return error.JitUnknownFixupKind,
+        }
+    }
+
+    // ════════ 写入可执行内存 ════════
+    const code_bytes = cg.code.items.len * 4;
+    const dst = exec_mem.alloc(code_bytes) orelse return error.JitOutOfExecMemory;
+    for (cg.code.items, 0..) |enc, i| {
+        const ptr: *u32 = @ptrCast(@alignCast(dst + i * 4));
+        ptr.* = enc;
+    }
+
+    return @intFromPtr(dst);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// IR 模式后端接口
+// ════════════════════════════════════════════════════════════════════
+
+/// IR 模式后端实例（供 IR 编译路径使用）。
+pub const ir_backend_instance: backend_mod.Backend = .{
+    .availableGPRs = &AVAIL_GPRS,
+    .availableFPRs = &AVAIL_FPRS,
+    .compileFn = compileWrapper,
+};
+
+fn compileWrapper(
+    _: *const backend_mod.Backend,
+    allocator: std.mem.Allocator,
+    func: *const ir.IRFunction,
+    exec_mem: *mem.ExecMemory,
+    func_entries: []const usize,
+) !usize {
+    return compile(allocator, func, exec_mem, func_entries);
 }

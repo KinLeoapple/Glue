@@ -15,6 +15,7 @@ const reg_chunk = reg_vm.reg_chunk_mod;
 pub const Type = enum {
     i32,
     i64,
+    f32,
     f64,
     boolean,
     unit,
@@ -24,10 +25,15 @@ pub const Type = enum {
     /// 返回该类型在机器上的字节大小。
     pub fn sizeOf(self: Type) usize {
         return switch (self) {
-            .i32, .boolean => 4,
+            .i32, .boolean, .f32 => 4,
             .i64, .f64, .ptr => 8,
             .unit => 0,
         };
+    }
+
+    /// 是否为浮点类型
+    pub fn isFloat(self: Type) bool {
+        return self == .f32 or self == .f64;
     }
 };
 
@@ -35,7 +41,8 @@ pub const Type = enum {
 pub const Opcode = enum {
     // 常量加载
     const_i64, // dst = imm64
-    const_f64, // dst = imm64 (bitcast)
+    const_f64, // dst = imm64 (bitcast to f64)
+    const_f32, // dst = imm32 (低 32 位 bitcast to f32)
     const_bool, // dst = imm1
 
     // 算术（i64）
@@ -59,6 +66,13 @@ pub const Opcode = enum {
     div_f64,
     neg_f64,
 
+    // 算术（f32）
+    add_f32,
+    sub_f32,
+    mul_f32,
+    div_f32,
+    neg_f32,
+
     // 比较（i64）→ bool
     eq_i64,
     neq_i64,
@@ -75,10 +89,22 @@ pub const Opcode = enum {
     gt_f64,
     ge_f64,
 
+    // 比较（f32）→ bool
+    eq_f32,
+    neq_f32,
+    lt_f32,
+    le_f32,
+    gt_f32,
+    ge_f32,
+
     // 类型转换
     i32_to_i64, // 符号扩展
-    i64_to_f64, // 整数转浮点
+    i64_to_f64, // 整数转浮点（double）
     f64_to_i64, // 浮点转整数
+    i64_to_f32, // 整数转浮点（single）
+    f32_to_i64, // 单精度浮点转整数
+    f32_to_f64, // 单精度→双精度
+    f64_to_f32, // 双精度→单精度
 
     // 布尔逻辑
     bool_not,
@@ -200,6 +226,7 @@ pub const LiftResult = union(enum) {
 fn typeNameToIRType(name: []const u8) ?Type {
     if (std.mem.eql(u8, name, "i64")) return .i64;
     if (std.mem.eql(u8, name, "i32")) return .i32;
+    if (std.mem.eql(u8, name, "f32")) return .f32;
     if (std.mem.eql(u8, name, "f64")) return .f64;
     if (std.mem.eql(u8, name, "bool")) return .boolean;
     if (std.mem.eql(u8, name, "unit")) return .unit;
@@ -230,7 +257,11 @@ fn inferRegTypes(func: *const reg_chunk.RegFunction, reg_types: []Type) Type {
                         if (iv.type != .i128) reg_types[a] = .i64;
                     },
                     .float => |fv| {
-                        if (fv.type == .f64) reg_types[a] = .f64;
+                        reg_types[a] = switch (fv.type) {
+                            .f32 => .f32,
+                            .f64 => .f64,
+                            else => .i64, // f8/f16/f128 走桥接，标记为 i64 让 lift 失败
+                        };
                     },
                     .boolean => reg_types[a] = .boolean,
                     else => {},
@@ -247,10 +278,18 @@ fn inferRegTypes(func: *const reg_chunk.RegFunction, reg_types: []Type) Type {
             },
             .add, .sub, .mul, .div, .mod => {
                 if (a >= reg_types.len) continue;
-                // 算术运算结果与操作数相同
+                // 算术运算结果与操作数相同（f32 优先于 f64）
+                const lhs_f32 = b < reg_types.len and reg_types[b] == .f32;
+                const rhs_f32 = c < reg_types.len and reg_types[c] == .f32;
                 const lhs_f64 = b < reg_types.len and reg_types[b] == .f64;
                 const rhs_f64 = c < reg_types.len and reg_types[c] == .f64;
-                if (lhs_f64 or rhs_f64) {
+                if (lhs_f32 and rhs_f32) {
+                    reg_types[a] = .f32;
+                } else if (lhs_f64 and rhs_f64) {
+                    reg_types[a] = .f64;
+                } else if (lhs_f32 or rhs_f32) {
+                    reg_types[a] = .f32;
+                } else if (lhs_f64 or rhs_f64) {
                     reg_types[a] = .f64;
                 } else if (b < reg_types.len) {
                     reg_types[a] = reg_types[b];
@@ -386,11 +425,18 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
                         try ir.append(.{ .op = .const_i64, .dst = dst, .imm = val });
                     },
                     .float => |fv| {
-                        if (fv.type == .f64) {
-                            const bits: i64 = @bitCast(fv.bits);
-                            try ir.append(.{ .op = .const_f64, .dst = dst, .imm = bits });
-                        } else {
-                            return .{ .unsupported = .load_const };
+                        switch (fv.type) {
+                            .f64 => {
+                                const bits: i64 = @bitCast(fv.bits);
+                                try ir.append(.{ .op = .const_f64, .dst = dst, .imm = bits });
+                            },
+                            .f32 => {
+                                // f32 的 bits 存储在低 32 位，扩展为 i64 立即数
+                                const bits32: u32 = @truncate(fv.bits);
+                                const bits: i64 = @intCast(bits32);
+                                try ir.append(.{ .op = .const_f32, .dst = dst, .imm = bits });
+                            },
+                            else => return .{ .unsupported = .load_const },
                         }
                     },
                     .boolean => {
@@ -421,18 +467,40 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
                 });
             },
 
-            // i64 算术
+            // i64/f64/f32 算术（按操作数类型分派）
             .add, .sub, .mul, .div, .mod => {
                 const lhs = reg_map.items[b];
                 const rhs = reg_map.items[c];
                 const dst = reg_map.items[a];
-                const ir_op: Opcode = switch (op) {
-                    .add => .add_i64,
-                    .sub => .sub_i64,
-                    .mul => .mul_i64,
-                    .div => .div_i64,
-                    .mod => .rem_i64,
-                    else => unreachable,
+                const lhs_ty: Type = if (b < reg_types.len) reg_types[b] else .i64;
+                const rhs_ty: Type = if (c < reg_types.len) reg_types[c] else .i64;
+                // mod 仅整数支持
+                if (op == .mod and (lhs_ty.isFloat() or rhs_ty.isFloat())) {
+                    return .{ .unsupported = op };
+                }
+                const ir_op: Opcode = blk: {
+                    if (lhs_ty == .f32 or rhs_ty == .f32) break :blk switch (op) {
+                        .add => .add_f32,
+                        .sub => .sub_f32,
+                        .mul => .mul_f32,
+                        .div => .div_f32,
+                        else => unreachable,
+                    };
+                    if (lhs_ty == .f64 or rhs_ty == .f64) break :blk switch (op) {
+                        .add => .add_f64,
+                        .sub => .sub_f64,
+                        .mul => .mul_f64,
+                        .div => .div_f64,
+                        else => unreachable,
+                    };
+                    break :blk switch (op) {
+                        .add => .add_i64,
+                        .sub => .sub_i64,
+                        .mul => .mul_i64,
+                        .div => .div_i64,
+                        .mod => .rem_i64,
+                        else => unreachable,
+                    };
                 };
                 try ir.append(.{
                     .op = ir_op,
@@ -442,10 +510,16 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
                 });
             },
 
-            // 整数取反
+            // 取反（按操作数类型分派）
             .neg => {
+                const src_ty: Type = if (b < reg_types.len) reg_types[b] else .i64;
+                const ir_op: Opcode = switch (src_ty) {
+                    .f32 => .neg_f32,
+                    .f64 => .neg_f64,
+                    else => .neg_i64,
+                };
                 try ir.append(.{
-                    .op = .neg_i64,
+                    .op = ir_op,
                     .dst = reg_map.items[a],
                     .a = .{ .vreg = reg_map.items[b] },
                 });
@@ -470,19 +544,41 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
                 });
             },
 
-            // i64 比较
+            // 比较（按操作数类型分派 i64/f64/f32）
             .eq, .neq, .lt, .gt, .le, .ge => {
                 const lhs = reg_map.items[b];
                 const rhs = reg_map.items[c];
                 const dst = reg_map.items[a];
-                const ir_op: Opcode = switch (op) {
-                    .eq => .eq_i64,
-                    .neq => .neq_i64,
-                    .lt => .lt_i64,
-                    .gt => .gt_i64,
-                    .le => .le_i64,
-                    .ge => .ge_i64,
-                    else => unreachable,
+                const lhs_ty: Type = if (b < reg_types.len) reg_types[b] else .i64;
+                const rhs_ty: Type = if (c < reg_types.len) reg_types[c] else .i64;
+                const ir_op: Opcode = blk: {
+                    if (lhs_ty == .f32 or rhs_ty == .f32) break :blk switch (op) {
+                        .eq => .eq_f32,
+                        .neq => .neq_f32,
+                        .lt => .lt_f32,
+                        .gt => .gt_f32,
+                        .le => .le_f32,
+                        .ge => .ge_f32,
+                        else => unreachable,
+                    };
+                    if (lhs_ty == .f64 or rhs_ty == .f64) break :blk switch (op) {
+                        .eq => .eq_f64,
+                        .neq => .neq_f64,
+                        .lt => .lt_f64,
+                        .gt => .gt_f64,
+                        .le => .le_f64,
+                        .ge => .ge_f64,
+                        else => unreachable,
+                    };
+                    break :blk switch (op) {
+                        .eq => .eq_i64,
+                        .neq => .neq_i64,
+                        .lt => .lt_i64,
+                        .gt => .gt_i64,
+                        .le => .le_i64,
+                        .ge => .ge_i64,
+                        else => unreachable,
+                    };
                 };
                 try ir.append(.{
                     .op = ir_op,
@@ -514,12 +610,19 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
                     switch (target_ty) {
                         .i64 => break :blk switch (src_ty) {
                             .f64 => .f64_to_i64,
+                            .f32 => .f32_to_i64,
                             .i32 => .i32_to_i64,
                             else => .i32_to_i64,
                         },
                         .f64 => break :blk switch (src_ty) {
-                            .f64 => .move,
+                            .f32 => .f32_to_f64,
+                            .i32, .i64 => .i64_to_f64,
                             else => .i64_to_f64,
+                        },
+                        .f32 => break :blk switch (src_ty) {
+                            .f64 => .f64_to_f32,
+                            .i32, .i64 => .i64_to_f32,
+                            else => .i64_to_f32,
                         },
                         .i32 => break :blk .move,
                         else => break :blk null,

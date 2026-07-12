@@ -138,11 +138,15 @@ pub fn allocExec(size: usize) !ExecMemory {
 
 /// 刷新指令缓存，确保 JIT 生成的机器码对 CPU 可见。
 /// ARM64 不保证指令缓存与数据缓存的一致性，必须显式刷新。
+/// RISC-V 需要通过 FENCE.I 指令刷新指令缓存。
 /// x86-64 硬件保证缓存一致性，此函数为空操作。
 fn flushIcache(start: [*]u8, len: usize) void {
     switch (builtin.cpu.arch) {
         .aarch64 => {
             flushIcacheArm64(start, len);
+        },
+        .riscv64 => {
+            flushIcacheRiscv64(start, len);
         },
         .x86_64 => {
             // x86-64 硬件保证指令缓存一致性，无需刷新
@@ -198,6 +202,22 @@ fn flushIcacheArm64(start: [*]u8, len: usize) void {
             asm volatile ("isb" ::: "memory");
         },
     }
+}
+
+/// RISC-V 64 指令缓存刷新。
+/// RISC-V 使用 FENCE.I 指令确保指令缓存与数据缓存一致性。
+/// 在用户态下，FENCE.I 刷新当前 hart 的指令缓存。
+/// 注意：某些多核系统可能需要额外的 RISC-V CMO 扩展支持，
+/// 但对于单核 QEMU 用户态模拟，FENCE.I 足够。
+fn flushIcacheRiscv64(start: [*]u8, len: usize) void {
+    _ = start;
+    _ = len;
+    // FENCE.I: 指令同步屏障，确保后续取指看到最新写入的指令。
+    // 编码: imm=0, rs1=0, funct3=001, rd=0, opcode=0001111
+    // 等价于 .word 0x0000100f
+    asm volatile (
+        \\fence.i
+        :::.{ .memory = true });
 }
 
 test "ExecMemory 分配与写入" {
