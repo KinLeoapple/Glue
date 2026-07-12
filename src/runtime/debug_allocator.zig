@@ -1,40 +1,30 @@
-//! 自实现 DebugAllocator：在 c_allocator（libc malloc）之上叠加分配追踪，
-//! deinit 时检测泄漏（未 free 的分配）和 double-free（重复 free 同一指针）。
+//! 调试分配器模块。
 //!
-//! 替代 std.heap.DebugAllocator，避免依赖 Zig 原生分配器实现。
-//! backing 为 std.heap.c_allocator（libc malloc/free），精确按需分配字节数。
-//!
-//! 用法：
-//!   var dbg = DebugAllocator.init();
-//!   defer _ = dbg.deinit();  // 报告泄漏
-//!   const alloc = dbg.allocator();
-//!
-//! 线程安全：内部 Mutex 保护 alloc_map。单线程场景（VM 主线程）可用 initSingleThreaded 跳过锁。
+//! 在底层分配器之上叠加分配追踪，用于检测内存泄漏、双重释放与长度不匹配。
+//! 每次分配记录地址、长度、对齐与调用点；释放时校验并从映射中移除。
+//! `deinit` 时若仍有未释放记录则报告泄漏。
 
 const std = @import("std");
-const builtin = @import("builtin");
 const sync = @import("sync");
-
 const Mutex = sync.Mutex;
 
-/// 分配追踪记录
+// 单次分配的追踪记录。
 const AllocRecord = struct {
     len: usize,
-    /// 0 = 无对齐要求（默认指针自然对齐），否则为请求的对齐字节数。
     alignment: usize,
-    /// 分配时的返回地址（用于泄漏堆栈定位）。
     ret_addr: usize,
 };
 
-/// DebugAllocator：c_allocator + 分配追踪 + 泄漏/double-free 检测。
+/// 调试分配器，包装底层分配器并提供泄漏与双重释放检测。
 pub const DebugAllocator = struct {
     backing: std.mem.Allocator,
-    /// 分配指针 → 记录。所有未释放的分配在此。
     alloc_map: std.AutoHashMap(usize, AllocRecord),
-    /// 单线程模式跳过锁。
     single_threaded: bool,
+    /// 是否在检测到泄漏 / 双重释放时打印诊断信息。
+    verbose: bool = true,
     lock: Mutex = .{},
 
+    /// 创建多线程安全的调试分配器，底层使用 C 分配器。
     pub fn init() DebugAllocator {
         return .{
             .backing = std.heap.c_allocator,
@@ -43,6 +33,7 @@ pub const DebugAllocator = struct {
         };
     }
 
+    /// 创建单线程调试分配器，跳过锁操作以减少开销。
     pub fn initSingleThreaded() DebugAllocator {
         return .{
             .backing = std.heap.c_allocator,
@@ -51,38 +42,39 @@ pub const DebugAllocator = struct {
         };
     }
 
-    /// 释放追踪表并检测泄漏。返回 .leak 表示有未释放的分配。
+    /// 释放分配映射。若存在未释放的分配则报告泄漏并返回 `.leak`。
     pub fn deinit(self: *DebugAllocator) LeakReport {
         const leaked_count = self.alloc_map.count();
         if (leaked_count == 0) {
             self.alloc_map.deinit();
             return .ok;
         }
-        // 报告泄漏：输出首个泄漏的地址和大小（避免海量输出）
-        var it = self.alloc_map.iterator();
-        if (it.next()) |entry| {
-            const rec = entry.value_ptr.*;
-            std.debug.print(
-                "[GLUE_DBG] LEAK: addr=0x{x} len={} align={} ret_addr=0x{x}\n",
-                .{ entry.key_ptr.*, rec.len, rec.alignment, rec.ret_addr },
-            );
+        // verbose 模式下打印第一条泄漏记录作为示例，并汇总泄漏总数。
+        if (self.verbose) {
+            var it = self.alloc_map.iterator();
+            if (it.next()) |entry| {
+                const rec = entry.value_ptr.*;
+                std.debug.print(
+                    "[GLUE_DBG] LEAK: addr=0x{x} len={} align={} ret_addr=0x{x}\n",
+                    .{ entry.key_ptr.*, rec.len, rec.alignment, rec.ret_addr },
+                );
+            }
+            std.debug.print("[GLUE_DBG] total leaked allocations: {}\n", .{leaked_count});
         }
-        std.debug.print("[GLUE_DBG] total leaked allocations: {}\n", .{leaked_count});
         self.alloc_map.deinit();
         return .leak;
     }
 
+    /// `deinit` 的检测结果：无泄漏或存在泄漏。
     pub const LeakReport = enum { ok, leak };
 
-    /// 返回 std.mem.Allocator 接口（vtable 委托给 alloc/free/remap 函数）。
+    /// 返回符合 `std.mem.Allocator` 接口的分配器句柄。
     pub fn allocator(self: *DebugAllocator) std.mem.Allocator {
         return .{
             .ptr = self,
             .vtable = &vtable,
         };
     }
-
-    // ── vtable 实现 ──
 
     const vtable: std.mem.Allocator.VTable = .{
         .alloc = &vtableAlloc,
@@ -91,6 +83,7 @@ pub const DebugAllocator = struct {
         .free = &vtableFree,
     };
 
+    // 分配并记录到映射，检测地址冲突。
     fn vtableAlloc(
         ctx: *anyopaque,
         len: usize,
@@ -101,10 +94,9 @@ pub const DebugAllocator = struct {
         const a = @max(alignment.toByteUnits(), @alignOf(std.c.max_align_t));
         const ptr = self.backing.rawAlloc(len, .fromByteUnits(a), ra) orelse return null;
         self.lockIf();
-        // double-alloc 同一指针：理论不可能（malloc 不返回在用指针），但防御性检查
+        // 若地址已存在记录，视为异常，回滚分配。
         if (self.alloc_map.contains(@intFromPtr(ptr))) {
             self.unlockIf();
-            // 严重错误：释放新分配并返回 null
             self.backing.rawFree(ptr[0..len], .fromByteUnits(a), ra);
             return null;
         }
@@ -121,6 +113,7 @@ pub const DebugAllocator = struct {
         return ptr;
     }
 
+    // 原地调整大小并同步更新记录中的长度。
     fn vtableResize(
         ctx: *anyopaque,
         buf: []u8,
@@ -129,7 +122,6 @@ pub const DebugAllocator = struct {
         ra: usize,
     ) bool {
         const self: *DebugAllocator = @ptrCast(@alignCast(ctx));
-        // 尝试 in-place resize：成功则更新记录长度
         const a = @max(alignment.toByteUnits(), @alignOf(std.c.max_align_t));
         if (self.backing.rawResize(buf, .fromByteUnits(a), new_len, ra)) {
             self.lockIf();
@@ -142,6 +134,7 @@ pub const DebugAllocator = struct {
         return false;
     }
 
+    // 尝试原地扩展，失败则分配新内存、拷贝并释放旧内存。
     fn vtableRemap(
         ctx: *anyopaque,
         buf: []u8,
@@ -150,7 +143,6 @@ pub const DebugAllocator = struct {
         ra: usize,
     ) ?[*]u8 {
         const self: *DebugAllocator = @ptrCast(@alignCast(ctx));
-        // 尝试 in-place remap（rawResize）；失败则 alloc 新块 + copy + free 旧块
         const a = @max(alignment.toByteUnits(), @alignOf(std.c.max_align_t));
         if (self.backing.rawResize(buf, .fromByteUnits(a), new_len, ra)) {
             self.lockIf();
@@ -160,7 +152,6 @@ pub const DebugAllocator = struct {
             self.unlockIf();
             return buf.ptr;
         }
-        // 退路：分配新块并复制
         const new_ptr = vtableAlloc(ctx, new_len, alignment, ra) orelse return null;
         const copy_len = @min(buf.len, new_len);
         @memcpy(new_ptr[0..copy_len], buf[0..copy_len]);
@@ -168,6 +159,7 @@ pub const DebugAllocator = struct {
         return new_ptr;
     }
 
+    // 释放并校验：双重释放、长度不匹配均会打印告警。
     fn vtableFree(
         ctx: *anyopaque,
         buf: []u8,
@@ -181,21 +173,24 @@ pub const DebugAllocator = struct {
         const rec = self.alloc_map.fetchRemove(key);
         self.unlockIf();
         if (rec == null) {
-            // double-free 或非法 free：报告但不调用 backing.free（避免崩溃）
-            std.debug.print(
-                "[GLUE_DBG] DOUBLE-FREE or invalid free: addr=0x{x} len={} ret_addr=0x{x}\n",
-                .{ key, buf.len, ra },
-            );
+            // 未找到记录，疑似双重释放或非法释放。
+            if (self.verbose) {
+                std.debug.print(
+                    "[GLUE_DBG] DOUBLE-FREE or invalid free: addr=0x{x} len={} ret_addr=0x{x}\n",
+                    .{ key, buf.len, ra },
+                );
+            }
             return;
         }
-        // 校验长度一致性（可选，避免传错 len）
         const actual = rec.?.value;
         if (actual.len != buf.len) {
-            std.debug.print(
-                "[GLUE_DBG] free len mismatch: addr=0x{x} alloc_len={} free_len={} ret_addr=0x{x}\n",
-                .{ key, actual.len, buf.len, ra },
-            );
-            // 用 alloc 时的真实长度释放
+            // 释放长度与分配长度不一致，按原始长度归还底层。
+            if (self.verbose) {
+                std.debug.print(
+                    "[GLUE_DBG] free len mismatch: addr=0x{x} alloc_len={} free_len={} ret_addr=0x{x}\n",
+                    .{ key, actual.len, buf.len, ra },
+                );
+            }
             self.backing.rawFree(
                 @as([*]u8, @ptrCast(buf.ptr))[0..actual.len],
                 .fromByteUnits(actual.alignment),
@@ -206,6 +201,7 @@ pub const DebugAllocator = struct {
         self.backing.rawFree(buf, .fromByteUnits(a), ra);
     }
 
+    // 多线程模式下加锁，单线程模式下空操作。
     inline fn lockIf(self: *DebugAllocator) void {
         if (!self.single_threaded) self.lock.lock();
     }
@@ -215,15 +211,10 @@ pub const DebugAllocator = struct {
     }
 };
 
-// ============================================================
-// 单元测试
-// ============================================================
-
 test "DebugAllocator basic alloc/free" {
     var dbg = DebugAllocator.initSingleThreaded();
     defer _ = dbg.deinit();
     const alloc = dbg.allocator();
-
     const p = alloc.alloc(u32, 10) catch unreachable;
     defer alloc.free(p);
     try std.testing.expect(p.len == 10);
@@ -231,21 +222,20 @@ test "DebugAllocator basic alloc/free" {
 
 test "DebugAllocator leak detection" {
     var dbg = DebugAllocator.initSingleThreaded();
+    dbg.verbose = false;
     const alloc = dbg.allocator();
-
-    _ = alloc.alloc(u8, 100) catch unreachable; // 故意泄漏
+    _ = alloc.alloc(u8, 100) catch unreachable;
     const report = dbg.deinit();
     try std.testing.expect(report == .leak);
 }
 
 test "DebugAllocator double-free detection" {
     var dbg = DebugAllocator.initSingleThreaded();
+    dbg.verbose = false;
     defer _ = dbg.deinit();
     const alloc = dbg.allocator();
-
     const p = alloc.alloc(u8, 16) catch unreachable;
     alloc.free(p);
-    // 第二次 free：应触发 double-free 报告（打印到 stderr，不崩溃）
     alloc.free(p);
 }
 
@@ -253,7 +243,6 @@ test "DebugAllocator alignment" {
     var dbg = DebugAllocator.initSingleThreaded();
     defer _ = dbg.deinit();
     const alloc = dbg.allocator();
-
     const p = alloc.alignedAlloc(u8, .@"64", 256) catch unreachable;
     defer alloc.free(p);
     try std.testing.expect(@intFromPtr(p.ptr) % 64 == 0);

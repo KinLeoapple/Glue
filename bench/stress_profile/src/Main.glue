@@ -1,0 +1,132 @@
+// 分项计时版本 — 每个子测试单独测量
+fun nestedLoop(n: i32): i64 {
+    var total: i64 = 0
+    var i: i32 = 0
+    while i < n {
+        var j: i32 = 0
+        while j < n {
+            total = (total + i64(i * j)) % 1000000007
+            j = j + 1
+        }
+        i = i + 1
+    }
+    total
+}
+
+fun newtonSqrt(x: f64): f64 {
+    if (x == 0.0) { return 0.0 }
+    var guess: f64 = x / 2.0
+    var i: i32 = 0
+    while i < 20 {
+        var next: f64 = (guess + x / guess) / 2.0
+        guess = next
+        i = i + 1
+    }
+    guess
+}
+
+fun hashFold(n: i32): i64 {
+    var h: i64 = 5381
+    var i: i32 = 0
+    while i < n {
+        h = ((h * 33) + i64(i * 31 + 7)) % 1000000007
+        i = i + 1
+    }
+    if (h < 0) { -h } else { h }
+}
+
+fun isPrime(n: i64): bool {
+    if (n < 2) { return false }
+    if (n < 4) { return true }
+    if (n % 2 == 0) { return false }
+    var i: i64 = 3
+    while i * i <= n {
+        if (n % i == 0) { return false }
+        i = i + 2
+    }
+    true
+}
+
+fun primeSum(lo: i64, hi: i64): i64 {
+    var sum: i64 = 0
+    var n: i64 = lo
+    while n < hi {
+        if (isPrime(n)) { sum = sum + n }
+        n = n + 1
+    }
+    sum
+}
+
+fun merge(a: i64[], b: i64[]): i64[] {
+    var result: i64[] = []
+    var i: i32 = 0
+    var j: i32 = 0
+    while i < a.len() && j < b.len() {
+        if (a[i] <= b[j]) {
+            result = result.push(a[i])
+            i = i + 1
+        } else {
+            result = result.push(b[j])
+            j = j + 1
+        }
+    }
+    while i < a.len() {
+        result = result.push(a[i])
+        i = i + 1
+    }
+    while j < b.len() {
+        result = result.push(b[j])
+        j = j + 1
+    }
+    result
+}
+
+fun mergeSort(arr: i64[]): i64[] {
+    if (arr.len() <= 1) { return arr }
+    var mid: i32 = arr.len() / 2
+    var left: i64[] = []
+    var right: i64[] = []
+    var i: i32 = 0
+    while i < arr.len() {
+        if (i < mid) {
+            left = left.push(arr[i])
+        } else {
+            right = right.push(arr[i])
+        }
+        i = i + 1
+    }
+    merge(mergeSort(left), mergeSort(right))
+}
+
+fun main() {
+    println("--- nestedLoop ---")
+    println(nestedLoop(4000))
+
+    println("--- newtonSqrt batch ---")
+    var sqSum: f64 = 0.0
+    var n: i32 = 0
+    while n < 200000 {
+        sqSum = sqSum + newtonSqrt(f64(n + 1))
+        n = n + 1
+    }
+    println(sqSum)
+
+    println("--- hashFold ---")
+    println(hashFold(20000000))
+
+    println("--- primeSum ---")
+    println(primeSum(2, 500000))
+
+    println("--- mergeSort ---")
+    var input: i64[] = []
+    var k: i32 = 5000
+    while k > 0 {
+        input = input.push(i64(k))
+        k = k - 1
+    }
+    var sorted = mergeSort(input)
+    println(sorted[0])
+    println(sorted[sorted.len() - 1])
+
+    println("done")
+}

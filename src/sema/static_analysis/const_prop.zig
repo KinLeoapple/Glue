@@ -1,31 +1,32 @@
-//! Pass 1：常量传播。
+//! 常量传播模块。
 //!
-//! 在函数内做前向数据流分析，追踪已知的常量绑定。
-//! 编译器查询表达式是否为编译期常量，若是则直接发射 op_const 而非算术。
-//!
-//! 限制：仅分析函数体内的 val 绑定（不可变），不跨函数。
+//! 提供常量值表示（ConstValue）、表达式常量表（ConstTable）和作用域常量环境
+//! （ConstEnv），以及二元 / 一元运算的常量折叠辅助函数。常量传播是其他优化
+//! （分支可达性、CSE 等）的基础数据来源，由 fused_analysis 在跨函数分析时
+//! 将结果写入 ConstTable。
 
 const std = @import("std");
 const ast = @import("ast");
 
-/// 常量值（仅基本类型）
+/// 编译期可追踪的常量值。unknown 表示该表达式无法折叠为常量。
 pub const ConstValue = union(enum) {
     int_val: i128,
     float_val: f64,
     bool_val: bool,
-    /// 非常量
     unknown,
 
+    /// 是否为整型常量。
     pub fn isInt(self: ConstValue) bool {
         return self == .int_val;
     }
 
+    /// 是否为布尔常量。
     pub fn isBool(self: ConstValue) bool {
         return self == .bool_val;
     }
 };
 
-/// 表达式 → 常量值 的映射
+/// 表达式到常量值的映射表。键为 AST 表达式指针，值为折叠后的常量。
 pub const ConstTable = struct {
     entries: std.AutoHashMap(*const ast.Expr, ConstValue),
     allocator: std.mem.Allocator,
@@ -49,14 +50,13 @@ pub const ConstTable = struct {
         return self.entries.get(expr);
     }
 
+    /// 常量表是否为空。
     pub fn isEmpty(self: *const ConstTable) bool {
         return self.entries.count() == 0;
     }
 };
 
-/// 【优化 #11】链式常量环境：block 嵌套时 child 仅存本地绑定，查找沿 parent 链回溯。
-/// 原实现每进 block 都把父 env 全量复制到 child（O(N) per block，深嵌套 O(depth²)）；
-/// 链式实现 O(1) 进出 block，查找 O(depth)，整体更优。
+/// 作用域常量环境。通过 parent 指针形成词法作用域链，用于跟踪变量名到常量值的绑定。
 pub const ConstEnv = struct {
     parent: ?*ConstEnv,
     locals: std.StringHashMap(ConstValue),
@@ -74,7 +74,7 @@ pub const ConstEnv = struct {
         self.locals.deinit();
     }
 
-    /// 沿父链查找；本地优先（shadow 父级同名绑定）。
+    /// 沿作用域链查找变量名对应的常量值。
     pub fn get(self: *const ConstEnv, name: []const u8) ?ConstValue {
         var cur: ?*const ConstEnv = self;
         while (cur) |e| {
@@ -84,22 +84,21 @@ pub const ConstEnv = struct {
         return null;
     }
 
-    /// 写入本地层（shadow 父级同名绑定）。
     pub fn put(self: *ConstEnv, name: []const u8, val: ConstValue) !void {
         try self.locals.put(name, val);
     }
 
-    /// 仅删本地层绑定；var 赋值后不再视为常量。父级同名绑定（若有）不受影响——
-    /// 但 val 不可变，故父级绝不会出现同名的常量绑定被赋值的情况，逻辑等价于原实现。
+    /// 移除变量绑定，用于变量被重新赋值为非常量时。
     pub fn remove(self: *ConstEnv, name: []const u8) void {
         _ = self.locals.remove(name);
     }
 };
 
+/// 对两个常量执行二元运算并返回折叠结果；任一操作数为 unknown 或运算不适用时返回 null。
 fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
     if (lv == .unknown or rv == .unknown) return null;
 
-    // 整数算术
+    // 整型运算：除法 / 取模需防止除零。
     if (lv == .int_val and rv == .int_val) {
         const l = lv.int_val;
         const r = rv.int_val;
@@ -122,7 +121,7 @@ fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
         };
     }
 
-    // 浮点算术
+    // 浮点运算：除法需防止除零。
     if (lv == .float_val and rv == .float_val) {
         const l = lv.float_val;
         const r = rv.float_val;
@@ -141,7 +140,7 @@ fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
         };
     }
 
-    // 布尔逻辑
+    // 布尔逻辑运算。
     if (lv == .bool_val and rv == .bool_val) {
         return switch (op) {
             .and_op => .{ .bool_val = lv.bool_val and rv.bool_val },
@@ -151,10 +150,10 @@ fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
             else => null,
         };
     }
-
     return null;
 }
 
+/// 对常量执行一元运算并返回折叠结果；运算不适用时返回 null。
 fn evalUnary(op: ast.UnaryOp, v: ConstValue) ?ConstValue {
     return switch (v) {
         .int_val => |i| switch (op) {
@@ -173,9 +172,9 @@ fn evalUnary(op: ast.UnaryOp, v: ConstValue) ?ConstValue {
     };
 }
 
-/// 解析整数字面量（支持 0x/0o/0b 前缀和 _ 分隔符）
+/// 解析整型字面量字符串，支持十进制、十六进制（0x）、八进制（0o）、二进制（0b）以及下划线分隔。
 fn parseIntLiteral(allocator: std.mem.Allocator, raw: []const u8) ?ConstValue {
-    // 去除下划线
+    // 先剔除下划线分隔符。
     var clean = std.ArrayList(u8).empty;
     defer clean.deinit(allocator);
     for (raw) |c| {
@@ -184,7 +183,7 @@ fn parseIntLiteral(allocator: std.mem.Allocator, raw: []const u8) ?ConstValue {
     const bytes = clean.items;
     if (bytes.len == 0) return null;
 
-    // 判断进制
+    // 根据前缀判断进制。
     if (bytes.len >= 2 and bytes[0] == '0') {
         if (bytes[1] == 'x' or bytes[1] == 'X') {
             const val = std.fmt.parseInt(i128, bytes[2..], 16) catch return null;
@@ -207,9 +206,6 @@ test "ConstTable basic put/lookup" {
     var table = ConstTable.init(std.testing.allocator);
     defer table.deinit();
     try std.testing.expect(table.isEmpty());
-    // 构造一个假 Expr 指针用于测试 lookup
-    // 由于 ConstTable 用 *const ast.Expr 做键，这里仅测试空表行为
-    // 完整的 put/lookup 测试需要 AST 节点，在集成测试中覆盖
 }
 
 test "ConstValue tags" {

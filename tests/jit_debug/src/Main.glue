@@ -1,0 +1,40 @@
+// Minimal JIT debugging test
+
+fun cmp_result(n: i64): bool {
+    n < 2
+}
+
+fun cmp_eq(a: i64, b: i64): bool {
+    a == b
+}
+
+fun simple_cmp(n: i64): i64 {
+    if (n < 2) { 999 } else { 111 }
+}
+
+fun bool_if(b: bool): i64 {
+    if (b) { 1 } else { 2 }
+}
+
+fun simple_add(a: i64, b: i64): i64 {
+    a + b
+}
+
+fun main() {
+    // Test 0: direct comparison result
+    println(cmp_result(0))    // true
+    println(cmp_result(2))    // false
+
+    // Test 1: comparison in if
+    println(simple_cmp(0))    // 999
+    println(simple_cmp(2))    // 111
+
+    // Test 2: direct boolean if
+    println(bool_if(true))    // 1
+    println(bool_if(false))   // 2
+
+    // Test 3: addition
+    println(simple_add(3, 4)) // 7
+
+    println("jit_debug: done")
+}

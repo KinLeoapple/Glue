@@ -1,18 +1,8 @@
-//! 融合静态分析 pass：单次 AST 遍历同时填充 const_prop / loop_invariant / purity。
+//! 融合静态分析模块。
 //!
-//! 原实现中 3 个 pass（const_prop / branch_reach / loop_invariant）各自独立遍历
-//! 所有 fun_decl 体，总计 3 次完整遍历。purity pass 还额外多轮递归 AST。
-//!
-//! 融合策略：
-//! 1. 单次遍历每个函数体，同时收集：
-//!    - 常量绑定 → db.const_prop
-//!    - 循环大小 → db.loop_invariant
-//!    - 调用边（按函数名）→ 临时 name_call_graph
-//!    - 直接 impure 标记（调用 impure builtin / 方法调用 / spawn / select 等）→ direct_impure 集合
-//! 2. 单次遍历后，用 name_call_graph + direct_impure 做 purity fixpoint（O(N+E)，不再递归 AST）
-//! 3. branch_reach 依赖 const_prop 完成，保持独立轻量遍历（仅查 if 条件）
-//!
-//! 语义不变：所有 pass 的判定逻辑与原实现完全一致，仅合并遍历顺序。
+//! 将常量传播、纯度分析、循环不变量外提、死代码消除和公共子表达式消除融合为
+//! 单遍分析。FusedAnalysis 在一次遍历中同时完成常量折叠与调用图构建，随后通过
+//! 不动点迭代传播纯度信息，最后委托 DeadCodePass 和 CsePass 完成各自的独立遍。
 
 const std = @import("std");
 const ast = @import("ast");
@@ -32,29 +22,24 @@ const DeadCodePass = dead_code_mod.DeadCodePass;
 const CseTable = cse_mod.CseTable;
 const CsePass = cse_mod.CsePass;
 
+/// 循环展开的估算大小阈值。循环体估算大小不超过此值时视为小循环，可考虑展开。
 const UNROLL_THRESHOLD: u32 = 32;
 
-/// 融合分析器：单次遍历填充 const_prop / loop_invariant / hoist_table，并收集调用图用于 purity fixpoint。
+/// 融合分析器。在一次遍历中完成常量传播、纯度分析和循环不变量收集，
+/// 并在遍历结束后委托 DCE 和 CSE 进行独立分析。
 pub const FusedAnalysis = struct {
-    /// 借用：写入 db.const_prop
     const_table: *const_prop_mod.ConstTable,
-    /// 借用：写入 db.loop_invariant
     loop_table: *loop_invariant_mod.LoopTable,
-    /// 借用：写入 db.purity
     purity_table: *purity_mod.PurityTable,
-    /// 借用：写入 db.hoist_table（LICM 不变量提升表）
     hoist_table: *loop_invariant_mod.HoistTable,
-    /// 借用：写入 db.dead_code（DCE 死代码表）
     dead_table: *DeadTable,
-    /// 借用：写入 db.cse（CSE 公共子表达式表）
     cse_table: *CseTable,
     allocator: std.mem.Allocator,
-
-    /// 临时：函数名 → 它直接调用的函数名列表（仅顶层 fun_decl 之间的边）
+    /// 调用图：函数名 -> 其调用的其他函数名列表。
     name_call_graph: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
-    /// 临时：直接 impure 的函数名集合（调用 impure builtin / 方法调用 / spawn 等）
+    /// 直接判定为非纯的函数名集合（调用了内建非纯函数或方法调用等）。
     direct_impure: std.StringHashMap(void),
-    /// 临时：所有 fun_decl 名字集合（用于 fixpoint 初始化）
+    /// 模块中所有函数名列表。
     all_fn_names: std.ArrayListUnmanaged([]const u8),
 
     pub fn init(
@@ -88,17 +73,16 @@ pub const FusedAnalysis = struct {
         self.all_fn_names.deinit(self.allocator);
     }
 
-    /// 分析模块：单次遍历 + purity fixpoint
+    /// 分析整个模块：常量传播 + 纯度不动点 + DCE + CSE。
     pub fn analyzeModule(self: *FusedAnalysis, module: *const ast.Module) !void {
-        // Pass 1: 收集所有 fun_decl 名字，初始化 purity 表为 pure
+        // 第一遍：收集所有函数名，初始假定全部为纯函数。
         for (module.declarations) |decl| {
             if (decl != .fun_decl) continue;
             const name = decl.fun_decl.name;
             try self.all_fn_names.append(self.allocator, name);
             try self.purity_table.put(name, .pure);
         }
-
-        // Pass 2: 单次遍历每个函数体，填充 const_prop / loop_invariant / name_call_graph / direct_impure
+        // 第二遍：逐函数进行常量传播与调用图构建。
         for (module.declarations) |decl| {
             if (decl != .fun_decl) continue;
             const fd = decl.fun_decl;
@@ -106,19 +90,16 @@ pub const FusedAnalysis = struct {
             defer env.deinit();
             try self.analyzeExpr(fd.body, &env, fd.name);
         }
-
-        // Pass 3: purity fixpoint（基于 name_call_graph，O(N+E)，不再递归 AST）
+        // 基于调用图传播纯度信息至不动点。
         try self.purityFixpoint();
-
-        // Pass 4: DCE（迭代到 fixpoint，标记未引用且无副作用的 val_decl/var_decl 为 dead）
+        // 委托 DCE 和 CSE 进行独立分析。
         var dce_pass = DeadCodePass.init(self.allocator, self.dead_table);
         try dce_pass.analyzeModule(module);
-
-        // Pass 5: CSE（基本块级公共子表达式消除，标记 redundant → canonical）
         var cse_pass = CsePass.init(self.allocator, self.cse_table);
         try cse_pass.analyzeModule(module);
     }
 
+    /// 递归分析表达式：常量折叠、调用图边收集、纯度判定。
     fn analyzeExpr(
         self: *FusedAnalysis,
         expr: *const ast.Expr,
@@ -141,6 +122,7 @@ pub const FusedAnalysis = struct {
                 try self.const_table.put(expr, .{ .bool_val = bl.value });
             },
             .identifier => |id| {
+                // 从常量环境中查找变量绑定。
                 if (env.get(id.name)) |val| {
                     try self.const_table.put(expr, val);
                 }
@@ -148,7 +130,6 @@ pub const FusedAnalysis = struct {
             .binary => |b| {
                 try self.analyzeExpr(b.left, env, current_fn);
                 try self.analyzeExpr(b.right, env, current_fn);
-
                 const lv = self.const_table.lookup(b.left) orelse ConstValue.unknown;
                 const rv = self.const_table.lookup(b.right) orelse ConstValue.unknown;
                 if (evalBinary(b.op, lv, rv)) |result| {
@@ -168,6 +149,7 @@ pub const FusedAnalysis = struct {
                 if (i.else_branch) |e| try self.analyzeExpr(e, env, current_fn);
             },
             .block => |b| {
+                // 块创建新的子作用域。
                 var child_env = ConstEnv.init(self.allocator, env);
                 defer child_env.deinit();
                 for (b.statements) |s| {
@@ -178,19 +160,17 @@ pub const FusedAnalysis = struct {
             .call => |c| {
                 try self.analyzeExpr(c.callee, env, current_fn);
                 for (c.arguments) |arg| try self.analyzeExpr(arg, env, current_fn);
-
-                // 调用图边收集 + impure 判定
                 if (c.callee.* == .identifier) {
                     const callee_name = c.callee.identifier.name;
-                    // 自递归不算 impure（已在当前函数判定中）
+                    // 递归调用不构成调用图边（不影响纯度判定）。
                     if (!std.mem.eql(u8, callee_name, current_fn)) {
                         if (isImpureBuiltin(callee_name)) {
+                            // 调用内建非纯函数，当前函数直接标记为非纯。
                             try self.direct_impure.put(current_fn, {});
                         } else {
-                            // 记录调用边（callee 可能是顶层 fun_decl）
+                            // 添加调用图边 current_fn -> callee_name（去重）。
                             const gop = try self.name_call_graph.getOrPut(current_fn);
                             if (!gop.found_existing) gop.value_ptr.* = .empty;
-                            // 去重
                             for (gop.value_ptr.items) |existing| {
                                 if (std.mem.eql(u8, existing, callee_name)) return;
                             }
@@ -198,12 +178,12 @@ pub const FusedAnalysis = struct {
                         }
                     }
                 } else {
-                    // 间接调用（callee 非标识符）→ 保守 impure
+                    // 非标识符调用（如方法调用、lambda 调用）保守视为非纯。
                     try self.direct_impure.put(current_fn, {});
                 }
             },
+            // 方法调用、安全方法调用、select、inline_trait_value 均保守视为非纯。
             .method_call => {
-                // 方法调用保守视为 impure（与原 purity.exprHasImpureCall 一致）
                 try self.direct_impure.put(current_fn, {});
             },
             .safe_method_call => {
@@ -261,6 +241,7 @@ pub const FusedAnalysis = struct {
         }
     }
 
+    /// 递归分析语句：常量传播、循环大小估算、循环不变量收集。
     fn analyzeStmt(
         self: *FusedAnalysis,
         stmt: *const ast.Stmt,
@@ -270,6 +251,7 @@ pub const FusedAnalysis = struct {
         switch (stmt.*) {
             .val_decl => |v| {
                 try self.analyzeExpr(v.value, env, current_fn);
+                // 若初值为常量，则绑定到环境中。
                 if (self.const_table.lookup(v.value)) |val| {
                     if (val != .unknown) {
                         try env.put(v.name, val);
@@ -278,11 +260,10 @@ pub const FusedAnalysis = struct {
             },
             .var_decl => |v| {
                 try self.analyzeExpr(v.value, env, current_fn);
-                // var 绑定不加入常量 env（可变）
             },
             .assignment => |a| {
                 try self.analyzeExpr(a.value, env, current_fn);
-                // 赋值后该变量不再常量
+                // 赋值后变量不再为常量，从环境中移除。
                 if (a.target.* == .identifier) {
                     _ = env.remove(a.target.identifier.name);
                 }
@@ -291,15 +272,13 @@ pub const FusedAnalysis = struct {
             .return_stmt => |r| if (r.value) |v| try self.analyzeExpr(v, env, current_fn),
             .for_stmt => |f| {
                 try self.analyzeExpr(f.iterable, env, current_fn);
-                // 循环大小估计（融合自 loop_invariant）
+                // 估算循环体大小并记录到循环表。
                 const size = self.estimateSize(f.body);
                 try self.loop_table.put(stmt, .{
                     .is_small = size <= UNROLL_THRESHOLD,
                     .est_size = size,
                 });
-                // 【LICM】收集循环体内可 hoist 的不变量子表达式
-                // for 循环变量每轮被赋值，算作 assigned；
-                // 同时收集循环体内被赋值的变量（assignment/compound_assignment/val_decl/var_decl target）
+                // 收集循环体内被赋值的变量，用于判断循环不变量。
                 var for_assigned: std.ArrayListUnmanaged([]const u8) = .empty;
                 defer for_assigned.deinit(self.allocator);
                 try for_assigned.append(self.allocator, f.name);
@@ -320,7 +299,6 @@ pub const FusedAnalysis = struct {
                     .is_small = size <= UNROLL_THRESHOLD,
                     .est_size = size,
                 });
-                // 【LICM】while 无循环变量，assigned_vars 仅含循环体内 assignment target
                 var assigned: std.ArrayListUnmanaged([]const u8) = .empty;
                 defer assigned.deinit(self.allocator);
                 try loop_invariant_mod.collectAssignedVars(self.allocator, w.body, &assigned);
@@ -339,7 +317,6 @@ pub const FusedAnalysis = struct {
                     .is_small = size <= UNROLL_THRESHOLD,
                     .est_size = size,
                 });
-                // 【LICM】loop 同 while——无循环变量
                 var assigned: std.ArrayListUnmanaged([]const u8) = .empty;
                 defer assigned.deinit(self.allocator);
                 try loop_invariant_mod.collectAssignedVars(self.allocator, l.body, &assigned);
@@ -360,26 +337,20 @@ pub const FusedAnalysis = struct {
         }
     }
 
-    /// 基于调用图的 purity fixpoint（O(N+E)）。
-    /// 初始：direct_impure 集合中的函数标 impure；然后反向传播——
-    /// 任何调用 impure 函数的函数也变 impure，直到收敛。
+    /// 纯度不动点迭代：从直接非纯函数出发，沿逆向调用图传播 impure 标记。
     fn purityFixpoint(self: *FusedAnalysis) !void {
-        // 工作队列：初始为所有 direct_impure 函数
+        // 工作列表初始化为所有直接非纯函数。
         var worklist = std.ArrayList([]const u8).empty;
         defer worklist.deinit(self.allocator);
         var it = self.direct_impure.keyIterator();
         while (it.next()) |k| {
             try worklist.append(self.allocator, k.*);
         }
-
-        // 标记 direct_impure 为 impure
         for (worklist.items) |name| {
             try self.purity_table.put(name, .impure);
         }
 
-        // 反向传播：worklist 中的函数是 impure 的，所有调用它的函数也变 impure。
-        // 用逆邻接表：callee → [callers]
-        // 构建 caller 表后，每次取出 impure 函数，把它的 callers 也加入 impure。
+        // 构建逆向调用图：callee -> [callers]。
         var reverse_edges = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(self.allocator);
         defer {
             var rit = reverse_edges.valueIterator();
@@ -396,10 +367,9 @@ pub const FusedAnalysis = struct {
             }
         }
 
-        // 处理 worklist
+        // 工作列表算法：非纯函数的调用者也变为非纯，直到不再有变化。
         while (worklist.items.len > 0) {
             const impure_fn = worklist.pop().?;
-            // 找到所有调用 impure_fn 的函数
             if (reverse_edges.get(impure_fn)) |callers| {
                 for (callers.items) |caller| {
                     if (self.purity_table.lookup(caller)) |info| {
@@ -413,7 +383,7 @@ pub const FusedAnalysis = struct {
         }
     }
 
-    /// 估计表达式的字节码指令数（镜像 loop_invariant.LoopInvariantPass.estimateSize）
+    /// 估算表达式的大小（用于循环展开判定）。字面量和标识符为 1，复杂构造按结构递归累加。
     fn estimateSize(self: *FusedAnalysis, expr: *const ast.Expr) u32 {
         return switch (expr.*) {
             .int_literal, .float_literal, .bool_literal, .char_literal,
@@ -433,6 +403,7 @@ pub const FusedAnalysis = struct {
         };
     }
 
+    /// 估算语句的大小。
     fn estimateStmtSize(self: *FusedAnalysis, stmt: *const ast.Stmt) u32 {
         return switch (stmt.*) {
             .val_decl => |v| self.estimateSize(v.value) + 1,
@@ -448,12 +419,13 @@ pub const FusedAnalysis = struct {
     }
 };
 
-/// 已知的 impure 内建函数名（镜像 purity.zig）
+/// 内建非纯函数列表。这些函数有 I/O、并发或通信副作用，调用它们的函数自动判定为非纯。
 const impure_builtins = [_][]const u8{
     "println", "print", "eprintln", "eprint",
     "spawn",   "lazy",  "select",   "send",   "recv",
 };
 
+/// 判断给定函数名是否为内建非纯函数。
 fn isImpureBuiltin(name: []const u8) bool {
     for (impure_builtins) |b| {
         if (std.mem.eql(u8, b, name)) return true;
@@ -461,10 +433,9 @@ fn isImpureBuiltin(name: []const u8) bool {
     return false;
 }
 
-// 以下函数镜像 const_prop.zig 的实现，保持语义一致
+/// 对两个常量执行二元运算并返回折叠结果；任一操作数为 unknown 或运算不适用时返回 null。
 fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
     if (lv == .unknown or rv == .unknown) return null;
-
     if (lv == .int_val and rv == .int_val) {
         const l = lv.int_val;
         const r = rv.int_val;
@@ -486,7 +457,6 @@ fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
             else => null,
         };
     }
-
     if (lv == .float_val and rv == .float_val) {
         const l = lv.float_val;
         const r = rv.float_val;
@@ -504,7 +474,6 @@ fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
             else => null,
         };
     }
-
     if (lv == .bool_val and rv == .bool_val) {
         return switch (op) {
             .and_op => .{ .bool_val = lv.bool_val and rv.bool_val },
@@ -514,10 +483,10 @@ fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
             else => null,
         };
     }
-
     return null;
 }
 
+/// 对常量执行一元运算并返回折叠结果；运算不适用时返回 null。
 fn evalUnary(op: ast.UnaryOp, v: ConstValue) ?ConstValue {
     return switch (v) {
         .int_val => |i| switch (op) {
@@ -536,6 +505,7 @@ fn evalUnary(op: ast.UnaryOp, v: ConstValue) ?ConstValue {
     };
 }
 
+/// 解析整型字面量字符串，支持十进制、十六进制（0x）、八进制（0o）、二进制（0b）以及下划线分隔。
 fn parseIntLiteral(allocator: std.mem.Allocator, raw: []const u8) ?ConstValue {
     var clean = std.ArrayList(u8).empty;
     defer clean.deinit(allocator);
@@ -544,7 +514,6 @@ fn parseIntLiteral(allocator: std.mem.Allocator, raw: []const u8) ?ConstValue {
     }
     const bytes = clean.items;
     if (bytes.len == 0) return null;
-
     if (bytes.len >= 2 and bytes[0] == '0') {
         if (bytes[1] == 'x' or bytes[1] == 'X') {
             const val = std.fmt.parseInt(i128, bytes[2..], 16) catch return null;

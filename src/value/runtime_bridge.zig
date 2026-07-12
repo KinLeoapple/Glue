@@ -1,20 +1,24 @@
-//! runtime 模块桥接——re-export runtime/ 的并发原语类型
+//! 运行时桥接模块
 //!
-//! 定义留 runtime/（atomic.zig/spawn.zig/channel.zig），value/runtime_bridge.zig re-export。
-//! Value union 持 *T 指针，release 逻辑由 mod.zig 调 runtime 类型的 unref/release 方法。
-//!
-//! 这里的 @import("atomic")/("spawn")/("channel") 由 build.zig 的 addImport 注入，
-//! 与旧 value.zig L13-15 的循环依赖结构一致。
-//!
-//! 命名规范：方法名全部使用完整单词，不使用缩写。
+//! 将并发运行时相关的外部模块（原子操作、协程调度、通道通信）
+//! 重新导出为 Value 系统可用的类型别名，使 Value 联合体能引用
+//! 这些运行时对象而无需直接依赖其实现细节。
 
 const atomic_mod = @import("atomic");
 const spawn_mod = @import("spawn");
 const channel_mod = @import("channel");
 
+/// 原子值，封装对共享可变状态的原子访问
 pub const AtomicValue = atomic_mod.AtomicValue;
-pub const SpawnHandle = spawn_mod.SpawnHandle;
-pub const ChannelValue = channel_mod.ChannelValue;
-pub const SenderValue = channel_mod.SenderValue;
-pub const ReceiverValue = channel_mod.ReceiverValue;
 
+/// 协程句柄，表示一个异步任务的运行时引用
+pub const SpawnHandle = spawn_mod.SpawnHandle;
+
+/// 通道值，用于协程间通信的同步通道
+pub const ChannelValue = channel_mod.ChannelValue;
+
+/// 发送端，通道的写入半部
+pub const SenderValue = channel_mod.SenderValue;
+
+/// 接收端，通道的读取半部
+pub const ReceiverValue = channel_mod.ReceiverValue;

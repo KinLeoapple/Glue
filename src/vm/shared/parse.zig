@@ -1,5 +1,8 @@
-//! VM 共享：字面量软件解析（无 libc strtod/strtoll）。
-//! 栈式与寄存器式 VM 共用。
+//! 整数与浮点字面量的软件解析。
+//!
+//! 提供 parseIntSoftware / parseFloatSoftware 两个核心函数，
+//! 支持 2/8/10/16 进制、下划线分隔、类型后缀及大数推断，
+//! 供编译器将 AST 字面量节点转换为运行期 Value。
 
 const std = @import("std");
 const value = @import("value");
@@ -7,8 +10,8 @@ const ast = @import("ast");
 
 const Value = value.Value;
 
-/// 软件解析整数字面量字符串 → Int（不依赖 u128/i128）。
-/// 支持符号（+/-）、进制前缀（0x/0o/0b）、下划线。不处理类型后缀。
+/// 以软件方式解析整数字面量，支持符号、进制前缀与下划线。
+/// 返回推断出的 Int 类型，无法解析时返回 null。
 pub fn parseIntSoftware(raw: []const u8) ?value.Int {
     var s = raw;
     var negative = false;
@@ -16,6 +19,7 @@ pub fn parseIntSoftware(raw: []const u8) ?value.Int {
         negative = s[0] == '-';
         s = s[1..];
     }
+    // 识别进制前缀 0x/0o/0b
     var base: u8 = 10;
     if (s.len > 2 and s[0] == '0') {
         switch (s[1]) {
@@ -25,6 +29,7 @@ pub fn parseIntSoftware(raw: []const u8) ?value.Int {
             else => {},
         }
     }
+    // 去除下划线分隔符
     var digits: [128]u8 = undefined;
     var n: usize = 0;
     for (s) |c| {
@@ -34,14 +39,11 @@ pub fn parseIntSoftware(raw: []const u8) ?value.Int {
         n += 1;
     }
     if (n == 0) return null;
-
     var buf: [16]u8 = undefined;
     _ = value.int.parseUnsignedBytes(&buf, digits[0..n], base) orelse return null;
-
     const t = value.inferIntTypeBytes(&buf, negative);
-
+    // 负数：对补码取反再加一
     if (negative) {
-        // 补码取负：~buf + 1（16 字节全量，自动符号扩展）
         var carry: u16 = 1;
         for (buf[0..16]) |*b| {
             const inv: u16 = ~b.*;
@@ -50,32 +52,25 @@ pub fn parseIntSoftware(raw: []const u8) ?value.Int {
             carry = sum >> 8;
         }
     }
-
     return value.Int.fromBytes(t, &buf);
 }
 
-/// 解析整数字面量为 Value（镜像 eval.zig evalIntLiteral 的默认最小类型推断）。
-/// 全软件：用 parseIntSoftware（不依赖 u128/i128）。
+/// 解析带后缀的整数字面量 AST 节点，返回对应的 Value。
+/// 无后缀时按推断类型返回；有后缀时强转为指定类型。
 pub fn parseIntLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(ast.Expr, undefined).int_literal)) !?Value {
     _ = allocator;
-
     if (lit.suffix) |s| {
         const target = value.IntType.fromName(s) orelse return null;
-        // 有后缀：解析后用 coerceTo 检查范围
         const parsed = parseIntSoftware(lit.raw) orelse return null;
         const coerced = parsed.coerceTo(target) orelse return null;
         return Value.fromInt(coerced);
     }
-
-    // 无后缀：类型推断
     const parsed = parseIntSoftware(lit.raw) orelse return null;
     return Value.fromInt(parsed);
 }
 
-/// 软件解析浮点字面量字符串 → Float(.f128)（不依赖 f128 原生算术）。
-/// 支持符号、小数点、十进制指数（e/E）、下划线。
-/// 算法：解析为 digits + decimal_exp，digits 解析为 u128 Int，fromInt 转 f128，
-/// 再用快速幂乘/除 10^|decimal_exp|，最后应用符号。全精度，不丢精度。
+/// 以软件方式解析浮点字面量，支持十进制科学计数法。
+/// 内部使用 f128 计算，可安全处理大数与精度需求。
 pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
     var s = raw;
     var negative = false;
@@ -85,7 +80,7 @@ pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
     }
     if (s.len == 0) return null;
 
-    // 找 e/E 分割尾数和指数
+    // 分离尾数与指数部分
     var e_pos: usize = s.len;
     for (s, 0..) |c, i| {
         if (c == 'e' or c == 'E') {
@@ -95,14 +90,12 @@ pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
     }
     const mantissa_str = s[0..e_pos];
     const exp_str = if (e_pos < s.len) s[e_pos + 1 ..] else "";
-
-    // 解析十进制指数
     var exp: i32 = 0;
     if (exp_str.len > 0) {
         exp = std.fmt.parseInt(i32, exp_str, 10) catch return null;
     }
 
-    // 分割整数/小数部分
+    // 拆分整数与小数部分
     var int_part: []const u8 = "";
     var frac_part: []const u8 = "";
     if (std.mem.indexOfScalar(u8, mantissa_str, '.')) |dot_pos| {
@@ -112,7 +105,7 @@ pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
         int_part = mantissa_str;
     }
 
-    // 合并数字（去除下划线），记录小数位数
+    // 收集有效数字并统计小数位数
     var digits_buf: [128]u8 = undefined;
     var digits_len: usize = 0;
     var frac_digit_count: i32 = 0;
@@ -131,33 +124,29 @@ pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
         digits_len += 1;
         frac_digit_count += 1;
     }
-
     if (digits_len == 0) return null;
 
-    // 十进制指数 = 字面指数 - 小数位数
     var decimal_exp = exp - frac_digit_count;
 
-    // 去除前导零（不影响 decimal_exp）
+    // 去除前导零
     var start: usize = 0;
     while (start < digits_len and digits_buf[start] == '0') start += 1;
     if (start == digits_len) {
-        // 全零：值为 0
+        // 全零：直接返回带符号的 0
         var z = value.Float.zero(.f128);
         if (negative) z = z.negate();
         return z;
     }
 
-    // 去除尾随零（每去一个，decimal_exp += 1）
+    // 去除尾随零并相应调整指数
     var end: usize = digits_len;
     while (end > start and digits_buf[end - 1] == '0') {
         end -= 1;
         decimal_exp += 1;
     }
-
     const digits = digits_buf[start..end];
 
-    // 解析 digits 为 Int(.u128)（u128 最大 39 位十进制）
-    // 如果 digits 太长，截断到 39 位并四舍五入（f128 也只能保留 ~34 位有效十进制）
+    // 将数字串转为整数（超过 39 位时截断并四舍五入）
     var int_val: value.Int = undefined;
     if (digits.len <= 39) {
         var buf: [16]u8 = undefined;
@@ -167,7 +156,7 @@ pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
         const trunc_len: usize = 39;
         var trunc_digits: [39]u8 = undefined;
         @memcpy(&trunc_digits, digits[0..trunc_len]);
-        // 四舍五入：第 40 位 >= '5' 则进位
+        // 对截断后的尾数做四舍五入
         if (digits[trunc_len] >= '5') {
             var i: usize = trunc_len;
             while (i > 0) {
@@ -179,7 +168,6 @@ pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
                 trunc_digits[i] = '0';
             }
             if (i == 0 and trunc_digits[0] == '0') {
-                // 全进位：999...9 + 1 = 1000...0
                 trunc_digits[0] = '1';
                 decimal_exp += 1;
             }
@@ -190,37 +178,29 @@ pub fn parseFloatSoftware(raw: []const u8) ?value.Float {
         decimal_exp += @as(i32, @intCast(digits.len - trunc_len));
     }
 
-    // 转换为 f128
     var result = value.Float.fromInt(.f128, int_val);
-
-    // 应用十进制指数（快速幂）
     if (decimal_exp != 0) {
         result = applyDecimalExp(result, decimal_exp);
         if (result.isInfinite() or result.isNan()) return null;
     }
-
-    // 应用符号
     if (negative) result = result.negate();
-
     return result;
 }
 
-/// 计算 float × 10^exp（快速幂，软件 f128 乘除法，不依赖 f128 原生算术）。
+/// 通过快速幂将 base 乘以 10^exp，用于浮点小数点对齐。
 fn applyDecimalExp(base: value.Float, exp: i32) value.Float {
     if (exp == 0) return base;
     const ten = value.Float.fromInt(.f128, value.Int.fromNative(.i8, @as(i8, 10)));
     const abs_e: u32 = @intCast(if (exp < 0) -exp else exp);
-
-    // 快速幂计算 10^abs_e
     var ten_pow = value.Float.fromInt(.f128, value.Int.fromNative(.i8, @as(i8, 1)));
     var factor = ten;
     var bits = abs_e;
+    // 二进制快速幂
     while (bits > 0) {
         if (bits & 1 == 1) ten_pow = ten_pow.multiply(factor);
         bits >>= 1;
         if (bits > 0) factor = factor.multiply(factor);
     }
-
     if (exp > 0) {
         return base.multiply(ten_pow);
     } else {
@@ -228,6 +208,8 @@ fn applyDecimalExp(base: value.Float, exp: i32) value.Float {
     }
 }
 
+/// 解析带后缀的浮点字面量 AST 节点，返回对应的 Value。
+/// NaN/Inf 视为非法返回 null；无后缀时降为 f64。
 pub fn parseFloatLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(ast.Expr, undefined).float_literal)) !?Value {
     _ = allocator;
     const fv = parseFloatSoftware(lit.raw) orelse return null;
@@ -235,9 +217,8 @@ pub fn parseFloatLiteral(allocator: std.mem.Allocator, lit: @TypeOf(@as(ast.Expr
     if (lit.suffix) |s| {
         const t = value.FloatType.fromName(s) orelse return null;
         const result = fv.toFloatType(t);
-        if (result.isInfinite()) return null; // 溢出
+        if (result.isInfinite()) return null;
         return Value.fromFloat(result);
     }
-    // 默认使用 f64
     return Value.fromFloat(fv.toFloatType(.f64));
 }

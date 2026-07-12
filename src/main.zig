@@ -1,3 +1,10 @@
+//! Glue 语言运行时入口
+//!
+//! 提供命令行工具，支持项目脚手架初始化（`glue init`）、
+//! 构建并运行项目（`glue run`）、以及带内存检测与运行时追踪的诊断模式（`glue debug`）。
+//! 运行流程：定位项目根 → 解析清单 → 读取入口源码 → 词法分析 → 语法分析 →
+//! 类型检查 → 寄存器式 VM 编译 → 执行，并可选地输出各阶段性能分析报告。
+
 const std = @import("std");
 const builtin = @import("builtin");
 const lexer = @import("lexer");
@@ -10,9 +17,7 @@ const reg_vm = @import("reg_vm");
 const profiler = @import("profiler");
 const debug_allocator = @import("debug_allocator");
 
-/// 把求值器错误映射为专业英文消息（Go/Java 风格）。
-/// 若求值器已经设置了带上下文的 panic_message（如 "no method 'x' on type 'array'"），
-/// 优先使用它；否则按错误枚举给出通用但专业的兜底措辞。
+/// 将运行时错误转换为面向用户的中文/英文提示，优先使用 panic 消息
 fn runtimeErrorMessage(err: anyerror, panic_message: ?[]const u8) []const u8 {
     if (panic_message) |msg| return msg;
     return switch (err) {
@@ -31,7 +36,7 @@ fn runtimeErrorMessage(err: anyerror, panic_message: ?[]const u8) []const u8 {
     };
 }
 
-/// 打印一条运行时诊断，带可选行列。有位置则 `file:line:col: label: msg`，否则 `file: label: msg`。
+/// 向指定输出接口打印运行时诊断信息（文件名、位置、标签与消息）
 fn printRuntimeDiag(iface: anytype, filename: []const u8, loc: ?ast.SourceLocation, label: []const u8, msg: []const u8) void {
     if (loc) |l| {
         iface.print("{s}:{d}:{d}: {s}: {s}\n", .{ filename, l.line, l.column, label, msg }) catch {};
@@ -40,27 +45,21 @@ fn printRuntimeDiag(iface: anytype, filename: []const u8, loc: ?ast.SourceLocati
     }
 }
 
-/// 项目清单（glue.toml）解析结果。
+/// 项目清单：名称、版本与入口文件路径
 const Manifest = struct {
     name: []const u8,
     version: []const u8,
-    /// 入口文件相对项目根的路径，缺省 "src/Main.glue"。
     entry: []const u8,
 };
 
 const MANIFEST_NAME = "glue.toml";
 const DEFAULT_ENTRY = "src/Main.glue";
 
-// ============================================================
-// 运行选项（命令行 flag）
-// ============================================================
-
-/// `--profile`：全管线 profiling（阶段计时 + 内存统计 + opcode 频率），结束后输出报告。
 var profiler_enabled: bool = false;
-
-/// 全局 profiler 实例（runNormal/runDiagnostic 入口设置 io，各阶段埋点写入，结束 dump）。
+var jit_disabled: bool = false;
 var prof: profiler.Profiler = .{};
 
+/// 向标准错误流打印格式化错误信息
 fn printError(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writerStreaming(io, &buf);
@@ -68,6 +67,7 @@ fn printError(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     w.flush() catch {};
 }
 
+/// 打印命令行用法说明
 fn printUsage(io: std.Io) void {
     printError(io,
         \\Glue v0.1.0 — project-based language runtime
@@ -79,36 +79,36 @@ fn printUsage(io: std.Io) void {
         \\
         \\Options:
         \\  --profile          Dump full pipeline profile (phases + memory + opcodes) after run
+        \\  --no-jit           Disable JIT compilation (use interpreter only)
         \\
     , .{});
 }
 
+/// 程序入口：解析命令行参数并分派到对应子命令
 pub fn main(init: std.process.Init) !void {
-    // Windows 控制台默认使用 GBK 编码，需设置为 UTF-8 以正确输出非 ASCII 字符
     if (builtin.os.tag == .windows) {
         setWindowsConsoleUtf8();
     }
-
     const allocator = std.heap.c_allocator;
     const io = init.io;
-
     const args_slice = try std.process.Args.toSlice(init.minimal.args, init.arena.allocator());
-
     if (args_slice.len < 2) {
         printUsage(io);
         std.process.exit(1);
     }
-
     const cmd = args_slice[1];
-
     if (std.mem.eql(u8, cmd, "init")) {
         const name: ?[]const u8 = if (args_slice.len >= 3) args_slice[2] else null;
         try cmdInit(allocator, io, name);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "debug")) {
-        // 运行选项（命令行 flag）：扫描命令之后的参数。--profile 对 run/debug 均生效。
+        // 解析 run/debug 之后的选项
         for (args_slice[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--profile")) {
                 profiler_enabled = true;
+            } else if (std.mem.eql(u8, arg, "--no-jit")) {
+                jit_disabled = true;
+            } else if (std.mem.eql(u8, arg, "--jit")) {
+                // 向后兼容：JIT 现已默认启用，此选项为空操作
             } else {
                 printError(io, "error: unknown option '{s}'\n\n", .{arg});
                 printUsage(io);
@@ -123,19 +123,13 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-// ============================================================
-// 项目根定位 + 清单解析
-// ============================================================
-
-/// 从 cwd 向上逐级查找 glue.toml，返回项目根的相对路径前缀（"" 表示当前目录）。
-/// 找不到返回 null。最多上溯 64 级（防御）。
+/// 从当前目录向上逐级查找包含清单文件的目录，返回其相对前缀
 fn findProjectRoot(allocator: std.mem.Allocator, io: std.Io) !?[]const u8 {
     const cwd = std.Io.Dir.cwd();
     var prefix = std.ArrayList(u8).empty;
     defer prefix.deinit(allocator);
     var level: usize = 0;
     while (level < 64) : (level += 1) {
-        // 拼出 <prefix>glue.toml 检测
         const candidate = if (prefix.items.len == 0)
             try allocator.dupe(u8, MANIFEST_NAME)
         else
@@ -144,19 +138,16 @@ fn findProjectRoot(allocator: std.mem.Allocator, io: std.Io) !?[]const u8 {
         if (cwd.access(io, candidate, .{})) {
             return try allocator.dupe(u8, prefix.items);
         } else |_| {}
-        // 上溯一级：prefix 追加 "../"
         try prefix.appendSlice(allocator, ".." ++ [_]u8{std.fs.path.sep});
     }
     return null;
 }
 
-/// 极简 TOML 子集解析：逐行认 `key = "value"`（或裸值），忽略空行与 `#` 注释。
-/// 仅取 name/version/entry 三个键；entry 缺省 src/Main.glue。返回的字符串借用 source（不分配）。
+/// 解析清单文件内容（简化的 key = value 格式），返回 Manifest
 fn parseManifest(source: []const u8) Manifest {
     var name: []const u8 = "app";
     var version: []const u8 = "0.0.0";
     var entry: []const u8 = DEFAULT_ENTRY;
-
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -164,7 +155,6 @@ fn parseManifest(source: []const u8) Manifest {
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq], " \t");
         var val = std.mem.trim(u8, line[eq + 1 ..], " \t");
-        // 剥去成对引号
         if (val.len >= 2 and val[0] == '"' and val[val.len - 1] == '"') {
             val = val[1 .. val.len - 1];
         }
@@ -179,28 +169,20 @@ fn parseManifest(source: []const u8) Manifest {
     return .{ .name = name, .version = version, .entry = entry };
 }
 
-// ============================================================
-// glue init
-// ============================================================
-
-/// 检查目标目录状态，用于 init 的空目录约束。
+/// 目标目录状态：不存在、空、非空、已是项目
 const DirState = enum {
-    /// 目录不存在（可创建）
     missing,
-    /// 目录存在且为空
     empty,
-    /// 目录存在但非空（无 glue.toml）
     non_empty,
-    /// 目录存在且含 glue.toml（已是项目）
     is_project,
 };
 
-/// 检查 path 指向的目录状态。path 为空串表示当前目录。
+/// 检查目标目录的状态
 fn checkDirState(io: std.Io, path: []const u8) DirState {
     const cwd = std.Io.Dir.cwd();
     const open_path = if (path.len == 0) "." else path;
     var dir = cwd.openDir(io, open_path, .{ .iterate = true }) catch {
-        return .missing; // 打不开（多半不存在）→ 视为可创建
+        return .missing;
     };
     defer dir.close(io);
     var it = dir.iterate();
@@ -212,21 +194,15 @@ fn checkDirState(io: std.Io, path: []const u8) DirState {
     return if (empty) .empty else .non_empty;
 }
 
+/// 执行 `glue init` 子命令：在指定目录（或当前目录）脚手架化新项目
 fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
     const cwd = std.Io.Dir.cwd();
-
-    // 目标目录前缀：有 name 则 "name/"，否则当前目录 ""。
     const dir_prefix = if (name) |n|
         try std.fmt.allocPrint(allocator, "{s}{c}", .{ n, std.fs.path.sep })
     else
         try allocator.dupe(u8, "");
     defer allocator.free(dir_prefix);
-
-    // 项目名：有 name 用 name，否则用 "app"。
     const proj_name = name orelse "app";
-
-    // init 只在空目录初始化：先检查目标目录状态。
-    // 目标目录 = name（或当前目录）；非空且非已存在项目 → 拒绝。
     const target_dir = name orelse "";
     switch (checkDirState(io, target_dir)) {
         .is_project => {
@@ -239,22 +215,16 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
             printError(io, "error: {s} is not an empty directory\n", .{shown});
             std.process.exit(1);
         },
-        .missing, .empty => {}, // 可初始化
+        .missing, .empty => {},
     }
-
-    // 清单路径
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_prefix, MANIFEST_NAME });
     defer allocator.free(manifest_path);
-
-    // 创建目录：<prefix>src/
     const src_dir = try std.fmt.allocPrint(allocator, "{s}src", .{dir_prefix});
     defer allocator.free(src_dir);
     cwd.createDirPath(io, src_dir) catch |err| {
         printError(io, "error: could not create directory '{s}': {s}\n", .{ src_dir, @errorName(err) });
         std.process.exit(1);
     };
-
-    // 写清单
     const manifest_content = try std.fmt.allocPrint(allocator,
         \\name = "{s}"
         \\version = "0.1.0"
@@ -266,8 +236,6 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
         printError(io, "error: could not write '{s}': {s}\n", .{ manifest_path, @errorName(err) });
         std.process.exit(1);
     };
-
-    // 写入口 src/Main.glue
     const main_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_prefix, DEFAULT_ENTRY });
     defer allocator.free(main_path);
     const main_content =
@@ -280,28 +248,20 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
         printError(io, "error: could not write '{s}': {s}\n", .{ main_path, @errorName(err) });
         std.process.exit(1);
     };
-
     var out_buf: [1024]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(io, &out_buf);
     w.interface.print("Created Glue project '{s}'\n  {s}\n  {s}\n", .{ proj_name, manifest_path, main_path }) catch {};
     w.flush() catch {};
 }
 
-// ============================================================
-// glue run / glue debug
-// ============================================================
-
-/// 运行当前项目。diagnostic=true 走 DebugAllocator 诊断模式（glue debug）。
+/// 执行 `glue run` / `glue debug`：定位项目、解析清单、读取入口源码并运行
 fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void {
     const cwd = std.Io.Dir.cwd();
-
     const root = (try findProjectRoot(allocator, io)) orelse {
         printError(io, "error: not a Glue project (no {s} found); run 'glue init' first\n", .{MANIFEST_NAME});
         std.process.exit(1);
     };
     defer allocator.free(root);
-
-    // 读清单
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ root, MANIFEST_NAME });
     defer allocator.free(manifest_path);
     const manifest_src = cwd.readFileAlloc(io, manifest_path, allocator, .unlimited) catch |err| {
@@ -310,17 +270,13 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
     };
     defer allocator.free(manifest_src);
     const manifest = parseManifest(manifest_src);
-
-    // 入口文件路径 = root + entry
     const entry_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ root, manifest.entry });
     defer allocator.free(entry_path);
-
     const source = cwd.readFileAlloc(io, entry_path, allocator, .unlimited) catch |err| {
         printError(io, "error: could not read entry '{s}': {s}\n", .{ entry_path, @errorName(err) });
         std.process.exit(1);
     };
     defer allocator.free(source);
-
     if (diagnostic) {
         try runDiagnostic(allocator, io, source, entry_path);
     } else {
@@ -328,31 +284,19 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
     }
 }
 
-/// 普通运行（统一 SlabAllocator + ThreadCache，loader/value/spawn 全走此分配器）。出错以非零码退出。
+/// 普通运行模式：使用 slab 分配器与线程缓存执行源码
 fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
-    // SlabAllocator：通用多线程 slab 分配器（per-class Mutex + Comptime size class 表）。
-    // ThreadCache：per-thread 无锁快路径，纯指针 push/pop，避免 per-class lock 开销。
-    // VM 主线程单线程运行，用 initSingleThreaded 跳过 atomic + Mutex 开销；
-    // spawn 子 VM 创建自己独立的 SlabAllocator 实例（同样单线程隔离）。
-    //
     var slab = slab_allocator.SlabAllocator.initSingleThreaded(allocator);
     defer slab.deinit();
-    // idle 回收协程：缓存空闲 slab/大对象，超时未用（5s）则归还 backing，兼顾复用与紧凑。
     slab.startIdleRecycler(5000, 1000);
     var cache = slab_allocator.ThreadCache.init(&slab);
     defer cache.deinit();
     const value_allocator = cache.allocator();
     const loader_alloc = value_allocator;
-
     var loader = module_loader.ModuleLoader.init(loader_alloc, io);
     defer loader.deinit();
-
-    // profiler：初始化（io 用于单调时钟）。SlabAllocator 统计在 executeSource 返回后注入（slab 未 deinit）。
     prof = profiler.Profiler.init(profiler_enabled, io);
-
     const outcome = executeSource(loader_alloc, &loader, value_allocator, &cache, io, source, entry_path);
-
-    // 注入 SlabAllocator 内存统计 + 输出 profile 报告（slab.deinit 前读取准确统计）。
     if (profiler_enabled) {
         prof.recordSlabStats(
             slab.live_bytes.load(.monotonic),
@@ -374,8 +318,6 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
         prof.recordCacheStats(cache_stats.hits, cache_stats.misses, cache_stats.refills, cache_stats.drains);
         prof.dump(io);
     }
-
-    // VM 已执行 main 或失败
     if (outcome == .failed) {
         loader.deinit();
         cache.deinit();
@@ -384,8 +326,7 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
     }
 }
 
-/// 诊断运行（glue debug）：全程 DebugAllocator + SlabAllocator(backing=dbg) 检测 double-free/泄漏，
-/// trace=true 输出更详细的运行时错误位置链。结束报告 [GLUE_GPA] LEAK/clean。
+/// 诊断运行模式：使用调试分配器检测内存泄漏与双重释放
 fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
     _ = allocator;
     var dbg = debug_allocator.DebugAllocator.initSingleThreaded();
@@ -393,20 +334,14 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
     {
         var slab = slab_allocator.SlabAllocator.initSingleThreaded(dbg_alloc);
         defer slab.deinit();
-        // idle 回收协程：缓存空闲 slab/大对象，超时未用（5s）则归还 backing。
         slab.startIdleRecycler(5000, 1000);
         var cache = slab_allocator.ThreadCache.init(&slab);
         defer cache.deinit();
         const value_allocator = cache.allocator();
-
         var loader = module_loader.ModuleLoader.init(value_allocator, io);
         defer loader.deinit();
-
-        // profiler：诊断模式同样支持 profiling。
         prof = profiler.Profiler.init(profiler_enabled, io);
-
         _ = executeSource(value_allocator, &loader, value_allocator, &cache, io, source, entry_path);
-
         if (profiler_enabled) {
             prof.recordSlabStats(
                 slab.live_bytes.load(.monotonic),
@@ -437,17 +372,10 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
     }
 }
 
-// ============================================================
-// 寄存器式 VM 执行路径
-// ============================================================
-
-/// tryRunOnVM 的结果。
-/// - ran_main：VM 已编译并执行 main（含 println 等副作用）。
-/// - failed：准备阶段（类型检查）失败或 VM 运行期 panic（已报告）。
+/// VM 执行结果：成功执行 main 或失败
 const VmOutcome = enum { ran_main, failed };
 
-/// VM 资格检查：确保模块有 main 函数
-/// VM 编译器现在处理所有声明类型，不再需要保守的预扫描
+/// 检查模块是否包含 main 函数（VM 执行的入口条件）
 fn vmEligible(module: ast.Module) bool {
     for (module.declarations) |decl| {
         switch (decl) {
@@ -460,7 +388,7 @@ fn vmEligible(module: ast.Module) bool {
     return false;
 }
 
-/// 尝试在寄存器式 VM 上整体编译并执行模块（含 main）。
+/// 尝试在寄存器式 VM 上执行模块：类型检查 → 依赖收集 → 编译 → 运行
 fn tryRunOnVM(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
@@ -474,8 +402,6 @@ fn tryRunOnVM(
         printError(io, "{s}: error: no 'main' function found\n", .{filename});
         return .failed;
     }
-
-    // 准备阶段：use 预加载 + 类型检查 + resolve
     prof.phaseBegin(.type_check);
     loader.prepareModule(module) catch |err| switch (err) {
         error.TypeCheckFailed => {
@@ -494,14 +420,10 @@ fn tryRunOnVM(
         },
     };
     prof.phaseEnd();
-
-    // 编译模块 → RegProgram
     var rmc = reg_vm.RegModuleCompiler.init(allocator);
     rmc.analysis_db = &loader.analysis_db;
     defer rmc.deinit();
     defer rmc.program.deinit();
-
-    // 收集 use 依赖模块
     if (module.source_path) |sp| {
         const sep_idx = std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep) orelse
             std.mem.lastIndexOfScalar(u8, sp, '/');
@@ -519,7 +441,6 @@ fn tryRunOnVM(
         printError(io, "{s}: error: dependency collection failed: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
-
     prof.phaseBegin(.compile);
     rmc.compileModuleWithDeps(&module, deps.items) catch |err| {
         prof.phaseEnd();
@@ -527,16 +448,14 @@ fn tryRunOnVM(
         return .failed;
     };
     prof.phaseEnd();
-
     const entry = rmc.lookupFn("main") orelse {
         printError(io, "{s}: error: 'main' function not found after compilation\n", .{filename});
         return .failed;
     };
-
     return runProgram(value_allocator, cache, io, &rmc.program, entry, filename);
 }
 
-/// 执行已编译的 RegProgram（寄存器式 VM）。
+/// 在寄存器式 VM 上执行已编译的程序，处理运行时 panic 与未捕获错误
 fn runProgram(
     value_allocator: std.mem.Allocator,
     cache: ?*slab_allocator.ThreadCache,
@@ -547,7 +466,13 @@ fn runProgram(
 ) VmOutcome {
     var machine = if (cache) |c| reg_vm.reg_vm.RegVM.initWithCache(c, io) else reg_vm.reg_vm.RegVM.initWithIo(value_allocator, io);
     defer machine.deinit();
-    if (profiler_enabled) machine.setProfiler(&prof);
+    if (profiler_enabled) {
+        machine.setProfiler(&prof);
+        prof.setOpcodeNameFn(reg_vm.reg_opcode.opName);
+    }
+    if (!jit_disabled) {
+        machine.enableJit();
+    }
     prof.phaseBegin(.vm);
     const result = machine.call(program, entry, &.{}) catch |err| {
         prof.phaseEnd();
@@ -566,9 +491,6 @@ fn runProgram(
     if (profiler_enabled) {
         prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
     }
-
-    // 检查是否有未捕获的 throw：main 返回 Throw 值时，
-    // Ok(_) 视为正常退出，Err(_) 视为未捕获错误。
     if (result == .throw_val) {
         const throw_val = result.throw_val.payload;
         switch (throw_val) {
@@ -580,16 +502,14 @@ fn runProgram(
             .ok => {},
         }
     }
-
     result.release(value_allocator);
     return .ran_main;
 }
 
-/// executeSource 的结果。
-/// - failed：出错（已报告），调用方以非零码退出。
-/// - ran_main：VM 已编译并执行 main。
+/// 源码执行结果：成功或失败
 const ExecOutcome = enum { failed, ran_main };
 
+/// 完整执行管线：词法分析 → 语法分析 → VM 执行
 fn executeSource(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
@@ -599,10 +519,8 @@ fn executeSource(
     source: []const u8,
     filename: []const u8,
 ) ExecOutcome {
-    // 词法分析
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
-
     prof.phaseBegin(.lex);
     const tokens = lex.tokenize() catch |err| {
         prof.phaseEnd();
@@ -614,15 +532,11 @@ fn executeSource(
     };
     prof.phaseEnd();
     defer allocator.free(tokens);
-
-    // 语法分析 — 只支持模块（顶层声明）
     var p = parser.Parser.init(allocator, tokens);
     defer p.deinit();
-
     prof.phaseBegin(.parse);
     const module = p.parseModule(filename) catch {
         prof.phaseEnd();
-        // 模块解析失败，报告错误
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         for (p.errors.items) |e| {
@@ -632,20 +546,15 @@ fn executeSource(
         return .failed;
     };
     prof.phaseEnd();
-
-    // 设置入口模块的源文件路径
-    // 入口文件路径作为 source_path，使模块加载器能正确解析相对 use 依赖
-    // （文档 §4.5）。否则从父目录运行 `glue dir/Main.glue` 时基目录误为 `.`。
     var entry_module = module;
     entry_module.source_path = filename;
-
-    // VM-only路径：直接在字节码VM上编译并执行模块
     switch (tryRunOnVM(allocator, loader, value_allocator, cache, io, entry_module, filename)) {
         .ran_main => return .ran_main,
         .failed => return .failed,
     }
 }
 
+/// 在 Windows 上将控制台输出代码页设置为 UTF-8
 fn setWindowsConsoleUtf8() void {
     const windows = std.os.windows;
     const CP_UTF8: windows.UINT = 65001;
@@ -656,7 +565,3 @@ const SetConsoleOutputCP = @extern(
     *const fn (std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL,
     .{ .name = "SetConsoleOutputCP" },
 );
-
-// (LLVM AOT 后端相关代码已移除：cmdBuild / generateImportLib / linkExecutable)
-
-

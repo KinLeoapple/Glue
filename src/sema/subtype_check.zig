@@ -1,13 +1,13 @@
-//! 子类型检查
+//! 子类型关系判定模块。
 //!
-//! 从 type_check.zig 提取的子类型判定逻辑，以自由函数形式实现。
-//! TypeInferencer 上的 isSubtype/isRecordSubtype/... 方法委托到此模块。
+//! 本模块负责 Glue 语言中各种类型之间的子类型（subtyping）检查，包括：
+//! - 基础类型与可空类型之间的兼容关系
+//! - 记录类型（record）的结构化子类型
+//! - 代数数据类型（ADT）的错误子类型关系
+//! - Throw 类型在值/错误维度上的子类型关系
+//! - trait 之间的结构化子类型关系
 //!
-//! 文档 §2.12: 三种子类型关系
-//!   §2.12.1 记录宽度子类型 —— 字段更多的记录是字段更少的记录的子类型
-//!   §2.12.2 Trait 结构化子类型 —— 方法更多的模块是方法更少的 Trait 的子类型
-//!   §2.12.3 Error 子类型 —— 自定义错误类型是 Error 的子类型
-//! 另含 Null<:T?、T<:T?、Throw<T,E1><:Throw<T,E2>(E1<:E2) 等关系。
+//! 这些判定由 TypeInferencer 在 unify、参数检查等场景下调用。
 
 const std = @import("std");
 const ast = @import("ast");
@@ -17,36 +17,38 @@ pub const Type = type_check.Type;
 pub const FieldType = type_check.FieldType;
 pub const TypeInferencer = type_check.TypeInferencer;
 
-/// 子类型判定：sub <: super ?
+/// 判断 `sub` 是否为 `super` 的子类型。
+///
+/// 判定流程依次处理：同一类型、null 与 nullable 的关系、nullable 内层、
+/// record 结构子类型、ADT 错误子类型、Throw 子类型以及 trait 结构子类型。
+/// 任何一步成立即返回 true；否则最终返回 false。
 pub fn isSubtype(inferencer: *TypeInferencer, sub: *Type, super: *Type) bool {
     const resolved_sub = inferencer.resolve(sub);
     const resolved_super = inferencer.resolve(super);
 
-    // 相同类型
+    // 解析后指向同一类型对象，必然兼容
     if (resolved_sub == resolved_super) return true;
 
-    // 1. Null <: T?（文档 §2.3.1: null 是所有 T? 的共享值）
+    // null 字面量类型可赋值给任意可空类型
     if (resolved_sub.* == .null_type and resolved_super.* == .nullable_type) return true;
 
-    // 2. T <: T?（任何类型都是其可空版本的子类型）
+    // 可空类型的内层类型若与 sub 存在子类型关系，则整体也兼容
     if (resolved_super.* == .nullable_type) {
         const inner = resolved_super.nullable_type;
         if (isSubtype(inferencer, resolved_sub, inner)) return true;
     }
 
-    // 3. 记录宽度子类型（文档 §2.12.1）
-    //    (name: str, age: i32) <: (name: str)
+    // 记录类型按结构化子类型判定（子类型需包含超类型全部字段）
     if (resolved_sub.* == .record_type and resolved_super.* == .record_type) {
         return isRecordSubtype(inferencer, resolved_sub.record_type.fields, resolved_super.record_type.fields);
     }
 
-    // 4. Error 子类型（文档 §2.12.3）
-    //    FileError <: Error
+    // ADT 类型仅在错误新类型（error newtype）场景下构成子类型
     if (resolved_sub.* == .adt_type and resolved_super.* == .adt_type) {
         return isErrorSubtype(inferencer, resolved_sub.adt_type.name, resolved_super.adt_type.name);
     }
 
-    // 5. Throw 子类型：Throw<T, E1> <: Throw<T, E2> 当 E1 <: E2
+    // Throw 类型要求值类型与错误类型同时满足子类型关系
     if (resolved_sub.* == .throw_type and resolved_super.* == .throw_type) {
         return isThrowSubtype(
             inferencer,
@@ -57,8 +59,7 @@ pub fn isSubtype(inferencer: *TypeInferencer, sub: *Type, super: *Type) bool {
         );
     }
 
-    // 6. Trait 结构化子类型（文档 §2.12.2）
-    //    方法更多的模块是方法更少的 Trait 的子类型
+    // trait 类型按方法集合的结构化子类型判定
     if (resolved_sub.* == .trait_type and resolved_super.* == .trait_type) {
         return isTraitStructuralSubtype(inferencer, resolved_sub.trait_type.name, resolved_super.trait_type.name);
     }
@@ -66,16 +67,15 @@ pub fn isSubtype(inferencer: *TypeInferencer, sub: *Type, super: *Type) bool {
     return false;
 }
 
-/// 记录宽度子类型检查
-/// 文档 §2.12.1: 字段更多的记录是字段更少的记录的子类型
+/// 记录类型结构化子类型判定：`sub_fields` 是否覆盖 `super_fields` 的全部字段。
+/// 仅按字段名匹配，不递归校验字段类型（宽度子类型）。
 pub fn isRecordSubtype(inferencer: *TypeInferencer, sub_fields: []const FieldType, super_fields: []const FieldType) bool {
     _ = inferencer;
-    // 子类型（字段更多）必须包含父类型（字段更少）的所有字段
+
     for (super_fields) |super_field| {
         var found = false;
         for (sub_fields) |sub_field| {
             if (std.mem.eql(u8, super_field.name, sub_field.name)) {
-                // 字段类型必须相同（简化处理，递归子类型检查在 unify 中处理）
                 found = true;
                 break;
             }
@@ -85,15 +85,15 @@ pub fn isRecordSubtype(inferencer: *TypeInferencer, sub_fields: []const FieldTyp
     return true;
 }
 
-/// 调用点方向性检查：实参类型 arg 是否满足形参类型 param。
-/// 只针对「两者都是记录」的情况按宽度子类型方向把关（arg 字段 ⊇ param 字段），
-/// 并对同名字段递归检查（嵌套记录的宽度子类型也按方向把关）；
-/// 其它类型组合一律返回 true，交给 unify/tryWidenUnify 处理。
+/// 判断实参记录 `arg` 是否满足形参记录 `param` 的字段要求。
+/// 非记录类型视为满足；记录类型则递归校验每个形参字段都存在且类型满足。
 pub fn recordArgSatisfies(inferencer: *TypeInferencer, param: *Type, arg: *Type) bool {
     const rp = inferencer.resolve(param);
     const ra = inferencer.resolve(arg);
+
+    // 其中任一不是记录类型则不做结构校验
     if (rp.* != .record_type or ra.* != .record_type) return true;
-    // param 的每个字段都要在 arg 中出现，且字段类型递归满足
+
     for (rp.record_type.fields) |pf| {
         var found = false;
         for (ra.record_type.fields) |af| {
@@ -108,10 +108,9 @@ pub fn recordArgSatisfies(inferencer: *TypeInferencer, param: *Type, arg: *Type)
     return true;
 }
 
-/// Error 子类型检查
-/// 文档 §2.12.3: 自定义错误类型是 Error 的子类型
+/// 错误子类型判定：当 `super_name` 为内置 Error 类型时，
+/// 任何错误新类型（is_error_newtype）的 ADT 都是其子类型。
 pub fn isErrorSubtype(inferencer: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
-    // 检查 sub 是否是 Error 的子类型
     if (std.mem.eql(u8, super_name, ast.type_names.error_type)) {
         if (inferencer.adt_types.get(sub_name)) |info| {
             if (info.is_error_newtype) return true;
@@ -120,23 +119,18 @@ pub fn isErrorSubtype(inferencer: *TypeInferencer, sub_name: []const u8, super_n
     return false;
 }
 
-/// Throw 子类型检查
-/// Throw<T, E1> <: Throw<T, E2> 当 E1 <: E2
+/// Throw 子类型判定：值类型与错误类型需同时满足子类型关系。
 pub fn isThrowSubtype(inferencer: *TypeInferencer, sub_val: *Type, sub_err: *Type, super_val: *Type, super_err: *Type) bool {
-    // 值类型必须兼容
     if (!isSubtype(inferencer, sub_val, super_val)) return false;
-    // 错误类型必须是子类型关系
     if (!isSubtype(inferencer, sub_err, super_err)) return false;
     return true;
 }
 
-/// Trait 结构化子类型检查
-/// 文档 §2.12.2: 方法更多的模块是方法更少的 Trait 的子类型
+/// trait 结构化子类型判定：`sub_name` 的方法集合需覆盖 `super_name` 的全部方法名。
 pub fn isTraitStructuralSubtype(inferencer: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
     const sub_info = inferencer.trait_types.get(sub_name) orelse return false;
     const super_info = inferencer.trait_types.get(super_name) orelse return false;
 
-    // sub 必须包含 super 的所有方法
     for (super_info.method_names) |super_method| {
         var found = false;
         for (sub_info.method_names) |sub_method| {

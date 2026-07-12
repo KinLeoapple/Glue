@@ -1,32 +1,14 @@
-//! Pass：公共子表达式消除（CSE）。
+//! 公共子表达式消除（CSE）模块。
 //!
-//! 借鉴 LLVM CSE：在同一基本块内识别重复计算的纯 binary 表达式，
-//! 将后续出现标记为 redundant（指向首次出现的 canonical）。
-//! 编译器在 emitExpr 的 .binary 分支查询：
-//!   - redundant：读 canonical 的缓存 slot（op_get_local）替代重算
-//!   - canonical：正常 emit 后缓存结果到 slot（op_set_local）供后续 redundant 读取
-//!
-//! 算法（基本块级 CSE，保守正确）：
-//!   1. 按源序遍历 block 内语句，维护 seen 列表（已见的 CSE-eligible binary）
-//!   2. 遇到 CSE-eligible binary 时，与 seen 逐一做结构相等比较
-//!      - 命中：标记当前为 redundant → seen 中的为 canonical
-//!      - 未命中：加入 seen
-//!   3. 遇 assignment 到变量 v：从 seen 移除所有读取 v 的项（缓存失效）
-//!   4. 遇控制流语句（if/while/for/loop）：清空 seen（合并点保守失效）
-//!   5. 嵌套 block/if 分支体：使用独立 fresh seen（新作用域，不继承父级）
-//!
-//! 限制：
-//! - 仅分析 pure binary（算术/比较/位运算，非 and/or/elvis/concat/range）
-//! - 仅在同一 block 内有效（canonical 与 redundant 间无控制流分隔）
-//! - 不跨函数、不跨 block
-//! - 嵌套 if/match/while/for 体作为新作用域，不继承父级 seen
+//! 定义 CSE 结果表（CseTable）与分析遍（CsePass）。遍历函数体时记录已出现的
+//! 可消除表达式，当后续遇到结构相同的表达式时，将其标记为冗余并指向首次出现
+//! 的规范表达式。赋值和循环等可能改变可见值的构造会触发失效，清空已记录集合。
 
 const std = @import("std");
 const ast = @import("ast");
 
-/// CSE 表：
-/// - redundant_map: redundant expr → canonical expr（首次出现）
-/// - canonical_set: canonical expr 集合（编译器据此决定是否缓存结果）
+/// CSE 结果表。redundant_map 将冗余表达式映射到其规范（首次出现）表达式，
+/// canonical_set 记录所有作为规范的表达式。
 pub const CseTable = struct {
     redundant_map: std.AutoHashMap(*const ast.Expr, *const ast.Expr),
     canonical_set: std.AutoHashMap(*const ast.Expr, void),
@@ -45,27 +27,28 @@ pub const CseTable = struct {
         self.canonical_set.deinit();
     }
 
-    /// 查询 expr 是否是 redundant（有对应的 canonical）。返回 canonical expr。
+    /// 返回给定表达式的规范表达式；若表达式非冗余则返回 null。
     pub fn canonicalOf(self: *const CseTable, expr: *const ast.Expr) ?*const ast.Expr {
         return self.redundant_map.get(expr);
     }
 
-    /// 查询 expr 是否是 canonical（有 redundant 指向它）。
+    /// 判断给定表达式是否为某个 CSE 组的规范表达式。
     pub fn isCanonical(self: *const CseTable, expr: *const ast.Expr) bool {
         return self.canonical_set.contains(expr);
     }
 
+    /// 结果表是否为空（无冗余表达式）。
     pub fn isEmpty(self: *const CseTable) bool {
         return self.redundant_map.count() == 0;
     }
 };
 
-/// seen 列表项：已见的 CSE-eligible binary 表达式
+/// 已见表达式条目，用于在遍历过程中追踪已出现的可消除表达式。
 const SeenEntry = struct {
     expr: *const ast.Expr,
 };
 
-/// CSE pass（借用 CseTable，由 AnalysisDB 持有）
+/// CSE 分析遍。逐函数遍历 AST，在函数体内识别结构相同的冗余表达式。
 pub const CsePass = struct {
     table: *CseTable,
     allocator: std.mem.Allocator,
@@ -77,7 +60,6 @@ pub const CsePass = struct {
         };
     }
 
-    /// 分析模块：对每个 fun_decl 体跑 CSE
     pub fn analyzeModule(self: *CsePass, module: *const ast.Module) !void {
         for (module.declarations) |decl| {
             if (decl != .fun_decl) continue;
@@ -91,33 +73,27 @@ pub const CsePass = struct {
         try self.processExpr(body, &seen);
     }
 
-    /// 处理表达式：递归子表达式，对 CSE-eligible binary 查 seen 匹配或登记。
     fn processExpr(self: *CsePass, expr: *const ast.Expr, seen: *std.ArrayListUnmanaged(SeenEntry)) anyerror!void {
         switch (expr.*) {
             .binary => |b| {
-                // 先递归子表达式（后序：子树先处理）
                 try self.processExpr(b.left, seen);
                 try self.processExpr(b.right, seen);
-                // 当前 binary 是否 CSE-eligible
                 if (isCseEligibleBinary(expr)) {
-                    // 与 seen 逐一结构比较
+                    // 与已见表达式逐一比较；若结构相同则标记为冗余。
                     for (seen.items) |entry| {
                         if (exprEqual(entry.expr, expr)) {
-                            // 命中：标记 redundant → canonical
                             try self.table.redundant_map.put(expr, entry.expr);
                             try self.table.canonical_set.put(entry.expr, {});
                             return;
                         }
                     }
-                    // 未命中：加入 seen
                     try seen.append(self.allocator, .{ .expr = expr });
                 }
             },
             .unary => |u| try self.processExpr(u.operand, seen),
             .if_expr => |i| {
-                // 条件在当前作用域
+                // then / else 分支各自独立作用域，处理后清空已见集合。
                 try self.processExpr(i.condition, seen);
-                // then/else 分支体：新作用域（fresh seen）
                 var then_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                 defer then_seen.deinit(self.allocator);
                 try self.processExpr(i.then_branch, &then_seen);
@@ -126,14 +102,12 @@ pub const CsePass = struct {
                     defer else_seen.deinit(self.allocator);
                     try self.processExpr(e, &else_seen);
                 }
-                // if 后：清空 seen（合并点保守失效）
                 seen.clearRetainingCapacity();
             },
             .block => |b| {
-                // block 内语句按源序处理，共享 seen
                 for (b.statements) |stmt| {
                     try self.processStmt(stmt, seen);
-                    // 控制流语句后清空 seen（保守）
+                    // 循环语句可能改变变量值，清空已见集合以保证安全。
                     switch (stmt.*) {
                         .while_stmt, .for_stmt, .loop_stmt => {
                             seen.clearRetainingCapacity();
@@ -156,15 +130,14 @@ pub const CsePass = struct {
                 for (mc.arguments) |a| try self.processExpr(a, seen);
             },
             .match => |m| {
+                // 每个 arm 独立作用域。
                 try self.processExpr(m.scrutinee, seen);
-                // 每个 arm 体：新作用域
                 for (m.arms) |arm| {
                     var arm_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                     defer arm_seen.deinit(self.allocator);
                     if (arm.guard) |g| try self.processExpr(g, &arm_seen);
                     try self.processExpr(arm.body, &arm_seen);
                 }
-                // match 后：清空 seen
                 seen.clearRetainingCapacity();
             },
             .type_cast => |tc| try self.processExpr(tc.expr, seen),
@@ -195,11 +168,11 @@ pub const CsePass = struct {
             },
             .assignment_expr => |a| {
                 try self.processExpr(a.value, seen);
-                // 赋值失效 seen 中读取该变量的项
+                // 对标识符赋值时仅需失效读取该变量的已见表达式；
+                // 对复杂目标赋值则保守清空全部已见集合。
                 if (a.target.* == .identifier) {
                     self.invalidate(a.target.identifier.name, seen);
                 } else {
-                    // 复杂赋值目标（字段/索引）：保守清空 seen
                     try self.processExpr(a.target, seen);
                     seen.clearRetainingCapacity();
                 }
@@ -219,7 +192,6 @@ pub const CsePass = struct {
         }
     }
 
-    /// 处理语句：提取表达式并处理，处理赋值失效。
     fn processStmt(self: *CsePass, stmt: *const ast.Stmt, seen: *std.ArrayListUnmanaged(SeenEntry)) anyerror!void {
         switch (stmt.*) {
             .val_decl => |v| try self.processExpr(v.value, seen),
@@ -229,14 +201,12 @@ pub const CsePass = struct {
                 if (a.target.* == .identifier) {
                     self.invalidate(a.target.identifier.name, seen);
                 } else {
-                    // 字段/索引赋值：保守清空
                     seen.clearRetainingCapacity();
                 }
             },
             .field_assignment => |f| {
                 try self.processExpr(f.object, seen);
                 try self.processExpr(f.value, seen);
-                // 字段赋值可能间接修改变量：保守清空
                 seen.clearRetainingCapacity();
             },
             .compound_assignment => |c| {
@@ -250,29 +220,24 @@ pub const CsePass = struct {
             .expression => |e| try self.processExpr(e.expr, seen),
             .return_stmt => |r| if (r.value) |v| try self.processExpr(v, seen),
             .while_stmt => |w| {
+                // 循环体独立作用域，处理完条件后用独立的 seen 集合分析循环体。
                 try self.processExpr(w.condition, seen);
-                // 循环体：新作用域
                 var body_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                 defer body_seen.deinit(self.allocator);
                 try self.processExpr(w.body, &body_seen);
-                // while 后：清空 seen
                 seen.clearRetainingCapacity();
             },
             .for_stmt => |f| {
                 try self.processExpr(f.iterable, seen);
-                // 循环体：新作用域
                 var body_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                 defer body_seen.deinit(self.allocator);
                 try self.processExpr(f.body, &body_seen);
-                // for 后：清空 seen
                 seen.clearRetainingCapacity();
             },
             .loop_stmt => |l| {
-                // 循环体：新作用域
                 var body_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                 defer body_seen.deinit(self.allocator);
                 try self.processExpr(l.body, &body_seen);
-                // loop 后：清空 seen
                 seen.clearRetainingCapacity();
             },
             .defer_stmt => |d| try self.processExpr(d.expr, seen),
@@ -281,7 +246,7 @@ pub const CsePass = struct {
         }
     }
 
-    /// 从 seen 中移除所有读取变量 name 的项。
+    /// 失效所有读取指定变量的已见表达式，因为该变量已被重新赋值。
     fn invalidate(self: *CsePass, name: []const u8, seen: *std.ArrayListUnmanaged(SeenEntry)) void {
         _ = self;
         var i: usize = 0;
@@ -295,11 +260,7 @@ pub const CsePass = struct {
     }
 };
 
-// ============================================================
-// 结构相等判定
-// ============================================================
-
-/// 两个表达式是否结构相等（递归比较 AST 节点）。
+/// 两个表达式的结构相等性判断。比较时忽略位置信息，仅比较语义内容。
 fn exprEqual(a: *const ast.Expr, b: *const ast.Expr) bool {
     if (@intFromEnum(a.*) != @intFromEnum(b.*)) return false;
     return switch (a.*) {
@@ -312,11 +273,11 @@ fn exprEqual(a: *const ast.Expr, b: *const ast.Expr) bool {
         .identifier => |ai| std.mem.eql(u8, ai.name, b.identifier.name),
         .binary => |ab| ab.op == b.binary.op and exprEqual(ab.left, b.binary.left) and exprEqual(ab.right, b.binary.right),
         .unary => |au| au.op == b.unary.op and exprEqual(au.operand, b.unary.operand),
-        else => a == b, // 其他类型用指针相等（不参与 CSE 匹配）
+        else => a == b,
     };
 }
 
-/// 表达式是否读取变量 name（递归检查子表达式）。
+/// 判断表达式是否读取了指定名称的变量。
 fn exprReadsVar(expr: *const ast.Expr, name: []const u8) bool {
     return switch (expr.*) {
         .identifier => |id| std.mem.eql(u8, id.name, name),
@@ -326,11 +287,7 @@ fn exprReadsVar(expr: *const ast.Expr, name: []const u8) bool {
     };
 }
 
-// ============================================================
-// CSE 资格判定
-// ============================================================
-
-/// binary 是否 CSE-eligible：op 是纯算术/比较/位运算，且操作数均 eligible。
+/// 判断二元表达式是否适合 CSE。仅纯算术 / 比较 / 位运算且操作数满足条件的表达式可消除。
 fn isCseEligibleBinary(expr: *const ast.Expr) bool {
     switch (expr.*) {
         .binary => |b| switch (b.op) {
@@ -338,15 +295,13 @@ fn isCseEligibleBinary(expr: *const ast.Expr) bool {
             .eq, .not_eq, .lt, .gt, .lt_eq, .gt_eq,
             .bit_and, .bit_or, .bit_xor,
             => return isCseEligibleOperand(b.left) and isCseEligibleOperand(b.right),
-            // and/or/elvis 短路语义不适合 CSE（可能不计算右操作数）
-            // concat/concat_list/range/range_inclusive 可能分配，不 CSE
             else => return false,
         },
         else => return false,
     }
 }
 
-/// 操作数是否 CSE-eligible：字面量/identifier/pure binary/pure unary。
+/// 判断操作数是否适合 CSE：字面量、标识符或递归满足条件的二元 / 一元表达式。
 fn isCseEligibleOperand(expr: *const ast.Expr) bool {
     return switch (expr.*) {
         .int_literal, .float_literal, .bool_literal, .char_literal,

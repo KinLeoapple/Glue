@@ -1,16 +1,8 @@
-//! Kind 检查与推断
+//! 类型种类（kind）检查模块。
 //!
-//! 文档 §2.11.1: Kind 系统
-//!   *            具体类型           i32, str, bool
-//!   * -> *       一阶类型构造器     List, Vec, Tree, Atomic, Spawn
-//!   * -> * -> *  二阶类型构造器     Map, Throw
-//!
-//! 以自由函数形式实现，TypeInferencer 委托过来。
-//! 核心检查：类型注解中出现的类型构造器，必须按其 arity 完全应用到 `*`
-//! （即"用作具体类型的地方 kind 必须是 *"）。
-//!   - `C<a, b, ...>`：head C 的 arity 必须等于实参个数，且每个实参 kind 为 *
-//!   - 裸 `C`（无尖括号）：若 C 是 arity>0 的构造器，则它是 `* -> ...`，
-//!     用在类型位置是 kind 不匹配。
+//! 负责在语义分析阶段校验类型注解中类型构造器的使用是否与其种类（arity）一致，
+//! 例如 `Throw` 期望 2 个类型参数、`Atomic` 期望 1 个，而自定义 ADT 按其声明
+//! 的类型参数个数决定。当类型构造器被当作具体类型使用或参数个数不符时报告错误。
 
 const std = @import("std");
 const ast = @import("ast");
@@ -18,12 +10,11 @@ const type_check = @import("type_check");
 
 pub const TypeInferencer = type_check.TypeInferencer;
 
-/// 返回某个类型名作为类型构造器的 arity（需要的类型参数个数）。
-/// 未知名字返回 0（当作具体类型，避免误报）。
+/// 返回类型名为 `name` 的类型构造器所期望的类型参数个数（种类 arity）。
+/// 内建高阶类型（Throw/Atomic/Spawn 等）使用固定 arity，自定义 ADT 取其声明的
+/// 类型参数个数，其余裸类型名 arity 为 0。
 pub fn arityOfTypeName(inferencer: *TypeInferencer, name: []const u8) usize {
-    // 内建二阶构造器
     if (std.mem.eql(u8, name, "Throw")) return 2;
-    // 内建一阶构造器
     if (std.mem.eql(u8, name, "Atomic") or
         std.mem.eql(u8, name, "Spawn") or
         std.mem.eql(u8, name, "Channel") or
@@ -33,16 +24,14 @@ pub fn arityOfTypeName(inferencer: *TypeInferencer, name: []const u8) usize {
     {
         return 1;
     }
-    // 用户 ADT / newtype：type_param_names 长度即 arity
     if (inferencer.adt_types.get(name)) |info| {
         return info.type_param_names.len;
     }
     return 0;
 }
 
-/// 检查一个类型注解节点的 kind 合法性，错误写入 inferencer.errors。
-/// type_param_names：当前作用域内的类型参数名（如函数/ADT 的 <T>），
-/// 这些名字是已绑定的类型变量，跳过 arity 检查。
+/// 递归检查类型节点树中每个类型构造器的使用是否符合其种类 arity。
+/// `type_param_names` 给出当前作用域内合法的类型参数名（它们可作具体类型使用）。
 pub fn checkTypeNode(
     inferencer: *TypeInferencer,
     node: *const ast.TypeNode,
@@ -50,7 +39,7 @@ pub fn checkTypeNode(
 ) void {
     switch (node.*) {
         .named => |n| {
-            // 裸类型名用在类型位置：若是 arity>0 的构造器则 kind 不匹配
+            // 类型参数名可直接作为具体类型使用，无需校验
             if (isTypeParam(n.name, type_param_names)) return;
             const arity = arityOfTypeName(inferencer, n.name);
             if (arity > 0) {
@@ -58,19 +47,15 @@ pub fn checkTypeNode(
             }
         },
         .self_type => {
-            // Self 类型在方法中总是具体类型
             return;
         },
         .generic => |g| {
-            // Throw/内建/用户构造器：实参个数必须等于 arity
             if (!isTypeParam(g.name, type_param_names)) {
                 const arity = arityOfTypeName(inferencer, g.name);
-                // arity==0 且非内建泛型：可能是未知类型（由别处报 undefined），不在此重复报 kind
                 if (arity != 0 and arity != g.args.len) {
                     inferencer.addErrorAt(.type_mismatch, g.location.line, g.location.column, "kind mismatch: type constructor '{s}' expects {d} type argument(s) but got {d}", .{ g.name, arity, g.args.len });
                 }
             }
-            // 递归检查每个实参必须是具体类型（kind *）
             for (g.args) |arg| {
                 checkTypeNode(inferencer, arg, type_param_names);
             }
@@ -88,6 +73,7 @@ pub fn checkTypeNode(
     }
 }
 
+/// 判断 `name` 是否为当前作用域内的类型参数。
 fn isTypeParam(name: []const u8, type_param_names: []const []const u8) bool {
     for (type_param_names) |tp| {
         if (std.mem.eql(u8, name, tp)) return true;
@@ -95,12 +81,8 @@ fn isTypeParam(name: []const u8, type_param_names: []const []const u8) bool {
     return false;
 }
 
-/// 计算一个类型注解在「类型构造器」意义上的 kind arity（剩余未应用的参数个数）。
-///   i32 / List<i32>            → 0（具体类型，kind *）
-///   List（裸名，arity 1）       → 1（kind * -> *）
-///   Map（裸名，arity 2）        → 2
-///   List<i32>（已应用 1 个）    → 0
-/// 未知/类型参数名 → 0（当作具体类型，避免误报）。
+/// 计算类型节点剩余的种类 arity：即还差多少个类型参数才能成为具体类型。
+/// 裸类型名返回其 arity；部分应用的高阶类型返回 (arity - 已提供参数数)。
 pub fn kindArityOfTypeNode(inferencer: *TypeInferencer, node: *const ast.TypeNode) usize {
     switch (node.*) {
         .named => |n| return arityOfTypeName(inferencer, n.name),
@@ -111,17 +93,4 @@ pub fn kindArityOfTypeNode(inferencer: *TypeInferencer, node: *const ast.TypeNod
         },
         else => return 0,
     }
-}
-
-fn typeNodeLoc(node: *const ast.TypeNode) ast.SourceLocation {
-    return switch (node.*) {
-        .named => |n| n.location,
-        .self_type => |s| s.location,
-        .generic => |g| g.location,
-        .nullable => |nl| typeNodeLoc(nl.inner),
-        .function => |f| f.location,
-        .record => |r| r.location,
-        .array => |a| a.location,
-        .kind_annotated => |ka| ka.location,
-    };
 }

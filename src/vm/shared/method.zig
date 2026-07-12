@@ -1,21 +1,26 @@
-//! VM 共享：内建方法分派（数组 / 字符串 / Atomic / Channel）。
+//! 运行期内置方法分派。
 //!
-//! 镜像 eval.zig callMethod 的数据方法子集（len/push/pop/contains/is_empty/first/last/drop_last），
-//! 但走 VM 纯 refcount 纪律：receiver 与实参均为栈上 owned，由调用方（OP_CALL_METHOD）释放；
-//! 本模块仅负责构造结果（新数组/标量），retainOwned 元素自留。并发/原子方法（send/recv/cas/...）留 M4。
-//!
-//! 不变量：dispatch 不持有 receiver/args 所有权（不 release 它们）；返回的 Value 是 fresh owned。
+//! 提供按 MethodId 与按方法名字符串两种分派入口，支持数组、字符串、
+//! 原子值与通道等接收者类型的常用方法（len/push/pop/send/recv 等），
+//! 供 RegVM 在执行 op_call_method 时调用。
 
 const std = @import("std");
 const value = @import("value");
+
 const Value = value.Value;
 const Int = value.Int;
 
-pub const MethodError = error{ OutOfMemory, NoSuchMethod, TypeMismatch, WrongArity, ChannelClosed, ArithmeticOverflow };
+/// 方法调用可能产生的错误。
+pub const MethodError = error{
+    OutOfMemory,
+    NoSuchMethod,
+    TypeMismatch,
+    WrongArity,
+    ChannelClosed,
+    ArithmeticOverflow,
+};
 
-/// 【方案 A：方法分派 ID 化】
-/// 编译期内建方法名 → u8 id，运行时用 switch(id) 替代字符串比较链。
-/// unknown 表示非内建方法（需走 trait/用户方法分派路径）。
+/// 内置方法标识枚举，按方法名长度分组以便快速匹配。
 pub const MethodId = enum(u8) {
     unknown = 0,
     len,
@@ -33,18 +38,16 @@ pub const MethodId = enum(u8) {
     close,
     message,
     type_name,
-    // Spawn 方法
     await_op,
     cancel,
     status,
-    // Channel 字段访问
     sender,
     receiver,
-    // error_newtype 方法
     prefix,
 
+    /// 根据方法名返回对应的 MethodId，未匹配时返回 .unknown。
+    /// 按名称长度分组后逐字节比较，避免重复哈希计算。
     pub fn fromName(name: []const u8) MethodId {
-        // 仍用字符串比较，但只在 call site 做一次，运行时分派走 switch(id)
         if (name.len == 3) {
             if (name[0] == 'l' and name[1] == 'e' and name[2] == 'n') return .len;
             if (name[0] == 'p' and name[1] == 'o' and name[2] == 'p') return .pop;
@@ -91,9 +94,8 @@ pub const MethodId = enum(u8) {
     }
 };
 
-/// 【方案 A】按 MethodId 分派内建方法。
-/// 返回 null 表示非内建方法（调用方应走 trait/用户方法路径）。
-/// 返回 Value 表示内建方法已处理（调用方负责释放 receiver + args）。
+/// 按 MethodId 分派方法调用，返回结果值或 null（表示方法不适用）。
+/// 对参数个数与接收者类型进行校验，失败时返回对应错误。
 pub fn dispatchById(allocator: std.mem.Allocator, receiver: Value, method_id: MethodId, args: []const Value) MethodError!?Value {
     switch (method_id) {
         .unknown => return null,
@@ -169,9 +171,9 @@ pub fn dispatchById(allocator: std.mem.Allocator, receiver: Value, method_id: Me
             for (arr.elements[0..n], 0..) |e, i| new_elems[i] = try retainOwned(allocator, e);
             return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
         },
+        // 原子值的比较交换与交换操作，仅接受标量参数
         .cas, .swap => {
-            // Atomic<T> 方法
-            if (receiver != .atomic_val) return null; // 非 Atomic，让上层处理
+            if (receiver != .atomic_val) return null;
             const av = receiver.atomic_val;
             const isScalar = struct {
                 fn check(v: Value) bool {
@@ -195,8 +197,8 @@ pub fn dispatchById(allocator: std.mem.Allocator, receiver: Value, method_id: Me
                 else => unreachable,
             }
         },
+        // 通道相关方法：send/recv/close，根据接收者类型分派
         .send, .recv, .close => {
-            // Channel<T>/Sender<T>/Receiver<T> 方法
             return switch (receiver) {
                 .channel_val => blk: {
                     const ch = receiver.channel_val;
@@ -215,7 +217,7 @@ pub fn dispatchById(allocator: std.mem.Allocator, receiver: Value, method_id: Me
                             if (args.len != 0) return error.WrongArity;
                             break :blk ch.recv() orelse Value.fromNull();
                         },
-                        else => break :blk null, // close 仅 Sender
+                        else => break :blk null,
                     }
                 },
                 .sender_val => blk: {
@@ -249,35 +251,32 @@ pub fn dispatchById(allocator: std.mem.Allocator, receiver: Value, method_id: Me
                         else => break :blk null,
                     }
                 },
-                else => null, // 非通道类型，让上层处理
+                else => null,
             };
         },
+        // 以下方法由 VM 层直接处理，此处返回 null
         .message, .type_name => {
-            // Error trait 内置方法 —— 这些在 doCallMethod 中已有特殊处理（需访问 error_val/throw_val 字段）
-            // 返回 null 让上层处理（避免重复逻辑）
             return null;
         },
-        // 以下方法由 reg_vm 专用路径处理（Spawn/Channel/error_newtype），此处不处理
         .await_op, .cancel, .status, .sender, .receiver, .prefix => return null,
     }
 }
 
-/// 结构相等（contains 用）。复用 value.equals（深比较基础/数组/记录）。
+/// 比较两个 Value 是否结构相等，委托给 value.equals。
 fn structEquals(a: Value, b: Value) bool {
     return value.equals(a, b);
 }
 
-/// retainOwned 语义：所有类型走 v.retain()（新 Str 有 rc，共享而非 dupe；基础值 retain 是 noop）。
+/// 对 Value 执行引用计数保留，返回保留后的新引用。
 fn retainOwned(allocator: std.mem.Allocator, v: Value) MethodError!Value {
     _ = allocator;
     return v.retain();
 }
 
-/// 分派内建方法。receiver + args 为栈上 owned（调用方负责 release）；返回 fresh owned 结果。
-/// 未知方法 → NoSuchMethod；类型不符 → TypeMismatch；参数数错 → WrongArity。
+/// 按方法名字符串分派方法调用。
+/// 与 dispatchById 功能对应，但通过字符串比较匹配方法名，
+/// 供无法预先解析 MethodId 的调用路径使用。
 pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u8, args: []const Value) MethodError!Value {
-    // len()：string → Unicode 标量数；array → 元素数。
-    // usize/u64 → i32 为 narrowing（大转小），必须范围检查；超范围返回 ArithmeticOverflow。
     if (std.mem.eql(u8, method, "len")) {
         if (args.len != 0) return error.WrongArity;
         return switch (receiver) {
@@ -294,7 +293,6 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
             else => error.TypeMismatch,
         };
     }
-    // is_empty()：string/array。
     if (std.mem.eql(u8, method, "is_empty")) {
         if (args.len != 0) return error.WrongArity;
         return switch (receiver) {
@@ -303,7 +301,6 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
             else => error.TypeMismatch,
         };
     }
-    // push(v)：array → 追加后的新数组（值语义；用法 arr = arr.push(x)）。
     if (std.mem.eql(u8, method, "push")) {
         if (args.len != 1) return error.WrongArity;
         if (receiver != .array) return error.TypeMismatch;
@@ -313,7 +310,6 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         new_elems[arr.elements.len] = try retainOwned(allocator, args[0]);
         return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
     }
-    // pop()：array → 最后一个元素（T?），空数组 → null。
     if (std.mem.eql(u8, method, "pop")) {
         if (args.len != 0) return error.WrongArity;
         if (receiver != .array) return error.TypeMismatch;
@@ -321,7 +317,6 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         if (arr.elements.len == 0) return Value.fromNull();
         return try retainOwned(allocator, arr.elements[arr.elements.len - 1]);
     }
-    // first()/last()：array → 首/末元素（T?），空 → null。
     if (std.mem.eql(u8, method, "first")) {
         if (args.len != 0) return error.WrongArity;
         if (receiver != .array) return error.TypeMismatch;
@@ -336,7 +331,6 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         if (arr.elements.len == 0) return Value.fromNull();
         return try retainOwned(allocator, arr.elements[arr.elements.len - 1]);
     }
-    // contains(v)：array → 结构相等查找，压 bool。
     if (std.mem.eql(u8, method, "contains")) {
         if (args.len != 1) return error.WrongArity;
         if (receiver != .array) return error.TypeMismatch;
@@ -346,7 +340,6 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         }
         return Value.fromBool(false);
     }
-    // drop_last()：array → 去掉末元素的新数组（空数组返回空数组拷贝）。
     if (std.mem.eql(u8, method, "drop_last")) {
         if (args.len != 0) return error.WrongArity;
         if (receiver != .array) return error.TypeMismatch;
@@ -356,8 +349,7 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         for (arr.elements[0..n], 0..) |e, i| new_elems[i] = try retainOwned(allocator, e);
         return value.Value.makeArray(allocator, new_elems, null) catch error.OutOfMemory;
     }
-    // M4a：Atomic<T> 方法 —— cas(expected, new) → bool；swap(new) → 旧值。
-    // 直接传 Value（atomic 内部 std.meta.eql 做位精确比较），仅校验实参是标量。
+    // 原子值方法：cas / swap
     if (receiver == .atomic_val) {
         const av = receiver.atomic_val;
         const isScalar = struct {
@@ -380,9 +372,7 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         }
         return error.NoSuchMethod;
     }
-    // M4b：Channel<T> 方法 —— send(v) → unit（关闭则 ChannelClosed）；recv() → T?（关闭且空 → null）。
-    // close 仅 Sender 可用。所有权：send 把值 retainOwned 进缓冲（调用方随后 release 实参）；
-    // recv 把缓冲值所有权转出（不再 retain）。
+    // 通道方法：send / recv
     if (receiver == .channel_val) {
         const ch = receiver.channel_val;
         if (std.mem.eql(u8, method, "send")) {
@@ -401,6 +391,7 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         }
         return error.NoSuchMethod;
     }
+    // 发送端方法：send / close
     if (receiver == .sender_val) {
         const sv = receiver.sender_val;
         if (std.mem.eql(u8, method, "send")) {
@@ -420,6 +411,7 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
         }
         return error.NoSuchMethod;
     }
+    // 接收端方法：recv
     if (receiver == .receiver_val) {
         const rv = receiver.receiver_val;
         if (std.mem.eql(u8, method, "recv")) {
@@ -431,27 +423,28 @@ pub fn dispatch(allocator: std.mem.Allocator, receiver: Value, method: []const u
     return error.NoSuchMethod;
 }
 
-/// UTF-8 字符串的 Unicode 标量值（码点）个数；非法 UTF-8 退化为字节数。
+/// 计算 UTF-8 字符串的码点数量（而非字节数）。
+/// 先以 8 字节为块扫描 ASCII 快速路径，遇非 ASCII 再回退到码点迭代。
 fn utf8Len(s: []const u8) u64 {
-    // ASCII fast path：所有字节 < 128 时码点数 = 字节数，O(1) 返回。
-    // SIMD 友好：每次 8 字节 OR 后检查高位。纯 ASCII 字符串（如 "abab..."）
-    // 命中率极高，避免 Utf8View 迭代的逐字节状态机开销。
+    // 按 8 字节块检查是否有非 ASCII 字节（高位为 1）
     var i: usize = 0;
     while (i + 8 <= s.len) : (i += 8) {
         const chunk = std.mem.readInt(u64, s[i..][0..8], .little);
-        if (chunk & 0x8080_8080_8080_8080 != 0) break; // 非 ASCII，转慢路径
+        if (chunk & 0x8080_8080_8080_8080 != 0) break;
     }
     if (i < s.len) {
-        // 检查尾部剩余字节（< 8）
         var has_non_ascii = false;
         for (s[i..]) |b| {
-            if (b >= 0x80) { has_non_ascii = true; break; }
+            if (b >= 0x80) {
+                has_non_ascii = true;
+                break;
+            }
         }
         if (!has_non_ascii) return @intCast(s.len);
     } else {
-        return @intCast(s.len); // 全 ASCII（含 i==s.len 的对齐情况）
+        return @intCast(s.len);
     }
-    // slow path：含非 ASCII 字节，走 Utf8View 逐码点计数
+    // 非 ASCII 路径：逐码点迭代计数
     const view = std.unicode.Utf8View.init(s) catch return @intCast(s.len);
     var count: u64 = 0;
     var it = view.iterator();
@@ -459,15 +452,8 @@ fn utf8Len(s: []const u8) u64 {
     return count;
 }
 
-// ============================================================
-// 测试：支撑 §2.15 类型转换规范 + F6 len() narrowing 范围检查
-// ============================================================
-
 const testing = std.testing;
 
-/// 释放 string Value（绕过 Value.release 对 SSO 字符串的 rc 处理缺陷）。
-/// SSO 字符串 rc 字段编码了 SSO 标志（bit31）+ 长度（bits 0-4），
-/// Value.release 的 `rc > 1` 检查对 SSO 字符串恒为 true，导致永不释放。
 fn freeStringVal(allocator: std.mem.Allocator, v: Value) void {
     v.string.deinit(allocator);
     allocator.destroy(v.string);
@@ -483,7 +469,6 @@ test "len() string ASCII returns codepoint count" {
 
 test "len() string multi-byte UTF-8 returns codepoint count not byte count" {
     const allocator = testing.allocator;
-    // "你好世界" = 4 个汉字，每个 3 字节 UTF-8 → 12 字节，但 len() 应返回 4
     const s = try Value.fromStringBytes(allocator, "你好世界");
     defer freeStringVal(allocator, s);
     const result = try dispatch(allocator, s, "len", &.{});
@@ -492,7 +477,6 @@ test "len() string multi-byte UTF-8 returns codepoint count not byte count" {
 
 test "len() string with emoji (4-byte UTF-8)" {
     const allocator = testing.allocator;
-    // "a😀b" = 3 个码点（'a', U+1F600, 'b'），字节数 = 1+4+1 = 6
     const s = try Value.fromStringBytes(allocator, "a😀b");
     defer freeStringVal(allocator, s);
     const result = try dispatch(allocator, s, "len", &.{});
@@ -509,8 +493,6 @@ test "len() empty string returns 0" {
 
 test "len() array returns element count" {
     const allocator = testing.allocator;
-    // 注意：makeArray 接管 elems 所有权，deinit 时会 free(elements)。
-    // 所以不要 defer allocator.free(elems)——那会导致 double-free。
     const elems = try allocator.alloc(Value, 3);
     elems[0] = Value.fromInt(Int.fromNative(.i32, @as(i32, 10)));
     elems[1] = Value.fromInt(Int.fromNative(.i32, @as(i32, 20)));
@@ -525,7 +507,6 @@ test "len() empty array returns 0" {
     const allocator = testing.allocator;
     const empty_elems = try allocator.alloc(Value, 0);
     const arr = try Value.makeArray(allocator, empty_elems, null);
-    // deinit 不 free 空 slice（len==0），需手动 free（LIFO：先 release 后 free）
     defer allocator.free(empty_elems);
     defer arr.release(allocator);
     const result = try dispatch(allocator, arr, "len", &.{});
@@ -547,7 +528,6 @@ test "len() with args returns WrongArity" {
 }
 
 test "len() result type is i32 (narrowing target)" {
-    // F6: 验证 len() 返回 i32 类型（usize→i32 narrowing 的目标类型）
     const allocator = testing.allocator;
     const s = try Value.fromStringBytes(allocator, "test");
     defer freeStringVal(allocator, s);

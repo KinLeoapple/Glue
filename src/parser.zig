@@ -1,54 +1,35 @@
-//! Glue 语言递归下降语法分析器
+//! 递归下降语法分析器（Parser）
 //!
-//! 将 Token 流转换为 AST，支持：
-//! - 完整的运算符优先级解析
-//! - 顶层声明（fun/type/trait/use/pack）
-//! - 表达式（字面量、二元/一元/后缀运算、Lambda、if/match/spawn/lazy/select 等）
-//! - 语句（val/var/赋值/return/defer/throw/break/continue/for/while/loop）
-//! - 类型注解和模式
-//! - 错误恢复
+//! 将词法分析器产生的 Token 序列解析为抽象语法树（AST）。
+//! 采用递归下降 + 优先级爬升方式处理表达式，支持函数/类型/trait/import 等声明、
+//! 模式匹配、lambda、控制流语句、字符串插值等语言特性。
+//! AST 节点通过 arena 分配器统一分配，分析失败时收集错误并尝试同步恢复。
 
 const std = @import("std");
 const lexer = @import("lexer");
 const ast = @import("ast");
 const arena_allocator = @import("arena_allocator");
 
-// ============================================================
-// 解析错误
-// ============================================================
-
-/// 解析错误信息
+/// 语法错误信息：行列号与消息
 pub const ParseError = struct {
-    /// 错误位置
     line: u32,
     column: u32,
-    /// 错误消息
     message: []const u8,
 };
 
-/// 解析器可能返回的错误集（用于打破互相递归函数的依赖循环）
 const ParserError = error{ OutOfMemory, UnexpectedToken };
 
-// ============================================================
-// Parser
-// ============================================================
-
+/// 语法分析器：持有 Token 序列、当前位置、arena 与错误列表
 pub const Parser = struct {
     tokens: []lexer.Token,
     current: usize,
     allocator: std.mem.Allocator,
-    /// 【优化】AST 节点 arena：所有 allocExpr/allocStmt/allocType/allocPattern/allocKind
-    /// 从此 arena 分配，deinit 时一次性释放，避免数百次逐个 destroy + 追踪 ArrayList 开销。
     arena: arena_allocator.ArenaAllocator,
     errors: std.ArrayList(ParseError),
-    /// 是否拥有 tokens 缓冲（init 复制以便就地拆分 `>=`/`>>`，deinit 释放）
     owns_tokens: bool,
 
-    /// 初始化解析器
+    /// 创建分析器，尝试复制 Token 序列；复制失败时直接引用传入切片
     pub fn init(allocator: std.mem.Allocator, tokens: []const lexer.Token) Parser {
-        // 复制一份可变 token 缓冲：闭合泛型尖括号时需把 `>=` 就地拆成 `>` + `=`
-        // （词法器贪婪地把 `>=` 合成单 token，导致 `Type<T>=` 无法解析）。
-        // 复制失败则退回只读切片（拆分能力降级，但不影响其它解析）。
         const owned: ?[]lexer.Token = allocator.dupe(lexer.Token, tokens) catch null;
         return Parser{
             .tokens = owned orelse @constCast(tokens),
@@ -60,37 +41,35 @@ pub const Parser = struct {
         };
     }
 
-    /// 释放解析器资源
+    /// 释放分析器资源
     pub fn deinit(self: *Parser) void {
         if (self.owns_tokens) self.allocator.free(self.tokens);
         self.errors.deinit(self.allocator);
         self.arena.deinit();
     }
 
-    // --------------------------------------------------------
-    // 导航辅助方法
-    // --------------------------------------------------------
+    // ---- Token 导航辅助 ----
 
-    /// 当前 token
+    /// 查看当前 Token，越界时返回最后一个（eof）
     fn peek(self: *Parser) lexer.Token {
         if (self.current >= self.tokens.len) {
-            return self.tokens[self.tokens.len - 1]; // EOF
+            return self.tokens[self.tokens.len - 1];
         }
         return self.tokens[self.current];
     }
 
-    /// 上一个 token
+    /// 返回上一个已消费的 Token
     fn previous(self: *Parser) lexer.Token {
         std.debug.assert(self.current > 0);
         return self.tokens[self.current - 1];
     }
 
-    /// 是否到达末尾
+    /// 是否到达 Token 序列末尾
     pub fn isAtEnd(self: *Parser) bool {
         return self.peek().type == .eof;
     }
 
-    /// 前进一个 token，返回被消费的 token
+    /// 消费当前 Token 并前进，到达末尾时不前进
     fn advance(self: *Parser) lexer.Token {
         if (!self.isAtEnd()) {
             self.current += 1;
@@ -98,13 +77,13 @@ pub const Parser = struct {
         return self.previous();
     }
 
-    /// 检查当前 token 类型
+    /// 当前 Token 是否为指定类型
     fn check(self: *Parser, token_type: lexer.TokenType) bool {
         if (self.isAtEnd()) return false;
         return self.peek().type == token_type;
     }
 
-    /// 如果当前 token 匹配则前进，返回是否匹配
+    /// 当当前 Token 匹配时消费并返回 true
     fn matchToken(self: *Parser, token_type: lexer.TokenType) bool {
         if (self.check(token_type)) {
             _ = self.advance();
@@ -113,7 +92,7 @@ pub const Parser = struct {
         return false;
     }
 
-    /// 期望特定 token，不匹配则报错
+    /// 期望消费指定类型 Token，不匹配时记录错误并返回 UnexpectedToken
     fn expect(self: *Parser, token_type: lexer.TokenType, message: []const u8) ParserError!lexer.Token {
         if (self.check(token_type)) {
             return self.advance();
@@ -127,21 +106,13 @@ pub const Parser = struct {
         return error.UnexpectedToken;
     }
 
-    /// 闭合泛型尖括号 `>`。
-    /// 词法器会把 `>=` 贪婪合成单个 `gt_eq`，把 `>>` 切成两个 `gt`。
-    /// 这里统一处理闭合点：
-    ///   - 当前是 `gt`：正常消费。
-    ///   - 当前是 `gt_eq`：只消费它的 `>` 部分，把该 token 就地改写成 `eq`
-    ///     （`current` 不前进），使后续读到一个独立的 `=`。这样 `Type<T>= v`
-    ///     能正确解析，无需用户加空格。
-    /// owns_tokens 为 false（复制失败降级）时无法就地改写，退回普通 expect(.gt)。
+    /// 期望消费关闭泛型参数的 '>'，支持把 `>=` 拆分为 `>` 与 `=` 以消除歧义
     fn expectCloseAngle(self: *Parser, message: []const u8) ParserError!void {
         if (self.check(.gt)) {
             _ = self.advance();
             return;
         }
         if (self.owns_tokens and self.current < self.tokens.len and self.tokens[self.current].type == .gt_eq) {
-            // 拆分：把 `>=` 改写为 `=`，列号右移 1，相当于已消费了前面的 `>`
             self.tokens[self.current].type = .eq;
             self.tokens[self.current].column +%= 1;
             return;
@@ -155,7 +126,7 @@ pub const Parser = struct {
         return error.UnexpectedToken;
     }
 
-    /// 报告错误
+    /// 在当前 Token 处记录一条语法错误
     fn reportError(self: *Parser, message: []const u8) ParserError!void {
         const tok = self.peek();
         try self.errors.append(self.allocator, ParseError{
@@ -165,7 +136,7 @@ pub const Parser = struct {
         });
     }
 
-    /// 错误恢复：跳到同步点
+    /// 错误恢复：跳过 Token 直到遇到下一个声明起始或右大括号
     fn synchronize(self: *Parser) void {
         while (!self.isAtEnd()) {
             switch (self.peek().type) {
@@ -190,15 +161,13 @@ pub const Parser = struct {
         }
     }
 
-    /// 检查当前 token 是否为标识符且词素匹配
+    /// 当前 Token 是否为指定名称的标识符
     fn checkIdentifier(self: *Parser, name: []const u8) bool {
         if (self.peek().type != .identifier) return false;
         return std.mem.eql(u8, self.peek().lexeme, name);
     }
 
-    // --------------------------------------------------------
-    // AST 节点分配辅助
-    // --------------------------------------------------------
+    // ---- AST 节点分配辅助 ----
 
     fn allocExpr(self: *Parser, expr: ast.Expr) ParserError!*ast.Expr {
         const ptr = try self.arena.allocator().create(ast.Expr);
@@ -230,49 +199,33 @@ pub const Parser = struct {
         return ptr;
     }
 
-    // ============================================================
-    // 模块解析
-    // ============================================================
+    // ---- 模块与顶层声明 ----
 
-    /// 解析整个模块
+    /// 解析整个模块：循环解析声明或顶层表达式，收集错误后返回 Module
     pub fn parseModule(self: *Parser, module_name: []const u8) ParserError!ast.Module {
         var declarations = std.ArrayList(ast.Decl).empty;
         errdefer declarations.deinit(self.allocator);
-
         while (!self.isAtEnd()) {
-            // 声明关键字开头：必然是声明，解析失败则同步到下一声明，
-            // 不回退到 parseExpr（否则会对声明残余 token 产生误导性次生错误，
-            // 如缺前导 `|` 的枚举在真正诊断后再报一次 "expected expression"）。
             const at_decl_kw = self.check(.kw_fun) or self.check(.kw_type) or
                 self.check(.kw_trait) or
                 self.check(.kw_import) or self.check(.kw_pack) or self.check(.kw_pub);
-
-            // 先尝试解析为声明
             if (self.tryParseDecl()) |decl| {
                 try declarations.append(self.allocator, decl);
                 continue;
             }
-
             if (at_decl_kw) {
                 self.synchronize();
                 continue;
             }
-
-            // 声明解析失败，尝试解析为顶层表达式或赋值语句
             const before_expr = self.current;
             const expr = self.parseExpr() catch {
-                // 表达式也解析失败，同步到下一个语句开始
                 self.synchronize();
                 continue;
             };
-
-            // 如果 parseExpr 没有消费任何 token，跳过当前 token 避免无限循环
             if (self.current == before_expr) {
                 _ = self.advance();
                 continue;
             }
-
-            // 检查是否是赋值语句（identifier = expr）
             if (self.matchToken(.eq)) {
                 const value = self.parseExpr() catch |err| {
                     if (err == error.UnexpectedToken) {
@@ -281,7 +234,6 @@ pub const Parser = struct {
                     }
                     return err;
                 };
-                // 包装为赋值语句的表达式声明
                 const stmt = try self.allocStmt(ast.Stmt{
                     .assignment = .{
                         .location = getExprLocation(expr),
@@ -297,7 +249,6 @@ pub const Parser = struct {
                     },
                 });
             } else {
-                // 将表达式包装为表达式声明
                 try declarations.append(self.allocator, ast.Decl{
                     .expr_decl = .{
                         .location = getExprLocation(expr),
@@ -306,12 +257,9 @@ pub const Parser = struct {
                 });
             }
         }
-
-        // 如果解析过程中有错误，返回错误让调用者报告
         if (self.errors.items.len > 0) {
             return error.UnexpectedToken;
         }
-
         return ast.Module{
             .name = module_name,
             .source_path = null,
@@ -319,21 +267,17 @@ pub const Parser = struct {
         };
     }
 
-    /// 尝试解析顶层声明，失败返回 null
-    /// 注意：失败时解析器位置可能已改变，调用者需用 synchronize 跳过无法解析的内容
+    /// 尝试解析顶层声明（容错版本，失败返回 null 而不抛出）
     fn tryParseDecl(self: *Parser) ?ast.Decl {
         var visibility: ast.Visibility = .private;
         if (self.matchToken(.kw_pub)) {
             visibility = .public;
         }
-
-        // async fun name(...) { ... }
         var is_async = false;
         if (self.matchToken(.kw_async)) {
             if (!self.check(.kw_fun)) return null;
             is_async = true;
         }
-
         if (self.check(.kw_fun)) {
             return self.parseFunDecl(visibility, is_async) catch return null;
         }
@@ -349,11 +293,8 @@ pub const Parser = struct {
         if (self.check(.kw_pack)) {
             return self.parsePackDecl(visibility) catch return null;
         }
-
-        // 支持 pub val / pub var 作为顶层声明
         if (visibility == .public and (self.check(.kw_val) or self.check(.kw_var))) {
             const stmt = self.parseStmt() catch return null;
-            // 将 visibility 注入到 val_decl/var_decl 中
             switch (stmt.*) {
                 .val_decl => |*vd| vd.visibility = visibility,
                 .var_decl => |*vd| vd.visibility = visibility,
@@ -370,20 +311,15 @@ pub const Parser = struct {
                 },
             };
         }
-
-        // 如果消费了 pub 但后面不是声明关键字，回退
         if (visibility == .public) {
             self.current -= 1;
         }
-
-        // 支持 val/var/for/while/loop/defer/throw/return 作为顶层语句
         if (self.check(.kw_val) or self.check(.kw_var) or
             self.check(.kw_for) or self.check(.kw_while) or
             self.check(.kw_loop) or self.check(.kw_defer) or
             self.check(.kw_throw) or self.check(.kw_return))
         {
             const stmt = self.parseStmt() catch return null;
-            // 创建一个空的 dummy 表达式
             const dummy = self.allocExpr(ast.Expr{
                 .unit_literal = stmt.getLocation(),
             }) catch return null;
@@ -395,22 +331,15 @@ pub const Parser = struct {
                 },
             };
         }
-
         return null;
     }
 
-    // ============================================================
-    // 顶层声明解析
-    // ============================================================
-
-    /// 解析顶层声明
+    /// 解析单个顶层声明（严格版本，失败时抛出错误）
     pub fn parseDecl(self: *Parser) ParserError!ast.Decl {
         var visibility: ast.Visibility = .private;
         if (self.matchToken(.kw_pub)) {
             visibility = .public;
         }
-
-        // async fun name(...) { ... } —— async 修饰顶层函数声明
         var is_async = false;
         if (self.matchToken(.kw_async)) {
             if (!self.check(.kw_fun)) {
@@ -419,7 +348,6 @@ pub const Parser = struct {
             }
             is_async = true;
         }
-
         if (self.check(.kw_fun)) {
             return self.parseFunDecl(visibility, is_async);
         }
@@ -435,8 +363,6 @@ pub const Parser = struct {
         if (self.check(.kw_pack)) {
             return self.parsePackDecl(visibility);
         }
-
-        // 支持 pub val / pub var 作为顶层声明
         if (visibility == .public and (self.check(.kw_val) or self.check(.kw_var))) {
             const stmt = try self.parseStmt();
             switch (stmt.*) {
@@ -455,51 +381,38 @@ pub const Parser = struct {
                 },
             };
         }
-
         try self.reportError("expected top-level declaration (fun/type/trait/use/pack/val/var)");
         return error.UnexpectedToken;
     }
 
-    /// 解析函数声明：fun name<T>(params) : ReturnType with Bounds { body }
-    /// is_async=true 时为 async fun，调用返回 Spawn<T>
+    /// 解析函数声明：fun name<类型参数>(参数): 返回类型 with 约束 { body }
     fn parseFunDecl(self: *Parser, visibility: ast.Visibility, is_async: bool) ParserError!ast.Decl {
-        const fun_tok = self.advance(); // 消费 fun
+        const fun_tok = self.advance();
         const name_tok = try self.expect(.identifier, "expected function name");
-
-        // 类型参数
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
             self.expectCloseAngle("expected '>' to close type parameter list") catch {};
         }
-
-        // 参数列表
         var params = std.ArrayList(ast.Param).empty;
         _ = self.expect(.l_paren, "expected '(' to start parameter list") catch {};
         if (!self.check(.r_paren)) {
             try self.parseParamList(&params);
         }
         _ = self.expect(.r_paren, "expected ')' to close parameter list") catch {};
-
-        // 返回类型
         var return_type: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             return_type = self.parseType() catch |err| {
                 return err;
             };
         }
-
-        // Trait 约束 with Bounds
         var bounds = std.ArrayList(ast.TraitBound).empty;
         if (self.matchToken(.kw_with)) {
             try self.parseTraitBoundList(&bounds);
         }
-
-        // 函数体
         const body = self.parseExpr() catch |err| {
             return err;
         };
-
         return ast.Decl{
             .fun_decl = .{
                 .location = tokenLoc(fun_tok),
@@ -516,35 +429,26 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析类型声明：type Name<T>: Trait1, Trait2 = ... with T: ConcreteType { methods }
+    /// 解析类型声明：type Name<类型参数> : traits = 定义 with 约束 { 方法 }
     fn parseTypeDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
-        const type_tok = self.advance(); // 消费 type
+        const type_tok = self.advance();
         const name_tok = try self.expect(.identifier, "expected type name");
-
-        // 类型参数
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
             self.expectCloseAngle("expected '>' to close type parameter list") catch {};
         }
-
-        // 实现的 trait 列表：: Trait1 或 : (Trait1, Trait2)
         var implemented_traits = std.ArrayList(ast.TraitBound).empty;
         var has_error_trait = false;
         if (self.matchToken(.colon)) {
-            // 检查是否有括号（多个 trait）
             const has_paren = self.check(.l_paren);
             if (has_paren) {
-                _ = self.advance(); // 消耗 (
+                _ = self.advance();
             }
-
             try self.parseTraitBoundList(&implemented_traits);
-
             if (has_paren) {
                 _ = self.expect(.r_paren, "expected ')' after trait list") catch {};
             }
-
-            // 检查是否实现了 Error trait
             for (implemented_traits.items) |trait_bound| {
                 if (std.mem.eql(u8, trait_bound.trait_name, ast.type_names.error_type)) {
                     has_error_trait = true;
@@ -552,35 +456,23 @@ pub const Parser = struct {
                 }
             }
         }
-
         _ = self.expect(.eq, "expected '=' to define type body") catch {};
-
         var def = try self.parseTypeDef(has_error_trait);
-
-        // 修正 error_newtype 的 name：文档语法 type FileError = Error("msg")
-        // 中 FileError 才是类型名，Error("msg") 只是定义体
         if (def == .error_newtype) {
             def.error_newtype.name = name_tok.lexeme;
         }
-
-        // 类型特化约束：with T: ConcreteType
         var type_constraints = std.ArrayList(ast.TypeConstraint).empty;
         if (self.matchToken(.kw_with)) {
             try self.parseTypeConstraints(&type_constraints);
         }
-
-        // 方法块：{ methods }
         var methods = std.ArrayList(ast.MethodDecl).empty;
         if (self.matchToken(.l_brace)) {
             try self.parseMethodBlock(&methods);
             _ = self.expect(.r_brace, "expected '}' to close method block") catch {};
-
-            // 如果是 error_newtype，将方法附加到其定义中
             if (def == .error_newtype) {
                 def.error_newtype.methods = try methods.toOwnedSlice(self.allocator);
             }
         }
-
         return ast.Decl{
             .type_decl = .{
                 .location = tokenLoc(type_tok),
@@ -595,14 +487,11 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析类型定义体
+    /// 解析类型定义体：ADT、记录、别名、新类型、错误新类型
     fn parseTypeDef(self: *Parser, has_error_trait: bool) ParserError!ast.TypeDef {
-        // 检查 ADT：以 | 开头
         if (self.matchToken(.pipe)) {
             return self.parseAdtBody();
         }
-
-        // 检查记录类型：(name: Type, ...)
         if (self.check(.l_paren)) {
             const saved = self.current;
             if (self.tryParseRecordTypeDef()) |def| {
@@ -610,25 +499,17 @@ pub const Parser = struct {
             }
             self.current = saved;
         }
-
-        // 检查 error newtype 或构造器：Name(params)
         if (self.check(.identifier)) {
             const saved = self.current;
             const name_tok = self.advance();
-
-            // 如果有参数列表，尝试解析
             if (self.check(.l_paren)) {
-                _ = self.advance(); // 消费 (
-
-                // 解析参数列表
+                _ = self.advance();
                 var params = std.ArrayList(ast.Param).empty;
                 if (!self.check(.r_paren)) {
-                    // 检查是否是命名参数 (msg: str)
                     const saved2 = self.current;
                     if (self.check(.identifier)) {
-                        _ = self.advance(); // 检查下一个 token
+                        _ = self.advance();
                         if (self.check(.colon)) {
-                            // 命名参数，回退并解析
                             self.current = saved2;
                             try self.parseParamList(&params);
                             _ = self.expect(.r_paren, "expected ')'") catch {
@@ -636,8 +517,6 @@ pub const Parser = struct {
                                 const target = try self.parseType();
                                 return ast.TypeDef{ .alias = .{ .target = target } };
                             };
-
-                            // 只有在实现了 Error trait 时才是 error newtype
                             if (has_error_trait) {
                                 return ast.TypeDef{
                                     .error_newtype = .{
@@ -647,8 +526,6 @@ pub const Parser = struct {
                                     },
                                 };
                             }
-
-                            // 否则是单构造器 ADT
                             self.current = saved;
                             if (self.tryParseSingleCtorAdt()) |def| {
                                 return def;
@@ -657,28 +534,17 @@ pub const Parser = struct {
                         }
                         self.current = saved2;
                     }
-
-                    // 回退，可能是单构造器 ADT
                     self.current = saved;
                     if (self.tryParseSingleCtorAdt()) |def| {
                         return def;
                     }
                     self.current = saved;
                 } else {
-                    // 空参数列表，检查是否跟随 { 方法块
-                    // 这种情况可能是 Error newtype 但还没实现
                 }
             }
-
-            // 回退
             self.current = saved;
         }
-
-        // 类型别名：target_type
         const target = try self.parseType();
-        // 文档 §2.5.1: 多构造器枚举每个构造器须以 `|` 起始（含首个）。
-        // 形如 `type Color = Red | Green`（缺前导 `|`）会把 Red 当别名解析后撞上 `|`，
-        // 原先报误导性的 "expected expression"。这里给出可操作的诊断。
         if (self.check(.pipe)) {
             try self.reportError("each variant of a sum type must be prefixed with '|', including the first; for example `type Color = | Red | Green`");
             return ParserError.UnexpectedToken;
@@ -686,15 +552,11 @@ pub const Parser = struct {
         return ast.TypeDef{ .alias = .{ .target = target } };
     }
 
-    /// 尝试解析单构造器 ADT：Name(field: Type, ...) 或 Name(Type)
-    /// type Pair = Pair(first: i32, second: i32)
-    /// type Handle = Handle(i32)
+    /// 尝试解析单构造器 ADT（形如 Name(field1, field2)）
     fn tryParseSingleCtorAdt(self: *Parser) ?ast.TypeDef {
-        const name_tok = self.advance(); // 消费构造器名
+        const name_tok = self.advance();
         if (!self.check(.l_paren)) return null;
-        _ = self.advance(); // 消费 (
-
-        // 检查空构造器：Name()
+        _ = self.advance();
         if (self.check(.r_paren)) {
             _ = self.advance();
             const ctors = self.allocator.alloc(ast.ConstructorDef, 1) catch return null;
@@ -708,11 +570,7 @@ pub const Parser = struct {
                 .adt = .{ .constructors = ctors },
             };
         }
-
-        // 检查是否有命名字段：Name(field: Type, ...)
-        // 通过看第一个标识符后是否跟着冒号来判断
         if (self.check(.identifier) and self.current + 1 < self.tokens.len and self.tokens[self.current + 1].type == .colon) {
-            // 有命名字段 — 解析为 ADT 构造器
             var fields = std.ArrayList(ast.ConstructorField).empty;
             self.parseConstructorFieldList(&fields) catch {
                 fields.deinit(self.allocator);
@@ -733,15 +591,8 @@ pub const Parser = struct {
                 .adt = .{ .constructors = ctors },
             };
         }
-
-        // 位置参数 — 解析类型列表
-        // 单个位置参数：Name(Type) → newtype
-        // 多个位置参数：Name(Type, Type, ...) → ADT 构造器
         const first_type = self.parseType() catch return null;
-
         if (self.check(.comma)) {
-            // 多个位置参数 — 解析为 ADT 构造器
-            // Name(Type1, Type2, ...)
             var fields = std.ArrayList(ast.ConstructorField).empty;
             fields.append(self.allocator, .{
                 .name = null,
@@ -775,8 +626,6 @@ pub const Parser = struct {
                 .adt = .{ .constructors = ctors },
             };
         }
-
-        // 单个位置参数 — 解析为 newtype：Name(Type)
         _ = self.expect(.r_paren, "expected ')'") catch return null;
         return ast.TypeDef{ .newtype = .{
             .name = name_tok.lexeme,
@@ -784,22 +633,20 @@ pub const Parser = struct {
         } };
     }
 
-    /// 尝试解析记录类型定义
+    /// 尝试解析记录类型定义（形如 (field: Type, ...)）
     fn tryParseRecordTypeDef(self: *Parser) ?ast.TypeDef {
-        _ = self.advance(); // 消费 (
+        _ = self.advance();
         if (self.peek().type == .identifier) {
             const name = self.advance();
             if (self.check(.colon)) {
-                _ = self.advance(); // 消费 :
+                _ = self.advance();
                 const ty = self.parseType() catch return null;
                 var fields = std.ArrayList(ast.RecordFieldType).empty;
                 fields.append(self.allocator, .{
                     .name = name.lexeme,
                     .ty = ty,
                 }) catch return null;
-
                 while (self.matchToken(.comma)) {
-                    // 支持尾随逗号：(name: str, age: i32,)
                     if (self.check(.r_paren)) break;
                     const field_name = self.expect(.identifier, "expected field name") catch return null;
                     _ = self.expect(.colon, "expected ':'") catch return null;
@@ -820,25 +667,21 @@ pub const Parser = struct {
         return null;
     }
 
-    /// 解析 ADT 体：| Constructor(fields) | ...
+    /// 解析 ADT 构造器列表（以 | 分隔）
     fn parseAdtBody(self: *Parser) ParserError!ast.TypeDef {
         var constructors = std.ArrayList(ast.ConstructorDef).empty;
-
         try constructors.append(self.allocator, try self.parseConstructorDef());
-
         while (self.matchToken(.pipe)) {
             try constructors.append(self.allocator, try self.parseConstructorDef());
         }
-
         return ast.TypeDef{
             .adt = .{ .constructors = try constructors.toOwnedSlice(self.allocator) },
         };
     }
 
-    /// 解析构造器定义：Name(fields) [: ReturnType]
+    /// 解析单个构造器定义：Name(字段列表): 返回类型
     fn parseConstructorDef(self: *Parser) ParserError!ast.ConstructorDef {
         const name_tok = try self.expect(.identifier, "expected constructor name");
-
         var fields = std.ArrayList(ast.ConstructorField).empty;
         if (self.matchToken(.l_paren)) {
             if (!self.check(.r_paren)) {
@@ -846,12 +689,10 @@ pub const Parser = struct {
             }
             _ = self.expect(.r_paren, "expected ')' to close constructor fields") catch {};
         }
-
         var return_type: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             return_type = try self.parseType();
         }
-
         return ast.ConstructorDef{
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
@@ -860,7 +701,7 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析构造器字段列表
+    /// 解析构造器字段列表（逗号分隔）
     fn parseConstructorFieldList(self: *Parser, fields: *std.ArrayList(ast.ConstructorField)) ParserError!void {
         try fields.append(self.allocator, try self.parseConstructorField());
         while (self.matchToken(.comma)) {
@@ -868,7 +709,7 @@ pub const Parser = struct {
         }
     }
 
-    /// 解析单个构造器字段
+    /// 解析单个构造器字段：可带名称（name: Type）或仅为类型
     fn parseConstructorField(self: *Parser) ParserError!ast.ConstructorField {
         if (self.peek().type == .identifier) {
             const saved = self.current;
@@ -882,7 +723,6 @@ pub const Parser = struct {
             }
             self.current = saved;
         }
-
         const ty = try self.parseType();
         return ast.ConstructorField{
             .name = null,
@@ -890,17 +730,15 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析 Trait 声明：trait Name<T>(Parents) { methods }
+    /// 解析 trait 声明：trait Name<类型参数>(父 trait) { 关联类型 / 方法 }
     fn parseTraitDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
-        const trait_tok = self.advance(); // 消费 trait
+        const trait_tok = self.advance();
         const name_tok = try self.expect(.identifier, "expected trait name");
-
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
             self.expectCloseAngle("expected '>' to close type parameter list") catch {};
         }
-
         var parents = std.ArrayList(ast.TraitBound).empty;
         if (self.matchToken(.l_paren)) {
             if (!self.check(.r_paren)) {
@@ -908,10 +746,8 @@ pub const Parser = struct {
             }
             _ = self.expect(.r_paren, "expected ')' to close parent trait list") catch {};
         }
-
         var associated_types = std.ArrayList(ast.AssociatedType).empty;
         var methods = std.ArrayList(ast.MethodDecl).empty;
-
         _ = self.expect(.l_brace, "expected '{' to start trait body") catch {};
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             if (self.check(.kw_type)) {
@@ -921,7 +757,6 @@ pub const Parser = struct {
             }
         }
         _ = self.expect(.r_brace, "expected '}' to close trait body") catch {};
-
         return ast.Decl{
             .trait_decl = .{
                 .location = tokenLoc(trait_tok),
@@ -935,16 +770,14 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析关联类型声明
+    /// 解析关联类型声明：type Name: kind
     fn parseAssociatedType(self: *Parser) ParserError!ast.AssociatedType {
-        const type_tok = self.advance(); // 消费 type
+        const type_tok = self.advance();
         const name_tok = try self.expect(.identifier, "expected associated type name");
-
         var kind: ?*ast.Kind = null;
         if (self.matchToken(.colon)) {
             kind = try self.parseKind();
         }
-
         return ast.AssociatedType{
             .location = tokenLoc(type_tok),
             .name = name_tok.lexeme,
@@ -952,46 +785,36 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析方法声明
+    /// 解析方法声明：[pub] [override] fun name<类型参数>(参数): 返回类型 { body } 或 = Trait.method
     fn parseMethodDecl(self: *Parser) ParserError!ast.MethodDecl {
         var visibility: ast.Visibility = .private;
         if (self.matchToken(.kw_pub)) {
             visibility = .public;
         }
-
         var is_override = false;
         if (self.matchToken(.kw_override)) {
             is_override = true;
         }
-
         _ = self.expect(.kw_fun, "expected 'fun'") catch {};
         const name_tok = try self.expect(.identifier, "expected method name");
-
         var type_params = std.ArrayList(ast.TypeParam).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeParamList(&type_params);
             self.expectCloseAngle("expected '>'") catch {};
         }
-
         var params = std.ArrayList(ast.Param).empty;
         _ = self.expect(.l_paren, "expected '('") catch {};
         if (!self.check(.r_paren)) {
             try self.parseParamList(&params);
         }
         _ = self.expect(.r_paren, "expected ')'") catch {};
-
         var return_type: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             return_type = try self.parseType();
         }
-
-        // 委托语法：= TraitName.method_name
-        // 文档 2.7.2: fun to_string(self): str = Serializable.to_string
         var delegate: ?ast.DelegateInfo = null;
         var body: ?*ast.Expr = null;
-
         if (self.matchToken(.eq)) {
-            // 解析 TraitName.method_name
             const trait_tok = try self.expect(.identifier, "expected delegate trait name");
             _ = self.expect(.dot, "expected '.'") catch {};
             const method_tok = try self.expect(.identifier, "expected delegate method name");
@@ -1002,7 +825,6 @@ pub const Parser = struct {
         } else if (self.check(.l_brace)) {
             body = try self.parseExpr();
         }
-
         return ast.MethodDecl{
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
@@ -1016,24 +838,18 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析 use 声明：use Module.{items}
+    /// 解析 import 声明：import path.to.module { item1, item2 as alias }
     fn parseUseDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
-        const use_tok = self.advance(); // 消费 use
-
+        const use_tok = self.advance();
         var module_path = std.ArrayList([]const u8).empty;
         const first = try self.expect(.identifier, "expected module name");
         try module_path.append(self.allocator, first.lexeme);
-
         while (self.matchToken(.dot)) {
             if (self.check(.l_brace)) break;
             const part = try self.expect(.identifier, "expected module path segment");
             try module_path.append(self.allocator, part.lexeme);
         }
-
         var items: ?[]ast.ImportItem = null;
-        // `use Mod.{...}` 进入 brace 列表前的 `.` 已被上面的 while 消费，
-        // 此时 previous() 是 `.`、当前是 `{`；`use Mod.Sub.{...}` 同理。
-        // 因此条件是「当前已在 `{`」或「再吃一个 `.` 后是 `{`」。
         if (self.check(.l_brace) or self.matchToken(.dot)) {
             _ = self.expect(.l_brace, "expected '{'") catch {};
             var item_list = std.ArrayList(ast.ImportItem).empty;
@@ -1047,7 +863,6 @@ pub const Parser = struct {
             _ = self.expect(.r_brace, "expected '}'") catch {};
             items = try item_list.toOwnedSlice(self.allocator);
         }
-
         return ast.Decl{
             .import_decl = .{
                 .location = tokenLoc(use_tok),
@@ -1058,7 +873,7 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析单个 use 导入项
+    /// 解析单个导入项：name as alias
     fn parseImportItem(self: *Parser) ParserError!ast.ImportItem {
         const name = try self.expect(.identifier, "expected import item name");
         var alias: ?[]const u8 = null;
@@ -1072,11 +887,10 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析 pack 声明：[pub] pack Name
+    /// 解析 pack 声明：pack Name
     fn parsePackDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
-        const pack_tok = self.advance(); // 消费 pack
+        const pack_tok = self.advance();
         const name_tok = try self.expect(.identifier, "expected pack name");
-
         return ast.Decl{
             .pack_decl = .{
                 .location = tokenLoc(pack_tok),
@@ -1086,10 +900,9 @@ pub const Parser = struct {
         };
     }
 
-    // ============================================================
-    // 类型参数和参数列表解析
-    // ============================================================
+    // ---- 类型参数、kind、参数、约束 ----
 
+    /// 解析类型参数列表（逗号分隔）
     fn parseTypeParamList(self: *Parser, type_params: *std.ArrayList(ast.TypeParam)) ParserError!void {
         try type_params.append(self.allocator, try self.parseTypeParam());
         while (self.matchToken(.comma)) {
@@ -1097,31 +910,22 @@ pub const Parser = struct {
         }
     }
 
+    /// 解析单个类型参数：Name: kind/trait with 约束
     fn parseTypeParam(self: *Parser) ParserError!ast.TypeParam {
         const name_tok = try self.expect(.identifier, "expected type parameter name");
-
         var kind: ?*ast.Kind = null;
         var bounds = std.ArrayList(ast.TraitBound).empty;
-
         if (self.matchToken(.colon)) {
-            // 检查是否是 trait bound 还是 kind
-            // trait bound: <T: Trait> 或 <T: (Trait1, Trait2)>
-            // kind: <F: * -> *>
             if (self.check(.identifier)) {
-                // 解析 trait bound: T: Trait 或 T: (Trait1, Trait2)
                 const has_paren = self.check(.l_paren);
                 if (has_paren) {
-                    _ = self.advance(); // 消耗 (
+                    _ = self.advance();
                 }
-
-                // 解析第一个 trait
                 const trait_name_tok = try self.expect(.identifier, "expected trait name");
                 try bounds.append(self.allocator, ast.TraitBound{
                     .trait_name = trait_name_tok.lexeme,
                     .type_args = &[_]*ast.TypeNode{},
                 });
-
-                // 如果有括号，继续解析更多 trait
                 if (has_paren) {
                     while (self.matchToken(.comma)) {
                         const next_trait = try self.expect(.identifier, "expected trait name");
@@ -1133,17 +937,12 @@ pub const Parser = struct {
                     _ = self.expect(.r_paren, "expected ')' after trait list") catch {};
                 }
             } else {
-                // 解析 kind
                 kind = try self.parseKind();
             }
         }
-
-        // with 用于类型特化，不是 trait bound
         if (self.matchToken(.kw_with)) {
-            // with 后面应该跟类型特化，但为了兼容性暂时保留
             try self.parseTraitBoundListInner(&bounds);
         }
-
         return ast.TypeParam{
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
@@ -1152,10 +951,12 @@ pub const Parser = struct {
         };
     }
 
+    /// 解析 kind 表达式（入口）
     fn parseKind(self: *Parser) ParserError!*ast.Kind {
         return self.parseKindArrow();
     }
 
+    /// 解析箭头 kind：右结合，如 * -> * -> *
     fn parseKindArrow(self: *Parser) ParserError!*ast.Kind {
         const left = try self.parseKindPrimary();
         if (self.matchToken(.minus_gt)) {
@@ -1170,6 +971,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析 kind 基本元素：* 或括号包裹的 kind
     fn parseKindPrimary(self: *Parser) ParserError!*ast.Kind {
         if (self.check(.star)) {
             _ = self.advance();
@@ -1184,6 +986,7 @@ pub const Parser = struct {
         return error.UnexpectedToken;
     }
 
+    /// 解析参数列表（逗号分隔，支持尾随逗号）
     fn parseParamList(self: *Parser, params: *std.ArrayList(ast.Param)) ParserError!void {
         try params.append(self.allocator, try self.parseParam());
         while (self.matchToken(.comma)) {
@@ -1192,26 +995,22 @@ pub const Parser = struct {
         }
     }
 
+    /// 解析单个参数：[var|val] name: Type
     fn parseParam(self: *Parser) ParserError!ast.Param {
         var is_var = false;
-        // 支持 var 在参数名前面：var data: i32
         if (self.matchToken(.kw_var)) {
             is_var = true;
         } else {
             _ = self.matchToken(.kw_val);
         }
-
         const name_tok = try self.expect(.identifier, "expected parameter name");
-
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
-            // 支持 var 在类型注解中：data: var i32
             if (self.matchToken(.kw_var)) {
                 is_var = true;
             }
             type_annotation = try self.parseType();
         }
-
         return ast.Param{
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
@@ -1220,10 +1019,12 @@ pub const Parser = struct {
         };
     }
 
+    /// 解析 trait 约束列表（委托给 parseTraitBoundListInner）
     fn parseTraitBoundList(self: *Parser, bounds: *std.ArrayList(ast.TraitBound)) ParserError!void {
         try self.parseTraitBoundListInner(bounds);
     }
 
+    /// 解析 trait 约束列表内部实现（逗号分隔）
     fn parseTraitBoundListInner(self: *Parser, bounds: *std.ArrayList(ast.TraitBound)) ParserError!void {
         try bounds.append(self.allocator, try self.parseTraitBound());
         while (self.matchToken(.comma)) {
@@ -1231,22 +1032,21 @@ pub const Parser = struct {
         }
     }
 
+    /// 解析单个 trait 约束：Name<类型实参>
     fn parseTraitBound(self: *Parser) ParserError!ast.TraitBound {
         const name_tok = try self.expect(.identifier, "expected trait name");
-
         var type_args = std.ArrayList(*ast.TypeNode).empty;
         if (self.matchToken(.lt)) {
             try self.parseTypeArgList(&type_args);
             self.expectCloseAngle("expected '>'") catch {};
         }
-
         return ast.TraitBound{
             .trait_name = name_tok.lexeme,
             .type_args = try type_args.toOwnedSlice(self.allocator),
         };
     }
 
-    /// 解析类型特化约束：with T: ConcreteType, U: AnotherType
+    /// 解析类型约束列表（逗号分隔）
     fn parseTypeConstraints(self: *Parser, constraints: *std.ArrayList(ast.TypeConstraint)) ParserError!void {
         try constraints.append(self.allocator, try self.parseTypeConstraint());
         while (self.matchToken(.comma)) {
@@ -1254,27 +1054,26 @@ pub const Parser = struct {
         }
     }
 
-    /// 解析单个类型约束：T: ConcreteType
+    /// 解析单个类型约束：类型参数: 具体类型
     fn parseTypeConstraint(self: *Parser) ParserError!ast.TypeConstraint {
         const type_param_tok = try self.expect(.identifier, "expected type parameter name");
         _ = try self.expect(.colon, "expected ':' after type parameter");
         const concrete_type = try self.parseType();
-
         return ast.TypeConstraint{
             .type_param = type_param_tok.lexeme,
             .concrete_type = concrete_type,
         };
     }
 
-    /// 解析方法块：{ fun method1() { ... } fun method2() { ... } }
+    /// 解析方法块（直到右大括号）
     fn parseMethodBlock(self: *Parser, methods: *std.ArrayList(ast.MethodDecl)) ParserError!void {
         while (!self.check(.r_brace) and !self.isAtEnd()) {
-            // 解析方法声明
             const method = try self.parseMethodDecl();
             try methods.append(self.allocator, method);
         }
     }
 
+    /// 解析类型实参列表（逗号分隔）
     fn parseTypeArgList(self: *Parser, type_args: *std.ArrayList(*ast.TypeNode)) ParserError!void {
         try type_args.append(self.allocator, try self.parseType());
         while (self.matchToken(.comma)) {
@@ -1282,24 +1081,18 @@ pub const Parser = struct {
         }
     }
 
-    // ============================================================
-    // 类型注解解析
-    // ============================================================
+    // ---- 类型解析 ----
 
+    /// 类型解析入口
     fn parseType(self: *Parser) ParserError!*ast.TypeNode {
         return self.parseFunctionType();
     }
 
+    /// 解析函数类型：支持 (A, B) -> C 与 A -> C 两种形式
     fn parseFunctionType(self: *Parser) ParserError!*ast.TypeNode {
-        // 文档 §2.8.2 函数类型语法：
-        //   A -> B            单参数（由下方 left -> ret 处理）
-        //   () -> C           零参数
-        //   (A, B) -> C       多参数（语法糖，flat fn_type）
-        // 普通 `(field: T, ...)` 是记录类型，由 parsePrimaryType 处理。
-        // 仅当 `(` ... 匹配的 `)` 后紧跟 `->` 时，才把括号组解释为函数类型形参列表。
         if (self.check(.l_paren) and self.parenGroupFollowedByArrow()) {
             const loc = tokenLoc(self.peek());
-            _ = self.advance(); // (
+            _ = self.advance();
             var params = std.ArrayList(*ast.TypeNode).empty;
             if (!self.check(.r_paren)) {
                 try params.append(self.allocator, try self.parseType());
@@ -1319,7 +1112,6 @@ pub const Parser = struct {
                 },
             });
         }
-
         const left = try self.parseNullableType();
         if (self.matchToken(.minus_gt)) {
             var params = std.ArrayList(*ast.TypeNode).empty;
@@ -1336,9 +1128,7 @@ pub const Parser = struct {
         return left;
     }
 
-    /// 从当前 `(` 向前扫描到与之匹配的 `)`，判断其后是否紧跟 `->`。
-    /// 用于在类型位置区分函数类型 `(A, B) -> C` 与记录类型 `(name: T, ...)`。
-    /// 只看括号配平，不解析内容；嵌套括号/尖括号一并计入深度。
+    /// 向前探测：圆括号组之后是否紧跟箭头（用于区分函数类型与分组类型）
     fn parenGroupFollowedByArrow(self: *Parser) bool {
         var i = self.current;
         if (i >= self.tokens.len or self.tokens[i].type != .l_paren) return false;
@@ -1360,15 +1150,13 @@ pub const Parser = struct {
         return false;
     }
 
+    /// 解析可空类型：T?，支持链式（如 T??）
     fn parseNullableType(self: *Parser) ParserError!*ast.TypeNode {
         var ty = try self.parsePrimaryType();
         while (self.matchToken(.question)) {
             const location = getTypeNodeLocation(ty);
-            // 文档 D20: T?? 扁平化为 T?
-            // 如果内部已经是 nullable，直接复用（不嵌套）
             switch (ty.*) {
                 .nullable => {
-                    // T? 已经是 nullable，T?? 等价于 T?，跳过嵌套
                 },
                 else => {
                     ty = try self.allocType(ast.TypeNode{
@@ -1383,16 +1171,14 @@ pub const Parser = struct {
         return ty;
     }
 
+    /// 解析基本类型：命名/泛型类型，支持后缀数组 [N]
     fn parsePrimaryType(self: *Parser) ParserError!*ast.TypeNode {
         if (self.check(.l_paren)) {
             return self.parseRecordType();
         }
-
         const name_tok = try self.expect(.identifier, "expected type name");
         const location = tokenLoc(name_tok);
-
         var ty: *ast.TypeNode = undefined;
-
         if (self.matchToken(.lt)) {
             var args = std.ArrayList(*ast.TypeNode).empty;
             try args.append(self.allocator, try self.parseType());
@@ -1400,7 +1186,6 @@ pub const Parser = struct {
                 try args.append(self.allocator, try self.parseType());
             }
             self.expectCloseAngle("expected '>' to close type parameters") catch {};
-
             ty = try self.allocType(ast.TypeNode{
                 .generic = .{
                     .location = location,
@@ -1416,13 +1201,11 @@ pub const Parser = struct {
                 },
             });
         }
-
-        // 支持 T[N] 和 T[] 数组类型语法（命名类型与泛型类型均可，如 i32[]、Spawn<i32>[]）
+        // 后缀数组类型 T[N]
         while (self.matchToken(.l_bracket)) {
             const arr_location = tokenLoc(name_tok);
             var size: ?u64 = null;
             if (!self.check(.r_bracket)) {
-                // 解析大小表达式（必须是整数）
                 const size_tok = try self.expect(.int_literal, "expected array size");
                 size = std.fmt.parseInt(u64, size_tok.lexeme, 10) catch {
                     try self.reportError("array size must be a positive integer");
@@ -1438,16 +1221,14 @@ pub const Parser = struct {
                 },
             });
         }
-
         return ty;
     }
 
+    /// 解析记录类型：(field: Type, ...)
     fn parseRecordType(self: *Parser) ParserError!*ast.TypeNode {
-        const lparen = self.advance(); // 消费 (
+        const lparen = self.advance();
         const location = tokenLoc(lparen);
-
         var fields = std.ArrayList(ast.RecordFieldType).empty;
-
         if (!self.check(.r_paren)) {
             const name_tok = try self.expect(.identifier, "expected field name");
             _ = self.expect(.colon, "expected ':'") catch {};
@@ -1456,7 +1237,6 @@ pub const Parser = struct {
                 .name = name_tok.lexeme,
                 .ty = ty,
             });
-
             while (self.matchToken(.comma)) {
                 if (self.check(.r_paren)) break;
                 const field_name = try self.expect(.identifier, "expected field name");
@@ -1468,9 +1248,7 @@ pub const Parser = struct {
                 });
             }
         }
-
         _ = self.expect(.r_paren, "expected ')'") catch {};
-
         return self.allocType(ast.TypeNode{
             .record = .{
                 .location = location,
@@ -1479,14 +1257,14 @@ pub const Parser = struct {
         });
     }
 
-    // ============================================================
-    // 表达式解析（按优先级从低到高）
-    // ============================================================
+    // ---- 表达式解析（优先级爬升） ----
 
+    /// 表达式解析入口
     pub fn parseExpr(self: *Parser) ParserError!*ast.Expr {
         return self.parseElvis();
     }
 
+    /// 解析 Elvis 运算符 ??（最低优先级）
     fn parseElvis(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseOr();
         while (self.matchToken(.question_question)) {
@@ -1504,6 +1282,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析逻辑或 ||
     fn parseOr(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseAnd();
         while (self.matchToken(.pipe_pipe)) {
@@ -1521,6 +1300,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析逻辑与 &&
     fn parseAnd(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseBitOr();
         while (self.matchToken(.amp_amp)) {
@@ -1538,6 +1318,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析按位或 |
     fn parseBitOr(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseBitXor();
         while (self.matchToken(.pipe)) {
@@ -1555,6 +1336,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析按位异或 ^
     fn parseBitXor(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseBitAnd();
         while (self.matchToken(.caret)) {
@@ -1572,6 +1354,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析按位与 &
     fn parseBitAnd(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseEquality();
         while (self.matchToken(.ampersand)) {
@@ -1589,6 +1372,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析相等性 == !=
     fn parseEquality(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseComparison();
         while (true) {
@@ -1621,6 +1405,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析比较 < > <= >=
     fn parseComparison(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseRange();
         while (true) {
@@ -1649,6 +1434,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析范围 .. ..=
     fn parseRange(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseAddition();
         while (true) {
@@ -1681,6 +1467,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析加减 ++ + -
     fn parseAddition(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseMultiplication();
         while (true) {
@@ -1696,7 +1483,6 @@ pub const Parser = struct {
                     },
                 });
             } else if (self.matchToken(.plus_plus)) {
-                // ++：数组/列表拼接，与 + 同优先级、左结合
                 const op_tok = self.previous();
                 const right = try self.parseMultiplication();
                 left = try self.allocExpr(ast.Expr{
@@ -1725,6 +1511,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析乘除模 * / %
     fn parseMultiplication(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseUnary();
         while (true) {
@@ -1752,6 +1539,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// 解析一元运算 ! -，负号直接折叠到数字字面量
     fn parseUnary(self: *Parser) ParserError!*ast.Expr {
         if (self.matchToken(.bang)) {
             const op_tok = self.previous();
@@ -1766,12 +1554,11 @@ pub const Parser = struct {
         }
         if (self.matchToken(.minus)) {
             const op_tok = self.previous();
-            // 优化：-int_literal 合并为负整数字面量，避免 -2147483648 等边界值溢出
+            // 负号紧跟数字字面量时直接合并，避免产生多余的一元节点
             if (self.check(.int_literal)) {
                 const lit_tok = self.advance();
                 return self.parseNegativeIntLiteral(op_tok, lit_tok);
             }
-            // 优化：-float_literal 合并为负浮点字面量
             if (self.check(.float_literal)) {
                 const lit_tok = self.advance();
                 return self.parseNegativeFloatLiteral(op_tok, lit_tok);
@@ -1788,9 +1575,9 @@ pub const Parser = struct {
         return self.parsePostfix();
     }
 
+    /// 解析后缀运算：? ! ?. . () <> []
     fn parsePostfix(self: *Parser) ParserError!*ast.Expr {
         var expr_node = try self.parsePrimary();
-
         while (true) {
             if (self.matchToken(.question)) {
                 const op_tok = self.previous();
@@ -1809,9 +1596,9 @@ pub const Parser = struct {
                     },
                 });
             } else if (self.matchToken(.question_dot)) {
+                // 安全调用 ?.field 或 ?.method(args)
                 const op_tok = self.previous();
                 const field_tok = try self.expect(.identifier, "expected field or method name");
-
                 if (self.check(.l_paren)) {
                     var args = std.ArrayList(*ast.Expr).empty;
                     var type_args: ?[]*ast.TypeNode = null;
@@ -1829,7 +1616,6 @@ pub const Parser = struct {
                         }
                     }
                     _ = self.expect(.r_paren, "expected ')'") catch {};
-
                     expr_node = try self.allocExpr(ast.Expr{
                         .safe_method_call = .{
                             .location = tokenLoc(op_tok),
@@ -1849,9 +1635,9 @@ pub const Parser = struct {
                     });
                 }
             } else if (self.matchToken(.dot)) {
+                // 字段访问 .field 或方法调用 .method(args)
                 const op_tok = self.previous();
                 const field_tok = try self.expect(.identifier, "expected field or method name");
-
                 if (self.check(.l_paren)) {
                     var args = std.ArrayList(*ast.Expr).empty;
                     var type_args: ?[]*ast.TypeNode = null;
@@ -1869,7 +1655,6 @@ pub const Parser = struct {
                         }
                     }
                     _ = self.expect(.r_paren, "expected ')'") catch {};
-
                     expr_node = try self.allocExpr(ast.Expr{
                         .method_call = .{
                             .location = tokenLoc(op_tok),
@@ -1889,8 +1674,7 @@ pub const Parser = struct {
                     });
                 }
             } else if (self.check(.l_paren)) {
-                // 文档 D69: 禁止链式调用 f(a)(b)
-                // 默认柯里化下，f(a)(b) 是语法错误，必须绑定中间结果
+                // 函数调用 f(args)，禁止链式调用 f(a)(b)
                 if (expr_node.* == .call) {
                     const tok = self.peek();
                     try self.errors.append(self.allocator, ParseError{
@@ -1903,7 +1687,6 @@ pub const Parser = struct {
                 const call_tok = self.peek();
                 var args = std.ArrayList(*ast.Expr).empty;
                 var type_args: ?[]*ast.TypeNode = null;
-
                 if (self.matchToken(.lt)) {
                     var ta = std.ArrayList(*ast.TypeNode).empty;
                     try self.parseTypeArgList(&ta);
@@ -1914,7 +1697,6 @@ pub const Parser = struct {
                         ta.deinit(self.allocator);
                     }
                 }
-
                 _ = self.expect(.l_paren, "expected '('") catch {};
                 if (!self.check(.r_paren)) {
                     try args.append(self.allocator, try self.parseExpr());
@@ -1923,7 +1705,6 @@ pub const Parser = struct {
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
-
                 expr_node = try self.allocExpr(ast.Expr{
                     .call = .{
                         .location = tokenLoc(call_tok),
@@ -1933,16 +1714,12 @@ pub const Parser = struct {
                     },
                 });
             } else if (self.check(.lt) and self.isTurbofishCall()) {
-                // Turbofish 泛型调用：callee<TypeArgs>(args)，如 channel<i32>(0)
-                // 仅当 <...> 之后紧跟 ( 时才解析为调用，否则交给比较运算符。
-                // isTurbofishCall() 已确认该形态，这里的解析必定成功。
+                // turbofish 调用 f::<Type>(args)
                 _ = self.matchToken(.lt);
                 var ta = std.ArrayList(*ast.TypeNode).empty;
                 try self.parseTypeArgList(&ta);
                 self.expectCloseAngle("expected '>'") catch {};
                 const type_args: ?[]*ast.TypeNode = try ta.toOwnedSlice(self.allocator);
-
-                // 禁止链式调用 f(a)(b)（与下方 l_paren 分支一致）
                 if (expr_node.* == .call) {
                     const tok = self.peek();
                     try self.errors.append(self.allocator, ParseError{
@@ -1962,7 +1739,6 @@ pub const Parser = struct {
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
-
                 expr_node = try self.allocExpr(ast.Expr{
                     .call = .{
                         .location = tokenLoc(call_tok),
@@ -1972,10 +1748,10 @@ pub const Parser = struct {
                     },
                 });
             } else if (self.matchToken(.l_bracket)) {
+                // 索引访问 obj[index]
                 const bracket_tok = self.previous();
                 const index = try self.parseExpr();
                 _ = self.expect(.r_bracket, "expected ']'") catch {};
-
                 expr_node = try self.allocExpr(ast.Expr{
                     .index = .{
                         .location = tokenLoc(bracket_tok),
@@ -1987,20 +1763,14 @@ pub const Parser = struct {
                 break;
             }
         }
-
         return expr_node;
     }
 
-    /// 前瞻：判断当前位置的 `<` 是否开启一个 turbofish 泛型调用 `<TypeArgs>(`。
-    /// 从当前 `<` 开始，平衡嵌套的 `<`/`>`（`>>` 在本语言中词法上是两个 `gt`），
-    /// 在匹配到最外层 `>` 后检查紧随的 token 是否为 `(`。
-    /// 不消费任何 token——只读 self.tokens。
-    /// 这样 `a < b` 比较不会被误判，而 `channel<i32>(0)` / `foo<A, B>(x)` 会被识别。
+    /// 探测 `::<...>(` 形式的 turbofish 调用，避免与小于号比较混淆
     fn isTurbofishCall(self: *Parser) bool {
         if (!self.check(.lt)) return false;
         var i = self.current + 1;
         var depth: usize = 1;
-        // 限定一个合理的前瞻上限，避免在病态输入上扫描过远
         var steps: usize = 0;
         while (i < self.tokens.len and steps < 256) : (steps += 1) {
             const tt = self.tokens[i].type;
@@ -2009,12 +1779,9 @@ pub const Parser = struct {
                 .gt => {
                     depth -= 1;
                     if (depth == 0) {
-                        // 最外层 `>` 之后必须紧跟 `(` 才是调用
                         return i + 1 < self.tokens.len and self.tokens[i + 1].type == .l_paren;
                     }
                 },
-                // 这些 token 不可能出现在类型实参列表中，提前否决
-                // （类型实参里只会出现标识符、`<` `>` `,` `?` `(` `)` `->` 等）
                 .l_brace, .r_brace, .eq, .eq_gt, .eof => return false,
                 else => {},
             }
@@ -2023,17 +1790,16 @@ pub const Parser = struct {
         return false;
     }
 
+    /// 解析基本表达式：字面量、标识符、lambda、if/match/lazy/atomic/select、块、数组、括号等
     fn parsePrimary(self: *Parser) ParserError!*ast.Expr {
         if (self.matchToken(.int_literal)) {
             const tok = self.previous();
             return self.parseIntLiteral(tok);
         }
-
         if (self.matchToken(.float_literal)) {
             const tok = self.previous();
             return self.parseFloatLiteral(tok);
         }
-
         if (self.matchToken(.true_literal)) {
             const tok = self.previous();
             return self.allocExpr(ast.Expr{
@@ -2052,7 +1818,6 @@ pub const Parser = struct {
                 },
             });
         }
-
         if (self.matchToken(.char_literal)) {
             const tok = self.previous();
             return self.allocExpr(ast.Expr{
@@ -2062,75 +1827,56 @@ pub const Parser = struct {
                 },
             });
         }
-
         if (self.matchToken(.string_literal)) {
             const tok = self.previous();
             return self.parseStringLiteral(tok);
         }
-
         if (self.matchToken(.null_literal)) {
             const tok = self.previous();
             return self.allocExpr(ast.Expr{
                 .null_literal = tokenLoc(tok),
             });
         }
-
-        // Lambda: fun(params) { body }
         if (self.check(.kw_fun)) {
             if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_paren) {
                 return self.parseLambdaFun(false);
             }
         }
-
-        // async fun(params) { body } —— async lambda，调用返回 Spawn<T>
         if (self.check(.kw_async)) {
             if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .kw_fun) {
-                _ = self.advance(); // 消费 async
+                _ = self.advance();
                 return self.parseLambdaFun(true);
             }
         }
-
         if (self.matchToken(.kw_if)) {
             return self.parseIfExpr();
         }
-
         if (self.matchToken(.kw_match)) {
             return self.parseMatchExpr();
         }
-
         if (self.matchToken(.kw_lazy)) {
             return self.parseLazyExpr();
         }
-
         if (self.matchToken(.kw_atomic)) {
             return self.parseAtomicExpr();
         }
-
         if (self.matchToken(.kw_select)) {
             return self.parseSelectExpr();
         }
-
-        // 内联 Trait 值 trait { methods }
         if (self.check(.kw_trait)) {
             if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_brace) {
                 return self.parseInlineTraitValue();
             }
         }
-
         if (self.matchToken(.l_bracket)) {
             return self.parseArrayLiteral();
         }
-
         if (self.check(.l_brace)) {
             return self.parseBlockExpr();
         }
-
         if (self.matchToken(.l_paren)) {
             return self.parseParenOrRecordOrLambda();
         }
-
-        // `type` 是关键字（type Foo = ...），但内建函数 type(x) 也用这个名字。
-        // 仅当 `type` 紧跟 `(` 时，按内建函数标识符处理；否则仍是类型定义关键字。
         if (self.check(.kw_type) and
             self.tokens.len > self.current + 1 and
             self.tokens[self.current + 1].type == .l_paren)
@@ -2143,9 +1889,7 @@ pub const Parser = struct {
                 },
             });
         }
-
         if (self.check(.identifier) or self.check(.kw_val) or self.check(.kw_var) or self.check(.kw_channel)) {
-            // 检查类型转换：Name(expr) 其中 Name 是内建类型
             if (isBuiltinType(self.peek().lexeme)) {
                 if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_paren) {
                     return self.parseTypeCast();
@@ -2159,11 +1903,11 @@ pub const Parser = struct {
                 },
             });
         }
-
         try self.reportError("expected expression");
         return error.UnexpectedToken;
     }
 
+    /// 解析整数字面量，分离数字部分与类型后缀
     fn parseIntLiteral(self: *Parser, tok: lexer.Token) ParserError!*ast.Expr {
         var suffix: ?[]const u8 = null;
         const raw = tok.lexeme;
@@ -2189,7 +1933,7 @@ pub const Parser = struct {
         });
     }
 
-    /// 解析负整数字面量（如 -2147483648），将负号合并到 raw 中
+    /// 解析负整数字面量，将负号合并进 raw
     fn parseNegativeIntLiteral(self: *Parser, minus_tok: lexer.Token, lit_tok: lexer.Token) ParserError!*ast.Expr {
         _ = minus_tok;
         var suffix: ?[]const u8 = null;
@@ -2207,7 +1951,6 @@ pub const Parser = struct {
         if (i < lit_raw.len) {
             suffix = lit_raw[i..];
         }
-        // 合并负号：raw = "-" + lit_raw（不含后缀）
         const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw[0..i]});
         return self.allocExpr(ast.Expr{
             .int_literal = .{
@@ -2218,13 +1961,12 @@ pub const Parser = struct {
         });
     }
 
-    /// 解析负浮点字面量（如 -3.14），将负号合并到 raw 中
+    /// 解析负浮点字面量，将负号合并进 raw
     fn parseNegativeFloatLiteral(self: *Parser, minus_tok: lexer.Token, lit_tok: lexer.Token) ParserError!*ast.Expr {
         _ = minus_tok;
         var suffix: ?[]const u8 = null;
         const lit_raw = lit_tok.lexeme;
         var i: usize = lit_raw.len;
-        // 后缀可能包含字母和数字（如 f16, f128），先跳过末尾数字，再跳过字母
         while (i > 0) {
             const ch = lit_raw[i - 1];
             if (ch >= '0' and ch <= '9') {
@@ -2241,13 +1983,11 @@ pub const Parser = struct {
                 break;
             }
         }
-        // 确保至少有一个字母开头（避免把纯数字当作后缀）
         if (i < lit_raw.len and i > 0 and ((lit_raw[i] >= 'a' and lit_raw[i] <= 'z') or (lit_raw[i] >= 'A' and lit_raw[i] <= 'Z'))) {
             suffix = lit_raw[i..];
         } else {
             i = lit_raw.len;
         }
-        // 合并负号：raw = "-" + lit_raw（不含后缀）
         const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw[0..i]});
         return self.allocExpr(ast.Expr{
             .float_literal = .{
@@ -2258,11 +1998,11 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析浮点字面量，分离数字部分与类型后缀
     fn parseFloatLiteral(self: *Parser, tok: lexer.Token) ParserError!*ast.Expr {
         var suffix: ?[]const u8 = null;
         const raw = tok.lexeme;
         var i: usize = raw.len;
-        // 后缀可能包含字母和数字（如 f16, f128），先跳过末尾数字，再跳过字母
         while (i > 0) {
             const ch = raw[i - 1];
             if (ch >= '0' and ch <= '9') {
@@ -2279,7 +2019,6 @@ pub const Parser = struct {
                 break;
             }
         }
-        // 确保至少有一个字母开头（避免把纯数字当作后缀）
         if (i < raw.len and i > 0 and ((raw[i] >= 'a' and raw[i] <= 'z') or (raw[i] >= 'A' and raw[i] <= 'Z'))) {
             suffix = raw[i..];
         } else {
@@ -2294,6 +2033,7 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析字符串字面量，含插值时拆分为字面量与表达式片段
     fn parseStringLiteral(self: *Parser, tok: lexer.Token) ParserError!*ast.Expr {
         const raw = tok.lexeme;
         if (!containsInterpolation(raw)) {
@@ -2306,9 +2046,6 @@ pub const Parser = struct {
                 },
             });
         }
-
-        // 解析字符串插值：将 "Hello, {name}!" 解析为
-        // [literal("Hello, "), expression(name), literal("!")]
         var parts = std.ArrayList(ast.InterpolationPart).empty;
         errdefer {
             for (parts.items) |*p| {
@@ -2319,30 +2056,23 @@ pub const Parser = struct {
             }
             parts.deinit(self.allocator);
         }
-
-        // 内容区域（去掉首尾引号）
         const content = raw[1 .. raw.len - 1];
         var i: usize = 0;
         var literal_start: usize = 0;
-
         while (i < content.len) {
             if (content[i] == '\\') {
-                // 转义序列：跳过两个字符
                 i += 2;
                 continue;
             }
             if (content[i] == '{') {
-                // 检查 {{ 转义
                 if (i + 1 < content.len and content[i + 1] == '{') {
                     i += 2;
                     continue;
                 }
-                // 保存前面的字面量文本
                 if (i > literal_start) {
                     const text = try self.unescapeString(content[literal_start..i]);
                     try parts.append(self.allocator, ast.InterpolationPart{ .literal = text });
                 }
-                // 找到匹配的 }
                 i += 1;
                 const expr_start = i;
                 var brace_depth: usize = 1;
@@ -2352,13 +2082,11 @@ pub const Parser = struct {
                     } else if (content[i] == '}') {
                         brace_depth -= 1;
                     } else if (content[i] == '\\') {
-                        i += 1; // 跳过转义
+                        i += 1;
                     }
                     i += 1;
                 }
-                // expr_start..i-1 是插值表达式文本
                 const expr_text = content[expr_start .. i - 1];
-                // 对插值表达式文本进行词法分析和语法分析
                 const expr = try self.parseInterpolationExpr(expr_text);
                 try parts.append(self.allocator, ast.InterpolationPart{ .expression = expr });
                 literal_start = i;
@@ -2366,13 +2094,10 @@ pub const Parser = struct {
             }
             i += 1;
         }
-
-        // 保存尾部字面量文本
         if (literal_start < content.len) {
             const text = try self.unescapeString(content[literal_start..]);
             try parts.append(self.allocator, ast.InterpolationPart{ .literal = text });
         }
-
         return self.allocExpr(ast.Expr{
             .string_interpolation = .{
                 .location = tokenLoc(tok),
@@ -2381,23 +2106,20 @@ pub const Parser = struct {
         });
     }
 
-    /// 对插值表达式文本进行词法分析和语法分析
+    /// 对插值表达式文本进行词法+语法分析，返回其 AST 节点
     fn parseInterpolationExpr(self: *Parser, text: []const u8) ParserError!*ast.Expr {
         var interp_lex = lexer.Lexer.init(self.allocator, text);
         const tokens = interp_lex.tokenize() catch return error.UnexpectedToken;
         defer self.allocator.free(tokens);
-
         var interp_parser = Parser.init(self.allocator, tokens);
-        // 不需要 deinit，因为分配的节点由外层 parser 管理
         const expr = interp_parser.parseExpr() catch return error.UnexpectedToken;
         return expr;
     }
 
-    /// 处理字符串中的转义序列，返回新分配的字符串
+    /// 反转义字符串：处理 \n \t \r \\ \" \{ \} 以及 {{ }} 转义
     fn unescapeString(self: *Parser, text: []const u8) ParserError![]const u8 {
         var result = std.ArrayList(u8).empty;
         errdefer result.deinit(self.allocator);
-
         var i: usize = 0;
         while (i < text.len) {
             if (text[i] == '\\' and i + 1 < text.len) {
@@ -2437,11 +2159,9 @@ pub const Parser = struct {
                     },
                 }
             } else if (text[i] == '{' and i + 1 < text.len and text[i + 1] == '{') {
-                // {{ 转义为 {
                 try result.append(self.allocator, '{');
                 i += 2;
             } else if (text[i] == '}' and i + 1 < text.len and text[i + 1] == '}') {
-                // }} 转义为 }
                 try result.append(self.allocator, '}');
                 i += 2;
             } else {
@@ -2449,24 +2169,21 @@ pub const Parser = struct {
                 i += 1;
             }
         }
-
         return result.toOwnedSlice(self.allocator);
     }
 
+    /// 解析 fun 关键字开头的 lambda：fun(params) body
     fn parseLambdaFun(self: *Parser, is_async: bool) ParserError!*ast.Expr {
-        const fun_tok = self.advance(); // 消费 fun
+        const fun_tok = self.advance();
         const location = tokenLoc(fun_tok);
-
         var params = std.ArrayList(ast.Param).empty;
         _ = self.expect(.l_paren, "expected '('") catch {};
         if (!self.check(.r_paren)) {
             try self.parseParamList(&params);
         }
         _ = self.expect(.r_paren, "expected ')'") catch {};
-
         const body_expr = try self.parseExpr();
         const body = ast.LambdaBody{ .block = body_expr };
-
         return self.allocExpr(ast.Expr{
             .lambda = .{
                 .location = location,
@@ -2477,16 +2194,15 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 if 表达式：if cond then else?
     fn parseIfExpr(self: *Parser) ParserError!*ast.Expr {
         const if_tok = self.previous();
         const condition = try self.parseExpr();
         const then_branch = try self.parseExpr();
-
         var else_branch: ?*ast.Expr = null;
         if (self.matchToken(.kw_else)) {
             else_branch = try self.parseExpr();
         }
-
         return self.allocExpr(ast.Expr{
             .if_expr = .{
                 .location = tokenLoc(if_tok),
@@ -2497,12 +2213,11 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 match 表达式：match scrutinee { arms }
     fn parseMatchExpr(self: *Parser) ParserError!*ast.Expr {
         const match_tok = self.previous();
         const scrutinee = try self.parseExpr();
-
         _ = self.expect(.l_brace, "expected '{'") catch {};
-
         var arms = std.ArrayList(ast.MatchArm).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             const arm = self.parseMatchArm() catch |err| {
@@ -2516,11 +2231,9 @@ pub const Parser = struct {
                 return err;
             };
             try arms.append(self.allocator, arm);
-            _ = self.matchToken(.comma); // 逗号可选
+            _ = self.matchToken(.comma);
         }
-
         _ = self.expect(.r_brace, "expected '}'") catch {};
-
         return self.allocExpr(ast.Expr{
             .match = .{
                 .location = tokenLoc(match_tok),
@@ -2530,17 +2243,15 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 match 的单个分支：pattern if guard => body
     fn parseMatchArm(self: *Parser) ParserError!ast.MatchArm {
         const pattern = try self.parsePattern();
-
         var guard: ?*ast.Expr = null;
         if (self.matchToken(.kw_if)) {
             guard = try self.parseExpr();
         }
-
         _ = self.expect(.eq_gt, "expected '=>'") catch {};
-        // match 分支体通常是表达式，但 throw/return/break/continue 是语句。
-        // 允许它们作为裸分支体（如 `Nil => throw Err(...)`），包装成单语句块表达式。
+        // 控制流语句作为分支体时包装为块表达式
         const body = if (self.check(.kw_throw) or self.check(.kw_return) or
             self.check(.kw_break) or self.check(.kw_continue))
         blk: {
@@ -2556,7 +2267,6 @@ pub const Parser = struct {
                 },
             });
         } else try self.parseExpr();
-
         return ast.MatchArm{
             .pattern = pattern,
             .guard = guard,
@@ -2564,10 +2274,10 @@ pub const Parser = struct {
         };
     }
 
+    /// 解析 lazy 表达式：lazy expr
     fn parseLazyExpr(self: *Parser) ParserError!*ast.Expr {
         const lazy_tok = self.previous();
         const expr = try self.parseExpr();
-
         return self.allocExpr(ast.Expr{
             .lazy = .{
                 .location = tokenLoc(lazy_tok),
@@ -2576,13 +2286,10 @@ pub const Parser = struct {
         });
     }
 
-    /// atomic expr — 解析为 atomic_expr AST 节点
-    /// 文档 §3.4.1: `atomic expr` 在堆上创建原子值，返回 Atomic<T> 引用
-    /// atomic 是关键字前缀表达式，不是函数调用
+    /// 解析 atomic 表达式：atomic value
     fn parseAtomicExpr(self: *Parser) ParserError!*ast.Expr {
         const atomic_tok = self.previous();
         const value_expr = try self.parsePrimary();
-
         return self.allocExpr(ast.Expr{
             .atomic_expr = .{
                 .location = tokenLoc(atomic_tok),
@@ -2591,18 +2298,16 @@ pub const Parser = struct {
         }) catch return error.OutOfMemory;
     }
 
+    /// 解析 select 表达式：select { arms }
     fn parseSelectExpr(self: *Parser) ParserError!*ast.Expr {
         const select_tok = self.previous();
         _ = self.expect(.l_brace, "expected '{'") catch {};
-
         var arms = std.ArrayList(ast.SelectArm).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             try arms.append(self.allocator, try self.parseSelectArm());
-            // 消费可选的逗号分隔符
             _ = self.matchToken(.comma);
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
-
         return self.allocExpr(ast.Expr{
             .select = .{
                 .location = tokenLoc(select_tok),
@@ -2611,6 +2316,7 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 select 的单个分支：timeout(duration) => body 或 channel => binding => body
     fn parseSelectArm(self: *Parser) ParserError!ast.SelectArm {
         if (self.checkIdentifier("timeout")) {
             const timeout_tok = self.advance();
@@ -2627,26 +2333,18 @@ pub const Parser = struct {
                 },
             };
         }
-
         const channel_expr = try self.parseExpr();
         _ = self.expect(.eq_gt, "expected '=>'") catch {};
-
-        // 文档 §3.5.3: 接收分支支持两种形态
-        //   ch.recv() => name => body   绑定收到的值到 name
-        //   ch.recv() => body           不绑定
-        // 区分：第一个 `=>` 之后若是「标识符 紧跟 `=>`」，则该标识符是绑定名。
         var binding: ?[]const u8 = null;
         if (self.check(.identifier) and
             self.current + 1 < self.tokens.len and
             self.tokens[self.current + 1].type == .eq_gt)
         {
-            const name_tok = self.advance(); // 标识符
-            _ = self.advance(); // 第二个 `=>`
+            const name_tok = self.advance();
+            _ = self.advance();
             binding = name_tok.lexeme;
         }
-
         const body = try self.parseExpr();
-
         return ast.SelectArm{
             .receive = .{
                 .location = getExprLocation(channel_expr),
@@ -2657,16 +2355,15 @@ pub const Parser = struct {
         };
     }
 
+    /// 解析内联 trait 值：trait { methods }
     fn parseInlineTraitValue(self: *Parser) ParserError!*ast.Expr {
-        const trait_tok = self.advance(); // 消费 trait
+        const trait_tok = self.advance();
         _ = self.expect(.l_brace, "expected '{'") catch {};
-
         var methods = std.ArrayList(ast.MethodDecl).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             try methods.append(self.allocator, try self.parseMethodDecl());
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
-
         return self.allocExpr(ast.Expr{
             .inline_trait_value = .{
                 .location = tokenLoc(trait_tok),
@@ -2675,9 +2372,9 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析数组字面量：[e1, e2, ...]
     fn parseArrayLiteral(self: *Parser) ParserError!*ast.Expr {
         const bracket_tok = self.previous();
-
         var elements = std.ArrayList(*ast.Expr).empty;
         if (!self.check(.r_bracket)) {
             try elements.append(self.allocator, try self.parseExpr());
@@ -2687,7 +2384,6 @@ pub const Parser = struct {
             }
         }
         _ = self.expect(.r_bracket, "expected ']'") catch {};
-
         return self.allocExpr(ast.Expr{
             .array_literal = .{
                 .location = tokenLoc(bracket_tok),
@@ -2696,33 +2392,26 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析块表达式：{ statements; trailing_expr? }
     fn parseBlockExpr(self: *Parser) ParserError!*ast.Expr {
-        const brace_tok = self.advance(); // 消费 {
+        const brace_tok = self.advance();
         const location = tokenLoc(brace_tok);
-
         var statements = std.ArrayList(*ast.Stmt).empty;
         var trailing_expr: ?*ast.Expr = null;
-
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             if (self.isStmtStart()) {
                 const stmt = self.parseStmt() catch |err| {
                     return err;
                 };
-                // 匿名 lambda（fun(...){...}）经 parseFunStmt 包装成 .expression 语句。
-                // 若它是块内最后一项（后紧跟 }），应作为尾表达式，使块的求值/类型
-                // 结果为该 lambda（函数类型），而非 Unit。命名 fun 会变成 val_decl，
-                // 不受影响。
                 if (stmt.* == .expression and self.check(.r_brace)) {
                     trailing_expr = stmt.expression.expr;
                     break;
                 }
                 try statements.append(self.allocator, stmt);
             } else {
-                // 使用 parseExprOrAssignmentStmt 处理赋值语句（如 x = 10）
                 const stmt = self.parseExprOrAssignmentStmt() catch |err| {
                     return err;
                 };
-                // 检查是否是尾表达式（纯表达式语句且后面紧跟 }）
                 if (stmt.* == .expression and self.check(.r_brace)) {
                     trailing_expr = stmt.expression.expr;
                     break;
@@ -2730,9 +2419,7 @@ pub const Parser = struct {
                 try statements.append(self.allocator, stmt);
             }
         }
-
         _ = self.expect(.r_brace, "expected '}'") catch {};
-
         return self.allocExpr(ast.Expr{
             .block = .{
                 .location = location,
@@ -2742,35 +2429,26 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析圆括号表达式：可能是单元值、lambda、记录字面量、记录扩展或普通分组表达式
     fn parseParenOrRecordOrLambda(self: *Parser) ParserError!*ast.Expr {
         const lparen_tok = self.previous();
         const location = tokenLoc(lparen_tok);
-
-        // 空括号 = 单位值
         if (self.matchToken(.r_paren)) {
             return self.allocExpr(ast.Expr{
                 .unit_literal = location,
             });
         }
-
         const saved = self.current;
-
-        // 尝试解析为 Lambda
         if (self.tryParseLambda(saved, location)) |lambda_expr| {
             return lambda_expr;
         }
-
         self.current = saved;
-
-        // 尝试解析为记录字面量（可能包含 ...spread 扩展）
-        // Phase 3: 支持 (...expr, field: val) 记录扩展语法
         if (self.peek().type == .identifier or self.peek().type == .ellipsis) {
-            // 检查是否以 ... 开头（记录扩展）
             if (self.peek().type == .ellipsis) {
-                _ = self.advance(); // 消费 ...
+                // 记录扩展：(...base, field: value)
+                _ = self.advance();
                 const base_expr = try self.parseExpr();
                 var updates = std.ArrayList(ast.RecordFieldExpr).empty;
-                // 解析后续的 , field: val
                 while (self.matchToken(.comma)) {
                     if (self.check(.r_paren)) break;
                     const field_name = try self.expect(.identifier, "expected field name");
@@ -2790,10 +2468,10 @@ pub const Parser = struct {
                     },
                 });
             }
-
             const name_tok = self.advance();
             if (self.check(.colon)) {
-                _ = self.advance(); // 消费 :
+                // 记录字面量：(field: value, ...)
+                _ = self.advance();
                 const value = try self.parseExpr();
                 var fields = std.ArrayList(ast.RecordFieldExpr).empty;
                 try fields.append(self.allocator, .{
@@ -2802,16 +2480,14 @@ pub const Parser = struct {
                 });
                 while (self.matchToken(.comma)) {
                     if (self.check(.r_paren)) break;
-                    // 支持 ...spread 在字段列表中间
                     if (self.check(.ellipsis)) {
-                        _ = self.advance(); // 消费 ...
+                        // 记录扩展：(field: value, ...base, more: value)
+                        _ = self.advance();
                         const base_expr = try self.parseExpr();
                         var updates = std.ArrayList(ast.RecordFieldExpr).empty;
-                        // 将已有的字段加入 updates
                         for (fields.items) |f| {
                             try updates.append(self.allocator, f);
                         }
-                        // 解析后续的 , field: val
                         while (self.matchToken(.comma)) {
                             if (self.check(.r_paren)) break;
                             const field_name = try self.expect(.identifier, "expected field name");
@@ -2849,39 +2525,31 @@ pub const Parser = struct {
             }
             self.current = saved;
         }
-
-        // 解析第一个表达式
         const first_expr = try self.parseExpr();
-
-        // 文档 D71: 无匿名元组，记录必须有命名字段
-        // (expr, expr, ...) 语法被禁止
         if (self.matchToken(.comma)) {
+            // 匿名元组不被允许，报告错误并跳过剩余
             const loc = tokenLoc(lparen_tok);
             try self.errors.append(self.allocator, ParseError{
                 .line = loc.line,
                 .column = loc.column,
                 .message = "anonymous tuples are not allowed; use named record fields like (name: value, ...)",
             });
-            // 错误恢复：跳到右括号
             while (!self.check(.r_paren) and !self.isAtEnd()) {
                 _ = self.advance();
             }
             _ = self.matchToken(.r_paren);
-            // 返回第一个表达式作为恢复结果
             return first_expr;
         }
-
-        // 单个表达式 = 括号表达式
         _ = self.expect(.r_paren, "expected ')'") catch {};
         return first_expr;
     }
 
+    /// 尝试解析 lambda（(params) => expr），失败时回退
     fn tryParseLambda(self: *Parser, saved: usize, location: ast.SourceLocation) ?*ast.Expr {
         const saved_error_count = self.errors.items.len;
         var params = std.ArrayList(ast.Param).empty;
         if (!self.check(.r_paren)) {
             self.parseLambdaParamList(&params) catch {
-                // 回滚尝试 lambda 时产生的虚假错误消息
                 self.errors.shrinkRetainingCapacity(saved_error_count);
                 return null;
             };
@@ -2890,18 +2558,15 @@ pub const Parser = struct {
             self.errors.shrinkRetainingCapacity(saved_error_count);
             return null;
         }
-        _ = self.advance(); // 消费 )
-
+        _ = self.advance();
         if (!self.check(.eq_gt)) {
             self.current = saved;
             self.errors.shrinkRetainingCapacity(saved_error_count);
             return null;
         }
-        _ = self.advance(); // 消费 =>
-
+        _ = self.advance();
         const body_expr = self.parseExpr() catch return null;
         const body = ast.LambdaBody{ .expression = body_expr };
-
         return self.allocExpr(ast.Expr{
             .lambda = .{
                 .location = location,
@@ -2911,6 +2576,7 @@ pub const Parser = struct {
         }) catch return null;
     }
 
+    /// 解析 lambda 参数列表（逗号分隔）
     fn parseLambdaParamList(self: *Parser, params: *std.ArrayList(ast.Param)) ParserError!void {
         try params.append(self.allocator, try self.parseLambdaParam());
         while (self.matchToken(.comma)) {
@@ -2919,6 +2585,7 @@ pub const Parser = struct {
         }
     }
 
+    /// 解析单个 lambda 参数：[var|val] name: Type
     fn parseLambdaParam(self: *Parser) ParserError!ast.Param {
         var is_var = false;
         if (self.matchToken(.kw_var)) {
@@ -2926,14 +2593,11 @@ pub const Parser = struct {
         } else {
             _ = self.matchToken(.kw_val);
         }
-
         const name_tok = try self.expect(.identifier, "expected parameter name");
-
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             type_annotation = try self.parseType();
         }
-
         return ast.Param{
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
@@ -2942,21 +2606,19 @@ pub const Parser = struct {
         };
     }
 
+    /// 解析类型转换表达式：BuiltinType(expr)
     fn parseTypeCast(self: *Parser) ParserError!*ast.Expr {
-        const name_tok = self.advance(); // 消费类型名
+        const name_tok = self.advance();
         const location = tokenLoc(name_tok);
-
         const target_type = try self.allocType(ast.TypeNode{
             .named = .{
                 .location = location,
                 .name = name_tok.lexeme,
             },
         });
-
         _ = self.expect(.l_paren, "expected '('") catch {};
         const expr = try self.parseExpr();
         _ = self.expect(.r_paren, "expected ')'") catch {};
-
         return self.allocExpr(ast.Expr{
             .type_cast = .{
                 .location = location,
@@ -2966,14 +2628,14 @@ pub const Parser = struct {
         });
     }
 
-    // ============================================================
-    // 模式解析
-    // ============================================================
+    // ---- 模式解析 ----
 
+    /// 模式解析入口
     fn parsePattern(self: *Parser) ParserError!*ast.Pattern {
         return self.parseOrPattern();
     }
 
+    /// 解析或模式：left | right
     fn parseOrPattern(self: *Parser) ParserError!*ast.Pattern {
         var left = try self.parsePrimaryPattern();
         while (self.matchToken(.pipe)) {
@@ -2990,22 +2652,7 @@ pub const Parser = struct {
         return left;
     }
 
-    fn parseGuardPattern(self: *Parser) ParserError!*ast.Pattern {
-        const pat = try self.parsePrimaryPattern();
-        if (self.matchToken(.kw_if)) {
-            const if_tok = self.previous();
-            const condition = try self.parseExpr();
-            return self.allocPattern(ast.Pattern{
-                .guard = .{
-                    .location = tokenLoc(if_tok),
-                    .pattern = pat,
-                    .condition = condition,
-                },
-            });
-        }
-        return pat;
-    }
-
+    /// 解析基本模式：通配符、字面量、变量、构造器、记录模式
     fn parsePrimaryPattern(self: *Parser) ParserError!*ast.Pattern {
         if (self.check(.identifier) and std.mem.eql(u8, self.peek().lexeme, "_")) {
             const tok = self.advance();
@@ -3013,14 +2660,12 @@ pub const Parser = struct {
                 .wildcard = tokenLoc(tok),
             });
         }
-
         if (self.matchToken(.null_literal)) {
             const tok = self.previous();
             return self.allocPattern(ast.Pattern{
                 .literal = .{ .null = tokenLoc(tok) },
             });
         }
-
         if (self.matchToken(.true_literal)) {
             return self.allocPattern(ast.Pattern{
                 .literal = .{ .bool = true },
@@ -3031,28 +2676,24 @@ pub const Parser = struct {
                 .literal = .{ .bool = false },
             });
         }
-
         if (self.matchToken(.int_literal)) {
             const tok = self.previous();
             return self.allocPattern(ast.Pattern{
                 .literal = .{ .int = tok.lexeme },
             });
         }
-
         if (self.matchToken(.float_literal)) {
             const tok = self.previous();
             return self.allocPattern(ast.Pattern{
                 .literal = .{ .float = tok.lexeme },
             });
         }
-
         if (self.matchToken(.char_literal)) {
             const tok = self.previous();
             return self.allocPattern(ast.Pattern{
                 .literal = .{ .char = parseCharValue(tok.lexeme) },
             });
         }
-
         if (self.matchToken(.string_literal)) {
             const tok = self.previous();
             const value = tok.lexeme[1 .. tok.lexeme.len - 1];
@@ -3060,17 +2701,13 @@ pub const Parser = struct {
                 .literal = .{ .string = value },
             });
         }
-
         if (self.matchToken(.l_paren)) {
             return self.parseRecordPattern();
         }
-
-        // kw_val/kw_var 在模式上下文中作为变量名使用
-        // 例如 Ok(val) 中的 val 会被词法分析器识别为 kw_val
         if (self.check(.kw_val) or self.check(.kw_var)) {
             const name_tok = self.advance();
             if (self.check(.l_paren)) {
-                _ = self.advance(); // 消费 (
+                _ = self.advance();
                 var patterns = std.ArrayList(*ast.Pattern).empty;
                 if (!self.check(.r_paren)) {
                     try patterns.append(self.allocator, try self.parsePattern());
@@ -3094,11 +2731,10 @@ pub const Parser = struct {
                 },
             });
         }
-
         if (self.check(.identifier)) {
             const name_tok = self.advance();
             if (self.check(.l_paren)) {
-                _ = self.advance(); // 消费 (
+                _ = self.advance();
                 var patterns = std.ArrayList(*ast.Pattern).empty;
                 if (!self.check(.r_paren)) {
                     try patterns.append(self.allocator, try self.parsePattern());
@@ -3122,25 +2758,22 @@ pub const Parser = struct {
                 },
             });
         }
-
         try self.reportError("expected pattern");
         return error.UnexpectedToken;
     }
 
+    /// 解析记录模式：(field: pattern, ...) 或位置模式 (p0, p1, ...)
     fn parseRecordPattern(self: *Parser) ParserError!*ast.Pattern {
         const lparen = self.previous();
         const location = tokenLoc(lparen);
-
         var fields = std.ArrayList(ast.PatternRecordField).empty;
         if (!self.check(.r_paren)) {
-            // 尝试判断是命名字段 (name: pattern) 还是位置字段 (pattern)
-            // 命名字段：identifier 后面跟着 :
             if (self.peek().type == .identifier) {
                 const saved = self.current;
                 const name_tok = self.advance();
                 if (self.check(.colon)) {
                     // 命名字段模式
-                    _ = self.advance(); // 消费 :
+                    _ = self.advance();
                     const pattern = try self.parsePattern();
                     try fields.append(self.allocator, .{
                         .name = name_tok.lexeme,
@@ -3164,11 +2797,9 @@ pub const Parser = struct {
                         },
                     });
                 }
-                // 不是命名字段，回退
                 self.current = saved;
             }
-
-            // 位置字段模式（元组模式）：(pattern1, pattern2, ...)
+            // 位置模式：用数字字符串作为字段名
             const first_pattern = try self.parsePattern();
             const key0 = try self.allocator.dupe(u8, "0");
             try fields.append(self.allocator, .{
@@ -3188,7 +2819,6 @@ pub const Parser = struct {
             }
         }
         _ = self.expect(.r_paren, "expected ')'") catch {};
-
         return self.allocPattern(ast.Pattern{
             .record = .{
                 .location = location,
@@ -3197,10 +2827,9 @@ pub const Parser = struct {
         });
     }
 
-    // ============================================================
-    // 语句解析
-    // ============================================================
+    // ---- 语句解析 ----
 
+    /// 当前 Token 是否为语句起始关键字
     fn isStmtStart(self: *Parser) bool {
         return switch (self.peek().type) {
             .kw_val,
@@ -3219,6 +2848,7 @@ pub const Parser = struct {
         };
     }
 
+    /// 语句解析入口：根据关键字分派
     fn parseStmt(self: *Parser) ParserError!*ast.Stmt {
         if (self.matchToken(.kw_val)) {
             return self.parseValDecl();
@@ -3227,8 +2857,6 @@ pub const Parser = struct {
             return self.parseVarDecl();
         }
         if (self.matchToken(.kw_fun)) {
-            // 块内 fun 声明：fun name(...) { ... } 转为 val name = fun(...) { ... }
-            // 或者 lambda 表达式：fun(x) { ... }
             return self.parseFunStmt();
         }
         if (self.matchToken(.kw_return)) {
@@ -3261,39 +2889,26 @@ pub const Parser = struct {
         if (self.matchToken(.kw_loop)) {
             return self.parseLoopStmt();
         }
-
         return self.parseExprOrAssignmentStmt();
     }
 
-    /// 解析块内 fun 语句
-    /// fun name(params): Type { body } → val name = fun(params) { body }
-    /// fun(params) { body } → 表达式语句（lambda）
+    /// 解析 fun 语句：具名时作为 val 绑定 lambda，匿名时作为表达式语句
     fn parseFunStmt(self: *Parser) ParserError!*ast.Stmt {
-        const fun_tok = self.previous(); // fun 已被消费
-
-        // 检查是否是命名函数：fun name(...)
+        const fun_tok = self.previous();
         if (self.check(.identifier) and !self.checkIdentifier("in")) {
             const name_tok = self.advance();
-
-            // 解析参数列表
             var params = std.ArrayList(ast.Param).empty;
             _ = self.expect(.l_paren, "expected '('") catch {};
             if (!self.check(.r_paren)) {
                 try self.parseParamList(&params);
             }
             _ = self.expect(.r_paren, "expected ')'") catch {};
-
-            // 返回类型
             var return_type: ?*ast.TypeNode = null;
             if (self.matchToken(.colon)) {
                 return_type = try self.parseType();
             }
-
-            // 函数体
             const body_expr = try self.parseExpr();
             const body = ast.LambdaBody{ .block = body_expr };
-
-            // 构建 lambda 表达式
             const lambda_expr = try self.allocExpr(ast.Expr{
                 .lambda = .{
                     .location = tokenLoc(fun_tok),
@@ -3302,8 +2917,6 @@ pub const Parser = struct {
                     .return_type = return_type,
                 },
             });
-
-            // 返回 val name = lambda
             return self.allocStmt(ast.Stmt{
                 .val_decl = .{
                     .location = tokenLoc(fun_tok),
@@ -3313,19 +2926,14 @@ pub const Parser = struct {
                 },
             });
         }
-
-        // Lambda 表达式：fun(params) { body }
-        // fun 已被消费，需要解析参数和函数体
         var params = std.ArrayList(ast.Param).empty;
         _ = self.expect(.l_paren, "expected '('") catch {};
         if (!self.check(.r_paren)) {
             try self.parseParamList(&params);
         }
         _ = self.expect(.r_paren, "expected ')'") catch {};
-
         const body_expr = try self.parseExpr();
         const body = ast.LambdaBody{ .block = body_expr };
-
         const lambda_expr = try self.allocExpr(ast.Expr{
             .lambda = .{
                 .location = tokenLoc(fun_tok),
@@ -3333,7 +2941,6 @@ pub const Parser = struct {
                 .body = body,
             },
         });
-
         return self.allocStmt(ast.Stmt{
             .expression = .{
                 .location = tokenLoc(fun_tok),
@@ -3342,18 +2949,16 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 val 声明：val name: Type = value
     fn parseValDecl(self: *Parser) ParserError!*ast.Stmt {
         const val_tok = self.previous();
         const name_tok = try self.expect(.identifier, "expected variable name");
-
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             type_annotation = try self.parseType();
         }
-
         _ = self.expect(.eq, "expected '='") catch {};
         const value = try self.parseExpr();
-
         return self.allocStmt(ast.Stmt{
             .val_decl = .{
                 .location = tokenLoc(val_tok),
@@ -3364,18 +2969,16 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 var 声明：var name: Type = value
     fn parseVarDecl(self: *Parser) ParserError!*ast.Stmt {
         const var_tok = self.previous();
         const name_tok = try self.expect(.identifier, "expected variable name");
-
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             type_annotation = try self.parseType();
         }
-
         _ = self.expect(.eq, "expected '='") catch {};
         const value = try self.parseExpr();
-
         return self.allocStmt(ast.Stmt{
             .var_decl = .{
                 .location = tokenLoc(var_tok),
@@ -3386,14 +2989,13 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 return 语句：return expr?
     fn parseReturnStmt(self: *Parser) ParserError!*ast.Stmt {
         const return_tok = self.previous();
-
         var value: ?*ast.Expr = null;
         if (!self.check(.r_brace) and !self.isStmtStart() and !self.isAtEnd()) {
             value = try self.parseExpr();
         }
-
         return self.allocStmt(ast.Stmt{
             .return_stmt = .{
                 .location = tokenLoc(return_tok),
@@ -3402,17 +3004,12 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 defer 语句：defer expr 或 defer target = value
     fn parseDeferStmt(self: *Parser) ParserError!*ast.Stmt {
         const defer_tok = self.previous();
         const expr = try self.parseExpr();
-
-        // 支持 defer 中包含赋值（如 defer counter = 10）
         if (self.matchToken(.eq)) {
             const value = try self.parseExpr();
-            // 将赋值包装为赋值表达式 — 使用 field_assignment 或 assignment
-            // 但 defer_stmt.expr 是 *Expr，不是 *Stmt
-            // 我们需要将赋值包装为一个特殊的表达式
-            // 最简单的方案：将 defer 后面的 "identifier = expr" 解析为一个赋值表达式
             const assign_expr = try self.allocExpr(ast.Expr{
                 .assignment_expr = .{
                     .location = getExprLocation(expr),
@@ -3427,7 +3024,6 @@ pub const Parser = struct {
                 },
             });
         }
-
         return self.allocStmt(ast.Stmt{
             .defer_stmt = .{
                 .location = tokenLoc(defer_tok),
@@ -3436,10 +3032,10 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 throw 语句：throw expr
     fn parseThrowStmt(self: *Parser) ParserError!*ast.Stmt {
         const throw_tok = self.previous();
         const expr = try self.parseExpr();
-
         return self.allocStmt(ast.Stmt{
             .throw_stmt = .{
                 .location = tokenLoc(throw_tok),
@@ -3448,13 +3044,13 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 for 语句：for name in iterable body
     fn parseForStmt(self: *Parser) ParserError!*ast.Stmt {
         const for_tok = self.previous();
         const name_tok = try self.expect(.identifier, "expected iterator variable name");
         _ = self.expect(.kw_in, "expected 'in'") catch {};
         const iterable = try self.parseExpr();
         const body = try self.parseExpr();
-
         return self.allocStmt(ast.Stmt{
             .for_stmt = .{
                 .location = tokenLoc(for_tok),
@@ -3465,11 +3061,11 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 while 语句：while condition body
     fn parseWhileStmt(self: *Parser) ParserError!*ast.Stmt {
         const while_tok = self.previous();
         const condition = try self.parseExpr();
         const body = try self.parseExpr();
-
         return self.allocStmt(ast.Stmt{
             .while_stmt = .{
                 .location = tokenLoc(while_tok),
@@ -3479,10 +3075,10 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 loop 语句：loop body
     fn parseLoopStmt(self: *Parser) ParserError!*ast.Stmt {
         const loop_tok = self.previous();
         const body = try self.parseExpr();
-
         return self.allocStmt(ast.Stmt{
             .loop_stmt = .{
                 .location = tokenLoc(loop_tok),
@@ -3491,13 +3087,12 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析表达式语句或赋值语句（含复合赋值）
     fn parseExprOrAssignmentStmt(self: *Parser) ParserError!*ast.Stmt {
         const expr = try self.parseExpr();
-
         if (self.matchToken(.eq)) {
             const eq_tok = self.previous();
             const value = try self.parseExpr();
-
             switch (expr.*) {
                 .identifier => |id| {
                     return self.allocStmt(ast.Stmt{
@@ -3529,15 +3124,12 @@ pub const Parser = struct {
                 },
             }
         }
-
-        // 复合赋值运算符：+=, -=, *=, /=, %=, &=, |=
         const compound_op = self.peekCompoundAssign();
         if (compound_op != null) {
             _ = self.advance();
             const op_tok = self.previous();
             const value = try self.parseExpr();
             const op = compound_op.?;
-
             return self.allocStmt(ast.Stmt{
                 .compound_assignment = .{
                     .location = tokenLoc(op_tok),
@@ -3547,7 +3139,6 @@ pub const Parser = struct {
                 },
             });
         }
-
         return self.allocStmt(ast.Stmt{
             .expression = .{
                 .location = getExprLocation(expr),
@@ -3556,7 +3147,7 @@ pub const Parser = struct {
         });
     }
 
-    /// 检查当前 token 是否为复合赋值运算符，返回对应的 CompoundAssignOp
+    /// 查看当前 Token 是否为复合赋值运算符，返回对应枚举
     fn peekCompoundAssign(self: *Parser) ?ast.CompoundAssignOp {
         const tok_type = self.peek().type;
         return switch (tok_type) {
@@ -3572,11 +3163,9 @@ pub const Parser = struct {
     }
 };
 
-// ============================================================
-// 辅助函数
-// ============================================================
+// ---- 模块级辅助函数 ----
 
-/// 从 token 获取源位置
+/// 从 Token 提取源码位置
 fn tokenLoc(token: lexer.Token) ast.SourceLocation {
     return ast.SourceLocation{
         .line = token.line,
@@ -3584,7 +3173,7 @@ fn tokenLoc(token: lexer.Token) ast.SourceLocation {
     };
 }
 
-/// 获取类型节点的源位置
+/// 返回类型节点的源码位置
 fn getTypeNodeLocation(ty: *const ast.TypeNode) ast.SourceLocation {
     return switch (ty.*) {
         .named => |n| n.location,
@@ -3598,12 +3187,12 @@ fn getTypeNodeLocation(ty: *const ast.TypeNode) ast.SourceLocation {
     };
 }
 
-/// 获取表达式的源位置
+/// 返回表达式的源码位置（委托给 ast.exprLocation）
 fn getExprLocation(expr: *const ast.Expr) ast.SourceLocation {
     return ast.exprLocation(expr);
 }
 
-/// 判断标识符是否为内建类型名（用于类型转换判断）
+/// 判断名称是否为内置类型（整数、浮点、布尔、字符串）
 fn isBuiltinType(name: []const u8) bool {
     const builtin_types = [_][]const u8{
         "i8",   "i16",  "i32",  "i64",  "i128",
@@ -3617,12 +3206,11 @@ fn isBuiltinType(name: []const u8) bool {
     return false;
 }
 
-/// 解析字符字面量的值
+/// 解析字符字面量的实际码点值，处理转义序列
 fn parseCharValue(lexeme: []const u8) u21 {
     if (lexeme.len < 3) return 0;
     const content = lexeme[1 .. lexeme.len - 1];
     if (content.len == 0) return 0;
-
     if (content[0] == '\\') {
         if (content.len < 2) return 0;
         switch (content[1]) {
@@ -3635,11 +3223,10 @@ fn parseCharValue(lexeme: []const u8) u21 {
             else => return @intCast(content[1]),
         }
     }
-
     return @intCast(content[0]);
 }
 
-/// 检查字符串是否包含插值
+/// 判断字符串字面量是否包含插值表达式（未转义的 { ）
 fn containsInterpolation(raw: []const u8) bool {
     if (raw.len < 2) return false;
     var i: usize = 1;
@@ -3660,7 +3247,7 @@ fn containsInterpolation(raw: []const u8) bool {
     return false;
 }
 
-/// 将 usize 转换为位置键字符串（用于元组的位置索引）
+/// 将索引转换为字符串键（用于位置模式的字段名）
 fn intToKey(allocator: std.mem.Allocator, idx: usize) ![]const u8 {
     var buf: [16]u8 = undefined;
     var len: usize = 0;
@@ -3676,7 +3263,6 @@ fn intToKey(allocator: std.mem.Allocator, idx: usize) ![]const u8 {
             tmp_len += 1;
             n /= 10;
         }
-        // 反转
         var i: usize = 0;
         while (i < tmp_len) : (i += 1) {
             buf[i] = tmp[tmp_len - 1 - i];
@@ -3686,10 +3272,12 @@ fn intToKey(allocator: std.mem.Allocator, idx: usize) ![]const u8 {
     return allocator.dupe(u8, buf[0..len]);
 }
 
+/// 判断字符是否为数字或下划线
 fn isDigitOrUnderscore(ch: u8) bool {
     return (ch >= '0' and ch <= '9') or ch == '_';
 }
 
+/// 判断字符是否为十六进制数字或下划线
 fn isHexOrUnderscore(ch: u8) bool {
     return isDigitOrUnderscore(ch) or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
 }

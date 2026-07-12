@@ -1,29 +1,26 @@
-//! Pass 5：分支可达性分析。
+//! 分支可达性分析模块。
 //!
-//! 查询 ConstTable 检测 if 表达式的条件是否为编译期常量布尔值。
-//! 若是，则标记该分支为 always_true / always_false，编译器可跳过死分支。
-//!
-//! 限制：仅利用同函数内的常量传播结果（ConstTable 不跨函数）。
+//! 基于常量传播的结果，判断 if 表达式的条件是否在编译期可确定为常量布尔值。
+//! 若条件恒为 true 或 false，则对应的分支必然可达或必然不可达，可用于死分支
+//! 消除等优化。分析结果记录在 BranchTable 中，键为 if 表达式指针。
 
 const std = @import("std");
 const ast = @import("ast");
 const const_prop_mod = @import("const_prop.zig");
 
-/// 分支可达性信息
+/// 分支可达性信息：恒真、恒假或运行时判定。
 pub const BranchInfo = enum {
-    /// 条件恒为 true：then 分支必执行，else 分支死代码
     always_true,
-    /// 条件恒为 false：else 分支必执行（若有），then 分支死代码
     always_false,
-    /// 条件为运行时值：两分支均可能执行
     runtime,
 
+    /// 是否为编译期确定的常量分支（非运行时判定）。
     pub fn isConst(self: BranchInfo) bool {
         return self != .runtime;
     }
 };
 
-/// 分支表：if_expr 节点指针 → BranchInfo
+/// if 表达式到分支可达性信息的映射表。
 pub const BranchTable = struct {
     entries: std.AutoHashMap(*const ast.Expr, BranchInfo),
     allocator: std.mem.Allocator,
@@ -47,15 +44,15 @@ pub const BranchTable = struct {
         return self.entries.get(if_expr);
     }
 
+    /// 分支表是否为空。
     pub fn isEmpty(self: *const BranchTable) bool {
         return self.entries.count() == 0;
     }
 };
 
-/// Pass 5：分支可达性分析器
+/// 分支可达性分析遍。依赖常量传播结果，逐函数遍历 AST 判定每个 if 的分支可达性。
 pub const BranchReachPass = struct {
     table: BranchTable,
-    /// 借用 ConstPropPass 的结果表（不拥有）
     const_table: *const const_prop_mod.ConstTable,
     allocator: std.mem.Allocator,
 
@@ -71,9 +68,8 @@ pub const BranchReachPass = struct {
         self.table.deinit();
     }
 
-    /// 遍历模块所有 if_expr，查询条件是否为常量布尔
     pub fn analyzeModule(self: *BranchReachPass, module: *const ast.Module) !void {
-        // 【优化】const_table 为空时所有 if 条件必然非常量，跳过整个遍历
+        // 无常量信息时跳过分析。
         if (self.const_table.isEmpty()) return;
         for (module.declarations) |decl| {
             if (decl != .fun_decl) continue;
@@ -81,23 +77,24 @@ pub const BranchReachPass = struct {
         }
     }
 
+    /// 递归分析表达式，对 if 表达式根据条件常量值判定分支可达性。
     fn analyzeExpr(self: *BranchReachPass, expr: *const ast.Expr) anyerror!void {
         switch (expr.*) {
             .if_expr => |i| {
-                // 先递归子节点（条件、then、else 内部可能还有嵌套 if）
                 try self.analyzeExpr(i.condition);
                 try self.analyzeExpr(i.then_branch);
                 if (i.else_branch) |e| try self.analyzeExpr(e);
-
-                // 查询条件是否为常量布尔
+                // 查询条件在常量表中的值，判定分支可达性。
                 if (self.const_table.lookup(i.condition)) |cv| {
                     if (cv == .bool_val) {
                         const info: BranchInfo = if (cv.bool_val) .always_true else .always_false;
                         try self.table.put(expr, info);
                     } else {
+                        // 条件为常量但非布尔类型，视为运行时判定。
                         try self.table.put(expr, .runtime);
                     }
                 } else {
+                    // 条件无常量信息，视为运行时判定。
                     try self.table.put(expr, .runtime);
                 }
             },
@@ -131,6 +128,7 @@ pub const BranchReachPass = struct {
         }
     }
 
+    /// 递归分析语句中的表达式。
     fn analyzeStmt(self: *BranchReachPass, stmt: *const ast.Stmt) anyerror!void {
         switch (stmt.*) {
             .val_decl => |v| try self.analyzeExpr(v.value),
@@ -156,7 +154,6 @@ test "BranchTable basic put/lookup" {
     var table = BranchTable.init(std.testing.allocator);
     defer table.deinit();
     try std.testing.expect(table.isEmpty());
-    // 完整 put/lookup 需 AST 节点指针，在集成测试中覆盖
 }
 
 test "BranchInfo isConst" {

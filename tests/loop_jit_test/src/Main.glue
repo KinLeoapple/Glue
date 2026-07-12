@@ -1,0 +1,11 @@
+// Test float comparison in if-statement
+
+fun testFloatEq(x: f64): i32 {
+    if (x == 0.0) { return 1 }
+    return 0
+}
+
+fun main() {
+    println(testFloatEq(0.0))    // 1
+    println(testFloatEq(4.0))    // 0
+}

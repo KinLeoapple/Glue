@@ -1,7 +1,14 @@
-//! Trait 解析
+//! Trait 解析与检查模块。
 //!
-//! 从 type_check.zig 提取的 Trait 解析逻辑，以自由函数形式实现。
-//! TypeInferencer 上的方法委托到此模块。
+//! 负责 Glue 语言中 trait 相关的全部语义检查工作，包括：
+//! - 父 trait 方法的继承注册
+//! - 用具体类型实例化含类型变量的类型
+//! - 在调用点检查函数的 trait 约束是否被满足
+//! - 实例化类型方案后检查其 trait bound 是否满足
+//! - 单个 trait bound 的合法性校验
+//! - 方法调用与方法安全调用的类型推断
+//! - trait 声明的完整检查（含父 trait 冲突、override、委托等）
+//! - 类型上 trait 实现的检查（孤儿规则、重叠实例、方法完备性）
 
 const std = @import("std");
 const ast = @import("ast");
@@ -18,8 +25,8 @@ pub const TypeErrorKind = type_check.TypeErrorKind;
 pub const SemaError = type_check.SemaError;
 pub const TypeInferencer = type_check.TypeInferencer;
 
-/// 文档 2.7.2: 递归注册父 Trait 的方法到类型环境
-/// 类型实现 Child<T> 会自动满足所有父 Trait 的 bound
+/// 将父 trait 的方法方案注册到当前环境，用于实现 trait 方法的继承。
+/// 仅注册未被 `overridden` 标记且环境中尚不存在的方法。
 pub fn registerParentTraitMethods(
     inferencer: *TypeInferencer,
     env: *TypeEnv,
@@ -39,8 +46,8 @@ pub fn registerParentTraitMethods(
     }
 }
 
-/// 将类型中的所有类型变量替换为具体类型
-/// 用于 trait 方法的类型实例化（如类型实现 Ord<i32> 中 T -> i32）
+/// 用具体类型 `concrete` 实例化类型 `ty` 中的类型变量。
+/// 递归处理函数类型；其余具体类型原样返回。
 pub fn instantiateWithConcreteType(
     inferencer: *TypeInferencer,
     ty: *Type,
@@ -74,7 +81,8 @@ pub fn instantiateWithConcreteType(
     }
 }
 
-/// Call-site trait bound checking
+/// 在函数调用点检查被调用函数声明的 trait bound 是否被满足。
+/// 仅对内建类型名或当前模块定义的类型名做实现存在性校验。
 pub fn checkCallSiteTraitBound(
     inferencer: *TypeInferencer,
     callee: *const ast.Expr,
@@ -95,6 +103,7 @@ pub fn checkCallSiteTraitBound(
                 .generic => |g| g.name,
                 else => continue,
             };
+            // 内建类型作为 trait 实参时，要求存在对应 trait 实现
             if (isBuiltinTypeName(tp_name)) {
                 const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
                 defer inferencer.allocator.free(trait_key);
@@ -102,6 +111,7 @@ pub fn checkCallSiteTraitBound(
                     inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
                 }
             }
+            // 用户定义类型作为 trait 实参时，同样要求存在对应实现
             if (inferencer.type_defining_modules.contains(tp_name)) {
                 const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
                 defer inferencer.allocator.free(trait_key);
@@ -113,8 +123,8 @@ pub fn checkCallSiteTraitBound(
     }
 }
 
-/// 文档 2.7.3: 从 TypeScheme 的 BoundInfo 检查 Trait Bound
-/// 在实例化后调用，检查实例化后的类型参数是否满足 bound
+/// 在实例化类型方案后检查其 trait bound 是否被满足。
+/// 对每个 bound，定位被绑定的具体类型名并校验是否注册了对应 trait 实现。
 pub fn checkInstantiatedBounds(
     inferencer: *TypeInferencer,
     scheme: TypeScheme,
@@ -144,8 +154,7 @@ pub fn checkInstantiatedBounds(
     }
 }
 
-/// 文档 2.7.3: Trait Bound `with` 验证
-/// 检查声明的 Trait bound 是否有对应的 trait 定义和 trait 实现
+/// 校验单个 trait bound 的合法性：trait 是否存在、各类型实参是否有对应实现。
 pub fn checkTraitBound(
     inferencer: *TypeInferencer,
     bound: ast.TraitBound,
@@ -162,6 +171,7 @@ pub fn checkTraitBound(
                 const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
                 defer inferencer.allocator.free(trait_key);
                 if (!inferencer.registered_traits.contains(trait_key)) {
+                    // 仅对内建类型与当前项目定义的类型报缺实现错误
                     if (isBuiltinTypeName(tp_name)) {
                         inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}>", .{ bound.trait_name, tp_name });
                     }
@@ -174,30 +184,26 @@ pub fn checkTraitBound(
             const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::", .{bound.trait_name}) catch return;
             defer inferencer.allocator.free(trait_key);
         }
-
         if (trait_info.associated_type_names.len > 0 and bound.type_args.len == 0) {
-            // Trait 有关联类型但 bound 没有指定 — 简化：不强制要求
         }
     } else {
         inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "trait '{s}' is not defined", .{bound.trait_name});
     }
 }
 
-/// method_call 表达式的 trait 方法分派解析
+/// 推断方法调用表达式的类型。
+/// 先推断接收者类型并对 nullable 接收者做安全检查，再在各 trait 的方法方案中
+/// 查找匹配方法，实例化后用接收者类型统一 self 参数，返回方法返回类型。
 pub fn inferMethodCall(
     inferencer: *TypeInferencer,
     mc: @TypeOf(@as(ast.Expr, undefined).method_call),
     env: *TypeEnv,
 ) SemaError!*Type {
     const obj_ty = inferencer.inferExpr(mc.object, env, null) catch return inferencer.freshTypeVar() catch unreachable;
-    // 文档 §2.3.5：使用可空值前必须消除空值可能性。对 nullable 接收者直接调方法非法——
-    // 必须先用 ?.（安全调用）、!（非空断言）或 if x != null narrowing 消除 null。
-    // narrowing 后绑定已收窄为非 null（applyNarrowing），故此处只拦真正的 nullable。
     {
+        // 对 nullable 接收者调用方法：需已通过窄化确认非空，否则报错
         const robj = inferencer.resolve(obj_ty);
         if (robj.* == .nullable_type) {
-            // 字段路径 narrowing：若接收者路径（如 "u.addr"）已在 narrowed_paths 中
-            // （处于 `if (u.addr != null)` 的 then 分支），视为已收窄，放行。
             var narrowed = false;
             if (inferencer.exprPath(mc.object)) |op| {
                 defer inferencer.allocator.free(op);
@@ -209,7 +215,8 @@ pub fn inferMethodCall(
             }
         }
     }
-    // 查找 trait 方法签名
+
+    // 遍历所有 trait 查找同名方法
     var trait_iter = inferencer.trait_types.iterator();
     while (trait_iter.next()) |entry| {
         if (entry.value_ptr.method_schemes.get(mc.method)) |scheme| {
@@ -229,14 +236,14 @@ pub fn inferMethodCall(
     return inferencer.freshTypeVar() catch unreachable;
 }
 
-/// safe_method_call 表达式的 trait 方法分派解析
+/// 推断安全方法调用（`?.method(...)`）的类型。
+/// 始终返回一个 nullable 包装的新类型变量，表示可能为空的结果。
 pub fn inferSafeMethodCall(
     inferencer: *TypeInferencer,
     smc: @TypeOf(@as(ast.Expr, undefined).safe_method_call),
     env: *TypeEnv,
 ) SemaError!*Type {
     const obj_ty = inferencer.inferExpr(smc.object, env, null) catch return inferencer.freshTypeVar() catch unreachable;
-    // Try to find the method in registered traits (similar to method_call)
     var trait_iter = inferencer.trait_types.iterator();
     while (trait_iter.next()) |entry| {
         for (entry.value_ptr.method_names) |mname| {
@@ -251,8 +258,7 @@ pub fn inferSafeMethodCall(
     return inferencer.makeNullableType(inner) catch unreachable;
 }
 
-/// trait_decl 声明的处理逻辑
-/// 计算 ast.Kind 的箭头 arity（`* -> *` → 1，`* -> * -> *` → 2，`*` → 0）。
+/// 计算种类的箭头 arity：star 为 0，箭头则递归累加。
 fn kindArrowArity(k: *const ast.Kind) usize {
     return switch (k.*) {
         .star => 0,
@@ -260,6 +266,8 @@ fn kindArrowArity(k: *const ast.Kind) usize {
     };
 }
 
+/// 完整检查一个 trait 声明：注册 trait 类型、收集父 trait 方法、校验
+/// override/委托冲突、检测多继承的方法冲突，并登记 trait 的定义模块。
 pub fn checkTraitDecl(
     inferencer: *TypeInferencer,
     td: @TypeOf(@as(ast.Decl, undefined).trait_decl),
@@ -267,23 +275,17 @@ pub fn checkTraitDecl(
     const trait_ty = inferencer.allocator.create(Type) catch return;
     trait_ty.* = Type{ .trait_type = .{ .name = td.name, .type_args = &[_]*Type{} } };
     inferencer.types.append(inferencer.allocator, trait_ty) catch return;
-
-    // 收集关联类型名称
     var assoc_names = inferencer.allocator.alloc([]const u8, td.associated_types.len) catch return;
     for (td.associated_types, 0..) |at, i| {
         assoc_names[i] = at.name;
     }
 
-    // 创建类型参数映射
     var type_param_map = std.StringHashMap(*Type).init(inferencer.allocator);
     defer type_param_map.deinit();
-
-    // 创建 Self 类型变量（表示实现该 trait 的类型）
     const self_type_var = inferencer.freshTypeVar() catch return;
     const old_self_type = inferencer.current_self_type;
     defer inferencer.current_self_type = old_self_type;
     inferencer.current_self_type = self_type_var;
-
     for (td.type_params) |tp| {
         const tv = inferencer.freshTypeVar() catch return;
         type_param_map.put(tp.name, tv) catch return;
@@ -293,12 +295,11 @@ pub fn checkTraitDecl(
         type_param_map.put(at.name, tv) catch return;
     }
 
-    // 收集方法名称和类型签名
     var meth_names_list = std.ArrayList([]const u8).empty;
     defer meth_names_list.deinit(inferencer.allocator);
     var method_schemes = std.StringHashMap(TypeScheme).init(inferencer.allocator);
 
-    // 先合并父 Trait 的方法签名
+    // 继承父 trait 的方法名与方法方案
     for (td.parents) |parent| {
         if (inferencer.trait_types.getPtr(parent.trait_name)) |parent_info| {
             for (parent_info.method_names) |mname| {
@@ -312,7 +313,7 @@ pub fn checkTraitDecl(
         }
     }
 
-    // 再处理子 Trait 自身的方法
+    // 处理本 trait 自身声明的方法，并校验 override/委托合法性
     for (td.methods) |m| {
         var name_conflicts_with_parent = false;
         for (td.parents) |parent| {
@@ -348,9 +349,8 @@ pub fn checkTraitDecl(
                 inferencer.addError(.type_mismatch, "delegate trait '{s}' is not defined", .{del.trait_name});
             }
         }
+
         meth_names_list.append(inferencer.allocator, m.name) catch return;
-        // 方法自身的类型参数（如 map<T, U>）并入一个临时映射，
-        // 使方法签名里的 T/U 以及 F<T>（trait 的 F）都能解析。
         var method_param_map = std.StringHashMap(*Type).init(inferencer.allocator);
         defer method_param_map.deinit();
         {
@@ -379,7 +379,7 @@ pub fn checkTraitDecl(
         method_schemes.put(mname, scheme) catch return;
     }
 
-    // 冲突检测
+    // 检测多继承导致的同名方法冲突，要求子类用 override/委托消解
     {
         var method_all_sources = std.StringHashMap(std.ArrayList([]const u8)).init(inferencer.allocator);
         defer {
@@ -389,7 +389,6 @@ pub fn checkTraitDecl(
             }
             method_all_sources.deinit();
         }
-
         for (td.parents) |parent| {
             if (inferencer.trait_types.getPtr(parent.trait_name)) |parent_info| {
                 for (parent_info.method_names) |mname| {
@@ -404,7 +403,6 @@ pub fn checkTraitDecl(
                 }
             }
         }
-
         var conflict_iter = method_all_sources.iterator();
         while (conflict_iter.next()) |entry| {
             const mname = entry.key_ptr.*;
@@ -426,14 +424,10 @@ pub fn checkTraitDecl(
     }
 
     const meth_names = meth_names_list.toOwnedSlice(inferencer.allocator) catch return;
-
-    // 文档 §2.11.1: 计算每个类型参数声明的 kind arity（`->` 个数），
-    // 供 trait 实现头部的类型实参 kind 检查使用。
     const kind_arities = inferencer.allocator.alloc(usize, td.type_params.len) catch return;
     for (td.type_params, 0..) |tp, i| {
         kind_arities[i] = if (tp.kind) |k| kindArrowArity(k) else 0;
     }
-
     const key = inferencer.allocator.dupe(u8, td.name) catch return;
     if (inferencer.isBuiltinName(td.name)) {
         inferencer.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
@@ -454,7 +448,7 @@ pub fn checkTraitDecl(
     inferencer.trait_defining_modules.put(mod_key, mod_val) catch return;
 }
 
-/// 检查名称是否为内建类型名
+/// 判断 `name` 是否为内建基础类型名。
 fn isBuiltinTypeName(name: []const u8) bool {
     const builtin_types = .{
         "i8",  "i16", "i32", "i64", "i128",
@@ -467,33 +461,27 @@ fn isBuiltinTypeName(name: []const u8) bool {
     return false;
 }
 
-/// 检查 type 声明的 trait 实现（新语法）
-/// type Point: Show, Eq = (x: i32, y: i32) { methods }
+/// 检查某类型上声明的 trait 实现：应用孤儿规则、检测重叠实例、
+/// 校验必需方法是否齐全，并把实现的方法方案注入到环境以便方法解析。
 pub fn checkTypeTraitImplementations(
     inferencer: *TypeInferencer,
     td: @TypeOf(@as(ast.Decl, undefined).type_decl),
     env: *TypeEnv,
 ) void {
-    // 为每个实现的 trait 进行验证
     for (td.implemented_traits) |trait_bound| {
-        // 检查 trait 是否存在
         const trait_info = inferencer.trait_types.getPtr(trait_bound.trait_name) orelse {
             inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "undefined trait '{s}'", .{trait_bound.trait_name});
             continue;
         };
-
-        // Orphan 检查：类型和 trait 至少有一个在当前模块定义
+        // 孤儿规则：类型与 trait 至少有一个定义在当前模块
         const type_in_current_module = std.mem.eql(u8, inferencer.current_module, inferencer.type_defining_modules.get(td.name) orelse "");
         const trait_in_current_module = std.mem.eql(u8, inferencer.current_module, inferencer.trait_defining_modules.get(trait_bound.trait_name) orelse "");
-
         if (!type_in_current_module and !trait_in_current_module) {
             inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "orphan instance: neither type '{s}' nor trait '{s}' is defined in this module", .{ td.name, trait_bound.trait_name });
         }
-
-        // Overlapping 检查：确保没有重复实现
+        // 重叠实例检测
         const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ trait_bound.trait_name, td.name }) catch return;
         defer inferencer.allocator.free(trait_key);
-
         if (inferencer.registered_traits.contains(trait_key)) {
             inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "overlapping instance: trait '{s}' is already implemented for type '{s}'", .{ trait_bound.trait_name, td.name });
         } else {
@@ -505,8 +493,7 @@ pub fn checkTypeTraitImplementations(
                 .column = td.location.column,
             }) catch return;
         }
-
-        // 验证所有 trait 方法都已实现
+        // 校验 trait 必需方法是否全部实现
         for (trait_info.method_names) |required_method| {
             var found = false;
             for (td.methods) |method| {
@@ -519,14 +506,10 @@ pub fn checkTypeTraitImplementations(
                 inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "type '{s}' does not implement required method '{s}' from trait '{s}'", .{ td.name, required_method, trait_bound.trait_name });
             }
         }
-
-        // 将 trait 方法注册到环境中（用于方法调用解析）
+        // 将实现的方法方案以 "TypeName.methodName" 的键注入环境
         for (trait_info.method_names) |mname| {
             if (trait_info.method_schemes.get(mname)) |method_scheme| {
-                // 将方法注册到类型环境中
                 const method_key = std.fmt.allocPrint(inferencer.allocator, "{s}.{s}", .{ td.name, mname }) catch continue;
-                // 不要 defer free，因为 TypeEnv 会拥有这个键
-                // 使用 put 是安全的，因为 method_key 已经是新分配的
                 env.bindings.put(method_key, method_scheme) catch {
                     inferencer.allocator.free(method_key);
                     continue;
@@ -535,4 +518,3 @@ pub fn checkTypeTraitImplementations(
         }
     }
 }
-

@@ -1,22 +1,14 @@
-//! Pass：死代码消除（DCE）。
+//! 死代码消除（DCE）模块。
 //!
-//! 借鉴 LLVM DCE：识别"完全未被引用"且"RHS 无副作用"的 val_decl/var_decl，
-//! 标记为 dead。编译器在 emitStmt 中查询 DeadTable，命中则跳过整个声明
-//!（不分配 slot、不 emit RHS、不 emit set_local），消除 dead 指令。
-//!
-//! 算法（迭代到 fixpoint，捕获 chained dead）：
-//!   1. 收集所有"读取位置"的 identifier name（assignment target 不算读取；
-//!      compound_assignment target 既读又写，算读取）
-//!   2. 已标记 dead 的 val_decl/var_decl 的 RHS 不计入 reads（因为 RHS 不再 emit）
-//!   3. 遍历所有 val_decl/var_decl，若 name 不在 reads 且 RHS 无副作用 → 标记 dead
-//!   4. 重复 1-3 直到 table 不再增长
-//!
-//! 限制：函数级分析（不跨函数）；只标记整个声明 dead（不做部分消除）。
+//! 定义死代码表（DeadTable）与分析遍（DeadCodePass）。分析遍对每个函数体执行
+//! 不动点迭代：先收集所有被读取的变量名，再将从未被读取且初值无副作用的声明
+//! 标记为死代码。标记为死代码后，其初始化值中读取的变量不再计入有效读取，
+//! 因此需要反复迭代直到不再产生新的死代码。
 
 const std = @import("std");
 const ast = @import("ast");
 
-/// 死代码表：被标记为 dead 的 val_decl/var_decl stmt 指针集合
+/// 死代码标记表。键为被标记为死代码的语句指针。
 pub const DeadTable = struct {
     entries: std.AutoHashMap(*const ast.Stmt, void),
     allocator: std.mem.Allocator,
@@ -36,16 +28,18 @@ pub const DeadTable = struct {
         try self.entries.put(stmt, {});
     }
 
+    /// 判断给定语句是否被标记为死代码。
     pub fn isDead(self: *const DeadTable, stmt: *const ast.Stmt) bool {
         return self.entries.contains(stmt);
     }
 
+    /// 死代码表是否为空。
     pub fn isEmpty(self: *const DeadTable) bool {
         return self.entries.count() == 0;
     }
 };
 
-/// DCE pass（借用 DeadTable，由 AnalysisDB 持有）
+/// 死代码分析遍。逐函数遍历 AST，通过不动点迭代标记未被使用的声明。
 pub const DeadCodePass = struct {
     table: *DeadTable,
     allocator: std.mem.Allocator,
@@ -57,7 +51,6 @@ pub const DeadCodePass = struct {
         };
     }
 
-    /// 分析模块：对每个 fun_decl 体跑迭代 DCE
     pub fn analyzeModule(self: *DeadCodePass, module: *const ast.Module) !void {
         for (module.declarations) |decl| {
             if (decl != .fun_decl) continue;
@@ -65,14 +58,14 @@ pub const DeadCodePass = struct {
         }
     }
 
+    /// 对函数体执行不动点迭代：反复收集有效读取并标记死声明，直到不再变化。
     fn analyzeFunction(self: *DeadCodePass, body: *const ast.Expr) !void {
-        // 迭代到 fixpoint：每次标记新 dead 后，被 dead 的 RHS 引用不再算 reads，
-        // 可能使上游 val_decl 也变 dead。
         var changed = true;
         while (changed) {
             changed = false;
             var reads = std.StringHashMap(void).init(self.allocator);
             defer reads.deinit();
+            // 已标记为死的声明其初始化值中的读取不再计入。
             try self.collectReadsExpr(body, &reads);
             const before = self.table.entries.count();
             try self.collectAndMarkDeclsExpr(body, &reads);
@@ -80,8 +73,7 @@ pub const DeadCodePass = struct {
         }
     }
 
-    /// 收集"读取位置"的 identifier name。
-    /// 已标记 dead 的 val_decl/var_decl 的 RHS 不收集（因为 RHS 不再 emit）。
+    /// 递归收集表达式中所有被读取的变量名。已标记为死代码的声明跳过其值。
     fn collectReadsExpr(self: *DeadCodePass, expr: *const ast.Expr, reads: *std.StringHashMap(void)) anyerror!void {
         switch (expr.*) {
             .identifier => |id| try reads.put(id.name, {}),
@@ -145,12 +137,11 @@ pub const DeadCodePass = struct {
                 for (mc.arguments) |a| try self.collectReadsExpr(a, reads);
             },
             .assignment_expr => |a| {
-                // 纯 identifier target 是写入，不算读取；其他 target（字段/索引）的 object 部分算读取
+                // 赋值目标若是标识符则为写入而非读取，不收集。
                 if (a.target.* != .identifier) try self.collectReadsExpr(a.target, reads);
                 try self.collectReadsExpr(a.value, reads);
             },
             .compound_assign => |c| {
-                // compound assignment target 既读又写（a += 1 读取 a）
                 try self.collectReadsExpr(c.target, reads);
                 try self.collectReadsExpr(c.value, reads);
             },
@@ -158,10 +149,11 @@ pub const DeadCodePass = struct {
         }
     }
 
+    /// 递归收集语句中所有被读取的变量名。
     fn collectReadsStmt(self: *DeadCodePass, stmt: *const ast.Stmt, reads: *std.StringHashMap(void)) anyerror!void {
         switch (stmt.*) {
             .val_decl => |v| {
-                // 已 dead 的 RHS 不再 emit，不收集其 reads
+                // 已标记为死的声明不计入读取。
                 if (!self.table.isDead(stmt)) try self.collectReadsExpr(v.value, reads);
             },
             .var_decl => |v| {
@@ -196,7 +188,7 @@ pub const DeadCodePass = struct {
         }
     }
 
-    /// 遍历所有 val_decl/var_decl，若 name 未被读取 且 RHS 无副作用 → 标记 dead。
+    /// 遍历表达式，对其中声明的变量检查是否被读取；若未被读取且初值无副作用则标记为死。
     fn collectAndMarkDeclsExpr(self: *DeadCodePass, expr: *const ast.Expr, reads: *const std.StringHashMap(void)) anyerror!void {
         switch (expr.*) {
             .binary => |b| {
@@ -270,6 +262,8 @@ pub const DeadCodePass = struct {
         }
     }
 
+    /// 遍历语句，对 val_decl / var_decl 检查其变量名是否被读取。
+    /// 若未被读取且初值无副作用，则标记为死代码。
     fn collectAndMarkDeclsStmt(self: *DeadCodePass, stmt: *const ast.Stmt, reads: *const std.StringHashMap(void)) anyerror!void {
         switch (stmt.*) {
             .val_decl => |v| {
@@ -311,8 +305,8 @@ pub const DeadCodePass = struct {
     }
 };
 
-/// 判定表达式是否无副作用（保守版，镜像 compiler.exprHasNoSideEffects）。
-/// 用于 DCE：RHS 无副作用时，未使用的 val_decl 可安全消除。
+/// 判断表达式是否无副作用。仅纯字面量、标识符、无副作用的一元 / 二元运算、
+/// if 表达式、类型转换等可判定为无副作用；调用、索引、赋值等一律视为有副作用。
 fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
     return switch (expr.*) {
         .int_literal, .float_literal, .bool_literal, .char_literal,
@@ -320,8 +314,9 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
         => true,
         .unary => |u| isSideEffectFreeExpr(u.operand),
         .binary => |b| switch (b.op) {
-            .and_op, .or_op, .elvis => false, // 短路可能跳过右操作数，保守不消除
-            .range, .range_inclusive, .concat_list => false, // 可能分配
+            // 短路运算、范围、列表拼接等可能有副作用或特殊语义，保守视为非纯。
+            .and_op, .or_op, .elvis => false,
+            .range, .range_inclusive, .concat_list => false,
             else => isSideEffectFreeExpr(b.left) and isSideEffectFreeExpr(b.right),
         },
         .block => |b| {
@@ -339,7 +334,7 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
         },
         .type_cast => |tc| isSideEffectFreeExpr(tc.expr),
         .non_null_assert => |n| isSideEffectFreeExpr(n.expr),
-        // 有副作用或可能抛异常/分配
+        // 以下表达式一律视为有副作用，不在此处逐条展开。
         .call, .method_call, .safe_method_call, .string_interpolation,
         .index, .record_literal, .record_extend, .array_literal,
         .lambda, .match, .select, .lazy,
@@ -349,6 +344,7 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
     };
 }
 
+/// 判断语句是否无副作用。仅表达式语句和声明语句可能无副作用，其余一律视为有副作用。
 fn isSideEffectFreeStmt(stmt: *const ast.Stmt) bool {
     return switch (stmt.*) {
         .expression => |e| isSideEffectFreeExpr(e.expr),
@@ -365,7 +361,6 @@ test "DeadTable basic" {
 }
 
 test "isSideEffectFreeExpr literals" {
-    // 直接构造字面量 AST 节点测试
     const expr = ast.Expr{ .int_literal = .{ .raw = "42", .suffix = null, .location = .{ .line = 1, .column = 1 } } };
     try std.testing.expect(isSideEffectFreeExpr(&expr));
 }

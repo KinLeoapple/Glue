@@ -1,23 +1,31 @@
-//! 寄存器式字节码容器。与栈式 chunk.zig 对应，但 code 为 Instruction(u32) 数组。
+//! 寄存器 VM 的字节码块与程序结构。
+//!
+//! 定义 RegChunk（指令序列 + 常量池 + 行号表）、RegFunction（单个函数）
+//! 以及 RegProgram（完整程序，含函数表、构造器表、trait 表等）。
+//! 同时提供常量去重、指令写入与跳转回填等基础操作。
 
 const std = @import("std");
 const value = @import("value");
 const ast = @import("ast");
 const reg_opcode = @import("opcode.zig");
+
 pub const reg_opcode_mod = reg_opcode;
 const Instruction = reg_opcode.Instruction;
 
+/// 字节码块，承载单个函数的指令、常量与行号信息。
 pub const RegChunk = struct {
     code: std.ArrayListUnmanaged(Instruction) = .empty,
     constants: std.ArrayListUnmanaged(value.Value) = .empty,
-    lines: std.ArrayListUnmanaged(u32) = .empty, // PackedLoc，与 code 等长（每条指令一个 loc）
+    lines: std.ArrayListUnmanaged(u32) = .empty,
     const_dedup: std.HashMapUnmanaged(value.Value, u16, ConstDedupContext, std.hash_map.default_max_load_percentage) = .{},
     allocator: std.mem.Allocator,
 
+    /// 创建一个空的字节码块。
     pub fn init(allocator: std.mem.Allocator) RegChunk {
         return .{ .allocator = allocator };
     }
 
+    /// 释放指令、常量、行号与去重表等全部资源。
     pub fn deinit(self: *RegChunk) void {
         self.code.deinit(self.allocator);
         for (self.constants.items) |c| c.release(self.allocator);
@@ -26,42 +34,42 @@ pub const RegChunk = struct {
         self.const_dedup.deinit(self.allocator);
     }
 
-    /// 写入一条 iABC 指令
+    /// 写入一条 iABC 格式指令并记录行号。
     pub fn writeABC(self: *RegChunk, op: reg_opcode.Op, a: u8, b: u8, c: u8, loc: ast.SourceLocation) !void {
         try self.code.append(self.allocator, reg_opcode.makeABC(op, a, b, c));
         try self.lines.append(self.allocator, packLoc(loc));
     }
 
-    /// 写入一条 iABx 指令
+    /// 写入一条 iABx 格式指令并记录行号。
     pub fn writeABx(self: *RegChunk, op: reg_opcode.Op, a: u8, bx: u16, loc: ast.SourceLocation) !void {
         try self.code.append(self.allocator, reg_opcode.makeABx(op, a, bx));
         try self.lines.append(self.allocator, packLoc(loc));
     }
 
-    /// 写入一条 iAsBx 指令（有符号偏移）
+    /// 写入一条 iAsBx 格式指令并记录行号。
     pub fn writesBx(self: *RegChunk, op: reg_opcode.Op, a: u8, offset: i32, loc: ast.SourceLocation) !void {
         try self.code.append(self.allocator, reg_opcode.makesBx(op, a, offset));
         try self.lines.append(self.allocator, packLoc(loc));
     }
 
-    /// 写入占位跳转指令，返回指令索引（用于后续 patchJump）
+    /// 发射一条跳转指令，返回其在代码中的索引，便于后续回填。
     pub fn emitJump(self: *RegChunk, op: reg_opcode.Op, a: u8, loc: ast.SourceLocation) !usize {
         const idx = self.code.items.len;
-        try self.writesBx(op, a, 0, loc); // 占位偏移=0
+        try self.writesBx(op, a, 0, loc);
         return idx;
     }
 
-    /// 回填跳转偏移
+    /// 回填指定跳转指令的目标地址。
     pub fn patchJump(self: *RegChunk, jump_idx: usize, target_idx: usize) void {
         reg_opcode.patchJump(self.code.items, jump_idx, target_idx);
     }
 
-    /// 当前指令索引
+    /// 返回当前指令数量（即下一条指令将要写入的位置）。
     pub fn here(self: *const RegChunk) usize {
         return self.code.items.len;
     }
 
-    /// 添加常量（带去重），返回常量索引。常量池取得该值所有权。
+    /// 添加常量并返回其索引，对可去重类型进行去重以节省空间。
     pub fn addConstant(self: *RegChunk, v: value.Value) !u16 {
         if (ConstDedupContext.isDedupable(v)) {
             if (self.const_dedup.get(v)) |existing_idx| {
@@ -78,14 +86,16 @@ pub const RegChunk = struct {
         return idx;
     }
 
+    /// 返回指定指令索引对应的源码位置。
     pub fn locAt(self: *const RegChunk, inst_idx: usize) ast.SourceLocation {
         if (inst_idx >= self.lines.items.len) return .{ .line = 0, .column = 0 };
         return unpackLoc(self.lines.items[inst_idx]);
     }
 
+    // 行号打包：高 20 位行号 + 低 12 位列号
     fn packLoc(loc: ast.SourceLocation) u32 {
-        const line: u32 = @intCast(loc.line & 0xFFFFF); // 20 bits
-        const col: u32 = @intCast(loc.column & 0xFFF); // 12 bits
+        const line: u32 = @intCast(loc.line & 0xFFFFF);
+        const col: u32 = @intCast(loc.column & 0xFFF);
         return (line << 12) | col;
     }
 
@@ -97,7 +107,7 @@ pub const RegChunk = struct {
     }
 };
 
-/// 常量池去重 context（镜像栈式 chunk.zig 的 ConstDedupContext，仅对内联标量 + string 去重）
+/// 常量去重上下文，为基本标量类型提供哈希与相等判定。
 const ConstDedupContext = struct {
     pub fn hash(_: ConstDedupContext, v: value.Value) u64 {
         return switch (v) {
@@ -108,7 +118,7 @@ const ConstDedupContext = struct {
             .int => |i| hashInt(i.type, i.lo, i.hi),
             .float => |f| hashInt(f.type, f.bits, f.extra),
             .string => |s| std.hash.Wyhash.hash(0, s.bytes()),
-            else => unreachable, // isDedupable 保证不会走到这里
+            else => unreachable,
         };
     }
 
@@ -116,6 +126,7 @@ const ConstDedupContext = struct {
         return value.equals(a, b);
     }
 
+    /// 判断该值是否可以参与去重（仅基本标量类型）。
     pub fn isDedupable(v: value.Value) bool {
         return switch (v) {
             .null_val, .unit, .boolean, .char, .int, .float, .string => true,
@@ -131,24 +142,20 @@ const ConstDedupContext = struct {
     }
 };
 
+/// 单个函数的完整定义，包含字节码、参数与寄存器信息。
 pub const RegFunction = struct {
     chunk: RegChunk,
     arity: u8 = 0,
-    /// 本函数所需寄存器总数（含参数 + 局部 + 临时）
     register_count: u16 = 0,
-    /// release_mask：bit i=1 表示寄存器 i 持 boxed 值需 release
     release_mask: u64 = 0,
     name: []const u8 = "",
     ic_slot_count: u16 = 0,
-    /// upvalue 描述符列表（闭包用）
     upvalue_specs: std.ArrayListUnmanaged(UpvalueSpec) = .empty,
-    /// 参数类型注解名（caller-side coerce 用；null = 无注解）。由 program.allocator 拥有。
     param_types: []const ?[]const u8 = &.{},
-    /// async 函数：调用时返回 Spawn<T>（发射 closure+spawn 而非 call）
     is_async: bool = false,
-    /// memoization slot（0xFFFF = MEMO_SLOT_NONE = 非 memoized；否则为全局唯一 slot 索引）
     memo_slot: u16 = 0xFFFF,
 
+    /// 释放函数占用的字节码与 upvalue 规格等资源。
     pub fn deinit(self: *RegFunction, allocator: std.mem.Allocator) void {
         self.chunk.deinit();
         self.upvalue_specs.deinit(allocator);
@@ -156,11 +163,13 @@ pub const RegFunction = struct {
     }
 };
 
+/// upvalue 规格：指明捕获的是外层局部变量还是外层 upvalue。
 pub const UpvalueSpec = struct {
-    is_local: bool, // true = 捕获外层局部，false = 捕获外层 upvalue
-    index: u8, // 寄存器号或 upvalue 索引
+    is_local: bool,
+    index: u8,
 };
 
+/// 完整程序，聚合所有函数、类型描述符与 trait 信息。
 pub const RegProgram = struct {
     functions: std.ArrayListUnmanaged(RegFunction) = .empty,
     entry: ?u16 = null,
@@ -174,10 +183,12 @@ pub const RegProgram = struct {
     trait_defaults: std.ArrayListUnmanaged(TraitDefaultDesc) = .empty,
     allocator: std.mem.Allocator,
 
+    /// 创建一个空的程序。
     pub fn init(allocator: std.mem.Allocator) RegProgram {
         return .{ .allocator = allocator };
     }
 
+    /// 释放函数表、构造器表、trait 表等全部资源。
     pub fn deinit(self: *RegProgram) void {
         for (self.functions.items) |*f| f.deinit(self.allocator);
         self.functions.deinit(self.allocator);
@@ -198,7 +209,7 @@ pub const RegProgram = struct {
         self.trait_defaults.deinit(self.allocator);
     }
 
-    /// 登记一个 trait 方法（字符串复制，生命周期独立于 AST）
+    /// 注册一个 trait 方法，复制所有名称字符串。
     pub fn addTraitMethod(self: *RegProgram, type_name: []const u8, method_name: []const u8, trait_name: []const u8, func_idx: u16) !void {
         try self.trait_methods.append(self.allocator, .{
             .type_name = try self.allocator.dupe(u8, type_name),
@@ -208,7 +219,7 @@ pub const RegProgram = struct {
         });
     }
 
-    /// 登记一个 trait 默认方法（字符串复制）
+    /// 注册一个 trait 默认方法，复制 trait 名与方法名。
     pub fn addTraitDefault(self: *RegProgram, trait_name: []const u8, method_name: []const u8, func_idx: u16) !void {
         try self.trait_defaults.append(self.allocator, .{
             .trait_name = try self.allocator.dupe(u8, trait_name),
@@ -218,8 +229,8 @@ pub const RegProgram = struct {
     }
 };
 
-// 描述结构体复用 shared/descriptors.zig 的定义
 const shared = @import("shared");
+
 pub const AdtCtorDesc = shared.descriptors_mod.AdtCtorDesc;
 pub const RecordShape = shared.descriptors_mod.RecordShape;
 pub const NewtypeCtorDesc = shared.descriptors_mod.NewtypeCtorDesc;

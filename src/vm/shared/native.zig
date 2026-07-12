@@ -1,10 +1,12 @@
-//! VM 共享：原生内建函数枚举（println/print/channel 等）。
-//! 栈式与寄存器式 VM 共用。
+//! 原生函数枚举与名称映射。
+//!
+//! 定义 VM 内建原生函数的枚举及其名称查找逻辑，
+//! 供 call_native 指令快速分派到对应实现。
 
 const std = @import("std");
 const ast = @import("ast");
 
-/// 原生内建函数 id（OP_CALL_NATIVE / call_native 的立即数）。编译器按裸名映射，VM 按 id 分派。
+/// 内建原生函数标识，编码在 call_native 指令的操作数 B 中。
 pub const Native = enum(u8) {
     println,
     print,
@@ -19,6 +21,7 @@ pub const Native = enum(u8) {
     scan,
     scanln,
 
+    /// 根据源码名称查找对应的原生函数，找不到返回 null。
     pub fn fromName(s: []const u8) ?Native {
         if (std.mem.eql(u8, s, "println")) return .println;
         if (std.mem.eql(u8, s, "print")) return .print;
