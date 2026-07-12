@@ -37,6 +37,28 @@ pub const GPR = struct {
     pub const r15: u8 = 15;
 };
 
+/// x86-64 浮点寄存器编号（xmm0-xmm15）。
+/// xmm0: 返回值/scratch；xmm1: scratch；xmm2-xmm5: 调用者保存（volatile）；
+/// Windows: xmm6-xmm15 被调用方保存；System V: xmm8-xmm15 被调用方保存。
+pub const FPR = struct {
+    pub const xmm0: u8 = 0;
+    pub const xmm1: u8 = 1;
+    pub const xmm2: u8 = 2;
+    pub const xmm3: u8 = 3;
+    pub const xmm4: u8 = 4;
+    pub const xmm5: u8 = 5;
+    pub const xmm6: u8 = 6; // Windows 被调用方保存
+    pub const xmm7: u8 = 7; // Windows 被调用方保存
+    pub const xmm8: u8 = 8; // 被调用方保存
+    pub const xmm9: u8 = 9;
+    pub const xmm10: u8 = 10;
+    pub const xmm11: u8 = 11;
+    pub const xmm12: u8 = 12;
+    pub const xmm13: u8 = 13;
+    pub const xmm14: u8 = 14;
+    pub const xmm15: u8 = 15;
+};
+
 /// 可用于分配的通用寄存器（避开 rax=返回值, rsp=栈, rbp=帧, rdi-r9=参数）。
 const AVAIL_GPRS = [_]backend_mod.PhysReg{
     .{ .id = GPR.rbx, .kind = .gpr },
@@ -599,6 +621,11 @@ const TMP0 = GPR.rax; // 算术、返回值
 const TMP1 = GPR.r11; // 通用临时
 const TMP2 = GPR.r10; // frame base（reg_pool + base * 32）
 
+/// FPR 常驻池：xmm2-xmm5（4 个，全部 volatile，Windows/System V 均无需 prologue 保存）。
+/// xmm0/xmm1 保留为运算 scratch。每个 xmm 缓存一个 f64 reg 的 bits（不写内存）。
+const FPR_POOL = [_]u8{ FPR.xmm2, FPR.xmm3, FPR.xmm4, FPR.xmm5 };
+const FPR_NONE: i8 = -1; // fpr_map 中表示"未分配"
+
 /// RegVM 中 reg_pool 字段的偏移量（编译期常量）。
 const REG_POOL_PTR_OFFSET: usize = @offsetOf(RegVM, "reg_pool");
 
@@ -950,6 +977,15 @@ const BridgeBuf = struct {
         try self.appendI32(disp);
     }
 
+    /// movsd xmm, xmm (0xF2 0x0F 0x10 + ModRM(mod=3)) — 寄存器间移动低 64 位
+    fn movsdReg(self: *BridgeBuf, dst: u8, src: u8) !void {
+        try self.append(0xF2);
+        try self.rex(true, dst, 0, src);
+        try self.append(0x0F);
+        try self.append(0x10);
+        try self.append(modrm(3, dst, src));
+    }
+
     /// addsd xmm, xmm (0xF2 0x0F 0x58 + ModRM(mod=3))
     fn addsd(self: *BridgeBuf, rd: u8, rs: u8) !void {
         try self.append(0xF2);
@@ -1057,12 +1093,17 @@ fn emitFrameBase(buf: *BridgeBuf) !void {
 /// 发射 rt_step 桥接调用代码。
 /// rt_step(vm, ip) — 返回 false=继续, true=函数已返回
 /// 调用后 emit cbnz_exit (test rax + jne exit)
+/// 调用前自动 spill 所有常驻 FPR（rt_step 可能修改 reg_pool）。
 fn emitRtStepCall(
     buf: *BridgeBuf,
     ip: u32,
     pending_fixups: *std.ArrayListUnmanaged(BridgeFixup),
     allocator: std.mem.Allocator,
+    fpr: *FprState,
 ) !void {
+    // spill 所有常驻 FPR（需 frame base）
+    try emitFrameBase(buf);
+    try emitSpillAllFpr(buf, fpr);
     // 设置参数: CARG0 = vm (r12), CARG1 = ip
     try buf.movReg(CARG0, BR_VM);
     try buf.movImm64(CARG1, @intCast(ip));
@@ -1087,6 +1128,162 @@ const BridgeFixup = struct {
     kind: u8, // 1=jmp, 2=jcc, 3=exit
     rel32_pos: u32, // rel32 字段的偏移量
 };
+
+/// FPR 常驻状态：跟踪 reg_pool 槽位 → XMM 寄存器的映射。
+/// fpr_map[reg] = FPR_NONE 表示该 reg 的 f64 bits 仅在内存中；
+/// 否则值 = FPR_POOL 索引（0..FPR_POOL.len-1），对应 xmm 寄存器持有最新 bits。
+/// fpr_owner[pool_idx] = 持有该 xmm 的 reg 编号（仅当 fpr_map[reg]==pool_idx 时有效）。
+const FprState = struct {
+    fpr_map: []i8, // reg_count × 1
+    fpr_owner: [FPR_POOL.len]u8, // pool_idx → reg（0xFF=空闲）
+
+    fn init(allocator: std.mem.Allocator, reg_count: usize) !FprState {
+        const m = try allocator.alloc(i8, reg_count);
+        @memset(m, FPR_NONE);
+        return .{ .fpr_map = m, .fpr_owner = [_]u8{0xFF} ** FPR_POOL.len };
+    }
+
+    fn deinit(self: *FprState, allocator: std.mem.Allocator) void {
+        allocator.free(self.fpr_map);
+    }
+
+    /// 判断 reg 是否常驻 FPR
+    fn isResident(self: *const FprState, reg: u8) bool {
+        return reg < self.fpr_map.len and self.fpr_map[reg] != FPR_NONE;
+    }
+
+    /// 获取 reg 对应的 xmm 编号；调用方需先 isResident 判断
+    fn getXmm(self: *const FprState, reg: u8) u8 {
+        const idx: usize = @intCast(self.fpr_map[reg]);
+        return FPR_POOL[idx];
+    }
+
+    /// 将 reg 标记为常驻到 pool_idx 对应的 xmm（替换原 owner）
+    fn setResident(self: *FprState, reg: u8, pool_idx: usize) void {
+        // 先驱逐原 owner（如果有）
+        const old_owner = self.fpr_owner[pool_idx];
+        if (old_owner != 0xFF and old_owner < self.fpr_map.len) {
+            self.fpr_map[old_owner] = FPR_NONE;
+        }
+        // 清除 reg 的旧映射（如果 reg 之前在其他 xmm）
+        if (reg < self.fpr_map.len and self.fpr_map[reg] != FPR_NONE) {
+            const old_idx: usize = @intCast(self.fpr_map[reg]);
+            self.fpr_owner[old_idx] = 0xFF;
+        }
+        self.fpr_map[reg] = @intCast(pool_idx);
+        self.fpr_owner[pool_idx] = reg;
+    }
+
+    /// 驱逐 reg（如果常驻），使其仅在内存
+    fn evict(self: *FprState, reg: u8) void {
+        if (reg >= self.fpr_map.len) return;
+        const idx = self.fpr_map[reg];
+        if (idx == FPR_NONE) return;
+        self.fpr_owner[@intCast(idx)] = 0xFF;
+        self.fpr_map[reg] = FPR_NONE;
+    }
+
+    /// 分配一个空闲 pool_idx；若无空闲返回 null
+    fn allocSlot(self: *const FprState) ?usize {
+        var i: usize = 0;
+        while (i < FPR_POOL.len) : (i += 1) {
+            if (self.fpr_owner[i] == 0xFF) return i;
+        }
+        return null;
+    }
+
+    /// 清空所有 FPR 映射（跳转目标处重置）
+    fn invalidateAll(self: *FprState) void {
+        @memset(self.fpr_map, FPR_NONE);
+        self.fpr_owner = [_]u8{0xFF} ** FPR_POOL.len;
+    }
+};
+
+/// 发射 spill 代码：若 reg 常驻 FPR，将其 xmm 写回 reg_pool[reg].bits。
+/// 调用前需已 emitFrameBase（TMP2 = frame base）。
+fn emitSpillFpr(buf: *BridgeBuf, fpr: *FprState, reg: u8) !void {
+    if (!fpr.isResident(reg)) return;
+    const xmm = fpr.getXmm(reg);
+    try buf.movsdStore(TMP2, @intCast(@as(i32, reg) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm);
+    fpr.evict(reg);
+}
+
+/// 发射 spill-all 代码：所有常驻 f64 写回内存（外部调用前）。
+fn emitSpillAllFpr(buf: *BridgeBuf, fpr: *FprState) !void {
+    // 需 frame base；调用方保证 TMP2 已加载
+    var i: usize = 0;
+    while (i < FPR_POOL.len) : (i += 1) {
+        const owner = fpr.fpr_owner[i];
+        if (owner == 0xFF) continue;
+        const xmm = FPR_POOL[i];
+        try buf.movsdStore(TMP2, @intCast(@as(i32, owner) * 32 + @as(i32, FLOAT_BITS_OFF)), xmm);
+    }
+    fpr.invalidateAll();
+}
+
+/// 确保 reg 的 f64 bits 加载到某个 xmm，返回 xmm 编号。
+/// 若已常驻直接返回；否则从内存加载（必要时驱逐一个非 protect_reg 的槽）。
+/// 调用前需已 emitFrameBase。
+/// protect_reg: 指定一个 reg 编号，其常驻 xmm 不允许被驱逐（传 0xFF 表示无保护）。
+fn emitEnsureFpr(buf: *BridgeBuf, fpr: *FprState, reg: u8, protect_reg: u8) !u8 {
+    if (fpr.isResident(reg)) return fpr.getXmm(reg);
+    // 分配空闲槽
+    const slot = fpr.allocSlot() orelse blk: {
+        // 池满：驱逐一个非 protect_reg 的槽
+        var evict_idx: usize = 0;
+        var found_evict = false;
+        var i: usize = 0;
+        while (i < FPR_POOL.len) : (i += 1) {
+            const owner = fpr.fpr_owner[i];
+            if (owner == 0xFF) continue;
+            if (owner == protect_reg) continue;
+            evict_idx = i;
+            found_evict = true;
+            break;
+        }
+        if (!found_evict) {
+            // 所有槽都是 protect_reg 或空闲（不应发生，因为 allocSlot 返回 null 说明无空闲）
+            // 强制驱逐 pool[0]
+            evict_idx = 0;
+        }
+        const victim = fpr.fpr_owner[evict_idx];
+        if (victim != 0xFF) {
+            try buf.movsdStore(TMP2, @intCast(@as(i32, victim) * 32 + @as(i32, FLOAT_BITS_OFF)), FPR_POOL[evict_idx]);
+            fpr.evict(victim);
+        }
+        break :blk evict_idx;
+    };
+    const xmm = FPR_POOL[slot];
+    try buf.movsdLoad(xmm, TMP2, @intCast(@as(i32, reg) * 32 + @as(i32, FLOAT_BITS_OFF)));
+    fpr.setResident(reg, slot);
+    return xmm;
+}
+
+/// 为结果 reg 分配一个常驻 xmm 槽，返回 pool_idx（FPR_POOL 索引）。
+/// 若池满，驱逐一个非 protect_b/protect_c 的槽（写回内存）。
+/// 调用前需已 emitFrameBase。
+fn emitAllocResultSlot(buf: *BridgeBuf, fpr: *FprState, protect_b: u8, protect_c: u8) !usize {
+    if (fpr.allocSlot()) |free_slot| return free_slot;
+    // 池满：驱逐一个非 protect 的槽
+    var evict_idx: usize = 0;
+    var found_evict = false;
+    var i: usize = 0;
+    while (i < FPR_POOL.len) : (i += 1) {
+        const owner = fpr.fpr_owner[i];
+        if (owner == 0xFF) continue;
+        if (owner == protect_b or owner == protect_c) continue;
+        evict_idx = i;
+        found_evict = true;
+        break;
+    }
+    if (!found_evict) evict_idx = 0;
+    const victim = fpr.fpr_owner[evict_idx];
+    if (victim != 0xFF) {
+        try buf.movsdStore(TMP2, @intCast(@as(i32, victim) * 32 + @as(i32, FLOAT_BITS_OFF)), FPR_POOL[evict_idx]);
+        fpr.evict(victim);
+    }
+    return evict_idx;
+}
 
 /// 桥接模式编译：直接从字节码生成 x86-64 机器码。
 ///
@@ -1129,6 +1326,10 @@ pub fn compileBridge(
     var reg_types = try allocator.alloc(RegType, reg_count);
     defer allocator.free(reg_types);
     @memset(reg_types, .unknown);
+
+    // ── FPR 常驻状态 ──
+    var fpr_state = try FprState.init(allocator, reg_count);
+    defer fpr_state.deinit(allocator);
     // 从 param_types 初始化参数寄存器类型（仅在入口基本块有效）
     for (func.param_types, 0..) |pt, i| {
         if (i >= reg_count) break;
@@ -1207,9 +1408,10 @@ pub fn compileBridge(
         // 记录字节码 ip → 代码偏移
         try ip_to_code.put(ip, buf.len());
 
-        // 跳转目标处重置类型传播
+        // 跳转目标处重置类型传播与 FPR 状态
         if (ip > 0 and jump_targets.contains(ip)) {
             @memset(reg_types, .unknown);
+            fpr_state.invalidateAll();
         }
 
         const inst = instructions[ip];
@@ -1227,6 +1429,11 @@ pub fn compileBridge(
                 const c_known_i64 = c < reg_count and reg_types[c] == .i64;
                 const b_known_f64 = b < reg_count and reg_types[b] == .f64;
                 const c_known_f64 = c < reg_count and reg_types[c] == .f64;
+
+                // a 将被覆盖；若 a 常驻 FPR，先 spill 回内存（防止 a==b/c 时数据丢失）。
+                // i64/unknown 路径会覆盖 a 的内存字段，spill 是冗余但安全的。
+                try emitFrameBase(&buf);
+                try emitSpillFpr(&buf, &fpr_state, a);
 
                 if (b_known_i64 and c_known_i64) {
                     // ── 类型已知 i64：跳过 tag 检查，直接算术 ──
@@ -1260,21 +1467,26 @@ pub fn compileBridge(
                     try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
                     reg_types[a] = .i64;
                 } else if (b_known_f64 and c_known_f64 and op != .mod) {
-                    // ── 类型已知 f64：跳过 tag 检查，直接浮点算术 ──
+                    // ── 类型已知 f64：跳过 tag 检查，FPR 常驻路径 ──
                     try emitFrameBase(&buf);
-                    // xmm0 = reg_pool[b].bits
-                    try buf.movsdLoad(0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                    // xmm1 = reg_pool[c].bits
-                    try buf.movsdLoad(1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
+                    // a 已在开头 spill；确保 b、c 的 f64 bits 在 xmm 中
+                    const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                    const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
+                    // 将 b 的 bits 复制到 xmm0，运算结果存于 xmm0
+                    try buf.movsdReg(0, xmm_b);
                     switch (op) {
-                        .add => try buf.addsd(0, 1),
-                        .sub => try buf.subsd(0, 1),
-                        .mul => try buf.mulsd(0, 1),
-                        .div => try buf.divsd(0, 1),
+                        .add => try buf.addsd(0, xmm_c),
+                        .sub => try buf.subsd(0, xmm_c),
+                        .mul => try buf.mulsd(0, xmm_c),
+                        .div => try buf.divsd(0, xmm_c),
                         else => unreachable,
                     }
-                    // 存储 f64 结果
-                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), 0);
+                    // 将结果常驻到 a 的 xmm（分配槽，保护 b、c 不被驱逐）
+                    const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, c);
+                    const xmm_a = FPR_POOL[a_slot];
+                    try buf.movsdReg(xmm_a, 0);
+                    fpr_state.setResident(a, a_slot);
+                    // 更新 tag/type（内存元数据需同步，供 cold 路径检查）
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
                     reg_types[a] = .f64;
@@ -1344,21 +1556,26 @@ pub fn compileBridge(
                         try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
                         const jne_f4 = try buf.jccRel32(X86Cond.NE);
 
-                        // 加载 f64 bits 到 xmm
-                        try buf.movsdLoad(0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                        try buf.movsdLoad(1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
-
-                        // 执行浮点运算
+                        // a 将被覆盖；若 a 常驻 FPR，先 spill 回内存
+                        try emitSpillFpr(&buf, &fpr_state, a);
+                        // 确保 b、c 的 f64 bits 在 xmm（FPR 常驻，保护 b 不被驱逐）
+                        const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                        const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
+                        // xmm0 = xmm_b；xmm0 op= xmm_c
+                        try buf.movsdReg(0, xmm_b);
                         switch (op) {
-                            .add => try buf.addsd(0, 1),
-                            .sub => try buf.subsd(0, 1),
-                            .mul => try buf.mulsd(0, 1),
-                            .div => try buf.divsd(0, 1),
+                            .add => try buf.addsd(0, xmm_c),
+                            .sub => try buf.subsd(0, xmm_c),
+                            .mul => try buf.mulsd(0, xmm_c),
+                            .div => try buf.divsd(0, xmm_c),
                             else => unreachable,
                         }
-
-                        // 存储 f64 结果到 dst(a)
-                        try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), 0);
+                        // 将结果常驻到 a（保护 b、c 不被驱逐）
+                        const a_slot = try emitAllocResultSlot(&buf, &fpr_state, b, c);
+                        const xmm_a = FPR_POOL[a_slot];
+                        try buf.movsdReg(xmm_a, 0);
+                        fpr_state.setResident(a, a_slot);
+                        // 更新 tag/type
                         try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                         try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_TYPE_OFF)), FLOAT_TYPE_F64_VAL);
 
@@ -1373,7 +1590,7 @@ pub fn compileBridge(
                     }
 
                     // ── cold: rt_step 桥接 ──
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     // ── .next: 回填 b_next 和 b_next2 ──
                     const next_off = buf.len();
@@ -1389,6 +1606,8 @@ pub fn compileBridge(
             .neg => {
                 const b_known_i64 = b < reg_count and reg_types[b] == .i64;
                 try emitFrameBase(&buf);
+                // a 将被覆盖，失效其 FPR 常驻
+                fpr_state.evict(a);
 
                 if (b_known_i64) {
                     // 类型已知 i64：跳过 tag 检查
@@ -1418,7 +1637,7 @@ pub fn compileBridge(
                     const cold_off = buf.len();
                     BridgeBuf.patchRel32(code.items, jne_cold + 2, cold_off);
 
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1432,6 +1651,9 @@ pub fn compileBridge(
                 const c_known_i64 = c < reg_count and reg_types[c] == .i64;
                 const b_known_f64 = b < reg_count and reg_types[b] == .f64;
                 const c_known_f64 = c < reg_count and reg_types[c] == .f64;
+
+                // a 将被写为 boolean，失效其 FPR 常驻
+                fpr_state.evict(a);
 
                 if (b_known_i64 and c_known_i64) {
                     // ── 类型已知 i64：跳过 tag 检查 ──
@@ -1454,11 +1676,13 @@ pub fn compileBridge(
                     try buf.storeByte(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, PAYLOAD_OFF)), TMP0);
                     reg_types[a] = .boolean;
                 } else if (b_known_f64 and c_known_f64) {
-                    // ── 类型已知 f64：跳过 tag 检查 ──
+                    // ── 类型已知 f64：FPR 常驻路径 ──
                     try emitFrameBase(&buf);
-                    try buf.movsdLoad(0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                    try buf.movsdLoad(1, TMP2, @intCast(@as(i32, c) * 32 + @as(i32, FLOAT_BITS_OFF)));
-                    try buf.ucomisd(0, 1);
+                    const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
+                    const xmm_c = try emitEnsureFpr(&buf, &fpr_state, c, b);
+                    // ucomisd xmm_b, xmm_c（xmm0 作 scratch 以避免破坏常驻 xmm）
+                    try buf.movsdReg(0, xmm_b);
+                    try buf.ucomisd(0, xmm_c);
                     const cc: u8 = switch (op) {
                         .eq => X86Cond.E,
                         .neq => X86Cond.NE,
@@ -1513,7 +1737,7 @@ pub fn compileBridge(
                     BridgeBuf.patchRel32(code.items, jne_cold1 + 2, cold_off);
                     BridgeBuf.patchRel32(code.items, jne_cold2 + 2, cold_off);
 
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1524,6 +1748,8 @@ pub fn compileBridge(
             // ── 热点 opcode：布尔取反（一元: dst=a, src=b）──
             .not_op => {
                 try emitFrameBase(&buf);
+                // a 将被写为 boolean，失效其 FPR 常驻
+                fpr_state.evict(a);
 
                 // 检查源操作数 b 的 tag == TAG_BOOLEAN
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_BOOLEAN_VAL);
@@ -1546,7 +1772,7 @@ pub fn compileBridge(
                 const cold_off = buf.len();
                 BridgeBuf.patchRel32(code.items, jne_cold + 2, cold_off);
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
                 BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1635,7 +1861,7 @@ pub fn compileBridge(
                 const cold_off = buf.len();
                 BridgeBuf.patchRel32(code.items, jne_cold + 2, cold_off);
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
                 BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1688,22 +1914,16 @@ pub fn compileBridge(
             // ── return_op / return_unit：通过 rt_step 处理，然后跳到 exit ──
             .return_op, .return_unit => {
                 // rt_step(vm, ip) — rt_step 会检测到返回并返回 true
-                try buf.movReg(CARG0, BR_VM);
-                try buf.movImm64(CARG1, @intCast(ip));
-                try buf.callReg(BR_RT_STEP);
-                // rt_step 返回 true（函数已返回），跳到 exit
-                const jmp_exit = try buf.jmpRel32();
-                try pending_fixups.append(allocator, .{
-                    .code_offset = jmp_exit,
-                    .target_ip = 0xFFFFFFFF,
-                    .kind = 3,
-                    .rel32_pos = jmp_exit + 1,
-                });
+                // emitRtStepCall 内部会 spill 所有常驻 FPR
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
             },
 
             // ── 热点 opcode：load_const（标量快速路径）──
             .load_const => {
                 try emitFrameBase(&buf);
+                // load_const 有 cold/fast 两条路径；cold 路径会 invalidateAll，
+                // 为保持两条路径后 FPR 状态一致，fast 路径前先 spillAll。
+                try emitSpillAllFpr(&buf, &fpr_state);
 
                 // 加载常量池地址到 r11
                 const const_addr: u64 = @intFromPtr(func.chunk.constants.items.ptr) + @as(u64, bx) * @sizeOf(value.Value);
@@ -1731,7 +1951,7 @@ pub fn compileBridge(
                 BridgeBuf.patchRel32(code.items, bhi_cold1 + 2, cold_off);
                 BridgeBuf.patchRel32(code.items, bhi_cold2 + 2, cold_off);
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
                 BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1750,6 +1970,8 @@ pub fn compileBridge(
             // ── 热点 opcode：move / assign（标量快速路径）──
             .move, .assign => {
                 try emitFrameBase(&buf);
+                // move 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
+                try emitSpillAllFpr(&buf, &fpr_state);
 
                 // 检查 src(b) 是否标量
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), MAX_SCALAR_TAG);
@@ -1772,7 +1994,7 @@ pub fn compileBridge(
                 BridgeBuf.patchRel32(code.items, bhi_cold1 + 2, cold_off);
                 BridgeBuf.patchRel32(code.items, bhi_cold2 + 2, cold_off);
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
                 BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1783,6 +2005,8 @@ pub fn compileBridge(
             // ── 热点 opcode：load_unit / load_null（标量快速路径）──
             .load_unit, .load_null => {
                 try emitFrameBase(&buf);
+                // 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
+                try emitSpillAllFpr(&buf, &fpr_state);
 
                 // 检查 dst 是否标量
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), MAX_SCALAR_TAG);
@@ -1798,7 +2022,7 @@ pub fn compileBridge(
                 const cold_off = buf.len();
                 BridgeBuf.patchRel32(code.items, bhi_cold + 2, cold_off);
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
                 BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1807,6 +2031,8 @@ pub fn compileBridge(
             // ── 热点 opcode：load_true / load_false（标量快速路径）──
             .load_true, .load_false => {
                 try emitFrameBase(&buf);
+                // 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
+                try emitSpillAllFpr(&buf, &fpr_state);
 
                 // 检查 dst 是否标量
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), MAX_SCALAR_TAG);
@@ -1823,7 +2049,7 @@ pub fn compileBridge(
                 const cold_off = buf.len();
                 BridgeBuf.patchRel32(code.items, bhi_cold + 2, cold_off);
 
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
                 BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1854,11 +2080,13 @@ pub fn compileBridge(
 
                 // 无法解析的类型 → rt_step 桥接
                 if (int_target == null and float_target == null) {
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
                     continue;
                 }
 
                 try emitFrameBase(&buf);
+                // cast 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
+                try emitSpillAllFpr(&buf, &fpr_state);
 
                 if (int_target) |it| {
                     // 目标是整数类型
@@ -1885,7 +2113,7 @@ pub fn compileBridge(
                     BridgeBuf.patchRel32(code.items, bne_cold1 + 2, cold_off);
                     BridgeBuf.patchRel32(code.items, bne_cold2 + 2, cold_off);
 
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1905,7 +2133,7 @@ pub fn compileBridge(
 
                     // 仅支持 f64 目标
                     if (ft != .f64) {
-                        try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                        try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
                         continue;
                     }
 
@@ -1913,8 +2141,11 @@ pub fn compileBridge(
                     try buf.loadMem(TMP0, TMP2, @intCast(@as(i32, b) * 32 + @as(i32, INT_LO_OFF)));
                     // cvtsi2sd xmm0, rax (i64 → f64)
                     try buf.cvtsi2sd(0, TMP0);
-                    // 存储 f64 bits 到 dst(a)
-                    try buf.movsdStore(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, FLOAT_BITS_OFF)), 0);
+                    // 将结果常驻到 a 的 xmm（a 已在 cast 开头 evict；b 是 int 无需保护）
+                    const a_slot = try emitAllocResultSlot(&buf, &fpr_state, 0xFF, 0xFF);
+                    const xmm_a = FPR_POOL[a_slot];
+                    try buf.movsdReg(xmm_a, 0);
+                    fpr_state.setResident(a, a_slot);
                     // 设置 tag = FLOAT
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                     // 设置 float type = F64
@@ -1928,7 +2159,7 @@ pub fn compileBridge(
                     BridgeBuf.patchRel32(code.items, bne_cold2 + 2, cold_off);
                     BridgeBuf.patchRel32(code.items, bne_cold3 + 2, cold_off);
 
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -1940,6 +2171,9 @@ pub fn compileBridge(
             // ── 热点 opcode：call（通过 rt_call_inline）──
             .call => {
                 const func_idx_val = bx;
+                // spill 所有常驻 FPR（rt_call_inline 可能修改 reg_pool）
+                try emitFrameBase(&buf);
+                try emitSpillAllFpr(&buf, &fpr_state);
                 // rt_call_inline(vm, func_idx, args_base, argc, return_base, return_reg)
                 try buf.movReg(CARG0, BR_VM); // x0 = vm
                 try buf.movImm64(CARG1, @intCast(func_idx_val)); // x1 = func_idx
@@ -1986,6 +2220,8 @@ pub fn compileBridge(
             // ── 热点 opcode：index_op（数组索引快速路径）──
             .index_op => {
                 try emitFrameBase(&buf);
+                // index_op 有 cold/fast 两条路径；为保持一致，fast 路径前先 spillAll。
+                try emitSpillAllFpr(&buf, &fpr_state);
 
                 // 检查 arr(b) tag == TAG_ARRAY
                 try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_ARRAY_VAL);
@@ -2043,7 +2279,7 @@ pub fn compileBridge(
                 inline for (.{ bne_cold1, bne_cold2, bhi_cold3, bhs_cold4, bhi_cold5 }) |jcc_pos| {
                     BridgeBuf.patchRel32(code.items, jcc_pos + 2, cold_off);
                 }
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                 const next_off = buf.len();
                 BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
@@ -2056,6 +2292,9 @@ pub fn compileBridge(
 
                 if (std.mem.eql(u8, mname, "len") and c == 0) {
                     // arr.len() → rt_array_len(vm, recv_slot, dst_slot)
+                    // spill 所有常驻 FPR（rt_array_len 可能修改 reg_pool）
+                    try emitFrameBase(&buf);
+                    try emitSpillAllFpr(&buf, &fpr_state);
                     try buf.movReg(CARG0, BR_VM); // vm
                     // recv_slot = base + a
                     try buf.movReg(TMP0, BR_BASE);
@@ -2081,12 +2320,15 @@ pub fn compileBridge(
                     const cold_off = buf.len();
                     BridgeBuf.patchRel32(code.items, jne_cold + 2, cold_off);
 
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
                 } else if (std.mem.eql(u8, mname, "push") and c == 1) {
                     // arr.push(elem) → rt_array_push(vm, recv_slot, arg_slot, dst_slot)
+                    // spill 所有常驻 FPR（rt_array_push 可能修改 reg_pool）
+                    try emitFrameBase(&buf);
+                    try emitSpillAllFpr(&buf, &fpr_state);
                     try buf.movReg(CARG0, BR_VM); // vm
                     // recv_slot = base + a
                     try buf.movReg(TMP0, BR_BASE);
@@ -2123,19 +2365,19 @@ pub fn compileBridge(
                     const cold_off = buf.len();
                     BridgeBuf.patchRel32(code.items, jne_cold + 2, cold_off);
 
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
 
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
                 } else {
                     // 其他方法 → rt_step 桥接
-                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                    try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
                 }
             },
 
             // ── 所有其他 opcode：通过 rt_step 桥接 ──
             else => {
-                try emitRtStepCall(&buf, ip, &pending_fixups, allocator);
+                try emitRtStepCall(&buf, ip, &pending_fixups, allocator, &fpr_state);
             },
         }
     }

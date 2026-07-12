@@ -1,34 +1,17 @@
 // f64 JIT arithmetic tests
 
-fun testAdd(a: f64, b: f64): f64 {
-    return a + b
-}
-
-fun testSub(a: f64, b: f64): f64 {
-    return a - b
-}
-
-fun testMul(a: f64, b: f64): f64 {
-    return a * b
-}
-
-fun testDiv(a: f64, b: f64): f64 {
-    return a / b
-}
-
-fun testChain(x: f64): f64 {
-    return x * 9.0 / 5.0 + 32.0
-}
-
-fun testNested(a: f64, b: f64, c: f64): f64 {
-    return (a + b) * c - a / b
-}
+fun testAdd(a: f64, b: f64): f64 { return a + b }
+fun testSub(a: f64, b: f64): f64 { return a - b }
+fun testMul(a: f64, b: f64): f64 { return a * b }
+fun testDiv(a: f64, b: f64): f64 { return a / b }
+fun testChain(x: f64): f64 { return x * 9.0 / 5.0 + 32.0 }
+fun testNested(a: f64, b: f64, c: f64): f64 { return (a + b) * c - a / b }
 
 fun main() {
     println(testAdd(1.5, 2.5))          // 4
     println(testSub(10.0, 3.0))         // 7
-    println(testMul(3.0, 4.0))         // 12
-    println(testDiv(900.0, 5.0))       // 180
-    println(testChain(100.0))          // 212
-    println(testNested(10.0, 5.0, 2.0))  // 28
+    println(testMul(3.0, 4.0))          // 12
+    println(testDiv(900.0, 5.0))        // 180
+    println(testChain(100.0))           // 212
+    println(testNested(10.0, 5.0, 2.0)) // 28
 }
