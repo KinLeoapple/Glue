@@ -1956,7 +1956,7 @@ pub fn compileBridge(
 
         switch (op) {
             // ── 热点 opcode：i64/f64/f32 算术 ──
-            .add, .sub, .mul, .div, .mod => {
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
                 const b_known_i64 = b < reg_count and reg_types[b] == .i64;
                 const c_known_i64 = c < reg_count and reg_types[c] == .i64;
                 const b_known_f64 = b < reg_count and reg_types[b] == .f64;
@@ -1979,6 +1979,9 @@ pub fn compileBridge(
                             try emit(&code, allocator, encSdiv(1, GPR.x15, GPR.x13, GPR.x14));
                             try emit(&code, allocator, encMsub(1, GPR.x13, GPR.x15, GPR.x14, GPR.x13));
                         },
+                        .bit_and => try emit(&code, allocator, encAndReg(1, GPR.x13, GPR.x13, GPR.x14)),
+                        .bit_or => try emit(&code, allocator, encOrrReg(1, GPR.x13, GPR.x13, GPR.x14)),
+                        .bit_xor => try emit(&code, allocator, encEorReg(1, GPR.x13, GPR.x13, GPR.x14)),
                         else => unreachable,
                     }
                     try emit(&code, allocator, encMovz(1, GPR.x11, TAG_INT_VAL, 0));
@@ -1987,7 +1990,7 @@ pub fn compileBridge(
                     try emit(&code, allocator, encStrb(GPR.x11, GPR.x10, @intCast(@as(u32, a) * 32 + INT_TYPE_OFF)));
                     try emit(&code, allocator, encStrImm(1, GPR.x13, GPR.x10, @intCast((@as(u32, a) * 32 + INT_LO_OFF) / 8)));
                     reg_types[a] = .i64;
-                } else if (b_known_f64 and c_known_f64 and op != .mod) {
+                } else if (b_known_f64 and c_known_f64 and op != .mod and op != .bit_and and op != .bit_or and op != .bit_xor) {
                     // ── 类型已知 f64：用 FPR 池加载，跳过 tag 检查 ──
                     try emitFrameBase(&code, allocator);
                     // a 将被覆盖；若 a 常驻 FPR，先驱逐（防止 a==b/c 时数据丢失）
@@ -2068,6 +2071,9 @@ pub fn compileBridge(
                         try emit(&code, allocator, encSdiv(1, GPR.x15, GPR.x13, GPR.x14));
                         try emit(&code, allocator, encMsub(1, GPR.x13, GPR.x15, GPR.x14, GPR.x13));
                     },
+                    .bit_and => try emit(&code, allocator, encAndReg(1, GPR.x13, GPR.x13, GPR.x14)),
+                    .bit_or => try emit(&code, allocator, encOrrReg(1, GPR.x13, GPR.x13, GPR.x14)),
+                    .bit_xor => try emit(&code, allocator, encEorReg(1, GPR.x13, GPR.x13, GPR.x14)),
                     else => unreachable,
                 }
 
@@ -2096,8 +2102,8 @@ pub fn compileBridge(
                 var b_next2: u32 = 0;
                 var b_next3: u32 = 0;
 
-                // ── f64 快速路径（.mod 无浮点路径，直接走 cold）──
-                if (op != .mod) {
+                // ── f64 快速路径（.mod 和位运算无浮点路径，直接走 cold）──
+                if (op != .mod and op != .bit_and and op != .bit_or and op != .bit_xor) {
                     // 检查 b 的 tag == TAG_FLOAT
                     try emit(&code, allocator, encLdrb(GPR.x11, GPR.x10, @intCast(@as(u32, b) * 32 + TAG_OFF)));
                     try emit(&code, allocator, encCmpImm(1, GPR.x11, TAG_FLOAT_VAL));
@@ -2217,7 +2223,7 @@ pub fn compileBridge(
                     const d: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next));
                     code.items[b_next] = encB(@intCast(d));
                 }
-                if (op != .mod) {
+                if (op != .mod and op != .bit_and and op != .bit_or and op != .bit_xor) {
                     const d2: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next2));
                     code.items[b_next2] = encB(@intCast(d2));
                     const d3: i64 = @as(i64, next_off) - @as(i64, @intCast(b_next3));
@@ -3411,12 +3417,6 @@ fn compileBridgeFn(
     const JitEngine = jit_mod.JitEngine;
     const engine: *JitEngine = @ptrCast(@alignCast(engine_ctx));
     const func: *const reg_chunk.RegFunction = @ptrCast(@alignCast(func_opaque));
-
-    // 跳过包含闭包/upvalue 的函数：回退到解释器以确保正确性
-    if (@import("mod.zig").containsClosureOps(func)) {
-        engine.failed[func_idx] = true;
-        return null;
-    }
 
     // 预分配可执行内存（32KB，桥接模式代码量较大）
     var exec_mem = mem.allocExec(32 * 1024) catch {

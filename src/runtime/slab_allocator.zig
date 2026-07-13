@@ -9,6 +9,9 @@
 //! - 后台空闲回收线程定期驱逐长期闲置的 slab 与大块。
 
 const std = @import("std");
+
+/// 平台自适应计数器类型：64 位平台用 u64，32 位平台用 u32（避免 64 位原子不支持）。
+const Counter = if (@sizeOf(usize) >= 8) u64 else u32;
 const value = @import("value");
 const sync = @import("sync");
 const Mutex = sync.Mutex;
@@ -203,9 +206,9 @@ pub const SlabAllocator = struct {
     scan_interval_ns: u64 = 0,
     recycler_thread: ?std.Thread = null,
     recycler_shutdown: std.atomic.Value(bool) = .{ .raw = false },
-    evict_scans: std.atomic.Value(u64) = .{ .raw = 0 },
-    evicted_slabs: std.atomic.Value(u64) = .{ .raw = 0 },
-    evicted_large: std.atomic.Value(u64) = .{ .raw = 0 },
+    evict_scans: std.atomic.Value(Counter) = .{ .raw = 0 },
+    evicted_slabs: std.atomic.Value(Counter) = .{ .raw = 0 },
+    evicted_large: std.atomic.Value(Counter) = .{ .raw = 0 },
     live_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
     reserved_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
     peak_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
@@ -717,7 +720,7 @@ pub const SlabAllocator = struct {
         {
             // 驱逐闲置空闲 slab。
             var to_evict: ?*Slab = null;
-            var evicted_count: u64 = 0;
+            var evicted_count: Counter = 0;
             self.lockEmpty();
             {
                 var prev: ?*Slab = null;
@@ -752,7 +755,7 @@ pub const SlabAllocator = struct {
         {
             // 驱逐闲置大对象缓存。
             var to_evict: ?*LargeNode = null;
-            var evicted_count: u64 = 0;
+            var evicted_count: Counter = 0;
             self.lockLarge();
             {
                 var prev: ?*LargeNode = null;
@@ -788,9 +791,9 @@ pub const SlabAllocator = struct {
     /// 返回回收统计：扫描次数、驱逐 slab 数、驱逐大对象数。
     pub fn getEvictStats(self: *SlabAllocator) struct { scans: u64, slabs: u64, large: u64 } {
         return .{
-            .scans = self.evict_scans.load(.monotonic),
-            .slabs = self.evicted_slabs.load(.monotonic),
-            .large = self.evicted_large.load(.monotonic),
+            .scans = @intCast(self.evict_scans.load(.monotonic)),
+            .slabs = @intCast(self.evicted_slabs.load(.monotonic)),
+            .large = @intCast(self.evicted_large.load(.monotonic)),
         };
     }
 

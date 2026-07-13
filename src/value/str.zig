@@ -108,8 +108,8 @@ return .{
 /// 释放堆模式下的字节缓冲区，SSO 模式为空操作
 pub fn deinit(self: *Str, allocator: std.mem.Allocator) void {
 if (!self.isSso()) {
-const ptr: [*]u8 = @ptrFromInt(self._word0);
-allocator.free(ptr[0..self._word1]);
+const ptr: [*]u8 = @ptrFromInt(@as(usize, @truncate(self._word0)));
+allocator.free(ptr[0..@as(usize, @truncate(self._word1))]);
 self._word0 = 0;
 self._word1 = 0;
 }
@@ -122,8 +122,8 @@ const len = self.ssoLen();
 const ptr: [*]const u8 = @ptrCast(self);
 return ptr[0..len];
 }
-const ptr: [*]const u8 = @ptrFromInt(self._word0);
-return ptr[0..self._word1];
+const ptr: [*]const u8 = @ptrFromInt(@as(usize, @truncate(self._word0)));
+return ptr[0..@as(usize, @truncate(self._word1))];
 }
 
 /// 返回字符串字节长度
@@ -131,7 +131,7 @@ pub inline fn byteLength(self: Str) usize {
 if (self.isSso()) {
 return self.ssoLen();
 }
-return self._word1;
+return @as(usize, @truncate(self._word1));
 }
 
 /// 返回 Unicode 码点数量

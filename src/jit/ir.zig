@@ -344,6 +344,7 @@ fn inferRegTypes(func: *const reg_chunk.RegFunction, reg_types: []Type) Type {
             },
             .return_unit => {
                 if (!seen_return_op) return_type = .unit;
+                seen_return_op = true;
             },
             else => {},
         }
@@ -418,12 +419,18 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
     }
 
     // 第二遍：逐条转换字节码为 IR
+    var seen_return = false;
     for (code, 0..) |inst, ip| {
         const op = reg_opcode.getOp(inst);
 
-        // 如果是跳转目标，发射标签
+        // 如果是跳转目标，发射标签（即使 return 后也需要，可能被前面的跳转引用）
         if (jump_targets.get(ip)) |label_id| {
             try ir.appendLabel(label_id);
+            seen_return = false; // 跳转目标可达，重置 return 标志
+        } else if (seen_return) {
+            // return 后的非标签死代码：跳过（编译器常在 return 后发射
+            // load_unit/load_const 作为默认返回值，可能引用超出范围的寄存器）
+            continue;
         }
 
         const a = reg_opcode.getA(inst);
@@ -726,9 +733,11 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
             // 返回
             .return_op => {
                 try ir.append(.{ .op = .return_val, .a = .{ .vreg = reg_map.items[a] } });
+                seen_return = true;
             },
             .return_unit => {
                 try ir.append(.{ .op = .return_void });
+                seen_return = true;
             },
 
             // 赋值：生成 move 指令
@@ -743,18 +752,18 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
             // 函数调用（同模块内已知函数）
             // call: A=dst, Bx=callee_idx, C=argc
             // call_memoized: A=dst, Bx=callee_idx, argc=callee.arity
-            // tail_call: A=dst, Bx=callee_idx, argc=callee.arity
             // 参数在 a+1, a+2, ..., a+argc 寄存器中
-            .call, .call_memoized, .tail_call => {
+            .call, .call_memoized => {
                 const callee_idx: usize = bx;
                 if (callee_idx >= functions.len) return .{ .unsupported = op };
                 const callee = &functions[callee_idx];
                 const argc: usize = switch (op) {
                     .call => c,
-                    .call_memoized, .tail_call => callee.arity,
+                    .call_memoized => callee.arity,
                     else => unreachable,
                 };
                 if (argc > 16) return .{ .unsupported = op };
+                if (a >= reg_map.items.len) return .{ .unsupported = op };
                 var call_inst = Inst{
                     .op = .call,
                     .dst = reg_map.items[a],
@@ -763,10 +772,14 @@ pub fn liftFromChunk(allocator: std.mem.Allocator, func: *const reg_chunk.RegFun
                 };
                 // 参数在 a+1, a+2, ..., a+argc
                 for (0..argc) |i| {
+                    if (a + 1 + i >= reg_map.items.len) return .{ .unsupported = op };
                     call_inst.call_args[i] = reg_map.items[a + 1 + i];
                 }
                 try ir.append(call_inst);
             },
+
+            // tail_call: IR 模式不支持（帧语义不同于普通 call），回退到桥接模式
+            .tail_call => return .{ .unsupported = op },
 
             // 未实现/不支持的指令
             else => return .{ .unsupported = op },

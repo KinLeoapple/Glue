@@ -1942,7 +1942,7 @@ pub fn compileBridge(
 
         switch (op) {
             // ── 热点 opcode：i64/f64 算术 ──
-            .add, .sub, .mul, .div, .mod => {
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
                 const b_known_i64 = b < reg_count and reg_types[b] == .i64;
                 const c_known_i64 = c < reg_count and reg_types[c] == .i64;
                 const b_known_f64 = b < reg_count and reg_types[b] == .f64;
@@ -1975,6 +1975,9 @@ pub fn compileBridge(
                             // 余数在 rdx
                             try buf.movReg(TMP0, GPR.rdx);
                         },
+                        .bit_and => try buf.andReg(TMP0, TMP1),
+                        .bit_or => try buf.orReg(TMP0, TMP1),
+                        .bit_xor => try buf.xorReg(TMP0, TMP1),
                         else => unreachable,
                     }
                     // 存储 tag = TAG_INT
@@ -1984,7 +1987,7 @@ pub fn compileBridge(
                     // 存储 lo
                     try buf.storeMem(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_LO_OFF)), TMP0);
                     reg_types[a] = .i64;
-                } else if (b_known_f64 and c_known_f64 and op != .mod) {
+                } else if (b_known_f64 and c_known_f64 and op != .mod and op != .bit_and and op != .bit_or and op != .bit_xor) {
                     // ── 类型已知 f64：跳过 tag 检查，用 FPR 池加载 ──
                     try emitFrameBase(&buf);
                     const xmm_b = try emitEnsureFpr(&buf, &fpr_state, b, 0xFF);
@@ -2037,9 +2040,11 @@ pub fn compileBridge(
                             try buf.idivReg(TMP1);
                             try buf.movReg(TMP0, GPR.rdx);
                         },
+                        .bit_and => try buf.andReg(TMP0, TMP1),
+                        .bit_or => try buf.orReg(TMP0, TMP1),
+                        .bit_xor => try buf.xorReg(TMP0, TMP1),
                         else => unreachable,
                     }
-
                     // 存储 i64 结果到 dst(a)
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, TAG_OFF)), TAG_INT_VAL);
                     try buf.storeByteImm(TMP2, @intCast(@as(i32, a) * 32 + @as(i32, INT_TYPE_OFF)), INT_TYPE_I64_VAL);
@@ -2055,8 +2060,8 @@ pub fn compileBridge(
 
                     var b_next2: u32 = 0;
 
-                    // ── f64 快速路径（.mod 无浮点路径，直接走 cold）──
-                    if (op != .mod) {
+                    // ── f64 快速路径（.mod 和位运算无浮点路径，直接走 cold）──
+                    if (op != .mod and op != .bit_and and op != .bit_or and op != .bit_xor) {
                         // 检查 b 的 tag == TAG_FLOAT
                         try buf.cmpByteMemImm(TMP2, @intCast(@as(i32, b) * 32 + @as(i32, TAG_OFF)), TAG_FLOAT_VAL);
                         const jne_f1 = try buf.jccRel32(X86Cond.NE);
@@ -2109,7 +2114,7 @@ pub fn compileBridge(
                     // ── .next: 回填 b_next 和 b_next2 ──
                     const next_off = buf.len();
                     BridgeBuf.patchRel32(code.items, b_next + 1, next_off);
-                    if (op != .mod) {
+                    if (op != .mod and op != .bit_and and op != .bit_or and op != .bit_xor) {
                         BridgeBuf.patchRel32(code.items, b_next2 + 1, next_off);
                     }
                     reg_types[a] = .unknown;
@@ -3069,12 +3074,6 @@ fn compileBridgeFn(
     const JitEngine = jit_mod.JitEngine;
     const engine: *JitEngine = @ptrCast(@alignCast(engine_ctx));
     const func: *const reg_chunk.RegFunction = @ptrCast(@alignCast(func_opaque));
-
-    // 跳过包含闭包/upvalue 的函数
-    if (@import("mod.zig").containsClosureOps(func)) {
-        engine.failed[func_idx] = true;
-        return null;
-    }
 
     // 预分配可执行内存（32KB）
     var exec_mem = mem.allocExec(32 * 1024) catch {

@@ -132,7 +132,6 @@ pub const JitEngine = struct {
     /// - ARM64: 桥接模式（直接从字节码生成机器码）
     /// - x86-64: IR 模式（IR 提升 + 寄存器分配 + 递归编译）
     /// - RISC-V 64: 桥接模式（直接从字节码生成机器码）
-    /// - LoongArch64: 桥接模式（直接从字节码生成机器码）
     pub fn compileFunction(self: *JitEngine, func_idx: u32, func: *const reg_chunk.RegFunction) ?*const CompiledFn {
         if (func_idx >= self.compiled.len) return null;
         // 已编译则直接返回

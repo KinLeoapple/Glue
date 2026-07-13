@@ -140,6 +140,9 @@ break :blk value.Value.fromInt(value.Int.fromNative(.i64, r[0]));
 },
 .div => if (ri == 0) null else value.Value.fromInt(value.Int.fromNative(.i64, @divTrunc(li, ri))),
 .mod => if (ri == 0) null else value.Value.fromInt(value.Int.fromNative(.i64, @rem(li, ri))),
+.bit_and => value.Value.fromInt(value.Int.fromNative(.i64, li & ri)),
+.bit_or => value.Value.fromInt(value.Int.fromNative(.i64, li | ri)),
+.bit_xor => value.Value.fromInt(value.Int.fromNative(.i64, li ^ ri)),
 else => null,
 };
 }
@@ -294,9 +297,15 @@ const program = self.program.?;
 if (func_idx >= program.functions.items.len) return error.NoSuchFunction;
 const callee = &program.functions.items[func_idx];
 const saved_stop = self.stop_depth;
+const saved_single_step = self.single_step;
+const saved_step_count = self.step_count;
+defer self.stop_depth = saved_stop;
+defer self.single_step = saved_single_step;
+defer self.step_count = saved_step_count;
+self.single_step = false;
+self.step_count = 0;
 try self.setupFrame(callee, args, return_base, return_reg);
 self.stop_depth = self.frames.items.len;
-defer self.stop_depth = saved_stop;
 return try self.runLoop();
 }
 /// 调用程序入口函数：先执行全局初始化函数，再设置入口帧并运行主循环。
@@ -1340,7 +1349,13 @@ for (vc.bound_args, 0..) |ba, i| all_args[i] = ba;
 for (0..argc) |i| all_args[vc.bound_args.len + i] = self.reg_pool[base + b + 1 + i];
 const callee: *const reg_chunk.RegFunction = @ptrCast(@alignCast(vc.func));
 const saved_stop = self.stop_depth;
+const saved_single_step = self.single_step;
+const saved_step_count = self.step_count;
 defer self.stop_depth = saved_stop;
+defer self.single_step = saved_single_step;
+defer self.step_count = saved_step_count;
+self.single_step = false;
+self.step_count = 0;
 try self.setupFrame(callee, all_args, 0, 0);
 self.stop_depth = self.frames.items.len;
 const spawn_result = try self.runLoop();

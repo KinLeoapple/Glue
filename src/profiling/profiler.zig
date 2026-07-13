@@ -6,6 +6,9 @@
 
 const std = @import("std");
 
+/// 平台自适应计数器类型：64 位平台用 u64，32 位平台用 u32（避免 64 位原子不支持）。
+const Counter = if (@sizeOf(usize) >= 8) u64 else u32;
+
 /// 编译/运行阶段标识，用于阶段级耗时统计。
 pub const Phase = enum {
     lex,
@@ -181,20 +184,20 @@ pub const Profiler = struct {
     slab_evicted_slabs: u64 = 0,
     slab_evicted_large: u64 = 0,
     slab_evict_scans: u64 = 0,
-    vm_call_count: std.atomic.Value(u64) = .{ .raw = 0 },
-    vm_tail_call_count: std.atomic.Value(u64) = .{ .raw = 0 },
-    vm_method_call_count: std.atomic.Value(u64) = .{ .raw = 0 },
-    vm_spawn_count: std.atomic.Value(u64) = .{ .raw = 0 },
-    vm_await_count: std.atomic.Value(u64) = .{ .raw = 0 },
-    vm_cancel_count: std.atomic.Value(u64) = .{ .raw = 0 },
-    vm_memo_hits: std.atomic.Value(u64) = .{ .raw = 0 },
-    vm_memo_misses: std.atomic.Value(u64) = .{ .raw = 0 },
+    vm_call_count: std.atomic.Value(Counter) = .{ .raw = 0 },
+    vm_tail_call_count: std.atomic.Value(Counter) = .{ .raw = 0 },
+    vm_method_call_count: std.atomic.Value(Counter) = .{ .raw = 0 },
+    vm_spawn_count: std.atomic.Value(Counter) = .{ .raw = 0 },
+    vm_await_count: std.atomic.Value(Counter) = .{ .raw = 0 },
+    vm_cancel_count: std.atomic.Value(Counter) = .{ .raw = 0 },
+    vm_memo_hits: std.atomic.Value(Counter) = .{ .raw = 0 },
+    vm_memo_misses: std.atomic.Value(Counter) = .{ .raw = 0 },
     vm_memo_cache_size: usize = 0,
     vm_memo_disabled_count: usize = 0,
-    cache_hits: std.atomic.Value(u64) = .{ .raw = 0 },
-    cache_misses: std.atomic.Value(u64) = .{ .raw = 0 },
-    cache_refills: std.atomic.Value(u64) = .{ .raw = 0 },
-    cache_drains: std.atomic.Value(u64) = .{ .raw = 0 },
+    cache_hits: std.atomic.Value(Counter) = .{ .raw = 0 },
+    cache_misses: std.atomic.Value(Counter) = .{ .raw = 0 },
+    cache_refills: std.atomic.Value(Counter) = .{ .raw = 0 },
+    cache_drains: std.atomic.Value(Counter) = .{ .raw = 0 },
 
     /// 创建分析器实例，enabled 控制是否实际采集数据。
     pub fn init(enabled: bool, io: ?std.Io) Profiler {
@@ -330,10 +333,10 @@ pub const Profiler = struct {
         refills: u64,
         drains: u64,
     ) void {
-        self.cache_hits.store(hits, .monotonic);
-        self.cache_misses.store(misses, .monotonic);
-        self.cache_refills.store(refills, .monotonic);
-        self.cache_drains.store(drains, .monotonic);
+        self.cache_hits.store(@intCast(hits), .monotonic);
+        self.cache_misses.store(@intCast(misses), .monotonic);
+        self.cache_refills.store(@intCast(refills), .monotonic);
+        self.cache_drains.store(@intCast(drains), .monotonic);
     }
 
     /// 将所有采集到的统计以可读格式输出到 stderr。

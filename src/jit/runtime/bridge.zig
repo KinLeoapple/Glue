@@ -65,10 +65,7 @@ pub export fn rt_step(vm: *RegVM, ip: usize) callconv(.c) bool {
     }
 
     // 情况 3：调用类指令（帧增加，被调用函数尚未执行）
-    // 保存返回槽位信息（被调用帧的 return_base/return_reg 指向 JIT 帧的寄存器）
-    const callee_frame = vm.frames.items[vm.frames.items.len - 1];
-    const ret_base = callee_frame.return_base;
-    const ret_reg = callee_frame.return_reg;
+    // return_op 会将返回值写入被调用帧的 return_base+return_reg（指向 JIT 帧的寄存器）。
 
     // 运行被调用函数至完成
     const saved_stop = vm.stop_depth;
@@ -78,11 +75,11 @@ pub export fn rt_step(vm: *RegVM, ip: usize) callconv(.c) bool {
         return true;
     };
     vm.stop_depth = saved_stop;
-
-    // 将返回值写入调用者（JIT 帧）的返回槽位
-    // result 带 +1 retain（return_op 中 retain 转移给 result），写入寄存器即转移所有权
-    vm.reg_pool[ret_base + ret_reg].release(vm.allocator);
-    vm.reg_pool[ret_base + ret_reg] = result;
+    // return_op 已将返回值写入 ret_base+ret_reg（无论 return_op 在哪个 runLoop 层执行）。
+    // 当被调用函数通过 tail_call → JIT → rt_step 返回时，return_op 在嵌套 runLoop 中执行，
+    // 外层 runLoop 的 result 可能为 unit（初始值），因此不能覆盖寄存器。
+    // 释放 jitRunLoop 返回的 result（正常情况与寄存器值相同，tail_call 嵌套情况为 unit）。
+    result.release(vm.allocator);
 
     // 检查 JIT 帧本身是否在调用过程中返回
     if (vm.frames.items.len < initial_frames) return true;
@@ -157,10 +154,8 @@ pub export fn rt_call_inline(vm: *RegVM, func_idx: u32, args_base: usize, argc: 
         return true;
     };
     vm.stop_depth = saved_stop;
-
-    // 将返回值写入调用者的返回槽位
-    vm.reg_pool[return_base + return_reg].release(vm.allocator);
-    vm.reg_pool[return_base + return_reg] = result;
+    // return_op 已将返回值写入 return_base+return_reg，不覆盖（同 rt_step case 3）
+    result.release(vm.allocator);
 
     // 检查 JIT 帧本身是否在调用过程中返回
     return vm.frames.items.len < initial_frames;
@@ -177,15 +172,15 @@ pub export fn rt_call(vm: *RegVM, func_idx: u32, args_base: usize, argc: u8, dst
     for (0..n) |i| {
         args_buf[i] = vm.reg_pool[args_base + i];
     }
-    // jitCallFunction 返回的结果已带 +1 retain（return_op 中 retain）；
-    // 释放 dst_slot 旧值后写入，引用计数正确。
+    // jitCallFunction 返回的结果已带 +1 retain（return_op 中 retain）。
+    // return_op 已将返回值写入 dst_slot，不覆盖（同 rt_step case 3）。
+    // 释放 result 的额外 retain。
     const result = vm.jitCallFunction(func_idx, args_buf[0..n], dst_slot, 0) catch {
         vm.reg_pool[dst_slot].release(vm.allocator);
         vm.reg_pool[dst_slot] = value.Value.fromNull();
         return;
     };
-    vm.reg_pool[dst_slot].release(vm.allocator);
-    vm.reg_pool[dst_slot] = result;
+    result.release(vm.allocator);
 }
 
 /// 构造 i64 Value 并写入指定槽位。

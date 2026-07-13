@@ -243,7 +243,7 @@ pub fn build(b: *std.Build) void {
         .aarch64 => "aarch64",
         .x86_64 => "x86_64",
         .riscv64 => "riscv64",
-        .loongarch64 => "loongarch64",
+        .riscv32 => "riscv32",
         else => "unknown",
     };
     const install_step = b.addInstallArtifact(exe, .{
