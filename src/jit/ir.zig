@@ -281,7 +281,7 @@ fn inferRegTypes(func: *const reg_chunk.RegFunction, reg_types: []Type) Type {
                         reg_types[a] = switch (fv.type) {
                             .f32 => .f32,
                             .f64 => .f64,
-                            else => .i64, // f8/f16/f128 走桥接，标记为 i64 让 lift 失败
+                            else => .i64, // f16/f128 走桥接，标记为 i64 让 lift 失败
                         };
                     },
                     .boolean => reg_types[a] = .boolean,

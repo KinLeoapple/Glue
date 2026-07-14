@@ -1,6 +1,6 @@
 //! 浮点数值类型模块
 //!
-//! 定义 Glue 语言的浮点数类型系统，支持 f8/f16/f32/f64/f128 共五种
+//! 定义 Glue 语言的浮点数类型系统，支持 f16/f32/f64/f128 共四种
 //! IEEE 754 精度。Float 结构体以低 64 位 + 高 64 位存储原始比特，
 //! 提供加减乘除、比较、类型转换、整数互转、格式化等运算。
 //! 所有运算基于软件实现的分解-重组（decompose/compose）流水线，
@@ -12,9 +12,8 @@ const U128 = wide_lib.U128;
 const U256 = wide_lib.U256;
 const int = @import("int.zig");
 
-/// 浮点数类型枚举，涵盖 8/16/32/64/128 位 IEEE 754 精度
+/// 浮点数类型枚举，涵盖 16/32/64/128 位 IEEE 754 精度
 pub const Type = enum {
-f8,
 f16,
 f32,
 f64,
@@ -23,7 +22,6 @@ f128,
 /// 该类型占用的字节数
 pub fn byteLength(self: Type) u8 {
 return switch (self) {
-.f8 => 1,
 .f16 => 2,
 .f32 => 4,
 .f64 => 8,
@@ -34,7 +32,6 @@ return switch (self) {
 /// 该类型的位宽
 pub fn bitWidth(self: Type) u8 {
 return switch (self) {
-.f8 => 8,
 .f16 => 16,
 .f32 => 32,
 .f64 => 64,
@@ -45,7 +42,6 @@ return switch (self) {
 /// 指数字段的位数
 pub fn exponentBits(self: Type) u8 {
 return switch (self) {
-.f8 => 5,
 .f16 => 5,
 .f32 => 8,
 .f64 => 11,
@@ -56,7 +52,6 @@ return switch (self) {
 /// 尾数字段的位数（不含隐含位）
 pub fn mantissaBits(self: Type) u8 {
 return switch (self) {
-.f8 => 2,
 .f16 => 10,
 .f32 => 23,
 .f64 => 52,
@@ -67,7 +62,6 @@ return switch (self) {
 /// 指数偏置值
 pub fn bias(self: Type) u16 {
 return switch (self) {
-.f8 => 15,
 .f16 => 15,
 .f32 => 127,
 .f64 => 1023,
@@ -77,7 +71,6 @@ return switch (self) {
 
 /// 从类型名字符串解析为 Type，无法识别时返回 null
 pub fn fromName(name: []const u8) ?Type {
-if (std.mem.eql(u8, name, "f8")) return .f8;
 if (std.mem.eql(u8, name, "f16")) return .f16;
 if (std.mem.eql(u8, name, "f32")) return .f32;
 if (std.mem.eql(u8, name, "f64")) return .f64;
@@ -1546,238 +1539,4 @@ try std.testing.expectEqual(@as(u16, @bitCast(native_down)), @as(u16, @bitCast(d
 }
 }
 }
-test "Type f8 methods" {
-try std.testing.expectEqual(@as(u8, 1), Type.f8.byteLength());
-try std.testing.expectEqual(@as(u8, 8), Type.f8.bitWidth());
-try std.testing.expectEqual(@as(u8, 5), Type.f8.exponentBits());
-try std.testing.expectEqual(@as(u8, 2), Type.f8.mantissaBits());
-try std.testing.expectEqual(@as(u16, 15), Type.f8.bias());
-}
-test "Type.fromName f8" {
-try std.testing.expectEqual(@as(?Type, .f8), Type.fromName("f8"));
-try std.testing.expectEqual(@as(?Type, .f16), Type.fromName("f16"));
-try std.testing.expectEqual(@as(?Type, null), Type.fromName("f4"));
-}
-test "Float f8 fromNative/toNative roundtrip" {
-const cases = [_]u8{ 0x00, 0x80, 0x7C, 0xFC, 0x7D, 0x3C, 0xBC, 0x38, 0x40, 0x44, 0x3D, 0x3E, 0x3F, 0x7B, 0x04, 0x01, 0x03 };
-for (cases) |bits| {
-const v = Float.fromNative(.f8, bits);
-try std.testing.expectEqual(bits, v.toNative(u8));
-}
-}
-test "Float f8 special values" {
-const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
-const neg_zero = Float.fromNative(.f8, @as(u8, 0x80));
-const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-const neg_inf = Float.fromNative(.f8, @as(u8, 0xFC));
-const pos_nan = Float.fromNative(.f8, @as(u8, 0x7D));
-const one = Float.fromNative(.f8, @as(u8, 0x3C));
-try std.testing.expect(pos_zero.isZero());
-try std.testing.expect(!pos_zero.isNegative());
-try std.testing.expect(neg_zero.isZero());
-try std.testing.expect(neg_zero.isNegative());
-try std.testing.expect(pos_inf.isInfinite());
-try std.testing.expect(!pos_inf.isNan());
-try std.testing.expect(!pos_inf.isNegative());
-try std.testing.expect(neg_inf.isInfinite());
-try std.testing.expect(neg_inf.isNegative());
-try std.testing.expect(pos_nan.isNan());
-try std.testing.expect(!pos_nan.isInfinite());
-try std.testing.expect(!one.isZero());
-try std.testing.expect(!one.isSubnormal());
-try std.testing.expect(!one.isNegative());
-}
-test "Float f8 subnormal" {
-const min_sub = Float.fromNative(.f8, @as(u8, 0x01));
-const max_sub = Float.fromNative(.f8, @as(u8, 0x03));
-const min_normal = Float.fromNative(.f8, @as(u8, 0x04));
-try std.testing.expect(min_sub.isSubnormal());
-try std.testing.expect(!min_sub.isZero());
-try std.testing.expect(max_sub.isSubnormal());
-try std.testing.expect(!min_normal.isSubnormal());
-}
-test "Float f8 unpack fields" {
-const one = Float.fromNative(.f8, @as(u8, 0x3C));
-const u = one.unpack();
-try std.testing.expectEqual(@as(u1, 0), u.sign);
-try std.testing.expectEqual(@as(u32, 15), u.exp);
-try std.testing.expect(u.mantissa.isZero());
-try std.testing.expect(!u.is_nan);
-try std.testing.expect(!u.is_infinite);
-const neg_one = Float.fromNative(.f8, @as(u8, 0xBC));
-const un = neg_one.unpack();
-try std.testing.expectEqual(@as(u1, 1), un.sign);
-try std.testing.expectEqual(@as(u32, 15), un.exp);
-const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-const ui = pos_inf.unpack();
-try std.testing.expectEqual(@as(u32, 31), ui.exp);
-try std.testing.expect(ui.is_infinite);
-const pos_nan = Float.fromNative(.f8, @as(u8, 0x7D));
-const un2 = pos_nan.unpack();
-try std.testing.expectEqual(@as(u32, 31), un2.exp);
-try std.testing.expect(un2.is_nan);
-try std.testing.expect(un2.mantissa.equals(U128.fromU64(1)));
-}
-test "Float f8 compare" {
-const one = Float.fromNative(.f8, @as(u8, 0x3C));
-const two = Float.fromNative(.f8, @as(u8, 0x40));
-const neg_one = Float.fromNative(.f8, @as(u8, 0xBC));
-const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
-const neg_zero = Float.fromNative(.f8, @as(u8, 0x80));
-const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-const neg_inf = Float.fromNative(.f8, @as(u8, 0xFC));
-try std.testing.expectEqual(.lt, one.compare(two));
-try std.testing.expectEqual(.gt, two.compare(one));
-try std.testing.expectEqual(.eq, one.compare(Float.fromNative(.f8, @as(u8, 0x3C))));
-try std.testing.expectEqual(.gt, one.compare(neg_one));
-try std.testing.expectEqual(.lt, neg_one.compare(one));
-try std.testing.expectEqual(.eq, pos_zero.compare(neg_zero));
-try std.testing.expectEqual(.gt, pos_inf.compare(one));
-try std.testing.expectEqual(.lt, neg_inf.compare(one));
-try std.testing.expectEqual(.lt, neg_inf.compare(pos_inf));
-}
-test "Float f8 negate" {
-const one = Float.fromNative(.f8, @as(u8, 0x3C));
-const neg_one = one.negate();
-try std.testing.expectEqual(@as(u8, 0xBC), neg_one.toNative(u8));
-const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
-const neg_zero = pos_zero.negate();
-try std.testing.expectEqual(@as(u8, 0x80), neg_zero.toNative(u8));
-const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-const neg_inf = pos_inf.negate();
-try std.testing.expectEqual(@as(u8, 0xFC), neg_inf.toNative(u8));
-}
-test "Float f8 add" {
-const one = Float.fromNative(.f8, @as(u8, 0x3C));
-const half = Float.fromNative(.f8, @as(u8, 0x38));
-const neg_one = Float.fromNative(.f8, @as(u8, 0xBC));
-const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
-try std.testing.expectEqual(@as(u8, 0x40), one.add(one).toNative(u8));
-try std.testing.expectEqual(@as(u8, 0x3E), one.add(half).toNative(u8));
-try std.testing.expectEqual(@as(u8, 0x00), one.add(neg_one).toNative(u8));
-try std.testing.expectEqual(@as(u8, 0x3C), one.add(pos_zero).toNative(u8));
-const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-try std.testing.expect(pos_inf.addPortable(pos_inf).isInfinite());
-const neg_inf = Float.fromNative(.f8, @as(u8, 0xFC));
-try std.testing.expect(pos_inf.addPortable(neg_inf).isNan());
-}
-test "Float f8 subtract" {
-const one = Float.fromNative(.f8, @as(u8, 0x3C));
-const half = Float.fromNative(.f8, @as(u8, 0x38));
-try std.testing.expectEqual(@as(u8, 0x38), one.subtract(half).toNative(u8));
-try std.testing.expectEqual(@as(u8, 0x00), one.subtract(one).toNative(u8));
-}
-test "Float f8 multiply" {
-const one = Float.fromNative(.f8, @as(u8, 0x3C));
-const two = Float.fromNative(.f8, @as(u8, 0x40));
-const one_point_five = Float.fromNative(.f8, @as(u8, 0x3E));
-const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
-try std.testing.expectEqual(@as(u8, 0x44), two.multiply(two).toNative(u8));
-try std.testing.expectEqual(@as(u8, 0x3E), one.multiply(one_point_five).toNative(u8));
-try std.testing.expectEqual(@as(u8, 0x00), one.multiply(pos_zero).toNative(u8));
-const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-try std.testing.expect(pos_inf.multiplyPortable(pos_zero).isNan());
-try std.testing.expect(pos_inf.multiplyPortable(pos_inf).isInfinite());
-}
-test "Float f8 divide" {
-const one = Float.fromNative(.f8, @as(u8, 0x3C));
-const two = Float.fromNative(.f8, @as(u8, 0x40));
-const pos_zero = Float.fromNative(.f8, @as(u8, 0x00));
-try std.testing.expectEqual(@as(u8, 0x38), one.divide(two).toNative(u8));
-try std.testing.expectEqual(@as(u8, 0x3C), two.divide(two).toNative(u8));
-try std.testing.expectEqual(@as(u8, 0x7C), one.dividePortable(pos_zero).toNative(u8));
-try std.testing.expect(pos_zero.dividePortable(pos_zero).isNan());
-const pos_inf = Float.fromNative(.f8, @as(u8, 0x7C));
-try std.testing.expect(pos_inf.dividePortable(pos_inf).isNan());
-}
-test "Float f8 toFloatType f8->f16 widen" {
-{
-const v = Float.fromNative(.f8, @as(u8, 0x3C));
-const wide = v.toFloatType(.f16);
-try std.testing.expectEqual(@as(u16, 0x3C00), @as(u16, @bitCast(wide.toNative(f16))));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x38));
-const wide = v.toFloatType(.f16);
-try std.testing.expectEqual(@as(u16, 0x3800), @as(u16, @bitCast(wide.toNative(f16))));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x3E));
-const wide = v.toFloatType(.f16);
-try std.testing.expectEqual(@as(u16, 0x3E00), @as(u16, @bitCast(wide.toNative(f16))));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x7C));
-const wide = v.toFloatType(.f16);
-try std.testing.expect(wide.isInfinite());
-try std.testing.expectEqual(@as(u16, 0x7C00), @as(u16, @bitCast(wide.toNative(f16))));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x00));
-const wide = v.toFloatType(.f16);
-try std.testing.expectEqual(@as(u16, 0x0000), @as(u16, @bitCast(wide.toNative(f16))));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x7D));
-const wide = v.toFloatType(.f16);
-try std.testing.expect(wide.isNan());
-}
-}
-test "Float f8 toFloatType f16->f8 narrow" {
-{
-const v = Float.fromNative(.f16, @as(f16, 1.0));
-const narrow = v.toFloatType(.f8);
-try std.testing.expectEqual(@as(u8, 0x3C), narrow.toNative(u8));
-}
-{
-const v = Float.fromNative(.f16, @as(f16, 0.5));
-const narrow = v.toFloatType(.f8);
-try std.testing.expectEqual(@as(u8, 0x38), narrow.toNative(u8));
-}
-{
-const v = Float.fromNative(.f16, @as(f16, 1.5));
-const narrow = v.toFloatType(.f8);
-try std.testing.expectEqual(@as(u8, 0x3E), narrow.toNative(u8));
-}
-{
-const v = Float.fromNative(.f16, @as(f16, 2.0));
-const narrow = v.toFloatType(.f8);
-try std.testing.expectEqual(@as(u8, 0x40), narrow.toNative(u8));
-}
-}
-test "Float f8 toFloatType roundtrip f8->f16->f8" {
-var bits: u16 = 0;
-while (bits < 256) : (bits += 1) {
-const v = Float.fromNative(.f8, @as(u8, @truncate(bits)));
-if (v.isNan()) continue;
-const wide = v.toFloatType(.f16);
-const back = wide.toFloatType(.f8);
-try std.testing.expectEqual(v.toNative(u8), back.toNative(u8));
-}
-}
-test "Float f8 nextUp/nextDown" {
-{
-const v = Float.fromNative(.f8, @as(u8, 0x00));
-try std.testing.expectEqual(@as(u8, 0x01), v.nextUp().toNative(u8));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x3C));
-try std.testing.expectEqual(@as(u8, 0x3D), v.nextUp().toNative(u8));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x7B));
-try std.testing.expectEqual(@as(u8, 0x7C), v.nextUp().toNative(u8));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x7C));
-try std.testing.expectEqual(@as(u8, 0x7C), v.nextUp().toNative(u8));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0xFC));
-try std.testing.expectEqual(@as(u8, 0xFB), v.nextUp().toNative(u8));
-}
-{
-const v = Float.fromNative(.f8, @as(u8, 0x3C));
-try std.testing.expectEqual(@as(u8, 0x3B), v.nextDown().toNative(u8));
-}
-}
+

@@ -30,9 +30,9 @@ pub fn build(b: *std.Build) void {
     parser_module.addImport("ast", ast_module);
     parser_module.addImport("lexer", lexer_module);
 
-    // ---- 运行时基础模块：slab 分配器、性能分析器、同步原语、channel、spawn、原子操作 ----
+    // ---- 内存管理模块：分配器 ----
     const slab_allocator_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/slab_allocator.zig"),
+        .root_source_file = b.path("src/mem/slab_allocator.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -41,55 +41,33 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // ---- 并发原语模块：互斥锁、条件变量 ----
     const sync_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/sync.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const channel_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/channel.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const spawn_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/spawn.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const atomic_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/atomic.zig"),
+        .root_source_file = b.path("src/sync/sync.zig"),
         .target = target,
         .optimize = optimize,
     });
     const debug_allocator_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/debug_allocator.zig"),
+        .root_source_file = b.path("src/mem/debug_allocator.zig"),
         .target = target,
         .optimize = optimize,
     });
     debug_allocator_module.addImport("sync", sync_module);
     const arena_allocator_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/arena_allocator.zig"),
+        .root_source_file = b.path("src/mem/arena_allocator.zig"),
         .target = target,
         .optimize = optimize,
     });
     parser_module.addImport("arena_allocator", arena_allocator_module);
 
-    // ---- 值系统模块：与运行时各模块互相导入 ----
+    // ---- 值系统模块：依赖并发原语 ----
     const value_module = b.createModule(.{
         .root_source_file = b.path("src/value/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     value_module.addImport("ast", ast_module);
-    value_module.addImport("atomic", atomic_module);
-    value_module.addImport("channel", channel_module);
-    value_module.addImport("spawn", spawn_module);
-    atomic_module.addImport("value", value_module);
-    atomic_module.addImport("sync", sync_module);
-    channel_module.addImport("value", value_module);
-    channel_module.addImport("sync", sync_module);
-    spawn_module.addImport("value", value_module);
-    spawn_module.addImport("sync", sync_module);
+    value_module.addImport("sync", sync_module);
     slab_allocator_module.addImport("value", value_module);
     slab_allocator_module.addImport("sync", sync_module);
 
@@ -280,10 +258,6 @@ pub fn build(b: *std.Build) void {
         .root_module = reg_vm_module,
     });
     const run_reg_vm_unit_tests = b.addRunArtifact(reg_vm_unit_tests);
-    const atomic_unit_tests = b.addTest(.{
-        .root_module = atomic_module,
-    });
-    const run_atomic_unit_tests = b.addRunArtifact(atomic_unit_tests);
     const analysis_db_unit_tests = b.addTest(.{
         .root_module = analysis_db_module,
     });
@@ -301,16 +275,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_jit_unit_tests = b.addRunArtifact(jit_unit_tests);
 
-    // 值系统单独构建一份用于测试（避免与运行时互相导入形成循环依赖）
-    const value_new_module = b.createModule(.{
+    // 值系统单独构建一份用于测试（需导入 sync 供 concurrent.zig 使用）
+    const value_module_test = b.createModule(.{
         .root_source_file = b.path("src/value/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const value_new_unit_tests = b.addTest(.{
-        .root_module = value_new_module,
+    value_module_test.addImport("sync", sync_module);
+    const value_unit_tests = b.addTest(.{
+        .root_module = value_module_test,
     });
-    const run_value_new_unit_tests = b.addRunArtifact(value_new_unit_tests);
+    const run_value_unit_tests = b.addRunArtifact(value_unit_tests);
 
     // 所有测试产物都需要链接 libc
     lexer_unit_tests.root_module.linkSystemLibrary("c", .{});
@@ -320,9 +295,8 @@ pub fn build(b: *std.Build) void {
     slab_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
     stdlib_unit_tests.root_module.linkSystemLibrary("c", .{});
     reg_vm_unit_tests.root_module.linkSystemLibrary("c", .{});
-    atomic_unit_tests.root_module.linkSystemLibrary("c", .{});
     analysis_db_unit_tests.root_module.linkSystemLibrary("c", .{});
-    value_new_unit_tests.root_module.linkSystemLibrary("c", .{});
+    value_unit_tests.root_module.linkSystemLibrary("c", .{});
     debug_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
     arena_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
     jit_unit_tests.root_module.linkSystemLibrary("c", .{});
@@ -336,9 +310,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_slab_allocator_unit_tests.step);
     test_step.dependOn(&run_stdlib_unit_tests.step);
     test_step.dependOn(&run_reg_vm_unit_tests.step);
-    test_step.dependOn(&run_atomic_unit_tests.step);
     test_step.dependOn(&run_analysis_db_unit_tests.step);
-    test_step.dependOn(&run_value_new_unit_tests.step);
+    test_step.dependOn(&run_value_unit_tests.step);
     test_step.dependOn(&run_debug_allocator_unit_tests.step);
     test_step.dependOn(&run_arena_allocator_unit_tests.step);
     test_step.dependOn(&run_jit_unit_tests.step);

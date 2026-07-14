@@ -1,16 +1,24 @@
-//! 原子值模块。
+//! 并发值类型模块
 //!
-//! 为 Glue 语言的 `Value` 类型提供互斥保护的原子操作容器。
-//! 支持整数与浮点的算术原子更新（加减乘除模、位与或）、CAS 与交换，
-//! 并通过引用计数支持多所有者共享。
+//! 定义 Glue 语言中承载并发语义的值类型：
+//! - AtomicValue 互斥保护的原子操作容器
+//! - SpawnHandle 异步任务句柄
+//! - ChannelValue/SenderValue/ReceiverValue CSP 风格通道通信
+//!
+//! 这些类型持有或传递 Value，属于语义层，依赖 runtime 层的同步原语。
 
 const std = @import("std");
-const value = @import("value");
+const value = @import("mod.zig");
 const sync = @import("sync");
 const Value = value.Value;
 const Int = value.Int;
 const Float = value.Float;
 const Mutex = sync.Mutex;
+const Condition = sync.Condition;
+
+// ──────────────────────────────────────────────
+// AtomicValue
+// ──────────────────────────────────────────────
 
 /// 原子操作可能产生的错误。
 pub const AtomicError = error{
@@ -214,6 +222,254 @@ pub const AtomicValue = struct {
     }
 };
 
+// ──────────────────────────────────────────────
+// SpawnHandle
+// ──────────────────────────────────────────────
+
+/// 异步任务的执行状态。
+pub const SpawnStatus = enum(u8) {
+    Pending,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+};
+
+/// 异步任务句柄，持有任务结果与同步原语。
+///
+/// 调用方可通过原子字段查询任务状态，并在任务完成后消费结果。
+/// 句柄使用引用计数管理生命周期。
+pub const SpawnHandle = struct {
+    status: std.atomic.Value(SpawnStatus),
+    result: ?Value,
+    consumed: std.atomic.Value(bool),
+    finished: std.atomic.Value(bool),
+    allocator: std.mem.Allocator,
+    panic_message: ?[]const u8 = null,
+    mutex: Mutex,
+    condition: Condition,
+
+    pub fn init(allocator: std.mem.Allocator) SpawnHandle {
+        return SpawnHandle{
+            .status = std.atomic.Value(SpawnStatus).init(.Pending),
+            .result = null,
+            .consumed = std.atomic.Value(bool).init(false),
+            .finished = std.atomic.Value(bool).init(false),
+            .allocator = allocator,
+            .mutex = .{},
+            .condition = .{},
+        };
+    }
+
+    /// 释放句柄持有的资源，包括未消费的结果与 panic 信息。
+    pub fn deinit(self: *SpawnHandle) void {
+        if (self.result) |r| {
+            var v = r;
+            v.release(self.allocator);
+        }
+        if (self.panic_message) |msg| {
+            std.heap.c_allocator.free(msg);
+        }
+    }
+};
+
+// ──────────────────────────────────────────────
+// ChannelValue / SenderValue / ReceiverValue
+// ──────────────────────────────────────────────
+
+/// 通道值，支持有缓冲环形队列与无缓冲（会合）两种模式。
+///
+/// 当 `capacity` 为 0 时采用会合模式：发送方阻塞直到接收方取走值。
+/// 通过引用计数支持多端共享，关闭后所有阻塞操作立即返回。
+pub const ChannelValue = struct {
+    buffer: []Value,
+    head: usize,
+    tail: usize,
+    count: usize,
+    capacity: usize,
+    // 会合模式下暂存待传递的值。
+    rend_value: ?Value,
+    // 会合模式下标记已有发送方就绪。
+    rend_ready: bool,
+    closed: bool,
+    mutex: Mutex,
+    not_empty: Condition,
+    not_full: Condition,
+    allocator: std.mem.Allocator,
+    ref_count: std.atomic.Value(usize),
+
+    /// 创建容量为 `cap` 的通道。`cap` 为 0 时进入会合模式。
+    pub fn init(allocator: std.mem.Allocator, cap: usize) !ChannelValue {
+        const buf: []Value = if (cap == 0) &.{} else try allocator.alloc(Value, cap);
+        return ChannelValue{
+            .buffer = buf,
+            .head = 0,
+            .tail = 0,
+            .count = 0,
+            .capacity = cap,
+            .rend_value = null,
+            .rend_ready = false,
+            .closed = false,
+            .mutex = .{},
+            .not_empty = .{},
+            .not_full = .{},
+            .allocator = allocator,
+            .ref_count = std.atomic.Value(usize).init(1),
+        };
+    }
+
+    /// 释放通道资源，包括未消费的缓冲值与会合暂存值。
+    pub fn deinit(self: *ChannelValue) void {
+        if (self.capacity > 0) {
+            // 释放环形缓冲区中尚未被接收的值。
+            var i: usize = 0;
+            while (i < self.count) : (i += 1) {
+                var v = self.buffer[(self.head + i) % self.capacity];
+                v.release(self.allocator);
+            }
+            self.allocator.free(self.buffer);
+        }
+        if (self.rend_ready) {
+            if (self.rend_value) |v| {
+                var val = v;
+                val.release(self.allocator);
+            }
+        }
+    }
+
+    /// 发送一个值。通道关闭后返回 false，阻塞直到有空间或被接收。
+    pub fn send(self: *ChannelValue, val: Value) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return false;
+        if (self.capacity == 0) {
+            // 会合模式：等待之前的会合完成，然后提交新值并等待对方接收。
+            while (self.rend_ready) {
+                if (self.closed) return false;
+                self.not_full.wait(&self.mutex);
+            }
+            if (self.closed) return false;
+            self.rend_value = val;
+            self.rend_ready = true;
+            self.not_empty.signal();
+            // 阻塞直到接收方取走会合值。
+            while (self.rend_ready) {
+                if (self.closed) return true;
+                self.not_full.wait(&self.mutex);
+            }
+            return true;
+        }
+        // 有缓冲模式：等待环形队列出现空位。
+        while (self.count >= self.capacity) {
+            if (self.closed) return false;
+            self.not_full.wait(&self.mutex);
+        }
+        if (self.closed) return false;
+        self.buffer[self.tail] = val;
+        self.tail = (self.tail + 1) % self.capacity;
+        self.count += 1;
+        self.not_empty.signal();
+        return true;
+    }
+
+    /// 接收一个值。通道关闭且无数据时返回 null，否则阻塞直到有值可取。
+    pub fn recv(self: *ChannelValue) ?Value {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.capacity == 0) {
+            // 会合模式：等待发送方提交值后取走。
+            while (!self.rend_ready) {
+                if (self.closed) return null;
+                self.not_empty.wait(&self.mutex);
+            }
+            const val = self.rend_value.?;
+            self.rend_value = null;
+            self.rend_ready = false;
+            self.not_full.signal();
+            return val;
+        }
+        // 有缓冲模式：等待环形队列出现数据。
+        while (self.count == 0) {
+            if (self.closed) return null;
+            self.not_empty.wait(&self.mutex);
+        }
+        const val = self.buffer[self.head];
+        self.head = (self.head + 1) % self.capacity;
+        self.count -= 1;
+        self.not_full.signal();
+        return val;
+    }
+
+    /// 非阻塞接收。无数据可取时立即返回 null。
+    pub fn tryRecv(self: *ChannelValue) ?Value {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.capacity == 0) {
+            if (!self.rend_ready) return null;
+            const val = self.rend_value.?;
+            self.rend_value = null;
+            self.rend_ready = false;
+            self.not_full.signal();
+            return val;
+        }
+        if (self.count == 0) return null;
+        const val = self.buffer[self.head];
+        self.head = (self.head + 1) % self.capacity;
+        self.count -= 1;
+        self.not_full.signal();
+        return val;
+    }
+
+    /// 关闭通道，唤醒所有阻塞的发送方与接收方。
+    pub fn close(self: *ChannelValue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = true;
+        self.not_empty.broadcast();
+        self.not_full.broadcast();
+    }
+
+    /// 增加引用计数。
+    pub fn ref(self: *ChannelValue) void {
+        _ = self.ref_count.fetchAdd(1, .seq_cst);
+    }
+
+    /// 减少引用计数，返回是否为最后一次引用。
+    pub fn unref(self: *ChannelValue) bool {
+        return self.ref_count.fetchSub(1, .seq_cst) == 1;
+    }
+};
+
+/// 发送端句柄，共享底层通道的引用计数。
+pub const SenderValue = struct {
+    channel: *ChannelValue,
+
+    pub fn ref(self: *SenderValue) void {
+        self.channel.ref();
+    }
+
+    pub fn unref(self: *SenderValue) bool {
+        return self.channel.unref();
+    }
+};
+
+/// 接收端句柄，共享底层通道的引用计数。
+pub const ReceiverValue = struct {
+    channel: *ChannelValue,
+
+    pub fn ref(self: *ReceiverValue) void {
+        self.channel.ref();
+    }
+
+    pub fn unref(self: *ReceiverValue) bool {
+        return self.channel.unref();
+    }
+};
+
+// ──────────────────────────────────────────────
+// 测试
+// ──────────────────────────────────────────────
+
 const testing = std.testing;
 
 test "AtomicValue fetchAdd int type promotion (widen operand)" {
@@ -302,4 +558,37 @@ test "AtomicValue fetchAnd int narrowing overflow returns error" {
     var av = AtomicValue.init(Value.fromInt(Int.fromNative(.i8, @as(i8, 0x0F))));
     const operand = Value.fromInt(Int.fromNative(.i32, @as(i32, 256)));
     try testing.expectError(error.ArithmeticOverflow, av.fetchAnd(operand));
+}
+
+test "buffered channel ring buffer FIFO order" {
+    var ch = try ChannelValue.init(testing.allocator, 3);
+    defer ch.deinit();
+    try testing.expect(try ch.send(Value.fromInt(Int.fromNative(.i32, 10))));
+    try testing.expect(try ch.send(Value.fromInt(Int.fromNative(.i32, 20))));
+    try testing.expect(try ch.send(Value.fromInt(Int.fromNative(.i32, 30))));
+    const v1 = ch.tryRecv().?;
+    try testing.expectEqual(@as(i32, 10), v1.asInt().toNative(i32));
+    try testing.expect(try ch.send(Value.fromInt(Int.fromNative(.i32, 40))));
+    const v2 = ch.recv().?;
+    try testing.expectEqual(@as(i32, 20), v2.asInt().toNative(i32));
+    const v3 = ch.recv().?;
+    try testing.expectEqual(@as(i32, 30), v3.asInt().toNative(i32));
+    const v4 = ch.recv().?;
+    try testing.expectEqual(@as(i32, 40), v4.asInt().toNative(i32));
+    try testing.expect(ch.tryRecv() == null);
+}
+
+test "channel close wakes blocked recv" {
+    var ch = try ChannelValue.init(testing.allocator, 1);
+    defer ch.deinit();
+    ch.close();
+    try testing.expect(ch.recv() == null);
+}
+
+test "channel send after close returns false" {
+    var ch = try ChannelValue.init(testing.allocator, 2);
+    defer ch.deinit();
+    ch.close();
+    const v = Value.fromInt(Int.fromNative(.i32, 99));
+    try testing.expect(!(try ch.send(v)));
 }

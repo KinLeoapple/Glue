@@ -1819,7 +1819,7 @@ if (left == .float and right == .float and left.float.type == right.float.type) 
 switch (left.float.type) {
 .f32 => return try nativeFloatArith(f32, left.float.type, op, left.float, right.float),
 .f64 => return try nativeFloatArith(f64, left.float.type, op, left.float, right.float),
-.f8, .f16, .f128 => {}, // 非原生宽度走通用路径
+.f16, .f128 => {}, // 非原生宽度走通用路径
 }
 }
 const tag: value.FloatType = if (left.isFloat() and right.isFloat()) blk: {
@@ -1919,7 +1919,7 @@ const f = v.asFloat();
 switch (f.type) {
 .f32 => return value.Value.fromFloat(value.Float.fromNative(.f32, -f.toNative(f32))),
 .f64 => return value.Value.fromFloat(value.Float.fromNative(.f64, -f.toNative(f64))),
-else => {}, // f8/f16/f128 走通用路径
+else => {}, // f16/f128 走通用路径
 }
 return value.Value.fromFloat(f.negate());
 }
@@ -2037,7 +2037,7 @@ return value.Value.fromBool(switch (op) {
 else => unreachable,
 });
 },
-.f8, .f16, .f128 => {}, // 非原生宽度走通用路径
+.f16, .f128 => {}, // 非原生宽度走通用路径
 }
 }
 const tag: value.FloatType = if (left.isFloat() and right.isFloat()) blk: {

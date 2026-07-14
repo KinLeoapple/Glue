@@ -40,12 +40,12 @@ pub const iterator = @import("iterator.zig");
 const ArrayIterator = iterator.ArrayIterator;
 const StringIterator = iterator.StringIterator;
 const RangeIterator = iterator.RangeIterator;
-pub const runtime_bridge = @import("runtime_bridge.zig");
-pub const AtomicValue = runtime_bridge.AtomicValue;
-pub const SpawnHandle = runtime_bridge.SpawnHandle;
-pub const ChannelValue = runtime_bridge.ChannelValue;
-pub const SenderValue = runtime_bridge.SenderValue;
-pub const ReceiverValue = runtime_bridge.ReceiverValue;
+pub const concurrent = @import("concurrent.zig");
+pub const AtomicValue = concurrent.AtomicValue;
+pub const SpawnHandle = concurrent.SpawnHandle;
+pub const ChannelValue = concurrent.ChannelValue;
+pub const SenderValue = concurrent.SenderValue;
+pub const ReceiverValue = concurrent.ReceiverValue;
 /// Glue 语言的核心值类型联合体
 ///
 /// 标量变体（null_val、unit、boolean、char、int、float）为内联值，
