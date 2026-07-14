@@ -8,7 +8,6 @@
 const std = @import("std");
 const lexer = @import("lexer");
 const ast = @import("ast");
-const arena_allocator = @import("arena_allocator");
 
 /// 语法错误信息：行列号与消息
 pub const ParseError = struct {
@@ -23,29 +22,37 @@ const ParserError = error{ OutOfMemory, UnexpectedToken };
 pub const Parser = struct {
     tokens: []lexer.Token,
     current: usize,
-    allocator: std.mem.Allocator,
-    arena: arena_allocator.ArenaAllocator,
+    arena: std.heap.ArenaAllocator,
     errors: std.ArrayList(ParseError),
     owns_tokens: bool,
 
     /// 创建分析器，尝试复制 Token 序列；复制失败时直接引用传入切片
-    pub fn init(allocator: std.mem.Allocator, tokens: []const lexer.Token) Parser {
-        const owned: ?[]lexer.Token = allocator.dupe(lexer.Token, tokens) catch null;
-        return Parser{
-            .tokens = owned orelse @constCast(tokens),
+    pub fn init(backing: std.mem.Allocator, tokens: []const lexer.Token) Parser {
+        var p = Parser{
+            .tokens = @constCast(tokens),
             .current = 0,
-            .allocator = allocator,
-            .arena = arena_allocator.ArenaAllocator.init(allocator),
+            .arena = std.heap.ArenaAllocator.init(backing),
             .errors = .empty,
-            .owns_tokens = owned != null,
+            .owns_tokens = false,
         };
+        const alloc = p.arena.allocator();
+        const owned: ?[]lexer.Token = alloc.dupe(lexer.Token, tokens) catch null;
+        if (owned) |o| {
+            p.tokens = o;
+            p.owns_tokens = true;
+        }
+        return p;
     }
 
     /// 释放分析器资源
     pub fn deinit(self: *Parser) void {
-        if (self.owns_tokens) self.allocator.free(self.tokens);
-        self.errors.deinit(self.allocator);
+        self.errors.deinit(self.arena.allocator());
         self.arena.deinit();
+    }
+
+    /// 获取 arena 的分配器接口
+    pub fn allocator(self: *Parser) std.mem.Allocator {
+        return self.arena.allocator();
     }
 
     // ---- Token 导航辅助 ----
@@ -98,7 +105,7 @@ pub const Parser = struct {
             return self.advance();
         }
         const tok = self.peek();
-        try self.errors.append(self.allocator, ParseError{
+        try self.errors.append(self.arena.allocator(), ParseError{
             .line = tok.line,
             .column = tok.column,
             .message = message,
@@ -118,7 +125,7 @@ pub const Parser = struct {
             return;
         }
         const tok = self.peek();
-        try self.errors.append(self.allocator, ParseError{
+        try self.errors.append(self.arena.allocator(), ParseError{
             .line = tok.line,
             .column = tok.column,
             .message = message,
@@ -129,7 +136,7 @@ pub const Parser = struct {
     /// 在当前 Token 处记录一条语法错误
     fn reportError(self: *Parser, message: []const u8) ParserError!void {
         const tok = self.peek();
-        try self.errors.append(self.allocator, ParseError{
+        try self.errors.append(self.arena.allocator(), ParseError{
             .line = tok.line,
             .column = tok.column,
             .message = message,
@@ -204,13 +211,13 @@ pub const Parser = struct {
     /// 解析整个模块：循环解析声明或顶层表达式，收集错误后返回 Module
     pub fn parseModule(self: *Parser, module_name: []const u8) ParserError!ast.Module {
         var declarations = std.ArrayList(ast.Decl).empty;
-        errdefer declarations.deinit(self.allocator);
+        errdefer declarations.deinit(self.arena.allocator());
         while (!self.isAtEnd()) {
             const at_decl_kw = self.check(.kw_fun) or self.check(.kw_type) or
                 self.check(.kw_trait) or
                 self.check(.kw_import) or self.check(.kw_pack) or self.check(.kw_pub);
             if (self.tryParseDecl()) |decl| {
-                try declarations.append(self.allocator, decl);
+                try declarations.append(self.arena.allocator(), decl);
                 continue;
             }
             if (at_decl_kw) {
@@ -241,7 +248,7 @@ pub const Parser = struct {
                         .value = value,
                     },
                 });
-                try declarations.append(self.allocator, ast.Decl{
+                try declarations.append(self.arena.allocator(), ast.Decl{
                     .expr_decl = .{
                         .location = getExprLocation(expr),
                         .expr = expr,
@@ -249,7 +256,7 @@ pub const Parser = struct {
                     },
                 });
             } else {
-                try declarations.append(self.allocator, ast.Decl{
+                try declarations.append(self.arena.allocator(), ast.Decl{
                     .expr_decl = .{
                         .location = getExprLocation(expr),
                         .expr = expr,
@@ -263,7 +270,7 @@ pub const Parser = struct {
         return ast.Module{
             .name = module_name,
             .source_path = null,
-            .declarations = try declarations.toOwnedSlice(self.allocator),
+            .declarations = try declarations.toOwnedSlice(self.arena.allocator()),
         };
     }
 
@@ -418,10 +425,10 @@ pub const Parser = struct {
                 .location = tokenLoc(fun_tok),
                 .visibility = visibility,
                 .name = name_tok.lexeme,
-                .type_params = try type_params.toOwnedSlice(self.allocator),
-                .params = try params.toOwnedSlice(self.allocator),
+                .type_params = try type_params.toOwnedSlice(self.arena.allocator()),
+                .params = try params.toOwnedSlice(self.arena.allocator()),
                 .return_type = return_type,
-                .bounds = try bounds.toOwnedSlice(self.allocator),
+                .bounds = try bounds.toOwnedSlice(self.arena.allocator()),
                 .body = body,
                 .is_async = is_async,
                 .is_entry = std.mem.eql(u8, name_tok.lexeme, "main"),
@@ -470,7 +477,7 @@ pub const Parser = struct {
             try self.parseMethodBlock(&methods);
             _ = self.expect(.r_brace, "expected '}' to close method block") catch {};
             if (def == .error_newtype) {
-                def.error_newtype.methods = try methods.toOwnedSlice(self.allocator);
+                def.error_newtype.methods = try methods.toOwnedSlice(self.arena.allocator());
             }
         }
         return ast.Decl{
@@ -478,11 +485,11 @@ pub const Parser = struct {
                 .location = tokenLoc(type_tok),
                 .visibility = visibility,
                 .name = name_tok.lexeme,
-                .type_params = try type_params.toOwnedSlice(self.allocator),
-                .implemented_traits = try implemented_traits.toOwnedSlice(self.allocator),
-                .type_constraints = try type_constraints.toOwnedSlice(self.allocator),
+                .type_params = try type_params.toOwnedSlice(self.arena.allocator()),
+                .implemented_traits = try implemented_traits.toOwnedSlice(self.arena.allocator()),
+                .type_constraints = try type_constraints.toOwnedSlice(self.arena.allocator()),
                 .def = def,
-                .methods = if (def == .error_newtype) &.{} else try methods.toOwnedSlice(self.allocator),
+                .methods = if (def == .error_newtype) &.{} else try methods.toOwnedSlice(self.arena.allocator()),
             },
         };
     }
@@ -521,7 +528,7 @@ pub const Parser = struct {
                                 return ast.TypeDef{
                                     .error_newtype = .{
                                         .name = name_tok.lexeme,
-                                        .params = try params.toOwnedSlice(self.allocator),
+                                        .params = try params.toOwnedSlice(self.arena.allocator()),
                                         .methods = &.{},
                                     },
                                 };
@@ -559,7 +566,7 @@ pub const Parser = struct {
         _ = self.advance();
         if (self.check(.r_paren)) {
             _ = self.advance();
-            const ctors = self.allocator.alloc(ast.ConstructorDef, 1) catch return null;
+            const ctors = self.arena.allocator().alloc(ast.ConstructorDef, 1) catch return null;
             ctors[0] = .{
                 .location = tokenLoc(name_tok),
                 .name = name_tok.lexeme,
@@ -573,18 +580,18 @@ pub const Parser = struct {
         if (self.check(.identifier) and self.current + 1 < self.tokens.len and self.tokens[self.current + 1].type == .colon) {
             var fields = std.ArrayList(ast.ConstructorField).empty;
             self.parseConstructorFieldList(&fields) catch {
-                fields.deinit(self.allocator);
+                fields.deinit(self.arena.allocator());
                 return null;
             };
             _ = self.expect(.r_paren, "expected ')' to close constructor fields") catch {
-                fields.deinit(self.allocator);
+                fields.deinit(self.arena.allocator());
                 return null;
             };
-            const ctors = self.allocator.alloc(ast.ConstructorDef, 1) catch return null;
+            const ctors = self.arena.allocator().alloc(ast.ConstructorDef, 1) catch return null;
             ctors[0] = .{
                 .location = tokenLoc(name_tok),
                 .name = name_tok.lexeme,
-                .fields = fields.toOwnedSlice(self.allocator) catch return null,
+                .fields = fields.toOwnedSlice(self.arena.allocator()) catch return null,
                 .return_type = null,
             };
             return ast.TypeDef{
@@ -594,32 +601,32 @@ pub const Parser = struct {
         const first_type = self.parseType() catch return null;
         if (self.check(.comma)) {
             var fields = std.ArrayList(ast.ConstructorField).empty;
-            fields.append(self.allocator, .{
+            fields.append(self.arena.allocator(), .{
                 .name = null,
                 .ty = first_type,
             }) catch return null;
             while (self.matchToken(.comma)) {
                 const ty = self.parseType() catch {
-                    fields.deinit(self.allocator);
+                    fields.deinit(self.arena.allocator());
                     return null;
                 };
-                fields.append(self.allocator, .{
+                fields.append(self.arena.allocator(), .{
                     .name = null,
                     .ty = ty,
                 }) catch {
-                    fields.deinit(self.allocator);
+                    fields.deinit(self.arena.allocator());
                     return null;
                 };
             }
             _ = self.expect(.r_paren, "expected ')' to close constructor fields") catch {
-                fields.deinit(self.allocator);
+                fields.deinit(self.arena.allocator());
                 return null;
             };
-            const ctors = self.allocator.alloc(ast.ConstructorDef, 1) catch return null;
+            const ctors = self.arena.allocator().alloc(ast.ConstructorDef, 1) catch return null;
             ctors[0] = .{
                 .location = tokenLoc(name_tok),
                 .name = name_tok.lexeme,
-                .fields = fields.toOwnedSlice(self.allocator) catch return null,
+                .fields = fields.toOwnedSlice(self.arena.allocator()) catch return null,
                 .return_type = null,
             };
             return ast.TypeDef{
@@ -642,7 +649,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 const ty = self.parseType() catch return null;
                 var fields = std.ArrayList(ast.RecordFieldType).empty;
-                fields.append(self.allocator, .{
+                fields.append(self.arena.allocator(), .{
                     .name = name.lexeme,
                     .ty = ty,
                 }) catch return null;
@@ -651,14 +658,14 @@ pub const Parser = struct {
                     const field_name = self.expect(.identifier, "expected field name") catch return null;
                     _ = self.expect(.colon, "expected ':'") catch return null;
                     const field_ty = self.parseType() catch return null;
-                    fields.append(self.allocator, .{
+                    fields.append(self.arena.allocator(), .{
                         .name = field_name.lexeme,
                         .ty = field_ty,
                     }) catch return null;
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch return null;
                 return ast.TypeDef{
-                    .record = .{ .fields = fields.toOwnedSlice(self.allocator) catch return null },
+                    .record = .{ .fields = fields.toOwnedSlice(self.arena.allocator()) catch return null },
                 };
             } else {
                 return null;
@@ -670,12 +677,12 @@ pub const Parser = struct {
     /// 解析 ADT 构造器列表（以 | 分隔）
     fn parseAdtBody(self: *Parser) ParserError!ast.TypeDef {
         var constructors = std.ArrayList(ast.ConstructorDef).empty;
-        try constructors.append(self.allocator, try self.parseConstructorDef());
+        try constructors.append(self.arena.allocator(), try self.parseConstructorDef());
         while (self.matchToken(.pipe)) {
-            try constructors.append(self.allocator, try self.parseConstructorDef());
+            try constructors.append(self.arena.allocator(), try self.parseConstructorDef());
         }
         return ast.TypeDef{
-            .adt = .{ .constructors = try constructors.toOwnedSlice(self.allocator) },
+            .adt = .{ .constructors = try constructors.toOwnedSlice(self.arena.allocator()) },
         };
     }
 
@@ -696,16 +703,16 @@ pub const Parser = struct {
         return ast.ConstructorDef{
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
-            .fields = try fields.toOwnedSlice(self.allocator),
+            .fields = try fields.toOwnedSlice(self.arena.allocator()),
             .return_type = return_type,
         };
     }
 
     /// 解析构造器字段列表（逗号分隔）
     fn parseConstructorFieldList(self: *Parser, fields: *std.ArrayList(ast.ConstructorField)) ParserError!void {
-        try fields.append(self.allocator, try self.parseConstructorField());
+        try fields.append(self.arena.allocator(), try self.parseConstructorField());
         while (self.matchToken(.comma)) {
-            try fields.append(self.allocator, try self.parseConstructorField());
+            try fields.append(self.arena.allocator(), try self.parseConstructorField());
         }
     }
 
@@ -751,9 +758,9 @@ pub const Parser = struct {
         _ = self.expect(.l_brace, "expected '{' to start trait body") catch {};
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             if (self.check(.kw_type)) {
-                try associated_types.append(self.allocator, try self.parseAssociatedType());
+                try associated_types.append(self.arena.allocator(), try self.parseAssociatedType());
             } else {
-                try methods.append(self.allocator, try self.parseMethodDecl());
+                try methods.append(self.arena.allocator(), try self.parseMethodDecl());
             }
         }
         _ = self.expect(.r_brace, "expected '}' to close trait body") catch {};
@@ -762,10 +769,10 @@ pub const Parser = struct {
                 .location = tokenLoc(trait_tok),
                 .visibility = visibility,
                 .name = name_tok.lexeme,
-                .type_params = try type_params.toOwnedSlice(self.allocator),
-                .parents = try parents.toOwnedSlice(self.allocator),
-                .associated_types = try associated_types.toOwnedSlice(self.allocator),
-                .methods = try methods.toOwnedSlice(self.allocator),
+                .type_params = try type_params.toOwnedSlice(self.arena.allocator()),
+                .parents = try parents.toOwnedSlice(self.arena.allocator()),
+                .associated_types = try associated_types.toOwnedSlice(self.arena.allocator()),
+                .methods = try methods.toOwnedSlice(self.arena.allocator()),
             },
         };
     }
@@ -828,8 +835,8 @@ pub const Parser = struct {
         return ast.MethodDecl{
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
-            .type_params = try type_params.toOwnedSlice(self.allocator),
-            .params = try params.toOwnedSlice(self.allocator),
+            .type_params = try type_params.toOwnedSlice(self.arena.allocator()),
+            .params = try params.toOwnedSlice(self.arena.allocator()),
             .return_type = return_type,
             .body = body,
             .is_override = is_override,
@@ -843,30 +850,30 @@ pub const Parser = struct {
         const use_tok = self.advance();
         var module_path = std.ArrayList([]const u8).empty;
         const first = try self.expect(.identifier, "expected module name");
-        try module_path.append(self.allocator, first.lexeme);
+        try module_path.append(self.arena.allocator(), first.lexeme);
         while (self.matchToken(.dot)) {
             if (self.check(.l_brace)) break;
             const part = try self.expect(.identifier, "expected module path segment");
-            try module_path.append(self.allocator, part.lexeme);
+            try module_path.append(self.arena.allocator(), part.lexeme);
         }
         var items: ?[]ast.ImportItem = null;
         if (self.check(.l_brace) or self.matchToken(.dot)) {
             _ = self.expect(.l_brace, "expected '{'") catch {};
             var item_list = std.ArrayList(ast.ImportItem).empty;
             if (!self.check(.r_brace)) {
-                try item_list.append(self.allocator, try self.parseImportItem());
+                try item_list.append(self.arena.allocator(), try self.parseImportItem());
                 while (self.matchToken(.comma)) {
                     if (self.check(.r_brace)) break;
-                    try item_list.append(self.allocator, try self.parseImportItem());
+                    try item_list.append(self.arena.allocator(), try self.parseImportItem());
                 }
             }
             _ = self.expect(.r_brace, "expected '}'") catch {};
-            items = try item_list.toOwnedSlice(self.allocator);
+            items = try item_list.toOwnedSlice(self.arena.allocator());
         }
         return ast.Decl{
             .import_decl = .{
                 .location = tokenLoc(use_tok),
-                .module_path = try module_path.toOwnedSlice(self.allocator),
+                .module_path = try module_path.toOwnedSlice(self.arena.allocator()),
                 .items = items,
                 .visibility = visibility,
             },
@@ -904,9 +911,9 @@ pub const Parser = struct {
 
     /// 解析类型参数列表（逗号分隔）
     fn parseTypeParamList(self: *Parser, type_params: *std.ArrayList(ast.TypeParam)) ParserError!void {
-        try type_params.append(self.allocator, try self.parseTypeParam());
+        try type_params.append(self.arena.allocator(), try self.parseTypeParam());
         while (self.matchToken(.comma)) {
-            try type_params.append(self.allocator, try self.parseTypeParam());
+            try type_params.append(self.arena.allocator(), try self.parseTypeParam());
         }
     }
 
@@ -922,14 +929,14 @@ pub const Parser = struct {
                     _ = self.advance();
                 }
                 const trait_name_tok = try self.expect(.identifier, "expected trait name");
-                try bounds.append(self.allocator, ast.TraitBound{
+                try bounds.append(self.arena.allocator(), ast.TraitBound{
                     .trait_name = trait_name_tok.lexeme,
                     .type_args = &[_]*ast.TypeNode{},
                 });
                 if (has_paren) {
                     while (self.matchToken(.comma)) {
                         const next_trait = try self.expect(.identifier, "expected trait name");
-                        try bounds.append(self.allocator, ast.TraitBound{
+                        try bounds.append(self.arena.allocator(), ast.TraitBound{
                             .trait_name = next_trait.lexeme,
                             .type_args = &[_]*ast.TypeNode{},
                         });
@@ -947,7 +954,7 @@ pub const Parser = struct {
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
             .kind = kind,
-            .bounds = try bounds.toOwnedSlice(self.allocator),
+            .bounds = try bounds.toOwnedSlice(self.arena.allocator()),
         };
     }
 
@@ -988,10 +995,10 @@ pub const Parser = struct {
 
     /// 解析参数列表（逗号分隔，支持尾随逗号）
     fn parseParamList(self: *Parser, params: *std.ArrayList(ast.Param)) ParserError!void {
-        try params.append(self.allocator, try self.parseParam());
+        try params.append(self.arena.allocator(), try self.parseParam());
         while (self.matchToken(.comma)) {
             if (self.check(.r_paren)) break;
-            try params.append(self.allocator, try self.parseParam());
+            try params.append(self.arena.allocator(), try self.parseParam());
         }
     }
 
@@ -1026,9 +1033,9 @@ pub const Parser = struct {
 
     /// 解析 trait 约束列表内部实现（逗号分隔）
     fn parseTraitBoundListInner(self: *Parser, bounds: *std.ArrayList(ast.TraitBound)) ParserError!void {
-        try bounds.append(self.allocator, try self.parseTraitBound());
+        try bounds.append(self.arena.allocator(), try self.parseTraitBound());
         while (self.matchToken(.comma)) {
-            try bounds.append(self.allocator, try self.parseTraitBound());
+            try bounds.append(self.arena.allocator(), try self.parseTraitBound());
         }
     }
 
@@ -1042,15 +1049,15 @@ pub const Parser = struct {
         }
         return ast.TraitBound{
             .trait_name = name_tok.lexeme,
-            .type_args = try type_args.toOwnedSlice(self.allocator),
+            .type_args = try type_args.toOwnedSlice(self.arena.allocator()),
         };
     }
 
     /// 解析类型约束列表（逗号分隔）
     fn parseTypeConstraints(self: *Parser, constraints: *std.ArrayList(ast.TypeConstraint)) ParserError!void {
-        try constraints.append(self.allocator, try self.parseTypeConstraint());
+        try constraints.append(self.arena.allocator(), try self.parseTypeConstraint());
         while (self.matchToken(.comma)) {
-            try constraints.append(self.allocator, try self.parseTypeConstraint());
+            try constraints.append(self.arena.allocator(), try self.parseTypeConstraint());
         }
     }
 
@@ -1069,15 +1076,15 @@ pub const Parser = struct {
     fn parseMethodBlock(self: *Parser, methods: *std.ArrayList(ast.MethodDecl)) ParserError!void {
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             const method = try self.parseMethodDecl();
-            try methods.append(self.allocator, method);
+            try methods.append(self.arena.allocator(), method);
         }
     }
 
     /// 解析类型实参列表（逗号分隔）
     fn parseTypeArgList(self: *Parser, type_args: *std.ArrayList(*ast.TypeNode)) ParserError!void {
-        try type_args.append(self.allocator, try self.parseType());
+        try type_args.append(self.arena.allocator(), try self.parseType());
         while (self.matchToken(.comma)) {
-            try type_args.append(self.allocator, try self.parseType());
+            try type_args.append(self.arena.allocator(), try self.parseType());
         }
     }
 
@@ -1095,10 +1102,10 @@ pub const Parser = struct {
             _ = self.advance();
             var params = std.ArrayList(*ast.TypeNode).empty;
             if (!self.check(.r_paren)) {
-                try params.append(self.allocator, try self.parseType());
+                try params.append(self.arena.allocator(), try self.parseType());
                 while (self.matchToken(.comma)) {
                     if (self.check(.r_paren)) break;
-                    try params.append(self.allocator, try self.parseType());
+                    try params.append(self.arena.allocator(), try self.parseType());
                 }
             }
             _ = self.expect(.r_paren, "expected ')'") catch {};
@@ -1107,7 +1114,7 @@ pub const Parser = struct {
             return self.allocType(ast.TypeNode{
                 .function = .{
                     .location = loc,
-                    .params = try params.toOwnedSlice(self.allocator),
+                    .params = try params.toOwnedSlice(self.arena.allocator()),
                     .return_type = ret,
                 },
             });
@@ -1115,12 +1122,12 @@ pub const Parser = struct {
         const left = try self.parseNullableType();
         if (self.matchToken(.minus_gt)) {
             var params = std.ArrayList(*ast.TypeNode).empty;
-            try params.append(self.allocator, left);
+            try params.append(self.arena.allocator(), left);
             const ret = try self.parseType();
             return self.allocType(ast.TypeNode{
                 .function = .{
                     .location = getTypeNodeLocation(left),
-                    .params = try params.toOwnedSlice(self.allocator),
+                    .params = try params.toOwnedSlice(self.arena.allocator()),
                     .return_type = ret,
                 },
             });
@@ -1181,16 +1188,16 @@ pub const Parser = struct {
         var ty: *ast.TypeNode = undefined;
         if (self.matchToken(.lt)) {
             var args = std.ArrayList(*ast.TypeNode).empty;
-            try args.append(self.allocator, try self.parseType());
+            try args.append(self.arena.allocator(), try self.parseType());
             while (self.matchToken(.comma)) {
-                try args.append(self.allocator, try self.parseType());
+                try args.append(self.arena.allocator(), try self.parseType());
             }
             self.expectCloseAngle("expected '>' to close type parameters") catch {};
             ty = try self.allocType(ast.TypeNode{
                 .generic = .{
                     .location = location,
                     .name = name_tok.lexeme,
-                    .args = try args.toOwnedSlice(self.allocator),
+                    .args = try args.toOwnedSlice(self.arena.allocator()),
                 },
             });
         } else {
@@ -1233,7 +1240,7 @@ pub const Parser = struct {
             const name_tok = try self.expect(.identifier, "expected field name");
             _ = self.expect(.colon, "expected ':'") catch {};
             const ty = try self.parseType();
-            try fields.append(self.allocator, .{
+            try fields.append(self.arena.allocator(), .{
                 .name = name_tok.lexeme,
                 .ty = ty,
             });
@@ -1242,7 +1249,7 @@ pub const Parser = struct {
                 const field_name = try self.expect(.identifier, "expected field name");
                 _ = self.expect(.colon, "expected ':'") catch {};
                 const field_ty = try self.parseType();
-                try fields.append(self.allocator, .{
+                try fields.append(self.arena.allocator(), .{
                     .name = field_name.lexeme,
                     .ty = field_ty,
                 });
@@ -1252,7 +1259,7 @@ pub const Parser = struct {
         return self.allocType(ast.TypeNode{
             .record = .{
                 .location = location,
-                .fields = try fields.toOwnedSlice(self.allocator),
+                .fields = try fields.toOwnedSlice(self.arena.allocator()),
             },
         });
     }
@@ -1606,13 +1613,13 @@ pub const Parser = struct {
                         var ta = std.ArrayList(*ast.TypeNode).empty;
                         try self.parseTypeArgList(&ta);
                         self.expectCloseAngle("expected '>'") catch {};
-                        type_args = try ta.toOwnedSlice(self.allocator);
+                        type_args = try ta.toOwnedSlice(self.arena.allocator());
                     }
                     _ = self.expect(.l_paren, "expected '('") catch {};
                     if (!self.check(.r_paren)) {
-                        try args.append(self.allocator, try self.parseExpr());
+                        try args.append(self.arena.allocator(), try self.parseExpr());
                         while (self.matchToken(.comma)) {
-                            try args.append(self.allocator, try self.parseExpr());
+                            try args.append(self.arena.allocator(), try self.parseExpr());
                         }
                     }
                     _ = self.expect(.r_paren, "expected ')'") catch {};
@@ -1621,7 +1628,7 @@ pub const Parser = struct {
                             .location = tokenLoc(op_tok),
                             .object = expr_node,
                             .method = field_tok.lexeme,
-                            .arguments = try args.toOwnedSlice(self.allocator),
+                            .arguments = try args.toOwnedSlice(self.arena.allocator()),
                             .type_args = type_args,
                         },
                     });
@@ -1645,13 +1652,13 @@ pub const Parser = struct {
                         var ta = std.ArrayList(*ast.TypeNode).empty;
                         try self.parseTypeArgList(&ta);
                         self.expectCloseAngle("expected '>'") catch {};
-                        type_args = try ta.toOwnedSlice(self.allocator);
+                        type_args = try ta.toOwnedSlice(self.arena.allocator());
                     }
                     _ = self.expect(.l_paren, "expected '('") catch {};
                     if (!self.check(.r_paren)) {
-                        try args.append(self.allocator, try self.parseExpr());
+                        try args.append(self.arena.allocator(), try self.parseExpr());
                         while (self.matchToken(.comma)) {
-                            try args.append(self.allocator, try self.parseExpr());
+                            try args.append(self.arena.allocator(), try self.parseExpr());
                         }
                     }
                     _ = self.expect(.r_paren, "expected ')'") catch {};
@@ -1660,7 +1667,7 @@ pub const Parser = struct {
                             .location = tokenLoc(op_tok),
                             .object = expr_node,
                             .method = field_tok.lexeme,
-                            .arguments = try args.toOwnedSlice(self.allocator),
+                            .arguments = try args.toOwnedSlice(self.arena.allocator()),
                             .type_args = type_args,
                         },
                     });
@@ -1677,7 +1684,7 @@ pub const Parser = struct {
                 // 函数调用 f(args)，禁止链式调用 f(a)(b)
                 if (expr_node.* == .call) {
                     const tok = self.peek();
-                    try self.errors.append(self.allocator, ParseError{
+                    try self.errors.append(self.arena.allocator(), ParseError{
                         .line = tok.line,
                         .column = tok.column,
                         .message = "chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first",
@@ -1691,17 +1698,17 @@ pub const Parser = struct {
                     var ta = std.ArrayList(*ast.TypeNode).empty;
                     try self.parseTypeArgList(&ta);
                     if (self.matchToken(.gt)) {
-                        type_args = try ta.toOwnedSlice(self.allocator);
+                        type_args = try ta.toOwnedSlice(self.arena.allocator());
                     } else {
                         self.current -= ta.items.len + 1;
-                        ta.deinit(self.allocator);
+                        ta.deinit(self.arena.allocator());
                     }
                 }
                 _ = self.expect(.l_paren, "expected '('") catch {};
                 if (!self.check(.r_paren)) {
-                    try args.append(self.allocator, try self.parseExpr());
+                    try args.append(self.arena.allocator(), try self.parseExpr());
                     while (self.matchToken(.comma)) {
-                        try args.append(self.allocator, try self.parseExpr());
+                        try args.append(self.arena.allocator(), try self.parseExpr());
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
@@ -1709,7 +1716,7 @@ pub const Parser = struct {
                     .call = .{
                         .location = tokenLoc(call_tok),
                         .callee = expr_node,
-                        .arguments = try args.toOwnedSlice(self.allocator),
+                        .arguments = try args.toOwnedSlice(self.arena.allocator()),
                         .type_args = type_args,
                     },
                 });
@@ -1719,10 +1726,10 @@ pub const Parser = struct {
                 var ta = std.ArrayList(*ast.TypeNode).empty;
                 try self.parseTypeArgList(&ta);
                 self.expectCloseAngle("expected '>'") catch {};
-                const type_args: ?[]*ast.TypeNode = try ta.toOwnedSlice(self.allocator);
+                const type_args: ?[]*ast.TypeNode = try ta.toOwnedSlice(self.arena.allocator());
                 if (expr_node.* == .call) {
                     const tok = self.peek();
-                    try self.errors.append(self.allocator, ParseError{
+                    try self.errors.append(self.arena.allocator(), ParseError{
                         .line = tok.line,
                         .column = tok.column,
                         .message = "chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first",
@@ -1733,9 +1740,9 @@ pub const Parser = struct {
                 var args = std.ArrayList(*ast.Expr).empty;
                 _ = self.expect(.l_paren, "expected '('") catch {};
                 if (!self.check(.r_paren)) {
-                    try args.append(self.allocator, try self.parseExpr());
+                    try args.append(self.arena.allocator(), try self.parseExpr());
                     while (self.matchToken(.comma)) {
-                        try args.append(self.allocator, try self.parseExpr());
+                        try args.append(self.arena.allocator(), try self.parseExpr());
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
@@ -1743,7 +1750,7 @@ pub const Parser = struct {
                     .call = .{
                         .location = tokenLoc(call_tok),
                         .callee = expr_node,
-                        .arguments = try args.toOwnedSlice(self.allocator),
+                        .arguments = try args.toOwnedSlice(self.arena.allocator()),
                         .type_args = type_args,
                     },
                 });
@@ -1951,7 +1958,7 @@ pub const Parser = struct {
         if (i < lit_raw.len) {
             suffix = lit_raw[i..];
         }
-        const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw[0..i]});
+        const neg_raw = try std.fmt.allocPrint(self.arena.allocator(), "-{s}", .{lit_raw[0..i]});
         return self.allocExpr(ast.Expr{
             .int_literal = .{
                 .location = tokenLoc(lit_tok),
@@ -1988,7 +1995,7 @@ pub const Parser = struct {
         } else {
             i = lit_raw.len;
         }
-        const neg_raw = try std.fmt.allocPrint(self.allocator, "-{s}", .{lit_raw[0..i]});
+        const neg_raw = try std.fmt.allocPrint(self.arena.allocator(), "-{s}", .{lit_raw[0..i]});
         return self.allocExpr(ast.Expr{
             .float_literal = .{
                 .location = tokenLoc(lit_tok),
@@ -2050,11 +2057,11 @@ pub const Parser = struct {
         errdefer {
             for (parts.items) |*p| {
                 switch (p.*) {
-                    .literal => |s| self.allocator.free(s),
+                    .literal => |s| self.arena.allocator().free(s),
                     else => {},
                 }
             }
-            parts.deinit(self.allocator);
+            parts.deinit(self.arena.allocator());
         }
         const content = raw[1 .. raw.len - 1];
         var i: usize = 0;
@@ -2071,7 +2078,7 @@ pub const Parser = struct {
                 }
                 if (i > literal_start) {
                     const text = try self.unescapeString(content[literal_start..i]);
-                    try parts.append(self.allocator, ast.InterpolationPart{ .literal = text });
+                    try parts.append(self.arena.allocator(), ast.InterpolationPart{ .literal = text });
                 }
                 i += 1;
                 const expr_start = i;
@@ -2088,7 +2095,7 @@ pub const Parser = struct {
                 }
                 const expr_text = content[expr_start .. i - 1];
                 const expr = try self.parseInterpolationExpr(expr_text);
-                try parts.append(self.allocator, ast.InterpolationPart{ .expression = expr });
+                try parts.append(self.arena.allocator(), ast.InterpolationPart{ .expression = expr });
                 literal_start = i;
                 continue;
             }
@@ -2096,22 +2103,22 @@ pub const Parser = struct {
         }
         if (literal_start < content.len) {
             const text = try self.unescapeString(content[literal_start..]);
-            try parts.append(self.allocator, ast.InterpolationPart{ .literal = text });
+            try parts.append(self.arena.allocator(), ast.InterpolationPart{ .literal = text });
         }
         return self.allocExpr(ast.Expr{
             .string_interpolation = .{
                 .location = tokenLoc(tok),
-                .parts = try parts.toOwnedSlice(self.allocator),
+                .parts = try parts.toOwnedSlice(self.arena.allocator()),
             },
         });
     }
 
     /// 对插值表达式文本进行词法+语法分析，返回其 AST 节点
     fn parseInterpolationExpr(self: *Parser, text: []const u8) ParserError!*ast.Expr {
-        var interp_lex = lexer.Lexer.init(self.allocator, text);
+        var interp_lex = lexer.Lexer.init(self.arena.allocator(), text);
         const tokens = interp_lex.tokenize() catch return error.UnexpectedToken;
-        defer self.allocator.free(tokens);
-        var interp_parser = Parser.init(self.allocator, tokens);
+        defer self.arena.allocator().free(tokens);
+        var interp_parser = Parser.init(self.arena.allocator(), tokens);
         const expr = interp_parser.parseExpr() catch return error.UnexpectedToken;
         return expr;
     }
@@ -2119,57 +2126,57 @@ pub const Parser = struct {
     /// 反转义字符串：处理 \n \t \r \\ \" \{ \} 以及 {{ }} 转义
     fn unescapeString(self: *Parser, text: []const u8) ParserError![]const u8 {
         var result = std.ArrayList(u8).empty;
-        errdefer result.deinit(self.allocator);
+        errdefer result.deinit(self.arena.allocator());
         var i: usize = 0;
         while (i < text.len) {
             if (text[i] == '\\' and i + 1 < text.len) {
                 const next = text[i + 1];
                 switch (next) {
                     'n' => {
-                        try result.append(self.allocator, '\n');
+                        try result.append(self.arena.allocator(), '\n');
                         i += 2;
                     },
                     't' => {
-                        try result.append(self.allocator, '\t');
+                        try result.append(self.arena.allocator(), '\t');
                         i += 2;
                     },
                     'r' => {
-                        try result.append(self.allocator, '\r');
+                        try result.append(self.arena.allocator(), '\r');
                         i += 2;
                     },
                     '\\' => {
-                        try result.append(self.allocator, '\\');
+                        try result.append(self.arena.allocator(), '\\');
                         i += 2;
                     },
                     '"' => {
-                        try result.append(self.allocator, '"');
+                        try result.append(self.arena.allocator(), '"');
                         i += 2;
                     },
                     '{' => {
-                        try result.append(self.allocator, '{');
+                        try result.append(self.arena.allocator(), '{');
                         i += 2;
                     },
                     '}' => {
-                        try result.append(self.allocator, '}');
+                        try result.append(self.arena.allocator(), '}');
                         i += 2;
                     },
                     else => {
-                        try result.append(self.allocator, text[i]);
+                        try result.append(self.arena.allocator(), text[i]);
                         i += 1;
                     },
                 }
             } else if (text[i] == '{' and i + 1 < text.len and text[i + 1] == '{') {
-                try result.append(self.allocator, '{');
+                try result.append(self.arena.allocator(), '{');
                 i += 2;
             } else if (text[i] == '}' and i + 1 < text.len and text[i + 1] == '}') {
-                try result.append(self.allocator, '}');
+                try result.append(self.arena.allocator(), '}');
                 i += 2;
             } else {
-                try result.append(self.allocator, text[i]);
+                try result.append(self.arena.allocator(), text[i]);
                 i += 1;
             }
         }
-        return result.toOwnedSlice(self.allocator);
+        return result.toOwnedSlice(self.arena.allocator());
     }
 
     /// 解析 fun 关键字开头的 lambda：fun(params) body
@@ -2187,7 +2194,7 @@ pub const Parser = struct {
         return self.allocExpr(ast.Expr{
             .lambda = .{
                 .location = location,
-                .params = try params.toOwnedSlice(self.allocator),
+                .params = try params.toOwnedSlice(self.arena.allocator()),
                 .body = body,
                 .is_async = is_async,
             },
@@ -2230,7 +2237,7 @@ pub const Parser = struct {
                 }
                 return err;
             };
-            try arms.append(self.allocator, arm);
+            try arms.append(self.arena.allocator(), arm);
             _ = self.matchToken(.comma);
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
@@ -2238,7 +2245,7 @@ pub const Parser = struct {
             .match = .{
                 .location = tokenLoc(match_tok),
                 .scrutinee = scrutinee,
-                .arms = try arms.toOwnedSlice(self.allocator),
+                .arms = try arms.toOwnedSlice(self.arena.allocator()),
             },
         });
     }
@@ -2258,11 +2265,11 @@ pub const Parser = struct {
             const stmt_tok = self.peek();
             const stmt = try self.parseStmt();
             var stmts = std.ArrayList(*ast.Stmt).empty;
-            try stmts.append(self.allocator, stmt);
+            try stmts.append(self.arena.allocator(), stmt);
             break :blk try self.allocExpr(ast.Expr{
                 .block = .{
                     .location = tokenLoc(stmt_tok),
-                    .statements = try stmts.toOwnedSlice(self.allocator),
+                    .statements = try stmts.toOwnedSlice(self.arena.allocator()),
                     .trailing_expr = null,
                 },
             });
@@ -2304,14 +2311,14 @@ pub const Parser = struct {
         _ = self.expect(.l_brace, "expected '{'") catch {};
         var arms = std.ArrayList(ast.SelectArm).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
-            try arms.append(self.allocator, try self.parseSelectArm());
+            try arms.append(self.arena.allocator(), try self.parseSelectArm());
             _ = self.matchToken(.comma);
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
         return self.allocExpr(ast.Expr{
             .select = .{
                 .location = tokenLoc(select_tok),
-                .arms = try arms.toOwnedSlice(self.allocator),
+                .arms = try arms.toOwnedSlice(self.arena.allocator()),
             },
         });
     }
@@ -2361,13 +2368,13 @@ pub const Parser = struct {
         _ = self.expect(.l_brace, "expected '{'") catch {};
         var methods = std.ArrayList(ast.MethodDecl).empty;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
-            try methods.append(self.allocator, try self.parseMethodDecl());
+            try methods.append(self.arena.allocator(), try self.parseMethodDecl());
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
         return self.allocExpr(ast.Expr{
             .inline_trait_value = .{
                 .location = tokenLoc(trait_tok),
-                .methods = try methods.toOwnedSlice(self.allocator),
+                .methods = try methods.toOwnedSlice(self.arena.allocator()),
             },
         });
     }
@@ -2377,17 +2384,17 @@ pub const Parser = struct {
         const bracket_tok = self.previous();
         var elements = std.ArrayList(*ast.Expr).empty;
         if (!self.check(.r_bracket)) {
-            try elements.append(self.allocator, try self.parseExpr());
+            try elements.append(self.arena.allocator(), try self.parseExpr());
             while (self.matchToken(.comma)) {
                 if (self.check(.r_bracket)) break;
-                try elements.append(self.allocator, try self.parseExpr());
+                try elements.append(self.arena.allocator(), try self.parseExpr());
             }
         }
         _ = self.expect(.r_bracket, "expected ']'") catch {};
         return self.allocExpr(ast.Expr{
             .array_literal = .{
                 .location = tokenLoc(bracket_tok),
-                .elements = try elements.toOwnedSlice(self.allocator),
+                .elements = try elements.toOwnedSlice(self.arena.allocator()),
             },
         });
     }
@@ -2407,7 +2414,7 @@ pub const Parser = struct {
                     trailing_expr = stmt.expression.expr;
                     break;
                 }
-                try statements.append(self.allocator, stmt);
+                try statements.append(self.arena.allocator(), stmt);
             } else {
                 const stmt = self.parseExprOrAssignmentStmt() catch |err| {
                     return err;
@@ -2416,14 +2423,14 @@ pub const Parser = struct {
                     trailing_expr = stmt.expression.expr;
                     break;
                 }
-                try statements.append(self.allocator, stmt);
+                try statements.append(self.arena.allocator(), stmt);
             }
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
         return self.allocExpr(ast.Expr{
             .block = .{
                 .location = location,
-                .statements = try statements.toOwnedSlice(self.allocator),
+                .statements = try statements.toOwnedSlice(self.arena.allocator()),
                 .trailing_expr = trailing_expr,
             },
         });
@@ -2454,7 +2461,7 @@ pub const Parser = struct {
                     const field_name = try self.expect(.identifier, "expected field name");
                     _ = self.expect(.colon, "expected ':'") catch {};
                     const field_value = try self.parseExpr();
-                    try updates.append(self.allocator, .{
+                    try updates.append(self.arena.allocator(), .{
                         .name = field_name.lexeme,
                         .value = field_value,
                     });
@@ -2464,7 +2471,7 @@ pub const Parser = struct {
                     .record_extend = .{
                         .location = location,
                         .base = base_expr,
-                        .updates = try updates.toOwnedSlice(self.allocator),
+                        .updates = try updates.toOwnedSlice(self.arena.allocator()),
                     },
                 });
             }
@@ -2474,7 +2481,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 const value = try self.parseExpr();
                 var fields = std.ArrayList(ast.RecordFieldExpr).empty;
-                try fields.append(self.allocator, .{
+                try fields.append(self.arena.allocator(), .{
                     .name = name_tok.lexeme,
                     .value = value,
                 });
@@ -2486,14 +2493,14 @@ pub const Parser = struct {
                         const base_expr = try self.parseExpr();
                         var updates = std.ArrayList(ast.RecordFieldExpr).empty;
                         for (fields.items) |f| {
-                            try updates.append(self.allocator, f);
+                            try updates.append(self.arena.allocator(), f);
                         }
                         while (self.matchToken(.comma)) {
                             if (self.check(.r_paren)) break;
                             const field_name = try self.expect(.identifier, "expected field name");
                             _ = self.expect(.colon, "expected ':'") catch {};
                             const field_value = try self.parseExpr();
-                            try updates.append(self.allocator, .{
+                            try updates.append(self.arena.allocator(), .{
                                 .name = field_name.lexeme,
                                 .value = field_value,
                             });
@@ -2503,14 +2510,14 @@ pub const Parser = struct {
                             .record_extend = .{
                                 .location = location,
                                 .base = base_expr,
-                                .updates = try updates.toOwnedSlice(self.allocator),
+                                .updates = try updates.toOwnedSlice(self.arena.allocator()),
                             },
                         });
                     }
                     const field_name = try self.expect(.identifier, "expected field name");
                     _ = self.expect(.colon, "expected ':'") catch {};
                     const field_value = try self.parseExpr();
-                    try fields.append(self.allocator, .{
+                    try fields.append(self.arena.allocator(), .{
                         .name = field_name.lexeme,
                         .value = field_value,
                     });
@@ -2519,7 +2526,7 @@ pub const Parser = struct {
                 return self.allocExpr(ast.Expr{
                     .record_literal = .{
                         .location = location,
-                        .fields = try fields.toOwnedSlice(self.allocator),
+                        .fields = try fields.toOwnedSlice(self.arena.allocator()),
                     },
                 });
             }
@@ -2529,7 +2536,7 @@ pub const Parser = struct {
         if (self.matchToken(.comma)) {
             // 匿名元组不被允许，报告错误并跳过剩余
             const loc = tokenLoc(lparen_tok);
-            try self.errors.append(self.allocator, ParseError{
+            try self.errors.append(self.arena.allocator(), ParseError{
                 .line = loc.line,
                 .column = loc.column,
                 .message = "anonymous tuples are not allowed; use named record fields like (name: value, ...)",
@@ -2570,7 +2577,7 @@ pub const Parser = struct {
         return self.allocExpr(ast.Expr{
             .lambda = .{
                 .location = location,
-                .params = params.toOwnedSlice(self.allocator) catch return null,
+                .params = params.toOwnedSlice(self.arena.allocator()) catch return null,
                 .body = body,
             },
         }) catch return null;
@@ -2578,10 +2585,10 @@ pub const Parser = struct {
 
     /// 解析 lambda 参数列表（逗号分隔）
     fn parseLambdaParamList(self: *Parser, params: *std.ArrayList(ast.Param)) ParserError!void {
-        try params.append(self.allocator, try self.parseLambdaParam());
+        try params.append(self.arena.allocator(), try self.parseLambdaParam());
         while (self.matchToken(.comma)) {
             if (self.check(.r_paren)) break;
-            try params.append(self.allocator, try self.parseLambdaParam());
+            try params.append(self.arena.allocator(), try self.parseLambdaParam());
         }
     }
 
@@ -2710,9 +2717,9 @@ pub const Parser = struct {
                 _ = self.advance();
                 var patterns = std.ArrayList(*ast.Pattern).empty;
                 if (!self.check(.r_paren)) {
-                    try patterns.append(self.allocator, try self.parsePattern());
+                    try patterns.append(self.arena.allocator(), try self.parsePattern());
                     while (self.matchToken(.comma)) {
-                        try patterns.append(self.allocator, try self.parsePattern());
+                        try patterns.append(self.arena.allocator(), try self.parsePattern());
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
@@ -2720,7 +2727,7 @@ pub const Parser = struct {
                     .constructor = .{
                         .location = tokenLoc(name_tok),
                         .name = name_tok.lexeme,
-                        .patterns = try patterns.toOwnedSlice(self.allocator),
+                        .patterns = try patterns.toOwnedSlice(self.arena.allocator()),
                     },
                 });
             }
@@ -2737,9 +2744,9 @@ pub const Parser = struct {
                 _ = self.advance();
                 var patterns = std.ArrayList(*ast.Pattern).empty;
                 if (!self.check(.r_paren)) {
-                    try patterns.append(self.allocator, try self.parsePattern());
+                    try patterns.append(self.arena.allocator(), try self.parsePattern());
                     while (self.matchToken(.comma)) {
-                        try patterns.append(self.allocator, try self.parsePattern());
+                        try patterns.append(self.arena.allocator(), try self.parsePattern());
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
@@ -2747,7 +2754,7 @@ pub const Parser = struct {
                     .constructor = .{
                         .location = tokenLoc(name_tok),
                         .name = name_tok.lexeme,
-                        .patterns = try patterns.toOwnedSlice(self.allocator),
+                        .patterns = try patterns.toOwnedSlice(self.arena.allocator()),
                     },
                 });
             }
@@ -2775,7 +2782,7 @@ pub const Parser = struct {
                     // 命名字段模式
                     _ = self.advance();
                     const pattern = try self.parsePattern();
-                    try fields.append(self.allocator, .{
+                    try fields.append(self.arena.allocator(), .{
                         .name = name_tok.lexeme,
                         .pattern = pattern,
                     });
@@ -2784,7 +2791,7 @@ pub const Parser = struct {
                         const field_name = try self.expect(.identifier, "expected field name");
                         _ = self.expect(.colon, "expected ':'") catch {};
                         const field_pattern = try self.parsePattern();
-                        try fields.append(self.allocator, .{
+                        try fields.append(self.arena.allocator(), .{
                             .name = field_name.lexeme,
                             .pattern = field_pattern,
                         });
@@ -2793,7 +2800,7 @@ pub const Parser = struct {
                     return self.allocPattern(ast.Pattern{
                         .record = .{
                             .location = location,
-                            .fields = try fields.toOwnedSlice(self.allocator),
+                            .fields = try fields.toOwnedSlice(self.arena.allocator()),
                         },
                     });
                 }
@@ -2801,8 +2808,8 @@ pub const Parser = struct {
             }
             // 位置模式：用数字字符串作为字段名
             const first_pattern = try self.parsePattern();
-            const key0 = try self.allocator.dupe(u8, "0");
-            try fields.append(self.allocator, .{
+            const key0 = try self.arena.allocator().dupe(u8, "0");
+            try fields.append(self.arena.allocator(), .{
                 .name = key0,
                 .pattern = first_pattern,
             });
@@ -2810,8 +2817,8 @@ pub const Parser = struct {
             while (self.matchToken(.comma)) {
                 if (self.check(.r_paren)) break;
                 const next_pattern = try self.parsePattern();
-                const k = try intToKey(self.allocator, idx);
-                try fields.append(self.allocator, .{
+                const k = try intToKey(self.arena.allocator(), idx);
+                try fields.append(self.arena.allocator(), .{
                     .name = k,
                     .pattern = next_pattern,
                 });
@@ -2822,7 +2829,7 @@ pub const Parser = struct {
         return self.allocPattern(ast.Pattern{
             .record = .{
                 .location = location,
-                .fields = try fields.toOwnedSlice(self.allocator),
+                .fields = try fields.toOwnedSlice(self.arena.allocator()),
             },
         });
     }
@@ -2912,7 +2919,7 @@ pub const Parser = struct {
             const lambda_expr = try self.allocExpr(ast.Expr{
                 .lambda = .{
                     .location = tokenLoc(fun_tok),
-                    .params = try params.toOwnedSlice(self.allocator),
+                    .params = try params.toOwnedSlice(self.arena.allocator()),
                     .body = body,
                     .return_type = return_type,
                 },
@@ -2937,7 +2944,7 @@ pub const Parser = struct {
         const lambda_expr = try self.allocExpr(ast.Expr{
             .lambda = .{
                 .location = tokenLoc(fun_tok),
-                .params = try params.toOwnedSlice(self.allocator),
+                .params = try params.toOwnedSlice(self.arena.allocator()),
                 .body = body,
             },
         });

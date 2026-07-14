@@ -3,47 +3,15 @@
 //! 提供命令行工具，支持项目脚手架初始化（`glue init`）、
 //! 构建并运行项目（`glue run`）、以及带内存检测与运行时追踪的诊断模式（`glue debug`）。
 //! 运行流程：定位项目根 → 解析清单 → 读取入口源码 → 词法分析 → 语法分析 →
-//! 类型检查 → 寄存器式 VM 编译 → 执行，并可选地输出各阶段性能分析报告。
+//! 类型检查，执行后端由 LFE 层流图引擎接管（尚未接入）。
 
 const std = @import("std");
 const builtin = @import("builtin");
 const lexer = @import("lexer");
 const parser = @import("parser");
-const ast = @import("ast");
 const module_loader = @import("module_loader");
-const value = @import("value");
-const slab_allocator = @import("slab_allocator");
-const reg_vm = @import("reg_vm");
 const profiler = @import("profiler");
 const debug_allocator = @import("debug_allocator");
-
-/// 将运行时错误转换为面向用户的中文/英文提示，优先使用 panic 消息
-fn runtimeErrorMessage(err: anyerror, panic_message: ?[]const u8) []const u8 {
-    if (panic_message) |msg| return msg;
-    return switch (err) {
-        error.TypeMismatch => "type error: incompatible types",
-        error.UndefinedVariable => "undefined name",
-        error.ImmutableAssignment => "cannot assign to immutable binding",
-        error.NotCallable => "value is not callable",
-        error.WrongArity => "wrong number of arguments",
-        error.IndexOutOfBounds => "index out of bounds",
-        error.UnsupportedOperation => "unsupported operation",
-        error.OutOfMemory => "out of memory",
-        error.CircularDependency => "circular module dependency",
-        error.FileNotFound => "file not found",
-        error.MissingMain => "undefined entry point",
-        else => @errorName(err),
-    };
-}
-
-/// 向指定输出接口打印运行时诊断信息（文件名、位置、标签与消息）
-fn printRuntimeDiag(iface: anytype, filename: []const u8, loc: ?ast.SourceLocation, label: []const u8, msg: []const u8) void {
-    if (loc) |l| {
-        iface.print("{s}:{d}:{d}: {s}: {s}\n", .{ filename, l.line, l.column, label, msg }) catch {};
-    } else {
-        iface.print("{s}: {s}: {s}\n", .{ filename, label, msg }) catch {};
-    }
-}
 
 /// 项目清单：名称、版本与入口文件路径
 const Manifest = struct {
@@ -56,7 +24,6 @@ const MANIFEST_NAME = "glue.toml";
 const DEFAULT_ENTRY = "src/Main.glue";
 
 var profiler_enabled: bool = false;
-var jit_disabled: bool = false;
 var prof: profiler.Profiler = .{};
 
 /// 向标准错误流打印格式化错误信息
@@ -78,8 +45,7 @@ fn printUsage(io: std.Io) void {
         \\  glue debug         Run with diagnostics (memory checking + runtime trace)
         \\
         \\Options:
-        \\  --profile          Dump full pipeline profile (phases + memory + opcodes) after run
-        \\  --no-jit           Disable JIT compilation (use interpreter only)
+        \\  --profile          Dump full pipeline profile (phases + memory) after run
         \\
     , .{});
 }
@@ -101,14 +67,9 @@ pub fn main(init: std.process.Init) !void {
         const name: ?[]const u8 = if (args_slice.len >= 3) args_slice[2] else null;
         try cmdInit(allocator, io, name);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "debug")) {
-        // 解析 run/debug 之后的选项
         for (args_slice[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--profile")) {
                 profiler_enabled = true;
-            } else if (std.mem.eql(u8, arg, "--no-jit")) {
-                jit_disabled = true;
-            } else if (std.mem.eql(u8, arg, "--jit")) {
-                // 向后兼容：JIT 现已默认启用，此选项为空操作
             } else {
                 printError(io, "error: unknown option '{s}'\n\n", .{arg});
                 printUsage(io);
@@ -284,237 +245,14 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
     }
 }
 
-/// 普通运行模式：使用 slab 分配器与线程缓存执行源码
-fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
-    var slab = slab_allocator.SlabAllocator.initSingleThreaded(allocator);
-    defer slab.deinit();
-    slab.startIdleRecycler(5000, 1000);
-    var cache = slab_allocator.ThreadCache.init(&slab);
-    defer cache.deinit();
-    const value_allocator = cache.allocator();
-    const loader_alloc = value_allocator;
-    var loader = module_loader.ModuleLoader.init(loader_alloc, io);
-    defer loader.deinit();
-    prof = profiler.Profiler.init(profiler_enabled, io);
-    const outcome = executeSource(loader_alloc, &loader, value_allocator, &cache, io, source, entry_path);
-    if (profiler_enabled) {
-        prof.recordSlabStats(
-            slab.live_bytes.load(.monotonic),
-            slab.reserved_bytes.load(.monotonic),
-            slab.live_peak_bytes.load(.monotonic),
-            slab.peak_bytes.load(.monotonic),
-        );
-        const cache_snap = slab.getCacheSnapshot();
-        const evict_stats = slab.getEvictStats();
-        prof.recordSlabCacheStats(
-            cache_snap.empty_count,
-            cache_snap.large_active,
-            cache_snap.large_cached,
-            evict_stats.slabs,
-            evict_stats.large,
-            evict_stats.scans,
-        );
-        const cache_stats = cache.getStats();
-        prof.recordCacheStats(cache_stats.hits, cache_stats.misses, cache_stats.refills, cache_stats.drains);
-        prof.dump(io);
-    }
-    if (outcome == .failed) {
-        loader.deinit();
-        cache.deinit();
-        slab.deinit();
-        std.process.exit(1);
-    }
-}
-
-/// 诊断运行模式：使用调试分配器检测内存泄漏与双重释放
-fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
-    _ = allocator;
-    var dbg = debug_allocator.DebugAllocator.initSingleThreaded();
-    const dbg_alloc = dbg.allocator();
-    {
-        var slab = slab_allocator.SlabAllocator.initSingleThreaded(dbg_alloc);
-        defer slab.deinit();
-        slab.startIdleRecycler(5000, 1000);
-        var cache = slab_allocator.ThreadCache.init(&slab);
-        defer cache.deinit();
-        const value_allocator = cache.allocator();
-        var loader = module_loader.ModuleLoader.init(value_allocator, io);
-        defer loader.deinit();
-        prof = profiler.Profiler.init(profiler_enabled, io);
-        _ = executeSource(value_allocator, &loader, value_allocator, &cache, io, source, entry_path);
-        if (profiler_enabled) {
-            prof.recordSlabStats(
-                slab.live_bytes.load(.monotonic),
-                slab.reserved_bytes.load(.monotonic),
-                slab.live_peak_bytes.load(.monotonic),
-                slab.peak_bytes.load(.monotonic),
-            );
-            const cache_snap = slab.getCacheSnapshot();
-            const evict_stats = slab.getEvictStats();
-            prof.recordSlabCacheStats(
-                cache_snap.empty_count,
-                cache_snap.large_active,
-                cache_snap.large_cached,
-                evict_stats.slabs,
-                evict_stats.large,
-                evict_stats.scans,
-            );
-            const cache_stats = cache.getStats();
-            prof.recordCacheStats(cache_stats.hits, cache_stats.misses, cache_stats.refills, cache_stats.drains);
-            prof.dump(io);
-        }
-    }
-    const leaked = dbg.deinit();
-    if (leaked == .leak) {
-        printError(io, "[GLUE_GPA] LEAK detected\n", .{});
-    } else {
-        printError(io, "[GLUE_GPA] clean (no leak / no double-free)\n", .{});
-    }
-}
-
-/// VM 执行结果：成功执行 main 或失败
-const VmOutcome = enum { ran_main, failed };
-
-/// 检查模块是否包含 main 函数（VM 执行的入口条件）
-fn vmEligible(module: ast.Module) bool {
-    for (module.declarations) |decl| {
-        switch (decl) {
-            .fun_decl => |f| {
-                if (std.mem.eql(u8, f.name, "main")) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
-/// 尝试在寄存器式 VM 上执行模块：类型检查 → 依赖收集 → 编译 → 运行
-fn tryRunOnVM(
-    allocator: std.mem.Allocator,
-    loader: *module_loader.ModuleLoader,
-    value_allocator: std.mem.Allocator,
-    cache: ?*slab_allocator.ThreadCache,
-    io: std.Io,
-    module: ast.Module,
-    filename: []const u8,
-) VmOutcome {
-    if (!vmEligible(module)) {
-        printError(io, "{s}: error: no 'main' function found\n", .{filename});
-        return .failed;
-    }
-    prof.phaseBegin(.type_check);
-    loader.prepareModule(module) catch |err| switch (err) {
-        error.TypeCheckFailed => {
-            prof.phaseEnd();
-            return .failed;
-        },
-        error.CircularDependency => {
-            prof.phaseEnd();
-            printError(io, "{s}: error: circular module dependency\n", .{filename});
-            return .failed;
-        },
-        else => {
-            prof.phaseEnd();
-            printError(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
-            return .failed;
-        },
-    };
-    prof.phaseEnd();
-    var rmc = reg_vm.RegModuleCompiler.init(allocator);
-    rmc.analysis_db = &loader.analysis_db;
-    defer rmc.deinit();
-    defer rmc.program.deinit();
-    if (module.source_path) |sp| {
-        const sep_idx = std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep) orelse
-            std.mem.lastIndexOfScalar(u8, sp, '/');
-        if (sep_idx) |idx| loader.setSourceDir(sp[0..idx]) catch {};
-    }
-    var deps = std.ArrayList(ast.Module).empty;
-    defer deps.deinit(allocator);
-    var seen = std.StringHashMap(void).init(allocator);
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |k| allocator.free(k.*);
-        seen.deinit();
-    }
-    loader.collectDependencies(module, &deps, &seen) catch |err| {
-        printError(io, "{s}: error: dependency collection failed: {s}\n", .{ filename, @errorName(err) });
-        return .failed;
-    };
-    prof.phaseBegin(.compile);
-    rmc.compileModuleWithDeps(&module, deps.items) catch |err| {
-        prof.phaseEnd();
-        printError(io, "{s}: error: reg-vm compilation failed: {s}\n", .{ filename, @errorName(err) });
-        return .failed;
-    };
-    prof.phaseEnd();
-    const entry = rmc.lookupFn("main") orelse {
-        printError(io, "{s}: error: 'main' function not found after compilation\n", .{filename});
-        return .failed;
-    };
-    return runProgram(value_allocator, cache, io, &rmc.program, entry, filename);
-}
-
-/// 在寄存器式 VM 上执行已编译的程序，处理运行时 panic 与未捕获错误
-fn runProgram(
-    value_allocator: std.mem.Allocator,
-    cache: ?*slab_allocator.ThreadCache,
-    io: std.Io,
-    program: *const reg_vm.reg_chunk_mod.RegProgram,
-    entry: u16,
-    filename: []const u8,
-) VmOutcome {
-    var machine = if (cache) |c| reg_vm.reg_vm.RegVM.initWithCache(c, io) else reg_vm.reg_vm.RegVM.initWithIo(value_allocator, io);
-    defer machine.deinit();
-    if (profiler_enabled) {
-        machine.setProfiler(&prof);
-        prof.setOpcodeNameFn(reg_vm.reg_opcode.opName);
-    }
-    if (!jit_disabled) {
-        machine.enableJit();
-    }
-    prof.phaseBegin(.vm);
-    const result = machine.call(program, entry, &.{}) catch |err| {
-        prof.phaseEnd();
-        const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
-        const loc: ?ast.SourceLocation = if (machine.err_loc.line > 0) machine.err_loc else null;
-        var err_buf: [4096]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-        printRuntimeDiag(&stderr_writer.interface, filename, loc, "runtime panic", msg);
-        stderr_writer.flush() catch {};
-        if (profiler_enabled) {
-            prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
-        }
-        return .failed;
-    };
-    prof.phaseEnd();
-    if (profiler_enabled) {
-        prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
-    }
-    if (result == .throw_val) {
-        const throw_val = result.throw_val.payload;
-        switch (throw_val) {
-            .err => |e| {
-                std.debug.print("Uncaught error: {s}\n", .{e.message});
-                result.release(value_allocator);
-                return .failed;
-            },
-            .ok => {},
-        }
-    }
-    result.release(value_allocator);
-    return .ran_main;
-}
-
 /// 源码执行结果：成功或失败
 const ExecOutcome = enum { failed, ran_main };
 
-/// 完整执行管线：词法分析 → 语法分析 → VM 执行
+/// 完整执行管线：词法分析 → 语法分析 → 类型检查
+/// 执行后端（LFE 层流图引擎）尚未接入，当前仅完成前端阶段
 fn executeSource(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
-    value_allocator: std.mem.Allocator,
-    cache: ?*slab_allocator.ThreadCache,
     io: std.Io,
     source: []const u8,
     filename: []const u8,
@@ -548,9 +286,66 @@ fn executeSource(
     prof.phaseEnd();
     var entry_module = module;
     entry_module.source_path = filename;
-    switch (tryRunOnVM(allocator, loader, value_allocator, cache, io, entry_module, filename)) {
-        .ran_main => return .ran_main,
-        .failed => return .failed,
+
+    // 类型检查阶段
+    prof.phaseBegin(.type_check);
+    loader.prepareModule(entry_module) catch |err| switch (err) {
+        error.TypeCheckFailed => {
+            prof.phaseEnd();
+            return .failed;
+        },
+        error.CircularDependency => {
+            prof.phaseEnd();
+            printError(io, "{s}: error: circular module dependency\n", .{filename});
+            return .failed;
+        },
+        else => {
+            prof.phaseEnd();
+            printError(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
+            return .failed;
+        },
+    };
+    prof.phaseEnd();
+
+    // LFE 执行后端尚未接入
+    printError(io, "{s}: error: LFE execution engine not yet integrated\n", .{filename});
+    return .failed;
+}
+
+/// 普通运行模式：使用 c_allocator 执行源码
+fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
+    var loader = module_loader.ModuleLoader.init(allocator, io);
+    defer loader.deinit();
+    prof = profiler.Profiler.init(profiler_enabled, io);
+    const outcome = executeSource(allocator, &loader, io, source, entry_path);
+    if (profiler_enabled) {
+        prof.dump(io);
+    }
+    if (outcome == .failed) {
+        loader.deinit();
+        std.process.exit(1);
+    }
+}
+
+/// 诊断运行模式：使用调试分配器检测内存泄漏与双重释放
+fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
+    _ = allocator;
+    var dbg = debug_allocator.DebugAllocator.initSingleThreaded();
+    const dbg_alloc = dbg.allocator();
+    {
+        var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
+        defer loader.deinit();
+        prof = profiler.Profiler.init(profiler_enabled, io);
+        _ = executeSource(dbg_alloc, &loader, io, source, entry_path);
+        if (profiler_enabled) {
+            prof.dump(io);
+        }
+    }
+    const leaked = dbg.deinit();
+    if (leaked == .leak) {
+        printError(io, "[GLUE_GPA] LEAK detected\n", .{});
+    } else {
+        printError(io, "[GLUE_GPA] clean (no leak / no double-free)\n", .{});
     }
 }
 

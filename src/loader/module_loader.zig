@@ -1,6 +1,6 @@
 //! 模块加载器。
 //!
-//! 负责从源文件或标准库加载 Glue 模块，解析、类型检查并运行分析 passes，
+//! 负责从源文件加载 Glue 模块，解析、类型检查并运行分析 passes，
 //! 同时处理模块间的依赖收集与循环依赖检测。维护源目录上下文以便
 //! 解析相对导入路径，并将已加载模块与所属 arena 保留至生命周期结束。
 
@@ -9,12 +9,7 @@ const ast = @import("ast");
 const lexer_mod = @import("lexer");
 const parser_mod = @import("parser");
 const type_check = @import("sema");
-const stdlib = @import("stdlib");
 const analysis_db_mod = @import("analysis_db");
-const arena_allocator = @import("arena_allocator");
-
-/// 标准库目录标记，用于在 source_dir 中标识当前处于标准库上下文。
-const STDLIB_DIR_MARKER = "<stdlib>";
 
 /// 模块加载器，负责模块的解析、类型检查、依赖分析与生命周期管理。
 pub const ModuleLoader = struct {
@@ -26,7 +21,7 @@ pub const ModuleLoader = struct {
     loading_modules: std.StringHashMap(void),
     loaded_modules: std.StringHashMap(ast.Module),
     retained_sources: std.ArrayList([]const u8),
-    retained_arenas: std.ArrayList(arena_allocator.ArenaAllocator),
+    retained_arenas: std.ArrayList(std.heap.ArenaAllocator),
 
     /// 初始化加载器，创建类型推导器与分析数据库。
     pub fn init(allocator: std.mem.Allocator, io: ?std.Io) ModuleLoader {
@@ -170,80 +165,45 @@ pub const ModuleLoader = struct {
     }
 
     /// 根据模块路径加载模块源文本并解析。
-    /// 查找顺序：标准库内嵌源 → 文件系统（flat.glue 或 pack.glue）→ 标准库回退。
+    /// 查找顺序：文件系统 flat.glue → pack.glue，找不到则返回 FileNotFound。
     fn loadModule(self: *ModuleLoader, module_path: [][]const u8) anyerror!void {
-        const in_stdlib = if (self.current_source_dir) |d|
-            std.mem.eql(u8, d, STDLIB_DIR_MARKER)
-        else
-            false;
-
-        // 标准库上下文下直接查找内嵌源
-        if (in_stdlib and module_path.len == 1) {
-            if (stdlib.lookup(module_path[0])) |source| {
-                const synthetic_path = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}{c}{s}.glue",
-                    .{ STDLIB_DIR_MARKER, std.fs.path.sep, module_path[0] },
-                );
-                try self.retained_sources.append(self.allocator, synthetic_path);
-                try self.parseAndPrepare(source, module_path[0], synthetic_path);
-                return;
-            }
-        }
-
         // 文件系统查找：尝试 flat.glue 与 pack.glue 两种布局
         if (self.io) |io| {
             if (self.current_source_dir) |source_dir| {
-                if (!std.mem.eql(u8, source_dir, STDLIB_DIR_MARKER)) {
-                    var file_path = std.ArrayList(u8).empty;
-                    defer file_path.deinit(self.allocator);
-                    try file_path.appendSlice(self.allocator, source_dir);
-                    for (module_path) |component| {
-                        try file_path.append(self.allocator, std.fs.path.sep);
-                        try file_path.appendSlice(self.allocator, component);
-                    }
-                    const cwd = std.Io.Dir.cwd();
-                    const flat_path = try std.fmt.allocPrint(self.allocator, "{s}.glue", .{file_path.items});
-                    defer self.allocator.free(flat_path);
-                    const pack_path = try std.fmt.allocPrint(
-                        self.allocator,
-                        "{s}{c}pack.glue",
-                        .{ file_path.items, std.fs.path.sep },
-                    );
-                    defer self.allocator.free(pack_path);
-                    const flat_exists = if (cwd.access(io, flat_path, .{})) true else |_| false;
-                    const dir_exists = if (cwd.access(io, pack_path, .{})) true else |_| false;
-                    const resolved_path: ?[]const u8 = if (flat_exists)
-                        flat_path
-                    else if (dir_exists)
-                        pack_path
-                    else
-                        null;
-                    if (resolved_path) |path| {
-                        const source = cwd.readFileAlloc(io, path, self.allocator, .unlimited) catch {
-                            return error.FileNotFound;
-                        };
-                        try self.retained_sources.append(self.allocator, source);
-                        const full_path = try self.allocator.dupe(u8, path);
-                        try self.retained_sources.append(self.allocator, full_path);
-                        try self.parseAndPrepare(source, module_path[0], full_path);
-                        return;
-                    }
+                var file_path = std.ArrayList(u8).empty;
+                defer file_path.deinit(self.allocator);
+                try file_path.appendSlice(self.allocator, source_dir);
+                for (module_path) |component| {
+                    try file_path.append(self.allocator, std.fs.path.sep);
+                    try file_path.appendSlice(self.allocator, component);
                 }
-            }
-        }
-
-        // 最终回退到标准库内嵌源
-        if (module_path.len == 1) {
-            if (stdlib.lookup(module_path[0])) |source| {
-                const synthetic_path = try std.fmt.allocPrint(
+                const cwd = std.Io.Dir.cwd();
+                const flat_path = try std.fmt.allocPrint(self.allocator, "{s}.glue", .{file_path.items});
+                defer self.allocator.free(flat_path);
+                const pack_path = try std.fmt.allocPrint(
                     self.allocator,
-                    "{s}{c}{s}.glue",
-                    .{ STDLIB_DIR_MARKER, std.fs.path.sep, module_path[0] },
+                    "{s}{c}pack.glue",
+                    .{ file_path.items, std.fs.path.sep },
                 );
-                try self.retained_sources.append(self.allocator, synthetic_path);
-                try self.parseAndPrepare(source, module_path[0], synthetic_path);
-                return;
+                defer self.allocator.free(pack_path);
+                const flat_exists = if (cwd.access(io, flat_path, .{})) true else |_| false;
+                const dir_exists = if (cwd.access(io, pack_path, .{})) true else |_| false;
+                const resolved_path: ?[]const u8 = if (flat_exists)
+                    flat_path
+                else if (dir_exists)
+                    pack_path
+                else
+                    null;
+                if (resolved_path) |path| {
+                    const source = cwd.readFileAlloc(io, path, self.allocator, .unlimited) catch {
+                        return error.FileNotFound;
+                    };
+                    try self.retained_sources.append(self.allocator, source);
+                    const full_path = try self.allocator.dupe(u8, path);
+                    try self.retained_sources.append(self.allocator, full_path);
+                    try self.parseAndPrepare(source, module_path[0], full_path);
+                    return;
+                }
             }
         }
         return error.FileNotFound;
@@ -309,8 +269,7 @@ pub const ModuleLoader = struct {
 
         const registered_name = try self.allocator.dupe(u8, module_name);
         try self.loaded_modules.put(registered_name, module);
-        if (p.owns_tokens) self.allocator.free(p.tokens);
-        p.errors.deinit(self.allocator);
+        // tokens 与 errors 均由 arena 管理，偷走 arena 后无需单独释放
     }
 
     /// 递归收集模块的所有依赖（import 与 pack），按依赖顺序追加到 out。

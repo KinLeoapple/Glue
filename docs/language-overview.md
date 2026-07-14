@@ -90,7 +90,7 @@ Glue 的类型系统以 Hindley-Milner 为基础，扩展了代数数据类型 (
 ```
 i8    i16    i32    i64    i128
 u8    u16    u32    u64    u128
-f8    f16   f32    f64    f128
+f16   f32    f64    f128
 bool
 char
 ```
@@ -109,7 +109,6 @@ char
 | `u32`  | 无符号 32 位整数  |                                             |
 | `u64`  | 无符号 64 位整数  |                                             |
 | `u128` | 无符号 128 位整数 |                                             |
-| `f8`   | 8 位半精度浮点数   | binary8 e5m2                                |
 | `f16`  | 16 位半精度浮点数  | IEEE 754-2008 binary16，范围 ±65504，约 3 位十进制精度 |
 | `f32`  | 32 位单精度浮点数  | IEEE 754 binary32，约 7 位十进制精度                |
 | `f64`  | 64 位双精度浮点数  | IEEE 754 binary64，约 15 位十进制精度               |
@@ -1244,7 +1243,7 @@ var x = 3       // ✗ duplicate definition: 'x' is already defined in this scop
 |------|------|
 | I/O | `println`, `print`, `eprintln`, `eprint`, `scanln`, `scan` |
 | 工具 | `Panic`, `eq`, `type` |
-| 类型转换 | `str`, `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`, `f8`, `f16`, `f32`, `f64` |
+| 类型转换 | `str`, `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`, `f16`, `f32`, `f64` |
 | 错误处理 | `Error`, `Ok` |
 
 ```glue
