@@ -2,7 +2,7 @@
 //!
 //! 定义 Glue 语言中承载并发语义的值类型：
 //! - AtomicValue 互斥保护的原子操作容器
-//! - SpawnHandle 异步任务句柄
+//! - AsyncHandle 异步任务句柄
 //! - ChannelValue/SenderValue/ReceiverValue CSP 风格通道通信
 //!
 //! 这些类型持有或传递 Value，属于语义层，依赖 runtime 层的同步原语。
@@ -87,11 +87,11 @@ pub fn atomicDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
 }
 
 // ──────────────────────────────────────────────
-// SpawnHandle
+// AsyncHandle
 // ──────────────────────────────────────────────
 
 /// 异步任务的执行状态。
-pub const SpawnStatus = enum(u8) {
+pub const AsyncStatus = enum(u8) {
     Pending,
     Running,
     Completed,
@@ -103,9 +103,9 @@ pub const SpawnStatus = enum(u8) {
 ///
 /// 调用方可通过原子字段查询任务状态，并在任务完成后消费结果。
 /// 引用计数通过 ObjHeader 统一管理。
-pub const SpawnHandle = struct {
-    header: ObjHeader = .{ .type_tag = .spawn_val },
-    status: std.atomic.Value(SpawnStatus),
+pub const AsyncHandle = struct {
+    header: ObjHeader = .{ .type_tag = .async_val },
+    status: std.atomic.Value(AsyncStatus),
     result: ?Value,
     consumed: std.atomic.Value(bool),
     finished: std.atomic.Value(bool),
@@ -114,9 +114,9 @@ pub const SpawnHandle = struct {
     mutex: Mutex,
     condition: Condition,
 
-    pub fn init(allocator: std.mem.Allocator) SpawnHandle {
-        return SpawnHandle{
-            .status = std.atomic.Value(SpawnStatus).init(.Pending),
+    pub fn init(allocator: std.mem.Allocator) AsyncHandle {
+        return AsyncHandle{
+            .status = std.atomic.Value(AsyncStatus).init(.Pending),
             .result = null,
             .consumed = std.atomic.Value(bool).init(false),
             .finished = std.atomic.Value(bool).init(false),
@@ -127,7 +127,7 @@ pub const SpawnHandle = struct {
     }
 
     /// 释放句柄持有的资源，包括未消费的结果与 panic 信息。
-    pub fn deinit(self: *SpawnHandle, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *AsyncHandle, allocator: std.mem.Allocator) void {
         if (self.result) |r| {
             var v = r;
             v.release(allocator);
@@ -138,9 +138,9 @@ pub const SpawnHandle = struct {
     }
 };
 
-/// SpawnHandle 的 ObjHeader deinit 分派入口。
-pub fn spawnDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
-    const self: *SpawnHandle = @alignCast(@fieldParentPtr("header", obj));
+/// AsyncHandle 的 ObjHeader deinit 分派入口。
+pub fn asyncDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+    const self: *AsyncHandle = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(allocator);
     allocator.destroy(self);
 }
@@ -349,7 +349,7 @@ pub fn receiverDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
 /// 应在运行时初始化阶段调用，使 obj_header.release 能正确分派到各类型的析构函数。
 pub fn registerDeinits() void {
     obj_header.registerDeinit(.atomic_val, atomicDeinit);
-    obj_header.registerDeinit(.spawn_val, spawnDeinit);
+    obj_header.registerDeinit(.async_val, asyncDeinit);
     obj_header.registerDeinit(.channel_val, channelDeinit);
     obj_header.registerDeinit(.sender_val, senderDeinit);
     obj_header.registerDeinit(.receiver_val, receiverDeinit);

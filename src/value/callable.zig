@@ -2,7 +2,7 @@
 //!
 //! 定义 Glue 语言中可被调用求值的值类型：
 //! - Builtin 内置函数（原生函数指针）
-//! - VmClosure 虚拟机闭包（捕获上值和绑定参数）
+//! - Closure 闭包（捕获上值和绑定参数）
 //! - PartialApplication 部分应用（已绑定部分参数的函数）
 //! - TraitValue trait 对象（方法集 + 可选数据）
 //! - LazyValue 惰性值（延迟求值的表达式）
@@ -30,9 +30,9 @@ pub const Builtin = struct {
     }
 };
 
-/// 虚拟机闭包，携带函数体、上值、绑定参数和 self 上值索引
-pub const VmClosure = struct {
-    header: ObjHeader = .{ .type_tag = .vm_closure },
+/// 闭包，携带函数体、上值、绑定参数和 self 上值索引
+pub const Closure = struct {
+    header: ObjHeader = .{ .type_tag = .closure },
     func: *const anyopaque,
     arity: u8,
     upvalues: []Value = &.{},
@@ -41,7 +41,7 @@ pub const VmClosure = struct {
     self_upvalue_idx: i32 = -1,
 
     /// 释放上值和绑定参数，跳过 self 上值以避免自引用释放
-    pub fn deinit(self: *VmClosure, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Closure, allocator: std.mem.Allocator) void {
         const self_idx = self.self_upvalue_idx;
         for (self.upvalues, 0..) |uv, i| {
             if (self_idx >= 0 and i == @as(usize, @intCast(self_idx))) continue;
@@ -75,7 +75,7 @@ pub const TraitValue = struct {
     methods: std.StringHashMap(Value),
     data: ?Value = null,
     allocator: std.mem.Allocator,
-    vm_owned: bool = false,
+    owned: bool = false,
 
     /// 释放所有方法键值和关联数据
     pub fn deinit(self: *TraitValue, allocator: std.mem.Allocator) void {
@@ -97,13 +97,13 @@ pub const LazyValue = struct {
     cached: ?Value = null,
     forced: bool = false,
     allocator: std.mem.Allocator,
-    vm_thunk: ?*anyopaque = null,
+    thunk: ?*anyopaque = null,
 
-    /// 释放缓存的求值结果和虚拟机 thunk 闭包
+    /// 释放缓存的求值结果和 thunk 闭包
     pub fn deinit(self: *LazyValue, allocator: std.mem.Allocator) void {
         if (self.cached) |cached| cached.release(allocator);
-        if (self.vm_thunk) |thunk| {
-            const vc: *VmClosure = @ptrCast(@alignCast(thunk));
+        if (self.thunk) |thunk| {
+            const vc: *Closure = @ptrCast(@alignCast(thunk));
             (Value{ .ref = &vc.header }).release(allocator);
         }
     }
@@ -117,8 +117,8 @@ pub fn builtinDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
     allocator.destroy(self);
 }
 
-pub fn vmClosureDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
-    const self: *VmClosure = @alignCast(@fieldParentPtr("header", obj));
+pub fn closureDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+    const self: *Closure = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(allocator);
     allocator.destroy(self);
 }
@@ -144,7 +144,7 @@ pub fn lazyValDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
 /// 注册所有可调用类型的 deinit 函数
 pub fn registerDeinits() void {
     obj_header.registerDeinit(.builtin, builtinDeinit);
-    obj_header.registerDeinit(.vm_closure, vmClosureDeinit);
+    obj_header.registerDeinit(.closure, closureDeinit);
     obj_header.registerDeinit(.partial, partialDeinit);
     obj_header.registerDeinit(.trait_val, traitValDeinit);
     obj_header.registerDeinit(.lazy_val, lazyValDeinit);

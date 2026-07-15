@@ -4,7 +4,6 @@
 //! 同时配置各模块的单元测试并聚合到 `test` 步骤。
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 /// 构建入口：配置目标、优化级别、模块依赖、可执行产物与测试步骤
 pub fn build(b: *std.Build) void {
@@ -13,17 +12,17 @@ pub fn build(b: *std.Build) void {
 
     // ---- 前端核心模块：AST、词法分析器、语法分析器 ----
     const ast_module = b.createModule(.{
-        .root_source_file = b.path("src/ast.zig"),
+        .root_source_file = b.path("src/parse/ast.zig"),
         .target = target,
         .optimize = optimize,
     });
     const lexer_module = b.createModule(.{
-        .root_source_file = b.path("src/lexer.zig"),
+        .root_source_file = b.path("src/parse/lexer.zig"),
         .target = target,
         .optimize = optimize,
     });
     const parser_module = b.createModule(.{
-        .root_source_file = b.path("src/parser.zig"),
+        .root_source_file = b.path("src/parse/parser.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -48,6 +47,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     debug_allocator_module.addImport("sync", sync_module);
+
+    // ---- 内存管理模块入口 ----
+    const mem_module = b.createModule(.{
+        .root_source_file = b.path("src/mem/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mem_module.addImport("sync", sync_module);
 
     // ---- 值系统模块：依赖并发原语 ----
     const value_module = b.createModule(.{
@@ -110,7 +117,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- 模块加载器：串联前端与语义分析 ----
     const module_loader_module = b.createModule(.{
-        .root_source_file = b.path("src/loader/module_loader.zig"),
+        .root_source_file = b.path("src/parse/module_loader.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -133,6 +140,17 @@ pub fn build(b: *std.Build) void {
     kind_check_module.addImport("type_check", type_check_module);
     gadt_check_module.addImport("type_check", type_check_module);
 
+    // ---- LFE 层流执行引擎模块 ----
+    const lfe_module = b.createModule(.{
+        .root_source_file = b.path("src/lfe/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lfe_module.addImport("ast", ast_module);
+    lfe_module.addImport("value", value_module);
+    lfe_module.addImport("mem", mem_module);
+    lfe_module.addImport("sync", sync_module);
+
     // ---- 根模块：聚合所有依赖，产出可执行文件 ----
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -147,24 +165,14 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("profiler", profiler_module);
     root_module.addImport("sema", type_check_module);
     root_module.addImport("debug_allocator", debug_allocator_module);
+    root_module.addImport("lfe", lfe_module);
 
     const exe = b.addExecutable(.{
         .name = "glue",
         .root_module = root_module,
     });
     exe.root_module.linkSystemLibrary("c", .{});
-    // 按架构分目录安装，避免多架构交叉编译时互相覆盖
-    const arch_dir = switch (target.result.cpu.arch) {
-        .aarch64 => "aarch64",
-        .x86_64 => "x86_64",
-        .riscv64 => "riscv64",
-        .riscv32 => "riscv32",
-        else => "unknown",
-    };
-    const install_step = b.addInstallArtifact(exe, .{
-        .dest_dir = .{ .override = .{ .custom = arch_dir } },
-    });
-    b.getInstallStep().dependOn(&install_step.step);
+    b.installArtifact(exe);
 
     // ---- 单元测试：为每个需要测试的模块创建测试产物 ----
     const lexer_unit_tests = b.addTest(.{
@@ -227,6 +235,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_value_unit_tests = b.addRunArtifact(value_unit_tests);
 
+    // LFE 层流执行引擎测试（需导入 ast、value 和 mem）
+    const lfe_module_test = b.createModule(.{
+        .root_source_file = b.path("src/lfe/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lfe_module_test.addImport("ast", ast_module);
+    lfe_module_test.addImport("value", value_module);
+    lfe_module_test.addImport("mem", mem_module);
+    lfe_module_test.addImport("sync", sync_module);
+    const lfe_unit_tests = b.addTest(.{
+        .root_module = lfe_module_test,
+    });
+    const run_lfe_unit_tests = b.addRunArtifact(lfe_unit_tests);
+
     // 所有测试产物都需要链接 libc
     lexer_unit_tests.root_module.linkSystemLibrary("c", .{});
     parser_unit_tests.root_module.linkSystemLibrary("c", .{});
@@ -235,6 +258,7 @@ pub fn build(b: *std.Build) void {
     analysis_db_unit_tests.root_module.linkSystemLibrary("c", .{});
     value_unit_tests.root_module.linkSystemLibrary("c", .{});
     debug_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
+    lfe_unit_tests.root_module.linkSystemLibrary("c", .{});
 
     // ---- 聚合测试步骤：`zig build test` 运行全部单元测试 ----
     const test_step = b.step("test", "Run all tests");
@@ -245,5 +269,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_analysis_db_unit_tests.step);
     test_step.dependOn(&run_value_unit_tests.step);
     test_step.dependOn(&run_debug_allocator_unit_tests.step);
+    test_step.dependOn(&run_lfe_unit_tests.step);
     for (mem_test_runs) |run| test_step.dependOn(&run.step);
 }

@@ -1,3 +1,0 @@
-name = "jit_debug"
-version = "0.1.0"
-entry = "src/Main.glue"

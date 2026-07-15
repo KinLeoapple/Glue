@@ -11,6 +11,35 @@ const parser_mod = @import("parser");
 const type_check = @import("sema");
 const analysis_db_mod = @import("analysis_db");
 
+/// 字符串 intern 池：模块名等重复字符串统一去重分配，由池统一释放。
+const StringInterner = struct {
+    map: std.StringHashMap([]const u8),
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) StringInterner {
+        return .{
+            .map = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    /// 返回与 s 内容相同的稳定切片：若池中已有则复用，否则 dupe 并登记。
+    fn intern(self: *StringInterner, s: []const u8) ![]const u8 {
+        if (self.map.get(s)) |existing| return existing;
+        const owned = try self.allocator.dupe(u8, s);
+        try self.map.put(owned, owned);
+        return owned;
+    }
+
+    fn deinit(self: *StringInterner) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |v| {
+            self.allocator.free(v.*);
+        }
+        self.map.deinit();
+    }
+};
+
 /// 模块加载器，负责模块的解析、类型检查、依赖分析与生命周期管理。
 pub const ModuleLoader = struct {
     allocator: std.mem.Allocator,
@@ -22,6 +51,7 @@ pub const ModuleLoader = struct {
     loaded_modules: std.StringHashMap(ast.Module),
     retained_sources: std.ArrayList([]const u8),
     retained_arenas: std.ArrayList(std.heap.ArenaAllocator),
+    interner: StringInterner,
 
     /// 初始化加载器，创建类型推导器与分析数据库。
     pub fn init(allocator: std.mem.Allocator, io: ?std.Io) ModuleLoader {
@@ -35,20 +65,14 @@ pub const ModuleLoader = struct {
             .loaded_modules = std.StringHashMap(ast.Module).init(allocator),
             .retained_sources = .{ .items = &.{}, .capacity = 0 },
             .retained_arenas = .{ .items = &.{}, .capacity = 0 },
+            .interner = StringInterner.init(allocator),
         };
     }
 
-    /// 释放所有持有的模块名、源文本、arena 与分析设施。
+    /// 释放所有持有的源文本、arena 与分析设施。
+    /// 模块名由 interner 统一管理，无需单独释放。
     pub fn deinit(self: *ModuleLoader) void {
-        var loading_it = self.loading_modules.keyIterator();
-        while (loading_it.next()) |k| {
-            self.allocator.free(k.*);
-        }
         self.loading_modules.deinit();
-        var loaded_it = self.loaded_modules.keyIterator();
-        while (loaded_it.next()) |k| {
-            self.allocator.free(k.*);
-        }
         self.loaded_modules.deinit();
         for (self.retained_sources.items) |source| {
             self.allocator.free(source);
@@ -63,24 +87,21 @@ pub const ModuleLoader = struct {
         }
         self.type_inferencer.deinit();
         self.analysis_db.deinit();
+        self.interner.deinit();
     }
 
     /// 准备一个已解析的模块：规范化名称、切换源目录、加载依赖并运行类型检查与分析。
     pub fn prepareModule(self: *ModuleLoader, module: ast.Module) !void {
-        var normalized_name: ?[]const u8 = null;
         // 优先用源路径的文件名（不含扩展名）作为模块名，否则回退到 module.name
         const module_name = blk: {
             if (module.source_path) |sp| {
                 const stem = std.fs.path.stem(std.fs.path.basename(sp));
                 if (stem.len > 0) {
-                    const owned = try self.allocator.dupe(u8, stem);
-                    normalized_name = owned;
-                    break :blk owned;
+                    break :blk try self.interner.intern(stem);
                 }
             }
             break :blk module.name;
         };
-        defer if (normalized_name) |n| self.allocator.free(n);
 
         // 根据源路径切换 current_source_dir，defer 中恢复
         const saved_source_dir = self.current_source_dir;
@@ -102,12 +123,10 @@ pub const ModuleLoader = struct {
         }
 
         // 登记到 loading_modules 以检测循环依赖
-        const owned_name = try self.allocator.dupe(u8, module_name);
+        const owned_name = try self.interner.intern(module_name);
         try self.loading_modules.put(owned_name, {});
         defer {
-            if (self.loading_modules.fetchRemove(module_name)) |entry| {
-                self.allocator.free(entry.key);
-            }
+            _ = self.loading_modules.fetchRemove(module_name);
         }
         try self.prepareModuleInner(module, module_name);
     }
@@ -132,6 +151,16 @@ pub const ModuleLoader = struct {
 
         // 类型检查
         self.type_inferencer.checkModule(&module);
+        if (self.type_inferencer.errors.items.len > 0) {
+            var has_fatal = false;
+            for (self.type_inferencer.errors.items) |err| {
+                if (err.kind == .signature_mismatch) {
+                    std.debug.print("error:{d}:{d}: {s}\n", .{ err.line, err.column, err.message });
+                    has_fatal = true;
+                }
+            }
+            if (has_fatal) return error.TypeCheckFailed;
+        }
 
         // 融合分析：常量传播、循环不变量、纯度、提升、死代码消除、公共子表达式
         {
@@ -249,12 +278,10 @@ pub const ModuleLoader = struct {
         if (self.loading_modules.contains(module_name)) {
             return error.CircularDependency;
         }
-        const owned_name = try self.allocator.dupe(u8, module_name);
+        const owned_name = try self.interner.intern(module_name);
         try self.loading_modules.put(owned_name, {});
         defer {
-            if (self.loading_modules.fetchRemove(module_name)) |entry| {
-                self.allocator.free(entry.key);
-            }
+            _ = self.loading_modules.fetchRemove(module_name);
         }
 
         try self.prepareModuleInner(module, module_name);
@@ -267,7 +294,7 @@ pub const ModuleLoader = struct {
             arena_retained = false;
         }
 
-        const registered_name = try self.allocator.dupe(u8, module_name);
+        const registered_name = try self.interner.intern(module_name);
         try self.loaded_modules.put(registered_name, module);
         // tokens 与 errors 均由 arena 管理，偷走 arena 后无需单独释放
     }
@@ -307,7 +334,7 @@ pub const ModuleLoader = struct {
                     try self.loadModule(ud.module_path);
                 }
                 const dep_module = self.loaded_modules.get(dep_name) orelse continue;
-                try seen.put(try self.allocator.dupe(u8, dep_name), {});
+                try seen.put(try self.interner.intern(dep_name), {});
                 try self.collectDependencies(dep_module, out, seen);
                 try out.append(self.allocator, dep_module);
             }
@@ -319,7 +346,7 @@ pub const ModuleLoader = struct {
                     self.loadModule(&sub_path) catch continue;
                 }
                 const sub_module = self.loaded_modules.get(pd.name) orelse continue;
-                try seen.put(try self.allocator.dupe(u8, pd.name), {});
+                try seen.put(try self.interner.intern(pd.name), {});
                 try self.collectDependencies(sub_module, out, seen);
                 try out.append(self.allocator, sub_module);
             }

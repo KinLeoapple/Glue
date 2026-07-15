@@ -33,10 +33,10 @@ pub const ChannelRegion = struct {
     }
 
     /// 分配 size 字节的通道数据，16B 对齐。热路径：1 次加法 + 1 次比较。
-    pub fn alloc(self: *ChannelRegion, size: usize) ![]u8 {
+    pub fn alloc(self: *ChannelRegion, size: usize) ![]align(16) u8 {
         const aligned = std.mem.alignForward(usize, self.used, 16);
         if (self.data != null and aligned + size <= self.len) {
-            const ptr = self.data.? + aligned;
+            const ptr: [*]align(16) u8 = @ptrCast(@alignCast(self.data.? + aligned));
             self.used = aligned + size;
             return ptr[0..size];
         }

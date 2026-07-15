@@ -62,7 +62,7 @@ pub fn instantiateWithConcreteType(
             var param_types = std.ArrayList(*Type).empty;
             for (ft.params) |pt| {
                 const inst_pt = try instantiateWithConcreteType(inferencer, pt, concrete);
-                param_types.append(inferencer.allocator, inst_pt) catch return error.OutOfMemory;
+                param_types.append(inferencer.arena.allocator(), inst_pt) catch return error.OutOfMemory;
             }
             const inst_ret = try instantiateWithConcreteType(inferencer, ft.return_type, concrete);
             return inferencer.makeFnType(param_types.items, inst_ret);
@@ -105,16 +105,16 @@ pub fn checkCallSiteTraitBound(
             };
             // 内建类型作为 trait 实参时，要求存在对应 trait 实现
             if (isBuiltinTypeName(tp_name)) {
-                const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
-                defer inferencer.allocator.free(trait_key);
+                const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
+                defer inferencer.arena.allocator().free(trait_key);
                 if (!inferencer.registered_traits.contains(trait_key)) {
                     inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
                 }
             }
             // 用户定义类型作为 trait 实参时，同样要求存在对应实现
             if (inferencer.type_defining_modules.contains(tp_name)) {
-                const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
-                defer inferencer.allocator.free(trait_key);
+                const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
+                defer inferencer.arena.allocator().free(trait_key);
                 if (!inferencer.registered_traits.contains(trait_key)) {
                     inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
                 }
@@ -142,8 +142,8 @@ pub fn checkInstantiatedBounds(
                     else => null,
                 };
                 if (type_name) |tn| {
-                    const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tn }) catch return;
-                    defer inferencer.allocator.free(trait_key);
+                    const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::{s}", .{ bound.trait_name, tn }) catch return;
+                    defer inferencer.arena.allocator().free(trait_key);
                     if (!inferencer.registered_traits.contains(trait_key)) {
                         inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for {s}<{s}>", .{ bound.trait_name, tn });
                     }
@@ -168,8 +168,8 @@ pub fn checkTraitBound(
                     .generic => |g| g.name,
                     else => continue,
                 };
-                const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
-                defer inferencer.allocator.free(trait_key);
+                const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::{s}", .{ bound.trait_name, tp_name }) catch return;
+                defer inferencer.arena.allocator().free(trait_key);
                 if (!inferencer.registered_traits.contains(trait_key)) {
                     // 仅对内建类型与当前项目定义的类型报缺实现错误
                     if (isBuiltinTypeName(tp_name)) {
@@ -181,8 +181,8 @@ pub fn checkTraitBound(
                 }
             }
         } else {
-            const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::", .{bound.trait_name}) catch return;
-            defer inferencer.allocator.free(trait_key);
+            const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::", .{bound.trait_name}) catch return;
+            defer inferencer.arena.allocator().free(trait_key);
         }
         if (trait_info.associated_type_names.len > 0 and bound.type_args.len == 0) {
         }
@@ -196,6 +196,7 @@ pub fn checkTraitBound(
 /// 查找匹配方法，实例化后用接收者类型统一 self 参数，返回方法返回类型。
 pub fn inferMethodCall(
     inferencer: *TypeInferencer,
+    expr: *const ast.Expr,
     mc: @TypeOf(@as(ast.Expr, undefined).method_call),
     env: *TypeEnv,
 ) SemaError!*Type {
@@ -206,11 +207,12 @@ pub fn inferMethodCall(
         if (robj.* == .nullable_type) {
             var narrowed = false;
             if (inferencer.exprPath(mc.object)) |op| {
-                defer inferencer.allocator.free(op);
+                defer inferencer.arena.allocator().free(op);
                 narrowed = inferencer.narrowed_paths.contains(op);
             }
             if (!narrowed) {
-                inferencer.addErrorAt(.type_mismatch, mc.location.line, mc.location.column, "cannot call method '{s}' on nullable type; use '?.', '!', or narrow with 'if x != null' first", .{mc.method});
+                const loc = ast.exprLocation(expr);
+                inferencer.addErrorAt(.type_mismatch, loc.line, loc.column, "cannot call method '{s}' on nullable type; use '?.', '!', or narrow with 'if x != null' first", .{mc.method});
                 return inferencer.freshTypeVar() catch unreachable;
             }
         }
@@ -272,15 +274,15 @@ pub fn checkTraitDecl(
     inferencer: *TypeInferencer,
     td: @TypeOf(@as(ast.Decl, undefined).trait_decl),
 ) void {
-    const trait_ty = inferencer.allocator.create(Type) catch return;
+    const trait_ty = inferencer.arena.allocator().create(Type) catch return;
     trait_ty.* = Type{ .trait_type = .{ .name = td.name, .type_args = &[_]*Type{} } };
-    inferencer.types.append(inferencer.allocator, trait_ty) catch return;
-    var assoc_names = inferencer.allocator.alloc([]const u8, td.associated_types.len) catch return;
+    inferencer.types.append(inferencer.arena.allocator(), trait_ty) catch return;
+    var assoc_names = inferencer.arena.allocator().alloc([]const u8, td.associated_types.len) catch return;
     for (td.associated_types, 0..) |at, i| {
         assoc_names[i] = at.name;
     }
 
-    var type_param_map = std.StringHashMap(*Type).init(inferencer.allocator);
+    var type_param_map = std.StringHashMap(*Type).init(inferencer.arena.allocator());
     defer type_param_map.deinit();
     const self_type_var = inferencer.freshTypeVar() catch return;
     const old_self_type = inferencer.current_self_type;
@@ -296,18 +298,23 @@ pub fn checkTraitDecl(
     }
 
     var meth_names_list = std.ArrayList([]const u8).empty;
-    defer meth_names_list.deinit(inferencer.allocator);
-    var method_schemes = std.StringHashMap(TypeScheme).init(inferencer.allocator);
+    defer meth_names_list.deinit(inferencer.arena.allocator());
+    var required_meth_names_list = std.ArrayList([]const u8).empty;
+    defer required_meth_names_list.deinit(inferencer.arena.allocator());
+    var method_schemes = std.StringHashMap(TypeScheme).init(inferencer.arena.allocator());
 
     // 继承父 trait 的方法名与方法方案
     for (td.parents) |parent| {
         if (inferencer.trait_types.getPtr(parent.trait_name)) |parent_info| {
             for (parent_info.method_names) |mname| {
-                meth_names_list.append(inferencer.allocator, mname) catch return;
+                meth_names_list.append(inferencer.arena.allocator(), mname) catch return;
+            }
+            for (parent_info.required_method_names) |mname| {
+                required_meth_names_list.append(inferencer.arena.allocator(), mname) catch return;
             }
             var ms_iter = parent_info.method_schemes.iterator();
             while (ms_iter.next()) |entry| {
-                const mname = inferencer.allocator.dupe(u8, entry.key_ptr.*) catch return;
+                const mname = inferencer.arena.allocator().dupe(u8, entry.key_ptr.*) catch return;
                 method_schemes.put(mname, entry.value_ptr.*) catch return;
             }
         }
@@ -350,8 +357,32 @@ pub fn checkTraitDecl(
             }
         }
 
-        meth_names_list.append(inferencer.allocator, m.name) catch return;
-        var method_param_map = std.StringHashMap(*Type).init(inferencer.allocator);
+        meth_names_list.append(inferencer.arena.allocator(), m.name) catch return;
+        // 更新必需方法列表：无默认实现的方法为必需；有默认实现的覆盖使父 trait 必需方法变为非必需
+        if (m.body == null) {
+            // 检查是否已在必需列表中，避免重复
+            var already_required = false;
+            for (required_meth_names_list.items) |rn| {
+                if (std.mem.eql(u8, rn, m.name)) {
+                    already_required = true;
+                    break;
+                }
+            }
+            if (!already_required) {
+                required_meth_names_list.append(inferencer.arena.allocator(), m.name) catch return;
+            }
+        } else {
+            // 有默认实现：从必需列表中移除（覆盖父 trait 的必需方法）
+            var i: usize = 0;
+            while (i < required_meth_names_list.items.len) {
+                if (std.mem.eql(u8, required_meth_names_list.items[i], m.name)) {
+                    _ = required_meth_names_list.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        var method_param_map = std.StringHashMap(*Type).init(inferencer.arena.allocator());
         defer method_param_map.deinit();
         {
             var it = type_param_map.iterator();
@@ -367,7 +398,7 @@ pub fn checkTraitDecl(
                 inferencer.typeFromAstWithParams(ta, &method_param_map) catch inferencer.freshTypeVar() catch return
             else
                 inferencer.freshTypeVar() catch return;
-            param_types.append(inferencer.allocator, pt) catch return;
+            param_types.append(inferencer.arena.allocator(), pt) catch return;
         }
         const ret_type = if (m.return_type) |rt|
             inferencer.typeFromAstWithParams(rt, &method_param_map) catch inferencer.freshTypeVar() catch return
@@ -375,17 +406,17 @@ pub fn checkTraitDecl(
             inferencer.freshTypeVar() catch return;
         const fn_type = inferencer.makeFnType(param_types.items, ret_type) catch return;
         const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_type };
-        const mname = inferencer.allocator.dupe(u8, m.name) catch return;
+        const mname = inferencer.arena.allocator().dupe(u8, m.name) catch return;
         method_schemes.put(mname, scheme) catch return;
     }
 
     // 检测多继承导致的同名方法冲突，要求子类用 override/委托消解
     {
-        var method_all_sources = std.StringHashMap(std.ArrayList([]const u8)).init(inferencer.allocator);
+        var method_all_sources = std.StringHashMap(std.ArrayList([]const u8)).init(inferencer.arena.allocator());
         defer {
             var mas_iter = method_all_sources.iterator();
             while (mas_iter.next()) |entry| {
-                entry.value_ptr.deinit(inferencer.allocator);
+                entry.value_ptr.deinit(inferencer.arena.allocator());
             }
             method_all_sources.deinit();
         }
@@ -393,11 +424,11 @@ pub fn checkTraitDecl(
             if (inferencer.trait_types.getPtr(parent.trait_name)) |parent_info| {
                 for (parent_info.method_names) |mname| {
                     if (method_all_sources.getPtr(mname)) |sources| {
-                        sources.append(inferencer.allocator, parent.trait_name) catch {};
+                        sources.append(inferencer.arena.allocator(), parent.trait_name) catch {};
                     } else {
                         var new_list = std.ArrayList([]const u8).empty;
-                        new_list.append(inferencer.allocator, parent.trait_name) catch {};
-                        const name_copy = inferencer.allocator.dupe(u8, mname) catch return;
+                        new_list.append(inferencer.arena.allocator(), parent.trait_name) catch {};
+                        const name_copy = inferencer.arena.allocator().dupe(u8, mname) catch return;
                         method_all_sources.put(name_copy, new_list) catch return;
                     }
                 }
@@ -423,12 +454,22 @@ pub fn checkTraitDecl(
         }
     }
 
-    const meth_names = meth_names_list.toOwnedSlice(inferencer.allocator) catch return;
-    const kind_arities = inferencer.allocator.alloc(usize, td.type_params.len) catch return;
+    const meth_names = meth_names_list.toOwnedSlice(inferencer.arena.allocator()) catch return;
+    const required_meth_names = required_meth_names_list.toOwnedSlice(inferencer.arena.allocator()) catch return;
+    const kind_arities = inferencer.arena.allocator().alloc(usize, td.type_params.len) catch return;
     for (td.type_params, 0..) |tp, i| {
         kind_arities[i] = if (tp.kind) |k| kindArrowArity(k) else 0;
     }
-    const key = inferencer.allocator.dupe(u8, td.name) catch return;
+    const key = inferencer.arena.allocator().dupe(u8, td.name) catch return;
+    // 收集 trait 类型参数的 type var ids，用于签名匹配时替换
+    const param_var_ids = inferencer.arena.allocator().alloc(usize, td.type_params.len) catch return;
+    for (td.type_params, 0..) |tp, i| {
+        if (type_param_map.get(tp.name)) |tv| {
+            param_var_ids[i] = tv.type_var.id;
+        } else {
+            param_var_ids[i] = 0;
+        }
+    }
     if (inferencer.isBuiltinName(td.name)) {
         inferencer.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{td.name});
     } else if (inferencer.trait_types.contains(td.name)) {
@@ -438,13 +479,16 @@ pub fn checkTraitDecl(
             .ty = trait_ty,
             .associated_type_names = assoc_names,
             .method_names = meth_names,
+            .required_method_names = required_meth_names,
             .method_schemes = method_schemes,
             .defining_module = inferencer.current_module,
             .type_param_kind_arities = kind_arities,
+            .self_type_var_id = self_type_var.type_var.id,
+            .trait_type_param_var_ids = param_var_ids,
         }) catch return;
     }
-    const mod_key = inferencer.allocator.dupe(u8, td.name) catch return;
-    const mod_val = inferencer.allocator.dupe(u8, inferencer.current_module) catch return;
+    const mod_key = inferencer.arena.allocator().dupe(u8, td.name) catch return;
+    const mod_val = inferencer.arena.allocator().dupe(u8, inferencer.current_module) catch return;
     inferencer.trait_defining_modules.put(mod_key, mod_val) catch return;
 }
 
@@ -473,19 +517,20 @@ pub fn checkTypeTraitImplementations(
             inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "undefined trait '{s}'", .{trait_bound.trait_name});
             continue;
         };
-        // 孤儿规则：类型与 trait 至少有一个定义在当前模块
+        // 孤儿规则：类型与 trait 至少有一个定义在当前模块（内建 trait 豁免）
+        const trait_is_builtin = std.mem.eql(u8, trait_info.defining_module, "<builtin>");
         const type_in_current_module = std.mem.eql(u8, inferencer.current_module, inferencer.type_defining_modules.get(td.name) orelse "");
         const trait_in_current_module = std.mem.eql(u8, inferencer.current_module, inferencer.trait_defining_modules.get(trait_bound.trait_name) orelse "");
-        if (!type_in_current_module and !trait_in_current_module) {
+        if (!trait_is_builtin and !type_in_current_module and !trait_in_current_module) {
             inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "orphan instance: neither type '{s}' nor trait '{s}' is defined in this module", .{ td.name, trait_bound.trait_name });
         }
         // 重叠实例检测
-        const trait_key = std.fmt.allocPrint(inferencer.allocator, "{s}::{s}", .{ trait_bound.trait_name, td.name }) catch return;
-        defer inferencer.allocator.free(trait_key);
+        const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::{s}", .{ trait_bound.trait_name, td.name }) catch return;
+        defer inferencer.arena.allocator().free(trait_key);
         if (inferencer.registered_traits.contains(trait_key)) {
             inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "overlapping instance: trait '{s}' is already implemented for type '{s}'", .{ trait_bound.trait_name, td.name });
         } else {
-            const key_owned = inferencer.allocator.dupe(u8, trait_key) catch return;
+            const key_owned = inferencer.arena.allocator().dupe(u8, trait_key) catch return;
             inferencer.registered_traits.put(key_owned, TraitEntry{
                 .trait_name = trait_bound.trait_name,
                 .type_name = td.name,
@@ -493,28 +538,132 @@ pub fn checkTypeTraitImplementations(
                 .column = td.location.column,
             }) catch return;
         }
-        // 校验 trait 必需方法是否全部实现
-        for (trait_info.method_names) |required_method| {
+        // 校验 trait 必需方法是否全部实现，并检查方法签名是否匹配
+        // 获取具体类型的 ADT 类型（作为 Self 的替换目标）
+        const concrete_self_type = if (inferencer.adt_types.get(td.name)) |info| info.ty else null;
+        for (trait_info.required_method_names) |required_method| {
             var found = false;
+            var impl_method: ?ast.MethodDecl = null;
             for (td.methods) |method| {
                 if (std.mem.eql(u8, method.name, required_method)) {
                     found = true;
+                    impl_method = method;
                     break;
                 }
             }
             if (!found) {
-                inferencer.addErrorAt(.type_mismatch, td.location.line, td.location.column, "type '{s}' does not implement required method '{s}' from trait '{s}'", .{ td.name, required_method, trait_bound.trait_name });
+                inferencer.addErrorAt(.signature_mismatch, td.location.line, td.location.column, "type '{s}' does not implement required method '{s}' from trait '{s}'", .{ td.name, required_method, trait_bound.trait_name });
+                continue;
+            }
+            // 签名匹配校验：比较 trait 声明的方法签名与 type 实现的方法签名
+            if (impl_method) |m| {
+                if (trait_info.method_schemes.get(required_method)) |trait_scheme| {
+                    checkMethodSignature(inferencer, td, m, trait_scheme, trait_info, concrete_self_type, trait_bound);
+                }
             }
         }
         // 将实现的方法方案以 "TypeName.methodName" 的键注入环境
         for (trait_info.method_names) |mname| {
             if (trait_info.method_schemes.get(mname)) |method_scheme| {
-                const method_key = std.fmt.allocPrint(inferencer.allocator, "{s}.{s}", .{ td.name, mname }) catch continue;
+                const method_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}.{s}", .{ td.name, mname }) catch continue;
                 env.bindings.put(method_key, method_scheme) catch {
-                    inferencer.allocator.free(method_key);
+                    inferencer.arena.allocator().free(method_key);
                     continue;
                 };
             }
+        }
+    }
+}
+
+/// 检查 type 实现的方法签名是否与 trait 声明的方法签名匹配。
+/// 将 trait 方案中的 Self 替换为具体类型，然后逐参数、逐返回类型做结构相等比较。
+fn checkMethodSignature(
+    inferencer: *TypeInferencer,
+    td: @TypeOf(@as(ast.Decl, undefined).type_decl),
+    impl_method: ast.MethodDecl,
+    trait_scheme: TypeScheme,
+    trait_info: *const type_check.TraitInfo,
+    concrete_self_type: ?*Type,
+    trait_bound: ast.TraitBound,
+) void {
+    // 构建 trait 方法签名
+    const trait_fn_ty = inferencer.resolve(trait_scheme.ty);
+    if (trait_fn_ty.* != .fn_type) return;
+
+    // 构建替换表：trait 的 Self var → 具体 type，trait 类型参数 → trait_bound.type_args
+    var subst = std.AutoHashMap(usize, *Type).init(inferencer.arena.allocator());
+    defer subst.deinit();
+    if (trait_info.self_type_var_id) |sid| {
+        if (concrete_self_type) |cs| {
+            subst.put(sid, cs) catch return;
+        }
+    }
+    // 用 trait_bound.type_args 替换 trait 类型参数
+    for (trait_info.trait_type_param_var_ids, 0..) |param_id, i| {
+        if (i < trait_bound.type_args.len) {
+            const arg_type = inferencer.typeFromAstWithParams(trait_bound.type_args[i], &std.StringHashMap(*Type).init(inferencer.arena.allocator())) catch continue;
+            subst.put(param_id, arg_type) catch return;
+        }
+    }
+
+    // 应用替换，得到期望的方法签名
+    const expected_fn_ty = inferencer.applyTypeSubst(trait_fn_ty, &subst) catch return;
+    if (expected_fn_ty.* != .fn_type) return;
+    const expected = expected_fn_ty.fn_type;
+
+    // 构建实现方法的方法签名
+    var impl_type_param_map = std.StringHashMap(*Type).init(inferencer.arena.allocator());
+    defer impl_type_param_map.deinit();
+    for (td.type_params) |tp| {
+        const tv = inferencer.freshTypeVar() catch return;
+        impl_type_param_map.put(tp.name, tv) catch return;
+    }
+    for (impl_method.type_params) |tp| {
+        const tv = inferencer.freshTypeVar() catch return;
+        impl_type_param_map.put(tp.name, tv) catch return;
+    }
+    const old_self_type = inferencer.current_self_type;
+    defer inferencer.current_self_type = old_self_type;
+    if (concrete_self_type) |cs| {
+        inferencer.current_self_type = cs;
+    }
+
+    var impl_params = std.ArrayList(*Type).empty;
+    defer impl_params.deinit(inferencer.arena.allocator());
+    for (impl_method.params) |param| {
+        const pt = if (param.type_annotation) |ta|
+            inferencer.typeFromAstWithParams(ta, &impl_type_param_map) catch inferencer.freshTypeVar() catch return
+        else
+            inferencer.freshTypeVar() catch return;
+        impl_params.append(inferencer.arena.allocator(), pt) catch return;
+    }
+    const impl_ret = if (impl_method.return_type) |rt|
+        inferencer.typeFromAstWithParams(rt, &impl_type_param_map) catch inferencer.freshTypeVar() catch return
+    else
+        inferencer.freshTypeVar() catch return;
+
+    // 比较参数个数
+    if (impl_params.items.len != expected.params.len) {
+        inferencer.addErrorAt(.signature_mismatch, impl_method.location.line, impl_method.location.column, "method '{s}' has {d} parameters but trait '{s}' expects {d}", .{ impl_method.name, impl_params.items.len, trait_bound.trait_name, expected.params.len });
+        return;
+    }
+
+    // 逐参数比较类型
+    for (impl_params.items, 0..) |impl_pt, i| {
+        const exp_pt = expected.params[i];
+        if (!inferencer.typesStructurallyEqual(impl_pt, exp_pt)) {
+            // 允许 type_var 匹配任意类型（宽松模式：未注解参数）
+            if (inferencer.resolve(impl_pt).* == .type_var) continue;
+            if (inferencer.resolve(exp_pt).* == .type_var) continue;
+            inferencer.addErrorAt(.signature_mismatch, impl_method.location.line, impl_method.location.column, "method '{s}' parameter {d} type mismatch: cannot match trait '{s}' signature", .{ impl_method.name, i + 1, trait_bound.trait_name });
+            return;
+        }
+    }
+
+    // 比较返回类型
+    if (!inferencer.typesStructurallyEqual(impl_ret, expected.return_type)) {
+        if (inferencer.resolve(impl_ret).* != .type_var and inferencer.resolve(expected.return_type).* != .type_var) {
+            inferencer.addErrorAt(.signature_mismatch, impl_method.location.line, impl_method.location.column, "method '{s}' return type mismatch: cannot match trait '{s}' signature", .{ impl_method.name, trait_bound.trait_name });
         }
     }
 }

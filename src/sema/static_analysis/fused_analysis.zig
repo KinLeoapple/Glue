@@ -422,7 +422,7 @@ pub const FusedAnalysis = struct {
 /// 内建非纯函数列表。这些函数有 I/O、并发或通信副作用，调用它们的函数自动判定为非纯。
 const impure_builtins = [_][]const u8{
     "println", "print", "eprintln", "eprint",
-    "spawn",   "lazy",  "select",   "send",   "recv",
+    "async",   "lazy",  "select",   "send",   "recv",
 };
 
 /// 判断给定函数名是否为内建非纯函数。

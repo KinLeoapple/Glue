@@ -18,30 +18,54 @@ pub const ParseError = struct {
 
 const ParserError = error{ OutOfMemory, UnexpectedToken };
 
+/// AST 节点 chunk 批量分配器：以 64 项为单位从 arena 批量申请 NodeSlot(T)，
+/// 消除逐节点 vtable 开销并将 SourceLocation 存储在 node 外部。
+/// 所有内存归属 arena，无需单独释放。
+fn NodeChunk(comptime T: type) type {
+    return struct {
+        const Slot = ast.NodeSlot(T);
+        const CHUNK_SIZE = 64;
+        const Self = @This();
+
+        current: []Slot = &.{},
+        idx: usize = 0,
+
+        fn alloc(self: *Self, arena: std.mem.Allocator) !*Slot {
+            if (self.idx >= self.current.len) {
+                self.current = try arena.alloc(Slot, CHUNK_SIZE);
+                self.idx = 0;
+            }
+            const slot = &self.current[self.idx];
+            self.idx += 1;
+            return slot;
+        }
+    };
+}
+
 /// 语法分析器：持有 Token 序列、当前位置、arena 与错误列表
 pub const Parser = struct {
-    tokens: []lexer.Token,
+    tokens: []const lexer.Token,
     current: usize,
     arena: std.heap.ArenaAllocator,
     errors: std.ArrayList(ParseError),
-    owns_tokens: bool,
+    /// expectCloseAngle 遇到 gt_eq 时虚拟拆分：当前已消费 gt 部分，待注入 eq
+    pending_eq: bool,
+    /// 节点批量分配器，减少逐节点 arena vtable 调用
+    expr_chunk: NodeChunk(ast.Expr) = .{},
+    stmt_chunk: NodeChunk(ast.Stmt) = .{},
+    type_chunk: NodeChunk(ast.TypeNode) = .{},
+    pattern_chunk: NodeChunk(ast.Pattern) = .{},
+    kind_chunk: NodeChunk(ast.Kind) = .{},
 
-    /// 创建分析器，尝试复制 Token 序列；复制失败时直接引用传入切片
+    /// 创建分析器，直接引用外部 Token 切片（零拷贝）
     pub fn init(backing: std.mem.Allocator, tokens: []const lexer.Token) Parser {
-        var p = Parser{
-            .tokens = @constCast(tokens),
+        return Parser{
+            .tokens = tokens,
             .current = 0,
             .arena = std.heap.ArenaAllocator.init(backing),
             .errors = .empty,
-            .owns_tokens = false,
+            .pending_eq = false,
         };
-        const alloc = p.arena.allocator();
-        const owned: ?[]lexer.Token = alloc.dupe(lexer.Token, tokens) catch null;
-        if (owned) |o| {
-            p.tokens = o;
-            p.owns_tokens = true;
-        }
-        return p;
     }
 
     /// 释放分析器资源
@@ -57,8 +81,18 @@ pub const Parser = struct {
 
     // ---- Token 导航辅助 ----
 
-    /// 查看当前 Token，越界时返回最后一个（eof）
+    /// 查看当前 Token，越界时返回最后一个（eof）。处理 pending_eq 虚拟注入。
     fn peek(self: *Parser) lexer.Token {
+        if (self.pending_eq) {
+            // 构造虚拟 eq token，位置基于被拆分的 gt_eq 的下一列
+            const base = if (self.current > 0) self.tokens[self.current - 1] else self.tokens[0];
+            return lexer.Token{
+                .type = .eq,
+                .lexeme = "=",
+                .line = base.line,
+                .column = base.column + 1,
+            };
+        }
         if (self.current >= self.tokens.len) {
             return self.tokens[self.tokens.len - 1];
         }
@@ -76,8 +110,19 @@ pub const Parser = struct {
         return self.peek().type == .eof;
     }
 
-    /// 消费当前 Token 并前进，到达末尾时不前进
+    /// 消费当前 Token 并前进，到达末尾时不前进。处理 pending_eq 虚拟消费。
     fn advance(self: *Parser) lexer.Token {
+        if (self.pending_eq) {
+            self.pending_eq = false;
+            // 返回虚拟 eq token
+            const base = if (self.current > 0) self.tokens[self.current - 1] else self.tokens[0];
+            return lexer.Token{
+                .type = .eq,
+                .lexeme = "=",
+                .line = base.line,
+                .column = base.column + 1,
+            };
+        }
         if (!self.isAtEnd()) {
             self.current += 1;
         }
@@ -119,9 +164,10 @@ pub const Parser = struct {
             _ = self.advance();
             return;
         }
-        if (self.owns_tokens and self.current < self.tokens.len and self.tokens[self.current].type == .gt_eq) {
-            self.tokens[self.current].type = .eq;
-            self.tokens[self.current].column +%= 1;
+        if (self.current < self.tokens.len and self.tokens[self.current].type == .gt_eq) {
+            // 虚拟拆分 gt_eq：消费整个 token，设置 pending_eq 供下一次 peek 注入 eq
+            self.current += 1;
+            self.pending_eq = true;
             return;
         }
         const tok = self.peek();
@@ -176,34 +222,34 @@ pub const Parser = struct {
 
     // ---- AST 节点分配辅助 ----
 
-    fn allocExpr(self: *Parser, expr: ast.Expr) ParserError!*ast.Expr {
-        const ptr = try self.arena.allocator().create(ast.Expr);
-        ptr.* = expr;
-        return ptr;
+    fn allocExpr(self: *Parser, loc: ast.SourceLocation, expr: ast.Expr) ParserError!*ast.Expr {
+        const slot = try self.expr_chunk.alloc(self.arena.allocator());
+        slot.* = .{ .loc = loc, .node = expr };
+        return &slot.node;
     }
 
-    fn allocStmt(self: *Parser, stmt: ast.Stmt) ParserError!*ast.Stmt {
-        const ptr = try self.arena.allocator().create(ast.Stmt);
-        ptr.* = stmt;
-        return ptr;
+    fn allocStmt(self: *Parser, loc: ast.SourceLocation, stmt: ast.Stmt) ParserError!*ast.Stmt {
+        const slot = try self.stmt_chunk.alloc(self.arena.allocator());
+        slot.* = .{ .loc = loc, .node = stmt };
+        return &slot.node;
     }
 
-    fn allocType(self: *Parser, ty: ast.TypeNode) ParserError!*ast.TypeNode {
-        const ptr = try self.arena.allocator().create(ast.TypeNode);
-        ptr.* = ty;
-        return ptr;
+    fn allocType(self: *Parser, loc: ast.SourceLocation, ty: ast.TypeNode) ParserError!*ast.TypeNode {
+        const slot = try self.type_chunk.alloc(self.arena.allocator());
+        slot.* = .{ .loc = loc, .node = ty };
+        return &slot.node;
     }
 
-    fn allocPattern(self: *Parser, pat: ast.Pattern) ParserError!*ast.Pattern {
-        const ptr = try self.arena.allocator().create(ast.Pattern);
-        ptr.* = pat;
-        return ptr;
+    fn allocPattern(self: *Parser, loc: ast.SourceLocation, pat: ast.Pattern) ParserError!*ast.Pattern {
+        const slot = try self.pattern_chunk.alloc(self.arena.allocator());
+        slot.* = .{ .loc = loc, .node = pat };
+        return &slot.node;
     }
 
-    fn allocKind(self: *Parser, kind: ast.Kind) ParserError!*ast.Kind {
-        const ptr = try self.arena.allocator().create(ast.Kind);
-        ptr.* = kind;
-        return ptr;
+    fn allocKind(self: *Parser, loc: ast.SourceLocation, kind: ast.Kind) ParserError!*ast.Kind {
+        const slot = try self.kind_chunk.alloc(self.arena.allocator());
+        slot.* = .{ .loc = loc, .node = kind };
+        return &slot.node;
     }
 
     // ---- 模块与顶层声明 ----
@@ -211,6 +257,7 @@ pub const Parser = struct {
     /// 解析整个模块：循环解析声明或顶层表达式，收集错误后返回 Module
     pub fn parseModule(self: *Parser, module_name: []const u8) ParserError!ast.Module {
         var declarations = std.ArrayList(ast.Decl).empty;
+        try declarations.ensureTotalCapacity(self.arena.allocator(), 16);
         errdefer declarations.deinit(self.arena.allocator());
         while (!self.isAtEnd()) {
             const at_decl_kw = self.check(.kw_fun) or self.check(.kw_type) or
@@ -241,9 +288,8 @@ pub const Parser = struct {
                     }
                     return err;
                 };
-                const stmt = try self.allocStmt(ast.Stmt{
+                const stmt = try self.allocStmt(getExprLocation(expr), ast.Stmt{
                     .assignment = .{
-                        .location = getExprLocation(expr),
                         .target = expr,
                         .value = value,
                     },
@@ -307,8 +353,8 @@ pub const Parser = struct {
                 .var_decl => |*vd| vd.visibility = visibility,
                 else => {},
             }
-            const dummy = self.allocExpr(ast.Expr{
-                .unit_literal = stmt.getLocation(),
+            const dummy = self.allocExpr(stmt.getLocation(), ast.Expr{
+                .unit_literal = {},
             }) catch return null;
             return ast.Decl{
                 .expr_decl = .{
@@ -327,8 +373,8 @@ pub const Parser = struct {
             self.check(.kw_throw) or self.check(.kw_return))
         {
             const stmt = self.parseStmt() catch return null;
-            const dummy = self.allocExpr(ast.Expr{
-                .unit_literal = stmt.getLocation(),
+            const dummy = self.allocExpr(stmt.getLocation(), ast.Expr{
+                .unit_literal = {},
             }) catch return null;
             return ast.Decl{
                 .expr_decl = .{
@@ -377,8 +423,8 @@ pub const Parser = struct {
                 .var_decl => |*vd| vd.visibility = visibility,
                 else => {},
             }
-            const dummy = try self.allocExpr(ast.Expr{
-                .unit_literal = stmt.getLocation(),
+            const dummy = try self.allocExpr(stmt.getLocation(), ast.Expr{
+                .unit_literal = {},
             });
             return ast.Decl{
                 .expr_decl = .{
@@ -457,7 +503,7 @@ pub const Parser = struct {
                 _ = self.expect(.r_paren, "expected ')' after trait list") catch {};
             }
             for (implemented_traits.items) |trait_bound| {
-                if (std.mem.eql(u8, trait_bound.trait_name, ast.type_names.error_type)) {
+                if (std.mem.eql(u8, trait_bound.trait_name, "Error")) {
                     has_error_trait = true;
                     break;
                 }
@@ -476,9 +522,6 @@ pub const Parser = struct {
         if (self.matchToken(.l_brace)) {
             try self.parseMethodBlock(&methods);
             _ = self.expect(.r_brace, "expected '}' to close method block") catch {};
-            if (def == .error_newtype) {
-                def.error_newtype.methods = try methods.toOwnedSlice(self.arena.allocator());
-            }
         }
         return ast.Decl{
             .type_decl = .{
@@ -489,7 +532,7 @@ pub const Parser = struct {
                 .implemented_traits = try implemented_traits.toOwnedSlice(self.arena.allocator()),
                 .type_constraints = try type_constraints.toOwnedSlice(self.arena.allocator()),
                 .def = def,
-                .methods = if (def == .error_newtype) &.{} else try methods.toOwnedSlice(self.arena.allocator()),
+                .methods = try methods.toOwnedSlice(self.arena.allocator()),
             },
         };
     }
@@ -529,7 +572,6 @@ pub const Parser = struct {
                                     .error_newtype = .{
                                         .name = name_tok.lexeme,
                                         .params = try params.toOwnedSlice(self.arena.allocator()),
-                                        .methods = &.{},
                                     },
                                 };
                             }
@@ -911,6 +953,7 @@ pub const Parser = struct {
 
     /// 解析类型参数列表（逗号分隔）
     fn parseTypeParamList(self: *Parser, type_params: *std.ArrayList(ast.TypeParam)) ParserError!void {
+        try type_params.ensureTotalCapacity(self.arena.allocator(), 2);
         try type_params.append(self.arena.allocator(), try self.parseTypeParam());
         while (self.matchToken(.comma)) {
             try type_params.append(self.arena.allocator(), try self.parseTypeParam());
@@ -967,8 +1010,9 @@ pub const Parser = struct {
     fn parseKindArrow(self: *Parser) ParserError!*ast.Kind {
         const left = try self.parseKindPrimary();
         if (self.matchToken(.minus_gt)) {
+            const arrow_tok = self.previous();
             const right = try self.parseKindArrow();
-            return self.allocKind(ast.Kind{
+            return self.allocKind(tokenLoc(arrow_tok), ast.Kind{
                 .arrow = .{
                     .param = left,
                     .result = right,
@@ -981,8 +1025,8 @@ pub const Parser = struct {
     /// 解析 kind 基本元素：* 或括号包裹的 kind
     fn parseKindPrimary(self: *Parser) ParserError!*ast.Kind {
         if (self.check(.star)) {
-            _ = self.advance();
-            return self.allocKind(ast.Kind.star);
+            const star_tok = self.advance();
+            return self.allocKind(tokenLoc(star_tok), ast.Kind.star);
         }
         if (self.matchToken(.l_paren)) {
             const kind = try self.parseKindArrow();
@@ -995,6 +1039,7 @@ pub const Parser = struct {
 
     /// 解析参数列表（逗号分隔，支持尾随逗号）
     fn parseParamList(self: *Parser, params: *std.ArrayList(ast.Param)) ParserError!void {
+        try params.ensureTotalCapacity(self.arena.allocator(), 4);
         try params.append(self.arena.allocator(), try self.parseParam());
         while (self.matchToken(.comma)) {
             if (self.check(.r_paren)) break;
@@ -1101,6 +1146,7 @@ pub const Parser = struct {
             const loc = tokenLoc(self.peek());
             _ = self.advance();
             var params = std.ArrayList(*ast.TypeNode).empty;
+            try params.ensureTotalCapacity(self.arena.allocator(), 4);
             if (!self.check(.r_paren)) {
                 try params.append(self.arena.allocator(), try self.parseType());
                 while (self.matchToken(.comma)) {
@@ -1111,9 +1157,8 @@ pub const Parser = struct {
             _ = self.expect(.r_paren, "expected ')'") catch {};
             _ = self.expect(.minus_gt, "expected '->'") catch {};
             const ret = try self.parseType();
-            return self.allocType(ast.TypeNode{
+            return self.allocType(loc, ast.TypeNode{
                 .function = .{
-                    .location = loc,
                     .params = try params.toOwnedSlice(self.arena.allocator()),
                     .return_type = ret,
                 },
@@ -1124,9 +1169,8 @@ pub const Parser = struct {
             var params = std.ArrayList(*ast.TypeNode).empty;
             try params.append(self.arena.allocator(), left);
             const ret = try self.parseType();
-            return self.allocType(ast.TypeNode{
+            return self.allocType(getTypeNodeLocation(left), ast.TypeNode{
                 .function = .{
-                    .location = getTypeNodeLocation(left),
                     .params = try params.toOwnedSlice(self.arena.allocator()),
                     .return_type = ret,
                 },
@@ -1166,9 +1210,8 @@ pub const Parser = struct {
                 .nullable => {
                 },
                 else => {
-                    ty = try self.allocType(ast.TypeNode{
+                    ty = try self.allocType(location, ast.TypeNode{
                         .nullable = .{
-                            .location = location,
                             .inner = ty,
                         },
                     });
@@ -1193,17 +1236,15 @@ pub const Parser = struct {
                 try args.append(self.arena.allocator(), try self.parseType());
             }
             self.expectCloseAngle("expected '>' to close type parameters") catch {};
-            ty = try self.allocType(ast.TypeNode{
+            ty = try self.allocType(location, ast.TypeNode{
                 .generic = .{
-                    .location = location,
                     .name = name_tok.lexeme,
                     .args = try args.toOwnedSlice(self.arena.allocator()),
                 },
             });
         } else {
-            ty = try self.allocType(ast.TypeNode{
+            ty = try self.allocType(location, ast.TypeNode{
                 .named = .{
-                    .location = location,
                     .name = name_tok.lexeme,
                 },
             });
@@ -1220,9 +1261,8 @@ pub const Parser = struct {
                 };
             }
             _ = self.expect(.r_bracket, "expected ']'") catch {};
-            ty = try self.allocType(ast.TypeNode{
+            ty = try self.allocType(arr_location, ast.TypeNode{
                 .array = .{
-                    .location = arr_location,
                     .element_type = ty,
                     .size = size,
                 },
@@ -1256,9 +1296,8 @@ pub const Parser = struct {
             }
         }
         _ = self.expect(.r_paren, "expected ')'") catch {};
-        return self.allocType(ast.TypeNode{
+        return self.allocType(location, ast.TypeNode{
             .record = .{
-                .location = location,
                 .fields = try fields.toOwnedSlice(self.arena.allocator()),
             },
         });
@@ -1277,9 +1316,8 @@ pub const Parser = struct {
         while (self.matchToken(.question_question)) {
             const op_tok = self.previous();
             const right = try self.parseOr();
-            left = try self.allocExpr(ast.Expr{
+            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .binary = .{
-                    .location = tokenLoc(op_tok),
                     .op = .elvis,
                     .left = left,
                     .right = right,
@@ -1295,9 +1333,8 @@ pub const Parser = struct {
         while (self.matchToken(.pipe_pipe)) {
             const op_tok = self.previous();
             const right = try self.parseAnd();
-            left = try self.allocExpr(ast.Expr{
+            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .binary = .{
-                    .location = tokenLoc(op_tok),
                     .op = .or_op,
                     .left = left,
                     .right = right,
@@ -1313,9 +1350,8 @@ pub const Parser = struct {
         while (self.matchToken(.amp_amp)) {
             const op_tok = self.previous();
             const right = try self.parseBitOr();
-            left = try self.allocExpr(ast.Expr{
+            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .binary = .{
-                    .location = tokenLoc(op_tok),
                     .op = .and_op,
                     .left = left,
                     .right = right,
@@ -1331,9 +1367,8 @@ pub const Parser = struct {
         while (self.matchToken(.pipe)) {
             const op_tok = self.previous();
             const right = try self.parseBitXor();
-            left = try self.allocExpr(ast.Expr{
+            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .binary = .{
-                    .location = tokenLoc(op_tok),
                     .op = .bit_or,
                     .left = left,
                     .right = right,
@@ -1349,9 +1384,8 @@ pub const Parser = struct {
         while (self.matchToken(.caret)) {
             const op_tok = self.previous();
             const right = try self.parseBitAnd();
-            left = try self.allocExpr(ast.Expr{
+            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .binary = .{
-                    .location = tokenLoc(op_tok),
                     .op = .bit_xor,
                     .left = left,
                     .right = right,
@@ -1367,9 +1401,8 @@ pub const Parser = struct {
         while (self.matchToken(.ampersand)) {
             const op_tok = self.previous();
             const right = try self.parseEquality();
-            left = try self.allocExpr(ast.Expr{
+            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .binary = .{
-                    .location = tokenLoc(op_tok),
                     .op = .bit_and,
                     .left = left,
                     .right = right,
@@ -1386,9 +1419,8 @@ pub const Parser = struct {
             if (self.matchToken(.eq_eq)) {
                 const op_tok = self.previous();
                 const right = try self.parseComparison();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = .eq,
                         .left = left,
                         .right = right,
@@ -1397,9 +1429,8 @@ pub const Parser = struct {
             } else if (self.matchToken(.bang_eq)) {
                 const op_tok = self.previous();
                 const right = try self.parseComparison();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = .not_eq,
                         .left = left,
                         .right = right,
@@ -1426,9 +1457,8 @@ pub const Parser = struct {
             if (op) |o| {
                 const op_tok = self.advance();
                 const right = try self.parseRange();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = o,
                         .left = left,
                         .right = right,
@@ -1448,9 +1478,8 @@ pub const Parser = struct {
             if (self.matchToken(.dot_dot)) {
                 const op_tok = self.previous();
                 const right = try self.parseAddition();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = .range,
                         .left = left,
                         .right = right,
@@ -1459,9 +1488,8 @@ pub const Parser = struct {
             } else if (self.matchToken(.dot_dot_eq)) {
                 const op_tok = self.previous();
                 const right = try self.parseAddition();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = .range_inclusive,
                         .left = left,
                         .right = right,
@@ -1481,9 +1509,8 @@ pub const Parser = struct {
             if (self.matchToken(.plus)) {
                 const op_tok = self.previous();
                 const right = try self.parseMultiplication();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = .add,
                         .left = left,
                         .right = right,
@@ -1492,9 +1519,8 @@ pub const Parser = struct {
             } else if (self.matchToken(.plus_plus)) {
                 const op_tok = self.previous();
                 const right = try self.parseMultiplication();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = .concat_list,
                         .left = left,
                         .right = right,
@@ -1503,9 +1529,8 @@ pub const Parser = struct {
             } else if (self.matchToken(.minus)) {
                 const op_tok = self.previous();
                 const right = try self.parseMultiplication();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = .sub,
                         .left = left,
                         .right = right,
@@ -1531,9 +1556,8 @@ pub const Parser = struct {
             if (op) |o| {
                 const op_tok = self.advance();
                 const right = try self.parseUnary();
-                left = try self.allocExpr(ast.Expr{
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
-                        .location = tokenLoc(op_tok),
                         .op = o,
                         .left = left,
                         .right = right,
@@ -1551,9 +1575,8 @@ pub const Parser = struct {
         if (self.matchToken(.bang)) {
             const op_tok = self.previous();
             const operand = try self.parseUnary();
-            return self.allocExpr(ast.Expr{
+            return self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .unary = .{
-                    .location = tokenLoc(op_tok),
                     .op = .not,
                     .operand = operand,
                 },
@@ -1571,9 +1594,8 @@ pub const Parser = struct {
                 return self.parseNegativeFloatLiteral(op_tok, lit_tok);
             }
             const operand = try self.parseUnary();
-            return self.allocExpr(ast.Expr{
+            return self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .unary = .{
-                    .location = tokenLoc(op_tok),
                     .op = .neg,
                     .operand = operand,
                 },
@@ -1588,17 +1610,15 @@ pub const Parser = struct {
         while (true) {
             if (self.matchToken(.question)) {
                 const op_tok = self.previous();
-                expr_node = try self.allocExpr(ast.Expr{
+                expr_node = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .propagate = .{
-                        .location = tokenLoc(op_tok),
                         .expr = expr_node,
                     },
                 });
             } else if (self.matchToken(.bang)) {
                 const op_tok = self.previous();
-                expr_node = try self.allocExpr(ast.Expr{
+                expr_node = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .non_null_assert = .{
-                        .location = tokenLoc(op_tok),
                         .expr = expr_node,
                     },
                 });
@@ -1608,6 +1628,7 @@ pub const Parser = struct {
                 const field_tok = try self.expect(.identifier, "expected field or method name");
                 if (self.check(.l_paren)) {
                     var args = std.ArrayList(*ast.Expr).empty;
+                    try args.ensureTotalCapacity(self.arena.allocator(), 4);
                     var type_args: ?[]*ast.TypeNode = null;
                     if (self.matchToken(.lt)) {
                         var ta = std.ArrayList(*ast.TypeNode).empty;
@@ -1623,9 +1644,8 @@ pub const Parser = struct {
                         }
                     }
                     _ = self.expect(.r_paren, "expected ')'") catch {};
-                    expr_node = try self.allocExpr(ast.Expr{
+                    expr_node = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                         .safe_method_call = .{
-                            .location = tokenLoc(op_tok),
                             .object = expr_node,
                             .method = field_tok.lexeme,
                             .arguments = try args.toOwnedSlice(self.arena.allocator()),
@@ -1633,9 +1653,8 @@ pub const Parser = struct {
                         },
                     });
                 } else {
-                    expr_node = try self.allocExpr(ast.Expr{
+                    expr_node = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                         .safe_access = .{
-                            .location = tokenLoc(op_tok),
                             .object = expr_node,
                             .field = field_tok.lexeme,
                         },
@@ -1647,6 +1666,7 @@ pub const Parser = struct {
                 const field_tok = try self.expect(.identifier, "expected field or method name");
                 if (self.check(.l_paren)) {
                     var args = std.ArrayList(*ast.Expr).empty;
+                    try args.ensureTotalCapacity(self.arena.allocator(), 4);
                     var type_args: ?[]*ast.TypeNode = null;
                     if (self.matchToken(.lt)) {
                         var ta = std.ArrayList(*ast.TypeNode).empty;
@@ -1662,9 +1682,8 @@ pub const Parser = struct {
                         }
                     }
                     _ = self.expect(.r_paren, "expected ')'") catch {};
-                    expr_node = try self.allocExpr(ast.Expr{
+                    expr_node = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                         .method_call = .{
-                            .location = tokenLoc(op_tok),
                             .object = expr_node,
                             .method = field_tok.lexeme,
                             .arguments = try args.toOwnedSlice(self.arena.allocator()),
@@ -1672,9 +1691,8 @@ pub const Parser = struct {
                         },
                     });
                 } else {
-                    expr_node = try self.allocExpr(ast.Expr{
+                    expr_node = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                         .field_access = .{
-                            .location = tokenLoc(op_tok),
                             .object = expr_node,
                             .field = field_tok.lexeme,
                         },
@@ -1693,6 +1711,7 @@ pub const Parser = struct {
                 }
                 const call_tok = self.peek();
                 var args = std.ArrayList(*ast.Expr).empty;
+                try args.ensureTotalCapacity(self.arena.allocator(), 4);
                 var type_args: ?[]*ast.TypeNode = null;
                 if (self.matchToken(.lt)) {
                     var ta = std.ArrayList(*ast.TypeNode).empty;
@@ -1712,9 +1731,8 @@ pub const Parser = struct {
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
-                expr_node = try self.allocExpr(ast.Expr{
+                expr_node = try self.allocExpr(tokenLoc(call_tok), ast.Expr{
                     .call = .{
-                        .location = tokenLoc(call_tok),
                         .callee = expr_node,
                         .arguments = try args.toOwnedSlice(self.arena.allocator()),
                         .type_args = type_args,
@@ -1738,6 +1756,7 @@ pub const Parser = struct {
                 }
                 const call_tok = self.peek();
                 var args = std.ArrayList(*ast.Expr).empty;
+                try args.ensureTotalCapacity(self.arena.allocator(), 4);
                 _ = self.expect(.l_paren, "expected '('") catch {};
                 if (!self.check(.r_paren)) {
                     try args.append(self.arena.allocator(), try self.parseExpr());
@@ -1746,9 +1765,8 @@ pub const Parser = struct {
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
-                expr_node = try self.allocExpr(ast.Expr{
+                expr_node = try self.allocExpr(tokenLoc(call_tok), ast.Expr{
                     .call = .{
-                        .location = tokenLoc(call_tok),
                         .callee = expr_node,
                         .arguments = try args.toOwnedSlice(self.arena.allocator()),
                         .type_args = type_args,
@@ -1759,9 +1777,8 @@ pub const Parser = struct {
                 const bracket_tok = self.previous();
                 const index = try self.parseExpr();
                 _ = self.expect(.r_bracket, "expected ']'") catch {};
-                expr_node = try self.allocExpr(ast.Expr{
+                expr_node = try self.allocExpr(tokenLoc(bracket_tok), ast.Expr{
                     .index = .{
-                        .location = tokenLoc(bracket_tok),
                         .object = expr_node,
                         .index = index,
                     },
@@ -1809,27 +1826,24 @@ pub const Parser = struct {
         }
         if (self.matchToken(.true_literal)) {
             const tok = self.previous();
-            return self.allocExpr(ast.Expr{
+            return self.allocExpr(tokenLoc(tok), ast.Expr{
                 .bool_literal = .{
-                    .location = tokenLoc(tok),
                     .value = true,
                 },
             });
         }
         if (self.matchToken(.false_literal)) {
             const tok = self.previous();
-            return self.allocExpr(ast.Expr{
+            return self.allocExpr(tokenLoc(tok), ast.Expr{
                 .bool_literal = .{
-                    .location = tokenLoc(tok),
                     .value = false,
                 },
             });
         }
         if (self.matchToken(.char_literal)) {
             const tok = self.previous();
-            return self.allocExpr(ast.Expr{
+            return self.allocExpr(tokenLoc(tok), ast.Expr{
                 .char_literal = .{
-                    .location = tokenLoc(tok),
                     .value = parseCharValue(tok.lexeme),
                 },
             });
@@ -1840,8 +1854,8 @@ pub const Parser = struct {
         }
         if (self.matchToken(.null_literal)) {
             const tok = self.previous();
-            return self.allocExpr(ast.Expr{
-                .null_literal = tokenLoc(tok),
+            return self.allocExpr(tokenLoc(tok), ast.Expr{
+                .null_literal = {},
             });
         }
         if (self.check(.kw_fun)) {
@@ -1889,9 +1903,8 @@ pub const Parser = struct {
             self.tokens[self.current + 1].type == .l_paren)
         {
             const tok = self.advance();
-            return self.allocExpr(ast.Expr{
+            return self.allocExpr(tokenLoc(tok), ast.Expr{
                 .identifier = .{
-                    .location = tokenLoc(tok),
                     .name = tok.lexeme,
                 },
             });
@@ -1903,9 +1916,8 @@ pub const Parser = struct {
                 }
             }
             const tok = self.advance();
-            return self.allocExpr(ast.Expr{
+            return self.allocExpr(tokenLoc(tok), ast.Expr{
                 .identifier = .{
-                    .location = tokenLoc(tok),
                     .name = tok.lexeme,
                 },
             });
@@ -1931,9 +1943,8 @@ pub const Parser = struct {
         if (i < raw.len) {
             suffix = raw[i..];
         }
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(tok), ast.Expr{
             .int_literal = .{
-                .location = tokenLoc(tok),
                 .raw = raw[0..i],
                 .suffix = suffix,
             },
@@ -1958,10 +1969,11 @@ pub const Parser = struct {
         if (i < lit_raw.len) {
             suffix = lit_raw[i..];
         }
-        const neg_raw = try std.fmt.allocPrint(self.arena.allocator(), "-{s}", .{lit_raw[0..i]});
-        return self.allocExpr(ast.Expr{
+        const neg_raw = try self.arena.allocator().alloc(u8, i + 1);
+        neg_raw[0] = '-';
+        @memcpy(neg_raw[1..], lit_raw[0..i]);
+        return self.allocExpr(tokenLoc(lit_tok), ast.Expr{
             .int_literal = .{
-                .location = tokenLoc(lit_tok),
                 .raw = neg_raw,
                 .suffix = suffix,
             },
@@ -1995,10 +2007,11 @@ pub const Parser = struct {
         } else {
             i = lit_raw.len;
         }
-        const neg_raw = try std.fmt.allocPrint(self.arena.allocator(), "-{s}", .{lit_raw[0..i]});
-        return self.allocExpr(ast.Expr{
+        const neg_raw = try self.arena.allocator().alloc(u8, i + 1);
+        neg_raw[0] = '-';
+        @memcpy(neg_raw[1..], lit_raw[0..i]);
+        return self.allocExpr(tokenLoc(lit_tok), ast.Expr{
             .float_literal = .{
-                .location = tokenLoc(lit_tok),
                 .raw = neg_raw,
                 .suffix = suffix,
             },
@@ -2031,9 +2044,8 @@ pub const Parser = struct {
         } else {
             i = raw.len;
         }
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(tok), ast.Expr{
             .float_literal = .{
-                .location = tokenLoc(tok),
                 .raw = raw[0..i],
                 .suffix = suffix,
             },
@@ -2046,9 +2058,8 @@ pub const Parser = struct {
         if (!containsInterpolation(raw)) {
             const content = raw[1 .. raw.len - 1];
             const value = try self.unescapeString(content);
-            return self.allocExpr(ast.Expr{
+            return self.allocExpr(tokenLoc(tok), ast.Expr{
                 .string_literal = .{
-                    .location = tokenLoc(tok),
                     .value = value,
                 },
             });
@@ -2105,26 +2116,56 @@ pub const Parser = struct {
             const text = try self.unescapeString(content[literal_start..]);
             try parts.append(self.arena.allocator(), ast.InterpolationPart{ .literal = text });
         }
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(tok), ast.Expr{
             .string_interpolation = .{
-                .location = tokenLoc(tok),
                 .parts = try parts.toOwnedSlice(self.arena.allocator()),
             },
         });
     }
 
-    /// 对插值表达式文本进行词法+语法分析，返回其 AST 节点
+    /// 对插值表达式文本进行词法+语法分析，返回其 AST 节点。
+    /// 复用当前 Parser（保存/恢复状态），避免创建嵌套 ArenaAllocator。
     fn parseInterpolationExpr(self: *Parser, text: []const u8) ParserError!*ast.Expr {
         var interp_lex = lexer.Lexer.init(self.arena.allocator(), text);
         const tokens = interp_lex.tokenize() catch return error.UnexpectedToken;
-        defer self.arena.allocator().free(tokens);
-        var interp_parser = Parser.init(self.arena.allocator(), tokens);
-        const expr = interp_parser.parseExpr() catch return error.UnexpectedToken;
+        // tokens 由 arena 管理，无需手动释放
+        const saved_tokens = self.tokens;
+        const saved_current = self.current;
+        const saved_pending_eq = self.pending_eq;
+        const saved_error_count = self.errors.items.len;
+        self.tokens = tokens;
+        self.current = 0;
+        self.pending_eq = false;
+        const expr = self.parseExpr() catch {
+            // 恢复解析器状态
+            self.tokens = saved_tokens;
+            self.current = saved_current;
+            self.pending_eq = saved_pending_eq;
+            self.errors.shrinkRetainingCapacity(saved_error_count);
+            return error.UnexpectedToken;
+        };
+        // 恢复解析器状态
+        self.tokens = saved_tokens;
+        self.current = saved_current;
+        self.pending_eq = saved_pending_eq;
         return expr;
     }
 
     /// 反转义字符串：处理 \n \t \r \\ \" \{ \} 以及 {{ }} 转义
     fn unescapeString(self: *Parser, text: []const u8) ParserError![]const u8 {
+        // 快路径：单次扫描检测是否含转义序列（\、{{、}}），若无则零拷贝返回原切片
+        {
+            var i: usize = 0;
+            while (i < text.len) {
+                const c = text[i];
+                if (c == '\\') break;
+                if (c == '{' and i + 1 < text.len and text[i + 1] == '{') break;
+                if (c == '}' and i + 1 < text.len and text[i + 1] == '}') break;
+                i += 1;
+            }
+            if (i >= text.len) return text;
+        }
+        // 慢路径：逐字符处理转义
         var result = std.ArrayList(u8).empty;
         errdefer result.deinit(self.arena.allocator());
         var i: usize = 0;
@@ -2191,9 +2232,8 @@ pub const Parser = struct {
         _ = self.expect(.r_paren, "expected ')'") catch {};
         const body_expr = try self.parseExpr();
         const body = ast.LambdaBody{ .block = body_expr };
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(location, ast.Expr{
             .lambda = .{
-                .location = location,
                 .params = try params.toOwnedSlice(self.arena.allocator()),
                 .body = body,
                 .is_async = is_async,
@@ -2210,9 +2250,8 @@ pub const Parser = struct {
         if (self.matchToken(.kw_else)) {
             else_branch = try self.parseExpr();
         }
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(if_tok), ast.Expr{
             .if_expr = .{
-                .location = tokenLoc(if_tok),
                 .condition = condition,
                 .then_branch = then_branch,
                 .else_branch = else_branch,
@@ -2226,6 +2265,7 @@ pub const Parser = struct {
         const scrutinee = try self.parseExpr();
         _ = self.expect(.l_brace, "expected '{'") catch {};
         var arms = std.ArrayList(ast.MatchArm).empty;
+        try arms.ensureTotalCapacity(self.arena.allocator(), 4);
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             const arm = self.parseMatchArm() catch |err| {
                 if (err == error.UnexpectedToken) {
@@ -2241,9 +2281,8 @@ pub const Parser = struct {
             _ = self.matchToken(.comma);
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(match_tok), ast.Expr{
             .match = .{
-                .location = tokenLoc(match_tok),
                 .scrutinee = scrutinee,
                 .arms = try arms.toOwnedSlice(self.arena.allocator()),
             },
@@ -2265,10 +2304,10 @@ pub const Parser = struct {
             const stmt_tok = self.peek();
             const stmt = try self.parseStmt();
             var stmts = std.ArrayList(*ast.Stmt).empty;
+            try stmts.ensureTotalCapacity(self.arena.allocator(), 1);
             try stmts.append(self.arena.allocator(), stmt);
-            break :blk try self.allocExpr(ast.Expr{
+            break :blk try self.allocExpr(tokenLoc(stmt_tok), ast.Expr{
                 .block = .{
-                    .location = tokenLoc(stmt_tok),
                     .statements = try stmts.toOwnedSlice(self.arena.allocator()),
                     .trailing_expr = null,
                 },
@@ -2285,9 +2324,8 @@ pub const Parser = struct {
     fn parseLazyExpr(self: *Parser) ParserError!*ast.Expr {
         const lazy_tok = self.previous();
         const expr = try self.parseExpr();
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(lazy_tok), ast.Expr{
             .lazy = .{
-                .location = tokenLoc(lazy_tok),
                 .expr = expr,
             },
         });
@@ -2297,9 +2335,8 @@ pub const Parser = struct {
     fn parseAtomicExpr(self: *Parser) ParserError!*ast.Expr {
         const atomic_tok = self.previous();
         const value_expr = try self.parsePrimary();
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(atomic_tok), ast.Expr{
             .atomic_expr = .{
-                .location = tokenLoc(atomic_tok),
                 .value = value_expr,
             },
         }) catch return error.OutOfMemory;
@@ -2315,9 +2352,8 @@ pub const Parser = struct {
             _ = self.matchToken(.comma);
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(select_tok), ast.Expr{
             .select = .{
-                .location = tokenLoc(select_tok),
                 .arms = try arms.toOwnedSlice(self.arena.allocator()),
             },
         });
@@ -2371,9 +2407,8 @@ pub const Parser = struct {
             try methods.append(self.arena.allocator(), try self.parseMethodDecl());
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(trait_tok), ast.Expr{
             .inline_trait_value = .{
-                .location = tokenLoc(trait_tok),
                 .methods = try methods.toOwnedSlice(self.arena.allocator()),
             },
         });
@@ -2391,9 +2426,8 @@ pub const Parser = struct {
             }
         }
         _ = self.expect(.r_bracket, "expected ']'") catch {};
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(tokenLoc(bracket_tok), ast.Expr{
             .array_literal = .{
-                .location = tokenLoc(bracket_tok),
                 .elements = try elements.toOwnedSlice(self.arena.allocator()),
             },
         });
@@ -2404,6 +2438,7 @@ pub const Parser = struct {
         const brace_tok = self.advance();
         const location = tokenLoc(brace_tok);
         var statements = std.ArrayList(*ast.Stmt).empty;
+        try statements.ensureTotalCapacity(self.arena.allocator(), 8);
         var trailing_expr: ?*ast.Expr = null;
         while (!self.check(.r_brace) and !self.isAtEnd()) {
             if (self.isStmtStart()) {
@@ -2427,9 +2462,8 @@ pub const Parser = struct {
             }
         }
         _ = self.expect(.r_brace, "expected '}'") catch {};
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(location, ast.Expr{
             .block = .{
-                .location = location,
                 .statements = try statements.toOwnedSlice(self.arena.allocator()),
                 .trailing_expr = trailing_expr,
             },
@@ -2441,8 +2475,8 @@ pub const Parser = struct {
         const lparen_tok = self.previous();
         const location = tokenLoc(lparen_tok);
         if (self.matchToken(.r_paren)) {
-            return self.allocExpr(ast.Expr{
-                .unit_literal = location,
+            return self.allocExpr(location, ast.Expr{
+                .unit_literal = {},
             });
         }
         const saved = self.current;
@@ -2467,9 +2501,8 @@ pub const Parser = struct {
                     });
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
-                return self.allocExpr(ast.Expr{
+                return self.allocExpr(location, ast.Expr{
                     .record_extend = .{
-                        .location = location,
                         .base = base_expr,
                         .updates = try updates.toOwnedSlice(self.arena.allocator()),
                     },
@@ -2506,9 +2539,8 @@ pub const Parser = struct {
                             });
                         }
                         _ = self.expect(.r_paren, "expected ')'") catch {};
-                        return self.allocExpr(ast.Expr{
+                        return self.allocExpr(location, ast.Expr{
                             .record_extend = .{
-                                .location = location,
                                 .base = base_expr,
                                 .updates = try updates.toOwnedSlice(self.arena.allocator()),
                             },
@@ -2523,9 +2555,8 @@ pub const Parser = struct {
                     });
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
-                return self.allocExpr(ast.Expr{
+                return self.allocExpr(location, ast.Expr{
                     .record_literal = .{
-                        .location = location,
                         .fields = try fields.toOwnedSlice(self.arena.allocator()),
                     },
                 });
@@ -2574,9 +2605,8 @@ pub const Parser = struct {
         _ = self.advance();
         const body_expr = self.parseExpr() catch return null;
         const body = ast.LambdaBody{ .expression = body_expr };
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(location, ast.Expr{
             .lambda = .{
-                .location = location,
                 .params = params.toOwnedSlice(self.arena.allocator()) catch return null,
                 .body = body,
             },
@@ -2617,18 +2647,16 @@ pub const Parser = struct {
     fn parseTypeCast(self: *Parser) ParserError!*ast.Expr {
         const name_tok = self.advance();
         const location = tokenLoc(name_tok);
-        const target_type = try self.allocType(ast.TypeNode{
+        const target_type = try self.allocType(location, ast.TypeNode{
             .named = .{
-                .location = location,
                 .name = name_tok.lexeme,
             },
         });
         _ = self.expect(.l_paren, "expected '('") catch {};
         const expr = try self.parseExpr();
         _ = self.expect(.r_paren, "expected ')'") catch {};
-        return self.allocExpr(ast.Expr{
+        return self.allocExpr(location, ast.Expr{
             .type_cast = .{
-                .location = location,
                 .target_type = target_type,
                 .expr = expr,
             },
@@ -2648,9 +2676,8 @@ pub const Parser = struct {
         while (self.matchToken(.pipe)) {
             const pipe_tok = self.previous();
             const right = try self.parsePrimaryPattern();
-            left = try self.allocPattern(ast.Pattern{
+            left = try self.allocPattern(tokenLoc(pipe_tok), ast.Pattern{
                 .or_pattern = .{
-                    .location = tokenLoc(pipe_tok),
                     .left = left,
                     .right = right,
                 },
@@ -2663,48 +2690,48 @@ pub const Parser = struct {
     fn parsePrimaryPattern(self: *Parser) ParserError!*ast.Pattern {
         if (self.check(.identifier) and std.mem.eql(u8, self.peek().lexeme, "_")) {
             const tok = self.advance();
-            return self.allocPattern(ast.Pattern{
-                .wildcard = tokenLoc(tok),
+            return self.allocPattern(tokenLoc(tok), ast.Pattern{
+                .wildcard = {},
             });
         }
         if (self.matchToken(.null_literal)) {
             const tok = self.previous();
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(tok), ast.Pattern{
                 .literal = .{ .null = tokenLoc(tok) },
             });
         }
         if (self.matchToken(.true_literal)) {
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(self.previous()), ast.Pattern{
                 .literal = .{ .bool = true },
             });
         }
         if (self.matchToken(.false_literal)) {
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(self.previous()), ast.Pattern{
                 .literal = .{ .bool = false },
             });
         }
         if (self.matchToken(.int_literal)) {
             const tok = self.previous();
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(tok), ast.Pattern{
                 .literal = .{ .int = tok.lexeme },
             });
         }
         if (self.matchToken(.float_literal)) {
             const tok = self.previous();
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(tok), ast.Pattern{
                 .literal = .{ .float = tok.lexeme },
             });
         }
         if (self.matchToken(.char_literal)) {
             const tok = self.previous();
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(tok), ast.Pattern{
                 .literal = .{ .char = parseCharValue(tok.lexeme) },
             });
         }
         if (self.matchToken(.string_literal)) {
             const tok = self.previous();
             const value = tok.lexeme[1 .. tok.lexeme.len - 1];
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(tok), ast.Pattern{
                 .literal = .{ .string = value },
             });
         }
@@ -2723,17 +2750,15 @@ pub const Parser = struct {
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
-                return self.allocPattern(ast.Pattern{
+                return self.allocPattern(tokenLoc(name_tok), ast.Pattern{
                     .constructor = .{
-                        .location = tokenLoc(name_tok),
                         .name = name_tok.lexeme,
                         .patterns = try patterns.toOwnedSlice(self.arena.allocator()),
                     },
                 });
             }
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(name_tok), ast.Pattern{
                 .variable = .{
-                    .location = tokenLoc(name_tok),
                     .name = name_tok.lexeme,
                 },
             });
@@ -2750,17 +2775,15 @@ pub const Parser = struct {
                     }
                 }
                 _ = self.expect(.r_paren, "expected ')'") catch {};
-                return self.allocPattern(ast.Pattern{
+                return self.allocPattern(tokenLoc(name_tok), ast.Pattern{
                     .constructor = .{
-                        .location = tokenLoc(name_tok),
                         .name = name_tok.lexeme,
                         .patterns = try patterns.toOwnedSlice(self.arena.allocator()),
                     },
                 });
             }
-            return self.allocPattern(ast.Pattern{
+            return self.allocPattern(tokenLoc(name_tok), ast.Pattern{
                 .variable = .{
-                    .location = tokenLoc(name_tok),
                     .name = name_tok.lexeme,
                 },
             });
@@ -2797,9 +2820,8 @@ pub const Parser = struct {
                         });
                     }
                     _ = self.expect(.r_paren, "expected ')'") catch {};
-                    return self.allocPattern(ast.Pattern{
+                    return self.allocPattern(location, ast.Pattern{
                         .record = .{
-                            .location = location,
                             .fields = try fields.toOwnedSlice(self.arena.allocator()),
                         },
                     });
@@ -2826,9 +2848,8 @@ pub const Parser = struct {
             }
         }
         _ = self.expect(.r_paren, "expected ')'") catch {};
-        return self.allocPattern(ast.Pattern{
+        return self.allocPattern(location, ast.Pattern{
             .record = .{
-                .location = location,
                 .fields = try fields.toOwnedSlice(self.arena.allocator()),
             },
         });
@@ -2877,14 +2898,14 @@ pub const Parser = struct {
         }
         if (self.matchToken(.kw_break)) {
             const tok = self.previous();
-            return self.allocStmt(ast.Stmt{
-                .break_stmt = .{ .location = tokenLoc(tok) },
+            return self.allocStmt(tokenLoc(tok), ast.Stmt{
+                .break_stmt = .{ },
             });
         }
         if (self.matchToken(.kw_continue)) {
             const tok = self.previous();
-            return self.allocStmt(ast.Stmt{
-                .continue_stmt = .{ .location = tokenLoc(tok) },
+            return self.allocStmt(tokenLoc(tok), ast.Stmt{
+                .continue_stmt = .{ },
             });
         }
         if (self.matchToken(.kw_for)) {
@@ -2916,17 +2937,15 @@ pub const Parser = struct {
             }
             const body_expr = try self.parseExpr();
             const body = ast.LambdaBody{ .block = body_expr };
-            const lambda_expr = try self.allocExpr(ast.Expr{
+            const lambda_expr = try self.allocExpr(tokenLoc(fun_tok), ast.Expr{
                 .lambda = .{
-                    .location = tokenLoc(fun_tok),
                     .params = try params.toOwnedSlice(self.arena.allocator()),
                     .body = body,
                     .return_type = return_type,
                 },
             });
-            return self.allocStmt(ast.Stmt{
+            return self.allocStmt(tokenLoc(fun_tok), ast.Stmt{
                 .val_decl = .{
-                    .location = tokenLoc(fun_tok),
                     .name = name_tok.lexeme,
                     .type_annotation = null,
                     .value = lambda_expr,
@@ -2941,16 +2960,14 @@ pub const Parser = struct {
         _ = self.expect(.r_paren, "expected ')'") catch {};
         const body_expr = try self.parseExpr();
         const body = ast.LambdaBody{ .block = body_expr };
-        const lambda_expr = try self.allocExpr(ast.Expr{
+        const lambda_expr = try self.allocExpr(tokenLoc(fun_tok), ast.Expr{
             .lambda = .{
-                .location = tokenLoc(fun_tok),
                 .params = try params.toOwnedSlice(self.arena.allocator()),
                 .body = body,
             },
         });
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(fun_tok), ast.Stmt{
             .expression = .{
-                .location = tokenLoc(fun_tok),
                 .expr = lambda_expr,
             },
         });
@@ -2966,9 +2983,8 @@ pub const Parser = struct {
         }
         _ = self.expect(.eq, "expected '='") catch {};
         const value = try self.parseExpr();
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(val_tok), ast.Stmt{
             .val_decl = .{
-                .location = tokenLoc(val_tok),
                 .name = name_tok.lexeme,
                 .type_annotation = type_annotation,
                 .value = value,
@@ -2986,9 +3002,8 @@ pub const Parser = struct {
         }
         _ = self.expect(.eq, "expected '='") catch {};
         const value = try self.parseExpr();
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(var_tok), ast.Stmt{
             .var_decl = .{
-                .location = tokenLoc(var_tok),
                 .name = name_tok.lexeme,
                 .type_annotation = type_annotation,
                 .value = value,
@@ -3003,9 +3018,8 @@ pub const Parser = struct {
         if (!self.check(.r_brace) and !self.isStmtStart() and !self.isAtEnd()) {
             value = try self.parseExpr();
         }
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(return_tok), ast.Stmt{
             .return_stmt = .{
-                .location = tokenLoc(return_tok),
                 .value = value,
             },
         });
@@ -3017,23 +3031,20 @@ pub const Parser = struct {
         const expr = try self.parseExpr();
         if (self.matchToken(.eq)) {
             const value = try self.parseExpr();
-            const assign_expr = try self.allocExpr(ast.Expr{
+            const assign_expr = try self.allocExpr(getExprLocation(expr), ast.Expr{
                 .assignment_expr = .{
-                    .location = getExprLocation(expr),
                     .target = expr,
                     .value = value,
                 },
             });
-            return self.allocStmt(ast.Stmt{
+            return self.allocStmt(tokenLoc(defer_tok), ast.Stmt{
                 .defer_stmt = .{
-                    .location = tokenLoc(defer_tok),
                     .expr = assign_expr,
                 },
             });
         }
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(defer_tok), ast.Stmt{
             .defer_stmt = .{
-                .location = tokenLoc(defer_tok),
                 .expr = expr,
             },
         });
@@ -3043,9 +3054,8 @@ pub const Parser = struct {
     fn parseThrowStmt(self: *Parser) ParserError!*ast.Stmt {
         const throw_tok = self.previous();
         const expr = try self.parseExpr();
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(throw_tok), ast.Stmt{
             .throw_stmt = .{
-                .location = tokenLoc(throw_tok),
                 .expr = expr,
             },
         });
@@ -3058,9 +3068,8 @@ pub const Parser = struct {
         _ = self.expect(.kw_in, "expected 'in'") catch {};
         const iterable = try self.parseExpr();
         const body = try self.parseExpr();
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(for_tok), ast.Stmt{
             .for_stmt = .{
-                .location = tokenLoc(for_tok),
                 .name = name_tok.lexeme,
                 .iterable = iterable,
                 .body = body,
@@ -3073,9 +3082,8 @@ pub const Parser = struct {
         const while_tok = self.previous();
         const condition = try self.parseExpr();
         const body = try self.parseExpr();
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(while_tok), ast.Stmt{
             .while_stmt = .{
-                .location = tokenLoc(while_tok),
                 .condition = condition,
                 .body = body,
             },
@@ -3086,9 +3094,8 @@ pub const Parser = struct {
     fn parseLoopStmt(self: *Parser) ParserError!*ast.Stmt {
         const loop_tok = self.previous();
         const body = try self.parseExpr();
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(tokenLoc(loop_tok), ast.Stmt{
             .loop_stmt = .{
-                .location = tokenLoc(loop_tok),
                 .body = body,
             },
         });
@@ -3101,19 +3108,17 @@ pub const Parser = struct {
             const eq_tok = self.previous();
             const value = try self.parseExpr();
             switch (expr.*) {
-                .identifier => |id| {
-                    return self.allocStmt(ast.Stmt{
+                .identifier => {
+                    return self.allocStmt(getExprLocation(expr), ast.Stmt{
                         .assignment = .{
-                            .location = id.location,
                             .target = expr,
                             .value = value,
                         },
                     });
                 },
                 .field_access => |fa| {
-                    return self.allocStmt(ast.Stmt{
+                    return self.allocStmt(tokenLoc(eq_tok), ast.Stmt{
                         .field_assignment = .{
-                            .location = tokenLoc(eq_tok),
                             .object = fa.object,
                             .field = fa.field,
                             .value = value,
@@ -3121,9 +3126,8 @@ pub const Parser = struct {
                     });
                 },
                 else => {
-                    return self.allocStmt(ast.Stmt{
+                    return self.allocStmt(tokenLoc(eq_tok), ast.Stmt{
                         .assignment = .{
-                            .location = tokenLoc(eq_tok),
                             .target = expr,
                             .value = value,
                         },
@@ -3137,18 +3141,16 @@ pub const Parser = struct {
             const op_tok = self.previous();
             const value = try self.parseExpr();
             const op = compound_op.?;
-            return self.allocStmt(ast.Stmt{
+            return self.allocStmt(tokenLoc(op_tok), ast.Stmt{
                 .compound_assignment = .{
-                    .location = tokenLoc(op_tok),
                     .target = expr,
                     .op = op,
                     .value = value,
                 },
             });
         }
-        return self.allocStmt(ast.Stmt{
+        return self.allocStmt(getExprLocation(expr), ast.Stmt{
             .expression = .{
-                .location = getExprLocation(expr),
                 .expr = expr,
             },
         });
@@ -3182,16 +3184,7 @@ fn tokenLoc(token: lexer.Token) ast.SourceLocation {
 
 /// 返回类型节点的源码位置
 fn getTypeNodeLocation(ty: *const ast.TypeNode) ast.SourceLocation {
-    return switch (ty.*) {
-        .named => |n| n.location,
-        .self_type => |s| s.location,
-        .generic => |g| g.location,
-        .nullable => |n| n.location,
-        .function => |f| f.location,
-        .record => |r| r.location,
-        .array => |a| a.location,
-        .kind_annotated => |k| k.location,
-    };
+    return ast.typeNodeLocation(ty);
 }
 
 /// 返回表达式的源码位置（委托给 ast.exprLocation）

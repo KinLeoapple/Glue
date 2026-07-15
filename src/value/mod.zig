@@ -7,7 +7,7 @@
 //! 提供值的构造、访问、引用计数管理、深拷贝、格式化和相等性比较。
 
 const std = @import("std");
-const obj_header = @import("obj_header.zig");
+pub const obj_header = @import("obj_header.zig");
 const ObjHeader = obj_header.ObjHeader;
 const RefKind = obj_header.RefKind;
 
@@ -16,6 +16,7 @@ pub const scalar = @import("scalar.zig");
 pub const ScalarTag = scalar.ScalarTag;
 pub const ops = @import("ops.zig");
 pub const batch = @import("batch.zig");
+pub const cast = @import("cast.zig");
 
 // ── 字符类型 ──
 pub const char_mod = @import("char.zig");
@@ -37,7 +38,7 @@ pub const Range = composite.Range;
 
 // ── 可调用类型 ──
 pub const callable = @import("callable.zig");
-pub const VmClosure = callable.VmClosure;
+pub const Closure = callable.Closure;
 pub const TraitValue = callable.TraitValue;
 pub const LazyValue = callable.LazyValue;
 const BuiltinFn = callable.BuiltinFn;
@@ -58,7 +59,7 @@ const RangeIterator = iterator.RangeIterator;
 // ── 并发类型 ──
 pub const concurrent = @import("concurrent.zig");
 pub const AtomicValue = concurrent.AtomicValue;
-pub const SpawnHandle = concurrent.SpawnHandle;
+pub const AsyncHandle = concurrent.AsyncHandle;
 pub const ChannelValue = concurrent.ChannelValue;
 pub const SenderValue = concurrent.SenderValue;
 pub const ReceiverValue = concurrent.ReceiverValue;
@@ -226,9 +227,9 @@ pub const Value = union(enum) {
         return .{ .ref = &r.header };
     }
 
-    /// 构造虚拟机闭包值
-    pub fn makeVmClosure(allocator: std.mem.Allocator, closure: VmClosure) !Value {
-        const c = try allocator.create(VmClosure);
+    /// 构造闭包值
+    pub fn makeClosure(allocator: std.mem.Allocator, closure: Closure) !Value {
+        const c = try allocator.create(Closure);
         c.* = closure;
         return .{ .ref = &c.header };
     }
@@ -464,7 +465,7 @@ pub const Value = union(enum) {
                     .newtype => try deepCopyNewtype(obj, allocator),
                     .cell => try deepCopyCell(obj, allocator),
                     .range => try deepCopyRange(obj, allocator),
-                    .vm_closure => try deepCopyVmClosure(obj, allocator),
+                    .closure => try deepCopyClosure(obj, allocator),
                     .partial => try deepCopyPartial(obj, allocator),
                     .builtin => try deepCopyBuiltin(obj, allocator),
                     .error_val => try deepCopyError(obj, allocator),
@@ -473,7 +474,7 @@ pub const Value = union(enum) {
                     // 迭代器、惰性值、并发对象：引用语义，retain 即可
                     .array_iter, .string_iter, .range_iter,
                     .lazy_val,
-                    .atomic_val, .spawn_val, .channel_val, .sender_val, .receiver_val => self.retain(),
+                    .atomic_val, .async_val, .channel_val, .sender_val, .receiver_val => self.retain(),
                 };
             },
         }
@@ -589,8 +590,8 @@ pub const Value = union(enum) {
         return .{ .ref = &r.header };
     }
 
-    fn deepCopyVmClosure(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
-        const p: *VmClosure = @alignCast(@fieldParentPtr("header", obj));
+    fn deepCopyClosure(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+        const p: *Closure = @alignCast(@fieldParentPtr("header", obj));
         const new_upvalues: []Value = if (p.upvalues.len > 0)
             try allocator.alloc(Value, p.upvalues.len)
         else
@@ -617,7 +618,7 @@ pub const Value = union(enum) {
             new_bound_args[i] = try ba.deepCopy(allocator);
             ba_copied += 1;
         }
-        const c = try allocator.create(VmClosure);
+        const c = try allocator.create(Closure);
         c.* = .{
             .func = p.func,
             .arity = p.arity,
@@ -704,7 +705,7 @@ pub const Value = union(enum) {
 
     fn deepCopyTrait(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
         const p: *TraitValue = @alignCast(@fieldParentPtr("header", obj));
-        if (!p.vm_owned) return Value.fromRef(obj).retain();
+        if (!p.owned) return Value.fromRef(obj).retain();
         var new_methods = std.StringHashMap(Value).init(allocator);
         errdefer {
             var it = new_methods.iterator();
@@ -730,7 +731,7 @@ pub const Value = union(enum) {
             .methods = new_methods,
             .data = new_data,
             .allocator = allocator,
-            .vm_owned = true,
+            .owned = true,
         };
         return .{ .ref = &tv.header };
     }
@@ -829,7 +830,7 @@ pub const Value = union(enum) {
                         try buf.appendSlice(allocator, "<range>");
                         _ = r;
                     },
-                    .vm_closure => try buf.appendSlice(allocator, "<closure>"),
+                    .closure => try buf.appendSlice(allocator, "<closure>"),
                     .partial => try buf.appendSlice(allocator, "<partial>"),
                     .builtin => try buf.appendSlice(allocator, "<builtin>"),
                     .error_val => {
@@ -845,7 +846,7 @@ pub const Value = union(enum) {
                     .string_iter => try buf.appendSlice(allocator, "<string_iter>"),
                     .range_iter => try buf.appendSlice(allocator, "<range_iter>"),
                     .atomic_val => try buf.appendSlice(allocator, "<atomic>"),
-                    .spawn_val => try buf.appendSlice(allocator, "<spawn>"),
+                    .async_val => try buf.appendSlice(allocator, "<async>"),
                     .channel_val => try buf.appendSlice(allocator, "<channel>"),
                     .sender_val => try buf.appendSlice(allocator, "<sender>"),
                     .receiver_val => try buf.appendSlice(allocator, "<receiver>"),

@@ -2,7 +2,7 @@
 //!
 //! 定义 Glue 语言经词法分析与语法分析后产生的所有语法树节点类型，
 //! 包括表达式、语句、声明、类型节点、模式以及模块结构。
-//! 这些类型是前端（lexer/parser）与后端（语义分析、VM 编译）之间共享的数据契约。
+//! 这些类型是前端（lexer/parser）与后端（语义分析、LFE 编译）之间共享的数据契约。
 
 const std = @import("std");
 
@@ -11,6 +11,15 @@ pub const SourceLocation = struct {
     line: u32,
     column: u32,
 };
+
+/// AST 节点包装：将源码位置提取到节点外部，减少 union 体积。
+/// 通过 @fieldParentPtr("node", ptr) 从 *T 反查 *NodeSlot(T) 获取 loc。
+pub fn NodeSlot(comptime T: type) type {
+    return struct {
+        loc: SourceLocation,
+        node: T,
+    };
+}
 
 /// 可见性修饰：区分私有与公开声明
 pub const Visibility = enum {
@@ -72,70 +81,68 @@ pub const Kind = union(enum) {
 /// 类型语法节点：命名类型、泛型、可空、函数、记录、数组、kind 标注等
 pub const TypeNode = union(enum) {
     named: struct {
-        location: SourceLocation,
         name: []const u8,
     },
-    self_type: struct {
-        location: SourceLocation,
-    },
+    self_type: struct {},
     generic: struct {
-        location: SourceLocation,
         name: []const u8,
         args: []*TypeNode,
     },
     nullable: struct {
-        location: SourceLocation,
         inner: *TypeNode,
     },
     function: struct {
-        location: SourceLocation,
         params: []*TypeNode,
         return_type: *TypeNode,
     },
     record: struct {
-        location: SourceLocation,
         fields: []RecordFieldType,
     },
     array: struct {
-        location: SourceLocation,
         element_type: *TypeNode,
         size: ?u64,
     },
     kind_annotated: struct {
-        location: SourceLocation,
         inner: *TypeNode,
         kind: *Kind,
     },
 };
 
+/// 返回类型节点的源码位置
+pub fn typeNodeLocation(node: *const TypeNode) SourceLocation {
+    const slot: *const NodeSlot(TypeNode) = @alignCast(@fieldParentPtr("node", node));
+    return slot.loc;
+}
+
 /// 模式匹配中的模式：通配符、字面量、变量、构造器、记录、或模式、守卫模式
 pub const Pattern = union(enum) {
-    wildcard: SourceLocation,
+    wildcard,
     literal: PatternLiteral,
     variable: struct {
-        location: SourceLocation,
         name: []const u8,
     },
     constructor: struct {
-        location: SourceLocation,
         name: []const u8,
         patterns: []*Pattern,
     },
     record: struct {
-        location: SourceLocation,
         fields: []PatternRecordField,
     },
     or_pattern: struct {
-        location: SourceLocation,
         left: *Pattern,
         right: *Pattern,
     },
     guard: struct {
-        location: SourceLocation,
         pattern: *Pattern,
         condition: *Expr,
     },
 };
+
+/// 返回模式节点的源码位置
+pub fn patternLocation(pat: *const Pattern) SourceLocation {
+    const slot: *const NodeSlot(Pattern) = @alignCast(@fieldParentPtr("node", pat));
+    return slot.loc;
+}
 
 /// 模式匹配中的字面量模式
 pub const PatternLiteral = union(enum) {
@@ -265,7 +272,6 @@ pub const TypeDef = union(enum) {
     error_newtype: struct {
         name: []const u8,
         params: []Param,
-        methods: []MethodDecl,
     },
 };
 
@@ -295,167 +301,129 @@ pub const AssociatedType = struct {
     kind: ?*Kind,
 };
 
-/// 关联类型的具体定义：名称与实际类型
-pub const AssociatedTypeDef = struct {
-    location: SourceLocation,
-    name: []const u8,
-    actual_type: *TypeNode,
-};
-
 /// 表达式节点：涵盖字面量、标识符、各种运算、调用、控制流、模式匹配等全部表达式形式
 pub const Expr = union(enum) {
     int_literal: struct {
-        location: SourceLocation,
         raw: []const u8,
         suffix: ?[]const u8,
     },
     float_literal: struct {
-        location: SourceLocation,
         raw: []const u8,
         suffix: ?[]const u8,
     },
     bool_literal: struct {
-        location: SourceLocation,
         value: bool,
     },
     char_literal: struct {
-        location: SourceLocation,
         value: u21,
     },
     string_literal: struct {
-        location: SourceLocation,
         value: []const u8,
     },
     string_interpolation: struct {
-        location: SourceLocation,
         parts: []InterpolationPart,
     },
-    null_literal: SourceLocation,
-    unit_literal: SourceLocation,
+    null_literal,
+    unit_literal,
     identifier: struct {
-        location: SourceLocation,
         name: []const u8,
     },
     assignment_expr: struct {
-        location: SourceLocation,
         target: *Expr,
         value: *Expr,
     },
     compound_assign: struct {
-        location: SourceLocation,
         op: CompoundAssignOp,
         target: *Expr,
         value: *Expr,
     },
     binary: struct {
-        location: SourceLocation,
         op: BinaryOp,
         left: *Expr,
         right: *Expr,
     },
     unary: struct {
-        location: SourceLocation,
         op: UnaryOp,
         operand: *Expr,
     },
     call: struct {
-        location: SourceLocation,
         callee: *Expr,
         arguments: []*Expr,
         type_args: ?[]*TypeNode,
     },
     method_call: struct {
-        location: SourceLocation,
         object: *Expr,
         method: []const u8,
         arguments: []*Expr,
         type_args: ?[]*TypeNode,
     },
     field_access: struct {
-        location: SourceLocation,
         object: *Expr,
         field: []const u8,
     },
     safe_access: struct {
-        location: SourceLocation,
         object: *Expr,
         field: []const u8,
     },
     safe_method_call: struct {
-        location: SourceLocation,
         object: *Expr,
         method: []const u8,
         arguments: []*Expr,
         type_args: ?[]*TypeNode,
     },
     non_null_assert: struct {
-        location: SourceLocation,
         expr: *Expr,
     },
     propagate: struct {
-        location: SourceLocation,
         expr: *Expr,
     },
     index: struct {
-        location: SourceLocation,
         object: *Expr,
         index: *Expr,
     },
     array_literal: struct {
-        location: SourceLocation,
         elements: []*Expr,
     },
     record_literal: struct {
-        location: SourceLocation,
         fields: []RecordFieldExpr,
     },
     record_extend: struct {
-        location: SourceLocation,
         base: *Expr,
         updates: []RecordFieldExpr,
     },
     lambda: struct {
-        location: SourceLocation,
         params: []Param,
         body: LambdaBody,
         is_async: bool = false,
         return_type: ?*TypeNode = null,
     },
     if_expr: struct {
-        location: SourceLocation,
         condition: *Expr,
         then_branch: *Expr,
         else_branch: ?*Expr,
     },
     block: struct {
-        location: SourceLocation,
         statements: []*Stmt,
         trailing_expr: ?*Expr,
     },
     match: struct {
-        location: SourceLocation,
         scrutinee: *Expr,
         arms: []MatchArm,
     },
     type_cast: struct {
-        location: SourceLocation,
         target_type: *TypeNode,
         expr: *Expr,
     },
     atomic_expr: struct {
-        location: SourceLocation,
         value: *Expr,
     },
     lazy: struct {
-        location: SourceLocation,
         expr: *Expr,
     },
     select: struct {
-        location: SourceLocation,
         arms: []SelectArm,
     },
     inline_trait_value: struct {
-        location: SourceLocation,
         methods: []MethodDecl,
     },
 };
@@ -463,92 +431,62 @@ pub const Expr = union(enum) {
 /// 语句节点：声明、赋值、控制流（return/throw/break/continue）、循环等
 pub const Stmt = union(enum) {
     val_decl: struct {
-        location: SourceLocation,
         name: []const u8,
         type_annotation: ?*TypeNode,
         value: *Expr,
         visibility: Visibility = .private,
     },
     var_decl: struct {
-        location: SourceLocation,
         name: []const u8,
         type_annotation: ?*TypeNode,
         value: *Expr,
         visibility: Visibility = .private,
     },
     assignment: struct {
-        location: SourceLocation,
         target: *Expr,
         value: *Expr,
     },
     field_assignment: struct {
-        location: SourceLocation,
         object: *Expr,
         field: []const u8,
         value: *Expr,
     },
     compound_assignment: struct {
-        location: SourceLocation,
         target: *Expr,
         op: CompoundAssignOp,
         value: *Expr,
     },
     expression: struct {
-        location: SourceLocation,
         expr: *Expr,
     },
     return_stmt: struct {
-        location: SourceLocation,
         value: ?*Expr,
     },
     defer_stmt: struct {
-        location: SourceLocation,
         expr: *Expr,
     },
     throw_stmt: struct {
-        location: SourceLocation,
         expr: *Expr,
     },
-    break_stmt: struct {
-        location: SourceLocation,
-    },
-    continue_stmt: struct {
-        location: SourceLocation,
-    },
+    break_stmt: struct {},
+    continue_stmt: struct {},
     for_stmt: struct {
-        location: SourceLocation,
         name: []const u8,
         iterable: *Expr,
         body: *Expr,
     },
     while_stmt: struct {
-        location: SourceLocation,
         condition: *Expr,
         body: *Expr,
     },
     loop_stmt: struct {
-        location: SourceLocation,
         body: *Expr,
     },
 
     /// 返回该语句的源码位置
-    pub fn getLocation(self: Stmt) SourceLocation {
-        return switch (self) {
-            .val_decl => |v| v.location,
-            .var_decl => |v| v.location,
-            .assignment => |v| v.location,
-            .field_assignment => |v| v.location,
-            .expression => |v| v.location,
-            .return_stmt => |v| v.location,
-            .defer_stmt => |v| v.location,
-            .throw_stmt => |v| v.location,
-            .break_stmt => |v| v.location,
-            .continue_stmt => |v| v.location,
-            .for_stmt => |v| v.location,
-            .while_stmt => |v| v.location,
-            .loop_stmt => |v| v.location,
-            .compound_assignment => |v| v.location,
-        };
+    pub fn getLocation(self: *const Stmt) SourceLocation {
+        const slot: *const NodeSlot(Stmt) = @alignCast(@fieldParentPtr("node", self));
+        return slot.loc;
     }
 };
 
@@ -612,46 +550,6 @@ pub const Module = struct {
 
 /// 返回表达式节点的源码位置
 pub fn exprLocation(expr: *const Expr) SourceLocation {
-    return switch (expr.*) {
-        .int_literal => |e| e.location,
-        .float_literal => |e| e.location,
-        .bool_literal => |e| e.location,
-        .char_literal => |e| e.location,
-        .string_literal => |e| e.location,
-        .string_interpolation => |e| e.location,
-        .null_literal => |l| l,
-        .unit_literal => |l| l,
-        .identifier => |e| e.location,
-        .assignment_expr => |e| e.location,
-        .binary => |e| e.location,
-        .unary => |e| e.location,
-        .call => |e| e.location,
-        .method_call => |e| e.location,
-        .field_access => |e| e.location,
-        .safe_access => |e| e.location,
-        .safe_method_call => |e| e.location,
-        .non_null_assert => |e| e.location,
-        .propagate => |e| e.location,
-        .index => |e| e.location,
-        .array_literal => |e| e.location,
-        .record_literal => |e| e.location,
-        .record_extend => |e| e.location,
-        .lambda => |e| e.location,
-        .if_expr => |e| e.location,
-        .block => |e| e.location,
-        .match => |e| e.location,
-        .type_cast => |e| e.location,
-        .atomic_expr => |e| e.location,
-        .lazy => |e| e.location,
-        .select => |e| e.location,
-        .inline_trait_value => |e| e.location,
-        .compound_assign => |e| e.location,
-    };
+    const slot: *const NodeSlot(Expr) = @alignCast(@fieldParentPtr("node", expr));
+    return slot.loc;
 }
-
-/// 内置类型名常量集合，供语义分析等阶段引用
-pub const type_names = struct {
-    pub const error_type = "Error";
-    pub const str_type = "str";
-    pub const spawn_status_type = "SpawnStatus";
-};

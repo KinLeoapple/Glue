@@ -317,19 +317,19 @@ test "CseTable basic" {
     var table = CseTable.init(std.testing.allocator);
     defer table.deinit();
     try std.testing.expect(table.isEmpty());
-    try std.testing.expect(table.canonicalOf(@constCast(&ast.Expr{ .int_literal = .{ .raw = "1", .suffix = null, .location = .{ .line = 1, .column = 1 } } })) == null);
+    try std.testing.expect(table.canonicalOf(@constCast(&ast.Expr{ .int_literal = .{ .raw = "1", .suffix = null } })) == null);
 }
 
 test "exprEqual literals" {
-    const a = ast.Expr{ .int_literal = .{ .raw = "42", .suffix = null, .location = .{ .line = 1, .column = 1 } } };
-    const b = ast.Expr{ .int_literal = .{ .raw = "42", .suffix = null, .location = .{ .line = 2, .column = 3 } } };
+    const a = ast.Expr{ .int_literal = .{ .raw = "42", .suffix = null } };
+    const b = ast.Expr{ .int_literal = .{ .raw = "42", .suffix = null } };
     try std.testing.expect(exprEqual(&a, &b));
-    const c = ast.Expr{ .int_literal = .{ .raw = "43", .suffix = null, .location = .{ .line = 1, .column = 1 } } };
+    const c = ast.Expr{ .int_literal = .{ .raw = "43", .suffix = null } };
     try std.testing.expect(!exprEqual(&a, &c));
 }
 
 test "exprReadsVar" {
-    const expr = ast.Expr{ .identifier = .{ .name = "x", .location = .{ .line = 1, .column = 1 } } };
+    const expr = ast.Expr{ .identifier = .{ .name = "x" } };
     try std.testing.expect(exprReadsVar(&expr, "x"));
     try std.testing.expect(!exprReadsVar(&expr, "y"));
 }

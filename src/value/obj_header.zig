@@ -25,7 +25,7 @@ pub const RefKind = enum(u8) {
     cell,
     range,
     // 可调用
-    vm_closure,
+    closure,
     partial,
     builtin,
     trait_val,
@@ -39,7 +39,7 @@ pub const RefKind = enum(u8) {
     range_iter,
     // 并发
     atomic_val,
-    spawn_val,
+    async_val,
     channel_val,
     sender_val,
     receiver_val,

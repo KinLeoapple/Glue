@@ -3,7 +3,7 @@
 //! 提供命令行工具，支持项目脚手架初始化（`glue init`）、
 //! 构建并运行项目（`glue run`）、以及带内存检测与运行时追踪的诊断模式（`glue debug`）。
 //! 运行流程：定位项目根 → 解析清单 → 读取入口源码 → 词法分析 → 语法分析 →
-//! 类型检查，执行后端由 LFE 层流图引擎接管（尚未接入）。
+//! 类型检查，执行后端由 LFE 层流图引擎接管。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,6 +12,7 @@ const parser = @import("parser");
 const module_loader = @import("module_loader");
 const profiler = @import("profiler");
 const debug_allocator = @import("debug_allocator");
+const lfe = @import("lfe");
 
 /// 项目清单：名称、版本与入口文件路径
 const Manifest = struct {
@@ -248,8 +249,7 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
 /// 源码执行结果：成功或失败
 const ExecOutcome = enum { failed, ran_main };
 
-/// 完整执行管线：词法分析 → 语法分析 → 类型检查
-/// 执行后端（LFE 层流图引擎）尚未接入，当前仅完成前端阶段
+/// 完整执行管线：词法分析 → 语法分析 → 类型检查 → LFE 层流执行
 fn executeSource(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
@@ -307,9 +307,71 @@ fn executeSource(
     };
     prof.phaseEnd();
 
-    // LFE 执行后端尚未接入
-    printError(io, "{s}: error: LFE execution engine not yet integrated\n", .{filename});
-    return .failed;
+    // LFE 层流执行阶段
+    prof.phaseBegin(.lfe_compile);
+    var graph = lfe.LaminarCompiler.compile(allocator, entry_module) catch |err| {
+        prof.phaseEnd();
+        printError(io, "{s}: LFE compile error: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
+    };
+    defer graph.deinit(allocator);
+    prof.phaseEnd();
+
+    // LFE 优化阶段（常量折叠 + 死通道消除 + 层融合 + 槽位复用）
+    prof.phaseBegin(.lfe_optimize);
+    var optimized = lfe.Optimizer.optimize(allocator, &graph) catch |err| {
+        prof.phaseEnd();
+        printError(io, "{s}: LFE optimize error: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
+    };
+    defer if (optimized.arena == null) {
+        allocator.free(optimized.laminas);
+        allocator.free(optimized.channel_metas);
+        if (optimized.input_channels.len > 0) allocator.free(optimized.input_channels);
+    };
+    prof.phaseEnd();
+
+    prof.phaseBegin(.lfe_run);
+    if (optimized.subgraphs.len > 0) {
+        // 并发模式：使用 M:N 协程调度器
+        var sched = lfe.Scheduler.init(allocator, std.Thread.getCpuCount() catch 4, 1);
+        sched.start() catch |err| {
+            prof.phaseEnd();
+            printError(io, "{s}: LFE scheduler start error: {s}\n", .{ filename, @errorName(err) });
+            return .failed;
+        };
+        defer sched.stop();
+
+        // 创建 main task
+        const main_task = lfe.LfeTask.create(allocator, &sched, &optimized, 1) catch |err| {
+            prof.phaseEnd();
+            printError(io, "{s}: LFE task create error: {s}\n", .{ filename, @errorName(err) });
+            return .failed;
+        };
+        _ = sched.active_tasks.fetchAdd(1, .monotonic);
+        sched.enqueue(main_task);
+
+        // 等待 main task 完成
+        sched.waitFor(main_task);
+        sched.stop();
+    } else {
+        // 纯顺序模式：直接用 Engine
+        var eng = lfe.Engine.init(allocator, &optimized, 1) catch |err| {
+            prof.phaseEnd();
+            printError(io, "{s}: LFE engine init error: {s}\n", .{ filename, @errorName(err) });
+            return .failed;
+        };
+        defer eng.deinit();
+
+        eng.run() catch |err| {
+            prof.phaseEnd();
+            printError(io, "{s}: LFE execution error: {s}\n", .{ filename, @errorName(err) });
+            return .failed;
+        };
+    }
+    prof.phaseEnd();
+
+    return .ran_main;
 }
 
 /// 普通运行模式：使用 c_allocator 执行源码
