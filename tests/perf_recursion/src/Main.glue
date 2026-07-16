@@ -5,7 +5,7 @@ type List<T> = | Nil | Cons(T, List<T>)
 
 // 尾递归深度计数（TCO，O(n)，常数栈）
 fun countDown(n: i32): i32 {
-    if (n == 0) { 0 } else { countDown(n - 1) }
+    if n == 0 { 0 } else { countDown(n - 1) }
 }
 
 fun main() {

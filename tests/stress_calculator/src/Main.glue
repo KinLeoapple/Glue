@@ -73,11 +73,11 @@ type LexError: Error = LexError(msg: str) {
 
 // 从位置 i 开始扫描一个整数，返回 (值, 下一个位置)
 fun scanNum(s: str, i: i32, acc: i32): (value: i32, next: i32) {
-    if (i >= s.len()) {
+    if i >= s.len() {
         (value: acc, next: i)
     } else {
         val c = s[i]
-        if (isDigit(c)) {
+        if isDigit(c) {
             scanNum(s, i + 1, acc * 10 + digitVal(c))
         } else {
             (value: acc, next: i)
@@ -87,26 +87,26 @@ fun scanNum(s: str, i: i32, acc: i32): (value: i32, next: i32) {
 
 fun tokenize(s: str): Throw<List<Token>, Error> {
     fun go(i: i32, acc: List<Token>): Throw<List<Token>, Error> {
-        if (i >= s.len()) {
+        if i >= s.len() {
             Ok(reverseL(acc))
         } else {
             val c = s[i]
-            if (c == ' ') {
+            if c == ' ' {
                 go(i + 1, acc)
-            } else if (isDigit(c)) {
+            } else if isDigit(c) {
                 val r = scanNum(s, i, 0)
                 go(r.next, Cons(TNum(r.value), acc))
-            } else if (c == '+') {
+            } else if c == '+' {
                 go(i + 1, Cons(TPlus, acc))
-            } else if (c == '-') {
+            } else if c == '-' {
                 go(i + 1, Cons(TMinus, acc))
-            } else if (c == '*') {
+            } else if c == '*' {
                 go(i + 1, Cons(TStar, acc))
-            } else if (c == '/') {
+            } else if c == '/' {
                 go(i + 1, Cons(TSlash, acc))
-            } else if (c == '(') {
+            } else if c == '(' {
                 go(i + 1, Cons(TLParen, acc))
-            } else if (c == ')') {
+            } else if c == ')' {
                 go(i + 1, Cons(TRParen, acc))
             } else {
                 throw LexError("unexpected char")
@@ -154,7 +154,7 @@ fun parseTermLoop(acc: i32, toks: List<Token>): Throw<(value: i32, rest: List<To
         }
         Cons(TSlash, rest) => {
             val f = parseFactor(rest)?
-            if (f.value == 0) { throw ParseError("division by zero") }
+            if f.value == 0 { throw ParseError("division by zero") }
             else { parseTermLoop(acc / f.value, f.rest) }
         }
         _ => Ok((value: acc, rest: toks))

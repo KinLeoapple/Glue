@@ -39,15 +39,15 @@ fun safeDivChain(a: i32, b: i32, c: i32): Throw<i32, Error> {
 }
 
 fun checkedDiv(a: i32, b: i32): Throw<i32, Error> {
-    if (b == 0) { throw Error("division by zero") }
+    if b == 0 { throw Error("division by zero") }
     Ok(a / b)
 }
 
 // error subtype: specific errors flow into Throw<_, Error>
 fun lookup(id: i32): Throw<str, Error> {
-    if (id < 0) { throw NotFound("id " + str(id)) }
-    if (id == 0) { throw Timeout("slow") }
-    if (id > 100) { throw Denied("forbidden") }
+    if id < 0 { throw NotFound("id " + str(id)) }
+    if id == 0 { throw Timeout("slow") }
+    if id > 100 { throw Denied("forbidden") }
     Ok("user-" + str(id))
 }
 

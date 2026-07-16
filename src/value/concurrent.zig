@@ -133,8 +133,70 @@ pub const AsyncHandle = struct {
             v.release(allocator);
         }
         if (self.panic_message) |msg| {
-            std.heap.c_allocator.free(msg);
+            allocator.free(msg);
         }
+    }
+
+    /// 设置任务状态（原子操作）
+    pub fn setStatus(self: *AsyncHandle, status: AsyncStatus) void {
+        self.status.store(status, .release);
+        if (status == .Completed or status == .Failed or status == .Cancelled) {
+            self.finished.store(true, .release);
+            self.mutex.lock();
+            self.condition.broadcast();
+            self.mutex.unlock();
+        }
+    }
+
+    /// 获取任务状态（原子操作）
+    pub fn getStatus(self: *AsyncHandle) AsyncStatus {
+        return self.status.load(.acquire);
+    }
+
+    /// 设置任务结果（在任务完成时调用）
+    /// 注意：不持锁，依赖 setStatus 中 finished.store(.release) 提供的 happens-before 保证
+    pub fn setResult(self: *AsyncHandle, val: Value) void {
+        self.result = val;
+        self.setStatus(.Completed);
+    }
+
+    /// 设置 panic 信息（在任务失败时调用）
+    /// 注意：不持锁，依赖 setStatus 中 finished.store(.release) 提供的 happens-before 保证
+    pub fn setPanic(self: *AsyncHandle, msg: []const u8) void {
+        const msg_copy = self.allocator.dupe(u8, msg) catch return;
+        self.panic_message = msg_copy;
+        self.setStatus(.Failed);
+    }
+
+    /// 阻塞等待任务完成并消费结果
+    /// 返回结果值，如果任务失败则返回 null
+    pub fn join(self: *AsyncHandle) ?Value {
+        // 快速路径：已完成
+        if (self.finished.load(.acquire)) {
+            return self.consumeResult();
+        }
+        // 慢速路径：等待完成
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.finished.load(.acquire)) {
+            self.condition.wait(&self.mutex);
+        }
+        return self.consumeResult();
+    }
+
+    /// 消费结果（只能消费一次）
+    fn consumeResult(self: *AsyncHandle) ?Value {
+        if (self.consumed.swap(true, .acq_rel)) {
+            return null; // 已被消费
+        }
+        const result = self.result;
+        self.result = null;
+        return result;
+    }
+
+    /// 检查任务是否已完成
+    pub fn isFinished(self: *AsyncHandle) bool {
+        return self.finished.load(.acquire);
     }
 };
 

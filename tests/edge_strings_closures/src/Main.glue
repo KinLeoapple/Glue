@@ -2,15 +2,15 @@
 
 // mutual recursion
 fun isEven(n: i32): bool {
-    if (n == 0) { true } else { isOdd(n - 1) }
+    if n == 0 { true } else { isOdd(n - 1) }
 }
 fun isOdd(n: i32): bool {
-    if (n == 0) { false } else { isEven(n - 1) }
+    if n == 0 { false } else { isEven(n - 1) }
 }
 
 // deep tail recursion (should not stack overflow with TCO)
 fun countTo(n: i32, acc: i32): i32 {
-    if (n == 0) { acc } else { countTo(n - 1, acc + 1) }
+    if n == 0 { acc } else { countTo(n - 1, acc + 1) }
 }
 
 // closure returning closure (currying)
@@ -38,7 +38,7 @@ fun applyAll(x: i32, f, g, h): i32 {
 
 // recursion building a string
 fun repeat(s: str, n: i32): str {
-    if (n <= 0) { "" } else { s + repeat(s, n - 1) }
+    if n <= 0 { "" } else { s + repeat(s, n - 1) }
 }
 
 fun main() {

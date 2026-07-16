@@ -16,6 +16,14 @@ pub const ChannelRegion = struct {
     len: usize = 0, // 已分配容量
     used: usize = 0, // 已使用字节数
     backing: std.mem.Allocator,
+    /// 扩容信息：扩容后非 null，调用方需 rebase 指针后清除
+    rebase_info: ?RebaseInfo = null,
+
+    pub const RebaseInfo = struct {
+        old_base: usize, // 旧 data 基址
+        old_end: usize, // 旧 data 末尾
+        offset: i64, // 新基址 - 旧基址（可能为负）
+    };
 
     /// 创建空线性区
     pub fn init(backing: std.mem.Allocator) ChannelRegion {
@@ -47,6 +55,14 @@ pub const ChannelRegion = struct {
         if (self.data) |d| {
             @memcpy(new_data[0..self.used], d[0..self.used]);
             self.backing.free(d[0..self.len]);
+            // 记录扩容偏移，供调用方 rebase 指针
+            const old_base = @intFromPtr(d);
+            const new_base = @intFromPtr(new_data.ptr);
+            self.rebase_info = .{
+                .old_base = old_base,
+                .old_end = old_base + self.len,
+                .offset = @as(i64, @bitCast(new_base)) - @as(i64, @bitCast(old_base)),
+            };
         }
         self.data = new_data.ptr;
         self.len = new_len;

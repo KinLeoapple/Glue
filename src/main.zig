@@ -3,7 +3,7 @@
 //! 提供命令行工具，支持项目脚手架初始化（`glue init`）、
 //! 构建并运行项目（`glue run`）、以及带内存检测与运行时追踪的诊断模式（`glue debug`）。
 //! 运行流程：定位项目根 → 解析清单 → 读取入口源码 → 词法分析 → 语法分析 →
-//! 类型检查，执行后端由 LFE 层流图引擎接管。
+//! IR 构建 → IR 优化 → 引擎执行（Glue IR 共享内存图模型）。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,7 +12,8 @@ const parser = @import("parser");
 const module_loader = @import("module_loader");
 const profiler = @import("profiler");
 const debug_allocator = @import("debug_allocator");
-const lfe = @import("lfe");
+const ir = @import("ir");
+const engine = @import("engine");
 
 /// 项目清单：名称、版本与入口文件路径
 const Manifest = struct {
@@ -203,6 +204,7 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
     const main_content =
         \\fun main() {
         \\    println("Hello, Glue!")
+        \\    0
         \\}
         \\
     ;
@@ -249,7 +251,7 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
 /// 源码执行结果：成功或失败
 const ExecOutcome = enum { failed, ran_main };
 
-/// 完整执行管线：词法分析 → 语法分析 → 类型检查 → LFE 层流执行
+/// 完整执行管线：词法分析 → 语法分析 → IR 构建 → IR 优化 → 引擎执行
 fn executeSource(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
@@ -257,6 +259,8 @@ fn executeSource(
     source: []const u8,
     filename: []const u8,
 ) ExecOutcome {
+    _ = loader; // module_loader 暂未接入新流水线（单文件模式）
+
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
     prof.phaseBegin(.lex);
@@ -270,6 +274,7 @@ fn executeSource(
     };
     prof.phaseEnd();
     defer allocator.free(tokens);
+
     var p = parser.Parser.init(allocator, tokens);
     defer p.deinit();
     prof.phaseBegin(.parse);
@@ -287,87 +292,52 @@ fn executeSource(
     var entry_module = module;
     entry_module.source_path = filename;
 
-    // 类型检查阶段
-    prof.phaseBegin(.type_check);
-    loader.prepareModule(entry_module) catch |err| switch (err) {
-        error.TypeCheckFailed => {
-            prof.phaseEnd();
-            return .failed;
-        },
-        error.CircularDependency => {
-            prof.phaseEnd();
-            printError(io, "{s}: error: circular module dependency\n", .{filename});
-            return .failed;
-        },
-        else => {
-            prof.phaseEnd();
-            printError(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
-            return .failed;
-        },
-    };
-    prof.phaseEnd();
-
-    // LFE 层流执行阶段
-    prof.phaseBegin(.lfe_compile);
-    var graph = lfe.LaminarCompiler.compile(allocator, entry_module) catch |err| {
+    // IR 构建阶段（AST → Glue IR 共享内存图）
+    prof.phaseBegin(.ir_build);
+    var builder = ir.IRBuilder.init(allocator) catch |err| {
         prof.phaseEnd();
-        printError(io, "{s}: LFE compile error: {s}\n", .{ filename, @errorName(err) });
+        printError(io, "{s}: IR builder init error: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
-    defer graph.deinit(allocator);
-    prof.phaseEnd();
-
-    // LFE 优化阶段（常量折叠 + 死通道消除 + 层融合 + 槽位复用）
-    prof.phaseBegin(.lfe_optimize);
-    var optimized = lfe.Optimizer.optimize(allocator, &graph) catch |err| {
+    var glue_ir = builder.build(entry_module) catch |err| {
         prof.phaseEnd();
-        printError(io, "{s}: LFE optimize error: {s}\n", .{ filename, @errorName(err) });
+        printError(io, "{s}: IR build error: {s}\n", .{ filename, @errorName(err) });
+        builder.deinit();
         return .failed;
     };
-    defer if (optimized.arena == null) {
-        allocator.free(optimized.laminas);
-        allocator.free(optimized.channel_metas);
-        if (optimized.input_channels.len > 0) allocator.free(optimized.input_channels);
-    };
+    // build() 成功后 arena 所有权转交 glue_ir，builder.deinit() 不再释放 arena
+    builder.deinit();
+    defer glue_ir.deinit();
     prof.phaseEnd();
 
-    prof.phaseBegin(.lfe_run);
-    if (optimized.subgraphs.len > 0) {
-        // 并发模式：使用 M:N 协程调度器
-        var sched = lfe.Scheduler.init(allocator, std.Thread.getCpuCount() catch 4, 1);
-        sched.start() catch |err| {
-            prof.phaseEnd();
-            printError(io, "{s}: LFE scheduler start error: {s}\n", .{ filename, @errorName(err) });
-            return .failed;
-        };
-        defer sched.stop();
+    // IR 优化阶段（常量折叠 + 死节点消除 + 向量融合 + 通道活跃性）
+    prof.phaseBegin(.ir_optimize);
+    _ = ir.optimize(&glue_ir);
+    prof.phaseEnd();
 
-        // 创建 main task
-        const main_task = lfe.LfeTask.create(allocator, &sched, &optimized, 1) catch |err| {
-            prof.phaseEnd();
-            printError(io, "{s}: LFE task create error: {s}\n", .{ filename, @errorName(err) });
-            return .failed;
-        };
-        _ = sched.active_tasks.fetchAdd(1, .monotonic);
-        sched.enqueue(main_task);
+    // 引擎执行阶段
+    prof.phaseBegin(.engine_run);
+    var eng = engine.Engine.initOwned(&glue_ir, allocator) catch |err| {
+        prof.phaseEnd();
+        printError(io, "{s}: engine init error: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
+    };
+    defer eng.deinit();
+    eng.io = io; // 注入 IO 接口供内置 print/println 使用
 
-        // 等待 main task 完成
-        sched.waitFor(main_task);
-        sched.stop();
-    } else {
-        // 纯顺序模式：直接用 Engine
-        var eng = lfe.Engine.init(allocator, &optimized, 1) catch |err| {
-            prof.phaseEnd();
-            printError(io, "{s}: LFE engine init error: {s}\n", .{ filename, @errorName(err) });
-            return .failed;
-        };
-        defer eng.deinit();
+    const result = eng.run() catch |err| {
+        prof.phaseEnd();
+        printError(io, "{s}: execution error: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
+    };
 
-        eng.run() catch |err| {
-            prof.phaseEnd();
-            printError(io, "{s}: LFE execution error: {s}\n", .{ filename, @errorName(err) });
-            return .failed;
-        };
+    // 输出 main 函数返回值（unit/null 类型不打印）
+    const ret_chan_type = glue_ir.channels.get(eng.result_chan).chan_type;
+    if (ret_chan_type != .unit_chan and ret_chan_type != .null_chan) {
+        var out_buf: [256]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
+        stdout_writer.interface.print("{d}\n", .{result}) catch {};
+        stdout_writer.flush() catch {};
     }
     prof.phaseEnd();
 

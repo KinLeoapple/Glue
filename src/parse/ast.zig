@@ -45,6 +45,8 @@ pub const BinaryOp = enum {
     bit_and,
     bit_or,
     bit_xor,
+    shl,
+    shr,
     concat,
     concat_list,
     range,
@@ -61,12 +63,16 @@ pub const CompoundAssignOp = enum {
     mod_assign,
     bit_and_assign,
     bit_or_assign,
+    bit_xor_assign,
+    shl_assign,
+    shr_assign,
 };
 
 /// 一元运算符种类
 pub const UnaryOp = enum {
     not,
     neg,
+    bit_not,
 };
 
 /// 类型种类（kind）：用于高阶类型标注，支持星类型与箭头类型
@@ -413,11 +419,17 @@ pub const Expr = union(enum) {
     type_cast: struct {
         target_type: *TypeNode,
         expr: *Expr,
+        /// true = 安全转换（i32(x)?），越界抛出错误（? 错误传播），结果类型为 target_type
+        /// false = 不安全转换（i32(x)），结果类型为 target_type，wrap/饱和
+        safe: bool = false,
     },
     atomic_expr: struct {
         value: *Expr,
     },
     lazy: struct {
+        expr: *Expr,
+    },
+    spawn_expr: struct {
         expr: *Expr,
     },
     select: struct {

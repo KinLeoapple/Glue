@@ -43,6 +43,7 @@ const DeferEntry = lamina_mod.DeferEntry;
 const Value = value.Value;
 const ObjHeader = value.obj_header.ObjHeader;
 const concurrent = value.concurrent;
+const composite = value.composite;
 const Scheduler = scheduler_mod.Scheduler;
 const LfeTask = scheduler_mod.LfeTask;
 const TaskState = scheduler_mod.TaskState;
@@ -85,7 +86,6 @@ pub const EngineError = error{
     Unexpected,
     LockedMemoryLimitExceeded,
     ThreadQuotaExceeded,
-    CastOverflow,
 };
 
 /// 停机原因
@@ -263,6 +263,16 @@ pub const Engine = struct {
             if (self.halt_reason != .none) break;
             try self.executeLamina(lam);
         }
+        // throw_halt 传播到太阳层后，执行 defer（return_halt 已在 execHaltReturn 中执行）
+        if (self.halt_reason == .throw_halt and self.defer_stack.items.len > 0) {
+            while (self.defer_stack.items.len > 0) {
+                const orbit_idx = self.defer_stack.pop().?;
+                const saved_halt = self.halt_reason;
+                self.halt_reason = .none;
+                try self.runOrbit(orbit_idx);
+                self.halt_reason = saved_halt;
+            }
+        }
         // 太阳层执行完毕，等待所有异步轨道完成
         if (self.owned_scheduler) |sched| {
             sched.waitForAll();
@@ -343,6 +353,193 @@ pub const Engine = struct {
 
     // ── 层派发 ──
 
+    /// 处理函数指针类型
+    const Handler = *const fn(*Engine, Lamina) EngineError!void;
+
+    /// comptime 包装器：将推断错误集的函数包装为 EngineError!void
+    /// 如果被包装函数返回非 EngineError 错误，编译期会报错
+    fn wrap(comptime func: anytype) Handler {
+        return struct {
+            fn call(self: *Engine, lam: Lamina) EngineError!void {
+                try func(self, lam);
+            }
+        }.call;
+    }
+
+    /// comptime 生成的函数指针表——O(1) 索引分派，无 switch
+    const handler_table = blk: {
+        @setEvalBranchQuota(20000);
+        const n = @typeInfo(LaminaOp).@"enum".fields.len;
+        var table: [n]Handler = undefined;
+        // 默认全部指向 execUnsupported
+        for (&table) |*h| h.* = wrap(&Engine.execUnsupported);
+        // 常量与载入
+        table[@intFromEnum(LaminaOp.constant)] = wrap(&Engine.execConstant);
+        table[@intFromEnum(LaminaOp.str_const)] = wrap(&Engine.execStrConst);
+        table[@intFromEnum(LaminaOp.move)] = wrap(&Engine.execMove);
+        // 整数算术
+        table[@intFromEnum(LaminaOp.int_add)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_sub)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_mul)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_div)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_mod)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_and)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_or)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_xor)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_shl)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_shr)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_neg)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_abs)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_not)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_scale_add)] = wrap(&Engine.execIntArith);
+        table[@intFromEnum(LaminaOp.int_fma)] = wrap(&Engine.execIntArith);
+        // 浮点算术
+        table[@intFromEnum(LaminaOp.float_add)] = wrap(&Engine.execFloatArith);
+        table[@intFromEnum(LaminaOp.float_sub)] = wrap(&Engine.execFloatArith);
+        table[@intFromEnum(LaminaOp.float_mul)] = wrap(&Engine.execFloatArith);
+        table[@intFromEnum(LaminaOp.float_div)] = wrap(&Engine.execFloatArith);
+        table[@intFromEnum(LaminaOp.float_neg)] = wrap(&Engine.execFloatArith);
+        table[@intFromEnum(LaminaOp.float_abs)] = wrap(&Engine.execFloatArith);
+        table[@intFromEnum(LaminaOp.float_scale_add)] = wrap(&Engine.execFloatArith);
+        table[@intFromEnum(LaminaOp.float_fma)] = wrap(&Engine.execFloatArith);
+        // 整数比较
+        table[@intFromEnum(LaminaOp.int_lt)] = wrap(&Engine.execIntCompare);
+        table[@intFromEnum(LaminaOp.int_gt)] = wrap(&Engine.execIntCompare);
+        table[@intFromEnum(LaminaOp.int_eq)] = wrap(&Engine.execIntCompare);
+        table[@intFromEnum(LaminaOp.int_ne)] = wrap(&Engine.execIntCompare);
+        table[@intFromEnum(LaminaOp.int_le)] = wrap(&Engine.execIntCompare);
+        table[@intFromEnum(LaminaOp.int_ge)] = wrap(&Engine.execIntCompare);
+        // 浮点比较
+        table[@intFromEnum(LaminaOp.float_lt)] = wrap(&Engine.execFloatCompare);
+        table[@intFromEnum(LaminaOp.float_gt)] = wrap(&Engine.execFloatCompare);
+        table[@intFromEnum(LaminaOp.float_eq)] = wrap(&Engine.execFloatCompare);
+        table[@intFromEnum(LaminaOp.float_ne)] = wrap(&Engine.execFloatCompare);
+        table[@intFromEnum(LaminaOp.float_le)] = wrap(&Engine.execFloatCompare);
+        table[@intFromEnum(LaminaOp.float_ge)] = wrap(&Engine.execFloatCompare);
+        // 布尔运算
+        table[@intFromEnum(LaminaOp.bool_and)] = wrap(&Engine.execBoolArith);
+        table[@intFromEnum(LaminaOp.bool_or)] = wrap(&Engine.execBoolArith);
+        table[@intFromEnum(LaminaOp.bool_not)] = wrap(&Engine.execBoolArith);
+        table[@intFromEnum(LaminaOp.bool_xor)] = wrap(&Engine.execBoolArith);
+        // 布尔比较
+        table[@intFromEnum(LaminaOp.bool_eq)] = wrap(&Engine.execBoolCompare);
+        table[@intFromEnum(LaminaOp.bool_ne)] = wrap(&Engine.execBoolCompare);
+        // 字符比较
+        table[@intFromEnum(LaminaOp.char_lt)] = wrap(&Engine.execCharCompare);
+        table[@intFromEnum(LaminaOp.char_gt)] = wrap(&Engine.execCharCompare);
+        table[@intFromEnum(LaminaOp.char_eq)] = wrap(&Engine.execCharCompare);
+        table[@intFromEnum(LaminaOp.char_ne)] = wrap(&Engine.execCharCompare);
+        table[@intFromEnum(LaminaOp.char_le)] = wrap(&Engine.execCharCompare);
+        table[@intFromEnum(LaminaOp.char_ge)] = wrap(&Engine.execCharCompare);
+        // 谓词选择
+        table[@intFromEnum(LaminaOp.select)] = wrap(&Engine.execSelect);
+        // 控制流出口
+        table[@intFromEnum(LaminaOp.halt_return)] = wrap(&Engine.execHaltReturn);
+        table[@intFromEnum(LaminaOp.halt_throw)] = wrap(&Engine.execHaltThrow);
+        table[@intFromEnum(LaminaOp.halt_break)] = wrap(&Engine.execHaltBreak);
+        table[@intFromEnum(LaminaOp.halt_continue)] = wrap(&Engine.execHaltContinue);
+        // 调试输出
+        table[@intFromEnum(LaminaOp.debug_print)] = wrap(&Engine.execDebugPrint);
+        table[@intFromEnum(LaminaOp.debug_print_err)] = wrap(&Engine.execDebugPrintErr);
+        // 聚合与流控制
+        table[@intFromEnum(LaminaOp.reduce_sum)] = wrap(&Engine.execReduce);
+        table[@intFromEnum(LaminaOp.reduce_min)] = wrap(&Engine.execReduce);
+        table[@intFromEnum(LaminaOp.reduce_max)] = wrap(&Engine.execReduce);
+        table[@intFromEnum(LaminaOp.reduce_prod)] = wrap(&Engine.execReduce);
+        table[@intFromEnum(LaminaOp.reduce_count)] = wrap(&Engine.execReduce);
+        table[@intFromEnum(LaminaOp.compress)] = wrap(&Engine.execCompress);
+        table[@intFromEnum(LaminaOp.length)] = wrap(&Engine.execLength);
+        table[@intFromEnum(LaminaOp.broadcast_input)] = wrap(&Engine.execBroadcastInput);
+        // Cell 操作
+        table[@intFromEnum(LaminaOp.cell_make)] = wrap(&Engine.execCellMake);
+        table[@intFromEnum(LaminaOp.cell_get)] = wrap(&Engine.execCellGet);
+        table[@intFromEnum(LaminaOp.cell_set)] = wrap(&Engine.execCellSet);
+        table[@intFromEnum(LaminaOp.cell_swap)] = wrap(&Engine.execCellSwap);
+        // Throw / Error 操作
+        table[@intFromEnum(LaminaOp.throw_make)] = wrap(&Engine.execThrowMake);
+        table[@intFromEnum(LaminaOp.throw_is_ok)] = wrap(&Engine.execThrowIsOk);
+        table[@intFromEnum(LaminaOp.throw_is_err)] = wrap(&Engine.execThrowIsErr);
+        table[@intFromEnum(LaminaOp.throw_get_ok)] = wrap(&Engine.execThrowGetOk);
+        table[@intFromEnum(LaminaOp.throw_get_err)] = wrap(&Engine.execThrowGetErr);
+        table[@intFromEnum(LaminaOp.throw_propagate)] = wrap(&Engine.execThrowPropagate);
+        table[@intFromEnum(LaminaOp.error_make)] = wrap(&Engine.execErrorMake);
+        // 闭包操作
+        table[@intFromEnum(LaminaOp.closure_make)] = wrap(&Engine.execClosureMake);
+        table[@intFromEnum(LaminaOp.closure_call)] = wrap(&Engine.execClosureCall);
+        table[@intFromEnum(LaminaOp.closure_capture)] = wrap(&Engine.execClosureCapture);
+        // Trait 操作
+        table[@intFromEnum(LaminaOp.trait_make)] = wrap(&Engine.execTraitMake);
+        table[@intFromEnum(LaminaOp.trait_call_method)] = wrap(&Engine.execTraitCallMethod);
+        table[@intFromEnum(LaminaOp.trait_downcast)] = wrap(&Engine.execTraitDowncast);
+        // 动态分派
+        table[@intFromEnum(LaminaOp.switch_lamina)] = wrap(&Engine.execSwitchLamina);
+        // Atomic 操作
+        table[@intFromEnum(LaminaOp.atomic_make)] = wrap(&Engine.execAtomicMake);
+        table[@intFromEnum(LaminaOp.atomic_load)] = wrap(&Engine.execAtomicLoad);
+        table[@intFromEnum(LaminaOp.atomic_store)] = wrap(&Engine.execAtomicStore);
+        table[@intFromEnum(LaminaOp.atomic_cas)] = wrap(&Engine.execAtomicCas);
+        table[@intFromEnum(LaminaOp.atomic_swap)] = wrap(&Engine.execAtomicSwap);
+        table[@intFromEnum(LaminaOp.atomic_fetch_add)] = wrap(&Engine.execAtomicFetchAdd);
+        table[@intFromEnum(LaminaOp.atomic_fetch_sub)] = wrap(&Engine.execAtomicFetchSub);
+        // Async 操作（async_join/async_yield 在 runTaskSlice 中处理，此处占位）
+        table[@intFromEnum(LaminaOp.async_create)] = wrap(&Engine.execAsyncCreate);
+        table[@intFromEnum(LaminaOp.async_join)] = wrap(&Engine.execNop);
+        table[@intFromEnum(LaminaOp.async_yield)] = wrap(&Engine.execNop);
+        table[@intFromEnum(LaminaOp.async_status)] = wrap(&Engine.execAsyncStatus);
+        // Channel 操作（channel_recv 在 runTaskSlice 中处理，此处占位）
+        table[@intFromEnum(LaminaOp.channel_make)] = wrap(&Engine.execChannelMake);
+        table[@intFromEnum(LaminaOp.channel_split)] = wrap(&Engine.execChannelSplit);
+        table[@intFromEnum(LaminaOp.channel_send)] = wrap(&Engine.execChannelSend);
+        table[@intFromEnum(LaminaOp.channel_recv)] = wrap(&Engine.execNop);
+        table[@intFromEnum(LaminaOp.channel_try_recv)] = wrap(&Engine.execChannelTryRecv);
+        table[@intFromEnum(LaminaOp.channel_close)] = wrap(&Engine.execChannelClose);
+        table[@intFromEnum(LaminaOp.channel_get_sender)] = wrap(&Engine.execChannelGetSender);
+        table[@intFromEnum(LaminaOp.channel_get_receiver)] = wrap(&Engine.execChannelGetReceiver);
+        // Sender/Receiver（receiver_recv 在 runTaskSlice 中处理，此处占位）
+        table[@intFromEnum(LaminaOp.sender_send)] = wrap(&Engine.execSenderSend);
+        table[@intFromEnum(LaminaOp.sender_close)] = wrap(&Engine.execSenderClose);
+        table[@intFromEnum(LaminaOp.receiver_recv)] = wrap(&Engine.execNop);
+        table[@intFromEnum(LaminaOp.receiver_try_recv)] = wrap(&Engine.execReceiverTryRecv);
+        table[@intFromEnum(LaminaOp.receiver_close)] = wrap(&Engine.execReceiverClose);
+        // Range 操作
+        table[@intFromEnum(LaminaOp.range_make)] = wrap(&Engine.execRangeMake);
+        table[@intFromEnum(LaminaOp.range_start)] = wrap(&Engine.execRangeStart);
+        table[@intFromEnum(LaminaOp.range_end)] = wrap(&Engine.execRangeEnd);
+        table[@intFromEnum(LaminaOp.range_len)] = wrap(&Engine.execRangeLen);
+        table[@intFromEnum(LaminaOp.range_to_stream)] = wrap(&Engine.execRangeToStream);
+        // Iterator 操作
+        table[@intFromEnum(LaminaOp.iter_has_next)] = wrap(&Engine.execIterHasNext);
+        table[@intFromEnum(LaminaOp.iter_next)] = wrap(&Engine.execIterNext);
+        table[@intFromEnum(LaminaOp.iter_to_stream)] = wrap(&Engine.execIterToStream);
+        // 星轨模型：轨道枢纽
+        table[@intFromEnum(LaminaOp.orbit_hub)] = wrap(&Engine.execOrbitHub);
+        table[@intFromEnum(LaminaOp.orbit_hub_async)] = wrap(&Engine.execOrbitHubAsync);
+        table[@intFromEnum(LaminaOp.orbit_join)] = wrap(&Engine.execOrbitJoinSync);
+        // 星轨模型：defer 栈
+        table[@intFromEnum(LaminaOp.defer_register)] = wrap(&Engine.execDeferRegister);
+        table[@intFromEnum(LaminaOp.defer_execute)] = wrap(&Engine.execDeferExecute);
+        // 星轨模型：显式数据栈
+        table[@intFromEnum(LaminaOp.stack_push)] = wrap(&Engine.execStackPush);
+        table[@intFromEnum(LaminaOp.stack_pop)] = wrap(&Engine.execStackPop);
+        table[@intFromEnum(LaminaOp.stack_peek)] = wrap(&Engine.execStackPeek);
+        table[@intFromEnum(LaminaOp.stack_depth)] = wrap(&Engine.execStackDepth);
+        // 类型转换
+        table[@intFromEnum(LaminaOp.type_cast)] = wrap(&Engine.execTypeCast);
+        table[@intFromEnum(LaminaOp.type_cast_safe)] = wrap(&Engine.execTypeCastSafe);
+        // Nullable 操作
+        table[@intFromEnum(LaminaOp.nullable_make)] = wrap(&Engine.execNullableMake);
+        table[@intFromEnum(LaminaOp.nullable_is_null)] = wrap(&Engine.execNullableIsNull);
+        table[@intFromEnum(LaminaOp.nullable_unwrap)] = wrap(&Engine.execNullableUnwrap);
+        table[@intFromEnum(LaminaOp.nullable_unwrap_or)] = wrap(&Engine.execNullableUnwrapOr);
+        // 数组操作
+        table[@intFromEnum(LaminaOp.array_make)] = wrap(&Engine.execArrayMake);
+        table[@intFromEnum(LaminaOp.array_len)] = wrap(&Engine.execArrayLen);
+        table[@intFromEnum(LaminaOp.array_get)] = wrap(&Engine.execArrayGet);
+        table[@intFromEnum(LaminaOp.array_set)] = wrap(&Engine.execArraySet);
+        table[@intFromEnum(LaminaOp.array_push)] = wrap(&Engine.execArrayPush);
+        break :blk table;
+    };
+
     fn executeLamina(self: *Engine, lam: Lamina) EngineError!void {
         // 谓词门控：条件为假时跳过操作（select 和 throw_propagate 除外，它们用 predicate 作为数据输入）
         if (lam.predicate) |p| {
@@ -353,157 +550,9 @@ pub const Engine = struct {
                 }
             }
         }
-        switch (lam.op) {
-            // 常量与载入
-            .constant => try self.execConstant(lam),
-            .str_const => try self.execStrConst(lam),
-            .move => try self.execMove(lam),
-
-            // 整数算术
-            .int_add, .int_sub, .int_mul, .int_div, .int_mod,
-            .int_and, .int_or, .int_xor,
-            .int_neg, .int_abs, .int_not,
-            .int_scale_add, .int_fma,
-            => try self.execIntArith(lam),
-
-            // 浮点算术
-            .float_add, .float_sub, .float_mul, .float_div,
-            .float_neg, .float_abs,
-            .float_scale_add, .float_fma,
-            => try self.execFloatArith(lam),
-
-            // 整数比较
-            .int_lt, .int_gt, .int_eq, .int_ne, .int_le, .int_ge,
-            => try self.execIntCompare(lam),
-
-            // 浮点比较
-            .float_lt, .float_gt, .float_eq, .float_ne, .float_le, .float_ge,
-            => try self.execFloatCompare(lam),
-
-            // 布尔运算
-            .bool_and, .bool_or, .bool_not, .bool_xor,
-            => try self.execBoolArith(lam),
-
-            // 布尔比较
-            .bool_eq, .bool_ne,
-            => try self.execBoolCompare(lam),
-
-            // 字符比较
-            .char_lt, .char_gt, .char_eq, .char_ne, .char_le, .char_ge,
-            => try self.execCharCompare(lam),
-
-            // 谓词选择
-            .select => try self.execSelect(lam),
-
-            // 控制流出口
-            .halt_return => try self.execHaltReturn(lam),
-            .halt_throw => self.halt_reason = .throw_halt,
-            .halt_break => self.halt_reason = .break_halt,
-            .halt_continue => self.halt_reason = .continue_halt,
-
-            // 调试输出
-            .debug_print => try self.execDebugPrint(lam),
-
-            // 阶段 4: 聚合与流控制
-            .reduce_sum, .reduce_min, .reduce_max, .reduce_prod, .reduce_count,
-            => try self.execReduce(lam),
-            .compress => try self.execCompress(lam),
-            .length => try self.execLength(lam),
-            .broadcast_input => try self.execBroadcastInput(lam),
-
-            // 阶段 5: Cell 操作（可变状态）
-            .cell_make => try self.execCellMake(lam),
-            .cell_get => try self.execCellGet(lam),
-            .cell_set => try self.execCellSet(lam),
-            .cell_swap => try self.execCellSwap(lam),
-
-            // 阶段 5: Throw / Error 操作（异常作为数据）
-            .throw_make => try self.execThrowMake(lam),
-            .throw_is_ok => try self.execThrowIsOk(lam),
-            .throw_is_err => try self.execThrowIsErr(lam),
-            .throw_get_ok => try self.execThrowGetOk(lam),
-            .throw_get_err => try self.execThrowGetErr(lam),
-            .throw_propagate => try self.execThrowPropagate(lam),
-            .error_make => try self.execErrorMake(lam),
-
-            // 阶段 5: 闭包操作（lambda 捕获与调用）
-            .closure_make => try self.execClosureMake(lam),
-            .closure_call => try self.execClosureCall(lam),
-            .closure_capture => try self.execClosureCapture(lam),
-
-            // 阶段 5: Trait 操作（动态分派）
-            .trait_make => try self.execTraitMake(lam),
-            .trait_call_method => try self.execTraitCallMethod(lam),
-            .trait_downcast => try self.execTraitDowncast(lam),
-
-            // 阶段 5: 动态分派（switch_lamina）
-            .switch_lamina => try self.execSwitchLamina(lam),
-
-            // 阶段 5: Atomic 操作（原子读写，复用 value/concurrent.zig）
-            .atomic_make => try self.execAtomicMake(lam),
-            .atomic_load => try self.execAtomicLoad(lam),
-            .atomic_store => try self.execAtomicStore(lam),
-            .atomic_cas => try self.execAtomicCas(lam),
-            .atomic_swap => try self.execAtomicSwap(lam),
-            .atomic_fetch_add => try self.execAtomicFetchAdd(lam),
-            .atomic_fetch_sub => try self.execAtomicFetchSub(lam),
-
-            // 阶段 5: Async 操作（协程调度）
-            .async_create => try self.execAsyncCreate(lam),
-            .async_join => {}, // 在 runTaskSlice 中处理
-            .async_yield => {}, // 在 runTaskSlice 中处理
-            .async_status => try self.execAsyncStatus(lam),
-
-            // 阶段 5: Channel 操作（复用 value/concurrent.zig）
-            .channel_make => try self.execChannelMake(lam),
-            .channel_split => try self.execChannelSplit(lam),
-            .channel_send => try self.execChannelSend(lam),
-            .channel_recv => {}, // 在 runTaskSlice 中处理（阻塞）
-            .channel_try_recv => try self.execChannelTryRecv(lam),
-            .channel_close => try self.execChannelClose(lam),
-            .channel_get_sender => try self.execChannelGetSender(lam),
-            .channel_get_receiver => try self.execChannelGetReceiver(lam),
-
-            // 阶段 5: Sender/Receiver（通道引用）
-            .sender_send => try self.execSenderSend(lam),
-            .sender_close => try self.execSenderClose(lam),
-            .receiver_recv => {}, // 在 runTaskSlice 中处理（阻塞）
-            .receiver_try_recv => try self.execReceiverTryRecv(lam),
-            .receiver_close => try self.execReceiverClose(lam),
-
-            // 阶段 5: Range 操作
-            .range_make => try self.execRangeMake(lam),
-            .range_start => try self.execRangeStart(lam),
-            .range_end => try self.execRangeEnd(lam),
-            .range_len => try self.execRangeLen(lam),
-            .range_to_stream => try self.execRangeToStream(lam),
-
-            // 阶段 5: Iterator 操作
-            .iter_has_next => try self.execIterHasNext(lam),
-            .iter_next => try self.execIterNext(lam),
-            .iter_to_stream => try self.execIterToStream(lam),
-
-            // 星轨模型：轨道枢纽
-            .orbit_hub => try self.execOrbitHub(lam),
-            .orbit_hub_async => try self.execOrbitHubAsync(lam),
-            .orbit_join => try self.execOrbitJoinSync(lam),
-
-            // 星轨模型：defer 栈
-            .defer_register => try self.execDeferRegister(lam),
-            .defer_execute => try self.execDeferExecute(),
-
-            // 星轨模型：显式数据栈
-            .stack_push => try self.execStackPush(lam),
-            .stack_pop => try self.execStackPop(lam),
-            .stack_peek => try self.execStackPeek(lam),
-            .stack_depth => try self.execStackDepth(lam),
-
-            // 统一标量类型转换
-            .type_cast => try self.execTypeCast(lam),
-
-            // 阶段 1 暂不支持
-            else => return error.UnsupportedOp,
-        }
+        // O(1) 函数指针表分派，无 switch
+        const handler = handler_table[@intFromEnum(lam.op)];
+        try handler(self, lam);
     }
 
     // ── 常量载入 ──
@@ -615,12 +664,179 @@ pub const Engine = struct {
         const src_w = src_chan.elem_width;
         if (src_w > 0) @memcpy(src_bytes[0..src_w], src_chan.data[0..src_w]);
 
-        // 执行转换（comptime 特化分派表 O(1) 查表）
-        const dst_bytes = try value.cast.cast(src_tag, dst_tag, src_bytes);
+        // 执行转换（Rust as 风格，永不失败，comptime 特化分派表 O(1) 查表）
+        const dst_bytes = value.cast.cast(src_tag, dst_tag, src_bytes);
 
         // 写入目标通道（仅前 dst_width 字节）
         const dst_w = dst_chan.elem_width;
         if (dst_w > 0) @memcpy(dst_chan.data[0..dst_w], dst_bytes[0..dst_w]);
+    }
+
+    /// 安全类型转换：tryCast，越界时抛出错误（halt_reason = throw_halt），成功时输出 target_type 标量
+    /// 输出通道为普通标量通道，? 作为错误传播处理
+    fn execTypeCastSafe(self: *Engine, lam: Lamina) !void {
+        const src_chan = &self.channels[lam.inputs[0]];
+        const dst_chan = &self.channels[lam.output];
+        const src_tag = lamina_mod.chanTypeToScalarTag(self.graph.channel_metas[lam.inputs[0]].chan_type) orelse return;
+        const dst_tag: value.scalar.ScalarTag = @enumFromInt(@as(u8, @intCast(lam.const_val orelse return)));
+
+        // 读取源数据
+        var src_bytes: [16]u8 = [_]u8{0} ** 16;
+        const src_w = src_chan.elem_width;
+        if (src_w > 0) @memcpy(src_bytes[0..src_w], src_chan.data[0..src_w]);
+
+        // tryCast：成功写入值，越界抛出错误
+        const dst_bytes = value.cast.tryCast(src_tag, dst_tag, src_bytes) catch {
+            self.halt_reason = .throw_halt;
+            return;
+        };
+        const dst_w = dst_chan.elem_width;
+        if (dst_w > 0) @memcpy(dst_chan.data[0..dst_w], dst_bytes[0..dst_w]);
+    }
+
+    // ── Nullable 操作 ──
+
+    /// nullable_make：将值包装为 Nullable（非空）
+    fn execNullableMake(self: *Engine, lam: Lamina) !void {
+        const src_chan = &self.channels[lam.inputs[0]];
+        const dst_chan = &self.channels[lam.output];
+        const inner_w = dst_chan.elem_width -| 1;
+        if (inner_w == 0) return;
+        const copy_w = @min(@as(usize, inner_w), @as(usize, src_chan.elem_width));
+        @memcpy(dst_chan.data[0..copy_w], src_chan.data[0..copy_w]);
+        dst_chan.data[inner_w] = 1; // present
+    }
+
+    /// nullable_is_null：检查 Nullable 是否为 null，输出 bool
+    fn execNullableIsNull(self: *Engine, lam: Lamina) !void {
+        const src_chan = &self.channels[lam.inputs[0]];
+        const out = &self.channels[lam.output];
+        const inner_w = src_chan.elem_width -| 1;
+        if (inner_w == 0) {
+            out.setScalar(u8, 0, 1); // 空 nullable 视为 null
+            return;
+        }
+        out.setScalar(u8, 0, if (src_chan.data[inner_w] == 0) 1 else 0);
+    }
+
+    /// nullable_unwrap：解包 Nullable，null 时抛出错误
+    fn execNullableUnwrap(self: *Engine, lam: Lamina) !void {
+        const src_chan = &self.channels[lam.inputs[0]];
+        const out = &self.channels[lam.output];
+        const inner_w = src_chan.elem_width -| 1;
+        if (inner_w == 0) return;
+        if (src_chan.data[inner_w] == 0) {
+            self.halt_reason = .throw_halt;
+            return;
+        }
+        const copy_w = @min(@as(usize, inner_w), @as(usize, out.elem_width));
+        @memcpy(out.data[0..copy_w], src_chan.data[0..copy_w]);
+    }
+
+    /// nullable_unwrap_or：解包 Nullable，null 时用默认值
+    fn execNullableUnwrapOr(self: *Engine, lam: Lamina) !void {
+        const src_chan = &self.channels[lam.inputs[0]];
+        const default_chan = &self.channels[lam.inputs[1]];
+        const out = &self.channels[lam.output];
+        const inner_w = src_chan.elem_width -| 1;
+        if (inner_w == 0) return;
+        const copy_w = @min(@as(usize, inner_w), @as(usize, out.elem_width));
+        if (src_chan.data[inner_w] == 0) {
+            @memcpy(out.data[0..copy_w], default_chan.data[0..copy_w]);
+        } else {
+            @memcpy(out.data[0..copy_w], src_chan.data[0..copy_w]);
+        }
+    }
+
+    // ── 数组操作 ──
+    // 数组值通过 ArrayValue 堆分配，ref_chan 通道存储 ObjHeader 指针
+
+    fn execArrayMake(self: *Engine, lam: Lamina) !void {
+        const out = &self.channels[lam.output];
+        const initial_cap: usize = @intCast(lam.const_val orelse 0);
+        const arr = try self.allocator.create(composite.ArrayValue);
+        // 预分配容量但 len=0，后续通过 push 添加元素
+        if (initial_cap > 0) {
+            const buf = try self.allocator.alloc(Value, initial_cap);
+            arr.* = .{
+                .elements = buf[0..0],
+                .capacity = initial_cap,
+                .fixed_size = null,
+            };
+        } else {
+            arr.* = .{
+                .elements = &.{},
+                .capacity = 0,
+                .fixed_size = null,
+            };
+        }
+        out.setScalar(usize, 0, @intFromPtr(&arr.header));
+    }
+
+    fn execArrayLen(self: *Engine, lam: Lamina) !void {
+        const arr_chan = &self.channels[lam.inputs[0]];
+        const out = &self.channels[lam.output];
+        const header: *ObjHeader = @ptrFromInt(arr_chan.getScalar(usize, 0));
+        const arr: *composite.ArrayValue = @alignCast(@fieldParentPtr("header", header));
+        out.setScalar(i64, 0, @intCast(arr.elements.len));
+    }
+
+    fn execArrayGet(self: *Engine, lam: Lamina) !void {
+        const arr_chan = &self.channels[lam.inputs[0]];
+        const idx_chan = &self.channels[lam.inputs[1]];
+        const out = &self.channels[lam.output];
+        const header: *ObjHeader = @ptrFromInt(arr_chan.getScalar(usize, 0));
+        const arr: *composite.ArrayValue = @alignCast(@fieldParentPtr("header", header));
+        const idx: usize = @intCast(idx_chan.getScalar(i64, 0));
+        if (idx >= arr.elements.len) {
+            out.setScalar(i64, 0, 0);
+            return;
+        }
+        valueToChan(arr.elements[idx], out, self.graph.channel_metas[lam.output]);
+    }
+
+    fn execArraySet(self: *Engine, lam: Lamina) !void {
+        const arr_chan = &self.channels[lam.inputs[0]];
+        const idx_chan = &self.channels[lam.inputs[1]];
+        const val_chan = &self.channels[lam.inputs[2]];
+        const header: *ObjHeader = @ptrFromInt(arr_chan.getScalar(usize, 0));
+        const arr: *composite.ArrayValue = @alignCast(@fieldParentPtr("header", header));
+        const idx: usize = @intCast(idx_chan.getScalar(i64, 0));
+        if (idx >= arr.elements.len) return;
+        arr.elements[idx] = chanToValue(val_chan, self.graph.channel_metas[lam.inputs[2]]);
+    }
+
+    fn execArrayPush(self: *Engine, lam: Lamina) !void {
+        const arr_chan = &self.channels[lam.inputs[0]];
+        const val_chan = &self.channels[lam.inputs[1]];
+        const out = &self.channels[lam.output];
+        const header: *ObjHeader = @ptrFromInt(arr_chan.getScalar(usize, 0));
+        const arr: *composite.ArrayValue = @alignCast(@fieldParentPtr("header", header));
+
+        // 固定大小数组不支持 push
+        if (arr.fixed_size != null) {
+            out.setScalar(usize, 0, @intFromPtr(&arr.header));
+            return;
+        }
+
+        // 扩容
+        const old_len = arr.elements.len;
+        const new_len = old_len + 1;
+        if (new_len > arr.capacity) {
+            const new_cap = if (arr.capacity == 0) 4 else arr.capacity * 2;
+            const new_elems = try self.allocator.alloc(Value, new_cap);
+            @memcpy(new_elems[0..old_len], arr.elements);
+            if (arr.capacity > 0) {
+                self.allocator.free(arr.elements.ptr[0..arr.capacity]);
+            }
+            arr.elements = new_elems[0..new_len];
+            arr.capacity = new_cap;
+        } else {
+            arr.elements = arr.elements.ptr[0..new_len];
+        }
+        arr.elements[old_len] = chanToValue(val_chan, self.graph.channel_metas[lam.inputs[1]]);
+        // 输出数组引用（push 是 in-place 修改，引用不变）
+        out.setScalar(usize, 0, @intFromPtr(&arr.header));
     }
 
     // ── 整数算术 ──
@@ -661,6 +877,16 @@ pub const Engine = struct {
                             .int_and => a & b,
                             .int_or => a | b,
                             .int_xor => a ^ b,
+                            .int_shl => blk: {
+                                const max_bits = @bitSizeOf(T);
+                                const raw = @as(u64, @intCast(if (b < 0) 0 else b));
+                                break :blk if (raw >= max_bits) 0 else a << @intCast(raw);
+                            },
+                            .int_shr => blk: {
+                                const max_bits = @bitSizeOf(T);
+                                const raw = @as(u64, @intCast(if (b < 0) 0 else b));
+                                break :blk if (raw >= max_bits) 0 else a >> @intCast(raw);
+                            },
                             .int_fma => blk: {
                                 const c: T = @intCast(lam.const_val orelse 0);
                                 break :blk a *% b +% c;
@@ -698,6 +924,8 @@ pub const Engine = struct {
                             .int_and => try batch.batchBinOp(T, .band, out_slice, a_slice, b_slice),
                             .int_or => try batch.batchBinOp(T, .bor, out_slice, a_slice, b_slice),
                             .int_xor => try batch.batchBinOp(T, .bxor, out_slice, a_slice, b_slice),
+                            .int_shl => try batch.batchBinOp(T, .shl, out_slice, a_slice, b_slice),
+                            .int_shr => try batch.batchBinOp(T, .shr, out_slice, a_slice, b_slice),
                             .int_fma => batch.batchFma(T, out_slice, a_slice, b_slice, @intCast(lam.const_val orelse 0)),
                             else => unreachable,
                         }
@@ -1109,7 +1337,7 @@ pub const Engine = struct {
     fn execHaltReturn(self: *Engine, lam: Lamina) !void {
         // halt 时 LIFO 执行所有已注册的 defer 体
         if (self.defer_stack.items.len > 0) {
-            try self.execDeferExecute();
+            try self.execDeferExecute(lam);
         }
         self.halt_reason = .return_halt;
         const ret_chan = &self.channels[lam.inputs[0]];
@@ -1128,37 +1356,47 @@ pub const Engine = struct {
     }
 
     // ── 调试输出 ──
+    // 注：Zig 0.16 的 std.Io 需要实例参数，引擎层暂用 std.debug.print（stderr）
+    // 未来通过传入 io 实例实现 stdout/stderr 分离
+
+    fn printValue(in_chan: *const PhysicalChannel, meta: lamina_mod.ChannelMeta, string_table: []const []const u8, newline: bool) void {
+        switch (meta.chan_type) {
+            .ref_chan => {
+                const str_idx = in_chan.getScalar(u64, 0);
+                if (str_idx < string_table.len) {
+                    const s = string_table[str_idx];
+                    if (newline) std.debug.print("{s}\n", .{s}) else std.debug.print("{s}", .{s});
+                }
+            },
+            .i64_chan => std.debug.print("{s}{d}{s}", .{ if (newline) "" else "", in_chan.getScalar(i64, 0), if (newline) "\n" else "" }),
+            .i32_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(i32, 0), if (newline) "\n" else "" }),
+            .i16_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(i16, 0), if (newline) "\n" else "" }),
+            .i8_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(i8, 0), if (newline) "\n" else "" }),
+            .u64_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(u64, 0), if (newline) "\n" else "" }),
+            .u32_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(u32, 0), if (newline) "\n" else "" }),
+            .u16_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(u16, 0), if (newline) "\n" else "" }),
+            .u8_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(u8, 0), if (newline) "\n" else "" }),
+            .f64_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(f64, 0), if (newline) "\n" else "" }),
+            .f32_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(f32, 0), if (newline) "\n" else "" }),
+            .f16_chan => std.debug.print("{d}{s}", .{ in_chan.getScalar(f16, 0), if (newline) "\n" else "" }),
+            .bool_chan, .mask_chan => std.debug.print("{s}{s}", .{ if (in_chan.getScalar(u8, 0) != 0) "true" else "false", if (newline) "\n" else "" }),
+            .char_chan => std.debug.print("{u}{s}", .{ @as(u21, @intCast(in_chan.getScalar(u32, 0))), if (newline) "\n" else "" }),
+            .null_chan => std.debug.print("null{s}", .{if (newline) "\n" else ""}),
+            .unit_chan => std.debug.print("(){s}", .{if (newline) "\n" else ""}),
+            else => std.debug.print("<unknown>{s}", .{if (newline) "\n" else ""}),
+        }
+    }
 
     fn execDebugPrint(self: *Engine, lam: Lamina) !void {
         const in_chan = &self.channels[lam.inputs[0]];
         const meta = self.graph.channel_metas[lam.inputs[0]];
+        printValue(in_chan, meta, self.graph.string_table, true);
+    }
 
-        switch (meta.chan_type) {
-            .ref_chan => {
-                // 字符串：从字符串表查找
-                const str_idx = in_chan.getScalar(u64, 0);
-                if (str_idx < self.graph.string_table.len) {
-                    const s = self.graph.string_table[str_idx];
-                    std.debug.print("{s}\n", .{s});
-                }
-            },
-            .i64_chan => std.debug.print("{d}\n", .{in_chan.getScalar(i64, 0)}),
-            .i32_chan => std.debug.print("{d}\n", .{in_chan.getScalar(i32, 0)}),
-            .i16_chan => std.debug.print("{d}\n", .{in_chan.getScalar(i16, 0)}),
-            .i8_chan => std.debug.print("{d}\n", .{in_chan.getScalar(i8, 0)}),
-            .u64_chan => std.debug.print("{d}\n", .{in_chan.getScalar(u64, 0)}),
-            .u32_chan => std.debug.print("{d}\n", .{in_chan.getScalar(u32, 0)}),
-            .u16_chan => std.debug.print("{d}\n", .{in_chan.getScalar(u16, 0)}),
-            .u8_chan => std.debug.print("{d}\n", .{in_chan.getScalar(u8, 0)}),
-            .f64_chan => std.debug.print("{d}\n", .{in_chan.getScalar(f64, 0)}),
-            .f32_chan => std.debug.print("{d}\n", .{in_chan.getScalar(f32, 0)}),
-            .f16_chan => std.debug.print("{d}\n", .{in_chan.getScalar(f16, 0)}),
-            .bool_chan, .mask_chan => std.debug.print("{s}\n", .{if (in_chan.getScalar(u8, 0) != 0) "true" else "false"}),
-            .char_chan => std.debug.print("{u}\n", .{@as(u21, @intCast(in_chan.getScalar(u32, 0)))}),
-            .null_chan => std.debug.print("null\n", .{}),
-            .unit_chan => std.debug.print("()\n", .{}),
-            else => std.debug.print("<unknown>\n", .{}),
-        }
+    fn execDebugPrintErr(self: *Engine, lam: Lamina) !void {
+        const in_chan = &self.channels[lam.inputs[0]];
+        const meta = self.graph.channel_metas[lam.inputs[0]];
+        printValue(in_chan, meta, self.graph.string_table, true);
     }
 
     // ── 阶段 4: 聚合（reduce）──
@@ -1987,6 +2225,7 @@ pub const Engine = struct {
 
         // 绑定参数：太阳层通道 → 轨道入口通道（桥接，避免轨道跨层读父层通道）
         for (hub.param_mapping) |pm| {
+            if (pm.src == pm.dst) continue; // 同一物理通道（优化器合并），无需复制
             const src = &self.channels[pm.src];
             const dst = &self.channels[pm.dst];
             const w = dst.elem_width;
@@ -1997,7 +2236,6 @@ pub const Engine = struct {
         try self.runOrbit(orbit_idx);
 
         // 返回值桥接：轨道内 output_channel → 太阳层 hub.output_channel
-        // 轨道内 ret_chan 写入结果后，复制到太阳层 out_chan 供父层读取
         if (orbit.output_channel != hub.output_channel) {
             const src = &self.channels[orbit.output_channel];
             const dst = &self.channels[hub.output_channel];
@@ -2007,32 +2245,28 @@ pub const Engine = struct {
     }
 
     /// 匹配轨道：根据条件值查找 orbit_table
+    /// 每个 entry 可有自己的 cond_channel（select_hub 多条件），回退到 hub.cond_channel
     fn matchOrbit(self: *Engine, hub: *const OrbitHub) !u16 {
-        const cond_chan_idx = hub.cond_channel orelse {
-            // 无条件通道：找 always 条目或返回第一条
-            for (hub.orbit_table) |entry| {
-                if (entry.cond_kind == .always) return entry.orbit_index;
-            }
-            if (hub.orbit_table.len > 0) return hub.orbit_table[0].orbit_index;
-            return error.InvalidChannel;
-        };
-
-        // 读取条件值（按通道宽度转 i64）
-        const cond_chan = &self.channels[cond_chan_idx];
-        const cond_val: i64 = blk: {
-            const w = cond_chan.elem_width;
-            if (w == 0) break :blk 0;
-            break :blk switch (w) {
-                1 => @as(i64, cond_chan.getScalar(i8, 0)),
-                2 => @as(i64, cond_chan.getScalar(i16, 0)),
-                4 => @as(i64, cond_chan.getScalar(i32, 0)),
-                8 => cond_chan.getScalar(i64, 0),
-                else => 0,
-            };
-        };
-
-        // 遍历轨道表查找匹配
         for (hub.orbit_table) |entry| {
+            if (entry.cond_kind == .always) return entry.orbit_index;
+
+            // entry 自己的 cond_channel 优先，回退到 hub.cond_channel
+            const cond_chan_idx = entry.cond_channel orelse hub.cond_channel orelse continue;
+
+            // 读取条件值（按通道宽度转 i64）
+            const cond_chan = &self.channels[cond_chan_idx];
+            const cond_val: i64 = blk: {
+                const w = cond_chan.elem_width;
+                if (w == 0) break :blk 0;
+                break :blk switch (w) {
+                    1 => @as(i64, cond_chan.getScalar(i8, 0)),
+                    2 => @as(i64, cond_chan.getScalar(i16, 0)),
+                    4 => @as(i64, cond_chan.getScalar(i32, 0)),
+                    8 => cond_chan.getScalar(i64, 0),
+                    else => 0,
+                };
+            };
+
             const matched = switch (entry.cond_kind) {
                 .always => true,
                 .eq => cond_val == entry.expected_val,
@@ -2077,11 +2311,9 @@ pub const Engine = struct {
                         self.halt_reason = .none;
                         break;
                     },
-                    .continue_halt => {
+                    .continue_halt, .none => {
                         self.halt_reason = .none;
-                        // 继续下一轮，检查 continue_channel
                     },
-                    .none => {},
                 }
 
                 // 检查继续条件通道
@@ -2267,7 +2499,8 @@ pub const Engine = struct {
     }
 
     /// LIFO 执行所有已注册的 defer 体
-    fn execDeferExecute(self: *Engine) !void {
+    fn execDeferExecute(self: *Engine, lam: Lamina) !void {
+        _ = lam;
         while (self.defer_stack.items.len > 0) {
             const orbit_idx = self.defer_stack.pop().?;
             // defer 轨道执行不传播 halt
@@ -2276,6 +2509,37 @@ pub const Engine = struct {
             try self.runOrbit(orbit_idx);
             self.halt_reason = saved_halt;
         }
+    }
+
+    /// halt_throw 包装（函数指针表用）
+    fn execHaltThrow(self: *Engine, lam: Lamina) !void {
+        _ = lam;
+        self.halt_reason = .throw_halt;
+    }
+
+    /// halt_break 包装（函数指针表用）
+    fn execHaltBreak(self: *Engine, lam: Lamina) !void {
+        _ = lam;
+        self.halt_reason = .break_halt;
+    }
+
+    /// halt_continue 包装（函数指针表用）
+    fn execHaltContinue(self: *Engine, lam: Lamina) !void {
+        _ = lam;
+        self.halt_reason = .continue_halt;
+    }
+
+    /// 空操作（阻塞/异步 op 在 runTaskSlice 中处理，此处仅占位）
+    fn execNop(self: *Engine, lam: Lamina) !void {
+        _ = self;
+        _ = lam;
+    }
+
+    /// 未实现的 op
+    fn execUnsupported(self: *Engine, lam: Lamina) !void {
+        _ = self;
+        _ = lam;
+        return error.UnsupportedOp;
     }
 
     // ── 星轨模型：显式数据栈（递归用）──
@@ -2389,6 +2653,17 @@ fn chanToValue(chan: *const PhysicalChannel, meta: lamina_mod.ChannelMeta) Value
         .ref_chan => Value.fromRef(@ptrFromInt(chan.getScalar(usize, 0))),
         .null_chan => Value.fromNull(),
         .unit_chan => Value.fromUnit(),
+        .nullable_chan => blk: {
+            // 布局 [value: inner_w bytes][null_flag: 1 byte]
+            const inner_w = chan.elem_width -| 1;
+            if (inner_w == 0 or chan.data[inner_w] == 0) break :blk Value.fromNull();
+            // 非空：用 inner_type 递归提取内部值
+            const inner_meta = lamina_mod.ChannelMeta{
+                .chan_type = meta.inner_type,
+                .elem_width = inner_w,
+            };
+            break :blk chanToValue(chan, inner_meta);
+        },
     };
 }
 
@@ -2414,6 +2689,20 @@ fn valueToChan(val: Value, chan: *PhysicalChannel, meta: lamina_mod.ChannelMeta)
         .f128_chan => chan.setScalar(f128, 0, val.asF128()),
         .ref_chan => chan.setScalar(usize, 0, @intFromPtr(val.asRef())),
         .null_chan, .unit_chan => {},
+        .nullable_chan => {
+            const inner_w = chan.elem_width -| 1;
+            if (inner_w == 0) return;
+            if (val == .null_val) {
+                chan.data[inner_w] = 0; // null
+            } else {
+                const inner_meta = lamina_mod.ChannelMeta{
+                    .chan_type = meta.inner_type,
+                    .elem_width = inner_w,
+                };
+                valueToChan(val, chan, inner_meta);
+                chan.data[inner_w] = 1; // present
+            }
+        },
     }
 }
 
@@ -2626,6 +2915,152 @@ test "整数比较: 10 < 20 = true, 10 > 20 = false" {
         // mask_chan 存为 u8，halt_return 对 mask_chan 返回 0
         // 但 getScalar(u8, 0) 应该是 1
         try testing.expectEqual(@as(i64, 0), engine.return_value); // mask 不是整数通道
+    }
+}
+
+test "位运算: 0xF0 & 0x0F = 0x00, 0xF0 | 0x0F = 0xFF, 0xF0 ^ 0xFF = 0x0F" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 0: a
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 1: b
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 2: result
+    };
+
+    // 0xF0 & 0x0F = 0
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 0xF0, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .constant, .output = 1, .const_val = 0x0F, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_and, .inputs = .{ 0, 1, 0 }, .output = 2, .int_kind = .i64, .input_count = 2 },
+            .{ .op = .halt_return, .inputs = .{ 2, 0, 0 }, .output = 2, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, 0), engine.return_value);
+    }
+
+    // 0xF0 | 0x0F = 0xFF
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 0xF0, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .constant, .output = 1, .const_val = 0x0F, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_or, .inputs = .{ 0, 1, 0 }, .output = 2, .int_kind = .i64, .input_count = 2 },
+            .{ .op = .halt_return, .inputs = .{ 2, 0, 0 }, .output = 2, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, 0xFF), engine.return_value);
+    }
+
+    // 0xF0 ^ 0xFF = 0x0F
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 0xF0, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .constant, .output = 1, .const_val = 0xFF, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_xor, .inputs = .{ 0, 1, 0 }, .output = 2, .int_kind = .i64, .input_count = 2 },
+            .{ .op = .halt_return, .inputs = .{ 2, 0, 0 }, .output = 2, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, 0x0F), engine.return_value);
+    }
+}
+
+test "按位取反: ~0 = -1, ~0xFF = -256" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 0: input
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 1: result
+    };
+
+    // ~0 = -1 (all bits set)
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 0, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_not, .inputs = .{ 0, 0, 0 }, .output = 1, .int_kind = .i64, .input_count = 1 },
+            .{ .op = .halt_return, .inputs = .{ 1, 0, 0 }, .output = 1, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 2, 1);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, -1), engine.return_value);
+    }
+
+    // ~0xFF = -256
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 0xFF, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_not, .inputs = .{ 0, 0, 0 }, .output = 1, .int_kind = .i64, .input_count = 1 },
+            .{ .op = .halt_return, .inputs = .{ 1, 0, 0 }, .output = 1, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 2, 1);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, -256), engine.return_value);
+    }
+}
+
+test "左移右移: 1 << 4 = 16, 256 >> 3 = 32" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 0: a
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 1: b
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 2: result
+    };
+
+    // 1 << 4 = 16
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 1, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .constant, .output = 1, .const_val = 4, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_shl, .inputs = .{ 0, 1, 0 }, .output = 2, .int_kind = .i64, .input_count = 2 },
+            .{ .op = .halt_return, .inputs = .{ 2, 0, 0 }, .output = 2, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, 16), engine.return_value);
+    }
+
+    // 256 >> 3 = 32
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 256, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .constant, .output = 1, .const_val = 3, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_shr, .inputs = .{ 0, 1, 0 }, .output = 2, .int_kind = .i64, .input_count = 2 },
+            .{ .op = .halt_return, .inputs = .{ 2, 0, 0 }, .output = 2, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, 32), engine.return_value);
+    }
+}
+
+test "移位溢出保护: 1 << 100 = 0, 1 << -3 = 1" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 0: a
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 1: b
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // 2: result
+    };
+
+    // 1 << 100 (i64 位宽 64, 100 >= 64 → 0)
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 1, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .constant, .output = 1, .const_val = 100, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_shl, .inputs = .{ 0, 1, 0 }, .output = 2, .int_kind = .i64, .input_count = 2 },
+            .{ .op = .halt_return, .inputs = .{ 2, 0, 0 }, .output = 2, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, 0), engine.return_value);
+    }
+
+    // 1 << -3 (负移位按 0 处理 → 1 << 0 = 1)
+    {
+        const laminas = [_]Lamina{
+            .{ .op = .constant, .output = 0, .const_val = 1, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .constant, .output = 1, .const_val = -3, .int_kind = .i64, .input_count = 0 },
+            .{ .op = .int_shl, .inputs = .{ 0, 1, 0 }, .output = 2, .int_kind = .i64, .input_count = 2 },
+            .{ .op = .halt_return, .inputs = .{ 2, 0, 0 }, .output = 2, .input_count = 1 },
+        };
+        var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+        defer engine.deinit();
+        try testing.expectEqual(@as(i64, 1), engine.return_value);
     }
 }
 
@@ -3917,4 +4352,145 @@ test "星轨: defer 执行 — halt_return 前执行 defer 体" {
     try testing.expectEqual(@as(i64, 10), engine.return_value);
     // defer_val = 10 + 5 = 15 (defer body executed before halt_return)
     try testing.expectEqual(@as(i64, 15), engine.channels[1].getScalar(i64, 0));
+}
+
+// ══════════════════════════════════════════════════════
+// 安全/不安全类型转换 + Nullable 操作测试
+// ══════════════════════════════════════════════════════
+
+test "不安全类型转换: i64(42) → i32 = 42" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .i32_chan, .elem_width = 4 },
+    };
+    const laminas = [_]Lamina{
+        .{ .op = .constant, .output = 0, .const_val = 42, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .type_cast, .inputs = .{ 0, 0, 0 }, .output = 1, .const_val = @intFromEnum(value.scalar.ScalarTag.i32), .input_count = 1 },
+        .{ .op = .halt_return, .inputs = .{ 1, 0, 0 }, .output = 1, .input_count = 1 },
+    };
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 2, 1);
+    defer engine.deinit();
+    try testing.expectEqual(@as(i64, 42), engine.return_value);
+}
+
+test "不安全类型转换: i64(200) → i8 wrap = -56" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .i8_chan, .elem_width = 1 },
+    };
+    const laminas = [_]Lamina{
+        .{ .op = .constant, .output = 0, .const_val = 200, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .type_cast, .inputs = .{ 0, 0, 0 }, .output = 1, .const_val = @intFromEnum(value.scalar.ScalarTag.i8), .input_count = 1 },
+        .{ .op = .halt_return, .inputs = .{ 1, 0, 0 }, .output = 1, .input_count = 1 },
+    };
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 2, 1);
+    defer engine.deinit();
+    // 200 = 0xC8 → i8 = -56
+    try testing.expectEqual(@as(i64, -56), engine.return_value);
+}
+
+test "安全类型转换成功: i64(100) → i32 = 100" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .i32_chan, .elem_width = 4 },
+    };
+    const laminas = [_]Lamina{
+        .{ .op = .constant, .output = 0, .const_val = 100, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .type_cast_safe, .inputs = .{ 0, 0, 0 }, .output = 1, .const_val = @intFromEnum(value.scalar.ScalarTag.i32), .input_count = 1 },
+    };
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 2, 1);
+    defer engine.deinit();
+    try testing.expectEqual(@as(i32, 100), engine.channels[1].getScalar(i32, 0));
+}
+
+test "安全类型转换溢出: i64(300) → i8 抛出错误" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .i8_chan, .elem_width = 1 },
+    };
+    const laminas = [_]Lamina{
+        .{ .op = .constant, .output = 0, .const_val = 300, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .type_cast_safe, .inputs = .{ 0, 0, 0 }, .output = 1, .const_val = @intFromEnum(value.scalar.ScalarTag.i8), .input_count = 1 },
+    };
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 2, 1);
+    defer engine.deinit();
+    // i8 range: -128..127, 300 overflows → throw_halt
+    try testing.expectEqual(HaltReason.throw_halt, engine.halt_reason);
+}
+
+test "Nullable make + unwrap: 42" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .nullable_chan, .elem_width = lamina_mod.nullableElemWidth(.i64_chan), .inner_type = .i64_chan },
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+    };
+    const laminas = [_]Lamina{
+        .{ .op = .constant, .output = 0, .const_val = 42, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .nullable_make, .inputs = .{ 0, 0, 0 }, .output = 1, .input_count = 1 },
+        .{ .op = .nullable_unwrap, .inputs = .{ 1, 0, 0 }, .output = 2, .input_count = 1 },
+    };
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+    defer engine.deinit();
+    try testing.expectEqual(@as(i64, 42), engine.channels[2].getScalar(i64, 0));
+}
+
+test "Nullable unwrap_or: null → 默认值 99" {
+    // chan0 全零初始化（null flag=0），chan1=99, chan2=unwrap_or(chan0, chan1)
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .nullable_chan, .elem_width = lamina_mod.nullableElemWidth(.i64_chan), .inner_type = .i64_chan },
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+    };
+    const laminas = [_]Lamina{
+        .{ .op = .constant, .output = 1, .const_val = 99, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .nullable_unwrap_or, .inputs = .{ 0, 1, 0 }, .output = 2, .input_count = 2 },
+    };
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 3, 2);
+    defer engine.deinit();
+    try testing.expectEqual(@as(i64, 99), engine.channels[2].getScalar(i64, 0));
+}
+
+test "Nullable unwrap_or: 非空 → 原值 42" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .nullable_chan, .elem_width = lamina_mod.nullableElemWidth(.i64_chan), .inner_type = .i64_chan },
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+    };
+    const laminas = [_]Lamina{
+        .{ .op = .constant, .output = 0, .const_val = 42, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .nullable_make, .inputs = .{ 0, 0, 0 }, .output = 1, .input_count = 1 },
+        .{ .op = .constant, .output = 2, .const_val = 99, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .nullable_unwrap_or, .inputs = .{ 1, 2, 0 }, .output = 3, .input_count = 2 },
+    };
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 4, 3);
+    defer engine.deinit();
+    try testing.expectEqual(@as(i64, 42), engine.channels[3].getScalar(i64, 0));
+}
+
+test "chanToValue: nullable_chan 非空 → 内部值" {
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 },
+        .{ .chan_type = .nullable_chan, .elem_width = lamina_mod.nullableElemWidth(.i64_chan), .inner_type = .i64_chan },
+    };
+    const laminas = [_]Lamina{
+        .{ .op = .constant, .output = 0, .const_val = 77, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .nullable_make, .inputs = .{ 0, 0, 0 }, .output = 1, .input_count = 1 },
+    };
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 2, 1);
+    defer engine.deinit();
+    const val = chanToValue(&engine.channels[1], engine.graph.channel_metas[1]);
+    try testing.expectEqual(@as(i64, 77), val.asI64());
+}
+
+test "chanToValue: nullable_chan null → null_val" {
+    // chan0 全零（null），直接读取
+    const metas = [_]lamina_mod.ChannelMeta{
+        .{ .chan_type = .nullable_chan, .elem_width = lamina_mod.nullableElemWidth(.i64_chan), .inner_type = .i64_chan },
+    };
+    const laminas = [_]Lamina{};
+    var engine = try buildAndRunGraph(testing.allocator, &laminas, &metas, 1, 0);
+    defer engine.deinit();
+    const val = chanToValue(&engine.channels[0], engine.graph.channel_metas[0]);
+    try testing.expect(val == .null_val);
 }

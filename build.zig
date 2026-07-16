@@ -151,6 +151,25 @@ pub fn build(b: *std.Build) void {
     lfe_module.addImport("mem", mem_module);
     lfe_module.addImport("sync", sync_module);
 
+    // ---- Glue IR 模块（新架构：共享内存图） ----
+    const ir_module = b.createModule(.{
+        .root_source_file = b.path("src/ir/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ir_module.addImport("ast", ast_module);
+    ir_module.addImport("value", value_module);
+
+    // ---- 执行引擎模块（后端：接收 GlueIR 执行） ----
+    const engine_module = b.createModule(.{
+        .root_source_file = b.path("src/engine/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    engine_module.addImport("ir", ir_module);
+    engine_module.addImport("mem", mem_module);
+    engine_module.addImport("value", value_module);
+
     // ---- 根模块：聚合所有依赖，产出可执行文件 ----
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -165,7 +184,8 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("profiler", profiler_module);
     root_module.addImport("sema", type_check_module);
     root_module.addImport("debug_allocator", debug_allocator_module);
-    root_module.addImport("lfe", lfe_module);
+    root_module.addImport("ir", ir_module);
+    root_module.addImport("engine", engine_module);
 
     const exe = b.addExecutable(.{
         .name = "glue",
@@ -250,6 +270,36 @@ pub fn build(b: *std.Build) void {
     });
     const run_lfe_unit_tests = b.addRunArtifact(lfe_unit_tests);
 
+    // Glue IR 模块测试（需导入 ast 和 value）
+    const ir_module_test = b.createModule(.{
+        .root_source_file = b.path("src/ir/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ir_module_test.addImport("ast", ast_module);
+    ir_module_test.addImport("value", value_module);
+    const ir_unit_tests = b.addTest(.{
+        .root_module = ir_module_test,
+    });
+    const run_ir_unit_tests = b.addRunArtifact(ir_unit_tests);
+
+    // 执行引擎测试（需导入 ir、mem、ast、lexer、parser、value）
+    const engine_module_test = b.createModule(.{
+        .root_source_file = b.path("src/engine/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    engine_module_test.addImport("ir", ir_module_test);
+    engine_module_test.addImport("mem", mem_module);
+    engine_module_test.addImport("ast", ast_module);
+    engine_module_test.addImport("lexer", lexer_module);
+    engine_module_test.addImport("parser", parser_module);
+    engine_module_test.addImport("value", value_module);
+    const engine_unit_tests = b.addTest(.{
+        .root_module = engine_module_test,
+    });
+    const run_engine_unit_tests = b.addRunArtifact(engine_unit_tests);
+
     // 所有测试产物都需要链接 libc
     lexer_unit_tests.root_module.linkSystemLibrary("c", .{});
     parser_unit_tests.root_module.linkSystemLibrary("c", .{});
@@ -259,6 +309,8 @@ pub fn build(b: *std.Build) void {
     value_unit_tests.root_module.linkSystemLibrary("c", .{});
     debug_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
     lfe_unit_tests.root_module.linkSystemLibrary("c", .{});
+    ir_unit_tests.root_module.linkSystemLibrary("c", .{});
+    engine_unit_tests.root_module.linkSystemLibrary("c", .{});
 
     // ---- 聚合测试步骤：`zig build test` 运行全部单元测试 ----
     const test_step = b.step("test", "Run all tests");
@@ -270,5 +322,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_value_unit_tests.step);
     test_step.dependOn(&run_debug_allocator_unit_tests.step);
     test_step.dependOn(&run_lfe_unit_tests.step);
+    test_step.dependOn(&run_ir_unit_tests.step);
+    test_step.dependOn(&run_engine_unit_tests.step);
     for (mem_test_runs) |run| test_step.dependOn(&run.step);
 }

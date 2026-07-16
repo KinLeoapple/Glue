@@ -71,7 +71,7 @@ pub fn div(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ?ByteA
     const bv: T = @bitCast(b);
     const result = switch (@typeInfo(T)) {
         .int => if (bv == 0) null else @as(?T, @truncate(@divTrunc(av, bv))),
-        .float => av / bv,
+        .float => @as(?T, av / bv),
         else => @compileError("unsupported type for div"),
     };
     return if (result) |r| @bitCast(r) else null;
@@ -84,7 +84,7 @@ pub fn mod(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ?ByteA
     const bv: T = @bitCast(b);
     const result = switch (@typeInfo(T)) {
         .int => if (bv == 0) null else @as(?T, @rem(av, bv)),
-        .float => @mod(av, bv),
+        .float => @as(?T, @mod(av, bv)),
         else => @compileError("unsupported type for mod"),
     };
     return if (result) |r| @bitCast(r) else null;

@@ -23,6 +23,9 @@ const NativeFloatType = lamina_mod.NativeFloatType;
 const Orbit = lamina_mod.Orbit;
 const OrbitHub = lamina_mod.OrbitHub;
 const OrbitEntry = lamina_mod.OrbitEntry;
+const ChannelScope = lamina_mod.ChannelScope;
+const ParamBind = lamina_mod.ParamBind;
+const TraitMethodEntry = lamina_mod.TraitMethodEntry;
 
 const ALL_INT_KINDS = [_]IntKind{
     .i8, .i16, .i32, .i64, .i128,
@@ -54,8 +57,6 @@ fn hasSideEffect(op: LaminaOp) bool {
         .halt_throw,
         .halt_break,
         .halt_continue,
-        .extern_call,
-        .extern_call_batch,
         .cell_set,
         .cell_swap,
         .atomic_store,
@@ -85,15 +86,24 @@ fn hasSideEffect(op: LaminaOp) bool {
 }
 
 /// 主优化入口：对层流图执行全部优化 pass
+/// 顺序遵循设计文档 7.6：
+///   第一轮：太阳层优化（常量折叠 → 死通道消除 → 层融合）
+///   第二轮：星轨层优化（静态提升 → 轨道合并 → 死轨道消除）
+///   第三轮：联合优化（跨层通道活跃性 → 常量折叠）
 pub fn optimize(allocator: std.mem.Allocator, graph: *const LaminarGraph) OptError!LaminarGraph {
+    // 第一轮：太阳层优化
     var g = try constantFold(allocator, graph);
     g = try deadChannelElim(allocator, &g);
     g = try layerFusion(allocator, &g);
-    g = try channelLiveness(allocator, &g);
-    // 星轨专用 pass：提升 → 合并 → 死轨道消除
+
+    // 第二轮：星轨层优化
     g = try staticHoisting(allocator, &g);
     g = try orbitMerging(allocator, &g);
     g = try orbitDeadCode(allocator, &g);
+
+    // 第三轮：联合优化
+    g = try channelLiveness(allocator, &g);
+    g = try constantFold(allocator, &g);
     return g;
 }
 
@@ -454,38 +464,116 @@ fn isConstChannel(graph: *const LaminarGraph, chan: u16) ?i64 {
 }
 
 // ══════════════════════════════════════════════════════
-// Pass 4: 通道活跃区间分析 + 物理槽位复用
+// Pass 4: 跨层通道活跃区间分析 + 物理槽位复用（D4）
 // ══════════════════════════════════════════════════════
 
-/// 通道活跃区间分析：计算每个通道的 [定义点, 最后使用点]
-/// 非重叠的通道共享物理槽位，减少总物理通道数
-/// 注意：含轨道的图跳过槽位复用（轨道内通道引用不会被重映射）
+/// 跨层通道活跃区间分析：计算每个通道的 [定义点, 最后使用点]
+/// 非重叠的通道共享物理槽位，减少总物理通道数。
+///
+/// 活跃区间计算策略（设计文档 7.5 + 风险点约束"只分析太阳层 + 当前轨道"）：
+/// - solar 通道：基于太阳层 laminas 线性索引
+/// - orbit/bridge 通道：映射到 OrbitHub 在太阳层的位置
+///   - 非环形轨道：活跃区间 = [hub_pos, hub_pos]（点区间）
+///   - 环形轨道/async 轨道：活跃区间 = [hub_pos, 太阳层末尾]（可能长时间执行）
 pub fn channelLiveness(allocator: std.mem.Allocator, graph: *const LaminarGraph) OptError!LaminarGraph {
     if (graph.laminas.len == 0 or graph.channel_count == 0) {
         return cloneGraph(allocator, graph);
     }
-    // 含轨道时跳过槽位复用，避免破坏轨道内通道引用
-    if (graph.orbits.len > 0) {
-        return cloneGraph(allocator, graph);
+
+    // 检测 stack_push/stack_pop：递归调用使用通道范围保存/恢复现场，
+    // 槽位复用会破坏通道范围连续性，导致 stack_pop 越界。
+    // 含递归调用的图跳过槽位复用，保证正确性。
+    for (graph.laminas) |lam| {
+        if (lam.op == .stack_push or lam.op == .stack_pop) {
+            return cloneGraph(allocator, graph);
+        }
+    }
+    for (graph.orbits) |orbit| {
+        for (orbit.laminas) |lam| {
+            if (lam.op == .stack_push or lam.op == .stack_pop) {
+                return cloneGraph(allocator, graph);
+            }
+        }
     }
 
     const n_chans = graph.channel_count;
+    const n_lams = graph.laminas.len;
 
-    // 计算每个通道的最后使用索引
-    const last_use = try allocator.alloc(usize, n_chans);
-    defer allocator.free(last_use);
-    @memset(last_use, 0);
+    // ── 1. 构建 orbit → hub_positions 映射 ──
+    //    记录每个轨道被激活的位置
+    //    太阳层 orbit_hub lamina → 用太阳层 lamina 索引
+    //    轨道内嵌套 orbit_hub lamina → 继承父轨道的 hub 位置
+    var orbit_hub_positions = std.AutoHashMap(u16, struct { min: usize, max: usize, is_async: bool }).init(allocator);
+    defer orbit_hub_positions.deinit();
 
+    // 1a. 太阳层 orbit_hub laminas
+    for (graph.laminas, 0..) |lam, i| {
+        if (lam.op != .orbit_hub and lam.op != .orbit_hub_async) continue;
+        const hi = lam.hub_index orelse continue;
+        if (hi >= graph.orbit_hubs.len) continue;
+        const hub = &graph.orbit_hubs[hi];
+        const is_async = (hub.kind == .async_hub);
+        for (hub.orbit_table) |entry| {
+            const gop = try orbit_hub_positions.getOrPut(entry.orbit_index);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .min = i, .max = i, .is_async = is_async };
+            } else {
+                gop.value_ptr.min = @min(gop.value_ptr.min, i);
+                gop.value_ptr.max = @max(gop.value_ptr.max, i);
+                gop.value_ptr.is_async = gop.value_ptr.is_async or is_async;
+            }
+        }
+    }
+
+    // 1b. 轨道内嵌套 orbit_hub laminas（递归传播父轨道的 hub 位置）
+    //     多轮传播直到不再变化（处理多层嵌套）
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (graph.orbits, 0..) |orbit, orbit_idx| {
+            // 父轨道必须已有 hub 位置
+            const parent_pos = orbit_hub_positions.get(@intCast(orbit_idx)) orelse continue;
+            for (orbit.laminas) |lam| {
+                if (lam.op != .orbit_hub and lam.op != .orbit_hub_async) continue;
+                const hi = lam.hub_index orelse continue;
+                if (hi >= graph.orbit_hubs.len) continue;
+                const hub = &graph.orbit_hubs[hi];
+                const is_async = (hub.kind == .async_hub);
+                for (hub.orbit_table) |entry| {
+                    const gop = try orbit_hub_positions.getOrPut(entry.orbit_index);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .{ .min = parent_pos.min, .max = parent_pos.max, .is_async = is_async or parent_pos.is_async };
+                        changed = true;
+                    } else {
+                        const new_min = @min(gop.value_ptr.min, parent_pos.min);
+                        const new_max = @max(gop.value_ptr.max, parent_pos.max);
+                        const new_async = gop.value_ptr.is_async or is_async or parent_pos.is_async;
+                        if (new_min != gop.value_ptr.min or new_max != gop.value_ptr.max or new_async != gop.value_ptr.is_async) {
+                            gop.value_ptr.min = new_min;
+                            gop.value_ptr.max = new_max;
+                            gop.value_ptr.is_async = new_async;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 2. 计算每个通道的活跃区间 [first_def, last_use] ──
     const first_def = try allocator.alloc(usize, n_chans);
     defer allocator.free(first_def);
     @memset(first_def, std.math.maxInt(usize));
 
+    const last_use = try allocator.alloc(usize, n_chans);
+    defer allocator.free(last_use);
+    @memset(last_use, 0);
+
+    // 2a. 太阳层 laminas 的通道引用
     for (graph.laminas, 0..) |lam, i| {
-        // 定义点
         if (lam.output < n_chans and first_def[lam.output] == std.math.maxInt(usize)) {
             first_def[lam.output] = i;
         }
-        // 使用点
         for (lam.inputs[0..lam.input_count]) |in| {
             if (in < n_chans) last_use[in] = i;
         }
@@ -494,12 +582,168 @@ pub fn channelLiveness(allocator: std.mem.Allocator, graph: *const LaminarGraph)
         }
     }
     // 输出通道的最后使用 = 最后一个层
-    last_use[graph.output_channel] = graph.laminas.len;
+    if (graph.output_channel < n_chans) {
+        last_use[graph.output_channel] = n_lams;
+    }
 
-    // 贪心着色：为每个通道分配物理槽位
-    // 遍历通道，找到第一个在 [first_def, last_use] 区间内空闲且类型相同的槽位
-    // 类型不同（如 i64_chan vs f64_chan）的通道不能共享槽位，
-    // 否则 chan_type 元数据会被覆盖，导致执行时类型解释错误
+    // 2b. OrbitHub 引用的太阳层通道（cond_channel, output_channel, param_mapping.src, orbit_table.cond_channel）
+    for (graph.laminas, 0..) |lam, i| {
+        if (lam.op != .orbit_hub and lam.op != .orbit_hub_async) continue;
+        const hi = lam.hub_index orelse continue;
+        if (hi >= graph.orbit_hubs.len) continue;
+        const hub = &graph.orbit_hubs[hi];
+
+        if (hub.cond_channel) |cc| {
+            if (cc < n_chans) {
+                first_def[cc] = @min(first_def[cc], i);
+                last_use[cc] = @max(last_use[cc], i);
+            }
+        }
+        if (hub.output_channel < n_chans) {
+            first_def[hub.output_channel] = @min(first_def[hub.output_channel], i);
+            last_use[hub.output_channel] = @max(last_use[hub.output_channel], i);
+        }
+        if (hub.continue_channel) |cc| {
+            if (cc < n_chans) {
+                first_def[cc] = @min(first_def[cc], i);
+                last_use[cc] = @max(last_use[cc], i);
+            }
+        }
+        for (hub.param_mapping) |pm| {
+            if (pm.src < n_chans) {
+                first_def[pm.src] = @min(first_def[pm.src], i);
+                last_use[pm.src] = @max(last_use[pm.src], i);
+            }
+            // dst（bridge_in 通道）在 hub 位置被写入，标记活跃以防被误判为未定义通道
+            if (pm.dst < n_chans) {
+                first_def[pm.dst] = @min(first_def[pm.dst], i);
+                last_use[pm.dst] = @max(last_use[pm.dst], i);
+            }
+        }
+        for (hub.orbit_table) |entry| {
+            if (entry.cond_channel) |cc| {
+                if (cc < n_chans) {
+                    first_def[cc] = @min(first_def[cc], i);
+                    last_use[cc] = @max(last_use[cc], i);
+                }
+            }
+        }
+    }
+
+    // 2c. 轨道内通道和 bridge 通道的活跃区间
+    //     映射到 OrbitHub 在太阳层的位置
+    for (graph.orbits, 0..) |orbit, orbit_idx| {
+        const pos = orbit_hub_positions.get(@intCast(orbit_idx)) orelse continue;
+        // 环形轨道和异步轨道的活跃区间扩展到太阳层末尾
+        const effective_last = if (orbit.is_cyclic or pos.is_async) n_lams else pos.max;
+
+        // 轨道内 laminas 的通道引用
+        for (orbit.laminas) |lam| {
+            if (lam.output < n_chans) {
+                first_def[lam.output] = @min(first_def[lam.output], pos.min);
+                last_use[lam.output] = @max(last_use[lam.output], effective_last);
+            }
+            for (lam.inputs[0..lam.input_count]) |in| {
+                if (in < n_chans) {
+                    first_def[in] = @min(first_def[in], pos.min);
+                    last_use[in] = @max(last_use[in], effective_last);
+                }
+            }
+            if (lam.predicate) |p| {
+                if (p < n_chans) {
+                    first_def[p] = @min(first_def[p], pos.min);
+                    last_use[p] = @max(last_use[p], effective_last);
+                }
+            }
+        }
+        // 轨道元数据中的通道引用
+        if (orbit.output_channel < n_chans) {
+            first_def[orbit.output_channel] = @min(first_def[orbit.output_channel], pos.min);
+            last_use[orbit.output_channel] = @max(last_use[orbit.output_channel], effective_last);
+        }
+        if (orbit.continue_channel) |cc| {
+            if (cc < n_chans) {
+                first_def[cc] = @min(first_def[cc], pos.min);
+                last_use[cc] = @max(last_use[cc], effective_last);
+            }
+        }
+        for (orbit.input_channels) |ic| {
+            if (ic < n_chans) {
+                first_def[ic] = @min(first_def[ic], pos.min);
+                last_use[ic] = @max(last_use[ic], effective_last);
+            }
+        }
+        for (orbit.capture_channels) |cc| {
+            if (cc < n_chans) {
+                first_def[cc] = @min(first_def[cc], pos.min);
+                last_use[cc] = @max(last_use[cc], effective_last);
+            }
+        }
+
+        // 2c-嵌套. 轨道内 OrbitHub 引用的通道（嵌套 hub 的 param_mapping/cond_channel/output_channel）
+        for (orbit.laminas) |lam| {
+            if (lam.op != .orbit_hub and lam.op != .orbit_hub_async) continue;
+            const hi = lam.hub_index orelse continue;
+            if (hi >= graph.orbit_hubs.len) continue;
+            const nested_hub = &graph.orbit_hubs[hi];
+            if (nested_hub.cond_channel) |cc| {
+                if (cc < n_chans) {
+                    first_def[cc] = @min(first_def[cc], pos.min);
+                    last_use[cc] = @max(last_use[cc], effective_last);
+                }
+            }
+            if (nested_hub.output_channel < n_chans) {
+                first_def[nested_hub.output_channel] = @min(first_def[nested_hub.output_channel], pos.min);
+                last_use[nested_hub.output_channel] = @max(last_use[nested_hub.output_channel], effective_last);
+            }
+            if (nested_hub.continue_channel) |cc| {
+                if (cc < n_chans) {
+                    first_def[cc] = @min(first_def[cc], pos.min);
+                    last_use[cc] = @max(last_use[cc], effective_last);
+                }
+            }
+            for (nested_hub.param_mapping) |pm| {
+                if (pm.src < n_chans) {
+                    first_def[pm.src] = @min(first_def[pm.src], pos.min);
+                    last_use[pm.src] = @max(last_use[pm.src], effective_last);
+                }
+                if (pm.dst < n_chans) {
+                    first_def[pm.dst] = @min(first_def[pm.dst], pos.min);
+                    last_use[pm.dst] = @max(last_use[pm.dst], effective_last);
+                }
+            }
+            for (nested_hub.orbit_table) |entry| {
+                if (entry.cond_channel) |cc| {
+                    if (cc < n_chans) {
+                        first_def[cc] = @min(first_def[cc], pos.min);
+                        last_use[cc] = @max(last_use[cc], effective_last);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2d. TraitMethodEntry 引用的通道（轨道内通道，通过 orbit_index 找 hub 位置）
+    for (graph.trait_method_table) |tme| {
+        const pos = orbit_hub_positions.get(tme.orbit_index) orelse continue;
+        for (tme.param_channels) |pc| {
+            if (pc < n_chans) {
+                first_def[pc] = @min(first_def[pc], pos.min);
+                last_use[pc] = @max(last_use[pc], pos.max);
+            }
+        }
+        if (tme.self_channel < n_chans) {
+            first_def[tme.self_channel] = @min(first_def[tme.self_channel], pos.min);
+            last_use[tme.self_channel] = @max(last_use[tme.self_channel], pos.max);
+        }
+        if (tme.output_channel < n_chans) {
+            first_def[tme.output_channel] = @min(first_def[tme.output_channel], pos.min);
+            last_use[tme.output_channel] = @max(last_use[tme.output_channel], pos.max);
+        }
+    }
+
+    // ── 3. 贪心着色：为每个通道分配物理槽位 ──
+    // 类型不同（如 i64_chan vs f64_chan）的通道不能共享槽位
     const slot_map = try allocator.alloc(u16, n_chans);
     defer allocator.free(slot_map);
 
@@ -516,7 +760,6 @@ pub fn channelLiveness(allocator: std.mem.Allocator, graph: *const LaminarGraph)
         }
 
         const chan_type = graph.channel_metas[chan].chan_type;
-        // 找到第一个在定义时刻已空闲且类型相同的槽位
         var assigned: ?u16 = null;
         for (slot_free_at.items, 0..) |*free_at, slot| {
             if (free_at.* <= first_def[chan] and slot_types.items[slot] == chan_type) {
@@ -542,33 +785,66 @@ pub fn channelLiveness(allocator: std.mem.Allocator, graph: *const LaminarGraph)
         return cloneGraph(allocator, graph);
     }
 
-    // 重写所有层中的通道索引
-    var new_laminas = try allocator.alloc(Lamina, graph.laminas.len);
+    // ── 4. 重映射所有通道引用 ──
+
+    // 4a. 太阳层 laminas
+    var new_laminas = try allocator.alloc(Lamina, n_lams);
     for (graph.laminas, 0..) |lam, i| {
-        new_laminas[i] = lam;
-        new_laminas[i].output = slot_map[lam.output];
-        for (new_laminas[i].inputs[0..lam.input_count]) |*in| {
-            in.* = slot_map[in.*];
-        }
-        if (lam.predicate) |p| {
-            new_laminas[i].predicate = slot_map[p];
-        }
+        new_laminas[i] = remapLamina(lam, slot_map);
     }
 
-    // 构建新的通道元数据
-    // 同一槽位的所有通道具有相同 chan_type（由槽位分配保证），
-    // 取任意一个的元数据即可；保留 is_cell 标记
+    // 4b. 通道元数据
     var new_metas = try allocator.alloc(ChannelMeta, physical_count);
     @memset(new_metas, .{ .chan_type = .null_chan, .elem_width = 0 });
     for (0..n_chans) |chan| {
         const meta = graph.channel_metas[chan];
         const slot = slot_map[chan];
-        // 首次设置该槽位，或保留 is_cell 标记
         if (new_metas[slot].elem_width == 0) {
             new_metas[slot] = meta;
         } else if (meta.is_cell) {
             new_metas[slot].is_cell = true;
         }
+    }
+
+    // 4c. 通道 scope（重映射到新槽位）
+    var new_scopes: []const ChannelScope = &.{};
+    if (graph.channel_scopes.len > 0) {
+        const scopes_copy = try allocator.alloc(ChannelScope, physical_count);
+        @memset(scopes_copy, .solar);
+        for (0..n_chans) |chan| {
+            scopes_copy[slot_map[chan]] = graph.channel_scopes[chan];
+        }
+        new_scopes = scopes_copy;
+    }
+
+    // 4d. 轨道（重映射轨道内所有通道引用）
+    var new_orbits: []const Orbit = &.{};
+    if (graph.orbits.len > 0) {
+        const orbits_copy = try allocator.alloc(Orbit, graph.orbits.len);
+        for (graph.orbits, 0..) |orbit, i| {
+            orbits_copy[i] = remapOrbit(allocator, orbit, slot_map) catch orbit;
+        }
+        new_orbits = orbits_copy;
+    }
+
+    // 4e. OrbitHub（重映射 cond_channel, output_channel, param_mapping, orbit_table）
+    var new_hubs: []const OrbitHub = &.{};
+    if (graph.orbit_hubs.len > 0) {
+        const hubs_copy = try allocator.alloc(OrbitHub, graph.orbit_hubs.len);
+        for (graph.orbit_hubs, 0..) |hub, i| {
+            hubs_copy[i] = remapOrbitHub(allocator, hub, slot_map) catch hub;
+        }
+        new_hubs = hubs_copy;
+    }
+
+    // 4f. TraitMethodTable（重映射 param_channels, self_channel, output_channel）
+    var new_trait_table: []const TraitMethodEntry = &.{};
+    if (graph.trait_method_table.len > 0) {
+        const trait_copy = try allocator.alloc(TraitMethodEntry, graph.trait_method_table.len);
+        for (graph.trait_method_table, 0..) |tme, i| {
+            trait_copy[i] = remapTraitMethod(allocator, tme, slot_map) catch tme;
+        }
+        new_trait_table = trait_copy;
     }
 
     const result = LaminarGraph{
@@ -579,12 +855,119 @@ pub fn channelLiveness(allocator: std.mem.Allocator, graph: *const LaminarGraph)
         .output_channel = slot_map[graph.output_channel],
         .string_table = graph.string_table,
         .name_table = graph.name_table,
-        .orbits = graph.orbits,
-        .orbit_hubs = graph.orbit_hubs,
+        .orbits = new_orbits,
+        .orbit_hubs = new_hubs,
         .defer_entries = graph.defer_entries,
-        .channel_scopes = graph.channel_scopes,
-        .arena = null, // 新图不持有 arena，由调用者管理
+        .channel_scopes = new_scopes,
+        .trait_method_table = new_trait_table,
+        .arena = null,
     };
+    return result;
+}
+
+/// 重映射单个 Lamina 中的所有通道索引
+fn remapLamina(lam: Lamina, slot_map: []const u16) Lamina {
+    var result = lam;
+    if (lam.output < slot_map.len) result.output = slot_map[lam.output];
+    var j: usize = 0;
+    while (j < lam.input_count) : (j += 1) {
+        if (lam.inputs[j] < slot_map.len) result.inputs[j] = slot_map[lam.inputs[j]];
+    }
+    if (lam.predicate) |p| {
+        if (p < slot_map.len) result.predicate = slot_map[p];
+    }
+    // stack_push/stack_pop 的 const_val 存储参数通道起始索引，需随 slot_map 重映射
+    if (lam.op == .stack_push or lam.op == .stack_pop) {
+        if (lam.const_val) |cv| {
+            const start: usize = @intCast(cv);
+            if (start < slot_map.len) result.const_val = @intCast(slot_map[start]);
+        }
+    }
+    return result;
+}
+
+/// 重映射 Orbit 中的所有通道引用
+fn remapOrbit(allocator: std.mem.Allocator, orbit: Orbit, slot_map: []const u16) OptError!Orbit {
+    var result = orbit;
+
+    // 重映射 laminas
+    const new_lams = try allocator.alloc(Lamina, orbit.laminas.len);
+    for (orbit.laminas, 0..) |lam, i| {
+        new_lams[i] = remapLamina(lam, slot_map);
+    }
+    result.laminas = new_lams;
+
+    // 重映射 output_channel
+    if (orbit.output_channel < slot_map.len) result.output_channel = slot_map[orbit.output_channel];
+
+    // 重映射 continue_channel
+    if (orbit.continue_channel) |cc| {
+        if (cc < slot_map.len) result.continue_channel = slot_map[cc];
+    }
+
+    // 重映射 input_channels
+    if (orbit.input_channels.len > 0) {
+        result.input_channels = try remapChannels(allocator, orbit.input_channels, slot_map);
+    }
+
+    // 重映射 capture_channels
+    if (orbit.capture_channels.len > 0) {
+        result.capture_channels = try remapChannels(allocator, orbit.capture_channels, slot_map);
+    }
+
+    return result;
+}
+
+/// 重映射 OrbitHub 中的所有通道引用
+fn remapOrbitHub(allocator: std.mem.Allocator, hub: OrbitHub, slot_map: []const u16) OptError!OrbitHub {
+    var result = hub;
+
+    if (hub.cond_channel) |cc| {
+        if (cc < slot_map.len) result.cond_channel = slot_map[cc];
+    }
+    if (hub.output_channel < slot_map.len) result.output_channel = slot_map[hub.output_channel];
+    if (hub.continue_channel) |cc| {
+        if (cc < slot_map.len) result.continue_channel = slot_map[cc];
+    }
+
+    // 重映射 param_mapping
+    if (hub.param_mapping.len > 0) {
+        const new_pm = try allocator.alloc(ParamBind, hub.param_mapping.len);
+        for (hub.param_mapping, 0..) |pm, i| {
+            new_pm[i] = .{
+                .src = if (pm.src < slot_map.len) slot_map[pm.src] else pm.src,
+                .dst = if (pm.dst < slot_map.len) slot_map[pm.dst] else pm.dst,
+            };
+        }
+        result.param_mapping = new_pm;
+    }
+
+    // 重映射 orbit_table 中的 cond_channel
+    if (hub.orbit_table.len > 0) {
+        const new_table = try allocator.alloc(OrbitEntry, hub.orbit_table.len);
+        for (hub.orbit_table, 0..) |entry, i| {
+            new_table[i] = entry;
+            if (entry.cond_channel) |cc| {
+                if (cc < slot_map.len) new_table[i].cond_channel = slot_map[cc];
+            }
+        }
+        result.orbit_table = new_table;
+    }
+
+    return result;
+}
+
+/// 重映射 TraitMethodEntry 中的所有通道引用
+fn remapTraitMethod(allocator: std.mem.Allocator, tme: TraitMethodEntry, slot_map: []const u16) OptError!TraitMethodEntry {
+    var result = tme;
+
+    if (tme.self_channel < slot_map.len) result.self_channel = slot_map[tme.self_channel];
+    if (tme.output_channel < slot_map.len) result.output_channel = slot_map[tme.output_channel];
+
+    if (tme.param_channels.len > 0) {
+        result.param_channels = try remapChannels(allocator, tme.param_channels, slot_map);
+    }
+
     return result;
 }
 
@@ -729,8 +1112,16 @@ pub fn orbitDeadCode(allocator: std.mem.Allocator, graph: *const LaminarGraph) O
 // Pass 6: 静态提升（staticHoisting）
 // ══════════════════════════════════════════════════════
 
-/// 静态提升：将轨道内无谓词门控的 constant 层提升到太阳层
-/// 仅提升 .constant 层（无输入、无谓词、无副作用），安全且有效
+/// 静态提升：将轨道内静态代码提升到太阳层
+///
+/// 提升条件（全部满足）：
+/// 1. 无谓词门控（predicate == null）
+/// 2. 无副作用（不含 halt/orbit_hub/defer/stack 等）
+/// 3. 非 .move（move 是轨道出口回写，必须留在轨道内）
+/// 4. 环形轨道：仅提升 .constant（保证循环不变性）
+/// 5. 非环形轨道：所有输入通道均为太阳层通道（scope == .solar 或 .bridge_out）
+///
+/// 提升的 lamina 插入太阳层中第一个 orbit_hub 之前（确保输入通道已定义）
 pub fn staticHoisting(allocator: std.mem.Allocator, graph: *const LaminarGraph) OptError!LaminarGraph {
     if (graph.orbits.len == 0) return cloneGraph(allocator, graph);
 
@@ -745,7 +1136,7 @@ pub fn staticHoisting(allocator: std.mem.Allocator, graph: *const LaminarGraph) 
         var orbit_hoisted = false;
 
         for (orbit.laminas) |lam| {
-            if (lam.op == .constant and lam.predicate == null) {
+            if (isHoistable(lam, orbit, graph)) {
                 try hoisted_laminas.append(allocator, lam);
                 any_hoisted = true;
                 orbit_hoisted = true;
@@ -764,11 +1155,20 @@ pub fn staticHoisting(allocator: std.mem.Allocator, graph: *const LaminarGraph) 
 
     if (!any_hoisted) return cloneGraph(allocator, graph);
 
-    // 将提升的 laminas 插入太阳层开头（constant 无依赖，位置不影响正确性）
+    // 找到太阳层中第一个 orbit_hub 的位置，将提升的 laminas 插入其前
+    var insert_pos: usize = graph.laminas.len;
+    for (graph.laminas, 0..) |lam, i| {
+        if (lam.op == .orbit_hub or lam.op == .orbit_hub_async) {
+            insert_pos = i;
+            break;
+        }
+    }
+
     var new_solar = std.ArrayList(Lamina).empty;
     defer new_solar.deinit(allocator);
+    try new_solar.appendSlice(allocator, graph.laminas[0..insert_pos]);
     try new_solar.appendSlice(allocator, hoisted_laminas.items);
-    try new_solar.appendSlice(allocator, graph.laminas);
+    try new_solar.appendSlice(allocator, graph.laminas[insert_pos..]);
 
     const metas_copy = try allocator.dupe(ChannelMeta, graph.channel_metas);
     const inputs_copy = try allocator.dupe(u16, graph.input_channels);
@@ -788,12 +1188,45 @@ pub fn staticHoisting(allocator: std.mem.Allocator, graph: *const LaminarGraph) 
     };
 }
 
+/// 判断轨道内 lamina 是否可提升到太阳层
+fn isHoistable(lam: Lamina, orbit: Orbit, graph: *const LaminarGraph) bool {
+    // 1. 必须无谓词门控
+    if (lam.predicate != null) return false;
+    // 2. 必须无副作用
+    if (hasSideEffect(lam.op)) return false;
+    // 3. 不能是控制流出口
+    switch (lam.op) {
+        .halt_return, .halt_throw, .halt_break, .halt_continue => return false,
+        .orbit_hub, .orbit_hub_async, .orbit_join => return false,
+        .defer_register, .defer_execute => return false,
+        .stack_push, .stack_pop, .stack_peek, .stack_depth => return false,
+        .move => return false, // move 是轨道出口回写，必须留在轨道内
+        else => {},
+    }
+    // 4. 环形轨道：仅提升 constant（保证循环不变性）
+    if (orbit.is_cyclic) {
+        return lam.op == .constant;
+    }
+    // 5. 非环形轨道：所有输入通道必须是太阳层通道
+    for (lam.inputs[0..lam.input_count]) |in| {
+        if (in < graph.channel_scopes.len) {
+            const scope = graph.channel_scopes[in];
+            if (scope == .bridge_in or scope == .orbit) return false;
+        }
+    }
+    return true;
+}
+
 // ══════════════════════════════════════════════════════
 // Pass 7: 极简轨道合并（orbitMerging）
 // ══════════════════════════════════════════════════════
 
 /// 极简轨道合并：将结构相同、仅常量不同的极简轨道（≤4轨道、每条≤3 lamina、
 /// 无副作用、无嵌套）合并为 select 层，避免轨道激活开销
+///
+/// 合并策略：
+/// - 2 轨道（if-else 模式）：select(cond, r0, r1)
+/// - 3-4 轨道（match 模式）：constant(expected) + int_eq + 嵌套 select
 pub fn orbitMerging(allocator: std.mem.Allocator, graph: *const LaminarGraph) OptError!LaminarGraph {
     if (graph.orbit_hubs.len == 0) return cloneGraph(allocator, graph);
 
@@ -804,6 +1237,11 @@ pub fn orbitMerging(allocator: std.mem.Allocator, graph: *const LaminarGraph) Op
     defer allocator.free(used_orbit);
     @memset(used_orbit, false);
 
+    // 合并过程中可能需要分配新通道（比较常量、mask、中间 select 结果）
+    var new_metas = std.ArrayList(ChannelMeta).empty;
+    defer new_metas.deinit(allocator);
+    var next_chan: u16 = graph.channel_count;
+
     for (graph.laminas) |lam| {
         if (lam.op == .orbit_hub) {
             const hub_idx = lam.hub_index orelse {
@@ -812,14 +1250,11 @@ pub fn orbitMerging(allocator: std.mem.Allocator, graph: *const LaminarGraph) Op
             };
             const hub = graph.orbit_hubs[hub_idx];
 
-            // 尝试合并：仅处理 if_hub / match_hub，≤4 轨道
-            if (try tryMergeHub(allocator, hub, graph.orbits)) |merge_result| {
+            if (try tryMergeHub(allocator, hub, graph.orbits, graph, &new_metas, &next_chan)) |merge_result| {
                 solar_changed = true;
-                // 标记被合并的轨道为已用（将在 orbitDeadCode 中消除）
                 for (hub.orbit_table) |entry| {
-                    used_orbit[entry.orbit_index] = true;
+                    if (entry.orbit_index < used_orbit.len) used_orbit[entry.orbit_index] = true;
                 }
-                // 用合并后的 laminas 替换 orbit_hub
                 try new_solar.appendSlice(allocator, merge_result);
                 continue;
             }
@@ -829,12 +1264,27 @@ pub fn orbitMerging(allocator: std.mem.Allocator, graph: *const LaminarGraph) Op
 
     if (!solar_changed) return cloneGraph(allocator, graph);
 
-    const metas_copy = try allocator.dupe(ChannelMeta, graph.channel_metas);
+    // 合并 channel_metas 和 channel_scopes（新通道标记为 solar）
+    const final_chan_count = next_chan;
+    const metas_copy = try allocator.alloc(ChannelMeta, final_chan_count);
+    @memcpy(metas_copy[0..graph.channel_metas.len], graph.channel_metas);
+    for (new_metas.items, 0..) |m, i| {
+        metas_copy[graph.channel_metas.len + i] = m;
+    }
+
+    const scopes_copy = try allocator.alloc(lamina_mod.ChannelScope, final_chan_count);
+    if (graph.channel_scopes.len > 0) {
+        @memcpy(scopes_copy[0..graph.channel_scopes.len], graph.channel_scopes);
+    }
+    for (graph.channel_scopes.len..final_chan_count) |i| {
+        scopes_copy[i] = .solar;
+    }
+
     const inputs_copy = try allocator.dupe(u16, graph.input_channels);
     return .{
         .laminas = try allocator.dupe(Lamina, new_solar.items),
         .channel_metas = metas_copy,
-        .channel_count = graph.channel_count,
+        .channel_count = final_chan_count,
         .input_channels = inputs_copy,
         .output_channel = graph.output_channel,
         .string_table = graph.string_table,
@@ -842,66 +1292,153 @@ pub fn orbitMerging(allocator: std.mem.Allocator, graph: *const LaminarGraph) Op
         .orbits = graph.orbits,
         .orbit_hubs = graph.orbit_hubs,
         .defer_entries = graph.defer_entries,
-        .channel_scopes = graph.channel_scopes,
+        .channel_scopes = scopes_copy,
         .arena = null,
     };
 }
 
-/// 尝试合并一个 OrbitHub 的轨道
-/// 条件：≤4 轨道、每条 ≤3 lamina、结构相同仅常量不同、无副作用、无嵌套
-/// 合并策略：每个轨道是 [constant → move(output)] 模式时，合并为 select
 const MergeResult = []const Lamina;
 
-fn tryMergeHub(allocator: std.mem.Allocator, hub: OrbitHub, orbits: []const Orbit) OptError!?MergeResult {
+/// 分配新通道（合并过程中用于比较常量、mask 等）
+fn allocMergeChan(
+    new_metas: *std.ArrayList(ChannelMeta),
+    next_chan: *u16,
+    allocator: std.mem.Allocator,
+    chan_type: ScalarChanType,
+) !u16 {
+    const idx = next_chan.*;
+    next_chan.* += 1;
+    try new_metas.append(allocator, .{
+        .chan_type = chan_type,
+        .elem_width = lamina_mod.chanElemWidth(chan_type),
+    });
+    return idx;
+}
+
+fn tryMergeHub(
+    allocator: std.mem.Allocator,
+    hub: OrbitHub,
+    orbits: []const Orbit,
+    graph: *const LaminarGraph,
+    new_metas: *std.ArrayList(ChannelMeta),
+    next_chan: *u16,
+) OptError!?MergeResult {
     const table = hub.orbit_table;
     if (table.len < 2 or table.len > 4) return null;
-    if (hub.is_cyclic) return null; // 环形轨道不合并
-
-    // 检查每个轨道是否是极简模式：[constant, move]
-    // 所有轨道的 lamina 结构必须相同（同 op、同 input_count），仅 const_val 不同
-    const first_orbit = orbits[table[0].orbit_index];
-    if (first_orbit.laminas.len != 2) return null;
-    if (first_orbit.laminas[0].op != .constant) return null;
-    if (first_orbit.laminas[1].op != .move) return null;
-
-    // 检查所有轨道结构一致
-    for (table[1..]) |entry| {
-        const orbit = orbits[entry.orbit_index];
-        if (orbit.laminas.len != 2) return null;
-        if (orbit.laminas[0].op != .constant) return null;
-        if (orbit.laminas[1].op != .move) return null;
-        // 无副作用、无谓词门控
-        for (orbit.laminas) |olam| {
-            if (hasSideEffect(olam.op)) return null;
-            if (olam.predicate != null) return null;
-        }
-    }
-
-    // 仅处理 2 轨道合并（if-else 模式）
-    if (table.len != 2) return null;
+    if (hub.is_cyclic) return null;
 
     const cond_chan = hub.cond_channel orelse return null;
     const out_chan = hub.output_channel;
+    const n = table.len;
 
-    // 提取每个轨道的常量值和临时通道
-    // 轨道结构: [constant(val) → val_chan, move(val_chan → out_chan)]
-    const orbit0 = orbits[table[0].orbit_index];
-    const orbit1 = orbits[table[1].orbit_index];
-    const val_chan0 = orbit0.laminas[0].output;
-    const val_chan1 = orbit1.laminas[0].output;
+    // 验证所有轨道结构一致：[constant, move?] 或 [constant]
+    const first_lams = orbits[table[0].orbit_index].laminas;
+    if (first_lams.len < 1 or first_lams.len > 3) return null;
+    if (first_lams[0].op != .constant) return null;
+    if (first_lams[0].predicate != null) return null;
 
-    // 合并为: constant(val0) → val_chan0, constant(val1) → val_chan1,
-    //         select(cond, val_chan0, val_chan1) → out_chan
+    // 检查所有轨道结构一致 + 无副作用 + 无谓词
+    for (table[1..]) |entry| {
+        const olams = orbits[entry.orbit_index].laminas;
+        if (olams.len != first_lams.len) return null;
+        for (olams, first_lams) |olam, flam| {
+            if (olam.op != flam.op) return null;
+            if (olam.input_count != flam.input_count) return null;
+            if (olam.predicate != null) return null;
+            if (hasSideEffect(olam.op)) return null;
+        }
+    }
+
+    // 提取每个轨道的结果通道（move 的 input[0]，或最后一个 lamina 的 output）
+    const n_orbits = n;
+    var result_chans = try allocator.alloc(u16, n_orbits);
+    defer allocator.free(result_chans);
+    for (table, 0..) |entry, i| {
+        const olams = orbits[entry.orbit_index].laminas;
+        if (olams.len > 0 and olams[olams.len - 1].op == .move) {
+            result_chans[i] = olams[olams.len - 1].inputs[0];
+        } else if (olams.len > 0) {
+            result_chans[i] = olams[olams.len - 1].output;
+        } else {
+            return null;
+        }
+    }
+
     var result = std.ArrayList(Lamina).empty;
     errdefer result.deinit(allocator);
-    try result.append(allocator, orbit0.laminas[0]); // constant 0
-    try result.append(allocator, orbit1.laminas[0]); // constant 1
-    try result.append(allocator, .{
-        .op = .select,
-        .inputs = .{ cond_chan, val_chan0, val_chan1 },
-        .output = out_chan,
-        .input_count = 3,
-    });
+
+    // 发射所有轨道的非 move laminas 到太阳层（保留各自的 const_val）
+    for (table) |entry| {
+        const olams = orbits[entry.orbit_index].laminas;
+        for (olams) |olam| {
+            if (olam.op != .move) {
+                try result.append(allocator, olam);
+            }
+        }
+    }
+
+    // 结果值类型（从第一个轨道的 constant 推断）
+    const result_type = graph.channel_metas[first_lams[0].output].chan_type;
+
+    if (n == 2) {
+        // 2 轨道：直接 select(cond, r0, r1)
+        try result.append(allocator, .{
+            .op = .select,
+            .inputs = .{ cond_chan, result_chans[0], result_chans[1] },
+            .output = out_chan,
+            .input_count = 3,
+        });
+    } else {
+        // 3-4 轨道：比较常量 + int_eq + 嵌套 select
+        const cond_meta = graph.channel_metas[cond_chan];
+        const cond_int_kind = lamina_mod.intKindFromChanType(cond_meta.chan_type);
+        const cond_chan_type = cond_meta.chan_type;
+
+        // 为前 n-1 个 arm 生成 constant(expected) + int_eq(cond, expected) → mask
+        var mask_chans = try allocator.alloc(u16, n - 1);
+        defer allocator.free(mask_chans);
+
+        for (table[0 .. n - 1], 0..) |entry, i| {
+            const exp_chan = try allocMergeChan(new_metas, next_chan, allocator, cond_chan_type);
+            try result.append(allocator, .{
+                .op = .constant,
+                .const_val = entry.expected_val,
+                .output = exp_chan,
+                .int_kind = cond_int_kind,
+                .input_count = 0,
+            });
+            const mask_chan = try allocMergeChan(new_metas, next_chan, allocator, .mask_chan);
+            try result.append(allocator, .{
+                .op = .int_eq,
+                .inputs = .{ cond_chan, exp_chan, 0 },
+                .output = mask_chan,
+                .int_kind = cond_int_kind,
+                .input_count = 2,
+            });
+            mask_chans[i] = mask_chan;
+        }
+
+        // 嵌套 select：select(mask[0], r0, select(mask[1], r1, ... select(mask[n-2], r[n-2], r[n-1])))
+        var current_chan = result_chans[n - 1];
+        var i: usize = n - 1;
+        while (i > 1) : (i -= 1) {
+            const tmp_chan = try allocMergeChan(new_metas, next_chan, allocator, result_type);
+            try result.append(allocator, .{
+                .op = .select,
+                .inputs = .{ mask_chans[i - 1], result_chans[i - 1], current_chan },
+                .output = tmp_chan,
+                .input_count = 3,
+            });
+            current_chan = tmp_chan;
+        }
+        // 最外层 select → out_chan
+        try result.append(allocator, .{
+            .op = .select,
+            .inputs = .{ mask_chans[0], result_chans[0], current_chan },
+            .output = out_chan,
+            .input_count = 3,
+        });
+    }
 
     return try allocator.dupe(Lamina, result.items);
 }
@@ -923,10 +1460,12 @@ fn cloneGraph(allocator: std.mem.Allocator, graph: *const LaminarGraph) OptError
         .output_channel = graph.output_channel,
         .string_table = graph.string_table,
         .name_table = graph.name_table,
+        .subgraphs = graph.subgraphs,
         .orbits = graph.orbits,
         .orbit_hubs = graph.orbit_hubs,
         .defer_entries = graph.defer_entries,
         .channel_scopes = graph.channel_scopes,
+        .trait_method_table = graph.trait_method_table,
         .arena = null,
     };
 }
@@ -944,10 +1483,12 @@ fn rebuildGraph(allocator: std.mem.Allocator, graph: *const LaminarGraph, new_la
         .output_channel = graph.output_channel,
         .string_table = graph.string_table,
         .name_table = graph.name_table,
+        .subgraphs = graph.subgraphs,
         .orbits = graph.orbits,
         .orbit_hubs = graph.orbit_hubs,
         .defer_entries = graph.defer_entries,
         .channel_scopes = graph.channel_scopes,
+        .trait_method_table = graph.trait_method_table,
         .arena = null,
     };
 }
@@ -1108,4 +1649,87 @@ test "通道活跃区间: 非重叠通道共享槽位" {
 
     // 4 个逻辑通道应被压缩到 ≤ 3 个物理槽位
     try testing.expect(optimized.channel_count < 4);
+}
+
+test "跨层活跃性: 含轨道的图通道复用" {
+    // 太阳层:
+    //   lam0: constant(1) → chan0  [def=0, last_use=1]
+    //   lam1: int_add(chan0, chan0) → chan1  [def=1, last_use=2]  (chan0 死于此后)
+    //   lam2: orbit_hub(hub=0) → chan2  [hub_pos=2, 激活 orbit 0]
+    //   lam3: halt_return(chan2) → chan3  [def=3, last_use=3]
+    // 轨道 0:
+    //   lam0: move(chan4) → chan5  (bridge_in → bridge_out)
+    // OrbitHub 0:
+    //   cond_channel=chan1, output=chan2, param_mapping=[{src=chan1, dst=chan4}]
+    //
+    // 活跃区间:
+    //   chan0 [0,1]  ← 可与 chan2/chan3/chan4/chan5 复用
+    //   chan1 [0,2]  ← 被 hub 引用
+    //   chan2 [2,3]
+    //   chan3 [3,3]
+    //   chan4 [2,2]  ← bridge_in, hub_pos=2
+    //   chan5 [2,2]  ← bridge_out, hub_pos=2
+    // 6 个逻辑通道应压缩到 < 6 个物理槽位
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const metas = [_]ChannelMeta{
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // chan0 solar
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // chan1 solar
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // chan2 solar
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // chan3 solar
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // chan4 bridge_in
+        .{ .chan_type = .i64_chan, .elem_width = 8 }, // chan5 bridge_out
+    };
+    const scopes = [_]ChannelScope{
+        .solar, .solar, .solar, .solar, .bridge_in, .bridge_out,
+    };
+
+    const solar_lams = [_]Lamina{
+        .{ .op = .constant, .output = 0, .const_val = 1, .int_kind = .i64, .input_count = 0 },
+        .{ .op = .int_add, .inputs = .{ 0, 0, 0 }, .output = 1, .int_kind = .i64, .input_count = 1 },
+        .{ .op = .orbit_hub, .hub_index = 0, .output = 2, .input_count = 0 },
+        .{ .op = .halt_return, .inputs = .{ 2, 0, 0 }, .output = 3, .input_count = 1 },
+    };
+    const orbit_lams = [_]Lamina{
+        .{ .op = .move, .inputs = .{ 4, 0, 0 }, .output = 5, .input_count = 1 },
+    };
+
+    const orbit_table = [_]OrbitEntry{
+        .{ .cond_channel = 1, .cond_kind = .eq, .expected_val = 1, .orbit_index = 0 },
+    };
+    const param_mapping = [_]ParamBind{
+        .{ .src = 1, .dst = 4 },
+    };
+    const hubs = [_]OrbitHub{
+        .{ .kind = .if_hub, .cond_channel = 1, .orbit_table = &orbit_table, .output_channel = 2, .param_mapping = &param_mapping },
+    };
+    const orbits = [_]Orbit{
+        .{ .laminas = &orbit_lams, .output_channel = 5 },
+    };
+
+    const graph = LaminarGraph{
+        .laminas = &solar_lams,
+        .channel_metas = &metas,
+        .channel_count = 6,
+        .input_channels = &.{},
+        .output_channel = 3,
+        .string_table = &.{},
+        .name_table = &.{},
+        .orbits = &orbits,
+        .orbit_hubs = &hubs,
+        .channel_scopes = &scopes,
+        .arena = null,
+    };
+
+    const optimized = try channelLiveness(a, &graph);
+    // arena.deinit() 释放所有分配，无需手动 free
+
+    // 6 个逻辑通道应被压缩到 < 6 个物理槽位
+    try testing.expect(optimized.channel_count < 6);
+    // 验证重映射后轨道和 hub 数据完整
+    try testing.expect(optimized.orbits.len == 1);
+    try testing.expect(optimized.orbit_hubs.len == 1);
 }

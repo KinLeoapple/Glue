@@ -255,7 +255,7 @@ OrbitState
 环形轨道是星轨设计的核心突破——**循环不是 DAG 的补丁，而是轨道的天然形态**。
 
 ```
-while (cond) { body }
+while cond { body }
 
 编译为：
   太阳层：

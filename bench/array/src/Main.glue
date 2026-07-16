@@ -55,7 +55,7 @@ fun main() {
     var k: i32 = 0
     while k < 1000 {
         val tmp = buildArray(100)
-        if (tmp.len() == 100) { churnCount = churnCount + 1 }
+        if tmp.len() == 100 { churnCount = churnCount + 1 }
         k = k + 1
     }
     println(churnCount)  // 1000

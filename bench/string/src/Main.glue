@@ -42,7 +42,7 @@ fun main() {
     var eqCount: i32 = 0
     var j: i32 = 0
     while j < 10000 {
-        if (a == b) { eqCount = eqCount + 1 }
+        if a == b { eqCount = eqCount + 1 }
         j = j + 1
     }
     println(eqCount)   // 10000
@@ -52,7 +52,7 @@ fun main() {
     var k: i32 = 0
     while k < 50000 {
         val tiny = "x" + "y"
-        if (tiny.len() == 2) { ssoCount = ssoCount + 1 }
+        if tiny.len() == 2 { ssoCount = ssoCount + 1 }
         k = k + 1
     }
     println(ssoCount)  // 50000

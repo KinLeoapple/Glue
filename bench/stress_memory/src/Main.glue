@@ -58,7 +58,7 @@ type LList =
 
 fun buildLList(n: i32): LList {
     fun go(i: i32, acc: LList): LList {
-        if (i <= 0) { acc } else { go(i - 1, LCons(i64(i), acc)) }
+        if i <= 0 { acc } else { go(i - 1, LCons(i64(i), acc)) }
     }
     go(n, LNil)
 }
@@ -95,8 +95,8 @@ fun bstInsert(t: BST, v: i64): BST {
     match t {
         BLeaf => BNode(v, BLeaf, BLeaf)
         BNode(n, lo, hi) => {
-            if (v < n) { BNode(n, bstInsert(lo, v), hi) }
-            else if (v > n) { BNode(n, lo, bstInsert(hi, v)) }
+            if v < n { BNode(n, bstInsert(lo, v), hi) }
+            else if v > n { BNode(n, lo, bstInsert(hi, v)) }
             else { t }
         }
     }
@@ -108,7 +108,7 @@ fun bstHeight(t: BST): i32 {
         BNode(_, lo, hi) => {
             val lh = bstHeight(lo)
             val rh = bstHeight(hi)
-            1 + (if (lh > rh) { lh } else { rh })
+            1 + (if lh > rh { lh } else { rh })
         }
     }
 }

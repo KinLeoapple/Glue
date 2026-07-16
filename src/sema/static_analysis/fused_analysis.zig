@@ -448,6 +448,8 @@ fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
             .bit_and => .{ .int_val = l & r },
             .bit_or => .{ .int_val = l | r },
             .bit_xor => .{ .int_val = l ^ r },
+            .shl => .{ .int_val = if (r < @bitSizeOf(@TypeOf(l))) l << @intCast(r) else 0 },
+            .shr => .{ .int_val = l >> @intCast(@min(r, @bitSizeOf(@TypeOf(l)) - 1)) },
             .eq => .{ .bool_val = l == r },
             .not_eq => .{ .bool_val = l != r },
             .lt => .{ .bool_val = l < r },

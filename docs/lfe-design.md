@@ -1275,7 +1275,7 @@ pub fn execute(
 ```glue
 fn compute(a: i64, b: i64) -> i64 {
     let x = a + b * 2
-    if (x > 10) {
+    if x > 10 {
         return x - 5
     } else {
         return x * 3
@@ -1306,7 +1306,7 @@ fn compute(a: i64, b: i64) -> i64 {
 fn process(arr: [i64]) -> i64 {
     var sum = 0
     for x in arr {
-        if (x > 0) {
+        if x > 0 {
             sum += x * 2 + 1
         }
     }

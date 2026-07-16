@@ -33,6 +33,7 @@ pub const TokenType = enum {
     kw_channel,
     kw_select,
     kw_atomic,
+    kw_spawn,
     kw_loop,
     kw_for,
     kw_in,
@@ -76,6 +77,12 @@ pub const TokenType = enum {
     percent_eq,
     amp_eq,
     pipe_eq,
+    caret_eq,
+    lt_lt,
+    gt_gt,
+    lt_lt_eq,
+    gt_gt_eq,
+    tilde,
     eq_gt,
     minus_gt,
     l_paren,
@@ -301,7 +308,13 @@ pub const Lexer = struct {
                 }
             },
             '<' => {
-                if (self.matchChar('=')) {
+                if (self.matchChar('<')) {
+                    if (self.matchChar('=')) {
+                        try self.addToken(.lt_lt_eq, start, start_line, start_col);
+                    } else {
+                        try self.addToken(.lt_lt, start, start_line, start_col);
+                    }
+                } else if (self.matchChar('=')) {
                     try self.addToken(.lt_eq, start, start_line, start_col);
                 } else if (self.matchChar('-')) {
                     try self.addToken(.lt_minus, start, start_line, start_col);
@@ -310,7 +323,13 @@ pub const Lexer = struct {
                 }
             },
             '>' => {
-                if (self.matchChar('=')) {
+                if (self.matchChar('>')) {
+                    if (self.matchChar('=')) {
+                        try self.addToken(.gt_gt_eq, start, start_line, start_col);
+                    } else {
+                        try self.addToken(.gt_gt, start, start_line, start_col);
+                    }
+                } else if (self.matchChar('=')) {
                     try self.addToken(.gt_eq, start, start_line, start_col);
                 } else {
                     try self.addToken(.gt, start, start_line, start_col);
@@ -361,7 +380,14 @@ pub const Lexer = struct {
                     try self.addToken(.ampersand, start, start_line, start_col);
                 }
             },
-            '^' => try self.addToken(.caret, start, start_line, start_col),
+            '^' => {
+                if (self.matchChar('=')) {
+                    try self.addToken(.caret_eq, start, start_line, start_col);
+                } else {
+                    try self.addToken(.caret, start, start_line, start_col);
+                }
+            },
+            '~' => try self.addToken(.tilde, start, start_line, start_col),
             '\'' => try self.scanChar(start, start_line, start_col),
             '"' => try self.scanString(start, start_line, start_col),
             '0'...'9' => try self.scanNumber(start, start_line, start_col),
@@ -924,6 +950,7 @@ const KEYWORDS = std.StaticStringMap(TokenType).initComptime(.{
     .{ "channel", .kw_channel },
     .{ "select", .kw_select },
     .{ "atomic", .kw_atomic },
+    .{ "spawn", .kw_spawn },
     .{ "loop", .kw_loop },
     .{ "for", .kw_for },
     .{ "in", .kw_in },

@@ -83,8 +83,8 @@ fun tInsert(t: Tree, v: i64): Tree {
     match t {
         Leaf => Node(v, Leaf, Leaf)
         Node(n, lo, hi) => {
-            if (v < n) { Node(n, tInsert(lo, v), hi) }
-            else if (v > n) { Node(n, lo, tInsert(hi, v)) }
+            if v < n { Node(n, tInsert(lo, v), hi) }
+            else if v > n { Node(n, lo, tInsert(hi, v)) }
             else { t }
         }
     }
@@ -96,7 +96,7 @@ fun bstHeight(t: Tree): i32 {
         Node(_, lo, hi) => {
             val lh = bstHeight(lo)
             val rh = bstHeight(hi)
-            1 + (if (lh > rh) { lh } else { rh })
+            1 + (if lh > rh { lh } else { rh })
         }
     }
 }
@@ -117,7 +117,7 @@ type IList =
 
 fun buildIList(n: i32): IList {
     fun go(i: i32, acc: IList): IList {
-        if (i <= 0) { acc } else { go(i - 1, ICons(i64(i), acc)) }
+        if i <= 0 { acc } else { go(i - 1, ICons(i64(i), acc)) }
     }
     go(n, INil)
 }
@@ -159,7 +159,7 @@ fun arrFilter(arr: i64[], p): i64[] {
     var out: i64[] = []
     var i: i32 = 0
     while i < arr.len() {
-        if (p(arr[i])) {
+        if p(arr[i]) {
             out = out.push(arr[i])
         }
         i = i + 1
@@ -212,14 +212,14 @@ fun evalExpr(e: Expr): Throw<i64, Error> {
         EDiv(a, b) => {
             val x = evalExpr(a)?
             val y = evalExpr(b)?
-            if (y == 0) { throw EvalErr("div0") } else { Ok(x / y) }
+            if y == 0 { throw EvalErr("div0") } else { Ok(x / y) }
         }
     }
 }
 
 // 构造嵌套表达式树（深度 d → ~2^d 节点）
 fun buildExpr(depth: i32): Expr {
-    if (depth <= 0) { return ENum(1) }
+    if depth <= 0 { return ENum(1) }
     val inner = buildExpr(depth - 1)
     EAdd(EMul(ENum(2), inner), ESub(inner, ENum(1)))
 }

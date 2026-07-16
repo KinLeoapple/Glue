@@ -5,25 +5,25 @@
 
 // 尾递归:acc 在尾位置返回，调用自身在尾位置 → TCO 复用帧
 fun countUp(n: i64, acc: i64): i64 {
-    if (n == 0) { acc } else { countUp(n - 1, acc + n) }
+    if n == 0 { acc } else { countUp(n - 1, acc + n) }
 }
 
 // 尾递归:乘法累积
 fun factorialTail(n: i64, acc: i64): i64 {
-    if (n <= 1) { acc } else { factorialTail(n - 1, acc * n) }
+    if n <= 1 { acc } else { factorialTail(n - 1, acc * n) }
 }
 
 // 尾递归:交替加减
 fun altSum(n: i64, acc: i64): i64 {
-    if (n == 0) { acc } else { altSum(n - 1, acc + (if (n % 2 == 0) { n } else { -n })) }
+    if n == 0 { acc } else { altSum(n - 1, acc + (if n % 2 == 0 { n } else { -n })) }
 }
 
 // 互相尾递归（mutual TCO）
 fun isEvenTCO(n: i64): bool {
-    if (n == 0) { true } else { isOddTCO(n - 1) }
+    if n == 0 { true } else { isOddTCO(n - 1) }
 }
 fun isOddTCO(n: i64): bool {
-    if (n == 0) { false } else { isEvenTCO(n - 1) }
+    if n == 0 { false } else { isEvenTCO(n - 1) }
 }
 
 fun main() {

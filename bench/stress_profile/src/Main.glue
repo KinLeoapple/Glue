@@ -14,7 +14,7 @@ fun nestedLoop(n: i32): i64 {
 }
 
 fun newtonSqrt(x: f64): f64 {
-    if (x == 0.0) { return 0.0 }
+    if x == 0.0 { return 0.0 }
     var guess: f64 = x / 2.0
     var i: i32 = 0
     while i < 20 {
@@ -32,16 +32,16 @@ fun hashFold(n: i32): i64 {
         h = ((h * 33) + i64(i * 31 + 7)) % 1000000007
         i = i + 1
     }
-    if (h < 0) { -h } else { h }
+    if h < 0 { -h } else { h }
 }
 
 fun isPrime(n: i64): bool {
-    if (n < 2) { return false }
-    if (n < 4) { return true }
-    if (n % 2 == 0) { return false }
+    if n < 2 { return false }
+    if n < 4 { return true }
+    if n % 2 == 0 { return false }
     var i: i64 = 3
     while i * i <= n {
-        if (n % i == 0) { return false }
+        if n % i == 0 { return false }
         i = i + 2
     }
     true
@@ -51,7 +51,7 @@ fun primeSum(lo: i64, hi: i64): i64 {
     var sum: i64 = 0
     var n: i64 = lo
     while n < hi {
-        if (isPrime(n)) { sum = sum + n }
+        if isPrime(n) { sum = sum + n }
         n = n + 1
     }
     sum
@@ -62,7 +62,7 @@ fun merge(a: i64[], b: i64[]): i64[] {
     var i: i32 = 0
     var j: i32 = 0
     while i < a.len() && j < b.len() {
-        if (a[i] <= b[j]) {
+        if a[i] <= b[j] {
             result = result.push(a[i])
             i = i + 1
         } else {
@@ -82,13 +82,13 @@ fun merge(a: i64[], b: i64[]): i64[] {
 }
 
 fun mergeSort(arr: i64[]): i64[] {
-    if (arr.len() <= 1) { return arr }
+    if arr.len() <= 1 { return arr }
     var mid: i32 = arr.len() / 2
     var left: i64[] = []
     var right: i64[] = []
     var i: i32 = 0
     while i < arr.len() {
-        if (i < mid) {
+        if i < mid {
             left = left.push(arr[i])
         } else {
             right = right.push(arr[i])

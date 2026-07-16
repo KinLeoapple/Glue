@@ -6,7 +6,7 @@
 const std = @import("std");
 
 /// 二元算术操作
-pub const BinOp = enum { add, sub, mul, div, mod, band, bor, bxor };
+pub const BinOp = enum { add, sub, mul, div, mod, band, bor, bxor, shl, shr };
 
 /// 一元算术操作
 pub const UnaryOp = enum { neg, abs, bnot };
@@ -61,6 +61,30 @@ pub fn batchBinOp(
             .band => va & vb,
             .bor => va | vb,
             .bxor => va ^ vb,
+            .shl => blk: {
+                // 移位无法用 @Vector 直接运算（每 lane 移位量不同）
+                // 降级为标量循环，LLVM 可自动向量化
+                const arr_a: [lanes]T = va;
+                const arr_b: [lanes]T = vb;
+                var r: [lanes]T = undefined;
+                for (0..lanes) |j| {
+                    const max_bits = @bitSizeOf(T);
+                    const raw = @as(u64, @intCast(if (arr_b[j] < 0) 0 else arr_b[j]));
+                    r[j] = if (raw >= max_bits) 0 else arr_a[j] << @intCast(raw);
+                }
+                break :blk r;
+            },
+            .shr => blk: {
+                const arr_a: [lanes]T = va;
+                const arr_b: [lanes]T = vb;
+                var r: [lanes]T = undefined;
+                for (0..lanes) |j| {
+                    const max_bits = @bitSizeOf(T);
+                    const raw = @as(u64, @intCast(if (arr_b[j] < 0) 0 else arr_b[j]));
+                    r[j] = if (raw >= max_bits) 0 else arr_a[j] >> @intCast(raw);
+                }
+                break :blk r;
+            },
         };
         dst[i..][0..lanes].* = @as([lanes]T, result);
     }
@@ -74,6 +98,16 @@ pub fn batchBinOp(
             .band => a[i] & b[i],
             .bor => a[i] | b[i],
             .bxor => a[i] ^ b[i],
+            .shl => blk: {
+                const max_bits = @bitSizeOf(T);
+                const raw = @as(u64, @intCast(if (b[i] < 0) 0 else b[i]));
+                break :blk if (raw >= max_bits) 0 else a[i] << @intCast(raw);
+            },
+            .shr => blk: {
+                const max_bits = @bitSizeOf(T);
+                const raw = @as(u64, @intCast(if (b[i] < 0) 0 else b[i]));
+                break :blk if (raw >= max_bits) 0 else a[i] >> @intCast(raw);
+            },
         };
     }
 }
@@ -298,4 +332,35 @@ test "batchScaleAdd 缩放加" {
     var dst: [5]i32 = undefined;
     batchScaleAdd(i32, &dst, &a, 3, 7);
     for (0..5) |i| try testing.expectEqual(a[i] *% 3 +% 7, dst[i]);
+}
+
+test "batchBinOp 移位运算 shl/shr" {
+    var a = [_]i32{ 1, 2, 4, 8, 16 };
+    var b = [_]i32{ 1, 2, 3, 4, 0 };
+    var dst: [5]i32 = undefined;
+    try batchBinOp(i32, .shl, &dst, &a, &b);
+    try testing.expectEqual(@as(i32, 2), dst[0]); // 1 << 1
+    try testing.expectEqual(@as(i32, 8), dst[1]); // 2 << 2
+    try testing.expectEqual(@as(i32, 32), dst[2]); // 4 << 3
+    try testing.expectEqual(@as(i32, 128), dst[3]); // 8 << 4
+    try testing.expectEqual(@as(i32, 16), dst[4]); // 16 << 0
+
+    var a2 = [_]i32{ 256, 128, 64, 32, 16 };
+    var dst2: [5]i32 = undefined;
+    try batchBinOp(i32, .shr, &dst2, &a2, &b);
+    try testing.expectEqual(@as(i32, 128), dst2[0]); // 256 >> 1
+    try testing.expectEqual(@as(i32, 32), dst2[1]); // 128 >> 2
+    try testing.expectEqual(@as(i32, 8), dst2[2]); // 64 >> 3
+    try testing.expectEqual(@as(i32, 2), dst2[3]); // 32 >> 4
+    try testing.expectEqual(@as(i32, 16), dst2[4]); // 16 >> 0
+}
+
+test "batchBinOp 移位溢出保护" {
+    var a = [_]i32{ 1, 1, 1 };
+    var b = [_]i32{ 100, -1, 31 }; // 100>=32 →0, -1 →0 (1<<0=1), 31 → 1<<31 (i32 最小负数)
+    var dst: [3]i32 = undefined;
+    try batchBinOp(i32, .shl, &dst, &a, &b);
+    try testing.expectEqual(@as(i32, 0), dst[0]); // 溢出 → 0
+    try testing.expectEqual(@as(i32, 1), dst[1]); // 负移位按 0 → 1<<0 = 1
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), dst[2]); // 1<<31
 }

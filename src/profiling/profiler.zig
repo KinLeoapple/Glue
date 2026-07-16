@@ -13,9 +13,9 @@ pub const Phase = enum {
     lex,
     parse,
     type_check,
-    lfe_compile,
-    lfe_optimize,
-    lfe_run,
+    ir_build,
+    ir_optimize,
+    engine_run,
 };
 
 /// 各阶段对应的显示名称，与 Phase 枚举顺序一致。
@@ -23,9 +23,9 @@ const PHASE_NAMES = [@typeInfo(Phase).@"enum".fields.len][]const u8{
     "lex",
     "parse",
     "type_check",
-    "lfe_compile",
-    "lfe_optimize",
-    "lfe_run",
+    "ir_build",
+    "ir_optimize",
+    "engine_run",
 };
 
 /// 性能分析器，聚合各阶段耗时与内存统计。

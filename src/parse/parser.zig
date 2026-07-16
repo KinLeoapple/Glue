@@ -189,6 +189,16 @@ pub const Parser = struct {
         });
     }
 
+    /// 条件语句禁止使用括号：if/while/for/match 的条件部分不允许以 '(' 开头
+    fn rejectParenCondition(self: *Parser, kw_name: []const u8) ParserError!void {
+        if (self.check(.l_paren)) {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "{s} 条件不允许使用括号", .{kw_name}) catch "条件不允许使用括号";
+            try self.reportError(msg);
+            return error.UnexpectedToken;
+        }
+    }
+
     /// 错误恢复：跳过 Token 直到遇到下一个声明起始或右大括号
     fn synchronize(self: *Parser) void {
         while (!self.isAtEnd()) {
@@ -1397,10 +1407,10 @@ pub const Parser = struct {
 
     /// 解析按位与 &
     fn parseBitAnd(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseEquality();
+        var left = try self.parseShift();
         while (self.matchToken(.ampersand)) {
             const op_tok = self.previous();
-            const right = try self.parseEquality();
+            const right = try self.parseShift();
             left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .binary = .{
                     .op = .bit_and,
@@ -1408,6 +1418,35 @@ pub const Parser = struct {
                     .right = right,
                 },
             });
+        }
+        return left;
+    }
+
+    /// 解析移位 << >>
+    fn parseShift(self: *Parser) ParserError!*ast.Expr {
+        var left = try self.parseEquality();
+        while (true) {
+            if (self.matchToken(.lt_lt)) {
+                const op_tok = self.previous();
+                const right = try self.parseEquality();
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
+                    .binary = .{
+                        .op = .shl,
+                        .left = left,
+                        .right = right,
+                    },
+                });
+            } else if (self.matchToken(.gt_gt)) {
+                const op_tok = self.previous();
+                const right = try self.parseEquality();
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
+                    .binary = .{
+                        .op = .shr,
+                        .left = left,
+                        .right = right,
+                    },
+                });
+            } else break;
         }
         return left;
     }
@@ -1570,7 +1609,7 @@ pub const Parser = struct {
         return left;
     }
 
-    /// 解析一元运算 ! -，负号直接折叠到数字字面量
+    /// 解析一元运算 ! - ~，负号直接折叠到数字字面量
     fn parseUnary(self: *Parser) ParserError!*ast.Expr {
         if (self.matchToken(.bang)) {
             const op_tok = self.previous();
@@ -1578,6 +1617,16 @@ pub const Parser = struct {
             return self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .unary = .{
                     .op = .not,
+                    .operand = operand,
+                },
+            });
+        }
+        if (self.matchToken(.tilde)) {
+            const op_tok = self.previous();
+            const operand = try self.parseUnary();
+            return self.allocExpr(tokenLoc(op_tok), ast.Expr{
+                .unary = .{
+                    .op = .bit_not,
                     .operand = operand,
                 },
             });
@@ -1610,6 +1659,11 @@ pub const Parser = struct {
         while (true) {
             if (self.matchToken(.question)) {
                 const op_tok = self.previous();
+                // 特殊处理：type_cast 后紧跟 ? → 安全转换（i32(x)? → tryCast + 错误传播）
+                if (expr_node.* == .type_cast and !expr_node.type_cast.safe) {
+                    expr_node.type_cast.safe = true;
+                    continue;
+                }
                 expr_node = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .propagate = .{
                         .expr = expr_node,
@@ -1877,6 +1931,9 @@ pub const Parser = struct {
         }
         if (self.matchToken(.kw_lazy)) {
             return self.parseLazyExpr();
+        }
+        if (self.matchToken(.kw_spawn)) {
+            return self.parseSpawnExpr();
         }
         if (self.matchToken(.kw_atomic)) {
             return self.parseAtomicExpr();
@@ -2244,6 +2301,7 @@ pub const Parser = struct {
     /// 解析 if 表达式：if cond then else?
     fn parseIfExpr(self: *Parser) ParserError!*ast.Expr {
         const if_tok = self.previous();
+        try self.rejectParenCondition("if");
         const condition = try self.parseExpr();
         const then_branch = try self.parseExpr();
         var else_branch: ?*ast.Expr = null;
@@ -2262,6 +2320,7 @@ pub const Parser = struct {
     /// 解析 match 表达式：match scrutinee { arms }
     fn parseMatchExpr(self: *Parser) ParserError!*ast.Expr {
         const match_tok = self.previous();
+        try self.rejectParenCondition("match");
         const scrutinee = try self.parseExpr();
         _ = self.expect(.l_brace, "expected '{'") catch {};
         var arms = std.ArrayList(ast.MatchArm).empty;
@@ -2294,6 +2353,7 @@ pub const Parser = struct {
         const pattern = try self.parsePattern();
         var guard: ?*ast.Expr = null;
         if (self.matchToken(.kw_if)) {
+            try self.rejectParenCondition("if guard");
             guard = try self.parseExpr();
         }
         _ = self.expect(.eq_gt, "expected '=>'") catch {};
@@ -2326,6 +2386,17 @@ pub const Parser = struct {
         const expr = try self.parseExpr();
         return self.allocExpr(tokenLoc(lazy_tok), ast.Expr{
             .lazy = .{
+                .expr = expr,
+            },
+        });
+    }
+
+    /// 解析 spawn 表达式：spawn expr（创建异步任务，不自动 await）
+    fn parseSpawnExpr(self: *Parser) ParserError!*ast.Expr {
+        const spawn_tok = self.previous();
+        const expr = try self.parseExpr();
+        return self.allocExpr(tokenLoc(spawn_tok), ast.Expr{
+            .spawn_expr = .{
                 .expr = expr,
             },
         });
@@ -3066,6 +3137,7 @@ pub const Parser = struct {
         const for_tok = self.previous();
         const name_tok = try self.expect(.identifier, "expected iterator variable name");
         _ = self.expect(.kw_in, "expected 'in'") catch {};
+        try self.rejectParenCondition("for");
         const iterable = try self.parseExpr();
         const body = try self.parseExpr();
         return self.allocStmt(tokenLoc(for_tok), ast.Stmt{
@@ -3080,6 +3152,7 @@ pub const Parser = struct {
     /// 解析 while 语句：while condition body
     fn parseWhileStmt(self: *Parser) ParserError!*ast.Stmt {
         const while_tok = self.previous();
+        try self.rejectParenCondition("while");
         const condition = try self.parseExpr();
         const body = try self.parseExpr();
         return self.allocStmt(tokenLoc(while_tok), ast.Stmt{
@@ -3167,6 +3240,9 @@ pub const Parser = struct {
             .percent_eq => .mod_assign,
             .amp_eq => .bit_and_assign,
             .pipe_eq => .bit_or_assign,
+            .caret_eq => .bit_xor_assign,
+            .lt_lt_eq => .shl_assign,
+            .gt_gt_eq => .shr_assign,
             else => null,
         };
     }
@@ -3192,13 +3268,13 @@ fn getExprLocation(expr: *const ast.Expr) ast.SourceLocation {
     return ast.exprLocation(expr);
 }
 
-/// 判断名称是否为内置类型（整数、浮点、布尔、字符串）
+/// 判断名称是否为内置类型（整数、浮点、布尔、字符、字符串）
 fn isBuiltinType(name: []const u8) bool {
     const builtin_types = [_][]const u8{
         "i8",   "i16",  "i32",  "i64",  "i128",
         "u8",   "u16",  "u32",  "u64",  "u128",
-        "f32",  "f64",
-        "bool", "str",
+        "f16",  "f32",  "f64",  "f128",
+        "bool", "char", "str",
     };
     for (builtin_types) |bt| {
         if (std.mem.eql(u8, name, bt)) return true;

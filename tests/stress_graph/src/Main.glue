@@ -24,7 +24,7 @@ fun reverseL<T>(l: List<T>): List<T> {
 }
 
 fun containsI(l: List<i32>, x: i32): bool {
-    match l { Nil => false, Cons(h, t) => if (h == x) { true } else { containsI(t, x) } }
+    match l { Nil => false, Cons(h, t) => if h == x { true } else { containsI(t, x) } }
 }
 
 fun showI(l: List<i32>): str {
@@ -52,7 +52,7 @@ fun neighbors(g: Graph, node: i32): List<i32> {
                     Nil => Nil
                     Cons(e, t) => {
                         match e {
-                            Edge(f, to) => if (f == node) { Cons(to, go(t)) } else { go(t) }
+                            Edge(f, to) => if f == node { Cons(to, go(t)) } else { go(t) }
                         }
                     }
                 }
@@ -70,7 +70,7 @@ fun dfs(g: Graph, start: i32): List<i32> {
         match stack {
             Nil => reverseL(visited)
             Cons(node, rest) => {
-                if (containsI(visited, node)) {
+                if containsI(visited, node) {
                     go(rest, visited)
                 } else {
                     val nbrs = neighbors(g, node)
@@ -90,7 +90,7 @@ fun bfs(g: Graph, start: i32): List<i32> {
         match queue {
             Nil => reverseL(visited)
             Cons(node, rest) => {
-                if (containsI(visited, node)) {
+                if containsI(visited, node) {
                     go(rest, visited)
                 } else {
                     val nbrs = neighbors(g, node)
@@ -112,9 +112,9 @@ fun reachable(g: Graph, start: i32, target: i32): bool {
 // 找一条 start -> target 的路径（返回 List<i32>?，找不到为 null）
 fun findPath(g: Graph, start: i32, target: i32): List<i32>? {
     fun go(node: i32, visited: List<i32>): List<i32>? {
-        if (node == target) {
+        if node == target {
             Cons(node, Nil)
-        } else if (containsI(visited, node)) {
+        } else if containsI(visited, node) {
             null
         } else {
             fun tryNbrs(nbrs: List<i32>): List<i32>? {
@@ -142,7 +142,7 @@ fun inDegree(g: Graph, node: i32): i32 {
             fun go(l: List<Edge>): i32 {
                 match l {
                     Nil => 0
-                    Cons(e, t) => match e { Edge(_, to) => if (to == node) { 1 + go(t) } else { go(t) } }
+                    Cons(e, t) => match e { Edge(_, to) => if to == node { 1 + go(t) } else { go(t) } }
                 }
             }
             go(es)

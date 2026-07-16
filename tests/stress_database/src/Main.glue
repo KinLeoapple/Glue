@@ -21,7 +21,7 @@ fun filterL<T>(l: List<T>, pred): List<T> {
         Nil => Nil
         Cons(x, t) => {
             val rest = filterL(t, pred)
-            if (pred(x)) { Cons(x, rest) } else { rest }
+            if pred(x) { Cons(x, rest) } else { rest }
         }
     }
 }
@@ -55,7 +55,7 @@ fun findById(db: Db, id: i32): Emp? {
                 match l {
                     Nil => null
                     Cons(e, t) => {
-                        match e { Emp(eid, _, _, _) => if (eid == id) { e } else { go(t) } }
+                        match e { Emp(eid, _, _, _) => if eid == id { e } else { go(t) } }
                     }
                 }
             }
@@ -84,14 +84,14 @@ fun totalSalary(emps: List<Emp>): i32 {
 }
 
 fun maxSalary(emps: List<Emp>): i32 {
-    foldL(emps, 0, fun(acc, e) { if (empSalary(e) > acc) { empSalary(e) } else { acc } })
+    foldL(emps, 0, fun(acc, e) { if empSalary(e) > acc { empSalary(e) } else { acc } })
 }
 
 // 给某部门所有人加薪 pct%，返回新 Db
 fun raiseSalary(db: Db, dept: str, pct: i32): Db {
     val updated = mapL(allRows(db), fun(e) {
         match e {
-            Emp(id, n, d, s) => if (d == dept) { Emp(id, n, d, s + s * pct / 100) } else { e }
+            Emp(id, n, d, s) => if d == dept { Emp(id, n, d, s + s * pct / 100) } else { e }
         }
     })
     Db(updated)

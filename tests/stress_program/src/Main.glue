@@ -44,13 +44,13 @@ fun filterL(l: List<i32>, pred): List<i32> {
         Nil => Nil
         Cons(x, tail) => {
             val rest = filterL(tail, pred)
-            if (pred(x)) { Cons(x, rest) } else { rest }
+            if pred(x) { Cons(x, rest) } else { rest }
         }
     }
 }
 
 fun rangeL(lo: i32, hi: i32): List<i32> {
-    if (lo > hi) { Nil } else { Cons(lo, rangeL(lo + 1, hi)) }
+    if lo > hi { Nil } else { Cons(lo, rangeL(lo + 1, hi)) }
 }
 
 // ============================================================
@@ -88,7 +88,7 @@ fun evalExpr(e: Expr): Throw<i32, Error> {
         Div(a, b) => {
             val x = evalExpr(a)?
             val y = evalExpr(b)?
-            if (y == 0) { throw EvalError("division by zero") } else { Ok(x / y) }
+            if y == 0 { throw EvalError("division by zero") } else { Ok(x / y) }
         }
     }
 }
@@ -104,8 +104,8 @@ fun insert(t: Tree, v: i32): Tree {
     match t {
         Leaf => Node(v, Leaf, Leaf)
         Node(n, lo, hi) => {
-            if (v < n) { Node(n, insert(lo, v), hi) }
-            else if (v > n) { Node(n, lo, insert(hi, v)) }
+            if v < n { Node(n, insert(lo, v), hi) }
+            else if v > n { Node(n, lo, insert(hi, v)) }
             else { t }
         }
     }
@@ -177,7 +177,7 @@ fun main() {
     // --- 闭包计数器 + 链表生成 ---
     var seen: i32[] = []
     for x in [3, 1, 4, 1, 5, 9, 2, 6] {
-        if (!seen.contains(x)) {
+        if !seen.contains(x) {
             seen = seen ++ [x]
         }
     }

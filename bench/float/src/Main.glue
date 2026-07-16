@@ -6,12 +6,12 @@
 
 fun newtonSqrt(x: f64, iters: i32): f64 {
     var guess: f64 = x / 2.0
-    if (guess == 0.0) { return 0.0 }
+    if guess == 0.0 { return 0.0 }
     var i: i32 = 0
     while i < iters {
         val next: f64 = (guess + x / guess) / 2.0
         // 收敛检查（比较走 Float.compare 软件路径）
-        if (next == guess) { return next }
+        if next == guess { return next }
         guess = next
         i = i + 1
     }

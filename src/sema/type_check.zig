@@ -1657,7 +1657,7 @@ pub const TypeInferencer = struct {
                         try self.unify(right_ty, try self.makeType(.bool_type));
                         return self.makeType(.bool_type);
                     },
-                    .bit_and, .bit_or, .bit_xor => {
+                    .bit_and, .bit_or, .bit_xor, .shl, .shr => {
                         try self.unify(left_ty, right_ty);
                         return left_ty;
                     },
@@ -1698,8 +1698,14 @@ pub const TypeInferencer = struct {
                 const operand_ty = try self.inferExpr(un.operand, env, null);
                 return switch (un.op) {
                     .not => {
-                        try self.unify(operand_ty, try self.makeType(.bool_type));
-                        return self.makeType(.bool_type);
+                        // ! 对 bool 逻辑取反，~ 对整数按位取反
+                        // 两者在 sema 层都返回操作数类型
+                        // 编译器根据操作数类型分派到 bool_not 或 int_not
+                        return operand_ty;
+                    },
+                    .bit_not => {
+                        // ~ 对整数按位取反，返回操作数类型
+                        return operand_ty;
                     },
                     .neg => operand_ty,
                 };
@@ -2141,7 +2147,7 @@ pub const TypeInferencer = struct {
                         };
                         return target_ty;
                     },
-                    .bit_and_assign, .bit_or_assign => {
+                    .bit_and_assign, .bit_or_assign, .bit_xor_assign, .shl_assign, .shr_assign => {
                         try self.unify(target_ty, val_ty);
                         return target_ty;
                     },

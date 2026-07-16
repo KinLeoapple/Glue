@@ -293,7 +293,7 @@ fn isCseEligibleBinary(expr: *const ast.Expr) bool {
         .binary => |b| switch (b.op) {
             .add, .sub, .mul, .div, .mod,
             .eq, .not_eq, .lt, .gt, .lt_eq, .gt_eq,
-            .bit_and, .bit_or, .bit_xor,
+            .bit_and, .bit_or, .bit_xor, .shl, .shr,
             => return isCseEligibleOperand(b.left) and isCseEligibleOperand(b.right),
             else => return false,
         },

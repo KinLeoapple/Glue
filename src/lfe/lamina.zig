@@ -39,21 +39,29 @@ pub const ScalarChanType = enum(u5) {
     bool_chan, char_chan, null_chan, unit_chan,
     // 堆引用与谓词
     ref_chan, mask_chan,
+    // Nullable<T>：值域 [inner_value_bytes][null_flag: 1 byte]，inner_type 记录内部类型
+    nullable_chan,
 };
 
 /// 堆引用子类型（复用 obj_header 的 RefKind）
 pub const RefKind = value.obj_header.RefKind;
 
 /// 通道类型 → 元素字节宽度
+/// nullable_chan 返回 0：实际宽度依赖 inner_type，需通过 nullableElemWidth 计算
 pub fn chanElemWidth(chan_type: ScalarChanType) u8 {
     return switch (chan_type) {
-        .null_chan, .unit_chan => 0,
+        .null_chan, .unit_chan, .nullable_chan => 0,
         .i8_chan, .u8_chan, .bool_chan, .mask_chan => 1,
         .i16_chan, .u16_chan, .f16_chan => 2,
         .i32_chan, .u32_chan, .f32_chan, .char_chan => 4,
         .i64_chan, .u64_chan, .f64_chan, .ref_chan => 8,
         .i128_chan, .u128_chan, .f128_chan => 16,
     };
+}
+
+/// Nullable<T> 通道元素字节宽度 = inner_width + 1（1 byte null 标志）
+pub inline fn nullableElemWidth(inner_type: ScalarChanType) u8 {
+    return chanElemWidth(inner_type) + 1;
 }
 
 /// 将 sema.Type 映射为 ScalarChanType
@@ -97,7 +105,7 @@ pub fn chanTypeToScalarTag(ct: ScalarChanType) ?value.scalar.ScalarTag {
         .i8_chan => .i8, .i16_chan => .i16, .i32_chan => .i32, .i64_chan => .i64, .i128_chan => .i128,
         .u8_chan => .u8, .u16_chan => .u16, .u32_chan => .u32, .u64_chan => .u64, .u128_chan => .u128,
         .f16_chan => .f16, .f32_chan => .f32, .f64_chan => .f64, .f128_chan => .f128,
-        .null_chan, .unit_chan, .mask_chan, .ref_chan => null,
+        .null_chan, .unit_chan, .mask_chan, .ref_chan, .nullable_chan => null,
     };
 }
 
@@ -150,6 +158,9 @@ pub const LaminaOp = enum(u8) {
     /// 统一标量类型转换：src_chan → output_chan
     /// const_val 存 dst ScalarTag（@intFromEnum），src_tag 从输入通道元数据推断
     type_cast,
+    /// 安全标量转换：src_chan → output_chan（标量）
+    /// const_val 存 dst ScalarTag，转换越界时抛出错误（halt_reason = throw_halt），成功输出标量值
+    type_cast_safe,
 
     // ═══ 字符串操作 ═══
     str_const, str_concat, str_len, str_char_at, str_slice,
@@ -223,7 +234,6 @@ pub const LaminaOp = enum(u8) {
 
     // ═══ 动态分派 ═══
     switch_lamina,
-    extern_call, extern_call_batch,
 
     // ═══ 轨道枢纽（星轨模型）═══
     orbit_hub,          // sync_hub：同步轨道激活，主 DAG 等待输出
@@ -241,7 +251,8 @@ pub const LaminaOp = enum(u8) {
     stack_depth,        // 栈深度
 
     // ═══ 调试输出 ═══
-    debug_print,
+    debug_print,        // stdout 输出
+    debug_print_err,    // stderr 输出
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -331,6 +342,8 @@ pub const Orbit = struct {
     state: OrbitState = .inactive,
     /// 轨道私有通道数量
     private_channel_count: u16 = 0,
+    /// E2: 闭包捕获 bridge_in 通道列表（closure_hub 运行时绑定用）
+    capture_channels: []const u16 = &.{},
 };
 
 /// 通道归属层级
@@ -347,6 +360,22 @@ pub const DeferEntry = struct {
     orbit_index: u16,
     /// 注册顺序（LIFO 执行）
     order: u32,
+};
+
+/// E2: Trait 方法分派表条目（运行时 trait_hub 查找用）
+pub const TraitMethodEntry = struct {
+    /// trait 值的 type_tag（构造时分配的唯一标识）
+    type_tag: u64,
+    /// 方法名索引（name_table 中的索引）
+    method_name_id: u16,
+    /// 方法体编译的轨道索引
+    orbit_index: u16,
+    /// 方法参数 bridge_in 通道（轨道内）
+    param_channels: []const u16 = &.{},
+    /// self 数据 bridge_in 通道（轨道内，trait 数据入口）
+    self_channel: u16 = 0,
+    /// 输出 bridge_out 通道（轨道内）
+    output_channel: u16 = 0,
 };
 
 /// 层：平台无关的计算单元
@@ -387,6 +416,9 @@ pub const ChannelMeta = struct {
     is_cell: bool = false,
     /// Cell 内部值类型（var_decl 时记录，cell_get 时用于输出通道类型）
     inner_type: ScalarChanType = .unit_chan,
+    /// ref_chan 的子类型（用于 builtin 方法按类型分派）
+    /// 仅当 chan_type == .ref_chan 时有效，null 表示未指定
+    ref_kind: ?RefKind = null,
 };
 
 /// 层流图：一个 Glue 函数编译后的完整表示（太阳层 + 星轨层）
@@ -417,6 +449,8 @@ pub const LaminarGraph = struct {
     defer_entries: []const DeferEntry = &.{},
     /// 通道归属层级（与 channel_metas 一一对应）
     channel_scopes: []const ChannelScope = &.{},
+    /// E2: Trait 方法分派表（trait_hub 运行时查找用）
+    trait_method_table: []const TraitMethodEntry = &.{},
 
     /// 拥有的 arena 指针（所有切片由 arena 分配，deinit 时统一释放）
     arena: ?*std.heap.ArenaAllocator = null,
@@ -550,7 +584,6 @@ test "LaminaOp 枚举完整性" {
     _ = LaminaOp.float_mul;
     _ = LaminaOp.select;
     _ = LaminaOp.halt_return;
-    _ = LaminaOp.extern_call;
     // 星轨模型 op
     _ = LaminaOp.orbit_hub;
     _ = LaminaOp.orbit_hub_async;

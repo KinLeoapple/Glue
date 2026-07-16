@@ -10,6 +10,7 @@ pub const compiler = @import("compiler.zig");
 pub const engine = @import("engine.zig");
 pub const optimizer = @import("optimizer.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const builtin = @import("builtin.zig");
 
 // 重导出常用类型
 pub const LaminarGraph = lamina.LaminarGraph;
@@ -56,4 +57,5 @@ test {
     _ = engine;
     _ = optimizer;
     _ = scheduler;
+    _ = builtin;
 }
