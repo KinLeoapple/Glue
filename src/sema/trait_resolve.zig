@@ -231,6 +231,32 @@ pub fn inferMethodCall(
         }
     }
 
+    // 用户自定义 type 方法查找：从 obj_ty 提取 adt_type.name，构造 "TypeName.method" mangled name
+    // type_decl 的方法在 checkDeclCollecting 中以该 mangled name 注册到 env，
+    // 此处查找以获取正确的返回类型，避免 fallback 到 freshTypeVar 导致 field_id 解析失败。
+    {
+        const robj = inferencer.resolve(obj_ty);
+        const type_name: ?[]const u8 = switch (robj.*) {
+            .adt_type => |at| at.name,
+            .generic_type => |gt| gt.name,
+            else => null,
+        };
+        if (type_name) |tn| {
+            const mangled = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}.{s}", .{ tn, mc.method }) catch return inferencer.freshTypeVar() catch unreachable;
+            defer inferencer.arena.allocator().free(mangled);
+            if (env.lookup(mangled)) |scheme| {
+                const instantiated = inferencer.instantiate(scheme) catch return inferencer.freshTypeVar() catch unreachable;
+                const resolved = inferencer.resolve(instantiated);
+                if (resolved.* == .fn_type) {
+                    if (resolved.fn_type.params.len > 0) {
+                        inferencer.unify(resolved.fn_type.params[0], obj_ty) catch {};
+                    }
+                    return resolved.fn_type.return_type;
+                }
+            }
+        }
+    }
+
     // 遍历所有 trait 查找同名方法
     var trait_iter = inferencer.trait_types.iterator();
     while (trait_iter.next()) |entry| {
@@ -551,29 +577,42 @@ pub fn checkTypeTraitImplementations(
                 .column = td.location.column,
             }) catch return;
         }
-        // 校验 trait 必需方法是否全部实现，并检查方法签名是否匹配
+        // 校验 trait 方法实现：必需方法必须实现，所有方法（含默认）签名需匹配
+        // 漏洞修复 #2 + #3：扩展至所有 trait 方法（必需 + 默认）
+        //   - 必需方法：未实现报错
+        //   - 默认方法：Type 实现时必须 override，且签名需匹配
         // 获取具体类型的 ADT 类型（作为 Self 的替换目标）
         const concrete_self_type = if (inferencer.adt_types.get(td.name)) |info| info.ty else null;
+        // 第一遍：必需方法必须实现
         for (trait_info.required_method_names) |required_method| {
             var found = false;
-            var impl_method: ?ast.MethodDecl = null;
             for (td.methods) |method| {
                 if (std.mem.eql(u8, method.name, required_method)) {
                     found = true;
-                    impl_method = method;
                     break;
                 }
             }
             if (!found) {
                 inferencer.addErrorAt(.signature_mismatch, td.location.line, td.location.column, "type '{s}' does not implement required method '{s}' from trait '{s}'", .{ td.name, required_method, trait_bound.trait_name });
-                continue;
             }
-            // 签名匹配校验：比较 trait 声明的方法签名与 type 实现的方法签名
-            if (impl_method) |m| {
-                if (trait_info.method_schemes.get(required_method)) |trait_scheme| {
-                    checkMethodSignature(inferencer, td, m, trait_scheme, trait_info, concrete_self_type, trait_bound);
+        }
+        // 第二遍：遍历 Type 自身实现的方法，检查 override 与签名
+        for (td.methods) |method| {
+            const trait_scheme = trait_info.method_schemes.get(method.name) orelse continue;
+            const is_required = blk: {
+                for (trait_info.required_method_names) |rn| {
+                    if (std.mem.eql(u8, rn, method.name)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!is_required) {
+                // 默认方法被 Type 实现：必须 override（除非是委托）
+                if (!method.is_override and method.delegate == null) {
+                    inferencer.addErrorAt(.signature_mismatch, method.location.line, method.location.column, "method '{s}' overrides default from trait '{s}' — must declare 'override'", .{ method.name, trait_bound.trait_name });
                 }
             }
+            // 签名匹配校验：比较 trait 声明的方法签名与 type 实现的方法签名
+            checkMethodSignature(inferencer, td, method, trait_scheme, trait_info, concrete_self_type, trait_bound);
         }
         // 将实现的方法方案以 "TypeName.methodName" 的键注入环境
         for (trait_info.method_names) |mname| {

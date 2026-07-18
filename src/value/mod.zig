@@ -70,6 +70,11 @@ pub const ReceiverValue = concurrent.ReceiverValue;
 /// 标量变体以 [N]u8 字节数组按实际宽度内联存储，对齐为 1，无 padding。
 /// 22 种堆对象统一为 ref: *ObjHeader，通过 ObjHeader.type_tag 区分类型。
 /// @sizeOf(Value) = 24B（16B 最大 payload + 8B tag 对齐）
+
+/// 深拷贝/分配操作的错误集（显式定义，避免推断错误集循环依赖）
+/// 包含 ThreadContext.allocObj 和 fromStringBytes 的所有可能错误
+pub const AllocError = error{ OutOfMemory, Overflow, TooManyPools, AllocFailed };
+
 pub const Value = union(enum) {
     // ── 零字节特殊值 ──
     null_val,
@@ -521,7 +526,7 @@ pub const Value = union(enum) {
     // ════════════════════════════════════════════
 
     /// 深拷贝值：标量值原样返回，堆分配值递归复制其内容
-    pub fn deepCopy(self: Value, tctx: *ThreadContext) !Value {
+    pub fn deepCopy(self: Value, tctx: *ThreadContext) AllocError!Value {
         switch (self) {
             .null_val, .unit, .boolean, .char,
             .i8, .i16, .i32, .i64, .i128,
@@ -552,12 +557,12 @@ pub const Value = union(enum) {
         }
     }
 
-    fn deepCopyStr(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyStr(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const s: *Str = @alignCast(@fieldParentPtr("header", obj));
         return try Value.fromStringBytes(tctx, s.bytes());
     }
 
-    fn deepCopyArray(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyArray(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *ArrayValue = @alignCast(@fieldParentPtr("header", obj));
         // header 和 elements 分离分配（支持后续 push/pop 替换切片）
         const new_elems: []Value = if (p.elements.len > 0) blk: {
@@ -582,7 +587,7 @@ pub const Value = union(enum) {
         return .{ .ref = &arr.header };
     }
 
-    fn deepCopyRecord(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyRecord(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[RecordValue header | Value fields[]]
         const f_size = p.fields.len * @sizeOf(Value);
@@ -604,7 +609,7 @@ pub const Value = union(enum) {
         return .{ .ref = &rec.header };
     }
 
-    fn deepCopyAdt(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyAdt(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *AdtValue = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[AdtValue header | AdtField fields[]]
         const f_size = p.fields.len * @sizeOf(AdtField);
@@ -633,22 +638,22 @@ pub const Value = union(enum) {
         return .{ .ref = &adt.header };
     }
 
-    fn deepCopyNewtype(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyNewtype(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
         return try Value.makeNewtype(tctx, p.type_name, try p.inner.deepCopy(tctx));
     }
 
-    fn deepCopyCell(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyCell(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *Cell = @alignCast(@fieldParentPtr("header", obj));
         return try Value.makeCell(tctx, try p.inner.deepCopy(tctx));
     }
 
-    fn deepCopyRange(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyRange(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *Range = @alignCast(@fieldParentPtr("header", obj));
         return try Value.makeRange(tctx, p.start, p.end, p.inclusive);
     }
 
-    fn deepCopyClosure(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyClosure(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *Closure = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[Closure header | upvalues[] | bound_args[]]
         const uv_size = p.upvalues.len * @sizeOf(Value);
@@ -685,7 +690,7 @@ pub const Value = union(enum) {
         return .{ .ref = &c.header };
     }
 
-    fn deepCopyPartial(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyPartial(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *PartialApplication = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[PartialApplication header | bound_args[]]
         const ba_size = p.bound_args.len * @sizeOf(Value);
@@ -713,18 +718,18 @@ pub const Value = union(enum) {
         return .{ .ref = &pa.header };
     }
 
-    fn deepCopyBuiltin(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyBuiltin(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *Builtin = @alignCast(@fieldParentPtr("header", obj));
         return try Value.makeBuiltin(tctx, p.fn_ptr, p.user_ctx);
     }
 
-    fn deepCopyError(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyError(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *ErrorValue = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[ErrorValue header | type_name | message]
         return try Value.makeError(tctx, p.type_name, p.message, p.is_error_subtype);
     }
 
-    fn deepCopyThrow(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyThrow(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *ThrowValue = @alignCast(@fieldParentPtr("header", obj));
         switch (p.payload) {
             .ok => |v| return try Value.makeThrow(tctx, .{ .ok = try v.deepCopy(tctx) }),
@@ -737,7 +742,7 @@ pub const Value = union(enum) {
         }
     }
 
-    fn deepCopyTrait(obj: *ObjHeader, tctx: *ThreadContext) !Value {
+    fn deepCopyTrait(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *TraitValue = @alignCast(@fieldParentPtr("header", obj));
         if (!p.owned) return Value.fromRef(obj).retain();
         const count = p.method_names.len;
@@ -750,7 +755,7 @@ pub const Value = union(enum) {
         const new_values = mv_ptr[0..count];
         // method_names 独立分配：指针数组 + 每个名字字符串
         const names_mem = if (count > 0) try tctx.allocObj(count * @sizeOf([]const u8)) else &.{};
-        const new_names: [][]const u8 = if (count > 0) @ptrCast(@alignCast(names_mem.ptr)) else &.{};
+        const new_names: [][]const u8 = if (count > 0) @as([*][]const u8, @ptrCast(@alignCast(@constCast(names_mem.ptr))))[0..count] else &.{};
         var names_copied: usize = 0;
         var values_copied: usize = 0;
         errdefer {

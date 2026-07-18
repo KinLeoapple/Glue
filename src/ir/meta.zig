@@ -56,6 +56,10 @@ pub const CallMeta = struct {
     /// Memoization 槽位索引。0 = 不缓存，>0 = 对应 Engine 中的 memo_cache 槽位。
     /// 纯函数 + 标量参数/返回类型时由 IRBuilder 分配。
     memo_slot: u16 = 0,
+    /// 泛型函数的类型实参（type_id 列表，1-indexed；空切片表示非泛型调用）
+    /// typeof(T) 在泛型函数内通过哨兵 meta_index=0x8000|param_idx 查此切片
+    /// 由调用点从显式 type_args 或参数类型推断填充
+    type_args: []const u16 = &.{},
 };
 
 /// halt 种类：控制 cleanup 的触发时机
@@ -270,6 +274,187 @@ pub const ClosureMeta = struct {
     /// 每个 upvalue 是否为 cell 通道（var 变量，引用语义），最多 8 个 upvalue
     /// cell upvalue 在 call_indirect 时直接共享通道指针，而非拷贝值
     cell_upvalues: u8 = 0,
+};
+
+// ════════════════════════════════════════════════════════════════
+// 反射元数据：TypeInfo<T> 静态类型描述符
+// ════════════════════════════════════════════════════════════════
+
+/// 类型形态枚举（对应 Glue TypeKind ADT 的 9 个变体，含 Nullable）
+/// 纯枚举，仅用于 == 判断，不携带数据
+pub const TypeKind = enum(u4) {
+    primitive, // 基础类型（i32/f64/bool/char/str/()）
+    record, // 记录（Product Type，命名字段）
+    adt, // 代数数据类型（Sum Type，多个构造器）
+    newtype, // Newtype（单字段包装）
+    alias, // 类型别名
+    func, // 函数类型
+    trait, // Trait 类型
+    unit, // 单位类型（）
+    nullable, // 可空类型注解（typeof(T?) 的返回值）
+
+    /// 转换为 TypeKind ADT 的构造器名（与 Glue 源码一致）
+    pub fn ctorName(self: TypeKind) []const u8 {
+        return switch (self) {
+            .primitive => "Primitive",
+            .record => "Record",
+            .adt => "Adt",
+            .newtype => "Newtype",
+            .alias => "Alias",
+            .func => "Func",
+            .trait => "Trait",
+            .unit => "Unit",
+            .nullable => "Nullable",
+        };
+    }
+};
+
+/// 字段元信息（对应 Glue FieldInfo 类型的静态部分）
+pub const FieldMeta = struct {
+    name: []const u8,
+    type_name: []const u8,
+    is_nullable: bool,
+    index: u32,
+};
+
+/// 构造器元信息（对应 Glue ConstructorInfo 类型的静态部分）
+pub const ConstructorMeta = struct {
+    name: []const u8,
+    fields: []const FieldMeta,
+    is_unit: bool,
+    index: u32,
+};
+
+/// 类型参数元信息（对应 Glue TypeParamInfo 类型的静态部分）
+pub const TypeParamMeta = struct {
+    name: []const u8,
+    constraints: []const []const u8, // Trait 名列表
+    is_specialized: bool,
+    specialization: ?[]const u8, // 具体类型名（特化时）
+};
+
+/// 函数签名元信息（对应 Glue FuncSig 类型的静态部分）
+pub const FuncSigMeta = struct {
+    param_types: []const []const u8,
+    return_type: []const u8,
+    is_async: bool,
+};
+
+/// Trait 元信息（对应 Glue TraitInfo 类型的静态部分）
+pub const TraitMeta = struct {
+    name: []const u8,
+    module: []const u8,
+    type_params: []const TypeParamMeta,
+    parent_traits: []const []const u8, // 父 Trait 名列表
+    associated_types: []const []const u8, // 关联类型名列表
+    method_names: []const []const u8, // 方法名列表
+};
+
+/// 关联类型元信息（对应 Glue AssociatedTypeInfo 类型的静态部分）
+pub const AssociatedTypeMeta = struct {
+    name: []const u8,
+    is_specified: bool,
+    default_type: ?[]const u8,
+};
+
+/// 方法元信息（对应 Glue MethodInfo 类型的静态部分）
+pub const MethodMeta = struct {
+    name: []const u8,
+    signature: FuncSigMeta,
+    is_override: bool,
+    is_delegate: bool,
+    delegate_trait: ?[]const u8,
+    is_async: bool,
+};
+
+/// 布局信息子结构（对应 Glue LayoutInfo）
+/// size/alignment 用 u32：天然非负，范围足够（4GB）
+pub const LayoutInfo = struct {
+    size: u32,
+    alignment: u32,
+};
+
+/// Trait 实现信息子结构（对应 Glue TraitImplInfo）
+/// 与 LayoutInfo 对称，从 TypeInfo 剥离
+pub const TraitImplInfo = struct {
+    parent_traits: []const TraitMeta,
+    implemented_traits: []const TraitMeta,
+    methods: []const MethodMeta,
+    associated_types: []const AssociatedTypeMeta,
+};
+
+/// 类型结构形态 ADT（对应 Glue TypeStructure）
+/// kind-dependent 字段的 ADT 化，编译器保证字段存在
+/// inner/target/nullable_inner 通过 type_id 引用其他 TypeMetadata（1-indexed，0 = None）
+pub const TypeStructure = union(enum) {
+    primitive,
+    record: []const FieldMeta,
+    adt: []const ConstructorMeta,
+    /// Newtype 的内部类型 type_id
+    newtype: u16,
+    /// Alias 的目标类型 type_id
+    alias: u16,
+    /// 函数类型签名
+    func: FuncSigMeta,
+    /// Trait 元信息
+    trait: TraitMeta,
+    unit,
+    /// Nullable 包装的内部类型 type_id（typeof(T?) 使用）
+    nullable: u16,
+};
+
+/// 完整的类型描述符（对应 Glue TypeInfo<T> 的 7 个顶层字段）
+///
+/// 由 IRBuilder 在编译期收集，存入 GlueIR.type_metadata_table。
+/// Engine 执行 builtin_typeof 时按 type_id 查表，构造 RecordValue。
+/// kind 是快速标签，structure 是携带数据的 ADT（kind 决定哪个变体有效）。
+/// layout/impls 是剥离的子结构（与 layout/impls 对称）。
+pub const TypeMetadata = struct {
+    name: []const u8,
+    module: []const u8,
+    kind: TypeKind,
+    structure: TypeStructure,
+    layout: LayoutInfo,
+    impls: TraitImplInfo,
+    type_params: []const TypeParamMeta,
+};
+
+/// 类型元数据表：按 type_id（1-indexed）索引
+///
+/// type_id 0 保留为 "无类型" 哨兵。
+/// name_to_id 提供 "Point" → type_id 的反向查询。
+/// builtin_typeof 节点的 meta_index 即 type_id，Engine 查表构造 TypeInfo。
+pub const TypeMetadataTable = struct {
+    /// 1-indexed 条目：entries[type_id - 1]
+    entries: []const TypeMetadata = &.{},
+    /// 类型名 → type_id 映射（不区分类型参数）
+    name_to_id: std.StringHashMap(u16) = undefined,
+
+    /// 按名称查询 type_id（找不到返回 0）
+    pub fn getIdByName(self: *const TypeMetadataTable, name: []const u8) u16 {
+        return self.name_to_id.get(name) orelse 0;
+    }
+
+    /// 按 type_id 查询元数据（id=0 或越界返回 null）
+    pub fn get(self: *const TypeMetadataTable, type_id: u16) ?*const TypeMetadata {
+        if (type_id == 0 or type_id > self.entries.len) return null;
+        return &self.entries[type_id - 1];
+    }
+
+    /// 初始化 name_to_id 映射（必须在 entries 填充后调用一次）
+    pub fn initNameMap(self: *TypeMetadataTable, allocator: std.mem.Allocator) !void {
+        self.name_to_id = std.StringHashMap(u16).init(allocator);
+        for (self.entries, 0..) |entry, i| {
+            try self.name_to_id.put(entry.name, @intCast(i + 1));
+        }
+    }
+
+    /// 释放 name_to_id 占用的内存
+    pub fn deinit(self: *TypeMetadataTable) void {
+        if (self.entries.len > 0) {
+            self.name_to_id.deinit();
+        }
+    }
 };
 
 // ════════════════════════════════════════════════════════════════

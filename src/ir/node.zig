@@ -66,6 +66,7 @@ pub const NodeOp = enum(u8) {
     builtin_ok, builtin_error, builtin_eq, builtin_str,
     builtin_ref_eq,
     builtin_type, builtin_panic,
+    builtin_typeof,
 
     // === 星轨（async/spawn，Phase 5） ===
     orbit_async_create, orbit_async_join, orbit_async_status,

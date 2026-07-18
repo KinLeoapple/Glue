@@ -23,6 +23,9 @@ pub const ExprInfo = struct {
     const_val: ?ConstVal = null,
     /// 表达式的 AST 指针地址（用作 key）
     expr_id: u64 = 0,
+    /// 表达式的类型名（若类型是 adt_type/generic_type，用于 IRBuilder 的 field_id 查找）
+    /// 解决 method_call 返回值等场景下 inferTypeNameFromExpr 无法从 AST 回溯类型名的问题
+    type_name: ?[]const u8 = null,
 };
 
 /// sema 产出的图构建元信息

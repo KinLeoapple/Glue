@@ -162,7 +162,7 @@ pub const FusedAnalysis = struct {
                 for (c.arguments) |arg| try self.analyzeExpr(arg, env, current_fn);
                 if (c.callee.* == .identifier) {
                     const callee_name = c.callee.identifier.name;
-                    // 递归调用不构成调用图边（不影响纯度判定）。
+                    // 递归调用不构成调用图边（不影响纯度判定），但标记为递归函数（memoization 用）
                     if (!std.mem.eql(u8, callee_name, current_fn)) {
                         if (isImpureBuiltin(callee_name)) {
                             // 调用内建非纯函数，当前函数直接标记为非纯。
@@ -176,6 +176,9 @@ pub const FusedAnalysis = struct {
                             }
                             try gop.value_ptr.append(self.allocator, callee_name);
                         }
+                    } else {
+                        // 直接递归：标记为递归函数（驱动 memoization）
+                        try self.purity_table.markRecursive(current_fn);
                     }
                 } else {
                     // 非标识符调用（如方法调用、lambda 调用）保守视为非纯。

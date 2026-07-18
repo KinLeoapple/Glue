@@ -34,6 +34,8 @@ pub const ClosureMeta = meta_mod.ClosureMeta;
 pub const ChanType = channel_mod.ChanType;
 pub const ChannelMeta = channel_mod.ChannelMeta;
 pub const ChannelSpace = channel_mod.ChannelSpace;
+pub const TypeMetadata = meta_mod.TypeMetadata;
+pub const TypeMetadataTable = meta_mod.TypeMetadataTable;
 
 /// Glue IR：完整的共享内存图
 ///
@@ -76,6 +78,9 @@ pub const GlueIR = struct {
     /// 闭包元数据表（closure_make 节点引用，lambda 编译）
     closure_metas: []ClosureMeta = &.{},
 
+    /// 类型元数据表（builtin_typeof 节点引用，反射机制）
+    type_metadata_table: TypeMetadataTable = .{},
+
     /// 函数表：每个函数是一个子图（node_start..node_start+node_count）
     functions: []Function = &.{},
 
@@ -107,6 +112,8 @@ pub const GlueIR = struct {
             // 非 arena 模式：channels 自行管理内存
             self.channels.deinit();
         }
+        // type_metadata_table 的 name_to_id 用 backing 分配，需显式释放
+        self.type_metadata_table.deinit();
     }
 
     /// 获取函数的节点切片

@@ -1644,7 +1644,14 @@ pub const TypeInferencer = struct {
         const ty = try self.inferExprInner(expr, env, expected);
         if (self.sema_result) |sr| {
             if (semaTypeToChanType(ty)) |ct| {
-                sr.putExpr(@intFromPtr(expr), .{ .chan_type = ct }) catch {};
+                // 提取类型名：adt_type/generic_type 携带 name，供 IRBuilder 的 field_id 查找使用
+                // 解决 method_call 返回值等场景下 inferTypeNameFromExpr 无法从 AST 回溯类型名的问题
+                const type_name: ?[]const u8 = switch (ty.*) {
+                    .adt_type => |at| at.name,
+                    .generic_type => |gt| gt.name,
+                    else => null,
+                };
+                sr.putExpr(@intFromPtr(expr), .{ .chan_type = ct, .type_name = type_name }) catch {};
             }
         }
         return ty;
@@ -1854,6 +1861,14 @@ pub const TypeInferencer = struct {
             },
             .call => |c| {
                 const loc = ast.exprLocation(expr);
+                // typeof 内建函数特殊处理：参数是类型引用（在值位置传递类型名）
+                // 不走常规函数调用推断，直接构造 TypeInfo<T> 类型
+                if (c.callee.* == .identifier) {
+                    const callee_name = c.callee.identifier.name;
+                    if (std.mem.eql(u8, callee_name, "typeof") and self.isBuiltinName("typeof")) {
+                        return try self.inferTypeofCall(c.arguments, env, loc);
+                    }
+                }
                 const callee_ty = try self.inferExpr(c.callee, env, null);
                 const ret_ty = try self.freshTypeVar();
                 const resolved_callee = self.resolve(callee_ty);
@@ -2665,7 +2680,8 @@ pub const TypeInferencer = struct {
                     std.mem.eql(u8, g.name, "Channel") or
                     std.mem.eql(u8, g.name, "Sender") or
                     std.mem.eql(u8, g.name, "Receiver") or
-                    std.mem.eql(u8, g.name, "Lazy"))
+                    std.mem.eql(u8, g.name, "Lazy") or
+                    std.mem.eql(u8, g.name, "TypeInfo"))
                 {
                     return self.makeGenericType(g.name, args);
                 }
@@ -3230,6 +3246,9 @@ pub const TypeInferencer = struct {
             env.define("channel", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
             self.registerBuiltinName("channel");
         }
+        // 注册 typeof 内建函数名（参数是类型引用，特殊处理，不进入 env）
+        // typeof 的实际处理在 inferExprInner 的 .call 分支中特殊分支
+        self.registerBuiltinName("typeof");
     }
     fn registerBuiltinName(self: *TypeInferencer, name: []const u8) void {
         if (!self.builtin_names.contains(name)) {
@@ -3239,6 +3258,86 @@ pub const TypeInferencer = struct {
     }
     pub fn isBuiltinName(self: *TypeInferencer, name: []const u8) bool {
         return self.builtin_names.contains(name);
+    }
+    /// typeof 内建函数的类型推断：typeof(TypeName) -> TypeInfo<TypeName>
+    ///
+    /// 参数语义：参数位置出现类型名（在值位置传递类型引用）
+    /// - 具体类型：Point / i32 / str / Shape 等
+    /// - 类型参数：T（在泛型函数内）
+    /// - Self（在 Trait 默认方法内）
+    ///
+    /// 返回 TypeInfo<T> 类型。具体类型解析后由 IRBuilder 在 type_metadata_table
+    /// 中查找；泛型 T 在运行时由引擎通过类型参数上下文查表。
+    fn inferTypeofCall(
+        self: *TypeInferencer,
+        arguments: []*ast.Expr,
+        env: *TypeEnv,
+        loc: ast.SourceLocation,
+    ) SemaError!*Type {
+        if (arguments.len != 1) {
+            self.addErrorAt(.type_mismatch, loc.line, loc.column, "typeof expects exactly 1 type argument, got {d}", .{arguments.len});
+            return self.makeType(.unit_type) catch error.OutOfMemory;
+        }
+        // 参数必须是标识符（类型名）或 propagate（typeof(T?) 形式）
+        const arg_expr = arguments[0];
+        switch (arg_expr.*) {
+            .propagate => |p| {
+                // typeof(T?) — nullable 类型包装
+                // 递归处理 inner expr 作为类型，构造 TypeInfo<T?> 类型
+                var inner_args = [_]*ast.Expr{p.expr};
+                const inner_type_info = try self.inferTypeofCall(&inner_args, env, loc);
+                // inner_type_info 是 TypeInfo<T>，我们需要 TypeInfo<T?>
+                // 从 TypeInfo<T> 中提取 T：TypeInfo 是 generic_type.args[0]
+                if (inner_type_info.* == .generic_type and inner_type_info.generic_type.args.len == 1) {
+                    const inner_ty = inner_type_info.generic_type.args[0];
+                    const nullable_ty = try self.makeNullableType(inner_ty);
+                    return self.makeGenericType("TypeInfo", &[_]*Type{nullable_ty}) catch error.OutOfMemory;
+                }
+                self.addErrorAt(.type_mismatch, loc.line, loc.column, "typeof(T?): inner type resolution failed", .{});
+                return self.makeType(.unit_type) catch error.OutOfMemory;
+            },
+            .identifier => {},
+            else => {
+                self.addErrorAt(.type_mismatch, loc.line, loc.column, "typeof argument must be a type name (identifier) or T? (propagate), got {s}", .{@tagName(arg_expr.*)});
+                return self.makeType(.unit_type) catch error.OutOfMemory;
+            },
+        }
+        const type_name = arg_expr.identifier.name;
+        // 1. 检查是否是 Self（Trait 默认方法内）
+        if (std.mem.eql(u8, type_name, "Self")) {
+            if (self.current_self_type) |self_ty| {
+                return self.makeGenericType("TypeInfo", &[_]*Type{self_ty}) catch error.OutOfMemory;
+            }
+            self.addErrorAt(.type_mismatch, loc.line, loc.column, "typeof(Self): Self is not available in current context", .{});
+            return self.makeType(.unit_type) catch error.OutOfMemory;
+        }
+        // 2. 检查是否是当前泛型函数的类型参数
+        if (self.current_type_params) |tpm| {
+            if (tpm.get(type_name)) |t| {
+                return self.makeGenericType("TypeInfo", &[_]*Type{t}) catch error.OutOfMemory;
+            }
+        }
+        // 3. 检查是否是内建类型（i32, str, bool 等）
+        inline for (BUILTIN_TYPES) |entry| {
+            if (std.mem.eql(u8, entry.name, type_name)) {
+                const t = self.makeType(entry.ty) catch return error.OutOfMemory;
+                return self.makeGenericType("TypeInfo", &[_]*Type{t}) catch error.OutOfMemory;
+            }
+        }
+        // 4. 检查是否是 ADT/Record/Newtype/Alias 类型
+        if (self.adt_types.get(type_name)) |info| {
+            return self.makeGenericType("TypeInfo", &[_]*Type{info.ty}) catch error.OutOfMemory;
+        }
+        // 5. 检查是否是 Trait 类型
+        if (self.trait_types.contains(type_name)) {
+            const t = self.arena.allocator().create(Type) catch return error.OutOfMemory;
+            t.* = Type{ .trait_type = .{ .name = type_name, .type_args = &[_]*Type{} } };
+            self.types.append(self.arena.allocator(), t) catch return error.OutOfMemory;
+            return self.makeGenericType("TypeInfo", &[_]*Type{t}) catch error.OutOfMemory;
+        }
+        // 6. 未找到类型
+        self.addErrorAt(.type_mismatch, loc.line, loc.column, "typeof: unknown type '{s}'", .{type_name});
+        return self.makeType(.unit_type) catch error.OutOfMemory;
     }
     fn unwrapAtomic(self: *TypeInferencer, ty: *Type) *Type {
         const resolved = self.resolve(ty);
@@ -3628,6 +3727,19 @@ pub const TypeInferencer = struct {
                     },
                 }
                 if (td.methods.len > 0) {
+                    // 漏洞修复 #1：Type 内部同名方法必须报错（重复定义）
+                    {
+                        var seen_methods = std.StringHashMap(void).init(self.arena.allocator());
+                        defer seen_methods.deinit();
+                        for (td.methods) |method| {
+                            if (seen_methods.contains(method.name)) {
+                                self.addErrorAt(.signature_mismatch, method.location.line, method.location.column, "duplicate method '{s}' in type '{s}'", .{ method.name, td.name });
+                            } else {
+                                const owned_name = self.arena.allocator().dupe(u8, method.name) catch continue;
+                                seen_methods.put(owned_name, {}) catch continue;
+                            }
+                        }
+                    }
                     const self_type = if (self.adt_types.get(td.name)) |info| info.ty else null;
                     if (self_type) |st| {
                         const old_self_type = self.current_self_type;
@@ -3647,37 +3759,96 @@ pub const TypeInferencer = struct {
                             const old_type_params = self.current_type_params;
                             defer self.current_type_params = old_type_params;
                             self.current_type_params = &type_param_map;
-                            if (method.body) |body| {
-                                var method_env = TypeEnv.init(self.arena.allocator());
-                                defer method_env.deinit();
-                                for (method.params) |param| {
-                                    const param_ty = if (param.type_annotation) |ty|
-                                        self.typeFromAstWithParams(ty, &type_param_map) catch self.freshTypeVar() catch continue
+
+                            // 收集参数类型数组，供构造 fn scheme 复用
+                            var param_types_list = std.ArrayList(*Type).empty;
+                            defer param_types_list.deinit(self.arena.allocator());
+
+                            const return_ty: *Type = blk: {
+                                if (method.body) |body| {
+                                    var method_env = TypeEnv.init(self.arena.allocator());
+                                    defer method_env.deinit();
+                                    for (method.params) |param| {
+                                        // self 参数：绑定到所在 type 的类型（td.name 对应的 self_type）
+                                        // 否则 method 体内 self.field 会因为 type_var 无法解析字段类型，
+                                        // 导致 IRBuilder 拿不到 chan_type，fallback 到 i64_chan，
+                                        // 进而破坏 ref 字段值（get() 返回跨类型字段的 bug 根源）。
+                                        const is_self_param = std.mem.eql(u8, param.name, "self");
+                                        const param_ty = if (is_self_param) pblk: {
+                                            if (self.current_self_type) |self_st| break :pblk self_st;
+                                            // 退化路径：无 self_type 时仍 fallback 到标注或 fresh var
+                                            if (param.type_annotation) |ty|
+                                                break :pblk self.typeFromAstWithParams(ty, &type_param_map) catch self.freshTypeVar() catch continue;
+                                            break :pblk self.freshTypeVar() catch continue;
+                                        } else if (param.type_annotation) |ty|
+                                            self.typeFromAstWithParams(ty, &type_param_map) catch self.freshTypeVar() catch continue
+                                        else
+                                            self.freshTypeVar() catch continue;
+                                        param_types_list.append(self.arena.allocator(), param_ty) catch continue;
+                                        const scheme = TypeScheme{
+                                            .quantified_vars = &[_]usize{},
+                                            .ty = param_ty,
+                                            .bounds = &[_]BoundInfo{},
+                                        };
+                                        method_env.define(param.name, scheme) catch continue;
+                                    }
+                                    const rt = if (method.return_type) |rt|
+                                        self.typeFromAstWithParams(rt, &type_param_map) catch self.freshTypeVar() catch continue
                                     else
                                         self.freshTypeVar() catch continue;
-                                    const scheme = TypeScheme{
-                                        .quantified_vars = &[_]usize{},
-                                        .ty = param_ty,
-                                        .bounds = &[_]BoundInfo{},
+                                    const old_return_type = self.current_fn_return_type;
+                                    defer self.current_fn_return_type = old_return_type;
+                                    self.current_fn_return_type = rt;
+                                    const body_ty = self.inferExpr(body, &method_env, rt) catch |err| {
+                                        self.reportInferError(err, method.location);
+                                        break :blk rt;
                                     };
-                                    method_env.define(param.name, scheme) catch continue;
+                                    // 与普通函数一致：用 unifyReturnType（含 int/float 拓宽），
+                                    // 避免字面量推断的窄类型（如 u8 的 3）与声明的 i32 严格 unify 失败
+                                    self.unifyReturnType(rt, body_ty) catch |err| {
+                                        self.reportInferError(err, method.location);
+                                    };
+                                    break :blk rt;
+                                } else {
+                                    // 无 body 的方法（抽象声明）：仅从签名推断参数与返回类型
+                                    for (method.params) |param| {
+                                        const is_self_param = std.mem.eql(u8, param.name, "self");
+                                        const param_ty = if (is_self_param) pblk: {
+                                            if (self.current_self_type) |self_st| break :pblk self_st;
+                                            if (param.type_annotation) |ty|
+                                                break :pblk self.typeFromAstWithParams(ty, &type_param_map) catch self.freshTypeVar() catch continue;
+                                            break :pblk self.freshTypeVar() catch continue;
+                                        } else if (param.type_annotation) |ty|
+                                            self.typeFromAstWithParams(ty, &type_param_map) catch self.freshTypeVar() catch continue
+                                        else
+                                            self.freshTypeVar() catch continue;
+                                        param_types_list.append(self.arena.allocator(), param_ty) catch continue;
+                                    }
+                                    const rt = if (method.return_type) |rt|
+                                        self.typeFromAstWithParams(rt, &type_param_map) catch self.freshTypeVar() catch continue
+                                    else
+                                        self.freshTypeVar() catch continue;
+                                    break :blk rt;
                                 }
-                                const return_ty = if (method.return_type) |rt|
-                                    self.typeFromAstWithParams(rt, &type_param_map) catch self.freshTypeVar() catch continue
-                                else
-                                    self.freshTypeVar() catch continue;
-                                const old_return_type = self.current_fn_return_type;
-                                defer self.current_fn_return_type = old_return_type;
-                                self.current_fn_return_type = return_ty;
-                                const body_ty = self.inferExpr(body, &method_env, return_ty) catch |err| {
-                                    self.reportInferError(err, method.location);
-                                    continue;
+                            };
+
+                            // 将方法以 mangled name "TypeName.method" 注册到外层 env，
+                            // 供 trait_resolve.inferMethodCall 在 o.method() 调用点查找返回类型。
+                            // 这是修复 get() 返回跨类型字段值错误 bug 的关键：让 inferMethodCall
+                            // 能拿到 method 的精确返回类型，而不是 fallback 到 freshTypeVar。
+                            {
+                                const fn_ty = self.makeFnType(param_types_list.items, return_ty) catch continue;
+                                const fn_scheme = TypeScheme{
+                                    .quantified_vars = &[_]usize{},
+                                    .ty = fn_ty,
+                                    .bounds = &[_]BoundInfo{},
                                 };
-                                // 与普通函数一致：用 unifyReturnType（含 int/float 拓宽），
-                                // 避免字面量推断的窄类型（如 u8 的 3）与声明的 i32 严格 unify 失败
-                                self.unifyReturnType(return_ty, body_ty) catch |err| {
-                                    self.reportInferError(err, method.location);
-                                };
+                                const mangled = std.fmt.allocPrint(
+                                    self.arena.allocator(),
+                                    "{s}.{s}",
+                                    .{ td.name, method.name },
+                                ) catch continue;
+                                env.redefine(mangled, fn_scheme) catch continue;
                             }
                         }
                     }

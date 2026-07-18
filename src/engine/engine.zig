@@ -29,6 +29,8 @@ const ChanType = ir_mod.ChanType;
 const ChannelMeta = ir_mod.ChannelMeta;
 const Function = ir_mod.Function;
 const Runtime = runtime_mod.Runtime;
+const TypeMetadata = ir_mod.meta_mod.TypeMetadata;
+const TypeKind = ir_mod.meta_mod.TypeKind;
 
 const debug_route_dispatch = false;
 const debug_record = false;
@@ -42,10 +44,13 @@ const ScalarTag = scalar.ScalarTag;
 const batch = value.batch;
 
 /// 执行错误
+/// 注意：必须包含 value.AllocError 的所有错误（makeRecord 等 value 层调用会传播）
 pub const EngineError = error{
     OutOfMemory,
-    DivisionByZero,
     Overflow,
+    TooManyPools,
+    AllocFailed,
+    DivisionByZero,
     CastOverflow,
     UnsupportedOp,
     Thrown,
@@ -178,7 +183,8 @@ pub const Engine = struct {
         arg_hash: u64,
     };
 
-    /// Memoization 缓存值：标量结果字节（最大 16B，覆盖 i128/f128）
+    /// Memoization 缓存值
+    /// 标量/nullable<标量> 结果：bytes[0..width] 存储结果字节（最大 16B，覆盖 i128/f128）
     const MemoEntry = struct {
         bytes: [16]u8 = [_]u8{0} ** 16,
         width: u8 = 0,
@@ -208,6 +214,11 @@ pub const Engine = struct {
     current_func_idx: u16 = 0,
     /// 最后一次 run() 的实际返回通道索引（供外部查询返回类型）
     result_chan: u16 = 0,
+
+    /// 泛型函数类型实参栈（与 call_stack 并行，每层 frame 的 type_args）
+    /// typeof(T) 在泛型函数内通过哨兵 meta_index=0x8000|param_idx 查此栈
+    /// 元素为 arena 分配的切片，生命周期与 IR 一致
+    frame_type_args_stack: std.ArrayListUnmanaged([]const u16) = .empty,
 
     /// defer 栈（LIFO）：cleanup_register 入栈，halt 时 cleanup_run 执行
     defer_stack: [MAX_DEFERS]DeferFrame = undefined,
@@ -251,10 +262,15 @@ pub const Engine = struct {
     /// 消除 TCO 主循环的 execNode switch dispatch
     func_body_cache: []?FuncBodyCache = &.{},
 
-    /// Memoization 缓存：纯函数 + 标量参数 → 结果值缓存
-    /// key = (memo_slot, arg_hash)，value = 缓存的结果字节
-    /// 仅缓存标量结果（无堆指针，无需 retain/release）
+    /// Memoization 缓存：纯函数 → 结果值缓存
+    /// key = (memo_slot, arg_hash)，value = 缓存的结果
+    /// 标量结果：bytes[0..width]
+    /// 堆类型结果：value（deepCopy + retain）
     memo_cache: std.AutoHashMapUnmanaged(MemoKey, MemoEntry) = .{},
+
+    /// 全局缓存条目上限（避免内存爆炸）
+    /// 超过后不再插入新条目（简单有效的容量控制）
+    memo_capacity: u32 = 65536,
 
     /// Memoization 命中/未命中统计（调试用，可在 --profile 中输出）
     memo_hits: u64 = 0,
@@ -402,6 +418,9 @@ pub const Engine = struct {
         if (self.call_stack.len > 0) {
             backing.free(self.call_stack);
         }
+
+        // 释放泛型类型实参栈（切片本身由 arena 拥有，只释放 ArrayList 容量）
+        self.frame_type_args_stack.deinit(backing);
 
         // 释放 memoization 缓存
         self.memo_cache.deinit(backing);
@@ -1128,6 +1147,7 @@ pub const Engine = struct {
             .builtin_ref_eq => try self.execBuiltinRefEq(node),
             .builtin_str => try self.execBuiltinStr(node),
             .builtin_type => try self.execBuiltinType(node),
+            .builtin_typeof => try self.execBuiltinTypeof(node),
             .builtin_panic => return error.Panic,
 
             // === Newtype ===
@@ -2053,6 +2073,576 @@ pub const Engine = struct {
         const str_obj = value.str_mod.Str.createContiguous(self.tctx.?, type_name) catch return error.OutOfMemory;
         try self.trackObj(&str_obj.header);
         self.runtime.writePtr(node.output, @ptrCast(&str_obj.header));
+    }
+
+    /// builtin_typeof：编译期类型反射，返回 TypeInfo RecordValue
+    ///
+    /// 无输入通道；node.meta_index = type_id（1-indexed，0 = 泛型参数 T/Self）
+    /// output = ref_chan（RecordValue 指针）
+    ///
+    /// TypeInfo 是 7 顶层字段的 RecordValue，字段顺序与 IRBuilder.registerTypeInfoFields 一致：
+    ///   0=name, 1=module, 2=kind, 3=structure, 4=layout, 5=impls, 6=type_params
+    /// 子结构：
+    ///   layout = LayoutInfo(size: u32, alignment: u32)
+    ///   impls  = TraitImplInfo(parent_traits, implemented_traits, methods, associated_types)
+    ///   structure = TypeStructure ADT 变体（type_name 为 "Adt"/"Record"/"Newtype"/... 等）
+    ///
+    /// type_id 编码：
+    ///   - 0：未知/泛型参数 T/Self，运行时查 frame.type_args（参见 Step 3）
+    ///   - 0x8000..0xFFFF：泛型参数哨兵，param_idx = meta_index & 0x7FFF
+    ///   - 1..N：具体类型 type_id，查 TypeMetadataTable
+    fn execBuiltinTypeof(self: *Engine, node: *const Node) EngineError!void {
+        const meta_idx = node.meta_index;
+        const tctx = self.tctx.?;
+
+        // nullable 包装哨兵：typeof(T?) → 构造 Nullable kind 的 TypeInfo
+        // meta_index = 0x4000 | inner_meta_idx
+        if (meta_idx & 0x4000 != 0) {
+            const inner_meta: u16 = meta_idx & 0xBFFF;
+            // 递归构造 inner TypeInfo
+            const inner_value = try self.makeTypeInfoFromMeta(inner_meta);
+            // 构造 Nullable kind 的 TypeInfo：复用 inner TypeInfo 的字段，
+            // 但 kind = Nullable，structure = Nullable(inner_type_id)
+            try self.emitNullableTypeInfo(node, inner_value, tctx);
+            return;
+        }
+
+        // 哨兵：泛型参数 T（meta_index = 0x8000 | param_idx）
+        if (meta_idx & 0x8000 != 0) {
+            const param_idx: u16 = meta_idx & 0x7FFF;
+            // 从当前 frame 的 type_args 查找实际 type_id
+            if (self.lookupFrameTypeArg(param_idx)) |actual_type_id| {
+                if (actual_type_id != 0) {
+                    if (self.ir.type_metadata_table.get(actual_type_id)) |md| {
+                        try self.emitTypeInfoRecord(node, md, tctx);
+                        return;
+                    }
+                }
+            }
+            // 查表失败：返回占位 TypeInfo
+            try self.emitPlaceholderTypeInfo(node, "?", tctx);
+            return;
+        }
+
+        // type_id=0：未知类型，返回占位
+        if (meta_idx == 0) {
+            try self.emitPlaceholderTypeInfo(node, "?", tctx);
+            return;
+        }
+
+        // 查表
+        const md: *const TypeMetadata = self.ir.type_metadata_table.get(meta_idx) orelse {
+            try self.emitPlaceholderTypeInfo(node, "<unknown>", tctx);
+            return;
+        };
+
+        try self.emitTypeInfoRecord(node, md, tctx);
+    }
+
+    /// 从 meta_index 构造 TypeInfo Value（不写入通道，返回 Value）
+    /// 用于 typeof(T?) 中递归构造 inner TypeInfo
+    fn makeTypeInfoFromMeta(self: *Engine, meta_idx: u16) EngineError!value.Value {
+        // nullable 包装
+        if (meta_idx & 0x4000 != 0) {
+            const inner_meta: u16 = meta_idx & 0xBFFF;
+            const inner_val = try self.makeTypeInfoFromMeta(inner_meta);
+            return self.makeNullableTypeInfoValue(inner_val);
+        }
+        // 泛型参数
+        if (meta_idx & 0x8000 != 0) {
+            const param_idx: u16 = meta_idx & 0x7FFF;
+            if (self.lookupFrameTypeArg(param_idx)) |actual_type_id| {
+                if (actual_type_id != 0) {
+                    if (self.ir.type_metadata_table.get(actual_type_id)) |_| {
+                        return self.makeTypeInfoFromId(actual_type_id);
+                    }
+                }
+            }
+            return self.makePlaceholderTypeInfoValue("?");
+        }
+        if (meta_idx == 0) return self.makePlaceholderTypeInfoValue("?");
+        if (self.ir.type_metadata_table.get(meta_idx)) |_| {
+            return self.makeTypeInfoFromId(meta_idx);
+        }
+        return self.makePlaceholderTypeInfoValue("<unknown>");
+    }
+
+    /// 构造 Nullable kind 的 TypeInfo Value
+    /// 复用 inner TypeInfo 的 name，kind=Nullable，structure=Nullable(inner TypeInfo)
+    fn makeNullableTypeInfoValue(self: *Engine, inner_value: value.Value) EngineError!value.Value {
+        const tctx = self.tctx.?;
+        // 从 inner TypeInfo RecordValue 提取 name 字段（fields[0] 是 str）
+        const inner_name: []const u8 = blk: {
+            switch (inner_value) {
+                .ref => |header| {
+                    if (header.type_tag == .record) {
+                        const r: *value.RecordValue = @alignCast(@fieldParentPtr("header", header));
+                        if (r.fields.len > 0) {
+                            switch (r.fields[0]) {
+                                .ref => |str_header| {
+                                    if (str_header.type_tag == .str) {
+                                        const s: *value.Str = @alignCast(@fieldParentPtr("header", str_header));
+                                        break :blk s.bytes();
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+            break :blk "?";
+        };
+        // structure: Nullable(inner) — 用 Nullable 构造器包装 inner TypeInfo
+        var struct_fields = [_]value.Value{inner_value};
+        const struct_rec = value.Value.makeRecord(tctx, "Nullable", &struct_fields) catch return error.OutOfMemory;
+        try self.trackObj(struct_rec.asRef());
+
+        var field_buf: [7]value.Value = undefined;
+        field_buf[0] = value.Value.fromStringBytes(tctx, inner_name) catch return error.OutOfMemory;
+        field_buf[1] = value.Value.fromStringBytes(tctx, "") catch return error.OutOfMemory;
+        field_buf[2] = value.Value.fromStringBytes(tctx, TypeKind.nullable.ctorName()) catch return error.OutOfMemory;
+        field_buf[3] = struct_rec;
+        field_buf[4] = try self.makeLayoutInfoRecord(.{ .size = 8, .alignment = 8 });
+        field_buf[5] = try self.makeEmptyTraitImplInfoRecord();
+        field_buf[6] = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+        const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 Nullable kind 的 TypeInfo 并写入通道
+    fn emitNullableTypeInfo(self: *Engine, node: *const Node, inner_value: value.Value, tctx: *ThreadContext) EngineError!void {
+        _ = tctx;
+        const rv = try self.makeNullableTypeInfoValue(inner_value);
+        self.runtime.writePtr(node.output, @ptrCast(rv.asRef()));
+    }
+
+    /// 构造占位 TypeInfo Value（不写入通道，返回 Value）
+    fn makePlaceholderTypeInfoValue(self: *Engine, name: []const u8) EngineError!value.Value {
+        const tctx = self.tctx.?;
+        const unit_rec = value.Value.makeRecord(tctx, "Unit", &.{}) catch return error.OutOfMemory;
+        try self.trackObj(unit_rec.asRef());
+
+        var field_buf: [7]value.Value = undefined;
+        field_buf[0] = value.Value.fromStringBytes(tctx, name) catch return error.OutOfMemory;
+        field_buf[1] = value.Value.fromStringBytes(tctx, "") catch return error.OutOfMemory;
+        field_buf[2] = value.Value.fromStringBytes(tctx, TypeKind.unit.ctorName()) catch return error.OutOfMemory;
+        field_buf[3] = unit_rec;
+        field_buf[4] = try self.makeLayoutInfoRecord(.{ .size = 0, .alignment = 0 });
+        field_buf[5] = try self.makeEmptyTraitImplInfoRecord();
+        field_buf[6] = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+        const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 查找当前 frame 的类型实参（Step 3：泛型 T 运行时查表）
+    /// 返回 type_id（1-indexed，0 = 未绑定）
+    fn lookupFrameTypeArg(self: *Engine, param_idx: u16) ?u16 {
+        if (self.frame_type_args_stack.items.len == 0) return null;
+        const top = self.frame_type_args_stack.items[self.frame_type_args_stack.items.len - 1];
+        if (param_idx >= top.len) return null;
+        return top[param_idx];
+    }
+
+    /// 构造占位 TypeInfo RecordValue（未知类型或查表失败时使用）
+    /// 新设计：7 个顶层字段（name/module/kind/structure/layout/impls/type_params）
+    fn emitPlaceholderTypeInfo(self: *Engine, node: *const Node, name: []const u8, tctx: *ThreadContext) EngineError!void {
+        var placeholder_fields = [_]value.Value{
+            // 0: name
+            value.Value.fromStringBytes(tctx, name) catch return error.OutOfMemory,
+            // 1: module
+            value.Value.fromStringBytes(tctx, "") catch return error.OutOfMemory,
+            // 2: kind (TypeKind 构造器名)
+            value.Value.fromStringBytes(tctx, "Unit") catch return error.OutOfMemory,
+            // 3: structure (TypeStructure.Unit，空 RecordValue)
+            value.Value.makeRecord(tctx, "Unit", &.{}) catch return error.OutOfMemory,
+            // 4: layout (LayoutInfo{0, 0})
+            self.makeLayoutInfoRecord(.{ .size = 0, .alignment = 0 }) catch return error.OutOfMemory,
+            // 5: impls (empty TraitImplInfo)
+            self.makeEmptyTraitImplInfoRecord() catch return error.OutOfMemory,
+            // 6: type_params (empty array)
+            value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory,
+        };
+        const rec = value.Value.makeRecord(tctx, "TypeInfo", &placeholder_fields) catch return error.OutOfMemory;
+        try self.trackObj(rec.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(rec.asRef()));
+    }
+
+    /// 构造完整 TypeInfo RecordValue（7 顶层字段，完整嵌套结构）
+    fn emitTypeInfoRecord(self: *Engine, node: *const Node, md: *const TypeMetadata, tctx: *ThreadContext) EngineError!void {
+        var field_buf: [7]value.Value = undefined;
+
+        // 0: name (str)
+        field_buf[0] = value.Value.fromStringBytes(tctx, md.name) catch return error.OutOfMemory;
+        // 1: module (str)
+        field_buf[1] = value.Value.fromStringBytes(tctx, md.module) catch return error.OutOfMemory;
+        // 2: kind (str，TypeKind 的 ADT 构造器名)
+        field_buf[2] = value.Value.fromStringBytes(tctx, md.kind.ctorName()) catch return error.OutOfMemory;
+        // 3: structure (TypeStructure ADT，按 kind 构造对应变体)
+        field_buf[3] = self.makeStructureRecord(md) catch return error.OutOfMemory;
+        // 4: layout (LayoutInfo RecordValue)
+        field_buf[4] = self.makeLayoutInfoRecord(md.layout) catch return error.OutOfMemory;
+        // 5: impls (TraitImplInfo RecordValue)
+        field_buf[5] = self.makeTraitImplInfoRecord(md.impls) catch return error.OutOfMemory;
+        // 6: type_params (Array<TypeParamMeta>)
+        field_buf[6] = self.makeTypeParamMetaArray(md.type_params) catch return error.OutOfMemory;
+
+        const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
+        try self.trackObj(rec.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(rec.asRef()));
+    }
+
+    /// 构造 LayoutInfo RecordValue：(size, alignment)
+    fn makeLayoutInfoRecord(self: *Engine, layout: ir_mod.meta_mod.LayoutInfo) !value.Value {
+        const tctx = self.tctx.?;
+        var fields = [_]value.Value{
+            value.Value.fromU32(layout.size),
+            value.Value.fromU32(layout.alignment),
+        };
+        const rec = try value.Value.makeRecord(tctx, "LayoutInfo", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造空 TraitImplInfo RecordValue（占位 TypeInfo 用）
+    fn makeEmptyTraitImplInfoRecord(self: *Engine) !value.Value {
+        const tctx = self.tctx.?;
+        const empty = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+        var fields = [_]value.Value{ empty, empty, empty, empty };
+        const rec = value.Value.makeRecord(tctx, "TraitImplInfo", &fields) catch return error.OutOfMemory;
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 TraitImplInfo RecordValue：(parent_traits, implemented_traits, methods, associated_types)
+    fn makeTraitImplInfoRecord(self: *Engine, impls: ir_mod.meta_mod.TraitImplInfo) !value.Value {
+        const tctx = self.tctx.?;
+        var fields = [_]value.Value{
+            try self.makeTraitMetaArray(impls.parent_traits),
+            try self.makeTraitMetaArray(impls.implemented_traits),
+            try self.makeMethodMetaArray(impls.methods),
+            try self.makeAssociatedTypeMetaArray(impls.associated_types),
+        };
+        const rec = try value.Value.makeRecord(tctx, "TraitImplInfo", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 TypeStructure RecordValue（按 kind 构造对应变体）
+    /// 返回 RecordValue，type_name 为变体构造器名（如 "Record"、"Adt"）
+    /// 显式命名错误集 EngineError 打破与 makeTypeInfoFromId 的循环依赖（推断错误集才会循环）
+    fn makeStructureRecord(self: *Engine, md: *const TypeMetadata) EngineError!value.Value {
+        const tctx = self.tctx.?;
+        switch (md.structure) {
+            .primitive => {
+                const rec = try value.Value.makeRecord(tctx, "Primitive", &.{});
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+            .record => |fields| {
+                const fields_arr = try self.makeFieldMetaArray(fields);
+                var buf = [_]value.Value{fields_arr};
+                const rec = try value.Value.makeRecord(tctx, "Record", &buf);
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+            .adt => |constructors| {
+                const ctors_arr = try self.makeConstructorMetaArray(constructors);
+                var buf = [_]value.Value{ctors_arr};
+                const rec = try value.Value.makeRecord(tctx, "Adt", &buf);
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+            .newtype => |inner_id| {
+                const inner_info = try self.makeTypeInfoFromId(inner_id);
+                var buf = [_]value.Value{inner_info};
+                const rec = try value.Value.makeRecord(tctx, "Newtype", &buf);
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+            .alias => |target_id| {
+                const target_info = try self.makeTypeInfoFromId(target_id);
+                var buf = [_]value.Value{target_info};
+                const rec = try value.Value.makeRecord(tctx, "Alias", &buf);
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+            .func => |fs| {
+                const sig_rec = try self.makeFuncSigRecord(fs);
+                var buf = [_]value.Value{sig_rec};
+                const rec = try value.Value.makeRecord(tctx, "Func", &buf);
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+            .trait => |tm| {
+                const trait_rec = try self.makeTraitMetaRecord(tm);
+                var buf = [_]value.Value{trait_rec};
+                const rec = try value.Value.makeRecord(tctx, "Trait", &buf);
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+            .unit => {
+                const rec = try value.Value.makeRecord(tctx, "Unit", &.{});
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+            .nullable => |inner_id| {
+                const inner_info = try self.makeTypeInfoFromId(inner_id);
+                var buf = [_]value.Value{inner_info};
+                const rec = try value.Value.makeRecord(tctx, "Nullable", &buf);
+                try self.trackObj(rec.asRef());
+                return rec;
+            },
+        }
+    }
+
+    /// 按 type_id 查表递归构造 TypeInfo RecordValue
+    /// type_id=0 时返回占位 TypeInfo（null 内部类型）
+    /// 显式命名错误集 EngineError 打破与 makeStructureRecord 的循环依赖（推断错误集才会循环）
+    fn makeTypeInfoFromId(self: *Engine, type_id: u16) EngineError!value.Value {
+        const tctx = self.tctx.?;
+        if (type_id == 0 or type_id > self.ir.type_metadata_table.entries.len) {
+            // 未解析：返回占位 TypeInfo
+            const placeholder_name = "?";
+            var placeholder_fields = [_]value.Value{
+                value.Value.fromStringBytes(tctx, placeholder_name) catch return error.OutOfMemory,
+                value.Value.fromStringBytes(tctx, "") catch return error.OutOfMemory,
+                value.Value.fromStringBytes(tctx, "Unit") catch return error.OutOfMemory,
+                value.Value.makeRecord(tctx, "Unit", &.{}) catch return error.OutOfMemory,
+                self.makeLayoutInfoRecord(.{ .size = 0, .alignment = 0 }) catch return error.OutOfMemory,
+                self.makeEmptyTraitImplInfoRecord() catch return error.OutOfMemory,
+                value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory,
+            };
+            const rec = value.Value.makeRecord(tctx, "TypeInfo", &placeholder_fields) catch return error.OutOfMemory;
+            try self.trackObj(rec.asRef());
+            return rec;
+        }
+        const md = &self.ir.type_metadata_table.entries[type_id - 1];
+        var field_buf: [7]value.Value = undefined;
+        field_buf[0] = value.Value.fromStringBytes(tctx, md.name) catch return error.OutOfMemory;
+        field_buf[1] = value.Value.fromStringBytes(tctx, md.module) catch return error.OutOfMemory;
+        field_buf[2] = value.Value.fromStringBytes(tctx, md.kind.ctorName()) catch return error.OutOfMemory;
+        field_buf[3] = try self.makeStructureRecord(md);
+        field_buf[4] = try self.makeLayoutInfoRecord(md.layout);
+        field_buf[5] = try self.makeTraitImplInfoRecord(md.impls);
+        field_buf[6] = try self.makeTypeParamMetaArray(md.type_params);
+        const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 FieldMeta RecordValue：(name, type_name, is_nullable, index)
+    fn makeFieldMetaRecord(self: *Engine, fm: ir_mod.meta_mod.FieldMeta) !value.Value {
+        const tctx = self.tctx.?;
+        var fields = [_]value.Value{
+            try value.Value.fromStringBytes(tctx, fm.name),
+            try value.Value.fromStringBytes(tctx, fm.type_name),
+            value.Value.fromBool(fm.is_nullable),
+            value.Value.fromU32(fm.index),
+        };
+        const rec = try value.Value.makeRecord(tctx, "FieldMeta", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 FieldMeta 数组
+    fn makeFieldMetaArray(self: *Engine, items: []const ir_mod.meta_mod.FieldMeta) !value.Value {
+        const tctx = self.tctx.?;
+        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
+        for (items, 0..) |it, i| {
+            ptr[i] = try self.makeFieldMetaRecord(it);
+        }
+        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+    }
+
+    /// 构造 ConstructorMeta RecordValue：(name, fields, is_unit, index)
+    fn makeConstructorMetaRecord(self: *Engine, cm: ir_mod.meta_mod.ConstructorMeta) !value.Value {
+        const tctx = self.tctx.?;
+        const fields_arr = try self.makeFieldMetaArray(cm.fields);
+        var fields = [_]value.Value{
+            try value.Value.fromStringBytes(tctx, cm.name),
+            fields_arr,
+            value.Value.fromBool(cm.is_unit),
+            value.Value.fromU32(cm.index),
+        };
+        const rec = try value.Value.makeRecord(tctx, "ConstructorMeta", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 ConstructorMeta 数组
+    fn makeConstructorMetaArray(self: *Engine, items: []const ir_mod.meta_mod.ConstructorMeta) !value.Value {
+        const tctx = self.tctx.?;
+        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
+        for (items, 0..) |it, i| {
+            ptr[i] = try self.makeConstructorMetaRecord(it);
+        }
+        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+    }
+
+    /// 构造 TypeParamMeta RecordValue：(name, constraints, is_specialized, specialization)
+    fn makeTypeParamMetaRecord(self: *Engine, tp: ir_mod.meta_mod.TypeParamMeta) !value.Value {
+        const tctx = self.tctx.?;
+        // constraints: []const []const u8 → Array<str>
+        const constraints_arr = try self.makeStrArray(tp.constraints);
+        // specialization: ?[]const u8 → nullable<str>
+        const spec_val = if (tp.specialization) |s|
+            value.Value{ .ref = (try value.Value.fromStringBytes(tctx, s)).ref }
+        else
+            value.Value.fromNull();
+
+        var fields = [_]value.Value{
+            try value.Value.fromStringBytes(tctx, tp.name),
+            constraints_arr,
+            value.Value.fromBool(tp.is_specialized),
+            spec_val,
+        };
+        const rec = try value.Value.makeRecord(tctx, "TypeParamMeta", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 TypeParamMeta 数组
+    fn makeTypeParamMetaArray(self: *Engine, items: []const ir_mod.meta_mod.TypeParamMeta) !value.Value {
+        const tctx = self.tctx.?;
+        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
+        for (items, 0..) |it, i| {
+            ptr[i] = try self.makeTypeParamMetaRecord(it);
+        }
+        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+    }
+
+    /// 构造 FuncSigMeta RecordValue：(param_types, return_type, is_async)
+    fn makeFuncSigRecord(self: *Engine, fs: ir_mod.meta_mod.FuncSigMeta) !value.Value {
+        const tctx = self.tctx.?;
+        const param_types_arr = try self.makeStrArray(fs.param_types);
+        var fields = [_]value.Value{
+            param_types_arr,
+            try value.Value.fromStringBytes(tctx, fs.return_type),
+            value.Value.fromBool(fs.is_async),
+        };
+        const rec = try value.Value.makeRecord(tctx, "FuncSigMeta", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 TraitMeta RecordValue：(name, module, type_params, parent_traits, associated_types, method_names)
+    fn makeTraitMetaRecord(self: *Engine, tm: ir_mod.meta_mod.TraitMeta) !value.Value {
+        const tctx = self.tctx.?;
+        const tp_arr = try self.makeTypeParamMetaArray(tm.type_params);
+        const pt_arr = try self.makeStrArray(tm.parent_traits);
+        const at_arr = try self.makeStrArray(tm.associated_types);
+        const mn_arr = try self.makeStrArray(tm.method_names);
+        var fields = [_]value.Value{
+            try value.Value.fromStringBytes(tctx, tm.name),
+            try value.Value.fromStringBytes(tctx, tm.module),
+            tp_arr,
+            pt_arr,
+            at_arr,
+            mn_arr,
+        };
+        const rec = try value.Value.makeRecord(tctx, "TraitMeta", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 TraitMeta 数组
+    fn makeTraitMetaArray(self: *Engine, items: []const ir_mod.meta_mod.TraitMeta) !value.Value {
+        const tctx = self.tctx.?;
+        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
+        for (items, 0..) |it, i| {
+            ptr[i] = try self.makeTraitMetaRecord(it);
+        }
+        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+    }
+
+    /// 构造 MethodMeta RecordValue：(name, signature, is_override, is_delegate, delegate_trait, is_async)
+    fn makeMethodMetaRecord(self: *Engine, mm: ir_mod.meta_mod.MethodMeta) !value.Value {
+        const tctx = self.tctx.?;
+        const sig_rec = try self.makeFuncSigRecord(mm.signature);
+        // delegate_trait: ?[]const u8 → nullable<str>
+        const dt_val = if (mm.delegate_trait) |dt|
+            value.Value{ .ref = (try value.Value.fromStringBytes(tctx, dt)).ref }
+        else
+            value.Value.fromNull();
+
+        var fields = [_]value.Value{
+            try value.Value.fromStringBytes(tctx, mm.name),
+            sig_rec,
+            value.Value.fromBool(mm.is_override),
+            value.Value.fromBool(mm.is_delegate),
+            dt_val,
+            value.Value.fromBool(mm.is_async),
+        };
+        const rec = try value.Value.makeRecord(tctx, "MethodMeta", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 MethodMeta 数组
+    fn makeMethodMetaArray(self: *Engine, items: []const ir_mod.meta_mod.MethodMeta) !value.Value {
+        const tctx = self.tctx.?;
+        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
+        for (items, 0..) |it, i| {
+            ptr[i] = try self.makeMethodMetaRecord(it);
+        }
+        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+    }
+
+    /// 构造 AssociatedTypeMeta RecordValue：(name, is_specified, default_type)
+    fn makeAssociatedTypeMetaRecord(self: *Engine, atm: ir_mod.meta_mod.AssociatedTypeMeta) !value.Value {
+        const tctx = self.tctx.?;
+        // default_type: ?[]const u8 → nullable<str>
+        const dt_val = if (atm.default_type) |dt|
+            value.Value{ .ref = (try value.Value.fromStringBytes(tctx, dt)).ref }
+        else
+            value.Value.fromNull();
+
+        var fields = [_]value.Value{
+            try value.Value.fromStringBytes(tctx, atm.name),
+            value.Value.fromBool(atm.is_specified),
+            dt_val,
+        };
+        const rec = try value.Value.makeRecord(tctx, "AssociatedTypeMeta", &fields);
+        try self.trackObj(rec.asRef());
+        return rec;
+    }
+
+    /// 构造 AssociatedTypeMeta 数组
+    fn makeAssociatedTypeMetaArray(self: *Engine, items: []const ir_mod.meta_mod.AssociatedTypeMeta) !value.Value {
+        const tctx = self.tctx.?;
+        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
+        for (items, 0..) |it, i| {
+            ptr[i] = try self.makeAssociatedTypeMetaRecord(it);
+        }
+        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+    }
+
+    /// 辅助：从 []const []const u8 构造字符串数组
+    fn makeStrArray(self: *Engine, strs: []const []const u8) !value.Value {
+        const tctx = self.tctx.?;
+        if (strs.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        const buf = try tctx.allocObj(strs.len * @sizeOf(value.Value));
+        const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
+        for (strs, 0..) |s, i| {
+            ptr[i] = try value.Value.fromStringBytes(tctx, s);
+        }
+        return value.Value.makeArray(tctx, ptr[0..strs.len], null);
     }
 
     // ════════════════════════════════════════════
@@ -3237,9 +3827,10 @@ pub const Engine = struct {
         const callee_func = self.ir.functions[call_meta.func_index];
         const args = node.inputs[0..call_meta.arg_count];
 
-        // Memoization 快速路径：纯函数 + 标量参数 + 非尾调用 → 查缓存
+        // Memoization 快速路径：递归纯函数 + 标量/nullable<标量> 参数 + 非尾调用
         // 命中则直接复制结果，跳过整个函数执行（O(1) 替代 O(递归深度)）
         // 尾调用跳过 memo（TCO 已优化，且 tco_restart 路径无标准结果写入）
+        // ref_chan 参数/返回不启用 memoization（指针哈希命中率低，deepCopy 开销巨大）
         if (call_meta.memo_slot > 0 and !call_meta.tail_call) {
             const arg_hash = self.hashArgs(args);
             const key = MemoKey{ .slot = call_meta.memo_slot, .arg_hash = arg_hash };
@@ -3259,9 +3850,9 @@ pub const Engine = struct {
             // 执行标准调用路径
             try self.execCallStandard(node, call_meta, callee_func, args);
 
-            // 缓存结果：从 node.output 读取结果字节
+            // 缓存结果：直接缓存字节（标量和 nullable<标量> 都用字节路径）
             const result_w = self.runtime.elemWidth(node.output);
-            if (result_w > 0) {
+            if (result_w > 0 and result_w <= 16) {
                 var entry: MemoEntry = .{ .width = result_w };
                 const src = self.runtime.rawPtr(node.output);
                 @memcpy(entry.bytes[0..result_w], src[0..result_w]);
@@ -3447,6 +4038,9 @@ pub const Engine = struct {
                 .return_pc = 0,
             };
             self.call_depth += 1;
+            // 泛型类型实参压栈（供 typeof(T) 运行时查表）
+            self.frame_type_args_stack.append(self.tctx.?.backing, call_meta.type_args) catch return error.OutOfMemory;
+            defer _ = self.frame_type_args_stack.pop();
 
             const saved_func_idx = self.current_func_idx;
             const result_chan = try self.execFunction(call_meta.func_index, args);
@@ -3511,6 +4105,9 @@ pub const Engine = struct {
                 .return_pc = 0,
             };
             self.call_depth += 1;
+            // 泛型类型实参压栈（供 typeof(T) 运行时查表）
+            self.frame_type_args_stack.append(self.tctx.?.backing, call_meta.type_args) catch return error.OutOfMemory;
+            defer _ = self.frame_type_args_stack.pop();
 
             const saved_func_idx = self.current_func_idx;
             const result_chan = try self.execFunction(call_meta.func_index, args);
@@ -3527,17 +4124,18 @@ pub const Engine = struct {
         }
     }
 
-    /// 哈希参数字节为 u64（FNV-1a 变体）
-    /// 仅用于标量参数（isScalarChanType 已在 IRBuilder 中保证参数为标量）
+    /// 哈希参数为 u64（FNV-1a 变体）
+    /// 直接哈希通道字节（标量 + nullable<标量>，ref_chan 已被 isMemoizableChanType 排除）
     fn hashArgs(self: *Engine, args: []const u16) u64 {
         var h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
         for (args) |arg_chan| {
-            const w = self.runtime.elemWidth(arg_chan);
+            const meta = self.ir.channels.get(arg_chan);
+            const w = meta.elem_width;
             if (w == 0) continue;
             const src = self.runtime.rawPtr(arg_chan);
             for (src[0..w]) |b| {
                 h ^= b;
-                h *%= 0x100000001b3; // FNV-1a prime
+                h *%= 0x100000001b3;
             }
         }
         return h;

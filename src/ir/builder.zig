@@ -40,6 +40,19 @@ pub const LoopMeta = meta_mod.LoopMeta;
 pub const ClosureMeta = meta_mod.ClosureMeta;
 pub const LoopKind = meta_mod.LoopKind;
 pub const HaltKind = meta_mod.HaltKind;
+pub const TypeMetadata = meta_mod.TypeMetadata;
+pub const TypeMetadataTable = meta_mod.TypeMetadataTable;
+pub const TypeKind = meta_mod.TypeKind;
+pub const TypeStructure = meta_mod.TypeStructure;
+pub const LayoutInfo = meta_mod.LayoutInfo;
+pub const TraitImplInfo = meta_mod.TraitImplInfo;
+pub const FieldMeta = meta_mod.FieldMeta;
+pub const ConstructorMeta = meta_mod.ConstructorMeta;
+pub const TypeParamMeta = meta_mod.TypeParamMeta;
+pub const MethodMeta = meta_mod.MethodMeta;
+pub const FuncSigMeta = meta_mod.FuncSigMeta;
+pub const TraitMeta = meta_mod.TraitMeta;
+pub const AssociatedTypeMeta = meta_mod.AssociatedTypeMeta;
 pub const ChanType = channel_mod.ChanType;
 pub const ChannelSpace = channel_mod.ChannelSpace;
 pub const GlueIR = ir_mod.GlueIR;
@@ -223,6 +236,10 @@ pub const IRBuilder = struct {
     current_func_name: ?[]const u8 = null,
     /// 当前函数的参数类型注解（用于 GADT 类型推断）
     current_func_param_types: ?[]const ast.Param = null,
+    /// 当前函数的类型参数（用于 typeof(T) 哨兵发射）
+    current_func_type_params: ?[]const ast.TypeParam = null,
+    /// 当前 trait default 方法中的 Self 类型名（用于 typeof(Self) 解析）
+    current_self_type_name: ?[]const u8 = null,
     /// 当前模式绑定的类型提示（从构造器字段类型继承）
     pattern_type_hint: ?*ast.TypeNode = null,
     /// lambda 计数器（生成匿名函数名 __lambda_N）
@@ -242,6 +259,14 @@ pub const IRBuilder = struct {
     memo_slot_counter: u16 = 1,
     /// 函数名 → memo_slot 映射（纯函数首次调用分配，后续相同函数复用同一 slot）
     func_memo_slots: std.StringHashMapUnmanaged(u16) = .empty,
+    /// TypeMetadata 条目收集（typeof 反射机制）：1-indexed，type_id = index + 1
+    /// 在 registerTypeDecl 中收集，build() 完成时转交给 GlueIR.type_metadata_table
+    type_metadata_entries: std.ArrayList(TypeMetadata) = .empty,
+    /// 类型名 → type_id 映射（1-indexed，0 = 未找到/泛型参数）
+    /// typeof 编译时查找：具体类型返回 type_id，泛型参数返回 0（运行时查表）
+    type_name_to_id: std.StringHashMapUnmanaged(u16) = .empty,
+    /// Alias 类型名 → target 类型名（resolveTypeMetadataRefs 使用，处理递归）
+    pending_alias_targets: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     /// 初始化构建器
     pub fn init(allocator: std.mem.Allocator) !IRBuilder {
@@ -278,7 +303,112 @@ pub const IRBuilder = struct {
         };
         // meta_index=0 保留为"无元数据"占位
         try builder.scalar_metas.append(arena.allocator(), .{ .kind = .unit });
+        // 注册 TypeInfo 反射类型的 field_id（0-indexed，无 __tag）
+        try builder.registerTypeInfoFields();
         return builder;
+    }
+
+    /// 注册 TypeInfo 类型的 field_id 映射（反射机制）
+    ///
+    /// TypeInfo 是 builtin typeof 的返回类型，包含 7 个顶层字段。
+    /// 字段顺序与 meta.TypeMetadata 字段定义保持一致（0-indexed）。
+    /// 工作原理：info.name → record_get(info, field_id=0)
+    fn registerTypeInfoFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{
+            "name",          // 0
+            "module",        // 1
+            "kind",          // 2
+            "structure",     // 3
+            "layout",        // 4
+            "impls",         // 5
+            "type_params",   // 6
+        };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("TypeInfo", fname, @intCast(idx));
+        }
+        // 注册子结构 field_id
+        try self.registerLayoutInfoFields();
+        try self.registerTraitImplInfoFields();
+        // 注册反射辅助类型的 field_id（嵌套 RecordValue 使用）
+        try self.registerFieldMetaFields();
+        try self.registerConstructorMetaFields();
+        try self.registerTypeParamMetaFields();
+        try self.registerMethodMetaFields();
+        try self.registerFuncSigMetaFields();
+        try self.registerTraitMetaFields();
+        try self.registerAssociatedTypeMetaFields();
+    }
+
+    /// LayoutInfo 字段：(size, alignment)
+    fn registerLayoutInfoFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "size", "alignment" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("LayoutInfo", fname, @intCast(idx));
+        }
+    }
+
+    /// TraitImplInfo 字段：(parent_traits, implemented_traits, methods, associated_types)
+    fn registerTraitImplInfoFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "parent_traits", "implemented_traits", "methods", "associated_types" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("TraitImplInfo", fname, @intCast(idx));
+        }
+    }
+
+    /// FieldMeta 字段：(name, type_name, is_nullable, index)
+    fn registerFieldMetaFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "name", "type_name", "is_nullable", "index" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("FieldMeta", fname, @intCast(idx));
+        }
+    }
+
+    /// ConstructorMeta 字段：(name, fields, is_unit, index)
+    fn registerConstructorMetaFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "name", "fields", "is_unit", "index" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("ConstructorMeta", fname, @intCast(idx));
+        }
+    }
+
+    /// TypeParamMeta 字段：(name, constraints, is_specialized, specialization)
+    fn registerTypeParamMetaFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "name", "constraints", "is_specialized", "specialization" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("TypeParamMeta", fname, @intCast(idx));
+        }
+    }
+
+    /// MethodMeta 字段：(name, signature, is_override, is_delegate, delegate_trait, is_async)
+    fn registerMethodMetaFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "name", "signature", "is_override", "is_delegate", "delegate_trait", "is_async" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("MethodMeta", fname, @intCast(idx));
+        }
+    }
+
+    /// FuncSigMeta 字段：(param_types, return_type, is_async)
+    fn registerFuncSigMetaFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "param_types", "return_type", "is_async" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("FuncSigMeta", fname, @intCast(idx));
+        }
+    }
+
+    /// TraitMeta 字段：(name, module, type_params, parent_traits, associated_types, method_names)
+    fn registerTraitMetaFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "name", "module", "type_params", "parent_traits", "associated_types", "method_names" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("TraitMeta", fname, @intCast(idx));
+        }
+    }
+
+    /// AssociatedTypeMeta 字段：(name, is_specified, default_type)
+    fn registerAssociatedTypeMetaFields(self: *IRBuilder) !void {
+        const fields = [_][]const u8{ "name", "is_specified", "default_type" };
+        for (fields, 0..) |fname, idx| {
+            self.registerFieldId("AssociatedTypeMeta", fname, @intCast(idx));
+        }
     }
     /// 注入 sema 输出契约（驱动式接入）。必须在 build() 之前调用。
     /// 设置后，inferChanTypeFromExpr 会优先从 SemaResult.expr_types 查询表达式类型，
@@ -312,6 +442,8 @@ pub const IRBuilder = struct {
         self.gadt_binding_stack.deinit(self.allocator);
         self.pre_declared_lambda_names.deinit(self.allocator);
         if (self.arena_owned) {
+            // type_metadata_entries/type_name_to_id/pending_alias_targets 用 arena 分配
+            // 由 arena.deinit() 统一释放，无需单独 deinit
             self.arena.deinit();
             self.allocator.destroy(self.arena);
             self.arena_owned = false;
@@ -324,6 +456,10 @@ pub const IRBuilder = struct {
 
         // 全局作用域（scope_stack[0]）：顶层 val/var 在此注册，所有函数可见
         try self.pushScope();
+
+        // 反射：注册内建类型（i32/str/bool/char/f64 等）到 TypeMetadataTable
+        // 使 typeof(i32) 等返回 Primitive kind + 正确 name/layout，而非占位 "?"
+        try self.registerBuiltinTypeMetadata(arena_alloc);
 
         // 第一遍：注册所有函数名 + 预分配 Function 占位条目
         // 同时注册 type_decl（类型+构造器）和 trait_decl
@@ -470,8 +606,19 @@ pub const IRBuilder = struct {
         // 释放全局作用域
         self.popScope();
 
+        // 反射：解析所有 TypeMetadata 的 inner/target 引用（处理递归类型）
+        self.resolveTypeMetadataRefs();
+        // 反射：计算所有 TypeMetadata 的 size/alignment（类型布局 pass）
+        self.computeTypeLayout();
+
         // 组装 IR（arena 所有权转交给 GlueIR）
         self.arena_owned = false;
+        // 反射：构建 TypeMetadataTable（entries 由 arena 拥有，name_to_id 用 backing 分配）
+        var type_metadata_table = TypeMetadataTable{
+            .entries = try self.type_metadata_entries.toOwnedSlice(arena_alloc),
+            .name_to_id = std.StringHashMap(u16).init(self.allocator),
+        };
+        try type_metadata_table.initNameMap(self.allocator);
         return GlueIR{
             .nodes = try self.nodes.toOwnedSlice(arena_alloc),
             .scalar_metas = try self.scalar_metas.toOwnedSlice(arena_alloc),
@@ -491,6 +638,7 @@ pub const IRBuilder = struct {
             .init_index = init_idx,
             .arena = self.arena,
             .backing = self.allocator,
+            .type_metadata_table = type_metadata_table,
         };
     }
 
@@ -787,6 +935,9 @@ pub const IRBuilder = struct {
                 }
             }
         }
+
+        // 收集 TypeMetadata（typeof 反射机制）：在类型注册完成后调用
+        try self.collectTypeMetadata(td, arena_alloc);
     }
 
     /// 注册 trait_decl：记录 trait 名和方法签名
@@ -805,6 +956,381 @@ pub const IRBuilder = struct {
             .name = trd.name,
             .methods = methods,
         });
+    }
+
+    /// 注册内建类型到 TypeMetadataTable（使 typeof(i32) 等返回正确 TypeInfo）
+    ///
+    /// 内建类型不通过 AST type_decl 声明，但 typeof(i32) / typeof(str) 等需要返回
+    /// Primitive kind + 正确 name + 正确 layout 的 TypeInfo。
+    /// 在 build() 开头调用，先于用户类型注册。
+    fn registerBuiltinTypeMetadata(self: *IRBuilder, arena_alloc: std.mem.Allocator) !void {
+        const Builtin = struct { n: []const u8 };
+        const builtins = [_]Builtin{
+            .{ .n = "bool" },    .{ .n = "char" },
+            .{ .n = "i8" },      .{ .n = "u8" },
+            .{ .n = "i16" },     .{ .n = "u16" },
+            .{ .n = "i32" },     .{ .n = "u32" },
+            .{ .n = "i64" },     .{ .n = "u64" },
+            .{ .n = "i128" },    .{ .n = "u128" },
+            .{ .n = "f16" },     .{ .n = "f32" },
+            .{ .n = "f64" },     .{ .n = "f128" },
+            .{ .n = "str" },     .{ .n = "unit" },
+        };
+        for (builtins) |b| {
+            // layout 由 primitiveLayout 计算（保证与字段布局一致）
+            const layout = primitiveLayout(b.n) orelse LayoutInfo{ .size = 0, .alignment = 1 };
+            const entry = TypeMetadata{
+                .name = b.n,
+                .module = "",
+                .kind = .primitive,
+                .structure = .primitive,
+                .layout = layout,
+                .impls = .{
+                    .parent_traits = &.{},
+                    .implemented_traits = &.{},
+                    .methods = &.{},
+                    .associated_types = &.{},
+                },
+                .type_params = &.{},
+            };
+            try self.type_metadata_entries.append(arena_alloc, entry);
+            const type_id: u16 = @intCast(self.type_metadata_entries.items.len); // 1-indexed
+            try self.type_name_to_id.put(arena_alloc, b.n, type_id);
+        }
+    }
+
+    /// 收集类型元数据（typeof 反射机制）
+    ///
+    /// 在 registerTypeDecl 中调用，为每个类型创建 TypeMetadata 条目。
+    /// inner/target 的 type_id 引用在 build() 结束时通过 resolveTypeMetadataRefs 解析。
+    /// 这样可以处理递归类型（如 type List<T> = | Nil | Cons(T, List<T>)）。
+    fn collectTypeMetadata(self: *IRBuilder, td: anytype, arena_alloc: std.mem.Allocator) BuildError!void {
+        // 判断 TypeKind 并构造 TypeStructure ADT
+        var kind: TypeKind = .unit;
+        var structure: TypeStructure = .unit;
+        var inner_type_name: ?[]const u8 = null;
+        var target_type_name: ?[]const u8 = null;
+
+        switch (td.def) {
+            .adt => |adt| {
+                kind = .adt;
+                // 收集构造器元信息
+                const constructors = try arena_alloc.alloc(ConstructorMeta, adt.constructors.len);
+                for (adt.constructors, 0..) |cdef, ci| {
+                    const ctor_fields = try arena_alloc.alloc(FieldMeta, cdef.fields.len);
+                    for (cdef.fields, 0..) |cf, fi| {
+                        const fname = cf.name orelse try std.fmt.allocPrint(arena_alloc, "_{d}", .{fi});
+                        ctor_fields[fi] = .{
+                            .name = fname,
+                            .type_name = try typeNameFromTypeNode(cf.ty, arena_alloc),
+                            .is_nullable = isNullableTypeNode(cf.ty),
+                            .index = @intCast(fi),
+                        };
+                    }
+                    constructors[ci] = .{
+                        .name = cdef.name,
+                        .fields = ctor_fields,
+                        .is_unit = cdef.fields.len == 0,
+                        .index = @intCast(ci),
+                    };
+                }
+                structure = .{ .adt = constructors };
+            },
+            .record => |r| {
+                kind = .record;
+                const fields = try arena_alloc.alloc(FieldMeta, r.fields.len);
+                for (r.fields, 0..) |f, fi| {
+                    fields[fi] = .{
+                        .name = f.name,
+                        .type_name = try typeNameFromTypeNode(f.ty, arena_alloc),
+                        .is_nullable = isNullableTypeNode(f.ty),
+                        .index = @intCast(fi),
+                    };
+                }
+                structure = .{ .record = fields };
+            },
+            .newtype => |nt| {
+                kind = .newtype;
+                inner_type_name = try typeNameFromTypeNode(nt.inner, arena_alloc);
+                // structure.newtype 是 inner 的 type_id（由 resolveTypeMetadataRefs 填充）
+                // 此处先填 0，后续 resolveTypeMetadataRefs 会查 inner_type_name 设置正确 type_id
+                structure = .{ .newtype = 0 };
+            },
+            .error_newtype => |en| {
+                kind = .newtype;
+                // Error newtype 也作为 newtype 处理
+                // 内部 type_id 由 resolveTypeMetadataRefs 填充（用 error_newtype 自身的 type_id）
+                _ = en;
+                structure = .{ .newtype = 0 };
+            },
+            .alias => |a| {
+                kind = .alias;
+                target_type_name = try typeNameFromTypeNode(a.target, arena_alloc);
+                structure = .{ .alias = 0 }; // 由 resolveTypeMetadataRefs 填充
+            },
+        }
+
+        // alias: 记录到 pending_alias_targets 表，供 resolveTypeMetadataRefs 查询
+        if (target_type_name) |tn| {
+            try self.pending_alias_targets.put(self.arena.allocator(), td.name, tn);
+        }
+        // newtype: 记录 inner type name，供 resolveTypeMetadataRefs 查询
+        if (inner_type_name) |tn| {
+            try self.pending_alias_targets.put(self.arena.allocator(), td.name, tn);
+        }
+
+        // 收集类型参数元信息
+        const type_params = try arena_alloc.alloc(TypeParamMeta, td.type_params.len);
+        for (td.type_params, 0..) |tp, ti| {
+            const constraints = try arena_alloc.alloc([]const u8, tp.bounds.len);
+            for (tp.bounds, 0..) |b, bi| {
+                constraints[bi] = b.trait_name;
+            }
+            type_params[ti] = .{
+                .name = tp.name,
+                .constraints = constraints,
+                .is_specialized = false,
+                .specialization = null,
+            };
+        }
+
+        // 收集方法元信息
+        const methods_meta = try arena_alloc.alloc(MethodMeta, td.methods.len);
+        for (td.methods, 0..) |m, mi| {
+            const param_types = try arena_alloc.alloc([]const u8, m.params.len);
+            for (m.params, 0..) |p, pi| {
+                param_types[pi] = if (p.type_annotation) |tn|
+                    try typeNameFromTypeNode(tn, arena_alloc)
+                else
+                    "unknown";
+            }
+            const return_type = if (m.return_type) |rt|
+                try typeNameFromTypeNode(rt, arena_alloc)
+            else
+                "unit";
+            methods_meta[mi] = .{
+                .name = m.name,
+                .signature = .{
+                    .param_types = param_types,
+                    .return_type = return_type,
+                    .is_async = false,
+                },
+                .is_override = m.is_override,
+                .is_delegate = m.delegate != null,
+                .delegate_trait = if (m.delegate) |d| d.trait_name else null,
+                .is_async = false,
+            };
+        }
+
+        // 构造子结构：layout 初始为 {0, 0}（由 computeTypeLayout 填充）
+        const layout = LayoutInfo{ .size = 0, .alignment = 0 };
+        // 构造子结构：impls（Trait 实现信息）
+        const impls = TraitImplInfo{
+            .parent_traits = &.{},
+            .implemented_traits = &.{},
+            .methods = methods_meta,
+            .associated_types = &.{},
+        };
+
+        const entry = TypeMetadata{
+            .name = td.name,
+            .module = "",
+            .kind = kind,
+            .structure = structure,
+            .layout = layout,
+            .impls = impls,
+            .type_params = type_params,
+        };
+        try self.type_metadata_entries.append(self.arena.allocator(), entry);
+        const type_id: u16 = @intCast(self.type_metadata_entries.items.len); // 1-indexed
+        try self.type_name_to_id.put(self.arena.allocator(), td.name, type_id);
+    }
+
+    /// 解析 TypeMetadata 中 TypeStructure 的 type_id 引用
+    ///
+    /// 在所有类型注册完成后调用，处理递归类型引用。
+    /// 处理：
+    ///   - structure.newtype：Newtype 的 inner type_id（从 pending_alias_targets 取 inner type name）
+    ///   - structure.alias：Alias 的 target type_id
+    /// 未找到的类型保留 type_id = 0（运行时返回 null TypeInfo）。
+    fn resolveTypeMetadataRefs(self: *IRBuilder) void {
+        for (self.type_metadata_entries.items) |*entry| {
+            switch (entry.structure) {
+                .newtype => |*inner_id| {
+                    // 从 pending_alias_targets 查 inner type name
+                    if (self.pending_alias_targets.get(entry.name)) |inner_name| {
+                        if (self.type_name_to_id.get(inner_name)) |tid| {
+                            inner_id.* = tid;
+                        }
+                    }
+                },
+                .alias => |*target_id| {
+                    if (self.pending_alias_targets.get(entry.name)) |target_name| {
+                        if (self.type_name_to_id.get(target_name)) |tid| {
+                            target_id.* = tid;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// 计算所有 TypeMetadata 的 layout.size 和 layout.alignment（类型布局 pass）
+    ///
+    /// 在 resolveTypeMetadataRefs 之后调用，递归计算类型内存布局。
+    /// 处理：
+    ///   - 基础类型：i8→1, i16→2, i32→4, i64→8, i128→16, f16→2, f32→4, f64→8, f128→16
+    ///   - bool→1, char→4, str→16 (ref 指针)
+    ///   - Record：字段对齐 padding + 累加 size
+    ///   - ADT：1 字节 tag + 最大构造器 size（含 padding 对齐到 tag 对齐）
+    ///   - Newtype：inner type 的 size/alignment
+    ///   - Alias：target type 的 size/alignment
+    ///   - 递归类型：使用 ref 指针大小（8 字节，64-bit 系统）
+    ///   - Trait/Func：指针大小（8 字节）
+    fn computeTypeLayout(self: *IRBuilder) void {
+        if (self.type_metadata_entries.items.len == 0) return;
+        // 多次迭代直到收敛（处理递归类型的间接依赖）
+        // 简单策略：迭代 N 次（N = 类型数量），每次处理未计算的类型
+        const n = self.type_metadata_entries.items.len;
+        var iteration: usize = 0;
+        while (iteration < n + 1) : (iteration += 1) {
+            var progress = false;
+            for (self.type_metadata_entries.items) |*entry| {
+                if (entry.layout.size != 0) continue; // 已计算
+                const layout = self.computeLayoutForEntry(entry);
+                if (layout) |l| {
+                    entry.layout = l;
+                    progress = true;
+                }
+            }
+            if (!progress) break;
+        }
+    }
+
+    /// 计算单个类型的布局
+    /// 返回 null 表示依赖未解决（递归类型的间接引用未计算）
+    fn computeLayoutForEntry(self: *IRBuilder, entry: *const TypeMetadata) ?LayoutInfo {
+        switch (entry.structure) {
+            .primitive => {
+                // 基础类型：按名字判断大小
+                const layout = primitiveLayout(entry.name) orelse return null;
+                return .{ .size = layout.size, .alignment = layout.alignment };
+            },
+            .unit => return .{ .size = 0, .alignment = 1 },
+            .record => |fields| {
+                // 记录：累加字段 size，按最大对齐对齐
+                var size: u32 = 0;
+                var align_max: u32 = 1;
+                for (fields) |f| {
+                    const flayout = self.layoutOfTypeName(f.type_name) orelse return null;
+                    // 对齐到字段对齐
+                    size = alignUp(size, flayout.alignment);
+                    size += flayout.size;
+                    if (flayout.alignment > align_max) align_max = flayout.alignment;
+                }
+                // 总 size 对齐到最大对齐
+                size = alignUp(size, align_max);
+                return .{ .size = size, .alignment = align_max };
+            },
+            .adt => |constructors| {
+                // ADT：1 字节 tag + 最大构造器 size
+                var max_variant_size: u32 = 0;
+                var align_max: u32 = 1;
+                for (constructors) |ctor| {
+                    var variant_size: u32 = 0;
+                    var variant_align: u32 = 1;
+                    for (ctor.fields) |f| {
+                        const flayout = self.layoutOfTypeName(f.type_name) orelse return null;
+                        variant_size = alignUp(variant_size, flayout.alignment);
+                        variant_size += flayout.size;
+                        if (flayout.alignment > variant_align) variant_align = flayout.alignment;
+                    }
+                    variant_size = alignUp(variant_size, variant_align);
+                    if (variant_size > max_variant_size) max_variant_size = variant_size;
+                    if (variant_align > align_max) align_max = variant_align;
+                }
+                // 总布局：tag (1B) + padding + variant
+                const tag_size: u32 = 1;
+                const total = alignUp(tag_size, align_max) + max_variant_size;
+                return .{ .size = alignUp(total, align_max), .alignment = @max(align_max, 1) };
+            },
+            .newtype => |inner_id| {
+                // Newtype：inner type 的布局
+                // inner_id == 0：inner 是原始类型（i32/str/bool 等，未注册到 type_name_to_id）
+                // 通过 pending_alias_targets 查 inner type name，再用 primitiveLayout 查布局
+                if (inner_id == 0) {
+                    if (self.pending_alias_targets.get(entry.name)) |inner_name| {
+                        if (primitiveLayout(inner_name)) |pl| {
+                            return .{ .size = pl.size, .alignment = pl.alignment };
+                        }
+                        // inner 是其他用户类型但未解析（如递归类型）→ null 等下一轮
+                        if (self.type_name_to_id.get(inner_name) != null) return null;
+                    }
+                    return .{ .size = 0, .alignment = 1 };
+                }
+                if (inner_id <= self.type_metadata_entries.items.len) {
+                    const inner = &self.type_metadata_entries.items[inner_id - 1];
+                    if (inner.layout.size == 0) return null; // 依赖未计算
+                    return .{ .size = inner.layout.size, .alignment = inner.layout.alignment };
+                }
+                return .{ .size = 0, .alignment = 1 };
+            },
+            .alias => |target_id| {
+                // Alias：target type 的布局
+                if (target_id == 0) {
+                    // 未解析或基础类型别名
+                    if (self.pending_alias_targets.get(entry.name)) |target_name| {
+                        return self.layoutOfTypeName(target_name);
+                    }
+                    return .{ .size = 0, .alignment = 1 };
+                }
+                if (target_id <= self.type_metadata_entries.items.len) {
+                    const target = &self.type_metadata_entries.items[target_id - 1];
+                    if (target.layout.size == 0) return null; // 依赖未计算
+                    return .{ .size = target.layout.size, .alignment = target.layout.alignment };
+                }
+                return .{ .size = 0, .alignment = 1 };
+            },
+            .func, .trait => {
+                // 函数/Trait：指针大小（64-bit 假设 8 字节）
+                return .{ .size = 8, .alignment = 8 };
+            },
+            .nullable => {
+                // Nullable：指针大小（8 字节）
+                return .{ .size = 8, .alignment = 8 };
+            },
+        }
+    }
+
+    /// 按类型名查询布局（递归查 TypeMetadata 或基础类型表）
+    fn layoutOfTypeName(self: *IRBuilder, name: []const u8) ?LayoutInfo {
+        // 基础类型快速路径
+        if (primitiveLayout(name)) |l| return l;
+        // nullable 类型：指针大小（8 字节）
+        if (std.mem.endsWith(u8, name, "?")) {
+            return .{ .size = 8, .alignment = 8 };
+        }
+        // 用户类型：查 type_metadata_entries
+        if (self.type_name_to_id.get(name)) |tid| {
+            if (tid <= self.type_metadata_entries.items.len) {
+                const entry = &self.type_metadata_entries.items[tid - 1];
+                if (entry.layout.size == 0) return null; // 递归类型未计算
+                return .{ .size = entry.layout.size, .alignment = entry.layout.alignment };
+            }
+        }
+        // 未识别：指针大小（可能是构造器引用，递归类型如 List）
+        return .{ .size = 8, .alignment = 8 };
+    }
+    /// build() 中调用：解析引用后计算布局
+
+    /// 查找类型 ID（typeof 编译时使用）
+    ///
+    /// 返回 1-indexed type_id；0 表示未找到（可能是泛型参数 T 或 Self）。
+    /// 对于未找到的情况，IRBuilder 发出 meta_index=0 的 builtin_typeof，
+    /// 引擎运行时通过类型参数上下文查表。
+    fn lookupTypeId(self: *const IRBuilder, type_name: []const u8) u16 {
+        return self.type_name_to_id.get(type_name) orelse 0;
     }
 
     /// 编译 type_decl 的方法体（第二遍）
@@ -828,6 +1354,12 @@ pub const IRBuilder = struct {
         }
 
         // 编译继承的 trait 默认方法体
+        // 注意：trait default 方法体可能引用 typeof(Self)，需设置 current_self_type_name
+        // 使 builder 在解析 typeof(Self) 时能查到 type_id
+        const prev_self_type = self.current_self_type_name;
+        self.current_self_type_name = td.name;
+        defer self.current_self_type_name = prev_self_type;
+
         for (td.implemented_traits) |tb| {
             if (self.trait_table.get(tb.trait_name)) |trait_info| {
                 for (trait_info.methods) |tm| {
@@ -866,18 +1398,23 @@ pub const IRBuilder = struct {
         try self.pushScope();
         defer self.popScope();
 
-        // 设置当前函数上下文（用于 GADT 类型推断）
+        // 设置当前函数上下文（用于 GADT 类型推断 + typeof(T) 哨兵发射）
         const prev_func_name = self.current_func_name;
         const prev_param_types = self.current_func_param_types;
+        const prev_type_params = self.current_func_type_params;
         if (@hasField(@TypeOf(fd), "name")) {
             self.current_func_name = fd.name;
         }
         if (@hasField(@TypeOf(fd), "params")) {
             self.current_func_param_types = fd.params;
         }
+        if (@hasField(@TypeOf(fd), "type_params")) {
+            self.current_func_type_params = fd.type_params;
+        }
         defer {
             self.current_func_name = prev_func_name;
             self.current_func_param_types = prev_param_types;
+            self.current_func_type_params = prev_type_params;
         }
 
         // 分配参数通道
@@ -1035,18 +1572,18 @@ pub const IRBuilder = struct {
             .binary => |b| return self.compileBinary(b.op, b.left, b.right),
             .unary => |u| return self.compileUnary(u.op, u.operand),
             .block => |blk| return self.compileBlock(blk.statements, blk.trailing_expr),
-            .call => |c| return self.compileCall(c.callee, c.arguments),
+            .call => |c| return self.compileCallWithTypeArgs(c.callee, c.arguments, c.type_args),
             .if_expr => |ie| return self.compileIf(ie),
             .propagate => |p| return self.compilePropagate(p.expr),
             .select => |s| return self.compileSelect(s.arms),
             .type_cast => |tc| return self.compileTypeCast(tc),
             .record_literal => |rl| return self.compileRecordLiteral(rl.fields),
             .record_extend => |re| return self.compileRecordExtend(re.base, re.updates),
-            .field_access => |fa| return self.compileFieldAccess(fa.object, fa.field),
+            .field_access => |fa| return self.compileFieldAccess(fa.object, fa.field, expr),
             .index => |idx| return self.compileIndex(idx.object, idx.index),
             .string_interpolation => |si| return self.compileStringInterpolation(si.parts),
             .non_null_assert => |nn| return self.compileNonNullAssert(nn.expr),
-            .safe_access => |sa| return self.compileSafeAccess(sa.object, sa.field),
+            .safe_access => |sa| return self.compileSafeAccess(sa.object, sa.field, expr),
             .method_call => |mc| return self.compileMethodCall(mc.object, mc.method, mc.arguments, false),
             .safe_method_call => |mc| return self.compileMethodCall(mc.object, mc.method, mc.arguments, true),
             .lambda => |lam| return self.compileLambda(lam),
@@ -1519,7 +2056,7 @@ pub const IRBuilder = struct {
     /// 编译字段访问：obj.field
     /// → record_get(obj, field_id) 或 channel_sender/channel_receiver
     /// field_id 通过 field_id_map 查找：先推断 obj 的 type_name，再查映射
-    fn compileFieldAccess(self: *IRBuilder, object: *ast.Expr, field: []const u8) BuildError!u16 {
+    fn compileFieldAccess(self: *IRBuilder, object: *ast.Expr, field: []const u8, field_access_expr: *const ast.Expr) BuildError!u16 {
         // channel 的 sender/receiver 字段特殊处理
         if (std.mem.eql(u8, field, "sender")) {
             const obj_chan = try self.compileExpr(object);
@@ -1547,9 +2084,18 @@ pub const IRBuilder = struct {
             break :blk 0;
         };
         const meta_idx = try self.addFieldIdMeta(field_id);
-        // 尝试从 AST 推断字段类型，无 sema 时的实用方案
-        // 无法推断时默认 i64_chan（保持向后兼容，整数字段最常见）
-        const chan_type = self.inferFieldType(object, field) orelse .i64_chan;
+        // 优先从 sema 查询 field_access 表达式本身的 chan_type
+        // 这能正确处理 ref 对象的 scalar 字段（如 g.v 中 g 是 ref 但 v 是 i32）
+        // 以及 ref 对象的 ref 字段（如 self.inner 中 self 是 ref 且 inner 也是 ref）
+        const sema_ct: ?ChanType = blk: {
+            if (self.sema_result) |sr| {
+                if (sr.getExpr(@intFromPtr(field_access_expr))) |info| {
+                    if (info.chan_type != .null_chan) break :blk info.chan_type;
+                }
+            }
+            break :blk null;
+        };
+        const chan_type: ChanType = sema_ct orelse self.inferFieldType(object, field) orelse .i64_chan;
         const out = try self.allocChannel(chan_type);
         try self.emit(Node.makeUnary(.record_get, out, meta_idx, obj_chan));
         return out;
@@ -1558,6 +2104,13 @@ pub const IRBuilder = struct {
     /// 从 AST 推断字段类型（无 sema 时的简易类型推导）
     /// 通过回溯对象表达式找到 record_literal/record_extend/构造器调用，再查字段值类型
     fn inferFieldType(self: *IRBuilder, object: *const ast.Expr, field: []const u8) ?ChanType {
+        // typeof(TypeName) 返回 TypeInfo，字段类型按字段名推导
+        // 不能进入下面的 .call 分支（ctor_table 无 typeof 条目）
+        if (object.* == .call and object.call.callee.* == .identifier and
+            std.mem.eql(u8, object.call.callee.identifier.name, "typeof"))
+        {
+            return typeInfoFieldType(field);
+        }
         // 如果是 identifier，查找其定义
         const obj_expr = switch (object.*) {
             .identifier => |id| blk: {
@@ -1568,6 +2121,13 @@ pub const IRBuilder = struct {
             },
             else => object,
         } orelse return null;
+
+        // 变量绑定的 typeof 表达式
+        if (obj_expr.* == .call and obj_expr.call.callee.* == .identifier and
+            std.mem.eql(u8, obj_expr.call.callee.identifier.name, "typeof"))
+        {
+            return typeInfoFieldType(field);
+        }
 
         switch (obj_expr.*) {
             .record_literal => |rl| {
@@ -1604,6 +2164,25 @@ pub const IRBuilder = struct {
             },
             else => {},
         }
+        return null;
+    }
+
+    /// TypeInfo 字段名 → 通道类型（用于 typeof(TypeName).field 的字段访问）
+    ///
+    /// 新设计：7 个顶层字段，字段顺序与 IRBuilder.registerTypeInfoFields 和 engine.execBuiltinTypeof 一致：
+    ///   0: name (str) → ref_chan
+    ///   1: module (str) → ref_chan
+    ///   2: kind (TypeKind，str 表示 ADT 构造器名) → ref_chan
+    ///   3: structure (TypeStructure ADT) → ref_chan
+    ///   4: layout (LayoutInfo) → ref_chan
+    ///   5: impls (TraitImplInfo) → ref_chan
+    ///   6: type_params (Array<TypeParamMeta>) → ref_chan
+    /// 所有顶层字段都是引用类型（字符串或嵌套 RecordValue/Array）
+    fn typeInfoFieldType(field: []const u8) ?ChanType {
+        const ref_fields = [_][]const u8{
+            "name", "module", "kind", "structure", "layout", "impls", "type_params",
+        };
+        for (ref_fields) |f| if (std.mem.eql(u8, field, f)) return .ref_chan;
         return null;
     }
 
@@ -1717,6 +2296,63 @@ pub const IRBuilder = struct {
 
     /// 编译函数调用
     fn compileCall(self: *IRBuilder, callee: *ast.Expr, arguments: []*ast.Expr) BuildError!u16 {
+        return try self.compileCallWithTypeArgs(callee, arguments, null);
+    }
+
+    /// typeof 参数解析为 meta_index
+    ///
+    /// 递归处理 propagate 节点（typeof(T?) 形式）：
+    /// - identifier "TypeName" → 查 type_name_to_id / 泛型参数 / Self → type_id 或 0x8000|idx 或 0
+    /// - propagate(inner) → 0x4000 | resolveTypeofMetaIndex(inner)
+    ///
+    /// meta_index 编码（u16）：
+    /// - bit 15 (0x8000): 泛型参数哨兵
+    /// - bit 14 (0x4000): nullable 包装哨兵
+    /// - bit 0-13: type_id 或 param_idx
+    fn resolveTypeofMetaIndex(self: *IRBuilder, arg: *ast.Expr) BuildError!u16 {
+        switch (arg.*) {
+            .propagate => |p| {
+                // typeof(T?) — nullable 包装
+                const inner_meta = try self.resolveTypeofMetaIndex(p.expr);
+                if (inner_meta == 0) return 0; // inner 未识别，整体返回 0
+                const nullable_meta: u16 = 0x4000 | inner_meta;
+                return nullable_meta;
+            },
+            .identifier => |id| {
+                const type_name = id.name;
+                // 1. 具体类型：查 type_name_to_id
+                if (self.type_name_to_id.get(type_name)) |tid| return tid;
+                // 2. Self：在 trait default 方法中
+                if (std.mem.eql(u8, type_name, "Self")) {
+                    if (self.current_self_type_name) |self_name| {
+                        if (self.type_name_to_id.get(self_name)) |tid| return tid;
+                    }
+                    return 0; // Self 未解析
+                }
+                // 3. 泛型参数 T
+                if (self.current_func_type_params) |tps| {
+                    for (tps, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.name, type_name)) {
+                            const sentinel: u16 = @intCast(0x8000 | idx);
+                            return sentinel;
+                        }
+                    }
+                }
+                // 4. 未识别类型
+                return 0;
+            },
+            else => return error.UnsupportedExpr,
+        }
+    }
+
+    /// 编译函数调用，附带显式类型实参（来自 `func[T](args)` 形式）
+    /// type_args_hint != null 时优先使用显式类型实参；否则从参数类型推断
+    fn compileCallWithTypeArgs(
+        self: *IRBuilder,
+        callee: *ast.Expr,
+        arguments: []*ast.Expr,
+        type_args_hint: ?[]*ast.TypeNode,
+    ) BuildError!u16 {
         // 只支持直接函数名调用
         const func_name = switch (callee.*) {
             .identifier => |id| id.name,
@@ -1757,6 +2393,21 @@ pub const IRBuilder = struct {
             const arg_chan = try self.compileExpr(arguments[0]);
             const out = try self.allocChannel(.ref_chan);
             try self.emit(Node.makeUnary(.builtin_type, out, 0, arg_chan));
+            return out;
+        }
+
+        // 内置函数：typeof(TypeName) → 编译期类型反射，返回 TypeInfo RecordValue
+        // 参数是类型名（在值位置传递类型），不是表达式值
+        // meta_index 编码：
+        //   1..N             = 具体类型 type_id（查 TypeMetadataTable）
+        //   0x8000|param_idx = 泛型参数哨兵（运行时查 frame.type_args[param_idx]）
+        //   0x4000|inner_meta = nullable 包装（typeof(T?)，运行时构造 Nullable kind）
+        //   0                 = 未识别（运行时返回占位 TypeInfo）
+        if (std.mem.eql(u8, func_name, "typeof")) {
+            if (arguments.len != 1) return error.UnsupportedExpr;
+            const meta_idx = try self.resolveTypeofMetaIndex(arguments[0]);
+            const out = try self.allocChannel(.ref_chan);
+            try self.emit(Node.makeSink(.builtin_typeof, out, meta_idx));
             return out;
         }
 
@@ -1886,11 +2537,14 @@ pub const IRBuilder = struct {
             try self.channels.allocNullable(ret_meta.inner_type)
         else
             try self.allocChannel(ret_chan_type);
+        // 计算泛型类型实参（type_args）用于 typeof(T) 运行时查表
+        const type_args = try self.inferCallTypeArgs(func_name, arguments, type_args_hint);
         const call_meta_idx = try self.addCallMeta(.{
             .func_index = func_idx,
             .arg_count = @intCast(arguments.len),
             .tail_call = tail_call,
-            .memo_slot = self.tryAssignMemoSlot(func_name, arg_chans, ret_chan_type),
+            .memo_slot = self.tryAssignMemoSlot(func_name, arg_chans, ret_chan_type, ret_meta.inner_type),
+            .type_args = type_args,
         });
 
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
@@ -1907,6 +2561,143 @@ pub const IRBuilder = struct {
         return out;
     }
 
+    /// 推导调用点的泛型类型实参（type_id 列表）
+    ///
+    /// 用于 typeof(T) 在泛型函数内的运行时查表：
+    ///   - 非泛型函数：返回空切片
+    ///   - 显式类型实参：从 type_args_hint 解析类型名 → type_id
+    ///   - 隐式推断：从参数类型注解匹配实参类型，再映射到 type_id
+    ///   - 递归调用：从 GADT 绑定栈继承当前函数的类型绑定
+    ///
+    /// 返回切片由 arena 拥有，与 IR 生命周期一致
+    fn inferCallTypeArgs(
+        self: *IRBuilder,
+        func_name: []const u8,
+        arguments: []*ast.Expr,
+        type_args_hint: ?[]*ast.TypeNode,
+    ) ![]const u16 {
+        const arena_alloc = self.arena.allocator();
+        const info = self.func_generic_info.get(func_name) orelse return &.{};
+        if (info.type_params.len == 0) return &.{};
+
+        // 1. 显式类型实参：直接从 type_args_hint 解析类型名 → type_id
+        if (type_args_hint) |hints| {
+            if (hints.len > 0) {
+                const args = try arena_alloc.alloc(u16, hints.len);
+                for (hints, 0..) |tn, i| {
+                    const name = typeNameFromTypeNodeConst(tn);
+                    args[i] = self.lookupTypeId(name);
+                }
+                return args;
+            }
+        }
+
+        // 2. 隐式推断：构建类型参数名 → type_id 的绑定表
+        //    先从参数类型注解中匹配类型参数名，再用实参的构造器/类型推断 type_id
+        var name_to_typeid = std.StringHashMap(u16).init(self.allocator);
+        defer name_to_typeid.deinit();
+
+        // 递归调用：从 GADT 绑定栈继承当前函数的类型绑定
+        if (self.current_func_name) |cfn| {
+            if (std.mem.eql(u8, cfn, func_name) and self.gadt_binding_stack.items.len > 0) {
+                // 递归调用时，type_args 与当前函数一致——从 current_func_type_params 提取
+                if (self.current_func_type_params) |tps| {
+                    const args = try arena_alloc.alloc(u16, tps.len);
+                    for (tps, 0..) |tp, i| {
+                        // 递归调用：类型实参 = 当前函数的类型参数（发出哨兵）
+                        // 但这里需要 type_id，所以用 lookupTypeId
+                        args[i] = self.lookupTypeId(tp.name);
+                    }
+                    return args;
+                }
+            }
+        }
+
+        // 从参数类型注解匹配类型参数名，并从实参提取 type_id
+        const param_count = @min(info.params.len, arguments.len);
+        for (0..param_count) |i| {
+            const param_type = info.params[i].type_annotation orelse continue;
+            try self.matchTypeParamToTypeId(param_type, arguments[i], &name_to_typeid);
+        }
+
+        // 按函数定义的 type_params 顺序输出 type_id
+        const args = try arena_alloc.alloc(u16, info.type_params.len);
+        for (info.type_params, 0..) |tp, i| {
+            args[i] = name_to_typeid.get(tp.name) orelse 0;
+        }
+        return args;
+    }
+
+    /// 从参数类型注解匹配类型参数名，并从实参提取对应的 type_id
+    /// 例如：参数注解 T，实参 typeof(Point) → name_to_typeid["T"] = Point 的 type_id
+    fn matchTypeParamToTypeId(
+        self: *IRBuilder,
+        param_type: *ast.TypeNode,
+        arg_expr: *const ast.Expr,
+        name_to_typeid: *std.StringHashMap(u16),
+    ) !void {
+        // 实参解引用：若实参是变量绑定，则替换为其绑定的表达式
+        const resolved_expr: *const ast.Expr = blk: {
+            if (arg_expr.* == .identifier) {
+                if (self.lookupVar(arg_expr.identifier.name)) |binding| {
+                    if (binding.ast_expr) |var_expr| break :blk var_expr;
+                }
+            }
+            break :blk arg_expr;
+        };
+        switch (param_type.*) {
+            .named => |n| {
+                if (!self.isTypeParamName(n.name)) return;
+                if (name_to_typeid.contains(n.name)) return;
+                // 从实参推断类型名
+                if (self.inferTypeNameFromExpr(resolved_expr)) |type_name| {
+                    const tid = self.lookupTypeId(type_name);
+                    if (tid != 0) {
+                        try name_to_typeid.put(n.name, tid);
+                    }
+                }
+            },
+            .generic => |g| {
+                // 泛型类型如 Box<T>：从构造器调用参数递归推断 T 的具体类型
+                // 例如：参数类型 Box<T>，实参 Box(Point(1, 2))
+                // → 查 Box 的字段定义（value: T），用第 0 个实参 Point(1, 2) 递归匹配 T
+                if (resolved_expr.* == .call) {
+                    if (resolved_expr.call.callee.* == .identifier) {
+                        const ctor_name = resolved_expr.call.callee.identifier.name;
+                        if (self.ctor_table.get(ctor_name)) |ctor| {
+                            // 1. 优先：GADT 构造器，从 return_type 显式提取具体类型
+                            if (ctor.return_type) |rt| {
+                                if (rt.* == .generic and rt.generic.args.len > 0) {
+                                    for (g.args, 0..) |param_arg, idx| {
+                                        if (param_arg.* != .named) continue;
+                                        if (!self.isTypeParamName(param_arg.named.name)) continue;
+                                        if (idx >= rt.generic.args.len) continue;
+                                        const concrete_name = typeNameFromTypeNodeConst(rt.generic.args[idx]);
+                                        const tid = self.lookupTypeId(concrete_name);
+                                        if (tid != 0) {
+                                            try name_to_typeid.put(param_arg.named.name, tid);
+                                        }
+                                    }
+                                }
+                            }
+                            // 2. 通用：递归匹配构造器字段类型与构造器实参
+                            //    Box<T> 的字段 value: T，实参 arg → 递归匹配 T 与 arg
+                            const ctor_args = resolved_expr.call.arguments;
+                            for (ctor.fields, 0..) |cf, fi| {
+                                if (cf.type_node) |ftn| {
+                                    if (fi >= ctor_args.len) break;
+                                    try self.matchTypeParamToTypeId(ftn, ctor_args[fi], name_to_typeid);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            .nullable => |nb| try self.matchTypeParamToTypeId(nb.inner, resolved_expr, name_to_typeid),
+            else => {},
+        }
+    }
+
     /// 判断通道类型是否为标量（无堆指针，可安全作为 memo key/val）
     /// 标量：整数、浮点、布尔、字符。排除 ref/nullable/null/unit（后者无信息量或含堆指针）
     fn isScalarChanType(ct: ChanType) bool {
@@ -1919,29 +2710,48 @@ pub const IRBuilder = struct {
         };
     }
 
+    /// 可 memoize 的通道类型：标量 + nullable_chan
+    /// 排除 ref_chan（指针哈希命中率低，deepCopy 返回值开销巨大）
+    /// 排除 unit_chan/null_chan（无数据）和 mask_chan（内部状态）
+    /// nullable_chan 仅当 inner_type 为标量时才有效（Engine 层处理）
+    fn isMemoizableChanType(ct: ChanType) bool {
+        return switch (ct) {
+            .i8_chan, .i16_chan, .i32_chan, .i64_chan, .i128_chan,
+            .u8_chan, .u16_chan, .u32_chan, .u64_chan, .u128_chan,
+            .f16_chan, .f32_chan, .f64_chan, .f128_chan,
+            .bool_chan, .char_chan,
+            .nullable_chan => true,
+            else => false,
+        };
+    }
+
     /// 尝试为纯函数分配 memo_slot。
     /// 条件：purity_db 可用 + 函数为 pure + 所有实参通道为标量 + 返回类型为标量。
     /// 同一函数名复用同一 slot（per-function memo，非 per-call-site）。
     /// 返回 0 表示不可 memoize，>0 表示 slot 索引。
-    fn tryAssignMemoSlot(self: *IRBuilder, func_name: []const u8, arg_chans: []const u16, ret_chan_type: ChanType) u16 {
+    fn tryAssignMemoSlot(self: *IRBuilder, func_name: []const u8, arg_chans: []const u16, ret_chan_type: ChanType, ret_inner_type: ChanType) u16 {
         const pdb = self.purity_db orelse return 0;
         if (!pdb.isPure(func_name)) return 0;
-        // 返回类型必须为标量
-        if (!isScalarChanType(ret_chan_type)) return 0;
-        // 所有实参通道必须为标量
+        // 仅对递归函数启用 memoization
+        // 非递归纯函数的参数通常每次不同，哈希开销 > 收益
+        if (!pdb.isRecursive(func_name)) return 0;
+        // 返回类型必须为可 memoize 类型（标量/nullable<标量>）
+        if (!isMemoizableChanType(ret_chan_type)) return 0;
+        // nullable 返回的 inner_type 必须为标量（排除 nullable<ref>）
+        if (ret_chan_type == .nullable_chan and !isScalarChanType(ret_inner_type)) return 0;
+        // 所有实参通道必须为可 memoize 类型
         for (arg_chans) |ch| {
-            const arg_type = self.channels.get(ch).chan_type;
-            // nullable 参数可能是 null 或标量，跳过（保守策略）
-            if (!isScalarChanType(arg_type)) return 0;
+            const meta = self.channels.get(ch);
+            if (!isMemoizableChanType(meta.chan_type)) return 0;
+            // nullable 的 inner_type 必须为标量（排除 nullable<ref>）
+            if (meta.chan_type == .nullable_chan and !isScalarChanType(meta.inner_type)) return 0;
         }
         // per-function memo_slot：同函数名复用同一 slot
         if (self.func_memo_slots.get(func_name)) |slot| return slot;
         const slot = self.memo_slot_counter;
         self.memo_slot_counter += 1;
-        // key 使用 arena 分配（与 IR 同生命周期）
-        const arena_alloc = self.arena.allocator();
-        const key = arena_alloc.dupe(u8, func_name) catch return 0;
-        self.func_memo_slots.put(arena_alloc, key, slot) catch return 0;
+        // hashmap 内部存储用 self.allocator（与 deinit 一致）
+        self.func_memo_slots.put(self.allocator, func_name, slot) catch return 0;
         return slot;
     }
 
@@ -3233,7 +4043,7 @@ pub const IRBuilder = struct {
                     .field_access => |fa| {
                         // obj.field op= value → record_get + op + record_set
                         const obj_chan = try self.compileExpr(fa.object);
-                        const old_val_chan = try self.compileFieldAccess(fa.object, fa.field);
+                        const old_val_chan = try self.compileFieldAccess(fa.object, fa.field, ca.target);
                         const bin_op: ast.BinaryOp = switch (ca.op) {
                             .add_assign => .add,
                             .sub_assign => .sub,
@@ -4686,9 +5496,25 @@ pub const IRBuilder = struct {
     }
 
     /// 编译 safe_access (obj?.field)：null 时返回 null，否则访问字段
-    fn compileSafeAccess(self: *IRBuilder, object: *const ast.Expr, field: []const u8) BuildError!u16 {
+    fn compileSafeAccess(self: *IRBuilder, object: *const ast.Expr, field: []const u8, safe_access_expr: *const ast.Expr) BuildError!u16 {
         const obj_chan = try self.compileExpr(object);
         const obj_meta = self.channels.get(obj_chan);
+
+        // 从 sema 查询 safe_access 表达式的字段类型
+        // safe_access 的 chan_type 是 nullable_chan，inner_type 是字段的实际类型
+        const sema_field_ct: ?ChanType = blk: {
+            if (self.sema_result) |sr| {
+                if (sr.getExpr(@intFromPtr(safe_access_expr))) |info| {
+                    if (info.chan_type == .nullable_chan and info.inner_type != .null_chan) {
+                        break :blk info.inner_type;
+                    }
+                    if (info.chan_type != .null_chan and info.chan_type != .nullable_chan) {
+                        break :blk info.chan_type;
+                    }
+                }
+            }
+            break :blk null;
+        };
 
         // null_literal：直接返回 null_chan（结果确定为 null）
         if (obj_meta.chan_type == .null_chan) {
@@ -4708,7 +5534,7 @@ pub const IRBuilder = struct {
 
         // 如果不是 nullable（例如基本类型），直接做字段访问
         if (obj_meta.chan_type != .nullable_chan and obj_meta.chan_type != .ref_chan and obj_meta.chan_type != .null_chan) {
-            return self.compileFieldAccessOnChan(obj_chan, field, object);
+            return self.compileFieldAccessOnChan(obj_chan, field, object, sema_field_ct);
         }
 
         // 检查是否为 null
@@ -4721,7 +5547,7 @@ pub const IRBuilder = struct {
         try self.emit(Node.makeUnary(.nullable_unwrap, unwrapped_chan, 0, nullable_chan));
 
         // 在 unwrapped 上做字段访问
-        const field_chan = self.compileFieldAccessOnChan(unwrapped_chan, field, object);
+        const field_chan = self.compileFieldAccessOnChan(unwrapped_chan, field, object, sema_field_ct);
         const field_meta = self.channels.get(field_chan);
         const field_ct = field_meta.chan_type;
 
@@ -4752,7 +5578,7 @@ pub const IRBuilder = struct {
     }
 
     /// 在已有通道上编译字段访问（复用 record_get 逻辑）
-    fn compileFieldAccessOnChan(self: *IRBuilder, obj_chan: u16, field: []const u8, object: *const ast.Expr) u16 {
+    fn compileFieldAccessOnChan(self: *IRBuilder, obj_chan: u16, field: []const u8, object: *const ast.Expr, sema_chan_type: ?ChanType) u16 {
         // 解析 field_id（与 compileFieldAccess 相同逻辑）
         const field_id: u16 = blk: {
             if (std.mem.eql(u8, field, "__tag")) break :blk 0;
@@ -4763,7 +5589,8 @@ pub const IRBuilder = struct {
             break :blk 0;
         };
         const meta_idx = self.addFieldIdMeta(field_id) catch return obj_chan;
-        const chan_type = self.inferFieldType(object, field) orelse .i64_chan;
+        // 优先使用调用方传入的 sema chan_type（来自 field_access 或 safe_access 的 inner_type）
+        const chan_type: ChanType = sema_chan_type orelse self.inferFieldType(object, field) orelse .i64_chan;
         const out = self.allocChannel(chan_type) catch return obj_chan;
         self.emit(Node.makeUnary(.record_get, out, meta_idx, obj_chan)) catch return obj_chan;
         return out;
@@ -4772,9 +5599,22 @@ pub const IRBuilder = struct {
     /// 从表达式推断类型名（用于用户自定义方法调用 obj.method()）
     /// 仅支持构造器调用和标识符引用构造器的场景
     fn inferTypeNameFromExpr(self: *IRBuilder, expr: *const ast.Expr) ?[]const u8 {
+        // 优先接入 sema：若 sema_result 记录了表达式的 type_name（adt/generic），
+        // 直接返回。这覆盖了 method_call 返回值、self.field 等场景。
+        if (self.sema_result) |sr| {
+            if (sr.getExpr(@intFromPtr(expr))) |info| {
+                if (info.type_name) |tn| {
+                    return tn;
+                }
+            }
+        }
         switch (expr.*) {
             .call => |c| {
                 if (c.callee.* == .identifier) {
+                    // typeof(TypeName) 返回 TypeInfo RecordValue
+                    if (std.mem.eql(u8, c.callee.identifier.name, "typeof")) {
+                        return "TypeInfo";
+                    }
                     if (self.ctor_table.get(c.callee.identifier.name)) |ctor| {
                         return ctor.type_name;
                     }
@@ -4799,6 +5639,15 @@ pub const IRBuilder = struct {
                 return null;
             },
             .field_access => |fa| {
+                // 情况 0：base 是 TypeInfo，反射子结构字段访问
+                // info.layout → LayoutInfo，info.impls → TraitImplInfo
+                // structure 字段类型名因 kind 而异（Adt/Record/Newtype/...），无法静态确定
+                if (self.inferTypeNameFromExpr(fa.object)) |base_type| {
+                    if (std.mem.eql(u8, base_type, "TypeInfo")) {
+                        if (std.mem.eql(u8, fa.field, "layout")) return "LayoutInfo";
+                        if (std.mem.eql(u8, fa.field, "impls")) return "TraitImplInfo";
+                    }
+                }
                 // 情况 1：base 是命名类型，从构造器字段查字段类型
                 if (self.inferTypeNameFromExpr(fa.object)) |base_type| {
                     if (self.type_table.get(base_type)) |ti| {
@@ -5816,11 +6665,11 @@ pub const IRBuilder = struct {
                     }
                     // 非 async 函数：包装为 async lambda 后 spawn
                     // 简化：直接调用（同步执行）
-                    return try self.compileCall(c.callee, c.arguments);
+                    return try self.compileCallWithTypeArgs(c.callee, c.arguments, c.type_args);
                 }
 
                 // 未知函数：尝试构造器或内置
-                return try self.compileCall(c.callee, c.arguments);
+                return try self.compileCallWithTypeArgs(c.callee, c.arguments, c.type_args);
             },
             .lambda => |lam| {
                 // 编译 lambda 为 async 闭包，然后 spawn
@@ -6236,12 +7085,106 @@ fn throwOkChanType(type_node: ?*ast.TypeNode) ?ChanType {
     }
 }
 
+/// 简化版：从 TypeNode 提取类型名（不分配，用于快速查表）
+/// 复杂类型（generic/nullable/function/record/array）返回 "?"
+fn typeNameFromTypeNodeConst(type_node: *const ast.TypeNode) []const u8 {
+    return switch (type_node.*) {
+        .named => |n| n.name,
+        .self_type => "Self",
+        else => "?",
+    };
+}
+
 /// 判断类型节点是否为字符串类型（str 或 str?）
 fn isStringTypeNode(type_node: *const ast.TypeNode) bool {
     return switch (type_node.*) {
         .named => |n| std.mem.eql(u8, n.name, "str"),
         .nullable => |nb| isStringTypeNode(nb.inner),
         else => false,
+    };
+}
+
+/// 基础类型布局查询
+/// 返回 null 表示不是基础类型（交由 layoutOfTypeName 处理用户类型）
+/// 返回 meta.LayoutInfo（与 TypeMetadata.layout 同类型）
+fn primitiveLayout(name: []const u8) ?LayoutInfo {
+    const Entry = struct { n: []const u8, s: u32, a: u32 };
+    const table = [_]Entry{
+        .{ .n = "bool", .s = 1, .a = 1 },
+        .{ .n = "char", .s = 4, .a = 4 },
+        .{ .n = "i8", .s = 1, .a = 1 },
+        .{ .n = "u8", .s = 1, .a = 1 },
+        .{ .n = "i16", .s = 2, .a = 2 },
+        .{ .n = "u16", .s = 2, .a = 2 },
+        .{ .n = "i32", .s = 4, .a = 4 },
+        .{ .n = "u32", .s = 4, .a = 4 },
+        .{ .n = "i64", .s = 8, .a = 8 },
+        .{ .n = "u64", .s = 8, .a = 8 },
+        .{ .n = "i128", .s = 16, .a = 16 },
+        .{ .n = "u128", .s = 16, .a = 16 },
+        .{ .n = "f16", .s = 2, .a = 2 },
+        .{ .n = "f32", .s = 4, .a = 4 },
+        .{ .n = "f64", .s = 8, .a = 8 },
+        .{ .n = "f128", .s = 16, .a = 16 },
+        .{ .n = "str", .s = 16, .a = 8 }, // Str 对象指针 + 长度
+        .{ .n = "unit", .s = 0, .a = 1 },
+    };
+    for (table) |e| {
+        if (std.mem.eql(u8, e.n, name)) {
+            return .{ .size = e.s, .alignment = e.a };
+        }
+    }
+    return null;
+}
+
+/// 对齐到指定对齐值
+fn alignUp(offset: u32, alignment: u32) u32 {
+    if (alignment <= 1) return offset;
+    const mask = alignment - 1;
+    return (offset + mask) & ~mask;
+}
+
+/// 判断类型节点是否为 nullable 类型（T?）
+fn isNullableTypeNode(type_node: *const ast.TypeNode) bool {
+    return switch (type_node.*) {
+        .nullable => true,
+        else => false,
+    };
+}
+
+/// 从 TypeNode 提取类型名字符串（用于 TypeMetadata）
+///
+/// 分配在 arena_alloc 上，生命周期与 IRBuilder 一致。
+/// 处理所有 TypeNode 变体：named、self_type、generic、nullable、function、record、array、kind_annotated。
+fn typeNameFromTypeNode(
+    type_node: *const ast.TypeNode,
+    arena_alloc: std.mem.Allocator,
+) ![]const u8 {
+    return switch (type_node.*) {
+        .named => |n| n.name,
+        .self_type => "Self",
+        .generic => |g| blk: {
+            // 构造 "Name<arg1, arg2, ...>" 形式的字符串
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(arena_alloc);
+            try buf.appendSlice(arena_alloc, g.name);
+            try buf.append(arena_alloc, '<');
+            for (g.args, 0..) |arg, i| {
+                if (i > 0) try buf.appendSlice(arena_alloc, ", ");
+                const arg_name = try typeNameFromTypeNode(arg, arena_alloc);
+                try buf.appendSlice(arena_alloc, arg_name);
+            }
+            try buf.append(arena_alloc, '>');
+            break :blk try buf.toOwnedSlice(arena_alloc);
+        },
+        .nullable => |nb| blk: {
+            const inner_name = try typeNameFromTypeNode(nb.inner, arena_alloc);
+            break :blk try std.fmt.allocPrint(arena_alloc, "{s}?", .{inner_name});
+        },
+        .function => "fn",
+        .record => "Record",
+        .array => "Array",
+        .kind_annotated => |ka| try typeNameFromTypeNode(ka.inner, arena_alloc),
     };
 }
 

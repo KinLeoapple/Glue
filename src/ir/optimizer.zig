@@ -323,7 +323,7 @@ fn hasSideEffect(op: NodeOp) bool {
         .builtin_scan, .builtin_scanln,
         .builtin_ok, .builtin_error, .builtin_eq, .builtin_str,
         .builtin_ref_eq,
-        .builtin_type, .builtin_panic,
+        .builtin_type, .builtin_panic, .builtin_typeof,
         .newtype_wrap, .newtype_unwrap,
         .scalar_loop,
         // route_dispatch 执行 body 子图（match/if/select 分支体），
