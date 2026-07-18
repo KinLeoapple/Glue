@@ -1,7 +1,37 @@
-// Benchmark 2: 变量查找密集(多层作用域 + 多局部变量)
-// 目标:量 environment.get 沿父链 StringHashMap 查找的成本。
-// 词法地址解析(De Bruijn)应在此负载上收益最大。
-// 内层循环大量引用外层与本层变量,制造深查找链。
+// Benchmark 2: 变量查找密集（强化版）
+// 目标：压测多变量跨作用域查找、深嵌套作用域
+// 强化：5000→10000 外层，1000→2000 内层，变量 4→8 个，嵌套 1→3 层
+
+fun computeLevel3(seed: i64, outer_a: i64, outer_b: i64, outer_c: i64): i64 {
+    val a: i64 = seed + 1
+    val b: i64 = seed + 2
+    val c: i64 = seed + 3
+    val d: i64 = seed + 4
+    val e: i64 = seed + 5
+    val f: i64 = seed + 6
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < 200 {
+        // 引用 8 个本层 + 3 个外层变量
+        val t: i64 = (a + b + c + d + e + f + outer_a + outer_b + outer_c + i) % 1024
+        acc = (acc + t) % 1048576
+        i = i + 1
+    }
+    acc
+}
+
+fun computeLevel2(seed: i64, outer_a: i64, outer_b: i64): i64 {
+    val a: i64 = seed + 10
+    val b: i64 = seed + 20
+    val c: i64 = seed + 30
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < 200 {
+        acc = (acc + computeLevel3(seed + i, a, b, c) + outer_a + outer_b) % 1073741824
+        i = i + 1
+    }
+    acc
+}
 
 fun compute(seed: i64): i64 {
     val a: i64 = seed + 1
@@ -10,20 +40,20 @@ fun compute(seed: i64): i64 {
     val d: i64 = seed + 4
     var acc: i64 = 0
     var i: i64 = 0
-    while i < 1000 {
+    while i < 2000 {
         // 每轮引用 a/b/c/d/acc/i —— 多变量、跨作用域查找
-        // 取模避免数值累积溢出(本基准关注查找成本,非算术)
         val t: i64 = (a + b + c + d + i) % 1024
         acc = (acc + t) % 1048576
         i = i + 1
     }
-    acc
+    // 进入二层嵌套
+    acc + computeLevel2(seed, a, b)
 }
 
 fun main() {
     var total: i64 = 0
     var k: i64 = 0
-    while k < 5000 {
+    while k < 10000 {
         total = (total + compute(k)) % 1073741824
         k = k + 1
     }

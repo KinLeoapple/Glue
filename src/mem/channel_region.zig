@@ -40,7 +40,8 @@ pub const ChannelRegion = struct {
         }
     }
 
-    /// 分配 size 字节的通道数据，16B 对齐。热路径：1 次加法 + 1 次比较。
+    /// 分配 size 字节的通道数据，16B 对齐（SIMD 128-bit 友好，缓存行密度优先）。
+    /// 热路径：1 次加法 + 1 次比较。64B 对齐会浪费 4x 内存用于标量通道，反而降低缓存密度。
     pub fn alloc(self: *ChannelRegion, size: usize) ![]align(16) u8 {
         const aligned = std.mem.alignForward(usize, self.used, 16);
         if (self.data != null and aligned + size <= self.len) {
@@ -66,7 +67,6 @@ pub const ChannelRegion = struct {
         }
         self.data = new_data.ptr;
         self.len = new_len;
-        // 递归重试
         return self.alloc(size);
     }
 
@@ -88,9 +88,11 @@ test "ChannelRegion 分配与 reset" {
 
     const m1 = try region.alloc(100);
     @memset(m1, 0xAA);
+    // 第一次分配：aligned=0，used=0+100=100
     try testing.expectEqual(@as(usize, 100), region.used);
 
     _ = try region.alloc(16);
+    // 第二次分配：alignForward(100, 16)=112，used=112+16=128
     try testing.expectEqual(@as(usize, 128), region.used);
 
     // reset 后 used 归零

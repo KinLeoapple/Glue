@@ -88,6 +88,11 @@ const LoopActiveCache = struct {
     cond_active: []u32 = &.{},
     body_active: []u32 = &.{},
     invariant_active: []u32 = &.{},
+    /// 预编译的直接调用指令（无 execNode switch dispatch）
+    /// null 表示有 op 不支持直接调用，需回退到 execBodyNodesCompact
+    cond_compiled: ?[]BodyInst = null,
+    body_compiled: ?[]BodyInst = null,
+    invariant_compiled: ?[]BodyInst = null,
 };
 
 // ════════════════════════════════════════════
@@ -135,8 +140,49 @@ const CompiledBody = struct {
     node_count: u32,
 };
 
+/// 编译后的函数体执行计划（TCO 主循环优化）
+/// 当 body_skip 全为 false 时使用 direct 路径（直接遍历 nodes，零间接寻址）
+/// 否则使用 compact_idx 路径（紧凑索引数组，消除 body_skip 检查）
+/// 保持 execNode switch dispatch（编译器可内联各分支，优于间接函数调用）
+/// TCO 参数复制预计算：避免每次迭代的 elemWidth/rawPtr 查找
+const FuncBodyCache = struct {
+    /// 紧凑节点索引（compact 路径用，direct 路径为空切片）
+    compact_idx: []u32,
+    /// TCO call 节点索引：
+    /// - direct 路径：nodes 中的直接索引
+    /// - compact 路径：compact_idx 中的索引
+    /// null 表示无 TCO
+    tco_node_idx: ?u32 = null,
+    /// 是否为 direct 路径（body_skip 全 false）
+    direct: bool = false,
+    /// TCO 参数预计算信息（仅 tco_node_idx != null 时有效）
+    tco_arg_count: u8 = 0,
+    /// TCO 目标通道数组（param_channels 的副本，避免每次迭代间接寻址）
+    tco_arg_dst_chans: [16]u16 = [_]u16{0} ** 16,
+    /// TCO 参数宽度数组（预计算，避免每次 elemWidth 查找）
+    tco_arg_widths: [16]u8 = [_]u8{0} ** 16,
+    /// BodyInst 数组：预编译 body [0..tco_node_idx) 为直接函数指针调用
+    /// 跳过 execNode 的 100+ 分支 switch dispatch
+    /// 仅 direct+tco 路径使用，空切片表示不可编译（回退到 execNode 路径）
+    body_insts: []BodyInst = &.{},
+    /// body 是否含 call 节点（决定是否检查 tco_restart）
+    /// false → body 无 call，可跳过 tco_restart 检查（hot path 优化）
+    body_has_call: bool = false,
+};
+
 /// 执行引擎：接收 GlueIR 并执行
 pub const Engine = struct {
+    /// Memoization 缓存键：memo_slot + 参数哈希
+    const MemoKey = struct {
+        slot: u16,
+        arg_hash: u64,
+    };
+
+    /// Memoization 缓存值：标量结果字节（最大 16B，覆盖 i128/f128）
+    const MemoEntry = struct {
+        bytes: [16]u8 = [_]u8{0} ** 16,
+        width: u8 = 0,
+    };
     /// TCO 检测结果
     const TcoInfo = struct {
         has_tco: bool = false, // 是否有自递归尾调用
@@ -177,6 +223,15 @@ pub const Engine = struct {
     tco_arg_count: u8 = 0,
     tco_caller_func_idx: u16 = 0,
 
+    /// 互递归 TCO 跳转目标：当 execCall 检测到互递归尾调用时设置，
+    /// execFunction 主循环检测到后切换到目标函数体重新执行（trampoline 模式）
+    /// 零栈帧增长，与自递归 TCO 共享 tco_restart 信号
+    tco_jump_to: ?u16 = null,
+
+    /// halt_return 信号：预编译路径中，wrapHaltReturn 设置此字段，
+    /// TCO 主循环检查后跳出（替代 execNode 返回 ?u16 的机制）
+    pending_halt: ?u16 = null,
+
     /// body_skip 缓存：每个函数的 body_skip 位图只计算一次（IR 不可变）
     body_skip_cache: []?[]bool = &.{},
 
@@ -191,6 +246,19 @@ pub const Engine = struct {
     /// 按 vector_meta_index 索引，首次执行 vec_* 节点时编译 body 子图为 CompiledBody
     /// IR 不可变，缓存安全，避免重复分析 body 语义
     body_cache: []?CompiledBody = &.{},
+
+    /// 函数体预编译缓存：按函数索引，首次执行时编译为 BodyInst 数组
+    /// 消除 TCO 主循环的 execNode switch dispatch
+    func_body_cache: []?FuncBodyCache = &.{},
+
+    /// Memoization 缓存：纯函数 + 标量参数 → 结果值缓存
+    /// key = (memo_slot, arg_hash)，value = 缓存的结果字节
+    /// 仅缓存标量结果（无堆指针，无需 retain/release）
+    memo_cache: std.AutoHashMapUnmanaged(MemoKey, MemoEntry) = .{},
+
+    /// Memoization 命中/未命中统计（调试用，可在 --profile 中输出）
+    memo_hits: u64 = 0,
+    memo_misses: u64 = 0,
 
     /// 堆对象跟踪表（引擎创建的所有堆对象，deinit 时统一释放）
     /// 去重通过 ObjHeader.flags 的 TRACKED 位完成，无需 HashMap
@@ -210,6 +278,8 @@ pub const Engine = struct {
         if (tco_cache.len > 0) @memset(tco_cache, .{});
         const body_cache = try backing.alloc(?CompiledBody, ir.vector_metas.len);
         if (body_cache.len > 0) @memset(body_cache, null);
+        const func_body_cache = try backing.alloc(?FuncBodyCache, ir.functions.len);
+        if (func_body_cache.len > 0) @memset(func_body_cache, null);
         return .{
             .ir = ir,
             .tctx = tctx,
@@ -222,6 +292,7 @@ pub const Engine = struct {
             .loop_active_cache = lcache,
             .tco_cache = tco_cache,
             .body_cache = body_cache,
+            .func_body_cache = func_body_cache,
         };
     }
 
@@ -242,6 +313,8 @@ pub const Engine = struct {
         @memset(tco_cache, .{});
         const body_cache = try backing.alloc(?CompiledBody, ir.vector_metas.len);
         @memset(body_cache, null);
+        const func_body_cache = try backing.alloc(?FuncBodyCache, ir.functions.len);
+        @memset(func_body_cache, null);
         return .{
             .ir = ir,
             .tctx = tctx,
@@ -254,6 +327,7 @@ pub const Engine = struct {
             .loop_active_cache = lcache,
             .tco_cache = tco_cache,
             .body_cache = body_cache,
+            .func_body_cache = func_body_cache,
         };
     }
 
@@ -288,6 +362,9 @@ pub const Engine = struct {
                     backing.free(lac.cond_active);
                     backing.free(lac.body_active);
                     backing.free(lac.invariant_active);
+                    if (lac.cond_compiled) |cc| backing.free(cc);
+                    if (lac.body_compiled) |bc| backing.free(bc);
+                    if (lac.invariant_compiled) |ic| backing.free(ic);
                 }
             }
             backing.free(self.loop_active_cache);
@@ -305,10 +382,29 @@ pub const Engine = struct {
             }
             backing.free(self.body_cache);
         }
+        // 释放函数体预编译缓存（TCO 主循环优化）
+        if (self.func_body_cache.len > 0) {
+            for (self.func_body_cache) |entry| {
+                if (entry) |fbc| {
+                    // direct 路径的 compact_idx 为空切片（&.{}），不需要 free
+                    if (fbc.compact_idx.len > 0) {
+                        backing.free(fbc.compact_idx);
+                    }
+                    // direct+tco 路径的 body_insts 由 backing 分配，需释放
+                    if (fbc.body_insts.len > 0) {
+                        backing.free(fbc.body_insts);
+                    }
+                }
+            }
+            backing.free(self.func_body_cache);
+        }
 
         if (self.call_stack.len > 0) {
             backing.free(self.call_stack);
         }
+
+        // 释放 memoization 缓存
+        self.memo_cache.deinit(backing);
 
         self.runtime.deinit();
         if (self.owns_tctx) {
@@ -336,6 +432,7 @@ pub const Engine = struct {
     /// 运行入口函数，返回字符串结果（main 函数返回 str 时使用）
     pub fn runStr(self: *Engine) EngineError![]const u8 {
         try self.runtime.layout(&self.ir.channels);
+        self.precomputeNodeTags();
         const entry = self.ir.entryFunc();
         const result_chan = try self.execFunction(self.ir.entry_index, entry.param_channels);
         const s = self.readStr(result_chan) orelse return error.InvalidChannel;
@@ -346,6 +443,8 @@ pub const Engine = struct {
     pub fn run(self: *Engine) EngineError!i64 {
         // 布局通道存储
         try self.runtime.layout(&self.ir.channels);
+        // 预计算所有节点的 scalar_tag（消除热路径中 chanToScalarTag 查找）
+        self.precomputeNodeTags();
 
         // 执行初始化函数（顶层 val/var 声明）
         if (self.ir.init_index) |init_idx| {
@@ -378,16 +477,30 @@ pub const Engine = struct {
     }
 
     /// 执行一个函数，返回结果通道索引
-    fn execFunction(self: *Engine, func_idx: u16, args: []const u16) EngineError!u16 {
-        const func = self.ir.functions[func_idx];
-        const nodes = self.ir.funcNodes(func_idx);
-        const node_start = func.node_start;
-        self.current_func_idx = func_idx;
-
+    fn execFunction(self: *Engine, initial_func_idx: u16, args: []const u16) EngineError!u16 {
         _ = args;
 
         // 记录函数入口时的 defer 栈顶（用于函数返回时清理本函数的 defer 帧）
+        // 互递归 TCO 跳转期间不执行 defer（defer 帧属于最终返回点）
         const entry_defer_top = self.defer_top;
+
+        // 保存调用者的 body_skip 和 current_func_idx，函数返回时恢复
+        const saved_body_skip = self.body_skip;
+        const saved_func_idx = self.current_func_idx;
+        defer self.body_skip = saved_body_skip;
+        defer self.current_func_idx = saved_func_idx;
+
+        // 互递归 TCO 跳转循环：tco_jump_to 触发时切换到目标函数体重新执行
+        // 零栈帧增长，零通道 save/restore（trampoline 模式）
+        var func_idx = initial_func_idx;
+        var tco_iteration: u32 = 0;
+        const tco_max: u32 = 10_000_000; // 安全上限（跨所有跳转累计）
+
+        jump_loop: while (true) {
+            const func = self.ir.functions[func_idx];
+            const nodes = self.ir.funcNodes(func_idx);
+            const node_start = func.node_start;
+            self.current_func_idx = func_idx;
 
         // 构建子图跳过位图：vec_map/vec_fold/vec_scan 等的 body 子图
         // 不在主循环中执行，由对应的 vec_* exec 函数按需执行
@@ -466,9 +579,8 @@ pub const Engine = struct {
         };
 
         // 设置 body_skip 供 execBodyNodes 使用（递归调用时保存/恢复）
-        const saved_body_skip = self.body_skip;
+        // saved_body_skip 已在函数入口保存，defer 在函数返回时恢复
         self.body_skip = body_skip;
-        defer self.body_skip = saved_body_skip;
 
         // 尾调用优化（TCO）：检测函数末尾的尾调用模式
         // 模式：[..., call(callee), halt_return(call.output)] 且 call 是最后一个非跳过节点
@@ -526,76 +638,303 @@ pub const Engine = struct {
             }
         }
 
+        // 预编译函数体为紧凑索引（IR 不可变，只编译一次）
+        // 消除 TCO 主循环的 body_skip 检查 + TCO call 节点每节点检查
+        const func_body: ?FuncBodyCache = blk: {
+            if (func_idx < self.func_body_cache.len) {
+                if (self.func_body_cache[func_idx]) |cached| {
+                    break :blk cached;
+                }
+            }
+            break :blk self.compileFuncBody(func_idx, nodes, body_skip, tco_call_node_idx, tco_call_meta_idx);
+        };
+
         // TCO 主循环：每次迭代相当于一次函数执行
         // 首次执行用原始参数（已在 execCall 中复制到 param_channels）
         // 尾调用时更新参数并重新执行
-        var tco_iteration: u32 = 0;
-        const tco_max: u32 = 10_000_000; // 安全上限
         while (true) {
-            // 线性遍历节点
-            var pc: u32 = 0;
             var halt_chan: ?u16 = null;
             var tco_triggered = false;
-            // 清除 tco_restart（可能由嵌套的 execCall 设置）
             self.tco_restart = false;
-            while (pc < nodes.len) {
-                if (body_skip[pc]) {
-                    pc += 1;
-                    continue;
-                }
-                const node: *const Node = &nodes[pc];
 
-                // TCO：如果到达尾 call 节点，提取参数，重新执行
-                if (tco_call_node_idx) |tci| {
-                    if (pc == tci) {
-                        // 检查 TCO 安全上限
-                        tco_iteration += 1;
-                        if (tco_iteration > tco_max) return error.CallDepthExceeded;
-
-                        // 复制 call 参数到当前函数的 param_channels
-                        const call_meta = self.ir.call_metas[tco_call_meta_idx - 1];
-                        const tco_args = node.inputs[0..call_meta.arg_count];
-                        for (tco_args, 0..) |arg_chan, i| {
-                            if (i < func.param_channels.len) {
-                                const dst_chan = func.param_channels[i];
-                                const w = self.runtime.elemWidth(arg_chan);
-                                if (w > 0) {
-                                    if (arg_chan == dst_chan) continue;
+            if (func_body) |fbc| {
+                // direct 路径：body_skip 全 false，直接遍历 nodes（零间接寻址）
+                // compact 路径：通过 compact_idx 间接寻址（消除 body_skip 检查）
+                // 分支在外层，内层循环零额外检查
+                if (fbc.direct) {
+                    const tco_ni = fbc.tco_node_idx;
+                    if (tco_ni) |tci| {
+                        // 有 TCO：分裂循环在 TCO call 点
+                        // Part 1: [0, tci) — body 节点执行
+                        var early_halt = false;
+                        if (fbc.body_insts.len > 0) {
+                            // BodyInst 路径：直接函数指针调用，跳过 execNode switch dispatch
+                            // halt 通过 pending_halt 字段传播（wrapHaltReturn 设置）
+                            if (fbc.body_has_call) {
+                                for (fbc.body_insts) |inst| {
+                                    try inst.exec(self, inst.node);
+                                    if (self.pending_halt) |halt_c| {
+                                        self.pending_halt = null;
+                                        halt_chan = halt_c;
+                                        early_halt = true;
+                                        break;
+                                    }
+                                    if (self.tco_restart) {
+                                        self.tco_restart = false;
+                                        tco_iteration += 1;
+                                        if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                                        tco_triggered = true;
+                                        early_halt = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // body 无 call 节点：跳过 tco_restart 检查（hot path 优化）
+                                for (fbc.body_insts) |inst| {
+                                    try inst.exec(self, inst.node);
+                                    if (self.pending_halt) |halt_c| {
+                                        self.pending_halt = null;
+                                        halt_chan = halt_c;
+                                        early_halt = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            // execNode 回退路径：body 含 opToScalarExecFn 不支持的 op
+                            var i: u32 = 0;
+                            while (i < tci) : (i += 1) {
+                                const node: *const Node = &nodes[i];
+                                const result = self.execNode(node) catch |err| {
+                                    return err;
+                                };
+                                if (self.tco_restart) {
+                                    self.tco_restart = false;
+                                    tco_iteration += 1;
+                                    if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                                    tco_triggered = true;
+                                    early_halt = true;
+                                    break;
+                                }
+                                if (result) |ret_chan| {
+                                    halt_chan = ret_chan;
+                                    early_halt = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // Part 2: TCO call node — 直接处理，无 execNode 开销
+                        if (!early_halt) {
+                            tco_iteration += 1;
+                            if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                            const tco_node: *const Node = &nodes[tci];
+                            const arg_count = fbc.tco_arg_count;
+                            const dst_chans = &fbc.tco_arg_dst_chans;
+                            const widths = &fbc.tco_arg_widths;
+                            var j: u8 = 0;
+                            while (j < arg_count) : (j += 1) {
+                                const arg_chan = tco_node.inputs[j];
+                                const dst_chan = dst_chans[j];
+                                const w = widths[j];
+                                if (w > 0 and arg_chan != dst_chan) {
                                     const src = self.runtime.rawPtr(arg_chan);
                                     const dst = self.runtime.rawPtr(dst_chan);
                                     @memcpy(dst[0..w], src[0..w]);
                                 }
                             }
+                            tco_triggered = true;
                         }
-                        tco_triggered = true;
-                        break; // 跳出内层循环，重新执行函数体
+                        // Part 3: [tci+1, len) — 尾位置之后通常无节点
+                        // 若有，继续执行（非 TCO call 节点）
+                        if (!early_halt and !tco_triggered) {
+                            var k: u32 = tci + 1;
+                            const total: u32 = @intCast(nodes.len);
+                            while (k < total) : (k += 1) {
+                                const node: *const Node = &nodes[k];
+                                const result = self.execNode(node) catch |err| {
+                                    return err;
+                                };
+                                if (self.tco_restart) {
+                                    self.tco_restart = false;
+                                    tco_iteration += 1;
+                                    if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                                    tco_triggered = true;
+                                    break;
+                                }
+                                if (result) |ret_chan| {
+                                    halt_chan = ret_chan;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        // 无 TCO：单循环，无 TCO 检查
+                        if (fbc.body_insts.len > 0) {
+                            // BodyInst 路径：直接函数指针调用，跳过 execNode switch dispatch
+                            // 非 TCO 函数也受益于直接调用（record/route/算术等 op 密集场景）
+                            if (fbc.body_has_call) {
+                                for (fbc.body_insts) |inst| {
+                                    try inst.exec(self, inst.node);
+                                    if (self.pending_halt) |halt_c| {
+                                        self.pending_halt = null;
+                                        halt_chan = halt_c;
+                                        break;
+                                    }
+                                    if (self.tco_restart) {
+                                        self.tco_restart = false;
+                                        tco_iteration += 1;
+                                        if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                                        tco_triggered = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // body 无 call 节点：跳过 tco_restart 检查（hot path 优化）
+                                for (fbc.body_insts) |inst| {
+                                    try inst.exec(self, inst.node);
+                                    if (self.pending_halt) |halt_c| {
+                                        self.pending_halt = null;
+                                        halt_chan = halt_c;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            // execNode 回退路径：body 含 opToScalarExecFn 不支持的 op
+                            var i: u32 = 0;
+                            const total: u32 = @intCast(nodes.len);
+                            while (i < total) : (i += 1) {
+                                const node: *const Node = &nodes[i];
+                                const result = self.execNode(node) catch |err| {
+                                    return err;
+                                };
+                                if (self.tco_restart) {
+                                    self.tco_restart = false;
+                                    tco_iteration += 1;
+                                    if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                                    tco_triggered = true;
+                                    break;
+                                }
+                                if (result) |ret_chan| {
+                                    halt_chan = ret_chan;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Compact 路径：紧凑索引数组
+                    const tco_ci = fbc.tco_node_idx;
+                    var i: u32 = 0;
+                    while (i < fbc.compact_idx.len) : (i += 1) {
+                        const node: *const Node = &nodes[fbc.compact_idx[i]];
+
+                        // TCO call 节点：仅在此位置检查，其余节点无 TCO 检查开销
+                        if (tco_ci) |tci| {
+                            if (i == tci) {
+                                tco_iteration += 1;
+                                if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                                // 使用预计算的参数信息（避免每次 elemWidth/rawPtr 查找）
+                                const arg_count = fbc.tco_arg_count;
+                                const dst_chans = &fbc.tco_arg_dst_chans;
+                                const widths = &fbc.tco_arg_widths;
+                                var j: u8 = 0;
+                                while (j < arg_count) : (j += 1) {
+                                    const arg_chan = node.inputs[j];
+                                    const dst_chan = dst_chans[j];
+                                    const w = widths[j];
+                                    if (w > 0 and arg_chan != dst_chan) {
+                                        const src = self.runtime.rawPtr(arg_chan);
+                                        const dst = self.runtime.rawPtr(dst_chan);
+                                        @memcpy(dst[0..w], src[0..w]);
+                                    }
+                                }
+                                tco_triggered = true;
+                                break;
+                            }
+                        }
+
+                        const result = self.execNode(node) catch |err| {
+                            return err;
+                        };
+                        if (self.tco_restart) {
+                            self.tco_restart = false;
+                            tco_iteration += 1;
+                            if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                            tco_triggered = true;
+                            break;
+                        }
+                        if (result) |ret_chan| {
+                            halt_chan = ret_chan;
+                            break;
+                        }
                     }
                 }
+            } else {
+                // 回退路径：原始节点遍历（body_skip 检查 + TCO 每节点检查）
+                var pc: u32 = 0;
+                while (pc < nodes.len) {
+                    if (body_skip[pc]) {
+                        pc += 1;
+                        continue;
+                    }
+                    const node: *const Node = &nodes[pc];
 
-                const result = self.execNode(node) catch |err| {
-                    return err;
-                };
-                // 检查 tco_restart（execCall 检测到自递归时设置）
-                if (self.tco_restart) {
-                    self.tco_restart = false;
-                    tco_iteration += 1;
-                    if (tco_iteration > tco_max) return error.CallDepthExceeded;
-                    tco_triggered = true;
-                    break; // 重新执行函数体
+                    if (tco_call_node_idx) |tci| {
+                        if (pc == tci) {
+                            tco_iteration += 1;
+                            if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                            const call_meta = self.ir.call_metas[tco_call_meta_idx - 1];
+                            const tco_args = node.inputs[0..call_meta.arg_count];
+                            for (tco_args, 0..) |arg_chan, j| {
+                                if (j < func.param_channels.len) {
+                                    const dst_chan = func.param_channels[j];
+                                    const w = self.runtime.elemWidth(arg_chan);
+                                    if (w > 0) {
+                                        if (arg_chan == dst_chan) continue;
+                                        const src = self.runtime.rawPtr(arg_chan);
+                                        const dst = self.runtime.rawPtr(dst_chan);
+                                        @memcpy(dst[0..w], src[0..w]);
+                                    }
+                                }
+                            }
+                            tco_triggered = true;
+                            break;
+                        }
+                    }
+
+                    const result = self.execNode(node) catch |err| {
+                        return err;
+                    };
+                    if (self.tco_restart) {
+                        self.tco_restart = false;
+                        tco_iteration += 1;
+                        if (tco_iteration > tco_max) return error.CallDepthExceeded;
+                        tco_triggered = true;
+                        break;
+                    }
+                    if (result) |ret_chan| {
+                        halt_chan = ret_chan;
+                        break;
+                    }
+                    pc += 1;
                 }
-                if (result) |ret_chan| {
-                    halt_chan = ret_chan;
-                    break; // halt：跳出主循环，执行 defer 后返回
-                }
-                pc += 1;
             }
 
-            if (tco_triggered) continue; // TCO：重新执行函数体
+            if (tco_triggered) {
+                // 互递归 TCO：跳转到目标函数体重新执行（trampoline）
+                if (self.tco_jump_to) |jf| {
+                    self.tco_jump_to = null;
+                    func_idx = jf;
+                    continue :jump_loop;
+                }
+                // 自递归 TCO：重新执行当前函数体
+                continue;
+            }
 
             // halt 时执行本函数注册的 defer（LIFO 顺序）
             if (self.defer_top > entry_defer_top) {
-                // 从当前函数的 defer 帧开始，LIFO 执行
-                const saved_func_idx = self.current_func_idx;
+                const defer_saved_func_idx = self.current_func_idx;
                 while (self.defer_top > entry_defer_top) {
                     self.defer_top -= 1;
                     const frame = self.defer_stack[self.defer_top];
@@ -604,12 +943,13 @@ pub const Engine = struct {
                     const local_start = frame.body_start - self.ir.functions[frame.func_idx].node_start;
                     _ = try self.execBodyNodes(defer_nodes, local_start, frame.body_len);
                 }
-                self.current_func_idx = saved_func_idx;
+                self.current_func_idx = defer_saved_func_idx;
             }
 
             // 如果 halt 返回了通道，返回它；否则返回函数的 return_channel
             return halt_chan orelse func.return_channel;
-        }
+        } // end inner TCO loop
+        } // end jump_loop
     }
 
     /// 执行单个节点，返回非 null 表示 halt_return 的返回通道
@@ -813,6 +1153,73 @@ pub const Engine = struct {
             .f16_chan => .f16, .f32_chan => .f32, .f64_chan => .f64, .f128_chan => .f128,
             else => null,
         };
+    }
+
+    /// 预计算所有节点的 scalar_tag 字段（IR 不可变，layout 后只算一次）
+    /// 消除热路径中 chanToScalarTag(channels.get(...)) 的 array access + switch 开销
+    /// 直接读取 node.scalar_tag，单次内存访问
+    fn precomputeNodeTags(self: *Engine) void {
+        const nodes = self.ir.nodes;
+        const channels = &self.ir.channels;
+        const scalar_metas = self.ir.scalar_metas;
+        for (nodes) |*node| {
+            const tag: ?ScalarTag = switch (node.op) {
+                // 整数算术：tag = 输出通道类型（输入输出同类型）
+                .int_add, .int_sub, .int_mul, .int_div, .int_mod,
+                .int_and, .int_or, .int_xor, .int_shl, .int_shr,
+                .int_neg, .int_abs, .int_not,
+                // 浮点算术：tag = 输出通道类型
+                .float_add, .float_sub, .float_mul, .float_div, .float_mod,
+                .float_neg, .float_abs,
+                // const 节点：tag = 输出通道类型（用于 readScalarAt 快速路径）
+                .const_i, .const_f, .const_bool, .const_char,
+                // load/store：tag = 输出通道类型
+                .load, .store,
+                => chanToScalarTag(channels.get(node.output)),
+
+                // 比较：tag = 左输入通道类型（输出是 bool，不能用于推导）
+                .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge,
+                => chanToScalarTag(channels.get(node.inputs[0])),
+
+                // record_get：tag = 输出通道类型（字段值类型，用于直接指针读写）
+                // 同时预计算 field_id 到 _pad（避免每次解析 meta）
+                .record_get => blk: {
+                    node._pad = extractRecordFieldId(node, scalar_metas);
+                    break :blk chanToScalarTag(channels.get(node.output));
+                },
+
+                // record_set/record_clone：预计算 field_id/extra_count 到 _pad
+                // record_set 还预计算 inputs[1]（值通道）的 ScalarTag，用于直接指针读取
+                .record_set => blk: {
+                    node._pad = extractRecordFieldId(node, scalar_metas);
+                    break :blk chanToScalarTag(channels.get(node.inputs[1]));
+                },
+                .record_clone => blk: {
+                    node._pad = extractRecordFieldId(node, scalar_metas);
+                    break :blk null;
+                },
+
+                // 其他节点：不预计算（0xFF）
+                else => null,
+            };
+            node.scalar_tag = if (tag) |t| @intFromEnum(t) else 0xFF;
+        }
+    }
+
+    /// 从 record_get/set/clone 节点的 meta 中提取 field_id（或 extra_count）
+    /// 返回 u8（field_id 实际很少超过 256，超出时返回 0xFF 触发运行时回退）
+    inline fn extractRecordFieldId(node: *const Node, scalar_metas: []const ScalarMeta) u8 {
+        if (node.meta_index == 0 or node.meta_index >= scalar_metas.len) return 0xFF;
+        const meta = scalar_metas[node.meta_index];
+        const cv = meta.const_val orelse return 0xFF;
+        switch (cv) {
+            .int_val => |iv| {
+                const fid: u32 = @truncate(@as(u64, @bitCast(@as(i64, @truncate(iv)))));
+                if (fid > 0xFF) return 0xFF;
+                return @intCast(fid);
+            },
+            else => return 0xFF,
+        }
     }
 
     /// 读取通道值为 16 字节填充缓冲区（ops 函数的输入格式）
@@ -1715,13 +2122,13 @@ pub const Engine = struct {
 
     const IntBinOpKind = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor };
 
-    fn execIntBinOp(self: *Engine, node: *const Node, kind: IntBinOpKind) EngineError!void {
+    inline fn execIntBinOp(self: *Engine, node: *const Node, kind: IntBinOpKind) EngineError!void {
         const left_chan = node.inputs[0];
         const right_chan = node.inputs[1];
 
-        // 获取通道的 ScalarTag
-        const out_meta = self.ir.channels.get(node.output);
-        const tag = chanToScalarTag(out_meta) orelse return error.UnsupportedOp;
+        // 读取预计算的 ScalarTag（0xFF = 无标量类型，预计算阶段已填充）
+        if (node.scalar_tag == 0xFF) return error.UnsupportedOp;
+        const tag: ScalarTag = @enumFromInt(node.scalar_tag);
 
         // 字符串拼接由专用 string_concat 节点处理（builder 按 operand_type 分派）
         // int_add 路径只处理纯整数运算，无需运行时 hashmap 查找
@@ -1761,8 +2168,9 @@ pub const Engine = struct {
         const left_chan = node.inputs[0];
         const right_chan = node.inputs[1];
 
-        const out_meta = self.ir.channels.get(node.output);
-        const tag = chanToScalarTag(out_meta) orelse return error.UnsupportedOp;
+        // 读取预计算的 ScalarTag
+        if (node.scalar_tag == 0xFF) return error.UnsupportedOp;
+        const tag: ScalarTag = @enumFromInt(node.scalar_tag);
 
         // 快速路径：按 comptime tag 直接指针读写，保留各类型的原生位宽语义
         return switch (tag) {
@@ -1788,8 +2196,9 @@ pub const Engine = struct {
     fn execIntUnOp(self: *Engine, node: *const Node, kind: IntUnOpKind) EngineError!void {
         const input_chan = node.inputs[0];
 
-        const out_meta = self.ir.channels.get(node.output);
-        const tag = chanToScalarTag(out_meta) orelse return error.UnsupportedOp;
+        // 读取预计算的 ScalarTag
+        if (node.scalar_tag == 0xFF) return error.UnsupportedOp;
+        const tag: ScalarTag = @enumFromInt(node.scalar_tag);
 
         // 快速路径：按 comptime tag 直接指针读写，跳过 16B 中间缓冲
         return switch (tag) {
@@ -1824,8 +2233,9 @@ pub const Engine = struct {
         const left_chan = node.inputs[0];
         const right_chan = node.inputs[1];
 
-        const out_meta = self.ir.channels.get(node.output);
-        const tag = chanToScalarTag(out_meta) orelse return error.UnsupportedOp;
+        // 读取预计算的 ScalarTag
+        if (node.scalar_tag == 0xFF) return error.UnsupportedOp;
+        const tag: ScalarTag = @enumFromInt(node.scalar_tag);
 
         // 快速路径：按 comptime tag 直接指针读写原生浮点，跳过 16B 中间缓冲
         return switch (tag) {
@@ -1853,8 +2263,9 @@ pub const Engine = struct {
     fn execFloatUnOp(self: *Engine, node: *const Node, kind: FloatUnOpKind) EngineError!void {
         const input_chan = node.inputs[0];
 
-        const out_meta = self.ir.channels.get(node.output);
-        const tag = chanToScalarTag(out_meta) orelse return error.UnsupportedOp;
+        // 读取预计算的 ScalarTag
+        if (node.scalar_tag == 0xFF) return error.UnsupportedOp;
+        const tag: ScalarTag = @enumFromInt(node.scalar_tag);
 
         // 快速路径：按 comptime tag 直接指针读写，跳过 16B 中间缓冲
         return switch (tag) {
@@ -1877,13 +2288,13 @@ pub const Engine = struct {
 
     const CmpKind = enum { eq, ne, lt, le, gt, ge };
 
-    fn execCmp(self: *Engine, node: *const Node, kind: CmpKind) EngineError!void {
+    inline fn execCmp(self: *Engine, node: *const Node, kind: CmpKind) EngineError!void {
         const left_chan = node.inputs[0];
         const right_chan = node.inputs[1];
 
-        // 从输入通道推导类型（输出是 bool，不能用于推导）
-        const left_meta = self.ir.channels.get(left_chan);
-        const tag = chanToScalarTag(left_meta) orelse {
+        // 读取预计算的 ScalarTag（0xFF = 非标量通道，预计算阶段已填充）
+        // tag 来自左输入通道（输出是 bool，不能用于推导）
+        if (node.scalar_tag == 0xFF) {
             // 非标量通道：== 和 != 使用递归值相等（value.equals）
             // 其他比较（< > <= >=）退化为指针比较（仅用于排序/判空）
             if (kind == .eq or kind == .ne) {
@@ -1912,7 +2323,8 @@ pub const Engine = struct {
             };
             self.runtime.writeBool(node.output, result);
             return;
-        };
+        }
+        const tag: ScalarTag = @enumFromInt(node.scalar_tag);
 
         // 快速路径：按 comptime tag 直接指针读写，覆盖 int/uint/float/bool 所有类型
         const result: bool = switch (tag) {
@@ -2594,7 +3006,8 @@ pub const Engine = struct {
     // ════════════════════════════════════════════
 
     /// 从 ref_chan 读取 RecordValue 指针
-    fn readRecord(self: *Engine, chan: u16) ?*value.RecordValue {
+    /// 内联以让编译器消除连续 record_get/set 的冗余 null/对齐/type_tag 检查
+    inline fn readRecord(self: *Engine, chan: u16) ?*value.RecordValue {
         const ptr = self.runtime.readPtr(chan) orelse return null;
         if (@intFromPtr(ptr) < 0x1000) return null;
         if (@intFromPtr(ptr) % @alignOf(value.obj_header.ObjHeader) != 0) return null;
@@ -2619,7 +3032,8 @@ pub const Engine = struct {
     /// record_make：创建空记录，预分配 field_count 个槽位
     /// meta.const_val.int_val 编码：(field_count << 32) | type_name_pool_idx
     /// 字段表初始化为 unit（后续 record_set 覆写）
-    fn execRecordMake(self: *Engine, node: *const Node) EngineError!void {
+    /// 优化：直接在 allocObj 连续内存上初始化 fields，跳过临时数组 alloc/free + memcpy
+    inline fn execRecordMake(self: *Engine, node: *const Node) EngineError!void {
         const meta = if (node.meta_index < self.ir.scalar_metas.len) self.ir.scalar_metas[node.meta_index] else return error.InvalidMetaIndex;
         const packed_val = if (meta.const_val) |cv| switch (cv) {
             .int_val => |iv| @as(i64, @truncate(iv)),
@@ -2628,15 +3042,18 @@ pub const Engine = struct {
         const type_name_idx: usize = @intCast(@as(u32, @truncate(@as(u64, @bitCast(packed_val)))));
         const field_count: u32 = @truncate(@as(u64, @bitCast(packed_val)) >> 32);
         const type_name = if (type_name_idx < self.ir.string_pool.len) self.ir.string_pool[type_name_idx] else "";
-        // 预分配字段数组，初始化为 unit（无引用，零开销）
-        // 临时切片（makeRecord 会拷贝到连续内存）
-        const fields: []value.Value = if (field_count > 0)
-            self.tctx.?.backing.alloc(value.Value, field_count) catch return error.OutOfMemory
-        else
-            &[_]value.Value{};
-        defer if (fields.len > 0) self.tctx.?.backing.free(fields);
-        @memset(fields, value.Value.unit);
-        const v = value.Value.makeRecord(self.tctx.?, type_name, fields) catch return error.OutOfMemory;
+
+        // 直接分配连续内存：[RecordValue header | Value fields[]]
+        // 在连续内存上直接初始化 fields 为 unit，无需临时数组 + memcpy
+        const f_size = field_count * @sizeOf(value.Value);
+        const total = @sizeOf(value.RecordValue) + f_size;
+        const obj_mem = self.tctx.?.allocObj(total) catch return error.OutOfMemory;
+        const rec: *value.RecordValue = @ptrCast(@alignCast(obj_mem.ptr));
+        const f_ptr: [*]value.Value = @ptrCast(@alignCast(obj_mem.ptr + @sizeOf(value.RecordValue)));
+        // 初始化 fields 为 unit（连续内存，单次 memset）
+        @memset(f_ptr[0..field_count], value.Value.unit);
+        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..field_count] };
+        const v = value.Value.fromRef(&rec.header);
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
     }
@@ -2645,8 +3062,10 @@ pub const Engine = struct {
     /// meta.const_val.int_val = field_id（u16 范围）
     /// inputs[0] = record_chan
     /// null/无效记录时安全写零（用于 ?. 安全访问中 unwrap null 后的 record_get）
-    fn execRecordGet(self: *Engine, node: *const Node) EngineError!void {
-        const field_id: u16 = blk: {
+    /// 优化：_pad 预计算 field_id（< 256 时），scalar_tag 预计算输出通道类型
+    inline fn execRecordGet(self: *Engine, node: *const Node) EngineError!void {
+        // 快速路径：_pad 预计算了 field_id（< 256）
+        const field_id: u16 = if (node._pad != 0xFF) node._pad else blk: {
             const meta = if (node.meta_index < self.ir.scalar_metas.len) self.ir.scalar_metas[node.meta_index] else return error.InvalidMetaIndex;
             if (meta.const_val) |cv| switch (cv) {
                 .int_val => |iv| break :blk @intCast(@as(u32, @truncate(@as(u64, @bitCast(@as(i64, @truncate(iv))))))),
@@ -2664,23 +3083,100 @@ pub const Engine = struct {
         };
         if (field_id >= rec.fields.len) return error.InvalidChannel;
         const v = rec.fields[field_id];
+
+        // 快速路径：scalar_tag 预计算了输出通道类型（标量类型）
+        // 且 Value variant 与输出通道类型匹配时，直接 payload 字节复制
+        // 跳过 valueToChan 的 17 分支 switch
+        if (node.scalar_tag != 0xFF) {
+            const tag: ScalarTag = @enumFromInt(node.scalar_tag);
+            const dst = self.runtime.rawPtr(node.output);
+            // 检查 Value variant 是否与 tag 匹配
+            // variant tag 可通过 @intFromEnum(v) 获取（Value 是 tagged union）
+            const variant_matches: bool = switch (v) {
+                .boolean => tag == .boolean,
+                .char => tag == .char,
+                .i8 => tag == .i8, .i16 => tag == .i16, .i32 => tag == .i32,
+                .i64 => tag == .i64, .i128 => tag == .i128,
+                .u8 => tag == .u8, .u16 => tag == .u16, .u32 => tag == .u32,
+                .u64 => tag == .u64, .u128 => tag == .u128,
+                .f16 => tag == .f16, .f32 => tag == .f32, .f64 => tag == .f64, .f128 => tag == .f128,
+                else => false,
+            };
+            if (variant_matches) {
+                const w: usize = switch (tag) {
+                    .boolean, .i8, .u8 => 1,
+                    .char, .i16, .u16, .f16 => 2,
+                    .i32, .u32, .f32 => 4,
+                    .i64, .u64, .f64 => 8,
+                    .i128, .u128, .f128 => 16,
+                };
+                const src: [*]const u8 = switch (tag) {
+                    .boolean => @ptrCast(&v.boolean),
+                    .char => @ptrCast(&v.char),
+                    .i8 => @ptrCast(&v.i8),
+                    .i16 => @ptrCast(&v.i16),
+                    .i32 => @ptrCast(&v.i32),
+                    .i64 => @ptrCast(&v.i64),
+                    .i128 => @ptrCast(&v.i128),
+                    .u8 => @ptrCast(&v.u8),
+                    .u16 => @ptrCast(&v.u16),
+                    .u32 => @ptrCast(&v.u32),
+                    .u64 => @ptrCast(&v.u64),
+                    .u128 => @ptrCast(&v.u128),
+                    .f16 => @ptrCast(&v.f16),
+                    .f32 => @ptrCast(&v.f32),
+                    .f64 => @ptrCast(&v.f64),
+                    .f128 => @ptrCast(&v.f128),
+                };
+                @memcpy(dst[0..w], src[0..w]);
+                return;
+            }
+            // variant 不匹配：回退到 valueToChan（处理类型转换）
+        }
+        // 回退：非标量通道或 variant 不匹配
         self.valueToChan(node.output, v);
     }
 
     /// record_set：按 field_id 写入字段值
     /// meta.const_val.int_val = field_id（u16 范围）
     /// inputs[0] = record_chan, inputs[1] = value_chan
-    fn execRecordSet(self: *Engine, node: *const Node) EngineError!void {
+    /// 优化：_pad 预计算 field_id，scalar_tag 预计算 inputs[1] 类型，直接指针读取
+    inline fn execRecordSet(self: *Engine, node: *const Node) EngineError!void {
         const rec = self.readRecord(node.inputs[0]) orelse return error.InvalidChannel;
-        const field_id: u16 = blk: {
+        const field_id: u16 = if (node._pad != 0xFF) node._pad else blk: {
             const meta = if (node.meta_index < self.ir.scalar_metas.len) self.ir.scalar_metas[node.meta_index] else return error.InvalidMetaIndex;
             if (meta.const_val) |cv| switch (cv) {
                 .int_val => |iv| break :blk @intCast(@as(u32, @truncate(@as(u64, @bitCast(@as(i64, @truncate(iv))))))),
                 else => return error.InvalidMetaIndex,
             } else return error.InvalidMetaIndex;
         };
-        const v = self.chanToValue(node.inputs[1]);
         if (field_id >= rec.fields.len) return error.InvalidChannel;
+
+        // 快速路径：scalar_tag 预计算了 inputs[1] 类型（标量类型）
+        // 直接指针读取，构造 Value，跳过 chanToValue 的 17 分支 switch
+        const v: value.Value = if (node.scalar_tag != 0xFF) blk: {
+            const tag: ScalarTag = @enumFromInt(node.scalar_tag);
+            const src = self.runtime.rawPtr(node.inputs[1]);
+            break :blk switch (tag) {
+                .boolean => value.Value.fromBool(src[0] != 0),
+                .char => value.Value{ .char = @bitCast(@as(*u32, @ptrCast(@alignCast(src))).*) },
+                .i8 => value.Value.fromI8(@bitCast(src[0])),
+                .u8 => value.Value.fromU8(src[0]),
+                .i16 => value.Value.fromI16(@bitCast(@as(*i16, @ptrCast(@alignCast(src))).*)),
+                .u16 => value.Value.fromU16(@bitCast(@as(*u16, @ptrCast(@alignCast(src))).*)),
+                .i32 => value.Value.fromI32(@bitCast(@as(*i32, @ptrCast(@alignCast(src))).*)),
+                .u32 => value.Value.fromU32(@bitCast(@as(*u32, @ptrCast(@alignCast(src))).*)),
+                .i64 => value.Value.fromI64(@bitCast(@as(*i64, @ptrCast(@alignCast(src))).*)),
+                .u64 => value.Value.fromU64(@bitCast(@as(*u64, @ptrCast(@alignCast(src))).*)),
+                .i128 => value.Value.fromI128(@bitCast(@as(*i128, @ptrCast(@alignCast(src))).*)),
+                .u128 => value.Value.fromU128(@bitCast(@as(*u128, @ptrCast(@alignCast(src))).*)),
+                .f16 => value.Value.fromF16(@bitCast(@as(*f16, @ptrCast(@alignCast(src))).*)),
+                .f32 => value.Value.fromF32(@bitCast(@as(*f32, @ptrCast(@alignCast(src))).*)),
+                .f64 => value.Value.fromF64(@bitCast(@as(*f64, @ptrCast(@alignCast(src))).*)),
+                .f128 => value.Value.fromF128(@bitCast(@as(*f128, @ptrCast(@alignCast(src))).*)),
+            };
+        } else self.chanToValue(node.inputs[1]);
+
         // retain 新值（record 持有引用，deinit 时 release）
         _ = v.retain();
         // release 旧值
@@ -2691,11 +3187,11 @@ pub const Engine = struct {
     /// record_clone：浅拷贝记录（用于记录扩展 (...base, field: value)）
     /// inputs[0] = base record_chan，output = new record_chan
     /// meta.const_val.int_val = extra_count（扩展字段数，默认 0）
-    /// 字段表连续内存：alloc(base.fields.len + extra) + memcpy + extra 个 unit 槽位
-    fn execRecordClone(self: *Engine, node: *const Node) EngineError!void {
+    /// 优化：直接在 allocObj 连续内存上初始化，跳过临时数组 alloc/free + memcpy
+    inline fn execRecordClone(self: *Engine, node: *const Node) EngineError!void {
         const base_rec = self.readRecord(node.inputs[0]) orelse return error.InvalidChannel;
-        // 读取扩展字段数（meta 缺省为 0）
-        const extra_count: u32 = blk: {
+        // 读取扩展字段数（_pad 预计算优先，回退到 meta）
+        const extra_count: u32 = if (node._pad != 0xFF) node._pad else blk: {
             if (node.meta_index == 0 or node.meta_index >= self.ir.scalar_metas.len) break :blk 0;
             const meta = self.ir.scalar_metas[node.meta_index];
             if (meta.const_val) |cv| switch (cv) {
@@ -2704,28 +3200,28 @@ pub const Engine = struct {
             } else break :blk 0;
         };
         const total = base_rec.fields.len + extra_count;
-        // 预分配字段数组，浅拷贝 base + extra 槽位初始化为 unit
-        // 临时切片（makeRecordWithNames 会拷贝到连续内存）
-        const new_fields: []value.Value = if (total > 0)
-            self.tctx.?.backing.alloc(value.Value, total) catch return error.OutOfMemory
-        else
-            &[_]value.Value{};
-        defer if (new_fields.len > 0) self.tctx.?.backing.free(new_fields);
+
+        // 直接分配连续内存：[RecordValue header | Value fields[]]
+        const f_size = total * @sizeOf(value.Value);
+        const alloc_total = @sizeOf(value.RecordValue) + f_size;
+        const obj_mem = self.tctx.?.allocObj(alloc_total) catch return error.OutOfMemory;
+        const new_rec: *value.RecordValue = @ptrCast(@alignCast(obj_mem.ptr));
+        const f_ptr: [*]value.Value = @ptrCast(@alignCast(obj_mem.ptr + @sizeOf(value.RecordValue)));
         // 拷贝 base 字段（retain ref 值）
         for (base_rec.fields, 0..) |src, i| {
-            new_fields[i] = src;
-            _ = new_fields[i].retain();
+            f_ptr[i] = src;
+            _ = f_ptr[i].retain();
         }
         // extra 槽位初始化为 unit
-        @memset(new_fields[base_rec.fields.len..], value.Value.unit);
-        const new_rec = value.Value.makeRecordWithNames(
-            self.tctx.?,
-            base_rec.type_name,
-            new_fields,
-            base_rec.field_names,
-        ) catch return error.OutOfMemory;
-        try self.trackObj(new_rec.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(new_rec.asRef()));
+        @memset(f_ptr[base_rec.fields.len..total], value.Value.unit);
+        new_rec.* = .{
+            .type_name = base_rec.type_name,
+            .fields = f_ptr[0..total],
+            .field_names = base_rec.field_names,
+        };
+        const v = value.Value.fromRef(&new_rec.header);
+        try self.trackObj(v.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
     }
 
     // ════════════════════════════════════════════
@@ -2741,6 +3237,48 @@ pub const Engine = struct {
         const callee_func = self.ir.functions[call_meta.func_index];
         const args = node.inputs[0..call_meta.arg_count];
 
+        // Memoization 快速路径：纯函数 + 标量参数 + 非尾调用 → 查缓存
+        // 命中则直接复制结果，跳过整个函数执行（O(1) 替代 O(递归深度)）
+        // 尾调用跳过 memo（TCO 已优化，且 tco_restart 路径无标准结果写入）
+        if (call_meta.memo_slot > 0 and !call_meta.tail_call) {
+            const arg_hash = self.hashArgs(args);
+            const key = MemoKey{ .slot = call_meta.memo_slot, .arg_hash = arg_hash };
+            if (self.memo_cache.get(key)) |entry| {
+                // 缓存命中：复制结果字节到输出通道
+                if (entry.width > 0) {
+                    const dst = self.runtime.rawPtr(node.output);
+                    @memcpy(dst[0..entry.width], entry.bytes[0..entry.width]);
+                }
+                self.memo_hits += 1;
+                return;
+            }
+            self.memo_misses += 1;
+            // 未命中：执行函数，结束后缓存结果
+            const memo_key = key;
+
+            // 执行标准调用路径
+            try self.execCallStandard(node, call_meta, callee_func, args);
+
+            // 缓存结果：从 node.output 读取结果字节
+            const result_w = self.runtime.elemWidth(node.output);
+            if (result_w > 0) {
+                var entry: MemoEntry = .{ .width = result_w };
+                const src = self.runtime.rawPtr(node.output);
+                @memcpy(entry.bytes[0..result_w], src[0..result_w]);
+                // 使用 backing allocator（Engine 生命周期）
+                const backing = if (self.tctx) |tc| tc.backing else self.ir.backing;
+                self.memo_cache.put(backing, memo_key, entry) catch {};
+            }
+            return;
+        }
+
+        // 标准调用路径（TCO + 递归 save/restore + 非递归直通）
+        try self.execCallStandard(node, call_meta, callee_func, args);
+    }
+
+    /// 标准调用路径：从 execCall 抽出，供 memoization 快速路径未命中时调用
+    /// 包含自递归/互递归 TCO 检查、递归调用 save/restore、非递归调用直通
+    fn execCallStandard(self: *Engine, node: *const Node, call_meta: ir_mod.CallMeta, callee_func: Function, args: []const u16) EngineError!void {
         // 自递归尾调用优化：当 callee == current_func_idx 且 call_meta.tail_call == true 时，
         // 设置 tco_restart 信号，让 execFunction 用新参数重新执行
         // tail_call 由 IR builder 标记（只有尾位置的调用才标记为 true），
@@ -2768,6 +3306,40 @@ pub const Engine = struct {
             // 写入结果占位（execFunction 会用 halt_return 的值覆盖）
             // 实际上不需要写入，因为 execFunction 会重新执行并最终返回正确结果
             return;
+        }
+
+        // 互递归尾调用优化：当 callee != current_func_idx 但 callee 在调用栈中（互递归），
+        // 且 call_meta.tail_call == true 时，设置 tco_jump_to 信号，
+        // execFunction 主循环检测到后切换到目标函数体重新执行（trampoline 模式）
+        // 零栈帧增长，零通道 save/restore
+        if (call_meta.tail_call and args.len <= 16 and call_meta.func_index != self.current_func_idx) {
+            // 检查 callee 是否在调用栈中（互递归）
+            var is_mutual_recursive = false;
+            for (self.call_stack[0..self.call_depth]) |frame| {
+                if (frame.func_idx == call_meta.func_index) {
+                    is_mutual_recursive = true;
+                    break;
+                }
+            }
+            if (is_mutual_recursive) {
+                // 复制参数值到 callee 的 param_channels（为跳转后重执行做准备）
+                for (args, 0..) |arg_chan, i| {
+                    if (i < callee_func.param_channels.len) {
+                        const dst_chan = callee_func.param_channels[i];
+                        const w = self.runtime.elemWidth(arg_chan);
+                        if (w > 0) {
+                            if (arg_chan == dst_chan) continue;
+                            const src = self.runtime.rawPtr(arg_chan);
+                            const dst = self.runtime.rawPtr(dst_chan);
+                            @memcpy(dst[0..w], src[0..w]);
+                        }
+                    }
+                }
+                // 设置跳转信号：execFunction 主循环检测后切换到 callee 函数体
+                self.tco_jump_to = call_meta.func_index;
+                self.tco_restart = true;
+                return;
+            }
         }
 
         // 非尾调用自递归：标准调用逻辑
@@ -2955,6 +3527,22 @@ pub const Engine = struct {
         }
     }
 
+    /// 哈希参数字节为 u64（FNV-1a 变体）
+    /// 仅用于标量参数（isScalarChanType 已在 IRBuilder 中保证参数为标量）
+    fn hashArgs(self: *Engine, args: []const u16) u64 {
+        var h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+        for (args) |arg_chan| {
+            const w = self.runtime.elemWidth(arg_chan);
+            if (w == 0) continue;
+            const src = self.runtime.rawPtr(arg_chan);
+            for (src[0..w]) |b| {
+                h ^= b;
+                h *%= 0x100000001b3; // FNV-1a prime
+            }
+        }
+        return h;
+    }
+
     // ════════════════════════════════════════════
     // 向量操作（Phase 3）
     // ════════════════════════════════════════════
@@ -3091,6 +3679,177 @@ pub const Engine = struct {
             }
         }
         return null;
+    }
+
+    /// 预编译有效节点为 BodyInst 数组（直接函数指针调用，无 switch dispatch）
+    /// 若任一节点的 op 不在 opToScalarExecFn 中，返回 null（调用方回退到 execBodyNodesCompact）
+    fn compileActiveNodes(self: *Engine, nodes: []const Node, start: usize, active: []const u32) ?[]BodyInst {
+        if (active.len == 0) return null;
+        const insts = self.tctx.?.backing.alloc(BodyInst, active.len) catch return null;
+        for (active, 0..) |local_idx, i| {
+            const node = &nodes[start + local_idx];
+            const exec_fn = opToScalarExecFn(node.op) orelse {
+                self.tctx.?.backing.free(insts);
+                return null;
+            };
+            insts[i] = .{ .exec = exec_fn, .node = node };
+        }
+        return insts;
+    }
+
+    /// 执行预编译的指令数组（紧凑直接调用循环，无 execNode switch）
+    /// 仅处理不含 halt_return/throw/panic 的 body（break/continue 通过 error 传播）
+    fn execCompiledCompact(self: *Engine, insts: []const BodyInst) EngineError!void {
+        for (insts) |inst| {
+            try inst.exec(self, inst.node);
+        }
+    }
+
+    /// 编译函数体为 FuncBodyCache（TCO 主循环优化）
+    /// 当 body_skip 全为 false 时使用 direct 路径（零间接寻址）
+    /// 否则使用 compact_idx 路径（紧凑索引数组，消除 body_skip 检查）
+    /// 记录 TCO call 节点位置 + 预计算参数复制信息
+    fn compileFuncBody(
+        self: *Engine,
+        func_idx: u16,
+        nodes: []const Node,
+        body_skip: []const bool,
+        tco_call_node_idx: ?usize,
+        tco_call_meta_idx: u16,
+    ) ?FuncBodyCache {
+        const backing = self.tctx.?.backing;
+
+        // 统计有效节点数（排除 body_skip）+ 检测是否全有效
+        var count: u32 = 0;
+        var all_active = true;
+        for (0..nodes.len) |i| {
+            if (!body_skip[i]) {
+                count += 1;
+            } else {
+                all_active = false;
+            }
+        }
+        if (count == 0) return null;
+
+        // 预计算 TCO 参数复制信息（避免每次迭代的 elemWidth/rawPtr 查找）
+        var tco_arg_count: u8 = 0;
+        var tco_arg_dst_chans: [16]u16 = [_]u16{0} ** 16;
+        var tco_arg_widths: [16]u8 = [_]u8{0} ** 16;
+        if (tco_call_node_idx != null and tco_call_meta_idx > 0 and tco_call_meta_idx <= self.ir.call_metas.len) {
+            const call_meta = self.ir.call_metas[tco_call_meta_idx - 1];
+            const tco_node = &nodes[tco_call_node_idx.?];
+            const tco_args = tco_node.inputs[0..call_meta.arg_count];
+            const arg_count = @min(tco_args.len, 16);
+            tco_arg_count = @intCast(arg_count);
+            const param_channels = self.ir.functions[func_idx].param_channels;
+            for (0..arg_count) |j| {
+                if (j < param_channels.len) {
+                    tco_arg_dst_chans[j] = param_channels[j];
+                    tco_arg_widths[j] = self.runtime.elemWidth(tco_args[j]);
+                }
+            }
+        }
+
+        if (all_active) {
+            // Direct 路径：body_skip 全 false，直接遍历 nodes，零间接寻址
+            // 不分配 compact_idx，tco_node_idx 直接指向 nodes 中的索引
+
+            // 尝试编译 body [0..tco_node_idx) 为 BodyInst 数组（TCO hot path 优化）
+            // 跳过 execNode 的 100+ 分支 switch dispatch
+            // 仅当所有 body 节点的 op 都被 opToScalarExecFn 支持时才编译
+            var body_insts: []BodyInst = &.{};
+            var body_has_call = false;
+            if (tco_call_node_idx) |tci| {
+                if (tci > 0) {
+                    var all_supported = true;
+                    for (nodes[0..tci]) |n| {
+                        if (opToScalarExecFn(n.op) == null) {
+                            all_supported = false;
+                            break;
+                        }
+                        if (n.op == .call) body_has_call = true;
+                    }
+                    if (all_supported) {
+                        body_insts = backing.alloc(BodyInst, tci) catch &.{};
+                        for (0..tci) |i| {
+                            body_insts[i] = .{
+                                .exec = opToScalarExecFn(nodes[i].op).?,
+                                .node = &nodes[i],
+                            };
+                        }
+                    }
+                }
+            } else {
+                // 无 TCO：编译全函数体为 BodyInst（消除 execNode switch dispatch）
+                // 非尾递归函数也受益于直接函数指针调用
+                var all_supported = true;
+                for (nodes) |n| {
+                    if (opToScalarExecFn(n.op) == null) {
+                        all_supported = false;
+                        break;
+                    }
+                    if (n.op == .call) body_has_call = true;
+                }
+                if (all_supported and nodes.len > 0) {
+                    body_insts = backing.alloc(BodyInst, nodes.len) catch &.{};
+                    for (nodes, 0..) |n, i| {
+                        body_insts[i] = .{
+                            .exec = opToScalarExecFn(n.op).?,
+                            .node = &nodes[i],
+                        };
+                    }
+                }
+            }
+
+            const result = FuncBodyCache{
+                .compact_idx = &.{},
+                .tco_node_idx = if (tco_call_node_idx) |tci| @intCast(tci) else null,
+                .direct = true,
+                .tco_arg_count = tco_arg_count,
+                .tco_arg_dst_chans = tco_arg_dst_chans,
+                .tco_arg_widths = tco_arg_widths,
+                .body_insts = body_insts,
+                .body_has_call = body_has_call,
+            };
+            if (func_idx < self.func_body_cache.len) {
+                self.func_body_cache[func_idx] = result;
+            }
+            return result;
+        }
+
+        // Compact 路径：构建紧凑索引数组，排除 body_skip 的节点
+        const compact_idx = backing.alloc(u32, count) catch return null;
+
+        var tco_compact_idx: ?u32 = null;
+        var idx: u32 = 0;
+        for (0..nodes.len) |i| {
+            if (body_skip[i]) continue;
+            compact_idx[idx] = @intCast(i);
+
+            // 记录 TCO call 节点在紧凑索引中的位置
+            if (tco_call_node_idx) |tci| {
+                if (i == tci) {
+                    tco_compact_idx = idx;
+                }
+            }
+            idx += 1;
+        }
+
+        const result = FuncBodyCache{
+            .compact_idx = compact_idx,
+            .tco_node_idx = tco_compact_idx,
+            .direct = false,
+            .tco_arg_count = tco_arg_count,
+            .tco_arg_dst_chans = tco_arg_dst_chans,
+            .tco_arg_widths = tco_arg_widths,
+        };
+
+        // 写入缓存
+        if (func_idx < self.func_body_cache.len) {
+            self.func_body_cache[func_idx] = result;
+        }
+
+        return result;
     }
 
     /// LICM：分析循环不变量，返回不变量节点的本地索引数组（相对 body 子图起始）
@@ -3286,10 +4045,20 @@ pub const Engine = struct {
                 }
             }
 
+            // 预编译有效节点为直接调用指令（消除 execNode switch dispatch）
+            // 若任一节点 op 不支持直接调用，返回 null，运行时回退到 execBodyNodesCompact
+            const body_node_start = body_local_start + cond_len;
+            const cond_compiled = self.compileActiveNodes(nodes, body_local_start, cond_active);
+            const body_compiled = self.compileActiveNodes(nodes, body_node_start, body_active);
+            const inv_compiled = self.compileActiveNodes(nodes, body_local_start, invariant_active);
+
             const result = LoopActiveCache{
                 .cond_active = cond_active,
                 .body_active = body_active,
                 .invariant_active = invariant_active,
+                .cond_compiled = cond_compiled,
+                .body_compiled = body_compiled,
+                .invariant_compiled = inv_compiled,
             };
             if (meta_idx < self.loop_active_cache.len) {
                 self.loop_active_cache[meta_idx] = result;
@@ -3299,36 +4068,66 @@ pub const Engine = struct {
 
         // LICM：循环前执行一次不变量子图（纯计算节点，输入不依赖循环变量）
         if (lac.invariant_active.len > 0) {
-            const inv_result = try self.execBodyNodesCompact(nodes, body_local_start, lac.invariant_active);
-            if (inv_result) |halt_chan| return halt_chan;
+            if (lac.invariant_compiled) |insts| {
+                try self.execCompiledCompact(insts);
+            } else {
+                const inv_result = try self.execBodyNodesCompact(nodes, body_local_start, lac.invariant_active);
+                if (inv_result) |halt_chan| return halt_chan;
+            }
         }
 
         switch (lm.loop_kind) {
             .loop => {
                 // 无限循环，仅 break 退出
-                while (true) {
-                    const result = self.execBodyNodesCompact(nodes, body_local_start, lac.body_active) catch |err| switch (err) {
-                        error.LoopBreak => break,
-                        error.LoopContinue => continue,
-                        else => return err,
-                    };
-                    if (result) |halt_chan| return halt_chan;
+                if (lac.body_compiled) |insts| {
+                    while (true) {
+                        self.execCompiledCompact(insts) catch |err| switch (err) {
+                            error.LoopBreak => break,
+                            error.LoopContinue => continue,
+                            else => return err,
+                        };
+                    }
+                } else {
+                    while (true) {
+                        const result = self.execBodyNodesCompact(nodes, body_local_start, lac.body_active) catch |err| switch (err) {
+                            error.LoopBreak => break,
+                            error.LoopContinue => continue,
+                            else => return err,
+                        };
+                        if (result) |halt_chan| return halt_chan;
+                    }
                 }
             },
             .while_loop => {
                 // while 循环：每轮先执行条件子图，再检查条件
                 const cond_len = lm.cond_len;
+                const cond_compiled = lac.cond_compiled;
+                const body_compiled = lac.body_compiled;
                 while (true) {
-                    const cond_result = try self.execBodyNodesCompact(nodes, body_local_start, lac.cond_active);
-                    if (cond_result) |halt_chan| return halt_chan;
+                    // 条件段
+                    if (cond_compiled) |insts| {
+                        try self.execCompiledCompact(insts);
+                    } else {
+                        const cond_result = try self.execBodyNodesCompact(nodes, body_local_start, lac.cond_active);
+                        if (cond_result) |halt_chan| return halt_chan;
+                    }
                     const cond = self.runtime.readBool(lm.cond_chan);
                     if (!cond) break;
-                    const body_result = self.execBodyNodesCompact(nodes, body_local_start + cond_len, lac.body_active) catch |err| switch (err) {
-                        error.LoopBreak => break,
-                        error.LoopContinue => continue,
-                        else => return err,
-                    };
-                    if (body_result) |halt_chan| return halt_chan;
+                    // 循环体段
+                    if (body_compiled) |insts| {
+                        self.execCompiledCompact(insts) catch |err| switch (err) {
+                            error.LoopBreak => break,
+                            error.LoopContinue => continue,
+                            else => return err,
+                        };
+                    } else {
+                        const body_result = self.execBodyNodesCompact(nodes, body_local_start + cond_len, lac.body_active) catch |err| switch (err) {
+                            error.LoopBreak => break,
+                            error.LoopContinue => continue,
+                            else => return err,
+                        };
+                        if (body_result) |halt_chan| return halt_chan;
+                    }
                 }
             },
             .for_loop => {
@@ -3338,21 +4137,30 @@ pub const Engine = struct {
                 const elem_w = self.runtime.elemWidth(vec_chan);
                 const base_ptr = self.runtime.chan_ptrs[vec_chan].?;
 
-                for (0..count) |i| {
-                    // pin 循环变量到当前元素
-                    self.runtime.chan_ptrs[lm.iter_chan] = base_ptr + i * elem_w;
-                    self.runtime.chan_lengths[lm.iter_chan] = 1;
-
-                    const result = self.execBodyNodesCompact(nodes, body_local_start, lac.body_active) catch |err| switch (err) {
-                        error.LoopBreak => break,
-                        error.LoopContinue => continue,
-                        else => return err,
-                    };
-                    if (result) |halt_chan| {
-                        // 恢复向量通道
-                        self.runtime.chan_ptrs[vec_chan] = base_ptr;
-                        self.runtime.chan_lengths[vec_chan] = count;
-                        return halt_chan;
+                if (lac.body_compiled) |insts| {
+                    for (0..count) |i| {
+                        self.runtime.chan_ptrs[lm.iter_chan] = base_ptr + i * elem_w;
+                        self.runtime.chan_lengths[lm.iter_chan] = 1;
+                        self.execCompiledCompact(insts) catch |err| switch (err) {
+                            error.LoopBreak => break,
+                            error.LoopContinue => continue,
+                            else => return err,
+                        };
+                    }
+                } else {
+                    for (0..count) |i| {
+                        self.runtime.chan_ptrs[lm.iter_chan] = base_ptr + i * elem_w;
+                        self.runtime.chan_lengths[lm.iter_chan] = 1;
+                        const result = self.execBodyNodesCompact(nodes, body_local_start, lac.body_active) catch |err| switch (err) {
+                            error.LoopBreak => break,
+                            error.LoopContinue => continue,
+                            else => return err,
+                        };
+                        if (result) |halt_chan| {
+                            self.runtime.chan_ptrs[vec_chan] = base_ptr;
+                            self.runtime.chan_lengths[vec_chan] = count;
+                            return halt_chan;
+                        }
                     }
                 }
 
@@ -3565,6 +4373,56 @@ pub const Engine = struct {
     fn wrapStore(self: *Engine, node: *const Node) EngineError!void {
         try self.execStore(node);
     }
+    fn wrapHaltBreak(self: *Engine, node: *const Node) EngineError!void {
+        _ = node;
+        _ = self;
+        return error.LoopBreak;
+    }
+    fn wrapHaltContinue(self: *Engine, node: *const Node) EngineError!void {
+        _ = node;
+        _ = self;
+        return error.LoopContinue;
+    }
+    fn wrapHaltReturn(self: *Engine, node: *const Node) EngineError!void {
+        // 设置 pending_halt 信号，TCO 主循环检查后跳出
+        self.pending_halt = node.inputs[0];
+    }
+    fn wrapCall(self: *Engine, node: *const Node) EngineError!void {
+        try self.execCall(node);
+    }
+    fn wrapVecSelect(self: *Engine, node: *const Node) EngineError!void {
+        try self.execVecSelect(node);
+    }
+    fn wrapHaltThrow(self: *Engine, node: *const Node) EngineError!void {
+        _ = self;
+        _ = node;
+        return error.Thrown;
+    }
+    fn wrapRecordMake(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRecordMake(node);
+    }
+    fn wrapRecordGet(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRecordGet(node);
+    }
+    fn wrapRecordSet(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRecordSet(node);
+    }
+    fn wrapRecordClone(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRecordClone(node);
+    }
+    fn wrapRouteGetTag(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRouteGetTag(node);
+    }
+    fn wrapRouteDispatch(self: *Engine, node: *const Node) EngineError!void {
+        // route_dispatch 可能返回 halt channel（body 内含 halt 节点）
+        // 通过 pending_halt 传播，与非 TCO direct 路径的 halt 机制一致
+        if (try self.execRouteDispatch(node)) |halt_chan| {
+            self.pending_halt = halt_chan;
+        }
+    }
+    fn wrapRouteMerge(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRouteMerge(node);
+    }
 
     /// NodeOp → 直接调用函数指针映射
     /// 返回 null 表示该 op 不支持直接调用（非标量 op 或含动态分派）
@@ -3608,6 +4466,19 @@ pub const Engine = struct {
             .cast_safe => &wrapCastSafe,
             .load => &wrapLoad,
             .store => &wrapStore,
+            .halt_break => &wrapHaltBreak,
+            .halt_continue => &wrapHaltContinue,
+            .halt_return => &wrapHaltReturn,
+            .halt_throw => &wrapHaltThrow,
+            .call => &wrapCall,
+            .vec_select => &wrapVecSelect,
+            .record_make => &wrapRecordMake,
+            .record_get => &wrapRecordGet,
+            .record_set => &wrapRecordSet,
+            .record_clone => &wrapRecordClone,
+            .route_get_tag => &wrapRouteGetTag,
+            .route_dispatch => &wrapRouteDispatch,
+            .route_merge => &wrapRouteMerge,
             else => null,
         };
     }

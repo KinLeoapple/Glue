@@ -1,8 +1,22 @@
-// Benchmark 3: 记录字段访问 + ADT 构造/匹配
-// 目标:量字段访问(accessField)、记录构造装箱、模式匹配的成本。
-// 复合值 churn(构造 + 读取 + 丢弃)走 refcount/COW + SlabPool 路径。
+// Benchmark 3: 记录字段访问 + ADT 构造/匹配（强化版）
+// 目标：压测 record make/get/set、单/多构造器 match、嵌套记录
+// 强化：1M→10M 迭代，2 字段→6 字段，单构造器→多构造器，新增嵌套记录
 
+// 单构造器记录（测试 tag 检查跳过优化）
 type Point = Point(x: i64, y: i64)
+
+// 多字段记录（测试 field_id 直接索引）
+type Box = Box(x1: i64, x2: i64, x3: i64, x4: i64, x5: i64, x6: i64)
+
+// 嵌套记录（测试复合记录构造）
+type Line = Line(start: Point, end: Point)
+
+// 多构造器 ADT（测试 tag 检查保留路径）
+type Shape =
+    | Circle(i64)              // radius
+    | Square(i64)              // side
+    | Rect(i64, i64)           // w, h
+    | Triangle(i64, i64, i64)  // a, b, c
 
 fun dist2(p: Point): i64 {
     match p {
@@ -10,16 +24,66 @@ fun dist2(p: Point): i64 {
     }
 }
 
+fun boxSum(b: Box): i64 {
+    match b {
+        Box(x1, x2, x3, x4, x5, x6) => x1 + x2 + x3 + x4 + x5 + x6
+    }
+}
+
+fun lineLen(l: Line): i64 {
+    match l {
+        Line(s, e) => dist2(s) + dist2(e)
+    }
+}
+
+fun shapeArea(s: Shape): i64 {
+    match s {
+        Circle(r) => 3 * r * r
+        Square(side) => side * side
+        Rect(w, h) => w * h
+        Triangle(a, b, c) => (a + b + c) / 3
+    }
+}
+
+fun shapeClassify(s: Shape): i64 {
+    match s {
+        Circle(_) => 1
+        Square(_) => 2
+        Rect(_, _) => 3
+        Triangle(_, _, _) => 4
+    }
+}
+
 fun main() {
     var sum: i64 = 0
     var i: i64 = 0
-    while i < 1000000 {
-        // 取模限制输入范围,避免 dist2 中间值过大
+    while i < 10000000 {
+        // 取模限制输入范围
         val v = i % 10000
         val p = Point(v, v + 1)
-        // 取模避免数值累积溢出(本基准关注记录操作成本,非算术)
-        sum = (sum + dist2(p) + p.x - p.y) % 1073741824
+        // Point 单构造器 match（应走优化路径）
+        // Box 多字段记录（测试字段访问开销）
+        val b = Box(v, v + 1, v + 2, v + 3, v + 4, v + 5)
+        // Line 嵌套记录
+        val l = Line(p, Point(v + 2, v + 3))
+        sum = (sum + dist2(p) + boxSum(b) + lineLen(l) + p.x - p.y) % 1073741824
         i = i + 1
     }
     println(sum)
+
+    // --- 多构造器 match 压测（测试 tag 检查保留路径）---
+    var shapeSum: i64 = 0
+    var j: i64 = 0
+    while j < 5000000 {
+        val v = j % 4
+        val s = match v {
+            0 => Circle(j % 100 + 1)
+            1 => Square(j % 100 + 1)
+            2 => Rect(j % 100 + 1, j % 50 + 1)
+            _ => Triangle(j % 100 + 1, j % 50 + 1, j % 25 + 1)
+        }
+        shapeSum = (shapeSum + shapeArea(s) + shapeClassify(s)) % 1073741824
+        j = j + 1
+    }
+    println(shapeSum)
 }

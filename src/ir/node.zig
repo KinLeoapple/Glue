@@ -120,14 +120,21 @@ pub const NodeOp = enum(u8) {
 /// 统一节点结构：固定 16 字节
 ///
 /// 字段布局（按对齐优化）：
-///   op: 1B + input_count: 1B + output: 2B + meta_index: 2B + inputs: 8B + _pad: 2B = 16B
+///   op: 1B + input_count: 1B + output: 2B + meta_index: 2B + inputs: 8B
+///   + scalar_tag: 1B + _pad: 1B = 16B
+///
+/// scalar_tag: 预计算的 ScalarTag(u8)，0xFF 表示无标量类型（非数值节点）。
+/// 由引擎 layout 后一次性预计算，避免热路径中 chanToScalarTag 的 switch 分派。
 pub const Node = struct {
     op: NodeOp, // 操作类型
     input_count: u8, // 实际输入数（0-4）
     output: u16, // 输出通道索引（全局）
     meta_index: u16, // 元数据表索引（指向对应 meta 表，0 表示无元数据）
     inputs: [4]u16 = .{ 0, 0, 0, 0 }, // 输入通道索引（全局）
-    _pad: u16 = 0, // 显式填充至 16 字节（缓存行友好）
+    /// 预计算的 ScalarTag（@intFromEnum(scalar.ScalarTag)），0xFF = 无标量类型
+    /// 热路径直接读取，避免 chanToScalarTag 运行时 switch
+    scalar_tag: u8 = 0xFF,
+    _pad: u8 = 0, // 显式填充至 16 字节（缓存行友好）
 
     /// 构造一个节点
     pub fn make(

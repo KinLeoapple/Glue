@@ -1,0 +1,39 @@
+// 相等性测试：== 值相等 + === 引用相等
+
+type List = | Nil | Cons(i32, List)
+type UserId = UserId(i32)
+
+fun main() {
+    // ---- 标量值相等 ----
+    println(1 == 1)
+    println(1 != 2)
+    println(1.0 == 1.0)
+    println(true == true)
+
+    // ---- str 值相等 ----
+    println("hello" == "hello")
+    println("hello" != "world")
+
+    // ---- array 值相等 ----
+    println([1, 2, 3] == [1, 2, 3])
+    println([1, 2, 3] != [1, 2, 4])
+
+    // ---- ADT 值相等 ----
+    println(Cons(1, Nil) == Cons(1, Nil))
+    println(Cons(1, Nil) != Cons(2, Nil))
+
+    // ---- newtype 值相等 ----
+    println(UserId(42) == UserId(42))
+    println(UserId(42) != UserId(43))
+
+    // ---- 引用相等 === ----
+    val x = Cons(1, Nil)
+    println(x === x)
+    println(Cons(1, Nil) !== Cons(1, Nil))
+
+    // ---- 标量 === 退化为 == ----
+    println(1 === 1)
+    println(1 !== 2)
+
+    println("done")
+}

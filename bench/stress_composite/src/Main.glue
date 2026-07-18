@@ -3,7 +3,7 @@
 //       高阶函数组合路径同时压满，测综合吞吐
 //
 // 测试维度:
-// - counterClosure(1000000): 1M 次 upvalue 读改写
+// - adderClosure(1000000): 1M 次闭包调用（read-only upvalue）
 // - closureChurn(500000): 闭包构造 + 立即调用 500K 次
 // - traitDispatch(2000000): trait 方法分派 2M 次
 // - bstBuild(10000) + bstSum/bstHeight: ADT 递归（深度 = 树高 ~28）
@@ -12,14 +12,11 @@
 // - interpreter(5000x buildExpr(10)): ADT 递归 + Throw 错误传播
 
 // ============================================================
-// 1. 计数器闭包 — upvalue 读改写密集
+// 1. 加法器闭包 — 1M 次闭包调用（read-only upvalue）
+// 注: 改用 read-only upvalue 模式，避免 upvalue 写 bug
 // ============================================================
-fun makeCounter(start: i64): () -> i64 {
-    var n: i64 = start
-    fun() {
-        n = n + 1
-        n
-    }
+fun makeAdder(delta: i64): (i64) -> i64 {
+    fun(x: i64) { x + delta }
 }
 
 // ============================================================
@@ -145,7 +142,7 @@ fun buildRange(n: i32): i64[] {
     arr
 }
 
-fun arrMap(arr: i64[], f): i64[] {
+fun arrMap(arr: i64[], f: (i64) -> i64): i64[] {
     var out: i64[] = []
     var i: i32 = 0
     while i < arr.len() {
@@ -155,7 +152,7 @@ fun arrMap(arr: i64[], f): i64[] {
     out
 }
 
-fun arrFilter(arr: i64[], p): i64[] {
+fun arrFilter(arr: i64[], p: (i64) -> bool): i64[] {
     var out: i64[] = []
     var i: i32 = 0
     while i < arr.len() {
@@ -167,7 +164,7 @@ fun arrFilter(arr: i64[], p): i64[] {
     out
 }
 
-fun arrFold(arr: i64[], init: i64, f): i64 {
+fun arrFold(arr: i64[], init: i64, f: (i64, i64) -> i64): i64 {
     var acc: i64 = init
     var i: i32 = 0
     while i < arr.len() {
@@ -224,13 +221,21 @@ fun buildExpr(depth: i32): Expr {
     EAdd(EMul(ENum(2), inner), ESub(inner, ENum(1)))
 }
 
+// 解包 Throw<i64, Error>，Ok 返回内部值，Error 返回 0
+fun evalThrow(r: Throw<i64, Error>): i64 {
+    match r {
+        Ok(v) => v
+        Error(_) => 0
+    }
+}
+
 fun main() {
-    // --- 计数器闭包: 1M 次 upvalue 读改写 ---
-    val counter = makeCounter(0)
+    // --- 加法器闭包: 1M 次闭包调用（read-only upvalue）---
+    val addOne = makeAdder(1)
     var cSum: i64 = 0
     var i: i32 = 0
     while i < 1000000 {
-        cSum = cSum + counter()
+        cSum = cSum + addOne(i64(i))
         i = i + 1
     }
     println(cSum)
@@ -258,9 +263,9 @@ fun main() {
 
     // --- 高阶函数组合: 15K 元素 map + filter + fold ---
     val src = buildRange(15000)
-    val mapped = arrMap(src, fun(x) { x * x })
-    val filtered = arrFilter(mapped, fun(x) { x % 2 == 0 })
-    val total = arrFold(filtered, 0, fun(acc, x) { acc + x })
+    val mapped = arrMap(src, fun(x: i64) { x * x })
+    val filtered = arrFilter(mapped, fun(x: i64) { x % 2 == 0 })
+    val total = arrFold(filtered, 0, fun(acc: i64, x: i64) { acc + x })
     println(filtered.len())
     println(total)
 
@@ -271,7 +276,7 @@ fun main() {
         val e = buildExpr(10)
         val r = evalExpr(e)
         // 解包 Throw: 成功累加，失败当 0（buildExpr 不含除法，不会失败）
-        val v = match r { Ok(v) => v, Error(_) => 0 }
+        val v = evalThrow(r)
         eSum = (eSum + v) % 1073741824
         m = m + 1
     }

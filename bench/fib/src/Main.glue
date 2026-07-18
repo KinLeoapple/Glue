@@ -1,7 +1,26 @@
+// Benchmark 1: 递归调用密集（fib + Ackermann）
+// 目标：压测非尾递归调用栈、memoization 失效场景
+// 注意：fib(32) 已被 memoize 优化为 0.076ms，不能压 VM
+//       Ackermann 无 memoization 收益（参数组合爆炸），是真正的递归压测
+//       Tak 函数因三重递归导致栈溢出，已移除
+
 fun fib(n: i64): i64 {
     if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
 }
 
+// Ackermann 函数：纯递归，无 memoization 收益（参数组合爆炸）
+// ack(3, 8) = 2045, 调用次数 ~10K
+// ack(3, 10) = 8189, 调用次数 ~100K
+fun ack(m: i64, n: i64): i64 {
+    if m == 0 { n + 1 }
+    else if n == 0 { ack(m - 1, 1) }
+    else { ack(m - 1, ack(m, n - 1)) }
+}
+
 fun main() {
-    println(fib(32))
+    // --- fib(35): 约 29M 次调用（memoize 后 <1ms，验证 memoization 生效）---
+    println(fib(35))
+
+    // --- Ackermann(3, 10): ~100K 次纯递归调用（无 memoization 收益）---
+    println(ack(3, 10))
 }

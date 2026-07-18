@@ -28,7 +28,7 @@ pub fn add(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ByteAr
     const av: T = @bitCast(a);
     const bv: T = @bitCast(b);
     const result = switch (@typeInfo(T)) {
-        .int => |info| if (info.signedness == .signed) av +% bv else av +% bv,
+        .int => av +% bv,
         .float => av + bv,
         .bool => av or bv,
         else => @compileError("unsupported type for add"),
@@ -70,7 +70,7 @@ pub fn div(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ?ByteA
     const av: T = @bitCast(a);
     const bv: T = @bitCast(b);
     const result = switch (@typeInfo(T)) {
-        .int => if (bv == 0) null else @as(?T, @truncate(@divTrunc(av, bv))),
+        .int => if (bv == 0) null else @as(?T, @divTrunc(av, bv)),
         .float => @as(?T, av / bv),
         else => @compileError("unsupported type for div"),
     };
@@ -155,64 +155,3 @@ pub fn ge(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) bool {
     const T = NativeType(tag);
     return @as(T, @bitCast(a)) >= @as(T, @bitCast(b));
 }
-
-// ── comptime 分派表 ──
-
-/// 运算函数指针类型
-pub const BinOpFn = *const fn ([16]u8, [16]u8) [16]u8;
-pub const CmpFn = *const fn ([16]u8, [16]u8) bool;
-
-/// 生成分派表（内部辅助）
-fn buildAddTable() [scalar.ALL_TAGS.len]BinOpFn {
-    var table: [scalar.ALL_TAGS.len]BinOpFn = undefined;
-    inline for (scalar.ALL_TAGS, 0..) |tag, i| {
-        const W = byteWidth(tag);
-        table[i] = struct {
-            fn call(a: [16]u8, b: [16]u8) [16]u8 {
-                var result: [16]u8 = [_]u8{0} ** 16;
-                const ba: ByteArray(tag) = a[0..W].*;
-                const bb: ByteArray(tag) = b[0..W].*;
-                result[0..W].* = add(tag, ba, bb);
-                return result;
-            }
-        }.call;
-    }
-    return table;
-}
-
-pub const add_table = buildAddTable();
-
-// Similarly for sub, mul, etc. - create tables for the most common operations
-fn buildSubTable() [scalar.ALL_TAGS.len]BinOpFn {
-    var table: [scalar.ALL_TAGS.len]BinOpFn = undefined;
-    inline for (scalar.ALL_TAGS, 0..) |tag, i| {
-        const W = byteWidth(tag);
-        table[i] = struct {
-            fn call(a: [16]u8, b: [16]u8) [16]u8 {
-                var result: [16]u8 = [_]u8{0} ** 16;
-                result[0..W].* = sub(tag, a[0..W].*, b[0..W].*);
-                return result;
-            }
-        }.call;
-    }
-    return table;
-}
-
-pub const sub_table = buildSubTable();
-
-fn buildMulTable() [scalar.ALL_TAGS.len]BinOpFn {
-    var table: [scalar.ALL_TAGS.len]BinOpFn = undefined;
-    inline for (scalar.ALL_TAGS, 0..) |tag, i| {
-        const W = byteWidth(tag);
-        table[i] = struct {
-            fn call(a: [16]u8, b: [16]u8) [16]u8 {
-                var result: [16]u8 = [_]u8{0} ** 16;
-                result[0..W].* = mul(tag, a[0..W].*, b[0..W].*);
-                return result;
-            }
-        }.call;
-    }
-    return table;
-}
-
-pub const mul_table = buildMulTable();

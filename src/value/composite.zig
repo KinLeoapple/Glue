@@ -73,9 +73,7 @@ pub const ArrayValue = struct {
         if (!obj_header.shutdown_mode) {
             for (self.elements) |*e| e.release(tctx);
         }
-        if (self.capacity > 0) {
-            tctx.freeObj(@ptrCast(self.elements.ptr));
-        } else if (self.elements.len > 0) {
+        if (self.elements.len > 0) {
             tctx.freeObj(@ptrCast(self.elements.ptr));
         }
     }

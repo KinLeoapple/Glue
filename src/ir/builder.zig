@@ -16,6 +16,7 @@ const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
 const ir_mod = @import("ir.zig");
 const sema_output_mod = @import("sema_output.zig");
+const analysis_db_mod = @import("analysis_db");
 
 /// sema 产出的表达式类型映射契约（驱动式接入：sema 填充、builder 消费）
 const SemaResult = sema_output_mod.SemaResult;
@@ -234,6 +235,13 @@ pub const IRBuilder = struct {
     /// sema 输出契约（驱动式接入）：若非 null，inferChanTypeFromExpr 优先从此处
     /// 查询表达式类型，fallback 到自建推导。所有权归调用方，build 期间不得释放。
     sema_result: ?*const SemaResult = null,
+    /// 纯度表（驱动式接入）：若非 null，compileCall 查询函数纯度决定是否分配 memo_slot。
+    /// 所有权归调用方，build 期间不得释放。
+    purity_db: ?*const analysis_db_mod.PurityTable = null,
+    /// memo_slot 分配计数器（0 保留为"不缓存"，从 1 开始递增）
+    memo_slot_counter: u16 = 1,
+    /// 函数名 → memo_slot 映射（纯函数首次调用分配，后续相同函数复用同一 slot）
+    func_memo_slots: std.StringHashMapUnmanaged(u16) = .empty,
 
     /// 初始化构建器
     pub fn init(allocator: std.mem.Allocator) !IRBuilder {
@@ -279,6 +287,12 @@ pub const IRBuilder = struct {
         self.sema_result = sr;
     }
 
+    /// 注入纯度表（驱动式接入）。必须在 build() 之前调用。
+    /// 设置后，compileCall 会查询函数纯度，对纯函数 + 标量参数分配 memo_slot。
+    pub fn setPurityDB(self: *IRBuilder, db: ?*const analysis_db_mod.PurityTable) void {
+        self.purity_db = db;
+    }
+
     /// 释放构建器资源（不释放产出的 IR，IR 由 GlueIR.deinit 管理）
     /// 注意：build() 成功后 arena 所有权转交给 GlueIR，此函数不再释放 arena
     pub fn deinit(self: *IRBuilder) void {
@@ -293,6 +307,7 @@ pub const IRBuilder = struct {
         self.imported_modules.deinit();
         self.field_id_map.deinit();
         self.linear_rec_map.deinit();
+        self.func_memo_slots.deinit(self.allocator);
         for (self.gadt_binding_stack.items) |*m| m.deinit();
         self.gadt_binding_stack.deinit(self.allocator);
         self.pre_declared_lambda_names.deinit(self.allocator);
@@ -1875,6 +1890,7 @@ pub const IRBuilder = struct {
             .func_index = func_idx,
             .arg_count = @intCast(arguments.len),
             .tail_call = tail_call,
+            .memo_slot = self.tryAssignMemoSlot(func_name, arg_chans, ret_chan_type),
         });
 
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
@@ -1889,6 +1905,44 @@ pub const IRBuilder = struct {
             .inputs = inputs,
         });
         return out;
+    }
+
+    /// 判断通道类型是否为标量（无堆指针，可安全作为 memo key/val）
+    /// 标量：整数、浮点、布尔、字符。排除 ref/nullable/null/unit（后者无信息量或含堆指针）
+    fn isScalarChanType(ct: ChanType) bool {
+        return switch (ct) {
+            .i8_chan, .i16_chan, .i32_chan, .i64_chan, .i128_chan,
+            .u8_chan, .u16_chan, .u32_chan, .u64_chan, .u128_chan,
+            .f16_chan, .f32_chan, .f64_chan, .f128_chan,
+            .bool_chan, .char_chan => true,
+            else => false,
+        };
+    }
+
+    /// 尝试为纯函数分配 memo_slot。
+    /// 条件：purity_db 可用 + 函数为 pure + 所有实参通道为标量 + 返回类型为标量。
+    /// 同一函数名复用同一 slot（per-function memo，非 per-call-site）。
+    /// 返回 0 表示不可 memoize，>0 表示 slot 索引。
+    fn tryAssignMemoSlot(self: *IRBuilder, func_name: []const u8, arg_chans: []const u16, ret_chan_type: ChanType) u16 {
+        const pdb = self.purity_db orelse return 0;
+        if (!pdb.isPure(func_name)) return 0;
+        // 返回类型必须为标量
+        if (!isScalarChanType(ret_chan_type)) return 0;
+        // 所有实参通道必须为标量
+        for (arg_chans) |ch| {
+            const arg_type = self.channels.get(ch).chan_type;
+            // nullable 参数可能是 null 或标量，跳过（保守策略）
+            if (!isScalarChanType(arg_type)) return 0;
+        }
+        // per-function memo_slot：同函数名复用同一 slot
+        if (self.func_memo_slots.get(func_name)) |slot| return slot;
+        const slot = self.memo_slot_counter;
+        self.memo_slot_counter += 1;
+        // key 使用 arena 分配（与 IR 同生命周期）
+        const arena_alloc = self.arena.allocator();
+        const key = arena_alloc.dupe(u8, func_name) catch return 0;
+        self.func_memo_slots.put(arena_alloc, key, slot) catch return 0;
+        return slot;
     }
 
     /// 推断 Throw 表达式的 Ok 值通道类型
@@ -2393,8 +2447,185 @@ pub const IRBuilder = struct {
         return try self.compileMatchArms(scrutinee, scrutinee_chan, arms, 0);
     }
 
+    /// 判断模式是否总是匹配（无需 route_dispatch 条件选择）
+    /// wildcard/变量绑定/单构造器类型的构造器模式（含全变量子模式）总是匹配
+    fn patternAlwaysMatches(self: *IRBuilder, pattern: *const ast.Pattern) bool {
+        switch (pattern.*) {
+            .wildcard => return true,
+            .variable => |v| {
+                if (self.ctor_table.get(v.name)) |ctor| {
+                    if (ctor.fields.len != 0) return false;
+                    if (self.type_table.get(ctor.type_name)) |ti| return ti.constructors.len == 1;
+                    return false;
+                }
+                return true;
+            },
+            .constructor => |c| {
+                const ctor = self.ctor_table.get(c.name) orelse return false;
+                const ti = self.type_table.get(ctor.type_name) orelse return false;
+                if (ti.constructors.len != 1) return false;
+                for (c.patterns) |sub| {
+                    if (!self.patternAlwaysMatches(sub)) return false;
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// 跳表优化：所有 arms 都是同一 ADT 构造器模式时，用 __tag 直接索引替代线性比较
+    /// 条件：arms >= 2，全部为构造器模式（或无参构造器变量），无 guard，子模式为变量/通配符
+    /// 优化效果：O(N) 嵌套 route_dispatch 链 → O(1) tag 索引分派
+    /// 适用场景：枚举分派（如 colorToValue、tokenWeight、exprDepth）
+    fn tryCompileJumpTableMatch(self: *IRBuilder, scrutinee: *ast.Expr, scrutinee_chan: u16, arms: []const ast.MatchArm) BuildError!?u16 {
+        // 条件 1: 至少 2 个 arms
+        if (arms.len < 2) return null;
+
+        // 条件 2: 所有 arms 为构造器模式（或无参构造器变量），无 guard，子模式为变量/通配符
+        var common_type_name: ?[]const u8 = null;
+        for (arms) |arm| {
+            if (arm.guard != null) return null;
+            const ctor_name: ?[]const u8 = switch (arm.pattern.*) {
+                .constructor => |c| blk: {
+                    for (c.patterns) |sub| {
+                        switch (sub.*) {
+                            .wildcard, .variable => {},
+                            else => break :blk null,
+                        }
+                    }
+                    break :blk c.name;
+                },
+                .variable => |v| blk: {
+                    if (self.ctor_table.get(v.name)) |ctor| {
+                        if (ctor.fields.len == 0) break :blk v.name;
+                    }
+                    break :blk null;
+                },
+                else => null,
+            };
+            if (ctor_name == null) return null;
+
+            const ctor = self.ctor_table.get(ctor_name.?) orelse return null;
+            if (common_type_name) |ctn| {
+                if (!std.mem.eql(u8, ctn, ctor.type_name)) return null;
+            } else {
+                common_type_name = ctor.type_name;
+            }
+        }
+
+        const type_name = common_type_name orelse return null;
+        const type_info = self.type_table.get(type_name) orelse return null;
+
+        // 条件 3: ADT 有 > 1 个构造器（单构造器已有优化路径），且不超过 u8 容量
+        if (type_info.constructors.len <= 1) return null;
+        if (type_info.constructors.len > 255) return null;
+
+        const arena_alloc = self.arena.allocator();
+        const ctor_count = type_info.constructors.len;
+
+        // 读取 __tag（field_id=0）一次，作为 route_dispatch 的 winner 索引
+        const tag_field_meta = try self.addFieldIdMeta(0);
+        const tag_chan = try self.allocChannel(.i64_chan);
+        try self.emit(Node.makeUnary(.record_get, tag_chan, tag_field_meta, scrutinee_chan));
+
+        // 为每个构造器编译 body 子图（按 tag 索引）
+        const body_starts = try arena_alloc.alloc(u32, ctor_count);
+        const body_lens = try arena_alloc.alloc(u32, ctor_count);
+
+        var result_type: ?ChanType = null;
+
+        for (type_info.constructors, 0..) |ctor, tag_idx| {
+            // 查找该构造器对应的 arm（线性搜索，arm 数量通常 < 10）
+            var found_arm_idx: ?usize = null;
+            for (arms, 0..) |arm, i| {
+                const name_match = switch (arm.pattern.*) {
+                    .constructor => |c| std.mem.eql(u8, c.name, ctor.name),
+                    .variable => |v| std.mem.eql(u8, v.name, ctor.name),
+                    else => false,
+                };
+                if (name_match) {
+                    found_arm_idx = i;
+                    break;
+                }
+            }
+
+            const body_start: u32 = @intCast(self.nodes.items.len);
+
+            if (found_arm_idx) |arm_idx| {
+                const arm = arms[arm_idx];
+
+                try self.pushScope();
+                self.pushGadtBindingsForArm(scrutinee, arm.pattern);
+
+                // 读取字段并绑定变量（子模式已确认为变量/通配符，总是匹配）
+                const sub_patterns: []*ast.Pattern = switch (arm.pattern.*) {
+                    .constructor => |c| c.patterns,
+                    else => &.{}, // 无参构造器变量模式
+                };
+                const sub_count = @min(sub_patterns.len, ctor.fields.len);
+                for (0..sub_count) |i| {
+                    const field_meta = try self.addFieldIdMeta(@intCast(i + 1));
+                    const field_chan_type = self.resolveFieldTypeWithBindings(ctor.fields[i].type_node);
+                    const field_chan = try self.allocChannel(field_chan_type);
+                    try self.emit(Node.makeUnary(.record_get, field_chan, field_meta, scrutinee_chan));
+                    const prev_hint = self.pattern_type_hint;
+                    self.pattern_type_hint = ctor.fields[i].type_node;
+                    _ = try self.compilePatternCheck(field_chan, sub_patterns[i]);
+                    self.pattern_type_hint = prev_hint;
+                }
+
+                // 编译 body（追踪 body 表达式起始，若 body 无节点则补 load 确保最后节点是 body 输出）
+                const body_expr_start: u32 = @intCast(self.nodes.items.len);
+                const body_chan = try self.compileExpr(arm.body);
+                if (self.nodes.items.len == body_expr_start) {
+                    const load_chan = try self.allocChannel(self.channels.get(body_chan).chan_type);
+                    try self.emit(Node.makeUnary(.load, load_chan, 0, body_chan));
+                }
+
+                self.popGadtBindings();
+                self.popScope();
+
+                // 记录结果类型（取第一个真实 arm 的 body 最后节点输出类型）
+                if (result_type == null) {
+                    const body_len_tmp: u32 = @intCast(self.nodes.items.len - body_start);
+                    result_type = self.channels.get(self.nodes.items[body_start + body_len_tmp - 1].output).chan_type;
+                }
+            } else {
+                // 该构造器无对应 arm — default body 返回 unit（仅非穷尽 match 触发，sema 应拒绝）
+                const unit_chan = try self.allocChannel(.unit_chan);
+                try self.emit(Node.makeSink(.const_unit, unit_chan, 0));
+            }
+
+            const body_len: u32 = @intCast(self.nodes.items.len - body_start);
+            body_starts[tag_idx] = body_start;
+            body_lens[tag_idx] = body_len;
+        }
+
+        // 结果通道
+        const result_chan = try self.allocChannel(result_type orelse .unit_chan);
+
+        // route_dispatch with N entries indexed by tag
+        const route_meta_idx = try self.addRouteMeta(.{
+            .trait_id = 0,
+            .method_id = 0,
+            .target_count = @intCast(ctor_count),
+            .body_starts = body_starts,
+            .body_lens = body_lens,
+        });
+        try self.emit(Node.makeUnary(.route_dispatch, result_chan, route_meta_idx, tag_chan));
+
+        return result_chan;
+    }
+
     /// 递归编译 match arms：当前 arm + 剩余 arms（else 分支）
     fn compileMatchArms(self: *IRBuilder, scrutinee: *ast.Expr, scrutinee_chan: u16, arms: []const ast.MatchArm, start_idx: usize) BuildError!u16 {
+        // 跳表优化入口：首层 match 且所有 arms 为同一 ADT 构造器模式时，用 __tag 直接索引
+        if (start_idx == 0) {
+            if (try self.tryCompileJumpTableMatch(scrutinee, scrutinee_chan, arms)) |result_chan| {
+                return result_chan;
+            }
+        }
+
         if (start_idx >= arms.len) {
             // 无匹配 arm：返回 unit（实际应由 wildcard 兜底）
             const out = try self.allocChannel(.unit_chan);
@@ -2403,6 +2634,24 @@ pub const IRBuilder = struct {
         }
 
         const arm = arms[start_idx];
+
+        // 单 arm 无 guard 且 pattern 总是匹配时，跳过 route_dispatch
+        // 直接编译 pattern check（绑定变量）+ body，无需条件选择
+        if (start_idx == arms.len - 1 and arm.guard == null and self.patternAlwaysMatches(arm.pattern)) {
+            try self.pushScope();
+            self.pushGadtBindingsForArm(scrutinee, arm.pattern);
+            _ = try self.compilePatternCheck(scrutinee_chan, arm.pattern);
+            const then_start: u32 = @intCast(self.nodes.items.len);
+            const body_chan = try self.compileExpr(arm.body);
+            if (self.nodes.items.len == then_start) {
+                const load_chan = try self.allocChannel(self.channels.get(body_chan).chan_type);
+                try self.emit(Node.makeUnary(.load, load_chan, 0, body_chan));
+            }
+            self.popGadtBindings();
+            self.popScope();
+            return body_chan;
+        }
+
         const arena_alloc = self.arena.allocator();
 
         // push scope for pattern variables（check 和 then body 共享）
@@ -2612,6 +2861,59 @@ pub const IRBuilder = struct {
         }
 
         const ctor = self.ctor_table.get(ctor_name) orelse return error.UndefinedFunction;
+
+        // 单构造器类型优化：若类型只有一个构造器，__tag 永远为 0，tag 检查恒为真
+        // 跳过 record_get(__tag) + const_i + cmp_eq + cast + route_dispatch + const_bool(false)
+        // 直接读取字段并 AND 子模式检查
+        const is_single_ctor = blk: {
+            if (self.type_table.get(ctor.type_name)) |type_info| {
+                break :blk type_info.constructors.len == 1;
+            }
+            break :blk false;
+        };
+        if (is_single_ctor) {
+            const sub_count = @min(sub_patterns.len, ctor.fields.len);
+            if (sub_count == 0) return try self.emitConstBool(true);
+            // 全变量/通配符子模式：跳过 AND 链，直接读取字段并绑定
+            // Point(x, y) 等 destructure 模式的子模式总是变量绑定，AND 链冗余
+            var all_var = true;
+            for (sub_patterns[0..sub_count]) |sub| {
+                switch (sub.*) {
+                    .wildcard, .variable => {},
+                    else => all_var = false,
+                }
+            }
+            if (all_var) {
+                for (0..sub_count) |i| {
+                    const field_meta = try self.addFieldIdMeta(@intCast(i + 1));
+                    const field_chan_type = self.resolveFieldTypeWithBindings(ctor.fields[i].type_node);
+                    const field_chan = try self.allocChannel(field_chan_type);
+                    try self.emit(Node.makeUnary(.record_get, field_chan, field_meta, scrutinee_chan));
+                    const prev_hint = self.pattern_type_hint;
+                    self.pattern_type_hint = ctor.fields[i].type_node;
+                    _ = try self.compilePatternCheck(field_chan, sub_patterns[i]);
+                    self.pattern_type_hint = prev_hint;
+                }
+                return try self.emitConstBool(true);
+            }
+            var result_chan = try self.emitConstBool(true);
+            for (0..sub_count) |i| {
+                const field_meta = try self.addFieldIdMeta(@intCast(i + 1));
+                const field_chan_type = self.resolveFieldTypeWithBindings(ctor.fields[i].type_node);
+                const field_chan = try self.allocChannel(field_chan_type);
+                try self.emit(Node.makeUnary(.record_get, field_chan, field_meta, scrutinee_chan));
+                const prev_hint = self.pattern_type_hint;
+                self.pattern_type_hint = ctor.fields[i].type_node;
+                const sub_check_chan = try self.compilePatternCheck(field_chan, sub_patterns[i]);
+                self.pattern_type_hint = prev_hint;
+                const and_chan = try self.allocChannel(.bool_chan);
+                const and_meta = try self.addScalarMeta(.{ .kind = .bool });
+                try self.emit(Node.makeBinary(.bool_and, and_chan, and_meta, result_chan, sub_check_chan));
+                result_chan = and_chan;
+            }
+            return result_chan;
+        }
+
         const arena_alloc = self.arena.allocator();
 
         // 读取 __tag 字段（field_id=0）

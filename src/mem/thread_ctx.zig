@@ -207,24 +207,26 @@ pub const ThreadContext = struct {
             const object_size: usize = page_pool.pageHeader(page).object_size;
             const all_free = freeToPage(page, ptr);
             if (!all_free) return;
-            // 页全空：缓存或归还
+            // 页全空：线性扫描对应槽位
             const sz: u16 = @intCast(object_size);
             for (&self.pools) |*slot| {
                 if (slot.object_size != sz) continue;
                 if (slot.active == page) {
                     slot.active = null;
                     if (slot.cached == null) {
-                        slot.cached = page;
+                        slot.cached = page; // 缓存全空页
                     } else {
-                        self.global.returnPage(page);
+                        self.global.returnPage(page); // 已有缓存，归还
                     }
                 } else if (slot.cached == page) {
-                    // cached 页不释放
+                    // cached 页不会被释放，忽略
                 } else {
+                    // 页可能属于其他线程的 pool，归还到 global
                     self.global.returnPage(page);
                 }
                 return;
             }
+            // 未找到对应池，归还到 global
             self.global.returnPage(page);
         } else {
             // buddy 对象：block_size 从 BuddyHeader 读取

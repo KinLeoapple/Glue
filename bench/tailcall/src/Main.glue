@@ -1,19 +1,18 @@
-// Benchmark 8: 尾递归 TCO 密集
-// 目标:量尾调用优化（TailCall）路径——尾位置递归调用应复用当前帧，不增长栈。
-// 对比:countUp（尾递归，走 TCO）vs countDown（非尾递归，需新建帧）。
-// 两个函数做相同计算，但只有 countUp 能 TCO——差异即帧创建开销。
+// Benchmark 8: 尾递归 TCO 密集（强化版）
+// 目标：压测 TCO 路径、互递归 trampoline、深度递归
+// 强化：10万→1000万迭代，新增 3+ 函数互递归、状态机 TCO
 
-// 尾递归:acc 在尾位置返回，调用自身在尾位置 → TCO 复用帧
+// 尾递归求和
 fun countUp(n: i64, acc: i64): i64 {
     if n == 0 { acc } else { countUp(n - 1, acc + n) }
 }
 
-// 尾递归:乘法累积
+// 尾递归阶乘
 fun factorialTail(n: i64, acc: i64): i64 {
     if n <= 1 { acc } else { factorialTail(n - 1, acc * n) }
 }
 
-// 尾递归:交替加减
+// 尾递归交替和
 fun altSum(n: i64, acc: i64): i64 {
     if n == 0 { acc } else { altSum(n - 1, acc + (if n % 2 == 0 { n } else { -n })) }
 }
@@ -26,26 +25,58 @@ fun isOddTCO(n: i64): bool {
     if n == 0 { false } else { isEvenTCO(n - 1) }
 }
 
-fun main() {
-    // ---- 尾递归求和:100000 次迭代 ----
-    println(countUp(100000, 0))   // 5000050000
+// 三函数互递归（A→B→C→A）
+fun mod3_0(n: i64): i64 {
+    if n == 0 { 0 } else { mod3_1(n - 1) }
+}
+fun mod3_1(n: i64): i64 {
+    if n == 0 { 1 } else { mod3_2(n - 1) }
+}
+fun mod3_2(n: i64): i64 {
+    if n == 0 { 2 } else { mod3_0(n - 1) }
+}
 
-    // ---- 尾递归阶乘:20!（i64 范围内最大精确阶乘）----
+// 状态机 TCO：模拟简单的状态转换
+fun stateMachine(steps: i64, state: i64, acc: i64): i64 {
+    if steps == 0 { acc }
+    else {
+        val new_state: i64 = (state + 1) % 4
+        val delta: i64 = if new_state == 0 { 1 } else if new_state == 1 { 2 } else if new_state == 2 { 4 } else { 8 }
+        stateMachine(steps - 1, new_state, acc + delta)
+    }
+}
+
+// 多次 TCO 调用累积（测试 TCO 启动开销）
+fun denseTCO(iters: i32): i64 {
+    var sum: i64 = 0
+    var i: i32 = 0
+    while i < iters {
+        sum = sum + countUp(1000, 0)
+        i = i + 1
+    }
+    sum
+}
+
+fun main() {
+    // ---- 尾递归求和:10000000 次迭代 ----
+    println(countUp(10000000, 0))   // 50000005000000
+
+    // ---- 尾递归阶乘:20! ----
     println(factorialTail(20, 1))
 
     // ---- 尾递归交替和 ----
-    println(altSum(100000, 0))
+    println(altSum(1000000, 0))
 
     // ---- 互相尾递归 ----
-    println(isEvenTCO(100000))   // true
-    println(isOddTCO(99999))     // true
+    println(isEvenTCO(1000000))   // true
+    println(isOddTCO(999999))     // true
+
+    // --- 三函数互递归 ---
+    println(mod3_0(1000000))
+
+    // --- 状态机 TCO ---
+    println(stateMachine(5000000, 0, 0))
 
     // ---- 密集调用:小 N 重复调用测 TCO 启动开销 ----
-    var sum: i64 = 0
-    var i: i64 = 0
-    while i < 10000 {
-        sum = sum + countUp(100, 0)
-        i = i + 1
-    }
-    println(sum)   // 10000 * 5050 = 50500000
+    println(denseTCO(50000))
 }

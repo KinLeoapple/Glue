@@ -1,0 +1,127 @@
+// Edge cases: defer — LIFO ordering, nested blocks, interaction with throw/return/loop
+
+var log: str = ""
+
+// defer runs in LIFO order on normal scope exit
+fun lifo(): Unit {
+    defer log = log + "A"
+    defer log = log + "B"
+    defer log = log + "C"
+    log = log + "body|"
+}
+
+// defer runs even when function returns early via `return`
+fun earlyReturn(n: i32): i32 {
+    defer log = log + "defer-ret|"
+    if n < 0 {
+        return -1
+    }
+    log = log + "before-ret|"
+    n
+}
+
+// defer runs when function throws (error propagation path)
+fun mayThrow(n: i32): Throw<i32, Error> {
+    defer log = log + "defer-throw|"
+    if n < 0 {
+        throw Error("negative")
+    }
+    Ok(n)
+}
+
+// nested blocks: defers accumulate and fire at function exit in LIFO order
+fun nestedBlocks(): Unit {
+    defer log = log + "outer|"
+    {
+        defer log = log + "inner|"
+        log = log + "inner-body|"
+    }
+    log = log + "outer-body|"
+}
+
+// multiple defers stacked conditionally via if branches
+fun conditionalDefer(flag: bool): Unit {
+    if flag {
+        defer log = log + "if-defer|"
+        log = log + "if-body|"
+    } else {
+        defer log = log + "else-defer|"
+        log = log + "else-body|"
+    }
+}
+
+// defer in match arms
+fun matchDefer(n: i32): i32 {
+    match n {
+        0 => {
+            defer log = log + "zero|"
+            0
+        }
+        _ => {
+            defer log = log + "nonzero|"
+            n
+        }
+    }
+}
+
+fun main() {
+    // ---- LIFO ordering ----
+    log = ""
+    lifo()
+    println(log)   // body|CBA
+
+    // ---- early return: defer still runs ----
+    log = ""
+    val r1 = earlyReturn(-5)
+    println(r1)    // -1
+    println(log)   // defer-ret|
+
+    log = ""
+    val r2 = earlyReturn(42)
+    println(r2)    // 42
+    println(log)   // before-ret|defer-ret|
+
+    // ---- throw path: defer still runs ----
+    log = ""
+    val t1 = match mayThrow(-1) {
+        Ok(v) => str(v)
+        Error(e) => "err:" + e.message()
+    }
+    println(t1)    // err:negative
+    println(log)   // defer-throw|
+
+    log = ""
+    val t2 = match mayThrow(7) {
+        Ok(v) => str(v)
+        Error(e) => "err"
+    }
+    println(t2)    // 7
+    println(log)   // defer-throw|
+
+    // ---- nested blocks: defers fire at function exit, LIFO ----
+    log = ""
+    nestedBlocks()
+    println(log)   // inner-body|outer-body|inner|outer|
+
+    // ---- conditional defer ----
+    log = ""
+    conditionalDefer(true)
+    println(log)   // if-body|if-defer|
+
+    log = ""
+    conditionalDefer(false)
+    println(log)   // else-body|else-defer|
+
+    // ---- defer in match arms ----
+    log = ""
+    val m1 = matchDefer(0)
+    println(m1)    // 0
+    println(log)   // zero|
+
+    log = ""
+    val m2 = matchDefer(5)
+    println(m2)    // 5
+    println(log)   // nonzero|
+
+    println("edge_defer: All tests passed!")
+}

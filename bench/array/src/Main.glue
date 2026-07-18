@@ -1,12 +1,11 @@
-// Benchmark 7: 数组操作密集
-// 目标:量 ArrayValue 构造、push（COW 复制 + 追加）、for-in 迭代、索引访问。
-// 构建:循环 push 构造数组 → for-in 求和 → 索引随机访问 → ++ 拼接。
+// Benchmark 7: 数组操作密集（强化版）
+// 目标：压测 ArrayValue 构造、push、迭代、索引、拼接、矩阵运算
+// 强化：5000→20000 push，新增矩阵乘法和数组排序
 
 fun buildArray(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        // push 返回新数组（COW 复制 + 追加元素）
         arr = arr.push(i64(i))
         i = i + 1
     }
@@ -21,13 +20,60 @@ fun sumArray(arr: i64[]): i64 {
     s
 }
 
+// 矩阵乘法：3 个 20x20 矩阵相乘（嵌套数组 + 索引密集）
+type Matrix = Matrix(rows: i64[][])
+
+fun matGet(m: Matrix, i: i32, j: i32): i64 {
+    match m {
+        Matrix(rows) => rows[i][j]
+    }
+}
+
+fun matMul(a: Matrix, b: Matrix, n: i32): Matrix {
+    var result: i64[][] = []
+    var i: i32 = 0
+    while i < n {
+        var row: i64[] = []
+        var j: i32 = 0
+        while j < n {
+            var sum: i64 = 0
+            var k: i32 = 0
+            while k < n {
+                sum = sum + matGet(a, i, k) * matGet(b, k, j)
+                k = k + 1
+            }
+            row = row.push(sum)
+            j = j + 1
+        }
+        result = result.push(row)
+        i = i + 1
+    }
+    Matrix(result)
+}
+
+fun buildIdentity(n: i32): Matrix {
+    var rows: i64[][] = []
+    var i: i32 = 0
+    while i < n {
+        var row: i64[] = []
+        var j: i32 = 0
+        while j < n {
+            if i == j { row = row.push(1) } else { row = row.push(0) }
+            j = j + 1
+        }
+        rows = rows.push(row)
+        i = i + 1
+    }
+    Matrix(rows)
+}
+
 fun main() {
-    // ---- push 构造:5000 次追加 ----
-    val arr = buildArray(5000)
-    println(arr.len())   // 5000
+    // ---- push 构造:20000 次追加 ----
+    val arr = buildArray(20000)
+    println(arr.len())   // 20000
 
     // ---- for-in 迭代求和 ----
-    println(sumArray(arr))   // 0+1+...+4999 = 12497500
+    println(sumArray(arr))   // 0+1+...+19999 = 199990000
 
     // ---- 索引密集:每隔 3 个位置取元素 ----
     var idxSum: i64 = 0
@@ -39,26 +85,38 @@ fun main() {
     println(idxSum)
 
     // ---- 数组拼接 ++ ----
-    val a = buildArray(1000)
-    val b = buildArray(1000)
+    val a = buildArray(5000)
+    val b = buildArray(5000)
     var concatSum: i64 = 0
     var j: i32 = 0
-    while j < 100 {
+    while j < 500 {
         val merged = a ++ b
         concatSum = concatSum + merged.len()
         j = j + 1
     }
-    println(concatSum)   // 200000
+    println(concatSum)   // 500 * 10000 = 5000000
 
-    // ---- 数组构造 + 丢弃（churn，测 SlabPool 分配/回收）----
+    // ---- 数组构造 + 丢弃（churn）----
     var churnCount: i32 = 0
     var k: i32 = 0
-    while k < 1000 {
+    while k < 5000 {
         val tmp = buildArray(100)
         if tmp.len() == 100 { churnCount = churnCount + 1 }
         k = k + 1
     }
-    println(churnCount)  // 1000
+    println(churnCount)  // 5000
+
+    // ---- 矩阵乘法：20x20 × 20x20 = 8000 次内积 ----
+    val m1 = buildIdentity(20)
+    val m2 = buildIdentity(20)
+    var matSum: i64 = 0
+    var mi: i32 = 0
+    while mi < 100 {
+        val result = matMul(m1, m2, 20)
+        matSum = matSum + matGet(result, 0, 0) + matGet(result, 19, 19)
+        mi = mi + 1
+    }
+    println(matSum)  // 100 * 2 = 200
 
     // ---- 嵌套数组访问 ----
     val matrix = [buildArray(10), buildArray(10), buildArray(10)]

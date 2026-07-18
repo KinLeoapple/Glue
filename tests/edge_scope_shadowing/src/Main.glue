@@ -1,0 +1,144 @@
+// Edge cases: variable shadowing, nested scopes, block expressions, if/match as expressions
+
+fun id(x: i32): i32 { x }
+
+fun main() {
+    // ---- simple shadowing in nested block ----
+    val x = 1
+    {
+        val x = 2
+        println(x)   // 2
+    }
+    println(x)       // 1 (outer unchanged)
+
+    // ---- shadowing with different type ----
+    val y = 10
+    {
+        val y = "hello"
+        println(y)   // hello
+    }
+    println(y)       // 10
+
+    // ---- shadowing in if branches ----
+    val z = 100
+    if z > 50 {
+        val z = 999
+        println(z)   // 999
+    }
+    println(z)       // 100
+
+    // ---- shadowing in for loop body ----
+    val w = 0
+    for i in 1..=3 {
+        val w = i * 10
+        println(w)   // 10, 20, 30
+    }
+    println(w)       // 0
+
+    // ---- block expression yields last value ----
+    val block_val = {
+        val a = 1
+        val b = 2
+        a + b
+    }
+    println(block_val)   // 3
+
+    // ---- if as expression ----
+    val cond = 5
+    val s = if cond > 3 { "big" } else { "small" }
+    println(s)       // big
+
+    // ---- nested if expression ----
+    val grade = if cond > 10 {
+        "A"
+    } else if cond > 3 {
+        "B"
+    } else {
+        "C"
+    }
+    println(grade)   // B
+
+    // ---- match as expression bound to val ----
+    val n = 2
+    val label = match n {
+        0 => "zero"
+        1 => "one"
+        2 => "two"
+        _ => "many"
+    }
+    println(label)   // two
+
+    // ---- block with shadowing yields inner value ----
+    val outer = 5
+    val result = {
+        val outer = 10
+        outer * 2
+    }
+    println(result)  // 20
+    println(outer)   // 5
+
+    // ---- parameter shadows outer var ----
+    val p = 42
+    val r = id(99)
+    println(r)       // 99
+    println(p)       // 42 (parameter doesn't affect outer)
+
+    // ---- nested function captures outer var, inner shadows ----
+    var counter = 0
+    val bump = fun() { counter = counter + 1 }
+    bump()
+    bump()
+    {
+        val counter = 1000
+        println(counter)   // 1000 (shadows in this block)
+    }
+    println(counter)       // 2 (outer counter unchanged)
+
+    // ---- multiple sequential blocks each with own scope ----
+    var acc = 0
+    {
+        val local = 5
+        acc = acc + local
+    }
+    {
+        val local = 10
+        acc = acc + local
+    }
+    println(acc)   // 15
+
+    // ---- block expression in arithmetic ----
+    val sum = { val a = 3; val b = 4; a + b } + { val c = 5; c }
+    println(sum)   // 12
+
+    // ---- shadowing in match arm ----
+    val m = match 3 {
+        0 => { val x = 0; x }
+        n => { val x = n * 2; x }
+    }
+    println(m)   // 6
+
+    // ---- deep nesting: 4 levels of blocks ----
+    val deep = {
+        val a = 1
+        {
+            val b = 2
+            {
+                val c = 3
+                {
+                    val d = 4
+                    a + b + c + d
+                }
+            }
+        }
+    }
+    println(deep)   // 10
+
+    // ---- outer var readable inside inner scope ----
+    val readable = 100
+    {
+        val inner = readable + 1
+        println(inner)   // 101
+    }
+
+    println("edge_scope_shadowing: All tests passed!")
+}

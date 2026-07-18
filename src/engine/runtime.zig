@@ -101,61 +101,61 @@ pub const Runtime = struct {
     // ════════════════════════════════════════════
 
     /// 读取 i64 值
-    pub fn readI64(self: *Runtime, chan: u16) i64 {
+    pub inline fn readI64(self: *Runtime, chan: u16) i64 {
         const ptr: *i64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         return ptr.*;
     }
 
     /// 写入 i64 值
-    pub fn writeI64(self: *Runtime, chan: u16, val: i64) void {
+    pub inline fn writeI64(self: *Runtime, chan: u16, val: i64) void {
         const ptr: *i64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         ptr.* = val;
     }
 
     /// 读取 u64 值
-    pub fn readU64(self: *Runtime, chan: u16) u64 {
+    pub inline fn readU64(self: *Runtime, chan: u16) u64 {
         const ptr: *u64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         return ptr.*;
     }
 
     /// 写入 u64 值
-    pub fn writeU64(self: *Runtime, chan: u16, val: u64) void {
+    pub inline fn writeU64(self: *Runtime, chan: u16, val: u64) void {
         const ptr: *u64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         ptr.* = val;
     }
 
     /// 读取 f64 值
-    pub fn readF64(self: *Runtime, chan: u16) f64 {
+    pub inline fn readF64(self: *Runtime, chan: u16) f64 {
         const ptr: *f64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         return ptr.*;
     }
 
     /// 写入 f64 值
-    pub fn writeF64(self: *Runtime, chan: u16, val: f64) void {
+    pub inline fn writeF64(self: *Runtime, chan: u16, val: f64) void {
         const ptr: *f64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         ptr.* = val;
     }
 
     /// 读取 bool 值
-    pub fn readBool(self: *Runtime, chan: u16) bool {
+    pub inline fn readBool(self: *Runtime, chan: u16) bool {
         const ptr: *u8 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         return ptr.* != 0;
     }
 
     /// 写入 bool 值
-    pub fn writeBool(self: *Runtime, chan: u16, val: bool) void {
+    pub inline fn writeBool(self: *Runtime, chan: u16, val: bool) void {
         const ptr: *u8 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         ptr.* = if (val) 1 else 0;
     }
 
     /// 读取堆对象指针（ref_chan）
-    pub fn readPtr(self: *Runtime, chan: u16) ?*anyopaque {
+    pub inline fn readPtr(self: *Runtime, chan: u16) ?*anyopaque {
         const ptr: *?*anyopaque = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         return ptr.*;
     }
 
     /// 写入堆对象指针（ref_chan）
-    pub fn writePtr(self: *Runtime, chan: u16, val: ?*anyopaque) void {
+    pub inline fn writePtr(self: *Runtime, chan: u16, val: ?*anyopaque) void {
         const ptr: *?*anyopaque = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         ptr.* = val;
     }
@@ -176,12 +176,12 @@ pub const Runtime = struct {
     }
 
     /// 读取原始字节指针（用于通用访问）
-    pub fn rawPtr(self: *Runtime, chan: u16) [*]u8 {
+    pub inline fn rawPtr(self: *Runtime, chan: u16) [*]u8 {
         return self.chan_ptrs[chan].?;
     }
 
     /// 获取通道元素宽度
-    pub fn elemWidth(self: *Runtime, chan: u16) u8 {
+    pub inline fn elemWidth(self: *Runtime, chan: u16) u8 {
         return self.chan_widths[chan];
     }
 

@@ -1,0 +1,117 @@
+// Edge cases: type casts — widening, narrowing, int<->float, char<->int, str conversions
+
+fun main() {
+    // ---- widening: small int -> larger int preserves value and sign ----
+    val i8v: i8 = -42
+    println(i16(i8v))           // -42
+    println(i32(i8v))           // -42
+    println(i64(i8v))           // -42
+    val u8v: u8 = 200
+    println(u16(u8v))           // 200
+    println(u32(u8v))           // 200
+    println(u64(u8v))           // 200
+
+    // ---- widening: signed -> unsigned (negative becomes large positive) ----
+    val neg: i8 = -1
+    println(u8(neg))            // 255
+    println(u16(neg))           // 65535
+
+    // ---- narrowing: in-range values preserved ----
+    val big: i64 = 1000
+    println(i16(big))           // 1000
+    println(i32(big))           // 1000
+    val ubig: u64 = 500
+    println(u16(ubig))          // 500
+    println(u8(ubig))           // 244 (500 % 256 = 244, narrowing truncates)
+
+    // ---- narrowing: i32 -> i8 wraps modulo 256 ----
+    val wide: i32 = 300
+    println(i8(wide))           // 44 (300 - 256 = 44)
+
+    // ---- int -> float (exact for small integers) ----
+    println(f32(42i32))          // 42
+    println(f64(42i32))          // 42
+    println(f64(-100i32))        // -100
+
+    // ---- int -> float (large i64 may lose precision in f32) ----
+    println(f64(2147483647i32))  // 2147483647
+
+    // ---- float -> int (truncation toward zero) ----
+    println(i32(3.14))           // 3
+    println(i32(-3.99))          // -3
+    println(i32(3.99))           // 3
+    println(i64(1234567.89))     // 1234567
+
+    // ---- float -> float (precision changes) ----
+    val d: f64 = 3.141592653589793
+    println(f32(d))              // 3.1415927 (precision loss)
+    println(f64(f32(d)))         // 3.1415927410125732 (double rounding)
+
+    // ---- float -> float widening (exact) ----
+    val f: f32 = 1.5
+    println(f64(f))              // 1.5
+
+    // ---- char <-> int ----
+    val c: char = 'A'
+    println(i32(c))              // 65
+    println(u8(c))               // 65
+    val code: i32 = 97
+    println(char(code))          // a
+    val high: i32 = 200
+    println(char(high))          // char(200)
+
+    // ---- char -> str ----
+    println(str('Z'))            // Z
+    println(str('1'))            // 1
+
+    // ---- int -> str ----
+    println(str(42i32))          // 42
+    println(str(-100i32))        // -100
+    println(str(255u8))          // 255
+    println(str(0i32))           // 0
+
+    // ---- float -> str ----
+    println(str(3.14))           // 3.14
+    println(str(-0.5))           // -0.5
+
+    // ---- bool -> str ----
+    println(str(true))           // true
+    println(str(false))          // false
+
+    // ---- chained casts: i8 -> i16 -> i32 -> f64 ----
+    val start: i8 = -7
+    val step1 = i16(start)
+    val step2 = i32(step1)
+    val step3 = f64(step2)
+    println(step3)              // -7
+
+    // ---- cast in arithmetic context ----
+    val a: i32 = 10
+    val b: i32 = 3
+    println(f64(a) / f64(b))     // 3.3333333333333335
+    println(i32(a) + i32(b))     // 13
+
+    // ---- cast result used in comparison ----
+    val small: i8 = 5
+    val large: i64 = 1000000
+    println(i64(small) < large)  // true
+    println(i8(large) > 0)       // depends on truncation
+
+    // ---- unsigned to signed of same width ----
+    val u: u8 = 200
+    println(i8(u))               // -56 (200 - 256)
+    val s: i8 = -56
+    println(u8(s))               // 200
+
+    // ---- zero conversions ----
+    println(i32(0u8))            // 0
+    println(f64(0i32))           // 0
+    println(i32(0.0))            // 0
+
+    // ---- str length and char code interaction ----
+    val s2 = "hello"
+    println(s2.len())            // 5
+    println(i32(s2[0]))          // 104 (h)
+
+    println("edge_cast: All tests passed!")
+}

@@ -16,6 +16,7 @@ const debug_allocator = @import("debug_allocator");
 const ir = @import("ir");
 const engine = @import("engine");
 const sema = @import("sema");
+const analysis_db_mod = @import("analysis_db");
 
 /// 项目清单：名称、版本与入口文件路径
 const Manifest = struct {
@@ -462,6 +463,25 @@ fn executeSource(
     };
     // 注入 sema 产出的类型映射，驱动图构建（通道宽度由 sema 类型决定）
     builder.setSemaResult(&sema_result);
+    // 运行纯度分析（fused_analysis）并注入 IRBuilder，驱动 memoization slot 分配
+    // 纯函数 + 标量参数/返回 → compileCall 分配 memo_slot，Engine 运行时缓存结果
+    // MEMO_DISABLE: 暂时禁用，调试用
+    // var analysis_db = analysis_db_mod.AnalysisDB.init(allocator);
+    // defer analysis_db.deinit();
+    // {
+    //     var fused = analysis_db_mod.FusedAnalysis.init(
+    //         allocator,
+    //         &analysis_db.const_prop,
+    //         &analysis_db.loop_invariant,
+    //         &analysis_db.purity,
+    //         &analysis_db.hoist_table,
+    //         &analysis_db.dead_code,
+    //         &analysis_db.cse,
+    //     );
+    //     defer fused.deinit();
+    //     fused.analyzeModule(&entry_module) catch {};
+    // }
+    // builder.setPurityDB(&analysis_db.purity);
     var glue_ir = builder.build(entry_module) catch |err| {
         prof.phaseEnd();
         printError(io, "{s}: IR build error: {s}\n", .{ filename, @errorName(err) });

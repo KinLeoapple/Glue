@@ -149,6 +149,7 @@ pub fn build(b: *std.Build) void {
     });
     ir_module.addImport("ast", ast_module);
     ir_module.addImport("value", value_module);
+    ir_module.addImport("analysis_db", analysis_db_module);
 
     // ---- sema 模块接入 IR 管线：type_check 及子检查器可读取 SemaResult 契约 ----
     // 依赖方向：sema → ir → (ast, value)，ir 不依赖 sema，无循环。
@@ -186,6 +187,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("debug_allocator", debug_allocator_module);
     root_module.addImport("ir", ir_module);
     root_module.addImport("engine", engine_module);
+    root_module.addImport("analysis_db", analysis_db_module);
 
     const exe = b.addExecutable(.{
         .name = "glue",
@@ -264,6 +266,7 @@ pub fn build(b: *std.Build) void {
     });
     ir_module_test.addImport("ast", ast_module);
     ir_module_test.addImport("value", value_module);
+    ir_module_test.addImport("analysis_db", analysis_db_module);
     const ir_unit_tests = b.addTest(.{
         .root_module = ir_module_test,
     });

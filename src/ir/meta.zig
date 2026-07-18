@@ -53,6 +53,9 @@ pub const CallMeta = struct {
     func_index: u16, // 被调用函数在 functions 表中的索引
     arg_count: u8, // 实际参数个数
     tail_call: bool = false, // 是否在尾位置（用于 TCO 判定）
+    /// Memoization 槽位索引。0 = 不缓存，>0 = 对应 Engine 中的 memo_cache 槽位。
+    /// 纯函数 + 标量参数/返回类型时由 IRBuilder 分配。
+    memo_slot: u16 = 0,
 };
 
 /// halt 种类：控制 cleanup 的触发时机
