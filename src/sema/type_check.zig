@@ -9,12 +9,52 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const ir = @import("ir");
 const subtype_check = @import("subtype_check");
 const trait_resolve = @import("trait_resolve");
 const throw_check = @import("throw_check");
 const kind_check = @import("kind_check");
 const gadt_check = @import("gadt_check");
 const module_check = @import("module_check");
+
+/// SemaResult 契约类型（来自 ir 模块）：sema 产出、builder 消费的表达式类型映射。
+const SemaResult = ir.SemaResult;
+const ExprInfo = ir.ExprInfo;
+const ChanType = ir.ChanType;
+
+/// 将 sema 内部 Type 表示转换为 IR 的 ChanType（决定通道宽度）。
+/// 标量类型直接映射；复合类型（record/adt/array/fn/generic/trait）→ ref_chan（堆引用）；
+/// nullable/throw 递归取内部类型；type_var/unknown 返回 null（无法静态确定）。
+fn semaTypeToChanType(ty: *Type) ?ChanType {
+    return switch (ty.*) {
+        .i8_type => .i8_chan,
+        .i16_type => .i16_chan,
+        .i32_type => .i32_chan,
+        .i64_type => .i64_chan,
+        .i128_type => .i128_chan,
+        .u8_type => .u8_chan,
+        .u16_type => .u16_chan,
+        .u32_type => .u32_chan,
+        .u64_type => .u64_chan,
+        .u128_type => .u128_chan,
+        .f16_type => .f16_chan,
+        .f32_type => .f32_chan,
+        .f64_type => .f64_chan,
+        .f128_type => .f128_chan,
+        .bool_type => .bool_chan,
+        .str_type => .ref_chan,
+        .char_type => .char_chan,
+        .null_type => .null_chan,
+        .unit_type => .unit_chan,
+        .record_type, .adt_type, .array_type, .fn_type, .generic_type, .trait_type => .ref_chan,
+        .nullable_type => |inner| blk: {
+            const inner_ct = semaTypeToChanType(inner) orelse .ref_chan;
+            break :blk inner_ct;
+        },
+        .throw_type => |tt| semaTypeToChanType(tt.value_type) orelse .ref_chan,
+        .type_var, .unknown_type => null,
+    };
+}
 fn canRoundTripFloat(comptime T: type, val: f64) bool {
     if (std.math.isNan(val) or std.math.isInf(val) or val == 0.0) {
         return true;
@@ -570,6 +610,9 @@ pub const TypeInferencer = struct {
     fn_bounds: std.StringHashMap([]ast.TraitBound),
     predeclared_fns: std.StringHashMap(void),
     suppress_errors: bool = false,
+    /// sema 输出契约：若非 null，inferExpr 会把每个表达式推断出的类型记录到此结构，
+    /// 供 IRBuilder 在图构建时读取（驱动式接入）。
+    sema_result: ?*SemaResult = null,
     exported_schemes: std.StringHashMap(TypeScheme),
     module_member_sigs: std.StringHashMap([]module_check.MethodSig),
     module_submodules: std.StringHashMap([][]const u8),
@@ -610,6 +653,12 @@ pub const TypeInferencer = struct {
             .linear_scope_stack = std.ArrayList(std.ArrayList(LinearVarInfo)).empty,
             .narrowed_paths = std.StringHashMap(void).init(allocator),
         };
+    }
+    /// 注入 SemaResult 输出契约。设置后，inferExpr 会把每个表达式的推断类型
+    /// 记录到 sema_result.expr_types，供 IRBuilder 在图构建时读取。
+    /// 传入 null 可关闭记录。SemaResult 所有权归调用方。
+    pub fn setSemaResult(self: *TypeInferencer, sr: ?*SemaResult) void {
+        self.sema_result = sr;
     }
     /// 释放所有资源。
     /// HashMap 内部结构由 backing allocator 分配，需逐一 deinit。
@@ -808,7 +857,7 @@ pub const TypeInferencer = struct {
         const encoded = try std.fmt.allocPrint(self.arena.allocator(), "{s}{s}", .{ module_ref_prefix, module_name });
         return self.makeAdtType(encoded, &[_]*Type{});
     }
-    fn asModuleRef(self: *TypeInferencer, ty: *Type) ?[]const u8 {
+    pub fn asModuleRef(self: *TypeInferencer, ty: *Type) ?[]const u8 {
         const r = self.resolve(ty);
         if (r.* == .adt_type and std.mem.startsWith(u8, r.adt_type.name, module_ref_prefix)) {
             return r.adt_type.name[module_ref_prefix.len..];
@@ -1170,6 +1219,57 @@ pub const TypeInferencer = struct {
         }.get;
         return if (rank(b.*) > rank(a.*)) b else a;
     }
+    /// 浮点类型拓宽：取两个 float 类型中较宽者（f16 < f32 < f64 < f128）。
+    fn widerFloatType(self: *TypeInferencer, a: *Type, b: *Type) *Type {
+        _ = self;
+        const rank = struct {
+            fn get(t: Type) u8 {
+                return switch (t) {
+                    .f16_type => 0,
+                    .f32_type => 1,
+                    .f64_type => 2,
+                    .f128_type => 3,
+                    else => 0,
+                };
+            }
+        }.get;
+        return if (rank(b.*) > rank(a.*)) b else a;
+    }
+    /// 数值二元运算的类型推导（Rust 风格，int/float 对称）。
+    /// 规则：
+    ///   - 字面量可提升到另一侧的显式变量类型（2 + x:i64 → i64）
+    ///   - 两侧都是字面量：选最宽类型（仅在 int 域或 float 域内，int+float 仍报错）
+    ///   - 两侧都是显式变量类型：必须完全相同，否则 TypeMismatch（需显式 cast）
+    /// 跨域（int + float）不在本函数处理范围，由调用方 unify。
+    /// 返回运算结果类型；is_arith=false 表示比较运算，结果类型仅用于诊断。
+    fn numericOpType(
+        self: *TypeInferencer,
+        left_ty: *Type,
+        right_ty: *Type,
+        left_expr: *const ast.Expr,
+        right_expr: *const ast.Expr,
+        is_arith: bool,
+    ) SemaError!*Type {
+        const rl = self.resolve(left_ty);
+        const rr = self.resolve(right_ty);
+        const left_is_literal = left_expr.* == .int_literal or left_expr.* == .float_literal;
+        const right_is_literal = right_expr.* == .int_literal or right_expr.* == .float_literal;
+        // 字面量提升到变量类型
+        if (left_is_literal and !right_is_literal) return rr;
+        if (!left_is_literal and right_is_literal) return rl;
+        // 两侧都是字面量：选最宽（同域内）
+        if (left_is_literal and right_is_literal) {
+            if (rl.isIntType() and rr.isIntType()) return self.widerIntType(rl, rr);
+            if (rl.isFloatType() and rr.isFloatType()) return self.widerFloatType(rl, rr);
+            // 跨域字面量（1 + 2.0）：提升到 float
+            if (rl.isIntType() and rr.isFloatType()) return rr;
+            if (rl.isFloatType() and rr.isIntType()) return rl;
+        }
+        // 两侧都是显式变量类型：必须完全相同
+        _ = is_arith;
+        try self.unify(left_ty, right_ty);
+        return left_ty;
+    }
     fn nullableViolation(self: *TypeInferencer, target: *Type, source: *Type) bool {
         const rt = self.resolve(target);
         const rs = self.resolve(source);
@@ -1410,7 +1510,7 @@ pub const TypeInferencer = struct {
         switch (cond.*) {
             .binary => |bin| {
                 switch (bin.op) {
-                    .not_eq => {
+                    .not_eq, .ref_neq => {
                         if (self.isNullLiteral(bin.right)) {
                             if (self.getIdentifierName(bin.left)) |name| {
                                 self.narrowing_buf[0] = .{ .name = name, .is_non_null = true };
@@ -1424,7 +1524,7 @@ pub const TypeInferencer = struct {
                             }
                         }
                     },
-                    .eq => {
+                    .eq, .ref_eq => {
                         if (self.isNullLiteral(bin.right)) {
                             if (self.getIdentifierName(bin.left)) |name| {
                                 self.narrowing_buf[0] = .{ .name = name, .is_non_null = false };
@@ -1493,8 +1593,8 @@ pub const TypeInferencer = struct {
     fn fieldPathNullCheck(self: *TypeInferencer, cond: *const ast.Expr, out_path: *?[]const u8, out_then: *bool) void {
         if (cond.* != .binary) return;
         const bin = cond.binary;
-        const is_neq = bin.op == .not_eq;
-        const is_eq = bin.op == .eq;
+        const is_neq = bin.op == .not_eq or bin.op == .ref_neq;
+        const is_eq = bin.op == .eq or bin.op == .ref_eq;
         if (!is_neq and !is_eq) return;
         const operand: ?*const ast.Expr =
             if (self.isNullLiteral(bin.right)) bin.left else if (self.isNullLiteral(bin.left)) bin.right else null;
@@ -1537,7 +1637,19 @@ pub const TypeInferencer = struct {
     }
     /// 推断表达式的类型。这是类型检查的核心入口，递归处理所有表达式变体，
     /// 结合 expected 类型进行双向类型检查。返回推断出的类型。
+    /// 表达式类型推断入口（wrapper）：委托 inferExprInner 完成实际推断，
+    /// 若 sema_result 已设置，则把 (expr 指针地址 → ChanType) 记录到 SemaResult.expr_types，
+    /// 供 IRBuilder 在图构建时读取（驱动式接入）。
     pub fn inferExpr(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv, expected: ?*Type) SemaError!*Type {
+        const ty = try self.inferExprInner(expr, env, expected);
+        if (self.sema_result) |sr| {
+            if (semaTypeToChanType(ty)) |ct| {
+                sr.putExpr(@intFromPtr(expr), .{ .chan_type = ct }) catch {};
+            }
+        }
+        return ty;
+    }
+    fn inferExprInner(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv, expected: ?*Type) SemaError!*Type {
         return switch (expr.*) {
             .int_literal => |lit| {
                 if (lit.suffix) |suffix| {
@@ -1638,18 +1750,24 @@ pub const TypeInferencer = struct {
                     .add, .sub, .mul, .div, .mod => {
                         const rl = self.resolve(left_ty);
                         const rr = self.resolve(right_ty);
-                        if (rl.isIntType() and rr.isIntType()) {
-                            return self.widerIntType(rl, rr);
+                        // 数值算术（Rust 风格）：字面量可提升到变量类型，
+                        // 两个显式变量类型不同则报错（需显式 cast）。int/float 规则对称。
+                        if (rl.isNumericType() and rr.isNumericType()) {
+                            return try self.numericOpType(left_ty, right_ty, bin.left, bin.right, true);
                         }
                         try self.unify(left_ty, right_ty);
                         return left_ty;
                     },
-                    .eq, .not_eq, .lt, .gt, .lt_eq, .gt_eq => {
+                    .eq, .not_eq, .ref_eq, .ref_neq, .lt, .gt, .lt_eq, .gt_eq => {
                         const rl = self.resolve(left_ty);
                         const rr = self.resolve(right_ty);
-                        if (!(rl.isIntType() and rr.isIntType())) {
-                            try self.unify(left_ty, right_ty);
+                        // 数值比较（Rust 风格）：字面量可提升，两个显式变量类型必须相同
+                        if (rl.isNumericType() and rr.isNumericType()) {
+                            _ = try self.numericOpType(left_ty, right_ty, bin.left, bin.right, false);
+                            return self.makeType(.bool_type);
                         }
+                        // 其他类型：严格 unify
+                        try self.unify(left_ty, right_ty);
                         return self.makeType(.bool_type);
                     },
                     .and_op, .or_op => {
@@ -1903,7 +2021,14 @@ pub const TypeInferencer = struct {
                 self.pushLinearScope();
                 var result_ty = try self.makeType(.unit_type);
                 for (blk.statements) |stmt| {
-                    _ = try self.inferStmt(stmt, child_env);
+                    const stmt_ty = try self.inferStmt(stmt, child_env);
+                    // return_stmt 的类型是函数返回值，在没有尾表达式时用作 block 类型
+                    switch (stmt.*) {
+                        .return_stmt => {
+                            if (stmt_ty) |st| result_ty = st;
+                        },
+                        else => {},
+                    }
                 }
                 if (blk.trailing_expr) |te| {
                     result_ty = try self.inferExpr(te, child_env, null);
@@ -2021,7 +2146,9 @@ pub const TypeInferencer = struct {
                     if (self.module_submodules.get(mod_name)) |subs| {
                         for (subs) |sub| {
                             if (std.mem.eql(u8, sub, fa.field)) {
-                                return self.makeModuleRef(fa.field) catch unreachable;
+                                // 使用完整模块名 "Parent.Sub"，使后续方法查找能匹配
+                                const full = std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ mod_name, fa.field }) catch return self.freshTypeVar() catch unreachable;
+                                return self.makeModuleRef(full) catch unreachable;
                             }
                         }
                     }
@@ -2195,6 +2322,12 @@ pub const TypeInferencer = struct {
                 return self.freshTypeVar();
             },
             .inline_trait_value => {
+                return self.freshTypeVar();
+            },
+            .spawn_expr => |sp| {
+                // spawn 返回 Channel<T>，元素类型由派生表达式推断。
+                // sema 侧退化为 fresh type var（不阻塞图构建），实际通道类型由 builder 决定。
+                _ = self.inferExpr(sp.expr, env, null) catch try self.freshTypeVar();
                 return self.freshTypeVar();
             },
         };
@@ -2613,6 +2746,7 @@ pub const TypeInferencer = struct {
                 }
             }
         }
+        self.registerImportedModuleStructure(module, &env);
         self.checkCrossKindNameClashes(module);
         self.suppress_errors = true;
         for (module.declarations) |decl| {
@@ -2626,6 +2760,74 @@ pub const TypeInferencer = struct {
         }
         self.popLinearScope();
         self.recordModuleStructure(module, module_name);
+    }
+    /// 扫描主模块中 mangled 名函数（如 Store.Memory.put），为导入的模块注册
+    /// 子模块列表和方法签名，使 Store.Memory 限定访问和模块作为 Trait 值可用。
+    fn registerImportedModuleStructure(self: *TypeInferencer, module: *const ast.Module, env: *TypeEnv) void {
+        for (module.declarations) |decl| {
+            if (decl != .import_decl) continue;
+            const ud = decl.import_decl;
+            if (ud.module_path.len == 0) continue;
+            if (ud.items != null) continue; // 只处理导入整个模块的情况
+            const mod = ud.module_path[0];
+
+            // 注册模块引用变量，使 Store 能被识别为模块
+            const mod_ty = self.makeModuleRef(mod) catch continue;
+            const mod_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = mod_ty };
+            env.redefine(mod, mod_scheme) catch {};
+
+            // 扫描 mangled 名函数 "Module.Sub.method"，提取子模块结构
+            var subs = std.ArrayList([]const u8).empty;
+            defer subs.deinit(self.arena.allocator());
+            var subs_seen = std.StringHashMap(void).init(self.arena.allocator());
+            defer subs_seen.deinit();
+            // 为每个子模块收集方法签名
+            var sub_sigs = std.StringHashMap(std.ArrayList(module_check.MethodSig)).init(self.arena.allocator());
+            defer {
+                var it = sub_sigs.iterator();
+                while (it.next()) |e| e.value_ptr.deinit(self.arena.allocator());
+                sub_sigs.deinit();
+            }
+
+            const prefix = std.fmt.allocPrint(self.arena.allocator(), "{s}.", .{mod}) catch continue;
+            for (module.declarations) |d| {
+                if (d != .fun_decl) continue;
+                const f = d.fun_decl;
+                if (!std.mem.startsWith(u8, f.name, prefix)) continue;
+                const rest = f.name[prefix.len..];
+                const sub_end = std.mem.indexOfScalar(u8, rest, '.') orelse continue;
+                const sub_name = rest[0..sub_end];
+                const method_name = rest[sub_end + 1 ..];
+
+                // 记录子模块名（去重）
+                if (!subs_seen.contains(sub_name)) {
+                    subs_seen.put(sub_name, {}) catch {};
+                    const sub_dup = self.arena.allocator().dupe(u8, sub_name) catch continue;
+                    subs.append(self.arena.allocator(), sub_dup) catch {};
+                }
+
+                // 记录方法签名到 "Module.Sub"
+                const full_mod = std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ mod, sub_name }) catch continue;
+                const entry = sub_sigs.getOrPut(full_mod) catch continue;
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = std.ArrayList(module_check.MethodSig).empty;
+                }
+                const method_dup = self.arena.allocator().dupe(u8, method_name) catch continue;
+                entry.value_ptr.append(self.arena.allocator(), .{ .name = method_dup, .arity = f.params.len }) catch {};
+            }
+
+            // 记录模块的子模块列表
+            self.putModuleSubmodules(mod, subs.toOwnedSlice(self.arena.allocator()) catch continue);
+
+            // 记录每个子模块的方法签名
+            var sig_it = sub_sigs.iterator();
+            while (sig_it.next()) |entry| {
+                const sigs = entry.value_ptr.items;
+                const sigs_dup = self.arena.allocator().alloc(module_check.MethodSig, sigs.len) catch continue;
+                for (sigs, 0..) |s, i| sigs_dup[i] = s;
+                self.putModuleMemberSigs(entry.key_ptr.*, sigs_dup);
+            }
+        }
     }
     fn importUseDecl(self: *TypeInferencer, ud: anytype, env: *TypeEnv) void {
         if (ud.module_path.len == 0) return;
@@ -2818,17 +3020,6 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
             env.define("Panic", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
             self.registerBuiltinName("Panic");
-        }
-        {
-            const param = self.freshTypeVar() catch return;
-            const params = self.arena.allocator().alloc(*Type, 2) catch return;
-            params[0] = param;
-            params[1] = param;
-            const fn_ty = self.makeFnType(params, self.makeType(.bool_type) catch return) catch return;
-            const qvars = self.arena.allocator().alloc(usize, 1) catch return;
-            qvars[0] = param.type_var.id;
-            env.define("eq", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("eq");
         }
         {
             const param = self.freshTypeVar() catch return;
@@ -3160,7 +3351,7 @@ pub const TypeInferencer = struct {
                 else
                     self.generalize(env, fn_ty) catch return;
                 if (self.isBuiltinName(f.name)) {
-                    if (!std.mem.eql(u8, f.name, "eq") and !std.mem.eql(u8, f.name, "compare") and !std.mem.eql(u8, f.name, "str")) {
+                    if (!std.mem.eql(u8, f.name, "compare") and !std.mem.eql(u8, f.name, "str")) {
                         self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "cannot redefine built-in name '{s}'", .{f.name});
                     } else {
                         env.redefine(f.name, final_scheme) catch return;
@@ -3482,7 +3673,9 @@ pub const TypeInferencer = struct {
                                     self.reportInferError(err, method.location);
                                     continue;
                                 };
-                                self.unify(body_ty, return_ty) catch |err| {
+                                // 与普通函数一致：用 unifyReturnType（含 int/float 拓宽），
+                                // 避免字面量推断的窄类型（如 u8 的 3）与声明的 i32 严格 unify 失败
+                                self.unifyReturnType(return_ty, body_ty) catch |err| {
                                     self.reportInferError(err, method.location);
                                 };
                             }

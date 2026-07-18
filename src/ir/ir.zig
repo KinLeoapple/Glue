@@ -85,6 +85,9 @@ pub const GlueIR = struct {
     /// 入口函数索引（main 函数在 functions 表中的位置）
     entry_index: u16 = 0,
 
+    /// 初始化函数索引（顶层 val/var 声明的初始化代码，run() 时先执行）
+    init_index: ?u16 = null,
+
     /// 持有所有权的 arena（deinit 时释放所有编译期产物）
     /// 若为 null，则 nodes/metas/functions 为外部管理的内存，deinit 不释放
     arena: ?*std.heap.ArenaAllocator = null,

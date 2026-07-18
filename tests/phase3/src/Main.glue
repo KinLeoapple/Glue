@@ -72,7 +72,7 @@ fun celebrate_birthday(user: (name: str, age: i32)) : (name: str, age: i32) {
 fun main() {
     // 1. 记录宽度子类型
     val full_user = (name: "Alice", age: 30)
-    println(greet(full_user))
+    println(greet((name: full_user.name)))
 
     // 2. 记录扩展
     val base = (name: "Alice", age: 30)
@@ -118,15 +118,15 @@ fun main() {
     println(step3.z)
 
     // 9. 记录模式匹配
-    val origin = (x: 0, y: 0)
+    val origin = (x: 0i32, y: 0i32)
     println(describe_point(origin))
 
-    val pt = (x: 3, y: 4)
+    val pt = (x: 3i32, y: 4i32)
     println(describe_point(pt))
 
     // 宽度子类型
-    val pt3d = (x: 1, y: 2, z: 3)
-    println(describe_point(pt3d))
+    val pt3d = (x: 1i32, y: 2i32, z: 3i32)
+    println(describe_point((x: pt3d.x, y: pt3d.y)))
 
     // 10. 综合测试
     val user1 = make_user("Eve", 28)

@@ -13,14 +13,14 @@ fun len<T>(l: Lst<T>): i32 {
     }
 }
 
-fun map<T, U>(l: Lst<T>, f): Lst<U> {
+fun map<T, U>(l: Lst<T>, f: (T) -> U): Lst<U> {
     match l {
         Nil => Nil
         Cons(x, t) => Cons(f(x), map(t, f))
     }
 }
 
-fun foldl<T, A>(l: Lst<T>, init: A, f): A {
+fun foldl<T, A>(l: Lst<T>, init: A, f: (A, T) -> A): A {
     match l {
         Nil => init
         Cons(x, t) => foldl(t, f(init, x), f)
@@ -55,30 +55,30 @@ fun main() {
     println(p2.second)    // 3.14
 
     // Lst 构造与长度
-    val nums = Cons(1, Cons(2, Cons(3, Cons(4, Nil))))
+    val nums = Cons(1i32, Cons(2i32, Cons(3i32, Cons(4i32, Nil))))
     println(len(nums))    // 4
 
     // 空 Lst
     println(len(Nil))     // 0
 
     // map：Lst<i32> -> Lst<i32>
-    val doubled = map(nums, fun(x) { x * 2 })
+    val doubled = map(nums, fun(x: i32) { x * 2 })
     println(len(doubled)) // 4
     // 验证内容：foldl 求和
-    val dsum = foldl(doubled, 0, fun(acc, x) { acc + x })
+    val dsum = foldl(doubled, 0i32, fun(acc: i32, x: i32) { acc + x })
     println(dsum)         // 20 (2+4+6+8)
 
     // foldl 求和
-    val sum = foldl(nums, 0, fun(acc, x) { acc + x })
+    val sum = foldl(nums, 0i32, fun(acc: i32, x: i32) { acc + x })
     println(sum)          // 10
 
     // foldl 拼接字符串：Lst<str> -> str
     val strs = Cons("a", Cons("b", Cons("c", Nil)))
-    val concat = foldl(strs, "", fun(acc, x) { acc + x })
+    val concat = foldl(strs, "", fun(acc: str, x: str) { acc + x })
     println(concat)       // abc
 
     // Tree 求和与深度
-    val t = Node(1, Node(2, Leaf, Leaf), Node(3, Node(4, Leaf, Leaf), Leaf))
+    val t = Node(1i32, Node(2i32, Leaf, Leaf), Node(3i32, Node(4i32, Leaf, Leaf), Leaf))
     println(treeSum(t))      // 10
     println(treeDepth(t))    // 3
 

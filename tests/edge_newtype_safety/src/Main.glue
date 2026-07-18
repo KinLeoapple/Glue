@@ -63,7 +63,7 @@ fun main() {
 
     // newtype 数组迭代 + 解包求和
     val temps = [Celsius(0.0), Celsius(25.0), Celsius(100.0)]
-    var sumC = 0.0
+    var sumC: f64 = 0.0
     for t in temps {
         sumC = sumC + celsiusRaw(t)
     }

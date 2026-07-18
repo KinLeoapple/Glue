@@ -218,6 +218,19 @@ pub fn inferMethodCall(
         }
     }
 
+    // 模块引用上的方法调用：查找 mangled 名函数 "Module.Sub.method"
+    if (inferencer.asModuleRef(obj_ty)) |mod_name| {
+        const mangled = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}.{s}", .{ mod_name, mc.method }) catch return inferencer.freshTypeVar() catch unreachable;
+        defer inferencer.arena.allocator().free(mangled);
+        if (env.lookup(mangled)) |scheme| {
+            const instantiated = inferencer.instantiate(scheme) catch return inferencer.freshTypeVar() catch unreachable;
+            const resolved = inferencer.resolve(instantiated);
+            if (resolved.* == .fn_type) {
+                return resolved.fn_type.return_type;
+            }
+        }
+    }
+
     // 遍历所有 trait 查找同名方法
     var trait_iter = inferencer.trait_types.iterator();
     while (trait_iter.next()) |entry| {

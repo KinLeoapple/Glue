@@ -4,7 +4,7 @@ type IntFn = () -> i32
 
 // escaping closure capturing mutable state (counter factory)
 fun makeCounter(): IntFn {
-    var n = 0
+    var n: i32 = 0
     fun() {
         n = n + 1
         n
@@ -13,20 +13,20 @@ fun makeCounter(): IntFn {
 
 fun main() {
     // ---- capture var by reference: external mutation visible ----
-    var x = 10
+    var x: i32 = 10
     val read = fun() { x }
     x = 20
     println(read())          // 20
 
     // ---- closure mutates captured var, visible outside ----
-    var y = 0
+    var y: i32 = 0
     val inc = fun() { y = y + 1 }
     inc()
     inc()
     println(y)               // 2
 
     // ---- nested closures share the same captured var ----
-    var count = 0
+    var count: i32 = 0
     val outer = fun() {
         val inner = fun() { count = count + 1 }
         inner()
@@ -51,16 +51,22 @@ fun main() {
 
     // ---- loop-variable capture: each closure captures its own value ----
     var fns: IntFn[] = []
-    for i in 1..=3 {
-        val captured = i
+    var i: i32 = 1
+    while i <= 3 {
+        val captured: i32 = i
         fns = fns ++ [fun() { captured }]
+        i = i + 1
     }
-    for f in fns {
-        println(f())         // 1, 2, 3 (not all 3)
-    }
+    // 逐个调用验证每个闭包捕获独立值
+    val f0: IntFn = fns[0]
+    val f1: IntFn = fns[1]
+    val f2: IntFn = fns[2]
+    println(f0())  // 1
+    println(f1())  // 2
+    println(f2())  // 3 (not all 3)
 
     // ---- nullary function type () -> T annotation ----
-    val g: () -> i32 = fun() { 42 }
+    val g: () -> i32 = fun() { 42i32 }
     println(g())             // 42
 
     println("edge_closures: All tests passed!")

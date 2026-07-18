@@ -52,6 +52,8 @@ pub const TokenType = enum {
     percent,
     eq_eq,
     bang_eq,
+    ref_eq,
+    ref_neq,
     lt,
     gt,
     lt_eq,
@@ -293,7 +295,11 @@ pub const Lexer = struct {
             },
             '=' => {
                 if (self.matchChar('=')) {
-                    try self.addToken(.eq_eq, start, start_line, start_col);
+                    if (self.matchChar('=')) {
+                        try self.addToken(.ref_eq, start, start_line, start_col);
+                    } else {
+                        try self.addToken(.eq_eq, start, start_line, start_col);
+                    }
                 } else if (self.matchChar('>')) {
                     try self.addToken(.eq_gt, start, start_line, start_col);
                 } else {
@@ -302,7 +308,11 @@ pub const Lexer = struct {
             },
             '!' => {
                 if (self.matchChar('=')) {
-                    try self.addToken(.bang_eq, start, start_line, start_col);
+                    if (self.matchChar('=')) {
+                        try self.addToken(.ref_neq, start, start_line, start_col);
+                    } else {
+                        try self.addToken(.bang_eq, start, start_line, start_col);
+                    }
                 } else {
                     try self.addToken(.bang, start, start_line, start_col);
                 }

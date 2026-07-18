@@ -82,10 +82,15 @@ pub const ThreadContext = struct {
     }
 
     /// 按 object_size 分配小对象（热路径：位图扫描，零锁）
+    /// object_size 自动向上取整到 8 字节对齐，确保所有对象满足 u64/f64 对齐要求
+    /// 返回切片长度 = 请求的 object_size（底层实际分配 aligned_size，多出的尾部不可用）
     pub fn allocBySize(self: *ThreadContext, object_size: usize) ![]u8 {
-        if (object_size > MAX_PAGE_OBJECT_SIZE) return self.allocLarge(object_size);
-        const idx = try self.findOrCreateSlot(object_size);
-        return self.allocByIdx(idx);
+        // 向上取整到 8 字节对齐（u64/f64 的最大对齐要求）
+        const aligned_size = std.mem.alignForward(usize, object_size, 8);
+        if (aligned_size > MAX_PAGE_OBJECT_SIZE) return self.allocLarge(object_size);
+        const idx = try self.findOrCreateSlot(aligned_size);
+        const mem = try self.allocByIdx(idx);
+        return mem[0..object_size];
     }
 
     /// 按槽位索引分配
@@ -114,8 +119,10 @@ pub const ThreadContext = struct {
     }
 
     /// 按 object_size 释放对象（热路径：清位图，零锁）
+    /// object_size 自动向上取整到 8 字节对齐，与 allocBySize 保持一致
     pub fn freeBySize(self: *ThreadContext, object_size: usize, ptr: []u8) void {
-        if (object_size > MAX_PAGE_OBJECT_SIZE) {
+        const aligned_size = std.mem.alignForward(usize, object_size, 8);
+        if (aligned_size > MAX_PAGE_OBJECT_SIZE) {
             self.freeLarge(ptr);
             return;
         }
@@ -132,7 +139,7 @@ pub const ThreadContext = struct {
         if (!all_free) return;
 
         // 页全空：归还或缓存
-        const sz: u16 = @intCast(object_size);
+        const sz: u16 = @intCast(aligned_size);
         for (&self.pools) |*slot| {
             if (slot.object_size != sz) continue;
             if (slot.active == page) {
@@ -182,6 +189,63 @@ pub const ThreadContext = struct {
     /// 函数返回：reset 临时区（O(1)）
     pub fn endFunction(self: *ThreadContext) void {
         self.arena.reset();
+    }
+
+    // ── 对象分配 API ──
+
+    /// 分配对象（统一入口）：按 total_size 路由到页池或 buddy
+    /// total_size = sizeof(Type) + payload_size（连续内存分配）
+    pub fn allocObj(self: *ThreadContext, total_size: usize) ![]u8 {
+        return self.allocBySize(total_size);
+    }
+
+    /// 释放对象（统一入口）：从分配器元数据读取尺寸，无需调用方传 size
+    /// 页池对象从 PageHeader.object_size 读取；buddy 对象从 BuddyHeader.block_size 读取
+    pub fn freeObj(self: *ThreadContext, ptr: [*]u8) void {
+        if (page_pool.isPagePtr(ptr)) {
+            const page = page_pool.pageOf(ptr);
+            const object_size: usize = page_pool.pageHeader(page).object_size;
+            const all_free = freeToPage(page, ptr);
+            if (!all_free) return;
+            // 页全空：缓存或归还
+            const sz: u16 = @intCast(object_size);
+            for (&self.pools) |*slot| {
+                if (slot.object_size != sz) continue;
+                if (slot.active == page) {
+                    slot.active = null;
+                    if (slot.cached == null) {
+                        slot.cached = page;
+                    } else {
+                        self.global.returnPage(page);
+                    }
+                } else if (slot.cached == page) {
+                    // cached 页不释放
+                } else {
+                    self.global.returnPage(page);
+                }
+                return;
+            }
+            self.global.returnPage(page);
+        } else {
+            // buddy 对象：block_size 从 BuddyHeader 读取
+            self.global.freeLarge(ptr[0..0]);
+        }
+    }
+
+    /// 创建固定大小对象（便利方法）
+    pub fn createObj(self: *ThreadContext, comptime T: type) !*T {
+        const mem_bytes = try self.allocObj(@sizeOf(T));
+        return @ptrCast(@alignCast(mem_bytes.ptr));
+    }
+
+    /// 保存 ShadowArena 水位（函数入口调用）
+    pub fn saveWatermark(self: *ThreadContext) usize {
+        return self.arena.saveWatermark();
+    }
+
+    /// 恢复 ShadowArena 水位（函数返回调用，释放临时分配）
+    pub fn restoreWatermark(self: *ThreadContext, pos: usize) void {
+        self.arena.restoreWatermark(pos);
     }
 };
 

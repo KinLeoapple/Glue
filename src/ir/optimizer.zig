@@ -122,10 +122,16 @@ fn isConstantOp(op: NodeOp) bool {
 }
 
 /// 从节点流中查找指定通道的常量值（在 node_index 之前查找）
+///
+/// 注意：const_str 的 const_val 是字符串池索引（int_val），不是整数值。
+/// 若将其作为整数参与折叠，会将"相同内容、不同池索引"的字符串字面量误判为不等。
+/// 因此 const_str 不视为可折叠常量，== / != 交给运行时 value.equals 处理。
 fn findConstVal(ir: *const GlueIR, chan: u16, node_index: usize) ?ConstVal {
     if (node_index == 0) return null;
     for (ir.nodes[0..node_index]) |n| {
         if (n.output == chan and isConstantOp(n.op)) {
+            // const_str 的 const_val 是池索引而非数值，不参与常量折叠
+            if (n.op == .const_str) return null;
             // scalar_metas 的 meta_index 即数组索引（index 0 是占位符）
             if (n.meta_index > 0 and n.meta_index < ir.scalar_metas.len) {
                 return ir.scalar_metas[n.meta_index].const_val;
@@ -316,9 +322,20 @@ fn hasSideEffect(op: NodeOp) bool {
         .builtin_eprint, .builtin_eprintln,
         .builtin_scan, .builtin_scanln,
         .builtin_ok, .builtin_error, .builtin_eq, .builtin_str,
+        .builtin_ref_eq,
         .builtin_type, .builtin_panic,
         .newtype_wrap, .newtype_unwrap,
         .scalar_loop,
+        // route_dispatch 执行 body 子图（match/if/select 分支体），
+        // body 可能包含 println/call/store 等副作用，故不能被消除
+        .route_dispatch,
+        // gate_make_ok/gate_make_err 创建 ThrowValue 堆对象，有副作用
+        .gate_make_ok, .gate_make_err,
+        // vec_map/vec_map2/vec_fold/vec_scan/vec_filter/vec_take_while 执行 body 子图，
+        // body 可能包含 store/call 等副作用，故不能被消除
+        .vec_map, .vec_map2, .vec_fold, .vec_scan, .vec_filter, .vec_take_while,
+        // vec_source 分配向量数据，vec_sink 收集结果（sink_to_array 产生堆对象）
+        .vec_source, .vec_sink, .vec_zip, .vec_take,
         => true,
         else => false,
     };

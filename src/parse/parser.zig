@@ -50,6 +50,10 @@ pub const Parser = struct {
     errors: std.ArrayList(ParseError),
     /// expectCloseAngle 遇到 gt_eq 时虚拟拆分：当前已消费 gt 部分，待注入 eq
     pending_eq: bool,
+    /// expectCloseAngle 遇到 gt_gt 时虚拟拆分：当前已消费一个 gt（内层），待注入外层 gt
+    pending_gt: bool,
+    /// expectCloseAngle 遇到 gt_gt_eq 时虚拟拆分：当前已消费一个 gt（内层），待注入外层 gt_eq
+    pending_gt_eq: bool,
     /// 节点批量分配器，减少逐节点 arena vtable 调用
     expr_chunk: NodeChunk(ast.Expr) = .{},
     stmt_chunk: NodeChunk(ast.Stmt) = .{},
@@ -65,6 +69,8 @@ pub const Parser = struct {
             .arena = std.heap.ArenaAllocator.init(backing),
             .errors = .empty,
             .pending_eq = false,
+            .pending_gt = false,
+            .pending_gt_eq = false,
         };
     }
 
@@ -81,7 +87,7 @@ pub const Parser = struct {
 
     // ---- Token 导航辅助 ----
 
-    /// 查看当前 Token，越界时返回最后一个（eof）。处理 pending_eq 虚拟注入。
+    /// 查看当前 Token，越界时返回最后一个（eof）。处理 pending_eq/pending_gt/pending_gt_eq 虚拟注入。
     fn peek(self: *Parser) lexer.Token {
         if (self.pending_eq) {
             // 构造虚拟 eq token，位置基于被拆分的 gt_eq 的下一列
@@ -89,6 +95,26 @@ pub const Parser = struct {
             return lexer.Token{
                 .type = .eq,
                 .lexeme = "=",
+                .line = base.line,
+                .column = base.column + 1,
+            };
+        }
+        if (self.pending_gt) {
+            // 构造虚拟 gt token，位置基于被拆分的 gt_gt 的下一列（外层 '>'）
+            const base = if (self.current > 0) self.tokens[self.current - 1] else self.tokens[0];
+            return lexer.Token{
+                .type = .gt,
+                .lexeme = ">",
+                .line = base.line,
+                .column = base.column + 1,
+            };
+        }
+        if (self.pending_gt_eq) {
+            // 构造虚拟 gt_eq token，位置基于被拆分的 gt_gt_eq 的下一列（外层 '>='）
+            const base = if (self.current > 0) self.tokens[self.current - 1] else self.tokens[0];
+            return lexer.Token{
+                .type = .gt_eq,
+                .lexeme = ">=",
                 .line = base.line,
                 .column = base.column + 1,
             };
@@ -110,7 +136,7 @@ pub const Parser = struct {
         return self.peek().type == .eof;
     }
 
-    /// 消费当前 Token 并前进，到达末尾时不前进。处理 pending_eq 虚拟消费。
+    /// 消费当前 Token 并前进，到达末尾时不前进。处理 pending_eq/pending_gt/pending_gt_eq 虚拟消费。
     fn advance(self: *Parser) lexer.Token {
         if (self.pending_eq) {
             self.pending_eq = false;
@@ -119,6 +145,28 @@ pub const Parser = struct {
             return lexer.Token{
                 .type = .eq,
                 .lexeme = "=",
+                .line = base.line,
+                .column = base.column + 1,
+            };
+        }
+        if (self.pending_gt) {
+            self.pending_gt = false;
+            // 返回虚拟 gt token
+            const base = if (self.current > 0) self.tokens[self.current - 1] else self.tokens[0];
+            return lexer.Token{
+                .type = .gt,
+                .lexeme = ">",
+                .line = base.line,
+                .column = base.column + 1,
+            };
+        }
+        if (self.pending_gt_eq) {
+            self.pending_gt_eq = false;
+            // 返回虚拟 gt_eq token
+            const base = if (self.current > 0) self.tokens[self.current - 1] else self.tokens[0];
+            return lexer.Token{
+                .type = .gt_eq,
+                .lexeme = ">=",
                 .line = base.line,
                 .column = base.column + 1,
             };
@@ -158,16 +206,35 @@ pub const Parser = struct {
         return error.UnexpectedToken;
     }
 
-    /// 期望消费关闭泛型参数的 '>'，支持把 `>=` 拆分为 `>` 与 `=` 以消除歧义
+    /// 期望消费关闭泛型参数的 '>'，支持把 `>=` 拆分为 `>` 与 `=`，把 `>>` 拆分为两个 `>`，
+    /// 把 `>>=` 拆分为 `>` 与 `>=`（`>=` 进一步拆分为 `>` 与 `=`），以消除嵌套泛型（如 List<List<i64>>）的歧义。
     fn expectCloseAngle(self: *Parser, message: []const u8) ParserError!void {
         if (self.check(.gt)) {
             _ = self.advance();
+            return;
+        }
+        if (self.pending_gt_eq) {
+            // 待注入的 gt_eq：消费 gt 部分作为 '>'，设置 pending_eq 供下次注入 '='
+            self.pending_gt_eq = false;
+            self.pending_eq = true;
             return;
         }
         if (self.current < self.tokens.len and self.tokens[self.current].type == .gt_eq) {
             // 虚拟拆分 gt_eq：消费整个 token，设置 pending_eq 供下一次 peek 注入 eq
             self.current += 1;
             self.pending_eq = true;
+            return;
+        }
+        if (self.current < self.tokens.len and self.tokens[self.current].type == .gt_gt) {
+            // 虚拟拆分 gt_gt：消费整个 token 作为内层 '>'，设置 pending_gt 供外层 expectCloseAngle 注入 gt
+            self.current += 1;
+            self.pending_gt = true;
+            return;
+        }
+        if (self.current < self.tokens.len and self.tokens[self.current].type == .gt_gt_eq) {
+            // 虚拟拆分 gt_gt_eq：消费整个 token 作为内层 '>'，设置 pending_gt_eq 供外层 expectCloseAngle 注入 gt_eq
+            self.current += 1;
+            self.pending_gt_eq = true;
             return;
         }
         const tok = self.peek();
@@ -1306,6 +1373,13 @@ pub const Parser = struct {
             }
         }
         _ = self.expect(.r_paren, "expected ')'") catch {};
+        if (fields.items.len == 0) {
+            return self.allocType(location, ast.TypeNode{
+                .named = .{
+                    .name = "unit",
+                },
+            });
+        }
         return self.allocType(location, ast.TypeNode{
             .record = .{
                 .fields = try fields.toOwnedSlice(self.arena.allocator()),
@@ -1451,7 +1525,7 @@ pub const Parser = struct {
         return left;
     }
 
-    /// 解析相等性 == !=
+    /// 解析相等性 == != === !==
     fn parseEquality(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseComparison();
         while (true) {
@@ -1471,6 +1545,26 @@ pub const Parser = struct {
                 left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                     .binary = .{
                         .op = .not_eq,
+                        .left = left,
+                        .right = right,
+                    },
+                });
+            } else if (self.matchToken(.ref_eq)) {
+                const op_tok = self.previous();
+                const right = try self.parseComparison();
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
+                    .binary = .{
+                        .op = .ref_eq,
+                        .left = left,
+                        .right = right,
+                    },
+                });
+            } else if (self.matchToken(.ref_neq)) {
+                const op_tok = self.previous();
+                const right = try self.parseComparison();
+                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
+                    .binary = .{
+                        .op = .ref_neq,
                         .left = left,
                         .right = right,
                     },

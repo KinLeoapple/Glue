@@ -2,7 +2,7 @@
 //!
 //! 定义 Glue 语言经词法分析与语法分析后产生的所有语法树节点类型，
 //! 包括表达式、语句、声明、类型节点、模式以及模块结构。
-//! 这些类型是前端（lexer/parser）与后端（语义分析、LFE 编译）之间共享的数据契约。
+//! 这些类型是前端（lexer/parser）与后端（语义分析、IR 构建）之间共享的数据契约。
 
 const std = @import("std");
 
@@ -36,6 +36,8 @@ pub const BinaryOp = enum {
     mod,
     eq,
     not_eq,
+    ref_eq,
+    ref_neq,
     lt,
     gt,
     lt_eq,

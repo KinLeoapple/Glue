@@ -52,6 +52,7 @@ pub const ConstVal = union(enum) {
 pub const CallMeta = struct {
     func_index: u16, // 被调用函数在 functions 表中的索引
     arg_count: u8, // 实际参数个数
+    tail_call: bool = false, // 是否在尾位置（用于 TCO 判定）
 };
 
 /// halt 种类：控制 cleanup 的触发时机
@@ -87,6 +88,7 @@ pub const VecOp = enum(u4) {
     range_source, // range(start, end) → 向量
     array_source, // 数组 → 向量
     repeat_source, // repeat(val, n) → 向量
+    string_source, // 字符串 → Unicode 标量值向量
     // vec_sink 子类型
     sink_last, // 取最后一个元素
     sink_first, // 取第一个元素
@@ -262,6 +264,9 @@ pub const ClosureMeta = struct {
     body_start: u32 = 0,
     /// lambda 函数体节点数量
     body_len: u32 = 0,
+    /// 每个 upvalue 是否为 cell 通道（var 变量，引用语义），最多 8 个 upvalue
+    /// cell upvalue 在 call_indirect 时直接共享通道指针，而非拷贝值
+    cell_upvalues: u8 = 0,
 };
 
 // ════════════════════════════════════════════════════════════════

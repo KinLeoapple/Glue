@@ -64,6 +64,7 @@ pub fn build(b: *std.Build) void {
     });
     value_module.addImport("ast", ast_module);
     value_module.addImport("sync", sync_module);
+    value_module.addImport("mem", mem_module);
 
     // ---- 语义分析模块族：分析数据库与各类检查器 ----
     const analysis_db_module = b.createModule(.{
@@ -140,17 +141,6 @@ pub fn build(b: *std.Build) void {
     kind_check_module.addImport("type_check", type_check_module);
     gadt_check_module.addImport("type_check", type_check_module);
 
-    // ---- LFE 层流执行引擎模块 ----
-    const lfe_module = b.createModule(.{
-        .root_source_file = b.path("src/lfe/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    lfe_module.addImport("ast", ast_module);
-    lfe_module.addImport("value", value_module);
-    lfe_module.addImport("mem", mem_module);
-    lfe_module.addImport("sync", sync_module);
-
     // ---- Glue IR 模块（新架构：共享内存图） ----
     const ir_module = b.createModule(.{
         .root_source_file = b.path("src/ir/mod.zig"),
@@ -159,6 +149,16 @@ pub fn build(b: *std.Build) void {
     });
     ir_module.addImport("ast", ast_module);
     ir_module.addImport("value", value_module);
+
+    // ---- sema 模块接入 IR 管线：type_check 及子检查器可读取 SemaResult 契约 ----
+    // 依赖方向：sema → ir → (ast, value)，ir 不依赖 sema，无循环。
+    type_check_module.addImport("ir", ir_module);
+    subtype_check_module.addImport("ir", ir_module);
+    throw_check_module.addImport("ir", ir_module);
+    trait_resolve_module.addImport("ir", ir_module);
+    kind_check_module.addImport("ir", ir_module);
+    gadt_check_module.addImport("ir", ir_module);
+    module_check_module.addImport("ir", ir_module);
 
     // ---- 执行引擎模块（后端：接收 GlueIR 执行） ----
     const engine_module = b.createModule(.{
@@ -250,25 +250,11 @@ pub fn build(b: *std.Build) void {
     });
     value_module_test.addImport("sync", sync_module);
     value_module_test.addImport("ast", ast_module);
+    value_module_test.addImport("mem", mem_module);
     const value_unit_tests = b.addTest(.{
         .root_module = value_module_test,
     });
     const run_value_unit_tests = b.addRunArtifact(value_unit_tests);
-
-    // LFE 层流执行引擎测试（需导入 ast、value 和 mem）
-    const lfe_module_test = b.createModule(.{
-        .root_source_file = b.path("src/lfe/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    lfe_module_test.addImport("ast", ast_module);
-    lfe_module_test.addImport("value", value_module);
-    lfe_module_test.addImport("mem", mem_module);
-    lfe_module_test.addImport("sync", sync_module);
-    const lfe_unit_tests = b.addTest(.{
-        .root_module = lfe_module_test,
-    });
-    const run_lfe_unit_tests = b.addRunArtifact(lfe_unit_tests);
 
     // Glue IR 模块测试（需导入 ast 和 value）
     const ir_module_test = b.createModule(.{
@@ -308,7 +294,6 @@ pub fn build(b: *std.Build) void {
     analysis_db_unit_tests.root_module.linkSystemLibrary("c", .{});
     value_unit_tests.root_module.linkSystemLibrary("c", .{});
     debug_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
-    lfe_unit_tests.root_module.linkSystemLibrary("c", .{});
     ir_unit_tests.root_module.linkSystemLibrary("c", .{});
     engine_unit_tests.root_module.linkSystemLibrary("c", .{});
 
@@ -321,7 +306,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_analysis_db_unit_tests.step);
     test_step.dependOn(&run_value_unit_tests.step);
     test_step.dependOn(&run_debug_allocator_unit_tests.step);
-    test_step.dependOn(&run_lfe_unit_tests.step);
     test_step.dependOn(&run_ir_unit_tests.step);
     test_step.dependOn(&run_engine_unit_tests.step);
     for (mem_test_runs) |run| test_step.dependOn(&run.step);

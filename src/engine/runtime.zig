@@ -12,6 +12,8 @@
 const std = @import("std");
 const ir_mod = @import("ir");
 const mem = @import("mem");
+const value = @import("value");
+const scalar = value.scalar;
 
 const ChannelRegion = mem.ChannelRegion;
 const ChannelSpace = ir_mod.ChannelSpace;
@@ -72,7 +74,24 @@ pub const Runtime = struct {
                 self.chan_ptrs[i] = null;
             } else {
                 const buf = try self.region.alloc(meta.elem_width);
+                @memset(buf, 0);
                 self.chan_ptrs[i] = buf.ptr;
+                // ChannelRegion 扩容后需 rebase 所有已分配的通道指针
+                if (self.region.rebase_info) |ri| {
+                    for (self.chan_ptrs[0 .. i + 1]) |*ptr| {
+                        if (ptr.*) |p| {
+                            const addr = @intFromPtr(p);
+                            if (addr >= ri.old_base and addr < ri.old_end) {
+                                const new_addr: usize = if (ri.offset >= 0)
+                                    addr + @as(usize, @intCast(ri.offset))
+                                else
+                                    addr - @as(usize, @intCast(-ri.offset));
+                                ptr.* = @ptrFromInt(new_addr);
+                            }
+                        }
+                    }
+                    self.region.rebase_info = null;
+                }
             }
         }
     }
@@ -138,6 +157,21 @@ pub const Runtime = struct {
     /// 写入堆对象指针（ref_chan）
     pub fn writePtr(self: *Runtime, chan: u16, val: ?*anyopaque) void {
         const ptr: *?*anyopaque = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
+        ptr.* = val;
+    }
+
+    /// 泛型标量读取（指定通道）：按 comptime tag 直接指针读写，跳过 16B 中间缓冲
+    /// 覆盖所有 int/uint/float 类型，零 memcpy
+    pub fn readScalarAt(self: *Runtime, comptime tag: scalar.ScalarTag, chan: u16) scalar.NativeType(tag) {
+        const T = scalar.NativeType(tag);
+        const ptr: *T = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
+        return ptr.*;
+    }
+
+    /// 泛型标量写入（指定通道）
+    pub fn writeScalarAt(self: *Runtime, comptime tag: scalar.ScalarTag, chan: u16, val: scalar.NativeType(tag)) void {
+        const T = scalar.NativeType(tag);
+        const ptr: *T = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
         ptr.* = val;
     }
 
@@ -221,24 +255,24 @@ pub const Runtime = struct {
     pub fn writeConst(self: *Runtime, chan: u16, const_val: ConstVal, kind: ScalarKind) void {
         switch (const_val) {
             .int_val => |v| {
-                // 按通道实际宽度截断存储
+                // 按通道实际宽度截断存储（使用 @truncate 处理超出范围的值）
                 const w = self.chan_widths[chan];
                 switch (w) {
                     1 => {
                         const ptr: *i8 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
-                        ptr.* = @intCast(v);
+                        ptr.* = @truncate(v);
                     },
                     2 => {
                         const ptr: *i16 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
-                        ptr.* = @intCast(v);
+                        ptr.* = @truncate(v);
                     },
                     4 => {
                         const ptr: *i32 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
-                        ptr.* = @intCast(v);
+                        ptr.* = @truncate(v);
                     },
                     8 => {
                         const ptr: *i64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
-                        ptr.* = @intCast(v);
+                        ptr.* = @truncate(v);
                     },
                     16 => {
                         const ptr: *i128 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));

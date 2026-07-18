@@ -32,7 +32,7 @@ fun makeClosures(): i32 {
 }
 
 // higher-order: compose a list of operations
-fun applyAll(x: i32, f, g, h): i32 {
+fun applyAll(x: i32, f: (i32) -> i32, g: (i32) -> i32, h: (i32) -> i32): i32 {
     h(g(f(x)))
 }
 
@@ -111,7 +111,7 @@ fun main() {
     println(makeClosures())  // 0+1+2+3+4 = 10
 
     // ---- higher-order composition ----
-    println(applyAll(2, fun(n) { n + 1 }, fun(n) { n * 3 }, fun(n) { n - 2 }))  // ((2+1)*3)-2 = 7
+    println(applyAll(2, fun(n: i32) { n + 1 }, fun(n: i32) { n * 3 }, fun(n: i32) { n - 2 }))  // ((2+1)*3)-2 = 7
 
     // ---- recursion building string ----
     println(repeat("xy", 3))   // xyxyxy
@@ -126,9 +126,9 @@ fun main() {
     println(counter)   // 3
 
     // ---- closure over multiple captured vars ----
-    val base = 1000
-    val rate = 5
-    val compute = fun(n) { base + n * rate }
+    val base: i32 = 1000
+    val rate: i32 = 5
+    val compute = fun(n: i32) { base + n * rate }
     println(compute(10))  // 1050
     println(compute(0))   // 1000
 

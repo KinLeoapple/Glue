@@ -23,7 +23,7 @@ type Regex =
 // ============================================================
 fun strLen(s: str): i32 { s.len() }
 
-fun matchRe(re: Regex, s: str, pos: i32, k): bool {
+fun matchRe(re: Regex, s: str, pos: i32, k: (i32) -> bool): bool {
     match re {
         Empty => k(pos)
         Lit(ch) => {
@@ -54,7 +54,7 @@ fun matchRe(re: Regex, s: str, pos: i32, k): bool {
 }
 
 // r* 的贪婪回溯：尝试匹配尽量多的 r，每步都可回退到调 k
-fun matchStar(r: Regex, s: str, pos: i32, k): bool {
+fun matchStar(r: Regex, s: str, pos: i32, k: (i32) -> bool): bool {
     // 先尝试再匹配一个 r（要求消费至少一个字符以避免空循环），
     // 失败或不前进则用当前 pos 调 k
     val advanced = matchRe(r, s, pos, fun(p2) {
@@ -77,12 +77,13 @@ fun seqOf(a: Regex, b: Regex): Regex { Seq(a, b) }
 
 // 把字符串变成字面序列： "ab" -> Seq(Lit('a'), Lit('b'))
 fun literal(s: str): Regex {
+    val n = i32(s.len())
     fun go(i: i32): Regex {
-        if i >= s.len() { Empty }
-        else if i == s.len() - 1 { Lit(s[i]) }
+        if i >= n { Empty }
+        else if i == n - 1 { Lit(s[i]) }
         else { Seq(Lit(s[i]), go(i + 1)) }
     }
-    if s.len() == 0 { Empty } else { go(0) }
+    if n == 0 { Empty } else { go(0) }
 }
 
 fun yn(b: bool): str { if b { "yes" } else { "no" } }

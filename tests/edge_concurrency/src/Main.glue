@@ -25,7 +25,7 @@ fun main() {
     println(x)            // 0 (unchanged)
 
     // ---- atomic shared across async ----
-    var counter = atomic 0
+    var counter = atomic 0i64
     val a1 = incrCounter(counter)
     a1.await()
     val a2 = incrCounter(counter)
@@ -92,7 +92,7 @@ fun main() {
     println(result_ch.recv())   // 12345
 
     // ---- many atomic increments via sequential async calls ----
-    var acc = atomic 0
+    var acc = atomic 0i64
     var i = 0
     while i < 10 {
         val sp = incrCounter(acc)

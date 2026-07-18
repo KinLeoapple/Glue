@@ -1,16 +1,17 @@
 //! 可调用值类型模块
 //!
 //! 定义 Glue 语言中可被调用求值的值类型：
-//! - Builtin 内置函数（原生函数指针）
-//! - Closure 闭包（捕获上值和绑定参数）
-//! - PartialApplication 部分应用（已绑定部分参数的函数）
-//! - TraitValue trait 对象（方法集 + 可选数据）
-//! - LazyValue 惰性值（延迟求值的表达式）
+//! - Builtin 内置函数（原生函数指针，固定大小）
+//! - Closure 闭包（连续内存：header + upvalues + bound_args）
+//! - PartialApplication 部分应用（连续内存：header + bound_args）
+//! - TraitValue trait 对象（连续内存：header + method_values；method_names owned 时独立分配）
+//! - LazyValue 惰性值（固定大小）
 
 const std = @import("std");
 const ast = @import("ast");
 const obj_header = @import("obj_header.zig");
 const ObjHeader = obj_header.ObjHeader;
+const ThreadContext = obj_header.ThreadContext;
 const value = @import("mod.zig");
 const Value = value.Value;
 
@@ -24,68 +25,96 @@ pub const Builtin = struct {
     user_ctx: ?*anyopaque = null,
 
     /// 空实现：函数指针和上下文由外部管理
-    pub fn deinit(self: *Builtin, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Builtin, tctx: *ThreadContext) void {
         _ = self;
-        _ = allocator;
+        _ = tctx;
     }
 };
 
 /// 闭包，携带函数体、上值、绑定参数和 self 上值索引
+///
+/// 连续内存布局：[Closure header | upvalues[] | bound_args[]]
+/// upvalues 和 bound_args 切片指向尾部连续区域，单次分配单次释放
 pub const Closure = struct {
     header: ObjHeader = .{ .type_tag = .closure },
     func: *const anyopaque,
     arity: u8,
     upvalues: []Value = &.{},
     bound_args: []Value = &.{},
-    allocator: std.mem.Allocator,
     self_upvalue_idx: i32 = -1,
 
-    /// 释放上值和绑定参数，跳过 self 上值以避免自引用释放
-    pub fn deinit(self: *Closure, allocator: std.mem.Allocator) void {
-        const self_idx = self.self_upvalue_idx;
-        for (self.upvalues, 0..) |uv, i| {
-            if (self_idx >= 0 and i == @as(usize, @intCast(self_idx))) continue;
-            uv.release(allocator);
+    /// 释放上值和绑定参数的引用计数，跳过 self 上值以避免自引用释放
+    /// upvalues 和 bound_args 是连续内存的一部分，由 closureDeinit 中的 freeObj 统一释放
+    pub fn deinit(self: *Closure, tctx: *ThreadContext) void {
+        if (!obj_header.shutdown_mode) {
+            const self_idx = self.self_upvalue_idx;
+            for (self.upvalues, 0..) |uv, i| {
+                if (self_idx >= 0 and i == @as(usize, @intCast(self_idx))) continue;
+                uv.release(tctx);
+            }
+            for (self.bound_args) |ba| ba.release(tctx);
         }
-        if (self.upvalues.len > 0) self.allocator.free(self.upvalues);
-        for (self.bound_args) |ba| ba.release(allocator);
-        if (self.bound_args.len > 0) self.allocator.free(self.bound_args);
     }
 };
 
 /// 部分应用值，记录已绑定的参数和剩余所需参数个数
+///
+/// 连续内存布局：[PartialApplication header | bound_args[]]
+/// bound_args 切片指向尾部连续区域，单次分配单次释放
 pub const PartialApplication = struct {
     header: ObjHeader = .{ .type_tag = .partial },
     func: Value,
     bound_args: []Value,
     remaining_arity: u8,
 
-    /// 释放被包装函数和已绑定参数
-    pub fn deinit(self: *PartialApplication, allocator: std.mem.Allocator) void {
-        self.func.release(allocator);
-        for (self.bound_args) |ba| ba.release(allocator);
-        if (self.bound_args.len > 0) allocator.free(self.bound_args);
+    /// 释放被包装函数和已绑定参数的引用计数
+    /// bound_args 是连续内存的一部分，由 partialDeinit 中的 freeObj 统一释放
+    pub fn deinit(self: *PartialApplication, tctx: *ThreadContext) void {
+        if (!obj_header.shutdown_mode) {
+            self.func.release(tctx);
+            for (self.bound_args) |ba| ba.release(tctx);
+        }
     }
 };
 
 /// trait 对象值，包含方法集和可选的关联数据
+/// methods 用并行数组存储（names + values），线性查找
+/// trait 方法数通常 <8，线性查找比 HashMap 快（无 hash 计算 + 无冲突，cache 连续）
+///
+/// 连续内存布局：[TraitValue header | method_values[]]
+/// method_values 切片指向尾部连续区域，随 header 单次释放
+/// method_names 当 owned=true 时为独立分配（每个名字字符串 + 指针数组均独立分配），
+///   在 deinit 中逐个释放；当 owned=false 时为借用指针，无需释放
 pub const TraitValue = struct {
     header: ObjHeader = .{ .type_tag = .trait_val },
     trait_name: []const u8 = "",
-    methods: std.StringHashMap(Value),
+    method_names: []const []const u8 = &.{},
+    method_values: []Value = &.{},
     data: ?Value = null,
-    allocator: std.mem.Allocator,
     owned: bool = false,
 
-    /// 释放所有方法键值和关联数据
-    pub fn deinit(self: *TraitValue, allocator: std.mem.Allocator) void {
-        var it = self.methods.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            entry.value_ptr.release(allocator);
+    /// 按名查找方法值，找不到返回 null
+    pub fn getMethod(self: *const TraitValue, name: []const u8) ?Value {
+        for (self.method_names, self.method_values) |n, v| {
+            if (std.mem.eql(u8, n, name)) return v;
         }
-        self.methods.deinit();
-        if (self.data) |v| v.release(allocator);
+        return null;
+    }
+
+    /// 释放所有方法键值和关联数据
+    /// method_values 是连续内存的一部分，由 traitValDeinit 中的 freeObj 统一释放
+    /// method_names 当 owned=true 时为独立分配，在此逐个释放
+    pub fn deinit(self: *TraitValue, tctx: *ThreadContext) void {
+        if (self.owned) {
+            for (self.method_names) |n| {
+                if (n.len > 0) tctx.freeObj(@ptrCast(@constCast(n.ptr)));
+            }
+            if (self.method_names.len > 0) tctx.freeObj(@ptrCast(@constCast(self.method_names.ptr)));
+        }
+        if (!obj_header.shutdown_mode) {
+            for (self.method_values) |v| v.release(tctx);
+            if (self.data) |v| v.release(tctx);
+        }
     }
 };
 
@@ -96,49 +125,50 @@ pub const LazyValue = struct {
     env: *anyopaque,
     cached: ?Value = null,
     forced: bool = false,
-    allocator: std.mem.Allocator,
     thunk: ?*anyopaque = null,
 
     /// 释放缓存的求值结果和 thunk 闭包
-    pub fn deinit(self: *LazyValue, allocator: std.mem.Allocator) void {
-        if (self.cached) |cached| cached.release(allocator);
-        if (self.thunk) |thunk| {
-            const vc: *Closure = @ptrCast(@alignCast(thunk));
-            (Value{ .ref = &vc.header }).release(allocator);
+    pub fn deinit(self: *LazyValue, tctx: *ThreadContext) void {
+        if (!obj_header.shutdown_mode) {
+            if (self.cached) |cached| cached.release(tctx);
+            if (self.thunk) |thunk| {
+                const vc: *Closure = @ptrCast(@alignCast(thunk));
+                (Value{ .ref = &vc.header }).release(tctx);
+            }
         }
     }
 };
 
 // ── deinit_table 注册函数 ──
 
-pub fn builtinDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn builtinDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *Builtin = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
-pub fn closureDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn closureDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *Closure = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
-pub fn partialDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn partialDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *PartialApplication = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
-pub fn traitValDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn traitValDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *TraitValue = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
-pub fn lazyValDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn lazyValDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *LazyValue = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
 /// 注册所有可调用类型的 deinit 函数

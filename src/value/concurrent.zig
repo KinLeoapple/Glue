@@ -8,12 +8,18 @@
 //! 这些类型持有或传递 Value，属于语义层，依赖 runtime 层的同步原语。
 //! 所有类型以 ObjHeader 作为首字段，通过统一 retain/release 管理引用计数，
 //! 各类型的 deinit 函数注册到 obj_header.deinit_table 中由分派表调用。
+//!
+//! 内存布局：
+//! - AtomicValue/SenderValue/ReceiverValue：固定大小，走 createObj 页池
+//! - AsyncHandle：固定大小，panic_message 独立分配（罕见路径）
+//! - ChannelValue：连续内存 [header | Value buffer[cap]]，单次分配单次释放
 
 const std = @import("std");
 const value = @import("mod.zig");
 const sync = @import("sync");
 const obj_header = @import("obj_header.zig");
 const ObjHeader = obj_header.ObjHeader;
+const ThreadContext = obj_header.ThreadContext;
 const Value = value.Value;
 const Mutex = sync.Mutex;
 const Condition = sync.Condition;
@@ -31,7 +37,8 @@ pub const AtomicValue = struct {
     data: Value,
     mutex: Mutex,
 
-    /// 创建初始引用计数为 1 的原子值。
+    /// 创建初始引用计数为 1 的原子值（by-value，用于栈/临时）。
+    /// 堆分配路径使用 tctx.createObj(AtomicValue) + 赋值。
     pub fn init(val: Value) AtomicValue {
         return AtomicValue{
             .data = val,
@@ -74,16 +81,18 @@ pub const AtomicValue = struct {
     }
 
     /// 释放内部资源（data 值的引用计数递减），不销毁对象本体。
-    pub fn deinit(self: *AtomicValue, allocator: std.mem.Allocator) void {
-        self.data.release(allocator);
+    pub fn deinit(self: *AtomicValue, tctx: *ThreadContext) void {
+        if (!obj_header.shutdown_mode) {
+            self.data.release(tctx);
+        }
     }
 };
 
 /// AtomicValue 的 ObjHeader deinit 分派入口。
-pub fn atomicDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn atomicDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *AtomicValue = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
 // ──────────────────────────────────────────────
@@ -103,37 +112,39 @@ pub const AsyncStatus = enum(u8) {
 ///
 /// 调用方可通过原子字段查询任务状态，并在任务完成后消费结果。
 /// 引用计数通过 ObjHeader 统一管理。
+/// panic_message 为独立分配（罕见路径），deinit 时由 freeObj 释放。
 pub const AsyncHandle = struct {
     header: ObjHeader = .{ .type_tag = .async_val },
     status: std.atomic.Value(AsyncStatus),
     result: ?Value,
     consumed: std.atomic.Value(bool),
     finished: std.atomic.Value(bool),
-    allocator: std.mem.Allocator,
     panic_message: ?[]const u8 = null,
     mutex: Mutex,
     condition: Condition,
 
-    pub fn init(allocator: std.mem.Allocator) AsyncHandle {
+    pub fn init() AsyncHandle {
         return AsyncHandle{
             .status = std.atomic.Value(AsyncStatus).init(.Pending),
             .result = null,
             .consumed = std.atomic.Value(bool).init(false),
             .finished = std.atomic.Value(bool).init(false),
-            .allocator = allocator,
             .mutex = .{},
             .condition = .{},
         };
     }
 
     /// 释放句柄持有的资源，包括未消费的结果与 panic 信息。
-    pub fn deinit(self: *AsyncHandle, allocator: std.mem.Allocator) void {
-        if (self.result) |r| {
-            var v = r;
-            v.release(allocator);
+    pub fn deinit(self: *AsyncHandle, tctx: *ThreadContext) void {
+        if (!obj_header.shutdown_mode) {
+            if (self.result) |r| {
+                var v = r;
+                v.release(tctx);
+            }
         }
         if (self.panic_message) |msg| {
-            allocator.free(msg);
+            tctx.freeObj(@ptrCast(@constCast(msg.ptr)));
+            self.panic_message = null;
         }
     }
 
@@ -161,10 +172,12 @@ pub const AsyncHandle = struct {
     }
 
     /// 设置 panic 信息（在任务失败时调用）
+    /// 通过 tctx.allocObj 独立分配 msg 副本，deinit 时由 freeObj 释放
     /// 注意：不持锁，依赖 setStatus 中 finished.store(.release) 提供的 happens-before 保证
-    pub fn setPanic(self: *AsyncHandle, msg: []const u8) void {
-        const msg_copy = self.allocator.dupe(u8, msg) catch return;
-        self.panic_message = msg_copy;
+    pub fn setPanic(self: *AsyncHandle, tctx: *ThreadContext, msg: []const u8) void {
+        const buf = tctx.allocObj(msg.len) catch return;
+        @memcpy(buf, msg);
+        self.panic_message = buf;
         self.setStatus(.Failed);
     }
 
@@ -201,10 +214,10 @@ pub const AsyncHandle = struct {
 };
 
 /// AsyncHandle 的 ObjHeader deinit 分派入口。
-pub fn asyncDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn asyncDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *AsyncHandle = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
 // ──────────────────────────────────────────────
@@ -215,6 +228,10 @@ pub fn asyncDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
 ///
 /// 当 `capacity` 为 0 时采用会合模式：发送方阻塞直到接收方取走值。
 /// 通过 ObjHeader 引用计数支持多端共享，关闭后所有阻塞操作立即返回。
+///
+/// 连续内存布局：[ChannelValue header | Value buffer[capacity]]
+/// buffer 切片指向尾部连续区域，单次分配单次释放。
+/// 会合模式（capacity=0）下 buffer 为空切片，不分配额外空间。
 pub const ChannelValue = struct {
     header: ObjHeader = .{ .type_tag = .channel_val },
     buffer: []Value,
@@ -230,12 +247,19 @@ pub const ChannelValue = struct {
     mutex: Mutex,
     not_empty: Condition,
     not_full: Condition,
-    allocator: std.mem.Allocator,
 
     /// 创建容量为 `cap` 的通道。`cap` 为 0 时进入会合模式。
-    pub fn init(allocator: std.mem.Allocator, cap: usize) !ChannelValue {
-        const buf: []Value = if (cap == 0) &.{} else try allocator.alloc(Value, cap);
-        return ChannelValue{
+    /// 连续内存分配：[ChannelValue header | Value buffer[cap]]
+    /// 返回堆分配的 *ChannelValue，buffer 指向 header 之后的连续区域。
+    pub fn create(tctx: *ThreadContext, cap: usize) !*ChannelValue {
+        const total = @sizeOf(ChannelValue) + cap * @sizeOf(Value);
+        const mem = try tctx.allocObj(total);
+        const self: *ChannelValue = @ptrCast(@alignCast(mem.ptr));
+        const buf: []Value = if (cap == 0) &.{} else blk: {
+            const buf_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(ChannelValue)));
+            break :blk buf_ptr[0..cap];
+        };
+        self.* = .{
             .buffer = buf,
             .head = 0,
             .tail = 0,
@@ -247,25 +271,30 @@ pub const ChannelValue = struct {
             .mutex = .{},
             .not_empty = .{},
             .not_full = .{},
-            .allocator = allocator,
         };
+        return self;
     }
 
     /// 释放通道资源，包括未消费的缓冲值与会合暂存值。
-    pub fn deinit(self: *ChannelValue, allocator: std.mem.Allocator) void {
+    /// buffer 是连续内存的一部分，随 channelDeinit 中的 freeObj 统一释放，无需单独释放。
+    pub fn deinit(self: *ChannelValue, tctx: *ThreadContext) void {
         if (self.capacity > 0) {
             // 释放环形缓冲区中尚未被接收的值。
-            var i: usize = 0;
-            while (i < self.count) : (i += 1) {
-                var v = self.buffer[(self.head + i) % self.capacity];
-                v.release(allocator);
+            if (!obj_header.shutdown_mode) {
+                var i: usize = 0;
+                while (i < self.count) : (i += 1) {
+                    var v = self.buffer[(self.head + i) % self.capacity];
+                    v.release(tctx);
+                }
             }
-            self.allocator.free(self.buffer);
+            // buffer 连续内存随 freeObj 统一释放
         }
         if (self.rend_ready) {
-            if (self.rend_value) |v| {
-                var val = v;
-                val.release(allocator);
+            if (!obj_header.shutdown_mode) {
+                if (self.rend_value) |v| {
+                    var val = v;
+                    val.release(tctx);
+                }
             }
         }
     }
@@ -364,10 +393,10 @@ pub const ChannelValue = struct {
 };
 
 /// ChannelValue 的 ObjHeader deinit 分派入口。
-pub fn channelDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn channelDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *ChannelValue = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
 /// 发送端句柄，持有底层通道的引用。
@@ -376,16 +405,18 @@ pub const SenderValue = struct {
     channel: *ChannelValue,
 
     /// 释放内部资源（递减底层通道的引用计数），不销毁对象本体。
-    pub fn deinit(self: *SenderValue, allocator: std.mem.Allocator) void {
-        obj_header.release(&self.channel.header, allocator);
+    pub fn deinit(self: *SenderValue, tctx: *ThreadContext) void {
+        if (!obj_header.shutdown_mode) {
+            obj_header.release(&self.channel.header, tctx);
+        }
     }
 };
 
 /// SenderValue 的 ObjHeader deinit 分派入口。
-pub fn senderDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn senderDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *SenderValue = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
 /// 接收端句柄，持有底层通道的引用。
@@ -394,16 +425,18 @@ pub const ReceiverValue = struct {
     channel: *ChannelValue,
 
     /// 释放内部资源（递减底层通道的引用计数），不销毁对象本体。
-    pub fn deinit(self: *ReceiverValue, allocator: std.mem.Allocator) void {
-        obj_header.release(&self.channel.header, allocator);
+    pub fn deinit(self: *ReceiverValue, tctx: *ThreadContext) void {
+        if (!obj_header.shutdown_mode) {
+            obj_header.release(&self.channel.header, tctx);
+        }
     }
 };
 
 /// ReceiverValue 的 ObjHeader deinit 分派入口。
-pub fn receiverDeinit(obj: *ObjHeader, allocator: std.mem.Allocator) void {
+pub fn receiverDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *ReceiverValue = @alignCast(@fieldParentPtr("header", obj));
-    self.deinit(allocator);
-    allocator.destroy(self);
+    self.deinit(tctx);
+    tctx.freeObj(@ptrCast(self));
 }
 
 /// 注册所有并发类型的 deinit 函数到 ObjHeader 分派表。
@@ -422,6 +455,13 @@ pub fn registerDeinits() void {
 // ──────────────────────────────────────────────
 
 const testing = std.testing;
+const mem_mod = @import("mem");
+
+fn testCtx() struct { g: mem_mod.GlobalPool, c: ThreadContext } {
+    var g = mem_mod.GlobalPool.init(testing.allocator);
+    const c = ThreadContext.init(&g, testing.allocator);
+    return .{ .g = g, .c = c };
+}
 
 test "AtomicValue load/store" {
     var av = AtomicValue.init(Value.fromI32(100));
@@ -446,8 +486,12 @@ test "AtomicValue xchg" {
 }
 
 test "buffered channel ring buffer FIFO order" {
-    var ch = try ChannelValue.init(testing.allocator, 3);
-    defer ch.deinit(testing.allocator);
+    var tc = testCtx();
+    tc.c.global = &tc.g;
+    defer tc.g.deinit();
+    defer tc.c.deinit();
+    const ch = try ChannelValue.create(&tc.c, 3);
+    defer tc.c.freeObj(@ptrCast(ch));
     try testing.expect(try ch.send(Value.fromI32(10)));
     try testing.expect(try ch.send(Value.fromI32(20)));
     try testing.expect(try ch.send(Value.fromI32(30)));
@@ -464,16 +508,51 @@ test "buffered channel ring buffer FIFO order" {
 }
 
 test "channel close wakes blocked recv" {
-    var ch = try ChannelValue.init(testing.allocator, 1);
-    defer ch.deinit(testing.allocator);
+    var tc = testCtx();
+    tc.c.global = &tc.g;
+    defer tc.g.deinit();
+    defer tc.c.deinit();
+    const ch = try ChannelValue.create(&tc.c, 1);
+    defer tc.c.freeObj(@ptrCast(ch));
     ch.close();
     try testing.expect(ch.recv() == null);
 }
 
 test "channel send after close returns false" {
-    var ch = try ChannelValue.init(testing.allocator, 2);
-    defer ch.deinit(testing.allocator);
+    var tc = testCtx();
+    tc.c.global = &tc.g;
+    defer tc.g.deinit();
+    defer tc.c.deinit();
+    const ch = try ChannelValue.create(&tc.c, 2);
+    defer tc.c.freeObj(@ptrCast(ch));
     ch.close();
     const v = Value.fromI32(99);
     try testing.expect(!(try ch.send(v)));
+}
+
+test "AsyncHandle setPanic 释放 panic_message" {
+    var tc = testCtx();
+    tc.c.global = &tc.g;
+    defer tc.g.deinit();
+    defer tc.c.deinit();
+    const handle = try tc.c.createObj(AsyncHandle);
+    handle.* = AsyncHandle.init();
+    handle.setPanic(&tc.c, "boom");
+    try testing.expect(handle.panic_message != null);
+    try testing.expectEqualStrings("boom", handle.panic_message.?);
+    try testing.expectEqual(AsyncStatus.Failed, handle.getStatus());
+    // 手动触发 deinit（释放 panic_message 独立分配）
+    handle.deinit(&tc.c);
+    tc.c.freeObj(@ptrCast(handle));
+}
+
+test "ChannelValue 会合模式 capacity=0" {
+    var tc = testCtx();
+    tc.c.global = &tc.g;
+    defer tc.g.deinit();
+    defer tc.c.deinit();
+    const ch = try ChannelValue.create(&tc.c, 0);
+    defer tc.c.freeObj(@ptrCast(ch));
+    try testing.expectEqual(@as(usize, 0), ch.capacity);
+    try testing.expectEqual(@as(usize, 0), ch.buffer.len);
 }

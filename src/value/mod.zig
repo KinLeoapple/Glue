@@ -10,6 +10,7 @@ const std = @import("std");
 pub const obj_header = @import("obj_header.zig");
 const ObjHeader = obj_header.ObjHeader;
 const RefKind = obj_header.RefKind;
+const ThreadContext = obj_header.ThreadContext;
 
 // ── 标量运算系统 ──
 pub const scalar = @import("scalar.zig");
@@ -178,86 +179,157 @@ pub const Value = union(enum) {
         return .{ .ref = obj };
     }
 
-    /// 从字节切片构造字符串值，在堆上分配 Str
-    pub fn fromStringBytes(allocator: std.mem.Allocator, bytes: []const u8) !Value {
-        const s = try allocator.create(Str);
-        s.* = try Str.fromLiteral(allocator, bytes);
+    /// 从字节切片构造字符串值（连续内存：[Str header | byte buffer]）
+    pub fn fromStringBytes(tctx: *ThreadContext, bytes: []const u8) !Value {
+        const s = try Str.createContiguous(tctx, bytes);
         return .{ .ref = &s.header };
     }
 
     /// 构造数组值，可选固定大小
-    pub fn makeArray(allocator: std.mem.Allocator, elements: []Value, fixed_size: ?u64) !Value {
-        const arr = try allocator.create(ArrayValue);
-        arr.* = .{ .elements = elements, .capacity = elements.len, .fixed_size = fixed_size };
+    /// header 和 elements 分离分配：header 走页池，elements 独立分配（支持后续 push/pop 替换切片）
+    pub fn makeArray(tctx: *ThreadContext, elements: []Value, fixed_size: ?u64) !Value {
+        const arr = try tctx.createObj(ArrayValue);
+        const elems: []Value = if (elements.len > 0) blk: {
+            const buf = try tctx.allocObj(elements.len * @sizeOf(Value));
+            break :blk @as([*]Value, @ptrCast(@alignCast(buf.ptr)))[0..elements.len];
+        } else &.{};
+        @memcpy(elems, elements);
+        arr.* = .{ .elements = elems, .capacity = elems.len, .fixed_size = fixed_size };
         return .{ .ref = &arr.header };
     }
 
-    /// 构造记录值，携带类型名和字段映射
-    pub fn makeRecord(allocator: std.mem.Allocator, type_name: []const u8, fields: std.StringHashMap(Value)) !Value {
-        const rec = try allocator.create(RecordValue);
-        rec.* = .{ .type_name = type_name, .fields = fields };
+    /// 构造记录值，携带类型名和字段切片
+    /// 连续内存布局：[RecordValue header | Value fields[]]
+    /// fields 切片指向尾部连续区域，单次分配单次释放
+    pub fn makeRecord(tctx: *ThreadContext, type_name: []const u8, fields: []Value) !Value {
+        const f_size = fields.len * @sizeOf(Value);
+        const total = @sizeOf(RecordValue) + f_size;
+        const mem = try tctx.allocObj(total);
+        const rec: *RecordValue = @ptrCast(@alignCast(mem.ptr));
+        const f_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(RecordValue)));
+        @memcpy(f_ptr[0..fields.len], fields);
+        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..fields.len] };
+        return .{ .ref = &rec.header };
+    }
+
+    /// 构造记录值（带字段名表，用于 format 输出）
+    /// 连续内存布局：[RecordValue header | Value fields[]]
+    /// field_names 指向源码 arena 或 string_pool，无需释放
+    pub fn makeRecordWithNames(
+        tctx: *ThreadContext,
+        type_name: []const u8,
+        fields: []Value,
+        field_names: []const ?[]const u8,
+    ) !Value {
+        const f_size = fields.len * @sizeOf(Value);
+        const total = @sizeOf(RecordValue) + f_size;
+        const mem = try tctx.allocObj(total);
+        const rec: *RecordValue = @ptrCast(@alignCast(mem.ptr));
+        const f_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(RecordValue)));
+        @memcpy(f_ptr[0..fields.len], fields);
+        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..fields.len], .field_names = field_names };
         return .{ .ref = &rec.header };
     }
 
     /// 构造代数数据类型（ADT）值，携带类型名、构造子和字段
-    pub fn makeAdt(allocator: std.mem.Allocator, type_name: []const u8, constructor: []const u8, fields: []AdtField) !Value {
-        const adt = try allocator.create(AdtValue);
-        adt.* = .{ .type_name = type_name, .constructor = constructor, .fields = fields };
+    /// 连续内存布局：[AdtValue header | AdtField fields[]]
+    pub fn makeAdt(tctx: *ThreadContext, type_name: []const u8, constructor: []const u8, fields: []AdtField) !Value {
+        const f_size = fields.len * @sizeOf(AdtField);
+        const total = @sizeOf(AdtValue) + f_size;
+        const mem = try tctx.allocObj(total);
+        const adt: *AdtValue = @ptrCast(@alignCast(mem.ptr));
+        const f_ptr: [*]AdtField = @ptrCast(@alignCast(mem.ptr + @sizeOf(AdtValue)));
+        @memcpy(f_ptr[0..fields.len], fields);
+        adt.* = .{ .type_name = type_name, .constructor = constructor, .fields = f_ptr[0..fields.len] };
         return .{ .ref = &adt.header };
     }
 
-    /// 构造新类型值，包裹一个内部值
-    pub fn makeNewtype(allocator: std.mem.Allocator, type_name: []const u8, inner: Value) !Value {
-        const nt = try allocator.create(NewtypeValue);
+    /// 构造新类型值，包裹一个内部值（固定大小）
+    pub fn makeNewtype(tctx: *ThreadContext, type_name: []const u8, inner: Value) !Value {
+        const nt = try tctx.createObj(NewtypeValue);
         nt.* = .{ .type_name = type_name, .inner = inner };
         return .{ .ref = &nt.header };
     }
 
-    /// 构造可变单元，持有对内部值的可变引用
-    pub fn makeCell(allocator: std.mem.Allocator, inner: Value) !Value {
-        const cell = try allocator.create(Cell);
+    /// 构造可变单元，持有对内部值的可变引用（固定大小）
+    pub fn makeCell(tctx: *ThreadContext, inner: Value) !Value {
+        const cell = try tctx.createObj(Cell);
         cell.* = .{ .inner = inner };
         return .{ .ref = &cell.header };
     }
 
-    /// 构造区间值
-    pub fn makeRange(allocator: std.mem.Allocator, start: [16]u8, end: [16]u8, inclusive: bool) !Value {
-        const r = try allocator.create(Range);
+    /// 构造区间值（固定大小）
+    pub fn makeRange(tctx: *ThreadContext, start: [16]u8, end: [16]u8, inclusive: bool) !Value {
+        const r = try tctx.createObj(Range);
         r.* = .{ .start = start, .end = end, .inclusive = inclusive };
         return .{ .ref = &r.header };
     }
 
     /// 构造闭包值
-    pub fn makeClosure(allocator: std.mem.Allocator, closure: Closure) !Value {
-        const c = try allocator.create(Closure);
-        c.* = closure;
+    /// 连续内存布局：[Closure header | upvalues[] | bound_args[]]
+    /// upvalues 和 bound_args 切片指向尾部连续区域，单次分配单次释放
+    pub fn makeClosure(tctx: *ThreadContext, closure: Closure) !Value {
+        const uv_size = closure.upvalues.len * @sizeOf(Value);
+        const ba_size = closure.bound_args.len * @sizeOf(Value);
+        const total = @sizeOf(Closure) + uv_size + ba_size;
+        const mem = try tctx.allocObj(total);
+        const c: *Closure = @ptrCast(@alignCast(mem.ptr));
+        const uv_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(Closure)));
+        const ba_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(Closure) + uv_size));
+        @memcpy(uv_ptr[0..closure.upvalues.len], closure.upvalues);
+        @memcpy(ba_ptr[0..closure.bound_args.len], closure.bound_args);
+        c.* = .{
+            .func = closure.func,
+            .arity = closure.arity,
+            .upvalues = uv_ptr[0..closure.upvalues.len],
+            .bound_args = ba_ptr[0..closure.bound_args.len],
+            .self_upvalue_idx = closure.self_upvalue_idx,
+        };
         return .{ .ref = &c.header };
     }
 
     /// 构造部分应用值，绑定部分参数
-    pub fn makePartial(allocator: std.mem.Allocator, func: Value, bound_args: []Value, remaining_arity: u8) !Value {
-        const p = try allocator.create(PartialApplication);
-        p.* = .{ .func = func, .bound_args = bound_args, .remaining_arity = remaining_arity };
+    /// 连续内存布局：[PartialApplication header | bound_args[]]
+    pub fn makePartial(tctx: *ThreadContext, func: Value, bound_args: []Value, remaining_arity: u8) !Value {
+        const ba_size = bound_args.len * @sizeOf(Value);
+        const total = @sizeOf(PartialApplication) + ba_size;
+        const mem = try tctx.allocObj(total);
+        const p: *PartialApplication = @ptrCast(@alignCast(mem.ptr));
+        const ba_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(PartialApplication)));
+        @memcpy(ba_ptr[0..bound_args.len], bound_args);
+        p.* = .{ .func = func, .bound_args = ba_ptr[0..bound_args.len], .remaining_arity = remaining_arity };
         return .{ .ref = &p.header };
     }
 
-    /// 构造内置函数值
-    pub fn makeBuiltin(allocator: std.mem.Allocator, fn_ptr: BuiltinFn, user_ctx: ?*anyopaque) !Value {
-        const b = try allocator.create(Builtin);
+    /// 构造内置函数值（固定大小）
+    pub fn makeBuiltin(tctx: *ThreadContext, fn_ptr: BuiltinFn, user_ctx: ?*anyopaque) !Value {
+        const b = try tctx.createObj(Builtin);
         b.* = .{ .fn_ptr = fn_ptr, .user_ctx = user_ctx };
         return .{ .ref = &b.header };
     }
 
     /// 构造错误值，携带类型名和消息
-    pub fn makeError(allocator: std.mem.Allocator, type_name: []const u8, message: []const u8, is_error_subtype: bool) !Value {
-        const e = try allocator.create(ErrorValue);
-        e.* = .{ .type_name = type_name, .message = message, .is_error_subtype = is_error_subtype };
+    /// 连续内存布局：[ErrorValue header | type_name bytes | message bytes]
+    /// type_name 和 message 切片指向尾部连续区域，单次分配单次释放
+    pub fn makeError(tctx: *ThreadContext, type_name: []const u8, message: []const u8, is_error_subtype: bool) !Value {
+        const total = @sizeOf(ErrorValue) + type_name.len + message.len;
+        const mem = try tctx.allocObj(total);
+        const e: *ErrorValue = @ptrCast(@alignCast(mem.ptr));
+        const tn_ptr: [*]u8 = mem.ptr + @sizeOf(ErrorValue);
+        const msg_ptr: [*]u8 = tn_ptr + type_name.len;
+        @memcpy(tn_ptr[0..type_name.len], type_name);
+        @memcpy(msg_ptr[0..message.len], message);
+        e.* = .{
+            .type_name = tn_ptr[0..type_name.len],
+            .message = msg_ptr[0..message.len],
+            .is_error_subtype = is_error_subtype,
+        };
         return .{ .ref = &e.header };
     }
 
-    /// 构造抛出值，封装成功值或错误载荷
-    pub fn makeThrow(allocator: std.mem.Allocator, payload: ThrowValue.Payload) !Value {
-        const t = try allocator.create(ThrowValue);
+    /// 构造抛出值，封装成功值或错误载荷（固定大小）
+    pub fn makeThrow(tctx: *ThreadContext, payload: ThrowValue.Payload) !Value {
+        const t = try tctx.createObj(ThrowValue);
         t.* = .{ .payload = payload };
         return .{ .ref = &t.header };
     }
@@ -420,7 +492,7 @@ pub const Value = union(enum) {
     ///
     /// 标量值无引用计数（no-op）。堆对象通过 ObjHeader 统一管理。
     /// Str SSO 模式归零时由 strDeinit 销毁对象本体。
-    pub fn release(self: Value, allocator: std.mem.Allocator) void {
+    pub fn release(self: Value, tctx: *ThreadContext) void {
         switch (self) {
             // 标量值无需释放
             .null_val, .unit, .boolean, .char,
@@ -433,13 +505,13 @@ pub const Value = union(enum) {
                     const s: *Str = @alignCast(@fieldParentPtr("header", obj));
                     if (s.isSso()) {
                         if (s.ssoRelease()) {
-                            s.deinit(allocator);
-                            allocator.destroy(s);
+                            s.deinit(tctx);
+                            tctx.freeObj(@ptrCast(s));
                         }
                         return;
                     }
                 }
-                obj_header.release(obj, allocator);
+                obj_header.release(obj, tctx);
             },
         }
     }
@@ -449,7 +521,7 @@ pub const Value = union(enum) {
     // ════════════════════════════════════════════
 
     /// 深拷贝值：标量值原样返回，堆分配值递归复制其内容
-    pub fn deepCopy(self: Value, allocator: std.mem.Allocator) !Value {
+    pub fn deepCopy(self: Value, tctx: *ThreadContext) !Value {
         switch (self) {
             .null_val, .unit, .boolean, .char,
             .i8, .i16, .i32, .i64, .i128,
@@ -458,19 +530,19 @@ pub const Value = union(enum) {
 
             .ref => |obj| {
                 return switch (obj.type_tag) {
-                    .str => try deepCopyStr(obj, allocator),
-                    .array => try deepCopyArray(obj, allocator),
-                    .record => try deepCopyRecord(obj, allocator),
-                    .adt => try deepCopyAdt(obj, allocator),
-                    .newtype => try deepCopyNewtype(obj, allocator),
-                    .cell => try deepCopyCell(obj, allocator),
-                    .range => try deepCopyRange(obj, allocator),
-                    .closure => try deepCopyClosure(obj, allocator),
-                    .partial => try deepCopyPartial(obj, allocator),
-                    .builtin => try deepCopyBuiltin(obj, allocator),
-                    .error_val => try deepCopyError(obj, allocator),
-                    .throw_val => try deepCopyThrow(obj, allocator),
-                    .trait_val => try deepCopyTrait(obj, allocator),
+                    .str => try deepCopyStr(obj, tctx),
+                    .array => try deepCopyArray(obj, tctx),
+                    .record => try deepCopyRecord(obj, tctx),
+                    .adt => try deepCopyAdt(obj, tctx),
+                    .newtype => try deepCopyNewtype(obj, tctx),
+                    .cell => try deepCopyCell(obj, tctx),
+                    .range => try deepCopyRange(obj, tctx),
+                    .closure => try deepCopyClosure(obj, tctx),
+                    .partial => try deepCopyPartial(obj, tctx),
+                    .builtin => try deepCopyBuiltin(obj, tctx),
+                    .error_val => try deepCopyError(obj, tctx),
+                    .throw_val => try deepCopyThrow(obj, tctx),
+                    .trait_val => try deepCopyTrait(obj, tctx),
                     // 迭代器、惰性值、并发对象：引用语义，retain 即可
                     .array_iter, .string_iter, .range_iter,
                     .lazy_val,
@@ -480,27 +552,28 @@ pub const Value = union(enum) {
         }
     }
 
-    fn deepCopyStr(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyStr(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const s: *Str = @alignCast(@fieldParentPtr("header", obj));
-        return try Value.fromStringBytes(allocator, s.bytes());
+        return try Value.fromStringBytes(tctx, s.bytes());
     }
 
-    fn deepCopyArray(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyArray(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *ArrayValue = @alignCast(@fieldParentPtr("header", obj));
-        const new_elems: []Value = if (p.elements.len > 0)
-            try allocator.alloc(Value, p.elements.len)
-        else
-            &.{};
-        errdefer if (new_elems.len > 0) allocator.free(new_elems);
+        // header 和 elements 分离分配（支持后续 push/pop 替换切片）
+        const new_elems: []Value = if (p.elements.len > 0) blk: {
+            const buf = try tctx.allocObj(p.elements.len * @sizeOf(Value));
+            break :blk @as([*]Value, @ptrCast(@alignCast(buf.ptr)))[0..p.elements.len];
+        } else &.{};
+        errdefer if (p.elements.len > 0) tctx.freeObj(@ptrCast(new_elems.ptr));
         var copied: usize = 0;
         errdefer {
-            for (new_elems[0..copied]) |e| e.release(allocator);
+            for (new_elems[0..copied]) |e| e.release(tctx);
         }
         for (p.elements, 0..) |elem, i| {
-            new_elems[i] = try elem.deepCopy(allocator);
+            new_elems[i] = try elem.deepCopy(tctx);
             copied += 1;
         }
-        const arr = try allocator.create(ArrayValue);
+        const arr = try tctx.createObj(ArrayValue);
         arr.* = .{
             .elements = new_elems,
             .capacity = new_elems.len,
@@ -509,49 +582,49 @@ pub const Value = union(enum) {
         return .{ .ref = &arr.header };
     }
 
-    fn deepCopyRecord(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyRecord(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
-        var new_fields = std.StringHashMap(Value).init(allocator);
+        // 连续内存布局：[RecordValue header | Value fields[]]
+        const f_size = p.fields.len * @sizeOf(Value);
+        const total = @sizeOf(RecordValue) + f_size;
+        const mem = try tctx.allocObj(total);
+        const rec: *RecordValue = @ptrCast(@alignCast(mem.ptr));
+        const f_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(RecordValue)));
+        const new_fields = f_ptr[0..p.fields.len];
+        var copied: usize = 0;
         errdefer {
-            var it = new_fields.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                entry.value_ptr.release(allocator);
-            }
-            new_fields.deinit();
+            for (new_fields[0..copied]) |*v| v.release(tctx);
+            tctx.freeObj(@ptrCast(rec));
         }
-        var it = p.fields.iterator();
-        while (it.next()) |entry| {
-            const dup_key = try allocator.dupe(u8, entry.key_ptr.*);
-            errdefer allocator.free(dup_key);
-            const dup_val = try entry.value_ptr.deepCopy(allocator);
-            errdefer dup_val.release(allocator);
-            try new_fields.put(dup_key, dup_val);
+        for (p.fields, 0..) |src, i| {
+            new_fields[i] = try src.deepCopy(tctx);
+            copied = i + 1;
         }
-        const rec = try allocator.create(RecordValue);
-        rec.* = .{ .type_name = p.type_name, .fields = new_fields };
+        rec.* = .{ .type_name = p.type_name, .fields = new_fields, .field_names = p.field_names };
         return .{ .ref = &rec.header };
     }
 
-    fn deepCopyAdt(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyAdt(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *AdtValue = @alignCast(@fieldParentPtr("header", obj));
-        const new_fields: []AdtField = if (p.fields.len > 0)
-            try allocator.alloc(AdtField, p.fields.len)
-        else
-            &.{};
-        errdefer if (new_fields.len > 0) allocator.free(new_fields);
+        // 连续内存布局：[AdtValue header | AdtField fields[]]
+        const f_size = p.fields.len * @sizeOf(AdtField);
+        const total = @sizeOf(AdtValue) + f_size;
+        const mem = try tctx.allocObj(total);
+        const adt: *AdtValue = @ptrCast(@alignCast(mem.ptr));
+        const f_ptr: [*]AdtField = @ptrCast(@alignCast(mem.ptr + @sizeOf(AdtValue)));
+        const new_fields = f_ptr[0..p.fields.len];
         var copied: usize = 0;
         errdefer {
-            for (new_fields[0..copied]) |*f| f.value.release(allocator);
+            for (new_fields[0..copied]) |*f| f.value.release(tctx);
+            tctx.freeObj(@ptrCast(adt));
         }
         for (p.fields, 0..) |f, i| {
             new_fields[i] = .{
                 .name = f.name,
-                .value = try f.value.deepCopy(allocator),
+                .value = try f.value.deepCopy(tctx),
             };
             copied += 1;
         }
-        const adt = try allocator.create(AdtValue);
         adt.* = .{
             .type_name = p.type_name,
             .constructor = p.constructor,
@@ -560,94 +633,78 @@ pub const Value = union(enum) {
         return .{ .ref = &adt.header };
     }
 
-    fn deepCopyNewtype(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyNewtype(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
-        const nt = try allocator.create(NewtypeValue);
-        nt.* = .{
-            .type_name = p.type_name,
-            .inner = try p.inner.deepCopy(allocator),
-        };
-        return .{ .ref = &nt.header };
+        return try Value.makeNewtype(tctx, p.type_name, try p.inner.deepCopy(tctx));
     }
 
-    fn deepCopyCell(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyCell(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *Cell = @alignCast(@fieldParentPtr("header", obj));
-        const cell = try allocator.create(Cell);
-        cell.* = .{ .inner = try p.inner.deepCopy(allocator) };
-        return .{ .ref = &cell.header };
+        return try Value.makeCell(tctx, try p.inner.deepCopy(tctx));
     }
 
-    fn deepCopyRange(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyRange(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *Range = @alignCast(@fieldParentPtr("header", obj));
-        const r = try allocator.create(Range);
-        r.* = .{
-            .start = p.start,
-            .end = p.end,
-            .inclusive = p.inclusive,
-            .start_i64 = p.start_i64,
-            .end_i64 = p.end_i64,
-        };
-        return .{ .ref = &r.header };
+        return try Value.makeRange(tctx, p.start, p.end, p.inclusive);
     }
 
-    fn deepCopyClosure(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyClosure(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *Closure = @alignCast(@fieldParentPtr("header", obj));
-        const new_upvalues: []Value = if (p.upvalues.len > 0)
-            try allocator.alloc(Value, p.upvalues.len)
-        else
-            &.{};
-        errdefer if (p.upvalues.len > 0) allocator.free(new_upvalues);
+        // 连续内存布局：[Closure header | upvalues[] | bound_args[]]
+        const uv_size = p.upvalues.len * @sizeOf(Value);
+        const ba_size = p.bound_args.len * @sizeOf(Value);
+        const total = @sizeOf(Closure) + uv_size + ba_size;
+        const mem = try tctx.allocObj(total);
+        const c: *Closure = @ptrCast(@alignCast(mem.ptr));
+        const uv_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(Closure)));
+        const ba_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(Closure) + uv_size));
+        const new_upvalues = uv_ptr[0..p.upvalues.len];
+        const new_bound_args = ba_ptr[0..p.bound_args.len];
         var uv_copied: usize = 0;
-        errdefer {
-            for (new_upvalues[0..uv_copied]) |e| e.release(allocator);
-        }
-        for (p.upvalues, 0..) |uv, i| {
-            new_upvalues[i] = try uv.deepCopy(allocator);
-            uv_copied += 1;
-        }
-        const new_bound_args: []Value = if (p.bound_args.len > 0)
-            try allocator.alloc(Value, p.bound_args.len)
-        else
-            &.{};
-        errdefer if (p.bound_args.len > 0) allocator.free(new_bound_args);
         var ba_copied: usize = 0;
         errdefer {
-            for (new_bound_args[0..ba_copied]) |e| e.release(allocator);
+            for (new_upvalues[0..uv_copied]) |e| e.release(tctx);
+            for (new_bound_args[0..ba_copied]) |e| e.release(tctx);
+            tctx.freeObj(@ptrCast(c));
+        }
+        for (p.upvalues, 0..) |uv, i| {
+            new_upvalues[i] = try uv.deepCopy(tctx);
+            uv_copied += 1;
         }
         for (p.bound_args, 0..) |ba, i| {
-            new_bound_args[i] = try ba.deepCopy(allocator);
+            new_bound_args[i] = try ba.deepCopy(tctx);
             ba_copied += 1;
         }
-        const c = try allocator.create(Closure);
         c.* = .{
             .func = p.func,
             .arity = p.arity,
             .upvalues = new_upvalues,
             .bound_args = new_bound_args,
-            .allocator = allocator,
             .self_upvalue_idx = p.self_upvalue_idx,
         };
         return .{ .ref = &c.header };
     }
 
-    fn deepCopyPartial(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyPartial(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *PartialApplication = @alignCast(@fieldParentPtr("header", obj));
-        const new_func = try p.func.deepCopy(allocator);
-        errdefer new_func.release(allocator);
-        const new_bound_args: []Value = if (p.bound_args.len > 0)
-            try allocator.alloc(Value, p.bound_args.len)
-        else
-            &.{};
-        errdefer if (p.bound_args.len > 0) allocator.free(new_bound_args);
+        // 连续内存布局：[PartialApplication header | bound_args[]]
+        const ba_size = p.bound_args.len * @sizeOf(Value);
+        const total = @sizeOf(PartialApplication) + ba_size;
+        const mem = try tctx.allocObj(total);
+        const pa: *PartialApplication = @ptrCast(@alignCast(mem.ptr));
+        const ba_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(PartialApplication)));
+        const new_bound_args = ba_ptr[0..p.bound_args.len];
+        const new_func = try p.func.deepCopy(tctx);
         var ba_copied: usize = 0;
         errdefer {
-            for (new_bound_args[0..ba_copied]) |e| e.release(allocator);
+            new_func.release(tctx);
+            for (new_bound_args[0..ba_copied]) |e| e.release(tctx);
+            tctx.freeObj(@ptrCast(pa));
         }
         for (p.bound_args, 0..) |ba, i| {
-            new_bound_args[i] = try ba.deepCopy(allocator);
+            new_bound_args[i] = try ba.deepCopy(tctx);
             ba_copied += 1;
         }
-        const pa = try allocator.create(PartialApplication);
         pa.* = .{
             .func = new_func,
             .bound_args = new_bound_args,
@@ -656,81 +713,69 @@ pub const Value = union(enum) {
         return .{ .ref = &pa.header };
     }
 
-    fn deepCopyBuiltin(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyBuiltin(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *Builtin = @alignCast(@fieldParentPtr("header", obj));
-        const b = try allocator.create(Builtin);
-        b.* = .{ .fn_ptr = p.fn_ptr, .user_ctx = p.user_ctx };
-        return .{ .ref = &b.header };
+        return try Value.makeBuiltin(tctx, p.fn_ptr, p.user_ctx);
     }
 
-    fn deepCopyError(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyError(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *ErrorValue = @alignCast(@fieldParentPtr("header", obj));
-        const e = try allocator.create(ErrorValue);
-        errdefer allocator.destroy(e);
-        const dup_type = try allocator.dupe(u8, p.type_name);
-        errdefer allocator.free(dup_type);
-        const dup_msg = try allocator.dupe(u8, p.message);
-        errdefer allocator.free(dup_msg);
-        e.* = .{
-            .type_name = dup_type,
-            .message = dup_msg,
-            .is_error_subtype = p.is_error_subtype,
-        };
-        return .{ .ref = &e.header };
+        // 连续内存布局：[ErrorValue header | type_name | message]
+        return try Value.makeError(tctx, p.type_name, p.message, p.is_error_subtype);
     }
 
-    fn deepCopyThrow(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyThrow(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *ThrowValue = @alignCast(@fieldParentPtr("header", obj));
-        const t = try allocator.create(ThrowValue);
-        errdefer allocator.destroy(t);
-        t.* = .{ .payload = switch (p.payload) {
-            .ok => |v| .{ .ok = try v.deepCopy(allocator) },
-            .err => |e| blk: {
-                const dup_type = try allocator.dupe(u8, e.type_name);
-                errdefer allocator.free(dup_type);
-                const dup_msg = try allocator.dupe(u8, e.message);
-                errdefer allocator.free(dup_msg);
-                const new_e = try allocator.create(ErrorValue);
-                errdefer allocator.destroy(new_e);
-                new_e.* = .{
-                    .type_name = dup_type,
-                    .message = dup_msg,
-                    .is_error_subtype = e.is_error_subtype,
-                };
-                break :blk .{ .err = new_e };
+        switch (p.payload) {
+            .ok => |v| return try Value.makeThrow(tctx, .{ .ok = try v.deepCopy(tctx) }),
+            .err => |e| {
+                // 深拷贝 ErrorValue（连续内存），引用计数为 1，所有权转给 ThrowValue
+                const err_val = try Value.makeError(tctx, e.type_name, e.message, e.is_error_subtype);
+                const new_e: *ErrorValue = @alignCast(@fieldParentPtr("header", err_val.ref));
+                return try Value.makeThrow(tctx, .{ .err = new_e });
             },
-        } };
-        return .{ .ref = &t.header };
+        }
     }
 
-    fn deepCopyTrait(obj: *ObjHeader, allocator: std.mem.Allocator) !Value {
+    fn deepCopyTrait(obj: *ObjHeader, tctx: *ThreadContext) !Value {
         const p: *TraitValue = @alignCast(@fieldParentPtr("header", obj));
         if (!p.owned) return Value.fromRef(obj).retain();
-        var new_methods = std.StringHashMap(Value).init(allocator);
+        const count = p.method_names.len;
+        // 连续内存布局：[TraitValue header | method_values[]]
+        const mv_size = count * @sizeOf(Value);
+        const total = @sizeOf(TraitValue) + mv_size;
+        const mem = try tctx.allocObj(total);
+        const tv: *TraitValue = @ptrCast(@alignCast(mem.ptr));
+        const mv_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(TraitValue)));
+        const new_values = mv_ptr[0..count];
+        // method_names 独立分配：指针数组 + 每个名字字符串
+        const names_mem = if (count > 0) try tctx.allocObj(count * @sizeOf([]const u8)) else &.{};
+        const new_names: [][]const u8 = if (count > 0) @ptrCast(@alignCast(names_mem.ptr)) else &.{};
+        var names_copied: usize = 0;
+        var values_copied: usize = 0;
         errdefer {
-            var it = new_methods.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                entry.value_ptr.release(allocator);
-            }
-            new_methods.deinit();
+            for (new_names[0..names_copied]) |n| if (n.len > 0) tctx.freeObj(@ptrCast(@constCast(n.ptr)));
+            if (count > 0) tctx.freeObj(@ptrCast(new_names.ptr));
+            for (new_values[0..values_copied]) |v| v.release(tctx);
+            tctx.freeObj(@ptrCast(tv));
         }
-        var it = p.methods.iterator();
-        while (it.next()) |entry| {
-            const dup_key = try allocator.dupe(u8, entry.key_ptr.*);
-            errdefer allocator.free(dup_key);
-            const dup_val = try entry.value_ptr.deepCopy(allocator);
-            errdefer dup_val.release(allocator);
-            try new_methods.put(dup_key, dup_val);
+        for (p.method_names, 0..) |name, i| {
+            const name_buf = try tctx.allocObj(name.len);
+            @memcpy(name_buf, name);
+            new_names[i] = name_buf;
+            names_copied += 1;
         }
-        const new_data: ?Value = if (p.data) |d| try d.deepCopy(allocator) else null;
-        errdefer if (new_data) |d| d.release(allocator);
-        const tv = try allocator.create(TraitValue);
+        for (p.method_values, 0..) |val, i| {
+            new_values[i] = try val.deepCopy(tctx);
+            values_copied += 1;
+        }
+        const new_data: ?Value = if (p.data) |d| try d.deepCopy(tctx) else null;
+        errdefer if (new_data) |d| d.release(tctx);
         tv.* = .{
             .trait_name = p.trait_name,
-            .methods = new_methods,
+            .method_names = new_names,
+            .method_values = new_values,
             .data = new_data,
-            .allocator = allocator,
             .owned = true,
         };
         return .{ .ref = &tv.header };
@@ -741,128 +786,139 @@ pub const Value = union(enum) {
     // ════════════════════════════════════════════
 
     /// 将值格式化为可读字符串，追加到 buf
-    pub fn format(self: Value, allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+    /// 使用 tctx.backing 作为 ArrayList 分配器（format 为非热路径）
+    pub fn format(self: Value, tctx: *ThreadContext, buf: *std.ArrayList(u8)) !void {
+        const al = tctx.backing;
         switch (self) {
-            .null_val => try buf.appendSlice(allocator, "null"),
-            .unit => try buf.appendSlice(allocator, "()"),
-            .boolean => try buf.appendSlice(allocator, if (self.asBool()) "true" else "false"),
+            .null_val => try buf.appendSlice(al, "null"),
+            .unit => try buf.appendSlice(al, "()"),
+            .boolean => try buf.appendSlice(al, if (self.asBool()) "true" else "false"),
             .char => {
                 var temp: [16]u8 = undefined;
                 const s = std.fmt.bufPrint(&temp, "'{u}'", .{self.asChar().toNative()}) catch unreachable;
-                try buf.appendSlice(allocator, s);
+                try buf.appendSlice(al, s);
             },
-            .i8 => try formatInt(self.asI8(), allocator, buf),
-            .i16 => try formatInt(self.asI16(), allocator, buf),
-            .i32 => try formatInt(self.asI32(), allocator, buf),
-            .i64 => try formatInt(self.asI64(), allocator, buf),
-            .i128 => try formatInt(self.asI128(), allocator, buf),
-            .u8 => try formatInt(self.asU8(), allocator, buf),
-            .u16 => try formatInt(self.asU16(), allocator, buf),
-            .u32 => try formatInt(self.asU32(), allocator, buf),
-            .u64 => try formatInt(self.asU64(), allocator, buf),
-            .u128 => try formatInt(self.asU128(), allocator, buf),
-            .f16 => try formatFloat(self.asF16(), allocator, buf),
-            .f32 => try formatFloat(self.asF32(), allocator, buf),
-            .f64 => try formatFloat(self.asF64(), allocator, buf),
-            .f128 => try formatFloat(self.asF128(), allocator, buf),
+            .i8 => try formatInt(self.asI8(), tctx, buf),
+            .i16 => try formatInt(self.asI16(), tctx, buf),
+            .i32 => try formatInt(self.asI32(), tctx, buf),
+            .i64 => try formatInt(self.asI64(), tctx, buf),
+            .i128 => try formatInt(self.asI128(), tctx, buf),
+            .u8 => try formatInt(self.asU8(), tctx, buf),
+            .u16 => try formatInt(self.asU16(), tctx, buf),
+            .u32 => try formatInt(self.asU32(), tctx, buf),
+            .u64 => try formatInt(self.asU64(), tctx, buf),
+            .u128 => try formatInt(self.asU128(), tctx, buf),
+            .f16 => try formatFloat(self.asF16(), tctx, buf),
+            .f32 => try formatFloat(self.asF32(), tctx, buf),
+            .f64 => try formatFloat(self.asF64(), tctx, buf),
+            .f128 => try formatFloat(self.asF128(), tctx, buf),
 
             .ref => |obj| {
                 switch (obj.type_tag) {
                     .str => {
                         const s: *Str = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.append(allocator, '"');
-                        try buf.appendSlice(allocator, s.bytes());
-                        try buf.append(allocator, '"');
+                        try buf.append(al, '"');
+                        try buf.appendSlice(al, s.bytes());
+                        try buf.append(al, '"');
                     },
                     .array => {
                         const arr: *ArrayValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.append(allocator, '[');
+                        try buf.append(al, '[');
                         for (arr.elements, 0..) |elem, i| {
-                            if (i > 0) try buf.appendSlice(allocator, ", ");
-                            try elem.format(allocator, buf);
+                            if (i > 0) try buf.appendSlice(al, ", ");
+                            try elem.format(tctx, buf);
                         }
-                        try buf.append(allocator, ']');
+                        try buf.append(al, ']');
                     },
                     .record => {
                         const rec: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(allocator, rec.type_name);
-                        try buf.append(allocator, '{');
-                        var it = rec.fields.iterator();
-                        var first = true;
-                        while (it.next()) |entry| {
-                            if (!first) try buf.appendSlice(allocator, ", ");
-                            first = false;
-                            try buf.appendSlice(allocator, entry.key_ptr.*);
-                            try buf.appendSlice(allocator, ": ");
-                            try entry.value_ptr.format(allocator, buf);
+                        try buf.appendSlice(al, rec.type_name);
+                        try buf.append(al, '{');
+                        for (rec.fields, 0..) |v, i| {
+                            if (i > 0) try buf.appendSlice(al, ", ");
+                            // 优先用字段名表，无则用 _<id>
+                            if (i < rec.field_names.len) {
+                                if (rec.field_names[i]) |nm| {
+                                    try buf.appendSlice(al, nm);
+                                } else {
+                                    try buf.appendSlice(al, "_");
+                                    try formatInt(i, tctx, buf);
+                                }
+                            } else {
+                                try buf.appendSlice(al, "_");
+                                try formatInt(i, tctx, buf);
+                            }
+                            try buf.appendSlice(al, ": ");
+                            try v.format(tctx, buf);
                         }
-                        try buf.append(allocator, '}');
+                        try buf.append(al, '}');
                     },
                     .adt => {
                         const adt: *AdtValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(allocator, adt.type_name);
-                        try buf.appendSlice(allocator, "::");
-                        try buf.appendSlice(allocator, adt.constructor);
+                        try buf.appendSlice(al, adt.type_name);
+                        try buf.appendSlice(al, "::");
+                        try buf.appendSlice(al, adt.constructor);
                         if (adt.fields.len > 0) {
-                            try buf.append(allocator, '(');
+                            try buf.append(al, '(');
                             for (adt.fields, 0..) |field, i| {
-                                if (i > 0) try buf.appendSlice(allocator, ", ");
-                                try field.value.format(allocator, buf);
+                                if (i > 0) try buf.appendSlice(al, ", ");
+                                try field.value.format(tctx, buf);
                             }
-                            try buf.append(allocator, ')');
+                            try buf.append(al, ')');
                         }
                     },
                     .newtype => {
                         const nt: *NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(allocator, nt.type_name);
-                        try buf.append(allocator, '(');
-                        try nt.inner.format(allocator, buf);
-                        try buf.append(allocator, ')');
+                        try buf.appendSlice(al, nt.type_name);
+                        try buf.append(al, '(');
+                        try nt.inner.format(tctx, buf);
+                        try buf.append(al, ')');
                     },
                     .cell => {
                         const cell: *Cell = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(allocator, "Cell(");
-                        try cell.inner.format(allocator, buf);
-                        try buf.append(allocator, ')');
+                        try buf.appendSlice(al, "Cell(");
+                        try cell.inner.format(tctx, buf);
+                        try buf.append(al, ')');
                     },
                     .range => {
                         const r: *Range = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(allocator, "<range>");
+                        try buf.appendSlice(al, "<range>");
                         _ = r;
                     },
-                    .closure => try buf.appendSlice(allocator, "<closure>"),
-                    .partial => try buf.appendSlice(allocator, "<partial>"),
-                    .builtin => try buf.appendSlice(allocator, "<builtin>"),
+                    .closure => try buf.appendSlice(al, "<closure>"),
+                    .partial => try buf.appendSlice(al, "<partial>"),
+                    .builtin => try buf.appendSlice(al, "<builtin>"),
                     .error_val => {
                         const e: *ErrorValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(allocator, "Error(");
-                        try buf.appendSlice(allocator, e.type_name);
-                        try buf.appendSlice(allocator, ": ");
-                        try buf.appendSlice(allocator, e.message);
-                        try buf.append(allocator, ')');
+                        try buf.appendSlice(al, "Error(");
+                        try buf.appendSlice(al, e.type_name);
+                        try buf.appendSlice(al, ": ");
+                        try buf.appendSlice(al, e.message);
+                        try buf.append(al, ')');
                     },
-                    .throw_val => try buf.appendSlice(allocator, "<throw>"),
-                    .array_iter => try buf.appendSlice(allocator, "<array_iter>"),
-                    .string_iter => try buf.appendSlice(allocator, "<string_iter>"),
-                    .range_iter => try buf.appendSlice(allocator, "<range_iter>"),
-                    .atomic_val => try buf.appendSlice(allocator, "<atomic>"),
-                    .async_val => try buf.appendSlice(allocator, "<async>"),
-                    .channel_val => try buf.appendSlice(allocator, "<channel>"),
-                    .sender_val => try buf.appendSlice(allocator, "<sender>"),
-                    .receiver_val => try buf.appendSlice(allocator, "<receiver>"),
-                    .trait_val => try buf.appendSlice(allocator, "<trait>"),
-                    .lazy_val => try buf.appendSlice(allocator, "<lazy>"),
+                    .throw_val => try buf.appendSlice(al, "<throw>"),
+                    .array_iter => try buf.appendSlice(al, "<array_iter>"),
+                    .string_iter => try buf.appendSlice(al, "<string_iter>"),
+                    .range_iter => try buf.appendSlice(al, "<range_iter>"),
+                    .atomic_val => try buf.appendSlice(al, "<atomic>"),
+                    .async_val => try buf.appendSlice(al, "<async>"),
+                    .channel_val => try buf.appendSlice(al, "<channel>"),
+                    .sender_val => try buf.appendSlice(al, "<sender>"),
+                    .receiver_val => try buf.appendSlice(al, "<receiver>"),
+                    .trait_val => try buf.appendSlice(al, "<trait>"),
+                    .lazy_val => try buf.appendSlice(al, "<lazy>"),
                 }
             },
         }
     }
 
     /// 格式化值并返回新分配的字符串切片
-    pub fn formatAlloc(self: Value, allocator: std.mem.Allocator) ![]const u8 {
+    /// 使用 tctx.backing 分配，调用方需用 tctx.backing.free 释放
+    pub fn formatAlloc(self: Value, tctx: *ThreadContext) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
-        errdefer buf.deinit(allocator);
-        try self.format(allocator, &buf);
-        return buf.toOwnedSlice(allocator);
+        errdefer buf.deinit(tctx.backing);
+        try self.format(tctx, &buf);
+        return buf.toOwnedSlice(tctx.backing);
     }
 };
 
@@ -870,18 +926,18 @@ pub const Value = union(enum) {
 // 模块级工具函数
 // ════════════════════════════════════════════════════════════
 
-/// 格式化整数到 buf
-fn formatInt(v: anytype, allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+/// 格式化整数到 buf（使用 tctx.backing 作为 ArrayList 分配器）
+fn formatInt(v: anytype, tctx: *ThreadContext, buf: *std.ArrayList(u8)) !void {
     var temp: [41]u8 = undefined;
     const s = std.fmt.bufPrint(&temp, "{d}", .{v}) catch unreachable;
-    try buf.appendSlice(allocator, s);
+    try buf.appendSlice(tctx.backing, s);
 }
 
-/// 格式化浮点数到 buf
-fn formatFloat(v: anytype, allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+/// 格式化浮点数到 buf（使用 tctx.backing 作为 ArrayList 分配器）
+fn formatFloat(v: anytype, tctx: *ThreadContext, buf: *std.ArrayList(u8)) !void {
     var temp: [80]u8 = undefined;
     const s = std.fmt.bufPrint(&temp, "{d}", .{v}) catch unreachable;
-    try buf.appendSlice(allocator, s);
+    try buf.appendSlice(tctx.backing, s);
 }
 
 /// 值的相等性比较：标量按值比较，容器递归比较，其余按引用相等
@@ -927,11 +983,10 @@ pub fn equals(a: Value, b: Value) bool {
                 .record => blk: {
                     const ra: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
                     const rb: *RecordValue = @alignCast(@fieldParentPtr("header", b.ref));
-                    if (ra.fields.count() != rb.fields.count()) break :blk false;
-                    var it = ra.fields.iterator();
-                    while (it.next()) |e| {
-                        const bv = rb.fields.get(e.key_ptr.*) orelse break :blk false;
-                        if (!equals(e.value_ptr.*, bv)) break :blk false;
+                    // 字段按 field_id 顺序存储，同类型 record 字段顺序一致
+                    if (ra.fields.len != rb.fields.len) break :blk false;
+                    for (ra.fields, rb.fields) |va, vb| {
+                        if (!equals(va, vb)) break :blk false;
                     }
                     break :blk true;
                 },

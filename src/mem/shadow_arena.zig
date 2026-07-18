@@ -54,6 +54,16 @@ pub const ShadowArena = struct {
     pub fn reset(self: *ShadowArena) void {
         self.used = 0;
     }
+
+    /// 保存当前水位（函数入口调用）
+    pub fn saveWatermark(self: *ShadowArena) usize {
+        return self.used;
+    }
+
+    /// 恢复到指定水位（函数返回调用，释放临时分配）
+    pub fn restoreWatermark(self: *ShadowArena, pos: usize) void {
+        self.used = pos;
+    }
 };
 
 // ──────────────────────────────────────────────

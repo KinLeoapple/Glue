@@ -37,7 +37,7 @@ fun main() {
 
     // 3. Atomic<T> 跨 async 共享
     // Atomic 在实参传递时浅拷贝，共享底层内存
-    var counter = atomic 0
+    var counter = atomic 0i64
     val s3 = incrAtomic(counter)
     s3.await()
     println(counter)

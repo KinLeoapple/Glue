@@ -137,7 +137,7 @@ val b = 0.0 / 0.0     // panic: division by zero
 ```
 
 理由：
-1. NaN 的 `NaN != NaN` 语义与 Glue 的 `==` 引用相等冲突
+1. NaN 的 `NaN != NaN` 语义与 Glue 的 `==` 值相等语义冲突——结构相等的两个值若有一个是 NaN，将产生令人困惑的结果
 2. NaN 和 Infinity 是 IEEE 754 的特殊值，增加了类型系统的不确定性——每个 `f64` 值都需要考虑"可能是 NaN"的情况
 3. 浮点除零几乎总是 bug，panic 比 silently 产生特殊值更安全
 4. 如果需要表示"无效"或"无穷大"，使用 `f64?` 或 `Throw<f64, Error>` 显式表达
@@ -709,7 +709,7 @@ type Point: (Show, Comparable) = Point(x: i32, y: i32) {
 - 多个 trait 用括号和逗号：`type T: (Trait1, Trait2) = ...`
 - 不支持为已定义的类型后续添加 trait 实现（必须在定义时一次性声明）
 
-**运算符不可重载**：`+`、`==`、`<` 等运算符是内建的，只能用于内建数值类型。自定义类型需要使用命名方法（如 `add`、`compare`、`eq`）。
+**运算符不可重载**：`+`、`<` 等运算符是内建的，只能用于内建数值类型。自定义类型需要使用命名方法（如 `add`、`compare`）。例外：`==` / `!=` 对所有类型自动派生为递归值相等（结构相等），用户不可覆盖；引用相等用 `===` / `!==`。
 
 #### 2.7.2 Trait 组合
 
@@ -1242,21 +1242,20 @@ var x = 3       // ✗ duplicate definition: 'x' is already defined in this scop
 | 类别 | 名称 |
 |------|------|
 | I/O | `println`, `print`, `eprintln`, `eprint`, `scanln`, `scan` |
-| 工具 | `Panic`, `eq`, `type` |
+| 工具 | `Panic`, `type` |
 | 类型转换 | `str`, `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`, `f16`, `f32`, `f64` |
 | 错误处理 | `Error`, `Ok` |
 
 ```glue
 val println = 42     // ✗ cannot redefine built-in 'println'
-fun eq(a, b) = a     // ✗ cannot redefine built-in 'eq'
 type Error = ...     // ✗ cannot redefine built-in 'Error'
 ```
 
-**大小写敏感**：`eq` 和 `Eq` 是不同的标识符。`eq` 是内建函数，`Eq` 可以作为构造器名：
+**大小写敏感**：`Eq` 可以作为构造器名（不再与任何内建冲突）：
 
 ```glue
-type Ordering = | Lt | Eq | Gt   // ✓ 构造器 Eq 与内建函数 eq 不冲突
-val eq = Eq                       // ✗ 变量名 eq 与内建函数冲突
+type Ordering = | Lt | Eq | Gt   // ✓ 构造器 Eq
+val eq = Eq                       // ✓ eq 不是内建标识符，可作为变量名
 val eq_val = Eq                   // ✓
 ```
 
@@ -2208,9 +2207,17 @@ for i in 1..=3 {
 
 ```
 ==   !=   <    >    <=   >=
+===  !==              // 引用相等 / 引用不等
 ```
 
-**`==` 引用相等**：基础类型值相等，ADT 比较内存地址。结构相等用 `eq` 方法。
+**`==` 值相等（递归结构相等）**：对任意类型自动派生，用户不可覆盖。
+- 标量：直接比较数值
+- str：逐字节比较 UTF-8 内容
+- array：按元素递归比较
+- record / ADT / newtype：按字段递归比较
+- **UB 警告**：递归类型（如 `type List<T> = | Cons(T, List<T>)`）若存在循环引用，结构相等将进入无限递归，行为为未定义。不做运行时检测。
+
+**`===` 引用相等**：比较两个值的内存地址。标量上退化为 `==`（因为没有地址概念）。
 
 #### 逻辑运算符
 
@@ -2595,7 +2602,7 @@ VM 当前可处理所有合法 Glue 程序。`vmEligible`（`src/main.zig`）仅
 | D47 | str 用 UTF-8 | 内存高效 | UTF-16 / char[] |
 | D48 | 运算符不可重载 | 简单可预测 | 支持重载 |
 | D49 | Iterable/Iterator Trait | 统一迭代协议 | 内建 for 循环 |
-| D50 | `==` 引用相等 | 性能可预测 O(1)，结构相等用 `eq` | 结构相等为默认 |
+| D50 | `==` 值相等 + `===` 引用相等 | `==` 自动派生结构相等符合主流；`===` 显式引用相等 | 结构相等为默认 |
 | D51 | `?` 不跨 Nullable/Throw | null 和 error 语义不同 | 自动转换 |
 | D52 | Panic 不可捕获 | bug 不应恢复，协程级隔离 | panic/recover |
 | D53 | `Panic()` 触发 panic | 不可捕获，协程级隔离，简单统一 | 三级断言(assert/precondition/fatal) |
@@ -2664,8 +2671,8 @@ VM 当前可处理所有合法 Glue 程序。`vmEligible`（`src/main.zig`）仅
 | 字节码 VM | Bytecode VM | 将 AST 编译为线性字节码后由栈式执行引擎运行 |
 | Chunk | Chunk | 字节码指令序列 + 立即数编码 |
 | 先检查后求值 | Check-then-eval | Sema 先完成类型检查，类型错误阻止求值；VM 信任类型信息 |
-| 引用相等 | Reference Equality | `==` 比较内存地址（ADT）或值（基础类型） |
-| 结构相等 | Structural Equality | `eq` 方法逐字段比较 |
+| 值相等 | Value Equality | `==` 自动派生，递归比较内容（结构相等） |
+| 引用相等 | Reference Equality | `===` 比较内存地址；标量退化为值相等 |
 | Panic | Panic | 不可恢复的 bug，不可捕获，协程级隔离 |
 | 断言 | Assertion | 统一为 `Panic()` 构造器，不可恢复，不可捕获 |
 | defer | defer | 延迟执行，LIFO 顺序，覆盖正常返回/throw/panic |

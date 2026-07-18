@@ -17,7 +17,7 @@ pub const NodeOp = enum(u8) {
     int_add, int_sub, int_mul, int_div, int_mod,
     int_and, int_or, int_xor, int_shl, int_shr, int_not,
     int_neg, int_abs,
-    float_add, float_sub, float_mul, float_div,
+    float_add, float_sub, float_mul, float_div, float_mod,
     float_neg, float_abs,
     cmp_eq, cmp_ne, cmp_lt, cmp_le, cmp_gt, cmp_ge,
     bool_and, bool_or, bool_not,
@@ -25,8 +25,9 @@ pub const NodeOp = enum(u8) {
 
     // === 数据结构 ===
     array_make, array_get, array_set, array_len, array_push, array_concat,
+    array_first, array_last, array_contains, array_get_safe, array_drop_last, array_pop,
     record_make, record_get, record_set, record_clone,
-    string_concat, string_len, string_index,
+    string_concat, string_len, string_index, string_contains,
     newtype_wrap, newtype_unwrap,
 
     // === 向量计算（处理循环/递归，Phase 2） ===
@@ -63,11 +64,16 @@ pub const NodeOp = enum(u8) {
     builtin_eprint, builtin_eprintln,
     builtin_scan, builtin_scanln,
     builtin_ok, builtin_error, builtin_eq, builtin_str,
+    builtin_ref_eq,
     builtin_type, builtin_panic,
 
     // === 星轨（async/spawn，Phase 5） ===
     orbit_async_create, orbit_async_join, orbit_async_status,
     orbit_chan_send, orbit_chan_recv, orbit_chan_try_recv, channel_close,
+    channel_create, channel_sender, channel_receiver,
+
+    // === 原子操作 ===
+    atomic_swap, atomic_cas,
 
     // === 反射方法（.message() / .type_name()） ===
     error_message, obj_type_name,
@@ -101,7 +107,7 @@ pub const NodeOp = enum(u8) {
             .int_add, .int_sub, .int_mul, .int_div, .int_mod,
             .int_and, .int_or, .int_xor, .int_shl, .int_shr, .int_not,
             .int_neg, .int_abs,
-            .float_add, .float_sub, .float_mul, .float_div,
+            .float_add, .float_sub, .float_mul, .float_div, .float_mod,
             .float_neg, .float_abs,
             .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge,
             .bool_and, .bool_or, .bool_not,

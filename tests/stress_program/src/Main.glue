@@ -15,14 +15,14 @@ fun length<T>(l: List<T>): i32 {
     }
 }
 
-fun mapL<T, U>(l: List<T>, f): List<U> {
+fun mapL(l: List<i32>, f: (i32) -> i32): List<i32> {
     match l {
         Nil => Nil
         Cons(x, tail) => Cons(f(x), mapL(tail, f))
     }
 }
 
-fun foldL<T>(l: List<T>, acc: i32, f): i32 {
+fun foldL(l: List<i32>, acc: i32, f: (i32, i32) -> i32): i32 {
     match l {
         Nil => acc
         Cons(x, tail) => foldL(tail, f(acc, x), f)
@@ -39,7 +39,7 @@ fun reverseL<T>(l: List<T>): List<T> {
     go(l, Nil)
 }
 
-fun filterL(l: List<i32>, pred): List<i32> {
+fun filterL(l: List<i32>, pred: (i32) -> bool): List<i32> {
     match l {
         Nil => Nil
         Cons(x, tail) => {
@@ -144,7 +144,7 @@ fun main() {
     val squared = mapL(nums, fun(x) { x * x })
     println(showL(squared))                        // 1,4,9,...,100,nil
 
-    val evens = filterL(nums, fun(x) { x % 2 == 0 })
+    val evens = filterL(nums, fun(x: i32) { x % 2 == 0 })
     println(showL(evens))                          // 2,4,6,8,10,nil
 
     val total = foldL(nums, 0, fun(acc, x) { acc + x })
@@ -157,7 +157,7 @@ fun main() {
 
     // --- 表达式求值: (3 + 4) * 2 = 14 ---
     val e1 = Mul(Add(Num(3), Num(4)), Num(2))
-    println(match evalExpr(e1) { Ok(v) => str(v), Error(err) => "err:" + err.message })  // 14
+    println(match evalExpr(e1) { Ok(v) => str(v), Error(err) => "err:" + err.message() })  // 14
 
     // --- 表达式求值: 100 / (5 - 5) => div by zero ---
     val e2 = Div(Num(100), Sub(Num(5), Num(5)))
@@ -169,25 +169,35 @@ fun main() {
 
     // --- BST: 插入乱序 → 中序得有序 ---
     var tree = Leaf
-    for v in [5, 3, 8, 1, 4, 7, 9, 2, 6] {
-        tree = insert(tree, v)
+    val bst_vals = [5, 3, 8, 1, 4, 7, 9, 2, 6]
+    var bi = 0i32
+    while bi < i32(bst_vals.len()) {
+        tree = insert(tree, bst_vals[bi])
+        bi = bi + 1
     }
     println(showL(inorder(tree)))                  // 1,2,3,4,5,6,7,8,9,nil
 
     // --- 闭包计数器 + 链表生成 ---
     var seen: i32[] = []
-    for x in [3, 1, 4, 1, 5, 9, 2, 6] {
+    val dedup_vals = [3, 1, 4, 1, 5, 9, 2, 6]
+    var di = 0i32
+    while di < i32(dedup_vals.len()) {
+        val x = dedup_vals[di]
         if !seen.contains(x) {
             seen = seen ++ [x]
         }
+        di = di + 1
     }
     println(seen)                                  // dedup: [3,1,4,5,9,2,6]
     println(seen.len())                            // 7
 
     // --- 字符串构建 ---
     var msg = ""
-    for w in ["Glue", "is", "working"] {
-        msg = msg + w + " "
+    val words = ["Glue", "is", "working"]
+    var wi = 0i32
+    while wi < i32(words.len()) {
+        msg = msg + words[wi] + " "
+        wi = wi + 1
     }
     println(msg)                                   // Glue is working
 
