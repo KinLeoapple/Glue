@@ -10,6 +10,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const ir = @import("ir");
+const glue_builtin = @import("glue_builtin");
 const subtype_check = @import("subtype_check");
 const trait_resolve = @import("trait_resolve");
 const throw_check = @import("throw_check");
@@ -37,6 +38,8 @@ fn semaTypeToChanType(ty: *Type) ?ChanType {
         .u32_type => .u32_chan,
         .u64_type => .u64_chan,
         .u128_type => .u128_chan,
+        .isize_type => .isize_chan,
+        .usize_type => .usize_chan,
         .f16_type => .f16_chan,
         .f32_type => .f32_chan,
         .f64_type => .f64_chan,
@@ -79,7 +82,7 @@ fn canRoundTripFloat(comptime T: type, val: f64) bool {
 }
 var next_type_id: usize = 0;
 
-const SINGLETON_COUNT: usize = 20;
+const SINGLETON_COUNT: usize = 22;
 fn singletonIdx(tag: Type) usize {
     return switch (tag) {
         .i8_type => 0,
@@ -102,6 +105,8 @@ fn singletonIdx(tag: Type) usize {
         .null_type => 17,
         .unit_type => 18,
         .unknown_type => 19,
+        .isize_type => 20,
+        .usize_type => 21,
         else => SINGLETON_COUNT,
     };
 }
@@ -118,6 +123,8 @@ pub const Type = union(enum) {
     u32_type,
     u64_type,
     u128_type,
+    isize_type,
+    usize_type,
     f16_type,
     f32_type,
     f64_type,
@@ -160,13 +167,85 @@ pub const Type = union(enum) {
 
     pub fn isIntType(self: Type) bool {
         return switch (self) {
-            .i8_type, .i16_type, .i32_type, .i64_type, .i128_type, .u8_type, .u16_type, .u32_type, .u64_type, .u128_type => true,
+            .i8_type, .i16_type, .i32_type, .i64_type, .i128_type, .u8_type, .u16_type, .u32_type, .u64_type, .u128_type, .isize_type, .usize_type => true,
             else => false,
         };
     }
     pub fn isFloatType(self: Type) bool {
         return switch (self) {
             .f16_type, .f32_type, .f64_type, .f128_type => true,
+            else => false,
+        };
+    }
+
+    // ── Phase 4 isWidening 辅助函数（按 spec §4.2 / §7.2 精确路径表）──
+
+    /// 整数类型的位宽（isize/usize 跟随平台位宽）
+    pub fn intTypeBitWidth(self: Type) ?u16 {
+        return switch (self) {
+            .i8_type, .u8_type => 8,
+            .i16_type, .u16_type => 16,
+            .i32_type, .u32_type => 32,
+            .i64_type, .u64_type => 64,
+            .i128_type, .u128_type => 128,
+            .isize_type, .usize_type => @intCast(@bitSizeOf(isize)),
+            else => null,
+        };
+    }
+
+    /// 浮点类型的位宽
+    pub fn floatTypeBitWidth(self: Type) ?u16 {
+        return switch (self) {
+            .f16_type => 16,
+            .f32_type => 32,
+            .f64_type => 64,
+            .f128_type => 128,
+            else => null,
+        };
+    }
+
+    /// 整数是否为有符号类型
+    pub fn isSignedIntType(self: Type) bool {
+        return switch (self) {
+            .i8_type, .i16_type, .i32_type, .i64_type, .i128_type, .isize_type => true,
+            else => false,
+        };
+    }
+
+    /// int→float 精确 widening 路径表（spec §4.2）
+    /// 关键变化：
+    ///   - i64→f64 不再是 widening（i64 有 64 位精度，f64 只有 53 位尾数）
+    ///   - i128→f128 不是 widening（i128 有 128 位精度，f128 只有 113 位尾数）
+    ///   - i8/i16/u8/u16 → f32/f64/f128 widening（精度无损）
+    ///   - i32/u32 → f64/f128 widening
+    ///   - i64/u64 → f128 widening（i64→f64 丢精度）
+    ///   - i128/u128 → 无 widening 路径
+    ///   - isize/usize 按平台位宽对应到 i64/u64（64 位平台）或 i32/u32（32 位平台）
+    ///   - 任何 int→f16 都不是 widening（f16 仅 10 位尾数，无法无损表示任何整数）
+    pub fn intToFloatWidening(int_ty: Type, float_ty: Type) bool {
+        const platform_bits: u16 = @intCast(@bitSizeOf(isize));
+        return switch (int_ty) {
+            .i8_type, .u8_type, .i16_type, .u16_type => switch (float_ty) {
+                .f32_type, .f64_type, .f128_type => true,
+                else => false, // f16 不算 widening
+            },
+            .i32_type, .u32_type => switch (float_ty) {
+                .f64_type, .f128_type => true,
+                else => false,
+            },
+            .i64_type, .u64_type => switch (float_ty) {
+                .f128_type => true,
+                else => false,
+            },
+            .i128_type, .u128_type => false, // 无 widening 路径
+            .isize_type, .usize_type => blk: {
+                // 按平台位宽等价映射到 i64/u64 或 i32/u32
+                const equiv: Type = if (platform_bits <= 32)
+                    if (int_ty == .isize_type) .i32_type else .u32_type
+                else
+                    if (int_ty == .isize_type) .i64_type else .u64_type;
+                break :blk intToFloatWidening(equiv, float_ty);
+            },
             else => false,
         };
     }
@@ -373,6 +452,8 @@ const BUILTIN_TYPES = [_]BuiltinTypeEntry{
     .{ .name = "u32", .ty = .u32_type },
     .{ .name = "u64", .ty = .u64_type },
     .{ .name = "u128", .ty = .u128_type },
+    .{ .name = "isize", .ty = .isize_type },
+    .{ .name = "usize", .ty = .usize_type },
     .{ .name = "f16", .ty = .f16_type },
     .{ .name = "f32", .ty = .f32_type },
     .{ .name = "f64", .ty = .f64_type },
@@ -396,6 +477,8 @@ const NUMERIC_TYPES = [_]BuiltinTypeEntry{
     .{ .name = "u32", .ty = .u32_type },
     .{ .name = "u64", .ty = .u64_type },
     .{ .name = "u128", .ty = .u128_type },
+    .{ .name = "isize", .ty = .isize_type },
+    .{ .name = "usize", .ty = .usize_type },
     .{ .name = "f16", .ty = .f16_type },
     .{ .name = "f32", .ty = .f32_type },
     .{ .name = "f64", .ty = .f64_type },
@@ -414,6 +497,8 @@ const INT_SUFFIXES = [_]BuiltinTypeEntry{
     .{ .name = "u32", .ty = .u32_type },
     .{ .name = "u64", .ty = .u64_type },
     .{ .name = "u128", .ty = .u128_type },
+    .{ .name = "isize", .ty = .isize_type },
+    .{ .name = "usize", .ty = .usize_type },
 };
 
 /// 浮点后缀条目
@@ -768,30 +853,64 @@ pub const TypeInferencer = struct {
     pub fn isWidening(self: *TypeInferencer, wider: *Type, narrower: *Type) bool {
         const w = self.resolve(wider);
         const n = self.resolve(narrower);
-        const rank = struct {
-            fn get(t: Type) ?u8 {
-                return switch (t) {
-                    .i8_type => 0,
-                    .u8_type => 1,
-                    .i16_type => 2,
-                    .u16_type => 3,
-                    .i32_type => 4,
-                    .u32_type => 5,
-                    .i64_type => 6,
-                    .u64_type => 7,
-                    .i128_type => 8,
-                    .u128_type => 9,
-                    .f16_type => 9,
-                    .f32_type => 10,
-                    .f64_type => 11,
-                    .f128_type => 12,
-                    else => null,
-                };
+
+        // 同类型：identity，视为 widening（永不失败的特例）
+        if (std.meta.activeTag(w.*) == std.meta.activeTag(n.*)) {
+            return switch (n.*) {
+                .i8_type, .i16_type, .i32_type, .i64_type, .i128_type,
+                .u8_type, .u16_type, .u32_type, .u64_type, .u128_type,
+                .isize_type, .usize_type,
+                .f16_type, .f32_type, .f64_type, .f128_type,
+                .bool_type, .char_type,
+                => true,
+                else => false,
+            };
+        }
+
+        // bool → 任意数值 → widening（false=0, true=1，可无损表示）
+        if (n.* == .bool_type) {
+            return switch (w.*) {
+                .i8_type, .i16_type, .i32_type, .i64_type, .i128_type,
+                .u8_type, .u16_type, .u32_type, .u64_type, .u128_type,
+                .isize_type, .usize_type,
+                .f16_type, .f32_type, .f64_type, .f128_type,
+                => true,
+                else => false,
+            };
+        }
+
+        // char → 任意其他类型：均非 widening（按 §4.1 表，char→int = N 码点截断/检查）
+        // char→char 已在上述同类型分支处理
+
+        // int→int 规则（§7.2）：
+        //   - 同符号且 dst 位数 ≥ src 位数 → widening
+        //   - 跨符号同位数 → widening (bit reinterpret)
+        //   - 跨符号不同位数 → 非 widening (需要范围检查)
+        if (n.isIntType() and w.isIntType()) {
+            const src_signed = n.isSignedIntType();
+            const dst_signed = w.isSignedIntType();
+            const src_bits = n.intTypeBitWidth() orelse return false;
+            const dst_bits = w.intTypeBitWidth() orelse return false;
+            if (src_signed == dst_signed) {
+                return dst_bits >= src_bits;
+            } else {
+                return dst_bits == src_bits;
             }
-        }.get;
-        const w_rank = rank(w.*) orelse return false;
-        const n_rank = rank(n.*) orelse return false;
-        return n_rank < w_rank;
+        }
+
+        // int→float: 按 §4.2 精确 widening 路径表
+        if (n.isIntType() and w.isFloatType()) {
+            return Type.intToFloatWidening(n.*, w.*);
+        }
+
+        // float→float: dst 位数 ≥ src 位数 → widening
+        if (n.isFloatType() and w.isFloatType()) {
+            const src_bits = n.floatTypeBitWidth() orelse return false;
+            const dst_bits = w.floatTypeBitWidth() orelse return false;
+            return dst_bits >= src_bits;
+        }
+
+        return false;
     }
     /// 创建新的类型变量。
     pub fn freshTypeVar(self: *TypeInferencer) !*Type {
@@ -1019,6 +1138,7 @@ pub const TypeInferencer = struct {
         return switch (a.*) {
             .i8_type, .i16_type, .i32_type, .i64_type, .i128_type,
             .u8_type, .u16_type, .u32_type, .u64_type, .u128_type,
+            .isize_type, .usize_type,
             .f16_type, .f32_type, .f64_type, .f128_type,
             .bool_type, .str_type, .char_type, .null_type, .unit_type, .unknown_type => true,
             .type_var => |va| {
@@ -1213,6 +1333,9 @@ pub const TypeInferencer = struct {
                     .u64_type => 7,
                     .i128_type => 8,
                     .u128_type => 9,
+                    // isize/usize 跟随平台位宽等价处理
+                    .isize_type => 6,
+                    .usize_type => 7,
                     else => 0,
                 };
             }
@@ -1651,7 +1774,12 @@ pub const TypeInferencer = struct {
                     .generic_type => |gt| gt.name,
                     else => null,
                 };
-                sr.putExpr(@intFromPtr(expr), .{ .chan_type = ct, .type_name = type_name }) catch {};
+                // nullable 类型需要单独设置 inner_type，供 IRBuilder 的 compileSafeAccess 使用
+                var inner_ct: ChanType = .null_chan;
+                if (ty.* == .nullable_type) {
+                    inner_ct = semaTypeToChanType(ty.nullable_type) orelse .ref_chan;
+                }
+                sr.putExpr(@intFromPtr(expr), .{ .chan_type = ct, .inner_type = inner_ct, .type_name = type_name }) catch {};
             }
         }
         return ty;
@@ -1801,14 +1929,16 @@ pub const TypeInferencer = struct {
                         return arr_ty;
                     },
                     .range, .range_inclusive => {
-                        const i32_ty = try self.makeType(.i32_type);
-                        _ = self.tryWidenUnify(i32_ty, left_ty) catch {
-                            try self.unify(left_ty, i32_ty);
+                        // Range 元素类型默认 usize（数组索引/计数场景）
+                        // 字面量操作数会经 expected=usize 路径自动提升
+                        const usize_ty = try self.makeType(.usize_type);
+                        _ = self.tryWidenUnify(usize_ty, left_ty) catch {
+                            try self.unify(left_ty, usize_ty);
                         };
-                        _ = self.tryWidenUnify(i32_ty, right_ty) catch {
-                            try self.unify(right_ty, i32_ty);
+                        _ = self.tryWidenUnify(usize_ty, right_ty) catch {
+                            try self.unify(right_ty, usize_ty);
                         };
-                        return self.makeType(.i32_type);
+                        return self.makeType(.usize_type);
                     },
                     .elvis => {
                         const rl = self.resolve(left_ty);
@@ -2244,16 +2374,63 @@ pub const TypeInferencer = struct {
             },
             .safe_access => |sa| {
                 const obj_ty = self.inferExpr(sa.object, env, null) catch return self.freshTypeVar() catch unreachable;
-                _ = obj_ty;
-                const inner = self.freshTypeVar() catch unreachable;
-                return self.makeNullableType(inner) catch unreachable;
+                const resolved = self.resolve(obj_ty);
+                // 如果 obj 是 nullable<T>，解包 T 后查找字段；否则直接在 obj 上查找
+                const inner_ty = if (resolved.* == .nullable_type) resolved.nullable_type else obj_ty;
+                const inner_resolved = self.resolve(inner_ty);
+                const field_ty: *Type = switch (inner_resolved.*) {
+                    .record_type => |rt| blk: {
+                        for (rt.fields) |field| {
+                            if (std.mem.eql(u8, field.name, sa.field)) break :blk field.ty;
+                        }
+                        break :blk self.freshTypeVar() catch unreachable;
+                    },
+                    .adt_type => |at| blk: {
+                        if (self.adt_types.get(at.name)) |info| {
+                            if (info.type_param_names.len == 0) {
+                                for (info.ctor_field_names, 0..) |fns, ci| {
+                                    for (fns, 0..) |fname_opt, fi| {
+                                        if (fname_opt) |fname| {
+                                            if (std.mem.eql(u8, fname, sa.field)) {
+                                                break :blk info.ctor_field_types[ci][fi];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        break :blk self.freshTypeVar() catch unreachable;
+                    },
+                    else => self.freshTypeVar() catch unreachable,
+                };
+                // 如果字段本身是 nullable<T>，结果也是 nullable<T>（避免嵌套 nullable）
+                const field_resolved = self.resolve(field_ty);
+                if (field_resolved.* == .nullable_type) {
+                    return field_resolved;
+                }
+                return self.makeNullableType(field_ty) catch unreachable;
             },
             .safe_method_call => |smc| {
                 return trait_resolve.inferSafeMethodCall(self, smc, env);
             },
             .index => |idx| {
                 const obj_ty = self.inferExpr(idx.object, env, null) catch return self.freshTypeVar() catch unreachable;
-                _ = self.inferExpr(idx.index, env, null) catch {};
+                // Phase 5: 数组索引类型强制 usize（spec §8.1）
+                // 字面量经 expected 路径自动提升；显式整数变量若非 usize 需报错
+                const usize_ty = try self.makeType(.usize_type);
+                const idx_ty = self.inferExpr(idx.index, env, usize_ty) catch |err| {
+                    if (err == error.TypeMismatch) {
+                        const loc = ast.exprLocation(idx.index);
+                        var idx_buf = std.ArrayList(u8).empty;
+                        defer idx_buf.deinit(self.arena.allocator());
+                        const actual_ty = self.inferExpr(idx.index, env, null) catch return self.freshTypeVar() catch unreachable;
+                        actual_ty.formatArrayList(&idx_buf, self.arena.allocator()) catch {};
+                        self.addErrorAt(.type_mismatch, loc.line, loc.column, "array index must be usize, got {s}; use cast(x).to(usize) to convert", .{idx_buf.items});
+                        return self.freshTypeVar() catch unreachable;
+                    }
+                    return self.freshTypeVar() catch unreachable;
+                };
+                _ = idx_ty;
                 const resolved = self.resolve(obj_ty);
                 switch (resolved.*) {
                     .array_type => |at| return at.element_type,
@@ -2266,6 +2443,29 @@ pub const TypeInferencer = struct {
             .type_cast => |tc| {
                 _ = try self.inferExpr(tc.expr, env, null);
                 return self.typeFromAst(tc.target_type);
+            },
+            .cast_builder => |cb| {
+                // Phase 3 cast builder：cast(expr).to(T) / cast(expr).try_to(T)
+                // to: wrap on overflow / panic on Inf / panic on parse failure
+                // try_to: returns Throw<T, CastError>
+                // 注：isWidening 已在 Phase 4 重写为精确路径表，可用于未来 narrowing 诊断
+                _ = try self.inferExpr(cb.expr, env, null);
+                const target_ty = try self.typeFromAst(cb.target_type);
+                switch (cb.mode) {
+                    .to => return target_ty,
+                    .try_to => {
+                        // 结果类型 = Throw<T, CastError>
+                        // CastError 已在 registerBuiltins 注册为 ADT（is_error_newtype=true）
+                        const cast_error_ty = self.adt_types.get("CastError") orelse {
+                            self.addErrorAt(.type_mismatch, ast.exprLocation(expr).line, ast.exprLocation(expr).column, "CastError builtin not registered", .{});
+                            return self.freshTypeVar() catch unreachable;
+                        };
+                        const throw_ty = self.arena.allocator().create(Type) catch return self.freshTypeVar() catch unreachable;
+                        throw_ty.* = Type{ .throw_type = .{ .value_type = target_ty, .error_type = cast_error_ty.ty } };
+                        self.types.append(self.arena.allocator(), throw_ty) catch return self.freshTypeVar() catch unreachable;
+                        return throw_ty;
+                    },
+                }
             },
             .assignment_expr => |ae| {
                 const val_ty = try self.inferExpr(ae.value, env, null);
@@ -2495,7 +2695,8 @@ pub const TypeInferencer = struct {
                 return null;
             },
             .throw_stmt => |thr| {
-                _ = try self.inferExpr(thr.expr, env, null);
+                const thrown_ty = try self.inferExpr(thr.expr, env, null);
+                throw_check.checkThrowStmt(self, thrown_ty, thr.location);
                 return null;
             },
             .break_stmt, .continue_stmt => {
@@ -3074,17 +3275,17 @@ pub const TypeInferencer = struct {
             self.registerBuiltinName("Error");
         }
         // Error 作为完全内建 trait 注册
+        // 设计：message/type_name 提供默认实现（读 ErrorValue 字段），用户可通过 override
+        // 自定义行为。prefix 已合并到 type_name（错误前缀直接使用 type_name()），故移除。
         {
             const error_trait_ty = self.arena.allocator().create(Type) catch return;
             error_trait_ty.* = Type{ .trait_type = .{ .name = "Error", .type_args = &[_]*Type{} } };
             self.types.append(self.arena.allocator(), error_trait_ty) catch return;
-            // method_names 包含所有方法；required_method_names 仅含必需方法（prefix）
-            const error_method_names = self.arena.allocator().alloc([]const u8, 3) catch return;
+            // method_names 包含所有方法；required_method_names 为空（message/type_name 均有默认实现）
+            const error_method_names = self.arena.allocator().alloc([]const u8, 2) catch return;
             error_method_names[0] = "message";
             error_method_names[1] = "type_name";
-            error_method_names[2] = "prefix";
-            const error_required_names = self.arena.allocator().alloc([]const u8, 1) catch return;
-            error_required_names[0] = "prefix";
+            const error_required_names = &[_][]const u8{};
             const error_assoc_names = &[_][]const u8{};
             var error_method_schemes = std.StringHashMap(TypeScheme).init(self.arena.allocator());
             // message(self: Error) -> str
@@ -3109,17 +3310,6 @@ pub const TypeInferencer = struct {
                 const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
                 error_method_schemes.put(self.arena.allocator().dupe(u8, "type_name") catch return, scheme) catch return;
             }
-            // prefix(self: Error) -> str
-            {
-                const self_type = self.arena.allocator().create(Type) catch return;
-                self_type.* = Type{ .trait_type = .{ .name = "Error", .type_args = &[_]*Type{} } };
-                self.types.append(self.arena.allocator(), self_type) catch return;
-                const fn_params = self.arena.allocator().alloc(*Type, 1) catch return;
-                fn_params[0] = self_type;
-                const fn_ty = self.makeFnType(fn_params, self.makeType(.str_type) catch return) catch return;
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
-                error_method_schemes.put(self.arena.allocator().dupe(u8, "prefix") catch return, scheme) catch return;
-            }
             const error_key = self.arena.allocator().dupe(u8, "Error") catch return;
             self.trait_types.put(error_key, TraitInfo{
                 .ty = error_trait_ty,
@@ -3129,6 +3319,57 @@ pub const TypeInferencer = struct {
                 .method_schemes = error_method_schemes,
                 .defining_module = "<builtin>",
             }) catch return;
+        }
+        // builtin 类型注册（决策 #18/#23/#24）：从 glue_builtin.BUILTIN_TYPES 元信息表加载
+        // 每个 builtin error_newtype 自动注册 ADT + 构造器 + builtin_names 防护
+        // sema 启动时全加载类型定义，代码生成阶段按需编译方法体（Phase 3 实现按需加载）
+        inline for (glue_builtin.BUILTIN_TYPES) |bt| {
+            switch (bt.kind) {
+                .error_newtype => {
+                    // 注册 ADT 类型
+                    const adt_ty = self.makeAdtType(bt.name, &[_]*Type{}) catch return;
+                    // 构造器参数类型按 bt.fields 中的 type_name 查询 BUILTIN_TYPES 转换为 *Type
+                    // 字段类型在 comptime inline for 中已知，内联展开保证 comptime 推断
+                    const ctor_params = self.arena.allocator().alloc(*Type, bt.fields.len) catch return;
+                    inline for (bt.fields, 0..) |f, i| {
+                        const field_ty: Type = blk: {
+                            inline for (BUILTIN_TYPES) |entry| {
+                                if (comptime std.mem.eql(u8, entry.name, f.type_name)) break :blk entry.ty;
+                            }
+                            break :blk .str_type;
+                        };
+                        ctor_params[i] = self.makeType(field_ty) catch return;
+                    }
+                    const ctor_ty = self.makeFnType(ctor_params, adt_ty) catch return;
+                    const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
+                    _ = env.define(bt.constructor_name, scheme) catch return;
+                    self.registerBuiltinName(bt.constructor_name);
+                    self.registerBuiltinName(bt.name);
+                    // 注册到 adt_types（标记 is_error_newtype=true，作为 Error 子类型）
+                    // 同时填充 ctor_field_names/ctor_field_types，使 field_access 能解析字段类型
+                    // （与用户定义 ADT 在 .adt 分支填充方式一致，sema/type_check.zig:3608-3634）
+                    const adt_key = self.arena.allocator().dupe(u8, bt.name) catch return;
+                    const ctor_names = self.arena.allocator().alloc([]const u8, 1) catch return;
+                    ctor_names[0] = bt.constructor_name;
+                    // 单构造器：ctor_field_types/ctor_field_names 第一维长度=1
+                    const ctor_field_types = self.arena.allocator().alloc([]const *Type, 1) catch return;
+                    const ctor_field_names = self.arena.allocator().alloc([]const ?[]const u8, 1) catch return;
+                    ctor_field_types[0] = ctor_params;
+                    const field_names = self.arena.allocator().alloc(?[]const u8, bt.fields.len) catch return;
+                    inline for (bt.fields, 0..) |f, i| {
+                        field_names[i] = f.name;
+                    }
+                    ctor_field_names[0] = field_names;
+                    self.adt_types.put(adt_key, AdtInfo{
+                        .ty = adt_ty,
+                        .constructor_names = ctor_names,
+                        .is_error_newtype = true,
+                        .defining_module = "<builtin>",
+                        .ctor_field_types = ctor_field_types,
+                        .ctor_field_names = ctor_field_names,
+                    }) catch return;
+                },
+            }
         }
         {
             const val_ty = self.freshTypeVar() catch return;
@@ -4070,3 +4311,187 @@ pub const TypeInferencer = struct {
         trait_resolve.checkTraitBound(self, bound, location);
     }
 };
+
+// ──────────────────────────────────────────────
+// Phase 4 isWidening 单元测试
+// 验证 §4.2 精确 widening 路径表 + §7.2 int→int 规则
+// ──────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "isWidening: int→int 同符号宽化" {
+    var inf = TypeInferencer.init(testing.allocator);
+    defer inf.deinit();
+    const i8_ty = try inf.makeType(.i8_type);
+    const i16_ty = try inf.makeType(.i16_type);
+    const i32_ty = try inf.makeType(.i32_type);
+    const i64_ty = try inf.makeType(.i64_type);
+    const i128_ty = try inf.makeType(.i128_type);
+    const u8_ty = try inf.makeType(.u8_type);
+    const u64_ty = try inf.makeType(.u64_type);
+
+    // 同符号宽化 → widening
+    try testing.expect(inf.isWidening(i16_ty, i8_ty));
+    try testing.expect(inf.isWidening(i32_ty, i8_ty));
+    try testing.expect(inf.isWidening(i64_ty, i32_ty));
+    try testing.expect(inf.isWidening(i128_ty, i64_ty));
+    try testing.expect(inf.isWidening(u64_ty, u8_ty));
+
+    // 同类型 identity → widening
+    try testing.expect(inf.isWidening(i32_ty, i32_ty));
+    try testing.expect(inf.isWidening(u64_ty, u64_ty));
+
+    // 同符号窄化 → 非 widening
+    try testing.expect(!inf.isWidening(i8_ty, i16_ty));
+    try testing.expect(!inf.isWidening(i32_ty, i64_ty));
+    try testing.expect(!inf.isWidening(u8_ty, u64_ty));
+}
+
+test "isWidening: int→int 跨符号规则" {
+    var inf = TypeInferencer.init(testing.allocator);
+    defer inf.deinit();
+    const i32_ty = try inf.makeType(.i32_type);
+    const u32_ty = try inf.makeType(.u32_type);
+    const i64_ty = try inf.makeType(.i64_type);
+    const u64_ty = try inf.makeType(.u64_type);
+    const i8_ty = try inf.makeType(.i8_type);
+    const u8_ty = try inf.makeType(.u8_type);
+
+    // 跨符号同位数 → widening (bit reinterpret)
+    try testing.expect(inf.isWidening(i32_ty, u32_ty));
+    try testing.expect(inf.isWidening(u32_ty, i32_ty));
+    try testing.expect(inf.isWidening(i8_ty, u8_ty));
+    try testing.expect(inf.isWidening(u8_ty, i8_ty));
+
+    // 跨符号不同位数 → 非 widening (需要范围检查)
+    try testing.expect(!inf.isWidening(i64_ty, u32_ty));
+    try testing.expect(!inf.isWidening(u64_ty, i32_ty));
+    try testing.expect(!inf.isWidening(i32_ty, u64_ty));
+}
+
+test "isWidening: int→float 按 §4.2 精确路径" {
+    var inf = TypeInferencer.init(testing.allocator);
+    defer inf.deinit();
+    const i8_ty = try inf.makeType(.i8_type);
+    const i16_ty = try inf.makeType(.i16_type);
+    const i32_ty = try inf.makeType(.i32_type);
+    const i64_ty = try inf.makeType(.i64_type);
+    const i128_ty = try inf.makeType(.i128_type);
+    const f16_ty = try inf.makeType(.f16_type);
+    const f32_ty = try inf.makeType(.f32_type);
+    const f64_ty = try inf.makeType(.f64_type);
+    const f128_ty = try inf.makeType(.f128_type);
+
+    // i8/i16 → f32/f64/f128 widening（精度无损）
+    try testing.expect(inf.isWidening(f32_ty, i8_ty));
+    try testing.expect(inf.isWidening(f64_ty, i16_ty));
+    try testing.expect(inf.isWidening(f128_ty, i8_ty));
+
+    // i32 → f64/f128 widening
+    try testing.expect(inf.isWidening(f64_ty, i32_ty));
+    try testing.expect(inf.isWidening(f128_ty, i32_ty));
+
+    // i64 → f128 widening
+    try testing.expect(inf.isWidening(f128_ty, i64_ty));
+
+    // 关键 bug 修复：i64→f64 不再是 widening（f64 仅 53 位尾数）
+    try testing.expect(!inf.isWidening(f64_ty, i64_ty));
+    // i128→f128 不是 widening（f128 仅 113 位尾数）
+    try testing.expect(!inf.isWidening(f128_ty, i128_ty));
+    // i128/u128 → 任何 float 都不 widening
+    try testing.expect(!inf.isWidening(f128_ty, i128_ty));
+
+    // 任何 int→f16 都不 widening（f16 仅 10 位尾数）
+    try testing.expect(!inf.isWidening(f16_ty, i8_ty));
+    try testing.expect(!inf.isWidening(f16_ty, i16_ty));
+
+    // i32→f32 不是 widening（i32 有 32 位精度，f32 仅 23 位尾数）
+    try testing.expect(!inf.isWidening(f32_ty, i32_ty));
+}
+
+test "isWidening: float→float 宽化" {
+    var inf = TypeInferencer.init(testing.allocator);
+    defer inf.deinit();
+    const f16_ty = try inf.makeType(.f16_type);
+    const f32_ty = try inf.makeType(.f32_type);
+    const f64_ty = try inf.makeType(.f64_type);
+    const f128_ty = try inf.makeType(.f128_type);
+
+    try testing.expect(inf.isWidening(f32_ty, f16_ty));
+    try testing.expect(inf.isWidening(f64_ty, f32_ty));
+    try testing.expect(inf.isWidening(f128_ty, f64_ty));
+    try testing.expect(inf.isWidening(f128_ty, f16_ty));
+
+    // 窄化 → 非 widening
+    try testing.expect(!inf.isWidening(f16_ty, f32_ty));
+    try testing.expect(!inf.isWidening(f32_ty, f64_ty));
+
+    // identity → widening
+    try testing.expect(inf.isWidening(f64_ty, f64_ty));
+}
+
+test "isWidening: bool → 任意数值 widening" {
+    var inf = TypeInferencer.init(testing.allocator);
+    defer inf.deinit();
+    const bool_ty = try inf.makeType(.bool_type);
+    const i32_ty = try inf.makeType(.i32_type);
+    const u64_ty = try inf.makeType(.u64_type);
+    const f64_ty = try inf.makeType(.f64_type);
+    const str_ty = try inf.makeType(.str_type);
+
+    try testing.expect(inf.isWidening(i32_ty, bool_ty));
+    try testing.expect(inf.isWidening(u64_ty, bool_ty));
+    try testing.expect(inf.isWidening(f64_ty, bool_ty));
+
+    // bool→str 不是 widening（format 路径）
+    try testing.expect(!inf.isWidening(str_ty, bool_ty));
+}
+
+test "isWidening: char → 任意其他类型非 widening" {
+    var inf = TypeInferencer.init(testing.allocator);
+    defer inf.deinit();
+    const char_ty = try inf.makeType(.char_type);
+    const i32_ty = try inf.makeType(.i32_type);
+    const u32_ty = try inf.makeType(.u32_type);
+    const i64_ty = try inf.makeType(.i64_type);
+    const f32_ty = try inf.makeType(.f32_type);
+
+    // char→任何其他类型都不 widening（按 §4.1 表 N=码点截断/检查）
+    try testing.expect(!inf.isWidening(i32_ty, char_ty));
+    try testing.expect(!inf.isWidening(u32_ty, char_ty));
+    try testing.expect(!inf.isWidening(i64_ty, char_ty));
+    try testing.expect(!inf.isWidening(f32_ty, char_ty));
+
+    // char→char identity 是 widening
+    try testing.expect(inf.isWidening(char_ty, char_ty));
+}
+
+test "isWidening: isize/usize 按平台位宽对应" {
+    var inf = TypeInferencer.init(testing.allocator);
+    defer inf.deinit();
+    const isize_ty = try inf.makeType(.isize_type);
+    const usize_ty = try inf.makeType(.usize_type);
+    const i32_ty = try inf.makeType(.i32_type);
+    const i64_ty = try inf.makeType(.i64_type);
+    const u32_ty = try inf.makeType(.u32_type);
+    const u64_ty = try inf.makeType(.u64_type);
+    const f128_ty = try inf.makeType(.f128_type);
+
+    // 64 位平台：isize=i64, usize=u64
+    if (@bitSizeOf(isize) == 64) {
+        // i32→isize 同符号宽化 → widening
+        try testing.expect(inf.isWidening(isize_ty, i32_ty));
+        // u32→usize 同符号宽化 → widening
+        try testing.expect(inf.isWidening(usize_ty, u32_ty));
+        // i64→isize identity（按平台等价）→ widening
+        try testing.expect(inf.isWidening(isize_ty, i64_ty));
+        // u64→usize identity → widening
+        try testing.expect(inf.isWidening(usize_ty, u64_ty));
+        // isize→f128 按 i64→f128 规则 → widening
+        try testing.expect(inf.isWidening(f128_ty, isize_ty));
+        // usize→f128 按 u64→f128 规则 → widening
+        try testing.expect(inf.isWidening(f128_ty, usize_ty));
+        // isize→i32 同符号窄化 → 非 widening
+        try testing.expect(!inf.isWidening(i32_ty, isize_ty));
+    }
+}

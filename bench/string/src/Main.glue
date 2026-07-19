@@ -18,7 +18,7 @@ fun repeatBuild(iters: i32, len: i32): i64 {
     var i: i32 = 0
     while i < iters {
         val s = buildString(len)
-        total = total + s.len()
+        total = total + cast(s.len()).to(i64)
         i = i + 1
     }
     total
@@ -29,13 +29,13 @@ fun mixedStringOps(s: str): i64 {
     var sum: i64 = 0
     // 字符迭代
     for ch in s {
-        sum = sum + i64(ch)
+        sum = sum + cast(ch).to(i64)
     }
     // 索引访问
     var i: i32 = 0
-    while i < s.len() {
-        val ch = s[i]
-        sum = sum + i64(ch) * 2
+    while i < cast(s.len()).to(i32) {
+        val ch = s[cast(i).to(usize)]
+        sum = sum + cast(ch).to(i64) * 2
         i = i + 3
     }
     sum

@@ -218,6 +218,15 @@ pub fn inferMethodCall(
         }
     }
 
+    // Phase 5: 内建方法 .len() 返回 usize（spec §8.1）
+    // 数组/字符串 .len() 在 IR builder 中硬编码为 .usize_chan，sema 同步返回 usize_type
+    if (std.mem.eql(u8, mc.method, "len") and mc.arguments.len == 0) {
+        const robj = inferencer.resolve(obj_ty);
+        if (robj.* == .array_type or robj.* == .str_type or robj.* == .adt_type) {
+            return inferencer.makeType(.usize_type) catch inferencer.freshTypeVar() catch unreachable;
+        }
+    }
+
     // 模块引用上的方法调用：查找 mangled 名函数 "Module.Sub.method"
     if (inferencer.asModuleRef(obj_ty)) |mod_name| {
         const mangled = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}.{s}", .{ mod_name, mc.method }) catch return inferencer.freshTypeVar() catch unreachable;

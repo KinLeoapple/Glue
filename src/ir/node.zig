@@ -22,6 +22,10 @@ pub const NodeOp = enum(u8) {
     cmp_eq, cmp_ne, cmp_lt, cmp_le, cmp_gt, cmp_ge,
     bool_and, bool_or, bool_not,
     cast, cast_safe,
+    /// Phase 3 cast builder：cast(x).to(T) — wrap on overflow，产生 Inf 时 panic，str→数值非法 panic
+    cast_to,
+    /// Phase 3 cast builder：cast(x).try_to(T) — 失败时返回 Throw<T, CastError>
+    cast_try_to,
 
     // === 数据结构 ===
     array_make, array_get, array_set, array_len, array_push, array_concat,
@@ -112,7 +116,7 @@ pub const NodeOp = enum(u8) {
             .float_neg, .float_abs,
             .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge,
             .bool_and, .bool_or, .bool_not,
-            .cast, .cast_safe => true,
+            .cast, .cast_safe, .cast_to, .cast_try_to => true,
             else => false,
         };
     }

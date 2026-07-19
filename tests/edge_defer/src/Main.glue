@@ -84,7 +84,7 @@ fun main() {
     // ---- throw path: defer still runs ----
     log = ""
     val t1 = match mayThrow(-1) {
-        Ok(v) => str(v)
+        Ok(v) => cast(v).to(str)
         Error(e) => "err:" + e.message()
     }
     println(t1)    // err:negative
@@ -92,7 +92,7 @@ fun main() {
 
     log = ""
     val t2 = match mayThrow(7) {
-        Ok(v) => str(v)
+        Ok(v) => cast(v).to(str)
         Error(e) => "err"
     }
     println(t2)    // 7

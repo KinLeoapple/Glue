@@ -11,6 +11,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const scalar = @import("value").scalar;
+const glue_builtin = @import("glue_builtin");
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
@@ -460,6 +461,10 @@ pub const IRBuilder = struct {
         // 反射：注册内建类型（i32/str/bool/char/f64 等）到 TypeMetadataTable
         // 使 typeof(i32) 等返回 Primitive kind + 正确 name/layout，而非占位 "?"
         try self.registerBuiltinTypeMetadata(arena_alloc);
+        // 注册 builtin error_newtype 构造器（CastError 等）—— 从 glue_builtin 元信息表加载
+        // builtin 类型无 AST，但代码生成需要 ctor_table/type_table/field_id_map 条目
+        // 决策 #18：sema 启动时全加载类型定义，代码生成阶段按需编译方法体
+        try self.registerBuiltinErrorTypes(arena_alloc);
 
         // 第一遍：注册所有函数名 + 预分配 Function 占位条目
         // 同时注册 type_decl（类型+构造器）和 trait_decl
@@ -852,6 +857,8 @@ pub const IRBuilder = struct {
             },
             .error_newtype => |en| {
                 // Error newtype：构造器名 = error_newtype name，参数来自 params
+                // error_newtype 实例用 RecordValue 表示（保持 match 兼容性），
+                // type_name 通过 RecordValue.type_name 携带，message 通过 field_id=1 访问
                 const fields = try arena_alloc.alloc(CtorField, en.params.len);
                 for (en.params, 0..) |p, fi| {
                     const fname = try std.fmt.allocPrint(arena_alloc, "_{d}", .{fi});
@@ -996,6 +1003,53 @@ pub const IRBuilder = struct {
             try self.type_metadata_entries.append(arena_alloc, entry);
             const type_id: u16 = @intCast(self.type_metadata_entries.items.len); // 1-indexed
             try self.type_name_to_id.put(arena_alloc, b.n, type_id);
+        }
+    }
+
+    /// 注册 builtin error_newtype 构造器（决策 #18/#23）
+    ///
+    /// 从 glue_builtin.BUILTIN_TYPES 元信息表读取所有 builtin error_newtype 类型定义，
+    /// 注册到 ctor_table / type_table / field_id_map，使代码生成阶段能像用户自定义
+    /// error_newtype 一样处理 CastError 等类型。
+    ///
+    /// 字段命名规则与用户自定义 error_newtype 一致（builder.zig:853-881）：
+    ///   - _<idx>（位置参数别名，field_id = idx + 1）
+    ///   - __tag（field_id = 0）
+    ///   - 用户源码字段名（field_id 同 _<idx>，便于 record_get 按名查询）
+    fn registerBuiltinErrorTypes(self: *IRBuilder, arena_alloc: std.mem.Allocator) !void {
+        inline for (glue_builtin.BUILTIN_TYPES) |bt| {
+            switch (bt.kind) {
+                .error_newtype => {
+                    // 构造器字段（位置参数别名 _0/_1/...，type_node 为 null 因为 builtin 无 AST）
+                    const fields = try arena_alloc.alloc(CtorField, bt.fields.len);
+                    for (bt.fields, 0..) |f, fi| {
+                        const fname = try std.fmt.allocPrint(arena_alloc, "_{d}", .{fi});
+                        fields[fi] = .{
+                            .name = fname,
+                            .type_node = null,
+                        };
+                        // 位置别名 field_id = fi + 1（与 error_newtype 一致，0 是 __tag）
+                        self.registerFieldId(bt.name, fname, @intCast(fi + 1));
+                        // 用户源码字段名作为同义 field_id（便于 record_get(type, "msg") 查询）
+                        self.registerFieldId(bt.name, f.name, @intCast(fi + 1));
+                    }
+                    const ctor = CtorInfo{
+                        .name = bt.constructor_name,
+                        .type_name = bt.name,
+                        .tag = 0,
+                        .fields = fields,
+                    };
+                    try self.ctor_table.put(bt.constructor_name, ctor);
+                    const ctors = try arena_alloc.alloc(CtorInfo, 1);
+                    ctors[0] = ctor;
+                    self.registerFieldId(bt.name, "__tag", 0);
+                    try self.type_table.put(bt.name, .{
+                        .name = bt.name,
+                        .kind = .error_newtype,
+                        .constructors = ctors,
+                    });
+                },
+            }
         }
     }
 
@@ -1577,6 +1631,7 @@ pub const IRBuilder = struct {
             .propagate => |p| return self.compilePropagate(p.expr),
             .select => |s| return self.compileSelect(s.arms),
             .type_cast => |tc| return self.compileTypeCast(tc),
+            .cast_builder => |cb| return self.compileCastBuilder(cb),
             .record_literal => |rl| return self.compileRecordLiteral(rl.fields),
             .record_extend => |re| return self.compileRecordExtend(re.base, re.updates),
             .field_access => |fa| return self.compileFieldAccess(fa.object, fa.field, expr),
@@ -1929,6 +1984,69 @@ pub const IRBuilder = struct {
         const op: NodeOp = if (tc.safe) .cast_safe else .cast;
         try self.emit(Node.makeUnary(op, out, meta_idx, src_chan));
         return out;
+    }
+
+    /// 编译 cast builder 表达式（Phase 3）：cast(expr).to(T) / cast(expr).try_to(T)
+    ///
+    /// to 模式：
+    ///   - 输出通道 = T 类型通道
+    ///   - op = .cast_to（engine 在产生 Inf / str 解析失败时 panic，否则 wrap）
+    ///   - str 目标：复用 .builtin_str 节点（永不失败）
+    ///
+    /// try_to 模式：
+    ///   - 输出通道 = ref_chan（ThrowValue 引用）
+    ///   - op = .cast_try_to（engine 在失败时构造 CastError + ThrowValue.err，成功时 ThrowValue.ok）
+    ///   - str 目标：直接构造 Throw.ok(str)
+    fn compileCastBuilder(self: *IRBuilder, cb: anytype) BuildError!u16 {
+        const src_chan = try self.compileExpr(cb.expr);
+        const dst_chan_type = chanTypeFromTypeNode(cb.target_type) orelse return error.UnsupportedType;
+        const target_is_str = blk: {
+            if (cb.target_type.* == .named) {
+                if (std.mem.eql(u8, cb.target_type.named.name, "str")) break :blk true;
+            }
+            break :blk false;
+        };
+
+        // str 目标：数值→str 永不失败，直接走 builtin_str，再按 mode 包装 Throw
+        if (target_is_str) {
+            const str_out = try self.allocChannel(.ref_chan);
+            try self.emit(Node.makeUnary(.builtin_str, str_out, 0, src_chan));
+            switch (cb.mode) {
+                .to => return str_out,
+                .try_to => {
+                    // 包装为 Throw.ok(str)
+                    const throw_out = try self.allocChannel(.ref_chan);
+                    const meta_idx = try self.addScalarMeta(.{
+                        .kind = .str,
+                    });
+                    try self.emit(Node.makeUnary(.cast_try_to, throw_out, meta_idx, str_out));
+                    return throw_out;
+                },
+            }
+        }
+
+        // 构造目标类型的 ScalarMeta（描述 dst 类型，engine 据此分派转换路径）
+        const kind: ScalarKind = if (dst_chan_type.isInt()) .int else if (dst_chan_type.isFloat()) .float else if (dst_chan_type == .bool_chan) .bool else if (dst_chan_type == .char_chan) .char else .ref;
+        const meta_idx = try self.addScalarMeta(.{
+            .kind = kind,
+            .int_kind = dst_chan_type.toIntKind() orelse .i64,
+            .float_kind = dst_chan_type.toFloatKind() orelse .f64,
+        });
+
+        switch (cb.mode) {
+            .to => {
+                // 输出类型 = T
+                const out = try self.allocChannel(dst_chan_type);
+                try self.emit(Node.makeUnary(.cast_to, out, meta_idx, src_chan));
+                return out;
+            },
+            .try_to => {
+                // 输出类型 = ref_chan（ThrowValue 引用）
+                const out = try self.allocChannel(.ref_chan);
+                try self.emit(Node.makeUnary(.cast_try_to, out, meta_idx, src_chan));
+                return out;
+            },
+        }
     }
 
     /// 编译记录字面量：{ field1: val1, field2: val2 }
@@ -2704,6 +2822,7 @@ pub const IRBuilder = struct {
         return switch (ct) {
             .i8_chan, .i16_chan, .i32_chan, .i64_chan, .i128_chan,
             .u8_chan, .u16_chan, .u32_chan, .u64_chan, .u128_chan,
+            .isize_chan, .usize_chan,
             .f16_chan, .f32_chan, .f64_chan, .f128_chan,
             .bool_chan, .char_chan => true,
             else => false,
@@ -2718,6 +2837,7 @@ pub const IRBuilder = struct {
         return switch (ct) {
             .i8_chan, .i16_chan, .i32_chan, .i64_chan, .i128_chan,
             .u8_chan, .u16_chan, .u32_chan, .u64_chan, .u128_chan,
+            .isize_chan, .usize_chan,
             .f16_chan, .f32_chan, .f64_chan, .f128_chan,
             .bool_chan, .char_chan,
             .nullable_chan => true,
@@ -2775,8 +2895,18 @@ pub const IRBuilder = struct {
                     if (binding.type_annotation) |ta| {
                         return throwOkChanType(ta);
                     }
+                    // 无类型注解：回溯到变量声明的初始表达式，递归推断 Throw Ok 类型
+                    // 用于 val h = cast(x).try_to(T); match h { ... } 这种间接绑定
+                    if (binding.ast_expr) |src_expr| {
+                        return self.inferThrowOkChanType(src_expr);
+                    }
                 }
                 return null;
+            },
+            // Phase 3 cast builder：cast(x).try_to(T) 的 Ok 值类型 = T
+            .cast_builder => |cb| {
+                if (cb.mode != .try_to) return null;
+                return chanTypeFromTypeNode(cb.target_type);
             },
             else => return null,
         }
@@ -3985,7 +4115,18 @@ pub const IRBuilder = struct {
                         }
                     }
                 }
-                const cell_chan = try self.allocCellChannel(value_meta.chan_type);
+                // 优先使用类型标注的 chan_type 作为 cell 类型；
+                // 这避免了字面量默认类型（如 usize）与标注类型（如 i32）不匹配时
+                // 引发的跨通道字节宽度错误（execCmp 读取超过源通道实际宽度）。
+                const cell_ct = blk: {
+                    if (vd.type_annotation) |tn| {
+                        if (tn.* != .nullable) {
+                            if (chanTypeFromTypeNode(tn)) |ct| break :blk ct;
+                        }
+                    }
+                    break :blk value_meta.chan_type;
+                };
+                const cell_chan = try self.allocCellChannel(cell_ct);
                 try self.emit(Node.makeUnary(.load, cell_chan, 0, value_chan));
                 try self.scopeVarTyped(vd.name, cell_chan, true, vd.value, vd.type_annotation);
             },
@@ -6076,13 +6217,14 @@ pub const IRBuilder = struct {
         }
         if (std.mem.eql(u8, method, "len")) {
             // obj.len() → string_len 或 array_len（按 AST 推断 + 参数类型标注）
+            // Phase 5: 返回类型从 i64 改为 usize（spec §8.1）
             const is_string = self.isStringExpr(object) or self.isStringParam(object);
             if (is_string) {
-                const out = try self.allocChannel(.i64_chan);
+                const out = try self.allocChannel(.usize_chan);
                 try self.emit(Node.makeUnary(.string_len, out, 0, obj_chan));
                 return out;
             }
-            const out = try self.allocChannel(.i64_chan);
+            const out = try self.allocChannel(.usize_chan);
             try self.emit(Node.makeUnary(.array_len, out, 0, obj_chan));
             return out;
         }
@@ -6116,11 +6258,12 @@ pub const IRBuilder = struct {
             // arr.is_empty() / s.is_empty() → len == 0 → bool
             const is_string = self.isStringExpr(object);
             const len_op: NodeOp = if (is_string) .string_len else .array_len;
-            const len_chan = try self.allocChannel(.i64_chan);
+            // Phase 5: len 返回 usize
+            const len_chan = try self.allocChannel(.usize_chan);
             try self.emit(Node.makeUnary(len_op, len_chan, 0, obj_chan));
             // 创建常量 0 通道用于比较
-            const zero_chan = try self.allocChannel(.i64_chan);
-            const zero_meta = try self.addScalarMeta(.{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 0 } });
+            const zero_chan = try self.allocChannel(.usize_chan);
+            const zero_meta = try self.addScalarMeta(.{ .kind = .int, .int_kind = .usize, .const_val = .{ .int_val = 0 } });
             try self.emit(Node.makeSink(.const_i, zero_chan, zero_meta));
             const out = try self.allocChannel(.bool_chan);
             try self.emit(Node.makeBinary(.cmp_eq, out, 0, len_chan, zero_chan));
@@ -7204,6 +7347,8 @@ fn chanTypeFromTypeNode(type_node: ?*ast.TypeNode) ?ChanType {
             if (std.mem.eql(u8, n.name, "u32")) return .u32_chan;
             if (std.mem.eql(u8, n.name, "u64")) return .u64_chan;
             if (std.mem.eql(u8, n.name, "u128")) return .u128_chan;
+            if (std.mem.eql(u8, n.name, "isize")) return .isize_chan;
+            if (std.mem.eql(u8, n.name, "usize")) return .usize_chan;
             if (std.mem.eql(u8, n.name, "f16")) return .f16_chan;
             if (std.mem.eql(u8, n.name, "f32")) return .f32_chan;
             if (std.mem.eql(u8, n.name, "f64")) return .f64_chan;
@@ -8577,6 +8722,7 @@ test "e2e: throw 语句编译为 halt_throw" {
     // AST: fun main() -> i64 { throw 42 }
     // 简化：throw 一个整数字面量
     const throw_stmt = ah.stmt(.{ .throw_stmt = .{
+        .location = .{ .line = 1, .column = 1 },
         .expr = ah.intLit("42"),
     } });
     const body = ah.block(&.{throw_stmt}, null);

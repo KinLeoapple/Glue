@@ -44,6 +44,7 @@ pub const TokenType = enum {
     kw_throw,
     kw_lazy,
     kw_defer,
+    kw_cast,
     identifier,
     plus,
     minus,
@@ -974,6 +975,7 @@ const KEYWORDS = std.StaticStringMap(TokenType).initComptime(.{
     .{ "throw", .kw_throw },
     .{ "lazy", .kw_lazy },
     .{ "defer", .kw_defer },
+    .{ "cast", .kw_cast },
 });
 
 /// 查询文本是否为关键字，否则返回 identifier
@@ -986,6 +988,7 @@ fn isIntSuffix(suffix: []const u8) bool {
     const valid = [_][]const u8{
         "i8",  "i16", "i32", "i64", "i128",
         "u8",  "u16", "u32", "u64", "u128",
+        "isize", "usize",
     };
     for (valid) |v| {
         if (std.mem.eql(u8, suffix, v)) return true;

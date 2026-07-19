@@ -3,6 +3,6 @@ fun checked(x: i32): Throw<i32, Error> {
 }
 
 fun main() {
-    println(match checked(5) { Ok(v) => str(v), Error(e) => "err:" + e.message() })
-    println(match checked(-1) { Ok(v) => str(v), Error(e) => "err:" + e.message() })
+    println(match checked(5) { Ok(v) => cast(v).to(str), Error(e) => "err:" + e.message() })
+    println(match checked(-1) { Ok(v) => cast(v).to(str), Error(e) => "err:" + e.message() })
 }

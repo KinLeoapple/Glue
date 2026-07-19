@@ -28,7 +28,7 @@ fun containsI(l: List<i32>, x: i32): bool {
 }
 
 fun showI(l: List<i32>): str {
-    match l { Nil => "", Cons(h, t) => str(h) + " " + showI(t) }
+    match l { Nil => "", Cons(h, t) => cast(h).to(str) + " " + showI(t) }
 }
 
 // ============================================================

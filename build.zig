@@ -73,12 +73,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     analysis_db_module.addImport("ast", ast_module);
+
+    // ---- Builtin 元信息模块：集中管理 builtin 类型字段布局（sema 与 ir 共用） ----
+    // 注意：import 名取 "glue_builtin" 避免与 Zig 标准内建模块 "builtin" 冲突
+    const builtin_module = b.createModule(.{
+        .root_source_file = b.path("src/builtin.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const type_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/type_check.zig"),
         .target = target,
         .optimize = optimize,
     });
     type_check_module.addImport("ast", ast_module);
+    type_check_module.addImport("glue_builtin", builtin_module);
     const subtype_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/subtype_check.zig"),
         .target = target,
@@ -150,6 +159,7 @@ pub fn build(b: *std.Build) void {
     ir_module.addImport("ast", ast_module);
     ir_module.addImport("value", value_module);
     ir_module.addImport("analysis_db", analysis_db_module);
+    ir_module.addImport("glue_builtin", builtin_module);
 
     // ---- sema 模块接入 IR 管线：type_check 及子检查器可读取 SemaResult 契约 ----
     // 依赖方向：sema → ir → (ast, value)，ir 不依赖 sema，无循环。
@@ -222,6 +232,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_debug_allocator_unit_tests = b.addRunArtifact(debug_allocator_unit_tests);
 
+    // builtin 元信息表单元测试
+    const builtin_unit_tests = b.addTest(.{
+        .root_module = builtin_module,
+    });
+    const run_builtin_unit_tests = b.addRunArtifact(builtin_unit_tests);
+
     // 内存管理新模块测试（page_pool/buddy/channel_region/shadow_arena/global_pool/thread_ctx）
     const mem_test_modules = [_]struct { name: []const u8, file: []const u8, need_sync: bool }{
         .{ .name = "page_pool", .file = "src/mem/page_pool.zig", .need_sync = false },
@@ -267,6 +283,7 @@ pub fn build(b: *std.Build) void {
     ir_module_test.addImport("ast", ast_module);
     ir_module_test.addImport("value", value_module);
     ir_module_test.addImport("analysis_db", analysis_db_module);
+    ir_module_test.addImport("glue_builtin", builtin_module);
     const ir_unit_tests = b.addTest(.{
         .root_module = ir_module_test,
     });
@@ -299,6 +316,7 @@ pub fn build(b: *std.Build) void {
     debug_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
     ir_unit_tests.root_module.linkSystemLibrary("c", .{});
     engine_unit_tests.root_module.linkSystemLibrary("c", .{});
+    builtin_unit_tests.root_module.linkSystemLibrary("c", .{});
 
     // ---- 聚合测试步骤：`zig build test` 运行全部单元测试 ----
     const test_step = b.step("test", "Run all tests");
@@ -311,5 +329,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_debug_allocator_unit_tests.step);
     test_step.dependOn(&run_ir_unit_tests.step);
     test_step.dependOn(&run_engine_unit_tests.step);
+    test_step.dependOn(&run_builtin_unit_tests.step);
     for (mem_test_runs) |run| test_step.dependOn(&run.step);
 }

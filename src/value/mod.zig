@@ -94,6 +94,8 @@ pub const Value = union(enum) {
     u64: [8]u8,
     i128: [16]u8,
     u128: [16]u8,
+    isize: [@sizeOf(isize)]u8,
+    usize: [@sizeOf(usize)]u8,
 
     f16: [2]u8,
     f32: [4]u8,
@@ -158,6 +160,12 @@ pub const Value = union(enum) {
     }
     pub inline fn fromU128(v: u128) Value {
         return .{ .u128 = @bitCast(v) };
+    }
+    pub inline fn fromIsize(v: isize) Value {
+        return .{ .isize = @bitCast(v) };
+    }
+    pub inline fn fromUsize(v: usize) Value {
+        return .{ .usize = @bitCast(v) };
     }
 
     // ── 浮点数构造 ──
@@ -395,6 +403,12 @@ pub const Value = union(enum) {
     pub inline fn asU128(self: Value) u128 {
         return @bitCast(self.u128);
     }
+    pub inline fn asIsize(self: Value) isize {
+        return @bitCast(self.isize);
+    }
+    pub inline fn asUsize(self: Value) usize {
+        return @bitCast(self.usize);
+    }
 
     // ── 浮点数访问器 ──
 
@@ -429,7 +443,8 @@ pub const Value = union(enum) {
     pub inline fn isInteger(self: Value) bool {
         return switch (self) {
             .i8, .i16, .i32, .i64, .i128,
-            .u8, .u16, .u32, .u64, .u128 => true,
+            .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize => true,
             else => false,
         };
     }
@@ -477,6 +492,7 @@ pub const Value = union(enum) {
             .null_val, .unit, .boolean, .char,
             .i8, .i16, .i32, .i64, .i128,
             .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize,
             .f16, .f32, .f64, .f128 => {},
             .ref => |obj| {
                 // Str SSO 模式使用 sso_flags 中的独立引用计数
@@ -503,6 +519,7 @@ pub const Value = union(enum) {
             .null_val, .unit, .boolean, .char,
             .i8, .i16, .i32, .i64, .i128,
             .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize,
             .f16, .f32, .f64, .f128 => {},
             .ref => |obj| {
                 // Str SSO 模式使用 sso_flags 中的独立引用计数
@@ -531,6 +548,7 @@ pub const Value = union(enum) {
             .null_val, .unit, .boolean, .char,
             .i8, .i16, .i32, .i64, .i128,
             .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize,
             .f16, .f32, .f64, .f128 => return self,
 
             .ref => |obj| {
@@ -813,6 +831,8 @@ pub const Value = union(enum) {
             .u32 => try formatInt(self.asU32(), tctx, buf),
             .u64 => try formatInt(self.asU64(), tctx, buf),
             .u128 => try formatInt(self.asU128(), tctx, buf),
+            .isize => try formatInt(self.asIsize(), tctx, buf),
+            .usize => try formatInt(self.asUsize(), tctx, buf),
             .f16 => try formatFloat(self.asF16(), tctx, buf),
             .f32 => try formatFloat(self.asF32(), tctx, buf),
             .f64 => try formatFloat(self.asF64(), tctx, buf),
@@ -962,6 +982,8 @@ pub fn equals(a: Value, b: Value) bool {
         .u32 => a.asU32() == b.asU32(),
         .u64 => a.asU64() == b.asU64(),
         .u128 => a.asU128() == b.asU128(),
+        .isize => a.asIsize() == b.asIsize(),
+        .usize => a.asUsize() == b.asUsize(),
         .f16 => a.asF16() == b.asF16(),
         .f32 => a.asF32() == b.asF32(),
         .f64 => a.asF64() == b.asF64(),

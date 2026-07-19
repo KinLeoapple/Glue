@@ -65,13 +65,15 @@ pub const BuddyAllocator = struct {
     lock: Mutex = .{},
     free_lists: [NUM_CLASSES]?*FreeBlock = [_]?*FreeBlock{null} ** NUM_CLASSES,
     arenas: std.ArrayList([]align(MAX_BLOCK_SIZE) u8) = .empty,
+    // 超大对象（> MAX_BLOCK_SIZE）直接走 backing，独立跟踪以便 deinit 释放
+    large_allocs: std.ArrayList([]align(16) u8) = .empty,
 
     /// 创建分配器
     pub fn init(backing: std.mem.Allocator) BuddyAllocator {
         return .{ .backing = backing };
     }
 
-    /// 释放所有 arena
+    /// 释放所有 arena 和超大对象
     pub fn deinit(self: *BuddyAllocator) void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -79,6 +81,11 @@ pub const BuddyAllocator = struct {
             self.backing.free(arena);
         }
         self.arenas.deinit(self.backing);
+        // 释放残留的超大对象
+        for (self.large_allocs.items) |mem| {
+            self.backing.free(mem);
+        }
+        self.large_allocs.deinit(self.backing);
         self.free_lists = [_]?*FreeBlock{null} ** NUM_CLASSES;
     }
 
@@ -125,7 +132,23 @@ pub const BuddyAllocator = struct {
     /// 返回的切片长度 = 用户请求的 size（不含 HEADER_SIZE）
     pub fn alloc(self: *BuddyAllocator, size: usize) ![]u8 {
         // 用户请求 size + HEADER_SIZE → 实际块大小
-        const block_size = roundUpSize(size + HEADER_SIZE);
+        const total = size + HEADER_SIZE;
+
+        // 超大对象（> MAX_BLOCK_SIZE）：直接走 backing，header 标记 block_size > MAX_BLOCK_SIZE
+        // 这避免了 roundUpSize 截断到 MAX_BLOCK_SIZE 导致的缓冲区溢出
+        if (total > MAX_BLOCK_SIZE) {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const mem = try self.backing.alignedAlloc(u8, .fromByteUnits(16), total);
+            const block: *FreeBlock = @ptrCast(@alignCast(mem.ptr));
+            block.header.block_size = total; // 记录实际总大小，> MAX_BLOCK_SIZE 标识超大对象
+            block.header.is_free = 0;
+            try self.large_allocs.append(self.backing, mem);
+            const user_ptr = @as([*]u8, @ptrCast(block)) + HEADER_SIZE;
+            return user_ptr[0..size];
+        }
+
+        const block_size = roundUpSize(total);
         const idx = classIndex(block_size);
 
         self.lock.lock();
@@ -176,10 +199,29 @@ pub const BuddyAllocator = struct {
     pub fn free(self: *BuddyAllocator, ptr: []u8) void {
         const block_addr = @intFromPtr(ptr.ptr) - HEADER_SIZE;
         var block: *FreeBlock = @ptrFromInt(block_addr);
-        var cur_size = block.header.block_size;
+        const stored_size = block.header.block_size;
+
+        // 超大对象：block_size > MAX_BLOCK_SIZE 标识直接走 backing 分配
+        if (stored_size > MAX_BLOCK_SIZE) {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const total = stored_size;
+            const mem: []align(16) u8 = @as([*]align(16) u8, @alignCast(@ptrCast(block)))[0..total];
+            // 从 large_allocs 移除并释放
+            for (self.large_allocs.items, 0..) |item, i| {
+                if (item.ptr == @as([*]u8, @ptrCast(block))) {
+                    _ = self.large_allocs.swapRemove(i);
+                    break;
+                }
+            }
+            self.backing.free(mem);
+            return;
+        }
 
         self.lock.lock();
         defer self.lock.unlock();
+
+        var cur_size = stored_size;
 
         // 递归合并伙伴
         while (cur_size < MAX_BLOCK_SIZE) {

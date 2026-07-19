@@ -121,9 +121,9 @@ type Point: (Show, Comparable) = Point(x: i32, y: i32) {
 
 // Error 子类型
 type FileError: Error = FileError(msg: str) {
-    override fun prefix(self): str { "file error" }
+    override fun type_name(self): str { "file error" }
 }
-// 内置方法：e.message()、e.type_name()
+// 内置方法：e.message()、e.type_name()（均可 override）
 ```
 
 > **注意**：关联类型只能在 trait 体中声明，不能在 type 实现块中定义。
@@ -254,7 +254,7 @@ match read("f") {
 
 // 自定义 Error 子类型
 type NotFound: Error = NotFound(msg: str) {
-    override fun prefix(self): str { "not found" }
+    override fun type_name(self): str { "not found" }
 }
 ```
 

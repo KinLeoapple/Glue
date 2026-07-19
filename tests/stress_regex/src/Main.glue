@@ -27,7 +27,7 @@ fun matchRe(re: Regex, s: str, pos: i32, k: (i32) -> bool): bool {
     match re {
         Empty => k(pos)
         Lit(ch) => {
-            if pos < s.len() && s[pos] == ch { k(pos + 1) } else { false }
+            if pos < s.len() && s[cast(pos).to(usize)] == ch { k(pos + 1) } else { false }
         }
         AnyChar => {
             if pos < s.len() { k(pos + 1) } else { false }
@@ -77,11 +77,11 @@ fun seqOf(a: Regex, b: Regex): Regex { Seq(a, b) }
 
 // 把字符串变成字面序列： "ab" -> Seq(Lit('a'), Lit('b'))
 fun literal(s: str): Regex {
-    val n = i32(s.len())
+    val n = cast(s.len()).to(i32)
     fun go(i: i32): Regex {
         if i >= n { Empty }
-        else if i == n - 1 { Lit(s[i]) }
-        else { Seq(Lit(s[i]), go(i + 1)) }
+        else if i == n - 1 { Lit(s[cast(i).to(usize)]) }
+        else { Seq(Lit(s[cast(i).to(usize)]), go(i + 1)) }
     }
     if n == 0 { Empty } else { go(0) }
 }

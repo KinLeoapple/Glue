@@ -26,8 +26,8 @@ fun closureChurn(iters: i32): i64 {
     var sum: i64 = 0
     var i: i32 = 0
     while i < iters {
-        val f = fun(x: i64) { x * x + i64(i) }
-        sum = sum + f(i64(i % 1000))
+        val f = fun(x: i64) { x * x + cast(i).to(i64) }
+        sum = sum + f(cast(i % 1000).to(i64))
         i = i + 1
     }
     sum
@@ -42,17 +42,17 @@ trait Shape {
 }
 
 type Rect: Shape = Rect(w: i32, h: i32) {
-    fun area(self): i64 { i64(self.w * self.h) }
+    fun area(self): i64 { cast(self.w * self.h).to(i64) }
     fun name(self): str { "rect" }
 }
 
 type Square: Shape = Square(side: i32) {
-    fun area(self): i64 { i64(self.side * self.side) }
+    fun area(self): i64 { cast(self.side * self.side).to(i64) }
     fun name(self): str { "square" }
 }
 
 type Tri: Shape = Tri(base: i32, hgt: i32) {
-    fun area(self): i64 { i64(self.base * self.hgt / 2) }
+    fun area(self): i64 { cast(self.base * self.hgt / 2).to(i64) }
     fun name(self): str { "tri" }
 }
 
@@ -114,7 +114,7 @@ type IList =
 
 fun buildIList(n: i32): IList {
     fun go(i: i32, acc: IList): IList {
-        if i <= 0 { acc } else { go(i - 1, ICons(i64(i), acc)) }
+        if i <= 0 { acc } else { go(i - 1, ICons(cast(i).to(i64), acc)) }
     }
     go(n, INil)
 }
@@ -136,7 +136,7 @@ fun buildRange(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        arr = arr.push(i64(i))
+        arr = arr.push(cast(i).to(i64))
         i = i + 1
     }
     arr
@@ -145,8 +145,8 @@ fun buildRange(n: i32): i64[] {
 fun arrMap(arr: i64[], f: (i64) -> i64): i64[] {
     var out: i64[] = []
     var i: i32 = 0
-    while i < arr.len() {
-        out = out.push(f(arr[i]))
+    while i < cast(arr.len()).to(i32) {
+        out = out.push(f(arr[cast(i).to(usize)]))
         i = i + 1
     }
     out
@@ -155,9 +155,9 @@ fun arrMap(arr: i64[], f: (i64) -> i64): i64[] {
 fun arrFilter(arr: i64[], p: (i64) -> bool): i64[] {
     var out: i64[] = []
     var i: i32 = 0
-    while i < arr.len() {
-        if p(arr[i]) {
-            out = out.push(arr[i])
+    while i < cast(arr.len()).to(i32) {
+        if p(arr[cast(i).to(usize)]) {
+            out = out.push(arr[cast(i).to(usize)])
         }
         i = i + 1
     }
@@ -167,8 +167,8 @@ fun arrFilter(arr: i64[], p: (i64) -> bool): i64[] {
 fun arrFold(arr: i64[], init: i64, f: (i64, i64) -> i64): i64 {
     var acc: i64 = init
     var i: i32 = 0
-    while i < arr.len() {
-        acc = f(acc, arr[i])
+    while i < cast(arr.len()).to(i32) {
+        acc = f(acc, arr[cast(i).to(usize)])
         i = i + 1
     }
     acc
@@ -185,7 +185,7 @@ type Expr =
     | EDiv(Expr, Expr)
 
 type EvalErr: Error = EvalErr(msg: str) {
-    override fun prefix(self): str { "eval" }
+    override fun type_name(self): str { "eval" }
 }
 
 fun evalExpr(e: Expr): Throw<i64, Error> {
@@ -235,7 +235,7 @@ fun main() {
     var cSum: i64 = 0
     var i: i32 = 0
     while i < 1000000 {
-        cSum = cSum + addOne(i64(i))
+        cSum = cSum + addOne(cast(i).to(i64))
         i = i + 1
     }
     println(cSum)

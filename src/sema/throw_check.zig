@@ -4,6 +4,7 @@
 //! - 函数返回类型与函数体推断类型之间的统一（含 nullable/throw 的特殊放宽规则）
 //! - 数值类型间的宽化（widening）统一，避免不必要的类型不匹配
 //! - 传播操作符 `?` 在 nullable/throw 表达式上的合法性检查与类型展开
+//! - throw 语句的表达式必须是 Error 子类型（error_newtype 或 Error trait 实例）
 
 const std = @import("std");
 const ast = @import("ast");
@@ -76,6 +77,9 @@ fn intTypeRank(t: Type) u8 {
         .u64_type => 4,
         .i128_type => 5,
         .u128_type => 5,
+        // isize/usize 跟随平台位宽等价处理
+        .isize_type => 4,
+        .usize_type => 4,
         else => 0,
     };
 }
@@ -83,7 +87,7 @@ fn intTypeRank(t: Type) u8 {
 /// 判断是否为有符号整型。
 fn isSignedInt(t: Type) bool {
     return switch (t) {
-        .i8_type, .i16_type, .i32_type, .i64_type, .i128_type => true,
+        .i8_type, .i16_type, .i32_type, .i64_type, .i128_type, .isize_type => true,
         else => false,
     };
 }
@@ -315,4 +319,62 @@ pub fn checkPropagate(
             return inner_ty;
         },
     }
+}
+
+/// 检查 throw 语句的表达式是否为 Error 子类型。
+///
+/// 合法情况：
+/// - 类型为 adt_type 且在 adt_types 中标记 is_error_newtype=true（用户定义的 `type X: Error = X(...)`）
+/// - 类型为 adt_type 且实现了 Error trait（通过 registered_traits 注册，key 为 "Error::TypeName"）
+/// - 类型为 throw_type（如 `throw Error("...")`，builtin Error 构造返回 Throw<T, Error>）
+/// - 类型为 type_var（尚未解析出具体类型，延迟到后续统一阶段处理）
+///
+/// 非法情况：抛出非 Error 类型（如 i32、str、普通 record），报 type_mismatch 错误。
+pub fn checkThrowStmt(
+    inferencer: *TypeInferencer,
+    thrown_ty: *Type,
+    location: ast.SourceLocation,
+) void {
+    const resolved = inferencer.resolve(thrown_ty);
+
+    // 类型变量延迟到统一阶段判断
+    switch (resolved.*) {
+        .type_var => return,
+        .throw_type => return, // throw Error("...") 返回 Throw<T, Error>，合法
+        .adt_type => |adt| {
+            // 检查是否为 error_newtype
+            if (inferencer.adt_types.get(adt.name)) |info| {
+                if (info.is_error_newtype) return;
+            }
+            // 检查是否实现 Error trait（registered_traits 的 key 格式为 "TraitName::TypeName"）
+            const trait_key = std.fmt.allocPrint(
+                inferencer.arena.allocator(),
+                "Error::{s}",
+                .{adt.name},
+            ) catch return;
+            defer inferencer.arena.allocator().free(trait_key);
+            if (inferencer.registered_traits.contains(trait_key)) return;
+        },
+        .generic_type => |gt| {
+            if (inferencer.adt_types.get(gt.name)) |info| {
+                if (info.is_error_newtype) return;
+            }
+            const trait_key = std.fmt.allocPrint(
+                inferencer.arena.allocator(),
+                "Error::{s}",
+                .{gt.name},
+            ) catch return;
+            defer inferencer.arena.allocator().free(trait_key);
+            if (inferencer.registered_traits.contains(trait_key)) return;
+        },
+        else => {},
+    }
+
+    inferencer.addErrorAt(
+        .type_mismatch,
+        location.line,
+        location.column,
+        "throw expression must be an Error subtype, got {s}",
+        .{@tagName(resolved.*)},
+    );
 }

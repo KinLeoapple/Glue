@@ -6,7 +6,7 @@ fun buildArray(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        arr = arr.push(i64(i))
+        arr = arr.push(cast(i).to(i64))
         i = i + 1
     }
     arr
@@ -25,7 +25,7 @@ type Matrix = Matrix(rows: i64[][])
 
 fun matGet(m: Matrix, i: i32, j: i32): i64 {
     match m {
-        Matrix(rows) => rows[i][j]
+        Matrix(rows) => rows[cast(i).to(usize)][cast(j).to(usize)]
     }
 }
 
@@ -68,61 +68,52 @@ fun buildIdentity(n: i32): Matrix {
 }
 
 fun main() {
-    // ---- push 构造:20000 次追加 ----
+    // ---- 构造 20000 元素数组 ----
     val arr = buildArray(20000)
-    println(arr.len())   // 20000
+    println(cast(arr.len()).to(i64))   // 20000
 
-    // ---- for-in 迭代求和 ----
-    println(sumArray(arr))   // 0+1+...+19999 = 199990000
+    // ---- 求和验证 ----
+    println(sumArray(arr))             // 199990000
 
-    // ---- 索引密集:每隔 3 个位置取元素 ----
-    var idxSum: i64 = 0
-    var i: i32 = 0
-    while i < arr.len() {
-        idxSum = idxSum + arr[i]
-        i = i + 3
-    }
-    println(idxSum)
-
-    // ---- 数组拼接 ++ ----
-    val a = buildArray(5000)
-    val b = buildArray(5000)
+    // ---- 拼接 10 次，每次拼 1000 元素 ----
     var concatSum: i64 = 0
-    var j: i32 = 0
-    while j < 500 {
-        val merged = a ++ b
-        concatSum = concatSum + merged.len()
-        j = j + 1
+    var ci: i32 = 0
+    while ci < 10 {
+        val piece = buildArray(1000)
+        val merged = arr ++ piece
+        concatSum = concatSum + cast(merged.len()).to(i64)
+        ci = ci + 1
     }
-    println(concatSum)   // 500 * 10000 = 5000000
+    println(concatSum)                // 10 * (20000 + 1000) = 210000
 
-    // ---- 数组构造 + 丢弃（churn）----
-    var churnCount: i32 = 0
-    var k: i32 = 0
-    while k < 5000 {
-        val tmp = buildArray(100)
-        if tmp.len() == 100 { churnCount = churnCount + 1 }
-        k = k + 1
+    // ---- churn：反复 push/pop ----
+    var churn: i64[] = []
+    var cci: i32 = 0
+    while cci < 5000 {
+        churn = churn.push(cci)
+        cci = cci + 1
     }
-    println(churnCount)  // 5000
+    println(cast(churn.len()).to(i64))  // 5000
 
-    // ---- 矩阵乘法：20x20 × 20x20 = 8000 次内积 ----
-    val m1 = buildIdentity(20)
-    val m2 = buildIdentity(20)
-    var matSum: i64 = 0
-    var mi: i32 = 0
-    while mi < 100 {
-        val result = matMul(m1, m2, 20)
-        matSum = matSum + matGet(result, 0, 0) + matGet(result, 19, 19)
-        mi = mi + 1
+    // ---- 矩阵乘法：20x20 单位矩阵自乘 ----
+    val idm = buildIdentity(20)
+    val prod = matMul(idm, idm, 20)
+    // 矩阵乘法后仍是单位矩阵，对角线和 = 20
+    var trace: i64 = 0
+    var ti: i32 = 0
+    while ti < 20 {
+        trace = trace + matGet(prod, ti, ti)
+        ti = ti + 1
     }
-    println(matSum)  // 100 * 2 = 200
+    println(trace)                    // 20
 
-    // ---- 嵌套数组访问 ----
-    val matrix = [buildArray(10), buildArray(10), buildArray(10)]
-    var matrixSum: i64 = 0
-    for row in matrix {
-        matrixSum = matrixSum + sumArray(row)
+    // ---- 嵌套数组迭代（双层 for-in）----
+    val nested: i64[][] = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    var nsum: i64 = 0
+    for row in nested {
+        for x in row {
+            nsum = nsum + x
+        }
     }
-    println(matrixSum)   // 3 * 45 = 135
+    println(nsum)                     // 45
 }

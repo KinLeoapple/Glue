@@ -62,7 +62,7 @@ fun nullableMatch(n: i32?): str {
         null => "none"
         0 => "zero"
         x if x < 0 => "neg"
-        x => "pos:" + str(x)
+        x => "pos:" + cast(x).to(str)
     }
 }
 
@@ -93,12 +93,12 @@ fun areaInt(s: Shape): i32 {
     match s {
         Circle(r) => {
             val rr = r * r
-            i32(3.14 * rr)
+            cast(3.14 * rr).to(i32)
         }
-        Rect(w, h) => i32(w * h)
+        Rect(w, h) => cast(w * h).to(i32)
         Triangle(a, b, c) => {
             val s2 = (a + b + c) / 2.0
-            i32(s2)
+            cast(s2).to(i32)
         }
     }
 }

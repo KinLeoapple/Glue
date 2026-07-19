@@ -10,13 +10,13 @@ fun greet(user: (name: str)) : str {
 
 // 4. Error 子类型
 type FileError: Error = FileError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "file error"
     }
 }
 
 type NetworkError: Error = NetworkError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "network error"
     }
 }
@@ -36,7 +36,7 @@ fun handle_error(result: Throw<str, Error>) : str {
 
 // 7. 多种错误类型
 type ParseError: Error = ParseError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "parse error"
     }
 }
@@ -47,7 +47,7 @@ fun parse_int(s: str) : Throw<i32, ParseError> {
 
 fun handle_int_error(result: Throw<i32, Error>) : str {
     match result {
-        Ok(val) => str(val),
+        Ok(val) => cast(val).to(str),
         Error(e) => "error: " + e.message(),
     }
 }
@@ -56,7 +56,7 @@ fun handle_int_error(result: Throw<i32, Error>) : str {
 fun describe_point(pt: (x: i32, y: i32)) : str {
     match pt {
         (x: 0, y: 0) => "origin",
-        (x: px, y: py) => "point at (" + str(px) + ", " + str(py) + ")",
+        (x: px, y: py) => "point at (" + cast(px).to(str) + ", " + cast(py).to(str) + ")",
     }
 }
 

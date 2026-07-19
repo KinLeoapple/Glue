@@ -71,24 +71,24 @@ fun main() {
     var rsum = 0i32
     var recs = [(x: 1i32), (x: 2i32), (x: 3i32)]
     var ri = 0i32
-    while ri < i32(recs.len()) {
-        rsum = rsum + recs[ri].x
+    while ri < cast(recs.len()).to(i32) {
+        rsum = rsum + recs[cast(ri).to(usize)].x
         ri = ri + 1
     }
     println(rsum)               // 6
     var ccat = 0i32
     var combined = [1i32, 2i32] ++ [3i32, 4i32]
     var ci = 0i32
-    while ci < i32(combined.len()) {
-        ccat = ccat + combined[ci]
+    while ci < cast(combined.len()).to(i32) {
+        ccat = ccat + combined[cast(ci).to(usize)]
         ci = ci + 1
     }
     println(ccat)               // 10
     var fsum = 0i32
     var farr = mkArray()
     var fi = 0i32
-    while fi < i32(farr.len()) {
-        fsum = fsum + farr[fi]
+    while fi < cast(farr.len()).to(i32) {
+        fsum = fsum + farr[cast(fi).to(usize)]
         fi = fi + 1
     }
     println(fsum)               // 60

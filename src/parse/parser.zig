@@ -2035,6 +2035,9 @@ pub const Parser = struct {
         if (self.matchToken(.kw_select)) {
             return self.parseSelectExpr();
         }
+        if (self.matchToken(.kw_cast)) {
+            return self.parseCastBuilder();
+        }
         if (self.check(.kw_trait)) {
             if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_brace) {
                 return self.parseInlineTraitValue();
@@ -2828,6 +2831,58 @@ pub const Parser = struct {
         });
     }
 
+    /// 解析 cast builder 表达式：cast(expr).to(T) / cast(expr).try_to(T)
+    ///
+    /// 语法规则（决策 #2/#3）：
+    ///   - cast 是内建关键字，接收任意值，返回 Cast<SrcType> 中间值（零开销，编译期内联）
+    ///   - to / try_to 是方法，参数位置只能是类型名（编译期特化）
+    ///   - 类型名只在 cast(...).to/try_to(...) 的参数位置识别为类型节点
+    ///
+    /// 失败语义（决策 #4/#28/#29/#30）：
+    ///   - to: wrap on overflow；str→数值非法 panic；产生 Inf panic（D61 强化）
+    ///   - try_to: 越界/解析失败/产生 Inf 返回 Throw<T, CastError>
+    fn parseCastBuilder(self: *Parser) ParserError!*ast.Expr {
+        const cast_tok = self.previous();
+        const location = tokenLoc(cast_tok);
+        _ = self.expect(.l_paren, "expected '(' after 'cast'") catch {};
+        const expr = try self.parseExpr();
+        _ = self.expect(.r_paren, "expected ')' after cast expression") catch {};
+        _ = self.expect(.dot, "expected '.to(...)' or '.try_to(...)' after cast(...)") catch {};
+        if (!self.check(.identifier)) {
+            try self.reportError("expected 'to' or 'try_to' after cast(...).");
+            return error.UnexpectedToken;
+        }
+        const method_tok = self.advance();
+        const mode: ast.CastMode = blk: {
+            if (std.mem.eql(u8, method_tok.lexeme, "to")) break :blk .to;
+            if (std.mem.eql(u8, method_tok.lexeme, "try_to")) break :blk .try_to;
+            try self.reportError("expected 'to' or 'try_to' after cast(...).");
+            return error.UnexpectedToken;
+        };
+        _ = self.expect(.l_paren, "expected '(' after cast method") catch {};
+        // 参数位置只能是类型名（编译期特化，决策 #3）
+        if (!self.check(.identifier)) {
+            try self.reportError("expected type name as cast target");
+            return error.UnexpectedToken;
+        }
+        const type_tok = self.advance();
+        if (!isBuiltinType(type_tok.lexeme)) {
+            try self.reportError("cast target must be a builtin type (i8/i16/.../isize/usize/.../bool/char/str)");
+            return error.UnexpectedToken;
+        }
+        const target_type = try self.allocType(tokenLoc(type_tok), ast.TypeNode{
+            .named = .{ .name = type_tok.lexeme },
+        });
+        _ = self.expect(.r_paren, "expected ')' after cast target type") catch {};
+        return self.allocExpr(location, ast.Expr{
+            .cast_builder = .{
+                .expr = expr,
+                .target_type = target_type,
+                .mode = mode,
+            },
+        });
+    }
+
     // ---- 模式解析 ----
 
     /// 模式解析入口
@@ -3221,6 +3276,7 @@ pub const Parser = struct {
         const expr = try self.parseExpr();
         return self.allocStmt(tokenLoc(throw_tok), ast.Stmt{
             .throw_stmt = .{
+                .location = tokenLoc(throw_tok),
                 .expr = expr,
             },
         });
@@ -3362,11 +3418,12 @@ fn getExprLocation(expr: *const ast.Expr) ast.SourceLocation {
     return ast.exprLocation(expr);
 }
 
-/// 判断名称是否为内置类型（整数、浮点、布尔、字符、字符串）
+/// 判断名称是否为内置类型（整数、浮点、布尔、字符、字符串、平台相关整数）
 fn isBuiltinType(name: []const u8) bool {
     const builtin_types = [_][]const u8{
         "i8",   "i16",  "i32",  "i64",  "i128",
         "u8",   "u16",  "u32",  "u64",  "u128",
+        "isize", "usize",
         "f16",  "f32",  "f64",  "f128",
         "bool", "char", "str",
     };

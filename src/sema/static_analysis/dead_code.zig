@@ -333,6 +333,7 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
             return true;
         },
         .type_cast => |tc| isSideEffectFreeExpr(tc.expr),
+        .cast_builder => |cb| isSideEffectFreeExpr(cb.expr),
         .non_null_assert => |n| isSideEffectFreeExpr(n.expr),
         // 以下表达式一律视为有副作用，不在此处逐条展开。
         .call, .method_call, .safe_method_call, .string_interpolation,

@@ -61,9 +61,9 @@ fun main() {
 
     // ---- integer overflow into float domain ----
     val big_int: i64 = 9007199254740992
-    println(f64(big_int))        // 9007199254740992
+    println(cast(big_int).to(f64))        // 9007199254740992
     val bigger: i64 = 9007199254740993
-    println(f64(bigger))         // 9007199254740992 (precision loss!)
+    println(cast(bigger).to(f64))         // 9007199254740992 (precision loss!)
 
     // ---- f64 comparison chains ----
     println(1.0f64 < 2.0f64)    // true
@@ -93,16 +93,16 @@ fun main() {
     println(half_pi)             // f16 value (3.14 stored, print may vary)
 
     // ---- float to int truncation (toward zero) ----
-    println(i32(2.7f64))         // 2
-    println(i32(-2.7f64))        // -2
-    println(i32(2.0f64))         // 2
-    println(i32(-2.0f64))        // -2
+    println(cast(2.7f64).to(i32))         // 2
+    println(cast(-2.7f64).to(i32))        // -2
+    println(cast(2.0f64).to(i32))         // 2
+    println(cast(-2.0f64).to(i32))        // -2
 
     // ---- mixed int/float arithmetic requires explicit cast ----
     val ii: i32 = 5
     val ff: f64 = 2.0
-    println(f64(ii) + ff)        // 7
-    println(f64(ii) * ff)        // 10
+    println(cast(ii).to(f64) + ff)        // 7
+    println(cast(ii).to(f64) * ff)        // 10
 
     // ---- exponent via repeated multiply ----
     var base: f64 = 2.0

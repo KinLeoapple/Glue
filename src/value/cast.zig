@@ -237,20 +237,33 @@ fn identityCast(src: [16]u8) [16]u8 {
 // ── 分派表构建 ──
 
 /// 判断 ScalarTag 是否为整数类型
-fn isIntTag(tag: ScalarTag) bool {
+pub fn isIntTag(tag: ScalarTag) bool {
     return switch (tag) {
         .i8, .i16, .i32, .i64, .i128,
         .u8, .u16, .u32, .u64, .u128,
+        .isize, .usize,
         => true,
         else => false,
     };
 }
 
 /// 判断 ScalarTag 是否为浮点类型
-fn isFloatTag(tag: ScalarTag) bool {
+pub fn isFloatTag(tag: ScalarTag) bool {
     return switch (tag) {
         .f16, .f32, .f64, .f128 => true,
         else => false,
+    };
+}
+
+/// 返回 ScalarTag 的字符串名（用于 CastError.from/to 字段）
+pub fn tagName(tag: ScalarTag) []const u8 {
+    return switch (tag) {
+        .boolean => "bool",
+        .char => "char",
+        .i8 => "i8", .i16 => "i16", .i32 => "i32", .i64 => "i64", .i128 => "i128",
+        .u8 => "u8", .u16 => "u16", .u32 => "u32", .u64 => "u64", .u128 => "u128",
+        .isize => "isize", .usize => "usize",
+        .f16 => "f16", .f32 => "f32", .f64 => "f64", .f128 => "f128",
     };
 }
 
@@ -616,6 +629,177 @@ pub inline fn tryCast(
     return try_cast_table[si][di](src);
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Phase 3 cast builder 辅助函数
+// ════════════════════════════════════════════════════════════════════
+
+/// 解析错误（str→数值）
+pub const ParseError = error{ ParseFailed, OutOfMemory };
+
+/// 将标量值格式化为字符串（用于 CastError.value 字段）
+/// allocator 用于分配返回的字符串
+pub fn formatScalarValue(allocator: std.mem.Allocator, tag: ScalarTag, bytes: [16]u8) ![]u8 {
+    return switch (tag) {
+        .boolean => allocator.dupe(u8, if (bytes[0] != 0) "true" else "false"),
+        .char => blk: {
+            const cp: u32 = @bitCast(bytes[0..4].*);
+            const cp_u21: u21 = @intCast(cp & 0xFFFFF);
+            break :blk std.fmt.allocPrint(allocator, "'{u}'", .{cp_u21});
+        },
+        .i8 => blk: {
+            const v: i8 = @bitCast(bytes[0..1].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .i16 => blk: {
+            const v: i16 = @bitCast(bytes[0..2].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .i32 => blk: {
+            const v: i32 = @bitCast(bytes[0..4].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .i64 => blk: {
+            const v: i64 = @bitCast(bytes[0..8].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .i128 => blk: {
+            const v: i128 = @bitCast(bytes[0..16].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .isize => blk: {
+            const v: isize = @bitCast(bytes[0..@sizeOf(isize)].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .u8 => blk: {
+            const v: u8 = @bitCast(bytes[0..1].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .u16 => blk: {
+            const v: u16 = @bitCast(bytes[0..2].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .u32 => blk: {
+            const v: u32 = @bitCast(bytes[0..4].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .u64 => blk: {
+            const v: u64 = @bitCast(bytes[0..8].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .u128 => blk: {
+            const v: u128 = @bitCast(bytes[0..16].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .usize => blk: {
+            const v: usize = @bitCast(bytes[0..@sizeOf(usize)].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .f16 => blk: {
+            const v: f16 = @bitCast(bytes[0..2].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .f32 => blk: {
+            const v: f32 = @bitCast(bytes[0..4].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .f64 => blk: {
+            const v: f64 = @bitCast(bytes[0..8].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+        .f128 => blk: {
+            const v: f128 = @bitCast(bytes[0..16].*);
+            break :blk std.fmt.allocPrint(allocator, "{d}", .{v});
+        },
+    };
+}
+
+/// 将字符串解析为目标数值类型，返回 [16]u8 字节表示
+/// 支持：i8..i128 / u8..u128 / isize / usize / f16..f128 / bool / char
+pub fn parseStrToNumeric(str: []const u8, dst_tag: ScalarTag) ParseError![16]u8 {
+    var result: [16]u8 = [_]u8{0} ** 16;
+    switch (dst_tag) {
+        .boolean => {
+            if (std.mem.eql(u8, str, "true")) {
+                result[0] = 1;
+            } else if (std.mem.eql(u8, str, "false")) {
+                result[0] = 0;
+            } else return error.ParseFailed;
+        },
+        .char => {
+            // 单字符字符串 → 码点
+            if (str.len == 1) {
+                const cp: u32 = str[0];
+                result[0..4].* = @bitCast(cp);
+            } else return error.ParseFailed;
+        },
+        .i8 => {
+            const v = std.fmt.parseInt(i8, str, 10) catch return error.ParseFailed;
+            result[0] = @bitCast(v);
+        },
+        .i16 => {
+            const v = std.fmt.parseInt(i16, str, 10) catch return error.ParseFailed;
+            result[0..2].* = @bitCast(v);
+        },
+        .i32 => {
+            const v = std.fmt.parseInt(i32, str, 10) catch return error.ParseFailed;
+            result[0..4].* = @bitCast(v);
+        },
+        .i64 => {
+            const v = std.fmt.parseInt(i64, str, 10) catch return error.ParseFailed;
+            result[0..8].* = @bitCast(v);
+        },
+        .i128 => {
+            const v = std.fmt.parseInt(i128, str, 10) catch return error.ParseFailed;
+            result[0..16].* = @bitCast(v);
+        },
+        .isize => {
+            const v = std.fmt.parseInt(isize, str, 10) catch return error.ParseFailed;
+            result[0..@sizeOf(isize)].* = @bitCast(v);
+        },
+        .u8 => {
+            const v = std.fmt.parseInt(u8, str, 10) catch return error.ParseFailed;
+            result[0] = @bitCast(v);
+        },
+        .u16 => {
+            const v = std.fmt.parseInt(u16, str, 10) catch return error.ParseFailed;
+            result[0..2].* = @bitCast(v);
+        },
+        .u32 => {
+            const v = std.fmt.parseInt(u32, str, 10) catch return error.ParseFailed;
+            result[0..4].* = @bitCast(v);
+        },
+        .u64 => {
+            const v = std.fmt.parseInt(u64, str, 10) catch return error.ParseFailed;
+            result[0..8].* = @bitCast(v);
+        },
+        .u128 => {
+            const v = std.fmt.parseInt(u128, str, 10) catch return error.ParseFailed;
+            result[0..16].* = @bitCast(v);
+        },
+        .usize => {
+            const v = std.fmt.parseInt(usize, str, 10) catch return error.ParseFailed;
+            result[0..@sizeOf(usize)].* = @bitCast(v);
+        },
+        .f16 => {
+            const v = std.fmt.parseFloat(f16, str) catch return error.ParseFailed;
+            result[0..2].* = @bitCast(v);
+        },
+        .f32 => {
+            const v = std.fmt.parseFloat(f32, str) catch return error.ParseFailed;
+            result[0..4].* = @bitCast(v);
+        },
+        .f64 => {
+            const v = std.fmt.parseFloat(f64, str) catch return error.ParseFailed;
+            result[0..8].* = @bitCast(v);
+        },
+        .f128 => {
+            const v = std.fmt.parseFloat(f128, str) catch return error.ParseFailed;
+            result[0..16].* = @bitCast(v);
+        },
+    }
+    return result;
+}
+
 // ── 测试 ──
 
 test "i→i 宽化：i8→i64" {
@@ -941,4 +1125,103 @@ test "tryCast i→f 大整数丢精度不报错" {
     const result = try tryCast(.i64, .f64, src);
     const val: f64 = @bitCast(result[0..8].*);
     try std.testing.expectEqual(@as(f64, @floatFromInt(big)), val);
+}
+
+// ── isize/usize 测试（平台相关位宽）──
+
+test "isize/usize ScalarTag 在 ALL_TAGS 中" {
+    // 验证新枚举值已被纳入 comptime 生成路径
+    var has_isize = false;
+    var has_usize = false;
+    for (scalar.ALL_TAGS) |t| {
+        if (t == .isize) has_isize = true;
+        if (t == .usize) has_usize = true;
+    }
+    try std.testing.expect(has_isize);
+    try std.testing.expect(has_usize);
+}
+
+test "isize/usize NativeType 字节宽度跟随平台" {
+    // 在 64 位平台上为 8，32 位平台上为 4
+    try std.testing.expectEqual(@sizeOf(isize), scalar.byteWidth(.isize));
+    try std.testing.expectEqual(@sizeOf(usize), scalar.byteWidth(.usize));
+}
+
+test "isize→i64 等宽转换往返" {
+    var src: [16]u8 = [_]u8{0} ** 16;
+    const v: isize = -12345;
+    src[0..@sizeOf(isize)].* = @bitCast(v);
+    const result = cast(.isize, .i64, src);
+    const out: i64 = @bitCast(result[0..8].*);
+    try std.testing.expectEqual(@as(i64, -12345), out);
+}
+
+test "usize→u64 等宽转换往返" {
+    var src: [16]u8 = [_]u8{0} ** 16;
+    const v: usize = 9876543;
+    src[0..@sizeOf(usize)].* = @bitCast(v);
+    const result = cast(.usize, .u64, src);
+    const out: u64 = @bitCast(result[0..8].*);
+    try std.testing.expectEqual(@as(u64, 9876543), out);
+}
+
+test "i32→usize 宽化" {
+    var src: [16]u8 = [_]u8{0} ** 16;
+    const v: i32 = 100000;
+    src[0..4].* = @bitCast(v);
+    const result = cast(.i32, .usize, src);
+    const out: usize = @bitCast(result[0..@sizeOf(usize)].*);
+    try std.testing.expectEqual(@as(usize, 100000), out);
+}
+
+test "usize→i8 wrap 截断" {
+    var src: [16]u8 = [_]u8{0} ** 16;
+    const v: usize = 300; // 超过 i8 范围
+    src[0..@sizeOf(usize)].* = @bitCast(v);
+    const result = cast(.usize, .i8, src);
+    const out: i8 = @bitCast(result[0..1].*);
+    // 300 = 0x12C，截取低 8 位 = 0x2C = 44
+    try std.testing.expectEqual(@as(i8, 44), out);
+}
+
+test "isize→f64 转换" {
+    var src: [16]u8 = [_]u8{0} ** 16;
+    const v: isize = 42;
+    src[0..@sizeOf(isize)].* = @bitCast(v);
+    const result = cast(.isize, .f64, src);
+    const out: f64 = @bitCast(result[0..8].*);
+    try std.testing.expectEqual(@as(f64, 42.0), out);
+}
+
+test "tryCast usize→isize 在 i64 平台不溢出" {
+    var src: [16]u8 = [_]u8{0} ** 16;
+    const v: usize = std.math.maxInt(i64);
+    src[0..@sizeOf(usize)].* = @bitCast(v);
+    const result = try tryCast(.usize, .isize, src);
+    const out: isize = @bitCast(result[0..@sizeOf(isize)].*);
+    try std.testing.expectEqual(@as(isize, std.math.maxInt(i64)), out);
+}
+
+test "tryCast usize→isize 超范围报错" {
+    var src: [16]u8 = [_]u8{0} ** 16;
+    // usize max 大于 isize max，应抛出 CastOverflow
+    src[0..@sizeOf(usize)].* = @bitCast(@as(usize, std.math.maxInt(usize)));
+    try std.testing.expectError(error.CastOverflow, tryCast(.usize, .isize, src));
+}
+
+test "cast_table 16×16 完整覆盖（isize/usize 行）" {
+    // 验证 comptime 生成的 cast_table 对所有 isize/usize 目标都有入口
+    var src: [16]u8 = [_]u8{0} ** 16;
+    src[0] = 1;
+    // 对每个目标类型执行一次，确保不 panic
+    _ = cast(.isize, .i8, src);
+    _ = cast(.isize, .u8, src);
+    _ = cast(.isize, .isize, src);
+    _ = cast(.isize, .usize, src);
+    _ = cast(.isize, .f64, src);
+    _ = cast(.usize, .i8, src);
+    _ = cast(.usize, .u8, src);
+    _ = cast(.usize, .isize, src);
+    _ = cast(.usize, .usize, src);
+    _ = cast(.usize, .f64, src);
 }

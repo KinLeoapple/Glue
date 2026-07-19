@@ -98,7 +98,7 @@ fun raiseSalary(db: Db, dept: str, pct: i32): Db {
 }
 
 fun showEmps(emps: List<Emp>): str {
-    foldL(emps, "", fun(acc: str, e: Emp) { acc + empName(e) + "(" + str(empSalary(e)) + ") " })
+    foldL(emps, "", fun(acc: str, e: Emp) { acc + empName(e) + "(" + cast(empSalary(e)).to(str) + ") " })
 }
 
 fun main() {

@@ -1,0 +1,78 @@
+// Edge cases: CastError builtin error_newtype (Phase 2 end-to-end verification)
+//
+// 验证内容（Phase 2 范围）：
+//   1. CastError 可被用户代码直接构造（无需导入，builtin 类型对所有代码可见）
+//   2. 字段访问（msg/from/to/value）按命名访问正常
+//   3. throw CastError(...) 可用，并能通过 match Error(e) 捕获
+//   4. CastError 可作为 Throw<T, CastError> 的错误类型参数
+//   5. match Error(e) 后调用 e.message() 读取 msg 字段（Error trait 默认实现）
+//
+// 不在 Phase 2 范围（留给 Phase 3 按需加载方法体 / 后续反射机制完善）：
+//   - CastError.type_name() override 返回 "cast error"（当前返回类型名）
+//   - 直接 println(CastError 实例) 打印 RecordValue（当前输出 null）
+//   - type(CastError 实例) 返回 "CastError"（当前对 RecordValue 返回通用 "record"）
+
+// ---- 构造与字段访问 ----
+fun makeCastError(): CastError {
+    CastError("value out of range", "i64", "i32", "9999999999")
+}
+
+// ---- throw CastError（CastError 作为具体错误类型） ----
+fun tryCastFail(): Throw<i32, CastError> {
+    throw CastError("narrowing overflow", "i64", "i32", "9999999999")
+}
+
+fun tryCastOk(): Throw<i32, CastError> {
+    Ok(42)
+}
+
+// ---- throw CastError（CastError 作为 Error 子类型） ----
+fun tryCastAsError(): Throw<i32, Error> {
+    throw CastError("as error subtype", "i64", "i32", "9999999999")
+}
+
+fun main() {
+    // ---- 1. 直接构造 CastError 并访问字段 ----
+    val ce = CastError("overflow", "i64", "i32", "9999999999")
+    println(ce.msg)      // overflow
+    println(ce.from)     // i64
+    println(ce.to)       // i32
+    println(ce.value)    // 9999999999
+
+    // ---- 2. 通过函数返回 CastError 并访问字段 ----
+    val ce2 = makeCastError()
+    println(ce2.msg)     // value out of range
+    println(ce2.from)    // i64
+    println(ce2.to)      // i32
+    println(ce2.value)   // 9999999999
+
+    // ---- 3. throw + match 作为 CastError 错误类型（错误路径） ----
+    val r1 = match tryCastFail() {
+        Ok(v) => v
+        Error(e) => -1
+    }
+    println(r1)          // -1
+
+    // ---- 4. throw + match Error(e) 调用 e.message() 读取 msg 字段 ----
+    val r2 = match tryCastFail() {
+        Ok(v) => "ok: " + cast(v).to(str)
+        Error(e) => "cast failed: " + e.message()
+    }
+    println(r2)          // cast failed: narrowing overflow
+
+    // ---- 5. Ok 路径 ----
+    val r3 = match tryCastOk() {
+        Ok(v) => v
+        Error(e) => -1
+    }
+    println(r3)          // 42
+
+    // ---- 6. throw CastError 作为 Error 子类型匹配 ----
+    val r4 = match tryCastAsError() {
+        Ok(v) => cast(v).to(str)
+        Error(e) => e.message()
+    }
+    println(r4)          // as error subtype
+
+    println("edge_cast_error: All tests passed!")
+}

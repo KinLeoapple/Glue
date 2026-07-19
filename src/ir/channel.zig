@@ -17,6 +17,8 @@ pub const ChanType = enum(u5) {
     // 整数（10 种）
     i8_chan, i16_chan, i32_chan, i64_chan, i128_chan,
     u8_chan, u16_chan, u32_chan, u64_chan, u128_chan,
+    // 平台相关整数（2 种）
+    isize_chan, usize_chan,
     // 浮点（4 种）
     f16_chan, f32_chan, f64_chan, f128_chan,
     // 其他标量
@@ -34,6 +36,7 @@ pub const ChanType = enum(u5) {
             .i16_chan, .u16_chan, .f16_chan => 2,
             .i32_chan, .u32_chan, .f32_chan, .char_chan => 4,
             .i64_chan, .u64_chan, .f64_chan, .ref_chan => 8,
+            .isize_chan, .usize_chan => @sizeOf(isize),
             .i128_chan, .u128_chan, .f128_chan => 16,
         };
     }
@@ -42,7 +45,8 @@ pub const ChanType = enum(u5) {
     pub fn isInt(self: ChanType) bool {
         return switch (self) {
             .i8_chan, .i16_chan, .i32_chan, .i64_chan, .i128_chan,
-            .u8_chan, .u16_chan, .u32_chan, .u64_chan, .u128_chan => true,
+            .u8_chan, .u16_chan, .u32_chan, .u64_chan, .u128_chan,
+            .isize_chan, .usize_chan => true,
             else => false,
         };
     }
@@ -60,6 +64,7 @@ pub const ChanType = enum(u5) {
         return switch (kind) {
             .i8 => .i8_chan, .i16 => .i16_chan, .i32 => .i32_chan, .i64 => .i64_chan, .i128 => .i128_chan,
             .u8 => .u8_chan, .u16 => .u16_chan, .u32 => .u32_chan, .u64 => .u64_chan, .u128 => .u128_chan,
+            .isize => .isize_chan, .usize => .usize_chan,
         };
     }
 
@@ -75,6 +80,7 @@ pub const ChanType = enum(u5) {
         return switch (self) {
             .i8_chan => .i8, .i16_chan => .i16, .i32_chan => .i32, .i64_chan => .i64, .i128_chan => .i128,
             .u8_chan => .u8, .u16_chan => .u16, .u32_chan => .u32, .u64_chan => .u64, .u128_chan => .u128,
+            .isize_chan => .isize, .usize_chan => .usize,
             else => null,
         };
     }

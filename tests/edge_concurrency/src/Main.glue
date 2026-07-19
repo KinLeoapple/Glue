@@ -82,7 +82,7 @@ fun main() {
     val chc = channel(10)
     chc.send(7)
     select {
-        chc.recv() => v => println("got " + str(v))
+        chc.recv() => v => println("got " + cast(v).to(str))
     }
 
     // ---- async computing into channel ----

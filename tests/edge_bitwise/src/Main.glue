@@ -101,7 +101,7 @@ fun main() {
     println((v >> 24u32) & 0xFFu32)      // 0x12 = 18
 
     // ---- byte assembly via shifts ----
-    val assembled = (u32(0x12) << 24u32) | (u32(0x34) << 16u32) | (u32(0x56) << 8u32) | u32(0x78)
+    val assembled = (cast(0x12).to(u32) << 24u32) | (cast(0x34).to(u32) << 16u32) | (cast(0x56).to(u32) << 8u32) | cast(0x78).to(u32)
     println(assembled)             // 305419896 (0x12345678)
 
     println("edge_bitwise: All tests passed!")

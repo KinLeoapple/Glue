@@ -5,13 +5,13 @@ type User = User(name: str, addr: Addr?)
 type Account = Account(owner: User?, balance: i32)
 
 type NotFound: Error = NotFound(msg: str) {
-    override fun prefix(self): str { "not found" }
+    override fun type_name(self): str { "not found" }
 }
 type Timeout: Error = Timeout(msg: str) {
-    override fun prefix(self): str { "timeout" }
+    override fun type_name(self): str { "timeout" }
 }
 type Denied: Error = Denied(msg: str) {
-    override fun prefix(self): str { "denied" }
+    override fun type_name(self): str { "denied" }
 }
 
 // deep optional chaining through 3 levels
@@ -45,10 +45,10 @@ fun checkedDiv(a: i32, b: i32): Throw<i32, Error> {
 
 // error subtype: specific errors flow into Throw<_, Error>
 fun lookup(id: i32): Throw<str, Error> {
-    if id < 0 { throw NotFound("id " + str(id)) }
+    if id < 0 { throw NotFound("id " + cast(id).to(str)) }
     if id == 0 { throw Timeout("slow") }
     if id > 100 { throw Denied("forbidden") }
-    Ok("user-" + str(id))
+    Ok("user-" + cast(id).to(str))
 }
 
 // non-null assertion on a known-non-null value

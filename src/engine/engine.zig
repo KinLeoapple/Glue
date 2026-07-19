@@ -41,6 +41,7 @@ const GlobalPool = mem.GlobalPool;
 const ops = value.ops;
 const scalar = value.scalar;
 const ScalarTag = scalar.ScalarTag;
+const cast_mod = value.cast;
 const batch = value.batch;
 
 /// 执行错误
@@ -1031,6 +1032,8 @@ pub const Engine = struct {
             // === 类型转换 ===
             .cast => try self.execCast(node, false),
             .cast_safe => try self.execCast(node, true),
+            .cast_to => try self.execCastTo(node),
+            .cast_try_to => try self.execCastTryTo(node),
 
             // === 字符串操作 ===
             .string_len => try self.execStringLen(node),
@@ -1170,6 +1173,7 @@ pub const Engine = struct {
             .char_chan => .char,
             .i8_chan => .i8, .i16_chan => .i16, .i32_chan => .i32, .i64_chan => .i64, .i128_chan => .i128,
             .u8_chan => .u8, .u16_chan => .u16, .u32_chan => .u32, .u64_chan => .u64, .u128_chan => .u128,
+            .isize_chan => .isize, .usize_chan => .usize,
             .f16_chan => .f16, .f32_chan => .f32, .f64_chan => .f64, .f128_chan => .f128,
             else => null,
         };
@@ -1498,6 +1502,7 @@ pub const Engine = struct {
                 return switch (tag) {
                     inline .i8, .i16, .i32, .i64, .i128,
                     .u8, .u16, .u32, .u64, .u128,
+                    .isize, .usize,
                     .f16, .f32, .f64, .f128 => |comptime_tag| blk: {
                         const T = scalar.NativeType(comptime_tag);
                         // init_bytes [16]u8 → T（前 @sizeOf(T) 字节有效）
@@ -1788,6 +1793,8 @@ pub const Engine = struct {
             .u8_chan => {
                 ap(&buf, &len, "{d}", .{self.runtime.rawPtr(val_chan)[0]});
             },
+            .isize_chan => ap(&buf, &len, "{d}", .{self.runtime.readUsize(val_chan)}),
+            .usize_chan => ap(&buf, &len, "{d}", .{self.runtime.readUsize(val_chan)}),
             .f64_chan => ap(&buf, &len, "{d}", .{self.runtime.readF64(val_chan)}),
             .f32_chan => {
                 const ptr: *f32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
@@ -1958,6 +1965,14 @@ pub const Engine = struct {
                 const ptr: *u8 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
                 break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
             },
+            .isize_chan => blk: {
+                const ptr: *isize = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
+            },
+            .usize_chan => blk: {
+                const ptr: *usize = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
+            },
             .f64_chan => std.fmt.bufPrint(&buf, "{d}", .{self.runtime.readF64(val_chan)}) catch "",
             .f32_chan => blk: {
                 const ptr: *f32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
@@ -2040,6 +2055,8 @@ pub const Engine = struct {
             .u16_chan => "u16",
             .u32_chan => "u32",
             .u64_chan => "u64",
+            .isize_chan => "isize",
+            .usize_chan => "usize",
             .f16_chan => "f16",
             .f32_chan => "f32",
             .f64_chan => "f64",
@@ -2726,7 +2743,8 @@ pub const Engine = struct {
         // 快速路径：按 comptime tag 直接指针读写原生类型，跳过 16B 中间缓冲
         return switch (tag) {
             inline .i8, .i16, .i32, .i64, .i128,
-            .u8, .u16, .u32, .u64, .u128 => |comptime_tag| {
+            .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize => |comptime_tag| {
                 const T = scalar.NativeType(comptime_tag);
                 const a = self.runtime.readScalarAt(comptime_tag, left_chan);
                 const b = self.runtime.readScalarAt(comptime_tag, right_chan);
@@ -2765,7 +2783,8 @@ pub const Engine = struct {
         // 快速路径：按 comptime tag 直接指针读写，保留各类型的原生位宽语义
         return switch (tag) {
             inline .i8, .i16, .i32, .i64, .i128,
-            .u8, .u16, .u32, .u64, .u128 => |comptime_tag| {
+            .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize => |comptime_tag| {
                 const T = scalar.NativeType(comptime_tag);
                 const a = self.runtime.readScalarAt(comptime_tag, left_chan);
                 const b = self.runtime.readScalarAt(comptime_tag, right_chan);
@@ -2793,7 +2812,8 @@ pub const Engine = struct {
         // 快速路径：按 comptime tag 直接指针读写，跳过 16B 中间缓冲
         return switch (tag) {
             inline .i8, .i16, .i32, .i64, .i128,
-            .u8, .u16, .u32, .u64, .u128 => |comptime_tag| {
+            .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize => |comptime_tag| {
                 const T = scalar.NativeType(comptime_tag);
                 const a = self.runtime.readScalarAt(comptime_tag, input_chan);
                 const result: T = switch (kind) {
@@ -2932,6 +2952,7 @@ pub const Engine = struct {
             },
             inline .i8, .i16, .i32, .i64, .i128,
             .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize,
             .f16, .f32, .f64, .f128, .char => |comptime_tag| blk: {
                 const a = self.runtime.readScalarAt(comptime_tag, left_chan);
                 const b = self.runtime.readScalarAt(comptime_tag, right_chan);
@@ -3053,12 +3074,216 @@ pub const Engine = struct {
         }
     }
 
+    /// 从 ScalarTag + [16]u8 字节直接构造 Value（不经过通道）
+    /// 用于 cast_try_to 成功路径：避免在 ref_chan 通道上用 chanToValue 误读标量字节为指针
+    fn scalarBytesToValue(tag: ScalarTag, bytes: [16]u8) value.Value {
+        return switch (tag) {
+            .boolean => value.Value.fromBool(bytes[0] != 0),
+            .char => value.Value.fromChar(.{ .codepoint = @bitCast(@as(*const [4]u8, @ptrCast(&bytes)).*) }),
+            .i8 => value.Value.fromI8(@bitCast(bytes[0])),
+            .i16 => value.Value.fromI16(@bitCast(@as(*const [2]u8, @ptrCast(&bytes)).*)),
+            .i32 => value.Value.fromI32(@bitCast(@as(*const [4]u8, @ptrCast(&bytes)).*)),
+            .i64 => value.Value.fromI64(@bitCast(@as(*const [8]u8, @ptrCast(&bytes)).*)),
+            .i128 => value.Value.fromI128(@bitCast(bytes)),
+            .u8 => value.Value.fromU8(bytes[0]),
+            .u16 => value.Value.fromU16(@bitCast(@as(*const [2]u8, @ptrCast(&bytes)).*)),
+            .u32 => value.Value.fromU32(@bitCast(@as(*const [4]u8, @ptrCast(&bytes)).*)),
+            .u64 => value.Value.fromU64(@bitCast(@as(*const [8]u8, @ptrCast(&bytes)).*)),
+            .u128 => value.Value.fromU128(@bitCast(bytes)),
+            .isize => blk: {
+                const arr: [@sizeOf(isize)]u8 = @as(*const [@sizeOf(isize)]u8, @ptrCast(&bytes)).*;
+                break :blk value.Value.fromIsize(@bitCast(arr));
+            },
+            .usize => blk: {
+                const arr: [@sizeOf(usize)]u8 = @as(*const [@sizeOf(usize)]u8, @ptrCast(&bytes)).*;
+                break :blk value.Value.fromUsize(@bitCast(arr));
+            },
+            .f16 => value.Value.fromF16(@bitCast(@as(*const [2]u8, @ptrCast(&bytes)).*)),
+            .f32 => value.Value.fromF32(@bitCast(@as(*const [4]u8, @ptrCast(&bytes)).*)),
+            .f64 => value.Value.fromF64(@bitCast(@as(*const [8]u8, @ptrCast(&bytes)).*)),
+            .f128 => value.Value.fromF128(@bitCast(bytes)),
+        };
+    }
+
+    /// cast_to：cast(x).to(T) Phase 3 新语法
+    /// 行为（spec §4.3 决策 #28/#30）：
+    ///   - 数值→数值：wrap on overflow（复用 cast()）
+    ///   - f→f 窄化产生 Inf → panic（D61 强化）
+    ///   - str→数值：暂不支持（panic 提示）；数值→str 在 IR 已分派到 builtin_str
+    ///   - 其他路径同 cast()
+    fn execCastTo(self: *Engine, node: *const Node) EngineError!void {
+        if (node.meta_index == 0 or node.meta_index >= self.ir.scalar_metas.len) return error.InvalidMetaIndex;
+        const meta = self.ir.scalar_metas[node.meta_index];
+
+        const src_chan = node.inputs[0];
+        const src_meta = self.ir.channels.get(src_chan);
+        const src_tag = chanToScalarTag(src_meta) orelse return error.UnsupportedOp;
+        const dst_tag = scalarKindToTag(meta.kind, meta.int_kind, meta.float_kind) orelse return error.UnsupportedOp;
+
+        // str→数值 在 to 模式 panic（决策 #27）
+        if (src_meta.chan_type == .ref_chan) {
+            return error.Panic;
+        }
+
+        const a = self.readChanBytes(src_chan);
+        const result = value.cast.cast(src_tag, dst_tag, a);
+
+        // D61 强化：f→f 窄化产生 Inf → panic
+        if (cast_mod.isFloatTag(src_tag) and cast_mod.isFloatTag(dst_tag)) {
+            if (isInfResult(dst_tag, result)) return error.Panic;
+        }
+
+        self.writeChanBytes(node.output, result);
+    }
+
+    /// cast_try_to：cast(x).try_to(T) Phase 3 新语法
+    /// 行为（spec §4.3 决策 #29/#30）：
+    ///   - 成功 → ThrowValue.ok(T)
+    ///   - 越界/产生 Inf/解析失败 → ThrowValue.err(CastError)
+    /// 输出：ref_chan（ThrowValue 指针）
+    fn execCastTryTo(self: *Engine, node: *const Node) EngineError!void {
+        if (node.meta_index == 0 or node.meta_index >= self.ir.scalar_metas.len) return error.InvalidMetaIndex;
+        const meta = self.ir.scalar_metas[node.meta_index];
+
+        const src_chan = node.inputs[0];
+        const src_meta = self.ir.channels.get(src_chan);
+
+        // str→数值：解析失败时构造 CastError
+        // 数值→str：IR 中已分派 builtin_str，但 try_to 模式仍走此节点包装为 Throw.ok
+        // 这里处理两种情况
+        if (meta.kind == .str) {
+            // 数值→str：永不失败，直接包装为 Throw.ok(str)
+            // src_chan 已经是 str 引用（IR 中先 builtin_str 再 cast_try_to）
+            const v = self.chanToValue(src_chan);
+            const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
+            _ = v.retain();
+            try self.trackObj(throw_v.asRef());
+            self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+            return;
+        }
+
+        const dst_tag = scalarKindToTag(meta.kind, meta.int_kind, meta.float_kind) orelse return error.UnsupportedOp;
+
+        // str→数值 解析路径：src 为 ref_chan (Str)，需在 chanToScalarTag 之前处理
+        // 因为 ref_chan 不能转换为 ScalarTag
+        if (src_meta.chan_type == .ref_chan) {
+            // 读取源字符串
+            const s = self.readStr(src_chan) orelse return error.UnsupportedOp;
+            const str_bytes = s.bytes();
+            return self.execCastTryToStrNumeric(node, str_bytes, dst_tag);
+        }
+
+        const src_tag = chanToScalarTag(src_meta) orelse return error.UnsupportedOp;
+
+        // 数值→数值：走 tryCast
+        const a = self.readChanBytes(src_chan);
+        const result = value.cast.tryCast(src_tag, dst_tag, a) catch {
+            // 转换失败 → 构造 CastError
+            return self.constructCastErrorThrow(node, src_tag, dst_tag, a);
+        };
+
+        // D61 强化：f→f 窄化产生 Inf → CastError
+        if (cast_mod.isFloatTag(src_tag) and cast_mod.isFloatTag(dst_tag)) {
+            if (isInfResult(dst_tag, result)) {
+                return self.constructCastErrorThrow(node, src_tag, dst_tag, a);
+            }
+        }
+
+        // 成功 → ThrowValue.ok(T)
+        // 直接从字节构造 Value，避免 ref_chan 上 chanToValue 把标量字节误读为指针
+        const ok_v = scalarBytesToValue(dst_tag, result);
+        const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = ok_v }) catch return error.OutOfMemory;
+        _ = ok_v.retain();
+        try self.trackObj(throw_v.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+    }
+
+    /// str→数值 的 try_to 实现
+    /// 解析字符串为目标数值类型，失败构造 CastError
+    fn execCastTryToStrNumeric(self: *Engine, node: *const Node, str_bytes: []const u8, dst_tag: ScalarTag) EngineError!void {
+        // 解析字符串
+        const parse_result = cast_mod.parseStrToNumeric(str_bytes, dst_tag) catch {
+            // 解析失败 → CastError
+            // src_tag 用 .boolean 作为占位（实际是 str）
+            return self.constructCastErrorThrowStr(node, str_bytes, dst_tag);
+        };
+
+        // 成功 → 直接从字节构造 Value，包装为 Throw.ok
+        const ok_v = scalarBytesToValue(dst_tag, parse_result);
+        const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = ok_v }) catch return error.OutOfMemory;
+        _ = ok_v.retain();
+        try self.trackObj(throw_v.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+    }
+
+    /// 构造 CastError RecordValue + ThrowValue.err，写入 output 通道
+    /// 字段顺序：msg / from / to / value（与 src/builtin/error/CastError.glue 一致）
+    fn constructCastErrorThrow(self: *Engine, node: *const Node, src_tag: ScalarTag, dst_tag: ScalarTag, src_bytes: [16]u8) EngineError!void {
+        const alloc = self.tctx.?.backing;
+        const from_str = cast_mod.tagName(src_tag);
+        const to_str = cast_mod.tagName(dst_tag);
+        const value_str = cast_mod.formatScalarValue(alloc, src_tag, src_bytes) catch return error.OutOfMemory;
+        const msg_str = std.fmt.allocPrint(alloc, "cannot cast '{s}' from {s} to {s}", .{ value_str, from_str, to_str }) catch return error.OutOfMemory;
+        return self.emitCastErrorThrow(node, msg_str, from_str, to_str, value_str);
+    }
+
+    /// str→数值 失败时构造 CastError
+    fn constructCastErrorThrowStr(self: *Engine, node: *const Node, str_bytes: []const u8, dst_tag: ScalarTag) EngineError!void {
+        const alloc = self.tctx.?.backing;
+        const from_str = "str";
+        const to_str = cast_mod.tagName(dst_tag);
+        const value_str = alloc.dupe(u8, str_bytes) catch return error.OutOfMemory;
+        const msg_str = std.fmt.allocPrint(alloc, "cannot cast \"{s}\" from str to {s} (parse failed)", .{ str_bytes, to_str }) catch return error.OutOfMemory;
+        return self.emitCastErrorThrow(node, msg_str, from_str, to_str, value_str);
+    }
+
+    /// 实际构造 CastError RecordValue（4 字段：msg/from/to/value）+ ThrowValue.err，写入 output
+    fn emitCastErrorThrow(self: *Engine, node: *const Node, msg_str: []const u8, from_str: []const u8, to_str: []const u8, value_str: []const u8) EngineError!void {
+        // 分配 4 个 str Value
+        const msg_obj = value.str_mod.Str.createContiguous(self.tctx.?, msg_str) catch return error.OutOfMemory;
+        try self.trackObj(&msg_obj.header);
+        const from_obj = value.str_mod.Str.createContiguous(self.tctx.?, from_str) catch return error.OutOfMemory;
+        try self.trackObj(&from_obj.header);
+        const to_obj = value.str_mod.Str.createContiguous(self.tctx.?, to_str) catch return error.OutOfMemory;
+        try self.trackObj(&to_obj.header);
+        const value_obj = value.str_mod.Str.createContiguous(self.tctx.?, value_str) catch return error.OutOfMemory;
+        try self.trackObj(&value_obj.header);
+
+        const msg_v: value.Value = .{ .ref = &msg_obj.header };
+        const from_v: value.Value = .{ .ref = &from_obj.header };
+        const to_v: value.Value = .{ .ref = &to_obj.header };
+        const value_v: value.Value = .{ .ref = &value_obj.header };
+
+        // 构造 CastError RecordValue
+        // 字段顺序：msg / from / to / value
+        var fields_buf: [4]value.Value = .{ msg_v, from_v, to_v, value_v };
+        const cast_err_v = value.Value.makeRecord(self.tctx.?, "CastError", fields_buf[0..]) catch return error.OutOfMemory;
+        try self.trackObj(cast_err_v.asRef());
+        // CastError 是 error_newtype，RecordValue.header.type_tag 已是 .record
+        // 4 字段：retain 引用计数
+        for (fields_buf) |fv| _ = value.obj_header.retain(fv.asRef());
+
+        // 包装为 ErrorValue（is_error_subtype=true）使 throw 路径能识别
+        // 但 Phase 2 中 throw 直接处理 .record 类型，所以这里直接构造 ThrowValue.err 指向 RecordValue
+        // 需要先把 RecordValue 包装成 ErrorValue
+        const err_v = value.Value.makeError(self.tctx.?, "CastError", msg_str, true) catch return error.OutOfMemory;
+        try self.trackObj(err_v.asRef());
+        const err_val: *value.ErrorValue = @alignCast(@fieldParentPtr("header", err_v.asRef()));
+
+        // ThrowValue.err 持有 ErrorValue 指针
+        const throw_v = value.Value.makeThrow(self.tctx.?, .{ .err = err_val }) catch return error.OutOfMemory;
+        _ = value.obj_header.retain(&err_val.header);
+        try self.trackObj(throw_v.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+    }
+
     /// 从 ScalarKind + IntKind/FloatKind 推导 ScalarTag
     fn scalarKindToTag(kind: ScalarKind, int_kind: scalar.IntKind, float_kind: scalar.FloatKind) ?ScalarTag {
         return switch (kind) {
             .int => switch (int_kind) {
                 .i8 => .i8, .i16 => .i16, .i32 => .i32, .i64 => .i64, .i128 => .i128,
                 .u8 => .u8, .u16 => .u16, .u32 => .u32, .u64 => .u64, .u128 => .u128,
+                .isize => .isize, .usize => .usize,
             },
             .float => switch (float_kind) {
                 .f16 => .f16, .f32 => .f32, .f64 => .f64, .f128 => .f128,
@@ -3066,6 +3291,30 @@ pub const Engine = struct {
             .bool => .boolean,
             .char => .char,
             else => null,
+        };
+    }
+
+    /// 检查 cast 结果是否为 Inf（仅用于 f→f 窄化产生 Inf 判断）
+    /// 通过 inline switch 在编译期展开各 float tag 的判断
+    fn isInfResult(dst_tag: ScalarTag, result: [16]u8) bool {
+        return switch (dst_tag) {
+            .f16 => {
+                const v: f16 = @bitCast(result[0..2].*);
+                return std.math.isInf(v);
+            },
+            .f32 => {
+                const v: f32 = @bitCast(result[0..4].*);
+                return std.math.isInf(v);
+            },
+            .f64 => {
+                const v: f64 = @bitCast(result[0..8].*);
+                return std.math.isInf(v);
+            },
+            .f128 => {
+                const v: f128 = @bitCast(result[0..16].*);
+                return std.math.isInf(v);
+            },
+            else => false,
         };
     }
 
@@ -3084,7 +3333,7 @@ pub const Engine = struct {
     }
 
     /// string_len：返回字符串字节长度
-    /// inputs[0] = str 通道，output = i64 通道
+    /// inputs[0] = str 通道，output = usize 通道（Phase 5: 从 i64 改为 usize）
     fn execStringLen(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
         const src_meta = self.ir.channels.get(src_chan);
@@ -3094,36 +3343,36 @@ pub const Engine = struct {
             const inner_w = src_meta.inner_type.elemWidth();
             const src = self.runtime.rawPtr(src_chan);
             if (src[inner_w] != 0) {
-                self.runtime.writeI64(node.output, 0);
+                self.runtime.writeUsize(node.output, 0);
                 return;
             }
             // 非 null：读取 inner ref 指针
             const inner_ptr: usize = std.mem.bytesToValue(usize, src[0..@sizeOf(usize)]);
             if (inner_ptr < 0x1000) {
-                self.runtime.writeI64(node.output, 0);
+                self.runtime.writeUsize(node.output, 0);
                 return;
             }
             const header: *value.obj_header.ObjHeader = @ptrFromInt(inner_ptr);
             if (header.type_tag != .str) {
-                self.runtime.writeI64(node.output, 0);
+                self.runtime.writeUsize(node.output, 0);
                 return;
             }
             const sv: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", header));
-            self.runtime.writeI64(node.output, @intCast(sv.byteLength()));
+            self.runtime.writeUsize(node.output, sv.byteLength());
             return;
         }
 
         // null_chan 或无指针：返回 0
         if (src_meta.chan_type == .null_chan or src_chan >= self.runtime.chan_count or self.runtime.chan_ptrs[src_chan] == null) {
-            self.runtime.writeI64(node.output, 0);
+            self.runtime.writeUsize(node.output, 0);
             return;
         }
 
         const s = self.readStr(src_chan) orelse {
-            self.runtime.writeI64(node.output, 0);
+            self.runtime.writeUsize(node.output, 0);
             return;
         };
-        self.runtime.writeI64(node.output, @intCast(s.byteLength()));
+        self.runtime.writeUsize(node.output, s.byteLength());
     }
 
     /// string_concat：拼接两个字符串
@@ -3244,6 +3493,8 @@ pub const Engine = struct {
             .u16_chan => value.Value.fromU16(@bitCast(@as(*[2]u8, @ptrCast(ptr)).*)),
             .u32_chan => value.Value.fromU32(@bitCast(@as(*[4]u8, @ptrCast(ptr)).*)),
             .u64_chan => value.Value.fromU64(self.runtime.readU64(chan)),
+            .isize_chan => value.Value.fromIsize(@bitCast(self.runtime.readUsize(chan))),
+            .usize_chan => value.Value.fromUsize(@bitCast(self.runtime.readUsize(chan))),
             .f32_chan => value.Value.fromF32(@bitCast(@as(*[4]u8, @ptrCast(ptr)).*)),
             .f64_chan => value.Value.fromF64(self.runtime.readF64(chan)),
             .ref_chan => blk: {
@@ -3438,10 +3689,10 @@ pub const Engine = struct {
     }
 
     /// array_len：返回数组长度
-    /// inputs[0] = array, output = i64
+    /// inputs[0] = array, output = usize（Phase 5: 从 i64 改为 usize）
     fn execArrayLen(self: *Engine, node: *const Node) EngineError!void {
         const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        self.runtime.writeI64(node.output, @intCast(arr.elements.len));
+        self.runtime.writeUsize(node.output, arr.elements.len);
     }
 
     /// array_push：向数组追加元素（扩容）
@@ -3689,6 +3940,7 @@ pub const Engine = struct {
                 .i64 => tag == .i64, .i128 => tag == .i128,
                 .u8 => tag == .u8, .u16 => tag == .u16, .u32 => tag == .u32,
                 .u64 => tag == .u64, .u128 => tag == .u128,
+                .isize => tag == .isize, .usize => tag == .usize,
                 .f16 => tag == .f16, .f32 => tag == .f32, .f64 => tag == .f64, .f128 => tag == .f128,
                 else => false,
             };
@@ -3697,7 +3949,7 @@ pub const Engine = struct {
                     .boolean, .i8, .u8 => 1,
                     .char, .i16, .u16, .f16 => 2,
                     .i32, .u32, .f32 => 4,
-                    .i64, .u64, .f64 => 8,
+                    .i64, .u64, .f64, .isize, .usize => @sizeOf(isize),
                     .i128, .u128, .f128 => 16,
                 };
                 const src: [*]const u8 = switch (tag) {
@@ -3713,6 +3965,8 @@ pub const Engine = struct {
                     .u32 => @ptrCast(&v.u32),
                     .u64 => @ptrCast(&v.u64),
                     .u128 => @ptrCast(&v.u128),
+                    .isize => @ptrCast(&v.isize),
+                    .usize => @ptrCast(&v.usize),
                     .f16 => @ptrCast(&v.f16),
                     .f32 => @ptrCast(&v.f32),
                     .f64 => @ptrCast(&v.f64),
@@ -3760,6 +4014,8 @@ pub const Engine = struct {
                 .u64 => value.Value.fromU64(@bitCast(@as(*u64, @ptrCast(@alignCast(src))).*)),
                 .i128 => value.Value.fromI128(@bitCast(@as(*i128, @ptrCast(@alignCast(src))).*)),
                 .u128 => value.Value.fromU128(@bitCast(@as(*u128, @ptrCast(@alignCast(src))).*)),
+                .isize => value.Value.fromIsize(@bitCast(@as(*isize, @ptrCast(@alignCast(src))).*)),
+                .usize => value.Value.fromUsize(@bitCast(@as(*usize, @ptrCast(@alignCast(src))).*)),
                 .f16 => value.Value.fromF16(@bitCast(@as(*f16, @ptrCast(@alignCast(src))).*)),
                 .f32 => value.Value.fromF32(@bitCast(@as(*f32, @ptrCast(@alignCast(src))).*)),
                 .f64 => value.Value.fromF64(@bitCast(@as(*f64, @ptrCast(@alignCast(src))).*)),
@@ -6187,6 +6443,8 @@ pub const Engine = struct {
             .u16_chan => @as(i64, @as(u16, @bitCast(@as(*[2]u8, @ptrCast(ptr)).*))),
             .u32_chan => @as(i64, @as(u32, @bitCast(@as(*[4]u8, @ptrCast(ptr)).*))),
             .u64_chan => @bitCast(self.runtime.readU64(chan)),
+            .isize_chan => @as(i64, @as(isize, @bitCast(self.runtime.readUsize(chan)))),
+            .usize_chan => @bitCast(@as(usize, @bitCast(self.runtime.readUsize(chan)))),
             else => 0,
         };
     }
@@ -7104,6 +7362,10 @@ pub const Engine = struct {
     /// error_message：提取错误值的消息字符串
     /// inputs[0] = error ref 通道
     /// output = ref_chan（Str 指针）
+    /// 支持：
+    /// - .error_val：读取 ErrorValue.message
+    /// - .throw_val：读取 ThrowValue.payload.err.message
+    /// - .record：error_newtype 实例用 RecordValue 表示，读取 field_id=1（第一个构造器字段，即 msg）
     fn execErrorMessage(self: *Engine, node: *const Node) EngineError!void {
         const in_chan = node.inputs[0];
         const ptr = self.runtime.readPtr(in_chan);
@@ -7120,6 +7382,21 @@ pub const Engine = struct {
                     .err => |e| e.message,
                     else => "ok",
                 };
+            },
+            .record => blk: {
+                // error_newtype 实例（RecordValue）：field_id=1 是第一个构造器字段（msg）
+                const r: *value.RecordValue = @alignCast(@fieldParentPtr("header", header));
+                if (r.fields.len > 1) {
+                    const field_val = r.fields[1];
+                    if (field_val == .ref) {
+                        const fh: *value.obj_header.ObjHeader = @ptrCast(@alignCast(field_val.ref));
+                        if (fh.type_tag == .str) {
+                            const fs: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", fh));
+                            break :blk fs.bytes();
+                        }
+                    }
+                }
+                break :blk "not an error";
             },
             else => "not an error",
         };

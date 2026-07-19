@@ -16,7 +16,7 @@ fun arrayPush(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        arr = arr.push(i64(i))
+        arr = arr.push(cast(i).to(i64))
         i = i + 1
     }
     arr
@@ -30,7 +30,7 @@ fun arrayConcatChurn(iters: i32, a: i64[], b: i64[]): i64 {
     var i: i32 = 0
     while i < iters {
         var merged = a ++ b
-        total = total + merged.len()
+        total = total + cast(merged.len()).to(i64)
         i = i + 1
     }
     total
@@ -58,7 +58,7 @@ type LList =
 
 fun buildLList(n: i32): LList {
     fun go(i: i32, acc: LList): LList {
-        if i <= 0 { acc } else { go(i - 1, LCons(i64(i), acc)) }
+        if i <= 0 { acc } else { go(i - 1, LCons(cast(i).to(i64), acc)) }
     }
     go(n, LNil)
 }
@@ -136,7 +136,7 @@ fun recordChurn(iters: i32): i64 {
     var i: i32 = 0
     while i < iters {
         val v = i % 10000
-        val p = Point(i64(v), i64(v + 1))
+        val p = Point(cast(v).to(i64), cast(v + 1).to(i64))
         sum = (sum + dist2(p) + p.x - p.y) % 1073741824
         i = i + 1
     }

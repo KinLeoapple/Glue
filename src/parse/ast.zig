@@ -86,6 +86,14 @@ pub const Kind = union(enum) {
     },
 };
 
+/// cast builder 转换模式
+/// - to: wrap on overflow（产生 Inf 时 panic，D61 强化），结果类型 = T
+/// - try_to: 越界/解析失败/产生 Inf 时返回 Throw<T, CastError>，结果类型 = Throw<T, CastError>
+pub const CastMode = enum {
+    to,
+    try_to,
+};
+
 /// 类型语法节点：命名类型、泛型、可空、函数、记录、数组、kind 标注等
 pub const TypeNode = union(enum) {
     named: struct {
@@ -425,6 +433,15 @@ pub const Expr = union(enum) {
         /// false = 不安全转换（i32(x)），结果类型为 target_type，wrap/饱和
         safe: bool = false,
     },
+    /// cast builder 表达式（Phase 3 新语法）
+    /// 语法形式：cast(expr).to(T) / cast(expr).try_to(T)
+    /// - to: wrap on overflow，产生 Inf 时 panic（D61 强化），结果类型 = T
+    /// - try_to: 越界 / 解析失败 / 产生 Inf 时返回 Throw<T, CastError>，结果类型 = Throw<T, CastError>
+    cast_builder: struct {
+        expr: *Expr,
+        target_type: *TypeNode,
+        mode: CastMode,
+    },
     atomic_expr: struct {
         value: *Expr,
     },
@@ -480,6 +497,7 @@ pub const Stmt = union(enum) {
         expr: *Expr,
     },
     throw_stmt: struct {
+        location: SourceLocation,
         expr: *Expr,
     },
     break_stmt: struct {},

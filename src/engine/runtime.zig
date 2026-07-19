@@ -124,6 +124,18 @@ pub const Runtime = struct {
         ptr.* = val;
     }
 
+    /// 读取 usize 值
+    pub inline fn readUsize(self: *Runtime, chan: u16) usize {
+        const ptr: *usize = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
+        return ptr.*;
+    }
+
+    /// 写入 usize 值（Phase 5: .len() 返回类型从 i64 改为 usize）
+    pub inline fn writeUsize(self: *Runtime, chan: u16, val: usize) void {
+        const ptr: *usize = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
+        ptr.* = val;
+    }
+
     /// 读取 f64 值
     pub inline fn readF64(self: *Runtime, chan: u16) f64 {
         const ptr: *f64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));

@@ -10,25 +10,25 @@
 
 // 自定义错误类型（Error 子类型）
 type FileError: Error = FileError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "file error"
     }
 }
 
 type NetworkError: Error = NetworkError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "network error"
     }
 }
 
 type ParseError: Error = ParseError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "parse error"
     }
 }
 
 type DbError: Error = DbError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "database error"
     }
 }
@@ -152,7 +152,7 @@ fun length(s: str?): i32 {
 fun describe(n: i32?): str {
     match n {
         null => "nothing"
-        x => "got " + str(x)
+        x => "got " + cast(x).to(str)
     }
 }
 
@@ -328,7 +328,7 @@ fun findOrError2(id: i32): Throw<str, Error> {
     if id == 0 {
         Ok("")
     } else {
-        Ok("user" + str(id))
+        Ok("user" + cast(id).to(str))
     }
 }
 
@@ -507,8 +507,8 @@ fun applyTwice2(f: (i32) -> i32, x: i32): i32 { f(f(x)) }
 fun mapArray(arr: i32[], f: (i32) -> i32): i32[] {
     var result: i32[] = []
     var mi = 0i32
-    while mi < i32(arr.len()) {
-        result = result.push(f(arr[mi]))
+    while mi < cast(arr.len()).to(i32) {
+        result = result.push(f(arr[cast(mi).to(usize)]))
         mi = mi + 1
     }
     result
@@ -517,9 +517,9 @@ fun mapArray(arr: i32[], f: (i32) -> i32): i32[] {
 fun filterArray(arr: i32[], pred: (i32) -> bool): i32[] {
     var result: i32[] = []
     var fi = 0i32
-    while fi < i32(arr.len()) {
-        if pred(arr[fi]) {
-            result = result.push(arr[fi])
+    while fi < cast(arr.len()).to(i32) {
+        if pred(arr[cast(fi).to(usize)]) {
+            result = result.push(arr[cast(fi).to(usize)])
         }
         fi = fi + 1
     }
@@ -544,7 +544,7 @@ fun fizzbuzz(n: i32): str {
         n if n % 15 == 0 => "FizzBuzz"
         n if n % 3 == 0 => "Fizz"
         n if n % 5 == 0 => "Buzz"
-        _ => str(n)
+        _ => cast(n).to(str)
     }
 }
 
@@ -702,8 +702,8 @@ println(arr[2])
 // ============================================================
 var total: i32 = 0
 var total_i = 0i32
-while total_i < i32(arr.len()) {
-    total = total + arr[total_i]
+while total_i < cast(arr.len()).to(i32) {
+    total = total + arr[cast(total_i).to(usize)]
     total_i = total_i + 1
 }
 println(total)
@@ -754,10 +754,10 @@ println(range_sum2)
 // 15. 类型转换
 // ============================================================
 val big: i64 = 100
-val small = i32(big)
+val small = cast(big).to(i32)
 println(small)
 
-val f = f64(42)
+val f = cast(42).to(f64)
 println(f)
 
 // ============================================================
@@ -1001,16 +1001,16 @@ println(f64_val)
 // 40. 类型转换 — widening/narrowing
 // ============================================================
 // widening
-val i8_to_i32 = i32(v_i8)
-val i32_to_i64 = i64(v_i32)
-val i32_to_f64 = f64(v_i32)
+val i8_to_i32 = cast(v_i8).to(i32)
+val i32_to_i64 = cast(v_i32).to(i64)
+val i32_to_f64 = cast(v_i32).to(f64)
 println(i8_to_i32)
 println(i32_to_i64)
 println(i32_to_f64)
 
 // narrowing（合法范围内）
 val small_i64: i64 = 100
-val i64_to_i32 = i32(small_i64)
+val i64_to_i32 = cast(small_i64).to(i32)
 println(i64_to_i32)
 
 // ============================================================
@@ -1247,8 +1247,8 @@ println(pipe_result)
 val nums: i32[] = [10, 20, 30, 40, 50]
 var arr_sum: i32 = 0
 var as_i = 0i32
-while as_i < i32(nums.len()) {
-    arr_sum = arr_sum + nums[as_i]
+while as_i < cast(nums.len()).to(i32) {
+    arr_sum = arr_sum + nums[cast(as_i).to(usize)]
     as_i = as_i + 1
 }
 println(arr_sum)
@@ -1279,9 +1279,9 @@ println(unit_val)
 // ============================================================
 // 61. str() 内建转换函数
 // ============================================================
-println(str(42))
-println(str(3.14))
-println(str(true))
+println(cast(42).to(str))
+println(cast(3.14).to(str))
+println(cast(true).to(str))
 
 // ============================================================
 // 62. 字符串转义字符
@@ -1456,8 +1456,8 @@ val unit_result = sideEffect()
 val nums_arr = [5, 3, 8, 1, 9, 2]
 var max_val = nums_arr[0]
 var mv_i = 1i32
-while mv_i < i32(nums_arr.len()) {
-    if nums_arr[mv_i] > max_val { max_val = nums_arr[mv_i] }
+while mv_i < cast(nums_arr.len()).to(i32) {
+    if nums_arr[cast(mv_i).to(usize)] > max_val { max_val = nums_arr[cast(mv_i).to(usize)] }
     mv_i = mv_i + 1
 }
 println(max_val)
@@ -1512,7 +1512,7 @@ println(defer_nested)
 // ============================================================
 // 84. 类型转换 — 更多场景
 // ============================================================
-val int_to_float = f64(42)
+val int_to_float = cast(42).to(f64)
 println(int_to_float)
 
 // ============================================================
@@ -1615,8 +1615,8 @@ println(arr2[2])
 
 var arr_total: i32 = 0
 var at_i = 0i32
-while at_i < i32(arr2.len()) {
-    arr_total = arr_total + arr2[at_i]
+while at_i < cast(arr2.len()).to(i32) {
+    arr_total = arr_total + arr2[cast(at_i).to(usize)]
     at_i = at_i + 1
 }
 println(arr_total)
@@ -1867,11 +1867,11 @@ println(sumTCO(100, 0))
 // ============================================================
 // 121. 类型转换 — 更多 widening/narrowing
 // ============================================================
-val i32_to_f = f64(100)
+val i32_to_f = cast(100).to(f64)
 println(i32_to_f)
 
 val i8_v2: i8 = 50
-val i8_widened = i32(i8_v2)
+val i8_widened = cast(i8_v2).to(i32)
 println(i8_widened)
 
 // ============================================================
@@ -1963,7 +1963,7 @@ fun test14(): Unit {
 var countdown_val = 5
 var countdown_result = ""
 while countdown_val > 0 {
-    countdown_result = countdown_result + str(countdown_val)
+    countdown_result = countdown_result + cast(countdown_val).to(str)
     countdown_val = countdown_val - 1
 }
 println(countdown_result)
@@ -2021,8 +2021,8 @@ println("apple" < "banana")
 val search_arr: i32[] = [5, 10, 15, 20, 25]
 var search_sum: i32 = 0
 var ss2_i = 0i32
-while ss2_i < i32(search_arr.len()) {
-    search_sum = search_sum + search_arr[ss2_i]
+while ss2_i < cast(search_arr.len()).to(i32) {
+    search_sum = search_sum + search_arr[cast(ss2_i).to(usize)]
     ss2_i = ss2_i + 1
 }
 println(search_sum)
@@ -2048,8 +2048,8 @@ println(mixed.len())
 // ============================================================
 // 140. char → str 转换
 // ============================================================
-println(str('A'))
-println(str('Z'))
+println(cast('A').to(str))
+println(cast('Z').to(str))
 
 // ============================================================
 // 141. 守卫条件与或模式组合
@@ -2148,8 +2148,8 @@ println(gcd(100, 75))
 var mapped: i32[] = []
 var map_src = [1i32, 2i32, 3i32, 4i32, 5i32]
 var map_i = 0i32
-while map_i < i32(map_src.len()) {
-    mapped = mapped.push(map_src[map_i] * map_src[map_i])
+while map_i < cast(map_src.len()).to(i32) {
+    mapped = mapped.push(map_src[cast(map_i).to(usize)] * map_src[cast(map_i).to(usize)])
     map_i = map_i + 1
 }
 println(mapped)
@@ -2157,9 +2157,9 @@ println(mapped)
 var evens: i32[] = []
 var filt_src = [1i32, 2i32, 3i32, 4i32, 5i32, 6i32]
 var filt_i = 0i32
-while filt_i < i32(filt_src.len()) {
-    if filt_src[filt_i] % 2 == 0 {
-        evens = evens.push(filt_src[filt_i])
+while filt_i < cast(filt_src.len()).to(i32) {
+    if filt_src[cast(filt_i).to(usize)] % 2 == 0 {
+        evens = evens.push(filt_src[cast(filt_i).to(usize)])
     }
     filt_i = filt_i + 1
 }
