@@ -1,0 +1,153 @@
+// Benchmark 10: 综合工作负载（新增）
+// 目标：模拟真实程序混合使用各种特性，测综合吞吐
+// 测试维度：
+// - 简单解释器（AST + 模式匹配 + 递归）
+// - 统计聚合（数组 + 记录 + 高阶函数）
+// - 状态机（match + TCO）
+// - BST 树构造与遍历（ADT + 递归）
+
+// ============================================================
+// 1. 表达式 AST
+// ============================================================
+type Expr =
+    | ENum(i64)
+    | EAdd(Expr, Expr)
+    | EMul(Expr, Expr)
+    | ESub(Expr, Expr)
+
+// ============================================================
+// 2. 记录：学生成绩
+// ============================================================
+type Student = Student(name: str, score: i64, age: i32)
+
+// ============================================================
+// 3. BST 树
+// ============================================================
+type Tree =
+    | Leaf
+    | Node(i64, Tree, Tree)
+
+// ============================================================
+// 表达式求值（AST + 模式匹配 + 递归）
+// ============================================================
+fun evalExpr(e: Expr): i64 {
+    match e {
+        ENum(n) => n
+        EAdd(a, b) => evalExpr(a) + evalExpr(b)
+        EMul(a, b) => evalExpr(a) * evalExpr(b)
+        ESub(a, b) => evalExpr(a) - evalExpr(b)
+    }
+}
+
+fun buildExpr(depth: i32): Expr {
+    if depth <= 0 { return ENum(1) }
+    val inner = buildExpr(depth - 1)
+    EAdd(EMul(ENum(2), inner), ESub(inner, ENum(1)))
+}
+
+// ============================================================
+// 学生统计（记录 + 数组 + 高阶函数）
+// ============================================================
+fun buildStudents(n: i32): Student[] {
+    var arr: Student[] = []
+    var i: i32 = 0
+    while i < n {
+        val s = Student("s" + cast(i).to(str), cast(i % 100).to(i64), 18 + (i % 5))
+        arr = arr.push(s)
+        i = i + 1
+    }
+    arr
+}
+
+fun avgScore(students: Student[]): i64 {
+    var total: i64 = 0
+    var count: i64 = 0
+    for s in students {
+        match s {
+            Student(_, score, _) => {
+                total = total + score
+                count = count + 1
+            }
+        }
+    }
+    if count == 0 { 0 } else { total / count }
+}
+
+fun maxScore(students: Student[]): i64 {
+    var max: i64 = 0
+    for s in students {
+        match s {
+            Student(_, score, _) => {
+                if score > max { max = score }
+            }
+        }
+    }
+    max
+}
+
+// ============================================================
+// BST 树（ADT + 模式匹配 + 递归）
+// ============================================================
+fun tInsert(t: Tree, v: i64): Tree {
+    match t {
+        Leaf => Node(v, Leaf, Leaf)
+        Node(n, lo, hi) => {
+            if v < n { Node(n, tInsert(lo, v), hi) }
+            else if v > n { Node(n, lo, tInsert(hi, v)) }
+            else { t }
+        }
+    }
+}
+
+fun tSum(t: Tree): i64 {
+    match t {
+        Leaf => 0
+        Node(n, lo, hi) => n + tSum(lo) + tSum(hi)
+    }
+}
+
+fun tHeight(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(_, lo, hi) => {
+            val lh = tHeight(lo)
+            val rh = tHeight(hi)
+            1 + (if lh > rh { lh } else { rh })
+        }
+    }
+}
+
+fun main() {
+    // --- 表达式求值 1K 次（buildExpr(10) 递归深度大，1K 次已足够压测）---
+    var exprSum: i64 = 0
+    var i: i32 = 0
+    while i < 1000 {
+        val e = buildExpr(10)
+        exprSum = (exprSum + evalExpr(e)) % 1073741824
+        i = i + 1
+    }
+    println(exprSum)
+
+    // --- 学生统计（1000 学生 × 10 轮）---
+    val students = buildStudents(1000)
+    var statSum: i64 = 0
+    i = 0
+    while i < 10 {
+        statSum = statSum + avgScore(students) + maxScore(students)
+        i = i + 1
+    }
+    println(statSum)
+
+    // --- BST 插入 5000 节点 + 遍历 ---
+    var tree = Leaf
+    var k: i64 = 0
+    while k < 5000 {
+        val v = (k * 7919 + 1) % 100000
+        tree = tInsert(tree, v)
+        k = k + 1
+    }
+    println(tHeight(tree))
+    println(tSum(tree))
+
+    println("mixed: done")
+}

@@ -1,0 +1,187 @@
+// Benchmark 9: 模式匹配密集（新增）
+// 目标：压测 match 编译优化（单构造器跳过 tag、多构造器 tag 分派、嵌套模式）
+// 测试维度：
+// - 单构造器 match 5M 次（应走优化路径）
+// - 多构造器 match 5M 次（测试 tag 检查保留路径）
+// - 嵌套模式 match 2M 次
+// - 字面量模式 match 2M 次
+
+// 单构造器类型
+type Point = Point(x: i64, y: i64)
+type Triple = Triple(a: i64, b: i64, c: i64)
+
+// 多构造器 ADT（4 个构造器）
+type Color =
+    | Red(i64)
+    | Green(i64)
+    | Blue(i64)
+    | Alpha(i64, i64)
+
+// 多构造器 ADT（8 个构造器，更密集的 tag 分派）
+type Token =
+    | TNum(i64)
+    | TPlus
+    | TMinus
+    | TStar
+    | TSlash
+    | TLParen
+    | TRParen
+    | TEOF
+
+// 嵌套 ADT
+type Expr =
+    | ENum(i64)
+    | EVar(str)
+    | EAdd(Expr, Expr)
+    | EMul(Expr, Expr)
+
+// 单构造器 match（应走优化路径）
+fun pointDist(p: Point): i64 {
+    match p {
+        Point(x, y) => x * x + y * y
+    }
+}
+
+fun tripleSum(t: Triple): i64 {
+    match t {
+        Triple(a, b, c) => a + b + c
+    }
+}
+
+// 多构造器 match（4 个分支）
+fun colorToValue(c: Color): i64 {
+    match c {
+        Red(v) => v
+        Green(v) => v * 2
+        Blue(v) => v * 3
+        Alpha(v, a) => v * a
+    }
+}
+
+// 多构造器 match（8 个分支，更密集 tag 分派）
+fun tokenWeight(t: Token): i64 {
+    match t {
+        TNum(n) => n
+        TPlus => 1
+        TMinus => 2
+        TStar => 3
+        TSlash => 4
+        TLParen => 5
+        TRParen => 6
+        TEOF => 0
+    }
+}
+
+// 嵌套模式 match
+fun exprDepth(e: Expr): i64 {
+    match e {
+        ENum(_) => 1
+        EVar(_) => 1
+        EAdd(a, b) => {
+            val da = exprDepth(a)
+            val db = exprDepth(b)
+            1 + (if da > db { da } else { db })
+        }
+        EMul(a, b) => {
+            val da = exprDepth(a)
+            val db = exprDepth(b)
+            1 + (if da > db { da } else { db })
+        }
+    }
+}
+
+fun buildExpr(depth: i32): Expr {
+    if depth <= 0 { return ENum(1) }
+    val inner = buildExpr(depth - 1)
+    EAdd(EMul(ENum(2), inner), ENum(1))
+}
+
+// 字面量模式 match
+fun classifyNum(n: i64): i64 {
+    match n % 7 {
+        0 => 100
+        1 => 200
+        2 => 300
+        3 => 400
+        4 => 500
+        5 => 600
+        _ => 700
+    }
+}
+
+fun main() {
+    // --- 单构造器 match 5M 次 ---
+    var pSum: i64 = 0
+    var i: i64 = 0
+    while i < 5000000 {
+        val p = Point(i % 1000, i % 500)
+        pSum = (pSum + pointDist(p)) % 1073741824
+        i = i + 1
+    }
+    println(pSum)
+
+    // --- 多字段单构造器 match 2M 次 ---
+    var tSum: i64 = 0
+    i = 0
+    while i < 2000000 {
+        val t = Triple(i % 100, i % 200, i % 300)
+        tSum = (tSum + tripleSum(t)) % 1073741824
+        i = i + 1
+    }
+    println(tSum)
+
+    // --- 4 构造器 match 5M 次 ---
+    var cSum: i64 = 0
+    i = 0
+    while i < 5000000 {
+        val v = i % 4
+        val c = match v {
+            0 => Red(i % 1000)
+            1 => Green(i % 1000)
+            2 => Blue(i % 1000)
+            _ => Alpha(i % 1000, i % 100)
+        }
+        cSum = (cSum + colorToValue(c)) % 1073741824
+        i = i + 1
+    }
+    println(cSum)
+
+    // --- 8 构造器 match 5M 次 ---
+    var tokSum: i64 = 0
+    i = 0
+    while i < 5000000 {
+        val v = i % 8
+        val t = match v {
+            0 => TNum(i % 1000)
+            1 => TPlus
+            2 => TMinus
+            3 => TStar
+            4 => TSlash
+            5 => TLParen
+            6 => TRParen
+            _ => TEOF
+        }
+        tokSum = (tokSum + tokenWeight(t)) % 1073741824
+        i = i + 1
+    }
+    println(tokSum)
+
+    // --- 嵌套模式 match 100K 次（每次递归多次 match）---
+    var eSum: i64 = 0
+    i = 0
+    while i < 100000 {
+        val e = buildExpr(10)
+        eSum = (eSum + exprDepth(e)) % 1073741824
+        i = i + 1
+    }
+    println(eSum)
+
+    // --- 字面量模式 match 2M 次 ---
+    var nSum: i64 = 0
+    i = 0
+    while i < 2000000 {
+        nSum = (nSum + classifyNum(i)) % 1073741824
+        i = i + 1
+    }
+    println(nSum)
+}

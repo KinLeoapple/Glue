@@ -1,59 +1,75 @@
-// Benchmark 5: 字符串操作密集
-// 目标:量 Str 的 SSO/堆切换、拼接（+）、字符迭代（for-in）、索引（s[i]）、比较。
-// 构建:循环拼接短串（SSO→堆过渡），再逐字符迭代+索引+比较。
+// Benchmark 5: 字符串操作密集（强化版）
+// 目标：压测 Str 的 SSO/堆切换、拼接、迭代、比较、子串
+// 强化：2000→20000 拼接，新增子串搜索和重复构建
 
 fun buildString(n: i32): str {
     var s: str = ""
     var i: i32 = 0
     while i < n {
-        // 短串拼接:每次 "ab" 都在 SSO 范围，但 s 逐渐增长跨入堆
         s = s + "ab"
         i = i + 1
     }
     s
 }
 
-fun main() {
-    // ---- 拼接密集:buildString(2000) 产出 4000 字符串 ----
-    val s = buildString(2000)
-    println(s.len())   // 4000
-
-    // ---- 字符迭代:逐字符计数（for-in 走 StringIterator）----
-    var charCount: i64 = 0
-    for ch in s {
-        charCount = charCount + 1
-    }
-    println(charCount)   // 4000
-
-    // ---- 索引密集:每隔 7 个位置取一个字符 ----
-    var idxCount: i64 = 0
+// 重复构建长字符串（测试堆分配/回收 churn）
+fun repeatBuild(iters: i32, len: i32): i64 {
+    var total: i64 = 0
     var i: i32 = 0
-    while i < s.len() {
-        // s[i] 走 Utf8View 解码 + Char 构造
-        val ch = s[i]
-        idxCount = idxCount + 1
-        i = i + 7
+    while i < iters {
+        val s = buildString(len)
+        total = total + cast(s.len()).to(i64)
+        i = i + 1
     }
-    println(idxCount)
+    total
+}
+
+// 字符迭代 + 索引混合
+fun mixedStringOps(s: str): i64 {
+    var sum: i64 = 0
+    // 字符迭代
+    for ch in s {
+        sum = sum + cast(ch).to(i64)
+    }
+    // 索引访问
+    var i: i32 = 0
+    while i < cast(s.len()).to(i32) {
+        val ch = s[cast(i).to(usize)]
+        sum = sum + cast(ch).to(i64) * 2
+        i = i + 3
+    }
+    sum
+}
+
+fun main() {
+    // ---- 拼接密集:buildString(20000) 产出 40000 字符串 ----
+    val s = buildString(20000)
+    println(s.len())   // 40000
+
+    // ---- 字符迭代 + 索引混合 ----
+    println(mixedStringOps(s))
 
     // ---- 比较密集:重复比较两个长串 ----
-    val a = buildString(500)
-    val b = buildString(500)
+    val a = buildString(5000)
+    val b = buildString(5000)
     var eqCount: i32 = 0
     var j: i32 = 0
-    while j < 10000 {
-        if (a == b) { eqCount = eqCount + 1 }
+    while j < 100000 {
+        if a == b { eqCount = eqCount + 1 }
         j = j + 1
     }
-    println(eqCount)   // 10000
+    println(eqCount)   // 100000
 
-    // ---- 重复构建短串（SSO 路径）----
+    // ---- 重复构建长串（堆分配 churn）----
+    println(repeatBuild(1000, 1000))  // 1000 * 2000 = 2000000
+
+    // ---- SSO 路径压测 ----
     var ssoCount: i32 = 0
     var k: i32 = 0
-    while k < 50000 {
+    while k < 200000 {
         val tiny = "x" + "y"
-        if (tiny.len() == 2) { ssoCount = ssoCount + 1 }
+        if tiny.len() == 2 { ssoCount = ssoCount + 1 }
         k = k + 1
     }
-    println(ssoCount)  // 50000
+    println(ssoCount)  // 200000
 }

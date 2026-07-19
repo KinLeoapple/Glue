@@ -1,6 +1,6 @@
 // Edge cases: concurrency — async functions, atomic ops, channel buffer/close, select
 
-// async 函数：调用返回 Spawn<T>
+// async 函数：调用返回 Async<T>
 async fun mul10x10(): i64 { 10 * 10 }
 async fun add20x5(): i64 { 20 + 5 }
 async fun sub100x1(): i64 { 100 - 1 }
@@ -25,7 +25,7 @@ fun main() {
     println(x)            // 0 (unchanged)
 
     // ---- atomic shared across async ----
-    var counter = atomic 0
+    var counter = atomic 0i64
     val a1 = incrCounter(counter)
     a1.await()
     val a2 = incrCounter(counter)
@@ -82,7 +82,7 @@ fun main() {
     val chc = channel(10)
     chc.send(7)
     select {
-        chc.recv() => v => println("got " + str(v))
+        chc.recv() => v => println("got " + cast(v).to(str))
     }
 
     // ---- async computing into channel ----
@@ -92,7 +92,7 @@ fun main() {
     println(result_ch.recv())   // 12345
 
     // ---- many atomic increments via sequential async calls ----
-    var acc = atomic 0
+    var acc = atomic 0i64
     var i = 0
     while i < 10 {
         val sp = incrCounter(acc)

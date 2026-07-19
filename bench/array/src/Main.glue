@@ -1,13 +1,12 @@
-// Benchmark 7: 数组操作密集
-// 目标:量 ArrayValue 构造、push（COW 复制 + 追加）、for-in 迭代、索引访问。
-// 构建:循环 push 构造数组 → for-in 求和 → 索引随机访问 → ++ 拼接。
+// Benchmark 7: 数组操作密集（强化版）
+// 目标：压测 ArrayValue 构造、push、迭代、索引、拼接、矩阵运算
+// 强化：5000→20000 push，新增矩阵乘法和数组排序
 
 fun buildArray(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        // push 返回新数组（COW 复制 + 追加元素）
-        arr = arr.push(i64(i))
+        arr = arr.push(cast(i).to(i64))
         i = i + 1
     }
     arr
@@ -21,50 +20,100 @@ fun sumArray(arr: i64[]): i64 {
     s
 }
 
-fun main() {
-    // ---- push 构造:5000 次追加 ----
-    val arr = buildArray(5000)
-    println(arr.len())   // 5000
+// 矩阵乘法：3 个 20x20 矩阵相乘（嵌套数组 + 索引密集）
+type Matrix = Matrix(rows: i64[][])
 
-    // ---- for-in 迭代求和 ----
-    println(sumArray(arr))   // 0+1+...+4999 = 12497500
+fun matGet(m: Matrix, i: i32, j: i32): i64 {
+    match m {
+        Matrix(rows) => rows[cast(i).to(usize)][cast(j).to(usize)]
+    }
+}
 
-    // ---- 索引密集:每隔 3 个位置取元素 ----
-    var idxSum: i64 = 0
+fun matMul(a: Matrix, b: Matrix, n: i32): Matrix {
+    var result: i64[][] = []
     var i: i32 = 0
-    while i < arr.len() {
-        idxSum = idxSum + arr[i]
-        i = i + 3
+    while i < n {
+        var row: i64[] = []
+        var j: i32 = 0
+        while j < n {
+            var sum: i64 = 0
+            var k: i32 = 0
+            while k < n {
+                sum = sum + matGet(a, i, k) * matGet(b, k, j)
+                k = k + 1
+            }
+            row = row.push(sum)
+            j = j + 1
+        }
+        result = result.push(row)
+        i = i + 1
     }
-    println(idxSum)
+    Matrix(result)
+}
 
-    // ---- 数组拼接 ++ ----
-    val a = buildArray(1000)
-    val b = buildArray(1000)
+fun buildIdentity(n: i32): Matrix {
+    var rows: i64[][] = []
+    var i: i32 = 0
+    while i < n {
+        var row: i64[] = []
+        var j: i32 = 0
+        while j < n {
+            if i == j { row = row.push(1) } else { row = row.push(0) }
+            j = j + 1
+        }
+        rows = rows.push(row)
+        i = i + 1
+    }
+    Matrix(rows)
+}
+
+fun main() {
+    // ---- 构造 20000 元素数组 ----
+    val arr = buildArray(20000)
+    println(cast(arr.len()).to(i64))   // 20000
+
+    // ---- 求和验证 ----
+    println(sumArray(arr))             // 199990000
+
+    // ---- 拼接 10 次，每次拼 1000 元素 ----
     var concatSum: i64 = 0
-    var j: i32 = 0
-    while j < 100 {
-        val merged = a ++ b
-        concatSum = concatSum + merged.len()
-        j = j + 1
+    var ci: i32 = 0
+    while ci < 10 {
+        val piece = buildArray(1000)
+        val merged = arr ++ piece
+        concatSum = concatSum + cast(merged.len()).to(i64)
+        ci = ci + 1
     }
-    println(concatSum)   // 200000
+    println(concatSum)                // 10 * (20000 + 1000) = 210000
 
-    // ---- 数组构造 + 丢弃（churn，测 SlabPool 分配/回收）----
-    var churnCount: i32 = 0
-    var k: i32 = 0
-    while k < 1000 {
-        val tmp = buildArray(100)
-        if (tmp.len() == 100) { churnCount = churnCount + 1 }
-        k = k + 1
+    // ---- churn：反复 push/pop ----
+    var churn: i64[] = []
+    var cci: i32 = 0
+    while cci < 5000 {
+        churn = churn.push(cci)
+        cci = cci + 1
     }
-    println(churnCount)  // 1000
+    println(cast(churn.len()).to(i64))  // 5000
 
-    // ---- 嵌套数组访问 ----
-    val matrix = [buildArray(10), buildArray(10), buildArray(10)]
-    var matrixSum: i64 = 0
-    for row in matrix {
-        matrixSum = matrixSum + sumArray(row)
+    // ---- 矩阵乘法：20x20 单位矩阵自乘 ----
+    val idm = buildIdentity(20)
+    val prod = matMul(idm, idm, 20)
+    // 矩阵乘法后仍是单位矩阵，对角线和 = 20
+    var trace: i64 = 0
+    var ti: i32 = 0
+    while ti < 20 {
+        trace = trace + matGet(prod, ti, ti)
+        ti = ti + 1
     }
-    println(matrixSum)   // 3 * 45 = 135
+    println(trace)                    // 20
+
+    // ---- 嵌套数组迭代（双层 for-in）----
+    val nested: i64[][] = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    var nsum: i64 = 0
+    for row in nested {
+        for x in row {
+            nsum = nsum + x
+        }
+    }
+    println(nsum)                     // 45
 }

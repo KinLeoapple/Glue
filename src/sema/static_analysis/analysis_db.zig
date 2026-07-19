@@ -14,6 +14,7 @@ pub const loop_invariant = @import("loop_invariant.zig");
 pub const fused_analysis = @import("fused_analysis.zig");
 pub const dead_code = @import("dead_code.zig");
 pub const cse = @import("cse.zig");
+pub const escape_analysis = @import("escape_analysis.zig");
 
 // 重新导出各子模块的核心类型，便于上层直接通过 analysis_db 引用
 pub const PurityInfo = purity.PurityInfo;
@@ -29,6 +30,11 @@ pub const HoistTable = loop_invariant.HoistTable;
 pub const FusedAnalysis = fused_analysis.FusedAnalysis;
 pub const DeadTable = dead_code.DeadTable;
 pub const CseTable = cse.CseTable;
+pub const EscapeInfo = escape_analysis.EscapeInfo;
+pub const EscapeTable = escape_analysis.EscapeTable;
+pub const EscapePass = escape_analysis.EscapePass;
+pub const ParamEscape = escape_analysis.ParamEscape;
+pub const ParamEscapeTable = escape_analysis.ParamEscapeTable;
 
 /// 静态分析数据库：把所有分析表聚合在一起，统一管理生命周期。
 pub const AnalysisDB = struct {
@@ -40,6 +46,8 @@ pub const AnalysisDB = struct {
     hoist_table: HoistTable,
     dead_code: DeadTable,
     cse: CseTable,
+    escape: EscapeTable,
+    param_escape: ParamEscapeTable,
     allocator: std.mem.Allocator,
 
     /// 用给定分配器初始化所有分析表。
@@ -53,6 +61,8 @@ pub const AnalysisDB = struct {
             .hoist_table = HoistTable.init(allocator),
             .dead_code = DeadTable.init(allocator),
             .cse = CseTable.init(allocator),
+            .escape = EscapeTable.init(allocator),
+            .param_escape = ParamEscapeTable.init(allocator),
             .allocator = allocator,
         };
     }
@@ -67,6 +77,8 @@ pub const AnalysisDB = struct {
         self.hoist_table.deinit();
         self.dead_code.deinit();
         self.cse.deinit();
+        self.escape.deinit();
+        self.param_escape.deinit();
     }
 };
 

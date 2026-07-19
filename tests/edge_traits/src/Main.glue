@@ -46,7 +46,7 @@ type Color: Sizeable = | Red | Green | Blue {
 type Pt: (Sizeable, Show) = Pt(x: i32, y: i32) {
     fun sz(self): i32 { 2 }
     fun show(self): str {
-        "Pt(" + str(self.x) + "," + str(self.y) + ")"
+        "Pt(" + cast(self.x).to(str) + "," + cast(self.y).to(str) + ")"
     }
 }
 

@@ -1,0 +1,107 @@
+// Phase 3 cast builder 端到端测试
+// 验证 cast(x).to(T) / cast(x).try_to(T) 完整语义
+//
+// 覆盖场景（按 spec §4.3 失败语义表）：
+//   1. 数值 widening（i8→i64，永不失败）
+//   2. 数值 narrowing 值域内（i64→i8，wrap）
+//   3. 数值 narrowing 值域外（i64→i8，wrap 按位截断）
+//   4. try_to 数值 widening（永不失败 → Ok）
+//   5. try_to 数值 narrowing 值域内（Ok）
+//   6. try_to 数值 narrowing 值域外（Throw CastError）
+//   7. 数值→str（永不失败）
+//   8. try_to 数值→str（Ok）
+//   9. try_to str→数值（合法解析 → Ok）
+//  10. try_to str→数值（非法解析 → Throw CastError）
+
+fun main() {
+    // ---- 1. 数值 widening（i8→i64） ----
+    val a: i8 = 42i8
+    val b: i64 = cast(a).to(i64)
+    println(b)                  // 42
+
+    // ---- 2. 数值 narrowing 值域内（i64→i8） ----
+    val c: i64 = 100
+    val d: i8 = cast(c).to(i8)
+    println(d)                  // 100
+
+    // ---- 3. 数值 narrowing 值域外（wrap） ----
+    val e: i64 = 300
+    val f: i8 = cast(e).to(i8)
+    println(f)                  // 44（300 mod 256）
+
+    // ---- 4. try_to 数值 widening（Ok 路径） ----
+    val g: i8 = 42i8
+    val h = cast(g).try_to(i64)
+    val h_result = match h {
+        Ok(v) => v
+        Error(e) => -1i64
+    }
+    println(h_result)          // 42
+
+    // ---- 5. try_to 数值 narrowing 值域内（Ok） ----
+    val i: i64 = 100
+    val j = cast(i).try_to(i8)
+    val j_result = match j {
+        Ok(v) => v
+        Error(e) => -1i8
+    }
+    println(j_result)          // 100
+
+    // ---- 6. try_to 数值 narrowing 值域外（Throw CastError） ----
+    val k: i64 = 9999999999
+    val l = cast(k).try_to(i32)
+    val l_result = match l {
+        Ok(v) => v
+        Error(e) => -1i32
+    }
+    println(l_result)          // -1
+
+    // ---- 7. 数值→str（永不失败） ----
+    val m: i32 = 12345
+    val n: str = cast(m).to(str)
+    println(n)                 // 12345
+
+    // ---- 8. try_to 数值→str（Ok） ----
+    val o: i32 = 67890
+    val p = cast(o).try_to(str)
+    val p_result = match p {
+        Ok(v) => v
+        Error(e) => "error"
+    }
+    println(p_result)          // 67890
+
+    // ---- 9. try_to str→数值（合法解析 → Ok） ----
+    val q = cast("100").try_to(i32)
+    val q_result = match q {
+        Ok(v) => v
+        Error(e) => -1i32
+    }
+    println(q_result)          // 100
+
+    // ---- 10. try_to str→数值（非法解析 → Throw CastError） ----
+    val r = cast("abc").try_to(i32)
+    val r_result = match r {
+        Ok(v) => v
+        Error(e) => -1i32
+    }
+    println(r_result)          // -1
+
+    // ---- 11. try_to 错误信息检查（访问 CastError 字段） ----
+    val s: i64 = 9999999999
+    val t = cast(s).try_to(i32)
+    val t_msg = match t {
+        Ok(v) => "ok"
+        Error(e) => e.message()
+    }
+    println(t_msg)             // cannot cast '9999999999' from i64 to i32
+
+    // ---- 12. bool→int（永不失败） ----
+    val u = cast(true).to(i32)
+    println(u)                 // 1
+
+    // ---- 13. char→int（码点） ----
+    val v = cast('A').to(u32)
+    println(v)                 // 65
+
+    println("edge_cast_builder: All tests passed!")
+}

@@ -333,11 +333,12 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
             return true;
         },
         .type_cast => |tc| isSideEffectFreeExpr(tc.expr),
+        .cast_builder => |cb| isSideEffectFreeExpr(cb.expr),
         .non_null_assert => |n| isSideEffectFreeExpr(n.expr),
         // 以下表达式一律视为有副作用，不在此处逐条展开。
         .call, .method_call, .safe_method_call, .string_interpolation,
         .index, .record_literal, .record_extend, .array_literal,
-        .lambda, .match, .select, .lazy,
+        .lambda, .match, .select, .lazy, .spawn_expr,
         .assignment_expr, .compound_assign, .propagate,
         .atomic_expr, .inline_trait_value,
         => false,
@@ -361,6 +362,6 @@ test "DeadTable basic" {
 }
 
 test "isSideEffectFreeExpr literals" {
-    const expr = ast.Expr{ .int_literal = .{ .raw = "42", .suffix = null, .location = .{ .line = 1, .column = 1 } } };
+    const expr = ast.Expr{ .int_literal = .{ .raw = "42", .suffix = null } };
     try std.testing.expect(isSideEffectFreeExpr(&expr));
 }

@@ -10,13 +10,13 @@ fun greet(user: (name: str)) : str {
 
 // 4. Error 子类型
 type FileError: Error = FileError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "file error"
     }
 }
 
 type NetworkError: Error = NetworkError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "network error"
     }
 }
@@ -36,7 +36,7 @@ fun handle_error(result: Throw<str, Error>) : str {
 
 // 7. 多种错误类型
 type ParseError: Error = ParseError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "parse error"
     }
 }
@@ -47,7 +47,7 @@ fun parse_int(s: str) : Throw<i32, ParseError> {
 
 fun handle_int_error(result: Throw<i32, Error>) : str {
     match result {
-        Ok(val) => str(val),
+        Ok(val) => cast(val).to(str),
         Error(e) => "error: " + e.message(),
     }
 }
@@ -56,7 +56,7 @@ fun handle_int_error(result: Throw<i32, Error>) : str {
 fun describe_point(pt: (x: i32, y: i32)) : str {
     match pt {
         (x: 0, y: 0) => "origin",
-        (x: px, y: py) => "point at (" + str(px) + ", " + str(py) + ")",
+        (x: px, y: py) => "point at (" + cast(px).to(str) + ", " + cast(py).to(str) + ")",
     }
 }
 
@@ -72,7 +72,7 @@ fun celebrate_birthday(user: (name: str, age: i32)) : (name: str, age: i32) {
 fun main() {
     // 1. 记录宽度子类型
     val full_user = (name: "Alice", age: 30)
-    println(greet(full_user))
+    println(greet((name: full_user.name)))
 
     // 2. 记录扩展
     val base = (name: "Alice", age: 30)
@@ -118,15 +118,15 @@ fun main() {
     println(step3.z)
 
     // 9. 记录模式匹配
-    val origin = (x: 0, y: 0)
+    val origin = (x: 0i32, y: 0i32)
     println(describe_point(origin))
 
-    val pt = (x: 3, y: 4)
+    val pt = (x: 3i32, y: 4i32)
     println(describe_point(pt))
 
     // 宽度子类型
-    val pt3d = (x: 1, y: 2, z: 3)
-    println(describe_point(pt3d))
+    val pt3d = (x: 1i32, y: 2i32, z: 3i32)
+    println(describe_point((x: pt3d.x, y: pt3d.y)))
 
     // 10. 综合测试
     val user1 = make_user("Eve", 28)

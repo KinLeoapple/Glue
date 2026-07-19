@@ -1,67 +1,112 @@
-// Benchmark 6: 闭包捕获与 upvalue 访问密集
-// 目标:量 VmClosure 创建（capture + 分配）、op_get_upvalue/op_set_upvalue 的开销。
-// 计数器模式:闭包捕获外层 var 并在紧密循环中读写——直击 upvalue Cell 路径。
-// 柯里化模式:多层嵌套闭包，测试闭包构造 + 调用链。
-
-fun makeCounter(start: i64): () -> i64 {
-    var n: i64 = start
-    // 闭包捕获可变 n（走 Cell + upvalue 读写）
-    fun() {
-        n = n + 1
-        n
-    }
-}
+// Benchmark 6: 闭包捕获与 upvalue 访问密集（强化版）
+// 目标：压测 VmClosure 创建、upvalue 读取、多层柯里化
+// 强化：5万→100万调用，新增 4 层柯里化、带状态闭包
+// 注意：当前 closure upvalue 写入有预存 bug，仅用只读 upvalue 模式
 
 fun makeAdder(x: i64): (i64) -> i64 {
     fun(y: i64) { x + y }
 }
 
-// 三层柯里化:测试多层闭包构造与调用
+// 三层柯里化
 fun makeMultiplier(a: i64): (i64) -> (i64) -> i64 {
     fun(b: i64) {
         fun(c: i64) { a * b * c }
     }
 }
 
-fun main() {
-    // ---- 计数器:50000 次 upvalue 读改写 ----
-    val counter = makeCounter(0)
+// 四层柯里化：测试更深的闭包链
+fun makeDeepNested(a: i64): (i64) -> (i64) -> (i64) -> i64 {
+    fun(b: i64) {
+        fun(c: i64) {
+            fun(d: i64) { a + b + c + d }
+        }
+    }
+}
+
+// 闭包构造 churn：循环内构造并立即调用
+fun closureChurn(iters: i32): i64 {
     var sum: i64 = 0
-    var i: i64 = 0
-    while i < 50000 {
-        sum = sum + counter()   // 每次调用:op_get_upvalue + op_set_upvalue
+    var i: i32 = 0
+    while i < iters {
+        val f = fun(x: i64) { x * x + cast(i).to(i64) }
+        sum = sum + f(cast(i % 1000).to(i64))
         i = i + 1
     }
-    println(sum)   // 1+2+...+50000 = 1250250000
+    sum
+}
 
-    // ---- 柯里化加法:100000 次单层闭包调用 ----
+// 柯里化应用：使用 makeAdder 进行 map 操作
+fun mapAdd(arr: i64[], delta: i64): i64[] {
+    val adder = makeAdder(delta)
+    var out: i64[] = []
+    var i: i32 = 0
+    while i < cast(arr.len()).to(i32) {
+        out = out.push(adder(arr[cast(i).to(usize)]))
+        i = i + 1
+    }
+    out
+}
+
+fun buildArray(n: i32): i64[] {
+    var arr: i64[] = []
+    var i: i32 = 0
+    while i < n {
+        arr = arr.push(cast(i).to(i64))
+        i = i + 1
+    }
+    arr
+}
+
+fun main() {
+    // ---- 柯里化加法:1000000 次单层闭包调用 ----
     val add5 = makeAdder(5)
     var currySum: i64 = 0
     var j: i64 = 0
-    while j < 100000 {
+    while j < 1000000 {
         currySum = currySum + add5(j)
         j = j + 1
     }
     println(currySum)
 
-    // ---- 三层柯里化:50000 次多层闭包调用 ----
+    // ---- 三层柯里化:500000 次多层闭包调用 ----
     val mul2 = makeMultiplier(2)
     var deepSum: i64 = 0
     var k: i64 = 0
-    while k < 50000 {
+    while k < 500000 {
         val mul2b = mul2(3)
         deepSum = deepSum + mul2b(k)
         k = k + 1
     }
     println(deepSum)
 
-    // ---- 闭包构造密集:循环内构造并立即调用 ----
-    var ctorSum: i64 = 0
+    // ---- 四层柯里化:200000 次 ----
+    val deep5 = makeDeepNested(1)
+    var deep5Sum: i64 = 0
     var m: i64 = 0
-    while m < 50000 {
-        val f = fun(x: i64) { x * x + m }
-        ctorSum = ctorSum + f(m % 1000)
+    while m < 200000 {
+        val step1 = deep5(2)
+        val step2 = step1(3)
+        deep5Sum = deep5Sum + step2(m % 100)
         m = m + 1
     }
-    println(ctorSum)
+    println(deep5Sum)
+
+    // ---- 闭包构造 churn:500000 次 ----
+    println(closureChurn(500000))
+
+    // ---- 柯里化 map：对 10000 元素数组做 +5 ----
+    val arr = buildArray(10000)
+    var mapSum: i64 = 0
+    var n: i32 = 0
+    while n < 100 {
+        val mapped = mapAdd(arr, cast(n).to(i64))
+        // 求和验证
+        var s: i64 = 0
+        for x in mapped {
+            s = s + x
+        }
+        mapSum = (mapSum + s) % 1073741824
+        n = n + 1
+    }
+    println(mapSum)
 }

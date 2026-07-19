@@ -1,0 +1,118 @@
+// Edge cases: floating-point — zero/neg-zero, precision, IEEE 754 behavior, f32/f64/f16
+
+fun main() {
+    // ---- zero and negative zero ----
+    val pos_zero: f64 = 0.0
+    val neg_zero: f64 = -0.0
+    println(pos_zero)            // 0
+    println(neg_zero)            // -0
+    println(pos_zero == neg_zero) // true (IEEE: +0 == -0)
+    println(1.0f64 / 0.0f64)     // inf
+    println(1.0f64 / neg_zero)   // -inf
+
+    // ---- small and large magnitudes ----
+    val tiny: f64 = 0.000001
+    val huge: f64 = 1000000000.0
+    println(tiny)                // 0.000001
+    println(huge)                // 1000000000
+    println(huge + 1.0f64 == huge)  // false (within f64 precision)
+
+    // ---- f32 vs f64 precision (f64 holds more digits) ----
+    val pi64: f64 = 3.141592653589793
+    val pi32: f32 = 3.141592653589793f32
+    println(pi64)                // 3.141592653589793
+    println(pi32)                // f32 value (note: printing may differ from f64)
+
+    // ---- float arithmetic identities ----
+    val a: f64 = 1.5
+    val b: f64 = 2.5
+    println(a + b)               // 4
+    println(a - b)               // -1
+    println(a * b)               // 3.75
+    println(a / b)               // 0.6
+
+    // ---- associativity is NOT guaranteed (floating point) ----
+    val x: f64 = 0.1
+    val y: f64 = 0.2
+    val z: f64 = 0.3
+    println(x + y)               // 0.30000000000000004
+    println((x + y) + z)         // 0.6000000000000001
+    println(x + (y + z))         // 0.6 (different rounding)
+
+    // ---- division producing repeating decimals ----
+    println(1.0f64 / 3.0f64)     // 0.3333333333333333
+    println(2.0f64 / 3.0f64)     // 0.6666666666666666
+    println(1.0f64 / 7.0f64)     // 0.14285714285714285
+
+    // ---- modulo on floats (result sign follows implementation) ----
+    println(10.5f64 % 3.0f64)    // 1.5
+    println(-10.5f64 % 3.0f64)   // 1.5 (Glue: float % always non-negative)
+    println(10.5f64 % -3.0f64)   // 1.5
+
+    // ---- comparison with tolerance (approx equal) ----
+    val eps: f64 = 0.000001
+    val v1: f64 = 0.1f64 + 0.2f64
+    val v2: f64 = 0.3f64
+    println(v1 == v2)            // false (not exactly equal)
+    // manual tolerance check
+    val diff = v1 - v2
+    val abs_diff = if diff < 0.0f64 { -diff } else { diff }
+    println(abs_diff < eps)      // true
+
+    // ---- integer overflow into float domain ----
+    val big_int: i64 = 9007199254740992
+    println(cast(big_int).to(f64))        // 9007199254740992
+    val bigger: i64 = 9007199254740993
+    println(cast(bigger).to(f64))         // 9007199254740992 (precision loss!)
+
+    // ---- f64 comparison chains ----
+    println(1.0f64 < 2.0f64)    // true
+    println(2.0f64 <= 2.0f64)    // true
+    println(3.5f64 > 3.5f64)     // false
+    println(3.5f64 >= 3.5f64)    // true
+
+    // ---- negative float arithmetic ----
+    println(-1.5f64 + -2.5f64)  // -4
+    println(-1.5f64 * 2.0f64)    // -3
+    println(1.5f64 * -2.0f64)    // -3
+
+    // ---- float from division ----
+    println(7.0f64 / 2.0f64)    // 3.5
+    println(8.0f64 / 4.0f64)    // 2
+    println(1.0f64 / 4.0f64)    // 0.25
+
+    // ---- very small differences ----
+    val one: f64 = 1.0
+    val almost: f64 = 1.0f64 + 1e-16
+    println(one == almost)       // true (below f64 precision near 1.0)
+
+    // ---- f16 half precision (printing may show representation issues) ----
+    val half: f16 = 1.5f16
+    println(half)                // f16 value (1.5 stored, print may vary)
+    val half_pi: f16 = 3.14f16
+    println(half_pi)             // f16 value (3.14 stored, print may vary)
+
+    // ---- float to int truncation (toward zero) ----
+    println(cast(2.7f64).to(i32))         // 2
+    println(cast(-2.7f64).to(i32))        // -2
+    println(cast(2.0f64).to(i32))         // 2
+    println(cast(-2.0f64).to(i32))        // -2
+
+    // ---- mixed int/float arithmetic requires explicit cast ----
+    val ii: i32 = 5
+    val ff: f64 = 2.0
+    println(cast(ii).to(f64) + ff)        // 7
+    println(cast(ii).to(f64) * ff)        // 10
+
+    // ---- exponent via repeated multiply ----
+    var base: f64 = 2.0
+    var result: f64 = 1.0
+    var i = 0
+    while i < 10 {
+        result = result * base
+        i = i + 1
+    }
+    println(result)              // 1024 (2^10)
+
+    println("edge_floats_special: All tests passed!")
+}

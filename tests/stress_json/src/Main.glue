@@ -36,7 +36,7 @@ type Member = Member(key: str, value: Json)
 // 解析状态：源串 + 当前位置，用记录携带 (json结果, 下一位置)
 // ============================================================
 type ParseError: Error = ParseError(msg: str) {
-    override fun prefix(self): str { "parse error" }
+    override fun type_name(self): str { "parse error" }
 }
 
 fun isDigit(c: char): bool { c >= '0' && c <= '9' }
@@ -49,20 +49,20 @@ fun digitVal(c: char): i32 {
 
 // 跳过空白，返回下一个非空白位置
 fun skipWs(s: str, i: i32): i32 {
-    if (i >= s.len()) { i }
+    if i >= cast(s.len()).to(i32) { i }
     else {
-        val c = s[i]
-        if (c == ' ' || c == '\n' || c == '\t') { skipWs(s, i + 1) } else { i }
+        val c = s[cast(i).to(usize)]
+        if c == ' ' || c == '\n' || c == '\t' { skipWs(s, i + 1) } else { i }
     }
 }
 
 // 解析数字
 fun parseNum(s: str, i: i32): Throw<(value: i32, next: i32), Error> {
     fun go(j: i32, acc: i32): (value: i32, next: i32) {
-        if (j >= s.len()) { (value: acc, next: j) }
+        if j >= cast(s.len()).to(i32) { (value: acc, next: j) }
         else {
-            val c = s[j]
-            if (isDigit(c)) { go(j + 1, acc * 10 + digitVal(c)) } else { (value: acc, next: j) }
+            val c = s[cast(j).to(usize)]
+            if isDigit(c) { go(j + 1, acc * 10 + digitVal(c)) } else { (value: acc, next: j) }
         }
     }
     val r = go(i, 0)
@@ -72,11 +72,11 @@ fun parseNum(s: str, i: i32): Throw<(value: i32, next: i32), Error> {
 // 解析字符串字面量（已在引号后），返回内容到下一个引号
 fun parseStr(s: str, i: i32): Throw<(value: str, next: i32), Error> {
     fun go(j: i32, acc: str): (value: str, next: i32) {
-        if (j >= s.len()) { (value: acc, next: j) }
+        if j >= cast(s.len()).to(i32) { (value: acc, next: j) }
         else {
-            val c = s[j]
-            if (c == '"') { (value: acc, next: j + 1) }
-            else { go(j + 1, acc + str(c)) }
+            val c = s[cast(j).to(usize)]
+            if c == '"' { (value: acc, next: j + 1) }
+            else { go(j + 1, acc + cast(c).to(str)) }
         }
     }
     val r = go(i, "")
@@ -86,25 +86,25 @@ fun parseStr(s: str, i: i32): Throw<(value: str, next: i32), Error> {
 // 主解析：解析一个 JSON 值，返回 (json, next)
 fun parseValue(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
     val i = skipWs(s, i0)
-    if (i >= s.len()) { throw ParseError("unexpected end") }
+    if i >= cast(s.len()).to(i32) { throw ParseError("unexpected end") }
     else {
-        val c = s[i]
-        if (c == 'n') {
+        val c = s[cast(i).to(usize)]
+        if c == 'n' {
             // null
             Ok((value: JNull, next: i + 4))
-        } else if (c == 't') {
+        } else if c == 't' {
             Ok((value: JBool(true), next: i + 4))
-        } else if (c == 'f') {
+        } else if c == 'f' {
             Ok((value: JBool(false), next: i + 5))
-        } else if (c == '"') {
+        } else if c == '"' {
             val r = parseStr(s, i + 1)?
             Ok((value: JStr(r.value), next: r.next))
-        } else if (isDigit(c)) {
+        } else if isDigit(c) {
             val r = parseNum(s, i)?
             Ok((value: JNum(r.value), next: r.next))
-        } else if (c == '[') {
+        } else if c == '[' {
             parseArray(s, i + 1)
-        } else if (c == '{') {
+        } else if c == '{' {
             parseObject(s, i + 1)
         } else {
             throw ParseError("unexpected char")
@@ -116,12 +116,12 @@ fun parseValue(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
 fun parseArray(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
     fun go(i: i32, acc: List<Json>): Throw<(value: Json, next: i32), Error> {
         val j = skipWs(s, i)
-        if (j >= s.len()) { throw ParseError("unterminated array") }
+        if j >= cast(s.len()).to(i32) { throw ParseError("unterminated array") }
         else {
-            val c = s[j]
-            if (c == ']') {
+            val c = s[cast(j).to(usize)]
+            if c == ']' {
                 Ok((value: JArr(reverseL(acc)), next: j + 1))
-            } else if (c == ',') {
+            } else if c == ',' {
                 go(j + 1, acc)
             } else {
                 val r = parseValue(s, j)?
@@ -136,22 +136,22 @@ fun parseArray(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
 fun parseObject(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
     fun go(i: i32, acc: List<Member>): Throw<(value: Json, next: i32), Error> {
         val j = skipWs(s, i)
-        if (j >= s.len()) { throw ParseError("unterminated object") }
+        if j >= cast(s.len()).to(i32) { throw ParseError("unterminated object") }
         else {
-            val c = s[j]
-            if (c == '}') {
+            val c = s[cast(j).to(usize)]
+            if c == '}' {
                 Ok((value: JObj(reverseL(acc)), next: j + 1))
-            } else if (c == ',') {
+            } else if c == ',' {
                 go(j + 1, acc)
-            } else if (c == '"') {
+            } else if c == '"' {
                 // key
                 val k = parseStr(s, j + 1)?
                 val afterKey = skipWs(s, k.next)
                 // 期望 ':'
-                if (afterKey >= s.len()) { throw ParseError("expected colon") }
+                if afterKey >= cast(s.len()).to(i32) { throw ParseError("expected colon") }
                 else {
-                    val colon = s[afterKey]
-                    if (colon == ':') {
+                    val colon = s[cast(afterKey).to(usize)]
+                    if colon == ':' {
                         val v = parseValue(s, afterKey + 1)?
                         go(v.next, Cons(Member(k.value, v.value), acc))
                     } else {
@@ -172,8 +172,8 @@ fun parseObject(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
 fun showJson(j: Json): str {
     match j {
         JNull => "null"
-        JBool(b) => if (b) { "true" } else { "false" }
-        JNum(n) => str(n)
+        JBool(b) => if b { "true" } else { "false" }
+        JNum(n) => cast(n).to(str)
         JStr(s) => "\"" + s + "\""
         JArr(items) => "[" + showArr(items) + "]"
         JObj(members) => "{{" + showObj(members) + "}}"

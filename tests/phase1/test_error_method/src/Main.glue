@@ -1,5 +1,5 @@
 type FileError: Error = FileError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "file error"
     }
 }
@@ -7,4 +7,5 @@ type FileError: Error = FileError(msg: str) {
 fun main() {
     val e = FileError("test")
     println(e.message())
+    println(e.type_name())
 }

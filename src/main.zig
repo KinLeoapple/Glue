@@ -3,7 +3,7 @@
 //! 提供命令行工具，支持项目脚手架初始化（`glue init`）、
 //! 构建并运行项目（`glue run`）、以及带内存检测与运行时追踪的诊断模式（`glue debug`）。
 //! 运行流程：定位项目根 → 解析清单 → 读取入口源码 → 词法分析 → 语法分析 →
-//! 类型检查 → 寄存器式 VM 编译 → 执行，并可选地输出各阶段性能分析报告。
+//! 语义分析（sema 产出图构建元信息）→ IR 构建 → IR 优化 → 引擎执行（Glue IR 共享内存图模型）。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,39 +11,12 @@ const lexer = @import("lexer");
 const parser = @import("parser");
 const ast = @import("ast");
 const module_loader = @import("module_loader");
-const value = @import("value");
-const slab_allocator = @import("slab_allocator");
-const reg_vm = @import("reg_vm");
 const profiler = @import("profiler");
 const debug_allocator = @import("debug_allocator");
-
-/// 将运行时错误转换为面向用户的中文/英文提示，优先使用 panic 消息
-fn runtimeErrorMessage(err: anyerror, panic_message: ?[]const u8) []const u8 {
-    if (panic_message) |msg| return msg;
-    return switch (err) {
-        error.TypeMismatch => "type error: incompatible types",
-        error.UndefinedVariable => "undefined name",
-        error.ImmutableAssignment => "cannot assign to immutable binding",
-        error.NotCallable => "value is not callable",
-        error.WrongArity => "wrong number of arguments",
-        error.IndexOutOfBounds => "index out of bounds",
-        error.UnsupportedOperation => "unsupported operation",
-        error.OutOfMemory => "out of memory",
-        error.CircularDependency => "circular module dependency",
-        error.FileNotFound => "file not found",
-        error.MissingMain => "undefined entry point",
-        else => @errorName(err),
-    };
-}
-
-/// 向指定输出接口打印运行时诊断信息（文件名、位置、标签与消息）
-fn printRuntimeDiag(iface: anytype, filename: []const u8, loc: ?ast.SourceLocation, label: []const u8, msg: []const u8) void {
-    if (loc) |l| {
-        iface.print("{s}:{d}:{d}: {s}: {s}\n", .{ filename, l.line, l.column, label, msg }) catch {};
-    } else {
-        iface.print("{s}: {s}: {s}\n", .{ filename, label, msg }) catch {};
-    }
-}
+const ir = @import("ir");
+const engine = @import("engine");
+const sema = @import("sema");
+const analysis_db_mod = @import("analysis_db");
 
 /// 项目清单：名称、版本与入口文件路径
 const Manifest = struct {
@@ -56,7 +29,6 @@ const MANIFEST_NAME = "glue.toml";
 const DEFAULT_ENTRY = "src/Main.glue";
 
 var profiler_enabled: bool = false;
-var jit_disabled: bool = false;
 var prof: profiler.Profiler = .{};
 
 /// 向标准错误流打印格式化错误信息
@@ -78,8 +50,7 @@ fn printUsage(io: std.Io) void {
         \\  glue debug         Run with diagnostics (memory checking + runtime trace)
         \\
         \\Options:
-        \\  --profile          Dump full pipeline profile (phases + memory + opcodes) after run
-        \\  --no-jit           Disable JIT compilation (use interpreter only)
+        \\  --profile          Dump full pipeline profile (phases + memory) after run
         \\
     , .{});
 }
@@ -101,14 +72,9 @@ pub fn main(init: std.process.Init) !void {
         const name: ?[]const u8 = if (args_slice.len >= 3) args_slice[2] else null;
         try cmdInit(allocator, io, name);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "debug")) {
-        // 解析 run/debug 之后的选项
         for (args_slice[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--profile")) {
                 profiler_enabled = true;
-            } else if (std.mem.eql(u8, arg, "--no-jit")) {
-                jit_disabled = true;
-            } else if (std.mem.eql(u8, arg, "--jit")) {
-                // 向后兼容：JIT 现已默认启用，此选项为空操作
             } else {
                 printError(io, "error: unknown option '{s}'\n\n", .{arg});
                 printUsage(io);
@@ -241,6 +207,7 @@ fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !void {
     const main_content =
         \\fun main() {
         \\    println("Hello, Glue!")
+        \\    0
         \\}
         \\
     ;
@@ -284,241 +251,132 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
     }
 }
 
-/// 普通运行模式：使用 slab 分配器与线程缓存执行源码
-fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
-    var slab = slab_allocator.SlabAllocator.initSingleThreaded(allocator);
-    defer slab.deinit();
-    slab.startIdleRecycler(5000, 1000);
-    var cache = slab_allocator.ThreadCache.init(&slab);
-    defer cache.deinit();
-    const value_allocator = cache.allocator();
-    const loader_alloc = value_allocator;
-    var loader = module_loader.ModuleLoader.init(loader_alloc, io);
-    defer loader.deinit();
-    prof = profiler.Profiler.init(profiler_enabled, io);
-    const outcome = executeSource(loader_alloc, &loader, value_allocator, &cache, io, source, entry_path);
-    if (profiler_enabled) {
-        prof.recordSlabStats(
-            slab.live_bytes.load(.monotonic),
-            slab.reserved_bytes.load(.monotonic),
-            slab.live_peak_bytes.load(.monotonic),
-            slab.peak_bytes.load(.monotonic),
-        );
-        const cache_snap = slab.getCacheSnapshot();
-        const evict_stats = slab.getEvictStats();
-        prof.recordSlabCacheStats(
-            cache_snap.empty_count,
-            cache_snap.large_active,
-            cache_snap.large_cached,
-            evict_stats.slabs,
-            evict_stats.large,
-            evict_stats.scans,
-        );
-        const cache_stats = cache.getStats();
-        prof.recordCacheStats(cache_stats.hits, cache_stats.misses, cache_stats.refills, cache_stats.drains);
-        prof.dump(io);
-    }
-    if (outcome == .failed) {
-        loader.deinit();
-        cache.deinit();
-        slab.deinit();
-        std.process.exit(1);
-    }
-}
+/// 源码执行结果：成功或失败
+const ExecOutcome = enum { failed, ran_main };
 
-/// 诊断运行模式：使用调试分配器检测内存泄漏与双重释放
-fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
-    _ = allocator;
-    var dbg = debug_allocator.DebugAllocator.initSingleThreaded();
-    const dbg_alloc = dbg.allocator();
-    {
-        var slab = slab_allocator.SlabAllocator.initSingleThreaded(dbg_alloc);
-        defer slab.deinit();
-        slab.startIdleRecycler(5000, 1000);
-        var cache = slab_allocator.ThreadCache.init(&slab);
-        defer cache.deinit();
-        const value_allocator = cache.allocator();
-        var loader = module_loader.ModuleLoader.init(value_allocator, io);
-        defer loader.deinit();
-        prof = profiler.Profiler.init(profiler_enabled, io);
-        _ = executeSource(value_allocator, &loader, value_allocator, &cache, io, source, entry_path);
-        if (profiler_enabled) {
-            prof.recordSlabStats(
-                slab.live_bytes.load(.monotonic),
-                slab.reserved_bytes.load(.monotonic),
-                slab.live_peak_bytes.load(.monotonic),
-                slab.peak_bytes.load(.monotonic),
-            );
-            const cache_snap = slab.getCacheSnapshot();
-            const evict_stats = slab.getEvictStats();
-            prof.recordSlabCacheStats(
-                cache_snap.empty_count,
-                cache_snap.large_active,
-                cache_snap.large_cached,
-                evict_stats.slabs,
-                evict_stats.large,
-                evict_stats.scans,
-            );
-            const cache_stats = cache.getStats();
-            prof.recordCacheStats(cache_stats.hits, cache_stats.misses, cache_stats.refills, cache_stats.drains);
-            prof.dump(io);
-        }
-    }
-    const leaked = dbg.deinit();
-    if (leaked == .leak) {
-        printError(io, "[GLUE_GPA] LEAK detected\n", .{});
-    } else {
-        printError(io, "[GLUE_GPA] clean (no leak / no double-free)\n", .{});
-    }
-}
+/// 加载导入的子模块声明：扫描 import_decl，读取 pack.glue 和子模块 .glue 文件，
+/// 将 pub fun 以 "Module.Sub.fun" 的 mangled 名合并到主模块声明列表。
+/// 保留 parser/source/tokens 直到 IR 构建完成。
+fn loadImportedDeclarations(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    entry_module: *ast.Module,
+    source_filename: []const u8,
+    retained_parsers: *std.ArrayList(*parser.Parser),
+    retained_sources: *std.ArrayList([]const u8),
+    retained_tokens: *std.ArrayList([]lexer.Token),
+) !void {
+    var extra_decls = std.ArrayList(ast.Decl).empty;
+    defer extra_decls.deinit(allocator);
 
-/// VM 执行结果：成功执行 main 或失败
-const VmOutcome = enum { ran_main, failed };
+    // 获取源文件所在目录
+    const source_dir = std.fs.path.dirname(source_filename) orelse "";
+    const source_dir_with_sep = if (source_dir.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}{c}", .{ source_dir, std.fs.path.sep })
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(source_dir_with_sep);
 
-/// 检查模块是否包含 main 函数（VM 执行的入口条件）
-fn vmEligible(module: ast.Module) bool {
-    for (module.declarations) |decl| {
+    const cwd = std.Io.Dir.cwd();
+
+    for (entry_module.declarations) |decl| {
         switch (decl) {
-            .fun_decl => |f| {
-                if (std.mem.eql(u8, f.name, "main")) return true;
+            .import_decl => |imp| {
+                if (imp.module_path.len == 0) continue;
+                const module_name = imp.module_path[0];
+
+                // 读取 pack.glue
+                const pack_path = try std.fmt.allocPrint(allocator, "{s}{s}{c}pack.glue", .{ source_dir_with_sep, module_name, std.fs.path.sep });
+                defer allocator.free(pack_path);
+                const pack_src = cwd.readFileAlloc(io, pack_path, allocator, .unlimited) catch continue;
+                defer allocator.free(pack_src);
+
+                // 解析 pack.glue
+                var pack_lex = lexer.Lexer.init(allocator, pack_src);
+                defer pack_lex.deinit();
+                const pack_tokens = pack_lex.tokenize() catch continue;
+                defer allocator.free(pack_tokens);
+                var pack_parser = parser.Parser.init(allocator, pack_tokens);
+                defer pack_parser.deinit();
+                const pack_module = pack_parser.parseModule("pack") catch continue;
+
+                // 查找子模块名
+                for (pack_module.declarations) |pack_decl| {
+                    switch (pack_decl) {
+                        .pack_decl => |pd| {
+                            const sub_name = pd.name;
+
+                            // 读取子模块文件
+                            const sub_path = try std.fmt.allocPrint(allocator, "{s}{s}{c}{s}.glue", .{ source_dir_with_sep, module_name, std.fs.path.sep, sub_name });
+                            defer allocator.free(sub_path);
+                            const sub_src = cwd.readFileAlloc(io, sub_path, allocator, .unlimited) catch continue;
+
+                            // 词法分析
+                            var sub_lex = lexer.Lexer.init(allocator, sub_src);
+                            const sub_tokens = sub_lex.tokenize() catch {
+                                allocator.free(sub_src);
+                                continue;
+                            };
+
+                            // 语法分析
+                            const sub_parser_ptr = try allocator.create(parser.Parser);
+                            sub_parser_ptr.* = parser.Parser.init(allocator, sub_tokens);
+                            const sub_module = sub_parser_ptr.parseModule(sub_name) catch {
+                                sub_parser_ptr.deinit();
+                                allocator.destroy(sub_parser_ptr);
+                                allocator.free(sub_tokens);
+                                allocator.free(sub_src);
+                                continue;
+                            };
+
+                            // 保留资源
+                            try retained_parsers.append(allocator, sub_parser_ptr);
+                            try retained_sources.append(allocator, sub_src);
+                            try retained_tokens.append(allocator, sub_tokens);
+
+                            // 收集 pub fun 声明，重命名为 Module.Sub.fun
+                            for (sub_module.declarations) |sub_decl| {
+                                switch (sub_decl) {
+                                    .fun_decl => |fd| {
+                                        if (fd.visibility == .public) {
+                                            const mangled_name = try std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ module_name, sub_name, fd.name });
+                                            var new_fd = fd;
+                                            new_fd.name = mangled_name;
+                                            new_fd.visibility = .private;
+                                            try extra_decls.append(allocator, .{ .fun_decl = new_fd });
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
             },
             else => {},
         }
     }
-    return false;
+
+    // 合并声明到主模块
+    if (extra_decls.items.len > 0) {
+        const combined = try allocator.alloc(ast.Decl, entry_module.declarations.len + extra_decls.items.len);
+        @memcpy(combined[0..entry_module.declarations.len], entry_module.declarations);
+        @memcpy(combined[entry_module.declarations.len..], extra_decls.items);
+        entry_module.declarations = combined;
+    }
 }
 
-/// 尝试在寄存器式 VM 上执行模块：类型检查 → 依赖收集 → 编译 → 运行
-fn tryRunOnVM(
-    allocator: std.mem.Allocator,
-    loader: *module_loader.ModuleLoader,
-    value_allocator: std.mem.Allocator,
-    cache: ?*slab_allocator.ThreadCache,
-    io: std.Io,
-    module: ast.Module,
-    filename: []const u8,
-) VmOutcome {
-    if (!vmEligible(module)) {
-        printError(io, "{s}: error: no 'main' function found\n", .{filename});
-        return .failed;
-    }
-    prof.phaseBegin(.type_check);
-    loader.prepareModule(module) catch |err| switch (err) {
-        error.TypeCheckFailed => {
-            prof.phaseEnd();
-            return .failed;
-        },
-        error.CircularDependency => {
-            prof.phaseEnd();
-            printError(io, "{s}: error: circular module dependency\n", .{filename});
-            return .failed;
-        },
-        else => {
-            prof.phaseEnd();
-            printError(io, "{s}: error: preparation failed: {s}\n", .{ filename, @errorName(err) });
-            return .failed;
-        },
-    };
-    prof.phaseEnd();
-    var rmc = reg_vm.RegModuleCompiler.init(allocator);
-    rmc.analysis_db = &loader.analysis_db;
-    defer rmc.deinit();
-    defer rmc.program.deinit();
-    if (module.source_path) |sp| {
-        const sep_idx = std.mem.lastIndexOfScalar(u8, sp, std.fs.path.sep) orelse
-            std.mem.lastIndexOfScalar(u8, sp, '/');
-        if (sep_idx) |idx| loader.setSourceDir(sp[0..idx]) catch {};
-    }
-    var deps = std.ArrayList(ast.Module).empty;
-    defer deps.deinit(allocator);
-    var seen = std.StringHashMap(void).init(allocator);
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |k| allocator.free(k.*);
-        seen.deinit();
-    }
-    loader.collectDependencies(module, &deps, &seen) catch |err| {
-        printError(io, "{s}: error: dependency collection failed: {s}\n", .{ filename, @errorName(err) });
-        return .failed;
-    };
-    prof.phaseBegin(.compile);
-    rmc.compileModuleWithDeps(&module, deps.items) catch |err| {
-        prof.phaseEnd();
-        printError(io, "{s}: error: reg-vm compilation failed: {s}\n", .{ filename, @errorName(err) });
-        return .failed;
-    };
-    prof.phaseEnd();
-    const entry = rmc.lookupFn("main") orelse {
-        printError(io, "{s}: error: 'main' function not found after compilation\n", .{filename});
-        return .failed;
-    };
-    return runProgram(value_allocator, cache, io, &rmc.program, entry, filename);
-}
-
-/// 在寄存器式 VM 上执行已编译的程序，处理运行时 panic 与未捕获错误
-fn runProgram(
-    value_allocator: std.mem.Allocator,
-    cache: ?*slab_allocator.ThreadCache,
-    io: std.Io,
-    program: *const reg_vm.reg_chunk_mod.RegProgram,
-    entry: u16,
-    filename: []const u8,
-) VmOutcome {
-    var machine = if (cache) |c| reg_vm.reg_vm.RegVM.initWithCache(c, io) else reg_vm.reg_vm.RegVM.initWithIo(value_allocator, io);
-    defer machine.deinit();
-    if (profiler_enabled) {
-        machine.setProfiler(&prof);
-        prof.setOpcodeNameFn(reg_vm.reg_opcode.opName);
-    }
-    if (!jit_disabled) {
-        machine.enableJit();
-    }
-    prof.phaseBegin(.vm);
-    const result = machine.call(program, entry, &.{}) catch |err| {
-        prof.phaseEnd();
-        const msg = machine.err_msg orelse runtimeErrorMessage(@as(anyerror, err), null);
-        const loc: ?ast.SourceLocation = if (machine.err_loc.line > 0) machine.err_loc else null;
-        var err_buf: [4096]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
-        printRuntimeDiag(&stderr_writer.interface, filename, loc, "runtime panic", msg);
-        stderr_writer.flush() catch {};
-        if (profiler_enabled) {
-            prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
-        }
-        return .failed;
-    };
-    prof.phaseEnd();
-    if (profiler_enabled) {
-        prof.recordMemoStats(machine.memo_cache.count(), machine.memo_disabled_slots.count());
-    }
-    if (result == .throw_val) {
-        const throw_val = result.throw_val.payload;
-        switch (throw_val) {
-            .err => |e| {
-                std.debug.print("Uncaught error: {s}\n", .{e.message});
-                result.release(value_allocator);
-                return .failed;
-            },
-            .ok => {},
-        }
-    }
-    result.release(value_allocator);
-    return .ran_main;
-}
-
-/// 源码执行结果：成功或失败
-const ExecOutcome = enum { failed, ran_main };
-
-/// 完整执行管线：词法分析 → 语法分析 → VM 执行
+/// 完整执行管线：词法分析 → 语法分析 → IR 构建 → IR 优化 → 引擎执行
 fn executeSource(
     allocator: std.mem.Allocator,
     loader: *module_loader.ModuleLoader,
-    value_allocator: std.mem.Allocator,
-    cache: ?*slab_allocator.ThreadCache,
     io: std.Io,
     source: []const u8,
     filename: []const u8,
 ) ExecOutcome {
+    _ = loader; // module_loader 暂未接入新流水线（单文件模式）
+
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
     prof.phaseBegin(.lex);
@@ -532,6 +390,7 @@ fn executeSource(
     };
     prof.phaseEnd();
     defer allocator.free(tokens);
+
     var p = parser.Parser.init(allocator, tokens);
     defer p.deinit();
     prof.phaseBegin(.parse);
@@ -548,9 +407,216 @@ fn executeSource(
     prof.phaseEnd();
     var entry_module = module;
     entry_module.source_path = filename;
-    switch (tryRunOnVM(allocator, loader, value_allocator, cache, io, entry_module, filename)) {
-        .ran_main => return .ran_main,
-        .failed => return .failed,
+
+    // 加载导入的子模块声明（多模块支持）
+    var retained_parsers = std.ArrayList(*parser.Parser).empty;
+    defer {
+        for (retained_parsers.items) |*rp| {
+            rp.*.deinit();
+            allocator.destroy(rp.*);
+        }
+        retained_parsers.deinit(allocator);
+    }
+    var retained_sources = std.ArrayList([]const u8).empty;
+    defer {
+        for (retained_sources.items) |s| allocator.free(s);
+        retained_sources.deinit(allocator);
+    }
+    var retained_tokens = std.ArrayList([]lexer.Token).empty;
+    defer {
+        for (retained_tokens.items) |t| allocator.free(t);
+        retained_tokens.deinit(allocator);
+    }
+    loadImportedDeclarations(allocator, io, &entry_module, filename, &retained_parsers, &retained_sources, &retained_tokens) catch {};
+
+    // sema 阶段（语义分析 + 图构建元信息产出）
+    // TypeInferencer.checkModule 推断所有表达式类型并记录到 SemaResult.expr_types，
+    // 供 IRBuilder 在图构建时读取（驱动式接入：sema 驱动 IR 构建）。
+    // 硬失败：sema 检出任何类型错误则打印并终止管线，不进入 IR 构建。
+    prof.phaseBegin(.type_check);
+    var sema_result = ir.SemaResult.init(allocator);
+    defer sema_result.deinit();
+    {
+        var inferencer = sema.TypeInferencer.init(allocator);
+        defer inferencer.deinit();
+        inferencer.setSemaResult(&sema_result);
+        inferencer.checkModule(&entry_module);
+        if (inferencer.errors.items.len > 0) {
+            var err_buf: [4096]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
+            for (inferencer.errors.items) |e| {
+                stderr_writer.interface.print("{s}:{d}:{d}: sema error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
+            }
+            stderr_writer.flush() catch {};
+            prof.phaseEnd();
+            return .failed;
+        }
+    }
+    prof.phaseEnd();
+
+    // IR 构建阶段（AST → Glue IR 共享内存图）
+    prof.phaseBegin(.ir_build);
+    var builder = ir.IRBuilder.init(allocator) catch |err| {
+        prof.phaseEnd();
+        printError(io, "{s}: IR builder init error: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
+    };
+    // 注入 sema 产出的类型映射，驱动图构建（通道宽度由 sema 类型决定）
+    builder.setSemaResult(&sema_result);
+    // 运行纯度分析（fused_analysis）并注入 IRBuilder，驱动 memoization slot 分配
+    // 纯函数 + 标量参数/返回 → compileCall 分配 memo_slot，Engine 运行时缓存结果
+    var analysis_db = analysis_db_mod.AnalysisDB.init(allocator);
+    defer analysis_db.deinit();
+    {
+        var fused = analysis_db_mod.FusedAnalysis.init(
+            allocator,
+            &analysis_db.const_prop,
+            &analysis_db.loop_invariant,
+            &analysis_db.purity,
+            &analysis_db.hoist_table,
+            &analysis_db.dead_code,
+            &analysis_db.cse,
+            &analysis_db.escape,
+            &analysis_db.param_escape,
+        );
+        defer fused.deinit();
+        fused.analyzeModule(&entry_module) catch |err| {
+            printError(io, "fused analysis error: {s}\n", .{@errorName(err)});
+        };
+    }
+    builder.setPurityDB(&analysis_db.purity);
+    builder.setEscapeTable(&analysis_db.escape);
+    var glue_ir = builder.build(entry_module) catch |err| {
+        prof.phaseEnd();
+        printError(io, "{s}: IR build error: {s}\n", .{ filename, @errorName(err) });
+        builder.deinit();
+        return .failed;
+    };
+    // build() 成功后 arena 所有权转交 glue_ir，builder.deinit() 不再释放 arena
+    builder.deinit();
+    defer glue_ir.deinit();
+    prof.phaseEnd();
+
+    // IR 优化阶段（常量折叠 + 死节点消除 + 向量融合 + 通道活跃性）
+    prof.phaseBegin(.ir_optimize);
+    _ = ir.optimize(&glue_ir);
+    prof.phaseEnd();
+
+    // 引擎执行阶段
+    prof.phaseBegin(.engine_run);
+    var eng = engine.Engine.initOwned(&glue_ir, allocator) catch |err| {
+        prof.phaseEnd();
+        printError(io, "{s}: engine init error: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
+    };
+    defer eng.deinit();
+    eng.io = io; // 注入 IO 接口供内置 print/println 使用
+
+    const result = eng.run() catch |err| {
+        prof.phaseEnd();
+        printError(io, "{s}: execution error: {s}\n", .{ filename, @errorName(err) });
+        return .failed;
+    };
+
+    // 输出 main 函数返回值（unit/null 类型不打印）
+    const ret_chan_type = glue_ir.channels.get(eng.result_chan).chan_type;
+    if (ret_chan_type != .unit_chan and ret_chan_type != .null_chan) {
+        var out_buf: [256]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
+        stdout_writer.interface.print("{d}\n", .{result}) catch {};
+        stdout_writer.flush() catch {};
+    }
+    prof.phaseEnd();
+
+    return .ran_main;
+}
+
+/// 普通运行模式：使用 c_allocator 在大栈线程中执行源码
+fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
+    var loader = module_loader.ModuleLoader.init(allocator, io);
+    defer loader.deinit();
+    prof = profiler.Profiler.init(profiler_enabled, io);
+
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        loader: *module_loader.ModuleLoader,
+        io: std.Io,
+        source: []const u8,
+        entry_path: []const u8,
+        outcome: ExecOutcome = .failed,
+    };
+    var ctx = Ctx{
+        .allocator = allocator,
+        .loader = &loader,
+        .io = io,
+        .source = source,
+        .entry_path = entry_path,
+    };
+
+    if (std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 * 1024 }, struct {
+        fn run(c: *Ctx) void {
+            c.outcome = executeSource(c.allocator, c.loader, c.io, c.source, c.entry_path);
+        }
+    }.run, .{&ctx})) |thread| {
+        thread.join();
+    } else |_| {
+        ctx.outcome = executeSource(allocator, &loader, io, source, entry_path);
+    }
+
+    if (profiler_enabled) {
+        prof.dump(io);
+    }
+    if (ctx.outcome == .failed) {
+        loader.deinit();
+        std.process.exit(1);
+    }
+}
+
+/// 诊断运行模式：使用调试分配器在大栈线程中检测内存泄漏与双重释放
+fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
+    _ = allocator;
+    var dbg = debug_allocator.DebugAllocator.initSingleThreaded();
+    const dbg_alloc = dbg.allocator();
+    {
+        var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
+        defer loader.deinit();
+        prof = profiler.Profiler.init(profiler_enabled, io);
+
+        const Ctx = struct {
+            allocator: std.mem.Allocator,
+            loader: *module_loader.ModuleLoader,
+            io: std.Io,
+            source: []const u8,
+            entry_path: []const u8,
+            outcome: ExecOutcome = .failed,
+        };
+        var ctx = Ctx{
+            .allocator = dbg_alloc,
+            .loader = &loader,
+            .io = io,
+            .source = source,
+            .entry_path = entry_path,
+        };
+
+        if (std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 * 1024 }, struct {
+            fn run(c: *Ctx) void {
+                c.outcome = executeSource(c.allocator, c.loader, c.io, c.source, c.entry_path);
+            }
+        }.run, .{&ctx})) |thread| {
+            thread.join();
+        } else |_| {
+            ctx.outcome = executeSource(dbg_alloc, &loader, io, source, entry_path);
+        }
+
+        if (profiler_enabled) {
+            prof.dump(io);
+        }
+    }
+    const leaked = dbg.deinit();
+    if (leaked == .leak) {
+        printError(io, "[GLUE_GPA] LEAK detected\n", .{});
+    } else {
+        printError(io, "[GLUE_GPA] clean (no leak / no double-free)\n", .{});
     }
 }
 

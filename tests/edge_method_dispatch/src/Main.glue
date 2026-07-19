@@ -6,13 +6,13 @@ trait Label {
 
 type Pt: Label = Pt(x: i32, y: i32) {
     fun label(self): str {
-        "Pt(" + str(self.x) + "," + str(self.y) + ")"
+        "Pt(" + cast(self.x).to(str) + "," + cast(self.y).to(str) + ")"
     }
 }
 
 type Box: Label = Box(items: i32[]) {
     fun label(self): str {
-        "Box(" + str(self.items.len()) + " items)"
+        "Box(" + cast(self.items.len()).to(str) + " items)"
     }
 }
 

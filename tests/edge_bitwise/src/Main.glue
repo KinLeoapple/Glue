@@ -1,0 +1,108 @@
+// Edge cases: bitwise ops — shift, masks, sign-extension, precedence, mixed widths
+// Note: shift operands must have matching types; use explicit suffixes or typed vars.
+
+fun main() {
+    // ---- all-zero and all-one patterns (use typed vars to avoid inference surprises) ----
+    val zero: u8 = 0
+    val ff: u8 = 0xFF
+    val aa: u8 = 0xAA
+    println(zero & ff)          // 0
+    println(ff & zero)          // 0
+    println(ff | zero)          // 255
+    println(ff & ff)             // 255
+    println(aa ^ aa)            // 0
+    println(ff ^ zero)          // 255
+
+    // ---- bitwise complement: ~ promotes to signed ----
+    val u8zero: u8 = 0
+    val u8ff: u8 = 0xFF
+    println(~u8zero)            // -1 (~0 in signed)
+    println(~u8ff)              // -256 (~255 in signed)
+    val i8zero: i8 = 0
+    val i8seven: i8 = 7
+    val i8neg1: i8 = -1
+    println(~i8zero)            // -1
+    println(~i8seven)           // -8
+    println(~i8neg1)            // 0
+
+    // ---- shifts: left multiply / right divide (operands must match types) ----
+    println(1 << 0)            // 1
+    println(1 << 4)            // 16
+    println(256i32 >> 4i32)    // 16
+    println(255i32 >> 0i32)   // 255
+    println(0i32 << 100i32)   // 0
+
+    // ---- shift by zero ----
+    println(100i32 << 0i32)    // 100
+    println(100i32 >> 0i32)    // 100
+
+    // ---- shift then mask ----
+    println((0xFFi32 << 4i32) & 0xFF0i32)   // 4080
+    println((0xABi32 >> 4i32) & 0x0Fi32)   // 10
+
+    // ---- extract nibble using shift+mask ----
+    val b: u8 = 0xA5
+    val nibble_mask: u8 = 0x0F
+    val shift4: u8 = 4
+    println((b >> shift4) & nibble_mask)   // 10 (high nibble)
+    println(b & nibble_mask)          // 5 (low nibble)
+
+    // ---- set/clear/toggle bit via masks ----
+    val base: u8 = 0
+    val one: u8 = 0b0001
+    val set = base | one
+    println(set)               // 1
+    val toggled = set ^ one
+    println(toggled)           // 0
+
+    // ---- signed right shift (arithmetic) ----
+    println((-16i8) >> 2i8)    // -4
+    println((-128i8) >> 1i8)   // -64
+
+    // ---- operator precedence: shifts lower than arithmetic ----
+    println(1 + 2 << 3)        // (1+2)<<3 = 24
+    println(2 << 3 + 1)        // 2<<(3+1) = 32
+
+    // ---- precedence: & higher than ^ higher than | ----
+    println(0xF0i32 | (0x0Fi32 & 0xF0i32))   // 0xF0 | (0x0F & 0xF0) = 240
+    println(0xFFi32 ^ (0x0Fi32 & 0xF0i32))    // 0xFF ^ (0x0F & 0xF0) = 255
+
+    // ---- comparison higher than bitwise ----
+    println((5i32 & 3i32) == 1i32)      // (5&3)=1, 1==1 => true
+
+    // ---- XOR swap idiom ----
+    var x: i32 = 10
+    var y: i32 = 20
+    x = x ^ y
+    y = x ^ y
+    x = x ^ y
+    println(x)                  // 20
+    println(y)                  // 10
+
+    // ---- power of two via shift ----
+    var p = 1i32
+    var i = 0i32
+    while i < 6i32 {
+        println(p)
+        p = p << 1i32
+        i = i + 1i32
+    }
+    // 1, 2, 4, 8, 16, 32
+
+    // ---- check even/odd via & 1 ----
+    println(7i32 & 1i32)              // 1 (odd)
+    println(8i32 & 1i32)              // 0 (even)
+
+    // ---- byte extraction from u32 ----
+    val v: u32 = 0x12345678
+    println(v & 0xFFu32)              // 0x78 = 120
+    println((v >> 8u32) & 0xFFu32)      // 0x56 = 86
+    println((v >> 16u32) & 0xFFu32)     // 0x34 = 52
+    println((v >> 24u32) & 0xFFu32)      // 0x12 = 18
+
+    // ---- byte assembly via shifts ----
+    val assembled = (cast(0x12).to(u32) << 24u32) | (cast(0x34).to(u32) << 16u32) | (cast(0x56).to(u32) << 8u32) | cast(0x78).to(u32)
+    println(assembled)             // 305419896 (0x12345678)
+
+    println("edge_bitwise: All tests passed!")
+}

@@ -27,22 +27,22 @@ fun main() {
     println(c + d)          // 255, exactly max
 
     // ---- division and modulo with negatives (truncated: rem follows dividend) ----
-    println(-7 / 2)         // -3 (truncation toward zero)
-    println(-7 % 2)         // -1 (sign of dividend)
-    println(7 % -2)         // 1
-    println(-7 % -2)        // -1
-    println(7 / -2)         // -3
+    println(-7i32 / 2i32)         // -3 (truncation toward zero)
+    println(-7i32 % 2i32)         // -1 (sign of dividend)
+    println(7i32 % -2i32)         // 1
+    println(-7i32 % -2i32)        // -1
+    println(7i32 / -2i32)         // -3
 
     // ---- modulo identity: (a/b)*b + a%b == a ----
-    val x = -17
-    val y = 5
+    val x: i32 = -17
+    val y: i32 = 5
     println((x / y) * y + (x % y))   // -17
 
     // ---- bitwise on full-width patterns ----
-    println(0xFF & 0x0F)    // 15
-    println(0xF0 | 0x0F)    // 255
-    println(0xAA ^ 0xFF)    // 85
-    println(0b1100 & 0b1010) // 8
+    println(0xFFu32 & 0x0Fu32)    // 15
+    println(0xF0u32 | 0x0Fu32)    // 255
+    println(0xAAu32 ^ 0xFFu32)    // 85
+    println(0b1100u32 & 0b1010u32) // 8
 
     // ---- mixed-base literals with underscores ----
     println(1_000_000)
@@ -52,19 +52,19 @@ fun main() {
 
     // ---- narrowing conversions in valid range ----
     val big: i64 = 1000
-    println(i8(i64(100)))   // 100
-    println(i16(big))       // 1000
-    println(u8(big % 256))  // 232
+    println(cast(cast(100).to(i64)).to(i8))   // 100
+    println(cast(big).to(i16))       // 1000
+    println(cast(big % 256).to(u8))  // 232
 
     // ---- widening conversions ----
     val small: i8 = -5
-    println(i64(small))     // -5
-    println(i32(small))     // -5
+    println(cast(small).to(i64))     // -5
+    println(cast(small).to(i32))     // -5
 
     // ---- int -> float and back ----
-    println(f64(42))        // 42
-    println(i32(f64(42)))   // 42
-    println(f64(-128i8))    // -128
+    println(cast(42).to(f64))        // 42
+    println(cast(cast(42).to(f64)).to(i32))   // 42
+    println(cast(-128i8).to(f64))    // -128
 
     // ---- float precision boundaries ----
     val pi: f64 = 3.141592653589793

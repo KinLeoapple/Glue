@@ -4,7 +4,6 @@
 //! 同时配置各模块的单元测试并聚合到 `test` 步骤。
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 /// 构建入口：配置目标、优化级别、模块依赖、可执行产物与测试步骤
 pub fn build(b: *std.Build) void {
@@ -13,29 +12,24 @@ pub fn build(b: *std.Build) void {
 
     // ---- 前端核心模块：AST、词法分析器、语法分析器 ----
     const ast_module = b.createModule(.{
-        .root_source_file = b.path("src/ast.zig"),
+        .root_source_file = b.path("src/parse/ast.zig"),
         .target = target,
         .optimize = optimize,
     });
     const lexer_module = b.createModule(.{
-        .root_source_file = b.path("src/lexer.zig"),
+        .root_source_file = b.path("src/parse/lexer.zig"),
         .target = target,
         .optimize = optimize,
     });
     const parser_module = b.createModule(.{
-        .root_source_file = b.path("src/parser.zig"),
+        .root_source_file = b.path("src/parse/parser.zig"),
         .target = target,
         .optimize = optimize,
     });
     parser_module.addImport("ast", ast_module);
     parser_module.addImport("lexer", lexer_module);
 
-    // ---- 内存管理模块：分配器 ----
-    const slab_allocator_module = b.createModule(.{
-        .root_source_file = b.path("src/mem/slab_allocator.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // ---- 内存管理模块 ----
     const profiler_module = b.createModule(.{
         .root_source_file = b.path("src/profiling/profiler.zig"),
         .target = target,
@@ -53,12 +47,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     debug_allocator_module.addImport("sync", sync_module);
-    const arena_allocator_module = b.createModule(.{
-        .root_source_file = b.path("src/mem/arena_allocator.zig"),
+
+    // ---- 内存管理模块入口 ----
+    const mem_module = b.createModule(.{
+        .root_source_file = b.path("src/mem/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
-    parser_module.addImport("arena_allocator", arena_allocator_module);
+    mem_module.addImport("sync", sync_module);
 
     // ---- 值系统模块：依赖并发原语 ----
     const value_module = b.createModule(.{
@@ -68,8 +64,7 @@ pub fn build(b: *std.Build) void {
     });
     value_module.addImport("ast", ast_module);
     value_module.addImport("sync", sync_module);
-    slab_allocator_module.addImport("value", value_module);
-    slab_allocator_module.addImport("sync", sync_module);
+    value_module.addImport("mem", mem_module);
 
     // ---- 语义分析模块族：分析数据库与各类检查器 ----
     const analysis_db_module = b.createModule(.{
@@ -78,12 +73,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     analysis_db_module.addImport("ast", ast_module);
+
+    // ---- Builtin 元信息模块：集中管理 builtin 类型字段布局（sema 与 ir 共用） ----
+    // 注意：import 名取 "glue_builtin" 避免与 Zig 标准内建模块 "builtin" 冲突
+    const builtin_module = b.createModule(.{
+        .root_source_file = b.path("src/builtin.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const type_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/type_check.zig"),
         .target = target,
         .optimize = optimize,
     });
     type_check_module.addImport("ast", ast_module);
+    type_check_module.addImport("glue_builtin", builtin_module);
     const subtype_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/subtype_check.zig"),
         .target = target,
@@ -121,16 +125,9 @@ pub fn build(b: *std.Build) void {
     });
     module_check_module.addImport("ast", ast_module);
 
-    // ---- 标准库模块 ----
-    const stdlib_module = b.createModule(.{
-        .root_source_file = b.path("src/stdlib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // ---- 模块加载器：串联前端、语义分析与标准库 ----
+    // ---- 模块加载器：串联前端与语义分析 ----
     const module_loader_module = b.createModule(.{
-        .root_source_file = b.path("src/loader/module_loader.zig"),
+        .root_source_file = b.path("src/parse/module_loader.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -138,46 +135,7 @@ pub fn build(b: *std.Build) void {
     module_loader_module.addImport("lexer", lexer_module);
     module_loader_module.addImport("parser", parser_module);
     module_loader_module.addImport("sema", type_check_module);
-    module_loader_module.addImport("stdlib", stdlib_module);
     module_loader_module.addImport("analysis_db", analysis_db_module);
-    module_loader_module.addImport("arena_allocator", arena_allocator_module);
-
-    // ---- 虚拟机模块：共享层与寄存器式编译器 ----
-    const shared_module = b.createModule(.{
-        .root_source_file = b.path("src/vm/shared/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    shared_module.addImport("ast", ast_module);
-    shared_module.addImport("value", value_module);
-    const reg_vm_module = b.createModule(.{
-        .root_source_file = b.path("src/vm/reg/compiler.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    reg_vm_module.addImport("ast", ast_module);
-    reg_vm_module.addImport("value", value_module);
-    reg_vm_module.addImport("lexer", lexer_module);
-    reg_vm_module.addImport("parser", parser_module);
-    reg_vm_module.addImport("profiler", profiler_module);
-    reg_vm_module.addImport("analysis_db", analysis_db_module);
-    reg_vm_module.addImport("slab_allocator", slab_allocator_module);
-    reg_vm_module.addImport("debug_allocator", debug_allocator_module);
-    reg_vm_module.addImport("arena_allocator", arena_allocator_module);
-    reg_vm_module.addImport("shared", shared_module);
-
-    // ---- JIT 编译器模块 ----
-    const jit_module = b.createModule(.{
-        .root_source_file = b.path("src/jit/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    jit_module.addImport("value", value_module);
-    jit_module.addImport("ast", ast_module);
-    jit_module.addImport("reg_vm", reg_vm_module);
-    // 循环依赖：reg_vm 需要 jit 模块来集成 JIT 加速
-    // Zig 的惰性编译可以正确处理这种循环导入
-    reg_vm_module.addImport("jit", jit_module);
 
     // ---- 语义分析模块间的交叉依赖：子检查器引用主类型检查器 ----
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -192,6 +150,37 @@ pub fn build(b: *std.Build) void {
     kind_check_module.addImport("type_check", type_check_module);
     gadt_check_module.addImport("type_check", type_check_module);
 
+    // ---- Glue IR 模块（新架构：共享内存图） ----
+    const ir_module = b.createModule(.{
+        .root_source_file = b.path("src/ir/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ir_module.addImport("ast", ast_module);
+    ir_module.addImport("value", value_module);
+    ir_module.addImport("analysis_db", analysis_db_module);
+    ir_module.addImport("glue_builtin", builtin_module);
+
+    // ---- sema 模块接入 IR 管线：type_check 及子检查器可读取 SemaResult 契约 ----
+    // 依赖方向：sema → ir → (ast, value)，ir 不依赖 sema，无循环。
+    type_check_module.addImport("ir", ir_module);
+    subtype_check_module.addImport("ir", ir_module);
+    throw_check_module.addImport("ir", ir_module);
+    trait_resolve_module.addImport("ir", ir_module);
+    kind_check_module.addImport("ir", ir_module);
+    gadt_check_module.addImport("ir", ir_module);
+    module_check_module.addImport("ir", ir_module);
+
+    // ---- 执行引擎模块（后端：接收 GlueIR 执行） ----
+    const engine_module = b.createModule(.{
+        .root_source_file = b.path("src/engine/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    engine_module.addImport("ir", ir_module);
+    engine_module.addImport("mem", mem_module);
+    engine_module.addImport("value", value_module);
+
     // ---- 根模块：聚合所有依赖，产出可执行文件 ----
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -203,31 +192,19 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("parser", parser_module);
     root_module.addImport("module_loader", module_loader_module);
     root_module.addImport("value", value_module);
-    root_module.addImport("slab_allocator", slab_allocator_module);
     root_module.addImport("profiler", profiler_module);
-    root_module.addImport("reg_vm", reg_vm_module);
     root_module.addImport("sema", type_check_module);
     root_module.addImport("debug_allocator", debug_allocator_module);
-    root_module.addImport("arena_allocator", arena_allocator_module);
-    root_module.addImport("jit", jit_module);
+    root_module.addImport("ir", ir_module);
+    root_module.addImport("engine", engine_module);
+    root_module.addImport("analysis_db", analysis_db_module);
 
     const exe = b.addExecutable(.{
         .name = "glue",
         .root_module = root_module,
     });
     exe.root_module.linkSystemLibrary("c", .{});
-    // 按架构分目录安装，避免多架构交叉编译时互相覆盖
-    const arch_dir = switch (target.result.cpu.arch) {
-        .aarch64 => "aarch64",
-        .x86_64 => "x86_64",
-        .riscv64 => "riscv64",
-        .riscv32 => "riscv32",
-        else => "unknown",
-    };
-    const install_step = b.addInstallArtifact(exe, .{
-        .dest_dir = .{ .override = .{ .custom = arch_dir } },
-    });
-    b.getInstallStep().dependOn(&install_step.step);
+    b.installArtifact(exe);
 
     // ---- 单元测试：为每个需要测试的模块创建测试产物 ----
     const lexer_unit_tests = b.addTest(.{
@@ -246,18 +223,6 @@ pub fn build(b: *std.Build) void {
         .root_module = module_check_module,
     });
     const run_module_check_unit_tests = b.addRunArtifact(module_check_unit_tests);
-    const slab_allocator_unit_tests = b.addTest(.{
-        .root_module = slab_allocator_module,
-    });
-    const run_slab_allocator_unit_tests = b.addRunArtifact(slab_allocator_unit_tests);
-    const stdlib_unit_tests = b.addTest(.{
-        .root_module = stdlib_module,
-    });
-    const run_stdlib_unit_tests = b.addRunArtifact(stdlib_unit_tests);
-    const reg_vm_unit_tests = b.addTest(.{
-        .root_module = reg_vm_module,
-    });
-    const run_reg_vm_unit_tests = b.addRunArtifact(reg_vm_unit_tests);
     const analysis_db_unit_tests = b.addTest(.{
         .root_module = analysis_db_module,
     });
@@ -266,14 +231,34 @@ pub fn build(b: *std.Build) void {
         .root_module = debug_allocator_module,
     });
     const run_debug_allocator_unit_tests = b.addRunArtifact(debug_allocator_unit_tests);
-    const arena_allocator_unit_tests = b.addTest(.{
-        .root_module = arena_allocator_module,
+
+    // builtin 元信息表单元测试
+    const builtin_unit_tests = b.addTest(.{
+        .root_module = builtin_module,
     });
-    const run_arena_allocator_unit_tests = b.addRunArtifact(arena_allocator_unit_tests);
-    const jit_unit_tests = b.addTest(.{
-        .root_module = jit_module,
-    });
-    const run_jit_unit_tests = b.addRunArtifact(jit_unit_tests);
+    const run_builtin_unit_tests = b.addRunArtifact(builtin_unit_tests);
+
+    // 内存管理新模块测试（page_pool/buddy/channel_region/shadow_arena/global_pool/thread_ctx）
+    const mem_test_modules = [_]struct { name: []const u8, file: []const u8, need_sync: bool }{
+        .{ .name = "page_pool", .file = "src/mem/page_pool.zig", .need_sync = false },
+        .{ .name = "buddy", .file = "src/mem/buddy.zig", .need_sync = true },
+        .{ .name = "channel_region", .file = "src/mem/channel_region.zig", .need_sync = false },
+        .{ .name = "shadow_arena", .file = "src/mem/shadow_arena.zig", .need_sync = false },
+        .{ .name = "global_pool", .file = "src/mem/global_pool.zig", .need_sync = true },
+        .{ .name = "thread_ctx", .file = "src/mem/thread_ctx.zig", .need_sync = true },
+    };
+    var mem_test_runs: [mem_test_modules.len]*std.Build.Step.Run = undefined;
+    for (mem_test_modules, 0..) |m, i| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(m.file),
+            .target = target,
+            .optimize = optimize,
+        });
+        if (m.need_sync) mod.addImport("sync", sync_module);
+        const test_art = b.addTest(.{ .root_module = mod });
+        test_art.root_module.linkSystemLibrary("c", .{});
+        mem_test_runs[i] = b.addRunArtifact(test_art);
+    }
 
     // 值系统单独构建一份用于测试（需导入 sync 供 concurrent.zig 使用）
     const value_module_test = b.createModule(.{
@@ -282,24 +267,56 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     value_module_test.addImport("sync", sync_module);
+    value_module_test.addImport("ast", ast_module);
+    value_module_test.addImport("mem", mem_module);
     const value_unit_tests = b.addTest(.{
         .root_module = value_module_test,
     });
     const run_value_unit_tests = b.addRunArtifact(value_unit_tests);
+
+    // Glue IR 模块测试（需导入 ast 和 value）
+    const ir_module_test = b.createModule(.{
+        .root_source_file = b.path("src/ir/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ir_module_test.addImport("ast", ast_module);
+    ir_module_test.addImport("value", value_module);
+    ir_module_test.addImport("analysis_db", analysis_db_module);
+    ir_module_test.addImport("glue_builtin", builtin_module);
+    const ir_unit_tests = b.addTest(.{
+        .root_module = ir_module_test,
+    });
+    const run_ir_unit_tests = b.addRunArtifact(ir_unit_tests);
+
+    // 执行引擎测试（需导入 ir、mem、ast、lexer、parser、value）
+    const engine_module_test = b.createModule(.{
+        .root_source_file = b.path("src/engine/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    engine_module_test.addImport("ir", ir_module_test);
+    engine_module_test.addImport("mem", mem_module);
+    engine_module_test.addImport("ast", ast_module);
+    engine_module_test.addImport("lexer", lexer_module);
+    engine_module_test.addImport("parser", parser_module);
+    engine_module_test.addImport("value", value_module);
+    const engine_unit_tests = b.addTest(.{
+        .root_module = engine_module_test,
+    });
+    const run_engine_unit_tests = b.addRunArtifact(engine_unit_tests);
 
     // 所有测试产物都需要链接 libc
     lexer_unit_tests.root_module.linkSystemLibrary("c", .{});
     parser_unit_tests.root_module.linkSystemLibrary("c", .{});
     type_check_unit_tests.root_module.linkSystemLibrary("c", .{});
     module_check_unit_tests.root_module.linkSystemLibrary("c", .{});
-    slab_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
-    stdlib_unit_tests.root_module.linkSystemLibrary("c", .{});
-    reg_vm_unit_tests.root_module.linkSystemLibrary("c", .{});
     analysis_db_unit_tests.root_module.linkSystemLibrary("c", .{});
     value_unit_tests.root_module.linkSystemLibrary("c", .{});
     debug_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
-    arena_allocator_unit_tests.root_module.linkSystemLibrary("c", .{});
-    jit_unit_tests.root_module.linkSystemLibrary("c", .{});
+    ir_unit_tests.root_module.linkSystemLibrary("c", .{});
+    engine_unit_tests.root_module.linkSystemLibrary("c", .{});
+    builtin_unit_tests.root_module.linkSystemLibrary("c", .{});
 
     // ---- 聚合测试步骤：`zig build test` 运行全部单元测试 ----
     const test_step = b.step("test", "Run all tests");
@@ -307,12 +324,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parser_unit_tests.step);
     test_step.dependOn(&run_type_check_unit_tests.step);
     test_step.dependOn(&run_module_check_unit_tests.step);
-    test_step.dependOn(&run_slab_allocator_unit_tests.step);
-    test_step.dependOn(&run_stdlib_unit_tests.step);
-    test_step.dependOn(&run_reg_vm_unit_tests.step);
     test_step.dependOn(&run_analysis_db_unit_tests.step);
     test_step.dependOn(&run_value_unit_tests.step);
     test_step.dependOn(&run_debug_allocator_unit_tests.step);
-    test_step.dependOn(&run_arena_allocator_unit_tests.step);
-    test_step.dependOn(&run_jit_unit_tests.step);
+    test_step.dependOn(&run_ir_unit_tests.step);
+    test_step.dependOn(&run_engine_unit_tests.step);
+    test_step.dependOn(&run_builtin_unit_tests.step);
+    for (mem_test_runs) |run| test_step.dependOn(&run.step);
 }

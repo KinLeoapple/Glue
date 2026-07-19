@@ -11,6 +11,7 @@ const loop_invariant_mod = @import("loop_invariant.zig");
 const purity_mod = @import("purity.zig");
 const dead_code_mod = @import("dead_code.zig");
 const cse_mod = @import("cse.zig");
+const escape_mod = @import("escape_analysis.zig");
 
 const ConstValue = const_prop_mod.ConstValue;
 const ConstEnv = const_prop_mod.ConstEnv;
@@ -21,6 +22,9 @@ const DeadTable = dead_code_mod.DeadTable;
 const DeadCodePass = dead_code_mod.DeadCodePass;
 const CseTable = cse_mod.CseTable;
 const CsePass = cse_mod.CsePass;
+const EscapeTable = escape_mod.EscapeTable;
+const EscapePass = escape_mod.EscapePass;
+const ParamEscapeTable = escape_mod.ParamEscapeTable;
 
 /// 循环展开的估算大小阈值。循环体估算大小不超过此值时视为小循环，可考虑展开。
 const UNROLL_THRESHOLD: u32 = 32;
@@ -34,6 +38,8 @@ pub const FusedAnalysis = struct {
     hoist_table: *loop_invariant_mod.HoistTable,
     dead_table: *DeadTable,
     cse_table: *CseTable,
+    escape_table: *EscapeTable,
+    param_escape_table: *ParamEscapeTable,
     allocator: std.mem.Allocator,
     /// 调用图：函数名 -> 其调用的其他函数名列表。
     name_call_graph: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
@@ -50,6 +56,8 @@ pub const FusedAnalysis = struct {
         hoist_table: *loop_invariant_mod.HoistTable,
         dead_table: *DeadTable,
         cse_table: *CseTable,
+        escape_table: *EscapeTable,
+        param_escape_table: *ParamEscapeTable,
     ) FusedAnalysis {
         return .{
             .const_table = const_table,
@@ -58,6 +66,8 @@ pub const FusedAnalysis = struct {
             .hoist_table = hoist_table,
             .dead_table = dead_table,
             .cse_table = cse_table,
+            .escape_table = escape_table,
+            .param_escape_table = param_escape_table,
             .allocator = allocator,
             .name_call_graph = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .direct_impure = std.StringHashMap(void).init(allocator),
@@ -97,6 +107,15 @@ pub const FusedAnalysis = struct {
         try dce_pass.analyzeModule(module);
         var cse_pass = CsePass.init(self.allocator, self.cse_table);
         try cse_pass.analyzeModule(module);
+        // 逃逸分析：两阶段过程间分析（参数逃逸 + 函数逃逸）
+        // 依赖 purity_table 判断纯函数参数是否逃逸
+        var escape_pass = EscapePass.init(
+            self.allocator,
+            self.escape_table,
+            self.purity_table,
+            self.param_escape_table,
+        );
+        try escape_pass.analyzeModule(module);
     }
 
     /// 递归分析表达式：常量折叠、调用图边收集、纯度判定。
@@ -162,7 +181,7 @@ pub const FusedAnalysis = struct {
                 for (c.arguments) |arg| try self.analyzeExpr(arg, env, current_fn);
                 if (c.callee.* == .identifier) {
                     const callee_name = c.callee.identifier.name;
-                    // 递归调用不构成调用图边（不影响纯度判定）。
+                    // 递归调用不构成调用图边（不影响纯度判定），但标记为递归函数（memoization 用）
                     if (!std.mem.eql(u8, callee_name, current_fn)) {
                         if (isImpureBuiltin(callee_name)) {
                             // 调用内建非纯函数，当前函数直接标记为非纯。
@@ -176,6 +195,9 @@ pub const FusedAnalysis = struct {
                             }
                             try gop.value_ptr.append(self.allocator, callee_name);
                         }
+                    } else {
+                        // 直接递归：标记为递归函数（驱动 memoization）
+                        try self.purity_table.markRecursive(current_fn);
                     }
                 } else {
                     // 非标识符调用（如方法调用、lambda 调用）保守视为非纯。
@@ -422,7 +444,7 @@ pub const FusedAnalysis = struct {
 /// 内建非纯函数列表。这些函数有 I/O、并发或通信副作用，调用它们的函数自动判定为非纯。
 const impure_builtins = [_][]const u8{
     "println", "print", "eprintln", "eprint",
-    "spawn",   "lazy",  "select",   "send",   "recv",
+    "async",   "lazy",  "select",   "send",   "recv",
 };
 
 /// 判断给定函数名是否为内建非纯函数。
@@ -448,6 +470,8 @@ fn evalBinary(op: ast.BinaryOp, lv: ConstValue, rv: ConstValue) ?ConstValue {
             .bit_and => .{ .int_val = l & r },
             .bit_or => .{ .int_val = l | r },
             .bit_xor => .{ .int_val = l ^ r },
+            .shl => .{ .int_val = if (r < @bitSizeOf(@TypeOf(l))) l << @intCast(r) else 0 },
+            .shr => .{ .int_val = l >> @intCast(@min(r, @bitSizeOf(@TypeOf(l)) - 1)) },
             .eq => .{ .bool_val = l == r },
             .not_eq => .{ .bool_val = l != r },
             .lt => .{ .bool_val = l < r },

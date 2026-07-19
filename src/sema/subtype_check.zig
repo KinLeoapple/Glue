@@ -111,7 +111,7 @@ pub fn recordArgSatisfies(inferencer: *TypeInferencer, param: *Type, arg: *Type)
 /// 错误子类型判定：当 `super_name` 为内置 Error 类型时，
 /// 任何错误新类型（is_error_newtype）的 ADT 都是其子类型。
 pub fn isErrorSubtype(inferencer: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
-    if (std.mem.eql(u8, super_name, ast.type_names.error_type)) {
+    if (std.mem.eql(u8, super_name, "Error")) {
         if (inferencer.adt_types.get(sub_name)) |info| {
             if (info.is_error_newtype) return true;
         }

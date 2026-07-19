@@ -320,7 +320,7 @@ fn collectHoistsInStmt(
 fn isHoistableBinary(b: anytype, assigned_vars: []const []const u8) bool {
     switch (b.op) {
         .add, .sub, .mul, .div, .mod,
-        .bit_and, .bit_or, .bit_xor,
+        .bit_and, .bit_or, .bit_xor, .shl, .shr,
         .eq, .not_eq, .lt, .gt, .lt_eq, .gt_eq,
         .and_op, .or_op => {},
         else => return false,

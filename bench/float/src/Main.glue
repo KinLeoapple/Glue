@@ -1,30 +1,73 @@
-// Benchmark 4: 浮点算术密集
-// 目标:量 Float 软件 IEEE 754 路径（add/sub/mul/div/compare）的开销。
-// Newton-Raphson 平方根近似:对 1..N 每个数用 10 次迭代求 sqrt，
-// 每轮含 1 次 div + 1 次 add + 1 次 mul + 1 次 compare，纯浮点热路径。
-// 同时覆盖 int→float 转换（f64(i)）与 float 比较。
+// Benchmark 4: 浮点算术密集（强化版）
+// 目标：压测 Float 软件 IEEE 754 路径、混合精度、Mandelbrot 迭代
+// 强化：10万→50万数 × 10→20 次迭代，新增 Mandelbrot 迭代
 
 fun newtonSqrt(x: f64, iters: i32): f64 {
     var guess: f64 = x / 2.0
-    if (guess == 0.0) { return 0.0 }
+    if guess == 0.0 { return 0.0 }
     var i: i32 = 0
     while i < iters {
         val next: f64 = (guess + x / guess) / 2.0
-        // 收敛检查（比较走 Float.compare 软件路径）
-        if (next == guess) { return next }
+        if next == guess { return next }
         guess = next
         i = i + 1
     }
     guess
 }
 
+// Mandelbrot 迭代：复数平方 + 模长比较，纯浮点热路径
+fun mandelbrot(cx: f64, cy: f64, maxIter: i32): i32 {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var i: i32 = 0
+    while i < maxIter {
+        val x2: f64 = x * x
+        val y2: f64 = y * y
+        if x2 + y2 > 4.0 { return i }
+        val xNew: f64 = x2 - y2 + cx
+        y = 2.0 * x * y + cy
+        x = xNew
+        i = i + 1
+    }
+    maxIter
+}
+
+// 浮点累加带混合运算
+fun floatMix(n: i32): f64 {
+    var acc: f64 = 0.0
+    var i: i32 = 0
+    while i < n {
+        val v: f64 = cast(i).to(f64) / 1000.0
+        acc = acc + v * v - v + newtonSqrt(v + 1.0, 5)
+        i = i + 1
+    }
+    acc
+}
+
 fun main() {
+    // --- Newton-Raphson sqrt: 500K 数 × 20 次迭代 ---
     var sum: f64 = 0.0
     var i: i64 = 1
-    while i < 100000 {
-        // f64(i) 触发 int→float 转换；newtonSqrt 内 10 次迭代走 mul/div/add/compare
-        sum = sum + newtonSqrt(f64(i), 10)
+    while i < 500000 {
+        sum = sum + newtonSqrt(cast(i).to(f64), 20)
         i = i + 1
     }
     println(sum)
+
+    // --- Mandelbrot: 500x500 网格 × 100 次迭代 ---
+    var escapeTotal: i64 = 0
+    var cy: i32 = -250
+    while cy < 250 {
+        var cx: i32 = -250
+        while cx < 250 {
+            val iter = mandelbrot(cast(cx).to(f64) / 100.0, cast(cy).to(f64) / 100.0, 100)
+            if iter < 100 { escapeTotal = escapeTotal + cast(iter).to(i64) }
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+    println(escapeTotal)
+
+    // --- 混合浮点运算 ---
+    println(floatMix(1000000))
 }

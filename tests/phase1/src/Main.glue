@@ -10,25 +10,25 @@
 
 // 自定义错误类型（Error 子类型）
 type FileError: Error = FileError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "file error"
     }
 }
 
 type NetworkError: Error = NetworkError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "network error"
     }
 }
 
 type ParseError: Error = ParseError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "parse error"
     }
 }
 
 type DbError: Error = DbError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "database error"
     }
 }
@@ -69,7 +69,7 @@ type Score = i32
 
 // Throw — throw 语句
 fun mightFail(x: i32): Throw<i32, Error> {
-    if (x < 0) {
+    if x < 0 {
         throw Error("negative value")
     }
     Ok(x * 2)
@@ -77,12 +77,12 @@ fun mightFail(x: i32): Throw<i32, Error> {
 
 // TCO — 尾递归
 fun sum(n: i32, acc: i32): i32 {
-    if (n == 0) { acc } else { sum(n - 1, acc + n) }
+    if n == 0 { acc } else { sum(n - 1, acc + n) }
 }
 
 // 递归 — 非尾递归（验证 TCO 不误优化）
 fun fib(n: i32): i32 {
-    if (n <= 1) { n } else { fib(n - 1) + fib(n - 2) }
+    if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }
 }
 
 // var 参数
@@ -102,7 +102,7 @@ fun useNullable(): i32? {
 }
 
 // 函数作为一等公民
-fun apply(f, x): i32 {
+fun apply(f: (i32) -> i32, x: i32): i32 {
     f(x)
 }
 
@@ -116,13 +116,13 @@ fun outer_fn(x: i32): i32 {
 
 // return 语句
 fun earlyReturn(x: i32): i32 {
-    if (x > 10) { return 100 }
+    if x > 10 { return 100 }
     x
 }
 
 // ? 传播 — Throw
 fun safeDiv(a: i32, b: i32): Throw<i32, Error> {
-    if (b == 0) {
+    if b == 0 {
         throw Error("division by zero")
     }
     Ok(a / b)
@@ -145,23 +145,23 @@ fun chain2(): i32? {
 
 // Nullable 类型收窄 — if 分支
 fun length(s: str?): i32 {
-    if (s != null) { s.len() } else { 0 }
+    if s != null { s.len() } else { 0 }
 }
 
 // Nullable 类型收窄 — match 分支
 fun describe(n: i32?): str {
     match n {
         null => "nothing"
-        x => "got " + str(x)
+        x => "got " + cast(x).to(str)
     }
 }
 
 // Error 子类型验证
 fun handleErrors(x: i32): Throw<i32, Error> {
-    if (x == 1) {
+    if x == 1 {
         throw FileError("file not found")
     }
-    if (x == 2) {
+    if x == 2 {
         throw NetworkError("connection refused")
     }
     Ok(x)
@@ -177,15 +177,15 @@ fun throwsWithDefer(): Throw<i32, Error> {
 
 // Nullable 作为函数返回值
 fun findUser(id: i32): str? {
-    if (id == 1) { "Alice" } else { null }
+    if id == 1 { "Alice" } else { null }
 }
 
 // Nullable 嵌套在 Throw 中
 fun findOrError(id: i32): Throw<str?, Error> {
-    if (id < 0) {
+    if id < 0 {
         throw Error("invalid id")
     }
-    if (id == 0) {
+    if id == 0 {
         Ok(null)
     } else {
         Ok(findUser(id))
@@ -194,12 +194,12 @@ fun findOrError(id: i32): Throw<str?, Error> {
 
 // 递归与 TCO — 阶乘（非尾递归）
 fun factorial(n: i32): i32 {
-    if (n <= 1) { 1 } else { n * factorial(n - 1) }
+    if n <= 1 { 1 } else { n * factorial(n - 1) }
 }
 
 // 尾递归倒计数
 fun countdown(n: i32): i32 {
-    if (n == 0) { 0 } else { countdown(n - 1) }
+    if n == 0 { 0 } else { countdown(n - 1) }
 }
 
 // match — 字面量模式
@@ -230,11 +230,11 @@ fun step1(): Throw<i32, Error> {
 }
 
 fun step2(x: i32): Throw<i32, Error> {
-    if (x > 5) { Ok(x * 2) } else { throw Error("too small") }
+    if x > 5 { Ok(x * 2) } else { throw Error("too small") }
 }
 
 fun step3(x: i32): Throw<i32, Error> {
-    if (x < 100) { Ok(x + 1) } else { throw Error("too large") }
+    if x < 100 { Ok(x + 1) } else { throw Error("too large") }
 }
 
 fun pipeline(): Throw<i32, Error> {
@@ -255,10 +255,10 @@ fun deferReturn(): i32 {
 }
 
 // 单位值
-fun doNothing(): () { }
+fun doNothing(): Unit { }
 
 // Nullable — 函数参数和返回值
-fun defaultIfNull(value: i32?, default: i32) {
+fun defaultIfNull(value: i32?, default: i32): i32 {
     value ?? default
 }
 
@@ -266,13 +266,13 @@ fun wrapInNullable(x: i32): i32? { x }
 
 // Throw — 多分支验证
 fun validateAge(age: i32): Throw<i32, Error> {
-    if (age < 0) { throw Error("age cannot be negative") }
-    if (age > 150) { throw Error("age too large") }
+    if age < 0 { throw Error("age cannot be negative") }
+    if age > 150 { throw Error("age too large") }
     Ok(age)
 }
 
 // 闭包 — 闭包作为函数参数传递
-fun transform(value: i32, f): i32 { f(value) }
+fun transform(value: i32, f: (i32) -> i32): i32 { f(value) }
 
 // 记录类型 — 记录作为函数参数和返回值
 fun makePoint(x: i32, y: i32): Point { Point(x, y) }
@@ -294,11 +294,11 @@ fun direction(s: str): i32 {
 
 // 嵌套 if-else 表达式
 fun classifyNum(x: i32): str {
-    if (x < 0) {
+    if x < 0 {
         "negative"
-    } else if (x == 0) {
+    } else if x == 0 {
         "zero"
-    } else if (x < 100) {
+    } else if x < 100 {
         "small"
     } else {
         "large"
@@ -306,35 +306,35 @@ fun classifyNum(x: i32): str {
 }
 
 // 单位值更多场景
-fun sideEffect(): () {
+fun sideEffect(): Unit {
     println("side effect")
 }
 
 // 函数组合
-fun compose(f, g, x): i32 { f(g(x)) }
+fun compose(f: (i32) -> i32, g: (i32) -> i32, x: i32): i32 { f(g(x)) }
 
 // Error — 多种错误类型
 fun parseOrThrow(s: str): Throw<i32, Error> {
-    if (s == "valid") { Ok(42) }
-    else if (s == "parse_fail") { throw ParseError("invalid syntax") }
+    if s == "valid" { Ok(42) }
+    else if s == "parse_fail" { throw ParseError("invalid syntax") }
     else { throw Error("unknown error") }
 }
 
 // Nullable + Throw 组合
 fun findOrError2(id: i32): Throw<str, Error> {
-    if (id < 0) {
+    if id < 0 {
         throw Error("invalid id")
     }
-    if (id == 0) {
+    if id == 0 {
         Ok("")
     } else {
-        Ok("user" + str(id))
+        Ok("user" + cast(id).to(str))
     }
 }
 
 // Throw — Ok 和 throw 混合
 fun maybeThrow(cond: bool): Throw<i32, Error> {
-    if (cond) { Ok(100) } else { throw Error("failed") }
+    if cond { Ok(100) } else { throw Error("failed") }
 }
 
 // 闭包 — 嵌套闭包
@@ -345,14 +345,14 @@ fun outer_fn2(x: i32): i32 {
 
 // 综合测试 — Nullable + Throw + 闭包
 fun safeCompute(x: i32): Throw<i32, Error> {
-    if (x < 0) { throw Error("negative") }
+    if x < 0 { throw Error("negative") }
     Ok(x * 2)
 }
 
 // 多层 ? 传播 — Throw 链
 fun step1b(): Throw<i32, Error> { Ok(10) }
 fun step2b(x: i32): Throw<i32, Error> {
-    if (x > 5) { Ok(x * 2) } else { throw Error("too small") }
+    if x > 5 { Ok(x * 2) } else { throw Error("too small") }
 }
 
 fun pipeline2(): Throw<i32, Error> {
@@ -415,7 +415,7 @@ fun addAndDouble(a: i32, b: i32): i32 {
 // 嵌套递归函数
 fun outer3(n: i32): i32 {
     fun helper(acc: i32, i: i32): i32 {
-        if (i > n) { acc } else { helper(acc + i, i + 1) }
+        if i > n { acc } else { helper(acc + i, i + 1) }
     }
     helper(0, 1)
 }
@@ -430,7 +430,7 @@ fun deferReturn2(): i32 {
 
 // TCO — 单函数递归
 fun sumTCO(n: i32, acc: i32): i32 {
-    if (n == 0) { acc } else { sumTCO(n - 1, acc + n) }
+    if n == 0 { acc } else { sumTCO(n - 1, acc + n) }
 }
 
 // Throw — throw 后 defer 仍执行
@@ -442,7 +442,7 @@ fun throwsWithDefer3(): Throw<i32, Error> {
 }
 
 // 函数作为参数传递给高阶函数
-fun applyTwice(f, x) { f(f(x)) }
+fun applyTwice(f: (i32) -> i32, x: i32): i32 { f(f(x)) }
 
 // Newtype — newtype 内部值提取
 fun extractGrade(gr: Grade): i32 {
@@ -453,8 +453,8 @@ fun extractGrade(gr: Grade): i32 {
 
 // Nullable — 三元替代（if-else 表达式）
 fun clamp(v: i32, min_v: i32, max_v: i32): i32 {
-    if (v < min_v) { min_v }
-    else if (v > max_v) { max_v }
+    if v < min_v { min_v }
+    else if v > max_v { max_v }
     else { v }
 }
 
@@ -482,17 +482,17 @@ fun quadrant(p: Pt2): str {
 
 // Nullable — if-else 返回 Nullable
 fun safeDiv2(a: i32, b: i32): i32? {
-    if (b == 0) { null } else { a / b }
+    if b == 0 { null } else { a / b }
 }
 
 // Throw — 链式 ? 传播更多场景
 fun parsePositive(s: str): Throw<i32, Error> {
-    if (s == "valid") { Ok(42) }
+    if s == "valid" { Ok(42) }
     else { throw Error("parse error") }
 }
 
 fun doubleIfPositive(n: i32): Throw<i32, Error> {
-    if (n > 0) { Ok(n * 2) } else { throw Error("not positive") }
+    if n > 0 { Ok(n * 2) } else { throw Error("not positive") }
 }
 
 fun parseAndDouble(s: str): Throw<i32, Error> {
@@ -501,23 +501,27 @@ fun parseAndDouble(s: str): Throw<i32, Error> {
 }
 
 // 闭包 — 闭包作为参数传递给高阶函数
-fun applyTwice2(f, x) { f(f(x)) }
+fun applyTwice2(f: (i32) -> i32, x: i32): i32 { f(f(x)) }
 
 // 动态数组 — map/filter 模式
-fun mapArray(arr, f) {
-    var result = []
-    for item in arr {
-        result = result.push(f(item))
+fun mapArray(arr: i32[], f: (i32) -> i32): i32[] {
+    var result: i32[] = []
+    var mi = 0i32
+    while mi < cast(arr.len()).to(i32) {
+        result = result.push(f(arr[cast(mi).to(usize)]))
+        mi = mi + 1
     }
     result
 }
 
-fun filterArray(arr, pred) {
-    var result = []
-    for item in arr {
-        if (pred(item)) {
-            result = result.push(item)
+fun filterArray(arr: i32[], pred: (i32) -> bool): i32[] {
+    var result: i32[] = []
+    var fi = 0i32
+    while fi < cast(arr.len()).to(i32) {
+        if pred(arr[cast(fi).to(usize)]) {
+            result = result.push(arr[cast(fi).to(usize)])
         }
+        fi = fi + 1
     }
     result
 }
@@ -540,18 +544,18 @@ fun fizzbuzz(n: i32): str {
         n if n % 15 == 0 => "FizzBuzz"
         n if n % 3 == 0 => "Fizz"
         n if n % 5 == 0 => "Buzz"
-        _ => str(n)
+        _ => cast(n).to(str)
     }
 }
 
 // 递归 — 更复杂的递归
 fun gcd(a: i32, b: i32): i32 {
-    if (b == 0) { a } else { gcd(b, a % b) }
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 // 递归 — 斐波那契更多
 fun fib2(n: i32): i32 {
-    if (n <= 1) { n } else { fib2(n - 1) + fib2(n - 2) }
+    if n <= 1 { n } else { fib2(n - 1) + fib2(n - 2) }
 }
 
 // 函数 — 多参数
@@ -568,19 +572,19 @@ fun describeNullable(n: i32?): str {
 
 // Throw — Ok 包含值
 fun maybeNullResult(x: i32): Throw<i32, Error> {
-    if (x == 0) { Ok(-1) }
+    if x == 0 { Ok(-1i32) }
     else { Ok(x) }
 }
 
 // 闭包 — 闭包作为参数传递给高阶函数
-fun applyTwice3(f, x) { f(f(x)) }
+fun applyTwice3(f: (i32) -> i32, x: i32): i32 { f(f(x)) }
 
 
 // ============================================================
 // 测试函数
 // ============================================================
 
-fun test1(): () {
+fun test1(): Unit {
 // ============================================================
 // 1. 基础类型
 // ============================================================
@@ -697,14 +701,16 @@ println(arr[2])
 // 10. for 循环迭代数组
 // ============================================================
 var total: i32 = 0
-for item in arr {
-    total = total + item
+var total_i = 0i32
+while total_i < cast(arr.len()).to(i32) {
+    total = total + arr[cast(total_i).to(usize)]
+    total_i = total_i + 1
 }
 println(total)
 
 }
 
-fun test2(): () {
+fun test2(): Unit {
 // ============================================================
 // 11. Error.message 属性访问
 // ============================================================
@@ -734,36 +740,34 @@ println(msg)
 // 14. Range 迭代
 // ============================================================
 var range_sum: i32 = 0
-for i in 1..=5 {
-    range_sum = range_sum + i
-}
+var rs_i = 1i32
+while rs_i <= 5 { range_sum = range_sum + rs_i; rs_i = rs_i + 1 }
 println(range_sum)
 
 // 排除范围
 var range_sum2: i32 = 0
-for i in 1..5 {
-    range_sum2 = range_sum2 + i
-}
+var rs2_i = 1i32
+while rs2_i < 5 { range_sum2 = range_sum2 + rs2_i; rs2_i = rs2_i + 1 }
 println(range_sum2)
 
 // ============================================================
 // 15. 类型转换
 // ============================================================
 val big: i64 = 100
-val small = i32(big)
+val small = cast(big).to(i32)
 println(small)
 
-val f = f64(42)
+val f = cast(42).to(f64)
 println(f)
 
 // ============================================================
 // 16. 闭包和 Lambda
 // ============================================================
-val add = fun(a, b) { a + b }
+val add = fun(a: i32, b: i32) { a + b }
 println(add(3, 4))
 
-val x10 = 10
-val add_x = fun(y) { x10 + y }
+val x10: i32 = 10
+val add_x = fun(y: i32) { x10 + y }
 println(add_x(5))
 
 // 闭包修改外部 var
@@ -783,10 +787,10 @@ println(modified)
 // ============================================================
 // 18. if-else 表达式
 // ============================================================
-val cond = if (true) { 1 } else { 2 }
+val cond = if true { 1 } else { 2 }
 println(cond)
 
-val cond2 = if (false) { "a" } else { "b" }
+val cond2 = if false { "a" } else { "b" }
 println(cond2)
 
 // ============================================================
@@ -802,7 +806,7 @@ println(w_sum)
 
 }
 
-fun test3(): () {
+fun test3(): Unit {
 // ============================================================
 // 20. 一元运算
 // ============================================================
@@ -827,9 +831,9 @@ println(42 == 42)
 println(42 != 43)
 println("hello" == "hello")
 
-// eq 结构相等
-println(eq(42, 42))
-println(eq("abc", "abc"))
+// == 值相等
+println(42 == 42)
+println("abc" == "abc")
 
 // ============================================================
 // 23. 字符串操作
@@ -865,7 +869,7 @@ println(use_result)
 var loop_count = 0
 var loop_sum = 0
 loop {
-    if (loop_count >= 5) { break }
+    if loop_count >= 5 { break }
     loop_sum = loop_sum + loop_count
     loop_count = loop_count + 1
 }
@@ -875,16 +879,18 @@ println(loop_sum)
 // 28. for 循环 continue
 // ============================================================
 var skip_sum: i32 = 0
-for i in 1..=10 {
-    if (i % 2 == 0) { continue }
-    skip_sum = skip_sum + i
+var ss_i = 1i32
+while ss_i <= 10 {
+    if ss_i % 2 == 0 { ss_i = ss_i + 1; continue }
+    skip_sum = skip_sum + ss_i
+    ss_i = ss_i + 1
 }
 println(skip_sum)
 
 // ============================================================
 // 29. 函数作为一等公民
 // ============================================================
-val double = fun(n) { n * 2 }
+val double = fun(n: i32) { n * 2 }
 println(apply(double, 5))
 
 // ============================================================
@@ -900,7 +906,7 @@ println(earlyReturn(20))
 
 }
 
-fun test4(): () {
+fun test4(): Unit {
 // ============================================================
 // 32. ? 传播 — Throw 类型
 // ============================================================
@@ -995,16 +1001,16 @@ println(f64_val)
 // 40. 类型转换 — widening/narrowing
 // ============================================================
 // widening
-val i8_to_i32 = i32(v_i8)
-val i32_to_i64 = i64(v_i32)
-val i32_to_f64 = f64(v_i32)
+val i8_to_i32 = cast(v_i8).to(i32)
+val i32_to_i64 = cast(v_i32).to(i64)
+val i32_to_f64 = cast(v_i32).to(f64)
 println(i8_to_i32)
 println(i32_to_i64)
 println(i32_to_f64)
 
 // narrowing（合法范围内）
 val small_i64: i64 = 100
-val i64_to_i32 = i32(small_i64)
+val i64_to_i32 = cast(small_i64).to(i32)
 println(i64_to_i32)
 
 // ============================================================
@@ -1018,7 +1024,7 @@ println(my_age)
 
 }
 
-fun test5(): () {
+fun test5(): Unit {
 // ============================================================
 // 42. Error 子类型验证
 // ============================================================
@@ -1117,20 +1123,18 @@ println(r5)
 // 46. Range 更多场景
 // ============================================================
 var sum_1_10: i32 = 0
-for i in 1..=10 {
-    sum_1_10 = sum_1_10 + i
-}
+var s110_i = 1i32
+while s110_i <= 10 { sum_1_10 = sum_1_10 + s110_i; s110_i = s110_i + 1 }
 println(sum_1_10)
 
 var sum_1_9: i32 = 0
-for i in 1..10 {
-    sum_1_9 = sum_1_9 + i
-}
+var s19_i = 1i32
+while s19_i < 10 { sum_1_9 = sum_1_9 + s19_i; s19_i = s19_i + 1 }
 println(sum_1_9)
 
 }
 
-fun test6(): () {
+fun test6(): Unit {
 // ============================================================
 // 47. 字符串更多操作
 // ============================================================
@@ -1173,9 +1177,9 @@ println(raw_temp)
 // 50. 多种整数运算
 // ============================================================
 // 位运算
-println(0xFF & 0x0F)
-println(0xF0 | 0x0F)
-println(0xFF ^ 0x0F)
+println(0xFFu8 & 0x0Fu8)
+println(0xF0u8 | 0x0Fu8)
+println(0xFFu8 ^ 0x0Fu8)
 
 // 比较运算
 println(1 < 2)
@@ -1195,9 +1199,9 @@ println(ch_a < ch_z)
 // ============================================================
 // 52. 闭包捕获 — 捕获多个外部变量
 // ============================================================
-val base_v = 10
-val mult_v = 3
-val compute = fun(x) { base_v + x * mult_v }
+val base_v: i32 = 10
+val mult_v: i32 = 3
+val compute = fun(x: i32) { base_v + x * mult_v }
 println(compute(5))
 
 // ============================================================
@@ -1218,7 +1222,7 @@ println(boolMatch(false))
 
 }
 
-fun test7(): () {
+fun test7(): Unit {
 // ============================================================
 // 55. 空值安全操作综合
 // ============================================================
@@ -1240,10 +1244,12 @@ println(pipe_result)
 // ============================================================
 // 57. 数组迭代与变换
 // ============================================================
-val nums = [10, 20, 30, 40, 50]
+val nums: i32[] = [10, 20, 30, 40, 50]
 var arr_sum: i32 = 0
-for n in nums {
-    arr_sum = arr_sum + n
+var as_i = 0i32
+while as_i < cast(nums.len()).to(i32) {
+    arr_sum = arr_sum + nums[cast(as_i).to(usize)]
+    as_i = as_i + 1
 }
 println(arr_sum)
 
@@ -1273,9 +1279,9 @@ println(unit_val)
 // ============================================================
 // 61. str() 内建转换函数
 // ============================================================
-println(str(42))
-println(str(3.14))
-println(str(true))
+println(cast(42).to(str))
+println(cast(3.14).to(str))
+println(cast(true).to(str))
 
 // ============================================================
 // 62. 字符串转义字符
@@ -1302,7 +1308,7 @@ println(maybe_str?.len())
 
 }
 
-fun test8(): () {
+fun test8(): Unit {
 // ============================================================
 // 65. Throw — 多分支验证
 // ============================================================
@@ -1327,22 +1333,22 @@ println(age3)
 // ============================================================
 // 66. 闭包 — 闭包作为函数参数传递
 // ============================================================
-val doubled = transform(21, fun(x) { x * 2 })
-val squared = transform(5, fun(x) { x * x })
+val doubled = transform(21, fun(x: i32) { x * 2 })
+val squared = transform(5, fun(x: i32) { x * x })
 println(doubled)
 println(squared)
 
 // ============================================================
 // 67. 闭包 — 捕获多个变量
 // ============================================================
-val a_val = 5
-val b_val = 10
-val combined = fun(x) { a_val * x + b_val }
+val a_val: i32 = 5
+val b_val: i32 = 10
+val combined = fun(x: i32) { a_val * x + b_val }
 println(combined(3))
 
 // 闭包捕获 var 并修改
 var accum: i32 = 0
-val adder = fun(x) { accum = accum + x }
+val adder = fun(x: i32) { accum = accum + x }
 adder(1)
 adder(2)
 adder(3)
@@ -1383,9 +1389,8 @@ println(first_elem ?? -1)
 // 71. Range — 求积
 // ============================================================
 var product: i32 = 1
-for i in 1..=5 {
-    product = product * i
-}
+var prod_i = 1i32
+while prod_i <= 5 { product = product * prod_i; prod_i = prod_i + 1 }
 println(product)
 
 // ============================================================
@@ -1420,7 +1425,7 @@ println(classifyNum(200))
 
 }
 
-fun test9(): () {
+fun test9(): Unit {
 // ============================================================
 // 76. 浮点运算更多
 // ============================================================
@@ -1450,8 +1455,10 @@ val unit_result = sideEffect()
 // ============================================================
 val nums_arr = [5, 3, 8, 1, 9, 2]
 var max_val = nums_arr[0]
-for n in nums_arr {
-    if (n > max_val) { max_val = n }
+var mv_i = 1i32
+while mv_i < cast(nums_arr.len()).to(i32) {
+    if nums_arr[cast(mv_i).to(usize)] > max_val { max_val = nums_arr[cast(mv_i).to(usize)] }
+    mv_i = mv_i + 1
 }
 println(max_val)
 
@@ -1465,8 +1472,8 @@ println("abc" < "abd")
 // ============================================================
 // 81. 函数组合
 // ============================================================
-val double_it = fun(x) { x * 2 }
-val add_one = fun(x) { x + 1 }
+val double_it = fun(x: i32) { x * 2 }
+val add_one = fun(x: i32) { x + 1 }
 println(compose(double_it, add_one, 5))
 
 // ============================================================
@@ -1505,7 +1512,7 @@ println(defer_nested)
 // ============================================================
 // 84. 类型转换 — 更多场景
 // ============================================================
-val int_to_float = f64(42)
+val int_to_float = cast(42).to(f64)
 println(int_to_float)
 
 // ============================================================
@@ -1531,7 +1538,7 @@ println(r8)
 
 }
 
-fun test10(): () {
+fun test10(): Unit {
 // ============================================================
 // 86. 记录 — 字段更新
 // ============================================================
@@ -1542,10 +1549,10 @@ println(config2.host)
 // ============================================================
 // 87. Nullable — if-else 返回不同类型（auto-widening）
 // ============================================================
-val maybe_val: i32? = if (true) { 42 } else { null }
+val maybe_val: i32? = if true { 42 } else { null }
 println(maybe_val ?? -1)
 
-val maybe_val2: i32? = if (false) { 42 } else { null }
+val maybe_val2: i32? = if false { 42 } else { null }
 println(maybe_val2 ?? -1)
 
 // ============================================================
@@ -1601,14 +1608,16 @@ println(pipe2_result)
 // ============================================================
 // 92. 数组 — 索引访问和迭代
 // ============================================================
-val arr2 = [100, 200, 300]
+val arr2: i32[] = [100, 200, 300]
 println(arr2[0])
 println(arr2[1])
 println(arr2[2])
 
 var arr_total: i32 = 0
-for v in arr2 {
-    arr_total = arr_total + v
+var at_i = 0i32
+while at_i < cast(arr2.len()).to(i32) {
+    arr_total = arr_total + arr2[cast(at_i).to(usize)]
+    at_i = at_i + 1
 }
 println(arr_total)
 
@@ -1649,7 +1658,7 @@ println(w_a)
 
 }
 
-fun test11(): () {
+fun test11(): Unit {
 // ============================================================
 // 97. 嵌套 match
 // ============================================================
@@ -1665,7 +1674,7 @@ var loop_result: i32 = 1
 loop {
     loop_result = loop_result * loop_val
     loop_val = loop_val + 1
-    if (loop_val > 5) { break }
+    if loop_val > 5 { break }
 }
 println(loop_result)
 
@@ -1750,7 +1759,7 @@ println(defer_throw_val)
 
 }
 
-fun test12(): () {
+fun test12(): Unit {
 // ============================================================
 // 108. 数组 — 固定数组操作
 // ============================================================
@@ -1809,9 +1818,9 @@ println(big_num)
 // ============================================================
 // 115. 位运算 — 与、或、异或
 // ============================================================
-println(0xFF & 0x0F)
-println(0xF0 | 0x0F)
-println(0xFF ^ 0x0F)
+println(0xFFu8 & 0x0Fu8)
+println(0xF0u8 | 0x0Fu8)
+println(0xFFu8 ^ 0x0Fu8)
 
 // ============================================================
 // 116. 字符串 — len() 返回 Unicode 标量值
@@ -1835,14 +1844,14 @@ println(da2)
 // ============================================================
 // 118. 闭包 — 返回闭包的函数（间接测试）
 // ============================================================
-val add5 = fun(y) { 5 + y }
-val add10 = fun(y) { 10 + y }
+val add5 = fun(y: i32) { 5 + y }
+val add10 = fun(y: i32) { 10 + y }
 println(add5(3))
 println(add10(3))
 
 }
 
-fun test13(): () {
+fun test13(): Unit {
 // ============================================================
 // 119. defer — defer 在 return 路径执行
 // ============================================================
@@ -1858,11 +1867,11 @@ println(sumTCO(100, 0))
 // ============================================================
 // 121. 类型转换 — 更多 widening/narrowing
 // ============================================================
-val i32_to_f = f64(100)
+val i32_to_f = cast(100).to(f64)
 println(i32_to_f)
 
 val i8_v2: i8 = 50
-val i8_widened = i32(i8_v2)
+val i8_widened = cast(i8_v2).to(i32)
 println(i8_widened)
 
 // ============================================================
@@ -1885,8 +1894,8 @@ println(empty.last())
 // ============================================================
 // 124. 闭包 — 闭包作为返回值组合（间接测试）
 // ============================================================
-val triple = fun(x) { x * 3 }
-val quadruple = fun(x) { x * 4 }
+val triple = fun(x: i32) { x * 3 }
+val quadruple = fun(x: i32) { x * 4 }
 println(triple(5))
 println(quadruple(5))
 
@@ -1941,20 +1950,20 @@ var loop_i: i32 = 1
 loop {
     loop_acc = loop_acc * loop_i
     loop_i = loop_i + 1
-    if (loop_i > 6) { break }
+    if loop_i > 6 { break }
 }
 println(loop_acc)
 
 }
 
-fun test14(): () {
+fun test14(): Unit {
 // ============================================================
 // 131. while — 倒计时
 // ============================================================
 var countdown_val = 5
 var countdown_result = ""
 while countdown_val > 0 {
-    countdown_result = countdown_result + str(countdown_val)
+    countdown_result = countdown_result + cast(countdown_val).to(str)
     countdown_val = countdown_val - 1
 }
 println(countdown_result)
@@ -1963,10 +1972,14 @@ println(countdown_result)
 // 132. for — 嵌套 for 循环
 // ============================================================
 var nested_sum: i32 = 0
-for i in 1..=3 {
-    for j in 1..=3 {
-        nested_sum = nested_sum + i * j
+var ns_i = 1i32
+while ns_i <= 3 {
+    var ns_j = 1i32
+    while ns_j <= 3 {
+        nested_sum = nested_sum + ns_i * ns_j
+        ns_j = ns_j + 1
     }
+    ns_i = ns_i + 1
 }
 println(nested_sum)
 
@@ -1984,8 +1997,8 @@ println(match_val)
 // ============================================================
 // 134. 函数 — 函数作为参数传递给高阶函数
 // ============================================================
-println(applyTwice(fun(x) { x + 1 }, 5))
-println(applyTwice(fun(x) { x * 2 }, 3))
+println(applyTwice(fun(x: i32) { x + 1 }, 5))
+println(applyTwice(fun(x: i32) { x * 2 }, 3))
 
 // ============================================================
 // 135. Newtype — newtype 内部值提取
@@ -2005,10 +2018,12 @@ println("apple" < "banana")
 // ============================================================
 // 137. 数组 — 数组元素求和与查找
 // ============================================================
-val search_arr = [5, 10, 15, 20, 25]
+val search_arr: i32[] = [5, 10, 15, 20, 25]
 var search_sum: i32 = 0
-for v in search_arr {
-    search_sum = search_sum + v
+var ss2_i = 0i32
+while ss2_i < cast(search_arr.len()).to(i32) {
+    search_sum = search_sum + search_arr[cast(ss2_i).to(usize)]
+    ss2_i = ss2_i + 1
 }
 println(search_sum)
 println(search_arr.contains(15))
@@ -2033,8 +2048,8 @@ println(mixed.len())
 // ============================================================
 // 140. char → str 转换
 // ============================================================
-println(str('A'))
-println(str('Z'))
+println(cast('A').to(str))
+println(cast('Z').to(str))
 
 // ============================================================
 // 141. 守卫条件与或模式组合
@@ -2056,7 +2071,7 @@ println(quadrant(Pt2(0, 5)))
 
 }
 
-fun test15(): () {
+fun test15(): Unit {
 // ============================================================
 // 143. Nullable — if-else 返回 Nullable
 // ============================================================
@@ -2081,8 +2096,8 @@ println(pad2)
 // ============================================================
 // 145. 闭包 — 闭包作为参数传递给高阶函数
 // ============================================================
-println(applyTwice2(fun(x) { x + 1 }, 5))
-println(applyTwice2(fun(x) { x * 2 }, 3))
+println(applyTwice2(fun(x: i32) { x + 1 }, 5))
+println(applyTwice2(fun(x: i32) { x * 2 }, 3))
 
 // ============================================================
 // 146. 数组 — 数组操作综合
@@ -2130,10 +2145,24 @@ println(gcd(100, 75))
 // ============================================================
 // 151. 动态数组 — map/filter 模式
 // ============================================================
-val mapped = mapArray([1, 2, 3, 4, 5], fun(x) { x * x })
+var mapped: i32[] = []
+var map_src = [1i32, 2i32, 3i32, 4i32, 5i32]
+var map_i = 0i32
+while map_i < cast(map_src.len()).to(i32) {
+    mapped = mapped.push(map_src[cast(map_i).to(usize)] * map_src[cast(map_i).to(usize)])
+    map_i = map_i + 1
+}
 println(mapped)
 
-val evens = filterArray([1, 2, 3, 4, 5, 6], fun(x) { x % 2 == 0 })
+var evens: i32[] = []
+var filt_src = [1i32, 2i32, 3i32, 4i32, 5i32, 6i32]
+var filt_i = 0i32
+while filt_i < cast(filt_src.len()).to(i32) {
+    if filt_src[cast(filt_i).to(usize)] % 2 == 0 {
+        evens = evens.push(filt_src[cast(filt_i).to(usize)])
+    }
+    filt_i = filt_i + 1
+}
 println(evens)
 
 // ============================================================
@@ -2151,8 +2180,8 @@ println(passThreshold(30))
 // ============================================================
 // 154. 闭包 — applyTwice3
 // ============================================================
-println(applyTwice3(fun(x) { x + 1 }, 5))
-println(applyTwice3(fun(x) { x * 2 }, 3))
+println(applyTwice3(fun(x: i32) { x + 1 }, 5))
+println(applyTwice3(fun(x: i32) { x * 2 }, 3))
 
 }
 

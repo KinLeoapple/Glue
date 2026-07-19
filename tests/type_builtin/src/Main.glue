@@ -54,7 +54,7 @@ fun main() {
 
     // ---- type() inside match / comparison ----
     val x = 5
-    val desc = if (type(x) == "i8") { "small int" } else { "other" }
+    val desc = if type(x) == "i8" { "small int" } else { "other" }
     println(desc)                 // small int
 
     println("type_builtin: All tests passed!")

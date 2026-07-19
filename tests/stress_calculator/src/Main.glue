@@ -33,7 +33,7 @@ type Token =
 
 fun showTok(t: Token): str {
     match t {
-        TNum(n) => "Num(" + str(n) + ")"
+        TNum(n) => "Num(" + cast(n).to(str) + ")"
         TPlus => "+"
         TMinus => "-"
         TStar => "*"
@@ -68,16 +68,16 @@ fun digitVal(c: char): i32 {
 }
 
 type LexError: Error = LexError(msg: str) {
-    override fun prefix(self): str { "lex error" }
+    override fun type_name(self): str { "lex error" }
 }
 
 // 从位置 i 开始扫描一个整数，返回 (值, 下一个位置)
 fun scanNum(s: str, i: i32, acc: i32): (value: i32, next: i32) {
-    if (i >= s.len()) {
+    if i >= cast(s.len()).to(i32) {
         (value: acc, next: i)
     } else {
-        val c = s[i]
-        if (isDigit(c)) {
+        val c = s[cast(i).to(usize)]
+        if isDigit(c) {
             scanNum(s, i + 1, acc * 10 + digitVal(c))
         } else {
             (value: acc, next: i)
@@ -87,26 +87,26 @@ fun scanNum(s: str, i: i32, acc: i32): (value: i32, next: i32) {
 
 fun tokenize(s: str): Throw<List<Token>, Error> {
     fun go(i: i32, acc: List<Token>): Throw<List<Token>, Error> {
-        if (i >= s.len()) {
+        if i >= cast(s.len()).to(i32) {
             Ok(reverseL(acc))
         } else {
-            val c = s[i]
-            if (c == ' ') {
+            val c = s[cast(i).to(usize)]
+            if c == ' ' {
                 go(i + 1, acc)
-            } else if (isDigit(c)) {
+            } else if isDigit(c) {
                 val r = scanNum(s, i, 0)
                 go(r.next, Cons(TNum(r.value), acc))
-            } else if (c == '+') {
+            } else if c == '+' {
                 go(i + 1, Cons(TPlus, acc))
-            } else if (c == '-') {
+            } else if c == '-' {
                 go(i + 1, Cons(TMinus, acc))
-            } else if (c == '*') {
+            } else if c == '*' {
                 go(i + 1, Cons(TStar, acc))
-            } else if (c == '/') {
+            } else if c == '/' {
                 go(i + 1, Cons(TSlash, acc))
-            } else if (c == '(') {
+            } else if c == '(' {
                 go(i + 1, Cons(TLParen, acc))
-            } else if (c == ')') {
+            } else if c == ')' {
                 go(i + 1, Cons(TRParen, acc))
             } else {
                 throw LexError("unexpected char")
@@ -121,7 +121,7 @@ fun tokenize(s: str): Throw<List<Token>, Error> {
 // 用记录携带 (剩余 token, 计算结果)
 // ============================================================
 type ParseError: Error = ParseError(msg: str) {
-    override fun prefix(self): str { "parse error" }
+    override fun type_name(self): str { "parse error" }
 }
 
 // factor = number | ( expr )
@@ -154,7 +154,7 @@ fun parseTermLoop(acc: i32, toks: List<Token>): Throw<(value: i32, rest: List<To
         }
         Cons(TSlash, rest) => {
             val f = parseFactor(rest)?
-            if (f.value == 0) { throw ParseError("division by zero") }
+            if f.value == 0 { throw ParseError("division by zero") }
             else { parseTermLoop(acc / f.value, f.rest) }
         }
         _ => Ok((value: acc, rest: toks))
@@ -192,7 +192,7 @@ fun calc(s: str): Throw<i32, Error> {
 
 fun run(s: str): str {
     match calc(s) {
-        Ok(v) => s + " = " + str(v)
+        Ok(v) => s + " = " + cast(v).to(str)
         Error(e) => s + " => " + e.message()
     }
 }

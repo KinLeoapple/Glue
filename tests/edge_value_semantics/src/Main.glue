@@ -27,8 +27,8 @@ fun main() {
     println(r.y)        // 6 (其它字段不变)
 
     // ---- 记录传参：函数内不改，外部原样 ----
-    val pt = (x: 3, y: 4, z: 9)
-    println(takesRec(pt))   // 7
+    val pt = (x: 3i32, y: 4i32, z: 9i32)
+    println(takesRec((x: pt.x, y: pt.y)))   // 7
     println(pt.x)           // 3
 
     // ---- 多层别名链 ----

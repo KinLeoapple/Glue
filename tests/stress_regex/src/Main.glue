@@ -21,27 +21,27 @@ type Regex =
 // k 返回 bool（最终是否到达接受态）。返回 bool。
 // 用 i32 位置 + 闭包续延模拟 CPS。
 // ============================================================
-fun strLen(s: str): i32 { s.len() }
+fun strLen(s: str): i32 { cast(s.len()).to(i32) }
 
-fun matchRe(re: Regex, s: str, pos: i32, k): bool {
+fun matchRe(re: Regex, s: str, pos: i32, k: (i32) -> bool): bool {
     match re {
         Empty => k(pos)
         Lit(ch) => {
-            if (pos < s.len() && s[pos] == ch) { k(pos + 1) } else { false }
+            if pos < cast(s.len()).to(i32) && s[cast(pos).to(usize)] == ch { k(pos + 1) } else { false }
         }
         AnyChar => {
-            if (pos < s.len()) { k(pos + 1) } else { false }
+            if pos < cast(s.len()).to(i32) { k(pos + 1) } else { false }
         }
         Seq(r1, r2) => {
             // 匹配 r1，其续延是"匹配 r2 然后调 k"
             matchRe(r1, s, pos, fun(p2) { matchRe(r2, s, p2, k) })
         }
         Alt(r1, r2) => {
-            if (matchRe(r1, s, pos, k)) { true } else { matchRe(r2, s, pos, k) }
+            if matchRe(r1, s, pos, k) { true } else { matchRe(r2, s, pos, k) }
         }
         Opt(r) => {
             // 先试匹配 r，失败则跳过
-            if (matchRe(r, s, pos, k)) { true } else { k(pos) }
+            if matchRe(r, s, pos, k) { true } else { k(pos) }
         }
         Star(r) => {
             matchStar(r, s, pos, k)
@@ -54,18 +54,18 @@ fun matchRe(re: Regex, s: str, pos: i32, k): bool {
 }
 
 // r* 的贪婪回溯：尝试匹配尽量多的 r，每步都可回退到调 k
-fun matchStar(r: Regex, s: str, pos: i32, k): bool {
+fun matchStar(r: Regex, s: str, pos: i32, k: (i32) -> bool): bool {
     // 先尝试再匹配一个 r（要求消费至少一个字符以避免空循环），
     // 失败或不前进则用当前 pos 调 k
     val advanced = matchRe(r, s, pos, fun(p2) {
-        if (p2 > pos) { matchStar(r, s, p2, k) } else { false }
+        if p2 > pos { matchStar(r, s, p2, k) } else { false }
     })
-    if (advanced) { true } else { k(pos) }
+    if advanced { true } else { k(pos) }
 }
 
 // 完整匹配：从 0 开始，要求续延检查是否到串尾
 fun fullMatch(re: Regex, s: str): bool {
-    matchRe(re, s, 0, fun(p) { p == s.len() })
+    matchRe(re, s, 0, fun(p) { p == cast(s.len()).to(i32) })
 }
 
 // ============================================================
@@ -77,15 +77,16 @@ fun seqOf(a: Regex, b: Regex): Regex { Seq(a, b) }
 
 // 把字符串变成字面序列： "ab" -> Seq(Lit('a'), Lit('b'))
 fun literal(s: str): Regex {
+    val n = cast(s.len()).to(i32)
     fun go(i: i32): Regex {
-        if (i >= s.len()) { Empty }
-        else if (i == s.len() - 1) { Lit(s[i]) }
-        else { Seq(Lit(s[i]), go(i + 1)) }
+        if i >= n { Empty }
+        else if i == n - 1 { Lit(s[cast(i).to(usize)]) }
+        else { Seq(Lit(s[cast(i).to(usize)]), go(i + 1)) }
     }
-    if (s.len() == 0) { Empty } else { go(0) }
+    if n == 0 { Empty } else { go(0) }
 }
 
-fun yn(b: bool): str { if (b) { "yes" } else { "no" } }
+fun yn(b: bool): str { if b { "yes" } else { "no" } }
 
 fun main() {
     // 字面串 "abc"

@@ -65,7 +65,9 @@ Glue 是一门通用编程语言，核心目标是让并行编程变得安全、
 | 变量绑定 | `val`（不可变）、`var`（可变） |
 | 并发原语 | `spawn` + `Spawn<T>.await()` + `channel` + `Atomic<T>` + `select` |
 | 协程运行时 | 依赖 Zio 库（栈式协程 + 多线程调度 + io_uring/IOCP/kqueue） |
-| 类型转换 | 显式 `Type(value)` 语法，widening 合法 narrowing 运行时检查 |
+| 类型转换 | cast builder：`cast(expr).to(T)` wrap 语义 / `cast(expr).try_to(T)` 检查语义（返回 `Throw<T, CastError>`） |
+| 平台相关整数 | `isize`/`usize` 跟随平台位宽，用于数组索引、`len()` 返回、Range 步进 |
+| Builtin 模块 | 用 Glue 自身定义内建错误类型（CastError 等），按需加载 |
 | 运算符 | 内建不可重载 |
 | 字符串 | UTF-8 编码，迭代产生 `char` |
 | 执行后端 | 字节码栈式 VM（树遍历求值器已废弃） |
@@ -82,15 +84,15 @@ Glue 的类型系统以 Hindley-Milner 为基础，扩展了代数数据类型 (
 - **安全默认**：类型 `T` 不可空，`T?` 才可空；`T` 不会抛错，`Throw<T, E>` 才可抛
 - **组合优于继承**：通过 ADT + Trait 组合行为，不提供继承
 - **显式传播**：`?` 操作符统一处理 Nullable 和 Throw 的坏值传播
-- **显式转换**：数值类型之间没有隐式转换，必须使用 `Type(value)` 显式转换
+- **显式转换**：数值类型之间没有隐式转换，必须使用 cast builder `cast(expr).to(T)` 显式转换
 - **运算符用户不可重载**：运算符对内建类型有特例（如 `str + str` 拼接），自定义类型使用命名方法
 
 ### 2.2 基础类型
 
 ```
-i8    i16    i32    i64    i128
-u8    u16    u32    u64    u128
-f8    f16   f32    f64    f128
+i8    i16    i32    i64    i128    isize
+u8    u16    u32    u64    u128    usize
+f16   f32    f64    f128
 bool
 char
 ```
@@ -104,19 +106,20 @@ char
 | `i32`  | 有符号 32 位整数  |                                             |
 | `i64`  | 有符号 64 位整数  |                                             |
 | `i128` | 有符号 128 位整数 |                                             |
+| `isize` | 平台相关有符号整数 | 64 位平台 = 8 字节，32 位平台 = 4 字节；用于指针差、内存大小 |
 | `u8`   | 无符号 8 位整数   |                                             |
 | `u16`  | 无符号 16 位整数  |                                             |
 | `u32`  | 无符号 32 位整数  |                                             |
 | `u64`  | 无符号 64 位整数  |                                             |
 | `u128` | 无符号 128 位整数 |                                             |
-| `f8`   | 8 位半精度浮点数   | binary8 e5m2                                |
+| `usize` | 平台相关无符号整数 | 64 位平台 = 8 字节，32 位平台 = 4 字节；数组索引、`len()` 返回类型、Range 步进 |
 | `f16`  | 16 位半精度浮点数  | IEEE 754-2008 binary16，范围 ±65504，约 3 位十进制精度 |
 | `f32`  | 32 位单精度浮点数  | IEEE 754 binary32，约 7 位十进制精度                |
 | `f64`  | 64 位双精度浮点数  | IEEE 754 binary64，约 15 位十进制精度               |
 | `f128` | 128 位四精度浮点数 | IEEE 754-2008 binary128，约 34 位十进制精度         |
 | `bool` | 布尔类型        | 值为 `true` 或 `false`                         |
 | `char` | Unicode 标量值 | 4 字节，字面量用单引号 `'a'`，显示时无引号 `a`               |
-| `str`  | 字符串         | UTF-8 编码，字面量用双引号 `"hello"`，迭代产生 `char`      |
+| `str`  | 字符串         | UTF-8 编码，字面量用双引号 `"hello"`，迭代产生 `char`，`len()` 返回 `usize`      |
 | `()`   | 单位类型        | 又称 `Unit`，表示没有有意义的值                         |
 
 **整数溢出行为**：
@@ -138,7 +141,7 @@ val b = 0.0 / 0.0     // panic: division by zero
 ```
 
 理由：
-1. NaN 的 `NaN != NaN` 语义与 Glue 的 `==` 引用相等冲突
+1. NaN 的 `NaN != NaN` 语义与 Glue 的 `==` 值相等语义冲突——结构相等的两个值若有一个是 NaN，将产生令人困惑的结果
 2. NaN 和 Infinity 是 IEEE 754 的特殊值，增加了类型系统的不确定性——每个 `f64` 值都需要考虑"可能是 NaN"的情况
 3. 浮点除零几乎总是 bug，panic 比 silently 产生特殊值更安全
 4. 如果需要表示"无效"或"无穷大"，使用 `f64?` 或 `Throw<f64, Error>` 显式表达
@@ -161,13 +164,13 @@ for c in s {
 ```
 
 **数值类型之间无隐式转换**：
-不同数值类型之间不会自动转换，必须使用显式转换语法 `Type(value)`。
+不同数值类型之间不会自动转换，必须使用 cast builder 显式转换（见 §2.15）。
 
 ```glue
 val a: i32 = 42
-val b: i64 = i64(a)      // 显式转换
-val c: f64 = f64(a)      // 显式转换
-// val d: i64 = a         // 编译错误：no implicit conversion
+val b: i64 = cast(a).to(i64)      // 显式转换
+val c: f64 = cast(a).to(f64)      // 显式转换
+// val d: i64 = a                  // 编译错误：no implicit conversion
 ```
 
 ### 2.3 Nullable 类型
@@ -442,41 +445,43 @@ e.message    // "not found"
 
 ```glue
 type FileError: Error = FileError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "file error"
     }
 }
 
 type NetworkError: Error = NetworkError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "network error"
     }
 }
 
 type ParseError: Error = ParseError(msg: str) {
-    override fun prefix(self): str {
+    override fun type_name(self): str {
         "parse error"
     }
 }
 ```
 
-语法：`type Name: Error = Name(msg: str) { override fun prefix(self): str { "前缀" } }`
+语法：`type Name: Error = Name(msg: str) { override fun type_name(self): str { "类型名" } }`
 
 语义：
 1. 声明 `Name` 实现 Error trait（`: Error`）
 2. 定义构造器参数 `msg: str`
-3. 通过 `override fun prefix` 定义错误前缀
-4. Error trait 提供内置方法：`message(self): str` 和 `type_name(self): str`
+3. 通过 `override fun type_name` 自定义类型名（错误前缀已合并到 type_name）
+4. Error trait 提供内置方法：`message(self): str` 和 `type_name(self): str`（均可 override）
 5. **`Name` 是 `Error` 的子类型**——`FileError <: Error`
+6. throw 语句的表达式必须是 Error 子类型（error_newtype、Error trait 实现或 Throw<T, Error>）
 
 ```glue
 throw FileError("config.json not found")
 // 错误消息通过 message() 方法获取
 val e = FileError("test")
-println(e.message())  // "file error: test"
+println(e.message())   // "test"（默认实现读取 msg 字段）
+println(e.type_name()) // "file error"（用户 override 生效）
 
 throw NetworkError("connection refused")
-// 错误消息: "network error: connection refused"
+// 错误消息: "connection refused"
 ```
 
 #### 2.4.3 Error 子类型关系
@@ -710,7 +715,7 @@ type Point: (Show, Comparable) = Point(x: i32, y: i32) {
 - 多个 trait 用括号和逗号：`type T: (Trait1, Trait2) = ...`
 - 不支持为已定义的类型后续添加 trait 实现（必须在定义时一次性声明）
 
-**运算符不可重载**：`+`、`==`、`<` 等运算符是内建的，只能用于内建数值类型。自定义类型需要使用命名方法（如 `add`、`compare`、`eq`）。
+**运算符不可重载**：`+`、`<` 等运算符是内建的，只能用于内建数值类型。自定义类型需要使用命名方法（如 `add`、`compare`）。例外：`==` / `!=` 对所有类型自动派生为递归值相等（结构相等），用户不可覆盖；引用相等用 `===` / `!==`。
 
 #### 2.7.2 Trait 组合
 
@@ -1138,36 +1143,62 @@ type Celsius = Celsius(f64)
 
 ### 2.15 类型转换
 
-显式 `Type(value)` 语法，无隐式转换。
+Glue 使用 **cast builder** 语法进行显式标量类型转换，无隐式转换。
+
+```glue
+cast(expr).to(T)        // wrap 语义：截断/饱和，永不失败
+cast(expr).try_to(T)    // 检查语义：返回 Throw<T, CastError>
+```
+
+- `cast(expr).to(T)`：Rust `as` 风格，窄化按位截断（int）/ round-to-nearest（float），整数十进制无警告
+- `cast(expr).try_to(T)`：Rust `TryFrom` 风格，值超出目标范围返回 `Err(CastError)`
 
 **widening（低位转高位）**：始终合法：
 
 ```glue
 val x: i8 = 42
-val y: i16 = i16(x)     // ✓
-val z: i32 = i32(y)     // ✓
-val f: f64 = f64(z)     // ✓
+val y: i16 = cast(x).to(i16)     // ✓
+val z: i32 = cast(y).to(i32)     // ✓
+val f: f64 = cast(z).to(f64)     // ✓
 ```
 
 合法路径：
-- `i8 → i16 → i32 → i64 → i128`
-- `u8 → u16 → u32 → u64 → u128`
-- `i8 → f32 → f64`，`i16 → f32 → f64`，`i32 → f64`
-- `u8 → f32 → f64`，`u16 → f32 → f64`，`u32 → f64`
+- `i8 → i16 → i32 → i64 → i128`，`u8 → u16 → u32 → u64 → u128`
+- `isize → i64`（64 位平台），`usize → u64`（64 位平台）
+- int → float 基于**尾数精度分析**（见决策 D57）：源整数尾数位数 ≤ 目标浮点尾数位数时为宽化
+  - `i8/i16/u8/u16 → f16/f32/f64/f128` 全部宽化
+  - `i32/u32 → f32` 非宽化（24 位尾数不够），`→ f64/f128` 宽化
+  - `i64/u64 → f64` 非宽化（53 位尾数不够），`→ f128` 宽化
+  - `i128/u128 → f128` 非宽化（113 位尾数不够）
 
-**narrowing（高位转低位）**：运行时检查，值超出范围则 panic。
+**narrowing（高位转低位）**：
+- `cast(expr).to(T)`：wrap 截断，永不失败
+- `cast(expr).try_to(T)`：超范围返回 `Err(CastError)`
 
 ```glue
 val big: i64 = 42
-val small: i32 = i32(big)     // ✓ 42 在 i32 范围内
+val small: i32 = cast(big).to(i32)         // ✓ wrap：42 在 i32 范围内
 val huge: i64 = 9999999999
-val overflow: i32 = i32(huge) // ✗ panic: value does not fit in i32
+val overflow: i32 = cast(huge).to(i32)    // wrap 截断（不 panic，取低 32 位）
 
-val neg: i32 = -1
-val unsign: u32 = u32(neg)    // ✗ panic: value -1 does not fit in u32
+val checked = cast(huge).try_to(i32)      // Err(CastError)
+match checked {
+    Ok(v) => println(v),
+    Err(e) => println(e.msg)              // "cannot cast '9999999999' from i64 to i32"
+}
 ```
 
-**`str()` 类型转换**：`str()` 是内建类型转换函数，将任意值转为字符串表示，与 `i32()`、`f64()` 同类。
+**类型转换规则**：
+- `i→i` 宽化：零扩展/符号扩展；窄化：按位截断（wrap）
+- `f→f` 宽化/窄化：IEEE 754 round-to-nearest，超大值→Inf（但 Glue 浮点无 Inf，触发 panic，见决策 D82）
+- `i→f`：round-to-nearest，大整数丢精度
+- `f→i`：截断小数 + 饱和（NaN→0, +Inf→max, -Inf→min, 超大值→max/min）
+- `bool→int`：false=0, true=1；`int→bool`：0=false, 非0=true
+- `char→int`：u32 码点直接转；`int→char`：wrap 截断到 u32（不检查 Unicode 有效性，与 Rust `as` 一致）
+
+**`CastError` 类型**：内建 Error 子类型，位于 `builtin/error/CastError.glue`，字段 `from: str`、`to: str`、`msg: str`。`cast(expr).try_to(T)` 在转换失败时返回 `Err(CastError{...})`。
+
+**`str()` 类型转换**：`str()` 是内建类型转换函数，将任意值转为字符串表示。
 
 ```glue
 str(42)          // "42"
@@ -1243,21 +1274,24 @@ var x = 3       // ✗ duplicate definition: 'x' is already defined in this scop
 | 类别 | 名称 |
 |------|------|
 | I/O | `println`, `print`, `eprintln`, `eprint`, `scanln`, `scan` |
-| 工具 | `Panic`, `eq`, `type` |
-| 类型转换 | `str`, `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`, `f8`, `f16`, `f32`, `f64` |
-| 错误处理 | `Error`, `Ok` |
+| 工具 | `Panic`, `type` |
+| 类型转换 | `cast`, `str` |
+| 错误处理 | `Error`, `Ok`, `CastError` |
+
+`cast` 是 cast builder 的入口关键字（`cast(expr).to(T)` / `cast(expr).try_to(T)`），`CastError` 是 builtin 错误类型，二者均不允许遮蔽。整数/浮点类型构造器（`i8`/`i32`/`f64` 等）已退化为 cast builder，不再作为类型转换函数存在。
 
 ```glue
 val println = 42     // ✗ cannot redefine built-in 'println'
-fun eq(a, b) = a     // ✗ cannot redefine built-in 'eq'
 type Error = ...     // ✗ cannot redefine built-in 'Error'
+val cast = 5         // ✗ cannot redefine built-in 'cast'
+type CastError = ... // ✗ cannot redefine built-in 'CastError'
 ```
 
-**大小写敏感**：`eq` 和 `Eq` 是不同的标识符。`eq` 是内建函数，`Eq` 可以作为构造器名：
+**大小写敏感**：`Eq` 可以作为构造器名（不再与任何内建冲突）：
 
 ```glue
-type Ordering = | Lt | Eq | Gt   // ✓ 构造器 Eq 与内建函数 eq 不冲突
-val eq = Eq                       // ✗ 变量名 eq 与内建函数冲突
+type Ordering = | Lt | Eq | Gt   // ✓ 构造器 Eq
+val eq = Eq                       // ✓ eq 不是内建标识符，可作为变量名
 val eq_val = Eq                   // ✓
 ```
 
@@ -1328,7 +1362,7 @@ loop {
 
 ```glue
 val line = scanln()          // "42"
-val n = i32(line ?? "0")     // 用户负责类型转换
+val n = cast(line ?? "0").to(i32)     // 用户负责类型转换
 val t = scan()               // 读取一个空白分隔的 token
 ```
 
@@ -1916,7 +1950,26 @@ fun main() {
 }
 ```
 
-### 4.9 内嵌标准库
+### 4.9 Builtin 模块
+
+Builtin 模块是 Glue 自举方向的关键组件：用 Glue 自身定义内建错误类型和元信息，避免在 Zig 主机代码中硬编码。
+
+**位置**：`src/builtin/` 目录，通过 `@embedFile` 编进解释器二进制。`src/builtin.zig` 是 builtin 元信息表，sema 启动时加载。
+
+**按需加载**：builtin 模块在 sema 阶段注册元信息（类型名、字段、构造器），方法体在代码生成阶段按需编译（避免无用代码膨胀）。
+
+**首批 builtin 模块**：
+
+- **`builtin/error/CastError.glue`** — cast builder 失败错误类型，`CastError: Error`，字段：
+  - `from: str` —— 源类型名
+  - `to: str` —— 目标类型名
+  - `msg: str` —— 人类可读错误消息（如 `"cannot cast '9999999999' from i64 to i32"`）
+
+- **`builtin/error/pack.glue`** — Error 子类型的统一打包/拆包逻辑（`pack`/`unpack`/`type_name` 等）
+
+**与 cast builder 的关系**：`cast(expr).try_to(T)` 在转换失败时由引擎构造 `CastError{from, to, msg}` 并包装为 `Throw<T, CastError>` 的 `Err` 分支返回。
+
+### 4.10 内嵌标准库
 
 标准库用 Glue 自身编写（文档 D67：核心语言只提供 `T[]`，集合等属 std 库），通过
 `@embedFile` 编进解释器二进制。`import <Name>` 加载模块时，**项目内同名文件优先**（允许用户
@@ -2070,7 +2123,7 @@ type UserId = UserId(i32)
 
 // 自定义错误
 type FileError: Error = FileError(msg: str) {
-    override fun prefix(self): str { "file error" }
+    override fun type_name(self): str { "file error" }
 }
 ```
 
@@ -2111,7 +2164,7 @@ loop {
 }
 
 // for（需要 Iterable<T>）
-for i in 0..100 { println(i) }
+for i in 0..100 { println(i) }    // 0..100 默认推断为 usize Range（见 §6.12.1）
 
 // while
 while condition() { do_work() }
@@ -2128,6 +2181,8 @@ fun find(items: List<i32>, target: i32) : i32? {
     null    // 未找到，返回 null
 }
 ```
+
+**Range 默认 usize**：当 `start..end` 字面量用于 for 循环迭代变量或数组索引上下文时，推断为 `usize`。若需其他整数类型，显式标注（`0i32..100i32`）或用 cast 转换。
 
 #### 6.7.1 尾调用优化
 
@@ -2205,13 +2260,38 @@ for i in 1..=3 {
 
 > 注：`++` 仅用于数组拼接，不是自增运算符——Glue 没有 `x++` / `++x` 自增语法（参考 Zig，自增请用 `x += 1`）。
 
+#### 索引运算符
+
+```
+arr[i]   数组/字符串索引（i 必须为 usize）
+```
+
+数组索引 `arr[i]` 强制 `i` 为 `usize` 类型。若 `i` 是其他整数类型（如 `i32`），必须用 cast 转换：
+
+```glue
+val arr: i64[] = [10, 20, 30]
+val i = 1i32
+val v = arr[cast(i).to(usize)]     // ✓ 显式转换为 usize
+// val v = arr[i]                  // ✗ sema error: array index must be usize, got i32
+```
+
+`str[i]` 同样要求 `i: usize`，返回第 i 个 Unicode 标量值（`char`）。
+
 #### 比较运算符
 
 ```
 ==   !=   <    >    <=   >=
+===  !==              // 引用相等 / 引用不等
 ```
 
-**`==` 引用相等**：基础类型值相等，ADT 比较内存地址。结构相等用 `eq` 方法。
+**`==` 值相等（递归结构相等）**：对任意类型自动派生，用户不可覆盖。
+- 标量：直接比较数值
+- str：逐字节比较 UTF-8 内容
+- array：按元素递归比较
+- record / ADT / newtype：按字段递归比较
+- **UB 警告**：递归类型（如 `type List<T> = | Cons(T, List<T>)`）若存在循环引用，结构相等将进入无限递归，行为为未定义。不做运行时检测。
+
+**`===` 引用相等**：比较两个值的内存地址。标量上退化为 `==`（因为没有地址概念）。
 
 #### 逻辑运算符
 
@@ -2235,7 +2315,7 @@ for i in 1..=3 {
 #### 运算符优先级（从高到低）
 
 ```
-1.  ?.  .   函数调用
+1.  ?.  .   函数调用  []  索引
 2.  ?   !
 3.  !   -（前缀）
 4.  *  /  %
@@ -2256,6 +2336,8 @@ for i in 1..=3 {
 42              // 无后缀、无标注：推断为能容纳该值的最小类型（此处 i8）
 42i32           // 显式 i32
 42u64           // 显式 u64
+42usize         // 显式 usize（平台相关位宽）
+42isize         // 显式 isize（平台相关位宽）
 3.14            // 无后缀、无标注：推断为能精确往返表示该值的最小浮点类型（此处 f128）
 3.14f32         // 显式 f32
 0xFF            // 十六进制
@@ -2273,14 +2355,19 @@ true  false  null
 
 整数字面量的类型按如下优先级确定：
 
-1. **显式后缀**最高优先：`42i32`、`255u8` 直接采用后缀类型。
-2. **显式类型标注**次之：`val x: i64 = 5` 中字面量按标注类型 `i64` 处理（声明 / 形参处转换）。
-3. **既无后缀也无标注**时，推断为**能容纳该值的最小类型**：非负值按 `i8 → u8 → i16 → u16 → i32 → u32 → i64 → u64 → i128 → u128` 逐级取首个可容纳者（同位宽优先有符号），负值按 `i8 → i16 → i32 → i64 → i128`。例如 `42` 为 `i8`、`200` 为 `u8`、`-200` 为 `i16`、`100000` 为 `i32`。
+1. **显式后缀**最高优先：`42i32`、`255u8`、`42usize`、`42isize` 直接采用后缀类型。
+2. **上下文提升**：当字面量用于数组索引、`for i in 0..N` 的 Range、或与 `usize`/`isize` 类型比较/赋值的位置时，无后缀无标注字面量自动提升为 `usize`。
+3. **显式类型标注**次之：`val x: i64 = 5` 中字面量按标注类型 `i64` 处理（声明 / 形参处转换）。
+4. **既无后缀也无标注**时，推断为**能容纳该值的最小类型**：非负值按 `i8 → u8 → i16 → u16 → i32 → u32 → i64 → u64 → i128 → u128` 逐级取首个可容纳者（同位宽优先有符号），负值按 `i8 → i16 → i32 → i64 → i128`。例如 `42` 为 `i8`、`200` 为 `u8`、`-200` 为 `i16`、`100000` 为 `i32`。
 
 > 注意：在"最小类型"规则下，无标注字面量参与算术时按各自的最小类型做范围检查。
 > 例如 `100 + 100`：两操作数均为 `i8`（最大 127），结果 `200` 超出 `i8` 范围会触发
 > 算术溢出 panic。需要更大范围时请加后缀（`100i32 + 100`）或标注变量类型
 > （`val a: i32 = 100`）。
+
+**isize/usize 类型检查规则**（Rust 风格严格类型）：
+- 字面量可上下文提升：`val n: usize = 5` ✓（字面量 5 提升为 usize）
+- 显式变量之间严格统一：`var i: i32 = 0; var j: usize = 0; i < j` ✗ 类型不匹配，需 `cast(i).to(usize)` 或 `cast(j).to(i32)`
 
 浮点字面量遵循同样的优先级（后缀 > 标注 > 默认），但默认规则不同：
 
@@ -2293,10 +2380,12 @@ true  false  null
 `start..end` 不是独立类型，元素类型由推断决定。
 
 ```glue
-0..3            // i8 范围（自动推断）
+0..3            // usize 范围（默认，用于迭代和索引上下文）
 0i32..1000i32   // i32 范围（显式指定）
 0u64..1000u64   // u64 范围
 ```
+
+**默认 usize**：当 Range 字面量用于 `for i in 0..N`、数组索引上下文、或 `arr.len()` 比较时，元素类型自动推断为 `usize`。需其他整数类型时显式标注两端（`0i32..100i32`）。
 
 Range 实现 `Iterable<T>`。
 
@@ -2312,7 +2401,7 @@ val result = "{x} + {x} = {x + x}"      // "10 + 10 = 20"
 val raw = "{{not interpolated}}"         // "{not interpolated}"
 ```
 
-- `{expression}` 会调用 `str()` 转为字符串（内建类型转换函数，与 `i32()`、`f64()` 同类）
+- `{expression}` 会调用 `str()` 转为字符串（内建类型转换函数）
 - `{{` → `{`，`}}` → `}`
 - `\"` → `"`，`\\` → `\`
 - `\n`、`\t`、`\r` → 换行、制表、回车
@@ -2388,7 +2477,7 @@ payload: u64     // 8 字节载荷
 | 调用/返回 | `OP_CALL`（顶层快路径）、`OP_CALL_VALUE`（栈上闭包）、`OP_TAIL_CALL`（TCO）、`OP_CALL_NATIVE`（内建）、`OP_RETURN` |
 | 闭包/upvalue | `OP_CLOSURE`、`OP_GET_UPVALUE`、`OP_SET_UPVALUE`、`OP_GET_UPVALUE_RAW` |
 | 复合值/match | `OP_MAKE_ADT`、`OP_GET_FIELD`、`OP_GET_ADT_FIELD`、`OP_TEST_CTOR`、`OP_MATCH_FAIL`、`OP_MAKE_ARRAY`、`OP_MAKE_RECORD`、`OP_INDEX`、`OP_TEST_LIT`、`OP_RECORD_EXTEND`、`OP_MAKE_NEWTYPE`、`OP_TEST_NEWTYPE`、`OP_GET_NEWTYPE_INNER`、`OP_MAKE_ERROR` |
-| 字符串/转换 | `OP_INTERP`、`OP_CAST`、`OP_COERCE`、`OP_CONCAT_LIST` |
+| 字符串/转换 | `OP_INTERP`、`OP_CAST_TO`（cast builder `.to`，wrap 语义）、`OP_CAST_TRY_TO`（cast builder `.try_to`，返回 `Throw<T, CastError>`）、`OP_COERCE`、`OP_CONCAT_LIST` |
 | 字段/索引赋值 | `OP_SET_FIELD`、`OP_SET_INDEX` |
 | 异常/Nullable | `OP_JUMP_IF_NOT_NULL/NULL`、`OP_NON_NULL`、`OP_PROPAGATE`、`OP_THROW`、`OP_TEST_THROW`、`OP_GET_THROW_OK/ERR` |
 | 方法调用/for | `OP_CALL_METHOD`、`OP_FOR_NEXT`、`OP_MAKE_RANGE` |
@@ -2493,9 +2582,10 @@ runtime/
 
 | 类别 | 特性 |
 |---|---|
-| **基础类型** | i8..i128、u8..u128、f16/f32/f64/f128、bool、char、str、Unit |
-| **字面量** | 整数（最小类型推断 + 后缀 + 标注）、浮点（round-trip 最小类型）、十六进制/八进制/二进制、下划线分隔、char、字符串插值、数组、记录 |
-| **运算符** | 算术、比较、逻辑、位、Nullable（`?.`/`??`/`!`/`?`）、范围（`..`/`..=`）、数组拼接（`++`） |
+| **基础类型** | i8..i128、u8..u128、isize/usize（平台相关）、f16/f32/f64/f128、bool、char、str、Unit |
+| **字面量** | 整数（最小类型推断 + 后缀 + 标注 + 上下文提升）、浮点（round-trip 最小类型）、十六进制/八进制/二进制、下划线分隔、char、字符串插值、数组、记录 |
+| **运算符** | 算术、比较、逻辑、位、Nullable（`?.`/`??`/`!`/`?`）、范围（`..`/`..=`，默认 usize）、数组拼接（`++`）、索引（强制 usize） |
+| **类型转换** | cast builder：`cast(expr).to(T)` wrap / `cast(expr).try_to(T)` 检查（返回 `Throw<T, CastError>`），基于尾数精度分析的宽化判定 |
 | **变量绑定** | `val`/`var`、类型收窄、嵌套遮蔽 |
 | **函数** | 命名函数、Lambda、默认柯里化、var 参数、禁止链式调用、TCO |
 | **类型** | 枚举、记录、递归类型、抽象类型、Type Alias、Newtype |
@@ -2525,7 +2615,7 @@ runtime/
 | **调用** | 顶层快路径、栈上闭包、TCO、Native 内建、部分应用 |
 | **复合值** | ADT 构造/解构、记录字面量/扩展/更新、Newtype、数组、索引 |
 | **字符串** | 插值、`str()` 转换、UTF-8 codepoint 索引 |
-| **类型转换** | `OP_CAST`（widening/narrowing 运行时检查）、`OP_COERCE`（best-effort 数值协调） |
+| **类型转换** | `OP_CAST_TO`（cast builder `.to`，wrap 语义）、`OP_CAST_TRY_TO`（cast builder `.try_to`，返回 `Throw<T, CastError>`）、`OP_COERCE`（best-effort 数值协调） |
 | **赋值** | 字段赋值（COW）、索引赋值（COW）、复合赋值、全局变量读写 |
 | **异常/Nullable** | `?.`/`??`/`!`/`?`/`throw`/Ok-Error 模式匹配 |
 | **方法分派** | 内建方法表、用户 trait 方法表（数值宽度互通）、trait 默认方法、自由函数式 trait 方法 |
@@ -2596,7 +2686,7 @@ VM 当前可处理所有合法 Glue 程序。`vmEligible`（`src/main.zig`）仅
 | D47 | str 用 UTF-8 | 内存高效 | UTF-16 / char[] |
 | D48 | 运算符不可重载 | 简单可预测 | 支持重载 |
 | D49 | Iterable/Iterator Trait | 统一迭代协议 | 内建 for 循环 |
-| D50 | `==` 引用相等 | 性能可预测 O(1)，结构相等用 `eq` | 结构相等为默认 |
+| D50 | `==` 值相等 + `===` 引用相等 | `==` 自动派生结构相等符合主流；`===` 显式引用相等 | 结构相等为默认 |
 | D51 | `?` 不跨 Nullable/Throw | null 和 error 语义不同 | 自动转换 |
 | D52 | Panic 不可捕获 | bug 不应恢复，协程级隔离 | panic/recover |
 | D53 | `Panic()` 触发 panic | 不可捕获，协程级隔离，简单统一 | 三级断言(assert/precondition/fatal) |
@@ -2625,6 +2715,14 @@ VM 当前可处理所有合法 Glue 程序。`vmEligible`（`src/main.zig`）仅
 | D76 | Value 16 字节紧凑表示 | tag + payload 双字，小值内联大值装箱，栈拷贝廉价 | 64 字节 union(enum) 按值拷贝 |
 | D77 | 栈式 VM（非寄存器式） | 与表达式求值天然契合，编译器实现量小 | 寄存器式 VM |
 | D78 | 现编译现执行（无磁盘字节码缓存） | 编译耗时相对运行时可忽略 | JIT / 字节码缓存到磁盘 |
+| D79 | cast builder 取代 `Type(value)` 转换语法 | 显式转换入口，`cast(expr).to(T)` / `cast(expr).try_to(T)` 双轨语义清晰，wrap vs 检查一目了然 | 保留 `Type(value)` 函数式语法 |
+| D80 | `to` wrap / `try_to` 返回 Throw | 对齐 Rust `as` vs `TryFrom` 双轨，wrap 永不失败、检查失败显式返回 CastError | 单一语义（全部 panic 或全部 wrap） |
+| D81 | cast 是 D56 例外 | 显式转换由用户承担风险，wrap 窄化不触发溢出 panic；非 cast 路径仍严格遵守 D56 | cast 也走 panic 语义 |
+| D82 | D61 强化：cast 产生 Inf 触发 panic | f→f 窄化或 i→f 转换可能产生 Inf，违反 D61（浮点无 Inf），此时 panic 而非返回特殊值 | 允许 cast 产生 Inf |
+| D83 | isize/usize 跟随平台 | 解决索引、Range、`len()` 返回、TypeInfo 位宽问题；64 位平台 8 字节，32 位平台 4 字节 | 固定 64 位 |
+| D84 | 数组索引强制 usize | 类型安全，消除有符号索引与无符号长度的反复转换 | 允许任意整数类型索引 |
+| D85 | builtin 用 Glue 自举 | builtin 错误类型（CastError 等）用 Glue 自身定义，避免在 Zig 主机硬编码，符合自举方向 | builtin 全部硬编码在 Zig |
+| D86 | builtin 按需加载 | sema 阶段注册元信息，代码生成阶段按需编译方法体，避免无用代码膨胀 | 全量加载 builtin 模块 |
 
 ---
 
@@ -2665,8 +2763,8 @@ VM 当前可处理所有合法 Glue 程序。`vmEligible`（`src/main.zig`）仅
 | 字节码 VM | Bytecode VM | 将 AST 编译为线性字节码后由栈式执行引擎运行 |
 | Chunk | Chunk | 字节码指令序列 + 立即数编码 |
 | 先检查后求值 | Check-then-eval | Sema 先完成类型检查，类型错误阻止求值；VM 信任类型信息 |
-| 引用相等 | Reference Equality | `==` 比较内存地址（ADT）或值（基础类型） |
-| 结构相等 | Structural Equality | `eq` 方法逐字段比较 |
+| 值相等 | Value Equality | `==` 自动派生，递归比较内容（结构相等） |
+| 引用相等 | Reference Equality | `===` 比较内存地址；标量退化为值相等 |
 | Panic | Panic | 不可恢复的 bug，不可捕获，协程级隔离 |
 | 断言 | Assertion | 统一为 `Panic()` 构造器，不可恢复，不可捕获 |
 | defer | defer | 延迟执行，LIFO 顺序，覆盖正常返回/throw/panic |

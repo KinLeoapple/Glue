@@ -1,12 +1,12 @@
 // Phase 4 并发原语功能验证
 // 严格按照语言设计规范 Phase 4 表格：
-//   Atomic<T>、Spawn<T>、Channel、select、Per-Heap GC
+//   Atomic<T>、Async<T>、Channel、select、Per-Heap GC
 
 // ============================================================
 // 1. async 函数 + await 基本功能
 // ============================================================
 
-// async 函数：调用返回 Spawn<T>，需 .await() 取结果
+// async 函数：调用返回 Async<T>，需 .await() 取结果
 async fun make42(): i64 { 42 }
 
 // async 函数深拷贝捕获：内部修改不影响外部
@@ -22,7 +22,7 @@ async fun mul42(): i64 { 7 * 6 }
 async fun make99(): i64 { 99 }
 
 fun main() {
-    // 1. async + await：async 函数调用返回 Spawn<T>，await 阻塞等待结果
+    // 1. async + await：async 函数调用返回 Async<T>，await 阻塞等待结果
     val s1 = make42()
     val r1 = s1.await()
     println(r1)
@@ -37,7 +37,7 @@ fun main() {
 
     // 3. Atomic<T> 跨 async 共享
     // Atomic 在实参传递时浅拷贝，共享底层内存
-    var counter = atomic 0
+    var counter = atomic 0i64
     val s3 = incrAtomic(counter)
     s3.await()
     println(counter)
@@ -74,7 +74,7 @@ fun main() {
     println(rv)
     sender.close()
 
-    // 7. SpawnStatus 查询
+    // 7. AsyncStatus 查询
     val s4 = make99()
     val status_before = s4.status()
     println(status_before)

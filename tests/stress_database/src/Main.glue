@@ -12,21 +12,21 @@ fun len<T>(l: List<T>): i32 {
     match l { Nil => 0, Cons(_, t) => 1 + len(t) }
 }
 
-fun mapL<T, U>(l: List<T>, f): List<U> {
+fun mapL<T, U>(l: List<T>, f: (T) -> U): List<U> {
     match l { Nil => Nil, Cons(x, t) => Cons(f(x), mapL(t, f)) }
 }
 
-fun filterL<T>(l: List<T>, pred): List<T> {
+fun filterL<T>(l: List<T>, pred: (T) -> bool): List<T> {
     match l {
         Nil => Nil
         Cons(x, t) => {
             val rest = filterL(t, pred)
-            if (pred(x)) { Cons(x, rest) } else { rest }
+            if pred(x) { Cons(x, rest) } else { rest }
         }
     }
 }
 
-fun foldL<T, A>(l: List<T>, init: A, f): A {
+fun foldL<T, A>(l: List<T>, init: A, f: (A, T) -> A): A {
     match l { Nil => init, Cons(x, t) => foldL(t, f(init, x), f) }
 }
 
@@ -55,7 +55,7 @@ fun findById(db: Db, id: i32): Emp? {
                 match l {
                     Nil => null
                     Cons(e, t) => {
-                        match e { Emp(eid, _, _, _) => if (eid == id) { e } else { go(t) } }
+                        match e { Emp(eid, _, _, _) => if eid == id { e } else { go(t) } }
                     }
                 }
             }
@@ -76,38 +76,38 @@ fun empDept(e: Emp): str { match e { Emp(_, _, d, _) => d } }
 fun empName(e: Emp): str { match e { Emp(_, n, _, _) => n } }
 
 fun byDept(db: Db, dept: str): List<Emp> {
-    filterL(allRows(db), fun(e) { empDept(e) == dept })
+    filterL(allRows(db), fun(e: Emp) { empDept(e) == dept })
 }
 
 fun totalSalary(emps: List<Emp>): i32 {
-    foldL(emps, 0, fun(acc, e) { acc + empSalary(e) })
+    foldL(emps, 0i32, fun(acc: i32, e: Emp) { acc + empSalary(e) })
 }
 
 fun maxSalary(emps: List<Emp>): i32 {
-    foldL(emps, 0, fun(acc, e) { if (empSalary(e) > acc) { empSalary(e) } else { acc } })
+    foldL(emps, 0i32, fun(acc: i32, e: Emp) { if empSalary(e) > acc { empSalary(e) } else { acc } })
 }
 
 // 给某部门所有人加薪 pct%，返回新 Db
 fun raiseSalary(db: Db, dept: str, pct: i32): Db {
-    val updated = mapL(allRows(db), fun(e) {
+    val updated = mapL(allRows(db), fun(e: Emp) {
         match e {
-            Emp(id, n, d, s) => if (d == dept) { Emp(id, n, d, s + s * pct / 100) } else { e }
+            Emp(id, n, d, s) => if d == dept { Emp(id, n, d, s + s * pct / 100) } else { e }
         }
     })
     Db(updated)
 }
 
 fun showEmps(emps: List<Emp>): str {
-    foldL(emps, "", fun(acc, e) { acc + empName(e) + "(" + str(empSalary(e)) + ") " })
+    foldL(emps, "", fun(acc: str, e: Emp) { acc + empName(e) + "(" + cast(empSalary(e)).to(str) + ") " })
 }
 
 fun main() {
     var db = emptyDb()
-    db = insert(db, Emp(1, "Alice", "eng", 100))
-    db = insert(db, Emp(2, "Bob", "eng", 120))
-    db = insert(db, Emp(3, "Carol", "sales", 90))
-    db = insert(db, Emp(4, "Dave", "sales", 80))
-    db = insert(db, Emp(5, "Eve", "eng", 150))
+    db = insert(db, Emp(1i32, "Alice", "eng", 100i32))
+    db = insert(db, Emp(2i32, "Bob", "eng", 120i32))
+    db = insert(db, Emp(3i32, "Carol", "sales", 90i32))
+    db = insert(db, Emp(4i32, "Dave", "sales", 80i32))
+    db = insert(db, Emp(5i32, "Eve", "eng", 150i32))
 
     println(len(allRows(db)))                          // 5
 
@@ -143,7 +143,7 @@ fun main() {
     println(totalSalary(byDept(db2, "sales")))         // 170
 
     // 高薪过滤（>= 100）
-    val highPaid = filterL(allRows(db), fun(e) { empSalary(e) >= 100 })
+    val highPaid = filterL(allRows(db), fun(e: Emp) { empSalary(e) >= 100 })
     println(len(highPaid))                             // 3 (Alice100, Bob120, Eve150)
 
     println("stress3: All tests passed!")

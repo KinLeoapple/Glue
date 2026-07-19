@@ -11,12 +11,12 @@ const type_check = @import("type_check");
 pub const TypeInferencer = type_check.TypeInferencer;
 
 /// 返回类型名为 `name` 的类型构造器所期望的类型参数个数（种类 arity）。
-/// 内建高阶类型（Throw/Atomic/Spawn 等）使用固定 arity，自定义 ADT 取其声明的
+/// 内建高阶类型（Throw/Atomic/Async 等）使用固定 arity，自定义 ADT 取其声明的
 /// 类型参数个数，其余裸类型名 arity 为 0。
 pub fn arityOfTypeName(inferencer: *TypeInferencer, name: []const u8) usize {
     if (std.mem.eql(u8, name, "Throw")) return 2;
     if (std.mem.eql(u8, name, "Atomic") or
-        std.mem.eql(u8, name, "Spawn") or
+        std.mem.eql(u8, name, "Async") or
         std.mem.eql(u8, name, "Channel") or
         std.mem.eql(u8, name, "Sender") or
         std.mem.eql(u8, name, "Receiver") or
@@ -43,7 +43,8 @@ pub fn checkTypeNode(
             if (isTypeParam(n.name, type_param_names)) return;
             const arity = arityOfTypeName(inferencer, n.name);
             if (arity > 0) {
-                inferencer.addErrorAt(.type_mismatch, n.location.line, n.location.column, "kind mismatch: type constructor '{s}' expects {d} type argument(s) but is used as a concrete type", .{ n.name, arity });
+                const loc = ast.typeNodeLocation(node);
+                inferencer.addErrorAt(.type_mismatch, loc.line, loc.column, "kind mismatch: type constructor '{s}' expects {d} type argument(s) but is used as a concrete type", .{ n.name, arity });
             }
         },
         .self_type => {
@@ -53,7 +54,8 @@ pub fn checkTypeNode(
             if (!isTypeParam(g.name, type_param_names)) {
                 const arity = arityOfTypeName(inferencer, g.name);
                 if (arity != 0 and arity != g.args.len) {
-                    inferencer.addErrorAt(.type_mismatch, g.location.line, g.location.column, "kind mismatch: type constructor '{s}' expects {d} type argument(s) but got {d}", .{ g.name, arity, g.args.len });
+                    const loc = ast.typeNodeLocation(node);
+                    inferencer.addErrorAt(.type_mismatch, loc.line, loc.column, "kind mismatch: type constructor '{s}' expects {d} type argument(s) but got {d}", .{ g.name, arity, g.args.len });
                 }
             }
             for (g.args) |arg| {

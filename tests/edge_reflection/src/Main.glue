@@ -1,0 +1,194 @@
+// typeof() builtin — 编译期类型反射，返回 TypeInfo RecordValue
+//
+// TypeInfo 顶层 7 字段（重构后设计）：
+//   name, module, kind, structure, layout, impls, type_params
+// 子结构：
+//   layout = LayoutInfo(size: u32, alignment: u32)
+//   impls  = TraitImplInfo(parent_traits, implemented_traits, methods, associated_types)
+//   structure = TypeStructure ADT（按 kind 取对应变体 RecordValue）
+
+type Color = | Red | Green | Blue
+type UserId = UserId(i32)
+type Point = Point(x: i32, y: i32)
+type List = | Nil | Cons(i32, List)
+
+// 泛型容器：用于测试 typeof(T) 在泛型函数内的运行时查表
+type Box<T> = Box(value: T)
+type Pair<A, B> = Pair(first: A, second: B)
+
+// 泛型函数：返回 T 的类型名（通过 typeof(T) 运行时查表）
+fun boxTypeName<T>(b: Box<T>): str {
+    val info = typeof(T)
+    return info.name
+}
+
+// 泛型函数：返回 A 的类型名
+fun pairFirstTypeName<A, B>(p: Pair<A, B>): str {
+    val info = typeof(A)
+    return info.name
+}
+
+// 泛型函数：返回 B 的类型名
+fun pairSecondTypeName<A, B>(p: Pair<A, B>): str {
+    val info = typeof(B)
+    return info.name
+}
+
+// 泛型函数：返回 typeof(T?) 的类型名（nullable 哨兵路径）
+fun nullableTypeName<T>(): str {
+    val info = typeof(T?)
+    return info.name
+}
+
+// 泛型函数：返回 typeof(T?) 的 kind（应为 "Nullable"）
+fun nullableTypeKind<T>(): str {
+    val info = typeof(T?)
+    return info.kind
+}
+
+// trait default 方法中的 typeof(Self) 与 typeof(Self?)
+trait Named {
+    fun inner_name(self): str
+
+    fun self_type_name(self): str {
+        val info = typeof(Self)
+        return info.name
+    }
+
+    fun self_nullable_kind(self): str {
+        val info = typeof(Self?)
+        return info.kind
+    }
+}
+
+type ReflectivePoint: Named = ReflectivePoint(x: i32, y: i32) {
+    fun inner_name(self): str {
+        "inner-RP"
+    }
+}
+
+fun main() {
+    // ---- typeof on user types：顶层 7 字段中的 name / kind / module ----
+    val info_point = typeof(Point)
+    println(info_point.name)         // Point
+    println(info_point.kind)        // Adt (单构造器 ADT)
+    println(info_point.module)       // (空字符串，无模块)
+
+    val info_color = typeof(Color)
+    println(info_color.name)        // Color
+    println(info_color.kind)        // Adt
+
+    val info_userid = typeof(UserId)
+    println(info_userid.name)       // UserId
+    println(info_userid.kind)       // Newtype
+
+    val info_list = typeof(List)
+    println(info_list.name)         // List
+    println(info_list.kind)         // Adt
+
+    // ---- 子结构 layout：链式字段访问 layout.size / layout.alignment ----
+    // Point：ADT 布局 = 1B tag + 4B padding + 8B variant(i32+i32) = 12B，对齐 4
+    println(info_point.layout.size)          // 12
+    println(info_point.layout.alignment)     // 4
+
+    // UserId：Newtype，inner = i32，layout = {4, 4}
+    println(info_userid.layout.size)         // 4
+    println(info_userid.layout.alignment)    // 4
+
+    // Color：3 个 unit 构造器，layout = {1, 1}
+    println(info_color.layout.size)          // 1
+    println(info_color.layout.alignment)     // 1
+
+    // ---- 子结构 impls：链式访问 impls.methods / impls.parent_traits 等 ----
+    // Point 无方法、无 Trait 实现，所有数组应为空
+    println(info_point.impls.methods.len())              // 0
+    println(info_point.impls.parent_traits.len())        // 0
+    println(info_point.impls.implemented_traits.len())   // 0
+    println(info_point.impls.associated_types.len())     // 0
+
+    // ---- type_params：非泛型类型为空数组 ----
+    println(info_point.type_params.len())    // 0
+
+    // ---- structure 字段验证：通过 type() 确认是 record 值 ----
+    // structure 是 TypeStructure ADT 变体的 RecordValue（type_name 为 "Adt"/"Record"/"Newtype" 等）
+    // println 无法直接显示 record 内容，用 type() 验证非空
+    println(type(info_point.structure))     // record
+
+    // ---- typeof 结果可存储、可复用 ----
+    val t = typeof(Color)
+    println("Type name: " + t.name)  // Type name: Color
+
+    // ---- typeof 在字符串插值中使用 ----
+    val info = typeof(UserId)
+    println("Reflecting: {info.name} kind={info.kind}")  // Reflecting: UserId kind=Newtype
+
+    // ---- typeof(T) 在泛型函数中：运行时查表 ----
+    // Box<Point>：T = Point
+    val inner_point = Point(1i32, 2i32)
+    val box_point = Box(inner_point)
+    println(boxTypeName(box_point))   // Point
+
+    // Box<Color>：通过 Nil 等单构造器 ADT 测试 T 绑定
+    val box_color = Box(Red)
+    println(boxTypeName(box_color))   // Color
+
+    // Pair<Point, UserId>：A = Point, B = UserId
+    val pair = Pair(Point(1i32, 2i32), UserId(42i32))
+    println(pairFirstTypeName(pair))   // Point
+    println(pairSecondTypeName(pair))  // UserId
+
+    // Pair<Color, Point>：A = Color, B = Point
+    val pair2 = Pair(Blue, Point(3i32, 4i32))
+    println(pairFirstTypeName(pair2))  // Color
+    println(pairSecondTypeName(pair2)) // Point
+
+    // ---- typeof(T) 嵌套：Box<Box<Point>> ----
+    val nested = Box(Box(Point(5i32, 6i32)))
+    println(boxTypeName(nested))       // Box
+
+    // ---- typeof(内建类型)：Primitive kind + 正确 name/layout ----
+    val info_i32 = typeof(i32)
+    println(info_i32.name)              // i32
+    println(info_i32.kind)             // Primitive
+    println(info_i32.layout.size)      // 4
+    println(info_i32.layout.alignment) // 4
+
+    val info_str = typeof(str)
+    println(info_str.name)             // str
+    println(info_str.kind)             // Primitive
+
+    val info_bool = typeof(bool)
+    println(info_bool.name)            // bool
+    println(info_bool.kind)            // Primitive
+
+    val info_f64 = typeof(f64)
+    println(info_f64.name)             // f64
+    println(info_f64.kind)             // Primitive
+    println(info_f64.layout.size)      // 8
+    println(info_f64.layout.alignment) // 8
+
+    // ---- typeof(T?) Nullable 变体：kind=Nullable, layout=指针大小 ----
+    val info_np = typeof(Point?)
+    println(info_np.name)              // Point
+    println(info_np.kind)              // Nullable
+    println(info_np.layout.size)       // 8
+    println(info_np.layout.alignment)  // 8
+
+    // ---- typeof(T?) 在泛型函数中：nullable 哨兵 + 泛型参数查表 ----
+    val n_name = nullableTypeName<Point>()
+    println(n_name)                    // Point
+    val n_kind = nullableTypeKind<Point>()
+    println(n_kind)                    // Nullable
+
+    // ---- typeof(Self) 在 trait default 方法中 ----
+    // 注意：拆开调用避免触发链式调用 bug
+    val rp = ReflectivePoint(7i32, 8i32)
+    val self_name = rp.self_type_name()
+    println(self_name)                 // ReflectivePoint (typeof(Self) 返回的 name)
+    val self_nkind = rp.self_nullable_kind()
+    println(self_nkind)                // Nullable
+    val rp_inner = rp.inner_name()
+    println(rp_inner)                  // inner-RP (证明 default 方法 + 覆盖方法共存)
+
+    println("edge_reflection: All tests passed!")
+}

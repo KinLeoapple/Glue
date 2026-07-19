@@ -1,3 +1,0 @@
-name = "comprehensive_vm_alignment"
-version = "0.1.0"
-entry = "src/Main.glue"
