@@ -172,6 +172,8 @@ pub const ModuleLoader = struct {
                 &self.analysis_db.hoist_table,
                 &self.analysis_db.dead_code,
                 &self.analysis_db.cse,
+                &self.analysis_db.escape,
+                &self.analysis_db.param_escape,
             );
             defer fused.deinit();
             fused.analyzeModule(&module) catch {};

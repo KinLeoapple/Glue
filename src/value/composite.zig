@@ -69,11 +69,12 @@ pub const ArrayValue = struct {
 
     /// 释放所有元素并回收元素数组内存
     /// header 由 arrayDeinit 中的 freeObj 释放
+    /// arena 分配的对象：elements 也从 arena 分配，跳过 freeObj（arena.reset 统一回收）
     pub fn deinit(self: *ArrayValue, tctx: *ThreadContext) void {
         if (!obj_header.shutdown_mode) {
             for (self.elements) |*e| e.release(tctx);
         }
-        if (self.elements.len > 0) {
+        if (self.elements.len > 0 and !self.header.isArenaAllocated()) {
             tctx.freeObj(@ptrCast(self.elements.ptr));
         }
     }
@@ -154,41 +155,43 @@ pub const Range = struct {
 };
 
 // ── deinit_table 注册函数 ──
+// 所有 deinit 包装函数：执行 Type.deinit（释放内部 RC 子对象/独立缓冲区），
+// 若对象非 arena 分配则 freeObj 释放对象本体；arena 分配的对象由 arena.reset 统一回收。
 
 pub fn adtDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *AdtValue = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn newtypeDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn arrayDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *ArrayValue = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn recordDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn cellDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *Cell = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn rangeDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *Range = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 /// 注册所有复合类型的 deinit 函数

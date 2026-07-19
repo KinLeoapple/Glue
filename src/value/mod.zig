@@ -478,6 +478,22 @@ pub const Value = union(enum) {
         return true;
     }
 
+    /// 判断值是否需要 release（标量返回 false，堆对象返回 true）
+    ///
+    /// 用于 channel drain 等批量释放场景，跳过标量值的 noop release。
+    /// 标量值在 release 中本就是 switch 分派的空分支，但批量场景下
+    /// N 次空 switch 累积开销显著（如 100K 元素 channel 关闭）。
+    pub inline fn requiresRelease(self: Value) bool {
+        return switch (self) {
+            .null_val, .unit, .boolean, .char,
+            .i8, .i16, .i32, .i64, .i128,
+            .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize,
+            .f16, .f32, .f64, .f128 => false,
+            .ref => true,
+        };
+    }
+
     // ════════════════════════════════════════════
     // 引用计数与生命周期
     // ════════════════════════════════════════════
@@ -528,7 +544,8 @@ pub const Value = union(enum) {
                     if (s.isSso()) {
                         if (s.ssoRelease()) {
                             s.deinit(tctx);
-                            tctx.freeObj(@ptrCast(s));
+                            // arena 分配的 SSO Str：本体由 arena.reset 统一回收
+                            if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(s));
                         }
                         return;
                     }

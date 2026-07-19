@@ -21,16 +21,16 @@ type Regex =
 // k 返回 bool（最终是否到达接受态）。返回 bool。
 // 用 i32 位置 + 闭包续延模拟 CPS。
 // ============================================================
-fun strLen(s: str): i32 { s.len() }
+fun strLen(s: str): i32 { cast(s.len()).to(i32) }
 
 fun matchRe(re: Regex, s: str, pos: i32, k: (i32) -> bool): bool {
     match re {
         Empty => k(pos)
         Lit(ch) => {
-            if pos < s.len() && s[cast(pos).to(usize)] == ch { k(pos + 1) } else { false }
+            if pos < cast(s.len()).to(i32) && s[cast(pos).to(usize)] == ch { k(pos + 1) } else { false }
         }
         AnyChar => {
-            if pos < s.len() { k(pos + 1) } else { false }
+            if pos < cast(s.len()).to(i32) { k(pos + 1) } else { false }
         }
         Seq(r1, r2) => {
             // 匹配 r1，其续延是"匹配 r2 然后调 k"
@@ -65,7 +65,7 @@ fun matchStar(r: Regex, s: str, pos: i32, k: (i32) -> bool): bool {
 
 // 完整匹配：从 0 开始，要求续延检查是否到串尾
 fun fullMatch(re: Regex, s: str): bool {
-    matchRe(re, s, 0, fun(p) { p == s.len() })
+    matchRe(re, s, 0, fun(p) { p == cast(s.len()).to(i32) })
 }
 
 // ============================================================

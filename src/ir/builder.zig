@@ -256,6 +256,8 @@ pub const IRBuilder = struct {
     /// 纯度表（驱动式接入）：若非 null，compileCall 查询函数纯度决定是否分配 memo_slot。
     /// 所有权归调用方，build 期间不得释放。
     purity_db: ?*const analysis_db_mod.PurityTable = null,
+    /// 逃逸分析表（驱动式注入），用于设置 Function.no_escape
+    escape_table: ?*const analysis_db_mod.EscapeTable = null,
     /// memo_slot 分配计数器（0 保留为"不缓存"，从 1 开始递增）
     memo_slot_counter: u16 = 1,
     /// 函数名 → memo_slot 映射（纯函数首次调用分配，后续相同函数复用同一 slot）
@@ -422,6 +424,12 @@ pub const IRBuilder = struct {
     /// 设置后，compileCall 会查询函数纯度，对纯函数 + 标量参数分配 memo_slot。
     pub fn setPurityDB(self: *IRBuilder, db: ?*const analysis_db_mod.PurityTable) void {
         self.purity_db = db;
+    }
+
+    /// 注入逃逸分析表（驱动式接入）。必须在 build() 之前调用。
+    /// 设置后，compileFunction 会查询函数逃逸性，设置 Function.no_escape 字段。
+    pub fn setEscapeTable(self: *IRBuilder, et: ?*const analysis_db_mod.EscapeTable) void {
+        self.escape_table = et;
     }
 
     /// 释放构建器资源（不释放产出的 IR，IR 由 GlueIR.deinit 管理）
@@ -1531,6 +1539,12 @@ pub const IRBuilder = struct {
         self.functions.items[func_idx].param_channels = param_channels;
         self.functions.items[func_idx].local_chan_start = chan_start;
         self.functions.items[func_idx].local_chan_count = chan_end - chan_start;
+        // 查询逃逸分析表，设置 no_escape 标记
+        if (self.escape_table) |et| {
+            if (@hasField(@TypeOf(fd), "name")) {
+                self.functions.items[func_idx].no_escape = et.isNoEscape(fd.name);
+            }
+        }
 
         self.current_return_chan = null;
         self.current_returns_throw = false;

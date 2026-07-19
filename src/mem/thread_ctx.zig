@@ -199,6 +199,20 @@ pub const ThreadContext = struct {
         return self.allocBySize(total_size);
     }
 
+    /// 分配 arena 对象（逃逸分析驱动：非逃逸对象走 ShadowArena）
+    /// endFunction 时由 arena.reset 统一回收，无需单独 freeObj。
+    /// 调用方必须在初始化 ObjHeader 后立即调用 markArenaAllocated()。
+    pub fn allocObjArena(self: *ThreadContext, total_size: usize) ![]u8 {
+        return self.arena.alloc(total_size);
+    }
+
+    /// 创建固定大小 arena 对象（便利方法）
+    /// 返回未初始化的 *T，调用方必须设置字段并调用 markArenaAllocated()
+    pub fn createObjArena(self: *ThreadContext, comptime T: type) !*T {
+        const mem_bytes = try self.arena.alloc(@sizeOf(T));
+        return @ptrCast(@alignCast(mem_bytes.ptr));
+    }
+
     /// 释放对象（统一入口）：从分配器元数据读取尺寸，无需调用方传 size
     /// 页池对象从 PageHeader.object_size 读取；buddy 对象从 BuddyHeader.block_size 读取
     pub fn freeObj(self: *ThreadContext, ptr: [*]u8) void {

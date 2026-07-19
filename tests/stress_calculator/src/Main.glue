@@ -73,7 +73,7 @@ type LexError: Error = LexError(msg: str) {
 
 // 从位置 i 开始扫描一个整数，返回 (值, 下一个位置)
 fun scanNum(s: str, i: i32, acc: i32): (value: i32, next: i32) {
-    if i >= s.len() {
+    if i >= cast(s.len()).to(i32) {
         (value: acc, next: i)
     } else {
         val c = s[cast(i).to(usize)]
@@ -87,7 +87,7 @@ fun scanNum(s: str, i: i32, acc: i32): (value: i32, next: i32) {
 
 fun tokenize(s: str): Throw<List<Token>, Error> {
     fun go(i: i32, acc: List<Token>): Throw<List<Token>, Error> {
-        if i >= s.len() {
+        if i >= cast(s.len()).to(i32) {
             Ok(reverseL(acc))
         } else {
             val c = s[cast(i).to(usize)]

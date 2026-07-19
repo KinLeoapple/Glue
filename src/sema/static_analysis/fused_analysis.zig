@@ -11,6 +11,7 @@ const loop_invariant_mod = @import("loop_invariant.zig");
 const purity_mod = @import("purity.zig");
 const dead_code_mod = @import("dead_code.zig");
 const cse_mod = @import("cse.zig");
+const escape_mod = @import("escape_analysis.zig");
 
 const ConstValue = const_prop_mod.ConstValue;
 const ConstEnv = const_prop_mod.ConstEnv;
@@ -21,6 +22,9 @@ const DeadTable = dead_code_mod.DeadTable;
 const DeadCodePass = dead_code_mod.DeadCodePass;
 const CseTable = cse_mod.CseTable;
 const CsePass = cse_mod.CsePass;
+const EscapeTable = escape_mod.EscapeTable;
+const EscapePass = escape_mod.EscapePass;
+const ParamEscapeTable = escape_mod.ParamEscapeTable;
 
 /// 循环展开的估算大小阈值。循环体估算大小不超过此值时视为小循环，可考虑展开。
 const UNROLL_THRESHOLD: u32 = 32;
@@ -34,6 +38,8 @@ pub const FusedAnalysis = struct {
     hoist_table: *loop_invariant_mod.HoistTable,
     dead_table: *DeadTable,
     cse_table: *CseTable,
+    escape_table: *EscapeTable,
+    param_escape_table: *ParamEscapeTable,
     allocator: std.mem.Allocator,
     /// 调用图：函数名 -> 其调用的其他函数名列表。
     name_call_graph: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
@@ -50,6 +56,8 @@ pub const FusedAnalysis = struct {
         hoist_table: *loop_invariant_mod.HoistTable,
         dead_table: *DeadTable,
         cse_table: *CseTable,
+        escape_table: *EscapeTable,
+        param_escape_table: *ParamEscapeTable,
     ) FusedAnalysis {
         return .{
             .const_table = const_table,
@@ -58,6 +66,8 @@ pub const FusedAnalysis = struct {
             .hoist_table = hoist_table,
             .dead_table = dead_table,
             .cse_table = cse_table,
+            .escape_table = escape_table,
+            .param_escape_table = param_escape_table,
             .allocator = allocator,
             .name_call_graph = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .direct_impure = std.StringHashMap(void).init(allocator),
@@ -97,6 +107,15 @@ pub const FusedAnalysis = struct {
         try dce_pass.analyzeModule(module);
         var cse_pass = CsePass.init(self.allocator, self.cse_table);
         try cse_pass.analyzeModule(module);
+        // 逃逸分析：两阶段过程间分析（参数逃逸 + 函数逃逸）
+        // 依赖 purity_table 判断纯函数参数是否逃逸
+        var escape_pass = EscapePass.init(
+            self.allocator,
+            self.escape_table,
+            self.purity_table,
+            self.param_escape_table,
+        );
+        try escape_pass.analyzeModule(module);
     }
 
     /// 递归分析表达式：常量折叠、调用图边收集、纯度判定。

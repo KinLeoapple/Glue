@@ -83,6 +83,10 @@ pub const Function = struct {
     local_chan_start: u16 = 0,
     /// 函数局部通道数量
     local_chan_count: u16 = 0,
+    /// 逃逸分析结果：true 表示函数内分配的对象不逃逸出函数作用域。
+    /// 引擎可在此类函数返回时 reset ShadowArena（当前为预留字段，
+    /// 实际启用需配合分配点分流：非逃逸对象进 ShadowArena 而非 RC 堆）
+    no_escape: bool = false,
 };
 
 // ════════════════════════════════════════════════════════════════

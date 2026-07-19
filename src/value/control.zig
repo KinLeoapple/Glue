@@ -52,17 +52,19 @@ pub const ThrowValue = struct {
 };
 
 // ── deinit_table 注册函数 ──
+// 所有 deinit 包装函数：执行 Type.deinit（释放内部 RC 子对象/独立缓冲区），
+// 若对象非 arena 分配则 freeObj 释放对象本体；arena 分配的对象由 arena.reset 统一回收。
 
 pub fn errorValDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *ErrorValue = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn throwValDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *ThrowValue = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 /// 注册所有控制流类型的 deinit 函数

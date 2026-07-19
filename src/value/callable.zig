@@ -104,8 +104,9 @@ pub const TraitValue = struct {
     /// 释放所有方法键值和关联数据
     /// method_values 是连续内存的一部分，由 traitValDeinit 中的 freeObj 统一释放
     /// method_names 当 owned=true 时为独立分配，在此逐个释放
+    /// arena 分配的对象：owned names 也从 arena 分配，跳过 freeObj
     pub fn deinit(self: *TraitValue, tctx: *ThreadContext) void {
-        if (self.owned) {
+        if (self.owned and !self.header.isArenaAllocated()) {
             for (self.method_names) |n| {
                 if (n.len > 0) tctx.freeObj(@ptrCast(@constCast(n.ptr)));
             }
@@ -140,35 +141,37 @@ pub const LazyValue = struct {
 };
 
 // ── deinit_table 注册函数 ──
+// 所有 deinit 包装函数：执行 Type.deinit（释放内部 RC 子对象/独立缓冲区），
+// 若对象非 arena 分配则 freeObj 释放对象本体；arena 分配的对象由 arena.reset 统一回收。
 
 pub fn builtinDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *Builtin = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn closureDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *Closure = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn partialDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *PartialApplication = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn traitValDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *TraitValue = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn lazyValDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *LazyValue = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 /// 注册所有可调用类型的 deinit 函数

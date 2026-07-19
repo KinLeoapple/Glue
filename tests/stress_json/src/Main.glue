@@ -49,7 +49,7 @@ fun digitVal(c: char): i32 {
 
 // 跳过空白，返回下一个非空白位置
 fun skipWs(s: str, i: i32): i32 {
-    if i >= s.len() { i }
+    if i >= cast(s.len()).to(i32) { i }
     else {
         val c = s[cast(i).to(usize)]
         if c == ' ' || c == '\n' || c == '\t' { skipWs(s, i + 1) } else { i }
@@ -59,7 +59,7 @@ fun skipWs(s: str, i: i32): i32 {
 // 解析数字
 fun parseNum(s: str, i: i32): Throw<(value: i32, next: i32), Error> {
     fun go(j: i32, acc: i32): (value: i32, next: i32) {
-        if j >= s.len() { (value: acc, next: j) }
+        if j >= cast(s.len()).to(i32) { (value: acc, next: j) }
         else {
             val c = s[cast(j).to(usize)]
             if isDigit(c) { go(j + 1, acc * 10 + digitVal(c)) } else { (value: acc, next: j) }
@@ -72,7 +72,7 @@ fun parseNum(s: str, i: i32): Throw<(value: i32, next: i32), Error> {
 // 解析字符串字面量（已在引号后），返回内容到下一个引号
 fun parseStr(s: str, i: i32): Throw<(value: str, next: i32), Error> {
     fun go(j: i32, acc: str): (value: str, next: i32) {
-        if j >= s.len() { (value: acc, next: j) }
+        if j >= cast(s.len()).to(i32) { (value: acc, next: j) }
         else {
             val c = s[cast(j).to(usize)]
             if c == '"' { (value: acc, next: j + 1) }
@@ -86,7 +86,7 @@ fun parseStr(s: str, i: i32): Throw<(value: str, next: i32), Error> {
 // 主解析：解析一个 JSON 值，返回 (json, next)
 fun parseValue(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
     val i = skipWs(s, i0)
-    if i >= s.len() { throw ParseError("unexpected end") }
+    if i >= cast(s.len()).to(i32) { throw ParseError("unexpected end") }
     else {
         val c = s[cast(i).to(usize)]
         if c == 'n' {
@@ -116,7 +116,7 @@ fun parseValue(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
 fun parseArray(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
     fun go(i: i32, acc: List<Json>): Throw<(value: Json, next: i32), Error> {
         val j = skipWs(s, i)
-        if j >= s.len() { throw ParseError("unterminated array") }
+        if j >= cast(s.len()).to(i32) { throw ParseError("unterminated array") }
         else {
             val c = s[cast(j).to(usize)]
             if c == ']' {
@@ -136,7 +136,7 @@ fun parseArray(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
 fun parseObject(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
     fun go(i: i32, acc: List<Member>): Throw<(value: Json, next: i32), Error> {
         val j = skipWs(s, i)
-        if j >= s.len() { throw ParseError("unterminated object") }
+        if j >= cast(s.len()).to(i32) { throw ParseError("unterminated object") }
         else {
             val c = s[cast(j).to(usize)]
             if c == '}' {
@@ -148,7 +148,7 @@ fun parseObject(s: str, i0: i32): Throw<(value: Json, next: i32), Error> {
                 val k = parseStr(s, j + 1)?
                 val afterKey = skipWs(s, k.next)
                 // 期望 ':'
-                if afterKey >= s.len() { throw ParseError("expected colon") }
+                if afterKey >= cast(s.len()).to(i32) { throw ParseError("expected colon") }
                 else {
                     val colon = s[cast(afterKey).to(usize)]
                     if colon == ':' {

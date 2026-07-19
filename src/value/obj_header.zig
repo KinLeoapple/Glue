@@ -54,7 +54,7 @@ pub const RefKind = enum(u8) {
 /// 作为每个堆对象 struct 的首字段，提供类型识别和引用计数。
 /// extern struct 保证跨架构内存布局一致：
 /// - type_tag: 1B，类型识别
-/// - flags: 1B，标志位（bit0: tracked，引擎已跟踪）
+/// - flags: 1B，标志位（bit0: tracked，bit1: arena_allocated）
 /// - rc: 4B，统一引用计数（初始 1）
 /// - 2B 隐式 padding 对齐到 8B
 pub const ObjHeader = extern struct {
@@ -65,6 +65,10 @@ pub const ObjHeader = extern struct {
 
     /// flags 位掩码
     pub const TRACKED: u8 = 1 << 0;
+    /// 对象从 ShadowArena 分配（逃逸分析驱动）
+    /// - release 归零时跳过 freeObj，由 endFunction 的 arena.reset 统一回收
+    /// - deinit 仍执行（释放内部非 arena 资源，如子对象 release）
+    pub const ARENA_ALLOCATED: u8 = 1 << 1;
 
     /// 标记为已被引擎跟踪
     pub inline fn markTracked(self: *ObjHeader) void {
@@ -74,6 +78,16 @@ pub const ObjHeader = extern struct {
     /// 是否已被引擎跟踪
     pub inline fn isTracked(self: *const ObjHeader) bool {
         return (self.flags & TRACKED) != 0;
+    }
+
+    /// 标记为 ShadowArena 分配
+    pub inline fn markArenaAllocated(self: *ObjHeader) void {
+        self.flags |= ARENA_ALLOCATED;
+    }
+
+    /// 是否从 ShadowArena 分配
+    pub inline fn isArenaAllocated(self: *const ObjHeader) bool {
+        return (self.flags & ARENA_ALLOCATED) != 0;
     }
 };
 
@@ -85,7 +99,7 @@ pub const ObjHeader = extern struct {
 pub const DeinitFn = *const fn (*ObjHeader, *ThreadContext) void;
 
 /// RefKind 变体数量，用于确定分派表长度
-const ref_kind_count = @typeInfo(RefKind).@"enum".fields.len;
+pub const ref_kind_count = @typeInfo(RefKind).@"enum".fields.len;
 
 /// 未注册类型占位的空析构函数
 ///
@@ -99,7 +113,7 @@ fn noopDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
 /// deinit 分派表：按 RefKind 索引到类型特定析构函数
 ///
 /// 初始全部填充 noopDeinit，由各对象模块在初始化时注册。
-var deinit_table: [ref_kind_count]DeinitFn = [_]DeinitFn{noopDeinit} ** ref_kind_count;
+pub var deinit_table: [ref_kind_count]DeinitFn = [_]DeinitFn{noopDeinit} ** ref_kind_count;
 
 /// 关闭模式标志：为 true 时，deinit 函数跳过对包含值的级联 release。
 /// 引擎 deinit 时设置为 true，tracked_objs 循环会单独释放每个跟踪的对象，

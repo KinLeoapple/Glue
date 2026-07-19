@@ -476,6 +476,8 @@ fn executeSource(
             &analysis_db.hoist_table,
             &analysis_db.dead_code,
             &analysis_db.cse,
+            &analysis_db.escape,
+            &analysis_db.param_escape,
         );
         defer fused.deinit();
         fused.analyzeModule(&entry_module) catch |err| {
@@ -483,6 +485,7 @@ fn executeSource(
         };
     }
     builder.setPurityDB(&analysis_db.purity);
+    builder.setEscapeTable(&analysis_db.escape);
     var glue_ir = builder.build(entry_module) catch |err| {
         prof.phaseEnd();
         printError(io, "{s}: IR build error: {s}\n", .{ filename, @errorName(err) });

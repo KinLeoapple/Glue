@@ -53,23 +53,25 @@ pub const RangeIterator = struct {
 };
 
 // ── deinit_table 注册函数 ──
+// 所有 deinit 包装函数：执行 Type.deinit（释放内部 RC 子对象/独立缓冲区），
+// 若对象非 arena 分配则 freeObj 释放对象本体；arena 分配的对象由 arena.reset 统一回收。
 
 pub fn arrayIterDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *ArrayIterator = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn stringIterDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *StringIterator = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 pub fn rangeIterDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *RangeIterator = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 /// 注册所有迭代器类型的 deinit 函数

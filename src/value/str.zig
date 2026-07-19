@@ -214,10 +214,13 @@ pub const Str = extern struct {
 
     /// 释放堆模式下的独立缓冲区，SSO/连续模式为空操作
     /// 注意：仅释放独立 buffer，不释放 Str 本体（Str 由 freeObj/栈管理释放）
+    /// arena 分配的对象：独立 buffer 也从 arena 分配，跳过 freeObj（arena.reset 统一回收）
     pub fn deinit(self: *Str, tctx: *ThreadContext) void {
         if (!self.isSso() and (self._word2 & HEAP_CONTIGUOUS_FLAG) == 0) {
-            const ptr: [*]u8 = @ptrFromInt(@as(usize, @truncate(self._word0)));
-            tctx.freeObj(ptr);
+            if (!self.header.isArenaAllocated()) {
+                const ptr: [*]u8 = @ptrFromInt(@as(usize, @truncate(self._word0)));
+                tctx.freeObj(ptr);
+            }
             self._word0 = 0;
             self._word1 = 0;
             self._word2 = 0;
@@ -326,10 +329,11 @@ pub const Str = extern struct {
 ///
 /// 通过 @fieldParentPtr 从 ObjHeader 指针还原为 *Str，
 /// 释放内部独立缓冲区（若有）后释放对象本体。
+/// arena 分配的对象：本体由 arena.reset 统一回收，跳过 freeObj。
 pub fn strDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
     const self: *Str = @alignCast(@fieldParentPtr("header", obj));
     self.deinit(tctx);
-    tctx.freeObj(@ptrCast(self));
+    if (!obj.isArenaAllocated()) tctx.freeObj(@ptrCast(self));
 }
 
 // ──────────────────────────────────────────────
