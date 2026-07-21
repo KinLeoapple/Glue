@@ -1,0 +1,71 @@
+// SystemTime.glue — 堆时钟（同步）+ TimeComponents
+//
+// 设计文档 §5.2 + §5.5：SystemTime newtype + TimeComponents record
+// SystemTime 基于 CLOCK_REALTIME（Unix epoch 纳秒），适合获取墙钟时间。
+// 同步实现——决策 S04。
+// TimeComponents 为 9 字段 record，syscall 层通过 makeRecordWithNames 构造。
+
+// ─── TimeComponents（syscall 层与 Glue 层共享的 record 类型） ──────
+// 字段顺序与 syscall/time.zig makeTimeComponents 一一对应：
+//   year, month, day, hour, minute, second, nanos, weekday, day_of_year
+
+pub type TimeComponents = TimeComponents(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16)
+
+// ─── SystemTime ────────────────────────────────────────────────────
+
+pub type SystemTime = SystemTime(nanos: i128)
+
+// Unix 纪元（1970-01-01 00:00:00 UTC）
+pub val UNIX_EPOCH: SystemTime = SystemTime(0)
+
+// 获取当前墙钟时间
+pub fun now(): SystemTime {
+    SystemTime(__systemtime_now_ns())
+}
+
+// ─── 加减 Duration ─────────────────────────────────────────────────
+
+pub fun add_duration(self: SystemTime, d: Duration): SystemTime {
+    SystemTime(self.nanos + d.nanos)
+}
+
+pub fun sub_duration(self: SystemTime, d: Duration): SystemTime {
+    SystemTime(self.nanos - d.nanos)
+}
+
+// self 相对 earlier 的时间长度
+pub fun duration_since(self: SystemTime, earlier: SystemTime): Duration {
+    Duration(self.nanos - earlier.nanos)
+}
+
+// ─── 与 DateTime 转换 ──────────────────────────────────────────────
+
+// 转换为本地时区的 DateTime
+pub fun to_local(self: SystemTime): DateTime {
+    val comp = __systemtime_to_local_components(self.nanos)
+    DateTime.from_components(comp)
+}
+
+// 转换为 UTC 的 DateTime
+pub fun to_utc(self: SystemTime): DateTime {
+    val comp = __systemtime_to_utc_components(self.nanos)
+    DateTime.from_components(comp)
+}
+
+// 从 UTC DateTime 构造 SystemTime（验证字段合法性）
+// 失败时返回 TimeError（字段越界 / timegm 失败）
+pub fun from_datetime_utc(dt: DateTime): Throw<SystemTime, TimeError> {
+    val comp = dt.to_components()
+    val ns = __components_to_ns_utc(comp)?
+    SystemTime(ns)
+}
+
+// ─── 比较 ──────────────────────────────────────────────────────────
+
+pub fun is_before(self: SystemTime, other: SystemTime): bool {
+    self.nanos < other.nanos
+}
+
+pub fun is_after(self: SystemTime, other: SystemTime): bool {
+    self.nanos > other.nanos
+}

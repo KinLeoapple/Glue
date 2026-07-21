@@ -17,6 +17,7 @@ const ir_mod = @import("ir");
 const mem = @import("mem");
 const value = @import("value");
 const runtime_mod = @import("runtime.zig");
+const syscall_dispatch = @import("syscall");
 
 const GlueIR = ir_mod.GlueIR;
 const Node = ir_mod.Node;
@@ -72,6 +73,20 @@ const Frame = struct {
     /// 调用者的节点流位置（返回后继续执行的位置）
     return_pc: u32,
 };
+
+/// 单调时钟毫秒时间戳（用于 select 超时截止计算，不受系统时间调整影响）
+fn monotonicMillis() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
+/// select 阻塞退避：睡眠 1ms（nanosleep 被信号打断时直接返回，由外层轮询重试）
+fn selectBackoffSleep() void {
+    const req = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+    var rem: std.c.timespec = undefined;
+    _ = std.c.nanosleep(&req, &rem);
+}
 
 /// 最大调用深度（配合大栈线程使用，防止原生栈溢出）
 const MAX_CALL_DEPTH: u32 = 2_000_000;
@@ -1062,6 +1077,11 @@ pub const Engine = struct {
             .load => try self.execLoad(node),
             .store => try self.execStore(node),
 
+            // === 借用引用 ===
+            .ref_of => try self.execRefOf(node),
+            .ref_get => try self.execRefGet(node),
+            .ref_set => try self.execRefSet(node),
+
             // === 选择（if 表达式，标量模式 N=1） ===
             .vec_select => try self.execVecSelect(node),
 
@@ -1076,6 +1096,9 @@ pub const Engine = struct {
             .string_concat => try self.execStringConcat(node),
             .string_index => try self.execStringIndex(node),
             .string_contains => try self.execStringContains(node),
+            .string_slice => try self.execStringSlice(node),
+            .string_bytes => try self.execStringBytes(node),
+            .array_to_str => try self.execArrayToStr(node),
 
             // === 数组操作 ===
             .array_make => try self.execArrayMake(node),
@@ -1090,6 +1113,8 @@ pub const Engine = struct {
             .array_get_safe => try self.execArrayGetSafe(node),
             .array_drop_last => try self.execArrayDropLast(node),
             .array_pop => try self.execArrayPop(node),
+            .array_fill => try self.execArrayFill(node),
+            .array_slice => try self.execArraySlice(node),
 
             // === 记录操作 ===
             .record_make => try self.execRecordMake(node),
@@ -1188,6 +1213,9 @@ pub const Engine = struct {
             .builtin_type => try self.execBuiltinType(node),
             .builtin_typeof => try self.execBuiltinTypeof(node),
             .builtin_panic => return error.Panic,
+
+            // === Syscall 调用 ===
+            .syscall_call => try self.execSyscall(node),
 
             // === Newtype ===
             .newtype_wrap => try self.execNewtypeWrap(node),
@@ -1817,6 +1845,43 @@ pub const Engine = struct {
                     }
                 } else if (self.readError(val_chan)) |e| {
                     ap(&buf, &len, "Error({s})", .{e.message});
+                } else if (self.readRecord(val_chan)) |rec| {
+                    // record/ADT/newtype：打印 TypeName(field0, field1, ...)
+                    ap(&buf, &len, "{s}(", .{if (rec.type_name.len > 0) rec.type_name else "record"});
+                    for (rec.fields, 0..) |f, i| {
+                        if (i > 0) ap(&buf, &len, ", ", .{});
+                        switch (f) {
+                            .boolean => |b| ap(&buf, &len, "{}", .{b[0] != 0}),
+                            .char => |c| {
+                                const cp: u32 = (@as(u32, c[0]) << 24) | (@as(u32, c[1]) << 16) | (@as(u32, c[2]) << 8) | @as(u32, c[3]);
+                                if (cp < 128) {
+                                    ap(&buf, &len, "{c}", .{@as(u8, @intCast(cp))});
+                                } else {
+                                    ap(&buf, &len, "U+{x:0>4}", .{cp});
+                                }
+                            },
+                            .i8 => ap(&buf, &len, "{d}", .{f.asI8()}),
+                            .i16 => ap(&buf, &len, "{d}", .{f.asI16()}),
+                            .i32 => ap(&buf, &len, "{d}", .{f.asI32()}),
+                            .i64 => ap(&buf, &len, "{d}", .{f.asI64()}),
+                            .i128 => ap(&buf, &len, "{d}", .{f.asI128()}),
+                            .u8 => ap(&buf, &len, "{d}", .{f.asU8()}),
+                            .u16 => ap(&buf, &len, "{d}", .{f.asU16()}),
+                            .u32 => ap(&buf, &len, "{d}", .{f.asU32()}),
+                            .u64 => ap(&buf, &len, "{d}", .{f.asU64()}),
+                            .u128 => ap(&buf, &len, "{d}", .{f.asU128()}),
+                            .isize => ap(&buf, &len, "{d}", .{f.asIsize()}),
+                            .usize => ap(&buf, &len, "{d}", .{f.asUsize()}),
+                            .f16 => ap(&buf, &len, "{d}", .{f.asF16()}),
+                            .f32 => ap(&buf, &len, "{d}", .{f.asF32()}),
+                            .f64 => ap(&buf, &len, "{d}", .{f.asF64()}),
+                            .f128 => ap(&buf, &len, "{d}", .{f.asF128()}),
+                            .unit => ap(&buf, &len, "()", .{}),
+                            .null_val => ap(&buf, &len, "null", .{}),
+                            .ref => ap(&buf, &len, "<obj>", .{}),
+                        }
+                    }
+                    ap(&buf, &len, ")", .{});
                 } else {
                     ap(&buf, &len, "null", .{});
                 }
@@ -1834,6 +1899,10 @@ pub const Engine = struct {
                 const ptr: *i8 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
                 ap(&buf, &len, "{d}", .{ptr.*});
             },
+            .i128_chan => {
+                const ptr: *i128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
+                ap(&buf, &len, "{d}", .{ptr.*});
+            },
             .u64_chan => ap(&buf, &len, "{d}", .{self.runtime.readU64(val_chan)}),
             .u32_chan => {
                 const ptr: *u32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
@@ -1845,6 +1914,10 @@ pub const Engine = struct {
             },
             .u8_chan => {
                 ap(&buf, &len, "{d}", .{self.runtime.rawPtr(val_chan)[0]});
+            },
+            .u128_chan => {
+                const ptr: *u128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
+                ap(&buf, &len, "{d}", .{ptr.*});
             },
             .isize_chan => ap(&buf, &len, "{d}", .{self.runtime.readUsize(val_chan)}),
             .usize_chan => ap(&buf, &len, "{d}", .{self.runtime.readUsize(val_chan)}),
@@ -2049,6 +2122,24 @@ pub const Engine = struct {
             },
             .ref_chan => blk: {
                 if (self.readStr(val_chan)) |s| break :blk s.bytes();
+                // 检查是否为数组（u8[] → UTF-8 解码为字符串）
+                if (self.readArray(val_chan)) |arr| {
+                    // 仅当所有元素都是 u8 时，按字节拼接为字符串
+                    if (arr.elements.len > 0 and arr.elements[0] == .u8) {
+                        // 使用 array_to_str 路径：解码为 Str
+                        const tmp_bytes = self.tctx.?.backing.alloc(u8, arr.elements.len) catch return error.OutOfMemory;
+                        defer self.tctx.?.backing.free(tmp_bytes);
+                        for (arr.elements, 0..) |elem, i| {
+                            tmp_bytes[i] = elem.asU8();
+                        }
+                        const new_str = value.str_mod.Str.createContiguous(self.tctx.?, tmp_bytes) catch return error.OutOfMemory;
+                        try self.trackObj(&new_str.header);
+                        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+                        return;
+                    }
+                    // 其他数组类型：显示为 [elem1, elem2, ...]
+                    break :blk "[array]";
+                }
                 // gate_get_ok 可能把标量值写入 ref_chan（i32/i64 等）
                 // 尝试读取为 i64
                 const iv = self.runtime.readI64(val_chan);
@@ -2207,6 +2298,54 @@ pub const Engine = struct {
         };
 
         try self.emitTypeInfoRecord(node, md, tctx);
+    }
+
+    /// syscall_call：分派到 syscall 实现（IO/Time 等宿主 syscall 包装）
+    ///
+    /// meta_index 索引 ir.syscall_metas 表（1-indexed），获取 SyscallId 与 arg_count，
+    /// 收集 inputs[] 通道的 Value，调用 syscall.dispatch 执行，结果写入 output 通道。
+    fn execSyscall(self: *Engine, node: *const Node) EngineError!void {
+        const meta_idx = node.meta_index;
+        if (meta_idx == 0 or meta_idx > self.ir.syscall_metas.len) {
+            return error.InvalidMetaIndex;
+        }
+        const syscall_meta = self.ir.syscall_metas[meta_idx - 1];
+        const tctx = self.tctx.?;
+
+        // 收集参数（最多 4 个）
+        var args: [4]value.Value = .{ value.Value.fromUnit(), value.Value.fromUnit(), value.Value.fromUnit(), value.Value.fromUnit() };
+        const arg_count: usize = @min(node.input_count, 4);
+        var i: usize = 0;
+        while (i < arg_count) : (i += 1) {
+            args[i] = self.chanToValue(node.inputs[i]);
+        }
+        const arg_slice = args[0..arg_count];
+
+        // 分派执行
+        const result = syscall_dispatch.dispatch(tctx, syscall_meta.syscall_id, arg_slice) catch |err| switch (err) {
+            error.OutOfMemory, error.TooManyPools, error.AllocFailed => return error.OutOfMemory,
+            error.InvalidArgument => return error.InvalidMetaIndex,
+        };
+
+        // 结果写入 output 通道
+        // 标量值直接写通道；堆对象（ref/Throw）写指针
+        switch (result) {
+            .null_val, .unit => {},
+            .boolean => |b| self.runtime.writeBool(node.output, b[0] != 0),
+            .char => |b| {
+                const ptr: *u32 = @ptrCast(@alignCast(self.runtime.rawPtr(node.output)));
+                ptr.* = @bitCast(b);
+            },
+            .i8, .i16, .i32, .i64, .i128,
+            .u8, .u16, .u32, .u64, .u128,
+            .isize, .usize,
+            .f16, .f32, .f64, .f128 => self.valueToChan(node.output, result),
+            .ref => |obj| {
+                // 堆对象：trackObj 注册跟踪后写通道
+                self.trackObj(obj) catch return error.OutOfMemory;
+                self.runtime.writePtr(node.output, @ptrCast(obj));
+            },
+        }
     }
 
     /// 从 meta_index 构造 TypeInfo Value（不写入通道，返回 Value）
@@ -3073,6 +3212,116 @@ pub const Engine = struct {
     }
 
     // ════════════════════════════════════════════
+    // 借用引用（&T / *expr / ref_get / ref_set）
+    // ════════════════════════════════════════════
+
+    /// ref_of：取引用 &expr
+    /// - 复合类型（operand 是 ref_chan）：operand 已经持有 *ObjHeader，直接复制指针到 output
+    /// - 标量（operand 是标量通道）：装箱到 BoxedScalar 对象，output 持有新对象指针
+    /// - operand 是 ref_chan（已是引用）：复制引用本身（实现引用的引用）
+    fn execRefOf(self: *Engine, node: *const Node) EngineError!void {
+        const src_chan = node.inputs[0];
+        const src_w = self.runtime.elemWidth(src_chan);
+        const dst = self.runtime.rawPtr(node.output);
+
+        if (src_w == 8) {
+            // 复合类型或已有引用：src 通道持有 8 字节指针，直接复制
+            const src = self.runtime.rawPtr(src_chan);
+            @memcpy(dst[0..8], src[0..8]);
+            // retain 引用计数（堆对象共享）
+            const obj_ptr: ?*anyopaque = @ptrCast(@alignCast(@as(*?*anyopaque, @ptrCast(@alignCast(src))).*));
+            if (obj_ptr) |p| {
+                const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(p));
+                _ = value.obj_header.retain(header);
+            }
+        } else if (src_w > 0 and src_w <= 16) {
+            // 标量：装箱到 BoxedScalar，存储通道索引（使回写生效）
+            // 内存布局：[ObjHeader][u16 channel_index][padding to 8B]
+            const tctx = self.tctx.?;
+            const total = @sizeOf(value.obj_header.ObjHeader) + 8; // 8B 对齐存储 channel_index
+            const buf = tctx.allocObj(total) catch return error.OutOfMemory;
+            const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(buf.ptr));
+            header.type_tag = .boxed_scalar;
+            header.flags = 0;
+            header.rc = 1;
+            // 存储源通道索引到 ObjHeader 之后（使 ref_get/ref_set 能回写到原始通道）
+            const chan_idx_ptr: *u16 = @ptrCast(@alignCast(buf.ptr + @sizeOf(value.obj_header.ObjHeader)));
+            chan_idx_ptr.* = src_chan;
+            // 注册跟踪（避免内存泄漏）
+            try self.trackObj(header);
+            // 写入指针到 output
+            const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));
+            dst_ptr.* = buf.ptr;
+        } else if (src_w == 0) {
+            // unit 类型：ref 无意义，写 null
+            const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));
+            dst_ptr.* = null;
+        }
+    }
+
+    /// ref_get：解引用 *expr
+    /// 读取引用指向的值到 output 通道
+    /// - BoxedScalar：从 ObjHeader 之后读取通道索引，再从该通道读取标量值（支持回写）
+    /// - 复合对象：直接复制对象指针（result 是 ref_chan）
+    fn execRefGet(self: *Engine, node: *const Node) EngineError!void {
+        const ref_chan = node.inputs[0];
+        const dst_w = self.runtime.elemWidth(node.output);
+        if (dst_w == 0) return;
+
+        const obj_ptr = self.runtime.readPtr(ref_chan) orelse return error.Panic;
+        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(obj_ptr));
+
+        const dst = self.runtime.rawPtr(node.output);
+        switch (header.type_tag) {
+            .boxed_scalar => {
+                // 标量装箱：读取通道索引，从原始通道读取标量值
+                const chan_idx_ptr: *const u16 = @ptrCast(@alignCast(@as([*]const u8, @ptrCast(@alignCast(obj_ptr))) + @sizeOf(value.obj_header.ObjHeader)));
+                const src_chan = chan_idx_ptr.*;
+                const src = self.runtime.rawPtr(src_chan);
+                const copy_w = @min(dst_w, 16);
+                @memcpy(dst[0..copy_w], src[0..copy_w]);
+            },
+            else => {
+                // 复合对象：复制对象指针本身（ref_get 对复合对象 = 取对象引用）
+                if (dst_w == 8) {
+                    const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));
+                    dst_ptr.* = obj_ptr;
+                    _ = value.obj_header.retain(header);
+                }
+            },
+        }
+    }
+
+    /// ref_set：通过引用写入 *ref = value
+    /// inputs[0] = 引用通道，inputs[1] = 值通道
+    /// - BoxedScalar：读取通道索引，写入原始通道（实现回写）
+    /// - 复合对象：无操作（复合对象本身是共享的，赋值语义不适用）
+    fn execRefSet(self: *Engine, node: *const Node) EngineError!void {
+        const ref_chan = node.inputs[0];
+        const val_chan = node.inputs[1];
+
+        const obj_ptr = self.runtime.readPtr(ref_chan) orelse return error.Panic;
+        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(obj_ptr));
+
+        switch (header.type_tag) {
+            .boxed_scalar => {
+                // 读取通道索引，写入原始通道（实现回写）
+                const chan_idx_ptr: *const u16 = @ptrCast(@alignCast(@as([*]const u8, @ptrCast(@alignCast(obj_ptr))) + @sizeOf(value.obj_header.ObjHeader)));
+                const dst_chan = chan_idx_ptr.*;
+                const val_w = self.runtime.elemWidth(val_chan);
+                if (val_w == 0 or val_w > 16) return;
+                const dst = self.runtime.rawPtr(dst_chan);
+                const src = self.runtime.rawPtr(val_chan);
+                @memcpy(dst[0..val_w], src[0..val_w]);
+            },
+            else => {
+                // 复合对象的 ref_set：替换引用本身（重新绑定）
+                // 暂不实现，复合对象赋值通过 field assignment 完成
+            },
+        }
+    }
+
+    // ════════════════════════════════════════════
     // 选择（if 表达式，标量模式 N=1）
     // ════════════════════════════════════════════
 
@@ -3385,8 +3634,8 @@ pub const Engine = struct {
         return @alignCast(@fieldParentPtr("header", header));
     }
 
-    /// string_len：返回字符串字节长度
-    /// inputs[0] = str 通道，output = usize 通道（Phase 5: 从 i64 改为 usize）
+    /// string_len：返回字符串 Unicode 标量值数量（字符数）
+    /// inputs[0] = str 通道，output = usize 通道
     fn execStringLen(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
         const src_meta = self.ir.channels.get(src_chan);
@@ -3411,7 +3660,8 @@ pub const Engine = struct {
                 return;
             }
             const sv: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", header));
-            self.runtime.writeUsize(node.output, sv.byteLength());
+            const count = sv.codepointCount() catch sv.byteLength();
+            self.runtime.writeUsize(node.output, count);
             return;
         }
 
@@ -3425,7 +3675,8 @@ pub const Engine = struct {
             self.runtime.writeUsize(node.output, 0);
             return;
         };
-        self.runtime.writeUsize(node.output, s.byteLength());
+        const count = s.codepointCount() catch s.byteLength();
+        self.runtime.writeUsize(node.output, count);
     }
 
     /// string_concat：拼接两个字符串
@@ -3542,14 +3793,31 @@ pub const Engine = struct {
             .i16_chan => value.Value.fromI16(@bitCast(@as(*[2]u8, @ptrCast(ptr)).*)),
             .i32_chan => value.Value.fromI32(@bitCast(@as(*[4]u8, @ptrCast(ptr)).*)),
             .i64_chan => value.Value.fromI64(self.runtime.readI64(chan)),
+            .i128_chan => blk: {
+                // 128-bit 通道按 16 字节直接读取
+                const p: *i128 = @ptrCast(@alignCast(ptr));
+                break :blk value.Value.fromI128(p.*);
+            },
             .u8_chan => value.Value.fromU8(ptr[0]),
             .u16_chan => value.Value.fromU16(@bitCast(@as(*[2]u8, @ptrCast(ptr)).*)),
             .u32_chan => value.Value.fromU32(@bitCast(@as(*[4]u8, @ptrCast(ptr)).*)),
             .u64_chan => value.Value.fromU64(self.runtime.readU64(chan)),
+            .u128_chan => blk: {
+                const p: *u128 = @ptrCast(@alignCast(ptr));
+                break :blk value.Value.fromU128(p.*);
+            },
             .isize_chan => value.Value.fromIsize(@bitCast(self.runtime.readUsize(chan))),
             .usize_chan => value.Value.fromUsize(@bitCast(self.runtime.readUsize(chan))),
+            .f16_chan => blk: {
+                const p: *f16 = @ptrCast(@alignCast(ptr));
+                break :blk value.Value.fromF16(p.*);
+            },
             .f32_chan => value.Value.fromF32(@bitCast(@as(*[4]u8, @ptrCast(ptr)).*)),
             .f64_chan => value.Value.fromF64(self.runtime.readF64(chan)),
+            .f128_chan => blk: {
+                const p: *f128 = @ptrCast(@alignCast(ptr));
+                break :blk value.Value.fromF128(p.*);
+            },
             .ref_chan => blk: {
                 const obj_ptr = self.runtime.readPtr(chan) orelse break :blk value.Value.fromNull();
                 if (@intFromPtr(obj_ptr) < 0x1000) break :blk value.Value.fromNull();
@@ -3615,12 +3883,29 @@ pub const Engine = struct {
                 const ptr: *u64 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
                 ptr.* = @bitCast(b);
             },
+            .i128 => |b| {
+                // 128-bit 值直接写入 16 字节通道
+                const ptr: *i128 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
+                ptr.* = @bitCast(b);
+            },
+            .u128 => |b| {
+                const ptr: *u128 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
+                ptr.* = @bitCast(b);
+            },
+            .f16 => |b| {
+                const ptr: *f16 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
+                ptr.* = @bitCast(b);
+            },
             .f32 => |b| {
                 const ptr: *f32 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
                 ptr.* = @bitCast(b);
             },
             .f64 => |b| {
                 const ptr: *f64 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
+                ptr.* = @bitCast(b);
+            },
+            .f128 => |b| {
+                const ptr: *f128 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
                 ptr.* = @bitCast(b);
             },
             .ref => |obj| self.runtime.writePtr(chan, @ptrCast(obj)),
@@ -3684,6 +3969,24 @@ pub const Engine = struct {
                     dst.* = @bitCast(b);
                 }
             },
+            .i128 => |b| {
+                if (w >= 16) {
+                    const dst: *i128 = @ptrCast(@alignCast(ptr));
+                    dst.* = @bitCast(b);
+                }
+            },
+            .u128 => |b| {
+                if (w >= 16) {
+                    const dst: *u128 = @ptrCast(@alignCast(ptr));
+                    dst.* = @bitCast(b);
+                }
+            },
+            .f16 => |b| {
+                if (w >= 2) {
+                    const dst: *f16 = @ptrCast(@alignCast(ptr));
+                    dst.* = @bitCast(b);
+                }
+            },
             .f32 => |b| {
                 if (w >= 4) {
                     const dst: *f32 = @ptrCast(@alignCast(ptr));
@@ -3693,6 +3996,12 @@ pub const Engine = struct {
             .f64 => |b| {
                 if (w >= 8) {
                     const dst: *f64 = @ptrCast(@alignCast(ptr));
+                    dst.* = @bitCast(b);
+                }
+            },
+            .f128 => |b| {
+                if (w >= 16) {
+                    const dst: *f128 = @ptrCast(@alignCast(ptr));
                     dst.* = @bitCast(b);
                 }
             },
@@ -3819,6 +4128,105 @@ pub const Engine = struct {
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
     }
 
+    /// array_fill：创建 count 个 value 副本的数组
+    /// inputs[0] = count, inputs[1] = value, output = ref_chan
+    fn execArrayFill(self: *Engine, node: *const Node) EngineError!void {
+        const count = self.runtime.readI64(node.inputs[0]);
+        if (count < 0) return error.Overflow;
+        const n: usize = @intCast(count);
+        const fill_value = self.chanToValue(node.inputs[1]);
+
+        const use_arena = self.currentFuncUseArena();
+        const v = if (use_arena) blk: {
+            const elems_size = n * @sizeOf(value.Value);
+            const total = @sizeOf(value.ArrayValue) + elems_size;
+            const arena_mem = self.tctx.?.allocObjArena(total) catch return error.OutOfMemory;
+            const arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
+            const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
+            // 初始化所有元素为 fill_value（注意 RC：每个 slot 引用同一对象需 retain n-1 次）
+            if (n > 0) {
+                @memset(elems_ptr[0..n], fill_value);
+                // 仅当 fill_value 为 ref 类型时需 retain n-1 次
+                // （@memset 已复制 Value 结构 n 次，但 RC 只算了 1 次）
+                if (fill_value.isBoxed() and n > 1) {
+                    const r = fill_value.asRef();
+                    var j: usize = 1;
+                    while (j < n) : (j += 1) {
+                        _ = value.obj_header.retain(r);
+                    }
+                }
+            }
+            arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null };
+            arr.header.markArenaAllocated();
+            break :blk value.Value.fromRef(&arr.header);
+        } else blk: {
+            // 非 arena 路径：先分配临时数组，逐个 retain 后用 makeArray
+            const tmp = self.tctx.?.backing.alloc(value.Value, n) catch return error.OutOfMemory;
+            defer self.tctx.?.backing.free(tmp);
+            @memset(tmp[0..n], fill_value);
+            if (fill_value.isBoxed() and n > 1) {
+                const r = fill_value.asRef();
+                var j: usize = 1;
+                while (j < n) : (j += 1) {
+                    _ = value.obj_header.retain(r);
+                }
+            }
+            break :blk value.Value.makeArray(self.tctx.?, tmp, null) catch return error.OutOfMemory;
+        };
+        try self.trackObj(v.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+    }
+
+    /// array_slice：数组切片
+    /// inputs[0] = arr, inputs[1] = start, inputs[2] = end
+    /// _pad: 0 = 左闭右开 [start, end)，1 = 左闭右闭 [start, end]
+    fn execArraySlice(self: *Engine, node: *const Node) EngineError!void {
+        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
+        const start = self.readIntAsI64(node.inputs[1]);
+        const end_raw = self.readIntAsI64(node.inputs[2]);
+        if (start < 0) return error.Overflow;
+        const s: usize = @intCast(start);
+        // 计算实际结束位置
+        const e: usize = if (node._pad == 1) blk: {
+            // 左闭右闭 [start, end]
+            if (end_raw < 0) return error.Overflow;
+            break :blk @as(usize, @intCast(end_raw)) + 1;
+        } else blk: {
+            // 左闭右开 [start, end)
+            if (end_raw < 0) return error.Overflow;
+            break :blk @as(usize, @intCast(end_raw));
+        };
+        if (s > arr.elements.len or e > arr.elements.len or s > e) return error.Overflow;
+        const new_len = e - s;
+        const new_elements = self.tctx.?.backing.alloc(value.Value, new_len) catch return error.OutOfMemory;
+        defer self.tctx.?.backing.free(new_elements);
+        @memcpy(new_elements[0..new_len], arr.elements[s..e]);
+
+        const use_arena = self.currentFuncUseArena();
+        const v = if (use_arena) blk: {
+            const elems_size = new_len * @sizeOf(value.Value);
+            const total = @sizeOf(value.ArrayValue) + elems_size;
+            const arena_mem = self.tctx.?.allocObjArena(total) catch return error.OutOfMemory;
+            const new_arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
+            const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
+            @memcpy(elems_ptr[0..new_len], new_elements);
+            new_arr.* = .{ .elements = elems_ptr[0..new_len], .capacity = new_len, .fixed_size = null };
+            new_arr.header.markArenaAllocated();
+            break :blk value.Value.fromRef(&new_arr.header);
+        } else
+            value.Value.makeArray(self.tctx.?, new_elements, null) catch return error.OutOfMemory;
+        // retain 切片中所有 ref 元素（makeArray 已拷贝 Value 结构，需补 retain）
+        if (new_len > 0) {
+            for (new_elements) |elem| {
+                if (elem.isBoxed()) {
+                    _ = value.obj_header.retain(elem.asRef());
+                }
+            }
+        }
+        try self.trackObj(v.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+    }
+
     /// array_first：返回数组首元素（nullable 输出，空数组返回 null）
     fn execArrayFirst(self: *Engine, node: *const Node) EngineError!void {
         const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
@@ -3930,6 +4338,92 @@ pub const Engine = struct {
         self.runtime.writeBool(node.output, std.mem.indexOf(u8, haystack.bytes(), needle.bytes()) != null);
     }
 
+    /// string_slice：字符串切片（按 Unicode 标量值索引）
+    /// inputs[0] = s, inputs[1] = start, inputs[2] = end
+    /// _pad: 0 = 左闭右开 [start, end)，1 = 左闭右闭 [start, end]
+    /// start/end 是字符索引（不是字节索引），内部按 UTF-8 解码定位字节位置
+    fn execStringSlice(self: *Engine, node: *const Node) EngineError!void {
+        const s = self.readStr(node.inputs[0]) orelse return error.InvalidChannel;
+        const start = self.readIntAsI64(node.inputs[1]);
+        const end_raw = self.readIntAsI64(node.inputs[2]);
+        if (start < 0) return error.Overflow;
+        const start_idx: usize = @intCast(start);
+        const end_idx: usize = if (node._pad == 1) blk: {
+            if (end_raw < 0) return error.Overflow;
+            break :blk @as(usize, @intCast(end_raw)) + 1;
+        } else blk: {
+            if (end_raw < 0) return error.Overflow;
+            break :blk @as(usize, @intCast(end_raw));
+        };
+        if (start_idx > end_idx) return error.Overflow;
+        const bytes = s.bytes();
+        // 定位 start 字节位置
+        var byte_pos: usize = 0;
+        var char_idx: usize = 0;
+        while (byte_pos < bytes.len and char_idx < start_idx) {
+            byte_pos += utf8SeqLen(bytes[byte_pos]);
+            char_idx += 1;
+        }
+        if (char_idx != start_idx) return error.Overflow;
+        const start_byte = byte_pos;
+        // 定位 end 字节位置
+        while (byte_pos < bytes.len and char_idx < end_idx) {
+            byte_pos += utf8SeqLen(bytes[byte_pos]);
+            char_idx += 1;
+        }
+        const end_byte = byte_pos;
+        // 创建子字符串
+        const sub_bytes = bytes[start_byte..end_byte];
+        const new_str = value.str_mod.Str.createContiguous(self.tctx.?, sub_bytes) catch return error.OutOfMemory;
+        try self.trackObj(&new_str.header);
+        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+    }
+
+    /// string_bytes：字符串转 u8[]（UTF-8 编码）
+    /// inputs[0] = s, output = ref_chan (ArrayValue<u8>)
+    fn execStringBytes(self: *Engine, node: *const Node) EngineError!void {
+        const s = self.readStr(node.inputs[0]) orelse return error.InvalidChannel;
+        const bytes = s.bytes();
+        const n = bytes.len;
+        // 临时 u8 Value 数组
+        const tmp = self.tctx.?.backing.alloc(value.Value, n) catch return error.OutOfMemory;
+        defer self.tctx.?.backing.free(tmp);
+        for (bytes, 0..) |b, i| {
+            tmp[i] = value.Value.fromU8(b);
+        }
+        const use_arena = self.currentFuncUseArena();
+        const v = if (use_arena) blk: {
+            const elems_size = n * @sizeOf(value.Value);
+            const total = @sizeOf(value.ArrayValue) + elems_size;
+            const arena_mem = self.tctx.?.allocObjArena(total) catch return error.OutOfMemory;
+            const arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
+            const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
+            @memcpy(elems_ptr[0..n], tmp);
+            arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null };
+            arr.header.markArenaAllocated();
+            break :blk value.Value.fromRef(&arr.header);
+        } else
+            value.Value.makeArray(self.tctx.?, tmp, null) catch return error.OutOfMemory;
+        try self.trackObj(v.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+    }
+
+    /// array_to_str：u8[] 转字符串（UTF-8 解码）
+    /// inputs[0] = arr (ArrayValue<u8>), output = ref_chan (Str)
+    fn execArrayToStr(self: *Engine, node: *const Node) EngineError!void {
+        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
+        // 收集字节数据
+        const n = arr.elements.len;
+        const tmp_bytes = self.tctx.?.backing.alloc(u8, n) catch return error.OutOfMemory;
+        defer self.tctx.?.backing.free(tmp_bytes);
+        for (arr.elements, 0..) |elem, i| {
+            tmp_bytes[i] = elem.asU8();
+        }
+        const new_str = value.str_mod.Str.createContiguous(self.tctx.?, tmp_bytes) catch return error.OutOfMemory;
+        try self.trackObj(&new_str.header);
+        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+    }
+
     // ════════════════════════════════════════════
     // 记录操作
     // ════════════════════════════════════════════
@@ -4007,7 +4501,8 @@ pub const Engine = struct {
                 else => return error.InvalidMetaIndex,
             } else return error.InvalidMetaIndex;
         };
-        const rec = self.readRecord(node.inputs[0]) orelse {
+        const in_chan = node.inputs[0];
+        const rec = self.readRecord(in_chan) orelse {
             // null/无效记录：写零到输出（safe access 场景，vec_select 会选择 null 分支）
             const w = self.runtime.elemWidth(node.output);
             if (w > 0) {
@@ -4016,7 +4511,9 @@ pub const Engine = struct {
             }
             return;
         };
-        if (field_id >= rec.fields.len) return error.InvalidChannel;
+        if (field_id >= rec.fields.len) {
+            return error.InvalidChannel;
+        }
         const v = rec.fields[field_id];
 
         // 快速路径：scalar_tag 预计算了输出通道类型（标量类型）
@@ -5321,6 +5818,15 @@ pub const Engine = struct {
     fn wrapStore(self: *Engine, node: *const Node) EngineError!void {
         try self.execStore(node);
     }
+    fn wrapRefOf(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRefOf(node);
+    }
+    fn wrapRefGet(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRefGet(node);
+    }
+    fn wrapRefSet(self: *Engine, node: *const Node) EngineError!void {
+        try self.execRefSet(node);
+    }
     fn wrapHaltBreak(self: *Engine, node: *const Node) EngineError!void {
         _ = node;
         _ = self;
@@ -5414,6 +5920,9 @@ pub const Engine = struct {
             .cast_safe => &wrapCastSafe,
             .load => &wrapLoad,
             .store => &wrapStore,
+            .ref_of => &wrapRefOf,
+            .ref_get => &wrapRefGet,
+            .ref_set => &wrapRefSet,
             .halt_break => &wrapHaltBreak,
             .halt_continue => &wrapHaltContinue,
             .halt_return => &wrapHaltReturn,
@@ -5671,6 +6180,20 @@ pub const Engine = struct {
         const func = self.ir.functions[self.currentFuncIdx()];
         const nodes = self.ir.funcNodes(self.currentFuncIdx());
         const body_local_start: usize = vm.body_start - func.node_start;
+
+        // DEBUG: dump body nodes
+        if (std.mem.eql(u8, func.name, "std.io.Path.test_if_else_in_loop")) {
+            std.debug.print("DEBUG: vec_map body for {s} (body_start={d}, body_len={d}):\n", .{ func.name, body_local_start, vm.body_len });
+            for (body_local_start..body_local_start + vm.body_len) |i| {
+                const n = nodes[i];
+                std.debug.print("  [{d}] op={s} output={d} inputs=[", .{ i, @tagName(n.op), n.output });
+                for (0..n.input_count) |j| {
+                    if (j > 0) std.debug.print(",", .{});
+                    std.debug.print("{d}", .{n.inputs[j]});
+                }
+                std.debug.print("] meta={d}\n", .{n.meta_index});
+            }
+        }
 
         // 找到 body 的输出通道（body 子图最后一个节点的 output）
         const body_out_chan = nodes[body_local_start + vm.body_len - 1].output;
@@ -6919,46 +7442,83 @@ pub const Engine = struct {
     /// inputs[0] = 通道值（ChannelValue 指针或任意标量值）
     /// output = mask_chan（1=就绪, 0=未就绪）
     fn execRaceSource(self: *Engine, node: *const Node) EngineError!void {
-        const val_chan = node.inputs[0];
-        const meta = self.ir.channels.get(val_chan);
-
-        // 只有 ref_chan 才可能是 ChannelValue/SenderValue/ReceiverValue
-        if (meta.chan_type == .ref_chan) {
-            const ch = self.readChannelValue(val_chan) orelse {
-                self.runtime.writeBool(node.output, false);
-                return;
-            };
-            // 非阻塞检查：count > 0 或会合模式有发送方就绪
-            ch.mutex.lock();
-            defer ch.mutex.unlock();
-            const ready = if (ch.capacity == 0) ch.rend_ready else ch.count > 0;
-            self.runtime.writeBool(node.output, ready);
-            return;
-        }
-        // 非 ChannelValue（标量/整数等）：视为始终就绪
-        self.runtime.writeBool(node.output, true);
+        const ready = self.selectSourceReady(node.inputs[0]);
+        self.runtime.writeBool(node.output, ready);
     }
 
-    /// race_select：选择第一个就绪的分支
-    /// inputs[0..N] = 各 race_source 的 mask
-    /// output = mask_chan（winner 索引，0-based）
+    /// select 源就绪性检查（非阻塞）
+    /// 非通道源（标量等）始终就绪；通道源有数据/会合发送方/已关闭时就绪
+    fn selectSourceReady(self: *Engine, chan: u16) bool {
+        const meta = self.ir.channels.get(chan);
+        // 只有 ref_chan 才可能是 ChannelValue/SenderValue/ReceiverValue
+        if (meta.chan_type != .ref_chan) return true;
+        const ch = self.readChannelValue(chan) orelse return true;
+        ch.mutex.lock();
+        defer ch.mutex.unlock();
+        // 已关闭：recv 立即返回（null），视为就绪，避免 select 永久挂起
+        if (ch.closed) return true;
+        // 缓冲模式看数据量，会合模式看发送方是否就绪
+        return if (ch.capacity == 0) ch.rend_ready else ch.count > 0;
+    }
+
+    /// race_select：阻塞多路复用，直到任一 receive 通道就绪或 timeout 到期
+    /// inputs[0..source_count)   = 各 receive 分支的通道引用
+    /// inputs[timeout_input]     = timeout 时长通道（毫秒，仅 RaceMeta.timeout_arm 非 null 时）
+    /// output = i64_chan（获胜分支的 arm 索引，0-based）
     fn execRaceSelect(self: *Engine, node: *const Node) EngineError!void {
-        var winner: u16 = 0;
-        for (0..node.input_count) |i| {
-            if (self.runtime.readBool(node.inputs[i])) {
-                winner = @intCast(i);
-                break;
+        var source_count: u8 = node.input_count;
+        var timeout_arm: ?u8 = null;
+        var timeout_input: u8 = 0;
+        if (node.meta_index > 0 and node.meta_index <= self.ir.race_metas.len) {
+            const rm = self.ir.race_metas[node.meta_index - 1];
+            source_count = rm.source_count;
+            timeout_arm = rm.timeout_arm;
+            timeout_input = rm.timeout_input;
+        }
+
+        // 计算超时截止时间（单调时钟毫秒时间戳），null 表示无限等待
+        var deadline: ?i64 = null;
+        if (timeout_arm != null) {
+            const dur_ms = self.readIntAsI64(node.inputs[timeout_input]);
+            deadline = monotonicMillis() + dur_ms;
+        }
+
+        // 阻塞轮询：先自旋让出 CPU，后 1ms 睡眠退避（与 sync.Condition 的等待纪律一致）
+        var spin: u32 = 0;
+        while (true) {
+            var i: u8 = 0;
+            while (i < source_count) : (i += 1) {
+                if (self.selectSourceReady(node.inputs[i])) {
+                    // 输入槽位 i → arm 索引：timeout 分支占据 arm 索引 timeout_arm，
+                    // 其后的 receive 分支 arm 索引 = 输入槽位 + 1
+                    const arm_idx: i64 = if (timeout_arm) |ta|
+                        (if (i >= ta) @as(i64, i) + 1 else @as(i64, i))
+                    else
+                        @as(i64, i);
+                    self.runtime.writeI64(node.output, arm_idx);
+                    return;
+                }
+            }
+            if (deadline) |dl| {
+                if (monotonicMillis() >= dl) {
+                    self.runtime.writeI64(node.output, @as(i64, timeout_arm.?));
+                    return;
+                }
+            }
+            if (spin < 64) {
+                std.Thread.yield() catch {};
+                spin += 1;
+            } else {
+                selectBackoffSleep();
             }
         }
-        // 如果没有就绪分支，winner=0（简化：不实现 yield，默认选第一个）
-        // 将 winner 索引写入 mask_chan（用 i64 存储索引）
-        self.runtime.writeI64(node.output, @intCast(winner));
     }
 
-    /// race_yield：让出执行权（Phase 5 简化：无操作，Phase 7 接入星轨调度器）
+    /// race_yield：让出执行权
     fn execRaceYield(self: *Engine, node: *const Node) EngineError!void {
         _ = self;
         _ = node;
+        std.Thread.yield() catch {};
     }
 
     /// route_get_tag：读取值的 tag（用于 Trait 动态分派和 ADT 构造器识别）
@@ -7143,7 +7703,8 @@ pub const Engine = struct {
         const inner_w = self.nullableInnerWidth(src_chan);
         const src = self.runtime.rawPtr(src_chan);
         // null flag 在 inner_w 偏移处
-        self.runtime.writeBool(node.output, src[inner_w] != 0);
+        const is_null = src[inner_w] != 0;
+        self.runtime.writeBool(node.output, is_null);
     }
 
     /// nullable_unwrap：提取 Nullable<T> 的内部值（null 时写零，由调用方通过 is_null 判断）

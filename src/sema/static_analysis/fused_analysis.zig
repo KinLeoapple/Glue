@@ -162,6 +162,14 @@ pub const FusedAnalysis = struct {
                     try self.const_table.put(expr, result);
                 }
             },
+            .ref_of => |r| {
+                // 取引用：递归分析 operand，不做常量折叠（地址不具有常量语义）
+                try self.analyzeExpr(r.operand, env, current_fn);
+            },
+            .deref => |d| {
+                // 解引用：递归分析 operand，不做常量折叠
+                try self.analyzeExpr(d.operand, env, current_fn);
+            },
             .if_expr => |i| {
                 try self.analyzeExpr(i.condition, env, current_fn);
                 try self.analyzeExpr(i.then_branch, env, current_fn);
@@ -413,6 +421,8 @@ pub const FusedAnalysis = struct {
             => 1,
             .binary => 3,
             .unary => 2,
+            .ref_of => 2,
+            .deref => 2,
             .call => |c| 1 + @as(u32, @intCast(c.arguments.len)),
             .if_expr => |i| 5 + (if (i.else_branch != null) @as(u32, 1) else 0),
             .block => |b| blk: {

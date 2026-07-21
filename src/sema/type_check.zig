@@ -54,6 +54,7 @@ fn semaTypeToChanType(ty: *Type) ?ChanType {
             const inner_ct = semaTypeToChanType(inner) orelse .ref_chan;
             break :blk inner_ct;
         },
+        .ref_type => .ref_chan,
         .throw_type => |tt| semaTypeToChanType(tt.value_type) orelse .ref_chan,
         .type_var, .unknown_type => null,
     };
@@ -162,6 +163,11 @@ pub const Type = union(enum) {
     trait_type: struct {
         name: []const u8,
         type_args: []*Type,
+    },
+    /// 借用引用 &T 或裸指针 *T：指向已有对象，通道存指针
+    ref_type: struct {
+        inner: *Type,
+        is_raw: bool,
     },
     unknown_type,
 
@@ -302,6 +308,10 @@ pub const Type = union(enum) {
                 try inner.*.format(writer);
                 try writer.writeAll("?");
             },
+            .ref_type => |rt| {
+                try writer.writeAll(if (rt.is_raw) "*" else "&");
+                try rt.inner.*.format(writer);
+            },
             .generic_type => |gt| {
                 try writer.writeAll(gt.name);
                 if (gt.args.len > 0) {
@@ -392,6 +402,10 @@ pub const Type = union(enum) {
             .nullable_type => |inner| {
                 try inner.*.formatArrayList(buf, allocator);
                 try buf.appendSlice(allocator, "?");
+            },
+            .ref_type => |rt| {
+                try buf.appendSlice(allocator, if (rt.is_raw) "*" else "&");
+                try rt.inner.*.formatArrayList(buf, allocator);
             },
             .generic_type => |gt| {
                 try buf.appendSlice(allocator, gt.name);
@@ -694,6 +708,7 @@ pub const TypeInferencer = struct {
     registered_traits: std.StringHashMap(TraitEntry),
     fn_bounds: std.StringHashMap([]ast.TraitBound),
     predeclared_fns: std.StringHashMap(void),
+    predeclared_types: std.StringHashMap(void),
     suppress_errors: bool = false,
     /// sema 输出契约：若非 null，inferExpr 会把每个表达式推断出的类型记录到此结构，
     /// 供 IRBuilder 在图构建时读取（驱动式接入）。
@@ -730,6 +745,7 @@ pub const TypeInferencer = struct {
             .registered_traits = std.StringHashMap(TraitEntry).init(allocator),
             .fn_bounds = std.StringHashMap([]ast.TraitBound).init(allocator),
             .predeclared_fns = std.StringHashMap(void).init(allocator),
+            .predeclared_types = std.StringHashMap(void).init(allocator),
             .exported_schemes = std.StringHashMap(TypeScheme).init(allocator),
             .module_member_sigs = std.StringHashMap([]module_check.MethodSig).init(allocator),
             .module_submodules = std.StringHashMap([][]const u8).init(allocator),
@@ -764,6 +780,7 @@ pub const TypeInferencer = struct {
         self.registered_traits.deinit();
         self.fn_bounds.deinit();
         self.predeclared_fns.deinit();
+        self.predeclared_types.deinit();
         self.exported_schemes.deinit();
         self.module_member_sigs.deinit();
         self.module_submodules.deinit();
@@ -943,6 +960,13 @@ pub const TypeInferencer = struct {
         try self.types.append(self.arena.allocator(), t);
         return t;
     }
+    /// 构造借用引用类型 &T（is_raw=false）或裸指针 *T（is_raw=true）
+    pub fn makeRefType(self: *TypeInferencer, inner: *Type, is_raw: bool) !*Type {
+        const t = try self.arena.allocator().create(Type);
+        t.* = Type{ .ref_type = .{ .inner = inner, .is_raw = is_raw } };
+        try self.types.append(self.arena.allocator(), t);
+        return t;
+    }
     pub fn makeFnType(self: *TypeInferencer, params: []*Type, return_type: *Type) !*Type {
         const owned_params = try self.arena.allocator().dupe(*Type, params);
         const t = try self.arena.allocator().create(Type);
@@ -1063,6 +1087,10 @@ pub const TypeInferencer = struct {
             },
             .nullable_type => |inner1| {
                 try self.unify(inner1, resolved2.nullable_type);
+            },
+            .ref_type => |rt1| {
+                // &T/*T 统一：递归统一 inner，is_raw 不参与（仅安全提示）
+                try self.unify(rt1.inner, resolved2.ref_type.inner);
             },
             .adt_type => |at1| {
                 const at2 = resolved2.adt_type;
@@ -1190,6 +1218,11 @@ pub const TypeInferencer = struct {
                 if (b.* != .nullable_type) return false;
                 return self.typesStructurallyEqual(aa, b.nullable_type);
             },
+            .ref_type => |aa| {
+                if (b.* != .ref_type) return false;
+                return aa.is_raw == b.ref_type.is_raw and
+                    self.typesStructurallyEqual(aa.inner, b.ref_type.inner);
+            },
             .throw_type => |aa| {
                 if (b.* != .throw_type) return false;
                 const ab = b.throw_type;
@@ -1262,6 +1295,10 @@ pub const TypeInferencer = struct {
             .nullable_type => |inner| {
                 const new_inner = try self.applyTypeSubst(inner, subst);
                 return self.makeNullableType(new_inner);
+            },
+            .ref_type => |rt| {
+                const new_inner = try self.applyTypeSubst(rt.inner, subst);
+                return self.makeRefType(new_inner, rt.is_raw);
             },
             .throw_type => |tt| {
                 const new_val = try self.applyTypeSubst(tt.value_type, subst);
@@ -1419,6 +1456,7 @@ pub const TypeInferencer = struct {
                 return false;
             },
             .nullable_type => |inner| return self.occurs(id, inner),
+            .ref_type => |rt| return self.occurs(id, rt.inner),
             .adt_type => |at| {
                 for (at.type_args) |arg| {
                     if (self.occurs(id, arg)) return true;
@@ -1529,6 +1567,7 @@ pub const TypeInferencer = struct {
                 }
             },
             .nullable_type => |inner| self.collectFreeVars(inner, free_vars),
+            .ref_type => |rt| self.collectFreeVars(rt.inner, free_vars),
             .adt_type => |at| {
                 for (at.type_args) |arg| {
                     self.collectFreeVars(arg, free_vars);
@@ -1566,6 +1605,10 @@ pub const TypeInferencer = struct {
             .nullable_type => |inner| {
                 const new_inner = try self.applySubst(inner, subst);
                 return self.makeNullableType(new_inner);
+            },
+            .ref_type => |rt| {
+                const new_inner = try self.applySubst(rt.inner, subst);
+                return self.makeRefType(new_inner, rt.is_raw);
             },
             .throw_type => |tt| {
                 const new_val = try self.applySubst(tt.value_type, subst);
@@ -1964,6 +2007,20 @@ pub const TypeInferencer = struct {
                     },
                     .neg => operand_ty,
                 };
+            },
+            .ref_of => |r| {
+                // &expr：返回 ref_type(inner = expr 类型)
+                const inner_ty = try self.inferExpr(r.operand, env, null);
+                return self.makeRefType(inner_ty, false);
+            },
+            .deref => |d| {
+                // *expr：解引用，返回 ref_type.inner
+                const operand_ty = try self.inferExpr(d.operand, env, null);
+                const resolved = self.resolve(operand_ty);
+                switch (resolved.*) {
+                    .ref_type => |rt| return rt.inner,
+                    else => return operand_ty, // 非引用类型解引用：返回原类型（运行期可能报错）
+                }
             },
             .lambda => |lam| {
                 const child_env = try env.createChild();
@@ -2434,6 +2491,25 @@ pub const TypeInferencer = struct {
                 const resolved = self.resolve(obj_ty);
                 switch (resolved.*) {
                     .array_type => |at| return at.element_type,
+                    else => return self.freshTypeVar() catch unreachable,
+                }
+            },
+            .slice => |sl| {
+                // arr[start..end] / s[start..end]：返回与对象相同类型
+                _ = self.inferExpr(sl.start, env, null) catch return self.freshTypeVar() catch unreachable;
+                _ = self.inferExpr(sl.end, env, null) catch return self.freshTypeVar() catch unreachable;
+                const obj_ty = self.inferExpr(sl.object, env, null) catch return self.freshTypeVar() catch unreachable;
+                const resolved = self.resolve(obj_ty);
+                switch (resolved.*) {
+                    // 数组切片返回相同元素类型的数组
+                    .array_type => |at| {
+                        const arr_ty = self.arena.allocator().create(Type) catch return self.freshTypeVar() catch unreachable;
+                        arr_ty.* = Type{ .array_type = .{ .element_type = at.element_type, .size = null } };
+                        self.types.append(self.arena.allocator(), arr_ty) catch return self.freshTypeVar() catch unreachable;
+                        return arr_ty;
+                    },
+                    // 字符串切片返回字符串
+                    .str_type => return self.makeType(.str_type),
                     else => return self.freshTypeVar() catch unreachable,
                 }
             },
@@ -2934,6 +3010,16 @@ pub const TypeInferencer = struct {
             .kind_annotated => |ka| {
                 return self.typeFromAstWithParams(ka.inner, type_param_map);
             },
+            .ref_type => |rt| {
+                // &T：借用引用类型，递归推导 inner 类型
+                const inner = try self.typeFromAstWithParams(rt.inner, type_param_map);
+                return self.makeRefType(inner, false);
+            },
+            .raw_ptr => |rp| {
+                // *T：裸指针类型，递归推导 inner 类型，is_raw=true
+                const inner = try self.typeFromAstWithParams(rp.inner, type_param_map);
+                return self.makeRefType(inner, true);
+            },
         }
     }
     /// 检查整个模块的类型。委托 module_check 完成实际的模块级检查。
@@ -2969,6 +3055,13 @@ pub const TypeInferencer = struct {
         for (module.declarations) |decl| {
             if (decl == .fun_decl) {
                 self.predeclareFunction(decl.fun_decl, &env);
+            }
+        }
+        // 预声明所有 type_decl（含 newtype 构造器），使跨模块引用的构造器
+        // 在函数体检查时已注册到 env（如 Instant.glue 引用 Duration 构造器）
+        for (module.declarations) |decl| {
+            if (decl == .type_decl) {
+                self.predeclareTypeDecl(decl.type_decl, &env);
             }
         }
         self.suppress_errors = false;
@@ -3190,6 +3283,248 @@ pub const TypeInferencer = struct {
         env.define(f.name, scheme) catch return;
         self.predeclared_fns.put(f.name, {}) catch {};
     }
+    /// 查找已存在的 generic_type stub（由 registerBuiltins 创建）。
+    /// 用于在 predeclareTypeDecl 中复用 stub 对象，使 syscall 签名中的引用
+    /// 自动指向实际 record 类型，避免 stub 与实际类型不匹配的 sema 错误。
+    fn findGenericTypeStub(self: *TypeInferencer, name: []const u8) ?*Type {
+        for (self.types.items) |t| {
+            switch (t.*) {
+                .generic_type => |gt| {
+                    if (std.mem.eql(u8, gt.name, name)) return t;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+    /// 预声明 type_decl：注册类型名到 adt_types 表，并把构造器名注册到 env。
+    /// 这样跨模块引用的构造器（如 Instant.glue 引用 Duration(x)）在函数体检查
+    /// 时已能解析。后续 checkDeclCollecting 会用 redefine 覆盖为完整方案。
+    fn predeclareTypeDecl(self: *TypeInferencer, td: anytype, env: *TypeEnv) void {
+        if (self.predeclared_types.contains(td.name)) return;
+        self.predeclared_types.put(td.name, {}) catch return;
+        switch (td.def) {
+            .adt => |adt_def| {
+                var type_param_map = std.StringHashMap(*Type).init(self.arena.allocator());
+                defer type_param_map.deinit();
+                var type_param_ids = std.ArrayList(usize).empty;
+                defer type_param_ids.deinit(self.arena.allocator());
+                var type_param_names = std.ArrayList([]const u8).empty;
+                defer type_param_names.deinit(self.arena.allocator());
+                for (td.type_params) |tp| {
+                    const tv = self.freshTypeVar() catch return;
+                    type_param_map.put(tp.name, tv) catch return;
+                    type_param_ids.append(self.arena.allocator(), tv.type_var.id) catch return;
+                    const name_copy = self.arena.allocator().dupe(u8, tp.name) catch return;
+                    type_param_names.append(self.arena.allocator(), name_copy) catch return;
+                }
+                var adt_args = std.ArrayList(*Type).empty;
+                defer adt_args.deinit(self.arena.allocator());
+                for (td.type_params) |tp| {
+                    const tv = type_param_map.get(tp.name).?;
+                    adt_args.append(self.arena.allocator(), tv) catch return;
+                }
+                // 复用 generic_type stub（由 registerBuiltins 创建的 TimeComponents 等）
+                // 覆写为 adt_type，使 syscall 签名中的引用自动指向实际 ADT 类型
+                const stub = self.findGenericTypeStub(td.name);
+                const adt_ty = if (stub) |s| blk: {
+                    const owned_args = self.arena.allocator().dupe(*Type, adt_args.items) catch return;
+                    s.* = Type{ .adt_type = .{ .name = td.name, .type_args = owned_args } };
+                    break :blk s;
+                } else self.makeAdtType(td.name, adt_args.items) catch return;
+                if (!self.adt_types.contains(td.name)) {
+                    const ctor_names = self.arena.allocator().alloc([]const u8, adt_def.constructors.len) catch return;
+                    for (adt_def.constructors, 0..) |con, i| {
+                        ctor_names[i] = con.name;
+                    }
+                    const owned_tp_names = type_param_names.toOwnedSlice(self.arena.allocator()) catch return;
+                    const key = self.arena.allocator().dupe(u8, td.name) catch return;
+                    self.adt_types.put(key, AdtInfo{
+                        .ty = adt_ty,
+                        .constructor_names = ctor_names,
+                        .type_param_names = owned_tp_names,
+                        .defining_module = self.current_module,
+                    }) catch return;
+                    const mod_key = self.arena.allocator().dupe(u8, td.name) catch return;
+                    const mod_val = self.arena.allocator().dupe(u8, self.current_module) catch return;
+                    self.type_defining_modules.put(mod_key, mod_val) catch return;
+                }
+                for (adt_def.constructors) |con| {
+                    if (self.isBuiltinName(con.name)) continue;
+                    if (con.fields.len == 0) {
+                        const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
+                        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = adt_ty };
+                        env.define(con.name, scheme) catch continue;
+                    } else {
+                        const fts = self.arena.allocator().alloc(*Type, con.fields.len) catch return;
+                        for (con.fields, 0..) |field, i| {
+                            fts[i] = self.typeFromAstWithParams(field.ty, &type_param_map) catch (self.freshTypeVar() catch return);
+                        }
+                        const ctor_ty = self.makeFnType(fts, adt_ty) catch return;
+                        const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
+                        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                        env.define(con.name, scheme) catch continue;
+                    }
+                }
+            },
+            .record => |rec_def| {
+                var type_param_map = std.StringHashMap(*Type).init(self.arena.allocator());
+                defer type_param_map.deinit();
+                var type_param_ids = std.ArrayList(usize).empty;
+                defer type_param_ids.deinit(self.arena.allocator());
+                for (td.type_params) |tp| {
+                    const tv = self.freshTypeVar() catch return;
+                    type_param_map.put(tp.name, tv) catch return;
+                    type_param_ids.append(self.arena.allocator(), tv.type_var.id) catch return;
+                }
+                // 检查是否已存在 generic_type stub（由 registerBuiltins 创建的 TimeComponents 等）
+                // 如果存在，复用该 Type 对象，使 syscall 签名中的引用自动指向实际 record 类型
+                const stub = self.findGenericTypeStub(td.name);
+                const rec_ty = stub orelse blk: {
+                    const new_ty = self.arena.allocator().create(Type) catch return;
+                    self.types.append(self.arena.allocator(), new_ty) catch return;
+                    break :blk new_ty;
+                };
+                const fields = self.arena.allocator().alloc(FieldType, rec_def.fields.len) catch return;
+                for (rec_def.fields, 0..) |f, i| {
+                    fields[i] = FieldType{
+                        .name = f.name,
+                        .ty = self.typeFromAstWithParams(f.ty, &type_param_map) catch return,
+                    };
+                }
+                rec_ty.* = Type{ .record_type = .{ .fields = fields } };
+                const param_types = self.arena.allocator().alloc(*Type, rec_def.fields.len) catch return;
+                for (rec_def.fields, 0..) |f, i| {
+                    param_types[i] = self.typeFromAstWithParams(f.ty, &type_param_map) catch return;
+                }
+                const ctor_ty = self.makeFnType(param_types, rec_ty) catch return;
+                const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
+                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                if (!self.isBuiltinName(td.name)) {
+                    env.define(td.name, scheme) catch {};
+                }
+                if (!self.adt_types.contains(td.name)) {
+                    const key = self.arena.allocator().dupe(u8, td.name) catch return;
+                    const type_param_names = self.arena.allocator().alloc([]const u8, td.type_params.len) catch return;
+                    for (td.type_params, 0..) |tp, i| {
+                        type_param_names[i] = tp.name;
+                    }
+                    self.adt_types.put(key, AdtInfo{
+                        .ty = rec_ty,
+                        .constructor_names = &[_][]const u8{},
+                        .type_param_names = type_param_names,
+                    }) catch return;
+                }
+            },
+            .alias => |ta| {
+                var type_param_map = std.StringHashMap(*Type).init(self.arena.allocator());
+                defer type_param_map.deinit();
+                var type_param_ids = std.ArrayList(usize).empty;
+                defer type_param_ids.deinit(self.arena.allocator());
+                var type_param_names = std.ArrayList([]const u8).empty;
+                defer type_param_names.deinit(self.arena.allocator());
+                for (td.type_params) |tp| {
+                    const tv = self.freshTypeVar() catch return;
+                    type_param_map.put(tp.name, tv) catch return;
+                    type_param_ids.append(self.arena.allocator(), tv.type_var.id) catch return;
+                    const name_copy = self.arena.allocator().dupe(u8, tp.name) catch return;
+                    type_param_names.append(self.arena.allocator(), name_copy) catch return;
+                }
+                const target_ty = self.typeFromAstWithParams(ta.target, &type_param_map) catch return;
+                const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
+                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = target_ty };
+                if (!self.isBuiltinName(td.name)) {
+                    env.define(td.name, scheme) catch {};
+                }
+                if (!self.adt_types.contains(td.name)) {
+                    const key = self.arena.allocator().dupe(u8, td.name) catch return;
+                    const owned_tp_names = type_param_names.toOwnedSlice(self.arena.allocator()) catch return;
+                    self.adt_types.put(key, AdtInfo{
+                        .ty = target_ty,
+                        .constructor_names = &[_][]const u8{},
+                        .type_param_names = owned_tp_names,
+                        .defining_module = self.current_module,
+                    }) catch return;
+                }
+            },
+            .newtype => |nt| {
+                var type_param_map = std.StringHashMap(*Type).init(self.arena.allocator());
+                defer type_param_map.deinit();
+                var type_param_ids = std.ArrayList(usize).empty;
+                defer type_param_ids.deinit(self.arena.allocator());
+                var type_param_names = std.ArrayList([]const u8).empty;
+                defer type_param_names.deinit(self.arena.allocator());
+                for (td.type_params) |tp| {
+                    const tv = self.freshTypeVar() catch return;
+                    type_param_map.put(tp.name, tv) catch return;
+                    type_param_ids.append(self.arena.allocator(), tv.type_var.id) catch return;
+                    const name_copy = self.arena.allocator().dupe(u8, tp.name) catch return;
+                    type_param_names.append(self.arena.allocator(), name_copy) catch return;
+                }
+                var adt_args = std.ArrayList(*Type).empty;
+                defer adt_args.deinit(self.arena.allocator());
+                for (td.type_params) |tp| {
+                    const tv = type_param_map.get(tp.name).?;
+                    adt_args.append(self.arena.allocator(), tv) catch return;
+                }
+                // 复用 generic_type stub（由 registerBuiltins 创建的 TimeComponents 等）
+                // 覆写为 adt_type，使 syscall 签名中的引用自动指向实际 newtype 类型
+                const stub = self.findGenericTypeStub(td.name);
+                const newtype_ty = if (stub) |s| blk: {
+                    const owned_args = self.arena.allocator().dupe(*Type, adt_args.items) catch return;
+                    s.* = Type{ .adt_type = .{ .name = td.name, .type_args = owned_args } };
+                    break :blk s;
+                } else self.makeAdtType(td.name, adt_args.items) catch return;
+                if (!self.adt_types.contains(td.name)) {
+                    const type_key = self.arena.allocator().dupe(u8, td.name) catch return;
+                    const ctor_names_single = self.arena.allocator().alloc([]const u8, 1) catch return;
+                    ctor_names_single[0] = nt.name;
+                    const owned_tp_names = type_param_names.toOwnedSlice(self.arena.allocator()) catch return;
+                    self.adt_types.put(type_key, AdtInfo{
+                        .ty = newtype_ty,
+                        .constructor_names = ctor_names_single,
+                        .type_param_names = owned_tp_names,
+                        .defining_module = self.current_module,
+                    }) catch return;
+                    const mod_key = self.arena.allocator().dupe(u8, td.name) catch return;
+                    const mod_val = self.arena.allocator().dupe(u8, self.current_module) catch return;
+                    self.type_defining_modules.put(mod_key, mod_val) catch return;
+                }
+                const inner_ty = self.typeFromAstWithParams(nt.inner, &type_param_map) catch return;
+                const ctor_params = self.arena.allocator().alloc(*Type, 1) catch return;
+                ctor_params[0] = inner_ty;
+                const ctor_ty = self.makeFnType(ctor_params, newtype_ty) catch return;
+                const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
+                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                if (!self.isBuiltinName(nt.name)) {
+                    env.define(nt.name, scheme) catch {};
+                }
+            },
+            .error_newtype => |en| {
+                const error_adt = self.makeAdtType(en.name, &[_]*Type{}) catch return;
+                const ctor_params = self.arena.allocator().alloc(*Type, 1) catch return;
+                ctor_params[0] = self.makeType(.str_type) catch return;
+                const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
+                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
+                if (!self.isBuiltinName(en.name)) {
+                    env.define(en.name, scheme) catch {};
+                }
+                if (!self.adt_types.contains(en.name)) {
+                    const key = self.arena.allocator().dupe(u8, en.name) catch return;
+                    const ctor_names = self.arena.allocator().alloc([]const u8, 1) catch return;
+                    ctor_names[0] = en.name;
+                    self.adt_types.put(key, AdtInfo{
+                        .ty = error_adt,
+                        .constructor_names = ctor_names,
+                        .is_error_newtype = true,
+                    }) catch return;
+                    const mod_key = self.arena.allocator().dupe(u8, en.name) catch return;
+                    const mod_val = self.arena.allocator().dupe(u8, self.current_module) catch return;
+                    self.type_defining_modules.put(mod_key, mod_val) catch return;
+                }
+            },
+        }
+    }
     fn registerBuiltins(self: *TypeInferencer, env: *TypeEnv) void {
         {
             const param = self.freshTypeVar() catch return;
@@ -3321,24 +3656,59 @@ pub const TypeInferencer = struct {
             }) catch return;
         }
         // builtin 类型注册（决策 #18/#23/#24）：从 glue_builtin.BUILTIN_TYPES 元信息表加载
-        // 每个 builtin error_newtype 自动注册 ADT + 构造器 + builtin_names 防护
+        // 采用两遍策略：
+        //   第一遍注册所有关联 ADT（IOErrorKind / TimeErrorKind）+ 构造器到 env
+        //   第二遍注册所有 error_newtype（CastError / IOError / TimeError），字段类型
+        //        可引用已注册的 ADT（如 IOError.kind: IOErrorKind）
         // sema 启动时全加载类型定义，代码生成阶段按需编译方法体（Phase 3 实现按需加载）
+
+        // 第一遍：注册关联 ADT
+        inline for (glue_builtin.BUILTIN_TYPES) |bt| {
+            switch (bt.kind) {
+                .adt => {
+                    const adt_ty = self.makeAdtType(bt.name, &[_]*Type{}) catch return;
+                    const ctor_names = self.arena.allocator().alloc([]const u8, bt.constructors.len) catch return;
+                    for (bt.constructors, 0..) |c, i| {
+                        ctor_names[i] = c;
+                    }
+                    const adt_key = self.arena.allocator().dupe(u8, bt.name) catch return;
+                    self.adt_types.put(adt_key, AdtInfo{
+                        .ty = adt_ty,
+                        .constructor_names = ctor_names,
+                        .defining_module = "<builtin>",
+                    }) catch return;
+                    self.registerBuiltinName(bt.name);
+                    // 注册所有 unit constructor 到 env
+                    // 注意：constructor 名不注册为 builtin_name，允许用户 ADT 覆盖
+                    // （如 FileKind::Other 与 IOErrorKind::Other 可共存，后者会被前者覆盖）
+                    for (bt.constructors) |con| {
+                        const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = adt_ty };
+                        _ = env.define(con, scheme) catch return;
+                    }
+                },
+                .error_newtype => {},
+            }
+        }
+        // 第二遍：注册 error_newtype（字段类型可引用第一遍注册的 ADT）
         inline for (glue_builtin.BUILTIN_TYPES) |bt| {
             switch (bt.kind) {
                 .error_newtype => {
                     // 注册 ADT 类型
                     const adt_ty = self.makeAdtType(bt.name, &[_]*Type{}) catch return;
-                    // 构造器参数类型按 bt.fields 中的 type_name 查询 BUILTIN_TYPES 转换为 *Type
-                    // 字段类型在 comptime inline for 中已知，内联展开保证 comptime 推断
+                    // 构造器参数类型按 bt.fields 中的 type_name 查找：
+                    //   1) 内建基础类型（i8/i16/.../str/bool）→ BUILTIN_TYPES 表
+                    //   2) 已注册 ADT（IOErrorKind 等）→ self.adt_types
+                    //   3) fallback → str_type
                     const ctor_params = self.arena.allocator().alloc(*Type, bt.fields.len) catch return;
                     inline for (bt.fields, 0..) |f, i| {
-                        const field_ty: Type = blk: {
+                        const field_ty: *Type = blk: {
                             inline for (BUILTIN_TYPES) |entry| {
-                                if (comptime std.mem.eql(u8, entry.name, f.type_name)) break :blk entry.ty;
+                                if (comptime std.mem.eql(u8, entry.name, f.type_name)) break :blk self.makeType(entry.ty) catch return;
                             }
-                            break :blk .str_type;
+                            if (self.adt_types.get(f.type_name)) |info| break :blk info.ty;
+                            break :blk self.makeType(.str_type) catch return;
                         };
-                        ctor_params[i] = self.makeType(field_ty) catch return;
+                        ctor_params[i] = field_ty;
                     }
                     const ctor_ty = self.makeFnType(ctor_params, adt_ty) catch return;
                     const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
@@ -3347,7 +3717,6 @@ pub const TypeInferencer = struct {
                     self.registerBuiltinName(bt.name);
                     // 注册到 adt_types（标记 is_error_newtype=true，作为 Error 子类型）
                     // 同时填充 ctor_field_names/ctor_field_types，使 field_access 能解析字段类型
-                    // （与用户定义 ADT 在 .adt 分支填充方式一致，sema/type_check.zig:3608-3634）
                     const adt_key = self.arena.allocator().dupe(u8, bt.name) catch return;
                     const ctor_names = self.arena.allocator().alloc([]const u8, 1) catch return;
                     ctor_names[0] = bt.constructor_name;
@@ -3369,6 +3738,7 @@ pub const TypeInferencer = struct {
                         .ctor_field_names = ctor_field_names,
                     }) catch return;
                 },
+                .adt => {},
             }
         }
         {
@@ -3487,9 +3857,201 @@ pub const TypeInferencer = struct {
             env.define("channel", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
             self.registerBuiltinName("channel");
         }
+        // 注册所有 syscall 函数签名（IO/Time 原语）
+        // 设计：__ 前缀函数返回 Throw<T, IOError> 或 Throw<T, TimeError>，
+        // 极少部分（path_*/str_*/make_u8_array 等纯函数）返回值类型。
+        // 返回类型按 spec 表 4.1 / 5.1 给出，参数从对应 spec 表中复制。
+        self.registerSyscallSignatures(env);
         // 注册 typeof 内建函数名（参数是类型引用，特殊处理，不进入 env）
         // typeof 的实际处理在 inferExprInner 的 .call 分支中特殊分支
         self.registerBuiltinName("typeof");
+    }
+
+    /// 注册所有 syscall 函数签名到 env（__ 前缀函数）
+    ///
+    /// 这些函数由 IRBuilder 在 compileCallWithTypeArgs 中识别并编译为 syscall_call 节点。
+    /// 类型签名按 stdlib 设计文档（docs/superpowers/specs/2026-07-19-stdlib-design.md）
+    /// 表 4.1（IO）与表 5.1（Time）。
+    fn registerSyscallSignatures(self: *TypeInferencer, env: *TypeEnv) void {
+        // 构造 IOError 与 TimeError 的 ADT 类型（已由 BUILTIN_TYPES 注册，复用即可）
+        const io_error_ty = self.makeAdtType("IOError", &[_]*Type{}) catch return;
+        const time_error_ty = self.makeAdtType("TimeError", &[_]*Type{}) catch return;
+
+        // 通用：构造 Throw<T, E> 类型
+        const makeThrowTy = struct {
+            fn f(it: *TypeInferencer, val_ty: *Type, err_ty: *Type) *Type {
+                const t = it.arena.allocator().create(Type) catch return err_ty;
+                t.* = Type{ .throw_type = .{ .value_type = val_ty, .error_type = err_ty } };
+                it.types.append(it.arena.allocator(), t) catch return t;
+                return t;
+            }
+        }.f;
+
+        // 通用：注册一个 syscall 函数
+        const define = struct {
+            fn f(it: *TypeInferencer, e: *TypeEnv, name: []const u8, params: []*Type, ret_ty: *Type) void {
+                const fn_ty = it.makeFnType(params, ret_ty) catch return;
+                e.define(name, TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
+                it.registerBuiltinName(name);
+            }
+        }.f;
+
+        const str_ty = self.makeType(.str_type) catch return;
+        const i32_ty = self.makeType(.i32_type) catch return;
+        const i64_ty = self.makeType(.i64_type) catch return;
+        const i128_ty = self.makeType(.i128_type) catch return;
+        const usize_ty = self.makeType(.usize_type) catch return;
+        const bool_ty = self.makeType(.bool_type) catch return;
+        const unit_ty = self.makeType(.unit_type) catch return;
+        const u8_ty = self.makeType(.u8_type) catch return;
+        const u8_array_ty = self.makeArrayType(u8_ty, null) catch return;
+
+        // Stat 类型：std/io 中定义的 record，syscall 层返回值类型用 generic "Stat"
+        const stat_ty = self.makeGenericType("Stat", &[_]*Type{}) catch return;
+        // DirEntry 类型：std/io 中定义的 record
+        const dir_entry_ty = self.makeGenericType("DirEntry", &[_]*Type{}) catch return;
+        const dir_entry_array_ty = self.makeArrayType(dir_entry_ty, null) catch return;
+        // TimeComponents 类型：std/time 中定义的 record
+        const time_comp_ty = self.makeGenericType("TimeComponents", &[_]*Type{}) catch return;
+
+        // ── IO syscall (0-18) ──
+        // __file_open(path: str, flags: i32, mode: i32) -> Throw<i32, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = str_ty;
+            ps[1] = i32_ty;
+            ps[2] = i32_ty;
+            define(self, env, "__file_open", ps, makeThrowTy(self, i32_ty, io_error_ty));
+        }
+        // __file_close(fd: i32) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i32_ty;
+            define(self, env, "__file_close", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __file_read(fd: i32, buf: u8[], len: usize) -> Throw<usize, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = i32_ty;
+            ps[1] = u8_array_ty;
+            ps[2] = usize_ty;
+            define(self, env, "__file_read", ps, makeThrowTy(self, usize_ty, io_error_ty));
+        }
+        // __file_write(fd: i32, buf: u8[], len: usize) -> Throw<usize, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = i32_ty;
+            ps[1] = u8_array_ty;
+            ps[2] = usize_ty;
+            define(self, env, "__file_write", ps, makeThrowTy(self, usize_ty, io_error_ty));
+        }
+        // __file_seek(fd: i32, offset: i64, whence: i32) -> Throw<i64, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = i32_ty;
+            ps[1] = i64_ty;
+            ps[2] = i32_ty;
+            define(self, env, "__file_seek", ps, makeThrowTy(self, i64_ty, io_error_ty));
+        }
+        // __file_tell(fd: i32) -> Throw<i64, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i32_ty;
+            define(self, env, "__file_tell", ps, makeThrowTy(self, i64_ty, io_error_ty));
+        }
+        // __file_stat(path: str) -> Throw<Stat, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = str_ty;
+            define(self, env, "__file_stat", ps, makeThrowTy(self, stat_ty, io_error_ty));
+        }
+        // __file_fstat(fd: i32) -> Throw<Stat, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i32_ty;
+            define(self, env, "__file_fstat", ps, makeThrowTy(self, stat_ty, io_error_ty));
+        }
+        // __file_remove(path: str) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = str_ty;
+            define(self, env, "__file_remove", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __file_rename(old: str, new: str) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
+            ps[0] = str_ty;
+            ps[1] = str_ty;
+            define(self, env, "__file_rename", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __file_chmod(path: str, mode: i32) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
+            ps[0] = str_ty;
+            ps[1] = i32_ty;
+            define(self, env, "__file_chmod", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __dir_create(path: str, recursive: bool) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
+            ps[0] = str_ty;
+            ps[1] = bool_ty;
+            define(self, env, "__dir_create", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __dir_remove(path: str, recursive: bool) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
+            ps[0] = str_ty;
+            ps[1] = bool_ty;
+            define(self, env, "__dir_remove", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __dir_list(path: str) -> Throw<DirEntry[], IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = str_ty;
+            define(self, env, "__dir_list", ps, makeThrowTy(self, dir_entry_array_ty, io_error_ty));
+        }
+
+        // ── Time syscall ──
+        // __instant_now_ns() -> i128
+        {
+            const ps = self.arena.allocator().alloc(*Type, 0) catch return;
+            define(self, env, "__instant_now_ns", ps, i128_ty);
+        }
+        // __systemtime_now_ns() -> i128
+        {
+            const ps = self.arena.allocator().alloc(*Type, 0) catch return;
+            define(self, env, "__systemtime_now_ns", ps, i128_ty);
+        }
+        // __sleep_ns(ns: i128) -> Unit
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i128_ty;
+            define(self, env, "__sleep_ns", ps, unit_ty);
+        }
+        // __localtime_offset_minutes() -> i32
+        {
+            const ps = self.arena.allocator().alloc(*Type, 0) catch return;
+            define(self, env, "__localtime_offset_minutes", ps, i32_ty);
+        }
+        // __systemtime_to_local_components(ns: i128) -> TimeComponents
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i128_ty;
+            define(self, env, "__systemtime_to_local_components", ps, time_comp_ty);
+        }
+        // __systemtime_to_utc_components(ns: i128) -> TimeComponents
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i128_ty;
+            define(self, env, "__systemtime_to_utc_components", ps, time_comp_ty);
+        }
+        // __components_to_ns_utc(comp: TimeComponents) -> Throw<i128, TimeError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = time_comp_ty;
+            define(self, env, "__components_to_ns_utc", ps, makeThrowTy(self, i128_ty, time_error_ty));
+        }
     }
     fn registerBuiltinName(self: *TypeInferencer, name: []const u8) void {
         if (!self.builtin_names.contains(name)) {
@@ -3643,10 +4205,26 @@ pub const TypeInferencer = struct {
                     const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = param_ty };
                     child_env.define(param.name, scheme) catch return;
                 }
-                const ret_ty = if (f.return_type) |ret_type|
+                const ret_ty_raw = if (f.return_type) |ret_type|
                     self.typeFromAstWithParams(ret_type, &type_param_map) catch self.freshTypeVar() catch return
                 else
                     self.freshTypeVar() catch return;
+                // async 函数：用户声明的返回类型 X 实际表示 Async<X>
+                // 这样 fn_ty 签名和 unifyReturnType 都使用 Async<X>，
+                // 与 body 推断的 Async<Y> 走 unifyReturnType 的 Async 递归分支，
+                // 让 X 与 Y（如 i64 与 i8 字面量）正确 widen 比较。
+                // 但若用户已显式声明返回 Async<X>（如 async fun sleep(): Async<Unit>），
+                // 不再二次包装。
+                const ret_ty = if (f.is_async) blk: {
+                    const resolved_raw = self.resolve(ret_ty_raw);
+                    if (resolved_raw.* == .generic_type and
+                        std.mem.eql(u8, resolved_raw.generic_type.name, "Async") and
+                        resolved_raw.generic_type.args.len == 1)
+                    {
+                        break :blk ret_ty_raw;
+                    }
+                    break :blk self.makeGenericType("Async", &[_]*Type{ret_ty_raw}) catch return;
+                } else ret_ty_raw;
                 const fn_ty = self.makeFnType(param_types, ret_ty) catch return;
                 const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
                 const fn_scheme = TypeScheme{ .quantified_vars = qvars, .ty = fn_ty };
@@ -3654,6 +4232,20 @@ pub const TypeInferencer = struct {
                 const prev_fn_return = self.current_fn_return_type;
                 if (f.return_type) |ret_type| {
                     self.current_fn_return_type = self.typeFromAstWithParams(ret_type, &type_param_map) catch null;
+                    // async 函数：声明返回类型应为 Async<X>，提取内部 X 作为 ? 传播的检查对象
+                    // 这样 body 中的 `expr?` 能正确匹配外层 Throw 上下文
+                    // （如 Async<Throw<File, IOError>> → current_fn_return_type = Throw<File, IOError>）
+                    if (f.is_async) {
+                        if (self.current_fn_return_type) |fr| {
+                            const resolved = self.resolve(fr);
+                            if (resolved.* == .generic_type and
+                                std.mem.eql(u8, resolved.generic_type.name, "Async") and
+                                resolved.generic_type.args.len == 1)
+                            {
+                                self.current_fn_return_type = resolved.generic_type.args[0];
+                            }
+                        }
+                    }
                 } else {
                     self.current_fn_return_type = null;
                 }
@@ -3679,7 +4271,7 @@ pub const TypeInferencer = struct {
                     self.reportInferError(err, f.location);
                     return;
                 };
-                const effective_body_ty = if (f.is_async and f.return_type == null)
+                const effective_body_ty = if (f.is_async)
                     self.makeGenericType("Async", &[_]*Type{body_ty}) catch return
                 else
                     body_ty;
@@ -3743,9 +4335,13 @@ pub const TypeInferencer = struct {
                         }
                         const key = self.arena.allocator().dupe(u8, td.name) catch return;
                         const owned_type_param_names = type_param_names.toOwnedSlice(self.arena.allocator()) catch return;
-                        const dup_or_builtin = self.isBuiltinName(td.name) or self.adt_types.contains(td.name);
+                        const is_predeclared = self.predeclared_types.contains(td.name);
+                        const dup_or_builtin = self.isBuiltinName(td.name) or (self.adt_types.contains(td.name) and !is_predeclared);
                         if (self.isBuiltinName(td.name)) {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "cannot redefine built-in name '{s}'", .{td.name});
+                        } else if (is_predeclared) {
+                            // 已 predeclared：跳过 adt_types 重复注册（predeclare 已注册）
+                            // ctor_field_types 等字段会在下面的 !dup_or_builtin 分支中更新
                         } else if (self.adt_types.contains(td.name)) {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "duplicate type definition: '{s}' is already defined in this scope", .{td.name});
                         } else {
@@ -3794,13 +4390,17 @@ pub const TypeInferencer = struct {
                                 self.addErrorAt(.type_mismatch, con.location.line, con.location.column, "cannot redefine built-in name '{s}'", .{con.name});
                             } else if (con.fields.len == 0) {
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ret_ty };
-                                if (!(env.defineOrReport(con.name, scheme) catch false)) {
+                                if (self.predeclared_types.contains(td.name)) {
+                                    env.redefine(con.name, scheme) catch {};
+                                } else if (!(env.defineOrReport(con.name, scheme) catch false)) {
                                     self.addErrorAt(.type_mismatch, con.location.line, con.location.column, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
                                 }
                             } else {
                                 const ctor_ty = self.makeFnType(@constCast(ctor_field_types[ci]), ret_ty) catch return;
                                 const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
-                                if (!(env.defineOrReport(con.name, scheme) catch false)) {
+                                if (self.predeclared_types.contains(td.name)) {
+                                    env.redefine(con.name, scheme) catch {};
+                                } else if (!(env.defineOrReport(con.name, scheme) catch false)) {
                                     self.addErrorAt(.type_mismatch, con.location.line, con.location.column, "duplicate definition: '{s}' is already defined in this scope", .{con.name});
                                 }
                             }
@@ -3840,6 +4440,8 @@ pub const TypeInferencer = struct {
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
                         if (self.isBuiltinName(td.name)) {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "cannot redefine built-in name '{s}'", .{td.name});
+                        } else if (self.predeclared_types.contains(td.name)) {
+                            env.redefine(td.name, scheme) catch {};
                         } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "duplicate definition: '{s}' is already defined", .{td.name});
                         }
@@ -3878,6 +4480,8 @@ pub const TypeInferencer = struct {
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = target_ty };
                         if (self.isBuiltinName(td.name)) {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "cannot redefine built-in name '{s}'", .{td.name});
+                        } else if (self.predeclared_types.contains(td.name)) {
+                            env.redefine(td.name, scheme) catch {};
                         } else if (!(env.defineOrReport(td.name, scheme) catch false)) {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "duplicate definition: '{s}' is already defined", .{td.name});
                         }
@@ -3936,6 +4540,8 @@ pub const TypeInferencer = struct {
                         const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
                         if (self.isBuiltinName(nt.name)) {
                             self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{nt.name});
+                        } else if (self.predeclared_types.contains(td.name)) {
+                            env.redefine(nt.name, scheme) catch {};
                         } else if (!(env.defineOrReport(nt.name, scheme) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{nt.name});
                         }
@@ -3949,12 +4555,17 @@ pub const TypeInferencer = struct {
                         ctor_params[0] = self.makeType(.str_type) catch return;
                         const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
                         const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
+                        const is_predeclared = self.predeclared_types.contains(td.name);
                         if (self.isBuiltinName(en.name)) {
                             self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{en.name});
+                        } else if (is_predeclared) {
+                            env.redefine(en.name, scheme) catch {};
                         } else if (!(env.defineOrReport(en.name, scheme) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{en.name});
                         }
-                        if (self.isBuiltinName(en.name)) {} else if (self.adt_types.contains(en.name)) {
+                        if (self.isBuiltinName(en.name)) {} else if (is_predeclared) {
+                            // 已 predeclared：跳过 adt_types 重复注册（predeclare 已注册）
+                        } else if (self.adt_types.contains(en.name)) {
                             self.addError(.type_mismatch, "duplicate type definition: '{s}' is already defined", .{en.name});
                         } else {
                             const key = self.arena.allocator().dupe(u8, en.name) catch return;

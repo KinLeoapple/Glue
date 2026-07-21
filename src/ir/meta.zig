@@ -181,13 +181,19 @@ pub const RouteMeta = struct {
 
 /// 竞争元数据：描述 select 多路复用
 ///
-/// race_source 检查通道就绪性，race_select 选择第一个就绪的，
+/// race_select 直接以各 receive 分支的通道引用为输入，阻塞直到任一通道
+/// 就绪（有数据/会合发送方/已关闭）或 timeout 到期，输出获胜分支的 arm 索引。
 /// race_yield 无就绪时让出执行权。
 pub const RaceMeta = struct {
-    /// 竞争源数量
+    /// 竞争源数量（receive 分支数，不含 timeout 分支）
     source_count: u8 = 0,
     /// 超时时间（毫秒），null 表示无限等待
     timeout_ms: ?u64 = null,
+    /// timeout 分支在 select arms 中的索引；null 表示无 timeout 分支
+    timeout_arm: ?u8 = null,
+    /// timeout 时长值在 race_select inputs 中的槽位（仅 timeout_arm 非 null 时有效，
+    /// 时长通道固定追加在 receive 通道之后）
+    timeout_input: u8 = 0,
 };
 
 /// 清理元数据：描述 defer 清理链
@@ -459,6 +465,52 @@ pub const TypeMetadataTable = struct {
             self.name_to_id.deinit();
         }
     }
+};
+
+// ════════════════════════════════════════════════════════════════
+// Phase 6: Syscall 元数据（IO/Time 等宿主 syscall 包装）
+// ════════════════════════════════════════════════════════════════
+
+/// Syscall ID（meta_index 索引到 syscall 分派表）
+///
+/// 分两组：
+/// - IO syscall：文件/目录操作（path 操作已下放到 Glue stdlib）
+/// - Time syscall：时间戳、睡眠、日期分量转换
+pub const SyscallId = enum(u16) {
+    // IO syscall
+    file_open,
+    file_close,
+    file_read,
+    file_write,
+    file_seek,
+    file_tell,
+    file_stat,
+    file_fstat,
+    file_remove,
+    file_rename,
+    file_chmod,
+    dir_create,
+    dir_remove,
+    dir_list,
+    // Time syscall
+    instant_now_ns,
+    systemtime_now_ns,
+    sleep_ns,
+    localtime_offset_minutes,
+    systemtime_to_local_components,
+    systemtime_to_utc_components,
+    components_to_ns_utc,
+};
+
+/// Syscall 元数据
+///
+/// syscall_call 节点的 meta_index（1-indexed）索引到 syscall_metas 表，
+/// 由 SyscallId 派发到对应实现函数。return_chan_type 用于 IR 通道分配。
+pub const SyscallMeta = struct {
+    syscall_id: SyscallId,
+    arg_count: u8,
+    /// 返回值通道类型（用于 IR 通道分配）
+    return_chan_type: channel_mod.ChanType = .ref_chan,
 };
 
 // ════════════════════════════════════════════════════════════════

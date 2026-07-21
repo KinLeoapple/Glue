@@ -24,7 +24,9 @@ const std = @import("std");
 pub const BuiltinKind = enum {
     /// Error 子类型（type X: Error = X(...) ）
     error_newtype,
-    // 未来扩展：record / adt / trait 等
+    /// 关联 ADT（type X = | A | B(...) ），如 IOErrorKind / TimeErrorKind
+    adt,
+    // 未来扩展：record / trait 等
 };
 
 /// Builtin 字段元信息
@@ -47,6 +49,8 @@ pub const BuiltinTypeInfo = struct {
     constructor_name: []const u8,
     /// 字段列表（按源码声明顺序）
     fields: []const FieldInfo,
+    /// ADT 构造器名列表（kind == .adt 时使用；其他情况为空）
+    constructors: []const []const u8 = &[_][]const u8{},
     /// 源文件相对路径（相对项目根，用于按需加载方法体）
     source_path: []const u8,
     /// 所属 pack 名（用于模块导入解析）
@@ -71,6 +75,72 @@ pub const BUILTIN_TYPES = [_]BuiltinTypeInfo{
         },
         .source_path = "src/builtin/error/CastError.glue",
         .pack_name = "CastError",
+    },
+    .{
+        .name = "IOError",
+        .kind = .error_newtype,
+        .parent_trait = "Error",
+        .constructor_name = "IOError",
+        .fields = &[_]FieldInfo{
+            .{ .name = "kind", .type_name = "IOErrorKind" },
+            .{ .name = "msg", .type_name = "str" },
+            .{ .name = "os_err", .type_name = "i32" },
+            .{ .name = "path", .type_name = "str?" },
+        },
+        .source_path = "src/builtin/error/IOError.glue",
+        .pack_name = "IOError",
+    },
+    .{
+        .name = "TimeError",
+        .kind = .error_newtype,
+        .parent_trait = "Error",
+        .constructor_name = "TimeError",
+        .fields = &[_]FieldInfo{
+            .{ .name = "kind", .type_name = "TimeErrorKind" },
+            .{ .name = "msg", .type_name = "str" },
+            .{ .name = "value", .type_name = "str" },
+        },
+        .source_path = "src/builtin/error/TimeError.glue",
+        .pack_name = "TimeError",
+    },
+    // ── 关联 ADT（kind == .adt） ──
+    // 作为 builtin error_newtype 的分类枚举，自动注册构造器到 env
+    .{
+        .name = "IOErrorKind",
+        .kind = .adt,
+        .parent_trait = "",
+        .constructor_name = "",
+        .fields = &[_]FieldInfo{},
+        .constructors = &[_][]const u8{
+            "NotFound",
+            "PermissionDenied",
+            "AlreadyExists",
+            "Busy",
+            "InvalidInput",
+            "UnexpectedEof",
+            "BrokenPipe",
+            "OutOfMemory",
+            "Interrupted",
+            "Other",
+        },
+        .source_path = "src/builtin/error/IOError.glue",
+        .pack_name = "IOError",
+    },
+    .{
+        .name = "TimeErrorKind",
+        .kind = .adt,
+        .parent_trait = "",
+        .constructor_name = "",
+        .fields = &[_]FieldInfo{},
+        .constructors = &[_][]const u8{
+            "InvalidDateTime",
+            "InvalidFormat",
+            "ParseFailed",
+            "OutOfRange",
+            "TimezoneNotFound",
+        },
+        .source_path = "src/builtin/error/TimeError.glue",
+        .pack_name = "TimeError",
     },
 };
 
@@ -97,13 +167,40 @@ pub fn isBuiltinTypeName(name: []const u8) bool {
 
 const testing = std.testing;
 
-test "BUILTIN_TYPES 包含 CastError" {
-    try testing.expectEqual(@as(usize, 1), BUILTIN_TYPES.len);
+test "BUILTIN_TYPES 包含 CastError/IOError/TimeError + 关联 ADT" {
+    try testing.expectEqual(@as(usize, 5), BUILTIN_TYPES.len);
     const t = BUILTIN_TYPES[0];
     try testing.expectEqualStrings("CastError", t.name);
     try testing.expectEqual(BuiltinKind.error_newtype, t.kind);
     try testing.expectEqualStrings("Error", t.parent_trait);
     try testing.expectEqualStrings("CastError", t.constructor_name);
+
+    const io = BUILTIN_TYPES[1];
+    try testing.expectEqualStrings("IOError", io.name);
+    try testing.expectEqual(BuiltinKind.error_newtype, io.kind);
+    try testing.expectEqualStrings("Error", io.parent_trait);
+    try testing.expectEqualStrings("IOError", io.constructor_name);
+
+    const tm = BUILTIN_TYPES[2];
+    try testing.expectEqualStrings("TimeError", tm.name);
+    try testing.expectEqual(BuiltinKind.error_newtype, tm.kind);
+    try testing.expectEqualStrings("Error", tm.parent_trait);
+    try testing.expectEqualStrings("TimeError", tm.constructor_name);
+
+    const io_kind = BUILTIN_TYPES[3];
+    try testing.expectEqualStrings("IOErrorKind", io_kind.name);
+    try testing.expectEqual(BuiltinKind.adt, io_kind.kind);
+    try testing.expectEqual(@as(usize, 10), io_kind.constructors.len);
+    try testing.expectEqualStrings("NotFound", io_kind.constructors[0]);
+    try testing.expectEqualStrings("InvalidInput", io_kind.constructors[4]);
+    try testing.expectEqualStrings("Other", io_kind.constructors[9]);
+
+    const tm_kind = BUILTIN_TYPES[4];
+    try testing.expectEqualStrings("TimeErrorKind", tm_kind.name);
+    try testing.expectEqual(BuiltinKind.adt, tm_kind.kind);
+    try testing.expectEqual(@as(usize, 5), tm_kind.constructors.len);
+    try testing.expectEqualStrings("InvalidDateTime", tm_kind.constructors[0]);
+    try testing.expectEqualStrings("TimezoneNotFound", tm_kind.constructors[4]);
 }
 
 test "CastError 字段布局" {
@@ -116,12 +213,40 @@ test "CastError 字段布局" {
     try testing.expectEqualStrings("value", layout[3].name);
 }
 
+test "IOError 字段布局" {
+    const layout = getFieldLayout("IOError") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 4), layout.len);
+    try testing.expectEqualStrings("kind", layout[0].name);
+    try testing.expectEqualStrings("IOErrorKind", layout[0].type_name);
+    try testing.expectEqualStrings("msg", layout[1].name);
+    try testing.expectEqualStrings("str", layout[1].type_name);
+    try testing.expectEqualStrings("os_err", layout[2].name);
+    try testing.expectEqualStrings("i32", layout[2].type_name);
+    try testing.expectEqualStrings("path", layout[3].name);
+    try testing.expectEqualStrings("str?", layout[3].type_name);
+}
+
+test "TimeError 字段布局" {
+    const layout = getFieldLayout("TimeError") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 3), layout.len);
+    try testing.expectEqualStrings("kind", layout[0].name);
+    try testing.expectEqualStrings("TimeErrorKind", layout[0].type_name);
+    try testing.expectEqualStrings("msg", layout[1].name);
+    try testing.expectEqualStrings("str", layout[1].type_name);
+    try testing.expectEqualStrings("value", layout[2].name);
+    try testing.expectEqualStrings("str", layout[2].type_name);
+}
+
 test "getBuiltinType 命中/未命中" {
     try testing.expect(getBuiltinType("CastError") != null);
+    try testing.expect(getBuiltinType("IOError") != null);
+    try testing.expect(getBuiltinType("TimeError") != null);
     try testing.expect(getBuiltinType("FileError") == null);
 }
 
 test "isBuiltinTypeName" {
     try testing.expect(isBuiltinTypeName("CastError"));
+    try testing.expect(isBuiltinTypeName("IOError"));
+    try testing.expect(isBuiltinTypeName("TimeError"));
     try testing.expect(!isBuiltinTypeName("NotABuiltin"));
 }

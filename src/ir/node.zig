@@ -30,8 +30,19 @@ pub const NodeOp = enum(u8) {
     // === 数据结构 ===
     array_make, array_get, array_set, array_len, array_push, array_concat,
     array_first, array_last, array_contains, array_get_safe, array_drop_last, array_pop,
+    /// 数组填充：array_fill(output, count, value) — 创建 count 个 value 副本的数组
+    array_fill,
+    /// 数组切片：array_slice(output, arr, start, end) — _pad=0 左闭右开，_pad=1 左闭右闭
+    array_slice,
     record_make, record_get, record_set, record_clone,
     string_concat, string_len, string_index, string_contains,
+    /// 字符串切片：string_slice(output, s, start, end) — _pad=0 左闭右开，_pad=1 左闭右闭
+    /// start/end 为字符索引（Unicode 标量值）
+    string_slice,
+    /// 字符串转 u8[]：string_bytes(output, s) — UTF-8 编码
+    string_bytes,
+    /// u8[] 转字符串：array_to_str(output, arr) — UTF-8 解码
+    array_to_str,
     newtype_wrap, newtype_unwrap,
 
     // === 向量计算（处理循环/递归，Phase 2） ===
@@ -57,6 +68,18 @@ pub const NodeOp = enum(u8) {
 
     // === 内存管理 ===
     alloc, free, load, store,
+    /// 借用引用：ref_get 读取 *ref 的值到 output 通道
+    /// inputs[0] = 引用通道（ref_chan，持有 *ObjHeader）
+    /// output = 值通道（按引用指向的类型分配）
+    ref_get,
+    /// 借用引用：ref_set 将 value 写入 *ref 指向的位置
+    /// inputs[0] = 引用通道，inputs[1] = 值通道
+    /// output = unit
+    ref_set,
+    /// 取引用：ref_of 将 expr 的地址包装为引用通道
+    /// inputs[0] = expr 通道（标量装箱或复合直接取址）
+    /// output = ref_chan
+    ref_of,
 
     // === 控制流（最小化） ===
     call, halt_return, halt_throw, halt_panic,
@@ -71,6 +94,11 @@ pub const NodeOp = enum(u8) {
     builtin_ref_eq,
     builtin_type, builtin_panic,
     builtin_typeof,
+
+    // === Syscall 调用（IO/Time 等宿主 syscall 包装）===
+    /// meta_index 索引到 syscall_metas 表（1-indexed）
+    /// inputs[] 为参数通道，output 为结果通道
+    syscall_call,
 
     // === 星轨（async/spawn，Phase 5） ===
     orbit_async_create, orbit_async_join, orbit_async_status,

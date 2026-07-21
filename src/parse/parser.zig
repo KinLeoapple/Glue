@@ -206,6 +206,17 @@ pub const Parser = struct {
         return error.UnexpectedToken;
     }
 
+    /// 检测当前位置是否为闭合泛型参数列表的 `>`（含被虚拟拆分的 `>>` / `>=` / `>>=` 形态）
+    /// 仅用于在尾随逗号后判断是否应停止追加元素，不消费任何 token
+    fn checkCloseAngle(self: *Parser) bool {
+        if (self.pending_gt or self.pending_gt_eq) return true;
+        if (self.current >= self.tokens.len) return false;
+        return switch (self.tokens[self.current].type) {
+            .gt, .gt_eq, .gt_gt, .gt_gt_eq => true,
+            else => false,
+        };
+    }
+
     /// 期望消费关闭泛型参数的 '>'，支持把 `>=` 拆分为 `>` 与 `=`，把 `>>` 拆分为两个 `>`，
     /// 把 `>>=` 拆分为 `>` 与 `>=`（`>=` 进一步拆分为 `>` 与 `=`），以消除嵌套泛型（如 List<List<i64>>）的歧义。
     fn expectCloseAngle(self: *Parser, message: []const u8) ParserError!void {
@@ -725,6 +736,7 @@ pub const Parser = struct {
                 .ty = first_type,
             }) catch return null;
             while (self.matchToken(.comma)) {
+                if (self.check(.r_paren)) break;
                 const ty = self.parseType() catch {
                     fields.deinit(self.arena.allocator());
                     return null;
@@ -831,6 +843,7 @@ pub const Parser = struct {
     fn parseConstructorFieldList(self: *Parser, fields: *std.ArrayList(ast.ConstructorField)) ParserError!void {
         try fields.append(self.arena.allocator(), try self.parseConstructorField());
         while (self.matchToken(.comma)) {
+            if (self.check(.r_paren)) break;
             try fields.append(self.arena.allocator(), try self.parseConstructorField());
         }
     }
@@ -1033,6 +1046,7 @@ pub const Parser = struct {
         try type_params.ensureTotalCapacity(self.arena.allocator(), 2);
         try type_params.append(self.arena.allocator(), try self.parseTypeParam());
         while (self.matchToken(.comma)) {
+            if (self.checkCloseAngle()) break;
             try type_params.append(self.arena.allocator(), try self.parseTypeParam());
         }
     }
@@ -1055,6 +1069,7 @@ pub const Parser = struct {
                 });
                 if (has_paren) {
                     while (self.matchToken(.comma)) {
+                        if (self.check(.r_paren)) break;
                         const next_trait = try self.expect(.identifier, "expected trait name");
                         try bounds.append(self.arena.allocator(), ast.TraitBound{
                             .trait_name = next_trait.lexeme,
@@ -1124,27 +1139,17 @@ pub const Parser = struct {
         }
     }
 
-    /// 解析单个参数：[var|val] name: Type
+    /// 解析单个参数：name: Type
     fn parseParam(self: *Parser) ParserError!ast.Param {
-        var is_var = false;
-        if (self.matchToken(.kw_var)) {
-            is_var = true;
-        } else {
-            _ = self.matchToken(.kw_val);
-        }
         const name_tok = try self.expect(.identifier, "expected parameter name");
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
-            if (self.matchToken(.kw_var)) {
-                is_var = true;
-            }
             type_annotation = try self.parseType();
         }
         return ast.Param{
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
             .type_annotation = type_annotation,
-            .is_var = is_var,
         };
     }
 
@@ -1157,6 +1162,7 @@ pub const Parser = struct {
     fn parseTraitBoundListInner(self: *Parser, bounds: *std.ArrayList(ast.TraitBound)) ParserError!void {
         try bounds.append(self.arena.allocator(), try self.parseTraitBound());
         while (self.matchToken(.comma)) {
+            if (self.check(.r_paren)) break;
             try bounds.append(self.arena.allocator(), try self.parseTraitBound());
         }
     }
@@ -1179,6 +1185,7 @@ pub const Parser = struct {
     fn parseTypeConstraints(self: *Parser, constraints: *std.ArrayList(ast.TypeConstraint)) ParserError!void {
         try constraints.append(self.arena.allocator(), try self.parseTypeConstraint());
         while (self.matchToken(.comma)) {
+            if (self.check(.l_brace)) break;
             try constraints.append(self.arena.allocator(), try self.parseTypeConstraint());
         }
     }
@@ -1206,6 +1213,7 @@ pub const Parser = struct {
     fn parseTypeArgList(self: *Parser, type_args: *std.ArrayList(*ast.TypeNode)) ParserError!void {
         try type_args.append(self.arena.allocator(), try self.parseType());
         while (self.matchToken(.comma)) {
+            if (self.checkCloseAngle()) break;
             try type_args.append(self.arena.allocator(), try self.parseType());
         }
     }
@@ -1214,6 +1222,32 @@ pub const Parser = struct {
 
     /// 类型解析入口
     fn parseType(self: *Parser) ParserError!*ast.TypeNode {
+        // 借用引用 &T 与裸指针 *T：前缀式，可链式（如 &&T 表示引用的引用）
+        if (self.matchToken(.ampersand)) {
+            const loc = tokenLoc(self.previous());
+            const inner = try self.parseType();
+            return self.allocType(loc, ast.TypeNode{
+                .ref_type = .{
+                    .inner = inner,
+                },
+            });
+        }
+        // &&T：lexer 将两个 & 合并为 amp_amp，这里拆成两层 ref_type
+        if (self.matchToken(.amp_amp)) {
+            const loc = tokenLoc(self.previous());
+            const inner = try self.parseType();
+            const inner_ref = try self.allocType(loc, ast.TypeNode{ .ref_type = .{ .inner = inner } });
+            return self.allocType(loc, ast.TypeNode{ .ref_type = .{ .inner = inner_ref } });
+        }
+        if (self.matchToken(.star)) {
+            const loc = tokenLoc(self.previous());
+            const inner = try self.parseType();
+            return self.allocType(loc, ast.TypeNode{
+                .raw_ptr = .{
+                    .inner = inner,
+                },
+            });
+        }
         return self.parseFunctionType();
     }
 
@@ -1310,6 +1344,7 @@ pub const Parser = struct {
             var args = std.ArrayList(*ast.TypeNode).empty;
             try args.append(self.arena.allocator(), try self.parseType());
             while (self.matchToken(.comma)) {
+                if (self.checkCloseAngle()) break;
                 try args.append(self.arena.allocator(), try self.parseType());
             }
             self.expectCloseAngle("expected '>' to close type parameters") catch {};
@@ -1677,16 +1712,26 @@ pub const Parser = struct {
     }
 
     /// 解析乘除模 * / %
+    /// 注意：`*` 既是乘法（中缀）也是解引用（前缀）。当 `*` 出现在新行开头时，
+    /// 更可能是解引用而非乘法，因此检查 `*` 是否与 left 末尾 token 同行。
     fn parseMultiplication(self: *Parser) ParserError!*ast.Expr {
         var left = try self.parseUnary();
         while (true) {
-            const op: ?ast.BinaryOp = switch (self.peek().type) {
+            const peek_tok = self.peek();
+            const op: ?ast.BinaryOp = switch (peek_tok.type) {
                 .star => .mul,
                 .slash => .div,
                 .percent => .mod,
                 else => null,
             };
             if (op) |o| {
+                // `*` 跨行时视为新语句的解引用，不作为乘法
+                if (o == .mul and self.current > 0) {
+                    const prev_tok = self.tokens[self.current - 1];
+                    if (peek_tok.line != prev_tok.line) {
+                        break;
+                    }
+                }
                 const op_tok = self.advance();
                 const right = try self.parseUnary();
                 left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
@@ -1721,6 +1766,33 @@ pub const Parser = struct {
             return self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .unary = .{
                     .op = .bit_not,
+                    .operand = operand,
+                },
+            });
+        }
+        // 取引用 &expr：获取指向 expr 的借用引用
+        if (self.matchToken(.ampersand)) {
+            const op_tok = self.previous();
+            const operand = try self.parseUnary();
+            return self.allocExpr(tokenLoc(op_tok), ast.Expr{
+                .ref_of = .{
+                    .operand = operand,
+                },
+            });
+        }
+        // &&expr：lexer 将两个 & 合并为 amp_amp，这里拆成两层 ref_of
+        if (self.matchToken(.amp_amp)) {
+            const op_tok = self.previous();
+            const operand = try self.parseUnary();
+            const inner_ref = try self.allocExpr(tokenLoc(op_tok), ast.Expr{ .ref_of = .{ .operand = operand } });
+            return self.allocExpr(tokenLoc(op_tok), ast.Expr{ .ref_of = .{ .operand = inner_ref } });
+        }
+        // 解引用 *expr：读取引用指向的值
+        if (self.matchToken(.star)) {
+            const op_tok = self.previous();
+            const operand = try self.parseUnary();
+            return self.allocExpr(tokenLoc(op_tok), ast.Expr{
+                .deref = .{
                     .operand = operand,
                 },
             });
@@ -1788,6 +1860,7 @@ pub const Parser = struct {
                     if (!self.check(.r_paren)) {
                         try args.append(self.arena.allocator(), try self.parseExpr());
                         while (self.matchToken(.comma)) {
+                            if (self.check(.r_paren)) break;
                             try args.append(self.arena.allocator(), try self.parseExpr());
                         }
                     }
@@ -1826,6 +1899,7 @@ pub const Parser = struct {
                     if (!self.check(.r_paren)) {
                         try args.append(self.arena.allocator(), try self.parseExpr());
                         while (self.matchToken(.comma)) {
+                            if (self.check(.r_paren)) break;
                             try args.append(self.arena.allocator(), try self.parseExpr());
                         }
                     }
@@ -1875,6 +1949,7 @@ pub const Parser = struct {
                 if (!self.check(.r_paren)) {
                     try args.append(self.arena.allocator(), try self.parseExpr());
                     while (self.matchToken(.comma)) {
+                        if (self.check(.r_paren)) break;
                         try args.append(self.arena.allocator(), try self.parseExpr());
                     }
                 }
@@ -1909,6 +1984,7 @@ pub const Parser = struct {
                 if (!self.check(.r_paren)) {
                     try args.append(self.arena.allocator(), try self.parseExpr());
                     while (self.matchToken(.comma)) {
+                        if (self.check(.r_paren)) break;
                         try args.append(self.arena.allocator(), try self.parseExpr());
                     }
                 }
@@ -1921,16 +1997,31 @@ pub const Parser = struct {
                     },
                 });
             } else if (self.matchToken(.l_bracket)) {
-                // 索引访问 obj[index]
+                // 索引访问 obj[index] 或切片 obj[start..end] / obj[start..=end]
+                // 注意：start 使用 parseAddition 而非 parseExpr，避免 .. 被解析为 range 表达式
                 const bracket_tok = self.previous();
-                const index = try self.parseExpr();
-                _ = self.expect(.r_bracket, "expected ']'") catch {};
-                expr_node = try self.allocExpr(tokenLoc(bracket_tok), ast.Expr{
-                    .index = .{
-                        .object = expr_node,
-                        .index = index,
-                    },
-                });
+                const start = try self.parseAddition();
+                if (self.matchToken(.dot_dot_eq) or self.matchToken(.dot_dot)) {
+                    const inclusive = self.previous().type == .dot_dot_eq;
+                    const end = try self.parseAddition();
+                    _ = self.expect(.r_bracket, "expected ']' after slice end") catch {};
+                    expr_node = try self.allocExpr(tokenLoc(bracket_tok), ast.Expr{
+                        .slice = .{
+                            .object = expr_node,
+                            .start = start,
+                            .end = end,
+                            .inclusive = inclusive,
+                        },
+                    });
+                } else {
+                    _ = self.expect(.r_bracket, "expected ']'") catch {};
+                    expr_node = try self.allocExpr(tokenLoc(bracket_tok), ast.Expr{
+                        .index = .{
+                            .object = expr_node,
+                            .index = start,
+                        },
+                    });
+                }
             } else {
                 break;
             }
@@ -2588,9 +2679,30 @@ pub const Parser = struct {
         var elements = std.ArrayList(*ast.Expr).empty;
         if (!self.check(.r_bracket)) {
             try elements.append(self.arena.allocator(), try self.parseExpr());
-            while (self.matchToken(.comma)) {
-                if (self.check(.r_bracket)) break;
-                try elements.append(self.arena.allocator(), try self.parseExpr());
+            // 数组填充语法 [value, ..count]
+            if (self.matchToken(.comma)) {
+                if (self.matchToken(.dot_dot)) {
+                    const count = try self.parseExpr();
+                    _ = self.expect(.r_bracket, "expected ']' after array fill count") catch {};
+                    const value = elements.items[0];
+                    return self.allocExpr(tokenLoc(bracket_tok), ast.Expr{
+                        .array_literal = .{
+                            .elements = try elements.toOwnedSlice(self.arena.allocator()),
+                            .fill_value = value,
+                            .fill_count = count,
+                        },
+                    });
+                }
+                // 普通多元素：继续解析
+                if (self.check(.r_bracket)) {
+                    // trailing comma 容忍
+                } else {
+                    try elements.append(self.arena.allocator(), try self.parseExpr());
+                    while (self.matchToken(.comma)) {
+                        if (self.check(.r_bracket)) break;
+                        try elements.append(self.arena.allocator(), try self.parseExpr());
+                    }
+                }
             }
         }
         _ = self.expect(.r_bracket, "expected ']'") catch {};
@@ -2790,14 +2902,8 @@ pub const Parser = struct {
         }
     }
 
-    /// 解析单个 lambda 参数：[var|val] name: Type
+    /// 解析单个 lambda 参数：name: Type
     fn parseLambdaParam(self: *Parser) ParserError!ast.Param {
-        var is_var = false;
-        if (self.matchToken(.kw_var)) {
-            is_var = true;
-        } else {
-            _ = self.matchToken(.kw_val);
-        }
         const name_tok = try self.expect(.identifier, "expected parameter name");
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
@@ -2807,7 +2913,6 @@ pub const Parser = struct {
             .location = tokenLoc(name_tok),
             .name = name_tok.lexeme,
             .type_annotation = type_annotation,
-            .is_var = is_var,
         };
     }
 
@@ -2966,6 +3071,7 @@ pub const Parser = struct {
                 if (!self.check(.r_paren)) {
                     try patterns.append(self.arena.allocator(), try self.parsePattern());
                     while (self.matchToken(.comma)) {
+                        if (self.check(.r_paren)) break;
                         try patterns.append(self.arena.allocator(), try self.parsePattern());
                     }
                 }
@@ -2991,6 +3097,7 @@ pub const Parser = struct {
                 if (!self.check(.r_paren)) {
                     try patterns.append(self.arena.allocator(), try self.parsePattern());
                     while (self.matchToken(.comma)) {
+                        if (self.check(.r_paren)) break;
                         try patterns.append(self.arena.allocator(), try self.parsePattern());
                     }
                 }

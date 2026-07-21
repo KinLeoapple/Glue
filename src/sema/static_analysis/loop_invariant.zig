@@ -104,6 +104,8 @@ fn collectAssignedVarsExpr(
             try collectAssignedVarsExpr(allocator, bn.right, out);
         },
         .unary => |u| try collectAssignedVarsExpr(allocator, u.operand, out),
+        .ref_of => |r| try collectAssignedVarsExpr(allocator, r.operand, out),
+        .deref => |d| try collectAssignedVarsExpr(allocator, d.operand, out),
         .call => |c| {
             try collectAssignedVarsExpr(allocator, c.callee, out);
             for (c.arguments) |a| try collectAssignedVarsExpr(allocator, a, out);
@@ -233,6 +235,8 @@ pub fn collectHoistsInExpr(
             try collectHoistsInExpr(allocator, hoist_table, b.right, owner_loop, assigned_vars);
         },
         .unary => |u| try collectHoistsInExpr(allocator, hoist_table, u.operand, owner_loop, assigned_vars),
+        .ref_of => |r| try collectHoistsInExpr(allocator, hoist_table, r.operand, owner_loop, assigned_vars),
+        .deref => |d| try collectHoistsInExpr(allocator, hoist_table, d.operand, owner_loop, assigned_vars),
         .if_expr => |i| {
             try collectHoistsInExpr(allocator, hoist_table, i.condition, owner_loop, assigned_vars);
             try collectHoistsInExpr(allocator, hoist_table, i.then_branch, owner_loop, assigned_vars);

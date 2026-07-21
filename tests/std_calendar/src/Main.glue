@@ -1,0 +1,81 @@
+// std_calendar: 验证 std.time.Calendar 模块（纯 Glue 实现的历法算法）
+// 覆盖闰年判定、月份天数、年积日、儒略日、星期、日期算术
+// 注意：import std.time.Calendar 只把 std 注册为顶层模块名，
+// 调用必须用完整路径 std.time.Calendar.xxx()
+import std.time.Calendar
+
+fun main() {
+    // ── 闰年判定 ───────────────────────────────────────────────
+    println(std.time.Calendar.is_leap_year(2024))   // true
+    println(std.time.Calendar.is_leap_year(2023))   // false
+    println(std.time.Calendar.is_leap_year(1900))   // false（100 倍数非 400）
+    println(std.time.Calendar.is_leap_year(2000))    // true（400 倍数）
+
+    // ── 月份天数 ───────────────────────────────────────────────
+    println(std.time.Calendar.days_in_month(2026, 1))   // 31
+    println(std.time.Calendar.days_in_month(2026, 4))   // 30
+    println(std.time.Calendar.days_in_month(2024, 2))   // 29（闰年）
+    println(std.time.Calendar.days_in_month(2026, 2))   // 28（平年）
+
+    // ── 年积日 day_of_year ────────────────────────────────────
+    println(std.time.Calendar.day_of_year(2026, 1, 1))    // 1
+    println(std.time.Calendar.day_of_year(2026, 12, 31)) // 365
+    println(std.time.Calendar.day_of_year(2024, 12, 31))  // 366（闰年）
+    println(std.time.Calendar.day_of_year(2026, 7, 20))   // 201
+
+    // ── 儒略日（Howard Hinnant 算法） ─────────────────────────
+    // 1970-01-01 → JD 2440588
+    println(std.time.Calendar.to_julian_day(1970, 1, 1))  // 2440588
+    // 2026-07-20 → JD 2461242
+    println(std.time.Calendar.to_julian_day(2026, 7, 20)) // 2461242
+    // 2000-01-01 → JD 2451545
+    println(std.time.Calendar.to_julian_day(2000, 1, 1))  // 2451545
+
+    // ── 儒略日 → 公历日期（往返验证） ─────────────────────────
+    val ymd = std.time.Calendar.from_julian_day(2461242)
+    println(ymd.year)   // 2026
+    println(ymd.month)  // 7
+    println(ymd.day)    // 20
+
+    val ymd_epoch = std.time.Calendar.from_julian_day(2440588)
+    println(ymd_epoch.year)   // 1970
+    println(ymd_epoch.month)  // 1
+    println(ymd_epoch.day)    // 1
+
+    // ── 星期 ─────────────────────────────────────────────────
+    // 0=周日, 1=周一, ..., 6=周六
+    // 2026-07-20 是周一
+    println(std.time.Calendar.weekday_of(2026, 7, 20))    // 1
+    // 1970-01-01 是周四
+    println(std.time.Calendar.weekday_of(1970, 1, 1))     // 4
+    // 2000-01-01 是周六
+    println(std.time.Calendar.weekday_of(2000, 1, 1))     // 6
+
+    // ── 日期算术 ─────────────────────────────────────────────
+    // 加 10 天：2026-07-20 → 2026-07-30
+    val add_10 = std.time.Calendar.add_days(2026, 7, 20, 10)
+    println(add_10.year)   // 2026
+    println(add_10.month)  // 7
+    println(add_10.day)    // 30
+
+    // 跨年边界：2026-12-31 + 1 → 2027-01-01
+    val add_newyear = std.time.Calendar.add_days(2026, 12, 31, 1)
+    println(add_newyear.year)   // 2027
+    println(add_newyear.month)  // 1
+    println(add_newyear.day)    // 1
+
+    // 减天数：2026-01-01 - 1 → 2025-12-31
+    val sub_newyear = std.time.Calendar.add_days(2026, 1, 1, -1)
+    println(sub_newyear.year)   // 2025
+    println(sub_newyear.month)  // 12
+    println(sub_newyear.day)    // 31
+
+    // ── 两日期差（通过 to_julian_day 间接验证） ────────────────
+    // 注：days_between 有 6 参数，超过 IR Node 4 输入限制
+    // 此处用 to_julian_day 分别计算后相减替代
+    val jd1 = std.time.Calendar.to_julian_day(2026, 1, 1)
+    val jd2 = std.time.Calendar.to_julian_day(2026, 12, 31)
+    println(jd2 - jd1)  // 364
+
+    println("std_calendar: OK")
+}

@@ -161,6 +161,24 @@ pub fn build(b: *std.Build) void {
     ir_module.addImport("analysis_db", analysis_db_module);
     ir_module.addImport("glue_builtin", builtin_module);
 
+    // ---- Syscall 原语模块（IO/Time 等宿主 syscall 包装）----
+    // 依赖 ir（SyscallId 元数据）与 value（构造 Value/ThrowValue）
+    const syscall_module = b.createModule(.{
+        .root_source_file = b.path("src/syscall/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    syscall_module.addImport("ir", ir_module);
+    syscall_module.addImport("value", value_module);
+
+    // ---- Stdlib 嵌入模块：@embedFile 把 std/ 下的 .glue 文件编进二进制 ----
+    // 供 main.zig 的 loadImportedDeclarations 解析 import std.* 时查找
+    const std_embed_module = b.createModule(.{
+        .root_source_file = b.path("src/std/embed.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ---- sema 模块接入 IR 管线：type_check 及子检查器可读取 SemaResult 契约 ----
     // 依赖方向：sema → ir → (ast, value)，ir 不依赖 sema，无循环。
     type_check_module.addImport("ir", ir_module);
@@ -180,6 +198,7 @@ pub fn build(b: *std.Build) void {
     engine_module.addImport("ir", ir_module);
     engine_module.addImport("mem", mem_module);
     engine_module.addImport("value", value_module);
+    engine_module.addImport("syscall", syscall_module);
 
     // ---- 根模块：聚合所有依赖，产出可执行文件 ----
     const root_module = b.createModule(.{
@@ -198,6 +217,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("ir", ir_module);
     root_module.addImport("engine", engine_module);
     root_module.addImport("analysis_db", analysis_db_module);
+    root_module.addImport("std_embed", std_embed_module);
 
     const exe = b.addExecutable(.{
         .name = "glue",
@@ -289,7 +309,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_ir_unit_tests = b.addRunArtifact(ir_unit_tests);
 
-    // 执行引擎测试（需导入 ir、mem、ast、lexer、parser、value）
+    // Syscall 模块测试（需导入 ir、value）
+    const syscall_module_test = b.createModule(.{
+        .root_source_file = b.path("src/syscall/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    syscall_module_test.addImport("ir", ir_module_test);
+    syscall_module_test.addImport("value", value_module);
+    const syscall_unit_tests = b.addTest(.{
+        .root_module = syscall_module_test,
+    });
+    const run_syscall_unit_tests = b.addRunArtifact(syscall_unit_tests);
+
+    // 执行引擎测试（需导入 ir、mem、ast、lexer、parser、value、syscall）
     const engine_module_test = b.createModule(.{
         .root_source_file = b.path("src/engine/mod.zig"),
         .target = target,
@@ -301,10 +334,17 @@ pub fn build(b: *std.Build) void {
     engine_module_test.addImport("lexer", lexer_module);
     engine_module_test.addImport("parser", parser_module);
     engine_module_test.addImport("value", value_module);
+    engine_module_test.addImport("syscall", syscall_module_test);
     const engine_unit_tests = b.addTest(.{
         .root_module = engine_module_test,
     });
     const run_engine_unit_tests = b.addRunArtifact(engine_unit_tests);
+
+    // Stdlib 嵌入表单元测试
+    const std_embed_unit_tests = b.addTest(.{
+        .root_module = std_embed_module,
+    });
+    const run_std_embed_unit_tests = b.addRunArtifact(std_embed_unit_tests);
 
     // 所有测试产物都需要链接 libc
     lexer_unit_tests.root_module.linkSystemLibrary("c", .{});
@@ -317,6 +357,8 @@ pub fn build(b: *std.Build) void {
     ir_unit_tests.root_module.linkSystemLibrary("c", .{});
     engine_unit_tests.root_module.linkSystemLibrary("c", .{});
     builtin_unit_tests.root_module.linkSystemLibrary("c", .{});
+    syscall_unit_tests.root_module.linkSystemLibrary("c", .{});
+    std_embed_unit_tests.root_module.linkSystemLibrary("c", .{});
 
     // ---- 聚合测试步骤：`zig build test` 运行全部单元测试 ----
     const test_step = b.step("test", "Run all tests");
@@ -330,5 +372,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ir_unit_tests.step);
     test_step.dependOn(&run_engine_unit_tests.step);
     test_step.dependOn(&run_builtin_unit_tests.step);
+    test_step.dependOn(&run_syscall_unit_tests.step);
+    test_step.dependOn(&run_std_embed_unit_tests.step);
     for (mem_test_runs) |run| test_step.dependOn(&run.step);
 }

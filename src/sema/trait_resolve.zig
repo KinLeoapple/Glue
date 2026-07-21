@@ -227,6 +227,20 @@ pub fn inferMethodCall(
         }
     }
 
+    // async 函数 .await() / .cancel()：解包 Async<T> 为 T
+    // Async<T>.await() 返回 T（即 generic_type.args[0]）
+    if ((std.mem.eql(u8, mc.method, "await") or std.mem.eql(u8, mc.method, "cancel")) and
+        mc.arguments.len == 0)
+    {
+        const robj = inferencer.resolve(obj_ty);
+        if (robj.* == .generic_type and
+            std.mem.eql(u8, robj.generic_type.name, "Async") and
+            robj.generic_type.args.len == 1)
+        {
+            return robj.generic_type.args[0];
+        }
+    }
+
     // 模块引用上的方法调用：查找 mangled 名函数 "Module.Sub.method"
     if (inferencer.asModuleRef(obj_ty)) |mod_name| {
         const mangled = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}.{s}", .{ mod_name, mc.method }) catch return inferencer.freshTypeVar() catch unreachable;
@@ -243,6 +257,9 @@ pub fn inferMethodCall(
     // 用户自定义 type 方法查找：从 obj_ty 提取 adt_type.name，构造 "TypeName.method" mangled name
     // type_decl 的方法在 checkDeclCollecting 中以该 mangled name 注册到 env，
     // 此处查找以获取正确的返回类型，避免 fallback 到 freshTypeVar 导致 field_id 解析失败。
+    // 对于 stdlib 模块（如 std.io.Buffered.read_to_end），方法以全限定名注册，
+    // 短名查找失败时会遍历 predeclared_fns 查找以 ".{method}" 结尾的 key，
+    // 并通过第一个参数类型匹配 obj_ty 来确定正确的方法。
     {
         const robj = inferencer.resolve(obj_ty);
         const type_name: ?[]const u8 = switch (robj.*) {
@@ -261,6 +278,43 @@ pub fn inferMethodCall(
                         inferencer.unify(resolved.fn_type.params[0], obj_ty) catch {};
                     }
                     return resolved.fn_type.return_type;
+                }
+            }
+            // 短名查找失败：遍历 predeclared_fns 查找以 ".{method}" 结尾的 key
+            // 并通过第一个参数类型匹配 obj_ty 来确定正确的方法
+            const method_suffix = std.fmt.allocPrint(inferencer.arena.allocator(), ".{s}", .{mc.method}) catch return inferencer.freshTypeVar() catch unreachable;
+            defer inferencer.arena.allocator().free(method_suffix);
+            var fn_iter = inferencer.predeclared_fns.keyIterator();
+            while (fn_iter.next()) |key| {
+                if (std.mem.endsWith(u8, key.*, method_suffix)) {
+                    if (env.lookup(key.*)) |scheme| {
+                        const instantiated = inferencer.instantiate(scheme) catch continue;
+                        const resolved = inferencer.resolve(instantiated);
+                        if (resolved.* == .fn_type) {
+                            // 验证第一个参数类型是否匹配 obj_ty
+                            if (resolved.fn_type.params.len > 0) {
+                                const param_resolved = inferencer.resolve(resolved.fn_type.params[0]);
+                                const obj_resolved = inferencer.resolve(obj_ty);
+                                // 检查参数类型名是否匹配（adt_type 或 generic_type）
+                                const param_name: ?[]const u8 = switch (param_resolved.*) {
+                                    .adt_type => |at| at.name,
+                                    .generic_type => |gt| gt.name,
+                                    else => null,
+                                };
+                                const obj_name: ?[]const u8 = switch (obj_resolved.*) {
+                                    .adt_type => |at| at.name,
+                                    .generic_type => |gt| gt.name,
+                                    else => null,
+                                };
+                                if (param_name != null and obj_name != null and
+                                    std.mem.eql(u8, param_name.?, obj_name.?))
+                                {
+                                    inferencer.unify(resolved.fn_type.params[0], obj_ty) catch {};
+                                    return resolved.fn_type.return_type;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

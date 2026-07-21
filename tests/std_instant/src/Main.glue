@@ -1,0 +1,50 @@
+// std_instant: 验证 std.time.Instant + std.time.Duration 模块
+// 覆盖 Instant now、elapsed、duration_since、add_duration、sub_duration
+// 同时验证 Duration 的构造器与转换器（from_secs/as_secs/as_nanos）
+// 注意：stdlib 方法分派 on value 暂不支持，使用模块函数调用语法
+//   std.time.Module.Type.method(value, args)
+import std.time.Duration
+import std.time.Instant
+
+fun main() {
+    // ── Duration 基础 ──────────────────────────────────────────────
+    val d_zero = std.time.Duration.from_secs(0)
+    println(std.time.Duration.as_nanos(d_zero))  // 0
+    println(std.time.Duration.as_secs(d_zero))    // 0
+
+    val d3 = std.time.Duration.from_secs(3)
+    println(std.time.Duration.as_nanos(d3))      // 3000000000
+    println(std.time.Duration.as_secs(d3))       // 3
+
+    val d_sub = std.time.Duration.sub(d3, d3)
+    println(std.time.Duration.as_nanos(d_sub))  // 0
+
+    // ── now()：单调时钟 ────────────────────────────────────────────
+    val n1 = std.time.Instant.now()
+    val n2 = std.time.Instant.now()
+    // n2 >= n1（单调时钟不会倒退）
+    val nsec_diff = std.time.Duration.as_nanos(std.time.Instant.duration_since(n2, n1))
+    println(if nsec_diff >= 0 { 1 } else { 0 })  // 1
+
+    // elapsed(n1) 应当为非负
+    val e = std.time.Instant.elapsed(n1)
+    val ensec = std.time.Duration.as_nanos(e)
+    println(if ensec >= 0 { 1 } else { 0 })  // 1
+
+    // ── add_duration / sub_duration ────────────────────────────────
+    // n1 + 3s 后再减 3s，与 n1 的差应为非负且较小（容许时钟漂移）
+    val n3 = std.time.Instant.add_duration(n1, d3)
+    val back = std.time.Instant.sub_duration(n3, d3)
+    val back_diff = std.time.Duration.as_nanos(std.time.Instant.duration_since(back, n1))
+    println(if back_diff >= 0 { 1 } else { 0 })  // 1（back >= n1）
+
+    // n3 - n1 应当 >= 3 秒（即 3_000_000_000 ns）
+    val add_diff = std.time.Duration.as_nanos(std.time.Instant.duration_since(n3, n1))
+    println(if add_diff >= 3_000_000_000 { 1 } else { 0 })  // 1
+
+    // duration_since(n3, n1) ≈ 3s
+    val ds_sec = std.time.Duration.as_secs(std.time.Instant.duration_since(n3, n1))
+    println(if ds_sec >= 3 { 1 } else { 0 })  // 1
+
+    println("std_instant: OK")
+}

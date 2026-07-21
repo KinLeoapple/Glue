@@ -85,10 +85,11 @@ fun fib(n: i32): i32 {
     if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }
 }
 
-// var 参数
-fun modify(data: var i32): i32 {
-    data = data + 1
-    data
+// 局部可变
+fun modify(data: i32): i32 {
+    var local = data
+    local = local + 1
+    local
 }
 
 // ? 传播 — Nullable
@@ -779,7 +780,7 @@ increment()
 println(outer)
 
 // ============================================================
-// 17. var 参数
+// 17. 局部可变
 // ============================================================
 val modified = modify(100)
 println(modified)
@@ -1277,7 +1278,7 @@ val unit_val = doNothing()
 println(unit_val)
 
 // ============================================================
-// 61. str() 内建转换函数
+// 61. cast().to(str) 内建转换
 // ============================================================
 println(cast(42).to(str))
 println(cast(3.14).to(str))

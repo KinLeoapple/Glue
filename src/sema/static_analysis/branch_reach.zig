@@ -103,6 +103,8 @@ pub const BranchReachPass = struct {
                 try self.analyzeExpr(b.right);
             },
             .unary => |u| try self.analyzeExpr(u.operand),
+            .ref_of => |r| try self.analyzeExpr(r.operand),
+            .deref => |d| try self.analyzeExpr(d.operand),
             .call => |c| {
                 try self.analyzeExpr(c.callee);
                 for (c.arguments) |arg| try self.analyzeExpr(arg);

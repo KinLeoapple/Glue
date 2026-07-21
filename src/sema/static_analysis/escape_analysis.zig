@@ -343,6 +343,16 @@ pub const EscapePass = struct {
                 _ = try self.analyzeExpr(u.operand, env, ctx, current_fn);
                 return .non_alloc;
             },
+            .ref_of => |r| {
+                // 取引用：递归分析 operand，本身不产生新分配
+                _ = try self.analyzeExpr(r.operand, env, ctx, current_fn);
+                return .non_alloc;
+            },
+            .deref => |d| {
+                // 解引用：递归分析 operand，本身不产生新分配
+                _ = try self.analyzeExpr(d.operand, env, ctx, current_fn);
+                return .non_alloc;
+            },
             .if_expr => |i| {
                 _ = try self.analyzeExpr(i.condition, env, ctx, current_fn);
                 const then_src = try self.analyzeExpr(i.then_branch, env, ctx, current_fn);
@@ -440,6 +450,12 @@ pub const EscapePass = struct {
             .index => |i| {
                 _ = try self.analyzeExpr(i.object, env, ctx, current_fn);
                 _ = try self.analyzeExpr(i.index, env, ctx, current_fn);
+                return .non_alloc;
+            },
+            .slice => |sl| {
+                _ = try self.analyzeExpr(sl.object, env, ctx, current_fn);
+                _ = try self.analyzeExpr(sl.start, env, ctx, current_fn);
+                _ = try self.analyzeExpr(sl.end, env, ctx, current_fn);
                 return .non_alloc;
             },
             .non_null_assert => |n| {

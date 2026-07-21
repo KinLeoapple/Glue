@@ -17,6 +17,7 @@ const ir = @import("ir");
 const engine = @import("engine");
 const sema = @import("sema");
 const analysis_db_mod = @import("analysis_db");
+const std_embed = @import("std_embed");
 
 /// 项目清单：名称、版本与入口文件路径
 const Manifest = struct {
@@ -254,6 +255,266 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, diagnostic: bool) !void 
 /// 源码执行结果：成功或失败
 const ExecOutcome = enum { failed, ran_main };
 
+/// 递归重写表达式 AST 中对同模块函数的短名调用为 mangled name。
+/// 当子模块 pub 函数被 mangle 为 "Module.Sub.method" 后，函数体内部对同模块
+/// 其他函数的短名调用（如 `to_julian_day(...)`）需要同步重写为
+/// "Module.Sub.to_julian_day"，否则 sema 会报 undefined variable。
+///
+/// renames: 同模块 pub 函数短名 → mangled name 的映射
+///   例: {"to_julian_day": "std.time.Calendar.to_julian_day", ...}
+///
+/// sibling_modules: 同 pack 内其他子模块短名 → 完整模块路径的映射
+///   例: {"Calendar": "std.time.Calendar", "Duration": "std.time.Duration", ...}
+///   用于重写跨子模块调用，如 DateTime.add_days 内部的 `Calendar.add_days(...)`
+///   会被重写为 `std.time.Calendar.add_days(...)`。
+///
+/// 仅重写 .call 节点中 callee 为 identifier 且 name 命中 renames 的情况，
+/// 以及 callee 为 field_access(identifier(short_mod), method) 且 short_mod 命中
+/// sibling_modules 的情况。方法调用（method_call）的 method 字段、字段访问
+/// （field_access）的 field 字段不需要重写——它们的语义由对象类型决定，
+/// 不属于模块函数调用。
+fn rewriteModuleCalls(
+    expr: *ast.Expr,
+    renames: *const std.StringHashMap([]const u8),
+    sibling_modules: *const std.StringHashMap([]const u8),
+    allocator: std.mem.Allocator,
+) void {
+    switch (expr.*) {
+        .call => |c| {
+            // callee 是 identifier 且短名命中 renames → 替换为 mangled name
+            if (c.callee.* == .identifier) {
+                const short_name = c.callee.identifier.name;
+                if (renames.get(short_name)) |mangled| {
+                    c.callee.* = .{ .identifier = .{ .name = mangled } };
+                }
+            } else if (c.callee.* == .field_access) {
+                // callee 是 field_access：可能是跨子模块调用 Calendar.add_days(...)
+                const fa = c.callee.field_access;
+                if (fa.object.* == .identifier) {
+                    const mod_name = fa.object.identifier.name;
+                    if (sibling_modules.get(mod_name)) |mod_path| {
+                        // 重写 Calendar.add_days → std.time.Calendar.add_days（作为单一 identifier）
+                        const mangled = std.fmt.allocPrint(allocator, "{s}.{s}", .{ mod_path, fa.field }) catch null;
+                        if (mangled) |m| {
+                            c.callee.* = .{ .identifier = .{ .name = m } };
+                        }
+                    }
+                } else {
+                    // object 非 identifier 时仍需递归
+                    rewriteModuleCalls(c.callee, renames, sibling_modules, allocator);
+                }
+            } else {
+                // callee 非简单 identifier 时仍需递归（如嵌套调用 f()(x)）
+                rewriteModuleCalls(c.callee, renames, sibling_modules, allocator);
+            }
+            for (c.arguments) |arg| {
+                rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+            }
+        },
+        .method_call => |mc| {
+            // 跨子模块调用：Calendar.add_days(...) → 转换为 call(identifier("std.time.Calendar.add_days"), ...)
+            if (mc.object.* == .identifier) {
+                const mod_name = mc.object.identifier.name;
+                if (sibling_modules.get(mod_name)) |mod_path| {
+                    const mangled = std.fmt.allocPrint(allocator, "{s}.{s}", .{ mod_path, mc.method }) catch null;
+                    if (mangled) |m| {
+                        // 将 method_call 转换为 call，callee 为单一 identifier
+                        const callee_ptr = allocator.create(ast.Expr) catch {
+                            // 分配失败时退回原 method_call 递归（保留旧行为）
+                            rewriteModuleCalls(mc.object, renames, sibling_modules, allocator);
+                            for (mc.arguments) |arg| {
+                                rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+                            }
+                            return;
+                        };
+                        expr.* = .{ .call = .{
+                            .callee = callee_ptr,
+                            .arguments = mc.arguments,
+                            .type_args = mc.type_args,
+                        } };
+                        expr.call.callee.* = .{ .identifier = .{ .name = m } };
+                        // arguments 虽然转移到 call，但其内部仍可能含跨模块短名调用
+                        // （如 File.open(path, File.read_only()) 的第二个参数 File.read_only()），
+                        // 必须递归重写
+                        for (expr.call.arguments) |arg| {
+                            rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+                        }
+                        return;
+                    }
+                }
+            }
+            rewriteModuleCalls(mc.object, renames, sibling_modules, allocator);
+            for (mc.arguments) |arg| {
+                rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+            }
+        },
+        .field_access => |fa| {
+            // 跨子模块常量值引用：File.DEFAULT_BUF_SIZE → identifier("std.io.File.DEFAULT_BUF_SIZE")
+            // 仅当 fa.object 为 identifier 且命中 sibling_modules 时执行重写；
+            // 否则按一般表达式递归处理 object（保留对 a.b.c 等链式访问的语义）。
+            if (fa.object.* == .identifier) {
+                const mod_name = fa.object.identifier.name;
+                if (sibling_modules.get(mod_name)) |mod_path| {
+                    const mangled = std.fmt.allocPrint(allocator, "{s}.{s}", .{ mod_path, fa.field }) catch null;
+                    if (mangled) |m| {
+                        expr.* = .{ .identifier = .{ .name = m } };
+                        return;
+                    }
+                }
+            }
+            rewriteModuleCalls(fa.object, renames, sibling_modules, allocator);
+        },
+        .safe_access => |sa| rewriteModuleCalls(sa.object, renames, sibling_modules, allocator),
+        .safe_method_call => |smc| {
+            rewriteModuleCalls(smc.object, renames, sibling_modules, allocator);
+            for (smc.arguments) |arg| {
+                rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+            }
+        },
+        .binary => |b| {
+            rewriteModuleCalls(b.left, renames, sibling_modules, allocator);
+            rewriteModuleCalls(b.right, renames, sibling_modules, allocator);
+        },
+        .unary => |u| rewriteModuleCalls(u.operand, renames, sibling_modules, allocator),
+        .ref_of => |r| rewriteModuleCalls(r.operand, renames, sibling_modules, allocator),
+        .deref => |d| rewriteModuleCalls(d.operand, renames, sibling_modules, allocator),
+        .assignment_expr => |ae| {
+            rewriteModuleCalls(ae.target, renames, sibling_modules, allocator);
+            rewriteModuleCalls(ae.value, renames, sibling_modules, allocator);
+        },
+        .compound_assign => |ca| {
+            rewriteModuleCalls(ca.target, renames, sibling_modules, allocator);
+            rewriteModuleCalls(ca.value, renames, sibling_modules, allocator);
+        },
+        .non_null_assert => |nna| rewriteModuleCalls(nna.expr, renames, sibling_modules, allocator),
+        .propagate => |p| rewriteModuleCalls(p.expr, renames, sibling_modules, allocator),
+        .index => |idx| {
+            rewriteModuleCalls(idx.object, renames, sibling_modules, allocator);
+            rewriteModuleCalls(idx.index, renames, sibling_modules, allocator);
+        },
+        .slice => |sl| {
+            rewriteModuleCalls(sl.object, renames, sibling_modules, allocator);
+            rewriteModuleCalls(sl.start, renames, sibling_modules, allocator);
+            rewriteModuleCalls(sl.end, renames, sibling_modules, allocator);
+        },
+        .array_literal => |al| {
+            for (al.elements) |e| rewriteModuleCalls(e, renames, sibling_modules, allocator);
+            if (al.fill_value) |fv| rewriteModuleCalls(fv, renames, sibling_modules, allocator);
+            if (al.fill_count) |fc| rewriteModuleCalls(fc, renames, sibling_modules, allocator);
+        },
+        .record_literal => |rl| {
+            for (rl.fields) |f| rewriteModuleCalls(f.value, renames, sibling_modules, allocator);
+        },
+        .record_extend => |re| {
+            rewriteModuleCalls(re.base, renames, sibling_modules, allocator);
+            for (re.updates) |u| rewriteModuleCalls(u.value, renames, sibling_modules, allocator);
+        },
+        .string_interpolation => |si| {
+            for (si.parts) |p| switch (p) {
+                .expression => |e| rewriteModuleCalls(e, renames, sibling_modules, allocator),
+                .literal => {},
+            };
+        },
+        .type_cast => |tc| rewriteModuleCalls(tc.expr, renames, sibling_modules, allocator),
+        .cast_builder => |cb| rewriteModuleCalls(cb.expr, renames, sibling_modules, allocator),
+        .atomic_expr => |ae| rewriteModuleCalls(ae.value, renames, sibling_modules, allocator),
+        .lazy => |l| rewriteModuleCalls(l.expr, renames, sibling_modules, allocator),
+        .spawn_expr => |se| rewriteModuleCalls(se.expr, renames, sibling_modules, allocator),
+        .if_expr => |ie| {
+            rewriteModuleCalls(ie.condition, renames, sibling_modules, allocator);
+            rewriteModuleCalls(ie.then_branch, renames, sibling_modules, allocator);
+            if (ie.else_branch) |eb| rewriteModuleCalls(eb, renames, sibling_modules, allocator);
+        },
+        .block => |blk| {
+            for (blk.statements) |s| rewriteStmt(s, renames, sibling_modules, allocator);
+            if (blk.trailing_expr) |te| rewriteModuleCalls(te, renames, sibling_modules, allocator);
+        },
+        .match => |m| {
+            rewriteModuleCalls(m.scrutinee, renames, sibling_modules, allocator);
+            for (m.arms) |arm| {
+                if (arm.guard) |g| rewriteModuleCalls(g, renames, sibling_modules, allocator);
+                rewriteModuleCalls(arm.body, renames, sibling_modules, allocator);
+            }
+        },
+        .lambda => |l| switch (l.body) {
+            .block => |b| rewriteModuleCalls(b, renames, sibling_modules, allocator),
+            .expression => |e| rewriteModuleCalls(e, renames, sibling_modules, allocator),
+        },
+        .select => |sel| {
+            for (sel.arms) |arm| switch (arm) {
+                .receive => |r| {
+                    rewriteModuleCalls(r.channel_expr, renames, sibling_modules, allocator);
+                    rewriteModuleCalls(r.body, renames, sibling_modules, allocator);
+                },
+                .timeout => |t| {
+                    rewriteModuleCalls(t.duration, renames, sibling_modules, allocator);
+                    rewriteModuleCalls(t.body, renames, sibling_modules, allocator);
+                },
+            };
+        },
+        .inline_trait_value => |itv| {
+            for (itv.methods) |m| {
+                if (m.body) |b| rewriteModuleCalls(b, renames, sibling_modules, allocator);
+            }
+        },
+        .identifier => |id| {
+            // 同模块 pub val 常量值引用：O_RDONLY → std.io.File.O_RDONLY
+            // 仅当裸标识符命中 renames（同模块 pub fun/val）时执行重写
+            if (renames.get(id.name)) |mangled| {
+                expr.* = .{ .identifier = .{ .name = mangled } };
+            }
+        },
+        .int_literal,
+        .float_literal,
+        .bool_literal,
+        .char_literal,
+        .string_literal,
+        .null_literal,
+        .unit_literal,
+        => {},
+    }
+}
+
+fn rewriteStmt(
+    stmt: *ast.Stmt,
+    renames: *const std.StringHashMap([]const u8),
+    sibling_modules: *const std.StringHashMap([]const u8),
+    allocator: std.mem.Allocator,
+) void {
+    switch (stmt.*) {
+        .val_decl => |vd| rewriteModuleCalls(vd.value, renames, sibling_modules, allocator),
+        .var_decl => |vd| rewriteModuleCalls(vd.value, renames, sibling_modules, allocator),
+        .assignment => |a| {
+            rewriteModuleCalls(a.target, renames, sibling_modules, allocator);
+            rewriteModuleCalls(a.value, renames, sibling_modules, allocator);
+        },
+        .field_assignment => |fa| {
+            rewriteModuleCalls(fa.object, renames, sibling_modules, allocator);
+            rewriteModuleCalls(fa.value, renames, sibling_modules, allocator);
+        },
+        .compound_assignment => |ca| {
+            rewriteModuleCalls(ca.target, renames, sibling_modules, allocator);
+            rewriteModuleCalls(ca.value, renames, sibling_modules, allocator);
+        },
+        .expression => |e| rewriteModuleCalls(e.expr, renames, sibling_modules, allocator),
+        .return_stmt => |r| {
+            if (r.value) |v| rewriteModuleCalls(v, renames, sibling_modules, allocator);
+        },
+        .defer_stmt => |d| rewriteModuleCalls(d.expr, renames, sibling_modules, allocator),
+        .throw_stmt => |t| rewriteModuleCalls(t.expr, renames, sibling_modules, allocator),
+        .for_stmt => |f| {
+            rewriteModuleCalls(f.iterable, renames, sibling_modules, allocator);
+            rewriteModuleCalls(f.body, renames, sibling_modules, allocator);
+        },
+        .while_stmt => |w| {
+            rewriteModuleCalls(w.condition, renames, sibling_modules, allocator);
+            rewriteModuleCalls(w.body, renames, sibling_modules, allocator);
+        },
+        .loop_stmt => |l| rewriteModuleCalls(l.body, renames, sibling_modules, allocator),
+        .break_stmt, .continue_stmt => {},
+    }
+}
+
 /// 加载导入的子模块声明：扫描 import_decl，读取 pack.glue 和子模块 .glue 文件，
 /// 将 pub fun 以 "Module.Sub.fun" 的 mangled 名合并到主模块声明列表。
 /// 保留 parser/source/tokens 直到 IR 构建完成。
@@ -268,6 +529,11 @@ fn loadImportedDeclarations(
 ) !void {
     var extra_decls = std.ArrayList(ast.Decl).empty;
     defer extra_decls.deinit(allocator);
+
+    // 已加载的 stdlib 子模块集合（避免重复加载）
+    // key 格式："pack/sub"，如 "time/Duration"、"io/File"
+    var loaded_submodules = std.StringHashMap(void).init(allocator);
+    defer loaded_submodules.deinit();
 
     // 获取源文件所在目录
     const source_dir = std.fs.path.dirname(source_filename) orelse "";
@@ -285,6 +551,181 @@ fn loadImportedDeclarations(
                 if (imp.module_path.len == 0) continue;
                 const module_name = imp.module_path[0];
 
+                // stdlib 嵌入查找：import std.<pack>[.<sub>] → 从 @embedFile 表读取
+                // 设计文档 §2.3：stdlib 通过 @embedFile 编进二进制，无需文件系统访问
+                if (std.mem.eql(u8, module_name, "std")) {
+                    if (imp.module_path.len < 2) continue;
+                    const pack_name = imp.module_path[1];
+                    // import std.<pack>.<sub>：只加载指定子模块；import std.<pack>：加载 pack 中所有子模块
+                    const specific_sub: ?[]const u8 = if (imp.module_path.len >= 3) imp.module_path[2] else null;
+
+                    // 读嵌入表中的 pack.glue（路径如 "io/pack.glue"、"time/pack.glue"）
+                    var path_buf: [256]u8 = undefined;
+                    const pack_path = std.fmt.bufPrint(&path_buf, "{s}/pack.glue", .{pack_name}) catch continue;
+                    const pack_src_embed = std_embed.find(pack_path) orelse continue;
+
+                    // 解析 pack.glue
+                    var pack_lex = lexer.Lexer.init(allocator, pack_src_embed);
+                    defer pack_lex.deinit();
+                    const pack_tokens = pack_lex.tokenize() catch continue;
+                    defer allocator.free(pack_tokens);
+                    var pack_parser = parser.Parser.init(allocator, pack_tokens);
+                    defer pack_parser.deinit();
+                    const pack_module = pack_parser.parseModule("pack") catch continue;
+
+                    // 构建 sibling_modules：同 pack 内所有子模块短名 → 完整模块路径
+                    // 用于重写跨子模块调用，如 DateTime.add_days 内部 `Calendar.add_days(...)`
+                    // 会被重写为 `std.time.Calendar.add_days(...)`
+                    var sibling_modules = std.StringHashMap([]const u8).init(allocator);
+                    defer sibling_modules.deinit();
+                    for (pack_module.declarations) |pack_decl| {
+                        switch (pack_decl) {
+                            .pack_decl => |pd| {
+                                const mangled_mod = std.fmt.allocPrint(allocator, "std.{s}.{s}", .{ pack_name, pd.name }) catch continue;
+                                sibling_modules.put(pd.name, mangled_mod) catch continue;
+                            },
+                            else => {},
+                        }
+                    }
+
+                    // 对 pack 中每个 pub pack X，读嵌入表中的 <pack>/<X>.glue
+                    // 注意：忽略 specific_sub 过滤，加载 pack 内全部子模块。
+                    // 原因：子模块之间存在跨模块依赖（如 SystemTime.to_local 调用
+                    // DateTime.from_components），只加载指定子模块会导致 sema 报
+                    // undefined variable。stdlib 体量较小，全量加载可接受。
+                    _ = specific_sub;
+                    for (pack_module.declarations) |pack_decl| {
+                        switch (pack_decl) {
+                            .pack_decl => |pd| {
+                                const sub_name = pd.name;
+                                // 跳过已加载的子模块（多个 import std.<pack>.<sub> 时避免重复）
+                                const sub_key = std.fmt.allocPrint(allocator, "{s}/{s}", .{ pack_name, sub_name }) catch continue;
+                                defer allocator.free(sub_key);
+                                if (loaded_submodules.contains(sub_key)) continue;
+                                loaded_submodules.put(try allocator.dupe(u8, sub_key), {}) catch continue;
+                                const sub_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.glue", .{ pack_name, sub_name }) catch continue;
+                                const sub_src_embed = std_embed.find(sub_path) orelse continue;
+
+                                // @embedFile 返回的是 const 数据，需要 dupe 一份以匹配 retained_sources 的 free 语义
+                                const sub_src = try allocator.dupe(u8, sub_src_embed);
+
+                                // 词法分析
+                                var sub_lex = lexer.Lexer.init(allocator, sub_src);
+                                const sub_tokens = sub_lex.tokenize() catch {
+                                    allocator.free(sub_src);
+                                    continue;
+                                };
+
+                                // 语法分析
+                                const sub_parser_ptr = try allocator.create(parser.Parser);
+                                sub_parser_ptr.* = parser.Parser.init(allocator, sub_tokens);
+                                const sub_module = sub_parser_ptr.parseModule(sub_name) catch {
+                                    sub_parser_ptr.deinit();
+                                    allocator.destroy(sub_parser_ptr);
+                                    allocator.free(sub_tokens);
+                                    allocator.free(sub_src);
+                                    continue;
+                                };
+
+                                // 保留资源
+                                try retained_parsers.append(allocator, sub_parser_ptr);
+                                try retained_sources.append(allocator, sub_src);
+                                try retained_tokens.append(allocator, sub_tokens);
+
+                                // 收集 pub fun 声明，重命名为 std.<pack>.<sub>.<fun>
+                                // 先构建本子模块短名 → mangled name 映射，用于重写函数体内部
+                                // 对同模块其他函数的短名调用（如 weekday_of 内部调用 to_julian_day）
+                                // 注意：不重写 type 构造器调用（如 Duration(...)），sema 通过
+                                // 合并的 type_decl 解析构造器名
+                                var local_renames = std.StringHashMap([]const u8).init(allocator);
+                                defer local_renames.deinit();
+                                for (sub_module.declarations) |sd| {
+                                    switch (sd) {
+                                        .fun_decl => |fd| {
+                                            if (fd.visibility == .public) {
+                                                const mangled = std.fmt.allocPrint(allocator, "std.{s}.{s}.{s}", .{ pack_name, sub_name, fd.name }) catch continue;
+                                                local_renames.put(fd.name, mangled) catch continue;
+                                            }
+                                        },
+                                        .expr_decl => |ed| {
+                                            // 收集 pub val 声明（如 SystemTime.UNIX_EPOCH）的短名 → mangled name
+                                            if (ed.stmt) |st| {
+                                                switch (st.*) {
+                                                    .val_decl => |vd| {
+                                                        if (vd.visibility == .public) {
+                                                            const mangled = std.fmt.allocPrint(allocator, "std.{s}.{s}.{s}", .{ pack_name, sub_name, vd.name }) catch continue;
+                                                            local_renames.put(vd.name, mangled) catch continue;
+                                                        }
+                                                    },
+                                                    else => {},
+                                                }
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                }
+                                for (sub_module.declarations) |sub_decl| {
+                                    switch (sub_decl) {
+                                        .fun_decl => |fd| {
+                                            if (fd.visibility == .public) {
+                                                const mangled_name = local_renames.get(fd.name) orelse continue;
+                                                var new_fd = fd;
+                                                new_fd.name = mangled_name;
+                                                new_fd.visibility = .private;
+                                                // 同步重写函数体内部对同模块函数的短名调用
+                                                rewriteModuleCalls(new_fd.body, &local_renames, &sibling_modules, allocator);
+                                                try extra_decls.append(allocator, .{ .fun_decl = new_fd });
+                                            }
+                                        },
+                                        // 合并 pub type_decl：newtype/record/ADT 类型定义需要被加载，
+                                        // 否则函数体内部的 newtype 构造器（如 Duration(...)）会找不到类型
+                                        .type_decl => |td| {
+                                            if (td.visibility == .public) {
+                                                var new_td = td;
+                                                new_td.visibility = .private;
+                                                try extra_decls.append(allocator, .{ .type_decl = new_td });
+                                            }
+                                        },
+                                        // 合并 pub val 声明（expr_decl 包装的 val_decl，如 SystemTime.UNIX_EPOCH）
+                                        // 重命名 name 为 mangled name，重写 value 中的同模块短名调用
+                                        .expr_decl => |ed| {
+                                            if (ed.stmt) |st| {
+                                                switch (st.*) {
+                                                    .val_decl => |vd| {
+                                                        if (vd.visibility == .public) {
+                                                            const mangled_name = local_renames.get(vd.name) orelse continue;
+                                                            const new_stmt = allocator.create(ast.Stmt) catch continue;
+                                                            new_stmt.* = .{ .val_decl = .{
+                                                                .name = mangled_name,
+                                                                .type_annotation = vd.type_annotation,
+                                                                .value = vd.value,
+                                                                .visibility = .private,
+                                                            } };
+                                                            // 重写 value 表达式中的同模块短名调用
+                                                            rewriteModuleCalls(vd.value, &local_renames, &sibling_modules, allocator);
+                                                            const new_expr = allocator.create(ast.Expr) catch continue;
+                                                            new_expr.* = .{ .unit_literal = {} };
+                                                            try extra_decls.append(allocator, .{ .expr_decl = .{
+                                                                .location = ed.location,
+                                                                .expr = new_expr,
+                                                                .stmt = new_stmt,
+                                                            } });
+                                                        }
+                                                    },
+                                                    else => {},
+                                                }
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    continue;
+                }
+
                 // 读取 pack.glue
                 const pack_path = try std.fmt.allocPrint(allocator, "{s}{s}{c}pack.glue", .{ source_dir_with_sep, module_name, std.fs.path.sep });
                 defer allocator.free(pack_path);
@@ -299,6 +740,19 @@ fn loadImportedDeclarations(
                 var pack_parser = parser.Parser.init(allocator, pack_tokens);
                 defer pack_parser.deinit();
                 const pack_module = pack_parser.parseModule("pack") catch continue;
+
+                // 构建 sibling_modules：同 pack 内所有子模块短名 → 完整模块路径
+                var sibling_modules = std.StringHashMap([]const u8).init(allocator);
+                defer sibling_modules.deinit();
+                for (pack_module.declarations) |pack_decl| {
+                    switch (pack_decl) {
+                        .pack_decl => |pd| {
+                            const mangled_mod = std.fmt.allocPrint(allocator, "{s}.{s}", .{ module_name, pd.name }) catch continue;
+                            sibling_modules.put(pd.name, mangled_mod) catch continue;
+                        },
+                        else => {},
+                    }
+                }
 
                 // 查找子模块名
                 for (pack_module.declarations) |pack_decl| {
@@ -335,15 +789,39 @@ fn loadImportedDeclarations(
                             try retained_tokens.append(allocator, sub_tokens);
 
                             // 收集 pub fun 声明，重命名为 Module.Sub.fun
+                            // 先构建本子模块短名 → mangled name 映射，用于重写函数体内部
+                            // 对同模块其他函数的短名调用
+                            // 注意：不重写 type 构造器调用，sema 通过合并的 type_decl 解析
+                            var local_renames = std.StringHashMap([]const u8).init(allocator);
+                            defer local_renames.deinit();
+                            for (sub_module.declarations) |sd| {
+                                switch (sd) {
+                                    .fun_decl => |fd| {
+                                        if (fd.visibility == .public) {
+                                            const mangled = std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ module_name, sub_name, fd.name }) catch continue;
+                                            local_renames.put(fd.name, mangled) catch continue;
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
                             for (sub_module.declarations) |sub_decl| {
                                 switch (sub_decl) {
                                     .fun_decl => |fd| {
                                         if (fd.visibility == .public) {
-                                            const mangled_name = try std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ module_name, sub_name, fd.name });
+                                            const mangled_name = local_renames.get(fd.name) orelse continue;
                                             var new_fd = fd;
                                             new_fd.name = mangled_name;
                                             new_fd.visibility = .private;
+                                            rewriteModuleCalls(new_fd.body, &local_renames, &sibling_modules, allocator);
                                             try extra_decls.append(allocator, .{ .fun_decl = new_fd });
+                                        }
+                                    },
+                                    .type_decl => |td| {
+                                        if (td.visibility == .public) {
+                                            var new_td = td;
+                                            new_td.visibility = .private;
+                                            try extra_decls.append(allocator, .{ .type_decl = new_td });
                                         }
                                     },
                                     else => {},

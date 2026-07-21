@@ -31,6 +31,8 @@ pub const OrbitMeta = meta_mod.OrbitMeta;
 pub const LoopMeta = meta_mod.LoopMeta;
 pub const LoopKind = meta_mod.LoopKind;
 pub const ClosureMeta = meta_mod.ClosureMeta;
+pub const SyscallId = meta_mod.SyscallId;
+pub const SyscallMeta = meta_mod.SyscallMeta;
 pub const ChanType = channel_mod.ChanType;
 pub const ChannelMeta = channel_mod.ChannelMeta;
 pub const ChannelSpace = channel_mod.ChannelSpace;
@@ -77,6 +79,10 @@ pub const GlueIR = struct {
 
     /// 闭包元数据表（closure_make 节点引用，lambda 编译）
     closure_metas: []ClosureMeta = &.{},
+
+    /// Syscall 元数据表（syscall_call 节点引用，IO/Time 等宿主 syscall 包装）
+    /// meta_index 1-indexed：syscall_call 节点的 meta_index 索引此表（0 = 哨兵）
+    syscall_metas: []SyscallMeta = &.{},
 
     /// 类型元数据表（builtin_typeof 节点引用，反射机制）
     type_metadata_table: TypeMetadataTable = .{},

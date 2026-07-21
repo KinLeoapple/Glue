@@ -107,6 +107,14 @@ pub const TypeNode = union(enum) {
     nullable: struct {
         inner: *TypeNode,
     },
+    /// 借用引用 &T：指向已有对象的引用，共享读写，RC 管理
+    ref_type: struct {
+        inner: *TypeNode,
+    },
+    /// 裸指针 *T：绕过 RC，不安全，预留用于 FFI
+    raw_ptr: struct {
+        inner: *TypeNode,
+    },
     function: struct {
         params: []*TypeNode,
         return_type: *TypeNode,
@@ -181,7 +189,6 @@ pub const Param = struct {
     location: SourceLocation,
     name: []const u8,
     type_annotation: ?*TypeNode,
-    is_var: bool,
 };
 
 /// 类型参数：携带名称、kind 约束与 trait 约束
@@ -362,6 +369,14 @@ pub const Expr = union(enum) {
         op: UnaryOp,
         operand: *Expr,
     },
+    /// 取引用 &expr：获取指向 expr 的借用引用
+    ref_of: struct {
+        operand: *Expr,
+    },
+    /// 解引用 *expr：读取引用指向的值
+    deref: struct {
+        operand: *Expr,
+    },
     call: struct {
         callee: *Expr,
         arguments: []*Expr,
@@ -397,8 +412,20 @@ pub const Expr = union(enum) {
         object: *Expr,
         index: *Expr,
     },
+    /// 切片表达式：obj[start..end] 或 obj[start..=end]
+    /// object 可以是数组或字符串；inclusive=true 时 end 包含在结果中
+    slice: struct {
+        object: *Expr,
+        start: *Expr,
+        end: *Expr,
+        inclusive: bool,
+    },
     array_literal: struct {
         elements: []*Expr,
+        /// 数组填充语法 [value, ..count]：用 fill_value 重复 count 次创建数组
+        /// 当 fill_value 非 null 时，elements 必须恰好 1 个元素（作为填充值）
+        fill_value: ?*Expr = null,
+        fill_count: ?*Expr = null,
     },
     record_literal: struct {
         fields: []RecordFieldExpr,

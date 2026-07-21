@@ -1,0 +1,65 @@
+// std_duration: 验证 std.time.Duration 模块
+// 覆盖 from_secs/from_millis/from_micros/from_nanos/from_mins/from_hours/from_days
+// 覆盖 as_secs/as_millis/as_micros/as_nanos/subsec_nanos
+// 覆盖 add/sub/mul/div/is_zero
+// 注意：stdlib 方法分派 on value 暂不支持，使用模块函数调用语法
+//   Module.Sub.Type.method(value, args)
+import std.time.Duration
+
+fun main() {
+    // ── 构造器 ─────────────────────────────────────────────────────
+    // from_secs(3) → 3_000_000_000 ns
+    val d_sec = std.time.Duration.from_secs(3)
+    println(std.time.Duration.as_secs(d_sec))       // 3
+    println(std.time.Duration.as_nanos(d_sec))      // 3000000000
+
+    // from_millis(2500) → 2_500_000_000 ns（= 2.5 秒）
+    val d_ms = std.time.Duration.from_millis(2500)
+    println(std.time.Duration.as_secs(d_ms))        // 2
+    println(std.time.Duration.subsec_nanos(d_ms))   // 500000000
+
+    // from_micros(3_000_000) → 3_000_000_000 ns（= 3 秒）
+    val d_us = std.time.Duration.from_micros(3_000_000)
+    println(std.time.Duration.as_secs(d_us))        // 3
+
+    // from_nanos(1_500_000_000) → 1.5 秒
+    val d_ns = std.time.Duration.from_nanos(1_500_000_000)
+    println(std.time.Duration.as_secs(d_ns))        // 1
+    println(std.time.Duration.as_millis(d_ns))      // 1500
+
+    // from_mins(2) → 120_000_000_000 ns
+    val d_min = std.time.Duration.from_mins(2)
+    println(std.time.Duration.as_secs(d_min))       // 120
+
+    // from_hours(1) → 3_600_000_000_000 ns
+    val d_hr = std.time.Duration.from_hours(1)
+    println(std.time.Duration.as_secs(d_hr))        // 3600
+
+    // from_days(1) → 86_400_000_000_000 ns
+    val d_day = std.time.Duration.from_days(1)
+    println(std.time.Duration.as_secs(d_day))       // 86400
+
+    // ── 算子 ───────────────────────────────────────────────────────
+    // add(from_secs(1), from_secs(2)) → 3 秒
+    val d_add = std.time.Duration.add(std.time.Duration.from_secs(1), std.time.Duration.from_secs(2))
+    println(std.time.Duration.as_secs(d_add))       // 3
+
+    // sub(from_secs(5), from_secs(2)) → 3 秒
+    val d_sub = std.time.Duration.sub(std.time.Duration.from_secs(5), std.time.Duration.from_secs(2))
+    println(std.time.Duration.as_secs(d_sub))       // 3
+
+    // mul(from_secs(3), 2) → 6 秒
+    val d_mul = std.time.Duration.mul(std.time.Duration.from_secs(3), 2)
+    println(std.time.Duration.as_secs(d_mul))       // 6
+
+    // div(from_secs(10), 2) → 5 秒
+    val d_div = std.time.Duration.div(std.time.Duration.from_secs(10), 2)
+    println(std.time.Duration.as_secs(d_div))       // 5
+
+    // ── is_zero ────────────────────────────────────────────────────
+    val d_zero = std.time.Duration.from_secs(0)
+    println(std.time.Duration.is_zero(d_zero))      // true
+    println(std.time.Duration.is_zero(d_sec))       // false
+
+    println("std_duration: OK")
+}

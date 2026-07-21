@@ -1,0 +1,61 @@
+// Dir.glue — 目录列表/创建/删除/遍历
+//
+// 设计文档 §4.6：Dir 便捷 API
+// 所有操作为 async，返回 Async<Throw<T, IOError>>。
+// DirEntry 通过 __dir_list syscall 返回，kind 字段为 FileKind ADT。
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+// 目录条目（name + kind），与 syscall/io.zig dir_list 返回结构对齐
+pub type DirEntry = DirEntry(name: str, kind: FileKind)
+
+// ─── 目录操作（async） ────────────────────────────────────────────
+
+// 列出目录直系子条目
+pub async fun list(path: str): Async<Throw<DirEntry[], IOError>> {
+    __dir_list(path)?
+}
+
+// 列出目录直系子条目（Path 重载）
+pub async fun list_path(path: Path): Async<Throw<DirEntry[], IOError>> {
+    __dir_list(path.to_str())?
+}
+
+// 创建目录
+// recursive=true 时递归创建父目录（类似 mkdir -p）
+pub async fun create(path: str, recursive: bool): Async<Throw<Unit, IOError>> {
+    __dir_create(path, recursive)?
+    Ok(())
+}
+
+// 创建目录（Path 重载）
+pub async fun create_path(path: Path, recursive: bool): Async<Throw<Unit, IOError>> {
+    __dir_create(path.to_str(), recursive)?
+    Ok(())
+}
+
+// 删除目录
+// recursive=true 时递归删除子目录与文件（类似 rm -r）
+pub async fun remove(path: str, recursive: bool): Async<Throw<Unit, IOError>> {
+    __dir_remove(path, recursive)?
+    Ok(())
+}
+
+// 递归遍历目录树（深度优先），返回所有条目（含子目录中的条目）
+pub async fun walk(path: str): Async<Throw<DirEntry[], IOError>> {
+    val entries = __dir_list(path)?
+    var result: DirEntry[] = []
+    for e in entries {
+        result = result ++ [e]
+        match e.kind {
+            Directory => {
+                // 纯 Glue 路径拼接：path + "/" + name（替代 __path_join_str syscall）
+                val sub_path = path + "/" + e.name
+                val sub_entries = walk(sub_path).await()?
+                result = result ++ sub_entries
+            },
+            _ => {},
+        }
+    }
+    Ok(result)
+}

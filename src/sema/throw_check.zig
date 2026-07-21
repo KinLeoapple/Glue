@@ -100,6 +100,18 @@ pub fn unifyReturnType(inferencer: *TypeInferencer, declared: *Type, inferred: *
     const resolved_declared = inferencer.resolve(declared);
     const resolved_inferred = inferencer.resolve(inferred);
 
+    // async 函数：声明返回类型应为 Async<X>，body 推断为 Async<Y>
+    // 递归统一内部类型 X 与 Y（支持 Throw<T, E> 与 T 兼容）
+    if (resolved_declared.* == .generic_type and resolved_inferred.* == .generic_type) {
+        const dg = resolved_declared.generic_type;
+        const ig = resolved_inferred.generic_type;
+        if (std.mem.eql(u8, dg.name, "Async") and std.mem.eql(u8, ig.name, "Async") and
+            dg.args.len == 1 and ig.args.len == 1)
+        {
+            return unifyReturnType(inferencer, dg.args[0], ig.args[0]);
+        }
+    }
+
     switch (resolved_declared.*) {
         .nullable_type => |inner| {
             switch (resolved_inferred.*) {
@@ -208,12 +220,16 @@ pub fn tryWidenUnify(inferencer: *TypeInferencer, t1: *Type, t2: *Type) SemaErro
                         if (inferencer.unify(v1, v2)) |_| {
                             return r1;
                         } else |_| {
-                            if (v1.isNumericType() and v2.isNumericType()) {
-                                if (canCoerceNumeric(v1, v2)) {
-                                    return r1;
+                            // 尝试宽化统一值类型（处理 nullable<T> 与 T 的兼容性）
+                            _ = tryWidenUnify(inferencer, v1, v2) catch {
+                                if (v1.isNumericType() and v2.isNumericType()) {
+                                    if (canCoerceNumeric(v1, v2)) {
+                                        return r1;
+                                    }
                                 }
-                            }
-                            return error.TypeMismatch;
+                                return error.TypeMismatch;
+                            };
+                            return r1;
                         }
                     },
                     .unit_type => {

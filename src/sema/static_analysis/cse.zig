@@ -91,6 +91,8 @@ pub const CsePass = struct {
                 }
             },
             .unary => |u| try self.processExpr(u.operand, seen),
+            .ref_of => |r| try self.processExpr(r.operand, seen),
+            .deref => |d| try self.processExpr(d.operand, seen),
             .if_expr => |i| {
                 // then / else 分支各自独立作用域，处理后清空已见集合。
                 try self.processExpr(i.condition, seen);
@@ -273,6 +275,8 @@ fn exprEqual(a: *const ast.Expr, b: *const ast.Expr) bool {
         .identifier => |ai| std.mem.eql(u8, ai.name, b.identifier.name),
         .binary => |ab| ab.op == b.binary.op and exprEqual(ab.left, b.binary.left) and exprEqual(ab.right, b.binary.right),
         .unary => |au| au.op == b.unary.op and exprEqual(au.operand, b.unary.operand),
+        .ref_of => |ar| exprEqual(ar.operand, b.ref_of.operand),
+        .deref => |ad| exprEqual(ad.operand, b.deref.operand),
         else => a == b,
     };
 }
@@ -283,6 +287,8 @@ fn exprReadsVar(expr: *const ast.Expr, name: []const u8) bool {
         .identifier => |id| std.mem.eql(u8, id.name, name),
         .binary => |b| exprReadsVar(b.left, name) or exprReadsVar(b.right, name),
         .unary => |u| exprReadsVar(u.operand, name),
+        .ref_of => |r| exprReadsVar(r.operand, name),
+        .deref => |d| exprReadsVar(d.operand, name),
         else => false,
     };
 }
@@ -309,6 +315,8 @@ fn isCseEligibleOperand(expr: *const ast.Expr) bool {
         => true,
         .binary => isCseEligibleBinary(expr),
         .unary => |u| (u.op == .neg or u.op == .not) and isCseEligibleOperand(u.operand),
+        // 取引用/解引用涉及地址语义，不作为 CSE 候选
+        .ref_of, .deref => false,
         else => false,
     };
 }

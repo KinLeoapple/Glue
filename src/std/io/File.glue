@@ -1,0 +1,170 @@
+// File.glue — FileHandle + OpenMode + Stat + SeekFrom + FileKind
+//
+// 设计文档 §4.2-§4.3：File 模块核心类型与 FileHandle 状态机
+// 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>（Instant/SystemTime 同步除外）
+//
+// 类型采用 newtype 形式（type Name = Name(...)），以便 syscall 层通过
+// Value.makeRecordWithNames(type_name="Name", ...) 构造的值能在 Glue 端被识别。
+
+// ─── 顶层常量（POSIX flags） ───────────────────────────────────────
+
+pub val DEFAULT_BUF_SIZE: usize = 8192
+pub val DEFAULT_FILE_MODE: i32 = 0o644
+
+pub val O_RDONLY: i32 = 0
+pub val O_WRONLY: i32 = 1
+pub val O_RDWR: i32 = 2
+pub val O_CREAT: i32 = 64
+pub val O_TRUNC: i32 = 512
+pub val O_APPEND: i32 = 1024
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+// OpenMode：文件打开模式（newtype record，可被顶层构造器函数构造）
+pub type OpenMode = OpenMode(read: bool, write: bool, create: bool, truncate: bool, append: bool)
+
+// SeekFrom：seek 起点位置（ADT，携带 i64 偏移）
+pub type SeekFrom =
+    | Set(i64)
+    | Current(i64)
+    | End(i64)
+
+// FileKind：文件种类（ADT 无字段变体）
+// syscall 层根据 stat.st_mode & S_IFMT 构造对应变体
+pub type FileKind =
+    | File
+    | Directory
+    | Symlink
+    | Other
+
+// Stat：文件元数据（newtype record，syscall 层用 type_name="Stat" 构造）
+pub type Stat = Stat(size: u64, mtime_ns: i64, ctime_ns: i64, kind: FileKind)
+
+// File：文件句柄（newtype record，公开导出）
+pub type File = File(fd: i32, path: str, mode: OpenMode, is_closed: bool)
+
+// ─── OpenMode 顶层构造器 ───────────────────────────────────────────
+
+pub fun read_only(): OpenMode {
+    OpenMode(true, false, false, false, false)
+}
+
+pub fun write_only(): OpenMode {
+    OpenMode(false, true, false, false, false)
+}
+
+pub fun read_write(): OpenMode {
+    OpenMode(true, true, false, false, false)
+}
+
+pub fun create_rw(): OpenMode {
+    OpenMode(true, true, true, false, false)
+}
+
+pub fun append_mode(): OpenMode {
+    OpenMode(false, true, true, false, true)
+}
+
+// ─── flags 计算（OpenMode → POSIX flags） ─────────────────────────
+
+pub fun __compute_flags(mode: OpenMode): i32 {
+    var flags: i32 = O_RDONLY
+    if mode.read && mode.write {
+        flags = O_RDWR
+    } else if mode.write {
+        flags = O_WRONLY
+    } else {
+        flags = O_RDONLY
+    }
+    if mode.create { flags = flags | O_CREAT }
+    if mode.truncate { flags = flags | O_TRUNC }
+    if mode.append { flags = flags | O_APPEND }
+    flags
+}
+
+// ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
+
+// async 函数体内通过 ? 传播 Throw 错误，成功则返回 T（自动包装为 Async<Throw<T, E>>）
+// 见设计文档 §4.3
+
+pub async fun open(path: str, mode: OpenMode): Async<Throw<File, IOError>> {
+    val flags = __compute_flags(mode)
+    val fd = __file_open(path, flags, DEFAULT_FILE_MODE)?
+    File(fd, path, mode, false)
+}
+
+pub async fun stat_of(path: str): Async<Throw<Stat, IOError>> {
+    __file_stat(path)?
+}
+
+pub async fun remove(path: str): Async<Throw<Unit, IOError>> {
+    __file_remove(path)?
+    Ok(())
+}
+
+pub async fun rename(old: str, new: str): Async<Throw<Unit, IOError>> {
+    __file_rename(old, new)?
+    Ok(())
+}
+
+pub async fun chmod(path: str, mode: i32): Async<Throw<Unit, IOError>> {
+    __file_chmod(path, mode)?
+    Ok(())
+}
+
+// ─── 实例方法（self : File） ───────────────────────────
+
+pub async fun close(self: File): Async<Throw<Unit, IOError>> {
+    if self.is_closed {
+        Ok(())
+    } else {
+        self.is_closed = true
+        __file_close(self.fd)?
+        Ok(())
+    }
+}
+
+pub async fun read(self: File, buf: u8[], len: usize): Async<Throw<usize, IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "file closed", 0, self.path)
+    }
+    __file_read(self.fd, buf, len)?
+}
+
+pub async fun write(self: File, buf: u8[], len: usize): Async<Throw<usize, IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "file closed", 0, self.path)
+    }
+    __file_write(self.fd, buf, len)?
+}
+
+pub async fun seek(self: File, from: SeekFrom): Async<Throw<i64, IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "file closed", 0, self.path)
+    }
+    val offset = match from {
+        Set(off) => off,
+        Current(off) => off,
+        End(off) => off,
+    }
+    val whence = match from {
+        Set(_) => 0,
+        Current(_) => 1,
+        End(_) => 2,
+    }
+    __file_seek(self.fd, offset, whence)?
+}
+
+pub async fun tell(self: File): Async<Throw<i64, IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "file closed", 0, self.path)
+    }
+    __file_tell(self.fd)?
+}
+
+pub async fun stat(self: File): Async<Throw<Stat, IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "file closed", 0, self.path)
+    }
+    __file_fstat(self.fd)?
+}

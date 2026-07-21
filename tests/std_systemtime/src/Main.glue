@@ -1,0 +1,56 @@
+import std.time.SystemTime
+import std.time.Duration
+import std.time.DateTime
+import std.time.TimeComponents
+
+fun main() {
+    // ─── 1. UNIX_EPOCH + to_utc ───────────────────────────────────────
+    val epoch = std.time.SystemTime.UNIX_EPOCH
+    val epoch_utc = epoch.to_utc()
+    println(epoch_utc.year)        // 1970
+    println(epoch_utc.month)       // 1
+    println(epoch_utc.day)         // 1
+    println(epoch_utc.hour)        // 0
+    println(epoch_utc.minute)      // 0
+    println(epoch_utc.second)      // 0
+    println(epoch_utc.weekday)     // 4（1970-01-01 是周四）
+
+    // ─── 2. add_duration / sub_duration ───────────────────────────────
+    val t1 = epoch.add_duration(std.time.Duration.from_secs(90061))
+    val t1_utc = t1.to_utc()
+    println(t1_utc.hour)          // 1（90061 秒 = 1 天 1 小时 1 分 1 秒）
+    println(t1_utc.minute)        // 1
+    println(t1_utc.second)        // 1
+    println(t1_utc.day)           // 2
+
+    val t2 = t1.sub_duration(std.time.Duration.from_secs(60))
+    val t2_utc = t2.to_utc()
+    println(t2_utc.second)        // 1
+    println(t2_utc.minute)        // 0
+
+    // ─── 3. duration_since ────────────────────────────────────────────
+    val dur = t1.duration_since(epoch)
+    println(dur.as_secs())         // 90061
+
+    // ─── 4. now() ────────────────────────────────────────────────────
+    val now_st = std.time.SystemTime.now()
+    val now_utc = now_st.to_utc()
+    println(now_utc.year >= 2026)  // true
+
+    // ─── 5. is_before / is_after ───────────────────────────────────────
+    println(epoch.is_before(t1))   // true
+    println(t1.is_after(epoch))    // true
+    println(epoch.is_before(epoch)) // false
+    println(epoch.is_after(epoch))  // false
+
+    // ─── 6. to_local — 本地时区（北京时间 UTC+8）──────────────────────
+    val local = epoch.to_local()
+    println(local.hour)            // 8（北京时间）
+
+    // ─── 7. from_datetime_utc（合法日期）──────────────────────────────
+    val dt = std.time.DateTime.from_components(epoch_utc)
+    val from_dt = std.time.SystemTime.from_datetime_utc(dt)?
+    println(from_dt.nanos)         // 0
+
+    println("done")
+}

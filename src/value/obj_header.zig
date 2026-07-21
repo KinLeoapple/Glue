@@ -47,6 +47,9 @@ pub const RefKind = enum(u8) {
     channel_val,
     sender_val,
     receiver_val,
+    /// 装箱标量：&i32/&f64 等标量引用的堆容器，内联标量值紧跟 ObjHeader 之后
+    /// 内存布局：[ObjHeader][标量值，最多 16B]
+    boxed_scalar,
 };
 
 /// 所有堆对象的统一头部

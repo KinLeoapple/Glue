@@ -63,6 +63,8 @@ pub fn checkTypeNode(
             }
         },
         .nullable => |nl| checkTypeNode(inferencer, nl.inner, type_param_names),
+        .ref_type => |rt| checkTypeNode(inferencer, rt.inner, type_param_names),
+        .raw_ptr => |rp| checkTypeNode(inferencer, rp.inner, type_param_names),
         .function => |f| {
             for (f.params) |p| checkTypeNode(inferencer, p, type_param_names);
             checkTypeNode(inferencer, f.return_type, type_param_names);

@@ -1,0 +1,53 @@
+// 引用语义端到端测试：覆盖 &T 借用引用和 *T 解引用
+//
+// 测试项：
+// 1. 标量取引用 + 解引用读取
+// 2. 标量解引用回写（*r = value）
+// 3. 标量复合赋值回写（*r += value）
+// 4. 函数参数引用传递 + 回写
+// 5. 链式引用（&&T）
+
+// 测试 4：函数参数引用传递 + 回写
+fun increment(r: &i32) {
+    *r = *r + 1
+}
+
+// 测试 5：通过引用累加
+fun add_n(r: &i32, n: i32) {
+    *r = *r + n
+}
+
+fun main() {
+    // 测试 1：标量取引用 + 解引用读取
+    val a: i32 = 42
+    val ra: &i32 = &a
+    val read_a = *ra
+    println(read_a)  // 预期：42
+
+    // 测试 2：标量解引用回写
+    val b: i32 = 10
+    val rb: &i32 = &b
+    *rb = *rb + 1
+    println(b)       // 预期：11
+
+    // 测试 3：标量复合赋值回写（*r += value 形式）
+    val c: i32 = 100
+    val rc: &i32 = &c
+    *rc = *rc + 50
+    println(c)       // 预期：150
+
+    // 测试 4：函数参数引用传递 + 回写
+    val count: i32 = 5
+    increment(&count)
+    println(count)   // 预期：6
+
+    // 测试 5：多次通过引用累加
+    val sum: i32 = 0
+    val rs: &i32 = &sum
+    add_n(rs, 10)
+    add_n(rs, 20)
+    add_n(rs, 30)
+    println(sum)     // 预期：60
+
+    println(0)       // 测试结束标记
+}

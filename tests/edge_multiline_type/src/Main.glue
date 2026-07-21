@@ -1,0 +1,60 @@
+// 测试各种多行 type 声明 + 尾随逗号
+
+// 模式 1: ADT 跨行,每个 | 单独一行
+type Tree =
+    | Leaf
+    | Node(i32, Tree, Tree)
+
+// 模式 2: 记录类型字段跨行 + 尾随逗号
+type Point3 = Point3(
+    x: i32,
+    y: i32,
+    z: i32,
+)
+
+// 模式 3: 等号在下一行
+type Point4
+    = Point4(x: i32, y: i32)
+
+// 模式 4: 类型别名跨行
+type Int5
+    = i32
+
+// 模式 5: 泛型参数跨行 + 尾随逗号
+type Map6<
+    K,
+    V,
+> = Map6(key: K, value: V)
+
+// 模式 6: 无名构造器字段 + 尾随逗号
+type Triple7 = Triple7(
+    i32,
+    i32,
+    i32,
+)
+
+// 模式 7: ADT 构造器 + 尾随逗号
+type Shape =
+    | Circle(f64,)
+    | Rect(f64, f64,)
+
+// 模式 8: 泛型实参尾随逗号
+type List8<i32,> = List8(head: i32)
+
+fun add3(a: i32, b: i32, c: i32): i32 { a + b + c }
+
+fun main() {
+    val t = Node(1i32, Leaf, Leaf)
+    val p3 = Point3(1i32, 2i32, 3i32)
+    val p4 = Point4(1i32, 2i32)
+    val i5: Int5 = 42i32
+    val m6 = Map6("k", 100i32)
+    val tr7 = Triple7(1i32, 2i32, 3i32)
+    val c = Circle(1.0)
+    val r = Rect(1.0, 2.0)
+    val l8 = List8(42i32)
+    // 函数调用尾随逗号
+    val s = add3(1i32, 2i32, 3i32,)
+    println("multi-line type OK")
+    println(s)
+}

@@ -82,6 +82,8 @@ pub const DeadCodePass = struct {
                 try self.collectReadsExpr(b.right, reads);
             },
             .unary => |u| try self.collectReadsExpr(u.operand, reads),
+            .ref_of => |r| try self.collectReadsExpr(r.operand, reads),
+            .deref => |d| try self.collectReadsExpr(d.operand, reads),
             .call => |c| {
                 try self.collectReadsExpr(c.callee, reads);
                 for (c.arguments) |a| try self.collectReadsExpr(a, reads);
@@ -196,6 +198,8 @@ pub const DeadCodePass = struct {
                 try self.collectAndMarkDeclsExpr(b.right, reads);
             },
             .unary => |u| try self.collectAndMarkDeclsExpr(u.operand, reads),
+            .ref_of => |r| try self.collectAndMarkDeclsExpr(r.operand, reads),
+            .deref => |d| try self.collectAndMarkDeclsExpr(d.operand, reads),
             .call => |c| {
                 try self.collectAndMarkDeclsExpr(c.callee, reads);
                 for (c.arguments) |a| try self.collectAndMarkDeclsExpr(a, reads);
@@ -313,6 +317,8 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
         .string_literal, .null_literal, .unit_literal, .identifier,
         => true,
         .unary => |u| isSideEffectFreeExpr(u.operand),
+        .ref_of => |r| isSideEffectFreeExpr(r.operand),
+        .deref => |d| isSideEffectFreeExpr(d.operand),
         .binary => |b| switch (b.op) {
             // 短路运算、范围、列表拼接等可能有副作用或特殊语义，保守视为非纯。
             .and_op, .or_op, .elvis => false,
@@ -337,7 +343,7 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
         .non_null_assert => |n| isSideEffectFreeExpr(n.expr),
         // 以下表达式一律视为有副作用，不在此处逐条展开。
         .call, .method_call, .safe_method_call, .string_interpolation,
-        .index, .record_literal, .record_extend, .array_literal,
+        .index, .slice, .record_literal, .record_extend, .array_literal,
         .lambda, .match, .select, .lazy, .spawn_expr,
         .assignment_expr, .compound_assign, .propagate,
         .atomic_expr, .inline_trait_value,

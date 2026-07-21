@@ -317,7 +317,8 @@ fn hasSideEffect(op: NodeOp) bool {
         .orbit_chan_send, .orbit_chan_recv, .orbit_chan_try_recv,
         .channel_close,
         .closure_make, .call_indirect,
-        .race_yield,
+        // race_select 阻塞等待通道就绪/超时，结果依赖时序，不可消除
+        .race_select, .race_yield,
         .builtin_print, .builtin_println,
         .builtin_eprint, .builtin_eprintln,
         .builtin_scan, .builtin_scanln,
@@ -336,6 +337,8 @@ fn hasSideEffect(op: NodeOp) bool {
         .vec_map, .vec_map2, .vec_fold, .vec_scan, .vec_filter, .vec_take_while,
         // vec_source 分配向量数据，vec_sink 收集结果（sink_to_array 产生堆对象）
         .vec_source, .vec_sink, .vec_zip, .vec_take,
+        // ref_set 通过引用写入原始通道（回写语义），有副作用
+        .ref_set,
         => true,
         else => false,
     };

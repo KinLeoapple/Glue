@@ -1,0 +1,95 @@
+// std_datetime: 验证 std.time.DateTime 模块
+// 覆盖构造器、to/from_components、add_days、add_duration、format、to_iso8601、pad_int
+// 重点验证 stdlib 方法调用（self.method()）与 Throw 传播（?）的组合：
+//   dt.add_duration(dur)? 的返回值字段访问（regression for inferTypeNameFromExpr on .propagate）
+import std.time.DateTime
+import std.time.Duration
+import std.time.TimeComponents
+
+fun main() {
+    // ── 1. 构造器 + 字段访问 ─────────────────────────────────────
+    val dt = DateTime(2026, 7, 20, 14, 30, 45, 123, 1, 201)
+    println(dt.year)        // 2026
+    println(dt.month)       // 7
+    println(dt.day)         // 20
+    println(dt.hour)        // 14
+    println(dt.minute)      // 30
+    println(dt.second)      // 45
+    println(dt.nanos)       // 123
+    println(dt.weekday)     // 1（周一）
+    println(dt.day_of_year) // 201
+
+    // ── 2. to_components / from_components 往返 ────────────────────
+    val comp = dt.to_components()
+    println(comp.year)      // 2026
+    println(comp.month)     // 7
+    println(comp.hour)      // 14
+
+    val dt2 = std.time.DateTime.from_components(comp)
+    println(dt2.year)       // 2026
+    println(dt2.minute)     // 30
+
+    // ── 3. add_days（委托 Calendar，重算 weekday 与 day_of_year） ──
+    val dt_epoch = DateTime(1970, 1, 1, 0, 0, 0, 0, 4, 1)
+    val plus_10 = dt_epoch.add_days(10)
+    println(plus_10.year)   // 1970
+    println(plus_10.month)  // 1
+    println(plus_10.day)    // 11
+
+    // 跨年边界
+    val nye = DateTime(2026, 12, 31, 23, 59, 59, 0, 3, 365)
+    val next_year = nye.add_days(1)
+    println(next_year.year)  // 2027
+    println(next_year.month) // 1
+    println(next_year.day)   // 1
+
+    // 减天数
+    val back = dt_epoch.add_days(-1)
+    println(back.year)      // 1969
+    println(back.month)     // 12
+    println(back.day)       // 31
+
+    // ── 4. add_duration（Throw<DateTime, TimeError> + ? 传播） ────
+    // 关键回归：dt.add_duration(dur)? 后字段访问必须返回正确值
+    val r = dt_epoch.add_duration(std.time.Duration.from_secs(60))?
+    println(r.year)         // 1970
+    println(r.minute)       // 1
+
+    val r2 = dt_epoch.add_duration(std.time.Duration.from_secs(90061))?
+    println(r2.day)         // 2（90061s = 1d 1h 1m 1s）
+    println(r2.hour)        // 1
+    println(r2.minute)      // 1
+    println(r2.second)      // 1
+
+    // 加纳秒精度
+    val r3 = dt_epoch.add_duration(std.time.Duration.from_nanos(1_500_000_000))?
+    println(r3.second)      // 1
+    println(r3.nanos)       // 500000000
+
+    // ── 5. pad_int（纯 Glue 格式化辅助） ─────────────────────────
+    println(std.time.DateTime.pad_int(7, 2))     // 07
+    println(std.time.DateTime.pad_int(2026, 4))   // 2026
+    println(std.time.DateTime.pad_int(0, 3))      // 000
+    println(std.time.DateTime.pad_int(-5, 3))     // -005
+
+    // ── 6. format（strftime-like） ────────────────────────────────
+    println(dt.format("%Y-%m-%d"))              // 2026-07-20
+    println(dt.format("%H:%M:%S"))              // 14:30:45
+    println(dt.format("%Y/%m/%d %H:%M"))        // 2026/07/20 14:30
+    println(dt.format("%A"))                    // Monday
+    println(dt.format("%a"))                    // Mon
+    println(dt.format("%B"))                    // July
+    println(dt.format("%b"))                    // Jul
+    println(dt.format("%j"))                    // 201
+
+    // ── 7. to_iso8601 ─────────────────────────────────────────────
+    println(dt.to_iso8601())  // 2026-07-20T14:30:45
+
+    // ── 8. weekday_name / month_name 等辅助 ──────────────────────
+    println(std.time.DateTime.weekday_name(0))   // Sunday
+    println(std.time.DateTime.weekday_name(6))   // Saturday
+    println(std.time.DateTime.month_name(1))     // January
+    println(std.time.DateTime.month_abbr(7))     // Jul
+
+    println("std_datetime: OK")
+}

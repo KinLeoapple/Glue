@@ -61,22 +61,22 @@ fun main() {
     println(char(high))          // char(200)
 
     // ---- char -> str ----
-    println(str('Z'))            // Z
-    println(str('1'))            // 1
+    println(cast('Z').to(str))            // Z
+    println(cast('1').to(str))            // 1
 
     // ---- int -> str ----
-    println(str(42i32))          // 42
-    println(str(-100i32))        // -100
-    println(str(255u8))          // 255
-    println(str(0i32))           // 0
+    println(cast(42i32).to(str))          // 42
+    println(cast(-100i32).to(str))        // -100
+    println(cast(255u8).to(str))          // 255
+    println(cast(0i32).to(str))           // 0
 
     // ---- float -> str ----
-    println(str(3.14))           // 3.14
-    println(str(-0.5))           // -0.5
+    println(cast(3.14).to(str))           // 3.14
+    println(cast(-0.5).to(str))           // -0.5
 
     // ---- bool -> str ----
-    println(str(true))           // true
-    println(str(false))          // false
+    println(cast(true).to(str))           // true
+    println(cast(false).to(str))          // false
 
     // ---- chained casts: i8 -> i16 -> i32 -> f64 ----
     val start: i8 = -7
