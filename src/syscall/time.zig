@@ -91,29 +91,43 @@ const TimeErrorKind = enum(u8) {
 const TimeErrorFieldCount: usize = 4;
 
 /// 构造 TimeError 值（与 Glue error_newtype 布局一致，包含 __tag）
+///
+/// RC 语义：makeRecordWithNames 仅 memcpy 字段（窃取调用方引用，不主动 retain）。
+/// fromStringBytes 返回 RC=1，直接交给 record 窃取，无需额外 retain（否则泄漏）。
 fn makeTimeError(tctx: *ThreadContext, kind: TimeErrorKind, msg: []const u8, val: []const u8) SyscallError!Value {
     var fields: [TimeErrorFieldCount]Value = .{
         Value.fromI64(0), // fields[0] = __tag
         Value.fromU8(@intFromEnum(kind)), // fields[1] = kind
-        try Value.fromStringBytes(tctx, msg), // fields[2] = msg
-        try Value.fromStringBytes(tctx, val), // fields[3] = value
+        try Value.fromStringBytes(tctx, msg), // fields[2] = msg（RC=1，由 record 窃取）
+        try Value.fromStringBytes(tctx, val), // fields[3] = value（RC=1，由 record 窃取）
     };
-    _ = fields[2].retain();
-    _ = fields[3].retain();
     const field_names: [TimeErrorFieldCount]?[]const u8 = .{ "__tag", "kind", "msg", "value" };
-    return Value.makeRecordWithNames(tctx, "TimeError", &fields, &field_names) catch return error.OutOfMemory;
+    return Value.makeRecordWithNames(tctx, "TimeError", &fields, &field_names) catch {
+        // OOM：释放已分配的 msg/value Str（makeRecordWithNames 未窃取）
+        fields[2].release(tctx);
+        fields[3].release(tctx);
+        return error.OutOfMemory;
+    };
 }
 
 /// 构造 Throw.ok(value) 包装
+///
+/// RC 语义：窃取语义——makeThrow 直接 memcpy 窃取 v 的引用（RC=1）。
+/// 所有调用方均为 `return makeThrowOk(tctx, val)` 形式，不再使用 v，故无需 retain。
 fn makeThrowOk(tctx: *ThreadContext, v: Value) SyscallError!Value {
-    _ = v.retain();
-    return Value.makeThrow(tctx, .{ .ok = v }) catch return error.OutOfMemory;
+    return Value.makeThrow(tctx, .{ .ok = v }) catch {
+        v.release(tctx); // OOM：释放 v 避免泄漏
+        return error.OutOfMemory;
+    };
 }
 
 /// 构造 Throw.err(TimeError) 包装
+///
+/// RC 语义：err_val 为窃取语义（调用方转移所有权）。提取 msg 后立即释放 err_val record；
+/// makeError 返回 RC=1 的 ErrorValue，直接交 makeThrow 窃取，无需额外 retain。
 fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
     const err_obj = err_val.asRef();
-    _ = value.obj_header.retain(err_obj);
+    // 提取 msg（借用，不改变 RC）
     const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", err_obj));
     const msg_bytes = if (rec.fields.len > 2) switch (rec.fields[2]) {
         .ref => |o| if (o.type_tag == .str) blk: {
@@ -122,11 +136,21 @@ fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
         } else "",
         else => "",
     } else "";
-    const err_ev = Value.makeError(tctx, "time error", msg_bytes, true) catch return error.OutOfMemory;
-    _ = value.obj_header.retain(err_ev.asRef());
+    // 构造 ErrorValue（RC=1）
+    const err_ev = Value.makeError(tctx, "time error", msg_bytes, true) catch {
+        // OOM：释放 err_val（所有权已转移）
+        value.obj_header.release(err_obj, tctx);
+        return error.OutOfMemory;
+    };
+    // err_val 所有权已转移，释放 record（触发 deinit 释放其 msg/value 字段）
     value.obj_header.release(err_obj, tctx);
+    // makeThrow 窃取 err_ev 的 RC=1
     const err_val_ptr: *ErrorValue = @alignCast(@fieldParentPtr("header", err_ev.asRef()));
-    return Value.makeThrow(tctx, .{ .err = err_val_ptr }) catch return error.OutOfMemory;
+    return Value.makeThrow(tctx, .{ .err = err_val_ptr }) catch {
+        // OOM：释放 err_ev
+        value.obj_header.release(err_ev.asRef(), tctx);
+        return error.OutOfMemory;
+    };
 }
 
 // ──────────────────────────────────────────────
@@ -224,7 +248,8 @@ fn getLocalOffsetSec(io: std.Io) i64 {
     const ts = std.Io.Clock.real.now(io);
     const now_sec: std.c.time_t = @intCast(@divFloor(ts.nanoseconds, 1_000_000_000));
     var t: tm = undefined;
-    _ = localtime_r(&now_sec, &t);
+    // localtime_r 失败时返回 null，此时返回 0（UTC）避免读取未初始化内存
+    if (localtime_r(&now_sec, &t) == null) return 0;
     return @intCast(t.gmtoff);
 }
 
@@ -257,8 +282,10 @@ pub fn sleep_ns(io: std.Io, _: *ThreadContext, args: []const Value) SyscallError
     if (args.len != 1) return error.InvalidArgument;
     const ns = args[0].intCast(i128);
     if (ns <= 0) return Value.fromUnit();
-    // i96 最大值约 2.4e28 纳秒（~7.7e11 年），ns 不会溢出
-    const dur = std.Io.Duration.fromNanoseconds(@intCast(ns));
+    // fromNanoseconds 接受 u64（最大约 1.8e19 ns ≈ 584 年），
+    // i128 超出 u64 范围会导致 @intCast panic，钳位到 u64::MAX（约 584 年 sleep，实际无意义但安全）
+    const ns_clamped: u64 = if (ns > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(ns);
+    const dur = std.Io.Duration.fromNanoseconds(ns_clamped);
     std.Io.Clock.Duration.sleep(.{ .raw = dur, .clock = .awake }, io) catch {};
     return Value.fromUnit();
 }
@@ -284,6 +311,10 @@ pub fn systemtime_to_local_components(io: std.Io, tctx: *ThreadContext, args: []
     const offset_sec = getLocalOffsetSec(io);
     // 本地时间 = UTC + offset
     const local_ns = ns + @as(i128, offset_sec) * 1_000_000_000;
+    // std.time.epoch 仅支持 u64（1970 年后）；1970 年前的负秒数返回 epoch 0
+    if (local_ns < 0) {
+        return epochSecondsToComponents(tctx, 0, 0);
+    }
     const total_sec: u64 = @intCast(@divFloor(local_ns, 1_000_000_000));
     const sub_ns: u32 = @intCast(@mod(local_ns, 1_000_000_000));
     return epochSecondsToComponents(tctx, total_sec, sub_ns);
@@ -296,6 +327,10 @@ pub fn systemtime_to_utc_components(io: std.Io, tctx: *ThreadContext, args: []co
     _ = io;
     if (args.len != 1) return error.InvalidArgument;
     const ns = args[0].intCast(i128);
+    // std.time.epoch 仅支持 u64（1970 年后）；1970 年前的负秒数返回 epoch 0
+    if (ns < 0) {
+        return epochSecondsToComponents(tctx, 0, 0);
+    }
     const total_sec: u64 = @intCast(@divFloor(ns, 1_000_000_000));
     const sub_ns: u32 = @intCast(@mod(ns, 1_000_000_000));
     return epochSecondsToComponents(tctx, total_sec, sub_ns);
@@ -322,7 +357,15 @@ pub fn components_to_ns_utc(io: std.Io, tctx: *ThreadContext, args: []const Valu
         const err = try makeTimeError(tctx, .invalid_format, "components_to_ns_utc: field count mismatch", "");
         return makeThrowErr(tctx, err);
     }
-    const year: i32 = rec.fields[1].intCast(i32);
+    // year 先读为 i64 校验范围后再 @intCast(i32)，避免越界 year 直接 panic
+    const year_raw: i64 = rec.fields[1].intCast(i64);
+    if (year_raw < std.math.minInt(i32) or year_raw > std.math.maxInt(i32)) {
+        var buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "year={d}", .{year_raw}) catch "year out of range";
+        const err = try makeTimeError(tctx, .out_of_range, "components_to_ns_utc: year out of range", msg);
+        return makeThrowErr(tctx, err);
+    }
+    const year: i32 = @intCast(year_raw);
     const month: u8 = switch (rec.fields[2]) {
         .u8 => rec.fields[2].asU8(),
         else => 1,
@@ -360,6 +403,22 @@ pub fn components_to_ns_utc(io: std.Io, tctx: *ThreadContext, args: []const Valu
         const msg = std.fmt.bufPrint(&buf, "day={d}", .{day}) catch "day out of range";
         const err = try makeTimeError(tctx, .invalid_date_time, "components_to_ns_utc: day out of range", msg);
         return makeThrowErr(tctx, err);
+    }
+    // 校验 day 不超过该月实际天数（考虑闰年），避免 Feb 30 等非法日期通过验证
+    {
+        const leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
+        const max_day: u8 = switch (month) {
+            1, 3, 5, 7, 8, 10, 12 => 31,
+            4, 6, 9, 11 => 30,
+            2 => if (leap) 29 else 28,
+            else => 31, // month 已验证 1-12，不会到达
+        };
+        if (day > max_day) {
+            var buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "year={d} month={d} day={d}", .{ year, month, day }) catch "day out of range for month";
+            const err = try makeTimeError(tctx, .invalid_date_time, "components_to_ns_utc: day out of range for month", msg);
+            return makeThrowErr(tctx, err);
+        }
     }
     if (hour > 23 or minute > 59 or second > 59) {
         const err = try makeTimeError(tctx, .invalid_date_time, "components_to_ns_utc: time field out of range", "");

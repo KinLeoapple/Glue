@@ -1495,23 +1495,26 @@ pub const Engine = struct {
         };
     }
 
-    fn dispatchIntUnOpT(comptime tag: ScalarTag, kind: IntUnOpKind, a: [16]u8) [16]u8 {
+    fn dispatchIntUnOpT(comptime tag: ScalarTag, kind: IntUnOpKind, a: [16]u8) ?[16]u8 {
         const W = comptime scalar.byteWidth(tag);
         const ByteArrayT = scalar.ByteArray(tag);
         const a_bytes: ByteArrayT = a[0..W].*;
-        const result: ByteArrayT = switch (kind) {
+        const result: ?ByteArrayT = switch (kind) {
             .neg => ops.neg(tag, a_bytes),
-            .bit_not => ops.bitNot(tag, a_bytes),
+            .bit_not => @as(?ByteArrayT, ops.bitNot(tag, a_bytes)),
             .abs => blk: {
                 const T = scalar.NativeType(tag);
                 const av: T = @bitCast(a_bytes);
                 const r = if (@typeInfo(T).int.signedness == .signed) @abs(av) else av;
-                break :blk @bitCast(@as(T, @intCast(r)));
+                break :blk @as(?ByteArrayT, @bitCast(@as(T, @intCast(r))));
             },
         };
-        var out: [16]u8 = [_]u8{0} ** 16;
-        out[0..W].* = result;
-        return out;
+        if (result) |r| {
+            var out: [16]u8 = [_]u8{0} ** 16;
+            out[0..W].* = r;
+            return out;
+        }
+        return null;
     }
 
     /// 运行时 tag → comptime 分派：浮点一元运算
@@ -1525,21 +1528,24 @@ pub const Engine = struct {
         };
     }
 
-    fn dispatchFloatUnOpT(comptime tag: ScalarTag, kind: FloatUnOpKind, a: [16]u8) [16]u8 {
+    fn dispatchFloatUnOpT(comptime tag: ScalarTag, kind: FloatUnOpKind, a: [16]u8) ?[16]u8 {
         const W = comptime scalar.byteWidth(tag);
         const ByteArrayT = scalar.ByteArray(tag);
         const a_bytes: ByteArrayT = a[0..W].*;
-        const result: ByteArrayT = switch (kind) {
+        const result: ?ByteArrayT = switch (kind) {
             .neg => ops.neg(tag, a_bytes),
             .abs => blk: {
                 const T = scalar.NativeType(tag);
                 const av: T = @bitCast(a_bytes);
-                break :blk @bitCast(@abs(av));
+                break :blk @as(?ByteArrayT, @bitCast(@abs(av)));
             },
         };
-        var out: [16]u8 = [_]u8{0} ** 16;
-        out[0..W].* = result;
-        return out;
+        if (result) |r| {
+            var out: [16]u8 = [_]u8{0} ** 16;
+            out[0..W].* = r;
+            return out;
+        }
+        return null;
     }
 
     /// 运行时 tag → comptime 分派：比较运算
@@ -3160,9 +3166,21 @@ pub const Engine = struct {
                 const a = self.runtime.readScalarAt(comptime_tag, left_chan);
                 const b = self.runtime.readScalarAt(comptime_tag, right_chan);
                 const result: T = switch (kind) {
-                    .add => a +% b,
-                    .sub => a -% b,
-                    .mul => a *% b,
+                    .add => blk: {
+                        const r, const overflow = @addWithOverflow(a, b);
+                        if (overflow != 0) return error.Overflow;
+                        break :blk r;
+                    },
+                    .sub => blk: {
+                        const r, const overflow = @subWithOverflow(a, b);
+                        if (overflow != 0) return error.Overflow;
+                        break :blk r;
+                    },
+                    .mul => blk: {
+                        const r, const overflow = @mulWithOverflow(a, b);
+                        if (overflow != 0) return error.Overflow;
+                        break :blk r;
+                    },
                     .div => blk: {
                         if (b == 0) return error.DivisionByZero;
                         break :blk @divTrunc(a, b);
@@ -3200,10 +3218,17 @@ pub const Engine = struct {
                 const a = self.runtime.readScalarAt(comptime_tag, left_chan);
                 const b = self.runtime.readScalarAt(comptime_tag, right_chan);
                 const max_bits = @bitSizeOf(T);
-                const raw = @as(u64, @intCast(if (b < 0) 0 else b));
+                // b 可能是 i128/u128，值 >= 2^64 时 @intCast 到 u64 会 panic。
+                // 先检查移位量是否 >= 位宽（>= 位宽时结果为 0），再安全窄化。
+                const b_val = if (b < 0) 0 else b;
+                if (b_val >= max_bits) {
+                    self.runtime.writeScalarAt(comptime_tag, node.output, 0);
+                    return;
+                }
+                const raw: u64 = @intCast(b_val);
                 const result: T = switch (kind) {
-                    .shl => if (raw >= max_bits) 0 else a << @intCast(raw),
-                    .shr => if (raw >= max_bits) 0 else a >> @intCast(raw),
+                    .shl => a << @intCast(raw),
+                    .shr => a >> @intCast(raw),
                 };
                 self.runtime.writeScalarAt(comptime_tag, node.output, result);
             },
@@ -3228,13 +3253,20 @@ pub const Engine = struct {
                 const T = scalar.NativeType(comptime_tag);
                 const a = self.runtime.readScalarAt(comptime_tag, input_chan);
                 const result: T = switch (kind) {
-                    .neg => 0 -% a,
+                    .neg => blk: {
+                        const r, const overflow = @subWithOverflow(@as(T, 0), a);
+                        if (overflow != 0) return error.Overflow;
+                        break :blk r;
+                    },
                     .abs => blk: {
                         const ti = @typeInfo(T).int;
-                        break :blk if (ti.signedness == .signed)
-                            @as(T, @intCast(@abs(a)))
-                        else
-                            a;
+                        if (ti.signedness == .signed) {
+                            // iN::MIN 的绝对值超出正数范围，溢出报错（与 neg 一致）
+                            if (a == std.math.minInt(T)) return error.Overflow;
+                            break :blk @intCast(@abs(a));
+                        } else {
+                            break :blk a;
+                        }
                     },
                     .bit_not => ~a,
                 };
@@ -3268,11 +3300,14 @@ pub const Engine = struct {
                     .add => a + b,
                     .sub => a - b,
                     .mul => a * b,
-                    // IEEE 754: 浮点除以 0 返回 ±inf（不抛出错误）
                     .div => a / b,
-                    // IEEE 754: 浮点 mod 0 返回 NaN（不抛出错误）
                     .mod => @rem(a, b),
                 };
+                // NaN 是无定义结果（如 0.0/0.0、@rem(a,0)），触发错误；
+                // Inf 是 IEEE 754 合法极值（如 1.0/0.0），保持标准行为
+                if (std.math.isNan(result)) {
+                    return error.Overflow;
+                }
                 self.runtime.writeScalarAt(comptime_tag, node.output, result);
             },
             else => return error.UnsupportedOp,
@@ -4363,8 +4398,12 @@ pub const Engine = struct {
     /// 递归跟踪值及其所有子引用对象
     /// 用于深拷贝后注册所有新建堆对象：shutdown_mode 下 deinit 跳过级联 release，
     /// 未跟踪的子对象（Str、Array、Record 等）会泄漏其页池页
+    /// 注意：必须在 trackObj 之前检查 isTracked，避免对自引用闭包/循环引用无限递归
     fn trackValueTree(self: *Engine, v: value.Value) EngineError!void {
         if (v != .ref) return;
+        // 已跟踪的对象直接返回，避免循环引用导致的无限递归
+        // （子树在首次跟踪时已完整递归，无需重复）
+        if (v.ref.isTracked()) return;
         try self.trackObj(v.ref);
         // 递归跟踪复合类型的子引用
         switch (v.ref.type_tag) {
@@ -4529,8 +4568,10 @@ pub const Engine = struct {
         const use_arena = self.currentFuncUseArena();
         const v = if (use_arena) blk: {
             // arena 分配：header + elements 连续，均从 ShadowArena 分配
-            const elems_size = n * @sizeOf(value.Value);
-            const total = @sizeOf(value.ArrayValue) + elems_size;
+            // n 极大时 n*sizeOf(Value) 和 +sizeOf(ArrayValue) 会溢出 usize，
+            // 导致分配小缓冲后越界写入。用 std.math.mul/add 检测溢出返回 OOM。
+            const elems_size = std.math.mul(usize, n, @sizeOf(value.Value)) catch return error.OutOfMemory;
+            const total = std.math.add(usize, @sizeOf(value.ArrayValue), elems_size) catch return error.OutOfMemory;
             const arena_mem = self.tctx.?.allocObjArena(total) catch return error.OutOfMemory;
             const arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
@@ -4586,10 +4627,17 @@ pub const Engine = struct {
         const new_len = old_len + 1;
         const use_arena = arr.header.isArenaAllocated();
         const new_size = new_len * @sizeOf(value.Value);
+        // alloc 失败时必须释放已克隆的 copied，避免泄漏
         const buf = if (use_arena)
-            self.tctx.?.allocObjArena(new_size) catch return error.OutOfMemory
+            self.tctx.?.allocObjArena(new_size) catch {
+                copied.release(self.tctx.?);
+                return error.OutOfMemory;
+            }
         else
-            self.tctx.?.allocObj(new_size) catch return error.OutOfMemory;
+            self.tctx.?.allocObj(new_size) catch {
+                copied.release(self.tctx.?);
+                return error.OutOfMemory;
+            };
         const new_elements: []value.Value = @as([*]value.Value, @ptrCast(@alignCast(buf.ptr)))[0..new_len];
         @memcpy(new_elements[0..old_len], arr.elements);
         new_elements[old_len] = copied;
@@ -4614,6 +4662,13 @@ pub const Engine = struct {
         const new_elements = self.tctx.?.backing.alloc(value.Value, new_len) catch return error.OutOfMemory;
         defer self.tctx.?.backing.free(new_elements);
         var i: usize = 0;
+        // 元素所有权未转移给新数组前（clone 失败或 makeArrayEx/arena 失败），需释放已克隆元素
+        var elements_consumed = false;
+        errdefer {
+            if (!elements_consumed) {
+                for (new_elements[0..i]) |elem| elem.release(self.tctx.?);
+            }
+        }
         for (left.elements) |elem| {
             new_elements[i] = try self.cloneValueForContainer(elem, elem_is_ref);
             i += 1;
@@ -4636,6 +4691,8 @@ pub const Engine = struct {
             break :blk value.Value.fromRef(&arr.header);
         } else
             value.Value.makeArrayEx(self.tctx.?, new_elements, null, elem_is_ref) catch return error.OutOfMemory;
+        // makeArrayEx/arena 成功，元素所有权已转移给新数组 v，失败时不再释放 new_elements
+        elements_consumed = true;
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
     }
@@ -4652,15 +4709,22 @@ pub const Engine = struct {
 
         const use_arena = self.currentFuncUseArena();
         const v = if (use_arena) blk: {
-            const elems_size = n * @sizeOf(value.Value);
-            const total = @sizeOf(value.ArrayValue) + elems_size;
+            // n 极大时 n*sizeOf(Value) 和 +sizeOf(ArrayValue) 会溢出 usize，
+            // 导致分配小缓冲后越界写入。用 std.math.mul/add 检测溢出返回 OOM。
+            const elems_size = std.math.mul(usize, n, @sizeOf(value.Value)) catch return error.OutOfMemory;
+            const total = std.math.add(usize, @sizeOf(value.ArrayValue), elems_size) catch return error.OutOfMemory;
             const arena_mem = self.tctx.?.allocObjArena(total) catch return error.OutOfMemory;
             const arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
-            // 按元素类型语义逐个填充
+            // 按元素类型语义逐个填充；失败时释放已克隆元素（arena 内存由 reset 回收，但堆引用需 release）
+            var filled: usize = 0;
+            errdefer {
+                for (elems_ptr[0..filled]) |elem| elem.release(self.tctx.?);
+            }
             if (n > 0) {
                 for (0..n) |j| {
                     elems_ptr[j] = try self.cloneValueForContainer(fill_value, elem_is_ref);
+                    filled = j + 1;
                 }
             }
             arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null, .elem_is_ref = elem_is_ref };
@@ -4670,9 +4734,15 @@ pub const Engine = struct {
             // 非 arena 路径：先分配临时数组，按元素类型语义填充
             const tmp = self.tctx.?.backing.alloc(value.Value, n) catch return error.OutOfMemory;
             defer self.tctx.?.backing.free(tmp);
+            var filled: usize = 0;
+            errdefer {
+                for (tmp[0..filled]) |elem| elem.release(self.tctx.?);
+            }
             for (0..n) |j| {
                 tmp[j] = try self.cloneValueForContainer(fill_value, elem_is_ref);
+                filled = j + 1;
             }
+            // makeArrayEx 拷贝 tmp 到自有缓冲区；失败时 errdefer 释放 tmp 元素
             break :blk value.Value.makeArrayEx(self.tctx.?, tmp, null, elem_is_ref) catch return error.OutOfMemory;
         };
         try self.trackObj(v.asRef());
@@ -4703,8 +4773,17 @@ pub const Engine = struct {
         const elem_is_ref = arr.elem_is_ref;
         const new_elements = self.tctx.?.backing.alloc(value.Value, new_len) catch return error.OutOfMemory;
         defer self.tctx.?.backing.free(new_elements);
-        for (arr.elements[s..e], 0..) |elem, j| {
+        var j: usize = 0;
+        // 元素所有权未转移给新数组前（clone 失败或 makeArrayEx/arena 失败），需释放已克隆元素
+        var elements_consumed = false;
+        errdefer {
+            if (!elements_consumed) {
+                for (new_elements[0..j]) |elem| elem.release(self.tctx.?);
+            }
+        }
+        for (arr.elements[s..e]) |elem| {
             new_elements[j] = try self.cloneValueForContainer(elem, elem_is_ref);
+            j += 1;
         }
 
         const use_arena = self.currentFuncUseArena();
@@ -4720,6 +4799,8 @@ pub const Engine = struct {
             break :blk value.Value.fromRef(&new_arr.header);
         } else
             value.Value.makeArrayEx(self.tctx.?, new_elements, null, elem_is_ref) catch return error.OutOfMemory;
+        // makeArrayEx/arena 成功，元素所有权已转移给新数组 v，失败时不再释放 new_elements
+        elements_consumed = true;
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
     }
@@ -4810,18 +4891,25 @@ pub const Engine = struct {
         const last_idx = arr.elements.len - 1;
         const v = arr.elements[last_idx];
         const new_len = last_idx;
+        // arena 数组扩容/缩容与 push 保持一致：arena 分配新 elements，旧 elements 由 reset 回收
+        const use_arena = arr.header.isArenaAllocated();
         if (new_len == 0) {
-            if (arr.elements.len > 0) {
+            if (!use_arena and arr.elements.len > 0) {
                 self.tctx.?.freeObj(@ptrCast(arr.elements.ptr));
             }
             arr.elements = &.{};
             arr.capacity = 0;
         } else {
-            // 通过 tctx.allocObj 分配（与 makeArray 一致，由 freeObj 释放）
-            const buf = self.tctx.?.allocObj(new_len * @sizeOf(value.Value)) catch return error.OutOfMemory;
+            const new_size = new_len * @sizeOf(value.Value);
+            const buf = if (use_arena)
+                self.tctx.?.allocObjArena(new_size) catch return error.OutOfMemory
+            else
+                self.tctx.?.allocObj(new_size) catch return error.OutOfMemory;
             const new_elements: []value.Value = @as([*]value.Value, @ptrCast(@alignCast(buf.ptr)))[0..new_len];
             @memcpy(new_elements, arr.elements[0..new_len]);
-            self.tctx.?.freeObj(@ptrCast(arr.elements.ptr));
+            if (!use_arena) {
+                self.tctx.?.freeObj(@ptrCast(arr.elements.ptr));
+            }
             arr.elements = new_elements;
             arr.capacity = new_len;
         }
@@ -4868,6 +4956,8 @@ pub const Engine = struct {
             byte_pos += utf8SeqLen(bytes[byte_pos]);
             char_idx += 1;
         }
+        // end 超出字符数时报错（与 start 越界行为一致），而非静默截断到字符串末尾
+        if (char_idx != end_idx) return error.Overflow;
         const end_byte = byte_pos;
         // 创建子字符串
         const sub_bytes = bytes[start_byte..end_byte];
@@ -4890,8 +4980,10 @@ pub const Engine = struct {
         }
         const use_arena = self.currentFuncUseArena();
         const v = if (use_arena) blk: {
-            const elems_size = n * @sizeOf(value.Value);
-            const total = @sizeOf(value.ArrayValue) + elems_size;
+            // n 极大时 n*sizeOf(Value) 和 +sizeOf(ArrayValue) 会溢出 usize，
+            // 导致分配小缓冲后越界写入。用 std.math.mul/add 检测溢出返回 OOM。
+            const elems_size = std.math.mul(usize, n, @sizeOf(value.Value)) catch return error.OutOfMemory;
+            const total = std.math.add(usize, @sizeOf(value.ArrayValue), elems_size) catch return error.OutOfMemory;
             const arena_mem = self.tctx.?.allocObjArena(total) catch return error.OutOfMemory;
             const arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
@@ -6154,21 +6246,33 @@ pub const Engine = struct {
                 const end = try self.readIntAsI64(node.inputs[1]);
                 // _pad=1 标记 inclusive range（..=）：count = end - start + 1
                 const inclusive = (node._pad & 1) != 0;
-                const range_end: i64 = if (inclusive) end + 1 else end;
-                const count: u32 = if (range_end > start) @intCast(range_end - start) else 0;
+                // inclusive 的 end+1 在 end == maxInt(i64) 时溢出（safe panic / fast wrap），
+                // 用 std.math.add 检测溢出后 clamp 到 maxInt(i64)
+                const range_end: i64 = if (inclusive)
+                    std.math.add(i64, end, 1) catch std.math.maxInt(i64)
+                else
+                    end;
+                // 跨度超 u32 范围时 clamp 到 maxInt(u32)（allocVector 上限 u32）
+                const count: u32 = if (range_end > start) blk: {
+                    const span = range_end - start;
+                    if (span > std.math.maxInt(u32)) break :blk std.math.maxInt(u32);
+                    break :blk @intCast(span);
+                } else 0;
                 try self.runtime.allocVector(node.output, count);
                 const elem_type = vm.elem_type;
                 for (0..count) |i| {
                     const val = start + @as(i64, @intCast(i));
                     const elem_ptr = self.runtime.vectorElemPtr(node.output, i);
+                    // val 超出窄类型范围时 clamp 到边界，避免 @intCast panic
+                    // （range 范围超出元素类型属类型错误，sema 应拦截；运行时防御性 clamp）
                     switch (elem_type) {
-                        .i8_chan => @as(*i8, @ptrCast(@alignCast(elem_ptr))).* = @intCast(val),
-                        .i16_chan => @as(*i16, @ptrCast(@alignCast(elem_ptr))).* = @intCast(val),
-                        .i32_chan => @as(*i32, @ptrCast(@alignCast(elem_ptr))).* = @intCast(val),
+                        .i8_chan => @as(*i8, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, std.math.minInt(i8), std.math.maxInt(i8))),
+                        .i16_chan => @as(*i16, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, std.math.minInt(i16), std.math.maxInt(i16))),
+                        .i32_chan => @as(*i32, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, std.math.minInt(i32), std.math.maxInt(i32))),
                         .i64_chan => @as(*i64, @ptrCast(@alignCast(elem_ptr))).* = val,
-                        .u8_chan => @as(*u8, @ptrCast(@alignCast(elem_ptr))).* = @intCast(val),
-                        .u16_chan => @as(*u16, @ptrCast(@alignCast(elem_ptr))).* = @intCast(val),
-                        .u32_chan => @as(*u32, @ptrCast(@alignCast(elem_ptr))).* = @intCast(val),
+                        .u8_chan => @as(*u8, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, 0, std.math.maxInt(u8))),
+                        .u16_chan => @as(*u16, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, 0, std.math.maxInt(u16))),
+                        .u32_chan => @as(*u32, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, 0, std.math.maxInt(u32))),
                         .u64_chan => @as(*u64, @ptrCast(@alignCast(elem_ptr))).* = @bitCast(val),
                         else => return error.UnsupportedOp,
                     }
@@ -7438,7 +7542,10 @@ pub const Engine = struct {
     /// vec_take：取前 N 个元素
     fn execVecTake(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
-        const n: u32 = @intCast(@max(0, try self.readIntAsI64(node.inputs[1])));
+        // n 超 u32 范围时 @intCast 会 panic，clamp 到 u32::max（take 语义取前 n 个，
+        // 实际会被 @min(n, count) 限制，clamp 不影响正确性）
+        const n_raw = @max(0, try self.readIntAsI64(node.inputs[1]));
+        const n: u32 = if (n_raw > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(n_raw);
         const count = self.runtime.vectorLen(src_chan);
         const take = @min(n, count);
         try self.runtime.allocVector(node.output, take);
@@ -7618,8 +7725,35 @@ pub const Engine = struct {
             .usize => |b| @bitCast(@as(usize, @bitCast(b))),
             .boolean => |b| @intFromBool(b[0] != 0),
             .char => |b| @as(i64, @intCast(@as(u32, @bitCast(b)))),
-            .f32 => |b| @intFromFloat(@as(f32, @bitCast(b))),
-            .f64 => |b| @intFromFloat(@as(f64, @bitCast(b))),
+            // i128/u128 超出 i64 范围时返回 error.Overflow，而非静默归零（else 分支）
+            .i128 => |b| blk: {
+                const val: i128 = @bitCast(b);
+                if (val < std.math.minInt(i64) or val > std.math.maxInt(i64)) break :blk error.Overflow;
+                break :blk @intCast(val);
+            },
+            .u128 => |b| blk: {
+                const val: u128 = @bitCast(b);
+                if (val > std.math.maxInt(i64)) break :blk error.Overflow;
+                break :blk @intCast(val);
+            },
+            // 浮点转整数：NaN/Inf/超范围时 @intFromFloat 会 panic，先校验
+            .f32 => |b| blk: {
+                const val: f32 = @bitCast(b);
+                if (std.math.isNan(val) or std.math.isInf(val)) break :blk error.Overflow;
+                // maxInt(i64) 超出 f32 精确表示范围，用 @floatFromInt 显式转换（允许精度损失）
+                const i64_min: f32 = @floatFromInt(std.math.minInt(i64));
+                const i64_max: f32 = @floatFromInt(std.math.maxInt(i64));
+                if (val < i64_min or val > i64_max) break :blk error.Overflow;
+                break :blk @intFromFloat(val);
+            },
+            .f64 => |b| blk: {
+                const val: f64 = @bitCast(b);
+                if (std.math.isNan(val) or std.math.isInf(val)) break :blk error.Overflow;
+                const i64_min: f64 = @floatFromInt(std.math.minInt(i64));
+                const i64_max: f64 = @floatFromInt(std.math.maxInt(i64));
+                if (val < i64_min or val > i64_max) break :blk error.Overflow;
+                break :blk @intFromFloat(val);
+            },
             else => 0,
         };
     }
@@ -8500,8 +8634,10 @@ pub const Engine = struct {
         handle.* = value.AsyncHandle.init();
         try self.trackObj(&handle.header);
 
-        // 读取参数值：标量按 i64 传递，ref_chan 传递原始对象指针由 worker 深拷贝
-        var args: [4]i64 = .{ 0, 0, 0, 0 };
+        // 读取参数值：标量按原始字节拷贝（保留完整位模式，支持 f16..f128/i128），
+        // ref_chan 传递原始对象指针由 worker 深拷贝
+        var arg_bytes: [4][16]u8 = std.mem.zeroes([4][16]u8);
+        var arg_widths: [4]u8 = .{ 0, 0, 0, 0 };
         var arg_objs: [4]?*value.obj_header.ObjHeader = .{ null, null, null, null };
         const arg_count = @min(om.arg_count, 4);
         for (0..arg_count) |i| {
@@ -8510,7 +8646,12 @@ pub const Engine = struct {
                 const v = self.chanToValue(node.inputs[i]);
                 arg_objs[i] = if (v == .ref) v.ref else null;
             } else {
-                args[i] = try self.readIntAsI64(node.inputs[i]);
+                const w = arg_meta.elem_width;
+                arg_widths[i] = w;
+                if (w > 0) {
+                    const src = self.runtime.rawPtr(node.inputs[i]);
+                    @memcpy(arg_bytes[i][0..w], src[0..w]);
+                }
             }
         }
 
@@ -8524,7 +8665,8 @@ pub const Engine = struct {
         thread_data.* = .{
             .ir = self.ir,
             .func_idx = om.func_index,
-            .args = args,
+            .arg_bytes = arg_bytes,
+            .arg_widths = arg_widths,
             .arg_objs = arg_objs,
             .arg_count = arg_count,
             .handle = handle,
@@ -9064,8 +9206,11 @@ pub const Engine = struct {
 const OrbitThreadData = struct {
     ir: *GlueIR,
     func_idx: u16,
-    /// 标量参数（按 i64 传递）
-    args: [4]i64,
+    /// 标量参数的原始字节（最大 16B，覆盖 i128/f128），
+    /// 直接拷贝位模式避免 readIntAsI64 对 float/i128 的类型转换损坏
+    arg_bytes: [4][16]u8,
+    /// 每个标量参数的字节宽度（0 表示该参数为 ref_chan，用 arg_objs）
+    arg_widths: [4]u8,
     /// ref_chan 参数的原始对象指针（由 worker 深拷贝到其本地 tctx）
     arg_objs: [4]?*value.obj_header.ObjHeader,
     arg_count: u8,
@@ -9111,12 +9256,23 @@ fn orbitWorker(data: *OrbitThreadData) void {
             if (data.arg_objs[i]) |obj| {
                 // 跨线程值语义：普通复合类型深拷贝到 worker tctx，channel/atomic 等 retain 共享
                 const v = value.Value{ .ref = obj };
-                const copied = v.deepCopy(&tctx) catch value.Value.fromNull();
+                const copied = v.deepCopy(&tctx) catch {
+                    engine.deinit();
+                    tctx.deinit();
+                    alloc.destroy(data);
+                    handle.setPanic("deepCopy failed for async argument");
+                    return;
+                };
                 engine.trackValueTree(copied) catch {};
                 engine.writeScalarValue(dst_chan, copied);
             }
         } else {
-            engine.runtime.writeI64(dst_chan, data.args[i]);
+            // 按原始字节宽度写回，保留完整位模式（f16..f128/i128 等）
+            const w = data.arg_widths[i];
+            if (w > 0) {
+                const dst = engine.runtime.rawPtr(dst_chan);
+                @memcpy(dst[0..w], data.arg_bytes[i][0..w]);
+            }
         }
     }
 
@@ -9133,10 +9289,18 @@ fn orbitWorker(data: *OrbitThreadData) void {
 
     // 值语义：普通复合类型结果跨线程深拷贝，使其在 worker deinit 后仍然有效
     const result_meta = data.ir.channels.get(result_chan);
-    const out_result = if (result_meta.chan_type == .ref_chan and !result_meta.is_ref)
-        result_val.deepCopy(&tctx) catch value.Value.fromNull()
-    else
-        result_val;
+    const out_result = blk: {
+        if (result_meta.chan_type == .ref_chan and !result_meta.is_ref) {
+            break :blk result_val.deepCopy(&tctx) catch {
+                engine.deinit();
+                tctx.deinit();
+                alloc.destroy(data);
+                handle.setPanic("deepCopy failed for async result");
+                return;
+            };
+        }
+        break :blk result_val;
+    };
 
     // 先清理所有资源（engine + tctx + data），再设置结果（setResult 会解除主线程 join() 阻塞）
     // 这样主线程在 join() 返回时，worker 的所有分配已释放，避免泄漏检测竞态

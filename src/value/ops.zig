@@ -22,46 +22,58 @@ pub inline fn pack(comptime tag: ScalarTag, val: NativeType(tag)) ByteArray(tag)
 
 // ── 算术运算 ──
 
-/// 泛型加法
-pub fn add(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ByteArray(tag) {
+/// 泛型加法（整数溢出返回 null，与文档"溢出 panic"语义一致）
+pub fn add(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ?ByteArray(tag) {
     const T = NativeType(tag);
     const av: T = @bitCast(a);
     const bv: T = @bitCast(b);
     const result = switch (@typeInfo(T)) {
-        .int => av +% bv,
-        .float => av + bv,
-        .bool => av or bv,
+        .int => blk: {
+            const r, const overflow = @addWithOverflow(av, bv);
+            if (overflow != 0) break :blk null;
+            break :blk @as(?T, r);
+        },
+        .float => @as(?T, av + bv),
+        .bool => @as(?T, av or bv),
         else => @compileError("unsupported type for add"),
     };
-    return @bitCast(result);
+    return if (result) |r| @bitCast(r) else null;
 }
 
-/// 泛型减法
-pub fn sub(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ByteArray(tag) {
+/// 泛型减法（整数溢出返回 null）
+pub fn sub(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ?ByteArray(tag) {
     const T = NativeType(tag);
     const av: T = @bitCast(a);
     const bv: T = @bitCast(b);
     const result = switch (@typeInfo(T)) {
-        .int => av -% bv,
-        .float => av - bv,
-        .bool => av and !bv,
+        .int => blk: {
+            const r, const overflow = @subWithOverflow(av, bv);
+            if (overflow != 0) break :blk null;
+            break :blk @as(?T, r);
+        },
+        .float => @as(?T, av - bv),
+        .bool => @as(?T, av and !bv),
         else => @compileError("unsupported type for sub"),
     };
-    return @bitCast(result);
+    return if (result) |r| @bitCast(r) else null;
 }
 
-/// 泛型乘法
-pub fn mul(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ByteArray(tag) {
+/// 泛型乘法（整数溢出返回 null）
+pub fn mul(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ?ByteArray(tag) {
     const T = NativeType(tag);
     const av: T = @bitCast(a);
     const bv: T = @bitCast(b);
     const result = switch (@typeInfo(T)) {
-        .int => av *% bv,
-        .float => av * bv,
-        .bool => av and bv,
+        .int => blk: {
+            const r, const overflow = @mulWithOverflow(av, bv);
+            if (overflow != 0) break :blk null;
+            break :blk @as(?T, r);
+        },
+        .float => @as(?T, av * bv),
+        .bool => @as(?T, av and bv),
         else => @compileError("unsupported type for mul"),
     };
-    return @bitCast(result);
+    return if (result) |r| @bitCast(r) else null;
 }
 
 /// 泛型除法（整数除零返回 null，浮点除零按 IEEE 754 处理）
@@ -77,29 +89,33 @@ pub fn div(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ?ByteA
     return if (result) |r| @bitCast(r) else null;
 }
 
-/// 泛型取模（整数专用，除零返回 null）
+/// 泛型取模（整数除零返回 null，浮点统一用 @rem 跟随被除数符号）
 pub fn mod(comptime tag: ScalarTag, a: ByteArray(tag), b: ByteArray(tag)) ?ByteArray(tag) {
     const T = NativeType(tag);
     const av: T = @bitCast(a);
     const bv: T = @bitCast(b);
     const result = switch (@typeInfo(T)) {
         .int => if (bv == 0) null else @as(?T, @rem(av, bv)),
-        .float => @as(?T, @mod(av, bv)),
+        .float => @as(?T, @rem(av, bv)),
         else => @compileError("unsupported type for mod"),
     };
     return if (result) |r| @bitCast(r) else null;
 }
 
-/// 泛型取负
-pub fn neg(comptime tag: ScalarTag, a: ByteArray(tag)) ByteArray(tag) {
+/// 泛型取负（整数 iN::MIN 溢出返回 null）
+pub fn neg(comptime tag: ScalarTag, a: ByteArray(tag)) ?ByteArray(tag) {
     const T = NativeType(tag);
     const av: T = @bitCast(a);
     const result = switch (@typeInfo(T)) {
-        .int => -%av,
-        .float => -av,
+        .int => blk: {
+            const r, const overflow = @subWithOverflow(@as(T, 0), av);
+            if (overflow != 0) break :blk null;
+            break :blk @as(?T, r);
+        },
+        .float => @as(?T, -av),
         else => @compileError("unsupported type for neg"),
     };
-    return @bitCast(result);
+    return if (result) |r| @bitCast(r) else null;
 }
 
 // ── 位运算（整数专用）──

@@ -52,9 +52,11 @@ pub const DebugAllocator = struct {
         if (self.verbose) {
             std.debug.print("[GLUE_GPA] LEAK: {} allocations\n", .{leaked_count});
             var it = self.alloc_map.iterator();
-            if (it.next()) |entry| {
+            var idx: usize = 0;
+            while (it.next()) |entry| {
                 const rec = entry.value_ptr.*;
-                std.debug.print("[GLUE_GPA]   first: addr=0x{x} len={} ret_addr=0x{x}\n", .{ entry.key_ptr.*, rec.len, rec.ret_addr });
+                std.debug.print("[GLUE_GPA]   [{d}] addr=0x{x} len={} ret_addr=0x{x}\n", .{ idx, entry.key_ptr.*, rec.len, rec.ret_addr });
+                idx += 1;
             }
         }
         self.alloc_map.deinit();

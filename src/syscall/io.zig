@@ -18,7 +18,6 @@ const value = @import("value");
 const Value = value.Value;
 const ThreadContext = value.obj_header.ThreadContext;
 const ErrorValue = value.ErrorValue;
-const AdtField = value.AdtField;
 const syscall_mod = @import("mod.zig");
 const SyscallError = syscall_mod.SyscallError;
 
@@ -143,68 +142,97 @@ fn errToKind(err: anyerror) IOErrorKind {
     };
 }
 
-/// 构造 IOError 值（ADT 单构造器，4 字段：kind/msg/os_err/path）
+/// 构造 IOError 值（error_newtype，布局：__tag + 4 个用户字段）
 ///
-/// IOError 是 error_newtype，构造器名 = 类型名 "IOError"，
-/// 字段位置参数别名 _0.._3，按 spec 顺序 kind/msg/os_err/path。
+/// IOError 是 error_newtype，IR 编译器注册 field_id：__tag=0, kind=1, msg=2, os_err=3, path=4。
+/// 必须用 makeRecordWithNames 构造 RecordValue（含 __tag），与 time.zig 保持一致。
+///
+/// RC 语义：makeRecordWithNames 仅 memcpy 字段（窃取调用方引用，不主动 retain）。
+/// fromStringBytes 返回 RC=1，直接交给 record 窃取，无需额外 retain（否则泄漏）。
 fn makeIOError(tctx: *ThreadContext, kind: IOErrorKind, msg: []const u8, os_err: i32, path: ?[]const u8) SyscallError!Value {
-    var fields: [4]AdtField = .{
-        .{ .name = "kind", .value = Value.fromU8(@intFromEnum(kind)) },
-        .{ .name = "msg", .value = try Value.fromStringBytes(tctx, msg) },
-        .{ .name = "os_err", .value = Value.fromI32(os_err) },
-        .{ .name = "path", .value = if (path) |p| try Value.fromStringBytes(tctx, p) else Value.fromNull() },
+    var fields: [5]Value = .{
+        Value.fromI64(0), // fields[0] = __tag（error_newtype 固定 0）
+        Value.fromU8(@intFromEnum(kind)), // fields[1] = kind
+        try Value.fromStringBytes(tctx, msg), // fields[2] = msg（RC=1，由 record 窃取）
+        Value.fromI32(os_err), // fields[3] = os_err
+        if (path) |p| try Value.fromStringBytes(tctx, p) else Value.fromNull(), // fields[4] = path（RC=1，由 record 窃取）
     };
-    // msg/path 已分配新堆对象，需 retain 后传入 makeAdt（makeAdt 不主动 retain）
-    _ = fields[1].value.retain();
-    if (path != null) _ = fields[3].value.retain();
-    return Value.makeAdt(tctx, "IOError", "IOError", &fields) catch return error.OutOfMemory;
+    const field_names: [5]?[]const u8 = .{ "__tag", "kind", "msg", "os_err", "path" };
+    return Value.makeRecordWithNames(tctx, "IOError", &fields, &field_names) catch {
+        // OOM：释放已分配的 msg/path Str（makeRecordWithNames 未窃取）
+        fields[2].release(tctx);
+        if (path != null) fields[4].release(tctx);
+        return error.OutOfMemory;
+    };
 }
 
 /// 构造 Throw.ok(value) 包装
+///
+/// RC 语义：窃取语义——makeThrow 直接 memcpy 窃取 v 的引用（RC=1）。
+/// 所有调用方均为 `return makeThrowOk(tctx, val)` 形式，不再使用 v，故无需 retain。
+/// 标量参数 retain 本就是 no-op；堆对象参数避免 retain 后泄漏 1 个引用。
 fn makeThrowOk(tctx: *ThreadContext, v: Value) SyscallError!Value {
-    _ = v.retain();
-    return Value.makeThrow(tctx, .{ .ok = v }) catch return error.OutOfMemory;
+    return Value.makeThrow(tctx, .{ .ok = v }) catch {
+        v.release(tctx); // OOM：释放 v 避免泄漏
+        return error.OutOfMemory;
+    };
 }
 
 /// 构造 Throw.err(IOError) 包装
+///
+/// IOError 现在是 RecordValue（含 __tag），msg 在 fields[2]。
+/// 从 RecordValue 提取 msg 后构造 ErrorValue，包装为 Throw.err。
+///
+/// RC 语义：err_val 为窃取语义（调用方转移所有权）。提取 msg 后立即释放 err_val record；
+/// makeError 返回 RC=1 的 ErrorValue，直接交 makeThrow 窃取，无需额外 retain。
 fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
-    // err_val 是 IOError ADT 对象（ref），需取 header 并 retain
     const err_obj = err_val.asRef();
-    _ = value.obj_header.retain(err_obj);
-    // 取 ErrorValue：IOError 是 error_newtype，本身即 ErrorValue 的子类型
-    // 但 ADT 值与 ErrorValue 是不同 ObjHeader 类型，此处 err_val 是 ADT 而非 ErrorValue
-    // 设计上：ThrowValue.err 需 *ErrorValue，而 IOError ADT 需进一步包装为 ErrorValue
-    // 为简化：将 IOError ADT 的描述信息拷贝到新 ErrorValue
-    const adt: *value.AdtValue = @alignCast(@fieldParentPtr("header", err_obj));
-    const msg_bytes = if (adt.fields.len > 1) switch (adt.fields[1].value) {
+    // 提取 msg（借用，不改变 RC）
+    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", err_obj));
+    const msg_bytes = if (rec.fields.len > 2) switch (rec.fields[2]) {
         .ref => |o| if (o.type_tag == .str) blk: {
             const s: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", o));
             break :blk s.bytes();
         } else "",
         else => "",
     } else "";
-    const err_ev = Value.makeError(tctx, "io error", msg_bytes, true) catch return error.OutOfMemory;
-    _ = value.obj_header.retain(err_ev.asRef());
-    // 释放临时 retain 的 ADT
+    // 构造 ErrorValue（RC=1）
+    const err_ev = Value.makeError(tctx, "io error", msg_bytes, true) catch {
+        // OOM：释放 err_val（所有权已转移）
+        value.obj_header.release(err_obj, tctx);
+        return error.OutOfMemory;
+    };
+    // err_val 所有权已转移，释放 record（触发 deinit 释放其 msg/path 字段）
     value.obj_header.release(err_obj, tctx);
+    // makeThrow 窃取 err_ev 的 RC=1
     const err_val_ptr: *ErrorValue = @alignCast(@fieldParentPtr("header", err_ev.asRef()));
-    return Value.makeThrow(tctx, .{ .err = err_val_ptr }) catch return error.OutOfMemory;
+    return Value.makeThrow(tctx, .{ .err = err_val_ptr }) catch {
+        // OOM：释放 err_ev
+        value.obj_header.release(err_ev.asRef(), tctx);
+        return error.OutOfMemory;
+    };
 }
 
 /// 根据 File.Kind 构造 FileKind ADT 值（无字段变体 File/Directory/Symlink/Other）
 ///
 /// FileKind 在 std/io/File.glue 中定义为 ADT：
 ///   type FileKind = | File | Directory | Symlink | Other
+/// IR 编译器为每个变体分配 __tag（按声明顺序 0/1/2/3），field_count=1（仅 __tag）。
 /// syscall 层按 std.Io.File.Kind 枚举选择构造器（跨平台）。
-/// 返回的 Value 已 RC=1（makeAdt 初始 RC），调用方如需放入 record 字段须额外 retain。
+/// 返回的 Value 已 RC=1（makeRecordWithNames 初始 RC），调用方如需放入 record 字段须额外 retain。
 fn makeFileKind(tctx: *ThreadContext, kind: File.Kind) SyscallError!Value {
-    const ctor: []const u8 = switch (kind) {
-        .file => "File",
-        .directory => "Directory",
-        .sym_link => "Symlink",
-        else => "Other",
+    // __tag 值按 FileKind ADT 声明顺序：File=0, Directory=1, Symlink=2, Other=3
+    const tag_val: i64 = switch (kind) {
+        .file => 0,
+        .directory => 1,
+        .sym_link => 2,
+        else => 3, // unknown/whiteout/door/event_port/named_pipe/block_device/character_device/unix_domain_socket
     };
-    return Value.makeAdt(tctx, "FileKind", ctor, &.{}) catch return error.OutOfMemory;
+    var fields: [1]Value = .{
+        Value.fromI64(tag_val), // fields[0] = __tag
+    };
+    const field_names: [1]?[]const u8 = .{"__tag"};
+    return Value.makeRecordWithNames(tctx, "FileKind", &fields, &field_names) catch return error.OutOfMemory;
 }
 
 // ──────────────────────────────────────────────
@@ -262,10 +290,27 @@ pub fn file_open(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError
     const flags = args[1].intCast(i32);
     _ = args[2]; // mode（permissions）：std.Io 用 .default_file，忽略 POSIX mode
 
+    // POSIX O_ 标志位按平台取值（Linux 与 BSD/macOS 不同，硬编码会导致位误判）
+    // O_ACCMODE 低 2 位跨平台一致；O_CREAT/O_TRUNC 按平台 switch
     const O_ACCMODE: i32 = 3;
-    const O_CREAT: i32 = 64;
-    const O_TRUNC: i32 = 512;
+    const O_CREAT: i32 = switch (builtin.os.tag) {
+        .linux => 64, // 0o100
+        .macos, .ios, .watchos, .tvos, .freebsd, .netbsd, .openbsd, .dragonfly => 512, // 0o200
+        .windows => 0, // Windows 不使用 POSIX O_ 位
+        else => 64, // 默认 Linux 值
+    };
+    const O_TRUNC: i32 = switch (builtin.os.tag) {
+        .linux => 512, // 0o1000
+        .macos, .ios, .watchos, .tvos, .freebsd, .netbsd, .openbsd, .dragonfly => 1024, // 0o400
+        .windows => 0,
+        else => 512,
+    };
     const accmode = flags & O_ACCMODE;
+    // accmode 仅 0(O_RDONLY)/1(O_WRONLY)/2(O_RDWR) 合法，3+ 为非法值
+    if (accmode > 2) {
+        const io_err = try makeIOError(tctx, .invalid_input, "file_open: invalid access mode", 22, path);
+        return makeThrowErr(tctx, io_err);
+    }
     const read = accmode != 1; // 非 O_WRONLY
     const write = accmode != 0; // 非 O_RDONLY
     const create = (flags & O_CREAT) != 0;
@@ -311,7 +356,13 @@ pub fn file_read(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError
         const io_err = try makeIOError(tctx, .invalid_input, "file_read: buf not array", 22, null);
         return makeThrowErr(tctx, io_err);
     };
-    const len = args[2].intCast(usize);
+    // 负 len 值会导致 intCast panic，先验证再转换
+    const len_raw = args[2].intCast(i64);
+    if (len_raw < 0) {
+        const io_err = try makeIOError(tctx, .invalid_input, "file_read: negative len", 22, null);
+        return makeThrowErr(tctx, io_err);
+    }
+    const len: usize = @intCast(len_raw);
     const actual_len = @min(len, arr.elements.len);
     // 将 Value 元素视作 u8：约定 u8[] 的每个 Value 都是 .u8 标量
     var tmp_buf: [32768]u8 = undefined;
@@ -339,16 +390,25 @@ pub fn file_write(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
         const io_err = try makeIOError(tctx, .invalid_input, "file_write: buf not array", 22, null);
         return makeThrowErr(tctx, io_err);
     };
-    const len = args[2].intCast(usize);
+    // 负 len 值会导致 intCast panic，先验证再转换
+    const len_raw = args[2].intCast(i64);
+    if (len_raw < 0) {
+        const io_err = try makeIOError(tctx, .invalid_input, "file_write: negative len", 22, null);
+        return makeThrowErr(tctx, io_err);
+    }
+    const len: usize = @intCast(len_raw);
     const actual_len = @min(len, arr.elements.len);
-    // 拼接 u8 字节，逐个 Value 转 u8
+    // 拼接 u8 字节，逐个 Value 转 u8；非 u8 元素直接报错而非静默写零
     var tmp_buf: [32768]u8 = undefined;
     const write_len = @min(actual_len, tmp_buf.len);
     var i: usize = 0;
     while (i < write_len) : (i += 1) {
         tmp_buf[i] = switch (arr.elements[i]) {
             .u8 => arr.elements[i].asU8(),
-            else => 0,
+            else => {
+                const io_err = try makeIOError(tctx, .invalid_input, "file_write: buf element not u8", 22, null);
+                return makeThrowErr(tctx, io_err);
+            },
         };
     }
     const file = fdToFile(fd);
@@ -426,18 +486,37 @@ pub fn file_fstat(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
 }
 
 /// 从 std.Io.File.Stat 构造 Glue Stat record 值
+///
+/// Stat 是 newtype（type Stat = Stat(size, mtime_ns, ctime_ns, kind)），
+/// IR 编译器注册 field_id：__tag=0, size=1, mtime_ns=2, ctime_ns=3, kind=4。
 fn makeStatValue(tctx: *ThreadContext, stat: File.Stat) SyscallError!Value {
     const kind_val = try makeFileKind(tctx, stat.kind);
-    // kind_val 是堆对象（AdtValue），进入 record 字段需额外 retain（makeRecordWithNames 不主动 retain）
-    _ = kind_val.retain();
-    var fields: [4]Value = .{
-        Value.fromU64(stat.size),
-        Value.fromI64(@intCast(stat.mtime.nanoseconds)),
-        Value.fromI64(@intCast(stat.ctime.nanoseconds)),
-        kind_val,
+    // kind_val RC=1，直接交 makeRecordWithNames 窃取，无需额外 retain
+    // mtime/ctime.nanoseconds 为 i128，钳位到 i64 范围避免 @intCast panic（超出 ±292 年的极端时间戳）
+    const mtime_ns: i64 = if (stat.mtime.nanoseconds > std.math.maxInt(i64))
+        std.math.maxInt(i64)
+    else if (stat.mtime.nanoseconds < std.math.minInt(i64))
+        std.math.minInt(i64)
+    else
+        @intCast(stat.mtime.nanoseconds);
+    const ctime_ns: i64 = if (stat.ctime.nanoseconds > std.math.maxInt(i64))
+        std.math.maxInt(i64)
+    else if (stat.ctime.nanoseconds < std.math.minInt(i64))
+        std.math.minInt(i64)
+    else
+        @intCast(stat.ctime.nanoseconds);
+    var fields: [5]Value = .{
+        Value.fromI64(0), // fields[0] = __tag（newtype 固定 0）
+        Value.fromU64(stat.size), // fields[1] = size
+        Value.fromI64(mtime_ns), // fields[2] = mtime_ns
+        Value.fromI64(ctime_ns), // fields[3] = ctime_ns
+        kind_val, // fields[4] = kind（RC=1，由 record 窃取）
     };
-    const field_names: [4]?[]const u8 = .{ "size", "mtime_ns", "ctime_ns", "kind" };
-    const stat_val = Value.makeRecordWithNames(tctx, "Stat", &fields, &field_names) catch return error.OutOfMemory;
+    const field_names: [5]?[]const u8 = .{ "__tag", "size", "mtime_ns", "ctime_ns", "kind" };
+    const stat_val = Value.makeRecordWithNames(tctx, "Stat", &fields, &field_names) catch {
+        kind_val.release(tctx); // OOM：释放 kind_val
+        return error.OutOfMemory;
+    };
     return makeThrowOk(tctx, stat_val);
 }
 
@@ -484,9 +563,26 @@ pub fn file_chmod(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
         const io_err = try makeIOError(tctx, .invalid_input, "file_chmod: path too long", 36, path);
         return makeThrowErr(tctx, io_err);
     };
-    const rc = std.c.chmod(path_z, @intCast(mode));
+    // mode 为 i32，chmod 需要 mode_t（POSIX 通常 u16/u32 因平台而异）。
+    // 负 mode 用 @bitCast 转 u32，再窄化到 mode_t 避免 panic
+    const mode_u: u32 = @bitCast(mode);
+    const rc = std.c.chmod(path_z, @truncate(mode_u));
     if (rc != 0) {
-        const io_err = try makeIOError(tctx, .permission_denied, "file_chmod failed", 0, path);
+        // 读取真实 errno 映射到 IOErrorKind，而非硬编码 permission_denied
+        const errno_val: i32 = blk: {
+            if (@hasDecl(std.c, "_errno")) {
+                break :blk @intCast(std.c._errno().*);
+            }
+            break :blk 0;
+        };
+        const kind: IOErrorKind = switch (errno_val) {
+            2 => .not_found, // ENOENT
+            13 => .permission_denied, // EACCES
+            17 => .already_exists, // EEXIST
+            22 => .invalid_input, // EINVAL
+            else => .other,
+        };
+        const io_err = try makeIOError(tctx, kind, "file_chmod failed", errno_val, path);
         return makeThrowErr(tctx, io_err);
     }
     return makeThrowOk(tctx, Value.fromUnit());
@@ -551,6 +647,15 @@ pub fn dir_list(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!
     var entries: std.ArrayList(Value) = .empty;
     defer entries.deinit(tctx.backing);
 
+    // 成功路径（makeThrowOk）将 entries 所有权转移给 makeArray；
+    // 任何失败/错误返回时（iterate 失败、OOM、makeThrowErr）释放已创建的 DirEntry，避免泄漏
+    var entries_consumed = false;
+    defer {
+        if (!entries_consumed) {
+            for (entries.items) |e| e.release(tctx);
+        }
+    }
+
     var it = dir.iterate();
     while (true) {
         const entry = it.next(io) catch |err| {
@@ -560,17 +665,34 @@ pub fn dir_list(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!
         const e = entry orelse break;
         if (std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) continue;
         const name_val = Value.fromStringBytes(tctx, e.name) catch return error.OutOfMemory;
-        _ = name_val.retain();
+        // name_val RC=1，直接交 record 窃取，无需 retain
         // DirEntry.kind 字段是 FileKind ADT（File/Directory/Symlink/Other，无字段变体）
-        const kind_val = try makeFileKind(tctx, e.kind);
-        _ = kind_val.retain();
-        var fields: [2]Value = .{ name_val, kind_val };
-        const field_names: [2]?[]const u8 = .{ "name", "kind" };
-        const rec = Value.makeRecordWithNames(tctx, "DirEntry", &fields, &field_names) catch return error.OutOfMemory;
-        _ = rec.retain();
-        entries.append(tctx.backing, rec) catch return error.OutOfMemory;
+        const kind_val = makeFileKind(tctx, e.kind) catch {
+            name_val.release(tctx); // OOM：释放 name_val
+            return error.OutOfMemory;
+        };
+        // kind_val RC=1，直接交 record 窃取，无需 retain
+        // DirEntry 是 newtype，field_id：__tag=0, name=1, kind=2
+        var fields: [3]Value = .{
+            Value.fromI64(0), // fields[0] = __tag（newtype 固定 0）
+            name_val, // fields[1] = name（RC=1，由 record 窃取）
+            kind_val, // fields[2] = kind（RC=1，由 record 窃取）
+        };
+        const field_names: [3]?[]const u8 = .{ "__tag", "name", "kind" };
+        const rec = Value.makeRecordWithNames(tctx, "DirEntry", &fields, &field_names) catch {
+            name_val.release(tctx); // OOM：释放已分配字段
+            kind_val.release(tctx);
+            return error.OutOfMemory;
+        };
+        // rec RC=1，直接交 makeArray 窃取，无需 retain
+        entries.append(tctx.backing, rec) catch {
+            rec.release(tctx); // OOM：释放 rec（级联释放 name_val/kind_val）
+            return error.OutOfMemory;
+        };
     }
 
     const arr_val = Value.makeArray(tctx, entries.items, null) catch return error.OutOfMemory;
+    // makeArray 成功，entries 所有权转移给 arr_val，失败时不再释放
+    entries_consumed = true;
     return makeThrowOk(tctx, arr_val);
 }

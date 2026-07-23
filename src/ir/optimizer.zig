@@ -22,6 +22,32 @@ const ScalarMeta = meta_mod.ScalarMeta;
 const ScalarKind = meta_mod.ScalarKind;
 const ConstVal = meta_mod.ConstVal;
 const ChanType = channel_mod.ChanType;
+const scalar = @import("value").scalar;
+const IntKind = scalar.IntKind;
+
+/// 检查 i128 值是否在给定 IntKind 的表示范围内
+///
+/// 折叠后的 int_val 统一为 i128，但运行时按实际类型 T 执行运算并检测溢出。
+/// 若折叠结果超出目标类型范围（如 200u8 + 100u8 = 300 超 u8 范围），
+/// 运行时会抛 error.Overflow，而编译期 @truncate 会静默截断，语义不一致。
+/// 此函数用于在折叠后校验结果是否安全，不安全则不折叠（交由运行时处理）。
+fn intValInRange(val: i128, kind: IntKind) bool {
+    return switch (kind) {
+        .i8 => val >= -128 and val <= 127,
+        .i16 => val >= -32768 and val <= 32767,
+        .i32 => val >= std.math.minInt(i32) and val <= std.math.maxInt(i32),
+        .i64 => val >= std.math.minInt(i64) and val <= std.math.maxInt(i64),
+        .i128 => true, // i128 是 ConstVal.int_val 的原生类型，永远在范围
+        .u8 => val >= 0 and val <= 255,
+        .u16 => val >= 0 and val <= 65535,
+        .u32 => val >= 0 and val <= std.math.maxInt(u32),
+        .u64 => val >= 0 and val <= std.math.maxInt(u64),
+        // u128 上界超出 i128 范围，ConstVal 只能存 i128，故只需检查非负
+        .u128 => val >= 0,
+        .isize => val >= std.math.minInt(isize) and val <= std.math.maxInt(isize),
+        .usize => val >= 0 and val <= std.math.maxInt(usize),
+    };
+}
 
 /// 优化统计信息
 pub const OptStats = struct {
@@ -92,6 +118,26 @@ fn constantFold(ir: *GlueIR) bool {
 
         // 尝试折叠
         if (foldBinaryOp(node.op, left_const, right_const)) |result| {
+            // 折叠结果为整数时，校验结果是否在目标类型范围内。
+            // foldBinaryOp 用 i128 检测溢出（第一道防线），但实际类型可能更窄（如 u8）。
+            // 若结果超目标类型范围（如 200u8+100u8=300），运行时会抛 error.Overflow，
+            // 而编译期 writeConst 会 @truncate 静默截断，语义不一致 → 不折叠，交由运行时。
+            if (result == .int_val) {
+                if (node.meta_index > 0 and node.meta_index < ir.scalar_metas.len) {
+                    const target_kind = ir.scalar_metas[node.meta_index].int_kind;
+                    if (!intValInRange(result.int_val, target_kind)) continue;
+                }
+            } else if (result == .bool_val and left_const == .int_val and right_const == .int_val) {
+                // 比较运算（cmp_lt/le/gt/ge）的操作数范围检查：
+                // ConstVal.int_val 为 i128（有符号），但运行时按操作数实际类型符号性比较。
+                // 若两操作数均在各自类型范围内，则 i128 有符号比较与运行时一致
+                // （有符号类型值在有符号范围内；无符号类型值非负，有符号比较=无符号比较）。
+                // 操作数超范围时不折叠，交由运行时处理。
+                const left_kind = findConstIntKind(ir, left_chan, i) orelse continue;
+                const right_kind = findConstIntKind(ir, right_chan, i) orelse continue;
+                if (!intValInRange(left_const.int_val, left_kind)) continue;
+                if (!intValInRange(right_const.int_val, right_kind)) continue;
+            }
             // 将节点替换为常量节点
             const new_op = constOpForVal(result);
             node.op = new_op;
@@ -141,6 +187,22 @@ fn findConstVal(ir: *const GlueIR, chan: u16, node_index: usize) ?ConstVal {
     return null;
 }
 
+/// 查找指定通道的整数常量节点的 IntKind（用于比较折叠的操作数范围检查）
+///
+/// 比较运算（cmp_lt/le/gt/ge）的结果是 bool，node.meta_index 指向 bool meta，
+/// 无法直接获取操作数的整数类型。此函数通过查找操作数常量节点获取其 int_kind。
+fn findConstIntKind(ir: *const GlueIR, chan: u16, node_index: usize) ?IntKind {
+    if (node_index == 0) return null;
+    for (ir.nodes[0..node_index]) |n| {
+        if (n.output == chan and n.op == .const_i) {
+            if (n.meta_index > 0 and n.meta_index < ir.scalar_metas.len) {
+                return ir.scalar_metas[n.meta_index].int_kind;
+            }
+        }
+    }
+    return null;
+}
+
 /// 折叠二元运算
 fn foldBinaryOp(op: NodeOp, left: ConstVal, right: ConstVal) ?ConstVal {
     // 整数算术
@@ -148,18 +210,42 @@ fn foldBinaryOp(op: NodeOp, left: ConstVal, right: ConstVal) ?ConstVal {
         const a = left.int_val;
         const b = right.int_val;
         return switch (op) {
-            .int_add => .{ .int_val = a +% b },
-            .int_sub => .{ .int_val = a -% b },
-            .int_mul => .{ .int_val = a *% b },
-            .int_div => if (b != 0) .{ .int_val = @divTrunc(a, b) } else null,
-            .int_mod => if (b != 0) .{ .int_val = @rem(a, b) } else null,
+            // 溢出时不折叠（返回 null），交由运行时 @*WithOverflow 检测并返回 error.Overflow，
+            // 保证编译期/运行时语义一致（原先用 +% wrapping 会静默回绕，与运行时行为不符）
+            .int_add => blk: {
+                const r, const of = @addWithOverflow(a, b);
+                break :blk if (of != 0) null else .{ .int_val = r };
+            },
+            .int_sub => blk: {
+                const r, const of = @subWithOverflow(a, b);
+                break :blk if (of != 0) null else .{ .int_val = r };
+            },
+            .int_mul => blk: {
+                const r, const of = @mulWithOverflow(a, b);
+                break :blk if (of != 0) null else .{ .int_val = r };
+            },
+            .int_div => if (b != 0 and !(a == std.math.minInt(i128) and b == -1))
+                .{ .int_val = @divTrunc(a, b) }
+            else
+                null, // 除零或 minInt/-1 溢出（UB），交由运行时处理
+            .int_mod => if (b != 0 and !(a == std.math.minInt(i128) and b == -1))
+                .{ .int_val = @rem(a, b) }
+            else
+                null,
             .int_and => .{ .int_val = a & b },
             .int_or => .{ .int_val = a | b },
             .int_xor => .{ .int_val = a ^ b },
-            .int_shl => .{ .int_val = a << @intCast(@as(u8, @intCast(b & 0x7F))) },
-            .int_shr => .{ .int_val = a >> @intCast(@as(u8, @intCast(b & 0x7F))) },
+            // 移位运算不折叠：运行时 execIntShift 按实际类型位宽（@bitSizeOf(T)）移位，
+            // 而 ConstVal.int_val 统一为 i64，编译期无法感知实际类型位宽。
+            // 例如 i32 移位 32-63：运行时返回 0，编译期（i64 阈值 64）返回非 0；
+            // i128 移位 64-127：运行时有效，编译期返回 0。为保证语义一致，交由运行时处理。
+            .int_shl, .int_shr => null,
             .cmp_eq => .{ .bool_val = a == b },
             .cmp_ne => .{ .bool_val = a != b },
+            // 有符号比较折叠：ConstVal.int_val 为 i128（有符号），运行时按实际类型符号性比较。
+            // 安全性由 constantFold 中的操作数范围检查保证：若两操作数均在目标类型范围内，
+            // 则有符号类型值在有符号范围内（i128 比较正确），无符号类型值非负（i128 有符号
+            // 比较与无符号比较结果一致）。操作数超范围时不折叠（见 constantFold）。
             .cmp_lt => .{ .bool_val = a < b },
             .cmp_le => .{ .bool_val = a <= b },
             .cmp_gt => .{ .bool_val = a > b },
@@ -181,22 +267,10 @@ fn foldBinaryOp(op: NodeOp, left: ConstVal, right: ConstVal) ?ConstVal {
         };
     }
 
-    // 浮点算术
-    if (left == .float_val and right == .float_val) {
-        // float_val 是 u128 位模式，按 f64 解释取低 64 位
-        const a: f64 = @bitCast(@as(u64, @truncate(left.float_val)));
-        const b: f64 = @bitCast(@as(u64, @truncate(right.float_val)));
-        const result: f64 = switch (op) {
-            .float_add => a + b,
-            .float_sub => a - b,
-            .float_mul => a * b,
-            .float_div => if (b != 0) a / b else return null,
-            else => return null,
-        };
-        const result_u64: u64 = @bitCast(result);
-        return .{ .float_val = @as(u128, result_u64) };
-    }
-
+    // 浮点算术：不折叠。ConstVal.float_val 是 u128 位模式，但折叠逻辑只按 f64 解释
+    // （truncate 到 u64）。对 f16/f32/f128 常量，位模式不是 f64 格式，折叠结果错误。
+    // 此外浮点折叠会丢失 NaN/Inf 传播语义（运行时 float_div 除零产生 Inf，编译期 return null）。
+    // 为保证语义一致与精度正确，浮点算术交由运行时处理。
     return null;
 }
 
@@ -318,6 +392,8 @@ fn hasSideEffect(op: NodeOp) bool {
         .halt_return, .halt_throw, .halt_panic,
         .halt_break, .halt_continue,
         .call, .store, .array_set, .array_push, .record_set,
+        // array_pop / array_drop_last 修改原数组（与 array_push 对称），不可消除
+        .array_pop, .array_drop_last,
         .cleanup_register, .cleanup_run,
         .orbit_async_create, .orbit_async_join,
         .orbit_chan_send, .orbit_chan_recv, .orbit_chan_try_recv,
@@ -349,6 +425,14 @@ fn hasSideEffect(op: NodeOp) bool {
         .ref_set,
         // atomic 操作：分配堆对象或互斥保护的读-改-写，有副作用
         .atomic_make, .atomic_fetch_add, .atomic_swap, .atomic_cas,
+        // syscall_call 执行宿主系统调用（IO/Time 等），有外部可观察副作用，不可消除
+        .syscall_call,
+        // lazy_force 强制求值 thunk 闭包，thunk body 可能含 println/call 等副作用
+        .lazy_force,
+        // cast_to 溢出或非法转换时 panic，消除会改变 panic 行为
+        .cast_to,
+        // alloc/free 内存管理：free 消除导致泄漏，alloc 消除可能破坏后续 free 配对
+        .alloc, .free,
         => true,
         else => false,
     };
@@ -388,45 +472,15 @@ fn channelLiveness(ir: *GlueIR) bool {
 ///
 /// 通过合并 body 子图实现：将 f 的子图追加到 g 的子图前面
 fn vecFusion(ir: *GlueIR) bool {
-    var changed = false;
-
-    // 查找 vec_map → vec_map 模式
-    for (ir.nodes, 0..) |*map_node, i| {
-        if (map_node.op != .vec_map) continue;
-        if (map_node.input_count != 1) continue;
-
-        // 查找输入通道是否来自另一个 vec_map
-        const src_chan = map_node.inputs[0];
-        const producer_idx = findProducer(ir, src_chan, i) orelse continue;
-        const producer = &ir.nodes[producer_idx];
-        if (producer.op != .vec_map) continue;
-
-        // 融合条件：两个 vec_map 的元素类型相同
-        const map_meta_idx = map_node.meta_index;
-        const prod_meta_idx = producer.meta_index;
-        if (map_meta_idx == 0 or prod_meta_idx == 0) continue;
-        if (map_meta_idx > ir.vector_metas.len or prod_meta_idx > ir.vector_metas.len) continue;
-
-        const map_meta = &ir.vector_metas[map_meta_idx - 1];
-        const prod_meta = &ir.vector_metas[prod_meta_idx - 1];
-        if (map_meta.elem_type != prod_meta.elem_type) continue;
-
-        // 融合：将 producer 的 body 子图追加到 map_node 的 body 子图前面
-        // Phase 4 简化：仅标记融合，不实际合并子图（需要复杂的节点重排）
-        // 标记方式：将 producer 的 vec_map 节点替换为 move（identity），让数据直接流过
-        // 注意：必须先保存 producer 的输入，再清零，否则会读到 0
-        const producer_input = producer.inputs[0];
-        producer.op = .const_unit; // 标记为已融合（消除中间 vec_map）
-        producer.input_count = 0;
-        producer.inputs = .{ 0, 0, 0, 0 };
-
-        // map_node 的输入改为 producer 的输入（跳过中间节点）
-        map_node.inputs[0] = producer_input;
-
-        changed = true;
-    }
-
-    return changed;
+    // ⚠️ 已禁用：原实现仅重定向 consumer 输入到 producer 的原始输入，并把 producer
+    // 标记为 const_unit，但未合并 producer 的 body 子图。这会导致 vec_map(g, vec_map(f, src))
+    // 被错误地优化为 vec_map(g, src)，producer 的变换 f 被静默丢弃，产生错误结果。
+    //
+    // 正确实现需要：将 producer 的 body 子图物理追加到 consumer body 子图前部，并重映射
+    // body 内所有通道引用。这涉及复杂的节点重排和 meta 更新，当前 Phase 4 未实现。
+    // 在此之前禁用该 pass 以保证正确性（牺牲少量优化收益）。
+    _ = ir;
+    return false;
 }
 
 /// 查找产生指定通道的节点索引（在 node_index 之前查找）

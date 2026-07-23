@@ -99,14 +99,16 @@ fn arenaAllocPosix(size: usize, alignment: usize) ![]u8 {
     const max_drop_len = alignment -| page_size;
     const overalloc_len = page_aligned_len + max_drop_len;
 
-    const slice = try std.posix.mmap(
+    // mmap 错误集（AccessDenied/MemoryMappingNotSupported 等）收窄为 OutOfMemory，
+    // 避免污染上层 AllocError 类型；arena 分配失败对调用方而言即内存不足
+    const slice = std.posix.mmap(
         null,
         overalloc_len,
         .{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
-    );
+    ) catch return error.OutOfMemory;
 
     const result_ptr = std.mem.alignPointer(slice.ptr, alignment) orelse {
         std.posix.munmap(slice);

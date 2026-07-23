@@ -19,6 +19,16 @@ pub const ops = @import("ops.zig");
 pub const batch = @import("batch.zig");
 pub const cast = @import("cast.zig");
 
+// ── deepCopy 递归深度限制（防止嵌套复合类型栈溢出）──
+threadlocal var deepCopyDepth: u32 = 0;
+const MAX_DEEPCOPY_DEPTH: u32 = 4096;
+
+// ── equals 递归深度限制（防止循环引用结构栈溢出）──
+// 循环引用（如 cell 自引用、闭包 upvalue 引用自身）在容器递归比较时会无限递归，
+// 超过上限时保守返回 false（不相等），优先保证不栈溢出
+threadlocal var equalsDepth: u32 = 0;
+const MAX_EQUALS_DEPTH: u32 = 4096;
+
 // ── 字符类型 ──
 pub const char_mod = @import("char.zig");
 pub const Char = char_mod.Char;
@@ -208,6 +218,8 @@ pub const Value = union(enum) {
     /// elem_is_ref 决定数组元素按值语义深拷贝还是按引用语义共享。
     pub fn makeArrayEx(tctx: *ThreadContext, elements: []Value, fixed_size: ?u64, elem_is_ref: bool) !Value {
         const arr = try tctx.createObj(ArrayValue);
+        // allocObj(elements) 失败时释放已分配的 ArrayValue header，避免泄漏
+        errdefer tctx.freeObj(@ptrCast(arr));
         const elems: []Value = if (elements.len > 0) blk: {
             const buf = try tctx.allocObj(elements.len * @sizeOf(Value));
             break :blk @as([*]Value, @ptrCast(@alignCast(buf.ptr)))[0..elements.len];
@@ -630,7 +642,9 @@ pub const Value = union(enum) {
     // ════════════════════════════════════════════
 
     /// 深拷贝值：标量值原样返回，堆分配值递归复制其内容
+    /// 深度限制 MAX_DEEPCOPY_DEPTH 防止嵌套复合类型栈溢出
     pub fn deepCopy(self: Value, tctx: *ThreadContext) AllocError!Value {
+        if (deepCopyDepth >= MAX_DEEPCOPY_DEPTH) return error.Overflow;
         switch (self) {
             .null_val, .unit, .boolean, .char,
             .i8, .i16, .i32, .i64, .i128,
@@ -639,6 +653,8 @@ pub const Value = union(enum) {
             .f16, .f32, .f64, .f128 => return self,
 
             .ref => |obj| {
+                deepCopyDepth += 1;
+                defer deepCopyDepth -= 1;
                 return switch (obj.type_tag) {
                     .str => try deepCopyStr(obj, tctx),
                     .array => try deepCopyArray(obj, tctx),
@@ -677,6 +693,9 @@ pub const Value = union(enum) {
             const new_s = try tctx.createObj(Str);
             new_s.* = s.*;
             new_s.header.rc = 1;
+            // 重置 flags：清除从源对象复制的 TRACKED / ARENA_ALLOCATED 标志，
+            // 否则 trackValueTree 会因 isTracked() 误判而跳过跟踪，导致页池页泄漏
+            new_s.header.flags = 0;
             // 重置 SSO 引用计数为初始值 1，保留标志位和长度
             new_s.sso_flags = (s.sso_flags & ~Str.SSO_REFCOUNT_MASK) | Str.SSO_REFCOUNT_INIT;
             return .{ .ref = &new_s.header };
@@ -833,6 +852,7 @@ pub const Value = union(enum) {
         const new_r = try tctx.createObj(Range);
         new_r.* = p.*;
         new_r.header.rc = 1;
+        new_r.header.flags = 0; // 清除从源对象复制的 TRACKED / ARENA_ALLOCATED 标志
         return .{ .ref = &new_r.header };
     }
 
@@ -932,6 +952,7 @@ pub const Value = union(enum) {
         const new_b = try tctx.createObj(Builtin);
         new_b.* = p.*;
         new_b.header.rc = 1;
+        new_b.header.flags = 0; // 清除从源对象复制的 TRACKED / ARENA_ALLOCATED 标志
         return .{ .ref = &new_b.header };
     }
 
@@ -1193,6 +1214,11 @@ pub fn equals(a: Value, b: Value) bool {
         .ref => |obj| {
             if (obj == b.ref) return true; // 同一对象
             if (obj.type_tag != b.ref.type_tag) return false;
+            // 容器递归比较前检查深度，防止循环引用（cell 自引用、闭包 upvalue 引用自身等）
+            // 导致无限递归栈溢出；超限时保守返回 false（不相等）
+            if (equalsDepth >= MAX_EQUALS_DEPTH) return false;
+            equalsDepth += 1;
+            defer equalsDepth -= 1;
             return switch (obj.type_tag) {
                 .str => blk: {
                     const sa: *Str = @alignCast(@fieldParentPtr("header", obj));
