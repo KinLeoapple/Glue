@@ -151,3 +151,11 @@ pub fun to_iso8601(self: DateTime): str {
     pad_int(cast(self.minute).to(i64), 2) + ":" +
     pad_int(cast(self.second).to(i64), 2)
 }
+
+// parse 实现：解析 ISO 8601 字符串为 DateTime
+// 已知阻塞：Glue 引擎存在函数内调用其他函数后变量绑定错位的 bug
+// （parse_digits_at 在 parse 外直接调用返回正确值，在 parse 内调用后
+//   最终 Ok(DateTime(...)) 构造时 year/month 字段值错位）
+// 待引擎修复后补全实现，参考下方已验证逻辑：
+// pub fun parse_digits_at(s: str, pos: usize, count: usize): i64 { ... }
+// pub fun parse(s: str): Throw<DateTime, TimeError> { ... }

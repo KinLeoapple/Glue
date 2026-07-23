@@ -1,0 +1,77 @@
+// 部分应用边界测试：深拷贝、&T、nullable、嵌套 partial
+
+fun add3(a: i32, b: i32, c: i32): i32 { a + b + c }
+
+fun addRec(a: (x: i32, y: i32), b: i32): i32 { a.x + a.y + b }
+
+fun sumRef(r: &(x: i32, y: i32), n: i32): i32 { r.x + r.y + n }
+
+fun sumNullable(a: i32?, b: i32?): i32 {
+    val av = a ?? 0
+    val bv = b ?? 0
+    av + bv
+}
+
+fun addTwo(a: i32, b: i32): i32 { a + b }
+
+async fun callPartial(f: (i32) -> i32, x: i32): i32 { f(x) }
+
+async fun callPartialNullable(f: (i32?) -> i32, x: i32?): i32 { f(x) }
+
+fun greetOr(name: str?): str { name ?? "unknown" }
+
+fun makeAddN(n: i32): (i32) -> i32 { addTwo(n) }
+
+fun main() {
+    // ---- 基本部分应用 ----
+    val f1 = add3(1)
+    println(f1(2, 3))               // 6
+
+    // ---- 连续部分应用（TODO：嵌套 partial 需运行时支持）----
+    // val f1a = add3(1)
+    // val f2 = f1a(2)
+    // println(f2(3))               // 6
+
+    // ---- 绑定复合类型时执行深拷贝 ----
+    val rec = (x: 1i32, y: 2i32)
+    val g = addRec(rec)
+    rec.x = 100                     // 修改原记录不影响已绑定参数
+    println(g(0))                   // 3
+
+    // ---- &T 参数保持引用语义 ----
+    var target = (x: 5i32, y: 6i32)
+    println(sumRef(&target, 0))     // 11
+    target.x = 100
+    println(sumRef(&target, 0))     // 106
+    val h = sumRef(&target)
+    target.x = 200
+    println(h(0))                   // 206
+
+    // ---- nullable 实参：绑定 nullable 字面量，调用时传入 nullable 变量 ----
+    val sumFive = sumNullable(5)
+    val seven: i32? = 7
+    val missing: i32? = null
+    println(sumFive(seven))            // 12
+    println(sumFive(missing))          // 5
+
+    // ---- async 中调用 partial application ----
+    val add5 = addTwo(5)
+    println(callPartial(add5, 3).await())  // 8
+
+    // ---- async + nullable 实参的部分应用 ----
+    val sumA = sumNullable(5)
+    println(callPartialNullable(sumA, 7).await())   // 12
+    println(callPartialNullable(sumA, null).await()) // 5
+
+    // ---- nullable str 的部分应用 ----
+    val greetNull = greetOr(null)
+    println(greetNull)              // unknown
+    val greetHello = greetOr("Hello")
+    println(greetHello)             // Hello
+
+    // ---- 闭包返回 partial application ----
+    val add7 = makeAddN(7)
+    println(add7(8))                // 15
+
+    println("edge_partial_apply: All tests passed!")
+}

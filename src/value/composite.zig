@@ -32,6 +32,9 @@ pub const AdtValue = struct {
     type_name: []const u8,
     constructor: []const u8,
     fields: []AdtField,
+    /// 字段引用标记位图：第 i 位为 1 表示第 i 个字段类型为 &T / *T。
+    /// 当前限制：最多 64 个字段；超出 64 的字段保守按值语义处理。
+    field_ref_bits: u64 = 0,
 
     /// 释放所有字段值
     /// fields 是连续内存的一部分，由 adtDeinit 中的 freeObj 统一释放
@@ -39,6 +42,12 @@ pub const AdtValue = struct {
         if (!obj_header.shutdown_mode) {
             for (self.fields) |*f| f.value.release(tctx);
         }
+    }
+
+    /// 判断指定字段是否为引用类型（&T / *T）
+    pub inline fn fieldIsRef(self: *const AdtValue, field_id: u16) bool {
+        if (field_id >= 64) return false;
+        return (self.field_ref_bits & (@as(u64, 1) << @intCast(field_id))) != 0;
     }
 };
 
@@ -66,6 +75,9 @@ pub const ArrayValue = struct {
     elements: []Value,
     capacity: usize = 0,
     fixed_size: ?u64 = null,
+    /// 元素类型是否为 &T / *T 引用类型。
+    /// true 时元素保持引用语义（retain），false 时按值语义深拷贝。
+    elem_is_ref: bool = false,
 
     /// 释放所有元素并回收元素数组内存
     /// header 由 arrayDeinit 中的 freeObj 释放
@@ -98,6 +110,9 @@ pub const RecordValue = struct {
     /// 字段名表（与 fields 同长，仅 format/调试用；运行时热路径不访问）
     /// 索引与 fields 对齐：field_names[i] 对应 fields[i] 的名字
     field_names: []const ?[]const u8 = &.{},
+    /// 字段引用标记位图：第 i 位为 1 表示第 i 个字段类型为 &T / *T。
+    /// 当前限制：最多 64 个字段；超出 64 的字段保守按值语义处理。
+    field_ref_bits: u64 = 0,
 
     /// 释放字段值
     /// fields 是连续内存的一部分，由 recordDeinit 中的 freeObj 统一释放
@@ -106,6 +121,12 @@ pub const RecordValue = struct {
         if (!obj_header.shutdown_mode) {
             for (self.fields) |*f| f.release(tctx);
         }
+    }
+
+    /// 判断指定字段是否为引用类型（&T / *T）
+    pub inline fn fieldIsRef(self: *const RecordValue, field_id: u16) bool {
+        if (field_id >= 64) return false;
+        return (self.field_ref_bits & (@as(u64, 1) << @intCast(field_id))) != 0;
     }
 
     /// 按 field_id 读取字段值（运行时热路径）

@@ -36,11 +36,18 @@ pub async fun ticker(period: Duration): Async<Receiver<Instant>> {
 
 // ─── timeout：d 后向 channel 推送一次 Unit ───────────────────────
 
-// 单次定时器：d 后向 channel 发送 ()，返回 Receiver<Unit>
-// 调用方 await 后再 recv 即可阻塞到超时
-pub async fun timeout(d: Duration): Async<Receiver<Unit>> {
-    val ch = channel<Unit>(1)
+// 后台 worker：sleep(d) 后向 ch 发送一次 ()，然后退出
+pub async fun timeout_worker(ch: Channel<Unit>, d: Duration): Async<Unit> {
     sleep(d).await()
     ch.send(())
+}
+
+// 单次定时器：立即返回 Receiver<Unit>，d 后 channel 收到 ()
+// 调用方 recv 会阻塞到超时触发（非 await 阻塞）
+// 修复：后台启动 timeout_worker（不 await），立即返回 receiver，
+// 避免原实现 sleep(d).await() 阻塞 timeout 函数自身导致调用方 await 即阻塞 d
+pub async fun timeout(d: Duration): Async<Receiver<Unit>> {
+    val ch = channel<Unit>(1)
+    timeout_worker(ch, d)
     ch.receiver
 }

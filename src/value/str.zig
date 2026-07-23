@@ -44,9 +44,9 @@ pub const Str = extern struct {
     // SSO 引用计数的位移量
     const SSO_REFCOUNT_SHIFT: u5 = 5;
     // SSO 引用计数掩码
-    const SSO_REFCOUNT_MASK: u32 = 0x7FFFFFE0;
+    pub const SSO_REFCOUNT_MASK: u32 = 0x7FFFFFE0;
     // SSO 引用计数初始值
-    const SSO_REFCOUNT_INIT: u32 = 1 << SSO_REFCOUNT_SHIFT;
+    pub const SSO_REFCOUNT_INIT: u32 = 1 << SSO_REFCOUNT_SHIFT;
 
     /// 堆模式连续缓冲区标志：_word2 bit31 置位表示 buffer 与 Str header 连续分配
     /// 置位时 deinit 为 no-op（buffer 随 freeObj 统一释放）

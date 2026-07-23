@@ -42,6 +42,10 @@ pub const ThreadContext = struct {
     arena: ShadowArena,
     global: *GlobalPool,
     backing: std.mem.Allocator,
+    /// slot 查找缓存（2 路组相联）：deepCopy 等场景反复分配相同 size 时跳过线性扫描
+    slot_cache_size: [2]u16 = .{ 0, 0 },
+    slot_cache_idx: [2]u8 = .{ 0, 0 },
+    slot_cache_next: u8 = 0,
 
     /// 创建线程上下文
     pub fn init(global: *GlobalPool, backing: std.mem.Allocator) ThreadContext {
@@ -69,16 +73,33 @@ pub const ThreadContext = struct {
     }
 
     /// 查找或创建指定 object_size 的池槽位索引
+    /// 2 路缓存优先查找，命中则跳过线性扫描
     fn findOrCreateSlot(self: *ThreadContext, object_size: usize) !u8 {
         const sz: u16 = @intCast(object_size);
+        // 2 路缓存快路径
+        if (self.slot_cache_size[0] == sz) return self.slot_cache_idx[0];
+        if (self.slot_cache_size[1] == sz) return self.slot_cache_idx[1];
+        // 慢路径：线性扫描 pools
         for (0..self.pool_count) |i| {
-            if (self.pools[i].object_size == sz) return @intCast(i);
+            if (self.pools[i].object_size == sz) {
+                self.slotCacheUpdate(sz, @intCast(i));
+                return @intCast(i);
+            }
         }
         if (self.pool_count >= MAX_POOLS) return error.TooManyPools;
         const idx = self.pool_count;
         self.pools[idx].object_size = sz;
         self.pool_count += 1;
+        self.slotCacheUpdate(sz, @intCast(idx));
         return idx;
+    }
+
+    /// 更新 slot 缓存（轮转替换）
+    inline fn slotCacheUpdate(self: *ThreadContext, size: u16, idx: u8) void {
+        const slot = self.slot_cache_next;
+        self.slot_cache_size[slot] = size;
+        self.slot_cache_idx[slot] = idx;
+        self.slot_cache_next ^= 1; // 在 0/1 之间轮转
     }
 
     /// 按 object_size 分配小对象（热路径：位图扫描，零锁）

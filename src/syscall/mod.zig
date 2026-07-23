@@ -41,32 +41,32 @@ pub const SyscallError = error{
 ///   - id：syscall 标识（从 SyscallMeta 读取）
 ///   - args：参数 Value 切片（按 spec 顺序）
 /// 返回：syscall 产出的 Value（可能是 Throw 值、标量或堆对象）
-pub fn dispatch(tctx: *ThreadContext, id: SyscallId, args: []const Value) SyscallError!Value {
+pub fn dispatch(io_inst: std.Io, tctx: *ThreadContext, id: SyscallId, args: []const Value) SyscallError!Value {
     return switch (id) {
         // IO syscall
-        .file_open => io.file_open(tctx, args),
-        .file_close => io.file_close(tctx, args),
-        .file_read => io.file_read(tctx, args),
-        .file_write => io.file_write(tctx, args),
-        .file_seek => io.file_seek(tctx, args),
-        .file_tell => io.file_tell(tctx, args),
-        .file_stat => io.file_stat(tctx, args),
-        .file_fstat => io.file_fstat(tctx, args),
-        .file_remove => io.file_remove(tctx, args),
-        .file_rename => io.file_rename(tctx, args),
-        .file_chmod => io.file_chmod(tctx, args),
-        .dir_create => io.dir_create(tctx, args),
-        .dir_remove => io.dir_remove(tctx, args),
-        .dir_list => io.dir_list(tctx, args),
+        .file_open => io.file_open(io_inst, tctx, args),
+        .file_close => io.file_close(io_inst, tctx, args),
+        .file_read => io.file_read(io_inst, tctx, args),
+        .file_write => io.file_write(io_inst, tctx, args),
+        .file_seek => io.file_seek(io_inst, tctx, args),
+        .file_tell => io.file_tell(io_inst, tctx, args),
+        .file_stat => io.file_stat(io_inst, tctx, args),
+        .file_fstat => io.file_fstat(io_inst, tctx, args),
+        .file_remove => io.file_remove(io_inst, tctx, args),
+        .file_rename => io.file_rename(io_inst, tctx, args),
+        .file_chmod => io.file_chmod(io_inst, tctx, args),
+        .dir_create => io.dir_create(io_inst, tctx, args),
+        .dir_remove => io.dir_remove(io_inst, tctx, args),
+        .dir_list => io.dir_list(io_inst, tctx, args),
 
         // Time syscall
-        .instant_now_ns => time.instant_now_ns(tctx, args),
-        .systemtime_now_ns => time.systemtime_now_ns(tctx, args),
-        .sleep_ns => time.sleep_ns(tctx, args),
-        .localtime_offset_minutes => time.localtime_offset_minutes(tctx, args),
-        .systemtime_to_local_components => time.systemtime_to_local_components(tctx, args),
-        .systemtime_to_utc_components => time.systemtime_to_utc_components(tctx, args),
-        .components_to_ns_utc => time.components_to_ns_utc(tctx, args),
+        .instant_now_ns => time.instant_now_ns(io_inst, tctx, args),
+        .systemtime_now_ns => time.systemtime_now_ns(io_inst, tctx, args),
+        .sleep_ns => time.sleep_ns(io_inst, tctx, args),
+        .localtime_offset_minutes => time.localtime_offset_minutes(io_inst, tctx, args),
+        .systemtime_to_local_components => time.systemtime_to_local_components(io_inst, tctx, args),
+        .systemtime_to_utc_components => time.systemtime_to_utc_components(io_inst, tctx, args),
+        .components_to_ns_utc => time.components_to_ns_utc(io_inst, tctx, args),
     };
 }
 

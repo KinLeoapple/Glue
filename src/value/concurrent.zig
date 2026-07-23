@@ -11,7 +11,7 @@
 //!
 //! 内存布局：
 //! - AtomicValue/SenderValue/ReceiverValue：固定大小，走 createObj 页池
-//! - AsyncHandle：固定大小，panic_message 独立分配（罕见路径）
+//! - AsyncHandle：固定大小，panic_message 使用内联缓冲区（无跨线程分配）
 //! - ChannelValue：连续内存 [header | Value buffer[cap]]，单次分配单次释放
 
 const std = @import("std");
@@ -80,6 +80,161 @@ pub const AtomicValue = struct {
         return old;
     }
 
+    /// 原子加法：将 val 加到当前值，返回旧值。
+    /// 按自身 data 的类型解释 val（支持 i8..i64/u8..u64 整数截断/扩展）。
+    pub fn fetchAdd(self: *AtomicValue, val: Value) Value {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const old = self.data;
+        self.data = switch (old) {
+            .i32 => |a| blk: {
+                const b: i32 = switch (val) {
+                    .i32 => |v| @bitCast(v),
+                    .i64 => |v| @truncate(@as(i64, @bitCast(v))),
+                    .i16 => |v| @as(i16, @bitCast(v)),
+                    .i8 => |v| @as(i8, @bitCast(v[0])),
+                    .u32 => |v| @bitCast(v),
+                    .u64 => |v| @bitCast(@as(u32, @truncate(@as(u64, @bitCast(v))))),
+                    .u16 => |v| @as(u16, @bitCast(v)),
+                    .u8 => |v| v[0],
+                    else => 0,
+                };
+                break :blk value.Value.fromI32(@as(i32, @bitCast(a)) +% b);
+            },
+            .i64 => |a| blk: {
+                const b: i64 = switch (val) {
+                    .i64 => |v| @bitCast(v),
+                    .i32 => |v| @as(i32, @bitCast(v)),
+                    .i16 => |v| @as(i16, @bitCast(v)),
+                    .i8 => |v| @as(i8, @bitCast(v[0])),
+                    .u64 => |v| @bitCast(v),
+                    .u32 => |v| @as(u32, @bitCast(v)),
+                    .u16 => |v| @as(u16, @bitCast(v)),
+                    .u8 => |v| v[0],
+                    else => 0,
+                };
+                break :blk value.Value.fromI64(@as(i64, @bitCast(a)) +% b);
+            },
+            .u32 => |a| blk: {
+                const b: u32 = switch (val) {
+                    .u32 => |v| @bitCast(v),
+                    .u64 => |v| @truncate(@as(u64, @bitCast(v))),
+                    .u16 => |v| @as(u16, @bitCast(v)),
+                    .u8 => |v| v[0],
+                    .i32 => |v| @bitCast(v),
+                    .i64 => |v| @bitCast(@as(u32, @truncate(@as(u64, @bitCast(@as(i64, @bitCast(v))))))),
+                    else => 0,
+                };
+                break :blk value.Value.fromU32(@as(u32, @bitCast(a)) +% b);
+            },
+            .u64 => |a| blk: {
+                const b: u64 = switch (val) {
+                    .u64 => |v| @bitCast(v),
+                    .u32 => |v| @as(u32, @bitCast(v)),
+                    .u16 => |v| @as(u16, @bitCast(v)),
+                    .u8 => |v| v[0],
+                    .i64 => |v| @bitCast(v),
+                    .i32 => |v| @as(u32, @bitCast(v)),
+                    else => 0,
+                };
+                break :blk value.Value.fromU64(@as(u64, @bitCast(a)) +% b);
+            },
+            .i8 => |a| blk: {
+                const b: i8 = switch (val) {
+                    .i8 => |v| @bitCast(v[0]),
+                    .i16 => |v| @truncate(@as(i16, @bitCast(v))),
+                    .i32 => |v| @truncate(@as(i32, @bitCast(v))),
+                    .i64 => |v| @truncate(@as(i64, @bitCast(v))),
+                    else => 0,
+                };
+                break :blk value.Value.fromI8(@as(i8, @bitCast(a[0])) +% b);
+            },
+            .i16 => |a| blk: {
+                const b: i16 = switch (val) {
+                    .i16 => |v| @bitCast(v),
+                    .i32 => |v| @truncate(@as(i32, @bitCast(v))),
+                    .i64 => |v| @truncate(@as(i64, @bitCast(v))),
+                    .i8 => |v| @as(i8, @bitCast(v[0])),
+                    else => 0,
+                };
+                break :blk value.Value.fromI16(@as(i16, @bitCast(a)) +% b);
+            },
+            .u8 => |a| blk: {
+                const b: u8 = switch (val) {
+                    .u8 => |v| v[0],
+                    .u16 => |v| @truncate(@as(u16, @bitCast(v))),
+                    .u32 => |v| @truncate(@as(u32, @bitCast(v))),
+                    .u64 => |v| @truncate(@as(u64, @bitCast(v))),
+                    else => 0,
+                };
+                break :blk value.Value.fromU8(a[0] +% b);
+            },
+            .u16 => |a| blk: {
+                const b: u16 = switch (val) {
+                    .u16 => |v| @bitCast(v),
+                    .u32 => |v| @truncate(@as(u32, @bitCast(v))),
+                    .u64 => |v| @truncate(@as(u64, @bitCast(v))),
+                    .u8 => |v| v[0],
+                    else => 0,
+                };
+                break :blk value.Value.fromU16(@as(u16, @bitCast(a)) +% b);
+            },
+            else => old,
+        };
+        return old;
+    }
+
+    /// 原子减法：将 val 从当前值中减去，返回旧值。
+    pub fn fetchSub(self: *AtomicValue, val: Value) Value {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const old = self.data;
+        self.data = switch (old) {
+            .i32 => |a| blk: {
+                const b: i32 = switch (val) {
+                    .i32 => |v| @bitCast(v),
+                    .i64 => |v| @truncate(@as(i64, @bitCast(v))),
+                    .i16 => |v| @as(i16, @bitCast(v)),
+                    .i8 => |v| @as(i8, @bitCast(v[0])),
+                    else => 0,
+                };
+                break :blk value.Value.fromI32(@as(i32, @bitCast(a)) -% b);
+            },
+            .i64 => |a| blk: {
+                const b: i64 = switch (val) {
+                    .i64 => |v| @bitCast(v),
+                    .i32 => |v| @as(i32, @bitCast(v)),
+                    .i16 => |v| @as(i16, @bitCast(v)),
+                    .i8 => |v| @as(i8, @bitCast(v[0])),
+                    else => 0,
+                };
+                break :blk value.Value.fromI64(@as(i64, @bitCast(a)) -% b);
+            },
+            .u32 => |a| blk: {
+                const b: u32 = switch (val) {
+                    .u32 => |v| @bitCast(v),
+                    .u64 => |v| @truncate(@as(u64, @bitCast(v))),
+                    .i32 => |v| @bitCast(v),
+                    .i64 => |v| @bitCast(@as(u32, @truncate(@as(u64, @bitCast(@as(i64, @bitCast(v))))))),
+                    else => 0,
+                };
+                break :blk value.Value.fromU32(@as(u32, @bitCast(a)) -% b);
+            },
+            .u64 => |a| blk: {
+                const b: u64 = switch (val) {
+                    .u64 => |v| @bitCast(v),
+                    .u32 => |v| @as(u32, @bitCast(v)),
+                    .i64 => |v| @bitCast(v),
+                    .i32 => |v| @as(u32, @bitCast(v)),
+                    else => 0,
+                };
+                break :blk value.Value.fromU64(@as(u64, @bitCast(a)) -% b);
+            },
+            else => old,
+        };
+        return old;
+    }
+
     /// 释放内部资源（data 值的引用计数递减），不销毁对象本体。
     pub fn deinit(self: *AtomicValue, tctx: *ThreadContext) void {
         if (!obj_header.shutdown_mode) {
@@ -112,16 +267,20 @@ pub const AsyncStatus = enum(u8) {
 ///
 /// 调用方可通过原子字段查询任务状态，并在任务完成后消费结果。
 /// 引用计数通过 ObjHeader 统一管理。
-/// panic_message 为独立分配（罕见路径），deinit 时由 freeObj 释放。
+/// panic_message 使用内联固定缓冲区，避免跨线程分配/释放导致的 double-free。
 pub const AsyncHandle = struct {
     header: ObjHeader = .{ .type_tag = .async_val },
     status: std.atomic.Value(AsyncStatus),
     result: ?Value,
     consumed: std.atomic.Value(bool),
     finished: std.atomic.Value(bool),
-    panic_message: ?[]const u8 = null,
+    panic_buf: [PANIC_BUF_SIZE]u8 = [_]u8{0} ** PANIC_BUF_SIZE,
+    panic_len: u8 = 0,
     mutex: Mutex,
     condition: Condition,
+
+    /// panic_message 内联缓冲区容量
+    pub const PANIC_BUF_SIZE: usize = 128;
 
     pub fn init() AsyncHandle {
         return AsyncHandle{
@@ -134,20 +293,14 @@ pub const AsyncHandle = struct {
         };
     }
 
-    /// 释放句柄持有的资源，包括未消费的结果与 panic 信息。
-    /// arena 分配的对象：panic_message 也从 arena 分配，跳过 freeObj
+    /// 释放句柄持有的资源（未消费的结果）。
+    /// panic_message 为内联缓冲区，无需释放。
     pub fn deinit(self: *AsyncHandle, tctx: *ThreadContext) void {
         if (!obj_header.shutdown_mode) {
             if (self.result) |r| {
                 var v = r;
                 v.release(tctx);
             }
-        }
-        if (self.panic_message) |msg| {
-            if (!self.header.isArenaAllocated()) {
-                tctx.freeObj(@ptrCast(@constCast(msg.ptr)));
-            }
-            self.panic_message = null;
         }
     }
 
@@ -175,13 +328,19 @@ pub const AsyncHandle = struct {
     }
 
     /// 设置 panic 信息（在任务失败时调用）
-    /// 通过 tctx.allocObj 独立分配 msg 副本，deinit 时由 freeObj 释放
+    /// 拷贝到内联缓冲区（超长截断），无需分配，避免跨线程 freeObj。
     /// 注意：不持锁，依赖 setStatus 中 finished.store(.release) 提供的 happens-before 保证
-    pub fn setPanic(self: *AsyncHandle, tctx: *ThreadContext, msg: []const u8) void {
-        const buf = tctx.allocObj(msg.len) catch return;
-        @memcpy(buf, msg);
-        self.panic_message = buf;
+    pub fn setPanic(self: *AsyncHandle, msg: []const u8) void {
+        const len = @min(msg.len, PANIC_BUF_SIZE);
+        @memcpy(self.panic_buf[0..len], msg[0..len]);
+        self.panic_len = @intCast(len);
         self.setStatus(.Failed);
+    }
+
+    /// 获取 panic 信息切片（无消息时返回 null）
+    pub fn panicMessage(self: *const AsyncHandle) ?[]const u8 {
+        if (self.panic_len == 0) return null;
+        return self.panic_buf[0..self.panic_len];
     }
 
     /// 阻塞等待任务完成并消费结果
@@ -538,18 +697,17 @@ test "channel send after close returns false" {
     try testing.expect(!(try ch.send(v)));
 }
 
-test "AsyncHandle setPanic 释放 panic_message" {
+test "AsyncHandle setPanic 内联缓冲区" {
     var tc = testCtx();
     tc.c.global = &tc.g;
     defer tc.g.deinit();
     defer tc.c.deinit();
     const handle = try tc.c.createObj(AsyncHandle);
     handle.* = AsyncHandle.init();
-    handle.setPanic(&tc.c, "boom");
-    try testing.expect(handle.panic_message != null);
-    try testing.expectEqualStrings("boom", handle.panic_message.?);
+    handle.setPanic("boom");
+    try testing.expect(handle.panicMessage() != null);
+    try testing.expectEqualStrings("boom", handle.panicMessage().?);
     try testing.expectEqual(AsyncStatus.Failed, handle.getStatus());
-    // 手动触发 deinit（释放 panic_message 独立分配）
     handle.deinit(&tc.c);
     tc.c.freeObj(@ptrCast(handle));
 }

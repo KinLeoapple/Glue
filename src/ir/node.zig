@@ -36,6 +36,9 @@ pub const NodeOp = enum(u8) {
     array_slice,
     record_make, record_get, record_set, record_clone,
     string_concat, string_len, string_index, string_contains,
+    /// 字符串字典序比较：string_cmp(output, left, right)
+    /// _pad 编码比较种类：0=lt, 1=le, 2=gt, 3=ge，output 为 bool_chan
+    string_cmp,
     /// 字符串切片：string_slice(output, s, start, end) — _pad=0 左闭右开，_pad=1 左闭右闭
     /// start/end 为字符索引（Unicode 标量值）
     string_slice,
@@ -106,6 +109,11 @@ pub const NodeOp = enum(u8) {
     channel_create, channel_sender, channel_receiver,
 
     // === 原子操作 ===
+    /// 构造 AtomicValue：inputs[0] = 初始值，output = ref_chan（AtomicValue 指针）
+    atomic_make,
+    /// 原子 fetch_add：inputs[0] = Atomic ref_chan，inputs[1] = 增量值
+    /// output = 旧值。_pad=0 为 add，_pad=1 为 sub
+    atomic_fetch_add,
     atomic_swap, atomic_cas,
 
     // === 反射方法（.message() / .type_name()） ===
@@ -113,6 +121,16 @@ pub const NodeOp = enum(u8) {
 
     // === 闭包（lambda） ===
     closure_make, call_indirect,
+
+    // === 部分应用 ===
+    /// 构造 PartialApplication：meta_index 指向 PartialMeta，output = ref_chan
+    partial_make,
+
+    // === 惰性求值（Lazy<T>） ===
+    /// 构造 LazyValue：inputs[0] = thunk closure (ref_chan)，output = ref_chan
+    lazy_make,
+    /// 强制求值：inputs[0] = LazyValue (ref_chan)，output = 值通道
+    lazy_force,
 
     /// 返回该 op 是否为 halt 节点（终止执行）
     pub fn isHalt(self: NodeOp) bool {

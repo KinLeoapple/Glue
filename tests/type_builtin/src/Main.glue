@@ -5,11 +5,11 @@ type UserId = UserId(i32)
 type Point = Point(x: i32, y: i32)
 
 fun main() {
-    // ---- primitives: smallest-type inference for unannotated int literals ----
-    println(type(42))         // i8
-    println(type(200))        // u8
+    // ---- primitives: Rust 模式无约束回退 i32/f32 ----
+    println(type(42))         // i32
+    println(type(200))        // i32
     println(type(100000))     // i32
-    println(type(3.14))       // f128 (smallest float that round-trips)
+    println(type(3.14))       // f32
 
     // ---- suffix overrides ----
     println(type(42i32))      // i32
@@ -48,14 +48,14 @@ fun main() {
 
     // ---- type() result is a str, usable in interpolation and concat ----
     val t = type(42)
-    println("kind=" + t)          // kind=i8
+    println("kind=" + t)          // kind=i32
     println("the type is {type(true)}")  // the type is bool
     println(type(t))              // str (type of a type-name is str)
 
     // ---- type() inside match / comparison ----
     val x = 5
-    val desc = if type(x) == "i8" { "small int" } else { "other" }
-    println(desc)                 // small int
+    val desc = if type(x) == "i32" { "int" } else { "other" }
+    println(desc)                 // int
 
     println("type_builtin: All tests passed!")
 }

@@ -226,6 +226,25 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(exe);
 
+    // ---- deepCopy 微基准可执行文件 ----
+    const deepcopy_bench_module = b.createModule(.{
+        .root_source_file = b.path("bench/deepcopy_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    deepcopy_bench_module.addImport("value", value_module);
+    deepcopy_bench_module.addImport("mem", mem_module);
+    deepcopy_bench_module.addImport("sync", sync_module);
+    deepcopy_bench_module.addImport("ast", ast_module);
+    const deepcopy_bench_exe = b.addExecutable(.{
+        .name = "deepcopy_bench",
+        .root_module = deepcopy_bench_module,
+    });
+    deepcopy_bench_exe.root_module.linkSystemLibrary("c", .{});
+    const deepcopy_install = b.addInstallArtifact(deepcopy_bench_exe, .{});
+    const bench_step = b.step("bench-deepcopy", "Build deepCopy micro-benchmark");
+    bench_step.dependOn(&deepcopy_install.step);
+
     // ---- 单元测试：为每个需要测试的模块创建测试产物 ----
     const lexer_unit_tests = b.addTest(.{
         .root_module = lexer_module,
@@ -322,19 +341,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_syscall_unit_tests = b.addRunArtifact(syscall_unit_tests);
 
-    // 执行引擎测试（需导入 ir、mem、ast、lexer、parser、value、syscall）
+    // 执行引擎测试（需导入 ir、mem、ast、lexer、parser、value、syscall、sema）
+    // 注意：此处使用 ir_module（非 ir_module_test）与 syscall_module（非 syscall_module_test），
+    // 与 type_check_module 的 ir 依赖保持同一模块实例，确保 SemaResult 类型身份一致。
+    // ir/syscall 自身的测试由各自的独立测试产物覆盖。
     const engine_module_test = b.createModule(.{
         .root_source_file = b.path("src/engine/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
-    engine_module_test.addImport("ir", ir_module_test);
+    engine_module_test.addImport("ir", ir_module);
     engine_module_test.addImport("mem", mem_module);
     engine_module_test.addImport("ast", ast_module);
     engine_module_test.addImport("lexer", lexer_module);
     engine_module_test.addImport("parser", parser_module);
     engine_module_test.addImport("value", value_module);
-    engine_module_test.addImport("syscall", syscall_module_test);
+    engine_module_test.addImport("syscall", syscall_module);
+    engine_module_test.addImport("sema", type_check_module);
     const engine_unit_tests = b.addTest(.{
         .root_module = engine_module_test,
     });

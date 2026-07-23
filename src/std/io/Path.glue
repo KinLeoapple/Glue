@@ -15,17 +15,28 @@ pub type Path = Path(segments: str[], is_absolute: bool)
 
 // 路径分隔符规范化：'\' → '/'
 // 不调用 syscall，纯字符串扫描替换
+// 优化：用 str 累积（走 concatInPlace amortized O(n)），避免 u8[] ++ 的 O(n²)
 pub fun normalize_seps(s: str): str {
-    var bytes = s.bytes()
-    var out: u8[] = []
-    for b in bytes {
-        if b == cast('\\').to(u8) {
-            out = out ++ [cast('/').to(u8)]
-        } else {
-            out = out ++ [b]
+    var out: str = ""
+    var i: usize = 0
+    var seg_start: usize = 0
+    // 按段累积：遇到反斜杠记录前段并追加 '/'，其余原样追加
+    while i < s.len() {
+        val c = s[i]
+        if c == '\\' {
+            if i > seg_start {
+                out = out + s[seg_start..i]
+            }
+            out = out + "/"
+            seg_start = i + 1
         }
+        i = i + 1
     }
-    cast(out).to(str)
+    // 追加末尾段
+    if seg_start < s.len() {
+        out = out + s[seg_start..s.len()]
+    }
+    out
 }
 
 // 按分隔符切分字符串，过滤空段和 "."（当前目录）

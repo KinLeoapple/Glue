@@ -1,12 +1,19 @@
-// 值语义 + 写时拷贝（COW）回归：共享绑定下别名必须互不影响
+// 统一值语义回归：默认深拷贝，&T / *T 显式引用才共享
 
 type Pair = Pair(a: i32, b: i32)
 
 fun takesRec(p: (x: i32, y: i32)): i32 { p.x + p.y }
 
+fun modifyRec(p: (x: i32, y: i32)) { p.x = 999 }
+
+fun makeRec(): (x: i32, y: i32) {
+    val inner = (x: 5i32, y: 6i32)
+    inner
+}
+
 fun main() {
     // ---- 记录：val 别名 + var 改字段，原值不变 ----
-    val a = (x: 1, y: 2)
+    val a = (x: 1i32, y: 2i32)
     var b = a
     b.x = 99
     println(a.x)        // 1 (未被串改)
@@ -21,7 +28,7 @@ fun main() {
     println(arr[1])     // 2
 
     // ---- 自身改字段正常 ----
-    var r = (x: 5, y: 6)
+    var r = (x: 5i32, y: 6i32)
     r.x = 50
     println(r.x)        // 50
     println(r.y)        // 6 (其它字段不变)
@@ -31,8 +38,26 @@ fun main() {
     println(takesRec((x: pt.x, y: pt.y)))   // 7
     println(pt.x)           // 3
 
+    // ---- 函数参数深拷贝：函数内修改不影响调用者 ----
+    val arg = (x: 1i32, y: 2i32)
+    modifyRec(arg)
+    println(arg.x)          // 1
+
+    // ---- 函数返回值深拷贝：多次调用结果独立 ----
+    val r1 = makeRec()
+    var r2 = makeRec()
+    r2.x = 100
+    println(r1.x)           // 5
+    println(r2.x)           // 100
+
+    // ---- &T 参数仍保持引用语义 ----
+    fun modifyRef(p: &(x: i32, y: i32)) { p.x = 888 }
+    var target = (x: 1i32, y: 2i32)
+    modifyRef(&target)
+    println(target.x)       // 888
+
     // ---- 多层别名链 ----
-    val base = (k: 1)
+    val base = (k: 1i32)
     val x1 = base
     val x2 = x1
     var x3 = x2
@@ -43,14 +68,14 @@ fun main() {
     println(x3.k)       // 100
 
     // ---- 数组里的记录元素（嵌套共享）----
-    val rec = (n: 7)
+    val rec = (n: 7i32)
     var lst = [rec, rec]
-    lst[0] = (n: 70)
+    lst[0] = (n: 70i32)
     println(rec.n)      // 7 (原记录不变)
 
     // ---- 记录更新 spread 不影响源 ----
-    val src = (p: 1, q: 2, s: 3)
-    val upd = (...src, q: 20)
+    val src = (p: 1i32, q: 2i32, s: 3i32)
+    val upd = (...src, q: 20i32)
     println(src.q)      // 2
     println(upd.q)      // 20
     println(upd.p)      // 1

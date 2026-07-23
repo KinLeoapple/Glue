@@ -42,20 +42,26 @@ pub async fun remove(path: str, recursive: bool): Async<Throw<Unit, IOError>> {
 }
 
 // 递归遍历目录树（深度优先），返回所有条目（含子目录中的条目）
+// 优化：本级条目先收集到局部数组（小数组 ++ 开销小），子目录结果批量拼接，
+// 避免对累积的大 result 反复 ++ 导致 O(n²)
 pub async fun walk(path: str): Async<Throw<DirEntry[], IOError>> {
     val entries = __dir_list(path)?
-    var result: DirEntry[] = []
+    // 本级所有条目一次性入 result（entries 已是数组，直接用作初始值）
+    var result: DirEntry[] = entries
+    // 收集子目录路径，统一递归后批量拼接
+    var sub_paths: str[] = []
     for e in entries {
-        result = result ++ [e]
         match e.kind {
             Directory => {
-                // 纯 Glue 路径拼接：path + "/" + name（替代 __path_join_str syscall）
-                val sub_path = path + "/" + e.name
-                val sub_entries = walk(sub_path).await()?
-                result = result ++ sub_entries
+                sub_paths = sub_paths ++ [path + "/" + e.name]
             },
             _ => {},
         }
+    }
+    // 逐个递归子目录，每次批量拼接结果
+    for sp in sub_paths {
+        val sub_entries = walk(sp).await()?
+        result = result ++ sub_entries
     }
     Ok(result)
 }

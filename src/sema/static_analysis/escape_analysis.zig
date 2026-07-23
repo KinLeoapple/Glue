@@ -107,6 +107,12 @@ pub const ParamEscapeTable = struct {
         try self.entries.put(name, owned);
     }
 
+    /// 直接接管 params 所有权（不 dupe），调用方必须用 allocator 分配 params
+    pub fn putOwned(self: *ParamEscapeTable, name: []const u8, params: []ParamEscape) !void {
+        try self.storage.append(self.allocator, params);
+        try self.entries.put(name, params);
+    }
+
     pub fn lookup(self: *const ParamEscapeTable, name: []const u8) ?[]const ParamEscape {
         return self.entries.get(name);
     }
@@ -236,7 +242,8 @@ pub const EscapePass = struct {
             return;
         }
         // 初始化所有参数为 no_escape
-        const param_escapes = try self.allocator.alloc(ParamEscape, param_count);
+        // 用 param_escape_table.allocator 分配，putOwned 转移所有权（不 dupe）
+        const param_escapes = try self.param_escape_table.allocator.alloc(ParamEscape, param_count);
         for (param_escapes) |*pe| pe.* = .no_escape;
 
         // 构建初始环境：每个参数名指向 .param(i)（携带索引，便于 return 时检测）
@@ -252,7 +259,8 @@ pub const EscapePass = struct {
         // trailing expr（隐式返回）的参数逃逸检测
         markParamEscape(body_src, param_escapes);
 
-        try self.param_escape_table.put(fd.name, param_escapes);
+        // 转移所有权给 param_escape_table（不 dupe）
+        try self.param_escape_table.putOwned(fd.name, param_escapes);
     }
 
     // ── 阶段 2：函数逃逸分析 ──

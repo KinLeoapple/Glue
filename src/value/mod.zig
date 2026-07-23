@@ -44,7 +44,7 @@ pub const TraitValue = callable.TraitValue;
 pub const LazyValue = callable.LazyValue;
 const BuiltinFn = callable.BuiltinFn;
 const Builtin = callable.Builtin;
-const PartialApplication = callable.PartialApplication;
+pub const PartialApplication = callable.PartialApplication;
 
 // ── 控制流类型 ──
 pub const control = @import("control.zig");
@@ -201,13 +201,19 @@ pub const Value = union(enum) {
     /// 构造数组值，可选固定大小
     /// header 和 elements 分离分配：header 走页池，elements 独立分配（支持后续 push/pop 替换切片）
     pub fn makeArray(tctx: *ThreadContext, elements: []Value, fixed_size: ?u64) !Value {
+        return makeArrayEx(tctx, elements, fixed_size, false);
+    }
+
+    /// 构造数组值（扩展版）：可指定元素类型是否为 &T / *T 引用类型。
+    /// elem_is_ref 决定数组元素按值语义深拷贝还是按引用语义共享。
+    pub fn makeArrayEx(tctx: *ThreadContext, elements: []Value, fixed_size: ?u64, elem_is_ref: bool) !Value {
         const arr = try tctx.createObj(ArrayValue);
         const elems: []Value = if (elements.len > 0) blk: {
             const buf = try tctx.allocObj(elements.len * @sizeOf(Value));
             break :blk @as([*]Value, @ptrCast(@alignCast(buf.ptr)))[0..elements.len];
         } else &.{};
         @memcpy(elems, elements);
-        arr.* = .{ .elements = elems, .capacity = elems.len, .fixed_size = fixed_size };
+        arr.* = .{ .elements = elems, .capacity = elems.len, .fixed_size = fixed_size, .elem_is_ref = elem_is_ref };
         return .{ .ref = &arr.header };
     }
 
@@ -215,13 +221,19 @@ pub const Value = union(enum) {
     /// 连续内存布局：[RecordValue header | Value fields[]]
     /// fields 切片指向尾部连续区域，单次分配单次释放
     pub fn makeRecord(tctx: *ThreadContext, type_name: []const u8, fields: []Value) !Value {
+        return makeRecordEx(tctx, type_name, fields, 0);
+    }
+
+    /// 构造记录值（扩展版）：可指定字段引用标记位图。
+    /// field_ref_bits 第 i 位为 1 表示第 i 个字段类型为 &T / *T。
+    pub fn makeRecordEx(tctx: *ThreadContext, type_name: []const u8, fields: []Value, field_ref_bits: u64) !Value {
         const f_size = fields.len * @sizeOf(Value);
         const total = @sizeOf(RecordValue) + f_size;
         const mem = try tctx.allocObj(total);
         const rec: *RecordValue = @ptrCast(@alignCast(mem.ptr));
         const f_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(RecordValue)));
         @memcpy(f_ptr[0..fields.len], fields);
-        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..fields.len] };
+        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..fields.len], .field_ref_bits = field_ref_bits };
         return .{ .ref = &rec.header };
     }
 
@@ -234,26 +246,43 @@ pub const Value = union(enum) {
         fields: []Value,
         field_names: []const ?[]const u8,
     ) !Value {
+        return makeRecordWithNamesEx(tctx, type_name, fields, field_names, 0);
+    }
+
+    /// 构造记录值（带字段名表扩展版）：可指定字段引用标记位图。
+    pub fn makeRecordWithNamesEx(
+        tctx: *ThreadContext,
+        type_name: []const u8,
+        fields: []Value,
+        field_names: []const ?[]const u8,
+        field_ref_bits: u64,
+    ) !Value {
         const f_size = fields.len * @sizeOf(Value);
         const total = @sizeOf(RecordValue) + f_size;
         const mem = try tctx.allocObj(total);
         const rec: *RecordValue = @ptrCast(@alignCast(mem.ptr));
         const f_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(RecordValue)));
         @memcpy(f_ptr[0..fields.len], fields);
-        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..fields.len], .field_names = field_names };
+        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..fields.len], .field_names = field_names, .field_ref_bits = field_ref_bits };
         return .{ .ref = &rec.header };
     }
 
     /// 构造代数数据类型（ADT）值，携带类型名、构造子和字段
     /// 连续内存布局：[AdtValue header | AdtField fields[]]
     pub fn makeAdt(tctx: *ThreadContext, type_name: []const u8, constructor: []const u8, fields: []AdtField) !Value {
+        return makeAdtEx(tctx, type_name, constructor, fields, 0);
+    }
+
+    /// 构造 ADT 值（扩展版）：可指定字段引用标记位图。
+    /// field_ref_bits 第 i 位为 1 表示第 i 个字段类型为 &T / *T。
+    pub fn makeAdtEx(tctx: *ThreadContext, type_name: []const u8, constructor: []const u8, fields: []AdtField, field_ref_bits: u64) !Value {
         const f_size = fields.len * @sizeOf(AdtField);
         const total = @sizeOf(AdtValue) + f_size;
         const mem = try tctx.allocObj(total);
         const adt: *AdtValue = @ptrCast(@alignCast(mem.ptr));
         const f_ptr: [*]AdtField = @ptrCast(@alignCast(mem.ptr + @sizeOf(AdtValue)));
         @memcpy(f_ptr[0..fields.len], fields);
-        adt.* = .{ .type_name = type_name, .constructor = constructor, .fields = f_ptr[0..fields.len] };
+        adt.* = .{ .type_name = type_name, .constructor = constructor, .fields = f_ptr[0..fields.len], .field_ref_bits = field_ref_bits };
         return .{ .ref = &adt.header };
     }
 
@@ -297,20 +326,27 @@ pub const Value = union(enum) {
             .upvalues = uv_ptr[0..closure.upvalues.len],
             .bound_args = ba_ptr[0..closure.bound_args.len],
             .self_upvalue_idx = closure.self_upvalue_idx,
+            .upvalue_ref_bits = closure.upvalue_ref_bits,
+            .cell_upvalues = closure.cell_upvalues,
         };
         return .{ .ref = &c.header };
     }
 
     /// 构造部分应用值，绑定部分参数
     /// 连续内存布局：[PartialApplication header | bound_args[]]
-    pub fn makePartial(tctx: *ThreadContext, func: Value, bound_args: []Value, remaining_arity: u8) !Value {
+    pub fn makePartial(tctx: *ThreadContext, func: *const anyopaque, bound_args: []Value, remaining_arity: u8, ref_bits: u16) !Value {
         const ba_size = bound_args.len * @sizeOf(Value);
         const total = @sizeOf(PartialApplication) + ba_size;
         const mem = try tctx.allocObj(total);
         const p: *PartialApplication = @ptrCast(@alignCast(mem.ptr));
         const ba_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(PartialApplication)));
         @memcpy(ba_ptr[0..bound_args.len], bound_args);
-        p.* = .{ .func = func, .bound_args = ba_ptr[0..bound_args.len], .remaining_arity = remaining_arity };
+        p.* = .{
+            .func = func,
+            .bound_args = ba_ptr[0..bound_args.len],
+            .remaining_arity = remaining_arity,
+            .bound_arg_ref_bits = ref_bits,
+        };
         return .{ .ref = &p.header };
     }
 
@@ -428,6 +464,40 @@ pub const Value = union(enum) {
     /// 取堆引用指针
     pub inline fn asRef(self: Value) *ObjHeader {
         return self.ref;
+    }
+
+    // ════════════════════════════════════════════
+    // 跨宽度标量转换
+    // ════════════════════════════════════════════
+
+    /// 任意整数变体 -> 目标整数类型（带截断/扩展）
+    pub inline fn intCast(self: Value, comptime T: type) T {
+        return switch (self) {
+            .i8    => @intCast(self.asI8()),
+            .i16   => @intCast(self.asI16()),
+            .i32   => @intCast(self.asI32()),
+            .i64   => @intCast(self.asI64()),
+            .i128  => @intCast(self.asI128()),
+            .u8    => @intCast(self.asU8()),
+            .u16   => @intCast(self.asU16()),
+            .u32   => @intCast(self.asU32()),
+            .u64   => @intCast(self.asU64()),
+            .u128  => @intCast(self.asU128()),
+            .isize => @intCast(self.asIsize()),
+            .usize => @intCast(self.asUsize()),
+            else   => 0,
+        };
+    }
+
+    /// 任意浮点变体 -> 目标浮点类型（带精度转换）
+    pub inline fn floatCast(self: Value, comptime T: type) T {
+        return switch (self) {
+            .f16  => @floatCast(self.asF16()),
+            .f32  => @floatCast(self.asF32()),
+            .f64  => @floatCast(self.asF64()),
+            .f128 => @floatCast(self.asF128()),
+            else  => 0,
+        };
     }
 
     // ════════════════════════════════════════════
@@ -583,17 +653,34 @@ pub const Value = union(enum) {
                     .error_val => try deepCopyError(obj, tctx),
                     .throw_val => try deepCopyThrow(obj, tctx),
                     .trait_val => try deepCopyTrait(obj, tctx),
-                    // 迭代器、惰性值、并发对象：引用语义，retain 即可
+                    // 迭代器、惰性值、并发对象、装箱标量：引用语义，retain 即可
                     .array_iter, .string_iter, .range_iter,
                     .lazy_val,
-                    .atomic_val, .async_val, .channel_val, .sender_val, .receiver_val => self.retain(),
+                    .atomic_val, .async_val, .channel_val, .sender_val, .receiver_val,
+                    .boxed_scalar => self.retain(),
                 };
             },
         }
     }
 
+    /// 检测切片内所有 Value 是否为标量（非堆引用）
+    /// 用于 deepCopy 快路径：全标量时直接 memcpy，跳过逐元素递归调用
+    inline fn allScalar(values: []const Value) bool {
+        for (values) |v| if (v == .ref) return false;
+        return true;
+    }
+
     fn deepCopyStr(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const s: *Str = @alignCast(@fieldParentPtr("header", obj));
+        // SSO 快路径：整体拷贝 32B 结构体，仅重置引用计数
+        if (s.isSso()) {
+            const new_s = try tctx.createObj(Str);
+            new_s.* = s.*;
+            new_s.header.rc = 1;
+            // 重置 SSO 引用计数为初始值 1，保留标志位和长度
+            new_s.sso_flags = (s.sso_flags & ~Str.SSO_REFCOUNT_MASK) | Str.SSO_REFCOUNT_INIT;
+            return .{ .ref = &new_s.header };
+        }
         return try Value.fromStringBytes(tctx, s.bytes());
     }
 
@@ -605,19 +692,38 @@ pub const Value = union(enum) {
             break :blk @as([*]Value, @ptrCast(@alignCast(buf.ptr)))[0..p.elements.len];
         } else &.{};
         errdefer if (p.elements.len > 0) tctx.freeObj(@ptrCast(new_elems.ptr));
-        var copied: usize = 0;
-        errdefer {
-            for (new_elems[0..copied]) |e| e.release(tctx);
-        }
-        for (p.elements, 0..) |elem, i| {
-            new_elems[i] = try elem.deepCopy(tctx);
-            copied += 1;
+
+        // 标量快路径：非引用元素且全标量时，直接 memcpy
+        if (!p.elem_is_ref and allScalar(p.elements)) {
+            @memcpy(new_elems, p.elements);
+        } else if (p.elem_is_ref) {
+            // 引用元素：全部 retain
+            var copied: usize = 0;
+            errdefer {
+                for (new_elems[0..copied]) |e| e.release(tctx);
+            }
+            for (p.elements, 0..) |elem, i| {
+                new_elems[i] = elem;
+                if (elem.isBoxed()) _ = elem.retain();
+                copied += 1;
+            }
+        } else {
+            // 混合元素：逐个递归深拷贝
+            var copied: usize = 0;
+            errdefer {
+                for (new_elems[0..copied]) |e| e.release(tctx);
+            }
+            for (p.elements, 0..) |elem, i| {
+                new_elems[i] = try elem.deepCopy(tctx);
+                copied += 1;
+            }
         }
         const arr = try tctx.createObj(ArrayValue);
         arr.* = .{
             .elements = new_elems,
             .capacity = new_elems.len,
             .fixed_size = p.fixed_size,
+            .elem_is_ref = p.elem_is_ref,
         };
         return .{ .ref = &arr.header };
     }
@@ -631,16 +737,29 @@ pub const Value = union(enum) {
         const rec: *RecordValue = @ptrCast(@alignCast(mem.ptr));
         const f_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(RecordValue)));
         const new_fields = f_ptr[0..p.fields.len];
-        var copied: usize = 0;
-        errdefer {
-            for (new_fields[0..copied]) |*v| v.release(tctx);
-            tctx.freeObj(@ptrCast(rec));
+
+        // 标量快路径：无引用字段且全标量时，直接 memcpy
+        if (p.field_ref_bits == 0 and allScalar(p.fields)) {
+            @memcpy(new_fields, p.fields);
+        } else {
+            var copied: usize = 0;
+            errdefer {
+                for (new_fields[0..copied]) |*v| v.release(tctx);
+                tctx.freeObj(@ptrCast(rec));
+            }
+            for (p.fields, 0..) |src, i| {
+                if (p.fieldIsRef(@intCast(i))) {
+                    // 字段类型为 &T / *T：保持引用语义，retain 即可
+                    new_fields[i] = src;
+                    if (src.isBoxed()) _ = src.retain();
+                    copied = i + 1;
+                } else {
+                    new_fields[i] = try src.deepCopy(tctx);
+                    copied = i + 1;
+                }
+            }
         }
-        for (p.fields, 0..) |src, i| {
-            new_fields[i] = try src.deepCopy(tctx);
-            copied = i + 1;
-        }
-        rec.* = .{ .type_name = p.type_name, .fields = new_fields, .field_names = p.field_names };
+        rec.* = .{ .type_name = p.type_name, .fields = new_fields, .field_names = p.field_names, .field_ref_bits = p.field_ref_bits };
         return .{ .ref = &rec.header };
     }
 
@@ -653,22 +772,47 @@ pub const Value = union(enum) {
         const adt: *AdtValue = @ptrCast(@alignCast(mem.ptr));
         const f_ptr: [*]AdtField = @ptrCast(@alignCast(mem.ptr + @sizeOf(AdtValue)));
         const new_fields = f_ptr[0..p.fields.len];
+
+        // 标量快路径：无引用字段且所有字段值为标量时，直接 memcpy
+        if (p.field_ref_bits == 0) {
+            var all_scalar = true;
+            for (p.fields) |f| if (f.value == .ref) { all_scalar = false; break; };
+            if (all_scalar) {
+                @memcpy(new_fields, p.fields);
+                adt.* = .{
+                    .type_name = p.type_name,
+                    .constructor = p.constructor,
+                    .fields = new_fields,
+                    .field_ref_bits = p.field_ref_bits,
+                };
+                return .{ .ref = &adt.header };
+            }
+        }
+
         var copied: usize = 0;
         errdefer {
             for (new_fields[0..copied]) |*f| f.value.release(tctx);
             tctx.freeObj(@ptrCast(adt));
         }
         for (p.fields, 0..) |f, i| {
-            new_fields[i] = .{
-                .name = f.name,
-                .value = try f.value.deepCopy(tctx),
-            };
-            copied += 1;
+            if (p.fieldIsRef(@intCast(i))) {
+                // 字段类型为 &T / *T：保持引用语义，retain 即可
+                new_fields[i] = .{ .name = f.name, .value = f.value };
+                if (f.value.isBoxed()) _ = f.value.retain();
+                copied += 1;
+            } else {
+                new_fields[i] = .{
+                    .name = f.name,
+                    .value = try f.value.deepCopy(tctx),
+                };
+                copied += 1;
+            }
         }
         adt.* = .{
             .type_name = p.type_name,
             .constructor = p.constructor,
             .fields = new_fields,
+            .field_ref_bits = p.field_ref_bits,
         };
         return .{ .ref = &adt.header };
     }
@@ -685,7 +829,11 @@ pub const Value = union(enum) {
 
     fn deepCopyRange(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *Range = @alignCast(@fieldParentPtr("header", obj));
-        return try Value.makeRange(tctx, p.start, p.end, p.inclusive);
+        // 直接 memcpy：Range 为固定大小纯数据，无嵌套引用
+        const new_r = try tctx.createObj(Range);
+        new_r.* = p.*;
+        new_r.header.rc = 1;
+        return .{ .ref = &new_r.header };
     }
 
     fn deepCopyClosure(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
@@ -700,20 +848,36 @@ pub const Value = union(enum) {
         const ba_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(Closure) + uv_size));
         const new_upvalues = uv_ptr[0..p.upvalues.len];
         const new_bound_args = ba_ptr[0..p.bound_args.len];
-        var uv_copied: usize = 0;
-        var ba_copied: usize = 0;
-        errdefer {
-            for (new_upvalues[0..uv_copied]) |e| e.release(tctx);
-            for (new_bound_args[0..ba_copied]) |e| e.release(tctx);
-            tctx.freeObj(@ptrCast(c));
-        }
-        for (p.upvalues, 0..) |uv, i| {
-            new_upvalues[i] = try uv.deepCopy(tctx);
-            uv_copied += 1;
-        }
-        for (p.bound_args, 0..) |ba, i| {
-            new_bound_args[i] = try ba.deepCopy(tctx);
-            ba_copied += 1;
+
+        // 标量快路径：无引用 upvalue/arg 且全标量时，直接 memcpy
+        const no_ref = p.upvalue_ref_bits == 0 and p.cell_upvalues == 0;
+        if (no_ref and allScalar(p.upvalues) and allScalar(p.bound_args)) {
+            @memcpy(new_upvalues, p.upvalues);
+            @memcpy(new_bound_args, p.bound_args);
+        } else {
+            var uv_copied: usize = 0;
+            var ba_copied: usize = 0;
+            errdefer {
+                for (new_upvalues[0..uv_copied]) |e| e.release(tctx);
+                for (new_bound_args[0..ba_copied]) |e| e.release(tctx);
+                tctx.freeObj(@ptrCast(c));
+            }
+            // upvalues：按 ref bits 分派
+            for (p.upvalues, 0..) |uv, i| {
+                if (i < 8 and p.upvalueIsRef(@intCast(i))) {
+                    // &T / *T / cell 上值：保持引用语义，retain 即可
+                    new_upvalues[i] = uv;
+                    if (uv.isBoxed()) _ = uv.retain();
+                } else {
+                    new_upvalues[i] = try uv.deepCopy(tctx);
+                }
+                uv_copied += 1;
+            }
+            // bound_args：无条件深拷贝（与原实现一致）
+            for (p.bound_args, 0..) |ba, i| {
+                new_bound_args[i] = try ba.deepCopy(tctx);
+                ba_copied += 1;
+            }
         }
         c.* = .{
             .func = p.func,
@@ -721,6 +885,8 @@ pub const Value = union(enum) {
             .upvalues = new_upvalues,
             .bound_args = new_bound_args,
             .self_upvalue_idx = p.self_upvalue_idx,
+            .upvalue_ref_bits = p.upvalue_ref_bits,
+            .cell_upvalues = p.cell_upvalues,
         };
         return .{ .ref = &c.header };
     }
@@ -734,28 +900,39 @@ pub const Value = union(enum) {
         const pa: *PartialApplication = @ptrCast(@alignCast(mem.ptr));
         const ba_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(PartialApplication)));
         const new_bound_args = ba_ptr[0..p.bound_args.len];
-        const new_func = try p.func.deepCopy(tctx);
-        var ba_copied: usize = 0;
-        errdefer {
-            new_func.release(tctx);
-            for (new_bound_args[0..ba_copied]) |e| e.release(tctx);
-            tctx.freeObj(@ptrCast(pa));
-        }
-        for (p.bound_args, 0..) |ba, i| {
-            new_bound_args[i] = try ba.deepCopy(tctx);
-            ba_copied += 1;
+
+        // 标量快路径：无引用参数且全标量时，直接 memcpy
+        if (p.bound_arg_ref_bits == 0 and allScalar(p.bound_args)) {
+            @memcpy(new_bound_args, p.bound_args);
+        } else {
+            var ba_copied: usize = 0;
+            errdefer {
+                for (new_bound_args[0..ba_copied]) |e| e.release(tctx);
+                tctx.freeObj(@ptrCast(pa));
+            }
+            for (p.bound_args, 0..) |ba, i| {
+                const is_ref = (p.bound_arg_ref_bits >> @intCast(i)) & 1 == 1;
+                // &T / *T 绑定参数保持引用语义；普通参数深拷贝
+                new_bound_args[i] = if (is_ref) ba.retain() else try ba.deepCopy(tctx);
+                ba_copied += 1;
+            }
         }
         pa.* = .{
-            .func = new_func,
+            .func = p.func,
             .bound_args = new_bound_args,
             .remaining_arity = p.remaining_arity,
+            .bound_arg_ref_bits = p.bound_arg_ref_bits,
         };
         return .{ .ref = &pa.header };
     }
 
     fn deepCopyBuiltin(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *Builtin = @alignCast(@fieldParentPtr("header", obj));
-        return try Value.makeBuiltin(tctx, p.fn_ptr, p.user_ctx);
+        // 直接 memcpy：Builtin 为固定大小纯数据（函数指针 + ctx），无嵌套引用
+        const new_b = try tctx.createObj(Builtin);
+        new_b.* = p.*;
+        new_b.header.rc = 1;
+        return .{ .ref = &new_b.header };
     }
 
     fn deepCopyError(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
@@ -788,22 +965,29 @@ pub const Value = union(enum) {
         const tv: *TraitValue = @ptrCast(@alignCast(mem.ptr));
         const mv_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(TraitValue)));
         const new_values = mv_ptr[0..count];
-        // method_names 独立分配：指针数组 + 每个名字字符串
-        const names_mem = if (count > 0) try tctx.allocObj(count * @sizeOf([]const u8)) else &.{};
-        const new_names: [][]const u8 = if (count > 0) @as([*][]const u8, @ptrCast(@alignCast(@constCast(names_mem.ptr))))[0..count] else &.{};
+
+        // method_names 批量分配：指针数组 + 所有名字字节连续
+        var names_total: usize = 0;
+        for (p.method_names) |n| names_total += n.len;
+        const names_mem: []u8 = if (count > 0) try tctx.allocObj(count * @sizeOf([]const u8) + names_total) else &[_]u8{};
+        const new_names: [][]const u8 = if (count > 0) @as([*][]const u8, @ptrCast(@alignCast(names_mem.ptr)))[0..count] else &.{};
         var names_copied: usize = 0;
         var values_copied: usize = 0;
         errdefer {
-            for (new_names[0..names_copied]) |n| if (n.len > 0) tctx.freeObj(@ptrCast(@constCast(n.ptr)));
             if (count > 0) tctx.freeObj(@ptrCast(new_names.ptr));
             for (new_values[0..values_copied]) |v| v.release(tctx);
             tctx.freeObj(@ptrCast(tv));
         }
-        for (p.method_names, 0..) |name, i| {
-            const name_buf = try tctx.allocObj(name.len);
-            @memcpy(name_buf, name);
-            new_names[i] = name_buf;
-            names_copied += 1;
+        // 批量填充 names：字节紧跟指针数组之后
+        if (count > 0) {
+            var byte_offset: usize = count * @sizeOf([]const u8);
+            for (p.method_names, 0..) |name, i| {
+                const dst = names_mem[byte_offset .. byte_offset + name.len];
+                @memcpy(dst, name);
+                new_names[i] = dst;
+                names_copied += 1;
+                byte_offset += name.len;
+            }
         }
         for (p.method_values, 0..) |val, i| {
             new_values[i] = try val.deepCopy(tctx);

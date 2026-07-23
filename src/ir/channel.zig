@@ -107,6 +107,9 @@ pub const ChannelMeta = struct {
     inner_type: ChanType = .null_chan,
     /// 是否为 Cell 包装通道（var 变量用，支持后续赋值）
     is_cell: bool = false,
+    /// 通道是否为 &T / *T 引用类型（ref_chan 时有效）。
+    /// 用于运行时判断值语义：普通复合类型 ref_chan 需深拷贝，引用类型保持共享。
+    is_ref: bool = false,
 };
 
 /// 通道空间：管理全局通道索引的分配
@@ -132,20 +135,25 @@ pub const ChannelSpace = struct {
 
     /// 分配一个新通道，返回其全局索引
     pub fn alloc(self: *ChannelSpace, chan_type: ChanType) !u16 {
-        return self.allocInner(chan_type, .null_chan, false);
+        return self.allocInner(chan_type, .null_chan, false, false);
+    }
+
+    /// 分配一个引用类型通道（&T / *T）
+    pub fn allocRef(self: *ChannelSpace, chan_type: ChanType) !u16 {
+        return self.allocInner(chan_type, .null_chan, false, true);
     }
 
     /// 分配一个 Cell 通道（var 变量用）
     pub fn allocCell(self: *ChannelSpace, chan_type: ChanType) !u16 {
-        return self.allocInner(chan_type, .null_chan, true);
+        return self.allocInner(chan_type, .null_chan, true, false);
     }
 
     /// 分配一个 Nullable 通道
     pub fn allocNullable(self: *ChannelSpace, inner_type: ChanType) !u16 {
-        return self.allocInner(.nullable_chan, inner_type, false);
+        return self.allocInner(.nullable_chan, inner_type, false, false);
     }
 
-    fn allocInner(self: *ChannelSpace, chan_type: ChanType, inner_type: ChanType, is_cell: bool) !u16 {
+    fn allocInner(self: *ChannelSpace, chan_type: ChanType, inner_type: ChanType, is_cell: bool, is_ref: bool) !u16 {
         const idx: u16 = @intCast(self.metas.items.len);
         const elem_w = if (chan_type == .nullable_chan) nullableElemWidth(inner_type) else chan_type.elemWidth();
         try self.metas.append(self.allocator, .{
@@ -153,6 +161,7 @@ pub const ChannelSpace = struct {
             .elem_width = elem_w,
             .inner_type = inner_type,
             .is_cell = is_cell,
+            .is_ref = is_ref,
         });
         return idx;
     }

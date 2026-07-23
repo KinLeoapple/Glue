@@ -287,6 +287,12 @@ fn deadNodeElim(ir: *GlueIR) bool {
             if (out < max_chan) referenced[out] = true;
         }
     }
+    // partial_make 通过 PartialMeta 间接引用绑定参数通道，必须额外标记
+    for (ir.partial_metas) |pm| {
+        for (pm.bound_arg_channels) |ch| {
+            if (ch < max_chan) referenced[ch] = true;
+        }
+    }
 
     // 标记死节点（用无效 op 标记，后续压缩）
     var changed = false;
@@ -317,6 +323,8 @@ fn hasSideEffect(op: NodeOp) bool {
         .orbit_chan_send, .orbit_chan_recv, .orbit_chan_try_recv,
         .channel_close,
         .closure_make, .call_indirect,
+        // partial_make 分配 PartialApplication 堆对象，有副作用
+        .partial_make,
         // race_select 阻塞等待通道就绪/超时，结果依赖时序，不可消除
         .race_select, .race_yield,
         .builtin_print, .builtin_println,
@@ -339,6 +347,8 @@ fn hasSideEffect(op: NodeOp) bool {
         .vec_source, .vec_sink, .vec_zip, .vec_take,
         // ref_set 通过引用写入原始通道（回写语义），有副作用
         .ref_set,
+        // atomic 操作：分配堆对象或互斥保护的读-改-写，有副作用
+        .atomic_make, .atomic_fetch_add, .atomic_swap, .atomic_cas,
         => true,
         else => false,
     };

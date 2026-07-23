@@ -1,0 +1,35 @@
+// Edge cases: Lazy<T> 惰性求值与缓存
+
+var compute_count = 0
+
+fun expensive(x: i32): i32 {
+    compute_count = compute_count + 1
+    x * x
+}
+
+fun makeLazy(): Lazy<i32> {
+    lazy expensive(7)
+}
+
+fun main() {
+    // 1. 创建时不求值
+    val lz = lazy expensive(5)
+    println("created")
+    if compute_count != 0 { println("wrong: computed too early") }
+
+    // 2. 首次访问触发求值
+    println(lz)
+    if compute_count != 1 { println("wrong: should compute once") }
+
+    // 3. 二次访问使用缓存，不重新计算
+    println(lz)
+    if compute_count != 1 { println("wrong: should not recompute") }
+
+    // 4. thunk 捕获外部变量
+    val lz2 = makeLazy()
+    println(lz2)
+    println(lz2)
+    if compute_count != 2 { println("wrong: captured lazy should compute once") }
+
+    println("edge_lazy: All tests passed!")
+}

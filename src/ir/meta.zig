@@ -60,6 +60,10 @@ pub const CallMeta = struct {
     /// typeof(T) 在泛型函数内通过哨兵 meta_index=0x8000|param_idx 查此切片
     /// 由调用点从显式 type_args 或参数类型推断填充
     type_args: []const u16 = &.{},
+    /// 参数引用标记位图：第 i 位为 1 表示第 i 个实参是 &T / *T，不执行深拷贝
+    arg_ref_bits: u16 = 0,
+    /// 返回值是否为 &T / *T，为 true 时返回不执行深拷贝
+    ret_is_ref: bool = false,
 };
 
 /// halt 种类：控制 cleanup 的触发时机
@@ -284,6 +288,29 @@ pub const ClosureMeta = struct {
     /// 每个 upvalue 是否为 cell 通道（var 变量，引用语义），最多 8 个 upvalue
     /// cell upvalue 在 call_indirect 时直接共享通道指针，而非拷贝值
     cell_upvalues: u8 = 0,
+    /// 每个 upvalue 是否为 &T / *T 引用类型，最多 8 个 upvalue
+    /// 第 i 位为 1 表示第 i 个 upvalue 是引用类型，捕获时保持共享而非深拷贝
+    upvalue_ref_bits: u8 = 0,
+};
+
+// ════════════════════════════════════════════════════════════════
+// 部分应用元数据
+// ════════════════════════════════════════════════════════════════
+
+/// 部分应用元数据：描述 partial_make 节点绑定的参数信息
+///
+/// partial_make 将已绑定的实参通道与剩余参数个数记录下来，
+/// 运行时构造 PartialApplication 对象；再次调用时把已绑定参数
+/// 与新实参合并后发起对原函数的调用。
+pub const PartialMeta = struct {
+    /// 被包装函数在 functions 表中的索引
+    func_index: u16,
+    /// 已绑定实参通道列表
+    bound_arg_channels: []const u16,
+    /// 已绑定实参中哪些为 &T / *T 引用类型（保持共享）
+    bound_arg_ref_bits: u16 = 0,
+    /// 剩余还需要传入的参数个数
+    remaining_arity: u8,
 };
 
 // ════════════════════════════════════════════════════════════════

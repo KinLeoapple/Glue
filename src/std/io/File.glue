@@ -41,7 +41,8 @@ pub type FileKind =
 pub type Stat = Stat(size: u64, mtime_ns: i64, ctime_ns: i64, kind: FileKind)
 
 // File：文件句柄（newtype record，公开导出）
-pub type File = File(fd: i32, path: str, mode: OpenMode, is_closed: bool)
+// fd 用 i64 跨平台存储（POSIX i32 扩展，Windows HANDLE 转整数）
+pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool)
 
 // ─── OpenMode 顶层构造器 ───────────────────────────────────────────
 
@@ -90,11 +91,11 @@ pub fun __compute_flags(mode: OpenMode): i32 {
 pub async fun open(path: str, mode: OpenMode): Async<Throw<File, IOError>> {
     val flags = __compute_flags(mode)
     val fd = __file_open(path, flags, DEFAULT_FILE_MODE)?
-    File(fd, path, mode, false)
+    Ok(File(fd, path, mode, false))
 }
 
 pub async fun stat_of(path: str): Async<Throw<Stat, IOError>> {
-    __file_stat(path)?
+    Ok(__file_stat(path)?)
 }
 
 pub async fun remove(path: str): Async<Throw<Unit, IOError>> {

@@ -63,6 +63,7 @@ pub const EngineError = error{
     LoopBreak,
     LoopContinue,
     InvalidUtf8,
+    IoNotInitialized,
 };
 
 /// 函数调用栈帧
@@ -189,6 +190,28 @@ const FuncBodyCache = struct {
     /// body 是否含 call 节点（决定是否检查 tco_restart）
     /// false → body 无 call，可跳过 tco_restart 检查（hot path 优化）
     body_has_call: bool = false,
+};
+
+/// 递归调用时的通道备份：保存被调用函数的 return_channel + 局部通道，
+/// 避免递归调用覆盖调用者的通道状态。栈缓冲优先，溢出走堆。
+const ChannelBackup = struct {
+    saved_ptrs: [256]?[*]u8 = undefined,
+    saved_lens: [256]u32 = undefined,
+    saved_widths: [256]u8 = undefined,
+    save_buf_stack: [4096]u8 = undefined,
+    save_buf_heap: ?[]u8 = null,
+    n_chans: usize = 0,
+    total_bytes: usize = 0,
+    ret_chan: u16 = 0,
+    lcs: u16 = 0,
+    cc: u16 = 0,
+};
+
+/// 递归调用结果暂存：restore 会覆盖 result_chan，故先暂存再恢复后写回。
+const SavedResult = union(enum) {
+    none,
+    bytes: struct { buf: [16]u8, w: u8 },
+    value: value.Value,
 };
 
 /// 执行引擎：接收 GlueIR 并执行
@@ -486,6 +509,15 @@ pub const Engine = struct {
         if (obj.isArenaAllocated()) return;
         self.tracked_objs.append(self.tctx.?.backing, obj) catch return error.OutOfMemory;
         obj.markTracked();
+    }
+
+    /// 跟踪字段数组中所有 ref 类型子对象
+    /// 用于 metadata 函数：shutdown_mode 下 deinit 跳过级联 release，
+    /// 未跟踪的子对象（Str、ArrayValue 等）会泄漏
+    fn trackRefFields(self: *Engine, fields: []const value.Value) EngineError!void {
+        for (fields) |f| {
+            if (f == .ref) try self.trackObj(f.ref);
+        }
     }
 
     /// 当前函数是否为非逃逸函数（逃逸分析驱动）
@@ -1094,6 +1126,7 @@ pub const Engine = struct {
             // === 字符串操作 ===
             .string_len => try self.execStringLen(node),
             .string_concat => try self.execStringConcat(node),
+            .string_cmp => try self.execStringCmp(node),
             .string_index => try self.execStringIndex(node),
             .string_contains => try self.execStringContains(node),
             .string_slice => try self.execStringSlice(node),
@@ -1178,6 +1211,8 @@ pub const Engine = struct {
             .channel_receiver => try self.execChannelReceiver(node),
 
             // === 原子操作 ===
+            .atomic_make => try self.execAtomicMake(node),
+            .atomic_fetch_add => try self.execAtomicFetchAdd(node),
             .atomic_swap => try self.execAtomicSwap(node),
             .atomic_cas => try self.execAtomicCas(node),
 
@@ -1188,6 +1223,13 @@ pub const Engine = struct {
             // === 闭包（lambda） ===
             .closure_make => try self.execClosureMake(node),
             .call_indirect => try self.execCallIndirect(node),
+
+            // === 部分应用 ===
+            .partial_make => try self.execPartialMake(node),
+
+            // === 惰性求值（Lazy<T>） ===
+            .lazy_make => try self.execLazyMake(node),
+            .lazy_force => try self.execLazyForce(node),
 
             // === 控制流 ===
             .call => try self.execCall(node),
@@ -1801,13 +1843,18 @@ pub const Engine = struct {
 
     /// 内置 print/println/eprint/eprintln：根据通道类型打印值
     fn execBuiltinPrint(self: *Engine, node: *const Node, with_newline: bool, to_stderr: bool) EngineError!void {
-        // io 仅用作"是否处于真实执行环境"的标记（测试中为 null，跳过输出）
-        // 实际输出改用直接 POSIX write，避免 std.Io streaming writer 在子线程中的不可靠性
-        _ = self.io orelse return;
         const val_chan = node.inputs[0];
         const meta = self.ir.channels.get(val_chan);
 
-        const fd: i32 = if (to_stderr) 2 else 1;
+        // 通过通用观察点读取值：readScalarValue 会在 ref_chan 指向 LazyValue 时自动强制求值。
+        // 同时保存结果，供 ref_chan 标量回退路径使用（类型参数实例化为标量时 ref_chan 持有标量位模式）。
+        const observed_val = try self.readScalarValue(val_chan);
+
+        // io 仅用作"是否处于真实执行环境"的标记（测试中为 null，跳过实际输出）
+        // 实际输出统一走注入的 std.Io（stdout/stderr streaming writer），
+        // 避免裸 std.c.write 与 std.Io 缓冲层状态不同步导致重复内容丢失
+        const io = self.io orelse return;
+
         var buf: [4096]u8 = undefined;
         var len: usize = 0;
 
@@ -1822,6 +1869,29 @@ pub const Engine = struct {
 
         switch (meta.chan_type) {
             .ref_chan => {
+                // Lazy<T> 被打印时强制求值一次，避免惰性语义仅停留在包装层
+                if (self.readLazyValue(val_chan)) |lazy| {
+                    const forced = try self.forceLazyValue(lazy);
+                    switch (forced) {
+                        .i64 => |b| ap(&buf, &len, "{d}", .{@as(i64, @bitCast(b))}),
+                        .i32 => |b| ap(&buf, &len, "{d}", .{@as(i32, @bitCast(b))}),
+                        .i16 => |b| ap(&buf, &len, "{d}", .{@as(i16, @bitCast(b[0..2].*))}),
+                        .i8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
+                        .u64 => |b| ap(&buf, &len, "{d}", .{@as(u64, @bitCast(b))}),
+                        .u32 => |b| ap(&buf, &len, "{d}", .{@as(u32, @bitCast(b))}),
+                        .u16 => |b| ap(&buf, &len, "{d}", .{@as(u16, @bitCast(b[0..2].*))}),
+                        .u8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
+                        .f64 => |b| ap(&buf, &len, "{d}", .{@as(f64, @bitCast(b))}),
+                        .f32 => |b| ap(&buf, &len, "{d}", .{@as(f32, @bitCast(b[0..4].*))}),
+                        .boolean => |b| ap(&buf, &len, "{}", .{b[0] != 0}),
+                        .char => |b| ap(&buf, &len, "{c}", .{@as(u8, @intCast(@as(u32, @bitCast(b[0..4].*))))}),
+                        .unit => ap(&buf, &len, "()", .{}),
+                        .null_val => ap(&buf, &len, "null", .{}),
+                        .ref => ap(&buf, &len, "<obj>", .{}),
+                        else => ap(&buf, &len, "<lazy:?>", .{}),
+                    }
+                    return self.flushPrintBuf(io, to_stderr, &buf, len, with_newline);
+                }
                 // 按引用类型分派打印
                 if (self.readStr(val_chan)) |s| {
                     ap(&buf, &len, "{s}", .{s.bytes()});
@@ -1878,12 +1948,55 @@ pub const Engine = struct {
                             .f128 => ap(&buf, &len, "{d}", .{f.asF128()}),
                             .unit => ap(&buf, &len, "()", .{}),
                             .null_val => ap(&buf, &len, "null", .{}),
-                            .ref => ap(&buf, &len, "<obj>", .{}),
+                            .ref => |obj| {
+                                if (obj.type_tag == .str) {
+                                    const sv: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", obj));
+                                    ap(&buf, &len, "{s}", .{sv.bytes()});
+                                } else {
+                                    ap(&buf, &len, "<obj>", .{});
+                                }
+                            },
                         }
                     }
                     ap(&buf, &len, ")", .{});
+                } else if (self.readAtomicValue(val_chan)) |av| {
+                    // AtomicValue：加载内部值并打印
+                    const inner = av.load();
+                    switch (inner) {
+                        .i64 => |b| ap(&buf, &len, "{d}", .{@as(i64, @bitCast(b))}),
+                        .i32 => |b| ap(&buf, &len, "{d}", .{@as(i32, @bitCast(b))}),
+                        .i16 => |b| ap(&buf, &len, "{d}", .{@as(i16, @bitCast(b))}),
+                        .i8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
+                        .u64 => |b| ap(&buf, &len, "{d}", .{@as(u64, @bitCast(b))}),
+                        .u32 => |b| ap(&buf, &len, "{d}", .{@as(u32, @bitCast(b))}),
+                        .u16 => |b| ap(&buf, &len, "{d}", .{@as(u16, @bitCast(b))}),
+                        .u8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
+                        .f64 => |b| ap(&buf, &len, "{d}", .{@as(f64, @bitCast(b))}),
+                        .f32 => |b| ap(&buf, &len, "{d}", .{@as(f32, @bitCast(b))}),
+                        .boolean => |b| ap(&buf, &len, "{}", .{b[0] != 0}),
+                        .unit => ap(&buf, &len, "()", .{}),
+                        .null_val => ap(&buf, &len, "null", .{}),
+                        else => ap(&buf, &len, "<atomic:?>", .{}),
+                    }
                 } else {
-                    ap(&buf, &len, "null", .{});
+                    // ref_chan 持有标量位模式（类型参数实例化为标量时）：
+                    // 按 observed_val 的实际类型打印
+                    switch (observed_val) {
+                        .i64 => |b| ap(&buf, &len, "{d}", .{@as(i64, @bitCast(b))}),
+                        .i32 => |b| ap(&buf, &len, "{d}", .{@as(i32, @bitCast(b))}),
+                        .i16 => |b| ap(&buf, &len, "{d}", .{@as(i16, @bitCast(b))}),
+                        .i8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
+                        .u64 => |b| ap(&buf, &len, "{d}", .{@as(u64, @bitCast(b))}),
+                        .u32 => |b| ap(&buf, &len, "{d}", .{@as(u32, @bitCast(b))}),
+                        .u16 => |b| ap(&buf, &len, "{d}", .{@as(u16, @bitCast(b))}),
+                        .u8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
+                        .f64 => |b| ap(&buf, &len, "{d}", .{@as(f64, @bitCast(b))}),
+                        .f32 => |b| ap(&buf, &len, "{d}", .{@as(f32, @bitCast(b))}),
+                        .boolean => |b| ap(&buf, &len, "{}", .{b[0] != 0}),
+                        .null_val => ap(&buf, &len, "null", .{}),
+                        .unit => ap(&buf, &len, "()", .{}),
+                        else => ap(&buf, &len, "null", .{}),
+                    }
                 }
             },
             .i64_chan => ap(&buf, &len, "{d}", .{self.runtime.readI64(val_chan)}),
@@ -1985,11 +2098,26 @@ pub const Engine = struct {
             else => {},
         }
 
-        if (with_newline) {
-            ap(&buf, &len, "\n", .{});
+        return self.flushPrintBuf(io, to_stderr, &buf, len, with_newline);
+    }
+
+    /// 输出 print 缓冲区到 stdout/stderr（统一走 std.Io streaming writer）
+    fn flushPrintBuf(self: *Engine, io: std.Io, to_stderr: bool, buf: *[4096]u8, len: usize, with_newline: bool) EngineError!void {
+        _ = self;
+        var wlen = len;
+        if (with_newline and wlen < buf.len) {
+            buf[wlen] = '\n';
+            wlen += 1;
         }
-        // 直接 C write，绕过 std.Io streaming writer 在子线程中的不可靠性
-        if (len > 0) _ = std.c.write(fd, buf[0..len].ptr, len);
+        if (wlen == 0) return;
+        // writer 使用独立缓冲，避免与数据源 buf 别名（writeAll 会拷贝到 writer 内部缓冲）
+        var out_buf: [4096]u8 = undefined;
+        var w = if (to_stderr)
+            std.Io.File.stderr().writerStreaming(io, &out_buf)
+        else
+            std.Io.File.stdout().writerStreaming(io, &out_buf);
+        w.interface.writeAll(buf[0..wlen]) catch return;
+        w.flush() catch return;
     }
 
     /// builtin_ok：构造 ThrowValue(ok payload)
@@ -2322,7 +2450,8 @@ pub const Engine = struct {
         const arg_slice = args[0..arg_count];
 
         // 分派执行
-        const result = syscall_dispatch.dispatch(tctx, syscall_meta.syscall_id, arg_slice) catch |err| switch (err) {
+        const io_ctx = self.io orelse return error.IoNotInitialized;
+        const result = syscall_dispatch.dispatch(io_ctx, tctx, syscall_meta.syscall_id, arg_slice) catch |err| switch (err) {
             error.OutOfMemory, error.TooManyPools, error.AllocFailed => return error.OutOfMemory,
             error.InvalidArgument => return error.InvalidMetaIndex,
         };
@@ -2416,6 +2545,7 @@ pub const Engine = struct {
         field_buf[4] = try self.makeLayoutInfoRecord(.{ .size = 8, .alignment = 8 });
         field_buf[5] = try self.makeEmptyTraitImplInfoRecord();
         field_buf[6] = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+        try self.trackRefFields(&field_buf);
         const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
         return rec;
@@ -2442,6 +2572,7 @@ pub const Engine = struct {
         field_buf[4] = try self.makeLayoutInfoRecord(.{ .size = 0, .alignment = 0 });
         field_buf[5] = try self.makeEmptyTraitImplInfoRecord();
         field_buf[6] = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+        try self.trackRefFields(&field_buf);
         const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
         return rec;
@@ -2475,6 +2606,7 @@ pub const Engine = struct {
             // 6: type_params (empty array)
             value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory,
         };
+        try self.trackRefFields(&placeholder_fields);
         const rec = value.Value.makeRecord(tctx, "TypeInfo", &placeholder_fields) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
         self.runtime.writePtr(node.output, @ptrCast(rec.asRef()));
@@ -2499,6 +2631,7 @@ pub const Engine = struct {
         // 6: type_params (Array<TypeParamMeta>)
         field_buf[6] = self.makeTypeParamMetaArray(md.type_params) catch return error.OutOfMemory;
 
+        try self.trackRefFields(&field_buf);
         const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
         self.runtime.writePtr(node.output, @ptrCast(rec.asRef()));
@@ -2520,6 +2653,12 @@ pub const Engine = struct {
     fn makeEmptyTraitImplInfoRecord(self: *Engine) !value.Value {
         const tctx = self.tctx.?;
         const empty = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+        try self.trackObj(empty.asRef());
+        // 同一 ArrayValue 存入 4 个字段，需 retain 3 次（总 RC=4）
+        // 避免 RecordValue.deinit 第 1 次 release 释放后，后续 3 次 release 访问已释放内存
+        _ = value.obj_header.retain(empty.ref);
+        _ = value.obj_header.retain(empty.ref);
+        _ = value.obj_header.retain(empty.ref);
         var fields = [_]value.Value{ empty, empty, empty, empty };
         const rec = value.Value.makeRecord(tctx, "TraitImplInfo", &fields) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
@@ -2535,6 +2674,7 @@ pub const Engine = struct {
             try self.makeMethodMetaArray(impls.methods),
             try self.makeAssociatedTypeMetaArray(impls.associated_types),
         };
+        try self.trackRefFields(&fields);
         const rec = try value.Value.makeRecord(tctx, "TraitImplInfo", &fields);
         try self.trackObj(rec.asRef());
         return rec;
@@ -2625,6 +2765,7 @@ pub const Engine = struct {
                 self.makeEmptyTraitImplInfoRecord() catch return error.OutOfMemory,
                 value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory,
             };
+            try self.trackRefFields(&placeholder_fields);
             const rec = value.Value.makeRecord(tctx, "TypeInfo", &placeholder_fields) catch return error.OutOfMemory;
             try self.trackObj(rec.asRef());
             return rec;
@@ -2638,6 +2779,7 @@ pub const Engine = struct {
         field_buf[4] = try self.makeLayoutInfoRecord(md.layout);
         field_buf[5] = try self.makeTraitImplInfoRecord(md.impls);
         field_buf[6] = try self.makeTypeParamMetaArray(md.type_params);
+        try self.trackRefFields(&field_buf);
         const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
         return rec;
@@ -2652,6 +2794,7 @@ pub const Engine = struct {
             value.Value.fromBool(fm.is_nullable),
             value.Value.fromU32(fm.index),
         };
+        try self.trackRefFields(&fields);
         const rec = try value.Value.makeRecord(tctx, "FieldMeta", &fields);
         try self.trackObj(rec.asRef());
         return rec;
@@ -2660,13 +2803,20 @@ pub const Engine = struct {
     /// 构造 FieldMeta 数组
     fn makeFieldMetaArray(self: *Engine, items: []const ir_mod.meta_mod.FieldMeta) !value.Value {
         const tctx = self.tctx.?;
-        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        if (items.len == 0) {
+            const arr = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+            try self.trackObj(arr.asRef());
+            return arr;
+        }
         const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        defer tctx.freeObj(buf.ptr);
         const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
         for (items, 0..) |it, i| {
             ptr[i] = try self.makeFieldMetaRecord(it);
         }
-        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+        const arr = value.Value.makeArray(tctx, ptr[0..items.len], null) catch return error.OutOfMemory;
+        try self.trackObj(arr.asRef());
+        return arr;
     }
 
     /// 构造 ConstructorMeta RecordValue：(name, fields, is_unit, index)
@@ -2679,6 +2829,7 @@ pub const Engine = struct {
             value.Value.fromBool(cm.is_unit),
             value.Value.fromU32(cm.index),
         };
+        try self.trackRefFields(&fields);
         const rec = try value.Value.makeRecord(tctx, "ConstructorMeta", &fields);
         try self.trackObj(rec.asRef());
         return rec;
@@ -2687,13 +2838,20 @@ pub const Engine = struct {
     /// 构造 ConstructorMeta 数组
     fn makeConstructorMetaArray(self: *Engine, items: []const ir_mod.meta_mod.ConstructorMeta) !value.Value {
         const tctx = self.tctx.?;
-        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        if (items.len == 0) {
+            const arr = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+            try self.trackObj(arr.asRef());
+            return arr;
+        }
         const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        defer tctx.freeObj(buf.ptr);
         const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
         for (items, 0..) |it, i| {
             ptr[i] = try self.makeConstructorMetaRecord(it);
         }
-        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+        const arr = value.Value.makeArray(tctx, ptr[0..items.len], null) catch return error.OutOfMemory;
+        try self.trackObj(arr.asRef());
+        return arr;
     }
 
     /// 构造 TypeParamMeta RecordValue：(name, constraints, is_specialized, specialization)
@@ -2713,6 +2871,7 @@ pub const Engine = struct {
             value.Value.fromBool(tp.is_specialized),
             spec_val,
         };
+        try self.trackRefFields(&fields);
         const rec = try value.Value.makeRecord(tctx, "TypeParamMeta", &fields);
         try self.trackObj(rec.asRef());
         return rec;
@@ -2721,13 +2880,20 @@ pub const Engine = struct {
     /// 构造 TypeParamMeta 数组
     fn makeTypeParamMetaArray(self: *Engine, items: []const ir_mod.meta_mod.TypeParamMeta) !value.Value {
         const tctx = self.tctx.?;
-        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        if (items.len == 0) {
+            const arr = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+            try self.trackObj(arr.asRef());
+            return arr;
+        }
         const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        defer tctx.freeObj(buf.ptr);
         const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
         for (items, 0..) |it, i| {
             ptr[i] = try self.makeTypeParamMetaRecord(it);
         }
-        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+        const arr = value.Value.makeArray(tctx, ptr[0..items.len], null) catch return error.OutOfMemory;
+        try self.trackObj(arr.asRef());
+        return arr;
     }
 
     /// 构造 FuncSigMeta RecordValue：(param_types, return_type, is_async)
@@ -2739,6 +2905,7 @@ pub const Engine = struct {
             try value.Value.fromStringBytes(tctx, fs.return_type),
             value.Value.fromBool(fs.is_async),
         };
+        try self.trackRefFields(&fields);
         const rec = try value.Value.makeRecord(tctx, "FuncSigMeta", &fields);
         try self.trackObj(rec.asRef());
         return rec;
@@ -2759,6 +2926,7 @@ pub const Engine = struct {
             at_arr,
             mn_arr,
         };
+        try self.trackRefFields(&fields);
         const rec = try value.Value.makeRecord(tctx, "TraitMeta", &fields);
         try self.trackObj(rec.asRef());
         return rec;
@@ -2767,13 +2935,20 @@ pub const Engine = struct {
     /// 构造 TraitMeta 数组
     fn makeTraitMetaArray(self: *Engine, items: []const ir_mod.meta_mod.TraitMeta) !value.Value {
         const tctx = self.tctx.?;
-        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        if (items.len == 0) {
+            const arr = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+            try self.trackObj(arr.asRef());
+            return arr;
+        }
         const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        defer tctx.freeObj(buf.ptr);
         const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
         for (items, 0..) |it, i| {
             ptr[i] = try self.makeTraitMetaRecord(it);
         }
-        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+        const arr = value.Value.makeArray(tctx, ptr[0..items.len], null) catch return error.OutOfMemory;
+        try self.trackObj(arr.asRef());
+        return arr;
     }
 
     /// 构造 MethodMeta RecordValue：(name, signature, is_override, is_delegate, delegate_trait, is_async)
@@ -2794,6 +2969,7 @@ pub const Engine = struct {
             dt_val,
             value.Value.fromBool(mm.is_async),
         };
+        try self.trackRefFields(&fields);
         const rec = try value.Value.makeRecord(tctx, "MethodMeta", &fields);
         try self.trackObj(rec.asRef());
         return rec;
@@ -2802,13 +2978,20 @@ pub const Engine = struct {
     /// 构造 MethodMeta 数组
     fn makeMethodMetaArray(self: *Engine, items: []const ir_mod.meta_mod.MethodMeta) !value.Value {
         const tctx = self.tctx.?;
-        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        if (items.len == 0) {
+            const arr = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+            try self.trackObj(arr.asRef());
+            return arr;
+        }
         const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        defer tctx.freeObj(buf.ptr);
         const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
         for (items, 0..) |it, i| {
             ptr[i] = try self.makeMethodMetaRecord(it);
         }
-        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+        const arr = value.Value.makeArray(tctx, ptr[0..items.len], null) catch return error.OutOfMemory;
+        try self.trackObj(arr.asRef());
+        return arr;
     }
 
     /// 构造 AssociatedTypeMeta RecordValue：(name, is_specified, default_type)
@@ -2825,6 +3008,7 @@ pub const Engine = struct {
             value.Value.fromBool(atm.is_specified),
             dt_val,
         };
+        try self.trackRefFields(&fields);
         const rec = try value.Value.makeRecord(tctx, "AssociatedTypeMeta", &fields);
         try self.trackObj(rec.asRef());
         return rec;
@@ -2833,25 +3017,41 @@ pub const Engine = struct {
     /// 构造 AssociatedTypeMeta 数组
     fn makeAssociatedTypeMetaArray(self: *Engine, items: []const ir_mod.meta_mod.AssociatedTypeMeta) !value.Value {
         const tctx = self.tctx.?;
-        if (items.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        if (items.len == 0) {
+            const arr = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+            try self.trackObj(arr.asRef());
+            return arr;
+        }
         const buf = try tctx.allocObj(items.len * @sizeOf(value.Value));
+        defer tctx.freeObj(buf.ptr);
         const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
         for (items, 0..) |it, i| {
             ptr[i] = try self.makeAssociatedTypeMetaRecord(it);
         }
-        return value.Value.makeArray(tctx, ptr[0..items.len], null);
+        const arr = value.Value.makeArray(tctx, ptr[0..items.len], null) catch return error.OutOfMemory;
+        try self.trackObj(arr.asRef());
+        return arr;
     }
 
     /// 辅助：从 []const []const u8 构造字符串数组
     fn makeStrArray(self: *Engine, strs: []const []const u8) !value.Value {
         const tctx = self.tctx.?;
-        if (strs.len == 0) return value.Value.makeArray(tctx, &.{}, null);
+        if (strs.len == 0) {
+            const arr = value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory;
+            try self.trackObj(arr.asRef());
+            return arr;
+        }
         const buf = try tctx.allocObj(strs.len * @sizeOf(value.Value));
+        defer tctx.freeObj(buf.ptr);
         const ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr));
         for (strs, 0..) |s, i| {
-            ptr[i] = try value.Value.fromStringBytes(tctx, s);
+            const str_val = value.Value.fromStringBytes(tctx, s) catch return error.OutOfMemory;
+            try self.trackObj(str_val.ref);
+            ptr[i] = str_val;
         }
-        return value.Value.makeArray(tctx, ptr[0..strs.len], null);
+        const arr = value.Value.makeArray(tctx, ptr[0..strs.len], null) catch return error.OutOfMemory;
+        try self.trackObj(arr.asRef());
+        return arr;
     }
 
     // ════════════════════════════════════════════
@@ -3190,25 +3390,19 @@ pub const Engine = struct {
     // ════════════════════════════════════════════
 
     /// load：将输入通道的值复制到输出通道（var 初始化）
+    /// node._pad bit 0 为 1 表示源为 &T / *T，保持引用语义；否则普通复合类型走深拷贝
     fn execLoad(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
-        const w = self.runtime.elemWidth(node.output);
-        if (w > 0) {
-            const src = self.runtime.rawPtr(src_chan);
-            const dst = self.runtime.rawPtr(node.output);
-            @memcpy(dst[0..w], src[0..w]);
-        }
+        const is_ref = (node._pad & 1) != 0;
+        try self.cloneValueBetweenChannels(node.output, src_chan, is_ref);
     }
 
     /// store：将输入通道的值写入 cell 通道（var 赋值）
+    /// node._pad bit 0 为 1 表示源为 &T / *T，保持引用语义；否则普通复合类型走深拷贝
     fn execStore(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
-        const w = self.runtime.elemWidth(node.output);
-        if (w > 0) {
-            const src = self.runtime.rawPtr(src_chan);
-            const dst = self.runtime.rawPtr(node.output);
-            @memcpy(dst[0..w], src[0..w]);
-        }
+        const is_ref = (node._pad & 1) != 0;
+        try self.cloneValueBetweenChannels(node.output, src_chan, is_ref);
     }
 
     // ════════════════════════════════════════════
@@ -3331,8 +3525,8 @@ pub const Engine = struct {
         const then_chan = node.inputs[0];
         const else_chan = node.inputs[1];
         const cond_chan = node.inputs[2];
-        const cond = self.runtime.readBool(cond_chan);
-        const src_chan = if (cond) then_chan else else_chan;
+        const cond_val = try self.readScalarValue(cond_chan);
+        const src_chan = if (cond_val.asBool()) then_chan else else_chan;
         const w = self.runtime.elemWidth(node.output);
         if (w > 0) {
             // 源通道可能为 null_chan（无数据指针），跳过拷贝
@@ -3525,7 +3719,9 @@ pub const Engine = struct {
         const from_str = cast_mod.tagName(src_tag);
         const to_str = cast_mod.tagName(dst_tag);
         const value_str = cast_mod.formatScalarValue(alloc, src_tag, src_bytes) catch return error.OutOfMemory;
+        defer alloc.free(value_str);
         const msg_str = std.fmt.allocPrint(alloc, "cannot cast '{s}' from {s} to {s}", .{ value_str, from_str, to_str }) catch return error.OutOfMemory;
+        defer alloc.free(msg_str);
         return self.emitCastErrorThrow(node, msg_str, from_str, to_str, value_str);
     }
 
@@ -3535,7 +3731,9 @@ pub const Engine = struct {
         const from_str = "str";
         const to_str = cast_mod.tagName(dst_tag);
         const value_str = alloc.dupe(u8, str_bytes) catch return error.OutOfMemory;
+        defer alloc.free(value_str);
         const msg_str = std.fmt.allocPrint(alloc, "cannot cast \"{s}\" from str to {s} (parse failed)", .{ str_bytes, to_str }) catch return error.OutOfMemory;
+        defer alloc.free(msg_str);
         return self.emitCastErrorThrow(node, msg_str, from_str, to_str, value_str);
     }
 
@@ -3630,6 +3828,18 @@ pub const Engine = struct {
         if (@intFromPtr(ptr) < 0x1000) return null;
         if (@intFromPtr(ptr) % @alignOf(value.obj_header.ObjHeader) != 0) return null;
         const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
+        if (header.type_tag == .lazy_val) {
+            const lazy: *value.LazyValue = @alignCast(@fieldParentPtr("header", header));
+            const forced = self.forceLazyValue(lazy) catch return null;
+            switch (forced) {
+                .ref => |r| {
+                    const h: *value.obj_header.ObjHeader = @ptrCast(@alignCast(r));
+                    if (h.type_tag != .str) return null;
+                    return @alignCast(@fieldParentPtr("header", h));
+                },
+                else => return null,
+            }
+        }
         if (header.type_tag != .str) return null;
         return @alignCast(@fieldParentPtr("header", header));
     }
@@ -3698,11 +3908,28 @@ pub const Engine = struct {
         self.runtime.writePtr(node.output, @ptrCast(&obj.header));
     }
 
+    /// string_cmp：字符串字典序比较
+    /// inputs[0] = left, inputs[1] = right, output = bool_chan
+    /// _pad 编码比较种类：0=lt, 1=le, 2=gt, 3=ge
+    fn execStringCmp(self: *Engine, node: *const Node) EngineError!void {
+        const left = self.readStr(node.inputs[0]) orelse return error.InvalidChannel;
+        const right = self.readStr(node.inputs[1]) orelse return error.InvalidChannel;
+        const order = left.compare(right.*);
+        const result: bool = switch (node._pad) {
+            0 => order == .lt,
+            1 => order != .gt,
+            2 => order == .gt,
+            3 => order != .lt,
+            else => return error.InvalidChannel,
+        };
+        self.runtime.writeBool(node.output, result);
+    }
+
     /// string_index：按字符索引获取 UTF-8 码点
     /// inputs[0] = str, inputs[1] = index, output = char_chan
     fn execStringIndex(self: *Engine, node: *const Node) EngineError!void {
         const s = self.readStr(node.inputs[0]) orelse return error.InvalidChannel;
-        const idx = self.readIntAsI64(node.inputs[1]);
+        const idx = try self.readIntAsI64(node.inputs[1]);
         const bytes = s.bytes();
         if (idx < 0) return error.Overflow;
 
@@ -3819,10 +4046,13 @@ pub const Engine = struct {
                 break :blk value.Value.fromF128(p.*);
             },
             .ref_chan => blk: {
-                const obj_ptr = self.runtime.readPtr(chan) orelse break :blk value.Value.fromNull();
-                if (@intFromPtr(obj_ptr) < 0x1000) break :blk value.Value.fromNull();
-                if (@intFromPtr(obj_ptr) % @alignOf(value.obj_header.ObjHeader) != 0) break :blk value.Value.fromNull();
-                break :blk value.Value.fromRef(@ptrCast(@alignCast(obj_ptr)));
+                if (self.readRefObj(chan)) |header| {
+                    break :blk value.Value.fromRef(header);
+                }
+                // readRefObj 失败：ref_chan 持有标量位模式（类型参数实例化为标量时）
+                const raw = self.runtime.readI64(chan);
+                if (raw == 0) break :blk value.Value.fromNull();
+                break :blk value.Value.fromI64(raw);
             },
             else => value.Value.fromUnit(),
         };
@@ -3830,6 +4060,14 @@ pub const Engine = struct {
 
     /// 将 Value 写入通道
     fn valueToChan(self: *Engine, chan: u16, v: value.Value) void {
+        // ref_chan 通道（8 字节）接收标量值时，必须扩展到完整 8 字节
+        // （整数符号扩展为 i64，浮点提升为 f64），否则只写标量宽度字节，
+        // 高字节残留旧数据导致值损坏（类型参数实例化为标量时的核心问题）
+        const meta = self.ir.channels.get(chan);
+        if (meta.chan_type == .ref_chan) {
+            self.writeScalarValue(chan, v);
+            return;
+        }
         switch (v) {
             .null_val, .unit => {},
             .boolean => |b| self.runtime.writeBool(chan, b[0] != 0),
@@ -3908,7 +4146,247 @@ pub const Engine = struct {
                 const ptr: *f128 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
                 ptr.* = @bitCast(b);
             },
-            .ref => |obj| self.runtime.writePtr(chan, @ptrCast(obj)),
+            .ref => |obj| {
+                if (meta.chan_type == .nullable_chan) {
+                    const inner_w = meta.inner_type.elemWidth();
+                    const ptr = self.runtime.rawPtr(chan);
+                    const dst_obj: *?*anyopaque = @ptrCast(@alignCast(ptr));
+                    dst_obj.* = @ptrCast(obj);
+                    ptr[inner_w] = 0; // non-null flag
+                } else {
+                    self.runtime.writePtr(chan, @ptrCast(obj));
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// 按统一值语义在通道间复制值。
+    /// - 同类型同宽度：直接 @memcpy
+    /// - ref_chan + 引用类型（is_ref=true）：共享指针（同宽度 @memcpy）
+    /// - ref_chan + 普通复合类型（is_ref=false）：深拷贝 Value 后写入目标通道
+    /// - 类型/宽度不匹配（含类型参数实例化为标量时标量存入 ref_chan）：走 copyCrossType
+    fn cloneValueBetweenChannels(self: *Engine, dst_chan: u16, src_chan: u16, is_ref: bool) EngineError!void {
+        const src_meta = self.ir.channels.get(src_chan);
+        const dst_meta = self.ir.channels.get(dst_chan);
+        const w = src_meta.elem_width;
+        if (w == 0) return;
+
+        // ref_chan 持有堆引用且需值语义深拷贝
+        if (src_meta.chan_type == .ref_chan and !is_ref) {
+            if (self.readRefObj(src_chan)) |header| {
+                const v = value.Value.fromRef(header);
+                const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                try self.trackValueTree(copied);
+                self.valueToChan(dst_chan, copied);
+                return;
+            }
+            // readRefObj 失败：ref_chan 持有标量位模式（类型参数实例化为标量），
+            // 走跨类型复制路径
+        }
+
+        // 源/目标通道类型或宽度不匹配：跨类型复制
+        if (src_meta.chan_type != dst_meta.chan_type or src_meta.elem_width != dst_meta.elem_width) {
+            try self.copyCrossType(dst_chan, src_chan);
+            return;
+        }
+
+        // 同类型同宽度：直接复制字节
+        if (src_chan == dst_chan) return;
+        const src = self.runtime.rawPtr(src_chan);
+        const dst = self.runtime.rawPtr(dst_chan);
+        @memcpy(dst[0..w], src[0..w]);
+    }
+
+    /// 跨通道类型复制：当源/目标 chan_type 或 elem_width 不匹配时使用。
+    /// 核心场景：泛型函数的类型参数（A/T）被映射为 ref_chan（8字节），
+    /// 但实际值为标量（i32/f32 等）。此时需要：
+    /// - 标量 → ref_chan：整数符号扩展为 i64，浮点提升为 f64，写入 8 字节
+    /// - ref_chan → 标量：按目标类型解释 8 字节（i64 截断为整数，f64 转换为浮点）
+    /// 这样保证标量值在 ref_chan 中转后能正确还原（i32→i64→i32, f32→f64→f32）。
+    fn copyCrossType(self: *Engine, dst_chan: u16, src_chan: u16) EngineError!void {
+        const src_meta = self.ir.channels.get(src_chan);
+        const dst_meta = self.ir.channels.get(dst_chan);
+        const src_raw = self.runtime.rawPtr(src_chan);
+        const dst_raw = self.runtime.rawPtr(dst_chan);
+
+        // 标量 → ref_chan：按源类型读取标量，扩展为 8 字节写入
+        if (dst_meta.chan_type == .ref_chan and src_meta.chan_type != .ref_chan) {
+            const dst_ptr: *i64 = @ptrCast(@alignCast(dst_raw));
+            dst_ptr.* = switch (src_meta.chan_type) {
+                .i8_chan => @as(i64, @as(i8, @bitCast(src_raw[0]))),
+                .u8_chan => @as(i64, src_raw[0]),
+                .i16_chan => blk: {
+                    const p: *i16 = @ptrCast(@alignCast(src_raw));
+                    break :blk @as(i64, p.*);
+                },
+                .u16_chan => blk: {
+                    const p: *u16 = @ptrCast(@alignCast(src_raw));
+                    break :blk @as(i64, p.*);
+                },
+                .i32_chan => blk: {
+                    const p: *i32 = @ptrCast(@alignCast(src_raw));
+                    break :blk @as(i64, p.*);
+                },
+                .u32_chan => blk: {
+                    const p: *u32 = @ptrCast(@alignCast(src_raw));
+                    break :blk @as(i64, p.*);
+                },
+                .i64_chan => blk: {
+                    const p: *i64 = @ptrCast(@alignCast(src_raw));
+                    break :blk p.*;
+                },
+                .u64_chan => blk: {
+                    const p: *u64 = @ptrCast(@alignCast(src_raw));
+                    break :blk @bitCast(p.*);
+                },
+                .isize_chan => blk: {
+                    const p: *isize = @ptrCast(@alignCast(src_raw));
+                    break :blk @as(i64, p.*);
+                },
+                .usize_chan => blk: {
+                    const p: *usize = @ptrCast(@alignCast(src_raw));
+                    break :blk @bitCast(@as(u64, p.*));
+                },
+                .bool_chan, .mask_chan => @intFromBool(src_raw[0] != 0),
+                .f32_chan => blk: {
+                    const p: *f32 = @ptrCast(@alignCast(src_raw));
+                    const f64_val: f64 = @floatCast(p.*);
+                    break :blk @bitCast(f64_val);
+                },
+                .f64_chan => blk: {
+                    const p: *f64 = @ptrCast(@alignCast(src_raw));
+                    break :blk @bitCast(p.*);
+                },
+                else => 0,
+            };
+            return;
+        }
+
+        // ref_chan → 标量：按目标类型解释 8 字节位模式
+        if (src_meta.chan_type == .ref_chan and dst_meta.chan_type != .ref_chan) {
+            switch (dst_meta.chan_type) {
+                .i8_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    dst_raw[0] = @truncate(@as(u64, @bitCast(sp.*)));
+                },
+                .u8_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    dst_raw[0] = @truncate(@as(u64, @bitCast(sp.*)));
+                },
+                .i16_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *i16 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = @truncate(sp.*);
+                },
+                .u16_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *u16 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = @truncate(@as(u64, @bitCast(sp.*)));
+                },
+                .i32_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *i32 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = @truncate(sp.*);
+                },
+                .u32_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *u32 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = @truncate(@as(u64, @bitCast(sp.*)));
+                },
+                .i64_chan, .u64_chan, .isize_chan, .usize_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *i64 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = sp.*;
+                },
+                .f32_chan => {
+                    const sp: *f64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *f32 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = @floatCast(sp.*);
+                },
+                .f64_chan => {
+                    const sp: *f64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *f64 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = sp.*;
+                },
+                .bool_chan, .mask_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    self.runtime.writeBool(dst_chan, sp.* != 0);
+                },
+                else => {
+                    const copy_w = @min(dst_meta.elem_width, 8);
+                    @memcpy(dst_raw[0..copy_w], src_raw[0..copy_w]);
+                },
+            }
+            return;
+        }
+
+        // 标量 → 标量（不同宽度）：通过 Value 中转
+        const v = self.chanToValue(src_chan);
+        self.writeScalarValue(dst_chan, v);
+    }
+
+    /// 按容器元素/字段的值语义复制 Value。
+    /// - is_ref = true：元素/字段类型为 &T / *T，retain 后共享。
+    /// - is_ref = false：普通类型，深拷贝生成独立副本。
+    fn cloneValueForContainer(self: *Engine, v: value.Value, is_ref: bool) EngineError!value.Value {
+        if (is_ref) {
+            if (v.isBoxed()) _ = v.retain();
+            return v;
+        }
+        const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+        // deepCopy 创建的新堆对象需要递归跟踪，否则 shutdown_mode 下 deinit 不级联
+        // release 时这些对象会泄漏
+        try self.trackValueTree(copied);
+        return copied;
+    }
+
+    /// 递归跟踪值及其所有子引用对象
+    /// 用于深拷贝后注册所有新建堆对象：shutdown_mode 下 deinit 跳过级联 release，
+    /// 未跟踪的子对象（Str、Array、Record 等）会泄漏其页池页
+    fn trackValueTree(self: *Engine, v: value.Value) EngineError!void {
+        if (v != .ref) return;
+        try self.trackObj(v.ref);
+        // 递归跟踪复合类型的子引用
+        switch (v.ref.type_tag) {
+            .str, .range, .builtin => {},
+            .array => {
+                const arr: *value.ArrayValue = @alignCast(@fieldParentPtr("header", v.ref));
+                for (arr.elements) |elem| try self.trackValueTree(elem);
+            },
+            .record => {
+                const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", v.ref));
+                for (rec.fields) |f| try self.trackValueTree(f);
+            },
+            .adt => {
+                const adt: *value.AdtValue = @alignCast(@fieldParentPtr("header", v.ref));
+                for (adt.fields) |f| try self.trackValueTree(f.value);
+            },
+            .newtype => {
+                const nt: *value.NewtypeValue = @alignCast(@fieldParentPtr("header", v.ref));
+                try self.trackValueTree(nt.inner);
+            },
+            .cell => {
+                const cell: *value.Cell = @alignCast(@fieldParentPtr("header", v.ref));
+                try self.trackValueTree(cell.inner);
+            },
+            .throw_val => {
+                const tv: *value.ThrowValue = @alignCast(@fieldParentPtr("header", v.ref));
+                switch (tv.payload) {
+                    .ok => |inner| try self.trackValueTree(inner),
+                    .err => |err_ptr| try self.trackObj(&err_ptr.header),
+                }
+            },
+            .error_val => {},
+            .closure => {
+                const cl: *value.Closure = @alignCast(@fieldParentPtr("header", v.ref));
+                for (cl.upvalues) |uv| try self.trackValueTree(uv);
+                for (cl.bound_args) |ba| try self.trackValueTree(ba);
+            },
+            .partial => {
+                const pt: *value.PartialApplication = @alignCast(@fieldParentPtr("header", v.ref));
+                for (pt.bound_args) |ba| try self.trackValueTree(ba);
+            },
             else => {},
         }
     }
@@ -4019,9 +4497,11 @@ pub const Engine = struct {
     /// inputs[0] = length 通道（i64），output = ref_chan
     /// 逃逸分析驱动：非逃逸函数内的数组走 ShadowArena，endFunction 时 O(1) reset
     fn execArrayMake(self: *Engine, node: *const Node) EngineError!void {
-        const len = self.runtime.readI64(node.inputs[0]);
+        const len = try self.readIntAsI64(node.inputs[0]);
         if (len < 0) return error.Overflow;
         const n: usize = @intCast(len);
+        // _pad bit 0：元素类型是否为 &T / *T
+        const elem_is_ref = (node._pad & 1) != 0;
         // 临时元素切片（makeArray 会拷贝到连续内存，此处仅临时用）
         const elements = self.tctx.?.backing.alloc(value.Value, n) catch return error.OutOfMemory;
         defer self.tctx.?.backing.free(elements);
@@ -4036,11 +4516,11 @@ pub const Engine = struct {
             const arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
             @memcpy(elems_ptr[0..n], elements);
-            arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null };
+            arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null, .elem_is_ref = elem_is_ref };
             arr.header.markArenaAllocated();
             break :blk value.Value.fromRef(&arr.header);
         } else
-            value.Value.makeArray(self.tctx.?, elements, null) catch return error.OutOfMemory;
+            value.Value.makeArrayEx(self.tctx.?, elements, null, elem_is_ref) catch return error.OutOfMemory;
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
     }
@@ -4049,20 +4529,24 @@ pub const Engine = struct {
     /// inputs[0] = array, inputs[1] = index, output = 元素通道
     fn execArrayGet(self: *Engine, node: *const Node) EngineError!void {
         const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const idx = self.readIntAsI64(node.inputs[1]);
+        const idx = try self.readIntAsI64(node.inputs[1]);
         if (idx < 0 or @as(usize, @intCast(idx)) >= arr.elements.len) return error.Overflow;
         const v = arr.elements[@intCast(idx)];
-        self.valueToChan(node.output, v);
+        const copied = try self.cloneValueForContainer(v, arr.elem_is_ref);
+        self.valueToChan(node.output, copied);
     }
 
     /// array_set：按索引设置元素
     /// inputs[0] = array, inputs[1] = index, inputs[2] = value
     fn execArraySet(self: *Engine, node: *const Node) EngineError!void {
         const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const idx = self.readIntAsI64(node.inputs[1]);
+        const idx = try self.readIntAsI64(node.inputs[1]);
         if (idx < 0 or @as(usize, @intCast(idx)) >= arr.elements.len) return error.Overflow;
         const v = self.chanToValue(node.inputs[2]);
-        arr.elements[@intCast(idx)] = v;
+        const copied = try self.cloneValueForContainer(v, arr.elem_is_ref);
+        const old = arr.elements[@intCast(idx)];
+        arr.elements[@intCast(idx)] = copied;
+        old.release(self.tctx.?);
     }
 
     /// array_len：返回数组长度
@@ -4078,6 +4562,7 @@ pub const Engine = struct {
     fn execArrayPush(self: *Engine, node: *const Node) EngineError!void {
         const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
         const v = self.chanToValue(node.inputs[1]);
+        const copied = try self.cloneValueForContainer(v, arr.elem_is_ref);
         const old_len = arr.elements.len;
         const new_len = old_len + 1;
         const use_arena = arr.header.isArenaAllocated();
@@ -4088,7 +4573,7 @@ pub const Engine = struct {
             self.tctx.?.allocObj(new_size) catch return error.OutOfMemory;
         const new_elements: []value.Value = @as([*]value.Value, @ptrCast(@alignCast(buf.ptr)))[0..new_len];
         @memcpy(new_elements[0..old_len], arr.elements);
-        new_elements[old_len] = v;
+        new_elements[old_len] = copied;
         // arena 数组的旧 elements 由 arena.reset 统一回收，跳过 freeObj
         if (!use_arena and arr.elements.len > 0) {
             self.tctx.?.freeObj(@ptrCast(arr.elements.ptr));
@@ -4105,11 +4590,19 @@ pub const Engine = struct {
         const left = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
         const right = self.readArray(node.inputs[1]) orelse return error.InvalidChannel;
         const new_len = left.elements.len + right.elements.len;
+        const elem_is_ref = left.elem_is_ref;
         // 临时元素切片（makeArray 会拷贝到自有缓冲区）
         const new_elements = self.tctx.?.backing.alloc(value.Value, new_len) catch return error.OutOfMemory;
         defer self.tctx.?.backing.free(new_elements);
-        @memcpy(new_elements[0..left.elements.len], left.elements);
-        @memcpy(new_elements[left.elements.len..], right.elements);
+        var i: usize = 0;
+        for (left.elements) |elem| {
+            new_elements[i] = try self.cloneValueForContainer(elem, elem_is_ref);
+            i += 1;
+        }
+        for (right.elements) |elem| {
+            new_elements[i] = try self.cloneValueForContainer(elem, elem_is_ref);
+            i += 1;
+        }
 
         const use_arena = self.currentFuncUseArena();
         const v = if (use_arena) blk: {
@@ -4119,11 +4612,11 @@ pub const Engine = struct {
             const arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
             @memcpy(elems_ptr[0..new_len], new_elements);
-            arr.* = .{ .elements = elems_ptr[0..new_len], .capacity = new_len, .fixed_size = null };
+            arr.* = .{ .elements = elems_ptr[0..new_len], .capacity = new_len, .fixed_size = null, .elem_is_ref = elem_is_ref };
             arr.header.markArenaAllocated();
             break :blk value.Value.fromRef(&arr.header);
         } else
-            value.Value.makeArray(self.tctx.?, new_elements, null) catch return error.OutOfMemory;
+            value.Value.makeArrayEx(self.tctx.?, new_elements, null, elem_is_ref) catch return error.OutOfMemory;
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
     }
@@ -4131,10 +4624,12 @@ pub const Engine = struct {
     /// array_fill：创建 count 个 value 副本的数组
     /// inputs[0] = count, inputs[1] = value, output = ref_chan
     fn execArrayFill(self: *Engine, node: *const Node) EngineError!void {
-        const count = self.runtime.readI64(node.inputs[0]);
+        const count = try self.readIntAsI64(node.inputs[0]);
         if (count < 0) return error.Overflow;
         const n: usize = @intCast(count);
         const fill_value = self.chanToValue(node.inputs[1]);
+        // 元素类型是否为 &T / *T：优先从 fill_value 通道的 is_ref 读取
+        const elem_is_ref = self.ir.channels.get(node.inputs[1]).is_ref;
 
         const use_arena = self.currentFuncUseArena();
         const v = if (use_arena) blk: {
@@ -4143,35 +4638,23 @@ pub const Engine = struct {
             const arena_mem = self.tctx.?.allocObjArena(total) catch return error.OutOfMemory;
             const arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
-            // 初始化所有元素为 fill_value（注意 RC：每个 slot 引用同一对象需 retain n-1 次）
+            // 按元素类型语义逐个填充
             if (n > 0) {
-                @memset(elems_ptr[0..n], fill_value);
-                // 仅当 fill_value 为 ref 类型时需 retain n-1 次
-                // （@memset 已复制 Value 结构 n 次，但 RC 只算了 1 次）
-                if (fill_value.isBoxed() and n > 1) {
-                    const r = fill_value.asRef();
-                    var j: usize = 1;
-                    while (j < n) : (j += 1) {
-                        _ = value.obj_header.retain(r);
-                    }
+                for (0..n) |j| {
+                    elems_ptr[j] = try self.cloneValueForContainer(fill_value, elem_is_ref);
                 }
             }
-            arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null };
+            arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null, .elem_is_ref = elem_is_ref };
             arr.header.markArenaAllocated();
             break :blk value.Value.fromRef(&arr.header);
         } else blk: {
-            // 非 arena 路径：先分配临时数组，逐个 retain 后用 makeArray
+            // 非 arena 路径：先分配临时数组，按元素类型语义填充
             const tmp = self.tctx.?.backing.alloc(value.Value, n) catch return error.OutOfMemory;
             defer self.tctx.?.backing.free(tmp);
-            @memset(tmp[0..n], fill_value);
-            if (fill_value.isBoxed() and n > 1) {
-                const r = fill_value.asRef();
-                var j: usize = 1;
-                while (j < n) : (j += 1) {
-                    _ = value.obj_header.retain(r);
-                }
+            for (0..n) |j| {
+                tmp[j] = try self.cloneValueForContainer(fill_value, elem_is_ref);
             }
-            break :blk value.Value.makeArray(self.tctx.?, tmp, null) catch return error.OutOfMemory;
+            break :blk value.Value.makeArrayEx(self.tctx.?, tmp, null, elem_is_ref) catch return error.OutOfMemory;
         };
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
@@ -4182,8 +4665,8 @@ pub const Engine = struct {
     /// _pad: 0 = 左闭右开 [start, end)，1 = 左闭右闭 [start, end]
     fn execArraySlice(self: *Engine, node: *const Node) EngineError!void {
         const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const start = self.readIntAsI64(node.inputs[1]);
-        const end_raw = self.readIntAsI64(node.inputs[2]);
+        const start = try self.readIntAsI64(node.inputs[1]);
+        const end_raw = try self.readIntAsI64(node.inputs[2]);
         if (start < 0) return error.Overflow;
         const s: usize = @intCast(start);
         // 计算实际结束位置
@@ -4198,9 +4681,12 @@ pub const Engine = struct {
         };
         if (s > arr.elements.len or e > arr.elements.len or s > e) return error.Overflow;
         const new_len = e - s;
+        const elem_is_ref = arr.elem_is_ref;
         const new_elements = self.tctx.?.backing.alloc(value.Value, new_len) catch return error.OutOfMemory;
         defer self.tctx.?.backing.free(new_elements);
-        @memcpy(new_elements[0..new_len], arr.elements[s..e]);
+        for (arr.elements[s..e], 0..) |elem, j| {
+            new_elements[j] = try self.cloneValueForContainer(elem, elem_is_ref);
+        }
 
         const use_arena = self.currentFuncUseArena();
         const v = if (use_arena) blk: {
@@ -4210,19 +4696,11 @@ pub const Engine = struct {
             const new_arr: *value.ArrayValue = @ptrCast(@alignCast(arena_mem.ptr));
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
             @memcpy(elems_ptr[0..new_len], new_elements);
-            new_arr.* = .{ .elements = elems_ptr[0..new_len], .capacity = new_len, .fixed_size = null };
+            new_arr.* = .{ .elements = elems_ptr[0..new_len], .capacity = new_len, .fixed_size = null, .elem_is_ref = elem_is_ref };
             new_arr.header.markArenaAllocated();
             break :blk value.Value.fromRef(&new_arr.header);
         } else
-            value.Value.makeArray(self.tctx.?, new_elements, null) catch return error.OutOfMemory;
-        // retain 切片中所有 ref 元素（makeArray 已拷贝 Value 结构，需补 retain）
-        if (new_len > 0) {
-            for (new_elements) |elem| {
-                if (elem.isBoxed()) {
-                    _ = value.obj_header.retain(elem.asRef());
-                }
-            }
-        }
+            value.Value.makeArrayEx(self.tctx.?, new_elements, null, elem_is_ref) catch return error.OutOfMemory;
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
     }
@@ -4270,7 +4748,7 @@ pub const Engine = struct {
     /// array_get_safe：安全索引，越界返回 null
     fn execArrayGetSafe(self: *Engine, node: *const Node) EngineError!void {
         const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const idx = self.readIntAsI64(node.inputs[1]);
+        const idx = try self.readIntAsI64(node.inputs[1]);
         const inner_w = self.nullableInnerWidth(node.output);
         const dst = self.runtime.rawPtr(node.output);
         if (idx < 0 or @as(usize, @intCast(idx)) >= arr.elements.len) {
@@ -4344,8 +4822,8 @@ pub const Engine = struct {
     /// start/end 是字符索引（不是字节索引），内部按 UTF-8 解码定位字节位置
     fn execStringSlice(self: *Engine, node: *const Node) EngineError!void {
         const s = self.readStr(node.inputs[0]) orelse return error.InvalidChannel;
-        const start = self.readIntAsI64(node.inputs[1]);
-        const end_raw = self.readIntAsI64(node.inputs[2]);
+        const start = try self.readIntAsI64(node.inputs[1]);
+        const end_raw = try self.readIntAsI64(node.inputs[2]);
         if (start < 0) return error.Overflow;
         const start_idx: usize = @intCast(start);
         const end_idx: usize = if (node._pad == 1) blk: {
@@ -4460,11 +4938,14 @@ pub const Engine = struct {
     inline fn execRecordMake(self: *Engine, node: *const Node) EngineError!void {
         const meta = if (node.meta_index < self.ir.scalar_metas.len) self.ir.scalar_metas[node.meta_index] else return error.InvalidMetaIndex;
         const packed_val = if (meta.const_val) |cv| switch (cv) {
-            .int_val => |iv| @as(i64, @truncate(iv)),
+            .int_val => |iv| iv,
             else => return error.InvalidMetaIndex,
         } else return error.InvalidMetaIndex;
-        const type_name_idx: usize = @intCast(@as(u32, @truncate(@as(u64, @bitCast(packed_val)))));
-        const field_count: u32 = @truncate(@as(u64, @bitCast(packed_val)) >> 32);
+        // meta 编码：(field_ref_bits << 64) | (field_count << 32) | type_name_pool_idx
+        const bits: u128 = @bitCast(packed_val);
+        const type_name_idx: usize = @intCast(@as(u32, @truncate(bits)));
+        const field_count: u32 = @truncate(bits >> 32);
+        const field_ref_bits: u64 = @truncate(bits >> 64);
         const type_name = if (type_name_idx < self.ir.string_pool.len) self.ir.string_pool[type_name_idx] else "";
 
         // 直接分配连续内存：[RecordValue header | Value fields[]]
@@ -4480,7 +4961,7 @@ pub const Engine = struct {
         const f_ptr: [*]value.Value = @ptrCast(@alignCast(obj_mem.ptr + @sizeOf(value.RecordValue)));
         // 初始化 fields 为 unit（连续内存，单次 memset）
         @memset(f_ptr[0..field_count], value.Value.unit);
-        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..field_count] };
+        rec.* = .{ .type_name = type_name, .fields = f_ptr[0..field_count], .field_ref_bits = field_ref_bits };
         if (use_arena) rec.header.markArenaAllocated();
         const v = value.Value.fromRef(&rec.header);
         try self.trackObj(v.asRef());
@@ -4515,6 +4996,8 @@ pub const Engine = struct {
             return error.InvalidChannel;
         }
         const v = rec.fields[field_id];
+        // 按字段类型语义复制：&T / *T 共享，普通类型深拷贝
+        const copied = try self.cloneValueForContainer(v, rec.fieldIsRef(field_id));
 
         // 快速路径：scalar_tag 预计算了输出通道类型（标量类型）
         // 且 Value variant 与输出通道类型匹配时，直接 payload 字节复制
@@ -4524,7 +5007,7 @@ pub const Engine = struct {
             const dst = self.runtime.rawPtr(node.output);
             // 检查 Value variant 是否与 tag 匹配
             // variant tag 可通过 @intFromEnum(v) 获取（Value 是 tagged union）
-            const variant_matches: bool = switch (v) {
+            const variant_matches: bool = switch (copied) {
                 .boolean => tag == .boolean,
                 .char => tag == .char,
                 .i8 => tag == .i8, .i16 => tag == .i16, .i32 => tag == .i32,
@@ -4544,24 +5027,24 @@ pub const Engine = struct {
                     .i128, .u128, .f128 => 16,
                 };
                 const src: [*]const u8 = switch (tag) {
-                    .boolean => @ptrCast(&v.boolean),
-                    .char => @ptrCast(&v.char),
-                    .i8 => @ptrCast(&v.i8),
-                    .i16 => @ptrCast(&v.i16),
-                    .i32 => @ptrCast(&v.i32),
-                    .i64 => @ptrCast(&v.i64),
-                    .i128 => @ptrCast(&v.i128),
-                    .u8 => @ptrCast(&v.u8),
-                    .u16 => @ptrCast(&v.u16),
-                    .u32 => @ptrCast(&v.u32),
-                    .u64 => @ptrCast(&v.u64),
-                    .u128 => @ptrCast(&v.u128),
-                    .isize => @ptrCast(&v.isize),
-                    .usize => @ptrCast(&v.usize),
-                    .f16 => @ptrCast(&v.f16),
-                    .f32 => @ptrCast(&v.f32),
-                    .f64 => @ptrCast(&v.f64),
-                    .f128 => @ptrCast(&v.f128),
+                    .boolean => @ptrCast(&copied.boolean),
+                    .char => @ptrCast(&copied.char),
+                    .i8 => @ptrCast(&copied.i8),
+                    .i16 => @ptrCast(&copied.i16),
+                    .i32 => @ptrCast(&copied.i32),
+                    .i64 => @ptrCast(&copied.i64),
+                    .i128 => @ptrCast(&copied.i128),
+                    .u8 => @ptrCast(&copied.u8),
+                    .u16 => @ptrCast(&copied.u16),
+                    .u32 => @ptrCast(&copied.u32),
+                    .u64 => @ptrCast(&copied.u64),
+                    .u128 => @ptrCast(&copied.u128),
+                    .isize => @ptrCast(&copied.isize),
+                    .usize => @ptrCast(&copied.usize),
+                    .f16 => @ptrCast(&copied.f16),
+                    .f32 => @ptrCast(&copied.f32),
+                    .f64 => @ptrCast(&copied.f64),
+                    .f128 => @ptrCast(&copied.f128),
                 };
                 @memcpy(dst[0..w], src[0..w]);
                 return;
@@ -4569,7 +5052,7 @@ pub const Engine = struct {
             // variant 不匹配：回退到 valueToChan（处理类型转换）
         }
         // 回退：非标量通道或 variant 不匹配
-        self.valueToChan(node.output, v);
+        self.valueToChan(node.output, copied);
     }
 
     /// record_set：按 field_id 写入字段值
@@ -4614,14 +5097,14 @@ pub const Engine = struct {
             };
         } else self.chanToValue(node.inputs[1]);
 
-        // retain 新值（record 持有引用，deinit 时 release）
-        _ = v.retain();
+        // 按字段类型语义复制新值：&T / *T 共享，普通类型深拷贝
+        const copied = try self.cloneValueForContainer(v, rec.fieldIsRef(field_id));
         // release 旧值
         rec.fields[field_id].release(self.tctx.?);
-        rec.fields[field_id] = v;
+        rec.fields[field_id] = copied;
     }
 
-    /// record_clone：浅拷贝记录（用于记录扩展 (...base, field: value)）
+    /// record_clone：深拷贝记录（用于记录扩展 (...base, field: value)）
     /// inputs[0] = base record_chan，output = new record_chan
     /// meta.const_val.int_val = extra_count（扩展字段数，默认 0）
     /// 优化：直接在 allocObj 连续内存上初始化，跳过临时数组 alloc/free + memcpy
@@ -4644,10 +5127,9 @@ pub const Engine = struct {
         const obj_mem = self.tctx.?.allocObj(alloc_total) catch return error.OutOfMemory;
         const new_rec: *value.RecordValue = @ptrCast(@alignCast(obj_mem.ptr));
         const f_ptr: [*]value.Value = @ptrCast(@alignCast(obj_mem.ptr + @sizeOf(value.RecordValue)));
-        // 拷贝 base 字段（retain ref 值）
+        // 拷贝 base 字段：&T / *T 共享，普通类型深拷贝
         for (base_rec.fields, 0..) |src, i| {
-            f_ptr[i] = src;
-            _ = f_ptr[i].retain();
+            f_ptr[i] = try self.cloneValueForContainer(src, base_rec.fieldIsRef(@intCast(i)));
         }
         // extra 槽位初始化为 unit
         @memset(f_ptr[base_rec.fields.len..total], value.Value.unit);
@@ -4655,6 +5137,7 @@ pub const Engine = struct {
             .type_name = base_rec.type_name,
             .fields = f_ptr[0..total],
             .field_names = base_rec.field_names,
+            .field_ref_bits = base_rec.field_ref_bits,
         };
         const v = value.Value.fromRef(&new_rec.header);
         try self.trackObj(v.asRef());
@@ -4714,6 +5197,174 @@ pub const Engine = struct {
         try self.execCallStandard(node, call_meta, callee_func, args);
     }
 
+    /// 复制单个实参到目标形参通道，自动处理 Lazy<T> 强制求值。
+    /// 当实参是 ref_chan（Lazy<T>）而形参通道是标量时，通过 readScalarValue 观察并求值。
+    /// 形参也是引用类型时保留引用本身（避免错误强制）。
+    /// is_ref 为 true 表示实参类型为 &T / *T，应保持引用语义；否则普通复合类型走深拷贝。
+    fn copyArgToParam(self: *Engine, arg_chan: u16, dst_chan: u16, is_ref: bool) EngineError!void {
+        const src_meta = self.ir.channels.get(arg_chan);
+        const dst_meta = self.ir.channels.get(dst_chan);
+
+        // ref_chan → 标量通道：可能是 Lazy<T> 强制求值或标量值解码
+        if (src_meta.chan_type == .ref_chan and dst_meta.chan_type != .ref_chan and dst_meta.chan_type != .nullable_chan) {
+            // 先尝试作为堆对象读取（处理 Lazy<T> 强制求值）
+            if (self.readRefObj(arg_chan)) |_| {
+                const v = try self.readScalarValue(arg_chan);
+                self.writeScalarValue(dst_chan, v);
+                return;
+            }
+            // readRefObj 失败：ref_chan 持有标量位模式，按目标类型解码
+            try self.copyCrossType(dst_chan, arg_chan);
+            return;
+        }
+
+        // 标量通道 → ref_chan：标量值扩展为 8 字节写入（类型参数实例化为标量时）
+        if (src_meta.chan_type != .ref_chan and src_meta.chan_type != .nullable_chan and dst_meta.chan_type == .ref_chan) {
+            try self.copyCrossType(dst_chan, arg_chan);
+            return;
+        }
+
+        try self.cloneValueBetweenChannels(dst_chan, arg_chan, is_ref);
+    }
+
+    /// 按引用位图将实参复制到形参通道（统一值语义深拷贝判定）。
+    /// 取 args.len 与形参数量的较小值，逐个按 arg_ref_bits 判定引用语义。
+    fn copyArgsToParams(self: *Engine, args: []const u16, callee_func: Function, arg_ref_bits: u16) EngineError!void {
+        const count = @min(args.len, callee_func.param_channels.len);
+        for (0..count) |i| {
+            const dst_chan = callee_func.param_channels[i];
+            const is_ref = ((arg_ref_bits >> @intCast(i)) & 1) != 0;
+            try self.copyArgToParam(args[i], dst_chan, is_ref);
+        }
+    }
+
+    /// 将闭包 upvalues 复制到 explicit_count 之后的形参通道。
+    fn copyClosureUpvalues(self: *Engine, callee_func: Function, closure: *value.Closure, explicit_count: usize) void {
+        const total_params = callee_func.param_channels.len;
+        const upvalue_count = @min(closure.upvalues.len, if (total_params > explicit_count) total_params - explicit_count else 0);
+        for (0..upvalue_count) |i| {
+            const dst_chan = callee_func.param_channels[explicit_count + i];
+            self.writeScalarValue(dst_chan, closure.upvalues[i]);
+        }
+    }
+
+    /// 保存递归调用所需的通道状态（return_channel + 局部通道）。
+    /// 必须在复制参数之前调用（递归时 param_channels 与调用者重叠）。
+    fn saveRecursiveChannels(self: *Engine, callee_func: Function) EngineError!ChannelBackup {
+        var b: ChannelBackup = .{};
+        const ret_chan = callee_func.return_channel;
+        const lcs = callee_func.local_chan_start;
+        const lcc = callee_func.local_chan_count;
+        const cc = self.runtime.chan_count;
+        b.ret_chan = ret_chan;
+        b.lcs = lcs;
+        b.cc = cc;
+        b.n_chans = 1 + @as(usize, lcc);
+        if (b.n_chans > b.saved_ptrs.len) return error.CallDepthExceeded;
+
+        const n = b.n_chans;
+        var total_bytes: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const ch: u16 = if (i == 0) ret_chan else lcs + @as(u16, @intCast(i - 1));
+            if (ch < cc) {
+                b.saved_ptrs[i] = self.runtime.chan_ptrs[ch];
+                b.saved_lens[i] = self.runtime.chan_lengths[ch];
+                b.saved_widths[i] = self.runtime.chan_widths[ch];
+                if (b.saved_widths[i] > 0 and b.saved_lens[i] > 0) {
+                    total_bytes += @as(usize, b.saved_widths[i]) * b.saved_lens[i];
+                }
+            } else {
+                b.saved_ptrs[i] = null;
+                b.saved_lens[i] = 0;
+                b.saved_widths[i] = 0;
+            }
+        }
+        b.total_bytes = total_bytes;
+
+        if (total_bytes > b.save_buf_stack.len) {
+            b.save_buf_heap = self.tctx.?.backing.alloc(u8, total_bytes) catch return error.OutOfMemory;
+        }
+        const save_buf = if (b.save_buf_heap) |sb| sb else b.save_buf_stack[0..total_bytes];
+        var off: usize = 0;
+        i = 0;
+        while (i < n) : (i += 1) {
+            const ch: u16 = if (i == 0) ret_chan else lcs + @as(u16, @intCast(i - 1));
+            if (ch < cc) {
+                const w = b.saved_widths[i];
+                const len = b.saved_lens[i];
+                if (w > 0 and len > 0) {
+                    const src = b.saved_ptrs[i].?;
+                    const nbytes = @as(usize, w) * len;
+                    @memcpy(save_buf[off .. off + nbytes], src[0..nbytes]);
+                    off += nbytes;
+                }
+            }
+        }
+        return b;
+    }
+
+    /// 恢复通道状态（使用保存时的 chan_widths，而非当前值）。
+    fn restoreRecursiveChannels(self: *Engine, b: *const ChannelBackup) void {
+        const save_buf = if (b.save_buf_heap) |sb| sb else b.save_buf_stack[0..b.total_bytes];
+        const n = b.n_chans;
+        var off: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const ch: u16 = if (i == 0) b.ret_chan else b.lcs + @as(u16, @intCast(i - 1));
+            if (ch < b.cc) {
+                self.runtime.chan_ptrs[ch] = b.saved_ptrs[i];
+                self.runtime.chan_lengths[ch] = b.saved_lens[i];
+                self.runtime.chan_widths[ch] = b.saved_widths[i];
+                const wd = b.saved_widths[i];
+                const len = b.saved_lens[i];
+                if (wd > 0 and len > 0) {
+                    const dst = b.saved_ptrs[i].?;
+                    const nbytes = @as(usize, wd) * len;
+                    @memcpy(dst[0..nbytes], save_buf[off .. off + nbytes]);
+                    off += nbytes;
+                }
+            }
+        }
+    }
+
+    fn freeBackupHeap(self: *Engine, b: *ChannelBackup) void {
+        if (b.save_buf_heap) |sb| {
+            self.tctx.?.backing.free(sb);
+            b.save_buf_heap = null;
+        }
+    }
+
+    /// 暂存调用结果（在 restoreRecursiveChannels 之前调用）。
+    /// ret_is_ref=true 或非 ref_chan 时直接字节拷贝；普通复合类型 ref_chan 深拷贝。
+    fn saveCallResult(self: *Engine, result_chan: u16, ret_is_ref: bool) EngineError!SavedResult {
+        const w = self.runtime.elemWidth(result_chan);
+        if (w == 0) return .none;
+        const result_meta = self.ir.channels.get(result_chan);
+        if (!ret_is_ref and result_meta.chan_type == .ref_chan) {
+            const v = self.chanToValue(result_chan);
+            const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+            try self.trackValueTree(copied);
+            return .{ .value = copied };
+        }
+        var buf: [16]u8 = undefined;
+        const src = self.runtime.rawPtr(result_chan);
+        @memcpy(buf[0..w], src[0..w]);
+        return .{ .bytes = .{ .buf = buf, .w = @intCast(w) } };
+    }
+
+    /// 将暂存结果写入输出通道（在 restoreRecursiveChannels 之后调用）。
+    fn writeCallResult(self: *Engine, out_chan: u16, saved: SavedResult) EngineError!void {
+        switch (saved) {
+            .none => {},
+            .bytes => |b| {
+                const dst = self.runtime.rawPtr(out_chan);
+                @memcpy(dst[0..b.w], b.buf[0..b.w]);
+            },
+            .value => |v| self.valueToChan(out_chan, v),
+        }
+    }
+
     /// 标准调用路径：从 execCall 抽出，供 memoization 快速路径未命中时调用
     /// 包含自递归/互递归 TCO 检查、递归调用 save/restore、非递归调用直通
     fn execCallStandard(self: *Engine, node: *const Node, call_meta: ir_mod.CallMeta, callee_func: Function, args: []const u16) EngineError!void {
@@ -4722,27 +5373,12 @@ pub const Engine = struct {
         // tail_call 由 IR builder 标记（只有尾位置的调用才标记为 true），
         // 非尾调用（如 1 + recAdd(n-1) 中的 recAdd）不触发 TCO
         if (call_meta.func_index == self.current_func_idx and args.len <= 16 and call_meta.tail_call) {
-            // 保存参数到 tco_args
             self.tco_arg_count = @intCast(args.len);
             @memcpy(self.tco_args[0..args.len], args);
             self.tco_caller_func_idx = self.current_func_idx;
             // 复制参数值到当前函数的 param_channels（为重执行做准备）
-            for (args, 0..) |arg_chan, i| {
-                if (i < callee_func.param_channels.len) {
-                    const dst_chan = callee_func.param_channels[i];
-                    const w = self.runtime.elemWidth(arg_chan);
-                    if (w > 0) {
-                        if (arg_chan == dst_chan) continue;
-                        const src = self.runtime.rawPtr(arg_chan);
-                        const dst = self.runtime.rawPtr(dst_chan);
-                        @memcpy(dst[0..w], src[0..w]);
-                    }
-                }
-            }
-            // 设置重执行信号
+            try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
             self.tco_restart = true;
-            // 写入结果占位（execFunction 会用 halt_return 的值覆盖）
-            // 实际上不需要写入，因为 execFunction 会重新执行并最终返回正确结果
             return;
         }
 
@@ -4761,18 +5397,7 @@ pub const Engine = struct {
             }
             if (is_mutual_recursive) {
                 // 复制参数值到 callee 的 param_channels（为跳转后重执行做准备）
-                for (args, 0..) |arg_chan, i| {
-                    if (i < callee_func.param_channels.len) {
-                        const dst_chan = callee_func.param_channels[i];
-                        const w = self.runtime.elemWidth(arg_chan);
-                        if (w > 0) {
-                            if (arg_chan == dst_chan) continue;
-                            const src = self.runtime.rawPtr(arg_chan);
-                            const dst = self.runtime.rawPtr(dst_chan);
-                            @memcpy(dst[0..w], src[0..w]);
-                        }
-                    }
-                }
+                try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
                 // 设置跳转信号：execFunction 主循环检测后切换到 callee 函数体
                 self.tco_jump_to = call_meta.func_index;
                 self.tco_restart = true;
@@ -4780,18 +5405,11 @@ pub const Engine = struct {
             }
         }
 
-        // 非尾调用自递归：标准调用逻辑
-        // 通道是全局分配的，每个函数有独立的通道范围。
-        // 非递归调用时，被调用函数的通道与调用者不重叠，无需 save/restore。
-        // 递归调用时（callee 在调用栈中），被调用函数的通道与祖先帧重叠，必须 save/restore。
-        const ret_chan = callee_func.return_channel;
-        const lcs = callee_func.local_chan_start;
-        const lcc = callee_func.local_chan_count;
-        const cc = self.runtime.chan_count;
-
         // 检查是否为递归调用（callee 已在调用栈中）
         // 直接递归：callee == current_func_idx
         // 互递归：callee 在 call_stack 中
+        // 通道是全局分配的：非递归调用时被调用函数通道与调用者不重叠，无需 save/restore；
+        // 递归调用时通道与祖先帧重叠，必须 save/restore。
         var is_recursive = call_meta.func_index == self.current_func_idx;
         if (!is_recursive) {
             for (self.call_stack[0..self.call_depth]) |frame| {
@@ -4802,81 +5420,12 @@ pub const Engine = struct {
             }
         }
 
-        // 递归调用：保存被调用函数的通道状态（return_channel + 局部通道）
-        // 保存/恢复仅在递归调用时需要（被调用函数的通道与调用者重叠）
-        // 注意：必须在复制参数之前保存，否则保存的是被调用者的新参数值而非调用者的原始值
-        var saved_ptrs_buf: [256]?[*]u8 = undefined;
-        var saved_lens_buf: [256]u32 = undefined;
-        var saved_widths_buf: [256]u8 = undefined;
-        var save_buf_stack: [4096]u8 = undefined;
-        var save_buf_heap: ?[]u8 = null;
-        const n_chans: usize = 1 + @as(usize, lcc);
-        const chanIdx = struct {
-            fn get(ret: u16, lstart: u16, i: usize) u16 {
-                return if (i == 0) ret else lstart + @as(u16, @intCast(i - 1));
-            }
-        };
-
         if (is_recursive) {
-            if (n_chans > saved_ptrs_buf.len) return error.CallDepthExceeded;
-            const saved_ptrs = saved_ptrs_buf[0..n_chans];
-            const saved_lens = saved_lens_buf[0..n_chans];
-            const saved_widths = saved_widths_buf[0..n_chans];
+            // 递归调用：必须先保存通道状态再复制参数（param_channels 与调用者重叠）
+            var backup = try self.saveRecursiveChannels(callee_func);
+            defer self.freeBackupHeap(&backup);
 
-            // 计算总字节数并保存元数据（此时通道保存的是调用者的原始值）
-            // 必须同时保存 chan_widths，因为 callee 可能修改通道宽度
-            var total_bytes: usize = 0;
-            for (0..n_chans) |i| {
-                const ch = chanIdx.get(ret_chan, lcs, i);
-                if (ch < cc) {
-                    saved_ptrs[i] = self.runtime.chan_ptrs[ch];
-                    saved_lens[i] = self.runtime.chan_lengths[ch];
-                    saved_widths[i] = self.runtime.chan_widths[ch];
-                    if (saved_widths[i] > 0 and saved_lens[i] > 0) total_bytes += @as(usize, saved_widths[i]) * saved_lens[i];
-                } else {
-                    saved_ptrs[i] = null;
-                    saved_lens[i] = 0;
-                    saved_widths[i] = 0;
-                }
-            }
-
-            // 保存通道数据（调用者的原始值）
-            const need_heap = total_bytes > save_buf_stack.len;
-            if (need_heap) {
-                save_buf_heap = self.tctx.?.backing.alloc(u8, total_bytes) catch return error.OutOfMemory;
-            }
-            const save_buf = if (save_buf_heap) |sb| sb else save_buf_stack[0..total_bytes];
-            {
-                var off: usize = 0;
-                for (0..n_chans) |i| {
-                    const ch = chanIdx.get(ret_chan, lcs, i);
-                    if (ch < cc) {
-                        const w = saved_widths[i];
-                        const len = saved_lens[i];
-                        if (w > 0 and len > 0) {
-                            const src = saved_ptrs[i].?;
-                            const n = @as(usize, w) * len;
-                            @memcpy(save_buf[off .. off + n], src[0..n]);
-                            off += n;
-                        }
-                    }
-                }
-            }
-
-            // 保存后才复制参数值到被调用函数的参数通道
-            // （递归调用时 param_channels 与调用者重叠，必须在保存后覆盖）
-            for (args, 0..) |arg_chan, i| {
-                if (i < callee_func.param_channels.len) {
-                    const dst_chan = callee_func.param_channels[i];
-                    const w = self.runtime.elemWidth(arg_chan);
-                    if (w > 0) {
-                        if (arg_chan == dst_chan) continue;
-                        const src = self.runtime.rawPtr(arg_chan);
-                        const dst = self.runtime.rawPtr(dst_chan);
-                        @memcpy(dst[0..w], src[0..w]);
-                    }
-                }
-            }
+            try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
 
             // 压栈
             self.call_stack[self.call_depth] = .{
@@ -4893,58 +5442,16 @@ pub const Engine = struct {
             const result_chan = try self.execFunction(call_meta.func_index, args);
             self.current_func_idx = saved_func_idx;
 
-            // 先把结果存到栈临时变量（恢复通道会覆盖 result_chan 和 node.output）
-            const result_w = self.runtime.elemWidth(result_chan);
-            var result_buf: [16]u8 = undefined;
-            if (result_w > 0) {
-                const src = self.runtime.rawPtr(result_chan);
-                @memcpy(result_buf[0..result_w], src[0..result_w]);
-            }
+            // 暂存结果（restore 会覆盖 result_chan 和 node.output）
+            const saved = try self.saveCallResult(result_chan, call_meta.ret_is_ref);
             self.call_depth -= 1;
 
-            // 恢复被调用函数的通道状态（恢复为调用者的原始值）
-            // 使用保存时的 chan_widths，而非当前值（callee 可能修改了通道宽度）
-            {
-                var off: usize = 0;
-                for (0..n_chans) |i| {
-                    const ch = chanIdx.get(ret_chan, lcs, i);
-                    if (ch < cc) {
-                        self.runtime.chan_ptrs[ch] = saved_ptrs[i];
-                        self.runtime.chan_lengths[ch] = saved_lens[i];
-                        self.runtime.chan_widths[ch] = saved_widths[i];
-                        const wd = saved_widths[i];
-                        const len = saved_lens[i];
-                        if (wd > 0 and len > 0) {
-                            const dst = saved_ptrs[i].?;
-                            const n = @as(usize, wd) * len;
-                            @memcpy(dst[0..n], save_buf[off .. off + n]);
-                            off += n;
-                        }
-                    }
-                }
-            }
-
-            // 恢复后再把结果写入 call 节点的输出通道
-            if (result_w > 0) {
-                const dst = self.runtime.rawPtr(node.output);
-                @memcpy(dst[0..result_w], result_buf[0..result_w]);
-            }
-            defer if (save_buf_heap) |sb| self.tctx.?.backing.free(sb);
+            // 恢复通道状态后再把结果写入输出通道
+            self.restoreRecursiveChannels(&backup);
+            try self.writeCallResult(node.output, saved);
         } else {
             // 非递归调用：被调用函数有独立通道，无需 save/restore
-            // 复制参数值到被调用函数的参数通道
-            for (args, 0..) |arg_chan, i| {
-                if (i < callee_func.param_channels.len) {
-                    const dst_chan = callee_func.param_channels[i];
-                    const w = self.runtime.elemWidth(arg_chan);
-                    if (w > 0) {
-                        if (arg_chan == dst_chan) continue;
-                        const src = self.runtime.rawPtr(arg_chan);
-                        const dst = self.runtime.rawPtr(dst_chan);
-                        @memcpy(dst[0..w], src[0..w]);
-                    }
-                }
-            }
+            try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
 
             self.call_stack[self.call_depth] = .{
                 .func_idx = call_meta.func_index,
@@ -4961,13 +5468,8 @@ pub const Engine = struct {
             self.current_func_idx = saved_func_idx;
             self.call_depth -= 1;
 
-            // 把结果写入 call 节点的输出通道
-            const result_w = self.runtime.elemWidth(result_chan);
-            if (result_w > 0) {
-                const src = self.runtime.rawPtr(result_chan);
-                const dst = self.runtime.rawPtr(node.output);
-                @memcpy(dst[0..result_w], src[0..result_w]);
-            }
+            // 把结果写入 call 节点的输出通道（统一值语义深拷贝）
+            try self.cloneValueBetweenChannels(node.output, result_chan, call_meta.ret_is_ref);
         }
     }
 
@@ -5556,8 +6058,8 @@ pub const Engine = struct {
                         const cond_result = try self.execBodyNodesCompact(nodes, body_local_start, lac.cond_active);
                         if (cond_result) |halt_chan| return halt_chan;
                     }
-                    const cond = self.runtime.readBool(lm.cond_chan);
-                    if (!cond) break;
+                    const cond_val = try self.readScalarValue(lm.cond_chan);
+                    if (!cond_val.asBool()) break;
                     // 循环体段
                     if (body_compiled) |insts| {
                         self.execCompiledCompact(insts) catch |err| switch (err) {
@@ -5629,9 +6131,12 @@ pub const Engine = struct {
         switch (vm.vec_op) {
             .range_source => {
                 // 按通道实际类型读取 start/end（避免 i32 通道读 8 字越界）
-                const start = self.readIntAsI64(node.inputs[0]);
-                const end = self.readIntAsI64(node.inputs[1]);
-                const count: u32 = if (end > start) @intCast(end - start) else 0;
+                const start = try self.readIntAsI64(node.inputs[0]);
+                const end = try self.readIntAsI64(node.inputs[1]);
+                // _pad=1 标记 inclusive range（..=）：count = end - start + 1
+                const inclusive = (node._pad & 1) != 0;
+                const range_end: i64 = if (inclusive) end + 1 else end;
+                const count: u32 = if (range_end > start) @intCast(range_end - start) else 0;
                 try self.runtime.allocVector(node.output, count);
                 const elem_type = vm.elem_type;
                 for (0..count) |i| {
@@ -6180,20 +6685,6 @@ pub const Engine = struct {
         const func = self.ir.functions[self.currentFuncIdx()];
         const nodes = self.ir.funcNodes(self.currentFuncIdx());
         const body_local_start: usize = vm.body_start - func.node_start;
-
-        // DEBUG: dump body nodes
-        if (std.mem.eql(u8, func.name, "std.io.Path.test_if_else_in_loop")) {
-            std.debug.print("DEBUG: vec_map body for {s} (body_start={d}, body_len={d}):\n", .{ func.name, body_local_start, vm.body_len });
-            for (body_local_start..body_local_start + vm.body_len) |i| {
-                const n = nodes[i];
-                std.debug.print("  [{d}] op={s} output={d} inputs=[", .{ i, @tagName(n.op), n.output });
-                for (0..n.input_count) |j| {
-                    if (j > 0) std.debug.print(",", .{});
-                    std.debug.print("{d}", .{n.inputs[j]});
-                }
-                std.debug.print("] meta={d}\n", .{n.meta_index});
-            }
-        }
 
         // 找到 body 的输出通道（body 子图最后一个节点的 output）
         const body_out_chan = nodes[body_local_start + vm.body_len - 1].output;
@@ -6901,7 +7392,8 @@ pub const Engine = struct {
                 const body_local_start: usize = vm.body_start - func.node_start;
                 _ = try self.execBodyNodes(nodes, body_local_start, vm.body_len);
             }
-            if (self.runtime.readBool(body_out_chan)) {
+            const body_out_val = try self.readScalarValue(body_out_chan);
+            if (body_out_val.asBool()) {
                 // 用 base_ptr 直接计算（chan_ptrs[src_chan] 已被循环移动）
                 const src = base_ptr + i * elem_w;
                 @memcpy(temp[kept * w .. (kept + 1) * w], src[0..w]);
@@ -6927,7 +7419,7 @@ pub const Engine = struct {
     /// vec_take：取前 N 个元素
     fn execVecTake(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
-        const n: u32 = @intCast(@max(0, self.runtime.readI64(node.inputs[1])));
+        const n: u32 = @intCast(@max(0, try self.readIntAsI64(node.inputs[1])));
         const count = self.runtime.vectorLen(src_chan);
         const take = @min(n, count);
         try self.runtime.allocVector(node.output, take);
@@ -6976,7 +7468,8 @@ pub const Engine = struct {
                 const body_local_start: usize = vm.body_start - func.node_start;
                 _ = try self.execBodyNodes(nodes, body_local_start, vm.body_len);
             }
-            if (!self.runtime.readBool(body_out_chan)) break;
+            const body_out_val = try self.readScalarValue(body_out_chan);
+            if (!body_out_val.asBool()) break;
             taken = @intCast(i + 1);
         }
 
@@ -6996,20 +7489,62 @@ pub const Engine = struct {
         self.runtime.chan_lengths[src_chan] = count;
     }
 
-    /// vec_zip：合并两个向量为 pair 数组
+    /// vec_zip：合并两个向量为 Pair(first, second) 记录向量
+    /// inputs[0] = 左向量，inputs[1] = 右向量
+    /// output = ref_chan 向量，每个元素是指向 Pair 记录的指针
     fn execVecZip(self: *Engine, node: *const Node) EngineError!void {
         const left_chan = node.inputs[0];
         const right_chan = node.inputs[1];
         const count = @min(self.runtime.vectorLen(left_chan), self.runtime.vectorLen(right_chan));
-        // 简化：输出左向量，右向量通过 vec_map2 使用
-        // 真正的 zip 需要 pair 类型支持，这里简化为拷贝左向量
+
+        // 输出通道必须是 ref_chan，每个元素存 Pair 记录指针
+        const out_meta = self.ir.channels.get(node.output);
+        if (out_meta.chan_type != .ref_chan) return error.InvalidChannel;
+
         try self.runtime.allocVector(node.output, count);
-        const w = self.runtime.elemWidth(left_chan);
-        if (count > 0) {
-            const src = self.runtime.rawPtr(left_chan);
-            const dst = self.runtime.rawPtr(node.output);
-            @memcpy(dst[0 .. w * count], src[0 .. w * count]);
+        if (count == 0) return;
+
+        const base_left = self.runtime.chan_ptrs[left_chan].?;
+        const base_right = self.runtime.chan_ptrs[right_chan].?;
+        const elem_w_left = self.runtime.elemWidth(left_chan);
+        const elem_w_right = self.runtime.elemWidth(right_chan);
+        const saved_left_len = self.runtime.chan_lengths[left_chan];
+        const saved_right_len = self.runtime.chan_lengths[right_chan];
+
+        const field_names: [2]?[]const u8 = .{ "first", "second" };
+        const dst = self.runtime.rawPtr(node.output);
+        const out_w = self.runtime.elemWidth(node.output);
+
+        for (0..count) |i| {
+            self.runtime.chan_ptrs[left_chan] = base_left + i * elem_w_left;
+            self.runtime.chan_lengths[left_chan] = 1;
+            self.runtime.chan_ptrs[right_chan] = base_right + i * elem_w_right;
+            self.runtime.chan_lengths[right_chan] = 1;
+
+            var fields: [2]value.Value = .{
+                try self.readScalarValue(left_chan),
+                try self.readScalarValue(right_chan),
+            };
+            // 所有权转移给 RecordValue，先增加引用计数
+            _ = fields[0].retain();
+            _ = fields[1].retain();
+            const pair = value.Value.makeRecordWithNames(
+                self.tctx.?,
+                "Pair",
+                &fields,
+                &field_names,
+            ) catch return error.OutOfMemory;
+            try self.trackObj(@ptrCast(@alignCast(pair.ref)));
+
+            const slot: *usize = @ptrCast(@alignCast(dst + i * out_w));
+            slot.* = @intFromPtr(pair.ref);
         }
+
+        // 恢复源向量指针和长度
+        self.runtime.chan_ptrs[left_chan] = base_left;
+        self.runtime.chan_lengths[left_chan] = saved_left_len;
+        self.runtime.chan_ptrs[right_chan] = base_right;
+        self.runtime.chan_lengths[right_chan] = saved_right_len;
     }
 
     /// 获取当前正在执行的函数索引
@@ -7046,22 +7581,26 @@ pub const Engine = struct {
         return @alignCast(@fieldParentPtr("header", header));
     }
 
-    /// 按通道实际类型读取整数值并符号扩展为 i64
-    /// 用于索引、长度等需要统一为 i64 的场景，避免 i32 通道读到 i64 时读到垃圾数据
-    fn readIntAsI64(self: *Engine, chan: u16) i64 {
-        const meta = self.ir.channels.get(chan);
-        const ptr = self.runtime.rawPtr(chan);
-        return switch (meta.chan_type) {
-            .i8_chan => @as(i64, @as(i8, @bitCast(ptr[0]))),
-            .i16_chan => @as(i64, @as(i16, @bitCast(@as(*[2]u8, @ptrCast(ptr)).*))),
-            .i32_chan => @as(i64, @as(i32, @bitCast(@as(*[4]u8, @ptrCast(ptr)).*))),
-            .i64_chan => self.runtime.readI64(chan),
-            .u8_chan => @as(i64, ptr[0]),
-            .u16_chan => @as(i64, @as(u16, @bitCast(@as(*[2]u8, @ptrCast(ptr)).*))),
-            .u32_chan => @as(i64, @as(u32, @bitCast(@as(*[4]u8, @ptrCast(ptr)).*))),
-            .u64_chan => @bitCast(self.runtime.readU64(chan)),
-            .isize_chan => @as(i64, @as(isize, @bitCast(self.runtime.readUsize(chan)))),
-            .usize_chan => @bitCast(@as(usize, @bitCast(self.runtime.readUsize(chan)))),
+    /// 按通道实际类型读取整数值并符号扩展为 i64。
+    /// 这是通用观察点：如果通道中是 LazyValue，会先强制求值，再转为 i64。
+    /// 用于索引、长度、select 超时等所有需要把值当作整数观察的场景。
+    fn readIntAsI64(self: *Engine, chan: u16) EngineError!i64 {
+        const v = try self.readScalarValue(chan);
+        return switch (v) {
+            .i8 => |b| @as(i64, @as(i8, @bitCast(b[0]))),
+            .i16 => |b| @as(i64, @as(i16, @bitCast(b))),
+            .i32 => |b| @as(i64, @as(i32, @bitCast(b))),
+            .i64 => |b| @as(i64, @bitCast(b)),
+            .u8 => |b| @as(i64, b[0]),
+            .u16 => |b| @as(i64, @as(u16, @bitCast(b))),
+            .u32 => |b| @as(i64, @as(u32, @bitCast(b))),
+            .u64 => |b| @bitCast(@as(u64, @bitCast(b))),
+            .isize => |b| @as(i64, @as(isize, @bitCast(b))),
+            .usize => |b| @bitCast(@as(usize, @bitCast(b))),
+            .boolean => |b| @intFromBool(b[0] != 0),
+            .char => |b| @as(i64, @intCast(@as(u32, @bitCast(b)))),
+            .f32 => |b| @intFromFloat(@as(f32, @bitCast(b))),
+            .f64 => |b| @intFromFloat(@as(f64, @bitCast(b))),
             else => 0,
         };
     }
@@ -7180,7 +7719,7 @@ pub const Engine = struct {
     fn execGateMakeOk(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
         // 读取值并构造 ThrowValue{ .ok = value }
-        const v = self.readScalarValue(val_chan);
+        const v = try self.readScalarValue(val_chan);
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
         _ = v.retain();
         try self.trackObj(throw_v.asRef());
@@ -7247,15 +7786,27 @@ pub const Engine = struct {
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
     }
 
-    /// 从通道读取标量值（用于 gate 操作）
-    fn readScalarValue(self: *Engine, chan: u16) value.Value {
+    /// 从通道读取标量值（用于 gate 操作、print、return 等观察点）
+    /// ref_chan 中若是 LazyValue，会自动强制求值一次并返回其结果（缓存借用）。
+    fn readScalarValue(self: *Engine, chan: u16) EngineError!value.Value {
         const meta = self.ir.channels.get(chan);
         const w = meta.elem_width;
         if (meta.chan_type == .ref_chan) {
-            const ptr = self.runtime.readPtr(chan) orelse return value.Value.fromNull();
-            return value.Value.fromRef(@ptrCast(@alignCast(ptr)));
+            if (self.readRefObj(chan)) |header| {
+                if (header.type_tag == .lazy_val) {
+                    const lazy: *value.LazyValue = @alignCast(@fieldParentPtr("header", header));
+                    return try self.forceLazyValue(lazy);
+                }
+                return value.Value.fromRef(header);
+            }
+            // readRefObj 失败：ref_chan 可能持有标量位模式（类型参数实例化为标量时，
+            // 标量按 i64/f64 位模式存入 8 字节 ref_chan）。null 返回 null_val，
+            // 否则按 i64 读取（注意：无法区分 i64 与 f64 位模式，浮点场景需走 copyCrossType）。
+            const raw = self.runtime.readI64(chan);
+            if (raw == 0) return value.Value.fromNull();
+            return value.Value.fromI64(raw);
         }
-        if (meta.chan_type == .bool_chan) {
+        if (meta.chan_type == .bool_chan or meta.chan_type == .mask_chan) {
             return value.Value.fromBool(self.runtime.readBool(chan));
         }
         if (meta.chan_type == .char_chan) {
@@ -7284,18 +7835,23 @@ pub const Engine = struct {
         const meta = self.ir.channels.get(chan);
         switch (meta.chan_type) {
             .ref_chan => {
+                const ptr: *i64 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
                 switch (v) {
                     .ref => |r| self.runtime.writePtr(chan, @ptrCast(r)),
-                    .null_val => self.runtime.writePtr(chan, null),
-                    // 整数值写入 ref_chan：按原始字节写入（用于 i64 被误判为 ref 的情况）
-                    .i64 => |b| {
-                        const ptr: *i64 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
-                        ptr.* = @bitCast(b);
-                    },
-                    .i32 => |b| {
-                        const ptr: *i32 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
-                        ptr.* = @bitCast(b);
-                    },
+                    .null_val, .unit => self.runtime.writePtr(chan, null),
+                    // 标量值写入 ref_chan（类型参数实例化为标量时）：
+                    // 整数符号扩展为 i64，浮点提升为 f64，写入完整 8 字节
+                    .i8 => |b| ptr.* = @as(i64, @as(i8, @bitCast(b[0]))),
+                    .u8 => |b| ptr.* = @as(i64, b[0]),
+                    .i16 => |b| ptr.* = @as(i64, @as(i16, @bitCast(b))),
+                    .u16 => |b| ptr.* = @as(i64, @as(u16, @bitCast(b))),
+                    .i32 => |b| ptr.* = @as(i64, @as(i32, @bitCast(b))),
+                    .u32 => |b| ptr.* = @as(i64, @as(u32, @bitCast(b))),
+                    .i64 => |b| ptr.* = @bitCast(b),
+                    .u64 => |b| ptr.* = @bitCast(@as(u64, @bitCast(b))),
+                    .boolean => |b| ptr.* = @intFromBool(b[0] != 0),
+                    .f32 => |b| ptr.* = @bitCast(@as(f64, @floatCast(@as(f32, @bitCast(b))))),
+                    .f64 => |b| ptr.* = @bitCast(@as(f64, @bitCast(b))),
                     else => self.runtime.writePtr(chan, null),
                 }
             },
@@ -7323,7 +7879,7 @@ pub const Engine = struct {
                 const ptr: *u32 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
                 ptr.* = cp;
             },
-            .i64_chan, .u64_chan => {
+            .i64_chan, .u64_chan, .isize_chan, .usize_chan => {
                 const i: i64 = switch (v) {
                     .i64 => |b| @as(i64, @bitCast(b)),
                     .i32 => |b| @as(i64, @as(i32, @bitCast(b))),
@@ -7333,6 +7889,8 @@ pub const Engine = struct {
                     .u32 => |b| @as(i64, @as(u32, @bitCast(b))),
                     .u16 => |b| @as(i64, @as(u16, @bitCast(b))),
                     .u8 => |b| @as(i64, b[0]),
+                    .isize => |b| @as(i64, @as(isize, @bitCast(b))),
+                    .usize => |b| @bitCast(@as(usize, @bitCast(b))),
                     .boolean => |b| @intFromBool(b[0] != 0),
                     .null_val, .unit => 0,
                     .ref => |r| @intCast(@intFromPtr(r)),
@@ -7415,6 +7973,94 @@ pub const Engine = struct {
     }
 
     // ════════════════════════════════════════════
+    // 惰性求值执行（Lazy<T>）
+    // ════════════════════════════════════════════
+
+    /// lazy_make：构造 LazyValue 对象
+    /// inputs[0] = thunk closure (ref_chan)，output = ref_chan
+    fn execLazyMake(self: *Engine, node: *const Node) EngineError!void {
+        const closure_ptr = self.runtime.readPtr(node.inputs[0]) orelse return error.InvalidChannel;
+        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(closure_ptr));
+        if (header.type_tag != .closure) return error.InvalidChannel;
+        const closure: *value.Closure = @alignCast(@fieldParentPtr("header", header));
+
+        const use_arena = self.currentFuncUseArena();
+        const buf = if (use_arena)
+            self.tctx.?.allocObjArena(@sizeOf(value.LazyValue)) catch return error.OutOfMemory
+        else
+            self.tctx.?.allocObj(@sizeOf(value.LazyValue)) catch return error.OutOfMemory;
+        const lazy: *value.LazyValue = @ptrCast(@alignCast(buf.ptr));
+        lazy.* = .{
+            .expr = undefined,
+            .env = undefined,
+            .thunk = closure,
+        };
+        if (use_arena) lazy.header.markArenaAllocated();
+        try self.trackObj(&lazy.header);
+        // LazyValue 持有 thunk 闭包的一次引用
+        _ = (value.Value{ .ref = &closure.header }).retain();
+        self.runtime.writePtr(node.output, @ptrCast(&lazy.header));
+    }
+
+    /// lazy_force：强制求值 Lazy<T>
+    /// inputs[0] = LazyValue (ref_chan)，output = 值通道
+    fn execLazyForce(self: *Engine, node: *const Node) EngineError!void {
+        const lazy = self.readLazyValue(node.inputs[0]) orelse return error.InvalidChannel;
+        if (lazy.forced) {
+            if (lazy.cached) |c| {
+                self.writeScalarValue(node.output, c);
+            }
+            return;
+        }
+        const result = try self.forceLazyValue(lazy);
+        self.writeScalarValue(node.output, result);
+    }
+
+    /// 读取 ref_chan 中的 LazyValue 指针
+    fn readLazyValue(self: *Engine, chan: u16) ?*value.LazyValue {
+        const header = self.readRefObj(chan) orelse return null;
+        if (header.type_tag != .lazy_val) return null;
+        return @alignCast(@fieldParentPtr("header", header));
+    }
+
+    /// 强制求值 LazyValue：调用 thunk 闭包并缓存结果
+    fn forceLazyValue(self: *Engine, lazy: *value.LazyValue) EngineError!value.Value {
+        if (lazy.forced) return lazy.cached orelse value.Value.fromNull();
+        const closure: *value.Closure = @ptrCast(@alignCast(lazy.thunk));
+        const func_idx: u16 = @intCast(@intFromPtr(closure.func));
+        if (func_idx >= self.ir.functions.len) return error.InvalidMetaIndex;
+        const callee_func = self.ir.functions[func_idx];
+
+        if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
+
+        // thunk 无显式参数，只需把上值写入 param_channels 尾部
+        const total_params = callee_func.param_channels.len;
+        const uv_count = @min(closure.upvalues.len, total_params);
+        for (0..uv_count) |i| {
+            self.writeScalarValue(callee_func.param_channels[i], closure.upvalues[i]);
+        }
+
+        self.call_stack[self.call_depth] = .{
+            .func_idx = func_idx,
+            .return_chan = callee_func.return_channel,
+            .return_pc = 0,
+        };
+        self.call_depth += 1;
+
+        const saved_func_idx = self.current_func_idx;
+        const result_chan = try self.execFunction(func_idx, &.{});
+        self.current_func_idx = saved_func_idx;
+        self.call_depth -= 1;
+
+        const result = try self.readScalarValue(result_chan);
+        // 缓存结果，避免重复求值
+        lazy.forced = true;
+        lazy.cached = result;
+        _ = result.retain();
+        return result;
+    }
+
+    // ════════════════════════════════════════════
     // 清理执行（Phase 4：defer）
     // ════════════════════════════════════════════
 
@@ -7479,7 +8125,7 @@ pub const Engine = struct {
         // 计算超时截止时间（单调时钟毫秒时间戳），null 表示无限等待
         var deadline: ?i64 = null;
         if (timeout_arm != null) {
-            const dur_ms = self.readIntAsI64(node.inputs[timeout_input]);
+            const dur_ms = try self.readIntAsI64(node.inputs[timeout_input]);
             deadline = monotonicMillis() + dur_ms;
         }
 
@@ -7554,8 +8200,9 @@ pub const Engine = struct {
         if (node.meta_index == 0 or node.meta_index > self.ir.route_metas.len) return error.InvalidMetaIndex;
         const rm = self.ir.route_metas[node.meta_index - 1];
 
-        // 读取 winner 索引
-        const winner_raw = self.runtime.readI64(node.inputs[0]);
+        // 读取 winner 索引（通用观察点：自动强制 Lazy<bool>/Lazy<i64>）
+        const winner_val = try self.readScalarValue(node.inputs[0]);
+        const winner_raw = winner_val.asI64();
         const winner: usize = @intCast(@as(u64, @bitCast(winner_raw)));
 
         if (winner >= rm.body_starts.len or winner >= rm.body_lens.len) {
@@ -7814,6 +8461,13 @@ pub const Engine = struct {
         };
     }
 
+    /// 读取 AtomicValue 指针（ref_chan → *AtomicValue）
+    fn readAtomicValue(self: *Engine, chan: u16) ?*value.AtomicValue {
+        const header = self.readRefObj(chan) orelse return null;
+        if (header.type_tag != .atomic_val) return null;
+        return @alignCast(@fieldParentPtr("header", header));
+    }
+
     /// orbit_async_create：在独立线程中执行 async 函数
     /// inputs[0..N] = 参数通道
     /// meta_index 指向 OrbitMeta（记录 func_index, arg_count, result_type）
@@ -7827,11 +8481,18 @@ pub const Engine = struct {
         handle.* = value.AsyncHandle.init();
         try self.trackObj(&handle.header);
 
-        // 读取参数值
+        // 读取参数值：标量按 i64 传递，ref_chan 传递原始对象指针由 worker 深拷贝
         var args: [4]i64 = .{ 0, 0, 0, 0 };
+        var arg_objs: [4]?*value.obj_header.ObjHeader = .{ null, null, null, null };
         const arg_count = @min(om.arg_count, 4);
         for (0..arg_count) |i| {
-            args[i] = self.runtime.readI64(node.inputs[i]);
+            const arg_meta = self.ir.channels.get(node.inputs[i]);
+            if (arg_meta.chan_type == .ref_chan) {
+                const v = self.chanToValue(node.inputs[i]);
+                arg_objs[i] = if (v == .ref) v.ref else null;
+            } else {
+                args[i] = try self.readIntAsI64(node.inputs[i]);
+            }
         }
 
         // 设置状态为 Running
@@ -7845,6 +8506,7 @@ pub const Engine = struct {
             .ir = self.ir,
             .func_idx = om.func_index,
             .args = args,
+            .arg_objs = arg_objs,
             .arg_count = arg_count,
             .handle = handle,
             .global = self.global.?,
@@ -7862,15 +8524,24 @@ pub const Engine = struct {
     /// orbit_async_join：阻塞等待异步任务完成，提取结果
     /// inputs[0] = handle 通道（ref_chan）
     /// output = 结果通道
+    /// 值语义：普通复合类型返回值深拷贝到主线程，&T / *T 保持共享
     fn execOrbitAsyncJoin(self: *Engine, node: *const Node) EngineError!void {
-        const handle = self.readAsyncHandle(node.inputs[0]) orelse return error.InvalidChannel;
+        const handle = self.readAsyncHandle(node.inputs[0]) orelse {
+            return error.InvalidChannel;
+        };
 
         // 阻塞等待完成
         const result_val = handle.join();
 
         // 将结果写入 output 通道
         if (result_val) |v| {
-            self.writeScalarValue(node.output, v);
+            const out_meta = self.ir.channels.get(node.output);
+            const out_val = if (out_meta.chan_type == .ref_chan and !out_meta.is_ref) blk: {
+                const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                try self.trackValueTree(copied);
+                break :blk copied;
+            } else v;
+            self.writeScalarValue(node.output, out_val);
         } else {
             // 任务失败或无结果：写入 0
             const w = self.runtime.elemWidth(node.output);
@@ -7884,11 +8555,18 @@ pub const Engine = struct {
     /// orbit_chan_send：向通道发送值（阻塞直到接收方就绪）
     /// inputs[0] = handle/channel 通道（ref_chan）
     /// inputs[1] = 值通道
+    /// 值语义：普通复合类型 ref_chan 深拷贝后发送，&T / *T 保持共享
     fn execOrbitChanSend(self: *Engine, node: *const Node) EngineError!void {
         const ch = self.readChannelValue(node.inputs[0]) orelse return error.InvalidChannel;
-        const val = self.readScalarValue(node.inputs[1]);
+        const val = try self.readScalarValue(node.inputs[1]);
+        const val_meta = self.ir.channels.get(node.inputs[1]);
+        const sent_val = if (val_meta.chan_type == .ref_chan and !val_meta.is_ref) blk: {
+            const copied = val.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+            try self.trackValueTree(copied);
+            break :blk copied;
+        } else val;
 
-        const sent = ch.send(val) catch return error.Panic;
+        const sent = ch.send(sent_val) catch return error.Panic;
         if (!sent) return error.Thrown; // 通道已关闭
     }
 
@@ -7967,7 +8645,7 @@ pub const Engine = struct {
 
     /// channel_create：创建带缓冲的 ChannelValue
     fn execChannelCreate(self: *Engine, node: *const Node) EngineError!void {
-        const capacity = self.runtime.readI64(node.inputs[0]);
+        const capacity = try self.readIntAsI64(node.inputs[0]);
         const cap: usize = if (capacity < 0) 0 else @intCast(capacity);
         const ch = value.ChannelValue.create(self.tctx.?, cap) catch return error.OutOfMemory;
         try self.trackObj(&ch.header);
@@ -7994,23 +8672,42 @@ pub const Engine = struct {
         self.runtime.writePtr(node.output, @ptrCast(&receiver.header));
     }
 
+    /// atomic_make：构造 AtomicValue 堆对象
+    /// inputs[0] = 初始值，output = ref_chan（AtomicValue 指针）
+    fn execAtomicMake(self: *Engine, node: *const Node) EngineError!void {
+        const init_val = self.chanToValue(node.inputs[0]);
+        const av = self.tctx.?.createObj(value.AtomicValue) catch return error.OutOfMemory;
+        av.* = .{ .data = init_val, .mutex = .{} };
+        try self.trackObj(&av.header);
+        self.runtime.writePtr(node.output, @ptrCast(&av.header));
+    }
+
+    /// atomic_fetch_add：原子加/减法，返回旧值
+    /// inputs[0] = Atomic ref_chan，inputs[1] = 增量值
+    /// _pad=0 为 add，_pad=1 为 sub
+    fn execAtomicFetchAdd(self: *Engine, node: *const Node) EngineError!void {
+        const av = self.readAtomicValue(node.inputs[0]) orelse return error.InvalidChannel;
+        const delta = self.chanToValue(node.inputs[1]);
+        const old = if (node._pad == 1) av.fetchSub(delta) else av.fetchAdd(delta);
+        self.valueToChan(node.output, old);
+    }
+
     /// atomic_swap：原子交换，返回旧值
+    /// inputs[0] = Atomic ref_chan，inputs[1] = 新值
     fn execAtomicSwap(self: *Engine, node: *const Node) EngineError!void {
-        const old_val = self.chanToValue(node.inputs[0]);
+        const av = self.readAtomicValue(node.inputs[0]) orelse return error.InvalidChannel;
         const new_val = self.chanToValue(node.inputs[1]);
-        self.valueToChan(node.output, old_val);
-        self.valueToChan(node.inputs[0], new_val);
+        const old = av.xchg(new_val);
+        self.valueToChan(node.output, old);
     }
 
     /// atomic_cas：原子比较并交换
+    /// inputs[0] = Atomic ref_chan，inputs[1] = expected，inputs[2] = new
     fn execAtomicCas(self: *Engine, node: *const Node) EngineError!void {
-        const current = self.chanToValue(node.inputs[0]);
+        const av = self.readAtomicValue(node.inputs[0]) orelse return error.InvalidChannel;
         const expected = self.chanToValue(node.inputs[1]);
         const new_val = self.chanToValue(node.inputs[2]);
-        const ok = value.equals(current, expected);
-        if (ok) {
-            self.valueToChan(node.inputs[0], new_val);
-        }
+        const ok = av.cas(expected, new_val);
         self.runtime.writeBool(node.output, ok);
     }
 
@@ -8114,6 +8811,8 @@ pub const Engine = struct {
             .func = @ptrFromInt(@as(usize, cm.func_index)),
             .arity = @intCast(upvalue_count),
             .upvalues = &.{},
+            .upvalue_ref_bits = cm.upvalue_ref_bits,
+            .cell_upvalues = cm.cell_upvalues,
         };
         if (use_arena) closure.header.markArenaAllocated();
         try self.trackObj(&closure.header);
@@ -8125,14 +8824,59 @@ pub const Engine = struct {
             const uv_ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr + @sizeOf(value.Closure)));
             const upvalues = uv_ptr[0..upvalue_count];
             for (0..upvalue_count) |i| {
-                upvalues[i] = self.chanToValue(node.inputs[i]);
-                _ = upvalues[i].retain();
+                const v = self.chanToValue(node.inputs[i]);
+                const is_cell = (cm.cell_upvalues >> @intCast(i)) & 1 == 1;
+                const is_ref = (cm.upvalue_ref_bits >> @intCast(i)) & 1 == 1;
+                if (is_cell or is_ref) {
+                    // cell / &T / *T 上值保持引用语义，共享原对象
+                    upvalues[i] = v;
+                    _ = upvalues[i].retain();
+                } else {
+                    // 普通复合类型上值：深拷贝以获得独立所有权
+                    const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                    try self.trackValueTree(copied);
+                    upvalues[i] = copied;
+                }
             }
             closure.upvalues = upvalues;
         }
     }
 
-    /// call_indirect：通过 Closure 值间接调用
+    /// partial_make：构造 PartialApplication 值
+    /// meta_index 指向 PartialMeta（func_index + 已绑定实参通道 + 剩余参数个数）
+    /// output = ref_chan（PartialApplication 指针）
+    fn execPartialMake(self: *Engine, node: *const Node) EngineError!void {
+        if (node.meta_index == 0 or node.meta_index > self.ir.partial_metas.len) return error.InvalidMetaIndex;
+        const pm = self.ir.partial_metas[node.meta_index - 1];
+
+        const bound_count = pm.bound_arg_channels.len;
+        var bound_args: [16]value.Value = undefined;
+        for (0..bound_count) |i| {
+            const arg_chan = pm.bound_arg_channels[i];
+            const v = self.chanToValue(arg_chan);
+            const is_ref = (pm.bound_arg_ref_bits >> @intCast(i)) & 1 == 1;
+            if (is_ref) {
+                bound_args[i] = v.retain();
+            } else {
+                const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                try self.trackValueTree(copied);
+                bound_args[i] = copied;
+            }
+        }
+
+        const func_ptr: *const anyopaque = @ptrFromInt(@as(usize, pm.func_index) + 1);
+        const partial_v = value.Value.makePartial(
+            self.tctx.?,
+            func_ptr,
+            bound_args[0..bound_count],
+            pm.remaining_arity,
+            pm.bound_arg_ref_bits,
+        ) catch return error.OutOfMemory;
+        try self.trackObj(partial_v.ref);
+        self.runtime.writePtr(node.output, @ptrCast(partial_v.ref));
+    }
+
+    /// call_indirect：通过 Closure / PartialApplication 值间接调用
     /// inputs[0] = closure_chan（ref to Closure）
     /// inputs[1..M] = 参数通道
     /// meta_index 指向 CallMeta（arg_count 包含 closure_chan）
@@ -8140,10 +8884,20 @@ pub const Engine = struct {
         if (node.meta_index == 0 or node.meta_index > self.ir.call_metas.len) return error.InvalidMetaIndex;
         const call_meta = self.ir.call_metas[node.meta_index - 1];
 
-        // 读取 Closure 值
+        // 读取 Closure / PartialApplication 值
         const ptr = self.runtime.readPtr(node.inputs[0]) orelse return error.InvalidChannel;
         const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
-        if (header.type_tag != .closure) return error.InvalidChannel;
+        const is_partial = header.type_tag == .partial;
+        if (header.type_tag != .closure and !is_partial) return error.InvalidChannel;
+
+        if (is_partial) {
+            const pa: *value.PartialApplication = @alignCast(@fieldParentPtr("header", header));
+            const func_idx: u16 = @intCast(@intFromPtr(pa.func) - 1);
+            if (func_idx >= self.ir.functions.len) return error.InvalidMetaIndex;
+            const callee_func = self.ir.functions[func_idx];
+            return try self.execPartialApplicationCall(node, call_meta, callee_func, func_idx, pa);
+        }
+
         const closure: *value.Closure = @alignCast(@fieldParentPtr("header", header));
         const func_idx: u16 = @intCast(@intFromPtr(closure.func));
 
@@ -8158,11 +8912,6 @@ pub const Engine = struct {
 
         // 通道隔离：与 execCall 相同的策略——仅在递归调用时 save/restore
         // 递归检测：callee 已在调用栈中（直接/互递归）
-        const ret_chan = callee_func.return_channel;
-        const lcs = callee_func.local_chan_start;
-        const lcc = callee_func.local_chan_count;
-        const cc = self.runtime.chan_count;
-
         var is_recursive = func_idx == self.current_func_idx;
         if (!is_recursive) {
             for (self.call_stack[0..self.call_depth]) |frame| {
@@ -8173,84 +8922,14 @@ pub const Engine = struct {
             }
         }
 
-        // 栈缓冲区 + 溢出堆分配（与 execCall 一致）
-        var saved_ptrs_buf: [256]?[*]u8 = undefined;
-        var saved_lens_buf: [256]u32 = undefined;
-        var saved_widths_buf: [256]u8 = undefined;
-        var save_buf_stack: [4096]u8 = undefined;
-        var save_buf_heap: ?[]u8 = null;
-        const n_chans: usize = 1 + @as(usize, lcc);
-        const chanIdx = struct {
-            fn get(ret: u16, lstart: u16, i: usize) u16 {
-                return if (i == 0) ret else lstart + @as(u16, @intCast(i - 1));
-            }
-        };
-
         if (is_recursive) {
-            if (n_chans > saved_ptrs_buf.len) return error.CallDepthExceeded;
-            const saved_ptrs = saved_ptrs_buf[0..n_chans];
-            const saved_lens = saved_lens_buf[0..n_chans];
-            const saved_widths = saved_widths_buf[0..n_chans];
+            // 递归调用：必须先保存通道状态再复制参数（param_channels 与调用者重叠）
+            var backup = try self.saveRecursiveChannels(callee_func);
+            defer self.freeBackupHeap(&backup);
 
-            // 计算总字节数并保存元数据（此时通道保存的是调用者的原始值）
-            // 必须同时保存 chan_widths，因为 callee 可能修改通道宽度
-            var total_bytes: usize = 0;
-            for (0..n_chans) |i| {
-                const ch = chanIdx.get(ret_chan, lcs, i);
-                if (ch < cc) {
-                    saved_ptrs[i] = self.runtime.chan_ptrs[ch];
-                    saved_lens[i] = self.runtime.chan_lengths[ch];
-                    saved_widths[i] = self.runtime.chan_widths[ch];
-                    if (saved_widths[i] > 0 and saved_lens[i] > 0) total_bytes += @as(usize, saved_widths[i]) * saved_lens[i];
-                } else {
-                    saved_ptrs[i] = null;
-                    saved_lens[i] = 0;
-                    saved_widths[i] = 0;
-                }
-            }
-
-            // 保存通道数据（调用者的原始值）
-            const need_heap = total_bytes > save_buf_stack.len;
-            if (need_heap) {
-                save_buf_heap = self.tctx.?.backing.alloc(u8, total_bytes) catch return error.OutOfMemory;
-            }
-            const save_buf = if (save_buf_heap) |sb| sb else save_buf_stack[0..total_bytes];
-            {
-                var off: usize = 0;
-                for (0..n_chans) |i| {
-                    const ch = chanIdx.get(ret_chan, lcs, i);
-                    if (ch < cc) {
-                        const w = saved_widths[i];
-                        const len = saved_lens[i];
-                        if (w > 0 and len > 0) {
-                            const src = saved_ptrs[i].?;
-                            const n = @as(usize, w) * len;
-                            @memcpy(save_buf[off .. off + n], src[0..n]);
-                            off += n;
-                        }
-                    }
-                }
-            }
-
-            // 保存后才复制参数（递归时 param_channels 与调用者重叠，必须保存后覆盖）
-            const total_params = callee_func.param_channels.len;
-            const explicit_count = @min(arg_count, total_params);
-            for (0..explicit_count) |i| {
-                const dst_chan = callee_func.param_channels[i];
-                const w = self.runtime.elemWidth(args[i]);
-                if (w > 0) {
-                    if (args[i] == dst_chan) continue;
-                    const src = self.runtime.rawPtr(args[i]);
-                    const dst = self.runtime.rawPtr(dst_chan);
-                    @memcpy(dst[0..w], src[0..w]);
-                }
-            }
-            // 上值参数（从 Closure 的 upvalues 复制到对应的参数通道）
-            const upvalue_count = @min(closure.upvalues.len, if (total_params > explicit_count) total_params - explicit_count else 0);
-            for (0..upvalue_count) |i| {
-                const dst_chan = callee_func.param_channels[explicit_count + i];
-                self.writeScalarValue(dst_chan, closure.upvalues[i]);
-            }
+            // 显式实参 + upvalue 参数
+            try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
+            self.copyClosureUpvalues(callee_func, closure, args.len);
 
             // 压栈
             self.call_stack[self.call_depth] = .{
@@ -8264,61 +8943,16 @@ pub const Engine = struct {
             const result_chan = try self.execFunction(func_idx, args);
             self.current_func_idx = saved_func_idx;
 
-            // 先保存结果（恢复通道会覆盖 result_chan）
-            const result_w = self.runtime.elemWidth(result_chan);
-            var result_buf: [16]u8 = undefined;
-            if (result_w > 0) {
-                const src = self.runtime.rawPtr(result_chan);
-                @memcpy(result_buf[0..result_w], src[0..result_w]);
-            }
+            // 暂存结果（restore 会覆盖 result_chan）
+            const saved = try self.saveCallResult(result_chan, call_meta.ret_is_ref);
             self.call_depth -= 1;
 
-            // 恢复通道状态（使用保存时的 chan_widths，而非当前值）
-            {
-                var off: usize = 0;
-                for (0..n_chans) |i| {
-                    const ch = chanIdx.get(ret_chan, lcs, i);
-                    if (ch < cc) {
-                        self.runtime.chan_ptrs[ch] = saved_ptrs[i];
-                        self.runtime.chan_lengths[ch] = saved_lens[i];
-                        self.runtime.chan_widths[ch] = saved_widths[i];
-                        const wd = saved_widths[i];
-                        const len = saved_lens[i];
-                        if (wd > 0 and len > 0) {
-                            const dst = saved_ptrs[i].?;
-                            const n = @as(usize, wd) * len;
-                            @memcpy(dst[0..n], save_buf[off .. off + n]);
-                            off += n;
-                        }
-                    }
-                }
-            }
-            if (save_buf_heap) |sb| self.tctx.?.backing.free(sb);
-
-            // 写入结果
-            if (result_w > 0) {
-                const dst = self.runtime.rawPtr(node.output);
-                @memcpy(dst[0..result_w], result_buf[0..result_w]);
-            }
+            self.restoreRecursiveChannels(&backup);
+            try self.writeCallResult(node.output, saved);
         } else {
             // 非递归调用：通道不重叠，直接复制参数并调用，无 save/restore
-            const total_params = callee_func.param_channels.len;
-            const explicit_count = @min(arg_count, total_params);
-            for (0..explicit_count) |i| {
-                const dst_chan = callee_func.param_channels[i];
-                const w = self.runtime.elemWidth(args[i]);
-                if (w > 0) {
-                    if (args[i] == dst_chan) continue;
-                    const src = self.runtime.rawPtr(args[i]);
-                    const dst = self.runtime.rawPtr(dst_chan);
-                    @memcpy(dst[0..w], src[0..w]);
-                }
-            }
-            const upvalue_count = @min(closure.upvalues.len, if (total_params > explicit_count) total_params - explicit_count else 0);
-            for (0..upvalue_count) |i| {
-                const dst_chan = callee_func.param_channels[explicit_count + i];
-                self.writeScalarValue(dst_chan, closure.upvalues[i]);
-            }
+            try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
+            self.copyClosureUpvalues(callee_func, closure, args.len);
 
             // 压栈
             self.call_stack[self.call_depth] = .{
@@ -8331,23 +8965,60 @@ pub const Engine = struct {
             const saved_func_idx = self.current_func_idx;
             const result_chan = try self.execFunction(func_idx, args);
             self.current_func_idx = saved_func_idx;
-
-            const result_w = self.runtime.elemWidth(result_chan);
-            const out_w = self.runtime.elemWidth(node.output);
-            const copy_w = @min(result_w, out_w);
-            var result_buf: [16]u8 = undefined;
-            if (copy_w > 0) {
-                const src = self.runtime.rawPtr(result_chan);
-                @memcpy(result_buf[0..copy_w], src[0..copy_w]);
-            }
             self.call_depth -= 1;
 
-            // 写入结果
-            if (copy_w > 0) {
-                const dst = self.runtime.rawPtr(node.output);
-                @memcpy(dst[0..copy_w], result_buf[0..copy_w]);
-            }
+            // 写入结果（统一值语义深拷贝）
+            try self.cloneValueBetweenChannels(node.output, result_chan, call_meta.ret_is_ref);
         }
+    }
+
+    /// 执行 PartialApplication 的调用：将已绑定参数与新实参合并后调用原函数
+    /// 当前实现覆盖非递归路径；递归 partial 调用暂走完整 save/restore（后续可扩展）
+    fn execPartialApplicationCall(
+        self: *Engine,
+        node: *const Node,
+        call_meta: ir_mod.CallMeta,
+        callee_func: Function,
+        func_idx: u16,
+        pa: *value.PartialApplication,
+    ) EngineError!void {
+        if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
+
+        const arg_count = @as(usize, call_meta.arg_count) - 1;
+        const args = node.inputs[1 .. 1 + arg_count];
+        const bound = pa.bound_args;
+        const total_params = callee_func.param_channels.len;
+
+        // 复制已绑定参数到被调用函数参数通道
+        const bound_count = @min(bound.len, total_params);
+        for (0..bound_count) |i| {
+            const dst_chan = callee_func.param_channels[i];
+            self.writeScalarValue(dst_chan, bound[i]);
+        }
+
+        // 复制新的显式实参到后续参数通道
+        const explicit_count = @min(arg_count, if (total_params > bound_count) total_params - bound_count else 0);
+        for (0..explicit_count) |i| {
+            const dst_chan = callee_func.param_channels[bound_count + i];
+            const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
+            try self.copyArgToParam(args[i], dst_chan, is_ref);
+        }
+
+        // 压栈并调用原函数
+        self.call_stack[self.call_depth] = .{
+            .func_idx = func_idx,
+            .return_chan = node.output,
+            .return_pc = 0,
+        };
+        self.call_depth += 1;
+
+        const saved_func_idx = self.current_func_idx;
+        const result_chan = try self.execFunction(func_idx, callee_func.param_channels);
+        self.current_func_idx = saved_func_idx;
+        self.call_depth -= 1;
+
+        // 写入结果（统一值语义深拷贝）
+        try self.cloneValueBetweenChannels(node.output, result_chan, call_meta.ret_is_ref);
     }
 
     /// 将标量 Value 转为字节缓冲区（用于 nullable 写入）
@@ -8374,7 +9045,10 @@ pub const Engine = struct {
 const OrbitThreadData = struct {
     ir: *GlueIR,
     func_idx: u16,
+    /// 标量参数（按 i64 传递）
     args: [4]i64,
+    /// ref_chan 参数的原始对象指针（由 worker 深拷贝到其本地 tctx）
+    arg_objs: [4]?*value.obj_header.ObjHeader,
     arg_count: u8,
     handle: *value.AsyncHandle,
     global: *GlobalPool,
@@ -8393,10 +9067,10 @@ fn orbitWorker(data: *OrbitThreadData) void {
     var tctx = ThreadContext.init(data.global, alloc);
     defer tctx.deinit();
 
-    // 使用 Engine.init（外部 tctx），tctx 在错误路径也可用于 setPanic
+    // 使用 Engine.init（外部 tctx），错误路径通过 setPanic 记录原因
     var engine = Engine.init(data.ir, &tctx) catch {
         alloc.destroy(data);
-        handle.setPanic(&tctx, "Failed to init engine");
+        handle.setPanic("Failed to init engine");
         return;
     };
 
@@ -8404,15 +9078,26 @@ fn orbitWorker(data: *OrbitThreadData) void {
     engine.runtime.layout(&data.ir.channels) catch {
         engine.deinit();
         alloc.destroy(data);
-        handle.setPanic(&tctx, "Failed to layout channels");
+        handle.setPanic("Failed to layout channels");
         return;
     };
 
     // 将参数写入函数的参数通道
     const func = data.ir.functions[data.func_idx];
     for (0..data.arg_count) |i| {
-        if (i < func.param_channels.len) {
-            engine.runtime.writeI64(func.param_channels[i], data.args[i]);
+        if (i >= func.param_channels.len) break;
+        const dst_chan = func.param_channels[i];
+        const dst_meta = data.ir.channels.get(dst_chan);
+        if (dst_meta.chan_type == .ref_chan) {
+            if (data.arg_objs[i]) |obj| {
+                // 跨线程值语义：普通复合类型深拷贝到 worker tctx，channel/atomic 等 retain 共享
+                const v = value.Value{ .ref = obj };
+                const copied = v.deepCopy(&tctx) catch value.Value.fromNull();
+                engine.trackValueTree(copied) catch {};
+                engine.writeScalarValue(dst_chan, copied);
+            }
+        } else {
+            engine.runtime.writeI64(dst_chan, data.args[i]);
         }
     }
 
@@ -8420,18 +9105,27 @@ fn orbitWorker(data: *OrbitThreadData) void {
     const result_chan = engine.execFunction(data.func_idx, func.param_channels) catch {
         engine.deinit();
         alloc.destroy(data);
-        handle.setPanic(&tctx, "Function execution failed");
+        handle.setPanic("Function execution failed");
         return;
     };
 
     // 读取结果（在 deinit 之前，因为结果通道在 engine 内）
-    const result_val = engine.readScalarValue(result_chan);
+    const result_val = engine.readScalarValue(result_chan) catch value.Value.fromNull();
 
-    // 先清理所有资源（engine + data），再设置结果（setResult 会解除主线程 join() 阻塞）
+    // 值语义：普通复合类型结果跨线程深拷贝，使其在 worker deinit 后仍然有效
+    const result_meta = data.ir.channels.get(result_chan);
+    const out_result = if (result_meta.chan_type == .ref_chan and !result_meta.is_ref)
+        result_val.deepCopy(&tctx) catch value.Value.fromNull()
+    else
+        result_val;
+
+    // 先清理所有资源（engine + tctx + data），再设置结果（setResult 会解除主线程 join() 阻塞）
     // 这样主线程在 join() 返回时，worker 的所有分配已释放，避免泄漏检测竞态
+    // 注意：tctx.deinit 必须在 setResult 之前，否则 ChannelRegion 数据未释放时主线程即检测到泄漏
     engine.deinit();
+    tctx.deinit(); // defer tctx.deinit() 将成为 no-op（ChannelRegion.data 已置 null）
     alloc.destroy(data);
-    handle.setResult(result_val);
+    handle.setResult(out_result);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -8441,8 +9135,10 @@ fn orbitWorker(data: *OrbitThreadData) void {
 const testing = std.testing;
 const ast = @import("ast");
 const builder_mod = ir_mod.builder_mod;
+const sema = @import("sema");
 
 /// 测试辅助：从源码构建 IR
+/// 与生产管线（main.zig）一致：先运行 sema 类型推断并注入 sema_result，再构建 IR。
 fn buildIRFromSource(source: []const u8) !GlueIR {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -8457,8 +9153,20 @@ fn buildIRFromSource(source: []const u8) !GlueIR {
     defer p.deinit();
     const module = try p.parseModule("test.glue");
 
+    // sema 阶段：类型推断产出 SemaResult，驱动 IR 图构建（通道宽度由 sema 类型决定）
+    // 注意：inferencer 的 arena 持有 Type 结构体及其 name 字符串，SemaResult.expr_types
+    // 中的 type_name 切片指向这些字符串。因此 inferencer 必须在 builder.build() 期间保持存活，
+    // 否则 type_name 成为悬垂指针。defer 确保在函数返回（build 完成后）才释放。
+    var sema_result = ir_mod.SemaResult.init(testing.allocator);
+    defer sema_result.deinit();
+    var inferencer = sema.TypeInferencer.init(testing.allocator);
+    defer inferencer.deinit();
+    inferencer.setSemaResult(&sema_result);
+    inferencer.checkModule(&module);
+
     var builder = try builder_mod.IRBuilder.init(testing.allocator);
     defer builder.deinit();
+    builder.setSemaResult(&sema_result);
     return try builder.build(module);
 }
 
@@ -9650,4 +10358,111 @@ test "P1-a: 闭包捕获多个自由变量" {
     var engine = try Engine.initOwned(&ir, testing.allocator);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 81), try engine.run());
+}
+
+test "lazy: 创建时不求值，强制时缓存" {
+    // 与 edge_lazy 保持一致：创建时不求值，首次 println 强制计算，二次 println 复用缓存
+    var ir = try buildIRFromSource(
+        \\var compute_count = 0
+        \\
+        \\fun expensive(x: i32): i32 {
+        \\    compute_count = compute_count + 1
+        \\    x * x
+        \\}
+        \\
+        \\fun main(): i64 {
+        \\    val lz = lazy expensive(5)
+        \\    if compute_count != 0 { -100 } else {
+        \\        println(lz)
+        \\        println(lz)
+        \\        compute_count
+        \\    }
+        \\}
+    );
+    defer ir.deinit();
+    var engine = try Engine.initOwned(&ir, testing.allocator);
+    defer engine.deinit();
+    try testing.expectEqual(@as(i64, 1), try engine.run());
+}
+
+test "lazy: thunk 捕获外部变量" {
+    var ir = try buildIRFromSource(
+        \\fun makeLazy(x: i32): Lazy<i32> {
+        \\    lazy x * x
+        \\}
+        \\
+        \\fun main(): i64 {
+        \\    val lz = makeLazy(7)
+        \\    println(lz)
+        \\    49
+        \\}
+    );
+    defer ir.deinit();
+    var engine = try Engine.initOwned(&ir, testing.allocator);
+    defer engine.deinit();
+    try testing.expectEqual(@as(i64, 49), try engine.run());
+}
+
+test "vec_zip: 合并两个 range 向量" {
+    // 手工构造 IR：
+    //   left  = range(0, 3)  -> [0, 1, 2]
+    //   right = range(10, 13) -> [10, 11, 12]
+    //   zipped = vec_zip(left, right) -> [(0,10), (1,11), (2,12)]
+    //   return sink_count(zipped) = 3
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var channels = ir_mod.ChannelSpace.init(alloc);
+    const c_const0 = try channels.alloc(.i64_chan);
+    const c_const3 = try channels.alloc(.i64_chan);
+    const c_left = try channels.alloc(.i64_chan);
+    const c_right = try channels.alloc(.i64_chan);
+    const c_zipped = try channels.alloc(.ref_chan);
+    const c_count = try channels.alloc(.i64_chan);
+
+    const scalar_metas = try alloc.alloc(ScalarMeta, 3);
+    scalar_metas[0] = .{ .kind = .unit }; // meta_index=0 占位
+    scalar_metas[1] = .{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 0 } };
+    scalar_metas[2] = .{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 3 } };
+
+    const vector_metas = try alloc.alloc(ir_mod.VectorMeta, 3);
+    vector_metas[0] = .{ .vec_op = .range_source, .elem_type = .i64_chan, .length = 3 };
+    vector_metas[1] = .{ .vec_op = .range_source, .elem_type = .i64_chan, .length = 3 };
+    vector_metas[2] = .{ .vec_op = .sink_count, .elem_type = .i64_chan };
+
+    const nodes = try alloc.alloc(Node, 7);
+    nodes[0] = Node.makeSink(.const_i, c_const0, 1);
+    nodes[1] = Node.makeSink(.const_i, c_const3, 2);
+    nodes[2] = Node.makeBinary(.vec_source, c_left, 1, c_const0, c_const3);
+    nodes[3] = Node.makeBinary(.vec_source, c_right, 2, c_const0, c_const3);
+    nodes[4] = Node.makeBinary(.vec_zip, c_zipped, 0, c_left, c_right);
+    nodes[5] = Node.makeUnary(.vec_sink, c_count, 3, c_zipped);
+    nodes[6] = Node.makeUnary(.halt_return, c_count, 0, c_count);
+
+    const funcs = try alloc.alloc(Function, 1);
+    funcs[0] = .{
+        .name = "main",
+        .node_start = 0,
+        .node_count = 7,
+        .param_channels = &.{},
+        .return_channel = c_count,
+        .is_entry = true,
+        .local_chan_start = 0,
+        .local_chan_count = 5,
+    };
+
+    var ir = GlueIR{
+        .nodes = nodes,
+        .channels = channels,
+        .scalar_metas = scalar_metas,
+        .vector_metas = vector_metas,
+        .functions = funcs,
+        .entry_index = 0,
+        .backing = alloc,
+    };
+
+    var engine = try Engine.initOwned(&ir, testing.allocator);
+    defer engine.deinit();
+    try testing.expectEqual(@as(i64, 3), try engine.run());
 }

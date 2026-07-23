@@ -42,6 +42,12 @@ pub const Closure = struct {
     upvalues: []Value = &.{},
     bound_args: []Value = &.{},
     self_upvalue_idx: i32 = -1,
+    /// 每个 upvalue 是否为 &T / *T 引用类型（保持共享，不做深拷贝）
+    /// 第 i 位为 1 表示第 i 个 upvalue 是引用类型
+    upvalue_ref_bits: u8 = 0,
+    /// 每个 upvalue 是否为 cell 通道（var 变量，引用语义）
+    /// cell upvalue 在 call_indirect 时直接共享通道指针
+    cell_upvalues: u8 = 0,
 
     /// 释放上值和绑定参数的引用计数，跳过 self 上值以避免自引用释放
     /// upvalues 和 bound_args 是连续内存的一部分，由 closureDeinit 中的 freeObj 统一释放
@@ -55,23 +61,30 @@ pub const Closure = struct {
             for (self.bound_args) |ba| ba.release(tctx);
         }
     }
+
+    /// 判断指定 upvalue 是否为引用类型（&T / *T / cell）
+    pub inline fn upvalueIsRef(self: *const Closure, idx: u3) bool {
+        return ((self.upvalue_ref_bits | self.cell_upvalues) >> idx) & 1 == 1;
+    }
 };
 
 /// 部分应用值，记录已绑定的参数和剩余所需参数个数
 ///
 /// 连续内存布局：[PartialApplication header | bound_args[]]
 /// bound_args 切片指向尾部连续区域，单次分配单次释放
+/// func 字段存储被包装函数索引（由引擎解释为 functions 表下标）
 pub const PartialApplication = struct {
     header: ObjHeader = .{ .type_tag = .partial },
-    func: Value,
+    func: *const anyopaque,
     bound_args: []Value,
     remaining_arity: u8,
+    /// 已绑定参数中哪些为 &T / *T 引用类型（保持共享，不做深拷贝）
+    bound_arg_ref_bits: u16 = 0,
 
-    /// 释放被包装函数和已绑定参数的引用计数
+    /// 释放已绑定参数的引用计数
     /// bound_args 是连续内存的一部分，由 partialDeinit 中的 freeObj 统一释放
     pub fn deinit(self: *PartialApplication, tctx: *ThreadContext) void {
         if (!obj_header.shutdown_mode) {
-            self.func.release(tctx);
             for (self.bound_args) |ba| ba.release(tctx);
         }
     }

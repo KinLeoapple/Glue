@@ -294,23 +294,28 @@ pub const Runtime = struct {
                 }
             },
             .float_val => |bits| {
+                // float_val 存储的是 f64 位模式（u128 低 64 位）。
+                // 必须先还原为 f64 值，再通过 @floatCast 做值转换到目标宽度。
+                // 旧实现用 @truncate 截取位模式再 @bitCast 是位截断，会导致
+                // f64→f32 时取到 f64 位模式的低 32 位（垃圾值）。
                 const w = self.chan_widths[chan];
+                const f64_val: f64 = @bitCast(@as(u64, @truncate(bits)));
                 switch (w) {
                     2 => {
                         const ptr: *f16 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
-                        ptr.* = @bitCast(@as(u16, @truncate(bits)));
+                        ptr.* = @floatCast(f64_val);
                     },
                     4 => {
                         const ptr: *f32 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
-                        ptr.* = @bitCast(@as(u32, @truncate(bits)));
+                        ptr.* = @floatCast(f64_val);
                     },
                     8 => {
                         const ptr: *f64 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
-                        ptr.* = @bitCast(@as(u64, @truncate(bits)));
+                        ptr.* = f64_val;
                     },
                     16 => {
                         const ptr: *f128 = @ptrCast(@alignCast(self.chan_ptrs[chan].?));
-                        ptr.* = @bitCast(bits);
+                        ptr.* = @floatCast(f64_val);
                     },
                     else => {},
                 }

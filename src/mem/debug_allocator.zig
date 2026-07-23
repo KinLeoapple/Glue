@@ -49,17 +49,13 @@ pub const DebugAllocator = struct {
             self.alloc_map.deinit();
             return .ok;
         }
-        // verbose 模式下打印第一条泄漏记录作为示例，并汇总泄漏总数。
         if (self.verbose) {
+            std.debug.print("[GLUE_GPA] LEAK: {} allocations\n", .{leaked_count});
             var it = self.alloc_map.iterator();
             if (it.next()) |entry| {
                 const rec = entry.value_ptr.*;
-                std.debug.print(
-                    "[GLUE_DBG] LEAK: addr=0x{x} len={} align={} ret_addr=0x{x}\n",
-                    .{ entry.key_ptr.*, rec.len, rec.alignment, rec.ret_addr },
-                );
+                std.debug.print("[GLUE_GPA]   first: addr=0x{x} len={} ret_addr=0x{x}\n", .{ entry.key_ptr.*, rec.len, rec.ret_addr });
             }
-            std.debug.print("[GLUE_DBG] total leaked allocations: {}\n", .{leaked_count});
         }
         self.alloc_map.deinit();
         return .leak;
@@ -100,11 +96,13 @@ pub const DebugAllocator = struct {
             self.backing.rawFree(ptr[0..len], .fromByteUnits(a), ra);
             return null;
         }
-        self.alloc_map.put(@intFromPtr(ptr), .{
+        // 记录分配信息
+        const rec: AllocRecord = .{
             .len = len,
             .alignment = a,
             .ret_addr = ra,
-        }) catch {
+        };
+        self.alloc_map.put(@intFromPtr(ptr), rec) catch {
             self.unlockIf();
             self.backing.rawFree(ptr[0..len], .fromByteUnits(a), ra);
             return null;
@@ -176,7 +174,7 @@ pub const DebugAllocator = struct {
             // 未找到记录，疑似双重释放或非法释放。
             if (self.verbose) {
                 std.debug.print(
-                    "[GLUE_DBG] DOUBLE-FREE or invalid free: addr=0x{x} len={} ret_addr=0x{x}\n",
+                    "[GLUE_GPA] DOUBLE-FREE or invalid free: addr=0x{x} len={} ret_addr=0x{x}\n",
                     .{ key, buf.len, ra },
                 );
             }
@@ -187,7 +185,7 @@ pub const DebugAllocator = struct {
             // 释放长度与分配长度不一致，按原始长度归还底层。
             if (self.verbose) {
                 std.debug.print(
-                    "[GLUE_DBG] free len mismatch: addr=0x{x} alloc_len={} free_len={} ret_addr=0x{x}\n",
+                    "[GLUE_GPA] free len mismatch: addr=0x{x} alloc_len={} free_len={} ret_addr=0x{x}\n",
                     .{ key, actual.len, buf.len, ra },
                 );
             }

@@ -61,16 +61,42 @@ fun zipOr(u: User): i32 {
     u.addr?.zip ?? 0
 }
 
-// mixing ?. and ?? and !
 fun combo(a: Account?): i32 {
     a?.balance ?? -1
 }
+
+fun ownerOf(a: Account?): User? {
+    a?.owner
+}
+
+fun addrOf(a: Account?): Addr? {
+    a?.owner?.addr
+}
+
+fun cityOfAddr(a: Addr?): str? {
+    a?.city
+}
+
+// async 边界：结果赋给 nullable 变量
+async fun asyncVal(x: i32): i32 { x + 1 }
+
+// closure 边界：lambda 内部使用 nullable
+fun makeNullableLocal(): () -> i32 {
+    fun() { val x: i32? = 10; x ?? -1 }
+}
+
+// partial application 与 nullable：绑定非 nullable 参数，返回 nullable 非空值
+fun makeSumOrNull(x: i32, y: i32): i32? { if x == y { null } else { x + y } }
 
 fun main() {
     val acc1 = Account(User("Alice", Addr("Beijing", 100000)), 500)
     val acc2 = Account(User("Bob", null), 300)
     val acc3 = Account(null, 0)
     val accNull: Account? = null
+
+    // debug
+    val o = ownerOf(acc1) ?? User("x", null)
+    println("name=" + o.name)
 
     // deep chaining
     println(cityOf(acc1) ?? "no-city")    // Beijing
@@ -135,6 +161,20 @@ fun main() {
     println(nn1 ?? 0)   // 5
     println(nn2 ?? 0)   // 0
     println(nn1!)       // 5
+
+    // async 边界：结果赋给 nullable 变量
+    val asyncResult: i32? = asyncVal(5).await()
+    println(asyncResult ?? -1)   // 6
+    val asyncNull: i32? = null
+    println(asyncNull ?? -1)      // -1
+
+    // closure 边界：lambda 内部使用 nullable
+    val localNull = makeNullableLocal()
+    println(localNull())      // 10
+
+    // partial application 与 nullable（绑定非 nullable，返回 nullable 非空值）
+    val sum7 = makeSumOrNull(5)
+    println(sum7(2) ?? -1)    // 7
 
     println("edge_nullable: All tests passed!")
 }

@@ -1,11 +1,19 @@
-//! Glue IO syscall 原语
+//! Glue IO syscall 原语（跨平台实现）
 //!
-//! 包装宿主文件/目录/路径/字节字符串操作，对外暴露为 __ 前缀 syscall 函数。
+//! 使用 std.Io.File / std.Io.Dir（跨平台文件/目录 API）替代 POSIX 专属的 std.c 调用。
 //! 业务错误通过 ThrowValue.err 传递（IOError 内部封装 kind/msg/os_err/path 字段）。
+//!
+//! 跨平台 fd 模型：Glue 层用 i64 存储 fd；Zig 层 File.handle 在 POSIX 上是 i32、
+//! Windows 上是 *anyopaque（HANDLE），通过 fdToHandle/fileToFd 用 @typeInfo 统一转换。
+//!
+//! seek/tell：std.Io 的 vtable 只有 fileSeekBy/fileSeekTo，无 tell（获取当前位置）。
+//! 故 seek/tell 用条件编译：POSIX 走 std.c.lseek（libc，覆盖 Linux/macOS/BSD），
+//! Windows 走 SetFilePointerEx（kernel32）。
 //!
 //! 设计参考：docs/superpowers/specs/2026-07-19-stdlib-design.md 第 4 节
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("value");
 const Value = value.Value;
 const ThreadContext = value.obj_header.ThreadContext;
@@ -14,61 +22,16 @@ const AdtField = value.AdtField;
 const syscall_mod = @import("mod.zig");
 const SyscallError = syscall_mod.SyscallError;
 
+const Io = std.Io;
+const File = Io.File;
+const Dir = Io.Dir;
+
 // ──────────────────────────────────────────────
 // 辅助：从 Value 提取参数
 // ──────────────────────────────────────────────
 
-/// 从 Value 提取 i32
-inline fn asI32(v: Value) i32 {
-    return switch (v) {
-        .i32 => v.asI32(),
-        .i64 => @intCast(v.asI64()),
-        .i128 => @intCast(v.asI128()),
-        .usize => @intCast(v.asUsize()),
-        .u8 => @intCast(v.asU8()),
-        .u16 => @intCast(v.asU16()),
-        .u32 => @intCast(v.asU32()),
-        .u64 => @intCast(v.asU64()),
-        else => 0,
-    };
-}
-
-/// 从 Value 提取 i64
-inline fn asI64(v: Value) i64 {
-    return switch (v) {
-        .i32 => v.asI32(),
-        .i64 => v.asI64(),
-        .i128 => @intCast(v.asI128()),
-        .usize => @intCast(v.asUsize()),
-        else => 0,
-    };
-}
-
-/// 从 Value 提取 i128
-inline fn asI128(v: Value) i128 {
-    return switch (v) {
-        .i32 => v.asI32(),
-        .i64 => v.asI64(),
-        .i128 => v.asI128(),
-        .usize => @intCast(v.asUsize()),
-        else => 0,
-    };
-}
-
-/// 从 Value 提取 usize
-inline fn asUsize(v: Value) usize {
-    return switch (v) {
-        .i32 => @intCast(v.asI32()),
-        .i64 => @intCast(v.asI64()),
-        .i128 => @intCast(v.asI128()),
-        .usize => v.asUsize(),
-        .u8 => v.asU8(),
-        .u16 => v.asU16(),
-        .u32 => v.asU32(),
-        .u64 => @intCast(v.asU64()),
-        else => 0,
-    };
-}
+// 整数跨宽度转换统一使用 Value.intCast(T)。
+// 浮点跨宽度转换统一使用 Value.floatCast(T)。
 
 /// 从 Value 提取 bool
 inline fn asBool(v: Value) bool {
@@ -106,12 +69,44 @@ fn asArray(v: Value) ?*value.ArrayValue {
 }
 
 /// 将 []const u8 路径转换为 sentinel-terminated 字符串（写入栈缓冲区）
+/// 仅用于 POSIX chmod（需要 [*:0]const u8）。std.Io API 接收 []const u8 无需 sentinel。
 /// 返回 null 表示路径过长
 fn pathToZ(path: []const u8, buf: *[4096]u8) ?[:0]const u8 {
     if (path.len >= buf.len) return null;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
     return buf[0..path.len :0];
+}
+
+// ──────────────────────────────────────────────
+// 辅助：跨平台 fd ↔ File 转换
+// ──────────────────────────────────────────────
+
+/// i64 fd → File.Handle（POSIX: i32，Windows: *anyopaque）
+/// Glue 层用 i64 统一存储 fd，此处按 Handle 实际类型转换。
+inline fn fdToHandle(fd: i64) File.Handle {
+    const H = File.Handle;
+    switch (@typeInfo(H)) {
+        .int => return @intCast(fd),
+        .pointer => return @ptrFromInt(@as(usize, @intCast(fd))),
+        else => @compileError("unsupported File.Handle type"),
+    }
+}
+
+/// File → i64 fd
+inline fn fileToFd(file: File) i64 {
+    const H = File.Handle;
+    switch (@typeInfo(H)) {
+        .int => return @intCast(file.handle),
+        .pointer => return @intCast(@intFromPtr(file.handle)),
+        else => @compileError("unsupported File.Handle type"),
+    }
+}
+
+/// i64 fd → File
+/// flags.nonblocking=false：fd 由 Glue 层管理，不假定非阻塞语义
+inline fn fdToFile(fd: i64) File {
+    return .{ .handle = fdToHandle(fd), .flags = .{ .nonblocking = false } };
 }
 
 // ──────────────────────────────────────────────
@@ -132,17 +127,18 @@ const IOErrorKind = enum(u8) {
     other,
 };
 
-/// errno → IOErrorKind 映射（POSIX 错误码归一化）
-fn errnoToKind(errno: i32) IOErrorKind {
-    return switch (errno) {
-        2 => .not_found, // ENOENT
-        13, 1 => .permission_denied, // EACCES, EPERM
-        17 => .already_exists, // EEXIST
-        16, 11 => .busy, // EBUSY, EAGAIN
-        22 => .invalid_input, // EINVAL
-        32 => .broken_pipe, // EPIPE
-        4 => .interrupted, // EINTR
-        12 => .out_of_memory, // ENOMEM
+/// std.Io 错误（anyerror）→ IOErrorKind 归一化映射
+fn errToKind(err: anyerror) IOErrorKind {
+    return switch (err) {
+        error.FileNotFound, error.NotDir, error.BadPathName, error.SymLinkLoop => .not_found,
+        error.AccessDenied, error.PermissionDenied => .permission_denied,
+        error.PathAlreadyExists => .already_exists,
+        error.FileBusy, error.WouldBlock => .busy,
+        error.InvalidArgument, error.IsDir => .invalid_input,
+        error.UnexpectedEof, error.EndOfStream, error.Truncated => .unexpected_eof,
+        error.BrokenPipe => .broken_pipe,
+        error.SystemResources, error.OutOfMemory, error.NoSpaceLeft => .out_of_memory,
+        error.Interrupted => .interrupted,
         else => .other,
     };
 }
@@ -195,114 +191,152 @@ fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
     return Value.makeThrow(tctx, .{ .err = err_val_ptr }) catch return error.OutOfMemory;
 }
 
-/// 根据 st_mode 构造 FileKind ADT 值（无字段变体 File/Directory/Symlink/Other）
+/// 根据 File.Kind 构造 FileKind ADT 值（无字段变体 File/Directory/Symlink/Other）
 ///
 /// FileKind 在 std/io/File.glue 中定义为 ADT：
 ///   type FileKind = | File | Directory | Symlink | Other
-/// syscall 层按 POSIX S_IFMT 位域选择构造器。
+/// syscall 层按 std.Io.File.Kind 枚举选择构造器（跨平台）。
 /// 返回的 Value 已 RC=1（makeAdt 初始 RC），调用方如需放入 record 字段须额外 retain。
-fn makeFileKind(tctx: *ThreadContext, mode: u32) SyscallError!Value {
-    const S_IFMT: u32 = 0o170000;
-    const S_IFREG: u32 = 0o100000;
-    const S_IFDIR: u32 = 0o040000;
-    const S_IFLNK: u32 = 0o120000;
-    const ctor: []const u8 = switch (mode & S_IFMT) {
-        S_IFREG => "File",
-        S_IFDIR => "Directory",
-        S_IFLNK => "Symlink",
+fn makeFileKind(tctx: *ThreadContext, kind: File.Kind) SyscallError!Value {
+    const ctor: []const u8 = switch (kind) {
+        .file => "File",
+        .directory => "Directory",
+        .sym_link => "Symlink",
         else => "Other",
     };
     return Value.makeAdt(tctx, "FileKind", ctor, &.{}) catch return error.OutOfMemory;
 }
 
 // ──────────────────────────────────────────────
+// seek/tell：条件编译（std.Io 无 tell API）
+// ──────────────────────────────────────────────
+
+const SeekFail = error{ SeekFailed };
+
+/// 跨平台 seek：设置 fd 位置并返回新位置
+/// whence: 0=SET, 1=CUR, 2=END（与 SEEK_SET/CUR/END、Windows FILE_BEGIN/CURRENT/END 一致）
+fn seekFile(file: File, offset: i64, whence: i32) SeekFail!i64 {
+    return switch (builtin.os.tag) {
+        .windows => seekFileWindows(file, offset, whence),
+        else => seekFilePosix(file, offset, whence),
+    };
+}
+
+/// POSIX seek（std.c.lseek，libc 覆盖 Linux/macOS/BSD）
+fn seekFilePosix(file: File, offset: i64, whence: i32) SeekFail!i64 {
+    const fd: std.c.fd_t = @intCast(file.handle);
+    const result = std.c.lseek(fd, @intCast(offset), @intCast(whence));
+    if (result < 0) return error.SeekFailed;
+    return @intCast(result);
+}
+
+/// Windows seek（SetFilePointerEx，kernel32）
+fn seekFileWindows(file: File, offset: i64, whence: i32) SeekFail!i64 {
+    const w = std.os.windows;
+    var new_pos: i64 = 0;
+    const rc = w.kernel32.SetFilePointerEx(file.handle, offset, &new_pos, @intCast(whence));
+    if (rc == 0) return error.SeekFailed;
+    return new_pos;
+}
+
+// ──────────────────────────────────────────────
 // 文件 syscall
 // ──────────────────────────────────────────────
 
-/// __file_open(path: str, flags: i32, mode: i32) -> Throw<i32, IOError>
-pub fn file_open(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+/// __file_open(path: str, flags: i32, mode: i32) -> Throw<i64, IOError>
+///
+/// flags 为 POSIX 风格（O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_TRUNC/O_APPEND）。
+/// O_CREAT → Dir.createFile；否则 → Dir.openFile。
+/// O_APPEND 当前由 Glue 层 seek End 语义处理（std.Io 无 append 选项）。
+/// 返回 i64 fd（跨平台：POSIX i32 扩展，Windows HANDLE 转整数）。
+pub fn file_open(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 3) return error.InvalidArgument;
     const path = asStrBytes(args[0]);
-    const flags = asI32(args[1]);
-    const mode = asI32(args[2]);
-    var path_buf: [4096]u8 = undefined;
-    const path_z = pathToZ(path, &path_buf) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "file_open: path too long", 36, path);
-        return makeThrowErr(tctx, io_err);
-    };
-    const oflag: std.c.O = @bitCast(@as(u32, @intCast(flags)));
-    const fd = std.posix.openatZ(@as(std.c.fd_t, std.c.AT.FDCWD), path_z, oflag, @intCast(mode)) catch |err| {
-        const errno: i32 = switch (err) {
-            error.AccessDenied => 13,
-            error.FileNotFound => 2,
-            error.PathAlreadyExists => 17,
-            error.FileBusy => 16,
-            error.SymLinkLoop => 40,
-            error.SystemResources => 12,
-            error.ProcessFdQuotaExceeded => 4,
-            error.NameTooLong => 36,
-            else => 0,
+    const flags = args[1].intCast(i32);
+    _ = args[2]; // mode（permissions）：std.Io 用 .default_file，忽略 POSIX mode
+
+    const O_ACCMODE: i32 = 3;
+    const O_CREAT: i32 = 64;
+    const O_TRUNC: i32 = 512;
+    const accmode = flags & O_ACCMODE;
+    const read = accmode != 1; // 非 O_WRONLY
+    const write = accmode != 0; // 非 O_RDONLY
+    const create = (flags & O_CREAT) != 0;
+    const truncate = (flags & O_TRUNC) != 0;
+
+    const file = if (create) blk: {
+        const f = Dir.cwd().createFile(io, path, .{
+            .read = read,
+            .truncate = truncate,
+            .permissions = .default_file,
+        }) catch |err| {
+            const io_err = try makeIOError(tctx, errToKind(err), "file_open failed", 0, path);
+            return makeThrowErr(tctx, io_err);
         };
-        const io_err = try makeIOError(tctx, errnoToKind(errno), "file_open failed", errno, path);
-        return makeThrowErr(tctx, io_err);
+        break :blk f;
+    } else blk: {
+        const mode: Dir.OpenFileOptions.Mode = if (read and write) .read_write else if (write) .write_only else .read_only;
+        const f = Dir.cwd().openFile(io, path, .{ .mode = mode }) catch |err| {
+            const io_err = try makeIOError(tctx, errToKind(err), "file_open failed", 0, path);
+            return makeThrowErr(tctx, io_err);
+        };
+        break :blk f;
     };
-    return makeThrowOk(tctx, Value.fromI32(fd));
+    return makeThrowOk(tctx, Value.fromI64(fileToFd(file)));
 }
 
-/// __file_close(fd: i32) -> Throw<Unit, IOError>
-pub fn file_close(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+/// __file_close(fd: i64) -> Throw<Unit, IOError>
+pub fn file_close(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 1) return error.InvalidArgument;
-    const fd = asI32(args[0]);
-    _ = std.c.close(@intCast(fd));
+    const fd = args[0].intCast(i64);
+    fdToFile(fd).close(io);
     return makeThrowOk(tctx, Value.fromUnit());
 }
 
-/// __file_read(fd: i32, buf: u8[], len: usize) -> Throw<usize, IOError>
-pub fn file_read(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+/// __file_read(fd: i64, buf: u8[], len: usize) -> Throw<usize, IOError>
+///
+/// 优化：栈缓冲区 32KB，单次 read 即可填满 8192 默认 buf，减少 syscall 次数。
+/// 语义保持单次 read（不循环阻塞，兼容管道/交互式 IO）。
+pub fn file_read(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 3) return error.InvalidArgument;
-    const fd = asI32(args[0]);
+    const fd = args[0].intCast(i64);
     const arr = asArray(args[1]) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "file_read: buf not array", 22, null);
         return makeThrowErr(tctx, io_err);
     };
-    const len = asUsize(args[2]);
+    const len = args[2].intCast(usize);
     const actual_len = @min(len, arr.elements.len);
     // 将 Value 元素视作 u8：约定 u8[] 的每个 Value 都是 .u8 标量
-    // 优化：若 array 的底层布局是连续 u8 字节，直接读入；这里为通用性逐字节写回
-    var tmp_buf: [4096]u8 = undefined;
-    const read_len = if (actual_len <= tmp_buf.len) actual_len else tmp_buf.len;
-    const n = std.posix.read(@intCast(fd), tmp_buf[0..read_len]) catch |err| {
-        const errno: i32 = switch (err) {
-            error.WouldBlock => 11,
-            error.NotOpenForReading => 9,
-            error.ConnectionResetByPeer => 104,
-            else => 0,
-        };
-        const io_err = try makeIOError(tctx, errnoToKind(errno), "file_read failed", errno, null);
+    var tmp_buf: [32768]u8 = undefined;
+    const read_len = @min(actual_len, tmp_buf.len);
+    const file = fdToFile(fd);
+    const n = file.readStreaming(io, &.{tmp_buf[0..read_len]}) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "file_read failed", 0, null);
         return makeThrowErr(tctx, io_err);
     };
     // 将读到的字节写回 array（覆盖前 n 个元素）
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        if (i >= arr.elements.len) break;
         arr.elements[i] = Value.fromU8(tmp_buf[i]);
     }
     return makeThrowOk(tctx, Value.fromUsize(n));
 }
 
-/// __file_write(fd: i32, buf: u8[], len: usize) -> Throw<usize, IOError>
-pub fn file_write(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+/// __file_write(fd: i64, buf: u8[], len: usize) -> Throw<usize, IOError>
+///
+/// 优化：栈缓冲区 32KB，单次 write 即可写完 8192 默认 buf。
+pub fn file_write(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 3) return error.InvalidArgument;
-    const fd = asI32(args[0]);
+    const fd = args[0].intCast(i64);
     const arr = asArray(args[1]) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "file_write: buf not array", 22, null);
         return makeThrowErr(tctx, io_err);
     };
-    const len = asUsize(args[2]);
+    const len = args[2].intCast(usize);
     const actual_len = @min(len, arr.elements.len);
     // 拼接 u8 字节，逐个 Value 转 u8
-    var tmp_buf: [4096]u8 = undefined;
-    const write_len = if (actual_len <= tmp_buf.len) actual_len else tmp_buf.len;
+    var tmp_buf: [32768]u8 = undefined;
+    const write_len = @min(actual_len, tmp_buf.len);
     var i: usize = 0;
     while (i < write_len) : (i += 1) {
         tmp_buf[i] = switch (arr.elements[i]) {
@@ -310,47 +344,49 @@ pub fn file_write(tctx: *ThreadContext, args: []const Value) SyscallError!Value 
             else => 0,
         };
     }
-    const write_rc = std.c.write(@intCast(fd), tmp_buf[0..write_len].ptr, write_len);
-    if (write_rc < 0) {
-        const errno: i32 = @intCast(std.c._errno().*);
-        const io_err = try makeIOError(tctx, errnoToKind(errno), "file_write failed", errno, null);
+    const file = fdToFile(fd);
+    const n = file.writeStreaming(io, &.{}, &.{tmp_buf[0..write_len]}, 1) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "file_write failed", 0, null);
         return makeThrowErr(tctx, io_err);
-    }
-    return makeThrowOk(tctx, Value.fromUsize(@intCast(write_rc)));
+    };
+    return makeThrowOk(tctx, Value.fromUsize(n));
 }
 
-/// __file_seek(fd: i32, offset: i64, whence: i32) -> Throw<i64, IOError>
-pub fn file_seek(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+/// __file_seek(fd: i64, offset: i64, whence: i32) -> Throw<i64, IOError>
+///
+/// whence: 0=SET, 1=CUR, 2=END
+/// 跨平台条件编译：POSIX lseek / Windows SetFilePointerEx
+pub fn file_seek(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    _ = io; // seek/tell 不依赖 std.Io（直接操作底层 handle）
     if (args.len != 3) return error.InvalidArgument;
-    const fd = asI32(args[0]);
-    const offset = asI64(args[1]);
-    const whence = asI32(args[2]);
-    // whence: 0=SET, 1=CUR, 2=END
+    const fd = args[0].intCast(i64);
+    const offset = args[1].intCast(i64);
+    const whence = args[2].intCast(i32);
     if (whence < 0 or whence > 2) {
         const io_err = try makeIOError(tctx, .invalid_input, "file_seek: bad whence", 22, null);
         return makeThrowErr(tctx, io_err);
     }
-    // 使用 lseek 系统调用（SEEK_SET=0, SEEK_CUR=1, SEEK_END=2）
-    const result = std.c.lseek(fd, offset, @intCast(whence));
-    if (result < 0) {
-        const errno: i32 = -1;
-        const io_err = try makeIOError(tctx, .invalid_input, "file_seek failed", errno, null);
+    const file = fdToFile(fd);
+    const result = seekFile(file, offset, whence) catch {
+        const io_err = try makeIOError(tctx, .other, "file_seek failed", 0, null);
         return makeThrowErr(tctx, io_err);
-    }
-    return makeThrowOk(tctx, Value.fromI64(@intCast(result)));
+    };
+    return makeThrowOk(tctx, Value.fromI64(result));
 }
 
-/// __file_tell(fd: i32) -> Throw<i64, IOError>
-pub fn file_tell(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+/// __file_tell(fd: i64) -> Throw<i64, IOError>
+///
+/// 获取当前 fd 位置（seek(fd, 0, SEEK_CUR)）
+pub fn file_tell(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    _ = io;
     if (args.len != 1) return error.InvalidArgument;
-    const fd = asI32(args[0]);
-    const result = std.c.lseek(fd, 0, 1); // SEEK_CUR
-    if (result < 0) {
-        const errno: i32 = -1;
-        const io_err = try makeIOError(tctx, .invalid_input, "file_tell failed", errno, null);
+    const fd = args[0].intCast(i64);
+    const file = fdToFile(fd);
+    const result = seekFile(file, 0, 1) catch { // SEEK_CUR=1
+        const io_err = try makeIOError(tctx, .other, "file_tell failed", 0, null);
         return makeThrowErr(tctx, io_err);
-    }
-    return makeThrowOk(tctx, Value.fromI64(@intCast(result)));
+    };
+    return makeThrowOk(tctx, Value.fromI64(result));
 }
 
 /// __file_stat(path: str) -> Throw<Stat, IOError>
@@ -360,62 +396,37 @@ pub fn file_tell(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
 ///   mtime_ns : i64      — 修改时间（纳秒，Unix epoch）
 ///   ctime_ns : i64      — 元数据变更时间（纳秒，Unix epoch）
 ///   kind     : FileKind — 文件种类 ADT（File/Directory/Symlink/Other）
-pub fn file_stat(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+pub fn file_stat(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 1) return error.InvalidArgument;
     const path = asStrBytes(args[0]);
-    var path_buf: [4096]u8 = undefined;
-    const path_z = pathToZ(path, &path_buf) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "file_stat: path too long", 36, path);
+    const stat = Dir.cwd().statFile(io, path, .{}) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "file_stat failed", 0, path);
         return makeThrowErr(tctx, io_err);
     };
-    var st: std.c.Stat = undefined;
-    const rc = std.c.fstatat(@as(std.c.fd_t, std.c.AT.FDCWD), path_z, &st, 0);
-    if (rc != 0) {
-        const errno: i32 = @intCast(std.c._errno().*);
-        const io_err = try makeIOError(tctx, .not_found, "file_stat failed", errno, path);
+    return makeStatValue(tctx, stat);
+}
+
+/// __file_fstat(fd: i64) -> Throw<Stat, IOError>
+pub fn file_fstat(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 1) return error.InvalidArgument;
+    const fd = args[0].intCast(i64);
+    const file = fdToFile(fd);
+    const stat = file.stat(io) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "file_fstat failed", 0, null);
         return makeThrowErr(tctx, io_err);
-    }
-    const mtime_sec: i64 = @intCast(st.mtimespec.sec);
-    const mtime_nsec: i64 = @intCast(st.mtimespec.nsec);
-    const ctime_sec: i64 = @intCast(st.ctimespec.sec);
-    const ctime_nsec: i64 = @intCast(st.ctimespec.nsec);
-    const mode_u32: u32 = @intCast(st.mode);
-    const kind_val = try makeFileKind(tctx, mode_u32);
+    };
+    return makeStatValue(tctx, stat);
+}
+
+/// 从 std.Io.File.Stat 构造 Glue Stat record 值
+fn makeStatValue(tctx: *ThreadContext, stat: File.Stat) SyscallError!Value {
+    const kind_val = try makeFileKind(tctx, stat.kind);
     // kind_val 是堆对象（AdtValue），进入 record 字段需额外 retain（makeRecordWithNames 不主动 retain）
     _ = kind_val.retain();
     var fields: [4]Value = .{
-        Value.fromU64(@intCast(st.size)),
-        Value.fromI64(mtime_sec * 1_000_000_000 + mtime_nsec),
-        Value.fromI64(ctime_sec * 1_000_000_000 + ctime_nsec),
-        kind_val,
-    };
-    const field_names: [4]?[]const u8 = .{ "size", "mtime_ns", "ctime_ns", "kind" };
-    const stat_val = Value.makeRecordWithNames(tctx, "Stat", &fields, &field_names) catch return error.OutOfMemory;
-    return makeThrowOk(tctx, stat_val);
-}
-
-/// __file_fstat(fd: i32) -> Throw<Stat, IOError>
-pub fn file_fstat(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
-    if (args.len != 1) return error.InvalidArgument;
-    const fd = asI32(args[0]);
-    var st: std.c.Stat = undefined;
-    const rc = std.c.fstat(@intCast(fd), &st);
-    if (rc != 0) {
-        const errno: i32 = @intCast(std.c._errno().*);
-        const io_err = try makeIOError(tctx, .invalid_input, "file_fstat failed", errno, null);
-        return makeThrowErr(tctx, io_err);
-    }
-    const mtime_sec: i64 = @intCast(st.mtimespec.sec);
-    const mtime_nsec: i64 = @intCast(st.mtimespec.nsec);
-    const ctime_sec: i64 = @intCast(st.ctimespec.sec);
-    const ctime_nsec: i64 = @intCast(st.ctimespec.nsec);
-    const mode_u32: u32 = @intCast(st.mode);
-    const kind_val = try makeFileKind(tctx, mode_u32);
-    _ = kind_val.retain();
-    var fields: [4]Value = .{
-        Value.fromU64(@intCast(st.size)),
-        Value.fromI64(mtime_sec * 1_000_000_000 + mtime_nsec),
-        Value.fromI64(ctime_sec * 1_000_000_000 + ctime_nsec),
+        Value.fromU64(stat.size),
+        Value.fromI64(@intCast(stat.mtime.nanoseconds)),
+        Value.fromI64(@intCast(stat.ctime.nanoseconds)),
         kind_val,
     };
     const field_names: [4]?[]const u8 = .{ "size", "mtime_ns", "ctime_ns", "kind" };
@@ -424,52 +435,43 @@ pub fn file_fstat(tctx: *ThreadContext, args: []const Value) SyscallError!Value 
 }
 
 /// __file_remove(path: str) -> Throw<Unit, IOError>
-pub fn file_remove(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+pub fn file_remove(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 1) return error.InvalidArgument;
     const path = asStrBytes(args[0]);
-    var path_buf: [4096]u8 = undefined;
-    const path_z = pathToZ(path, &path_buf) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "file_remove: path too long", 36, path);
+    Dir.cwd().deleteFile(io, path) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "file_remove failed", 0, path);
         return makeThrowErr(tctx, io_err);
     };
-    const rc = std.c.unlink(path_z);
-    if (rc != 0) {
-        const errno: i32 = @intCast(std.c._errno().*);
-        const io_err = try makeIOError(tctx, errnoToKind(errno), "file_remove failed", errno, path);
-        return makeThrowErr(tctx, io_err);
-    }
     return makeThrowOk(tctx, Value.fromUnit());
 }
 
 /// __file_rename(old: str, new: str) -> Throw<Unit, IOError>
-pub fn file_rename(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+pub fn file_rename(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 2) return error.InvalidArgument;
     const old_path = asStrBytes(args[0]);
     const new_path = asStrBytes(args[1]);
-    var old_buf: [4096]u8 = undefined;
-    var new_buf: [4096]u8 = undefined;
-    const old_z = pathToZ(old_path, &old_buf) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "file_rename: old path too long", 36, old_path);
+    const cwd = Dir.cwd();
+    Dir.rename(cwd, old_path, cwd, new_path, io) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "file_rename failed", 0, old_path);
         return makeThrowErr(tctx, io_err);
     };
-    const new_z = pathToZ(new_path, &new_buf) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "file_rename: new path too long", 36, new_path);
-        return makeThrowErr(tctx, io_err);
-    };
-    const rc = std.c.rename(old_z, new_z);
-    if (rc != 0) {
-        const errno: i32 = @intCast(std.c._errno().*);
-        const io_err = try makeIOError(tctx, errnoToKind(errno), "file_rename failed", errno, old_path);
-        return makeThrowErr(tctx, io_err);
-    }
     return makeThrowOk(tctx, Value.fromUnit());
 }
 
 /// __file_chmod(path: str, mode: i32) -> Throw<Unit, IOError>
-pub fn file_chmod(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+///
+/// 跨平台：POSIX 用 std.c.chmod（Unix 权限位）；Windows 权限模型不同，暂为 no-op。
+pub fn file_chmod(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    _ = io;
     if (args.len != 2) return error.InvalidArgument;
     const path = asStrBytes(args[0]);
-    const mode = asI32(args[1]);
+    const mode = args[1].intCast(i32);
+
+    if (builtin.os.tag == .windows) {
+        // Windows 无 Unix 权限位模型，chmod 语义不适用，直接成功
+        return makeThrowOk(tctx, Value.fromUnit());
+    }
+
     var path_buf: [4096]u8 = undefined;
     const path_z = pathToZ(path, &path_buf) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "file_chmod: path too long", 36, path);
@@ -477,8 +479,7 @@ pub fn file_chmod(tctx: *ThreadContext, args: []const Value) SyscallError!Value 
     };
     const rc = std.c.chmod(path_z, @intCast(mode));
     if (rc != 0) {
-        const errno: i32 = @intCast(std.c._errno().*);
-        const io_err = try makeIOError(tctx, .permission_denied, "file_chmod failed", errno, path);
+        const io_err = try makeIOError(tctx, .permission_denied, "file_chmod failed", 0, path);
         return makeThrowErr(tctx, io_err);
     }
     return makeThrowOk(tctx, Value.fromUnit());
@@ -489,96 +490,41 @@ pub fn file_chmod(tctx: *ThreadContext, args: []const Value) SyscallError!Value 
 // ──────────────────────────────────────────────
 
 /// __dir_create(path: str, recursive: bool) -> Throw<Unit, IOError>
-pub fn dir_create(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+pub fn dir_create(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 2) return error.InvalidArgument;
     const path = asStrBytes(args[0]);
     const recursive = asBool(args[1]);
-    var path_buf: [4096]u8 = undefined;
-    const path_z = pathToZ(path, &path_buf) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "dir_create: path too long", 36, path);
-        return makeThrowErr(tctx, io_err);
-    };
+
     if (recursive) {
-        // 递归创建：逐级 mkdir，忽略已存在的目录
-        var i: usize = 0;
-        while (i <= path.len) : (i += 1) {
-            if (i == path.len or path[i] == '/') {
-                if (i == 0) continue;
-                const seg_z = path_buf[0..i :0];
-                _ = std.c.mkdir(seg_z, 0o755);
-                // 忽略已存在（EEXIST=17）错误，继续下一级
-            }
-        }
-    } else {
-        const rc = std.c.mkdir(path_z, 0o777);
-        if (rc != 0) {
-            const errno: i32 = @intCast(std.c._errno().*);
-            const io_err = try makeIOError(tctx, errnoToKind(errno), "dir_create failed", errno, path);
+        Dir.cwd().createDirPath(io, path) catch |err| {
+            const io_err = try makeIOError(tctx, errToKind(err), "dir_create recursive failed", 0, path);
             return makeThrowErr(tctx, io_err);
-        }
+        };
+    } else {
+        Dir.cwd().createDir(io, path, .default_dir) catch |err| {
+            const io_err = try makeIOError(tctx, errToKind(err), "dir_create failed", 0, path);
+            return makeThrowErr(tctx, io_err);
+        };
     }
     return makeThrowOk(tctx, Value.fromUnit());
 }
 
-/// 递归删除目录及其内容
-fn removeTreeRecursive(path_z: [:0]const u8, path_buf: *[4096]u8) c_int {
-    // 先尝试 rmdir（仅对空目录有效）
-    var rc = std.c.rmdir(path_z);
-    if (rc == 0) return 0;
-    const en = std.c._errno().*;
-    // ENOTEMPTY=66 (macOS)，其他错误直接返回
-    if (en != 66) return -1;
-
-    // 打开目录迭代并删除内容
-    const dir = std.c.opendir(path_z) orelse return -1;
-    defer _ = std.c.closedir(dir);
-    const base_len = path_z.len;
-    while (true) {
-        const entry = std.c.readdir(dir) orelse break;
-        const name_bytes = entry.name[0..entry.namlen];
-        if (std.mem.eql(u8, name_bytes, ".") or std.mem.eql(u8, name_bytes, "..")) continue;
-        if (base_len + 1 + entry.namlen + 1 > path_buf.len) continue;
-        @memcpy(path_buf[0..base_len], path_z[0..base_len]);
-        path_buf[base_len] = '/';
-        @memcpy(path_buf[base_len + 1 .. base_len + 1 + entry.namlen], name_bytes);
-        const child_end = base_len + 1 + entry.namlen;
-        path_buf[child_end] = 0;
-        const child_z = path_buf[0..child_end :0];
-        if (entry.type == std.c.DT.DIR) {
-            _ = removeTreeRecursive(child_z, path_buf);
-        } else {
-            _ = std.c.unlink(child_z);
-        }
-    }
-    // 内容删除后再次尝试 rmdir
-    rc = std.c.rmdir(path_z);
-    return rc;
-}
-
 /// __dir_remove(path: str, recursive: bool) -> Throw<Unit, IOError>
-pub fn dir_remove(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+pub fn dir_remove(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 2) return error.InvalidArgument;
     const path = asStrBytes(args[0]);
     const recursive = asBool(args[1]);
-    var path_buf: [4096]u8 = undefined;
-    const path_z = pathToZ(path, &path_buf) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "dir_remove: path too long", 36, path);
-        return makeThrowErr(tctx, io_err);
-    };
+
     if (recursive) {
-        const rc = removeTreeRecursive(path_z, &path_buf);
-        if (rc != 0) {
-            const errno: i32 = @intCast(std.c._errno().*);
-            const io_err = try makeIOError(tctx, errnoToKind(errno), "dir_remove failed", errno, path);
+        Dir.cwd().deleteTree(io, path) catch |err| {
+            const io_err = try makeIOError(tctx, errToKind(err), "dir_remove failed", 0, path);
             return makeThrowErr(tctx, io_err);
-        }
+        };
     } else {
-        const rc = std.c.rmdir(path_z);
-        if (rc != 0) {
-            const errno: i32 = @intCast(std.c._errno().*);
-            const io_err = try makeIOError(tctx, errnoToKind(errno), "dir_remove failed", errno, path);
+        Dir.cwd().deleteDir(io, path) catch |err| {
+            const io_err = try makeIOError(tctx, errToKind(err), "dir_remove failed", 0, path);
             return makeThrowErr(tctx, io_err);
-        }
+        };
     }
     return makeThrowOk(tctx, Value.fromUnit());
 }
@@ -586,44 +532,36 @@ pub fn dir_remove(tctx: *ThreadContext, args: []const Value) SyscallError!Value 
 /// __dir_list(path: str) -> Throw<DirEntry[], IOError>
 ///
 /// DirEntry 是 (name: str, kind: FileKind) record
-pub fn dir_list(tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+pub fn dir_list(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 1) return error.InvalidArgument;
     const path = asStrBytes(args[0]);
-    var path_buf: [4096]u8 = undefined;
-    const path_z = pathToZ(path, &path_buf) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "dir_list: path too long", 36, path);
+    var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "dir_list failed", 0, path);
         return makeThrowErr(tctx, io_err);
     };
-    const dir = std.c.opendir(path_z) orelse {
-        const errno: i32 = @intCast(std.c._errno().*);
-        const io_err = try makeIOError(tctx, errnoToKind(errno), "dir_list failed", errno, path);
-        return makeThrowErr(tctx, io_err);
-    };
-    defer _ = std.c.closedir(dir);
+    defer dir.close(io);
 
     var entries: std.ArrayList(Value) = .empty;
     defer entries.deinit(tctx.backing);
 
+    var it = dir.iterate();
     while (true) {
-        const entry = std.c.readdir(dir) orelse break;
-        const name_bytes = entry.name[0..entry.namlen];
-        if (std.mem.eql(u8, name_bytes, ".") or std.mem.eql(u8, name_bytes, "..")) continue;
-        const name_val = Value.fromStringBytes(tctx, name_bytes) catch return error.OutOfMemory;
+        const entry = it.next(io) catch |err| {
+            const io_err = try makeIOError(tctx, errToKind(err), "dir_list iterate failed", 0, path);
+            return makeThrowErr(tctx, io_err);
+        };
+        const e = entry orelse break;
+        if (std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) continue;
+        const name_val = Value.fromStringBytes(tctx, e.name) catch return error.OutOfMemory;
         _ = name_val.retain();
         // DirEntry.kind 字段是 FileKind ADT（File/Directory/Symlink/Other，无字段变体）
-        const kind_ctor: []const u8 = switch (entry.type) {
-            std.c.DT.REG => "File",
-            std.c.DT.DIR => "Directory",
-            std.c.DT.LNK => "Symlink",
-            else => "Other",
-        };
-        const kind_val = Value.makeAdt(tctx, "FileKind", kind_ctor, &.{}) catch return error.OutOfMemory;
+        const kind_val = try makeFileKind(tctx, e.kind);
         _ = kind_val.retain();
         var fields: [2]Value = .{ name_val, kind_val };
         const field_names: [2]?[]const u8 = .{ "name", "kind" };
-        const e = Value.makeRecordWithNames(tctx, "DirEntry", &fields, &field_names) catch return error.OutOfMemory;
-        _ = e.retain();
-        entries.append(tctx.backing, e) catch return error.OutOfMemory;
+        const rec = Value.makeRecordWithNames(tctx, "DirEntry", &fields, &field_names) catch return error.OutOfMemory;
+        _ = rec.retain();
+        entries.append(tctx.backing, rec) catch return error.OutOfMemory;
     }
 
     const arr_val = Value.makeArray(tctx, entries.items, null) catch return error.OutOfMemory;

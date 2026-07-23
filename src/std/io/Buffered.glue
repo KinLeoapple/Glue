@@ -27,17 +27,19 @@ pub fun new_writer(file: File): BufWriter {
 
 // 读取一行（直到 '\n' 或 EOF）
 // 返回不含 '\n' 的内容；EOF 时返回空串表示流结束
+// 优化：用 str 累积整段切片（走 concatInPlace amortized O(n)），避免 u8[] ++ 的 O(n²)
 pub async fun read_line(self: BufReader): Async<Throw<str, IOError>> {
-    var result: u8[] = []
+    var result: str = ""
     loop {
         if self.pos >= self.cap {
             self.pos = 0
             self.cap = self.inner.read(self.buf, self.buf.len()).await()?
             if self.cap == 0 {
-                if result.len() == 0 { return Ok("") }
-                return Ok(cast(result).to(str))
+                return Ok(result)
             }
         }
+        // 扫描 buf 寻找 '\n'，记录本段起点
+        val seg_start = self.pos
         var found_newline = false
         while self.pos < self.cap {
             val b = self.buf[self.pos]
@@ -46,25 +48,32 @@ pub async fun read_line(self: BufReader): Async<Throw<str, IOError>> {
                 found_newline = true
                 break
             }
-            result = result ++ [b]
+        }
+        // 将本段（不含 '\n'）追加到 result
+        val seg_end = if found_newline { self.pos - 1 } else { self.pos }
+        if seg_end > seg_start {
+            result = result + cast(self.buf[seg_start..seg_end]).to(str)
         }
         if found_newline {
-            return Ok(cast(result).to(str))
+            return Ok(result)
         }
     }
 }
 
 // 读取全部剩余字节到 u8[]
+// 优化：用 str 累积整段切片（amortized O(n)），最后 .bytes() 转 u8[]
 pub async fun read_to_end(self: BufReader): Async<Throw<u8[], IOError>> {
-    var result: u8[] = []
+    var result: str = ""
     loop {
         if self.pos >= self.cap {
             self.pos = 0
             self.cap = self.inner.read(self.buf, self.buf.len()).await()?
-            if self.cap == 0 { return Ok(result) }
+            if self.cap == 0 {
+                return Ok(result.bytes())
+            }
         }
         val chunk = self.buf[self.pos..self.cap]
-        result = result ++ chunk
+        result = result + cast(chunk).to(str)
         self.pos = self.cap
     }
 }

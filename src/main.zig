@@ -277,7 +277,7 @@ fn rewriteModuleCalls(
     expr: *ast.Expr,
     renames: *const std.StringHashMap([]const u8),
     sibling_modules: *const std.StringHashMap([]const u8),
-    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
 ) void {
     switch (expr.*) {
         .call => |c| {
@@ -294,21 +294,21 @@ fn rewriteModuleCalls(
                     const mod_name = fa.object.identifier.name;
                     if (sibling_modules.get(mod_name)) |mod_path| {
                         // 重写 Calendar.add_days → std.time.Calendar.add_days（作为单一 identifier）
-                        const mangled = std.fmt.allocPrint(allocator, "{s}.{s}", .{ mod_path, fa.field }) catch null;
+                        const mangled = std.fmt.allocPrint(arena, "{s}.{s}", .{ mod_path, fa.field }) catch null;
                         if (mangled) |m| {
                             c.callee.* = .{ .identifier = .{ .name = m } };
                         }
                     }
                 } else {
                     // object 非 identifier 时仍需递归
-                    rewriteModuleCalls(c.callee, renames, sibling_modules, allocator);
+                    rewriteModuleCalls(c.callee, renames, sibling_modules, arena);
                 }
             } else {
                 // callee 非简单 identifier 时仍需递归（如嵌套调用 f()(x)）
-                rewriteModuleCalls(c.callee, renames, sibling_modules, allocator);
+                rewriteModuleCalls(c.callee, renames, sibling_modules, arena);
             }
             for (c.arguments) |arg| {
-                rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+                rewriteModuleCalls(arg, renames, sibling_modules, arena);
             }
         },
         .method_call => |mc| {
@@ -316,14 +316,14 @@ fn rewriteModuleCalls(
             if (mc.object.* == .identifier) {
                 const mod_name = mc.object.identifier.name;
                 if (sibling_modules.get(mod_name)) |mod_path| {
-                    const mangled = std.fmt.allocPrint(allocator, "{s}.{s}", .{ mod_path, mc.method }) catch null;
+                    const mangled = std.fmt.allocPrint(arena, "{s}.{s}", .{ mod_path, mc.method }) catch null;
                     if (mangled) |m| {
                         // 将 method_call 转换为 call，callee 为单一 identifier
-                        const callee_ptr = allocator.create(ast.Expr) catch {
+                        const callee_ptr = arena.create(ast.Expr) catch {
                             // 分配失败时退回原 method_call 递归（保留旧行为）
-                            rewriteModuleCalls(mc.object, renames, sibling_modules, allocator);
+                            rewriteModuleCalls(mc.object, renames, sibling_modules, arena);
                             for (mc.arguments) |arg| {
-                                rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+                                rewriteModuleCalls(arg, renames, sibling_modules, arena);
                             }
                             return;
                         };
@@ -337,15 +337,15 @@ fn rewriteModuleCalls(
                         // （如 File.open(path, File.read_only()) 的第二个参数 File.read_only()），
                         // 必须递归重写
                         for (expr.call.arguments) |arg| {
-                            rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+                            rewriteModuleCalls(arg, renames, sibling_modules, arena);
                         }
                         return;
                     }
                 }
             }
-            rewriteModuleCalls(mc.object, renames, sibling_modules, allocator);
+            rewriteModuleCalls(mc.object, renames, sibling_modules, arena);
             for (mc.arguments) |arg| {
-                rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+                rewriteModuleCalls(arg, renames, sibling_modules, arena);
             }
         },
         .field_access => |fa| {
@@ -355,106 +355,106 @@ fn rewriteModuleCalls(
             if (fa.object.* == .identifier) {
                 const mod_name = fa.object.identifier.name;
                 if (sibling_modules.get(mod_name)) |mod_path| {
-                    const mangled = std.fmt.allocPrint(allocator, "{s}.{s}", .{ mod_path, fa.field }) catch null;
+                    const mangled = std.fmt.allocPrint(arena, "{s}.{s}", .{ mod_path, fa.field }) catch null;
                     if (mangled) |m| {
                         expr.* = .{ .identifier = .{ .name = m } };
                         return;
                     }
                 }
             }
-            rewriteModuleCalls(fa.object, renames, sibling_modules, allocator);
+            rewriteModuleCalls(fa.object, renames, sibling_modules, arena);
         },
-        .safe_access => |sa| rewriteModuleCalls(sa.object, renames, sibling_modules, allocator),
+        .safe_access => |sa| rewriteModuleCalls(sa.object, renames, sibling_modules, arena),
         .safe_method_call => |smc| {
-            rewriteModuleCalls(smc.object, renames, sibling_modules, allocator);
+            rewriteModuleCalls(smc.object, renames, sibling_modules, arena);
             for (smc.arguments) |arg| {
-                rewriteModuleCalls(arg, renames, sibling_modules, allocator);
+                rewriteModuleCalls(arg, renames, sibling_modules, arena);
             }
         },
         .binary => |b| {
-            rewriteModuleCalls(b.left, renames, sibling_modules, allocator);
-            rewriteModuleCalls(b.right, renames, sibling_modules, allocator);
+            rewriteModuleCalls(b.left, renames, sibling_modules, arena);
+            rewriteModuleCalls(b.right, renames, sibling_modules, arena);
         },
-        .unary => |u| rewriteModuleCalls(u.operand, renames, sibling_modules, allocator),
-        .ref_of => |r| rewriteModuleCalls(r.operand, renames, sibling_modules, allocator),
-        .deref => |d| rewriteModuleCalls(d.operand, renames, sibling_modules, allocator),
+        .unary => |u| rewriteModuleCalls(u.operand, renames, sibling_modules, arena),
+        .ref_of => |r| rewriteModuleCalls(r.operand, renames, sibling_modules, arena),
+        .deref => |d| rewriteModuleCalls(d.operand, renames, sibling_modules, arena),
         .assignment_expr => |ae| {
-            rewriteModuleCalls(ae.target, renames, sibling_modules, allocator);
-            rewriteModuleCalls(ae.value, renames, sibling_modules, allocator);
+            rewriteModuleCalls(ae.target, renames, sibling_modules, arena);
+            rewriteModuleCalls(ae.value, renames, sibling_modules, arena);
         },
         .compound_assign => |ca| {
-            rewriteModuleCalls(ca.target, renames, sibling_modules, allocator);
-            rewriteModuleCalls(ca.value, renames, sibling_modules, allocator);
+            rewriteModuleCalls(ca.target, renames, sibling_modules, arena);
+            rewriteModuleCalls(ca.value, renames, sibling_modules, arena);
         },
-        .non_null_assert => |nna| rewriteModuleCalls(nna.expr, renames, sibling_modules, allocator),
-        .propagate => |p| rewriteModuleCalls(p.expr, renames, sibling_modules, allocator),
+        .non_null_assert => |nna| rewriteModuleCalls(nna.expr, renames, sibling_modules, arena),
+        .propagate => |p| rewriteModuleCalls(p.expr, renames, sibling_modules, arena),
         .index => |idx| {
-            rewriteModuleCalls(idx.object, renames, sibling_modules, allocator);
-            rewriteModuleCalls(idx.index, renames, sibling_modules, allocator);
+            rewriteModuleCalls(idx.object, renames, sibling_modules, arena);
+            rewriteModuleCalls(idx.index, renames, sibling_modules, arena);
         },
         .slice => |sl| {
-            rewriteModuleCalls(sl.object, renames, sibling_modules, allocator);
-            rewriteModuleCalls(sl.start, renames, sibling_modules, allocator);
-            rewriteModuleCalls(sl.end, renames, sibling_modules, allocator);
+            rewriteModuleCalls(sl.object, renames, sibling_modules, arena);
+            rewriteModuleCalls(sl.start, renames, sibling_modules, arena);
+            rewriteModuleCalls(sl.end, renames, sibling_modules, arena);
         },
         .array_literal => |al| {
-            for (al.elements) |e| rewriteModuleCalls(e, renames, sibling_modules, allocator);
-            if (al.fill_value) |fv| rewriteModuleCalls(fv, renames, sibling_modules, allocator);
-            if (al.fill_count) |fc| rewriteModuleCalls(fc, renames, sibling_modules, allocator);
+            for (al.elements) |e| rewriteModuleCalls(e, renames, sibling_modules, arena);
+            if (al.fill_value) |fv| rewriteModuleCalls(fv, renames, sibling_modules, arena);
+            if (al.fill_count) |fc| rewriteModuleCalls(fc, renames, sibling_modules, arena);
         },
         .record_literal => |rl| {
-            for (rl.fields) |f| rewriteModuleCalls(f.value, renames, sibling_modules, allocator);
+            for (rl.fields) |f| rewriteModuleCalls(f.value, renames, sibling_modules, arena);
         },
         .record_extend => |re| {
-            rewriteModuleCalls(re.base, renames, sibling_modules, allocator);
-            for (re.updates) |u| rewriteModuleCalls(u.value, renames, sibling_modules, allocator);
+            rewriteModuleCalls(re.base, renames, sibling_modules, arena);
+            for (re.updates) |u| rewriteModuleCalls(u.value, renames, sibling_modules, arena);
         },
         .string_interpolation => |si| {
             for (si.parts) |p| switch (p) {
-                .expression => |e| rewriteModuleCalls(e, renames, sibling_modules, allocator),
+                .expression => |e| rewriteModuleCalls(e, renames, sibling_modules, arena),
                 .literal => {},
             };
         },
-        .type_cast => |tc| rewriteModuleCalls(tc.expr, renames, sibling_modules, allocator),
-        .cast_builder => |cb| rewriteModuleCalls(cb.expr, renames, sibling_modules, allocator),
-        .atomic_expr => |ae| rewriteModuleCalls(ae.value, renames, sibling_modules, allocator),
-        .lazy => |l| rewriteModuleCalls(l.expr, renames, sibling_modules, allocator),
-        .spawn_expr => |se| rewriteModuleCalls(se.expr, renames, sibling_modules, allocator),
+        .type_cast => |tc| rewriteModuleCalls(tc.expr, renames, sibling_modules, arena),
+        .cast_builder => |cb| rewriteModuleCalls(cb.expr, renames, sibling_modules, arena),
+        .atomic_expr => |ae| rewriteModuleCalls(ae.value, renames, sibling_modules, arena),
+        .lazy => |l| rewriteModuleCalls(l.expr, renames, sibling_modules, arena),
+        .spawn_expr => |se| rewriteModuleCalls(se.expr, renames, sibling_modules, arena),
         .if_expr => |ie| {
-            rewriteModuleCalls(ie.condition, renames, sibling_modules, allocator);
-            rewriteModuleCalls(ie.then_branch, renames, sibling_modules, allocator);
-            if (ie.else_branch) |eb| rewriteModuleCalls(eb, renames, sibling_modules, allocator);
+            rewriteModuleCalls(ie.condition, renames, sibling_modules, arena);
+            rewriteModuleCalls(ie.then_branch, renames, sibling_modules, arena);
+            if (ie.else_branch) |eb| rewriteModuleCalls(eb, renames, sibling_modules, arena);
         },
         .block => |blk| {
-            for (blk.statements) |s| rewriteStmt(s, renames, sibling_modules, allocator);
-            if (blk.trailing_expr) |te| rewriteModuleCalls(te, renames, sibling_modules, allocator);
+            for (blk.statements) |s| rewriteStmt(s, renames, sibling_modules, arena);
+            if (blk.trailing_expr) |te| rewriteModuleCalls(te, renames, sibling_modules, arena);
         },
         .match => |m| {
-            rewriteModuleCalls(m.scrutinee, renames, sibling_modules, allocator);
+            rewriteModuleCalls(m.scrutinee, renames, sibling_modules, arena);
             for (m.arms) |arm| {
-                if (arm.guard) |g| rewriteModuleCalls(g, renames, sibling_modules, allocator);
-                rewriteModuleCalls(arm.body, renames, sibling_modules, allocator);
+                if (arm.guard) |g| rewriteModuleCalls(g, renames, sibling_modules, arena);
+                rewriteModuleCalls(arm.body, renames, sibling_modules, arena);
             }
         },
         .lambda => |l| switch (l.body) {
-            .block => |b| rewriteModuleCalls(b, renames, sibling_modules, allocator),
-            .expression => |e| rewriteModuleCalls(e, renames, sibling_modules, allocator),
+            .block => |b| rewriteModuleCalls(b, renames, sibling_modules, arena),
+            .expression => |e| rewriteModuleCalls(e, renames, sibling_modules, arena),
         },
         .select => |sel| {
             for (sel.arms) |arm| switch (arm) {
                 .receive => |r| {
-                    rewriteModuleCalls(r.channel_expr, renames, sibling_modules, allocator);
-                    rewriteModuleCalls(r.body, renames, sibling_modules, allocator);
+                    rewriteModuleCalls(r.channel_expr, renames, sibling_modules, arena);
+                    rewriteModuleCalls(r.body, renames, sibling_modules, arena);
                 },
                 .timeout => |t| {
-                    rewriteModuleCalls(t.duration, renames, sibling_modules, allocator);
-                    rewriteModuleCalls(t.body, renames, sibling_modules, allocator);
+                    rewriteModuleCalls(t.duration, renames, sibling_modules, arena);
+                    rewriteModuleCalls(t.body, renames, sibling_modules, arena);
                 },
             };
         },
         .inline_trait_value => |itv| {
             for (itv.methods) |m| {
-                if (m.body) |b| rewriteModuleCalls(b, renames, sibling_modules, allocator);
+                if (m.body) |b| rewriteModuleCalls(b, renames, sibling_modules, arena);
             }
         },
         .identifier => |id| {
@@ -479,38 +479,38 @@ fn rewriteStmt(
     stmt: *ast.Stmt,
     renames: *const std.StringHashMap([]const u8),
     sibling_modules: *const std.StringHashMap([]const u8),
-    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
 ) void {
     switch (stmt.*) {
-        .val_decl => |vd| rewriteModuleCalls(vd.value, renames, sibling_modules, allocator),
-        .var_decl => |vd| rewriteModuleCalls(vd.value, renames, sibling_modules, allocator),
+        .val_decl => |vd| rewriteModuleCalls(vd.value, renames, sibling_modules, arena),
+        .var_decl => |vd| rewriteModuleCalls(vd.value, renames, sibling_modules, arena),
         .assignment => |a| {
-            rewriteModuleCalls(a.target, renames, sibling_modules, allocator);
-            rewriteModuleCalls(a.value, renames, sibling_modules, allocator);
+            rewriteModuleCalls(a.target, renames, sibling_modules, arena);
+            rewriteModuleCalls(a.value, renames, sibling_modules, arena);
         },
         .field_assignment => |fa| {
-            rewriteModuleCalls(fa.object, renames, sibling_modules, allocator);
-            rewriteModuleCalls(fa.value, renames, sibling_modules, allocator);
+            rewriteModuleCalls(fa.object, renames, sibling_modules, arena);
+            rewriteModuleCalls(fa.value, renames, sibling_modules, arena);
         },
         .compound_assignment => |ca| {
-            rewriteModuleCalls(ca.target, renames, sibling_modules, allocator);
-            rewriteModuleCalls(ca.value, renames, sibling_modules, allocator);
+            rewriteModuleCalls(ca.target, renames, sibling_modules, arena);
+            rewriteModuleCalls(ca.value, renames, sibling_modules, arena);
         },
-        .expression => |e| rewriteModuleCalls(e.expr, renames, sibling_modules, allocator),
+        .expression => |e| rewriteModuleCalls(e.expr, renames, sibling_modules, arena),
         .return_stmt => |r| {
-            if (r.value) |v| rewriteModuleCalls(v, renames, sibling_modules, allocator);
+            if (r.value) |v| rewriteModuleCalls(v, renames, sibling_modules, arena);
         },
-        .defer_stmt => |d| rewriteModuleCalls(d.expr, renames, sibling_modules, allocator),
-        .throw_stmt => |t| rewriteModuleCalls(t.expr, renames, sibling_modules, allocator),
+        .defer_stmt => |d| rewriteModuleCalls(d.expr, renames, sibling_modules, arena),
+        .throw_stmt => |t| rewriteModuleCalls(t.expr, renames, sibling_modules, arena),
         .for_stmt => |f| {
-            rewriteModuleCalls(f.iterable, renames, sibling_modules, allocator);
-            rewriteModuleCalls(f.body, renames, sibling_modules, allocator);
+            rewriteModuleCalls(f.iterable, renames, sibling_modules, arena);
+            rewriteModuleCalls(f.body, renames, sibling_modules, arena);
         },
         .while_stmt => |w| {
-            rewriteModuleCalls(w.condition, renames, sibling_modules, allocator);
-            rewriteModuleCalls(w.body, renames, sibling_modules, allocator);
+            rewriteModuleCalls(w.condition, renames, sibling_modules, arena);
+            rewriteModuleCalls(w.body, renames, sibling_modules, arena);
         },
-        .loop_stmt => |l| rewriteModuleCalls(l.body, renames, sibling_modules, allocator),
+        .loop_stmt => |l| rewriteModuleCalls(l.body, renames, sibling_modules, arena),
         .break_stmt, .continue_stmt => {},
     }
 }
@@ -526,6 +526,7 @@ fn loadImportedDeclarations(
     retained_parsers: *std.ArrayList(*parser.Parser),
     retained_sources: *std.ArrayList([]const u8),
     retained_tokens: *std.ArrayList([]lexer.Token),
+    ast_arena: std.mem.Allocator,
 ) !void {
     var extra_decls = std.ArrayList(ast.Decl).empty;
     defer extra_decls.deinit(allocator);
@@ -581,7 +582,7 @@ fn loadImportedDeclarations(
                     for (pack_module.declarations) |pack_decl| {
                         switch (pack_decl) {
                             .pack_decl => |pd| {
-                                const mangled_mod = std.fmt.allocPrint(allocator, "std.{s}.{s}", .{ pack_name, pd.name }) catch continue;
+                                const mangled_mod = std.fmt.allocPrint(ast_arena, "std.{s}.{s}", .{ pack_name, pd.name }) catch continue;
                                 sibling_modules.put(pd.name, mangled_mod) catch continue;
                             },
                             else => {},
@@ -602,7 +603,7 @@ fn loadImportedDeclarations(
                                 const sub_key = std.fmt.allocPrint(allocator, "{s}/{s}", .{ pack_name, sub_name }) catch continue;
                                 defer allocator.free(sub_key);
                                 if (loaded_submodules.contains(sub_key)) continue;
-                                loaded_submodules.put(try allocator.dupe(u8, sub_key), {}) catch continue;
+                                loaded_submodules.put(try ast_arena.dupe(u8, sub_key), {}) catch continue;
                                 const sub_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.glue", .{ pack_name, sub_name }) catch continue;
                                 const sub_src_embed = std_embed.find(sub_path) orelse continue;
 
@@ -643,7 +644,7 @@ fn loadImportedDeclarations(
                                     switch (sd) {
                                         .fun_decl => |fd| {
                                             if (fd.visibility == .public) {
-                                                const mangled = std.fmt.allocPrint(allocator, "std.{s}.{s}.{s}", .{ pack_name, sub_name, fd.name }) catch continue;
+                                                const mangled = std.fmt.allocPrint(ast_arena, "std.{s}.{s}.{s}", .{ pack_name, sub_name, fd.name }) catch continue;
                                                 local_renames.put(fd.name, mangled) catch continue;
                                             }
                                         },
@@ -653,7 +654,7 @@ fn loadImportedDeclarations(
                                                 switch (st.*) {
                                                     .val_decl => |vd| {
                                                         if (vd.visibility == .public) {
-                                                            const mangled = std.fmt.allocPrint(allocator, "std.{s}.{s}.{s}", .{ pack_name, sub_name, vd.name }) catch continue;
+                                                            const mangled = std.fmt.allocPrint(ast_arena, "std.{s}.{s}.{s}", .{ pack_name, sub_name, vd.name }) catch continue;
                                                             local_renames.put(vd.name, mangled) catch continue;
                                                         }
                                                     },
@@ -673,7 +674,7 @@ fn loadImportedDeclarations(
                                                 new_fd.name = mangled_name;
                                                 new_fd.visibility = .private;
                                                 // 同步重写函数体内部对同模块函数的短名调用
-                                                rewriteModuleCalls(new_fd.body, &local_renames, &sibling_modules, allocator);
+                                                rewriteModuleCalls(new_fd.body, &local_renames, &sibling_modules, ast_arena);
                                                 try extra_decls.append(allocator, .{ .fun_decl = new_fd });
                                             }
                                         },
@@ -694,7 +695,7 @@ fn loadImportedDeclarations(
                                                     .val_decl => |vd| {
                                                         if (vd.visibility == .public) {
                                                             const mangled_name = local_renames.get(vd.name) orelse continue;
-                                                            const new_stmt = allocator.create(ast.Stmt) catch continue;
+                                                            const new_stmt = ast_arena.create(ast.Stmt) catch continue;
                                                             new_stmt.* = .{ .val_decl = .{
                                                                 .name = mangled_name,
                                                                 .type_annotation = vd.type_annotation,
@@ -702,8 +703,8 @@ fn loadImportedDeclarations(
                                                                 .visibility = .private,
                                                             } };
                                                             // 重写 value 表达式中的同模块短名调用
-                                                            rewriteModuleCalls(vd.value, &local_renames, &sibling_modules, allocator);
-                                                            const new_expr = allocator.create(ast.Expr) catch continue;
+                                                            rewriteModuleCalls(vd.value, &local_renames, &sibling_modules, ast_arena);
+                                                            const new_expr = ast_arena.create(ast.Expr) catch continue;
                                                             new_expr.* = .{ .unit_literal = {} };
                                                             try extra_decls.append(allocator, .{ .expr_decl = .{
                                                                 .location = ed.location,
@@ -747,7 +748,7 @@ fn loadImportedDeclarations(
                 for (pack_module.declarations) |pack_decl| {
                     switch (pack_decl) {
                         .pack_decl => |pd| {
-                            const mangled_mod = std.fmt.allocPrint(allocator, "{s}.{s}", .{ module_name, pd.name }) catch continue;
+                            const mangled_mod = std.fmt.allocPrint(ast_arena, "{s}.{s}", .{ module_name, pd.name }) catch continue;
                             sibling_modules.put(pd.name, mangled_mod) catch continue;
                         },
                         else => {},
@@ -798,7 +799,7 @@ fn loadImportedDeclarations(
                                 switch (sd) {
                                     .fun_decl => |fd| {
                                         if (fd.visibility == .public) {
-                                            const mangled = std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ module_name, sub_name, fd.name }) catch continue;
+                                            const mangled = std.fmt.allocPrint(ast_arena, "{s}.{s}.{s}", .{ module_name, sub_name, fd.name }) catch continue;
                                             local_renames.put(fd.name, mangled) catch continue;
                                         }
                                     },
@@ -813,7 +814,7 @@ fn loadImportedDeclarations(
                                             var new_fd = fd;
                                             new_fd.name = mangled_name;
                                             new_fd.visibility = .private;
-                                            rewriteModuleCalls(new_fd.body, &local_renames, &sibling_modules, allocator);
+                                            rewriteModuleCalls(new_fd.body, &local_renames, &sibling_modules, ast_arena);
                                             try extra_decls.append(allocator, .{ .fun_decl = new_fd });
                                         }
                                     },
@@ -838,7 +839,7 @@ fn loadImportedDeclarations(
 
     // 合并声明到主模块
     if (extra_decls.items.len > 0) {
-        const combined = try allocator.alloc(ast.Decl, entry_module.declarations.len + extra_decls.items.len);
+        const combined = try ast_arena.alloc(ast.Decl, entry_module.declarations.len + extra_decls.items.len);
         @memcpy(combined[0..entry_module.declarations.len], entry_module.declarations);
         @memcpy(combined[entry_module.declarations.len..], extra_decls.items);
         entry_module.declarations = combined;
@@ -905,7 +906,14 @@ fn executeSource(
         for (retained_tokens.items) |t| allocator.free(t);
         retained_tokens.deinit(allocator);
     }
-    loadImportedDeclarations(allocator, io, &entry_module, filename, &retained_parsers, &retained_sources, &retained_tokens) catch {};
+    // AST arena：管理 loadImportedDeclarations 和 rewriteModuleCalls 中创建的
+    // 临时 AST 节点（mangled names、callee_ptr、new_stmt/expr、combined 数组）。
+    // 这些节点随 entry_module 一起使用，IR 构建完成后统一释放。
+    var ast_arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer ast_arena_inst.deinit();
+    const ast_arena = ast_arena_inst.allocator();
+
+    loadImportedDeclarations(allocator, io, &entry_module, filename, &retained_parsers, &retained_sources, &retained_tokens, ast_arena) catch {};
 
     // sema 阶段（语义分析 + 图构建元信息产出）
     // TypeInferencer.checkModule 推断所有表达式类型并记录到 SemaResult.expr_types，
@@ -1053,7 +1061,9 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
 /// 诊断运行模式：使用调试分配器在大栈线程中检测内存泄漏与双重释放
 fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
     _ = allocator;
-    var dbg = debug_allocator.DebugAllocator.initSingleThreaded();
+    // 多线程模式：orbit async 会在独立线程中使用同一 allocator，
+    // 必须启用 Mutex 保护 alloc_map，否则 HashMap 并发访问触发 pointer_stability 断言
+    var dbg = debug_allocator.DebugAllocator.init();
     const dbg_alloc = dbg.allocator();
     {
         var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
