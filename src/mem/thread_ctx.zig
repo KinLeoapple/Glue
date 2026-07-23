@@ -16,6 +16,7 @@ const page_pool = @import("page_pool.zig");
 const global_pool_mod = @import("global_pool.zig");
 const channel_region_mod = @import("channel_region.zig");
 const shadow_arena_mod = @import("shadow_arena.zig");
+const profiling = @import("profiling");
 
 const PagePtr = page_pool.PagePtr;
 const GlobalPool = global_pool_mod.GlobalPool;
@@ -46,15 +47,32 @@ pub const ThreadContext = struct {
     slot_cache_size: [2]u16 = .{ 0, 0 },
     slot_cache_idx: [2]u8 = .{ 0, 0 },
     slot_cache_next: u8 = 0,
+    /// per-thread 性能采集器（--profile 时创建，否则 null）
+    prof: ?*profiling.ThreadProfiler = null,
+    /// GlobalProfiler 反向引用（deinit 时注销 ThreadProfiler 用）
+    global_prof: ?*profiling.GlobalProfiler = null,
 
     /// 创建线程上下文
-    pub fn init(global: *GlobalPool, backing: std.mem.Allocator) ThreadContext {
-        return .{
+    /// global_prof 非 null 且 enabled 时创建并注册 ThreadProfiler
+    pub fn init(global: *GlobalPool, backing: std.mem.Allocator, global_prof: ?*profiling.GlobalProfiler) !ThreadContext {
+        var ctx = ThreadContext{
             .channels = ChannelRegion.init(backing),
             .arena = ShadowArena.init(backing),
             .global = global,
             .backing = backing,
         };
+        if (global_prof) |gp| {
+            if (gp.enabled) {
+                // ThreadProfiler 由 GlobalProfiler.allocator 分配，生命周期归 GlobalProfiler 管理
+                // （ThreadContext.deinit 不销毁，GlobalProfiler.dump/deinit 统一清理）
+                const prof = try gp.allocator.create(profiling.ThreadProfiler);
+                prof.* = profiling.ThreadProfiler.init(gp.allocator, true, @truncate(std.Thread.getCurrentId()));
+                gp.registerThread(prof);
+                ctx.prof = prof;
+                ctx.global_prof = gp;
+            }
+        }
+        return ctx;
     }
 
     /// 释放所有线程本地资源（页归还给 GlobalPool）
@@ -70,6 +88,9 @@ pub const ThreadContext = struct {
         self.pool_count = 0;
         self.channels.deinit();
         self.arena.deinit();
+        // ThreadProfiler 生命周期由 GlobalProfiler 管理（dump/deinit 时统一清理）
+        // 这里只断开引用，不注销也不销毁
+        self.prof = null;
     }
 
     /// 查找或创建指定 object_size 的池槽位索引
@@ -77,12 +98,19 @@ pub const ThreadContext = struct {
     fn findOrCreateSlot(self: *ThreadContext, object_size: usize) !u8 {
         const sz: u16 = @intCast(object_size);
         // 2 路缓存快路径
-        if (self.slot_cache_size[0] == sz) return self.slot_cache_idx[0];
-        if (self.slot_cache_size[1] == sz) return self.slot_cache_idx[1];
+        if (self.slot_cache_size[0] == sz) {
+            if (self.prof) |p| p.recordSlotCache(true);
+            return self.slot_cache_idx[0];
+        }
+        if (self.slot_cache_size[1] == sz) {
+            if (self.prof) |p| p.recordSlotCache(true);
+            return self.slot_cache_idx[1];
+        }
         // 慢路径：线性扫描 pools
         for (0..self.pool_count) |i| {
             if (self.pools[i].object_size == sz) {
                 self.slotCacheUpdate(sz, @intCast(i));
+                if (self.prof) |p| p.recordSlotCache(false);
                 return @intCast(i);
             }
         }
@@ -91,6 +119,7 @@ pub const ThreadContext = struct {
         self.pools[idx].object_size = sz;
         self.pool_count += 1;
         self.slotCacheUpdate(sz, @intCast(idx));
+        if (self.prof) |p| p.recordSlotCache(false);
         return idx;
     }
 
@@ -194,21 +223,27 @@ pub const ThreadContext = struct {
 
     /// 分配通道数据
     pub fn allocChannel(self: *ThreadContext, size: usize) ![]u8 {
-        return self.channels.alloc(size);
+        const result = try self.channels.alloc(size);
+        if (self.prof) |p| p.recordAllocatorWatermark(.channel, self.channels.used);
+        return result;
     }
 
     /// 分配临时数据
     pub fn allocTemp(self: *ThreadContext, size: usize) ![]u8 {
-        return self.arena.alloc(size);
+        const result = try self.arena.alloc(size);
+        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used);
+        return result;
     }
 
     /// 基本块结束：reset 通道（O(1)）
     pub fn endBlock(self: *ThreadContext) void {
+        if (self.prof) |p| p.recordAllocatorReset(.channel, self.channels.used);
         self.channels.reset();
     }
 
     /// 函数返回：reset 临时区（O(1)）
     pub fn endFunction(self: *ThreadContext) void {
+        if (self.prof) |p| p.recordAllocatorReset(.shadow_arena, self.arena.used);
         self.arena.reset();
     }
 
@@ -224,13 +259,16 @@ pub const ThreadContext = struct {
     /// endFunction 时由 arena.reset 统一回收，无需单独 freeObj。
     /// 调用方必须在初始化 ObjHeader 后立即调用 markArenaAllocated()。
     pub fn allocObjArena(self: *ThreadContext, total_size: usize) ![]u8 {
-        return self.arena.alloc(total_size);
+        const result = try self.arena.alloc(total_size);
+        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used);
+        return result;
     }
 
     /// 创建固定大小 arena 对象（便利方法）
     /// 返回未初始化的 *T，调用方必须设置字段并调用 markArenaAllocated()
     pub fn createObjArena(self: *ThreadContext, comptime T: type) !*T {
         const mem_bytes = try self.arena.alloc(@sizeOf(T));
+        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used);
         return @ptrCast(@alignCast(mem_bytes.ptr));
     }
 
@@ -336,7 +374,7 @@ const testing = std.testing;
 test "ThreadContext 小对象分配与释放" {
     var global = GlobalPool.init(testing.allocator);
     defer global.deinit();
-    var ctx = ThreadContext.init(&global, testing.allocator);
+    var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
 
     const mem = try ctx.allocBySize(48);
@@ -349,7 +387,7 @@ test "ThreadContext 小对象分配与释放" {
 test "ThreadContext 多次分配" {
     var global = GlobalPool.init(testing.allocator);
     defer global.deinit();
-    var ctx = ThreadContext.init(&global, testing.allocator);
+    var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
 
     var ptrs: [20][]u8 = undefined;
@@ -368,7 +406,7 @@ test "ThreadContext 多次分配" {
 test "ThreadContext 大对象分配" {
     var global = GlobalPool.init(testing.allocator);
     defer global.deinit();
-    var ctx = ThreadContext.init(&global, testing.allocator);
+    var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
 
     const mem = try ctx.allocBySize(500);
@@ -380,7 +418,7 @@ test "ThreadContext 大对象分配" {
 test "ThreadContext 通道分配与 reset" {
     var global = GlobalPool.init(testing.allocator);
     defer global.deinit();
-    var ctx = ThreadContext.init(&global, testing.allocator);
+    var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
 
     const m1 = try ctx.allocChannel(100);
@@ -394,7 +432,7 @@ test "ThreadContext 通道分配与 reset" {
 test "ThreadContext 临时区分配与 reset" {
     var global = GlobalPool.init(testing.allocator);
     defer global.deinit();
-    var ctx = ThreadContext.init(&global, testing.allocator);
+    var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
 
     const m = try ctx.allocTemp(64);
@@ -406,7 +444,7 @@ test "ThreadContext 临时区分配与 reset" {
 test "ThreadContext 全空页归还" {
     var global = GlobalPool.init(testing.allocator);
     defer global.deinit();
-    var ctx = ThreadContext.init(&global, testing.allocator);
+    var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
 
     // 分配然后全部释放，页应被缓存或归还

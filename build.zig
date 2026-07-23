@@ -29,9 +29,9 @@ pub fn build(b: *std.Build) void {
     parser_module.addImport("ast", ast_module);
     parser_module.addImport("lexer", lexer_module);
 
-    // ---- 内存管理模块 ----
+    // ---- 性能分析模块 ----
     const profiler_module = b.createModule(.{
-        .root_source_file = b.path("src/profiling/profiler.zig"),
+        .root_source_file = b.path("src/profiling/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -55,6 +55,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mem_module.addImport("sync", sync_module);
+    // mem → profiling 单向依赖：thread_ctx.zig 使用 ThreadProfiler/GlobalProfiler
+    // profiling 不依赖 mem/value（stats.zig 用 u8 索引而非 RefKind，打破循环）
+    mem_module.addImport("profiling", profiler_module);
 
     // ---- 值系统模块：依赖并发原语 ----
     const value_module = b.createModule(.{
@@ -65,6 +68,8 @@ pub fn build(b: *std.Build) void {
     value_module.addImport("ast", ast_module);
     value_module.addImport("sync", sync_module);
     value_module.addImport("mem", mem_module);
+    // profiling 需要 value 模块中的 obj_header（RefKind / ref_kind_count）
+    profiler_module.addImport("value", value_module);
 
     // ---- 语义分析模块族：分析数据库与各类检查器 ----
     const analysis_db_module = b.createModule(.{
@@ -199,6 +204,7 @@ pub fn build(b: *std.Build) void {
     engine_module.addImport("mem", mem_module);
     engine_module.addImport("value", value_module);
     engine_module.addImport("syscall", syscall_module);
+    engine_module.addImport("profiling", profiler_module);
 
     // ---- 根模块：聚合所有依赖，产出可执行文件 ----
     const root_module = b.createModule(.{
@@ -278,13 +284,13 @@ pub fn build(b: *std.Build) void {
     const run_builtin_unit_tests = b.addRunArtifact(builtin_unit_tests);
 
     // 内存管理新模块测试（page_pool/buddy/channel_region/shadow_arena/global_pool/thread_ctx）
-    const mem_test_modules = [_]struct { name: []const u8, file: []const u8, need_sync: bool }{
-        .{ .name = "page_pool", .file = "src/mem/page_pool.zig", .need_sync = false },
-        .{ .name = "buddy", .file = "src/mem/buddy.zig", .need_sync = true },
-        .{ .name = "channel_region", .file = "src/mem/channel_region.zig", .need_sync = false },
-        .{ .name = "shadow_arena", .file = "src/mem/shadow_arena.zig", .need_sync = false },
-        .{ .name = "global_pool", .file = "src/mem/global_pool.zig", .need_sync = true },
-        .{ .name = "thread_ctx", .file = "src/mem/thread_ctx.zig", .need_sync = true },
+    const mem_test_modules = [_]struct { name: []const u8, file: []const u8, need_sync: bool, need_profiling: bool }{
+        .{ .name = "page_pool", .file = "src/mem/page_pool.zig", .need_sync = false, .need_profiling = false },
+        .{ .name = "buddy", .file = "src/mem/buddy.zig", .need_sync = true, .need_profiling = false },
+        .{ .name = "channel_region", .file = "src/mem/channel_region.zig", .need_sync = false, .need_profiling = false },
+        .{ .name = "shadow_arena", .file = "src/mem/shadow_arena.zig", .need_sync = false, .need_profiling = false },
+        .{ .name = "global_pool", .file = "src/mem/global_pool.zig", .need_sync = true, .need_profiling = false },
+        .{ .name = "thread_ctx", .file = "src/mem/thread_ctx.zig", .need_sync = true, .need_profiling = true },
     };
     var mem_test_runs: [mem_test_modules.len]*std.Build.Step.Run = undefined;
     for (mem_test_modules, 0..) |m, i| {
@@ -294,6 +300,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         if (m.need_sync) mod.addImport("sync", sync_module);
+        if (m.need_profiling) mod.addImport("profiling", profiler_module);
         const test_art = b.addTest(.{ .root_module = mod });
         test_art.root_module.linkSystemLibrary("c", .{});
         mem_test_runs[i] = b.addRunArtifact(test_art);
@@ -358,6 +365,7 @@ pub fn build(b: *std.Build) void {
     engine_module_test.addImport("value", value_module);
     engine_module_test.addImport("syscall", syscall_module);
     engine_module_test.addImport("sema", type_check_module);
+    engine_module_test.addImport("profiling", profiler_module);
     const engine_unit_tests = b.addTest(.{
         .root_module = engine_module_test,
     });

@@ -1,0 +1,14 @@
+// Math.Algebra 子模块：代数计算
+pub val GOLDEN_RATIO: f64 = 1.61803398874989484820
+
+pub fun square(x: f64): f64 {
+    x * x
+}
+
+pub fun cube(x: f64): f64 {
+    x * x * x
+}
+
+pub fun is_positive(x: f64): bool {
+    x > 0
+}

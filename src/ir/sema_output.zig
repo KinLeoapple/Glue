@@ -110,6 +110,19 @@ pub const FuncSigInfo = struct {
     is_throwing: bool = false,
 };
 
+/// Import 别名目标（区分模块引用和符号引用）
+pub const AliasTarget = union(enum) {
+    /// 模块短名 → 完整模块路径
+    /// import std.time.Calendar → "Calendar" → .{ .module = "std.time.Calendar" }
+    /// import std.time { Calendar } → "Calendar" → .{ .module = "std.time.Calendar" }
+    /// 类型即模块：import std.time.DateTime → "DateTime" → .{ .module = "std.time.DateTime" }
+    module: []const u8,
+    /// 函数/常量短名 → mangled 名
+    /// import std.time.Calendar { is_leap_year } → "is_leap_year" → .{ .symbol = "std.time.Calendar.is_leap_year" }
+    /// import std.time.Calendar { is_leap_year as ily } → "ily" → .{ .symbol = "std.time.Calendar.is_leap_year" }
+    symbol: []const u8,
+};
+
 /// sema 产出的图构建元信息
 ///
 /// Phase 1 仅定义结构，图构建器暂不依赖此结构。
@@ -137,6 +150,9 @@ pub const SemaResult = struct {
     func_sig_index: std.StringHashMap(u16),
     /// 构造器名 → (type_def_index << 16 | ctor_index)
     ctor_def_index: std.StringHashMap(u32),
+    /// import 别名表：短名 → 别名目标
+    /// 由 sema 阶段的 buildImportAliases 填充，IRBuilder 读取后构建 module_alias_map 和 symbol_alias_map
+    import_aliases: std.StringHashMap(AliasTarget),
     /// 从 TypeInferencer 转移而来的 arena 所有权。
     /// sema_result 中的 type_name / field_chan_types / constructors 等切片
     /// 引用了 inferencer arena 分配的 Type 结构体内存，因此 arena 必须与
@@ -156,6 +172,7 @@ pub const SemaResult = struct {
             .func_sigs = .empty,
             .func_sig_index = std.StringHashMap(u16).init(allocator),
             .ctor_def_index = std.StringHashMap(u32).init(allocator),
+            .import_aliases = std.StringHashMap(AliasTarget).init(allocator),
         };
     }
 
@@ -169,6 +186,7 @@ pub const SemaResult = struct {
         self.func_sigs.deinit(self.allocator);
         self.func_sig_index.deinit();
         self.ctor_def_index.deinit();
+        self.import_aliases.deinit();
         if (self.owned_arena) |*arena| {
             arena.deinit();
             self.owned_arena = null;
@@ -183,6 +201,19 @@ pub const SemaResult = struct {
     /// 查询表达式类型
     pub fn getExpr(self: *const SemaResult, expr_id: u64) ?ExprInfo {
         return self.expr_types.get(expr_id);
+    }
+
+    /// 注册 import 别名（检测重复）
+    pub fn putImportAlias(self: *SemaResult, short_name: []const u8, target: AliasTarget) !void {
+        if (self.import_aliases.contains(short_name)) {
+            return error.DuplicateImportAlias;
+        }
+        try self.import_aliases.put(short_name, target);
+    }
+
+    /// 查询 import 别名
+    pub fn getImportAlias(self: *const SemaResult, short_name: []const u8) ?AliasTarget {
+        return self.import_aliases.get(short_name);
     }
 
     /// 记录错误

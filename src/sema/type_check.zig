@@ -693,6 +693,10 @@ pub const TypeErrorKind = enum {
     unconsumed_async,
     /// trait 方法签名不匹配或必需方法缺失（强制中止执行）
     signature_mismatch,
+    /// import 别名冲突：短名重复或与本地定义冲突
+    name_conflict,
+    /// import item 不存在
+    import_item_not_found,
 };
 /// 类型错误记录。包含错误种类、消息和源码位置。
 pub const TypeError = struct {
@@ -1964,6 +1968,24 @@ pub const TypeInferencer = struct {
                 if (self.known_modules.contains(id.name)) {
                     return self.makeModuleRef(id.name) catch error.OutOfMemory;
                 }
+                // import 别名查找：短名 → 模块或符号
+                if (self.sema_result) |sr| {
+                    if (sr.getImportAlias(id.name)) |target| {
+                        switch (target) {
+                            .module => |full_path| {
+                                return self.makeModuleRef(full_path) catch error.OutOfMemory;
+                            },
+                            .symbol => |mangled| {
+                                // 函数/常量引用：查环境获取 mangled 名对应的类型
+                                if (env.lookup(mangled)) |scheme| {
+                                    return try self.instantiate(scheme);
+                                }
+                                // 未在环境中找到（可能是常量），返回 fresh var
+                                return self.freshTypeVar() catch error.OutOfMemory;
+                            },
+                        }
+                    }
+                }
                 const id_loc = ast.exprLocation(expr);
                 self.addErrorAt(.unbound_variable, id_loc.line, id_loc.column, "undefined variable '{s}'", .{id.name});
                 return self.freshTypeVar() catch error.OutOfMemory;
@@ -2393,7 +2415,17 @@ pub const TypeInferencer = struct {
             .field_access => |fa| {
                 const fa_loc = ast.exprLocation(expr);
                 const obj_ty = self.inferExpr(fa.object, env, null) catch return self.freshTypeVar() catch unreachable;
-                if (self.asModuleRef(obj_ty)) |mod_name| {
+                // 类型即模块：如果 object 是 identifier 且在 import_aliases 中为 .module，
+                // 优先按模块引用处理（即使 env 中有同名构造器函数类型）
+                var effective_mod_ref: ?[]const u8 = self.asModuleRef(obj_ty);
+                if (effective_mod_ref == null and fa.object.* == .identifier) {
+                    if (self.sema_result) |sr| {
+                        if (sr.getImportAlias(fa.object.identifier.name)) |target| {
+                            if (target == .module) effective_mod_ref = target.module;
+                        }
+                    }
+                }
+                if (effective_mod_ref) |mod_name| {
                     if (self.module_submodules.get(mod_name)) |subs| {
                         for (subs) |sub| {
                             if (std.mem.eql(u8, sub, fa.field)) {
@@ -2407,6 +2439,16 @@ pub const TypeInferencer = struct {
                     defer self.arena.allocator().free(key);
                     if (self.exported_schemes.get(key)) |scheme| {
                         return self.instantiate(scheme) catch unreachable;
+                    }
+                    // import 别名 fallback：模块短名的字段访问，确认函数存在
+                    // 如 Calendar.is_leap_year → "std.time.Calendar.is_leap_year"
+                    // 精确类型推断由 IR 层处理，sema 返回 fresh var
+                    if (self.sema_result) |sr| {
+                        const mangled = std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ mod_name, fa.field }) catch return self.freshTypeVar() catch unreachable;
+                        defer self.arena.allocator().free(mangled);
+                        if (sr.func_sig_index.contains(mangled)) {
+                            return self.freshTypeVar() catch unreachable;
+                        }
                     }
                     return self.freshTypeVar() catch unreachable;
                 }
@@ -3099,6 +3141,7 @@ pub const TypeInferencer = struct {
             }
         }
         self.registerImportedModuleStructure(module, &env);
+        self.buildImportAliases(module);
         self.checkCrossKindNameClashes(module);
         self.suppress_errors = true;
         for (module.declarations) |decl| {
@@ -3127,10 +3170,13 @@ pub const TypeInferencer = struct {
             if (decl != .import_decl) continue;
             const ud = decl.import_decl;
             if (ud.module_path.len == 0) continue;
-            if (ud.items != null) continue; // 只处理导入整个模块的情况
+            // 选择性导入也需注册模块路径首段为模块引用：loadImportedDeclarations
+            // 全量加载 pack 内子模块（含跨模块依赖），这些子模块内部使用完整路径
+            // （如 DateTime.glue 的 std.time.DateTime.from_components），需要首段
+            // （如 std）在 env 中可见，否则 sema 报 undefined variable。
             const mod = ud.module_path[0];
 
-            // 注册模块引用变量，使 Store 能被识别为模块
+            // 注册模块引用变量，使 Store/std 能被识别为模块
             const mod_ty = self.makeModuleRef(mod) catch continue;
             const mod_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = mod_ty };
             env.redefine(mod, mod_scheme) catch {};
@@ -3212,6 +3258,171 @@ pub const TypeInferencer = struct {
             }
         }
     }
+
+    // ── Import 别名表构建 ──
+
+    /// 构建 import 别名表：扫描已合并 declarations，为每个 import_decl 注册短名
+    /// 整路径导入：注册末段 → 完整模块路径
+    /// selective import：注册短名 → mangled 函数/常量名 或 子模块路径
+    /// 类型即模块：类型名与模块名同名时统一为模块引用
+    fn buildImportAliases(self: *TypeInferencer, module: *const ast.Module) void {
+        const sr = self.sema_result orelse return;
+        const arena_alloc = self.arena.allocator();
+
+        for (module.declarations) |decl| {
+            if (decl != .import_decl) continue;
+            const imp = decl.import_decl;
+            if (imp.module_path.len == 0) continue;
+
+            if (imp.items) |items| {
+                self.buildSelectiveImportAliases(imp.module_path, items, module, sr, arena_alloc);
+            } else {
+                self.buildWholeImportAlias(imp.module_path, module, sr, arena_alloc);
+            }
+        }
+    }
+
+    /// 整路径导入的别名构建：import path.to.module
+    fn buildWholeImportAlias(
+        self: *TypeInferencer,
+        module_path: []const []const u8,
+        module: *const ast.Module,
+        sr: *SemaResult,
+        arena_alloc: std.mem.Allocator,
+    ) void {
+        const last_segment = module_path[module_path.len - 1];
+        const full_path = joinModulePath(arena_alloc, module_path) catch return;
+
+        // 冲突检测：短名重复
+        if (sr.import_aliases.contains(last_segment)) {
+            self.addErrorAt(.name_conflict, 0, 0, "duplicate import alias: '{s}'", .{last_segment});
+            return;
+        }
+        // 冲突检测：与非类型本地定义冲突（类型定义允许，类型即模块）
+        if (self.isLocalNonTypeDefinition(last_segment, module)) {
+            self.addErrorAt(.name_conflict, 0, 0, "import alias '{s}' conflicts with local definition", .{last_segment});
+            return;
+        }
+        sr.putImportAlias(last_segment, .{ .module = full_path }) catch {};
+    }
+
+    /// selective import 的别名构建：import path { item1, item2 as alias }
+    fn buildSelectiveImportAliases(
+        self: *TypeInferencer,
+        module_path: []const []const u8,
+        items: []const ast.ImportItem,
+        module: *const ast.Module,
+        sr: *SemaResult,
+        arena_alloc: std.mem.Allocator,
+    ) void {
+        const prefix_path = joinModulePath(arena_alloc, module_path) catch return;
+
+        for (items) |item| {
+            const import_name = item.alias orelse item.name;
+            const candidate_module = std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ prefix_path, item.name }) catch continue;
+            const candidate_symbol = candidate_module;
+
+            // 冲突检测
+            if (sr.import_aliases.contains(import_name)) {
+                self.addErrorAt(.name_conflict, 0, 0, "duplicate import alias: '{s}'", .{import_name});
+                continue;
+            }
+            if (self.isLocalNonTypeDefinition(import_name, module)) {
+                self.addErrorAt(.name_conflict, 0, 0, "import alias '{s}' conflicts with local definition", .{import_name});
+                continue;
+            }
+
+            const kind = classifyImportItem(item.name, candidate_module, candidate_symbol, module);
+            switch (kind) {
+                .function, .constant => {
+                    sr.putImportAlias(import_name, .{ .symbol = candidate_symbol }) catch {};
+                },
+                .submodule, .type_kind => {
+                    sr.putImportAlias(import_name, .{ .module = candidate_module }) catch {};
+                },
+                .not_found => {
+                    self.addErrorAt(.import_item_not_found, 0, 0, "import item '{s}' not found in module '{s}'", .{ item.name, prefix_path });
+                },
+            }
+        }
+    }
+
+    /// 判断名字是否为本地非类型定义（函数/变量/trait）
+    fn isLocalNonTypeDefinition(self: *TypeInferencer, name: []const u8, module: *const ast.Module) bool {
+        _ = self;
+        for (module.declarations) |decl| {
+            switch (decl) {
+                .fun_decl => |fd| if (std.mem.eql(u8, fd.name, name)) return true,
+                .trait_decl => |td| if (std.mem.eql(u8, td.name, name)) return true,
+                .expr_decl => |ed| {
+                    if (ed.stmt) |st| {
+                        switch (st.*) {
+                            .val_decl => |vd| if (std.mem.eql(u8, vd.name, name)) return true,
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// selective import item 的种类分类
+    const ImportItemKind = enum { function, constant, submodule, type_kind, not_found };
+    fn classifyImportItem(
+        item_name: []const u8,
+        candidate_module: []const u8,
+        candidate_symbol: []const u8,
+        module: *const ast.Module,
+    ) ImportItemKind {
+        for (module.declarations) |decl| {
+            if (decl == .fun_decl and std.mem.eql(u8, decl.fun_decl.name, candidate_symbol)) {
+                return .function;
+            }
+            // 常量：expr_decl.stmt.val_decl.name == candidate_symbol
+            if (decl == .expr_decl) {
+                const ed = decl.expr_decl;
+                if (ed.stmt) |st| {
+                    switch (st.*) {
+                        .val_decl => |vd| if (std.mem.eql(u8, vd.name, candidate_symbol)) return .constant,
+                        else => {},
+                    }
+                }
+            }
+            // 子模块：存在以 candidate_module + "." 开头的 mangled 函数名
+            if (decl == .fun_decl) {
+                const fname = decl.fun_decl.name;
+                if (std.mem.startsWith(u8, fname, candidate_module) and fname.len > candidate_module.len and fname[candidate_module.len] == '.') {
+                    return .submodule;
+                }
+            }
+            // 类型（原名不 mangle）
+            if (decl == .type_decl and std.mem.eql(u8, decl.type_decl.name, item_name)) {
+                return .type_kind;
+            }
+        }
+        return .not_found;
+    }
+
+    /// 用 "." 连接模块路径段
+    fn joinModulePath(arena_alloc: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
+        if (parts.len == 0) return "";
+        var total: usize = 0;
+        for (parts) |p| total += p.len + 1;
+        const buf = try arena_alloc.alloc(u8, total - 1);
+        var pos: usize = 0;
+        for (parts, 0..) |p, i| {
+            @memcpy(buf[pos..][0..p.len], p);
+            pos += p.len;
+            if (i < parts.len - 1) {
+                buf[pos] = '.';
+                pos += 1;
+            }
+        }
+        return buf;
+    }
+
     fn checkCrossKindNameClashes(self: *TypeInferencer, module: *const ast.Module) void {
         const Kind = enum { function, type_decl, trait_decl };
         var seen = std.StringHashMap(Kind).init(self.arena.allocator());

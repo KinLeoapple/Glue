@@ -434,6 +434,7 @@ pub const ChannelValue = struct {
             .not_empty = .{},
             .not_full = .{},
         };
+        obj_header.initObjHeader(&self.header, .channel_val, total, false, tctx);
         return self;
     }
 
@@ -626,7 +627,7 @@ const mem_mod = @import("mem");
 
 fn testCtx() struct { g: mem_mod.GlobalPool, c: ThreadContext } {
     var g = mem_mod.GlobalPool.init(testing.allocator);
-    const c = ThreadContext.init(&g, testing.allocator);
+    const c = ThreadContext.init(&g, testing.allocator, null) catch unreachable;
     return .{ .g = g, .c = c };
 }
 

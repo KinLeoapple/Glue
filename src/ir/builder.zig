@@ -177,6 +177,10 @@ pub const IRBuilder = struct {
     func_returns_str: std.StringHashMap(void), // 返回 str 的函数名集合
     lambda_returns_throw: std.StringHashMap(void), // 返回 Throw 的 lambda 变量名集合（跨作用域持久）
     imported_modules: std.StringHashMap(void), // 已导入的顶层模块名集合（用于模块引用识别）
+    /// 模块短名 → 完整模块路径（从 SemaResult.import_aliases 的 .module 变体提取）
+    module_alias_map: std.StringHashMap([]const u8),
+    /// 函数/常量短名 → mangled 名（从 SemaResult.import_aliases 的 .symbol 变体提取）
+    symbol_alias_map: std.StringHashMap([]const u8),
     /// 字段名 → field_id 映射：key = "type_name\x00field_name"，value = field_id
     /// ADT/newtype/error_newtype：__tag=0，字段从 1 开始
     /// Record literal：字段按声明顺序 0..N-1
@@ -272,6 +276,8 @@ pub const IRBuilder = struct {
             .func_returns_str = std.StringHashMap(void).init(allocator),
             .lambda_returns_throw = std.StringHashMap(void).init(allocator),
             .imported_modules = std.StringHashMap(void).init(allocator),
+            .module_alias_map = std.StringHashMap([]const u8).init(allocator),
+            .symbol_alias_map = std.StringHashMap([]const u8).init(allocator),
             .field_id_map = std.StringHashMap(u16).init(allocator),
             .linear_rec_map = std.StringHashMap(LinearRecurrenceInfo).init(allocator),
         };
@@ -452,6 +458,8 @@ pub const IRBuilder = struct {
         self.func_returns_str.deinit();
         self.lambda_returns_throw.deinit();
         self.imported_modules.deinit();
+        self.module_alias_map.deinit();
+        self.symbol_alias_map.deinit();
         self.field_id_map.deinit();
         self.linear_rec_map.deinit();
         self.func_memo_slots.deinit(self.allocator);
@@ -544,6 +552,24 @@ pub const IRBuilder = struct {
                     // 注册导入的顶层模块名（用于 field_access 识别模块引用）
                     if (imp.module_path.len > 0) {
                         try self.imported_modules.put(imp.module_path[0], {});
+                    }
+                    // 从 sema_result 读取 import 别名，填充 alias map
+                    if (self.sema_result) |sr| {
+                        var alias_iter = sr.import_aliases.iterator();
+                        while (alias_iter.next()) |entry| {
+                            const short_name = entry.key_ptr.*;
+                            const target = entry.value_ptr.*;
+                            switch (target) {
+                                .module => |full_path| {
+                                    self.module_alias_map.put(short_name, full_path) catch {};
+                                    // 让 isModuleReference 能识别短名
+                                    self.imported_modules.put(short_name, {}) catch {};
+                                },
+                                .symbol => |mangled| {
+                                    self.symbol_alias_map.put(short_name, mangled) catch {};
+                                },
+                            }
+                        }
                     }
                 },
                 .expr_decl => |ed| {
@@ -2157,6 +2183,11 @@ pub const IRBuilder = struct {
             .identifier => |id| {
                 // 先查变量绑定
                 if (self.lookupVar(id.name)) |binding| return binding.chan;
+                // 符号别名查找：selective import 的常量/函数短名 → mangled 名
+                // 如 UNIX_EPOCH → std.time.SystemTime.UNIX_EPOCH（全局 val 已注册为变量）
+                if (self.symbol_alias_map.get(id.name)) |mangled| {
+                    if (self.lookupVar(mangled)) |binding| return binding.chan;
+                }
                 // 再查构造器表：无参构造器如 Leaf 可直接作为 identifier 引用
                 if (self.sema_result.?.getCtorDef(id.name)) |ctor| {
                     if (ctor.field_chan_types.len == 0) {
@@ -3644,7 +3675,14 @@ pub const IRBuilder = struct {
             return try self.compileConstructorCall(ctor, arguments);
         }
 
-        const func_idx = self.func_table.get(func_name) orelse {
+        // 短名别名解析：本地函数优先（原名在 func_table 中），否则查 symbol_alias_map 获取 mangled 名
+        // import std.time.Calendar { is_leap_year } → "is_leap_year" → "std.time.Calendar.is_leap_year"
+        const effective_name = if (self.func_table.contains(func_name))
+            func_name
+        else
+            (self.symbol_alias_map.get(func_name) orelse func_name);
+
+        const func_idx = self.func_table.get(effective_name) orelse {
             // 不在 func_table 中：检查是否为变量（lambda 调用）
             if (self.lookupVar(func_name)) |binding| {
                 // 从绑定的 type_annotation 推断闭包返回类型
@@ -3666,7 +3704,7 @@ pub const IRBuilder = struct {
         const func = self.functions.items[func_idx];
 
         // 线性递归优化：fib(n) 等模式 → 迭代 scalar_loop（O(N) 替代 O(2^N)）
-        if (self.linear_rec_map.get(func_name)) |rec_info| {
+        if (self.linear_rec_map.get(effective_name)) |rec_info| {
             if (arguments.len == 1) {
                 const arg_chan = try self.compileExpr(arguments[0]);
                 const forced_arg = try self.forceLazyArgIfNeeded(arg_chan, func.param_channels[0]);
@@ -3681,8 +3719,8 @@ pub const IRBuilder = struct {
         const tail_call = self.in_tail_position;
         self.in_tail_position = false;
         // 获取被调用函数的参数信息（用于判断参数是否为 trait 类型）
-        const func_params = self.findFuncParamsAst(func_name);
-        const func_return_type = self.findFuncReturnTypeAst(func_name);
+        const func_params = self.findFuncParamsAst(effective_name);
+        const func_return_type = self.findFuncReturnTypeAst(effective_name);
         // 收集参数引用标记，用于运行时值语义深拷贝判定
         var arg_ref_bits: u16 = 0;
         for (arguments, 0..) |arg, i| {
@@ -3737,14 +3775,14 @@ pub const IRBuilder = struct {
         // 普通函数：发射 call 节点
         const ret_meta = self.channels.get(func.return_channel);
         // 泛型函数：尝试从实参类型推断返回类型
-        const inferred_ret_type = self.inferGenericCallReturnType(func_name, arguments);
+        const inferred_ret_type = self.inferGenericCallReturnType(effective_name, arguments);
         const ret_chan_type = inferred_ret_type orelse ret_meta.chan_type;
         const out = if (ret_chan_type == .nullable_chan)
             try self.channels.allocNullable(ret_meta.inner_type)
         else
             try self.allocChannel(ret_chan_type);
         // 计算泛型类型实参（type_args）用于 typeof(T) 运行时查表
-        const type_args = try self.inferCallTypeArgs(func_name, arguments, type_args_hint);
+        const type_args = try self.inferCallTypeArgs(effective_name, arguments, type_args_hint);
         // 判断函数返回类型是否为引用类型，用于返回值深拷贝判定
         const ret_is_ref = blk: {
             if (func_return_type) |rtn| {
@@ -3759,7 +3797,7 @@ pub const IRBuilder = struct {
             .func_index = func_idx,
             .arg_count = @intCast(arguments.len),
             .tail_call = tail_call,
-            .memo_slot = self.tryAssignMemoSlot(func_name, arg_chans, ret_chan_type, ret_meta.inner_type),
+            .memo_slot = self.tryAssignMemoSlot(effective_name, arg_chans, ret_chan_type, ret_meta.inner_type),
             .type_args = type_args,
             .arg_ref_bits = arg_ref_bits,
             .ret_is_ref = ret_is_ref,
@@ -7580,6 +7618,11 @@ pub const IRBuilder = struct {
             .identifier => |id| {
                 // 基础情况：顶层模块名必须在 imported_modules 中登记
                 if (self.imported_modules.contains(id.name)) {
+                    // 短名别名优先：返回完整路径
+                    if (self.module_alias_map.get(id.name)) |full_path| {
+                        return .{ .full_path = full_path };
+                    }
+                    // 首段名：原逻辑
                     return .{ .full_path = id.name };
                 }
                 return null;
@@ -7630,6 +7673,11 @@ pub const IRBuilder = struct {
                     .inputs = inputs,
                 });
                 return out;
+            }
+            // 构造器调用：Module.Sub.TypeName(args) → 查 ctor_def_index
+            // 类型即模块：当 method 是类型/构造器名，走构造器路径
+            if (self.sema_result.?.getCtorDef(method)) |ctor| {
+                return try self.compileConstructorCall(ctor, arguments);
             }
         }
 

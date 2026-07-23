@@ -130,6 +130,7 @@ pub const Str = extern struct {
         if (data.len <= SSO_MAX) {
             const self = try tctx.createObj(Str);
             self.* = initSso(data);
+            obj_header.initObjHeader(&self.header, .str, @sizeOf(Str), false, tctx);
             return self;
         }
         const total = @sizeOf(Str) + data.len;
@@ -138,6 +139,7 @@ pub const Str = extern struct {
         const buf_ptr: [*]u8 = mem.ptr + @sizeOf(Str);
         @memcpy(buf_ptr[0..data.len], data);
         self.* = initHeapContiguous(buf_ptr, data.len, data.len);
+        obj_header.initObjHeader(&self.header, .str, total, false, tctx);
         return self;
     }
 
@@ -154,6 +156,7 @@ pub const Str = extern struct {
             const dst: [*]u8 = @ptrCast(&self._word0);
             @memcpy(dst[0..a_len], a.bytes());
             @memcpy(dst[a_len..total], b.bytes());
+            obj_header.initObjHeader(&self.header, .str, @sizeOf(Str), false, tctx);
             return self;
         }
         const new_cap = @max(total * 2, total + 16);
@@ -164,6 +167,7 @@ pub const Str = extern struct {
         @memcpy(buf_ptr[0..a_len], a.bytes());
         @memcpy(buf_ptr[a_len..total], b.bytes());
         self.* = initHeapContiguous(buf_ptr, total, new_cap);
+        obj_header.initObjHeader(&self.header, .str, alloc_size, false, tctx);
         return self;
     }
 
@@ -342,7 +346,7 @@ pub fn strDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
 
 fn testCtx() struct { g: mem_mod.GlobalPool, c: ThreadContext } {
     var g = mem_mod.GlobalPool.init(std.testing.allocator);
-    const c = ThreadContext.init(&g, std.testing.allocator);
+    const c = ThreadContext.init(&g, std.testing.allocator, null) catch unreachable;
     return .{ .g = g, .c = c };
 }
 

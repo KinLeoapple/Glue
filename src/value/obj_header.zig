@@ -133,8 +133,9 @@ pub fn registerDeinit(kind: RefKind, f: DeinitFn) void {
 /// 统一 retain：原子递增引用计数，返回自身以便链式调用
 ///
 /// 使用原子操作保证线程安全，无竞争时开销约 1 周期（x86 LOCK 前缀）。
-pub fn retain(obj: *ObjHeader) *ObjHeader {
+pub fn retain(obj: *ObjHeader, tctx: *ThreadContext) *ObjHeader {
     _ = @atomicRmw(u32, &obj.rc, .Add, 1, .monotonic);
+    if (tctx.prof) |p| p.recordRC(.retain);
     return obj;
 }
 
@@ -145,9 +146,28 @@ pub fn retain(obj: *ObjHeader) *ObjHeader {
 /// deinit 函数负责释放内部资源并销毁对象本体。
 pub fn release(obj: *ObjHeader, tctx: *ThreadContext) void {
     const old = @atomicRmw(u32, &obj.rc, .Sub, 1, .acq_rel);
+    if (tctx.prof) |p| {
+        if (old == 1) {
+            p.recordRC(.release_to_zero);
+        } else {
+            p.recordRC(.release);
+        }
+    }
     if (old == 1) {
         deinit_table[@intFromEnum(obj.type_tag)](obj, tctx);
     }
+}
+
+/// 统一 ObjHeader 初始化：设置类型标签、重置标志位、设置 rc=1，并记录分配埋点
+///
+/// 所有堆对象分配后应调用此函数初始化 header，确保 profiling 采集到 alloc 事件。
+/// size 为对象总分配大小（含 header），is_arena 标记是否从 ShadowArena 分配。
+pub fn initObjHeader(header: *ObjHeader, kind: RefKind, size: usize, is_arena: bool, tctx: *ThreadContext) void {
+    header.type_tag = kind;
+    header.flags = 0;
+    header.rc = 1;
+    if (is_arena) header.markArenaAllocated();
+    if (tctx.prof) |p| p.recordAlloc(@intFromEnum(kind), size, is_arena);
 }
 
 test {
@@ -157,11 +177,11 @@ test {
 test "retain 与 release 引用计数" {
     var global = mem_mod.GlobalPool.init(std.testing.allocator);
     defer global.deinit();
-    var ctx = ThreadContext.init(&global, std.testing.allocator);
+    var ctx = ThreadContext.init(&global, std.testing.allocator, null) catch unreachable;
     defer ctx.deinit();
 
     var obj = ObjHeader{ .type_tag = .array, .rc = 1 };
-    _ = retain(&obj);
+    _ = retain(&obj, &ctx);
     try std.testing.expectEqual(@as(u32, 2), obj.rc);
     // rc 从 2 递减到 1，不触发 deinit 分派
     release(&obj, &ctx);

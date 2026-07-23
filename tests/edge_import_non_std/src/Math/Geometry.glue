@@ -1,0 +1,14 @@
+// Math.Geometry 子模块：几何计算
+pub val PI: f64 = 3.14159265358979323846
+
+pub fun circle_area(radius: f64): f64 {
+    PI * radius * radius
+}
+
+pub fun circle_circumference(radius: f64): f64 {
+    2.0 * PI * radius
+}
+
+pub fun rectangle_area(width: f64, height: f64): f64 {
+    width * height
+}

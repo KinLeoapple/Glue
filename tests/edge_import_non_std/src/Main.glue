@@ -1,0 +1,20 @@
+// edge_import_non_std: 验证非 std 模块的多段路径 import 短名解析
+// 覆盖：整路径导入、选择性导入函数短名、常量短名、alias
+import Math.Geometry.{ circle_area as area, circle_circumference, rectangle_area }
+import Math.Algebra.{ square, cube, GOLDEN_RATIO as phi }
+
+fun main() {
+    // ── 选择性导入函数短名 + alias（非 std 模块） ──────────────
+    println(area(2.0))                  // 12.566... (PI * 4)
+    println(circle_circumference(1.0))  // 6.283... (2 * PI)
+    println(square(3.0))                // 9
+
+    // ── 常量短名 + alias（非 std 模块） ───────────────────────
+    println(phi > 1.6)                  // true
+
+    // ── 函数短名（多参数） ─────────────────────────────────────
+    println(rectangle_area(3.0, 4.0))   // 12
+    println(cube(2.0))                  // 8
+
+    println("OK")
+}

@@ -6,7 +6,7 @@ import std.time.Calendar
 
 fun main() {
     // ── 闰年判定 ───────────────────────────────────────────────
-    println(std.time.Calendar.is_leap_year(2024))   // true
+    println(Calendar.is_leap_year(2024))   // true
     println(std.time.Calendar.is_leap_year(2023))   // false
     println(std.time.Calendar.is_leap_year(1900))   // false（100 倍数非 400）
     println(std.time.Calendar.is_leap_year(2000))    // true（400 倍数）

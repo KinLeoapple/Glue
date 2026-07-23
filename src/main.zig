@@ -11,7 +11,7 @@ const lexer = @import("lexer");
 const parser = @import("parser");
 const ast = @import("ast");
 const module_loader = @import("module_loader");
-const profiler = @import("profiler");
+const profiling = @import("profiler");
 const debug_allocator = @import("debug_allocator");
 const ir = @import("ir");
 const engine = @import("engine");
@@ -29,8 +29,10 @@ const Manifest = struct {
 const MANIFEST_NAME = "glue.toml";
 const DEFAULT_ENTRY = "src/Main.glue";
 
-var profiler_enabled: bool = false;
-var prof: profiler.Profiler = .{};
+var profile_enabled: bool = false;
+var profile_json_path: ?[]const u8 = null;
+var profile_interval_us: u64 = 0;
+var global_prof: profiling.GlobalProfiler = undefined;
 
 /// 向标准错误流打印格式化错误信息
 fn printError(io: std.Io, comptime fmt: []const u8, args: anytype) void {
@@ -51,7 +53,9 @@ fn printUsage(io: std.Io) void {
         \\  glue debug         Run with diagnostics (memory checking + runtime trace)
         \\
         \\Options:
-        \\  --profile          Dump full pipeline profile (phases + memory) after run
+        \\  --profile              Enable profiling instrumentation
+        \\  --profile-json=<path>  Write JSON report to file (implies --profile)
+        \\  --profile-interval=<us> Sampling interval in microseconds (default: 1000)
         \\
     , .{});
 }
@@ -75,7 +79,16 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "debug")) {
         for (args_slice[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--profile")) {
-                profiler_enabled = true;
+                profile_enabled = true;
+            } else if (std.mem.startsWith(u8, arg, "--profile-json=")) {
+                profile_enabled = true;
+                profile_json_path = arg["--profile-json=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--profile-interval=")) {
+                profile_interval_us = std.fmt.parseInt(u64, arg["--profile-interval=".len..], 10) catch {
+                    printError(io, "error: invalid --profile-interval value\n\n", .{});
+                    printUsage(io);
+                    std.process.exit(1);
+                };
             } else {
                 printError(io, "error: unknown option '{s}'\n\n", .{arg});
                 printUsage(io);
@@ -760,6 +773,11 @@ fn loadImportedDeclarations(
                     switch (pack_decl) {
                         .pack_decl => |pd| {
                             const sub_name = pd.name;
+                            // 跳过已加载的子模块（多个 import 涉及同 pack 时避免重复）
+                            const sub_key = std.fmt.allocPrint(allocator, "{s}/{s}", .{ module_name, sub_name }) catch continue;
+                            defer allocator.free(sub_key);
+                            if (loaded_submodules.contains(sub_key)) continue;
+                            loaded_submodules.put(try ast_arena.dupe(u8, sub_key), {}) catch continue;
 
                             // 读取子模块文件
                             const sub_path = try std.fmt.allocPrint(allocator, "{s}{s}{c}{s}.glue", .{ source_dir_with_sep, module_name, std.fs.path.sep, sub_name });
@@ -803,6 +821,20 @@ fn loadImportedDeclarations(
                                             local_renames.put(fd.name, mangled) catch continue;
                                         }
                                     },
+                                    .expr_decl => |ed| {
+                                        // 收集 pub val 声明的短名 → mangled name
+                                        if (ed.stmt) |st| {
+                                            switch (st.*) {
+                                                .val_decl => |vd| {
+                                                    if (vd.visibility == .public) {
+                                                        const mangled = std.fmt.allocPrint(ast_arena, "{s}.{s}.{s}", .{ module_name, sub_name, vd.name }) catch continue;
+                                                        local_renames.put(vd.name, mangled) catch continue;
+                                                    }
+                                                },
+                                                else => {},
+                                            }
+                                        }
+                                    },
                                     else => {},
                                 }
                             }
@@ -823,6 +855,35 @@ fn loadImportedDeclarations(
                                             var new_td = td;
                                             new_td.visibility = .private;
                                             try extra_decls.append(allocator, .{ .type_decl = new_td });
+                                        }
+                                    },
+                                    // 合并 pub val 声明（expr_decl 包装的 val_decl）
+                                    // 重命名 name 为 mangled name，重写 value 中的同模块短名调用
+                                    .expr_decl => |ed| {
+                                        if (ed.stmt) |st| {
+                                            switch (st.*) {
+                                                .val_decl => |vd| {
+                                                    if (vd.visibility == .public) {
+                                                        const mangled_name = local_renames.get(vd.name) orelse continue;
+                                                        const new_stmt = ast_arena.create(ast.Stmt) catch continue;
+                                                        new_stmt.* = .{ .val_decl = .{
+                                                            .name = mangled_name,
+                                                            .type_annotation = vd.type_annotation,
+                                                            .value = vd.value,
+                                                            .visibility = .private,
+                                                        } };
+                                                        rewriteModuleCalls(vd.value, &local_renames, &sibling_modules, ast_arena);
+                                                        const new_expr = ast_arena.create(ast.Expr) catch continue;
+                                                        new_expr.* = .{ .unit_literal = {} };
+                                                        try extra_decls.append(allocator, .{ .expr_decl = .{
+                                                            .location = ed.location,
+                                                            .expr = new_expr,
+                                                            .stmt = new_stmt,
+                                                        } });
+                                                    }
+                                                },
+                                                else => {},
+                                            }
                                         }
                                     },
                                     else => {},
@@ -858,23 +919,23 @@ fn executeSource(
 
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
-    prof.phaseBegin(.lex);
+    global_prof.phases.phaseBegin(.lex);
     const tokens = lex.tokenize() catch |err| {
-        prof.phaseEnd();
+        global_prof.phases.phaseEnd(.lex);
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         stderr_writer.interface.print("{s}: lexer error: {s}\n", .{ filename, @errorName(err) }) catch {};
         stderr_writer.flush() catch {};
         return .failed;
     };
-    prof.phaseEnd();
+    global_prof.phases.phaseEnd(.lex);
     defer allocator.free(tokens);
 
     var p = parser.Parser.init(allocator, tokens);
     defer p.deinit();
-    prof.phaseBegin(.parse);
+    global_prof.phases.phaseBegin(.parse);
     const module = p.parseModule(filename) catch {
-        prof.phaseEnd();
+        global_prof.phases.phaseEnd(.parse);
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         for (p.errors.items) |e| {
@@ -883,7 +944,7 @@ fn executeSource(
         stderr_writer.flush() catch {};
         return .failed;
     };
-    prof.phaseEnd();
+    global_prof.phases.phaseEnd(.parse);
     var entry_module = module;
     entry_module.source_path = filename;
 
@@ -913,13 +974,16 @@ fn executeSource(
     defer ast_arena_inst.deinit();
     const ast_arena = ast_arena_inst.allocator();
 
+    // 模块加载阶段
+    global_prof.phases.phaseBegin(.module_load);
     loadImportedDeclarations(allocator, io, &entry_module, filename, &retained_parsers, &retained_sources, &retained_tokens, ast_arena) catch {};
+    global_prof.phases.phaseEnd(.module_load);
 
     // sema 阶段（语义分析 + 图构建元信息产出）
     // TypeInferencer.checkModule 推断所有表达式类型并记录到 SemaResult.expr_types，
     // 供 IRBuilder 在图构建时读取（驱动式接入：sema 驱动 IR 构建）。
     // 硬失败：sema 检出任何类型错误则打印并终止管线，不进入 IR 构建。
-    prof.phaseBegin(.type_check);
+    global_prof.phases.phaseBegin(.type_check);
     var sema_result = ir.SemaResult.init(allocator);
     defer sema_result.deinit();
     {
@@ -934,16 +998,16 @@ fn executeSource(
                 stderr_writer.interface.print("{s}:{d}:{d}: sema error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
             }
             stderr_writer.flush() catch {};
-            prof.phaseEnd();
+            global_prof.phases.phaseEnd(.type_check);
             return .failed;
         }
     }
-    prof.phaseEnd();
+    global_prof.phases.phaseEnd(.type_check);
 
     // IR 构建阶段（AST → Glue IR 共享内存图）
-    prof.phaseBegin(.ir_build);
+    global_prof.phases.phaseBegin(.ir_build);
     var builder = ir.IRBuilder.init(allocator) catch |err| {
-        prof.phaseEnd();
+        global_prof.phases.phaseEnd(.ir_build);
         printError(io, "{s}: IR builder init error: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
@@ -953,6 +1017,7 @@ fn executeSource(
     // 纯函数 + 标量参数/返回 → compileCall 分配 memo_slot，Engine 运行时缓存结果
     var analysis_db = analysis_db_mod.AnalysisDB.init(allocator);
     defer analysis_db.deinit();
+    global_prof.phases.phaseBegin(.fused_analysis);
     {
         var fused = analysis_db_mod.FusedAnalysis.init(
             allocator,
@@ -970,10 +1035,13 @@ fn executeSource(
             printError(io, "fused analysis error: {s}\n", .{@errorName(err)});
         };
     }
+    global_prof.phases.phaseEnd(.fused_analysis);
     builder.setPurityDB(&analysis_db.purity);
     builder.setEscapeTable(&analysis_db.escape);
+    global_prof.phases.phaseBegin(.ir_build_core);
     var glue_ir = builder.build(entry_module) catch |err| {
-        prof.phaseEnd();
+        global_prof.phases.phaseEnd(.ir_build_core);
+        global_prof.phases.phaseEnd(.ir_build);
         printError(io, "{s}: IR build error: {s}\n", .{ filename, @errorName(err) });
         builder.deinit();
         return .failed;
@@ -981,28 +1049,39 @@ fn executeSource(
     // build() 成功后 arena 所有权转交 glue_ir，builder.deinit() 不再释放 arena
     builder.deinit();
     defer glue_ir.deinit();
-    prof.phaseEnd();
+    global_prof.phases.phaseEnd(.ir_build_core);
+    global_prof.phases.phaseEnd(.ir_build);
 
     // IR 优化阶段（常量折叠 + 死节点消除 + 向量融合 + 通道活跃性）
-    prof.phaseBegin(.ir_optimize);
+    global_prof.phases.phaseBegin(.ir_optimize);
     _ = ir.optimize(&glue_ir);
-    prof.phaseEnd();
+    global_prof.phases.phaseEnd(.ir_optimize);
 
     // 引擎执行阶段
-    prof.phaseBegin(.engine_run);
-    var eng = engine.Engine.initOwned(&glue_ir, allocator) catch |err| {
-        prof.phaseEnd();
+    global_prof.phases.phaseBegin(.engine_run);
+    global_prof.phases.phaseBegin(.engine_setup);
+    var eng = engine.Engine.initOwned(&glue_ir, allocator, &global_prof) catch |err| {
+        global_prof.phases.phaseEnd(.engine_setup);
+        global_prof.phases.phaseEnd(.engine_run);
         printError(io, "{s}: engine init error: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
-    defer eng.deinit();
     eng.io = io; // 注入 IO 接口供内置 print/println 使用
+    global_prof.phases.phaseEnd(.engine_setup);
+    defer {
+        global_prof.phases.phaseBegin(.engine_teardown);
+        eng.deinit();
+        global_prof.phases.phaseEnd(.engine_teardown);
+        global_prof.phases.phaseEnd(.engine_run);
+    }
 
+    global_prof.phases.phaseBegin(.engine_exec);
     const result = eng.run() catch |err| {
-        prof.phaseEnd();
+        global_prof.phases.phaseEnd(.engine_exec);
         printError(io, "{s}: execution error: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
+    global_prof.phases.phaseEnd(.engine_exec);
 
     // 输出 main 函数返回值（unit/null 类型不打印）
     const ret_chan_type = glue_ir.channels.get(eng.result_chan).chan_type;
@@ -1012,7 +1091,6 @@ fn executeSource(
         stdout_writer.interface.print("{d}\n", .{result}) catch {};
         stdout_writer.flush() catch {};
     }
-    prof.phaseEnd();
 
     return .ran_main;
 }
@@ -1021,7 +1099,9 @@ fn executeSource(
 fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
     var loader = module_loader.ModuleLoader.init(allocator, io);
     defer loader.deinit();
-    prof = profiler.Profiler.init(profiler_enabled, io);
+    global_prof = try profiling.GlobalProfiler.init(allocator, profile_enabled, profile_interval_us, profile_json_path);
+    defer global_prof.deinit();
+    try global_prof.start();
 
     const Ctx = struct {
         allocator: std.mem.Allocator,
@@ -1049,9 +1129,7 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
         ctx.outcome = executeSource(allocator, &loader, io, source, entry_path);
     }
 
-    if (profiler_enabled) {
-        prof.dump(io);
-    }
+    global_prof.dump(io);
     if (ctx.outcome == .failed) {
         loader.deinit();
         std.process.exit(1);
@@ -1068,7 +1146,9 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
     {
         var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
         defer loader.deinit();
-        prof = profiler.Profiler.init(profiler_enabled, io);
+        global_prof = try profiling.GlobalProfiler.init(dbg_alloc, profile_enabled, profile_interval_us, profile_json_path);
+        defer global_prof.deinit();
+        try global_prof.start();
 
         const Ctx = struct {
             allocator: std.mem.Allocator,
@@ -1096,9 +1176,7 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
             ctx.outcome = executeSource(dbg_alloc, &loader, io, source, entry_path);
         }
 
-        if (profiler_enabled) {
-            prof.dump(io);
-        }
+        global_prof.dump(io);
     }
     const leaked = dbg.deinit();
     if (leaked == .leak) {

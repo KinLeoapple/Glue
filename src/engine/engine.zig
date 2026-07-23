@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const ir_mod = @import("ir");
 const mem = @import("mem");
 const value = @import("value");
+const profiling = @import("profiling");
 const runtime_mod = @import("runtime.zig");
 const syscall_dispatch = @import("syscall");
 
@@ -330,10 +331,6 @@ pub const Engine = struct {
     /// 超过后不再插入新条目（简单有效的容量控制）
     memo_capacity: u32 = 65536,
 
-    /// Memoization 命中/未命中统计（调试用，可在 --profile 中输出）
-    memo_hits: u64 = 0,
-    memo_misses: u64 = 0,
-
     /// 堆对象跟踪表（引擎创建的所有堆对象，deinit 时统一释放）
     /// 去重通过 ObjHeader.flags 的 TRACKED 位完成，无需 HashMap
     tracked_objs: std.ArrayList(*value.obj_header.ObjHeader) = .empty,
@@ -360,7 +357,7 @@ pub const Engine = struct {
             .owns_tctx = false,
             .global = tctx.global,
             .owns_global = false,
-            .runtime = Runtime.init(&tctx.channels, backing),
+            .runtime = Runtime.init(&tctx.channels, backing, tctx.prof),
             .call_stack = stack,
             .body_skip_cache = cache,
             .loop_active_cache = lcache,
@@ -371,13 +368,14 @@ pub const Engine = struct {
     }
 
     /// 初始化引擎（内部创建 ThreadContext，用于简单场景）
-    pub fn initOwned(ir: *GlueIR, backing: std.mem.Allocator) !Engine {
+    /// global_prof 非 null 且 enabled 时，ThreadContext 会创建并注册 ThreadProfiler
+    pub fn initOwned(ir: *GlueIR, backing: std.mem.Allocator, global_prof: ?*profiling.GlobalProfiler) !Engine {
         // 注册所有堆对象的析构函数（确保 release 时正确分派）
         value.registerAllDeinits();
         const global = try backing.create(GlobalPool);
         global.* = GlobalPool.init(backing);
         const tctx = try backing.create(ThreadContext);
-        tctx.* = ThreadContext.init(global, backing);
+        tctx.* = try ThreadContext.init(global, backing, global_prof);
         const stack = try backing.alloc(Frame, MAX_CALL_DEPTH);
         const cache = try backing.alloc(?[]bool, ir.functions.len);
         @memset(cache, null);
@@ -395,7 +393,7 @@ pub const Engine = struct {
             .owns_tctx = true,
             .global = global,
             .owns_global = true,
-            .runtime = Runtime.init(&tctx.channels, backing),
+            .runtime = Runtime.init(&tctx.channels, backing, tctx.prof),
             .call_stack = stack,
             .body_skip_cache = cache,
             .loop_active_cache = lcache,
@@ -2162,7 +2160,7 @@ pub const Engine = struct {
             }
         }
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
-        _ = v.retain();
+        _ = v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
         if (debug_record) {
@@ -2181,7 +2179,7 @@ pub const Engine = struct {
         const err_val: *value.ErrorValue = @alignCast(@fieldParentPtr("header", err_v.asRef()));
 
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .err = err_val }) catch return error.OutOfMemory;
-        _ = value.obj_header.retain(&err_val.header);
+        _ = value.obj_header.retain(&err_val.header, self.tctx.?);
         try self.trackObj(throw_v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
     }
@@ -2681,9 +2679,9 @@ pub const Engine = struct {
         try self.trackObj(empty.asRef());
         // 同一 ArrayValue 存入 4 个字段，需 retain 3 次（总 RC=4）
         // 避免 RecordValue.deinit 第 1 次 release 释放后，后续 3 次 release 访问已释放内存
-        _ = value.obj_header.retain(empty.ref);
-        _ = value.obj_header.retain(empty.ref);
-        _ = value.obj_header.retain(empty.ref);
+        _ = value.obj_header.retain(empty.ref, self.tctx.?);
+        _ = value.obj_header.retain(empty.ref, self.tctx.?);
+        _ = value.obj_header.retain(empty.ref, self.tctx.?);
         var fields = [_]value.Value{ empty, empty, empty, empty };
         const rec = value.Value.makeRecord(tctx, "TraitImplInfo", &fields) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
@@ -3090,7 +3088,7 @@ pub const Engine = struct {
     fn execNewtypeWrap(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
         const inner = self.chanToValue(val_chan);
-        _ = inner.retain();
+        _ = inner.retain(self.tctx.?);
 
         // 从 meta 获取类型名
         var type_name: []const u8 = "Newtype";
@@ -3480,7 +3478,7 @@ pub const Engine = struct {
             const obj_ptr: ?*anyopaque = @ptrCast(@alignCast(@as(*?*anyopaque, @ptrCast(@alignCast(src))).*));
             if (obj_ptr) |p| {
                 const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(p));
-                _ = value.obj_header.retain(header);
+                _ = value.obj_header.retain(header, self.tctx.?);
             }
         } else if (src_w > 0 and src_w <= 16) {
             // 标量：装箱到 BoxedScalar，存储通道索引（使回写生效）
@@ -3489,9 +3487,7 @@ pub const Engine = struct {
             const total = @sizeOf(value.obj_header.ObjHeader) + 8; // 8B 对齐存储 channel_index
             const buf = tctx.allocObj(total) catch return error.OutOfMemory;
             const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(buf.ptr));
-            header.type_tag = .boxed_scalar;
-            header.flags = 0;
-            header.rc = 1;
+            value.obj_header.initObjHeader(header, .boxed_scalar, total, false, tctx);
             // 存储源通道索引到 ObjHeader 之后（使 ref_get/ref_set 能回写到原始通道）
             const chan_idx_ptr: *u16 = @ptrCast(@alignCast(buf.ptr + @sizeOf(value.obj_header.ObjHeader)));
             chan_idx_ptr.* = src_chan;
@@ -3534,7 +3530,7 @@ pub const Engine = struct {
                 if (dst_w == 8) {
                     const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));
                     dst_ptr.* = obj_ptr;
-                    _ = value.obj_header.retain(header);
+                    _ = value.obj_header.retain(header, self.tctx.?);
                 }
             },
         }
@@ -3706,7 +3702,7 @@ pub const Engine = struct {
             // src_chan 已经是 str 引用（IR 中先 builtin_str 再 cast_try_to）
             const v = self.chanToValue(src_chan);
             const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
-            _ = v.retain();
+            _ = v.retain(self.tctx.?);
             try self.trackObj(throw_v.asRef());
             self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
             return;
@@ -3743,7 +3739,7 @@ pub const Engine = struct {
         // 直接从字节构造 Value，避免 ref_chan 上 chanToValue 把标量字节误读为指针
         const ok_v = scalarBytesToValue(dst_tag, result);
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = ok_v }) catch return error.OutOfMemory;
-        _ = ok_v.retain();
+        _ = ok_v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
     }
@@ -3761,7 +3757,7 @@ pub const Engine = struct {
         // 成功 → 直接从字节构造 Value，包装为 Throw.ok
         const ok_v = scalarBytesToValue(dst_tag, parse_result);
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = ok_v }) catch return error.OutOfMemory;
-        _ = ok_v.retain();
+        _ = ok_v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
     }
@@ -3815,7 +3811,7 @@ pub const Engine = struct {
         try self.trackObj(cast_err_v.asRef());
         // CastError 是 error_newtype，RecordValue.header.type_tag 已是 .record
         // 4 字段：retain 引用计数
-        for (fields_buf) |fv| _ = value.obj_header.retain(fv.asRef());
+        for (fields_buf) |fv| _ = value.obj_header.retain(fv.asRef(), self.tctx.?);
 
         // 包装为 ErrorValue（is_error_subtype=true）使 throw 路径能识别
         // 但 Phase 2 中 throw 直接处理 .record 类型，所以这里直接构造 ThrowValue.err 指向 RecordValue
@@ -3826,7 +3822,7 @@ pub const Engine = struct {
 
         // ThrowValue.err 持有 ErrorValue 指针
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .err = err_val }) catch return error.OutOfMemory;
-        _ = value.obj_header.retain(&err_val.header);
+        _ = value.obj_header.retain(&err_val.header, self.tctx.?);
         try self.trackObj(throw_v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
     }
@@ -4385,7 +4381,7 @@ pub const Engine = struct {
     /// - is_ref = false：普通类型，深拷贝生成独立副本。
     fn cloneValueForContainer(self: *Engine, v: value.Value, is_ref: bool) EngineError!value.Value {
         if (is_ref) {
-            if (v.isBoxed()) _ = v.retain();
+            if (v.isBoxed()) _ = v.retain(self.tctx.?);
             return v;
         }
         const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
@@ -4577,7 +4573,7 @@ pub const Engine = struct {
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
             @memcpy(elems_ptr[0..n], elements);
             arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null, .elem_is_ref = elem_is_ref };
-            arr.header.markArenaAllocated();
+            value.obj_header.initObjHeader(&arr.header, .array, total, true, self.tctx.?);
             break :blk value.Value.fromRef(&arr.header);
         } else
             value.Value.makeArrayEx(self.tctx.?, elements, null, elem_is_ref) catch return error.OutOfMemory;
@@ -4687,7 +4683,7 @@ pub const Engine = struct {
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
             @memcpy(elems_ptr[0..new_len], new_elements);
             arr.* = .{ .elements = elems_ptr[0..new_len], .capacity = new_len, .fixed_size = null, .elem_is_ref = elem_is_ref };
-            arr.header.markArenaAllocated();
+            value.obj_header.initObjHeader(&arr.header, .array, total, true, self.tctx.?);
             break :blk value.Value.fromRef(&arr.header);
         } else
             value.Value.makeArrayEx(self.tctx.?, new_elements, null, elem_is_ref) catch return error.OutOfMemory;
@@ -4728,7 +4724,7 @@ pub const Engine = struct {
                 }
             }
             arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null, .elem_is_ref = elem_is_ref };
-            arr.header.markArenaAllocated();
+            value.obj_header.initObjHeader(&arr.header, .array, total, true, self.tctx.?);
             break :blk value.Value.fromRef(&arr.header);
         } else blk: {
             // 非 arena 路径：先分配临时数组，按元素类型语义填充
@@ -4795,7 +4791,7 @@ pub const Engine = struct {
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
             @memcpy(elems_ptr[0..new_len], new_elements);
             new_arr.* = .{ .elements = elems_ptr[0..new_len], .capacity = new_len, .fixed_size = null, .elem_is_ref = elem_is_ref };
-            new_arr.header.markArenaAllocated();
+            value.obj_header.initObjHeader(&new_arr.header, .array, total, true, self.tctx.?);
             break :blk value.Value.fromRef(&new_arr.header);
         } else
             value.Value.makeArrayEx(self.tctx.?, new_elements, null, elem_is_ref) catch return error.OutOfMemory;
@@ -4989,7 +4985,7 @@ pub const Engine = struct {
             const elems_ptr: [*]value.Value = @ptrCast(@alignCast(arena_mem.ptr + @sizeOf(value.ArrayValue)));
             @memcpy(elems_ptr[0..n], tmp);
             arr.* = .{ .elements = elems_ptr[0..n], .capacity = n, .fixed_size = null };
-            arr.header.markArenaAllocated();
+            value.obj_header.initObjHeader(&arr.header, .array, total, true, self.tctx.?);
             break :blk value.Value.fromRef(&arr.header);
         } else
             value.Value.makeArray(self.tctx.?, tmp, null) catch return error.OutOfMemory;
@@ -5073,7 +5069,7 @@ pub const Engine = struct {
         // 初始化 fields 为 unit（连续内存，单次 memset）
         @memset(f_ptr[0..field_count], value.Value.unit);
         rec.* = .{ .type_name = type_name, .fields = f_ptr[0..field_count], .field_ref_bits = field_ref_bits };
-        if (use_arena) rec.header.markArenaAllocated();
+        value.obj_header.initObjHeader(&rec.header, .record, total, use_arena, self.tctx.?);
         const v = value.Value.fromRef(&rec.header);
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
@@ -5250,6 +5246,7 @@ pub const Engine = struct {
             .field_names = base_rec.field_names,
             .field_ref_bits = base_rec.field_ref_bits,
         };
+        value.obj_header.initObjHeader(&new_rec.header, .record, alloc_total, false, self.tctx.?);
         const v = value.Value.fromRef(&new_rec.header);
         try self.trackObj(v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
@@ -5262,6 +5259,13 @@ pub const Engine = struct {
     fn execCall(self: *Engine, node: *const Node) EngineError!void {
         if (node.meta_index == 0 or node.meta_index > self.ir.call_metas.len) return error.InvalidMetaIndex;
         const call_meta = self.ir.call_metas[node.meta_index - 1];
+
+        // Profiling: function call/ret 事件（精确重建 per-function 统计）
+        if (self.tctx.?.prof) |prof| {
+            prof.onFuncCall(call_meta.func_index);
+            prof.setCurrentFunc(call_meta.func_index);
+        }
+        defer if (self.tctx.?.prof) |prof| prof.onFuncRet(call_meta.func_index);
 
         if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
 
@@ -5281,10 +5285,10 @@ pub const Engine = struct {
                     const dst = self.runtime.rawPtr(node.output);
                     @memcpy(dst[0..entry.width], entry.bytes[0..entry.width]);
                 }
-                self.memo_hits += 1;
+                if (self.tctx.?.prof) |prof| prof.recordMemo(true);
                 return;
             }
-            self.memo_misses += 1;
+            if (self.tctx.?.prof) |prof| prof.recordMemo(false);
             // 未命中：执行函数，结束后缓存结果
             const memo_key = key;
 
@@ -7652,8 +7656,8 @@ pub const Engine = struct {
                 try self.readScalarValue(right_chan),
             };
             // 所有权转移给 RecordValue，先增加引用计数
-            _ = fields[0].retain();
-            _ = fields[1].retain();
+            _ = fields[0].retain(self.tctx.?);
+            _ = fields[1].retain(self.tctx.?);
             const pair = value.Value.makeRecordWithNames(
                 self.tctx.?,
                 "Pair",
@@ -7874,7 +7878,7 @@ pub const Engine = struct {
         // 读取值并构造 ThrowValue{ .ok = value }
         const v = try self.readScalarValue(val_chan);
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
-        _ = v.retain();
+        _ = v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
     }
@@ -7934,7 +7938,7 @@ pub const Engine = struct {
         };
 
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .err = err_val }) catch return error.OutOfMemory;
-        _ = value.obj_header.retain(&err_val.header);
+        _ = value.obj_header.retain(&err_val.header, self.tctx.?);
         try self.trackObj(throw_v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
     }
@@ -8148,10 +8152,10 @@ pub const Engine = struct {
             .env = undefined,
             .thunk = closure,
         };
-        if (use_arena) lazy.header.markArenaAllocated();
+        value.obj_header.initObjHeader(&lazy.header, .lazy_val, @sizeOf(value.LazyValue), use_arena, self.tctx.?);
         try self.trackObj(&lazy.header);
         // LazyValue 持有 thunk 闭包的一次引用
-        _ = (value.Value{ .ref = &closure.header }).retain();
+        _ = (value.Value{ .ref = &closure.header }).retain(self.tctx.?);
         self.runtime.writePtr(node.output, @ptrCast(&lazy.header));
     }
 
@@ -8209,7 +8213,7 @@ pub const Engine = struct {
         // 缓存结果，避免重复求值
         lazy.forced = true;
         lazy.cached = result;
-        _ = result.retain();
+        _ = result.retain(self.tctx.?);
         return result;
     }
 
@@ -8632,6 +8636,7 @@ pub const Engine = struct {
         // 创建 AsyncHandle
         const handle = self.tctx.?.createObj(value.AsyncHandle) catch return error.OutOfMemory;
         handle.* = value.AsyncHandle.init();
+        value.obj_header.initObjHeader(&handle.header, .async_val, @sizeOf(value.AsyncHandle), false, self.tctx.?);
         try self.trackObj(&handle.header);
 
         // 读取参数值：标量按原始字节拷贝（保留完整位模式，支持 f16..f128/i128），
@@ -8672,6 +8677,7 @@ pub const Engine = struct {
             .handle = handle,
             .global = self.global.?,
             .backing = self.tctx.?.backing,
+            .global_prof = self.tctx.?.global_prof,
         };
 
         // spawn 线程执行 async 函数
@@ -8818,7 +8824,8 @@ pub const Engine = struct {
         const ch = self.readChannelValue(node.inputs[0]) orelse return error.InvalidChannel;
         const sender = self.tctx.?.createObj(value.SenderValue) catch return error.OutOfMemory;
         sender.* = .{ .channel = ch };
-        _ = value.obj_header.retain(&ch.header);
+        value.obj_header.initObjHeader(&sender.header, .sender_val, @sizeOf(value.SenderValue), false, self.tctx.?);
+        _ = value.obj_header.retain(&ch.header, self.tctx.?);
         try self.trackObj(&sender.header);
         self.runtime.writePtr(node.output, @ptrCast(&sender.header));
     }
@@ -8828,7 +8835,8 @@ pub const Engine = struct {
         const ch = self.readChannelValue(node.inputs[0]) orelse return error.InvalidChannel;
         const receiver = self.tctx.?.createObj(value.ReceiverValue) catch return error.OutOfMemory;
         receiver.* = .{ .channel = ch };
-        _ = value.obj_header.retain(&ch.header);
+        value.obj_header.initObjHeader(&receiver.header, .receiver_val, @sizeOf(value.ReceiverValue), false, self.tctx.?);
+        _ = value.obj_header.retain(&ch.header, self.tctx.?);
         try self.trackObj(&receiver.header);
         self.runtime.writePtr(node.output, @ptrCast(&receiver.header));
     }
@@ -8839,6 +8847,7 @@ pub const Engine = struct {
         const init_val = self.chanToValue(node.inputs[0]);
         const av = self.tctx.?.createObj(value.AtomicValue) catch return error.OutOfMemory;
         av.* = .{ .data = init_val, .mutex = .{} };
+        value.obj_header.initObjHeader(&av.header, .atomic_val, @sizeOf(value.AtomicValue), false, self.tctx.?);
         try self.trackObj(&av.header);
         self.runtime.writePtr(node.output, @ptrCast(&av.header));
     }
@@ -8975,7 +8984,7 @@ pub const Engine = struct {
             .upvalue_ref_bits = cm.upvalue_ref_bits,
             .cell_upvalues = cm.cell_upvalues,
         };
-        if (use_arena) closure.header.markArenaAllocated();
+        value.obj_header.initObjHeader(&closure.header, .closure, total, use_arena, self.tctx.?);
         try self.trackObj(&closure.header);
         self.runtime.writePtr(node.output, @ptrCast(&closure.header));
 
@@ -8991,7 +9000,7 @@ pub const Engine = struct {
                 if (is_cell or is_ref) {
                     // cell / &T / *T 上值保持引用语义，共享原对象
                     upvalues[i] = v;
-                    _ = upvalues[i].retain();
+                    _ = upvalues[i].retain(self.tctx.?);
                 } else {
                     // 普通复合类型上值：深拷贝以获得独立所有权
                     const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
@@ -9017,7 +9026,7 @@ pub const Engine = struct {
             const v = self.chanToValue(arg_chan);
             const is_ref = (pm.bound_arg_ref_bits >> @intCast(i)) & 1 == 1;
             if (is_ref) {
-                bound_args[i] = v.retain();
+                bound_args[i] = v.retain(self.tctx.?);
             } else {
                 const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                 try self.trackValueTree(copied);
@@ -9056,6 +9065,14 @@ pub const Engine = struct {
             const func_idx: u16 = @intCast(@intFromPtr(pa.func) - 1);
             if (func_idx >= self.ir.functions.len) return error.InvalidMetaIndex;
             const callee_func = self.ir.functions[func_idx];
+
+            // Profiling: partial application 调用事件
+            if (self.tctx.?.prof) |prof| {
+                prof.onFuncCall(func_idx);
+                prof.setCurrentFunc(func_idx);
+            }
+            defer if (self.tctx.?.prof) |prof| prof.onFuncRet(func_idx);
+
             return try self.execPartialApplicationCall(node, call_meta, callee_func, func_idx, pa);
         }
 
@@ -9064,6 +9081,13 @@ pub const Engine = struct {
 
         if (func_idx >= self.ir.functions.len) return error.InvalidMetaIndex;
         const callee_func = self.ir.functions[func_idx];
+
+        // Profiling: closure 调用事件
+        if (self.tctx.?.prof) |prof| {
+            prof.onFuncCall(func_idx);
+            prof.setCurrentFunc(func_idx);
+        }
+        defer if (self.tctx.?.prof) |prof| prof.onFuncRet(func_idx);
 
         if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
 
@@ -9217,6 +9241,8 @@ const OrbitThreadData = struct {
     handle: *value.AsyncHandle,
     global: *GlobalPool,
     backing: std.mem.Allocator,
+    /// GlobalProfiler 引用（worker 线程创建 ThreadProfiler 用，null 时不采集）
+    global_prof: ?*profiling.GlobalProfiler = null,
 };
 
 /// 星轨 worker 线程函数：在独立线程中执行 async 函数
@@ -9228,7 +9254,11 @@ fn orbitWorker(data: *OrbitThreadData) void {
     const handle = data.handle; // 保存 handle 指针，因为 data 会在 setResult 前释放
 
     // 创建 worker 线程独立的 ThreadContext（每线程独立，零锁热路径）
-    var tctx = ThreadContext.init(data.global, alloc);
+    var tctx = ThreadContext.init(data.global, alloc, data.global_prof) catch {
+        alloc.destroy(data);
+        handle.setPanic("Failed to init ThreadContext");
+        return;
+    };
     defer tctx.deinit();
 
     // 使用 Engine.init（外部 tctx），错误路径通过 setPanic 记录原因
@@ -9358,7 +9388,7 @@ test "执行 const_i + halt_return" {
     var ir = try buildIRFromSource("fun main() { 42 }");
     defer ir.deinit();
 
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
 
     const result = try engine.run();
@@ -9370,7 +9400,7 @@ test "执行整数加法" {
     var ir = try buildIRFromSource("fun main() { 1 + 2 }");
     defer ir.deinit();
 
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
 
     const result = try engine.run();
@@ -9380,7 +9410,7 @@ test "执行整数加法" {
 test "执行整数减法" {
     var ir = try buildIRFromSource("fun main() { 10 - 4 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 6), try engine.run());
 }
@@ -9388,7 +9418,7 @@ test "执行整数减法" {
 test "执行整数乘法" {
     var ir = try buildIRFromSource("fun main() { 6 * 7 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -9396,7 +9426,7 @@ test "执行整数乘法" {
 test "执行整数除法" {
     var ir = try buildIRFromSource("fun main() { 20 / 4 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 5), try engine.run());
 }
@@ -9404,7 +9434,7 @@ test "执行整数除法" {
 test "执行整数取模" {
     var ir = try buildIRFromSource("fun main() { 17 % 5 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 2), try engine.run());
 }
@@ -9413,7 +9443,7 @@ test "执行嵌套表达式" {
     // 1 + 2 * 3 = 7
     var ir = try buildIRFromSource("fun main() { 1 + 2 * 3 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 7), try engine.run());
 }
@@ -9422,7 +9452,7 @@ test "执行比较运算" {
     // 3 < 5 → true → 1
     var ir = try buildIRFromSource("fun main() { 3 < 5 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 1), result);
@@ -9432,7 +9462,7 @@ test "执行布尔逻辑" {
     // true && false → false → 0
     var ir = try buildIRFromSource("fun main() { true && false }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 0), result);
@@ -9442,7 +9472,7 @@ test "执行 val 变量绑定" {
     // val x = 10, val y = 20, x + y
     var ir = try buildIRFromSource("fun main() { val x = 10; val y = 20; x + y }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 30), try engine.run());
 }
@@ -9455,7 +9485,7 @@ test "执行函数调用" {
         \\fun main() { add(3, 4) }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 7), try engine.run());
 }
@@ -9468,7 +9498,7 @@ test "执行优化后的常量折叠" {
     // 优化
     _ = ir_mod.optimize(&ir);
 
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 3), try engine.run());
 }
@@ -9481,7 +9511,7 @@ test "Phase 2: var 声明与赋值" {
     // var x = 10; x = 20; x
     var ir = try buildIRFromSource("fun main() { var x = 10; x = 20; x }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 20), try engine.run());
 }
@@ -9490,7 +9520,7 @@ test "Phase 2: 复合赋值 += " {
     // var x = 10; x += 5; x
     var ir = try buildIRFromSource("fun main() { var x = 10; x += 5; x }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 15), try engine.run());
 }
@@ -9499,7 +9529,7 @@ test "Phase 2: 复合赋值 *=" {
     // var x = 3; x *= 7; x
     var ir = try buildIRFromSource("fun main() { var x = 3; x *= 7; x }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 21), try engine.run());
 }
@@ -9508,7 +9538,7 @@ test "Phase 2: if 表达式 then 分支" {
     // if true { 42 } else { 0 }
     var ir = try buildIRFromSource("fun main() { if true { 42 } else { 0 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -9517,7 +9547,7 @@ test "Phase 2: if 表达式 else 分支" {
     // if 3 > 5 { 42 } else { 99 }
     var ir = try buildIRFromSource("fun main() { if 3 > 5 { 42 } else { 99 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 99), try engine.run());
 }
@@ -9526,7 +9556,7 @@ test "Phase 2: if 表达式条件求值" {
     // val x = 10; if x > 5 { x * 2 } else { x }
     var ir = try buildIRFromSource("fun main() { val x = 10; if x > 5 { x * 2 } else { x } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 20), try engine.run());
 }
@@ -9535,7 +9565,7 @@ test "Phase 2: 类型转换 i64→i32" {
     // i32(1000)
     var ir = try buildIRFromSource("fun main() { i32(1000) }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 1000), result);
@@ -9545,7 +9575,7 @@ test "Phase 2: 类型转换 i64→f64" {
     // f64(42) → 42.0 → 位模式转回 i64 验证
     var ir = try buildIRFromSource("fun main() { f64(42) }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     // f64 通道的 8 字节读为 i64
     const result = try engine.run();
@@ -9557,7 +9587,7 @@ test "Phase 2: 嵌套 if 表达式" {
     // val x = 5; if x > 3 { if x > 4 { 100 } else { 200 } } else { 300 }
     var ir = try buildIRFromSource("fun main() { val x = 5; if x > 3 { if x > 4 { 100 } else { 200 } } else { 300 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 100), try engine.run());
 }
@@ -9566,7 +9596,7 @@ test "Phase 2: 嵌套 if（then 分支内嵌套，字面量条件）" {
     // if true { if false { 1 } else { 2 } } else { 3 } → 2
     var ir = try buildIRFromSource("fun main() { if true { if false { 1 } else { 2 } } else { 3 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 2), try engine.run());
 }
@@ -9575,7 +9605,7 @@ test "Phase 2: cast 链 i64→i32→i64" {
     // i64(i32(1000))
     var ir = try buildIRFromSource("fun main() { i64(i32(1000)) }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 1000), try engine.run());
 }
@@ -9584,7 +9614,7 @@ test "Phase 2: var 与 if 组合" {
     // var x = 1; if x > 0 { x = 10 }; x
     var ir = try buildIRFromSource("fun main() { var x = 1; if x > 0 { x = 10 }; x }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 10), try engine.run());
 }
@@ -9593,7 +9623,7 @@ test "Phase 2: 复合赋值 -= " {
     // var x = 100; x -= 30; x
     var ir = try buildIRFromSource("fun main() { var x = 100; x -= 30; x }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 70), try engine.run());
 }
@@ -9602,7 +9632,7 @@ test "Phase 2: 类型转换 i64→u8（窄化 wrap）" {
     // u8(300) → 300 wrap to u8 = 44
     var ir = try buildIRFromSource("fun main() { u8(300) }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     // u8 通道读 1 字节，零扩展为 i64
@@ -9617,7 +9647,7 @@ test "Phase 2.5: 字符串字面量" {
     // "hello" → 创建 Str 堆对象
     var ir = try buildIRFromSource("fun main() { \"hello\" }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.runStr();
     try testing.expectEqualStrings("hello", result);
@@ -9627,7 +9657,7 @@ test "Phase 2.5: 字符串拼接 (+)" {
     // "hello" + "world"
     var ir = try buildIRFromSource("fun main() { \"hello\" + \"world\" }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.runStr();
     try testing.expectEqualStrings("helloworld", result);
@@ -9637,7 +9667,7 @@ test "Phase 2.5: 字符串拼接 (++)" {
     // "foo" ++ "bar"
     var ir = try buildIRFromSource("fun main() { \"foo\" ++ \"bar\" }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.runStr();
     try testing.expectEqualStrings("foobar", result);
@@ -9650,7 +9680,7 @@ test "Phase 2.5: 字符串长度" {
     // 此测试验证 const_str + string_len 的端到端流程
     var ir = try buildIRFromSource("fun main() { \"hello\" + \"world\" }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.runStr();
     try testing.expectEqual(@as(usize, 10), result.len);
@@ -9660,7 +9690,7 @@ test "Phase 2.5: 三字符串拼接" {
     // "a" + "b" + "c"
     var ir = try buildIRFromSource("fun main() { \"a\" + \"b\" + \"c\" }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.runStr();
     try testing.expectEqualStrings("abc", result);
@@ -9670,7 +9700,7 @@ test "Phase 2.5: 空字符串拼接" {
     // "" + "x"
     var ir = try buildIRFromSource("fun main() { \"\" + \"x\" }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.runStr();
     try testing.expectEqualStrings("x", result);
@@ -9700,7 +9730,7 @@ test "Phase 2.5: 数组索引访问" {
     // [10, 20, 30][1] → 20
     var ir = try buildIRFromSource("fun main() { [10, 20, 30][1] }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 20), try engine.run());
 }
@@ -9709,7 +9739,7 @@ test "Phase 2.5: record 字面量与字段访问" {
     // (x: 1, y: 2).x → 1
     var ir = try buildIRFromSource("fun main() { (x: 1, y: 2).x }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 1), try engine.run());
 }
@@ -9718,7 +9748,7 @@ test "Phase 2.5: record 多字段访问" {
     // (a: 10, b: 20, c: 30).b → 20
     var ir = try buildIRFromSource("fun main() { (a: 10, b: 20, c: 30).b }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 20), try engine.run());
 }
@@ -9727,7 +9757,7 @@ test "Phase 2.5: record 字段覆盖" {
     // (x: 1, y: 2).y → 2
     var ir = try buildIRFromSource("fun main() { (x: 1, y: 2).y }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 2), try engine.run());
 }
@@ -9736,7 +9766,7 @@ test "Phase 2.5: 字符串索引" {
     // "hello"[0] → 'h' = 104
     var ir = try buildIRFromSource("fun main() { \"hello\"[0] }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     // char 通道返回 u21，但 run() 按通道宽度读取
     // char_chan 宽度为 4 字节，按 i32 读取
@@ -9748,7 +9778,7 @@ test "Phase 2.5: 字符串插值" {
     // "hello {"world"}" → "hello world"
     var ir = try buildIRFromSource("fun main() { \"hello {\"world\"}\" }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.runStr();
     try testing.expectEqualStrings("hello world", result);
@@ -9758,7 +9788,7 @@ test "Phase 2.5: 字符串插值多段" {
     // "{"a"}b{"c"}" → "abc"
     var ir = try buildIRFromSource("fun main() { \"{\"a\"}b{\"c\"}\" }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.runStr();
     try testing.expectEqualStrings("abc", result);
@@ -9773,7 +9803,7 @@ test "Phase 3: for range 向量化 identity map" {
     // sink_last 取最后一个元素 = 9
     var ir = try buildIRFromSource("fun main() { for i in 0..10 { i } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 9), result);
@@ -9783,7 +9813,7 @@ test "Phase 3: for range 带运算 i * 2" {
     // for i in 0..5 { i * 2 } → [0,2,4,6,8], sink_last = 8
     var ir = try buildIRFromSource("fun main() { for i in 0..5 { i * 2 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 8), result);
@@ -9793,7 +9823,7 @@ test "Phase 3: for range 带运算 i + 10" {
     // for i in 1..4 { i + 10 } → [11,12,13], sink_last = 13
     var ir = try buildIRFromSource("fun main() { for i in 1..4 { i + 10 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 13), result);
@@ -9803,7 +9833,7 @@ test "Phase 3: for range 单元素" {
     // for i in 0..1 { i } → [0], sink_last = 0
     var ir = try buildIRFromSource("fun main() { for i in 0..1 { i } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 0), result);
@@ -9813,7 +9843,7 @@ test "Phase 3: for range 复杂表达式" {
     // for i in 0..5 { (i + 1) * 3 } → [3,6,9,12,15], sink_last = 15
     var ir = try buildIRFromSource("fun main() { for i in 0..5 { (i + 1) * 3 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 15), result);
@@ -9831,7 +9861,7 @@ test "Phase 4: defer 在 return 前执行" {
         "fun cleanup() { 0 } fun main() { defer cleanup(); 42 }",
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 42), result);
@@ -9843,7 +9873,7 @@ test "Phase 4: 多个 defer LIFO 执行" {
         "fun a() { 0 } fun b() { 0 } fun main() { defer a(); defer b(); 99 }",
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 99), result);
@@ -9856,7 +9886,7 @@ test "Phase 4: defer 带 var 赋值" {
         "fun cleanup() { 0 } fun main() { var x = 1; defer cleanup(); x }",
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     // x 的值在 defer 执行前就已经作为返回值
     const result = try engine.run();
@@ -9867,7 +9897,7 @@ test "Phase 4: throw 触发 halt_throw" {
     // throw 语句触发 halt_throw，run() 返回 error.Thrown
     var ir = try buildIRFromSource("fun main() { throw 42 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectError(error.Thrown, engine.run());
 }
@@ -9881,7 +9911,7 @@ test "Phase 5: select 第一个分支就绪" {
     // 非 ChannelValue 输入视为始终就绪，第一个分支胜出 → body 返回 10
     var ir = try buildIRFromSource("fun main() { select { 1 => v => 10; 2 => v => 20 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 10), result);
@@ -9892,7 +9922,7 @@ test "Phase 5: select 单分支" {
     // 单个分支，胜出后执行 body 返回 99
     var ir = try buildIRFromSource("fun main() { select { 42 => v => 99 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 99), result);
@@ -9903,7 +9933,7 @@ test "Phase 5: select 带 timeout 分支" {
     // timeout arm 的 duration 被当作普通表达式编译，body 返回 42
     var ir = try buildIRFromSource("fun main() { select { timeout(1000) => 42 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 42), result);
@@ -9914,7 +9944,7 @@ test "Phase 5: select body 带运算" {
     // body 包含运算，结果为 12
     var ir = try buildIRFromSource("fun main() { select { 1 => v => 3 * 4 } }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 12), result);
@@ -9929,7 +9959,7 @@ test "Phase 6: Elvis 整数默认值" {
     // 1 ?? 99 → 1
     var ir = try buildIRFromSource("fun main() { 1 ?? 99 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 1), result);
@@ -9940,7 +9970,7 @@ test "Phase 6: non_null_assert 整数透传" {
     // 42! → 42
     var ir = try buildIRFromSource("fun main() { 42! }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 42), result);
@@ -9950,7 +9980,7 @@ test "Phase 6: Elvis 链式表达式" {
     // (1 + 2) ?? 99 → 3
     var ir = try buildIRFromSource("fun main() { (1 + 2) ?? 99 }");
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 3), result);
@@ -9968,7 +9998,7 @@ test "Phase 7: async 函数基本执行 + join" {
         \\fun main() { compute().await() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 42), result);
@@ -9982,7 +10012,7 @@ test "Phase 7: async 函数带参数" {
         \\fun main() { add(3, 4).await() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 7), result);
@@ -9996,7 +10026,7 @@ test "Phase 7: async 函数计算" {
         \\fun main() { square(7).await() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 49), result);
@@ -10012,7 +10042,7 @@ test "Phase 7: async 函数调用普通函数" {
         \\fun main() { compute().await() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 42), result);
@@ -10028,7 +10058,7 @@ test "Phase 7: 嵌套普通函数调用（非 async）" {
         \\fun main() { compute() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 42), result);
@@ -10042,7 +10072,7 @@ test "Phase 7: 单层 double 调用" {
         \\fun main() { double(21) }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     const result = try engine.run();
     try testing.expectEqual(@as(i64, 42), result);
@@ -10054,7 +10084,7 @@ test "内置 print/println 编译与执行（无 io 时不崩溃）" {
         \\fun main() { println("Hello, Glue!"); 42 }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     // 无 io 接口，print 静默跳过，不崩溃
     const result = try engine.run();
@@ -10076,7 +10106,7 @@ test "loop + break" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 10), try engine.run()); // 0+1+2+3+4=10
 }
@@ -10093,7 +10123,7 @@ test "for + break" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 15), try engine.run()); // 0+1+2+3+4+5=15
 }
@@ -10110,7 +10140,7 @@ test "for + continue" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 25), try engine.run()); // 1+3+5+7+9=25
 }
@@ -10129,7 +10159,7 @@ test "while + break" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 10), try engine.run()); // 0+1+2+3+4=10
 }
@@ -10144,7 +10174,7 @@ test "P0-b: ADT 无参构造器（Leaf）" {
         \\fun main() { Leaf }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     _ = try engine.run(); // 只验证不崩溃
 }
@@ -10156,7 +10186,7 @@ test "P0-b: ADT 带参构造器 + 命名字段访问" {
         \\fun main() { Box(42).value }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -10168,7 +10198,7 @@ test "P0-b: ADT 多构造器 + 位置字段访问" {
         \\fun main() { Node(5, Leaf, Leaf)._0 }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 5), try engine.run());
 }
@@ -10180,7 +10210,7 @@ test "P0-b: newtype 构造器 + 字段访问" {
         \\fun main() { UserId(42)._0 }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -10193,7 +10223,7 @@ test "P0-b: trait_decl 注册（不崩溃）" {
         \\fun main() { 42 }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -10206,7 +10236,7 @@ test "P0-b: type 方法注册为函数" {
         \\fun main() { MyInt(10).value }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 10), try engine.run());
 }
@@ -10227,7 +10257,7 @@ test "P0-c: match 字面量匹配" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 20), try engine.run());
 }
@@ -10243,7 +10273,7 @@ test "P0-c: match 通配符兜底" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 30), try engine.run());
 }
@@ -10259,7 +10289,7 @@ test "P0-c: match 变量绑定" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -10276,7 +10306,7 @@ test "P0-c: match ADT 构造器解构" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -10293,7 +10323,7 @@ test "P0-c: match ADT 无参构造器" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 99), try engine.run());
 }
@@ -10309,7 +10339,7 @@ test "P0-c: match 或模式" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 10), try engine.run());
 }
@@ -10326,7 +10356,7 @@ test "P0-c: match 守卫条件" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 2), try engine.run());
 }
@@ -10343,7 +10373,7 @@ test "P0-c: match 多构造器 ADT 位置字段" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 5), try engine.run());
 }
@@ -10359,7 +10389,7 @@ test "P0-d: async .await() 显式等待" {
         \\fun main() { compute().await() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -10377,7 +10407,7 @@ test "P0-d: async .status() 状态查询" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 2), try engine.run());
 }
@@ -10388,7 +10418,7 @@ test "P0-d: array .len() 方法" {
         \\fun main() { [10, 20, 30].len() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 3), try engine.run());
 }
@@ -10399,7 +10429,7 @@ test "P0-d: string .len() 方法" {
         \\fun main() { "hello".len() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 5), try engine.run());
 }
@@ -10414,7 +10444,7 @@ test "P0-d: array .push() 方法" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 2), try engine.run());
 }
@@ -10430,7 +10460,7 @@ test "P0-d: 用户自定义方法调用" {
         \\fun main() { MyInt(10).get() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 10), try engine.run());
 }
@@ -10448,7 +10478,7 @@ test "P0-d: .type_name() 反射方法" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 42), try engine.run());
 }
@@ -10460,7 +10490,7 @@ test "P0-d: async .await() 带参数计算" {
         \\fun main() { add(3, 4).await() }
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 7), try engine.run());
 }
@@ -10479,7 +10509,7 @@ test "P1-a: fun lambda 基本调用" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 11), try engine.run());
 }
@@ -10493,7 +10523,7 @@ test "P1-a: 箭头 lambda 基本调用" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 11), try engine.run());
 }
@@ -10507,7 +10537,7 @@ test "P1-a: 多参数 lambda" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 7), try engine.run());
 }
@@ -10522,7 +10552,7 @@ test "P1-a: 闭包捕获自由变量" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 15), try engine.run());
 }
@@ -10538,7 +10568,7 @@ test "P1-a: 闭包捕获多个自由变量" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 81), try engine.run());
 }
@@ -10563,7 +10593,7 @@ test "lazy: 创建时不求值，强制时缓存" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 1), try engine.run());
 }
@@ -10581,7 +10611,7 @@ test "lazy: thunk 捕获外部变量" {
         \\}
     );
     defer ir.deinit();
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 49), try engine.run());
 }
@@ -10645,7 +10675,7 @@ test "vec_zip: 合并两个 range 向量" {
         .backing = alloc,
     };
 
-    var engine = try Engine.initOwned(&ir, testing.allocator);
+    var engine = try Engine.initOwned(&ir, testing.allocator, null);
     defer engine.deinit();
     try testing.expectEqual(@as(i64, 3), try engine.run());
 }

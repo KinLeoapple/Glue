@@ -977,20 +977,31 @@ pub const Parser = struct {
         };
     }
 
-    /// 解析 import 声明：import path.to.module { item1, item2 as alias }
+    /// 解析 import 声明：import path.to.module.{ item1, item2 as alias }
+    /// selective import 必须使用点号连接的 `.{ }` 语法，不接受空格分隔的 `{ }`
     fn parseUseDecl(self: *Parser, visibility: ast.Visibility) ParserError!ast.Decl {
         const use_tok = self.advance();
         var module_path = std.ArrayList([]const u8).empty;
         const first = try self.expect(.identifier, "expected module name");
         try module_path.append(self.arena.allocator(), first.lexeme);
+        // 路径循环：遇到 `.` 后若下一个为 `{`，标记为 selective import 起始并 break
+        var dot_before_brace = false;
         while (self.matchToken(.dot)) {
-            if (self.check(.l_brace)) break;
+            if (self.check(.l_brace)) {
+                dot_before_brace = true;
+                break;
+            }
             const part = try self.expect(.identifier, "expected module path segment");
             try module_path.append(self.arena.allocator(), part.lexeme);
         }
         var items: ?[]ast.ImportItem = null;
-        if (self.check(.l_brace) or self.matchToken(.dot)) {
-            _ = self.expect(.l_brace, "expected '{'") catch {};
+        if (self.check(.l_brace)) {
+            // selective import 必须使用 `.{ }` 语法：`{` 前必须有 `.`
+            if (!dot_before_brace) {
+                try self.reportError("selective import must use '.{ }' syntax; expected '.' before '{'");
+                return error.UnexpectedToken;
+            }
+            _ = self.advance(); // 消费 '{'
             var item_list = std.ArrayList(ast.ImportItem).empty;
             if (!self.check(.r_brace)) {
                 try item_list.append(self.arena.allocator(), try self.parseImportItem());

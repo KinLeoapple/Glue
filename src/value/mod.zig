@@ -226,6 +226,7 @@ pub const Value = union(enum) {
         } else &.{};
         @memcpy(elems, elements);
         arr.* = .{ .elements = elems, .capacity = elems.len, .fixed_size = fixed_size, .elem_is_ref = elem_is_ref };
+        obj_header.initObjHeader(&arr.header, .array, @sizeOf(ArrayValue), false, tctx);
         return .{ .ref = &arr.header };
     }
 
@@ -246,6 +247,7 @@ pub const Value = union(enum) {
         const f_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(RecordValue)));
         @memcpy(f_ptr[0..fields.len], fields);
         rec.* = .{ .type_name = type_name, .fields = f_ptr[0..fields.len], .field_ref_bits = field_ref_bits };
+        obj_header.initObjHeader(&rec.header, .record, total, false, tctx);
         return .{ .ref = &rec.header };
     }
 
@@ -276,6 +278,7 @@ pub const Value = union(enum) {
         const f_ptr: [*]Value = @ptrCast(@alignCast(mem.ptr + @sizeOf(RecordValue)));
         @memcpy(f_ptr[0..fields.len], fields);
         rec.* = .{ .type_name = type_name, .fields = f_ptr[0..fields.len], .field_names = field_names, .field_ref_bits = field_ref_bits };
+        obj_header.initObjHeader(&rec.header, .record, total, false, tctx);
         return .{ .ref = &rec.header };
     }
 
@@ -295,6 +298,7 @@ pub const Value = union(enum) {
         const f_ptr: [*]AdtField = @ptrCast(@alignCast(mem.ptr + @sizeOf(AdtValue)));
         @memcpy(f_ptr[0..fields.len], fields);
         adt.* = .{ .type_name = type_name, .constructor = constructor, .fields = f_ptr[0..fields.len], .field_ref_bits = field_ref_bits };
+        obj_header.initObjHeader(&adt.header, .adt, total, false, tctx);
         return .{ .ref = &adt.header };
     }
 
@@ -302,6 +306,7 @@ pub const Value = union(enum) {
     pub fn makeNewtype(tctx: *ThreadContext, type_name: []const u8, inner: Value) !Value {
         const nt = try tctx.createObj(NewtypeValue);
         nt.* = .{ .type_name = type_name, .inner = inner };
+        obj_header.initObjHeader(&nt.header, .newtype, @sizeOf(NewtypeValue), false, tctx);
         return .{ .ref = &nt.header };
     }
 
@@ -309,6 +314,7 @@ pub const Value = union(enum) {
     pub fn makeCell(tctx: *ThreadContext, inner: Value) !Value {
         const cell = try tctx.createObj(Cell);
         cell.* = .{ .inner = inner };
+        obj_header.initObjHeader(&cell.header, .cell, @sizeOf(Cell), false, tctx);
         return .{ .ref = &cell.header };
     }
 
@@ -316,6 +322,7 @@ pub const Value = union(enum) {
     pub fn makeRange(tctx: *ThreadContext, start: [16]u8, end: [16]u8, inclusive: bool) !Value {
         const r = try tctx.createObj(Range);
         r.* = .{ .start = start, .end = end, .inclusive = inclusive };
+        obj_header.initObjHeader(&r.header, .range, @sizeOf(Range), false, tctx);
         return .{ .ref = &r.header };
     }
 
@@ -341,6 +348,7 @@ pub const Value = union(enum) {
             .upvalue_ref_bits = closure.upvalue_ref_bits,
             .cell_upvalues = closure.cell_upvalues,
         };
+        obj_header.initObjHeader(&c.header, .closure, total, false, tctx);
         return .{ .ref = &c.header };
     }
 
@@ -359,6 +367,7 @@ pub const Value = union(enum) {
             .remaining_arity = remaining_arity,
             .bound_arg_ref_bits = ref_bits,
         };
+        obj_header.initObjHeader(&p.header, .partial, total, false, tctx);
         return .{ .ref = &p.header };
     }
 
@@ -366,6 +375,7 @@ pub const Value = union(enum) {
     pub fn makeBuiltin(tctx: *ThreadContext, fn_ptr: BuiltinFn, user_ctx: ?*anyopaque) !Value {
         const b = try tctx.createObj(Builtin);
         b.* = .{ .fn_ptr = fn_ptr, .user_ctx = user_ctx };
+        obj_header.initObjHeader(&b.header, .builtin, @sizeOf(Builtin), false, tctx);
         return .{ .ref = &b.header };
     }
 
@@ -385,6 +395,7 @@ pub const Value = union(enum) {
             .message = msg_ptr[0..message.len],
             .is_error_subtype = is_error_subtype,
         };
+        obj_header.initObjHeader(&e.header, .error_val, total, false, tctx);
         return .{ .ref = &e.header };
     }
 
@@ -392,6 +403,7 @@ pub const Value = union(enum) {
     pub fn makeThrow(tctx: *ThreadContext, payload: ThrowValue.Payload) !Value {
         const t = try tctx.createObj(ThrowValue);
         t.* = .{ .payload = payload };
+        obj_header.initObjHeader(&t.header, .throw_val, @sizeOf(ThrowValue), false, tctx);
         return .{ .ref = &t.header };
     }
 
@@ -584,7 +596,7 @@ pub const Value = union(enum) {
     ///
     /// 标量值无引用计数（no-op）。堆对象通过 ObjHeader 统一管理。
     /// Str SSO 模式使用 sso_flags 中的独立引用计数。
-    pub inline fn retain(self: Value) Value {
+    pub inline fn retain(self: Value, tctx: *ThreadContext) Value {
         switch (self) {
             // 标量值无需引用计数
             .null_val, .unit, .boolean, .char,
@@ -601,7 +613,7 @@ pub const Value = union(enum) {
                         return self;
                     }
                 }
-                _ = obj_header.retain(obj);
+                _ = obj_header.retain(obj, tctx);
             },
         }
         return self;
@@ -673,7 +685,7 @@ pub const Value = union(enum) {
                     .array_iter, .string_iter, .range_iter,
                     .lazy_val,
                     .atomic_val, .async_val, .channel_val, .sender_val, .receiver_val,
-                    .boxed_scalar => self.retain(),
+                    .boxed_scalar => self.retain(tctx),
                 };
             },
         }
@@ -692,12 +704,10 @@ pub const Value = union(enum) {
         if (s.isSso()) {
             const new_s = try tctx.createObj(Str);
             new_s.* = s.*;
-            new_s.header.rc = 1;
-            // 重置 flags：清除从源对象复制的 TRACKED / ARENA_ALLOCATED 标志，
-            // 否则 trackValueTree 会因 isTracked() 误判而跳过跟踪，导致页池页泄漏
-            new_s.header.flags = 0;
             // 重置 SSO 引用计数为初始值 1，保留标志位和长度
             new_s.sso_flags = (s.sso_flags & ~Str.SSO_REFCOUNT_MASK) | Str.SSO_REFCOUNT_INIT;
+            // 重置 header（type_tag/flags/rc，清除 TRACKED/ARENA_ALLOCATED）并记录分配埋点
+            obj_header.initObjHeader(&new_s.header, .str, @sizeOf(Str), false, tctx);
             return .{ .ref = &new_s.header };
         }
         return try Value.fromStringBytes(tctx, s.bytes());
@@ -723,7 +733,7 @@ pub const Value = union(enum) {
             }
             for (p.elements, 0..) |elem, i| {
                 new_elems[i] = elem;
-                if (elem.isBoxed()) _ = elem.retain();
+                if (elem.isBoxed()) _ = elem.retain(tctx);
                 copied += 1;
             }
         } else {
@@ -744,6 +754,7 @@ pub const Value = union(enum) {
             .fixed_size = p.fixed_size,
             .elem_is_ref = p.elem_is_ref,
         };
+        obj_header.initObjHeader(&arr.header, .array, @sizeOf(ArrayValue), false, tctx);
         return .{ .ref = &arr.header };
     }
 
@@ -770,7 +781,7 @@ pub const Value = union(enum) {
                 if (p.fieldIsRef(@intCast(i))) {
                     // 字段类型为 &T / *T：保持引用语义，retain 即可
                     new_fields[i] = src;
-                    if (src.isBoxed()) _ = src.retain();
+                    if (src.isBoxed()) _ = src.retain(tctx);
                     copied = i + 1;
                 } else {
                     new_fields[i] = try src.deepCopy(tctx);
@@ -779,6 +790,7 @@ pub const Value = union(enum) {
             }
         }
         rec.* = .{ .type_name = p.type_name, .fields = new_fields, .field_names = p.field_names, .field_ref_bits = p.field_ref_bits };
+        obj_header.initObjHeader(&rec.header, .record, total, false, tctx);
         return .{ .ref = &rec.header };
     }
 
@@ -804,6 +816,7 @@ pub const Value = union(enum) {
                     .fields = new_fields,
                     .field_ref_bits = p.field_ref_bits,
                 };
+                obj_header.initObjHeader(&adt.header, .adt, total, false, tctx);
                 return .{ .ref = &adt.header };
             }
         }
@@ -817,7 +830,7 @@ pub const Value = union(enum) {
             if (p.fieldIsRef(@intCast(i))) {
                 // 字段类型为 &T / *T：保持引用语义，retain 即可
                 new_fields[i] = .{ .name = f.name, .value = f.value };
-                if (f.value.isBoxed()) _ = f.value.retain();
+                if (f.value.isBoxed()) _ = f.value.retain(tctx);
                 copied += 1;
             } else {
                 new_fields[i] = .{
@@ -833,6 +846,7 @@ pub const Value = union(enum) {
             .fields = new_fields,
             .field_ref_bits = p.field_ref_bits,
         };
+        obj_header.initObjHeader(&adt.header, .adt, total, false, tctx);
         return .{ .ref = &adt.header };
     }
 
@@ -851,8 +865,8 @@ pub const Value = union(enum) {
         // 直接 memcpy：Range 为固定大小纯数据，无嵌套引用
         const new_r = try tctx.createObj(Range);
         new_r.* = p.*;
-        new_r.header.rc = 1;
-        new_r.header.flags = 0; // 清除从源对象复制的 TRACKED / ARENA_ALLOCATED 标志
+        // 重置 header（清除 TRACKED/ARENA_ALLOCATED）并记录分配埋点
+        obj_header.initObjHeader(&new_r.header, .range, @sizeOf(Range), false, tctx);
         return .{ .ref = &new_r.header };
     }
 
@@ -887,7 +901,7 @@ pub const Value = union(enum) {
                 if (i < 8 and p.upvalueIsRef(@intCast(i))) {
                     // &T / *T / cell 上值：保持引用语义，retain 即可
                     new_upvalues[i] = uv;
-                    if (uv.isBoxed()) _ = uv.retain();
+                    if (uv.isBoxed()) _ = uv.retain(tctx);
                 } else {
                     new_upvalues[i] = try uv.deepCopy(tctx);
                 }
@@ -908,6 +922,7 @@ pub const Value = union(enum) {
             .upvalue_ref_bits = p.upvalue_ref_bits,
             .cell_upvalues = p.cell_upvalues,
         };
+        obj_header.initObjHeader(&c.header, .closure, total, false, tctx);
         return .{ .ref = &c.header };
     }
 
@@ -933,7 +948,7 @@ pub const Value = union(enum) {
             for (p.bound_args, 0..) |ba, i| {
                 const is_ref = (p.bound_arg_ref_bits >> @intCast(i)) & 1 == 1;
                 // &T / *T 绑定参数保持引用语义；普通参数深拷贝
-                new_bound_args[i] = if (is_ref) ba.retain() else try ba.deepCopy(tctx);
+                new_bound_args[i] = if (is_ref) ba.retain(tctx) else try ba.deepCopy(tctx);
                 ba_copied += 1;
             }
         }
@@ -943,6 +958,7 @@ pub const Value = union(enum) {
             .remaining_arity = p.remaining_arity,
             .bound_arg_ref_bits = p.bound_arg_ref_bits,
         };
+        obj_header.initObjHeader(&pa.header, .partial, total, false, tctx);
         return .{ .ref = &pa.header };
     }
 
@@ -951,8 +967,8 @@ pub const Value = union(enum) {
         // 直接 memcpy：Builtin 为固定大小纯数据（函数指针 + ctx），无嵌套引用
         const new_b = try tctx.createObj(Builtin);
         new_b.* = p.*;
-        new_b.header.rc = 1;
-        new_b.header.flags = 0; // 清除从源对象复制的 TRACKED / ARENA_ALLOCATED 标志
+        // 重置 header（清除 TRACKED/ARENA_ALLOCATED）并记录分配埋点
+        obj_header.initObjHeader(&new_b.header, .builtin, @sizeOf(Builtin), false, tctx);
         return .{ .ref = &new_b.header };
     }
 
@@ -977,7 +993,7 @@ pub const Value = union(enum) {
 
     fn deepCopyTrait(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
         const p: *TraitValue = @alignCast(@fieldParentPtr("header", obj));
-        if (!p.owned) return Value.fromRef(obj).retain();
+        if (!p.owned) return Value.fromRef(obj).retain(tctx);
         const count = p.method_names.len;
         // 连续内存布局：[TraitValue header | method_values[]]
         const mv_size = count * @sizeOf(Value);
@@ -1023,6 +1039,7 @@ pub const Value = union(enum) {
             .data = new_data,
             .owned = true,
         };
+        obj_header.initObjHeader(&tv.header, .trait_val, total, false, tctx);
         return .{ .ref = &tv.header };
     }
 

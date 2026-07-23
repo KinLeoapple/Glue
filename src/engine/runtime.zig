@@ -13,6 +13,7 @@ const std = @import("std");
 const ir_mod = @import("ir");
 const mem = @import("mem");
 const value = @import("value");
+const profiling = @import("profiling");
 const scalar = value.scalar;
 
 const ChannelRegion = mem.ChannelRegion;
@@ -21,6 +22,7 @@ const ChanType = ir_mod.ChanType;
 const ConstVal = ir_mod.ConstVal;
 const ScalarMeta = ir_mod.ScalarMeta;
 const ScalarKind = ir_mod.ScalarKind;
+const ThreadProfiler = profiling.ThreadProfiler;
 
 /// 通道运行时存储：管理所有通道的实际数据
 ///
@@ -41,12 +43,15 @@ pub const Runtime = struct {
     region: *ChannelRegion,
     /// backing allocator（用于 chan_ptrs/chan_widths 数组）
     backing: std.mem.Allocator,
+    /// ThreadProfiler 引用（channel 分配水位埋点）
+    prof: ?*ThreadProfiler = null,
 
     /// 初始化运行时
-    pub fn init(region: *ChannelRegion, backing: std.mem.Allocator) Runtime {
+    pub fn init(region: *ChannelRegion, backing: std.mem.Allocator, prof: ?*ThreadProfiler) Runtime {
         return .{
             .region = region,
             .backing = backing,
+            .prof = prof,
         };
     }
 
@@ -76,6 +81,8 @@ pub const Runtime = struct {
                 const buf = try self.region.alloc(meta.elem_width);
                 @memset(buf, 0);
                 self.chan_ptrs[i] = buf.ptr;
+                // Profiling: 记录 channel 分配水位
+                if (self.prof) |p| p.recordAllocatorWatermark(.channel, self.region.used);
                 // ChannelRegion 扩容后需 rebase 所有已分配的通道指针
                 if (self.region.rebase_info) |ri| {
                     for (self.chan_ptrs[0 .. i + 1]) |*ptr| {
@@ -348,7 +355,7 @@ test "Runtime 布局与标量读写" {
     const ch1 = try channels.alloc(.f64_chan);
     const ch2 = try channels.alloc(.bool_chan);
 
-    var rt = Runtime.init(&region, testing.allocator);
+    var rt = Runtime.init(&region, testing.allocator, null);
     defer rt.deinit();
     try rt.layout(&channels);
 
@@ -371,7 +378,7 @@ test "Runtime writeConst 整数" {
 
     const ch = try channels.alloc(.i32_chan);
 
-    var rt = Runtime.init(&region, testing.allocator);
+    var rt = Runtime.init(&region, testing.allocator, null);
     defer rt.deinit();
     try rt.layout(&channels);
 
@@ -389,7 +396,7 @@ test "Runtime writeConst 浮点" {
 
     const ch = try channels.alloc(.f64_chan);
 
-    var rt = Runtime.init(&region, testing.allocator);
+    var rt = Runtime.init(&region, testing.allocator, null);
     defer rt.deinit();
     try rt.layout(&channels);
 
