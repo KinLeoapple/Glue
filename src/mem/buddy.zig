@@ -11,6 +11,7 @@
 //! - 热路径仅位运算 + 链表操作，无系统调用
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sync = @import("sync");
 const Mutex = sync.Mutex;
 
@@ -59,12 +60,138 @@ fn roundUpSize(size: usize) usize {
     return @min(pot, MAX_BLOCK_SIZE);
 }
 
+// =============================================================================
+// Arena 内存分配：跨平台、零浪费、绕过 backing allocator
+//
+// buddy 的 arena 需要 alignment 对齐的 size 字节内存。某些平台的 backing allocator
+//（如 Windows 的 std.heap.page_allocator）对超页对齐走 placeholder API 会失败。
+// 此处直接调用 OS 层 API（POSIX mmap / Windows NtAllocateVirtualMemory），
+// overalloc 后修剪前缀和后缀归还 OS，最终只保留 [aligned_addr, aligned_addr+size)，
+// 零内存浪费。arena 不经过 backing，由 deinit 显式管理生命周期。
+// =============================================================================
+
+/// 申请一块 alignment 对齐、size 字节的 arena 内存。
+/// 返回的切片指针满足 alignment 对齐，长度 = size（页对齐向上取整）。
+/// 调用方负责用 arenaFree 释放。
+fn arenaAlloc(size: usize, alignment: usize) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return arenaAllocWindows(size, alignment);
+    } else {
+        return arenaAllocPosix(size, alignment);
+    }
+}
+
+/// 释放 arenaAlloc 返回的切片
+fn arenaFree(buf: []u8) void {
+    if (builtin.os.tag == .windows) {
+        arenaFreeWindows(buf);
+    } else {
+        // POSIX: munmap 释放整段映射
+        std.posix.munmap(@alignCast(buf));
+    }
+}
+
+/// POSIX arena 分配：mmap overalloc + alignPointer + munmap 修剪前缀后缀
+fn arenaAllocPosix(size: usize, alignment: usize) ![]u8 {
+    const page_size = std.heap.page_size_min;
+    const page_aligned_len = std.mem.alignForward(usize, size, page_size);
+    // alignment > page_size 时需要 overalloc 以保证有对齐窗口；否则直接页对齐分配
+    const max_drop_len = alignment -| page_size;
+    const overalloc_len = page_aligned_len + max_drop_len;
+
+    const slice = try std.posix.mmap(
+        null,
+        overalloc_len,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+
+    const result_ptr = std.mem.alignPointer(slice.ptr, alignment) orelse {
+        std.posix.munmap(slice);
+        return error.OutOfMemory;
+    };
+
+    // 修剪前缀 [slice.ptr, result_ptr)
+    const drop_len = @intFromPtr(result_ptr) - @intFromPtr(slice.ptr);
+    if (drop_len != 0) {
+        std.posix.munmap(slice[0..drop_len]);
+    }
+    // 修剪后缀 [result_ptr + page_aligned_len, slice.ptr + overalloc_len)
+    const remaining_len = overalloc_len - drop_len;
+    if (remaining_len > page_aligned_len) {
+        const suffix = result_ptr[page_aligned_len..remaining_len];
+        std.posix.munmap(@alignCast(suffix));
+    }
+
+    return @alignCast(result_ptr[0..page_aligned_len]);
+}
+
+/// Windows arena 分配：NtAllocateVirtualMemory overalloc + NtFreeVirtualMemory 修剪前缀后缀
+fn arenaAllocWindows(size: usize, alignment: usize) ![]u8 {
+    const w = std.os.windows;
+    const ntdll = w.ntdll;
+    const page_size = std.heap.page_size_min;
+    const page_aligned_len = std.mem.alignForward(usize, size, page_size);
+    // Windows 分配粒度为 64KB，NtAllocateVirtualMemory(BaseAddress=NULL) 返回 64KB 对齐地址。
+    // alignment > 64KB 时需要 overalloc 以保证有对齐窗口。
+    const alloc_granularity: usize = 0x10000;
+    const max_drop_len = if (alignment > alloc_granularity) alignment - alloc_granularity else 0;
+    const overalloc_len = page_aligned_len + max_drop_len;
+
+    const current_process = w.GetCurrentProcess();
+    // base 用 ?*anyopaque 以便能初始化为 null（PVOID 是 *anyopaque，不可空）
+    var base: ?*anyopaque = null;
+    var region_size: w.SIZE_T = overalloc_len;
+    const alloc_type: w.MEM.ALLOCATE = .{ .COMMIT = true, .RESERVE = true };
+    const protect: w.PAGE = .{ .READWRITE = true };
+
+    const status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&base), 0, &region_size, alloc_type, protect);
+    if (status != .SUCCESS) return error.OutOfMemory;
+
+    const base_addr = @intFromPtr(base);
+    const aligned_addr = std.mem.alignForward(usize, base_addr, alignment);
+    const result_ptr: [*]u8 = @ptrFromInt(aligned_addr);
+
+    // 修剪前缀 [base_addr, aligned_addr)
+    const prefix_len = aligned_addr - base_addr;
+    if (prefix_len != 0) {
+        var prefix_base: ?*anyopaque = @ptrFromInt(base_addr);
+        var prefix_size: w.SIZE_T = prefix_len;
+        _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&prefix_base), &prefix_size, .{ .RELEASE = true });
+    }
+
+    // 修剪后缀 [aligned_addr + page_aligned_len, base_addr + overalloc_len)
+    const suffix_start = aligned_addr + page_aligned_len;
+    const suffix_len = base_addr + overalloc_len - suffix_start;
+    if (suffix_len != 0) {
+        var suffix_base: ?*anyopaque = @ptrFromInt(suffix_start);
+        var suffix_size: w.SIZE_T = suffix_len;
+        _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&suffix_base), &suffix_size, .{ .RELEASE = true });
+    }
+
+    return result_ptr[0..page_aligned_len];
+}
+
+/// Windows arena 释放：NtFreeVirtualMemory(RELEASE) 释放整段
+fn arenaFreeWindows(buf: []u8) void {
+    const w = std.os.windows;
+    const ntdll = w.ntdll;
+    const current_process = w.GetCurrentProcess();
+    var base: ?*anyopaque = @ptrCast(buf.ptr);
+    var size: w.SIZE_T = buf.len;
+    _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&base), &size, .{ .RELEASE = true });
+}
+
 /// Buddy 风格大对象分配器（完整合并实现）
 pub const BuddyAllocator = struct {
     backing: std.mem.Allocator,
     lock: Mutex = .{},
     free_lists: [NUM_CLASSES]?*FreeBlock = [_]?*FreeBlock{null} ** NUM_CLASSES,
-    arenas: std.ArrayList([]align(MAX_BLOCK_SIZE) u8) = .empty,
+    // arena 由 OS 层 API 直接分配（arenaAlloc），1MB 对齐、零浪费，不经过 backing。
+    // backing 仅用于 large_allocs 和 arenas 列表自身的元数据。
+    arenas: std.ArrayList([]u8) = .empty,
     // 超大对象（> MAX_BLOCK_SIZE）直接走 backing，独立跟踪以便 deinit 释放
     large_allocs: std.ArrayList([]align(16) u8) = .empty,
 
@@ -78,7 +205,7 @@ pub const BuddyAllocator = struct {
         self.lock.lock();
         defer self.lock.unlock();
         for (self.arenas.items) |arena| {
-            self.backing.free(arena);
+            arenaFree(arena);
         }
         self.arenas.deinit(self.backing);
         // 释放残留的超大对象
@@ -90,12 +217,14 @@ pub const BuddyAllocator = struct {
     }
 
     /// 分配一个新 arena 并加入 free list
+    /// 通过 OS 层 API（arenaAlloc）获取 1MB 对齐、1MB 大小的内存，前缀后缀已归还 OS，零浪费。
+    /// buddy 树根即切片起点，满足 1MB 对齐，free() 中的 arena_base = block_addr & ~(MAX_BLOCK_SIZE-1) 算式不变。
     fn growArena(self: *BuddyAllocator) !void {
-        const arena = try self.backing.alignedAlloc(u8, .fromByteUnits(MAX_BLOCK_SIZE), MAX_BLOCK_SIZE);
-        try self.arenas.append(self.backing, arena);
+        const buf = try arenaAlloc(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE);
+        try self.arenas.append(self.backing, buf);
 
         // 将整个 arena 作为一个 MAX_BLOCK_SIZE 空闲块加入最高级 free list
-        const block: *FreeBlock = @ptrCast(@alignCast(arena.ptr));
+        const block: *FreeBlock = @ptrCast(@alignCast(buf.ptr));
         block.header.block_size = MAX_BLOCK_SIZE;
         block.header.is_free = 1;
         block.next = null;
