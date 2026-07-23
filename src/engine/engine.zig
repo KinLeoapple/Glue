@@ -13,6 +13,7 @@
 //! - call 节点压栈调用其他函数
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ir_mod = @import("ir");
 const mem = @import("mem");
 const value = @import("value");
@@ -75,15 +76,33 @@ const Frame = struct {
     return_pc: u32,
 };
 
+/// Windows kernel32 高精度时钟与睡眠（仅 Windows 分支引用，其他平台不链接）
+extern "kernel32" fn QueryPerformanceCounter(count: *u64) callconv(.c) c_int;
+extern "kernel32" fn QueryPerformanceFrequency(frequency: *u64) callconv(.c) c_int;
+extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.c) void;
+
 /// 单调时钟毫秒时间戳（用于 select 超时截止计算，不受系统时间调整影响）
+/// 跨平台：Windows 走 QueryPerformanceCounter，POSIX 走 clock_gettime(CLOCK_MONOTONIC)
 fn monotonicMillis() i64 {
+    if (builtin.os.tag == .windows) {
+        var freq: u64 = 0;
+        if (QueryPerformanceFrequency(&freq) == 0) return 0;
+        var count: u64 = 0;
+        if (QueryPerformanceCounter(&count) == 0) return 0;
+        return @intCast(@divTrunc(count * 1_000, freq));
+    }
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
-/// select 阻塞退避：睡眠 1ms（nanosleep 被信号打断时直接返回，由外层轮询重试）
+/// select 阻塞退避：睡眠 1ms（被信号打断时直接返回，由外层轮询重试）
+/// 跨平台：Windows 走 Sleep，POSIX 走 nanosleep
 fn selectBackoffSleep() void {
+    if (builtin.os.tag == .windows) {
+        Sleep(1);
+        return;
+    }
     const req = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
     var rem: std.c.timespec = undefined;
     _ = std.c.nanosleep(&req, &rem);

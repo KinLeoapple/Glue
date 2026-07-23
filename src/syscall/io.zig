@@ -231,10 +231,17 @@ fn seekFilePosix(file: File, offset: i64, whence: i32) SeekFail!i64 {
 }
 
 /// Windows seek（SetFilePointerEx，kernel32）
+/// Zig 0.16 的 std.os.windows.kernel32 未导出 SetFilePointerEx，此处直接 extern 声明
+extern "kernel32" fn SetFilePointerEx(
+    hFile: std.os.windows.HANDLE,
+    liDistanceToMove: i64,
+    lpNewFilePointer: *i64,
+    dwMoveMethod: u32,
+) callconv(.c) c_int;
+
 fn seekFileWindows(file: File, offset: i64, whence: i32) SeekFail!i64 {
-    const w = std.os.windows;
     var new_pos: i64 = 0;
-    const rc = w.kernel32.SetFilePointerEx(file.handle, offset, &new_pos, @intCast(whence));
+    const rc = SetFilePointerEx(file.handle, offset, &new_pos, @intCast(whence));
     if (rc == 0) return error.SeekFailed;
     return new_pos;
 }
