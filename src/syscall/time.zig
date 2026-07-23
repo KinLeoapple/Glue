@@ -38,6 +38,43 @@ const tm = extern struct {
 extern "c" fn localtime_r(time: *const std.c.time_t, result: *tm) ?*tm;
 
 // ──────────────────────────────────────────────
+// Windows 时区 API（kernel32，跨平台编译时仅在 Windows 链接）
+// ──────────────────────────────────────────────
+
+/// Windows SYSTEMTIME 结构（用于 TIME_ZONE_INFORMATION 的转换日期字段）
+const SYSTEMTIME = extern struct {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+};
+
+/// Windows TIME_ZONE_INFORMATION 结构
+/// Bias: UTC = local + Bias（分钟），即本地时间落后 UTC 的分钟数
+/// StandardBias / DaylightBias: 在 Bias 基础上的额外偏移（通常 StandardBias=0, DaylightBias=-60）
+const TIME_ZONE_INFORMATION = extern struct {
+    bias: i32,
+    standard_name: [32]u16,
+    standard_date: SYSTEMTIME,
+    standard_bias: i32,
+    daylight_name: [32]u16,
+    daylight_date: SYSTEMTIME,
+    daylight_bias: i32,
+};
+
+extern "kernel32" fn GetTimeZoneInformation(lpTimeZoneInformation: *TIME_ZONE_INFORMATION) callconv(.c) u32;
+
+/// TIME_ZONE_ID 常量（GetTimeZoneInformation 返回值）
+const TIME_ZONE_ID_UNKNOWN: u32 = 0;
+const TIME_ZONE_ID_STANDARD: u32 = 1;
+const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+const TIME_ZONE_ID_INVALID: u32 = 0xFFFFFFFF;
+
+// ──────────────────────────────────────────────
 // 辅助：构造返回值
 // ──────────────────────────────────────────────
 
@@ -167,10 +204,22 @@ fn daysFromCivil(year: i32, month: u32, day: u32) i64 {
 }
 
 /// 获取本地时区相对 UTC 的秒偏移（跨平台）
-/// POSIX: localtime_r(&now).gmtoff；Windows: 暂返回 0（后续可用 _get_timezone 完善）
+/// POSIX: localtime_r(&now).gmtoff
+/// Windows: GetTimeZoneInformation，根据返回值叠加 StandardBias/DaylightBias
+/// 偏移语义：返回值为「本地时间 - UTC」的秒数（北京时间 +28800）
 fn getLocalOffsetSec(io: std.Io) i64 {
     if (builtin.os.tag == .windows) {
-        return 0; // TODO: Windows 用 _get_timezone 或注册表获取时区偏移
+        var tzi: TIME_ZONE_INFORMATION = undefined;
+        const tz_id = GetTimeZoneInformation(&tzi);
+        if (tz_id == TIME_ZONE_ID_INVALID) return 0;
+        // UTC = local + (Bias + extra_bias)
+        // → local - UTC = -(Bias + extra_bias)
+        const extra_bias: i32 = switch (tz_id) {
+            TIME_ZONE_ID_DAYLIGHT => tzi.daylight_bias,
+            else => tzi.standard_bias, // UNKNOWN 和 STANDARD 都用 standard_bias
+        };
+        const total_bias_min: i32 = tzi.bias + extra_bias;
+        return @as(i64, -total_bias_min) * 60;
     }
     const ts = std.Io.Clock.real.now(io);
     const now_sec: std.c.time_t = @intCast(@divFloor(ts.nanoseconds, 1_000_000_000));

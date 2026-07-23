@@ -27,7 +27,7 @@ fun main() {
     val f1 = add3(1)
     println(f1(2, 3))               // 6
 
-    // ---- 连续部分应用（TODO：嵌套 partial 需运行时支持）----
+    // ---- 连续部分应用（TODO：嵌套 partial 需类型推断+IR+引擎三层支持）----
     // val f1a = add3(1)
     // val f2 = f1a(2)
     // println(f2(3))               // 6
