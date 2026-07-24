@@ -10,6 +10,8 @@ const lexer_mod = @import("lexer");
 const parser_mod = @import("parser");
 const type_check = @import("sema");
 const analysis_db_mod = @import("analysis_db");
+const std_embed = @import("std_embed");
+const ast_rewrite = @import("ast_rewrite.zig");
 
 /// 字符串 intern 池：模块名等重复字符串统一去重分配，由池统一释放。
 const StringInterner = struct {
@@ -361,5 +363,354 @@ pub const ModuleLoader = struct {
             self.allocator.free(old_dir);
         }
         self.current_source_dir = try self.allocator.dupe(u8, dir);
+    }
+
+    /// 加载 entry_module 中所有 import_decl 引入的子模块声明，做 name mangling
+    /// 与跨子模块调用重写，合并到 entry_module.declarations。
+    /// 保留 parser/source/tokens 直到 IR 构建完成（由调用方通过 retained_* 字段管理）。
+    pub fn loadDecls(
+        self: *ModuleLoader,
+        entry_module: *ast.Module,
+        source_filename: []const u8,
+        retained_parsers: *std.ArrayList(*parser_mod.Parser),
+        retained_sources: *std.ArrayList([]const u8),
+        retained_tokens: *std.ArrayList([]lexer_mod.Token),
+        ast_arena: std.mem.Allocator,
+    ) !void {
+        var extra_decls = std.ArrayList(ast.Decl).empty;
+        defer extra_decls.deinit(self.allocator);
+
+        // 已加载的子模块集合（避免重复加载），key 格式："pack/sub"
+        var loaded_submodules = std.StringHashMap(void).init(self.allocator);
+        defer loaded_submodules.deinit();
+
+        // 源文件所在目录（带分隔符），供用户模块的文件系统查找使用
+        const source_dir = std.fs.path.dirname(source_filename) orelse "";
+        const source_dir_with_sep = if (source_dir.len > 0)
+            try std.fmt.allocPrint(self.allocator, "{s}{c}", .{ source_dir, std.fs.path.sep })
+        else
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(source_dir_with_sep);
+
+        for (entry_module.declarations) |decl| {
+            switch (decl) {
+                .import_decl => |imp| {
+                    if (imp.module_path.len == 0) continue;
+                    const module_name = imp.module_path[0];
+                    if (std.mem.eql(u8, module_name, "std")) {
+                        try self.loadStdlibPack(
+                            imp.module_path,
+                            &extra_decls,
+                            &loaded_submodules,
+                            retained_parsers,
+                            retained_sources,
+                            retained_tokens,
+                            ast_arena,
+                        );
+                    } else {
+                        try self.loadUserPack(
+                            module_name,
+                            source_dir_with_sep,
+                            &extra_decls,
+                            &loaded_submodules,
+                            retained_parsers,
+                            retained_sources,
+                            retained_tokens,
+                            ast_arena,
+                        );
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // 合并声明到主模块
+        if (extra_decls.items.len > 0) {
+            const combined = try ast_arena.alloc(ast.Decl, entry_module.declarations.len + extra_decls.items.len);
+            @memcpy(combined[0..entry_module.declarations.len], entry_module.declarations);
+            @memcpy(combined[entry_module.declarations.len..], extra_decls.items);
+            entry_module.declarations = combined;
+        }
+    }
+
+    /// 加载 stdlib pack：从 @embedFile 表读取 pack.glue 与子模块，mangle 为 std.<pack>.<sub>.<fun>
+    fn loadStdlibPack(
+        self: *ModuleLoader,
+        module_path: [][]const u8,
+        extra_decls: *std.ArrayList(ast.Decl),
+        loaded_submodules: *std.StringHashMap(void),
+        retained_parsers: *std.ArrayList(*parser_mod.Parser),
+        retained_sources: *std.ArrayList([]const u8),
+        retained_tokens: *std.ArrayList([]lexer_mod.Token),
+        ast_arena: std.mem.Allocator,
+    ) !void {
+        if (module_path.len < 2) return;
+        const pack_name = module_path[1];
+        // module_prefix 统一 mangling 前缀：std 分支为 "std.<pack>"
+        const module_prefix = std.fmt.allocPrint(ast_arena, "std.{s}", .{pack_name}) catch return;
+
+        // 读嵌入表中的 pack.glue
+        var path_buf: [256]u8 = undefined;
+        const pack_path = std.fmt.bufPrint(&path_buf, "{s}/pack.glue", .{pack_name}) catch return;
+        const pack_src_embed = std_embed.find(pack_path) orelse return;
+
+        // 解析 pack.glue
+        var pack_lex = lexer_mod.Lexer.init(self.allocator, pack_src_embed);
+        defer pack_lex.deinit();
+        const pack_tokens = pack_lex.tokenize() catch return;
+        defer self.allocator.free(pack_tokens);
+        var pack_parser = parser_mod.Parser.init(self.allocator, pack_tokens);
+        defer pack_parser.deinit();
+        const pack_module = pack_parser.parseModule("pack") catch return;
+
+        // 构建 sibling_modules：同 pack 内所有子模块短名 → 完整模块路径
+        var sibling_modules = std.StringHashMap([]const u8).init(self.allocator);
+        defer sibling_modules.deinit();
+        for (pack_module.declarations) |pack_decl| {
+            switch (pack_decl) {
+                .pack_decl => |pd| {
+                    const mangled_mod = std.fmt.allocPrint(ast_arena, "{s}.{s}", .{ module_prefix, pd.name }) catch continue;
+                    sibling_modules.put(pd.name, mangled_mod) catch continue;
+                },
+                else => {},
+            }
+        }
+
+        // 对 pack 中每个 pub pack X，读嵌入表中的 <pack>/<X>.glue
+        // 全量加载 pack 内全部子模块（子模块间存在跨模块依赖，部分加载会导致 sema 报错）
+        for (pack_module.declarations) |pack_decl| {
+            switch (pack_decl) {
+                .pack_decl => |pd| {
+                    const sub_name = pd.name;
+                    const sub_key = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ pack_name, sub_name }) catch continue;
+                    defer self.allocator.free(sub_key);
+                    if (loaded_submodules.contains(sub_key)) continue;
+                    loaded_submodules.put(try ast_arena.dupe(u8, sub_key), {}) catch continue;
+                    const sub_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.glue", .{ pack_name, sub_name }) catch continue;
+                    const sub_src_embed = std_embed.find(sub_path) orelse continue;
+
+                    // @embedFile 返回 const 数据，dupe 一份以匹配 retained_sources 的 free 语义
+                    const sub_src = try self.allocator.dupe(u8, sub_src_embed);
+
+                    var sub_lex = lexer_mod.Lexer.init(self.allocator, sub_src);
+                    const sub_tokens = sub_lex.tokenize() catch {
+                        self.allocator.free(sub_src);
+                        continue;
+                    };
+                    const sub_parser_ptr = try self.allocator.create(parser_mod.Parser);
+                    sub_parser_ptr.* = parser_mod.Parser.init(self.allocator, sub_tokens);
+                    const sub_module = sub_parser_ptr.parseModule(sub_name) catch {
+                        sub_parser_ptr.deinit();
+                        self.allocator.destroy(sub_parser_ptr);
+                        self.allocator.free(sub_tokens);
+                        self.allocator.free(sub_src);
+                        continue;
+                    };
+
+                    try retained_parsers.append(self.allocator, sub_parser_ptr);
+                    try retained_sources.append(self.allocator, sub_src);
+                    try retained_tokens.append(self.allocator, sub_tokens);
+
+                    try self.collectAndMangleDecls(
+                        module_prefix,
+                        sub_name,
+                        sub_module,
+                        &sibling_modules,
+                        extra_decls,
+                        ast_arena,
+                    );
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// 加载用户 pack：从文件系统读取 pack.glue 与子模块，mangle 为 <module>.<sub>.<fun>
+    fn loadUserPack(
+        self: *ModuleLoader,
+        module_name: []const u8,
+        source_dir_with_sep: []const u8,
+        extra_decls: *std.ArrayList(ast.Decl),
+        loaded_submodules: *std.StringHashMap(void),
+        retained_parsers: *std.ArrayList(*parser_mod.Parser),
+        retained_sources: *std.ArrayList([]const u8),
+        retained_tokens: *std.ArrayList([]lexer_mod.Token),
+        ast_arena: std.mem.Allocator,
+    ) !void {
+        // module_prefix 统一 mangling 前缀：用户分支为 "<module>"
+        const module_prefix = module_name;
+        const io = self.io orelse return;
+        const cwd = std.Io.Dir.cwd();
+
+        // 读取 pack.glue
+        const pack_path = try std.fmt.allocPrint(self.allocator, "{s}{s}{c}pack.glue", .{ source_dir_with_sep, module_name, std.fs.path.sep });
+        defer self.allocator.free(pack_path);
+        const pack_src = cwd.readFileAlloc(io, pack_path, self.allocator, .unlimited) catch return;
+        defer self.allocator.free(pack_src);
+
+        // 解析 pack.glue
+        var pack_lex = lexer_mod.Lexer.init(self.allocator, pack_src);
+        defer pack_lex.deinit();
+        const pack_tokens = pack_lex.tokenize() catch return;
+        defer self.allocator.free(pack_tokens);
+        var pack_parser = parser_mod.Parser.init(self.allocator, pack_tokens);
+        defer pack_parser.deinit();
+        const pack_module = pack_parser.parseModule("pack") catch return;
+
+        // 构建 sibling_modules
+        var sibling_modules = std.StringHashMap([]const u8).init(self.allocator);
+        defer sibling_modules.deinit();
+        for (pack_module.declarations) |pack_decl| {
+            switch (pack_decl) {
+                .pack_decl => |pd| {
+                    const mangled_mod = std.fmt.allocPrint(ast_arena, "{s}.{s}", .{ module_prefix, pd.name }) catch continue;
+                    sibling_modules.put(pd.name, mangled_mod) catch continue;
+                },
+                else => {},
+            }
+        }
+
+        // 查找并加载子模块
+        for (pack_module.declarations) |pack_decl| {
+            switch (pack_decl) {
+                .pack_decl => |pd| {
+                    const sub_name = pd.name;
+                    const sub_key = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ module_name, sub_name }) catch continue;
+                    defer self.allocator.free(sub_key);
+                    if (loaded_submodules.contains(sub_key)) continue;
+                    loaded_submodules.put(try ast_arena.dupe(u8, sub_key), {}) catch continue;
+
+                    const sub_path = try std.fmt.allocPrint(self.allocator, "{s}{s}{c}{s}.glue", .{ source_dir_with_sep, module_name, std.fs.path.sep, sub_name });
+                    defer self.allocator.free(sub_path);
+                    const sub_src = cwd.readFileAlloc(io, sub_path, self.allocator, .unlimited) catch continue;
+
+                    var sub_lex = lexer_mod.Lexer.init(self.allocator, sub_src);
+                    const sub_tokens = sub_lex.tokenize() catch {
+                        self.allocator.free(sub_src);
+                        continue;
+                    };
+                    const sub_parser_ptr = try self.allocator.create(parser_mod.Parser);
+                    sub_parser_ptr.* = parser_mod.Parser.init(self.allocator, sub_tokens);
+                    const sub_module = sub_parser_ptr.parseModule(sub_name) catch {
+                        sub_parser_ptr.deinit();
+                        self.allocator.destroy(sub_parser_ptr);
+                        self.allocator.free(sub_tokens);
+                        self.allocator.free(sub_src);
+                        continue;
+                    };
+
+                    try retained_parsers.append(self.allocator, sub_parser_ptr);
+                    try retained_sources.append(self.allocator, sub_src);
+                    try retained_tokens.append(self.allocator, sub_tokens);
+
+                    try self.collectAndMangleDecls(
+                        module_prefix,
+                        sub_name,
+                        sub_module,
+                        &sibling_modules,
+                        extra_decls,
+                        ast_arena,
+                    );
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// 收集子模块的 pub fun/type/val 声明，做 name mangling 与跨模块调用重写，追加到 extra_decls。
+    /// mangle 格式：<module_prefix>.<sub_name>.<name>
+    ///   std 分支：module_prefix = "std.<pack>" → "std.<pack>.<sub>.<fun>"
+    ///   user 分支：module_prefix = "<module>" → "<module>.<sub>.<fun>"
+    fn collectAndMangleDecls(
+        self: *ModuleLoader,
+        module_prefix: []const u8,
+        sub_name: []const u8,
+        sub_module: ast.Module,
+        sibling_modules: *std.StringHashMap([]const u8),
+        extra_decls: *std.ArrayList(ast.Decl),
+        ast_arena: std.mem.Allocator,
+    ) !void {
+        // 构建 local_renames：同模块 pub fun/val 短名 → mangled name
+        var local_renames = std.StringHashMap([]const u8).init(self.allocator);
+        defer local_renames.deinit();
+        for (sub_module.declarations) |sd| {
+            switch (sd) {
+                .fun_decl => |fd| {
+                    if (fd.visibility == .public) {
+                        const mangled = std.fmt.allocPrint(ast_arena, "{s}.{s}.{s}", .{ module_prefix, sub_name, fd.name }) catch continue;
+                        local_renames.put(fd.name, mangled) catch continue;
+                    }
+                },
+                .expr_decl => |ed| {
+                    if (ed.stmt) |st| {
+                        switch (st.*) {
+                            .val_decl => |vd| {
+                                if (vd.visibility == .public) {
+                                    const mangled = std.fmt.allocPrint(ast_arena, "{s}.{s}.{s}", .{ module_prefix, sub_name, vd.name }) catch continue;
+                                    local_renames.put(vd.name, mangled) catch continue;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        for (sub_module.declarations) |sub_decl| {
+            switch (sub_decl) {
+                .fun_decl => |fd| {
+                    if (fd.visibility == .public) {
+                        const mangled_name = local_renames.get(fd.name) orelse continue;
+                        var new_fd = fd;
+                        new_fd.name = mangled_name;
+                        new_fd.visibility = .private;
+                        // 同步重写函数体内部对同模块函数的短名调用
+                        ast_rewrite.rewriteModuleCalls(new_fd.body, &local_renames, sibling_modules, ast_arena);
+                        try extra_decls.append(self.allocator, .{ .fun_decl = new_fd });
+                    }
+                },
+                // 合并 pub type_decl：newtype/record/ADT 类型定义需要被加载，
+                // 否则函数体内部的 newtype 构造器会找不到类型
+                .type_decl => |td| {
+                    if (td.visibility == .public) {
+                        var new_td = td;
+                        new_td.visibility = .private;
+                        try extra_decls.append(self.allocator, .{ .type_decl = new_td });
+                    }
+                },
+                // 合并 pub val 声明（expr_decl 包装的 val_decl）
+                .expr_decl => |ed| {
+                    if (ed.stmt) |st| {
+                        switch (st.*) {
+                            .val_decl => |vd| {
+                                if (vd.visibility == .public) {
+                                    const mangled_name = local_renames.get(vd.name) orelse continue;
+                                    const new_stmt = ast_arena.create(ast.Stmt) catch continue;
+                                    new_stmt.* = .{ .val_decl = .{
+                                        .name = mangled_name,
+                                        .type_annotation = vd.type_annotation,
+                                        .value = vd.value,
+                                        .visibility = .private,
+                                    } };
+                                    // 重写 value 表达式中的同模块短名调用
+                                    ast_rewrite.rewriteModuleCalls(vd.value, &local_renames, sibling_modules, ast_arena);
+                                    const new_expr = ast_arena.create(ast.Expr) catch continue;
+                                    new_expr.* = .{ .unit_literal = {} };
+                                    try extra_decls.append(self.allocator, .{ .expr_decl = .{
+                                        .location = ed.location,
+                                        .expr = new_expr,
+                                        .stmt = new_stmt,
+                                    } });
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
     }
 };

@@ -35,18 +35,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // ---- 并发原语模块：互斥锁、条件变量 ----
-    const sync_module = b.createModule(.{
-        .root_source_file = b.path("src/sync/sync.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // ---- 调试分配器模块（独立于 mem 入口，被 root/debug 命令使用） ----
     const debug_allocator_module = b.createModule(.{
         .root_source_file = b.path("src/mem/debug_allocator.zig"),
         .target = target,
         .optimize = optimize,
     });
-    debug_allocator_module.addImport("sync", sync_module);
 
     // ---- 内存管理模块入口 ----
     const mem_module = b.createModule(.{
@@ -54,19 +48,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mem_module.addImport("sync", sync_module);
     // mem → profiling 单向依赖：thread_ctx.zig 使用 ThreadProfiler/GlobalProfiler
     // profiling 不依赖 mem/value（stats.zig 用 u8 索引而非 RefKind，打破循环）
     mem_module.addImport("profiling", profiler_module);
 
-    // ---- 值系统模块：依赖并发原语 ----
+    // ---- 值系统模块 ----
     const value_module = b.createModule(.{
         .root_source_file = b.path("src/value/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     value_module.addImport("ast", ast_module);
-    value_module.addImport("sync", sync_module);
     value_module.addImport("mem", mem_module);
     // profiling 需要 value 模块中的 obj_header（RefKind / ref_kind_count）
     profiler_module.addImport("value", value_module);
@@ -130,6 +122,14 @@ pub fn build(b: *std.Build) void {
     });
     module_check_module.addImport("ast", ast_module);
 
+    // ---- Stdlib 嵌入模块：@embedFile 把 std/ 下的 .glue 文件编进二进制 ----
+    // 供 module_loader 的 loadDecls 解析 import std.* 时查找
+    const std_embed_module = b.createModule(.{
+        .root_source_file = b.path("src/std/embed.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ---- 模块加载器：串联前端与语义分析 ----
     const module_loader_module = b.createModule(.{
         .root_source_file = b.path("src/parse/module_loader.zig"),
@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) void {
     module_loader_module.addImport("parser", parser_module);
     module_loader_module.addImport("sema", type_check_module);
     module_loader_module.addImport("analysis_db", analysis_db_module);
+    module_loader_module.addImport("std_embed", std_embed_module);
 
     // ---- 语义分析模块间的交叉依赖：子检查器引用主类型检查器 ----
     type_check_module.addImport("subtype_check", subtype_check_module);
@@ -176,14 +177,6 @@ pub fn build(b: *std.Build) void {
     syscall_module.addImport("ir", ir_module);
     syscall_module.addImport("value", value_module);
 
-    // ---- Stdlib 嵌入模块：@embedFile 把 std/ 下的 .glue 文件编进二进制 ----
-    // 供 main.zig 的 loadImportedDeclarations 解析 import std.* 时查找
-    const std_embed_module = b.createModule(.{
-        .root_source_file = b.path("src/std/embed.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // ---- sema 模块接入 IR 管线：type_check 及子检查器可读取 SemaResult 契约 ----
     // 依赖方向：sema → ir → (ast, value)，ir 不依赖 sema，无循环。
     type_check_module.addImport("ir", ir_module);
@@ -216,14 +209,12 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("lexer", lexer_module);
     root_module.addImport("parser", parser_module);
     root_module.addImport("module_loader", module_loader_module);
-    root_module.addImport("value", value_module);
     root_module.addImport("profiler", profiler_module);
     root_module.addImport("sema", type_check_module);
     root_module.addImport("debug_allocator", debug_allocator_module);
     root_module.addImport("ir", ir_module);
     root_module.addImport("engine", engine_module);
     root_module.addImport("analysis_db", analysis_db_module);
-    root_module.addImport("std_embed", std_embed_module);
 
     const exe = b.addExecutable(.{
         .name = "glue",
@@ -240,7 +231,6 @@ pub fn build(b: *std.Build) void {
     });
     deepcopy_bench_module.addImport("value", value_module);
     deepcopy_bench_module.addImport("mem", mem_module);
-    deepcopy_bench_module.addImport("sync", sync_module);
     deepcopy_bench_module.addImport("ast", ast_module);
     const deepcopy_bench_exe = b.addExecutable(.{
         .name = "deepcopy_bench",
@@ -284,13 +274,13 @@ pub fn build(b: *std.Build) void {
     const run_builtin_unit_tests = b.addRunArtifact(builtin_unit_tests);
 
     // 内存管理新模块测试（page_pool/buddy/channel_region/shadow_arena/global_pool/thread_ctx）
-    const mem_test_modules = [_]struct { name: []const u8, file: []const u8, need_sync: bool, need_profiling: bool }{
-        .{ .name = "page_pool", .file = "src/mem/page_pool.zig", .need_sync = false, .need_profiling = false },
-        .{ .name = "buddy", .file = "src/mem/buddy.zig", .need_sync = true, .need_profiling = false },
-        .{ .name = "channel_region", .file = "src/mem/channel_region.zig", .need_sync = false, .need_profiling = false },
-        .{ .name = "shadow_arena", .file = "src/mem/shadow_arena.zig", .need_sync = false, .need_profiling = false },
-        .{ .name = "global_pool", .file = "src/mem/global_pool.zig", .need_sync = true, .need_profiling = false },
-        .{ .name = "thread_ctx", .file = "src/mem/thread_ctx.zig", .need_sync = true, .need_profiling = true },
+    const mem_test_modules = [_]struct { name: []const u8, file: []const u8, need_profiling: bool }{
+        .{ .name = "page_pool", .file = "src/mem/page_pool.zig", .need_profiling = false },
+        .{ .name = "buddy", .file = "src/mem/buddy.zig", .need_profiling = false },
+        .{ .name = "channel_region", .file = "src/mem/channel_region.zig", .need_profiling = false },
+        .{ .name = "shadow_arena", .file = "src/mem/shadow_arena.zig", .need_profiling = false },
+        .{ .name = "global_pool", .file = "src/mem/global_pool.zig", .need_profiling = false },
+        .{ .name = "thread_ctx", .file = "src/mem/thread_ctx.zig", .need_profiling = true },
     };
     var mem_test_runs: [mem_test_modules.len]*std.Build.Step.Run = undefined;
     for (mem_test_modules, 0..) |m, i| {
@@ -299,20 +289,18 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        if (m.need_sync) mod.addImport("sync", sync_module);
         if (m.need_profiling) mod.addImport("profiling", profiler_module);
         const test_art = b.addTest(.{ .root_module = mod });
         test_art.root_module.linkSystemLibrary("c", .{});
         mem_test_runs[i] = b.addRunArtifact(test_art);
     }
 
-    // 值系统单独构建一份用于测试（需导入 sync 供 concurrent.zig 使用）
+    // 值系统单独构建一份用于测试
     const value_module_test = b.createModule(.{
         .root_source_file = b.path("src/value/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
-    value_module_test.addImport("sync", sync_module);
     value_module_test.addImport("ast", ast_module);
     value_module_test.addImport("mem", mem_module);
     const value_unit_tests = b.addTest(.{

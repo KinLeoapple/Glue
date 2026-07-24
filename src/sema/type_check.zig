@@ -3170,7 +3170,7 @@ pub const TypeInferencer = struct {
             if (decl != .import_decl) continue;
             const ud = decl.import_decl;
             if (ud.module_path.len == 0) continue;
-            // 选择性导入也需注册模块路径首段为模块引用：loadImportedDeclarations
+            // 选择性导入也需注册模块路径首段为模块引用：ModuleLoader.loadDecls
             // 全量加载 pack 内子模块（含跨模块依赖），这些子模块内部使用完整路径
             // （如 DateTime.glue 的 std.time.DateTime.from_components），需要首段
             // （如 std）在 env 中可见，否则 sema 报 undefined variable。

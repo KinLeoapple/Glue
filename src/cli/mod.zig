@@ -31,14 +31,15 @@ pub fn main(init: std.process.Init) !void {
         const name: ?[]const u8 = if (args_slice.len >= 3) args_slice[2] else null;
         try init_cmd.cmdInit(allocator, io, name);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "debug")) {
+        var profile_cfg = args_mod.ProfileConfig{};
         for (args_slice[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--profile")) {
-                args_mod.profile_enabled = true;
+                profile_cfg.enabled = true;
             } else if (std.mem.startsWith(u8, arg, "--profile-json=")) {
-                args_mod.profile_enabled = true;
-                args_mod.profile_json_path = arg["--profile-json=".len..];
+                profile_cfg.enabled = true;
+                profile_cfg.json_path = arg["--profile-json=".len..];
             } else if (std.mem.startsWith(u8, arg, "--profile-interval=")) {
-                args_mod.profile_interval_us = std.fmt.parseInt(u64, arg["--profile-interval=".len..], 10) catch {
+                profile_cfg.interval_us = std.fmt.parseInt(u64, arg["--profile-interval=".len..], 10) catch {
                     printError(io, "error: invalid --profile-interval value\n\n", .{});
                     printUsage(io);
                     std.process.exit(1);
@@ -49,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
         }
-        try run_cmd.runProject(allocator, io, std.mem.eql(u8, cmd, "debug"));
+        try run_cmd.runProject(allocator, io, profile_cfg, std.mem.eql(u8, cmd, "debug"));
     } else {
         printError(io, "error: unknown command '{s}'\n\n", .{cmd});
         printUsage(io);

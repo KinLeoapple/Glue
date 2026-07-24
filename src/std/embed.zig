@@ -3,7 +3,7 @@
 //! 使用 @embedFile 在编译期把所有 stdlib .glue 文件内容嵌入到二进制中，
 //! 使用户代码可以通过 `import std.io.Fs` 等路径加载标准库（设计文档 §2.3）。
 //!
-//! 查找规则（main.zig 的 loadImportedDeclarations 中）：
+//! 查找规则（module_loader 的 loadStdlibPack 中）：
 //!   - import std.io.Fs  → 读 "io/pack.glue" 与 "io/<X>.glue"（X 遍历 pack 中的 pub pack）
 //!   - import std.time.Timer → 读 "time/pack.glue" 与 "time/<X>.glue"
 //!
