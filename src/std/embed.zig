@@ -38,6 +38,13 @@ pub const STDLIB_FILES = [_]StdlibFile{
     .{ .path = "time/DateTime.glue", .content = @embedFile("time/DateTime.glue") },
     .{ .path = "time/Calendar.glue", .content = @embedFile("time/Calendar.glue") },
     .{ .path = "time/Timer.glue", .content = @embedFile("time/Timer.glue") },
+    // ── Net 模块 ──
+    .{ .path = "net/pack.glue", .content = @embedFile("net/pack.glue") },
+    .{ .path = "net/Addr.glue", .content = @embedFile("net/Addr.glue") },
+    .{ .path = "net/TcpListener.glue", .content = @embedFile("net/TcpListener.glue") },
+    .{ .path = "net/TcpStream.glue", .content = @embedFile("net/TcpStream.glue") },
+    .{ .path = "net/UdpSocket.glue", .content = @embedFile("net/UdpSocket.glue") },
+    .{ .path = "net/Dns.glue", .content = @embedFile("net/Dns.glue") },
 };
 
 /// 按相对路径查找嵌入的 stdlib 文件内容，未命中返回 null
@@ -52,8 +59,8 @@ pub fn find(path: []const u8) ?[]const u8 {
 
 const testing = std.testing;
 
-test "STDLIB_FILES 包含 13 个文件" {
-    try testing.expectEqual(@as(usize, 13), STDLIB_FILES.len);
+test "STDLIB_FILES 包含 19 个文件" {
+    try testing.expectEqual(@as(usize, 19), STDLIB_FILES.len);
 }
 
 test "find 命中 io/pack.glue" {
@@ -83,10 +90,17 @@ test "IO 与 Time 模块文件齐全" {
         "time/SystemTime.glue", "time/DateTime.glue", "time/Calendar.glue",
         "time/Timer.glue",
     };
+    const net_files = [_][]const u8{
+        "net/pack.glue", "net/Addr.glue", "net/TcpListener.glue",
+        "net/TcpStream.glue", "net/UdpSocket.glue", "net/Dns.glue",
+    };
     inline for (io_files) |p| {
         try testing.expect(find(p) != null);
     }
     inline for (time_files) |p| {
+        try testing.expect(find(p) != null);
+    }
+    inline for (net_files) |p| {
         try testing.expect(find(p) != null);
     }
 }

@@ -368,12 +368,23 @@ pub const AsyncStatus = enum(u8) {
 /// 调用方可通过原子字段查询任务状态，并在任务完成后消费结果。
 /// 引用计数通过 ObjHeader 统一管理。
 /// panic_message 使用内联固定缓冲区，避免跨线程分配/释放导致的 double-free。
+///
+/// 跨线程结果传递协议（修复 use-after-free）：
+/// - worker 在 setResult 后不立即 deinit tctx，而是等待 result_consumed
+/// - 主线程在 join + deepCopy 完成后设置 result_consumed
+/// - worker 收到信号后执行 engine.deinit + tctx.deinit，再设置 worker_done
+/// - 主线程（或 AsyncHandle.deinit）等待 worker_done 确保资源释放完成
+/// 这样主线程读取的 result 始终指向 worker tctx 中的有效内存。
 pub const AsyncHandle = struct {
     header: ObjHeader = .{ .type_tag = .async_val },
     status: std.atomic.Value(AsyncStatus),
     result: ?Value,
     consumed: std.atomic.Value(bool),
     finished: std.atomic.Value(bool),
+    /// 主线程消费结果后设置（worker 等待此标志后才能 deinit tctx）
+    result_consumed: std.atomic.Value(bool),
+    /// worker 线程完全退出后设置（主线程等待此标志确保 worker 清理完成）
+    worker_done: std.atomic.Value(bool),
     panic_buf: [PANIC_BUF_SIZE]u8 = [_]u8{0} ** PANIC_BUF_SIZE,
     panic_len: u8 = 0,
     mutex: Mutex,
@@ -388,20 +399,44 @@ pub const AsyncHandle = struct {
             .result = null,
             .consumed = std.atomic.Value(bool).init(false),
             .finished = std.atomic.Value(bool).init(false),
+            .result_consumed = std.atomic.Value(bool).init(false),
+            .worker_done = std.atomic.Value(bool).init(false),
             .mutex = .{},  // Mutex 默认值（state=0=UNLOCKED）
             .condition = .{},
         };
     }
 
-    /// 释放句柄持有的资源（未消费的结果）。
+    /// 释放句柄持有的资源。
+    /// 通知 worker 结果已消费（解除 worker 等待），并等待 worker 完全退出。
+    /// worker 的 engine.deinit 会释放 result（作为 tracked_obj），此处不重复释放。
     /// panic_message 为内联缓冲区，无需释放。
     pub fn deinit(self: *AsyncHandle, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
-            if (self.result) |r| {
-                var v = r;
-                v.release(tctx);
-            }
+        _ = tctx;
+        // 通知 worker 可以清理（fire-and-forget 场景下 join 未调用）
+        self.result_consumed.store(true, .release);
+        // 等待 worker 完全退出，确保 ChannelRegion 等 backing 资源已释放
+        while (!self.worker_done.load(.acquire)) {
+            std.Thread.yield() catch {};
         }
+        // worker 已退出，result 由 worker engine.deinit 的 tracked_objs 循环释放
+        self.result = null;
+    }
+
+    /// 主线程消费结果后调用，通知 worker 可以释放 tctx
+    pub fn signalConsumed(self: *AsyncHandle) void {
+        self.result_consumed.store(true, .release);
+    }
+
+    /// 主线程等待 worker 完全退出（engine.deinit + tctx.deinit 完成）
+    pub fn waitWorkerDone(self: *AsyncHandle) void {
+        while (!self.worker_done.load(.acquire)) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    /// worker 线程退出前调用，标记 worker 已完成清理
+    pub fn signalWorkerDone(self: *AsyncHandle) void {
+        self.worker_done.store(true, .release);
     }
 
     /// 设置任务状态（原子操作）

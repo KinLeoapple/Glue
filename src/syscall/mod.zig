@@ -19,6 +19,8 @@ const ir_mod = @import("ir");
 
 pub const io = @import("io.zig");
 pub const time = @import("time.zig");
+pub const net = @import("net.zig");
+pub const util = @import("util.zig");
 
 pub const SyscallId = ir_mod.SyscallId;
 
@@ -67,10 +69,24 @@ pub fn dispatch(io_inst: std.Io, tctx: *ThreadContext, id: SyscallId, args: []co
         .systemtime_to_local_components => time.systemtime_to_local_components(io_inst, tctx, args),
         .systemtime_to_utc_components => time.systemtime_to_utc_components(io_inst, tctx, args),
         .components_to_ns_utc => time.components_to_ns_utc(io_inst, tctx, args),
+
+        // Net syscall
+        .net_resolve => net.net_resolve(io_inst, tctx, args),
+        .net_tcp_listen => net.net_tcp_listen(io_inst, tctx, args),
+        .net_tcp_accept => net.net_tcp_accept(io_inst, tctx, args),
+        .net_tcp_connect => net.net_tcp_connect(io_inst, tctx, args),
+        .net_tcp_read => net.net_tcp_read(io_inst, tctx, args),
+        .net_tcp_write => net.net_tcp_write(io_inst, tctx, args),
+        .net_tcp_close => net.net_tcp_close(io_inst, tctx, args),
+        .net_udp_bind => net.net_udp_bind(io_inst, tctx, args),
+        .net_udp_send_to => net.net_udp_send_to(io_inst, tctx, args),
+        .net_udp_recv_from => net.net_udp_recv_from(io_inst, tctx, args),
     };
 }
 
 test {
     _ = io;
     _ = time;
+    _ = net;
+    _ = util;
 }

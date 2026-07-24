@@ -1,0 +1,86 @@
+// Test: TCP echo — bind + accept + connect + read + write + close
+import std.net.Addr
+import std.net.TcpListener
+import std.net.TcpStream
+
+// Client task: connect, send "Hello", read echo, close
+async fun client_task(addr: SocketAddr): Async<Throw<Unit, IOError>> {
+    val stream = std.net.TcpStream.connect(addr, 0i64).await()?
+    val msg = [72u8, 101u8, 108u8, 108u8, 111u8]  // "Hello"
+    val written = stream.write(msg, 5usize, 0i64).await()?
+    val data = stream.read(64usize, 0i64).await()?
+    if data.len() == 5usize {
+        // Check echo matches "Hello"
+        val ok = data[0] == 72u8 && data[1] == 101u8 && data[2] == 108u8 && data[3] == 108u8 && data[4] == 111u8
+        if ok {
+            println("client: echo ok")
+        } else {
+            println("client: echo mismatch")
+        }
+    } else {
+        println("client: short read")
+        println(data.len())
+    }
+    stream.close().await()?
+    Ok(())
+}
+
+fun main() {
+    val lo = std.net.Addr.v4_loopback()
+    val ip = std.net.Addr.ip_from_v4(lo)
+    val addr = std.net.Addr.socket_from(ip, 18089u16)
+
+    val bind_result = std.net.TcpListener.bind(addr, true).await()
+    match bind_result {
+        Ok(l) => {
+            println("bind ok, fd=")
+            println(l.fd)
+
+            // Spawn client concurrently
+            val client = client_task(addr)
+
+            // Accept connection
+            val accept_result = l.accept(0i64).await()
+            match accept_result {
+                Ok(ar) => {
+                    println("accept ok, stream_fd=")
+                    println(ar.stream_fd)
+
+                    val stream = std.net.TcpStream.from_accept_fd(ar.stream_fd, ar.peer_addr)
+
+                    // Read client data
+                    val read_result = stream.read(64usize, 0i64).await()
+                    match read_result {
+                        Ok(data) => {
+                            println("server read bytes=")
+                            println(data.len())
+
+                            // Echo back
+                            val write_result = stream.write(data, data.len(), 0i64).await()
+                            match write_result {
+                                Ok(_) => println("server echo ok"),
+                                Error(e) => println("server write err: " + e.message()),
+                            }
+                        },
+                        Error(e) => println("server read err: " + e.message()),
+                    }
+
+                    stream.close().await()
+
+                    // Wait for client to finish
+                    val client_result = client.await()
+                    match client_result {
+                        Ok(_) => println("client done ok"),
+                        Error(e) => println("client err: " + e.message()),
+                    }
+                },
+                Error(e) => println("accept err: " + e.message()),
+            }
+
+            l.close().await()
+        },
+        Error(e) => println("bind err: " + e.message()),
+    }
+
+    println("net_tcp_test: done")
+}

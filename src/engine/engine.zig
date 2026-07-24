@@ -38,6 +38,7 @@ const TypeKind = ir_mod.meta_mod.TypeKind;
 
 const debug_route_dispatch = false;
 const debug_record = false;
+const debug_orbit = false;
 const ThreadContext = mem.ThreadContext;
 const GlobalPool = mem.GlobalPool;
 
@@ -645,6 +646,13 @@ pub const Engine = struct {
             const node_start = func.node_start;
             self.current_func_idx = func_idx;
 
+            if (debug_orbit and func_idx == 0) {
+                std.debug.print("=== main function nodes (count={}) ===\n", .{nodes.len});
+                for (nodes, 0..) |n, i| {
+                    std.debug.print("  [{}] op={s} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ i, @tagName(n.op), if (n.input_count > 0) n.inputs[0] else 0, if (n.input_count > 1) n.inputs[1] else 0, if (n.input_count > 2) n.inputs[2] else 0, if (n.input_count > 3) n.inputs[3] else 0, n.output, n.meta_index });
+                }
+            }
+
         // 构建子图跳过位图：vec_map/vec_fold/vec_scan 等的 body 子图
         // 不在主循环中执行，由对应的 vec_* exec 函数按需执行
         // 同时跳过 cleanup_register 注册的 defer 体（由 cleanup_run 按需执行）
@@ -917,7 +925,12 @@ pub const Engine = struct {
                             // 非 TCO 函数也受益于直接调用（record/route/算术等 op 密集场景）
                             if (fbc.body_has_call) {
                                 for (fbc.body_insts) |inst| {
-                                    try inst.exec(self, inst.node);
+                                    inst.exec(self, inst.node) catch |err| {
+                                        if (err == error.InvalidChannel and debug_orbit) {
+                                            std.debug.print("InvalidChannel(BodyInst) op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ @tagName(inst.node.op), func_idx, if (inst.node.input_count > 0) inst.node.inputs[0] else 0, if (inst.node.input_count > 1) inst.node.inputs[1] else 0, if (inst.node.input_count > 2) inst.node.inputs[2] else 0, if (inst.node.input_count > 3) inst.node.inputs[3] else 0, inst.node.output, inst.node.meta_index });
+                                        }
+                                        return err;
+                                    };
                                     if (self.pending_halt) |halt_c| {
                                         self.pending_halt = null;
                                         halt_chan = halt_c;
@@ -934,7 +947,12 @@ pub const Engine = struct {
                             } else {
                                 // body 无 call 节点：跳过 tco_restart 检查（hot path 优化）
                                 for (fbc.body_insts) |inst| {
-                                    try inst.exec(self, inst.node);
+                                    inst.exec(self, inst.node) catch |err| {
+                                        if (err == error.InvalidChannel and debug_orbit) {
+                                            std.debug.print("InvalidChannel(BodyInst/no-call) op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ @tagName(inst.node.op), func_idx, if (inst.node.input_count > 0) inst.node.inputs[0] else 0, if (inst.node.input_count > 1) inst.node.inputs[1] else 0, if (inst.node.input_count > 2) inst.node.inputs[2] else 0, if (inst.node.input_count > 3) inst.node.inputs[3] else 0, inst.node.output, inst.node.meta_index });
+                                        }
+                                        return err;
+                                    };
                                     if (self.pending_halt) |halt_c| {
                                         self.pending_halt = null;
                                         halt_chan = halt_c;
@@ -1047,6 +1065,9 @@ pub const Engine = struct {
                     }
 
                     const result = self.execNode(node) catch |err| {
+                        if (err == error.InvalidChannel and debug_orbit) {
+                            std.debug.print("InvalidChannel at node pc={} op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ pc, @tagName(node.op), func_idx, if (node.input_count > 0) node.inputs[0] else 0, if (node.input_count > 1) node.inputs[1] else 0, if (node.input_count > 2) node.inputs[2] else 0, if (node.input_count > 3) node.inputs[3] else 0, node.output, node.meta_index });
+                        }
                         return err;
                     };
                     if (self.tco_restart) {
@@ -5564,6 +5585,9 @@ pub const Engine = struct {
             while (i < len) : (i += 1) {
                 const node: *const Node = &nodes[start + i];
                 const r = self.execNode(node) catch |err| {
+                    if (err == error.InvalidChannel and debug_orbit) {
+                        std.debug.print("InvalidChannel(execBodyNodes) op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ @tagName(node.op), self.current_func_idx, if (node.input_count > 0) node.inputs[0] else 0, if (node.input_count > 1) node.inputs[1] else 0, if (node.input_count > 2) node.inputs[2] else 0, if (node.input_count > 3) node.inputs[3] else 0, node.output, node.meta_index });
+                    }
                     return err;
                 };
                 // 检查 tco_restart：execCall 检测到自递归时设置
@@ -5637,6 +5661,9 @@ pub const Engine = struct {
             if (local_skip[i]) continue;
             const node: *const Node = &nodes[start + i];
             const r = self.execNode(node) catch |err| {
+                if (err == error.InvalidChannel and debug_orbit) {
+                    std.debug.print("InvalidChannel(execBodyNodes/nested) op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ @tagName(node.op), self.current_func_idx, if (node.input_count > 0) node.inputs[0] else 0, if (node.input_count > 1) node.inputs[1] else 0, if (node.input_count > 2) node.inputs[2] else 0, if (node.input_count > 3) node.inputs[3] else 0, node.output, node.meta_index });
+                }
                 return err;
             };
             // 检查 tco_restart：execCall 检测到自递归时设置
@@ -8584,6 +8611,9 @@ pub const Engine = struct {
     fn execOrbitAsyncCreate(self: *Engine, node: *const Node) EngineError!void {
         if (node.meta_index == 0 or node.meta_index > self.ir.orbit_metas.len) return error.InvalidMetaIndex;
         const om = self.ir.orbit_metas[node.meta_index - 1];
+        if (debug_orbit) {
+            std.debug.print("orbit_create: meta_idx={} func_idx={} output_chan={} arg_count={}\n", .{ node.meta_index, om.func_index, node.output, om.arg_count });
+        }
 
         // 创建 AsyncHandle
         const handle = self.tctx.?.createObj(value.AsyncHandle) catch return error.OutOfMemory;
@@ -8630,6 +8660,7 @@ pub const Engine = struct {
             .global = self.global.?,
             .backing = self.tctx.?.backing,
             .global_prof = self.tctx.?.global_prof,
+            .io = self.io,
         };
 
         // spawn 线程执行 async 函数
@@ -8644,18 +8675,40 @@ pub const Engine = struct {
     /// inputs[0] = handle 通道（ref_chan）
     /// output = 结果通道
     /// 值语义：普通复合类型返回值深拷贝到主线程，&T / *T 保持共享
+    ///
+    /// 跨线程结果传递协议：
+    /// 1. join() 获取 result_val（指向 worker tctx 中的有效内存）
+    /// 2. deepCopy 到主线程 tctx（读取 worker 内存，需 worker tctx 存活）
+    /// 3. signalConsumed 通知 worker 可以清理
+    /// 4. waitWorkerDone 确保 worker 完全退出（避免泄漏检测竞态）
     fn execOrbitAsyncJoin(self: *Engine, node: *const Node) EngineError!void {
+        if (debug_orbit) {
+            const in_meta = self.ir.channels.get(node.inputs[0]);
+            const out_meta = self.ir.channels.get(node.output);
+            std.debug.print("orbit_join: input_chan={} input_type={s} output_chan={} output_type={s} meta_idx={}\n", .{ node.inputs[0], @tagName(in_meta.chan_type), node.output, @tagName(out_meta.chan_type), node.meta_index });
+        }
         const handle = self.readAsyncHandle(node.inputs[0]) orelse {
+            if (debug_orbit) {
+                const ptr = self.runtime.readPtr(node.inputs[0]);
+                std.debug.print("orbit_join: readAsyncHandle FAILED, ptr={?}\n", .{ptr});
+            }
             return error.InvalidChannel;
         };
 
         // 阻塞等待完成
         const result_val = handle.join();
 
+        // 确保无论如何都通知 worker 并等待其退出（避免 worker 永久阻塞）
+        defer {
+            handle.signalConsumed();
+            handle.waitWorkerDone();
+        }
+
         // 将结果写入 output 通道
         if (result_val) |v| {
             const out_meta = self.ir.channels.get(node.output);
             const out_val = if (out_meta.chan_type == .ref_chan and !out_meta.is_ref) blk: {
+                // 深拷贝到主线程 tctx：此时 worker tctx 仍存活，读取安全
                 const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                 try self.trackValueTree(copied);
                 break :blk copied;
@@ -9250,20 +9303,29 @@ const OrbitThreadData = struct {
     backing: std.mem.Allocator,
     /// GlobalProfiler 引用（worker 线程创建 ThreadProfiler 用，null 时不采集）
     global_prof: ?*profiling.GlobalProfiler = null,
+    /// IO 实例（worker 线程执行 syscall 时需要，如 net/io 操作）
+    io: ?std.Io = null,
 };
 
 /// 星轨 worker 线程函数：在独立线程中执行 async 函数
 /// 创建独立的 Engine 实例（共享 IR 和 GlobalPool，独立 ThreadContext + Runtime，避免通道存储竞争）
-/// 注意：必须在设置结果（setResult，会解除 join() 阻塞）之前完成所有资源清理，
-/// 否则主线程的测试分配器会在 worker 清理未完成时检测到泄漏。
+///
+/// 跨线程结果传递协议：
+/// 1. 执行函数，读取 result_val（RC=1，由 worker engine 跟踪）
+/// 2. setResult(result_val) —— tctx 仍存活，result 指向有效内存
+/// 3. 等待主线程 result_consumed（主线程在此期间 deepCopy 到自己的 tctx）
+/// 4. 主线程完成 deepCopy 后设置 result_consumed
+/// 5. worker 执行 engine.deinit（释放 tracked_objs 包括 result）+ tctx.deinit
+/// 6. worker 设置 worker_done，主线程解除 waitWorkerDone
 fn orbitWorker(data: *OrbitThreadData) void {
     const alloc = data.backing;
-    const handle = data.handle; // 保存 handle 指针，因为 data 会在 setResult 前释放
+    const handle = data.handle; // 保存 handle 指针，因为 data 会在清理前释放
 
     // 创建 worker 线程独立的 ThreadContext（每线程独立，零锁热路径）
     var tctx = ThreadContext.init(data.global, alloc, data.global_prof) catch {
         alloc.destroy(data);
         handle.setPanic("Failed to init ThreadContext");
+        handle.signalWorkerDone();
         return;
     };
     defer tctx.deinit();
@@ -9272,14 +9334,18 @@ fn orbitWorker(data: *OrbitThreadData) void {
     var engine = Engine.init(data.ir, &tctx) catch {
         alloc.destroy(data);
         handle.setPanic("Failed to init engine");
+        handle.signalWorkerDone();
         return;
     };
+    // 注入 IO 实例（syscall 执行 net/io 操作时需要）
+    engine.io = data.io;
 
     // 布局全局通道存储（独立于主线程）
     engine.runtime.layoutGlobals(&data.ir.channels) catch {
         engine.deinit();
         alloc.destroy(data);
         handle.setPanic("Failed to layout channels");
+        handle.signalWorkerDone();
         return;
     };
 
@@ -9291,6 +9357,7 @@ fn orbitWorker(data: *OrbitThreadData) void {
         engine.deinit();
         alloc.destroy(data);
         handle.setPanic("Failed to enter function");
+        handle.signalWorkerDone();
         return;
     };
 
@@ -9308,6 +9375,7 @@ fn orbitWorker(data: *OrbitThreadData) void {
                     tctx.deinit();
                     alloc.destroy(data);
                     handle.setPanic("deepCopy failed for async argument");
+                    handle.signalWorkerDone();
                     return;
                 };
                 engine.trackValueTree(copied) catch {};
@@ -9324,42 +9392,42 @@ fn orbitWorker(data: *OrbitThreadData) void {
     }
 
     // 执行函数
-    const result_chan = engine.execFunction(data.func_idx, func.param_channels) catch {
+    const result_chan = engine.execFunction(data.func_idx, func.param_channels) catch |err| {
+        if (debug_orbit) {
+            std.debug.print("orbit_worker: execFunction FAILED func_idx={} err={s}\n", .{ data.func_idx, @errorName(err) });
+        }
         engine.runtime.leaveFunction();
         engine.deinit();
+        tctx.deinit();
         alloc.destroy(data);
         handle.setPanic("Function execution failed");
+        handle.signalWorkerDone();
         return;
     };
 
     // 读取结果（在 leaveFunction 之前，因为 leaveFunction 会 resetTo 回收通道内存）
     const result_val = engine.readScalarValue(result_chan) catch value.Value.fromNull();
 
-    // 值语义：普通复合类型结果跨线程深拷贝，使其在 worker deinit 后仍然有效
-    const result_meta = data.ir.channels.get(result_chan);
-    const out_result = blk: {
-        if (result_meta.chan_type == .ref_chan and !result_meta.is_ref) {
-            break :blk result_val.deepCopy(&tctx) catch {
-                engine.runtime.leaveFunction();
-                engine.deinit();
-                tctx.deinit();
-                alloc.destroy(data);
-                handle.setPanic("deepCopy failed for async result");
-                return;
-            };
-        }
-        break :blk result_val;
-    };
-
     engine.runtime.leaveFunction();
 
-    // 先清理所有资源（engine + tctx + data），再设置结果（setResult 会解除主线程 join() 阻塞）
-    // 这样主线程在 join() 返回时，worker 的所有分配已释放，避免泄漏检测竞态
-    // 注意：tctx.deinit 必须在 setResult 之前，否则 ChannelRegion 数据未释放时主线程即检测到泄漏
+    // 不再深拷贝：直接传递原始 Value（RC=1，由 worker engine 的 tracked_objs 跟踪）
+    // 主线程在 join 后 deepCopy 到自己的 tctx，读取期间 worker tctx 保持存活
+    handle.setResult(result_val);
+
+    // 等待主线程消费结果（deepCopy 完成后才允许清理 tctx）
+    // 这确保主线程读取的 result 始终指向有效内存
+    while (!handle.result_consumed.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+
+    // 主线程已完成 deepCopy，安全清理
+    // engine.deinit 释放 tracked_objs（包括 result_val），tctx.deinit 释放页池和 ChannelRegion
     engine.deinit();
     tctx.deinit(); // defer tctx.deinit() 将成为 no-op（ChannelRegion.data 已置 null）
     alloc.destroy(data);
-    handle.setResult(out_result);
+
+    // 通知主线程 worker 已完全退出
+    handle.signalWorkerDone();
 }
 
 // ════════════════════════════════════════════════════════════════

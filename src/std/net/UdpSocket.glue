@@ -1,0 +1,61 @@
+// UdpSocket.glue — UDP 套接字
+//
+// 设计文档 §6.4：UdpSocket newtype + send_to/recv_from/close。
+// 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>。
+//
+// RecvFromResult 布局（与 syscall/net.zig makeRecordWithNames 对齐）：
+//   fields = [__tag=0, data=u8[], src_addr=SocketAddr]
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+// RecvFromResult：newtype，fields = [__tag=0, data=u8[], src_addr=SocketAddr]
+// data 为收到的字节数组，长度可通过 data.len() 获取。
+pub type RecvFromResult = RecvFromResult(data: u8[], src_addr: SocketAddr)
+
+// UdpSocket：newtype，fd 跨平台 i64 存储句柄
+pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool)
+
+// ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
+
+// 绑定 UDP 地址。reuse_addr 为预留参数（syscall 层当前未使用）。
+pub async fun bind(addr: SocketAddr, reuse_addr: bool): Async<Throw<UdpSocket, IOError>> {
+    val fd = __net_udp_bind(addr.ip, addr.port, reuse_addr)?
+    Ok(UdpSocket(fd, addr, false))
+}
+
+// ─── 实例方法（self : UdpSocket） ─────────────────────────────────
+
+// 向目标地址发送 UDP 数据报。返回实际发送字节数。
+// send_to 直接使用 buf 的完整长度（syscall 无 len 参数）。
+pub async fun send_to(self: UdpSocket, dst: SocketAddr, buf: u8[]): Async<Throw<usize, IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "socket closed", 0, null)
+    }
+    __net_udp_send_to(self.fd, dst.ip, dst.port, buf)?
+}
+
+// 接收 UDP 数据报。返回 RecvFromResult(data, src_addr)。
+// timeout_ns <= 0 时无超时。
+pub async fun recv_from(self: UdpSocket, len: usize, timeout_ns: i64): Async<Throw<RecvFromResult, IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "socket closed", 0, null)
+    }
+    __net_udp_recv_from(self.fd, len, timeout_ns)?
+}
+
+// 关闭套接字。幂等：重复 close 不报错。
+// UDP 套接字复用 __net_tcp_close（底层都是 close(fd)）。
+pub async fun close(self: UdpSocket): Async<Throw<Unit, IOError>> {
+    if self.is_closed {
+        Ok(())
+    } else {
+        self.is_closed = true
+        __net_tcp_close(self.fd)?
+        Ok(())
+    }
+}
+
+// 返回绑定地址（构造时传入的本地地址）
+pub fun local_addr(self: UdpSocket): SocketAddr {
+    self.local_addr
+}

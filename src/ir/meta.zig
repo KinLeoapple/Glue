@@ -537,6 +537,17 @@ pub const SyscallId = enum(u16) {
     systemtime_to_local_components,
     systemtime_to_utc_components,
     components_to_ns_utc,
+    // ── Net syscall ──
+    net_resolve,
+    net_tcp_listen,
+    net_tcp_accept,
+    net_tcp_connect,
+    net_tcp_read,
+    net_tcp_write,
+    net_tcp_close,
+    net_udp_bind,
+    net_udp_send_to,
+    net_udp_recv_from,
 };
 
 /// Syscall 元数据

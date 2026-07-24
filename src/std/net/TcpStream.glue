@@ -1,0 +1,61 @@
+// TcpStream.glue — TCP 流
+//
+// 设计文档 §6.3：TcpStream newtype + read/write/close。
+// 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>。
+// 单次 read/write 语义（不循环阻塞，与 File.read 一致）。
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+// TcpStream：newtype，fd 跨平台 i64 存储句柄
+pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool)
+
+// ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
+
+// 发起 TCP 连接。timeout_ns <= 0 时无超时。
+pub async fun connect(addr: SocketAddr, timeout_ns: i64): Async<Throw<TcpStream, IOError>> {
+    val fd = __net_tcp_connect(addr.ip, addr.port, timeout_ns)?
+    Ok(TcpStream(fd, addr, false))
+}
+
+// 从 accept 返回的 fd 构造 TcpStream（服务端使用）。
+// AcceptResult.stream_fd + AcceptResult.peer_addr → TcpStream
+pub fun from_accept_fd(fd: i64, peer: SocketAddr): TcpStream {
+    TcpStream(fd, peer, false)
+}
+
+// ─── 实例方法（self : TcpStream） ─────────────────────────────────
+
+// 从流读取数据，返回读到的字节数组（空数组 = EOF）。
+// timeout_ns <= 0 时无超时。
+// 单次 read 语义（不循环阻塞）。
+pub async fun read(self: TcpStream, len: usize, timeout_ns: i64): Async<Throw<u8[], IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "stream closed", 0, null)
+    }
+    __net_tcp_read(self.fd, len, timeout_ns)?
+}
+
+// 向流写入数据，返回实际写入字节数。
+// timeout_ns <= 0 时无超时。
+pub async fun write(self: TcpStream, buf: u8[], len: usize, timeout_ns: i64): Async<Throw<usize, IOError>> {
+    if self.is_closed {
+        throw IOError(InvalidInput, "stream closed", 0, null)
+    }
+    __net_tcp_write(self.fd, buf, len, timeout_ns)?
+}
+
+// 关闭流。幂等：重复 close 不报错。
+pub async fun close(self: TcpStream): Async<Throw<Unit, IOError>> {
+    if self.is_closed {
+        Ok(())
+    } else {
+        self.is_closed = true
+        __net_tcp_close(self.fd)?
+        Ok(())
+    }
+}
+
+// 返回对端地址（构造时传入的 peer 地址）
+pub fun peer_addr(self: TcpStream): SocketAddr {
+    self.peer_addr
+}

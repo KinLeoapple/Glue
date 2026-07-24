@@ -3181,18 +3181,24 @@ pub const TypeInferencer = struct {
             const mod_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = mod_ty };
             env.redefine(mod, mod_scheme) catch {};
 
-            // 扫描 mangled 名函数 "Module.Sub.method"，提取子模块结构
-            var subs = std.ArrayList([]const u8).empty;
-            defer subs.deinit(self.arena.allocator());
-            var subs_seen = std.StringHashMap(void).init(self.arena.allocator());
-            defer subs_seen.deinit();
-            // 为每个子模块收集方法签名
+            // 扫描 mangled 名函数 "Module.Sub...method"，提取多级子模块结构
+            // 支持 std.net.Addr.v4_loopback 等任意深度的模块路径：
+            //   rest = "net.Addr.v4_loopback" → segs=["net","Addr","v4_loopback"]
+            //   注册 "net" under "std"，"Addr" under "std.net"，method "v4_loopback" under "std.net.Addr"
+            var subs_map = std.StringHashMap(std.ArrayList([]const u8)).init(self.arena.allocator());
+            defer {
+                var it = subs_map.iterator();
+                while (it.next()) |e| e.value_ptr.deinit(self.arena.allocator());
+                subs_map.deinit();
+            }
             var sub_sigs = std.StringHashMap(std.ArrayList(module_check.MethodSig)).init(self.arena.allocator());
             defer {
                 var it = sub_sigs.iterator();
                 while (it.next()) |e| e.value_ptr.deinit(self.arena.allocator());
                 sub_sigs.deinit();
             }
+            var seen_pairs = std.StringHashMap(void).init(self.arena.allocator());
+            defer seen_pairs.deinit();
 
             const prefix = std.fmt.allocPrint(self.arena.allocator(), "{s}.", .{mod}) catch continue;
             for (module.declarations) |d| {
@@ -3200,20 +3206,46 @@ pub const TypeInferencer = struct {
                 const f = d.fun_decl;
                 if (!std.mem.startsWith(u8, f.name, prefix)) continue;
                 const rest = f.name[prefix.len..];
-                const sub_end = std.mem.indexOfScalar(u8, rest, '.') orelse continue;
-                const sub_name = rest[0..sub_end];
-                const method_name = rest[sub_end + 1 ..];
 
-                // 记录子模块名（去重）
-                if (!subs_seen.contains(sub_name)) {
-                    subs_seen.put(sub_name, {}) catch {};
-                    const sub_dup = self.arena.allocator().dupe(u8, sub_name) catch continue;
-                    subs.append(self.arena.allocator(), sub_dup) catch {};
+                // 按 '.' 分割 rest：最后一段是 method，前面各段是子模块路径
+                var seg_count: usize = 1;
+                for (rest) |c| if (c == '.') {
+                    seg_count += 1;
+                };
+                if (seg_count < 2) continue; // 至少 sub.method
+                const segs = self.arena.allocator().alloc([]const u8, seg_count) catch continue;
+                {
+                    var si: usize = 0;
+                    var sstart: usize = 0;
+                    for (rest, 0..) |c, i| {
+                        if (c == '.') {
+                            segs[si] = rest[sstart..i];
+                            si += 1;
+                            sstart = i + 1;
+                        }
+                    }
+                    segs[si] = rest[sstart..];
+                }
+                const method_name = segs[segs.len - 1];
+
+                // 逐级注册子模块：mod → segs[0] → segs[1] → ... → segs[len-2]
+                var current_parent: []const u8 = mod;
+                for (segs[0 .. segs.len - 1]) |seg| {
+                    const pair_key = std.fmt.allocPrint(self.arena.allocator(), "{s}\x00{s}", .{ current_parent, seg }) catch continue;
+                    if (!seen_pairs.contains(pair_key)) {
+                        seen_pairs.put(pair_key, {}) catch {};
+                        const seg_dup = self.arena.allocator().dupe(u8, seg) catch continue;
+                        const sent = subs_map.getOrPut(current_parent) catch continue;
+                        if (!sent.found_existing) {
+                            sent.value_ptr.* = std.ArrayList([]const u8).empty;
+                        }
+                        sent.value_ptr.append(self.arena.allocator(), seg_dup) catch continue;
+                    }
+                    current_parent = std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ current_parent, seg }) catch continue;
                 }
 
-                // 记录方法签名到 "Module.Sub"
-                const full_mod = std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ mod, sub_name }) catch continue;
-                const entry = sub_sigs.getOrPut(full_mod) catch continue;
+                // 注册 method 到最终模块路径 current_parent
+                const entry = sub_sigs.getOrPut(current_parent) catch continue;
                 if (!entry.found_existing) {
                     entry.value_ptr.* = std.ArrayList(module_check.MethodSig).empty;
                 }
@@ -3221,8 +3253,13 @@ pub const TypeInferencer = struct {
                 entry.value_ptr.append(self.arena.allocator(), .{ .name = method_dup, .arity = f.params.len }) catch {};
             }
 
-            // 记录模块的子模块列表
-            self.putModuleSubmodules(mod, subs.toOwnedSlice(self.arena.allocator()) catch continue);
+            // 记录每个模块的子模块列表（含多级）
+            var smit = subs_map.iterator();
+            while (smit.next()) |entry| {
+                const subs_dup = self.arena.allocator().alloc([]const u8, entry.value_ptr.items.len) catch continue;
+                for (entry.value_ptr.items, 0..) |s, i| subs_dup[i] = s;
+                self.putModuleSubmodules(entry.key_ptr.*, subs_dup);
+            }
 
             // 记录每个子模块的方法签名
             var sig_it = sub_sigs.iterator();
@@ -4165,6 +4202,7 @@ pub const TypeInferencer = struct {
         const unit_ty = self.makeType(.unit_type) catch return;
         const u8_ty = self.makeType(.u8_type) catch return;
         const u8_array_ty = self.makeArrayType(u8_ty, null) catch return;
+        const u16_ty = self.makeType(.u16_type) catch return;
 
         // Stat 类型：std/io 中定义的 record，syscall 层返回值类型用 generic "Stat"
         const stat_ty = self.makeGenericType("Stat", &[_]*Type{}) catch return;
@@ -4173,6 +4211,11 @@ pub const TypeInferencer = struct {
         const dir_entry_array_ty = self.makeArrayType(dir_entry_ty, null) catch return;
         // TimeComponents 类型：std/time 中定义的 record
         const time_comp_ty = self.makeGenericType("TimeComponents", &[_]*Type{}) catch return;
+        // Net 类型：std/net 中定义的 record/ADT
+        const ip_addr_ty = self.makeGenericType("IpAddr", &[_]*Type{}) catch return;
+        const ip_addr_array_ty = self.makeArrayType(ip_addr_ty, null) catch return;
+        const accept_result_ty = self.makeGenericType("AcceptResult", &[_]*Type{}) catch return;
+        const recv_from_result_ty = self.makeGenericType("RecvFromResult", &[_]*Type{}) catch return;
 
         // ── IO syscall (0-18) ──
         // __file_open(path: str, flags: i32, mode: i32) -> Throw<i64, IOError>
@@ -4311,6 +4354,85 @@ pub const TypeInferencer = struct {
             const ps = self.arena.allocator().alloc(*Type, 1) catch return;
             ps[0] = time_comp_ty;
             define(self, env, "__components_to_ns_utc", ps, makeThrowTy(self, i128_ty, time_error_ty));
+        }
+
+        // ── Net syscall ──
+        // __net_resolve(host: str) -> Throw<IpAddr[], IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = str_ty;
+            define(self, env, "__net_resolve", ps, makeThrowTy(self, ip_addr_array_ty, io_error_ty));
+        }
+        // __net_tcp_listen(ip: IpAddr, port: u16, reuse_addr: bool) -> Throw<i64, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = ip_addr_ty;
+            ps[1] = u16_ty;
+            ps[2] = bool_ty;
+            define(self, env, "__net_tcp_listen", ps, makeThrowTy(self, i64_ty, io_error_ty));
+        }
+        // __net_tcp_accept(fd: i64, timeout_ns: i64) -> Throw<AcceptResult, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
+            ps[0] = i64_ty;
+            ps[1] = i64_ty;
+            define(self, env, "__net_tcp_accept", ps, makeThrowTy(self, accept_result_ty, io_error_ty));
+        }
+        // __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64) -> Throw<i64, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = ip_addr_ty;
+            ps[1] = u16_ty;
+            ps[2] = i64_ty;
+            define(self, env, "__net_tcp_connect", ps, makeThrowTy(self, i64_ty, io_error_ty));
+        }
+        // __net_tcp_read(fd: i64, len: usize, timeout_ns: i64) -> Throw<u8[], IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = i64_ty;
+            ps[1] = usize_ty;
+            ps[2] = i64_ty;
+            define(self, env, "__net_tcp_read", ps, makeThrowTy(self, u8_array_ty, io_error_ty));
+        }
+        // __net_tcp_write(fd: i64, buf: u8[], len: usize, timeout_ns: i64) -> Throw<usize, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 4) catch return;
+            ps[0] = i64_ty;
+            ps[1] = u8_array_ty;
+            ps[2] = usize_ty;
+            ps[3] = i64_ty;
+            define(self, env, "__net_tcp_write", ps, makeThrowTy(self, usize_ty, io_error_ty));
+        }
+        // __net_tcp_close(fd: i64) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i64_ty;
+            define(self, env, "__net_tcp_close", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __net_udp_bind(ip: IpAddr, port: u16, reuse_addr: bool) -> Throw<i64, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = ip_addr_ty;
+            ps[1] = u16_ty;
+            ps[2] = bool_ty;
+            define(self, env, "__net_udp_bind", ps, makeThrowTy(self, i64_ty, io_error_ty));
+        }
+        // __net_udp_send_to(fd: i64, ip: IpAddr, port: u16, data: u8[]) -> Throw<usize, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 4) catch return;
+            ps[0] = i64_ty;
+            ps[1] = ip_addr_ty;
+            ps[2] = u16_ty;
+            ps[3] = u8_array_ty;
+            define(self, env, "__net_udp_send_to", ps, makeThrowTy(self, usize_ty, io_error_ty));
+        }
+        // __net_udp_recv_from(fd: i64, len: usize, timeout_ns: i64) -> Throw<RecvFromResult, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = i64_ty;
+            ps[1] = usize_ty;
+            ps[2] = i64_ty;
+            define(self, env, "__net_udp_recv_from", ps, makeThrowTy(self, recv_from_result_ty, io_error_ty));
         }
     }
     fn registerBuiltinName(self: *TypeInferencer, name: []const u8) void {

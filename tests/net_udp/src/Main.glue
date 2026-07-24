@@ -1,0 +1,115 @@
+// Test: UDP echo + timeout — bind + send_to + recv_from + timeout
+import std.net.Addr
+import std.net.UdpSocket
+
+// Sender task: bind a client socket, send "Ping" to server, recv echo, close
+async fun sender_task(server_addr: SocketAddr): Async<Throw<Unit, IOError>> {
+    // Bind client socket on ephemeral port (port 0)
+    val lo = std.net.Addr.v4_loopback()
+    val ip = std.net.Addr.ip_from_v4(lo)
+    val client_addr = std.net.Addr.socket_from(ip, 0u16)
+    val sock = std.net.UdpSocket.bind(client_addr, true).await()?
+
+    // Send "Ping" (5 bytes) to server
+    val msg = [80u8, 105u8, 110u8, 103u8]  // "Ping"
+    val sent = sock.send_to(server_addr, msg).await()?
+    if sent == 4usize {
+        println("sender: sent 4 bytes")
+    } else {
+        println("sender: short send")
+        println(sent)
+    }
+
+    // Receive echo from server (with 2s timeout)
+    val recv = sock.recv_from(64usize, 2000000000i64).await()
+    match recv {
+        Ok(r) => {
+            if r.data.len() == 4usize {
+                val ok = r.data[0] == 80u8 && r.data[1] == 105u8 && r.data[2] == 110u8 && r.data[3] == 103u8
+                if ok {
+                    println("sender: echo ok")
+                } else {
+                    println("sender: echo mismatch")
+                }
+            } else {
+                println("sender: short recv")
+                println(r.data.len())
+            }
+        },
+        Error(e) => println("sender: recv err: " + e.message()),
+    }
+
+    sock.close().await()?
+    Ok(())
+}
+
+fun main() {
+    val lo = std.net.Addr.v4_loopback()
+    val ip = std.net.Addr.ip_from_v4(lo)
+    val addr = std.net.Addr.socket_from(ip, 18090u16)
+
+    val bind_result = std.net.UdpSocket.bind(addr, true).await()
+    match bind_result {
+        Ok(sock) => {
+            println("bind ok, fd=")
+            println(sock.fd)
+
+            // Spawn sender concurrently
+            val sender = sender_task(addr)
+
+            // Receive from sender (with 2s timeout)
+            val recv_result = sock.recv_from(64usize, 2000000000i64).await()
+            match recv_result {
+                Ok(r) => {
+                    if r.data.len() == 4usize {
+                        val ok = r.data[0] == 80u8 && r.data[1] == 105u8 && r.data[2] == 110u8 && r.data[3] == 103u8
+                        if ok {
+                            println("server: recv Ping ok")
+                        } else {
+                            println("server: recv mismatch")
+                        }
+                    } else {
+                        println("server: short recv")
+                        println(r.data.len())
+                    }
+
+                    // Echo back to sender's src_addr
+                    val echo = sock.send_to(r.src_addr, r.data).await()
+                    match echo {
+                        Ok(_) => println("server: echo ok"),
+                        Error(e) => println("server: send err: " + e.message()),
+                    }
+                },
+                Error(e) => println("server: recv err: " + e.message()),
+            }
+
+            // Wait for sender to finish
+            val sender_result = sender.await()
+            match sender_result {
+                Ok(_) => println("sender done ok"),
+                Error(e) => println("sender err: " + e.message()),
+            }
+
+            // ── Timeout test: recv on socket with no incoming data, short timeout ──
+            // Should return TimedOut IOError after ~100ms
+            println("server: testing timeout...")
+            val timeout_recv = sock.recv_from(64usize, 100000000i64).await()
+            match timeout_recv {
+                Ok(r) => {
+                    // Unexpected: got data
+                    println("server: unexpected recv during timeout test, len=")
+                    println(r.data.len())
+                },
+                Error(e) => {
+                    // Expected: timed out
+                    println("server: timeout ok: " + e.message())
+                },
+            }
+
+            sock.close().await()
+        },
+        Error(e) => println("bind err: " + e.message()),
+    }
+
+    println("net_udp_test: done")
+}

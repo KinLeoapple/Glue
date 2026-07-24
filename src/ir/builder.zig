@@ -187,6 +187,9 @@ pub const IRBuilder = struct {
     field_id_map: std.StringHashMap(u16),
     /// 线性递归识别：函数名 → LinearRecurrenceInfo
     linear_rec_map: std.StringHashMap(LinearRecurrenceInfo),
+    /// async handle 通道 → orbit_meta_idx 映射
+    /// emitOrbitCreate 时记录，await 时查询以获取 result_type
+    async_handle_meta: std.AutoHashMap(u16, u16),
 
     current_return_chan: ?u16 = null,
     /// 当前编译的表达式是否在尾位置（用于标记 tail_call）
@@ -280,6 +283,7 @@ pub const IRBuilder = struct {
             .symbol_alias_map = std.StringHashMap([]const u8).init(allocator),
             .field_id_map = std.StringHashMap(u16).init(allocator),
             .linear_rec_map = std.StringHashMap(LinearRecurrenceInfo).init(allocator),
+            .async_handle_meta = std.AutoHashMap(u16, u16).init(allocator),
         };
         // meta_index=0 保留为"无元数据"占位
         try builder.scalar_metas.append(arena.allocator(), .{ .kind = .unit });
@@ -323,6 +327,17 @@ pub const IRBuilder = struct {
             .{ .name = "__systemtime_to_local_components", .id = .systemtime_to_local_components },
             .{ .name = "__systemtime_to_utc_components", .id = .systemtime_to_utc_components },
             .{ .name = "__components_to_ns_utc", .id = .components_to_ns_utc },
+            // ── Net syscall ──
+            .{ .name = "__net_resolve", .id = .net_resolve },
+            .{ .name = "__net_tcp_listen", .id = .net_tcp_listen },
+            .{ .name = "__net_tcp_accept", .id = .net_tcp_accept },
+            .{ .name = "__net_tcp_connect", .id = .net_tcp_connect },
+            .{ .name = "__net_tcp_read", .id = .net_tcp_read },
+            .{ .name = "__net_tcp_write", .id = .net_tcp_write },
+            .{ .name = "__net_tcp_close", .id = .net_tcp_close },
+            .{ .name = "__net_udp_bind", .id = .net_udp_bind },
+            .{ .name = "__net_udp_send_to", .id = .net_udp_send_to },
+            .{ .name = "__net_udp_recv_from", .id = .net_udp_recv_from },
         };
         for (entries) |e| {
             try self.syscall_name_to_id.put(arena_alloc, e.name, e.id);
@@ -462,6 +477,7 @@ pub const IRBuilder = struct {
         self.symbol_alias_map.deinit();
         self.field_id_map.deinit();
         self.linear_rec_map.deinit();
+        self.async_handle_meta.deinit();
         self.func_memo_slots.deinit(self.allocator);
         for (self.gadt_binding_stack.items) |*m| m.deinit();
         self.gadt_binding_stack.deinit(self.allocator);
@@ -2167,10 +2183,16 @@ pub const IRBuilder = struct {
         // 使用第一遍预分配的返回通道（保证 compileCall 引用的是最终通道）
         const return_chan = self.functions.items[func_idx].return_channel;
         self.current_return_chan = return_chan;
-        self.current_returns_throw = if (@hasField(@TypeOf(fd), "return_type")) isThrowType(fd.return_type) else false;
+        // async 函数返回 Async<T>，但函数体实际产出 T：throw/Ok 语义按 T 处理。
+        // 同步函数直接用 return_type。
+        const effective_return_type = if (@hasField(@TypeOf(fd), "return_type"))
+            unwrapAsyncType(fd.return_type)
+        else
+            null;
+        self.current_returns_throw = if (@hasField(@TypeOf(fd), "return_type")) isThrowType(effective_return_type) else false;
         // 提取 Throw<T, E> 的 Ok 值通道类型，供 ? 传播使用
         if (self.current_returns_throw and @hasField(@TypeOf(fd), "return_type")) {
-            self.current_throw_ok_chan_type = throwOkChanType(fd.return_type) orelse .i64_chan;
+            self.current_throw_ok_chan_type = throwOkChanType(effective_return_type) orelse .i64_chan;
         }
 
         // 编译函数体（函数体在尾位置）
@@ -4169,6 +4191,91 @@ pub const IRBuilder = struct {
         return slot;
     }
 
+    /// 推断表达式对应的函数返回类型 AST 节点。
+    /// 用于追踪 val x = func(args) 或 val x = obj.method(args) 中 x 的类型。
+    fn inferReturnTypeAst(self: *IRBuilder, expr: *const ast.Expr) ?*ast.TypeNode {
+        switch (expr.*) {
+            .call => |c| {
+                if (c.callee.* == .identifier) {
+                    return self.findFuncReturnTypeAst(c.callee.identifier.name);
+                }
+                return null;
+            },
+            .method_call => |mc| {
+                const arena_alloc = self.arena.allocator();
+                if (self.isModuleReference(mc.object)) |mod_ref| {
+                    const mangled = std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ mod_ref.full_path, mc.method }) catch return null;
+                    return self.findFuncReturnTypeAst(mangled);
+                }
+                if (self.inferTypeNameFromExpr(mc.object)) |type_name| {
+                    const mangled = std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ type_name, mc.method }) catch return null;
+                    if (self.findFuncReturnTypeAst(mangled)) |rt| return rt;
+                    if (self.lookupMethodBySuffix(type_name, mc.method)) |func_idx| {
+                        if (func_idx < self.functions.items.len) {
+                            return self.findFuncReturnTypeAst(self.functions.items[func_idx].name);
+                        }
+                    }
+                }
+                return null;
+            },
+            .identifier => |id| {
+                if (self.lookupVar(id.name)) |binding| {
+                    if (binding.type_annotation) |ta| return ta;
+                    if (binding.ast_expr) |src_expr| return self.inferReturnTypeAst(src_expr);
+                }
+                return null;
+            },
+            .propagate => |p| return self.inferReturnTypeAst(p.expr),
+            else => return null,
+        }
+    }
+
+    /// 推断 Throw 表达式的 Ok 值类型节点（TypeNode）。
+    /// 用于 Ok(pattern) 中 pattern 变量的类型标注，使方法分派能正确找到用户自定义方法。
+    /// 支持 await（Async<Throw<T,E>> → T）、? 操作符、普通函数调用和方法调用。
+    fn inferThrowOkTypeNode(self: *IRBuilder, expr: *const ast.Expr) ?*ast.TypeNode {
+        switch (expr.*) {
+            .identifier => |id| {
+                if (self.lookupVar(id.name)) |binding| {
+                    if (binding.type_annotation) |ta| {
+                        return throwOkTypeNode(ta);
+                    }
+                    if (binding.ast_expr) |src_expr| {
+                        return self.inferThrowOkTypeNode(src_expr);
+                    }
+                }
+                return null;
+            },
+            .method_call => |mc| {
+                // await：X.await() 解包 Async<T> → T，再从 T 提取 Throw Ok 类型
+                if (std.mem.eql(u8, mc.method, "await")) {
+                    if (self.inferReturnTypeAst(mc.object)) |rt| {
+                        const inner = asyncInnerTypeNode(rt) orelse return null;
+                        return throwOkTypeNode(inner);
+                    }
+                    return null;
+                }
+                // 普通方法调用：查返回类型，提取 Throw Ok 类型
+                if (self.inferReturnTypeAst(expr)) |rt| {
+                    return throwOkTypeNode(rt);
+                }
+                return null;
+            },
+            .call => {
+                if (self.inferReturnTypeAst(expr)) |rt| {
+                    return throwOkTypeNode(rt);
+                }
+                return null;
+            },
+            .propagate => |p| return self.inferThrowOkTypeNode(p.expr),
+            .cast_builder => |cb| {
+                if (cb.mode != .try_to) return null;
+                return cb.target_type;
+            },
+            else => return null,
+        }
+    }
+
     /// 推断 Throw 表达式的 Ok 值通道类型
     /// 用于 match Ok(pattern) 和 ? 操作符，避免对 ref 类型硬编码 i64_chan
     fn inferThrowOkChanType(self: *IRBuilder, expr: *const ast.Expr) ?ChanType {
@@ -4211,6 +4318,14 @@ pub const IRBuilder = struct {
             },
             // 方法调用：obj.method(args) — 推断 obj 的类型，查 mangled name 的 return_type
             .method_call => |mc| {
+                // await：X.await() 解包 Async<T> → T，再从 T 提取 Throw Ok 通道类型
+                if (std.mem.eql(u8, mc.method, "await")) {
+                    if (self.inferReturnTypeAst(mc.object)) |rt| {
+                        const inner = asyncInnerTypeNode(rt) orelse return null;
+                        return throwOkChanType(inner);
+                    }
+                    return null;
+                }
                 const arena_alloc = self.arena.allocator();
                 // 1. 模块引用方法调用：Module.Sub.method(args) → mangled = "Module.Sub.method"
                 if (self.isModuleReference(mc.object)) |mod_ref| {
@@ -4275,6 +4390,14 @@ pub const IRBuilder = struct {
                 return null;
             },
             .method_call => |mc| {
+                // await：X.await() 解包 Async<T> → T，再从 T 提取 Throw Ok 类型名
+                if (std.mem.eql(u8, mc.method, "await")) {
+                    if (self.inferReturnTypeAst(mc.object)) |rt| {
+                        const inner = asyncInnerTypeNode(rt) orelse return null;
+                        return throwOkTypeName(inner);
+                    }
+                    return null;
+                }
                 const arena_alloc = self.arena.allocator();
                 if (self.isModuleReference(mc.object)) |mod_ref| {
                     const mangled = std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ mod_ref.full_path, mc.method }) catch return null;
@@ -5224,7 +5347,16 @@ pub const IRBuilder = struct {
             // gate_get_ok → 绑定到子模式（使用 current_throw_ok_chan_type 推断类型）
             const ok_val_chan = try self.allocChannel(self.current_throw_ok_chan_type);
             try self.emit(Node.makeUnary(.gate_get_ok, ok_val_chan, 0, scrutinee_chan));
+            // 设置 pattern_type_hint 为 Ok 值的类型节点，使子模式变量获得正确的 type_annotation
+            // 用于 l.close() 等方法分派：inferTypeNameFromExpr 通过 type_annotation 返回 "TcpListener"
+            const saved_hint = self.pattern_type_hint;
+            if (self.current_match_scrutinee) |scrut| {
+                if (self.inferThrowOkTypeNode(scrut)) |ok_type_node| {
+                    self.pattern_type_hint = ok_type_node;
+                }
+            }
             const sub_check = try self.compilePatternCheck(ok_val_chan, sub_patterns[0]);
+            self.pattern_type_hint = saved_hint;
             const and_chan = try self.allocChannel(.bool_chan);
             const meta = try self.addScalarMeta(.{ .kind = .bool });
             try self.emit(Node.makeBinary(.bool_and, and_chan, meta, is_ok_chan, sub_check));
@@ -5450,6 +5582,8 @@ pub const IRBuilder = struct {
             .meta_index = orbit_meta_idx,
             .inputs = inputs,
         });
+        // 记录 handle_chan → orbit_meta_idx 映射，供 await 查询 result_type
+        self.async_handle_meta.put(handle_chan, orbit_meta_idx) catch return error.OutOfMemory;
         return handle_chan;
     }
 
@@ -5567,13 +5701,21 @@ pub const IRBuilder = struct {
                         }
                     }
                     // val 绑定也遵循值语义：复合类型值深拷贝后绑定到独立通道
+                    // 例外：AsyncHandle 是共享引用（类似 Arc），深拷贝会破坏 orbit 句柄
+                    // 与 async_handle_meta 映射，因此使用浅拷贝（_pad=1）并传播映射
                     const final_chan = blk: {
                         const src_meta = self.channels.get(chan);
                         if (src_meta.chan_type == .ref_chan and !self.isRefExpr(vd.value)) {
+                            const is_async_handle = self.async_handle_meta.get(chan) != null;
                             const copy_chan = try self.allocChannel(.ref_chan);
                             var load_node = Node.makeUnary(.load, copy_chan, 0, chan);
-                            load_node._pad = 0; // 普通复合类型，load 时深拷贝
+                            load_node._pad = if (is_async_handle) 1 else 0;
                             try self.emit(load_node);
+                            if (is_async_handle) {
+                                if (self.async_handle_meta.get(chan)) |orbit_meta_idx| {
+                                    self.async_handle_meta.put(copy_chan, orbit_meta_idx) catch return error.OutOfMemory;
+                                }
+                            }
                             break :blk copy_chan;
                         }
                         break :blk chan;
@@ -5642,9 +5784,16 @@ pub const IRBuilder = struct {
                 };
                 const cell_chan = try self.allocCellChannel(cell_ct);
                 var load_node = Node.makeUnary(.load, cell_chan, 0, value_chan);
-                // 源表达式为 &T / *T 时标记为引用，运行时 load 不深拷贝
-                load_node._pad = if (self.isRefExpr(vd.value)) 1 else 0;
+                // 源表达式为 &T / *T 或 AsyncHandle 时标记为引用，运行时 load 不深拷贝
+                // AsyncHandle 是共享引用，深拷贝会破坏 orbit 句柄
+                const var_is_async_handle = self.async_handle_meta.get(value_chan) != null;
+                load_node._pad = if (self.isRefExpr(vd.value) or var_is_async_handle) 1 else 0;
                 try self.emit(load_node);
+                if (var_is_async_handle) {
+                    if (self.async_handle_meta.get(value_chan)) |orbit_meta_idx| {
+                        self.async_handle_meta.put(cell_chan, orbit_meta_idx) catch return error.OutOfMemory;
+                    }
+                }
                 try self.scopeVarTyped(vd.name, cell_chan, true, vd.value, vd.type_annotation);
                 // atomic 表达式 → 标记绑定为 Atomic
                 if (vd.value.* == .atomic_expr) self.markLastBindingAtomic();
@@ -7461,7 +7610,9 @@ pub const IRBuilder = struct {
     fn inferTypeNameFromExpr(self: *IRBuilder, expr: *const ast.Expr) ?[]const u8 {
         if (self.sema_result) |sr| {
             if (sr.getExpr(@intFromPtr(expr))) |info| {
-                if (info.type_name) |tn| return tn;
+                if (info.type_name) |tn| {
+                    return tn;
+                }
             }
             // 回退 1：nullary 构造器标识符（如 Lt/Eq/Gt）sema 推导为 fn_type，
             // type_name 为 null。从 ctor_def_index 查构造器的 type_name。
@@ -7825,6 +7976,10 @@ pub const IRBuilder = struct {
                 for (arguments, 0..) |arg, i| {
                     arg_chans[i] = try self.compileExpr(arg);
                 }
+                // async 函数：发射 orbit_async_create 返回 AsyncHandle（不自动 await）
+                if (func.is_async) {
+                    return try self.emitOrbitCreate(func_idx, arg_chans, func);
+                }
                 // 返回 nullable_chan 时传播 inner_type
                 const ret_meta = self.channels.get(func.return_channel);
                 const out = if (ret_meta.chan_type == .nullable_chan)
@@ -7931,8 +8086,12 @@ pub const IRBuilder = struct {
         // ── 内置方法（按名称分派） ──
         if (std.mem.eql(u8, method, "await")) {
             // obj.await() → orbit_async_join
-            // 结果类型默认 i64（无类型追踪，大多数 async 函数返回标量）
-            // engine 的 execOrbitAsyncJoin 不依赖 meta_index，直接从 handle 读取结果
+            // 通过 async_handle_meta 查询 handle_chan 关联的 orbit_meta_idx，
+            // 获取正确的 result_type（ref_chan 用于 Throw/record 等堆对象结果）
+            if (self.async_handle_meta.get(obj_chan)) |orbit_meta_idx| {
+                return try self.emitOrbitJoin(obj_chan, orbit_meta_idx);
+            }
+            // 回退：无法关联 orbit_meta（如跨函数传递的 handle），使用 i64_chan
             const out = try self.allocChannel(.i64_chan);
             try self.emit(Node.makeUnary(.orbit_async_join, out, 0, obj_chan));
             return out;
@@ -8126,6 +8285,11 @@ pub const IRBuilder = struct {
         arg_chans[0] = obj_chan;
         for (arguments, 0..) |arg, i| {
             arg_chans[i + 1] = try self.compileExpr(arg);
+        }
+        // async 函数：发射 orbit_async_create 返回 AsyncHandle（不自动 await）
+        // 与 dispatchMethodCall 中模块引用 async 路径一致
+        if (func.is_async) {
+            return try self.emitOrbitCreate(func_idx, arg_chans, func);
         }
         // 函数返回 nullable_chan 时，传播 inner_type（否则 nullable_is_null 读错字节）
         const ret_meta = self.channels.get(func.return_channel);
@@ -8337,9 +8501,11 @@ pub const IRBuilder = struct {
         }
         const return_chan = placeholder_return_chan;
         self.current_return_chan = return_chan;
-        self.current_returns_throw = isThrowType(lam.return_type);
+        // async lambda 返回 Async<T>，但体产出 T：throw/Ok 语义按 T 处理
+        const lam_effective_return_type = unwrapAsyncType(lam.return_type);
+        self.current_returns_throw = isThrowType(lam_effective_return_type);
         if (self.current_returns_throw) {
-            self.current_throw_ok_chan_type = throwOkChanType(lam.return_type) orelse .i64_chan;
+            self.current_throw_ok_chan_type = throwOkChanType(lam_effective_return_type) orelse .i64_chan;
         }
 
         // 编译函数体
@@ -9120,6 +9286,47 @@ fn isThrowType(type_node: ?*ast.TypeNode) bool {
     };
 }
 
+/// 若 type_node 为 Async<X>，返回 X；否则返回 type_node 本身。
+/// async 函数返回 Async<T>，但函数体实际产出 T，throw/Ok 语义按 T 处理。
+fn unwrapAsyncType(type_node: ?*ast.TypeNode) ?*ast.TypeNode {
+    const tn = type_node orelse return null;
+    switch (tn.*) {
+        .generic => |g| {
+            if (std.mem.eql(u8, g.name, "Async") and g.args.len > 0) {
+                return g.args[0];
+            }
+        },
+        else => {},
+    }
+    return type_node;
+}
+
+/// 从 Async<T> 类型节点提取内部类型 T
+fn asyncInnerTypeNode(type_node: ?*ast.TypeNode) ?*ast.TypeNode {
+    const tn = type_node orelse return null;
+    switch (tn.*) {
+        .generic => |g| {
+            if (!std.mem.eql(u8, g.name, "Async")) return null;
+            if (g.args.len < 1) return null;
+            return g.args[0];
+        },
+        else => return null,
+    }
+}
+
+/// 从 Throw<T, E> 类型节点提取 Ok 值的类型节点 T
+fn throwOkTypeNode(type_node: ?*ast.TypeNode) ?*ast.TypeNode {
+    const tn = type_node orelse return null;
+    switch (tn.*) {
+        .generic => |g| {
+            if (!std.mem.eql(u8, g.name, "Throw")) return null;
+            if (g.args.len < 1) return null;
+            return g.args[0];
+        },
+        else => return null,
+    }
+}
+
 /// 从 Throw<T, E> 类型节点提取 Ok 值的通道类型
 fn throwOkChanType(type_node: ?*ast.TypeNode) ?ChanType {
     const tn = type_node orelse return null;
@@ -9303,6 +9510,17 @@ fn syscallReturnType(sid: SyscallId) ChanType {
         .dir_create,
         .dir_remove,
         .dir_list,
+        // Net syscall：全部返回 Throw<..., IOError>（堆对象）
+        .net_resolve,
+        .net_tcp_listen,
+        .net_tcp_accept,
+        .net_tcp_connect,
+        .net_tcp_read,
+        .net_tcp_write,
+        .net_tcp_close,
+        .net_udp_bind,
+        .net_udp_send_to,
+        .net_udp_recv_from,
         => .ref_chan,
     };
 }

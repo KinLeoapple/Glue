@@ -20,6 +20,14 @@ const ThreadContext = value.obj_header.ThreadContext;
 const ErrorValue = value.ErrorValue;
 const syscall_mod = @import("mod.zig");
 const SyscallError = syscall_mod.SyscallError;
+const util = @import("util.zig");
+
+// 共享错误工具（从 io.zig 抽取到 util.zig，io.zig/net.zig 共用）
+const IOErrorKind = util.IOErrorKind;
+const errToKind = util.errToKind;
+const makeIOError = util.makeIOError;
+const makeThrowOk = util.makeThrowOk;
+const makeThrowErr = util.makeThrowErr;
 
 const Io = std.Io;
 const File = Io.File;
@@ -111,107 +119,9 @@ inline fn fdToFile(fd: i64) File {
 // ──────────────────────────────────────────────
 // 辅助：构造返回值
 // ──────────────────────────────────────────────
-
-/// IOErrorKind 枚举（与 IOError.glue 中 ADT 变体一一对应，0-indexed）
-const IOErrorKind = enum(u8) {
-    not_found = 0,
-    permission_denied,
-    already_exists,
-    busy,
-    invalid_input,
-    unexpected_eof,
-    broken_pipe,
-    out_of_memory,
-    interrupted,
-    other,
-};
-
-/// std.Io 错误（anyerror）→ IOErrorKind 归一化映射
-fn errToKind(err: anyerror) IOErrorKind {
-    return switch (err) {
-        error.FileNotFound, error.NotDir, error.BadPathName, error.SymLinkLoop => .not_found,
-        error.AccessDenied, error.PermissionDenied => .permission_denied,
-        error.PathAlreadyExists => .already_exists,
-        error.FileBusy, error.WouldBlock => .busy,
-        error.InvalidArgument, error.IsDir => .invalid_input,
-        error.UnexpectedEof, error.EndOfStream, error.Truncated => .unexpected_eof,
-        error.BrokenPipe => .broken_pipe,
-        error.SystemResources, error.OutOfMemory, error.NoSpaceLeft => .out_of_memory,
-        error.Interrupted => .interrupted,
-        else => .other,
-    };
-}
-
-/// 构造 IOError 值（error_newtype，布局：__tag + 4 个用户字段）
-///
-/// IOError 是 error_newtype，IR 编译器注册 field_id：__tag=0, kind=1, msg=2, os_err=3, path=4。
-/// 必须用 makeRecordWithNames 构造 RecordValue（含 __tag），与 time.zig 保持一致。
-///
-/// RC 语义：makeRecordWithNames 仅 memcpy 字段（窃取调用方引用，不主动 retain）。
-/// fromStringBytes 返回 RC=1，直接交给 record 窃取，无需额外 retain（否则泄漏）。
-fn makeIOError(tctx: *ThreadContext, kind: IOErrorKind, msg: []const u8, os_err: i32, path: ?[]const u8) SyscallError!Value {
-    var fields: [5]Value = .{
-        Value.fromI64(0), // fields[0] = __tag（error_newtype 固定 0）
-        Value.fromU8(@intFromEnum(kind)), // fields[1] = kind
-        try Value.fromStringBytes(tctx, msg), // fields[2] = msg（RC=1，由 record 窃取）
-        Value.fromI32(os_err), // fields[3] = os_err
-        if (path) |p| try Value.fromStringBytes(tctx, p) else Value.fromNull(), // fields[4] = path（RC=1，由 record 窃取）
-    };
-    const field_names: [5]?[]const u8 = .{ "__tag", "kind", "msg", "os_err", "path" };
-    return Value.makeRecordWithNames(tctx, "IOError", &fields, &field_names) catch {
-        // OOM：释放已分配的 msg/path Str（makeRecordWithNames 未窃取）
-        fields[2].release(tctx);
-        if (path != null) fields[4].release(tctx);
-        return error.OutOfMemory;
-    };
-}
-
-/// 构造 Throw.ok(value) 包装
-///
-/// RC 语义：窃取语义——makeThrow 直接 memcpy 窃取 v 的引用（RC=1）。
-/// 所有调用方均为 `return makeThrowOk(tctx, val)` 形式，不再使用 v，故无需 retain。
-/// 标量参数 retain 本就是 no-op；堆对象参数避免 retain 后泄漏 1 个引用。
-fn makeThrowOk(tctx: *ThreadContext, v: Value) SyscallError!Value {
-    return Value.makeThrow(tctx, .{ .ok = v }) catch {
-        v.release(tctx); // OOM：释放 v 避免泄漏
-        return error.OutOfMemory;
-    };
-}
-
-/// 构造 Throw.err(IOError) 包装
-///
-/// IOError 现在是 RecordValue（含 __tag），msg 在 fields[2]。
-/// 从 RecordValue 提取 msg 后构造 ErrorValue，包装为 Throw.err。
-///
-/// RC 语义：err_val 为窃取语义（调用方转移所有权）。提取 msg 后立即释放 err_val record；
-/// makeError 返回 RC=1 的 ErrorValue，直接交 makeThrow 窃取，无需额外 retain。
-fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
-    const err_obj = err_val.asRef();
-    // 提取 msg（借用，不改变 RC）
-    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", err_obj));
-    const msg_bytes = if (rec.fields.len > 2) switch (rec.fields[2]) {
-        .ref => |o| if (o.type_tag == .str) blk: {
-            const s: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", o));
-            break :blk s.bytes();
-        } else "",
-        else => "",
-    } else "";
-    // 构造 ErrorValue（RC=1）
-    const err_ev = Value.makeError(tctx, "io error", msg_bytes, true) catch {
-        // OOM：释放 err_val（所有权已转移）
-        value.obj_header.release(err_obj, tctx);
-        return error.OutOfMemory;
-    };
-    // err_val 所有权已转移，释放 record（触发 deinit 释放其 msg/path 字段）
-    value.obj_header.release(err_obj, tctx);
-    // makeThrow 窃取 err_ev 的 RC=1
-    const err_val_ptr: *ErrorValue = @alignCast(@fieldParentPtr("header", err_ev.asRef()));
-    return Value.makeThrow(tctx, .{ .err = err_val_ptr }) catch {
-        // OOM：释放 err_ev
-        value.obj_header.release(err_ev.asRef(), tctx);
-        return error.OutOfMemory;
-    };
-}
+//
+// IOErrorKind / errToKind / makeIOError / makeThrowOk / makeThrowErr
+// 已抽取到 util.zig（io.zig/net.zig 共享），见文件顶部 import。
 
 /// 根据 File.Kind 构造 FileKind ADT 值（无字段变体 File/Directory/Symlink/Other）
 ///

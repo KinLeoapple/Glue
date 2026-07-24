@@ -20,7 +20,7 @@ type IOError: Error = IOError(
 }
 
 // IO 错误分类（穷举 ADT）
-// errno 映射规则（Zig 层 syscall/io.zig 维护）：
+// errno 映射规则（Zig 层 syscall/util.zig 维护）：
 //   ENOENT        → NotFound
 //   EACCES/EPERM  → PermissionDenied
 //   EEXIST        → AlreadyExists
@@ -29,6 +29,16 @@ type IOError: Error = IOError(
 //   EPIPE         → BrokenPipe
 //   EINTR         → Interrupted
 //   ENOMEM        → OutOfMemory
+//   ECONNREFUSED  → ConnectionRefused
+//   ECONNRESET    → ConnectionReset
+//   ECONNABORTED  → ConnectionAborted
+//   ENOTCONN      → NotConnected
+//   EADDRINUSE    → AddrInUse
+//   EADDRNOTAVAIL → AddrNotAvailable
+//   ETIMEDOUT     → TimedOut
+//   EHOSTUNREACH  → HostUnreachable
+//   ENETUNREACH   → NetworkUnreachable
+//   ENETDOWN      → NetworkDown
 //   其他          → Other（保留 errno 到 os_err 字段）
 type IOErrorKind =
     | NotFound            // 文件/目录不存在
@@ -41,3 +51,14 @@ type IOErrorKind =
     | OutOfMemory         // 内存不足（映射自宿主）
     | Interrupted         // 被信号中断（应重试）
     | Other               // 未分类（查 os_err）
+    // ── Net 错误 ──
+    | ConnectionRefused      // 连接被拒绝（ECONNREFUSED）
+    | ConnectionReset        // 连接被对端重置（ECONNRESET）
+    | ConnectionAborted      // 连接被中止（ECONNABORTED）
+    | NotConnected           // 未连接（ENOTCONN）
+    | AddrInUse              // 地址已占用（EADDRINUSE）
+    | AddrNotAvailable       // 地址不可用（EADDRNOTAVAIL）
+    | TimedOut               // 操作超时（ETIMEDOUT 或 Future cancel）
+    | HostUnreachable        // 主机不可达（EHOSTUNREACH）
+    | NetworkUnreachable     // 网络不可达（ENETUNREACH）
+    | NetworkDown            // 网络子系统故障（ENETDOWN）

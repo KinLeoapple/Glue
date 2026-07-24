@@ -1,0 +1,65 @@
+// net_addr: 验证 std.net.Addr 地址类型与构造器/访问器
+//
+// 覆盖 Ipv4Addr/Ipv6Addr/IpAddr/SocketAddr 的构造、字段访问、判断函数。
+// 所有函数为同步（非 async），不涉及实际网络 IO。
+// 方法分派暂不支持，使用模块函数调用语法（参考 std_instant/Main.glue）：
+//   std.net.Addr.v4_loopback()
+//   std.net.Addr.v4_octet(addr, 0u8)
+
+import std.net.Addr
+
+fun main() {
+    // ── Ipv4Addr 构造与访问 ───────────────────────────────────────
+    val lo4 = std.net.Addr.v4_loopback()
+    println(std.net.Addr.v4_octet(lo4, 0u8))   // 127
+    println(std.net.Addr.v4_octet(lo4, 1u8))   // 0
+    println(std.net.Addr.v4_octet(lo4, 2u8))   // 0
+    println(std.net.Addr.v4_octet(lo4, 3u8))   // 1
+    println(std.net.Addr.v4_bits(lo4))          // 2130706433 (0x7F000001)
+
+    val ip4 = std.net.Addr.v4_from_octets(192u8, 168u8, 1u8, 1u8)
+    println(std.net.Addr.v4_octet(ip4, 0u8))   // 192
+    println(std.net.Addr.v4_octet(ip4, 3u8))   // 1
+    println(std.net.Addr.v4_bits(ip4))          // 3232235777 (0xC0A80101)
+
+    // ── Ipv4Addr 判断 ─────────────────────────────────────────────
+    println(std.net.Addr.v4_is_loopback(lo4))                    // true
+    println(std.net.Addr.v4_is_loopback(ip4))                    // false
+    println(std.net.Addr.v4_is_unspecified(lo4))                 // false
+    println(std.net.Addr.v4_is_unspecified(std.net.Addr.v4_unspecified()))  // true
+
+    // ── Ipv6Addr 构造与访问 ───────────────────────────────────────
+    val lo6 = std.net.Addr.v6_loopback()
+    println(std.net.Addr.v6_hi(lo6))   // 0
+    println(std.net.Addr.v6_lo(lo6))   // 1
+    println(std.net.Addr.v6_segment(lo6, 7u8))   // 1 (::1 最后一段)
+
+    val unspec6 = std.net.Addr.v6_unspecified()
+    println(std.net.Addr.v6_hi(unspec6))   // 0
+    println(std.net.Addr.v6_lo(unspec6))   // 0
+
+    // ── Ipv6Addr 判断 ─────────────────────────────────────────────
+    println(std.net.Addr.v6_is_loopback(lo6))                    // true
+    println(std.net.Addr.v6_is_loopback(unspec6))                // false
+    println(std.net.Addr.v6_is_unspecified(unspec6))             // true
+    println(std.net.Addr.v6_is_unspecified(lo6))                 // false
+
+    // ── IpAddr ADT 构造与判断 ─────────────────────────────────────
+    val a4 = std.net.Addr.ip_from_v4(lo4)
+    val a6 = std.net.Addr.ip_from_v6(lo6)
+    println(std.net.Addr.ip_is_v4(a4))   // true
+    println(std.net.Addr.ip_is_v4(a6))   // false
+    println(std.net.Addr.ip_is_v6(a4))   // false
+    println(std.net.Addr.ip_is_v6(a6))   // true
+
+    // ── SocketAddr 构造与访问 ─────────────────────────────────────
+    val sa = std.net.Addr.socket_from(a4, 8080u16)
+    println(std.net.Addr.ip_is_v4(std.net.Addr.socket_ip(sa)))   // true
+    println(std.net.Addr.socket_port(sa))   // 8080
+
+    val sa6 = std.net.Addr.socket_from(a6, 443u16)
+    println(std.net.Addr.ip_is_v6(std.net.Addr.socket_ip(sa6)))  // true
+    println(std.net.Addr.socket_port(sa6))  // 443
+
+    println("net_addr: OK")
+}
