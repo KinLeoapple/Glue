@@ -6,7 +6,6 @@
 //! - ShadowArena：临时作用域，bump + reset（极短生命周期）
 
 const std = @import("std");
-const sync = @import("sync");
 
 pub const channel_region = @import("channel_region.zig");
 pub const shadow_arena = @import("shadow_arena.zig");

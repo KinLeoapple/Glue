@@ -37,11 +37,13 @@ pub const Report = struct {
     allocators_final: AllocatorStats = .{},
     allocators_peak: AllocatorStats = .{},
     func_stats: std.ArrayList(FuncStat),
-    func_total_time_ns: u64 = 0,
     phases: Phases,
     sample_count: u32 = 0,
     coarse_count: u32 = 0,
     timespan_ns: u64 = 0,
+    /// 函数名表（按 func_idx 索引），由调用方在 dump 前注入。
+    /// 仅用于报告展示，生命周期由外部管理（不归 Report 所有）。
+    func_names: ?[]const []const u8 = null,
 
     pub fn deinit(self: *Report) void {
         self.func_stats.deinit(self.allocator);
@@ -119,16 +121,17 @@ pub const Aggregator = struct {
         }
 
         // 2. per-function 时长和调用计数：直接从 ThreadProfiler 数组读取
-        //    （实时调用栈计时，无需事件缓冲区重建）
+        //    func_time[fi][0] = inclusive, func_time[fi][1] = exclusive
         var func_map: std.AutoHashMap(u32, usize) = .init(self.allocator);
         defer func_map.deinit();
 
         for (thread_profilers) |prof| {
             for (0..MAX_TRACKED_FUNCS) |fi| {
-                const time_ns = prof.func_time[fi];
+                const inclusive = prof.func_time[fi][0];
+                const exclusive = prof.func_time[fi][1];
                 const calls = prof.func_calls[fi];
                 const fa = prof.func_alloc[fi];
-                if (time_ns == 0 and calls == 0 and
+                if (inclusive == 0 and exclusive == 0 and calls == 0 and
                     fa.arena_bytes == 0 and fa.heap_bytes == 0 and
                     fa.retain_count == 0 and fa.release_count == 0) continue;
 
@@ -138,20 +141,20 @@ pub const Aggregator = struct {
                     try report.func_stats.append(self.allocator, .{ .func_idx = @intCast(fi) });
                 }
                 const fs = &report.func_stats.items[gop.value_ptr.*];
-                fs.total_time_ns += time_ns;
+                fs.inclusive_time_ns += inclusive;
+                fs.exclusive_time_ns += exclusive;
                 fs.calls += calls;
                 fs.arena_alloc_bytes += fa.arena_bytes;
                 fs.heap_alloc_bytes += fa.heap_bytes;
                 fs.retain_count += fa.retain_count;
                 fs.release_count += fa.release_count;
-                report.func_total_time_ns += time_ns;
             }
         }
 
-        // 3. 排序 func_stats：按 total_time_ns 降序
+        // 3. 排序 func_stats：按 exclusive_time_ns 降序（exclusive 才是热点指标）
         std.mem.sort(FuncStat, report.func_stats.items, {}, struct {
             fn cmp(_: void, a: FuncStat, b: FuncStat) bool {
-                return a.total_time_ns > b.total_time_ns;
+                return a.exclusive_time_ns > b.exclusive_time_ns;
             }
         }.cmp);
 

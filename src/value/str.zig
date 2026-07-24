@@ -344,27 +344,39 @@ pub fn strDeinit(obj: *ObjHeader, tctx: *ThreadContext) void {
 // 测试
 // ──────────────────────────────────────────────
 
-fn testCtx() struct { g: mem_mod.GlobalPool, c: ThreadContext } {
-    var g = mem_mod.GlobalPool.init(std.testing.allocator);
-    const c = ThreadContext.init(&g, std.testing.allocator, null) catch unreachable;
-    return .{ .g = g, .c = c };
-}
+const TestCtx = struct {
+    threaded: std.Io.Threaded = undefined,
+    g: mem_mod.GlobalPool = undefined,
+    c: ThreadContext = undefined,
+
+    fn init(self: *TestCtx) void {
+        self.threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+        self.g = mem_mod.GlobalPool.init(std.testing.allocator, self.threaded.io());
+        self.c = ThreadContext.init(&self.g, std.testing.allocator, null) catch unreachable;
+    }
+
+    fn deinit(self: *TestCtx) void {
+        self.c.deinit();
+        self.g.deinit();
+        self.threaded.deinit();
+    }
+};
 
 test "Str.fromLiteral/deinit no leak" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var s = try Str.fromLiteral(&tc.c, "hello");
     defer s.deinit(&tc.c);
     try std.testing.expectEqual(@as(usize, 5), s.byteLength());
 }
 
 test "Str.byteLength/codepointCount for ASCII/CJK/emoji" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     {
         var s = try Str.fromLiteral(&tc.c, "hello");
         defer s.deinit(&tc.c);
@@ -392,10 +404,10 @@ test "Str.byteLength/codepointCount for ASCII/CJK/emoji" {
 }
 
 test "Str.concat (by-value, 独立缓冲区)" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var a = try Str.fromLiteral(&tc.c, "Hello, ");
     defer a.deinit(&tc.c);
     var b = try Str.fromLiteral(&tc.c, "世界!");
@@ -409,10 +421,10 @@ test "Str.concat (by-value, 独立缓冲区)" {
 }
 
 test "Str.concatContiguous (连续缓冲区)" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     // total > SSO_MAX(20)，强制走堆连续路径
     var a = try Str.fromLiteral(&tc.c, "Hello, World! ");
     defer a.deinit(&tc.c);
@@ -425,10 +437,10 @@ test "Str.concatContiguous (连续缓冲区)" {
 }
 
 test "Str.createContiguous" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     {
         const s = try Str.createContiguous(&tc.c, "hi");
         defer tc.c.freeObj(@ptrCast(s));
@@ -445,10 +457,10 @@ test "Str.createContiguous" {
 }
 
 test "Str.concatInPlace 独立缓冲区就地追加" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var a = try Str.fromLiteral(&tc.c, "0123456789ABCDEFGHIJK"); // 21 bytes, heap, 独立
     defer a.deinit(&tc.c);
     var b = try Str.fromLiteral(&tc.c, "XYZWV"); // 5 bytes, SSO
@@ -462,10 +474,10 @@ test "Str.concatInPlace 独立缓冲区就地追加" {
 }
 
 test "Str.concatInPlace 连续缓冲区容量足够时零 alloc" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     // concatContiguous 产生 2x 过分配的连续缓冲区
     // 注意：fromLiteral 用于 >SSO_MAX 的字符串（concatSso 仅限 <=SSO_MAX）
     var a_src = try Str.fromLiteral(&tc.c, "0123456789ABCDEFGHIJK"); // 21 bytes, heap 独立
@@ -485,10 +497,10 @@ test "Str.concatInPlace 连续缓冲区容量足够时零 alloc" {
 }
 
 test "Str.concatInPlace 连续缓冲区容量不足时回退" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     const a = try Str.createContiguous(&tc.c, "0123456789ABCDEFGHIJK"); // 21 bytes, cap=21
     defer tc.c.freeObj(@ptrCast(a));
     try std.testing.expect(a.isContiguous());
@@ -500,10 +512,10 @@ test "Str.concatInPlace 连续缓冲区容量不足时回退" {
 }
 
 test "Str.concatInPlace SSO 回退" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var a = try Str.fromLiteral(&tc.c, "abc"); // SSO
     defer a.deinit(&tc.c);
     var b = try Str.fromLiteral(&tc.c, "def");
@@ -512,20 +524,20 @@ test "Str.concatInPlace SSO 回退" {
 }
 
 test "Str.concatInPlace 自拼接回退" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var a = try Str.fromLiteral(&tc.c, "0123456789ABCDEFGHIJK"); // 21 bytes, heap
     defer a.deinit(&tc.c);
     try std.testing.expect(!a.concatInPlace(&tc.c, &a));
 }
 
 test "Str.concatInPlace rc>1 时回退" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var a = try Str.fromLiteral(&tc.c, "0123456789ABCDEFGHIJK"); // 21 bytes, heap
     defer a.deinit(&tc.c);
     a.heapRetain(); // rc=2
@@ -536,10 +548,10 @@ test "Str.concatInPlace rc>1 时回退" {
 }
 
 test "Str.compare and equals" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var a = try Str.fromLiteral(&tc.c, "apple");
     defer a.deinit(&tc.c);
     var b = try Str.fromLiteral(&tc.c, "banana");
@@ -558,10 +570,10 @@ test "Str.compare and equals" {
 }
 
 test "Str.empty string" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var s = try Str.fromLiteral(&tc.c, "");
     defer s.deinit(&tc.c);
     try std.testing.expectEqual(@as(usize, 0), s.byteLength());
@@ -581,10 +593,10 @@ test "Str.empty string" {
 }
 
 test "Str.SSO boundary (≤20 inline, >20 heap)" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     {
         const lit = "0123456789ABCDEFGHIJ";
         try std.testing.expectEqual(@as(usize, 20), lit.len);
@@ -604,10 +616,10 @@ test "Str.SSO boundary (≤20 inline, >20 heap)" {
 }
 
 test "Str.fromOwnedBytes SSO vs heap" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     {
         const buf = try tc.c.allocObj(5);
         @memcpy(buf, "hello");
@@ -627,10 +639,10 @@ test "Str.fromOwnedBytes SSO vs heap" {
 }
 
 test "Str concat produces SSO when result ≤20" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     {
         var a = try Str.fromLiteral(&tc.c, "abc");
         defer a.deinit(&tc.c);
@@ -656,10 +668,10 @@ test "Str concat produces SSO when result ≤20" {
 test "Str layout with ObjHeader" {
     // header(8) + _word0(8) + _word1(8) + _word2(4) + sso_flags(4) = 32
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(Str));
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var s = try Str.fromLiteral(&tc.c, "hi");
     defer s.deinit(&tc.c);
     try std.testing.expectEqual(obj_header.RefKind.str, s.header.type_tag);
@@ -669,10 +681,10 @@ test "Str layout with ObjHeader" {
 }
 
 test "Str heap retain/release via header.rc" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var s = try Str.fromLiteral(&tc.c, "0123456789ABCDEFGHIJK"); // 21 bytes, heap
     defer s.deinit(&tc.c);
     try std.testing.expect(!s.isSso());
@@ -685,10 +697,10 @@ test "Str heap retain/release via header.rc" {
 }
 
 test "Str strDeinit for heap-allocated contiguous Str" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     const s = try Str.createContiguous(&tc.c, "0123456789ABCDEFGHIJK"); // 21 bytes, heap, contiguous
     try std.testing.expect(!s.isSso());
     try std.testing.expect(s.isContiguous());
@@ -696,10 +708,10 @@ test "Str strDeinit for heap-allocated contiguous Str" {
 }
 
 test "Str strDeinit for SSO-allocated Str" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     const s = try Str.createContiguous(&tc.c, "hi"); // SSO
     try std.testing.expect(s.isSso());
     // SSO 模式下 deinit 为空操作，strDeinit 仅释放对象本体
@@ -707,10 +719,10 @@ test "Str strDeinit for SSO-allocated Str" {
 }
 
 test "Str sso retain/release in sso_flags" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     var s = try Str.fromLiteral(&tc.c, "abc");
     defer s.deinit(&tc.c);
     try std.testing.expect(s.isSso());

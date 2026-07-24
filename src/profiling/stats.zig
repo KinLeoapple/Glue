@@ -13,7 +13,19 @@ const builtin = @import("builtin");
 /// 堆对象类型变体数量（与 obj_header.RefKind 的字段数一致）
 /// 不直接导入 obj_header 以避免 profiling ↔ value 循环依赖。
 /// 调用方用 @intFromEnum(ref_kind) 转为 u8 传入 profiler API。
-pub const ref_kind_count: usize = 22;
+pub const ref_kind_count: usize = 23;
+
+/// RefKind 名称表（与 obj_header.RefKind 枚举顺序一一对应）
+/// 不直接导入 obj_header 以避免 profiling ↔ value 循环依赖；
+/// 此处手动镜像维护。每次 RefKind 增删需同步更新。
+pub const REF_KIND_NAMES = [_][]const u8{
+    "str",          "array",        "record",       "adt",
+    "newtype",      "cell",         "range",        "closure",
+    "partial",      "builtin",      "trait_val",    "lazy_val",
+    "error_val",    "throw_val",    "array_iter",   "string_iter",
+    "range_iter",   "atomic_val",   "async_val",    "channel_val",
+    "sender_val",   "receiver_val", "boxed_scalar",
+};
 
 // ============ 基础工具（Zig 0.16 兼容层）============
 
@@ -35,6 +47,10 @@ pub const SpinMutex = struct {
     }
 };
 
+// Zig 0.16 移除了 std.os.windows 下的 QueryPerformanceFrequency /
+// QueryPerformanceCounter / kernel32.Sleep，需直接 extern 声明。
+extern "kernel32" fn Sleep(dwMilliseconds: std.os.windows.DWORD) callconv(.winapi) void;
+
 /// 读取单调时钟的纳秒时间戳（替代 Zig 0.15 的 std.time.nanoTimestamp）
 ///
 /// 平台分支：POSIX 用 clock_gettime(CLOCK_MONOTONIC)，Windows 用 QPC。
@@ -42,12 +58,16 @@ pub const SpinMutex = struct {
 pub fn nanoTimestamp() i64 {
     switch (builtin.os.tag) {
         .windows => {
-            var freq: i64 = 0;
-            var now: i64 = 0;
-            _ = std.os.windows.QueryPerformanceFrequency(&freq);
-            _ = std.os.windows.QueryPerformanceCounter(&now);
+            var freq: std.os.windows.LARGE_INTEGER = 0;
+            var now: std.os.windows.LARGE_INTEGER = 0;
+            _ = std.os.windows.ntdll.RtlQueryPerformanceFrequency(&freq);
+            _ = std.os.windows.ntdll.RtlQueryPerformanceCounter(&now);
             if (freq == 0) return 0;
-            return @divFloor(now * std.time.ns_per_s, freq);
+            // 拆分为秒 + 小数部分分别换算，避免 now * ns_per_s 在长时间
+            // 运行后（QPC 计数可达 10^14）溢出 i64。
+            const sec = @divFloor(now, freq);
+            const frac = @mod(now, freq);
+            return sec * std.time.ns_per_s + @divFloor(frac * std.time.ns_per_s, freq);
         },
         else => {
             var ts: std.c.timespec = undefined;
@@ -63,7 +83,7 @@ pub fn nanoTimestamp() i64 {
 pub fn sleepNs(ns: u64) void {
     switch (builtin.os.tag) {
         .windows => {
-            std.os.windows.kernel32.Sleep(@intCast(ns / std.time.ns_per_ms));
+            Sleep(@intCast(ns / std.time.ns_per_ms));
         },
         else => {
             const sec: i64 = @intCast(ns / std.time.ns_per_s);
@@ -178,7 +198,10 @@ pub const CoarseSample = struct {
 pub const FuncStat = struct {
     func_idx: u32,
     calls: u64 = 0,
-    total_time_ns: u64 = 0,
+    /// inclusive time：函数从进入到返回的总耗时（含子调用）
+    inclusive_time_ns: u64 = 0,
+    /// exclusive time：函数自身耗时（扣除子调用），用于定位真正的热点
+    exclusive_time_ns: u64 = 0,
     arena_alloc_bytes: u64 = 0,
     heap_alloc_bytes: u64 = 0,
     retain_count: u64 = 0,
@@ -203,13 +226,16 @@ pub const FuncAllocArray = [MAX_TRACKED_FUNCS]FuncAllocAccum;
 pub const MAX_CALL_DEPTH: usize = 4096;
 
 /// 调用栈条目（实时 per-function 计时用）
+/// child_time_ns 累加本帧所有直接子调用的耗时，用于计算 exclusive time
 pub const CallStackEntry = struct {
     func_idx: u32,
     start_ns: i64,
+    child_time_ns: u64 = 0,
 };
 
-/// Per-function 时间和调用计数数组（实时累加，aggregator 直接读取）
-pub const FuncTimeArray = [MAX_TRACKED_FUNCS]u64;
+/// Per-function 时间数组（实时累加，aggregator 直接读取）
+/// [0] = inclusive_time_ns, [1] = exclusive_time_ns
+pub const FuncTimeArray = [MAX_TRACKED_FUNCS][2]u64;
 pub const FuncCallArray = [MAX_TRACKED_FUNCS]u64;
 
 test {

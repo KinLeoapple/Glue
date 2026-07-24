@@ -5,8 +5,7 @@
 //! `deinit` 时若仍有未释放记录则报告泄漏。
 
 const std = @import("std");
-const sync = @import("sync");
-const Mutex = sync.Mutex;
+const Mutex = std.Io.Mutex;
 
 // 单次分配的追踪记录。
 const AllocRecord = struct {
@@ -22,14 +21,16 @@ pub const DebugAllocator = struct {
     single_threaded: bool,
     /// 是否在检测到泄漏 / 双重释放时打印诊断信息。
     verbose: bool = true,
-    lock: Mutex = .{},
+    io: std.Io,
+    lock: Mutex = .init,
 
     /// 创建多线程安全的调试分配器，底层使用 C 分配器。
-    pub fn init() DebugAllocator {
+    pub fn init(io: std.Io) DebugAllocator {
         return .{
             .backing = std.heap.c_allocator,
             .alloc_map = std.AutoHashMap(usize, AllocRecord).init(std.heap.c_allocator),
             .single_threaded = false,
+            .io = io,
         };
     }
 
@@ -39,6 +40,7 @@ pub const DebugAllocator = struct {
             .backing = std.heap.c_allocator,
             .alloc_map = std.AutoHashMap(usize, AllocRecord).init(std.heap.c_allocator),
             .single_threaded = true,
+            .io = undefined,
         };
     }
 
@@ -203,11 +205,11 @@ pub const DebugAllocator = struct {
 
     // 多线程模式下加锁，单线程模式下空操作。
     inline fn lockIf(self: *DebugAllocator) void {
-        if (!self.single_threaded) self.lock.lock();
+        if (!self.single_threaded) self.lock.lockUncancelable(self.io);
     }
 
     inline fn unlockIf(self: *DebugAllocator) void {
-        if (!self.single_threaded) self.lock.unlock();
+        if (!self.single_threaded) self.lock.unlock(self.io);
     }
 };
 

@@ -43,6 +43,11 @@ pub const GlobalProfiler = struct {
     timeline: timeline_mod.Timeline,
     phases: phases_mod.Phases,
 
+    /// 函数名表（按 func_idx 索引）：由调用方在 build 完 IR 后通过
+    /// `setFuncNames` 注入。dump 时拷贝到 Report 用于显示。
+    /// 内存归 GlobalProfiler 所有，deinit 时释放。
+    func_names: ?[][]const u8 = null,
+
     /// 初始化
     pub fn init(
         allocator: std.mem.Allocator,
@@ -71,6 +76,32 @@ pub const GlobalProfiler = struct {
         }
         self.timeline.deinit();
         self.thread_profilers.deinit(self.allocator);
+        if (self.func_names) |names| {
+            for (names) |n| self.allocator.free(n);
+            self.allocator.free(names);
+            self.func_names = null;
+        }
+    }
+
+    /// 注入函数名表（深拷贝，所有权归 GlobalProfiler）
+    /// `names[i]` 对应 IR.functions[i].name；调用方传入的内存可随即释放。
+    pub fn setFuncNames(self: *GlobalProfiler, names: []const []const u8) !void {
+        if (self.func_names) |old| {
+            for (old) |n| self.allocator.free(n);
+            self.allocator.free(old);
+            self.func_names = null;
+        }
+        const dup = try self.allocator.alloc([]const u8, names.len);
+        errdefer self.allocator.free(dup);
+        var copied: usize = 0;
+        errdefer {
+            for (dup[0..copied]) |n| self.allocator.free(n);
+        }
+        for (names, 0..) |n, i| {
+            dup[i] = try self.allocator.dupe(u8, n);
+            copied += 1;
+        }
+        self.func_names = dup;
     }
 
     /// 注册 ThreadProfiler（ThreadContext 初始化时调用）
@@ -114,6 +145,8 @@ pub const GlobalProfiler = struct {
         var agg = aggregator_mod.Aggregator.init(self.allocator);
         var report = agg.buildReport(&self.timeline, self.phases, self.thread_profilers.items) catch return;
         defer report.deinit();
+        // 注入函数名表（若调用方在 build IR 后已 setFuncNames）
+        if (self.func_names) |names| report.func_names = names;
 
         // 文本格式到 stderr
         const stderr = std.Io.File.stderr();

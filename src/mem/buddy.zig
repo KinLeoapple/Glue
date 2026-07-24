@@ -12,8 +12,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const sync = @import("sync");
-const Mutex = sync.Mutex;
+const Mutex = std.Io.Mutex;
 
 /// 最小块大小（512B）
 pub const MIN_BLOCK_SIZE: usize = 512;
@@ -189,7 +188,8 @@ fn arenaFreeWindows(buf: []u8) void {
 /// Buddy 风格大对象分配器（完整合并实现）
 pub const BuddyAllocator = struct {
     backing: std.mem.Allocator,
-    lock: Mutex = .{},
+    io: std.Io,
+    lock: Mutex = .init,
     free_lists: [NUM_CLASSES]?*FreeBlock = [_]?*FreeBlock{null} ** NUM_CLASSES,
     // arena 由 OS 层 API 直接分配（arenaAlloc），1MB 对齐、零浪费，不经过 backing。
     // backing 仅用于 large_allocs 和 arenas 列表自身的元数据。
@@ -198,14 +198,14 @@ pub const BuddyAllocator = struct {
     large_allocs: std.ArrayList([]align(16) u8) = .empty,
 
     /// 创建分配器
-    pub fn init(backing: std.mem.Allocator) BuddyAllocator {
-        return .{ .backing = backing };
+    pub fn init(backing: std.mem.Allocator, io: std.Io) BuddyAllocator {
+        return .{ .backing = backing, .io = io };
     }
 
     /// 释放所有 arena 和超大对象
     pub fn deinit(self: *BuddyAllocator) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         for (self.arenas.items) |arena| {
             arenaFree(arena);
         }
@@ -268,8 +268,8 @@ pub const BuddyAllocator = struct {
         // 超大对象（> MAX_BLOCK_SIZE）：直接走 backing，header 标记 block_size > MAX_BLOCK_SIZE
         // 这避免了 roundUpSize 截断到 MAX_BLOCK_SIZE 导致的缓冲区溢出
         if (total > MAX_BLOCK_SIZE) {
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
             const mem = try self.backing.alignedAlloc(u8, .fromByteUnits(16), total);
             const block: *FreeBlock = @ptrCast(@alignCast(mem.ptr));
             block.header.block_size = total; // 记录实际总大小，> MAX_BLOCK_SIZE 标识超大对象
@@ -282,8 +282,8 @@ pub const BuddyAllocator = struct {
         const block_size = roundUpSize(total);
         const idx = classIndex(block_size);
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
         // 在 idx 及以上 class 查找空闲块
         var found: ?*FreeBlock = null;
@@ -334,8 +334,8 @@ pub const BuddyAllocator = struct {
 
         // 超大对象：block_size > MAX_BLOCK_SIZE 标识直接走 backing 分配
         if (stored_size > MAX_BLOCK_SIZE) {
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
             const total = stored_size;
             const mem: []align(16) u8 = @as([*]align(16) u8, @alignCast(@ptrCast(block)))[0..total];
             // 从 large_allocs 移除并释放
@@ -349,8 +349,8 @@ pub const BuddyAllocator = struct {
             return;
         }
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
         var cur_size = stored_size;
 
@@ -398,7 +398,9 @@ pub const BuddyAllocator = struct {
 const testing = std.testing;
 
 test "BuddyAllocator 分配与释放" {
-    var buddy = BuddyAllocator.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var buddy = BuddyAllocator.init(testing.allocator, threaded.io());
     defer buddy.deinit();
 
     const mem = try buddy.alloc(600);
@@ -411,7 +413,9 @@ test "BuddyAllocator 分配与释放" {
 }
 
 test "BuddyAllocator 缓存复用" {
-    var buddy = BuddyAllocator.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var buddy = BuddyAllocator.init(testing.allocator, threaded.io());
     defer buddy.deinit();
 
     const m1 = try buddy.alloc(512);
@@ -424,7 +428,9 @@ test "BuddyAllocator 缓存复用" {
 }
 
 test "BuddyAllocator 不同大小分配" {
-    var buddy = BuddyAllocator.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var buddy = BuddyAllocator.init(testing.allocator, threaded.io());
     defer buddy.deinit();
 
     const sizes = [_]usize{ 256, 512, 1024, 4096, 8192 };
@@ -437,7 +443,9 @@ test "BuddyAllocator 不同大小分配" {
 }
 
 test "BuddyAllocator 分裂与合并" {
-    var buddy = BuddyAllocator.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var buddy = BuddyAllocator.init(testing.allocator, threaded.io());
     defer buddy.deinit();
 
     // 分配多个小块触发分裂
@@ -455,7 +463,9 @@ test "BuddyAllocator 分裂与合并" {
 }
 
 test "BuddyAllocator 合并后复用" {
-    var buddy = BuddyAllocator.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var buddy = BuddyAllocator.init(testing.allocator, threaded.io());
     defer buddy.deinit();
 
     // 分配两个相邻块
@@ -471,7 +481,9 @@ test "BuddyAllocator 合并后复用" {
 }
 
 test "BuddyAllocator 16B 对齐" {
-    var buddy = BuddyAllocator.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var buddy = BuddyAllocator.init(testing.allocator, threaded.io());
     defer buddy.deinit();
 
     const m = try buddy.alloc(100);
@@ -480,7 +492,9 @@ test "BuddyAllocator 16B 对齐" {
 }
 
 test "BuddyAllocator 大量分配无碎片" {
-    var buddy = BuddyAllocator.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var buddy = BuddyAllocator.init(testing.allocator, threaded.io());
     defer buddy.deinit();
 
     // 模拟 fib 递归：大量小对象创建释放

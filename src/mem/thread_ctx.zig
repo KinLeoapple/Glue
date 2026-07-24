@@ -56,6 +56,7 @@ pub const ThreadContext = struct {
 
     /// 创建线程上下文
     /// global_prof 非 null 且 enabled 时创建并注册 ThreadProfiler
+    /// io 从 global.io 取（线程上下文与所属 GlobalPool 共享同一 io 实例）
     pub fn init(global: *GlobalPool, backing: std.mem.Allocator, global_prof: ?*profiling.GlobalProfiler) !ThreadContext {
         var ctx = ThreadContext{
             .channels = ChannelRegion.init(backing),
@@ -390,7 +391,9 @@ fn freeToPage(page: PagePtr, ptr: [*]u8) bool {
 const testing = std.testing;
 
 test "ThreadContext 小对象分配与释放" {
-    var global = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var global = GlobalPool.init(testing.allocator, threaded.io());
     defer global.deinit();
     var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
@@ -403,7 +406,9 @@ test "ThreadContext 小对象分配与释放" {
 }
 
 test "ThreadContext 多次分配" {
-    var global = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var global = GlobalPool.init(testing.allocator, threaded.io());
     defer global.deinit();
     var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
@@ -422,7 +427,9 @@ test "ThreadContext 多次分配" {
 }
 
 test "ThreadContext 大对象分配" {
-    var global = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var global = GlobalPool.init(testing.allocator, threaded.io());
     defer global.deinit();
     var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
@@ -434,7 +441,9 @@ test "ThreadContext 大对象分配" {
 }
 
 test "ThreadContext 通道分配" {
-    var global = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var global = GlobalPool.init(testing.allocator, threaded.io());
     defer global.deinit();
     var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
@@ -446,7 +455,9 @@ test "ThreadContext 通道分配" {
 }
 
 test "ThreadContext 临时区分配与 reset" {
-    var global = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var global = GlobalPool.init(testing.allocator, threaded.io());
     defer global.deinit();
     var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();
@@ -458,7 +469,9 @@ test "ThreadContext 临时区分配与 reset" {
 }
 
 test "ThreadContext 全空页归还" {
-    var global = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var global = GlobalPool.init(testing.allocator, threaded.io());
     defer global.deinit();
     var ctx = try ThreadContext.init(&global, testing.allocator, null);
     defer ctx.deinit();

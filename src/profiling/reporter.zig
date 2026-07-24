@@ -78,11 +78,14 @@ pub fn dumpText(report: *const Report, writer: anytype) !void {
     });
 
     // 7. 类型分布 Top-10
-    try writer.print("\ntype distribution (top 10 by live bytes):\n", .{});
+    try writer.print("\ntype distribution (top 10 by alloc bytes):\n", .{});
     try dumpTypeDistribution(&report.types_final, writer);
 
     // 8. per-function Top-20
-    try writer.print("\nfunctions (top 20 by time):\n", .{});
+    // exclusive = 自身耗时（扣除子调用），用于定位热点
+    // inclusive = 含子调用的总耗时，用于理解调用链开销
+    // 百分比分母为 wall-clock total，exclusive 之和不会超过 100%
+    try writer.print("\nfunctions (top 20 by exclusive time):\n", .{});
     try dumpFuncTopN(report, 20, writer);
 
     // 9. 时间序列元信息
@@ -119,7 +122,7 @@ pub fn dumpJson(report: *const Report, writer: anytype) !void {
     try dumpAllocatorsJson(&report.allocators_peak, &jw);
 
     try jw.objectField("functions");
-    try dumpFuncStatsJson(&report.func_stats, report.func_total_time_ns, &jw);
+    try dumpFuncStatsJson(&report.func_stats, report.phases.total_ns, report.func_names, &jw);
 
     try jw.objectField("timeline_meta");
     try jw.beginObject();
@@ -175,39 +178,62 @@ fn dumpHitRate(writer: anytype, name: []const u8, hits: u64, misses: u64) !void 
 }
 
 fn dumpTypeDistribution(types: *const TypeStatsArray, writer: anytype) !void {
-    // 收集并按 live_bytes 降序排序（使用 u8 索引，不依赖 RefKind 枚举）
-    var buf: [ref_kind_count]struct { idx: u8, live: u64 } = undefined;
+    // 收集并按 alloc_bytes 降序排序（程序结束时 live 通常已归零，按 alloc 更有信息量）
+    var buf: [ref_kind_count]struct { idx: u8, alloc_bytes: u64 } = undefined;
     var n: usize = 0;
     for (0..ref_kind_count) |i| {
         if (types[i].alloc_bytes > 0) {
-            buf[n] = .{ .idx = @intCast(i), .live = types[i].live_bytes };
+            buf[n] = .{ .idx = @intCast(i), .alloc_bytes = types[i].alloc_bytes };
             n += 1;
         }
     }
     std.mem.sort(@TypeOf(buf[0]), buf[0..n], {}, struct {
         fn cmp(_: void, a: @TypeOf(buf[0]), b: @TypeOf(buf[0])) bool {
-            return a.live > b.live;
+            return a.alloc_bytes > b.alloc_bytes;
         }
     }.cmp);
     const top = @min(n, 10);
     for (buf[0..top]) |e| {
-        try writer.print("  type[{d:>2}]       : {d} live, {d} B alloc\n", .{
-            e.idx, types[e.idx].live_count, types[e.idx].alloc_bytes,
+        const name = if (e.idx < stats.REF_KIND_NAMES.len) stats.REF_KIND_NAMES[e.idx] else "?";
+        try writer.print("  {s: <13} : {d} live, {d} allocs, {d} B\n", .{
+            name, types[e.idx].live_count, types[e.idx].alloc_count, types[e.idx].alloc_bytes,
         });
     }
 }
 
 fn dumpFuncTopN(report: *const Report, n: usize, writer: anytype) !void {
     const top = @min(report.func_stats.items.len, n);
+    const total_ns = report.phases.total_ns;
+    // 表头
+    try writer.print("  {s: <20} {s:>10} {s:>10} {s:>7} {s:>7}  {s}\n", .{
+        "name", "excl(ms)", "incl(ms)", "excl%", "incl%", "calls  arena  heap",
+    });
     for (report.func_stats.items[0..top]) |fs| {
-        const ms = @as(f64, @floatFromInt(fs.total_time_ns)) / 1e6;
-        const p = if (report.func_total_time_ns > 0)
-            (@as(f64, @floatFromInt(fs.total_time_ns)) * 100.0) / @as(f64, @floatFromInt(report.func_total_time_ns))
+        const excl_ms = @as(f64, @floatFromInt(fs.exclusive_time_ns)) / 1e6;
+        const incl_ms = @as(f64, @floatFromInt(fs.inclusive_time_ns)) / 1e6;
+        const excl_pct = if (total_ns > 0)
+            (@as(f64, @floatFromInt(fs.exclusive_time_ns)) * 100.0) / @as(f64, @floatFromInt(total_ns))
         else
             0;
-        try writer.print("  #{d: <5} : {d:>8.3} ms ({d:>5.1}%)  calls: {d}  arena: {d} B  heap: {d} B\n", .{
-            fs.func_idx, ms, p, fs.calls, fs.arena_alloc_bytes, fs.heap_alloc_bytes,
-        });
+        const incl_pct = if (total_ns > 0)
+            (@as(f64, @floatFromInt(fs.inclusive_time_ns)) * 100.0) / @as(f64, @floatFromInt(total_ns))
+        else
+            0;
+        const name = if (report.func_names) |names|
+            (if (fs.func_idx < names.len) names[fs.func_idx] else "<untracked>")
+        else
+            null;
+        if (name) |nm| {
+            try writer.print("  {s: <20} {d:>10.3} {d:>10.3} {d:>6.1}% {d:>6.1}%  {d}  {d} B  {d} B\n", .{
+                nm, excl_ms, incl_ms, excl_pct, incl_pct,
+                fs.calls, fs.arena_alloc_bytes, fs.heap_alloc_bytes,
+            });
+        } else {
+            try writer.print("  #{d: <19} {d:>10.3} {d:>10.3} {d:>6.1}% {d:>6.1}%  {d}  {d} B  {d} B\n", .{
+                fs.func_idx, excl_ms, incl_ms, excl_pct, incl_pct,
+                fs.calls, fs.arena_alloc_bytes, fs.heap_alloc_bytes,
+            });
+        }
     }
 }
 
@@ -251,6 +277,9 @@ fn dumpTypesJson(types: *const TypeStatsArray, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("kind_idx");
         try jw.write(@as(u8, @intCast(i)));
+        try jw.objectField("kind_name");
+        const name = if (i < stats.REF_KIND_NAMES.len) stats.REF_KIND_NAMES[i] else "?";
+        try jw.write(name);
         try jw.objectField("alloc_count");
         try jw.write(types[i].alloc_count);
         try jw.objectField("alloc_bytes");
@@ -290,22 +319,41 @@ fn dumpAllocatorsJson(a: *const AllocatorStats, jw: anytype) !void {
     try jw.endObject();
 }
 
-fn dumpFuncStatsJson(func_stats: *const std.ArrayList(FuncStat), total_ns: u64, jw: anytype) !void {
+fn dumpFuncStatsJson(
+    func_stats: *const std.ArrayList(FuncStat),
+    total_ns: u64,
+    func_names: ?[]const []const u8,
+    jw: anytype,
+) !void {
     try jw.beginArray();
     for (func_stats.items) |fs| {
         try jw.beginObject();
         try jw.objectField("func_idx");
         try jw.write(fs.func_idx);
+        if (func_names) |names| {
+            if (fs.func_idx < names.len) {
+                try jw.objectField("func_name");
+                try jw.write(names[fs.func_idx]);
+            }
+        }
         try jw.objectField("calls");
         try jw.write(fs.calls);
-        try jw.objectField("total_time_ns");
-        try jw.write(fs.total_time_ns);
-        try jw.objectField("pct");
-        const p = if (total_ns > 0)
-            (@as(f64, @floatFromInt(fs.total_time_ns)) * 100.0) / @as(f64, @floatFromInt(total_ns))
+        try jw.objectField("inclusive_time_ns");
+        try jw.write(fs.inclusive_time_ns);
+        try jw.objectField("exclusive_time_ns");
+        try jw.write(fs.exclusive_time_ns);
+        try jw.objectField("exclusive_pct");
+        const ep = if (total_ns > 0)
+            (@as(f64, @floatFromInt(fs.exclusive_time_ns)) * 100.0) / @as(f64, @floatFromInt(total_ns))
         else
             0;
-        try jw.write(p);
+        try jw.write(ep);
+        try jw.objectField("inclusive_pct");
+        const ip = if (total_ns > 0)
+            (@as(f64, @floatFromInt(fs.inclusive_time_ns)) * 100.0) / @as(f64, @floatFromInt(total_ns))
+        else
+            0;
+        try jw.write(ip);
         try jw.objectField("arena_alloc_bytes");
         try jw.write(fs.arena_alloc_bytes);
         try jw.objectField("heap_alloc_bytes");

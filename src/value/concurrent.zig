@@ -13,16 +13,116 @@
 //! - AtomicValue/SenderValue/ReceiverValue：固定大小，走 createObj 页池
 //! - AsyncHandle：固定大小，panic_message 使用内联缓冲区（无跨线程分配）
 //! - ChannelValue：连续内存 [header | Value buffer[cap]]，单次分配单次释放
+//!
+//! 阶段 1（mem/sync 改造）：内部保留自旋锁实现，等阶段 5 协程化时迁移到 Io.Mutex。
+//! 这里不复用已删除的 src/sync/sync.zig，而是直接内联一份最小自旋锁实现，
+//! 因为 Io.Mutex 需要 io 参数，会引发 AsyncHandle/Channel/Atomic 的连锁改造。
 
 const std = @import("std");
 const value = @import("mod.zig");
-const sync = @import("sync");
 const obj_header = @import("obj_header.zig");
 const ObjHeader = obj_header.ObjHeader;
 const ThreadContext = obj_header.ThreadContext;
 const Value = value.Value;
-const Mutex = sync.Mutex;
-const Condition = sync.Condition;
+
+// ──────────────────────────────────────────────
+// 内部自旋锁（阶段 5 协程化时迁移到 Io.Mutex）
+// ──────────────────────────────────────────────
+
+/// 自旋互斥锁（与已删除的 sync.Mutex 等价）。
+/// 阶段 5 协程化时替换为 Io.Mutex，并加 io 字段。
+pub const Mutex = struct {
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    const UNLOCKED: u32 = 0;
+    const LOCKED: u32 = 1;
+    const SPIN_DENSE: u32 = 64;
+    const SPIN_BACKOFF: u32 = 64;
+    const BACKOFF_MAX: u32 = 64;
+    const YIELD_THRESHOLD: u32 = SPIN_DENSE + SPIN_BACKOFF;
+
+    pub inline fn lock(self: *Mutex) void {
+        if (self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic)) |_| {} else return;
+        self.lockSlow();
+    }
+
+    fn lockSlow(self: *Mutex) void {
+        var attempts: u32 = 0;
+        var backoff: u32 = 1;
+        while (true) {
+            if (self.state.load(.acquire) == UNLOCKED) {
+                if (self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic)) |_| {} else return;
+            }
+            attempts += 1;
+            if (attempts <= SPIN_DENSE) {
+                std.atomic.spinLoopHint();
+            } else if (attempts <= YIELD_THRESHOLD) {
+                var i: u32 = 0;
+                while (i < backoff) : (i += 1) {
+                    std.atomic.spinLoopHint();
+                }
+                backoff = @min(backoff * 2, BACKOFF_MAX);
+            } else {
+                std.Thread.yield() catch {};
+                backoff = 1;
+                attempts = YIELD_THRESHOLD;
+            }
+        }
+    }
+
+    pub inline fn unlock(self: *Mutex) void {
+        self.state.store(UNLOCKED, .release);
+    }
+};
+
+/// 自旋条件变量（与已删除的 sync.Condition 等价）。
+pub const Condition = struct {
+    waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    wakeups: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    const SPIN_DENSE: u32 = 64;
+    const SPIN_BACKOFF: u32 = 64;
+    const BACKOFF_MAX: u32 = 64;
+    const YIELD_THRESHOLD: u32 = SPIN_DENSE + SPIN_BACKOFF;
+
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        _ = self.waiters.fetchAdd(1, .seq_cst);
+        mutex.unlock();
+
+        var attempts: u32 = 0;
+        var backoff: u32 = 1;
+        while (self.wakeups.load(.acquire) == 0) {
+            attempts += 1;
+            if (attempts <= SPIN_DENSE) {
+                std.atomic.spinLoopHint();
+            } else if (attempts <= YIELD_THRESHOLD) {
+                var i: u32 = 0;
+                while (i < backoff) : (i += 1) {
+                    std.atomic.spinLoopHint();
+                }
+                backoff = @min(backoff * 2, BACKOFF_MAX);
+            } else {
+                std.Thread.yield() catch {};
+                backoff = 1;
+                attempts = YIELD_THRESHOLD;
+            }
+        }
+        _ = self.wakeups.fetchSub(1, .seq_cst);
+        _ = self.waiters.fetchSub(1, .seq_cst);
+        mutex.lock();
+    }
+
+    pub fn signal(self: *Condition) void {
+        if (self.waiters.load(.acquire) == 0) return;
+        _ = self.wakeups.fetchAdd(1, .release);
+    }
+
+    pub fn broadcast(self: *Condition) void {
+        const w = self.waiters.load(.acquire);
+        if (w == 0) return;
+        _ = self.wakeups.fetchAdd(w, .release);
+    }
+};
 
 // ──────────────────────────────────────────────
 // AtomicValue
@@ -42,7 +142,7 @@ pub const AtomicValue = struct {
     pub fn init(val: Value) AtomicValue {
         return AtomicValue{
             .data = val,
-            .mutex = .{},
+            .mutex = .{},  // Mutex 默认值（state=0=UNLOCKED）
         };
     }
 
@@ -288,7 +388,7 @@ pub const AsyncHandle = struct {
             .result = null,
             .consumed = std.atomic.Value(bool).init(false),
             .finished = std.atomic.Value(bool).init(false),
-            .mutex = .{},
+            .mutex = .{},  // Mutex 默认值（state=0=UNLOCKED）
             .condition = .{},
         };
     }
@@ -430,7 +530,7 @@ pub const ChannelValue = struct {
             .rend_value = null,
             .rend_ready = false,
             .closed = false,
-            .mutex = .{},
+            .mutex = .{},  // Mutex 默认值（state=0=UNLOCKED）
             .not_empty = .{},
             .not_full = .{},
         };
@@ -625,11 +725,23 @@ pub fn registerDeinits() void {
 const testing = std.testing;
 const mem_mod = @import("mem");
 
-fn testCtx() struct { g: mem_mod.GlobalPool, c: ThreadContext } {
-    var g = mem_mod.GlobalPool.init(testing.allocator);
-    const c = ThreadContext.init(&g, testing.allocator, null) catch unreachable;
-    return .{ .g = g, .c = c };
-}
+const TestCtx = struct {
+    threaded: std.Io.Threaded = undefined,
+    g: mem_mod.GlobalPool = undefined,
+    c: ThreadContext = undefined,
+
+    fn init(self: *TestCtx) void {
+        self.threaded = std.Io.Threaded.init(testing.allocator, .{});
+        self.g = mem_mod.GlobalPool.init(testing.allocator, self.threaded.io());
+        self.c = ThreadContext.init(&self.g, testing.allocator, null) catch unreachable;
+    }
+
+    fn deinit(self: *TestCtx) void {
+        self.c.deinit();
+        self.g.deinit();
+        self.threaded.deinit();
+    }
+};
 
 test "AtomicValue load/store" {
     var av = AtomicValue.init(Value.fromI32(100));
@@ -654,10 +766,10 @@ test "AtomicValue xchg" {
 }
 
 test "buffered channel ring buffer FIFO order" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     const ch = try ChannelValue.create(&tc.c, 3);
     defer tc.c.freeObj(@ptrCast(ch));
     try testing.expect(try ch.send(Value.fromI32(10)));
@@ -676,10 +788,10 @@ test "buffered channel ring buffer FIFO order" {
 }
 
 test "channel close wakes blocked recv" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     const ch = try ChannelValue.create(&tc.c, 1);
     defer tc.c.freeObj(@ptrCast(ch));
     ch.close();
@@ -687,10 +799,10 @@ test "channel close wakes blocked recv" {
 }
 
 test "channel send after close returns false" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     const ch = try ChannelValue.create(&tc.c, 2);
     defer tc.c.freeObj(@ptrCast(ch));
     ch.close();
@@ -699,10 +811,10 @@ test "channel send after close returns false" {
 }
 
 test "AsyncHandle setPanic 内联缓冲区" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     const handle = try tc.c.createObj(AsyncHandle);
     handle.* = AsyncHandle.init();
     handle.setPanic("boom");
@@ -714,10 +826,10 @@ test "AsyncHandle setPanic 内联缓冲区" {
 }
 
 test "ChannelValue 会合模式 capacity=0" {
-    var tc = testCtx();
+    var tc: TestCtx = .{};
+    tc.init();
     tc.c.global = &tc.g;
-    defer tc.g.deinit();
-    defer tc.c.deinit();
+    defer tc.deinit();
     const ch = try ChannelValue.create(&tc.c, 0);
     defer tc.c.freeObj(@ptrCast(ch));
     try testing.expectEqual(@as(usize, 0), ch.capacity);

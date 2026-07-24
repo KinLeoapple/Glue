@@ -51,7 +51,8 @@ pub const ThreadProfiler = struct {
     // 实时调用栈计时（替代 func_events 事件流，O(1) 无缓冲区限制）
     func_call_stack: [MAX_CALL_DEPTH]CallStackEntry = undefined,
     func_call_stack_top: u32 = 0,
-    func_time: FuncTimeArray = [_]u64{0} ** MAX_TRACKED_FUNCS,
+    /// func_time[fi][0] = inclusive_time_ns, func_time[fi][1] = exclusive_time_ns
+    func_time: FuncTimeArray = [_][2]u64{.{ 0, 0 }} ** MAX_TRACKED_FUNCS,
     func_calls: FuncCallArray = [_]u64{0} ** MAX_TRACKED_FUNCS,
 
     /// 创建 ThreadProfiler
@@ -295,11 +296,15 @@ pub const ThreadProfiler = struct {
         self.func_call_stack[self.func_call_stack_top] = .{
             .func_idx = func_idx,
             .start_ns = nanoTimestamp(),
+            .child_time_ns = 0,
         };
         self.func_call_stack_top += 1;
     }
 
-    /// 函数返回：弹出调用栈，累加 per-function 耗时和调用计数
+    /// 函数返回：弹出调用栈，计算 inclusive/exclusive time 并累加
+    /// - inclusive = now - start_ns（含子调用）
+    /// - exclusive = inclusive - child_time_ns（扣除子调用，自身真实耗时）
+    /// - inclusive 累加到父栈帧的 child_time_ns（供父帧计算 exclusive）
     /// 调用栈为空时跳过（防御性，正常情况下 call/ret 配对）
     pub fn onFuncRet(self: *ThreadProfiler, func_idx: u32) void {
         if (!self.enabled) return;
@@ -307,10 +312,19 @@ pub const ThreadProfiler = struct {
         self.func_call_stack_top -= 1;
         const entry = self.func_call_stack[self.func_call_stack_top];
         const now = nanoTimestamp();
-        const dur: u64 = @intCast(now - entry.start_ns);
+        const inclusive: u64 = @intCast(now - entry.start_ns);
+        // exclusive = inclusive - 子调用耗时之和（下溢保护）
+        const exclusive = inclusive -| entry.child_time_ns;
+
         if (func_idx < MAX_TRACKED_FUNCS) {
-            self.func_time[func_idx] += dur;
+            self.func_time[func_idx][0] += inclusive;
+            self.func_time[func_idx][1] += exclusive;
             self.func_calls[func_idx] += 1;
+        }
+
+        // 将本次 inclusive 累加到父栈帧的 child_time_ns
+        if (self.func_call_stack_top > 0) {
+            self.func_call_stack[self.func_call_stack_top - 1].child_time_ns += inclusive;
         }
     }
 };
@@ -401,8 +415,13 @@ test "调用栈实时计时" {
     // 每个函数各调用 1 次
     try std.testing.expectEqual(@as(u64, 1), prof.func_calls[0]);
     try std.testing.expectEqual(@as(u64, 1), prof.func_calls[1]);
-    // 耗时非负（纳秒级，可能为 0 在高速机器上）
-    try std.testing.expect(prof.func_time[0] >= prof.func_time[1]);
+    // inclusive: A >= B（A 包含 B）
+    try std.testing.expect(prof.func_time[0][0] >= prof.func_time[1][0]);
+    // exclusive: A 的 exclusive = A.inclusive - B.inclusive（这里 B 是唯一子调用）
+    // 即 A.exclusive 应 <= A.inclusive
+    try std.testing.expect(prof.func_time[0][1] <= prof.func_time[0][0]);
+    // B 的 exclusive = B.inclusive（B 无子调用）
+    try std.testing.expectEqual(prof.func_time[1][0], prof.func_time[1][1]);
     // 调用栈已清空
     try std.testing.expectEqual(@as(u32, 0), prof.func_call_stack_top);
 }

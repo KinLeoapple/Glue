@@ -182,7 +182,9 @@ test {
 }
 
 test "retain 与 release 引用计数" {
-    var global = mem_mod.GlobalPool.init(std.testing.allocator);
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var global = mem_mod.GlobalPool.init(std.testing.allocator, threaded.io());
     defer global.deinit();
     var ctx = ThreadContext.init(&global, std.testing.allocator, null) catch unreachable;
     defer ctx.deinit();

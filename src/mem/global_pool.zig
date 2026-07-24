@@ -1,14 +1,13 @@
 //! 全局池模块。
 //!
 //! 冷路径内存管理，线程本地内存不足时从此处补充，线程退出时归还。
-//! 采用简单自旋锁保护（临界区短小）：
+//! 采用 `Io.Mutex` 保护（fiber-aware，协程化后挂起 fiber 而非阻塞线程）：
 //! - 每 object_size 最多缓存 8 页
 //! - 大对象通过 BuddyAllocator 分配
 //! - 空页归还给 backing allocator
 
 const std = @import("std");
-const sync = @import("sync");
-const Mutex = sync.Mutex;
+const Mutex = std.Io.Mutex;
 const page_pool = @import("page_pool.zig");
 const buddy_mod = @import("buddy.zig");
 const PagePtr = page_pool.PagePtr;
@@ -31,23 +30,25 @@ const SizeClassCache = struct {
 
 /// 全局池：冷路径页缓存 + 大对象分配
 pub const GlobalPool = struct {
-    lock: Mutex = .{},
+    io: std.Io,
+    lock: Mutex = .init,
     caches: [MAX_SIZE_CLASSES]SizeClassCache = [_]SizeClassCache{.{}} ** MAX_SIZE_CLASSES,
     buddy: BuddyAllocator,
     backing: std.mem.Allocator,
 
     /// 创建全局池
-    pub fn init(backing: std.mem.Allocator) GlobalPool {
+    pub fn init(backing: std.mem.Allocator, io: std.Io) GlobalPool {
         return .{
-            .buddy = BuddyAllocator.init(backing),
+            .io = io,
+            .buddy = BuddyAllocator.init(backing, io),
             .backing = backing,
         };
     }
 
     /// 释放所有缓存页
     pub fn deinit(self: *GlobalPool) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         for (&self.caches) |*cache| {
             if (cache.object_size == 0) continue;
             for (&cache.pages) |*page| {
@@ -76,8 +77,8 @@ pub const GlobalPool = struct {
 
     /// 获取一个指定 object_size 的页（冷路径，加锁）
     pub fn acquirePage(self: *GlobalPool, comptime object_size: usize) !PagePtr {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
         if (self.findOrInsertSlot(@intCast(object_size))) |idx| {
             const cache = &self.caches[idx];
@@ -95,8 +96,8 @@ pub const GlobalPool = struct {
 
     /// 获取一个运行时已知 object_size 的页
     pub fn acquirePageRuntime(self: *GlobalPool, object_size: usize) !PagePtr {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
         if (self.findOrInsertSlot(@intCast(object_size))) |idx| {
             const cache = &self.caches[idx];
@@ -116,8 +117,8 @@ pub const GlobalPool = struct {
         const hdr = page_pool.pageHeader(page);
         const obj_size = hdr.object_size;
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
         if (self.findOrInsertSlot(obj_size)) |idx| {
             const cache = &self.caches[idx];
@@ -193,7 +194,9 @@ fn freePageRaw(page: PagePtr, object_size: u16, backing: std.mem.Allocator) void
 const testing = std.testing;
 
 test "GlobalPool 页获取与归还" {
-    var pool = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var pool = GlobalPool.init(testing.allocator, threaded.io());
     defer pool.deinit();
 
     const page = try pool.acquirePage(48);
@@ -204,7 +207,9 @@ test "GlobalPool 页获取与归还" {
 }
 
 test "GlobalPool 页缓存复用" {
-    var pool = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var pool = GlobalPool.init(testing.allocator, threaded.io());
     defer pool.deinit();
 
     const p1 = try pool.acquirePage(32);
@@ -217,7 +222,9 @@ test "GlobalPool 页缓存复用" {
 }
 
 test "GlobalPool 大对象分配" {
-    var pool = GlobalPool.init(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var pool = GlobalPool.init(testing.allocator, threaded.io());
     defer pool.deinit();
 
     const mem = try pool.allocLarge(500);
