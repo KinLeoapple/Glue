@@ -1,12 +1,12 @@
 //! 通道线性区模块。
 //!
-//! 为 Glue IR 通道数据提供 bump 分配 + reset 释放的线性区：
+//! 为 Glue IR 通道数据提供 bump 分配 + resetTo 释放的线性区：
 //! - 零元数据开销：无 free-list，无位图，无头部
-//! - 零碎片：顺序分配，整块 reset
+//! - 零碎片：顺序分配，按偏移 resetTo
 //! - SIMD 友好：64B 对齐，满足 AVX-512
 //! - 按需扩容：容量不够时倍增扩容
 //!
-//! 生命周期与基本块一致，基本块结束时 O(1) reset。
+//! 生命周期与函数调用一致，函数返回时 O(1) resetTo 回收本函数通道内存。
 
 const std = @import("std");
 
@@ -70,9 +70,39 @@ pub const ChannelRegion = struct {
         return self.alloc(size);
     }
 
-    /// 基本块结束：reset，O(1)
-    pub fn reset(self: *ChannelRegion) void {
-        self.used = 0;
+    /// 按指定对齐分配 size 字节（用于 per-function 整块分配）
+    pub fn allocAligned(self: *ChannelRegion, size: usize, alignment: usize) ![]align(16) u8 {
+        const aligned = std.mem.alignForward(usize, self.used, alignment);
+        if (self.data != null and aligned + size <= self.len) {
+            const ptr: [*]align(16) u8 = @ptrCast(@alignCast(self.data.? + aligned));
+            self.used = aligned + size;
+            return ptr[0..size];
+        }
+
+        // 容量不够：倍增扩容（同 alloc 逻辑）
+        const new_len = @max(self.len * 2, aligned + size, 256);
+        const new_data = try self.backing.alignedAlloc(u8, .@"64", new_len);
+        if (self.data) |d| {
+            @memcpy(new_data[0..self.used], d[0..self.used]);
+            self.backing.free(d[0..self.len]);
+            const old_base = @intFromPtr(d);
+            const new_base = @intFromPtr(new_data.ptr);
+            self.rebase_info = .{
+                .old_base = old_base,
+                .old_end = old_base + self.len,
+                .offset = @as(i64, @bitCast(new_base)) - @as(i64, @bitCast(old_base)),
+            };
+        }
+        self.data = new_data.ptr;
+        self.len = new_len;
+        return self.allocAligned(size, alignment);
+    }
+
+    /// 回收 offset 之后的所有 bump 分配（O(1)）
+    /// 用于函数返回时回收本函数的通道内存
+    pub fn resetTo(self: *ChannelRegion, offset: usize) void {
+        std.debug.assert(offset <= self.used);
+        self.used = offset;
     }
 };
 
@@ -82,7 +112,7 @@ pub const ChannelRegion = struct {
 
 const testing = std.testing;
 
-test "ChannelRegion 分配与 reset" {
+test "ChannelRegion 分配与对齐" {
     var region = ChannelRegion.init(testing.allocator);
     defer region.deinit();
 
@@ -94,10 +124,6 @@ test "ChannelRegion 分配与 reset" {
     _ = try region.alloc(16);
     // 第二次分配：alignForward(100, 16)=112，used=112+16=128
     try testing.expectEqual(@as(usize, 128), region.used);
-
-    // reset 后 used 归零
-    region.reset();
-    try testing.expectEqual(@as(usize, 0), region.used);
 }
 
 test "ChannelRegion 扩容" {
@@ -119,4 +145,38 @@ test "ChannelRegion 16B 对齐" {
     _ = try region.alloc(7);
     const m2 = try region.alloc(1);
     try testing.expectEqual(@as(usize, 0), @intFromPtr(m2.ptr) % 16);
+}
+
+test "ChannelRegion resetTo 回收到指定偏移" {
+    var region = ChannelRegion.init(testing.allocator);
+    defer region.deinit();
+
+    const m1 = try region.alloc(100);
+    @memset(m1, 0xAA);
+    const offset_after_m1 = region.used;
+
+    const m2 = try region.alloc(50);
+    @memset(m2, 0xBB);
+
+    // resetTo 回收 m2，保留 m1
+    region.resetTo(offset_after_m1);
+    try testing.expectEqual(offset_after_m1, region.used);
+
+    // m1 数据仍有效
+    try testing.expectEqual(@as(u8, 0xAA), m1[0]);
+}
+
+test "ChannelRegion allocAligned 按指定对齐分配" {
+    var region = ChannelRegion.init(testing.allocator);
+    defer region.deinit();
+
+    // 先分配 7 字节，used=7
+    _ = try region.alloc(7);
+
+    // allocAligned(100, 16)：对齐到 16，分配 100 字节
+    const m = try region.allocAligned(100, 16);
+    try testing.expectEqual(@as(usize, 100), m.len);
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(m.ptr) % 16);
+    // used = alignForward(7, 16) + 100 = 16 + 100 = 116
+    try testing.expectEqual(@as(usize, 116), region.used);
 }

@@ -121,6 +121,9 @@ pub const ChannelSpace = struct {
     allocator: std.mem.Allocator,
     /// 入口通道数量（函数参数等，索引 [0, input_count)）
     input_count: u16 = 0,
+    /// 全局通道数量（全局 val/var 通道，索引 [0, global_count)）
+    /// 在 IR 构建完成后由 finalizeGlobalCount 填充
+    global_count: u16 = 0,
 
     pub fn init(allocator: std.mem.Allocator) ChannelSpace {
         return .{

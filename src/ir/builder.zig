@@ -699,6 +699,11 @@ pub const IRBuilder = struct {
         // 反射：计算所有 TypeMetadata 的 size/alignment（类型布局 pass）
         self.computeTypeLayout();
 
+        // 编译期元数据计算 pass
+        try self.computeFunctionChannelLayout();
+        try self.computeSCC();
+        self.finalizeGlobalCount(init_idx);
+
         // 组装 IR（arena 所有权转交给 GlueIR）
         self.arena_owned = false;
         // 反射：构建 TypeMetadataTable（entries 由 arena 拥有，name_to_id 用 backing 分配）
@@ -730,6 +735,153 @@ pub const IRBuilder = struct {
             .backing = self.allocator,
             .type_metadata_table = type_metadata_table,
         };
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 编译期元数据计算 pass
+    // ════════════════════════════════════════════════════════════════
+
+    /// IR 构建完成后计算每个函数的通道布局（chan_total_bytes + local_offsets）
+    /// 必须在 build() 的 toOwnedSlice 之前调用
+    pub fn computeFunctionChannelLayout(self: *IRBuilder) !void {
+        const arena_alloc = self.arena.allocator();
+
+        for (self.functions.items) |*func| {
+            // 收集本函数所有本地通道 + return_channel
+            const chan_count = @as(usize, func.local_chan_count) + 1;
+            const all_chans = try arena_alloc.alloc(u16, chan_count);
+            for (0..func.local_chan_count) |i| {
+                all_chans[i] = func.local_chan_start + @as(u16, @intCast(i));
+            }
+            all_chans[func.local_chan_count] = func.return_channel;
+
+            // 按对齐顺序计算偏移
+            const offsets = try arena_alloc.alloc(u32, chan_count);
+            var current_offset: usize = 0;
+
+            for (all_chans, 0..) |chan, i| {
+                const meta = self.channels.get(chan);
+                const w = meta.elem_width;
+                if (w == 0) {
+                    offsets[i] = @intCast(current_offset);
+                    continue;
+                }
+                current_offset = std.mem.alignForward(usize, current_offset, 16);
+                offsets[i] = @intCast(current_offset);
+                current_offset += w;
+            }
+
+            func.local_offsets = offsets;
+            func.chan_total_bytes = @intCast(std.mem.alignForward(usize, current_offset, 16));
+        }
+    }
+
+    /// 互递归 SCC 分析：使用 Tarjan 算法识别强连通分量
+    /// 必须在 computeFunctionChannelLayout 之后调用
+    pub fn computeSCC(self: *IRBuilder) !void {
+        const n = self.functions.items.len;
+        if (n == 0) return;
+
+        const allocator = self.allocator;
+        const scc_id = try allocator.alloc(u32, n);
+        defer allocator.free(scc_id);
+        @memset(scc_id, std.math.maxInt(u32));
+
+        var index_counter: u32 = 0;
+        var stack = std.ArrayList(u16).empty;
+        defer stack.deinit(allocator);
+        const on_stack = try allocator.alloc(bool, n);
+        defer allocator.free(on_stack);
+        @memset(on_stack, false);
+        const indices = try allocator.alloc(?u32, n);
+        defer allocator.free(indices);
+        @memset(indices, null);
+        const lowlinks = try allocator.alloc(u32, n);
+        defer allocator.free(lowlinks);
+        @memset(lowlinks, 0);
+        var scc_counter: u32 = 0;
+
+        for (self.functions.items, 0..) |_, fi| {
+            if (indices[fi] != null) continue;
+            try self.tarjanSCCVisit(@intCast(fi), &index_counter, &stack, on_stack, indices, lowlinks, scc_id, &scc_counter);
+        }
+
+        // 按 SCC 分组，计算每个 SCC 的 max(chan_total_bytes)
+        var scc_maxes = std.AutoHashMap(u32, u32).init(allocator);
+        defer scc_maxes.deinit();
+
+        for (self.functions.items, 0..) |func, i| {
+            const sid = scc_id[i];
+            const current_max = scc_maxes.get(sid) orelse 0;
+            if (func.chan_total_bytes > current_max) {
+                try scc_maxes.put(sid, func.chan_total_bytes);
+            }
+        }
+
+        // 填充 scc_max_chan_bytes
+        for (self.functions.items, 0..) |*func, i| {
+            const sid = scc_id[i];
+            func.scc_max_chan_bytes = scc_maxes.get(sid).?;
+        }
+    }
+
+    fn tarjanSCCVisit(
+        self: *IRBuilder,
+        v: u16,
+        index_counter: *u32,
+        stack: *std.ArrayList(u16),
+        on_stack: []bool,
+        indices: []?u32,
+        lowlinks: []u32,
+        scc_id: []u32,
+        scc_counter: *u32,
+    ) !void {
+        const vi: usize = v;
+        indices[vi] = index_counter.*;
+        lowlinks[vi] = index_counter.*;
+        index_counter.* += 1;
+        try stack.append(self.allocator, v);
+        on_stack[vi] = true;
+
+        // 遍历 v 的所有 call 节点，获取 callee func_index
+        const func = self.functions.items[vi];
+        const nodes_slice = self.nodes.items[func.node_start .. func.node_start + func.node_count];
+        for (nodes_slice) |node| {
+            if (node.op != .call) continue;
+            if (node.meta_index == 0) continue;
+            const call_meta = self.call_metas.items[node.meta_index - 1];
+            const w = call_meta.func_index;
+            const wi: usize = w;
+            if (wi >= self.functions.items.len) continue;
+
+            if (indices[wi] == null) {
+                try self.tarjanSCCVisit(w, index_counter, stack, on_stack, indices, lowlinks, scc_id, scc_counter);
+                lowlinks[vi] = @min(lowlinks[vi], lowlinks[wi]);
+            } else if (on_stack[wi]) {
+                lowlinks[vi] = @min(lowlinks[vi], indices[wi].?);
+            }
+        }
+
+        // 如果 v 是 SCC 的根
+        if (lowlinks[vi] == indices[vi].?) {
+            while (true) {
+                const w_top = stack.pop().?;
+                on_stack[w_top] = false;
+                scc_id[w_top] = scc_counter.*;
+                if (w_top == v) break;
+            }
+            scc_counter.* += 1;
+        }
+    }
+
+    /// 确定 global_count：全局通道数量
+    /// 必须在 build() 末尾、channels 所有权转交前调用
+    pub fn finalizeGlobalCount(self: *IRBuilder, init_index: ?u16) void {
+        if (init_index) |init_idx| {
+            self.channels.global_count = self.functions.items[init_idx].local_chan_start;
+        } else {
+            self.channels.global_count = 0;
+        }
     }
 
     // ════════════════════════════════════════════
@@ -5452,6 +5604,28 @@ pub const IRBuilder = struct {
                             try self.emit(Node.makeUnary(.nullable_make, nc, 0, value_chan));
                             value_chan = nc;
                             value_meta = self.channels.get(value_chan);
+                        }
+                    }
+                }
+                // 标量类型标注：值类型（如 usize）与标注类型（如 i32）不匹配时，
+                // 插入 cast 节点将值转换为标注类型（与 val_decl 一致）
+                if (vd.type_annotation) |tn| {
+                    if (tn.* != .nullable) {
+                        const dst_ct = self.chanTypeFromTypeNodeResolved(tn);
+                        if (dst_ct) |ct| {
+                            const src_meta = self.channels.get(value_chan);
+                            if (src_meta.chan_type != ct and (src_meta.chan_type.isInt() or src_meta.chan_type.isFloat()) and (ct.isInt() or ct.isFloat())) {
+                                const cast_chan = try self.allocChannel(ct);
+                                const kind: ScalarKind = if (ct.isInt()) .int else .float;
+                                const meta_idx = try self.addScalarMeta(.{
+                                    .kind = kind,
+                                    .int_kind = ct.toIntKind() orelse .i64,
+                                    .float_kind = ct.toFloatKind() orelse .f64,
+                                });
+                                try self.emit(Node.makeUnary(.cast, cast_chan, meta_idx, value_chan));
+                                value_chan = cast_chan;
+                                value_meta = self.channels.get(value_chan);
+                            }
                         }
                     }
                 }

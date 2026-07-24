@@ -91,6 +91,16 @@ pub const Function = struct {
     /// 引擎可在此类函数返回时 reset ShadowArena（当前为预留字段，
     /// 实际启用需配合分配点分流：非逃逸对象进 ShadowArena 而非 RC 堆）
     no_escape: bool = false,
+    /// 本函数通道在 CallStackRegion 中的总字节需求（编译期预计算）
+    chan_total_bytes: u32 = 0,
+    /// 本函数每个本地通道在 region 内的偏移表（编译期预计算）
+    /// local_offsets[i] = 通道 local_chan_start+i 在 region 内的字节偏移
+    /// 长度 = local_chan_count + 1（包含 return_channel 在末尾）
+    local_offsets: []const u32 = &.{},
+    /// 所属互递归 SCC 的最大通道字节数
+    /// 自递归或非递归函数：等于 chan_total_bytes
+    /// 互递归函数：等于 SCC 内所有函数的 max(chan_total_bytes)
+    scc_max_chan_bytes: u32 = 0,
 };
 
 // ════════════════════════════════════════════════════════════════

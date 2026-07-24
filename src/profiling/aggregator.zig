@@ -1,8 +1,9 @@
-//! 从 timeline + func_events 重建 Report
+//! 从 timeline + thread_profilers 重建 Report
 //!
 //! - 全局汇总：末态取最后一个 Sample，峰值遍历序列取 max
-//! - per-function 精确重建：收集 func_events，按 timestamp 排序，栈模拟调用链
-//! - per-function 内存归因：相邻 func_events 期间的全局 delta 归因给该函数
+//! - per-function 时长：直接从 ThreadProfiler.func_time/func_calls 数组读取
+//!   （实时调用栈计时，无事件缓冲区限制）
+//! - per-function 内存归因：从 ThreadProfiler.func_alloc 数组累加
 //! - 类型分布：取末态值
 
 const std = @import("std");
@@ -14,11 +15,11 @@ const thread_profiler_mod = @import("thread_profiler.zig");
 const Sample = stats.Sample;
 const CoarseSample = stats.CoarseSample;
 const FuncStat = stats.FuncStat;
-const FuncEvent = stats.FuncEvent;
 const GlobalStats = stats.GlobalStats;
 const TypeStatsArray = stats.TypeStatsArray;
 const AllocatorStats = stats.AllocatorStats;
 const ref_kind_count = stats.ref_kind_count;
+const MAX_TRACKED_FUNCS = stats.MAX_TRACKED_FUNCS;
 const Timeline = timeline_mod.Timeline;
 const Phases = phases_mod.Phases;
 const ThreadProfiler = thread_profiler_mod.ThreadProfiler;
@@ -94,8 +95,20 @@ pub const Aggregator = struct {
             prev_sample = s;
         }
 
-        // 末态取最后一个 Sample
-        if (prev_sample) |last| {
+        // 末态：优先直接从 ThreadProfiler 读取（权威值，补充 timeline 采样不足）
+        // 程序短或采样间隔长时，ring 中末态可能滞后甚至为空
+        if (thread_profilers.len > 0) {
+            var gf: GlobalStats = .{};
+            var tf: TypeStatsArray = [_]stats.TypeStats{.{}} ** ref_kind_count;
+            var af: AllocatorStats = .{};
+            readFinalFromProfilers(thread_profilers, &gf, &tf, &af);
+            report.global_final = gf;
+            report.types_final = tf;
+            report.allocators_final = af;
+            // 末态也参与峰值更新（单调递增计数器的末态 = 峰值）
+            updatePeakFromStats(&report, &gf, &af);
+        } else if (prev_sample) |last| {
+            // 无 ThreadProfiler 时回退到 timeline 末态
             report.global_final = last.global;
             report.types_final = last.types;
             report.allocators_final = last.allocators;
@@ -105,44 +118,37 @@ pub const Aggregator = struct {
             report.timespan_ns = @intCast(last_ns - f);
         }
 
-        // 2. per-function 精确重建：收集所有线程的 func_events
-        var all_events: std.ArrayList(FuncEvent) = .empty;
-        defer all_events.deinit(self.allocator);
-        for (thread_profilers) |prof| {
-            prof.func_event_mutex.lock();
-            defer prof.func_event_mutex.unlock();
-            try all_events.appendSlice(self.allocator, prof.func_events.items);
-        }
-
-        // 按 timestamp 排序
-        std.mem.sort(FuncEvent, all_events.items, {}, struct {
-            fn cmp(_: void, a: FuncEvent, b: FuncEvent) bool {
-                return a.timestamp_ns < b.timestamp_ns;
-            }
-        }.cmp);
-
-        // 3. 栈模拟调用链，精确计算 per-function 时长
-        var call_stack: std.ArrayList(struct { func_idx: u32, begin_ns: i64 }) = .empty;
-        defer call_stack.deinit(self.allocator);
+        // 2. per-function 时长和调用计数：直接从 ThreadProfiler 数组读取
+        //    （实时调用栈计时，无需事件缓冲区重建）
         var func_map: std.AutoHashMap(u32, usize) = .init(self.allocator);
         defer func_map.deinit();
 
-        for (all_events.items) |ev| {
-            switch (ev.kind) {
-                .call => {
-                    try call_stack.append(self.allocator, .{ .func_idx = ev.func_idx, .begin_ns = ev.timestamp_ns });
-                },
-                .ret => {
-                    if (call_stack.pop()) |top| {
-                        const dur: u64 = @intCast(ev.timestamp_ns - top.begin_ns);
-                        try accumulateFuncTime(&report, &func_map, top.func_idx, dur);
-                        report.func_total_time_ns += dur;
-                    }
-                },
+        for (thread_profilers) |prof| {
+            for (0..MAX_TRACKED_FUNCS) |fi| {
+                const time_ns = prof.func_time[fi];
+                const calls = prof.func_calls[fi];
+                const fa = prof.func_alloc[fi];
+                if (time_ns == 0 and calls == 0 and
+                    fa.arena_bytes == 0 and fa.heap_bytes == 0 and
+                    fa.retain_count == 0 and fa.release_count == 0) continue;
+
+                const gop = try func_map.getOrPut(@intCast(fi));
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = report.func_stats.items.len;
+                    try report.func_stats.append(self.allocator, .{ .func_idx = @intCast(fi) });
+                }
+                const fs = &report.func_stats.items[gop.value_ptr.*];
+                fs.total_time_ns += time_ns;
+                fs.calls += calls;
+                fs.arena_alloc_bytes += fa.arena_bytes;
+                fs.heap_alloc_bytes += fa.heap_bytes;
+                fs.retain_count += fa.retain_count;
+                fs.release_count += fa.release_count;
+                report.func_total_time_ns += time_ns;
             }
         }
 
-        // 4. 排序 func_stats：按 total_time_ns 降序
+        // 3. 排序 func_stats：按 total_time_ns 降序
         std.mem.sort(FuncStat, report.func_stats.items, {}, struct {
             fn cmp(_: void, a: FuncStat, b: FuncStat) bool {
                 return a.total_time_ns > b.total_time_ns;
@@ -153,36 +159,133 @@ pub const Aggregator = struct {
     }
 };
 
-/// 更新峰值
+/// 更新峰值：对所有 GlobalStats 和 AllocatorStats 字段取单调最大值
 fn updatePeak(report: *Report, s: *const Sample) void {
-    if (s.global.current_bytes > report.global_peak.current_bytes)
-        report.global_peak.current_bytes = s.global.current_bytes;
-    if (s.global.peak_bytes > report.global_peak.peak_bytes)
-        report.global_peak.peak_bytes = s.global.peak_bytes;
-    if (s.allocators.channel.current_bytes > report.allocators_peak.channel.current_bytes)
-        report.allocators_peak.channel.current_bytes = s.allocators.channel.current_bytes;
-    if (s.allocators.channel.peak_bytes > report.allocators_peak.channel.peak_bytes)
-        report.allocators_peak.channel.peak_bytes = s.allocators.channel.peak_bytes;
-    if (s.allocators.shadow_arena.current_bytes > report.allocators_peak.shadow_arena.current_bytes)
-        report.allocators_peak.shadow_arena.current_bytes = s.allocators.shadow_arena.current_bytes;
-    if (s.allocators.shadow_arena.peak_bytes > report.allocators_peak.shadow_arena.peak_bytes)
-        report.allocators_peak.shadow_arena.peak_bytes = s.allocators.shadow_arena.peak_bytes;
+    // GlobalStats：所有字段取 max（单调递增计数器的峰值 = 末态值）
+    inline for (@typeInfo(GlobalStats).@"struct".fields) |f| {
+        const sv = @field(s.global, f.name);
+        const rv = @field(report.global_peak, f.name);
+        if (sv > rv) @field(report.global_peak, f.name) = sv;
+    }
+
+    // ChannelStats：所有字段取 max
+    inline for (@typeInfo(@TypeOf(s.allocators.channel)).@"struct".fields) |f| {
+        const sv = @field(s.allocators.channel, f.name);
+        const rv = @field(report.allocators_peak.channel, f.name);
+        if (sv > rv) @field(report.allocators_peak.channel, f.name) = sv;
+    }
+
+    // ObjectPoolStats：所有字段取 max
+    inline for (@typeInfo(@TypeOf(s.allocators.object_pool)).@"struct".fields) |f| {
+        const sv = @field(s.allocators.object_pool, f.name);
+        const rv = @field(report.allocators_peak.object_pool, f.name);
+        if (sv > rv) @field(report.allocators_peak.object_pool, f.name) = sv;
+    }
+
+    // ShadowArenaStats：所有字段取 max
+    inline for (@typeInfo(@TypeOf(s.allocators.shadow_arena)).@"struct".fields) |f| {
+        const sv = @field(s.allocators.shadow_arena, f.name);
+        const rv = @field(report.allocators_peak.shadow_arena, f.name);
+        if (sv > rv) @field(report.allocators_peak.shadow_arena, f.name) = sv;
+    }
 }
 
-/// 累加 per-function 耗时
-fn accumulateFuncTime(
-    report: *Report,
-    func_map: *std.AutoHashMap(u32, usize),
-    func_idx: u32,
-    dur_ns: u64,
-) !void {
-    const gop = try func_map.getOrPut(func_idx);
-    if (!gop.found_existing) {
-        gop.value_ptr.* = report.func_stats.items.len;
-        try report.func_stats.append(report.allocator, .{ .func_idx = func_idx });
+/// 从所有 ThreadProfiler 直接读取末态（seqlock 一致性，多线程累加）
+/// 补充 timeline 采样不足：程序短或采样间隔长时，ring 中末态可能滞后甚至为空
+fn readFinalFromProfilers(
+    thread_profilers: []const *ThreadProfiler,
+    global_final: *GlobalStats,
+    types_final: *TypeStatsArray,
+    allocators_final: *AllocatorStats,
+) void {
+    for (thread_profilers) |prof| {
+        // seqlock 读取一致性快照
+        var snap_global: GlobalStats = .{};
+        var snap_types: TypeStatsArray = [_]stats.TypeStats{.{}} ** ref_kind_count;
+        var snap_allocators: AllocatorStats = .{};
+
+        var spin_count: u32 = 0;
+        var ok = false;
+        while (true) {
+            const seq1 = prof.seq.load(.acquire);
+            if (seq1 & 1 != 0) {
+                std.atomic.spinLoopHint();
+                spin_count += 1;
+                if (spin_count > 1000) break; // 防御性跳过
+                continue;
+            }
+            snap_global = prof.global;
+            snap_types = prof.types;
+            snap_allocators = prof.allocators;
+            const seq2 = prof.seq.load(.acquire);
+            if (seq1 == seq2) {
+                ok = true;
+                break;
+            }
+            std.atomic.spinLoopHint();
+            spin_count += 1;
+        }
+
+        if (!ok) continue; // seqlock 超时，跳过此线程
+
+        // 累加到 final（多线程聚合）
+        addGlobalStats(global_final, &snap_global);
+        for (0..ref_kind_count) |k| {
+            addTypeStats(&types_final[k], &snap_types[k]);
+        }
+        addAllocatorStats(allocators_final, &snap_allocators);
     }
-    report.func_stats.items[gop.value_ptr.*].total_time_ns += dur_ns;
-    report.func_stats.items[gop.value_ptr.*].calls += 1;
+}
+
+/// 从末态 GlobalStats + AllocatorStats 更新峰值（补充 timeline 采样遗漏）
+fn updatePeakFromStats(report: *Report, gf: *const GlobalStats, af: *const AllocatorStats) void {
+    inline for (@typeInfo(GlobalStats).@"struct".fields) |f| {
+        const sv = @field(gf.*, f.name);
+        const rv = @field(report.global_peak, f.name);
+        if (sv > rv) @field(report.global_peak, f.name) = sv;
+    }
+    inline for (@typeInfo(stats.ChannelStats).@"struct".fields) |f| {
+        const sv = @field(af.channel, f.name);
+        const rv = @field(report.allocators_peak.channel, f.name);
+        if (sv > rv) @field(report.allocators_peak.channel, f.name) = sv;
+    }
+    inline for (@typeInfo(stats.ObjectPoolStats).@"struct".fields) |f| {
+        const sv = @field(af.object_pool, f.name);
+        const rv = @field(report.allocators_peak.object_pool, f.name);
+        if (sv > rv) @field(report.allocators_peak.object_pool, f.name) = sv;
+    }
+    inline for (@typeInfo(stats.ShadowArenaStats).@"struct".fields) |f| {
+        const sv = @field(af.shadow_arena, f.name);
+        const rv = @field(report.allocators_peak.shadow_arena, f.name);
+        if (sv > rv) @field(report.allocators_peak.shadow_arena, f.name) = sv;
+    }
+}
+
+/// GlobalStats 字段累加（编译期反射，覆盖所有字段）
+fn addGlobalStats(dst: *GlobalStats, src: *const GlobalStats) void {
+    inline for (@typeInfo(GlobalStats).@"struct".fields) |f| {
+        @field(dst, f.name) += @field(src, f.name);
+    }
+}
+
+/// TypeStats 字段累加
+fn addTypeStats(dst: *stats.TypeStats, src: *const stats.TypeStats) void {
+    inline for (@typeInfo(stats.TypeStats).@"struct".fields) |f| {
+        @field(dst, f.name) += @field(src, f.name);
+    }
+}
+
+/// AllocatorStats 字段累加（channel + object_pool + shadow_arena）
+fn addAllocatorStats(dst: *AllocatorStats, src: *const AllocatorStats) void {
+    inline for (@typeInfo(stats.ChannelStats).@"struct".fields) |f| {
+        @field(dst.channel, f.name) += @field(src.channel, f.name);
+    }
+    inline for (@typeInfo(stats.ObjectPoolStats).@"struct".fields) |f| {
+        @field(dst.object_pool, f.name) += @field(src.object_pool, f.name);
+    }
+    inline for (@typeInfo(stats.ShadowArenaStats).@"struct".fields) |f| {
+        @field(dst.shadow_arena, f.name) += @field(src.shadow_arena, f.name);
+    }
 }
 
 test {

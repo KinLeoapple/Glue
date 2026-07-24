@@ -1,7 +1,7 @@
 //! 线程上下文模块。
 //!
 //! 每线程一个的统一内存管理入口，热路径零同步：
-//! - ChannelRegion：通道数据，bump + reset
+//! - ChannelRegion（双 Region）：global_region 程序级 + call_region 函数级（bump + resetTo）
 //! - ObjectPools：ObjHeader 对象，精确尺寸页池
 //! - ShadowArena：临时作用域，bump + reset
 //!
@@ -14,6 +14,7 @@
 const std = @import("std");
 const page_pool = @import("page_pool.zig");
 const global_pool_mod = @import("global_pool.zig");
+const buddy_mod = @import("buddy.zig");
 const channel_region_mod = @import("channel_region.zig");
 const shadow_arena_mod = @import("shadow_arena.zig");
 const profiling = @import("profiling");
@@ -40,6 +41,7 @@ pub const ThreadContext = struct {
     pools: [MAX_POOLS]PoolSlot = [_]PoolSlot{.{}} ** MAX_POOLS,
     pool_count: u8 = 0,
     channels: ChannelRegion,
+    call_region: ChannelRegion,
     arena: ShadowArena,
     global: *GlobalPool,
     backing: std.mem.Allocator,
@@ -57,6 +59,7 @@ pub const ThreadContext = struct {
     pub fn init(global: *GlobalPool, backing: std.mem.Allocator, global_prof: ?*profiling.GlobalProfiler) !ThreadContext {
         var ctx = ThreadContext{
             .channels = ChannelRegion.init(backing),
+            .call_region = ChannelRegion.init(backing),
             .arena = ShadowArena.init(backing),
             .global = global,
             .backing = backing,
@@ -66,7 +69,7 @@ pub const ThreadContext = struct {
                 // ThreadProfiler 由 GlobalProfiler.allocator 分配，生命周期归 GlobalProfiler 管理
                 // （ThreadContext.deinit 不销毁，GlobalProfiler.dump/deinit 统一清理）
                 const prof = try gp.allocator.create(profiling.ThreadProfiler);
-                prof.* = profiling.ThreadProfiler.init(gp.allocator, true, @truncate(std.Thread.getCurrentId()));
+                prof.* = profiling.ThreadProfiler.init(true, @truncate(std.Thread.getCurrentId()));
                 gp.registerThread(prof);
                 ctx.prof = prof;
                 ctx.global_prof = gp;
@@ -87,6 +90,7 @@ pub const ThreadContext = struct {
         }
         self.pool_count = 0;
         self.channels.deinit();
+        self.call_region.deinit();
         self.arena.deinit();
         // ThreadProfiler 生命周期由 GlobalProfiler 管理（dump/deinit 时统一清理）
         // 这里只断开引用，不注销也不销毁
@@ -140,6 +144,7 @@ pub const ThreadContext = struct {
         if (aligned_size > MAX_PAGE_OBJECT_SIZE) return self.allocLarge(object_size);
         const idx = try self.findOrCreateSlot(aligned_size);
         const mem = try self.allocByIdx(idx);
+        if (self.prof) |p| p.recordObjectPoolAlloc(object_size, false);
         return mem[0..object_size];
     }
 
@@ -171,6 +176,7 @@ pub const ThreadContext = struct {
     /// 按 object_size 释放对象（热路径：清位图，零锁）
     /// object_size 自动向上取整到 8 字节对齐，与 allocBySize 保持一致
     pub fn freeBySize(self: *ThreadContext, object_size: usize, ptr: []u8) void {
+        if (self.prof) |p| p.recordObjectPoolFree();
         const aligned_size = std.mem.alignForward(usize, object_size, 8);
         if (aligned_size > MAX_PAGE_OBJECT_SIZE) {
             self.freeLarge(ptr);
@@ -213,7 +219,9 @@ pub const ThreadContext = struct {
 
     /// 分配大对象（委托给 GlobalPool.buddy）
     pub fn allocLarge(self: *ThreadContext, size: usize) ![]u8 {
-        return self.global.allocLarge(size);
+        const result = try self.global.allocLarge(size);
+        if (self.prof) |p| p.recordObjectPoolAlloc(size, true);
+        return result;
     }
 
     /// 释放大对象
@@ -224,21 +232,15 @@ pub const ThreadContext = struct {
     /// 分配通道数据
     pub fn allocChannel(self: *ThreadContext, size: usize) ![]u8 {
         const result = try self.channels.alloc(size);
-        if (self.prof) |p| p.recordAllocatorWatermark(.channel, self.channels.used);
+        if (self.prof) |p| p.recordAllocatorWatermark(.channel, self.channels.used + self.call_region.used, true);
         return result;
     }
 
     /// 分配临时数据
     pub fn allocTemp(self: *ThreadContext, size: usize) ![]u8 {
         const result = try self.arena.alloc(size);
-        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used);
+        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used, true);
         return result;
-    }
-
-    /// 基本块结束：reset 通道（O(1)）
-    pub fn endBlock(self: *ThreadContext) void {
-        if (self.prof) |p| p.recordAllocatorReset(.channel, self.channels.used);
-        self.channels.reset();
     }
 
     /// 函数返回：reset 临时区（O(1)）
@@ -260,7 +262,7 @@ pub const ThreadContext = struct {
     /// 调用方必须在初始化 ObjHeader 后立即调用 markArenaAllocated()。
     pub fn allocObjArena(self: *ThreadContext, total_size: usize) ![]u8 {
         const result = try self.arena.alloc(total_size);
-        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used);
+        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used, true);
         return result;
     }
 
@@ -268,13 +270,14 @@ pub const ThreadContext = struct {
     /// 返回未初始化的 *T，调用方必须设置字段并调用 markArenaAllocated()
     pub fn createObjArena(self: *ThreadContext, comptime T: type) !*T {
         const mem_bytes = try self.arena.alloc(@sizeOf(T));
-        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used);
+        if (self.prof) |p| p.recordAllocatorWatermark(.shadow_arena, self.arena.used, true);
         return @ptrCast(@alignCast(mem_bytes.ptr));
     }
 
     /// 释放对象（统一入口）：从分配器元数据读取尺寸，无需调用方传 size
     /// 页池对象从 PageHeader.object_size 读取；buddy 对象从 BuddyHeader.block_size 读取
     pub fn freeObj(self: *ThreadContext, ptr: [*]u8) void {
+        if (self.prof) |p| p.recordObjectPoolFree();
         if (page_pool.isPagePtr(ptr)) {
             const page = page_pool.pageOf(ptr);
             const object_size: usize = page_pool.pageHeader(page).object_size;
@@ -304,6 +307,21 @@ pub const ThreadContext = struct {
         } else {
             // buddy 对象：block_size 从 BuddyHeader 读取
             self.global.freeLarge(ptr[0..0]);
+        }
+    }
+
+    /// 查询对象的分配大小（不释放内存）
+    /// 页池对象从 PageHeader.object_size 读取；buddy 对象从 BuddyHeader.block_size 读取
+    /// 用于 profiling recordFree 时获取真实 size，使 free_bytes/current_bytes 准确
+    pub fn getAllocSize(self: *ThreadContext, ptr: [*]u8) usize {
+        _ = self;
+        if (page_pool.isPagePtr(ptr)) {
+            const page = page_pool.pageOf(ptr);
+            return page_pool.pageHeader(page).object_size;
+        } else {
+            // buddy 对象：BuddyHeader 在用户指针前 HEADER_SIZE 字节
+            const buddy_header: *const buddy_mod.BuddyHeader = @ptrCast(@alignCast(ptr - buddy_mod.HEADER_SIZE));
+            return buddy_header.block_size;
         }
     }
 
@@ -415,7 +433,7 @@ test "ThreadContext 大对象分配" {
     ctx.freeBySize(500, mem);
 }
 
-test "ThreadContext 通道分配与 reset" {
+test "ThreadContext 通道分配" {
     var global = GlobalPool.init(testing.allocator);
     defer global.deinit();
     var ctx = try ThreadContext.init(&global, testing.allocator, null);
@@ -425,8 +443,6 @@ test "ThreadContext 通道分配与 reset" {
     @memset(m1, 0xCC);
     const m2 = try ctx.allocChannel(50);
     try testing.expect(m1.ptr != m2.ptr);
-
-    ctx.endBlock(); // reset 通道
 }
 
 test "ThreadContext 临时区分配与 reset" {

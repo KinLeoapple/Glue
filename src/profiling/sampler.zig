@@ -125,6 +125,7 @@ pub const Sampler = struct {
     }
 
     /// seqlock 读取（无上限自旋，保证不丢失采样）
+    /// 读取后累加到 dst（支持多线程聚合），而非覆盖
     fn readThreadSnapshot(prof: *ThreadProfiler, dst: *Sample) bool {
         var spin_count: u32 = 0;
         while (true) {
@@ -140,14 +141,20 @@ pub const Sampler = struct {
                 continue;
             }
 
-            // 读取所有计数器
-            dst.global = prof.global;
-            dst.types = prof.types;
-            dst.allocators = prof.allocators;
+            // 读取所有计数器到本地临时变量（seqlock 一致性快照）
+            const snap_global = prof.global;
+            const snap_types = prof.types;
+            const snap_allocators = prof.allocators;
             const snap_func = prof.current_func_idx.load(.acquire);
 
             const seq2 = prof.seq.load(.acquire);
             if (seq1 == seq2) {
+                // 累加到 dst（多线程聚合）
+                addGlobalStats(&dst.global, &snap_global);
+                for (0..ref_kind_count) |k| {
+                    addTypeStats(&dst.types[k], &snap_types[k]);
+                }
+                addAllocatorStats(&dst.allocators, &snap_allocators);
                 dst.func_idx = snap_func;
                 return true;
             }
@@ -157,6 +164,33 @@ pub const Sampler = struct {
         }
     }
 };
+
+/// GlobalStats 字段累加（编译期反射，覆盖所有字段）
+fn addGlobalStats(dst: *GlobalStats, src: *const GlobalStats) void {
+    inline for (@typeInfo(GlobalStats).@"struct".fields) |f| {
+        @field(dst, f.name) += @field(src, f.name);
+    }
+}
+
+/// TypeStats 字段累加
+fn addTypeStats(dst: *stats.TypeStats, src: *const stats.TypeStats) void {
+    inline for (@typeInfo(stats.TypeStats).@"struct".fields) |f| {
+        @field(dst, f.name) += @field(src, f.name);
+    }
+}
+
+/// AllocatorStats 字段累加（channel + object_pool + shadow_arena）
+fn addAllocatorStats(dst: *AllocatorStats, src: *const AllocatorStats) void {
+    inline for (@typeInfo(stats.ChannelStats).@"struct".fields) |f| {
+        @field(dst.channel, f.name) += @field(src.channel, f.name);
+    }
+    inline for (@typeInfo(stats.ObjectPoolStats).@"struct".fields) |f| {
+        @field(dst.object_pool, f.name) += @field(src.object_pool, f.name);
+    }
+    inline for (@typeInfo(stats.ShadowArenaStats).@"struct".fields) |f| {
+        @field(dst.shadow_arena, f.name) += @field(src.shadow_arena, f.name);
+    }
+}
 
 /// 降低采样线程优先级（平台相关）
 ///

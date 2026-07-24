@@ -32,6 +32,7 @@ const ChanType = ir_mod.ChanType;
 const ChannelMeta = ir_mod.ChannelMeta;
 const Function = ir_mod.Function;
 const Runtime = runtime_mod.Runtime;
+const FrameContext = runtime_mod.FrameContext;
 const TypeMetadata = ir_mod.meta_mod.TypeMetadata;
 const TypeKind = ir_mod.meta_mod.TypeKind;
 
@@ -212,22 +213,7 @@ const FuncBodyCache = struct {
     body_has_call: bool = false,
 };
 
-/// 递归调用时的通道备份：保存被调用函数的 return_channel + 局部通道，
-/// 避免递归调用覆盖调用者的通道状态。栈缓冲优先，溢出走堆。
-const ChannelBackup = struct {
-    saved_ptrs: [256]?[*]u8 = undefined,
-    saved_lens: [256]u32 = undefined,
-    saved_widths: [256]u8 = undefined,
-    save_buf_stack: [4096]u8 = undefined,
-    save_buf_heap: ?[]u8 = null,
-    n_chans: usize = 0,
-    total_bytes: usize = 0,
-    ret_chan: u16 = 0,
-    lcs: u16 = 0,
-    cc: u16 = 0,
-};
-
-/// 递归调用结果暂存：restore 会覆盖 result_chan，故先暂存再恢复后写回。
+/// 递归调用结果暂存：leaveFunction 会覆盖 result_chan，故先暂存再恢复后写回。
 const SavedResult = union(enum) {
     none,
     bytes: struct { buf: [16]u8, w: u8 },
@@ -341,6 +327,7 @@ pub const Engine = struct {
         value.registerAllDeinits();
         const backing = tctx.backing;
         const stack = try backing.alloc(Frame, MAX_CALL_DEPTH);
+        const frame_stack = try backing.alloc(FrameContext, MAX_CALL_DEPTH);
         const cache = try backing.alloc(?[]bool, ir.functions.len);
         if (cache.len > 0) @memset(cache, null);
         const lcache = try backing.alloc(?LoopActiveCache, ir.loop_metas.len);
@@ -351,13 +338,13 @@ pub const Engine = struct {
         if (body_cache.len > 0) @memset(body_cache, null);
         const func_body_cache = try backing.alloc(?FuncBodyCache, ir.functions.len);
         if (func_body_cache.len > 0) @memset(func_body_cache, null);
-        return .{
+        var engine = Engine{
             .ir = ir,
             .tctx = tctx,
             .owns_tctx = false,
             .global = tctx.global,
             .owns_global = false,
-            .runtime = Runtime.init(&tctx.channels, backing, tctx.prof),
+            .runtime = Runtime.init(&tctx.channels, &tctx.call_region, backing, tctx.prof),
             .call_stack = stack,
             .body_skip_cache = cache,
             .loop_active_cache = lcache,
@@ -365,6 +352,8 @@ pub const Engine = struct {
             .body_cache = body_cache,
             .func_body_cache = func_body_cache,
         };
+        engine.runtime.frame_stack = frame_stack;
+        return engine;
     }
 
     /// 初始化引擎（内部创建 ThreadContext，用于简单场景）
@@ -377,6 +366,7 @@ pub const Engine = struct {
         const tctx = try backing.create(ThreadContext);
         tctx.* = try ThreadContext.init(global, backing, global_prof);
         const stack = try backing.alloc(Frame, MAX_CALL_DEPTH);
+        const frame_stack = try backing.alloc(FrameContext, MAX_CALL_DEPTH);
         const cache = try backing.alloc(?[]bool, ir.functions.len);
         @memset(cache, null);
         const lcache = try backing.alloc(?LoopActiveCache, ir.loop_metas.len);
@@ -387,13 +377,13 @@ pub const Engine = struct {
         @memset(body_cache, null);
         const func_body_cache = try backing.alloc(?FuncBodyCache, ir.functions.len);
         @memset(func_body_cache, null);
-        return .{
+        var engine = Engine{
             .ir = ir,
             .tctx = tctx,
             .owns_tctx = true,
             .global = global,
             .owns_global = true,
-            .runtime = Runtime.init(&tctx.channels, backing, tctx.prof),
+            .runtime = Runtime.init(&tctx.channels, &tctx.call_region, backing, tctx.prof),
             .call_stack = stack,
             .body_skip_cache = cache,
             .loop_active_cache = lcache,
@@ -401,6 +391,8 @@ pub const Engine = struct {
             .body_cache = body_cache,
             .func_body_cache = func_body_cache,
         };
+        engine.runtime.frame_stack = frame_stack;
+        return engine;
     }
 
     /// 释放引擎资源
@@ -436,6 +428,16 @@ pub const Engine = struct {
         for (&buckets) |*bucket| {
             for (bucket.items) |obj| {
                 obj.rc = 1; // 强制 RC=1，确保 deinit 执行
+                // shutdown 路径绕过 release()，需手动记录 free 事件
+                // arena 对象跳过 recordFree（由 recordAllocatorReset 批量扣减）
+                // heap 对象从 getAllocSize 读取真实 size
+                if (self.tctx.?.prof) |p| {
+                    p.recordRC(.release_to_zero);
+                    if (!obj.isArenaAllocated()) {
+                        const sz = self.tctx.?.getAllocSize(@ptrCast(obj));
+                        p.recordFree(@intFromEnum(obj.type_tag), sz);
+                    }
+                }
                 value.obj_header.deinit_table[@intFromEnum(obj.type_tag)](obj, self.tctx.?);
             }
         }
@@ -545,49 +547,74 @@ pub const Engine = struct {
 
     /// 运行入口函数，返回字符串结果（main 函数返回 str 时使用）
     pub fn runStr(self: *Engine) EngineError![]const u8 {
-        try self.runtime.layout(&self.ir.channels);
+        try self.runtime.layoutGlobals(&self.ir.channels);
         self.precomputeNodeTags();
-        const entry = self.ir.entryFunc();
+        const entry = &self.ir.functions[self.ir.entry_index];
+        try self.runtime.enterFunction(self.ir.entry_index, entry);
+        errdefer self.runtime.leaveFunction();
         const result_chan = try self.execFunction(self.ir.entry_index, entry.param_channels);
-        const s = self.readStr(result_chan) orelse return error.InvalidChannel;
-        return s.bytes();
+        const s = self.readStr(result_chan) orelse {
+            self.runtime.leaveFunction();
+            return error.InvalidChannel;
+        };
+        const out = s.bytes();
+        self.runtime.leaveFunction();
+        return out;
     }
 
     /// 运行入口函数，返回 i64 结果（main 函数的返回值）
     pub fn run(self: *Engine) EngineError!i64 {
-        // 布局通道存储
-        try self.runtime.layout(&self.ir.channels);
+        // 布局全局通道存储（GlobalRegion）
+        try self.runtime.layoutGlobals(&self.ir.channels);
         // 预计算所有节点的 scalar_tag（消除热路径中 chanToScalarTag 查找）
         self.precomputeNodeTags();
 
         // 执行初始化函数（顶层 val/var 声明）
+        // enterFunction 在 CallStackRegion 中分配 init 函数的本地通道，
+        // 全局通道（已在 layoutGlobals 中布局）不受影响。
         if (self.ir.init_index) |init_idx| {
-            const init_func = self.ir.functions[init_idx];
+            const init_func = &self.ir.functions[init_idx];
+            try self.runtime.enterFunction(init_idx, init_func);
+            errdefer self.runtime.leaveFunction();
             _ = try self.execFunction(init_idx, init_func.param_channels);
+            self.runtime.leaveFunction();
         }
 
         // 执行入口函数
-        const entry = self.ir.entryFunc();
-        const result_chan = try self.execFunction(self.ir.entry_index, entry.param_channels);
+        const entry = &self.ir.functions[self.ir.entry_index];
+        try self.runtime.enterFunction(self.ir.entry_index, entry);
+        errdefer self.runtime.leaveFunction();
+        // Profiling: 入口函数的 call/ret 事件（execFunction 不经过 execCall，需手动埋点）
+        if (self.tctx.?.prof) |prof| {
+            prof.onFuncCall(self.ir.entry_index);
+            prof.setCurrentFunc(self.ir.entry_index);
+        }
+        const result_chan = self.execFunction(self.ir.entry_index, entry.param_channels) catch |e| {
+            if (self.tctx.?.prof) |prof| prof.onFuncRet(self.ir.entry_index);
+            return e;
+        };
+        if (self.tctx.?.prof) |prof| prof.onFuncRet(self.ir.entry_index);
         self.result_chan = result_chan;
 
-        // 读取返回值（按通道实际类型和宽度）
+        // 读取返回值（必须在 leaveFunction 之前，因为 leaveFunction 会 resetTo 回收通道内存）
         const ret_meta = self.ir.channels.get(result_chan);
         const w = ret_meta.elem_width;
-        if (w == 0) return 0; // unit 返回值
-        if (ret_meta.chan_type == .bool_chan or ret_meta.chan_type == .mask_chan) {
-            return @intFromBool(self.runtime.readBool(result_chan));
-        }
-        // 按宽度读取整数值（符号扩展）
-        const ptr = self.runtime.rawPtr(result_chan);
-        return switch (w) {
-            1 => @as(i64, @as(i8, @bitCast(ptr[0]))),
-            2 => @as(i64, @as(i16, @bitCast(@as(*[2]u8, @ptrCast(ptr)).*))),
-            4 => @as(i64, @as(i32, @bitCast(@as(*[4]u8, @ptrCast(ptr)).*))),
-            8 => @as(i64, @bitCast(@as(*[8]u8, @ptrCast(ptr)).*)),
-            16 => @as(i64, @truncate(@as(i128, @bitCast(@as(*[16]u8, @ptrCast(ptr)).*)))),
-            else => 0,
+        const result: i64 = if (w == 0) 0 // unit 返回值
+        else if (ret_meta.chan_type == .bool_chan or ret_meta.chan_type == .mask_chan) @intFromBool(self.runtime.readBool(result_chan))
+        else blk: {
+            // 按宽度读取整数值（符号扩展）
+            const ptr = self.runtime.rawPtr(result_chan);
+            break :blk switch (w) {
+                1 => @as(i64, @as(i8, @bitCast(ptr[0]))),
+                2 => @as(i64, @as(i16, @bitCast(@as(*[2]u8, @ptrCast(ptr)).*))),
+                4 => @as(i64, @as(i32, @bitCast(@as(*[4]u8, @ptrCast(ptr)).*))),
+                8 => @as(i64, @bitCast(@as(*[8]u8, @ptrCast(ptr)).*)),
+                16 => @as(i64, @truncate(@as(i128, @bitCast(@as(*[16]u8, @ptrCast(ptr)).*)))),
+                else => 0,
+            };
         };
+        self.runtime.leaveFunction();
+        return result;
     }
 
     /// 执行一个函数，返回结果通道索引
@@ -5261,11 +5288,21 @@ pub const Engine = struct {
         const call_meta = self.ir.call_metas[node.meta_index - 1];
 
         // Profiling: function call/ret 事件（精确重建 per-function 统计）
-        if (self.tctx.?.prof) |prof| {
-            prof.onFuncCall(call_meta.func_index);
-            prof.setCurrentFunc(call_meta.func_index);
+        // 保存/恢复 caller 的 current_func_idx，确保 callee 返回后的分配归因到 caller
+        // 注意：defer 必须在函数作用域，不能在 if 块内——
+        //   Zig 的 defer 在所在 block 结束时执行，若放在 if 块内，
+        //   current_func_idx 会在进入 callee body 前就恢复为 caller，导致 per-function 归因全部错位
+        const prof_opt = self.tctx.?.prof;
+        var saved_func: u32 = 0;
+        if (prof_opt) |p| {
+            p.onFuncCall(call_meta.func_index);
+            saved_func = p.current_func_idx.load(.acquire);
+            p.setCurrentFunc(call_meta.func_index);
         }
-        defer if (self.tctx.?.prof) |prof| prof.onFuncRet(call_meta.func_index);
+        defer if (prof_opt) |p| {
+            p.setCurrentFunc(saved_func);
+            p.onFuncRet(call_meta.func_index);
+        };
 
         if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
 
@@ -5363,94 +5400,7 @@ pub const Engine = struct {
         }
     }
 
-    /// 保存递归调用所需的通道状态（return_channel + 局部通道）。
-    /// 必须在复制参数之前调用（递归时 param_channels 与调用者重叠）。
-    fn saveRecursiveChannels(self: *Engine, callee_func: Function) EngineError!ChannelBackup {
-        var b: ChannelBackup = .{};
-        const ret_chan = callee_func.return_channel;
-        const lcs = callee_func.local_chan_start;
-        const lcc = callee_func.local_chan_count;
-        const cc = self.runtime.chan_count;
-        b.ret_chan = ret_chan;
-        b.lcs = lcs;
-        b.cc = cc;
-        b.n_chans = 1 + @as(usize, lcc);
-        if (b.n_chans > b.saved_ptrs.len) return error.CallDepthExceeded;
-
-        const n = b.n_chans;
-        var total_bytes: usize = 0;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const ch: u16 = if (i == 0) ret_chan else lcs + @as(u16, @intCast(i - 1));
-            if (ch < cc) {
-                b.saved_ptrs[i] = self.runtime.chan_ptrs[ch];
-                b.saved_lens[i] = self.runtime.chan_lengths[ch];
-                b.saved_widths[i] = self.runtime.chan_widths[ch];
-                if (b.saved_widths[i] > 0 and b.saved_lens[i] > 0) {
-                    total_bytes += @as(usize, b.saved_widths[i]) * b.saved_lens[i];
-                }
-            } else {
-                b.saved_ptrs[i] = null;
-                b.saved_lens[i] = 0;
-                b.saved_widths[i] = 0;
-            }
-        }
-        b.total_bytes = total_bytes;
-
-        if (total_bytes > b.save_buf_stack.len) {
-            b.save_buf_heap = self.tctx.?.backing.alloc(u8, total_bytes) catch return error.OutOfMemory;
-        }
-        const save_buf = if (b.save_buf_heap) |sb| sb else b.save_buf_stack[0..total_bytes];
-        var off: usize = 0;
-        i = 0;
-        while (i < n) : (i += 1) {
-            const ch: u16 = if (i == 0) ret_chan else lcs + @as(u16, @intCast(i - 1));
-            if (ch < cc) {
-                const w = b.saved_widths[i];
-                const len = b.saved_lens[i];
-                if (w > 0 and len > 0) {
-                    const src = b.saved_ptrs[i].?;
-                    const nbytes = @as(usize, w) * len;
-                    @memcpy(save_buf[off .. off + nbytes], src[0..nbytes]);
-                    off += nbytes;
-                }
-            }
-        }
-        return b;
-    }
-
-    /// 恢复通道状态（使用保存时的 chan_widths，而非当前值）。
-    fn restoreRecursiveChannels(self: *Engine, b: *const ChannelBackup) void {
-        const save_buf = if (b.save_buf_heap) |sb| sb else b.save_buf_stack[0..b.total_bytes];
-        const n = b.n_chans;
-        var off: usize = 0;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const ch: u16 = if (i == 0) b.ret_chan else b.lcs + @as(u16, @intCast(i - 1));
-            if (ch < b.cc) {
-                self.runtime.chan_ptrs[ch] = b.saved_ptrs[i];
-                self.runtime.chan_lengths[ch] = b.saved_lens[i];
-                self.runtime.chan_widths[ch] = b.saved_widths[i];
-                const wd = b.saved_widths[i];
-                const len = b.saved_lens[i];
-                if (wd > 0 and len > 0) {
-                    const dst = b.saved_ptrs[i].?;
-                    const nbytes = @as(usize, wd) * len;
-                    @memcpy(dst[0..nbytes], save_buf[off .. off + nbytes]);
-                    off += nbytes;
-                }
-            }
-        }
-    }
-
-    fn freeBackupHeap(self: *Engine, b: *ChannelBackup) void {
-        if (b.save_buf_heap) |sb| {
-            self.tctx.?.backing.free(sb);
-            b.save_buf_heap = null;
-        }
-    }
-
-    /// 暂存调用结果（在 restoreRecursiveChannels 之前调用）。
+    /// 暂存调用结果（在 leaveFunction 之前调用）。
     /// ret_is_ref=true 或非 ref_chan 时直接字节拷贝；普通复合类型 ref_chan 深拷贝。
     fn saveCallResult(self: *Engine, result_chan: u16, ret_is_ref: bool) EngineError!SavedResult {
         const w = self.runtime.elemWidth(result_chan);
@@ -5468,7 +5418,7 @@ pub const Engine = struct {
         return .{ .bytes = .{ .buf = buf, .w = @intCast(w) } };
     }
 
-    /// 将暂存结果写入输出通道（在 restoreRecursiveChannels 之后调用）。
+    /// 将暂存结果写入输出通道（在 leaveFunction 之后调用）。
     fn writeCallResult(self: *Engine, out_chan: u16, saved: SavedResult) EngineError!void {
         switch (saved) {
             .none => {},
@@ -5481,111 +5431,90 @@ pub const Engine = struct {
     }
 
     /// 标准调用路径：从 execCall 抽出，供 memoization 快速路径未命中时调用
-    /// 包含自递归/互递归 TCO 检查、递归调用 save/restore、非递归调用直通
+    /// 双 Region 架构：所有调用统一走 enterFunction/leaveFunction，
+    /// Runtime 内部管理 chan_ptrs 的保存/恢复和 call_region 的 bump/resetTo。
+    /// 自递归尾调用优化（TCO）复用当前帧，跳过 enterFunction/leaveFunction。
     fn execCallStandard(self: *Engine, node: *const Node, call_meta: ir_mod.CallMeta, callee_func: Function, args: []const u16) EngineError!void {
         // 自递归尾调用优化：当 callee == current_func_idx 且 call_meta.tail_call == true 时，
         // 设置 tco_restart 信号，让 execFunction 用新参数重新执行
-        // tail_call 由 IR builder 标记（只有尾位置的调用才标记为 true），
-        // 非尾调用（如 1 + recAdd(n-1) 中的 recAdd）不触发 TCO
+        // 复用当前帧（同一函数的通道索引相同），无需 enterFunction/leaveFunction
         if (call_meta.func_index == self.current_func_idx and args.len <= 16 and call_meta.tail_call) {
             self.tco_arg_count = @intCast(args.len);
             @memcpy(self.tco_args[0..args.len], args);
             self.tco_caller_func_idx = self.current_func_idx;
-            // 复制参数值到当前函数的 param_channels（为重执行做准备）
             try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
             self.tco_restart = true;
             return;
         }
 
-        // 互递归尾调用优化：当 callee != current_func_idx 但 callee 在调用栈中（互递归），
-        // 且 call_meta.tail_call == true 时，设置 tco_jump_to 信号，
-        // execFunction 主循环检测到后切换到目标函数体重新执行（trampoline 模式）
-        // 零栈帧增长，零通道 save/restore
-        if (call_meta.tail_call and args.len <= 16 and call_meta.func_index != self.current_func_idx) {
-            // 检查 callee 是否在调用栈中（互递归）
-            var is_mutual_recursive = false;
-            for (self.call_stack[0..self.call_depth]) |frame| {
-                if (frame.func_idx == call_meta.func_index) {
-                    is_mutual_recursive = true;
-                    break;
+        // 标准调用路径：enterFunction → copyArgsToParams → execFunction → saveResult → leaveFunction → writeResult
+        //
+        // SCC 问题（自递归）：callee == caller 时，通道索引重叠。
+        // enterFunction 覆盖 callee local 范围的 chan_ptrs（指向 callee 新内存），
+        // 导致实参通道（与 callee local 重叠）的值不可读。
+        // 修复：自递归调用在 enterFunction 前保存实参值（含深拷贝），
+        //   enterFunction 后直接写入 callee 的形参通道。
+        // 非自递归调用：enterFunction 不触碰实参通道，直接 copyArgsToParams。
+        //
+        // 结果处理：leaveFunction 前用 saveCallResult 暂存到栈上，
+        //   leaveFunction 后（chan_ptrs 已恢复为 caller）用 writeCallResult 写入。
+        //   消除 SCC 场景下 node.output chan_ptrs 指向 callee 内存的问题。
+
+        const is_self_recursive = (call_meta.func_index == self.current_func_idx);
+
+        if (is_self_recursive) {
+            // ── 自递归：保存实参值（含深拷贝） ──
+            var saved_arg_values: [16]value.Value = undefined;
+            for (args, 0..) |arg_chan, i| {
+                const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
+                const meta = self.ir.channels.get(arg_chan);
+                if (!is_ref and meta.chan_type == .ref_chan and self.readRefObj(arg_chan) != null) {
+                    const v = self.chanToValue(arg_chan);
+                    saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                    try self.trackValueTree(saved_arg_values[i]);
+                } else {
+                    saved_arg_values[i] = self.chanToValue(arg_chan);
                 }
             }
-            if (is_mutual_recursive) {
-                // 复制参数值到 callee 的 param_channels（为跳转后重执行做准备）
-                try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
-                // 设置跳转信号：execFunction 主循环检测后切换到 callee 函数体
-                self.tco_jump_to = call_meta.func_index;
-                self.tco_restart = true;
-                return;
+
+            try self.runtime.enterFunction(call_meta.func_index, &callee_func);
+            errdefer self.runtime.leaveFunction();
+
+            // 写入 callee 形参通道
+            const count = @min(args.len, callee_func.param_channels.len);
+            for (0..count) |i| {
+                self.valueToChan(callee_func.param_channels[i], saved_arg_values[i]);
             }
-        }
-
-        // 检查是否为递归调用（callee 已在调用栈中）
-        // 直接递归：callee == current_func_idx
-        // 互递归：callee 在 call_stack 中
-        // 通道是全局分配的：非递归调用时被调用函数通道与调用者不重叠，无需 save/restore；
-        // 递归调用时通道与祖先帧重叠，必须 save/restore。
-        var is_recursive = call_meta.func_index == self.current_func_idx;
-        if (!is_recursive) {
-            for (self.call_stack[0..self.call_depth]) |frame| {
-                if (frame.func_idx == call_meta.func_index) {
-                    is_recursive = true;
-                    break;
-                }
-            }
-        }
-
-        if (is_recursive) {
-            // 递归调用：必须先保存通道状态再复制参数（param_channels 与调用者重叠）
-            var backup = try self.saveRecursiveChannels(callee_func);
-            defer self.freeBackupHeap(&backup);
-
-            try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
-
-            // 压栈
-            self.call_stack[self.call_depth] = .{
-                .func_idx = call_meta.func_index,
-                .return_chan = node.output,
-                .return_pc = 0,
-            };
-            self.call_depth += 1;
-            // 泛型类型实参压栈（供 typeof(T) 运行时查表）
-            self.frame_type_args_stack.append(self.tctx.?.backing, call_meta.type_args) catch return error.OutOfMemory;
-            defer _ = self.frame_type_args_stack.pop();
-
-            const saved_func_idx = self.current_func_idx;
-            const result_chan = try self.execFunction(call_meta.func_index, args);
-            self.current_func_idx = saved_func_idx;
-
-            // 暂存结果（restore 会覆盖 result_chan 和 node.output）
-            const saved = try self.saveCallResult(result_chan, call_meta.ret_is_ref);
-            self.call_depth -= 1;
-
-            // 恢复通道状态后再把结果写入输出通道
-            self.restoreRecursiveChannels(&backup);
-            try self.writeCallResult(node.output, saved);
         } else {
-            // 非递归调用：被调用函数有独立通道，无需 save/restore
+            // ── 非递归：enterFunction 不触碰实参通道 ──
+            try self.runtime.enterFunction(call_meta.func_index, &callee_func);
+            errdefer self.runtime.leaveFunction();
             try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
-
-            self.call_stack[self.call_depth] = .{
-                .func_idx = call_meta.func_index,
-                .return_chan = node.output,
-                .return_pc = 0,
-            };
-            self.call_depth += 1;
-            // 泛型类型实参压栈（供 typeof(T) 运行时查表）
-            self.frame_type_args_stack.append(self.tctx.?.backing, call_meta.type_args) catch return error.OutOfMemory;
-            defer _ = self.frame_type_args_stack.pop();
-
-            const saved_func_idx = self.current_func_idx;
-            const result_chan = try self.execFunction(call_meta.func_index, args);
-            self.current_func_idx = saved_func_idx;
-            self.call_depth -= 1;
-
-            // 把结果写入 call 节点的输出通道（统一值语义深拷贝）
-            try self.cloneValueBetweenChannels(node.output, result_chan, call_meta.ret_is_ref);
         }
+
+        self.call_stack[self.call_depth] = .{
+            .func_idx = call_meta.func_index,
+            .return_chan = node.output,
+            .return_pc = 0,
+        };
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+
+        // 泛型类型实参压栈（供 typeof(T) 运行时查表）
+        self.frame_type_args_stack.append(self.tctx.?.backing, call_meta.type_args) catch return error.OutOfMemory;
+        defer _ = self.frame_type_args_stack.pop();
+
+        const saved_func_idx = self.current_func_idx;
+        const result_chan = try self.execFunction(call_meta.func_index, args);
+        self.current_func_idx = saved_func_idx;
+
+        // ── leaveFunction 前暂存结果到栈上局部变量 ──
+        const saved_result = try self.saveCallResult(result_chan, call_meta.ret_is_ref);
+
+        self.runtime.leaveFunction();
+
+        // ── leaveFunction 后写入结果（chan_ptrs 已恢复为 caller） ──
+        try self.writeCallResult(node.output, saved_result);
     }
 
     /// 哈希参数为 u64（FNV-1a 变体）
@@ -8064,6 +7993,9 @@ pub const Engine = struct {
                     .u32 => |b| @bitCast(@as(u32, @bitCast(b))),
                     .u16 => |b| @as(i32, @as(u16, @bitCast(b))),
                     .u8 => |b| @as(i32, b[0]),
+                    .u64 => |b| @truncate(@as(i64, @bitCast(@as(u64, @bitCast(b))))),
+                    .usize => |b| @truncate(@as(i64, @bitCast(@as(usize, @bitCast(b))))),
+                    .isize => |b| @truncate(@as(i64, @as(isize, @bitCast(b)))),
                     .boolean => |b| @intFromBool(b[0] != 0),
                     .null_val, .unit => 0,
                     else => 0,
@@ -8077,6 +8009,12 @@ pub const Engine = struct {
                     .i32 => |b| @truncate(@as(i32, @bitCast(b))),
                     .i64 => |b| @truncate(@as(i64, @bitCast(b))),
                     .u16 => |b| @bitCast(@as(u16, @bitCast(b))),
+                    .u32 => |b| @truncate(@as(i32, @bitCast(@as(u32, @bitCast(b))))),
+                    .u64 => |b| @truncate(@as(i64, @bitCast(@as(u64, @bitCast(b))))),
+                    .usize => |b| @truncate(@as(i64, @bitCast(@as(usize, @bitCast(b))))),
+                    .isize => |b| @truncate(@as(i64, @as(isize, @bitCast(b)))),
+                    .u8 => |b| @as(i16, b[0]),
+                    .i8 => |b| @as(i16, @as(i8, @bitCast(b[0]))),
                     .boolean => |b| @intFromBool(b[0] != 0),
                     else => 0,
                 };
@@ -8090,6 +8028,11 @@ pub const Engine = struct {
                     .i16 => |b| @truncate(@as(u16, @bitCast(b))),
                     .i32 => |b| @truncate(@as(u32, @bitCast(b))),
                     .i64 => |b| @truncate(@as(u64, @bitCast(b))),
+                    .u16 => |b| @truncate(@as(u16, @bitCast(b))),
+                    .u32 => |b| @truncate(@as(u32, @bitCast(b))),
+                    .u64 => |b| @truncate(@as(u64, @bitCast(b))),
+                    .usize => |b| @truncate(@as(usize, @bitCast(b))),
+                    .isize => |b| @truncate(@as(usize, @bitCast(@as(isize, @bitCast(b))))),
                     .boolean => |b| b[0],
                     else => 0,
                 };
@@ -8190,6 +8133,10 @@ pub const Engine = struct {
 
         if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
 
+        // enterFunction 在 CallStackRegion 中分配 thunk 函数的本地通道
+        try self.runtime.enterFunction(func_idx, &callee_func);
+        errdefer self.runtime.leaveFunction();
+
         // thunk 无显式参数，只需把上值写入 param_channels 尾部
         const total_params = callee_func.param_channels.len;
         const uv_count = @min(closure.upvalues.len, total_params);
@@ -8203,13 +8150,16 @@ pub const Engine = struct {
             .return_pc = 0,
         };
         self.call_depth += 1;
+        defer self.call_depth -= 1;
 
         const saved_func_idx = self.current_func_idx;
         const result_chan = try self.execFunction(func_idx, &.{});
         self.current_func_idx = saved_func_idx;
-        self.call_depth -= 1;
 
+        // 在 leaveFunction 之前读取结果（leaveFunction 会 resetTo 回收通道内存）
         const result = try self.readScalarValue(result_chan);
+        self.runtime.leaveFunction();
+
         // 缓存结果，避免重复求值
         lazy.forced = true;
         lazy.cached = result;
@@ -9067,11 +9017,18 @@ pub const Engine = struct {
             const callee_func = self.ir.functions[func_idx];
 
             // Profiling: partial application 调用事件
-            if (self.tctx.?.prof) |prof| {
-                prof.onFuncCall(func_idx);
-                prof.setCurrentFunc(func_idx);
+            // defer 必须在 if(is_partial) 块作用域，不能在 if(prof) 块内
+            const prof_opt_pa = self.tctx.?.prof;
+            var saved_func_pa: u32 = 0;
+            if (prof_opt_pa) |p| {
+                p.onFuncCall(func_idx);
+                saved_func_pa = p.current_func_idx.load(.acquire);
+                p.setCurrentFunc(func_idx);
             }
-            defer if (self.tctx.?.prof) |prof| prof.onFuncRet(func_idx);
+            defer if (prof_opt_pa) |p| {
+                p.setCurrentFunc(saved_func_pa);
+                p.onFuncRet(func_idx);
+            };
 
             return try self.execPartialApplicationCall(node, call_meta, callee_func, func_idx, pa);
         }
@@ -9083,11 +9040,18 @@ pub const Engine = struct {
         const callee_func = self.ir.functions[func_idx];
 
         // Profiling: closure 调用事件
-        if (self.tctx.?.prof) |prof| {
-            prof.onFuncCall(func_idx);
-            prof.setCurrentFunc(func_idx);
+        // defer 必须在函数作用域，不能在 if(prof) 块内
+        const prof_opt_cl = self.tctx.?.prof;
+        var saved_func_cl: u32 = 0;
+        if (prof_opt_cl) |p| {
+            p.onFuncCall(func_idx);
+            saved_func_cl = p.current_func_idx.load(.acquire);
+            p.setCurrentFunc(func_idx);
         }
-        defer if (self.tctx.?.prof) |prof| prof.onFuncRet(func_idx);
+        defer if (prof_opt_cl) |p| {
+            p.setCurrentFunc(saved_func_cl);
+            p.onFuncRet(func_idx);
+        };
 
         if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
 
@@ -9095,70 +9059,67 @@ pub const Engine = struct {
         const arg_count = @as(usize, call_meta.arg_count) - 1;
         const args = node.inputs[1 .. 1 + arg_count];
 
-        // 通道隔离：与 execCall 相同的策略——仅在递归调用时 save/restore
-        // 递归检测：callee 已在调用栈中（直接/互递归）
-        var is_recursive = func_idx == self.current_func_idx;
-        if (!is_recursive) {
-            for (self.call_stack[0..self.call_depth]) |frame| {
-                if (frame.func_idx == func_idx) {
-                    is_recursive = true;
-                    break;
+        // SCC 问题：自递归 closure 调用时，enterFunction 覆盖实参通道的 chan_ptrs。
+        // 自递归检测：func_idx == current_func_idx
+        const is_self_recursive = (func_idx == self.current_func_idx);
+
+        if (is_self_recursive) {
+            // ── 自递归：保存实参值（含深拷贝） ──
+            var saved_arg_values: [16]value.Value = undefined;
+            for (args, 0..) |arg_chan, i| {
+                const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
+                const meta = self.ir.channels.get(arg_chan);
+                if (!is_ref and meta.chan_type == .ref_chan and self.readRefObj(arg_chan) != null) {
+                    const v = self.chanToValue(arg_chan);
+                    saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                    try self.trackValueTree(saved_arg_values[i]);
+                } else {
+                    saved_arg_values[i] = self.chanToValue(arg_chan);
                 }
             }
-        }
 
-        if (is_recursive) {
-            // 递归调用：必须先保存通道状态再复制参数（param_channels 与调用者重叠）
-            var backup = try self.saveRecursiveChannels(callee_func);
-            defer self.freeBackupHeap(&backup);
+            try self.runtime.enterFunction(func_idx, &callee_func);
+            errdefer self.runtime.leaveFunction();
 
-            // 显式实参 + upvalue 参数
-            try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
+            // 写入 callee 形参通道 + upvalue 参数
+            const count = @min(args.len, callee_func.param_channels.len);
+            for (0..count) |i| {
+                self.valueToChan(callee_func.param_channels[i], saved_arg_values[i]);
+            }
             self.copyClosureUpvalues(callee_func, closure, args.len);
-
-            // 压栈
-            self.call_stack[self.call_depth] = .{
-                .func_idx = func_idx,
-                .return_chan = node.output,
-                .return_pc = 0,
-            };
-            self.call_depth += 1;
-
-            const saved_func_idx = self.current_func_idx;
-            const result_chan = try self.execFunction(func_idx, args);
-            self.current_func_idx = saved_func_idx;
-
-            // 暂存结果（restore 会覆盖 result_chan）
-            const saved = try self.saveCallResult(result_chan, call_meta.ret_is_ref);
-            self.call_depth -= 1;
-
-            self.restoreRecursiveChannels(&backup);
-            try self.writeCallResult(node.output, saved);
         } else {
-            // 非递归调用：通道不重叠，直接复制参数并调用，无 save/restore
+            // ── 非递归：enterFunction 不触碰实参通道 ──
+            try self.runtime.enterFunction(func_idx, &callee_func);
+            errdefer self.runtime.leaveFunction();
+
             try self.copyArgsToParams(args, callee_func, call_meta.arg_ref_bits);
             self.copyClosureUpvalues(callee_func, closure, args.len);
-
-            // 压栈
-            self.call_stack[self.call_depth] = .{
-                .func_idx = func_idx,
-                .return_chan = node.output,
-                .return_pc = 0,
-            };
-            self.call_depth += 1;
-
-            const saved_func_idx = self.current_func_idx;
-            const result_chan = try self.execFunction(func_idx, args);
-            self.current_func_idx = saved_func_idx;
-            self.call_depth -= 1;
-
-            // 写入结果（统一值语义深拷贝）
-            try self.cloneValueBetweenChannels(node.output, result_chan, call_meta.ret_is_ref);
         }
+
+        // 压栈
+        self.call_stack[self.call_depth] = .{
+            .func_idx = func_idx,
+            .return_chan = node.output,
+            .return_pc = 0,
+        };
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+
+        const saved_func_idx = self.current_func_idx;
+        const result_chan = try self.execFunction(func_idx, args);
+        self.current_func_idx = saved_func_idx;
+
+        // ── leaveFunction 前暂存结果 ──
+        const saved_result = try self.saveCallResult(result_chan, call_meta.ret_is_ref);
+
+        self.runtime.leaveFunction();
+
+        // ── leaveFunction 后写入结果（chan_ptrs 已恢复为 caller） ──
+        try self.writeCallResult(node.output, saved_result);
     }
 
     /// 执行 PartialApplication 的调用：将已绑定参数与新实参合并后调用原函数
-    /// 当前实现覆盖非递归路径；递归 partial 调用暂走完整 save/restore（后续可扩展）
+    /// 双 Region 架构：统一走 enterFunction/leaveFunction，Runtime 管理通道保存/恢复。
     fn execPartialApplicationCall(
         self: *Engine,
         node: *const Node,
@@ -9174,19 +9135,58 @@ pub const Engine = struct {
         const bound = pa.bound_args;
         const total_params = callee_func.param_channels.len;
 
-        // 复制已绑定参数到被调用函数参数通道
-        const bound_count = @min(bound.len, total_params);
-        for (0..bound_count) |i| {
-            const dst_chan = callee_func.param_channels[i];
-            self.writeScalarValue(dst_chan, bound[i]);
-        }
+        // SCC 问题：自递归 partial application 调用时，enterFunction 覆盖实参通道的 chan_ptrs。
+        const is_self_recursive = (func_idx == self.current_func_idx);
 
-        // 复制新的显式实参到后续参数通道
-        const explicit_count = @min(arg_count, if (total_params > bound_count) total_params - bound_count else 0);
-        for (0..explicit_count) |i| {
-            const dst_chan = callee_func.param_channels[bound_count + i];
-            const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
-            try self.copyArgToParam(args[i], dst_chan, is_ref);
+        if (is_self_recursive) {
+            // ── 自递归：保存显式实参值（含深拷贝） ──
+            var saved_arg_values: [16]value.Value = undefined;
+            for (args, 0..) |arg_chan, i| {
+                const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
+                const meta = self.ir.channels.get(arg_chan);
+                if (!is_ref and meta.chan_type == .ref_chan and self.readRefObj(arg_chan) != null) {
+                    const v = self.chanToValue(arg_chan);
+                    saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                    try self.trackValueTree(saved_arg_values[i]);
+                } else {
+                    saved_arg_values[i] = self.chanToValue(arg_chan);
+                }
+            }
+
+            try self.runtime.enterFunction(func_idx, &callee_func);
+            errdefer self.runtime.leaveFunction();
+
+            // 复制已绑定参数到被调用函数参数通道
+            const bound_count = @min(bound.len, total_params);
+            for (0..bound_count) |i| {
+                const dst_chan = callee_func.param_channels[i];
+                self.writeScalarValue(dst_chan, bound[i]);
+            }
+
+            // 写入显式实参到后续参数通道
+            const explicit_count = @min(arg_count, if (total_params > bound_count) total_params - bound_count else 0);
+            for (0..explicit_count) |i| {
+                self.valueToChan(callee_func.param_channels[bound_count + i], saved_arg_values[i]);
+            }
+        } else {
+            // ── 非递归：enterFunction 不触碰实参通道 ──
+            try self.runtime.enterFunction(func_idx, &callee_func);
+            errdefer self.runtime.leaveFunction();
+
+            // 复制已绑定参数到被调用函数参数通道
+            const bound_count = @min(bound.len, total_params);
+            for (0..bound_count) |i| {
+                const dst_chan = callee_func.param_channels[i];
+                self.writeScalarValue(dst_chan, bound[i]);
+            }
+
+            // 复制新的显式实参到后续参数通道
+            const explicit_count = @min(arg_count, if (total_params > bound_count) total_params - bound_count else 0);
+            for (0..explicit_count) |i| {
+                const dst_chan = callee_func.param_channels[bound_count + i];
+                const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
+                try self.copyArgToParam(args[i], dst_chan, is_ref);
+            }
         }
 
         // 压栈并调用原函数
@@ -9196,14 +9196,19 @@ pub const Engine = struct {
             .return_pc = 0,
         };
         self.call_depth += 1;
+        defer self.call_depth -= 1;
 
         const saved_func_idx = self.current_func_idx;
         const result_chan = try self.execFunction(func_idx, callee_func.param_channels);
         self.current_func_idx = saved_func_idx;
-        self.call_depth -= 1;
 
-        // 写入结果（统一值语义深拷贝）
-        try self.cloneValueBetweenChannels(node.output, result_chan, call_meta.ret_is_ref);
+        // ── leaveFunction 前暂存结果 ──
+        const saved_result = try self.saveCallResult(result_chan, call_meta.ret_is_ref);
+
+        self.runtime.leaveFunction();
+
+        // ── leaveFunction 后写入结果（chan_ptrs 已恢复为 caller） ──
+        try self.writeCallResult(node.output, saved_result);
     }
 
     /// 将标量 Value 转为字节缓冲区（用于 nullable 写入）
@@ -9268,8 +9273,8 @@ fn orbitWorker(data: *OrbitThreadData) void {
         return;
     };
 
-    // 布局通道存储（独立于主线程）
-    engine.runtime.layout(&data.ir.channels) catch {
+    // 布局全局通道存储（独立于主线程）
+    engine.runtime.layoutGlobals(&data.ir.channels) catch {
         engine.deinit();
         alloc.destroy(data);
         handle.setPanic("Failed to layout channels");
@@ -9278,6 +9283,15 @@ fn orbitWorker(data: *OrbitThreadData) void {
 
     // 将参数写入函数的参数通道
     const func = data.ir.functions[data.func_idx];
+
+    // enterFunction 在 CallStackRegion 中分配函数本地通道
+    engine.runtime.enterFunction(data.func_idx, &func) catch {
+        engine.deinit();
+        alloc.destroy(data);
+        handle.setPanic("Failed to enter function");
+        return;
+    };
+
     for (0..data.arg_count) |i| {
         if (i >= func.param_channels.len) break;
         const dst_chan = func.param_channels[i];
@@ -9287,6 +9301,7 @@ fn orbitWorker(data: *OrbitThreadData) void {
                 // 跨线程值语义：普通复合类型深拷贝到 worker tctx，channel/atomic 等 retain 共享
                 const v = value.Value{ .ref = obj };
                 const copied = v.deepCopy(&tctx) catch {
+                    engine.runtime.leaveFunction();
                     engine.deinit();
                     tctx.deinit();
                     alloc.destroy(data);
@@ -9308,13 +9323,14 @@ fn orbitWorker(data: *OrbitThreadData) void {
 
     // 执行函数
     const result_chan = engine.execFunction(data.func_idx, func.param_channels) catch {
+        engine.runtime.leaveFunction();
         engine.deinit();
         alloc.destroy(data);
         handle.setPanic("Function execution failed");
         return;
     };
 
-    // 读取结果（在 deinit 之前，因为结果通道在 engine 内）
+    // 读取结果（在 leaveFunction 之前，因为 leaveFunction 会 resetTo 回收通道内存）
     const result_val = engine.readScalarValue(result_chan) catch value.Value.fromNull();
 
     // 值语义：普通复合类型结果跨线程深拷贝，使其在 worker deinit 后仍然有效
@@ -9322,6 +9338,7 @@ fn orbitWorker(data: *OrbitThreadData) void {
     const out_result = blk: {
         if (result_meta.chan_type == .ref_chan and !result_meta.is_ref) {
             break :blk result_val.deepCopy(&tctx) catch {
+                engine.runtime.leaveFunction();
                 engine.deinit();
                 tctx.deinit();
                 alloc.destroy(data);
@@ -9331,6 +9348,8 @@ fn orbitWorker(data: *OrbitThreadData) void {
         }
         break :blk result_val;
     };
+
+    engine.runtime.leaveFunction();
 
     // 先清理所有资源（engine + tctx + data），再设置结果（setResult 会解除主线程 join() 阻塞）
     // 这样主线程在 join() 返回时，worker 的所有分配已释放，避免泄漏检测竞态
@@ -10654,6 +10673,15 @@ test "vec_zip: 合并两个 range 向量" {
     nodes[6] = Node.makeUnary(.halt_return, c_count, 0, c_count);
 
     const funcs = try alloc.alloc(Function, 1);
+    // 编译期通道布局元数据（手动构造，等价于 computeFunctionChannelLayout 的输出）
+    // 6 个 8B 通道（5 local + 1 return），16B 对齐
+    const local_offsets = try alloc.alloc(u32, 6);
+    local_offsets[0] = 0; // c_const0
+    local_offsets[1] = 16; // c_const3
+    local_offsets[2] = 32; // c_left
+    local_offsets[3] = 48; // c_right
+    local_offsets[4] = 64; // c_zipped
+    local_offsets[5] = 80; // c_count (return_channel)
     funcs[0] = .{
         .name = "main",
         .node_start = 0,
@@ -10663,6 +10691,9 @@ test "vec_zip: 合并两个 range 向量" {
         .is_entry = true,
         .local_chan_start = 0,
         .local_chan_count = 5,
+        .chan_total_bytes = 96,
+        .local_offsets = local_offsets,
+        .scc_max_chan_bytes = 96,
     };
 
     var ir = GlueIR{

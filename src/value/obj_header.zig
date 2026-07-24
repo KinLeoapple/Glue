@@ -149,6 +149,13 @@ pub fn release(obj: *ObjHeader, tctx: *ThreadContext) void {
     if (tctx.prof) |p| {
         if (old == 1) {
             p.recordRC(.release_to_zero);
+            // rc 归零时记录 free 事件
+            // arena 对象跳过 recordFree（由 recordAllocatorReset 批量扣减 live_count/live_bytes）
+            // heap 对象从分配器元数据读取真实 size，使 free_bytes/current_bytes 准确
+            if (!obj.isArenaAllocated()) {
+                const sz = tctx.getAllocSize(@ptrCast(obj));
+                p.recordFree(@intFromEnum(obj.type_tag), sz);
+            }
         } else {
             p.recordRC(.release);
         }

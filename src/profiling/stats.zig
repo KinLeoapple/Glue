@@ -1,7 +1,7 @@
 //! Profiler 数据模型定义（纯类型 + 基础工具）
 //!
 //! 定义 GlobalStats / TypeStats / AllocatorStats / Sample / CoarseSample /
-//! FuncStat / FuncEvent 结构体，供 thread_profiler / sampler / aggregator 使用。
+//! FuncStat / CallStackEntry 结构体，供 thread_profiler / sampler / aggregator 使用。
 //!
 //! 另提供 SpinMutex / nanoTimestamp / sleepNs 三个底层工具，供各 profiling
 //! 子模块共享。Zig 0.16 的 std.time 不再提供 nanoTimestamp / sleep，且
@@ -19,7 +19,7 @@ pub const ref_kind_count: usize = 22;
 
 /// 自旋互斥锁（替代 Zig 0.15 的 std.Thread.Mutex）
 ///
-/// 临界区短小（seqlock 更新、func_events push）时使用自旋即可，
+/// 临界区短小（seqlock 更新、线程注册表）时使用自旋即可，
 /// 无需 futex。state=0 未锁，state=1 已锁。
 pub const SpinMutex = struct {
     state: std.atomic.Value(u8) = .init(0),
@@ -185,14 +185,32 @@ pub const FuncStat = struct {
     release_count: u64 = 0,
 };
 
-/// 函数调用事件（精确重建 per-function 用）
-pub const FuncEvent = struct {
-    timestamp_ns: i64,
-    func_idx: u32,
-    kind: Kind,
-
-    pub const Kind = enum { call, ret };
+/// Per-function 分配累加器（ThreadProfiler 内部使用，热路径 O(1) 数组访问）
+/// 在 recordAlloc 中按 current_func_idx 累加，aggregator 读取后填充到 FuncStat
+pub const FuncAllocAccum = struct {
+    arena_bytes: u64 = 0,
+    heap_bytes: u64 = 0,
+    retain_count: u64 = 0,
+    release_count: u64 = 0,
 };
+
+/// 最大跟踪函数数（超过此索引的函数不记录 per-function 内存归因）
+pub const MAX_TRACKED_FUNCS: usize = 1024;
+pub const FuncAllocArray = [MAX_TRACKED_FUNCS]FuncAllocAccum;
+
+/// 最大调用栈深度（实时 per-function 计时用）
+/// 超过此深度时跳过计时但不崩溃；O(log n) 递归远低于此限制
+pub const MAX_CALL_DEPTH: usize = 4096;
+
+/// 调用栈条目（实时 per-function 计时用）
+pub const CallStackEntry = struct {
+    func_idx: u32,
+    start_ns: i64,
+};
+
+/// Per-function 时间和调用计数数组（实时累加，aggregator 直接读取）
+pub const FuncTimeArray = [MAX_TRACKED_FUNCS]u64;
+pub const FuncCallArray = [MAX_TRACKED_FUNCS]u64;
 
 test {
     std.testing.refAllDecls(@This());

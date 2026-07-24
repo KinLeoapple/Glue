@@ -25,8 +25,10 @@ pub fn dumpText(report: *const Report, writer: anytype) !void {
     try dumpPhases(report.phases, writer);
 
     // 2. 全局内存汇总
+    // peak_bytes 是 ThreadProfiler 在每次 watermark/alloc 时维护的单调最大值，
+    // 比采样到的 current_bytes 更准确（采样可能错过瞬时峰值）
     try writer.print("\nmemory (global):\n", .{});
-    try writer.print("  peak live      : {d} B\n", .{report.global_peak.current_bytes});
+    try writer.print("  peak live      : {d} B\n", .{report.global_final.peak_bytes});
     try writer.print("  final live     : {d} B\n", .{report.global_final.current_bytes});
     try writer.print("  total alloc    : {d} B ({d} objects)\n", .{
         report.global_final.alloc_bytes, report.global_final.alloc_count,
