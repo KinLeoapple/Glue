@@ -24,37 +24,9 @@ const Manifest = manifest_mod.Manifest;
 const MANIFEST_NAME = manifest_mod.MANIFEST_NAME;
 const DEFAULT_ENTRY = manifest_mod.DEFAULT_ENTRY;
 const init_cmd = @import("cli/init.zig");
-
-var profile_enabled: bool = false;
-var profile_json_path: ?[]const u8 = null;
-var profile_interval_us: u64 = 0;
-var global_prof: profiling.GlobalProfiler = undefined;
-
-/// 向标准错误流打印格式化错误信息
-fn printError(io: std.Io, comptime fmt: []const u8, args: anytype) void {
-    var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writerStreaming(io, &buf);
-    w.interface.print(fmt, args) catch {};
-    w.flush() catch {};
-}
-
-/// 打印命令行用法说明
-fn printUsage(io: std.Io) void {
-    printError(io,
-        \\Glue v0.1.0 — project-based language runtime
-        \\
-        \\Usage:
-        \\  glue init [name]   Scaffold a new Glue project (in ./name or current dir)
-        \\  glue run           Build and run the current project
-        \\  glue debug         Run with diagnostics (memory checking + runtime trace)
-        \\
-        \\Options:
-        \\  --profile              Enable profiling instrumentation
-        \\  --profile-json=<path>  Write JSON report to file (implies --profile)
-        \\  --profile-interval=<us> Sampling interval in microseconds (default: 1000)
-        \\
-    , .{});
-}
+const args_mod = @import("cli/args.zig");
+const printError = args_mod.printError;
+const printUsage = args_mod.printUsage;
 
 /// 程序入口：解析命令行参数并分派到对应子命令
 pub fn main(init: std.process.Init) !void {
@@ -75,12 +47,12 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "debug")) {
         for (args_slice[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--profile")) {
-                profile_enabled = true;
+                args_mod.profile_enabled = true;
             } else if (std.mem.startsWith(u8, arg, "--profile-json=")) {
-                profile_enabled = true;
-                profile_json_path = arg["--profile-json=".len..];
+                args_mod.profile_enabled = true;
+                args_mod.profile_json_path = arg["--profile-json=".len..];
             } else if (std.mem.startsWith(u8, arg, "--profile-interval=")) {
-                profile_interval_us = std.fmt.parseInt(u64, arg["--profile-interval=".len..], 10) catch {
+                args_mod.profile_interval_us = std.fmt.parseInt(u64, arg["--profile-interval=".len..], 10) catch {
                     printError(io, "error: invalid --profile-interval value\n\n", .{});
                     printUsage(io);
                     std.process.exit(1);
@@ -523,23 +495,23 @@ fn executeSource(
 
     var lex = lexer.Lexer.init(allocator, source);
     defer lex.deinit();
-    global_prof.phases.phaseBegin(.lex);
+    args_mod.global_prof.phases.phaseBegin(.lex);
     const tokens = lex.tokenize() catch |err| {
-        global_prof.phases.phaseEnd(.lex);
+        args_mod.global_prof.phases.phaseEnd(.lex);
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         stderr_writer.interface.print("{s}: lexer error: {s}\n", .{ filename, @errorName(err) }) catch {};
         stderr_writer.flush() catch {};
         return .failed;
     };
-    global_prof.phases.phaseEnd(.lex);
+    args_mod.global_prof.phases.phaseEnd(.lex);
     defer allocator.free(tokens);
 
     var p = parser.Parser.init(allocator, tokens);
     defer p.deinit();
-    global_prof.phases.phaseBegin(.parse);
+    args_mod.global_prof.phases.phaseBegin(.parse);
     const module = p.parseModule(filename) catch {
-        global_prof.phases.phaseEnd(.parse);
+        args_mod.global_prof.phases.phaseEnd(.parse);
         var err_buf: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);
         for (p.errors.items) |e| {
@@ -548,7 +520,7 @@ fn executeSource(
         stderr_writer.flush() catch {};
         return .failed;
     };
-    global_prof.phases.phaseEnd(.parse);
+    args_mod.global_prof.phases.phaseEnd(.parse);
     var entry_module = module;
     entry_module.source_path = filename;
 
@@ -579,15 +551,15 @@ fn executeSource(
     const ast_arena = ast_arena_inst.allocator();
 
     // 模块加载阶段
-    global_prof.phases.phaseBegin(.module_load);
+    args_mod.global_prof.phases.phaseBegin(.module_load);
     loadImportedDeclarations(allocator, io, &entry_module, filename, &retained_parsers, &retained_sources, &retained_tokens, ast_arena) catch {};
-    global_prof.phases.phaseEnd(.module_load);
+    args_mod.global_prof.phases.phaseEnd(.module_load);
 
     // sema 阶段（语义分析 + 图构建元信息产出）
     // TypeInferencer.checkModule 推断所有表达式类型并记录到 SemaResult.expr_types，
     // 供 IRBuilder 在图构建时读取（驱动式接入：sema 驱动 IR 构建）。
     // 硬失败：sema 检出任何类型错误则打印并终止管线，不进入 IR 构建。
-    global_prof.phases.phaseBegin(.type_check);
+    args_mod.global_prof.phases.phaseBegin(.type_check);
     var sema_result = ir.SemaResult.init(allocator);
     defer sema_result.deinit();
     {
@@ -602,16 +574,16 @@ fn executeSource(
                 stderr_writer.interface.print("{s}:{d}:{d}: sema error: {s}\n", .{ filename, e.line, e.column, e.message }) catch {};
             }
             stderr_writer.flush() catch {};
-            global_prof.phases.phaseEnd(.type_check);
+            args_mod.global_prof.phases.phaseEnd(.type_check);
             return .failed;
         }
     }
-    global_prof.phases.phaseEnd(.type_check);
+    args_mod.global_prof.phases.phaseEnd(.type_check);
 
     // IR 构建阶段（AST → Glue IR 共享内存图）
-    global_prof.phases.phaseBegin(.ir_build);
+    args_mod.global_prof.phases.phaseBegin(.ir_build);
     var builder = ir.IRBuilder.init(allocator) catch |err| {
-        global_prof.phases.phaseEnd(.ir_build);
+        args_mod.global_prof.phases.phaseEnd(.ir_build);
         printError(io, "{s}: IR builder init error: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
@@ -621,7 +593,7 @@ fn executeSource(
     // 纯函数 + 标量参数/返回 → compileCall 分配 memo_slot，Engine 运行时缓存结果
     var analysis_db = analysis_db_mod.AnalysisDB.init(allocator);
     defer analysis_db.deinit();
-    global_prof.phases.phaseBegin(.fused_analysis);
+    args_mod.global_prof.phases.phaseBegin(.fused_analysis);
     {
         var fused = analysis_db_mod.FusedAnalysis.init(
             allocator,
@@ -639,13 +611,13 @@ fn executeSource(
             printError(io, "fused analysis error: {s}\n", .{@errorName(err)});
         };
     }
-    global_prof.phases.phaseEnd(.fused_analysis);
+    args_mod.global_prof.phases.phaseEnd(.fused_analysis);
     builder.setPurityDB(&analysis_db.purity);
     builder.setEscapeTable(&analysis_db.escape);
-    global_prof.phases.phaseBegin(.ir_build_core);
+    args_mod.global_prof.phases.phaseBegin(.ir_build_core);
     var glue_ir = builder.build(entry_module) catch |err| {
-        global_prof.phases.phaseEnd(.ir_build_core);
-        global_prof.phases.phaseEnd(.ir_build);
+        args_mod.global_prof.phases.phaseEnd(.ir_build_core);
+        args_mod.global_prof.phases.phaseEnd(.ir_build);
         printError(io, "{s}: IR build error: {s}\n", .{ filename, @errorName(err) });
         builder.deinit();
         return .failed;
@@ -653,47 +625,47 @@ fn executeSource(
     // build() 成功后 arena 所有权转交 glue_ir，builder.deinit() 不再释放 arena
     builder.deinit();
     defer glue_ir.deinit();
-    global_prof.phases.phaseEnd(.ir_build_core);
-    global_prof.phases.phaseEnd(.ir_build);
+    args_mod.global_prof.phases.phaseEnd(.ir_build_core);
+    args_mod.global_prof.phases.phaseEnd(.ir_build);
 
     // 注入函数名表到 profiler（深拷贝，glue_ir deinit 后仍可使用）
-    if (profile_enabled) {
+    if (args_mod.profile_enabled) {
         var names_buf = std.ArrayList([]const u8).empty;
         defer names_buf.deinit(allocator);
         for (glue_ir.functions) |f| names_buf.append(allocator, f.name) catch break;
-        global_prof.setFuncNames(names_buf.items) catch {};
+        args_mod.global_prof.setFuncNames(names_buf.items) catch {};
     }
 
     // IR 优化阶段（常量折叠 + 死节点消除 + 向量融合 + 通道活跃性）
-    global_prof.phases.phaseBegin(.ir_optimize);
+    args_mod.global_prof.phases.phaseBegin(.ir_optimize);
     _ = ir.optimize(&glue_ir);
-    global_prof.phases.phaseEnd(.ir_optimize);
+    args_mod.global_prof.phases.phaseEnd(.ir_optimize);
 
     // 引擎执行阶段
-    global_prof.phases.phaseBegin(.engine_run);
-    global_prof.phases.phaseBegin(.engine_setup);
-    var eng = engine.Engine.initOwned(&glue_ir, allocator, &global_prof, io) catch |err| {
-        global_prof.phases.phaseEnd(.engine_setup);
-        global_prof.phases.phaseEnd(.engine_run);
+    args_mod.global_prof.phases.phaseBegin(.engine_run);
+    args_mod.global_prof.phases.phaseBegin(.engine_setup);
+    var eng = engine.Engine.initOwned(&glue_ir, allocator, &args_mod.global_prof, io) catch |err| {
+        args_mod.global_prof.phases.phaseEnd(.engine_setup);
+        args_mod.global_prof.phases.phaseEnd(.engine_run);
         printError(io, "{s}: engine init error: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
     eng.io = io; // 注入 IO 接口供内置 print/println 使用
-    global_prof.phases.phaseEnd(.engine_setup);
+    args_mod.global_prof.phases.phaseEnd(.engine_setup);
     defer {
-        global_prof.phases.phaseBegin(.engine_teardown);
+        args_mod.global_prof.phases.phaseBegin(.engine_teardown);
         eng.deinit();
-        global_prof.phases.phaseEnd(.engine_teardown);
-        global_prof.phases.phaseEnd(.engine_run);
+        args_mod.global_prof.phases.phaseEnd(.engine_teardown);
+        args_mod.global_prof.phases.phaseEnd(.engine_run);
     }
 
-    global_prof.phases.phaseBegin(.engine_exec);
+    args_mod.global_prof.phases.phaseBegin(.engine_exec);
     const result = eng.run() catch |err| {
-        global_prof.phases.phaseEnd(.engine_exec);
+        args_mod.global_prof.phases.phaseEnd(.engine_exec);
         printError(io, "{s}: execution error: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
-    global_prof.phases.phaseEnd(.engine_exec);
+    args_mod.global_prof.phases.phaseEnd(.engine_exec);
 
     // 输出 main 函数返回值（unit/null 类型不打印）
     const ret_chan_type = glue_ir.channels.get(eng.result_chan).chan_type;
@@ -711,9 +683,9 @@ fn executeSource(
 fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry_path: []const u8) !void {
     var loader = module_loader.ModuleLoader.init(allocator, io);
     defer loader.deinit();
-    global_prof = try profiling.GlobalProfiler.init(allocator, profile_enabled, profile_interval_us, profile_json_path);
-    defer global_prof.deinit();
-    try global_prof.start();
+    args_mod.global_prof = try profiling.GlobalProfiler.init(allocator, args_mod.profile_enabled, args_mod.profile_interval_us, args_mod.profile_json_path);
+    defer args_mod.global_prof.deinit();
+    try args_mod.global_prof.start();
 
     const Ctx = struct {
         allocator: std.mem.Allocator,
@@ -741,7 +713,7 @@ fn runNormal(allocator: std.mem.Allocator, io: std.Io, source: []const u8, entry
         ctx.outcome = executeSource(allocator, &loader, io, source, entry_path);
     }
 
-    global_prof.dump(io);
+    args_mod.global_prof.dump(io);
     if (ctx.outcome == .failed) {
         loader.deinit();
         std.process.exit(1);
@@ -758,9 +730,9 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
     {
         var loader = module_loader.ModuleLoader.init(dbg_alloc, io);
         defer loader.deinit();
-        global_prof = try profiling.GlobalProfiler.init(dbg_alloc, profile_enabled, profile_interval_us, profile_json_path);
-        defer global_prof.deinit();
-        try global_prof.start();
+        args_mod.global_prof = try profiling.GlobalProfiler.init(dbg_alloc, args_mod.profile_enabled, args_mod.profile_interval_us, args_mod.profile_json_path);
+        defer args_mod.global_prof.deinit();
+        try args_mod.global_prof.start();
 
         const Ctx = struct {
             allocator: std.mem.Allocator,
@@ -788,7 +760,7 @@ fn runDiagnostic(allocator: std.mem.Allocator, io: std.Io, source: []const u8, e
             ctx.outcome = executeSource(dbg_alloc, &loader, io, source, entry_path);
         }
 
-        global_prof.dump(io);
+        args_mod.global_prof.dump(io);
     }
     const leaked = dbg.deinit();
     if (leaked == .leak) {
