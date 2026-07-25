@@ -24,7 +24,7 @@ pub const REF_KIND_NAMES = [_][]const u8{
     "partial",      "builtin",      "trait_val",    "lazy_val",
     "error_val",    "throw_val",    "array_iter",   "string_iter",
     "range_iter",   "atomic_val",   "async_val",    "channel_val",
-    "sender_val",   "receiver_val", "boxed_scalar",
+    "sender_val",   "receiver_val", "coroutine_frame", "boxed_scalar",
 };
 
 // ============ 基础工具（Zig 0.16 兼容层）============
@@ -126,7 +126,7 @@ pub const TypeStats = struct {
     free_count: u64 = 0,
 };
 
-/// 类型统计数组（22 种 RefKind）
+/// 类型统计数组（23 种 RefKind）
 pub const TypeStatsArray = [ref_kind_count]TypeStats;
 
 /// 分配器种类

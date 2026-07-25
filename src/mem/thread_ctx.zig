@@ -53,6 +53,11 @@ pub const ThreadContext = struct {
     prof: ?*profiling.ThreadProfiler = null,
     /// GlobalProfiler 反向引用（deinit 时注销 ThreadProfiler 用）
     global_prof: ?*profiling.GlobalProfiler = null,
+    /// IoBridge 引用（由 Engine.startScheduler 注入，async syscall 通过此回调唤醒协程）
+    io_bridge: ?*anyopaque = null,
+    /// IoBridge.wakeChanRecv 回调：channel 有数据后唤醒等待的协程
+    /// 参数：bridge = io_bridge, chan = *ChannelValue（转 anyopaque 避免循环依赖）
+    wake_chan_recv_fn: ?*const fn (bridge: *anyopaque, chan: *anyopaque) void = null,
 
     /// 创建线程上下文
     /// global_prof 非 null 且 enabled 时创建并注册 ThreadProfiler

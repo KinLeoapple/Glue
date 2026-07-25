@@ -1,7 +1,9 @@
 //! syscall 共享工具：错误构造 + 超时包装
 //!
-//! 从 io.zig 抽取的 IOErrorKind/errToKind/makeIOError/makeThrowOk/makeThrowErr
-//! 供 io.zig / net.zig 共享。
+//! 集中所有错误构造逻辑（IOError / Throw 包装 / 超时包装），
+//! 供 io.zig / net.zig 共享，遵循 syscall 最小化原则——
+//! syscall 业务文件仅保留原语实现，错误构造统一在此。
+//! TimeError 构造已随算法下沉移至 Glue 层（SystemTime.glue），不再需要。
 //!
 //! 设计参考：docs/superpowers/specs/2026-07-24-net-io-design.md 第 4 节
 
@@ -10,8 +12,8 @@ const value = @import("value");
 const Value = value.Value;
 const ThreadContext = value.obj_header.ThreadContext;
 const ErrorValue = value.ErrorValue;
-const syscall_mod = @import("mod.zig");
-const SyscallError = syscall_mod.SyscallError;
+const registry = @import("registry.zig");
+const SyscallError = registry.SyscallError;
 
 const Io = std.Io;
 
@@ -102,6 +104,10 @@ pub fn makeIOError(tctx: *ThreadContext, kind: IOErrorKind, msg: []const u8, os_
     };
 }
 
+// ──────────────────────────────────────────────
+// Throw 包装工具（io.zig / net.zig 共享）
+// ──────────────────────────────────────────────
+
 /// 构造 Throw.ok(value) 包装
 ///
 /// RC 语义：窃取语义——makeThrow 直接 memcpy 窃取 v 的引用（RC=1）。
@@ -114,14 +120,16 @@ pub fn makeThrowOk(tctx: *ThreadContext, v: Value) SyscallError!Value {
     };
 }
 
-/// 构造 Throw.err(IOError) 包装
+/// 构造 Throw.err(ErrorNewtype) 包装
 ///
-/// IOError 现在是 RecordValue（含 __tag），msg 在 fields[2]。
-/// 从 RecordValue 提取 msg 后构造 ErrorValue，包装为 Throw.err。
+/// 通用错误包装：err_val 为任意 error_newtype record（IOError / TimeError 等），
+/// msg 固定位于 fields[2]（__tag=0, kind=1, msg=2, ...）。从 RecordValue 提取 msg 后
+/// 构造 ErrorValue，包装为 Throw.err。type_name 为错误类别名（如 "io error" / "time error"），
+/// 仅作为 ErrorValue.type_name 元数据，不影响控制流。
 ///
 /// RC 语义：err_val 为窃取语义（调用方转移所有权）。提取 msg 后立即释放 err_val record；
 /// makeError 返回 RC=1 的 ErrorValue，直接交 makeThrow 窃取，无需额外 retain。
-pub fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
+pub fn makeThrowErr(tctx: *ThreadContext, err_val: Value, type_name: []const u8) SyscallError!Value {
     const err_obj = err_val.asRef();
     // 提取 msg（借用，不改变 RC）
     const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", err_obj));
@@ -133,7 +141,7 @@ pub fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
         else => "",
     } else "";
     // 构造 ErrorValue（RC=1）
-    const err_ev = Value.makeError(tctx, "io error", msg_bytes, true) catch {
+    const err_ev = Value.makeError(tctx, type_name, msg_bytes, true) catch {
         // OOM：释放 err_val（所有权已转移）
         value.obj_header.release(err_obj, tctx);
         return error.OutOfMemory;
@@ -147,6 +155,31 @@ pub fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
         value.obj_header.release(err_ev.asRef(), tctx);
         return error.OutOfMemory;
     };
+}
+
+// ──────────────────────────────────────────────
+// 数组构造工具（io.zig / net.zig 共享）
+// ──────────────────────────────────────────────
+
+/// 从原始字节构造 u8[] 数组 Value（RC=1）。
+/// 用于 file_read / net_tcp_read 等返回 u8[] 的 syscall：调用方通过返回值获取数据，
+/// 而非就地填充传入的 buf（Glue 层 buf 参数值语义深拷贝，就地填充不可见）。
+pub fn makeU8Array(tctx: *ThreadContext, bytes: []const u8) SyscallError!Value {
+    if (bytes.len == 0) {
+        return Value.makeArray(tctx, &[_]Value{}, null) catch return error.OutOfMemory;
+    }
+    // 临时分配 Value[] 缓冲区填充 fromU8；makeArray 会拷贝到自己的缓冲区，完成后释放临时区
+    const buf = tctx.allocObj(bytes.len * @sizeOf(Value)) catch return error.OutOfMemory;
+    const elems: []Value = @as([*]Value, @ptrCast(@alignCast(buf.ptr)))[0..bytes.len];
+    for (bytes, 0..) |b, i| {
+        elems[i] = Value.fromU8(b);
+    }
+    const result = Value.makeArray(tctx, elems, null) catch {
+        tctx.freeObj(buf.ptr);
+        return error.OutOfMemory;
+    };
+    tctx.freeObj(buf.ptr);
+    return result;
 }
 
 // ──────────────────────────────────────────────
@@ -229,7 +262,7 @@ pub fn runWithTimeout(
         // Select 自身被取消：取消所有任务，返回超时
         sel.cancelDiscard();
         const io_err = try makeIOError(tctx, .timed_out, "operation canceled", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
 
     switch (first) {
@@ -244,7 +277,7 @@ pub fn runWithTimeout(
             // sleep 先完成：取消 op，返回 TimedOut
             sel.cancelDiscard();
             const io_err = try makeIOError(tctx, .timed_out, "operation timed out", 0, null);
-            return makeThrowErr(tctx, io_err);
+            return makeThrowErr(tctx, io_err, "io error");
         },
     }
 }
@@ -255,5 +288,5 @@ pub fn runWithTimeout(
 inline fn wrapOpError(tctx: *ThreadContext, err: anyerror) SyscallError!Value {
     const kind: IOErrorKind = if (err == error.Canceled) .timed_out else errToKind(err);
     const io_err = try makeIOError(tctx, kind, "operation failed", 0, null);
-    return makeThrowErr(tctx, io_err);
+    return makeThrowErr(tctx, io_err, "io error");
 }

@@ -160,6 +160,10 @@ pub fn tryWidenUnify(inferencer: *TypeInferencer, t1: *Type, t2: *Type) SemaErro
     const r1 = inferencer.resolve(t1);
     const r2 = inferencer.resolve(t2);
 
+    // never_type（发散）与任何类型统一为对方：发散路径不贡献值，类型由另一侧决定
+    if (r1.* == .never_type) return r2;
+    if (r2.* == .never_type) return r1;
+
     if (inferencer.unify(r1, r2)) {
         return r1;
     } else |_| {

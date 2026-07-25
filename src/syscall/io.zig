@@ -17,9 +17,8 @@ const builtin = @import("builtin");
 const value = @import("value");
 const Value = value.Value;
 const ThreadContext = value.obj_header.ThreadContext;
-const ErrorValue = value.ErrorValue;
-const syscall_mod = @import("mod.zig");
-const SyscallError = syscall_mod.SyscallError;
+const registry = @import("registry.zig");
+const SyscallError = registry.SyscallError;
 const util = @import("util.zig");
 
 // 共享错误工具（从 io.zig 抽取到 util.zig，io.zig/net.zig 共用）
@@ -28,6 +27,7 @@ const errToKind = util.errToKind;
 const makeIOError = util.makeIOError;
 const makeThrowOk = util.makeThrowOk;
 const makeThrowErr = util.makeThrowErr;
+const makeU8Array = util.makeU8Array;
 
 const Io = std.Io;
 const File = Io.File;
@@ -121,7 +121,7 @@ inline fn fdToFile(fd: i64) File {
 // ──────────────────────────────────────────────
 //
 // IOErrorKind / errToKind / makeIOError / makeThrowOk / makeThrowErr
-// 已抽取到 util.zig（io.zig/net.zig 共享），见文件顶部 import。
+// 已抽取到 util.zig（io.zig/net.zig/time.zig 共享），见文件顶部 import。
 
 /// 根据 File.Kind 构造 FileKind ADT 值（无字段变体 File/Directory/Symlink/Other）
 ///
@@ -190,9 +190,10 @@ fn seekFileWindows(file: File, offset: i64, whence: i32) SeekFail!i64 {
 
 /// __file_open(path: str, flags: i32, mode: i32) -> Throw<i64, IOError>
 ///
-/// flags 为 POSIX 风格（O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_TRUNC/O_APPEND）。
-/// O_CREAT → Dir.createFile；否则 → Dir.openFile。
-/// O_APPEND 当前由 Glue 层 seek End 语义处理（std.Io 无 append 选项）。
+/// flags 为平台无关语义位域（File.glue __compute_flags 产出）：
+///   bit0=OPEN_READ, bit1=OPEN_WRITE, bit2=OPEN_CREATE,
+///   bit3=OPEN_TRUNCATE, bit4=OPEN_APPEND
+/// syscall 层翻译为宿主 Dir.createFile/openFile 选项，避免 Glue 层硬编码 POSIX 值。
 /// 返回 i64 fd（跨平台：POSIX i32 扩展，Windows HANDLE 转整数）。
 pub fn file_open(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 3) return error.InvalidArgument;
@@ -200,31 +201,18 @@ pub fn file_open(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError
     const flags = args[1].intCast(i32);
     _ = args[2]; // mode（permissions）：std.Io 用 .default_file，忽略 POSIX mode
 
-    // POSIX O_ 标志位按平台取值（Linux 与 BSD/macOS 不同，硬编码会导致位误判）
-    // O_ACCMODE 低 2 位跨平台一致；O_CREAT/O_TRUNC 按平台 switch
-    const O_ACCMODE: i32 = 3;
-    const O_CREAT: i32 = switch (builtin.os.tag) {
-        .linux => 64, // 0o100
-        .macos, .ios, .watchos, .tvos, .freebsd, .netbsd, .openbsd, .dragonfly => 512, // 0o200
-        .windows => 0, // Windows 不使用 POSIX O_ 位
-        else => 64, // 默认 Linux 值
-    };
-    const O_TRUNC: i32 = switch (builtin.os.tag) {
-        .linux => 512, // 0o1000
-        .macos, .ios, .watchos, .tvos, .freebsd, .netbsd, .openbsd, .dragonfly => 1024, // 0o400
-        .windows => 0,
-        else => 512,
-    };
-    const accmode = flags & O_ACCMODE;
-    // accmode 仅 0(O_RDONLY)/1(O_WRONLY)/2(O_RDWR) 合法，3+ 为非法值
-    if (accmode > 2) {
-        const io_err = try makeIOError(tctx, .invalid_input, "file_open: invalid access mode", 22, path);
-        return makeThrowErr(tctx, io_err);
-    }
-    const read = accmode != 1; // 非 O_WRONLY
-    const write = accmode != 0; // 非 O_RDONLY
-    const create = (flags & O_CREAT) != 0;
-    const truncate = (flags & O_TRUNC) != 0;
+    // 平台无关语义位解析（与 File.glue OPEN_* 常量一致）
+    const OPEN_READ: i32 = 1;
+    const OPEN_WRITE: i32 = 2;
+    const OPEN_CREATE: i32 = 4;
+    const OPEN_TRUNCATE: i32 = 8;
+    const OPEN_APPEND: i32 = 16;
+    _ = OPEN_APPEND; // append 由 Glue 层 seek End 语义处理
+
+    const read = (flags & OPEN_READ) != 0;
+    const write = (flags & OPEN_WRITE) != 0;
+    const create = (flags & OPEN_CREATE) != 0;
+    const truncate = (flags & OPEN_TRUNCATE) != 0;
 
     const file = if (create) blk: {
         const f = Dir.cwd().createFile(io, path, .{
@@ -233,14 +221,14 @@ pub fn file_open(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError
             .permissions = .default_file,
         }) catch |err| {
             const io_err = try makeIOError(tctx, errToKind(err), "file_open failed", 0, path);
-            return makeThrowErr(tctx, io_err);
+            return makeThrowErr(tctx, io_err, "io error");
         };
         break :blk f;
     } else blk: {
         const mode: Dir.OpenFileOptions.Mode = if (read and write) .read_write else if (write) .write_only else .read_only;
         const f = Dir.cwd().openFile(io, path, .{ .mode = mode }) catch |err| {
             const io_err = try makeIOError(tctx, errToKind(err), "file_open failed", 0, path);
-            return makeThrowErr(tctx, io_err);
+            return makeThrowErr(tctx, io_err, "io error");
         };
         break :blk f;
     };
@@ -255,39 +243,35 @@ pub fn file_close(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
     return makeThrowOk(tctx, Value.fromUnit());
 }
 
-/// __file_read(fd: i64, buf: u8[], len: usize) -> Throw<usize, IOError>
+/// __file_read(fd: i64, len: usize) -> Throw<u8[], IOError>
 ///
+/// 从文件读取数据，返回读到的字节数组（空数组 = EOF）。
+/// 单次 read 语义（不循环阻塞，兼容管道/交互式 IO）。
+///
+/// 设计说明：不再接受 buf 参数就地填充。async fun 参数会被 orbit worker
+/// 深拷贝，就地修改 buf 对调用方不可见。改为返回新分配的 u8[] 数组，
+/// 由 async 返回值路径正常传回调用方（与 net_tcp_read 一致）。
 /// 优化：栈缓冲区 32KB，单次 read 即可填满 8192 默认 buf，减少 syscall 次数。
-/// 语义保持单次 read（不循环阻塞，兼容管道/交互式 IO）。
 pub fn file_read(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
-    if (args.len != 3) return error.InvalidArgument;
+    if (args.len != 2) return error.InvalidArgument;
     const fd = args[0].intCast(i64);
-    const arr = asArray(args[1]) orelse {
-        const io_err = try makeIOError(tctx, .invalid_input, "file_read: buf not array", 22, null);
-        return makeThrowErr(tctx, io_err);
-    };
     // 负 len 值会导致 intCast panic，先验证再转换
-    const len_raw = args[2].intCast(i64);
+    const len_raw = args[1].intCast(i64);
     if (len_raw < 0) {
         const io_err = try makeIOError(tctx, .invalid_input, "file_read: negative len", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     }
     const len: usize = @intCast(len_raw);
-    const actual_len = @min(len, arr.elements.len);
-    // 将 Value 元素视作 u8：约定 u8[] 的每个 Value 都是 .u8 标量
     var tmp_buf: [32768]u8 = undefined;
-    const read_len = @min(actual_len, tmp_buf.len);
+    const read_len = @min(len, tmp_buf.len);
     const file = fdToFile(fd);
     const n = file.readStreaming(io, &.{tmp_buf[0..read_len]}) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "file_read failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
-    // 将读到的字节写回 array（覆盖前 n 个元素）
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        arr.elements[i] = Value.fromU8(tmp_buf[i]);
-    }
-    return makeThrowOk(tctx, Value.fromUsize(n));
+    // 构造 u8[] 数组返回（调用方通过返回值获取数据，而非就地填充 buf）
+    const arr_val = try makeU8Array(tctx, tmp_buf[0..n]);
+    return makeThrowOk(tctx, arr_val);
 }
 
 /// __file_write(fd: i64, buf: u8[], len: usize) -> Throw<usize, IOError>
@@ -298,13 +282,13 @@ pub fn file_write(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
     const fd = args[0].intCast(i64);
     const arr = asArray(args[1]) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "file_write: buf not array", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     // 负 len 值会导致 intCast panic，先验证再转换
     const len_raw = args[2].intCast(i64);
     if (len_raw < 0) {
         const io_err = try makeIOError(tctx, .invalid_input, "file_write: negative len", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     }
     const len: usize = @intCast(len_raw);
     const actual_len = @min(len, arr.elements.len);
@@ -317,14 +301,14 @@ pub fn file_write(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
             .u8 => arr.elements[i].asU8(),
             else => {
                 const io_err = try makeIOError(tctx, .invalid_input, "file_write: buf element not u8", 22, null);
-                return makeThrowErr(tctx, io_err);
+                return makeThrowErr(tctx, io_err, "io error");
             },
         };
     }
     const file = fdToFile(fd);
     const n = file.writeStreaming(io, &.{}, &.{tmp_buf[0..write_len]}, 1) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "file_write failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromUsize(n));
 }
@@ -341,32 +325,256 @@ pub fn file_seek(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError
     const whence = args[2].intCast(i32);
     if (whence < 0 or whence > 2) {
         const io_err = try makeIOError(tctx, .invalid_input, "file_seek: bad whence", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     }
     const file = fdToFile(fd);
     const result = seekFile(file, offset, whence) catch {
         const io_err = try makeIOError(tctx, .other, "file_seek failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromI64(result));
 }
 
-/// __file_tell(fd: i64) -> Throw<i64, IOError>
+// ──────────────────────────────────────────────
+// 异步 File syscall
+// ──────────────────────────────────────────────
+//
+// 协议：创建完成 channel(cap=1) + spawn 独立线程跑 read/write（不阻塞协程 worker 线程），
+// 完成后 chan.trySend(Throw<T, IOError>) + wake_chan_recv_fn 唤醒等待协程。
+// 协程在 channel 上挂起（orbit_chan_recv），唤醒后从 channel 取 Throw 值。
+//
+// stdlib 用法（File.glue）：
+//   val done = __file_read_async(fd, len)
+//   done.recv()  // 返回 Throw<u8[], IOError>，作为 async 函数返回值
+
+/// file_read_async worker 线程参数
+const FileReadAsyncArgs = struct {
+    io: Io,
+    chan: *value.ChannelValue,
+    fd: i64,
+    len: usize,
+    bridge: *anyopaque,
+    wake_fn: *const fn (bridge: *anyopaque, chan: *anyopaque) void,
+    backing: std.mem.Allocator,
+    /// tctx 引用：worker 线程借用来分配 Throw/u8[] 对象。
+    /// 线程安全：tctx 的 backing 是线程安全 allocator（GlobalPool 持有），
+    /// pools/channels/arena 是 thread-local 但本线程不触碰，仅用 backing 分配。
+    tctx: *ThreadContext,
+};
+
+/// __file_read_async(fd: i64, len: usize) -> *ChannelValue
 ///
-/// 获取当前 fd 位置（seek(fd, 0, SEEK_CUR)）
-pub fn file_tell(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
-    _ = io;
-    if (args.len != 1) return error.InvalidArgument;
+/// 异步文件读：创建完成 channel + spawn 线程跑 read，
+/// 完成后 chan.trySend(Throw<u8[], IOError>) + wake_chan_recv_fn 唤醒协程。
+/// 返回 channel 指针，协程在 channel 上挂起（orbit_chan_recv）。
+pub fn file_read_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 2) return error.InvalidArgument;
+
     const fd = args[0].intCast(i64);
-    const file = fdToFile(fd);
-    const result = seekFile(file, 0, 1) catch { // SEEK_CUR=1
-        const io_err = try makeIOError(tctx, .other, "file_tell failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+    const len_raw = args[1].intCast(i64);
+    if (len_raw < 0) {
+        const io_err = try makeIOError(tctx, .invalid_input, "file_read_async: negative len", 22, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    }
+    const len: usize = @intCast(len_raw);
+
+    // 创建完成 channel（cap=1，buffer 容纳一个 Throw 值）
+    const chan = value.ChannelValue.create(tctx, 1) catch return error.OutOfMemory;
+
+    // spawn 线程跑 read + ioComplete
+    const args_ptr = tctx.backing.create(FileReadAsyncArgs) catch return error.OutOfMemory;
+    args_ptr.* = .{
+        .io = io,
+        .chan = chan,
+        .fd = fd,
+        .len = len,
+        .bridge = tctx.io_bridge.?,
+        .wake_fn = tctx.wake_chan_recv_fn.?,
+        .backing = tctx.backing,
+        .tctx = tctx,
     };
-    return makeThrowOk(tctx, Value.fromI64(result));
+    const thread = std.Thread.spawn(.{}, fileReadAsyncWorker, .{args_ptr}) catch {
+        tctx.backing.destroy(args_ptr);
+        // spawn 失败：返回错误 Throw（不应发生）
+        const io_err = try makeIOError(tctx, .other, "file_read_async: spawn failed", 0, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    thread.detach();
+
+    // 返回 channel 指针（stdlib 调 recv 挂起）
+    return Value.fromRef(@ptrCast(&chan.header));
+}
+
+/// file_read_async worker 线程：read + trySend(Throw) + wake + 释放资源。
+fn fileReadAsyncWorker(args: *FileReadAsyncArgs) void {
+    // 执行 read（复用同步 read 逻辑）
+    var tmp_buf: [32768]u8 = undefined;
+    const read_len = @min(args.len, tmp_buf.len);
+    const file = fdToFile(args.fd);
+    const n = file.readStreaming(args.io, &.{tmp_buf[0..read_len]}) catch |err| {
+        // read 失败：发 Throw.err 到 channel
+        const io_err = makeIOError(args.tctx, errToKind(err), "file_read_async failed", 0, null) catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.destroy(args);
+            return;
+        };
+        const throw_val = makeThrowErr(args.tctx, io_err, "io error") catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.destroy(args);
+            return;
+        };
+        _ = args.chan.trySend(throw_val);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+
+    // read 成功：构造 u8[] + Throw.ok + trySend + wake
+    const arr_val = makeU8Array(args.tctx, tmp_buf[0..n]) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    const throw_val = makeThrowOk(args.tctx, arr_val) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    _ = args.chan.trySend(throw_val);
+    args.wake_fn(args.bridge, @ptrCast(args.chan));
+
+    // 释放资源
+    args.backing.destroy(args);
+}
+
+/// file_write_async worker 线程参数
+const FileWriteAsyncArgs = struct {
+    io: Io,
+    chan: *value.ChannelValue,
+    fd: i64,
+    /// 已拷贝的待写字节缓冲区（worker 线程拥有，完成后释放）
+    buf: []u8,
+    len: usize,
+    bridge: *anyopaque,
+    wake_fn: *const fn (bridge: *anyopaque, chan: *anyopaque) void,
+    backing: std.mem.Allocator,
+    tctx: *ThreadContext,
+};
+
+/// __file_write_async(fd: i64, buf: u8[], len: usize) -> *ChannelValue
+///
+/// 异步文件写：创建完成 channel + spawn 线程跑 write，
+/// 完成后 chan.trySend(Throw<usize, IOError>) + wake_chan_recv_fn 唤醒协程。
+pub fn file_write_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 3) return error.InvalidArgument;
+
+    const fd = args[0].intCast(i64);
+    const arr = asArray(args[1]) orelse {
+        const io_err = try makeIOError(tctx, .invalid_input, "file_write_async: buf not array", 22, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    const len_raw = args[2].intCast(i64);
+    if (len_raw < 0) {
+        const io_err = try makeIOError(tctx, .invalid_input, "file_write_async: negative len", 22, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    }
+    const len: usize = @intCast(len_raw);
+    const actual_len = @min(len, arr.elements.len);
+
+    // 拷贝 buf 到独立缓冲区（worker 线程独立持有，避免跨线程访问 ArrayValue）
+    const write_len = @min(actual_len, 32768);
+    const buf_copy = tctx.backing.alloc(u8, write_len) catch return error.OutOfMemory;
+    var i: usize = 0;
+    while (i < write_len) : (i += 1) {
+        buf_copy[i] = switch (arr.elements[i]) {
+            .u8 => arr.elements[i].asU8(),
+            else => {
+                tctx.backing.free(buf_copy);
+                const io_err = try makeIOError(tctx, .invalid_input, "file_write_async: buf element not u8", 22, null);
+                return makeThrowErr(tctx, io_err, "io error");
+            },
+        };
+    }
+
+    // 创建完成 channel（cap=1）
+    const chan = value.ChannelValue.create(tctx, 1) catch {
+        tctx.backing.free(buf_copy);
+        return error.OutOfMemory;
+    };
+
+    // spawn 线程跑 write + ioComplete
+    const args_ptr = tctx.backing.create(FileWriteAsyncArgs) catch {
+        tctx.backing.free(buf_copy);
+        return error.OutOfMemory;
+    };
+    args_ptr.* = .{
+        .io = io,
+        .chan = chan,
+        .fd = fd,
+        .buf = buf_copy,
+        .len = write_len,
+        .bridge = tctx.io_bridge.?,
+        .wake_fn = tctx.wake_chan_recv_fn.?,
+        .backing = tctx.backing,
+        .tctx = tctx,
+    };
+    const thread = std.Thread.spawn(.{}, fileWriteAsyncWorker, .{args_ptr}) catch {
+        tctx.backing.destroy(args_ptr);
+        tctx.backing.free(buf_copy);
+        // spawn 失败：返回错误 Throw（不应发生）
+        const io_err = try makeIOError(tctx, .other, "file_write_async: spawn failed", 0, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    thread.detach();
+
+    // 返回 channel 指针（stdlib 调 recv 挂起）
+    return Value.fromRef(@ptrCast(&chan.header));
+}
+
+/// file_write_async worker 线程：write + trySend(Throw) + wake + 释放资源。
+fn fileWriteAsyncWorker(args: *FileWriteAsyncArgs) void {
+    const file = fdToFile(args.fd);
+    const n = file.writeStreaming(args.io, &.{}, &.{args.buf[0..args.len]}, 1) catch |err| {
+        // write 失败：发 Throw.err 到 channel
+        const io_err = makeIOError(args.tctx, errToKind(err), "file_write_async failed", 0, null) catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.free(args.buf);
+            args.backing.destroy(args);
+            return;
+        };
+        const throw_val = makeThrowErr(args.tctx, io_err, "io error") catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.free(args.buf);
+            args.backing.destroy(args);
+            return;
+        };
+        _ = args.chan.trySend(throw_val);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.free(args.buf);
+        args.backing.destroy(args);
+        return;
+    };
+
+    // write 成功：构造 Throw.ok(usize) + trySend + wake
+    const throw_val = makeThrowOk(args.tctx, Value.fromUsize(n)) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.free(args.buf);
+        args.backing.destroy(args);
+        return;
+    };
+    _ = args.chan.trySend(throw_val);
+    args.wake_fn(args.bridge, @ptrCast(args.chan));
+
+    // 释放资源
+    args.backing.free(args.buf);
+    args.backing.destroy(args);
 }
 
 /// __file_stat(path: str) -> Throw<Stat, IOError>
+///
+/// path-based stat：不打开文件直接读元数据。
+/// 与 __file_fstat(fd) 不是等价能力——path-based 对目录/权限受限文件/符号链接
+/// 语义不同，是独立的宿主能力，不可由 open+fstat+close 组合推导。
 ///
 /// Stat 字段布局（与 std/io/File.glue 中 Stat newtype 定义对齐）：
 ///   size     : u64      — 文件大小（字节数）
@@ -378,19 +586,21 @@ pub fn file_stat(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError
     const path = asStrBytes(args[0]);
     const stat = Dir.cwd().statFile(io, path, .{}) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "file_stat failed", 0, path);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeStatValue(tctx, stat);
 }
 
 /// __file_fstat(fd: i64) -> Throw<Stat, IOError>
+///
+/// fd-based stat：对已打开文件读元数据。
 pub fn file_fstat(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 1) return error.InvalidArgument;
     const fd = args[0].intCast(i64);
     const file = fdToFile(fd);
     const stat = file.stat(io) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "file_fstat failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeStatValue(tctx, stat);
 }
@@ -401,7 +611,6 @@ pub fn file_fstat(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
 /// IR 编译器注册 field_id：__tag=0, size=1, mtime_ns=2, ctime_ns=3, kind=4。
 fn makeStatValue(tctx: *ThreadContext, stat: File.Stat) SyscallError!Value {
     const kind_val = try makeFileKind(tctx, stat.kind);
-    // kind_val RC=1，直接交 makeRecordWithNames 窃取，无需额外 retain
     // mtime/ctime.nanoseconds 为 i128，钳位到 i64 范围避免 @intCast panic（超出 ±292 年的极端时间戳）
     const mtime_ns: i64 = if (stat.mtime.nanoseconds > std.math.maxInt(i64))
         std.math.maxInt(i64)
@@ -436,7 +645,7 @@ pub fn file_remove(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErr
     const path = asStrBytes(args[0]);
     Dir.cwd().deleteFile(io, path) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "file_remove failed", 0, path);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromUnit());
 }
@@ -449,7 +658,7 @@ pub fn file_rename(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErr
     const cwd = Dir.cwd();
     Dir.rename(cwd, old_path, cwd, new_path, io) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "file_rename failed", 0, old_path);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromUnit());
 }
@@ -471,7 +680,7 @@ pub fn file_chmod(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
     var path_buf: [4096]u8 = undefined;
     const path_z = pathToZ(path, &path_buf) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "file_chmod: path too long", 36, path);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     // mode 为 i32，chmod 需要 mode_t（POSIX 通常 u16/u32 因平台而异）。
     // 负 mode 用 @bitCast 转 u32，再窄化到 mode_t 避免 panic
@@ -493,7 +702,7 @@ pub fn file_chmod(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
             else => .other,
         };
         const io_err = try makeIOError(tctx, kind, "file_chmod failed", errno_val, path);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     }
     return makeThrowOk(tctx, Value.fromUnit());
 }
@@ -511,12 +720,12 @@ pub fn dir_create(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
     if (recursive) {
         Dir.cwd().createDirPath(io, path) catch |err| {
             const io_err = try makeIOError(tctx, errToKind(err), "dir_create recursive failed", 0, path);
-            return makeThrowErr(tctx, io_err);
+            return makeThrowErr(tctx, io_err, "io error");
         };
     } else {
         Dir.cwd().createDir(io, path, .default_dir) catch |err| {
             const io_err = try makeIOError(tctx, errToKind(err), "dir_create failed", 0, path);
-            return makeThrowErr(tctx, io_err);
+            return makeThrowErr(tctx, io_err, "io error");
         };
     }
     return makeThrowOk(tctx, Value.fromUnit());
@@ -531,12 +740,12 @@ pub fn dir_remove(io: Io, tctx: *ThreadContext, args: []const Value) SyscallErro
     if (recursive) {
         Dir.cwd().deleteTree(io, path) catch |err| {
             const io_err = try makeIOError(tctx, errToKind(err), "dir_remove failed", 0, path);
-            return makeThrowErr(tctx, io_err);
+            return makeThrowErr(tctx, io_err, "io error");
         };
     } else {
         Dir.cwd().deleteDir(io, path) catch |err| {
             const io_err = try makeIOError(tctx, errToKind(err), "dir_remove failed", 0, path);
-            return makeThrowErr(tctx, io_err);
+            return makeThrowErr(tctx, io_err, "io error");
         };
     }
     return makeThrowOk(tctx, Value.fromUnit());
@@ -550,7 +759,7 @@ pub fn dir_list(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!
     const path = asStrBytes(args[0]);
     var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "dir_list failed", 0, path);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     defer dir.close(io);
 
@@ -570,7 +779,7 @@ pub fn dir_list(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!
     while (true) {
         const entry = it.next(io) catch |err| {
             const io_err = try makeIOError(tctx, errToKind(err), "dir_list iterate failed", 0, path);
-            return makeThrowErr(tctx, io_err);
+            return makeThrowErr(tctx, io_err, "io error");
         };
         const e = entry orelse break;
         if (std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) continue;

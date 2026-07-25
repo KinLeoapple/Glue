@@ -24,12 +24,13 @@ pub fun add_days(self: DateTime, days: i64): DateTime {
     DateTime(new_ymd.year, new_ymd.month, new_ymd.day, self.hour, self.minute, self.second, self.nanos, Calendar.weekday_of(new_ymd.year, new_ymd.month, new_ymd.day), Calendar.day_of_year(new_ymd.year, new_ymd.month, new_ymd.day))
 }
 
-// 加 Duration（通过 UTC 分量往返转换）
+// 加 Duration（通过 UTC 分量往返转换，纯 Glue 算法）
+// 调用 SystemTime 的纯 Glue 转换函数（替代原 __components_to_ns_utc / __systemtime_to_utc_components syscall）
 pub fun add_duration(self: DateTime, d: Duration): Throw<DateTime, TimeError> {
     val comp = self.to_components()
-    val ns = __components_to_ns_utc(comp)?
+    val ns = std.time.SystemTime.components_to_ns_utc(comp)?
     val new_ns = ns + d.as_nanos()
-    val new_comp = __systemtime_to_utc_components(new_ns)
+    val new_comp = std.time.SystemTime.to_utc_components(new_ns)
     Ok(std.time.DateTime.from_components(new_comp))
 }
 

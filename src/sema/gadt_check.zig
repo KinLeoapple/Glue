@@ -13,19 +13,18 @@ pub const TypeScheme = type_check.TypeScheme;
 pub const TypeEnv = type_check.TypeEnv;
 pub const TypeInferencer = type_check.TypeInferencer;
 
-/// 对 GADT 构造器模式进行类型精化。
+/// 对构造器模式进行类型精化。
 ///
-/// 若该构造器不属于任何 GADT，则返回 false 交由常规模式推断处理；
-/// 否则实例化构造器方案，将其返回类型与 `expected_ty` 统一，并对子模式
+/// 实例化构造器方案，将其返回类型与 `expected_ty` 统一，并对子模式
 /// 依次按对应字段类型继续推断，最终返回 true 表示已由本函数处理。
+/// 若构造器未在环境中注册，返回 false 交由常规模式推断处理。
+/// 适用于 GADT、普通 ADT 和内置类型（如 Throw 的 Ok/Error）构造器。
 pub fn refineConstructorPattern(
     inferencer: *TypeInferencer,
     con: @TypeOf(@as(ast.Pattern, undefined).constructor),
     expected_ty: *Type,
     env: *TypeEnv,
 ) bool {
-    if (!constructorBelongsToGadt(inferencer, con.name)) return false;
-
     const scheme = env.lookup(con.name) orelse return false;
     const inst = inferencer.instantiate(scheme) catch return false;
     const resolved = inferencer.resolve(inst);

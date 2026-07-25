@@ -1,7 +1,7 @@
 //! 堆对象统一头部模块
 //!
 //! 定义所有堆分配值共享的统一对象头 ObjHeader，提供：
-//! - RefKind 枚举：22 种堆对象类型标签
+//! - RefKind 枚举：23 种堆对象类型标签
 //! - ObjHeader：extern struct，保证跨架构布局一致
 //! - 统一 retain/release 引用计数接口
 //! - deinit_table 分派表与注册机制
@@ -47,6 +47,9 @@ pub const RefKind = enum(u8) {
     channel_val,
     sender_val,
     receiver_val,
+    /// 协程帧：async 函数调度的执行载体（M:N 协程调度）
+    /// 内存布局：[ObjHeader][CoroutineFrame 字段][locals 区，64B 对齐]
+    coroutine_frame,
     /// 装箱标量：&i32/&f64 等标量引用的堆容器，内联标量值紧跟 ObjHeader 之后
     /// 内存布局：[ObjHeader][标量值，最多 16B]
     boxed_scalar,
@@ -72,6 +75,11 @@ pub const ObjHeader = extern struct {
     /// - release 归零时跳过 freeObj，由 endFunction 的 arena.reset 统一回收
     /// - deinit 仍执行（释放内部非 arena 资源，如子对象 release）
     pub const ARENA_ALLOCATED: u8 = 1 << 1;
+    /// 对象由 orbit worker 线程的 Engine 分配。
+    /// async 函数通过 &T 引用参数修改主线程对象时，worker 分配的堆值
+    /// 会存入主线程对象的字段。worker 退出后这些值变为悬垂指针。
+    /// 主线程在 join 后通过此标记识别并迁移到自身 tctx。
+    pub const WORKER_ALLOCATED: u8 = 1 << 2;
 
     /// 标记为已被引擎跟踪
     pub inline fn markTracked(self: *ObjHeader) void {
@@ -91,6 +99,16 @@ pub const ObjHeader = extern struct {
     /// 是否从 ShadowArena 分配
     pub inline fn isArenaAllocated(self: *const ObjHeader) bool {
         return (self.flags & ARENA_ALLOCATED) != 0;
+    }
+
+    /// 标记为 worker 线程分配（用于跨线程引用值迁移）
+    pub inline fn markWorkerAllocated(self: *ObjHeader) void {
+        self.flags |= WORKER_ALLOCATED;
+    }
+
+    /// 是否由 worker 线程分配
+    pub inline fn isWorkerAllocated(self: *const ObjHeader) bool {
+        return (self.flags & WORKER_ALLOCATED) != 0;
     }
 };
 

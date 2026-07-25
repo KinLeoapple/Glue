@@ -32,7 +32,6 @@ pub const LoopMeta = meta_mod.LoopMeta;
 pub const LoopKind = meta_mod.LoopKind;
 pub const ClosureMeta = meta_mod.ClosureMeta;
 pub const PartialMeta = meta_mod.PartialMeta;
-pub const SyscallId = meta_mod.SyscallId;
 pub const SyscallMeta = meta_mod.SyscallMeta;
 pub const ChanType = channel_mod.ChanType;
 pub const ChannelMeta = channel_mod.ChannelMeta;
@@ -74,6 +73,9 @@ pub const GlueIR = struct {
 
     /// 星轨元数据表（orbit_async_create/join 节点引用，Phase 5）
     orbit_metas: []OrbitMeta = &.{},
+
+    /// 协程元数据表（async 函数状态机变换产物，Phase 6）
+    coroutine_metas: []meta_mod.CoroutineMeta = &.{},
 
     /// 循环元数据表（scalar_loop 节点引用，含 break/continue 的循环）
     loop_metas: []LoopMeta = &.{},
@@ -130,6 +132,14 @@ pub const GlueIR = struct {
     pub fn funcNodes(self: *const GlueIR, func_idx: u16) []Node {
         const f = self.functions[func_idx];
         return self.nodes[f.node_start .. f.node_start + f.node_count];
+    }
+
+    /// 按 func_idx 查找协程元数据
+    pub fn getCoroutineMeta(self: *const GlueIR, func_idx: u16) ?*const meta_mod.CoroutineMeta {
+        for (self.coroutine_metas) |*m| {
+            if (m.func_idx == func_idx) return m;
+        }
+        return null;
     }
 
     /// 获取入口函数

@@ -202,6 +202,44 @@ pub const Value = union(enum) {
         return .{ .ref = obj };
     }
 
+    // ════════════════════════════════════════════
+    // 帧 locals 序列化（协程参数/局部值读写）
+    // ════════════════════════════════════════════
+
+    /// 返回内联 payload 的字节切片（标量返回数组本体，引用返回指针字节）。
+    /// 零字节值（null_val/unit）返回空切片。
+    /// 用于协程帧 locals 区参数槽写入：直接 memcpy 到目标偏移。
+    pub fn payloadBytes(self: Value) []const u8 {
+        return switch (self) {
+            .null_val, .unit => &.{},
+            .boolean => &self.boolean,
+            .char => &self.char,
+            .i8 => &self.i8,
+            .u8 => &self.u8,
+            .i16 => &self.i16,
+            .u16 => &self.u16,
+            .i32 => &self.i32,
+            .u32 => &self.u32,
+            .i64 => &self.i64,
+            .u64 => &self.u64,
+            .i128 => &self.i128,
+            .u128 => &self.u128,
+            .isize => &self.isize,
+            .usize => &self.usize,
+            .f16 => &self.f16,
+            .f32 => &self.f32,
+            .f64 => &self.f64,
+            .f128 => &self.f128,
+            .ref => std.mem.asBytes(&self.ref),
+        };
+    }
+
+    /// payload 字节大小（sizeof 内联表示）。
+    /// 标量 = 数组长度，引用 = 指针大小，零字节值 = 0。
+    pub fn payloadSize(self: Value) usize {
+        return self.payloadBytes().len;
+    }
+
     /// 从字节切片构造字符串值（连续内存：[Str header | byte buffer]）
     pub fn fromStringBytes(tctx: *ThreadContext, bytes: []const u8) !Value {
         const s = try Str.createContiguous(tctx, bytes);
@@ -681,11 +719,11 @@ pub const Value = union(enum) {
                     .error_val => try deepCopyError(obj, tctx),
                     .throw_val => try deepCopyThrow(obj, tctx),
                     .trait_val => try deepCopyTrait(obj, tctx),
-                    // 迭代器、惰性值、并发对象、装箱标量：引用语义，retain 即可
+                    // 迭代器、惰性值、并发对象、装箱标量、协程帧：引用语义，retain 即可
                     .array_iter, .string_iter, .range_iter,
                     .lazy_val,
                     .atomic_val, .async_val, .channel_val, .sender_val, .receiver_val,
-                    .boxed_scalar => self.retain(tctx),
+                    .coroutine_frame, .boxed_scalar => self.retain(tctx),
                 };
             },
         }

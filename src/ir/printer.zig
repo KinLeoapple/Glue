@@ -192,6 +192,23 @@ pub fn printIR(ir: *const GlueIR, allocator: std.mem.Allocator, buf: *std.ArrayL
             try buf.appendSlice(allocator, "\n");
         }
     }
+
+    // 打印协程元数据表
+    if (ir.coroutine_metas.len > 0) {
+        try buf.appendSlice(allocator, "\n--- 协程元数据 ---\n");
+        for (ir.coroutine_metas, 0..) |cm, i| {
+            try buf.print(allocator, "  cmeta[{d}]: func={d} segments={d}\n", .{ i, cm.func_idx, cm.segment_count });
+            for (cm.segments, 0..) |seg, j| {
+                try buf.print(allocator, "    seg[{d}]: nodes=[{d}..{d}] suspend={s}", .{
+                    j, seg.start_node, seg.end_node, @tagName(seg.suspend_kind),
+                });
+                if (seg.loop_back_target) |t| {
+                    try buf.print(allocator, " loop_back={d}", .{t});
+                }
+                try buf.appendSlice(allocator, "\n");
+            }
+        }
+    }
 }
 
 /// 将 IR 打印为字符串（调用方负责释放）

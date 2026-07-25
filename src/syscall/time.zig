@@ -1,8 +1,14 @@
 //! Glue Time syscall 原语（跨平台实现）
 //!
-//! 使用 std.Io.Clock（跨平台时钟）/ std.Io.Clock.Duration.sleep（跨平台 sleep）
-//! 和 std.time.epoch（纯 Zig UTC 分量计算）替代 std.c 的 POSIX 专属函数。
-//! 本地时区偏移通过 localtime_r（C 标准库，POSIX）获取；Windows 暂返回 0。
+//! syscall 最小化原则：仅保留依赖宿主能力的原语（时钟读取、sleep、时区偏移）。
+//! 纯算法（ns ↔ TimeComponents 转换、days_from_civil 等）已下沉为纯 Glue 实现，
+//! 由 src/std/time/Calendar.glue + SystemTime.glue 承载，不占用 syscall 槽位。
+//!
+//! 保留的 4 个 syscall：
+//!   - __instant_now_ns：单调时钟（CLOCK_MONOTONIC）
+//!   - __systemtime_now_ns：墙钟（CLOCK_REALTIME，Unix epoch 纳秒）
+//!   - __sleep_ns：纳秒级 sleep
+//!   - __localtime_offset_minutes：本地时区偏移（依赖 libc localtime_r / kernel32）
 //!
 //! 设计参考：docs/superpowers/specs/2026-07-19-stdlib-design.md 第 5 节
 
@@ -11,10 +17,8 @@ const builtin = @import("builtin");
 const value = @import("value");
 const Value = value.Value;
 const ThreadContext = value.obj_header.ThreadContext;
-const ErrorValue = value.ErrorValue;
-const syscall_mod = @import("mod.zig");
-const SyscallError = syscall_mod.SyscallError;
-const epoch = std.time.epoch;
+const registry = @import("registry.zig");
+const SyscallError = registry.SyscallError;
 
 // ──────────────────────────────────────────────
 // C 时间库 extern 声明（仅 localtime_r，用于本地时区偏移）
@@ -75,157 +79,8 @@ const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
 const TIME_ZONE_ID_INVALID: u32 = 0xFFFFFFFF;
 
 // ──────────────────────────────────────────────
-// 辅助：构造返回值
+// 跨平台辅助：本地时区偏移
 // ──────────────────────────────────────────────
-
-/// TimeErrorKind 枚举（与 TimeError.glue 中 ADT 变体一一对应，0-indexed）
-const TimeErrorKind = enum(u8) {
-    invalid_date_time = 0,
-    invalid_format,
-    parse_failed,
-    out_of_range,
-    timezone_not_found,
-};
-
-/// TimeError 字段数：__tag + 3 个用户字段（kind/msg/value）
-const TimeErrorFieldCount: usize = 4;
-
-/// 构造 TimeError 值（与 Glue error_newtype 布局一致，包含 __tag）
-///
-/// RC 语义：makeRecordWithNames 仅 memcpy 字段（窃取调用方引用，不主动 retain）。
-/// fromStringBytes 返回 RC=1，直接交给 record 窃取，无需额外 retain（否则泄漏）。
-fn makeTimeError(tctx: *ThreadContext, kind: TimeErrorKind, msg: []const u8, val: []const u8) SyscallError!Value {
-    var fields: [TimeErrorFieldCount]Value = .{
-        Value.fromI64(0), // fields[0] = __tag
-        Value.fromU8(@intFromEnum(kind)), // fields[1] = kind
-        try Value.fromStringBytes(tctx, msg), // fields[2] = msg（RC=1，由 record 窃取）
-        try Value.fromStringBytes(tctx, val), // fields[3] = value（RC=1，由 record 窃取）
-    };
-    const field_names: [TimeErrorFieldCount]?[]const u8 = .{ "__tag", "kind", "msg", "value" };
-    return Value.makeRecordWithNames(tctx, "TimeError", &fields, &field_names) catch {
-        // OOM：释放已分配的 msg/value Str（makeRecordWithNames 未窃取）
-        fields[2].release(tctx);
-        fields[3].release(tctx);
-        return error.OutOfMemory;
-    };
-}
-
-/// 构造 Throw.ok(value) 包装
-///
-/// RC 语义：窃取语义——makeThrow 直接 memcpy 窃取 v 的引用（RC=1）。
-/// 所有调用方均为 `return makeThrowOk(tctx, val)` 形式，不再使用 v，故无需 retain。
-fn makeThrowOk(tctx: *ThreadContext, v: Value) SyscallError!Value {
-    return Value.makeThrow(tctx, .{ .ok = v }) catch {
-        v.release(tctx); // OOM：释放 v 避免泄漏
-        return error.OutOfMemory;
-    };
-}
-
-/// 构造 Throw.err(TimeError) 包装
-///
-/// RC 语义：err_val 为窃取语义（调用方转移所有权）。提取 msg 后立即释放 err_val record；
-/// makeError 返回 RC=1 的 ErrorValue，直接交 makeThrow 窃取，无需额外 retain。
-fn makeThrowErr(tctx: *ThreadContext, err_val: Value) SyscallError!Value {
-    const err_obj = err_val.asRef();
-    // 提取 msg（借用，不改变 RC）
-    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", err_obj));
-    const msg_bytes = if (rec.fields.len > 2) switch (rec.fields[2]) {
-        .ref => |o| if (o.type_tag == .str) blk: {
-            const s: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", o));
-            break :blk s.bytes();
-        } else "",
-        else => "",
-    } else "";
-    // 构造 ErrorValue（RC=1）
-    const err_ev = Value.makeError(tctx, "time error", msg_bytes, true) catch {
-        // OOM：释放 err_val（所有权已转移）
-        value.obj_header.release(err_obj, tctx);
-        return error.OutOfMemory;
-    };
-    // err_val 所有权已转移，释放 record（触发 deinit 释放其 msg/value 字段）
-    value.obj_header.release(err_obj, tctx);
-    // makeThrow 窃取 err_ev 的 RC=1
-    const err_val_ptr: *ErrorValue = @alignCast(@fieldParentPtr("header", err_ev.asRef()));
-    return Value.makeThrow(tctx, .{ .err = err_val_ptr }) catch {
-        // OOM：释放 err_ev
-        value.obj_header.release(err_ev.asRef(), tctx);
-        return error.OutOfMemory;
-    };
-}
-
-// ──────────────────────────────────────────────
-// 跨平台辅助：UTC 分量计算（纯 Zig，替代 gmtime_r）
-// ──────────────────────────────────────────────
-
-/// TimeComponents 字段数：__tag + 9 个用户字段
-const TimeComponentsFieldCount: usize = 10;
-
-/// 构造 TimeComponents record 值（与 Glue ADT 布局一致，包含 __tag）
-fn makeTimeComponents(
-    tctx: *ThreadContext,
-    year: i32,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
-    nanos: u32,
-    weekday: u8,
-    day_of_year: u16,
-) SyscallError!Value {
-    var fields: [TimeComponentsFieldCount]Value = .{
-        Value.fromI64(0), // fields[0] = __tag
-        Value.fromI32(year), // fields[1] = year
-        Value.fromU8(month), // fields[2] = month
-        Value.fromU8(day), // fields[3] = day
-        Value.fromU8(hour), // fields[4] = hour
-        Value.fromU8(minute), // fields[5] = minute
-        Value.fromU8(second), // fields[6] = second
-        Value.fromU32(nanos), // fields[7] = nanos
-        Value.fromU8(weekday), // fields[8] = weekday
-        Value.fromU16(day_of_year), // fields[9] = day_of_year
-    };
-    const field_names: [TimeComponentsFieldCount]?[]const u8 = .{
-        "__tag", "year", "month", "day", "hour", "minute", "second", "nanos", "weekday", "day_of_year",
-    };
-    return Value.makeRecordWithNames(tctx, "TimeComponents", &fields, &field_names) catch return error.OutOfMemory;
-}
-
-/// 从 Unix epoch 秒数计算 UTC 时间分量（纯 Zig，替代 gmtime_r）
-/// 使用 std.time.epoch 模块，跨平台。
-fn epochSecondsToComponents(tctx: *ThreadContext, total_sec: u64, sub_ns: u32) SyscallError!Value {
-    const ep_secs = epoch.EpochSeconds{ .secs = total_sec };
-    const ep_day = ep_secs.getEpochDay();
-    const year_day = ep_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_secs = ep_secs.getDaySeconds();
-    // weekday: 1970-01-01 是周四（4，0=周日）
-    const weekday: u8 = @intCast(@mod(ep_day.day + 4, 7));
-    return makeTimeComponents(
-        tctx,
-        @intCast(year_day.year),
-        @intFromEnum(month_day.month) + 1, // Month 枚举 jan=0
-        @intCast(month_day.day_index + 1), // day_index 0-indexed
-        @intCast(day_secs.getHoursIntoDay()),
-        @intCast(day_secs.getMinutesIntoHour()),
-        @intCast(day_secs.getSecondsIntoMinute()),
-        sub_ns,
-        weekday,
-        @intCast(year_day.day + 1), // 0-indexed
-    );
-}
-
-/// Howard Hinnant days_from_civil 算法：年月日 → 自 1970-01-01 的天数
-/// 纯算术，跨平台，替代 timegm。
-fn daysFromCivil(year: i32, month: u32, day: u32) i64 {
-    const y: i64 = if (month <= 2) @as(i64, year) - 1 else @as(i64, year);
-    const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe: u32 = @intCast(y - era * 400); // [0, 399]
-    const m: u32 = month; // [1, 12]
-    const doy: u32 = @intCast((153 * (if (m > 2) m - 3 else m + 9) + 2) / 5 + day - 1); // [0, 365]
-    const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    return era * 146097 + @as(i64, doe) - 719468;
-}
 
 /// 获取本地时区相对 UTC 的秒偏移（跨平台）
 /// POSIX: localtime_r(&now).gmtoff
@@ -290,152 +145,75 @@ pub fn sleep_ns(io: std.Io, _: *ThreadContext, args: []const Value) SyscallError
     return Value.fromUnit();
 }
 
+/// __sleep_async(ns: i128) -> *ChannelValue
+///
+/// 异步 sleep：创建完成 channel + spawn 线程跑 sleep，
+/// 完成后 chan.trySend(unit) + wake_chan_recv_fn 唤醒等待协程。
+/// 返回 channel 指针，协程在 channel 上挂起（orbit_chan_recv）。
+///
+/// 协程不阻塞——挂起在 channel 上，worker 线程可跑其他协程。
+/// sleep 线程完成后 ioComplete + 释放资源 + 退出。
+pub fn sleep_async(io: std.Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 1) return error.InvalidArgument;
+    const ns = args[0].intCast(i128);
+    if (ns <= 0) return Value.fromUnit();
+
+    const ns_clamped: u64 = if (ns > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(ns);
+
+    // 创建完成 channel（cap=1，buffer 容纳一个 unit 值）
+    const chan = value.ChannelValue.create(tctx, 1) catch return error.OutOfMemory;
+
+    // spawn 线程跑 sleep + ioComplete
+    const args_ptr = tctx.backing.create(SleepAsyncArgs) catch return error.OutOfMemory;
+    args_ptr.* = .{
+        .io = io,
+        .chan = chan,
+        .nanos = ns_clamped,
+        .bridge = tctx.io_bridge.?,
+        .wake_fn = tctx.wake_chan_recv_fn.?,
+        .backing = tctx.backing,
+    };
+    const thread = std.Thread.spawn(.{}, sleepAsyncWorker, .{args_ptr}) catch {
+        tctx.backing.destroy(args_ptr);
+        // spawn 失败：同步 sleep 阻塞当前线程（保底，不应发生）
+        std.Io.Clock.Duration.sleep(.{ .raw = .{ .nanoseconds = ns_clamped }, .clock = .awake }, io) catch {};
+        return Value.fromUnit();
+    };
+    thread.detach();
+
+    // 返回 channel 指针（stdlib 调 recv 挂起）
+    return Value.fromRef(@ptrCast(&chan.header));
+}
+
+/// sleep_async 的 worker 线程参数
+const SleepAsyncArgs = struct {
+    io: std.Io,
+    chan: *value.ChannelValue,
+    nanos: u64,
+    bridge: *anyopaque,
+    wake_fn: *const fn (bridge: *anyopaque, chan: *anyopaque) void,
+    backing: std.mem.Allocator,
+};
+
+/// sleep_async worker 线程：sleep + trySend(unit) + wake + 释放资源。
+/// 独立线程跑，不阻塞协程的 worker 线程。
+fn sleepAsyncWorker(args: *SleepAsyncArgs) void {
+    // 跨平台 sleep
+    const dur = std.Io.Duration.fromNanoseconds(args.nanos);
+    std.Io.Clock.Duration.sleep(.{ .raw = dur, .clock = .awake }, args.io) catch {};
+
+    // sleep 完成：发 channel + 唤醒等待协程
+    _ = args.chan.trySend(Value.fromUnit());
+    args.wake_fn(args.bridge, @ptrCast(args.chan));
+
+    // 释放资源
+    args.backing.destroy(args);
+}
+
 /// __localtime_offset_minutes() -> i32
 ///
 /// 本地时区相对 UTC 的分钟偏移（北京时间 = +480）
 pub fn localtime_offset_minutes(io: std.Io, _: *ThreadContext, _: []const Value) SyscallError!Value {
     const offset_sec = getLocalOffsetSec(io);
     return Value.fromI32(@intCast(@divTrunc(offset_sec, 60)));
-}
-
-// ──────────────────────────────────────────────
-// 时间分量转换 syscall
-// ──────────────────────────────────────────────
-
-/// __systemtime_to_local_components(ns: i128) -> TimeComponents
-///
-/// 本地时间分量：UTC 分量 + 本地时区偏移（跨平台）
-pub fn systemtime_to_local_components(io: std.Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
-    if (args.len != 1) return error.InvalidArgument;
-    const ns = args[0].intCast(i128);
-    const offset_sec = getLocalOffsetSec(io);
-    // 本地时间 = UTC + offset
-    const local_ns = ns + @as(i128, offset_sec) * 1_000_000_000;
-    // std.time.epoch 仅支持 u64（1970 年后）；1970 年前的负秒数返回 epoch 0
-    if (local_ns < 0) {
-        return epochSecondsToComponents(tctx, 0, 0);
-    }
-    const total_sec: u64 = @intCast(@divFloor(local_ns, 1_000_000_000));
-    const sub_ns: u32 = @intCast(@mod(local_ns, 1_000_000_000));
-    return epochSecondsToComponents(tctx, total_sec, sub_ns);
-}
-
-/// __systemtime_to_utc_components(ns: i128) -> TimeComponents
-///
-/// UTC 时间分量（纯 Zig std.time.epoch，跨平台，替代 gmtime_r）
-pub fn systemtime_to_utc_components(io: std.Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
-    _ = io;
-    if (args.len != 1) return error.InvalidArgument;
-    const ns = args[0].intCast(i128);
-    // std.time.epoch 仅支持 u64（1970 年后）；1970 年前的负秒数返回 epoch 0
-    if (ns < 0) {
-        return epochSecondsToComponents(tctx, 0, 0);
-    }
-    const total_sec: u64 = @intCast(@divFloor(ns, 1_000_000_000));
-    const sub_ns: u32 = @intCast(@mod(ns, 1_000_000_000));
-    return epochSecondsToComponents(tctx, total_sec, sub_ns);
-}
-
-/// __components_to_ns_utc(comp: TimeComponents) -> Throw<i128, TimeError>
-///
-/// UTC 字段 → 纳秒，验证字段合法性（纯算术 daysFromCivil，跨平台，替代 timegm）
-pub fn components_to_ns_utc(io: std.Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
-    _ = io;
-    if (args.len != 1) return error.InvalidArgument;
-    const v = args[0];
-    const rec: *value.RecordValue = switch (v) {
-        .ref => |obj| if (obj.type_tag == .record) @alignCast(@fieldParentPtr("header", obj)) else {
-            const err = try makeTimeError(tctx, .invalid_format, "components_to_ns_utc: not a record", "");
-            return makeThrowErr(tctx, err);
-        },
-        else => {
-            const err = try makeTimeError(tctx, .invalid_format, "components_to_ns_utc: not a record", "");
-            return makeThrowErr(tctx, err);
-        },
-    };
-    if (rec.fields.len < TimeComponentsFieldCount) {
-        const err = try makeTimeError(tctx, .invalid_format, "components_to_ns_utc: field count mismatch", "");
-        return makeThrowErr(tctx, err);
-    }
-    // year 先读为 i64 校验范围后再 @intCast(i32)，避免越界 year 直接 panic
-    const year_raw: i64 = rec.fields[1].intCast(i64);
-    if (year_raw < std.math.minInt(i32) or year_raw > std.math.maxInt(i32)) {
-        var buf: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "year={d}", .{year_raw}) catch "year out of range";
-        const err = try makeTimeError(tctx, .out_of_range, "components_to_ns_utc: year out of range", msg);
-        return makeThrowErr(tctx, err);
-    }
-    const year: i32 = @intCast(year_raw);
-    const month: u8 = switch (rec.fields[2]) {
-        .u8 => rec.fields[2].asU8(),
-        else => 1,
-    };
-    const day: u8 = switch (rec.fields[3]) {
-        .u8 => rec.fields[3].asU8(),
-        else => 1,
-    };
-    const hour: u8 = switch (rec.fields[4]) {
-        .u8 => rec.fields[4].asU8(),
-        else => 0,
-    };
-    const minute: u8 = switch (rec.fields[5]) {
-        .u8 => rec.fields[5].asU8(),
-        else => 0,
-    };
-    const second: u8 = switch (rec.fields[6]) {
-        .u8 => rec.fields[6].asU8(),
-        else => 0,
-    };
-    const nanos: u32 = switch (rec.fields[7]) {
-        .u32 => rec.fields[7].asU32(),
-        else => 0,
-    };
-
-    // 字段合法性验证
-    if (month < 1 or month > 12) {
-        var buf: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "month={d}", .{month}) catch "month out of range";
-        const err = try makeTimeError(tctx, .invalid_date_time, "components_to_ns_utc: month out of range", msg);
-        return makeThrowErr(tctx, err);
-    }
-    if (day < 1 or day > 31) {
-        var buf: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "day={d}", .{day}) catch "day out of range";
-        const err = try makeTimeError(tctx, .invalid_date_time, "components_to_ns_utc: day out of range", msg);
-        return makeThrowErr(tctx, err);
-    }
-    // 校验 day 不超过该月实际天数（考虑闰年），避免 Feb 30 等非法日期通过验证
-    {
-        const leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
-        const max_day: u8 = switch (month) {
-            1, 3, 5, 7, 8, 10, 12 => 31,
-            4, 6, 9, 11 => 30,
-            2 => if (leap) 29 else 28,
-            else => 31, // month 已验证 1-12，不会到达
-        };
-        if (day > max_day) {
-            var buf: [64]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "year={d} month={d} day={d}", .{ year, month, day }) catch "day out of range for month";
-            const err = try makeTimeError(tctx, .invalid_date_time, "components_to_ns_utc: day out of range for month", msg);
-            return makeThrowErr(tctx, err);
-        }
-    }
-    if (hour > 23 or minute > 59 or second > 59) {
-        const err = try makeTimeError(tctx, .invalid_date_time, "components_to_ns_utc: time field out of range", "");
-        return makeThrowErr(tctx, err);
-    }
-    if (nanos >= 1_000_000_000) {
-        const err = try makeTimeError(tctx, .invalid_date_time, "components_to_ns_utc: nanos >= 1e9", "");
-        return makeThrowErr(tctx, err);
-    }
-
-    // 纯算术计算 epoch 秒（跨平台，替代 timegm）
-    const days = daysFromCivil(year, @intCast(month), @intCast(day));
-    const epoch_secs: i64 = days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
-    if (epoch_secs < 0) {
-        const err = try makeTimeError(tctx, .out_of_range, "components_to_ns_utc: before 1970", "");
-        return makeThrowErr(tctx, err);
-    }
-    const ns: i128 = @as(i128, epoch_secs) * 1_000_000_000 + @as(i128, nanos);
-    return makeThrowOk(tctx, Value.fromI128(ns));
 }

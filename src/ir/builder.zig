@@ -12,6 +12,7 @@ const std = @import("std");
 const ast = @import("ast");
 const scalar = @import("value").scalar;
 const glue_builtin = @import("glue_builtin");
+const syscall = @import("syscall");
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
@@ -42,11 +43,12 @@ pub const RouteMeta = meta_mod.RouteMeta;
 pub const RaceMeta = meta_mod.RaceMeta;
 pub const CleanupMeta = meta_mod.CleanupMeta;
 pub const OrbitMeta = meta_mod.OrbitMeta;
+pub const CoroutineMeta = meta_mod.CoroutineMeta;
 pub const LoopMeta = meta_mod.LoopMeta;
 pub const ClosureMeta = meta_mod.ClosureMeta;
 pub const PartialMeta = meta_mod.PartialMeta;
 pub const LoopKind = meta_mod.LoopKind;
-pub const SyscallId = meta_mod.SyscallId;
+pub const SyscallId = syscall.SyscallId;
 pub const SyscallMeta = meta_mod.SyscallMeta;
 pub const HaltKind = meta_mod.HaltKind;
 pub const TypeMetadata = meta_mod.TypeMetadata;
@@ -78,6 +80,7 @@ pub const BuildError = error{
     InvalidLiteral,
     UnboundVariable,
     UndefinedFunction,
+    TransformFailed,
 };
 
 /// 变量绑定
@@ -162,6 +165,8 @@ pub const IRBuilder = struct {
     race_metas: std.ArrayList(RaceMeta),
     cleanup_metas: std.ArrayList(CleanupMeta),
     orbit_metas: std.ArrayList(OrbitMeta),
+    /// 协程元数据表（async 函数状态机变换产物，Phase 6）
+    coroutine_metas: std.ArrayList(CoroutineMeta) = .empty,
     loop_metas: std.ArrayList(LoopMeta),
     closure_metas: std.ArrayList(ClosureMeta),
     /// 部分应用元数据表（partial_make 节点引用，1-indexed）
@@ -243,9 +248,6 @@ pub const IRBuilder = struct {
     type_name_to_id: std.StringHashMapUnmanaged(u16) = .empty,
     /// Alias 类型名 → target 类型名（resolveTypeMetadataRefs 使用，处理递归）
     pending_alias_targets: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Syscall 函数名（去 __ 前缀）→ SyscallId 映射
-    /// compileCallWithTypeArgs 识别 "__file_open" 等前缀函数后查此表派发
-    syscall_name_to_id: std.StringHashMapUnmanaged(SyscallId) = .empty,
     /// 当前编译的模块（build() 入口设置），用于 GADT return_type / field type_node 的 AST 回退查询
     current_module: ?ast.Module = null,
     /// 标记 sema_result 是否由 builder 内部创建（单元测试场景），build() 结束后需 deinit
@@ -287,61 +289,15 @@ pub const IRBuilder = struct {
         };
         // meta_index=0 保留为"无元数据"占位
         try builder.scalar_metas.append(arena.allocator(), .{ .kind = .unit });
-        // syscall_metas meta_index=0 同样保留为占位
+        // syscall_metas meta_index=0 同样保留为占位（syscall_id=0 对应 REGISTRY[0]，
+        // 但 meta_index=0 是哨兵，Engine 不会访问此条目）
         try builder.syscall_metas.append(arena.allocator(), .{
-            .syscall_id = .file_open,
+            .syscall_id = 0,
             .arg_count = 0,
         });
         // 注册 TypeInfo 反射类型的 field_id（0-indexed，无 __tag）
         try builder.registerTypeInfoFields();
-        // 注册所有 syscall 函数名 → SyscallId 映射
-        try builder.registerSyscalls();
         return builder;
-    }
-
-    /// 注册所有 syscall 函数名（带 __ 前缀）到 SyscallId 的映射
-    ///
-    /// compileCallWithTypeArgs 识别 "__" 前缀函数后查此表派发 syscall_call 节点。
-    /// 函数名与 SyscallId 变体名一一对应（如 "__file_open" ↔ .file_open）。
-    fn registerSyscalls(self: *IRBuilder) !void {
-        const arena_alloc = self.arena.allocator();
-        const entries = [_]struct { name: []const u8, id: SyscallId }{
-            .{ .name = "__file_open", .id = .file_open },
-            .{ .name = "__file_close", .id = .file_close },
-            .{ .name = "__file_read", .id = .file_read },
-            .{ .name = "__file_write", .id = .file_write },
-            .{ .name = "__file_seek", .id = .file_seek },
-            .{ .name = "__file_tell", .id = .file_tell },
-            .{ .name = "__file_stat", .id = .file_stat },
-            .{ .name = "__file_fstat", .id = .file_fstat },
-            .{ .name = "__file_remove", .id = .file_remove },
-            .{ .name = "__file_rename", .id = .file_rename },
-            .{ .name = "__file_chmod", .id = .file_chmod },
-            .{ .name = "__dir_create", .id = .dir_create },
-            .{ .name = "__dir_remove", .id = .dir_remove },
-            .{ .name = "__dir_list", .id = .dir_list },
-            .{ .name = "__instant_now_ns", .id = .instant_now_ns },
-            .{ .name = "__systemtime_now_ns", .id = .systemtime_now_ns },
-            .{ .name = "__sleep_ns", .id = .sleep_ns },
-            .{ .name = "__localtime_offset_minutes", .id = .localtime_offset_minutes },
-            .{ .name = "__systemtime_to_local_components", .id = .systemtime_to_local_components },
-            .{ .name = "__systemtime_to_utc_components", .id = .systemtime_to_utc_components },
-            .{ .name = "__components_to_ns_utc", .id = .components_to_ns_utc },
-            // ── Net syscall ──
-            .{ .name = "__net_resolve", .id = .net_resolve },
-            .{ .name = "__net_tcp_listen", .id = .net_tcp_listen },
-            .{ .name = "__net_tcp_accept", .id = .net_tcp_accept },
-            .{ .name = "__net_tcp_connect", .id = .net_tcp_connect },
-            .{ .name = "__net_tcp_read", .id = .net_tcp_read },
-            .{ .name = "__net_tcp_write", .id = .net_tcp_write },
-            .{ .name = "__net_tcp_close", .id = .net_tcp_close },
-            .{ .name = "__net_udp_bind", .id = .net_udp_bind },
-            .{ .name = "__net_udp_send_to", .id = .net_udp_send_to },
-            .{ .name = "__net_udp_recv_from", .id = .net_udp_recv_from },
-        };
-        for (entries) |e| {
-            try self.syscall_name_to_id.put(arena_alloc, e.name, e.id);
-        }
     }
 
     /// 注册 TypeInfo 类型的 field_id 映射（反射机制）
@@ -491,12 +447,9 @@ pub const IRBuilder = struct {
             self.owns_sema_result = false;
             self.sema_result = null;
         }
-        // syscall_name_to_id 用 arena 分配，arena_owned=true 时由 arena.deinit 统一释放；
-        // arena 所有权已转交 GlueIR 时跳过（避免 double-free）。
         if (self.arena_owned) {
             // type_metadata_entries/type_name_to_id/pending_alias_targets 用 arena 分配
             // 由 arena.deinit() 统一释放，无需单独 deinit
-            self.syscall_name_to_id.deinit(self.arena.allocator());
             self.arena.deinit();
             self.allocator.destroy(self.arena);
             self.arena_owned = false;
@@ -738,6 +691,7 @@ pub const IRBuilder = struct {
             .race_metas = try self.race_metas.toOwnedSlice(arena_alloc),
             .cleanup_metas = try self.cleanup_metas.toOwnedSlice(arena_alloc),
             .orbit_metas = try self.orbit_metas.toOwnedSlice(arena_alloc),
+            .coroutine_metas = try self.coroutine_metas.toOwnedSlice(arena_alloc),
             .loop_metas = try self.loop_metas.toOwnedSlice(arena_alloc),
             .closure_metas = try self.closure_metas.toOwnedSlice(arena_alloc),
             .partial_metas = try self.partial_metas.toOwnedSlice(arena_alloc),
@@ -972,6 +926,68 @@ pub const IRBuilder = struct {
         return @intCast(self.orbit_metas.items.len);
     }
 
+    /// 添加协程元数据，返回 1-based meta_index
+    fn addCoroutineMeta(self: *IRBuilder, meta: CoroutineMeta) !u16 {
+        try self.coroutine_metas.append(self.arena.allocator(), meta);
+        return @intCast(self.coroutine_metas.items.len);
+    }
+
+    /// 为协程的 defer/catch 块体创建独立 sync Function，回填 func_idx。
+    ///
+    /// 阶段 1b 完善：defer 块体和 catch handler 编译为独立 sync 函数，
+    /// 调度器可通过 func_idx 直接调用执行，运行时通过 captured_locals
+    /// 访问主协程帧的 slot（无需内联重复展开块体节点）。
+    ///
+    /// 独立函数共享主节点流的子范围（node_start/count 指向 block_body_*），
+    /// 无独立参数通道（通过 captured_locals slot 索引访问主帧），
+    /// 返回 unit_chan。
+    fn materializeCoroutineSyncFunctions(self: *IRBuilder, cm: *CoroutineMeta) !void {
+        const arena_alloc = self.arena.allocator();
+        const func_idx = cm.func_idx;
+
+        // defer 块体独立函数化
+        var defer_n: u32 = 0;
+        for (cm.defer_table.entries) |*entry| {
+            defer_n += 1;
+            if (entry.block_body_len == 0) continue;
+            const name = std.fmt.allocPrint(arena_alloc, "__defer_{d}_{d}", .{ func_idx, defer_n }) catch return error.OutOfMemory;
+            const ret_chan = try self.channels.alloc(.unit_chan);
+            const new_func_idx: u16 = @intCast(self.functions.items.len);
+            try self.func_table.put(name, new_func_idx);
+            try self.functions.append(arena_alloc, .{
+                .name = name,
+                .node_start = entry.block_body_start,
+                .node_count = entry.block_body_len,
+                .param_channels = &.{},
+                .return_channel = ret_chan,
+                .is_entry = false,
+                .is_async = false,
+            });
+            entry.block_func_idx = new_func_idx;
+        }
+
+        // catch handler 独立函数化
+        var catch_n: u32 = 0;
+        for (cm.catch_table.entries) |*entry| {
+            catch_n += 1;
+            if (entry.handler_body_len == 0) continue;
+            const name = std.fmt.allocPrint(arena_alloc, "__catch_{d}_{d}", .{ func_idx, catch_n }) catch return error.OutOfMemory;
+            const ret_chan = try self.channels.alloc(.unit_chan);
+            const new_func_idx: u16 = @intCast(self.functions.items.len);
+            try self.func_table.put(name, new_func_idx);
+            try self.functions.append(arena_alloc, .{
+                .name = name,
+                .node_start = entry.handler_body_start,
+                .node_count = entry.handler_body_len,
+                .param_channels = &.{},
+                .return_channel = ret_chan,
+                .is_entry = false,
+                .is_async = false,
+            });
+            entry.handler_func_idx = new_func_idx;
+        }
+    }
+
     /// 添加循环元数据，返回 1-based meta_index
     fn addLoopMeta(self: *IRBuilder, meta: LoopMeta) !u16 {
         try self.loop_metas.append(self.arena.allocator(), meta);
@@ -1036,6 +1052,26 @@ pub const IRBuilder = struct {
 
     fn scopeVar(self: *IRBuilder, name: []const u8, chan: u16, is_cell: bool, ast_expr: ?*const ast.Expr) !void {
         try self.scopeVarTyped(name, chan, is_cell, ast_expr, null);
+    }
+
+    /// 在 arena 中分配一个 .named TypeNode（用于循环变量等需要类型名推断的场景）
+    /// 返回的指针在 build() 期间有效（arena 生命周期）
+    fn makeNamedTypeNode(self: *IRBuilder, type_name: []const u8) !*ast.TypeNode {
+        const slot = try self.arena.allocator().create(ast.NodeSlot(ast.TypeNode));
+        slot.* = .{
+            .loc = .{ .line = 0, .column = 0 },
+            .node = .{ .named = .{ .name = type_name } },
+        };
+        return &slot.node;
+    }
+
+    /// 从数组类型名剥离 "[]" 后缀得到元素类型名
+    /// "DirEntry[]" → "DirEntry"，"u8[]" → "u8"；非数组类型返回 null
+    fn arrayElemTypeName(type_name: []const u8) ?[]const u8 {
+        if (std.mem.endsWith(u8, type_name, "[]")) {
+            return type_name[0 .. type_name.len - 2];
+        }
+        return null;
     }
 
     fn scopeVarTyped(self: *IRBuilder, name: []const u8, chan: u16, is_cell: bool, ast_expr: ?*const ast.Expr, type_annotation: ?*ast.TypeNode) !void {
@@ -2240,6 +2276,25 @@ pub const IRBuilder = struct {
             }
         }
 
+        // 阶段 1：async 函数状态机变换，产出 CoroutineMeta 写入 IR
+        if (self.functions.items[func_idx].is_async) {
+            const func_nodes = self.nodes.items[node_start .. node_start + node_count];
+            const smt = @import("state_machine_transform.zig");
+            var cm = smt.transformToStateMachine(
+                self.arena.allocator(),
+                func_idx,
+                func_nodes,
+                &self.functions.items[func_idx],
+                &self.channels,
+                self.cleanup_metas.items,
+                self.loop_metas.items,
+                self.route_metas.items,
+            ) catch return BuildError.TransformFailed;
+            // 阶段 1b 完善：defer/catch 块体独立函数化，回填 func_idx
+            self.materializeCoroutineSyncFunctions(&cm) catch return BuildError.TransformFailed;
+            _ = self.addCoroutineMeta(cm) catch return BuildError.TransformFailed;
+        }
+
         self.current_return_chan = null;
         self.current_returns_throw = false;
         self.current_throw_ok_chan_type = .i64_chan;
@@ -3405,8 +3460,9 @@ pub const IRBuilder = struct {
                 if (self.lookupFieldId(type_name, field)) |id| break :blk id;
             }
             if (self.lookupFieldId("", field)) |id| break :blk id;
-            // 未注册字段：fallback 用 0（运行时可能因越界失败，但保留旧行为兼容）
-            break :blk 0;
+            // 未注册字段：报编译错误（静默返回 0 会访问到 __tag，导致难以排查的 bug）
+            std.debug.print("error: field '{s}' not registered on type '{?s}'\n", .{ field, inferred_type });
+            return error.UnsupportedExpr;
         };
         const meta_idx = try self.addFieldIdMeta(field_id);
         // 优先从 sema 查询 field_access 表达式本身的 chan_type
@@ -3819,17 +3875,18 @@ pub const IRBuilder = struct {
         }
 
         // Syscall 调用：__ 前缀函数（如 __file_open/__instant_now_ns 等）
-        // 编译为 syscall_call 节点，meta_index 索引 syscall_metas 表
-        if (self.syscall_name_to_id.get(func_name)) |sid| {
+        // 编译为 syscall_call 节点，meta_index 索引 syscall_metas 表。
+        // syscall 名字→ID 查询由 syscall 模块的 registry.lookupByName 完成（inline for，运行时 0 开销）。
+        if (syscall.lookupByName(func_name)) |sid| {
             // 编译参数（最多 4 个，超出走不了 16B Node 固定布局）
             if (arguments.len > 4) return error.UnsupportedExpr;
             var arg_chans: [4]u16 = .{ 0, 0, 0, 0 };
             for (arguments, 0..) |arg, i| {
                 arg_chans[i] = try self.compileExpr(arg);
             }
-            const ret_chan_type = syscallReturnType(sid);
+            const ret_chan_type = retKindToChanType(syscall.returnKind(sid));
             const meta_idx = try self.addSyscallMeta(.{
-                .syscall_id = sid,
+                .syscall_id = @intFromEnum(sid),
                 .arg_count = @intCast(arguments.len),
                 .return_chan_type = ret_chan_type,
             });
@@ -4199,6 +4256,11 @@ pub const IRBuilder = struct {
                 if (c.callee.* == .identifier) {
                     return self.findFuncReturnTypeAst(c.callee.identifier.name);
                 }
+                // 模块限定调用：std.io.File.open(args) → callee 为 field_access 链
+                // 用 isModuleReference 解析完整路径，查 func_table 获取返回类型
+                if (self.isModuleReference(c.callee)) |mod_ref| {
+                    if (self.findFuncReturnTypeAst(mod_ref.full_path)) |rt| return rt;
+                }
                 return null;
             },
             .method_call => |mc| {
@@ -4289,13 +4351,6 @@ pub const IRBuilder = struct {
                 if (self.findFuncReturnTypeAst(func_name)) |rt| {
                     return throwOkChanType(rt);
                 }
-                // Syscall 调用：__components_to_ns_utc 返回 Throw<i128, TimeError>，Ok 类型为 i128
-                if (self.syscall_name_to_id.get(func_name)) |sid| {
-                    return switch (sid) {
-                        .components_to_ns_utc => .i128_chan,
-                        else => null,
-                    };
-                }
                 return null;
             },
             .identifier => |id| {
@@ -4370,11 +4425,9 @@ pub const IRBuilder = struct {
                 if (self.findFuncReturnTypeAst(func_name)) |rt| {
                     return throwOkTypeName(rt);
                 }
-                if (self.syscall_name_to_id.get(func_name)) |sid| {
-                    return switch (sid) {
-                        .components_to_ns_utc => "i128",
-                        else => null,
-                    };
+                // syscall（__ 前缀）：无 fun_decl，从 syscall registry 查 Ok 类型名
+                if (syscall.lookupByName(func_name)) |sid| {
+                    return syscall.okTypeName(sid);
                 }
                 return null;
             },
@@ -5564,11 +5617,21 @@ pub const IRBuilder = struct {
         const handle_chan = try self.allocChannel(.ref_chan);
         const result_type = self.channels.get(func.return_channel).chan_type;
 
+        // 从形参通道提取引用位图：第 i 位为 1 表示形参 i 为 &T / *T（引用语义）
+        var arg_ref_bits: u8 = 0;
+        for (func.param_channels, 0..) |pc, i| {
+            if (i >= 8) break;
+            if (self.channels.get(pc).is_ref) {
+                arg_ref_bits |= @as(u8, 1) << @intCast(i);
+            }
+        }
+
         const orbit_meta_idx = try self.addOrbitMeta(.{
             .func_index = func_idx,
             .arg_count = @intCast(arg_chans.len),
             .result_type = result_type,
             .is_spawn = false,
+            .arg_ref_bits = arg_ref_bits,
         });
 
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
@@ -5801,11 +5864,16 @@ pub const IRBuilder = struct {
             .assignment => |as| {
                 switch (as.target.*) {
                     .identifier => |id| {
-                        const binding = self.lookupVar(id.name) orelse return error.UnboundVariable;
-                        const value_chan = try self.compileExpr(as.value);
-                        var store_node = Node.makeUnary(.store, binding.chan, 0, value_chan);
-                        store_node._pad = if (self.isRefExpr(as.value)) 1 else 0;
-                        try self.emit(store_node);
+                        // _ = expr：丢弃表达式结果（常用于 ? 传播不需要 Ok 值时）
+                        if (std.mem.eql(u8, id.name, "_")) {
+                            _ = try self.compileExpr(as.value);
+                        } else {
+                            const binding = self.lookupVar(id.name) orelse return error.UnboundVariable;
+                            const value_chan = try self.compileExpr(as.value);
+                            var store_node = Node.makeUnary(.store, binding.chan, 0, value_chan);
+                            store_node._pad = if (self.isRefExpr(as.value)) 1 else 0;
+                            try self.emit(store_node);
+                        }
                     },
                     .field_access => |fa| {
                         // obj.field = value → record_set(obj, field_id, value)
@@ -6103,7 +6171,15 @@ pub const IRBuilder = struct {
         try self.pushScope();
         defer self.popScope();
         // 循环变量绑定到 vec_source 的元素通道
-        try self.defineVar(fs.name, src_vec_chan, false);
+        // 推断元素类型名：从 iterable 类型名剥离 "[]"（如 "DirEntry[]" → "DirEntry"）
+        // 使循环体内 `e.field` 能解析 field_id
+        var elem_type_node: ?*ast.TypeNode = null;
+        if (self.inferTypeNameFromExpr(fs.iterable)) |iter_ty| {
+            if (arrayElemTypeName(iter_ty)) |elem_ty| {
+                elem_type_node = self.makeNamedTypeNode(elem_ty) catch null;
+            }
+        }
+        try self.scopeVarTyped(fs.name, src_vec_chan, false, null, elem_type_node);
 
         // 编译循环体（结果通道由 body 子图的最后一个节点决定）
         _ = try self.compileExpr(fs.body);
@@ -6206,7 +6282,14 @@ pub const IRBuilder = struct {
         const body_start: u32 = @intCast(self.nodes.items.len);
         try self.pushScope();
         defer self.popScope();
-        try self.defineVar(fs.name, cur_chan, false);
+        // 推断元素类型名（与 compileFor 一致）
+        var elem_type_node: ?*ast.TypeNode = null;
+        if (self.inferTypeNameFromExpr(fs.iterable)) |iter_ty| {
+            if (arrayElemTypeName(iter_ty)) |elem_ty| {
+                elem_type_node = self.makeNamedTypeNode(elem_ty) catch null;
+            }
+        }
+        try self.scopeVarTyped(fs.name, cur_chan, false, null, elem_type_node);
 
         const saved_tail = self.in_tail_position;
         self.in_tail_position = false;
@@ -6837,7 +6920,14 @@ pub const IRBuilder = struct {
         defer self.popScope();
         // 循环变量绑定到向量元素通道（engine 执行时 pin 到当前元素）
         const iter_chan = try self.allocChannel(elem_type);
-        try self.defineVar(fs.name, iter_chan, false);
+        // 推断元素类型名（与 compileFor 一致，使循环体内字段访问可解析 field_id）
+        var elem_type_node: ?*ast.TypeNode = null;
+        if (self.inferTypeNameFromExpr(fs.iterable)) |iter_ty| {
+            if (arrayElemTypeName(iter_ty)) |elem_ty| {
+                elem_type_node = self.makeNamedTypeNode(elem_ty) catch null;
+            }
+        }
+        try self.scopeVarTyped(fs.name, iter_chan, false, null, elem_type_node);
         _ = try self.compileExpr(fs.body);
         const body_len: u32 = @intCast(self.nodes.items.len - body_start);
 
@@ -7580,6 +7670,8 @@ pub const IRBuilder = struct {
                 if (self.lookupFieldId(type_name, field)) |id| break :blk id;
             }
             if (self.lookupFieldId("", field)) |id| break :blk id;
+            // 未注册字段：回退 0（safe_access 场景，报错会破坏 ?. 链）
+            // TODO: 这里静默回退 0 会访问 __tag，但 safe_access 路径较难报错
             break :blk 0;
         };
         const meta_idx = self.addFieldIdMeta(field_id) catch return obj_chan;
@@ -7633,11 +7725,17 @@ pub const IRBuilder = struct {
         // 回退 3：变量绑定的类型标注（如 self: Path, dt: DateTime）。
         // sema 在 stdlib 模块方法中可能未记录 type_name，但从参数/变量的
         // type_annotation 可获取类型名，用于用户自定义方法分派。
+        // 对 &T / *T（ref_type / raw_ptr）递归到 inner 获取类型名。
         if (expr.* == .identifier) {
             if (self.lookupVar(expr.identifier.name)) |binding| {
                 if (binding.type_annotation) |tn| {
-                    if (tn.* == .named) {
-                        return tn.named.name;
+                    const effective_tn = switch (tn.*) {
+                        .ref_type => tn.ref_type.inner,
+                        .raw_ptr => tn.raw_ptr.inner,
+                        else => tn,
+                    };
+                    if (effective_tn.* == .named) {
+                        return effective_tn.named.name;
                     }
                 }
                 // 无类型标注时，从初始化表达式递归推断
@@ -7711,6 +7809,12 @@ pub const IRBuilder = struct {
                         }
                     }
                 }
+            },
+            // ? 传播表达式：expr? 的结果类型 = expr 的 Throw Ok 类型
+            // 如 val s = File.stat_of(path).await()? → s 的类型是 Stat
+            // inferThrowOkTypeName 已处理 await/method_call/call/identifier 等路径
+            .propagate => |p| {
+                return self.inferThrowOkTypeName(p.expr);
             },
             else => {},
         }
@@ -7986,9 +8090,20 @@ pub const IRBuilder = struct {
                     try self.channels.allocNullable(ret_meta.inner_type)
                 else
                     try self.allocChannel(ret_meta.chan_type);
+                // 从形参通道提取引用位图
+                var arg_ref_bits: u16 = 0;
+                for (func.param_channels, 0..) |pc, i| {
+                    if (i >= 16) break;
+                    if (self.channels.get(pc).is_ref) {
+                        arg_ref_bits |= @as(u16, 1) << @intCast(i);
+                    }
+                }
+                const ret_is_ref = self.channels.get(func.return_channel).is_ref;
                 const call_meta_idx = try self.addCallMeta(.{
                     .func_index = func_idx,
                     .arg_count = @intCast(arg_chans.len),
+                    .arg_ref_bits = arg_ref_bits,
+                    .ret_is_ref = ret_is_ref,
                 });
                 var inputs: [4]u16 = .{ 0, 0, 0, 0 };
                 for (arg_chans, 0..) |ch, i| {
@@ -8297,9 +8412,21 @@ pub const IRBuilder = struct {
             try self.channels.allocNullable(ret_meta.inner_type)
         else
             try self.allocChannel(ret_meta.chan_type);
+        // 从形参通道提取引用位图（self + 显式参数）
+        var arg_ref_bits: u16 = 0;
+        for (func.param_channels, 0..) |pc, i| {
+            if (i >= 16) break;
+            if (self.channels.get(pc).is_ref) {
+                arg_ref_bits |= @as(u16, 1) << @intCast(i);
+            }
+        }
+        // 返回值引用标记
+        const ret_is_ref = self.channels.get(func.return_channel).is_ref;
         const call_meta_idx = try self.addCallMeta(.{
             .func_index = func_idx,
             .arg_count = @intCast(arg_chans.len),
+            .arg_ref_bits = arg_ref_bits,
+            .ret_is_ref = ret_is_ref,
         });
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
         for (arg_chans, 0..) |ch, i| {
@@ -9473,55 +9600,16 @@ fn typeNameFromTypeNode(
     };
 }
 
-/// 根据 SyscallId 推导返回值通道类型
+/// SyscallRetKind → ChanType 转换（ir 层独有，将 syscall 模块的返回类型分类映射到 IR 通道类型）
 ///
-/// 时间 syscall 多返回 i128（纳秒）；IO/路径/数组 syscall 多返回 ref（堆对象）；
-/// 少数返回 bool/i32。需与 src/syscall/*.zig 中实际返回类型保持一致。
-fn syscallReturnType(sid: SyscallId) ChanType {
-    return switch (sid) {
-        // 时间 syscall：返回 i128（纳秒）
-        .instant_now_ns,
-        .systemtime_now_ns,
-        => .i128_chan,
-
-        // components_to_ns_utc 返回 Throw<i128, TimeError>（堆对象，非裸 i128）
-        .components_to_ns_utc => .ref_chan,
-
-        // 时区偏移：返回 i32（分钟）
-        .localtime_offset_minutes => .i32_chan,
-
-        // sleep：无返回值（unit）
-        .sleep_ns => .unit_chan,
-
-        // 时间组件 record / File / Dir / Stat / str / array：堆对象
-        .systemtime_to_local_components,
-        .systemtime_to_utc_components,
-        .file_open,
-        .file_close,
-        .file_read,
-        .file_write,
-        .file_seek,
-        .file_tell,
-        .file_stat,
-        .file_fstat,
-        .file_remove,
-        .file_rename,
-        .file_chmod,
-        .dir_create,
-        .dir_remove,
-        .dir_list,
-        // Net syscall：全部返回 Throw<..., IOError>（堆对象）
-        .net_resolve,
-        .net_tcp_listen,
-        .net_tcp_accept,
-        .net_tcp_connect,
-        .net_tcp_read,
-        .net_tcp_write,
-        .net_tcp_close,
-        .net_udp_bind,
-        .net_udp_send_to,
-        .net_udp_recv_from,
-        => .ref_chan,
+/// 这是从 syscall.SyscallRetKind 到 ir.ChanType 的唯一适配点。
+/// syscall 模块不依赖 ir（不知道 ChanType），故此转换在 ir 层完成。
+fn retKindToChanType(kind: syscall.SyscallRetKind) ChanType {
+    return switch (kind) {
+        .ref => .ref_chan,
+        .i128 => .i128_chan,
+        .i32 => .i32_chan,
+        .unit => .unit_chan,
     };
 }
 

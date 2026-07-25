@@ -243,6 +243,10 @@ pub const OrbitMeta = struct {
     result_type: channel_mod.ChanType = .i64_chan,
     /// 是否为 spawn（fire-and-forget，无 join）
     is_spawn: bool = false,
+    /// 参数引用位图：第 i 位为 1 表示第 i 个参数为 &T / *T（引用语义，跳过深拷贝）。
+    /// 从 Function.param_channels 的 ChannelMeta.is_ref 提取。
+    /// 最多支持 8 个参数（与 CallMeta.arg_ref_bits 对齐）。
+    arg_ref_bits: u8 = 0,
 };
 
 /// 循环元数据：描述标量循环（含 break/continue 的 for/while/loop）
@@ -272,6 +276,153 @@ pub const LoopKind = enum(u2) {
     loop, // 无限循环（仅 break 退出）
     while_loop, // while 循环（条件为 false 退出）
     for_loop, // for 循环（遍历完退出）
+};
+
+// ════════════════════════════════════════════════════════════════
+// Phase 6: 协程元数据（图驱动调度）
+// ════════════════════════════════════════════════════════════════
+
+/// 协程挂起类型：决定段末 orbit 节点的恢复条件
+pub const SuspendKind = enum(u3) {
+    /// 非挂起段（段内无 orbit 挂起节点，顺序执行到下一段）
+    none,
+    /// orbit_chan_recv：channel 空时挂起，等待 channel 可读
+    chan_recv,
+    /// orbit_chan_send：channel 满时挂起，等待 channel 可写
+    chan_send,
+    /// orbit_async_join：await 未完成时挂起，等待 async handle 完成
+    async_join,
+    /// 终态段：状态机执行完毕，写结果到 AsyncHandle
+    terminal,
+};
+
+/// 状态机段描述：async 函数体切分后的一个可独立执行的 IR 节点子序列
+pub const SegmentDesc = struct {
+    /// 段起始节点索引（全局节点流中的位置）
+    start_node: u32,
+    /// 段结束节点索引（含挂起节点本身）
+    end_node: u32,
+    /// 段末挂起类型（决定恢复条件）
+    suspend_kind: SuspendKind = .none,
+    /// 进入该段时的 defer 栈深度（用于 defer 跨挂起点保留）
+    defer_depth_on_entry: u16 = 0,
+    /// 该段是否为循环回边目标（指向循环头段索引），null 表示非回边
+    loop_back_target: ?u16 = null,
+};
+
+/// 帧内局部值槽描述
+pub const SlotDesc = struct {
+    /// 槽在 locals 区的字节偏移
+    offset: u32,
+    /// 槽的字节大小
+    size: u16,
+    /// 槽是否为引用类型（标量内联 vs 引用存指针）
+    is_ref: bool = false,
+};
+
+/// 帧内连续区域描述（locals 区的子区域）
+pub const SlotRegion = struct {
+    /// 起始偏移
+    start: u32,
+    /// 区域字节大小
+    size: u32,
+};
+
+/// 协程帧布局：描述 locals 区的字节布局
+pub const FrameLayout = struct {
+    /// locals 区总字节大小
+    total_size: u32,
+    /// 参数区（locals 区首段，参数无上限）
+    param_region: SlotRegion,
+    /// 局部变量区
+    local_region: SlotRegion,
+    /// 临时值区（段内活跃，段切换时可回收）
+    temp_region: SlotRegion,
+    /// 每个局部值槽的描述
+    slots: []SlotDesc = &.{},
+};
+
+/// defer 项描述：async 函数内的 defer 块编译为独立 sync 函数
+pub const DeferEntry = struct {
+    /// defer 注册点的节点索引
+    register_node: u32,
+    /// defer 块体编译为独立 sync 函数的索引（0 = 尚未函数化，由 builder 后处理回填）
+    block_func_idx: u16,
+    /// 该 defer 捕获的局部值 slot 索引列表
+    captured_locals: []const u16 = &.{},
+    /// 触发条件：return/throw/panic/any，运行时按 halt 种类选择性执行 defer
+    trigger: HaltKind = .any_halt,
+    /// defer 块体在主节点流中的起始索引（独立函数化用）
+    block_body_start: u32 = 0,
+    /// defer 块体节点数量
+    block_body_len: u32 = 0,
+    /// 注册顺序（LIFO 执行，小序号后执行）
+    order: u32 = 0,
+};
+
+/// defer 执行表：async 函数所有 defer 项的集合
+pub const DeferTable = struct {
+    entries: []DeferEntry = &.{},
+};
+
+/// catch 项描述：async 函数内的 catch 块编译为独立 sync 函数
+pub const CatchEntry = struct {
+    /// 保护的节点范围 [start, end]
+    protected_start: u32,
+    protected_end: u32,
+    /// catch 块体编译为独立 sync 函数的索引（0 = 尚未函数化，由 builder 后处理回填）
+    handler_func_idx: u16,
+    /// 异常值存入的 slot 索引（route_dispatch arm0 输出通道在帧中的 slot）
+    exception_slot: u16,
+    /// catch 完成后跳转的段索引（arm0 body 结束后的下一个段）
+    resume_segment: u16,
+    /// catch handler 块体在主节点流中的起始索引（独立函数化用）
+    handler_body_start: u32 = 0,
+    /// catch handler 块体节点数量
+    handler_body_len: u32 = 0,
+};
+
+/// 异常捕获表：async 函数所有 catch 项的集合
+pub const CatchTable = struct {
+    entries: []CatchEntry = &.{},
+};
+
+/// 循环项描述：async 函数内的循环结构映射到状态机段跳转
+pub const LoopEntry = struct {
+    /// 循环头段索引
+    head_segment: u16,
+    /// 循环体段索引列表
+    body_segments: []const u16 = &.{},
+    /// break 后跳转的段索引
+    after_segment: u16,
+    /// 嵌套层级（0 为最外层）
+    nesting_level: u8,
+};
+
+/// 循环回边表：async 函数所有循环结构的集合
+pub const LoopTable = struct {
+    entries: []LoopEntry = &.{},
+};
+
+/// 协程元数据：async 函数状态机变换的完整产物
+///
+/// 编译期由 sema 的 transformToStateMachine pass 生成，写入 IR meta 段。
+/// 运行时由协程调度器读取，驱动状态机段执行。
+pub const CoroutineMeta = struct {
+    /// async 函数索引（functions 表中的索引）
+    func_idx: u16,
+    /// 状态段数
+    segment_count: u16,
+    /// 段描述列表
+    segments: []SegmentDesc = &.{},
+    /// 帧布局（局部值偏移表）
+    frame_layout: FrameLayout,
+    /// defer 执行表
+    defer_table: DeferTable = .{},
+    /// 异常捕获表
+    catch_table: CatchTable = .{},
+    /// 循环回边表
+    loop_table: LoopTable = .{},
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -508,54 +659,18 @@ pub const TypeMetadataTable = struct {
 // Phase 6: Syscall 元数据（IO/Time 等宿主 syscall 包装）
 // ════════════════════════════════════════════════════════════════
 
-/// Syscall ID（meta_index 索引到 syscall 分派表）
-///
-/// 分两组：
-/// - IO syscall：文件/目录操作（path 操作已下放到 Glue stdlib）
-/// - Time syscall：时间戳、睡眠、日期分量转换
-pub const SyscallId = enum(u16) {
-    // IO syscall
-    file_open,
-    file_close,
-    file_read,
-    file_write,
-    file_seek,
-    file_tell,
-    file_stat,
-    file_fstat,
-    file_remove,
-    file_rename,
-    file_chmod,
-    dir_create,
-    dir_remove,
-    dir_list,
-    // Time syscall
-    instant_now_ns,
-    systemtime_now_ns,
-    sleep_ns,
-    localtime_offset_minutes,
-    systemtime_to_local_components,
-    systemtime_to_utc_components,
-    components_to_ns_utc,
-    // ── Net syscall ──
-    net_resolve,
-    net_tcp_listen,
-    net_tcp_accept,
-    net_tcp_connect,
-    net_tcp_read,
-    net_tcp_write,
-    net_tcp_close,
-    net_udp_bind,
-    net_udp_send_to,
-    net_udp_recv_from,
-};
-
 /// Syscall 元数据
 ///
 /// syscall_call 节点的 meta_index（1-indexed）索引到 syscall_metas 表，
-/// 由 SyscallId 派发到对应实现函数。return_chan_type 用于 IR 通道分配。
+/// 由 syscall_id（u16，对应 syscall 模块的 SyscallId enum 值）派发到实现。
+/// return_chan_type 用于 IR 通道分配。
+///
+/// 注意：SyscallId enum 定义在 src/syscall/registry.zig，IR 层不引用该类型，
+/// 仅存储其 u16 整数值，实现 IR ↔ 宿主能力解耦。
+/// 新增 syscall 只需改 src/syscall/registry.zig 一处，无需修改 IR 层。
 pub const SyscallMeta = struct {
-    syscall_id: SyscallId,
+    /// Syscall ID（@intFromEnum(syscall.SyscallId)，对应 REGISTRY 数组索引）
+    syscall_id: u16,
     arg_count: u8,
     /// 返回值通道类型（用于 IR 通道分配）
     return_chan_type: channel_mod.ChanType = .ref_chan,

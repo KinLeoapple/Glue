@@ -156,7 +156,18 @@ pub fn build(b: *std.Build) void {
     kind_check_module.addImport("type_check", type_check_module);
     gadt_check_module.addImport("type_check", type_check_module);
 
+    // ---- Syscall 原语模块（IO/Time 等宿主 syscall 包装）----
+    // 不依赖 ir（SyscallId/REGISTRY 自包含），仅依赖 value（Value/ThreadContext）。
+    // ir 模块依赖本模块的 lookupByName/returnKind/okTypeName 进行编译期查询。
+    const syscall_module = b.createModule(.{
+        .root_source_file = b.path("src/syscall/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    syscall_module.addImport("value", value_module);
+
     // ---- Glue IR 模块（新架构：共享内存图） ----
+    // 依赖 syscall（SyscallId/lookupByName/returnKind/okTypeName 编译期查询）。
     const ir_module = b.createModule(.{
         .root_source_file = b.path("src/ir/mod.zig"),
         .target = target,
@@ -166,16 +177,7 @@ pub fn build(b: *std.Build) void {
     ir_module.addImport("value", value_module);
     ir_module.addImport("analysis_db", analysis_db_module);
     ir_module.addImport("glue_builtin", builtin_module);
-
-    // ---- Syscall 原语模块（IO/Time 等宿主 syscall 包装）----
-    // 依赖 ir（SyscallId 元数据）与 value（构造 Value/ThrowValue）
-    const syscall_module = b.createModule(.{
-        .root_source_file = b.path("src/syscall/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    syscall_module.addImport("ir", ir_module);
-    syscall_module.addImport("value", value_module);
+    ir_module.addImport("syscall", syscall_module);
 
     // ---- sema 模块接入 IR 管线：type_check 及子检查器可读取 SemaResult 契约 ----
     // 依赖方向：sema → ir → (ast, value)，ir 不依赖 sema，无循环。
@@ -198,6 +200,19 @@ pub fn build(b: *std.Build) void {
     engine_module.addImport("value", value_module);
     engine_module.addImport("syscall", syscall_module);
     engine_module.addImport("profiling", profiler_module);
+
+    // ---- 协程调度模块（图驱动协程调度）----
+    // 依赖 ir（CoroutineMeta 等）、value（ObjHeader/Value）、mem（ThreadContext）
+    const coroutine_module = b.createModule(.{
+        .root_source_file = b.path("src/coroutine/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    coroutine_module.addImport("ir", ir_module);
+    coroutine_module.addImport("value", value_module);
+    coroutine_module.addImport("mem", mem_module);
+    coroutine_module.addImport("profiling", profiler_module);
+    engine_module.addImport("coroutine", coroutine_module);
 
     // ---- 根模块：聚合所有依赖，产出可执行文件 ----
     const root_module = b.createModule(.{
@@ -308,7 +323,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_value_unit_tests = b.addRunArtifact(value_unit_tests);
 
-    // Glue IR 模块测试（需导入 ast 和 value）
+    // Syscall 模块测试（仅依赖 value，不依赖 ir）
+    const syscall_module_test = b.createModule(.{
+        .root_source_file = b.path("src/syscall/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    syscall_module_test.addImport("value", value_module);
+    const syscall_unit_tests = b.addTest(.{
+        .root_module = syscall_module_test,
+    });
+    const run_syscall_unit_tests = b.addRunArtifact(syscall_unit_tests);
+
+    // Glue IR 模块测试（需导入 ast、value 和 syscall）
     const ir_module_test = b.createModule(.{
         .root_source_file = b.path("src/ir/mod.zig"),
         .target = target,
@@ -318,23 +345,11 @@ pub fn build(b: *std.Build) void {
     ir_module_test.addImport("value", value_module);
     ir_module_test.addImport("analysis_db", analysis_db_module);
     ir_module_test.addImport("glue_builtin", builtin_module);
+    ir_module_test.addImport("syscall", syscall_module);
     const ir_unit_tests = b.addTest(.{
         .root_module = ir_module_test,
     });
     const run_ir_unit_tests = b.addRunArtifact(ir_unit_tests);
-
-    // Syscall 模块测试（需导入 ir、value）
-    const syscall_module_test = b.createModule(.{
-        .root_source_file = b.path("src/syscall/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    syscall_module_test.addImport("ir", ir_module_test);
-    syscall_module_test.addImport("value", value_module);
-    const syscall_unit_tests = b.addTest(.{
-        .root_module = syscall_module_test,
-    });
-    const run_syscall_unit_tests = b.addRunArtifact(syscall_unit_tests);
 
     // 执行引擎测试（需导入 ir、mem、ast、lexer、parser、value、syscall、sema）
     // 注意：此处使用 ir_module（非 ir_module_test）与 syscall_module（非 syscall_module_test），
@@ -354,6 +369,23 @@ pub fn build(b: *std.Build) void {
     engine_module_test.addImport("syscall", syscall_module);
     engine_module_test.addImport("sema", type_check_module);
     engine_module_test.addImport("profiling", profiler_module);
+    engine_module_test.addImport("coroutine", coroutine_module);
+
+    // 协程调度模块测试（需导入 ir、value、mem；用生产版与 ir 依赖链一致）
+    const coroutine_module_test = b.createModule(.{
+        .root_source_file = b.path("src/coroutine/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    coroutine_module_test.addImport("ir", ir_module);
+    coroutine_module_test.addImport("value", value_module);
+    coroutine_module_test.addImport("mem", mem_module);
+    coroutine_module_test.addImport("profiling", profiler_module);
+    const coroutine_unit_tests = b.addTest(.{
+        .root_module = coroutine_module_test,
+    });
+    const run_coroutine_unit_tests = b.addRunArtifact(coroutine_unit_tests);
+
     const engine_unit_tests = b.addTest(.{
         .root_module = engine_module_test,
     });
@@ -393,5 +425,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_builtin_unit_tests.step);
     test_step.dependOn(&run_syscall_unit_tests.step);
     test_step.dependOn(&run_std_embed_unit_tests.step);
+    test_step.dependOn(&run_coroutine_unit_tests.step);
     for (mem_test_runs) |run| test_step.dependOn(&run.step);
 }

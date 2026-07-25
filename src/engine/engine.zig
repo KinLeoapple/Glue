@@ -20,6 +20,7 @@ const value = @import("value");
 const profiling = @import("profiling");
 const runtime_mod = @import("runtime.zig");
 const syscall_dispatch = @import("syscall");
+const coroutine = @import("coroutine");
 
 const GlueIR = ir_mod.GlueIR;
 const Node = ir_mod.Node;
@@ -38,7 +39,7 @@ const TypeKind = ir_mod.meta_mod.TypeKind;
 
 const debug_route_dispatch = false;
 const debug_record = false;
-const debug_orbit = false;
+const debug_orbit = true;
 const ThreadContext = mem.ThreadContext;
 const GlobalPool = mem.GlobalPool;
 
@@ -68,6 +69,7 @@ pub const EngineError = error{
     LoopContinue,
     InvalidUtf8,
     IoNotInitialized,
+    SchedulerNotStarted,
 };
 
 /// 函数调用栈帧
@@ -321,6 +323,16 @@ pub const Engine = struct {
     /// 堆对象跟踪表（引擎创建的所有堆对象，deinit 时统一释放）
     /// 去重通过 ObjHeader.flags 的 TRACKED 位完成，无需 HashMap
     tracked_objs: std.ArrayList(*value.obj_header.ObjHeader) = .empty,
+    /// 标记为 orbit worker 线程的 Engine。
+    /// trackObj 时对对象设置 WORKER_ALLOCATED 标志，
+    /// 主线程在 join 后据此识别并迁移通过 &T 引用存入主线程对象的 worker 堆值。
+    is_worker: bool = false,
+
+    /// 协程调度器（M:N 协程调度，由 run() 惰性启动）。
+    /// 由 startScheduler() 创建并启动（run() 首次调用时自动调用）。所有 async 调用走 M:N 协程调度。
+    scheduler: ?*coroutine.Scheduler = null,
+    /// 调度器是否由本 Engine 拥有（deinit 时释放）。外部注入时为 false。
+    owns_scheduler: bool = false,
 
     /// 初始化引擎（使用外部 ThreadContext）
     pub fn init(ir: *GlueIR, tctx: *ThreadContext) !Engine {
@@ -393,8 +405,13 @@ pub const Engine = struct {
             .tco_cache = tco_cache,
             .body_cache = body_cache,
             .func_body_cache = func_body_cache,
+            // io 保持 null：print/scan 在无 io 时静默跳过（测试默认行为）。
+            // startScheduler 从 global.io 获取 io（GlobalPool 持有 fiber-aware 同步原语）。
         };
         engine.runtime.frame_stack = frame_stack;
+        // 注意：不在此处启动协程调度器。initOwned 返回值类型 Engine，
+        // 此处 self 指向栈帧，函数返回后失效；worker 线程持有的 ctx 会悬垂。
+        // 协程调度器由 run() 首次调用时惰性启动（此时 self 已落在调用方稳定存储）。
         return engine;
     }
 
@@ -520,17 +537,220 @@ pub const Engine = struct {
                 backing.destroy(g);
             }
         }
+        // 释放协程调度器（若由本 Engine 拥有）
+        if (self.owns_scheduler) {
+            if (self.scheduler) |sched| {
+                sched.deinit();
+                // 先调用 deinit 释放 free list 中的帧内存，再销毁对象本身
+                sched.frame_pool.deinit();
+                backing.destroy(sched.frame_pool);
+                backing.destroy(sched.suspend_registry);
+                backing.destroy(sched);
+            }
+            // 释放 IoBridge（由 startScheduler 创建，主 Engine 拥有）
+            if (self.tctx) |tctx| {
+                if (tctx.io_bridge) |bridge_opaque| {
+                    const bridge: *coroutine.bridge.IoBridge = @ptrCast(@alignCast(bridge_opaque));
+                    backing.destroy(bridge);
+                    tctx.io_bridge = null;
+                }
+            }
+        }
+    }
+
+    /// 启动协程调度器：创建 Scheduler + FramePool + SuspendRegistry，
+    /// 注入 CoroutineMeta 表 + IR 节点流 + SegmentContext（vtable 回调委托 Engine）。
+    ///
+    /// 由 run() 首次调用时惰性启动（此时 self 已落在调用方稳定存储，
+    /// worker 线程持有的 ctx 不会悬垂）。使协程调度成为所有 async 函数的唯一执行路径。
+    /// 重复调用幂等，返回已存在的 scheduler。
+    ///
+    /// worker_count 默认 = CPU 核数；io 必须非 null。
+    pub fn startScheduler(self: *Engine, worker_count: usize) !void {
+        if (self.scheduler != null) return; // 已启动
+        // io 从 GlobalPool 获取（GlobalPool 持有 fiber-aware 同步原语）
+        const io = self.global.?.io;
+        const backing = self.tctx.?.backing;
+
+        // 创建 FramePool + SuspendRegistry（Scheduler 持有引用，需独立分配）
+        const frame_pool = try backing.create(coroutine.FramePool);
+        frame_pool.* = coroutine.FramePool.init(backing, io);
+        const suspend_registry = try backing.create(coroutine.SuspendRegistry);
+        suspend_registry.* = coroutine.SuspendRegistry.init(io, backing);
+
+        // 创建 Scheduler
+        const sched = try backing.create(coroutine.Scheduler);
+        sched.* = coroutine.Scheduler.init(backing, io, frame_pool, suspend_registry);
+
+        // 注入 CoroutineMeta 表 + IR 节点流
+        sched.setCoroutineIR(self.ir.coroutine_metas, self.ir.nodes);
+
+        // 注入 EngineContext 工厂（每个 worker 线程据此创建独立 Engine 实例）
+        sched.setEngineContext(self.createEngineContext());
+
+        // 创建 IoBridge 并设置主 Engine 的 tctx 回调（syscall 异步变体通过此回调唤醒协程）
+        const bridge = try backing.create(coroutine.bridge.IoBridge);
+        bridge.* = coroutine.bridge.IoBridge.init(io, suspend_registry, backing);
+        self.tctx.?.io_bridge = @ptrCast(bridge);
+        self.tctx.?.wake_chan_recv_fn = wakeChanRecvAdapter;
+
+        // 启动 worker 线程
+        try sched.startWorkers(worker_count);
+
+        self.scheduler = sched;
+        self.owns_scheduler = true;
+    }
+
+    /// wake_chan_recv_fn 适配器：将 anyopaque 参数转回 IoBridge + ChannelValue 调用 ioComplete
+    fn wakeChanRecvAdapter(bridge_opaque: *anyopaque, chan_opaque: *anyopaque) void {
+        const bridge: *coroutine.bridge.IoBridge = @ptrCast(@alignCast(bridge_opaque));
+        const chan: *value.ChannelValue = @ptrCast(@alignCast(chan_opaque));
+        bridge.registry.wakeChanRecv(chan);
+    }
+
+    /// 构造 SegmentContext vtable：5 个回调函数委托 Engine 的现有方法。
+    /// exec_node 委托 execNode（非 orbit 节点执行），
+    /// read_channel/read_async_handle/read_value/write_value 委托对应访问器。
+    fn buildSegmentContext(self: *Engine) coroutine.state_machine.SegmentContext {
+        return .{
+            .ctx = @ptrCast(self),
+            .exec_node = segmentExecNode,
+            .read_channel = segmentReadChannel,
+            .read_async_handle = segmentReadAsyncHandle,
+            .read_value = segmentReadValue,
+            .write_value = segmentWriteValue,
+            .install_frame = segmentInstallFrame,
+        };
+    }
+
+    /// 构造 EngineContext 工厂接口：由 Scheduler 持有，每个 worker 线程启动时
+    /// 调用 create_engine 创建独立 Engine 实例（独立 tctx/runtime/call_stack），
+    /// 共享主 Engine 的只读 IR 与 GlobalPool。
+    fn createEngineContext(self: *Engine) coroutine.EngineContext {
+        return .{
+            .ctx = @ptrCast(self),
+            .create_engine = createWorkerEngine,
+            .destroy_engine = destroyWorkerEngine,
+            .build_segment_context = buildWorkerSegmentContext,
+        };
+    }
+
+    /// EngineContext.create_engine 回调：创建 worker-local Engine 实例。
+    /// 共享主 Engine 的 ir 与 global，独立分配 tctx/call_stack/caches。
+    fn createWorkerEngine(ctx: *anyopaque) anyerror!*anyopaque {
+        const main: *Engine = @ptrCast(@alignCast(ctx));
+        const backing = main.tctx.?.backing;
+        const global = main.global.?;
+
+        // 创建 worker-local ThreadContext（共享 GlobalPool，线程本地 pools/channels/arena）
+        const worker_tctx = try backing.create(ThreadContext);
+        worker_tctx.* = try ThreadContext.init(global, backing, null);
+
+        // 创建 worker-local Engine（Engine.init 设 owns_tctx=false，手动修正为 true）
+        const worker_engine = try backing.create(Engine);
+        worker_engine.* = try Engine.init(main.ir, worker_tctx);
+        worker_engine.owns_tctx = true; // worker Engine 拥有其 tctx，deinit 时释放
+        worker_engine.is_worker = true;
+        // worker Engine 的 io 保持 null：段执行中不应直接做 I/O，
+        // 所有 I/O 通过 channel/AsyncHandle 与主线程桥接
+
+        // 初始化 chan_widths 和全局通道（协程帧的本地通道通过 installFrameChannels 安装，
+        // 但 chan_widths 需要覆盖所有通道，包括全局通道的宽度元信息）
+        try worker_engine.runtime.layoutGlobals(&main.ir.channels);
+
+        // 共享主 Engine 的 IoBridge 回调（syscall 异步变体通过此回调唤醒协程）
+        worker_tctx.io_bridge = main.tctx.?.io_bridge;
+        worker_tctx.wake_chan_recv_fn = main.tctx.?.wake_chan_recv_fn;
+
+        return @ptrCast(worker_engine);
+    }
+
+    /// EngineContext.destroy_engine 回调：销毁 worker-local Engine 实例。
+    fn destroyWorkerEngine(engine: *anyopaque) void {
+        const self: *Engine = @ptrCast(@alignCast(engine));
+        const backing = self.tctx.?.backing;
+        self.deinit(); // 释放 caches/call_stack/tctx（owns_tctx=true）
+        backing.destroy(self);
+    }
+
+    /// EngineContext.build_segment_context 回调：为 worker-local Engine 构造 SegmentContext。
+    fn buildWorkerSegmentContext(engine: *anyopaque) coroutine.state_machine.SegmentContext {
+        const self: *Engine = @ptrCast(@alignCast(engine));
+        return self.buildSegmentContext();
+    }
+
+    /// SegmentContext.exec_node 回调：委托 Engine.execNode（执行非 orbit 节点）
+    fn segmentExecNode(ctx: *anyopaque, node: *const Node) coroutine.state_machine.SegmentError!?u16 {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        return self.execNode(node) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Overflow => error.Overflow,
+            error.TooManyPools => error.TooManyPools,
+            error.AllocFailed => error.AllocFailed,
+            error.DivisionByZero => error.DivisionByZero,
+            error.CastOverflow => error.CastOverflow,
+            error.UnsupportedOp => error.UnsupportedOp,
+            error.Thrown => error.Thrown,
+            error.Panic => error.Panic,
+            error.InvalidMetaIndex => error.InvalidMetaIndex,
+            error.InvalidChannel => error.InvalidChannel,
+            error.CallDepthExceeded => error.CallDepthExceeded,
+            error.LoopBreak => error.LoopBreak,
+            error.LoopContinue => error.LoopContinue,
+            error.InvalidUtf8 => error.InvalidUtf8,
+            error.IoNotInitialized => error.IoNotInitialized,
+            error.SchedulerNotStarted => error.SchedulerNotStarted,
+        };
+    }
+
+    /// SegmentContext.read_channel 回调：读 ChannelValue 指针
+    fn segmentReadChannel(ctx: *anyopaque, chan_idx: u16) ?*value.ChannelValue {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        return self.readChannelValue(chan_idx);
+    }
+
+    /// SegmentContext.read_async_handle 回调：读 AsyncHandle 指针
+    fn segmentReadAsyncHandle(ctx: *anyopaque, chan_idx: u16) ?*value.AsyncHandle {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        return self.readAsyncHandle(chan_idx);
+    }
+
+    /// SegmentContext.read_value 回调：读 Value（用于 orbit_chan_send 的输入值）
+    fn segmentReadValue(ctx: *anyopaque, chan_idx: u16) value.Value {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        return self.readScalarValue(chan_idx) catch value.Value.fromUnit();
+    }
+
+    /// SegmentContext.write_value 回调：写 Value（用于 orbit_chan_recv 的输出值）
+    fn segmentWriteValue(ctx: *anyopaque, chan_idx: u16, val: value.Value) void {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        self.writeScalarValue(chan_idx, val);
+    }
+
+    /// SegmentContext.install_frame 回调：将帧的 locals 区安装到 runtime.chan_ptrs。
+    /// 帧自带通道空间方案——每次段执行前调用，使该函数的本地通道指向帧内持久化数据。
+    fn segmentInstallFrame(ctx: *anyopaque, frame: *coroutine.CoroutineFrame) void {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        if (frame.func_idx >= self.ir.functions.len) return;
+        const func = &self.ir.functions[frame.func_idx];
+        // CoroutineMeta 按 func_idx 索引，持有 FrameLayout
+        if (frame.func_idx >= self.ir.coroutine_metas.len) return;
+        const meta = &self.ir.coroutine_metas[frame.func_idx];
+        const locals_base: [*]u8 = @ptrCast(frame.localsPtr());
+        self.runtime.installFrameChannels(locals_base, func, &meta.frame_layout);
     }
 
     /// 跟踪堆对象（引擎创建的所有堆对象都应调用此方法）
     /// 通过 ObjHeader.flags 的 TRACKED 位去重，避免同一对象被多次跟踪导致 deinit 时双重释放
     /// arena 分配的对象不加入 tracked_objs：由 endFunction 的 arena.reset 统一回收，
     /// 避免 endFunction 后 tracked_objs 指向已回收内存导致 use-after-free。
+    /// worker 线程的 Engine 额外标记 WORKER_ALLOCATED，主线程在 join 后据此迁移。
     fn trackObj(self: *Engine, obj: *value.obj_header.ObjHeader) EngineError!void {
         if (obj.isTracked()) return;
         if (obj.isArenaAllocated()) return;
         self.tracked_objs.append(self.tctx.?.backing, obj) catch return error.OutOfMemory;
         obj.markTracked();
+        if (self.is_worker) obj.markWorkerAllocated();
     }
 
     /// 跟踪字段数组中所有 ref 类型子对象
@@ -567,6 +787,11 @@ pub const Engine = struct {
 
     /// 运行入口函数，返回 i64 结果（main 函数的返回值）
     pub fn run(self: *Engine) EngineError!i64 {
+        // 协程调度器惰性启动：此时 self 已落在调用方稳定存储，worker 线程
+        // 持有的 ctx 不会悬垂。幂等（已启动则直接返回）。协程是 async 的唯一路径。
+        if (self.scheduler == null) {
+            self.startScheduler(@as(usize, @intCast(std.Thread.getCpuCount() catch 1))) catch return error.OutOfMemory;
+        }
         // 布局全局通道存储（GlobalRegion）
         try self.runtime.layoutGlobals(&self.ir.channels);
         // 预计算所有节点的 scalar_tag（消除热路径中 chanToScalarTag 查找）
@@ -2503,7 +2728,7 @@ pub const Engine = struct {
 
     /// syscall_call：分派到 syscall 实现（IO/Time 等宿主 syscall 包装）
     ///
-    /// meta_index 索引 ir.syscall_metas 表（1-indexed），获取 SyscallId 与 arg_count，
+    /// meta_index 索引 ir.syscall_metas 表（1-indexed），获取 syscall_id（u16）与 arg_count，
     /// 收集 inputs[] 通道的 Value，调用 syscall.dispatch 执行，结果写入 output 通道。
     fn execSyscall(self: *Engine, node: *const Node) EngineError!void {
         const meta_idx = node.meta_index;
@@ -2522,9 +2747,10 @@ pub const Engine = struct {
         }
         const arg_slice = args[0..arg_count];
 
-        // 分派执行
+        // 分派执行（SyscallMeta.syscall_id 存为 u16，转 SyscallId enum 传给 dispatch）
         const io_ctx = self.io orelse return error.IoNotInitialized;
-        const result = syscall_dispatch.dispatch(io_ctx, tctx, syscall_meta.syscall_id, arg_slice) catch |err| switch (err) {
+        const sid: syscall_dispatch.SyscallId = @enumFromInt(syscall_meta.syscall_id);
+        const result = syscall_dispatch.dispatch(io_ctx, tctx, sid, arg_slice) catch |err| switch (err) {
             error.OutOfMemory, error.TooManyPools, error.AllocFailed => return error.OutOfMemory,
             error.InvalidArgument => return error.InvalidMetaIndex,
         };
@@ -8610,65 +8836,112 @@ pub const Engine = struct {
     /// output = ref_chan（AsyncHandle 指针）
     fn execOrbitAsyncCreate(self: *Engine, node: *const Node) EngineError!void {
         if (node.meta_index == 0 or node.meta_index > self.ir.orbit_metas.len) return error.InvalidMetaIndex;
-        const om = self.ir.orbit_metas[node.meta_index - 1];
+        const om = &self.ir.orbit_metas[node.meta_index - 1];
         if (debug_orbit) {
             std.debug.print("orbit_create: meta_idx={} func_idx={} output_chan={} arg_count={}\n", .{ node.meta_index, om.func_index, node.output, om.arg_count });
         }
+
+        // 协程调度路径是唯一路径：scheduler 由 run() 惰性启动，
+        // 所有 async 函数都有 CoroutineMeta（builder 阶段对所有 is_async 函数生成）
+        const sched = self.scheduler orelse return error.SchedulerNotStarted;
+        if (self.ir.getCoroutineMeta(om.func_index) == null) return error.InvalidMetaIndex;
+        return self.execOrbitAsyncCreateViaScheduler(node, om, sched);
+    }
+
+    /// 协程调度路径：通过 Scheduler.spawn 创建协程帧并入就绪队列。
+    /// 参数从 IR 通道读取为 Value 切片，写入帧 locals 参数槽。
+    /// AsyncHandle 输出到 node.output，状态设为 Running（worker 执行完会写结果）。
+    fn execOrbitAsyncCreateViaScheduler(
+        self: *Engine,
+        node: *const Node,
+        om: *const ir_mod.meta_mod.OrbitMeta,
+        sched: *coroutine.Scheduler,
+    ) EngineError!void {
+        const meta = self.ir.getCoroutineMeta(om.func_index) orelse return error.InvalidMetaIndex;
 
         // 创建 AsyncHandle
         const handle = self.tctx.?.createObj(value.AsyncHandle) catch return error.OutOfMemory;
         handle.* = value.AsyncHandle.init();
         value.obj_header.initObjHeader(&handle.header, .async_val, @sizeOf(value.AsyncHandle), false, self.tctx.?);
         try self.trackObj(&handle.header);
-
-        // 读取参数值：标量按原始字节拷贝（保留完整位模式，支持 f16..f128/i128），
-        // ref_chan 传递原始对象指针由 worker 深拷贝
-        var arg_bytes: [4][16]u8 = std.mem.zeroes([4][16]u8);
-        var arg_widths: [4]u8 = .{ 0, 0, 0, 0 };
-        var arg_objs: [4]?*value.obj_header.ObjHeader = .{ null, null, null, null };
-        const arg_count = @min(om.arg_count, 4);
-        for (0..arg_count) |i| {
-            const arg_meta = self.ir.channels.get(node.inputs[i]);
-            if (arg_meta.chan_type == .ref_chan) {
-                const v = self.chanToValue(node.inputs[i]);
-                arg_objs[i] = if (v == .ref) v.ref else null;
-            } else {
-                const w = arg_meta.elem_width;
-                arg_widths[i] = w;
-                if (w > 0) {
-                    const src = self.runtime.rawPtr(node.inputs[i]);
-                    @memcpy(arg_bytes[i][0..w], src[0..w]);
-                }
-            }
-        }
-
-        // 设置状态为 Running
         handle.setStatus(.Running);
 
-        // 准备线程数据：拷贝 IR 指针、函数索引、参数、handle 指针
-        // OrbitThreadData 跨线程分配（主线程分配，worker 线程释放），
-        // 使用 backing allocator（线程安全）而非 tctx 对象池（线程本地）
-        const thread_data = self.tctx.?.backing.create(OrbitThreadData) catch return error.OutOfMemory;
-        thread_data.* = .{
-            .ir = self.ir,
-            .func_idx = om.func_index,
-            .arg_bytes = arg_bytes,
-            .arg_widths = arg_widths,
-            .arg_objs = arg_objs,
-            .arg_count = arg_count,
-            .handle = handle,
-            .global = self.global.?,
-            .backing = self.tctx.?.backing,
-            .global_prof = self.tctx.?.global_prof,
-            .io = self.io,
-        };
+        // 读取参数为 Value 切片（参数数量无上限，按 om.arg_count 分配）
+        const arg_count = om.arg_count;
+        const args = self.tctx.?.backing.alloc(value.Value, arg_count) catch return error.OutOfMemory;
+        defer self.tctx.?.backing.free(args);
+        for (0..arg_count) |i| {
+            args[i] = self.readScalarValue(node.inputs[i]) catch value.Value.fromUnit();
+        }
 
-        // spawn 线程执行 async 函数
-        const thread = std.Thread.spawn(.{}, orbitWorker, .{thread_data}) catch return error.OutOfMemory;
-        thread.detach();
+        // spawn 协程：分配帧 + 写参数 + state=0 + 入就绪队列
+        const frame = sched.spawn(meta, args) catch return error.OutOfMemory;
+        // 帧与 handle 关联（complete 时 worker 写结果到 handle）
+        frame.async_handle = handle;
 
         // 输出 AsyncHandle 指针
         self.runtime.writePtr(node.output, @ptrCast(&handle.header));
+    }
+
+    /// 迁移 worker 通过 &T 引用写入主线程对象的堆值到主线程 tctx。
+    ///
+    /// 背景：async 函数的 &T 参数让 worker 直接修改主线程对象。当 worker 分配
+    /// 新堆值（如 self.rbuf = chunk）并存入主线程对象字段时，这些值位于 worker
+    /// tctx，worker 退出后变为悬垂指针，下次访问触发 use-after-free。
+    ///
+    /// 本方法在 join 后、signalConsumed 前调用（worker tctx 仍存活）：
+    /// 1. 遍历 handle.ref_param_objs 中的主线程对象
+    /// 2. 对每个对象的字段，检查是否带 WORKER_ALLOCATED 标志
+    /// 3. 若是，deepCopy 到主线程 tctx 并替换字段指针
+    /// 4. worker 的原对象由 worker tracked_objs 清理，不会双重释放
+    fn migrateRefParamValues(self: *Engine, handle: *value.AsyncHandle) void {
+        const count = handle.ref_param_count;
+        if (count == 0) return;
+        for (0..count) |i| {
+            const obj = handle.ref_param_objs[i] orelse continue;
+            self.migrateObjFieldsWorker(obj);
+        }
+    }
+
+    /// 递归迁移对象字段中的 worker 分配堆值。
+    /// 仅遍历主线程分配的容器对象（非 WORKER_ALLOCATED），对其字段中的
+    /// WORKER_ALLOCATED 引用执行 deepCopy 迁移。不递归进入已迁移的值
+    /// （deepCopy 已完整复制子树）。
+    fn migrateObjFieldsWorker(self: *Engine, obj: *value.obj_header.ObjHeader) void {
+        // worker 分配的容器不应出现在 ref_param_objs 中（引用参数本身是主线程对象）
+        if (obj.isWorkerAllocated()) return;
+
+        switch (obj.type_tag) {
+            .record => {
+                const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", obj));
+                for (rec.fields) |*field| {
+                    if (field.* == .ref and field.ref.isWorkerAllocated()) {
+                        const copied = field.deepCopy(self.tctx.?) catch continue;
+                        self.trackValueTree(copied) catch {};
+                        field.* = copied;
+                    }
+                }
+            },
+            .adt => {
+                const adt: *value.AdtValue = @alignCast(@fieldParentPtr("header", obj));
+                for (adt.fields) |*f| {
+                    if (f.value == .ref and f.value.ref.isWorkerAllocated()) {
+                        const copied = f.value.deepCopy(self.tctx.?) catch continue;
+                        self.trackValueTree(copied) catch {};
+                        f.value = copied;
+                    }
+                }
+            },
+            .newtype => {
+                const nt: *value.NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
+                if (nt.inner == .ref and nt.inner.ref.isWorkerAllocated()) {
+                    const copied = nt.inner.deepCopy(self.tctx.?) catch return;
+                    self.trackValueTree(copied) catch {};
+                    nt.inner = copied;
+                }
+            },
+            else => {},
+        }
     }
 
     /// orbit_async_join：阻塞等待异步任务完成，提取结果
@@ -8679,8 +8952,9 @@ pub const Engine = struct {
     /// 跨线程结果传递协议：
     /// 1. join() 获取 result_val（指向 worker tctx 中的有效内存）
     /// 2. deepCopy 到主线程 tctx（读取 worker 内存，需 worker tctx 存活）
-    /// 3. signalConsumed 通知 worker 可以清理
-    /// 4. waitWorkerDone 确保 worker 完全退出（避免泄漏检测竞态）
+    /// 3. migrateRefParamValues 迁移 worker 通过 &T 写入主线程对象的堆值
+    /// 4. signalConsumed 通知 worker 可以清理
+    /// 5. waitWorkerDone 确保 worker 完全退出（避免泄漏检测竞态）
     fn execOrbitAsyncJoin(self: *Engine, node: *const Node) EngineError!void {
         if (debug_orbit) {
             const in_meta = self.ir.channels.get(node.inputs[0]);
@@ -8722,6 +8996,11 @@ pub const Engine = struct {
                 @memset(dst[0..w], 0);
             }
         }
+
+        // 迁移 worker 通过 &T 引用写入主线程对象的堆值到主线程 tctx。
+        // worker 分配的对象在 worker tctx 中，worker 退出后变为悬垂指针。
+        // 必须在 signalConsumed 之前完成（此时 worker tctx 仍存活，deepCopy 安全）。
+        self.migrateRefParamValues(handle);
     }
 
     /// orbit_chan_send：向通道发送值（阻塞直到接收方就绪）
@@ -9285,150 +9564,6 @@ pub const Engine = struct {
         return buf;
     }
 };
-
-/// 星轨线程数据：传递给 worker 线程的参数
-const OrbitThreadData = struct {
-    ir: *GlueIR,
-    func_idx: u16,
-    /// 标量参数的原始字节（最大 16B，覆盖 i128/f128），
-    /// 直接拷贝位模式避免 readIntAsI64 对 float/i128 的类型转换损坏
-    arg_bytes: [4][16]u8,
-    /// 每个标量参数的字节宽度（0 表示该参数为 ref_chan，用 arg_objs）
-    arg_widths: [4]u8,
-    /// ref_chan 参数的原始对象指针（由 worker 深拷贝到其本地 tctx）
-    arg_objs: [4]?*value.obj_header.ObjHeader,
-    arg_count: u8,
-    handle: *value.AsyncHandle,
-    global: *GlobalPool,
-    backing: std.mem.Allocator,
-    /// GlobalProfiler 引用（worker 线程创建 ThreadProfiler 用，null 时不采集）
-    global_prof: ?*profiling.GlobalProfiler = null,
-    /// IO 实例（worker 线程执行 syscall 时需要，如 net/io 操作）
-    io: ?std.Io = null,
-};
-
-/// 星轨 worker 线程函数：在独立线程中执行 async 函数
-/// 创建独立的 Engine 实例（共享 IR 和 GlobalPool，独立 ThreadContext + Runtime，避免通道存储竞争）
-///
-/// 跨线程结果传递协议：
-/// 1. 执行函数，读取 result_val（RC=1，由 worker engine 跟踪）
-/// 2. setResult(result_val) —— tctx 仍存活，result 指向有效内存
-/// 3. 等待主线程 result_consumed（主线程在此期间 deepCopy 到自己的 tctx）
-/// 4. 主线程完成 deepCopy 后设置 result_consumed
-/// 5. worker 执行 engine.deinit（释放 tracked_objs 包括 result）+ tctx.deinit
-/// 6. worker 设置 worker_done，主线程解除 waitWorkerDone
-fn orbitWorker(data: *OrbitThreadData) void {
-    const alloc = data.backing;
-    const handle = data.handle; // 保存 handle 指针，因为 data 会在清理前释放
-
-    // 创建 worker 线程独立的 ThreadContext（每线程独立，零锁热路径）
-    var tctx = ThreadContext.init(data.global, alloc, data.global_prof) catch {
-        alloc.destroy(data);
-        handle.setPanic("Failed to init ThreadContext");
-        handle.signalWorkerDone();
-        return;
-    };
-    defer tctx.deinit();
-
-    // 使用 Engine.init（外部 tctx），错误路径通过 setPanic 记录原因
-    var engine = Engine.init(data.ir, &tctx) catch {
-        alloc.destroy(data);
-        handle.setPanic("Failed to init engine");
-        handle.signalWorkerDone();
-        return;
-    };
-    // 注入 IO 实例（syscall 执行 net/io 操作时需要）
-    engine.io = data.io;
-
-    // 布局全局通道存储（独立于主线程）
-    engine.runtime.layoutGlobals(&data.ir.channels) catch {
-        engine.deinit();
-        alloc.destroy(data);
-        handle.setPanic("Failed to layout channels");
-        handle.signalWorkerDone();
-        return;
-    };
-
-    // 将参数写入函数的参数通道
-    const func = data.ir.functions[data.func_idx];
-
-    // enterFunction 在 CallStackRegion 中分配函数本地通道
-    engine.runtime.enterFunction(data.func_idx, &func) catch {
-        engine.deinit();
-        alloc.destroy(data);
-        handle.setPanic("Failed to enter function");
-        handle.signalWorkerDone();
-        return;
-    };
-
-    for (0..data.arg_count) |i| {
-        if (i >= func.param_channels.len) break;
-        const dst_chan = func.param_channels[i];
-        const dst_meta = data.ir.channels.get(dst_chan);
-        if (dst_meta.chan_type == .ref_chan) {
-            if (data.arg_objs[i]) |obj| {
-                // 跨线程值语义：普通复合类型深拷贝到 worker tctx，channel/atomic 等 retain 共享
-                const v = value.Value{ .ref = obj };
-                const copied = v.deepCopy(&tctx) catch {
-                    engine.runtime.leaveFunction();
-                    engine.deinit();
-                    tctx.deinit();
-                    alloc.destroy(data);
-                    handle.setPanic("deepCopy failed for async argument");
-                    handle.signalWorkerDone();
-                    return;
-                };
-                engine.trackValueTree(copied) catch {};
-                engine.writeScalarValue(dst_chan, copied);
-            }
-        } else {
-            // 按原始字节宽度写回，保留完整位模式（f16..f128/i128 等）
-            const w = data.arg_widths[i];
-            if (w > 0) {
-                const dst = engine.runtime.rawPtr(dst_chan);
-                @memcpy(dst[0..w], data.arg_bytes[i][0..w]);
-            }
-        }
-    }
-
-    // 执行函数
-    const result_chan = engine.execFunction(data.func_idx, func.param_channels) catch |err| {
-        if (debug_orbit) {
-            std.debug.print("orbit_worker: execFunction FAILED func_idx={} err={s}\n", .{ data.func_idx, @errorName(err) });
-        }
-        engine.runtime.leaveFunction();
-        engine.deinit();
-        tctx.deinit();
-        alloc.destroy(data);
-        handle.setPanic("Function execution failed");
-        handle.signalWorkerDone();
-        return;
-    };
-
-    // 读取结果（在 leaveFunction 之前，因为 leaveFunction 会 resetTo 回收通道内存）
-    const result_val = engine.readScalarValue(result_chan) catch value.Value.fromNull();
-
-    engine.runtime.leaveFunction();
-
-    // 不再深拷贝：直接传递原始 Value（RC=1，由 worker engine 的 tracked_objs 跟踪）
-    // 主线程在 join 后 deepCopy 到自己的 tctx，读取期间 worker tctx 保持存活
-    handle.setResult(result_val);
-
-    // 等待主线程消费结果（deepCopy 完成后才允许清理 tctx）
-    // 这确保主线程读取的 result 始终指向有效内存
-    while (!handle.result_consumed.load(.acquire)) {
-        std.Thread.yield() catch {};
-    }
-
-    // 主线程已完成 deepCopy，安全清理
-    // engine.deinit 释放 tracked_objs（包括 result_val），tctx.deinit 释放页池和 ChannelRegion
-    engine.deinit();
-    tctx.deinit(); // defer tctx.deinit() 将成为 no-op（ChannelRegion.data 已置 null）
-    alloc.destroy(data);
-
-    // 通知主线程 worker 已完全退出
-    handle.signalWorkerDone();
-}
 
 // ════════════════════════════════════════════════════════════════
 // 测试
@@ -10324,6 +10459,44 @@ test "while + break" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     try testing.expectEqual(@as(i64, 10), try engine.run()); // 0+1+2+3+4=10
+}
+
+// ════════════════════════════════════════════
+// Phase 7-c: 协程调度路径集成测试（M:N 协程调度器）
+// ════════════════════════════════════════════
+
+test "Phase 7-c: startScheduler 启动协程调度器" {
+    // 验证 startScheduler 创建调度器并启动 worker 线程，不崩溃
+    var ir = try buildIRFromSource("fun main() { 42 }");
+    defer ir.deinit();
+    var threaded: std.Io.Threaded = undefined;
+    var engine = try initTestEngineOwned(&ir, &threaded);
+    defer { engine.deinit(); threaded.deinit(); }
+
+    try engine.startScheduler(2);
+    try testing.expect(engine.scheduler != null);
+    // 重复调用应幂等（不重复启动）
+    try engine.startScheduler(2);
+}
+
+test "Phase 7-c: async 函数走协程调度路径" {
+    // async fun compute() { 42 }
+    // fun main() { compute().await() }
+    // 启用调度器后，compute() 应走 scheduler.spawn → runSegment → complete → join
+    var ir = try buildIRFromSource(
+        \\async fun compute() { 42 }
+        \\fun main() { compute().await() }
+    );
+    defer ir.deinit();
+    var threaded: std.Io.Threaded = undefined;
+    var engine = try initTestEngineOwned(&ir, &threaded);
+    defer { engine.deinit(); threaded.deinit(); }
+
+    // 启动调度器（2 worker）
+    try engine.startScheduler(2);
+
+    const result = try engine.run();
+    try testing.expectEqual(@as(i64, 42), result);
 }
 
 // ════════════════════════════════════════════

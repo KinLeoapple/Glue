@@ -325,6 +325,52 @@ pub const Runtime = struct {
     }
 
     // ════════════════════════════════════════════
+    // 协程调度支持：帧自带通道空间安装
+    // ════════════════════════════════════════════
+
+    /// 将协程帧的 locals 区安装到 chan_ptrs，使该函数的本地通道指针指向帧内持久化的通道数据。
+    ///
+    /// 帧自带通道空间方案：CoroutineFrame 的 locals 区即该函数的通道数据存储
+    /// （FrameLayout.total_size = func.chan_total_bytes）。每次段执行前调用此方法，
+    /// 将帧的 locals 区按 SlotDesc 布局安装到 chan_ptrs，通道状态在帧中跨段持久化。
+    ///
+    /// 参数：
+    /// - locals_base：帧 locals 区起始指针（frame.localsPtr()）
+    /// - func：async 函数的 IR 元数据（local_chan_start/local_chan_count/return_channel）
+    /// - layout：帧布局（slots 描述每个通道在 locals 区的 offset/size）
+    pub fn installFrameChannels(
+        self: *Runtime,
+        locals_base: [*]u8,
+        func: *const Function,
+        layout: *const ir_mod.FrameLayout,
+    ) void {
+        // 本地通道：按 layout.slots 安装
+        for (0..func.local_chan_count) |i| {
+            const chan = func.local_chan_start + @as(u16, @intCast(i));
+            const slot = layout.slots[i];
+            if (slot.size > 0) {
+                self.chan_ptrs[chan] = locals_base + slot.offset;
+                self.chan_lengths[chan] = 1;
+            } else {
+                self.chan_ptrs[chan] = null;
+                self.chan_lengths[chan] = 0;
+            }
+        }
+        // return_channel（slots[local_chan_count]）
+        const ret_idx = func.local_chan_count;
+        if (ret_idx < layout.slots.len) {
+            const ret_slot = layout.slots[ret_idx];
+            if (ret_slot.size > 0) {
+                self.chan_ptrs[func.return_channel] = locals_base + ret_slot.offset;
+                self.chan_lengths[func.return_channel] = 1;
+            } else {
+                self.chan_ptrs[func.return_channel] = null;
+                self.chan_lengths[func.return_channel] = 0;
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════
     // 标量读写接口
     // ════════════════════════════════════════════
 

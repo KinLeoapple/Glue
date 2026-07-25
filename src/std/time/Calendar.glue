@@ -27,6 +27,26 @@ pub fun floor_mod(a: i64, b: i64): i64 {
     }
 }
 
+// i128 版本（时间分量转换用，ns 精度算术）
+pub fun floor_div_i128(a: i128, b: i128): i128 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && (r < 0) != (b < 0) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+pub fun floor_mod_i128(a: i128, b: i128): i128 {
+    val r = a % b
+    if r != 0 && (r < 0) != (b < 0) {
+        r + b
+    } else {
+        r
+    }
+}
+
 // ─── 闰年/月份天数 ────────────────────────────────────────────────
 
 pub fun is_leap_year(year: i32): bool {
@@ -84,6 +104,29 @@ pub fun from_julian_day(jd: i64): (year: i32, month: u8, day: u8) {
     val m = cast(if mp < 10 { mp + 3 } else { mp - 9 }).to(u8)
     val final_year = if m <= 2 { y + 1 } else { y }
     return (year: final_year, month: m, day: d)
+}
+
+// ─── Epoch 相关（自 1970-01-01 的天数，纯 Glue 算法） ──────────────
+//
+// 替代原 syscall/time.zig 中的 daysFromCivil + std.time.epoch 实现。
+// days_from_civil 与 Howard Hinnant 算法一致；civil_from_days 为其逆运算。
+// 1970-01-01 的儒略日 = 2440588（Julian Day Number）。
+
+pub val EPOCH_JULIAN_DAY: i64 = 2440588
+
+// 公历日期 → 自 1970-01-01 的天数（可为负，表示 1970 年前）
+pub fun days_from_civil(year: i32, month: u8, day: u8): i64 {
+    to_julian_day(year, month, day) - EPOCH_JULIAN_DAY
+}
+
+// 自 1970-01-01 的天数 → 公历日期
+pub fun civil_from_days(days: i64): (year: i32, month: u8, day: u8) {
+    from_julian_day(days + EPOCH_JULIAN_DAY)
+}
+
+// 自 1970-01-01 的天数 → 星期（0=周日，1970-01-01 是周四）
+pub fun weekday_from_days(days: i64): u8 {
+    cast(floor_mod(days + 4, 7)).to(u8)
 }
 
 // ─── 星期 ─────────────────────────────────────────────────────────

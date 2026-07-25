@@ -8,13 +8,16 @@
 // ─── sleep ─────────────────────────────────────────────────────────
 
 // 睡眠指定 Duration（阻塞当前协程）
+// __sleep_async 创建完成 channel + spawn sleep 线程，协程在 channel 上挂起
 pub async fun sleep(d: Duration): Async<Unit> {
-    __sleep_ns(d.as_nanos())
+    val done = __sleep_async(d.as_nanos())
+    done.recv()
 }
 
 // 睡眠指定秒数（便捷重载）
 pub async fun sleep_secs(secs: i64): Async<Unit> {
-    __sleep_ns(cast(secs).to(i128) * 1_000_000_000)
+    val done = __sleep_async(cast(secs).to(i128) * 1_000_000_000)
+    done.recv()
 }
 
 // ─── ticker：周期性向 channel 推送当前 Instant ────────────────────

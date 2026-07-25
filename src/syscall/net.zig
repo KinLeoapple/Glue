@@ -13,8 +13,8 @@ const std = @import("std");
 const value = @import("value");
 const Value = value.Value;
 const ThreadContext = value.obj_header.ThreadContext;
-const syscall_mod = @import("mod.zig");
-const SyscallError = syscall_mod.SyscallError;
+const registry = @import("registry.zig");
+const SyscallError = registry.SyscallError;
 const util = @import("util.zig");
 
 // 共享错误工具（io.zig/net.zig 共用）
@@ -23,6 +23,7 @@ const errToKind = util.errToKind;
 const makeIOError = util.makeIOError;
 const makeThrowOk = util.makeThrowOk;
 const makeThrowErr = util.makeThrowErr;
+const makeU8Array = util.makeU8Array;
 
 const Io = std.Io;
 const net = Io.net;
@@ -192,25 +193,6 @@ fn valueToIpAddress(v: Value, port: u16) ?IpAddress {
     }
 }
 
-/// 从字节切片构造 Glue u8[] 数组 Value（用于 read/recv_from 返回数据）
-fn makeU8Array(tctx: *ThreadContext, bytes: []const u8) SyscallError!Value {
-    if (bytes.len == 0) {
-        return Value.makeArray(tctx, &[_]Value{}, null) catch return error.OutOfMemory;
-    }
-    // 临时分配 Value[] 缓冲区填充 fromU8；makeArray 会拷贝到自己的缓冲区，完成后释放临时区
-    const buf = tctx.allocObj(bytes.len * @sizeOf(Value)) catch return error.OutOfMemory;
-    const elems: []Value = @as([*]Value, @ptrCast(@alignCast(buf.ptr)))[0..bytes.len];
-    for (bytes, 0..) |b, i| {
-        elems[i] = Value.fromU8(b);
-    }
-    const result = Value.makeArray(tctx, elems, null) catch {
-        tctx.freeObj(buf.ptr);
-        return error.OutOfMemory;
-    };
-    tctx.freeObj(buf.ptr);
-    return result;
-}
-
 /// 从 Ip4Address.bytes 构造 Ipv4Addr Value（newtype: __tag + bits）
 fn makeIpv4AddrValue(tctx: *ThreadContext, bytes: [4]u8) SyscallError!Value {
     // bytes 为大端，组装为 u32 网络字节序值
@@ -336,7 +318,7 @@ pub fn net_tcp_listen(io: Io, tctx: *ThreadContext, args: []const Value) Syscall
     const port = args[1].intCast(u16);
     var addr = valueToIpAddress(args[0], port) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_listen: invalid ip", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     const reuse_addr = asBool(args[2]);
 
@@ -346,7 +328,7 @@ pub fn net_tcp_listen(io: Io, tctx: *ThreadContext, args: []const Value) Syscall
         .protocol = .tcp,
     }) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "net_tcp_listen failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromI64(socketToFd(server.socket)));
 }
@@ -364,7 +346,7 @@ fn acceptOp(io: Io, tctx: *ThreadContext, ctx: *anyopaque) anyerror!Value {
     var server = fdToServer(c.fd);
     const stream = server.accept(io) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "net_tcp_accept failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     // peer 地址从 stream.socket.address 获取
     const peer_addr_val = try makeSocketAddrValue(tctx, stream.socket.address);
@@ -402,7 +384,7 @@ pub fn net_tcp_connect(io: Io, tctx: *ThreadContext, args: []const Value) Syscal
     const port = args[1].intCast(u16);
     var addr = valueToIpAddress(args[0], port) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_connect: invalid ip", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     const timeout_ns_raw = args[2].intCast(i64);
 
@@ -416,7 +398,7 @@ pub fn net_tcp_connect(io: Io, tctx: *ThreadContext, args: []const Value) Syscal
         .timeout = timeout,
     }) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "net_tcp_connect failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromI64(socketToFd(stream.socket)));
 }
@@ -443,7 +425,7 @@ fn readOp(io: Io, tctx: *ThreadContext, ctx: *anyopaque) anyerror!Value {
     var bufs = [_][]u8{tmp_buf[0..read_len]};
     const n = io.vtable.netRead(io.userdata, stream.socket.handle, bufs[0..]) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "net_tcp_read failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     // 构造 u8[] 数组返回（调用方通过返回值获取数据，而非就地填充 buf）
     const arr_val = try makeU8Array(tctx, tmp_buf[0..n]);
@@ -456,7 +438,7 @@ pub fn net_tcp_read(io: Io, tctx: *ThreadContext, args: []const Value) SyscallEr
     const len_raw = args[1].intCast(i64);
     if (len_raw < 0) {
         const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_read: negative len", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     }
     const len: usize = @intCast(len_raw);
     const timeout_ns_raw = args[2].intCast(i64);
@@ -486,7 +468,7 @@ fn writeOp(io: Io, tctx: *ThreadContext, ctx: *anyopaque) anyerror!Value {
             .u8 => c.arr.elements[i].asU8(),
             else => {
                 const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_write: buf element not u8", 22, null);
-                return makeThrowErr(tctx, io_err);
+                return makeThrowErr(tctx, io_err, "io error");
             },
         };
     }
@@ -494,7 +476,7 @@ fn writeOp(io: Io, tctx: *ThreadContext, ctx: *anyopaque) anyerror!Value {
     // 直接调用 vtable.netWrite（header 空，data 单缓冲，splat=1）
     const n = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &.{tmp_buf[0..write_len]}, 1) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "net_tcp_write failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromUsize(n));
 }
@@ -504,12 +486,12 @@ pub fn net_tcp_write(io: Io, tctx: *ThreadContext, args: []const Value) SyscallE
     const fd = args[0].intCast(i64);
     const arr = asArray(args[1]) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_write: buf not array", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     const len_raw = args[2].intCast(i64);
     if (len_raw < 0) {
         const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_write: negative len", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     }
     const len: usize = @intCast(len_raw);
     const timeout_ns_raw = args[3].intCast(i64);
@@ -538,7 +520,7 @@ pub fn net_udp_bind(io: Io, tctx: *ThreadContext, args: []const Value) SyscallEr
     const port = args[1].intCast(u16);
     var addr = valueToIpAddress(args[0], port) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "net_udp_bind: invalid ip", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     _ = asBool(args[2]); // reuse_addr：BindOptions 无 reuse_address 字段，预留参数
 
@@ -548,7 +530,7 @@ pub fn net_udp_bind(io: Io, tctx: *ThreadContext, args: []const Value) SyscallEr
         .allow_broadcast = false,
     }) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "net_udp_bind failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromI64(socketToFd(sock)));
 }
@@ -563,11 +545,11 @@ pub fn net_udp_send_to(io: Io, tctx: *ThreadContext, args: []const Value) Syscal
     const port = args[2].intCast(u16);
     var dest = valueToIpAddress(args[1], port) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "net_udp_send_to: invalid ip", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     const arr = asArray(args[3]) orelse {
         const io_err = try makeIOError(tctx, .invalid_input, "net_udp_send_to: data not array", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
 
     // 拼接 u8 字节到栈缓冲区（32KB 上限，与 file_write 一致）
@@ -579,7 +561,7 @@ pub fn net_udp_send_to(io: Io, tctx: *ThreadContext, args: []const Value) Syscal
             .u8 => arr.elements[i].asU8(),
             else => {
                 const io_err = try makeIOError(tctx, .invalid_input, "net_udp_send_to: data element not u8", 22, null);
-                return makeThrowErr(tctx, io_err);
+                return makeThrowErr(tctx, io_err, "io error");
             },
         };
     }
@@ -587,7 +569,7 @@ pub fn net_udp_send_to(io: Io, tctx: *ThreadContext, args: []const Value) Syscal
     const sock = fdToSocket(fd);
     sock.send(io, &dest, tmp_buf[0..write_len]) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "net_udp_send_to failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     return makeThrowOk(tctx, Value.fromUsize(write_len));
 }
@@ -608,7 +590,7 @@ fn recvFromOp(io: Io, tctx: *ThreadContext, ctx: *anyopaque) anyerror!Value {
     const sock = fdToSocket(c.fd);
     const msg = sock.receive(io, tmp_buf[0..read_len]) catch |err| {
         const io_err = try makeIOError(tctx, errToKind(err), "net_udp_recv_from failed", 0, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     };
     // 构造 u8[] 数据数组（返回值路径，非就地填充）
     const data_val = try makeU8Array(tctx, msg.data);
@@ -635,7 +617,7 @@ pub fn net_udp_recv_from(io: Io, tctx: *ThreadContext, args: []const Value) Sysc
     const len_raw = args[1].intCast(i64);
     if (len_raw < 0) {
         const io_err = try makeIOError(tctx, .invalid_input, "net_udp_recv_from: negative len", 22, null);
-        return makeThrowErr(tctx, io_err);
+        return makeThrowErr(tctx, io_err, "io error");
     }
     const len: usize = @intCast(len_raw);
     const timeout_ns_raw = args[2].intCast(i64);
@@ -643,4 +625,421 @@ pub fn net_udp_recv_from(io: Io, tctx: *ThreadContext, args: []const Value) Sysc
 
     var ctx = RecvFromCtx{ .fd = fd, .len = len };
     return util.runWithTimeout(io, tctx, timeout_ns, recvFromOp, &ctx);
+}
+
+// ──────────────────────────────────────────────
+// 异步 Net syscall
+// ──────────────────────────────────────────────
+//
+// 协议：创建完成 channel(cap=1) + spawn 独立线程跑阻塞 accept/read/write/recv_from
+// （不阻塞协程 worker 线程），完成后 chan.trySend(Throw<T, IOError>) + wake_chan_recv_fn
+// 唤醒等待协程。协程在 channel 上挂起（orbit_chan_recv），唤醒后从 channel 取 Throw 值。
+// 超时由 stdlib 在 Glue 层用 select + timeout channel 实现，syscall 层不处理超时。
+//
+// stdlib 用法（TcpStream.glue）：
+//   val done = __net_tcp_read_async(fd, len)
+//   done.recv()  // 返回 Throw<u8[], IOError>，作为 async 函数返回值
+
+/// accept_async worker 线程参数
+const AcceptAsyncArgs = struct {
+    io: Io,
+    chan: *value.ChannelValue,
+    fd: i64,
+    bridge: *anyopaque,
+    wake_fn: *const fn (bridge: *anyopaque, chan: *anyopaque) void,
+    backing: std.mem.Allocator,
+    tctx: *ThreadContext,
+};
+
+/// __net_tcp_accept_async(fd: i64) -> *ChannelValue
+///
+/// 异步 TCP accept：创建完成 channel + spawn 线程跑 accept，
+/// 完成后 chan.trySend(Throw<AcceptResult, IOError>) + wake_chan_recv_fn 唤醒协程。
+pub fn net_tcp_accept_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 1) return error.InvalidArgument;
+
+    const fd = args[0].intCast(i64);
+
+    // 创建完成 channel（cap=1）
+    const chan = value.ChannelValue.create(tctx, 1) catch return error.OutOfMemory;
+
+    // spawn 线程跑 accept + ioComplete
+    const args_ptr = tctx.backing.create(AcceptAsyncArgs) catch return error.OutOfMemory;
+    args_ptr.* = .{
+        .io = io,
+        .chan = chan,
+        .fd = fd,
+        .bridge = tctx.io_bridge.?,
+        .wake_fn = tctx.wake_chan_recv_fn.?,
+        .backing = tctx.backing,
+        .tctx = tctx,
+    };
+    const thread = std.Thread.spawn(.{}, acceptAsyncWorker, .{args_ptr}) catch {
+        tctx.backing.destroy(args_ptr);
+        // spawn 失败：返回错误 Throw（不应发生）
+        const io_err = try makeIOError(tctx, .other, "net_tcp_accept_async: spawn failed", 0, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    thread.detach();
+
+    return Value.fromRef(@ptrCast(&chan.header));
+}
+
+/// accept_async worker 线程：accept + trySend(Throw) + wake + 释放资源。
+fn acceptAsyncWorker(args: *AcceptAsyncArgs) void {
+    var server = fdToServer(args.fd);
+    const stream = server.accept(args.io) catch |err| {
+        const io_err = makeIOError(args.tctx, errToKind(err), "net_tcp_accept_async failed", 0, null) catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.destroy(args);
+            return;
+        };
+        const throw_val = makeThrowErr(args.tctx, io_err, "io error") catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.destroy(args);
+            return;
+        };
+        _ = args.chan.trySend(throw_val);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+
+    // accept 成功：构造 AcceptResult + Throw.ok + trySend + wake
+    const peer_addr_val = makeSocketAddrValue(args.tctx, stream.socket.address) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    var fields: [3]Value = .{
+        Value.fromI64(0), // __tag
+        Value.fromI64(socketToFd(stream.socket)), // stream_fd
+        peer_addr_val, // peer_addr（RC=1，由 record 窃取）
+    };
+    const field_names: [3]?[]const u8 = .{ "__tag", "stream_fd", "peer_addr" };
+    const result = Value.makeRecordWithNames(args.tctx, "AcceptResult", &fields, &field_names) catch {
+        peer_addr_val.release(args.tctx);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    const throw_val = makeThrowOk(args.tctx, result) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    _ = args.chan.trySend(throw_val);
+    args.wake_fn(args.bridge, @ptrCast(args.chan));
+
+    args.backing.destroy(args);
+}
+
+/// read_async worker 线程参数
+const ReadAsyncArgs = struct {
+    io: Io,
+    chan: *value.ChannelValue,
+    fd: i64,
+    len: usize,
+    bridge: *anyopaque,
+    wake_fn: *const fn (bridge: *anyopaque, chan: *anyopaque) void,
+    backing: std.mem.Allocator,
+    tctx: *ThreadContext,
+};
+
+/// __net_tcp_read_async(fd: i64, len: usize) -> *ChannelValue
+///
+/// 异步 TCP read。
+pub fn net_tcp_read_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 2) return error.InvalidArgument;
+
+    const fd = args[0].intCast(i64);
+    const len_raw = args[1].intCast(i64);
+    if (len_raw < 0) {
+        const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_read_async: negative len", 22, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    }
+    const len: usize = @intCast(len_raw);
+
+    const chan = value.ChannelValue.create(tctx, 1) catch return error.OutOfMemory;
+
+    const args_ptr = tctx.backing.create(ReadAsyncArgs) catch return error.OutOfMemory;
+    args_ptr.* = .{
+        .io = io,
+        .chan = chan,
+        .fd = fd,
+        .len = len,
+        .bridge = tctx.io_bridge.?,
+        .wake_fn = tctx.wake_chan_recv_fn.?,
+        .backing = tctx.backing,
+        .tctx = tctx,
+    };
+    const thread = std.Thread.spawn(.{}, readAsyncWorker, .{args_ptr}) catch {
+        tctx.backing.destroy(args_ptr);
+        const io_err = try makeIOError(tctx, .other, "net_tcp_read_async: spawn failed", 0, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    thread.detach();
+
+    return Value.fromRef(@ptrCast(&chan.header));
+}
+
+/// read_async worker 线程：read + trySend(Throw) + wake + 释放资源。
+fn readAsyncWorker(args: *ReadAsyncArgs) void {
+    var tmp_buf: [32768]u8 = undefined;
+    const read_len = @min(args.len, tmp_buf.len);
+    const stream = fdToStream(args.fd);
+    var bufs = [_][]u8{tmp_buf[0..read_len]};
+    const n = args.io.vtable.netRead(args.io.userdata, stream.socket.handle, bufs[0..]) catch |err| {
+        const io_err = makeIOError(args.tctx, errToKind(err), "net_tcp_read_async failed", 0, null) catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.destroy(args);
+            return;
+        };
+        const throw_val = makeThrowErr(args.tctx, io_err, "io error") catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.destroy(args);
+            return;
+        };
+        _ = args.chan.trySend(throw_val);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+
+    const arr_val = makeU8Array(args.tctx, tmp_buf[0..n]) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    const throw_val = makeThrowOk(args.tctx, arr_val) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    _ = args.chan.trySend(throw_val);
+    args.wake_fn(args.bridge, @ptrCast(args.chan));
+
+    args.backing.destroy(args);
+}
+
+/// write_async worker 线程参数
+const WriteAsyncArgs = struct {
+    io: Io,
+    chan: *value.ChannelValue,
+    fd: i64,
+    /// 已拷贝的待写字节缓冲区（worker 线程拥有，完成后释放）
+    buf: []u8,
+    len: usize,
+    bridge: *anyopaque,
+    wake_fn: *const fn (bridge: *anyopaque, chan: *anyopaque) void,
+    backing: std.mem.Allocator,
+    tctx: *ThreadContext,
+};
+
+/// __net_tcp_write_async(fd: i64, buf: u8[], len: usize) -> *ChannelValue
+///
+/// 异步 TCP write。
+pub fn net_tcp_write_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 3) return error.InvalidArgument;
+
+    const fd = args[0].intCast(i64);
+    const arr = asArray(args[1]) orelse {
+        const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_write_async: buf not array", 22, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    const len_raw = args[2].intCast(i64);
+    if (len_raw < 0) {
+        const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_write_async: negative len", 22, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    }
+    const len: usize = @intCast(len_raw);
+    const actual_len = @min(len, arr.elements.len);
+
+    // 拷贝 buf 到独立缓冲区（worker 线程独立持有，避免跨线程访问 ArrayValue）
+    const write_len = @min(actual_len, 32768);
+    const buf_copy = tctx.backing.alloc(u8, write_len) catch return error.OutOfMemory;
+    var i: usize = 0;
+    while (i < write_len) : (i += 1) {
+        buf_copy[i] = switch (arr.elements[i]) {
+            .u8 => arr.elements[i].asU8(),
+            else => {
+                tctx.backing.free(buf_copy);
+                const io_err = try makeIOError(tctx, .invalid_input, "net_tcp_write_async: buf element not u8", 22, null);
+                return makeThrowErr(tctx, io_err, "io error");
+            },
+        };
+    }
+
+    const chan = value.ChannelValue.create(tctx, 1) catch {
+        tctx.backing.free(buf_copy);
+        return error.OutOfMemory;
+    };
+
+    const args_ptr = tctx.backing.create(WriteAsyncArgs) catch {
+        tctx.backing.free(buf_copy);
+        return error.OutOfMemory;
+    };
+    args_ptr.* = .{
+        .io = io,
+        .chan = chan,
+        .fd = fd,
+        .buf = buf_copy,
+        .len = write_len,
+        .bridge = tctx.io_bridge.?,
+        .wake_fn = tctx.wake_chan_recv_fn.?,
+        .backing = tctx.backing,
+        .tctx = tctx,
+    };
+    const thread = std.Thread.spawn(.{}, writeAsyncWorker, .{args_ptr}) catch {
+        tctx.backing.destroy(args_ptr);
+        tctx.backing.free(buf_copy);
+        const io_err = try makeIOError(tctx, .other, "net_tcp_write_async: spawn failed", 0, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    thread.detach();
+
+    return Value.fromRef(@ptrCast(&chan.header));
+}
+
+/// write_async worker 线程：write + trySend(Throw) + wake + 释放资源。
+fn writeAsyncWorker(args: *WriteAsyncArgs) void {
+    const stream = fdToStream(args.fd);
+    const n = args.io.vtable.netWrite(args.io.userdata, stream.socket.handle, &.{}, &.{args.buf[0..args.len]}, 1) catch |err| {
+        const io_err = makeIOError(args.tctx, errToKind(err), "net_tcp_write_async failed", 0, null) catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.free(args.buf);
+            args.backing.destroy(args);
+            return;
+        };
+        const throw_val = makeThrowErr(args.tctx, io_err, "io error") catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.free(args.buf);
+            args.backing.destroy(args);
+            return;
+        };
+        _ = args.chan.trySend(throw_val);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.free(args.buf);
+        args.backing.destroy(args);
+        return;
+    };
+
+    const throw_val = makeThrowOk(args.tctx, Value.fromUsize(n)) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.free(args.buf);
+        args.backing.destroy(args);
+        return;
+    };
+    _ = args.chan.trySend(throw_val);
+    args.wake_fn(args.bridge, @ptrCast(args.chan));
+
+    args.backing.free(args.buf);
+    args.backing.destroy(args);
+}
+
+/// recv_from_async worker 线程参数
+const RecvFromAsyncArgs = struct {
+    io: Io,
+    chan: *value.ChannelValue,
+    fd: i64,
+    len: usize,
+    bridge: *anyopaque,
+    wake_fn: *const fn (bridge: *anyopaque, chan: *anyopaque) void,
+    backing: std.mem.Allocator,
+    tctx: *ThreadContext,
+};
+
+/// __net_udp_recv_from_async(fd: i64, len: usize) -> *ChannelValue
+///
+/// 异步 UDP recv_from。
+pub fn net_udp_recv_from_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 2) return error.InvalidArgument;
+
+    const fd = args[0].intCast(i64);
+    const len_raw = args[1].intCast(i64);
+    if (len_raw < 0) {
+        const io_err = try makeIOError(tctx, .invalid_input, "net_udp_recv_from_async: negative len", 22, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    }
+    const len: usize = @intCast(len_raw);
+
+    const chan = value.ChannelValue.create(tctx, 1) catch return error.OutOfMemory;
+
+    const args_ptr = tctx.backing.create(RecvFromAsyncArgs) catch return error.OutOfMemory;
+    args_ptr.* = .{
+        .io = io,
+        .chan = chan,
+        .fd = fd,
+        .len = len,
+        .bridge = tctx.io_bridge.?,
+        .wake_fn = tctx.wake_chan_recv_fn.?,
+        .backing = tctx.backing,
+        .tctx = tctx,
+    };
+    const thread = std.Thread.spawn(.{}, recvFromAsyncWorker, .{args_ptr}) catch {
+        tctx.backing.destroy(args_ptr);
+        const io_err = try makeIOError(tctx, .other, "net_udp_recv_from_async: spawn failed", 0, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    thread.detach();
+
+    return Value.fromRef(@ptrCast(&chan.header));
+}
+
+/// recv_from_async worker 线程：recv_from + trySend(Throw) + wake + 释放资源。
+fn recvFromAsyncWorker(args: *RecvFromAsyncArgs) void {
+    var tmp_buf: [32768]u8 = undefined;
+    const read_len = @min(args.len, tmp_buf.len);
+    const sock = fdToSocket(args.fd);
+    const msg = sock.receive(args.io, tmp_buf[0..read_len]) catch |err| {
+        const io_err = makeIOError(args.tctx, errToKind(err), "net_udp_recv_from_async failed", 0, null) catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.destroy(args);
+            return;
+        };
+        const throw_val = makeThrowErr(args.tctx, io_err, "io error") catch {
+            args.wake_fn(args.bridge, @ptrCast(args.chan));
+            args.backing.destroy(args);
+            return;
+        };
+        _ = args.chan.trySend(throw_val);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+
+    // recv_from 成功：构造 RecvFromResult + Throw.ok + trySend + wake
+    const data_val = makeU8Array(args.tctx, msg.data) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    const src_addr_val = makeSocketAddrValue(args.tctx, msg.from) catch {
+        data_val.release(args.tctx);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    var fields: [3]Value = .{
+        Value.fromI64(0), // __tag
+        data_val, // data（RC=1，由 record 窃取）
+        src_addr_val, // src_addr（RC=1，由 record 窃取）
+    };
+    const field_names: [3]?[]const u8 = .{ "__tag", "data", "src_addr" };
+    const result = Value.makeRecordWithNames(args.tctx, "RecvFromResult", &fields, &field_names) catch {
+        src_addr_val.release(args.tctx);
+        data_val.release(args.tctx);
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    const throw_val = makeThrowOk(args.tctx, result) catch {
+        args.wake_fn(args.bridge, @ptrCast(args.chan));
+        args.backing.destroy(args);
+        return;
+    };
+    _ = args.chan.trySend(throw_val);
+    args.wake_fn(args.bridge, @ptrCast(args.chan));
+
+    args.backing.destroy(args);
 }

@@ -35,12 +35,14 @@ pub async fun send_to(self: UdpSocket, dst: SocketAddr, buf: u8[]): Async<Throw<
 }
 
 // 接收 UDP 数据报。返回 RecvFromResult(data, src_addr)。
-// timeout_ns <= 0 时无超时。
-pub async fun recv_from(self: UdpSocket, len: usize, timeout_ns: i64): Async<Throw<RecvFromResult, IOError>> {
+// __net_udp_recv_from_async 创建完成 channel + spawn recv_from 线程，协程在 channel 上 recv 挂起；
+// recv_from 完成后 channel 收到 Throw<RecvFromResult, IOError>。
+pub async fun recv_from(self: UdpSocket, len: usize): Async<Throw<RecvFromResult, IOError>> {
     if self.is_closed {
         throw IOError(InvalidInput, "socket closed", 0, null)
     }
-    __net_udp_recv_from(self.fd, len, timeout_ns)?
+    val done = __net_udp_recv_from_async(self.fd, len)
+    done.recv()
 }
 
 // 关闭套接字。幂等：重复 close 不报错。

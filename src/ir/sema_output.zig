@@ -148,6 +148,8 @@ pub const SemaResult = struct {
     func_sigs: std.ArrayList(FuncSigInfo),
     /// 函数名 → func_sigs 索引
     func_sig_index: std.StringHashMap(u16),
+    /// 协程元数据表（async 函数状态机变换产物，阶段 1）
+    coroutine_metas: std.ArrayList(meta_mod.CoroutineMeta) = .empty,
     /// 构造器名 → (type_def_index << 16 | ctor_index)
     ctor_def_index: std.StringHashMap(u32),
     /// import 别名表：短名 → 别名目标
@@ -185,6 +187,7 @@ pub const SemaResult = struct {
         self.trait_def_index.deinit();
         self.func_sigs.deinit(self.allocator);
         self.func_sig_index.deinit();
+        self.coroutine_metas.deinit(self.allocator);
         self.ctor_def_index.deinit();
         self.import_aliases.deinit();
         if (self.owned_arena) |*arena| {
@@ -272,6 +275,19 @@ pub const SemaResult = struct {
     pub fn getFuncSig(self: *const SemaResult, name: []const u8) ?FuncSigInfo {
         const idx = self.func_sig_index.get(name) orelse return null;
         return self.func_sigs.items[idx];
+    }
+
+    /// 添加协程元数据
+    pub fn putCoroutineMeta(self: *SemaResult, meta: meta_mod.CoroutineMeta) !void {
+        try self.coroutine_metas.append(self.allocator, meta);
+    }
+
+    /// 按 func_idx 查询协程元数据
+    pub fn getCoroutineMetaByFuncIdx(self: *const SemaResult, func_idx: u16) ?*const meta_mod.CoroutineMeta {
+        for (self.coroutine_metas.items) |*m| {
+            if (m.func_idx == func_idx) return m;
+        }
+        return null;
     }
 };
 

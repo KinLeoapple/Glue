@@ -385,6 +385,10 @@ pub const AsyncHandle = struct {
     result_consumed: std.atomic.Value(bool),
     /// worker 线程完全退出后设置（主线程等待此标志确保 worker 清理完成）
     worker_done: std.atomic.Value(bool),
+    /// 引用参数对象列表（主线程的对象，worker 通过 &T 修改）
+    /// worker 执行前填充，主线程在 join 后据此遍历并迁移 worker 分配的堆值
+    ref_param_objs: [4]?*ObjHeader = .{ null, null, null, null },
+    ref_param_count: u8 = 0,
     panic_buf: [PANIC_BUF_SIZE]u8 = [_]u8{0} ** PANIC_BUF_SIZE,
     panic_len: u8 = 0,
     mutex: Mutex,
@@ -685,6 +689,29 @@ pub const ChannelValue = struct {
         return val;
     }
 
+    /// 非阻塞发送。通道满或关闭时立即返回 false，不阻塞。
+    /// 供协程 orbit_chan_send try-first 使用：成功继续段执行，失败挂起。
+    pub fn trySend(self: *ChannelValue, val: Value) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return false;
+        if (self.capacity == 0) {
+            // 会合模式：仅当接收方已就绪（rend_ready=false 且有等待接收方）时才提交。
+            // 会合模式 trySend 语义：若无接收方等待则失败（不阻塞）。
+            // 通过 not_empty.waiters 判断是否有等待接收方不可靠（waiters 计数语义），
+            // 改用：会合模式下 trySend 仅在对方已调用 recv 且阻塞（rend_ready 翻转前）时成功。
+            // 简化：会合模式 trySend 始终返回 false（让调用方挂起走阻塞 send 路径），
+            // 避免会合模式下的 try-first 复杂性。
+            return false;
+        }
+        if (self.count >= self.capacity) return false;
+        self.buffer[self.tail] = val;
+        self.tail = (self.tail + 1) % self.capacity;
+        self.count += 1;
+        self.not_empty.signal();
+        return true;
+    }
+
     /// 关闭通道，唤醒所有阻塞的发送方与接收方。
     pub fn close(self: *ChannelValue) void {
         self.mutex.lock();
@@ -856,6 +883,8 @@ test "AsyncHandle setPanic 内联缓冲区" {
     try testing.expect(handle.panicMessage() != null);
     try testing.expectEqualStrings("boom", handle.panicMessage().?);
     try testing.expectEqual(AsyncStatus.Failed, handle.getStatus());
+    // deinit 会等待 worker_done 标志；本测试无 worker 线程，手动标记以解除等待
+    handle.signalWorkerDone();
     handle.deinit(&tc.c);
     tc.c.freeObj(@ptrCast(handle));
 }

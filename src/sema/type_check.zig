@@ -17,6 +17,7 @@ const throw_check = @import("throw_check");
 const kind_check = @import("kind_check");
 const gadt_check = @import("gadt_check");
 const module_check = @import("module_check");
+// state_machine_transform 已移至 ir 模块（避免 ir↔sema 循环依赖）
 
 /// SemaResult 契约类型（来自 ir 模块）：sema 产出、builder 消费的表达式类型映射。
 const SemaResult = ir.SemaResult;
@@ -64,7 +65,7 @@ fn semaTypeToChanType(ty: *Type) ?ChanType {
         },
         .ref_type => .ref_chan,
         .throw_type => |tt| semaTypeToChanType(tt.value_type) orelse .ref_chan,
-        .type_var, .unknown_type => null,
+        .type_var, .unknown_type, .never_type => null,
     };
 }
 
@@ -154,6 +155,10 @@ pub const Type = union(enum) {
     char_type,
     null_type,
     unit_type,
+    /// 发散类型：表示通过 return/throw 等控制流提前退出的表达式不产生值。
+    /// never_type 与任何类型兼容（统一为对方），用于 match 分支、if 分支等
+    /// 含早退路径的类型统一场景。
+    never_type,
     type_var: *TypeVar,
     fn_type: struct {
         params: []*Type,
@@ -1066,6 +1071,8 @@ pub const TypeInferencer = struct {
         const resolved1 = self.resolve(t1);
         const resolved2 = self.resolve(t2);
         if (resolved1 == resolved2) return;
+        // never_type（发散）与任何类型兼容：不产生值，无需约束对方类型
+        if (resolved1.* == .never_type or resolved2.* == .never_type) return;
         switch (resolved1.*) {
             .type_var => |tv1| {
                 if (self.occurs(tv1.id, resolved2)) {
@@ -1206,7 +1213,7 @@ pub const TypeInferencer = struct {
             .u8_type, .u16_type, .u32_type, .u64_type, .u128_type,
             .isize_type, .usize_type,
             .f16_type, .f32_type, .f64_type, .f128_type,
-            .bool_type, .str_type, .char_type, .null_type, .unit_type, .unknown_type => true,
+            .bool_type, .str_type, .char_type, .null_type, .unit_type, .unknown_type, .never_type => true,
             .type_var => |va| {
                 if (b.* == .type_var) {
                     return va.id == b.type_var.id;
@@ -2282,6 +2289,9 @@ pub const TypeInferencer = struct {
                     self.popLinearScope();
                     const rthen = self.resolve(then_ty);
                     const relse = self.resolve(else_ty);
+                    // 发散分支（never_type）不贡献值，类型由另一侧决定
+                    if (rthen.* == .never_type) return else_ty;
+                    if (relse.* == .never_type) return then_ty;
                     if (rthen.* == .unit_type and relse.* != .unit_type) return else_ty;
                     if (relse.* == .unit_type and rthen.* != .unit_type) return then_ty;
                     const unified = try self.tryWidenUnify(then_ty, else_ty);
@@ -2293,18 +2303,22 @@ pub const TypeInferencer = struct {
                 const child_env = try env.createChild();
                 self.pushLinearScope();
                 var result_ty = try self.makeType(.unit_type);
+                var diverges = false;
                 for (blk.statements) |stmt| {
-                    const stmt_ty = try self.inferStmt(stmt, child_env);
-                    // return_stmt 的类型是函数返回值，在没有尾表达式时用作 block 类型
+                    _ = try self.inferStmt(stmt, child_env);
                     switch (stmt.*) {
-                        .return_stmt => {
-                            if (stmt_ty) |st| result_ty = st;
+                        .return_stmt, .throw_stmt => {
+                            diverges = true;
                         },
                         else => {},
                     }
                 }
                 if (blk.trailing_expr) |te| {
                     result_ty = try self.inferExpr(te, child_env, null);
+                } else if (diverges) {
+                    // 块通过 return/throw 提前退出，不会产生值：类型为 never，
+                    // 能与任何类型统一（用于 match/if 分支含早退路径的场景）
+                    result_ty = try self.makeType(.never_type);
                 }
                 self.popLinearScope();
                 return result_ty;
@@ -2853,7 +2867,17 @@ pub const TypeInferencer = struct {
             },
             .return_stmt => |ret| {
                 if (ret.value) |v| {
-                    return self.inferExpr(v, env, null);
+                    const val_ty = try self.inferExpr(v, env, null);
+                    // 块类型改为 never_type 后，return 值类型不再通过 unifyReturnType
+                    // 间接检查（块类型为 never 会与任何声明类型兼容），此处显式校验
+                    // 返回值类型与函数声明返回类型匹配
+                    if (self.current_fn_return_type) |fn_ret| {
+                        self.unifyReturnType(fn_ret, val_ty) catch {
+                            const ret_loc = ast.exprLocation(v);
+                            self.addErrorAt(.type_mismatch, ret_loc.line, ret_loc.column, "return value type does not match function return type", .{});
+                        };
+                    }
+                    return val_ty;
                 }
                 return self.makeType(.unit_type);
             },
@@ -4170,9 +4194,8 @@ pub const TypeInferencer = struct {
     /// 类型签名按 stdlib 设计文档（docs/superpowers/specs/2026-07-19-stdlib-design.md）
     /// 表 4.1（IO）与表 5.1（Time）。
     fn registerSyscallSignatures(self: *TypeInferencer, env: *TypeEnv) void {
-        // 构造 IOError 与 TimeError 的 ADT 类型（已由 BUILTIN_TYPES 注册，复用即可）
+        // 构造 IOError 的 ADT 类型（已由 BUILTIN_TYPES 注册，复用即可）
         const io_error_ty = self.makeAdtType("IOError", &[_]*Type{}) catch return;
-        const time_error_ty = self.makeAdtType("TimeError", &[_]*Type{}) catch return;
 
         // 通用：构造 Throw<T, E> 类型
         const makeThrowTy = struct {
@@ -4209,8 +4232,6 @@ pub const TypeInferencer = struct {
         // DirEntry 类型：std/io 中定义的 record
         const dir_entry_ty = self.makeGenericType("DirEntry", &[_]*Type{}) catch return;
         const dir_entry_array_ty = self.makeArrayType(dir_entry_ty, null) catch return;
-        // TimeComponents 类型：std/time 中定义的 record
-        const time_comp_ty = self.makeGenericType("TimeComponents", &[_]*Type{}) catch return;
         // Net 类型：std/net 中定义的 record/ADT
         const ip_addr_ty = self.makeGenericType("IpAddr", &[_]*Type{}) catch return;
         const ip_addr_array_ty = self.makeArrayType(ip_addr_ty, null) catch return;
@@ -4232,13 +4253,12 @@ pub const TypeInferencer = struct {
             ps[0] = i64_ty;
             define(self, env, "__file_close", ps, makeThrowTy(self, unit_ty, io_error_ty));
         }
-        // __file_read(fd: i64, buf: u8[], len: usize) -> Throw<usize, IOError>
+        // __file_read(fd: i64, len: usize) -> Throw<u8[], IOError>
         {
-            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
             ps[0] = i64_ty;
-            ps[1] = u8_array_ty;
-            ps[2] = usize_ty;
-            define(self, env, "__file_read", ps, makeThrowTy(self, usize_ty, io_error_ty));
+            ps[1] = usize_ty;
+            define(self, env, "__file_read", ps, makeThrowTy(self, u8_array_ty, io_error_ty));
         }
         // __file_write(fd: i64, buf: u8[], len: usize) -> Throw<usize, IOError>
         {
@@ -4255,12 +4275,6 @@ pub const TypeInferencer = struct {
             ps[1] = i64_ty;
             ps[2] = i32_ty;
             define(self, env, "__file_seek", ps, makeThrowTy(self, i64_ty, io_error_ty));
-        }
-        // __file_tell(fd: i64) -> Throw<i64, IOError>
-        {
-            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
-            ps[0] = i64_ty;
-            define(self, env, "__file_tell", ps, makeThrowTy(self, i64_ty, io_error_ty));
         }
         // __file_stat(path: str) -> Throw<Stat, IOError>
         {
@@ -4336,24 +4350,6 @@ pub const TypeInferencer = struct {
         {
             const ps = self.arena.allocator().alloc(*Type, 0) catch return;
             define(self, env, "__localtime_offset_minutes", ps, i32_ty);
-        }
-        // __systemtime_to_local_components(ns: i128) -> TimeComponents
-        {
-            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
-            ps[0] = i128_ty;
-            define(self, env, "__systemtime_to_local_components", ps, time_comp_ty);
-        }
-        // __systemtime_to_utc_components(ns: i128) -> TimeComponents
-        {
-            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
-            ps[0] = i128_ty;
-            define(self, env, "__systemtime_to_utc_components", ps, time_comp_ty);
-        }
-        // __components_to_ns_utc(comp: TimeComponents) -> Throw<i128, TimeError>
-        {
-            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
-            ps[0] = time_comp_ty;
-            define(self, env, "__components_to_ns_utc", ps, makeThrowTy(self, i128_ty, time_error_ty));
         }
 
         // ── Net syscall ──

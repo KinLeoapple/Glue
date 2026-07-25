@@ -262,9 +262,15 @@ pub fn inferMethodCall(
     // 并通过第一个参数类型匹配 obj_ty 来确定正确的方法。
     {
         const robj = inferencer.resolve(obj_ty);
+        // ref_type 递归到 inner 以支持 &T 方法调用（self: &TcpStream → 查找 TcpStream.read）
         const type_name: ?[]const u8 = switch (robj.*) {
             .adt_type => |at| at.name,
             .generic_type => |gt| gt.name,
+            .ref_type => |rt| switch (inferencer.resolve(rt.inner).*) {
+                .adt_type => |at| at.name,
+                .generic_type => |gt| gt.name,
+                else => null,
+            },
             else => null,
         };
         if (type_name) |tn| {
@@ -304,6 +310,11 @@ pub fn inferMethodCall(
                                 const obj_name: ?[]const u8 = switch (obj_resolved.*) {
                                     .adt_type => |at| at.name,
                                     .generic_type => |gt| gt.name,
+                                    .ref_type => |rt| switch (inferencer.resolve(rt.inner).*) {
+                                        .adt_type => |at| at.name,
+                                        .generic_type => |gt| gt.name,
+                                        else => null,
+                                    },
                                     else => null,
                                 };
                                 if (param_name != null and obj_name != null and
