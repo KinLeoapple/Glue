@@ -1,6 +1,7 @@
 // 测试各种多行 type 声明 + 尾随逗号
 
 // 模式 1: ADT 跨行,每个 | 单独一行
+import std.io.Console.{println}
 type Tree =
     | Leaf
     | Node(i32, Tree, Tree)

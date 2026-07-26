@@ -1,5 +1,6 @@
 // Edge cases: nullable chains, ?? coalescing, ? propagation, error subtyping
 
+import std.io.Console.{println}
 type Addr = Addr(city: str, zip: i32)
 type User = User(name: str, addr: Addr?)
 type Account = Account(owner: User?, balance: i32)

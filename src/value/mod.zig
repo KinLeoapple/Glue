@@ -1209,6 +1209,8 @@ pub const Value = union(enum) {
                     .receiver_val => try buf.appendSlice(al, "<receiver>"),
                     .trait_val => try buf.appendSlice(al, "<trait>"),
                     .lazy_val => try buf.appendSlice(al, "<lazy>"),
+                    .coroutine_frame => try buf.appendSlice(al, "<coroutine>"),
+                    .boxed_scalar => try buf.appendSlice(al, "<boxed>"),
                 }
             },
         }
@@ -1337,13 +1339,27 @@ pub fn equals(a: Value, b: Value) bool {
 /// 注册所有堆对象类型的 deinit 函数
 ///
 /// 应在运行时初始化阶段调用，使 obj_header.release 能正确分派到各类型的析构函数。
+/// 线程安全：三态原子保证只注册一次，避免 worker 线程并发调用导致数据竞争。
+/// 0=未注册 1=注册中 2=已注册
+var deinits_state: std.atomic.Value(u8) = .init(0);
+
 pub fn registerAllDeinits() void {
-    composite.registerDeinits();
-    callable.registerDeinits();
-    control.registerDeinits();
-    iterator.registerDeinits();
-    concurrent.registerDeinits();
-    obj_header.registerDeinit(.str, str_mod.strDeinit);
+    if (deinits_state.load(.acquire) == 2) return;
+    if (deinits_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+        // 抢到注册权：执行注册
+        composite.registerDeinits();
+        callable.registerDeinits();
+        control.registerDeinits();
+        iterator.registerDeinits();
+        concurrent.registerDeinits();
+        obj_header.registerDeinit(.str, str_mod.strDeinit);
+        deinits_state.store(2, .release);
+    } else {
+        // 其他线程正在注册：自旋等待完成
+        while (deinits_state.load(.acquire) != 2) {
+            std.Thread.yield() catch {};
+        }
+    }
 }
 
 test {

@@ -37,9 +37,6 @@ const FrameContext = runtime_mod.FrameContext;
 const TypeMetadata = ir_mod.meta_mod.TypeMetadata;
 const TypeKind = ir_mod.meta_mod.TypeKind;
 
-const debug_route_dispatch = false;
-const debug_record = false;
-const debug_orbit = true;
 const ThreadContext = mem.ThreadContext;
 const GlobalPool = mem.GlobalPool;
 
@@ -252,7 +249,7 @@ pub const Engine = struct {
     owns_tctx: bool = false,
     global: ?*GlobalPool = null,
     owns_global: bool = false,
-    /// IO 接口（用于内置 print/println 输出，可选）
+    /// IO 接口（用于 syscall dispatch 执行，可选）
     io: ?std.Io = null,
 
     /// 函数调用栈（堆分配，支持深度递归）
@@ -372,7 +369,7 @@ pub const Engine = struct {
     /// 初始化引擎（内部创建 ThreadContext，用于简单场景）
     /// global_prof 非 null 且 enabled 时，ThreadContext 会创建并注册 ThreadProfiler
     /// io 仅用于 GlobalPool/BuddyAllocator 的 fiber-aware 同步原语；
-    /// Engine.io（print 输出用）保持 null，由调用方按需注入
+    /// Engine.io（syscall dispatch 用）保持 null，由调用方按需注入
     pub fn initOwned(ir: *GlueIR, backing: std.mem.Allocator, global_prof: ?*profiling.GlobalProfiler, io: std.Io) !Engine {
         // 注册所有堆对象的析构函数（确保 release 时正确分派）
         value.registerAllDeinits();
@@ -418,9 +415,15 @@ pub const Engine = struct {
     /// 释放引擎资源
     pub fn deinit(self: *Engine) void {
         // 关闭模式：deinit 函数跳过级联 release 包含值，
-        // tracked_objs 循环单独释放每个跟踪对象，避免访问已释放内存
-        value.obj_header.shutdown_mode = true;
-        defer value.obj_header.shutdown_mode = false;
+        // tracked_objs 循环单独释放每个跟踪对象，避免访问已释放内存。
+        // 仅主引擎设置/清除：worker 引擎在 sched.deinit()（主引擎 deinit 内）时销毁，
+        // 此时主引擎已设 shutdown_mode=true，worker 复用即可，避免并发清除导致 UAF。
+        if (!self.is_worker) {
+            value.obj_header.shutdown_mode.store(true, .release);
+        }
+        defer if (!self.is_worker) {
+            value.obj_header.shutdown_mode.store(false, .release);
+        };
 
         const backing = self.tctx.?.backing;
 
@@ -733,11 +736,20 @@ pub const Engine = struct {
         const self: *Engine = @ptrCast(@alignCast(ctx));
         if (frame.func_idx >= self.ir.functions.len) return;
         const func = &self.ir.functions[frame.func_idx];
-        // CoroutineMeta 按 func_idx 索引，持有 FrameLayout
-        if (frame.func_idx >= self.ir.coroutine_metas.len) return;
-        const meta = &self.ir.coroutine_metas[frame.func_idx];
+        // coroutine_metas 只包含 async 函数的 meta（按 func_idx 线性搜索），
+        // 长度 = async 函数数量，不是 functions.len。
+        // 不能用 coroutine_metas[frame.func_idx] 直接索引，必须用 getCoroutineMeta 查找。
+        const meta = self.ir.getCoroutineMeta(frame.func_idx) orelse return;
         const locals_base: [*]u8 = @ptrCast(frame.localsPtr());
         self.runtime.installFrameChannels(locals_base, func, &meta.frame_layout);
+        // 协程段执行不经 execFunction，current_func_idx 不会被设置。
+        // 必须在此设置为 async 函数的 func_idx，否则 execCallStandard 的
+        // TCO/自递归检测（call_meta.func_index == current_func_idx）会误判：
+        // worker engine 的 current_func_idx 默认 0，若普通函数 func_idx 也为 0，
+        // 会被误判为自递归/TCO，跳过 enterFunction，导致 callee 通道未安装。
+        self.current_func_idx = frame.func_idx;
+        // 清除上一段残留的 TCO 信号，避免误触发 execFunction 的 trampoline 循环
+        self.tco_restart = false;
     }
 
     /// 跟踪堆对象（引擎创建的所有堆对象都应调用此方法）
@@ -785,8 +797,8 @@ pub const Engine = struct {
         return out;
     }
 
-    /// 运行入口函数，返回 i64 结果（main 函数的返回值）
-    pub fn run(self: *Engine) EngineError!i64 {
+    /// 运行入口函数，返回 main 函数的返回值（Value 联合体，完整支持所有标量类型）
+    pub fn run(self: *Engine) EngineError!value.Value {
         // 协程调度器惰性启动：此时 self 已落在调用方稳定存储，worker 线程
         // 持有的 ctx 不会悬垂。幂等（已启动则直接返回）。协程是 async 的唯一路径。
         if (self.scheduler == null) {
@@ -825,22 +837,9 @@ pub const Engine = struct {
         self.result_chan = result_chan;
 
         // 读取返回值（必须在 leaveFunction 之前，因为 leaveFunction 会 resetTo 回收通道内存）
-        const ret_meta = self.ir.channels.get(result_chan);
-        const w = ret_meta.elem_width;
-        const result: i64 = if (w == 0) 0 // unit 返回值
-        else if (ret_meta.chan_type == .bool_chan or ret_meta.chan_type == .mask_chan) @intFromBool(self.runtime.readBool(result_chan))
-        else blk: {
-            // 按宽度读取整数值（符号扩展）
-            const ptr = self.runtime.rawPtr(result_chan);
-            break :blk switch (w) {
-                1 => @as(i64, @as(i8, @bitCast(ptr[0]))),
-                2 => @as(i64, @as(i16, @bitCast(@as(*[2]u8, @ptrCast(ptr)).*))),
-                4 => @as(i64, @as(i32, @bitCast(@as(*[4]u8, @ptrCast(ptr)).*))),
-                8 => @as(i64, @bitCast(@as(*[8]u8, @ptrCast(ptr)).*)),
-                16 => @as(i64, @truncate(@as(i128, @bitCast(@as(*[16]u8, @ptrCast(ptr)).*)))),
-                else => 0,
-            };
-        };
+        // 通用实现：复用 chanToValue，完整支持所有标量类型（含 i128/u128/f128），
+        // ref_chan 走 BoxedScalar/LazyValue 快路径，避免任何截断。
+        const result = self.chanToValue(result_chan);
         self.runtime.leaveFunction();
         return result;
     }
@@ -870,13 +869,6 @@ pub const Engine = struct {
             const nodes = self.ir.funcNodes(func_idx);
             const node_start = func.node_start;
             self.current_func_idx = func_idx;
-
-            if (debug_orbit and func_idx == 0) {
-                std.debug.print("=== main function nodes (count={}) ===\n", .{nodes.len});
-                for (nodes, 0..) |n, i| {
-                    std.debug.print("  [{}] op={s} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ i, @tagName(n.op), if (n.input_count > 0) n.inputs[0] else 0, if (n.input_count > 1) n.inputs[1] else 0, if (n.input_count > 2) n.inputs[2] else 0, if (n.input_count > 3) n.inputs[3] else 0, n.output, n.meta_index });
-                }
-            }
 
         // 构建子图跳过位图：vec_map/vec_fold/vec_scan 等的 body 子图
         // 不在主循环中执行，由对应的 vec_* exec 函数按需执行
@@ -1151,9 +1143,6 @@ pub const Engine = struct {
                             if (fbc.body_has_call) {
                                 for (fbc.body_insts) |inst| {
                                     inst.exec(self, inst.node) catch |err| {
-                                        if (err == error.InvalidChannel and debug_orbit) {
-                                            std.debug.print("InvalidChannel(BodyInst) op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ @tagName(inst.node.op), func_idx, if (inst.node.input_count > 0) inst.node.inputs[0] else 0, if (inst.node.input_count > 1) inst.node.inputs[1] else 0, if (inst.node.input_count > 2) inst.node.inputs[2] else 0, if (inst.node.input_count > 3) inst.node.inputs[3] else 0, inst.node.output, inst.node.meta_index });
-                                        }
                                         return err;
                                     };
                                     if (self.pending_halt) |halt_c| {
@@ -1173,9 +1162,6 @@ pub const Engine = struct {
                                 // body 无 call 节点：跳过 tco_restart 检查（hot path 优化）
                                 for (fbc.body_insts) |inst| {
                                     inst.exec(self, inst.node) catch |err| {
-                                        if (err == error.InvalidChannel and debug_orbit) {
-                                            std.debug.print("InvalidChannel(BodyInst/no-call) op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ @tagName(inst.node.op), func_idx, if (inst.node.input_count > 0) inst.node.inputs[0] else 0, if (inst.node.input_count > 1) inst.node.inputs[1] else 0, if (inst.node.input_count > 2) inst.node.inputs[2] else 0, if (inst.node.input_count > 3) inst.node.inputs[3] else 0, inst.node.output, inst.node.meta_index });
-                                        }
                                         return err;
                                     };
                                     if (self.pending_halt) |halt_c| {
@@ -1290,9 +1276,6 @@ pub const Engine = struct {
                     }
 
                     const result = self.execNode(node) catch |err| {
-                        if (err == error.InvalidChannel and debug_orbit) {
-                            std.debug.print("InvalidChannel at node pc={} op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ pc, @tagName(node.op), func_idx, if (node.input_count > 0) node.inputs[0] else 0, if (node.input_count > 1) node.inputs[1] else 0, if (node.input_count > 2) node.inputs[2] else 0, if (node.input_count > 3) node.inputs[3] else 0, node.output, node.meta_index });
-                        }
                         return err;
                     };
                     if (self.tco_restart) {
@@ -1533,12 +1516,6 @@ pub const Engine = struct {
             .scalar_loop => return try self.execScalarLoop(node),
 
             // === 内置函数 ===
-            .builtin_print => try self.execBuiltinPrint(node, false, false),
-            .builtin_println => try self.execBuiltinPrint(node, true, false),
-            .builtin_eprint => try self.execBuiltinPrint(node, false, true),
-            .builtin_eprintln => try self.execBuiltinPrint(node, true, true),
-            .builtin_scan => try self.execBuiltinScan(node, false),
-            .builtin_scanln => try self.execBuiltinScan(node, true),
             .builtin_ok => try self.execBuiltinOk(node),
             .builtin_error => try self.execBuiltinError(node),
             .builtin_eq => try self.execBuiltinEq(node),
@@ -1546,6 +1523,12 @@ pub const Engine = struct {
             .builtin_str => try self.execBuiltinStr(node),
             .builtin_type => try self.execBuiltinType(node),
             .builtin_typeof => try self.execBuiltinTypeof(node),
+            .builtin_reflect => try self.execBuiltinReflect(node),
+            .builtin_reflect_field => try self.execBuiltinReflectField(node),
+            .builtin_scalar_to_str => try self.execBuiltinScalarToStr(node),
+            .builtin_reflect_deref => try self.execBuiltinReflectDeref(node),
+            .builtin_reflect_field_name => try self.execBuiltinReflectFieldName(node),
+            .builtin_reflect_meta => try self.execBuiltinReflectMeta(node),
             .builtin_panic => return error.Panic,
 
             // === Syscall 调用 ===
@@ -2139,308 +2122,15 @@ pub const Engine = struct {
         _ = node;
     }
 
-    /// 内置 print/println/eprint/eprintln：根据通道类型打印值
-    fn execBuiltinPrint(self: *Engine, node: *const Node, with_newline: bool, to_stderr: bool) EngineError!void {
-        const val_chan = node.inputs[0];
-        const meta = self.ir.channels.get(val_chan);
-
-        // 通过通用观察点读取值：readScalarValue 会在 ref_chan 指向 LazyValue 时自动强制求值。
-        // 同时保存结果，供 ref_chan 标量回退路径使用（类型参数实例化为标量时 ref_chan 持有标量位模式）。
-        const observed_val = try self.readScalarValue(val_chan);
-
-        // io 仅用作"是否处于真实执行环境"的标记（测试中为 null，跳过实际输出）
-        // 实际输出统一走注入的 std.Io（stdout/stderr streaming writer），
-        // 避免裸 std.c.write 与 std.Io 缓冲层状态不同步导致重复内容丢失
-        const io = self.io orelse return;
-
-        var buf: [4096]u8 = undefined;
-        var len: usize = 0;
-
-        // 格式化追加到 buf 的辅助函数
-        const ap = struct {
-            fn call(b: []u8, pos: *usize, comptime fmt: []const u8, args: anytype) void {
-                if (pos.* >= b.len) return;
-                const result = std.fmt.bufPrint(b[pos.*..], fmt, args) catch return;
-                pos.* += result.len;
-            }
-        }.call;
-
-        switch (meta.chan_type) {
-            .ref_chan => {
-                // Lazy<T> 被打印时强制求值一次，避免惰性语义仅停留在包装层
-                if (self.readLazyValue(val_chan)) |lazy| {
-                    const forced = try self.forceLazyValue(lazy);
-                    switch (forced) {
-                        .i64 => |b| ap(&buf, &len, "{d}", .{@as(i64, @bitCast(b))}),
-                        .i32 => |b| ap(&buf, &len, "{d}", .{@as(i32, @bitCast(b))}),
-                        .i16 => |b| ap(&buf, &len, "{d}", .{@as(i16, @bitCast(b[0..2].*))}),
-                        .i8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
-                        .u64 => |b| ap(&buf, &len, "{d}", .{@as(u64, @bitCast(b))}),
-                        .u32 => |b| ap(&buf, &len, "{d}", .{@as(u32, @bitCast(b))}),
-                        .u16 => |b| ap(&buf, &len, "{d}", .{@as(u16, @bitCast(b[0..2].*))}),
-                        .u8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
-                        .f64 => |b| ap(&buf, &len, "{d}", .{@as(f64, @bitCast(b))}),
-                        .f32 => |b| ap(&buf, &len, "{d}", .{@as(f32, @bitCast(b[0..4].*))}),
-                        .boolean => |b| ap(&buf, &len, "{}", .{b[0] != 0}),
-                        .char => |b| ap(&buf, &len, "{c}", .{@as(u8, @intCast(@as(u32, @bitCast(b[0..4].*))))}),
-                        .unit => ap(&buf, &len, "()", .{}),
-                        .null_val => ap(&buf, &len, "null", .{}),
-                        .ref => ap(&buf, &len, "<obj>", .{}),
-                        else => ap(&buf, &len, "<lazy:?>", .{}),
-                    }
-                    return self.flushPrintBuf(io, to_stderr, &buf, len, with_newline);
-                }
-                // 按引用类型分派打印
-                if (self.readStr(val_chan)) |s| {
-                    ap(&buf, &len, "{s}", .{s.bytes()});
-                } else if (self.readThrow(val_chan)) |tv| {
-                    switch (tv.payload) {
-                        .ok => |v| {
-                            // 简化：标量值打印数字，引用打印类型
-                            switch (v) {
-                                .i64 => |b| ap(&buf, &len, "Ok({d})", .{@as(i64, @bitCast(b))}),
-                                .i32 => |b| ap(&buf, &len, "Ok({d})", .{@as(i32, @bitCast(b))}),
-                                .boolean => |b| ap(&buf, &len, "Ok({})", .{b[0] != 0}),
-                                .null_val => ap(&buf, &len, "Ok(null)", .{}),
-                                .unit => ap(&buf, &len, "Ok(())", .{}),
-                                .ref => ap(&buf, &len, "Ok(<obj>)", .{}),
-                                else => ap(&buf, &len, "Ok(?)", .{}),
-                            }
-                        },
-                        .err => |e| {
-                            ap(&buf, &len, "Error({s})", .{e.message});
-                        },
-                    }
-                } else if (self.readError(val_chan)) |e| {
-                    ap(&buf, &len, "Error({s})", .{e.message});
-                } else if (self.readRecord(val_chan)) |rec| {
-                    // record/ADT/newtype：打印 TypeName(field0, field1, ...)
-                    ap(&buf, &len, "{s}(", .{if (rec.type_name.len > 0) rec.type_name else "record"});
-                    for (rec.fields, 0..) |f, i| {
-                        if (i > 0) ap(&buf, &len, ", ", .{});
-                        switch (f) {
-                            .boolean => |b| ap(&buf, &len, "{}", .{b[0] != 0}),
-                            .char => |c| {
-                                const cp: u32 = (@as(u32, c[0]) << 24) | (@as(u32, c[1]) << 16) | (@as(u32, c[2]) << 8) | @as(u32, c[3]);
-                                if (cp < 128) {
-                                    ap(&buf, &len, "{c}", .{@as(u8, @intCast(cp))});
-                                } else {
-                                    ap(&buf, &len, "U+{x:0>4}", .{cp});
-                                }
-                            },
-                            .i8 => ap(&buf, &len, "{d}", .{f.asI8()}),
-                            .i16 => ap(&buf, &len, "{d}", .{f.asI16()}),
-                            .i32 => ap(&buf, &len, "{d}", .{f.asI32()}),
-                            .i64 => ap(&buf, &len, "{d}", .{f.asI64()}),
-                            .i128 => ap(&buf, &len, "{d}", .{f.asI128()}),
-                            .u8 => ap(&buf, &len, "{d}", .{f.asU8()}),
-                            .u16 => ap(&buf, &len, "{d}", .{f.asU16()}),
-                            .u32 => ap(&buf, &len, "{d}", .{f.asU32()}),
-                            .u64 => ap(&buf, &len, "{d}", .{f.asU64()}),
-                            .u128 => ap(&buf, &len, "{d}", .{f.asU128()}),
-                            .isize => ap(&buf, &len, "{d}", .{f.asIsize()}),
-                            .usize => ap(&buf, &len, "{d}", .{f.asUsize()}),
-                            .f16 => ap(&buf, &len, "{d}", .{f.asF16()}),
-                            .f32 => ap(&buf, &len, "{d}", .{f.asF32()}),
-                            .f64 => ap(&buf, &len, "{d}", .{f.asF64()}),
-                            .f128 => ap(&buf, &len, "{d}", .{f.asF128()}),
-                            .unit => ap(&buf, &len, "()", .{}),
-                            .null_val => ap(&buf, &len, "null", .{}),
-                            .ref => |obj| {
-                                if (obj.type_tag == .str) {
-                                    const sv: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", obj));
-                                    ap(&buf, &len, "{s}", .{sv.bytes()});
-                                } else {
-                                    ap(&buf, &len, "<obj>", .{});
-                                }
-                            },
-                        }
-                    }
-                    ap(&buf, &len, ")", .{});
-                } else if (self.readAtomicValue(val_chan)) |av| {
-                    // AtomicValue：加载内部值并打印
-                    const inner = av.load();
-                    switch (inner) {
-                        .i64 => |b| ap(&buf, &len, "{d}", .{@as(i64, @bitCast(b))}),
-                        .i32 => |b| ap(&buf, &len, "{d}", .{@as(i32, @bitCast(b))}),
-                        .i16 => |b| ap(&buf, &len, "{d}", .{@as(i16, @bitCast(b))}),
-                        .i8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
-                        .u64 => |b| ap(&buf, &len, "{d}", .{@as(u64, @bitCast(b))}),
-                        .u32 => |b| ap(&buf, &len, "{d}", .{@as(u32, @bitCast(b))}),
-                        .u16 => |b| ap(&buf, &len, "{d}", .{@as(u16, @bitCast(b))}),
-                        .u8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
-                        .f64 => |b| ap(&buf, &len, "{d}", .{@as(f64, @bitCast(b))}),
-                        .f32 => |b| ap(&buf, &len, "{d}", .{@as(f32, @bitCast(b))}),
-                        .boolean => |b| ap(&buf, &len, "{}", .{b[0] != 0}),
-                        .unit => ap(&buf, &len, "()", .{}),
-                        .null_val => ap(&buf, &len, "null", .{}),
-                        else => ap(&buf, &len, "<atomic:?>", .{}),
-                    }
-                } else {
-                    // ref_chan 持有标量位模式（类型参数实例化为标量时）：
-                    // 按 observed_val 的实际类型打印
-                    switch (observed_val) {
-                        .i64 => |b| ap(&buf, &len, "{d}", .{@as(i64, @bitCast(b))}),
-                        .i32 => |b| ap(&buf, &len, "{d}", .{@as(i32, @bitCast(b))}),
-                        .i16 => |b| ap(&buf, &len, "{d}", .{@as(i16, @bitCast(b))}),
-                        .i8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
-                        .u64 => |b| ap(&buf, &len, "{d}", .{@as(u64, @bitCast(b))}),
-                        .u32 => |b| ap(&buf, &len, "{d}", .{@as(u32, @bitCast(b))}),
-                        .u16 => |b| ap(&buf, &len, "{d}", .{@as(u16, @bitCast(b))}),
-                        .u8 => |b| ap(&buf, &len, "{d}", .{b[0]}),
-                        .f64 => |b| ap(&buf, &len, "{d}", .{@as(f64, @bitCast(b))}),
-                        .f32 => |b| ap(&buf, &len, "{d}", .{@as(f32, @bitCast(b))}),
-                        .boolean => |b| ap(&buf, &len, "{}", .{b[0] != 0}),
-                        .null_val => ap(&buf, &len, "null", .{}),
-                        .unit => ap(&buf, &len, "()", .{}),
-                        else => ap(&buf, &len, "null", .{}),
-                    }
-                }
-            },
-            .i64_chan => ap(&buf, &len, "{d}", .{self.runtime.readI64(val_chan)}),
-            .i32_chan => {
-                const ptr: *i32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .i16_chan => {
-                const ptr: *i16 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .i8_chan => {
-                const ptr: *i8 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .i128_chan => {
-                const ptr: *i128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .u64_chan => ap(&buf, &len, "{d}", .{self.runtime.readU64(val_chan)}),
-            .u32_chan => {
-                const ptr: *u32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .u16_chan => {
-                const ptr: *u16 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .u8_chan => {
-                ap(&buf, &len, "{d}", .{self.runtime.rawPtr(val_chan)[0]});
-            },
-            .u128_chan => {
-                const ptr: *u128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .isize_chan => ap(&buf, &len, "{d}", .{self.runtime.readUsize(val_chan)}),
-            .usize_chan => ap(&buf, &len, "{d}", .{self.runtime.readUsize(val_chan)}),
-            .f64_chan => ap(&buf, &len, "{d}", .{self.runtime.readF64(val_chan)}),
-            .f32_chan => {
-                const ptr: *f32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .f16_chan => {
-                const ptr: *f16 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                ap(&buf, &len, "{d}", .{ptr.*});
-            },
-            .bool_chan, .mask_chan => ap(&buf, &len, "{}", .{self.runtime.readBool(val_chan)}),
-            .char_chan => {
-                const ptr: *u32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                if (ptr.* < 128) {
-                    ap(&buf, &len, "{c}", .{@as(u8, @intCast(ptr.*))});
-                } else {
-                    ap(&buf, &len, "U+{x:0>4}", .{ptr.*});
-                }
-            },
-            .unit_chan => ap(&buf, &len, "()", .{}),
-            .null_chan => ap(&buf, &len, "null", .{}),
-            .nullable_chan => {
-                // nullable 布局：[inner_value][null_flag: 1 byte]，0=有值，1=null
-                const inner_w = meta.inner_type.elemWidth();
-                const src = self.runtime.rawPtr(val_chan);
-                if (src[inner_w] != 0) {
-                    ap(&buf, &len, "null", .{});
-                } else {
-                    // 根据 inner_type 打印内部值
-                    switch (meta.inner_type) {
-                        .i64_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(i64, src[0..8])}),
-                        .i32_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(i32, src[0..4])}),
-                        .i16_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(i16, src[0..2])}),
-                        .i8_chan => ap(&buf, &len, "{d}", .{src[0]}),
-                        .u64_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(u64, src[0..8])}),
-                        .u32_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(u32, src[0..4])}),
-                        .u16_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(u16, src[0..2])}),
-                        .u8_chan => ap(&buf, &len, "{d}", .{src[0]}),
-                        .f64_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(f64, src[0..8])}),
-                        .f32_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(f32, src[0..4])}),
-                        .f16_chan => ap(&buf, &len, "{d}", .{std.mem.bytesToValue(f16, src[0..2])}),
-                        .bool_chan => ap(&buf, &len, "{}", .{src[0] != 0}),
-                        .ref_chan => {
-                            // 字符串或其他引用类型
-                            const inner_ptr_bytes: [*]u8 = @ptrCast(src[0..8].ptr);
-                            const inner_ptr: usize = std.mem.bytesToValue(usize, inner_ptr_bytes[0..@sizeOf(usize)]);
-                            if (inner_ptr < 0x1000) {
-                                ap(&buf, &len, "null", .{});
-                            } else {
-                                const header: *value.obj_header.ObjHeader = @ptrFromInt(inner_ptr);
-                                if (header.type_tag == .str) {
-                                    const sv: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", header));
-                                    ap(&buf, &len, "{s}", .{sv.bytes()});
-                                } else {
-                                    ap(&buf, &len, "<obj>", .{});
-                                }
-                            }
-                        },
-                        else => ap(&buf, &len, "?", .{}),
-                    }
-                }
-            },
-            else => {},
-        }
-
-        return self.flushPrintBuf(io, to_stderr, &buf, len, with_newline);
-    }
-
-    /// 输出 print 缓冲区到 stdout/stderr（统一走 std.Io streaming writer）
-    fn flushPrintBuf(self: *Engine, io: std.Io, to_stderr: bool, buf: *[4096]u8, len: usize, with_newline: bool) EngineError!void {
-        _ = self;
-        var wlen = len;
-        if (with_newline and wlen < buf.len) {
-            buf[wlen] = '\n';
-            wlen += 1;
-        }
-        if (wlen == 0) return;
-        // writer 使用独立缓冲，避免与数据源 buf 别名（writeAll 会拷贝到 writer 内部缓冲）
-        var out_buf: [4096]u8 = undefined;
-        var w = if (to_stderr)
-            std.Io.File.stderr().writerStreaming(io, &out_buf)
-        else
-            std.Io.File.stdout().writerStreaming(io, &out_buf);
-        w.interface.writeAll(buf[0..wlen]) catch return;
-        w.flush() catch return;
-    }
-
     /// builtin_ok：构造 ThrowValue(ok payload)
     /// inputs[0] = 值通道
     fn execBuiltinOk(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
         const v = self.chanToValue(val_chan);
-        if (debug_record) {
-            const in_meta = self.ir.channels.get(val_chan);
-            std.debug.print("builtin_ok: input_chan={} input_type={s} val_tag={s} output_chan={}\n", .{ val_chan, @tagName(in_meta.chan_type), @tagName(v), node.output });
-            switch (v) {
-                .ref => |r| {
-                    const header: *value.obj_header.ObjHeader = @ptrCast(r);
-                    std.debug.print("  input ref ptr={} type_tag={s}\n", .{ @intFromPtr(r), @tagName(header.type_tag) });
-                },
-                else => {},
-            }
-        }
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
         _ = v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
         self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
-        if (debug_record) {
-            std.debug.print("  throw_val ptr={} output_chan={} written ptr={}\n", .{ @intFromPtr(throw_v.asRef()), node.output, @intFromPtr(throw_v.asRef()) });
-        }
     }
 
     /// builtin_error：构造 ThrowValue(err payload) + ErrorValue
@@ -2483,8 +2173,8 @@ pub const Engine = struct {
         self.runtime.writeBool(node.output, result);
     }
 
-    /// builtin_str：将任意值转为字符串
-    /// inputs[0] = 值通道
+    /// builtin_str：标量值转字符串（复杂类型格式化由 std.reflect.format 接管）
+    /// inputs[0] = 值通道，output = ref_chan（Str 指针）
     fn execBuiltinStr(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
         const meta = self.ir.channels.get(val_chan);
@@ -2534,6 +2224,18 @@ pub const Engine = struct {
                 const ptr: *f16 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
                 break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
             },
+            .f128_chan => blk: {
+                const ptr: *f128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
+            },
+            .i128_chan => blk: {
+                const ptr: *i128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
+            },
+            .u128_chan => blk: {
+                const ptr: *u128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
+            },
             .bool_chan, .mask_chan => if (self.runtime.readBool(val_chan)) "true" else "false",
             .char_chan => blk: {
                 const ptr: *u32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
@@ -2550,9 +2252,8 @@ pub const Engine = struct {
                 if (self.readStr(val_chan)) |s| break :blk s.bytes();
                 // 检查是否为数组（u8[] → UTF-8 解码为字符串）
                 if (self.readArray(val_chan)) |arr| {
-                    // 仅当所有元素都是 u8 时，按字节拼接为字符串
+                    // 仅当所有元素都是 u8 时，按字节拼接为字符串（字节→str 语义转换）
                     if (arr.elements.len > 0 and arr.elements[0] == .u8) {
-                        // 使用 array_to_str 路径：解码为 Str
                         const tmp_bytes = self.tctx.?.backing.alloc(u8, arr.elements.len) catch return error.OutOfMemory;
                         defer self.tctx.?.backing.free(tmp_bytes);
                         for (arr.elements, 0..) |elem, i| {
@@ -2563,8 +2264,77 @@ pub const Engine = struct {
                         self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
                         return;
                     }
-                    // 其他数组类型：显示为 [elem1, elem2, ...]
+                    // 非标量数组格式化由 std.reflect.format_array 处理
                     break :blk "[array]";
+                }
+                // BoxedScalar 装箱标量（泛型参数 println<T>(x: T) 调用 println(42) 场景）：
+                // ref_of 节点把标量装箱为 BoxedScalar，存储原始通道索引。
+                // 从 ObjHeader 之后读取通道索引，再按通道的 chan_type 格式化标量值。
+                // 注意：ref_chan 可能持有标量值（如 array_pop 把 i32 写入 ref_chan），
+                // 必须先验证指针有效性（与 readStr/readArray 一致），否则解引用小整数会段错误。
+                if (self.runtime.readPtr(val_chan)) |obj_ptr| {
+                    const addr = @intFromPtr(obj_ptr);
+                    if (addr >= 0x1000 and addr % @alignOf(value.obj_header.ObjHeader) == 0) {
+                        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(obj_ptr));
+                        if (header.type_tag == .boxed_scalar) {
+                        const chan_idx_ptr: *const u16 = @ptrCast(@alignCast(@as([*]const u8, @ptrCast(@alignCast(obj_ptr))) + @sizeOf(value.obj_header.ObjHeader)));
+                        const src_chan = chan_idx_ptr.*;
+                        const src_meta = self.ir.channels.get(src_chan);
+                        const src_ptr = self.runtime.rawPtr(src_chan);
+                        break :blk switch (src_meta.chan_type) {
+                            .i64_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i64, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .i32_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i32, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .i16_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i16, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .i8_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i8, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .u64_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u64, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .u32_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u32, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .u16_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u16, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .u8_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u8, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .isize_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*isize, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .usize_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*usize, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .f64_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*f64, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .f32_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*f32, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .f16_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*f16, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .f128_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*f128, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .i128_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i128, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .u128_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u128, @ptrCast(@alignCast(src_ptr))).*}) catch "",
+                            .bool_chan, .mask_chan => if (@as(*bool, @ptrCast(@alignCast(src_ptr))).*) "true" else "false",
+                            .char_chan => blk2: {
+                                const cp: u21 = @intCast(@as(*u32, @ptrCast(@alignCast(src_ptr))).*);
+                                if (cp < 128) {
+                                    buf[0] = @intCast(cp);
+                                    break :blk2 buf[0..1];
+                                }
+                                const n = std.unicode.utf8Encode(cp, &buf) catch 0;
+                                break :blk2 buf[0..n];
+                            },
+                            .unit_chan => "()",
+                            .null_chan => "null",
+                            else => "<obj>",
+                        };
+                        } else {
+                            // 其他堆对象类型（throw_val/error_val/closure 等）：
+                            // 复杂类型格式化由 std.reflect.format 处理，此处返回占位
+                            const tag_name = switch (header.type_tag) {
+                                .closure => "<closure>",
+                                .partial => "<partial>",
+                                .builtin => "<builtin>",
+                                .array_iter => "<array_iter>",
+                                .string_iter => "<string_iter>",
+                                .range_iter => "<range_iter>",
+                                .atomic_val => "<atomic>",
+                                .async_val => "<async>",
+                                .channel_val => "<channel>",
+                                .sender_val => "<sender>",
+                                .receiver_val => "<receiver>",
+                                .trait_val => "<trait>",
+                                .lazy_val => "<lazy>",
+                                .coroutine_frame => "<coroutine>",
+                                else => "<obj>",
+                            };
+                            break :blk tag_name;
+                        }
+                    }
                 }
                 // gate_get_ok 可能把标量值写入 ref_chan（i32/i64 等）
                 // 尝试读取为 i64
@@ -2585,31 +2355,6 @@ pub const Engine = struct {
         self.runtime.writePtr(node.output, @ptrCast(&str_obj.header));
     }
 
-    /// builtin_scan/scanln：从 stdin 读取
-    /// scan: 读取一个空白分隔的 token
-    /// scanln: 读取一整行（不含换行）
-    /// output = ref_chan（Str 指针）或 null_chan（EOF）
-    fn execBuiltinScan(self: *Engine, node: *const Node, line_mode: bool) EngineError!void {
-        const io = self.io orelse {
-            self.runtime.writePtr(node.output, null);
-            return;
-        };
-        var r_buf: [4096]u8 = undefined;
-        var reader = std.Io.File.stdin().readerStreaming(io, &r_buf);
-        const result: ?[]const u8 = if (line_mode)
-            reader.interface.takeDelimiterExclusive('\n') catch null
-        else
-            reader.interface.takeDelimiterExclusive(' ') catch null;
-
-        if (result) |bytes| {
-            const str_obj = value.str_mod.Str.createContiguous(self.tctx.?, bytes) catch return error.OutOfMemory;
-            try self.trackObj(&str_obj.header);
-            self.runtime.writePtr(node.output, @ptrCast(&str_obj.header));
-        } else {
-            self.runtime.writePtr(node.output, null);
-        }
-    }
-
     /// builtin_type：返回值的运行时类型名
     /// inputs[0] = 值通道
     /// output = ref_chan（Str 指针）
@@ -2621,15 +2366,18 @@ pub const Engine = struct {
             .i16_chan => "i16",
             .i32_chan => "i32",
             .i64_chan => "i64",
+            .i128_chan => "i128",
             .u8_chan => "u8",
             .u16_chan => "u16",
             .u32_chan => "u32",
             .u64_chan => "u64",
+            .u128_chan => "u128",
             .isize_chan => "isize",
             .usize_chan => "usize",
             .f16_chan => "f16",
             .f32_chan => "f32",
             .f64_chan => "f64",
+            .f128_chan => "f128",
             .bool_chan, .mask_chan => "bool",
             .char_chan => "char",
             .unit_chan => "unit",
@@ -2654,7 +2402,6 @@ pub const Engine = struct {
                 break :blk "null";
             },
             .nullable_chan => "nullable",
-            else => "unknown",
         };
 
         const str_obj = value.str_mod.Str.createContiguous(self.tctx.?, type_name) catch return error.OutOfMemory;
@@ -2724,6 +2471,541 @@ pub const Engine = struct {
         };
 
         try self.emitTypeInfoRecord(node, md, tctx);
+    }
+
+    // ════════════════════════════════════════════
+    // 反射内置函数（reflect / reflect_field / scalar_to_str / reflect_deref / reflect_field_name）
+    // ════════════════════════════════════════════
+
+    /// builtin_reflect：运行时值反射，构造 Reflect RecordValue
+    ///
+    /// inputs[0] = 值通道，meta_index = type_id
+    /// output = ref_chan（Reflect RecordValue 指针）
+    ///
+    /// Reflect RecordValue 5 字段：
+    ///   0=type_name (str), 1=kind (str), 2=field_count (usize)
+    ///   3=__target (Value，隐藏), 4=__type_id (u16，隐藏)
+    fn execBuiltinReflect(self: *Engine, node: *const Node) EngineError!void {
+        const tctx = self.tctx.?;
+        const val_chan = node.inputs[0];
+        const meta_idx = node.meta_index;
+        var target_value = self.chanToValue(val_chan);
+        std.debug.print("DEBUG reflect: meta_idx={x}, target_value tag={s}\n", .{ meta_idx, @tagName(target_value) });
+
+        // 泛型参数装箱：当 T 是泛型参数时，标量值通过 ref_of 装箱为 BoxedScalar。
+        // 解箱获取原始标量值，使 __scalar_to_str 和 inferKindFromValue 能正确识别类型。
+        if (target_value == .ref and target_value.ref.type_tag == .boxed_scalar) {
+            target_value = self.unboxScalar(target_value.ref);
+        }
+
+        // 解析 meta_idx：可能是具体 type_id 或泛型参数哨兵 0x8000|param_idx
+        var type_id: u16 = meta_idx;
+        if (meta_idx & 0x8000 != 0) {
+            const param_idx: u16 = meta_idx & 0x7FFF;
+            type_id = self.lookupFrameTypeArg(param_idx) orelse 0;
+            std.debug.print("DEBUG reflect: sentinel param_idx={d}, type_id={d}\n", .{ param_idx, type_id });
+        }
+
+        // type_id 未知时（泛型递归格式化：field_value 返回 freshTypeVar，
+        // 编译期无法解析 type_id），从目标 RecordValue 的 type_name 反查 type_id。
+        // 这使递归 ADT 格式化能正确获取 kind/构造器名/字段名，无需哨兵传播。
+        if (type_id == 0) {
+            if (target_value == .ref and target_value.ref.type_tag == .record) {
+                const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+                type_id = self.ir.type_metadata_table.getIdByName(rec.type_name);
+            }
+        }
+
+        // 确定 type_name / kind / field_count
+        var type_name: []const u8 = "?";
+        var kind: []const u8 = "Primitive";
+        var field_count: usize = 0;
+
+        if (type_id != 0) {
+            if (self.ir.type_metadata_table.get(type_id)) |md| {
+                type_name = md.name;
+                kind = md.kind.ctorName();
+                field_count = self.reflectFieldCount(md, target_value);
+            }
+        }
+
+        // str 特殊处理：target 是 str 引用时，kind 覆盖为 "Str"
+        // （str 的 TypeKind 可能是 primitive，但 std.reflect.format 需区分 "Str"）
+        if (target_value == .ref and target_value.ref.type_tag == .str) {
+            kind = "Str";
+            if (type_id == 0) {
+                type_name = "str";
+            }
+        } else if (type_id == 0) {
+            // type_id 未知时从 Value 变体推断 kind
+            const inferred = inferKindFromValue(target_value);
+            kind = inferred.kind;
+            type_name = inferred.type_name;
+            field_count = inferred.field_count;
+        }
+
+        // 构造 5 字段
+        var fields = [_]value.Value{
+            value.Value.fromStringBytes(tctx, type_name) catch return error.OutOfMemory,
+            value.Value.fromStringBytes(tctx, kind) catch return error.OutOfMemory,
+            value.Value.fromUsize(field_count),
+            target_value,
+            value.Value.fromU16(type_id),
+        };
+        // __target 是引用时需 retain（RecordValue.deinit 会 release）
+        if (target_value.isBoxed()) _ = target_value.retain(tctx);
+        // 字段 0/1 是新建 Str（需跟踪），字段 3 可能是 ref（已 retain，需跟踪）
+        try self.trackRefFields(&fields);
+        // field_ref_bits: 仅当 __target (field 3) 是引用类型时标记为 ref
+        const field_ref_bits: u64 = if (target_value.isBoxed()) 0b1000 else 0;
+        const rec = value.Value.makeRecordEx(tctx, "Reflect", &fields, field_ref_bits) catch return error.OutOfMemory;
+        try self.trackObj(rec.asRef());
+        self.runtime.writePtr(node.output, @ptrCast(rec.asRef()));
+    }
+
+    /// 根据 TypeMetadata 和目标值计算 field_count
+    fn reflectFieldCount(self: *Engine, md: *const TypeMetadata, target: value.Value) usize {
+        _ = self;
+        const result: usize = switch (md.structure) {
+            .primitive => 0,
+            .record => |fields| fields.len,
+            .adt => |ctors| blk: {
+                // ADT: 读 __tag 决定当前构造器，返回该构造器的字段数
+                // __tag 字段是 i64 类型，需通过 asI64 读取再转型（asUsize 要求 usize active field）
+                if (target == .ref and target.ref.type_tag == .record) {
+                    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target.ref));
+                    if (rec.fields.len > 0) {
+                        const tag: usize = @intCast(rec.fields[0].asI64());
+                        if (tag < ctors.len) {
+                            break :blk ctors[tag].fields.len;
+                        }
+                    }
+                }
+                break :blk 0;
+            },
+            .nullable => if (target == .null_val) 0 else 1,
+            .newtype => 1,
+            else => 0,
+        };
+        return result;
+    }
+
+    /// builtin_reflect_field：从 Reflect 取字段值
+    ///
+    /// inputs[0] = Reflect 通道，meta_index = field_idx
+    /// output = 字段值通道
+    fn execBuiltinReflectField(self: *Engine, node: *const Node) EngineError!void {
+        const reflect_chan = node.inputs[0];
+        // meta_index >= 0xFFFE: 特殊编码（adt_tag）；否则从 inputs[1] 读取运行时索引
+        const field_idx: usize = if (node.meta_index >= 0xFFFE)
+            node.meta_index
+        else
+            self.chanToValue(node.inputs[1]).asUsize();
+
+        // 从 Reflect RecordValue 读取 __target (field 3) 和 __type_id (field 4)
+        const reflect_rec = self.readRecord(reflect_chan) orelse {
+            self.valueToChan(node.output, value.Value.fromUnit());
+            return;
+        };
+        if (reflect_rec.fields.len < 5) {
+            self.valueToChan(node.output, value.Value.fromUnit());
+            return;
+        }
+        const target_value = reflect_rec.fields[3];
+        const type_id: u16 = reflect_rec.fields[4].asU16();
+
+        // 特殊编码：meta_index=0xFFFE → 返回 target 的 __tag（ADT 构造器索引，field 0）
+        if (field_idx == 0xFFFE) {
+            if (target_value == .ref and target_value.ref.type_tag == .record) {
+                const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+                if (rec.fields.len > 0) {
+                    self.valueToChan(node.output, rec.fields[0]);
+                    return;
+                }
+            }
+            self.valueToChan(node.output, value.Value.fromUsize(0));
+            return;
+        }
+
+        // type_id 未知时按 Value 变体分派
+        if (type_id == 0) {
+            const result = self.reflectFieldByValue(target_value, field_idx) catch value.Value.fromUnit();
+            try self.writeFieldResult(node.output, result);
+            return;
+        }
+
+        const md: *const TypeMetadata = self.ir.type_metadata_table.get(type_id) orelse {
+            self.valueToChan(node.output, value.Value.fromUnit());
+            return;
+        };
+
+        const result: value.Value = switch (md.structure) {
+            .record => blk: {
+                // Record: field_id=0 是 __tag，1..N 是构造器字段
+                if (target_value != .ref or target_value.ref.type_tag != .record) break :blk value.Value.fromUnit();
+                const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+                const target_idx = field_idx + 1; // 跳过 __tag
+                if (target_idx >= rec.fields.len) break :blk value.Value.fromUnit();
+                break :blk rec.fields[target_idx];
+            },
+            .adt => |ctors| blk: {
+                if (target_value != .ref or target_value.ref.type_tag != .record) break :blk value.Value.fromUnit();
+                const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+                if (rec.fields.len == 0) break :blk value.Value.fromUnit();
+                const tag: usize = @intCast(rec.fields[0].asI64());
+                if (tag >= ctors.len) break :blk value.Value.fromUnit();
+                const target_idx = field_idx + 1; // 跳过 __tag
+                if (target_idx >= rec.fields.len) break :blk value.Value.fromUnit();
+                break :blk rec.fields[target_idx];
+            },
+            .nullable => blk: {
+                if (field_idx != 0) break :blk value.Value.fromUnit();
+                if (target_value == .null_val) break :blk value.Value.fromNull();
+                break :blk target_value;
+            },
+            .newtype => blk: {
+                if (field_idx != 0) break :blk value.Value.fromUnit();
+                if (target_value != .ref or target_value.ref.type_tag != .record) break :blk value.Value.fromUnit();
+                const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+                // newtype 存储为 RecordValue：field 0 是 __tag，field 1 是 inner value
+                const target_idx = field_idx + 1;
+                if (target_idx >= rec.fields.len) break :blk value.Value.fromUnit();
+                break :blk rec.fields[target_idx];
+            },
+            else => value.Value.fromUnit(),
+        };
+
+        try self.writeFieldResult(node.output, result);
+    }
+
+    /// 将 field_value 结果写入输出通道。
+    /// 当输出是 ref_chan 且结果为标量（非引用）时，装箱为 BoxedScalar（直接值模式），
+    /// 保留类型信息使后续 reflect/format 能正确识别 f64/i64 等位模式。
+    /// 引用类型（.ref）直接写指针，零宽值（unit/null）按原逻辑写。
+    fn writeFieldResult(self: *Engine, out_chan: u16, v: value.Value) EngineError!void {
+        const out_meta = self.ir.channels.get(out_chan);
+        if (out_meta.chan_type == .ref_chan and v != .ref) {
+            const header = try self.boxScalarValueDirect(v);
+            self.runtime.writePtr(out_chan, @ptrCast(header));
+        } else {
+            self.valueToChan(out_chan, v);
+        }
+    }
+
+    /// type_id 未知时按 Value 变体分派取字段
+    fn reflectFieldByValue(self: *Engine, target: value.Value, field_idx: usize) EngineError!value.Value {
+        _ = self;
+        if (target == .ref) {
+            switch (target.ref.type_tag) {
+                .array => {
+                    const arr: *value.ArrayValue = @alignCast(@fieldParentPtr("header", target.ref));
+                    if (field_idx >= arr.elements.len) return value.Value.fromUnit();
+                    return arr.elements[field_idx];
+                },
+                .record, .adt => {
+                    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target.ref));
+                    const target_idx = field_idx + 1; // 跳过 __tag
+                    if (target_idx >= rec.fields.len) return value.Value.fromUnit();
+                    return rec.fields[target_idx];
+                },
+                else => return value.Value.fromUnit(),
+            }
+        }
+        if (target == .null_val and field_idx == 0) return value.Value.fromNull();
+        return value.Value.fromUnit();
+    }
+
+    /// type_id 未知时从 Value 变体推断 kind/type_name/field_count
+    const InferredKind = struct {
+        kind: []const u8,
+        type_name: []const u8,
+        field_count: usize,
+    };
+
+    fn inferKindFromValue(v: value.Value) InferredKind {
+        return switch (v) {
+            .null_val => .{ .kind = "Nullable", .type_name = "null", .field_count = 0 },
+            .unit => .{ .kind = "Unit", .type_name = "unit", .field_count = 0 },
+            .boolean => .{ .kind = "Primitive", .type_name = "bool", .field_count = 0 },
+            .char => .{ .kind = "Primitive", .type_name = "char", .field_count = 0 },
+            .i8, .i16, .i32, .i64, .i128 => .{ .kind = "Primitive", .type_name = "int", .field_count = 0 },
+            .u8, .u16, .u32, .u64, .u128 => .{ .kind = "Primitive", .type_name = "uint", .field_count = 0 },
+            .isize => .{ .kind = "Primitive", .type_name = "isize", .field_count = 0 },
+            .usize => .{ .kind = "Primitive", .type_name = "usize", .field_count = 0 },
+            .f16, .f32, .f64, .f128 => .{ .kind = "Primitive", .type_name = "float", .field_count = 0 },
+            .ref => |obj| switch (obj.type_tag) {
+                .str => .{ .kind = "Str", .type_name = "str", .field_count = 0 },
+                .array => blk: {
+                    const arr: *value.ArrayValue = @alignCast(@fieldParentPtr("header", obj));
+                    break :blk .{ .kind = "Array", .type_name = "array", .field_count = arr.elements.len };
+                },
+                .record => blk: {
+                    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", obj));
+                    // __tag 在 field 0，构造器字段从 1 开始
+                    const fc = if (rec.fields.len > 0) rec.fields.len - 1 else 0;
+                    break :blk .{ .kind = "Record", .type_name = rec.type_name, .field_count = fc };
+                },
+                .adt => blk: {
+                    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", obj));
+                    const fc = if (rec.fields.len > 0) rec.fields.len - 1 else 0;
+                    break :blk .{ .kind = "Adt", .type_name = rec.type_name, .field_count = fc };
+                },
+                else => .{ .kind = "Primitive", .type_name = "?", .field_count = 0 },
+            },
+        };
+    }
+
+    /// builtin_scalar_to_str：标量转字符串
+    ///
+    /// inputs[0] = Reflect 对象通道（ref_chan → RecordValue），
+    /// 从 fields[3]（__target）读取原始标量 Value 并格式化。
+    /// 直接从 Reflect 读取避免标量通过 ref_chan 中转时位模式被误判为指针。
+    fn execBuiltinScalarToStr(self: *Engine, node: *const Node) EngineError!void {
+        const tctx = self.tctx.?;
+        const reflect_chan = node.inputs[0];
+
+        // 从 Reflect RecordValue 读取 __target (field 3)
+        const reflect_rec = self.readRecord(reflect_chan) orelse {
+            const fallback = value.Str.createContiguous(tctx, "<null>") catch return error.OutOfMemory;
+            try self.trackObj(&fallback.header);
+            self.runtime.writePtr(node.output, @ptrCast(&fallback.header));
+            return;
+        };
+        if (reflect_rec.fields.len < 5) {
+            const fallback = value.Str.createContiguous(tctx, "<null>") catch return error.OutOfMemory;
+            try self.trackObj(&fallback.header);
+            self.runtime.writePtr(node.output, @ptrCast(&fallback.header));
+            return;
+        }
+        const v = reflect_rec.fields[3];
+
+        var buf: [64]u8 = undefined;
+        const slice: []const u8 = switch (v) {
+            .boolean => if (v.boolean[0] != 0) "true" else "false",
+            .char => blk: {
+                const cp: u32 = @bitCast(v.char);
+                const codepoint: u21 = @intCast(cp);
+                const n = std.unicode.utf8Encode(codepoint, &buf) catch 0;
+                break :blk buf[0..n];
+            },
+            .i8 => blk: {
+                const x: i8 = @bitCast(v.i8[0]);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<i8>";
+            },
+            .u8 => blk: {
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{v.u8[0]}) catch "<u8>";
+            },
+            .i16 => blk: {
+                const x: i16 = @bitCast(v.i16[0..2].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<i16>";
+            },
+            .u16 => blk: {
+                const x: u16 = @bitCast(v.u16[0..2].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<u16>";
+            },
+            .i32 => blk: {
+                const x: i32 = @bitCast(v.i32[0..4].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<i32>";
+            },
+            .u32 => blk: {
+                const x: u32 = @bitCast(v.u32[0..4].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<u32>";
+            },
+            .i64 => blk: {
+                const x: i64 = @bitCast(v.i64[0..8].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<i64>";
+            },
+            .u64 => blk: {
+                const x: u64 = @bitCast(v.u64[0..8].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<u64>";
+            },
+            .i128 => blk: {
+                const x: i128 = @bitCast(v.i128[0..16].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<i128>";
+            },
+            .u128 => blk: {
+                const x: u128 = @bitCast(v.u128[0..16].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<u128>";
+            },
+            .isize => blk: {
+                const x: isize = @bitCast(v.isize);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<isize>";
+            },
+            .usize => blk: {
+                const x: usize = @bitCast(v.usize);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<usize>";
+            },
+            .f16 => blk: {
+                const x: f16 = @bitCast(v.f16[0..2].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<f16>";
+            },
+            .f32 => blk: {
+                const x: f32 = @bitCast(v.f32[0..4].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<f32>";
+            },
+            .f64 => blk: {
+                const x: f64 = @bitCast(v.f64[0..8].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<f64>";
+            },
+            .f128 => blk: {
+                const x: f128 = @bitCast(v.f128[0..16].*);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<f128>";
+            },
+            .null_val => "null",
+            .unit => "()",
+            .ref => blk: {
+                // str 直接返回字节；其他引用返回 <obj>
+                if (v.ref.type_tag == .str) {
+                    const s: *value.Str = @alignCast(@fieldParentPtr("header", v.ref));
+                    break :blk s.bytes();
+                }
+                break :blk "<obj>";
+            },
+        };
+
+        const new_str = value.Str.createContiguous(tctx, slice) catch return error.OutOfMemory;
+        try self.trackObj(&new_str.header);
+        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+    }
+
+    /// builtin_reflect_deref：返回 Reflect.__target
+    fn execBuiltinReflectDeref(self: *Engine, node: *const Node) EngineError!void {
+        const reflect_chan = node.inputs[0];
+        const reflect_rec = self.readRecord(reflect_chan) orelse {
+            self.valueToChan(node.output, value.Value.fromUnit());
+            return;
+        };
+        if (reflect_rec.fields.len < 5) {
+            self.valueToChan(node.output, value.Value.fromUnit());
+            return;
+        }
+        const target_value = reflect_rec.fields[3];
+        try self.writeFieldResult(node.output, target_value);
+    }
+
+    /// builtin_reflect_field_name：返回 Reflect 第 i 个字段名
+    ///
+    /// meta_index = 0xFFFF 时返回 ADT 构造器名
+    fn execBuiltinReflectFieldName(self: *Engine, node: *const Node) EngineError!void {
+        const tctx = self.tctx.?;
+        const reflect_chan = node.inputs[0];
+        // meta_index >= 0xFFFE: 特殊编码（adt_constructor）；否则从 inputs[1] 读取运行时索引
+        const field_idx: usize = if (node.meta_index >= 0xFFFE)
+            node.meta_index
+        else
+            self.chanToValue(node.inputs[1]).asUsize();
+        const reflect_rec = self.readRecord(reflect_chan) orelse {
+            self.emitEmptyStr(node);
+            return;
+        };
+        if (reflect_rec.fields.len < 5) {
+            self.emitEmptyStr(node);
+            return;
+        }
+        const target_value = reflect_rec.fields[3];
+        var type_id: u16 = reflect_rec.fields[4].asU16();
+
+        // type_id 未知时（泛型递归格式化：field_value 返回 freshTypeVar，
+        // 编译期无法解析 type_id），从目标 RecordValue 的 type_name 反查 type_id。
+        // 这使递归 ADT 格式化能正确获取构造器名和字段名，无需哨兵传播。
+        if (type_id == 0) {
+            if (target_value == .ref and target_value.ref.type_tag == .record) {
+                const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+                type_id = self.ir.type_metadata_table.getIdByName(rec.type_name);
+            }
+        }
+
+        const name: []const u8 = blk: {
+            if (type_id == 0) break :blk "";
+            const md: *const TypeMetadata = self.ir.type_metadata_table.get(type_id) orelse break :blk "";
+            if (field_idx == 0xFFFF) {
+                // Newtype: 构造器名 = 类型名
+                if (md.structure == .newtype) break :blk md.name;
+                // ADT 构造器名：从 __tag 查
+                if (target_value == .ref and target_value.ref.type_tag == .record) {
+                    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+                    if (rec.fields.len > 0) {
+                        const tag: usize = @intCast(rec.fields[0].asI64());
+                        break :blk switch (md.structure) {
+                            .adt => |ctors| if (tag < ctors.len) ctors[tag].name else "",
+                            .record => md.name,
+                            else => "",
+                        };
+                    }
+                }
+                break :blk "";
+            }
+            break :blk switch (md.structure) {
+                .record => |fields| if (field_idx < fields.len)
+                    reflectFieldName(fields[field_idx].name)
+                else
+                    "",
+                .adt => |ctors| blk2: {
+                    if (target_value != .ref or target_value.ref.type_tag != .record) break :blk2 "";
+                    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+                    if (rec.fields.len == 0) break :blk2 "";
+                    const tag: usize = @intCast(rec.fields[0].asI64());
+                    if (tag >= ctors.len) break :blk2 "";
+                    const ctor = ctors[tag];
+                    if (field_idx >= ctor.fields.len) break :blk2 "";
+                    break :blk2 reflectFieldName(ctor.fields[field_idx].name);
+                },
+                // newtype 的唯一字段始终是位置参数，返回空字符串
+                .newtype => "",
+                else => "",
+            };
+        };
+
+        const new_str = value.Str.createContiguous(tctx, name) catch return error.OutOfMemory;
+        try self.trackObj(&new_str.header);
+        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+    }
+
+    /// 辅助：发射空字符串到输出通道
+    fn emitEmptyStr(self: *Engine, node: *const Node) void {
+        const tctx = self.tctx.?;
+        const new_str = value.Str.createContiguous(tctx, "") catch return;
+        self.trackObj(&new_str.header) catch return;
+        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+    }
+
+    /// 反射字段名归一化：位置参数占位符（`_0`、`_1` 等）返回空字符串，
+    /// 使格式化输出 `Some(10)` 而非 `Some(_0: 10)`。
+    /// 判定规则：以 `_` 开头且后续全为 ASCII 数字。
+    fn reflectFieldName(name: []const u8) []const u8 {
+        if (name.len < 2 or name[0] != '_') return name;
+        for (name[1..]) |c| {
+            if (c < '0' or c > '9') return name;
+        }
+        return "";
+    }
+
+    /// builtin_reflect_meta：读取 Reflect 自身的元信息字段
+    ///
+    /// inputs[0] = Reflect 通道，meta_index = 字段索引
+    /// 0=type_name(str), 1=kind(str), 2=field_count(usize)
+    /// output = ref_chan（str）或 usize_chan（field_count）
+    fn execBuiltinReflectMeta(self: *Engine, node: *const Node) EngineError!void {
+        const reflect_chan = node.inputs[0];
+        const field_idx: usize = node.meta_index;
+        const reflect_rec = self.readRecord(reflect_chan) orelse {
+            if (field_idx == 2) {
+                self.valueToChan(node.output, value.Value.fromUsize(0));
+            } else {
+                self.emitEmptyStr(node);
+            }
+            return;
+        };
+        if (reflect_rec.fields.len < 5) {
+            if (field_idx == 2) {
+                self.valueToChan(node.output, value.Value.fromUsize(0));
+            } else {
+                self.emitEmptyStr(node);
+            }
+            return;
+        }
+        const result = reflect_rec.fields[field_idx];
+        self.valueToChan(node.output, result);
     }
 
     /// syscall_call：分派到 syscall 实现（IO/Time 等宿主 syscall 包装）
@@ -2880,10 +3162,60 @@ pub const Engine = struct {
     /// 查找当前 frame 的类型实参（Step 3：泛型 T 运行时查表）
     /// 返回 type_id（1-indexed，0 = 未绑定）
     fn lookupFrameTypeArg(self: *Engine, param_idx: u16) ?u16 {
-        if (self.frame_type_args_stack.items.len == 0) return null;
+        if (self.frame_type_args_stack.items.len == 0) {
+            return null;
+        }
         const top = self.frame_type_args_stack.items[self.frame_type_args_stack.items.len - 1];
-        if (param_idx >= top.len) return null;
+        if (param_idx >= top.len) {
+            return null;
+        }
         return top[param_idx];
+    }
+
+    /// 解析 type_args 列表中的泛型参数哨兵（0x8000|param_idx）
+    ///
+    /// 当泛型函数 A<T> 调用另一个泛型函数 B<T> 时，B 的 type_args 中可能包含
+    /// 哨兵 0x8000|param_idx（表示"使用调用者 A 的第 param_idx 个类型实参"）。
+    /// 此方法从父 frame（当前 frame 的倒数第二个）查找实际 type_id 并替换哨兵。
+    /// 非哨兵值（具体 type_id 或 0）原样返回。
+    /// 返回的切片由 scratch arena 分配，调用方负责管理生命周期。
+    fn resolveTypeArgSentinels(self: *Engine, type_args: []const u16) EngineError![]const u16 {
+        var has_sentinel = false;
+        for (type_args) |ta| {
+            if (ta & 0x8000 != 0) {
+                has_sentinel = true;
+                break;
+            }
+        }
+        if (!has_sentinel) {
+            return type_args;
+        }
+
+        const tctx = self.tctx.?;
+        const resolved = tctx.backing.alloc(u16, type_args.len) catch return error.OutOfMemory;
+        // 父 frame：当前栈顶（因为此调用的 type_args 尚未压栈）
+        const parent_idx: ?usize = if (self.frame_type_args_stack.items.len >= 1)
+            self.frame_type_args_stack.items.len - 1
+        else
+            null;
+        for (type_args, 0..) |ta, i| {
+            if (ta & 0x8000 != 0) {
+                const param_idx: u16 = ta & 0x7FFF;
+                if (parent_idx) |pi| {
+                    const parent_args = self.frame_type_args_stack.items[pi];
+                    if (param_idx < parent_args.len) {
+                        resolved[i] = parent_args[param_idx];
+                    } else {
+                        resolved[i] = 0;
+                    }
+                } else {
+                    resolved[i] = 0;
+                }
+            } else {
+                resolved[i] = ta;
+            }
+        }
+        return resolved;
     }
 
     /// 构造占位 TypeInfo RecordValue（未知类型或查表失败时使用）
@@ -3745,9 +4077,11 @@ pub const Engine = struct {
         const src_chan = node.inputs[0];
         const src_w = self.runtime.elemWidth(src_chan);
         const dst = self.runtime.rawPtr(node.output);
+        const src_meta = self.ir.channels.get(src_chan);
 
-        if (src_w == 8) {
-            // 复合类型或已有引用：src 通道持有 8 字节指针，直接复制
+        // ref_chan（复合对象/已有引用）：src 通道持有 8 字节指针，直接复制
+        // 标量类型（usize/u64/i64/f64 等也是 8 字节）必须走装箱路径，否则会把标量值误当指针。
+        if (src_meta.chan_type == .ref_chan) {
             const src = self.runtime.rawPtr(src_chan);
             @memcpy(dst[0..8], src[0..8]);
             // retain 引用计数（堆对象共享）
@@ -4150,10 +4484,7 @@ pub const Engine = struct {
 
     /// 从 ref_chan 读取 Str 对象指针
     fn readStr(self: *Engine, chan: u16) ?*value.str_mod.Str {
-        const ptr = self.runtime.readPtr(chan) orelse return null;
-        if (@intFromPtr(ptr) < 0x1000) return null;
-        if (@intFromPtr(ptr) % @alignOf(value.obj_header.ObjHeader) != 0) return null;
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
+        const header = self.readRefObj(chan) orelse return null;
         if (header.type_tag == .lazy_val) {
             const lazy: *value.LazyValue = @alignCast(@fieldParentPtr("header", header));
             const forced = self.forceLazyValue(lazy) catch return null;
@@ -4322,12 +4653,43 @@ pub const Engine = struct {
 
     /// 从 ref_chan 读取 ArrayValue 指针
     fn readArray(self: *Engine, chan: u16) ?*value.ArrayValue {
-        const ptr = self.runtime.readPtr(chan) orelse return null;
-        if (@intFromPtr(ptr) < 0x1000) return null;
-        if (@intFromPtr(ptr) % @alignOf(value.obj_header.ObjHeader) != 0) return null;
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
+        const header = self.readRefObj(chan) orelse return null;
         if (header.type_tag != .array) return null;
         return @alignCast(@fieldParentPtr("header", header));
+    }
+
+    /// 解箱 BoxedScalar：泛型参数 T 的标量值通过 ref_of 装箱，存储原始通道索引。
+    /// 读取通道索引并通过 chanToValue 还原原始标量 Value。
+    /// 直接值模式（DIRECT_VALUE 标志）：Value 内联存储在 ObjHeader 之后，直接读取。
+    fn unboxScalar(self: *Engine, header: *value.obj_header.ObjHeader) value.Value {
+        if (header.isDirectValue()) {
+            // 直接值模式：Value 存储在 ObjHeader 之后
+            const base: [*]const u8 = @ptrCast(@alignCast(header));
+            const val_ptr: *const value.Value = @ptrCast(@alignCast(base + @sizeOf(value.obj_header.ObjHeader)));
+            return val_ptr.*;
+        }
+        // 通道索引模式：从原始通道读取标量值
+        const base: [*]const u8 = @ptrCast(@alignCast(header));
+        const chan_idx_ptr: *const u16 = @ptrCast(@alignCast(base + @sizeOf(value.obj_header.ObjHeader)));
+        const src_chan = chan_idx_ptr.*;
+        return self.chanToValue(src_chan);
+    }
+
+    /// 将标量 Value 装箱为 BoxedScalar（直接值模式）。
+    /// 用于 field_value 返回标量到 ref_chan 时保留类型信息。
+    /// 内存布局：[ObjHeader 8B][Value 24B] = 32B
+    fn boxScalarValueDirect(self: *Engine, v: value.Value) EngineError!*value.obj_header.ObjHeader {
+        const tctx = self.tctx.?;
+        const total = @sizeOf(value.obj_header.ObjHeader) + @sizeOf(value.Value);
+        const buf = tctx.allocObj(total) catch return error.OutOfMemory;
+        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(buf.ptr));
+        value.obj_header.initObjHeader(header, .boxed_scalar, total, false, tctx);
+        header.markDirectValue();
+        // 存储 Value 到 ObjHeader 之后
+        const val_ptr: *value.Value = @ptrCast(@alignCast(buf.ptr + @sizeOf(value.obj_header.ObjHeader)));
+        val_ptr.* = v;
+        try self.trackObj(header);
+        return header;
     }
 
     /// 从通道读取 Value（标量值）
@@ -4373,9 +4735,13 @@ pub const Engine = struct {
             },
             .ref_chan => blk: {
                 if (self.readRefObj(chan)) |header| {
+                    // BoxedScalar：解箱获取原始标量值（保留类型信息）
+                    if (header.type_tag == .boxed_scalar) {
+                        break :blk self.unboxScalar(header);
+                    }
                     break :blk value.Value.fromRef(header);
                 }
-                // readRefObj 失败：ref_chan 持有标量位模式（类型参数实例化为标量时）
+                // readRefObj 失败：ref_chan 持有标量位模式（无 DIRECT_VALUE 装箱的旧路径）
                 const raw = self.runtime.readI64(chan);
                 if (raw == 0) break :blk value.Value.fromNull();
                 break :blk value.Value.fromI64(raw);
@@ -4414,21 +4780,51 @@ pub const Engine = struct {
                 ptr.* = @bitCast(b);
             },
             .i64 => |b| {
-                // 宽度转换：i64 值可能写入更窄的通道（i32/i16/i8）
-                const w = self.runtime.elemWidth(chan);
+                // 按 chan_type 派发：整数通道直接写，浮点通道走转换，ref_chan 走位模式
                 const ptr = self.runtime.rawPtr(chan);
                 const val: i64 = @bitCast(b);
-                if (w >= 8) {
-                    const dst: *i64 = @ptrCast(@alignCast(ptr));
-                    dst.* = val;
-                } else if (w >= 4) {
-                    const dst: *i32 = @ptrCast(@alignCast(ptr));
-                    dst.* = @truncate(val);
-                } else if (w >= 2) {
-                    const dst: *i16 = @ptrCast(@alignCast(ptr));
-                    dst.* = @truncate(val);
-                } else if (w >= 1) {
-                    ptr[0] = @truncate(@as(u64, @bitCast(val)));
+                switch (meta.chan_type) {
+                    .i64_chan, .u64_chan, .isize_chan, .usize_chan, .ref_chan => {
+                        const dst: *i64 = @ptrCast(@alignCast(ptr));
+                        dst.* = val;
+                    },
+                    .i32_chan, .u32_chan => {
+                        const dst: *i32 = @ptrCast(@alignCast(ptr));
+                        dst.* = @truncate(val);
+                    },
+                    .i16_chan, .u16_chan => {
+                        const dst: *i16 = @ptrCast(@alignCast(ptr));
+                        dst.* = @truncate(val);
+                    },
+                    .i8_chan, .u8_chan => {
+                        ptr[0] = @truncate(@as(u64, @bitCast(val)));
+                    },
+                    .f64_chan => {
+                        const dst: *f64 = @ptrCast(@alignCast(ptr));
+                        dst.* = @floatFromInt(val);
+                    },
+                    .f32_chan => {
+                        const dst: *f32 = @ptrCast(@alignCast(ptr));
+                        dst.* = @floatFromInt(@as(i32, @truncate(val)));
+                    },
+                    .f16_chan => {
+                        const dst: *f16 = @ptrCast(@alignCast(ptr));
+                        dst.* = @floatFromInt(@as(i16, @truncate(val)));
+                    },
+                    .f128_chan => {
+                        const dst: *f128 = @ptrCast(@alignCast(ptr));
+                        dst.* = @floatFromInt(val);
+                    },
+                    .i128_chan, .u128_chan => {
+                        const dst: *i128 = @ptrCast(@alignCast(ptr));
+                        dst.* = val; // 符号扩展到 i128
+                    },
+                    .bool_chan, .mask_chan => self.runtime.writeBool(chan, val != 0),
+                    .char_chan => {
+                        const dst: *u32 = @ptrCast(@alignCast(ptr));
+                        dst.* = @truncate(@as(u64, @bitCast(val)));
+                    },
+                    else => {},
                 }
             },
             .u8 => |b| {
@@ -4445,6 +4841,14 @@ pub const Engine = struct {
             },
             .u64 => |b| {
                 const ptr: *u64 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
+                ptr.* = @bitCast(b);
+            },
+            .usize => |b| {
+                const ptr: *usize = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
+                ptr.* = @bitCast(b);
+            },
+            .isize => |b| {
+                const ptr: *isize = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
                 ptr.* = @bitCast(b);
             },
             .i128 => |b| {
@@ -4483,7 +4887,6 @@ pub const Engine = struct {
                     self.runtime.writePtr(chan, @ptrCast(obj));
                 }
             },
-            else => {},
         }
     }
 
@@ -4537,7 +4940,19 @@ pub const Engine = struct {
         const dst_raw = self.runtime.rawPtr(dst_chan);
 
         // 标量 → ref_chan：按源类型读取标量，扩展为 8 字节写入
+        // 例外：i128/u128/f128（16 字节）无法塞入 8 字节 ref_chan，截断会丢失高 64 位，
+        // 改走 BoxedScalar 装箱：将完整 Value 存入堆对象，ref_chan 持有指针。
+        // f16/f32/f64 可经 f64 无损往返，走 8 字节提升路径即可。
         if (dst_meta.chan_type == .ref_chan and src_meta.chan_type != .ref_chan) {
+            switch (src_meta.chan_type) {
+                .i128_chan, .u128_chan, .f128_chan => {
+                    const v = self.chanToValue(src_chan);
+                    const header = try self.boxScalarValueDirect(v);
+                    self.runtime.writePtr(dst_chan, @ptrCast(header));
+                    return;
+                },
+                else => {},
+            }
             const dst_ptr: *i64 = @ptrCast(@alignCast(dst_raw));
             dst_ptr.* = switch (src_meta.chan_type) {
                 .i8_chan => @as(i64, @as(i8, @bitCast(src_raw[0]))),
@@ -4575,6 +4990,14 @@ pub const Engine = struct {
                     break :blk @bitCast(@as(u64, p.*));
                 },
                 .bool_chan, .mask_chan => @intFromBool(src_raw[0] != 0),
+                .char_chan => blk: {
+                    const p: *u32 = @ptrCast(@alignCast(src_raw));
+                    break :blk @as(i64, p.*);
+                },
+                .f16_chan => blk: {
+                    const p: *f16 = @ptrCast(@alignCast(src_raw));
+                    break :blk @bitCast(@as(f64, @floatCast(p.*)));
+                },
                 .f32_chan => blk: {
                     const p: *f32 = @ptrCast(@alignCast(src_raw));
                     const f64_val: f64 = @floatCast(p.*);
@@ -4590,7 +5013,30 @@ pub const Engine = struct {
         }
 
         // ref_chan → 标量：按目标类型解释 8 字节位模式
+        // 例外：i128/u128/f128（16 字节）若从 8 字节位模式扩展会丢失高 64 位，
+        // 优先尝试解箱 BoxedScalar（标量→ref_chan 装箱的对称路径）；
+        // 仅当 ref_chan 未持有 BoxedScalar 时回退到位模式扩展。
+        // f16/f32/f64 经 f64 无损往返，走位模式路径即可。
         if (src_meta.chan_type == .ref_chan and dst_meta.chan_type != .ref_chan) {
+            switch (dst_meta.chan_type) {
+                .i128_chan, .u128_chan, .f128_chan => {
+                    if (self.readRefObj(src_chan)) |header| {
+                        if (header.type_tag == .boxed_scalar) {
+                            const v = self.unboxScalar(header);
+                            self.writeScalarValue(dst_chan, v);
+                            return;
+                        }
+                    }
+                    // 回退：ref_chan 持有位模式（旧路径），低 64 位补零扩展
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *[16]u8 = @ptrCast(@alignCast(dst_raw));
+                    @memset(dp, 0);
+                    const low_bytes: [8]u8 = @bitCast(sp.*);
+                    @memcpy(dp[0..8], &low_bytes);
+                    return;
+                },
+                else => {},
+            }
             switch (dst_meta.chan_type) {
                 .i8_chan => {
                     const sp: *i64 = @ptrCast(@alignCast(src_raw));
@@ -4624,6 +5070,16 @@ pub const Engine = struct {
                     const sp: *i64 = @ptrCast(@alignCast(src_raw));
                     const dp: *i64 = @ptrCast(@alignCast(dst_raw));
                     dp.* = sp.*;
+                },
+                .char_chan => {
+                    const sp: *i64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *u32 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = @truncate(@as(u64, @bitCast(sp.*)));
+                },
+                .f16_chan => {
+                    const sp: *f64 = @ptrCast(@alignCast(src_raw));
+                    const dp: *f16 = @ptrCast(@alignCast(dst_raw));
+                    dp.* = @floatCast(sp.*);
                 },
                 .f32_chan => {
                     const sp: *f64 = @ptrCast(@alignCast(src_raw));
@@ -5292,10 +5748,7 @@ pub const Engine = struct {
     /// 从 ref_chan 读取 RecordValue 指针
     /// 内联以让编译器消除连续 record_get/set 的冗余 null/对齐/type_tag 检查
     inline fn readRecord(self: *Engine, chan: u16) ?*value.RecordValue {
-        const ptr = self.runtime.readPtr(chan) orelse return null;
-        if (@intFromPtr(ptr) < 0x1000) return null;
-        if (@intFromPtr(ptr) % @alignOf(value.obj_header.ObjHeader) != 0) return null;
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
+        const header = self.readRefObj(chan) orelse return null;
         if (header.type_tag != .record and header.type_tag != .adt and header.type_tag != .newtype) return null;
         return @alignCast(@fieldParentPtr("header", header));
     }
@@ -5750,7 +6203,9 @@ pub const Engine = struct {
         defer self.call_depth -= 1;
 
         // 泛型类型实参压栈（供 typeof(T) 运行时查表）
-        self.frame_type_args_stack.append(self.tctx.?.backing, call_meta.type_args) catch return error.OutOfMemory;
+        // 解析 type_args 中的泛型参数哨兵（0x8000|param_idx）：从父 frame 查实际 type_id
+        const resolved_type_args = try self.resolveTypeArgSentinels(call_meta.type_args);
+        self.frame_type_args_stack.append(self.tctx.?.backing, resolved_type_args) catch return error.OutOfMemory;
         defer _ = self.frame_type_args_stack.pop();
 
         const saved_func_idx = self.current_func_idx;
@@ -5811,9 +6266,6 @@ pub const Engine = struct {
             while (i < len) : (i += 1) {
                 const node: *const Node = &nodes[start + i];
                 const r = self.execNode(node) catch |err| {
-                    if (err == error.InvalidChannel and debug_orbit) {
-                        std.debug.print("InvalidChannel(execBodyNodes) op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ @tagName(node.op), self.current_func_idx, if (node.input_count > 0) node.inputs[0] else 0, if (node.input_count > 1) node.inputs[1] else 0, if (node.input_count > 2) node.inputs[2] else 0, if (node.input_count > 3) node.inputs[3] else 0, node.output, node.meta_index });
-                    }
                     return err;
                 };
                 // 检查 tco_restart：execCall 检测到自递归时设置
@@ -5887,9 +6339,6 @@ pub const Engine = struct {
             if (local_skip[i]) continue;
             const node: *const Node = &nodes[start + i];
             const r = self.execNode(node) catch |err| {
-                if (err == error.InvalidChannel and debug_orbit) {
-                    std.debug.print("InvalidChannel(execBodyNodes/nested) op={s} func_idx={} inputs=[{},{},{},{}] output={} meta_idx={}\n", .{ @tagName(node.op), self.current_func_idx, if (node.input_count > 0) node.inputs[0] else 0, if (node.input_count > 1) node.inputs[1] else 0, if (node.input_count > 2) node.inputs[2] else 0, if (node.input_count > 3) node.inputs[3] else 0, node.output, node.meta_index });
-                }
                 return err;
             };
             // 检查 tco_restart：execCall 检测到自递归时设置
@@ -7879,12 +8328,21 @@ pub const Engine = struct {
     // ════════════════════════════════════════════
 
     /// 读取 ref_chan 中的堆对象，返回 *ObjHeader 或 null
+    ///
+    /// 通过 ObjHeader 字段语义验证指针合法性（架构无关）：
+    /// - null/低地址过滤：addr < 0x1000 不是合法堆对象（null 指针、小整数）
+    /// - 对齐检查：堆对象必须按 ObjHeader 对齐
+    /// - isValidHeapObj：type_tag 范围 + rc>=1 + flags 未用位为 0
+    ///
+    /// 标量值通过 ref_chan 传输时位模式可能被误判为指针，
+    /// ObjHeader 字段语义验证可可靠过滤这类伪指针，不依赖架构相关地址范围假设。
     fn readRefObj(self: *Engine, chan: u16) ?*value.obj_header.ObjHeader {
         const ptr = self.runtime.readPtr(chan) orelse return null;
-        // 防御性对齐检查：小整数/标量值被误读为指针时，地址通常不满足堆对象对齐
-        if (@intFromPtr(ptr) < 0x1000) return null;
-        if (@intFromPtr(ptr) % @alignOf(value.obj_header.ObjHeader) != 0) return null;
+        const addr = @intFromPtr(ptr);
+        if (addr < 0x1000) return null;
+        if (addr % @alignOf(value.obj_header.ObjHeader) != 0) return null;
         const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
+        if (!header.isValidHeapObj()) return null;
         return header;
     }
 
@@ -7958,22 +8416,17 @@ pub const Engine = struct {
     /// output = mask_chan（1=Ok, 0=Err）
     fn execGateCheck(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
-        if (debug_record) {
-            std.debug.print("gate_check: input_chan={} output_chan={}\n", .{ val_chan, node.output });
-        }
         // 如果是 ThrowValue，检查 payload 是 ok 还是 err
         if (self.readThrow(val_chan)) |throw_val| {
             const is_ok = switch (throw_val.payload) {
                 .ok => true,
                 .err => false,
             };
-            if (debug_record) std.debug.print("  -> is_ok={}\n", .{is_ok});
             self.runtime.writeBool(node.output, is_ok);
             return;
         }
         // 非 ThrowValue：非 null 则 Ok
         const ptr = self.runtime.readPtr(val_chan);
-        if (debug_record) std.debug.print("  -> not ThrowValue, ptr={?}\n", .{ptr});
         self.runtime.writeBool(node.output, ptr != null);
     }
 
@@ -7982,25 +8435,18 @@ pub const Engine = struct {
     /// output = Ok 值通道
     fn execGateGetOk(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
-        if (debug_record) {
-            const out_meta = self.ir.channels.get(node.output);
-            std.debug.print("gate_get_ok: input_chan={} output_chan={} output_type={s}\n", .{ val_chan, node.output, @tagName(out_meta.chan_type) });
-        }
         if (self.readThrow(val_chan)) |throw_val| {
             switch (throw_val.payload) {
                 .ok => |v| {
-                    if (debug_record) std.debug.print("  -> ok val_tag={s}\n", .{@tagName(v)});
                     self.writeScalarValue(node.output, v);
                     return;
                 },
                 .err => {
-                    if (debug_record) std.debug.print("  -> err, writing null\n", .{});
                     self.runtime.writePtr(node.output, null);
                     return;
                 },
             }
         }
-        if (debug_record) std.debug.print("  -> not ThrowValue, copying raw\n", .{});
         // 非 ThrowValue：直接拷贝
         const w = self.runtime.elemWidth(val_chan);
         if (w > 0) {
@@ -8078,38 +8524,35 @@ pub const Engine = struct {
         var msg_bytes: []const u8 = "";
         var existing_err: ?*value.ErrorValue = null;
 
-        if (self.runtime.readPtr(val_chan)) |ptr| {
-            if (@intFromPtr(ptr) >= 0x1000 and @intFromPtr(ptr) % @alignOf(value.obj_header.ObjHeader) == 0) {
-                const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
-                switch (header.type_tag) {
-                    .str => {
-                        const s: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", header));
-                        msg_bytes = s.bytes();
-                    },
-                    .error_val => {
-                        // 已经是 ErrorValue：直接使用
-                        const e: *value.ErrorValue = @alignCast(@fieldParentPtr("header", header));
-                        existing_err = e;
-                    },
-                    .record => {
-                        // error_newtype 构造器产生的 RecordValue
-                        // 提取 type_name 和第一个字段（message）
-                        const r: *value.RecordValue = @alignCast(@fieldParentPtr("header", header));
-                        type_name = r.type_name;
-                        // field_id=1 是第一个构造器字段（field_id=0 是 __tag）
-                        if (r.fields.len > 1) {
-                            const field_val = r.fields[1];
-                            if (field_val == .ref) {
-                                const fh: *value.obj_header.ObjHeader = @ptrCast(@alignCast(field_val.ref));
-                                if (fh.type_tag == .str) {
-                                    const fs: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", fh));
-                                    msg_bytes = fs.bytes();
-                                }
+        if (self.readRefObj(val_chan)) |header| {
+            switch (header.type_tag) {
+                .str => {
+                    const s: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", header));
+                    msg_bytes = s.bytes();
+                },
+                .error_val => {
+                    // 已经是 ErrorValue：直接使用
+                    const e: *value.ErrorValue = @alignCast(@fieldParentPtr("header", header));
+                    existing_err = e;
+                },
+                .record => {
+                    // error_newtype 构造器产生的 RecordValue
+                    // 提取 type_name 和第一个字段（message）
+                    const r: *value.RecordValue = @alignCast(@fieldParentPtr("header", header));
+                    type_name = r.type_name;
+                    // field_id=1 是第一个构造器字段（field_id=0 是 __tag）
+                    if (r.fields.len > 1) {
+                        const field_val = r.fields[1];
+                        if (field_val == .ref) {
+                            const fh: *value.obj_header.ObjHeader = @ptrCast(@alignCast(field_val.ref));
+                            if (fh.type_tag == .str) {
+                                const fs: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", fh));
+                                msg_bytes = fs.bytes();
                             }
                         }
-                    },
-                    else => {},
-                }
+                    }
+                },
+                else => {},
             }
         }
 
@@ -8129,44 +8572,30 @@ pub const Engine = struct {
 
     /// 从通道读取标量值（用于 gate 操作、print、return 等观察点）
     /// ref_chan 中若是 LazyValue，会自动强制求值一次并返回其结果（缓存借用）。
+    /// 通用实现：ref_chan/bool/char 走快路径，其余所有标量类型复用 chanToValue，
+    /// 确保完整覆盖 i8..i128/u8..u128/isize/usize/f16..f128 全部类型变体。
     fn readScalarValue(self: *Engine, chan: u16) EngineError!value.Value {
         const meta = self.ir.channels.get(chan);
-        const w = meta.elem_width;
         if (meta.chan_type == .ref_chan) {
             if (self.readRefObj(chan)) |header| {
+                // BoxedScalar：解箱获取原始标量值（保留类型信息）
+                if (header.type_tag == .boxed_scalar) {
+                    return self.unboxScalar(header);
+                }
                 if (header.type_tag == .lazy_val) {
                     const lazy: *value.LazyValue = @alignCast(@fieldParentPtr("header", header));
                     return try self.forceLazyValue(lazy);
                 }
                 return value.Value.fromRef(header);
             }
-            // readRefObj 失败：ref_chan 可能持有标量位模式（类型参数实例化为标量时，
-            // 标量按 i64/f64 位模式存入 8 字节 ref_chan）。null 返回 null_val，
-            // 否则按 i64 读取（注意：无法区分 i64 与 f64 位模式，浮点场景需走 copyCrossType）。
+            // readRefObj 失败：ref_chan 持有标量位模式（无 DIRECT_VALUE 装箱的旧路径）
             const raw = self.runtime.readI64(chan);
             if (raw == 0) return value.Value.fromNull();
             return value.Value.fromI64(raw);
         }
-        if (meta.chan_type == .bool_chan or meta.chan_type == .mask_chan) {
-            return value.Value.fromBool(self.runtime.readBool(chan));
-        }
-        if (meta.chan_type == .char_chan) {
-            const ptr = self.runtime.rawPtr(chan);
-            const cp: u32 = @bitCast(@as(*[4]u8, @ptrCast(ptr)).*);
-            return value.Value.fromChar(.{ .codepoint = cp });
-        }
-        // 整数/浮点：按宽度读取
-        if (w == 8) {
-            return value.Value.fromI64(self.runtime.readI64(chan));
-        }
-        if (w == 4) {
-            const ptr: *i32 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
-            return value.Value.fromI32(ptr.*);
-        }
-        if (w == 0) {
-            return value.Value.fromUnit();
-        }
-        return value.Value.fromI64(self.runtime.readI64(chan));
+        // 其余所有类型（整数/浮点/bool/char/null/unit/mask/nullable）复用 chanToValue，
+        // 它已对全部 23 种 ChanType 穷举派发，避免按位宽派发丢失类型语义。
+        return self.chanToValue(chan);
     }
 
     /// 将标量值写入通道
@@ -8190,10 +8619,39 @@ pub const Engine = struct {
                     .u32 => |b| ptr.* = @as(i64, @as(u32, @bitCast(b))),
                     .i64 => |b| ptr.* = @bitCast(b),
                     .u64 => |b| ptr.* = @bitCast(@as(u64, @bitCast(b))),
+                    .isize => |b| ptr.* = @as(i64, @as(isize, @bitCast(b))),
+                    .usize => |b| ptr.* = @bitCast(@as(u64, @as(usize, @bitCast(b)))),
                     .boolean => |b| ptr.* = @intFromBool(b[0] != 0),
+                    .char => |b| ptr.* = @as(i64, @intCast(@as(u32, @bitCast(b)))),
+                    .f16 => |b| ptr.* = @bitCast(@as(f64, @floatCast(@as(f16, @bitCast(b))))),
                     .f32 => |b| ptr.* = @bitCast(@as(f64, @floatCast(@as(f32, @bitCast(b))))),
                     .f64 => |b| ptr.* = @bitCast(@as(f64, @bitCast(b))),
-                    else => self.runtime.writePtr(chan, null),
+                    // i128/u128/f128（16 字节）无法塞入 8 字节 ref_chan：
+                    // 走 BoxedScalar 装箱保留完整值；OOM 时回退写低 64 位（best-effort）
+                    .i128 => |b| {
+                        const val: i128 = @bitCast(b);
+                        if (self.boxScalarValueDirect(v)) |header| {
+                            self.runtime.writePtr(chan, @ptrCast(header));
+                        } else |_| {
+                            ptr.* = @truncate(val);
+                        }
+                    },
+                    .u128 => |b| {
+                        const val: u128 = @bitCast(b);
+                        if (self.boxScalarValueDirect(v)) |header| {
+                            self.runtime.writePtr(chan, @ptrCast(header));
+                        } else |_| {
+                            ptr.* = @bitCast(@as(u64, @truncate(val)));
+                        }
+                    },
+                    .f128 => |b| {
+                        const val: f128 = @bitCast(b);
+                        if (self.boxScalarValueDirect(v)) |header| {
+                            self.runtime.writePtr(chan, @ptrCast(header));
+                        } else |_| {
+                            ptr.* = @bitCast(@as(f64, @floatCast(val)));
+                        }
+                    },
                 }
             },
             .bool_chan, .mask_chan => {
@@ -8230,11 +8688,17 @@ pub const Engine = struct {
                     .u32 => |b| @as(i64, @as(u32, @bitCast(b))),
                     .u16 => |b| @as(i64, @as(u16, @bitCast(b))),
                     .u8 => |b| @as(i64, b[0]),
+                    .i128 => |b| @truncate(@as(i128, @bitCast(b))),
+                    .u128 => |b| @bitCast(@as(u64, @truncate(@as(u128, @bitCast(b))))),
                     .isize => |b| @as(i64, @as(isize, @bitCast(b))),
                     .usize => |b| @bitCast(@as(usize, @bitCast(b))),
                     .boolean => |b| @intFromBool(b[0] != 0),
                     .null_val, .unit => 0,
                     .ref => |r| @intCast(@intFromPtr(r)),
+                    .f32 => |b| @intFromFloat(@as(f32, @bitCast(b))),
+                    .f64 => |b| @intFromFloat(@as(f64, @bitCast(b))),
+                    .f16 => |b| @intFromFloat(@as(f16, @bitCast(b))),
+                    .f128 => |b| @intFromFloat(@as(f128, @bitCast(b))),
                     else => 0,
                 };
                 self.runtime.writeI64(chan, @bitCast(i));
@@ -8249,10 +8713,16 @@ pub const Engine = struct {
                     .u16 => |b| @as(i32, @as(u16, @bitCast(b))),
                     .u8 => |b| @as(i32, b[0]),
                     .u64 => |b| @truncate(@as(i64, @bitCast(@as(u64, @bitCast(b))))),
+                    .i128 => |b| @truncate(@as(i128, @bitCast(b))),
+                    .u128 => |b| @bitCast(@as(u32, @truncate(@as(u128, @bitCast(b))))),
                     .usize => |b| @truncate(@as(i64, @bitCast(@as(usize, @bitCast(b))))),
                     .isize => |b| @truncate(@as(i64, @as(isize, @bitCast(b)))),
                     .boolean => |b| @intFromBool(b[0] != 0),
                     .null_val, .unit => 0,
+                    .f32 => |b| @intFromFloat(@as(f32, @bitCast(b))),
+                    .f64 => |b| @intFromFloat(@as(f64, @bitCast(b))),
+                    .f16 => |b| @intFromFloat(@as(f16, @bitCast(b))),
+                    .f128 => |b| @intFromFloat(@as(f128, @bitCast(b))),
                     else => 0,
                 };
                 const ptr: *i32 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
@@ -8266,11 +8736,17 @@ pub const Engine = struct {
                     .u16 => |b| @bitCast(@as(u16, @bitCast(b))),
                     .u32 => |b| @truncate(@as(i32, @bitCast(@as(u32, @bitCast(b))))),
                     .u64 => |b| @truncate(@as(i64, @bitCast(@as(u64, @bitCast(b))))),
+                    .i128 => |b| @truncate(@as(i128, @bitCast(b))),
+                    .u128 => |b| @bitCast(@as(u16, @truncate(@as(u128, @bitCast(b))))),
                     .usize => |b| @truncate(@as(i64, @bitCast(@as(usize, @bitCast(b))))),
                     .isize => |b| @truncate(@as(i64, @as(isize, @bitCast(b)))),
                     .u8 => |b| @as(i16, b[0]),
                     .i8 => |b| @as(i16, @as(i8, @bitCast(b[0]))),
                     .boolean => |b| @intFromBool(b[0] != 0),
+                    .f32 => |b| @intFromFloat(@as(f32, @bitCast(b))),
+                    .f64 => |b| @intFromFloat(@as(f64, @bitCast(b))),
+                    .f16 => |b| @intFromFloat(@as(f16, @bitCast(b))),
+                    .f128 => |b| @intFromFloat(@as(f128, @bitCast(b))),
                     else => 0,
                 };
                 const ptr: *i16 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
@@ -8286,9 +8762,15 @@ pub const Engine = struct {
                     .u16 => |b| @truncate(@as(u16, @bitCast(b))),
                     .u32 => |b| @truncate(@as(u32, @bitCast(b))),
                     .u64 => |b| @truncate(@as(u64, @bitCast(b))),
+                    .i128 => |b| @bitCast(@as(u8, @truncate(@as(u128, @bitCast(@as(i128, @bitCast(b))))))),
+                    .u128 => |b| @truncate(@as(u128, @bitCast(b))),
                     .usize => |b| @truncate(@as(usize, @bitCast(b))),
                     .isize => |b| @truncate(@as(usize, @bitCast(@as(isize, @bitCast(b))))),
                     .boolean => |b| b[0],
+                    .f32 => |b| @intFromFloat(@as(f32, @bitCast(b))),
+                    .f64 => |b| @intFromFloat(@as(f64, @bitCast(b))),
+                    .f16 => |b| @intFromFloat(@as(f16, @bitCast(b))),
+                    .f128 => |b| @intFromFloat(@as(f128, @bitCast(b))),
                     else => 0,
                 };
                 self.runtime.rawPtr(chan)[0] = b_val;
@@ -8297,8 +8779,19 @@ pub const Engine = struct {
                 const f: f64 = switch (v) {
                     .f64 => |b| @bitCast(b),
                     .f32 => |b| @floatCast(@as(f32, @bitCast(b))),
-                    .i64 => |b| @floatFromInt(@as(i64, @bitCast(b))),
+                    .f16 => |b| @floatCast(@as(f16, @bitCast(b))),
+                    .f128 => |b| @floatCast(@as(f128, @bitCast(b))),
+                    .i8 => |b| @floatFromInt(@as(i8, @bitCast(b[0]))),
+                    .i16 => |b| @floatFromInt(@as(i16, @bitCast(b))),
                     .i32 => |b| @floatFromInt(@as(i32, @bitCast(b))),
+                    .i64 => |b| @floatFromInt(@as(i64, @bitCast(b))),
+                    .i128 => |b| @floatFromInt(@as(i128, @bitCast(b))),
+                    .u8 => |b| @floatFromInt(b[0]),
+                    .u16 => |b| @floatFromInt(@as(u16, @bitCast(b))),
+                    .u32 => |b| @floatFromInt(@as(u32, @bitCast(b))),
+                    .u64 => |b| @floatFromInt(@as(u64, @bitCast(b))),
+                    .u128 => |b| @floatFromInt(@as(u128, @bitCast(b))),
+                    .boolean => |b| @floatFromInt(@intFromBool(b[0] != 0)),
                     else => 0,
                 };
                 const ptr: *f64 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
@@ -8308,15 +8801,77 @@ pub const Engine = struct {
                 const f: f32 = switch (v) {
                     .f32 => |b| @bitCast(b),
                     .f64 => |b| @floatCast(@as(f64, @bitCast(b))),
+                    .f16 => |b| @floatCast(@as(f16, @bitCast(b))),
+                    .f128 => |b| @floatCast(@as(f128, @bitCast(b))),
+                    .i8 => |b| @floatFromInt(@as(i8, @bitCast(b[0]))),
+                    .i16 => |b| @floatFromInt(@as(i16, @bitCast(b))),
                     .i32 => |b| @floatFromInt(@as(i32, @bitCast(b))),
                     .i64 => |b| @floatFromInt(@as(i64, @bitCast(b))),
+                    .i128 => |b| @floatFromInt(@as(i128, @bitCast(b))),
+                    .u8 => |b| @floatFromInt(b[0]),
+                    .u16 => |b| @floatFromInt(@as(u16, @bitCast(b))),
+                    .u32 => |b| @floatFromInt(@as(u32, @bitCast(b))),
+                    .u64 => |b| @floatFromInt(@as(u64, @bitCast(b))),
+                    .u128 => |b| @floatFromInt(@as(u128, @bitCast(b))),
+                    .boolean => |b| @floatFromInt(@intFromBool(b[0] != 0)),
                     else => 0,
                 };
                 const ptr: *f32 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
                 ptr.* = f;
             },
+            .f16_chan => {
+                const f: f16 = switch (v) {
+                    .f16 => |b| @bitCast(b),
+                    .f32 => |b| @floatCast(@as(f32, @bitCast(b))),
+                    .f64 => |b| @floatCast(@as(f64, @bitCast(b))),
+                    .f128 => |b| @floatCast(@as(f128, @bitCast(b))),
+                    .i8 => |b| @floatFromInt(@as(i8, @bitCast(b[0]))),
+                    .i16 => |b| @floatFromInt(@as(i16, @bitCast(b))),
+                    .i32 => |b| @floatFromInt(@as(i32, @bitCast(b))),
+                    .i64 => |b| @floatFromInt(@as(i64, @bitCast(b))),
+                    .i128 => |b| @floatFromInt(@as(i128, @bitCast(b))),
+                    .u8 => |b| @floatFromInt(b[0]),
+                    .u16 => |b| @floatFromInt(@as(u16, @bitCast(b))),
+                    .u32 => |b| @floatFromInt(@as(u32, @bitCast(b))),
+                    .u64 => |b| @floatFromInt(@as(u64, @bitCast(b))),
+                    .u128 => |b| @floatFromInt(@as(u128, @bitCast(b))),
+                    .boolean => |b| @floatFromInt(@intFromBool(b[0] != 0)),
+                    else => 0,
+                };
+                const ptr: *f16 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
+                ptr.* = f;
+            },
+            .f128_chan => {
+                const f: f128 = switch (v) {
+                    .f128 => |b| @bitCast(b),
+                    .f16 => |b| @floatCast(@as(f16, @bitCast(b))),
+                    .f32 => |b| @floatCast(@as(f32, @bitCast(b))),
+                    .f64 => |b| @floatCast(@as(f64, @bitCast(b))),
+                    .i8 => |b| @floatFromInt(@as(i8, @bitCast(b[0]))),
+                    .i16 => |b| @floatFromInt(@as(i16, @bitCast(b))),
+                    .i32 => |b| @floatFromInt(@as(i32, @bitCast(b))),
+                    .i64 => |b| @floatFromInt(@as(i64, @bitCast(b))),
+                    .i128 => |b| @floatFromInt(@as(i128, @bitCast(b))),
+                    .u8 => |b| @floatFromInt(b[0]),
+                    .u16 => |b| @floatFromInt(@as(u16, @bitCast(b))),
+                    .u32 => |b| @floatFromInt(@as(u32, @bitCast(b))),
+                    .u64 => |b| @floatFromInt(@as(u64, @bitCast(b))),
+                    .u128 => |b| @floatFromInt(@as(u128, @bitCast(b))),
+                    .boolean => |b| @floatFromInt(@intFromBool(b[0] != 0)),
+                    else => 0,
+                };
+                const ptr: *f128 = @ptrCast(@alignCast(self.runtime.rawPtr(chan)));
+                ptr.* = f;
+            },
+            .i128_chan, .u128_chan => {
+                // i128/u128 通道：按 16 字节原样拷贝标量位模式
+                const w = meta.elem_width;
+                const src: [*]const u8 = @ptrCast(&v);
+                const dst = self.runtime.rawPtr(chan);
+                @memcpy(dst[0..w], src[0..w]);
+            },
             else => {
-                // 其他类型：按字节拷贝
+                // null/unit/char/nullable 等：按字节拷贝
                 const w = meta.elem_width;
                 if (w > 0 and w <= 16) {
                     const src: [*]const u8 = @ptrCast(&v);
@@ -8580,19 +9135,8 @@ pub const Engine = struct {
         const nodes = self.ir.funcNodes(self.current_func_idx);
         const local_start = body_start - func.node_start;
 
-        if (debug_route_dispatch) {
-            std.debug.print("route_dispatch: func={s} winner={} body_start={} body_len={} local_start={} node_start={}\n", .{ func.name, winner, body_start, body_len, local_start, func.node_start });
-            for (0..body_len) |i| {
-                const n = nodes[local_start + i];
-                std.debug.print("  body[{}]: op={} output={}\n", .{ i, n.op, n.output });
-            }
-        }
-
         // 如果 body 中遇到 halt 节点（halt_return/halt_throw），传播它
         if (try self.execBodyNodes(nodes, local_start, body_len)) |halt_chan| {
-            if (debug_route_dispatch) {
-                std.debug.print("  -> halt_chan={}\n", .{halt_chan});
-            }
             return halt_chan;
         }
 
@@ -8600,18 +9144,6 @@ pub const Engine = struct {
         const body_out_chan = nodes[local_start + body_len - 1].output;
         const body_meta = self.ir.channels.get(body_out_chan);
         const result_meta = self.ir.channels.get(node.output);
-
-        if (debug_route_dispatch) {
-            const bw = self.runtime.elemWidth(body_out_chan);
-            const rw = self.runtime.elemWidth(node.output);
-            std.debug.print("  result copy: body_out_chan={} body_type={} body_w={} result_chan={} result_type={} result_w={}\n", .{ body_out_chan, body_meta.chan_type, bw, node.output, result_meta.chan_type, rw });
-            if (bw > 0) {
-                const src = self.runtime.rawPtr(body_out_chan);
-                std.debug.print("  src bytes:", .{});
-                for (0..@min(bw, 16)) |i| std.debug.print(" {x:0>2}", .{src[i]});
-                std.debug.print("\n", .{});
-            }
-        }
 
         // 类型转换：body 输出 → 结果通道
         if (result_meta.chan_type == .nullable_chan and body_meta.chan_type != .nullable_chan) {
@@ -8634,15 +9166,6 @@ pub const Engine = struct {
                 const src = self.runtime.rawPtr(body_out_chan);
                 const dst = self.runtime.rawPtr(node.output);
                 @memcpy(dst[0..w], src[0..w]);
-            }
-        }
-        if (debug_route_dispatch) {
-            const rw2 = self.runtime.elemWidth(node.output);
-            if (rw2 > 0) {
-                const dst = self.runtime.rawPtr(node.output);
-                std.debug.print("  dst bytes:", .{});
-                for (0..@min(rw2, 16)) |i| std.debug.print(" {x:0>2}", .{dst[i]});
-                std.debug.print("\n", .{});
             }
         }
         return null;
@@ -8798,8 +9321,7 @@ pub const Engine = struct {
 
     /// 读取 ref_chan 中的 AsyncHandle 指针
     fn readAsyncHandle(self: *Engine, chan: u16) ?*value.AsyncHandle {
-        const ptr = self.runtime.readPtr(chan) orelse return null;
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
+        const header = self.readRefObj(chan) orelse return null;
         if (header.type_tag != .async_val) return null;
         return @alignCast(@fieldParentPtr("header", header));
     }
@@ -8807,8 +9329,7 @@ pub const Engine = struct {
     /// 读取 ref_chan 中的 ChannelValue 指针
     /// 支持 ChannelValue、SenderValue、ReceiverValue 三种引用类型
     fn readChannelValue(self: *Engine, chan: u16) ?*value.ChannelValue {
-        const ptr = self.runtime.readPtr(chan) orelse return null;
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
+        const header = self.readRefObj(chan) orelse return null;
         return switch (header.type_tag) {
             .channel_val => @alignCast(@fieldParentPtr("header", header)),
             .sender_val => blk: {
@@ -8837,9 +9358,6 @@ pub const Engine = struct {
     fn execOrbitAsyncCreate(self: *Engine, node: *const Node) EngineError!void {
         if (node.meta_index == 0 or node.meta_index > self.ir.orbit_metas.len) return error.InvalidMetaIndex;
         const om = &self.ir.orbit_metas[node.meta_index - 1];
-        if (debug_orbit) {
-            std.debug.print("orbit_create: meta_idx={} func_idx={} output_chan={} arg_count={}\n", .{ node.meta_index, om.func_index, node.output, om.arg_count });
-        }
 
         // 协程调度路径是唯一路径：scheduler 由 run() 惰性启动，
         // 所有 async 函数都有 CoroutineMeta（builder 阶段对所有 is_async 函数生成）
@@ -8956,16 +9474,7 @@ pub const Engine = struct {
     /// 4. signalConsumed 通知 worker 可以清理
     /// 5. waitWorkerDone 确保 worker 完全退出（避免泄漏检测竞态）
     fn execOrbitAsyncJoin(self: *Engine, node: *const Node) EngineError!void {
-        if (debug_orbit) {
-            const in_meta = self.ir.channels.get(node.inputs[0]);
-            const out_meta = self.ir.channels.get(node.output);
-            std.debug.print("orbit_join: input_chan={} input_type={s} output_chan={} output_type={s} meta_idx={}\n", .{ node.inputs[0], @tagName(in_meta.chan_type), node.output, @tagName(out_meta.chan_type), node.meta_index });
-        }
         const handle = self.readAsyncHandle(node.inputs[0]) orelse {
-            if (debug_orbit) {
-                const ptr = self.runtime.readPtr(node.inputs[0]);
-                std.debug.print("orbit_join: readAsyncHandle FAILED, ptr={?}\n", .{ptr});
-            }
             return error.InvalidChannel;
         };
 
@@ -9614,6 +10123,25 @@ fn initTestEngineOwned(ir: *GlueIR, threaded: *std.Io.Threaded) !Engine {
     return Engine.initOwned(ir, testing.allocator, null, threaded.io());
 }
 
+/// 测试辅助：从 Value 提取 i64（用于 expectEqual 比较）
+fn valI64(v: value.Value) i64 {
+    return switch (v) {
+        .i8 => |b| @as(i64, @as(i8, @bitCast(b[0]))),
+        .u8 => |b| @as(i64, b[0]),
+        .i16 => |b| @as(i64, @as(i16, @bitCast(b))),
+        .u16 => |b| @as(i64, @as(u16, @bitCast(b))),
+        .i32 => |b| @as(i64, @as(i32, @bitCast(b))),
+        .u32 => |b| @as(i64, @as(u32, @bitCast(b))),
+        .i64 => |b| @as(i64, @bitCast(b)),
+        .u64 => |b| @bitCast(@as(u64, @bitCast(b))),
+        .isize => |b| @as(i64, @as(isize, @bitCast(b))),
+        .usize => |b| @bitCast(@as(usize, @bitCast(b))),
+        .boolean => |b| @as(i64, @intFromBool(b[0] != 0)),
+        .char => |b| @as(i64, @as(u32, @bitCast(b))),
+        else => 0,
+    };
+}
+
 test "执行 const_i + halt_return" {
     // fun main() { 42 }
     var ir = try buildIRFromSource("fun main() { 42 }");
@@ -9624,7 +10152,7 @@ test "执行 const_i + halt_return" {
     defer { engine.deinit(); threaded.deinit(); }
 
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 test "执行整数加法" {
@@ -9637,7 +10165,7 @@ test "执行整数加法" {
     defer { engine.deinit(); threaded.deinit(); }
 
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 3), result);
+    try testing.expectEqual(@as(i64, 3), valI64(result));
 }
 
 test "执行整数减法" {
@@ -9646,7 +10174,7 @@ test "执行整数减法" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 6), try engine.run());
+    try testing.expectEqual(@as(i64, 6), valI64(try engine.run()));
 }
 
 test "执行整数乘法" {
@@ -9655,7 +10183,7 @@ test "执行整数乘法" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "执行整数除法" {
@@ -9664,7 +10192,7 @@ test "执行整数除法" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 5), try engine.run());
+    try testing.expectEqual(@as(i64, 5), valI64(try engine.run()));
 }
 
 test "执行整数取模" {
@@ -9673,7 +10201,7 @@ test "执行整数取模" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 2), try engine.run());
+    try testing.expectEqual(@as(i64, 2), valI64(try engine.run()));
 }
 
 test "执行嵌套表达式" {
@@ -9683,7 +10211,7 @@ test "执行嵌套表达式" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 7), try engine.run());
+    try testing.expectEqual(@as(i64, 7), valI64(try engine.run()));
 }
 
 test "执行比较运算" {
@@ -9694,7 +10222,7 @@ test "执行比较运算" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 1), result);
+    try testing.expectEqual(@as(i64, 1), valI64(result));
 }
 
 test "执行布尔逻辑" {
@@ -9705,7 +10233,7 @@ test "执行布尔逻辑" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 0), result);
+    try testing.expectEqual(@as(i64, 0), valI64(result));
 }
 
 test "执行 val 变量绑定" {
@@ -9715,7 +10243,7 @@ test "执行 val 变量绑定" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 30), try engine.run());
+    try testing.expectEqual(@as(i64, 30), valI64(try engine.run()));
 }
 
 test "执行函数调用" {
@@ -9729,7 +10257,7 @@ test "执行函数调用" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 7), try engine.run());
+    try testing.expectEqual(@as(i64, 7), valI64(try engine.run()));
 }
 
 test "执行优化后的常量折叠" {
@@ -9743,7 +10271,7 @@ test "执行优化后的常量折叠" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 3), try engine.run());
+    try testing.expectEqual(@as(i64, 3), valI64(try engine.run()));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -9757,7 +10285,7 @@ test "Phase 2: var 声明与赋值" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 20), try engine.run());
+    try testing.expectEqual(@as(i64, 20), valI64(try engine.run()));
 }
 
 test "Phase 2: 复合赋值 += " {
@@ -9767,7 +10295,7 @@ test "Phase 2: 复合赋值 += " {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 15), try engine.run());
+    try testing.expectEqual(@as(i64, 15), valI64(try engine.run()));
 }
 
 test "Phase 2: 复合赋值 *=" {
@@ -9777,7 +10305,7 @@ test "Phase 2: 复合赋值 *=" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 21), try engine.run());
+    try testing.expectEqual(@as(i64, 21), valI64(try engine.run()));
 }
 
 test "Phase 2: if 表达式 then 分支" {
@@ -9787,7 +10315,7 @@ test "Phase 2: if 表达式 then 分支" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "Phase 2: if 表达式 else 分支" {
@@ -9797,7 +10325,7 @@ test "Phase 2: if 表达式 else 分支" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 99), try engine.run());
+    try testing.expectEqual(@as(i64, 99), valI64(try engine.run()));
 }
 
 test "Phase 2: if 表达式条件求值" {
@@ -9807,7 +10335,7 @@ test "Phase 2: if 表达式条件求值" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 20), try engine.run());
+    try testing.expectEqual(@as(i64, 20), valI64(try engine.run()));
 }
 
 test "Phase 2: 类型转换 i64→i32" {
@@ -9818,7 +10346,7 @@ test "Phase 2: 类型转换 i64→i32" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 1000), result);
+    try testing.expectEqual(@as(i64, 1000), valI64(result));
 }
 
 test "Phase 2: 类型转换 i64→f64" {
@@ -9830,7 +10358,12 @@ test "Phase 2: 类型转换 i64→f64" {
     defer { engine.deinit(); threaded.deinit(); }
     // f64 通道的 8 字节读为 i64
     const result = try engine.run();
-    const f: f64 = @bitCast(result);
+    const f: f64 = switch (result) {
+        .f64 => |b| @as(f64, @bitCast(b)),
+        .f32 => |b| @as(f64, @floatCast(@as(f32, @bitCast(b)))),
+        .i64 => |b| @floatFromInt(@as(i64, @bitCast(b))),
+        else => 0,
+    };
     try testing.expectEqual(@as(f64, 42.0), f);
 }
 
@@ -9841,7 +10374,7 @@ test "Phase 2: 嵌套 if 表达式" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 100), try engine.run());
+    try testing.expectEqual(@as(i64, 100), valI64(try engine.run()));
 }
 
 test "Phase 2: 嵌套 if（then 分支内嵌套，字面量条件）" {
@@ -9851,7 +10384,7 @@ test "Phase 2: 嵌套 if（then 分支内嵌套，字面量条件）" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 2), try engine.run());
+    try testing.expectEqual(@as(i64, 2), valI64(try engine.run()));
 }
 
 test "Phase 2: cast 链 i64→i32→i64" {
@@ -9861,7 +10394,7 @@ test "Phase 2: cast 链 i64→i32→i64" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 1000), try engine.run());
+    try testing.expectEqual(@as(i64, 1000), valI64(try engine.run()));
 }
 
 test "Phase 2: var 与 if 组合" {
@@ -9871,7 +10404,7 @@ test "Phase 2: var 与 if 组合" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 10), try engine.run());
+    try testing.expectEqual(@as(i64, 10), valI64(try engine.run()));
 }
 
 test "Phase 2: 复合赋值 -= " {
@@ -9881,7 +10414,7 @@ test "Phase 2: 复合赋值 -= " {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 70), try engine.run());
+    try testing.expectEqual(@as(i64, 70), valI64(try engine.run()));
 }
 
 test "Phase 2: 类型转换 i64→u8（窄化 wrap）" {
@@ -9893,7 +10426,7 @@ test "Phase 2: 类型转换 i64→u8（窄化 wrap）" {
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
     // u8 通道读 1 字节，零扩展为 i64
-    try testing.expectEqual(@as(i64, 44), result);
+    try testing.expectEqual(@as(i64, 44), valI64(result));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -9996,7 +10529,7 @@ test "Phase 2.5: 数组索引访问" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 20), try engine.run());
+    try testing.expectEqual(@as(i64, 20), valI64(try engine.run()));
 }
 
 test "Phase 2.5: record 字面量与字段访问" {
@@ -10006,7 +10539,7 @@ test "Phase 2.5: record 字面量与字段访问" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 1), try engine.run());
+    try testing.expectEqual(@as(i64, 1), valI64(try engine.run()));
 }
 
 test "Phase 2.5: record 多字段访问" {
@@ -10016,7 +10549,7 @@ test "Phase 2.5: record 多字段访问" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 20), try engine.run());
+    try testing.expectEqual(@as(i64, 20), valI64(try engine.run()));
 }
 
 test "Phase 2.5: record 字段覆盖" {
@@ -10026,7 +10559,7 @@ test "Phase 2.5: record 字段覆盖" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 2), try engine.run());
+    try testing.expectEqual(@as(i64, 2), valI64(try engine.run()));
 }
 
 test "Phase 2.5: 字符串索引" {
@@ -10039,7 +10572,7 @@ test "Phase 2.5: 字符串索引" {
     // char 通道返回 u21，但 run() 按通道宽度读取
     // char_chan 宽度为 4 字节，按 i32 读取
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 104), result);
+    try testing.expectEqual(@as(i64, 104), valI64(result));
 }
 
 test "Phase 2.5: 字符串插值" {
@@ -10077,7 +10610,7 @@ test "Phase 3: for range 向量化 identity map" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 9), result);
+    try testing.expectEqual(@as(i64, 9), valI64(result));
 }
 
 test "Phase 3: for range 带运算 i * 2" {
@@ -10088,7 +10621,7 @@ test "Phase 3: for range 带运算 i * 2" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 8), result);
+    try testing.expectEqual(@as(i64, 8), valI64(result));
 }
 
 test "Phase 3: for range 带运算 i + 10" {
@@ -10099,7 +10632,7 @@ test "Phase 3: for range 带运算 i + 10" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 13), result);
+    try testing.expectEqual(@as(i64, 13), valI64(result));
 }
 
 test "Phase 3: for range 单元素" {
@@ -10110,7 +10643,7 @@ test "Phase 3: for range 单元素" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 0), result);
+    try testing.expectEqual(@as(i64, 0), valI64(result));
 }
 
 test "Phase 3: for range 复杂表达式" {
@@ -10121,7 +10654,7 @@ test "Phase 3: for range 复杂表达式" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 15), result);
+    try testing.expectEqual(@as(i64, 15), valI64(result));
 }
 
 // ════════════════════════════════════════════
@@ -10140,7 +10673,7 @@ test "Phase 4: defer 在 return 前执行" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 test "Phase 4: 多个 defer LIFO 执行" {
@@ -10153,7 +10686,7 @@ test "Phase 4: 多个 defer LIFO 执行" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 99), result);
+    try testing.expectEqual(@as(i64, 99), valI64(result));
 }
 
 test "Phase 4: defer 带 var 赋值" {
@@ -10168,7 +10701,7 @@ test "Phase 4: defer 带 var 赋值" {
     defer { engine.deinit(); threaded.deinit(); }
     // x 的值在 defer 执行前就已经作为返回值
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 1), result);
+    try testing.expectEqual(@as(i64, 1), valI64(result));
 }
 
 test "Phase 4: throw 触发 halt_throw" {
@@ -10194,7 +10727,7 @@ test "Phase 5: select 第一个分支就绪" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 10), result);
+    try testing.expectEqual(@as(i64, 10), valI64(result));
 }
 
 test "Phase 5: select 单分支" {
@@ -10206,7 +10739,7 @@ test "Phase 5: select 单分支" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 99), result);
+    try testing.expectEqual(@as(i64, 99), valI64(result));
 }
 
 test "Phase 5: select 带 timeout 分支" {
@@ -10218,7 +10751,7 @@ test "Phase 5: select 带 timeout 分支" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 test "Phase 5: select body 带运算" {
@@ -10230,7 +10763,7 @@ test "Phase 5: select body 带运算" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 12), result);
+    try testing.expectEqual(@as(i64, 12), valI64(result));
 }
 
 // ════════════════════════════════════════════
@@ -10246,7 +10779,7 @@ test "Phase 6: Elvis 整数默认值" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 1), result);
+    try testing.expectEqual(@as(i64, 1), valI64(result));
 }
 
 test "Phase 6: non_null_assert 整数透传" {
@@ -10258,7 +10791,7 @@ test "Phase 6: non_null_assert 整数透传" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 test "Phase 6: Elvis 链式表达式" {
@@ -10269,7 +10802,7 @@ test "Phase 6: Elvis 链式表达式" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 3), result);
+    try testing.expectEqual(@as(i64, 3), valI64(result));
 }
 
 // ════════════════════════════════════════════
@@ -10288,7 +10821,7 @@ test "Phase 7: async 函数基本执行 + join" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 test "Phase 7: async 函数带参数" {
@@ -10303,7 +10836,7 @@ test "Phase 7: async 函数带参数" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 7), result);
+    try testing.expectEqual(@as(i64, 7), valI64(result));
 }
 
 test "Phase 7: async 函数计算" {
@@ -10318,7 +10851,7 @@ test "Phase 7: async 函数计算" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 49), result);
+    try testing.expectEqual(@as(i64, 49), valI64(result));
 }
 
 test "Phase 7: async 函数调用普通函数" {
@@ -10335,7 +10868,7 @@ test "Phase 7: async 函数调用普通函数" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 test "Phase 7: 嵌套普通函数调用（非 async）" {
@@ -10352,7 +10885,7 @@ test "Phase 7: 嵌套普通函数调用（非 async）" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 test "Phase 7: 单层 double 调用" {
@@ -10367,21 +10900,7 @@ test "Phase 7: 单层 double 调用" {
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
-}
-
-test "内置 print/println 编译与执行（无 io 时不崩溃）" {
-    // fun main() { println("Hello, Glue!"); 42 }
-    var ir = try buildIRFromSource(
-        \\fun main() { println("Hello, Glue!"); 42 }
-    );
-    defer ir.deinit();
-    var threaded: std.Io.Threaded = undefined;
-    var engine = try initTestEngineOwned(&ir, &threaded);
-    defer { engine.deinit(); threaded.deinit(); }
-    // 无 io 接口，print 静默跳过，不崩溃
-    const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 test "loop + break" {
@@ -10402,7 +10921,7 @@ test "loop + break" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 10), try engine.run()); // 0+1+2+3+4=10
+    try testing.expectEqual(@as(i64, 10), valI64(try engine.run())); // 0+1+2+3+4=10
 }
 
 test "for + break" {
@@ -10420,7 +10939,7 @@ test "for + break" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 15), try engine.run()); // 0+1+2+3+4+5=15
+    try testing.expectEqual(@as(i64, 15), valI64(try engine.run())); // 0+1+2+3+4+5=15
 }
 
 test "for + continue" {
@@ -10438,7 +10957,7 @@ test "for + continue" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 25), try engine.run()); // 1+3+5+7+9=25
+    try testing.expectEqual(@as(i64, 25), valI64(try engine.run())); // 1+3+5+7+9=25
 }
 
 test "while + break" {
@@ -10458,7 +10977,7 @@ test "while + break" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 10), try engine.run()); // 0+1+2+3+4=10
+    try testing.expectEqual(@as(i64, 10), valI64(try engine.run())); // 0+1+2+3+4=10
 }
 
 // ════════════════════════════════════════════
@@ -10496,7 +11015,7 @@ test "Phase 7-c: async 函数走协程调度路径" {
     try engine.startScheduler(2);
 
     const result = try engine.run();
-    try testing.expectEqual(@as(i64, 42), result);
+    try testing.expectEqual(@as(i64, 42), valI64(result));
 }
 
 // ════════════════════════════════════════════
@@ -10525,7 +11044,7 @@ test "P0-b: ADT 带参构造器 + 命名字段访问" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "P0-b: ADT 多构造器 + 位置字段访问" {
@@ -10538,7 +11057,7 @@ test "P0-b: ADT 多构造器 + 位置字段访问" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 5), try engine.run());
+    try testing.expectEqual(@as(i64, 5), valI64(try engine.run()));
 }
 
 test "P0-b: newtype 构造器 + 字段访问" {
@@ -10551,7 +11070,7 @@ test "P0-b: newtype 构造器 + 字段访问" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "P0-b: trait_decl 注册（不崩溃）" {
@@ -10565,7 +11084,7 @@ test "P0-b: trait_decl 注册（不崩溃）" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "P0-b: type 方法注册为函数" {
@@ -10579,7 +11098,7 @@ test "P0-b: type 方法注册为函数" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 10), try engine.run());
+    try testing.expectEqual(@as(i64, 10), valI64(try engine.run()));
 }
 
 // ════════════════════════════════════════════
@@ -10601,7 +11120,7 @@ test "P0-c: match 字面量匹配" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 20), try engine.run());
+    try testing.expectEqual(@as(i64, 20), valI64(try engine.run()));
 }
 
 test "P0-c: match 通配符兜底" {
@@ -10618,7 +11137,7 @@ test "P0-c: match 通配符兜底" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 30), try engine.run());
+    try testing.expectEqual(@as(i64, 30), valI64(try engine.run()));
 }
 
 test "P0-c: match 变量绑定" {
@@ -10635,7 +11154,7 @@ test "P0-c: match 变量绑定" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "P0-c: match ADT 构造器解构" {
@@ -10653,7 +11172,7 @@ test "P0-c: match ADT 构造器解构" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "P0-c: match ADT 无参构造器" {
@@ -10671,7 +11190,7 @@ test "P0-c: match ADT 无参构造器" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 99), try engine.run());
+    try testing.expectEqual(@as(i64, 99), valI64(try engine.run()));
 }
 
 test "P0-c: match 或模式" {
@@ -10688,7 +11207,7 @@ test "P0-c: match 或模式" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 10), try engine.run());
+    try testing.expectEqual(@as(i64, 10), valI64(try engine.run()));
 }
 
 test "P0-c: match 守卫条件" {
@@ -10706,7 +11225,7 @@ test "P0-c: match 守卫条件" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 2), try engine.run());
+    try testing.expectEqual(@as(i64, 2), valI64(try engine.run()));
 }
 
 test "P0-c: match 多构造器 ADT 位置字段" {
@@ -10724,7 +11243,7 @@ test "P0-c: match 多构造器 ADT 位置字段" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 5), try engine.run());
+    try testing.expectEqual(@as(i64, 5), valI64(try engine.run()));
 }
 
 // ════════════════════════════════════════════
@@ -10741,7 +11260,7 @@ test "P0-d: async .await() 显式等待" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "P0-d: async .status() 状态查询" {
@@ -10760,7 +11279,7 @@ test "P0-d: async .status() 状态查询" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 2), try engine.run());
+    try testing.expectEqual(@as(i64, 2), valI64(try engine.run()));
 }
 
 test "P0-d: array .len() 方法" {
@@ -10772,7 +11291,7 @@ test "P0-d: array .len() 方法" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 3), try engine.run());
+    try testing.expectEqual(@as(i64, 3), valI64(try engine.run()));
 }
 
 test "P0-d: string .len() 方法" {
@@ -10784,7 +11303,7 @@ test "P0-d: string .len() 方法" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 5), try engine.run());
+    try testing.expectEqual(@as(i64, 5), valI64(try engine.run()));
 }
 
 test "P0-d: array .push() 方法" {
@@ -10800,7 +11319,7 @@ test "P0-d: array .push() 方法" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 2), try engine.run());
+    try testing.expectEqual(@as(i64, 2), valI64(try engine.run()));
 }
 
 test "P0-d: 用户自定义方法调用" {
@@ -10817,7 +11336,7 @@ test "P0-d: 用户自定义方法调用" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 10), try engine.run());
+    try testing.expectEqual(@as(i64, 10), valI64(try engine.run()));
 }
 
 test "P0-d: .type_name() 反射方法" {
@@ -10836,7 +11355,7 @@ test "P0-d: .type_name() 反射方法" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 42), try engine.run());
+    try testing.expectEqual(@as(i64, 42), valI64(try engine.run()));
 }
 
 test "P0-d: async .await() 带参数计算" {
@@ -10849,7 +11368,7 @@ test "P0-d: async .await() 带参数计算" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 7), try engine.run());
+    try testing.expectEqual(@as(i64, 7), valI64(try engine.run()));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -10869,7 +11388,7 @@ test "P1-a: fun lambda 基本调用" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 11), try engine.run());
+    try testing.expectEqual(@as(i64, 11), valI64(try engine.run()));
 }
 
 test "P1-a: 箭头 lambda 基本调用" {
@@ -10884,7 +11403,7 @@ test "P1-a: 箭头 lambda 基本调用" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 11), try engine.run());
+    try testing.expectEqual(@as(i64, 11), valI64(try engine.run()));
 }
 
 test "P1-a: 多参数 lambda" {
@@ -10899,7 +11418,7 @@ test "P1-a: 多参数 lambda" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 7), try engine.run());
+    try testing.expectEqual(@as(i64, 7), valI64(try engine.run()));
 }
 
 test "P1-a: 闭包捕获自由变量" {
@@ -10915,7 +11434,7 @@ test "P1-a: 闭包捕获自由变量" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 15), try engine.run());
+    try testing.expectEqual(@as(i64, 15), valI64(try engine.run()));
 }
 
 test "P1-a: 闭包捕获多个自由变量" {
@@ -10932,11 +11451,13 @@ test "P1-a: 闭包捕获多个自由变量" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 81), try engine.run());
+    try testing.expectEqual(@as(i64, 81), valI64(try engine.run()));
 }
 
 test "lazy: 创建时不求值，强制时缓存" {
-    // 与 edge_lazy 保持一致：创建时不求值，首次 println 强制计算，二次 println 复用缓存
+    // 与 edge_lazy 保持一致：创建时不求值，首次强制求值，二次复用缓存。
+    // 注意：buildIRFromSource 不加载 stdlib 模块，无法使用 println；
+    // 改用 lz + 0 触发严格运算上下文的 lazy_force（builder 对 ref_chan 操作数强制求值）。
     var ir = try buildIRFromSource(
         \\var compute_count = 0
         \\
@@ -10948,8 +11469,8 @@ test "lazy: 创建时不求值，强制时缓存" {
         \\fun main(): i64 {
         \\    val lz = lazy expensive(5)
         \\    if compute_count != 0 { -100 } else {
-        \\        println(lz)
-        \\        println(lz)
+        \\        lz + 0
+        \\        lz + 0
         \\        compute_count
         \\    }
         \\}
@@ -10958,10 +11479,12 @@ test "lazy: 创建时不求值，强制时缓存" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 1), try engine.run());
+    try testing.expectEqual(@as(i64, 1), valI64(try engine.run()));
 }
 
 test "lazy: thunk 捕获外部变量" {
+    // buildIRFromSource 不加载 stdlib 模块，无法使用 println；
+    // 改用 lz + 0 触发 lazy_force 验证 thunk 捕获外部变量。
     var ir = try buildIRFromSource(
         \\fun makeLazy(x: i32): Lazy<i32> {
         \\    lazy x * x
@@ -10969,7 +11492,7 @@ test "lazy: thunk 捕获外部变量" {
         \\
         \\fun main(): i64 {
         \\    val lz = makeLazy(7)
-        \\    println(lz)
+        \\    lz + 0
         \\    49
         \\}
     );
@@ -10977,7 +11500,7 @@ test "lazy: thunk 捕获外部变量" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 49), try engine.run());
+    try testing.expectEqual(@as(i64, 49), valI64(try engine.run()));
 }
 
 test "vec_zip: 合并两个 range 向量" {
@@ -11054,5 +11577,5 @@ test "vec_zip: 合并两个 range 向量" {
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
     defer { engine.deinit(); threaded.deinit(); }
-    try testing.expectEqual(@as(i64, 3), try engine.run());
+    try testing.expectEqual(@as(i64, 3), valI64(try engine.run()));
 }

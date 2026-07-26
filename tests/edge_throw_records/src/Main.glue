@@ -1,3 +1,4 @@
+import std.io.Console.{println}
 fun checked(x: i32): Throw<i32, Error> {
     if x >= 0 { x } else { throw Error("negative") }
 }

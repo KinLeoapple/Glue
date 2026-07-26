@@ -5,6 +5,7 @@
 import std.time.DateTime
 import std.time.Duration
 import std.time.TimeComponents
+import std.io.Console.{println}
 
 fun main() {
     // ── 1. 构造器 + 字段访问 ─────────────────────────────────────

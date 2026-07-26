@@ -230,6 +230,8 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("ir", ir_module);
     root_module.addImport("engine", engine_module);
     root_module.addImport("analysis_db", analysis_db_module);
+    // pipeline.zig 需按 value.Value 变体格式化返回值（eng.run() 返回 value.Value）
+    root_module.addImport("value", value_module);
 
     const exe = b.addExecutable(.{
         .name = "glue",

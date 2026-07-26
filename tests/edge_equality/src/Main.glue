@@ -1,5 +1,6 @@
 // 相等性测试：== 值相等 + === 引用相等
 
+import std.io.Console.{println}
 type List = | Nil | Cons(i32, List)
 type UserId = UserId(i32)
 

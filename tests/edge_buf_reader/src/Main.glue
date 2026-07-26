@@ -1,5 +1,6 @@
 // Test: 验证 File.read 基础功能（排除 BufReader 干扰）
 import std.io.File
+import std.io.Console.{println}
 
 fun main() {
     val path = "/tmp/glue_buf_reader_test.txt"

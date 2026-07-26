@@ -1,6 +1,7 @@
 // tests/specialization/arith_int/src/Main.glue
 // 验证类型特化算术语义正确性（int + float 全覆盖）
 
+import std.io.Console.{println}
 fun add(a: i32, b: i32): i32 {
     return a + b
 }

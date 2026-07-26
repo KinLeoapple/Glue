@@ -2,6 +2,7 @@
 // 目标：压测 Str 的 SSO/堆切换、拼接、迭代、比较、子串
 // 强化：2000→20000 拼接，新增子串搜索和重复构建
 
+import std.io.Console.{println}
 fun buildString(n: i32): str {
     var s: str = ""
     var i: i32 = 0

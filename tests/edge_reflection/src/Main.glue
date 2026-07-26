@@ -7,6 +7,7 @@
 //   impls  = TraitImplInfo(parent_traits, implemented_traits, methods, associated_types)
 //   structure = TypeStructure ADT（按 kind 取对应变体 RecordValue）
 
+import std.io.Console.{println}
 type Color = | Red | Green | Blue
 type UserId = UserId(i32)
 type Point = Point(x: i32, y: i32)

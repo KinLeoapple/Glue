@@ -162,23 +162,27 @@ pub fn runSegment(
             // ── 非 orbit 节点：委托 Engine.exec_node ──
             else => {
                 const ret = try sctx.exec_node(sctx.ctx, node);
-                if (ret) |chan| halt_ret_chan = chan;
+                if (ret) |chan| {
+                    halt_ret_chan = chan;
+                }
             },
         }
     }
 
     // 段内所有节点执行完毕，根据 suspend_kind 决定段末动作
-    return switch (seg.suspend_kind) {
+    const r: SegmentResult = switch (seg.suspend_kind) {
         .none => .advance,
         .chan_recv, .chan_send, .async_join => .advance,
         .terminal => blk: {
             // 终态段完成：从返回通道读取结果值到 frame.result
             if (halt_ret_chan) |chan| {
                 frame.result = sctx.read_value(sctx.ctx, chan);
+            } else {
             }
             break :blk .complete;
         },
     };
+    return r;
 }
 
 // ════════════════════════════════════════════════════════════════

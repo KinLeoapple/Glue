@@ -52,7 +52,7 @@ pub const Closure = struct {
     /// 释放上值和绑定参数的引用计数，跳过 self 上值以避免自引用释放
     /// upvalues 和 bound_args 是连续内存的一部分，由 closureDeinit 中的 freeObj 统一释放
     pub fn deinit(self: *Closure, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             const self_idx = self.self_upvalue_idx;
             for (self.upvalues, 0..) |uv, i| {
                 if (self_idx >= 0 and i == @as(usize, @intCast(self_idx))) continue;
@@ -84,7 +84,7 @@ pub const PartialApplication = struct {
     /// 释放已绑定参数的引用计数
     /// bound_args 是连续内存的一部分，由 partialDeinit 中的 freeObj 统一释放
     pub fn deinit(self: *PartialApplication, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             for (self.bound_args) |ba| ba.release(tctx);
         }
     }
@@ -125,7 +125,7 @@ pub const TraitValue = struct {
             }
             if (self.method_names.len > 0) tctx.freeObj(@ptrCast(@constCast(self.method_names.ptr)));
         }
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             for (self.method_values) |v| v.release(tctx);
             if (self.data) |v| v.release(tctx);
         }
@@ -143,7 +143,7 @@ pub const LazyValue = struct {
 
     /// 释放缓存的求值结果和 thunk 闭包
     pub fn deinit(self: *LazyValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             if (self.cached) |cached| cached.release(tctx);
             if (self.thunk) |thunk| {
                 const vc: *Closure = @ptrCast(@alignCast(thunk));

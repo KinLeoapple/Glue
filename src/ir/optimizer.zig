@@ -403,9 +403,6 @@ fn hasSideEffect(op: NodeOp) bool {
         .partial_make,
         // race_select 阻塞等待通道就绪/超时，结果依赖时序，不可消除
         .race_select, .race_yield,
-        .builtin_print, .builtin_println,
-        .builtin_eprint, .builtin_eprintln,
-        .builtin_scan, .builtin_scanln,
         .builtin_ok, .builtin_error, .builtin_eq, .builtin_str,
         .builtin_ref_eq,
         .builtin_type, .builtin_panic, .builtin_typeof,

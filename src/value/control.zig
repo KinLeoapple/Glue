@@ -42,7 +42,7 @@ pub const ThrowValue = struct {
 
     /// 释放抛出值持有的资源，递减内部错误值的引用计数
     pub fn deinit(self: *ThrowValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             switch (self.payload) {
                 .ok => |v| v.release(tctx),
                 .err => |e| obj_header.release(&e.header, tctx),

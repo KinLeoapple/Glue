@@ -4,6 +4,7 @@
 //       Ackermann 无 memoization 收益（参数组合爆炸），是真正的递归压测
 //       Tak 函数因三重递归导致栈溢出，已移除
 
+import std.io.Console.{println}
 fun fib(n: i64): i64 {
     if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
 }

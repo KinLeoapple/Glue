@@ -202,7 +202,9 @@ fn workerRun(worker: *Worker) void {
     var worker_engine: ?*anyopaque = null;
     var sctx: ?SegmentContext = null;
     if (sched.engine_ctx) |ectx| {
-        worker_engine = ectx.create_engine(ectx.ctx) catch null;
+        worker_engine = ectx.create_engine(ectx.ctx) catch {
+            return;
+        };
         if (worker_engine) |we| {
             sctx = ectx.build_segment_context(we);
         }
@@ -265,17 +267,40 @@ fn workerRun(worker: *Worker) void {
         const nodes = sched.ir_nodes.?;
         const ctx = sctx.?;
 
-        if (f.func_idx >= metas.len) {
-            f.setPanic("workerRun: func_idx out of range");
+        // coroutine_metas 只包含 async 函数的 meta（按 func_idx 线性搜索），
+        // 长度 = async 函数数量，不是 functions.len。
+        // 不能用 metas[f.func_idx] 直接索引（func_idx 较大的 async 函数会越界），
+        // 必须线性搜索匹配 m.func_idx == f.func_idx。
+        var meta_opt: ?*const CoroutineMeta = null;
+        for (metas) |*m| {
+            if (m.func_idx == f.func_idx) {
+                meta_opt = m;
+                break;
+            }
+        }
+        const meta = meta_opt orelse {
+            f.setPanic("workerRun: no coroutine meta for func_idx");
             f.setStatus(.failed);
             sched.frame_pool.free(f);
+            // 通知 handle
+            if (f.async_handle) |hp| {
+                const AsyncHandle = @import("value").AsyncHandle;
+                const handle: *AsyncHandle = @ptrCast(@alignCast(hp));
+                handle.setPanic("no coroutine meta for func_idx");
+                handle.signalWorkerDone();
+            }
             continue;
-        }
-        const meta = &metas[f.func_idx];
+        };
         if (f.state >= meta.segment_count) {
             f.setPanic("workerRun: state out of range");
             f.setStatus(.failed);
             sched.frame_pool.free(f);
+            if (f.async_handle) |hp| {
+                const AsyncHandle = @import("value").AsyncHandle;
+                const handle: *AsyncHandle = @ptrCast(@alignCast(hp));
+                handle.setPanic("state out of range");
+                handle.signalWorkerDone();
+            }
             continue;
         }
         const seg = meta.segments[f.state];

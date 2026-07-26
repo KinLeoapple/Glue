@@ -59,6 +59,8 @@ pub fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !voi
     const main_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_prefix, DEFAULT_ENTRY });
     defer allocator.free(main_path);
     const main_content =
+        \\import std.io.Console.{println}
+        \\
         \\fun main() {
         \\    println("Hello, Glue!")
         \\    0

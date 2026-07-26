@@ -10,6 +10,7 @@ const engine = @import("engine");
 const sema = @import("sema");
 const analysis_db_mod = @import("analysis_db");
 const args_mod = @import("args.zig");
+const value = @import("value");
 
 /// 源码执行结果：成功或失败
 pub const ExecOutcome = enum { failed, ran_main };
@@ -180,7 +181,7 @@ pub fn executeSource(
         args_mod.printError(io, "{s}: engine init error: {s}\n", .{ filename, @errorName(err) });
         return .failed;
     };
-    eng.io = io; // 注入 IO 接口供内置 print/println 使用
+    eng.io = io; // 注入 IO 接口供 syscall dispatch 使用
     cli_ctx.prof.phases.phaseEnd(.engine_setup);
     defer {
         cli_ctx.prof.phases.phaseBegin(.engine_teardown);
@@ -197,14 +198,40 @@ pub fn executeSource(
     };
     cli_ctx.prof.phases.phaseEnd(.engine_exec);
 
-    // 输出 main 函数返回值（unit/null 类型不打印）
-    const ret_chan_type = glue_ir.channels.get(eng.result_chan).chan_type;
-    if (ret_chan_type != .unit_chan and ret_chan_type != .null_chan) {
-        var out_buf: [256]u8 = undefined;
-        var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
-        stdout_writer.interface.print("{d}\n", .{result}) catch {};
-        stdout_writer.flush() catch {};
-    }
+    // 通用返回值打印：按 value.Value 变体分派，完整支持所有标量类型（含 i128/u128/f128）。
+    // - 整数/浮点/布尔：打印字面值
+    // - 引用类型（ref）：指针值打印无意义，不打印（避免泄露地址、避免误判位模式）
+    // - unit/null/char：不打印
+    printReturnValue(io, result);
 
     return .ran_main;
+}
+
+/// 按值变体打印标量返回值。
+/// 仅整数/浮点/布尔打印字面值；引用/unit/null/char 不打印（与 main 函数语义一致）。
+fn printReturnValue(io: std.Io, v: value.Value) void {
+    var out_buf: [256]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
+    switch (v) {
+        .i8 => |b| stdout_writer.interface.print("{d}\n", .{@as(i8, @bitCast(b[0]))}) catch {},
+        .u8 => |b| stdout_writer.interface.print("{d}\n", .{b[0]}) catch {},
+        .i16 => |b| stdout_writer.interface.print("{d}\n", .{@as(i16, @bitCast(b))}) catch {},
+        .u16 => |b| stdout_writer.interface.print("{d}\n", .{@as(u16, @bitCast(b))}) catch {},
+        .i32 => |b| stdout_writer.interface.print("{d}\n", .{@as(i32, @bitCast(b))}) catch {},
+        .u32 => |b| stdout_writer.interface.print("{d}\n", .{@as(u32, @bitCast(b))}) catch {},
+        .i64 => |b| stdout_writer.interface.print("{d}\n", .{@as(i64, @bitCast(b))}) catch {},
+        .u64 => |b| stdout_writer.interface.print("{d}\n", .{@as(u64, @bitCast(b))}) catch {},
+        .i128 => |b| stdout_writer.interface.print("{d}\n", .{@as(i128, @bitCast(b))}) catch {},
+        .u128 => |b| stdout_writer.interface.print("{d}\n", .{@as(u128, @bitCast(b))}) catch {},
+        .isize => |b| stdout_writer.interface.print("{d}\n", .{@as(isize, @bitCast(b))}) catch {},
+        .usize => |b| stdout_writer.interface.print("{d}\n", .{@as(usize, @bitCast(b))}) catch {},
+        .f16 => |b| stdout_writer.interface.print("{d}\n", .{@as(f16, @bitCast(b))}) catch {},
+        .f32 => |b| stdout_writer.interface.print("{d}\n", .{@as(f32, @bitCast(b))}) catch {},
+        .f64 => |b| stdout_writer.interface.print("{d}\n", .{@as(f64, @bitCast(b))}) catch {},
+        .f128 => |b| stdout_writer.interface.print("{d}\n", .{@as(f128, @bitCast(b))}) catch {},
+        .boolean => |b| stdout_writer.interface.print("{s}\n", .{if (b[0] != 0) "true" else "false"}) catch {},
+        // ref/unit/null/char：返回值非标量字面量，不打印
+        else => {},
+    }
+    stdout_writer.flush() catch {};
 }

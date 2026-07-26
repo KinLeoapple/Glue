@@ -519,6 +519,63 @@ pub const ModuleLoader = struct {
                         extra_decls,
                         ast_arena,
                     );
+
+                    // 递归处理子模块内的 import_decl：stdlib 子模块可能依赖其他 stdlib pack
+                    // （例如 Console.glue 依赖 std.reflect.Reflect）。
+                    // 只处理 std 分支，用户模块的 import 由 loadUserPack 路径处理。
+                    try self.loadStdlibTransitiveImports(
+                        sub_module,
+                        extra_decls,
+                        loaded_submodules,
+                        retained_parsers,
+                        retained_sources,
+                        retained_tokens,
+                        ast_arena,
+                    );
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// 遍历子模块的 declarations，对每个 import_decl[0]=="std" 的依赖递归调用 loadStdlibPack。
+    /// 避免无限递归：通过 loaded_submodules 集合去重（key 格式 "pack/sub"）。
+    /// 注意：显式 anyerror 打破与 loadStdlibPack 间的推断错误集循环。
+    fn loadStdlibTransitiveImports(
+        self: *ModuleLoader,
+        sub_module: ast.Module,
+        extra_decls: *std.ArrayList(ast.Decl),
+        loaded_submodules: *std.StringHashMap(void),
+        retained_parsers: *std.ArrayList(*parser_mod.Parser),
+        retained_sources: *std.ArrayList([]const u8),
+        retained_tokens: *std.ArrayList([]lexer_mod.Token),
+        ast_arena: std.mem.Allocator,
+    ) anyerror!void {
+        for (sub_module.declarations) |decl| {
+            switch (decl) {
+                .import_decl => |imp| {
+                    if (imp.module_path.len < 2) continue;
+                    if (!std.mem.eql(u8, imp.module_path[0], "std")) continue;
+                    const pack_name = imp.module_path[1];
+                    // 去重：检查 pack 内任意子模块是否已加载
+                    var already_loaded = false;
+                    var it = loaded_submodules.keyIterator();
+                    while (it.next()) |k| {
+                        if (std.mem.startsWith(u8, k.*, pack_name) and k.*.len > pack_name.len and k.*[pack_name.len] == '/') {
+                            already_loaded = true;
+                            break;
+                        }
+                    }
+                    if (already_loaded) continue;
+                    try self.loadStdlibPack(
+                        imp.module_path,
+                        extra_decls,
+                        loaded_submodules,
+                        retained_parsers,
+                        retained_sources,
+                        retained_tokens,
+                        ast_arena,
+                    );
                 },
                 else => {},
             }
@@ -630,25 +687,22 @@ pub const ModuleLoader = struct {
         extra_decls: *std.ArrayList(ast.Decl),
         ast_arena: std.mem.Allocator,
     ) !void {
-        // 构建 local_renames：同模块 pub fun/val 短名 → mangled name
+        // 构建 local_renames：同模块所有 fun/val 短名 → mangled name
+        // 包含私有函数：pub 函数可能调用同模块私有辅助函数，需一并 mangle 并收集
         var local_renames = std.StringHashMap([]const u8).init(self.allocator);
         defer local_renames.deinit();
         for (sub_module.declarations) |sd| {
             switch (sd) {
                 .fun_decl => |fd| {
-                    if (fd.visibility == .public) {
-                        const mangled = std.fmt.allocPrint(ast_arena, "{s}.{s}.{s}", .{ module_prefix, sub_name, fd.name }) catch continue;
-                        local_renames.put(fd.name, mangled) catch continue;
-                    }
+                    const mangled = std.fmt.allocPrint(ast_arena, "{s}.{s}.{s}", .{ module_prefix, sub_name, fd.name }) catch continue;
+                    local_renames.put(fd.name, mangled) catch continue;
                 },
                 .expr_decl => |ed| {
                     if (ed.stmt) |st| {
                         switch (st.*) {
                             .val_decl => |vd| {
-                                if (vd.visibility == .public) {
-                                    const mangled = std.fmt.allocPrint(ast_arena, "{s}.{s}.{s}", .{ module_prefix, sub_name, vd.name }) catch continue;
-                                    local_renames.put(vd.name, mangled) catch continue;
-                                }
+                                const mangled = std.fmt.allocPrint(ast_arena, "{s}.{s}.{s}", .{ module_prefix, sub_name, vd.name }) catch continue;
+                                local_renames.put(vd.name, mangled) catch continue;
                             },
                             else => {},
                         }
@@ -661,15 +715,13 @@ pub const ModuleLoader = struct {
         for (sub_module.declarations) |sub_decl| {
             switch (sub_decl) {
                 .fun_decl => |fd| {
-                    if (fd.visibility == .public) {
-                        const mangled_name = local_renames.get(fd.name) orelse continue;
-                        var new_fd = fd;
-                        new_fd.name = mangled_name;
-                        new_fd.visibility = .private;
-                        // 同步重写函数体内部对同模块函数的短名调用
-                        ast_rewrite.rewriteModuleCalls(new_fd.body, &local_renames, sibling_modules, ast_arena);
-                        try extra_decls.append(self.allocator, .{ .fun_decl = new_fd });
-                    }
+                    const mangled_name = local_renames.get(fd.name) orelse continue;
+                    var new_fd = fd;
+                    new_fd.name = mangled_name;
+                    new_fd.visibility = .private;
+                    // 同步重写函数体内部对同模块函数的短名调用
+                    ast_rewrite.rewriteModuleCalls(new_fd.body, &local_renames, sibling_modules, ast_arena);
+                    try extra_decls.append(self.allocator, .{ .fun_decl = new_fd });
                 },
                 // 合并 pub type_decl：newtype/record/ADT 类型定义需要被加载，
                 // 否则函数体内部的 newtype 构造器会找不到类型
@@ -680,30 +732,28 @@ pub const ModuleLoader = struct {
                         try extra_decls.append(self.allocator, .{ .type_decl = new_td });
                     }
                 },
-                // 合并 pub val 声明（expr_decl 包装的 val_decl）
+                // 合并所有 val 声明（expr_decl 包装的 val_decl）
                 .expr_decl => |ed| {
                     if (ed.stmt) |st| {
                         switch (st.*) {
                             .val_decl => |vd| {
-                                if (vd.visibility == .public) {
-                                    const mangled_name = local_renames.get(vd.name) orelse continue;
-                                    const new_stmt = ast_arena.create(ast.Stmt) catch continue;
-                                    new_stmt.* = .{ .val_decl = .{
-                                        .name = mangled_name,
-                                        .type_annotation = vd.type_annotation,
-                                        .value = vd.value,
-                                        .visibility = .private,
-                                    } };
-                                    // 重写 value 表达式中的同模块短名调用
-                                    ast_rewrite.rewriteModuleCalls(vd.value, &local_renames, sibling_modules, ast_arena);
-                                    const new_expr = ast_arena.create(ast.Expr) catch continue;
-                                    new_expr.* = .{ .unit_literal = {} };
-                                    try extra_decls.append(self.allocator, .{ .expr_decl = .{
-                                        .location = ed.location,
-                                        .expr = new_expr,
-                                        .stmt = new_stmt,
-                                    } });
-                                }
+                                const mangled_name = local_renames.get(vd.name) orelse continue;
+                                const new_stmt = ast_arena.create(ast.Stmt) catch continue;
+                                new_stmt.* = .{ .val_decl = .{
+                                    .name = mangled_name,
+                                    .type_annotation = vd.type_annotation,
+                                    .value = vd.value,
+                                    .visibility = .private,
+                                } };
+                                // 重写 value 表达式中的同模块短名调用
+                                ast_rewrite.rewriteModuleCalls(vd.value, &local_renames, sibling_modules, ast_arena);
+                                const new_expr = ast_arena.create(ast.Expr) catch continue;
+                                new_expr.* = .{ .unit_literal = {} };
+                                try extra_decls.append(self.allocator, .{ .expr_decl = .{
+                                    .location = ed.location,
+                                    .expr = new_expr,
+                                    .stmt = new_stmt,
+                                } });
                             },
                             else => {},
                         }

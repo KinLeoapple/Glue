@@ -80,6 +80,10 @@ pub const ObjHeader = extern struct {
     /// 会存入主线程对象的字段。worker 退出后这些值变为悬垂指针。
     /// 主线程在 join 后通过此标记识别并迁移到自身 tctx。
     pub const WORKER_ALLOCATED: u8 = 1 << 2;
+    /// BoxedScalar 直接值模式：ObjHeader 之后存储完整 Value（24B）而非通道索引（2B）。
+    /// 用于 field_value 返回标量到 ref_chan 时保留类型信息（f64/i64 等位模式不可区分）。
+    /// unboxScalar 检测此标记后直接读取内联 Value，无需查通道。
+    pub const DIRECT_VALUE: u8 = 1 << 3;
 
     /// 标记为已被引擎跟踪
     pub inline fn markTracked(self: *ObjHeader) void {
@@ -110,6 +114,35 @@ pub const ObjHeader = extern struct {
     pub inline fn isWorkerAllocated(self: *const ObjHeader) bool {
         return (self.flags & WORKER_ALLOCATED) != 0;
     }
+
+    /// 标记 BoxedScalar 为直接值模式
+    pub inline fn markDirectValue(self: *ObjHeader) void {
+        self.flags |= DIRECT_VALUE;
+    }
+
+    /// 是否为直接值模式（BoxedScalar 内联存储 Value）
+    pub inline fn isDirectValue(self: *const ObjHeader) bool {
+        return (self.flags & DIRECT_VALUE) != 0;
+    }
+
+    /// 所有已定义的 flags 位掩码（用于验证指针合法性）
+    pub const ALL_USED_FLAGS: u8 = TRACKED | ARENA_ALLOCATED | WORKER_ALLOCATED | DIRECT_VALUE;
+
+    /// 验证 ObjHeader 是否为合法堆对象（架构无关的指针验证）
+    ///
+    /// 用于 readRefObj 区分真实堆指针与标量位模式（标量值通过 ref_chan
+    /// 传输时位模式可能被误判为指针）。验证项完全基于 ObjHeader 字段语义：
+    /// - type_tag 在合法 RefKind 范围内（0..ref_kind_count）
+    /// - rc >= 1（合法对象引用计数至少为 1，标量位模式在 rc 位置通常为 0）
+    /// - flags 未使用位为 0（bit 4-7 保留，合法对象不会设置这些位）
+    ///
+    /// 此方法不依赖任何架构相关假设（如用户空间地址范围），可跨平台使用。
+    pub inline fn isValidHeapObj(self: *const ObjHeader) bool {
+        if (@intFromEnum(self.type_tag) >= ref_kind_count) return false;
+        if (self.rc == 0) return false;
+        if ((self.flags & ~ALL_USED_FLAGS) != 0) return false;
+        return true;
+    }
 };
 
 /// 类型特定的析构函数指针
@@ -139,7 +172,9 @@ pub var deinit_table: [ref_kind_count]DeinitFn = [_]DeinitFn{noopDeinit} ** ref_
 /// 关闭模式标志：为 true 时，deinit 函数跳过对包含值的级联 release。
 /// 引擎 deinit 时设置为 true，tracked_objs 循环会单独释放每个跟踪的对象，
 /// 避免级联 release 释放已被跟踪的包含对象后，循环访问已释放内存。
-pub var shutdown_mode: bool = false;
+/// 原子类型：主引擎写、worker 引擎并发读，需原子访问避免 UB。
+/// 仅主引擎（is_worker=false）设置/清除；worker 引擎复用主引擎的标志。
+pub var shutdown_mode: std.atomic.Value(bool) = .init(false);
 
 /// 注册类型特定的析构函数
 ///

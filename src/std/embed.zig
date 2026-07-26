@@ -30,6 +30,7 @@ pub const STDLIB_FILES = [_]StdlibFile{
     .{ .path = "io/Buffered.glue", .content = @embedFile("io/Buffered.glue") },
     .{ .path = "io/Dir.glue", .content = @embedFile("io/Dir.glue") },
     .{ .path = "io/Fs.glue", .content = @embedFile("io/Fs.glue") },
+    .{ .path = "io/Console.glue", .content = @embedFile("io/Console.glue") },
     // ── Time 模块 ──
     .{ .path = "time/pack.glue", .content = @embedFile("time/pack.glue") },
     .{ .path = "time/Duration.glue", .content = @embedFile("time/Duration.glue") },
@@ -45,6 +46,9 @@ pub const STDLIB_FILES = [_]StdlibFile{
     .{ .path = "net/TcpStream.glue", .content = @embedFile("net/TcpStream.glue") },
     .{ .path = "net/UdpSocket.glue", .content = @embedFile("net/UdpSocket.glue") },
     .{ .path = "net/Dns.glue", .content = @embedFile("net/Dns.glue") },
+    // ── Reflect 模块 ──
+    .{ .path = "reflect/pack.glue", .content = @embedFile("reflect/pack.glue") },
+    .{ .path = "reflect/Reflect.glue", .content = @embedFile("reflect/Reflect.glue") },
 };
 
 /// 按相对路径查找嵌入的 stdlib 文件内容，未命中返回 null
@@ -59,8 +63,8 @@ pub fn find(path: []const u8) ?[]const u8 {
 
 const testing = std.testing;
 
-test "STDLIB_FILES 包含 19 个文件" {
-    try testing.expectEqual(@as(usize, 19), STDLIB_FILES.len);
+test "STDLIB_FILES 包含 22 个文件" {
+    try testing.expectEqual(@as(usize, 22), STDLIB_FILES.len);
 }
 
 test "find 命中 io/pack.glue" {
@@ -84,6 +88,7 @@ test "IO 与 Time 模块文件齐全" {
     const io_files = [_][]const u8{
         "io/pack.glue", "io/File.glue", "io/Path.glue",
         "io/Buffered.glue", "io/Dir.glue", "io/Fs.glue",
+        "io/Console.glue",
     };
     const time_files = [_][]const u8{
         "time/pack.glue", "time/Duration.glue", "time/Instant.glue",
@@ -94,6 +99,9 @@ test "IO 与 Time 模块文件齐全" {
         "net/pack.glue", "net/Addr.glue", "net/TcpListener.glue",
         "net/TcpStream.glue", "net/UdpSocket.glue", "net/Dns.glue",
     };
+    const reflect_files = [_][]const u8{
+        "reflect/pack.glue", "reflect/Reflect.glue",
+    };
     inline for (io_files) |p| {
         try testing.expect(find(p) != null);
     }
@@ -101,6 +109,9 @@ test "IO 与 Time 模块文件齐全" {
         try testing.expect(find(p) != null);
     }
     inline for (net_files) |p| {
+        try testing.expect(find(p) != null);
+    }
+    inline for (reflect_files) |p| {
         try testing.expect(find(p) != null);
     }
 }

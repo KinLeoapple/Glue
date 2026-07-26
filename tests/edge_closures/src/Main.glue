@@ -1,5 +1,6 @@
 // Closure capture edges: var sharing, escape, independence, nested, loop capture
 
+import std.io.Console.{println}
 type IntFn = () -> i32
 
 // escaping closure capturing mutable state (counter factory)

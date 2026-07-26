@@ -90,13 +90,28 @@ pub const NodeOp = enum(u8) {
     scalar_loop,
 
     // === 内置函数 ===
-    builtin_print, builtin_println,
-    builtin_eprint, builtin_eprintln,
-    builtin_scan, builtin_scanln,
     builtin_ok, builtin_error, builtin_eq, builtin_str,
     builtin_ref_eq,
     builtin_type, builtin_panic,
     builtin_typeof,
+    // === 反射内置函数 ===
+    /// 构造 Reflect RecordValue：inputs[0]=值通道，meta_index=type_id
+    /// output = ref_chan（Reflect RecordValue 指针）
+    builtin_reflect,
+    /// 从 Reflect 取字段值：inputs[0]=Reflect 通道，meta_index=field_idx
+    /// output = 任意通道（字段值）
+    builtin_reflect_field,
+    /// 标量转字符串：inputs[0]=值通道，output = ref_chan（Str 指针）
+    builtin_scalar_to_str,
+    /// Reflect 解引用：inputs[0]=Reflect 通道，output = 原始值通道
+    builtin_reflect_deref,
+    /// Reflect 字段名：inputs[0]=Reflect 通道，meta_index=field_idx
+    /// output = ref_chan（Str 指针，字段名）；meta_index=0xFFFF 时返回 ADT 构造器名
+    builtin_reflect_field_name,
+    /// Reflect 元信息：inputs[0]=Reflect 通道，meta_index=field_idx
+    /// 0=type_name(str), 1=kind(str), 2=field_count(usize)
+    /// output = ref_chan（str）或 usize_chan（field_count）
+    builtin_reflect_meta,
 
     // === Syscall 调用（IO/Time 等宿主 syscall 包装）===
     /// meta_index 索引到 syscall_metas 表（1-indexed）

@@ -5,6 +5,7 @@
 //   std.time.Module.Type.method(value, args)
 import std.time.Duration
 import std.time.Instant
+import std.io.Console.{println}
 
 fun main() {
     // ── Duration 基础 ──────────────────────────────────────────────

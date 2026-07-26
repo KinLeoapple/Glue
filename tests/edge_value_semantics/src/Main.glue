@@ -1,5 +1,6 @@
 // 统一值语义回归：默认深拷贝，&T / *T 显式引用才共享
 
+import std.io.Console.{println}
 type Pair = Pair(a: i32, b: i32)
 
 fun takesRec(p: (x: i32, y: i32)): i32 { p.x + p.y }

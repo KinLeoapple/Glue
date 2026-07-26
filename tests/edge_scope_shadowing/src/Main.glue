@@ -1,5 +1,6 @@
 // Edge cases: variable shadowing, nested scopes, block expressions, if/match as expressions
 
+import std.io.Console.{println}
 fun id(x: i32): i32 { x }
 
 fun main() {

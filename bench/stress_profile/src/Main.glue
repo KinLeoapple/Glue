@@ -1,4 +1,5 @@
 // 分项计时版本 — 每个子测试单独测量
+import std.io.Console.{println}
 fun nestedLoop(n: i32): i64 {
     var total: i64 = 0
     var i: i32 = 0

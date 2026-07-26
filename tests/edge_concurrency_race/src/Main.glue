@@ -1,6 +1,7 @@
 // Concurrency under real parallel contention + generic-array types
 
 // async 函数：调用返回 Async<T>，实参深拷贝；Atomic 实参共享底层内存
+import std.io.Console.{println}
 async fun incrOne(c: Atomic<i32>): Unit { c += 1 }
 async fun addTwo(s: Atomic<i32>): Unit { s += 2 }
 async fun subTwo(s: Atomic<i32>): Unit { s -= 2 }

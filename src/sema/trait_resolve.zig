@@ -241,6 +241,58 @@ pub fn inferMethodCall(
         }
     }
 
+    // Reflect 类型方法：reflect(x) 返回的对象的方法
+    // obj_ty 解析为 generic_type "Reflect" 时，分派各方法
+    {
+        const robj = inferencer.resolve(obj_ty);
+        if (robj.* == .generic_type and std.mem.eql(u8, robj.generic_type.name, "Reflect")) {
+            // Reflect.field_value(i: usize) -> Value（动态值，类型运行时确定，用 freshTypeVar）
+            if (std.mem.eql(u8, mc.method, "field_value") and mc.arguments.len == 1) {
+                return inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.field_name(i: usize) -> str
+            if (std.mem.eql(u8, mc.method, "field_name") and mc.arguments.len == 1) {
+                return inferencer.makeType(.str_type) catch inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.field_type(i: usize) -> TypeInfo
+            if (std.mem.eql(u8, mc.method, "field_type") and mc.arguments.len == 1) {
+                const type_info_inner = inferencer.makeType(.unit_type) catch inferencer.freshTypeVar() catch unreachable;
+                return inferencer.makeGenericType("TypeInfo", &[_]*Type{type_info_inner}) catch inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.array_len() -> usize
+            if (std.mem.eql(u8, mc.method, "array_len") and mc.arguments.len == 0) {
+                return inferencer.makeType(.usize_type) catch inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.field_count() -> usize
+            if (std.mem.eql(u8, mc.method, "field_count") and mc.arguments.len == 0) {
+                return inferencer.makeType(.usize_type) catch inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.type_name() -> str
+            if (std.mem.eql(u8, mc.method, "type_name") and mc.arguments.len == 0) {
+                return inferencer.makeType(.str_type) catch inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.kind() -> str
+            if (std.mem.eql(u8, mc.method, "kind") and mc.arguments.len == 0) {
+                return inferencer.makeType(.str_type) catch inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.adt_tag() -> usize
+            if (std.mem.eql(u8, mc.method, "adt_tag") and mc.arguments.len == 0) {
+                return inferencer.makeType(.usize_type) catch inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.adt_constructor() -> str
+            if (std.mem.eql(u8, mc.method, "adt_constructor") and mc.arguments.len == 0) {
+                return inferencer.makeType(.str_type) catch inferencer.freshTypeVar() catch unreachable;
+            }
+            // Reflect.deref() -> T（返回 Reflect<T> 的 T，即 generic_type.args[0]）
+            if (std.mem.eql(u8, mc.method, "deref") and mc.arguments.len == 0) {
+                if (robj.generic_type.args.len == 1) {
+                    return robj.generic_type.args[0];
+                }
+                return inferencer.freshTypeVar() catch unreachable;
+            }
+        }
+    }
+
     // 模块引用上的方法调用：查找 mangled 名函数 "Module.Sub.method"
     if (inferencer.asModuleRef(obj_ty)) |mod_name| {
         const mangled = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}.{s}", .{ mod_name, mc.method }) catch return inferencer.freshTypeVar() catch unreachable;

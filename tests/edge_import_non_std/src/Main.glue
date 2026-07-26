@@ -2,6 +2,7 @@
 // 覆盖：整路径导入、选择性导入函数短名、常量短名、alias
 import Math.Geometry.{ circle_area as area, circle_circumference, rectangle_area }
 import Math.Algebra.{ square, cube, GOLDEN_RATIO as phi }
+import std.io.Console.{println}
 
 fun main() {
     // ── 选择性导入函数短名 + alias（非 std 模块） ──────────────

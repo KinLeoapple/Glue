@@ -1,6 +1,7 @@
 // Edge cases: strings (unicode/escapes/interpolation), closures (capture), recursion (deep/mutual/TCO)
 
 // mutual recursion
+import std.io.Console.{println}
 fun isEven(n: i32): bool {
     if n == 0 { true } else { isOdd(n - 1) }
 }

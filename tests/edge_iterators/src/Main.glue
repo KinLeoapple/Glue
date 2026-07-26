@@ -1,5 +1,6 @@
 // for-loop / iterator boundaries (regression)
 
+import std.io.Console.{println}
 fun mkArray(): i32[] { [10, 20, 30] }
 
 fun main() {

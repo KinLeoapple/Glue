@@ -3,6 +3,7 @@
 // 注意：import std.time.Calendar 只把 std 注册为顶层模块名，
 // 调用必须用完整路径 std.time.Calendar.xxx()
 import std.time.Calendar
+import std.io.Console.{println}
 
 fun main() {
     // ── 闰年判定 ───────────────────────────────────────────────

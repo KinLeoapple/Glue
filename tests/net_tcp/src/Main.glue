@@ -2,6 +2,7 @@
 import std.net.Addr
 import std.net.TcpListener
 import std.net.TcpStream
+import std.io.Console.{println}
 
 // Client task: connect, send "Hello", read echo, close
 async fun client_task(addr: SocketAddr): Async<Throw<Unit, IOError>> {

@@ -102,6 +102,10 @@ pub const SyscallId = enum(u16) {
     net_udp_send_to,
     net_udp_recv_from,
     net_udp_recv_from_async,
+    // ── 标准 IO（stdout/stderr/stdin） ──
+    stdout_write,
+    stderr_write,
+    stdin_readln,
 };
 
 /// 唯一的真相源：所有 syscall 的声明式注册表
@@ -145,6 +149,10 @@ pub const REGISTRY = [_]SyscallEntry{
     .{ .name = "__net_udp_send_to", .ret_kind = .ref, .ok_type_name = "usize", .impl = net.net_udp_send_to },
     .{ .name = "__net_udp_recv_from", .ret_kind = .ref, .ok_type_name = "RecvFromResult", .impl = net.net_udp_recv_from },
     .{ .name = "__net_udp_recv_from_async", .ret_kind = .ref, .ok_type_name = null, .impl = net.net_udp_recv_from_async },
+    // ── 标准 IO syscall ──
+    .{ .name = "__stdout_write", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.stdout_write },
+    .{ .name = "__stderr_write", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.stderr_write },
+    .{ .name = "__stdin_readln", .ret_kind = .ref, .ok_type_name = "str?", .impl = io.stdin_readln },
 };
 
 // comptime 校验：SyscallId enum 变体数必须与 REGISTRY 长度一致
@@ -191,8 +199,8 @@ pub fn dispatch(io_inst: std.Io, tctx: *ThreadContext, id: SyscallId, args: []co
 const testing = std.testing;
 
 test "REGISTRY 与 SyscallId 长度一致（comptime assert 兜底）" {
-    try testing.expectEqual(@as(usize, 34), REGISTRY.len);
-    try testing.expectEqual(@as(usize, 34), @typeInfo(SyscallId).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 37), REGISTRY.len);
+    try testing.expectEqual(@as(usize, 37), @typeInfo(SyscallId).@"enum".fields.len);
 }
 
 test "lookupByName 命中" {

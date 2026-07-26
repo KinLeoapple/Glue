@@ -5,6 +5,7 @@
 // 注意：stdlib 方法分派 on value 暂不支持，使用模块函数调用语法
 //   Module.Sub.Type.method(value, args)
 import std.time.Duration
+import std.io.Console.{println}
 
 fun main() {
     // ── 构造器 ─────────────────────────────────────────────────────

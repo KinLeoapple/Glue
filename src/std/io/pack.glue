@@ -6,3 +6,4 @@ pub pack Path
 pub pack Buffered
 pub pack Dir
 pub pack Fs
+pub pack Console

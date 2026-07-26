@@ -815,3 +815,56 @@ pub fn dir_list(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!
     entries_consumed = true;
     return makeThrowOk(tctx, arr_val);
 }
+
+// ──────────────────────────────────────────────
+// 标准 IO syscall（stdout/stderr/stdin）
+// ──────────────────────────────────────────────
+
+/// __stdout_write(s: str) -> Throw<Unit, IOError>
+///
+/// 写 stdout（无缓冲，直接走 File.stdout().writeStreaming）
+/// 接收 str 参数（Console 函数内联后直接传入格式化结果 str）。
+pub fn stdout_write(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 1) return error.InvalidArgument;
+    const bytes = asStrBytes(args[0]);
+    const stdout = File.stdout();
+    _ = stdout.writeStreaming(io, &.{}, &.{bytes}, 1) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "stdout_write failed", 0, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    return makeThrowOk(tctx, Value.fromUnit());
+}
+
+/// __stderr_write(s: str) -> Throw<Unit, IOError>
+///
+/// 写 stderr（无缓冲，直接走 File.stderr().writeStreaming）
+pub fn stderr_write(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 1) return error.InvalidArgument;
+    const bytes = asStrBytes(args[0]);
+    const stderr = File.stderr();
+    _ = stderr.writeStreaming(io, &.{}, &.{bytes}, 1) catch |err| {
+        const io_err = try makeIOError(tctx, errToKind(err), "stderr_write failed", 0, null);
+        return makeThrowErr(tctx, io_err, "io error");
+    };
+    return makeThrowOk(tctx, Value.fromUnit());
+}
+
+/// __stdin_readln() -> Throw<str?, IOError>
+///
+/// 从 stdin 读一行（不含换行）。EOF 返回 Throw.ok(null)。
+pub fn stdin_readln(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
+    if (args.len != 0) return error.InvalidArgument;
+
+    var r_buf: [4096]u8 = undefined;
+    var reader = File.stdin().readerStreaming(io, &r_buf);
+    const result: ?[]const u8 = reader.interface.takeDelimiterExclusive('\n') catch null;
+
+    if (result) |bytes| {
+        const str_obj = value.str_mod.Str.createContiguous(tctx, bytes) catch return error.OutOfMemory;
+        const nullable_val = Value.fromRef(&str_obj.header);
+        return makeThrowOk(tctx, nullable_val);
+    } else {
+        // EOF → Throw.ok(null)
+        return makeThrowOk(tctx, Value.fromNull());
+    }
+}

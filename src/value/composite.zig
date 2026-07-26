@@ -39,7 +39,7 @@ pub const AdtValue = struct {
     /// 释放所有字段值
     /// fields 是连续内存的一部分，由 adtDeinit 中的 freeObj 统一释放
     pub fn deinit(self: *AdtValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             for (self.fields) |*f| f.value.release(tctx);
         }
     }
@@ -59,7 +59,7 @@ pub const NewtypeValue = struct {
 
     /// 释放内部值
     pub fn deinit(self: *NewtypeValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             self.inner.release(tctx);
         }
     }
@@ -83,7 +83,7 @@ pub const ArrayValue = struct {
     /// header 由 arrayDeinit 中的 freeObj 释放
     /// arena 分配的对象：elements 也从 arena 分配，跳过 freeObj（arena.reset 统一回收）
     pub fn deinit(self: *ArrayValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             for (self.elements) |*e| e.release(tctx);
         }
         if (self.elements.len > 0 and !self.header.isArenaAllocated()) {
@@ -118,7 +118,7 @@ pub const RecordValue = struct {
     /// fields 是连续内存的一部分，由 recordDeinit 中的 freeObj 统一释放
     /// field_names 指向源码 arena 或 string_pool，无需释放
     pub fn deinit(self: *RecordValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             for (self.fields) |*f| f.release(tctx);
         }
     }
@@ -153,7 +153,7 @@ pub const Cell = struct {
 
     /// 释放内部值
     pub fn deinit(self: *Cell, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             self.inner.release(tctx);
         }
     }

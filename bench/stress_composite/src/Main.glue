@@ -15,6 +15,7 @@
 // 1. 加法器闭包 — 1M 次闭包调用（read-only upvalue）
 // 注: 改用 read-only upvalue 模式，避免 upvalue 写 bug
 // ============================================================
+import std.io.Console.{println}
 fun makeAdder(delta: i64): (i64) -> i64 {
     fun(x: i64) { x + delta }
 }

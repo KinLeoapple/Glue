@@ -3,6 +3,7 @@
 // 强化：5万→100万调用，新增 4 层柯里化、带状态闭包
 // 注意：当前 closure upvalue 写入有预存 bug，仅用只读 upvalue 模式
 
+import std.io.Console.{println}
 fun makeAdder(x: i64): (i64) -> i64 {
     fun(y: i64) { x + y }
 }

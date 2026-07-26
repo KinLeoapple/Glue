@@ -337,7 +337,7 @@ pub const AtomicValue = struct {
 
     /// 释放内部资源（data 值的引用计数递减），不销毁对象本体。
     pub fn deinit(self: *AtomicValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             self.data.release(tctx);
         }
     }
@@ -585,7 +585,7 @@ pub const ChannelValue = struct {
     pub fn deinit(self: *ChannelValue, tctx: *ThreadContext) void {
         if (self.capacity > 0) {
             // 释放环形缓冲区中尚未被接收的值。
-            if (!obj_header.shutdown_mode) {
+            if (!obj_header.shutdown_mode.load(.acquire)) {
                 var i: usize = 0;
                 while (i < self.count) : (i += 1) {
                     var v = self.buffer[(self.head + i) % self.capacity];
@@ -595,7 +595,7 @@ pub const ChannelValue = struct {
             // buffer 连续内存随 freeObj 统一释放
         }
         if (self.rend_ready) {
-            if (!obj_header.shutdown_mode) {
+            if (!obj_header.shutdown_mode.load(.acquire)) {
                 if (self.rend_value) |v| {
                     if (v.requiresRelease()) {
                         var val = v;
@@ -736,7 +736,7 @@ pub const SenderValue = struct {
 
     /// 释放内部资源（递减底层通道的引用计数），不销毁对象本体。
     pub fn deinit(self: *SenderValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             obj_header.release(&self.channel.header, tctx);
         }
     }
@@ -756,7 +756,7 @@ pub const ReceiverValue = struct {
 
     /// 释放内部资源（递减底层通道的引用计数），不销毁对象本体。
     pub fn deinit(self: *ReceiverValue, tctx: *ThreadContext) void {
-        if (!obj_header.shutdown_mode) {
+        if (!obj_header.shutdown_mode.load(.acquire)) {
             obj_header.release(&self.channel.header, tctx);
         }
     }

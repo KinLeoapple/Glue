@@ -9,6 +9,7 @@
 // ============================================================
 
 // 自定义错误类型（Error 子类型）
+import std.io.Console.{println}
 type FileError: Error = FileError(msg: str) {
     override fun type_name(self): str {
         "file error"

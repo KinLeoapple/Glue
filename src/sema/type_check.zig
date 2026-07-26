@@ -69,9 +69,11 @@ fn semaTypeToChanType(ty: *Type) ?ChanType {
     };
 }
 
-/// 提取类型的名字（adt_type.name / generic_type.name），无法提取返回 null。
+/// 提取类型的名字（原始类型返回内置名，adt_type.name / generic_type.name 等）。
 /// ref_type 和 nullable_type 会递归到内部类型，以便 trait 方法体内 `self`
 /// （sema 推导为 ref_type）仍能正确解析出所属 ADT/Trait 名字。
+/// 原始类型（i32/str/bool 等）返回对应名字，使表达式 type_name 能被 IRBuilder
+/// 的 lookupTypeId 解析为具体 type_id（单态化类型实参推断依赖此路径）。
 fn typeNameOfType(ty: *Type) ?[]const u8 {
     return switch (ty.*) {
         .adt_type => |at| at.name,
@@ -79,6 +81,27 @@ fn typeNameOfType(ty: *Type) ?[]const u8 {
         .trait_type => |tt| tt.name,
         .ref_type => |rt| typeNameOfType(rt.inner),
         .nullable_type => |inner| typeNameOfType(inner),
+        .i8_type => "i8",
+        .i16_type => "i16",
+        .i32_type => "i32",
+        .i64_type => "i64",
+        .i128_type => "i128",
+        .u8_type => "u8",
+        .u16_type => "u16",
+        .u32_type => "u32",
+        .u64_type => "u64",
+        .u128_type => "u128",
+        .isize_type => "isize",
+        .usize_type => "usize",
+        .f16_type => "f16",
+        .f32_type => "f32",
+        .f64_type => "f64",
+        .f128_type => "f128",
+        .bool_type => "bool",
+        .str_type => "str",
+        .char_type => "char",
+        .unit_type => "Unit",
+        .null_type => "Null",
         else => null,
     };
 }
@@ -2133,6 +2156,16 @@ pub const TypeInferencer = struct {
                     if (std.mem.eql(u8, callee_name, "typeof") and self.isBuiltinName("typeof")) {
                         return try self.inferTypeofCall(c.arguments, env, loc);
                     }
+                    // reflect 内建函数特殊处理：参数是值表达式，返回 Reflect<T>
+                    // T 从实参推断，构造 Reflect<T> 泛型类型
+                    if (std.mem.eql(u8, callee_name, "reflect") and self.isBuiltinName("reflect")) {
+                        if (c.arguments.len != 1) {
+                            self.addErrorAt(.type_mismatch, loc.line, loc.column, "reflect expects exactly 1 argument, got {d}", .{c.arguments.len});
+                            return self.makeType(.unit_type) catch error.OutOfMemory;
+                        }
+                        const arg_ty = try self.inferExpr(c.arguments[0], env, null);
+                        return self.makeGenericType("Reflect", &[_]*Type{arg_ty}) catch error.OutOfMemory;
+                    }
                 }
                 const callee_ty = try self.inferExpr(c.callee, env, null);
                 const ret_ty = try self.freshTypeVar();
@@ -3073,7 +3106,8 @@ pub const TypeInferencer = struct {
                     std.mem.eql(u8, g.name, "Sender") or
                     std.mem.eql(u8, g.name, "Receiver") or
                     std.mem.eql(u8, g.name, "Lazy") or
-                    std.mem.eql(u8, g.name, "TypeInfo"))
+                    std.mem.eql(u8, g.name, "TypeInfo") or
+                    std.mem.eql(u8, g.name, "Reflect"))
                 {
                     return self.makeGenericType(g.name, args);
                 }
@@ -3848,46 +3882,6 @@ pub const TypeInferencer = struct {
     }
     fn registerBuiltins(self: *TypeInferencer, env: *TypeEnv) void {
         {
-            const param = self.freshTypeVar() catch return;
-            const params = self.arena.allocator().alloc(*Type, 1) catch return;
-            params[0] = param;
-            const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
-            const qvars = self.arena.allocator().alloc(usize, 1) catch return;
-            qvars[0] = param.type_var.id;
-            env.define("println", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("println");
-        }
-        {
-            const param = self.freshTypeVar() catch return;
-            const params = self.arena.allocator().alloc(*Type, 1) catch return;
-            params[0] = param;
-            const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
-            const qvars = self.arena.allocator().alloc(usize, 1) catch return;
-            qvars[0] = param.type_var.id;
-            env.define("print", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("print");
-        }
-        {
-            const param = self.freshTypeVar() catch return;
-            const params = self.arena.allocator().alloc(*Type, 1) catch return;
-            params[0] = param;
-            const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
-            const qvars = self.arena.allocator().alloc(usize, 1) catch return;
-            qvars[0] = param.type_var.id;
-            env.define("eprintln", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("eprintln");
-        }
-        {
-            const param = self.freshTypeVar() catch return;
-            const params = self.arena.allocator().alloc(*Type, 1) catch return;
-            params[0] = param;
-            const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
-            const qvars = self.arena.allocator().alloc(usize, 1) catch return;
-            qvars[0] = param.type_var.id;
-            env.define("eprint", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("eprint");
-        }
-        {
             const params = self.arena.allocator().alloc(*Type, 1) catch return;
             params[0] = self.makeType(.str_type) catch return;
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
@@ -4074,20 +4068,6 @@ pub const TypeInferencer = struct {
             qvars[0] = val_ty.type_var.id;
             env.define("Ok", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
             self.registerBuiltinName("Ok");
-        }
-        {
-            const params = self.arena.allocator().alloc(*Type, 0) catch return;
-            const ret_ty = self.makeNullableType(self.makeType(.str_type) catch return) catch return;
-            const fn_ty = self.makeFnType(params, ret_ty) catch return;
-            env.define("scan", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("scan");
-        }
-        {
-            const params = self.arena.allocator().alloc(*Type, 0) catch return;
-            const ret_ty = self.makeNullableType(self.makeType(.str_type) catch return) catch return;
-            const fn_ty = self.makeFnType(params, ret_ty) catch return;
-            env.define("scanln", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
-            self.registerBuiltinName("scanln");
         }
         inline for (NUMERIC_TYPES) |cast| {
             const param = self.freshTypeVar() catch return;
@@ -4429,6 +4409,111 @@ pub const TypeInferencer = struct {
             ps[1] = usize_ty;
             ps[2] = i64_ty;
             define(self, env, "__net_udp_recv_from", ps, makeThrowTy(self, recv_from_result_ty, io_error_ty));
+        }
+
+        // ── 标准 IO syscall（stdout/stderr/stdin） ──
+        // __stdout_write(s: str) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = str_ty;
+            define(self, env, "__stdout_write", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __stderr_write(s: str) -> Throw<Unit, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = str_ty;
+            define(self, env, "__stderr_write", ps, makeThrowTy(self, unit_ty, io_error_ty));
+        }
+        // __stdin_readln() -> Throw<str?, IOError>
+        {
+            const ps = self.arena.allocator().alloc(*Type, 0) catch return;
+            const nullable_str_ty = self.makeNullableType(str_ty) catch str_ty;
+            define(self, env, "__stdin_readln", ps, makeThrowTy(self, nullable_str_ty, io_error_ty));
+        }
+
+        // reflect<T>(x: T) -> Reflect<T>
+        // 运行时值反射 builtin：返回 Reflect<T> 泛型类型
+        // T 从实参推断，Reflect<T> 是内置 generic_type "Reflect"
+        {
+            const t_var = self.freshTypeVar() catch return;
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = t_var;
+            const reflect_ty = self.makeGenericType("Reflect", &[_]*Type{t_var}) catch return;
+            const fn_ty = self.makeFnType(ps, reflect_ty) catch return;
+            const qv = self.arena.allocator().alloc(usize, 1) catch return;
+            qv[0] = t_var.type_var.id;
+            env.define("reflect", TypeScheme{ .quantified_vars = qv, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("reflect");
+        }
+
+        // __scalar_to_str<T>(x: T) -> str
+        // 标量转字符串原语：i8..f128/bool/char/str 等
+        {
+            const t_var = self.freshTypeVar() catch return;
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = t_var;
+            const fn_ty = self.makeFnType(ps, str_ty) catch return;
+            const qv = self.arena.allocator().alloc(usize, 1) catch return;
+            qv[0] = t_var.type_var.id;
+            env.define("__scalar_to_str", TypeScheme{ .quantified_vars = qv, .ty = fn_ty }) catch return;
+            self.registerBuiltinName("__scalar_to_str");
+        }
+
+        // ── Async syscall (phase 3 遗留) ──
+        // async syscall 返回 ChannelValue（用于协程挂起/唤醒）。
+        // sema 中 ChannelValue 没有专门类型表示，用 generic 类型占位；
+        // .recv() 在 trait_resolve.inferMethodCall 中找不到对应方法时退化为 freshTypeVar，
+        // 不阻塞类型检查。实际通道类型由 builder/engine 处理。
+        const channel_value_ty = self.makeGenericType("ChannelValue", &[_]*Type{}) catch return;
+
+        // __file_read_async(fd: i64, len: usize) -> ChannelValue
+        {
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
+            ps[0] = i64_ty;
+            ps[1] = usize_ty;
+            define(self, env, "__file_read_async", ps, channel_value_ty);
+        }
+        // __file_write_async(fd: i64, buf: u8[], len: usize) -> ChannelValue
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = i64_ty;
+            ps[1] = u8_array_ty;
+            ps[2] = usize_ty;
+            define(self, env, "__file_write_async", ps, channel_value_ty);
+        }
+        // __sleep_async(ns: i128) -> ChannelValue
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i128_ty;
+            define(self, env, "__sleep_async", ps, channel_value_ty);
+        }
+        // __net_tcp_accept_async(fd: i64) -> ChannelValue
+        {
+            const ps = self.arena.allocator().alloc(*Type, 1) catch return;
+            ps[0] = i64_ty;
+            define(self, env, "__net_tcp_accept_async", ps, channel_value_ty);
+        }
+        // __net_tcp_read_async(fd: i64, len: usize) -> ChannelValue
+        {
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
+            ps[0] = i64_ty;
+            ps[1] = usize_ty;
+            define(self, env, "__net_tcp_read_async", ps, channel_value_ty);
+        }
+        // __net_tcp_write_async(fd: i64, buf: u8[], len: usize) -> ChannelValue
+        {
+            const ps = self.arena.allocator().alloc(*Type, 3) catch return;
+            ps[0] = i64_ty;
+            ps[1] = u8_array_ty;
+            ps[2] = usize_ty;
+            define(self, env, "__net_tcp_write_async", ps, channel_value_ty);
+        }
+        // __net_udp_recv_from_async(fd: i64, len: usize) -> ChannelValue
+        {
+            const ps = self.arena.allocator().alloc(*Type, 2) catch return;
+            ps[0] = i64_ty;
+            ps[1] = usize_ty;
+            define(self, env, "__net_udp_recv_from_async", ps, channel_value_ty);
         }
     }
     fn registerBuiltinName(self: *TypeInferencer, name: []const u8) void {

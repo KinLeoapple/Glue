@@ -149,7 +149,7 @@ fn buildSegments(
 /// - local_region: 局部通道区
 /// - temp_region: 暂未单独划分（与 local_region 合并）
 /// - slots: 每个通道一个 SlotDesc
-fn buildFrameLayout(
+pub fn buildFrameLayout(
     arena: std.mem.Allocator,
     func: *const Function,
     channels: *const ChannelSpace,
@@ -518,7 +518,7 @@ test "buildDeferTable 单个 defer 完整字段" {
         .{ .op = .cleanup_register, .input_count = 0, .output = 5, .meta_index = 1 },
         .{ .op = .halt_return, .input_count = 1, .output = 1, .meta_index = 0 },
         // defer 块体节点（body_start=2, body_len=2）
-        .{ .op = .builtin_println, .input_count = 1, .output = 2, .meta_index = 0, .inputs = .{ 0, 0, 0, 0 } },
+        .{ .op = .builtin_str, .input_count = 1, .output = 2, .meta_index = 0, .inputs = .{ 0, 0, 0, 0 } },
         .{ .op = .halt_return, .input_count = 1, .output = 3, .meta_index = 0, .inputs = .{ 1, 0, 0, 0 } },
     };
     const cleanup_metas = [_]CleanupMeta{
