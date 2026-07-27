@@ -9,21 +9,13 @@ const ast = @import("ast");
 const type_check = @import("type_check");
 
 pub const TypeInferencer = type_check.TypeInferencer;
+pub const builtin_types = type_check.builtin_types;
 
 /// 返回类型名为 `name` 的类型构造器所期望的类型参数个数（种类 arity）。
 /// 内建高阶类型（Throw/Atomic/Async 等）使用固定 arity，自定义 ADT 取其声明的
 /// 类型参数个数，其余裸类型名 arity 为 0。
 pub fn arityOfTypeName(inferencer: *TypeInferencer, name: []const u8) usize {
-    if (std.mem.eql(u8, name, "Throw")) return 2;
-    if (std.mem.eql(u8, name, "Atomic") or
-        std.mem.eql(u8, name, "Async") or
-        std.mem.eql(u8, name, "Channel") or
-        std.mem.eql(u8, name, "Sender") or
-        std.mem.eql(u8, name, "Receiver") or
-        std.mem.eql(u8, name, "Lazy"))
-    {
-        return 1;
-    }
+    if (builtin_types.genericTypeArity(name)) |arity| return arity;
     if (inferencer.adt_types.get(name)) |info| {
         return info.type_param_names.len;
     }

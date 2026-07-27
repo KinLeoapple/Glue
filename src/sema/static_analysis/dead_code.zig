@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const ast_visitor = @import("ast_visitor");
 
 /// 死代码标记表。键为被标记为死代码的语句指针。
 pub const DeadTable = struct {
@@ -74,240 +75,145 @@ pub const DeadCodePass = struct {
     }
 
     /// 递归收集表达式中所有被读取的变量名。已标记为死代码的声明跳过其值。
+    /// v3 阶段 11：使用 ast_visitor.walkExprChildren 消除手写递归分支，
+    /// 仅保留 identifier（记录读取）、assignment_expr（跳过标识符目标）、
+    /// block（委托 collectReadsStmt 以处理死声明跳过）的特化 hook。
     fn collectReadsExpr(self: *DeadCodePass, expr: *const ast.Expr, reads: *std.StringHashMap(void)) anyerror!void {
-        switch (expr.*) {
-            .identifier => |id| try reads.put(id.name, {}),
-            .binary => |b| {
-                try self.collectReadsExpr(b.left, reads);
-                try self.collectReadsExpr(b.right, reads);
-            },
-            .unary => |u| try self.collectReadsExpr(u.operand, reads),
-            .ref_of => |r| try self.collectReadsExpr(r.operand, reads),
-            .deref => |d| try self.collectReadsExpr(d.operand, reads),
-            .call => |c| {
-                try self.collectReadsExpr(c.callee, reads);
-                for (c.arguments) |a| try self.collectReadsExpr(a, reads);
-            },
-            .if_expr => |i| {
-                try self.collectReadsExpr(i.condition, reads);
-                try self.collectReadsExpr(i.then_branch, reads);
-                if (i.else_branch) |e| try self.collectReadsExpr(e, reads);
-            },
-            .block => |b| {
-                for (b.statements) |s| try self.collectReadsStmt(s, reads);
-                if (b.trailing_expr) |te| try self.collectReadsExpr(te, reads);
-            },
-            .lambda => |l| switch (l.body) {
-                .block => |body_expr| try self.collectReadsExpr(body_expr, reads),
-                .expression => |body_expr| try self.collectReadsExpr(body_expr, reads),
-            },
-            .match => |m| {
-                try self.collectReadsExpr(m.scrutinee, reads);
-                for (m.arms) |arm| {
-                    if (arm.guard) |g| try self.collectReadsExpr(g, reads);
-                    try self.collectReadsExpr(arm.body, reads);
-                }
-            },
-            .type_cast => |tc| try self.collectReadsExpr(tc.expr, reads),
-            .atomic_expr => |ae| try self.collectReadsExpr(ae.value, reads),
-            .lazy => |l| try self.collectReadsExpr(l.expr, reads),
-            .field_access => |f| try self.collectReadsExpr(f.object, reads),
-            .safe_access => |f| try self.collectReadsExpr(f.object, reads),
-            .index => |i| {
-                try self.collectReadsExpr(i.object, reads);
-                try self.collectReadsExpr(i.index, reads);
-            },
-            .non_null_assert => |n| try self.collectReadsExpr(n.expr, reads),
-            .propagate => |p| try self.collectReadsExpr(p.expr, reads),
-            .array_literal => |a| for (a.elements) |e| try self.collectReadsExpr(e, reads),
-            .record_literal => |r| for (r.fields) |f| try self.collectReadsExpr(f.value, reads),
-            .record_extend => |r| {
-                try self.collectReadsExpr(r.base, reads);
-                for (r.updates) |u| try self.collectReadsExpr(u.value, reads);
-            },
-            .string_interpolation => |si| {
-                for (si.parts) |part| {
-                    if (part == .expression) try self.collectReadsExpr(part.expression, reads);
-                }
-            },
-            .method_call => |mc| {
-                try self.collectReadsExpr(mc.object, reads);
-                for (mc.arguments) |a| try self.collectReadsExpr(a, reads);
-            },
-            .safe_method_call => |mc| {
-                try self.collectReadsExpr(mc.object, reads);
-                for (mc.arguments) |a| try self.collectReadsExpr(a, reads);
-            },
-            .assignment_expr => |a| {
-                // 赋值目标若是标识符则为写入而非读取，不收集。
-                if (a.target.* != .identifier) try self.collectReadsExpr(a.target, reads);
-                try self.collectReadsExpr(a.value, reads);
-            },
-            .compound_assign => |c| {
-                try self.collectReadsExpr(c.target, reads);
-                try self.collectReadsExpr(c.value, reads);
-            },
-            else => {},
-        }
+        var ctx = ReadsCtx{ .pass = self, .reads = reads };
+        try collectReadsExprImpl(&ctx, expr);
     }
 
     /// 递归收集语句中所有被读取的变量名。
+    /// v3 阶段 11：使用 ast_visitor.walkStmtChildren 消除手写递归分支，
+    /// 仅保留 val_decl/var_decl（死声明跳过）和 assignment（跳过标识符目标）的特化 hook。
     fn collectReadsStmt(self: *DeadCodePass, stmt: *const ast.Stmt, reads: *std.StringHashMap(void)) anyerror!void {
-        switch (stmt.*) {
-            .val_decl => |v| {
-                // 已标记为死的声明不计入读取。
-                if (!self.table.isDead(stmt)) try self.collectReadsExpr(v.value, reads);
-            },
-            .var_decl => |v| {
-                if (!self.table.isDead(stmt)) try self.collectReadsExpr(v.value, reads);
-            },
-            .assignment => |a| {
-                if (a.target.* != .identifier) try self.collectReadsExpr(a.target, reads);
-                try self.collectReadsExpr(a.value, reads);
-            },
-            .field_assignment => |f| {
-                try self.collectReadsExpr(f.object, reads);
-                try self.collectReadsExpr(f.value, reads);
-            },
-            .compound_assignment => |c| {
-                try self.collectReadsExpr(c.target, reads);
-                try self.collectReadsExpr(c.value, reads);
-            },
-            .expression => |e| try self.collectReadsExpr(e.expr, reads),
-            .return_stmt => |r| if (r.value) |v| try self.collectReadsExpr(v, reads),
-            .for_stmt => |f| {
-                try self.collectReadsExpr(f.iterable, reads);
-                try self.collectReadsExpr(f.body, reads);
-            },
-            .while_stmt => |w| {
-                try self.collectReadsExpr(w.condition, reads);
-                try self.collectReadsExpr(w.body, reads);
-            },
-            .loop_stmt => |l| try self.collectReadsExpr(l.body, reads),
-            .defer_stmt => |d| try self.collectReadsExpr(d.expr, reads),
-            .throw_stmt => |t| try self.collectReadsExpr(t.expr, reads),
-            .break_stmt, .continue_stmt => {},
-        }
+        var ctx = ReadsCtx{ .pass = self, .reads = reads };
+        try collectReadsStmtImpl(&ctx, stmt);
     }
 
     /// 遍历表达式，对其中声明的变量检查是否被读取；若未被读取且初值无副作用则标记为死。
+    /// v3 阶段 11：使用 ast_visitor.walkExprChildren 消除手写递归分支，
+    /// 仅保留 block（委托 collectAndMarkDeclsStmt）的特化 hook。
     fn collectAndMarkDeclsExpr(self: *DeadCodePass, expr: *const ast.Expr, reads: *const std.StringHashMap(void)) anyerror!void {
-        switch (expr.*) {
-            .binary => |b| {
-                try self.collectAndMarkDeclsExpr(b.left, reads);
-                try self.collectAndMarkDeclsExpr(b.right, reads);
-            },
-            .unary => |u| try self.collectAndMarkDeclsExpr(u.operand, reads),
-            .ref_of => |r| try self.collectAndMarkDeclsExpr(r.operand, reads),
-            .deref => |d| try self.collectAndMarkDeclsExpr(d.operand, reads),
-            .call => |c| {
-                try self.collectAndMarkDeclsExpr(c.callee, reads);
-                for (c.arguments) |a| try self.collectAndMarkDeclsExpr(a, reads);
-            },
-            .if_expr => |i| {
-                try self.collectAndMarkDeclsExpr(i.condition, reads);
-                try self.collectAndMarkDeclsExpr(i.then_branch, reads);
-                if (i.else_branch) |e| try self.collectAndMarkDeclsExpr(e, reads);
-            },
-            .block => |b| {
-                for (b.statements) |s| try self.collectAndMarkDeclsStmt(s, reads);
-                if (b.trailing_expr) |te| try self.collectAndMarkDeclsExpr(te, reads);
-            },
-            .lambda => |l| switch (l.body) {
-                .block => |body_expr| try self.collectAndMarkDeclsExpr(body_expr, reads),
-                .expression => |body_expr| try self.collectAndMarkDeclsExpr(body_expr, reads),
-            },
-            .match => |m| {
-                try self.collectAndMarkDeclsExpr(m.scrutinee, reads);
-                for (m.arms) |arm| {
-                    if (arm.guard) |g| try self.collectAndMarkDeclsExpr(g, reads);
-                    try self.collectAndMarkDeclsExpr(arm.body, reads);
-                }
-            },
-            .type_cast => |tc| try self.collectAndMarkDeclsExpr(tc.expr, reads),
-            .atomic_expr => |ae| try self.collectAndMarkDeclsExpr(ae.value, reads),
-            .lazy => |l| try self.collectAndMarkDeclsExpr(l.expr, reads),
-            .field_access => |f| try self.collectAndMarkDeclsExpr(f.object, reads),
-            .safe_access => |f| try self.collectAndMarkDeclsExpr(f.object, reads),
-            .index => |i| {
-                try self.collectAndMarkDeclsExpr(i.object, reads);
-                try self.collectAndMarkDeclsExpr(i.index, reads);
-            },
-            .non_null_assert => |n| try self.collectAndMarkDeclsExpr(n.expr, reads),
-            .propagate => |p| try self.collectAndMarkDeclsExpr(p.expr, reads),
-            .array_literal => |a| for (a.elements) |e| try self.collectAndMarkDeclsExpr(e, reads),
-            .record_literal => |r| for (r.fields) |f| try self.collectAndMarkDeclsExpr(f.value, reads),
-            .record_extend => |r| {
-                try self.collectAndMarkDeclsExpr(r.base, reads);
-                for (r.updates) |u| try self.collectAndMarkDeclsExpr(u.value, reads);
-            },
-            .string_interpolation => |si| {
-                for (si.parts) |part| {
-                    if (part == .expression) try self.collectAndMarkDeclsExpr(part.expression, reads);
-                }
-            },
-            .method_call => |mc| {
-                try self.collectAndMarkDeclsExpr(mc.object, reads);
-                for (mc.arguments) |a| try self.collectAndMarkDeclsExpr(a, reads);
-            },
-            .safe_method_call => |mc| {
-                try self.collectAndMarkDeclsExpr(mc.object, reads);
-                for (mc.arguments) |a| try self.collectAndMarkDeclsExpr(a, reads);
-            },
-            .assignment_expr => |a| {
-                try self.collectAndMarkDeclsExpr(a.target, reads);
-                try self.collectAndMarkDeclsExpr(a.value, reads);
-            },
-            .compound_assign => |c| {
-                try self.collectAndMarkDeclsExpr(c.target, reads);
-                try self.collectAndMarkDeclsExpr(c.value, reads);
-            },
-            else => {},
-        }
+        var ctx = MarkCtx{ .pass = self, .reads = reads };
+        try collectAndMarkDeclsImpl(&ctx, expr);
     }
 
     /// 遍历语句，对 val_decl / var_decl 检查其变量名是否被读取。
     /// 若未被读取且初值无副作用，则标记为死代码。
+    /// v3 阶段 11：使用 ast_visitor.walkStmtChildren 消除手写递归分支，
+    /// 仅保留 val_decl/var_decl（标记死代码）的特化 hook。
     fn collectAndMarkDeclsStmt(self: *DeadCodePass, stmt: *const ast.Stmt, reads: *const std.StringHashMap(void)) anyerror!void {
-        switch (stmt.*) {
-            .val_decl => |v| {
-                if (!reads.contains(v.name) and isSideEffectFreeExpr(v.value)) {
-                    try self.table.put(stmt);
-                }
-                try self.collectAndMarkDeclsExpr(v.value, reads);
-            },
-            .var_decl => |v| {
-                if (!reads.contains(v.name) and isSideEffectFreeExpr(v.value)) {
-                    try self.table.put(stmt);
-                }
-                try self.collectAndMarkDeclsExpr(v.value, reads);
-            },
-            .assignment => |a| try self.collectAndMarkDeclsExpr(a.value, reads),
-            .field_assignment => |f| {
-                try self.collectAndMarkDeclsExpr(f.object, reads);
-                try self.collectAndMarkDeclsExpr(f.value, reads);
-            },
-            .compound_assignment => |c| {
-                try self.collectAndMarkDeclsExpr(c.target, reads);
-                try self.collectAndMarkDeclsExpr(c.value, reads);
-            },
-            .expression => |e| try self.collectAndMarkDeclsExpr(e.expr, reads),
-            .return_stmt => |r| if (r.value) |val| try self.collectAndMarkDeclsExpr(val, reads),
-            .for_stmt => |f| {
-                try self.collectAndMarkDeclsExpr(f.iterable, reads);
-                try self.collectAndMarkDeclsExpr(f.body, reads);
-            },
-            .while_stmt => |w| {
-                try self.collectAndMarkDeclsExpr(w.condition, reads);
-                try self.collectAndMarkDeclsExpr(w.body, reads);
-            },
-            .loop_stmt => |l| try self.collectAndMarkDeclsExpr(l.body, reads),
-            .defer_stmt => |d| try self.collectAndMarkDeclsExpr(d.expr, reads),
-            .throw_stmt => |t| try self.collectAndMarkDeclsExpr(t.expr, reads),
-            .break_stmt, .continue_stmt => {},
-        }
+        var ctx = MarkCtx{ .pass = self, .reads = reads };
+        try collectAndMarkDeclsStmtImpl(&ctx, stmt);
     }
 };
+
+/// collectReads 的上下文：绑定 pass 与 reads 映射。
+const ReadsCtx = struct {
+    pass: *DeadCodePass,
+    reads: *std.StringHashMap(void),
+};
+
+/// collectReadsExpr 的实现：特化 hook + 默认 walkExprChildren 递归。
+fn collectReadsExprImpl(ctx: *ReadsCtx, expr: *const ast.Expr) anyerror!void {
+    switch (expr.*) {
+        // hook：identifier → 记录读取
+        .identifier => |id| try ctx.reads.put(id.name, {}),
+        // hook：assignment_expr → 跳过标识符目标
+        .assignment_expr => |a| {
+            if (a.target.* != .identifier) try collectReadsExprImpl(ctx, a.target);
+            try collectReadsExprImpl(ctx, a.value);
+        },
+        // hook：block → 委托 collectReadsStmtImpl 处理死声明跳过
+        .block => |b| {
+            for (b.statements) |s| try collectReadsStmtImpl(ctx, s);
+            if (b.trailing_expr) |te| try collectReadsExprImpl(ctx, te);
+        },
+        // 默认：walkExprChildren 递归
+        else => {
+            try ast_visitor.walkExprChildren(@ptrCast(ctx), expr, collectReadsExprCb);
+        },
+    }
+}
+
+/// walkExprChildren 回调适配器
+fn collectReadsExprCb(ctx: *anyopaque, expr: *const ast.Expr) anyerror!void {
+    const c: *ReadsCtx = @ptrCast(@alignCast(ctx));
+    try collectReadsExprImpl(c, expr);
+}
+
+/// collectReadsStmt 的实现：特化 hook + 默认 walkStmtChildren 递归。
+fn collectReadsStmtImpl(ctx: *ReadsCtx, stmt: *const ast.Stmt) anyerror!void {
+    switch (stmt.*) {
+        // hook：val_decl/var_decl → 死声明跳过
+        .val_decl => |v| {
+            if (!ctx.pass.table.isDead(stmt)) try collectReadsExprImpl(ctx, v.value);
+        },
+        .var_decl => |v| {
+            if (!ctx.pass.table.isDead(stmt)) try collectReadsExprImpl(ctx, v.value);
+        },
+        // hook：assignment → 跳过标识符目标
+        .assignment => |a| {
+            if (a.target.* != .identifier) try collectReadsExprImpl(ctx, a.target);
+            try collectReadsExprImpl(ctx, a.value);
+        },
+        // 默认：walkStmtChildren 递归
+        else => {
+            try ast_visitor.walkStmtChildren(@ptrCast(ctx), stmt, collectReadsExprCb);
+        },
+    }
+}
+
+/// collectAndMark 的上下文：绑定 pass 与 reads 映射（只读）。
+const MarkCtx = struct {
+    pass: *DeadCodePass,
+    reads: *const std.StringHashMap(void),
+};
+
+/// collectAndMarkDeclsExpr 的实现：特化 hook + 默认 walkExprChildren 递归。
+fn collectAndMarkDeclsImpl(ctx: *MarkCtx, expr: *const ast.Expr) anyerror!void {
+    switch (expr.*) {
+        // hook：block → 委托 collectAndMarkDeclsStmtImpl 处理声明标记
+        .block => |b| {
+            for (b.statements) |s| try collectAndMarkDeclsStmtImpl(ctx, s);
+            if (b.trailing_expr) |te| try collectAndMarkDeclsImpl(ctx, te);
+        },
+        // 默认：walkExprChildren 递归
+        else => {
+            try ast_visitor.walkExprChildren(@ptrCast(ctx), expr, collectAndMarkDeclsCb);
+        },
+    }
+}
+
+/// walkExprChildren 回调适配器
+fn collectAndMarkDeclsCb(ctx: *anyopaque, expr: *const ast.Expr) anyerror!void {
+    const c: *MarkCtx = @ptrCast(@alignCast(ctx));
+    try collectAndMarkDeclsImpl(c, expr);
+}
+
+/// collectAndMarkDeclsStmt 的实现：特化 hook + 默认 walkStmtChildren 递归。
+fn collectAndMarkDeclsStmtImpl(ctx: *MarkCtx, stmt: *const ast.Stmt) anyerror!void {
+    switch (stmt.*) {
+        // hook：val_decl/var_decl → 标记死代码后递归
+        .val_decl => |v| {
+            if (!ctx.reads.contains(v.name) and isSideEffectFreeExpr(v.value)) {
+                try ctx.pass.table.put(stmt);
+            }
+            try collectAndMarkDeclsImpl(ctx, v.value);
+        },
+        .var_decl => |v| {
+            if (!ctx.reads.contains(v.name) and isSideEffectFreeExpr(v.value)) {
+                try ctx.pass.table.put(stmt);
+            }
+            try collectAndMarkDeclsImpl(ctx, v.value);
+        },
+        // 默认：walkStmtChildren 递归
+        else => {
+            try ast_visitor.walkStmtChildren(@ptrCast(ctx), stmt, collectAndMarkDeclsCb);
+        },
+    }
+}
 
 /// 判断表达式是否无副作用。仅纯字面量、标识符、无副作用的一元 / 二元运算、
 /// if 表达式、类型转换等可判定为无副作用；调用、索引、赋值等一律视为有副作用。

@@ -75,7 +75,7 @@ pub fn isRecordSubtype(inferencer: *TypeInferencer, sub_fields: []const FieldTyp
     for (super_fields) |super_field| {
         var found = false;
         for (sub_fields) |sub_field| {
-            if (std.mem.eql(u8, super_field.name, sub_field.name)) {
+            if (std.mem.eql(u8, super_field.name orelse "", sub_field.name orelse "")) {
                 found = true;
                 break;
             }
@@ -97,7 +97,7 @@ pub fn recordArgSatisfies(inferencer: *TypeInferencer, param: *Type, arg: *Type)
     for (rp.record_type.fields) |pf| {
         var found = false;
         for (ra.record_type.fields) |af| {
-            if (std.mem.eql(u8, pf.name, af.name)) {
+            if (std.mem.eql(u8, pf.name orelse "", af.name orelse "")) {
                 if (!recordArgSatisfies(inferencer, pf.ty, af.ty)) return false;
                 found = true;
                 break;

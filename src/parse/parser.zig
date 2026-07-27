@@ -8,6 +8,7 @@
 const std = @import("std");
 const lexer = @import("lexer");
 const ast = @import("ast");
+const binary_op_table = @import("binary_op_table.zig");
 
 /// 语法错误信息：行列号与消息
 pub const ParseError = struct {
@@ -1437,324 +1438,36 @@ pub const Parser = struct {
 
     /// 表达式解析入口
     pub fn parseExpr(self: *Parser) ParserError!*ast.Expr {
-        return self.parseElvis();
+        return self.parseBinary(binary_op_table.MIN_PREC);
     }
 
-    /// 解析 Elvis 运算符 ??（最低优先级）
-    fn parseElvis(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseOr();
-        while (self.matchToken(.question_question)) {
-            const op_tok = self.previous();
-            const right = try self.parseOr();
-            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                .binary = .{
-                    .op = .elvis,
-                    .left = left,
-                    .right = right,
-                },
-            });
-        }
-        return left;
-    }
-
-    /// 解析逻辑或 ||
-    fn parseOr(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseAnd();
-        while (self.matchToken(.pipe_pipe)) {
-            const op_tok = self.previous();
-            const right = try self.parseAnd();
-            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                .binary = .{
-                    .op = .or_op,
-                    .left = left,
-                    .right = right,
-                },
-            });
-        }
-        return left;
-    }
-
-    /// 解析逻辑与 &&
-    fn parseAnd(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseBitOr();
-        while (self.matchToken(.amp_amp)) {
-            const op_tok = self.previous();
-            const right = try self.parseBitOr();
-            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                .binary = .{
-                    .op = .and_op,
-                    .left = left,
-                    .right = right,
-                },
-            });
-        }
-        return left;
-    }
-
-    /// 解析按位或 |
-    fn parseBitOr(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseBitXor();
-        while (self.matchToken(.pipe)) {
-            const op_tok = self.previous();
-            const right = try self.parseBitXor();
-            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                .binary = .{
-                    .op = .bit_or,
-                    .left = left,
-                    .right = right,
-                },
-            });
-        }
-        return left;
-    }
-
-    /// 解析按位异或 ^
-    fn parseBitXor(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseBitAnd();
-        while (self.matchToken(.caret)) {
-            const op_tok = self.previous();
-            const right = try self.parseBitAnd();
-            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                .binary = .{
-                    .op = .bit_xor,
-                    .left = left,
-                    .right = right,
-                },
-            });
-        }
-        return left;
-    }
-
-    /// 解析按位与 &
-    fn parseBitAnd(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseShift();
-        while (self.matchToken(.ampersand)) {
-            const op_tok = self.previous();
-            const right = try self.parseShift();
-            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                .binary = .{
-                    .op = .bit_and,
-                    .left = left,
-                    .right = right,
-                },
-            });
-        }
-        return left;
-    }
-
-    /// 解析移位 << >>
-    fn parseShift(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseEquality();
-        while (true) {
-            if (self.matchToken(.lt_lt)) {
-                const op_tok = self.previous();
-                const right = try self.parseEquality();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .shl,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else if (self.matchToken(.gt_gt)) {
-                const op_tok = self.previous();
-                const right = try self.parseEquality();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .shr,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else break;
-        }
-        return left;
-    }
-
-    /// 解析相等性 == != === !==
-    fn parseEquality(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseComparison();
-        while (true) {
-            if (self.matchToken(.eq_eq)) {
-                const op_tok = self.previous();
-                const right = try self.parseComparison();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .eq,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else if (self.matchToken(.bang_eq)) {
-                const op_tok = self.previous();
-                const right = try self.parseComparison();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .not_eq,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else if (self.matchToken(.ref_eq)) {
-                const op_tok = self.previous();
-                const right = try self.parseComparison();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .ref_eq,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else if (self.matchToken(.ref_neq)) {
-                const op_tok = self.previous();
-                const right = try self.parseComparison();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .ref_neq,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else {
-                break;
-            }
-        }
-        return left;
-    }
-
-    /// 解析比较 < > <= >=
-    fn parseComparison(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseRange();
-        while (true) {
-            const op: ?ast.BinaryOp = switch (self.peek().type) {
-                .lt => .lt,
-                .gt => .gt,
-                .lt_eq => .lt_eq,
-                .gt_eq => .gt_eq,
-                else => null,
-            };
-            if (op) |o| {
-                const op_tok = self.advance();
-                const right = try self.parseRange();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = o,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else {
-                break;
-            }
-        }
-        return left;
-    }
-
-    /// 解析范围 .. ..=
-    fn parseRange(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseAddition();
-        while (true) {
-            if (self.matchToken(.dot_dot)) {
-                const op_tok = self.previous();
-                const right = try self.parseAddition();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .range,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else if (self.matchToken(.dot_dot_eq)) {
-                const op_tok = self.previous();
-                const right = try self.parseAddition();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .range_inclusive,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else {
-                break;
-            }
-        }
-        return left;
-    }
-
-    /// 解析加减 ++ + -
-    fn parseAddition(self: *Parser) ParserError!*ast.Expr {
-        var left = try self.parseMultiplication();
-        while (true) {
-            if (self.matchToken(.plus)) {
-                const op_tok = self.previous();
-                const right = try self.parseMultiplication();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .add,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else if (self.matchToken(.plus_plus)) {
-                const op_tok = self.previous();
-                const right = try self.parseMultiplication();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .concat_list,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else if (self.matchToken(.minus)) {
-                const op_tok = self.previous();
-                const right = try self.parseMultiplication();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = .sub,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else {
-                break;
-            }
-        }
-        return left;
-    }
-
-    /// 解析乘除模 * / %
-    /// 注意：`*` 既是乘法（中缀）也是解引用（前缀）。当 `*` 出现在新行开头时，
-    /// 更可能是解引用而非乘法，因此检查 `*` 是否与 left 末尾 token 同行。
-    fn parseMultiplication(self: *Parser) ParserError!*ast.Expr {
+    /// 单一 Pratt 解析器（v3 阶段 15：替代 13 个 parseXxx 模板函数）
+    ///
+    /// 算法：
+    /// 1. 解析左操作数（parseUnary，即更高优先级的前缀/后缀表达式）
+    /// 2. 查 BINARY_OPS 表，若当前 token 是二元运算符且优先级 >= min_prec
+    /// 3. 消费运算符，递归 parseBinary(prec + 1) 解析右操作数（左结合）
+    /// 4. 构建二元表达式，回到步骤 2
+    ///
+    /// 特殊处理：`*` 跨行时视为新语句的解引用，不作为乘法
+    fn parseBinary(self: *Parser, min_prec: u8) ParserError!*ast.Expr {
         var left = try self.parseUnary();
-        while (true) {
-            const peek_tok = self.peek();
-            const op: ?ast.BinaryOp = switch (peek_tok.type) {
-                .star => .mul,
-                .slash => .div,
-                .percent => .mod,
-                else => null,
-            };
-            if (op) |o| {
-                // `*` 跨行时视为新语句的解引用，不作为乘法
-                if (o == .mul and self.current > 0) {
-                    const prev_tok = self.tokens[self.current - 1];
-                    if (peek_tok.line != prev_tok.line) {
-                        break;
-                    }
-                }
-                const op_tok = self.advance();
-                const right = try self.parseUnary();
-                left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
-                    .binary = .{
-                        .op = o,
-                        .left = left,
-                        .right = right,
-                    },
-                });
-            } else {
-                break;
+        while (binary_op_table.lookupBinaryOp(self.peek().type)) |mapping| {
+            if (mapping.precedence < min_prec) break;
+            // `*` 跨行时视为新语句的解引用，不作为乘法
+            if (mapping.check_multiline_deref and self.current > 0) {
+                const prev_tok = self.tokens[self.current - 1];
+                if (self.peek().line != prev_tok.line) break;
             }
+            const op_tok = self.advance();
+            const right = try self.parseBinary(mapping.precedence + 1);
+            left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
+                .binary = .{
+                    .op = mapping.op,
+                    .left = left,
+                    .right = right,
+                },
+            });
         }
         return left;
     }
@@ -2009,12 +1722,12 @@ pub const Parser = struct {
                 });
             } else if (self.matchToken(.l_bracket)) {
                 // 索引访问 obj[index] 或切片 obj[start..end] / obj[start..=end]
-                // 注意：start 使用 parseAddition 而非 parseExpr，避免 .. 被解析为 range 表达式
+                // 注意：start 使用 ADDITION_PREC 而非 MIN_PREC，避免 .. 被解析为 range 表达式
                 const bracket_tok = self.previous();
-                const start = try self.parseAddition();
+                const start = try self.parseBinary(binary_op_table.ADDITION_PREC);
                 if (self.matchToken(.dot_dot_eq) or self.matchToken(.dot_dot)) {
                     const inclusive = self.previous().type == .dot_dot_eq;
-                    const end = try self.parseAddition();
+                    const end = try self.parseBinary(binary_op_table.ADDITION_PREC);
                     _ = self.expect(.r_bracket, "expected ']' after slice end") catch {};
                     expr_node = try self.allocExpr(tokenLoc(bracket_tok), ast.Expr{
                         .slice = .{

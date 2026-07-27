@@ -272,7 +272,7 @@ test "runSegment none 段推进 advance" {
         .end_node = 1,
         .suspend_kind = .none,
     };
-    var frame = CoroutineFrame.initFixed(0, emptyLayout());
+    var frame = CoroutineFrame.initFixed(0, emptyLayout(), &[_]u16{});
 
     const result = try runSegment(&frame, seg, &nodes, tctx.sctx(), &registry);
     try testing.expectEqual(@as(u32, 2), tctx.exec_count);
@@ -299,7 +299,7 @@ test "runSegment terminal 段返回 complete" {
         .end_node = 0,
         .suspend_kind = .terminal,
     };
-    var frame = CoroutineFrame.initFixed(0, emptyLayout());
+    var frame = CoroutineFrame.initFixed(0, emptyLayout(), &[_]u16{});
 
     const result = try runSegment(&frame, seg, &nodes, tctx.sctx(), &registry);
     switch (result) {
@@ -343,7 +343,7 @@ test "runSegment orbit_chan_recv 空通道挂起" {
         .end_node = 0,
         .suspend_kind = .chan_recv,
     };
-    var frame = CoroutineFrame.initFixed(0, emptyLayout());
+    var frame = CoroutineFrame.initFixed(0, emptyLayout(), &[_]u16{});
 
     const result = try runSegment(&frame, seg, &nodes, tctx.sctx(), &registry);
     switch (result) {
@@ -390,7 +390,7 @@ test "runSegment orbit_chan_recv 有数据继续" {
         .end_node = 0,
         .suspend_kind = .chan_recv,
     };
-    var frame = CoroutineFrame.initFixed(0, emptyLayout());
+    var frame = CoroutineFrame.initFixed(0, emptyLayout(), &[_]u16{});
 
     const result = try runSegment(&frame, seg, &nodes, tctx.sctx(), &registry);
     // try-first 成功 → 段完成 → advance

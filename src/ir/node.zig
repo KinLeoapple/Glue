@@ -147,40 +147,6 @@ pub const NodeOp = enum(u8) {
     /// 强制求值：inputs[0] = LazyValue (ref_chan)，output = 值通道
     lazy_force,
 
-    /// 返回该 op 是否为 halt 节点（终止执行）
-    pub fn isHalt(self: NodeOp) bool {
-        return switch (self) {
-            .halt_return, .halt_throw, .halt_panic,
-            .halt_break, .halt_continue => true,
-            else => false,
-        };
-    }
-
-    /// 返回该 op 是否为向量 op
-    pub fn isVector(self: NodeOp) bool {
-        return switch (self) {
-            .vec_source, .vec_map, .vec_map2, .vec_fold, .vec_scan,
-            .vec_filter, .vec_select, .vec_take, .vec_take_while,
-            .vec_zip, .vec_sink => true,
-            else => false,
-        };
-    }
-
-    /// 返回该 op 是否为标量计算 op
-    pub fn isScalar(self: NodeOp) bool {
-        return switch (self) {
-            .const_i, .const_f, .const_bool, .const_char, .const_str, .const_null, .const_unit,
-            .int_add, .int_sub, .int_mul, .int_div, .int_mod,
-            .int_and, .int_or, .int_xor, .int_shl, .int_shr, .int_not,
-            .int_neg, .int_abs,
-            .float_add, .float_sub, .float_mul, .float_div, .float_mod,
-            .float_neg, .float_abs,
-            .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge,
-            .bool_and, .bool_or, .bool_not,
-            .cast, .cast_safe, .cast_to, .cast_try_to => true,
-            else => false,
-        };
-    }
 };
 
 /// 统一节点结构：固定 16 字节
@@ -294,10 +260,11 @@ test "Node.make 构造二元节点" {
 }
 
 test "NodeOp.isHalt/isVector/isScalar 分类" {
-    try testing.expect(NodeOp.halt_return.isHalt());
-    try testing.expect(!NodeOp.int_add.isHalt());
-    try testing.expect(NodeOp.vec_map.isVector());
-    try testing.expect(!NodeOp.int_add.isVector());
-    try testing.expect(NodeOp.int_add.isScalar());
-    try testing.expect(!NodeOp.call.isScalar());
+    const op_table = @import("op_table.zig");
+    try testing.expect(op_table.isHalt(.halt_return));
+    try testing.expect(!op_table.isHalt(.int_add));
+    try testing.expect(op_table.isVector(.vec_map));
+    try testing.expect(!op_table.isVector(.int_add));
+    try testing.expect(op_table.isScalar(.int_add));
+    try testing.expect(!op_table.isScalar(.call));
 }

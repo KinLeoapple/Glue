@@ -13,7 +13,7 @@ const builtin = @import("builtin");
 /// 堆对象类型变体数量（与 obj_header.RefKind 的字段数一致）
 /// 不直接导入 obj_header 以避免 profiling ↔ value 循环依赖。
 /// 调用方用 @intFromEnum(ref_kind) 转为 u8 传入 profiler API。
-pub const ref_kind_count: usize = 23;
+pub const ref_kind_count: usize = 22;
 
 /// RefKind 名称表（与 obj_header.RefKind 枚举顺序一一对应）
 /// 不直接导入 obj_header 以避免 profiling ↔ value 循环依赖；
@@ -24,7 +24,7 @@ pub const REF_KIND_NAMES = [_][]const u8{
     "partial",      "builtin",      "trait_val",    "lazy_val",
     "error_val",    "throw_val",    "array_iter",   "string_iter",
     "range_iter",   "atomic_val",   "async_val",    "channel_val",
-    "sender_val",   "receiver_val", "coroutine_frame", "boxed_scalar",
+    "sender_val",   "receiver_val", "coroutine_frame",
 };
 
 // ============ 基础工具（Zig 0.16 兼容层）============

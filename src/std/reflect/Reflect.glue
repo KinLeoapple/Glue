@@ -1,0 +1,104 @@
+// std/reflect/Reflect.glue — 运行时反射格式化
+//
+// 替代 __format_value 伪函数，让 println 成为真正的 Glue 函数。
+// 递归格式化逻辑完全在 Glue 层实现，reflect/__scalar_to_str 为边界原语。
+//
+// 设计文档: docs/superpowers/specs/2026-07-25-reflect-builtin-design.md
+//
+// 用法：
+//   import std.reflect.Reflect.{format}
+//   val s = format(x)   // 任意类型值 → str
+
+// ─── 顶层格式化入口 ──────────────────────────────────────────────
+
+pub fun format<T>(x: T): str {
+    val r = reflect(x)
+    val k = r.kind()
+    if k == "Primitive" { return __scalar_to_str(r) }
+    if k == "Unit" { return __scalar_to_str(r) }
+    if k == "Str" { return __scalar_to_str(r) }
+    if k == "Record" { return format_record(r) }
+    if k == "Adt" { return format_adt(r) }
+    if k == "Newtype" { return format_newtype(r) }
+    if k == "Array" { return format_array(r) }
+    if k == "Nullable" { return format_nullable(r) }
+    "<unknown>"
+}
+
+// ─── Record 格式化：TypeName(field1: val1, field2: val2) ─────────
+
+fun format_record<T>(r: Reflect<T>): str {
+    var out = r.type_name() + "("
+    var i: usize = 0
+    val n = r.field_count()
+    while i < n {
+        if i > 0 { out = out + ", " }
+        val fv = r.field_value(i)
+        val fname = r.field_name(i)
+        if fname == "" {
+            out = out + format(fv)
+        } else {
+            out = out + fname + ": " + format(fv)
+        }
+        i = i + 1
+    }
+    out + ")"
+}
+
+// ─── ADT 格式化：Constructor(arg1, arg2) 或 Constructor ──────────
+
+fun format_adt<T>(r: Reflect<T>): str {
+    val ctor = r.adt_constructor()
+    val n = r.field_count()
+    if n == 0 { return ctor }
+    var out = ctor + "("
+    var i: usize = 0
+    while i < n {
+        if i > 0 { out = out + ", " }
+        val fv = r.field_value(i)
+        val fname = r.field_name(i)
+        if fname == "" {
+            out = out + format(fv)
+        } else {
+            out = out + fname + ": " + format(fv)
+        }
+        i = i + 1
+    }
+    out + ")"
+}
+
+// ─── Newtype 格式化：TypeName(inner) ─────────────────────────────
+
+fun format_newtype<T>(r: Reflect<T>): str {
+    val n = r.field_count()
+    if n == 0 { return r.type_name() }
+    var out = r.type_name() + "("
+    var i: usize = 0
+    while i < n {
+        if i > 0 { out = out + ", " }
+        out = out + format(r.field_value(i))
+        i = i + 1
+    }
+    out + ")"
+}
+
+// ─── 数组格式化：[elem1, elem2, ...] ─────────────────────────────
+
+fun format_array<T>(r: Reflect<T>): str {
+    var out = "["
+    var i: usize = 0
+    val n = r.array_len()
+    while i < n {
+        if i > 0 { out = out + ", " }
+        out = out + format(r.field_value(i))
+        i = i + 1
+    }
+    out + "]"
+}
+
+// ─── Nullable 格式化：null 或 内部值 ─────────────────────────────
+
+fun format_nullable<T>(r: Reflect<T>): str {
+    val n = r.field_count()
+    if n == 0 { "null" } else { format(r.field_value(0)) }
+}

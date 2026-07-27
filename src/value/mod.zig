@@ -12,6 +12,9 @@ const ObjHeader = obj_header.ObjHeader;
 const RefKind = obj_header.RefKind;
 const ThreadContext = obj_header.ThreadContext;
 
+// ── RefKind 描述符表（v3 阶段 7）──
+pub const ref_kind_table = @import("ref_kind_table.zig");
+
 // ── 标量运算系统 ──
 pub const scalar = @import("scalar.zig");
 pub const ScalarTag = scalar.ScalarTag;
@@ -602,10 +605,7 @@ pub const Value = union(enum) {
     /// 判断是否可作为 memo 表的键（不可变且可序列化）
     pub inline fn isMemoizableValue(self: Value) bool {
         if (self.isBoxed()) {
-            return switch (self.ref.type_tag) {
-                .str, .array, .record, .adt, .newtype, .range, .error_val, .throw_val => true,
-                else => false,
-            };
+            return ref_kind_table.isMemoizable(self.ref.type_tag);
         }
         return true;
     }
@@ -693,7 +693,7 @@ pub const Value = union(enum) {
 
     /// 深拷贝值：标量值原样返回，堆分配值递归复制其内容
     /// 深度限制 MAX_DEEPCOPY_DEPTH 防止嵌套复合类型栈溢出
-    pub fn deepCopy(self: Value, tctx: *ThreadContext) AllocError!Value {
+    pub fn deepCopy(self: Value, tctx: *ThreadContext) anyerror!Value {
         if (deepCopyDepth >= MAX_DEEPCOPY_DEPTH) return error.Overflow;
         switch (self) {
             .null_val, .unit, .boolean, .char,
@@ -705,26 +705,13 @@ pub const Value = union(enum) {
             .ref => |obj| {
                 deepCopyDepth += 1;
                 defer deepCopyDepth -= 1;
-                return switch (obj.type_tag) {
-                    .str => try deepCopyStr(obj, tctx),
-                    .array => try deepCopyArray(obj, tctx),
-                    .record => try deepCopyRecord(obj, tctx),
-                    .adt => try deepCopyAdt(obj, tctx),
-                    .newtype => try deepCopyNewtype(obj, tctx),
-                    .cell => try deepCopyCell(obj, tctx),
-                    .range => try deepCopyRange(obj, tctx),
-                    .closure => try deepCopyClosure(obj, tctx),
-                    .partial => try deepCopyPartial(obj, tctx),
-                    .builtin => try deepCopyBuiltin(obj, tctx),
-                    .error_val => try deepCopyError(obj, tctx),
-                    .throw_val => try deepCopyThrow(obj, tctx),
-                    .trait_val => try deepCopyTrait(obj, tctx),
-                    // 迭代器、惰性值、并发对象、装箱标量、协程帧：引用语义，retain 即可
-                    .array_iter, .string_iter, .range_iter,
-                    .lazy_val,
-                    .atomic_val, .async_val, .channel_val, .sender_val, .receiver_val,
-                    .coroutine_frame, .boxed_scalar => self.retain(tctx),
-                };
+                const desc = ref_kind_table_mod.descriptor(obj.type_tag);
+                if (desc.deep_copy_fn) |fn_ptr| {
+                    const new_obj = try fn_ptr(obj, tctx);
+                    return Value.fromRef(new_obj);
+                }
+                // null = retain 语义（迭代器/惰性值/并发对象/装箱标量/协程帧）
+                return self.retain(tctx);
             },
         }
     }
@@ -736,7 +723,7 @@ pub const Value = union(enum) {
         return true;
     }
 
-    fn deepCopyStr(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyStr(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const s: *Str = @alignCast(@fieldParentPtr("header", obj));
         // SSO 快路径：整体拷贝 32B 结构体，仅重置引用计数
         if (s.isSso()) {
@@ -751,7 +738,7 @@ pub const Value = union(enum) {
         return try Value.fromStringBytes(tctx, s.bytes());
     }
 
-    fn deepCopyArray(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyArray(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *ArrayValue = @alignCast(@fieldParentPtr("header", obj));
         // header 和 elements 分离分配（支持后续 push/pop 替换切片）
         const new_elems: []Value = if (p.elements.len > 0) blk: {
@@ -796,7 +783,7 @@ pub const Value = union(enum) {
         return .{ .ref = &arr.header };
     }
 
-    fn deepCopyRecord(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyRecord(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[RecordValue header | Value fields[]]
         const f_size = p.fields.len * @sizeOf(Value);
@@ -832,7 +819,7 @@ pub const Value = union(enum) {
         return .{ .ref = &rec.header };
     }
 
-    fn deepCopyAdt(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyAdt(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *AdtValue = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[AdtValue header | AdtField fields[]]
         const f_size = p.fields.len * @sizeOf(AdtField);
@@ -888,17 +875,17 @@ pub const Value = union(enum) {
         return .{ .ref = &adt.header };
     }
 
-    fn deepCopyNewtype(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyNewtype(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
         return try Value.makeNewtype(tctx, p.type_name, try p.inner.deepCopy(tctx));
     }
 
-    fn deepCopyCell(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyCell(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *Cell = @alignCast(@fieldParentPtr("header", obj));
         return try Value.makeCell(tctx, try p.inner.deepCopy(tctx));
     }
 
-    fn deepCopyRange(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyRange(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *Range = @alignCast(@fieldParentPtr("header", obj));
         // 直接 memcpy：Range 为固定大小纯数据，无嵌套引用
         const new_r = try tctx.createObj(Range);
@@ -908,7 +895,7 @@ pub const Value = union(enum) {
         return .{ .ref = &new_r.header };
     }
 
-    fn deepCopyClosure(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyClosure(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *Closure = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[Closure header | upvalues[] | bound_args[]]
         const uv_size = p.upvalues.len * @sizeOf(Value);
@@ -964,7 +951,7 @@ pub const Value = union(enum) {
         return .{ .ref = &c.header };
     }
 
-    fn deepCopyPartial(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyPartial(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *PartialApplication = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[PartialApplication header | bound_args[]]
         const ba_size = p.bound_args.len * @sizeOf(Value);
@@ -1000,7 +987,7 @@ pub const Value = union(enum) {
         return .{ .ref = &pa.header };
     }
 
-    fn deepCopyBuiltin(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyBuiltin(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *Builtin = @alignCast(@fieldParentPtr("header", obj));
         // 直接 memcpy：Builtin 为固定大小纯数据（函数指针 + ctx），无嵌套引用
         const new_b = try tctx.createObj(Builtin);
@@ -1010,13 +997,13 @@ pub const Value = union(enum) {
         return .{ .ref = &new_b.header };
     }
 
-    fn deepCopyError(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyError(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *ErrorValue = @alignCast(@fieldParentPtr("header", obj));
         // 连续内存布局：[ErrorValue header | type_name | message]
         return try Value.makeError(tctx, p.type_name, p.message, p.is_error_subtype);
     }
 
-    fn deepCopyThrow(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyThrow(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *ThrowValue = @alignCast(@fieldParentPtr("header", obj));
         switch (p.payload) {
             .ok => |v| return try Value.makeThrow(tctx, .{ .ok = try v.deepCopy(tctx) }),
@@ -1029,7 +1016,7 @@ pub const Value = union(enum) {
         }
     }
 
-    fn deepCopyTrait(obj: *ObjHeader, tctx: *ThreadContext) AllocError!Value {
+    fn deepCopyTrait(obj: *ObjHeader, tctx: *ThreadContext) anyerror!Value {
         const p: *TraitValue = @alignCast(@fieldParentPtr("header", obj));
         if (!p.owned) return Value.fromRef(obj).retain(tctx);
         const count = p.method_names.len;
@@ -1116,101 +1103,11 @@ pub const Value = union(enum) {
             .f128 => try formatFloat(self.asF128(), tctx, buf),
 
             .ref => |obj| {
-                switch (obj.type_tag) {
-                    .str => {
-                        const s: *Str = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.append(al, '"');
-                        try buf.appendSlice(al, s.bytes());
-                        try buf.append(al, '"');
-                    },
-                    .array => {
-                        const arr: *ArrayValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.append(al, '[');
-                        for (arr.elements, 0..) |elem, i| {
-                            if (i > 0) try buf.appendSlice(al, ", ");
-                            try elem.format(tctx, buf);
-                        }
-                        try buf.append(al, ']');
-                    },
-                    .record => {
-                        const rec: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(al, rec.type_name);
-                        try buf.append(al, '{');
-                        for (rec.fields, 0..) |v, i| {
-                            if (i > 0) try buf.appendSlice(al, ", ");
-                            // 优先用字段名表，无则用 _<id>
-                            if (i < rec.field_names.len) {
-                                if (rec.field_names[i]) |nm| {
-                                    try buf.appendSlice(al, nm);
-                                } else {
-                                    try buf.appendSlice(al, "_");
-                                    try formatInt(i, tctx, buf);
-                                }
-                            } else {
-                                try buf.appendSlice(al, "_");
-                                try formatInt(i, tctx, buf);
-                            }
-                            try buf.appendSlice(al, ": ");
-                            try v.format(tctx, buf);
-                        }
-                        try buf.append(al, '}');
-                    },
-                    .adt => {
-                        const adt: *AdtValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(al, adt.type_name);
-                        try buf.appendSlice(al, "::");
-                        try buf.appendSlice(al, adt.constructor);
-                        if (adt.fields.len > 0) {
-                            try buf.append(al, '(');
-                            for (adt.fields, 0..) |field, i| {
-                                if (i > 0) try buf.appendSlice(al, ", ");
-                                try field.value.format(tctx, buf);
-                            }
-                            try buf.append(al, ')');
-                        }
-                    },
-                    .newtype => {
-                        const nt: *NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(al, nt.type_name);
-                        try buf.append(al, '(');
-                        try nt.inner.format(tctx, buf);
-                        try buf.append(al, ')');
-                    },
-                    .cell => {
-                        const cell: *Cell = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(al, "Cell(");
-                        try cell.inner.format(tctx, buf);
-                        try buf.append(al, ')');
-                    },
-                    .range => {
-                        const r: *Range = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(al, "<range>");
-                        _ = r;
-                    },
-                    .closure => try buf.appendSlice(al, "<closure>"),
-                    .partial => try buf.appendSlice(al, "<partial>"),
-                    .builtin => try buf.appendSlice(al, "<builtin>"),
-                    .error_val => {
-                        const e: *ErrorValue = @alignCast(@fieldParentPtr("header", obj));
-                        try buf.appendSlice(al, "Error(");
-                        try buf.appendSlice(al, e.type_name);
-                        try buf.appendSlice(al, ": ");
-                        try buf.appendSlice(al, e.message);
-                        try buf.append(al, ')');
-                    },
-                    .throw_val => try buf.appendSlice(al, "<throw>"),
-                    .array_iter => try buf.appendSlice(al, "<array_iter>"),
-                    .string_iter => try buf.appendSlice(al, "<string_iter>"),
-                    .range_iter => try buf.appendSlice(al, "<range_iter>"),
-                    .atomic_val => try buf.appendSlice(al, "<atomic>"),
-                    .async_val => try buf.appendSlice(al, "<async>"),
-                    .channel_val => try buf.appendSlice(al, "<channel>"),
-                    .sender_val => try buf.appendSlice(al, "<sender>"),
-                    .receiver_val => try buf.appendSlice(al, "<receiver>"),
-                    .trait_val => try buf.appendSlice(al, "<trait>"),
-                    .lazy_val => try buf.appendSlice(al, "<lazy>"),
-                    .coroutine_frame => try buf.appendSlice(al, "<coroutine>"),
-                    .boxed_scalar => try buf.appendSlice(al, "<boxed>"),
+                const desc = ref_kind_table_mod.descriptor(obj.type_tag);
+                if (desc.format_fn) |fn_ptr| {
+                    try fn_ptr(obj, tctx, buf);
+                } else {
+                    try buf.appendSlice(al, desc.display_name);
                 }
             },
         }
@@ -1276,64 +1173,220 @@ pub fn equals(a: Value, b: Value) bool {
             if (equalsDepth >= MAX_EQUALS_DEPTH) return false;
             equalsDepth += 1;
             defer equalsDepth -= 1;
-            return switch (obj.type_tag) {
-                .str => blk: {
-                    const sa: *Str = @alignCast(@fieldParentPtr("header", obj));
-                    const sb: *Str = @alignCast(@fieldParentPtr("header", b.ref));
-                    break :blk std.mem.eql(u8, sa.bytes(), sb.bytes());
-                },
-                .array => blk: {
-                    const aa: *ArrayValue = @alignCast(@fieldParentPtr("header", obj));
-                    const ab: *ArrayValue = @alignCast(@fieldParentPtr("header", b.ref));
-                    if (aa.elements.len != ab.elements.len) break :blk false;
-                    for (aa.elements, ab.elements) |x, y| {
-                        if (!equals(x, y)) break :blk false;
-                    }
-                    break :blk true;
-                },
-                .record => blk: {
-                    const ra: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
-                    const rb: *RecordValue = @alignCast(@fieldParentPtr("header", b.ref));
-                    // 字段按 field_id 顺序存储，同类型 record 字段顺序一致
-                    if (ra.fields.len != rb.fields.len) break :blk false;
-                    for (ra.fields, rb.fields) |va, vb| {
-                        if (!equals(va, vb)) break :blk false;
-                    }
-                    break :blk true;
-                },
-                .adt => blk: {
-                    const va: *AdtValue = @alignCast(@fieldParentPtr("header", obj));
-                    const vb: *AdtValue = @alignCast(@fieldParentPtr("header", b.ref));
-                    if (!std.mem.eql(u8, va.type_name, vb.type_name)) break :blk false;
-                    if (!std.mem.eql(u8, va.constructor, vb.constructor)) break :blk false;
-                    if (va.fields.len != vb.fields.len) break :blk false;
-                    for (va.fields, vb.fields) |fa, fb| {
-                        if (!equals(fa.value, fb.value)) break :blk false;
-                    }
-                    break :blk true;
-                },
-                .newtype => blk: {
-                    const na: *NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
-                    const nb: *NewtypeValue = @alignCast(@fieldParentPtr("header", b.ref));
-                    break :blk std.mem.eql(u8, na.type_name, nb.type_name) and equals(na.inner, nb.inner);
-                },
-                .range => blk: {
-                    const ra: *Range = @alignCast(@fieldParentPtr("header", obj));
-                    const rb: *Range = @alignCast(@fieldParentPtr("header", b.ref));
-                    break :blk std.mem.eql(u8, &ra.start, &rb.start) and
-                        std.mem.eql(u8, &ra.end, &rb.end) and ra.inclusive == rb.inclusive;
-                },
-                .error_val => blk: {
-                    const ea: *ErrorValue = @alignCast(@fieldParentPtr("header", obj));
-                    const eb: *ErrorValue = @alignCast(@fieldParentPtr("header", b.ref));
-                    break :blk std.mem.eql(u8, ea.type_name, eb.type_name) and
-                        std.mem.eql(u8, ea.message, eb.message);
-                },
-                // 其余类型按引用相等
-                else => obj == b.ref,
-            };
+            const desc = ref_kind_table_mod.descriptor(obj.type_tag);
+            if (desc.equals_fn) |fn_ptr| {
+                return fn_ptr(obj, b.ref);
+            }
+            // null = 引用相等
+            return obj == b.ref;
         },
     };
+}
+
+// ════════════════════════════════════════════════════════════
+// RefKind 描述符表函数指针适配层（v3 阶段 7）
+// ════════════════════════════════════════════════════════════
+// deepCopy*/format/equals 逻辑提取为独立函数，注册到 ref_kind_table。
+// 消除 mod.zig 与 engine.zig 中的 type_tag switch 分派。
+
+const ref_kind_table_mod = ref_kind_table;
+
+// ── deepCopy 适配器：AllocError!Value → anyerror!*ObjHeader ──
+
+fn deepCopyStrAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyStr(obj, tctx);
+    return v.ref;
+}
+fn deepCopyArrayAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyArray(obj, tctx);
+    return v.ref;
+}
+fn deepCopyRecordAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyRecord(obj, tctx);
+    return v.ref;
+}
+fn deepCopyAdtAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyAdt(obj, tctx);
+    return v.ref;
+}
+fn deepCopyNewtypeAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyNewtype(obj, tctx);
+    return v.ref;
+}
+fn deepCopyCellAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyCell(obj, tctx);
+    return v.ref;
+}
+fn deepCopyRangeAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyRange(obj, tctx);
+    return v.ref;
+}
+fn deepCopyClosureAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyClosure(obj, tctx);
+    return v.ref;
+}
+fn deepCopyPartialAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyPartial(obj, tctx);
+    return v.ref;
+}
+fn deepCopyBuiltinAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyBuiltin(obj, tctx);
+    return v.ref;
+}
+fn deepCopyErrorAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyError(obj, tctx);
+    return v.ref;
+}
+fn deepCopyThrowAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyThrow(obj, tctx);
+    return v.ref;
+}
+fn deepCopyTraitAdapted(obj: *ObjHeader, tctx: *ThreadContext) anyerror!*ObjHeader {
+    const v = try Value.deepCopyTrait(obj, tctx);
+    return v.ref;
+}
+
+// ── format 提取函数：从 format switch 的 inline 逻辑提取 ──
+
+fn formatStr(obj: *ObjHeader, tctx: *ThreadContext, buf: *std.ArrayList(u8)) anyerror!void {
+    const al = tctx.backing;
+    const s: *Str = @alignCast(@fieldParentPtr("header", obj));
+    try buf.append(al, '"');
+    try buf.appendSlice(al, s.bytes());
+    try buf.append(al, '"');
+}
+fn formatArray(obj: *ObjHeader, tctx: *ThreadContext, buf: *std.ArrayList(u8)) anyerror!void {
+    const al = tctx.backing;
+    const arr: *ArrayValue = @alignCast(@fieldParentPtr("header", obj));
+    try buf.append(al, '[');
+    for (arr.elements, 0..) |elem, i| {
+        if (i > 0) try buf.appendSlice(al, ", ");
+        try elem.format(tctx, buf);
+    }
+    try buf.append(al, ']');
+}
+fn formatRecord(obj: *ObjHeader, tctx: *ThreadContext, buf: *std.ArrayList(u8)) anyerror!void {
+    const al = tctx.backing;
+    const rec: *RecordValue = @alignCast(@fieldParentPtr("header", obj));
+    try buf.appendSlice(al, rec.type_name);
+    try buf.append(al, '{');
+    for (rec.fields, 0..) |v, i| {
+        if (i > 0) try buf.appendSlice(al, ", ");
+        if (i < rec.field_names.len) {
+            if (rec.field_names[i]) |nm| {
+                try buf.appendSlice(al, nm);
+            } else {
+                try buf.appendSlice(al, "_");
+                try formatInt(i, tctx, buf);
+            }
+        } else {
+            try buf.appendSlice(al, "_");
+            try formatInt(i, tctx, buf);
+        }
+        try buf.appendSlice(al, ": ");
+        try v.format(tctx, buf);
+    }
+    try buf.append(al, '}');
+}
+fn formatAdt(obj: *ObjHeader, tctx: *ThreadContext, buf: *std.ArrayList(u8)) anyerror!void {
+    const al = tctx.backing;
+    const adt: *AdtValue = @alignCast(@fieldParentPtr("header", obj));
+    try buf.appendSlice(al, adt.type_name);
+    try buf.appendSlice(al, "::");
+    try buf.appendSlice(al, adt.constructor);
+    if (adt.fields.len > 0) {
+        try buf.append(al, '(');
+        for (adt.fields, 0..) |field, i| {
+            if (i > 0) try buf.appendSlice(al, ", ");
+            try field.value.format(tctx, buf);
+        }
+        try buf.append(al, ')');
+    }
+}
+fn formatNewtype(obj: *ObjHeader, tctx: *ThreadContext, buf: *std.ArrayList(u8)) anyerror!void {
+    const al = tctx.backing;
+    const nt: *NewtypeValue = @alignCast(@fieldParentPtr("header", obj));
+    try buf.appendSlice(al, nt.type_name);
+    try buf.append(al, '(');
+    try nt.inner.format(tctx, buf);
+    try buf.append(al, ')');
+}
+fn formatCell(obj: *ObjHeader, tctx: *ThreadContext, buf: *std.ArrayList(u8)) anyerror!void {
+    const al = tctx.backing;
+    const cell: *Cell = @alignCast(@fieldParentPtr("header", obj));
+    try buf.appendSlice(al, "Cell(");
+    try cell.inner.format(tctx, buf);
+    try buf.append(al, ')');
+}
+fn formatRange(obj: *ObjHeader, tctx: *ThreadContext, buf: *std.ArrayList(u8)) anyerror!void {
+    const al = tctx.backing;
+    _ = al;
+    const r: *Range = @alignCast(@fieldParentPtr("header", obj));
+    try buf.appendSlice(tctx.backing, "<range>");
+    _ = r;
+}
+fn formatError(obj: *ObjHeader, tctx: *ThreadContext, buf: *std.ArrayList(u8)) anyerror!void {
+    const al = tctx.backing;
+    const e: *ErrorValue = @alignCast(@fieldParentPtr("header", obj));
+    try buf.appendSlice(al, "Error(");
+    try buf.appendSlice(al, e.type_name);
+    try buf.appendSlice(al, ": ");
+    try buf.appendSlice(al, e.message);
+    try buf.append(al, ')');
+}
+
+// ── equals 提取函数：从 equals switch 的 inline 逻辑提取 ──
+
+fn equalsStr(a: *ObjHeader, b: *ObjHeader) bool {
+    const sa: *Str = @alignCast(@fieldParentPtr("header", a));
+    const sb: *Str = @alignCast(@fieldParentPtr("header", b));
+    return std.mem.eql(u8, sa.bytes(), sb.bytes());
+}
+fn equalsArray(a: *ObjHeader, b: *ObjHeader) bool {
+    const aa: *ArrayValue = @alignCast(@fieldParentPtr("header", a));
+    const ab: *ArrayValue = @alignCast(@fieldParentPtr("header", b));
+    if (aa.elements.len != ab.elements.len) return false;
+    for (aa.elements, ab.elements) |x, y| {
+        if (!equals(x, y)) return false;
+    }
+    return true;
+}
+fn equalsRecord(a: *ObjHeader, b: *ObjHeader) bool {
+    const ra: *RecordValue = @alignCast(@fieldParentPtr("header", a));
+    const rb: *RecordValue = @alignCast(@fieldParentPtr("header", b));
+    if (ra.fields.len != rb.fields.len) return false;
+    for (ra.fields, rb.fields) |va, vb| {
+        if (!equals(va, vb)) return false;
+    }
+    return true;
+}
+fn equalsAdt(a: *ObjHeader, b: *ObjHeader) bool {
+    const va: *AdtValue = @alignCast(@fieldParentPtr("header", a));
+    const vb: *AdtValue = @alignCast(@fieldParentPtr("header", b));
+    if (!std.mem.eql(u8, va.type_name, vb.type_name)) return false;
+    if (!std.mem.eql(u8, va.constructor, vb.constructor)) return false;
+    if (va.fields.len != vb.fields.len) return false;
+    for (va.fields, vb.fields) |fa, fb| {
+        if (!equals(fa.value, fb.value)) return false;
+    }
+    return true;
+}
+fn equalsNewtype(a: *ObjHeader, b: *ObjHeader) bool {
+    const na: *NewtypeValue = @alignCast(@fieldParentPtr("header", a));
+    const nb: *NewtypeValue = @alignCast(@fieldParentPtr("header", b));
+    return std.mem.eql(u8, na.type_name, nb.type_name) and equals(na.inner, nb.inner);
+}
+fn equalsRange(a: *ObjHeader, b: *ObjHeader) bool {
+    const ra: *Range = @alignCast(@fieldParentPtr("header", a));
+    const rb: *Range = @alignCast(@fieldParentPtr("header", b));
+    return std.mem.eql(u8, &ra.start, &rb.start) and
+        std.mem.eql(u8, &ra.end, &rb.end) and ra.inclusive == rb.inclusive;
+}
+fn equalsError(a: *ObjHeader, b: *ObjHeader) bool {
+    const ea: *ErrorValue = @alignCast(@fieldParentPtr("header", a));
+    const eb: *ErrorValue = @alignCast(@fieldParentPtr("header", b));
+    return std.mem.eql(u8, ea.type_name, eb.type_name) and
+        std.mem.eql(u8, ea.message, eb.message);
 }
 
 /// 注册所有堆对象类型的 deinit 函数
@@ -1353,6 +1406,8 @@ pub fn registerAllDeinits() void {
         iterator.registerDeinits();
         concurrent.registerDeinits();
         obj_header.registerDeinit(.str, str_mod.strDeinit);
+        // 注册 RefKind 描述符表函数指针（v3 阶段 7）
+        registerRefKindTableFns();
         deinits_state.store(2, .release);
     } else {
         // 其他线程正在注册：自旋等待完成
@@ -1360,6 +1415,43 @@ pub fn registerAllDeinits() void {
             std.Thread.yield() catch {};
         }
     }
+}
+
+/// 注册 RefKind 描述符表的函数指针（deep_copy/format/equals）
+/// 在 registerAllDeinits 内部调用，保证线程安全。
+fn registerRefKindTableFns() void {
+    const rkt = ref_kind_table_mod;
+    // deep_copy：有自定义深拷贝的类型
+    rkt.registerDeepCopyFn(.str, deepCopyStrAdapted);
+    rkt.registerDeepCopyFn(.array, deepCopyArrayAdapted);
+    rkt.registerDeepCopyFn(.record, deepCopyRecordAdapted);
+    rkt.registerDeepCopyFn(.adt, deepCopyAdtAdapted);
+    rkt.registerDeepCopyFn(.newtype, deepCopyNewtypeAdapted);
+    rkt.registerDeepCopyFn(.cell, deepCopyCellAdapted);
+    rkt.registerDeepCopyFn(.range, deepCopyRangeAdapted);
+    rkt.registerDeepCopyFn(.closure, deepCopyClosureAdapted);
+    rkt.registerDeepCopyFn(.partial, deepCopyPartialAdapted);
+    rkt.registerDeepCopyFn(.builtin, deepCopyBuiltinAdapted);
+    rkt.registerDeepCopyFn(.error_val, deepCopyErrorAdapted);
+    rkt.registerDeepCopyFn(.throw_val, deepCopyThrowAdapted);
+    rkt.registerDeepCopyFn(.trait_val, deepCopyTraitAdapted);
+    // format：有自定义格式化的类型
+    rkt.registerFormatFn(.str, formatStr);
+    rkt.registerFormatFn(.array, formatArray);
+    rkt.registerFormatFn(.record, formatRecord);
+    rkt.registerFormatFn(.adt, formatAdt);
+    rkt.registerFormatFn(.newtype, formatNewtype);
+    rkt.registerFormatFn(.cell, formatCell);
+    rkt.registerFormatFn(.range, formatRange);
+    rkt.registerFormatFn(.error_val, formatError);
+    // equals：有自定义相等比较的类型
+    rkt.registerEqualsFn(.str, equalsStr);
+    rkt.registerEqualsFn(.array, equalsArray);
+    rkt.registerEqualsFn(.record, equalsRecord);
+    rkt.registerEqualsFn(.adt, equalsAdt);
+    rkt.registerEqualsFn(.newtype, equalsNewtype);
+    rkt.registerEqualsFn(.range, equalsRange);
+    rkt.registerEqualsFn(.error_val, equalsError);
 }
 
 test {

@@ -137,8 +137,13 @@ pub const Scheduler = struct {
     }
 
     /// 提交协程：分配帧 + 写参数 + state=0 + 入就绪队列
-    pub fn spawn(self: *Scheduler, coroutine_meta: *const CoroutineMeta, args: []const Value) !*CoroutineFrame {
-        const frame = try self.frame_pool.alloc(coroutine_meta.func_idx, coroutine_meta.frame_layout);
+    pub fn spawn(
+        self: *Scheduler,
+        coroutine_meta: *const CoroutineMeta,
+        args: []const Value,
+        type_args: []const u16,
+    ) !*CoroutineFrame {
+        const frame = try self.frame_pool.alloc(coroutine_meta.func_idx, coroutine_meta.frame_layout, type_args);
         // 写参数到帧的 locals 区参数槽
         // 参数按 FrameLayout.slots 布局写入：标量内联 payload，引用存指针字节
         const locals = frame.localsPtr();
@@ -472,7 +477,7 @@ test "Scheduler spawn 入就绪队列" {
         .frame_layout = emptyLayout(),
     };
 
-    const frame = try sched.spawn(&meta, &.{});
+    const frame = try sched.spawn(&meta, &.{}, &[_]u16{});
     try testing.expectEqual(CoroutineStatus.ready, frame.getStatus());
     try testing.expectEqual(@as(u64, 1), sched.workers[0].readyCount());
 
@@ -522,7 +527,7 @@ test "Scheduler spawn 参数序列化到帧 locals" {
 
     // 参数：i32=42, i64=999999
     const args = [_]Value{ Value.fromI32(42), Value.fromI64(999999) };
-    const frame = try sched.spawn(&meta, &args);
+    const frame = try sched.spawn(&meta, &args, &[_]u16{});
 
     // 验证参数已写入 locals 区
     const locals = frame.localsPtr();

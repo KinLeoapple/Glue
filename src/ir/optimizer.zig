@@ -12,6 +12,7 @@
 const std = @import("std");
 const ir_mod = @import("ir.zig");
 const node_mod = @import("node.zig");
+const op_table = @import("op_table.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
 
@@ -107,7 +108,7 @@ fn constantFold(ir: *GlueIR) bool {
 
         // 只折叠二元标量运算
         if (node.input_count != 2) continue;
-        if (!node.op.isScalar()) continue;
+        if (!op_table.isScalar(node.op)) continue;
 
         // 获取两个输入的常量值
         const left_chan = node.inputs[0];
@@ -160,6 +161,7 @@ fn constantFold(ir: *GlueIR) bool {
 }
 
 /// 判断 op 是否为常量载入 op
+/// 注：OpTable.foldable 涵盖 const_* + 可折叠二元运算，语义不同，此处保留原 switch。
 fn isConstantOp(op: NodeOp) bool {
     return switch (op) {
         .const_i, .const_f, .const_bool, .const_char, .const_str, .const_null, .const_unit => true,

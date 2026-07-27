@@ -82,12 +82,15 @@ pub const CoroutineFrame = struct {
     wait_next: ?*CoroutineFrame = null,
     /// 就绪队列链表指针（Worker 本地就绪队列用，单线程访问无需原子）
     ready_next: ?*CoroutineFrame = null,
+    /// 泛型类型实参（spawn 时写入，segmentInstallFrame 段恢复时读取）
+    /// 切片生命周期挂在 IR arena，帧只持有引用
+    type_args: []const u16 = &[_]u16{},
 
     /// panic 缓冲区容量
     pub const PANIC_BUF_SIZE: usize = 128;
 
     /// 初始化帧的固定字段（locals 区由帧池单独写入）
-    pub fn initFixed(func_idx: u16, layout: FrameLayout) CoroutineFrame {
+    pub fn initFixed(func_idx: u16, layout: FrameLayout, type_args: []const u16) CoroutineFrame {
         return .{
             .header = .{ .type_tag = .coroutine_frame },
             .state = 0,
@@ -102,6 +105,7 @@ pub const CoroutineFrame = struct {
             // locals 区紧跟固定字段之后，按 64 对齐
             .locals_offset = @intCast(std.mem.alignForward(usize, @sizeOf(CoroutineFrame), 64)),
             .locals_size = layout.total_size,
+            .type_args = type_args,
         };
     }
 
@@ -186,7 +190,7 @@ pub const FramePool = struct {
     }
 
     /// 分配协程帧：O(1) free list pop，无可用则向 backing 申请
-    pub fn alloc(self: *FramePool, func_idx: u16, layout: FrameLayout) !*CoroutineFrame {
+    pub fn alloc(self: *FramePool, func_idx: u16, layout: FrameLayout, type_args: []const u16) !*CoroutineFrame {
         const frame_size = @as(usize, @sizeOf(CoroutineFrame)) + layout.total_size;
         const bucket = bucketFor(frame_size);
         const alloc_size = SIZE_CLASSES[bucket];
@@ -200,7 +204,7 @@ pub const FramePool = struct {
             self.stats.alloc_count += 1;
             self.stats.active_frames += 1;
             const frame: *CoroutineFrame = @ptrCast(@alignCast(node));
-            frame.* = CoroutineFrame.initFixed(func_idx, layout);
+            frame.* = CoroutineFrame.initFixed(func_idx, layout, type_args);
             return frame;
         }
 
@@ -211,7 +215,7 @@ pub const FramePool = struct {
         self.stats.active_frames += 1;
 
         const frame: *CoroutineFrame = @ptrCast(@alignCast(mem.ptr));
-        frame.* = CoroutineFrame.initFixed(func_idx, layout);
+        frame.* = CoroutineFrame.initFixed(func_idx, layout, type_args);
         return frame;
     }
 
@@ -272,7 +276,7 @@ fn smallLayout() FrameLayout {
 
 test "CoroutineFrame.initFixed 设置初始状态" {
     const layout = smallLayout();
-    var frame = CoroutineFrame.initFixed(42, layout);
+    var frame = CoroutineFrame.initFixed(42, layout, &[_]u16{});
     try testing.expectEqual(@as(u16, 42), frame.func_idx);
     try testing.expectEqual(@as(u16, 0), frame.state);
     try testing.expectEqual(CoroutineStatus.pending, frame.getStatus());
@@ -281,7 +285,7 @@ test "CoroutineFrame.initFixed 设置初始状态" {
 }
 
 test "CoroutineFrame 状态转换" {
-    var frame = CoroutineFrame.initFixed(0, emptyLayout());
+    var frame = CoroutineFrame.initFixed(0, emptyLayout(), &[_]u16{});
     frame.setStatus(.ready);
     try testing.expectEqual(CoroutineStatus.ready, frame.getStatus());
     frame.setStatus(.running);
@@ -291,7 +295,7 @@ test "CoroutineFrame 状态转换" {
 }
 
 test "CoroutineFrame panic 缓冲区读写" {
-    var frame = CoroutineFrame.initFixed(0, emptyLayout());
+    var frame = CoroutineFrame.initFixed(0, emptyLayout(), &[_]u16{});
     frame.setPanic("test panic message");
     try testing.expectEqualStrings("test panic message", frame.getPanic());
     // 超长消息截断
@@ -308,7 +312,7 @@ test "FramePool 分配与释放" {
     var pool = FramePool.init(testing.allocator, io);
     defer pool.deinit();
 
-    const frame = try pool.alloc(1, smallLayout());
+    const frame = try pool.alloc(1, smallLayout(), &[_]u16{});
     try testing.expectEqual(@as(u16, 1), frame.func_idx);
     try testing.expectEqual(CoroutineStatus.pending, frame.getStatus());
 
@@ -327,11 +331,11 @@ test "FramePool free list 复用" {
     var pool = FramePool.init(testing.allocator, io);
     defer pool.deinit();
 
-    const frame1 = try pool.alloc(1, smallLayout());
+    const frame1 = try pool.alloc(1, smallLayout(), &[_]u16{});
     pool.free(frame1);
 
     // 第二次分配应复用 free list 中的帧（地址相同）
-    const frame2 = try pool.alloc(2, smallLayout());
+    const frame2 = try pool.alloc(2, smallLayout(), &[_]u16{});
     try testing.expectEqual(frame1, frame2);
     try testing.expectEqual(@as(u16, 2), frame2.func_idx);
 

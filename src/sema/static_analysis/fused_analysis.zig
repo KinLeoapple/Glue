@@ -12,6 +12,7 @@ const purity_mod = @import("purity.zig");
 const dead_code_mod = @import("dead_code.zig");
 const cse_mod = @import("cse.zig");
 const escape_mod = @import("escape_analysis.zig");
+const ast_visitor = @import("ast_visitor");
 
 const ConstValue = const_prop_mod.ConstValue;
 const ConstEnv = const_prop_mod.ConstEnv;
@@ -118,7 +119,25 @@ pub const FusedAnalysis = struct {
         try escape_pass.analyzeModule(module);
     }
 
+    /// visitor 上下文：绑定 pass/env/current_fn 供 walkExprChildren/walkStmtChildren 回调使用。
+    /// v3 阶段 11：用于消除"仅递归子节点"的重复分支。
+    const FusedVCtx = struct {
+        pass: *FusedAnalysis,
+        env: *ConstEnv,
+        current_fn: []const u8,
+    };
+
+    /// walkExprChildren/walkStmtChildren 回调适配器：递归分析子表达式。
+    fn analyzeExprVCb(ctx: *anyopaque, expr: *const ast.Expr) anyerror!void {
+        const c: *FusedVCtx = @ptrCast(@alignCast(ctx));
+        try c.pass.analyzeExpr(expr, c.env, c.current_fn);
+    }
+
     /// 递归分析表达式：常量折叠、调用图边收集、纯度判定。
+    ///
+    /// v3 阶段 11：使用 ast_visitor.walkExprChildren 消除"仅递归子节点"的重复分支，
+    /// 仅保留常量折叠叶子、后处理（binary/unary）、作用域创建（block）、
+    /// 调用图构建（call）、保守非纯标记的特化 hook。
     fn analyzeExpr(
         self: *FusedAnalysis,
         expr: *const ast.Expr,
@@ -126,6 +145,7 @@ pub const FusedAnalysis = struct {
         current_fn: []const u8,
     ) anyerror!void {
         switch (expr.*) {
+            // ── 常量折叠叶子节点 ──
             .int_literal => |il| {
                 const val = parseIntLiteral(self.allocator, il.raw) orelse ConstValue.unknown;
                 try self.const_table.put(expr, val);
@@ -146,9 +166,11 @@ pub const FusedAnalysis = struct {
                     try self.const_table.put(expr, val);
                 }
             },
+
+            // ── 后处理 hook：walkExprChildren 递归 + 常量折叠 ──
             .binary => |b| {
-                try self.analyzeExpr(b.left, env, current_fn);
-                try self.analyzeExpr(b.right, env, current_fn);
+                var vctx = FusedVCtx{ .pass = self, .env = env, .current_fn = current_fn };
+                try ast_visitor.walkExprChildren(@ptrCast(&vctx), expr, analyzeExprVCb);
                 const lv = self.const_table.lookup(b.left) orelse ConstValue.unknown;
                 const rv = self.const_table.lookup(b.right) orelse ConstValue.unknown;
                 if (evalBinary(b.op, lv, rv)) |result| {
@@ -156,27 +178,16 @@ pub const FusedAnalysis = struct {
                 }
             },
             .unary => |u| {
-                try self.analyzeExpr(u.operand, env, current_fn);
+                var vctx = FusedVCtx{ .pass = self, .env = env, .current_fn = current_fn };
+                try ast_visitor.walkExprChildren(@ptrCast(&vctx), expr, analyzeExprVCb);
                 const v = self.const_table.lookup(u.operand) orelse ConstValue.unknown;
                 if (evalUnary(u.op, v)) |result| {
                     try self.const_table.put(expr, result);
                 }
             },
-            .ref_of => |r| {
-                // 取引用：递归分析 operand，不做常量折叠（地址不具有常量语义）
-                try self.analyzeExpr(r.operand, env, current_fn);
-            },
-            .deref => |d| {
-                // 解引用：递归分析 operand，不做常量折叠
-                try self.analyzeExpr(d.operand, env, current_fn);
-            },
-            .if_expr => |i| {
-                try self.analyzeExpr(i.condition, env, current_fn);
-                try self.analyzeExpr(i.then_branch, env, current_fn);
-                if (i.else_branch) |e| try self.analyzeExpr(e, env, current_fn);
-            },
+
+            // ── 作用域创建 hook：block 创建子作用域 ──
             .block => |b| {
-                // 块创建新的子作用域。
                 var child_env = ConstEnv.init(self.allocator, env);
                 defer child_env.deinit();
                 for (b.statements) |s| {
@@ -184,6 +195,8 @@ pub const FusedAnalysis = struct {
                 }
                 if (b.trailing_expr) |te| try self.analyzeExpr(te, &child_env, current_fn);
             },
+
+            // ── 调用图构建 hook：递归子节点 + 调用图边收集 ──
             .call => |c| {
                 try self.analyzeExpr(c.callee, env, current_fn);
                 for (c.arguments) |arg| try self.analyzeExpr(arg, env, current_fn);
@@ -212,66 +225,27 @@ pub const FusedAnalysis = struct {
                     try self.direct_impure.put(current_fn, {});
                 }
             },
-            // 方法调用、安全方法调用、select、inline_trait_value 均保守视为非纯。
-            .method_call => {
+
+            // ── 保守非纯标记（不递归子节点）──
+            .method_call, .safe_method_call, .select, .inline_trait_value => {
                 try self.direct_impure.put(current_fn, {});
             },
-            .safe_method_call => {
-                try self.direct_impure.put(current_fn, {});
-            },
-            .select => {
-                try self.direct_impure.put(current_fn, {});
-            },
-            .inline_trait_value => {
-                try self.direct_impure.put(current_fn, {});
-            },
-            .field_access => |f| try self.analyzeExpr(f.object, env, current_fn),
-            .safe_access => |f| try self.analyzeExpr(f.object, env, current_fn),
-            .index => |i| {
-                try self.analyzeExpr(i.object, env, current_fn);
-                try self.analyzeExpr(i.index, env, current_fn);
-            },
-            .non_null_assert => |n| try self.analyzeExpr(n.expr, env, current_fn),
-            .propagate => |p| try self.analyzeExpr(p.expr, env, current_fn),
-            .array_literal => |a| {
-                for (a.elements) |e| try self.analyzeExpr(e, env, current_fn);
-            },
-            .record_literal => |r| {
-                for (r.fields) |f| try self.analyzeExpr(f.value, env, current_fn);
-            },
-            .record_extend => |r| {
-                try self.analyzeExpr(r.base, env, current_fn);
-                for (r.updates) |u| try self.analyzeExpr(u.value, env, current_fn);
-            },
+
+            // ── lambda：不递归 body（独立作用域，不传播常量）──
             .lambda => {},
-            .match => |m| {
-                try self.analyzeExpr(m.scrutinee, env, current_fn);
-                for (m.arms) |arm| {
-                    if (arm.guard) |g| try self.analyzeExpr(g, env, current_fn);
-                    try self.analyzeExpr(arm.body, env, current_fn);
-                }
+
+            // ── 默认：walkExprChildren 递归 ──
+            else => {
+                var vctx = FusedVCtx{ .pass = self, .env = env, .current_fn = current_fn };
+                try ast_visitor.walkExprChildren(@ptrCast(&vctx), expr, analyzeExprVCb);
             },
-            .type_cast => |t| try self.analyzeExpr(t.expr, env, current_fn),
-            .atomic_expr => |a| try self.analyzeExpr(a.value, env, current_fn),
-            .lazy => |l| try self.analyzeExpr(l.expr, env, current_fn),
-            .assignment_expr => |a| {
-                try self.analyzeExpr(a.target, env, current_fn);
-                try self.analyzeExpr(a.value, env, current_fn);
-            },
-            .compound_assign => |c| {
-                try self.analyzeExpr(c.target, env, current_fn);
-                try self.analyzeExpr(c.value, env, current_fn);
-            },
-            .string_interpolation => |si| {
-                for (si.parts) |part| {
-                    if (part == .expression) try self.analyzeExpr(part.expression, env, current_fn);
-                }
-            },
-            else => {},
         }
     }
 
     /// 递归分析语句：常量传播、循环大小估算、循环不变量收集。
+    ///
+    /// v3 阶段 11：使用 ast_visitor.walkStmtChildren 消除"仅递归子节点"的重复分支，
+    /// 仅保留 val_decl（常量绑定）、assignment（环境移除）、循环语句（大小估算 + 不变量收集）的特化 hook。
     fn analyzeStmt(
         self: *FusedAnalysis,
         stmt: *const ast.Stmt,
@@ -288,9 +262,6 @@ pub const FusedAnalysis = struct {
                     }
                 }
             },
-            .var_decl => |v| {
-                try self.analyzeExpr(v.value, env, current_fn);
-            },
             .assignment => |a| {
                 try self.analyzeExpr(a.value, env, current_fn);
                 // 赋值后变量不再为常量，从环境中移除。
@@ -298,8 +269,6 @@ pub const FusedAnalysis = struct {
                     _ = env.remove(a.target.identifier.name);
                 }
             },
-            .expression => |e| try self.analyzeExpr(e.expr, env, current_fn),
-            .return_stmt => |r| if (r.value) |v| try self.analyzeExpr(v, env, current_fn),
             .for_stmt => |f| {
                 try self.analyzeExpr(f.iterable, env, current_fn);
                 // 估算循环体大小并记录到循环表。
@@ -359,11 +328,11 @@ pub const FusedAnalysis = struct {
                 );
                 try self.analyzeExpr(l.body, env, current_fn);
             },
-            .defer_stmt => |d| try self.analyzeExpr(d.expr, env, current_fn),
-            .throw_stmt => |t| try self.analyzeExpr(t.expr, env, current_fn),
-            .field_assignment => |f| try self.analyzeExpr(f.value, env, current_fn),
-            .compound_assignment => |c| try self.analyzeExpr(c.value, env, current_fn),
-            .break_stmt, .continue_stmt => {},
+            // ── 默认：walkStmtChildren 递归 ──
+            else => {
+                var vctx = FusedVCtx{ .pass = self, .env = env, .current_fn = current_fn };
+                try ast_visitor.walkStmtChildren(@ptrCast(&vctx), stmt, analyzeExprVCb);
+            },
         }
     }
 

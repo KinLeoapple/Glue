@@ -281,9 +281,9 @@ const WakeCounter = struct {
 
 test "WaiterList FIFO pushBack/popFront" {
     var list = WaiterList{};
-    var f1 = CoroutineFrame.initFixed(1, emptyLayout());
-    var f2 = CoroutineFrame.initFixed(2, emptyLayout());
-    var f3 = CoroutineFrame.initFixed(3, emptyLayout());
+    var f1 = CoroutineFrame.initFixed(1, emptyLayout(), &[_]u16{});
+    var f2 = CoroutineFrame.initFixed(2, emptyLayout(), &[_]u16{});
+    var f3 = CoroutineFrame.initFixed(3, emptyLayout(), &[_]u16{});
 
     try testing.expect(list.isEmpty());
     list.pushBack(&f1);
@@ -299,9 +299,9 @@ test "WaiterList FIFO pushBack/popFront" {
 
 test "WaiterList remove 中间与首尾" {
     var list = WaiterList{};
-    var f1 = CoroutineFrame.initFixed(1, emptyLayout());
-    var f2 = CoroutineFrame.initFixed(2, emptyLayout());
-    var f3 = CoroutineFrame.initFixed(3, emptyLayout());
+    var f1 = CoroutineFrame.initFixed(1, emptyLayout(), &[_]u16{});
+    var f2 = CoroutineFrame.initFixed(2, emptyLayout(), &[_]u16{});
+    var f3 = CoroutineFrame.initFixed(3, emptyLayout(), &[_]u16{});
 
     list.pushBack(&f1);
     list.pushBack(&f2);
@@ -342,8 +342,8 @@ test "SuspendRegistry register/wakeChanRecv 唤醒入就绪队列" {
     var chan: ChannelValue = undefined;
     chan.header = .{ .type_tag = .channel_val };
 
-    var f1 = CoroutineFrame.initFixed(1, emptyLayout());
-    var f2 = CoroutineFrame.initFixed(2, emptyLayout());
+    var f1 = CoroutineFrame.initFixed(1, emptyLayout(), &[_]u16{});
+    var f2 = CoroutineFrame.initFixed(2, emptyLayout(), &[_]u16{});
     f1.setStatus(.suspended);
     f2.setStatus(.suspended);
 
@@ -379,8 +379,8 @@ test "SuspendRegistry remove 从挂起队列摘除" {
     var chan: ChannelValue = undefined;
     chan.header = .{ .type_tag = .channel_val };
 
-    var f1 = CoroutineFrame.initFixed(1, emptyLayout());
-    var f2 = CoroutineFrame.initFixed(2, emptyLayout());
+    var f1 = CoroutineFrame.initFixed(1, emptyLayout(), &[_]u16{});
+    var f2 = CoroutineFrame.initFixed(2, emptyLayout(), &[_]u16{});
     registry.registerChanRecv(&chan, &f1);
     registry.registerChanRecv(&chan, &f2);
 

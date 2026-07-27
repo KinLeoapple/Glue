@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const ast_visitor = @import("ast_visitor");
 
 /// CSE 结果表。redundant_map 将冗余表达式映射到其规范（首次出现）表达式，
 /// canonical_set 记录所有作为规范的表达式。
@@ -49,9 +50,13 @@ const SeenEntry = struct {
 };
 
 /// CSE 分析遍。逐函数遍历 AST，在函数体内识别结构相同的冗余表达式。
+/// v3 阶段 11：使用 ast_visitor.walkExprChildren/walkStmtChildren 消除手写递归分支，
+/// 仅保留作用域隔离（if_expr/match/loops）和失效逻辑（assignment）的特化 hook。
 pub const CsePass = struct {
     table: *CseTable,
     allocator: std.mem.Allocator,
+    /// 当前已见表达式列表指针（visitor 回调通过此字段访问 seen）
+    current_seen: *std.ArrayListUnmanaged(SeenEntry) = undefined,
 
     pub fn init(allocator: std.mem.Allocator, table: *CseTable) CsePass {
         return .{
@@ -70,191 +75,173 @@ pub const CsePass = struct {
     fn analyzeFunction(self: *CsePass, body: *const ast.Expr) !void {
         var seen = std.ArrayListUnmanaged(SeenEntry).empty;
         defer seen.deinit(self.allocator);
-        try self.processExpr(body, &seen);
+        self.current_seen = &seen;
+        try self.processExprV(body);
     }
 
-    fn processExpr(self: *CsePass, expr: *const ast.Expr, seen: *std.ArrayListUnmanaged(SeenEntry)) anyerror!void {
+    /// processExpr 的 visitor 实现：特化 hook + 默认 walkExprChildren 递归。
+    fn processExprV(self: *CsePass, expr: *const ast.Expr) anyerror!void {
         switch (expr.*) {
             .binary => |b| {
-                try self.processExpr(b.left, seen);
-                try self.processExpr(b.right, seen);
+                try self.processExprV(b.left);
+                try self.processExprV(b.right);
                 if (isCseEligibleBinary(expr)) {
                     // 与已见表达式逐一比较；若结构相同则标记为冗余。
-                    for (seen.items) |entry| {
+                    for (self.current_seen.items) |entry| {
                         if (exprEqual(entry.expr, expr)) {
                             try self.table.redundant_map.put(expr, entry.expr);
                             try self.table.canonical_set.put(entry.expr, {});
                             return;
                         }
                     }
-                    try seen.append(self.allocator, .{ .expr = expr });
+                    try self.current_seen.append(self.allocator, .{ .expr = expr });
                 }
             },
-            .unary => |u| try self.processExpr(u.operand, seen),
-            .ref_of => |r| try self.processExpr(r.operand, seen),
-            .deref => |d| try self.processExpr(d.operand, seen),
             .if_expr => |i| {
                 // then / else 分支各自独立作用域，处理后清空已见集合。
-                try self.processExpr(i.condition, seen);
+                try self.processExprV(i.condition);
                 var then_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                 defer then_seen.deinit(self.allocator);
-                try self.processExpr(i.then_branch, &then_seen);
+                const saved = self.current_seen;
+                self.current_seen = &then_seen;
+                try self.processExprV(i.then_branch);
                 if (i.else_branch) |e| {
                     var else_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                     defer else_seen.deinit(self.allocator);
-                    try self.processExpr(e, &else_seen);
+                    self.current_seen = &else_seen;
+                    try self.processExprV(e);
                 }
-                seen.clearRetainingCapacity();
+                self.current_seen = saved;
+                self.current_seen.clearRetainingCapacity();
             },
             .block => |b| {
                 for (b.statements) |stmt| {
-                    try self.processStmt(stmt, seen);
+                    try self.processStmtV(stmt);
                     // 循环语句可能改变变量值，清空已见集合以保证安全。
                     switch (stmt.*) {
                         .while_stmt, .for_stmt, .loop_stmt => {
-                            seen.clearRetainingCapacity();
+                            self.current_seen.clearRetainingCapacity();
                         },
                         else => {},
                     }
                 }
-                if (b.trailing_expr) |te| try self.processExpr(te, seen);
-            },
-            .call => |c| {
-                try self.processExpr(c.callee, seen);
-                for (c.arguments) |a| try self.processExpr(a, seen);
-            },
-            .method_call => |mc| {
-                try self.processExpr(mc.object, seen);
-                for (mc.arguments) |a| try self.processExpr(a, seen);
-            },
-            .safe_method_call => |mc| {
-                try self.processExpr(mc.object, seen);
-                for (mc.arguments) |a| try self.processExpr(a, seen);
+                if (b.trailing_expr) |te| try self.processExprV(te);
             },
             .match => |m| {
                 // 每个 arm 独立作用域。
-                try self.processExpr(m.scrutinee, seen);
+                try self.processExprV(m.scrutinee);
+                const saved = self.current_seen;
                 for (m.arms) |arm| {
                     var arm_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                     defer arm_seen.deinit(self.allocator);
-                    if (arm.guard) |g| try self.processExpr(g, &arm_seen);
-                    try self.processExpr(arm.body, &arm_seen);
+                    self.current_seen = &arm_seen;
+                    if (arm.guard) |g| try self.processExprV(g);
+                    try self.processExprV(arm.body);
                 }
-                seen.clearRetainingCapacity();
-            },
-            .type_cast => |tc| try self.processExpr(tc.expr, seen),
-            .atomic_expr => |ae| try self.processExpr(ae.value, seen),
-            .lazy => |l| try self.processExpr(l.expr, seen),
-            .field_access => |f| try self.processExpr(f.object, seen),
-            .safe_access => |f| try self.processExpr(f.object, seen),
-            .index => |i| {
-                try self.processExpr(i.object, seen);
-                try self.processExpr(i.index, seen);
-            },
-            .non_null_assert => |n| try self.processExpr(n.expr, seen),
-            .propagate => |p| try self.processExpr(p.expr, seen),
-            .array_literal => |a| {
-                for (a.elements) |e| try self.processExpr(e, seen);
-            },
-            .record_literal => |r| {
-                for (r.fields) |f| try self.processExpr(f.value, seen);
-            },
-            .record_extend => |r| {
-                try self.processExpr(r.base, seen);
-                for (r.updates) |u| try self.processExpr(u.value, seen);
-            },
-            .string_interpolation => |si| {
-                for (si.parts) |part| {
-                    if (part == .expression) try self.processExpr(part.expression, seen);
-                }
+                self.current_seen = saved;
+                self.current_seen.clearRetainingCapacity();
             },
             .assignment_expr => |a| {
-                try self.processExpr(a.value, seen);
+                try self.processExprV(a.value);
                 // 对标识符赋值时仅需失效读取该变量的已见表达式；
                 // 对复杂目标赋值则保守清空全部已见集合。
                 if (a.target.* == .identifier) {
-                    self.invalidate(a.target.identifier.name, seen);
+                    self.invalidate(a.target.identifier.name);
                 } else {
-                    try self.processExpr(a.target, seen);
-                    seen.clearRetainingCapacity();
+                    try self.processExprV(a.target);
+                    self.current_seen.clearRetainingCapacity();
                 }
             },
             .compound_assign => |c| {
-                try self.processExpr(c.value, seen);
+                try self.processExprV(c.value);
                 if (c.target.* == .identifier) {
-                    self.invalidate(c.target.identifier.name, seen);
+                    self.invalidate(c.target.identifier.name);
                 } else {
-                    seen.clearRetainingCapacity();
+                    self.current_seen.clearRetainingCapacity();
                 }
             },
-            .lambda => {},
-            .select => {},
-            .inline_trait_value => {},
-            else => {},
+            // lambda/select/inline_trait_value 不递归（作用域隔离或无 CSE 候选）
+            .lambda, .select, .inline_trait_value => {},
+            // 默认：walkExprChildren 递归
+            else => {
+                try ast_visitor.walkExprChildren(@ptrCast(self), expr, processExprCb);
+            },
         }
     }
 
-    fn processStmt(self: *CsePass, stmt: *const ast.Stmt, seen: *std.ArrayListUnmanaged(SeenEntry)) anyerror!void {
+    /// walkExprChildren 回调适配器
+    fn processExprCb(ctx: *anyopaque, expr: *const ast.Expr) anyerror!void {
+        const self: *CsePass = @ptrCast(@alignCast(ctx));
+        try self.processExprV(expr);
+    }
+
+    /// processStmt 的 visitor 实现：特化 hook + 默认 walkStmtChildren 递归。
+    fn processStmtV(self: *CsePass, stmt: *const ast.Stmt) anyerror!void {
         switch (stmt.*) {
-            .val_decl => |v| try self.processExpr(v.value, seen),
-            .var_decl => |v| try self.processExpr(v.value, seen),
             .assignment => |a| {
-                try self.processExpr(a.value, seen);
+                try self.processExprV(a.value);
                 if (a.target.* == .identifier) {
-                    self.invalidate(a.target.identifier.name, seen);
+                    self.invalidate(a.target.identifier.name);
                 } else {
-                    seen.clearRetainingCapacity();
+                    self.current_seen.clearRetainingCapacity();
                 }
             },
             .field_assignment => |f| {
-                try self.processExpr(f.object, seen);
-                try self.processExpr(f.value, seen);
-                seen.clearRetainingCapacity();
+                try self.processExprV(f.object);
+                try self.processExprV(f.value);
+                self.current_seen.clearRetainingCapacity();
             },
             .compound_assignment => |c| {
-                try self.processExpr(c.value, seen);
+                try self.processExprV(c.value);
                 if (c.target.* == .identifier) {
-                    self.invalidate(c.target.identifier.name, seen);
+                    self.invalidate(c.target.identifier.name);
                 } else {
-                    seen.clearRetainingCapacity();
+                    self.current_seen.clearRetainingCapacity();
                 }
             },
-            .expression => |e| try self.processExpr(e.expr, seen),
-            .return_stmt => |r| if (r.value) |v| try self.processExpr(v, seen),
             .while_stmt => |w| {
                 // 循环体独立作用域，处理完条件后用独立的 seen 集合分析循环体。
-                try self.processExpr(w.condition, seen);
+                try self.processExprV(w.condition);
                 var body_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                 defer body_seen.deinit(self.allocator);
-                try self.processExpr(w.body, &body_seen);
-                seen.clearRetainingCapacity();
+                const saved = self.current_seen;
+                self.current_seen = &body_seen;
+                try self.processExprV(w.body);
+                self.current_seen = saved;
+                self.current_seen.clearRetainingCapacity();
             },
             .for_stmt => |f| {
-                try self.processExpr(f.iterable, seen);
+                try self.processExprV(f.iterable);
                 var body_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                 defer body_seen.deinit(self.allocator);
-                try self.processExpr(f.body, &body_seen);
-                seen.clearRetainingCapacity();
+                const saved = self.current_seen;
+                self.current_seen = &body_seen;
+                try self.processExprV(f.body);
+                self.current_seen = saved;
+                self.current_seen.clearRetainingCapacity();
             },
             .loop_stmt => |l| {
                 var body_seen = std.ArrayListUnmanaged(SeenEntry).empty;
                 defer body_seen.deinit(self.allocator);
-                try self.processExpr(l.body, &body_seen);
-                seen.clearRetainingCapacity();
+                const saved = self.current_seen;
+                self.current_seen = &body_seen;
+                try self.processExprV(l.body);
+                self.current_seen = saved;
+                self.current_seen.clearRetainingCapacity();
             },
-            .defer_stmt => |d| try self.processExpr(d.expr, seen),
-            .throw_stmt => |t| try self.processExpr(t.expr, seen),
-            .break_stmt, .continue_stmt => {},
+            // 默认：walkStmtChildren 递归（val_decl/var_decl/expression/return_stmt/defer_stmt/throw_stmt/break/continue）
+            else => {
+                try ast_visitor.walkStmtChildren(@ptrCast(self), stmt, processExprCb);
+            },
         }
     }
 
     /// 失效所有读取指定变量的已见表达式，因为该变量已被重新赋值。
-    fn invalidate(self: *CsePass, name: []const u8, seen: *std.ArrayListUnmanaged(SeenEntry)) void {
-        _ = self;
+    fn invalidate(self: *CsePass, name: []const u8) void {
         var i: usize = 0;
-        while (i < seen.items.len) {
-            if (exprReadsVar(seen.items[i].expr, name)) {
-                _ = seen.swapRemove(i);
+        while (i < self.current_seen.items.len) {
+            if (exprReadsVar(self.current_seen.items[i].expr, name)) {
+                _ = self.current_seen.swapRemove(i);
             } else {
                 i += 1;
             }

@@ -247,6 +247,8 @@ pub const OrbitMeta = struct {
     /// 从 Function.param_channels 的 ChannelMeta.is_ref 提取。
     /// 最多支持 8 个参数（与 CallMeta.arg_ref_bits 对齐）。
     arg_ref_bits: u8 = 0,
+    /// 泛型类型实参（与 CallMeta.type_args 一致，支持 async 泛型函数）
+    type_args: []const u16 = &[_]u16{},
 };
 
 /// 循环元数据：描述标量循环（含 break/continue 的 for/while/loop）

@@ -103,7 +103,7 @@ test "cancelFrame 标记 Cancelled 并入队" {
         testing.allocator.free(storage);
     }
 
-    const frame = try pool.alloc(0, emptyLayout());
+    const frame = try pool.alloc(0, emptyLayout(), &[_]u16{});
     frame.setStatus(.suspended);
     // 模拟挂起在 channel 上
     var chan: ChannelValue = undefined;
@@ -126,7 +126,7 @@ test "cancelFrame 标记 Cancelled 并入队" {
 }
 
 test "runCancelPath 清空挂起目标" {
-    var frame = CoroutineFrame.initFixed(0, emptyLayout());
+    var frame = CoroutineFrame.initFixed(0, emptyLayout(), &[_]u16{});
     frame.suspend_target = .{ .chan_recv = @ptrFromInt(0xdead) };
     frame.defer_depth = 3;
 

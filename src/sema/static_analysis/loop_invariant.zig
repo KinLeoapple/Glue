@@ -4,9 +4,13 @@
 //! 被赋值变量和外提候选表达式的辅助函数。循环不变量是指循环体内不依赖循环变量、
 //! 每次迭代计算结果相同的表达式，可以安全地外提到循环外部以减少重复计算。
 //! 这些数据由 fused_analysis 在遍历循环时收集。
+//!
+//! v3 阶段 11：使用 ast_visitor.walkExprChildren/walkStmtChildren 消除手写递归分支，
+//! 仅保留特化 hook（赋值目标记录、循环变量记录、二元表达式外提判定、作用域隔离）。
 
 const std = @import("std");
 const ast = @import("ast");
+const ast_visitor = @import("ast_visitor");
 
 /// 循环信息：是否为小循环（可考虑展开）及估算大小。
 pub const LoopInfo = struct {
@@ -80,126 +84,93 @@ pub fn collectAssignedVars(
     body: *const ast.Expr,
     out: *std.ArrayListUnmanaged([]const u8),
 ) anyerror!void {
-    return collectAssignedVarsExpr(allocator, body, out);
+    var ctx = AssignedVarsCtx{ .allocator = allocator, .out = out };
+    try collectAssignedVarsExprImpl(&ctx, body);
 }
 
-/// 递归收集表达式中被赋值的变量名。
-fn collectAssignedVarsExpr(
+/// collectAssignedVars 的上下文：绑定 allocator 与输出列表。
+const AssignedVarsCtx = struct {
     allocator: std.mem.Allocator,
-    expr: *const ast.Expr,
     out: *std.ArrayListUnmanaged([]const u8),
-) anyerror!void {
+};
+
+/// collectAssignedVarsExpr 的实现：特化 hook + 默认 walkExprChildren 递归。
+/// v3 阶段 11：消除手写递归分支，仅保留赋值目标记录、block 委托、作用域隔离的 hook。
+fn collectAssignedVarsExprImpl(ctx: *AssignedVarsCtx, expr: *const ast.Expr) anyerror!void {
     switch (expr.*) {
-        .block => |b| {
-            for (b.statements) |s| try collectAssignedVarsStmt(allocator, s, out);
-            if (b.trailing_expr) |te| try collectAssignedVarsExpr(allocator, te, out);
-        },
-        .if_expr => |i| {
-            try collectAssignedVarsExpr(allocator, i.condition, out);
-            try collectAssignedVarsExpr(allocator, i.then_branch, out);
-            if (i.else_branch) |e| try collectAssignedVarsExpr(allocator, e, out);
-        },
-        .binary => |bn| {
-            try collectAssignedVarsExpr(allocator, bn.left, out);
-            try collectAssignedVarsExpr(allocator, bn.right, out);
-        },
-        .unary => |u| try collectAssignedVarsExpr(allocator, u.operand, out),
-        .ref_of => |r| try collectAssignedVarsExpr(allocator, r.operand, out),
-        .deref => |d| try collectAssignedVarsExpr(allocator, d.operand, out),
-        .call => |c| {
-            try collectAssignedVarsExpr(allocator, c.callee, out);
-            for (c.arguments) |a| try collectAssignedVarsExpr(allocator, a, out);
-        },
-        .match => |m| {
-            try collectAssignedVarsExpr(allocator, m.scrutinee, out);
-            for (m.arms) |arm| {
-                if (arm.guard) |g| try collectAssignedVarsExpr(allocator, g, out);
-                try collectAssignedVarsExpr(allocator, arm.body, out);
-            }
-        },
-        .lambda => {},
-        .type_cast => |tc| try collectAssignedVarsExpr(allocator, tc.expr, out),
-        .atomic_expr => |ae| try collectAssignedVarsExpr(allocator, ae.value, out),
-        .field_access => |f| try collectAssignedVarsExpr(allocator, f.object, out),
-        .safe_access => |f| try collectAssignedVarsExpr(allocator, f.object, out),
-        .index => |i| {
-            try collectAssignedVarsExpr(allocator, i.object, out);
-            try collectAssignedVarsExpr(allocator, i.index, out);
-        },
-        .non_null_assert => |n| try collectAssignedVarsExpr(allocator, n.expr, out),
-        .propagate => |p| try collectAssignedVarsExpr(allocator, p.expr, out),
-        .array_literal => |a| for (a.elements) |e| try collectAssignedVarsExpr(allocator, e, out),
-        .record_literal => |r| for (r.fields) |f| try collectAssignedVarsExpr(allocator, f.value, out),
-        .record_extend => |r| {
-            try collectAssignedVarsExpr(allocator, r.base, out);
-            for (r.updates) |u| try collectAssignedVarsExpr(allocator, u.value, out);
-        },
-        .string_interpolation => |si| {
-            for (si.parts) |part| {
-                if (part == .expression) try collectAssignedVarsExpr(allocator, part.expression, out);
-            }
-        },
-        // 赋值表达式中，若目标为标识符则记录该变量名。
+        // hook：assignment_expr → 记录标识符目标，递归 value
         .assignment_expr => |a| {
             if (a.target.* == .identifier) {
-                try addStringIfNotPresent(allocator, out, a.target.identifier.name);
+                try addStringIfNotPresent(ctx.allocator, ctx.out, a.target.identifier.name);
             }
-            try collectAssignedVarsExpr(allocator, a.value, out);
+            try collectAssignedVarsExprImpl(ctx, a.value);
         },
+        // hook：compound_assign → 记录标识符目标，递归 value
         .compound_assign => |c| {
             if (c.target.* == .identifier) {
-                try addStringIfNotPresent(allocator, out, c.target.identifier.name);
+                try addStringIfNotPresent(ctx.allocator, ctx.out, c.target.identifier.name);
             }
-            try collectAssignedVarsExpr(allocator, c.value, out);
+            try collectAssignedVarsExprImpl(ctx, c.value);
         },
-        else => {},
+        // hook：block → 委托 collectAssignedVarsStmtImpl 处理语句级 hook
+        .block => |b| {
+            for (b.statements) |s| try collectAssignedVarsStmtImpl(ctx, s);
+            if (b.trailing_expr) |te| try collectAssignedVarsExprImpl(ctx, te);
+        },
+        // 作用域隔离：不递归（lambda/select/inline_trait_value/spawn/lazy 内的赋值不影响外层）
+        .lambda, .select, .inline_trait_value, .spawn_expr, .lazy => {},
+        // 默认：walkExprChildren 递归
+        else => {
+            try ast_visitor.walkExprChildren(@ptrCast(ctx), expr, collectAssignedVarsExprCb);
+        },
     }
 }
 
-/// 递归收集语句中被赋值的变量名。
-fn collectAssignedVarsStmt(
-    allocator: std.mem.Allocator,
-    stmt: *const ast.Stmt,
-    out: *std.ArrayListUnmanaged([]const u8),
-) anyerror!void {
+/// walkExprChildren 回调适配器
+fn collectAssignedVarsExprCb(ctx: *anyopaque, expr: *const ast.Expr) anyerror!void {
+    const c: *AssignedVarsCtx = @ptrCast(@alignCast(ctx));
+    try collectAssignedVarsExprImpl(c, expr);
+}
+
+/// collectAssignedVarsStmt 的实现：特化 hook + 默认 walkStmtChildren 递归。
+/// v3 阶段 11：消除手写递归分支，仅保留声明名记录、赋值目标记录、循环变量记录的 hook。
+fn collectAssignedVarsStmtImpl(ctx: *AssignedVarsCtx, stmt: *const ast.Stmt) anyerror!void {
     switch (stmt.*) {
+        // hook：val_decl/var_decl → 记录名，递归 value
         .val_decl => |v| {
-            try addStringIfNotPresent(allocator, out, v.name);
-            try collectAssignedVarsExpr(allocator, v.value, out);
+            try addStringIfNotPresent(ctx.allocator, ctx.out, v.name);
+            try collectAssignedVarsExprImpl(ctx, v.value);
         },
         .var_decl => |v| {
-            try addStringIfNotPresent(allocator, out, v.name);
-            try collectAssignedVarsExpr(allocator, v.value, out);
+            try addStringIfNotPresent(ctx.allocator, ctx.out, v.name);
+            try collectAssignedVarsExprImpl(ctx, v.value);
         },
+        // hook：assignment → 记录标识符目标，递归 value
         .assignment => |a| {
             if (a.target.* == .identifier) {
-                try addStringIfNotPresent(allocator, out, a.target.identifier.name);
+                try addStringIfNotPresent(ctx.allocator, ctx.out, a.target.identifier.name);
             }
-            try collectAssignedVarsExpr(allocator, a.value, out);
+            try collectAssignedVarsExprImpl(ctx, a.value);
         },
-        .field_assignment => |f| try collectAssignedVarsExpr(allocator, f.value, out),
+        // hook：field_assignment → 仅递归 value（object 被读不被赋值）
+        .field_assignment => |f| try collectAssignedVarsExprImpl(ctx, f.value),
+        // hook：compound_assignment → 记录标识符目标，递归 value
         .compound_assignment => |c| {
             if (c.target.* == .identifier) {
-                try addStringIfNotPresent(allocator, out, c.target.identifier.name);
+                try addStringIfNotPresent(ctx.allocator, ctx.out, c.target.identifier.name);
             }
-            try collectAssignedVarsExpr(allocator, c.value, out);
+            try collectAssignedVarsExprImpl(ctx, c.value);
         },
-        .expression => |e| try collectAssignedVarsExpr(allocator, e.expr, out),
-        .return_stmt => |r| if (r.value) |v| try collectAssignedVarsExpr(allocator, v, out),
+        // hook：for_stmt → 记录循环变量，递归 iterable + body
         .for_stmt => |f| {
-            // for 循环变量在每次迭代中被重新赋值。
-            try addStringIfNotPresent(allocator, out, f.name);
-            try collectAssignedVarsExpr(allocator, f.iterable, out);
-            try collectAssignedVarsExpr(allocator, f.body, out);
+            try addStringIfNotPresent(ctx.allocator, ctx.out, f.name);
+            try collectAssignedVarsExprImpl(ctx, f.iterable);
+            try collectAssignedVarsExprImpl(ctx, f.body);
         },
-        .while_stmt => |w| {
-            try collectAssignedVarsExpr(allocator, w.condition, out);
-            try collectAssignedVarsExpr(allocator, w.body, out);
+        // 默认：walkStmtChildren 递归（while_stmt/loop_stmt/expression/return_stmt/defer_stmt/throw_stmt/break/continue）
+        else => {
+            try ast_visitor.walkStmtChildren(@ptrCast(ctx), stmt, collectAssignedVarsExprCb);
         },
-        .loop_stmt => |l| try collectAssignedVarsExpr(allocator, l.body, out),
-        .defer_stmt => |d| try collectAssignedVarsExpr(allocator, d.expr, out),
-        .throw_stmt => |t| try collectAssignedVarsExpr(allocator, t.expr, out),
-        .break_stmt, .continue_stmt => {},
     }
 }
 
@@ -224,99 +195,72 @@ pub fn collectHoistsInExpr(
     owner_loop: *const ast.Stmt,
     assigned_vars: []const []const u8,
 ) anyerror!void {
+    _ = allocator; // 公共 API 保留参数，visitor 实现内部不需要
+    var ctx = HoistCtx{
+        .hoist_table = hoist_table,
+        .owner_loop = owner_loop,
+        .assigned_vars = assigned_vars,
+    };
+    try collectHoistsInExprImpl(&ctx, expr);
+}
+
+/// collectHoistsInExpr 的上下文：绑定 hoist_table、owner_loop、assigned_vars。
+const HoistCtx = struct {
+    hoist_table: *HoistTable,
+    owner_loop: *const ast.Stmt,
+    assigned_vars: []const []const u8,
+};
+
+/// collectHoistsInExpr 的实现：特化 hook + 默认 walkExprChildren 递归。
+/// v3 阶段 11：消除手写递归分支，仅保留二元表达式外提判定、赋值目标跳过、block 委托、作用域隔离的 hook。
+fn collectHoistsInExprImpl(ctx: *HoistCtx, expr: *const ast.Expr) anyerror!void {
     switch (expr.*) {
+        // hook：binary → 若可外提则记录并停止递归；否则递归子节点
         .binary => |b| {
-            // 若二元表达式整体可外提，则记录并停止递归。
-            if (isHoistableBinary(b, assigned_vars)) {
-                try hoist_table.put(expr, owner_loop);
+            if (isHoistableBinary(b, ctx.assigned_vars)) {
+                try ctx.hoist_table.put(expr, ctx.owner_loop);
                 return;
             }
-            try collectHoistsInExpr(allocator, hoist_table, b.left, owner_loop, assigned_vars);
-            try collectHoistsInExpr(allocator, hoist_table, b.right, owner_loop, assigned_vars);
+            try ast_visitor.walkExprChildren(@ptrCast(ctx), expr, collectHoistsInExprCb);
         },
-        .unary => |u| try collectHoistsInExpr(allocator, hoist_table, u.operand, owner_loop, assigned_vars),
-        .ref_of => |r| try collectHoistsInExpr(allocator, hoist_table, r.operand, owner_loop, assigned_vars),
-        .deref => |d| try collectHoistsInExpr(allocator, hoist_table, d.operand, owner_loop, assigned_vars),
-        .if_expr => |i| {
-            try collectHoistsInExpr(allocator, hoist_table, i.condition, owner_loop, assigned_vars);
-            try collectHoistsInExpr(allocator, hoist_table, i.then_branch, owner_loop, assigned_vars);
-            if (i.else_branch) |e| try collectHoistsInExpr(allocator, hoist_table, e, owner_loop, assigned_vars);
-        },
+        // hook：assignment_expr → 仅递归 value（目标跳过）
+        .assignment_expr => |a| try collectHoistsInExprImpl(ctx, a.value),
+        // hook：compound_assign → 仅递归 value（目标跳过）
+        .compound_assign => |c| try collectHoistsInExprImpl(ctx, c.value),
+        // hook：block → 委托 collectHoistsInStmtImpl 处理语句级 hook
         .block => |b| {
-            for (b.statements) |s| try collectHoistsInStmt(allocator, hoist_table, s, owner_loop, assigned_vars);
-            if (b.trailing_expr) |te| try collectHoistsInExpr(allocator, hoist_table, te, owner_loop, assigned_vars);
+            for (b.statements) |s| try collectHoistsInStmtImpl(ctx, s);
+            if (b.trailing_expr) |te| try collectHoistsInExprImpl(ctx, te);
         },
-        .call => |c| {
-            try collectHoistsInExpr(allocator, hoist_table, c.callee, owner_loop, assigned_vars);
-            for (c.arguments) |a| try collectHoistsInExpr(allocator, hoist_table, a, owner_loop, assigned_vars);
+        // 作用域隔离：不递归（lambda/select/inline_trait_value/spawn/lazy 内的表达式不可外提到外层循环）
+        .lambda, .select, .inline_trait_value, .spawn_expr, .lazy => {},
+        // 默认：walkExprChildren 递归
+        else => {
+            try ast_visitor.walkExprChildren(@ptrCast(ctx), expr, collectHoistsInExprCb);
         },
-        .match => |m| {
-            try collectHoistsInExpr(allocator, hoist_table, m.scrutinee, owner_loop, assigned_vars);
-            for (m.arms) |arm| {
-                if (arm.guard) |g| try collectHoistsInExpr(allocator, hoist_table, g, owner_loop, assigned_vars);
-                try collectHoistsInExpr(allocator, hoist_table, arm.body, owner_loop, assigned_vars);
-            }
-        },
-        .type_cast => |tc| try collectHoistsInExpr(allocator, hoist_table, tc.expr, owner_loop, assigned_vars),
-        .atomic_expr => |ae| try collectHoistsInExpr(allocator, hoist_table, ae.value, owner_loop, assigned_vars),
-        .field_access => |f| try collectHoistsInExpr(allocator, hoist_table, f.object, owner_loop, assigned_vars),
-        .safe_access => |f| try collectHoistsInExpr(allocator, hoist_table, f.object, owner_loop, assigned_vars),
-        .index => |i| {
-            try collectHoistsInExpr(allocator, hoist_table, i.object, owner_loop, assigned_vars);
-            try collectHoistsInExpr(allocator, hoist_table, i.index, owner_loop, assigned_vars);
-        },
-        .array_literal => |a| for (a.elements) |e| try collectHoistsInExpr(allocator, hoist_table, e, owner_loop, assigned_vars),
-        .record_literal => |r| for (r.fields) |f| try collectHoistsInExpr(allocator, hoist_table, f.value, owner_loop, assigned_vars),
-        .record_extend => |r| {
-            try collectHoistsInExpr(allocator, hoist_table, r.base, owner_loop, assigned_vars);
-            for (r.updates) |u| try collectHoistsInExpr(allocator, hoist_table, u.value, owner_loop, assigned_vars);
-        },
-        .string_interpolation => |si| {
-            for (si.parts) |part| {
-                if (part == .expression) try collectHoistsInExpr(allocator, hoist_table, part.expression, owner_loop, assigned_vars);
-            }
-        },
-        // 赋值表达式中仅值部分可能包含可外提子表达式，目标部分跳过。
-        .assignment_expr => |a| {
-            try collectHoistsInExpr(allocator, hoist_table, a.value, owner_loop, assigned_vars);
-        },
-        .compound_assign => |c| {
-            try collectHoistsInExpr(allocator, hoist_table, c.value, owner_loop, assigned_vars);
-        },
-        else => {},
     }
 }
 
-/// 递归收集语句中可外提的表达式。
-fn collectHoistsInStmt(
-    allocator: std.mem.Allocator,
-    hoist_table: *HoistTable,
-    stmt: *const ast.Stmt,
-    owner_loop: *const ast.Stmt,
-    assigned_vars: []const []const u8,
-) anyerror!void {
+/// walkExprChildren 回调适配器
+fn collectHoistsInExprCb(ctx: *anyopaque, expr: *const ast.Expr) anyerror!void {
+    const c: *HoistCtx = @ptrCast(@alignCast(ctx));
+    try collectHoistsInExprImpl(c, expr);
+}
+
+/// collectHoistsInStmt 的实现：特化 hook + 默认 walkStmtChildren 递归。
+/// v3 阶段 11：消除手写递归分支，仅保留赋值/字段赋值/复合赋值目标跳过的 hook。
+fn collectHoistsInStmtImpl(ctx: *HoistCtx, stmt: *const ast.Stmt) anyerror!void {
     switch (stmt.*) {
-        .val_decl => |v| try collectHoistsInExpr(allocator, hoist_table, v.value, owner_loop, assigned_vars),
-        .var_decl => |v| try collectHoistsInExpr(allocator, hoist_table, v.value, owner_loop, assigned_vars),
-        .assignment => |a| {
-            try collectHoistsInExpr(allocator, hoist_table, a.value, owner_loop, assigned_vars);
+        // hook：assignment → 仅递归 value（目标跳过）
+        .assignment => |a| try collectHoistsInExprImpl(ctx, a.value),
+        // hook：field_assignment → 仅递归 value（object 跳过）
+        .field_assignment => |f| try collectHoistsInExprImpl(ctx, f.value),
+        // hook：compound_assignment → 仅递归 value（目标跳过）
+        .compound_assignment => |c| try collectHoistsInExprImpl(ctx, c.value),
+        // 默认：walkStmtChildren 递归（val_decl/var_decl/expression/return_stmt/defer_stmt/throw_stmt/for_stmt/while_stmt/loop_stmt/break/continue）
+        else => {
+            try ast_visitor.walkStmtChildren(@ptrCast(ctx), stmt, collectHoistsInExprCb);
         },
-        .field_assignment => |f| try collectHoistsInExpr(allocator, hoist_table, f.value, owner_loop, assigned_vars),
-        .compound_assignment => |c| try collectHoistsInExpr(allocator, hoist_table, c.value, owner_loop, assigned_vars),
-        .expression => |e| try collectHoistsInExpr(allocator, hoist_table, e.expr, owner_loop, assigned_vars),
-        .return_stmt => |r| if (r.value) |v| try collectHoistsInExpr(allocator, hoist_table, v, owner_loop, assigned_vars),
-        .for_stmt => |f| {
-            try collectHoistsInExpr(allocator, hoist_table, f.iterable, owner_loop, assigned_vars);
-            try collectHoistsInExpr(allocator, hoist_table, f.body, owner_loop, assigned_vars);
-        },
-        .while_stmt => |w| {
-            try collectHoistsInExpr(allocator, hoist_table, w.condition, owner_loop, assigned_vars);
-            try collectHoistsInExpr(allocator, hoist_table, w.body, owner_loop, assigned_vars);
-        },
-        .loop_stmt => |l| try collectHoistsInExpr(allocator, hoist_table, l.body, owner_loop, assigned_vars),
-        .defer_stmt => |d| try collectHoistsInExpr(allocator, hoist_table, d.expr, owner_loop, assigned_vars),
-        .throw_stmt => |t| try collectHoistsInExpr(allocator, hoist_table, t.expr, owner_loop, assigned_vars),
-        .break_stmt, .continue_stmt => {},
     }
 }
 

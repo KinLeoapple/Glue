@@ -1,7 +1,7 @@
 //! 线程上下文模块。
 //!
 //! 每线程一个的统一内存管理入口，热路径零同步：
-//! - ChannelRegion（双 Region）：global_region 程序级 + call_region 函数级（bump + resetTo）
+//! - ChannelRegion（双 Region）：global_region 程序级 + scalar_area 函数级标量区（bump + resetTo，与协程帧 locals 区结构同构）
 //! - ObjectPools：ObjHeader 对象，精确尺寸页池
 //! - ShadowArena：临时作用域，bump + reset
 //!
@@ -41,7 +41,7 @@ pub const ThreadContext = struct {
     pools: [MAX_POOLS]PoolSlot = [_]PoolSlot{.{}} ** MAX_POOLS,
     pool_count: u8 = 0,
     channels: ChannelRegion,
-    call_region: ChannelRegion,
+    scalar_area: ChannelRegion,
     arena: ShadowArena,
     global: *GlobalPool,
     backing: std.mem.Allocator,
@@ -65,7 +65,7 @@ pub const ThreadContext = struct {
     pub fn init(global: *GlobalPool, backing: std.mem.Allocator, global_prof: ?*profiling.GlobalProfiler) !ThreadContext {
         var ctx = ThreadContext{
             .channels = ChannelRegion.init(backing),
-            .call_region = ChannelRegion.init(backing),
+            .scalar_area = ChannelRegion.init(backing),
             .arena = ShadowArena.init(backing),
             .global = global,
             .backing = backing,
@@ -96,7 +96,7 @@ pub const ThreadContext = struct {
         }
         self.pool_count = 0;
         self.channels.deinit();
-        self.call_region.deinit();
+        self.scalar_area.deinit();
         self.arena.deinit();
         // ThreadProfiler 生命周期由 GlobalProfiler 管理（dump/deinit 时统一清理）
         // 这里只断开引用，不注销也不销毁
@@ -238,7 +238,7 @@ pub const ThreadContext = struct {
     /// 分配通道数据
     pub fn allocChannel(self: *ThreadContext, size: usize) ![]u8 {
         const result = try self.channels.alloc(size);
-        if (self.prof) |p| p.recordAllocatorWatermark(.channel, self.channels.used + self.call_region.used, true);
+        if (self.prof) |p| p.recordAllocatorWatermark(.channel, self.channels.used + self.scalar_area.used, true);
         return result;
     }
 

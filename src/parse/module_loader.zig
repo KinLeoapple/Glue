@@ -10,8 +10,8 @@ const lexer_mod = @import("lexer");
 const parser_mod = @import("parser");
 const type_check = @import("sema");
 const analysis_db_mod = @import("analysis_db");
-const std_embed = @import("std_embed");
 const ast_rewrite = @import("ast_rewrite.zig");
+const module_source = @import("module_source.zig");
 
 /// 字符串 intern 池：模块名等重复字符串统一去重分配，由池统一释放。
 const StringInterner = struct {
@@ -398,8 +398,13 @@ pub const ModuleLoader = struct {
                     if (imp.module_path.len == 0) continue;
                     const module_name = imp.module_path[0];
                     if (std.mem.eql(u8, module_name, "std")) {
-                        try self.loadStdlibPack(
-                            imp.module_path,
+                        // stdlib 分支：构建 StdlibSource
+                        if (imp.module_path.len < 2) continue;
+                        const pack_name = imp.module_path[1];
+                        const module_prefix = std.fmt.allocPrint(ast_arena, "std.{s}", .{pack_name}) catch continue;
+                        var std_src = module_source.StdlibSource.init(pack_name, module_prefix);
+                        try self.loadPack(
+                            std_src.source(),
                             &extra_decls,
                             &loaded_submodules,
                             retained_parsers,
@@ -408,9 +413,12 @@ pub const ModuleLoader = struct {
                             ast_arena,
                         );
                     } else {
-                        try self.loadUserPack(
-                            module_name,
-                            source_dir_with_sep,
+                        // user 分支：构建 UserSource
+                        const io = self.io orelse continue;
+                        const cwd = std.Io.Dir.cwd();
+                        var user_src = module_source.UserSource.init(module_name, source_dir_with_sep, io, cwd);
+                        try self.loadPack(
+                            user_src.source(),
                             &extra_decls,
                             &loaded_submodules,
                             retained_parsers,
@@ -433,10 +441,13 @@ pub const ModuleLoader = struct {
         }
     }
 
-    /// 加载 stdlib pack：从 @embedFile 表读取 pack.glue 与子模块，mangle 为 std.<pack>.<sub>.<fun>
-    fn loadStdlibPack(
+    /// 加载 pack：通过 ModuleSource 接口统一 stdlib embedFile 源与用户文件系统源
+    ///
+    /// v3 阶段 13：合并 loadStdlibPack/loadUserPack 重复骨架，
+    /// 差异点（源读取/prefix/子模块路径/transitive imports）通过 ModuleSource 分派。
+    fn loadPack(
         self: *ModuleLoader,
-        module_path: [][]const u8,
+        src: module_source.ModuleSource,
         extra_decls: *std.ArrayList(ast.Decl),
         loaded_submodules: *std.StringHashMap(void),
         retained_parsers: *std.ArrayList(*parser_mod.Parser),
@@ -444,18 +455,31 @@ pub const ModuleLoader = struct {
         retained_tokens: *std.ArrayList([]lexer_mod.Token),
         ast_arena: std.mem.Allocator,
     ) !void {
-        if (module_path.len < 2) return;
-        const pack_name = module_path[1];
-        // module_prefix 统一 mangling 前缀：std 分支为 "std.<pack>"
-        const module_prefix = std.fmt.allocPrint(ast_arena, "std.{s}", .{pack_name}) catch return;
+        const module_prefix = src.modulePrefix(src.ctx);
+        const is_stdlib = src.isStdlib(src.ctx);
 
-        // 读嵌入表中的 pack.glue
-        var path_buf: [256]u8 = undefined;
-        const pack_path = std.fmt.bufPrint(&path_buf, "{s}/pack.glue", .{pack_name}) catch return;
-        const pack_src_embed = std_embed.find(pack_path) orelse return;
+        // 读取 pack.glue
+        // 路径构建：stdlib 用 "<pack>/pack.glue"，user 用 "<dir><module>/pack.glue"
+        var pack_path_buf: [512]u8 = undefined;
+        const pack_path = if (is_stdlib) blk: {
+            // stdlib: prefix 是 "std.<pack>"，取 pack 部分构建路径
+            const std_prefix = "std.";
+            const pack_name = if (std.mem.startsWith(u8, module_prefix, std_prefix))
+                module_prefix[std_prefix.len..]
+            else
+                module_prefix;
+            break :blk std.fmt.bufPrint(&pack_path_buf, "{s}/pack.glue", .{pack_name}) catch return;
+        } else blk: {
+            // user: 从 source_dir_with_sep + module_prefix 构建（module_prefix == module_name）
+            const us: *module_source.UserSource = @ptrCast(@alignCast(src.ctx));
+            break :blk std.fmt.bufPrint(&pack_path_buf, "{s}{s}{c}pack.glue", .{ us.source_dir_with_sep, module_prefix, std.fs.path.sep }) catch return;
+        };
+
+        const pack_src = src.readSource(src.ctx, self.allocator, pack_path) orelse return;
+        defer src.freeSource(src.ctx, self.allocator, pack_src);
 
         // 解析 pack.glue
-        var pack_lex = lexer_mod.Lexer.init(self.allocator, pack_src_embed);
+        var pack_lex = lexer_mod.Lexer.init(self.allocator, pack_src);
         defer pack_lex.deinit();
         const pack_tokens = pack_lex.tokenize() catch return;
         defer self.allocator.free(pack_tokens);
@@ -476,25 +500,35 @@ pub const ModuleLoader = struct {
             }
         }
 
-        // 对 pack 中每个 pub pack X，读嵌入表中的 <pack>/<X>.glue
-        // 全量加载 pack 内全部子模块（子模块间存在跨模块依赖，部分加载会导致 sema 报错）
+        // 加载子模块
         for (pack_module.declarations) |pack_decl| {
             switch (pack_decl) {
                 .pack_decl => |pd| {
                     const sub_name = pd.name;
-                    const sub_key = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ pack_name, sub_name }) catch continue;
+                    const sub_key = src.subModuleKey(src.ctx, self.allocator, sub_name);
                     defer self.allocator.free(sub_key);
                     if (loaded_submodules.contains(sub_key)) continue;
                     loaded_submodules.put(try ast_arena.dupe(u8, sub_key), {}) catch continue;
-                    const sub_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.glue", .{ pack_name, sub_name }) catch continue;
-                    const sub_src_embed = std_embed.find(sub_path) orelse continue;
 
-                    // @embedFile 返回 const 数据，dupe 一份以匹配 retained_sources 的 free 语义
-                    const sub_src = try self.allocator.dupe(u8, sub_src_embed);
+                    // 子模块路径：stdlib 用 "<pack>/<sub>.glue"，user 用 "<dir><module>/<sub>.glue"
+                    var sub_path_buf: [512]u8 = undefined;
+                    const sub_path = if (is_stdlib) blk: {
+                        const std_prefix = "std.";
+                        const pack_name = if (std.mem.startsWith(u8, module_prefix, std_prefix))
+                            module_prefix[std_prefix.len..]
+                        else
+                            module_prefix;
+                        break :blk std.fmt.bufPrint(&sub_path_buf, "{s}/{s}.glue", .{ pack_name, sub_name }) catch continue;
+                    } else blk: {
+                        const us: *module_source.UserSource = @ptrCast(@alignCast(src.ctx));
+                        break :blk std.fmt.bufPrint(&sub_path_buf, "{s}{s}{c}{s}.glue", .{ us.source_dir_with_sep, module_prefix, std.fs.path.sep, sub_name }) catch continue;
+                    };
+
+                    const sub_src = src.readSource(src.ctx, self.allocator, sub_path) orelse continue;
 
                     var sub_lex = lexer_mod.Lexer.init(self.allocator, sub_src);
                     const sub_tokens = sub_lex.tokenize() catch {
-                        self.allocator.free(sub_src);
+                        src.freeSource(src.ctx, self.allocator, sub_src);
                         continue;
                     };
                     const sub_parser_ptr = try self.allocator.create(parser_mod.Parser);
@@ -503,7 +537,7 @@ pub const ModuleLoader = struct {
                         sub_parser_ptr.deinit();
                         self.allocator.destroy(sub_parser_ptr);
                         self.allocator.free(sub_tokens);
-                        self.allocator.free(sub_src);
+                        src.freeSource(src.ctx, self.allocator, sub_src);
                         continue;
                     };
 
@@ -520,27 +554,28 @@ pub const ModuleLoader = struct {
                         ast_arena,
                     );
 
-                    // 递归处理子模块内的 import_decl：stdlib 子模块可能依赖其他 stdlib pack
-                    // （例如 Console.glue 依赖 std.reflect.Reflect）。
-                    // 只处理 std 分支，用户模块的 import 由 loadUserPack 路径处理。
-                    try self.loadStdlibTransitiveImports(
-                        sub_module,
-                        extra_decls,
-                        loaded_submodules,
-                        retained_parsers,
-                        retained_sources,
-                        retained_tokens,
-                        ast_arena,
-                    );
+                    // stdlib 子模块可能依赖其他 stdlib pack（如 Console 依赖 std.reflect.Reflect）
+                    // 递归处理 transitive imports；user 模块的 import 由 loadPack 路径处理
+                    if (is_stdlib) {
+                        try self.loadStdlibTransitiveImports(
+                            sub_module,
+                            extra_decls,
+                            loaded_submodules,
+                            retained_parsers,
+                            retained_sources,
+                            retained_tokens,
+                            ast_arena,
+                        );
+                    }
                 },
                 else => {},
             }
         }
     }
 
-    /// 遍历子模块的 declarations，对每个 import_decl[0]=="std" 的依赖递归调用 loadStdlibPack。
+    /// 遍历子模块的 declarations，对每个 import_decl[0]=="std" 的依赖递归调用 loadPack(StdlibSource)。
     /// 避免无限递归：通过 loaded_submodules 集合去重（key 格式 "pack/sub"）。
-    /// 注意：显式 anyerror 打破与 loadStdlibPack 间的推断错误集循环。
+    /// 注意：显式 anyerror 打破与 loadPack 间的推断错误集循环。
     fn loadStdlibTransitiveImports(
         self: *ModuleLoader,
         sub_module: ast.Module,
@@ -567,105 +602,18 @@ pub const ModuleLoader = struct {
                         }
                     }
                     if (already_loaded) continue;
-                    try self.loadStdlibPack(
-                        imp.module_path,
+                    // 构建 StdlibSource 并递归
+                    var module_prefix_buf: [256]u8 = undefined;
+                    const module_prefix = std.fmt.bufPrint(&module_prefix_buf, "std.{s}", .{pack_name}) catch continue;
+                    const module_prefix_owned = try ast_arena.dupe(u8, module_prefix);
+                    var std_src = module_source.StdlibSource.init(pack_name, module_prefix_owned);
+                    try self.loadPack(
+                        std_src.source(),
                         extra_decls,
                         loaded_submodules,
                         retained_parsers,
                         retained_sources,
                         retained_tokens,
-                        ast_arena,
-                    );
-                },
-                else => {},
-            }
-        }
-    }
-
-    /// 加载用户 pack：从文件系统读取 pack.glue 与子模块，mangle 为 <module>.<sub>.<fun>
-    fn loadUserPack(
-        self: *ModuleLoader,
-        module_name: []const u8,
-        source_dir_with_sep: []const u8,
-        extra_decls: *std.ArrayList(ast.Decl),
-        loaded_submodules: *std.StringHashMap(void),
-        retained_parsers: *std.ArrayList(*parser_mod.Parser),
-        retained_sources: *std.ArrayList([]const u8),
-        retained_tokens: *std.ArrayList([]lexer_mod.Token),
-        ast_arena: std.mem.Allocator,
-    ) !void {
-        // module_prefix 统一 mangling 前缀：用户分支为 "<module>"
-        const module_prefix = module_name;
-        const io = self.io orelse return;
-        const cwd = std.Io.Dir.cwd();
-
-        // 读取 pack.glue
-        const pack_path = try std.fmt.allocPrint(self.allocator, "{s}{s}{c}pack.glue", .{ source_dir_with_sep, module_name, std.fs.path.sep });
-        defer self.allocator.free(pack_path);
-        const pack_src = cwd.readFileAlloc(io, pack_path, self.allocator, .unlimited) catch return;
-        defer self.allocator.free(pack_src);
-
-        // 解析 pack.glue
-        var pack_lex = lexer_mod.Lexer.init(self.allocator, pack_src);
-        defer pack_lex.deinit();
-        const pack_tokens = pack_lex.tokenize() catch return;
-        defer self.allocator.free(pack_tokens);
-        var pack_parser = parser_mod.Parser.init(self.allocator, pack_tokens);
-        defer pack_parser.deinit();
-        const pack_module = pack_parser.parseModule("pack") catch return;
-
-        // 构建 sibling_modules
-        var sibling_modules = std.StringHashMap([]const u8).init(self.allocator);
-        defer sibling_modules.deinit();
-        for (pack_module.declarations) |pack_decl| {
-            switch (pack_decl) {
-                .pack_decl => |pd| {
-                    const mangled_mod = std.fmt.allocPrint(ast_arena, "{s}.{s}", .{ module_prefix, pd.name }) catch continue;
-                    sibling_modules.put(pd.name, mangled_mod) catch continue;
-                },
-                else => {},
-            }
-        }
-
-        // 查找并加载子模块
-        for (pack_module.declarations) |pack_decl| {
-            switch (pack_decl) {
-                .pack_decl => |pd| {
-                    const sub_name = pd.name;
-                    const sub_key = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ module_name, sub_name }) catch continue;
-                    defer self.allocator.free(sub_key);
-                    if (loaded_submodules.contains(sub_key)) continue;
-                    loaded_submodules.put(try ast_arena.dupe(u8, sub_key), {}) catch continue;
-
-                    const sub_path = try std.fmt.allocPrint(self.allocator, "{s}{s}{c}{s}.glue", .{ source_dir_with_sep, module_name, std.fs.path.sep, sub_name });
-                    defer self.allocator.free(sub_path);
-                    const sub_src = cwd.readFileAlloc(io, sub_path, self.allocator, .unlimited) catch continue;
-
-                    var sub_lex = lexer_mod.Lexer.init(self.allocator, sub_src);
-                    const sub_tokens = sub_lex.tokenize() catch {
-                        self.allocator.free(sub_src);
-                        continue;
-                    };
-                    const sub_parser_ptr = try self.allocator.create(parser_mod.Parser);
-                    sub_parser_ptr.* = parser_mod.Parser.init(self.allocator, sub_tokens);
-                    const sub_module = sub_parser_ptr.parseModule(sub_name) catch {
-                        sub_parser_ptr.deinit();
-                        self.allocator.destroy(sub_parser_ptr);
-                        self.allocator.free(sub_tokens);
-                        self.allocator.free(sub_src);
-                        continue;
-                    };
-
-                    try retained_parsers.append(self.allocator, sub_parser_ptr);
-                    try retained_sources.append(self.allocator, sub_src);
-                    try retained_tokens.append(self.allocator, sub_tokens);
-
-                    try self.collectAndMangleDecls(
-                        module_prefix,
-                        sub_name,
-                        sub_module,
-                        &sibling_modules,
-                        extra_decls,
                         ast_arena,
                     );
                 },

@@ -121,7 +121,7 @@ fn emptyLayout() FrameLayout {
 }
 
 fn makeFrame(id: u16) CoroutineFrame {
-    return CoroutineFrame.initFixed(id, emptyLayout());
+    return CoroutineFrame.initFixed(id, emptyLayout(), &[_]u16{});
 }
 
 test "Worker pushReady/popLocal LIFO" {

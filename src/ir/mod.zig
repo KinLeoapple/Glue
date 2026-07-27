@@ -19,10 +19,24 @@ pub const meta_mod = @import("meta.zig");
 pub const channel_mod = @import("channel.zig");
 pub const ir_mod = @import("ir.zig");
 pub const builder_mod = @import("builder.zig");
-pub const sema_output_mod = @import("sema_output.zig");
+pub const ast_traits_mod = @import("ast_traits.zig");
+pub const pattern_compiler_mod = @import("pattern_compiler.zig");
+pub const decl_collector_mod = @import("decl_collector.zig");
+pub const stmt_compiler_mod = @import("stmt_compiler.zig");
+pub const func_compiler_mod = @import("func_compiler.zig");
+pub const expr_compiler_mod = @import("expr_compiler.zig");
+pub const sema_output_mod = @import("sema").sema_output;
 pub const printer_mod = @import("printer.zig");
 pub const optimizer_mod = @import("optimizer.zig");
 pub const state_machine_transform = @import("state_machine_transform.zig");
+pub const type_descriptor_mod = @import("type_descriptor.zig");
+pub const builtin_registry = @import("builtin_registry.zig");
+pub const op_table_mod = @import("op_table.zig");
+pub const builtin_type_names = @import("builtin_type_names.zig");
+
+// v3 阶段 5 便捷别名：OpTable 单表覆盖 NodeOp 全部静态属性维度
+pub const OpTable = op_table_mod;
+pub const op_table = op_table_mod;
 
 // 核心类型重导出
 pub const Node = node_mod.Node;
@@ -67,6 +81,15 @@ pub const printIR = printer_mod.printIR;
 pub const optimize = optimizer_mod.optimize;
 pub const OptStats = optimizer_mod.OptStats;
 
+// v3 TypeDescriptor 类型重导出（定义已移至 ir/type_descriptor.zig）
+pub const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
+pub const ScalarOps = type_descriptor_mod.ScalarOps;
+pub const Slot = type_descriptor_mod.Slot;
+pub const SlotKind = type_descriptor_mod.SlotKind;
+
+// sema_output 别名：从 sema 模块重导出（sema_output.zig 已迁入 sema/）
+pub const sema_output = sema_output_mod;
+
 test {
     // 引用所有子模块以触发懒分析
     _ = node_mod;
@@ -74,7 +97,17 @@ test {
     _ = channel_mod;
     _ = ir_mod;
     _ = builder_mod;
+    _ = ast_traits_mod;
+    _ = pattern_compiler_mod;
+    _ = decl_collector_mod;
+    _ = stmt_compiler_mod;
+    _ = func_compiler_mod;
+    _ = expr_compiler_mod;
     _ = sema_output_mod;
     _ = printer_mod;
     _ = optimizer_mod;
+    _ = type_descriptor_mod;
+    _ = op_table_mod;
+    _ = @import("builder_tests.zig");
+    _ = @import("ast_helper.zig");
 }

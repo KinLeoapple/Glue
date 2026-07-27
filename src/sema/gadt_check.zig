@@ -9,7 +9,6 @@ const ast = @import("ast");
 const type_check = @import("type_check");
 
 pub const Type = type_check.Type;
-pub const TypeScheme = type_check.TypeScheme;
 pub const TypeEnv = type_check.TypeEnv;
 pub const TypeInferencer = type_check.TypeInferencer;
 
@@ -26,7 +25,7 @@ pub fn refineConstructorPattern(
     env: *TypeEnv,
 ) bool {
     const scheme = env.lookup(con.name) orelse return false;
-    const inst = inferencer.instantiate(scheme) catch return false;
+    const inst = inferencer.freshenType(scheme) catch return false;
     const resolved = inferencer.resolve(inst);
 
     switch (resolved.*) {

@@ -16,8 +16,6 @@ const type_check = @import("type_check");
 
 pub const Type = type_check.Type;
 pub const TypeVar = type_check.TypeVar;
-pub const TypeScheme = type_check.TypeScheme;
-pub const BoundInfo = type_check.BoundInfo;
 pub const TypeEnv = type_check.TypeEnv;
 pub const TraitInfo = type_check.TraitInfo;
 pub const TraitEntry = type_check.TraitEntry;
@@ -118,37 +116,6 @@ pub fn checkCallSiteTraitBound(
                 if (!inferencer.registered_traits.contains(trait_key)) {
                     inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for trait {s}<{s}> at call site", .{ bound.trait_name, tp_name });
                 }
-            }
-        }
-    }
-}
-
-/// 在实例化类型方案后检查其 trait bound 是否被满足。
-/// 对每个 bound，定位被绑定的具体类型名并校验是否注册了对应 trait 实现。
-pub fn checkInstantiatedBounds(
-    inferencer: *TypeInferencer,
-    scheme: TypeScheme,
-    location: ast.SourceLocation,
-) void {
-    for (scheme.bounds) |bound| {
-        if (bound.type_param_index >= scheme.quantified_vars.len) continue;
-        const var_id = scheme.quantified_vars[bound.type_param_index];
-        for (inferencer.type_vars.items) |tv| {
-            if (tv.type_var.id == var_id and tv.type_var.bound != null) {
-                const resolved = inferencer.resolve(tv.type_var.bound.?);
-                const type_name: ?[]const u8 = switch (resolved.*) {
-                    .adt_type => |adt| adt.name,
-                    .named => |n| n.name,
-                    else => null,
-                };
-                if (type_name) |tn| {
-                    const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::{s}", .{ bound.trait_name, tn }) catch return;
-                    defer inferencer.arena.allocator().free(trait_key);
-                    if (!inferencer.registered_traits.contains(trait_key)) {
-                        inferencer.addErrorAt(.unsatisfied_bound, location.line, location.column, "no trait implementation found for {s}<{s}>", .{ bound.trait_name, tn });
-                    }
-                }
-                break;
             }
         }
     }
@@ -298,7 +265,7 @@ pub fn inferMethodCall(
         const mangled = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}.{s}", .{ mod_name, mc.method }) catch return inferencer.freshTypeVar() catch unreachable;
         defer inferencer.arena.allocator().free(mangled);
         if (env.lookup(mangled)) |scheme| {
-            const instantiated = inferencer.instantiate(scheme) catch return inferencer.freshTypeVar() catch unreachable;
+            const instantiated = inferencer.freshenType(scheme) catch return inferencer.freshTypeVar() catch unreachable;
             const resolved = inferencer.resolve(instantiated);
             if (resolved.* == .fn_type) {
                 return resolved.fn_type.return_type;
@@ -329,7 +296,7 @@ pub fn inferMethodCall(
             const mangled = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}.{s}", .{ tn, mc.method }) catch return inferencer.freshTypeVar() catch unreachable;
             defer inferencer.arena.allocator().free(mangled);
             if (env.lookup(mangled)) |scheme| {
-                const instantiated = inferencer.instantiate(scheme) catch return inferencer.freshTypeVar() catch unreachable;
+                const instantiated = inferencer.freshenType(scheme) catch return inferencer.freshTypeVar() catch unreachable;
                 const resolved = inferencer.resolve(instantiated);
                 if (resolved.* == .fn_type) {
                     if (resolved.fn_type.params.len > 0) {
@@ -346,7 +313,7 @@ pub fn inferMethodCall(
             while (fn_iter.next()) |key| {
                 if (std.mem.endsWith(u8, key.*, method_suffix)) {
                     if (env.lookup(key.*)) |scheme| {
-                        const instantiated = inferencer.instantiate(scheme) catch continue;
+                        const instantiated = inferencer.freshenType(scheme) catch continue;
                         const resolved = inferencer.resolve(instantiated);
                         if (resolved.* == .fn_type) {
                             // 验证第一个参数类型是否匹配 obj_ty
@@ -387,7 +354,7 @@ pub fn inferMethodCall(
     var trait_iter = inferencer.trait_types.iterator();
     while (trait_iter.next()) |entry| {
         if (entry.value_ptr.method_schemes.get(mc.method)) |scheme| {
-            const instantiated = inferencer.instantiate(scheme) catch return inferencer.freshTypeVar() catch unreachable;
+            const instantiated = inferencer.freshenType(scheme) catch return inferencer.freshTypeVar() catch unreachable;
             const resolved = inferencer.resolve(instantiated);
             switch (resolved.*) {
                 .fn_type => |ft| {
@@ -466,7 +433,7 @@ pub fn checkTraitDecl(
     defer meth_names_list.deinit(inferencer.arena.allocator());
     var required_meth_names_list = std.ArrayList([]const u8).empty;
     defer required_meth_names_list.deinit(inferencer.arena.allocator());
-    var method_schemes = std.StringHashMap(TypeScheme).init(inferencer.arena.allocator());
+    var method_schemes = std.StringHashMap(*Type).init(inferencer.arena.allocator());
 
     // 继承父 trait 的方法名与方法方案
     for (td.parents) |parent| {
@@ -570,9 +537,8 @@ pub fn checkTraitDecl(
         else
             inferencer.freshTypeVar() catch return;
         const fn_type = inferencer.makeFnType(param_types.items, ret_type) catch return;
-        const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_type };
         const mname = inferencer.arena.allocator().dupe(u8, m.name) catch return;
-        method_schemes.put(mname, scheme) catch return;
+        method_schemes.put(mname, fn_type) catch return;
     }
 
     // 检测多继承导致的同名方法冲突，要求子类用 override/委托消解
@@ -759,13 +725,13 @@ fn checkMethodSignature(
     inferencer: *TypeInferencer,
     td: @TypeOf(@as(ast.Decl, undefined).type_decl),
     impl_method: ast.MethodDecl,
-    trait_scheme: TypeScheme,
+    trait_scheme: *Type,
     trait_info: *const type_check.TraitInfo,
     concrete_self_type: ?*Type,
     trait_bound: ast.TraitBound,
 ) void {
     // 构建 trait 方法签名
-    const trait_fn_ty = inferencer.resolve(trait_scheme.ty);
+    const trait_fn_ty = inferencer.resolve(trait_scheme);
     if (trait_fn_ty.* != .fn_type) return;
 
     // 构建替换表：trait 的 Self var → 具体 type，trait 类型参数 → trait_bound.type_args

@@ -41,6 +41,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const purity_mod = @import("purity.zig");
+const ast_visitor = @import("ast_visitor");
 
 // ════════════════════════════════════════════
 // 数据结构
@@ -289,7 +290,25 @@ pub const EscapePass = struct {
         param_escapes: []ParamEscape,
     };
 
+    /// visitor 上下文：绑定 pass/env/ctx/current_fn 供 walkExprChildren 回调使用。
+    /// v3 阶段 11：用于消除"递归子节点并返回固定值"的重复递归分支。
+    const EscapeVCtx = struct {
+        pass: *EscapePass,
+        env: *ValueEnv,
+        analyze_ctx: *AnalyzeCtx,
+        current_fn: []const u8,
+    };
+
+    /// walkExprChildren/walkStmtChildren 回调适配器：递归分析子表达式（忽略返回值）
+    fn analyzeExprVCb(ctx: *anyopaque, expr: *const ast.Expr) anyerror!void {
+        const c: *EscapeVCtx = @ptrCast(@alignCast(ctx));
+        _ = try c.pass.analyzeExpr(expr, c.env, c.analyze_ctx, c.current_fn);
+    }
+
     /// 递归分析表达式，返回其 AllocSource
+    ///
+    /// v3 阶段 11：使用 ast_visitor.walkExprChildren 消除"递归子节点并返回 .non_alloc/.direct_alloc"
+    /// 的重复分支，仅保留需要返回值合并、逃逸判定、环境更新的特化 hook。
     fn analyzeExpr(
         self: *EscapePass,
         expr: *const ast.Expr,
@@ -299,68 +318,35 @@ pub const EscapePass = struct {
     ) anyerror!AllocSource {
         if (ctx.escapes) return .escaped; // 已逃逸，提前终止
         switch (expr.*) {
-            // ── 直接分配表达式 ──
-            .array_literal => |a| {
-                for (a.elements) |e| _ = try self.analyzeExpr(e, env, ctx, current_fn);
-                return .direct_alloc;
-            },
-            .record_literal => |r| {
-                for (r.fields) |f| _ = try self.analyzeExpr(f.value, env, ctx, current_fn);
-                return .direct_alloc;
-            },
-            .record_extend => |r| {
-                // base 若为分配表达式，extend 会产生新对象（record_clone）
-                _ = try self.analyzeExpr(r.base, env, ctx, current_fn);
-                for (r.updates) |u| _ = try self.analyzeExpr(u.value, env, ctx, current_fn);
-                return .direct_alloc; // record_extend 产生新对象
-            },
-            .string_interpolation => |si| {
-                for (si.parts) |part| {
-                    if (part == .expression) _ = try self.analyzeExpr(part.expression, env, ctx, current_fn);
-                }
+            // ── 直接分配表达式：递归子节点，返回 .direct_alloc ──
+            .array_literal, .record_literal, .record_extend,
+            .string_interpolation, .cast_builder => {
+                var vctx = EscapeVCtx{ .pass = self, .env = env, .analyze_ctx = ctx, .current_fn = current_fn };
+                try ast_visitor.walkExprChildren(@ptrCast(&vctx), expr, analyzeExprVCb);
                 return .direct_alloc;
             },
             .lambda => {
-                // 闭包对象：保守视为分配，且闭包捕获分析见下方专节
-                // 闭包本身可能不逃逸，但捕获的分配表达式若逃逸则当前函数逃逸
-                // 简化处理：lambda 视为 direct_alloc，捕获分析在 analyzeLambdaBody
+                // 闭包对象：保守视为分配，捕获分析见下方专节
                 return .direct_alloc;
             },
 
             // ── 字面量与标识符 ──
-            .int_literal,
-            .float_literal,
-            .bool_literal,
-            .char_literal,
-            .string_literal,
-            .null_literal,
-            .unit_literal,
-            => return .non_alloc,
+            .int_literal, .float_literal, .bool_literal, .char_literal,
+            .string_literal, .null_literal, .unit_literal => return .non_alloc,
             .identifier => |id| {
                 if (env.lookup(id.name)) |src| return src;
                 return .non_alloc;
             },
 
-            // ── 控制流 ──
-            .binary => |b| {
-                _ = try self.analyzeExpr(b.left, env, ctx, current_fn);
-                _ = try self.analyzeExpr(b.right, env, ctx, current_fn);
+            // ── 递归子节点，返回 .non_alloc 的表达式（纯读/运算）──
+            .binary, .unary, .ref_of, .deref, .field_access, .safe_access,
+            .index, .slice, .non_null_assert, .propagate, .type_cast, .compound_assign => {
+                var vctx = EscapeVCtx{ .pass = self, .env = env, .analyze_ctx = ctx, .current_fn = current_fn };
+                try ast_visitor.walkExprChildren(@ptrCast(&vctx), expr, analyzeExprVCb);
                 return .non_alloc;
             },
-            .unary => |u| {
-                _ = try self.analyzeExpr(u.operand, env, ctx, current_fn);
-                return .non_alloc;
-            },
-            .ref_of => |r| {
-                // 取引用：递归分析 operand，本身不产生新分配
-                _ = try self.analyzeExpr(r.operand, env, ctx, current_fn);
-                return .non_alloc;
-            },
-            .deref => |d| {
-                // 解引用：递归分析 operand，本身不产生新分配
-                _ = try self.analyzeExpr(d.operand, env, ctx, current_fn);
-                return .non_alloc;
-            },
+
+            // ── 控制流（需返回值合并）──
             .if_expr => |i| {
                 _ = try self.analyzeExpr(i.condition, env, ctx, current_fn);
                 const then_src = try self.analyzeExpr(i.then_branch, env, ctx, current_fn);
@@ -446,38 +432,8 @@ pub const EscapePass = struct {
                 return .direct_alloc;
             },
 
-            // ── 字段访问 ──
-            .field_access => |f| {
-                _ = try self.analyzeExpr(f.object, env, ctx, current_fn);
-                return .non_alloc;
-            },
-            .safe_access => |f| {
-                _ = try self.analyzeExpr(f.object, env, ctx, current_fn);
-                return .non_alloc;
-            },
-            .index => |i| {
-                _ = try self.analyzeExpr(i.object, env, ctx, current_fn);
-                _ = try self.analyzeExpr(i.index, env, ctx, current_fn);
-                return .non_alloc;
-            },
-            .slice => |sl| {
-                _ = try self.analyzeExpr(sl.object, env, ctx, current_fn);
-                _ = try self.analyzeExpr(sl.start, env, ctx, current_fn);
-                _ = try self.analyzeExpr(sl.end, env, ctx, current_fn);
-                return .non_alloc;
-            },
-            .non_null_assert => |n| {
-                _ = try self.analyzeExpr(n.expr, env, ctx, current_fn);
-                return .non_alloc;
-            },
-            .propagate => |p| {
-                _ = try self.analyzeExpr(p.expr, env, ctx, current_fn);
-                return .non_alloc;
-            },
-
-            // ── 赋值 ──
+            // ── 赋值（复杂逃逸逻辑 + 环境更新）──
             .assignment_expr => |a| {
-                // 赋值到字段/索引：写入外层对象，逃逸
                 if (a.target.* == .field_access or a.target.* == .index) {
                     const val_src = try self.analyzeExpr(a.value, env, ctx, current_fn);
                     if (val_src == .direct_alloc) {
@@ -487,27 +443,10 @@ pub const EscapePass = struct {
                 }
                 _ = try self.analyzeExpr(a.target, env, ctx, current_fn);
                 const val_src = try self.analyzeExpr(a.value, env, ctx, current_fn);
-                // 赋值到局部变量：更新环境的 AllocSource
                 if (a.target.* == .identifier) {
                     try env.put(a.target.identifier.name, val_src);
                 }
                 return .non_alloc;
-            },
-            .compound_assign => |c| {
-                _ = try self.analyzeExpr(c.target, env, ctx, current_fn);
-                _ = try self.analyzeExpr(c.value, env, ctx, current_fn);
-                return .non_alloc;
-            },
-
-            // ── 类型转换 ──
-            .type_cast => |t| {
-                _ = try self.analyzeExpr(t.expr, env, ctx, current_fn);
-                return .non_alloc;
-            },
-            .cast_builder => |cb| {
-                _ = try self.analyzeExpr(cb.expr, env, ctx, current_fn);
-                // cast_try_to 可能产生 ThrowValue
-                return .direct_alloc;
             },
 
             // ── 跨协程/延迟执行（必逃逸）──
@@ -576,13 +515,6 @@ pub const EscapePass = struct {
                 // 写外层对象字段：保守逃逸
                 ctx.escapes = true;
             },
-            .compound_assignment => |c| {
-                _ = try self.analyzeExpr(c.target, env, ctx, current_fn);
-                _ = try self.analyzeExpr(c.value, env, ctx, current_fn);
-            },
-            .expression => |e| {
-                _ = try self.analyzeExpr(e.expr, env, ctx, current_fn);
-            },
             .return_stmt => |r| {
                 if (r.value) |v| {
                     const src = try self.analyzeExpr(v, env, ctx, current_fn);
@@ -627,7 +559,11 @@ pub const EscapePass = struct {
                 defer child_env.deinit();
                 _ = try self.analyzeExpr(l.body, &child_env, ctx, current_fn);
             },
-            .break_stmt, .continue_stmt => {},
+            // 默认：walkStmtChildren 递归（compound_assignment/expression/break/continue）
+            else => {
+                var vctx = EscapeVCtx{ .pass = self, .env = env, .analyze_ctx = ctx, .current_fn = current_fn };
+                try ast_visitor.walkStmtChildren(@ptrCast(&vctx), stmt, analyzeExprVCb);
+            },
         }
     }
 };

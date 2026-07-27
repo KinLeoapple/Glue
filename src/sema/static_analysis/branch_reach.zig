@@ -7,6 +7,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const const_prop_mod = @import("const_prop.zig");
+const ast_visitor = @import("ast_visitor");
 
 /// 分支可达性信息：恒真、恒假或运行时判定。
 pub const BranchInfo = enum {
@@ -78,77 +79,40 @@ pub const BranchReachPass = struct {
     }
 
     /// 递归分析表达式，对 if 表达式根据条件常量值判定分支可达性。
+    /// v3 阶段 11：使用 ast_visitor.walkExprChildren 消除手写递归分支，
+    /// 仅保留 if_expr 的特化 hook（常量条件检查）。
     fn analyzeExpr(self: *BranchReachPass, expr: *const ast.Expr) anyerror!void {
-        switch (expr.*) {
-            .if_expr => |i| {
-                try self.analyzeExpr(i.condition);
-                try self.analyzeExpr(i.then_branch);
-                if (i.else_branch) |e| try self.analyzeExpr(e);
-                // 查询条件在常量表中的值，判定分支可达性。
-                if (self.const_table.lookup(i.condition)) |cv| {
-                    if (cv == .bool_val) {
-                        const info: BranchInfo = if (cv.bool_val) .always_true else .always_false;
-                        try self.table.put(expr, info);
-                    } else {
-                        // 条件为常量但非布尔类型，视为运行时判定。
-                        try self.table.put(expr, .runtime);
-                    }
+        // 先递归子节点（默认遍历）
+        try ast_visitor.walkExprChildren(@ptrCast(self), expr, analyzeExprCallback);
+        // 特化 hook：if_expr 的常量条件判定
+        if (expr.* == .if_expr) {
+            const i = expr.if_expr;
+            // 查询条件在常量表中的值，判定分支可达性。
+            if (self.const_table.lookup(i.condition)) |cv| {
+                if (cv == .bool_val) {
+                    const info: BranchInfo = if (cv.bool_val) .always_true else .always_false;
+                    try self.table.put(expr, info);
                 } else {
-                    // 条件无常量信息，视为运行时判定。
+                    // 条件为常量但非布尔类型，视为运行时判定。
                     try self.table.put(expr, .runtime);
                 }
-            },
-            .binary => |b| {
-                try self.analyzeExpr(b.left);
-                try self.analyzeExpr(b.right);
-            },
-            .unary => |u| try self.analyzeExpr(u.operand),
-            .ref_of => |r| try self.analyzeExpr(r.operand),
-            .deref => |d| try self.analyzeExpr(d.operand),
-            .call => |c| {
-                try self.analyzeExpr(c.callee);
-                for (c.arguments) |arg| try self.analyzeExpr(arg);
-            },
-            .block => |b| {
-                for (b.statements) |s| try self.analyzeStmt(s);
-                if (b.trailing_expr) |te| try self.analyzeExpr(te);
-            },
-            .match => |m| {
-                try self.analyzeExpr(m.scrutinee);
-                for (m.arms) |arm| {
-                    if (arm.guard) |g| try self.analyzeExpr(g);
-                    try self.analyzeExpr(arm.body);
-                }
-            },
-            .lambda => |l| switch (l.body) {
-                .block => |body_expr| try self.analyzeExpr(body_expr),
-                .expression => |body_expr| try self.analyzeExpr(body_expr),
-            },
-            .type_cast => |tc| try self.analyzeExpr(tc.expr),
-            .atomic_expr => |ae| try self.analyzeExpr(ae.value),
-            else => {},
+            } else {
+                // 条件无常量信息，视为运行时判定。
+                try self.table.put(expr, .runtime);
+            }
         }
     }
 
+    /// walkExprChildren 的回调适配器（拆出以匹配 ExprVisitor 签名）
+    fn analyzeExprCallback(ctx: *anyopaque, expr: *const ast.Expr) anyerror!void {
+        const self: *BranchReachPass = @ptrCast(@alignCast(ctx));
+        try self.analyzeExpr(expr);
+    }
+
     /// 递归分析语句中的表达式。
+    /// v3 阶段 11：使用 ast_visitor.walkStmtChildren 消除手写递归分支。
     fn analyzeStmt(self: *BranchReachPass, stmt: *const ast.Stmt) anyerror!void {
-        switch (stmt.*) {
-            .val_decl => |v| try self.analyzeExpr(v.value),
-            .var_decl => |v| try self.analyzeExpr(v.value),
-            .assignment => |a| try self.analyzeExpr(a.value),
-            .expression => |e| try self.analyzeExpr(e.expr),
-            .return_stmt => |r| if (r.value) |v| try self.analyzeExpr(v),
-            .for_stmt => |f| {
-                try self.analyzeExpr(f.iterable);
-                try self.analyzeExpr(f.body);
-            },
-            .while_stmt => |w| {
-                try self.analyzeExpr(w.condition);
-                try self.analyzeExpr(w.body);
-            },
-            .loop_stmt => |l| try self.analyzeExpr(l.body),
-            else => {},
-        }
+        try ast_visitor.walkStmtChildren(@ptrCast(self), stmt, analyzeExprCallback);
     }
 };
 

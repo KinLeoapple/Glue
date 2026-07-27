@@ -50,9 +50,6 @@ pub const RefKind = enum(u8) {
     /// 协程帧：async 函数调度的执行载体（M:N 协程调度）
     /// 内存布局：[ObjHeader][CoroutineFrame 字段][locals 区，64B 对齐]
     coroutine_frame,
-    /// 装箱标量：&i32/&f64 等标量引用的堆容器，内联标量值紧跟 ObjHeader 之后
-    /// 内存布局：[ObjHeader][标量值，最多 16B]
-    boxed_scalar,
 };
 
 /// 所有堆对象的统一头部
@@ -80,10 +77,6 @@ pub const ObjHeader = extern struct {
     /// 会存入主线程对象的字段。worker 退出后这些值变为悬垂指针。
     /// 主线程在 join 后通过此标记识别并迁移到自身 tctx。
     pub const WORKER_ALLOCATED: u8 = 1 << 2;
-    /// BoxedScalar 直接值模式：ObjHeader 之后存储完整 Value（24B）而非通道索引（2B）。
-    /// 用于 field_value 返回标量到 ref_chan 时保留类型信息（f64/i64 等位模式不可区分）。
-    /// unboxScalar 检测此标记后直接读取内联 Value，无需查通道。
-    pub const DIRECT_VALUE: u8 = 1 << 3;
 
     /// 标记为已被引擎跟踪
     pub inline fn markTracked(self: *ObjHeader) void {
@@ -115,18 +108,8 @@ pub const ObjHeader = extern struct {
         return (self.flags & WORKER_ALLOCATED) != 0;
     }
 
-    /// 标记 BoxedScalar 为直接值模式
-    pub inline fn markDirectValue(self: *ObjHeader) void {
-        self.flags |= DIRECT_VALUE;
-    }
-
-    /// 是否为直接值模式（BoxedScalar 内联存储 Value）
-    pub inline fn isDirectValue(self: *const ObjHeader) bool {
-        return (self.flags & DIRECT_VALUE) != 0;
-    }
-
     /// 所有已定义的 flags 位掩码（用于验证指针合法性）
-    pub const ALL_USED_FLAGS: u8 = TRACKED | ARENA_ALLOCATED | WORKER_ALLOCATED | DIRECT_VALUE;
+    pub const ALL_USED_FLAGS: u8 = TRACKED | ARENA_ALLOCATED | WORKER_ALLOCATED;
 
     /// 验证 ObjHeader 是否为合法堆对象（架构无关的指针验证）
     ///

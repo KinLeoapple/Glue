@@ -64,12 +64,21 @@ pub fn build(b: *std.Build) void {
     profiler_module.addImport("value", value_module);
 
     // ---- 语义分析模块族：分析数据库与各类检查器 ----
+    // v3 阶段 11：ast_visitor 从 static_analysis/ 提升至 sema/，作为独立模块供 analysis_db 消费
+    const ast_visitor_module = b.createModule(.{
+        .root_source_file = b.path("src/sema/ast_visitor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_visitor_module.addImport("ast", ast_module);
+
     const analysis_db_module = b.createModule(.{
         .root_source_file = b.path("src/sema/static_analysis/analysis_db.zig"),
         .target = target,
         .optimize = optimize,
     });
     analysis_db_module.addImport("ast", ast_module);
+    analysis_db_module.addImport("ast_visitor", ast_visitor_module);
 
     // ---- Builtin 元信息模块：集中管理 builtin 类型字段布局（sema 与 ir 共用） ----
     // 注意：import 名取 "glue_builtin" 避免与 Zig 标准内建模块 "builtin" 冲突
@@ -178,10 +187,15 @@ pub fn build(b: *std.Build) void {
     ir_module.addImport("analysis_db", analysis_db_module);
     ir_module.addImport("glue_builtin", builtin_module);
     ir_module.addImport("syscall", syscall_module);
+    // v3 阶段 3：ir → sema 导入（用于架构收敛，builder.zig 消费 sema 侧 infer*/chanTypeFrom*）
+    // Zig 0.16 支持模块间循环依赖（type_check ↔ subtype_check 已在用）。
+    ir_module.addImport("sema", type_check_module);
 
     // ---- sema 模块接入 IR 管线：type_check 及子检查器可读取 SemaResult 契约 ----
-    // 依赖方向：sema → ir → (ast, value)，ir 不依赖 sema，无循环。
+    // 依赖方向：sema ↔ ir（双向），sema 产出 SemaResult，ir 消费 sema 侧 infer*/chanTypeFrom*
     type_check_module.addImport("ir", ir_module);
+    // type_descriptor.zig 引用 value.Value（标量 vtable 的读写返回值类型）
+    type_check_module.addImport("value", value_module);
     subtype_check_module.addImport("ir", ir_module);
     throw_check_module.addImport("ir", ir_module);
     trait_resolve_module.addImport("ir", ir_module);
@@ -337,19 +351,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_syscall_unit_tests = b.addRunArtifact(syscall_unit_tests);
 
-    // Glue IR 模块测试（需导入 ast、value 和 syscall）
-    const ir_module_test = b.createModule(.{
-        .root_source_file = b.path("src/ir/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ir_module_test.addImport("ast", ast_module);
-    ir_module_test.addImport("value", value_module);
-    ir_module_test.addImport("analysis_db", analysis_db_module);
-    ir_module_test.addImport("glue_builtin", builtin_module);
-    ir_module_test.addImport("syscall", syscall_module);
+    // Glue IR 模块测试（需导入 ast、value、syscall 和 sema）
+    // 注意：直接复用 ir_module（非创建独立 ir_module_test），与 type_check_module
+    // 的 ir 依赖保持同一模块实例，避免 src/ir/mod.zig 同时作为 root 和 ir 模块根
+    // 造成的 "file exists in modules 'root' and 'ir'" 冲突。
     const ir_unit_tests = b.addTest(.{
-        .root_module = ir_module_test,
+        .root_module = ir_module,
     });
     const run_ir_unit_tests = b.addRunArtifact(ir_unit_tests);
 

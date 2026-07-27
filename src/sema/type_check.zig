@@ -17,47 +17,47 @@ const throw_check = @import("throw_check");
 const kind_check = @import("kind_check");
 const gadt_check = @import("gadt_check");
 const module_check = @import("module_check");
+const decl_classifier = @import("decl_classifier.zig");
 // state_machine_transform 已移至 ir 模块（避免 ir↔sema 循环依赖）
 
-/// SemaResult 契约类型（来自 ir 模块）：sema 产出、builder 消费的表达式类型映射。
-const SemaResult = ir.SemaResult;
-const ExprInfo = ir.ExprInfo;
+// ConcreteType 基础设施（替代 HM Type 系统）
+pub const concrete_type_mod = @import("concrete_type.zig");
+
+// TypeDescriptor + ScalarOps vtable（v3 spec §4.1）
+pub const type_descriptor = @import("type_descriptor.zig");
+
+// v3 新增：sema 图构建驱动器子模块
+pub const type_resolver = @import("type_resolver.zig");
+pub const inference = @import("inference.zig");
+pub const monomorph = @import("monomorph.zig");
+pub const chan_layout = @import("chan_layout.zig");
+pub const populate = @import("populate.zig");
+pub const builtin_types = @import("builtin_types.zig");
+
+/// SemaResult 契约类型：sema 产出、builder 消费的表达式类型映射。
+/// v3 阶段 3：sema_output.zig 已从 ir/ 迁入 sema/，直接引用同模块文件。
+pub const sema_output = @import("sema_output.zig");
+const SemaResult = sema_output.SemaResult;
+const ExprInfo = sema_output.ExprInfo;
 const ChanType = ir.ChanType;
 const ConstVal = ir.ConstVal;
-const TypeDefInfo = ir.sema_output_mod.TypeDefInfo;
-const CtorDefInfo = ir.sema_output_mod.CtorDefInfo;
-const TraitDefInfo = ir.sema_output_mod.TraitDefInfo;
-const FuncSigInfo = ir.sema_output_mod.FuncSigInfo;
-const TraitMethodSig = ir.sema_output_mod.TraitMethodSig;
-const FnSigRef = ir.sema_output_mod.FnSigRef;
-const TypeDefKind = ir.sema_output_mod.TypeDefKind;
+const TypeDefInfo = sema_output.TypeDefInfo;
+const CtorDefInfo = sema_output.CtorDefInfo;
+const TraitDefInfo = sema_output.TraitDefInfo;
+const FuncSigInfo = sema_output.FuncSigInfo;
+const TraitMethodSig = sema_output.TraitMethodSig;
+const FnSigRef = sema_output.FnSigRef;
+const TypeDefKind = sema_output.TypeDefKind;
 
 /// 将 sema 内部 Type 表示转换为 IR 的 ChanType（决定通道宽度）。
-/// 标量类型直接映射；复合类型（record/adt/array/fn/generic/trait）→ ref_chan（堆引用）；
+/// 标量/内置类型走 BUILTIN_TYPES 表查询（消除 22 分支 switch）；
+/// 复合类型（record/adt/array/fn/generic/trait）→ ref_chan（堆引用）；
 /// nullable/throw 递归取内部类型；type_var/unknown 返回 null（无法静态确定）。
 fn semaTypeToChanType(ty: *Type) ?ChanType {
+    // 表驱动：标量 + str/unit/null 等内置类型
+    if (builtinTypeChanType(ty.*)) |ct| return ct;
+    // 结构性分派：复合类型
     return switch (ty.*) {
-        .i8_type => .i8_chan,
-        .i16_type => .i16_chan,
-        .i32_type => .i32_chan,
-        .i64_type => .i64_chan,
-        .i128_type => .i128_chan,
-        .u8_type => .u8_chan,
-        .u16_type => .u16_chan,
-        .u32_type => .u32_chan,
-        .u64_type => .u64_chan,
-        .u128_type => .u128_chan,
-        .isize_type => .isize_chan,
-        .usize_type => .usize_chan,
-        .f16_type => .f16_chan,
-        .f32_type => .f32_chan,
-        .f64_type => .f64_chan,
-        .f128_type => .f128_chan,
-        .bool_type => .bool_chan,
-        .str_type => .ref_chan,
-        .char_type => .char_chan,
-        .null_type => .null_chan,
-        .unit_type => .unit_chan,
         .record_type, .adt_type, .array_type, .fn_type, .generic_type, .trait_type => .ref_chan,
         .nullable_type => |inner| blk: {
             const inner_ct = semaTypeToChanType(inner) orelse .ref_chan;
@@ -66,6 +66,7 @@ fn semaTypeToChanType(ty: *Type) ?ChanType {
         .ref_type => .ref_chan,
         .throw_type => |tt| semaTypeToChanType(tt.value_type) orelse .ref_chan,
         .type_var, .unknown_type, .never_type => null,
+        else => null,
     };
 }
 
@@ -75,33 +76,15 @@ fn semaTypeToChanType(ty: *Type) ?ChanType {
 /// 原始类型（i32/str/bool 等）返回对应名字，使表达式 type_name 能被 IRBuilder
 /// 的 lookupTypeId 解析为具体 type_id（单态化类型实参推断依赖此路径）。
 fn typeNameOfType(ty: *Type) ?[]const u8 {
+    // 表驱动：标量 + str/unit/null 等内置类型
+    if (builtinTypeName(ty.*)) |name| return name;
+    // 结构性分派：用户类型 + 递归包装
     return switch (ty.*) {
         .adt_type => |at| at.name,
         .generic_type => |gt| gt.name,
         .trait_type => |tt| tt.name,
         .ref_type => |rt| typeNameOfType(rt.inner),
         .nullable_type => |inner| typeNameOfType(inner),
-        .i8_type => "i8",
-        .i16_type => "i16",
-        .i32_type => "i32",
-        .i64_type => "i64",
-        .i128_type => "i128",
-        .u8_type => "u8",
-        .u16_type => "u16",
-        .u32_type => "u32",
-        .u64_type => "u64",
-        .u128_type => "u128",
-        .isize_type => "isize",
-        .usize_type => "usize",
-        .f16_type => "f16",
-        .f32_type => "f32",
-        .f64_type => "f64",
-        .f128_type => "f128",
-        .bool_type => "bool",
-        .str_type => "str",
-        .char_type => "char",
-        .unit_type => "Unit",
-        .null_type => "Null",
         else => null,
     };
 }
@@ -124,450 +107,90 @@ fn typeNamesOfTypes(allocator: std.mem.Allocator, types: []const *Type) ![]const
     return result;
 }
 
-var next_type_id: usize = 0;
 
 const SINGLETON_COUNT: usize = 22;
+/// 表驱动：Type → singleton 索引（消除 22 分支 switch）
 fn singletonIdx(tag: Type) usize {
-    return switch (tag) {
-        .i8_type => 0,
-        .i16_type => 1,
-        .i32_type => 2,
-        .i64_type => 3,
-        .i128_type => 4,
-        .u8_type => 5,
-        .u16_type => 6,
-        .u32_type => 7,
-        .u64_type => 8,
-        .u128_type => 9,
-        .f16_type => 10,
-        .f32_type => 11,
-        .f64_type => 12,
-        .f128_type => 13,
-        .bool_type => 14,
-        .str_type => 15,
-        .char_type => 16,
-        .null_type => 17,
-        .unit_type => 18,
-        .unknown_type => 19,
-        .isize_type => 20,
-        .usize_type => 21,
-        else => SINGLETON_COUNT,
-    };
+    return builtinTypeSingletonIdx(tag) orelse SINGLETON_COUNT;
 }
-/// Glue 语言的类型表示。涵盖基本类型（整型、浮点、布尔、字符串等）、类型变量、
-/// 函数类型、记录类型、ADT 类型、可空类型、泛型类型、数组类型、throw 类型和 trait 类型。
-pub const Type = union(enum) {
-    i8_type,
-    i16_type,
-    i32_type,
-    i64_type,
-    i128_type,
-    u8_type,
-    u16_type,
-    u32_type,
-    u64_type,
-    u128_type,
-    isize_type,
-    usize_type,
-    f16_type,
-    f32_type,
-    f64_type,
-    f128_type,
-    bool_type,
-    str_type,
-    char_type,
-    null_type,
-    unit_type,
-    /// 发散类型：表示通过 return/throw 等控制流提前退出的表达式不产生值。
-    /// never_type 与任何类型兼容（统一为对方），用于 match 分支、if 分支等
-    /// 含早退路径的类型统一场景。
-    never_type,
-    type_var: *TypeVar,
-    fn_type: struct {
-        params: []*Type,
-        return_type: *Type,
-    },
-    record_type: struct {
-        fields: []FieldType,
-    },
-    adt_type: struct {
-        name: []const u8,
-        type_args: []*Type,
-    },
-    nullable_type: *Type,
-    generic_type: struct {
-        name: []const u8,
-        args: []*Type,
-    },
-    array_type: struct {
-        element_type: *Type,
-        size: ?u64,
-    },
-    throw_type: struct {
-        value_type: *Type,
-        error_type: *Type,
-    },
-    trait_type: struct {
-        name: []const u8,
-        type_args: []*Type,
-    },
-    /// 借用引用 &T 或裸指针 *T：指向已有对象，通道存指针
-    ref_type: struct {
-        inner: *Type,
-        is_raw: bool,
-    },
-    unknown_type,
+// ConcreteType 别名：旧 HM Type 已删除，统一使用 concrete_type.zig 的 ConcreteType。
+pub const Type = concrete_type_mod.ConcreteType;
+pub const FieldType = concrete_type_mod.ConcreteType.FieldType;
 
-    pub fn isIntType(self: Type) bool {
-        return switch (self) {
-            .i8_type, .i16_type, .i32_type, .i64_type, .i128_type, .u8_type, .u16_type, .u32_type, .u64_type, .u128_type, .isize_type, .usize_type => true,
-            else => false,
-        };
-    }
-    pub fn isFloatType(self: Type) bool {
-        return switch (self) {
-            .f16_type, .f32_type, .f64_type, .f128_type => true,
-            else => false,
-        };
-    }
-
-    // ── Phase 4 isWidening 辅助函数（按 spec §4.2 / §7.2 精确路径表）──
-
-    /// 整数类型的位宽（isize/usize 跟随平台位宽）
-    pub fn intTypeBitWidth(self: Type) ?u16 {
-        return switch (self) {
-            .i8_type, .u8_type => 8,
-            .i16_type, .u16_type => 16,
-            .i32_type, .u32_type => 32,
-            .i64_type, .u64_type => 64,
-            .i128_type, .u128_type => 128,
-            .isize_type, .usize_type => @intCast(@bitSizeOf(isize)),
-            else => null,
-        };
-    }
-
-    /// 浮点类型的位宽
-    pub fn floatTypeBitWidth(self: Type) ?u16 {
-        return switch (self) {
-            .f16_type => 16,
-            .f32_type => 32,
-            .f64_type => 64,
-            .f128_type => 128,
-            else => null,
-        };
-    }
-
-    /// 整数是否为有符号类型
-    pub fn isSignedIntType(self: Type) bool {
-        return switch (self) {
-            .i8_type, .i16_type, .i32_type, .i64_type, .i128_type, .isize_type => true,
-            else => false,
-        };
-    }
-
-    /// int→float 精确 widening 路径表（spec §4.2）
-    /// 关键变化：
-    ///   - i64→f64 不再是 widening（i64 有 64 位精度，f64 只有 53 位尾数）
-    ///   - i128→f128 不是 widening（i128 有 128 位精度，f128 只有 113 位尾数）
-    ///   - i8/i16/u8/u16 → f32/f64/f128 widening（精度无损）
-    ///   - i32/u32 → f64/f128 widening
-    ///   - i64/u64 → f128 widening（i64→f64 丢精度）
-    ///   - i128/u128 → 无 widening 路径
-    ///   - isize/usize 按平台位宽对应到 i64/u64（64 位平台）或 i32/u32（32 位平台）
-    ///   - 任何 int→f16 都不是 widening（f16 仅 10 位尾数，无法无损表示任何整数）
-    pub fn intToFloatWidening(int_ty: Type, float_ty: Type) bool {
-        const platform_bits: u16 = @intCast(@bitSizeOf(isize));
-        return switch (int_ty) {
-            .i8_type, .u8_type, .i16_type, .u16_type => switch (float_ty) {
-                .f32_type, .f64_type, .f128_type => true,
-                else => false, // f16 不算 widening
-            },
-            .i32_type, .u32_type => switch (float_ty) {
-                .f64_type, .f128_type => true,
-                else => false,
-            },
-            .i64_type, .u64_type => switch (float_ty) {
-                .f128_type => true,
-                else => false,
-            },
-            .i128_type, .u128_type => false, // 无 widening 路径
-            .isize_type, .usize_type => blk: {
-                // 按平台位宽等价映射到 i64/u64 或 i32/u32
-                const equiv: Type = if (platform_bits <= 32)
-                    if (int_ty == .isize_type) .i32_type else .u32_type
-                else
-                    if (int_ty == .isize_type) .i64_type else .u64_type;
-                break :blk intToFloatWidening(equiv, float_ty);
-            },
-            else => false,
-        };
-    }
-    pub fn isNumericType(self: Type) bool {
-        return self.isIntType() or self.isFloatType();
-    }
-    pub fn format(self: Type, writer: anytype) !void {
-        if (builtinTypeName(self)) |name| {
-            if (self == .unit_type) {
-                try writer.writeAll("()");
-            } else {
-                try writer.writeAll(name);
-            }
-            return;
-        }
-        switch (self) {
-            .type_var => |tv| {
-                if (tv.bound) |bound| {
-                    try bound.*.format(writer);
-                } else {
-                    try writer.print("'_{}", .{tv.id});
-                }
-            },
-            .fn_type => |ft| {
-                try writer.writeAll("(");
-                for (ft.params, 0..) |param, i| {
-                    if (i > 0) try writer.writeAll(", ");
-                    try param.*.format(writer);
-                }
-                try writer.writeAll(") -> ");
-                try ft.return_type.*.format(writer);
-            },
-            .record_type => |rt| {
-                try writer.writeAll("(");
-                for (rt.fields, 0..) |field, i| {
-                    if (i > 0) try writer.writeAll(", ");
-                    try writer.print("{s}: ", .{field.name});
-                    try field.ty.*.format(writer);
-                }
-                try writer.writeAll(")");
-            },
-            .adt_type => |at| {
-                try writer.writeAll(at.name);
-                if (at.type_args.len > 0) {
-                    try writer.writeAll("<");
-                    for (at.type_args, 0..) |arg, i| {
-                        if (i > 0) try writer.writeAll(", ");
-                        try arg.*.format(writer);
-                    }
-                    try writer.writeAll(">");
-                }
-            },
-            .nullable_type => |inner| {
-                try inner.*.format(writer);
-                try writer.writeAll("?");
-            },
-            .ref_type => |rt| {
-                try writer.writeAll(if (rt.is_raw) "*" else "&");
-                try rt.inner.*.format(writer);
-            },
-            .generic_type => |gt| {
-                try writer.writeAll(gt.name);
-                if (gt.args.len > 0) {
-                    try writer.writeAll("<");
-                    for (gt.args, 0..) |arg, i| {
-                        if (i > 0) try writer.writeAll(", ");
-                        try arg.*.format(writer);
-                    }
-                    try writer.writeAll(">");
-                }
-            },
-            .array_type => |at| {
-                try at.element_type.*.format(writer);
-                try writer.writeAll("[");
-                if (at.size) |s| {
-                    try writer.print("{}", .{s});
-                }
-                try writer.writeAll("]");
-            },
-            .throw_type => |tt| {
-                try writer.writeAll("Throw<");
-                try tt.value_type.*.format(writer);
-                try writer.writeAll(", ");
-                try tt.error_type.*.format(writer);
-                try writer.writeAll(">");
-            },
-            .trait_type => |tt| {
-                try writer.writeAll(tt.name);
-                if (tt.type_args.len > 0) {
-                    try writer.writeAll("<");
-                    for (tt.type_args, 0..) |arg, i| {
-                        if (i > 0) try writer.writeAll(", ");
-                        try arg.*.format(writer);
-                    }
-                    try writer.writeAll(">");
-                }
-            },
-            .unknown_type => try writer.writeAll("?"),
-            else => unreachable,
-        }
-    }
-    pub fn formatArrayList(self: Type, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
-        if (builtinTypeName(self)) |name| {
-            if (self == .unit_type) {
-                try buf.appendSlice(allocator, "()");
-            } else {
-                try buf.appendSlice(allocator, name);
-            }
-            return;
-        }
-        switch (self) {
-            .type_var => |tv| {
-                if (tv.bound) |bound| {
-                    try bound.*.formatArrayList(buf, allocator);
-                } else {
-                    try buf.print(allocator, "'_{}", .{tv.id});
-                }
-            },
-            .fn_type => |ft| {
-                try buf.appendSlice(allocator, "(");
-                for (ft.params, 0..) |param, i| {
-                    if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try param.*.formatArrayList(buf, allocator);
-                }
-                try buf.appendSlice(allocator, ") -> ");
-                try ft.return_type.*.formatArrayList(buf, allocator);
-            },
-            .record_type => |rt| {
-                try buf.appendSlice(allocator, "(");
-                for (rt.fields, 0..) |field, i| {
-                    if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try buf.print(allocator, "{s}: ", .{field.name});
-                    try field.ty.*.formatArrayList(buf, allocator);
-                }
-                try buf.appendSlice(allocator, ")");
-            },
-            .adt_type => |at| {
-                try buf.appendSlice(allocator, at.name);
-                if (at.type_args.len > 0) {
-                    try buf.appendSlice(allocator, "<");
-                    for (at.type_args, 0..) |arg, i| {
-                        if (i > 0) try buf.appendSlice(allocator, ", ");
-                        try arg.*.formatArrayList(buf, allocator);
-                    }
-                    try buf.appendSlice(allocator, ">");
-                }
-            },
-            .nullable_type => |inner| {
-                try inner.*.formatArrayList(buf, allocator);
-                try buf.appendSlice(allocator, "?");
-            },
-            .ref_type => |rt| {
-                try buf.appendSlice(allocator, if (rt.is_raw) "*" else "&");
-                try rt.inner.*.formatArrayList(buf, allocator);
-            },
-            .generic_type => |gt| {
-                try buf.appendSlice(allocator, gt.name);
-                if (gt.args.len > 0) {
-                    try buf.appendSlice(allocator, "<");
-                    for (gt.args, 0..) |arg, i| {
-                        if (i > 0) try buf.appendSlice(allocator, ", ");
-                        try arg.*.formatArrayList(buf, allocator);
-                    }
-                    try buf.appendSlice(allocator, ">");
-                }
-            },
-            .array_type => |at| {
-                try at.element_type.*.formatArrayList(buf, allocator);
-                try buf.appendSlice(allocator, "[");
-                if (at.size) |s| {
-                    try buf.print(allocator, "{}", .{s});
-                }
-                try buf.appendSlice(allocator, "]");
-            },
-            .throw_type => |tt| {
-                try buf.appendSlice(allocator, "Throw<");
-                try tt.value_type.*.formatArrayList(buf, allocator);
-                try buf.appendSlice(allocator, ", ");
-                try tt.error_type.*.formatArrayList(buf, allocator);
-                try buf.appendSlice(allocator, ">");
-            },
-            .trait_type => |tt| {
-                try buf.appendSlice(allocator, tt.name);
-                if (tt.type_args.len > 0) {
-                    try buf.appendSlice(allocator, "<");
-                    for (tt.type_args, 0..) |arg, i| {
-                        if (i > 0) try buf.appendSlice(allocator, ", ");
-                        try arg.*.formatArrayList(buf, allocator);
-                    }
-                    try buf.appendSlice(allocator, ">");
-                }
-            },
-            .unknown_type => try buf.appendSlice(allocator, "?"),
-            else => unreachable,
-        }
-    }
-};
-
-/// 内置类型名 ↔ Type 枚举映射表。
-/// 涵盖文档中所有内置类型：i8~i128、u8~u128、f16~f128、bool、str、char、Unit、Null。
-const BuiltinTypeEntry = struct { name: []const u8, ty: Type };
+/// 内置类型名 ↔ Type 枚举映射表（单一真相来源）。
+/// 涵盖文档中所有内置类型：i8~i128、u8~u128、isize/usize、f16~f128、bool、str、char、Unit、Null。
+/// chan 字段：Type → ChanType 映射（消除 semaTypeToChanType 的 22 分支 switch）。
+/// singleton_idx 字段：Type → singleton 索引（消除 singletonIdx 的 22 分支 switch）。
+const BuiltinTypeEntry = struct { name: []const u8, ty: Type, chan: ChanType, singleton_idx: usize };
 
 /// 所有内置类型条目（comptime 表，单一真相来源）
+/// 新增标量只需在此追加一条，semaTypeToChanType/typeNameOfType/singletonIdx 自动覆盖
 const BUILTIN_TYPES = [_]BuiltinTypeEntry{
-    .{ .name = "i8", .ty = .i8_type },
-    .{ .name = "i16", .ty = .i16_type },
-    .{ .name = "i32", .ty = .i32_type },
-    .{ .name = "i64", .ty = .i64_type },
-    .{ .name = "i128", .ty = .i128_type },
-    .{ .name = "u8", .ty = .u8_type },
-    .{ .name = "u16", .ty = .u16_type },
-    .{ .name = "u32", .ty = .u32_type },
-    .{ .name = "u64", .ty = .u64_type },
-    .{ .name = "u128", .ty = .u128_type },
-    .{ .name = "isize", .ty = .isize_type },
-    .{ .name = "usize", .ty = .usize_type },
-    .{ .name = "f16", .ty = .f16_type },
-    .{ .name = "f32", .ty = .f32_type },
-    .{ .name = "f64", .ty = .f64_type },
-    .{ .name = "f128", .ty = .f128_type },
-    .{ .name = "bool", .ty = .bool_type },
-    .{ .name = "str", .ty = .str_type },
-    .{ .name = "char", .ty = .char_type },
-    .{ .name = "Unit", .ty = .unit_type },
-    .{ .name = "Null", .ty = .null_type },
+    .{ .name = "i8", .ty = .i8_type, .chan = .i8_chan, .singleton_idx = 0 },
+    .{ .name = "i16", .ty = .i16_type, .chan = .i16_chan, .singleton_idx = 1 },
+    .{ .name = "i32", .ty = .i32_type, .chan = .i32_chan, .singleton_idx = 2 },
+    .{ .name = "i64", .ty = .i64_type, .chan = .i64_chan, .singleton_idx = 3 },
+    .{ .name = "i128", .ty = .i128_type, .chan = .i128_chan, .singleton_idx = 4 },
+    .{ .name = "u8", .ty = .u8_type, .chan = .u8_chan, .singleton_idx = 5 },
+    .{ .name = "u16", .ty = .u16_type, .chan = .u16_chan, .singleton_idx = 6 },
+    .{ .name = "u32", .ty = .u32_type, .chan = .u32_chan, .singleton_idx = 7 },
+    .{ .name = "u64", .ty = .u64_type, .chan = .u64_chan, .singleton_idx = 8 },
+    .{ .name = "u128", .ty = .u128_type, .chan = .u128_chan, .singleton_idx = 9 },
+    .{ .name = "f16", .ty = .f16_type, .chan = .f16_chan, .singleton_idx = 10 },
+    .{ .name = "f32", .ty = .f32_type, .chan = .f32_chan, .singleton_idx = 11 },
+    .{ .name = "f64", .ty = .f64_type, .chan = .f64_chan, .singleton_idx = 12 },
+    .{ .name = "f128", .ty = .f128_type, .chan = .f128_chan, .singleton_idx = 13 },
+    .{ .name = "bool", .ty = .bool_type, .chan = .bool_chan, .singleton_idx = 14 },
+    .{ .name = "str", .ty = .str_type, .chan = .ref_chan, .singleton_idx = 15 },
+    .{ .name = "char", .ty = .char_type, .chan = .char_chan, .singleton_idx = 16 },
+    .{ .name = "Null", .ty = .null_type, .chan = .null_chan, .singleton_idx = 17 },
+    .{ .name = "Unit", .ty = .unit_type, .chan = .unit_chan, .singleton_idx = 18 },
+    .{ .name = "isize", .ty = .isize_type, .chan = .isize_chan, .singleton_idx = 20 },
+    .{ .name = "usize", .ty = .usize_type, .chan = .usize_chan, .singleton_idx = 21 },
 };
 
 /// 数值类型条目（整数 + 浮点，用于类型转换函数注册）
 const NUMERIC_TYPES = [_]BuiltinTypeEntry{
-    .{ .name = "i8", .ty = .i8_type },
-    .{ .name = "i16", .ty = .i16_type },
-    .{ .name = "i32", .ty = .i32_type },
-    .{ .name = "i64", .ty = .i64_type },
-    .{ .name = "i128", .ty = .i128_type },
-    .{ .name = "u8", .ty = .u8_type },
-    .{ .name = "u16", .ty = .u16_type },
-    .{ .name = "u32", .ty = .u32_type },
-    .{ .name = "u64", .ty = .u64_type },
-    .{ .name = "u128", .ty = .u128_type },
-    .{ .name = "isize", .ty = .isize_type },
-    .{ .name = "usize", .ty = .usize_type },
-    .{ .name = "f16", .ty = .f16_type },
-    .{ .name = "f32", .ty = .f32_type },
-    .{ .name = "f64", .ty = .f64_type },
-    .{ .name = "f128", .ty = .f128_type },
+    .{ .name = "i8", .ty = .i8_type, .chan = .i8_chan, .singleton_idx = 0 },
+    .{ .name = "i16", .ty = .i16_type, .chan = .i16_chan, .singleton_idx = 1 },
+    .{ .name = "i32", .ty = .i32_type, .chan = .i32_chan, .singleton_idx = 2 },
+    .{ .name = "i64", .ty = .i64_type, .chan = .i64_chan, .singleton_idx = 3 },
+    .{ .name = "i128", .ty = .i128_type, .chan = .i128_chan, .singleton_idx = 4 },
+    .{ .name = "u8", .ty = .u8_type, .chan = .u8_chan, .singleton_idx = 5 },
+    .{ .name = "u16", .ty = .u16_type, .chan = .u16_chan, .singleton_idx = 6 },
+    .{ .name = "u32", .ty = .u32_type, .chan = .u32_chan, .singleton_idx = 7 },
+    .{ .name = "u64", .ty = .u64_type, .chan = .u64_chan, .singleton_idx = 8 },
+    .{ .name = "u128", .ty = .u128_type, .chan = .u128_chan, .singleton_idx = 9 },
+    .{ .name = "isize", .ty = .isize_type, .chan = .isize_chan, .singleton_idx = 20 },
+    .{ .name = "usize", .ty = .usize_type, .chan = .usize_chan, .singleton_idx = 21 },
+    .{ .name = "f16", .ty = .f16_type, .chan = .f16_chan, .singleton_idx = 10 },
+    .{ .name = "f32", .ty = .f32_type, .chan = .f32_chan, .singleton_idx = 11 },
+    .{ .name = "f64", .ty = .f64_type, .chan = .f64_chan, .singleton_idx = 12 },
+    .{ .name = "f128", .ty = .f128_type, .chan = .f128_chan, .singleton_idx = 13 },
 };
 
 /// 整数后缀条目（仅整数，用于整数字面量后缀推断）
 const INT_SUFFIXES = [_]BuiltinTypeEntry{
-    .{ .name = "i8", .ty = .i8_type },
-    .{ .name = "i16", .ty = .i16_type },
-    .{ .name = "i32", .ty = .i32_type },
-    .{ .name = "i64", .ty = .i64_type },
-    .{ .name = "i128", .ty = .i128_type },
-    .{ .name = "u8", .ty = .u8_type },
-    .{ .name = "u16", .ty = .u16_type },
-    .{ .name = "u32", .ty = .u32_type },
-    .{ .name = "u64", .ty = .u64_type },
-    .{ .name = "u128", .ty = .u128_type },
-    .{ .name = "isize", .ty = .isize_type },
-    .{ .name = "usize", .ty = .usize_type },
+    .{ .name = "i8", .ty = .i8_type, .chan = .i8_chan, .singleton_idx = 0 },
+    .{ .name = "i16", .ty = .i16_type, .chan = .i16_chan, .singleton_idx = 1 },
+    .{ .name = "i32", .ty = .i32_type, .chan = .i32_chan, .singleton_idx = 2 },
+    .{ .name = "i64", .ty = .i64_type, .chan = .i64_chan, .singleton_idx = 3 },
+    .{ .name = "i128", .ty = .i128_type, .chan = .i128_chan, .singleton_idx = 4 },
+    .{ .name = "u8", .ty = .u8_type, .chan = .u8_chan, .singleton_idx = 5 },
+    .{ .name = "u16", .ty = .u16_type, .chan = .u16_chan, .singleton_idx = 6 },
+    .{ .name = "u32", .ty = .u32_type, .chan = .u32_chan, .singleton_idx = 7 },
+    .{ .name = "u64", .ty = .u64_type, .chan = .u64_chan, .singleton_idx = 8 },
+    .{ .name = "u128", .ty = .u128_type, .chan = .u128_chan, .singleton_idx = 9 },
+    .{ .name = "isize", .ty = .isize_type, .chan = .isize_chan, .singleton_idx = 20 },
+    .{ .name = "usize", .ty = .usize_type, .chan = .usize_chan, .singleton_idx = 21 },
 };
 
 /// 浮点后缀条目
 const FLOAT_SUFFIXES = [_]BuiltinTypeEntry{
-    .{ .name = "f16", .ty = .f16_type },
-    .{ .name = "f32", .ty = .f32_type },
-    .{ .name = "f64", .ty = .f64_type },
-    .{ .name = "f128", .ty = .f128_type },
+    .{ .name = "f16", .ty = .f16_type, .chan = .f16_chan, .singleton_idx = 10 },
+    .{ .name = "f32", .ty = .f32_type, .chan = .f32_chan, .singleton_idx = 11 },
+    .{ .name = "f64", .ty = .f64_type, .chan = .f64_chan, .singleton_idx = 12 },
+    .{ .name = "f128", .ty = .f128_type, .chan = .f128_chan, .singleton_idx = 13 },
 };
 
 /// 按 Type 枚举查找内置类型名字符串，未找到返回 null
@@ -578,22 +201,26 @@ fn builtinTypeName(ty: Type) ?[]const u8 {
     return null;
 }
 
-/// 类型变量。用于 Hindley-Milner 推断中的未解析类型，通过 id 唯一标识，
-/// bound 字段在统一后指向绑定的具体类型。
-pub const TypeVar = struct {
-    id: usize,
-    bound: ?*Type = null,
-    pub fn init() TypeVar {
-        const id = next_type_id;
-        next_type_id += 1;
-        return TypeVar{ .id = id };
+/// 按 Type 枚举查找 ChanType，未找到返回 null（v3 阶段 10：消除 semaTypeToChanType switch）
+fn builtinTypeChanType(ty: Type) ?ChanType {
+    inline for (BUILTIN_TYPES) |entry| {
+        if (std.meta.activeTag(ty) == entry.ty) return entry.chan;
     }
-};
-/// 记录字段：字段名与字段类型的配对。
-pub const FieldType = struct {
-    name: []const u8,
-    ty: *Type,
-};
+    return null;
+}
+
+/// 按 Type 枚举查找 singleton 索引，未找到返回 null（v3 阶段 10：消除 singletonIdx switch）
+/// unknown_type 不在 BUILTIN_TYPES 中（无用户名），单独处理
+fn builtinTypeSingletonIdx(ty: Type) ?usize {
+    inline for (BUILTIN_TYPES) |entry| {
+        if (std.meta.activeTag(ty) == entry.ty) return entry.singleton_idx;
+    }
+    if (std.meta.activeTag(ty) == .unknown_type) return 19;
+    return null;
+}
+
+// TypeVar 别名：使用 concrete_type.zig 的 TypeVar（含 is_rigid 字段和 init() 方法）。
+pub const TypeVar = concrete_type_mod.TypeVar;
 /// ADT（代数数据类型）信息。记录类型、构造器名列表、是否为 error newtype、
 /// 类型参数、所属模块、是否为 GADT 以及各构造器的字段类型 / 名称 / 返回类型。
 pub const AdtInfo = struct {
@@ -622,7 +249,7 @@ pub const TraitInfo = struct {
     method_names: []const []const u8 = &[_][]const u8{},
     /// 仅含无默认实现的方法名（实现类型必须提供这些方法）
     required_method_names: []const []const u8 = &[_][]const u8{},
-    method_schemes: std.StringHashMap(TypeScheme),
+    method_schemes: std.StringHashMap(*Type),
     defining_module: []const u8 = "",
     type_param_kind_arities: []const usize = &[_]usize{},
     /// trait 声明中 Self 对应的 type var id，用于签名匹配时替换
@@ -630,26 +257,16 @@ pub const TraitInfo = struct {
     /// trait 类型参数对应的 type var ids，用于签名匹配时替换
     trait_type_param_var_ids: []const usize = &[_]usize{},
 };
-/// 类型方案（type scheme）。量化变量列表表示全称量化，bounds 记录 trait 约束。
-pub const TypeScheme = struct {
-    quantified_vars: []usize,
-    ty: *Type,
-    bounds: []BoundInfo = &[_]BoundInfo{},
-};
-/// Trait 约束信息：trait 名与对应的类型参数索引。
-pub const BoundInfo = struct {
-    trait_name: []const u8,
-    type_param_index: usize,
-};
-/// 类型环境。通过 parent 指针形成词法作用域链，用于变量名到类型方案的查找。
+/// 类型环境。通过 parent 指针形成词法作用域链，用于变量名到类型的查找。
+/// ConcreteType 替换 HM 后无 TypeScheme 包装，直接存储 *Type。
 pub const TypeEnv = struct {
     allocator: std.mem.Allocator,
-    bindings: std.StringHashMap(TypeScheme),
+    bindings: std.StringHashMap(*Type),
     parent: ?*TypeEnv,
     pub fn init(allocator: std.mem.Allocator) TypeEnv {
         return TypeEnv{
             .allocator = allocator,
-            .bindings = std.StringHashMap(TypeScheme).init(allocator),
+            .bindings = std.StringHashMap(*Type).init(allocator),
             .parent = null,
         };
     }
@@ -657,7 +274,6 @@ pub const TypeEnv = struct {
         var iter = self.bindings.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.quantified_vars);
         }
         self.bindings.deinit();
     }
@@ -667,28 +283,28 @@ pub const TypeEnv = struct {
         child.parent = self;
         return child;
     }
-    pub fn define(self: *TypeEnv, name: []const u8, scheme: TypeScheme) !void {
+    pub fn define(self: *TypeEnv, name: []const u8, ty: *Type) !void {
         if (self.bindings.contains(name)) {
             return error.DuplicateDefinition;
         }
         const key = try self.allocator.dupe(u8, name);
-        try self.bindings.put(key, scheme);
+        try self.bindings.put(key, ty);
     }
-    pub fn defineOrReport(self: *TypeEnv, name: []const u8, scheme: TypeScheme) !bool {
+    pub fn defineOrReport(self: *TypeEnv, name: []const u8, ty: *Type) !bool {
         if (self.bindings.contains(name)) {
             return false;
         }
         const key = try self.allocator.dupe(u8, name);
-        try self.bindings.put(key, scheme);
+        try self.bindings.put(key, ty);
         return true;
     }
-    pub fn redefine(self: *TypeEnv, name: []const u8, scheme: TypeScheme) !void {
+    pub fn redefine(self: *TypeEnv, name: []const u8, ty: *Type) !void {
         const key = try self.allocator.dupe(u8, name);
-        try self.bindings.put(key, scheme);
+        try self.bindings.put(key, ty);
     }
-    pub fn lookup(self: *TypeEnv, name: []const u8) ?TypeScheme {
-        if (self.bindings.get(name)) |scheme| {
-            return scheme;
+    pub fn lookup(self: *TypeEnv, name: []const u8) ?*Type {
+        if (self.bindings.get(name)) |ty| {
+            return ty;
         }
         if (self.parent) |parent| {
             return parent.lookup(name);
@@ -764,7 +380,7 @@ pub const TypeInferencer = struct {
     /// sema 输出契约：若非 null，inferExpr 会把每个表达式推断出的类型记录到此结构，
     /// 供 IRBuilder 在图构建时读取（驱动式接入）。
     sema_result: ?*SemaResult = null,
-    exported_schemes: std.StringHashMap(TypeScheme),
+    exported_schemes: std.StringHashMap(*Type),
     module_member_sigs: std.StringHashMap([]module_check.MethodSig),
     module_submodules: std.StringHashMap([][]const u8),
     known_modules: std.StringHashMap(void),
@@ -797,7 +413,7 @@ pub const TypeInferencer = struct {
             .fn_bounds = std.StringHashMap([]ast.TraitBound).init(allocator),
             .predeclared_fns = std.StringHashMap(void).init(allocator),
             .predeclared_types = std.StringHashMap(void).init(allocator),
-            .exported_schemes = std.StringHashMap(TypeScheme).init(allocator),
+            .exported_schemes = std.StringHashMap(*Type).init(allocator),
             .module_member_sigs = std.StringHashMap([]module_check.MethodSig).init(allocator),
             .module_submodules = std.StringHashMap([][]const u8).init(allocator),
             .known_modules = std.StringHashMap(void).init(allocator),
@@ -1080,7 +696,7 @@ pub const TypeInferencer = struct {
         defer required.deinit(self.arena.allocator());
         for (trait_info.method_names) |mname| {
             const scheme = trait_info.method_schemes.get(mname) orelse continue;
-            const rt = self.resolve(scheme.ty);
+            const rt = self.resolve(scheme);
             const arity: usize = if (rt.* == .fn_type) rt.fn_type.params.len else 0;
             required.append(self.arena.allocator(), .{ .name = mname, .arity = arity }) catch continue;
         }
@@ -1144,7 +760,7 @@ pub const TypeInferencer = struct {
                 for (smaller.fields) |sf| {
                     var found = false;
                     for (larger.fields) |lf| {
-                        if (std.mem.eql(u8, sf.name, lf.name)) {
+                        if (std.mem.eql(u8, sf.name orelse "", lf.name orelse "")) {
                             try self.unify(sf.ty, lf.ty);
                             found = true;
                             break;
@@ -1307,7 +923,7 @@ pub const TypeInferencer = struct {
                 const ab = b.record_type;
                 if (aa.fields.len != ab.fields.len) return false;
                 for (aa.fields, 0..) |fa, i| {
-                    if (!std.mem.eql(u8, fa.name, ab.fields[i].name)) return false;
+                    if (!std.mem.eql(u8, fa.name orelse "", ab.fields[i].name orelse "")) return false;
                     if (!self.typesStructurallyEqual(fa.ty, ab.fields[i].ty)) return false;
                 }
                 return true;
@@ -1380,6 +996,19 @@ pub const TypeInferencer = struct {
                 const new_elem = try self.applyTypeSubst(at.element_type, subst);
                 const result = self.arena.allocator().create(Type) catch return error.OutOfMemory;
                 result.* = Type{ .array_type = .{ .element_type = new_elem, .size = at.size } };
+                self.types.append(self.arena.allocator(), result) catch return error.OutOfMemory;
+                return result;
+            },
+            .record_type => |rt| {
+                const new_fields = self.arena.allocator().alloc(FieldType, rt.fields.len) catch return error.OutOfMemory;
+                for (rt.fields, 0..) |f, i| {
+                    new_fields[i] = FieldType{
+                        .name = f.name,
+                        .ty = try self.applyTypeSubst(f.ty, subst),
+                    };
+                }
+                const result = self.arena.allocator().create(Type) catch return error.OutOfMemory;
+                result.* = Type{ .record_type = .{ .fields = new_fields } };
                 self.types.append(self.arena.allocator(), result) catch return error.OutOfMemory;
                 return result;
             },
@@ -1509,62 +1138,8 @@ pub const TypeInferencer = struct {
             else => return false,
         }
     }
-    /// 泛化类型：将不在环境中自由出现的类型变量量化为类型方案。
-    pub fn generalize(self: *TypeInferencer, env: *TypeEnv, ty: *Type) !TypeScheme {
-        _ = env;
-        var free_vars = std.ArrayList(usize).empty;
-        defer free_vars.deinit(self.arena.allocator());
-        self.collectFreeVars(ty, &free_vars);
-        const quantified = try self.arena.allocator().dupe(usize, free_vars.items);
-        return TypeScheme{
-            .quantified_vars = quantified,
-            .ty = ty,
-        };
-    }
-    pub fn generalizeWithBounds(self: *TypeInferencer, env: *TypeEnv, ty: *Type, type_param_ids: []usize, bounds: []ast.TraitBound) !TypeScheme {
-        _ = env;
-        var free_vars = std.ArrayList(usize).empty;
-        defer free_vars.deinit(self.arena.allocator());
-        self.collectFreeVars(ty, &free_vars);
-        const quantified = try self.arena.allocator().dupe(usize, free_vars.items);
-        var bound_infos = std.ArrayList(BoundInfo).empty;
-        defer bound_infos.deinit(self.arena.allocator());
-        for (bounds) |bound| {
-            for (bound.type_args) |_| {
-                for (type_param_ids, 0..) |param_id, param_idx| {
-                    for (quantified, 0..) |qvar_id, qidx| {
-                        if (qvar_id == param_id) {
-                            bound_infos.append(self.arena.allocator(), BoundInfo{
-                                .trait_name = bound.trait_name,
-                                .type_param_index = qidx,
-                            }) catch return TypeScheme{ .quantified_vars = quantified, .ty = ty };
-                            break;
-                        }
-                    }
-                    _ = param_idx;
-                    break;
-                }
-            }
-        }
-        const owned_bounds = try self.arena.allocator().dupe(BoundInfo, bound_infos.items);
-        return TypeScheme{
-            .quantified_vars = quantified,
-            .ty = ty,
-            .bounds = owned_bounds,
-        };
-    }
-    /// 实例化类型方案：将量化变量替换为新的类型变量。
-    pub fn instantiate(self: *TypeInferencer, scheme: TypeScheme) !*Type {
-        if (scheme.quantified_vars.len == 0) return scheme.ty;
-        var subst = std.AutoHashMap(usize, *Type).init(self.arena.allocator());
-        defer subst.deinit();
-        for (scheme.quantified_vars) |var_id| {
-            const fresh = try self.freshTypeVar();
-            try subst.put(var_id, fresh);
-        }
-        return self.applySubst(scheme.ty, subst);
-    }
-    /// 刷新类型：将类型中的量化变量替换为新的类型变量，用于保持类型方案的独立性。
+    /// 刷新类型：将类型中的未绑定 type_var 替换为新的 type_var，
+    /// 用于从环境查找泛型函数类型时保持各次调用的独立性（替代旧 HM instantiate）。
     pub fn freshenType(self: *TypeInferencer, ty: *Type) !*Type {
         var free_vars = std.ArrayList(usize).empty;
         defer free_vars.deinit(self.arena.allocator());
@@ -1576,7 +1151,7 @@ pub const TypeInferencer = struct {
             const fresh = try self.freshTypeVar();
             try subst.put(var_id, fresh);
         }
-        return self.applySubst(ty, subst);
+        return self.applyTypeSubst(ty, &subst);
     }
     fn collectFreeVars(self: *TypeInferencer, ty: *Type, free_vars: *std.ArrayList(usize)) void {
         const resolved = self.resolve(ty);
@@ -1617,89 +1192,6 @@ pub const TypeInferencer = struct {
                 }
             },
             else => {},
-        }
-    }
-    fn applySubst(self: *TypeInferencer, ty: *Type, subst: std.AutoHashMap(usize, *Type)) !*Type {
-        const resolved = self.resolve(ty);
-        switch (resolved.*) {
-            .type_var => |tv| {
-                if (subst.get(tv.id)) |replacement| {
-                    return replacement;
-                }
-                return resolved;
-            },
-            .fn_type => |ft| {
-                var new_params = try self.arena.allocator().alloc(*Type, ft.params.len);
-                for (ft.params, 0..) |p, i| {
-                    new_params[i] = try self.applySubst(p, subst);
-                }
-                const new_ret = try self.applySubst(ft.return_type, subst);
-                return self.makeFnType(new_params, new_ret);
-            },
-            .nullable_type => |inner| {
-                const new_inner = try self.applySubst(inner, subst);
-                return self.makeNullableType(new_inner);
-            },
-            .ref_type => |rt| {
-                const new_inner = try self.applySubst(rt.inner, subst);
-                return self.makeRefType(new_inner, rt.is_raw);
-            },
-            .throw_type => |tt| {
-                const new_val = try self.applySubst(tt.value_type, subst);
-                const new_err = try self.applySubst(tt.error_type, subst);
-                const t = try self.arena.allocator().create(Type);
-                t.* = Type{ .throw_type = .{ .value_type = new_val, .error_type = new_err } };
-                try self.types.append(self.arena.allocator(), t);
-                return t;
-            },
-            .adt_type => |adt| {
-                if (adt.type_args.len == 0) return resolved;
-                var new_args = try self.arena.allocator().alloc(*Type, adt.type_args.len);
-                for (adt.type_args, 0..) |arg, i| {
-                    new_args[i] = try self.applySubst(arg, subst);
-                }
-                return self.makeAdtType(adt.name, new_args);
-            },
-            .trait_type => |tt| {
-                if (tt.type_args.len == 0) return resolved;
-                var new_args = try self.arena.allocator().alloc(*Type, tt.type_args.len);
-                for (tt.type_args, 0..) |arg, i| {
-                    new_args[i] = try self.applySubst(arg, subst);
-                }
-                const t = try self.arena.allocator().create(Type);
-                t.* = Type{ .trait_type = .{ .name = tt.name, .type_args = new_args } };
-                try self.types.append(self.arena.allocator(), t);
-                return t;
-            },
-            .record_type => |rt| {
-                var new_fields = try self.arena.allocator().alloc(FieldType, rt.fields.len);
-                for (rt.fields, 0..) |f, i| {
-                    new_fields[i] = FieldType{
-                        .name = f.name,
-                        .ty = try self.applySubst(f.ty, subst),
-                    };
-                }
-                const t = try self.arena.allocator().create(Type);
-                t.* = Type{ .record_type = .{ .fields = new_fields } };
-                try self.types.append(self.arena.allocator(), t);
-                return t;
-            },
-            .array_type => |at| {
-                const new_elem = try self.applySubst(at.element_type, subst);
-                return self.makeArrayType(new_elem, at.size);
-            },
-            .generic_type => |gt| {
-                if (gt.args.len == 0) return resolved;
-                var new_args = try self.arena.allocator().alloc(*Type, gt.args.len);
-                for (gt.args, 0..) |arg, i| {
-                    new_args[i] = try self.applySubst(arg, subst);
-                }
-                const t = try self.arena.allocator().create(Type);
-                t.* = Type{ .generic_type = .{ .name = gt.name, .args = new_args } };
-                try self.types.append(self.arena.allocator(), t);
-                return t;
-            },
-            else => return resolved,
         }
     }
     const NarrowingInfo = struct {
@@ -1823,9 +1315,9 @@ pub const TypeInferencer = struct {
         for (narrowings) |n| {
             if (n.is_non_null == want_non_null) {
                 if (env.lookup(n.name)) |scheme| {
-                    const resolved = self.resolve(scheme.ty);
+                    const resolved = self.resolve(scheme);
                     if (resolved.* == .nullable_type) {
-                        const narrowed_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = resolved.nullable_type };
+                        const narrowed_scheme = resolved.nullable_type;
                         env.define(n.name, narrowed_scheme) catch {};
                     }
                 }
@@ -1984,15 +1476,14 @@ pub const TypeInferencer = struct {
                     if (self.current_fn_info) |fn_info| {
                         if (std.mem.eql(u8, id.name, fn_info.name) and
                             fn_info.has_type_params and
-                            !fn_info.has_return_annotation and
-                            scheme.quantified_vars.len > 0)
+                            !fn_info.has_return_annotation)
                         {
                             const loc = ast.exprLocation(expr);
                             self.addErrorAt(.recursive_type, loc.line, loc.column, "polymorphic recursive function '{s}' requires an explicit return type annotation", .{id.name});
-                            return scheme.ty;
+                            return scheme;
                         }
                     }
-                    const ty = try self.instantiate(scheme);
+                    const ty = try self.freshenType(scheme);
                     return ty;
                 }
                 if (self.known_modules.contains(id.name)) {
@@ -2008,7 +1499,7 @@ pub const TypeInferencer = struct {
                             .symbol => |mangled| {
                                 // 函数/常量引用：查环境获取 mangled 名对应的类型
                                 if (env.lookup(mangled)) |scheme| {
-                                    return try self.instantiate(scheme);
+                                    return try self.freshenType(scheme);
                                 }
                                 // 未在环境中找到（可能是常量），返回 fresh var
                                 return self.freshTypeVar() catch error.OutOfMemory;
@@ -2132,8 +1623,7 @@ pub const TypeInferencer = struct {
                     else
                         try self.freshTypeVar();
                     param_types[i] = param_ty;
-                    const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = param_ty };
-                    try child_env.define(param.name, scheme);
+                    try child_env.define(param.name, param_ty);
                 }
                 self.pushLinearScope();
                 const body_ty = switch (lam.body) {
@@ -2435,7 +1925,7 @@ pub const TypeInferencer = struct {
                             const update_ty = try self.inferExpr(update.value, env, null);
                             var found = false;
                             for (all_fields.items, 0..) |*f, i| {
-                                if (std.mem.eql(u8, f.name, update.name)) {
+                                if (std.mem.eql(u8, f.name orelse "", update.name)) {
                                     all_fields.items[i].ty = update_ty;
                                     found = true;
                                     break;
@@ -2485,7 +1975,7 @@ pub const TypeInferencer = struct {
                     const key = std.fmt.allocPrint(self.arena.allocator(), "{s}\x00{s}", .{ mod_name, fa.field }) catch return self.freshTypeVar() catch unreachable;
                     defer self.arena.allocator().free(key);
                     if (self.exported_schemes.get(key)) |scheme| {
-                        return self.instantiate(scheme) catch unreachable;
+                        return self.freshenType(scheme) catch unreachable;
                     }
                     // import 别名 fallback：模块短名的字段访问，确认函数存在
                     // 如 Calendar.is_leap_year → "std.time.Calendar.is_leap_year"
@@ -2516,7 +2006,7 @@ pub const TypeInferencer = struct {
                 switch (eff_resolved.*) {
                     .record_type => |rt| {
                         for (rt.fields) |field| {
-                            if (std.mem.eql(u8, field.name, fa.field)) {
+                            if (std.mem.eql(u8, field.name orelse "", fa.field)) {
                                 return field.ty;
                             }
                         }
@@ -2576,7 +2066,7 @@ pub const TypeInferencer = struct {
                 const field_ty: *Type = switch (inner_resolved.*) {
                     .record_type => |rt| blk: {
                         for (rt.fields) |field| {
-                            if (std.mem.eql(u8, field.name, sa.field)) break :blk field.ty;
+                            if (std.mem.eql(u8, field.name orelse "", sa.field)) break :blk field.ty;
                         }
                         break :blk self.freshTypeVar() catch unreachable;
                     },
@@ -2733,7 +2223,7 @@ pub const TypeInferencer = struct {
                                 const recv_ty = self.inferExpr(recv_arm.channel_expr, env, null) catch try self.freshTypeVar();
                                 const resolved = self.resolve(recv_ty);
                                 const elem_ty = if (resolved.* == .nullable_type) resolved.nullable_type else recv_ty;
-                                arm_env.define(binding_name, TypeScheme{ .quantified_vars = &[_]usize{}, .ty = elem_ty }) catch {};
+                                arm_env.define(binding_name, elem_ty) catch {};
                             }
                             const body_ty = try self.inferExpr(recv_arm.body, arm_env, null);
                             if (result_ty == null) result_ty = body_ty;
@@ -2795,8 +2285,7 @@ pub const TypeInferencer = struct {
                                 try self.typeFromAst(ta)
                             else if (annot_fn) |af| (if (i < af.fn_type.params.len) af.fn_type.params[i] else try self.freshTypeVar()) else try self.freshTypeVar();
                             param_types[i] = param_ty;
-                            const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = param_ty };
-                            try child_env.define(param.name, scheme);
+                            try child_env.define(param.name, param_ty);
                         }
                         const ret_ty = if (annot_fn) |af|
                             af.fn_type.return_type
@@ -2805,7 +2294,7 @@ pub const TypeInferencer = struct {
                         else
                             try self.freshTypeVar();
                         const fn_ty = try self.makeFnType(param_types, ret_ty);
-                        const fn_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
+                        const fn_scheme = fn_ty;
                         try child_env.define(vd.name, fn_scheme);
                         const body_ty = switch (lam.body) {
                             .block => |body| try self.inferExpr(body, child_env, null),
@@ -2814,8 +2303,7 @@ pub const TypeInferencer = struct {
                         _ = self.tryWidenUnify(ret_ty, body_ty) catch {
                             self.addErrorAt(.type_mismatch, loc.line, loc.column, "val declaration annotation does not match inferred type", .{});
                         };
-                        const final_scheme = try self.generalize(env, fn_ty);
-                        if (!(try env.defineOrReport(vd.name, final_scheme))) {
+                        if (!(try env.defineOrReport(vd.name, fn_ty))) {
                             self.addErrorAt(.type_mismatch, loc.line, loc.column, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                         }
                     } else {
@@ -2841,8 +2329,7 @@ pub const TypeInferencer = struct {
                         if (self.isAsyncType(val_ty)) {
                             self.registerLinearVar(vd.name, loc.line, loc.column);
                         }
-                        const scheme = try self.generalize(env, bind_ty);
-                        if (!(try env.defineOrReport(vd.name, scheme))) {
+                        if (!(try env.defineOrReport(vd.name, bind_ty))) {
                             self.addErrorAt(.type_mismatch, loc.line, loc.column, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                         }
                     }
@@ -2875,8 +2362,7 @@ pub const TypeInferencer = struct {
                     if (self.isAsyncType(val_ty)) {
                         self.registerLinearVar(vd.name, loc.line, loc.column);
                     }
-                    const scheme = try self.generalize(env, bind_ty);
-                    if (!(try env.defineOrReport(vd.name, scheme))) {
+                    if (!(try env.defineOrReport(vd.name, bind_ty))) {
                         self.addErrorAt(.type_mismatch, loc.line, loc.column, "duplicate definition: '{s}' is already defined in this scope", .{vd.name});
                     }
                 }
@@ -2950,7 +2436,7 @@ pub const TypeInferencer = struct {
                         if (trait_key.len > 0 and !self.registered_traits.contains(trait_key)) {}
                     }
                 }
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = item_ty };
+                const scheme = item_ty;
                 try child_env.define(fs.name, scheme);
                 self.pushLinearScope();
                 _ = try self.inferExpr(fs.body, child_env, null);
@@ -3016,7 +2502,7 @@ pub const TypeInferencer = struct {
                     };
                     _ = gadt_check.refineConstructorPattern(self, nullary, expected_ty, env);
                 } else {
-                    const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = expected_ty };
+                    const scheme = expected_ty;
                     try env.define(v.name, scheme);
                 }
             },
@@ -3100,15 +2586,7 @@ pub const TypeInferencer = struct {
                         return t;
                     }
                 }
-                if (std.mem.eql(u8, g.name, "Atomic") or
-                    std.mem.eql(u8, g.name, "Async") or
-                    std.mem.eql(u8, g.name, "Channel") or
-                    std.mem.eql(u8, g.name, "Sender") or
-                    std.mem.eql(u8, g.name, "Receiver") or
-                    std.mem.eql(u8, g.name, "Lazy") or
-                    std.mem.eql(u8, g.name, "TypeInfo") or
-                    std.mem.eql(u8, g.name, "Reflect"))
-                {
+                if (builtin_types.isBuiltinGenericType(g.name)) {
                     return self.makeGenericType(g.name, args);
                 }
                 if (self.adt_types.get(g.name)) |adt_info| {
@@ -3220,6 +2698,12 @@ pub const TypeInferencer = struct {
         }
         self.popLinearScope();
         self.recordModuleStructure(module, module_name);
+
+        // v3: 类型检查完成后，收集单态化实例（泛型调用点 → 实例集合）
+        // 错误非致命：IRBuilder 仍可 on-demand 补全缺失实例
+        if (self.sema_result) |sr| {
+            monomorph.collectMonomorphInstances(module, sr) catch {};
+        }
     }
     /// 扫描主模块中 mangled 名函数（如 Store.Memory.put），为导入的模块注册
     /// 子模块列表和方法签名，使 Store.Memory 限定访问和模块作为 Trait 值可用。
@@ -3236,7 +2720,7 @@ pub const TypeInferencer = struct {
 
             // 注册模块引用变量，使 Store/std 能被识别为模块
             const mod_ty = self.makeModuleRef(mod) catch continue;
-            const mod_scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = mod_ty };
+            const mod_scheme = mod_ty;
             env.redefine(mod, mod_scheme) catch {};
 
             // 扫描 mangled 名函数 "Module.Sub...method"，提取多级子模块结构
@@ -3463,42 +2947,9 @@ pub const TypeInferencer = struct {
         return false;
     }
 
-    /// selective import item 的种类分类
-    const ImportItemKind = enum { function, constant, submodule, type_kind, not_found };
-    fn classifyImportItem(
-        item_name: []const u8,
-        candidate_module: []const u8,
-        candidate_symbol: []const u8,
-        module: *const ast.Module,
-    ) ImportItemKind {
-        for (module.declarations) |decl| {
-            if (decl == .fun_decl and std.mem.eql(u8, decl.fun_decl.name, candidate_symbol)) {
-                return .function;
-            }
-            // 常量：expr_decl.stmt.val_decl.name == candidate_symbol
-            if (decl == .expr_decl) {
-                const ed = decl.expr_decl;
-                if (ed.stmt) |st| {
-                    switch (st.*) {
-                        .val_decl => |vd| if (std.mem.eql(u8, vd.name, candidate_symbol)) return .constant,
-                        else => {},
-                    }
-                }
-            }
-            // 子模块：存在以 candidate_module + "." 开头的 mangled 函数名
-            if (decl == .fun_decl) {
-                const fname = decl.fun_decl.name;
-                if (std.mem.startsWith(u8, fname, candidate_module) and fname.len > candidate_module.len and fname[candidate_module.len] == '.') {
-                    return .submodule;
-                }
-            }
-            // 类型（原名不 mangle）
-            if (decl == .type_decl and std.mem.eql(u8, decl.type_decl.name, item_name)) {
-                return .type_kind;
-            }
-        }
-        return .not_found;
-    }
+    /// selective import item 的种类分类（委托给 decl_classifier 注册表）
+    const ImportItemKind = decl_classifier.ImportItemKind;
+    const classifyImportItem = decl_classifier.classifyImportItem;
 
     /// 用 "." 连接模块路径段
     fn joinModulePath(arena_alloc: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
@@ -3633,8 +3084,7 @@ pub const TypeInferencer = struct {
         else
             self.freshTypeVar() catch return;
         const fn_ty = self.makeFnType(param_types, ret_ty) catch return;
-        const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = fn_ty };
+                const scheme = fn_ty;
         env.define(f.name, scheme) catch return;
         self.predeclared_fns.put(f.name, {}) catch {};
     }
@@ -3707,8 +3157,7 @@ pub const TypeInferencer = struct {
                 for (adt_def.constructors) |con| {
                     if (self.isBuiltinName(con.name)) continue;
                     if (con.fields.len == 0) {
-                        const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = adt_ty };
+                                                const scheme = adt_ty;
                         env.define(con.name, scheme) catch continue;
                     } else {
                         const fts = self.arena.allocator().alloc(*Type, con.fields.len) catch return;
@@ -3716,8 +3165,7 @@ pub const TypeInferencer = struct {
                             fts[i] = self.typeFromAstWithParams(field.ty, &type_param_map) catch (self.freshTypeVar() catch return);
                         }
                         const ctor_ty = self.makeFnType(fts, adt_ty) catch return;
-                        const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                                                const scheme = ctor_ty;
                         env.define(con.name, scheme) catch continue;
                     }
                 }
@@ -3753,8 +3201,7 @@ pub const TypeInferencer = struct {
                     param_types[i] = self.typeFromAstWithParams(f.ty, &type_param_map) catch return;
                 }
                 const ctor_ty = self.makeFnType(param_types, rec_ty) catch return;
-                const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                                const scheme = ctor_ty;
                 if (!self.isBuiltinName(td.name)) {
                     env.define(td.name, scheme) catch {};
                 }
@@ -3786,8 +3233,7 @@ pub const TypeInferencer = struct {
                     type_param_names.append(self.arena.allocator(), name_copy) catch return;
                 }
                 const target_ty = self.typeFromAstWithParams(ta.target, &type_param_map) catch return;
-                const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = target_ty };
+                                const scheme = target_ty;
                 if (!self.isBuiltinName(td.name)) {
                     env.define(td.name, scheme) catch {};
                 }
@@ -3849,8 +3295,7 @@ pub const TypeInferencer = struct {
                 const ctor_params = self.arena.allocator().alloc(*Type, 1) catch return;
                 ctor_params[0] = inner_ty;
                 const ctor_ty = self.makeFnType(ctor_params, newtype_ty) catch return;
-                const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                                const scheme = ctor_ty;
                 if (!self.isBuiltinName(nt.name)) {
                     env.define(nt.name, scheme) catch {};
                 }
@@ -3860,9 +3305,8 @@ pub const TypeInferencer = struct {
                 const ctor_params = self.arena.allocator().alloc(*Type, 1) catch return;
                 ctor_params[0] = self.makeType(.str_type) catch return;
                 const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
                 if (!self.isBuiltinName(en.name)) {
-                    env.define(en.name, scheme) catch {};
+                    env.define(en.name, ctor_ty) catch {};
                 }
                 if (!self.adt_types.contains(en.name)) {
                     const key = self.arena.allocator().dupe(u8, en.name) catch return;
@@ -3885,7 +3329,7 @@ pub const TypeInferencer = struct {
             const params = self.arena.allocator().alloc(*Type, 1) catch return;
             params[0] = self.makeType(.str_type) catch return;
             const fn_ty = self.makeFnType(params, self.makeType(.unit_type) catch return) catch return;
-            env.define("Panic", TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
+            env.define("Panic", fn_ty) catch return;
             self.registerBuiltinName("Panic");
         }
         {
@@ -3895,7 +3339,7 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.str_type) catch return) catch return;
             const qvars = self.arena.allocator().alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("str", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            env.define("str", fn_ty) catch return;
             self.registerBuiltinName("str");
         }
         {
@@ -3905,7 +3349,7 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(.str_type) catch return) catch return;
             const qvars = self.arena.allocator().alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define("type", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            env.define("type", fn_ty) catch return;
             self.registerBuiltinName("type");
         }
         const error_adt_ty = self.makeAdtType("Error", &[_]*Type{}) catch return;
@@ -3921,7 +3365,7 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, throw_ty) catch return;
             const qvars = self.arena.allocator().alloc(usize, 1) catch return;
             qvars[0] = val_ty.type_var.id;
-            env.define("Error", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            env.define("Error", fn_ty) catch return;
             self.registerBuiltinName("Error");
         }
         // Error 作为完全内建 trait 注册
@@ -3937,7 +3381,7 @@ pub const TypeInferencer = struct {
             error_method_names[1] = "type_name";
             const error_required_names = &[_][]const u8{};
             const error_assoc_names = &[_][]const u8{};
-            var error_method_schemes = std.StringHashMap(TypeScheme).init(self.arena.allocator());
+            var error_method_schemes = std.StringHashMap(*Type).init(self.arena.allocator());
             // message(self: Error) -> str
             {
                 const self_type = self.arena.allocator().create(Type) catch return;
@@ -3946,7 +3390,7 @@ pub const TypeInferencer = struct {
                 const fn_params = self.arena.allocator().alloc(*Type, 1) catch return;
                 fn_params[0] = self_type;
                 const fn_ty = self.makeFnType(fn_params, self.makeType(.str_type) catch return) catch return;
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
+                const scheme = fn_ty;
                 error_method_schemes.put(self.arena.allocator().dupe(u8, "message") catch return, scheme) catch return;
             }
             // type_name(self: Error) -> str
@@ -3957,7 +3401,7 @@ pub const TypeInferencer = struct {
                 const fn_params = self.arena.allocator().alloc(*Type, 1) catch return;
                 fn_params[0] = self_type;
                 const fn_ty = self.makeFnType(fn_params, self.makeType(.str_type) catch return) catch return;
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
+                const scheme = fn_ty;
                 error_method_schemes.put(self.arena.allocator().dupe(u8, "type_name") catch return, scheme) catch return;
             }
             const error_key = self.arena.allocator().dupe(u8, "Error") catch return;
@@ -3997,7 +3441,7 @@ pub const TypeInferencer = struct {
                     // 注意：constructor 名不注册为 builtin_name，允许用户 ADT 覆盖
                     // （如 FileKind::Other 与 IOErrorKind::Other 可共存，后者会被前者覆盖）
                     for (bt.constructors) |con| {
-                        const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = adt_ty };
+                        const scheme = adt_ty;
                         _ = env.define(con, scheme) catch return;
                     }
                 },
@@ -4026,8 +3470,7 @@ pub const TypeInferencer = struct {
                         ctor_params[i] = field_ty;
                     }
                     const ctor_ty = self.makeFnType(ctor_params, adt_ty) catch return;
-                    const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
-                    _ = env.define(bt.constructor_name, scheme) catch return;
+                    _ = env.define(bt.constructor_name, ctor_ty) catch return;
                     self.registerBuiltinName(bt.constructor_name);
                     self.registerBuiltinName(bt.name);
                     // 注册到 adt_types（标记 is_error_newtype=true，作为 Error 子类型）
@@ -4066,7 +3509,7 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, throw_ty) catch return;
             const qvars = self.arena.allocator().alloc(usize, 1) catch return;
             qvars[0] = val_ty.type_var.id;
-            env.define("Ok", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            env.define("Ok", fn_ty) catch return;
             self.registerBuiltinName("Ok");
         }
         inline for (NUMERIC_TYPES) |cast| {
@@ -4076,7 +3519,7 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, self.makeType(cast.ty) catch return) catch return;
             const qvars = self.arena.allocator().alloc(usize, 1) catch return;
             qvars[0] = param.type_var.id;
-            env.define(cast.name, TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            env.define(cast.name, fn_ty) catch return;
             self.registerBuiltinName(cast.name);
         }
         {
@@ -4086,7 +3529,7 @@ pub const TypeInferencer = struct {
             const iterable_method_names = self.arena.allocator().alloc([]const u8, 1) catch return;
             iterable_method_names[0] = "iterator";
             const iterable_assoc_names = &[_][]const u8{};
-            var iterable_method_schemes = std.StringHashMap(TypeScheme).init(self.arena.allocator());
+            var iterable_method_schemes = std.StringHashMap(*Type).init(self.arena.allocator());
             {
                 const t_var = self.freshTypeVar() catch return;
                 const self_args = self.arena.allocator().alloc(*Type, 1) catch return;
@@ -4102,7 +3545,7 @@ pub const TypeInferencer = struct {
                 const fn_params = self.arena.allocator().alloc(*Type, 1) catch return;
                 fn_params[0] = self_type;
                 const fn_ty = self.makeFnType(fn_params, ret_type) catch return;
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
+                const scheme = fn_ty;
                 iterable_method_schemes.put(self.arena.allocator().dupe(u8, "iterator") catch return, scheme) catch return;
             }
             const iterable_key = self.arena.allocator().dupe(u8, "Iterable") catch return;
@@ -4122,7 +3565,7 @@ pub const TypeInferencer = struct {
             const iterator_method_names = self.arena.allocator().alloc([]const u8, 1) catch return;
             iterator_method_names[0] = "next";
             const iterator_assoc_names = &[_][]const u8{};
-            var iterator_method_schemes = std.StringHashMap(TypeScheme).init(self.arena.allocator());
+            var iterator_method_schemes = std.StringHashMap(*Type).init(self.arena.allocator());
             {
                 const t_var = self.freshTypeVar() catch return;
                 const self_args = self.arena.allocator().alloc(*Type, 1) catch return;
@@ -4134,7 +3577,7 @@ pub const TypeInferencer = struct {
                 const fn_params = self.arena.allocator().alloc(*Type, 1) catch return;
                 fn_params[0] = self_type;
                 const fn_ty = self.makeFnType(fn_params, ret_type) catch return;
-                const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty };
+                const scheme = fn_ty;
                 iterator_method_schemes.put(self.arena.allocator().dupe(u8, "next") catch return, scheme) catch return;
             }
             const iterator_key = self.arena.allocator().dupe(u8, "Iterator") catch return;
@@ -4155,7 +3598,7 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(params, ret_ty) catch return;
             const qvars = self.arena.allocator().alloc(usize, 1) catch return;
             qvars[0] = t_var.type_var.id;
-            env.define("channel", TypeScheme{ .quantified_vars = qvars, .ty = fn_ty }) catch return;
+            env.define("channel", fn_ty) catch return;
             self.registerBuiltinName("channel");
         }
         // 注册所有 syscall 函数签名（IO/Time 原语）
@@ -4191,7 +3634,7 @@ pub const TypeInferencer = struct {
         const define = struct {
             fn f(it: *TypeInferencer, e: *TypeEnv, name: []const u8, params: []*Type, ret_ty: *Type) void {
                 const fn_ty = it.makeFnType(params, ret_ty) catch return;
-                e.define(name, TypeScheme{ .quantified_vars = &[_]usize{}, .ty = fn_ty }) catch return;
+                e.define(name, fn_ty) catch return;
                 it.registerBuiltinName(name);
             }
         }.f;
@@ -4442,7 +3885,7 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(ps, reflect_ty) catch return;
             const qv = self.arena.allocator().alloc(usize, 1) catch return;
             qv[0] = t_var.type_var.id;
-            env.define("reflect", TypeScheme{ .quantified_vars = qv, .ty = fn_ty }) catch return;
+            env.define("reflect", fn_ty) catch return;
             self.registerBuiltinName("reflect");
         }
 
@@ -4455,7 +3898,7 @@ pub const TypeInferencer = struct {
             const fn_ty = self.makeFnType(ps, str_ty) catch return;
             const qv = self.arena.allocator().alloc(usize, 1) catch return;
             qv[0] = t_var.type_var.id;
-            env.define("__scalar_to_str", TypeScheme{ .quantified_vars = qv, .ty = fn_ty }) catch return;
+            env.define("__scalar_to_str", fn_ty) catch return;
             self.registerBuiltinName("__scalar_to_str");
         }
 
@@ -4658,7 +4101,7 @@ pub const TypeInferencer = struct {
                 break :blk false;
             };
             if (info.method_schemes.get(mname)) |scheme| {
-                const resolved = self.resolve(scheme.ty);
+                const resolved = self.resolve(scheme);
                 if (resolved.* == .fn_type) {
                     const param_count: u8 = @intCast(resolved.fn_type.params.len);
                     const return_ct = semaTypeToChanType(resolved.fn_type.return_type) orelse .ref_chan;
@@ -4690,12 +4133,12 @@ pub const TypeInferencer = struct {
     fn schemeToFuncSig(
         self: *TypeInferencer,
         name: []const u8,
-        scheme: TypeScheme,
+        scheme: *Type,
         ast_type_params: []const ast.TypeParam,
         is_async: bool,
         is_throwing: bool,
     ) !FuncSigInfo {
-        const resolved = self.resolve(scheme.ty);
+        const resolved = self.resolve(scheme);
         if (resolved.* != .fn_type) {
             const tp_names = try self.arena.allocator().alloc([]const u8, ast_type_params.len);
             for (ast_type_params, 0..) |tp, i| tp_names[i] = tp.name;
@@ -4784,8 +4227,7 @@ pub const TypeInferencer = struct {
                     else
                         self.freshTypeVar() catch return;
                     param_types[i] = param_ty;
-                    const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = param_ty };
-                    child_env.define(param.name, scheme) catch return;
+                    child_env.define(param.name, param_ty) catch return;
                 }
                 const ret_ty_raw = if (f.return_type) |ret_type|
                     self.typeFromAstWithParams(ret_type, &type_param_map) catch self.freshTypeVar() catch return
@@ -4808,8 +4250,7 @@ pub const TypeInferencer = struct {
                     break :blk self.makeGenericType("Async", &[_]*Type{ret_ty_raw}) catch return;
                 } else ret_ty_raw;
                 const fn_ty = self.makeFnType(param_types, ret_ty) catch return;
-                const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                const fn_scheme = TypeScheme{ .quantified_vars = qvars, .ty = fn_ty };
+                                const fn_scheme = fn_ty;
                 child_env.define(f.name, fn_scheme) catch return;
                 const prev_fn_return = self.current_fn_return_type;
                 if (f.return_type) |ret_type| {
@@ -4860,19 +4301,15 @@ pub const TypeInferencer = struct {
                 self.unifyReturnType(ret_ty, effective_body_ty) catch |err| {
                     self.reportUnifyError(err, f.location, ret_ty, effective_body_ty);
                 };
-                const final_scheme = if (f.bounds.len > 0)
-                    self.generalizeWithBounds(env, fn_ty, type_param_ids.items, f.bounds) catch return
-                else
-                    self.generalize(env, fn_ty) catch return;
                 if (self.isBuiltinName(f.name)) {
                     if (!std.mem.eql(u8, f.name, "compare") and !std.mem.eql(u8, f.name, "str")) {
                         self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "cannot redefine built-in name '{s}'", .{f.name});
                     } else {
-                        env.redefine(f.name, final_scheme) catch return;
+                        env.redefine(f.name, fn_ty) catch return;
                     }
                 } else if (self.predeclared_fns.contains(f.name)) {
-                    env.redefine(f.name, final_scheme) catch return;
-                } else if (!(env.defineOrReport(f.name, final_scheme) catch false)) {
+                    env.redefine(f.name, fn_ty) catch return;
+                } else if (!(env.defineOrReport(f.name, fn_ty) catch false)) {
                     self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "duplicate definition: '{s}' is already defined in this scope", .{f.name});
                 }
                 if (f.visibility == .public) {
@@ -4895,7 +4332,7 @@ pub const TypeInferencer = struct {
                         }
                         break :blk rt.* == .throw_type;
                     };
-                    sr.putFuncSig(self.schemeToFuncSig(f.name, final_scheme, f.type_params, f.is_async, is_throwing) catch return) catch {};
+                    sr.putFuncSig(self.schemeToFuncSig(f.name, fn_ty, f.type_params, f.is_async, is_throwing) catch return) catch {};
                 }
             },
             .type_decl => |td| {
@@ -4982,12 +4419,11 @@ pub const TypeInferencer = struct {
                         const mod_val = self.arena.allocator().dupe(u8, self.current_module) catch return;
                         self.type_defining_modules.put(mod_key, mod_val) catch return;
                         for (adt_def.constructors, 0..) |con, ci| {
-                            const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                            const ret_ty = ctor_return_types[ci] orelse adt_ty;
+                                                        const ret_ty = ctor_return_types[ci] orelse adt_ty;
                             if (self.isBuiltinName(con.name)) {
                                 self.addErrorAt(.type_mismatch, con.location.line, con.location.column, "cannot redefine built-in name '{s}'", .{con.name});
                             } else if (con.fields.len == 0) {
-                                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ret_ty };
+                                const scheme = ret_ty;
                                 if (self.predeclared_types.contains(td.name)) {
                                     env.redefine(con.name, scheme) catch {};
                                 } else if (!(env.defineOrReport(con.name, scheme) catch false)) {
@@ -4995,7 +4431,7 @@ pub const TypeInferencer = struct {
                                 }
                             } else {
                                 const ctor_ty = self.makeFnType(@constCast(ctor_field_types[ci]), ret_ty) catch return;
-                                const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                                const scheme = ctor_ty;
                                 if (self.predeclared_types.contains(td.name)) {
                                     env.redefine(con.name, scheme) catch {};
                                 } else if (!(env.defineOrReport(con.name, scheme) catch false)) {
@@ -5034,8 +4470,7 @@ pub const TypeInferencer = struct {
                             param_types[i] = self.typeFromAstWithParams(f.ty, &type_param_map) catch return;
                         }
                         const ctor_ty = self.makeFnType(param_types, rec_ty) catch return;
-                        const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                                                const scheme = ctor_ty;
                         if (self.isBuiltinName(td.name)) {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (self.predeclared_types.contains(td.name)) {
@@ -5094,8 +4529,7 @@ pub const TypeInferencer = struct {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "invalid target type in type alias '{s}'", .{td.name});
                             return;
                         };
-                        const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = target_ty };
+                                                const scheme = target_ty;
                         if (self.isBuiltinName(td.name)) {
                             self.addErrorAt(.type_mismatch, td.location.line, td.location.column, "cannot redefine built-in name '{s}'", .{td.name});
                         } else if (self.predeclared_types.contains(td.name)) {
@@ -5193,8 +4627,7 @@ pub const TypeInferencer = struct {
                         const ctor_params = self.arena.allocator().alloc(*Type, 1) catch return;
                         ctor_params[0] = inner_ty;
                         const ctor_ty = self.makeFnType(ctor_params, newtype_ty) catch return;
-                        const qvars = self.arena.allocator().dupe(usize, type_param_ids.items) catch return;
-                        const scheme = TypeScheme{ .quantified_vars = qvars, .ty = ctor_ty };
+                                                const scheme = ctor_ty;
                         if (self.isBuiltinName(nt.name)) {
                             self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{nt.name});
                         } else if (self.predeclared_types.contains(td.name)) {
@@ -5211,13 +4644,12 @@ pub const TypeInferencer = struct {
                         const ctor_params = self.arena.allocator().alloc(*Type, 1) catch return;
                         ctor_params[0] = self.makeType(.str_type) catch return;
                         const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
-                        const scheme = TypeScheme{ .quantified_vars = &[_]usize{}, .ty = ctor_ty };
                         const is_predeclared = self.predeclared_types.contains(td.name);
                         if (self.isBuiltinName(en.name)) {
                             self.addError(.type_mismatch, "cannot redefine built-in name '{s}'", .{en.name});
                         } else if (is_predeclared) {
-                            env.redefine(en.name, scheme) catch {};
-                        } else if (!(env.defineOrReport(en.name, scheme) catch false)) {
+                            env.redefine(en.name, ctor_ty) catch {};
+                        } else if (!(env.defineOrReport(en.name, ctor_ty) catch false)) {
                             self.addError(.type_mismatch, "duplicate definition: '{s}' is already defined", .{en.name});
                         }
                         if (self.isBuiltinName(en.name)) {} else if (is_predeclared) {
@@ -5323,12 +4755,7 @@ pub const TypeInferencer = struct {
                                         else
                                             self.freshTypeVar() catch continue;
                                         param_types_list.append(self.arena.allocator(), param_ty) catch continue;
-                                        const scheme = TypeScheme{
-                                            .quantified_vars = &[_]usize{},
-                                            .ty = param_ty,
-                                            .bounds = &[_]BoundInfo{},
-                                        };
-                                        method_env.define(param.name, scheme) catch continue;
+                                        method_env.define(param.name, param_ty) catch continue;
                                     }
                                     const rt = if (method.return_type) |rt|
                                         self.typeFromAstWithParams(rt, &type_param_map) catch self.freshTypeVar() catch continue
@@ -5376,20 +4803,15 @@ pub const TypeInferencer = struct {
                             // 能拿到 method 的精确返回类型，而不是 fallback 到 freshTypeVar。
                             {
                                 const fn_ty = self.makeFnType(param_types_list.items, return_ty) catch continue;
-                                const fn_scheme = TypeScheme{
-                                    .quantified_vars = &[_]usize{},
-                                    .ty = fn_ty,
-                                    .bounds = &[_]BoundInfo{},
-                                };
                                 const mangled = std.fmt.allocPrint(
                                     self.arena.allocator(),
                                     "{s}.{s}",
                                     .{ td.name, method.name },
                                 ) catch continue;
-                                env.redefine(mangled, fn_scheme) catch continue;
+                                env.redefine(mangled, fn_ty) catch continue;
                                 if (self.sema_result) |sr| {
                                     const meth_is_throwing = (self.resolve(return_ty).* == .throw_type);
-                                    sr.putFuncSig(self.schemeToFuncSig(mangled, fn_scheme, method.type_params, false, meth_is_throwing) catch continue) catch {};
+                                    sr.putFuncSig(self.schemeToFuncSig(mangled, fn_ty, method.type_params, false, meth_is_throwing) catch continue) catch {};
                                 }
                             }
                         }
