@@ -547,6 +547,9 @@ pub const Parser = struct {
             return_type = self.parseType() catch |err| {
                 return err;
             };
+        } else {
+            try self.reportError("函数声明必须显式标注返回类型（无返回值请使用 ': void'）");
+            return error.UnexpectedToken;
         }
         var bounds = std.ArrayList(ast.TraitBound).empty;
         if (self.matchToken(.kw_with)) {
@@ -951,6 +954,9 @@ pub const Parser = struct {
         var return_type: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             return_type = try self.parseType();
+        } else {
+            try self.reportError("方法声明必须显式标注返回类型（无返回值请使用 ': void'）");
+            return error.UnexpectedToken;
         }
         var delegate: ?ast.DelegateInfo = null;
         var body: ?*ast.Expr = null;
@@ -1423,7 +1429,7 @@ pub const Parser = struct {
         if (fields.items.len == 0) {
             return self.allocType(location, ast.TypeNode{
                 .named = .{
-                    .name = "unit",
+                    .name = "void",
                 },
             });
         }
@@ -1879,6 +1885,13 @@ pub const Parser = struct {
             });
         }
         if (self.check(.identifier) or self.check(.kw_val) or self.check(.kw_var) or self.check(.kw_channel)) {
+            // void 在表达式位置表示单元值（替代旧的 () 字面量）
+            if (self.check(.identifier) and std.mem.eql(u8, self.peek().lexeme, "void")) {
+                const tok = self.advance();
+                return self.allocExpr(tokenLoc(tok), ast.Expr{
+                    .unit_literal = {},
+                });
+            }
             if (isBuiltinType(self.peek().lexeme)) {
                 if (self.tokens.len > self.current + 1 and self.tokens[self.current + 1].type == .l_paren) {
                     return self.parseTypeCast();

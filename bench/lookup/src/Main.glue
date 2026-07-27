@@ -51,7 +51,7 @@ fun compute(seed: i64): i64 {
     acc + computeLevel2(seed, a, b)
 }
 
-fun main() {
+fun main(): void {
     var total: i64 = 0
     var k: i64 = 0
     while k < 10000 {

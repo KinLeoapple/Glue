@@ -16,6 +16,7 @@ const syscall = @import("syscall");
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const builtin_registry = @import("builtin_registry.zig");
 const builtin_type_names = @import("builtin_type_names.zig");
 const ir_mod = @import("ir.zig");
@@ -67,7 +68,6 @@ pub const MethodMeta = meta_mod.MethodMeta;
 pub const FuncSigMeta = meta_mod.FuncSigMeta;
 pub const TraitMeta = meta_mod.TraitMeta;
 pub const AssociatedTypeMeta = meta_mod.AssociatedTypeMeta;
-pub const ChanType = channel_mod.ChanType;
 pub const ChannelSpace = channel_mod.ChannelSpace;
 pub const GlueIR = ir_mod.GlueIR;
 pub const IntKind = scalar.IntKind;
@@ -141,19 +141,11 @@ pub const LinearRecurrenceInfo = struct {
     op: NodeOp, // 递归运算（int_add / int_mul / int_and / int_or / int_xor）
     init_a: i64, // 状态 a 初值（= f(0)）
     init_b: i64, // 状态 b 初值（= f(1)）
-    elem_type: ChanType, // 运算元素类型
+    elem_type: *const type_descriptor_mod.TypeDescriptor, // 运算元素类型
 };
 
-/// 单态化类型绑定：type_param 名 → 具体 ChanType + type_id
-/// 在实例化泛型函数时压栈，函数体编译期间 chanTypeFromTypeNode 查此栈
-pub const TypeBinding = struct {
-    map: std.StringHashMap(BoundType),
-};
-
-pub const BoundType = struct {
-    chan_type: ChanType,
-    type_id: u16, // 0 表示未知（如 ref_chan 包装的用户类型）
-};
+// TypeBinding/BoundType 已删除：sema 侧 inference.zig 的 TypeBindingContext 是唯一权威来源
+// IR 侧不再维护独立类型绑定栈，current_type_args 直接引用 sema instance.type_args
 
 /// IR 构建器：从 AST 构建 GlueIR
 pub const IRBuilder = struct {
@@ -205,13 +197,13 @@ pub const IRBuilder = struct {
     in_tail_position: bool = false,
     /// 当前函数返回类型是否为 Throw<T, E>（决定是否需要包装返回值为 ThrowValue）
     current_returns_throw: bool = false,
-    /// 当前函数 Throw<T, E> 返回类型的 Ok 值通道类型（用于 ? 传播提取 Ok 值）
-    current_throw_ok_chan_type: ChanType = .i64_chan,
+    /// 当前函数 Throw<T, E> 返回类型的 Ok 值类型描述符（用于 ? 传播提取 Ok 值）
+    current_throw_ok_type_desc: *const type_descriptor_mod.TypeDescriptor = type_descriptor_mod.i64_descriptor,
     /// 当前编译的方法所属类型名（用于 self 的类型推断）
     current_type_context: ?[]const u8 = null,
-    /// GADT 类型绑定栈：match arm 内的类型参数绑定（如 T → i32_chan）
+    /// GADT 类型绑定栈：match arm 内的类型参数绑定（如 T → i32_descriptor）
     /// 每个 match arm 压入一个绑定表，arm 结束后弹出
-    gadt_binding_stack: std.ArrayList(std.StringHashMap(ChanType)) = .empty,
+    gadt_binding_stack: std.ArrayList(std.StringHashMap(*const type_descriptor_mod.TypeDescriptor)) = .empty,
     /// 当前函数名（用于判断递归调用）
     current_func_name: ?[]const u8 = null,
     /// 当前函数的参数类型注解（用于 GADT 类型推断）
@@ -220,14 +212,18 @@ pub const IRBuilder = struct {
     current_func_type_params: ?[]const ast.TypeParam = null,
     /// 当前 trait default 方法中的 Self 类型名（用于 typeof(Self) 解析）
     current_self_type_name: ?[]const u8 = null,
-    /// 单态化类型绑定栈：实例化泛型函数时压栈，函数体编译期间 chanTypeFromTypeNode 查此栈
-    /// 栈顶为当前函数的类型绑定，每项是 type_param 名 → 具体 ChanType + type_id
-    type_binding_stack: std.ArrayList(TypeBinding) = .empty,
-    /// 单态化缓存：键 "func_name#hash" → 特化函数索引
-    monomorph_cache: std.StringHashMap(u16),
-    /// 单态化进行中的函数集合（防止递归实例化无限展开）
-    /// 首次进入时预占，递归命中返回预占索引
-    monomorph_in_progress: std.StringHashMap(u16),
+    /// 当前正在编译的 sema 单态化实例（null = 顶层非泛型函数）
+    /// 由 instantiateFunction 设置，chanTypeFromTypeNodeBound 等查询此实例的 type_args
+    current_instance: ?*const sema_output_mod.MonomorphInstance = null,
+    /// 当前实例的类型实参（= current_instance.type_args，空切片 = 非泛型上下文）
+    /// 直接引用避免重复解引用；chanTypeFromTypeNodeBound 委托 sema type_resolver 时传入
+    current_type_args: []const type_descriptor_mod.TypeDescriptor = &.{},
+    /// sema MonomorphInstance.instance_id → IR func_table 索引
+    /// 替代原 monomorph_cache，复用 sema 的实例缓存
+    instance_func_map: std.AutoHashMap(u32, u16),
+    /// 正在编译的实例（递归循环检测，替代原 monomorph_in_progress）
+    /// key = sema instance_id，value = 预占的 func_idx
+    instances_in_progress: std.AutoHashMap(u32, u16),
     /// 当前模式绑定的类型提示（从构造器字段类型继承）
     pattern_type_hint: ?*ast.TypeNode = null,
     /// 当前 match 的 scrutinee AST 表达式（用于 variable pattern 绑定时推断类型名）
@@ -239,10 +235,11 @@ pub const IRBuilder = struct {
     pre_declared_lambda_names: std.ArrayList([]const u8) = .empty,
     /// arena 所有权标志：build() 成功后转交给 GlueIR，置为 false
     arena_owned: bool = true,
-    /// sema 输出契约（驱动式接入）：若非 null，inferChanTypeFromExpr 优先从此处
-    /// 查询表达式类型，fallback 到自建推导。所有权归调用方，build 期间不得释放。
+    /// sema 输出契约（必需）：inferChanTypeFromExpr 从此处查询表达式类型。
+    /// 所有权归调用方，build 期间不得释放。
     /// 可变指针：builder 在 registerBuiltinErrorTypes 中向其注册 builtin 类型定义。
-    sema_result: ?*SemaResult = null,
+    /// 必须在 build() 之前通过 setSemaResult 注入。
+    sema_result: *SemaResult = undefined,
     /// 纯度表（驱动式接入）：若非 null，compileCall 查询函数纯度决定是否分配 memo_slot。
     /// 所有权归调用方，build 期间不得释放。
     purity_db: ?*const analysis_db_mod.PurityTable = null,
@@ -260,10 +257,8 @@ pub const IRBuilder = struct {
     type_name_to_id: std.StringHashMapUnmanaged(u16) = .empty,
     /// Alias 类型名 → target 类型名（resolveTypeMetadataRefs 使用，处理递归）
     pending_alias_targets: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// 当前编译的模块（build() 入口设置），用于 GADT return_type / field type_node 的 AST 回退查询
+    /// 当前编译的模块（build() 入口设置），用于 GADT return_type / field type_node 的 AST 访问
     current_module: ?ast.Module = null,
-    /// 标记 sema_result 是否由 builder 内部创建（单元测试场景），build() 结束后需 deinit
-    owns_sema_result: bool = false,
 
     // v3 阶段 4：pattern/match 编译方法从 pattern_compiler.zig 混入
     //（Zig 0.16 已移除 usingnamespace，改用 pub const 别名注入方法命名空间）
@@ -301,7 +296,7 @@ pub const IRBuilder = struct {
     /// 从 AST 模块填充 sema_result 的类型/函数/Trait 定义表
     /// v3 阶段 3：委托到 sema.populate.populateSemaResultFromAst
     pub fn populateSemaResultFromAst(self: *IRBuilder, module: ast.Module) !void {
-        const sr = self.sema_result orelse return;
+        const sr = self.sema_result;
         try sema.populate.populateSemaResultFromAst(sr, module, self.arena.allocator());
     }
     pub const chanTypeFromTypeName = @import("decl_collector.zig").Methods.chanTypeFromTypeName;
@@ -309,9 +304,12 @@ pub const IRBuilder = struct {
     pub const getCtorAstFieldTypeNode = @import("decl_collector.zig").Methods.getCtorAstFieldTypeNode;
     pub const findTraitMethodsAst = @import("decl_collector.zig").Methods.findTraitMethodsAst;
     pub const findFuncParamsAst = @import("decl_collector.zig").Methods.findFuncParamsAst;
-    pub const findFuncReturnTypeAst = @import("decl_collector.zig").Methods.findFuncReturnTypeAst;
+    /// 查找函数/方法的返回类型 TypeNode（委托 sema/inference，消除 IR 侧重复实现）
+    pub fn findFuncReturnTypeAst(self: *IRBuilder, name: []const u8) ?*ast.TypeNode {
+        const mod = self.current_module orelse return null;
+        return sema.inference.findFuncReturnTypeAst(&mod, name);
+    }
     pub const findFunDeclAst = @import("decl_collector.zig").Methods.findFunDeclAst;
-    pub const resolveFieldChanType = @import("decl_collector.zig").Methods.resolveFieldChanType;
     pub const getCtorTag = @import("decl_collector.zig").Methods.getCtorTag;
     pub const registerBuiltinErrorTypes = @import("decl_collector.zig").Methods.registerBuiltinErrorTypes;
     pub const collectTypeMetadata = @import("decl_collector.zig").Methods.collectTypeMetadata;
@@ -373,8 +371,8 @@ pub const IRBuilder = struct {
             .field_id_map = std.StringHashMap(u16).init(allocator),
             .linear_rec_map = std.StringHashMap(LinearRecurrenceInfo).init(allocator),
             .async_handle_meta = std.AutoHashMap(u16, u16).init(allocator),
-            .monomorph_cache = std.StringHashMap(u16).init(allocator),
-            .monomorph_in_progress = std.StringHashMap(u16).init(allocator),
+            .instance_func_map = std.AutoHashMap(u32, u16).init(allocator),
+            .instances_in_progress = std.AutoHashMap(u32, u16).init(allocator),
         };
         // meta_index=0 保留为"无元数据"占位
         try builder.scalar_metas.append(arena.allocator(), .{ .kind = .unit });
@@ -389,10 +387,9 @@ pub const IRBuilder = struct {
         return builder;
     }
 
-    /// 注入 sema 输出契约（驱动式接入）。必须在 build() 之前调用。
-    /// 设置后，inferChanTypeFromExpr 会优先从 SemaResult.expr_types 查询表达式类型，
-    /// 查不到再 fallback 到自建推导。传入 null 可恢复纯自建推导模式。
-    pub fn setSemaResult(self: *IRBuilder, sr: ?*SemaResult) void {
+    /// 注入 sema 输出契约（必需）。必须在 build() 之前调用。
+    /// 设置后，inferChanTypeFromExpr 从 SemaResult.expr_types 查询表达式类型。
+    pub fn setSemaResult(self: *IRBuilder, sr: *SemaResult) void {
         self.sema_result = sr;
     }
 
@@ -425,20 +422,9 @@ pub const IRBuilder = struct {
         for (self.gadt_binding_stack.items) |*m| m.deinit();
         self.gadt_binding_stack.deinit(self.allocator);
         self.pre_declared_lambda_names.deinit(self.allocator);
-        // 释放单态化数据结构
-        for (self.type_binding_stack.items) |*tb| tb.map.deinit();
-        self.type_binding_stack.deinit(self.allocator);
-        self.monomorph_cache.deinit();
-        self.monomorph_in_progress.deinit();
-        // 释放内部创建的 sema_result（单元测试场景）
-        if (self.owns_sema_result) {
-            if (self.sema_result) |sr| {
-                sr.deinit();
-                self.allocator.destroy(sr);
-            }
-            self.owns_sema_result = false;
-            self.sema_result = null;
-        }
+        // current_instance/current_type_args 不拥有资源（指向 sema_result），无需 deinit
+        self.instance_func_map.deinit();
+        self.instances_in_progress.deinit();
         if (self.arena_owned) {
             // type_metadata_entries/type_name_to_id/pending_alias_targets 用 arena 分配
             // 由 arena.deinit() 统一释放，无需单独 deinit
@@ -449,18 +435,10 @@ pub const IRBuilder = struct {
     }
 
     /// 构建完整 IR：遍历模块声明，编译所有函数
+    /// 前置条件：必须先通过 setSemaResult 注入 SemaResult
     pub fn build(self: *IRBuilder, module: ast.Module) BuildError!GlueIR {
         const arena_alloc = self.arena.allocator();
         self.current_module = module;
-
-        // 若 sema_result 未注入（单元测试场景），创建本地 SemaResult 并从 AST 填充类型定义
-        if (self.sema_result == null) {
-            const sr = try self.allocator.create(SemaResult);
-            sr.* = SemaResult.init(self.allocator);
-            self.sema_result = sr;
-            self.owns_sema_result = true;
-            try self.populateSemaResultFromAst(module);
-        }
 
         // 全局作用域（scope_stack[0]）：顶层 val/var 在此注册，所有函数可见
         try self.pushScope();
@@ -515,7 +493,8 @@ pub const IRBuilder = struct {
                         try self.imported_modules.put(imp.module_path[0], {});
                     }
                     // 从 sema_result 读取 import 别名，填充 alias map
-                    if (self.sema_result) |sr| {
+                    {
+                        const sr = self.sema_result;
                         var alias_iter = sr.import_aliases.iterator();
                         while (alias_iter.next()) |entry| {
                             const short_name = entry.key_ptr.*;
@@ -538,9 +517,9 @@ pub const IRBuilder = struct {
                         switch (stmt.*) {
                             .val_decl => |vd| {
                                 const chan_type = if (vd.type_annotation) |tn|
-                                    self.chanTypeFromTypeNodeResolved(tn) orelse .i64_chan
+                                    self.chanTypeFromTypeNodeResolved(tn) orelse type_descriptor_mod.i64_descriptor
                                 else
-                                    self.inferChanTypeFromExpr(vd.value) orelse .ref_chan;
+                                    self.inferChanTypeFromExpr(vd.value) orelse type_descriptor_mod.ref_descriptor;
                                 const chan = try self.allocChannel(chan_type);
                                 // 保留 type_annotation：使 inferTypeNameFromExpr 可通过
                                 // binding.type_annotation 推断全局 val 的类型（如 UNIX_EPOCH: SystemTime）
@@ -549,9 +528,9 @@ pub const IRBuilder = struct {
                             },
                             .var_decl => |vd| {
                                 const chan_type = if (vd.type_annotation) |tn|
-                                    self.chanTypeFromTypeNodeResolved(tn) orelse .i64_chan
+                                    self.chanTypeFromTypeNodeResolved(tn) orelse type_descriptor_mod.i64_descriptor
                                 else
-                                    self.inferChanTypeFromExpr(vd.value) orelse .ref_chan;
+                                    self.inferChanTypeFromExpr(vd.value) orelse type_descriptor_mod.ref_descriptor;
                                 const cell_chan = try self.allocCellChannel(chan_type);
                                 try self.scopeVarTyped(vd.name, cell_chan, true, null, vd.type_annotation);
                                 has_global_init = true;
@@ -570,7 +549,7 @@ pub const IRBuilder = struct {
             const init_node_start: u32 = @intCast(self.nodes.items.len);
             const init_chan_start: u16 = self.channels.count();
             init_idx = func_count;
-            const init_return_chan = try self.allocChannel(.unit_chan);
+            const init_return_chan = try self.allocChannel(type_descriptor_mod.unit_descriptor);
             try self.functions.append(arena_alloc, .{
                 .name = "__init",
                 .node_start = init_node_start,
@@ -608,7 +587,7 @@ pub const IRBuilder = struct {
                     else => {},
                 }
             }
-            const unit_chan = try self.allocChannel(.unit_chan);
+            const unit_chan = try self.allocChannel(type_descriptor_mod.unit_descriptor);
             try self.emit(Node.makeSink(.const_unit, unit_chan, 0));
             try self.emit(Node.makeUnary(.halt_return, init_return_chan, 0, unit_chan));
 
@@ -816,22 +795,22 @@ pub const IRBuilder = struct {
     // 通道与元数据分配
     // ════════════════════════════════════════════
 
-    pub fn allocChannel(self: *IRBuilder, chan_type: ChanType) !u16 {
-        return self.channels.alloc(chan_type);
+    pub fn allocChannel(self: *IRBuilder, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.channels.alloc(type_desc);
     }
 
-    pub fn allocRef(self: *IRBuilder, chan_type: ChanType) !u16 {
-        return self.channels.allocRef(chan_type);
+    pub fn allocRef(self: *IRBuilder, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.channels.allocRef(type_desc);
     }
 
-    pub fn allocCellChannel(self: *IRBuilder, chan_type: ChanType) !u16 {
-        return self.channels.allocCell(chan_type);
+    pub fn allocCellChannel(self: *IRBuilder, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.channels.allocCell(type_desc);
     }
 
     /// 从 cell 通道读取当前值，返回普通值通道
     pub fn emitLoad(self: *IRBuilder, cell_chan: u16) BuildError!u16 {
         const meta = self.channels.get(cell_chan);
-        const load_chan = try self.allocChannel(meta.chan_type);
+        const load_chan = try self.allocChannel(meta.type_desc);
         try self.emit(Node.makeUnary(.load, load_chan, 0, cell_chan));
         return load_chan;
     }
@@ -909,7 +888,7 @@ pub const IRBuilder = struct {
             defer_n += 1;
             if (entry.block_body_len == 0) continue;
             const name = std.fmt.allocPrint(arena_alloc, "__defer_{d}_{d}", .{ func_idx, defer_n }) catch return error.OutOfMemory;
-            const ret_chan = try self.channels.alloc(.unit_chan);
+            const ret_chan = try self.channels.alloc(type_descriptor_mod.unit_descriptor);
             const new_func_idx: u16 = @intCast(self.functions.items.len);
             try self.func_table.put(name, new_func_idx);
             try self.functions.append(arena_alloc, .{
@@ -930,7 +909,7 @@ pub const IRBuilder = struct {
             catch_n += 1;
             if (entry.handler_body_len == 0) continue;
             const name = std.fmt.allocPrint(arena_alloc, "__catch_{d}_{d}", .{ func_idx, catch_n }) catch return error.OutOfMemory;
-            const ret_chan = try self.channels.alloc(.unit_chan);
+            const ret_chan = try self.channels.alloc(type_descriptor_mod.unit_descriptor);
             const new_func_idx: u16 = @intCast(self.functions.items.len);
             try self.func_table.put(name, new_func_idx);
             try self.functions.append(arena_alloc, .{
@@ -1091,21 +1070,36 @@ pub const IRBuilder = struct {
         return null;
     }
 
-    /// 构造 sema InferContext（栈上），返回 null 表示 sema_result/current_module 未就绪
-    fn inferContext(self: *const IRBuilder) ?sema.inference.InferContext {
-        const sr = self.sema_result orelse return null;
+    /// 构造 sema InferContext（栈上）
+    pub fn inferContext(self: *const IRBuilder) ?sema.inference.InferContext {
         if (self.current_module == null) return null;
         return sema.inference.InferContext{
-            .sema_result = sr,
+            .sema_result = self.sema_result,
             .module = &self.current_module.?,
             .arena = self.arena.allocator(),
         };
     }
 
     /// 构造 sema InferContextExt（栈上，带 var_lookup 回调）
-    fn inferContextExt(self: *IRBuilder, ctx: *sema.inference.InferContext) sema.inference.InferContextExt {
+    pub fn inferContextExt(self: *IRBuilder, ctx: *sema.inference.InferContext) sema.inference.InferContextExt {
         return .{
             .base = ctx,
+            .var_lookup_ctx = @ptrCast(self),
+            .var_lookup_fn = varLookupAdapter,
+        };
+    }
+
+    /// 构造 sema GadtContext（栈上，封装 GADT 推断所需的所有依赖）
+    /// gadt_binding_stack/current_func_param_types/current_func_name 仍由 IRBuilder 持有
+    pub fn gadtContext(self: *IRBuilder) sema.inference.GadtContext {
+        return .{
+            .allocator = self.allocator,
+            .sema_result = self.sema_result,
+            .current_type_args = self.current_type_args,
+            .current_module = if (self.current_module) |*m| m else null,
+            .binding_stack = &self.gadt_binding_stack,
+            .func_param_types = self.current_func_param_types,
+            .func_name = self.current_func_name,
             .var_lookup_ctx = @ptrCast(self),
             .var_lookup_fn = varLookupAdapter,
         };
@@ -1184,8 +1178,8 @@ pub const IRBuilder = struct {
 
     /// 编译取引用 &expr
     /// - 复合类型（ref_chan）：operand 已经是指针，ref_of 直接复制指针到新的 ref_chan
-    /// - 标量（i32/f64 等）：operand 是内联值，ref_of 编码为 tagged pointer (chan_idx << 1) | 1
-    ///   标量引用通过 bit 0 = 1 标记，无需堆分配
+    /// - 标量（i32/f64 等）：operand 是内联值，ref_of 装箱为 Cell 写入 ref_chan
+    ///   标量引用统一通过 Cell 装箱实现回写语义
     /// - ref_chan（已经是引用）：ref_of 复制引用本身（引用的引用）
     pub const compileRefOf = @import("expr_compiler.zig").Methods.compileRefOf;
 
@@ -1249,7 +1243,7 @@ pub const IRBuilder = struct {
 
     /// 通过类型名查 sema_result 获取字段类型（用于 method_call 返回值等场景）
     /// v3 阶段 3：委托到 sema.inference.inferFieldTypeByCtor
-    pub fn inferFieldTypeByCtor(self: *IRBuilder, type_name: []const u8, field: []const u8) ?ChanType {
+    pub fn inferFieldTypeByCtor(self: *IRBuilder, type_name: []const u8, field: []const u8) ?*const type_descriptor_mod.TypeDescriptor {
         var ctx = self.inferContext() orelse return null;
         return sema.inference.inferFieldTypeByCtor(&ctx, type_name, field);
     }
@@ -1257,7 +1251,7 @@ pub const IRBuilder = struct {
     /// 从 AST 推断字段类型（无 sema 时的简易类型推导）
     /// 通过回溯对象表达式找到 record_literal/record_extend/构造器调用，再查字段值类型
     /// v3 阶段 3：委托到 sema.inference.inferFieldType
-    pub fn inferFieldType(self: *IRBuilder, object: *const ast.Expr, field: []const u8) ?ChanType {
+    pub fn inferFieldType(self: *IRBuilder, object: *const ast.Expr, field: []const u8) ?*const type_descriptor_mod.TypeDescriptor {
         var ctx = self.inferContext() orelse return null;
         var ext = self.inferContextExt(&ctx);
         return sema.inference.inferFieldType(&ext, object, field);
@@ -1278,7 +1272,7 @@ pub const IRBuilder = struct {
 
     /// 从表达式推断通道类型
     /// v3 阶段 3：委托到 sema.inference.inferChanTypeFromExpr
-    pub fn inferChanTypeFromExpr(self: *IRBuilder, expr: *const ast.Expr) ?ChanType {
+    pub fn inferChanTypeFromExpr(self: *IRBuilder, expr: *const ast.Expr) ?*const type_descriptor_mod.TypeDescriptor {
         var ctx = self.inferContext() orelse return null;
         return sema.inference.inferChanTypeFromExpr(&ctx, expr);
     }
@@ -1347,23 +1341,15 @@ pub const IRBuilder = struct {
     /// type_args_hint != null 时优先使用显式类型实参；否则从参数类型推断
     pub const compileCallWithTypeArgs = @import("expr_compiler.zig").Methods.compileCallWithTypeArgs;
 
-    /// 推导调用点的泛型类型实参（type_id 列表）
-    ///
-    /// 用于 typeof(T) 在泛型函数内的运行时查表：
-    ///   - 非泛型函数：返回空切片
-    ///   - 显式类型实参：从 type_args_hint 解析类型名 → type_id
-    ///   - 隐式推断：从参数类型注解匹配实参类型，再映射到 type_id
-    ///   - 递归调用：从 GADT 绑定栈继承当前函数的类型绑定
-    ///
-    /// 返回切片由 arena 拥有，与 IR 生命周期一致
-    pub const inferCallTypeArgs = @import("expr_compiler.zig").Methods.inferCallTypeArgs;
+    /// 从 sema call_instantiations 查询调用点的 type_args（消费 sema 产出）
+    pub const typeArgsFromCallExpr = @import("expr_compiler.zig").Methods.typeArgsFromCallExpr;
 
     /// 从参数类型注解匹配类型参数名，并从实参提取对应的 type_id
     /// 例如：参数注解 T，实参 typeof(Point) → name_to_typeid["T"] = Point 的 type_id
     ///
     /// 单态化上下文：当外层泛型函数被实例化时（如 println<i32>），其参数 x: T
-    /// 的类型参数 T 已在 type_binding_stack 中绑定到具体 type_id。
-    /// 内层调用 format(x) 时，实参 x 的类型注解仍是 T，此时从类型绑定栈
+    /// 的类型参数 T 已在 sema instance.type_args 中绑定到具体 type_id。
+    /// 内层调用 format(x) 时，实参 x 的类型注解仍是 T，此时从 current_type_args
     /// 查找 T 的具体 type_id，使内层泛型函数也能正确单态化。
     pub const matchTypeParamToTypeId = @import("expr_compiler.zig").Methods.matchTypeParamToTypeId;
 
@@ -1405,7 +1391,7 @@ pub const IRBuilder = struct {
     /// 推断 Throw 表达式的 Ok 值通道类型
     /// 用于 match Ok(pattern) 和 ? 操作符，避免对 ref 类型硬编码 i64_chan
     /// v3 阶段 3：委托到 sema.inference.inferThrowOkChanType
-    pub fn inferThrowOkChanType(self: *IRBuilder, expr: *const ast.Expr) ?ChanType {
+    pub fn inferThrowOkChanType(self: *IRBuilder, expr: *const ast.Expr) ?*const type_descriptor_mod.TypeDescriptor {
         var ctx = self.inferContext() orelse return null;
         var ext = self.inferContextExt(&ctx);
         return sema.inference.inferThrowOkChanType(&ext, expr);
@@ -1413,7 +1399,7 @@ pub const IRBuilder = struct {
 
     /// 推断 `expr?`（propagate）表达式中 Ok 值的类型名。
     /// 用于 `val r = obj.method()?; r.field` 场景下推断 r 的类型。
-    /// 与 inferThrowOkChanType 平行，但返回类型名而非 ChanType。
+    /// 与 inferThrowOkChanType 平行，但返回类型名而非 TypeDescriptor。
     /// v3 阶段 3：委托到 sema.inference.inferThrowOkTypeName
     pub fn inferThrowOkTypeName(self: *IRBuilder, expr: *const ast.Expr) ?[]const u8 {
         var ctx = self.inferContext() orelse return null;
@@ -1440,8 +1426,7 @@ pub const IRBuilder = struct {
     /// 从栈顶向下查找类型参数绑定，找到则返回具体类型，否则用 chanTypeFromTypeNode
     pub const resolveFieldTypeWithBindings = @import("expr_compiler.zig").Methods.resolveFieldTypeWithBindings;
 
-    /// 从 AST 类型节点 + 泛型绑定映射推导通道类型
-    /// type_bindings: 类型参数名 → 具体通道类型（如 "T" → .i32_chan）
+    /// 从 AST 类型节点 + 泛型绑定映射推导通道类型（统一路径：委托 sema/type_resolver.resolveTypeNode）
     pub const chanTypeWithTypeNode = @import("expr_compiler.zig").Methods.chanTypeWithTypeNode;
 
     /// 推断泛型函数调用的返回通道类型
@@ -1477,29 +1462,28 @@ pub const IRBuilder = struct {
     /// 发射 orbit_async_join 节点：等待轨道完成，返回结果通道
     pub fn emitOrbitJoin(self: *IRBuilder, handle_chan: u16, orbit_meta_idx: u16) BuildError!u16 {
         const orbit_meta = self.orbit_metas.items[orbit_meta_idx - 1];
-        const result_chan = try self.allocChannel(orbit_meta.result_type);
+        const result_chan = try self.allocChannel(orbit_meta.result_type_desc);
         try self.emit(Node.makeUnary(.orbit_async_join, result_chan, orbit_meta_idx, handle_chan));
         return result_chan;
     }
 
     /// 发射 orbit_chan_send 节点：向轨道通道发送值
     pub fn emitOrbitSend(self: *IRBuilder, handle_chan: u16, val_chan: u16) BuildError!u16 {
-        const out = try self.allocChannel(.unit_chan);
+        const out = try self.allocChannel(type_descriptor_mod.unit_descriptor);
         try self.emit(Node.makeBinary(.orbit_chan_send, out, 0, handle_chan, val_chan));
         return out;
     }
 
     /// 发射 orbit_chan_recv 节点：从轨道通道接收值（阻塞）
-    pub fn emitOrbitRecv(self: *IRBuilder, handle_chan: u16, result_type: ChanType) BuildError!u16 {
+    pub fn emitOrbitRecv(self: *IRBuilder, handle_chan: u16, result_type: *const type_descriptor_mod.TypeDescriptor) BuildError!u16 {
         const out = try self.allocChannel(result_type);
         try self.emit(Node.makeUnary(.orbit_chan_recv, out, 0, handle_chan));
         return out;
     }
 
     /// 发射 orbit_chan_try_recv 节点：非阻塞接收，返回 nullable
-    pub fn emitOrbitTryRecv(self: *IRBuilder, handle_chan: u16, inner_type: ChanType) BuildError!u16 {
-        const out = try self.allocChannel(.nullable_chan);
-        _ = inner_type;
+    pub fn emitOrbitTryRecv(self: *IRBuilder, handle_chan: u16, inner_type: *const type_descriptor_mod.TypeDescriptor) BuildError!u16 {
+        const out = try self.channels.allocNullable(inner_type);
         try self.emit(Node.makeUnary(.orbit_chan_try_recv, out, 0, handle_chan));
         return out;
     }
@@ -1540,7 +1524,8 @@ pub const IRBuilder = struct {
     /// 优先查 sema_result.field_id_map（用户类型），回退到本地 field_id_map（内置类型/匿名 record）
     pub fn lookupFieldId(self: *IRBuilder, type_name: []const u8, field_name: []const u8) ?u16 {
         // 1. 优先从 sema_result 查询（用户自定义类型）
-        if (self.sema_result) |sr| {
+        {
+            const sr = self.sema_result;
             if (sr.lookupFieldId(type_name, field_name)) |id| return id;
         }
         // 2. 回退到本地 field_id_map（内置类型 TypeInfo/LayoutInfo 等 + 匿名 record）
@@ -1597,7 +1582,7 @@ pub const IRBuilder = struct {
     /// 从数组表达式推断元素通道类型
     /// 支持 method_call（如 s.bytes() → u8_chan）、identifier（从 var 类型推断）、array_literal
     /// v3 阶段 3：委托到 sema.inference.inferArrayElemType
-    pub fn inferArrayElemType(self: *IRBuilder, expr: *const ast.Expr) ChanType {
+    pub fn inferArrayElemType(self: *IRBuilder, expr: *const ast.Expr) *const type_descriptor_mod.TypeDescriptor {
         var ctx = self.inferContext() orelse return sema.inference.inferArrayLiteralElemType(expr);
         var ext = self.inferContextExt(&ctx);
         return sema.inference.inferArrayElemType(&ext, expr);
@@ -1605,14 +1590,11 @@ pub const IRBuilder = struct {
 
     /// 推断 newtype/record 字段的数组元素类型（如 self.segments → str[] 的元素类型 str）
     /// v3 阶段 3：委托到 sema.inference.inferFieldArrayElemType
-    pub fn inferFieldArrayElemType(self: *IRBuilder, object: *const ast.Expr, field: []const u8) ?ChanType {
+    pub fn inferFieldArrayElemType(self: *IRBuilder, object: *const ast.Expr, field: []const u8) ?*const type_descriptor_mod.TypeDescriptor {
         var ctx = self.inferContext() orelse return null;
         var ext = self.inferContextExt(&ctx);
         return sema.inference.inferFieldArrayElemType(&ext, object, field);
     }
-
-    /// 从 AST 表达式粗略推断通道类型（用于数组元素类型推断）
-    pub const chanTypeFromExprAst = sema.inference.chanTypeFromExprAst;
 
     /// 从通道查找编译期常量值
     pub const findConstVal = @import("expr_compiler.zig").Methods.findConstVal;
@@ -1752,9 +1734,9 @@ pub const IRBuilder = struct {
     pub const compileLinearRecurrenceCall = @import("func_compiler.zig").Methods.compileLinearRecurrenceCall;
 
     /// 发射整数常量到指定类型通道
-    pub fn emitConstInt(self: *IRBuilder, value: i64, chan_type: ChanType) BuildError!u16 {
-        const int_kind = chan_type.toIntKind() orelse .i64;
-        const out = try self.allocChannel(chan_type);
+    pub fn emitConstInt(self: *IRBuilder, value: i64, type_desc: *const type_descriptor_mod.TypeDescriptor) BuildError!u16 {
+        const int_kind = type_desc.toIntKind() orelse .i64;
+        const out = try self.allocChannel(type_desc);
         const meta_idx = try self.addScalarMeta(.{
             .kind = .int,
             .int_kind = int_kind,
@@ -1799,46 +1781,27 @@ pub const IRBuilder = struct {
     pub const exprIsThrowValue = @import("expr_compiler.zig").Methods.exprIsThrowValue;
 
     /// 解析 type alias 后再推导通道类型
-    /// 对于 named type，先查 pending_alias_targets：若是 alias（如 "Age"=i32），
-    /// 递归解析 target type 的 ChanType，避免 alias 被误判为 ref_chan。
-    /// 对于 generic type Lazy<T>，由于当前简化实现把 lazy 表达式直接编译为内部表达式，
-    /// 返回内部类型 T 的 ChanType（如 Lazy<i32> → i32_chan）。
-    /// 其他类型直接委托独立函数 chanTypeFromTypeNode。
+    /// 委托 sema type_resolver.resolveTypeNodeResolved，传入 current_type_args + sema_result
     pub const chanTypeFromTypeNodeResolved = @import("expr_compiler.zig").Methods.chanTypeFromTypeNodeResolved;
 
-    /// 单态化：查类型绑定栈，返回 type_param 名对应的具体 ChanType
-    /// 从栈顶向下查找（内层绑定优先），未命中返回 null
-    pub const lookupTypeBinding = @import("expr_compiler.zig").Methods.lookupTypeBinding;
-
-    /// 单态化：带类型绑定的 TypeNode → ChanType 解析
-    /// 优先查 type_binding_stack，命中返回具体 ChanType；
-    /// 未命中委托 chanTypeFromTypeNode（保持原行为）
-    /// 递归处理 nullable/ref_type/raw_ptr/kind_annotated 的 inner
+    /// 单态化：带类型绑定的 TypeNode → TypeDescriptor 解析
+    /// 委托 sema type_resolver.chanTypeFromTypeNodeBound，传入 current_type_args
     pub const chanTypeFromTypeNodeBound = @import("expr_compiler.zig").Methods.chanTypeFromTypeNodeBound;
 
-    /// 单态化：压入类型绑定（实例化泛型函数时调用）
-    /// type_param 名列表与 type_args 一一对应，type_args[i] 解析为 ChanType + type_id
-    pub const pushTypeBinding = @import("expr_compiler.zig").Methods.pushTypeBinding;
-
-    /// field_value 标量单态化：从 type_binding_stack 解析 T 的类型结构
-    /// 如果 T 是 newtype/nullable 且 inner 是标量类型，返回具体标量 ChanType
-    /// 否则返回 ref_chan（保持原有行为，运行时通过 tagged pointer 标量引用中转）
+    /// field_value 标量单态化：从 current_type_args 解析 T 的标量 inner 类型
     pub const resolveFieldValueChanType = @import("expr_compiler.zig").Methods.resolveFieldValueChanType;
 
-    /// 单态化：弹出类型绑定（函数体编译结束）
-    pub const popTypeBinding = @import("expr_compiler.zig").Methods.popTypeBinding;
-
-    /// 单态化：type_id → ChanType（与 TypeMetadata 一致）
-    /// type_id 0 = 未知，返回 ref_chan
+    /// 单态化：type_id → TypeDescriptor
+    /// 委托 sema type_resolver.chanTypeFromTypeId，查 sema_result.type_descriptors
     pub const chanTypeFromTypeId = @import("expr_compiler.zig").Methods.chanTypeFromTypeId;
 
-    /// 单态化：ChanType → type_id（反查 type_name_to_id）
-    /// 用于从实参的 sema chan_type 直接推导 type_id，处理 int_literal 等无 type_name 的表达式
+    /// 单态化：TypeDescriptor → type_id（反查 type_name_to_id）
+    /// 用于从实参的 type_desc 直接推导 type_id，处理 int_literal 等无 type_name 的表达式
     pub const chanTypeToTypeId = @import("expr_compiler.zig").Methods.chanTypeToTypeId;
 
     /// 单态化：从 field_access 表达式推导 type_id
     /// 对于泛型记录的字段访问（如 p1.first where p1: Pair<i32, str>），
-    /// sema 不记录 ExprInfo（类型变量无法转 ChanType），需手动解析：
+    /// sema 不记录 ExprInfo（类型变量无法转 TypeDescriptor），需手动解析：
     /// 1. 从对象表达式推导基类型名 + 类型实参
     /// 2. 查类型定义获取字段的声明类型
     /// 3. 若字段类型是类型参数，用类型实参替换
@@ -1851,7 +1814,7 @@ pub const IRBuilder = struct {
 
     /// 单态化：从实参表达式推导 type_id
     /// 优先用 inferTypeNameFromExpr → lookupTypeId（处理 ADT/构造器），
-    /// 失败时从 sema ExprInfo.chan_type 直接反查（处理 int_literal 等原始类型）
+    /// 失败时从 sema ExprInfo.type_desc 直接反查（处理 int_literal 等原始类型）
     /// v3 阶段 3：委托到 sema.inference.inferTypeIdFromExpr
     pub fn inferTypeIdFromExpr(self: *IRBuilder, expr: *const ast.Expr) u16 {
         var ctx = self.inferContext() orelse return 0;
@@ -1859,16 +1822,13 @@ pub const IRBuilder = struct {
         return sema.inference.inferTypeIdFromExpr(&ext, expr);
     }
 
-    /// 单态化：计算 type_args 列表的 FNV-1a 哈希
-    pub const hashTypeArgs = @import("func_compiler.zig").Methods.hashTypeArgs;
-
     /// 单态化核心：实例化泛型函数，返回特化函数索引
     ///
     /// 对每个 (func_name, type_args) 组合生成一份特化代码：
     /// 1. 查缓存命中 → 直接返回
     /// 2. 查进行中（递归）→ 返回预占索引
     /// 3. 查找函数 AST，预占 Function 索引
-    /// 4. push type binding（type_param 名 → 具体 ChanType + type_id）
+    /// 4. push type binding（type_param 名 → 具体 TypeDescriptor + type_id）
     /// 5. 预分配占位 Function（return channel 用 bound 版本解析）
     /// 6. 调用 compileFunction 编译函数体（chanTypeFromTypeNodeBound 查绑定栈）
     /// 7. pop type binding，写入缓存
@@ -1905,6 +1865,7 @@ pub const primitiveLayout = @import("ast_traits.zig").primitiveLayout;
 pub const alignUp = @import("ast_traits.zig").alignUp;
 pub const retKindToChanType = @import("ast_traits.zig").retKindToChanType;
 pub const chanTypeFromTypeNode = @import("ast_traits.zig").chanTypeFromTypeNode;
+pub const chanTypeFromExprAst = sema.inference.chanTypeFromExprAst;
 pub const allocChanFromTypeNode = @import("ast_traits.zig").allocChanFromTypeNode;
 pub const astContainsBreakOrContinueExpr = @import("ast_traits.zig").astContainsBreakOrContinueExpr;
 pub const astContainsBreakOrContinueStmt = @import("ast_traits.zig").astContainsBreakOrContinueStmt;
@@ -1928,9 +1889,9 @@ test "IRBuilder 编译简单算术: 1 + 2" {
     defer builder.deinit();
 
     // 手动构造节点验证构建器逻辑
-    const ch1 = try builder.allocChannel(.i64_chan);
-    const ch2 = try builder.allocChannel(.i64_chan);
-    const ch_out = try builder.allocChannel(.i64_chan);
+    const ch1 = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
+    const ch2 = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
+    const ch_out = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
 
     const meta1 = try builder.addScalarMeta(.{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 1 } });
     const meta2 = try builder.addScalarMeta(.{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 2 } });

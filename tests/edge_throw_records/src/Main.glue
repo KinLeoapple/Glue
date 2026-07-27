@@ -3,7 +3,7 @@ fun checked(x: i32): Throw<i32, Error> {
     if x >= 0 { x } else { throw Error("negative") }
 }
 
-fun main() {
+fun main(): void {
     println(match checked(5) { Ok(v) => cast(v).to(str), Error(e) => "err:" + e.message() })
     println(match checked(-1) { Ok(v) => cast(v).to(str), Error(e) => "err:" + e.message() })
 }

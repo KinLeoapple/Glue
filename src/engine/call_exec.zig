@@ -99,11 +99,13 @@ pub const Methods = struct {
     /// 形参也是引用类型时保留引用本身（避免错误强制）。
     /// is_ref 为 true 表示实参类型为 &T / *T，应保持引用语义；否则普通复合类型走深拷贝。
     pub fn copyArgToParam(self: *Engine, arg_chan: u16, dst_chan: u16, is_ref: bool) EngineError!void {
-        const src_meta = self.ir.channels.get(arg_chan);
-        const dst_meta = self.ir.channels.get(dst_chan);
+        const src_is_ref = self.runtime.isRef(arg_chan);
+        const dst_is_ref = self.runtime.isRef(dst_chan);
+        const src_is_nullable = self.runtime.isNullable(arg_chan);
+        const dst_is_nullable = self.runtime.isNullable(dst_chan);
 
         // ref_chan → 标量通道：可能是 Lazy<T> 强制求值或标量值解码
-        if (src_meta.chan_type == .ref_chan and dst_meta.chan_type != .ref_chan and dst_meta.chan_type != .nullable_chan) {
+        if (src_is_ref and !dst_is_ref and !dst_is_nullable) {
             // 先尝试作为堆对象读取（处理 Lazy<T> 强制求值）
             if (self.readRefObj(arg_chan)) |_| {
                 const v = try self.readScalarValue(arg_chan);
@@ -116,7 +118,7 @@ pub const Methods = struct {
         }
 
         // 标量通道 → ref_chan：标量值扩展为 8 字节写入（类型参数实例化为标量时）
-        if (src_meta.chan_type != .ref_chan and src_meta.chan_type != .nullable_chan and dst_meta.chan_type == .ref_chan) {
+        if (!src_is_ref and !src_is_nullable and dst_is_ref) {
             try self.copyCrossType(dst_chan, arg_chan);
             return;
         }
@@ -150,8 +152,7 @@ pub const Methods = struct {
     pub fn saveCallResult(self: *Engine, result_chan: u16, ret_is_ref: bool) EngineError!SavedResult {
         const w = self.runtime.elemWidth(result_chan);
         if (w == 0) return .none;
-        const result_meta = self.ir.channels.get(result_chan);
-        if (!ret_is_ref and result_meta.chan_type == .ref_chan) {
+        if (!ret_is_ref and self.runtime.isRef(result_chan)) {
             const v = self.chanToValue(result_chan);
             const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
             try self.trackValueTree(copied);
@@ -217,8 +218,7 @@ pub const Methods = struct {
             var saved_arg_values: [16]value.Value = undefined;
             for (args, 0..) |arg_chan, i| {
                 const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
-                const meta = self.ir.channels.get(arg_chan);
-                if (!is_ref and meta.chan_type == .ref_chan and self.readRefObj(arg_chan) != null) {
+                if (!is_ref and self.runtime.isRef(arg_chan) and self.readRefObj(arg_chan) != null) {
                     const v = self.chanToValue(arg_chan);
                     saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                     try self.trackValueTree(saved_arg_values[i]);
@@ -350,8 +350,7 @@ pub const Methods = struct {
             var saved_arg_values: [16]value.Value = undefined;
             for (args, 0..) |arg_chan, i| {
                 const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
-                const meta = self.ir.channels.get(arg_chan);
-                if (!is_ref and meta.chan_type == .ref_chan and self.readRefObj(arg_chan) != null) {
+                if (!is_ref and self.runtime.isRef(arg_chan) and self.readRefObj(arg_chan) != null) {
                     const v = self.chanToValue(arg_chan);
                     saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                     try self.trackValueTree(saved_arg_values[i]);

@@ -230,7 +230,7 @@ fun evalThrow(r: Throw<i64, Error>): i64 {
     }
 }
 
-fun main() {
+fun main(): void {
     // --- 加法器闭包: 1M 次闭包调用（read-only upvalue）---
     val addOne = makeAdder(1)
     var cSum: i64 = 0

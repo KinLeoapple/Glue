@@ -49,7 +49,7 @@ fn buildIRFromSource(source: []const u8) !GlueIR {
     var inferencer = sema.TypeInferencer.init(testing.allocator);
     defer inferencer.deinit();
     inferencer.setSemaResult(&sema_result);
-    inferencer.checkModule(&module);
+    try inferencer.checkModule(&module);
 
     var builder = try builder_mod.IRBuilder.init(testing.allocator);
     defer builder.deinit();
@@ -85,7 +85,7 @@ fn valI64(v: value.Value) i64 {
 
 test "执行 const_i + halt_return" {
     // fun main() { 42 }
-    var ir = try buildIRFromSource("fun main() { 42 }");
+    var ir = try buildIRFromSource("fun main(): void { 42 }");
     defer ir.deinit();
 
     var threaded: std.Io.Threaded = undefined;
@@ -98,7 +98,7 @@ test "执行 const_i + halt_return" {
 
 test "执行整数加法" {
     // fun main() { 1 + 2 }
-    var ir = try buildIRFromSource("fun main() { 1 + 2 }");
+    var ir = try buildIRFromSource("fun main(): void { 1 + 2 }");
     defer ir.deinit();
 
     var threaded: std.Io.Threaded = undefined;
@@ -110,7 +110,7 @@ test "执行整数加法" {
 }
 
 test "执行整数减法" {
-    var ir = try buildIRFromSource("fun main() { 10 - 4 }");
+    var ir = try buildIRFromSource("fun main(): void { 10 - 4 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -119,7 +119,7 @@ test "执行整数减法" {
 }
 
 test "执行整数乘法" {
-    var ir = try buildIRFromSource("fun main() { 6 * 7 }");
+    var ir = try buildIRFromSource("fun main(): void { 6 * 7 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -128,7 +128,7 @@ test "执行整数乘法" {
 }
 
 test "执行整数除法" {
-    var ir = try buildIRFromSource("fun main() { 20 / 4 }");
+    var ir = try buildIRFromSource("fun main(): void { 20 / 4 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -137,7 +137,7 @@ test "执行整数除法" {
 }
 
 test "执行整数取模" {
-    var ir = try buildIRFromSource("fun main() { 17 % 5 }");
+    var ir = try buildIRFromSource("fun main(): void { 17 % 5 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -147,7 +147,7 @@ test "执行整数取模" {
 
 test "执行嵌套表达式" {
     // 1 + 2 * 3 = 7
-    var ir = try buildIRFromSource("fun main() { 1 + 2 * 3 }");
+    var ir = try buildIRFromSource("fun main(): void { 1 + 2 * 3 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -157,7 +157,7 @@ test "执行嵌套表达式" {
 
 test "执行比较运算" {
     // 3 < 5 → true → 1
-    var ir = try buildIRFromSource("fun main() { 3 < 5 }");
+    var ir = try buildIRFromSource("fun main(): void { 3 < 5 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -168,7 +168,7 @@ test "执行比较运算" {
 
 test "执行布尔逻辑" {
     // true && false → false → 0
-    var ir = try buildIRFromSource("fun main() { true && false }");
+    var ir = try buildIRFromSource("fun main(): void { true && false }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -179,7 +179,7 @@ test "执行布尔逻辑" {
 
 test "执行 val 变量绑定" {
     // val x = 10, val y = 20, x + y
-    var ir = try buildIRFromSource("fun main() { val x = 10; val y = 20; x + y }");
+    var ir = try buildIRFromSource("fun main(): void { val x = 10; val y = 20; x + y }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -191,8 +191,8 @@ test "执行函数调用" {
     // fun add(a, b) { a + b }
     // fun main() { add(3, 4) }
     var ir = try buildIRFromSource(
-        \\fun add(a, b) { a + b }
-        \\fun main() { add(3, 4) }
+        \\fun add(a, b): i64 { a + b }
+        \\fun main(): i64 { add(3, 4) }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -203,7 +203,7 @@ test "执行函数调用" {
 
 test "执行优化后的常量折叠" {
     // fun main() { 1 + 2 } → 优化后应为 const_i(3)
-    var ir = try buildIRFromSource("fun main() { 1 + 2 }");
+    var ir = try buildIRFromSource("fun main(): void { 1 + 2 }");
     defer ir.deinit();
 
     // 优化
@@ -221,7 +221,7 @@ test "执行优化后的常量折叠" {
 
 test "Phase 2: var 声明与赋值" {
     // var x = 10; x = 20; x
-    var ir = try buildIRFromSource("fun main() { var x = 10; x = 20; x }");
+    var ir = try buildIRFromSource("fun main(): void { var x = 10; x = 20; x }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -231,7 +231,7 @@ test "Phase 2: var 声明与赋值" {
 
 test "Phase 2: 复合赋值 += " {
     // var x = 10; x += 5; x
-    var ir = try buildIRFromSource("fun main() { var x = 10; x += 5; x }");
+    var ir = try buildIRFromSource("fun main(): void { var x = 10; x += 5; x }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -241,7 +241,7 @@ test "Phase 2: 复合赋值 += " {
 
 test "Phase 2: 复合赋值 *=" {
     // var x = 3; x *= 7; x
-    var ir = try buildIRFromSource("fun main() { var x = 3; x *= 7; x }");
+    var ir = try buildIRFromSource("fun main(): void { var x = 3; x *= 7; x }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -251,7 +251,7 @@ test "Phase 2: 复合赋值 *=" {
 
 test "Phase 2: if 表达式 then 分支" {
     // if true { 42 } else { 0 }
-    var ir = try buildIRFromSource("fun main() { if true { 42 } else { 0 } }");
+    var ir = try buildIRFromSource("fun main(): void { if true { 42 } else { 0 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -261,7 +261,7 @@ test "Phase 2: if 表达式 then 分支" {
 
 test "Phase 2: if 表达式 else 分支" {
     // if 3 > 5 { 42 } else { 99 }
-    var ir = try buildIRFromSource("fun main() { if 3 > 5 { 42 } else { 99 } }");
+    var ir = try buildIRFromSource("fun main(): void { if 3 > 5 { 42 } else { 99 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -271,7 +271,7 @@ test "Phase 2: if 表达式 else 分支" {
 
 test "Phase 2: if 表达式条件求值" {
     // val x = 10; if x > 5 { x * 2 } else { x }
-    var ir = try buildIRFromSource("fun main() { val x = 10; if x > 5 { x * 2 } else { x } }");
+    var ir = try buildIRFromSource("fun main(): void { val x = 10; if x > 5 { x * 2 } else { x } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -281,7 +281,7 @@ test "Phase 2: if 表达式条件求值" {
 
 test "Phase 2: 类型转换 i64→i32" {
     // i32(1000)
-    var ir = try buildIRFromSource("fun main() { i32(1000) }");
+    var ir = try buildIRFromSource("fun main(): void { i32(1000) }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -292,7 +292,7 @@ test "Phase 2: 类型转换 i64→i32" {
 
 test "Phase 2: 类型转换 i64→f64" {
     // f64(42) → 42.0 → 位模式转回 i64 验证
-    var ir = try buildIRFromSource("fun main() { f64(42) }");
+    var ir = try buildIRFromSource("fun main(): void { f64(42) }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -310,7 +310,7 @@ test "Phase 2: 类型转换 i64→f64" {
 
 test "Phase 2: 嵌套 if 表达式" {
     // val x = 5; if x > 3 { if x > 4 { 100 } else { 200 } } else { 300 }
-    var ir = try buildIRFromSource("fun main() { val x = 5; if x > 3 { if x > 4 { 100 } else { 200 } } else { 300 } }");
+    var ir = try buildIRFromSource("fun main(): void { val x = 5; if x > 3 { if x > 4 { 100 } else { 200 } } else { 300 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -320,7 +320,7 @@ test "Phase 2: 嵌套 if 表达式" {
 
 test "Phase 2: 嵌套 if（then 分支内嵌套，字面量条件）" {
     // if true { if false { 1 } else { 2 } } else { 3 } → 2
-    var ir = try buildIRFromSource("fun main() { if true { if false { 1 } else { 2 } } else { 3 } }");
+    var ir = try buildIRFromSource("fun main(): void { if true { if false { 1 } else { 2 } } else { 3 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -330,7 +330,7 @@ test "Phase 2: 嵌套 if（then 分支内嵌套，字面量条件）" {
 
 test "Phase 2: cast 链 i64→i32→i64" {
     // i64(i32(1000))
-    var ir = try buildIRFromSource("fun main() { i64(i32(1000)) }");
+    var ir = try buildIRFromSource("fun main(): void { i64(i32(1000)) }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -340,7 +340,7 @@ test "Phase 2: cast 链 i64→i32→i64" {
 
 test "Phase 2: var 与 if 组合" {
     // var x = 1; if x > 0 { x = 10 }; x
-    var ir = try buildIRFromSource("fun main() { var x = 1; if x > 0 { x = 10 }; x }");
+    var ir = try buildIRFromSource("fun main(): void { var x = 1; if x > 0 { x = 10 }; x }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -350,7 +350,7 @@ test "Phase 2: var 与 if 组合" {
 
 test "Phase 2: 复合赋值 -= " {
     // var x = 100; x -= 30; x
-    var ir = try buildIRFromSource("fun main() { var x = 100; x -= 30; x }");
+    var ir = try buildIRFromSource("fun main(): void { var x = 100; x -= 30; x }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -360,7 +360,7 @@ test "Phase 2: 复合赋值 -= " {
 
 test "Phase 2: 类型转换 i64→u8（窄化 wrap）" {
     // u8(300) → 300 wrap to u8 = 44
-    var ir = try buildIRFromSource("fun main() { u8(300) }");
+    var ir = try buildIRFromSource("fun main(): void { u8(300) }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -376,7 +376,7 @@ test "Phase 2: 类型转换 i64→u8（窄化 wrap）" {
 
 test "Phase 2.5: 字符串字面量" {
     // "hello" → 创建 Str 堆对象
-    var ir = try buildIRFromSource("fun main() { \"hello\" }");
+    var ir = try buildIRFromSource("fun main(): void { \"hello\" }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -387,7 +387,7 @@ test "Phase 2.5: 字符串字面量" {
 
 test "Phase 2.5: 字符串拼接 (+)" {
     // "hello" + "world"
-    var ir = try buildIRFromSource("fun main() { \"hello\" + \"world\" }");
+    var ir = try buildIRFromSource("fun main(): void { \"hello\" + \"world\" }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -398,7 +398,7 @@ test "Phase 2.5: 字符串拼接 (+)" {
 
 test "Phase 2.5: 字符串拼接 (++)" {
     // "foo" ++ "bar"
-    var ir = try buildIRFromSource("fun main() { \"foo\" ++ \"bar\" }");
+    var ir = try buildIRFromSource("fun main(): void { \"foo\" ++ \"bar\" }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -412,7 +412,7 @@ test "Phase 2.5: 字符串长度" {
     // 简化：直接验证 string_len op 在 IR 层的正确性
     // "hello".len() 暂未支持 method_call，用内建方式测试
     // 此测试验证 const_str + string_len 的端到端流程
-    var ir = try buildIRFromSource("fun main() { \"hello\" + \"world\" }");
+    var ir = try buildIRFromSource("fun main(): void { \"hello\" + \"world\" }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -423,7 +423,7 @@ test "Phase 2.5: 字符串长度" {
 
 test "Phase 2.5: 三字符串拼接" {
     // "a" + "b" + "c"
-    var ir = try buildIRFromSource("fun main() { \"a\" + \"b\" + \"c\" }");
+    var ir = try buildIRFromSource("fun main(): void { \"a\" + \"b\" + \"c\" }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -434,7 +434,7 @@ test "Phase 2.5: 三字符串拼接" {
 
 test "Phase 2.5: 空字符串拼接" {
     // "" + "x"
-    var ir = try buildIRFromSource("fun main() { \"\" + \"x\" }");
+    var ir = try buildIRFromSource("fun main(): void { \"\" + \"x\" }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -449,7 +449,7 @@ test "Phase 2.5: 空字符串拼接" {
 
 test "Phase 2.5: 数组字面量长度" {
     // [1, 2, 3] — 验证 array_make + array_set 链
-    var ir = try buildIRFromSource("fun main() { [1, 2, 3] }");
+    var ir = try buildIRFromSource("fun main(): void { [1, 2, 3] }");
     defer ir.deinit();
 
     // 验证 IR 中包含 array_make 和 array_set 节点
@@ -465,7 +465,7 @@ test "Phase 2.5: 数组字面量长度" {
 
 test "Phase 2.5: 数组索引访问" {
     // [10, 20, 30][1] → 20
-    var ir = try buildIRFromSource("fun main() { [10, 20, 30][1] }");
+    var ir = try buildIRFromSource("fun main(): void { [10, 20, 30][1] }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -475,7 +475,7 @@ test "Phase 2.5: 数组索引访问" {
 
 test "Phase 2.5: record 字面量与字段访问" {
     // (x: 1, y: 2).x → 1
-    var ir = try buildIRFromSource("fun main() { (x: 1, y: 2).x }");
+    var ir = try buildIRFromSource("fun main(): void { (x: 1, y: 2).x }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -485,7 +485,7 @@ test "Phase 2.5: record 字面量与字段访问" {
 
 test "Phase 2.5: record 多字段访问" {
     // (a: 10, b: 20, c: 30).b → 20
-    var ir = try buildIRFromSource("fun main() { (a: 10, b: 20, c: 30).b }");
+    var ir = try buildIRFromSource("fun main(): void { (a: 10, b: 20, c: 30).b }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -495,7 +495,7 @@ test "Phase 2.5: record 多字段访问" {
 
 test "Phase 2.5: record 字段覆盖" {
     // (x: 1, y: 2).y → 2
-    var ir = try buildIRFromSource("fun main() { (x: 1, y: 2).y }");
+    var ir = try buildIRFromSource("fun main(): void { (x: 1, y: 2).y }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -505,7 +505,7 @@ test "Phase 2.5: record 字段覆盖" {
 
 test "Phase 2.5: 字符串索引" {
     // "hello"[0] → 'h' = 104
-    var ir = try buildIRFromSource("fun main() { \"hello\"[0] }");
+    var ir = try buildIRFromSource("fun main(): void { \"hello\"[0] }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -518,7 +518,7 @@ test "Phase 2.5: 字符串索引" {
 
 test "Phase 2.5: 字符串插值" {
     // "hello {"world"}" → "hello world"
-    var ir = try buildIRFromSource("fun main() { \"hello {\"world\"}\" }");
+    var ir = try buildIRFromSource("fun main(): void { \"hello {\"world\"}\" }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -529,7 +529,7 @@ test "Phase 2.5: 字符串插值" {
 
 test "Phase 2.5: 字符串插值多段" {
     // "{"a"}b{"c"}" → "abc"
-    var ir = try buildIRFromSource("fun main() { \"{\"a\"}b{\"c\"}\" }");
+    var ir = try buildIRFromSource("fun main(): void { \"{\"a\"}b{\"c\"}\" }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -545,7 +545,7 @@ test "Phase 2.5: 字符串插值多段" {
 test "Phase 3: for range 向量化 identity map" {
     // for i in 0..10 { i } → vec_source(range) |> vec_map(identity) |> vec_sink(last)
     // sink_last 取最后一个元素 = 9
-    var ir = try buildIRFromSource("fun main() { for i in 0..10 { i } }");
+    var ir = try buildIRFromSource("fun main(): void { for i in 0..10 { i } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -556,7 +556,7 @@ test "Phase 3: for range 向量化 identity map" {
 
 test "Phase 3: for range 带运算 i * 2" {
     // for i in 0..5 { i * 2 } → [0,2,4,6,8], sink_last = 8
-    var ir = try buildIRFromSource("fun main() { for i in 0..5 { i * 2 } }");
+    var ir = try buildIRFromSource("fun main(): void { for i in 0..5 { i * 2 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -567,7 +567,7 @@ test "Phase 3: for range 带运算 i * 2" {
 
 test "Phase 3: for range 带运算 i + 10" {
     // for i in 1..4 { i + 10 } → [11,12,13], sink_last = 13
-    var ir = try buildIRFromSource("fun main() { for i in 1..4 { i + 10 } }");
+    var ir = try buildIRFromSource("fun main(): void { for i in 1..4 { i + 10 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -578,7 +578,7 @@ test "Phase 3: for range 带运算 i + 10" {
 
 test "Phase 3: for range 单元素" {
     // for i in 0..1 { i } → [0], sink_last = 0
-    var ir = try buildIRFromSource("fun main() { for i in 0..1 { i } }");
+    var ir = try buildIRFromSource("fun main(): void { for i in 0..1 { i } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -589,7 +589,7 @@ test "Phase 3: for range 单元素" {
 
 test "Phase 3: for range 复杂表达式" {
     // for i in 0..5 { (i + 1) * 3 } → [3,6,9,12,15], sink_last = 15
-    var ir = try buildIRFromSource("fun main() { for i in 0..5 { (i + 1) * 3 } }");
+    var ir = try buildIRFromSource("fun main(): void { for i in 0..5 { (i + 1) * 3 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -607,7 +607,7 @@ test "Phase 4: defer 在 return 前执行" {
     // fun main() -> i64 { defer cleanup(); 42 }
     // 验证 defer 不影响返回值
     var ir = try buildIRFromSource(
-        "fun cleanup() { 0 } fun main() { defer cleanup(); 42 }",
+        "fun cleanup(): i64 { 0 } fun main(): i64 { defer cleanup(); 42 }",
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -620,7 +620,7 @@ test "Phase 4: defer 在 return 前执行" {
 test "Phase 4: 多个 defer LIFO 执行" {
     // 多个 defer 不影响返回值，验证 LIFO 执行不崩溃
     var ir = try buildIRFromSource(
-        "fun a() { 0 } fun b() { 0 } fun main() { defer a(); defer b(); 99 }",
+        "fun a(): i64 { 0 } fun b(): i64 { 0 } fun main(): i64 { defer a(); defer b(); 99 }",
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -634,7 +634,7 @@ test "Phase 4: defer 带 var 赋值" {
     // defer 调用函数，不影响返回值
     // 验证 defer 体能正确执行函数调用
     var ir = try buildIRFromSource(
-        "fun cleanup() { 0 } fun main() { var x = 1; defer cleanup(); x }",
+        "fun cleanup(): void { 0 } fun main(): void { var x = 1; defer cleanup(); x }",
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -647,7 +647,7 @@ test "Phase 4: defer 带 var 赋值" {
 
 test "Phase 4: throw 触发 halt_throw" {
     // throw 语句触发 halt_throw，run() 返回 error.Thrown
-    var ir = try buildIRFromSource("fun main() { throw 42 }");
+    var ir = try buildIRFromSource("fun main(): void { throw 42 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -662,7 +662,7 @@ test "Phase 4: throw 触发 halt_throw" {
 test "Phase 5: select 第一个分支就绪" {
     // select { 1 => v => 10; 2 => v => 20 }
     // 非 ChannelValue 输入视为始终就绪，第一个分支胜出 → body 返回 10
-    var ir = try buildIRFromSource("fun main() { select { 1 => v => 10; 2 => v => 20 } }");
+    var ir = try buildIRFromSource("fun main(): void { select { 1 => v => 10; 2 => v => 20 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -674,7 +674,7 @@ test "Phase 5: select 第一个分支就绪" {
 test "Phase 5: select 单分支" {
     // select { 42 => v => 99 }
     // 单个分支，胜出后执行 body 返回 99
-    var ir = try buildIRFromSource("fun main() { select { 42 => v => 99 } }");
+    var ir = try buildIRFromSource("fun main(): void { select { 42 => v => 99 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -686,7 +686,7 @@ test "Phase 5: select 单分支" {
 test "Phase 5: select 带 timeout 分支" {
     // select { timeout(1000) => 42 }
     // timeout arm 的 duration 被当作普通表达式编译，body 返回 42
-    var ir = try buildIRFromSource("fun main() { select { timeout(1000) => 42 } }");
+    var ir = try buildIRFromSource("fun main(): void { select { timeout(1000) => 42 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -698,7 +698,7 @@ test "Phase 5: select 带 timeout 分支" {
 test "Phase 5: select body 带运算" {
     // select { 1 => v => 3 * 4 }
     // body 包含运算，结果为 12
-    var ir = try buildIRFromSource("fun main() { select { 1 => v => 3 * 4 } }");
+    var ir = try buildIRFromSource("fun main(): void { select { 1 => v => 3 * 4 } }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -714,7 +714,7 @@ test "Phase 5: select body 带运算" {
 test "Phase 6: Elvis 整数默认值" {
     // 整数不可能为 null，直接返回左操作数
     // 1 ?? 99 → 1
-    var ir = try buildIRFromSource("fun main() { 1 ?? 99 }");
+    var ir = try buildIRFromSource("fun main(): void { 1 ?? 99 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -726,7 +726,7 @@ test "Phase 6: Elvis 整数默认值" {
 test "Phase 6: non_null_assert 整数透传" {
     // 整数不可能为 null，! 直接透传
     // 42! → 42
-    var ir = try buildIRFromSource("fun main() { 42! }");
+    var ir = try buildIRFromSource("fun main(): void { 42! }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -737,7 +737,7 @@ test "Phase 6: non_null_assert 整数透传" {
 
 test "Phase 6: Elvis 链式表达式" {
     // (1 + 2) ?? 99 → 3
-    var ir = try buildIRFromSource("fun main() { (1 + 2) ?? 99 }");
+    var ir = try buildIRFromSource("fun main(): void { (1 + 2) ?? 99 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -754,8 +754,8 @@ test "Phase 7: async 函数基本执行 + join" {
     // async fun compute() { 42 }
     // fun main() { compute().await() }
     var ir = try buildIRFromSource(
-        \\async fun compute() { 42 }
-        \\fun main() { compute().await() }
+        \\async fun compute(): Async<i64> { 42 }
+        \\fun main(): void { compute().await() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -769,8 +769,8 @@ test "Phase 7: async 函数带参数" {
     // async fun add(a, b) { a + b }
     // fun main() { add(3, 4).await() }
     var ir = try buildIRFromSource(
-        \\async fun add(a, b) { a + b }
-        \\fun main() { add(3, 4).await() }
+        \\async fun add(a, b): Async<i64> { a + b }
+        \\fun main(): i64 { add(3, 4).await() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -784,8 +784,8 @@ test "Phase 7: async 函数计算" {
     // async fun square(n) { n * n }
     // fun main() { square(7).await() }
     var ir = try buildIRFromSource(
-        \\async fun square(n) { n * n }
-        \\fun main() { square(7).await() }
+        \\async fun square(n): i64 { n * n }
+        \\fun main(): i64 { square(7).await() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -800,9 +800,9 @@ test "Phase 7: async 函数调用普通函数" {
     // async fun compute() { double(21) }
     // fun main() { compute().await() }
     var ir = try buildIRFromSource(
-        \\fun double(n) { n * 2 }
-        \\async fun compute() { double(21) }
-        \\fun main() { compute().await() }
+        \\fun double(n): i64 { n * 2 }
+        \\async fun compute(): i64 { double(21) }
+        \\fun main(): void { compute().await() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -817,9 +817,9 @@ test "Phase 7: 嵌套普通函数调用（非 async）" {
     // fun compute() { double(21) }
     // fun main() { compute() }
     var ir = try buildIRFromSource(
-        \\fun double(n) { n * 2 }
-        \\fun compute() { double(21) }
-        \\fun main() { compute() }
+        \\fun double(n): i64 { n * 2 }
+        \\fun compute(): i64 { double(21) }
+        \\fun main(): i64 { compute() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -833,8 +833,8 @@ test "Phase 7: 单层 double 调用" {
     // fun double(n) { n * 2 }
     // fun main() { double(21) }
     var ir = try buildIRFromSource(
-        \\fun double(n) { n * 2 }
-        \\fun main() { double(21) }
+        \\fun double(n): i64 { n * 2 }
+        \\fun main(): i64 { double(21) }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -847,7 +847,7 @@ test "Phase 7: 单层 double 调用" {
 test "loop + break" {
     // var i = 0; var sum = 0; loop { if i >= 5 { break } sum += i; i += 1 } sum
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    var i = 0
         \\    var sum = 0
         \\    loop {
@@ -867,7 +867,7 @@ test "loop + break" {
 
 test "for + break" {
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    var sum = 0
         \\    for i in 0..100 {
         \\        if i > 5 { break }
@@ -885,7 +885,7 @@ test "for + break" {
 
 test "for + continue" {
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    var sum = 0
         \\    for i in 0..10 {
         \\        if i % 2 == 0 { continue }
@@ -903,7 +903,7 @@ test "for + continue" {
 
 test "while + break" {
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    var i = 0
         \\    var sum = 0
         \\    while i < 100 {
@@ -927,7 +927,7 @@ test "while + break" {
 
 test "Phase 7-c: startScheduler 启动协程调度器" {
     // 验证 startScheduler 创建调度器并启动 worker 线程，不崩溃
-    var ir = try buildIRFromSource("fun main() { 42 }");
+    var ir = try buildIRFromSource("fun main(): void { 42 }");
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
     var engine = try initTestEngineOwned(&ir, &threaded);
@@ -944,8 +944,8 @@ test "Phase 7-c: async 函数走协程调度路径" {
     // fun main() { compute().await() }
     // 启用调度器后，compute() 应走 scheduler.spawn → runSegment → complete → join
     var ir = try buildIRFromSource(
-        \\async fun compute() { 42 }
-        \\fun main() { compute().await() }
+        \\async fun compute(): Async<i64> { 42 }
+        \\fun main(): void { compute().await() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -966,7 +966,7 @@ test "Phase 7-c: async 函数走协程调度路径" {
 test "P0-b: ADT 无参构造器（Leaf）" {
     var ir = try buildIRFromSource(
         \\type Tree = | Leaf | Node(i32, Tree, Tree)
-        \\fun main() { Leaf }
+        \\fun main(): void { Leaf }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -979,7 +979,7 @@ test "P0-b: ADT 带参构造器 + 命名字段访问" {
     // Box(42).value → 42
     var ir = try buildIRFromSource(
         \\type Box = | Box(value: i32)
-        \\fun main() { Box(42).value }
+        \\fun main(): void { Box(42).value }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -992,7 +992,7 @@ test "P0-b: ADT 多构造器 + 位置字段访问" {
     // Node(5, Leaf, Leaf)._0 → 5
     var ir = try buildIRFromSource(
         \\type Tree = | Leaf | Node(i32, Tree, Tree)
-        \\fun main() { Node(5, Leaf, Leaf)._0 }
+        \\fun main(): void { Node(5, Leaf, Leaf)._0 }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1005,7 +1005,7 @@ test "P0-b: newtype 构造器 + 字段访问" {
     // UserId(42)._0 → 42
     var ir = try buildIRFromSource(
         \\type UserId = UserId(i32)
-        \\fun main() { UserId(42)._0 }
+        \\fun main(): void { UserId(42)._0 }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1019,7 +1019,7 @@ test "P0-b: trait_decl 注册（不崩溃）" {
         \\trait Printable {
         \\    fun format(self): str
         \\}
-        \\fun main() { 42 }
+        \\fun main(): void { 42 }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1033,7 +1033,7 @@ test "P0-b: type 方法注册为函数" {
     // 方法已注册，通过字段访问验证构造器
     var ir = try buildIRFromSource(
         \\type MyInt = | MyInt(value: i32)
-        \\fun main() { MyInt(10).value }
+        \\fun main(): void { MyInt(10).value }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1049,7 +1049,7 @@ test "P0-b: type 方法注册为函数" {
 test "P0-c: match 字面量匹配" {
     // match 2 { 1 => 10, 2 => 20, _ => 30 } → 20
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    match 2 {
         \\        1 => 10
         \\        2 => 20
@@ -1067,7 +1067,7 @@ test "P0-c: match 字面量匹配" {
 test "P0-c: match 通配符兜底" {
     // match 99 { 1 => 10, _ => 30 } → 30
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    match 99 {
         \\        1 => 10
         \\        _ => 30
@@ -1084,7 +1084,7 @@ test "P0-c: match 通配符兜底" {
 test "P0-c: match 变量绑定" {
     // match 42 { 1 => 10, x => x } → 42
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    match 42 {
         \\        1 => 10
         \\        x => x
@@ -1102,7 +1102,7 @@ test "P0-c: match ADT 构造器解构" {
     // match Box(42) { Box(v) => v, Leaf => 0 } → 42
     var ir = try buildIRFromSource(
         \\type Box = | Box(value: i32) | Empty
-        \\fun main() {
+        \\fun main(): void {
         \\    match Box(42) {
         \\        Box(v) => v
         \\        Empty => 0
@@ -1120,7 +1120,7 @@ test "P0-c: match ADT 无参构造器" {
     // match Empty { Box(v) => v, Empty => 99 } → 99
     var ir = try buildIRFromSource(
         \\type Box = | Box(value: i32) | Empty
-        \\fun main() {
+        \\fun main(): void {
         \\    match Empty {
         \\        Box(v) => v
         \\        Empty => 99
@@ -1137,7 +1137,7 @@ test "P0-c: match ADT 无参构造器" {
 test "P0-c: match 或模式" {
     // match 2 { 1 | 2 | 3 => 10, _ => 20 } → 10
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    match 2 {
         \\        1 | 2 | 3 => 10
         \\        _ => 20
@@ -1154,7 +1154,7 @@ test "P0-c: match 或模式" {
 test "P0-c: match 守卫条件" {
     // match 5 { n if n < 0 => 1, n if n > 3 => 2, _ => 3 } → 2
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    match 5 {
         \\        n if n < 0 => 1
         \\        n if n > 3 => 2
@@ -1173,7 +1173,7 @@ test "P0-c: match 多构造器 ADT 位置字段" {
     // match Node(5, Leaf, Leaf) { Node(v, _, _) => v, Leaf => 0 } → 5
     var ir = try buildIRFromSource(
         \\type Tree = | Leaf | Node(i32, Tree, Tree)
-        \\fun main() {
+        \\fun main(): void {
         \\    match Node(5, Leaf, Leaf) {
         \\        Node(v, _, _) => v
         \\        Leaf => 0
@@ -1194,8 +1194,8 @@ test "P0-c: match 多构造器 ADT 位置字段" {
 test "P0-d: async .await() 显式等待" {
     // async fun compute() { 42 } fun main() { compute().await() }
     var ir = try buildIRFromSource(
-        \\async fun compute() { 42 }
-        \\fun main() { compute().await() }
+        \\async fun compute(): Async<i64> { 42 }
+        \\fun main(): void { compute().await() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1209,8 +1209,8 @@ test "P0-d: async .status() 状态查询" {
     // fun main() { val s = compute(); s.await(); s.status() }
     // await 后状态应为 2（Completed）
     var ir = try buildIRFromSource(
-        \\async fun compute() { 42 }
-        \\fun main() {
+        \\async fun compute(): Async<i64> { 42 }
+        \\fun main(): void {
         \\    val s = compute()
         \\    s.await()
         \\    s.status()
@@ -1226,7 +1226,7 @@ test "P0-d: async .status() 状态查询" {
 test "P0-d: array .len() 方法" {
     // [10, 20, 30].len() → 3
     var ir = try buildIRFromSource(
-        \\fun main() { [10, 20, 30].len() }
+        \\fun main(): void { [10, 20, 30].len() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1238,7 +1238,7 @@ test "P0-d: array .len() 方法" {
 test "P0-d: string .len() 方法" {
     // "hello".len() → 5
     var ir = try buildIRFromSource(
-        \\fun main() { "hello".len() }
+        \\fun main(): void { "hello".len() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1250,7 +1250,7 @@ test "P0-d: string .len() 方法" {
 test "P0-d: array .push() 方法" {
     // val arr = [1]; arr.push(2); arr.len() → 2
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    val arr = [1]
         \\    arr.push(2)
         \\    arr.len()
@@ -1271,7 +1271,7 @@ test "P0-d: 用户自定义方法调用" {
         \\{
         \\    fun get(self): i32 { self.value }
         \\}
-        \\fun main() { MyInt(10).get() }
+        \\fun main(): void { MyInt(10).get() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1286,7 +1286,7 @@ test "P0-d: .type_name() 反射方法" {
     // 验证不崩溃即可
     var ir = try buildIRFromSource(
         \\type Point = | Point(x: i32, y: i32)
-        \\fun main() {
+        \\fun main(): void {
         \\    val p = Point(1, 2)
         \\    p.type_name()
         \\    42
@@ -1302,8 +1302,8 @@ test "P0-d: .type_name() 反射方法" {
 test "P0-d: async .await() 带参数计算" {
     // async fun add(a, b) { a + b } fun main() { add(3, 4).await() }
     var ir = try buildIRFromSource(
-        \\async fun add(a, b) { a + b }
-        \\fun main() { add(3, 4).await() }
+        \\async fun add(a, b): Async<i64> { a + b }
+        \\fun main(): i64 { add(3, 4).await() }
     );
     defer ir.deinit();
     var threaded: std.Io.Threaded = undefined;
@@ -1320,7 +1320,7 @@ test "P1-a: fun lambda 基本调用" {
     // val f = fun(x) { x + 1 }
     // fun main() { val f = fun(x) { x + 1 }; f(10) }
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    val f = fun(x) { x + 1 }
         \\    f(10)
         \\}
@@ -1335,7 +1335,7 @@ test "P1-a: fun lambda 基本调用" {
 test "P1-a: 箭头 lambda 基本调用" {
     // val f = (x) => x + 1; f(10) → 11
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    val f = (x) => x + 1
         \\    f(10)
         \\}
@@ -1350,7 +1350,7 @@ test "P1-a: 箭头 lambda 基本调用" {
 test "P1-a: 多参数 lambda" {
     // val g = (a, b) => a + b; g(3, 4) → 7
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    val g = (a, b) => a + b
         \\    g(3, 4)
         \\}
@@ -1365,7 +1365,7 @@ test "P1-a: 多参数 lambda" {
 test "P1-a: 闭包捕获自由变量" {
     // val n = 10; val f = fun(x) { x + n }; f(5) → 15
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    val n = 10
         \\    val f = fun(x) { x + n }
         \\    f(5)
@@ -1381,7 +1381,7 @@ test "P1-a: 闭包捕获自由变量" {
 test "P1-a: 闭包捕获多个自由变量" {
     // val a = 100; val b = 20; val f = fun(x) { x + a - b }; f(1) → 81
     var ir = try buildIRFromSource(
-        \\fun main() {
+        \\fun main(): void {
         \\    val a = 100
         \\    val b = 20
         \\    val f = fun(x) { x + a - b }
@@ -1455,12 +1455,12 @@ test "vec_zip: 合并两个 range 向量" {
     const alloc = arena.allocator();
 
     var channels = ir_mod.ChannelSpace.init(alloc);
-    const c_const0 = try channels.alloc(.i64_chan);
-    const c_const3 = try channels.alloc(.i64_chan);
-    const c_left = try channels.alloc(.i64_chan);
-    const c_right = try channels.alloc(.i64_chan);
-    const c_zipped = try channels.alloc(.ref_chan);
-    const c_count = try channels.alloc(.i64_chan);
+    const c_const0 = try channels.alloc(ir_mod.type_descriptor_mod.i64_descriptor);
+    const c_const3 = try channels.alloc(ir_mod.type_descriptor_mod.i64_descriptor);
+    const c_left = try channels.alloc(ir_mod.type_descriptor_mod.i64_descriptor);
+    const c_right = try channels.alloc(ir_mod.type_descriptor_mod.i64_descriptor);
+    const c_zipped = try channels.alloc(ir_mod.type_descriptor_mod.ref_descriptor);
+    const c_count = try channels.alloc(ir_mod.type_descriptor_mod.i64_descriptor);
 
     const scalar_metas = try alloc.alloc(ScalarMeta, 3);
     scalar_metas[0] = .{ .kind = .unit }; // meta_index=0 占位
@@ -1468,9 +1468,9 @@ test "vec_zip: 合并两个 range 向量" {
     scalar_metas[2] = .{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 3 } };
 
     const vector_metas = try alloc.alloc(ir_mod.VectorMeta, 3);
-    vector_metas[0] = .{ .vec_op = .range_source, .elem_type = .i64_chan, .length = 3 };
-    vector_metas[1] = .{ .vec_op = .range_source, .elem_type = .i64_chan, .length = 3 };
-    vector_metas[2] = .{ .vec_op = .sink_count, .elem_type = .i64_chan };
+    vector_metas[0] = .{ .vec_op = .range_source, .elem_type_desc = ir_mod.type_descriptor_mod.i64_descriptor, .length = 3 };
+    vector_metas[1] = .{ .vec_op = .range_source, .elem_type_desc = ir_mod.type_descriptor_mod.i64_descriptor, .length = 3 };
+    vector_metas[2] = .{ .vec_op = .sink_count, .elem_type_desc = ir_mod.type_descriptor_mod.i64_descriptor };
 
     const nodes = try alloc.alloc(Node, 7);
     nodes[0] = Node.makeSink(.const_i, c_const0, 1);

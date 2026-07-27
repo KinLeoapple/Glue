@@ -6,6 +6,7 @@
 const std = @import("std");
 const ir_mod = @import("ir.zig");
 const node_mod = @import("node.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 
 pub const GlueIR = ir_mod.GlueIR;
 pub const Node = node_mod.Node;
@@ -24,12 +25,14 @@ pub fn printIR(ir: *const GlueIR, allocator: std.mem.Allocator, buf: *std.ArrayL
     for (ir.channels.metas.items, 0..) |meta, i| {
         try buf.print(allocator, "  ch{d}: type={s} width={d}", .{
             i,
-            @tagName(meta.chan_type),
+            meta.type_desc.type_name,
             meta.elem_width,
         });
         if (meta.is_cell) try buf.appendSlice(allocator, " [cell]");
-        if (meta.chan_type == .nullable_chan) {
-            try buf.print(allocator, " inner={s}", .{@tagName(meta.inner_type)});
+        if (meta.type_desc.is_nullable) {
+            if (meta.inner_type_desc) |inner| {
+                try buf.print(allocator, " inner={s}", .{inner.type_name});
+            }
         }
         try buf.appendSlice(allocator, "\n");
     }
@@ -102,7 +105,7 @@ pub fn printIR(ir: *const GlueIR, allocator: std.mem.Allocator, buf: *std.ArrayL
                 i,
                 @tagName(meta.vec_op),
                 @tagName(meta.inner_op),
-                @tagName(meta.elem_type),
+                meta.elem_type_desc.type_name,
             });
             if (meta.length) |len| {
                 try buf.print(allocator, " length={d}", .{len});
@@ -184,7 +187,7 @@ pub fn printIR(ir: *const GlueIR, allocator: std.mem.Allocator, buf: *std.ArrayL
                 i,
                 meta.func_index,
                 meta.arg_count,
-                @tagName(meta.result_type),
+                meta.result_type_desc.type_name,
             });
             if (meta.is_spawn) {
                 try buf.appendSlice(allocator, " [spawn]");
@@ -229,8 +232,8 @@ const meta_mod = @import("meta.zig");
 
 test "printIR 基本输出" {
     var cs = channel_mod.ChannelSpace.init(testing.allocator);
-    _ = try cs.alloc(.i64_chan);
-    _ = try cs.alloc(.i64_chan);
+    _ = try cs.alloc(type_descriptor_mod.i64_descriptor);
+    _ = try cs.alloc(type_descriptor_mod.i64_descriptor);
 
     const nodes = [_]Node{
         Node.makeSink(.const_i, 0, 1),

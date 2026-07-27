@@ -14,11 +14,12 @@ const syscall = @import("syscall");
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const builtin_type_names = @import("builtin_type_names.zig");
 
 const NodeOp = node_mod.NodeOp;
-const ChanType = channel_mod.ChanType;
 const ChannelSpace = channel_mod.ChannelSpace;
+const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
 const LayoutInfo = meta_mod.LayoutInfo;
 const IntKind = scalar.IntKind;
 const FloatKind = scalar.FloatKind;
@@ -80,10 +81,10 @@ pub fn floatKindFromSuffix(suffix: ?[]const u8) ?FloatKind {
 // ════════════════════════════════════════════════════════════════
 
 /// BinaryOp + 操作数类型 → NodeOp
-pub fn binaryOpToNodeOp(op: ast.BinaryOp, operand_type: ChanType) BuildError!NodeOp {
+pub fn binaryOpToNodeOp(op: ast.BinaryOp, operand_type: *const TypeDescriptor) BuildError!NodeOp {
     const is_int = operand_type.isInt();
     const is_float = operand_type.isFloat();
-    const is_ref = operand_type == .ref_chan;
+    const is_ref = operand_type.is_ref;
     return switch (op) {
         .add => if (is_int) .int_add else if (is_float) .float_add else if (is_ref) .string_concat else return error.UnsupportedType,
         .sub => if (is_int) .int_sub else if (is_float) .float_sub else return error.UnsupportedType,
@@ -110,7 +111,7 @@ pub fn binaryOpToNodeOp(op: ast.BinaryOp, operand_type: ChanType) BuildError!Nod
 }
 
 /// UnaryOp + 操作数类型 → NodeOp
-pub fn unaryOpToNodeOp(op: ast.UnaryOp, operand_type: ChanType) BuildError!NodeOp {
+pub fn unaryOpToNodeOp(op: ast.UnaryOp, operand_type: *const TypeDescriptor) BuildError!NodeOp {
     const is_int = operand_type.isInt();
     const is_float = operand_type.isFloat();
     return switch (op) {
@@ -121,11 +122,11 @@ pub fn unaryOpToNodeOp(op: ast.UnaryOp, operand_type: ChanType) BuildError!NodeO
 }
 
 /// 二元运算结果类型
-pub fn binaryResultType(op: ast.BinaryOp, operand_type: ChanType) ChanType {
+pub fn binaryResultType(op: ast.BinaryOp, operand_type: *const TypeDescriptor) *const TypeDescriptor {
     return switch (op) {
-        .eq, .not_eq, .ref_eq, .ref_neq, .lt, .gt, .lt_eq, .gt_eq => .mask_chan, // 比较输出 mask
-        .and_op, .or_op => .bool_chan,
-        .concat_list => .ref_chan, // 字符串/数组拼接返回引用
+        .eq, .not_eq, .ref_eq, .ref_neq, .lt, .gt, .lt_eq, .gt_eq => type_descriptor_mod.mask_descriptor, // 比较输出 mask
+        .and_op, .or_op => type_descriptor_mod.bool_descriptor,
+        .concat_list => type_descriptor_mod.ref_descriptor, // 字符串/数组拼接返回引用
         else => operand_type, // 算术/位运算继承操作数类型
     };
 }
@@ -199,8 +200,8 @@ pub fn throwOkTypeNode(type_node: ?*ast.TypeNode) ?*ast.TypeNode {
     }
 }
 
-/// 从 Throw<T, E> 类型节点提取 Ok 值的通道类型
-pub fn throwOkChanType(type_node: ?*ast.TypeNode) ?ChanType {
+/// 从 Throw<T, E> 类型节点提取 Ok 值的类型描述符
+pub fn throwOkChanType(type_node: ?*ast.TypeNode) ?*const TypeDescriptor {
     const tn = type_node orelse return null;
     switch (tn.*) {
         .generic => |g| {
@@ -252,7 +253,7 @@ pub fn isNullableTypeNode(type_node: *const ast.TypeNode) bool {
 }
 
 // ════════════════════════════════════════════════════════════════
-// TypeNode → 类型名 / ChanType / 布局
+// TypeNode → 类型名 / TypeDescriptor / 布局
 // ════════════════════════════════════════════════════════════════
 
 /// 从 TypeNode 提取类型名（不分配，用于快速查表）
@@ -262,10 +263,10 @@ pub fn typeNameFromTypeNodeConst(type_node: *const ast.TypeNode) []const u8 {
     return switch (type_node.*) {
         .named => |n| n.name,
         .self_type => "Self",
-        // 泛型类型取基础名（如 Array<i32> → "Array"），args 信息由 chan_type 承载
+        // 泛型类型取基础名（如 Array<i32> → "Array"），args 信息由 type_desc 承载
         .generic => |g| g.name,
         // 包装类型递归取内部名：nullable/ref_type/raw_ptr/kind_annotated
-        // 注：格式化时 nullable/ref 由 chan_type（.nullable_chan/.ref_chan）检测，
+        // 注：格式化时 nullable/ref 由 type_desc.is_nullable/is_ref 检测，
         // type_name 仅用于内部值的类型分派，返回内部名即可正确递归。
         .nullable => |nb| typeNameFromTypeNodeConst(nb.inner),
         .ref_type => |rb| typeNameFromTypeNodeConst(rb.inner),
@@ -343,7 +344,7 @@ pub fn primitiveLayout(name: []const u8) ?LayoutInfo {
         .{ .n = "f64", .s = 8, .a = 8 },
         .{ .n = "f128", .s = 16, .a = 16 },
         .{ .n = "str", .s = 16, .a = 8 }, // Str 对象指针 + 长度
-        .{ .n = "unit", .s = 0, .a = 1 },
+        .{ .n = "void", .s = 0, .a = 1 },
     };
     for (table) |e| {
         if (std.mem.eql(u8, e.n, name)) {
@@ -360,69 +361,39 @@ pub fn alignUp(offset: u32, alignment: u32) u32 {
     return (offset + mask) & ~mask;
 }
 
-/// SyscallRetKind → ChanType 转换（ir 层独有，将 syscall 模块的返回类型分类映射到 IR 通道类型）
+/// SyscallRetKind → TypeDescriptor 转换（ir 层独有，将 syscall 模块的返回类型分类映射到 IR 类型描述符）
 ///
-/// 这是从 syscall.SyscallRetKind 到 ir.ChanType 的唯一适配点。
-/// syscall 模块不依赖 ir（不知道 ChanType），故此转换在 ir 层完成。
-pub fn retKindToChanType(kind: syscall.SyscallRetKind) ChanType {
+/// 这是从 syscall.SyscallRetKind 到 ir TypeDescriptor 的唯一适配点。
+/// syscall 模块不依赖 ir（不知道 TypeDescriptor），故此转换在 ir 层完成。
+pub fn retKindToChanType(kind: syscall.SyscallRetKind) *const TypeDescriptor {
     return switch (kind) {
-        .ref => .ref_chan,
-        .i128 => .i128_chan,
-        .i32 => .i32_chan,
-        .unit => .unit_chan,
+        .ref => type_descriptor_mod.ref_descriptor,
+        .i128 => type_descriptor_mod.i128_descriptor,
+        .i32 => type_descriptor_mod.i32_descriptor,
+        .unit => type_descriptor_mod.unit_descriptor,
     };
 }
 
-/// 从 TypeNode 推导通道类型
-/// 原始类型返回精确 ChanType，用户自定义类型（ADT/record/newtype）返回 ref_chan
-/// 注意：此独立函数无法解析 type alias。对 alias 名称（如 "Age"=i32）会 fallthrough 返回 ref_chan。
-/// 调用方若需解析 alias，应使用 IRBuilder.chanTypeFromTypeNodeResolved。
-pub fn chanTypeFromTypeNode(type_node: ?*ast.TypeNode) ?ChanType {
-    const tn = type_node orelse return null;
-    return switch (tn.*) {
-        .named => |n| {
-            // 内置标量 + str/unit → ChanType；用户自定义类型 → ref_chan（堆引用）
-            return builtin_type_names.chanTypeFromNameWithDefault(n.name, .ref_chan);
-        },
-        .generic => |g| {
-            // 泛型类型如 List<T>、Channel<T> → ref_chan
-            if (std.mem.eql(u8, g.name, "Channel")) return .ref_chan;
-            // Atomic<T> → ref_chan（堆分配的 AtomicValue 指针，跨线程共享）
-            if (std.mem.eql(u8, g.name, "Atomic")) return .ref_chan;
-            return .ref_chan;
-        },
-        .nullable => |nb| {
-            // nullable 类型：返回内部类型的 ChanType，调用方可用于 allocNullable
-            return chanTypeFromTypeNode(nb.inner) orelse .ref_chan;
-        },
-        // 借用引用 &T：通道存指针，固定 8 字节 ref_chan
-        .ref_type => .ref_chan,
-        // 裸指针 *T：通道存指针，固定 8 字节 ref_chan
-        .raw_ptr => .ref_chan,
-        // 记录类型（含元组）：堆分配的 RecordValue → ref_chan
-        .record => .ref_chan,
-        // 函数类型：Callable 引用 → ref_chan
-        .function => .ref_chan,
-        // 数组类型：堆分配的 ArrayValue → ref_chan
-        .array => .ref_chan,
-        // self_type/kind_annotated：无法静态推断，退化为 ref_chan
-        .self_type => .ref_chan,
-        .kind_annotated => |ka| chanTypeFromTypeNode(ka.inner) orelse .ref_chan,
-    };
+/// 从 TypeNode 推导类型描述符
+/// 统一路径：委托 sema/type_resolver.resolveChanType（消除并行 switch 实现）
+/// 无 type_args 上下文时调用（空 type_args），行为与 resolveTypeNode(type_node, &.{}) 等价
+pub fn chanTypeFromTypeNode(type_node: ?*ast.TypeNode) ?*const TypeDescriptor {
+    const sema = @import("sema");
+    return sema.type_resolver.resolveChanType(type_node, &.{});
 }
 
 /// 分配类型节点对应的通道（正确处理 nullable 类型）
 /// 返回通道索引
 pub fn allocChanFromTypeNode(channels: *ChannelSpace, type_node: ?*ast.TypeNode) !u16 {
-    const tn = type_node orelse return try channels.alloc(.i64_chan);
+    const tn = type_node orelse return try channels.alloc(type_descriptor_mod.i64_descriptor);
     return switch (tn.*) {
         .nullable => |nb| {
-            const inner_ct = chanTypeFromTypeNode(nb.inner) orelse .ref_chan;
-            return try channels.allocNullable(inner_ct);
+            const inner_td = chanTypeFromTypeNode(nb.inner) orelse type_descriptor_mod.ref_descriptor;
+            return try channels.allocNullable(inner_td);
         },
         else => {
-            const ct = chanTypeFromTypeNode(tn) orelse .i64_chan;
-            return try channels.alloc(ct);
+            const td = chanTypeFromTypeNode(tn) orelse type_descriptor_mod.i64_descriptor;
+            return try channels.alloc(td);
         },
     };
 }
@@ -759,15 +730,15 @@ test "intKindFromSuffix 后缀解析" {
 }
 
 test "binaryOpToNodeOp 类型分派" {
-    try testing.expectEqual(NodeOp.int_add, try binaryOpToNodeOp(.add, .i64_chan));
-    try testing.expectEqual(NodeOp.float_add, try binaryOpToNodeOp(.add, .f64_chan));
-    try testing.expectEqual(NodeOp.int_and, try binaryOpToNodeOp(.bit_and, .i32_chan));
-    try testing.expectEqual(NodeOp.cmp_lt, try binaryOpToNodeOp(.lt, .i64_chan));
-    try testing.expectError(error.UnsupportedType, binaryOpToNodeOp(.bit_and, .f64_chan));
+    try testing.expectEqual(NodeOp.int_add, try binaryOpToNodeOp(.add, type_descriptor_mod.i64_descriptor));
+    try testing.expectEqual(NodeOp.float_add, try binaryOpToNodeOp(.add, type_descriptor_mod.f64_descriptor));
+    try testing.expectEqual(NodeOp.int_and, try binaryOpToNodeOp(.bit_and, type_descriptor_mod.i32_descriptor));
+    try testing.expectEqual(NodeOp.cmp_lt, try binaryOpToNodeOp(.lt, type_descriptor_mod.i64_descriptor));
+    try testing.expectError(error.UnsupportedType, binaryOpToNodeOp(.bit_and, type_descriptor_mod.f64_descriptor));
 }
 
 test "binaryResultType 结果类型推导" {
-    try testing.expectEqual(ChanType.mask_chan, binaryResultType(.lt, .i64_chan));
-    try testing.expectEqual(ChanType.bool_chan, binaryResultType(.and_op, .bool_chan));
-    try testing.expectEqual(ChanType.i64_chan, binaryResultType(.add, .i64_chan));
+    try testing.expectEqual(type_descriptor_mod.mask_descriptor, binaryResultType(.lt, type_descriptor_mod.i64_descriptor));
+    try testing.expectEqual(type_descriptor_mod.bool_descriptor, binaryResultType(.and_op, type_descriptor_mod.bool_descriptor));
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, binaryResultType(.add, type_descriptor_mod.i64_descriptor));
 }

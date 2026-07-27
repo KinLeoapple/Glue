@@ -5,14 +5,14 @@ type Pair = Pair(a: i32, b: i32)
 
 fun takesRec(p: (x: i32, y: i32)): i32 { p.x + p.y }
 
-fun modifyRec(p: (x: i32, y: i32)) { p.x = 999 }
+fun modifyRec(p: (x: i32, y: i32)): void { p.x = 999 }
 
 fun makeRec(): (x: i32, y: i32) {
     val inner = (x: 5i32, y: 6i32)
     inner
 }
 
-fun main() {
+fun main(): void {
     // ---- 记录：val 别名 + var 改字段，原值不变 ----
     val a = (x: 1i32, y: 2i32)
     var b = a
@@ -52,7 +52,7 @@ fun main() {
     println(r2.x)           // 100
 
     // ---- &T 参数仍保持引用语义 ----
-    fun modifyRef(p: &(x: i32, y: i32)) { p.x = 888 }
+    fun modifyRef(p: &(x: i32, y: i32)): void { p.x = 888 }
     var target = (x: 1i32, y: 2i32)
     modifyRef(&target)
     println(target.x)       // 888

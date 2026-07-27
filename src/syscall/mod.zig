@@ -9,7 +9,7 @@
 //! - syscall 原语层（本模块）：宿主 syscall 包装，构造错误用 makeError+makeThrow
 //! - stdlib 业务层（src/std/）：File/Path/Duration 等高层 API
 //!
-//! 依赖方向：本模块不依赖 ir（ChanType 不在此使用），ir 模块依赖本模块的
+//! 依赖方向：本模块不依赖 ir（类型信息通过 SyscallRetKind 自描述），ir 模块依赖本模块的
 //! SyscallId/lookupByName/returnKind/okTypeName 进行编译期查询。
 //! 这反转了原先 syscall → ir 的依赖方向，实现 IR 层与宿主能力解耦。
 //!

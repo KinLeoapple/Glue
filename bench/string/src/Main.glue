@@ -42,7 +42,7 @@ fun mixedStringOps(s: str): i64 {
     sum
 }
 
-fun main() {
+fun main(): void {
     // ---- 拼接密集:buildString(20000) 产出 40000 字符串 ----
     val s = buildString(20000)
     println(s.len())   // 40000

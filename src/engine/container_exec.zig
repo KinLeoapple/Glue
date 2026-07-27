@@ -26,11 +26,10 @@ pub const Methods = struct {
     /// inputs[0] = str 通道，output = usize 通道
     pub fn execStringLen(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
-        const src_meta = self.ir.channels.get(src_chan);
 
         // nullable_chan：检查 null flag，null 时返回 0
-        if (src_meta.chan_type == .nullable_chan) {
-            const inner_w = src_meta.inner_type.elemWidth();
+        if (self.runtime.isNullable(src_chan)) {
+            const inner_w = self.runtime.elemWidth(src_chan) - 1; // 总宽 - 1 byte flag
             const src = self.runtime.rawPtr(src_chan);
             if (src[inner_w] != 0) {
                 self.runtime.writeUsize(node.output, 0);
@@ -54,7 +53,7 @@ pub const Methods = struct {
         }
 
         // null_chan 或无指针：返回 0
-        if (src_meta.chan_type == .null_chan or src_chan >= self.runtime.chan_count or self.runtime.chanPtrs(src_chan) == null) {
+        if (self.runtime.isNull(src_chan) or src_chan >= self.runtime.chan_count or self.runtime.chanPtrs(src_chan) == null) {
             self.runtime.writeUsize(node.output, 0);
             return;
         }
@@ -325,8 +324,8 @@ pub const Methods = struct {
         if (count < 0) return error.Overflow;
         const n: usize = @intCast(count);
         const fill_value = self.chanToValue(node.inputs[1]);
-        // 元素类型是否为 &T / *T：优先从 fill_value 通道的 is_ref 读取
-        const elem_is_ref = self.ir.channels.get(node.inputs[1]).is_ref;
+        // 元素类型是否为 &T / *T：优先从 fill_value 通道的 type_desc.is_ref 读取
+        const elem_is_ref = self.ir.channels.get(node.inputs[1]).type_desc.is_ref;
 
         const use_arena = self.currentFuncUseArena();
         const v = if (use_arena) blk: {

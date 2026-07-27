@@ -3,7 +3,7 @@
 import std.io.Console.{println}
 fun mkArray(): i32[] { [10, 20, 30] }
 
-fun main() {
+fun main(): void {
     // ---- empty sources iterate zero times ----
     var s = 0i32
     // empty array: no iterations (for x in [] would use free-type x in s + x)

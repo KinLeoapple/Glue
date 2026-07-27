@@ -3,7 +3,7 @@
 import std.io.Console.{println}
 fun id(x: i32): i32 { x }
 
-fun main() {
+fun main(): void {
     // ---- simple shadowing in nested block ----
     val x = 1
     {

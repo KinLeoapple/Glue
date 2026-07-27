@@ -118,7 +118,7 @@ fun pairKind(a: i32?, b: i32?): str {
     }
 }
 
-fun main() {
+fun main(): void {
     val t = Node(5, Node(3, Leaf, Leaf), Node(8, Leaf, Leaf))
     println(deepNest(t))                  // 11
     println(deepNest(Node(7, Leaf, Leaf))) // 7

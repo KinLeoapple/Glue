@@ -97,7 +97,7 @@ pub const Methods = struct {
         const dst_tag = scalarKindToTag(meta.kind, meta.int_kind, meta.float_kind) orelse return error.UnsupportedOp;
 
         // str→数值 在 to 模式 panic（决策 #27）
-        if (src_meta.chan_type == .ref_chan) {
+        if (self.runtime.isRef(src_chan)) {
             return error.Panic;
         }
 
@@ -142,7 +142,7 @@ pub const Methods = struct {
 
         // str→数值 解析路径：src 为 ref_chan (Str)，需在 chanToScalarTag 之前处理
         // 因为 ref_chan 不能转换为 ScalarTag
-        if (src_meta.chan_type == .ref_chan) {
+        if (self.runtime.isRef(src_chan)) {
             // 读取源字符串
             const s = self.readStr(src_chan) orelse return error.UnsupportedOp;
             const str_bytes = s.bytes();

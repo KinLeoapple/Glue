@@ -19,11 +19,13 @@
 //! 不属于模块函数调用。
 //!
 //! v3 阶段 16：采用 AstVisitor 模式，仅 4 个特化 hook（call/method_call/
-//! field_access/identifier），其余变体走 walkExprChildrenMut 默认递归。
-//! 新增 AST 变体只需在 walkExprChildrenMut 补一行子节点遍历。
+//! field_access/identifier），其余变体委托 sema/ast_visitor.walkExprChildrenMut
+//! 默认递归。新增 AST 变体只需在 sema/ast_visitor.zig 的 walkExprChildrenMut
+//! 补一行子节点遍历，parse 层无需改动。
 
 const std = @import("std");
 const ast = @import("ast");
+const ast_visitor = @import("ast_visitor");
 
 /// 重写上下文：封装 renames/sibling_modules/arena，避免 4 参数透传。
 const RewriteCtx = struct {
@@ -62,7 +64,14 @@ pub fn rewriteStmt(
     rewriteStmtWithCtx(stmt, &ctx);
 }
 
-/// 表达式重写核心：4 个特化 hook + 其余走 walkExprChildrenMut 默认递归。
+/// walkExprChildrenMut 的 callback 适配器：把 (*anyopaque, *Expr) 转发回 rewriteExprWithCtx。
+/// rewriteExprWithCtx 内部无抛错路径（allocPrint 用 catch null），故此处永远返回成功。
+fn rewriteExprCb(opaque_ctx: *anyopaque, expr: *ast.Expr) anyerror!void {
+    const c: *const RewriteCtx = @ptrCast(@alignCast(opaque_ctx));
+    rewriteExprWithCtx(expr, c);
+}
+
+/// 表达式重写核心：4 个特化 hook + 其余委托 sema/ast_visitor.walkExprChildrenMut 默认递归。
 fn rewriteExprWithCtx(expr: *ast.Expr, ctx: *const RewriteCtx) void {
     switch (expr.*) {
         // ── 特化 1: .call ──
@@ -159,166 +168,13 @@ fn rewriteExprWithCtx(expr: *ast.Expr, ctx: *const RewriteCtx) void {
             }
         },
 
-        // ── 默认：走 walkExprChildrenMut 递归子节点 ──
-        else => walkExprChildrenMut(expr, ctx),
-    }
-}
-
-/// 遍历表达式的所有子节点并递归重写（不含 expr 自身）。
-/// 镜像 sema/static_analysis/ast_visitor.walkExprChildren 的结构，
-/// 但使用可变指针以支持 AST 就地变换。
-fn walkExprChildrenMut(expr: *ast.Expr, ctx: *const RewriteCtx) void {
-    switch (expr.*) {
-        // 单子节点
-        .unary => |u| rewriteExprWithCtx(u.operand, ctx),
-        .ref_of => |r| rewriteExprWithCtx(r.operand, ctx),
-        .deref => |d| rewriteExprWithCtx(d.operand, ctx),
-        .non_null_assert => |n| rewriteExprWithCtx(n.expr, ctx),
-        .propagate => |p| rewriteExprWithCtx(p.expr, ctx),
-        .safe_access => |s| rewriteExprWithCtx(s.object, ctx),
-        .type_cast => |tc| rewriteExprWithCtx(tc.expr, ctx),
-        .cast_builder => |cb| rewriteExprWithCtx(cb.expr, ctx),
-        .atomic_expr => |ae| rewriteExprWithCtx(ae.value, ctx),
-        .lazy => |l| rewriteExprWithCtx(l.expr, ctx),
-        .spawn_expr => |se| rewriteExprWithCtx(se.expr, ctx),
-
-        // 双子节点
-        .assignment_expr => |a| {
-            rewriteExprWithCtx(a.target, ctx);
-            rewriteExprWithCtx(a.value, ctx);
-        },
-        .compound_assign => |c| {
-            rewriteExprWithCtx(c.target, ctx);
-            rewriteExprWithCtx(c.value, ctx);
-        },
-        .binary => |b| {
-            rewriteExprWithCtx(b.left, ctx);
-            rewriteExprWithCtx(b.right, ctx);
-        },
-        .index => |i| {
-            rewriteExprWithCtx(i.object, ctx);
-            rewriteExprWithCtx(i.index, ctx);
-        },
-        .slice => |s| {
-            rewriteExprWithCtx(s.object, ctx);
-            rewriteExprWithCtx(s.start, ctx);
-            rewriteExprWithCtx(s.end, ctx);
-        },
-        .if_expr => |i| {
-            rewriteExprWithCtx(i.condition, ctx);
-            rewriteExprWithCtx(i.then_branch, ctx);
-            if (i.else_branch) |e| rewriteExprWithCtx(e, ctx);
-        },
-
-        // 多子节点
-        .safe_method_call => |smc| {
-            rewriteExprWithCtx(smc.object, ctx);
-            for (smc.arguments) |arg| rewriteExprWithCtx(arg, ctx);
-        },
-        .array_literal => |al| {
-            for (al.elements) |e| rewriteExprWithCtx(e, ctx);
-            if (al.fill_value) |fv| rewriteExprWithCtx(fv, ctx);
-            if (al.fill_count) |fc| rewriteExprWithCtx(fc, ctx);
-        },
-        .record_literal => |rl| {
-            for (rl.fields) |f| rewriteExprWithCtx(f.value, ctx);
-        },
-        .record_extend => |re| {
-            rewriteExprWithCtx(re.base, ctx);
-            for (re.updates) |u| rewriteExprWithCtx(u.value, ctx);
-        },
-        .string_interpolation => |si| {
-            for (si.parts) |p| switch (p) {
-                .expression => |e| rewriteExprWithCtx(e, ctx),
-                .literal => {},
-            };
-        },
-
-        // 含语句的表达式
-        .block => |blk| {
-            for (blk.statements) |s| rewriteStmtWithCtx(s, ctx);
-            if (blk.trailing_expr) |te| rewriteExprWithCtx(te, ctx);
-        },
-
-        // match：scrutinee + arms（guard + body）
-        .match => |m| {
-            rewriteExprWithCtx(m.scrutinee, ctx);
-            for (m.arms) |arm| {
-                if (arm.guard) |g| rewriteExprWithCtx(g, ctx);
-                rewriteExprWithCtx(arm.body, ctx);
-            }
-        },
-
-        // lambda：body
-        .lambda => |l| switch (l.body) {
-            .block => |b| rewriteExprWithCtx(b, ctx),
-            .expression => |e| rewriteExprWithCtx(e, ctx),
-        },
-
-        // select：arms 的 channel_expr + body
-        .select => |sel| {
-            for (sel.arms) |arm| switch (arm) {
-                .receive => |r| {
-                    rewriteExprWithCtx(r.channel_expr, ctx);
-                    rewriteExprWithCtx(r.body, ctx);
-                },
-                .timeout => |t| {
-                    rewriteExprWithCtx(t.duration, ctx);
-                    rewriteExprWithCtx(t.body, ctx);
-                },
-            };
-        },
-
-        .inline_trait_value => |itv| {
-            for (itv.methods) |m| {
-                if (m.body) |b| rewriteExprWithCtx(b, ctx);
-            }
-        },
-
-        // 叶子节点：无子表达式
-        .int_literal, .float_literal, .bool_literal, .char_literal,
-        .string_literal, .null_literal, .unit_literal,
-        => {},
-
-        // 特化变体（call/method_call/field_access/identifier）由 rewriteExprWithCtx
-        // 处理，不会到达此函数。列出以保持 exhaustive switch 的编译期安全。
-        .call, .method_call, .field_access, .identifier => {},
+        // ── 默认：委托 sema/ast_visitor.walkExprChildrenMut 递归子节点 ──
+        else => ast_visitor.walkExprChildrenMut(@constCast(@ptrCast(ctx)), expr, rewriteExprCb) catch {},
     }
 }
 
 /// 语句重写：遍历所有子表达式并递归重写。
-/// 语句层无特化需求，全部委托给表达式重写器。
+/// 语句层无特化需求，全部委托 sema/ast_visitor.walkStmtChildrenMut。
 fn rewriteStmtWithCtx(stmt: *ast.Stmt, ctx: *const RewriteCtx) void {
-    switch (stmt.*) {
-        .val_decl => |v| rewriteExprWithCtx(v.value, ctx),
-        .var_decl => |v| rewriteExprWithCtx(v.value, ctx),
-        .assignment => |a| {
-            rewriteExprWithCtx(a.target, ctx);
-            rewriteExprWithCtx(a.value, ctx);
-        },
-        .field_assignment => |f| {
-            rewriteExprWithCtx(f.object, ctx);
-            rewriteExprWithCtx(f.value, ctx);
-        },
-        .compound_assignment => |c| {
-            rewriteExprWithCtx(c.target, ctx);
-            rewriteExprWithCtx(c.value, ctx);
-        },
-        .expression => |e| rewriteExprWithCtx(e.expr, ctx),
-        .return_stmt => |r| {
-            if (r.value) |v| rewriteExprWithCtx(v, ctx);
-        },
-        .defer_stmt => |d| rewriteExprWithCtx(d.expr, ctx),
-        .throw_stmt => |t| rewriteExprWithCtx(t.expr, ctx),
-        .for_stmt => |f| {
-            rewriteExprWithCtx(f.iterable, ctx);
-            rewriteExprWithCtx(f.body, ctx);
-        },
-        .while_stmt => |w| {
-            rewriteExprWithCtx(w.condition, ctx);
-            rewriteExprWithCtx(w.body, ctx);
-        },
-        .loop_stmt => |l| rewriteExprWithCtx(l.body, ctx),
-        .break_stmt, .continue_stmt => {},
-    }
+    ast_visitor.walkStmtChildrenMut(@constCast(@ptrCast(ctx)), stmt, rewriteExprCb) catch {};
 }

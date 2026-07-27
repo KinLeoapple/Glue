@@ -18,7 +18,7 @@ fun ack(m: i32, n: i32): i32 {
     else { ack(m - 1, ack(m, n - 1)) }
 }
 
-fun main() {
+fun main(): void {
     // ---- recursion within safe depth ----
     println(sumTo(100))        // 5050
     println(sumTo(150))        // 11325

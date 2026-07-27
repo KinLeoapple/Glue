@@ -5,7 +5,7 @@ type Color = | Red | Green | Blue
 type UserId = UserId(i32)
 type Point = Point(x: i32, y: i32)
 
-fun main() {
+fun main(): void {
     // ---- primitives: Rust 模式无约束回退 i32/f32 ----
     println(type(42))         // i32
     println(type(200))        // i32

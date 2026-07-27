@@ -23,22 +23,22 @@ pub async fun list_path(path: Path): Async<Throw<DirEntry[], IOError>> {
 
 // 创建目录
 // recursive=true 时递归创建父目录（类似 mkdir -p）
-pub async fun create(path: str, recursive: bool): Async<Throw<Unit, IOError>> {
+pub async fun create(path: str, recursive: bool): Async<Throw<void, IOError>> {
     __dir_create(path, recursive)?
-    Ok(())
+    Ok(void)
 }
 
 // 创建目录（Path 重载）
-pub async fun create_path(path: Path, recursive: bool): Async<Throw<Unit, IOError>> {
+pub async fun create_path(path: Path, recursive: bool): Async<Throw<void, IOError>> {
     __dir_create(path.to_str(), recursive)?
-    Ok(())
+    Ok(void)
 }
 
 // 删除目录
 // recursive=true 时递归删除子目录与文件（类似 rm -r）
-pub async fun remove(path: str, recursive: bool): Async<Throw<Unit, IOError>> {
+pub async fun remove(path: str, recursive: bool): Async<Throw<void, IOError>> {
     __dir_remove(path, recursive)?
-    Ok(())
+    Ok(void)
 }
 
 // 递归遍历目录树（深度优先），返回所有条目（含子目录中的条目）

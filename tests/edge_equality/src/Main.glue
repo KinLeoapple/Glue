@@ -4,7 +4,7 @@ import std.io.Console.{println}
 type List = | Nil | Cons(i32, List)
 type UserId = UserId(i32)
 
-fun main() {
+fun main(): void {
     // ---- 标量值相等 ----
     println(1 == 1)
     println(1 != 2)

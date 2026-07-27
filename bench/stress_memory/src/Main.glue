@@ -144,7 +144,7 @@ fun recordChurn(iters: i32): i64 {
     sum
 }
 
-fun main() {
+fun main(): void {
     // --- 数组 push 50000: O(n²) COW 复制 ---
     val bigArr = arrayPush(50000)
     println(bigArr.len())

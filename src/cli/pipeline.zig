@@ -97,7 +97,10 @@ pub fn executeSource(
         var inferencer = sema.TypeInferencer.init(allocator);
         defer inferencer.deinit();
         inferencer.setSemaResult(&sema_result);
-        inferencer.checkModule(&entry_module);
+        inferencer.checkModule(&entry_module) catch {
+            cli_ctx.prof.phases.phaseEnd(.type_check);
+            return .failed;
+        };
         if (inferencer.errors.items.len > 0) {
             var err_buf: [4096]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writerStreaming(io, &err_buf);

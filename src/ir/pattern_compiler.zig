@@ -6,13 +6,13 @@
 const std = @import("std");
 const ast = @import("ast");
 const node_mod = @import("node.zig");
-const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const builder_mod = @import("builder.zig");
+const sema_inference = @import("sema").inference;
 
 const IRBuilder = builder_mod.IRBuilder;
 const BuildError = builder_mod.BuildError;
 const Node = node_mod.Node;
-const ChanType = channel_mod.ChanType;
 
 pub const Methods = struct {
     // ════════════════════════════════════════════
@@ -20,126 +20,17 @@ pub const Methods = struct {
     // ════════════════════════════════════════════
 
     /// 为 match arm 推送 GADT 类型绑定
-    /// 如果 pattern 是构造器模式（如 Add(a, b)）且构造器有 return_type 注解（如 Expr<i32>），
-    /// 且被匹配值的类型包含类型参数（如 Expr<T>），则推断 T 的绑定
+    /// 已迁移至 sema.inference.pushGadtBindingsForArm（通过 GadtContext）
     pub fn pushGadtBindingsForArm(self: *IRBuilder, scrutinee: *ast.Expr, pattern: *const ast.Pattern) void {
-        // 类型参数推断：不仅适用于泛型函数，也适用于非泛型函数匹配泛型类型的构造器
-        // 例如 filterL(l: List<i32>) 匹配 Cons(x, tail) 时，需推断 T → i32_chan
-
-        // 获取被匹配值的类型注解
-        // scrutinee 通常是函数参数（如 expr），查找其类型注解
-        var scrutinee_type: ?*ast.TypeNode = null;
-        if (scrutinee.* == .identifier) {
-            const name = scrutinee.identifier.name;
-            // 在当前函数参数中查找类型注解
-            if (self.current_func_param_types) |params| {
-                for (params) |p| {
-                    if (std.mem.eql(u8, p.name, name)) {
-                        scrutinee_type = p.type_annotation;
-                        break;
-                    }
-                }
-            }
-            // 也检查作用域中的变量绑定
-            if (scrutinee_type == null) {
-                if (self.lookupVar(name)) |binding| {
-                    if (binding.type_annotation) |ta| {
-                        scrutinee_type = ta;
-                    }
-                }
-            }
-        }
-        if (scrutinee_type == null) return;
-
-        // 获取 pattern 的构造器名和构造器信息
-        const ctor_name = switch (pattern.*) {
-            .constructor => |c| c.name,
-            else => return, // 非构造器模式：不推送绑定
-        };
-        const sr = self.sema_result orelse return;
-        const ctor = sr.getCtorDef(ctor_name) orelse return;
-
-        // 获取构造器返回类型（GADT 注解）或从类型表推断
-        // GADT 情况：ctor.return_type_name 非空（如 Expr<i32>），从 AST 回退获取 TypeNode
-        // 非 GADT 情况：return_type_name 为空，使用类型表的 type_params 与 scrutinee_type 匹配
-        const scrutinee_generic = switch (scrutinee_type.?.*) {
-            .generic => |g| g,
-            else => return, // scrutinee 不是泛型类型，无法推断
-        };
-
-        var bindings = std.StringHashMap(ChanType).init(self.allocator);
-        var has_binding = false;
-
-        const ctor_rt_opt = self.getCtorAstReturnType(ctor_name);
-        if (ctor_rt_opt) |ctor_rt| {
-            // GADT 情况：ctor_rt 如 Expr<i32>，scrutinee_type 如 Expr<T>
-            if (ctor_rt.* != .generic) {
-                bindings.deinit();
-                return;
-            }
-            const ctor_rt_generic = ctor_rt.generic;
-            if (!std.mem.eql(u8, scrutinee_generic.name, ctor_rt_generic.name)) {
-                bindings.deinit();
-                return;
-            }
-            // 匹配 scrutinee_type 的类型参数（可能为 T）与 ctor_rt 的类型实参（如 i32）
-            const param_args = scrutinee_generic.args;
-            const ctor_args = ctor_rt_generic.args;
-            const count = @min(param_args.len, ctor_args.len);
-            for (0..count) |i| {
-                const pa = param_args[i];
-                const ca = ctor_args[i];
-                if (pa.* == .named and ca.* == .named) {
-                    const tp_name = pa.named.name;
-                    if (self.isTypeParamName(tp_name)) {
-                        // 如果构造器返回类型的实参也是同一个类型参数（如 Expr<T> vs Expr<T>），
-                        // 则不做绑定（T 未被细化）
-                        if (std.mem.eql(u8, ca.named.name, tp_name)) continue;
-                        const ct = builder_mod.chanTypeFromTypeNode(ca) orelse continue;
-                        bindings.put(tp_name, ct) catch {};
-                        has_binding = true;
-                    }
-                }
-            }
-        } else {
-            // 非 GADT 情况：使用类型的 type_params 推断
-            // scrutinee_type 如 List<i32>，类型 List 有 type_params [T] → T = i32
-            const type_info = sr.getTypeDef(ctor.type_name) orelse {
-                bindings.deinit();
-                return;
-            };
-            if (!std.mem.eql(u8, scrutinee_generic.name, type_info.name)) {
-                bindings.deinit();
-                return;
-            }
-            const type_params = type_info.type_params;
-            const scrutinee_args = scrutinee_generic.args;
-            const count = @min(type_params.len, scrutinee_args.len);
-            for (0..count) |i| {
-                const tp_name = type_params[i];
-                if (!self.isTypeParamName(tp_name)) continue;
-                const ca = scrutinee_args[i];
-                const ct = builder_mod.chanTypeFromTypeNode(ca) orelse continue;
-                bindings.put(tp_name, ct) catch {};
-                has_binding = true;
-            }
-        }
-
-        if (has_binding) {
-            self.gadt_binding_stack.append(self.allocator, bindings) catch {
-                bindings.deinit();
-            };
-        } else {
-            bindings.deinit();
-        }
+        var ctx = self.gadtContext();
+        sema_inference.pushGadtBindingsForArm(&ctx, scrutinee, pattern);
     }
 
     /// 弹出 GADT 类型绑定栈顶
+    /// 已迁移至 sema.inference.popGadtBindings（通过 GadtContext）
     pub fn popGadtBindings(self: *IRBuilder) void {
-        if (self.gadt_binding_stack.pop()) |*bindings| {
-            var b = bindings.*;
-            b.deinit();
-        }
+        var ctx = self.gadtContext();
+        sema_inference.popGadtBindings(&ctx);
     }
 
     /// 编译 match 表达式：match scrutinee { arm1 => body1, ... }
@@ -148,11 +39,11 @@ pub const Methods = struct {
         const scrutinee_chan = try self.compileExpr(scrutinee);
         // 推断 scrutinee 的 Throw Ok 类型，用于 Ok(pattern) 中 ok_val_chan 的类型
         // 避免 ref 类型 Ok 值被硬编码为 i64_chan 导致指针丢失
-        const saved_ok_type = self.current_throw_ok_chan_type;
+        const saved_ok_type = self.current_throw_ok_type_desc;
         if (self.inferThrowOkChanType(scrutinee)) |ok_type| {
-            self.current_throw_ok_chan_type = ok_type;
+            self.current_throw_ok_type_desc = ok_type;
         }
-        defer self.current_throw_ok_chan_type = saved_ok_type;
+        defer self.current_throw_ok_type_desc = saved_ok_type;
         return try self.compileMatchArms(scrutinee, scrutinee_chan, arms, 0);
     }
 
@@ -162,9 +53,9 @@ pub const Methods = struct {
         switch (pattern.*) {
             .wildcard => return true,
             .variable => |v| {
-                const sr = self.sema_result orelse return true;
+                const sr = self.sema_result;
                 if (sr.getCtorDef(v.name)) |ctor| {
-                    if (ctor.field_chan_types.len != 0) return false;
+                    if (ctor.field_type_descs.len != 0) return false;
                     if (sr.getTypeDef(ctor.type_name)) |ti| {
                         return ti.constructors.len == 1;
                     }
@@ -173,7 +64,7 @@ pub const Methods = struct {
                 return true;
             },
             .constructor => |c| {
-                const sr = self.sema_result orelse return false;
+                const sr = self.sema_result;
                 const ctor = sr.getCtorDef(c.name) orelse return false;
                 const ti = sr.getTypeDef(ctor.type_name) orelse return false;
                 if (ti.constructors.len != 1) return false;
@@ -194,7 +85,7 @@ pub const Methods = struct {
         // 条件 1: 至少 2 个 arms
         if (arms.len < 2) return null;
 
-        const sr = self.sema_result orelse return null;
+        const sr = self.sema_result;
 
         // 条件 2: 所有 arms 为构造器模式（或无参构造器变量），无 guard，子模式为变量/通配符
         var common_type_name: ?[]const u8 = null;
@@ -212,7 +103,7 @@ pub const Methods = struct {
                 },
                 .variable => |v| blk: {
                     if (sr.getCtorDef(v.name)) |ctor| {
-                        if (ctor.field_chan_types.len == 0) break :blk v.name;
+                        if (ctor.field_type_descs.len == 0) break :blk v.name;
                     }
                     break :blk null;
                 },
@@ -240,14 +131,14 @@ pub const Methods = struct {
 
         // 读取 __tag（field_id=0）一次，作为 route_dispatch 的 winner 索引
         const tag_field_meta = try self.addFieldIdMeta(0);
-        const tag_chan = try self.allocChannel(.i64_chan);
+        const tag_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         try self.emit(Node.makeUnary(.record_get, tag_chan, tag_field_meta, scrutinee_chan));
 
         // 为每个构造器编译 body 子图（按 tag 索引）
         const body_starts = try arena_alloc.alloc(u32, ctor_count);
         const body_lens = try arena_alloc.alloc(u32, ctor_count);
 
-        var result_type: ?ChanType = null;
+        var result_type: ?*const type_descriptor_mod.TypeDescriptor = null;
 
         for (type_info.constructors, 0..) |ctor, tag_idx| {
             // 查找该构造器对应的 arm（线性搜索，arm 数量通常 < 10）
@@ -277,7 +168,7 @@ pub const Methods = struct {
                     .constructor => |c| c.patterns,
                     else => &.{}, // 无参构造器变量模式
                 };
-                const sub_count = @min(sub_patterns.len, ctor.field_chan_types.len);
+                const sub_count = @min(sub_patterns.len, ctor.field_type_descs.len);
                 for (0..sub_count) |i| {
                     const field_meta = try self.addFieldIdMeta(@intCast(i + 1));
                     const field_type_node = self.getCtorAstFieldTypeNode(ctor.name, i);
@@ -294,7 +185,7 @@ pub const Methods = struct {
                 const body_expr_start: u32 = @intCast(self.nodes.items.len);
                 const body_chan = try self.compileExpr(arm.body);
                 if (self.nodes.items.len == body_expr_start) {
-                    const load_chan = try self.allocChannel(self.channels.get(body_chan).chan_type);
+                    const load_chan = try self.allocChannel(self.channels.get(body_chan).type_desc);
                     try self.emit(Node.makeUnary(.load, load_chan, 0, body_chan));
                 }
 
@@ -304,11 +195,11 @@ pub const Methods = struct {
                 // 记录结果类型（取第一个真实 arm 的 body 最后节点输出类型）
                 if (result_type == null) {
                     const body_len_tmp: u32 = @intCast(self.nodes.items.len - body_start);
-                    result_type = self.channels.get(self.nodes.items[body_start + body_len_tmp - 1].output).chan_type;
+                    result_type = self.channels.get(self.nodes.items[body_start + body_len_tmp - 1].output).type_desc;
                 }
             } else {
                 // 该构造器无对应 arm — default body 返回 unit（仅非穷尽 match 触发，sema 应拒绝）
-                const unit_chan = try self.allocChannel(.unit_chan);
+                const unit_chan = try self.allocChannel(type_descriptor_mod.unit_descriptor);
                 try self.emit(Node.makeSink(.const_unit, unit_chan, 0));
             }
 
@@ -318,7 +209,7 @@ pub const Methods = struct {
         }
 
         // 结果通道
-        const result_chan = try self.allocChannel(result_type orelse .unit_chan);
+        const result_chan = try self.allocChannel(result_type orelse type_descriptor_mod.unit_descriptor);
 
         // route_dispatch with N entries indexed by tag
         const route_meta_idx = try self.addRouteMeta(.{
@@ -344,7 +235,7 @@ pub const Methods = struct {
 
         if (start_idx >= arms.len) {
             // 无匹配 arm：返回 unit（实际应由 wildcard 兜底）
-            const out = try self.allocChannel(.unit_chan);
+            const out = try self.allocChannel(type_descriptor_mod.unit_descriptor);
             try self.emit(Node.makeSink(.const_unit, out, 0));
             return out;
         }
@@ -363,7 +254,7 @@ pub const Methods = struct {
             const then_start: u32 = @intCast(self.nodes.items.len);
             const body_chan = try self.compileExpr(arm.body);
             if (self.nodes.items.len == then_start) {
-                const load_chan = try self.allocChannel(self.channels.get(body_chan).chan_type);
+                const load_chan = try self.allocChannel(self.channels.get(body_chan).type_desc);
                 try self.emit(Node.makeUnary(.load, load_chan, 0, body_chan));
             }
             self.popGadtBindings();
@@ -392,7 +283,7 @@ pub const Methods = struct {
         // 处理 guard：cond = pattern_match AND guard
         const final_cond_chan = if (arm.guard) |guard| blk: {
             const guard_chan = try self.compileExpr(guard);
-            const and_chan = try self.allocChannel(.bool_chan);
+            const and_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             const meta_idx = try self.addScalarMeta(.{ .kind = .bool });
             try self.emit(Node.makeBinary(.bool_and, and_chan, meta_idx, pat_cond_chan, guard_chan));
             break :blk and_chan;
@@ -402,7 +293,7 @@ pub const Methods = struct {
         const then_start: u32 = @intCast(self.nodes.items.len);
         const body_chan = try self.compileExpr(arm.body);
         if (self.nodes.items.len == then_start) {
-            const load_chan = try self.allocChannel(self.channels.get(body_chan).chan_type);
+            const load_chan = try self.allocChannel(self.channels.get(body_chan).type_desc);
             try self.emit(Node.makeUnary(.load, load_chan, 0, body_chan));
         }
         const then_len: u32 = @intCast(self.nodes.items.len - then_start);
@@ -414,31 +305,32 @@ pub const Methods = struct {
         const else_start: u32 = @intCast(self.nodes.items.len);
         const else_chan = try self.compileMatchArms(scrutinee, scrutinee_chan, arms, start_idx + 1);
         if (self.nodes.items.len == else_start) {
-            const load_chan = try self.allocChannel(self.channels.get(else_chan).chan_type);
+            const load_chan = try self.allocChannel(self.channels.get(else_chan).type_desc);
             try self.emit(Node.makeUnary(.load, load_chan, 0, else_chan));
         }
         const else_len: u32 = @intCast(self.nodes.items.len - else_start);
 
         // winner: bool → i64（true=1→then, false=0→else）
-        const winner_chan = try self.allocChannel(.i64_chan);
+        const winner_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         const cast_meta = try self.addScalarMeta(.{ .kind = .int, .int_kind = .i64 });
         try self.emit(Node.makeUnary(.cast, winner_chan, cast_meta, final_cond_chan));
 
         // 结果类型统一：then/else 任一为 null_chan 而另一为值类型时，结果为 nullable_chan
-        const then_type = self.channels.get(self.nodes.items[then_start + then_len - 1].output).chan_type;
+        const then_meta = self.channels.get(self.nodes.items[then_start + then_len - 1].output);
         const else_meta = self.channels.get(self.nodes.items[else_start + else_len - 1].output);
+        const then_type = then_meta.type_desc;
         const result_chan = blk: {
-            if (then_type == .null_chan and else_meta.chan_type != .null_chan and else_meta.chan_type != .nullable_chan) {
-                break :blk try self.channels.allocNullable(else_meta.chan_type);
+            if (then_type.is_null_type and !else_meta.type_desc.is_null_type and !else_meta.type_desc.is_nullable) {
+                break :blk try self.channels.allocNullable(else_meta.type_desc);
             }
-            if (else_meta.chan_type == .null_chan and then_type != .null_chan and then_type != .nullable_chan) {
+            if (else_meta.type_desc.is_null_type and !then_type.is_null_type and !then_type.is_nullable) {
                 break :blk try self.channels.allocNullable(then_type);
             }
-            if (then_type == .nullable_chan) {
-                break :blk try self.channels.allocNullable(self.channels.get(self.nodes.items[then_start + then_len - 1].output).inner_type);
+            if (then_type.is_nullable) {
+                break :blk try self.channels.allocNullable(then_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
             }
-            if (else_meta.chan_type == .nullable_chan) {
-                break :blk try self.channels.allocNullable(else_meta.inner_type);
+            if (else_meta.type_desc.is_nullable) {
+                break :blk try self.channels.allocNullable(else_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
             }
             break :blk try self.allocChannel(then_type);
         };
@@ -469,9 +361,9 @@ pub const Methods = struct {
             },
             .variable => |v| {
                 // 如果变量名是已知构造器（enum variant），作为无参构造器模式处理
-                if (self.sema_result) |sr| {
+                { const sr = self.sema_result;
                     if (sr.getCtorDef(v.name)) |ctor| {
-                        if (ctor.field_chan_types.len == 0) {
+                        if (ctor.field_type_descs.len == 0) {
                             return try self.compileConstructorPattern(scrutinee_chan, v.name, &.{});
                         }
                     }
@@ -480,9 +372,9 @@ pub const Methods = struct {
                 // 对于 nullable scrutinee（如 match Path? { null => ..., p => ... }），
                 // 需要 unwrap 后绑定到内部值，使 p.method() 能正确分派到 Path 方法
                 const scrut_meta = self.channels.get(scrutinee_chan);
-                if (scrut_meta.chan_type == .nullable_chan) {
+                if (scrut_meta.type_desc.is_nullable) {
                     // nullable unwrap → 内部值通道
-                    const unwrapped_chan = try self.allocChannel(scrut_meta.inner_type);
+                    const unwrapped_chan = try self.allocChannel(scrut_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
                     try self.emit(Node.makeUnary(.nullable_unwrap, unwrapped_chan, 0, scrutinee_chan));
                     // ast_expr 设为 current_match_scrutinee（其 inferTypeNameFromExpr 返回内部类型名，
                     // 因 typeNameFromTypeNodeSimple 会剥 nullable 包装）
@@ -506,7 +398,7 @@ pub const Methods = struct {
                 // left OR right（变量绑定在两侧都发生，应绑定同名变量）
                 const left_chan = try self.compilePatternCheck(scrutinee_chan, op.left);
                 const right_chan = try self.compilePatternCheck(scrutinee_chan, op.right);
-                const out = try self.allocChannel(.bool_chan);
+                const out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
                 const meta = try self.addScalarMeta(.{ .kind = .bool });
                 try self.emit(Node.makeBinary(.bool_or, out, meta, left_chan, right_chan));
                 return out;
@@ -515,7 +407,7 @@ pub const Methods = struct {
                 // pattern AND condition
                 const pat_chan = try self.compilePatternCheck(scrutinee_chan, g.pattern);
                 const cond_chan = try self.compileExpr(g.condition);
-                const out = try self.allocChannel(.bool_chan);
+                const out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
                 const meta = try self.addScalarMeta(.{ .kind = .bool });
                 try self.emit(Node.makeBinary(.bool_and, out, meta, pat_chan, cond_chan));
                 return out;
@@ -525,7 +417,7 @@ pub const Methods = struct {
 
     /// 发射 const_bool 节点
     pub fn emitConstBool(self: *IRBuilder, val: bool) BuildError!u16 {
-        const out = try self.allocChannel(.bool_chan);
+        const out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
         const meta = try self.addScalarMeta(.{ .kind = .bool, .const_val = .{ .bool_val = val } });
         try self.emit(Node.makeSink(.const_bool, out, meta));
         return out;
@@ -547,13 +439,13 @@ pub const Methods = struct {
                 return try self.emitCmpEq(scrutinee_chan, lit_chan);
             },
             .char => |c| {
-                const lit_chan = try self.allocChannel(.char_chan);
+                const lit_chan = try self.allocChannel(type_descriptor_mod.char_descriptor);
                 const meta = try self.addScalarMeta(.{ .kind = .char, .const_val = .{ .char_val = c } });
                 try self.emit(Node.makeSink(.const_char, lit_chan, meta));
                 return try self.emitCmpEq(scrutinee_chan, lit_chan);
             },
             .string => |s| {
-                const lit_chan = try self.allocChannel(.ref_chan);
+                const lit_chan = try self.allocChannel(type_descriptor_mod.ref_descriptor);
                 const str_idx = self.addString(s);
                 const meta = try self.addScalarMeta(.{ .kind = .str, .const_val = .{ .int_val = @intCast(str_idx) } });
                 try self.emit(Node.makeSink(.const_str, lit_chan, meta));
@@ -561,7 +453,7 @@ pub const Methods = struct {
             },
             .null => {
                 // null 检查：nullable_is_null（仅对 nullable_chan 有效）
-                const out = try self.allocChannel(.bool_chan);
+                const out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
                 try self.emit(Node.makeUnary(.nullable_is_null, out, 0, scrutinee_chan));
                 return out;
             },
@@ -570,7 +462,7 @@ pub const Methods = struct {
 
     /// 发射 cmp_eq 节点：left == right → mask_chan
     pub fn emitCmpEq(self: *IRBuilder, left_chan: u16, right_chan: u16) BuildError!u16 {
-        const out = try self.allocChannel(.mask_chan);
+        const out = try self.allocChannel(type_descriptor_mod.mask_descriptor);
         const meta = try self.addScalarMeta(.{ .kind = .bool });
         try self.emit(Node.makeBinary(.cmp_eq, out, meta, left_chan, right_chan));
         return out;
@@ -582,11 +474,11 @@ pub const Methods = struct {
         // 内置构造器模式：Ok(...) / Error(...) — ThrowValue 解构
         if (std.mem.eql(u8, ctor_name, "Ok")) {
             // gate_check → is_ok
-            const is_ok_chan = try self.allocChannel(.bool_chan);
+            const is_ok_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             try self.emit(Node.makeUnary(.gate_check, is_ok_chan, 0, scrutinee_chan));
             if (sub_patterns.len == 0) return is_ok_chan;
-            // gate_get_ok → 绑定到子模式（使用 current_throw_ok_chan_type 推断类型）
-            const ok_val_chan = try self.allocChannel(self.current_throw_ok_chan_type);
+            // gate_get_ok → 绑定到子模式（使用 current_throw_ok_type_desc 推断类型）
+            const ok_val_chan = try self.allocChannel(self.current_throw_ok_type_desc);
             try self.emit(Node.makeUnary(.gate_get_ok, ok_val_chan, 0, scrutinee_chan));
             // 设置 pattern_type_hint 为 Ok 值的类型节点，使子模式变量获得正确的 type_annotation
             // 用于 l.close() 等方法分派：inferTypeNameFromExpr 通过 type_annotation 返回 "TcpListener"
@@ -598,30 +490,30 @@ pub const Methods = struct {
             }
             const sub_check = try self.compilePatternCheck(ok_val_chan, sub_patterns[0]);
             self.pattern_type_hint = saved_hint;
-            const and_chan = try self.allocChannel(.bool_chan);
+            const and_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             const meta = try self.addScalarMeta(.{ .kind = .bool });
             try self.emit(Node.makeBinary(.bool_and, and_chan, meta, is_ok_chan, sub_check));
             return and_chan;
         }
         if (std.mem.eql(u8, ctor_name, "Error")) {
             // gate_check → is_ok, 然后 not is_ok → is_err
-            const is_ok_chan = try self.allocChannel(.bool_chan);
+            const is_ok_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             try self.emit(Node.makeUnary(.gate_check, is_ok_chan, 0, scrutinee_chan));
-            const is_err_chan = try self.allocChannel(.bool_chan);
+            const is_err_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             const not_meta = try self.addScalarMeta(.{ .kind = .bool });
             try self.emit(Node.makeUnary(.bool_not, is_err_chan, not_meta, is_ok_chan));
             if (sub_patterns.len == 0) return is_err_chan;
             // gate_get_err → 绑定到子模式
-            const err_val_chan = try self.allocChannel(.ref_chan);
+            const err_val_chan = try self.allocChannel(type_descriptor_mod.ref_descriptor);
             try self.emit(Node.makeUnary(.gate_get_err, err_val_chan, 0, scrutinee_chan));
             const sub_check = try self.compilePatternCheck(err_val_chan, sub_patterns[0]);
-            const and_chan = try self.allocChannel(.bool_chan);
+            const and_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             const meta = try self.addScalarMeta(.{ .kind = .bool });
             try self.emit(Node.makeBinary(.bool_and, and_chan, meta, is_err_chan, sub_check));
             return and_chan;
         }
 
-        const sr = self.sema_result orelse return error.UndefinedFunction;
+        const sr = self.sema_result;
         const ctor = sr.getCtorDef(ctor_name) orelse return error.UndefinedFunction;
 
         // 单构造器类型优化：若类型只有一个构造器，__tag 永远为 0，tag 检查恒为真
@@ -634,7 +526,7 @@ pub const Methods = struct {
             break :blk false;
         };
         if (is_single_ctor) {
-            const sub_count = @min(sub_patterns.len, ctor.field_chan_types.len);
+            const sub_count = @min(sub_patterns.len, ctor.field_type_descs.len);
             if (sub_count == 0) return try self.emitConstBool(true);
             // 全变量/通配符子模式：跳过 AND 链，直接读取字段并绑定
             // Point(x, y) 等 destructure 模式的子模式总是变量绑定，AND 链冗余
@@ -670,7 +562,7 @@ pub const Methods = struct {
                 self.pattern_type_hint = field_type_node;
                 const sub_check_chan = try self.compilePatternCheck(field_chan, sub_patterns[i]);
                 self.pattern_type_hint = prev_hint;
-                const and_chan = try self.allocChannel(.bool_chan);
+                const and_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
                 const and_meta = try self.addScalarMeta(.{ .kind = .bool });
                 try self.emit(Node.makeBinary(.bool_and, and_chan, and_meta, result_chan, sub_check_chan));
                 result_chan = and_chan;
@@ -682,11 +574,11 @@ pub const Methods = struct {
 
         // 读取 __tag 字段（field_id=0）
         const tag_field_meta = try self.addFieldIdMeta(0);
-        const tag_chan = try self.allocChannel(.i64_chan);
+        const tag_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         try self.emit(Node.makeUnary(.record_get, tag_chan, tag_field_meta, scrutinee_chan));
 
         // 期望的 tag 值（构造器在所属类型 constructors 数组中的索引）
-        const expected_tag_chan = try self.allocChannel(.i64_chan);
+        const expected_tag_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         const ctor_tag = self.getCtorTag(ctor_name) orelse return error.UndefinedFunction;
         const expected_tag_meta = try self.addScalarMeta(.{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = @intCast(ctor_tag) } });
         try self.emit(Node.makeSink(.const_i, expected_tag_chan, expected_tag_meta));
@@ -695,12 +587,12 @@ pub const Methods = struct {
         const tag_cond = try self.emitCmpEq(tag_chan, expected_tag_chan);
 
         // 无子模式：直接返回 tag 检查结果（不需要读字段）
-        const sub_count = @min(sub_patterns.len, ctor.field_chan_types.len);
+        const sub_count = @min(sub_patterns.len, ctor.field_type_descs.len);
         if (sub_count == 0) return tag_cond;
 
         // 有子模式：字段读取在 tag 匹配时才执行
         // 用 route_dispatch 条件执行（与 compileIf 相同的子图模式）
-        const winner_chan = try self.allocChannel(.i64_chan);
+        const winner_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         const cast_meta = try self.addScalarMeta(.{ .kind = .int, .int_kind = .i64 });
         try self.emit(Node.makeUnary(.cast, winner_chan, cast_meta, tag_cond));
 
@@ -708,7 +600,7 @@ pub const Methods = struct {
         const else_start: u32 = @intCast(self.nodes.items.len);
         const false_chan = try self.emitConstBool(false);
         if (self.nodes.items.len == else_start) {
-            const load_chan = try self.allocChannel(.bool_chan);
+            const load_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             try self.emit(Node.makeUnary(.load, load_chan, 0, false_chan));
         }
         const else_len: u32 = @intCast(self.nodes.items.len - else_start);
@@ -736,13 +628,13 @@ pub const Methods = struct {
             self.pattern_type_hint = prev_hint;
 
             // AND 到当前结果
-            const and_chan = try self.allocChannel(.bool_chan);
+            const and_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             const and_meta = try self.addScalarMeta(.{ .kind = .bool });
             try self.emit(Node.makeBinary(.bool_and, and_chan, and_meta, result_chan, sub_check_chan));
             result_chan = and_chan;
         }
         if (self.nodes.items.len == then_start) {
-            const load_chan = try self.allocChannel(.bool_chan);
+            const load_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             try self.emit(Node.makeUnary(.load, load_chan, 0, result_chan));
         }
         const then_len: u32 = @intCast(self.nodes.items.len - then_start);
@@ -755,7 +647,7 @@ pub const Methods = struct {
         body_starts[1] = then_start;
         body_lens[1] = then_len;
 
-        const result_type = self.channels.get(self.nodes.items[then_start + then_len - 1].output).chan_type;
+        const result_type = self.channels.get(self.nodes.items[then_start + then_len - 1].output).type_desc;
         const result_out = try self.allocChannel(result_type);
         const route_meta_idx = try self.addRouteMeta(.{
             .trait_id = 0,
@@ -778,13 +670,13 @@ pub const Methods = struct {
             // 查找 field_id；若未注册（匿名 record literal 模式），按声明顺序用 i
             const field_id: u16 = self.lookupFieldId("", field.name) orelse @intCast(i);
             const field_meta = try self.addFieldIdMeta(field_id);
-            const field_chan = try self.allocChannel(.i64_chan);
+            const field_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
             try self.emit(Node.makeUnary(.record_get, field_chan, field_meta, scrutinee_chan));
 
             const sub_check = try self.compilePatternCheck(field_chan, field.pattern);
 
             if (result_chan) |rc| {
-                const and_chan = try self.allocChannel(.bool_chan);
+                const and_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
                 const and_meta = try self.addScalarMeta(.{ .kind = .bool });
                 try self.emit(Node.makeBinary(.bool_and, and_chan, and_meta, rc, sub_check));
                 result_chan = and_chan;

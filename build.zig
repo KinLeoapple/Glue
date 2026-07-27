@@ -151,6 +151,8 @@ pub fn build(b: *std.Build) void {
     module_loader_module.addImport("sema", type_check_module);
     module_loader_module.addImport("analysis_db", analysis_db_module);
     module_loader_module.addImport("std_embed", std_embed_module);
+    // v3 阶段 16：ast_rewrite 复用 sema/ast_visitor 的 walkExprChildrenMut
+    module_loader_module.addImport("ast_visitor", ast_visitor_module);
 
     // ---- 语义分析模块间的交叉依赖：子检查器引用主类型检查器 ----
     type_check_module.addImport("subtype_check", subtype_check_module);

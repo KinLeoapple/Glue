@@ -45,7 +45,7 @@ fun floatMix(n: i32): f64 {
     acc
 }
 
-fun main() {
+fun main(): void {
     // --- Newton-Raphson sqrt: 500K 数 × 20 次迭代 ---
     var sum: f64 = 0.0
     var i: i64 = 1

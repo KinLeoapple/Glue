@@ -70,7 +70,7 @@ fun celebrate_birthday(user: (name: str, age: i32)) : (name: str, age: i32) {
     (...user, age: user.age + 1)
 }
 
-fun main() {
+fun main(): void {
     // 1. 记录宽度子类型
     val full_user = (name: "Alice", age: 30)
     println(greet((name: full_user.name)))

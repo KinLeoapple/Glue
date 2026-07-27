@@ -5,7 +5,7 @@ import std.net.TcpStream
 import std.io.Console.{println}
 
 // 服务端发送任务：accept 后发送 3 行数据，然后关闭
-async fun sender_task(listener: TcpListener): Async<Throw<Unit, IOError>> {
+async fun sender_task(listener: TcpListener): Async<Throw<void, IOError>> {
     val ar = listener.accept(0i64).await()?
     val s = std.net.TcpStream.from_accept_fd(ar.stream_fd, ar.peer_addr)
     // 一次性发送 "line1\nline2\nline3\n"（18 字节）
@@ -14,10 +14,10 @@ async fun sender_task(listener: TcpListener): Async<Throw<Unit, IOError>> {
     val data = "line1\nline2\nline3\n".bytes()
     s.write_all(data, data.len(), 0i64).await()?
     s.close().await()?
-    Ok(())
+    Ok(void)
 }
 
-fun main() {
+fun main(): void {
     val lo = std.net.Addr.v4_loopback()
     val ip = std.net.Addr.ip_from_v4(lo)
     val addr = std.net.Addr.socket_from(ip, 18091u16)

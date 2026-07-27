@@ -46,7 +46,7 @@ fun treeDepth<T>(t: Tree<T>): i32 {
     }
 }
 
-fun main() {
+fun main(): void {
     // Pair 混合类型
     val p1 = Pair(1, "one")
     val p2 = Pair(true, 3.14)

@@ -38,13 +38,13 @@ pub async fun accept(self: TcpListener): Async<Throw<AcceptResult, IOError>> {
 }
 
 // 关闭监听器。幂等：重复 close 不报错。
-pub async fun close(self: TcpListener): Async<Throw<Unit, IOError>> {
+pub async fun close(self: TcpListener): Async<Throw<void, IOError>> {
     if self.is_closed {
-        Ok(())
+        Ok(void)
     } else {
         self.is_closed = true
         __net_tcp_close(self.fd)?
-        Ok(())
+        Ok(void)
     }
 }
 

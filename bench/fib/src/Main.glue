@@ -18,7 +18,7 @@ fun ack(m: i64, n: i64): i64 {
     else { ack(m - 1, ack(m, n - 1)) }
 }
 
-fun main() {
+fun main(): void {
     // --- fib(35): 约 29M 次调用（memoize 后 <1ms，验证 memoization 生效）---
     println(fib(35))
 

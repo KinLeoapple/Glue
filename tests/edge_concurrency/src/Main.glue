@@ -6,11 +6,11 @@ async fun mul10x10(): i64 { 10 * 10 }
 async fun add20x5(): i64 { 20 + 5 }
 async fun sub100x1(): i64 { 100 - 1 }
 async fun addX50(x: i64): i64 { x + 50 }
-async fun incrCounter(c: Atomic<i64>): Unit { c = c + 1 }
-async fun produceResult(ch: Channel<i64>): Unit { ch.send(12345) }
+async fun incrCounter(c: Atomic<i64>): void { c = c + 1 }
+async fun produceResult(ch: Channel<i64>): void { ch.send(12345) }
 async fun mul7x7(): i64 { 7 * 7 }
 
-fun main() {
+fun main(): void {
     // ---- multiple async calls, independent results ----
     val s1 = mul10x10()
     val s2 = add20x5()

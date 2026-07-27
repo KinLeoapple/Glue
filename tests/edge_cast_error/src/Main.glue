@@ -32,7 +32,7 @@ fun tryCastAsError(): Throw<i32, Error> {
     throw CastError("as error subtype", "i64", "i32", "9999999999")
 }
 
-fun main() {
+fun main(): void {
     // ---- 1. 直接构造 CastError 并访问字段 ----
     val ce = CastError("overflow", "i64", "i32", "9999999999")
     println(ce.msg)      // overflow

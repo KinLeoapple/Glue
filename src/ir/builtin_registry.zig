@@ -9,11 +9,11 @@
 
 const std = @import("std");
 const node_mod = @import("node.zig");
-const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 
 const Node = node_mod.Node;
 const NodeOp = node_mod.NodeOp;
-const ChanType = channel_mod.ChanType;
+const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
 
 /// 内置函数种类（对应 NodeOp）
 pub const BuiltinKind = enum {
@@ -57,8 +57,8 @@ pub const BuiltinEntry = struct {
     kind: BuiltinKind,
     /// 预期参数数量（null = 变参）
     arg_count: ?u8,
-    /// 输出通道类型
-    out_chan_type: ChanType,
+    /// 输出通道类型描述符
+    out_type_desc: *const TypeDescriptor,
     /// 节点形状
     shape: BuiltinShape,
     /// meta_index 来源
@@ -73,7 +73,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "reflect",
         .kind = .reflect,
         .arg_count = 1,
-        .out_chan_type = .ref_chan,
+        .out_type_desc = type_descriptor_mod.ref_descriptor,
         .shape = .unary,
         .meta_source = .reflect,
         .op = .builtin_reflect,
@@ -82,7 +82,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "__scalar_to_str",
         .kind = .scalar_to_str,
         .arg_count = 1,
-        .out_chan_type = .ref_chan,
+        .out_type_desc = type_descriptor_mod.ref_descriptor,
         .shape = .unary,
         .meta_source = .zero,
         .op = .builtin_scalar_to_str,
@@ -91,7 +91,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "type",
         .kind = .type_name,
         .arg_count = 1,
-        .out_chan_type = .ref_chan,
+        .out_type_desc = type_descriptor_mod.ref_descriptor,
         .shape = .unary,
         .meta_source = .zero,
         .op = .builtin_type,
@@ -100,7 +100,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "typeof",
         .kind = .typeof_meta,
         .arg_count = 1,
-        .out_chan_type = .ref_chan,
+        .out_type_desc = type_descriptor_mod.ref_descriptor,
         .shape = .sink,
         .meta_source = .typeof,
         .op = .builtin_typeof,
@@ -109,7 +109,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "Panic",
         .kind = .panic,
         .arg_count = null, // 0 或 1 个参数
-        .out_chan_type = .unit_chan,
+        .out_type_desc = type_descriptor_mod.unit_descriptor,
         .shape = .sink_optional,
         .meta_source = .zero,
         .op = .builtin_panic,
@@ -118,7 +118,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "Ok",
         .kind = .ok,
         .arg_count = 1,
-        .out_chan_type = .ref_chan,
+        .out_type_desc = type_descriptor_mod.ref_descriptor,
         .shape = .unary,
         .meta_source = .zero,
         .op = .builtin_ok,
@@ -127,7 +127,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "Error",
         .kind = .error_ctor,
         .arg_count = 1,
-        .out_chan_type = .ref_chan,
+        .out_type_desc = type_descriptor_mod.ref_descriptor,
         .shape = .unary,
         .meta_source = .zero,
         .op = .builtin_error,
@@ -136,7 +136,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "str",
         .kind = .str,
         .arg_count = 1,
-        .out_chan_type = .ref_chan,
+        .out_type_desc = type_descriptor_mod.ref_descriptor,
         .shape = .unary,
         .meta_source = .zero,
         .op = .builtin_str,
@@ -145,7 +145,7 @@ pub const BUILTIN_TABLE = [_]BuiltinEntry{
         .name = "channel",
         .kind = .channel_create,
         .arg_count = 1,
-        .out_chan_type = .ref_chan,
+        .out_type_desc = type_descriptor_mod.ref_descriptor,
         .shape = .unary,
         .meta_source = .zero,
         .op = .channel_create,
@@ -169,7 +169,7 @@ test "builtin_registry: lookupBuiltin 查询" {
     const reflect_entry = lookupBuiltin("reflect").?;
     try std.testing.expectEqual(BuiltinKind.reflect, reflect_entry.kind);
     try std.testing.expectEqual(@as(?u8, 1), reflect_entry.arg_count);
-    try std.testing.expectEqual(ChanType.ref_chan, reflect_entry.out_chan_type);
+    try std.testing.expectEqual(type_descriptor_mod.ref_descriptor, reflect_entry.out_type_desc);
     try std.testing.expectEqual(BuiltinShape.unary, reflect_entry.shape);
     try std.testing.expectEqual(MetaSource.reflect, reflect_entry.meta_source);
 

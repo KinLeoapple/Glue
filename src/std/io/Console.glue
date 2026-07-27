@@ -1,6 +1,6 @@
 // Console.glue — 标准 IO 顶层入口（stdout/stderr/stdin）
 //
-// println/print/eprintln/eprint 为同步函数，返回 Throw<Unit, IOError>。
+// println/print/eprintln/eprint 为同步函数，返回 Throw<void, IOError>。
 // scan/scanln 为同步函数，返回 Throw<str?, IOError>（null = EOF）。
 //
 // 格式化委托给 std.reflect.format（Glue 层递归实现，reflect/__scalar_to_str 为边界原语）。
@@ -15,32 +15,32 @@ import std.reflect.Reflect
 
 // ─── 标准输出 ──────────────────────────────────────────────────────
 
-pub fun print<T>(x: T): Throw<Unit, IOError> {
+pub fun print<T>(x: T): Throw<void, IOError> {
     val s = std.reflect.Reflect.format(x)
     __stdout_write(s)?
-    Ok(())
+    Ok(void)
 }
 
-pub fun println<T>(x: T): Throw<Unit, IOError> {
+pub fun println<T>(x: T): Throw<void, IOError> {
     val s = std.reflect.Reflect.format(x)
     __stdout_write(s)?
     __stdout_write("\n")?
-    Ok(())
+    Ok(void)
 }
 
 // ─── 标准错误 ──────────────────────────────────────────────────────
 
-pub fun eprint<T>(x: T): Throw<Unit, IOError> {
+pub fun eprint<T>(x: T): Throw<void, IOError> {
     val s = std.reflect.Reflect.format(x)
     __stderr_write(s)?
-    Ok(())
+    Ok(void)
 }
 
-pub fun eprintln<T>(x: T): Throw<Unit, IOError> {
+pub fun eprintln<T>(x: T): Throw<void, IOError> {
     val s = std.reflect.Reflect.format(x)
     __stderr_write(s)?
     __stderr_write("\n")?
-    Ok(())
+    Ok(void)
 }
 
 // ─── 标准输入 ─────────────────────────────────────────────────────

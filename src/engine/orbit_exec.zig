@@ -107,7 +107,7 @@ pub const Methods = struct {
         // 将结果写入 output 通道
         if (result_val) |v| {
             const out_meta = self.ir.channels.get(node.output);
-            const out_val = if (out_meta.chan_type == .ref_chan and !out_meta.is_ref) blk: {
+            const out_val = if (self.runtime.isRef(node.output) and !out_meta.type_desc.is_ref) blk: {
                 // 深拷贝到主线程 tctx：此时 worker tctx 仍存活，读取安全
                 const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                 try self.trackValueTree(copied);
@@ -137,7 +137,7 @@ pub const Methods = struct {
         const ch = self.readChannelValue(node.inputs[0]) orelse return error.InvalidChannel;
         const val = try self.readScalarValue(node.inputs[1]);
         const val_meta = self.ir.channels.get(node.inputs[1]);
-        const sent_val = if (val_meta.chan_type == .ref_chan and !val_meta.is_ref) blk: {
+        const sent_val = if (self.runtime.isRef(node.inputs[1]) and !val_meta.type_desc.is_ref) blk: {
             const copied = val.deepCopy(self.tctx.?) catch return error.OutOfMemory;
             try self.trackValueTree(copied);
             break :blk copied;

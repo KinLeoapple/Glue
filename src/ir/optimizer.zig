@@ -22,7 +22,7 @@ const NodeOp = node_mod.NodeOp;
 const ScalarMeta = meta_mod.ScalarMeta;
 const ScalarKind = meta_mod.ScalarKind;
 const ConstVal = meta_mod.ConstVal;
-const ChanType = channel_mod.ChanType;
+
 const scalar = @import("value").scalar;
 const IntKind = scalar.IntKind;
 
@@ -500,6 +500,8 @@ fn findProducer(ir: *const GlueIR, chan: u16, node_index: usize) ?usize {
 const testing = std.testing;
 const IRBuilder = @import("builder.zig").IRBuilder;
 const ast = @import("ast");
+const sema = @import("sema");
+const SemaResult = sema.sema_output.SemaResult;
 
 /// 测试用 AST 构造器（简化版，复用 builder.zig 的 AstHelper 模式）
 const AstHelper = struct {
@@ -574,6 +576,21 @@ const AstHelper = struct {
     }
 };
 
+/// 测试辅助：显式注入 sema_result 构建 IR
+fn buildIRWithSema(ah: *AstHelper, mod: ast.Module) !GlueIR {
+    _ = ah;
+    var sema_result = SemaResult.init(testing.allocator);
+    defer sema_result.deinit();
+    var inferencer = sema.TypeInferencer.init(testing.allocator);
+    defer inferencer.deinit();
+    inferencer.setSemaResult(&sema_result);
+    try inferencer.checkModule(&mod);
+    var builder = try IRBuilder.init(testing.allocator);
+    defer builder.deinit();
+    builder.setSemaResult(&sema_result);
+    return try builder.build(mod);
+}
+
 test "constantFold: 整数加法折叠" {
     var ah = AstHelper.init(testing.allocator);
     defer ah.deinit();
@@ -583,9 +600,7 @@ test "constantFold: 整数加法折叠" {
     const decls = [_]ast.Decl{ah.funDecl("main", body, true)};
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 优化前：const_i(1), const_i(2), int_add, halt_return
@@ -614,9 +629,7 @@ test "constantFold: 整数乘法折叠" {
     const decls = [_]ast.Decl{ah.funDecl("main", body, true)};
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     _ = optimize(&ir);
@@ -636,9 +649,7 @@ test "constantFold: 比较运算折叠" {
     const decls = [_]ast.Decl{ah.funDecl("main", body, true)};
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     _ = optimize(&ir);
@@ -659,9 +670,7 @@ test "constantFold: 嵌套表达式折叠" {
     const decls = [_]ast.Decl{ah.funDecl("main", body, true)};
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     _ = optimize(&ir);
@@ -682,9 +691,7 @@ test "constantFold: 除零不折叠" {
     const decls = [_]ast.Decl{ah.funDecl("main", body, true)};
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     _ = optimize(&ir);
@@ -708,9 +715,7 @@ test "deadNodeElim: 移除无用节点" {
     const decls = [_]ast.Decl{ah.funDecl("main", body, true)};
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     const stats = optimize(&ir);
@@ -733,9 +738,7 @@ test "optimize: 不动点迭代" {
     const decls = [_]ast.Decl{ah.funDecl("main", body, true)};
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     const stats = optimize(&ir);

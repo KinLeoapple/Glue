@@ -4,7 +4,7 @@ import std.io.Console.{println}
 var log: str = ""
 
 // defer runs in LIFO order on normal scope exit
-fun lifo(): Unit {
+fun lifo(): void {
     defer log = log + "A"
     defer log = log + "B"
     defer log = log + "C"
@@ -31,7 +31,7 @@ fun mayThrow(n: i32): Throw<i32, Error> {
 }
 
 // nested blocks: defers accumulate and fire at function exit in LIFO order
-fun nestedBlocks(): Unit {
+fun nestedBlocks(): void {
     defer log = log + "outer|"
     {
         defer log = log + "inner|"
@@ -41,7 +41,7 @@ fun nestedBlocks(): Unit {
 }
 
 // multiple defers stacked conditionally via if branches
-fun conditionalDefer(flag: bool): Unit {
+fun conditionalDefer(flag: bool): void {
     if flag {
         defer log = log + "if-defer|"
         log = log + "if-body|"
@@ -65,7 +65,7 @@ fun matchDefer(n: i32): i32 {
     }
 }
 
-fun main() {
+fun main(): void {
     // ---- LIFO ordering ----
     log = ""
     lifo()

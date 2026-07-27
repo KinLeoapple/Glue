@@ -2,12 +2,12 @@
 
 // async 函数：调用返回 Async<T>，实参深拷贝；Atomic 实参共享底层内存
 import std.io.Console.{println}
-async fun incrOne(c: Atomic<i32>): Unit { c += 1 }
-async fun addTwo(s: Atomic<i32>): Unit { s += 2 }
-async fun subTwo(s: Atomic<i32>): Unit { s -= 2 }
+async fun incrOne(c: Atomic<i32>): void { c += 1 }
+async fun addTwo(s: Atomic<i32>): void { s += 2 }
+async fun subTwo(s: Atomic<i32>): void { s -= 2 }
 async fun ret7(): i32 { 7 }
 
-fun main() {
+fun main(): void {
     // ---- 100 async calls incrementing a shared atomic in parallel ----
     var counter = atomic 0
     var handles: Async<()>[] = []

@@ -99,7 +99,7 @@ fun mergeSort(arr: i64[]): i64[] {
     merge(mergeSort(left), mergeSort(right))
 }
 
-fun main() {
+fun main(): void {
     println("--- nestedLoop ---")
     println(nestedLoop(4000))
 

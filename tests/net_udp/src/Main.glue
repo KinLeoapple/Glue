@@ -4,7 +4,7 @@ import std.net.UdpSocket
 import std.io.Console.{println}
 
 // Sender task: bind a client socket, send "Ping" to server, recv echo, close
-async fun sender_task(server_addr: SocketAddr): Async<Throw<Unit, IOError>> {
+async fun sender_task(server_addr: SocketAddr): Async<Throw<void, IOError>> {
     // Bind client socket on ephemeral port (port 0)
     val lo = std.net.Addr.v4_loopback()
     val ip = std.net.Addr.ip_from_v4(lo)
@@ -41,10 +41,10 @@ async fun sender_task(server_addr: SocketAddr): Async<Throw<Unit, IOError>> {
     }
 
     sock.close().await()?
-    Ok(())
+    Ok(void)
 }
 
-fun main() {
+fun main(): void {
     val lo = std.net.Addr.v4_loopback()
     val ip = std.net.Addr.ip_from_v4(lo)
     val addr = std.net.Addr.socket_from(ip, 18090u16)

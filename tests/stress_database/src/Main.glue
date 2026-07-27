@@ -102,7 +102,7 @@ fun showEmps(emps: List<Emp>): str {
     foldL(emps, "", fun(acc: str, e: Emp) { acc + empName(e) + "(" + cast(empSalary(e)).to(str) + ") " })
 }
 
-fun main() {
+fun main(): void {
     var db = emptyDb()
     db = insert(db, Emp(1i32, "Alice", "eng", 100i32))
     db = insert(db, Emp(2i32, "Bob", "eng", 120i32))

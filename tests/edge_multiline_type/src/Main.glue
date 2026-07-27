@@ -44,7 +44,7 @@ type List8<i32,> = List8(head: i32)
 
 fun add3(a: i32, b: i32, c: i32): i32 { a + b + c }
 
-fun main() {
+fun main(): void {
     val t = Node(1i32, Leaf, Leaf)
     val p3 = Point3(1i32, 2i32, 3i32)
     val p4 = Point4(1i32, 2i32)

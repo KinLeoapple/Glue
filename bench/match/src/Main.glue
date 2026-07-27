@@ -110,7 +110,7 @@ fun classifyNum(n: i64): i64 {
     }
 }
 
-fun main() {
+fun main(): void {
     // --- 单构造器 match 5M 次 ---
     var pSum: i64 = 0
     var i: i64 = 0

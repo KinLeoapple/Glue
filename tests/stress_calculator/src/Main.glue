@@ -198,7 +198,7 @@ fun run(s: str): str {
     }
 }
 
-fun main() {
+fun main(): void {
     // tokenizer 单测
     val toks = match tokenize("12 + 34") {
         Ok(ts) => ts

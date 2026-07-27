@@ -9,7 +9,7 @@ fun countDown(n: i32): i32 {
     if n == 0 { 0 } else { countDown(n - 1) }
 }
 
-fun main() {
+fun main(): void {
     // 1. 深尾递归 100 万次：验证 TCO 不爆栈、O(n) 快速
     println(countDown(1000000))          // 0
 

@@ -136,8 +136,7 @@ pub const Methods = struct {
             var saved_arg_values: [16]value.Value = undefined;
             for (args, 0..) |arg_chan, i| {
                 const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
-                const meta = self.ir.channels.get(arg_chan);
-                if (!is_ref and meta.chan_type == .ref_chan and self.readRefObj(arg_chan) != null) {
+                if (!is_ref and self.runtime.isRef(arg_chan) and self.readRefObj(arg_chan) != null) {
                     const v = self.chanToValue(arg_chan);
                     saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                     try self.trackValueTree(saved_arg_values[i]);

@@ -7,7 +7,7 @@
 import std.time.Duration
 import std.io.Console.{println}
 
-fun main() {
+fun main(): void {
     // ── 构造器 ─────────────────────────────────────────────────────
     // from_secs(3) → 3_000_000_000 ns
     val d_sec = std.time.Duration.from_secs(3)

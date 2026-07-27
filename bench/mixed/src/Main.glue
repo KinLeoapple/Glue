@@ -118,7 +118,7 @@ fun tHeight(t: Tree): i32 {
     }
 }
 
-fun main() {
+fun main(): void {
     // --- 表达式求值 1K 次（buildExpr(10) 递归深度大，1K 次已足够压测）---
     var exprSum: i64 = 0
     var i: i32 = 0

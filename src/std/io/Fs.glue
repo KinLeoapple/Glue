@@ -20,22 +20,22 @@ pub async fun read_file_path(path: Path): Async<Throw<str, IOError>> {
 }
 
 // 一次性写入 str 到文件（覆盖已有内容）
-pub async fun write_file(path: str, content: str): Async<Throw<Unit, IOError>> {
+pub async fun write_file(path: str, content: str): Async<Throw<void, IOError>> {
     val f = File.open(path, File.create_rw()).await()?
     defer f.close().await()
     val writer = Buffered.new_writer(f)
     writer.write_str(content).await()?
     writer.flush().await()?
-    Ok(())
+    Ok(void)
 }
 
 // 追加写入 str 到文件末尾
-pub async fun append_file(path: str, content: str): Async<Throw<Unit, IOError>> {
+pub async fun append_file(path: str, content: str): Async<Throw<void, IOError>> {
     val f = File.open(path, File.append_mode()).await()?
     defer f.close().await()
     val bytes = content.bytes()
     f.write(bytes, bytes.len()).await()?
-    Ok(())
+    Ok(void)
 }
 
 // ─── 字节 IO ──────────────────────────────────────────────────────
@@ -49,9 +49,9 @@ pub async fun read_file_bytes(path: str): Async<Throw<u8[], IOError>> {
 }
 
 // 一次性写入字节到文件（覆盖已有内容）
-pub async fun write_file_bytes(path: str, content: u8[]): Async<Throw<Unit, IOError>> {
+pub async fun write_file_bytes(path: str, content: u8[]): Async<Throw<void, IOError>> {
     val f = File.open(path, File.create_rw()).await()?
     defer f.close().await()
     f.write(content, content.len()).await()?
-    Ok(())
+    Ok(void)
 }

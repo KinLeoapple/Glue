@@ -75,80 +75,21 @@ pub const Methods = struct {
 
     /// builtin_str：标量值转字符串（复杂类型格式化由 std.reflect.format 接管）
     /// inputs[0] = 值通道，output = ref_chan（Str 指针）
+    /// 标量类型走 runtime.formatChannel（scalar_ops.format vtable），零运行时 switch；
+    /// ref_chan 跳过 formatChannel（ref_ops.format 返回 "ref:0x..." 不适用），
+    /// 按 Str/Array/Cell/堆对象/标量位模式顺序处理；unit/null 走字面量。
     pub fn execBuiltinStr(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
-        const meta = self.ir.channels.get(val_chan);
 
         var buf: [64]u8 = undefined;
-        const slice: []const u8 = switch (meta.chan_type) {
-            .i64_chan => std.fmt.bufPrint(&buf, "{d}", .{self.runtime.readI64(val_chan)}) catch "",
-            .i32_chan => blk: {
-                const ptr: *i32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .i16_chan => blk: {
-                const ptr: *i16 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .i8_chan => blk: {
-                const ptr: *i8 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .u64_chan => std.fmt.bufPrint(&buf, "{d}", .{self.runtime.readU64(val_chan)}) catch "",
-            .u32_chan => blk: {
-                const ptr: *u32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .u16_chan => blk: {
-                const ptr: *u16 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .u8_chan => blk: {
-                const ptr: *u8 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .isize_chan => blk: {
-                const ptr: *isize = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .usize_chan => blk: {
-                const ptr: *usize = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .f64_chan => std.fmt.bufPrint(&buf, "{d}", .{self.runtime.readF64(val_chan)}) catch "",
-            .f32_chan => blk: {
-                const ptr: *f32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .f16_chan => blk: {
-                const ptr: *f16 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .f128_chan => blk: {
-                const ptr: *f128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .i128_chan => blk: {
-                const ptr: *i128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .u128_chan => blk: {
-                const ptr: *u128 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                break :blk std.fmt.bufPrint(&buf, "{d}", .{ptr.*}) catch "";
-            },
-            .bool_chan, .mask_chan => if (self.runtime.readBool(val_chan)) "true" else "false",
-            .char_chan => blk: {
-                const ptr: *u32 = @ptrCast(@alignCast(self.runtime.rawPtr(val_chan)));
-                const cp: u21 = @intCast(ptr.*);
-                if (cp < 128) {
-                    buf[0] = @intCast(cp);
-                    break :blk buf[0..1];
-                }
-                // 多字节 UTF-8
-                const n = std.unicode.utf8Encode(cp, &buf) catch 0;
-                break :blk buf[0..n];
-            },
-            .ref_chan => blk: {
+        const slice: []const u8 = blk: {
+            // 标量类型（非 ref_chan）：走 vtable format 快路径
+            // ref_chan 的 ref_ops.format 返回 "ref:0x..."，不适用于 builtin_str，需特殊处理
+            if (!self.runtime.isRef(val_chan)) {
+                if (self.runtime.formatChannel(val_chan, &buf)) |s| break :blk s;
+            }
+
+            if (self.runtime.isRef(val_chan)) {
                 if (self.readStr(val_chan)) |s| break :blk s.bytes();
                 // 检查是否为数组（u8[] → UTF-8 解码为字符串）
                 if (self.readArray(val_chan)) |arr| {
@@ -167,68 +108,33 @@ pub const Methods = struct {
                     // 非标量数组格式化由 std.reflect.format_array 处理
                     break :blk "[array]";
                 }
-                // 标量引用（tagged pointer，bit 0 = 1）：
-                // ref_of 节点把标量编码为 tagged pointer，存储原始通道索引。
-                // 解码通道索引，再按通道的 chan_type 格式化标量值。
-                // 注意：ref_chan 可能持有标量值（如 array_pop 把 i32 写入 ref_chan），
-                // 标量值位模式可能 bit 0 = 1，必须用 tryDecodeScalarRef 验证合法性。
-                if (self.runtime.readPtr(val_chan)) |obj_ptr| {
-                    const addr = @intFromPtr(obj_ptr);
-                    // 标量引用：解码通道索引并按源通道类型格式化
-                    if (self.tryDecodeScalarRef(addr)) |src_chan| {
-                        const src_meta = self.ir.channels.get(src_chan);
-                        const src_ptr = self.runtime.rawPtr(src_chan);
-                        break :blk switch (src_meta.chan_type) {
-                            .i64_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i64, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .i32_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i32, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .i16_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i16, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .i8_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i8, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .u64_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u64, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .u32_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u32, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .u16_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u16, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .u8_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u8, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .isize_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*isize, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .usize_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*usize, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .f64_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*f64, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .f32_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*f32, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .f16_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*f16, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .f128_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*f128, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .i128_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*i128, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .u128_chan => std.fmt.bufPrint(&buf, "{d}", .{@as(*u128, @ptrCast(@alignCast(src_ptr))).*}) catch "",
-                            .bool_chan, .mask_chan => if (@as(*bool, @ptrCast(@alignCast(src_ptr))).*) "true" else "false",
-                            .char_chan => blk2: {
-                                const cp: u21 = @intCast(@as(*u32, @ptrCast(@alignCast(src_ptr))).*);
-                                if (cp < 128) {
-                                    buf[0] = @intCast(cp);
-                                    break :blk2 buf[0..1];
-                                }
-                                const n = std.unicode.utf8Encode(cp, &buf) catch 0;
-                                break :blk2 buf[0..n];
-                            },
-                            .unit_chan => "()",
-                            .null_chan => "null",
-                            else => "<obj>",
-                        };
+                // 通过 ref_ops.read 读取 Value（统一处理堆对象/null/标量位模式）
+                if (self.runtime.readChannel(val_chan)) |v| {
+                    switch (v) {
+                        .ref => |header| {
+                            // Cell（标量引用）：格式化 inner 值
+                            if (header.type_tag == .cell) {
+                                const cell: *value.Cell = @alignCast(@fieldParentPtr("header", header));
+                                const formatted = cell.inner.formatAlloc(self.tctx.?) catch return error.OutOfMemory;
+                                defer self.tctx.?.backing.free(formatted);
+                                const str_obj = value.str_mod.Str.createContiguous(self.tctx.?, formatted) catch return error.OutOfMemory;
+                                try self.trackObj(&str_obj.header);
+                                self.runtime.writePtr(node.output, @ptrCast(&str_obj.header));
+                                return;
+                            }
+                            // 其他堆对象类型（throw_val/error_val/closure 等）
+                            break :blk value.ref_kind_table.displayName(header.type_tag);
+                        },
+                        .null_val => break :blk "null",
+                        .i64 => |b| break :blk std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @bitCast(b))}) catch "null",
+                        else => break :blk "<scalar>",
                     }
-                    if (addr >= 0x1000 and addr % @alignOf(value.obj_header.ObjHeader) == 0) {
-                        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(obj_ptr));
-                        // 其他堆对象类型（throw_val/error_val/closure 等）：
-                        // 复杂类型格式化由 std.reflect.format 处理，此处返回占位
-                        const tag_name = value.ref_kind_table.displayName(header.type_tag);
-                        break :blk tag_name;
-                    }
-                }
-                // gate_get_ok 可能把标量值写入 ref_chan（i32/i64 等）
-                // 尝试读取为 i64
-                const iv = self.runtime.readI64(val_chan);
-                if (iv != 0) {
-                    break :blk std.fmt.bufPrint(&buf, "{d}", .{iv}) catch "null";
                 }
                 break :blk "null";
-            },
-            .unit_chan => "()",
-            .null_chan => "null",
-            else => "",
+            }
+            if (self.runtime.isUnit(val_chan)) break :blk "void";
+            if (self.runtime.isNull(val_chan)) break :blk "null";
+            break :blk "";
         };
 
         // 创建 Str 并写入输出通道
@@ -240,38 +146,24 @@ pub const Methods = struct {
     /// builtin_type：返回值的运行时类型名
     /// inputs[0] = 值通道
     /// output = ref_chan（Str 指针）
+    /// 标量类型名直接从 runtime.typeDesc().type_name 获取（builtin_chan_descriptors 已填充），
+    /// 零运行时 switch；ref_chan 走 ref_kind_table.typeName；unit/null/nullable 走字面量。
     pub fn execBuiltinType(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
-        const meta = self.ir.channels.get(val_chan);
-        const type_name: []const u8 = switch (meta.chan_type) {
-            .i8_chan => "i8",
-            .i16_chan => "i16",
-            .i32_chan => "i32",
-            .i64_chan => "i64",
-            .i128_chan => "i128",
-            .u8_chan => "u8",
-            .u16_chan => "u16",
-            .u32_chan => "u32",
-            .u64_chan => "u64",
-            .u128_chan => "u128",
-            .isize_chan => "isize",
-            .usize_chan => "usize",
-            .f16_chan => "f16",
-            .f32_chan => "f32",
-            .f64_chan => "f64",
-            .f128_chan => "f128",
-            .bool_chan, .mask_chan => "bool",
-            .char_chan => "char",
-            .unit_chan => "unit",
-            .null_chan => "null",
-            .ref_chan => blk: {
+        const type_name: []const u8 = blk: {
+            if (self.runtime.isRef(val_chan)) {
                 const header = self.readRefObj(val_chan);
                 if (header) |h| {
                     break :blk value.ref_kind_table.typeName(h.type_tag);
                 }
                 break :blk "null";
-            },
-            .nullable_chan => "nullable",
+            }
+            if (self.runtime.isUnit(val_chan)) break :blk "void";
+            if (self.runtime.isNull(val_chan)) break :blk "null";
+            if (self.runtime.isNullable(val_chan)) break :blk "nullable";
+            // 标量（含 mask_chan）：type_desc.type_name 已含正确语义名称
+            // mask_chan 的 type_name 已统一为 "bool"（与 bool_chan 一致）
+            break :blk self.runtime.typeDesc(val_chan).type_name;
         };
 
         const str_obj = value.str_mod.Str.createContiguous(self.tctx.?, type_name) catch return error.OutOfMemory;

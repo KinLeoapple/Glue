@@ -43,8 +43,8 @@ pub const Methods = struct {
         const meta_idx = node.meta_index;
         var target_value = self.chanToValue(val_chan);
 
-        // chanToValue 已处理标量引用（tagged pointer）：解码后递归读取标量值，
-        // target_value 已是带类型信息的标量 Value，无需额外解箱。
+        // chanToValue 已通过 ref_ops.read 处理 ref_chan（堆对象/null/标量位模式），
+        // target_value 已是带类型信息的 Value，无需额外解箱。
 
         // 解析 meta_idx：可能是具体 type_id 或泛型参数引用 0x8000|param_idx
         var type_id: u16 = meta_idx;
@@ -260,7 +260,7 @@ pub const Methods = struct {
     pub fn inferKindFromValue(v: value.Value) InferredKind {
         return switch (v) {
             .null_val => .{ .kind = "Nullable", .type_name = "null", .field_count = 0 },
-            .unit => .{ .kind = "Unit", .type_name = "unit", .field_count = 0 },
+            .unit => .{ .kind = "Void", .type_name = "void", .field_count = 0 },
             .boolean => .{ .kind = "Primitive", .type_name = "bool", .field_count = 0 },
             .char => .{ .kind = "Primitive", .type_name = "char", .field_count = 0 },
             .i8, .i16, .i32, .i64, .i128 => .{ .kind = "Primitive", .type_name = "int", .field_count = 0 },
@@ -387,7 +387,7 @@ pub const Methods = struct {
                 break :blk std.fmt.bufPrint(&buf, "{d}", .{x}) catch "<f128>";
             },
             .null_val => "null",
-            .unit => "()",
+            .unit => "void",
             .ref => blk: {
                 // str 直接返回字节；其他引用返回 <obj>
                 if (v.ref.type_tag == .str) {

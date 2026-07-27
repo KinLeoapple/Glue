@@ -6,17 +6,40 @@
 const std = @import("std");
 const ast = @import("ast");
 const builder_mod = @import("builder.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const op_table = @import("op_table.zig");
 const AstHelper = @import("ast_helper.zig").AstHelper;
+const sema = @import("sema");
+const ir_mod = @import("ir.zig");
 
 const testing = std.testing;
 const IRBuilder = builder_mod.IRBuilder;
 const NodeOp = builder_mod.NodeOp;
-const ChanType = builder_mod.ChanType;
 const FloatKind = builder_mod.FloatKind;
 const GateKind = builder_mod.GateKind;
 const HaltKind = builder_mod.HaltKind;
 const VecOp = builder_mod.VecOp;
+const GlueIR = ir_mod.GlueIR;
+const SemaResult = sema.sema_output.SemaResult;
+
+// ── 测试辅助：显式注入 sema_result 构建 IR ──
+// 与生产管线（main.zig）一致：先运行 sema 类型推断并注入 sema_result，再构建 IR。
+// inferencer 的 arena 持有 Type 结构体及 name 字符串，SemaResult.expr_types 中的
+// type_name 切片指向这些字符串，故 inferencer 必须在 builder.build() 期间保持存活。
+// defer 确保在函数返回（build 完成后）才释放。
+fn buildIRWithSema(ah: *AstHelper, mod: ast.Module) !GlueIR {
+    _ = ah;
+    var sema_result = SemaResult.init(testing.allocator);
+    defer sema_result.deinit();
+    var inferencer = sema.TypeInferencer.init(testing.allocator);
+    defer inferencer.deinit();
+    inferencer.setSemaResult(&sema_result);
+    try inferencer.checkModule(&mod);
+    var builder = try IRBuilder.init(testing.allocator);
+    defer builder.deinit();
+    builder.setSemaResult(&sema_result);
+    return try builder.build(mod);
+}
 
 // ── 端到端测试用例 ──
 
@@ -31,9 +54,7 @@ test "e2e: 简单算术 fun main() -> i64 { 1 + 2 }" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 验证：1 个函数、4 个节点（const_i, const_i, int_add, halt_return）
@@ -74,9 +95,7 @@ test "e2e: 变量绑定与使用 fun main() -> i64 { val x = 10; x }" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：const_i(10), halt_return
@@ -106,9 +125,7 @@ test "e2e: if 表达式 fun main() -> i64 { if true { 1 } else { 2 } }" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：const_bool, cast, const_i(2)[else], const_i(1)[then], route_dispatch, halt_return
@@ -145,9 +162,7 @@ test "e2e: 函数定义与调用 add(1, 2)" {
     const decls = [_]ast.Decl{ add_decl, main_decl };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 2 个函数
@@ -196,9 +211,7 @@ test "e2e: var 声明与赋值 fun main() -> i64 { var x = 1; x = 2; x }" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：const_i(1), load(x_cell), const_i(2), store(x_cell), halt_return
@@ -232,9 +245,7 @@ test "e2e: 类型推导（后缀 + 浮点）" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：const_f, const_f, float_add, halt_return
@@ -245,8 +256,8 @@ test "e2e: 类型推导（后缀 + 浮点）" {
     try testing.expectEqual(NodeOp.halt_return, ir.nodes[3].op);
 
     // 通道类型应为 f32
-    try testing.expectEqual(ChanType.f32_chan, ir.channels.get(ir.nodes[0].output).chan_type);
-    try testing.expectEqual(ChanType.f32_chan, ir.channels.get(ir.nodes[2].output).chan_type);
+    try testing.expectEqual(type_descriptor_mod.f32_descriptor, ir.channels.get(ir.nodes[0].output).type_desc);
+    try testing.expectEqual(type_descriptor_mod.f32_descriptor, ir.channels.get(ir.nodes[2].output).type_desc);
 
     // 元数据中 float_kind 应为 f32
     try testing.expectEqual(FloatKind.f32, ir.scalar_metas[1].float_kind);
@@ -265,9 +276,7 @@ test "e2e: 比较运算与 bool 逻辑" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：const_i, const_i, cmp_lt, halt_return
@@ -275,7 +284,7 @@ test "e2e: 比较运算与 bool 逻辑" {
     try testing.expectEqual(NodeOp.cmp_lt, ir.nodes[2].op);
 
     // 比较结果类型应为 mask
-    try testing.expectEqual(ChanType.mask_chan, ir.channels.get(ir.nodes[2].output).chan_type);
+    try testing.expectEqual(type_descriptor_mod.mask_descriptor, ir.channels.get(ir.nodes[2].output).type_desc);
 }
 
 test "e2e: 一元运算 fun main() -> i64 { -5 }" {
@@ -289,9 +298,7 @@ test "e2e: 一元运算 fun main() -> i64 { -5 }" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：const_i(5), int_neg, halt_return
@@ -315,9 +322,7 @@ test "e2e: IR printer 输出验证" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 打印 IR
@@ -353,9 +358,7 @@ test "e2e: for 循环 range 向量化 fun main() { for i in 0..10 { i } }" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：const_i(0), const_i(10), vec_source, vec_map, vec_sink, halt_return
@@ -383,7 +386,7 @@ test "e2e: for 循环 range 向量化 fun main() { for i in 0..10 { i } }" {
     // vmeta[0]: vec_source (range_source)
     try testing.expectEqual(VecOp.range_source, ir.vector_metas[0].vec_op);
     try testing.expectEqual(@as(?u32, 10), ir.vector_metas[0].length); // 编译期推导长度
-    try testing.expectEqual(ChanType.i32_chan, ir.vector_metas[0].elem_type);
+    try testing.expectEqual(type_descriptor_mod.i32_descriptor, ir.vector_metas[0].elem_type_desc);
 
     // vmeta[2]: vec_sink (sink_last)
     try testing.expectEqual(VecOp.sink_last, ir.vector_metas[2].vec_op);
@@ -405,9 +408,7 @@ test "e2e: for 循环 inclusive range 向量化" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // range_inclusive 长度 = 5 - 0 + 1 = 6
@@ -430,9 +431,7 @@ test "e2e: for 循环带循环体运算" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：const_i(0), const_i(100), vec_source, const_i(2), int_mul, vec_map, vec_sink, halt_return
@@ -463,9 +462,7 @@ test "e2e: while 循环向量化" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // while 编译为 scalar_loop（while_loop kind）
@@ -492,8 +489,8 @@ test "e2e: vec_fold 归约编译" {
     defer builder.deinit();
 
     // 手动构造场景：src_vec_chan 和 init_chan
-    const src_vec = try builder.allocChannel(.i64_chan);
-    const init_chan = try builder.allocChannel(.i64_chan);
+    const src_vec = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
+    const init_chan = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
 
     const fold_out = try builder.compileFold(.int_add, init_chan, src_vec);
 
@@ -508,7 +505,7 @@ test "e2e: vec_fold 归约编译" {
     // 验证向量元数据
     const fold_meta = builder.vector_metas.items[0];
     try testing.expectEqual(NodeOp.int_add, fold_meta.inner_op);
-    try testing.expectEqual(ChanType.i64_chan, fold_meta.elem_type);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, fold_meta.elem_type_desc);
 }
 
 test "e2e: vec_scan 前缀计算编译" {
@@ -518,8 +515,8 @@ test "e2e: vec_scan 前缀计算编译" {
     var builder = try IRBuilder.init(testing.allocator);
     defer builder.deinit();
 
-    const src_vec = try builder.allocChannel(.i64_chan);
-    const init_chan = try builder.allocChannel(.i64_chan);
+    const src_vec = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
+    const init_chan = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
 
     const scan_out = try builder.compileScan(.int_add, init_chan, src_vec);
 
@@ -554,9 +551,7 @@ test "e2e: for 循环 dispatch 降频验证" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 统计向量 op 数量
@@ -589,9 +584,7 @@ test "e2e: 向量 meta printer 输出" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     const output = try @import("printer.zig").irToString(testing.allocator, &ir);
@@ -627,9 +620,7 @@ test "e2e: ? 传播表达式编译为 gate 节点链" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 节点序列：call(f), gate_check, gate_get_ok, const_unit, halt_return
@@ -669,9 +660,7 @@ test "e2e: defer 语句编译为 cleanup_register" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 查找 cleanup_register 节点
@@ -711,9 +700,7 @@ test "e2e: 多个 defer LIFO 顺序" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 两个 cleanup_register 节点
@@ -744,9 +731,7 @@ test "e2e: throw 语句编译为 halt_throw" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 查找 halt_throw 节点
@@ -794,9 +779,7 @@ test "e2e: select 多路复用编译为竞争图" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 查找竞争节点
@@ -838,9 +821,7 @@ test "e2e: Phase 3 元数据 printer 输出" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     const output = try @import("printer.zig").irToString(testing.allocator, &ir);
@@ -867,9 +848,7 @@ test "e2e: async 函数调用编译为 orbit_async_create" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 验证：compute 函数标记为 async
@@ -885,13 +864,13 @@ test "e2e: async 函数调用编译为 orbit_async_create" {
     try testing.expectEqual(NodeOp.halt_return, main_nodes[2].op);
 
     // 验证：orbit_async_create 的输出是 ref_chan（handle）
-    try testing.expectEqual(ChanType.ref_chan, ir.channels.get(main_nodes[0].output).chan_type);
+    try testing.expectEqual(type_descriptor_mod.ref_descriptor, ir.channels.get(main_nodes[0].output).type_desc);
 
     // 验证：orbit_metas 表有 1 条记录
     try testing.expectEqual(@as(usize, 1), ir.orbit_metas.len);
     try testing.expectEqual(@as(u16, 0), ir.orbit_metas[0].func_index);
     try testing.expectEqual(@as(u8, 0), ir.orbit_metas[0].arg_count);
-    try testing.expectEqual(ChanType.i64_chan, ir.orbit_metas[0].result_type);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, ir.orbit_metas[0].result_type_desc);
 }
 
 test "e2e: orbit_async_join 等待异步结果" {
@@ -907,9 +886,7 @@ test "e2e: orbit_async_join 等待异步结果" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 验证：orbit_async_create 的 meta_index 指向 orbit_metas[0]
@@ -918,7 +895,7 @@ test "e2e: orbit_async_join 等待异步结果" {
     try testing.expectEqual(@as(u16, 1), create_node.meta_index);
 
     // 验证：orbit_metas 记录了结果类型，join 时用此类型分配结果通道
-    try testing.expectEqual(ChanType.i64_chan, ir.orbit_metas[0].result_type);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, ir.orbit_metas[0].result_type_desc);
 }
 
 test "e2e: async 函数带参数" {
@@ -937,9 +914,7 @@ test "e2e: async 函数带参数" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     // 验证：orbit_async_create 有 2 个输入（参数通道）
@@ -966,8 +941,8 @@ test "e2e: orbit_chan_send/recv 通道通信" {
     const handle_chan: u16 = 0;
     const val_chan: u16 = 1;
     _ = try builder.emitOrbitSend(handle_chan, val_chan);
-    _ = try builder.emitOrbitRecv(handle_chan, .i64_chan);
-    _ = try builder.emitOrbitTryRecv(handle_chan, .i64_chan);
+    _ = try builder.emitOrbitRecv(handle_chan, type_descriptor_mod.i64_descriptor);
+    _ = try builder.emitOrbitTryRecv(handle_chan, type_descriptor_mod.i64_descriptor);
 
     // 验证节点已追加到 builder.nodes
     try testing.expectEqual(@as(usize, 3), builder.nodes.items.len);
@@ -994,9 +969,7 @@ test "e2e: 星轨元数据 printer 输出" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     const output = try @import("printer.zig").irToString(testing.allocator, &ir);
@@ -1021,9 +994,7 @@ test "e2e: 优化器不消除 orbit 副作用节点" {
     };
     const mod = ah.module("test", &decls);
 
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-    var ir = try builder.build(mod);
+    var ir = try buildIRWithSema(&ah, mod);
     defer ir.deinit();
 
     _ = @import("optimizer.zig").optimize(&ir);

@@ -34,7 +34,7 @@ fun celsiusRaw(c: Celsius): f64 {
     }
 }
 
-fun main() {
+fun main(): void {
     // newtype 解包与重建（温度转换）
     val c = Celsius(100.0)
     val f = toF(c)

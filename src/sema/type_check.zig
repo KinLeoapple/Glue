@@ -39,7 +39,6 @@ pub const builtin_types = @import("builtin_types.zig");
 pub const sema_output = @import("sema_output.zig");
 const SemaResult = sema_output.SemaResult;
 const ExprInfo = sema_output.ExprInfo;
-const ChanType = ir.ChanType;
 const ConstVal = ir.ConstVal;
 const TypeDefInfo = sema_output.TypeDefInfo;
 const CtorDefInfo = sema_output.CtorDefInfo;
@@ -49,25 +48,19 @@ const TraitMethodSig = sema_output.TraitMethodSig;
 const FnSigRef = sema_output.FnSigRef;
 const TypeDefKind = sema_output.TypeDefKind;
 
-/// 将 sema 内部 Type 表示转换为 IR 的 ChanType（决定通道宽度）。
-/// 标量/内置类型走 BUILTIN_TYPES 表查询（消除 22 分支 switch）；
-/// 复合类型（record/adt/array/fn/generic/trait）→ ref_chan（堆引用）；
-/// nullable/throw 递归取内部类型；type_var/unknown 返回 null（无法静态确定）。
-fn semaTypeToChanType(ty: *Type) ?ChanType {
-    // 表驱动：标量 + str/unit/null 等内置类型
-    if (builtinTypeChanType(ty.*)) |ct| return ct;
-    // 结构性分派：复合类型
-    return switch (ty.*) {
-        .record_type, .adt_type, .array_type, .fn_type, .generic_type, .trait_type => .ref_chan,
-        .nullable_type => |inner| blk: {
-            const inner_ct = semaTypeToChanType(inner) orelse .ref_chan;
-            break :blk inner_ct;
-        },
-        .ref_type => .ref_chan,
-        .throw_type => |tt| semaTypeToChanType(tt.value_type) orelse .ref_chan,
-        .type_var, .unknown_type, .never_type => null,
-        else => null,
-    };
+/// 将 sema 内部 Type 表示转换为 *const TypeDescriptor（统一类型描述符）。
+/// 委托 type_resolver.fromConcreteType，返回 null 表示无法确定类型。
+fn semaTypeToTypeDesc(ty: *Type) ?*const type_descriptor.TypeDescriptor {
+    return type_resolver.fromConcreteType(ty.*);
+}
+
+/// 批量将 Type 列表转换为 *const TypeDescriptor 列表，无法确定的类型回退为 ref descriptor。
+fn typesToTypeDescs(allocator: std.mem.Allocator, types: []const *Type) ![]const *const type_descriptor.TypeDescriptor {
+    const result = try allocator.alloc(*const type_descriptor.TypeDescriptor, types.len);
+    for (types, 0..) |t, i| {
+        result[i] = semaTypeToTypeDesc(t) orelse &type_resolver.ref_type_descriptor;
+    }
+    return result;
 }
 
 /// 提取类型的名字（原始类型返回内置名，adt_type.name / generic_type.name 等）。
@@ -87,15 +80,6 @@ fn typeNameOfType(ty: *Type) ?[]const u8 {
         .nullable_type => |inner| typeNameOfType(inner),
         else => null,
     };
-}
-
-/// 批量将 Type 列表转换为 ChanType 列表，无法确定的类型回退为 ref_chan。
-fn typesToChanTypes(allocator: std.mem.Allocator, types: []const *Type) ![]const ChanType {
-    const result = try allocator.alloc(ChanType, types.len);
-    for (types, 0..) |t, i| {
-        result[i] = semaTypeToChanType(t) orelse .ref_chan;
-    }
-    return result;
 }
 
 /// 批量提取类型名列表，无法提取的元素为 null。
@@ -119,92 +103,83 @@ pub const FieldType = concrete_type_mod.ConcreteType.FieldType;
 
 /// 内置类型名 ↔ Type 枚举映射表（单一真相来源）。
 /// 涵盖文档中所有内置类型：i8~i128、u8~u128、isize/usize、f16~f128、bool、str、char、Unit、Null。
-/// chan 字段：Type → ChanType 映射（消除 semaTypeToChanType 的 22 分支 switch）。
 /// singleton_idx 字段：Type → singleton 索引（消除 singletonIdx 的 22 分支 switch）。
-const BuiltinTypeEntry = struct { name: []const u8, ty: Type, chan: ChanType, singleton_idx: usize };
+const BuiltinTypeEntry = struct { name: []const u8, ty: Type, singleton_idx: usize };
 
 /// 所有内置类型条目（comptime 表，单一真相来源）
-/// 新增标量只需在此追加一条，semaTypeToChanType/typeNameOfType/singletonIdx 自动覆盖
+/// 新增标量只需在此追加一条，typeNameOfType/singletonIdx 自动覆盖
 const BUILTIN_TYPES = [_]BuiltinTypeEntry{
-    .{ .name = "i8", .ty = .i8_type, .chan = .i8_chan, .singleton_idx = 0 },
-    .{ .name = "i16", .ty = .i16_type, .chan = .i16_chan, .singleton_idx = 1 },
-    .{ .name = "i32", .ty = .i32_type, .chan = .i32_chan, .singleton_idx = 2 },
-    .{ .name = "i64", .ty = .i64_type, .chan = .i64_chan, .singleton_idx = 3 },
-    .{ .name = "i128", .ty = .i128_type, .chan = .i128_chan, .singleton_idx = 4 },
-    .{ .name = "u8", .ty = .u8_type, .chan = .u8_chan, .singleton_idx = 5 },
-    .{ .name = "u16", .ty = .u16_type, .chan = .u16_chan, .singleton_idx = 6 },
-    .{ .name = "u32", .ty = .u32_type, .chan = .u32_chan, .singleton_idx = 7 },
-    .{ .name = "u64", .ty = .u64_type, .chan = .u64_chan, .singleton_idx = 8 },
-    .{ .name = "u128", .ty = .u128_type, .chan = .u128_chan, .singleton_idx = 9 },
-    .{ .name = "f16", .ty = .f16_type, .chan = .f16_chan, .singleton_idx = 10 },
-    .{ .name = "f32", .ty = .f32_type, .chan = .f32_chan, .singleton_idx = 11 },
-    .{ .name = "f64", .ty = .f64_type, .chan = .f64_chan, .singleton_idx = 12 },
-    .{ .name = "f128", .ty = .f128_type, .chan = .f128_chan, .singleton_idx = 13 },
-    .{ .name = "bool", .ty = .bool_type, .chan = .bool_chan, .singleton_idx = 14 },
-    .{ .name = "str", .ty = .str_type, .chan = .ref_chan, .singleton_idx = 15 },
-    .{ .name = "char", .ty = .char_type, .chan = .char_chan, .singleton_idx = 16 },
-    .{ .name = "Null", .ty = .null_type, .chan = .null_chan, .singleton_idx = 17 },
-    .{ .name = "Unit", .ty = .unit_type, .chan = .unit_chan, .singleton_idx = 18 },
-    .{ .name = "isize", .ty = .isize_type, .chan = .isize_chan, .singleton_idx = 20 },
-    .{ .name = "usize", .ty = .usize_type, .chan = .usize_chan, .singleton_idx = 21 },
+    .{ .name = "i8", .ty = .i8_type, .singleton_idx = 0 },
+    .{ .name = "i16", .ty = .i16_type, .singleton_idx = 1 },
+    .{ .name = "i32", .ty = .i32_type, .singleton_idx = 2 },
+    .{ .name = "i64", .ty = .i64_type, .singleton_idx = 3 },
+    .{ .name = "i128", .ty = .i128_type, .singleton_idx = 4 },
+    .{ .name = "u8", .ty = .u8_type, .singleton_idx = 5 },
+    .{ .name = "u16", .ty = .u16_type, .singleton_idx = 6 },
+    .{ .name = "u32", .ty = .u32_type, .singleton_idx = 7 },
+    .{ .name = "u64", .ty = .u64_type, .singleton_idx = 8 },
+    .{ .name = "u128", .ty = .u128_type, .singleton_idx = 9 },
+    .{ .name = "f16", .ty = .f16_type, .singleton_idx = 10 },
+    .{ .name = "f32", .ty = .f32_type, .singleton_idx = 11 },
+    .{ .name = "f64", .ty = .f64_type, .singleton_idx = 12 },
+    .{ .name = "f128", .ty = .f128_type, .singleton_idx = 13 },
+    .{ .name = "bool", .ty = .bool_type, .singleton_idx = 14 },
+    .{ .name = "str", .ty = .str_type, .singleton_idx = 15 },
+    .{ .name = "char", .ty = .char_type, .singleton_idx = 16 },
+    .{ .name = "Null", .ty = .null_type, .singleton_idx = 17 },
+    .{ .name = "void", .ty = .unit_type, .singleton_idx = 18 },
+    .{ .name = "isize", .ty = .isize_type, .singleton_idx = 20 },
+    .{ .name = "usize", .ty = .usize_type, .singleton_idx = 21 },
 };
 
 /// 数值类型条目（整数 + 浮点，用于类型转换函数注册）
 const NUMERIC_TYPES = [_]BuiltinTypeEntry{
-    .{ .name = "i8", .ty = .i8_type, .chan = .i8_chan, .singleton_idx = 0 },
-    .{ .name = "i16", .ty = .i16_type, .chan = .i16_chan, .singleton_idx = 1 },
-    .{ .name = "i32", .ty = .i32_type, .chan = .i32_chan, .singleton_idx = 2 },
-    .{ .name = "i64", .ty = .i64_type, .chan = .i64_chan, .singleton_idx = 3 },
-    .{ .name = "i128", .ty = .i128_type, .chan = .i128_chan, .singleton_idx = 4 },
-    .{ .name = "u8", .ty = .u8_type, .chan = .u8_chan, .singleton_idx = 5 },
-    .{ .name = "u16", .ty = .u16_type, .chan = .u16_chan, .singleton_idx = 6 },
-    .{ .name = "u32", .ty = .u32_type, .chan = .u32_chan, .singleton_idx = 7 },
-    .{ .name = "u64", .ty = .u64_type, .chan = .u64_chan, .singleton_idx = 8 },
-    .{ .name = "u128", .ty = .u128_type, .chan = .u128_chan, .singleton_idx = 9 },
-    .{ .name = "isize", .ty = .isize_type, .chan = .isize_chan, .singleton_idx = 20 },
-    .{ .name = "usize", .ty = .usize_type, .chan = .usize_chan, .singleton_idx = 21 },
-    .{ .name = "f16", .ty = .f16_type, .chan = .f16_chan, .singleton_idx = 10 },
-    .{ .name = "f32", .ty = .f32_type, .chan = .f32_chan, .singleton_idx = 11 },
-    .{ .name = "f64", .ty = .f64_type, .chan = .f64_chan, .singleton_idx = 12 },
-    .{ .name = "f128", .ty = .f128_type, .chan = .f128_chan, .singleton_idx = 13 },
+    .{ .name = "i8", .ty = .i8_type, .singleton_idx = 0 },
+    .{ .name = "i16", .ty = .i16_type, .singleton_idx = 1 },
+    .{ .name = "i32", .ty = .i32_type, .singleton_idx = 2 },
+    .{ .name = "i64", .ty = .i64_type, .singleton_idx = 3 },
+    .{ .name = "i128", .ty = .i128_type, .singleton_idx = 4 },
+    .{ .name = "u8", .ty = .u8_type, .singleton_idx = 5 },
+    .{ .name = "u16", .ty = .u16_type, .singleton_idx = 6 },
+    .{ .name = "u32", .ty = .u32_type, .singleton_idx = 7 },
+    .{ .name = "u64", .ty = .u64_type, .singleton_idx = 8 },
+    .{ .name = "u128", .ty = .u128_type, .singleton_idx = 9 },
+    .{ .name = "isize", .ty = .isize_type, .singleton_idx = 20 },
+    .{ .name = "usize", .ty = .usize_type, .singleton_idx = 21 },
+    .{ .name = "f16", .ty = .f16_type, .singleton_idx = 10 },
+    .{ .name = "f32", .ty = .f32_type, .singleton_idx = 11 },
+    .{ .name = "f64", .ty = .f64_type, .singleton_idx = 12 },
+    .{ .name = "f128", .ty = .f128_type, .singleton_idx = 13 },
 };
 
 /// 整数后缀条目（仅整数，用于整数字面量后缀推断）
 const INT_SUFFIXES = [_]BuiltinTypeEntry{
-    .{ .name = "i8", .ty = .i8_type, .chan = .i8_chan, .singleton_idx = 0 },
-    .{ .name = "i16", .ty = .i16_type, .chan = .i16_chan, .singleton_idx = 1 },
-    .{ .name = "i32", .ty = .i32_type, .chan = .i32_chan, .singleton_idx = 2 },
-    .{ .name = "i64", .ty = .i64_type, .chan = .i64_chan, .singleton_idx = 3 },
-    .{ .name = "i128", .ty = .i128_type, .chan = .i128_chan, .singleton_idx = 4 },
-    .{ .name = "u8", .ty = .u8_type, .chan = .u8_chan, .singleton_idx = 5 },
-    .{ .name = "u16", .ty = .u16_type, .chan = .u16_chan, .singleton_idx = 6 },
-    .{ .name = "u32", .ty = .u32_type, .chan = .u32_chan, .singleton_idx = 7 },
-    .{ .name = "u64", .ty = .u64_type, .chan = .u64_chan, .singleton_idx = 8 },
-    .{ .name = "u128", .ty = .u128_type, .chan = .u128_chan, .singleton_idx = 9 },
-    .{ .name = "isize", .ty = .isize_type, .chan = .isize_chan, .singleton_idx = 20 },
-    .{ .name = "usize", .ty = .usize_type, .chan = .usize_chan, .singleton_idx = 21 },
+    .{ .name = "i8", .ty = .i8_type, .singleton_idx = 0 },
+    .{ .name = "i16", .ty = .i16_type, .singleton_idx = 1 },
+    .{ .name = "i32", .ty = .i32_type, .singleton_idx = 2 },
+    .{ .name = "i64", .ty = .i64_type, .singleton_idx = 3 },
+    .{ .name = "i128", .ty = .i128_type, .singleton_idx = 4 },
+    .{ .name = "u8", .ty = .u8_type, .singleton_idx = 5 },
+    .{ .name = "u16", .ty = .u16_type, .singleton_idx = 6 },
+    .{ .name = "u32", .ty = .u32_type, .singleton_idx = 7 },
+    .{ .name = "u64", .ty = .u64_type, .singleton_idx = 8 },
+    .{ .name = "u128", .ty = .u128_type, .singleton_idx = 9 },
+    .{ .name = "isize", .ty = .isize_type, .singleton_idx = 20 },
+    .{ .name = "usize", .ty = .usize_type, .singleton_idx = 21 },
 };
 
 /// 浮点后缀条目
 const FLOAT_SUFFIXES = [_]BuiltinTypeEntry{
-    .{ .name = "f16", .ty = .f16_type, .chan = .f16_chan, .singleton_idx = 10 },
-    .{ .name = "f32", .ty = .f32_type, .chan = .f32_chan, .singleton_idx = 11 },
-    .{ .name = "f64", .ty = .f64_type, .chan = .f64_chan, .singleton_idx = 12 },
-    .{ .name = "f128", .ty = .f128_type, .chan = .f128_chan, .singleton_idx = 13 },
+    .{ .name = "f16", .ty = .f16_type, .singleton_idx = 10 },
+    .{ .name = "f32", .ty = .f32_type, .singleton_idx = 11 },
+    .{ .name = "f64", .ty = .f64_type, .singleton_idx = 12 },
+    .{ .name = "f128", .ty = .f128_type, .singleton_idx = 13 },
 };
 
 /// 按 Type 枚举查找内置类型名字符串，未找到返回 null
 fn builtinTypeName(ty: Type) ?[]const u8 {
     inline for (BUILTIN_TYPES) |entry| {
         if (std.meta.activeTag(ty) == entry.ty) return entry.name;
-    }
-    return null;
-}
-
-/// 按 Type 枚举查找 ChanType，未找到返回 null（v3 阶段 10：消除 semaTypeToChanType switch）
-fn builtinTypeChanType(ty: Type) ?ChanType {
-    inline for (BUILTIN_TYPES) |entry| {
-        if (std.meta.activeTag(ty) == entry.ty) return entry.chan;
     }
     return null;
 }
@@ -233,6 +208,11 @@ pub const AdtInfo = struct {
     ctor_field_types: []const []const *Type = &[_][]const *Type{},
     ctor_field_names: []const []const ?[]const u8 = &[_][]const ?[]const u8{},
     ctor_return_types: []const ?*Type = &[_]?*Type{},
+    /// GADT 构造器返回类型 AST TypeNode（消除 IR 侧 getCtorAstReturnType AST 回退）
+    ctor_return_type_nodes: []const ?*const ast.TypeNode = &[_]?*const ast.TypeNode{},
+    /// 构造器字段的 AST TypeNode（消除 IR 侧 getCtorAstFieldTypeNode AST 回退）
+    /// 第一维与 constructor_names 一致，第二维与 ctor_field_names 一致
+    ctor_field_type_nodes: []const []const ?*const ast.TypeNode = &[_][]const ?*const ast.TypeNode{},
 };
 /// Trait 实现条目：记录 trait 名、类型名和源码位置。
 pub const TraitEntry = struct {
@@ -1377,14 +1357,14 @@ pub const TypeInferencer = struct {
         const resolved = self.resolve(ty);
         switch (resolved.*) {
             .fn_type => |ft| {
-                const param_types = self.arena.allocator().alloc(ChanType, ft.params.len) catch return null;
+                const param_type_descs = self.arena.allocator().alloc(*const type_descriptor.TypeDescriptor, ft.params.len) catch return null;
                 for (ft.params, 0..) |p, i| {
-                    param_types[i] = semaTypeToChanType(p) orelse .ref_chan;
+                    param_type_descs[i] = semaTypeToTypeDesc(p) orelse &type_resolver.ref_type_descriptor;
                 }
-                const return_type = semaTypeToChanType(ft.return_type) orelse .ref_chan;
+                const return_type_desc = semaTypeToTypeDesc(ft.return_type) orelse &type_resolver.ref_type_descriptor;
                 return .{
-                    .param_types = param_types,
-                    .return_type = return_type,
+                    .param_type_descs = param_type_descs,
+                    .return_type_desc = return_type_desc,
                 };
             },
             else => return null,
@@ -1393,16 +1373,16 @@ pub const TypeInferencer = struct {
     /// 推断表达式的类型。这是类型检查的核心入口，递归处理所有表达式变体，
     /// 结合 expected 类型进行双向类型检查。返回推断出的类型。
     /// 表达式类型推断入口（wrapper）：委托 inferExprInner 完成实际推断，
-    /// 若 sema_result 已设置，则把 (expr 指针地址 → ChanType) 记录到 SemaResult.expr_types，
+    /// 若 sema_result 已设置，则把 (expr 指针地址 → TypeDescriptor) 记录到 SemaResult.expr_types，
     /// 供 IRBuilder 在图构建时读取（驱动式接入）。
     pub fn inferExpr(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv, expected: ?*Type) SemaError!*Type {
         const ty = try self.inferExprInner(expr, env, expected);
         if (self.sema_result) |sr| {
-            if (semaTypeToChanType(ty)) |ct| {
+            if (semaTypeToTypeDesc(ty)) |td| {
                 const type_name: ?[]const u8 = typeNameOfType(ty);
-                var inner_ct: ChanType = .null_chan;
+                var inner_td: ?*const type_descriptor.TypeDescriptor = null;
                 if (ty.* == .nullable_type) {
-                    inner_ct = semaTypeToChanType(ty.nullable_type) orelse .ref_chan;
+                    inner_td = semaTypeToTypeDesc(ty.nullable_type);
                 }
                 const is_ref = switch (ty.*) {
                     .ref_type => true,
@@ -1414,8 +1394,8 @@ pub const TypeInferencer = struct {
                     else => false,
                 };
                 sr.putExpr(@intFromPtr(expr), .{
-                    .chan_type = ct,
-                    .inner_type = inner_ct,
+                    .type_desc = td,
+                    .inner_type_desc = inner_td,
                     .type_name = type_name,
                     .is_ref_type = is_ref,
                     .is_raw_ref = is_raw_ref,
@@ -1548,11 +1528,6 @@ pub const TypeInferencer = struct {
                     .bit_and, .bit_or, .bit_xor, .shl, .shr => {
                         try self.unify(left_ty, right_ty);
                         return left_ty;
-                    },
-                    .concat => {
-                        try self.unify(left_ty, try self.makeType(.str_type));
-                        try self.unify(right_ty, try self.makeType(.str_type));
-                        return self.makeType(.str_type);
                     },
                     .concat_list => {
                         const elem_ty = try self.freshTypeVar();
@@ -2650,12 +2625,12 @@ pub const TypeInferencer = struct {
         }
     }
     /// 检查整个模块的类型。委托 module_check 完成实际的模块级检查。
-    pub fn checkModule(self: *TypeInferencer, module: *const ast.Module) void {
-        self.checkModuleWithName(module, module.name);
+    pub fn checkModule(self: *TypeInferencer, module: *const ast.Module) anyerror!void {
+        try self.checkModuleWithName(module, module.name);
     }
     /// 带模块名的模块检查入口。委托 module_check 完成模块级声明检查、kind 检查、
     /// trait 检查和类型推断。
-    pub fn checkModuleWithName(self: *TypeInferencer, module: *const ast.Module, module_name: []const u8) void {
+    pub fn checkModuleWithName(self: *TypeInferencer, module: *const ast.Module, module_name: []const u8) anyerror!void {
         self.resetForNextModule();
         self.current_module = module_name;
         var env = TypeEnv.init(self.arena.allocator());
@@ -2700,9 +2675,9 @@ pub const TypeInferencer = struct {
         self.recordModuleStructure(module, module_name);
 
         // v3: 类型检查完成后，收集单态化实例（泛型调用点 → 实例集合）
-        // 错误非致命：IRBuilder 仍可 on-demand 补全缺失实例
+        // sema 是单态化实例的权威来源，IR 从 sema 获取 type_args 并编译实例体
         if (self.sema_result) |sr| {
-            monomorph.collectMonomorphInstances(module, sr) catch {};
+            try monomorph.collectMonomorphInstances(module, sr);
         }
     }
     /// 扫描主模块中 mangled 名函数（如 Store.Memory.put），为导入的模块注册
@@ -4067,20 +4042,24 @@ pub const TypeInferencer = struct {
         for (info.constructor_names, 0..) |ctor_name, i| {
             const field_types: []const *Type = if (i < info.ctor_field_types.len) info.ctor_field_types[i] else &[_]*Type{};
             const field_names: []const ?[]const u8 = if (i < info.ctor_field_names.len) info.ctor_field_names[i] else &[_]?[]const u8{};
-            const field_chan_types = try typesToChanTypes(self.arena.allocator(), field_types);
+            const field_type_descs = try typesToTypeDescs(self.arena.allocator(), field_types);
             const field_type_names = try typeNamesOfTypes(self.arena.allocator(), field_types);
             const return_type_name: ?[]const u8 = if (i < info.ctor_return_types.len)
                 (if (info.ctor_return_types[i]) |rt| typeNameOfType(self.resolve(rt)) else null)
             else
                 null;
+            const return_type_node: ?*const ast.TypeNode = if (i < info.ctor_return_type_nodes.len) info.ctor_return_type_nodes[i] else null;
+            const field_type_nodes: []const ?*const ast.TypeNode = if (i < info.ctor_field_type_nodes.len) info.ctor_field_type_nodes[i] else &[_]?*const ast.TypeNode{};
             ctors[i] = .{
                 .name = ctor_name,
                 .type_name = name,
                 .field_names = field_names,
-                .field_chan_types = field_chan_types,
+                .field_type_descs = field_type_descs,
                 .field_type_names = field_type_names,
                 .is_newtype = (kind == .newtype),
                 .return_type_name = return_type_name,
+                .return_type_node = return_type_node,
+                .field_type_nodes = field_type_nodes,
             };
         }
         return .{
@@ -4104,18 +4083,18 @@ pub const TypeInferencer = struct {
                 const resolved = self.resolve(scheme);
                 if (resolved.* == .fn_type) {
                     const param_count: u8 = @intCast(resolved.fn_type.params.len);
-                    const return_ct = semaTypeToChanType(resolved.fn_type.return_type) orelse .ref_chan;
+                    const return_td = semaTypeToTypeDesc(resolved.fn_type.return_type) orelse &type_resolver.ref_type_descriptor;
                     methods[i] = .{
                         .name = mname,
                         .param_count = param_count,
-                        .return_chan_type = return_ct,
+                        .return_type_desc = return_td,
                         .has_body = has_body,
                     };
                 } else {
                     methods[i] = .{
                         .name = mname,
                         .param_count = 0,
-                        .return_chan_type = .null_chan,
+                        .return_type_desc = &type_resolver.null_type_descriptor,
                         .has_body = has_body,
                     };
                 }
@@ -4123,7 +4102,7 @@ pub const TypeInferencer = struct {
                 methods[i] = .{
                     .name = mname,
                     .param_count = 0,
-                    .return_chan_type = .null_chan,
+                    .return_type_desc = &type_resolver.null_type_descriptor,
                     .has_body = has_body,
                 };
             }
@@ -4145,35 +4124,38 @@ pub const TypeInferencer = struct {
             return .{
                 .name = name,
                 .type_params = tp_names,
-                .param_chan_types = &[_]ChanType{},
-                .return_chan_type = .null_chan,
+                .param_type_descs = &[_]*const type_descriptor.TypeDescriptor{},
+                .return_type_desc = &type_resolver.null_type_descriptor,
                 .param_is_ref = &[_]bool{},
                 .is_async = is_async,
                 .is_throwing = is_throwing,
             };
         }
         const ft = resolved.fn_type;
-        const param_chan_types = try self.arena.allocator().alloc(ChanType, ft.params.len);
+        const param_type_descs = try self.arena.allocator().alloc(*const type_descriptor.TypeDescriptor, ft.params.len);
         const param_is_ref = try self.arena.allocator().alloc(bool, ft.params.len);
+        const param_type_names = try self.arena.allocator().alloc(?[]const u8, ft.params.len);
         for (ft.params, 0..) |p, i| {
             const presolved = self.resolve(p);
-            param_chan_types[i] = semaTypeToChanType(presolved) orelse .ref_chan;
+            param_type_descs[i] = semaTypeToTypeDesc(presolved) orelse &type_resolver.ref_type_descriptor;
             param_is_ref[i] = (presolved.* == .ref_type);
+            param_type_names[i] = typeNameOfType(presolved);
         }
         const return_resolved = self.resolve(ft.return_type);
-        const return_chan_type = semaTypeToChanType(return_resolved) orelse .ref_chan;
+        const return_type_desc = semaTypeToTypeDesc(return_resolved) orelse &type_resolver.ref_type_descriptor;
         const return_is_ref = (return_resolved.* == .ref_type);
         const tp_names = try self.arena.allocator().alloc([]const u8, ast_type_params.len);
         for (ast_type_params, 0..) |tp, i| tp_names[i] = tp.name;
         return .{
             .name = name,
             .type_params = tp_names,
-            .param_chan_types = param_chan_types,
-            .return_chan_type = return_chan_type,
+            .param_type_descs = param_type_descs,
+            .return_type_desc = return_type_desc,
             .param_is_ref = param_is_ref,
             .return_is_ref = return_is_ref,
             .is_async = is_async,
             .is_throwing = is_throwing,
+            .param_type_names = param_type_names,
         };
     }
     fn kindCheckDecl(self: *TypeInferencer, decl: ast.Decl) void {
@@ -4384,21 +4366,28 @@ pub const TypeInferencer = struct {
                         const ctor_field_types = self.arena.allocator().alloc([]const *Type, adt_def.constructors.len) catch return;
                         const ctor_field_names = self.arena.allocator().alloc([]const ?[]const u8, adt_def.constructors.len) catch return;
                         const ctor_return_types = self.arena.allocator().alloc(?*Type, adt_def.constructors.len) catch return;
+                        const ctor_return_type_nodes = self.arena.allocator().alloc(?*const ast.TypeNode, adt_def.constructors.len) catch return;
+                        const ctor_field_type_nodes = self.arena.allocator().alloc([]const ?*const ast.TypeNode, adt_def.constructors.len) catch return;
                         var is_gadt = false;
                         for (adt_def.constructors, 0..) |con, ci| {
                             const fts = self.arena.allocator().alloc(*Type, con.fields.len) catch return;
                             const fns = self.arena.allocator().alloc(?[]const u8, con.fields.len) catch return;
+                            const ft_nodes = self.arena.allocator().alloc(?*const ast.TypeNode, con.fields.len) catch return;
                             for (con.fields, 0..) |field, fi| {
                                 fts[fi] = self.typeFromAstWithParams(field.ty, &type_param_map) catch (self.freshTypeVar() catch return);
                                 fns[fi] = field.name;
+                                ft_nodes[fi] = field.ty;
                             }
                             ctor_field_types[ci] = fts;
                             ctor_field_names[ci] = fns;
+                            ctor_field_type_nodes[ci] = ft_nodes;
                             if (con.return_type) |rt| {
                                 is_gadt = true;
                                 ctor_return_types[ci] = self.typeFromAstWithParams(rt, &type_param_map) catch null;
+                                ctor_return_type_nodes[ci] = rt;
                             } else {
                                 ctor_return_types[ci] = null;
+                                ctor_return_type_nodes[ci] = null;
                             }
                         }
                         if (!dup_or_builtin) {
@@ -4407,6 +4396,8 @@ pub const TypeInferencer = struct {
                                 info.ctor_field_types = ctor_field_types;
                                 info.ctor_field_names = ctor_field_names;
                                 info.ctor_return_types = ctor_return_types;
+                                info.ctor_return_type_nodes = ctor_return_type_nodes;
+                                info.ctor_field_type_nodes = ctor_field_type_nodes;
                             }
                             if (self.sema_result) |sr| {
                                 if (self.adt_types.get(td.name)) |info| {
@@ -4490,7 +4481,7 @@ pub const TypeInferencer = struct {
                                 .type_param_names = type_param_names,
                             }) catch return;
                             if (self.sema_result) |sr| {
-                                const field_chan_types = typesToChanTypes(self.arena.allocator(), param_types) catch return;
+                                const field_type_descs = typesToTypeDescs(self.arena.allocator(), param_types) catch return;
                                 const field_type_names = typeNamesOfTypes(self.arena.allocator(), param_types) catch return;
                                 const field_name_list = self.arena.allocator().alloc(?[]const u8, fields.len) catch return;
                                 for (fields, 0..) |f, i| field_name_list[i] = f.name;
@@ -4499,7 +4490,7 @@ pub const TypeInferencer = struct {
                                     .name = td.name,
                                     .type_name = td.name,
                                     .field_names = field_name_list,
-                                    .field_chan_types = field_chan_types,
+                                    .field_type_descs = field_type_descs,
                                     .field_type_names = field_type_names,
                                 };
                                 sr.putTypeDef(.{
@@ -4554,7 +4545,7 @@ pub const TypeInferencer = struct {
                                     .constructors = &[_]CtorDefInfo{},
                                     .type_params = owned_type_param_names,
                                     .target_type_name = typeNameOfType(resolved_target),
-                                    .target_chan_type = semaTypeToChanType(resolved_target),
+                                    .target_type_desc = semaTypeToTypeDesc(resolved_target),
                                 }) catch {};
                             }
                         }
@@ -4592,6 +4583,13 @@ pub const TypeInferencer = struct {
                         ctor_field_names[0] = nt_fns;
                         const nt_return_types = self.arena.allocator().alloc(?*Type, 1) catch return;
                         nt_return_types[0] = null;
+                        // AST TypeNode（消除 IR 侧 AST 回退）
+                        const nt_return_type_nodes = self.arena.allocator().alloc(?*const ast.TypeNode, 1) catch return;
+                        nt_return_type_nodes[0] = null;
+                        const nt_field_type_nodes = self.arena.allocator().alloc([]const ?*const ast.TypeNode, 1) catch return;
+                        const nt_ft_nodes = self.arena.allocator().alloc(?*const ast.TypeNode, 1) catch return;
+                        nt_ft_nodes[0] = nt.inner;
+                        nt_field_type_nodes[0] = nt_ft_nodes;
                         if (!self.adt_types.contains(td.name)) {
                             const type_key = self.arena.allocator().dupe(u8, td.name) catch return;
                             const ctor_names_single = self.arena.allocator().alloc([]const u8, 1) catch return;
@@ -4606,6 +4604,8 @@ pub const TypeInferencer = struct {
                                 .ctor_field_types = ctor_field_types,
                                 .ctor_field_names = ctor_field_names,
                                 .ctor_return_types = nt_return_types,
+                                .ctor_return_type_nodes = nt_return_type_nodes,
+                                .ctor_field_type_nodes = nt_field_type_nodes,
                             }) catch return;
                             const mod_key = self.arena.allocator().dupe(u8, td.name) catch return;
                             const mod_val = self.arena.allocator().dupe(u8, self.current_module) catch return;
@@ -4616,6 +4616,8 @@ pub const TypeInferencer = struct {
                                 info.ctor_field_types = ctor_field_types;
                                 info.ctor_field_names = ctor_field_names;
                                 info.ctor_return_types = nt_return_types;
+                                info.ctor_return_type_nodes = nt_return_type_nodes;
+                                info.ctor_field_type_nodes = nt_field_type_nodes;
                             }
                         }
                         // 注册到 sema_result（与 ADT case 一致，不受 predeclare 影响）
@@ -4659,19 +4661,24 @@ pub const TypeInferencer = struct {
                             if (self.adt_types.getPtr(en.name)) |info| {
                                 const fts = self.arena.allocator().alloc(*Type, en.params.len) catch return;
                                 const fns = self.arena.allocator().alloc(?[]const u8, en.params.len) catch return;
+                                const ft_nodes = self.arena.allocator().alloc(?*const ast.TypeNode, en.params.len) catch return;
                                 for (en.params, 0..) |param, fi| {
                                     fts[fi] = if (param.type_annotation) |tn|
                                         self.typeFromAstWithParams(tn, null) catch (self.makeType(.str_type) catch return)
                                     else
                                         self.makeType(.str_type) catch return;
                                     fns[fi] = param.name;
+                                    ft_nodes[fi] = param.type_annotation;
                                 }
                                 const ctor_field_types_arr = self.arena.allocator().alloc([]const *Type, 1) catch return;
                                 const ctor_field_names_arr = self.arena.allocator().alloc([]const ?[]const u8, 1) catch return;
+                                const ctor_field_type_nodes_arr = self.arena.allocator().alloc([]const ?*const ast.TypeNode, 1) catch return;
                                 ctor_field_types_arr[0] = fts;
                                 ctor_field_names_arr[0] = fns;
+                                ctor_field_type_nodes_arr[0] = ft_nodes;
                                 info.ctor_field_types = ctor_field_types_arr;
                                 info.ctor_field_names = ctor_field_names_arr;
+                                info.ctor_field_type_nodes = ctor_field_type_nodes_arr;
                             }
                             if (self.sema_result) |sr| {
                                 if (self.adt_types.get(en.name)) |info| {

@@ -9,16 +9,16 @@
 
 // 测试 4：函数参数引用传递 + 回写
 import std.io.Console.{println}
-fun increment(r: &i32) {
+fun increment(r: &i32): void {
     *r = *r + 1
 }
 
 // 测试 5：通过引用累加
-fun add_n(r: &i32, n: i32) {
+fun add_n(r: &i32, n: i32): void {
     *r = *r + n
 }
 
-fun main() {
+fun main(): void {
     // 测试 1：标量取引用 + 解引用读取
     val a: i32 = 42
     val ra: &i32 = &a

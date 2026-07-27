@@ -1,103 +1,84 @@
 //! comptime 内置类型名注册表（ir 模块用）
 //!
-//! 从 ChanType 枚举 comptime 派生 name → ChanType 查找表，
+//! 从标量类型名派生 name → *const TypeDescriptor / IntKind / FloatKind 查找表，
 //! 消除 ir/ 中散落的 if-else 链（decl_collector/builder/expr_compiler）。
 //!
-//! 单一真相：ChanType 枚举字段名（去 `_chan` 后缀即为类型名）。
-//! 新增标量只需在 ChanType 追加 `xxx_chan`，本文件自动覆盖。
+//! 单一真相：type_descriptor.zig 的静态 TypeDescriptor 常量。
+//! 新增标量只需在 type_descriptor.zig 追加描述符，本文件自动覆盖。
 //!
-//! 注：sema/ 有独立的 builtin_types.zig（依赖 ScalarKind/builtin_type_descriptors），
-//! ir/ 不能依赖 sema/，故本文件从 ChanType 直接派生，两者数据一致。
+//! 注：chanTypeFromTypeNode 已统一委托 sema/type_resolver.resolveChanType。
+//! 本文件提供 intKindFromName/floatKindFromName/typeDescFromBuiltinName 等 ir 内部专用查询。
 
 const std = @import("std");
-const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const value = @import("value");
 
-const ChanType = channel_mod.ChanType;
+const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
 const IntKind = value.scalar.IntKind;
 const FloatKind = value.scalar.FloatKind;
 
-/// 内置类型名条目（comptime 从 ChanType 枚举派生）
+/// 内置类型名条目（comptime 从标量描述符表派生）
 const BuiltinNameEntry = struct {
     name: []const u8,
-    chan: ChanType,
+    type_desc: *const TypeDescriptor,
 };
 
-/// comptime 计算有效标量条目数（跳过 null_chan/mask_chan/nullable_chan）
-const SCALAR_COUNT = blk: {
-    const fields = std.meta.fields(ChanType);
-    var count: usize = 0;
-    for (fields) |field| {
-        const name = field.name;
-        if (std.mem.eql(u8, name, "null_chan")) continue;
-        if (std.mem.eql(u8, name, "mask_chan")) continue;
-        if (std.mem.eql(u8, name, "nullable_chan")) continue;
-        count += 1;
-    }
-    break :blk count;
-};
-
-/// comptime 构建：从 ChanType 枚举字段名去 `_chan` 后缀派生类型名
-/// 仅保留标量类型（跳过 null_chan/mask_chan/nullable_chan 等非类型名条目）
-const SCALAR_ENTRIES: [SCALAR_COUNT]BuiltinNameEntry = blk: {
-    const fields = std.meta.fields(ChanType);
-    var entries: [SCALAR_COUNT]BuiltinNameEntry = undefined;
-    var idx: usize = 0;
-    for (fields) |field| {
-        const chan: ChanType = @enumFromInt(field.value);
-        const name = field.name;
-        // 跳过非类型名条目
-        if (std.mem.eql(u8, name, "null_chan")) continue;
-        if (std.mem.eql(u8, name, "mask_chan")) continue;
-        if (std.mem.eql(u8, name, "nullable_chan")) continue;
-        // 去掉 `_chan` 后缀得到类型名
-        const type_name = name[0 .. name.len - 5];
-        entries[idx] = .{ .name = type_name, .chan = chan };
-        idx += 1;
+/// comptime 构建标量条目表（i8..char 共 18 种）
+const SCALAR_ENTRIES = blk: {
+    const descs = [_]struct { name: []const u8, desc: *const TypeDescriptor }{
+        .{ .name = "i8", .desc = type_descriptor_mod.i8_descriptor },
+        .{ .name = "i16", .desc = type_descriptor_mod.i16_descriptor },
+        .{ .name = "i32", .desc = type_descriptor_mod.i32_descriptor },
+        .{ .name = "i64", .desc = type_descriptor_mod.i64_descriptor },
+        .{ .name = "i128", .desc = type_descriptor_mod.i128_descriptor },
+        .{ .name = "u8", .desc = type_descriptor_mod.u8_descriptor },
+        .{ .name = "u16", .desc = type_descriptor_mod.u16_descriptor },
+        .{ .name = "u32", .desc = type_descriptor_mod.u32_descriptor },
+        .{ .name = "u64", .desc = type_descriptor_mod.u64_descriptor },
+        .{ .name = "u128", .desc = type_descriptor_mod.u128_descriptor },
+        .{ .name = "isize", .desc = type_descriptor_mod.isize_descriptor },
+        .{ .name = "usize", .desc = type_descriptor_mod.usize_descriptor },
+        .{ .name = "f16", .desc = type_descriptor_mod.f16_descriptor },
+        .{ .name = "f32", .desc = type_descriptor_mod.f32_descriptor },
+        .{ .name = "f64", .desc = type_descriptor_mod.f64_descriptor },
+        .{ .name = "f128", .desc = type_descriptor_mod.f128_descriptor },
+        .{ .name = "bool", .desc = type_descriptor_mod.bool_descriptor },
+        .{ .name = "char", .desc = type_descriptor_mod.char_descriptor },
+    };
+    var entries: [descs.len]BuiltinNameEntry = undefined;
+    for (descs, 0..) |d, i| {
+        entries[i] = .{ .name = d.name, .type_desc = d.desc };
     }
     break :blk entries;
 };
 
-/// 非标量内置类型（str 是堆引用，不在 ChanType 枚举中单独列出）
-const NON_SCALAR_BUILTINS = [_]BuiltinNameEntry{
-    .{ .name = "str", .chan = .ref_chan },
+/// 非标量内置类型（str 是堆引用，unit 是零字节类型）
+const NON_SCALAR_BUILTINS = [_]struct { name: []const u8, type_desc: *const TypeDescriptor }{
+    .{ .name = "str", .type_desc = type_descriptor_mod.ref_descriptor },
+    .{ .name = "void", .type_desc = type_descriptor_mod.unit_descriptor },
 };
 
-/// 内置类型名（标量 + str）→ ChanType，未匹配返回 null
-pub fn chanTypeFromBuiltinName(name: []const u8) ?ChanType {
+/// 内置类型名（标量 + str/unit）→ *const TypeDescriptor，未匹配返回 null
+pub fn typeDescFromBuiltinName(name: []const u8) ?*const TypeDescriptor {
     inline for (SCALAR_ENTRIES) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) return entry.chan;
+        if (std.mem.eql(u8, entry.name, name)) return entry.type_desc;
     }
     inline for (NON_SCALAR_BUILTINS) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) return entry.chan;
+        if (std.mem.eql(u8, entry.name, name)) return entry.type_desc;
     }
     return null;
 }
 
-/// 内置类型名（标量 + str）→ ChanType，未匹配返回 default（用户类型 → ref_chan）
-pub inline fn chanTypeFromNameWithDefault(name: []const u8, default: ChanType) ChanType {
-    return chanTypeFromBuiltinName(name) orelse default;
+/// 内置类型名（标量 + str/unit）→ *const TypeDescriptor，未匹配返回 default
+pub inline fn typeDescFromNameWithDefault(name: []const u8, default: *const TypeDescriptor) *const TypeDescriptor {
+    return typeDescFromBuiltinName(name) orelse default;
 }
 
 /// 标量名 → IntKind（非整数返回 null）
 pub fn intKindFromName(name: []const u8) ?IntKind {
     inline for (SCALAR_ENTRIES) |entry| {
         if (std.mem.eql(u8, entry.name, name)) {
-            return switch (entry.chan) {
-                .i8_chan => .i8,
-                .i16_chan => .i16,
-                .i32_chan => .i32,
-                .i64_chan => .i64,
-                .i128_chan => .i128,
-                .u8_chan => .u8,
-                .u16_chan => .u16,
-                .u32_chan => .u32,
-                .u64_chan => .u64,
-                .u128_chan => .u128,
-                .isize_chan => .isize,
-                .usize_chan => .usize,
-                else => null,
-            };
+            return entry.type_desc.toIntKind();
         }
     }
     return null;
@@ -107,29 +88,23 @@ pub fn intKindFromName(name: []const u8) ?IntKind {
 pub fn floatKindFromName(name: []const u8) ?FloatKind {
     inline for (SCALAR_ENTRIES) |entry| {
         if (std.mem.eql(u8, entry.name, name)) {
-            return switch (entry.chan) {
-                .f16_chan => .f16,
-                .f32_chan => .f32,
-                .f64_chan => .f64,
-                .f128_chan => .f128,
-                else => null,
-            };
+            return entry.type_desc.toFloatKind();
         }
     }
     return null;
 }
 
-test "builtin_type_names: chanTypeFromBuiltinName 覆盖标量 + str" {
-    try std.testing.expect(chanTypeFromBuiltinName("i8").? == .i8_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("u64").? == .u64_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("f64").? == .f64_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("bool").? == .bool_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("char").? == .char_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("str").? == .ref_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("unit").? == .unit_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("isize").? == .isize_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("usize").? == .usize_chan);
-    try std.testing.expect(chanTypeFromBuiltinName("not_a_type") == null);
+test "builtin_type_names: typeDescFromBuiltinName 覆盖标量 + str" {
+    try std.testing.expectEqual(type_descriptor_mod.i8_descriptor, typeDescFromBuiltinName("i8").?);
+    try std.testing.expectEqual(type_descriptor_mod.u64_descriptor, typeDescFromBuiltinName("u64").?);
+    try std.testing.expectEqual(type_descriptor_mod.f64_descriptor, typeDescFromBuiltinName("f64").?);
+    try std.testing.expectEqual(type_descriptor_mod.bool_descriptor, typeDescFromBuiltinName("bool").?);
+    try std.testing.expectEqual(type_descriptor_mod.char_descriptor, typeDescFromBuiltinName("char").?);
+    try std.testing.expectEqual(type_descriptor_mod.ref_descriptor, typeDescFromBuiltinName("str").?);
+    try std.testing.expectEqual(type_descriptor_mod.unit_descriptor, typeDescFromBuiltinName("void").?);
+    try std.testing.expectEqual(type_descriptor_mod.isize_descriptor, typeDescFromBuiltinName("isize").?);
+    try std.testing.expectEqual(type_descriptor_mod.usize_descriptor, typeDescFromBuiltinName("usize").?);
+    try std.testing.expect(typeDescFromBuiltinName("not_a_type") == null);
 }
 
 test "builtin_type_names: intKindFromName / floatKindFromName" {

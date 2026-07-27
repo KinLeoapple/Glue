@@ -2,7 +2,7 @@
 // Note: shift operands must have matching types; use explicit suffixes or typed vars.
 
 import std.io.Console.{println}
-fun main() {
+fun main(): void {
     // ---- all-zero and all-one patterns (use typed vars to avoid inference surprises) ----
     val zero: u8 = 0
     val ff: u8 = 0xFF

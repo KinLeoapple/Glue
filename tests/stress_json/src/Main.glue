@@ -204,7 +204,7 @@ fun parse(s: str): str {
     }
 }
 
-fun main() {
+fun main(): void {
     // 基本值
     println(parse("null"))                          // null
     println(parse("true"))                          // true

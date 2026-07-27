@@ -78,16 +78,9 @@ const WalkCtx = struct {
 };
 
 /// 由 ExprInfo 推导对应的 TypeDescriptor（用于隐式 type_args 推断）
-/// - 内置标量：lookupBuiltinByChan 反查
-/// - null / unit：专用描述符
-/// - ref / mask / nullable：统一退化为 ref_type_descriptor
+/// ExprInfo.type_desc 已是 TypeDescriptor，直接返回
 fn tdFromExprInfo(info: ExprInfo) *const TypeDescriptor {
-    if (type_descriptor_mod.lookupBuiltinByChan(info.chan_type)) |td| return td;
-    return switch (info.chan_type) {
-        .null_chan => &type_resolver.null_type_descriptor,
-        .unit_chan => &type_resolver.unit_type_descriptor,
-        else => &type_resolver.ref_type_descriptor,
-    };
+    return info.type_desc;
 }
 
 /// 由 AST 类型节点推导 TypeDescriptor（用于显式 type_args）
@@ -234,7 +227,7 @@ fn getOrCreateInstance(
 
     // 5. 递归解析函数体类型（可能触发前向引用，此时返回预分配的 instance_id）
     //    替代 IRBuilder 的 infer* 系列函数（变量绑定回溯 + 泛型字段访问）
-    resolveInstanceBodyTypes(&instance, fd, ctx) catch {};
+    try resolveInstanceBodyTypes(&instance, fd, ctx);
 
     try ctx.sema_result.monomorph_instances.append(ctx.sema_result.allocator, instance);
 
@@ -564,15 +557,18 @@ pub fn collectMonomorphInstances(
                         .field_accesses = std.AutoHashMap(u64, FieldAccessInfo).init(sema_result.allocator),
                     };
                     try sema_result.monomorph_instances.append(sema_result.allocator, instance);
-                }
 
-                // 所有函数（泛型/非泛型）：遍历函数体收集泛型调用点
-                try walkExpr(fd.body, &ctx);
+                    // 非泛型函数：遍历函数体收集泛型调用点
+                    // （泛型函数体的调用点在 resolveInstanceBodyTypes 中发现，
+                    //  因为它们依赖当前实例的 type_args 上下文才能正确推断类型实参）
+                    try walkExpr(fd.body, &ctx);
+                }
             },
 
-            // 类型声明：遍历方法体（方法可能调用泛型函数）
+            // 类型声明：遍历非泛型方法体（泛型方法体在实例化时发现）
             .type_decl => |td| {
                 for (td.methods) |method| {
+                    if (method.type_params.len > 0) continue; // 跳过泛型方法体
                     if (method.body) |body| try walkExpr(body, &ctx);
                 }
             },
@@ -612,8 +608,12 @@ const ResolveCtx = struct {
     bindings: std.ArrayList(std.StringHashMap(LocalBinding)),
     /// 类型参数名 → type_args 索引（快速查找）
     type_param_map: std.StringHashMap(u16),
+    /// WalkCtx 引用：用于在函数体内发现泛型调用点时创建实例
+    /// （泛型函数体内的调用依赖当前实例的 type_args 上下文，
+    /// 顶层 walk 无法正确推断，故在 resolveInstanceBodyTypes 中发现并创建）
+    walk_ctx: *WalkCtx,
 
-    fn init(allocator: std.mem.Allocator, instance: *MonomorphInstance, sema_result: *SemaResult, fd: anytype) !ResolveCtx {
+    fn init(allocator: std.mem.Allocator, instance: *MonomorphInstance, sema_result: *SemaResult, fd: anytype, walk_ctx: *WalkCtx) !ResolveCtx {
         var ctx = ResolveCtx{
             .instance = instance,
             .sema_result = sema_result,
@@ -621,6 +621,7 @@ const ResolveCtx = struct {
             .allocator = allocator,
             .bindings = .empty,
             .type_param_map = std.StringHashMap(u16).init(allocator),
+            .walk_ctx = walk_ctx,
         };
         // 构建类型参数名 → 索引映射
         for (fd.type_params, 0..) |tp, i| {
@@ -672,7 +673,7 @@ fn resolveInstanceBodyTypes(
     fd: anytype,
     ctx: *WalkCtx,
 ) ResolveError!void {
-    var rctx = try ResolveCtx.init(ctx.sema_result.allocator, instance, ctx.sema_result, fd);
+    var rctx = try ResolveCtx.init(ctx.sema_result.allocator, instance, ctx.sema_result, fd, ctx);
     defer rctx.deinit();
 
     // 注册函数参数到变量绑定
@@ -686,16 +687,129 @@ fn resolveInstanceBodyTypes(
     }
 
     // 遍历函数体
-    resolveExpr(fd.body, &rctx) catch {};
+    try resolveExpr(fd.body, &rctx);
+}
+
+/// 在函数体内发现泛型调用点时，用当前实例的 type_args 上下文推断 type_args 并创建实例
+///
+/// 与顶层 processCall 的区别：
+/// - 顶层 processCall 依赖 sema_result.expr_types（HM 推断产出），无法解析类型参数 T
+/// - 此函数用 resolveExprType 递归解析实参类型，能利用当前实例的 type_args 将 T 解析为具体类型
+fn processCallInBody(
+    func_name: []const u8,
+    arguments: []const *const ast.Expr,
+    type_args_hint: ?[]*ast.TypeNode,
+    call_expr: *const ast.Expr,
+    ctx: *ResolveCtx,
+) ResolveError!void {
+    const sig = ctx.sema_result.getFuncSig(func_name) orelse return;
+    if (sig.type_params.len == 0) return; // 非泛型函数，无需单态化
+
+    const fd_decl = ctx.walk_ctx.func_decls.get(func_name) orelse return;
+
+    const type_args = try inferTypeArgsInBody(func_name, arguments, type_args_hint, sig, fd_decl, ctx);
+
+    // 查找或创建实例（getOrCreateInstance 在缓存命中时不释放 type_args，需手动处理）
+    const existing_id = findInstance(ctx.sema_result, func_name, type_args);
+    if (existing_id) |id| {
+        // 缓存命中：type_args 不被实例拥有，需释放
+        ctx.sema_result.allocator.free(type_args);
+        try ctx.sema_result.call_instantiations.put(@intFromPtr(call_expr), id);
+        return;
+    }
+
+    const instance_id = getOrCreateInstance(func_name, type_args, fd_decl, ctx.walk_ctx) catch return;
+    try ctx.sema_result.call_instantiations.put(@intFromPtr(call_expr), instance_id);
+}
+
+/// 在实例体上下文中推断 type_args
+///
+/// 与顶层 inferTypeArgs 的区别：
+/// - 显式类型实参：用当前实例的 type_args 解析类型参数 T（而非空 type_args）
+/// - 隐式推断：用 resolveExprType 递归解析实参类型（而非 sema_result.expr_types）
+fn inferTypeArgsInBody(
+    func_name: []const u8,
+    arguments: []const *const ast.Expr,
+    type_args_hint: ?[]*ast.TypeNode,
+    sig: FuncSigInfo,
+    fd_decl: *const ast.Decl,
+    ctx: *ResolveCtx,
+) ![]const TypeDescriptor {
+    const alloc = ctx.sema_result.allocator;
+
+    // 1. 显式类型实参：用当前实例的 type_args 解析（支持 foo<T>(x) 中 T 为外层类型参数）
+    if (type_args_hint) |hints| {
+        if (hints.len > 0) {
+            const args = try alloc.alloc(TypeDescriptor, hints.len);
+            for (hints, 0..) |tn, i| {
+                args[i] = if (type_resolver.resolveTypeNode(tn, ctx.type_args)) |td| td.* else type_resolver.ref_type_descriptor;
+            }
+            return args;
+        }
+    }
+
+    // 2. 隐式推断：匹配参数类型注解中的类型参数名与实参类型
+    std.debug.assert(fd_decl.* == .fun_decl);
+    const fd = &fd_decl.fun_decl;
+
+    var name_to_td = std.StringHashMap(*const TypeDescriptor).init(alloc);
+    defer name_to_td.deinit();
+
+    const param_count = @min(fd.params.len, arguments.len);
+    for (0..param_count) |i| {
+        const param_type = fd.params[i].type_annotation orelse continue;
+        if (param_type.* != .named) continue;
+        const pname = param_type.named.name;
+
+        // 确认 pname 是类型参数
+        var is_type_param = false;
+        for (sig.type_params) |tp_name| {
+            if (std.mem.eql(u8, tp_name, pname)) {
+                is_type_param = true;
+                break;
+            }
+        }
+        if (!is_type_param) continue;
+        if (name_to_td.contains(pname)) continue;
+
+        // 用 resolveExprType 递归解析实参类型（利用当前实例的 type_args）
+        const arg_td = resolveExprType(arguments[i], ctx) orelse continue;
+        try name_to_td.put(pname, arg_td);
+    }
+
+    _ = func_name;
+    // 按 sig.type_params 顺序输出 TypeDescriptor
+    const args = try alloc.alloc(TypeDescriptor, sig.type_params.len);
+    for (sig.type_params, 0..) |tp_name, i| {
+        args[i] = if (name_to_td.get(tp_name)) |td| td.* else type_resolver.ref_type_descriptor;
+    }
+    return args;
 }
 
 /// 解析表达式类型并存入实例表
 fn resolveExpr(expr: *const ast.Expr, ctx: *ResolveCtx) ResolveError!void {
+    // 对调用表达式：先发现并创建被调用函数的实例（填充 call_instantiations），
+    // 再计算返回类型（resolveExprType 的 .call 分支会查询 call_instantiations）
+    switch (expr.*) {
+        .call => |c| {
+            if (c.callee.* == .identifier) {
+                processCallInBody(c.callee.identifier.name, c.arguments, c.type_args, expr, ctx) catch {};
+            }
+        },
+        .method_call => |mc| {
+            processCallInBody(mc.method, mc.arguments, mc.type_args, expr, ctx) catch {};
+        },
+        .safe_method_call => |smc| {
+            processCallInBody(smc.method, smc.arguments, smc.type_args, expr, ctx) catch {};
+        },
+        else => {},
+    }
+
     const td = resolveExprType(expr, ctx) orelse &type_resolver.ref_type_descriptor;
 
     // 存入实例本地表达式类型表
     try ctx.instance.expr_types.put(@intFromPtr(expr), .{
-        .chan_type = td.chan,
+        .type_desc = td,
         .type_name = td.type_name,
         .is_ref_type = td.is_ref,
     });
@@ -712,15 +826,13 @@ fn resolveExpr(expr: *const ast.Expr, ctx: *ResolveCtx) ResolveError!void {
                 // 查询字段类型
                 if (ctx.sema_result.getCtorDef(obj_td.type_name)) |ctor| {
                     const idx = field_id;
-                    if (idx > 0 and idx - 1 < ctor.field_chan_types.len) {
-                        const field_ct = ctor.field_chan_types[idx - 1];
-                        if (type_descriptor_mod.lookupBuiltinByChan(field_ct)) |field_td| {
-                            try ctx.instance.field_accesses.put(@intFromPtr(expr), .{
-                                .obj_type_desc = obj_td,
-                                .field_idx = field_id,
-                                .field_type_desc = field_td,
-                            });
-                        }
+                    if (idx > 0 and idx - 1 < ctor.field_type_descs.len) {
+                        const field_td = ctor.field_type_descs[idx - 1];
+                        try ctx.instance.field_accesses.put(@intFromPtr(expr), .{
+                            .obj_type_desc = obj_td,
+                            .field_idx = field_id,
+                            .field_type_desc = field_td,
+                        });
                     }
                 }
             }
@@ -788,7 +900,7 @@ fn resolveExpr(expr: *const ast.Expr, ctx: *ResolveCtx) ResolveError!void {
                 try ctx.pushScope();
                 defer ctx.popScope();
                 // 注册 pattern 绑定
-                resolvePattern(arm.pattern, ctx) catch {};
+                try resolvePattern(arm.pattern, ctx);
                 try resolveExpr(arm.body, ctx);
             }
         },
@@ -886,16 +998,16 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
             if (il.suffix) |s| {
                 if (type_resolver.resolveTypeNode(&.{ .named = .{ .name = s } }, ctx.type_args)) |td| return td;
             }
-            return type_descriptor_mod.builtin_type_descriptors.getPtrConst(.i32);
+            return type_descriptor_mod.lookupByScalarKind(.i32);
         },
         .float_literal => |fl| {
             if (fl.suffix) |s| {
                 if (type_resolver.resolveTypeNode(&.{ .named = .{ .name = s } }, ctx.type_args)) |td| return td;
             }
-            return type_descriptor_mod.builtin_type_descriptors.getPtrConst(.f64);
+            return type_descriptor_mod.lookupByScalarKind(.f64);
         },
-        .bool_literal => return type_descriptor_mod.builtin_type_descriptors.getPtrConst(.bool),
-        .char_literal => return type_descriptor_mod.builtin_type_descriptors.getPtrConst(.char),
+        .bool_literal => return type_descriptor_mod.lookupByScalarKind(.bool),
+        .char_literal => return type_descriptor_mod.lookupByScalarKind(.char),
         .string_literal, .string_interpolation => return &type_resolver.ref_type_descriptor,
         .null_literal => return &type_resolver.null_type_descriptor,
         .unit_literal => return &type_resolver.unit_type_descriptor,
@@ -908,8 +1020,7 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
             if (ctx.lookupVar(id.name)) |td| return td;
             // 3. 查 sema_result.expr_types
             if (ctx.sema_result.getExpr(@intFromPtr(expr))) |info| {
-                if (type_descriptor_mod.lookupBuiltinByChan(info.chan_type)) |td| return td;
-                return &type_resolver.ref_type_descriptor;
+                return info.type_desc;
             }
             return null;
         },
@@ -918,9 +1029,8 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
             const obj_td = resolveExprType(fa.object, ctx) orelse return null;
             if (ctx.sema_result.lookupFieldId(obj_td.type_name, fa.field)) |field_id| {
                 if (ctx.sema_result.getCtorDef(obj_td.type_name)) |ctor| {
-                    if (field_id > 0 and field_id - 1 < ctor.field_chan_types.len) {
-                        const field_ct = ctor.field_chan_types[field_id - 1];
-                        if (type_descriptor_mod.lookupBuiltinByChan(field_ct)) |field_td| return field_td;
+                    if (field_id > 0 and field_id - 1 < ctor.field_type_descs.len) {
+                        return ctor.field_type_descs[field_id - 1];
                     }
                 }
             }
@@ -929,17 +1039,33 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
         .call => |c| {
             if (c.callee.* == .identifier) {
                 // 构造器调用：返回构造器的类型名
-                if (ctx.sema_result.getCtorDef(c.callee.identifier.name)) |ctor| {
-                    if (type_descriptor_mod.lookupBuiltinByChan(ctor.field_chan_types[0])) |_| {
-                        // 标量 newtype：返回内部标量类型
+                if (ctx.sema_result.getCtorDef(c.callee.identifier.name)) |_| {
+                    return &type_resolver.ref_type_descriptor;
+                }
+                // 优先查询 call_instantiations：泛型调用点已由 processCallInBody 创建实例
+                // 实例的 return_type 用具体 type_args 解析，避免 sig.return_type_desc 的 ref_chan 回退
+                if (ctx.sema_result.call_instantiations.get(@intFromPtr(expr))) |instance_id| {
+                    if (instance_id < ctx.sema_result.monomorph_instances.items.len) {
+                        return ctx.sema_result.monomorph_instances.items[instance_id].return_type;
                     }
-                    return &type_resolver.ref_type_descriptor;
                 }
-                // 普通函数调用：查返回类型
+                // 非泛型函数或未命中：查 sig.return_type_desc
                 if (ctx.sema_result.getFuncSig(c.callee.identifier.name)) |sig| {
-                    if (type_descriptor_mod.lookupBuiltinByChan(sig.return_chan_type)) |td| return td;
-                    return &type_resolver.ref_type_descriptor;
+                    return sig.return_type_desc;
                 }
+            }
+            return &type_resolver.ref_type_descriptor;
+        },
+        .method_call, .safe_method_call => {
+            // 查询 call_instantiations（processCallInBody 已为泛型方法调用创建实例）
+            if (ctx.sema_result.call_instantiations.get(@intFromPtr(expr))) |instance_id| {
+                if (instance_id < ctx.sema_result.monomorph_instances.items.len) {
+                    return ctx.sema_result.monomorph_instances.items[instance_id].return_type;
+                }
+            }
+            // 未命中：回退到 sema_result.expr_types
+            if (ctx.sema_result.getExpr(@intFromPtr(expr))) |info| {
+                return info.type_desc;
             }
             return &type_resolver.ref_type_descriptor;
         },
@@ -951,8 +1077,7 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
         else => {
             // 其他表达式：回退到 sema_result.expr_types
             if (ctx.sema_result.getExpr(@intFromPtr(expr))) |info| {
-                if (type_descriptor_mod.lookupBuiltinByChan(info.chan_type)) |td| return td;
-                return &type_resolver.ref_type_descriptor;
+                return info.type_desc;
             }
             return null;
         },

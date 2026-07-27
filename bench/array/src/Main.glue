@@ -68,7 +68,7 @@ fun buildIdentity(n: i32): Matrix {
     Matrix(rows)
 }
 
-fun main() {
+fun main(): void {
     // ---- 构造 20000 元素数组 ----
     val arr = buildArray(20000)
     println(cast(arr.len()).to(i64))   // 20000

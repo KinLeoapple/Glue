@@ -33,7 +33,6 @@ pub const LoopKind = meta_mod.LoopKind;
 pub const ClosureMeta = meta_mod.ClosureMeta;
 pub const PartialMeta = meta_mod.PartialMeta;
 pub const SyscallMeta = meta_mod.SyscallMeta;
-pub const ChanType = channel_mod.ChanType;
 pub const ChannelMeta = channel_mod.ChannelMeta;
 pub const ChannelSpace = channel_mod.ChannelSpace;
 pub const TypeMetadata = meta_mod.TypeMetadata;

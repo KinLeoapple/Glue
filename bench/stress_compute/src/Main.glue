@@ -129,7 +129,7 @@ fun mergeSort(arr: i64[]): i64[] {
     merge(mergeSort(left), mergeSort(right))
 }
 
-fun main() {
+fun main(): void {
     // --- 嵌套循环 4000x4000 = 16M 次内层迭代 ---
     println(nestedLoop(4000))
 

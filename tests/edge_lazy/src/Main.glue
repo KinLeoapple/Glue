@@ -12,7 +12,7 @@ fun makeLazy(): Lazy<i32> {
     lazy expensive(7)
 }
 
-fun main() {
+fun main(): void {
     // 1. 创建时不求值
     val lz = lazy expensive(5)
     println("created")

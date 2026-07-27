@@ -108,7 +108,7 @@ pub const Methods = struct {
     /// 构造占位 TypeInfo Value（不写入通道，返回 Value）
     pub fn makePlaceholderTypeInfoValue(self: *Engine, name: []const u8) EngineError!value.Value {
         const tctx = self.tctx.?;
-        const unit_rec = value.Value.makeRecord(tctx, "Unit", &.{}) catch return error.OutOfMemory;
+        const unit_rec = value.Value.makeRecord(tctx, "Void", &.{}) catch return error.OutOfMemory;
         try self.trackObj(unit_rec.asRef());
 
         var field_buf: [7]value.Value = undefined;
@@ -187,9 +187,9 @@ pub const Methods = struct {
             // 1: module
             value.Value.fromStringBytes(tctx, "") catch return error.OutOfMemory,
             // 2: kind (TypeKind 构造器名)
-            value.Value.fromStringBytes(tctx, "Unit") catch return error.OutOfMemory,
+            value.Value.fromStringBytes(tctx, "Void") catch return error.OutOfMemory,
             // 3: structure (TypeStructure.Unit，空 RecordValue)
-            value.Value.makeRecord(tctx, "Unit", &.{}) catch return error.OutOfMemory,
+            value.Value.makeRecord(tctx, "Void", &.{}) catch return error.OutOfMemory,
             // 4: layout (LayoutInfo{0, 0})
             self.makeLayoutInfoRecord(.{ .size = 0, .alignment = 0 }) catch return error.OutOfMemory,
             // 5: impls (empty TraitImplInfo)
@@ -325,7 +325,7 @@ pub const Methods = struct {
                 return rec;
             },
             .unit => {
-                const rec = try value.Value.makeRecord(tctx, "Unit", &.{});
+                const rec = try value.Value.makeRecord(tctx, "Void", &.{});
                 try self.trackObj(rec.asRef());
                 return rec;
             },
@@ -350,8 +350,8 @@ pub const Methods = struct {
             var placeholder_fields = [_]value.Value{
                 value.Value.fromStringBytes(tctx, placeholder_name) catch return error.OutOfMemory,
                 value.Value.fromStringBytes(tctx, "") catch return error.OutOfMemory,
-                value.Value.fromStringBytes(tctx, "Unit") catch return error.OutOfMemory,
-                value.Value.makeRecord(tctx, "Unit", &.{}) catch return error.OutOfMemory,
+                value.Value.fromStringBytes(tctx, "Void") catch return error.OutOfMemory,
+                value.Value.makeRecord(tctx, "Void", &.{}) catch return error.OutOfMemory,
                 self.makeLayoutInfoRecord(.{ .size = 0, .alignment = 0 }) catch return error.OutOfMemory,
                 self.makeEmptyTraitImplInfoRecord() catch return error.OutOfMemory,
                 value.Value.makeArray(tctx, &.{}, null) catch return error.OutOfMemory,

@@ -1,7 +1,7 @@
 // Edge cases: arithmetic, integer widths, overflow boundaries, conversions
 
 import std.io.Console.{println}
-fun main() {
+fun main(): void {
     // ---- signed min/max boundaries per width ----
     println(127i8)
     println(-128i8)

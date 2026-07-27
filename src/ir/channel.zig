@@ -8,108 +8,18 @@
 //! 通道数据存储复用 src/mem/ChannelRegion（执行引擎阶段）
 
 const std = @import("std");
-const scalar = @import("value").scalar;
-
-/// 通道类型：决定通道的数据宽度与存储方式
-///
-/// 复用 value.scalar 的 IntKind/FloatKind，避免重复定义。
-pub const ChanType = enum(u5) {
-    // 整数（10 种）
-    i8_chan, i16_chan, i32_chan, i64_chan, i128_chan,
-    u8_chan, u16_chan, u32_chan, u64_chan, u128_chan,
-    // 平台相关整数（2 种）
-    isize_chan, usize_chan,
-    // 浮点（4 种）
-    f16_chan, f32_chan, f64_chan, f128_chan,
-    // 其他标量
-    bool_chan, char_chan, null_chan, unit_chan,
-    // 堆引用与谓词
-    ref_chan, mask_chan,
-    // Nullable<T>
-    nullable_chan,
-
-    /// 通道类型 → 元素字节宽度
-    pub fn elemWidth(self: ChanType) u8 {
-        return switch (self) {
-            .null_chan, .unit_chan, .nullable_chan => 0,
-            .i8_chan, .u8_chan, .bool_chan, .mask_chan => 1,
-            .i16_chan, .u16_chan, .f16_chan => 2,
-            .i32_chan, .u32_chan, .f32_chan, .char_chan => 4,
-            .i64_chan, .u64_chan, .f64_chan, .ref_chan => 8,
-            .isize_chan, .usize_chan => @sizeOf(isize),
-            .i128_chan, .u128_chan, .f128_chan => 16,
-        };
-    }
-
-    /// 是否为整数通道
-    pub fn isInt(self: ChanType) bool {
-        return switch (self) {
-            .i8_chan, .i16_chan, .i32_chan, .i64_chan, .i128_chan,
-            .u8_chan, .u16_chan, .u32_chan, .u64_chan, .u128_chan,
-            .isize_chan, .usize_chan => true,
-            else => false,
-        };
-    }
-
-    /// 是否为浮点通道
-    pub fn isFloat(self: ChanType) bool {
-        return switch (self) {
-            .f16_chan, .f32_chan, .f64_chan, .f128_chan => true,
-            else => false,
-        };
-    }
-
-    /// IntKind → ChanType
-    pub fn fromIntKind(kind: scalar.IntKind) ChanType {
-        return switch (kind) {
-            .i8 => .i8_chan, .i16 => .i16_chan, .i32 => .i32_chan, .i64 => .i64_chan, .i128 => .i128_chan,
-            .u8 => .u8_chan, .u16 => .u16_chan, .u32 => .u32_chan, .u64 => .u64_chan, .u128 => .u128_chan,
-            .isize => .isize_chan, .usize => .usize_chan,
-        };
-    }
-
-    /// FloatKind → ChanType
-    pub fn fromFloatKind(kind: scalar.FloatKind) ChanType {
-        return switch (kind) {
-            .f16 => .f16_chan, .f32 => .f32_chan, .f64 => .f64_chan, .f128 => .f128_chan,
-        };
-    }
-
-    /// ChanType → IntKind（非整数通道返回 null）
-    pub fn toIntKind(self: ChanType) ?scalar.IntKind {
-        return switch (self) {
-            .i8_chan => .i8, .i16_chan => .i16, .i32_chan => .i32, .i64_chan => .i64, .i128_chan => .i128,
-            .u8_chan => .u8, .u16_chan => .u16, .u32_chan => .u32, .u64_chan => .u64, .u128_chan => .u128,
-            .isize_chan => .isize, .usize_chan => .usize,
-            else => null,
-        };
-    }
-
-    /// ChanType → FloatKind（非浮点通道返回 null）
-    pub fn toFloatKind(self: ChanType) ?scalar.FloatKind {
-        return switch (self) {
-            .f16_chan => .f16, .f32_chan => .f32, .f64_chan => .f64, .f128_chan => .f128,
-            else => null,
-        };
-    }
-};
-
-/// Nullable<T> 通道元素字节宽度 = inner_width + 1（1 byte null 标志）
-pub inline fn nullableElemWidth(inner: ChanType) u8 {
-    return inner.elemWidth() + 1;
-}
+const type_descriptor_mod = @import("type_descriptor.zig");
 
 /// 通道元信息：描述单个通道的类型与宽度
 pub const ChannelMeta = struct {
-    chan_type: ChanType,
-    elem_width: u8, // 元素字节宽度（0 表示无数据通道）
-    /// nullable_chan 时的内部类型（其他通道为 .null_chan）
-    inner_type: ChanType = .null_chan,
+    /// 元素字节宽度（0 表示无数据通道）
+    elem_width: u8,
+    /// nullable 通道的内部类型（其他通道为 null）
+    inner_type_desc: ?*const type_descriptor_mod.TypeDescriptor = null,
     /// 是否为 Cell 包装通道（var 变量用，支持后续赋值）
     is_cell: bool = false,
-    /// 通道是否为 &T / *T 引用类型（ref_chan 时有效）。
-    /// 用于运行时判断值语义：普通复合类型 ref_chan 需深拷贝，引用类型保持共享。
-    is_ref: bool = false,
+    /// 统一类型描述符：唯一类型来源（is_ref 等类型信息从 type_desc 获取）
+    type_desc: *const type_descriptor_mod.TypeDescriptor = undefined,
 };
 
 /// 通道空间：管理全局通道索引的分配
@@ -137,34 +47,36 @@ pub const ChannelSpace = struct {
     }
 
     /// 分配一个新通道，返回其全局索引
-    pub fn alloc(self: *ChannelSpace, chan_type: ChanType) !u16 {
-        return self.allocInner(chan_type, .null_chan, false, false);
+    pub fn alloc(self: *ChannelSpace, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.allocInner(type_desc, null, false);
     }
 
     /// 分配一个引用类型通道（&T / *T）
-    pub fn allocRef(self: *ChannelSpace, chan_type: ChanType) !u16 {
-        return self.allocInner(chan_type, .null_chan, false, true);
+    pub fn allocRef(self: *ChannelSpace, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.allocInner(type_desc, null, false);
     }
 
     /// 分配一个 Cell 通道（var 变量用）
-    pub fn allocCell(self: *ChannelSpace, chan_type: ChanType) !u16 {
-        return self.allocInner(chan_type, .null_chan, true, false);
+    pub fn allocCell(self: *ChannelSpace, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.allocInner(type_desc, null, true);
     }
 
     /// 分配一个 Nullable 通道
-    pub fn allocNullable(self: *ChannelSpace, inner_type: ChanType) !u16 {
-        return self.allocInner(.nullable_chan, inner_type, false, false);
+    pub fn allocNullable(self: *ChannelSpace, inner_type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.allocInner(type_descriptor_mod.nullable_descriptor, inner_type_desc, false);
     }
 
-    fn allocInner(self: *ChannelSpace, chan_type: ChanType, inner_type: ChanType, is_cell: bool, is_ref: bool) !u16 {
+    fn allocInner(self: *ChannelSpace, type_desc: *const type_descriptor_mod.TypeDescriptor, inner_type_desc: ?*const type_descriptor_mod.TypeDescriptor, is_cell: bool) !u16 {
         const idx: u16 = @intCast(self.metas.items.len);
-        const elem_w = if (chan_type == .nullable_chan) nullableElemWidth(inner_type) else chan_type.elemWidth();
+        const elem_w: u8 = if (type_desc.is_nullable) blk: {
+            const inner = inner_type_desc orelse type_descriptor_mod.null_descriptor;
+            break :blk inner.size + 1;
+        } else type_desc.size;
         try self.metas.append(self.allocator, .{
-            .chan_type = chan_type,
             .elem_width = elem_w,
-            .inner_type = inner_type,
+            .inner_type_desc = inner_type_desc,
             .is_cell = is_cell,
-            .is_ref = is_ref,
+            .type_desc = type_desc,
         });
         return idx;
     }
@@ -191,41 +103,20 @@ pub const ChannelSpace = struct {
 
 const testing = std.testing;
 
-test "ChanType.elemWidth" {
-    try testing.expectEqual(@as(u8, 1), ChanType.i8_chan.elemWidth());
-    try testing.expectEqual(@as(u8, 4), ChanType.i32_chan.elemWidth());
-    try testing.expectEqual(@as(u8, 8), ChanType.i64_chan.elemWidth());
-    try testing.expectEqual(@as(u8, 16), ChanType.i128_chan.elemWidth());
-    try testing.expectEqual(@as(u8, 0), ChanType.unit_chan.elemWidth());
-}
-
-test "ChanType.isInt/isFloat" {
-    try testing.expect(ChanType.i32_chan.isInt());
-    try testing.expect(!ChanType.f32_chan.isInt());
-    try testing.expect(ChanType.f64_chan.isFloat());
-    try testing.expect(!ChanType.bool_chan.isFloat());
-}
-
-test "ChanType.fromIntKind/toIntKind 往返" {
-    try testing.expectEqual(ChanType.i32_chan, ChanType.fromIntKind(.i32));
-    try testing.expectEqual(scalar.IntKind.u64, ChanType.u64_chan.toIntKind().?);
-    try testing.expect(ChanType.bool_chan.toIntKind() == null);
-}
-
 test "ChannelSpace 分配与查询" {
     var cs = ChannelSpace.init(testing.allocator);
     defer cs.deinit();
 
-    const ch0 = try cs.alloc(.i64_chan);
-    const ch1 = try cs.alloc(.i32_chan);
-    const ch2 = try cs.alloc(.bool_chan);
+    const ch0 = try cs.alloc(type_descriptor_mod.i64_descriptor);
+    const ch1 = try cs.alloc(type_descriptor_mod.i32_descriptor);
+    const ch2 = try cs.alloc(type_descriptor_mod.bool_descriptor);
 
     try testing.expectEqual(@as(u16, 0), ch0);
     try testing.expectEqual(@as(u16, 1), ch1);
     try testing.expectEqual(@as(u16, 2), ch2);
     try testing.expectEqual(@as(u16, 3), cs.count());
 
-    try testing.expectEqual(ChanType.i64_chan, cs.get(ch0).chan_type);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, cs.get(ch0).type_desc);
     try testing.expectEqual(@as(u8, 8), cs.get(ch0).elem_width);
     try testing.expectEqual(@as(u8, 4), cs.get(ch1).elem_width);
 }
@@ -234,11 +125,11 @@ test "ChannelSpace.allocCell 与 allocNullable" {
     var cs = ChannelSpace.init(testing.allocator);
     defer cs.deinit();
 
-    const ch = try cs.allocCell(.i32_chan);
+    const ch = try cs.allocCell(type_descriptor_mod.i32_descriptor);
     try testing.expect(cs.get(ch).is_cell);
 
-    const nch = try cs.allocNullable(.i64_chan);
-    try testing.expectEqual(ChanType.nullable_chan, cs.get(nch).chan_type);
-    try testing.expectEqual(ChanType.i64_chan, cs.get(nch).inner_type);
+    const nch = try cs.allocNullable(type_descriptor_mod.i64_descriptor);
+    try testing.expectEqual(type_descriptor_mod.nullable_descriptor, cs.get(nch).type_desc);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, cs.get(nch).inner_type_desc.?);
     try testing.expectEqual(@as(u8, 9), cs.get(nch).elem_width); // 8 + 1
 }

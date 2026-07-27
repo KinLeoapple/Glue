@@ -21,7 +21,7 @@ fun eval_expr<T>(expr: Expr<T>) : T {
     }
 }
 
-fun main() {
+fun main(): void {
     // Add: (3 + 4) = 7
     println(eval_expr(Add(IntLit(3), IntLit(4))))
 

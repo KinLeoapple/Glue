@@ -89,7 +89,7 @@ fun literal(s: str): Regex {
 
 fun yn(b: bool): str { if b { "yes" } else { "no" } }
 
-fun main() {
+fun main(): void {
     // 字面串 "abc"
     val abc = literal("abc")
     println(yn(fullMatch(abc, "abc")))      // yes

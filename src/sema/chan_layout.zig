@@ -65,7 +65,7 @@ pub fn deriveChanLayout(
     };
 }
 
-/// 便捷方法：从 ChanType 列表推导布局
+/// 便捷方法：从 TypeDescriptor 列表推导布局
 /// 适用于 IRBuilder 已有 ChannelSpace 通道元信息的场景
 pub fn deriveChanLayoutFromMetas(
     allocator: std.mem.Allocator,

@@ -5,7 +5,7 @@
 import std.time.Calendar
 import std.io.Console.{println}
 
-fun main() {
+fun main(): void {
     // ── 闰年判定 ───────────────────────────────────────────────
     println(Calendar.is_leap_year(2024))   // true
     println(std.time.Calendar.is_leap_year(2023))   // false

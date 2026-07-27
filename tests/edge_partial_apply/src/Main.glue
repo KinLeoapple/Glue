@@ -23,7 +23,7 @@ fun greetOr(name: str?): str { name ?? "unknown" }
 
 fun makeAddN(n: i32): (i32) -> i32 { addTwo(n) }
 
-fun main() {
+fun main(): void {
     // ---- 基本部分应用 ----
     val f1 = add3(1)
     println(f1(2, 3))               // 6

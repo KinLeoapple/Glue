@@ -22,6 +22,7 @@ const std = @import("std");
 const meta_mod = @import("meta.zig");
 const node_mod = @import("node.zig");
 const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const CoroutineMeta = meta_mod.CoroutineMeta;
 const SegmentDesc = meta_mod.SegmentDesc;
 const SuspendKind = meta_mod.SuspendKind;
@@ -170,7 +171,7 @@ pub fn buildFrameLayout(
         slots[i] = .{
             .offset = offset,
             .size = cm.elem_width,
-            .is_ref = cm.is_ref,
+            .is_ref = cm.type_desc.is_ref,
         };
     }
 
@@ -473,8 +474,8 @@ test "buildFrameLayout 单参数函数" {
     var channels = ChannelSpace.init(testing.allocator);
     defer channels.deinit();
 
-    const param_chan = try channels.alloc(.i64_chan);
-    const ret_chan = try channels.alloc(.i64_chan);
+    const param_chan = try channels.alloc(type_descriptor_mod.i64_descriptor);
+    const ret_chan = try channels.alloc(type_descriptor_mod.i64_descriptor);
 
     const func = Function{
         .name = "test",

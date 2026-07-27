@@ -51,7 +51,7 @@ type Pt: (Sizeable, Show) = Pt(x: i32, y: i32) {
     }
 }
 
-fun main() {
+fun main(): void {
     // 默认方法（trait 提供默认实现，type 不覆盖即可用）
     println(Lt.hello())   // Hello, less
     println(Eq.hello())   // Hello, equal

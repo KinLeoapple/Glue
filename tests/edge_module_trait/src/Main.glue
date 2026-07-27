@@ -4,17 +4,17 @@ import Store
 import std.io.Console.{println}
 
 trait KVStore {
-    fun put(key: str, value: str): Unit
+    fun put(key: str, value: str): void
     fun get(key: str): str
 }
 
 // 一等 Trait 值作为运行时参数：vtable 分派到 Store.Memory 模块的函数。
-fun run(s: KVStore): Unit {
+fun run(s: KVStore): void {
     s.put("hello", "world")
     println(s.get("hello"))
 }
 
-fun main() {
+fun main(): void {
     // 文件模块 Store.Memory 自动转换为 Trait 值传入。
     run(Store.Memory)
 

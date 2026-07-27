@@ -47,13 +47,13 @@ pub async fun recv_from(self: UdpSocket, len: usize): Async<Throw<RecvFromResult
 
 // 关闭套接字。幂等：重复 close 不报错。
 // UDP 套接字复用 __net_tcp_close（底层都是 close(fd)）。
-pub async fun close(self: UdpSocket): Async<Throw<Unit, IOError>> {
+pub async fun close(self: UdpSocket): Async<Throw<void, IOError>> {
     if self.is_closed {
-        Ok(())
+        Ok(void)
     } else {
         self.is_closed = true
         __net_tcp_close(self.fd)?
-        Ok(())
+        Ok(void)
     }
 }
 

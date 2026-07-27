@@ -7,8 +7,6 @@
 const std = @import("std");
 const ir = @import("ir");
 
-pub const ChanType = ir.ChanType;
-
 /// 类型变量（用于局部推断，非 HM 量化）
 pub const TypeVar = struct {
     id: usize,
@@ -140,39 +138,6 @@ pub const ConcreteType = union(enum) {
         };
     }
 
-    // ── toChanType：转换到 IR 的 ChanType（供 SemaResult.expr_types 使用）──
-
-    pub fn toChanType(self: *const ConcreteType) ?ChanType {
-        return switch (self.*) {
-            .i8_type => .i8_chan,
-            .i16_type => .i16_chan,
-            .i32_type => .i32_chan,
-            .i64_type => .i64_chan,
-            .i128_type => .i128_chan,
-            .u8_type => .u8_chan,
-            .u16_type => .u16_chan,
-            .u32_type => .u32_chan,
-            .u64_type => .u64_chan,
-            .u128_type => .u128_chan,
-            .isize_type => .isize_chan,
-            .usize_type => .usize_chan,
-            .f16_type => .f16_chan,
-            .f32_type => .f32_chan,
-            .f64_type => .f64_chan,
-            .f128_type => .f128_chan,
-            .bool_type => .bool_chan,
-            .str_type => .ref_chan,
-            .char_type => .char_chan,
-            .null_type => .null_chan,
-            .unit_type => .unit_chan,
-            .record_type, .adt_type, .array_type, .fn_type, .generic_type, .trait_type => .ref_chan,
-            .nullable_type => |inner| inner.toChanType() orelse .ref_chan,
-            .ref_type => .ref_chan,
-            .throw_type => |tt| tt.value_type.toChanType() orelse .ref_chan,
-            .type_var, .unknown_type, .never_type => null,
-        };
-    }
-
     /// 提取类型名（用于 ExprInfo.type_name）
     pub fn typeName(self: *const ConcreteType) ?[]const u8 {
         return switch (self.*) {
@@ -200,7 +165,7 @@ pub const ConcreteType = union(enum) {
             .bool_type => "bool",
             .str_type => "str",
             .char_type => "char",
-            .unit_type => "Unit",
+            .unit_type => "void",
             .null_type => "Null",
             else => null,
         };
@@ -229,7 +194,7 @@ pub const ConcreteType = union(enum) {
             .bool_type => "bool",
             .str_type => "str",
             .char_type => "char",
-            .unit_type => "Unit",
+            .unit_type => "void",
             .null_type => "Null",
             else => null,
         };
@@ -275,7 +240,7 @@ pub const ConcreteType = union(enum) {
     pub fn format(self: ConcreteType, writer: anytype) !void {
         if (self.builtinName()) |name| {
             if (self == .unit_type) {
-                try writer.writeAll("()");
+                try writer.writeAll("void");
             } else {
                 try writer.writeAll(name);
             }
@@ -375,7 +340,7 @@ pub const ConcreteType = union(enum) {
     pub fn formatArrayList(self: ConcreteType, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
         if (self.builtinName()) |name| {
             if (self == .unit_type) {
-                try buf.appendSlice(allocator, "()");
+                try buf.appendSlice(allocator, "void");
             } else {
                 try buf.appendSlice(allocator, name);
             }
@@ -766,58 +731,39 @@ pub const TypeAllocator = struct {
         return ty;
     }
 
-    /// 从标量 ChanType 反向构造 ConcreteType（用于内置类型）
-    pub fn fromChanType(self: *TypeAllocator, ct: ChanType) !*ConcreteType {
-        return self.make(switch (ct) {
-            .i8_chan => .i8_type,
-            .i16_chan => .i16_type,
-            .i32_chan => .i32_type,
-            .i64_chan => .i64_type,
-            .i128_chan => .i128_type,
-            .u8_chan => .u8_type,
-            .u16_chan => .u16_type,
-            .u32_chan => .u32_type,
-            .u64_chan => .u64_type,
-            .u128_chan => .u128_type,
-            .isize_chan => .isize_type,
-            .usize_chan => .usize_type,
-            .f16_chan => .f16_type,
-            .f32_chan => .f32_type,
-            .f64_chan => .f64_type,
-            .f128_chan => .f128_type,
-            .bool_chan => .bool_type,
-            .char_chan => .char_type,
-            .null_chan => .null_type,
-            .unit_chan => .unit_type,
-            else => .unknown_type,
-        });
+    /// 从标量类型名反向构造 ConcreteType（用于内置类型）
+    pub fn fromScalarName(self: *TypeAllocator, name: []const u8) !*ConcreteType {
+        const Entry = struct { n: []const u8, t: ConcreteType };
+        const table = [_]Entry{
+            .{ .n = "i8", .t = .i8_type },
+            .{ .n = "i16", .t = .i16_type },
+            .{ .n = "i32", .t = .i32_type },
+            .{ .n = "i64", .t = .i64_type },
+            .{ .n = "i128", .t = .i128_type },
+            .{ .n = "u8", .t = .u8_type },
+            .{ .n = "u16", .t = .u16_type },
+            .{ .n = "u32", .t = .u32_type },
+            .{ .n = "u64", .t = .u64_type },
+            .{ .n = "u128", .t = .u128_type },
+            .{ .n = "isize", .t = .isize_type },
+            .{ .n = "usize", .t = .usize_type },
+            .{ .n = "f16", .t = .f16_type },
+            .{ .n = "f32", .t = .f32_type },
+            .{ .n = "f64", .t = .f64_type },
+            .{ .n = "f128", .t = .f128_type },
+            .{ .n = "bool", .t = .bool_type },
+            .{ .n = "char", .t = .char_type },
+            .{ .n = "Null", .t = .null_type },
+            .{ .n = "void", .t = .unit_type },
+        };
+        for (table) |e| {
+            if (std.mem.eql(u8, e.n, name)) return self.make(e.t);
+        }
+        return self.make(.unknown_type);
     }
 };
 
 // ── 测试 ──
-
-test "ConcreteType.toChanType 标量映射" {
-    const i64_ty = ConcreteType{ .i64_type = {} };
-    try std.testing.expectEqual(ChanType.i64_chan, i64_ty.toChanType().?);
-
-    const f64_ty = ConcreteType{ .f64_type = {} };
-    try std.testing.expectEqual(ChanType.f64_chan, f64_ty.toChanType().?);
-
-    const bool_ty = ConcreteType{ .bool_type = {} };
-    try std.testing.expectEqual(ChanType.bool_chan, bool_ty.toChanType().?);
-}
-
-test "ConcreteType.toChanType 复合类型映射为 ref_chan" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const inner = try a.create(ConcreteType);
-    inner.* = .{ .i64_type = {} };
-    const arr = try a.create(ConcreteType);
-    arr.* = .{ .array_type = .{ .element_type = inner, .size = null } };
-    try std.testing.expectEqual(ChanType.ref_chan, arr.toChanType().?);
-}
 
 test "ConcreteType.typeName" {
     const i64_ty = ConcreteType{ .i64_type = {} };
@@ -950,10 +896,10 @@ test "TypeAllocator.freshRigidVar 不可与不同类型统一" {
     try std.testing.expectError(error.TypeMismatch, unify(rigid, i64_ty));
 }
 
-test "TypeAllocator.fromChanType 标量反向构造" {
+test "TypeAllocator.fromScalarName 标量反向构造" {
     var alloc = TypeAllocator.init(std.testing.allocator);
     defer alloc.deinit();
 
-    const ty = try alloc.fromChanType(.i64_chan);
+    const ty = try alloc.fromScalarName("i64");
     try std.testing.expect(ty.* == .i64_type);
 }

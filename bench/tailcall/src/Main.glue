@@ -58,7 +58,7 @@ fun denseTCO(iters: i32): i64 {
     sum
 }
 
-fun main() {
+fun main(): void {
     // ---- 尾递归求和:10000000 次迭代 ----
     println(countUp(10000000, 0))   // 50000005000000
 

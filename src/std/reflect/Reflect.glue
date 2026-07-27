@@ -15,7 +15,7 @@ pub fun format<T>(x: T): str {
     val r = reflect(x)
     val k = r.kind()
     if k == "Primitive" { return __scalar_to_str(r) }
-    if k == "Unit" { return __scalar_to_str(r) }
+    if k == "Void" { return __scalar_to_str(r) }
     if k == "Str" { return __scalar_to_str(r) }
     if k == "Record" { return format_record(r) }
     if k == "Adt" { return format_adt(r) }

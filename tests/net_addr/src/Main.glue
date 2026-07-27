@@ -9,7 +9,7 @@
 import std.net.Addr
 import std.io.Console.{println}
 
-fun main() {
+fun main(): void {
     // ── Ipv4Addr 构造与访问 ───────────────────────────────────────
     val lo4 = std.net.Addr.v4_loopback()
     println(std.net.Addr.v4_octet(lo4, 0u8))   // 127

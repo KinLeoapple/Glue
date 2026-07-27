@@ -217,9 +217,8 @@ pub const Methods = struct {
     /// select 源就绪性检查（非阻塞）
     /// 非通道源（标量等）始终就绪；通道源有数据/会合发送方/已关闭时就绪
     pub fn selectSourceReady(self: *Engine, chan: u16) bool {
-        const meta = self.ir.channels.get(chan);
         // 只有 ref_chan 才可能是 ChannelValue/SenderValue/ReceiverValue
-        if (meta.chan_type != .ref_chan) return true;
+        if (!self.runtime.isRef(chan)) return true;
         const ch = self.readChannelValue(chan) orelse return true;
         ch.mutex.lock();
         defer ch.mutex.unlock();
@@ -294,24 +293,20 @@ pub const Methods = struct {
     /// output = mask_chan（tag 值，用 i64 存储）
     pub fn execRouteGetTag(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
-        const meta = self.ir.channels.get(val_chan);
 
-        switch (meta.chan_type) {
-            .ref_chan => {
-                // 堆对象：读取 type_tag 的整数值作为 tag
-                const header = self.readRefObj(val_chan);
-                if (header) |h| {
-                    const tag_val: i64 = @intFromEnum(h.type_tag);
-                    self.runtime.writeI64(node.output, tag_val);
-                } else {
-                    self.runtime.writeI64(node.output, 0);
-                }
-            },
-            // 标量值：用 chan_type 的整数值作为 tag
-            else => {
-                const tag_val: i64 = @intFromEnum(meta.chan_type);
+        if (self.runtime.isRef(val_chan)) {
+            // 堆对象：读取 type_tag 的整数值作为 tag
+            const header = self.readRefObj(val_chan);
+            if (header) |h| {
+                const tag_val: i64 = @intFromEnum(h.type_tag);
                 self.runtime.writeI64(node.output, tag_val);
-            },
+            } else {
+                self.runtime.writeI64(node.output, 0);
+            }
+        } else {
+            // 标量值：用 type_desc.type_id 作为 tag（替代旧的 @intFromEnum(chan_type)）
+            const tag_val: i64 = @intCast(self.runtime.typeDesc(val_chan).type_id);
+            self.runtime.writeI64(node.output, tag_val);
         }
     }
 
@@ -347,15 +342,13 @@ pub const Methods = struct {
 
         // body 子图最后一个节点的 output 作为结果
         const body_out_chan = nodes[local_start + body_len - 1].output;
-        const body_meta = self.ir.channels.get(body_out_chan);
-        const result_meta = self.ir.channels.get(node.output);
 
         // 类型转换：body 输出 → 结果通道
-        if (result_meta.chan_type == .nullable_chan and body_meta.chan_type != .nullable_chan) {
+        if (self.runtime.isNullable(node.output) and !self.runtime.isNullable(body_out_chan)) {
             // 结果是 nullable，body 输出不是 nullable → 包装为 nullable
             const inner_w = self.nullableInnerWidth(node.output);
             const dst = self.runtime.rawPtr(node.output);
-            if (body_meta.chan_type == .null_chan) {
+            if (self.runtime.isNull(body_out_chan)) {
                 // body 输出是 null → 设置 null flag
                 dst[inner_w] = 1;
             } else {
@@ -395,9 +388,9 @@ pub const Methods = struct {
     // null_flag = 0 表示有值（non-null），null_flag = 1 表示 null
 
     /// 获取 nullable 通道的 inner 宽度（总宽度 - 1 byte flag）
+    /// 统一通过 runtime.elemWidth 获取，不再依赖 ChannelMeta.inner_type
     pub fn nullableInnerWidth(self: *Engine, chan: u16) u8 {
-        const meta = self.ir.channels.get(chan);
-        return meta.inner_type.elemWidth();
+        return self.runtime.elemWidth(chan) - 1;
     }
 
     /// nullable_make：将值包装为 Nullable<T>
@@ -405,17 +398,16 @@ pub const Methods = struct {
     /// output = nullable_chan
     pub fn execNullableMake(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
-        const val_meta = self.ir.channels.get(val_chan);
 
         const inner_w = self.nullableInnerWidth(node.output);
         const total_w = self.runtime.elemWidth(node.output); // inner_w + 1
         const dst = self.runtime.rawPtr(node.output);
 
         // 检查是否为 null（ref_chan 的 null 指针，或 null_chan）
-        const is_null = switch (val_meta.chan_type) {
-            .ref_chan => self.runtime.readPtr(val_chan) == null,
-            .null_chan => true,
-            else => false,
+        const is_null = blk: {
+            if (self.runtime.isRef(val_chan)) break :blk self.runtime.readPtr(val_chan) == null;
+            if (self.runtime.isNull(val_chan)) break :blk true;
+            break :blk false;
         };
 
         if (is_null) {

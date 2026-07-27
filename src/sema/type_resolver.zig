@@ -12,7 +12,6 @@ const builtin_types = @import("builtin_types.zig");
 
 const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
 const ScalarKind = type_descriptor_mod.ScalarKind;
-const ChanType = ir_mod.ChanType;
 
 /// 内置标量名 → ScalarKind 映射
 /// v3 阶段 10：委托给 builtin_types.zig 的 comptime 注册表
@@ -22,16 +21,16 @@ fn scalarKindFromName(name: []const u8) ?ScalarKind {
 
 /// 引用语义类型的 TypeDescriptor（ref_chan，8 字节指针）
 /// 用于 str/record/adt/array/fn/generic/trait/ref_type/raw_ptr 等堆引用类型
+/// scalar_ops 引用 ir 侧的 ref_ops，使 readChannel/writeChannel 能处理 ref_chan
 pub const ref_type_descriptor: TypeDescriptor = .{
     .size = 8,
     .alignment = 8,
     .is_ref = true,
-    .scalar_ops = null,
+    .scalar_ops = &ir_mod.type_descriptor_mod.ref_ops,
     .slots = &.{},
     .slot_kind = .none,
     .type_id = 0,
     .type_name = "ref",
-    .chan = .ref_chan,
 };
 
 /// null 类型的 TypeDescriptor
@@ -39,12 +38,11 @@ pub const null_type_descriptor: TypeDescriptor = .{
     .size = 0,
     .alignment = 1,
     .is_ref = false,
-    .scalar_ops = null,
+    .scalar_ops = &ir_mod.type_descriptor_mod.null_ops,
     .slots = &.{},
     .slot_kind = .none,
     .type_id = 17,
     .type_name = "null",
-    .chan = .null_chan,
 };
 
 /// unit 类型的 TypeDescriptor
@@ -52,12 +50,11 @@ pub const unit_type_descriptor: TypeDescriptor = .{
     .size = 0,
     .alignment = 1,
     .is_ref = false,
-    .scalar_ops = null,
+    .scalar_ops = &ir_mod.type_descriptor_mod.unit_ops,
     .slots = &.{},
     .slot_kind = .none,
     .type_id = 18,
-    .type_name = "unit",
-    .chan = .unit_chan,
+    .type_name = "void",
 };
 
 /// 将 AST 类型节点解析为 TypeDescriptor
@@ -76,12 +73,12 @@ pub fn resolveTypeNode(
             }
             // 内置标量类型
             if (scalarKindFromName(n.name)) |kind| {
-                return type_descriptor_mod.builtin_type_descriptors.getPtrConst(kind);
+                return type_descriptor_mod.lookupByScalarKind(kind);
             }
             // str → ref_chan
             if (std.mem.eql(u8, n.name, "str")) return &ref_type_descriptor;
             // unit → unit_chan
-            if (std.mem.eql(u8, n.name, "unit")) return &unit_type_descriptor;
+            if (std.mem.eql(u8, n.name, "void")) return &unit_type_descriptor;
             // 用户自定义类型（ADT/record/newtype/alias）→ ref_chan（堆引用）
             return &ref_type_descriptor;
         },
@@ -116,24 +113,24 @@ pub fn resolveTypeNode(
 /// 迁自 type_check.zig:50 semaTypeToChanType（升级为返回 TypeDescriptor）
 pub fn fromConcreteType(ct: concrete_type.ConcreteType) ?*const TypeDescriptor {
     return switch (ct) {
-        .i8_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.i8),
-        .i16_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.i16),
-        .i32_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.i32),
-        .i64_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.i64),
-        .i128_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.i128),
-        .u8_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.u8),
-        .u16_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.u16),
-        .u32_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.u32),
-        .u64_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.u64),
-        .u128_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.u128),
-        .isize_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.isize),
-        .usize_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.usize),
-        .f16_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.f16),
-        .f32_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.f32),
-        .f64_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.f64),
-        .f128_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.f128),
-        .bool_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.bool),
-        .char_type => type_descriptor_mod.builtin_type_descriptors.getPtrConst(.char),
+        .i8_type => type_descriptor_mod.lookupByScalarKind(.i8),
+        .i16_type => type_descriptor_mod.lookupByScalarKind(.i16),
+        .i32_type => type_descriptor_mod.lookupByScalarKind(.i32),
+        .i64_type => type_descriptor_mod.lookupByScalarKind(.i64),
+        .i128_type => type_descriptor_mod.lookupByScalarKind(.i128),
+        .u8_type => type_descriptor_mod.lookupByScalarKind(.u8),
+        .u16_type => type_descriptor_mod.lookupByScalarKind(.u16),
+        .u32_type => type_descriptor_mod.lookupByScalarKind(.u32),
+        .u64_type => type_descriptor_mod.lookupByScalarKind(.u64),
+        .u128_type => type_descriptor_mod.lookupByScalarKind(.u128),
+        .isize_type => type_descriptor_mod.lookupByScalarKind(.isize),
+        .usize_type => type_descriptor_mod.lookupByScalarKind(.usize),
+        .f16_type => type_descriptor_mod.lookupByScalarKind(.f16),
+        .f32_type => type_descriptor_mod.lookupByScalarKind(.f32),
+        .f64_type => type_descriptor_mod.lookupByScalarKind(.f64),
+        .f128_type => type_descriptor_mod.lookupByScalarKind(.f128),
+        .bool_type => type_descriptor_mod.lookupByScalarKind(.bool),
+        .char_type => type_descriptor_mod.lookupByScalarKind(.char),
         .str_type => &ref_type_descriptor,
         .null_type => &null_type_descriptor,
         .unit_type => &unit_type_descriptor,
@@ -157,14 +154,13 @@ pub fn fromConcreteType(ct: concrete_type.ConcreteType) ?*const TypeDescriptor {
     };
 }
 
-/// 便捷方法：将 AST 类型节点解析为 ChanType
-/// 兼容现有 IRBuilder 调用（仅返回 ChanType，不返回完整 TypeDescriptor）
+/// 便捷方法：将 AST 类型节点解析为 TypeDescriptor（委托 resolveTypeNode）
+/// 兼容现有 IRBuilder 调用
 pub fn resolveChanType(
     type_node: ?*const ast.TypeNode,
     type_args: []const TypeDescriptor,
-) ?ChanType {
-    const td = resolveTypeNode(type_node, type_args) orelse return null;
-    return td.chan;
+) ?*const TypeDescriptor {
+    return resolveTypeNode(type_node, type_args);
 }
 
 /// 从 TypeNode 提取类型名（用于变量绑定的类型推断）
@@ -205,7 +201,7 @@ pub fn registerBuiltinTypeDescriptors(sema_result: *SemaResult) !void {
     // 内置标量
     inline for (std.meta.fields(type_descriptor_mod.ScalarKind)) |field| {
         const kind: type_descriptor_mod.ScalarKind = @enumFromInt(field.value);
-        const td = type_descriptor_mod.builtin_type_descriptors.get(kind);
+        const td = type_descriptor_mod.lookupByScalarKind(kind).*;
         try registerTypeDescriptor(sema_result, td);
     }
     // 引用/null/unit
@@ -236,23 +232,19 @@ pub fn resolveTypeNodeResolved(
             }
             // 2. 内置标量类型
             if (scalarKindFromName(n.name)) |kind| {
-                break :blk type_descriptor_mod.builtin_type_descriptors.getPtrConst(kind);
+                break :blk type_descriptor_mod.lookupByScalarKind(kind);
             }
             // 3. str/unit
             if (std.mem.eql(u8, n.name, "str")) break :blk &ref_type_descriptor;
-            if (std.mem.eql(u8, n.name, "unit")) break :blk &unit_type_descriptor;
+            if (std.mem.eql(u8, n.name, "void")) break :blk &unit_type_descriptor;
             // 4. 查 sema_result.type_defs 解析 alias/newtype 链
             if (sema_result) |sr| {
                 if (sr.getTypeDef(n.name)) |td| {
-                    if (td.target_chan_type) |tc| {
-                        // alias/newtype 有目标 ChanType：反查 TypeDescriptor
-                        if (type_descriptor_mod.lookupBuiltinByChan(tc)) |inner| {
-                            break :blk inner;
-                        }
-                        // target 是 ref_chan（如 alias 到 str/record）→ 无法进一步展开
-                        break :blk &ref_type_descriptor;
+                    if (td.target_type_desc) |inner_td| {
+                        // alias/newtype 有目标 TypeDescriptor：直接返回
+                        break :blk inner_td;
                     }
-                    // target_type_name 已知但 target_chan_type 未知：递归解析
+                    // target_type_name 已知但 target_type_desc 未知：递归解析
                     if (td.target_type_name) |ttn| {
                         var tmp: ast.TypeNode = .{ .named = .{ .name = ttn } };
                         break :blk resolveTypeNodeResolved(&tmp, type_args, sema_result) orelse &ref_type_descriptor;
@@ -284,37 +276,36 @@ pub fn resolveTypeNodeResolved(
 // chanTypeFrom* 系列（Task 3.11 迁移）
 // ════════════════════════════════════════════════════════════
 
-/// 类型名 → ChanType
+/// 类型名 → TypeDescriptor
 /// 迁自 builder.zig:1482 chanTypeFromTypeName
 /// 纯函数，无状态依赖
-pub fn chanTypeFromTypeName(type_name: []const u8) ChanType {
+pub fn chanTypeFromTypeName(type_name: []const u8) *const TypeDescriptor {
     if (scalarKindFromName(type_name)) |kind| {
-        return type_descriptor_mod.builtin_type_descriptors.get(kind).chan;
+        return type_descriptor_mod.lookupByScalarKind(kind);
     }
-    if (std.mem.eql(u8, type_name, "str")) return .ref_chan;
-    if (std.mem.eql(u8, type_name, "unit")) return .unit_chan;
-    // nullable 类型 "T?" → 返回内部类型的 ChanType
+    if (std.mem.eql(u8, type_name, "str")) return &ref_type_descriptor;
+    if (std.mem.eql(u8, type_name, "void")) return &unit_type_descriptor;
+    // nullable 类型 "T?" → 返回内部类型的 TypeDescriptor
     if (type_name.len > 1 and type_name[type_name.len - 1] == '?') {
         return chanTypeFromTypeName(type_name[0 .. type_name.len - 1]);
     }
-    // 用户自定义类型（ADT/record/newtype）→ ref_chan
-    return .ref_chan;
+    // 用户自定义类型（ADT/record/newtype）→ ref
+    return &ref_type_descriptor;
 }
 
-/// type_id → ChanType
+/// type_id → TypeDescriptor
 /// 迁自 builder.zig:9811 chanTypeFromTypeId
 /// 依赖 sema_result.type_descriptors 全局表（v3 阶段 2 已产出）
-/// type_id=0 → ref_chan；type_id=17 → null_chan；type_id=18 → unit_chan
-/// 其他 type_id 查 type_descriptors 表
-pub fn chanTypeFromTypeId(sema_result: *const ir_mod.SemaResult, type_id: u16) ChanType {
-    if (type_id == 0) return .ref_chan;
-    for (sema_result.type_descriptors.items) |td| {
-        if (td.type_id == type_id) return td.chan;
+/// type_id=0 → ref；其他 type_id 查 type_descriptors 表
+pub fn chanTypeFromTypeId(sema_result: *const ir_mod.SemaResult, type_id: u16) *const TypeDescriptor {
+    if (type_id == 0) return &ref_type_descriptor;
+    for (sema_result.type_descriptors.items) |*td| {
+        if (td.type_id == type_id) return td;
     }
-    return .ref_chan;
+    return &ref_type_descriptor;
 }
 
-/// 带类型绑定的 TypeNode → ChanType 解析
+/// 带类型绑定的 TypeNode → TypeDescriptor 解析
 /// 迁自 builder.zig:9725 chanTypeFromTypeNodeBound
 /// 优先查 TypeBindingContext（type_param 名 → 具体类型），
 /// 未命中委托 resolveTypeNode（保持原行为）
@@ -322,25 +313,25 @@ pub fn chanTypeFromTypeNodeBound(
     type_node: ?*const ast.TypeNode,
     type_args: []const TypeDescriptor,
     type_binding_ctx: ?*const TypeBindingContext,
-) ?ChanType {
+) ?*const TypeDescriptor {
     const tn = type_node orelse return null;
     switch (tn.*) {
         .named => |n| {
             // 1. 先查类型绑定栈（type_param 名）
             if (type_binding_ctx) |ctx| {
-                if (ctx.lookup(n.name)) |bt| return bt.type_desc.chan;
+                if (ctx.lookup(n.name)) |bt| return bt.type_desc;
             }
             // 2. 未命中委托 resolveTypeNode
-            return resolveTypeNode(tn, type_args).?.chan;
+            return resolveTypeNode(tn, type_args);
         },
         .nullable => |nb| {
-            return chanTypeFromTypeNodeBound(nb.inner, type_args, type_binding_ctx) orelse resolveTypeNode(tn, type_args).?.chan;
+            return chanTypeFromTypeNodeBound(nb.inner, type_args, type_binding_ctx) orelse resolveTypeNode(tn, type_args);
         },
-        .ref_type, .raw_ptr => return .ref_chan,
+        .ref_type, .raw_ptr => return &ref_type_descriptor,
         .kind_annotated => |ka| {
-            return chanTypeFromTypeNodeBound(ka.inner, type_args, type_binding_ctx) orelse resolveTypeNode(tn, type_args).?.chan;
+            return chanTypeFromTypeNodeBound(ka.inner, type_args, type_binding_ctx) orelse resolveTypeNode(tn, type_args);
         },
-        else => return resolveTypeNode(tn, type_args).?.chan,
+        else => return resolveTypeNode(tn, type_args),
     }
 }
 

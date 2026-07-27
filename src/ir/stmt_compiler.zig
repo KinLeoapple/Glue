@@ -6,6 +6,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const node_mod = @import("node.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const builder_mod = @import("builder.zig");
 
 const IRBuilder = builder_mod.IRBuilder;
@@ -55,7 +56,7 @@ pub const Methods = struct {
         // 无尾表达式：如果最后一条语句产生了值（for/while），使用它
         if (last_stmt_chan) |ch| return ch;
         // 否则返回 unit
-        const out = try self.allocChannel(.unit_chan);
+        const out = try self.allocChannel(type_descriptor_mod.unit_descriptor);
         try self.emit(Node.makeSink(.const_unit, out, 0));
         return out;
     }
@@ -79,15 +80,15 @@ pub const Methods = struct {
                     if (vd.type_annotation) |tn| {
                         if (tn.* == .nullable) {
                             const value_meta = self.channels.get(chan);
-                            if (value_meta.chan_type == .null_chan) {
+                            if (value_meta.type_desc.is_null_type) {
                                 // null_literal → 分配 nullable 通道，nullable_make 会写入 null flag
-                                const inner_ct = builder_mod.chanTypeFromTypeNode(tn.nullable.inner) orelse .ref_chan;
+                                const inner_ct = self.chanTypeFromTypeNodeBound(tn.nullable.inner) orelse type_descriptor_mod.ref_descriptor;
                                 const nc = try self.channels.allocNullable(inner_ct);
                                 try self.emit(Node.makeUnary(.nullable_make, nc, 0, chan));
                                 chan = nc;
-                            } else if (value_meta.chan_type != .nullable_chan) {
+                            } else if (!value_meta.type_desc.is_nullable) {
                                 // 非 null 值 → 包装为 nullable
-                                const nc = try self.channels.allocNullable(value_meta.chan_type);
+                                const nc = try self.channels.allocNullable(value_meta.type_desc);
                                 try self.emit(Node.makeUnary(.nullable_make, nc, 0, chan));
                                 chan = nc;
                             }
@@ -100,7 +101,7 @@ pub const Methods = struct {
                                 // 仅在 src 和 dst 都是标量类型（int/float）时才插入 cast；
                                 // 否则（如 dst 为 ref_chan/Lazy 等堆引用）跳过 cast，避免把
                                 // 整数值误转换为 f64 位模式后存入 ref_chan 导致 readStr 误读为指针
-                                if (src_meta.chan_type != ct and (src_meta.chan_type.isInt() or src_meta.chan_type.isFloat()) and (ct.isInt() or ct.isFloat())) {
+                                if (src_meta.type_desc != ct and (src_meta.type_desc.isInt() or src_meta.type_desc.isFloat()) and (ct.isInt() or ct.isFloat())) {
                                     const cast_chan = try self.allocChannel(ct);
                                     const kind: ScalarKind = if (ct.isInt()) .int else .float;
                                     const meta_idx = try self.addScalarMeta(.{
@@ -119,9 +120,9 @@ pub const Methods = struct {
                     // 与 async_handle_meta 映射，因此使用浅拷贝（_pad=1）并传播映射
                     const final_chan = blk: {
                         const src_meta = self.channels.get(chan);
-                        if (src_meta.chan_type == .ref_chan and !self.isRefExpr(vd.value)) {
+                        if (src_meta.type_desc.is_ref and !self.isRefExpr(vd.value)) {
                             const is_async_handle = self.async_handle_meta.get(chan) != null;
-                            const copy_chan = try self.allocChannel(.ref_chan);
+                            const copy_chan = try self.allocChannel(type_descriptor_mod.ref_descriptor);
                             var load_node = Node.makeUnary(.load, copy_chan, 0, chan);
                             load_node._pad = if (is_async_handle) 1 else 0;
                             try self.emit(load_node);
@@ -149,14 +150,14 @@ pub const Methods = struct {
                 // 类型标注为 nullable 时，将值包装为 nullable_chan
                 if (vd.type_annotation) |tn| {
                     if (tn.* == .nullable) {
-                        if (value_meta.chan_type == .null_chan) {
-                            const inner_ct = builder_mod.chanTypeFromTypeNode(tn.nullable.inner) orelse .ref_chan;
+                        if (value_meta.type_desc.is_null_type) {
+                            const inner_ct = self.chanTypeFromTypeNodeBound(tn.nullable.inner) orelse type_descriptor_mod.ref_descriptor;
                             const nc = try self.channels.allocNullable(inner_ct);
                             try self.emit(Node.makeUnary(.nullable_make, nc, 0, value_chan));
                             value_chan = nc;
                             value_meta = self.channels.get(value_chan);
-                        } else if (value_meta.chan_type != .nullable_chan) {
-                            const nc = try self.channels.allocNullable(value_meta.chan_type);
+                        } else if (!value_meta.type_desc.is_nullable) {
+                            const nc = try self.channels.allocNullable(value_meta.type_desc);
                             try self.emit(Node.makeUnary(.nullable_make, nc, 0, value_chan));
                             value_chan = nc;
                             value_meta = self.channels.get(value_chan);
@@ -170,7 +171,7 @@ pub const Methods = struct {
                         const dst_ct = self.chanTypeFromTypeNodeResolved(tn);
                         if (dst_ct) |ct| {
                             const src_meta = self.channels.get(value_chan);
-                            if (src_meta.chan_type != ct and (src_meta.chan_type.isInt() or src_meta.chan_type.isFloat()) and (ct.isInt() or ct.isFloat())) {
+                            if (src_meta.type_desc != ct and (src_meta.type_desc.isInt() or src_meta.type_desc.isFloat()) and (ct.isInt() or ct.isFloat())) {
                                 const cast_chan = try self.allocChannel(ct);
                                 const kind: ScalarKind = if (ct.isInt()) .int else .float;
                                 const meta_idx = try self.addScalarMeta(.{
@@ -194,7 +195,7 @@ pub const Methods = struct {
                             if (self.chanTypeFromTypeNodeResolved(tn)) |ct| break :blk ct;
                         }
                     }
-                    break :blk value_meta.chan_type;
+                    break :blk value_meta.type_desc;
                 };
                 const cell_chan = try self.allocCellChannel(cell_ct);
                 var load_node = Node.makeUnary(.load, cell_chan, 0, value_chan);
@@ -266,7 +267,7 @@ pub const Methods = struct {
                         if (binding.is_atomic and (ca.op == .add_assign or ca.op == .sub_assign)) {
                             const val_chan = try self.compileExpr(ca.value);
                             const val_meta = self.channels.get(val_chan);
-                            const out = try self.allocChannel(val_meta.chan_type);
+                            const out = try self.allocChannel(val_meta.type_desc);
                             var node = Node.makeBinary(.atomic_fetch_add, out, 0, binding.chan, val_chan);
                             node._pad = if (ca.op == .sub_assign) 1 else 0;
                             try self.emit(node);
@@ -300,7 +301,7 @@ pub const Methods = struct {
                         // arr[i] op= value → array_get + op + array_set
                         const obj_chan = try self.compileExpr(idx.object);
                         const idx_chan = try self.compileExpr(idx.index);
-                        const old_val_chan = try self.allocChannel(.ref_chan);
+                        const old_val_chan = try self.allocChannel(type_descriptor_mod.ref_descriptor);
                         try self.emit(Node.makeBinary(.array_get, old_val_chan, 0, obj_chan, idx_chan));
                         const bin_op = compoundAssignOpToBinaryOp(ca.op);
                         const result_chan = try self.compileBinaryOpWithChan(bin_op, old_val_chan, ca.value);
@@ -309,7 +310,7 @@ pub const Methods = struct {
                     .deref => |d| {
                         // *ref op= value → ref_get + op + ref_set
                         const ref_chan = try self.compileExpr(d.operand);
-                        const old_val_chan = try self.allocChannel(.ref_chan);
+                        const old_val_chan = try self.allocChannel(type_descriptor_mod.ref_descriptor);
                         const get_meta = try self.addScalarMeta(.{ .kind = .ref });
                         try self.emit(Node.makeUnary(.ref_get, old_val_chan, get_meta, ref_chan));
                         const bin_op = compoundAssignOpToBinaryOp(ca.op);
@@ -326,22 +327,22 @@ pub const Methods = struct {
             .return_stmt => |rs| {
                 const ret_chan = self.current_return_chan orelse return error.UnsupportedStmt;
                 const raw_chan = if (rs.value) |v| try self.compileExpr(v) else blk: {
-                    const ch = try self.allocChannel(.unit_chan);
+                    const ch = try self.allocChannel(type_descriptor_mod.unit_descriptor);
                     try self.emit(Node.makeSink(.const_unit, ch, 0));
                     break :blk ch;
                 };
                 const throw_wrapped = if (self.current_returns_throw and rs.value != null and !self.exprIsThrowValue(rs.value.?)) blk: {
-                    const wrap_out = try self.allocChannel(.ref_chan);
+                    const wrap_out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
                     const meta_idx = try self.addGateMeta(.{ .gate_kind = .make_ok });
                     try self.emit(Node.makeUnary(.gate_make_ok, wrap_out, meta_idx, raw_chan));
                     break :blk wrap_out;
                 } else raw_chan;
                 // 若返回通道为 nullable，包装返回值
                 const ret_meta = self.channels.get(ret_chan);
-                const value_chan = if (ret_meta.chan_type == .nullable_chan) blk: {
+                const value_chan = if (ret_meta.type_desc.is_nullable) blk: {
                     const body_meta = self.channels.get(throw_wrapped);
-                    if (body_meta.chan_type == .nullable_chan) break :blk throw_wrapped;
-                    const nc = try self.channels.allocNullable(ret_meta.inner_type);
+                    if (body_meta.type_desc.is_nullable) break :blk throw_wrapped;
+                    const nc = try self.channels.allocNullable(ret_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
                     try self.emit(Node.makeUnary(.nullable_make, nc, 0, throw_wrapped));
                     break :blk nc;
                 } else throw_wrapped;
@@ -351,12 +352,12 @@ pub const Methods = struct {
             .while_stmt => |ws| return try self.compileWhile(ws),
             .loop_stmt => |ls| return try self.compileLoop(ls),
             .break_stmt => {
-                const out = try self.allocChannel(.unit_chan);
+                const out = try self.allocChannel(type_descriptor_mod.unit_descriptor);
                 try self.emit(Node.makeSink(.halt_break, out, 0));
                 return out;
             },
             .continue_stmt => {
-                const out = try self.allocChannel(.unit_chan);
+                const out = try self.allocChannel(type_descriptor_mod.unit_descriptor);
                 try self.emit(Node.makeSink(.halt_continue, out, 0));
                 return out;
             },
@@ -375,7 +376,7 @@ pub const Methods = struct {
                     break :blk 0;
                 };
                 const field_meta_idx = try self.addFieldIdMeta(field_id);
-                const out = try self.allocChannel(.unit_chan);
+                const out = try self.allocChannel(type_descriptor_mod.unit_descriptor);
                 try self.emit(Node.makeBinary(.record_set, out, field_meta_idx, obj_chan, val_chan));
             },
         }
@@ -421,18 +422,18 @@ pub const Methods = struct {
             .inner_op = .const_i, // 占位，实际由 body_start/body_len 决定
             .body_start = body_start,
             .body_len = body_len,
-            .elem_type = self.channels.get(src_vec_chan).chan_type,
+            .elem_type_desc = self.channels.get(src_vec_chan).type_desc,
         });
 
-        const map_out = try self.allocChannel(self.channels.get(src_vec_chan).chan_type);
+        const map_out = try self.allocChannel(self.channels.get(src_vec_chan).type_desc);
         try self.emit(Node.makeUnary(.vec_map, map_out, map_meta_idx, src_vec_chan));
 
         // 发射 vec_sink 节点（取最后一个元素作为 for 表达式的值）
         const sink_meta_idx = try self.addVectorMeta(.{
             .vec_op = .sink_last,
-            .elem_type = self.channels.get(src_vec_chan).chan_type,
+            .elem_type_desc = self.channels.get(src_vec_chan).type_desc,
         });
-        const sink_out = try self.allocChannel(self.channels.get(src_vec_chan).chan_type);
+        const sink_out = try self.allocChannel(self.channels.get(src_vec_chan).type_desc);
         try self.emit(Node.makeUnary(.vec_sink, sink_out, sink_meta_idx, map_out));
 
         return sink_out;
@@ -495,7 +496,7 @@ pub const Methods = struct {
 
         // 3. 编译 vec_source
         const src_vec_chan = try self.compileVecSource(fs.iterable);
-        const elem_type = self.channels.get(src_vec_chan).chan_type;
+        const elem_type = self.channels.get(src_vec_chan).type_desc;
         var cur_chan = src_vec_chan;
 
         // 4. [可选] vec_take_while(¬break_cond)
@@ -541,7 +542,7 @@ pub const Methods = struct {
                 .inner_op = .const_i,
                 .body_start = body_start,
                 .body_len = body_len,
-                .elem_type = elem_type,
+                .elem_type_desc = elem_type,
             });
             const map_out = try self.allocChannel(elem_type);
             try self.emit(Node.makeUnary(.vec_map, map_out, map_meta_idx, cur_chan));
@@ -551,7 +552,7 @@ pub const Methods = struct {
         // 7. vec_sink（取最后一个元素作为 for 表达式的值）
         const sink_meta_idx = try self.addVectorMeta(.{
             .vec_op = .sink_last,
-            .elem_type = elem_type,
+            .elem_type_desc = elem_type,
         });
         const sink_out = try self.allocChannel(elem_type);
         try self.emit(Node.makeUnary(.vec_sink, sink_out, sink_meta_idx, cur_chan));
@@ -567,7 +568,7 @@ pub const Methods = struct {
         break_cond: *const ast.Expr,
         loop_var: []const u8,
     ) BuildError!u16 {
-        const elem_type = self.channels.get(src_chan).chan_type;
+        const elem_type = self.channels.get(src_chan).type_desc;
 
         // 编译条件体（在 loop_var 作用域中，loop_var 绑定到 src_chan 当前元素）
         const cond_start: u32 = @intCast(self.nodes.items.len);
@@ -577,7 +578,7 @@ pub const Methods = struct {
 
         const cond_chan = try self.compileExpr(break_cond);
         // 取反：¬break_cond
-        const not_chan = try self.allocChannel(.bool_chan);
+        const not_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
         try self.emit(Node.makeUnary(.bool_not, not_chan, 0, cond_chan));
 
         const cond_len: u32 = @intCast(self.nodes.items.len - cond_start);
@@ -585,7 +586,7 @@ pub const Methods = struct {
         const tw_meta_idx = try self.addVectorMeta(.{
             .body_start = cond_start,
             .body_len = cond_len,
-            .elem_type = .bool_chan,
+            .elem_type_desc = type_descriptor_mod.bool_descriptor,
         });
         const tw_out = try self.allocChannel(elem_type);
         try self.emit(Node.makeUnary(.vec_take_while, tw_out, tw_meta_idx, src_chan));
@@ -600,7 +601,7 @@ pub const Methods = struct {
         continue_cond: *const ast.Expr,
         loop_var: []const u8,
     ) BuildError!u16 {
-        const elem_type = self.channels.get(src_chan).chan_type;
+        const elem_type = self.channels.get(src_chan).type_desc;
 
         const cond_start: u32 = @intCast(self.nodes.items.len);
         try self.pushScope();
@@ -608,7 +609,7 @@ pub const Methods = struct {
         try self.defineVar(loop_var, src_chan, false);
 
         const cond_chan = try self.compileExpr(continue_cond);
-        const not_chan = try self.allocChannel(.bool_chan);
+        const not_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
         try self.emit(Node.makeUnary(.bool_not, not_chan, 0, cond_chan));
 
         const cond_len: u32 = @intCast(self.nodes.items.len - cond_start);
@@ -616,7 +617,7 @@ pub const Methods = struct {
         const filt_meta_idx = try self.addVectorMeta(.{
             .body_start = cond_start,
             .body_len = cond_len,
-            .elem_type = .bool_chan,
+            .elem_type_desc = type_descriptor_mod.bool_descriptor,
         });
         const filt_out = try self.allocChannel(elem_type);
         try self.emit(Node.makeUnary(.vec_filter, filt_out, filt_meta_idx, src_chan));
@@ -768,7 +769,7 @@ pub const Methods = struct {
         const var_binding = self.lookupVar(var_name) orelse return null;
         const start_chan = var_binding.chan;
         const var_chan = var_binding.chan;
-        const elem_type = self.channels.get(start_chan).chan_type;
+        const elem_type = self.channels.get(start_chan).type_desc;
         if (!elem_type.isInt()) return null;
 
         // 7. 编译 end 表达式
@@ -788,7 +789,7 @@ pub const Methods = struct {
         const source_meta_idx = try self.addVectorMeta(.{
             .vec_op = .range_source,
             .length = length,
-            .elem_type = elem_type,
+            .elem_type_desc = elem_type,
         });
         const src_vec_chan = try self.allocChannel(elem_type);
         try self.emit(Node.makeBinary(.vec_source, src_vec_chan, source_meta_idx, start_chan, end_chan));
@@ -829,7 +830,7 @@ pub const Methods = struct {
                 .inner_op = .const_i,
                 .body_start = body_start,
                 .body_len = body_len,
-                .elem_type = elem_type,
+                .elem_type_desc = elem_type,
             });
             const map_out = try self.allocChannel(elem_type);
             try self.emit(Node.makeUnary(.vec_map, map_out, map_meta_idx, cur_chan));
@@ -839,7 +840,7 @@ pub const Methods = struct {
         // 12. vec_sink（取最后一个元素）
         const sink_meta_idx = try self.addVectorMeta(.{
             .vec_op = .sink_last,
-            .elem_type = elem_type,
+            .elem_type_desc = elem_type,
         });
         const sink_out = try self.allocChannel(elem_type);
         try self.emit(Node.makeUnary(.vec_sink, sink_out, sink_meta_idx, cur_chan));
@@ -975,13 +976,13 @@ pub const Methods = struct {
             // 获取累加器通道和初始值
             const acc_binding = self.lookupVar(ai.name) orelse return null;
             const acc_chan = acc_binding.chan;
-            const acc_type = self.channels.get(acc_chan).chan_type;
+            const acc_type = self.channels.get(acc_chan).type_desc;
 
             // 5. 编译 end 表达式
             const end_chan = try self.compileExpr(end_expr);
 
             // 6. 获取元素类型
-            const elem_type = self.channels.get(start_chan).chan_type;
+            const elem_type = self.channels.get(start_chan).type_desc;
             if (!elem_type.isInt()) return null;
             if (acc_type != elem_type) return null; // 类型必须一致
 
@@ -999,7 +1000,7 @@ pub const Methods = struct {
             const source_meta_idx = try self.addVectorMeta(.{
                 .vec_op = .range_source,
                 .length = length,
-                .elem_type = elem_type,
+                .elem_type_desc = elem_type,
             });
             const src_vec_chan = try self.allocChannel(elem_type);
             try self.emit(Node.makeBinary(.vec_source, src_vec_chan, source_meta_idx, start_chan, end_chan));
@@ -1030,7 +1031,7 @@ pub const Methods = struct {
                 .inner_op = .const_i,
                 .body_start = body_start,
                 .body_len = body_len,
-                .elem_type = elem_type,
+                .elem_type_desc = elem_type,
             });
             const map_out = try self.allocChannel(elem_type);
             try self.emit(Node.makeUnary(.vec_map, map_out, map_meta_idx, src_vec_chan));
@@ -1058,7 +1059,7 @@ pub const Methods = struct {
         const end_chan = try self.compileExpr(end_expr);
 
         // 6. 获取元素类型，检查是整数
-        const elem_type = self.channels.get(start_chan).chan_type;
+        const elem_type = self.channels.get(start_chan).type_desc;
         if (!elem_type.isInt()) return null;
 
         // 7. 生成 vec_source(range, start, end)
@@ -1075,7 +1076,7 @@ pub const Methods = struct {
         const source_meta_idx = try self.addVectorMeta(.{
             .vec_op = .range_source,
             .length = length,
-            .elem_type = elem_type,
+            .elem_type_desc = elem_type,
         });
         const src_vec_chan = try self.allocChannel(elem_type);
         try self.emit(Node.makeBinary(.vec_source, src_vec_chan, source_meta_idx, start_chan, end_chan));
@@ -1100,7 +1101,7 @@ pub const Methods = struct {
             .inner_op = .const_i, // 占位
             .body_start = body_start,
             .body_len = body_len,
-            .elem_type = elem_type,
+            .elem_type_desc = elem_type,
         });
         const map_out = try self.allocChannel(elem_type);
         try self.emit(Node.makeUnary(.vec_map, map_out, map_meta_idx, src_vec_chan));
@@ -1108,7 +1109,7 @@ pub const Methods = struct {
         // 11. 生成 vec_sink（取最后一个元素作为 while 表达式的值）
         const sink_meta_idx = try self.addVectorMeta(.{
             .vec_op = .sink_last,
-            .elem_type = elem_type,
+            .elem_type_desc = elem_type,
         });
         const sink_out = try self.allocChannel(elem_type);
         try self.emit(Node.makeUnary(.vec_sink, sink_out, sink_meta_idx, map_out));
@@ -1128,7 +1129,7 @@ pub const Methods = struct {
         _ = try self.compileExpr(ls.body);
         const body_len: u32 = @intCast(self.nodes.items.len - body_start);
 
-        const out = try self.allocChannel(.i64_chan);
+        const out = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         const meta_idx = try self.addLoopMeta(.{
             .body_start = body_start,
             .body_len = body_len,
@@ -1142,7 +1143,7 @@ pub const Methods = struct {
     pub fn compileForScalar(self: *IRBuilder, fs: anytype) BuildError!u16 {
         // 编译 iterable → 向量通道
         const src_vec_chan = try self.compileVecSource(fs.iterable);
-        const elem_type = self.channels.get(src_vec_chan).chan_type;
+        const elem_type = self.channels.get(src_vec_chan).type_desc;
 
         const body_start: u32 = @intCast(self.nodes.items.len);
 
@@ -1161,14 +1162,14 @@ pub const Methods = struct {
         _ = try self.compileExpr(fs.body);
         const body_len: u32 = @intCast(self.nodes.items.len - body_start);
 
-        const out = try self.allocChannel(.i64_chan);
+        const out = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         const meta_idx = try self.addLoopMeta(.{
             .body_start = body_start,
             .body_len = body_len,
             .loop_kind = .for_loop,
             .cond_chan = src_vec_chan,
             .iter_chan = iter_chan,
-            .elem_type = elem_type,
+            .elem_type_desc = elem_type,
         });
         try self.emit(Node.makeSink(.scalar_loop, out, meta_idx));
         return out;
@@ -1185,7 +1186,7 @@ pub const Methods = struct {
         _ = try self.compileExpr(ws.body);
         const body_len: u32 = @intCast(self.nodes.items.len - body_start);
 
-        const out = try self.allocChannel(.i64_chan);
+        const out = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         const meta_idx = try self.addLoopMeta(.{
             .body_start = body_start,
             .body_len = body_len,
@@ -1214,7 +1215,7 @@ pub const Methods = struct {
         });
 
         // cleanup_register 不产生值，输出到 unit 通道
-        const unit_chan = try self.allocChannel(.unit_chan);
+        const unit_chan = try self.allocChannel(type_descriptor_mod.unit_descriptor);
         try self.emit(Node.makeSink(.cleanup_register, unit_chan, cleanup_meta_idx));
     }
 
@@ -1228,14 +1229,14 @@ pub const Methods = struct {
         if (self.current_returns_throw) {
             // Throw 返回函数：构造 ThrowValue 并正常返回
             const ret_chan = self.current_return_chan orelse {
-                const out = try self.allocChannel(.ref_chan);
+                const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
                 const gate_meta_idx = try self.addGateMeta(.{ .gate_kind = .make_err });
                 try self.emit(Node.makeUnary(.halt_throw, out, gate_meta_idx, err_chan));
                 return out;
             };
             const value_chan = if (self.exprIsThrowValue(ts.expr)) err_chan else blk: {
                 // 非 ThrowValue 输入：用 gate_make_err 构造 ThrowValue(err)
-                const wrap_out = try self.allocChannel(.ref_chan);
+                const wrap_out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
                 const meta_idx = try self.addGateMeta(.{ .gate_kind = .make_err });
                 try self.emit(Node.makeUnary(.gate_make_err, wrap_out, meta_idx, err_chan));
                 break :blk wrap_out;
@@ -1244,7 +1245,7 @@ pub const Methods = struct {
             return ret_chan;
         } else {
             // 非 Throw 返回函数：halt_throw 运行时返回 error.Thrown
-            const out = try self.allocChannel(.ref_chan);
+            const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
             const gate_meta_idx = try self.addGateMeta(.{ .gate_kind = .make_err });
             try self.emit(Node.makeUnary(.halt_throw, out, gate_meta_idx, err_chan));
             return out;
@@ -1317,7 +1318,7 @@ pub const Methods = struct {
             .timeout_input = receive_count,
         });
 
-        const winner_chan = try self.allocChannel(.i64_chan);
+        const winner_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
         {
             var slot: u8 = 0;
@@ -1355,7 +1356,7 @@ pub const Methods = struct {
 
                 if (is_chan_recv) {
                     // 真正的通道接收：发射 orbit_chan_recv 消费值
-                    const recv_out = try self.allocChannel(.i64_chan);
+                    const recv_out = try self.allocChannel(type_descriptor_mod.i64_descriptor);
                     try self.emit(Node.makeUnary(.orbit_chan_recv, recv_out, 0, arm_chans[i]));
 
                     if (arm.receive.binding != null) {
@@ -1388,7 +1389,7 @@ pub const Methods = struct {
             .body_lens = body_lens,
         });
 
-        const result_chan = try self.allocChannel(.ref_chan);
+        const result_chan = try self.allocChannel(type_descriptor_mod.ref_descriptor);
         try self.emit(Node.makeUnary(.route_dispatch, result_chan, route_meta_idx, winner_chan));
 
         return result_chan;

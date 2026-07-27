@@ -68,7 +68,6 @@ pub const CatchTable = meta_mod.CatchTable;
 pub const LoopEntry = meta_mod.LoopEntry;
 pub const LoopTable = meta_mod.LoopTable;
 pub const CoroutineMeta = meta_mod.CoroutineMeta;
-pub const ChanType = channel_mod.ChanType;
 pub const ChannelMeta = channel_mod.ChannelMeta;
 pub const ChannelSpace = channel_mod.ChannelSpace;
 pub const nullableElemWidth = channel_mod.nullableElemWidth;

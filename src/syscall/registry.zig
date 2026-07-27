@@ -4,7 +4,7 @@
 //! 新增 syscall 只需在 REGISTRY 加一行，无需修改 IR 层。
 //!
 //! 依赖方向：本模块仅依赖 value（Value/ThreadContext）和 io/time/net 实现，
-//! 不依赖 ir 模块（ChanType 不在此处使用，改用 SyscallRetKind 解耦）。
+//! 不依赖 ir 模块（改用 SyscallRetKind 自描述类型，实现 ir ↔ syscall 解耦）。
 //!
 //! 运行时分派：REGISTRY[id] 数组索引，O(1)，无 hash/字符串比较。
 //! 编译期名字查找：inline for 展开，运行时 0 开销。
@@ -29,9 +29,9 @@ pub const SyscallError = error{
     AllocFailed,
 };
 
-/// Syscall 返回类型分类（不依赖 ir.ChanType，实现 ir ↔ syscall 解耦）
+/// Syscall 返回类型分类（不依赖 ir.TypeDescriptor，实现 ir ↔ syscall 解耦）
 ///
-/// ir 模块的 builder 通过 retKindToChanType 将此枚举转为 ChanType。
+/// ir 模块的 builder 通过 retKindToChanType 将此枚举转为 TypeDescriptor。
 pub const SyscallRetKind = enum(u3) {
     /// 堆对象（ref_chan）：File/Dir/Throw/数组等
     ref,
@@ -114,7 +114,7 @@ pub const SyscallId = enum(u16) {
 pub const REGISTRY = [_]SyscallEntry{
     // ── IO syscall ──
     .{ .name = "__file_open", .ret_kind = .ref, .ok_type_name = "File", .impl = io.file_open },
-    .{ .name = "__file_close", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.file_close },
+    .{ .name = "__file_close", .ret_kind = .ref, .ok_type_name = "void", .impl = io.file_close },
     .{ .name = "__file_read", .ret_kind = .ref, .ok_type_name = "u8[]", .impl = io.file_read },
     .{ .name = "__file_write", .ret_kind = .ref, .ok_type_name = "usize", .impl = io.file_write },
     .{ .name = "__file_read_async", .ret_kind = .ref, .ok_type_name = null, .impl = io.file_read_async },
@@ -122,11 +122,11 @@ pub const REGISTRY = [_]SyscallEntry{
     .{ .name = "__file_seek", .ret_kind = .ref, .ok_type_name = "i64", .impl = io.file_seek },
     .{ .name = "__file_stat", .ret_kind = .ref, .ok_type_name = "Stat", .impl = io.file_stat },
     .{ .name = "__file_fstat", .ret_kind = .ref, .ok_type_name = "Stat", .impl = io.file_fstat },
-    .{ .name = "__file_remove", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.file_remove },
-    .{ .name = "__file_rename", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.file_rename },
-    .{ .name = "__file_chmod", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.file_chmod },
-    .{ .name = "__dir_create", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.dir_create },
-    .{ .name = "__dir_remove", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.dir_remove },
+    .{ .name = "__file_remove", .ret_kind = .ref, .ok_type_name = "void", .impl = io.file_remove },
+    .{ .name = "__file_rename", .ret_kind = .ref, .ok_type_name = "void", .impl = io.file_rename },
+    .{ .name = "__file_chmod", .ret_kind = .ref, .ok_type_name = "void", .impl = io.file_chmod },
+    .{ .name = "__dir_create", .ret_kind = .ref, .ok_type_name = "void", .impl = io.dir_create },
+    .{ .name = "__dir_remove", .ret_kind = .ref, .ok_type_name = "void", .impl = io.dir_remove },
     .{ .name = "__dir_list", .ret_kind = .ref, .ok_type_name = "DirEntry[]", .impl = io.dir_list },
     // ── Time syscall ──
     .{ .name = "__instant_now_ns", .ret_kind = .i128, .ok_type_name = null, .impl = time.instant_now_ns },
@@ -144,14 +144,14 @@ pub const REGISTRY = [_]SyscallEntry{
     .{ .name = "__net_tcp_read_async", .ret_kind = .ref, .ok_type_name = null, .impl = net.net_tcp_read_async },
     .{ .name = "__net_tcp_write", .ret_kind = .ref, .ok_type_name = "usize", .impl = net.net_tcp_write },
     .{ .name = "__net_tcp_write_async", .ret_kind = .ref, .ok_type_name = null, .impl = net.net_tcp_write_async },
-    .{ .name = "__net_tcp_close", .ret_kind = .ref, .ok_type_name = "Unit", .impl = net.net_tcp_close },
+    .{ .name = "__net_tcp_close", .ret_kind = .ref, .ok_type_name = "void", .impl = net.net_tcp_close },
     .{ .name = "__net_udp_bind", .ret_kind = .ref, .ok_type_name = "i64", .impl = net.net_udp_bind },
     .{ .name = "__net_udp_send_to", .ret_kind = .ref, .ok_type_name = "usize", .impl = net.net_udp_send_to },
     .{ .name = "__net_udp_recv_from", .ret_kind = .ref, .ok_type_name = "RecvFromResult", .impl = net.net_udp_recv_from },
     .{ .name = "__net_udp_recv_from_async", .ret_kind = .ref, .ok_type_name = null, .impl = net.net_udp_recv_from_async },
     // ── 标准 IO syscall ──
-    .{ .name = "__stdout_write", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.stdout_write },
-    .{ .name = "__stderr_write", .ret_kind = .ref, .ok_type_name = "Unit", .impl = io.stderr_write },
+    .{ .name = "__stdout_write", .ret_kind = .ref, .ok_type_name = "void", .impl = io.stdout_write },
+    .{ .name = "__stderr_write", .ret_kind = .ref, .ok_type_name = "void", .impl = io.stderr_write },
     .{ .name = "__stdin_readln", .ret_kind = .ref, .ok_type_name = "str?", .impl = io.stdin_readln },
 };
 

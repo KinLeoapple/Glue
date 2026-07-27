@@ -4,11 +4,11 @@
 // ---- 内联 Trait 值 (§4.6.3) ----
 import std.io.Console.{println}
 trait Logger {
-    fun log(msg: str) : Unit
+    fun log(msg: str) : void
 }
 
 // 一等 Trait 值作为运行时值传递 (§4.6.2)
-fun run_with(l: Logger) : Unit {
+fun run_with(l: Logger) : void {
     l.log("message via trait param")
 }
 
@@ -18,10 +18,10 @@ fun expensive() : i32 {
     100
 }
 
-fun main() {
+fun main(): void {
     // 内联 trait 值：trait { ... } 匿名实现，编译为 vtable
     val console : Logger = trait {
-        fun log(msg) { println("[console] " + msg) }
+        fun log(msg): void { println("[console] " + msg) }
     }
     console.log("direct call")
 
@@ -30,7 +30,7 @@ fun main() {
 
     // 不同实现，同一接口
     val prefixed : Logger = trait {
-        fun log(msg) { println(">>> " + msg) }
+        fun log(msg): void { println(">>> " + msg) }
     }
     run_with(prefixed)
 

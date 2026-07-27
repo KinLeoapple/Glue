@@ -7,24 +7,23 @@
 //! 后续 Phase：sema 完成完整类型分析后填充此结构，图构建器从中读取类型/分派信息。
 //!
 //! v3 阶段 3：从 ir/ 迁入 sema/（设计文档 §5.1 要求）。
-//! 依赖 ir 模块的 ChanType/ConstVal/TypeDescriptor/CoroutineMeta（通过 @import("ir") 跨模块引用）。
+//! 依赖 ir 模块的 ConstVal/TypeDescriptor/CoroutineMeta（通过 @import("ir") 跨模块引用）。
 
 const std = @import("std");
+const ast = @import("ast");
 const ir_mod = @import("ir");
-const channel_mod = ir_mod.channel_mod;
 const meta_mod = ir_mod.meta_mod;
 const type_descriptor_mod = ir_mod.type_descriptor_mod;
 
-pub const ChanType = channel_mod.ChanType;
 pub const ConstVal = meta_mod.ConstVal;
 pub const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
 
 /// 单个表达式的语义信息
 pub const ExprInfo = struct {
-    /// 表达式的通道类型（决定通道宽度）
-    chan_type: ChanType,
-    /// Nullable 内部类型（chan_type == .nullable_chan 时有效）
-    inner_type: ChanType = .null_chan,
+    /// 表达式的类型描述符（决定通道宽度与读写 vtable）
+    type_desc: *const TypeDescriptor,
+    /// Nullable 内部类型描述符（type_desc.is_nullable 时有效）
+    inner_type_desc: ?*const TypeDescriptor = null,
     /// 编译期常量值（若表达式是常量）
     const_val: ?ConstVal = null,
     /// 表达式的 AST 指针地址（用作 key）
@@ -56,11 +55,16 @@ pub const CtorDefInfo = struct {
     name: []const u8,
     type_name: []const u8,
     field_names: []const ?[]const u8,
-    field_chan_types: []const ChanType,
+    field_type_descs: []const *const TypeDescriptor,
     field_type_names: []const ?[]const u8,
     is_newtype: bool = false,
     /// GADT 构造器返回类型名（仅 GADT 有效）
     return_type_name: ?[]const u8 = null,
+    /// GADT 构造器返回类型 TypeNode（仅 GADT 有效，消除 IR 侧 AST 回退）
+    return_type_node: ?*const ast.TypeNode = null,
+    /// 构造器字段的 TypeNode（消除 IR 侧 AST 回退）
+    /// 长度与 field_names 一致，无类型信息的字段为 null
+    field_type_nodes: []const ?*const ast.TypeNode = &.{},
 };
 
 /// 类型定义信息（替代 IRBuilder 的 type_table + ctor_table）
@@ -74,15 +78,15 @@ pub const TypeDefInfo = struct {
     type_params: []const []const u8,
     /// 仅 alias/newtype：目标类型名
     target_type_name: ?[]const u8 = null,
-    /// 仅 alias/newtype：目标通道类型
-    target_chan_type: ?ChanType = null,
+    /// 仅 alias/newtype：目标类型描述符
+    target_type_desc: ?*const TypeDescriptor = null,
 };
 
 /// Trait 方法签名（压平后的 sema TraitInfo 方法）
 pub const TraitMethodSig = struct {
     name: []const u8,
     param_count: u8,
-    return_chan_type: ChanType,
+    return_type_desc: *const TypeDescriptor,
     is_async: bool = false,
     /// 是否有 default 实现体（IRBuilder 据此决定是否从 AST 取 body）
     has_body: bool,
@@ -96,8 +100,8 @@ pub const TraitDefInfo = struct {
 
 /// 函数签名引用（嵌入 ExprInfo，仅对 callee 表达式有效）
 pub const FnSigRef = struct {
-    param_types: []const ChanType,
-    return_type: ChanType,
+    param_type_descs: []const *const TypeDescriptor,
+    return_type_desc: *const TypeDescriptor,
     is_async: bool = false,
     is_throwing: bool = false,
 };
@@ -107,13 +111,17 @@ pub const FuncSigInfo = struct {
     /// 函数名或 mangled 名（TypeName.method）
     name: []const u8,
     type_params: []const []const u8,
-    param_chan_types: []const ChanType,
-    return_chan_type: ChanType,
+    param_type_descs: []const *const TypeDescriptor,
+    return_type_desc: *const TypeDescriptor,
     /// 每个参数是否为 &T 引用语义
     param_is_ref: []const bool,
     return_is_ref: bool = false,
     is_async: bool = false,
     is_throwing: bool = false,
+    /// 参数类型名（消除 IR 侧 findFuncParamsAst AST 回退）
+    /// 用于判断参数是否为 trait 类型（配合 getTraitDef 查询）
+    /// null 表示该参数无类型注解或类型推断产生
+    param_type_names: []const ?[]const u8 = &.{},
 };
 
 /// Import 别名目标（区分模块引用和符号引用）
@@ -498,12 +506,12 @@ test "SemaResult 基本操作" {
     try testing.expect(!sr.has_error);
     try testing.expectEqual(@as(usize, 0), sr.expr_types.count());
 
-    try sr.putExpr(0x1000, .{ .chan_type = .i64_chan });
-    try sr.putExpr(0x2000, .{ .chan_type = .f64_chan });
+    try sr.putExpr(0x1000, .{ .type_desc = type_descriptor_mod.i64_descriptor });
+    try sr.putExpr(0x2000, .{ .type_desc = type_descriptor_mod.f64_descriptor });
 
     try testing.expectEqual(@as(usize, 2), sr.expr_types.count());
-    try testing.expectEqual(ChanType.i64_chan, sr.getExpr(0x1000).?.chan_type);
-    try testing.expectEqual(ChanType.f64_chan, sr.getExpr(0x2000).?.chan_type);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, sr.getExpr(0x1000).?.type_desc);
+    try testing.expectEqual(type_descriptor_mod.f64_descriptor, sr.getExpr(0x2000).?.type_desc);
     try testing.expect(sr.getExpr(0x3000) == null);
 }
 
@@ -522,14 +530,17 @@ test "SemaResult type_defs 查询" {
     defer sr.deinit();
 
     const field_names = [_]?[]const u8{ "x", "y" };
-    const field_chan_types = [_]ChanType{ .i64_chan, .i64_chan };
+    const field_type_descs = [_]*const TypeDescriptor{
+        type_descriptor_mod.i64_descriptor,
+        type_descriptor_mod.i64_descriptor,
+    };
     const field_type_names = [_]?[]const u8{ "i64", "i64" };
     const ctors = [_]CtorDefInfo{
         .{
             .name = "Point",
             .type_name = "Point",
             .field_names = &field_names,
-            .field_chan_types = &field_chan_types,
+            .field_type_descs = &field_type_descs,
             .field_type_names = &field_type_names,
         },
     };
@@ -551,7 +562,7 @@ test "SemaResult type_defs 查询" {
     try testing.expectEqualStrings("Point", ctor.type_name);
     try testing.expectEqual(@as(usize, 2), ctor.field_names.len);
     try testing.expectEqualStrings("x", ctor.field_names[0].?);
-    try testing.expectEqual(ChanType.i64_chan, ctor.field_chan_types[0]);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, ctor.field_type_descs[0]);
 
     try testing.expect(sr.getTypeDef("Missing") == null);
     try testing.expect(sr.getCtorDef("Missing") == null);
@@ -562,8 +573,8 @@ test "SemaResult trait_defs 查询" {
     defer sr.deinit();
 
     const methods = [_]TraitMethodSig{
-        .{ .name = "next", .param_count = 0, .return_chan_type = .nullable_chan, .has_body = false },
-        .{ .name = "has_next", .param_count = 0, .return_chan_type = .bool_chan, .has_body = true },
+        .{ .name = "next", .param_count = 0, .return_type_desc = type_descriptor_mod.nullable_descriptor, .has_body = false },
+        .{ .name = "has_next", .param_count = 0, .return_type_desc = type_descriptor_mod.bool_descriptor, .has_body = true },
     };
     try sr.putTraitDef(.{
         .name = "Iterator",
@@ -575,7 +586,7 @@ test "SemaResult trait_defs 查询" {
     try testing.expectEqual(@as(usize, 2), def.methods.len);
     try testing.expectEqualStrings("next", def.methods[0].name);
     try testing.expectEqual(@as(u8, 0), def.methods[0].param_count);
-    try testing.expectEqual(ChanType.bool_chan, def.methods[1].return_chan_type);
+    try testing.expectEqual(type_descriptor_mod.bool_descriptor, def.methods[1].return_type_desc);
     try testing.expect(def.methods[1].has_body);
 
     try testing.expect(sr.getTraitDef("Missing") == null);
@@ -585,22 +596,25 @@ test "SemaResult func_sigs 查询" {
     var sr = SemaResult.init(testing.allocator);
     defer sr.deinit();
 
-    const param_chan_types = [_]ChanType{ .i64_chan, .i64_chan };
+    const param_type_descs = [_]*const TypeDescriptor{
+        type_descriptor_mod.i64_descriptor,
+        type_descriptor_mod.i64_descriptor,
+    };
     const param_is_ref = [_]bool{ false, false };
     const type_params = [_][]const u8{};
     try sr.putFuncSig(.{
         .name = "add",
         .type_params = &type_params,
-        .param_chan_types = &param_chan_types,
-        .return_chan_type = .i64_chan,
+        .param_type_descs = &param_type_descs,
+        .return_type_desc = type_descriptor_mod.i64_descriptor,
         .param_is_ref = &param_is_ref,
     });
 
     const sig = sr.getFuncSig("add").?;
     try testing.expectEqualStrings("add", sig.name);
-    try testing.expectEqual(@as(usize, 2), sig.param_chan_types.len);
-    try testing.expectEqual(ChanType.i64_chan, sig.param_chan_types[0]);
-    try testing.expectEqual(ChanType.i64_chan, sig.return_chan_type);
+    try testing.expectEqual(@as(usize, 2), sig.param_type_descs.len);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, sig.param_type_descs[0]);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, sig.return_type_desc);
     try testing.expect(!sig.is_async);
     try testing.expect(!sig.is_throwing);
 

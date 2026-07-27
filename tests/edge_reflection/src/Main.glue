@@ -68,7 +68,7 @@ type ReflectivePoint: Named = ReflectivePoint(x: i32, y: i32) {
     }
 }
 
-fun main() {
+fun main(): void {
     // ---- typeof on user types：顶层 7 字段中的 name / kind / module ----
     val info_point = typeof(Point)
     println(info_point.name)         // Point

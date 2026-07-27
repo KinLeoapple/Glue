@@ -1078,7 +1078,7 @@ pub const Value = union(enum) {
         const al = tctx.backing;
         switch (self) {
             .null_val => try buf.appendSlice(al, "null"),
-            .unit => try buf.appendSlice(al, "()"),
+            .unit => try buf.appendSlice(al, "void"),
             .boolean => try buf.appendSlice(al, if (self.asBool()) "true" else "false"),
             .char => {
                 var temp: [16]u8 = undefined;

@@ -152,7 +152,7 @@ pub const ModuleLoader = struct {
         }
 
         // 类型检查
-        self.type_inferencer.checkModule(&module);
+        try self.type_inferencer.checkModule(&module);
         if (self.type_inferencer.errors.items.len > 0) {
             var has_fatal = false;
             for (self.type_inferencer.errors.items) |err| {

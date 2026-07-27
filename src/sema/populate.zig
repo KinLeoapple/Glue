@@ -8,10 +8,10 @@ const std = @import("std");
 const ast = @import("ast");
 const ir_mod = @import("ir");
 const type_resolver = @import("type_resolver.zig");
+const type_descriptor = @import("type_descriptor.zig");
 
 const sema_output = @import("sema_output.zig");
 const SemaResult = sema_output.SemaResult;
-const ChanType = ir_mod.ChanType;
 const TypeDefInfo = sema_output.TypeDefInfo;
 const TypeDefKind = sema_output.TypeDefKind;
 const CtorDefInfo = sema_output.CtorDefInfo;
@@ -49,24 +49,27 @@ fn astFunDeclToFuncSig(
     const type_params = try arena_alloc.alloc([]const u8, fd.type_params.len);
     for (fd.type_params, 0..) |tp, i| type_params[i] = tp.name;
 
-    const param_chan_types = try arena_alloc.alloc(ChanType, fd.params.len);
+    const param_type_descs = try arena_alloc.alloc(*const TypeDescriptor, fd.params.len);
     const param_is_ref = try arena_alloc.alloc(bool, fd.params.len);
+    const param_type_names = try arena_alloc.alloc(?[]const u8, fd.params.len);
     for (fd.params, 0..) |p, i| {
-        param_chan_types[i] = type_resolver.resolveChanType(p.type_annotation, &.{}) orelse .ref_chan;
+        param_type_descs[i] = type_resolver.resolveTypeNode(p.type_annotation, &.{}) orelse &type_resolver.ref_type_descriptor;
         param_is_ref[i] = if (p.type_annotation) |ta| ta.* == .ref_type else false;
+        param_type_names[i] = if (p.type_annotation) |tn| typeNameFromTypeNodeConst(tn) else null;
     }
 
-    const return_chan_type = type_resolver.resolveChanType(fd.return_type, &.{}) orelse .i64_chan;
+    const return_type_desc = type_resolver.resolveTypeNode(fd.return_type, &.{}) orelse type_descriptor.lookupByScalarKind(.i64);
     const is_throwing = isThrowType(fd.return_type);
 
     try sema_result.putFuncSig(.{
         .name = fd.name,
         .type_params = type_params,
-        .param_chan_types = param_chan_types,
-        .return_chan_type = return_chan_type,
+        .param_type_descs = param_type_descs,
+        .return_type_desc = return_type_desc,
         .param_is_ref = param_is_ref,
         .is_async = fd.is_async,
         .is_throwing = is_throwing,
+        .param_type_names = param_type_names,
     });
 }
 
@@ -79,11 +82,11 @@ fn astTraitDeclToTraitDef(
 ) !void {
     const methods = try arena_alloc.alloc(TraitMethodSig, trd.methods.len);
     for (trd.methods, 0..) |m, i| {
-        const return_chan_type = type_resolver.resolveChanType(m.return_type, &.{}) orelse .i64_chan;
+        const return_type_desc = type_resolver.resolveTypeNode(m.return_type, &.{}) orelse type_descriptor.lookupByScalarKind(.i64);
         methods[i] = .{
             .name = m.name,
             .param_count = @intCast(m.params.len),
-            .return_chan_type = return_chan_type,
+            .return_type_desc = return_type_desc,
             .has_body = m.body != null,
         };
     }
@@ -108,20 +111,24 @@ fn astTypeDeclToTypeDef(
             const ctors = try arena_alloc.alloc(CtorDefInfo, adt.constructors.len);
             for (adt.constructors, 0..) |cdef, ci| {
                 const field_names = try arena_alloc.alloc(?[]const u8, cdef.fields.len);
-                const field_chan_types = try arena_alloc.alloc(ChanType, cdef.fields.len);
+                const field_type_descs = try arena_alloc.alloc(*const TypeDescriptor, cdef.fields.len);
                 const field_type_names = try arena_alloc.alloc(?[]const u8, cdef.fields.len);
+                const field_type_nodes = try arena_alloc.alloc(?*const ast.TypeNode, cdef.fields.len);
                 for (cdef.fields, 0..) |cf, fi| {
                     field_names[fi] = cf.name;
-                    field_chan_types[fi] = type_resolver.resolveChanType(cf.ty, &.{}) orelse .ref_chan;
+                    field_type_descs[fi] = type_resolver.resolveTypeNode(cf.ty, &.{}) orelse &type_resolver.ref_type_descriptor;
                     field_type_names[fi] = typeNameFromTypeNodeConst(cf.ty);
+                    field_type_nodes[fi] = cf.ty;
                 }
                 ctors[ci] = .{
                     .name = cdef.name,
                     .type_name = td.name,
                     .field_names = field_names,
-                    .field_chan_types = field_chan_types,
+                    .field_type_descs = field_type_descs,
                     .field_type_names = field_type_names,
                     .return_type_name = null,
+                    .return_type_node = cdef.return_type,
+                    .field_type_nodes = field_type_nodes,
                 };
             }
             try sema_result.putTypeDef(.{
@@ -133,11 +140,11 @@ fn astTypeDeclToTypeDef(
         },
         .record => |r| {
             const field_names = try arena_alloc.alloc(?[]const u8, r.fields.len);
-            const field_chan_types = try arena_alloc.alloc(ChanType, r.fields.len);
+            const field_type_descs = try arena_alloc.alloc(*const TypeDescriptor, r.fields.len);
             const field_type_names = try arena_alloc.alloc(?[]const u8, r.fields.len);
             for (r.fields, 0..) |f, fi| {
                 field_names[fi] = f.name;
-                field_chan_types[fi] = type_resolver.resolveChanType(f.ty, &.{}) orelse .ref_chan;
+                field_type_descs[fi] = type_resolver.resolveTypeNode(f.ty, &.{}) orelse &type_resolver.ref_type_descriptor;
                 field_type_names[fi] = typeNameFromTypeNodeConst(f.ty);
             }
             const ctors = try arena_alloc.alloc(CtorDefInfo, 1);
@@ -145,7 +152,7 @@ fn astTypeDeclToTypeDef(
                 .name = td.name,
                 .type_name = td.name,
                 .field_names = field_names,
-                .field_chan_types = field_chan_types,
+                .field_type_descs = field_type_descs,
                 .field_type_names = field_type_names,
             };
             try sema_result.putTypeDef(.{
@@ -162,24 +169,27 @@ fn astTypeDeclToTypeDef(
                 .constructors = &[_]CtorDefInfo{},
                 .type_params = type_params,
                 .target_type_name = typeNameFromTypeNodeConst(a.target),
-                .target_chan_type = type_resolver.resolveChanType(a.target, &.{}),
+                .target_type_desc = type_resolver.resolveTypeNode(a.target, &.{}),
             });
         },
         .newtype => |nt| {
-            const field_chan_types = try arena_alloc.alloc(ChanType, 1);
+            const field_type_descs = try arena_alloc.alloc(*const TypeDescriptor, 1);
             const field_type_names = try arena_alloc.alloc(?[]const u8, 1);
             const field_names = try arena_alloc.alloc(?[]const u8, 1);
-            field_chan_types[0] = type_resolver.resolveChanType(nt.inner, &.{}) orelse .ref_chan;
+            const field_type_nodes = try arena_alloc.alloc(?*const ast.TypeNode, 1);
+            field_type_descs[0] = type_resolver.resolveTypeNode(nt.inner, &.{}) orelse &type_resolver.ref_type_descriptor;
             field_type_names[0] = typeNameFromTypeNodeConst(nt.inner);
             field_names[0] = "_0";
+            field_type_nodes[0] = nt.inner;
             const ctors = try arena_alloc.alloc(CtorDefInfo, 1);
             ctors[0] = .{
                 .name = td.name,
                 .type_name = td.name,
                 .field_names = field_names,
-                .field_chan_types = field_chan_types,
+                .field_type_descs = field_type_descs,
                 .field_type_names = field_type_names,
                 .is_newtype = true,
+                .field_type_nodes = field_type_nodes,
             };
             try sema_result.putTypeDef(.{
                 .name = td.name,
@@ -190,20 +200,23 @@ fn astTypeDeclToTypeDef(
         },
         .error_newtype => |en| {
             const field_names = try arena_alloc.alloc(?[]const u8, en.params.len);
-            const field_chan_types = try arena_alloc.alloc(ChanType, en.params.len);
+            const field_type_descs = try arena_alloc.alloc(*const TypeDescriptor, en.params.len);
             const field_type_names = try arena_alloc.alloc(?[]const u8, en.params.len);
+            const field_type_nodes = try arena_alloc.alloc(?*const ast.TypeNode, en.params.len);
             for (en.params, 0..) |p, pi| {
                 field_names[pi] = p.name;
-                field_chan_types[pi] = type_resolver.resolveChanType(p.type_annotation, &.{}) orelse .ref_chan;
+                field_type_descs[pi] = type_resolver.resolveTypeNode(p.type_annotation, &.{}) orelse &type_resolver.ref_type_descriptor;
                 field_type_names[pi] = if (p.type_annotation) |tn| typeNameFromTypeNodeConst(tn) else null;
+                field_type_nodes[pi] = p.type_annotation;
             }
             const ctors = try arena_alloc.alloc(CtorDefInfo, 1);
             ctors[0] = .{
                 .name = en.name,
                 .type_name = td.name,
                 .field_names = field_names,
-                .field_chan_types = field_chan_types,
+                .field_type_descs = field_type_descs,
                 .field_type_names = field_type_names,
+                .field_type_nodes = field_type_nodes,
             };
             try sema_result.putTypeDef(.{
                 .name = td.name,

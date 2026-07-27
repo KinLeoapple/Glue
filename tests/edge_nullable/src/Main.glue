@@ -89,7 +89,7 @@ fun makeNullableLocal(): () -> i32 {
 // partial application 与 nullable：绑定非 nullable 参数，返回 nullable 非空值
 fun makeSumOrNull(x: i32, y: i32): i32? { if x == y { null } else { x + y } }
 
-fun main() {
+fun main(): void {
     val acc1 = Account(User("Alice", Addr("Beijing", 100000)), 500)
     val acc2 = Account(User("Bob", null), 300)
     val acc3 = Account(null, 0)

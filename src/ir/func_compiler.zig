@@ -7,13 +7,13 @@ const std = @import("std");
 const ast = @import("ast");
 const node_mod = @import("node.zig");
 const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const builder_mod = @import("builder.zig");
 
 const IRBuilder = builder_mod.IRBuilder;
 const BuildError = builder_mod.BuildError;
 const Node = node_mod.Node;
 const NodeOp = builder_mod.NodeOp;
-const ChanType = channel_mod.ChanType;
 const LinearRecurrenceInfo = builder_mod.LinearRecurrenceInfo;
 
 pub const Methods = struct {
@@ -49,7 +49,7 @@ pub const Methods = struct {
         defer self.current_self_type_name = prev_self_type;
 
         for (td.implemented_traits) |tb| {
-            if (self.sema_result.?.getTraitDef(tb.trait_name) == null) continue;
+            if (self.sema_result.getTraitDef(tb.trait_name) == null) continue;
             const trait_methods = self.findTraitMethodsAst(tb.trait_name) orelse continue;
             for (trait_methods) |tm| {
                 if (tm.body == null) continue;
@@ -85,10 +85,10 @@ pub const Methods = struct {
         var param_channels = try arena_alloc.alloc(u16, params.len);
         for (params, 0..) |param, i| {
             const chan = if (param.type_annotation) |tn| switch (tn.*) {
-                .nullable => |nb| try self.channels.allocNullable(self.chanTypeFromTypeNodeBound(nb.inner) orelse .i64_chan),
-                .ref_type, .raw_ptr => try self.channels.allocRef(.ref_chan),
-                else => try self.allocChannel(self.chanTypeFromTypeNodeBound(tn) orelse .i64_chan),
-            } else try self.allocChannel(.i64_chan);
+                .nullable => |nb| try self.channels.allocNullable(self.chanTypeFromTypeNodeBound(nb.inner) orelse type_descriptor_mod.i64_descriptor),
+                .ref_type, .raw_ptr => try self.channels.allocRef(type_descriptor_mod.ref_descriptor),
+                else => try self.allocChannel(self.chanTypeFromTypeNodeBound(tn) orelse type_descriptor_mod.i64_descriptor),
+            } else try self.allocChannel(type_descriptor_mod.i64_descriptor);
             param_channels[i] = chan;
         }
         return param_channels;
@@ -111,7 +111,7 @@ pub const Methods = struct {
         const prev_type_ctx = self.current_type_context;
         const prev_return_chan = self.current_return_chan;
         const prev_returns_throw = self.current_returns_throw;
-        const prev_throw_ok_chan_type = self.current_throw_ok_chan_type;
+        const prev_throw_ok_chan_type = self.current_throw_ok_type_desc;
         if (@hasField(@TypeOf(fd), "name")) {
             self.current_func_name = fd.name;
             // stdlib 方法（如 "std.time.DateTime.add_duration"）：从函数名推断类型上下文
@@ -122,13 +122,13 @@ pub const Methods = struct {
                     const prefix = fd.name[0..last_dot];
                     if (std.mem.lastIndexOfScalar(u8, prefix, '.')) |prev_dot| {
                         const type_candidate = prefix[prev_dot + 1 ..];
-                        if (self.sema_result.?.getTypeDef(type_candidate) != null) {
+                        if (self.sema_result.getTypeDef(type_candidate) != null) {
                             self.current_type_context = type_candidate;
                         }
                     } else {
                         // 只有一个点：TypeName.method
                         const type_candidate = prefix;
-                        if (self.sema_result.?.getTypeDef(type_candidate) != null) {
+                        if (self.sema_result.getTypeDef(type_candidate) != null) {
                             self.current_type_context = type_candidate;
                         }
                     }
@@ -148,7 +148,7 @@ pub const Methods = struct {
             self.current_type_context = prev_type_ctx;
             self.current_return_chan = prev_return_chan;
             self.current_returns_throw = prev_returns_throw;
-            self.current_throw_ok_chan_type = prev_throw_ok_chan_type;
+            self.current_throw_ok_type_desc = prev_throw_ok_chan_type;
         }
 
         // 在局部通道范围内重新分配参数通道（确保 recursion save/restore 覆盖参数通道）
@@ -174,7 +174,7 @@ pub const Methods = struct {
         self.current_returns_throw = if (@hasField(@TypeOf(fd), "return_type")) builder_mod.isThrowType(effective_return_type) else false;
         // 提取 Throw<T, E> 的 Ok 值通道类型，供 ? 传播使用
         if (self.current_returns_throw and @hasField(@TypeOf(fd), "return_type")) {
-            self.current_throw_ok_chan_type = builder_mod.throwOkChanType(effective_return_type) orelse .i64_chan;
+            self.current_throw_ok_type_desc = builder_mod.throwOkChanType(effective_return_type) orelse type_descriptor_mod.i64_descriptor;
         }
 
         // 编译函数体（函数体在尾位置）
@@ -185,7 +185,7 @@ pub const Methods = struct {
         // 若函数返回 Throw<T, E> 且函数体不是直接产生 ThrowValue 的表达式（如 Ok(...)），
         // 则包装结果为 ThrowValue(ok)
         const throw_wrapped = if (self.current_returns_throw and !self.exprIsThrowValue(fd.body)) blk: {
-            const wrap_out = try self.allocChannel(.ref_chan);
+            const wrap_out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
             const meta_idx = try self.addGateMeta(.{ .gate_kind = .make_ok });
             try self.emit(Node.makeUnary(.gate_make_ok, wrap_out, meta_idx, body_chan));
             break :blk wrap_out;
@@ -193,13 +193,13 @@ pub const Methods = struct {
 
         // 若函数返回 nullable 类型且函数体未产生 nullable_chan，则包装为 nullable
         const return_meta = self.channels.get(return_chan);
-        const final_chan = if (return_meta.chan_type == .nullable_chan) blk: {
+        const final_chan = if (return_meta.type_desc.is_nullable) blk: {
             const body_meta = self.channels.get(throw_wrapped);
-            if (body_meta.chan_type == .nullable_chan) {
+            if (body_meta.type_desc.is_nullable) {
                 break :blk throw_wrapped; // 已是 nullable
             }
             // 需要包装（null_chan 或其他类型 → nullable_make）
-            const nc = try self.channels.allocNullable(return_meta.inner_type);
+            const nc = try self.channels.allocNullable(return_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
             try self.emit(Node.makeUnary(.nullable_make, nc, 0, throw_wrapped));
             break :blk nc;
         } else throw_wrapped;
@@ -248,7 +248,7 @@ pub const Methods = struct {
             _ = self.addCoroutineMeta(cm) catch return BuildError.TransformFailed;
         }
 
-        // current_return_chan/current_returns_throw/current_throw_ok_chan_type
+        // current_return_chan/current_returns_throw/current_throw_ok_type_desc
         // 由函数开头的 defer 块统一恢复（支持单态化嵌套 compileFunction 调用）
         return func_idx;
     }
@@ -267,9 +267,9 @@ pub const Methods = struct {
         const param_name = param.name;
         // 参数必须是整数类型
         const chan_type = if (param.type_annotation) |tn|
-            builder_mod.chanTypeFromTypeNode(tn) orelse .i64_chan
+            self.chanTypeFromTypeNodeBound(tn) orelse type_descriptor_mod.i64_descriptor
         else
-            .i64_chan;
+            type_descriptor_mod.i64_descriptor;
         if (!chan_type.isInt()) return null;
 
         // 函数体必须是 if_expr（允许包裹在无语句的 block 中）
@@ -389,7 +389,7 @@ pub const Methods = struct {
         const body_start: u32 = @intCast(self.nodes.items.len);
 
         // 条件子图：cmp_lt(i_chan, n_chan)
-        const cond_chan = try self.allocChannel(.bool_chan);
+        const cond_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
         try self.emit(Node.makeBinary(.cmp_lt, cond_chan, 0, i_chan, n_chan));
         const cond_len: u32 = @intCast(self.nodes.items.len - body_start);
 
@@ -409,7 +409,7 @@ pub const Methods = struct {
         const body_len: u32 = @intCast(self.nodes.items.len - body_start);
 
         // 发射 scalar_loop
-        const loop_out = try self.allocChannel(.i64_chan);
+        const loop_out = try self.allocChannel(type_descriptor_mod.i64_descriptor);
         const meta_idx = try self.addLoopMeta(.{
             .body_start = body_start,
             .body_len = body_len,
@@ -438,14 +438,15 @@ pub const Methods = struct {
 
     /// 单态化核心：实例化泛型函数，返回特化函数索引
     ///
+    /// sema 已预先收集所有泛型调用点（collectMonomorphInstances），IR 从 sema
+    /// monomorph_index 查询实例，编译函数体生成 IR 节点。
+    ///
     /// 对每个 (func_name, type_args) 组合生成一份特化代码：
-    /// 1. 查缓存命中 → 直接返回
-    /// 2. 查进行中（递归）→ 返回预占索引
-    /// 3. 查找函数 AST，预占 Function 索引
-    /// 4. push type binding（type_param 名 → 具体 ChanType + type_id）
-    /// 5. 预分配占位 Function（return channel 用 bound 版本解析）
-    /// 6. 调用 compileFunction 编译函数体（chanTypeFromTypeNodeBound 查绑定栈）
-    /// 7. pop type binding，写入缓存
+    /// 1. 查 sema monomorph_index 获取 instance_id
+    /// 2. 查 instance_func_map：已编译则返回
+    /// 3. 查 instances_in_progress：递归中则返回预占索引
+    /// 4. 查找函数 AST，预占 Function 索引
+    /// 5. push type binding，编译函数体，建立映射
     ///
     /// 非泛型函数（type_params.len == 0）直接返回原 func_table 索引，不做单态化。
     pub fn instantiateFunction(
@@ -454,26 +455,35 @@ pub const Methods = struct {
         type_args: []const u16,
     ) !u16 {
         // 1. 非泛型函数：直接返回原索引
-        const sig = self.sema_result.?.getFuncSig(func_name) orelse {
+        const sig = self.sema_result.getFuncSig(func_name) orelse {
             return self.func_table.get(func_name) orelse return error.UndefinedFunction;
         };
         if (sig.type_params.len == 0) {
             return self.func_table.get(func_name) orelse return error.UndefinedFunction;
         }
 
-        // 2. 构造缓存键 "func_name#hash"
+        // 2. 查 sema monomorph_index（统一缓存）
+        //    IR 侧 hashTypeArgs 与 sema 侧 hashTypeArgs 实现兼容（均用 type_id 做 FNV-1a），
+        //    因此构造的 cache_key 与 sema 一致
         const arena_alloc = self.arena.allocator();
         const hash = hashTypeArgs(type_args);
         const cache_key = try std.fmt.allocPrint(arena_alloc, "{s}#{x}", .{ func_name, hash });
+        defer arena_alloc.free(cache_key);
 
-        // 3. 查缓存
-        if (self.monomorph_cache.get(cache_key)) |idx| {
-            return idx;
+        const instance_id = self.sema_result.monomorph_index.get(cache_key) orelse {
+            // sema 未收集（不应发生，collectMonomorphInstances 已收集所有调用点）
+            // 回退：返回原函数索引
+            return self.func_table.get(func_name) orelse return error.UndefinedFunction;
+        };
+
+        // 3. 查 instance_func_map：已编译则返回
+        if (self.instance_func_map.get(instance_id)) |func_idx| {
+            return func_idx;
         }
 
         // 4. 查进行中（递归占位）
-        if (self.monomorph_in_progress.get(cache_key)) |idx| {
-            return idx;
+        if (self.instances_in_progress.get(instance_id)) |func_idx| {
+            return func_idx;
         }
 
         // 5. 查找函数 AST
@@ -486,17 +496,25 @@ pub const Methods = struct {
         const new_func_idx: u16 = @intCast(self.functions.items.len);
 
         // 7. 写入进行中（防止递归无限展开）
-        try self.monomorph_in_progress.put(cache_key, new_func_idx);
-        defer _ = self.monomorph_in_progress.remove(cache_key);
+        try self.instances_in_progress.put(instance_id, new_func_idx);
+        defer _ = self.instances_in_progress.remove(instance_id);
 
-        // 8. push type binding
-        try self.pushTypeBinding(fd.type_params, type_args);
-        defer self.popTypeBinding();
+        // 8. 设置单态化上下文：current_instance + current_type_args
+        //    替代原 pushTypeBinding/popTypeBinding，sema 已是类型绑定权威来源
+        const instance_ptr = &self.sema_result.monomorph_instances.items[instance_id];
+        const prev_instance = self.current_instance;
+        const prev_type_args = self.current_type_args;
+        self.current_instance = instance_ptr;
+        self.current_type_args = instance_ptr.type_args;
+        defer {
+            self.current_instance = prev_instance;
+            self.current_type_args = prev_type_args;
+        }
 
         // 9. 预分配占位 Function（return channel 用 bound 版本解析）
-        const return_chan_type = self.chanTypeFromTypeNodeBound(fd.return_type) orelse .i64_chan;
-        const placeholder_return_chan = if (return_chan_type == .nullable_chan)
-            try self.channels.allocNullable(.i64_chan) // inner_type 暂用 i64，compileFunction 会修正
+        const return_chan_type = self.chanTypeFromTypeNodeBound(fd.return_type) orelse type_descriptor_mod.i64_descriptor;
+        const placeholder_return_chan = if (return_chan_type.is_nullable)
+            try self.channels.allocNullable(type_descriptor_mod.i64_descriptor) // inner_type 暂用 i64，compileFunction 会修正
         else
             try self.allocChannel(return_chan_type);
         const placeholder_param_channels = try self.allocParamChannels(fd.params, arena_alloc);
@@ -513,8 +531,8 @@ pub const Methods = struct {
         // 10. 编译函数体（compileFunction 会更新占位条目）
         _ = try self.compileFunction(fd.*, new_func_idx);
 
-        // 11. 写入缓存
-        try self.monomorph_cache.put(cache_key, new_func_idx);
+        // 11. 建立 sema instance_id → IR func_idx 映射
+        try self.instance_func_map.put(instance_id, new_func_idx);
 
         return new_func_idx;
     }

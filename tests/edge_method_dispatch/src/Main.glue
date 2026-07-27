@@ -17,7 +17,7 @@ type Box: Label = Box(items: i32[]) {
     }
 }
 
-fun main() {
+fun main(): void {
     // ---- 内建方法：数组 ----
     val arr = [1, 2, 3, 4, 5]
     println(arr.len())           // 5

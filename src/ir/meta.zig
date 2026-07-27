@@ -11,6 +11,8 @@ const std = @import("std");
 const scalar = @import("value").scalar;
 const node_mod = @import("node.zig");
 const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
+const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
 
 /// 标量元数据：描述 const_i/const_f/int_*/float_*/cmp_*/cast 等节点的类型信息
 pub const ScalarMeta = struct {
@@ -142,8 +144,8 @@ pub const VectorMeta = struct {
     body_len: u32 = 0,
     /// 向量长度（编译期已知则填充，未知为 null）
     length: ?u32 = null,
-    /// 元素通道类型
-    elem_type: channel_mod.ChanType = .i64_chan,
+    /// 元素类型描述符
+    elem_type_desc: *const TypeDescriptor = type_descriptor_mod.i64_descriptor,
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -239,8 +241,8 @@ pub const OrbitMeta = struct {
     func_index: u16,
     /// 参数数量
     arg_count: u8,
-    /// 结果通道类型（orbit_async_join 的输出类型）
-    result_type: channel_mod.ChanType = .i64_chan,
+    /// 结果类型描述符（orbit_async_join 的输出类型）
+    result_type_desc: *const TypeDescriptor = type_descriptor_mod.i64_descriptor,
     /// 是否为 spawn（fire-and-forget，无 join）
     is_spawn: bool = false,
     /// 参数引用位图：第 i 位为 1 表示第 i 个参数为 &T / *T（引用语义，跳过深拷贝）。
@@ -269,8 +271,8 @@ pub const LoopMeta = struct {
     cond_chan: u16 = 0,
     /// 循环变量通道（for 专用，绑定当前元素）
     iter_chan: u16 = 0,
-    /// 元素类型（for 专用）
-    elem_type: channel_mod.ChanType = .i64_chan,
+    /// 元素类型描述符（for 专用）
+    elem_type_desc: *const TypeDescriptor = type_descriptor_mod.i64_descriptor,
 };
 
 /// 循环类型
@@ -442,8 +444,8 @@ pub const ClosureMeta = struct {
     func_index: u16,
     /// 上值（捕获变量）数量
     upvalue_count: u8,
-    /// 结果通道类型（call_indirect 的输出类型）
-    result_type: channel_mod.ChanType = .i64_chan,
+    /// 结果类型描述符（call_indirect 的输出类型）
+    result_type_desc: *const TypeDescriptor = type_descriptor_mod.i64_descriptor,
     /// lambda 函数体节点序列在主节点流中的起始索引（全局）
     body_start: u32 = 0,
     /// lambda 函数体节点数量
@@ -503,7 +505,7 @@ pub const TypeKind = enum(u4) {
             .alias => "Alias",
             .func => "Func",
             .trait => "Trait",
-            .unit => "Unit",
+            .unit => "Void",
             .nullable => "Nullable",
         };
     }
@@ -674,8 +676,8 @@ pub const SyscallMeta = struct {
     /// Syscall ID（@intFromEnum(syscall.SyscallId)，对应 REGISTRY 数组索引）
     syscall_id: u16,
     arg_count: u8,
-    /// 返回值通道类型（用于 IR 通道分配）
-    return_chan_type: channel_mod.ChanType = .ref_chan,
+    /// 返回值类型描述符（用于 IR 通道分配）
+    return_type_desc: *const TypeDescriptor = type_descriptor_mod.ref_descriptor,
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -725,11 +727,11 @@ test "VectorMeta range_source 默认" {
     const vm = VectorMeta{
         .vec_op = .range_source,
         .length = 10,
-        .elem_type = .i64_chan,
+        .elem_type_desc = type_descriptor_mod.i64_descriptor,
     };
     try testing.expectEqual(VecOp.range_source, vm.vec_op);
     try testing.expectEqual(@as(?u32, 10), vm.length);
-    try testing.expectEqual(channel_mod.ChanType.i64_chan, vm.elem_type);
+    try testing.expectEqual(type_descriptor_mod.i64_descriptor, vm.elem_type_desc);
 }
 
 test "VectorMeta vec_map 内联标量" {
@@ -738,7 +740,7 @@ test "VectorMeta vec_map 内联标量" {
         .inner_op = .int_add,
         .inner_meta = 3,
         .length = 100,
-        .elem_type = .i32_chan,
+        .elem_type_desc = type_descriptor_mod.i32_descriptor,
     };
     try testing.expectEqual(node_mod.NodeOp.int_add, vm.inner_op);
     try testing.expectEqual(@as(u16, 3), vm.inner_meta);
@@ -748,7 +750,7 @@ test "VectorMeta vec_map 内联标量" {
 test "VectorMeta vec_sink 收集方式" {
     const vm = VectorMeta{
         .vec_op = .sink_last,
-        .elem_type = .i64_chan,
+        .elem_type_desc = type_descriptor_mod.i64_descriptor,
     };
     try testing.expectEqual(VecOp.sink_last, vm.vec_op);
 }
@@ -807,11 +809,11 @@ test "OrbitMeta async 轨道" {
     const om = OrbitMeta{
         .func_index = 3,
         .arg_count = 2,
-        .result_type = .i32_chan,
+        .result_type_desc = type_descriptor_mod.i32_descriptor,
         .is_spawn = false,
     };
     try testing.expectEqual(@as(u16, 3), om.func_index);
     try testing.expectEqual(@as(u8, 2), om.arg_count);
-    try testing.expectEqual(channel_mod.ChanType.i32_chan, om.result_type);
+    try testing.expectEqual(type_descriptor_mod.i32_descriptor, om.result_type_desc);
     try testing.expect(!om.is_spawn);
 }

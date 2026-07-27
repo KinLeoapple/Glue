@@ -34,7 +34,7 @@ fun float_compare(a: f64, b: f64): bool {
     return a < b
 }
 
-fun main() {
+fun main(): void {
     println(add(10, 20))
     println(sub(50, 20))
     println(mul(6, 7))

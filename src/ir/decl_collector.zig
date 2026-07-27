@@ -10,14 +10,15 @@ const glue_builtin = @import("glue_builtin");
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 const builder_mod = @import("builder.zig");
 const sema_output_mod = @import("sema").sema_output;
 const builtin_type_names = @import("builtin_type_names.zig");
 
 const IRBuilder = builder_mod.IRBuilder;
 const BuildError = builder_mod.BuildError;
-const ChanType = channel_mod.ChanType;
 const ChannelSpace = channel_mod.ChannelSpace;
+const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
 const TypeMetadata = meta_mod.TypeMetadata;
 const TypeKind = meta_mod.TypeKind;
 const TypeStructure = meta_mod.TypeStructure;
@@ -248,7 +249,7 @@ pub const Methods = struct {
 
         // 注册继承的 trait 默认方法（有 body 但未被 type 覆盖的 trait 方法）
         for (td.implemented_traits) |tb| {
-            if (self.sema_result.?.getTraitDef(tb.trait_name) == null) continue;
+            if (self.sema_result.getTraitDef(tb.trait_name) == null) continue;
             const trait_methods = self.findTraitMethodsAst(tb.trait_name) orelse continue;
             for (trait_methods) |tm| {
                 if (tm.body == null) continue; // 无默认实现，跳过
@@ -290,7 +291,7 @@ pub const Methods = struct {
             .{ .n = "i128" },    .{ .n = "u128" },
             .{ .n = "f16" },     .{ .n = "f32" },
             .{ .n = "f64" },     .{ .n = "f128" },
-            .{ .n = "str" },     .{ .n = "unit" },
+            .{ .n = "str" },     .{ .n = "void" },
         };
         for (builtins) |b| {
             // layout 由 primitiveLayout 计算（保证与字段布局一致）
@@ -315,79 +316,43 @@ pub const Methods = struct {
         }
     }
 
-    /// 从类型名字符串推导 ChanType（用于 builtin 类型注册）
-    pub fn chanTypeFromTypeName(type_name: []const u8) ChanType {
-        // 内置标量 + str/unit → ChanType
-        if (builtin_type_names.chanTypeFromBuiltinName(type_name)) |ct| return ct;
-        // nullable 类型 "T?" → 返回内部类型的 ChanType（与 semaTypeToChanType 一致）
+    /// 从类型名字符串推导 TypeDescriptor（用于 builtin 类型注册）
+    pub fn chanTypeFromTypeName(type_name: []const u8) *const TypeDescriptor {
+        // 内置标量 + str/unit → TypeDescriptor
+        if (builtin_type_names.typeDescFromBuiltinName(type_name)) |td| return td;
+        // nullable 类型 "T?" → 返回内部类型的 TypeDescriptor
         if (type_name.len > 1 and type_name[type_name.len - 1] == '?') {
             return chanTypeFromTypeName(type_name[0 .. type_name.len - 1]);
         }
-        // 用户自定义类型（ADT/record/newtype）→ ref_chan
-        return .ref_chan;
+        // 用户自定义类型（ADT/record/newtype）→ ref
+        return type_descriptor_mod.ref_descriptor;
     }
 
-    /// AST 回退：从 current_module 查找构造器的 return_type TypeNode（GADT 专用）
+    /// 从类型名字符串推导 TypeDescriptor（chanTypeFromTypeName 的别名）
+    pub fn typeDescFromTypeName(type_name: []const u8) *const TypeDescriptor {
+        return chanTypeFromTypeName(type_name);
+    }
+
+    /// 从 sema_result 查找构造器的 return_type TypeNode（GADT 专用）
     pub fn getCtorAstReturnType(self: *IRBuilder, ctor_name: []const u8) ?*ast.TypeNode {
-        const mod = self.current_module orelse return null;
-        for (mod.declarations) |decl| {
-            switch (decl) {
-                .type_decl => |td| {
-                    switch (td.def) {
-                        .adt => |adt| {
-                            for (adt.constructors) |c| {
-                                if (std.mem.eql(u8, c.name, ctor_name)) return c.return_type;
-                            }
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
-            }
-        }
+        const ctor = self.sema_result.getCtorDef(ctor_name) orelse return null;
+        if (ctor.return_type_node) |rtn| return @constCast(rtn);
         return null;
     }
 
-    /// AST 回退：从 current_module 查找构造器字段的 TypeNode
+    /// 从 sema_result 查找构造器字段的 TypeNode
     pub fn getCtorAstFieldTypeNode(self: *IRBuilder, ctor_name: []const u8, field_idx: usize) ?*ast.TypeNode {
-        const mod = self.current_module orelse return null;
-        for (mod.declarations) |decl| {
-            switch (decl) {
-                .type_decl => |td| {
-                    switch (td.def) {
-                        .adt => |adt| {
-                            for (adt.constructors) |c| {
-                                if (std.mem.eql(u8, c.name, ctor_name)) {
-                                    if (field_idx < c.fields.len) return c.fields[field_idx].ty;
-                                    return null;
-                                }
-                            }
-                        },
-                        .newtype => |nt| {
-                            if (std.mem.eql(u8, nt.name, ctor_name)) {
-                                if (field_idx == 0) return nt.inner;
-                                return null;
-                            }
-                        },
-                        .error_newtype => |en| {
-                            if (std.mem.eql(u8, en.name, ctor_name)) {
-                                if (field_idx < en.params.len) return en.params[field_idx].type_annotation;
-                                return null;
-                            }
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
-            }
-        }
+        const ctor = self.sema_result.getCtorDef(ctor_name) orelse return null;
+        if (field_idx >= ctor.field_type_nodes.len) return null;
+        if (ctor.field_type_nodes[field_idx]) |ftn| return @constCast(ftn);
         return null;
     }
 
-    /// AST 回退：从 current_module 查找 trait_decl 的方法列表（仅当前模块声明的 trait）
+    /// 设计必需的 AST 访问：从 current_module 查找 trait_decl 的方法列表
     ///
     /// sema_result.getTraitDef 提供压平后的方法签名（含继承方法），但 trait 值分派和
-    /// 默认方法体编译需要与方法声明顺序一致的索引和 AST body/params，故回退到 AST。
+    /// 默认方法体编译需要与方法声明顺序一致的索引和 AST body/params。
+    /// 这是 IR 编译对 AST 的根本依赖，非双轨制残留。
     pub fn findTraitMethodsAst(self: *IRBuilder, trait_name: []const u8) ?[]ast.MethodDecl {
         const mod = self.current_module orelse return null;
         for (mod.declarations) |decl| {
@@ -401,11 +366,12 @@ pub const Methods = struct {
         return null;
     }
 
-    /// AST 回退：从 current_module 查找函数或方法的参数列表
+    /// 设计必需的 AST 访问：从 current_module 查找函数或方法的参数列表
     ///
-    /// name 为普通函数名、mangled 名 "Type.method" 或 stdlib mangled 名
-    /// "std.pack.sub.func"。sema_result.getFuncSig 提供 param_chan_types（压平
-    /// ChanType），但泛型推断需要 AST 参数的 type_annotation TypeNode。
+    /// sema_result.getFuncSig 提供 param_type_descs（压平 TypeDescriptor）和 param_type_names，
+    /// 但泛型类型参数推断（matchTypeParamToTypeId/matchTypeParamBinding）需要完整的
+    /// AST type_annotation TypeNode 进行结构化匹配，字符串类型名无法替代。
+    /// 这是 IR 编译对 AST 的根本依赖，非双轨制残留。
     pub fn findFuncParamsAst(self: *IRBuilder, name: []const u8) ?[]ast.Param {
         const mod = self.current_module orelse return null;
         const dot = std.mem.indexOfScalar(u8, name, '.');
@@ -450,57 +416,9 @@ pub const Methods = struct {
         return null;
     }
 
-    /// AST 回退：从 current_module 查找函数或方法的返回类型 TypeNode
-    ///
-    /// name 为普通函数名、mangled 名 "Type.method" 或 stdlib mangled 名
-    /// "std.pack.sub.func"。sema_result.getFuncSig 提供 return_chan_type 和
-    /// is_throwing，但 Throw<T,E> 的 Ok 值类型名需从 AST TypeNode 提取。
-    pub fn findFuncReturnTypeAst(self: *IRBuilder, name: []const u8) ?*ast.TypeNode {
-        const mod = self.current_module orelse return null;
-        const dot = std.mem.indexOfScalar(u8, name, '.');
-        if (dot) |idx| {
-            // mangled "Type.method"：先在 type_decl 的方法中查找
-            const type_name = name[0..idx];
-            const method_name = name[idx + 1 ..];
-            for (mod.declarations) |decl| {
-                switch (decl) {
-                    .type_decl => |td| {
-                        if (!std.mem.eql(u8, td.name, type_name)) continue;
-                        for (td.methods) |m| {
-                            if (std.mem.eql(u8, m.name, method_name)) return m.return_type;
-                        }
-                    },
-                    else => {},
-                }
-            }
-            // 多段 mangled 名（如 "std.pack.sub.func"）是 fun_decl，按全名精确匹配
-            // 单段 "Type.method" 不走此路径：type 方法在 type_decl.methods 中
-            if (std.mem.indexOfScalar(u8, method_name, '.') != null) {
-                for (mod.declarations) |decl| {
-                    switch (decl) {
-                        .fun_decl => |fd| {
-                            if (std.mem.eql(u8, fd.name, name)) return fd.return_type;
-                        },
-                        else => {},
-                    }
-                }
-            }
-        } else {
-            // 普通函数名
-            for (mod.declarations) |decl| {
-                switch (decl) {
-                    .fun_decl => |fd| {
-                        if (std.mem.eql(u8, fd.name, name)) return fd.return_type;
-                    },
-                    else => {},
-                }
-            }
-        }
-        return null;
-    }
-
-    /// AST 回退：从 current_module 查找函数声明的完整 AST（含 type_params/params/return_type/body）
-    /// 用于单态化实例化器。name 为普通函数名、mangled 名 "Type.method" 或 stdlib mangled 名。
+    /// AST 访问：从 current_module 查找函数声明的完整 AST（含 type_params/params/return_type/body）
+    /// 用于单态化实例化器（单态化需要完整 AST body，sema 仅存签名无法替代）。
+    /// name 为普通函数名、mangled 名 "Type.method" 或 stdlib mangled 名。
     /// 返回 fun_decl payload 的只读引用
     pub fn findFunDeclAst(self: *IRBuilder, name: []const u8) ?*const @FieldType(ast.Decl, "fun_decl") {
         const mod = self.current_module orelse return null;
@@ -548,26 +466,10 @@ pub const Methods = struct {
         return null;
     }
 
-    /// 用 GADT 绑定栈解析字段通道类型（替代 resolveFieldTypeWithBindings 的 type_node 版本）
-    /// field_type_name 为类型参数名时查绑定栈，否则直接返回 field_chan_type
-    pub fn resolveFieldChanType(self: *IRBuilder, field_chan_type: ChanType, field_type_name: ?[]const u8) ChanType {
-        if (field_type_name) |ftn| {
-            if (self.isTypeParamName(ftn)) {
-                var i: usize = self.gadt_binding_stack.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (self.gadt_binding_stack.items[i].get(ftn)) |ct| return ct;
-                }
-                return .i64_chan;
-            }
-        }
-        return field_chan_type;
-    }
-
     /// 查询构造器在其所属类型的 constructors 数组中的索引（即 __tag 值）
     /// sema_result 的 ctor_def_index 已将 ctor_idx 编码在低 16 位，直接复用
     pub fn getCtorTag(self: *IRBuilder, ctor_name: []const u8) ?u32 {
-        const sr = self.sema_result orelse return null;
+        const sr = self.sema_result;
         const packed_idx = sr.ctor_def_index.get(ctor_name) orelse return null;
         return packed_idx & 0xFFFF;
     }
@@ -583,7 +485,7 @@ pub const Methods = struct {
     ///   - __tag（field_id = 0）
     ///   - 用户源码字段名（field_id 同 _<idx>，便于 record_get 按名查询）
     pub fn registerBuiltinErrorTypes(self: *IRBuilder, arena_alloc: std.mem.Allocator) !void {
-        const sr = self.sema_result orelse return; // build() 保证非 null
+        const sr = self.sema_result;
         inline for (glue_builtin.BUILTIN_TYPES) |bt| {
             // 已由 sema 注册的类型跳过（sema 接入时 builtin 类型可能已注册）
             if (sr.getTypeDef(bt.name) != null) {
@@ -606,12 +508,12 @@ pub const Methods = struct {
                     .error_newtype => {
                         // 构造器字段（位置参数别名 _0/_1/...）
                         const field_names = try arena_alloc.alloc(?[]const u8, bt.fields.len);
-                        const field_chan_types = try arena_alloc.alloc(ChanType, bt.fields.len);
+                        const field_type_descs = try arena_alloc.alloc(*const TypeDescriptor, bt.fields.len);
                         const field_type_names = try arena_alloc.alloc(?[]const u8, bt.fields.len);
                         for (bt.fields, 0..) |f, fi| {
                             const fname = try std.fmt.allocPrint(arena_alloc, "_{d}", .{fi});
                             field_names[fi] = fname;
-                            field_chan_types[fi] = chanTypeFromTypeName(f.type_name);
+                            field_type_descs[fi] = chanTypeFromTypeName(f.type_name);
                             field_type_names[fi] = f.type_name;
                             // 位置别名 field_id = fi + 1（与 error_newtype 一致，0 是 __tag）
                             self.registerFieldId(bt.name, fname, @intCast(fi + 1));
@@ -624,7 +526,7 @@ pub const Methods = struct {
                             .name = bt.constructor_name,
                             .type_name = bt.name,
                             .field_names = field_names,
-                            .field_chan_types = field_chan_types,
+                            .field_type_descs = field_type_descs,
                             .field_type_names = field_type_names,
                         };
                         try sr.putTypeDef(.{
@@ -642,7 +544,7 @@ pub const Methods = struct {
                                 .name = con,
                                 .type_name = bt.name,
                                 .field_names = &.{},
-                                .field_chan_types = &.{},
+                                .field_type_descs = &.{},
                                 .field_type_names = &.{},
                             };
                         }
@@ -767,7 +669,7 @@ pub const Methods = struct {
             const return_type = if (m.return_type) |rt|
                 try builder_mod.typeNameFromTypeNode(rt, arena_alloc)
             else
-                "unit";
+                "void";
             methods_meta[mi] = .{
                 .name = m.name,
                 .signature = .{

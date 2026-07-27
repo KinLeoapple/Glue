@@ -79,23 +79,15 @@ pub const Methods = struct {
                     break :blk @intCast(span);
                 } else 0;
                 try self.runtime.allocVector(node.output, count);
-                const elem_type = vm.elem_type;
+                const desc = vm.elem_type_desc;
+                const ops = desc.scalar_ops orelse return error.UnsupportedOp;
                 for (0..count) |i| {
                     const val = start + @as(i64, @intCast(i));
                     const elem_ptr = self.runtime.vectorElemPtr(node.output, i);
-                    // val 超出窄类型范围时 clamp 到边界，避免 @intCast panic
-                    // （range 范围超出元素类型属类型错误，sema 应拦截；运行时防御性 clamp）
-                    switch (elem_type) {
-                        .i8_chan => @as(*i8, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, std.math.minInt(i8), std.math.maxInt(i8))),
-                        .i16_chan => @as(*i16, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, std.math.minInt(i16), std.math.maxInt(i16))),
-                        .i32_chan => @as(*i32, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, std.math.minInt(i32), std.math.maxInt(i32))),
-                        .i64_chan => @as(*i64, @ptrCast(@alignCast(elem_ptr))).* = val,
-                        .u8_chan => @as(*u8, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, 0, std.math.maxInt(u8))),
-                        .u16_chan => @as(*u16, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, 0, std.math.maxInt(u16))),
-                        .u32_chan => @as(*u32, @ptrCast(@alignCast(elem_ptr))).* = @intCast(std.math.clamp(val, 0, std.math.maxInt(u32))),
-                        .u64_chan => @as(*u64, @ptrCast(@alignCast(elem_ptr))).* = @bitCast(val),
-                        else => return error.UnsupportedOp,
-                    }
+                    // val 超出窄类型范围时由 coerce 自动 clamp（截断到目标类型范围）
+                    // 走 vtable coerce + write，零运行时 switch
+                    const coerced = ops.coerce(value.Value.fromI64(val));
+                    ops.write(elem_ptr, coerced);
                 }
             },
             .array_source => {
@@ -1059,8 +1051,7 @@ pub const Methods = struct {
         const count = @min(self.runtime.vectorLen(left_chan), self.runtime.vectorLen(right_chan));
 
         // 输出通道必须是 ref_chan，每个元素存 Pair 记录指针
-        const out_meta = self.ir.channels.get(node.output);
-        if (out_meta.chan_type != .ref_chan) return error.InvalidChannel;
+        if (!self.runtime.isRef(node.output)) return error.InvalidChannel;
 
         try self.runtime.allocVector(node.output, count);
         if (count == 0) return;

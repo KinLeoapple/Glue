@@ -2,7 +2,7 @@
 import std.io.File
 import std.io.Console.{println}
 
-fun main() {
+fun main(): void {
     val path = "/tmp/glue_buf_reader_test.txt"
     std.io.File.remove(path).await()
 

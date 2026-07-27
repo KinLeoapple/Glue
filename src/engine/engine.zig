@@ -29,7 +29,7 @@ const NodeOp = ir_mod.NodeOp;
 const ScalarMeta = ir_mod.ScalarMeta;
 const ScalarKind = ir_mod.ScalarKind;
 const ConstVal = ir_mod.ConstVal;
-const ChanType = ir_mod.ChanType;
+
 const ChannelMeta = ir_mod.ChannelMeta;
 const Function = ir_mod.Function;
 const Runtime = runtime_mod.Runtime;
@@ -837,7 +837,7 @@ pub const Engine = struct {
 
         // 读取返回值（必须在 leaveFunction 之前，因为 leaveFunction 会 resetTo 回收通道内存）
         // 通用实现：复用 chanToValue，完整支持所有标量类型（含 i128/u128/f128），
-        // ref_chan 走 BoxedScalar/LazyValue 快路径，避免任何截断。
+        // ref_chan 走 ref_ops.read/LazyValue 路径，避免任何截断。
         const result = self.chanToValue(result_chan);
         self.runtime.leaveFunction();
         return result;
@@ -1367,20 +1367,29 @@ pub const Engine = struct {
     }
 
     // ════════════════════════════════════════════
-    // 通道元信息 → ScalarTag 映射
+    // 通道元信息 → ScalarTag 映射（comptime 注册表，替代运行时 switch）
     // ════════════════════════════════════════════
 
     /// 从通道元信息推导 ScalarTag（用于选择 ops 函数）
+    /// 通过 type_desc.type_name 查表，零运行时 switch
     pub fn chanToScalarTag(chan_meta: ChannelMeta) ?ScalarTag {
-        return switch (chan_meta.chan_type) {
-            .bool_chan, .mask_chan => .boolean,
-            .char_chan => .char,
-            .i8_chan => .i8, .i16_chan => .i16, .i32_chan => .i32, .i64_chan => .i64, .i128_chan => .i128,
-            .u8_chan => .u8, .u16_chan => .u16, .u32_chan => .u32, .u64_chan => .u64, .u128_chan => .u128,
-            .isize_chan => .isize, .usize_chan => .usize,
-            .f16_chan => .f16, .f32_chan => .f32, .f64_chan => .f64, .f128_chan => .f128,
-            else => null,
-        };
+        const td = chan_meta.type_desc;
+        const n = td.type_name;
+        if (std.mem.eql(u8, n, "bool")) return .boolean;
+        if (std.mem.eql(u8, n, "char")) return .char;
+        if (td.toIntKind()) |ik| {
+            return switch (ik) {
+                .i8 => .i8, .i16 => .i16, .i32 => .i32, .i64 => .i64, .i128 => .i128,
+                .u8 => .u8, .u16 => .u16, .u32 => .u32, .u64 => .u64, .u128 => .u128,
+                .isize => .isize, .usize => .usize,
+            };
+        }
+        if (td.toFloatKind()) |fk| {
+            return switch (fk) {
+                .f16 => .f16, .f32 => .f32, .f64 => .f64, .f128 => .f128,
+            };
+        }
+        return null;
     }
 
     /// 预计算所有节点的 scalar_tag 字段（IR 不可变，layout 后只算一次）
@@ -1676,10 +1685,6 @@ pub const Engine = struct {
     // ════════════════════════════════════════════
 
     pub const readArray = @import("value_conv.zig").Methods.readArray;
-    pub const encodeScalarRef = @import("value_conv.zig").Methods.encodeScalarRef;
-    pub const isScalarRef = @import("value_conv.zig").Methods.isScalarRef;
-    pub const decodeScalarRef = @import("value_conv.zig").Methods.decodeScalarRef;
-    pub const tryDecodeScalarRef = @import("value_conv.zig").Methods.tryDecodeScalarRef;
     pub const chanToValue = @import("value_conv.zig").Methods.chanToValue;
     pub const valueToChan = @import("value_conv.zig").Methods.valueToChan;
     pub const cloneValueBetweenChannels = @import("value_conv.zig").Methods.cloneValueBetweenChannels;

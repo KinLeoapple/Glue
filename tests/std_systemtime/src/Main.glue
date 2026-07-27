@@ -4,7 +4,7 @@ import std.time.DateTime
 import std.time.TimeComponents
 import std.io.Console.{println}
 
-fun main() {
+fun main(): void {
     // ─── 1. UNIX_EPOCH + to_utc ───────────────────────────────────────
     val epoch = std.time.SystemTime.UNIX_EPOCH
     val epoch_utc = epoch.to_utc()

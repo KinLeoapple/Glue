@@ -58,7 +58,7 @@ fun buildArray(n: i32): i64[] {
     arr
 }
 
-fun main() {
+fun main(): void {
     // ---- 柯里化加法:1000000 次单层闭包调用 ----
     val add5 = makeAdder(5)
     var currySum: i64 = 0

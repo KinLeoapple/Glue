@@ -409,6 +409,177 @@ pub fn walkStmtCb(ctx: *anyopaque, stmt: *const ast.Stmt, expr_callback: ExprVis
 }
 
 // ════════════════════════════════════════════════════════════
+// 可变版本（callback-based，*ast.Expr / *ast.Stmt）
+// 供 parse/ast_rewrite 等需要就地修改 AST 的场景使用
+// ════════════════════════════════════════════════════════════
+
+/// 可变表达式访问者回调类型
+pub const ExprVisitorMut = *const fn (ctx: *anyopaque, expr: *ast.Expr) anyerror!void;
+
+/// 遍历表达式的所有子表达式（可变版本，不含 expr 自身）
+/// 对每个子节点调用 callback。callback 可抛 error 中断遍历。
+/// 与 walkExprChildren 结构镜像，但子节点以 *ast.Expr 传入以支持就地修改。
+pub fn walkExprChildrenMut(ctx: *anyopaque, expr: *ast.Expr, callback: ExprVisitorMut) anyerror!void {
+    switch (expr.*) {
+        // 叶子节点：无子表达式
+        .int_literal, .float_literal, .bool_literal, .char_literal,
+        .string_literal, .null_literal, .unit_literal,
+        .identifier,
+        => {},
+
+        .string_interpolation => |si| {
+            for (si.parts) |part| {
+                if (part == .expression) try callback(ctx, part.expression);
+            }
+        },
+
+        // 单子节点
+        .unary => |u| try callback(ctx, u.operand),
+        .ref_of => |r| try callback(ctx, r.operand),
+        .deref => |d| try callback(ctx, d.operand),
+        .non_null_assert => |n| try callback(ctx, n.expr),
+        .propagate => |p| try callback(ctx, p.expr),
+        .field_access => |f| try callback(ctx, f.object),
+        .safe_access => |s| try callback(ctx, s.object),
+        .type_cast => |tc| try callback(ctx, tc.expr),
+        .cast_builder => |cb| try callback(ctx, cb.expr),
+        .atomic_expr => |ae| try callback(ctx, ae.value),
+        .lazy => |l| try callback(ctx, l.expr),
+        .spawn_expr => |se| try callback(ctx, se.expr),
+
+        // 双子节点
+        .assignment_expr => |a| {
+            try callback(ctx, a.target);
+            try callback(ctx, a.value);
+        },
+        .compound_assign => |c| {
+            try callback(ctx, c.target);
+            try callback(ctx, c.value);
+        },
+        .binary => |b| {
+            try callback(ctx, b.left);
+            try callback(ctx, b.right);
+        },
+        .index => |i| {
+            try callback(ctx, i.object);
+            try callback(ctx, i.index);
+        },
+        .slice => |s| {
+            try callback(ctx, s.object);
+            try callback(ctx, s.start);
+            try callback(ctx, s.end);
+        },
+        .if_expr => |i| {
+            try callback(ctx, i.condition);
+            try callback(ctx, i.then_branch);
+            if (i.else_branch) |e| try callback(ctx, e);
+        },
+
+        // 多子节点
+        .call => |c| {
+            try callback(ctx, c.callee);
+            for (c.arguments) |arg| try callback(ctx, arg);
+        },
+        .method_call => |mc| {
+            try callback(ctx, mc.object);
+            for (mc.arguments) |arg| try callback(ctx, arg);
+        },
+        .safe_method_call => |smc| {
+            try callback(ctx, smc.object);
+            for (smc.arguments) |arg| try callback(ctx, arg);
+        },
+        .array_literal => |al| {
+            for (al.elements) |e| try callback(ctx, e);
+            if (al.fill_value) |fv| try callback(ctx, fv);
+            if (al.fill_count) |fc| try callback(ctx, fc);
+        },
+        .record_literal => |rl| {
+            for (rl.fields) |f| try callback(ctx, f.value);
+        },
+        .record_extend => |re| {
+            try callback(ctx, re.base);
+            for (re.updates) |f| try callback(ctx, f.value);
+        },
+
+        // 含语句的表达式
+        .block => |b| {
+            for (b.statements) |s| try walkStmtChildrenMut(ctx, s, callback);
+            if (b.trailing_expr) |te| try callback(ctx, te);
+        },
+
+        // match：scrutinee + arms（guard + body）
+        .match => |m| {
+            try callback(ctx, m.scrutinee);
+            for (m.arms) |arm| {
+                if (arm.guard) |g| try callback(ctx, g);
+                try callback(ctx, arm.body);
+            }
+        },
+
+        // lambda：body
+        .lambda => |l| switch (l.body) {
+            .block => |body_expr| try callback(ctx, body_expr),
+            .expression => |body_expr| try callback(ctx, body_expr),
+        },
+
+        // select：arms 的 channel_expr + body
+        .select => |s| {
+            for (s.arms) |arm| switch (arm) {
+                .receive => |r| {
+                    try callback(ctx, r.channel_expr);
+                    try callback(ctx, r.body);
+                },
+                .timeout => |t| {
+                    try callback(ctx, t.duration);
+                    try callback(ctx, t.body);
+                },
+            };
+        },
+
+        .inline_trait_value => |itv| {
+            for (itv.methods) |method| {
+                if (method.body) |body| try callback(ctx, body);
+            }
+        },
+    }
+}
+
+/// 遍历语句的所有子节点（可变版本）
+/// 与 walkStmtChildren 结构镜像，但子表达式以 *ast.Expr 传入以支持就地修改。
+pub fn walkStmtChildrenMut(ctx: *anyopaque, stmt: *ast.Stmt, callback: ExprVisitorMut) anyerror!void {
+    switch (stmt.*) {
+        .val_decl => |v| try callback(ctx, v.value),
+        .var_decl => |v| try callback(ctx, v.value),
+        .assignment => |a| {
+            try callback(ctx, a.target);
+            try callback(ctx, a.value);
+        },
+        .compound_assignment => |c| {
+            try callback(ctx, c.target);
+            try callback(ctx, c.value);
+        },
+        .field_assignment => |f| {
+            try callback(ctx, f.object);
+            try callback(ctx, f.value);
+        },
+        .expression => |e| try callback(ctx, e.expr),
+        .return_stmt => |r| if (r.value) |v| try callback(ctx, v),
+        .defer_stmt => |d| try callback(ctx, d.expr),
+        .throw_stmt => |t| try callback(ctx, t.expr),
+        .for_stmt => |f| {
+            try callback(ctx, f.iterable);
+            try callback(ctx, f.body);
+        },
+        .while_stmt => |w| {
+            try callback(ctx, w.condition);
+            try callback(ctx, w.body);
+        },
+        .loop_stmt => |l| try callback(ctx, l.body),
+        .break_stmt, .continue_stmt => {},
+    }
+}
+
+// ════════════════════════════════════════════════════════════
 // 单元测试
 // ════════════════════════════════════════════════════════════
 

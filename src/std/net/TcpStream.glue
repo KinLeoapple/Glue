@@ -57,13 +57,13 @@ pub async fun write(self: TcpStream, buf: u8[], len: usize): Async<Throw<usize, 
 }
 
 // 关闭流。幂等：重复 close 不报错。
-pub async fun close(self: TcpStream): Async<Throw<Unit, IOError>> {
+pub async fun close(self: TcpStream): Async<Throw<void, IOError>> {
     if self.is_closed {
-        Ok(())
+        Ok(void)
     } else {
         self.is_closed = true
         __net_tcp_close(self.fd)?
-        Ok(())
+        Ok(void)
     }
 }
 
@@ -75,7 +75,7 @@ pub fun peer_addr(self: TcpStream): SocketAddr {
 // ─── 组合语义方法（基于 read/write 原语组合，纯 Glue 实现） ──────
 
 // 写入全部字节；write 返回 0 时抛 BrokenPipe（避免死循环）
-pub async fun write_all(self: TcpStream, buf: u8[], len: usize): Async<Throw<Unit, IOError>> {
+pub async fun write_all(self: TcpStream, buf: u8[], len: usize): Async<Throw<void, IOError>> {
     if self.is_closed {
         throw IOError(InvalidInput, "stream closed", 0, null)
     }
@@ -88,7 +88,7 @@ pub async fun write_all(self: TcpStream, buf: u8[], len: usize): Async<Throw<Uni
         }
         written = written + n
     }
-    Ok(())
+    Ok(void)
 }
 
 // 读取直到遇到分隔符字节，返回包含分隔符在内的 u8[]

@@ -99,30 +99,30 @@ pub async fun stat_of(path: str): Async<Throw<Stat, IOError>> {
     Ok(__file_stat(path)?)
 }
 
-pub async fun remove(path: str): Async<Throw<Unit, IOError>> {
+pub async fun remove(path: str): Async<Throw<void, IOError>> {
     __file_remove(path)?
-    Ok(())
+    Ok(void)
 }
 
-pub async fun rename(old: str, new: str): Async<Throw<Unit, IOError>> {
+pub async fun rename(old: str, new: str): Async<Throw<void, IOError>> {
     __file_rename(old, new)?
-    Ok(())
+    Ok(void)
 }
 
-pub async fun chmod(path: str, mode: i32): Async<Throw<Unit, IOError>> {
+pub async fun chmod(path: str, mode: i32): Async<Throw<void, IOError>> {
     __file_chmod(path, mode)?
-    Ok(())
+    Ok(void)
 }
 
 // ─── 实例方法（self : File） ───────────────────────────
 
-pub async fun close(self: File): Async<Throw<Unit, IOError>> {
+pub async fun close(self: File): Async<Throw<void, IOError>> {
     if self.is_closed {
-        Ok(())
+        Ok(void)
     } else {
         self.is_closed = true
         __file_close(self.fd)?
-        Ok(())
+        Ok(void)
     }
 }
 
@@ -202,7 +202,7 @@ pub async fun read_exact(self: File, len: usize): Async<Throw<u8[], IOError>> {
 }
 
 // 写入全部字节；write 返回 0 时抛 BrokenPipe（避免死循环）
-pub async fun write_all(self: File, buf: u8[], len: usize): Async<Throw<Unit, IOError>> {
+pub async fun write_all(self: File, buf: u8[], len: usize): Async<Throw<void, IOError>> {
     if self.is_closed {
         throw IOError(InvalidInput, "file closed", 0, self.path)
     }
@@ -215,7 +215,7 @@ pub async fun write_all(self: File, buf: u8[], len: usize): Async<Throw<Unit, IO
         }
         written = written + n
     }
-    Ok(())
+    Ok(void)
 }
 
 // 复制全部内容到 dst，返回已复制字节数

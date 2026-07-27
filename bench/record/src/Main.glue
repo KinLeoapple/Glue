@@ -55,7 +55,7 @@ fun shapeClassify(s: Shape): i64 {
     }
 }
 
-fun main() {
+fun main(): void {
     var sum: i64 = 0
     var i: i64 = 0
     while i < 10000000 {

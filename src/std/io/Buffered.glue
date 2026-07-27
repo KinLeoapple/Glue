@@ -102,7 +102,7 @@ pub async fun read_byte(self: BufReader): Async<Throw<u8?, IOError>> {
 // ─── BufWriter 方法 ────────────────────────────────────────────────
 
 // 写入字节序列；缓冲满时自动 flush
-pub async fun write(self: BufWriter, data: u8[]): Async<Throw<Unit, IOError>> {
+pub async fun write(self: BufWriter, data: u8[]): Async<Throw<void, IOError>> {
     var i: usize = 0
     while i < data.len() {
         while self.pos < self.buf.len() && i < data.len() {
@@ -114,24 +114,24 @@ pub async fun write(self: BufWriter, data: u8[]): Async<Throw<Unit, IOError>> {
             self.flush().await()?
         }
     }
-    Ok(())
+    Ok(void)
 }
 
 // 写入字符串（UTF-8 字节序列）
-pub async fun write_str(self: BufWriter, s: str): Async<Throw<Unit, IOError>> {
+pub async fun write_str(self: BufWriter, s: str): Async<Throw<void, IOError>> {
     self.write(s.bytes()).await()?
-    Ok(())
+    Ok(void)
 }
 
 // 写入字符串并追加换行
-pub async fun write_line(self: BufWriter, s: str): Async<Throw<Unit, IOError>> {
+pub async fun write_line(self: BufWriter, s: str): Async<Throw<void, IOError>> {
     self.write_str(s).await()?
     self.write_str("\n").await()?
-    Ok(())
+    Ok(void)
 }
 
 // 将缓冲区剩余字节全部写入下层 File
-pub async fun flush(self: BufWriter): Async<Throw<Unit, IOError>> {
+pub async fun flush(self: BufWriter): Async<Throw<void, IOError>> {
     if self.pos > 0 {
         var written: usize = 0
         while written < self.pos {
@@ -145,5 +145,5 @@ pub async fun flush(self: BufWriter): Async<Throw<Unit, IOError>> {
         }
         self.pos = 0
     }
-    Ok(())
+    Ok(void)
 }

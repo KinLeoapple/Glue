@@ -49,7 +49,6 @@ pub const BinaryOp = enum {
     bit_xor,
     shl,
     shr,
-    concat,
     concat_list,
     range,
     range_inclusive,

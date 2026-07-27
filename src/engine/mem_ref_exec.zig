@@ -85,35 +85,37 @@ pub const Methods = struct {
     // ════════════════════════════════════════════
 
     /// ref_of：取引用 &expr
-    /// - 复合类型（operand 是 ref_chan）：operand 已经持有 *ObjHeader，直接复制指针到 output
-    /// - 标量（operand 是标量通道）：编码为 tagged pointer (channel_index << 1) | 1
-    ///   无需堆分配，output ref_chan 直接存储编码后的标量引用
-    /// - operand 是 ref_chan（已是引用）：复制引用本身（实现引用的引用）
+    /// - 复合类型（operand 是 ref_chan）：operand 已持有 *ObjHeader，直接复制指针到 output
+    /// - 标量（operand 是标量通道）：装箱为 Cell，写入 Cell 指针到 ref_chan
+    ///   （废除 tagged scalar ref 后，标量引用统一通过 Cell 装箱实现回写语义）
+    /// - unit 类型：ref 无意义，写 null
     pub fn execRefOf(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
         const src_w = self.runtime.elemWidth(src_chan);
         const dst = self.runtime.rawPtr(node.output);
-        const src_meta = self.ir.channels.get(src_chan);
 
-        // ref_chan（复合对象/已有引用）：src 通道持有 8 字节指针，直接复制
-        // 标量类型（usize/u64/i64/f64 等也是 8 字节）必须走编码路径，否则会把标量值误当指针。
-        if (src_meta.chan_type == .ref_chan) {
+        if (self.runtime.isRef(src_chan)) {
+            // ref_chan（复合对象/已有引用）：src 通道持有 8 字节指针，直接复制
             const src = self.runtime.rawPtr(src_chan);
             @memcpy(dst[0..8], src[0..8]);
-            // retain 引用计数（堆对象共享）— 仅对真实堆对象，标量引用无需 retain
+            // retain 引用计数（仅对真实堆对象，标量位模式跳过）
             const obj_ptr: ?*anyopaque = @ptrCast(@alignCast(@as(*?*anyopaque, @ptrCast(@alignCast(src))).*));
             if (obj_ptr) |p| {
                 const addr = @intFromPtr(p);
-                if (!Engine.isScalarRef(addr)) {
+                if (addr >= 0x1000 and addr % @alignOf(value.obj_header.ObjHeader) == 0) {
                     const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(p));
-                    _ = value.obj_header.retain(header, self.tctx.?);
+                    if (header.isValidHeapObj()) {
+                        _ = value.obj_header.retain(header, self.tctx.?);
+                    }
                 }
             }
         } else if (src_w > 0 and src_w <= 16) {
-            // 标量：编码为 tagged pointer (channel_index << 1) | 1，无需堆分配
-            const encoded = Engine.encodeScalarRef(src_chan);
-            const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));
-            dst_ptr.* = @ptrFromInt(encoded);
+            // 标量：装箱为 Cell，写入 Cell 指针（实现可回写的引用语义）
+            const inner = self.chanToValue(src_chan);
+            _ = inner.retain(self.tctx.?);
+            const cell_v = value.Value.makeCell(self.tctx.?, inner) catch return error.OutOfMemory;
+            try self.trackObj(cell_v.asRef());
+            self.runtime.writePtr(node.output, @ptrCast(cell_v.asRef()));
         } else if (src_w == 0) {
             // unit 类型：ref 无意义，写 null
             const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));
@@ -123,59 +125,70 @@ pub const Methods = struct {
 
     /// ref_get：解引用 *expr
     /// 读取引用指向的值到 output 通道
-    /// - 标量引用（tagged pointer）：解码通道索引，从原始通道读取标量值（支持回写）
+    /// - Cell：提取 inner 值写入 output（标量引用解箱）
     /// - 复合对象：直接复制对象指针（result 是 ref_chan）
+    /// - null/标量位模式：error.Panic
     pub fn execRefGet(self: *Engine, node: *const Node) EngineError!void {
         const ref_chan = node.inputs[0];
         const dst_w = self.runtime.elemWidth(node.output);
         if (dst_w == 0) return;
 
-        const obj_ptr = self.runtime.readPtr(ref_chan) orelse return error.Panic;
-        const ptr_bits = @intFromPtr(obj_ptr);
+        // 通过 vtable 读取 ref_chan 值（ref_ops.read 返回 ref/null/i64）
+        const v = self.chanToValue(ref_chan);
         const dst = self.runtime.rawPtr(node.output);
 
-        // 标量引用（tagged pointer，bit 0 = 1）：从原始通道读取标量值
-        // 注意：标量值位模式可能 bit 0 = 1，必须用 tryDecodeScalarRef 验证合法性
-        if (self.tryDecodeScalarRef(ptr_bits)) |src_chan| {
-            const src = self.runtime.rawPtr(src_chan);
-            const copy_w = @min(dst_w, 16);
-            @memcpy(dst[0..copy_w], src[0..copy_w]);
-            return;
-        }
-
-        // 复合对象：复制对象指针本身（ref_get 对复合对象 = 取对象引用）
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(obj_ptr));
-        if (dst_w == 8) {
-            const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));
-            dst_ptr.* = obj_ptr;
-            _ = value.obj_header.retain(header, self.tctx.?);
+        switch (v) {
+            .ref => |header| {
+                if (header.type_tag == .cell) {
+                    // Cell：提取 inner 值写入 output（标量引用解箱）
+                    const cell: *value.Cell = @alignCast(@fieldParentPtr("header", header));
+                    self.writeScalarValue(node.output, cell.inner);
+                    return;
+                }
+                // 复合对象：复制对象指针本身（ref_get 对复合对象 = 取对象引用）
+                if (dst_w == 8) {
+                    const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));
+                    dst_ptr.* = @ptrCast(header);
+                    _ = value.obj_header.retain(header, self.tctx.?);
+                }
+            },
+            .null_val => return error.Panic, // 解引用 null
+            else => {
+                // ref_chan 持有标量位模式（泛型 T = 标量，未走 ref_of 路径）
+                self.writeScalarValue(node.output, v);
+            },
         }
     }
 
     /// ref_set：通过引用写入 *ref = value
     /// inputs[0] = 引用通道，inputs[1] = 值通道
-    /// - 标量引用（tagged pointer）：解码通道索引，写入原始通道（实现回写）
-    /// - 复合对象：无操作（复合对象本身是共享的，赋值语义不适用）
+    /// - Cell：更新 inner 值（实现标量引用回写）
+    /// - 复合对象：无操作（复合对象赋值通过 field assignment 完成）
+    /// - null/标量位模式：error.Panic
     pub fn execRefSet(self: *Engine, node: *const Node) EngineError!void {
         const ref_chan = node.inputs[0];
         const val_chan = node.inputs[1];
 
-        const obj_ptr = self.runtime.readPtr(ref_chan) orelse return error.Panic;
-        const ptr_bits = @intFromPtr(obj_ptr);
+        // 通过 vtable 读取 ref_chan 值
+        const v = self.chanToValue(ref_chan);
 
-        // 标量引用（tagged pointer，bit 0 = 1）：写入原始通道（实现回写）
-        // 注意：标量值位模式可能 bit 0 = 1，必须用 tryDecodeScalarRef 验证合法性
-        if (self.tryDecodeScalarRef(ptr_bits)) |dst_chan| {
-            const val_w = self.runtime.elemWidth(val_chan);
-            if (val_w == 0 or val_w > 16) return;
-            const dst = self.runtime.rawPtr(dst_chan);
-            const src = self.runtime.rawPtr(val_chan);
-            @memcpy(dst[0..val_w], src[0..val_w]);
-            return;
+        switch (v) {
+            .ref => |header| {
+                if (header.type_tag == .cell) {
+                    // Cell：更新 inner 值（实现回写）
+                    const cell: *value.Cell = @alignCast(@fieldParentPtr("header", header));
+                    // 先 retain 新值（防止 self-assignment 时旧值被释放）
+                    const new_val = self.chanToValue(val_chan);
+                    _ = new_val.retain(self.tctx.?);
+                    // release 旧值
+                    cell.inner.release(self.tctx.?);
+                    cell.inner = new_val;
+                    return;
+                }
+                // 复合对象的 ref_set：替换引用本身（暂不实现，通过 field assignment 完成）
+            },
+            else => return error.Panic, // null 或标量位模式，无法 ref_set
         }
-
-        // 复合对象的 ref_set：替换引用本身（重新绑定）
-        // 暂不实现，复合对象赋值通过 field assignment 完成
     }
 
     // ════════════════════════════════════════════

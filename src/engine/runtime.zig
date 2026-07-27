@@ -19,7 +19,7 @@ const scalar = value.scalar;
 
 const ChannelRegion = mem.ChannelRegion;
 const ChannelSpace = ir_mod.ChannelSpace;
-const ChanType = ir_mod.ChanType;
+const type_descriptor_mod = ir_mod.type_descriptor_mod;
 const ConstVal = ir_mod.ConstVal;
 const ScalarMeta = ir_mod.ScalarMeta;
 const ScalarKind = ir_mod.ScalarKind;
@@ -28,20 +28,24 @@ const ThreadProfiler = profiling.ThreadProfiler;
 
 /// 单个通道的运行时槽位：数据指针 + 类型描述符 + 长度
 ///
-/// v3 阶段 6：将 chan_ptrs/chan_widths/chan_lengths/chan_types/chan_is_ref
+/// v3 阶段 6：将原 chan_ptrs/chan_widths/chan_lengths/chan_types/chan_is_ref
 /// 五个并排数组合并为单一结构体数组，提高缓存局部性，简化扩展。
-/// v3 阶段 6（type_desc 统一）：chan_type/is_ref 已移除（死字段，从未被读取），
-/// 改由 type_desc 统一携带类型元信息（chan/is_ref/scalar_ops）。
-/// width 保留：nullable_chan 的实际宽度因 inner_type 而异（size=inner+1），
+/// v3 阶段 6（type_desc 统一）：所有类型元信息（is_ref/scalar_ops/is_nullable/...）
+/// 统一由 type_desc 携带，运行时通过 type_desc.<field> 获取，无任何通道派分。
+/// width 保留：nullable 的实际宽度因 inner_type 而异（size=inner+1），
 /// 无法从静态 type_desc.size 获取，故 width 仍为权威宽度来源。
 pub const ChanSlot = struct {
     /// 数据指针（指向 ChannelRegion 中的内存）
     /// 标量通道：1 个元素；向量通道：多个元素（由调用方管理长度）
     /// null 表示无数据通道（unit/null 类型）
     ptr: ?[*]u8 = null,
-    /// 类型描述符（含 chan/is_ref/scalar_ops/type_id 等编译期元信息）
-    type_desc: *const ir_mod.type_descriptor_mod.TypeDescriptor = ir_mod.type_descriptor_mod.lookupChanDescriptor(.null_chan),
-    /// 元素宽度（字节，权威值——nullable_chan 宽度因 inner_type 而异）
+    /// 类型描述符（含 is_ref/scalar_ops/is_nullable/is_null_type/is_unit_type 等编译期元信息）
+    /// 所有类型判断统一通过 type_desc.<field> 获取，无任何通道派分
+    type_desc: *const ir_mod.type_descriptor_mod.TypeDescriptor = ir_mod.type_descriptor_mod.null_descriptor,
+    /// nullable 通道的内部类型描述符（仅 type_desc.is_nullable 时有效）
+    /// 用于 readChannel/writeChannel 通过 inner type 的 scalar_ops 读写 inner data
+    inner_type_desc: ?*const ir_mod.type_descriptor_mod.TypeDescriptor = null,
+    /// 元素宽度（字节，权威值——nullable 宽度因 inner_type 而异：inner.size + 1 byte flag）
     width: u8 = 0,
     /// 元素数量（标量=1，向量=N）
     length: u32 = 0,
@@ -104,24 +108,26 @@ pub const Runtime = struct {
     call_depth: u32 = 0,
     current_func: ?*const Function = null,
 
-    // ── 向后兼容的 accessor（v3 阶段 6：过渡期保留，供 engine.zig 外部访问） ──
-    /// 读取通道数据指针（向后兼容）
+    // ── ChanSlot 字段访问器（向量切片操作核心 API） ──
+    // vector_exec/body_exec 通过这些 accessor 设置子向量视图的 ptr/length，
+    // 实现逐元素遍历时将向量通道重定向到单个元素。
+    /// 读取通道数据指针
     pub inline fn chanPtrs(self: *Runtime, chan: u16) ?[*]u8 {
         return self.chan_slots[chan].ptr;
     }
-    /// 设置通道数据指针（向后兼容）
+    /// 设置通道数据指针（向量切片重定向）
     pub inline fn setChanPtr(self: *Runtime, chan: u16, ptr: ?[*]u8) void {
         self.chan_slots[chan].ptr = ptr;
     }
-    /// 读取通道长度（向后兼容）
+    /// 读取通道向量长度
     pub inline fn chanLengths(self: *Runtime, chan: u16) u32 {
         return self.chan_slots[chan].length;
     }
-    /// 设置通道长度（向后兼容）
+    /// 设置通道向量长度
     pub inline fn setChanLength(self: *Runtime, chan: u16, len: u32) void {
         self.chan_slots[chan].length = len;
     }
-    /// 读取通道宽度（向后兼容）
+    /// 读取通道元素宽度
     pub inline fn chanWidths(self: *Runtime, chan: u16) u8 {
         return self.chan_slots[chan].width;
     }
@@ -160,11 +166,13 @@ pub const Runtime = struct {
         self.chan_slots = try self.backing.alloc(ChanSlot, self.chan_count);
         @memset(self.chan_slots, .{});
 
-        // 为所有通道设置 type_desc 与 width（静态元信息，不随函数调用变化）
-        // 本地通道的 chan_slots.ptr 在 enterFunction 中设置，但 type_desc/width 在此处一次性设置
+        // 为所有通道设置 type_desc/inner_type_desc/width（静态元信息，不随函数调用变化）
+        // 本地通道的 chan_slots.ptr 在 enterFunction 中设置，但 type_desc/inner_type_desc/width 在此处一次性设置
+        // nullable 通道的 inner_type_desc 从 ChannelMeta.inner_type_desc 获取，用于 vtable 读写 inner data
         for (0..self.chan_count) |i| {
             const meta = channels.get(@intCast(i));
-            self.chan_slots[i].type_desc = ir_mod.type_descriptor_mod.lookupChanDescriptor(meta.chan_type);
+            self.chan_slots[i].type_desc = meta.type_desc;
+            self.chan_slots[i].inner_type_desc = meta.inner_type_desc;
             self.chan_slots[i].width = meta.elem_width;
         }
 
@@ -174,10 +182,12 @@ pub const Runtime = struct {
 
         for (0..gc) |i| {
             const meta = channels.get(@intCast(i));
-            self.global_slots[i].type_desc = ir_mod.type_descriptor_mod.lookupChanDescriptor(meta.chan_type);
+            self.global_slots[i].type_desc = meta.type_desc;
+            self.global_slots[i].inner_type_desc = meta.inner_type_desc;
             self.global_slots[i].width = meta.elem_width;
             self.global_slots[i].length = 1;
-            self.chan_slots[i].type_desc = ir_mod.type_descriptor_mod.lookupChanDescriptor(meta.chan_type);
+            self.chan_slots[i].type_desc = meta.type_desc;
+            self.chan_slots[i].inner_type_desc = meta.inner_type_desc;
             self.chan_slots[i].width = meta.elem_width;
             self.chan_slots[i].length = 1;
             if (meta.elem_width == 0) {
@@ -316,7 +326,7 @@ pub const Runtime = struct {
             self.frame_stack[self.call_depth - 1].scalar_area_size = alloc_bytes;
 
             // 设置本函数通道的 chan_slots.ptr/length
-            // width/chan_type/is_ref 已在 layoutGlobals 中一次性设置（静态元信息）
+            // width/type_desc 已在 layoutGlobals 中一次性设置（静态元信息）
             for (0..func.local_chan_count) |i| {
                 const chan = func.local_chan_start + @as(u16, @intCast(i));
                 self.chan_slots[chan].ptr = chan_bytes.ptr + func.local_offsets[i];
@@ -513,6 +523,139 @@ pub const Runtime = struct {
     }
 
     // ════════════════════════════════════════════
+    // 统一通道读写接口（基于 type_desc.scalar_ops vtable）
+    // ════════════════════════════════════════════
+
+    /// 统一读取通道值为 value.Value（通过 scalar_ops vtable 分派）
+    /// 标量类型 + ref + unit/null 均有 vtable，零运行时 switch。
+    /// 零字节类型（unit/null）ptr 可能为 null，使用 dummy ptr 调用 vtable。
+    /// nullable 通道：通过 inner_type_desc.scalar_ops 读取 inner data，
+    /// 再读取 null flag，组装为 Value。所有类型均通过 vtable 读写。
+    pub fn readChannel(self: *Runtime, chan: u16) ?value.Value {
+        const slot = &self.chan_slots[chan];
+        // nullable 通道：[data (inner_w bytes) | 1 byte flag]
+        // 通过 inner_type_desc.scalar_ops 读取 inner data + 单独读取 flag
+        if (slot.type_desc.is_nullable) {
+            const inner_ops = if (slot.inner_type_desc) |itd| itd.scalar_ops else null;
+            if (inner_ops) |iops| {
+                if (slot.ptr) |p| {
+                    const inner_w = slot.width - 1; // 减去 flag 字节
+                    // 检查 null flag
+                    if (p[inner_w] != 0) return value.Value.fromUnit(); // null
+                    // 非 null：通过 inner type 的 scalar_ops 读取 inner data
+                    return iops.read(@ptrCast(p));
+                }
+                return value.Value.fromUnit();
+            }
+            return value.Value.fromUnit();
+        }
+        // 标量/ref/unit/null：通过 type_desc.scalar_ops vtable 读取
+        const ops = slot.type_desc.scalar_ops orelse return null;
+        if (slot.ptr) |p| return ops.read(@ptrCast(p));
+        // ptr 为 null：仅对零字节类型（unit/null）合法，使用 dummy ptr
+        if (slot.width == 0) return ops.read(@ptrFromInt(@as(usize, 1)));
+        return null; // 数据类型但 ptr 未初始化
+    }
+
+    /// 统一写入 value.Value 到通道（通过 scalar_ops vtable 分派）
+    /// 先 coerce 将 Value 转为通道类型匹配的 Value，再 write 写入。
+    /// 零运行时 switch，且安全处理跨类型写入（如 i32 写入 i64 通道）。
+    /// nullable 通道：通过 inner_type_desc.scalar_ops 写入 inner data + 设置 flag。
+    /// 所有类型均通过 vtable 读写。
+    pub fn writeChannel(self: *Runtime, chan: u16, v: value.Value) bool {
+        const slot = &self.chan_slots[chan];
+        // nullable 通道：[data (inner_w bytes) | 1 byte flag]
+        // 通过 inner_type_desc.scalar_ops 写入 inner data + 设置 flag
+        if (slot.type_desc.is_nullable) {
+            const inner_ops = if (slot.inner_type_desc) |itd| itd.scalar_ops else null;
+            if (inner_ops) |iops| {
+                if (slot.ptr) |p| {
+                    const inner_w = slot.width - 1; // 减去 flag 字节
+                    // null/unit 值：设置 null flag
+                    switch (v) {
+                        .null_val, .unit => {
+                            p[inner_w] = 1; // null flag
+                            return true;
+                        },
+                        else => {
+                            // 非 null：通过 inner type 的 scalar_ops 写入 inner data
+                            const coerced = iops.coerce(v);
+                            iops.write(@ptrCast(p), coerced);
+                            p[inner_w] = 0; // non-null flag
+                            return true;
+                        },
+                    }
+                }
+                return false;
+            }
+            return false;
+        }
+        // 标量/ref/unit/null：通过 type_desc.scalar_ops vtable 写入
+        const ops = slot.type_desc.scalar_ops orelse return false;
+        const coerced = ops.coerce(v);
+        if (slot.ptr) |p| {
+            ops.write(@ptrCast(p), coerced);
+            return true;
+        }
+        // ptr 为 null：仅对零字节类型合法，write 为 no-op
+        if (slot.width == 0) return true;
+        return false;
+    }
+
+    /// 获取通道的类型描述符
+    pub inline fn typeDesc(self: *Runtime, chan: u16) *const ir_mod.type_descriptor_mod.TypeDescriptor {
+        return self.chan_slots[chan].type_desc;
+    }
+
+    /// 统一引用判断：通道是否持有引用类型（堆对象指针）
+    /// 通过 type_desc.is_ref 字段获取（替代旧 chan_type 派分）
+    pub inline fn isRef(self: *Runtime, chan: u16) bool {
+        return self.chan_slots[chan].type_desc.is_ref;
+    }
+
+    /// 统一标量判断：通道是否持有标量值（有 scalar_ops vtable）
+    pub inline fn isScalar(self: *Runtime, chan: u16) bool {
+        return self.chan_slots[chan].type_desc.scalar_ops != null;
+    }
+
+    /// 统一 nullable 判断：通道是否为 nullable<T> 类型
+    /// 通过 type_desc.is_nullable 字段获取
+    pub inline fn isNullable(self: *Runtime, chan: u16) bool {
+        return self.chan_slots[chan].type_desc.is_nullable;
+    }
+
+    /// 统一 null 类型判断：通道是否为 null 类型
+    /// 通过 type_desc.is_null_type 字段获取
+    pub inline fn isNull(self: *Runtime, chan: u16) bool {
+        return self.chan_slots[chan].type_desc.is_null_type;
+    }
+
+    /// 统一 unit 类型判断：通道是否为 unit 类型
+    /// 通过 type_desc.is_unit_type 字段获取
+    pub inline fn isUnit(self: *Runtime, chan: u16) bool {
+        return self.chan_slots[chan].type_desc.is_unit_type;
+    }
+
+
+    /// 统一格式化通道标量值为字符串（通过 scalar_ops.format vtable 分派）
+    /// 标量类型走 vtable 快路径，零运行时 switch；
+    /// 非标量类型（ref/nullable/unit/null）返回 null，由调用方处理。
+    pub fn formatChannel(self: *Runtime, chan: u16, buf: []u8) ?[]const u8 {
+        const slot = &self.chan_slots[chan];
+        if (slot.ptr == null) return null;
+        const ops = slot.type_desc.scalar_ops orelse return null;
+        return ops.format(@ptrCast(slot.ptr.?), buf);
+    }
+
+    /// 统一格式化任意标量指针为字符串（通过 scalar_ops.format vtable 分派）
+    /// 用于 ref_chan 内嵌的标量引用场景：指针来自其他通道的 rawPtr，
+    /// type_desc 来自源通道。零运行时 switch。
+    pub fn formatScalarPtr(_: *Runtime, ptr: *anyopaque, type_desc: *const ir_mod.type_descriptor_mod.TypeDescriptor, buf: []u8) ?[]const u8 {
+        const ops = type_desc.scalar_ops orelse return null;
+        return ops.format(ptr, buf);
+    }
+
+    // ════════════════════════════════════════════
     // 向量读写接口
     // ════════════════════════════════════════════
 
@@ -649,8 +792,8 @@ test "Runtime 双 Region 分层寻址" {
     var channels = ChannelSpace.init(testing.allocator);
     defer channels.deinit();
     channels.global_count = 1;
-    _ = try channels.alloc(.i64_chan); // ch0: 全局
-    _ = try channels.alloc(.i64_chan); // ch1: 本地
+    _ = try channels.alloc(type_descriptor_mod.i64_descriptor); // ch0: 全局
+    _ = try channels.alloc(type_descriptor_mod.i64_descriptor); // ch1: 本地
 
     var rt = Runtime.init(&global_region, &scalar_area, testing.allocator, null);
     defer rt.deinit();
