@@ -10,7 +10,7 @@
 //
 // 作为 builtin error_newtype，自动获得 Error trait 的 message() 默认实现（读 msg 字段）。
 // type_name() override 返回 "io error"，便于在日志中识别。
-type IOError: Error = IOError(
+type IOError: Err = IOError(
     kind: IOErrorKind,
     msg: str,
     os_err: i32,

@@ -1,0 +1,12 @@
+// Err trait: 所有错误类型实现的 trait
+//
+// message() 默认实现读 self.msg 字段（强制字段命名约束）
+// type_name() 默认实现返回 "Error"，子类型可 override
+trait Err {
+    fun message(self): str {
+        self.msg
+    }
+    fun type_name(self): str {
+        "Error"
+    }
+}
