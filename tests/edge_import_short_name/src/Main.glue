@@ -1,0 +1,24 @@
+// edge_import_short_name: 验证 import 短名解析
+// 覆盖：模块短名、函数短名、常量短名、selective import alias
+import std.time.Calendar.{ is_leap_year, days_in_month as dim, weekday_of }
+import std.time.SystemTime.{ UNIX_EPOCH }
+import std.io.Console.{println}
+
+fun main(): void {
+    // ── 函数短名（selective import） ────────────────────────────
+    val leap = is_leap_year(2024)
+    println(leap)                    // true
+    println(is_leap_year(1900))      // false
+
+    // ── selective import alias（重命名） ───────────────────────
+    println(dim(2026, 1))            // 31
+    println(dim(2024, 2))            // 29（闰年）
+
+    // ── 常量短名（selective import pub val） ───────────────────
+    println(UNIX_EPOCH.nanos)        // 0
+
+    // ── 函数短名（多参数） ─────────────────────────────────────
+    println(weekday_of(2026, 7, 20))  // 1（周一）
+
+    println("OK")
+}

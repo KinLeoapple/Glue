@@ -1,0 +1,270 @@
+// std_math 集成测试 — Math 标准库验证
+//
+// 阶段 3 验证：Float.glue 原语函数（sqrt/abs/floor/ceil/round/trunc/sin/cos/...）
+
+import std.io.Console.{println}
+import std.math.Float.{sqrt, abs, floor, ceil, round, trunc}
+import std.math.Float.{sin, cos, tan, asin, acos, atan, atan2}
+import std.math.Float.{exp, log, log2, log10, pow}
+import std.math.Float.{sinh, cosh, tanh, hypot}
+import std.math.Float.{is_nan, is_infinite, is_finite, signbit}
+import std.math.Float.{pi, tau, e, ln2, ln10, zero, one}
+import std.math.Float.{min_positive, max_finite, epsilon}
+import std.math.Const.{PI, E, SQRT2, GOLDEN_RATIO, GAMMA_EULER}
+import std.math.Const.{SPEED_OF_LIGHT, PLANCK, BOLTZMANN, AVOGADRO}
+import std.math.Const.{ELECTRON_MASS, GRAVITATIONAL, FINE_STRUCTURE}
+import std.math.Special.{erf, erfc, erf_inv}
+import std.math.Special.{tgamma, lgamma, digamma, beta, lbeta}
+import std.math.Special.{zeta, lambert_w}
+import std.math.Special.{si, ci, sin_int}
+import std.math.Special.{fresnel_s, fresnel_c}
+import std.math.Special.{elliptic_k, elliptic_e}
+import std.math.Special.{dawson, expint_e1, expint_ei}
+import std.math.Complex.{Complex, complex, from_real, from_polar, re, im}
+import std.math.Complex.{add, sub, mul, div, neg, conj, abs as cabs, norm_sq, arg}
+import std.math.Complex.{exp as cexp, log as clog, pow as cpow, sin as csin, cos as ccos, tan as ctan}
+import std.math.Vector.{sqrt_v, sin_v, cos_v, exp_v, log_v, abs_v}
+import std.math.Vector.{sqrt_v_inplace, sin_v_inplace}
+
+fun main() {
+    // ── 基本运算（f64） ──
+    println(sqrt(2.0f64))    // 1.4142135623730951
+    println(abs(-3.5f64))    // 3.5
+
+    // ── 取整（f64） ──
+    println(floor(2.7f64))   // 2
+    println(ceil(2.3f64))    // 3
+    println(round(2.5f64))   // 3
+    println(trunc(-2.7f64))  // -2
+
+    // ── 三角函数（f64） ──
+    println(sin(1.5707963267948966f64))  // 1 (sin(π/2))
+    println(cos(0.0f64))                  // 1
+    println(tan(0.0f64))                  // 0
+    println(asin(1.0f64))                 // 1.5707963267948966 (π/2)
+    println(acos(1.0f64))                 // 0
+    println(atan(1.0f64))                 // 0.7853981633974483 (π/4)
+
+    // ── 指数对数（f64） ──
+    println(exp(1.0f64))                  // 2.718281828459045 (e)
+    println(log(2.718281828459045f64))    // 1 (ln(e))
+    println(log2(8.0f64))                 // 3
+    println(log10(1000.0f64))             // 3
+    println(pow(2.0f64, 10.0f64))         // 1024
+
+    // ── f32 类型分派验证 ──
+    println(sqrt(2.0f32))   // 1.4142135
+
+    // ── f128 类型分派验证 ──
+    println(sqrt(2.0f128))  // 1.4142135623730951
+
+    println("std_math: primitives passed!")
+
+    // ── 组合函数（f64） ──
+    println(hypot(3.0f64, 4.0f64))  // 5.0
+    println(sinh(1.0f64))           // 1.1752011936438014
+    println(cosh(1.0f64))           // 1.5430806348152437
+    println(tanh(1.0f64))           // 0.7615941559557649
+
+    println("std_math: composite passed!")
+
+    // ── 分类函数（f64） ──
+    // sqrt(-1.0) = NaN（IEEE 哨兵），exp(999.0) = Inf（溢出）
+    println(is_nan(sqrt(0.0f64 - 2.0f64)))   // true (sqrt(-2)=NaN)
+    println(is_nan(1.0f64))                   // false
+    println(is_nan(0.0f64 / 0.0f64))          // true (0/0=NaN，IEEE 哨兵模型)
+    println(is_infinite(1.0f64 / 0.0f64))     // true (Inf)
+    println(is_infinite(0.0f64 / 0.0f64))     // false (NaN 不是 Inf)
+    println(is_finite(1.0f64))                // true
+    println(is_finite(1.0f64 / 0.0f64))       // false (Inf 不是 finite)
+    println(signbit(-1.0f64))                 // true (负数)
+    println(signbit(1.0f64))                  // false (正数)
+
+    println("std_math: classify passed!")
+
+    // ── 泛型常量（turbofish 显式标注 T） ──
+    println(pi<f64>())            // 3.141592653589793
+    println(pi<f32>())            // 3.1415927
+    println(pi<f128>())           // 3.1415926535897932385...
+    println(tau<f64>())           // 6.283185307179586
+    println(e<f64>())             // 2.718281828459045
+    println(ln2<f64>())           // 0.6931471805599453
+    println(ln10<f64>())          // 2.302585092994046
+    println(zero<f64>())          // 0
+    println(one<f64>())           // 1
+    println(min_positive<f64>())  // 2.2250738585072014e-308
+    println(max_finite<f64>())    // 1.7976931348623157e+308
+    println(epsilon<f64>())       // 2.220446049250313e-16
+
+    println("std_math: constants passed!")
+
+    // ── Const.glue 全精度数学常数 + 物理常数 ──
+    println(PI)                    // 3.1415926535897932384626433832795028 (f128)
+    println(E)                     // 2.7182818284590452353602874713526625 (f128)
+    println(SQRT2)                 // 1.4142135623730950488016887242096981 (f128)
+    println(GOLDEN_RATIO)          // 1.6180339887498948482045868343656381
+    println(GAMMA_EULER)           // 0.5772156649015328606065120900824024
+
+    println(SPEED_OF_LIGHT)        // 299792458 (exact, m/s)
+    println(PLANCK)                // 6.62607015e-34 (exact, J·s)
+    println(BOLTZMANN)             // 1.380649e-23 (exact, J/K)
+    println(AVOGADRO)              // 6.02214076e23 (exact, mol⁻¹)
+    println(ELECTRON_MASS)         // 9.1093837015e-31 (kg)
+    println(GRAVITATIONAL)         // 6.6743e-11 (m³ kg⁻¹ s⁻²)
+    println(FINE_STRUCTURE)        // 0.0072973525693 (无量纲)
+
+    println("std_math: Const passed!")
+
+    // ── Special.glue 高精度特殊函数 ──
+    // erf/erfc 误差函数（与 scipy.special.erf 对比）
+    println(erf(0.0f64))           // 0.0
+    println(erf(0.5f64))           // ≈ 0.5204998778130465
+    println(erf(1.0f64))           // ≈ 0.8427007929497149
+    println(erf(2.0f64))           // ≈ 0.9953222650189527
+    println(erfc(0.5f64))          // ≈ 0.4795001221869535 (= 1 - erf(0.5))
+
+    // tgamma/lgamma 伽马函数族（与 scipy.special.gamma 对比）
+    println(tgamma(0.5f64))        // ≈ 1.772453850905516 (√π)
+    println(tgamma(1.0f64))        // 1.0 (0!)
+    println(tgamma(5.0f64))        // 24.0 (4!)
+    println(tgamma(0.5f64) * tgamma(0.5f64))  // ≈ π (反射公式验证)
+    println(lgamma(0.5f64))        // ≈ 0.5723649429247001 (ln(√π))
+    println(lgamma(5.0f64))        // ≈ 3.178053830347946 (ln(24))
+    println(digamma(1.0f64))       // ≈ -0.5772156649015329 (-γ)
+    println(digamma(2.0f64))       // ≈ 0.4227843350984671 (1 - γ)
+
+    // beta/lbeta 贝塔函数
+    println(beta(1.0f64, 1.0f64))  // 1.0
+    println(beta(0.5f64, 0.5f64))  // ≈ 3.141592653589793 (π)
+    println(lbeta(1.0f64, 1.0f64)) // 0.0 (ln(1))
+
+    // zeta 黎曼 zeta 函数（与 mpmath.zeta 对比）
+    println(zeta(2.0f64))          // ≈ 1.6449340668482264 (π²/6)
+    println(zeta(4.0f64))          // ≈ 1.082323233711138 (π⁴/90)
+    println(zeta(0.0f64))          // -0.5 (解析延拓)
+    println(zeta(-1.0f64))         // ≈ -0.08333333333333333 (-1/12)
+
+    // lambert_w 朗伯 W 函数（W(0) = 0, W(e) = 1）
+    println(lambert_w(0.0f64))     // 0.0
+    println(lambert_w(1.0f64))     // ≈ 0.5671432904097838 (Omega constant)
+    println(lambert_w(2.718281828459045f64))  // ≈ 1.0 (W(e) = 1)
+
+    // si/ci 正弦/余弦积分
+    println(si(1.0f64))            // ≈ 0.9460830703671830
+    println(ci(1.0f64))            // ≈ 0.3374039229009681
+    println(sin_int(2.0f64))       // ≈ 1.6054129768026948
+
+    // fresnel_s/fresnel_c 菲涅耳积分
+    println(fresnel_s(1.0f64))     // ≈ 0.4382591473903547
+    println(fresnel_c(1.0f64))     // ≈ 0.7798934003768228
+
+    // elliptic_k/elliptic_e 椭圆积分
+    println(elliptic_k(0.0f64))    // π/2 ≈ 1.5707963267948966
+    println(elliptic_k(0.5f64))    // ≈ 1.8540746773013719
+    println(elliptic_e(0.0f64))    // π/2 ≈ 1.5707963267948966
+    println(elliptic_e(0.5f64))    // ≈ 1.3506438810476755
+
+    // dawson 道森积分
+    println(dawson(0.0f64))        // 0.0
+    println(dawson(1.0f64))        // ≈ 0.5380795069127684
+
+    // expint_e1/expint_ei 指数积分
+    println(expint_e1(1.0f64))     // ≈ 0.2193839343955203
+    println(expint_ei(1.0f64))     // ≈ 1.8951178163559368
+
+    println("std_math: Special passed!")
+
+    // ── atan2 组合函数（四象限反正切） ──
+    println(atan2(0.0f64, 1.0f64))    // 0.0 (正 x 轴)
+    println(atan2(1.0f64, 0.0f64))    // 1.5707963267948966 (π/2, 正 y 轴)
+    println(atan2(0.0f64, -1.0f64))   // 3.141592653589793 (π, 负 x 轴)
+    println(atan2(-1.0f64, 0.0f64))   // -1.5707963267948966 (-π/2, 负 y 轴)
+    println(atan2(1.0f64, 1.0f64))    // 0.7853981633974483 (π/4)
+
+    println("std_math: atan2 passed!")
+
+    // ── Complex 域（f64 复数） ──
+    // 构造器 + 访问器
+    val z1 = complex(1.0, 2.0)  // 1 + 2i
+    val z2 = complex(3.0, 4.0)  // 3 + 4i
+    println(re(z1))   // 1.0
+    println(im(z1))   // 2.0
+
+    // 基础算子
+    println(re(add(z1, z2)))   // 4.0
+    println(im(add(z1, z2)))   // 6.0
+    println(re(sub(z2, z1)))   // 2.0
+    println(im(sub(z2, z1)))   // 2.0
+    // 乘法: (1+2i)(3+4i) = 3+4i+6i+8i² = 3-8 + 10i = -5 + 10i
+    println(re(mul(z1, z2)))   // -5.0
+    println(im(mul(z1, z2)))   // 10.0
+    // 模长: |3+4i| = 5
+    println(cabs(complex(3.0, 4.0)))  // 5.0
+    // 共轭: conj(1+2i) = 1-2i
+    println(re(conj(z1)))  // 1.0
+    println(im(conj(z1)))  // -2.0
+    // i² = -1
+    val i_unit = complex(0.0, 1.0)
+    println(re(mul(i_unit, i_unit)))  // -1.0
+    println(im(mul(i_unit, i_unit)))  // 0.0
+
+    // 复初等函数
+    // 欧拉公式: e^(iπ) = -1
+    val euler = cexp(complex(0.0, 3.141592653589793))
+    println(re(euler))  // ≈ -1.0
+    println(im(euler))  // ≈ 0.0
+    // arg(3+4i) = atan2(4, 3) ≈ 0.9272952180016122
+    println(arg(complex(3.0, 4.0)))  // 0.9272952180016122
+    // norm_sq(3+4i) = 25
+    println(norm_sq(complex(3.0, 4.0)))  // 25.0
+    // from_polar(5, 0) = 5+0i
+    println(re(from_polar(5.0, 0.0)))  // 5.0
+    println(im(from_polar(5.0, 0.0)))  // 0.0
+    // sin(0+0i) = 0
+    println(re(csin(complex(0.0, 0.0))))  // 0.0
+    // cos(0+0i) = 1
+    println(re(ccos(complex(0.0, 0.0))))  // 1.0
+
+    println("std_math: Complex passed!")
+
+    // ── Vector 域（标量批处理） ──
+    // 正常批处理
+    val vin = [1.0f64, 4.0f64, 9.0f64, 16.0f64]
+    val vout = [0.0f64, 0.0f64, 0.0f64, 0.0f64]
+    val r1 = sqrt_v<f64>(&vin, &vout, 4)
+    println(vout[0])  // 1.0
+    println(vout[1])  // 2.0
+    println(vout[2])  // 3.0
+    println(vout[3])  // 4.0
+
+    // sin 批处理
+    val vin2 = [0.0f64, 1.5707963267948966f64, 3.141592653589793f64]
+    val vout2 = [0.0f64, 0.0f64, 0.0f64]
+    val r2 = sin_v<f64>(&vin2, &vout2, 3)
+    println(vout2[0])  // 0.0 (sin(0))
+    println(vout2[1])  // 1.0 (sin(π/2))
+    println(vout2[2])  // ≈ 0.0 (sin(π))
+
+    // 就地批处理
+    val vbuf = [1.0f64, 4.0f64, 9.0f64]
+    val r3 = sqrt_v_inplace<f64>(&vbuf, 3)
+    println(vbuf[0])  // 1.0
+    println(vbuf[1])  // 2.0
+    println(vbuf[2])  // 3.0
+
+    // 错误处理: len == 0 → BatchInvalidArgument
+    val r4 = sqrt_v<f64>(&vin, &vout, 0)
+    match r4 {
+        Error(e) => println(e.msg),  // "len == 0"
+        Ok(_) => println("no error"),
+    }
+
+    // 错误处理: len > 容量 → BatchLenMismatch
+    val r5 = sqrt_v<f64>(&vin, &vout, 10)
+    match r5 {
+        Error(e) => println(e.msg),  // "array capacity < len"
+        Ok(_) => println("no error"),
+    }
+
+    println("std_math: Vector passed!")
+}
