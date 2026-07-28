@@ -98,8 +98,7 @@ pub const Methods = struct {
                 const w = self.runtime.elemWidth(node.output);
                 for (0..count) |i| {
                     const elem_ptr = self.runtime.vectorElemPtr(node.output, i);
-                    const v = arr.elements[i];
-                    self.valueToRawPtr(elem_ptr, w, v);
+                    self.valueToRawPtr(elem_ptr, w, arr.elements[i]);
                 }
             },
             .repeat_source => {
@@ -252,12 +251,18 @@ pub const Methods = struct {
         const body_out_chan = nodes[body_local_start + vm.body_len - 1].output;
         const body_out_w = self.runtime.elemWidth(body_out_chan);
         const elem_w = self.runtime.elemWidth(src_chan);
-        const base_ptr = self.runtime.chanPtrs(src_chan).?;
 
+        // base_ptr 不能在循环外缓存：body 执行可能触发 scalar_area rebase，
+        // 导致 chan_slots[src_chan].ptr 更新到新地址，而缓存的 base_ptr 指向已释放的旧内存。
+        // 通过追踪前一次 setChanPtr 的偏移量，每次迭代从当前 chanPtrs 重新推导 base。
+        var prev_offset: usize = 0;
         for (0..count) |i| {
-            // 将循环变量通道临时指向 src_chan 的第 i 个元素（基于原始指针计算）
-            self.runtime.setChanPtr(src_chan, base_ptr + i * elem_w);
+            // 从当前通道指针推导 base（rebase 后指针已更新，偏移量保持不变）
+            const base = self.runtime.chanPtrs(src_chan).? - prev_offset;
+            const offset = i * elem_w;
+            self.runtime.setChanPtr(src_chan, base + offset);
             self.runtime.setChanLength(src_chan, 1);
+            prev_offset = offset;
 
             _ = try self.execBodyNodes(nodes, body_local_start, vm.body_len);
 
@@ -269,8 +274,9 @@ pub const Methods = struct {
             }
         }
 
-        // 恢复循环变量通道为向量模式
-        self.runtime.setChanPtr(src_chan, base_ptr);
+        // 恢复循环变量通道为向量模式（从当前指针推导 base，处理可能的 rebase）
+        const final_base = self.runtime.chanPtrs(src_chan).? - prev_offset;
+        self.runtime.setChanPtr(src_chan, final_base);
         self.runtime.setChanLength(src_chan, count);
     }
 
@@ -296,12 +302,15 @@ pub const Methods = struct {
         const body_out_chan = cb.out_chan;
         const body_out_w = self.runtime.elemWidth(body_out_chan);
         const elem_w = self.runtime.elemWidth(src_chan);
-        const base_ptr = self.runtime.chanPtrs(src_chan).?;
 
+        // base_ptr 不能在循环外缓存：body 执行可能触发 scalar_area rebase
+        var prev_offset: usize = 0;
         for (0..count) |i| {
-            // pin 元素：循环变量通道指向第 i 个元素
-            self.runtime.setChanPtr(src_chan, base_ptr + i * elem_w);
+            const base = self.runtime.chanPtrs(src_chan).? - prev_offset;
+            const offset = i * elem_w;
+            self.runtime.setChanPtr(src_chan, base + offset);
             self.runtime.setChanLength(src_chan, 1);
+            prev_offset = offset;
 
             // 直接调用 body 指令流，无 execNode switch
             try self.execCompiledBody(cb);
@@ -315,7 +324,8 @@ pub const Methods = struct {
         }
 
         // 恢复循环变量通道为向量模式
-        self.runtime.setChanPtr(src_chan, base_ptr);
+        const final_base = self.runtime.chanPtrs(src_chan).? - prev_offset;
+        self.runtime.setChanPtr(src_chan, final_base);
         self.runtime.setChanLength(src_chan, count);
     }
 
@@ -414,11 +424,17 @@ pub const Methods = struct {
         const body_out_chan = nodes[body_local_start + vm.body_len - 1].output;
         const body_out_w = self.runtime.elemWidth(body_out_chan);
         const elem_w = self.runtime.elemWidth(src_chan);
-        const base_ptr = self.runtime.chanPtrs(src_chan).?;
 
+        // base_ptr 不能在循环外缓存：body 执行可能触发 scalar_area rebase，
+        // 导致 chan_slots[src_chan].ptr 更新到新地址，而缓存的 base_ptr 指向已释放的旧内存。
+        // 通过追踪前一次 setChanPtr 的偏移量，每次迭代从当前 chanPtrs 重新推导 base。
+        var prev_offset: usize = 0;
         for (0..count) |i| {
-            self.runtime.setChanPtr(src_chan, base_ptr + i * elem_w);
+            const base = self.runtime.chanPtrs(src_chan).? - prev_offset;
+            const offset = i * elem_w;
+            self.runtime.setChanPtr(src_chan, base + offset);
             self.runtime.setChanLength(src_chan, 1);
+            prev_offset = offset;
             _ = try self.execBodyNodes(nodes, body_local_start, vm.body_len);
             if (body_out_w > 0) {
                 const src = self.runtime.rawPtr(body_out_chan);
@@ -426,7 +442,9 @@ pub const Methods = struct {
                 @memcpy(dst[0..body_out_w], src[0..body_out_w]);
             }
         }
-        self.runtime.setChanPtr(src_chan, base_ptr);
+        // 恢复循环变量通道为向量模式（从当前指针推导 base，处理可能的 rebase）
+        const final_base = self.runtime.chanPtrs(src_chan).? - prev_offset;
+        self.runtime.setChanPtr(src_chan, final_base);
         self.runtime.setChanLength(src_chan, count);
     }
 

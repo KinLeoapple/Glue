@@ -2437,12 +2437,67 @@ pub const Methods = struct {
             return val_chan;
         }
 
-        // nullable 传播：a? — unwrap nullable，null 时返回零值（简化：不做短路返回）
+        // nullable 传播：a? — null 时短路返回 null，非 null 时 unwrap
         if (val_meta.type_desc.isNullable()) {
             const inner_type = val_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor;
+
+            // 无返回通道时退化为简单 unwrap（不短路）
+            const ret_chan = self.current_return_chan orelse {
+                const unwrapped_chan = try self.allocChannel(inner_type);
+                try self.emit(Node.makeUnary(.nullable_unwrap, unwrapped_chan, 0, val_chan));
+                return unwrapped_chan;
+            };
+
+            // nullable_is_null → bool (true=null, false=not null)
+            const is_null_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
+            try self.emit(Node.makeUnary(.nullable_is_null, is_null_chan, 0, val_chan));
+
+            // cast bool → i64 (true=1=null→arm1, false=0=not null→arm0)
+            const winner_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
+            const cast_meta_idx = try self.addScalarMeta(.{ .kind = .int, .int_kind = .i64 });
+            try self.emit(Node.makeUnary(.cast, winner_chan, cast_meta_idx, is_null_chan));
+
+            // arm 0 = not null: nullable_unwrap
+            const ok_arm_start: u32 = @intCast(self.nodes.items.len);
             const unwrapped_chan = try self.allocChannel(inner_type);
             try self.emit(Node.makeUnary(.nullable_unwrap, unwrapped_chan, 0, val_chan));
-            return unwrapped_chan;
+            const ok_arm_len: u32 = @intCast(self.nodes.items.len - ok_arm_start);
+
+            // arm 1 = null: 创建 null nullable 并 halt_return
+            const null_arm_start: u32 = @intCast(self.nodes.items.len);
+            const null_input = try self.allocChannel(type_descriptor_mod.null_descriptor);
+            try self.emit(Node.makeSink(.const_null, null_input, 0));
+            const ret_meta = self.channels.get(ret_chan);
+            if (ret_meta.type_desc.isNullable()) {
+                // 返回类型是 nullable：创建匹配的 null nullable 值
+                const null_ret = try self.channels.allocNullable(ret_meta.inner_type_desc orelse inner_type);
+                try self.emit(Node.makeUnary(.nullable_make, null_ret, 0, null_input));
+                try self.emit(Node.makeUnary(.halt_return, ret_chan, 0, null_ret));
+            } else {
+                // 返回类型非 nullable：直接 halt_return（类型不匹配应由 sema 报错）
+                try self.emit(Node.makeUnary(.halt_return, ret_chan, 0, null_input));
+            }
+            const null_arm_len: u32 = @intCast(self.nodes.items.len - null_arm_start);
+
+            // route_dispatch 按 winner 索引执行对应子图
+            const arena_alloc = self.arena.allocator();
+            const body_starts = try arena_alloc.alloc(u32, 2);
+            const body_lens = try arena_alloc.alloc(u32, 2);
+            body_starts[0] = ok_arm_start;
+            body_lens[0] = ok_arm_len;
+            body_starts[1] = null_arm_start;
+            body_lens[1] = null_arm_len;
+
+            const result_chan = try self.allocChannel(inner_type);
+            const route_meta_idx = try self.addRouteMeta(.{
+                .trait_id = 0,
+                .method_id = 0,
+                .target_count = 2,
+                .body_starts = body_starts,
+                .body_lens = body_lens,
+            });
+            try self.emit(Node.makeUnary(.route_dispatch, result_chan, route_meta_idx, winner_chan));
+            return result_chan;
         }
 
         // Throw 传播：a? — 检查 is_ok，is_err 时函数返回 error，is_ok 时提取 Ok 值

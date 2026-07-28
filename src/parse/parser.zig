@@ -1466,7 +1466,9 @@ pub const Parser = struct {
                 if (self.peek().line != prev_tok.line) break;
             }
             const op_tok = self.advance();
-            const right = try self.parseBinary(mapping.precedence + 1);
+            // 右结合运算符（如 ??）用 precedence 而非 precedence+1，使右侧递归包含同级运算符
+            const next_min = if (mapping.right_assoc) mapping.precedence else mapping.precedence + 1;
+            const right = try self.parseBinary(next_min);
             left = try self.allocExpr(tokenLoc(op_tok), ast.Expr{
                 .binary = .{
                     .op = mapping.op,

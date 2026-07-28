@@ -64,10 +64,13 @@ pub const ChannelSpace = struct {
     }
 
     /// 分配一个 Nullable 通道
+    /// pool 路径创建具名 nullable<T> 描述符（含专属 scalar_ops vtable），
+    /// 同时通过 allocInner 保留 inner_type_desc 在 ChannelMeta 中，
+    /// 供 IR 编译器（compileElvis/compileSafeAccess 等）查询内部类型。
     pub fn allocNullable(self: *ChannelSpace, inner_type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
         if (self.pool) |pool| {
             const nullable_td = try pool.getOrCreateNullableDesc(inner_type_desc);
-            return self.alloc(nullable_td);
+            return self.allocInner(nullable_td, inner_type_desc, false);
         }
         return self.allocInner(type_descriptor_mod.nullable_descriptor, inner_type_desc, false);
     }

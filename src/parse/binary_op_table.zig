@@ -16,6 +16,7 @@ pub const OpMapping = struct {
     op: ast.BinaryOp,
     precedence: u8, // 数值越大越紧密
     check_multiline_deref: bool = false, // 仅 `*`（乘法 vs 解引用歧义）
+    right_assoc: bool = false, // 右结合（如 ?? elvis 运算符）
 };
 
 /// 优先级常量（从低到高）
@@ -38,8 +39,8 @@ pub const MIN_PREC: u8 = ELVIS_PREC;
 /// 扁平二元运算符注册表（单一真相来源）
 /// 新增运算符只需在此追加一条
 pub const BINARY_OPS = [_]OpMapping{
-    // Elvis ?? (最低)
-    .{ .token = .question_question, .op = .elvis, .precedence = ELVIS_PREC },
+    // Elvis ?? (最低，右结合)
+    .{ .token = .question_question, .op = .elvis, .precedence = ELVIS_PREC, .right_assoc = true },
     // 逻辑或 ||
     .{ .token = .pipe_pipe, .op = .or_op, .precedence = OR_PREC },
     // 逻辑与 &&

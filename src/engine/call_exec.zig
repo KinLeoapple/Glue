@@ -126,6 +126,14 @@ pub const Methods = struct {
             return;
         }
 
+        // null/unit/零字节类型 → nullable 通道：通过 vtable 写入 null，
+        // 正确设置 null flag（cloneValueBetweenChannels 因 src width=0 直接返回，不会写 flag）
+        if (dst_is_nullable and self.runtime.elemWidth(arg_chan) == 0) {
+            const v = self.chanToValue(arg_chan);
+            self.valueToChan(dst_chan, v);
+            return;
+        }
+
         try self.cloneValueBetweenChannels(dst_chan, arg_chan, is_ref);
     }
 

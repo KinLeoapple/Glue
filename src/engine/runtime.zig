@@ -622,6 +622,10 @@ pub const Runtime = struct {
         // 其地址基于新 data，不受 rebase 影响。不过 chan_slots.ptr 可能被 rebase 修改，需在 rebase 后赋值。
         self.chan_slots[chan].ptr = buf.ptr;
         self.chan_slots[chan].length = count;
+        // 向量数据属于当前帧，更新 current_frame_offset 以防止嵌套调用的 leaveFunction
+        // 通过 resetTo(caller_frame_offset) 回收向量内存（否则后续 enterFunction 的 saved_slots
+        // 分配会覆盖向量数据）
+        self.current_frame_offset = self.scalar_area.used;
     }
 
     /// 获取通道元素数量（标量=1，向量=N）

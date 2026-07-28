@@ -76,7 +76,11 @@ pub const TypeDescriptor = struct {
     /// type_id 19: str（引用）
     /// type_id 0: ref_descriptor / nullable_descriptor（引用/特殊）
     /// type_id 22+: 用户类型（引用）
+    /// nullable<T> 类型（无论 inner 是否为引用）均不是 ref 通道：
+    /// nullable 通道使用 [data|flag] 布局，由 nullable vtable 统一处理读写，
+    /// 不走 ref_chan 的 8 字节指针路径。
     pub fn isRef(self: *const TypeDescriptor) bool {
+        if (self.isNullable()) return false;
         return switch (self.type_id) {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21 => false,
             else => true,
@@ -1242,9 +1246,9 @@ pub const ref_ops: ScalarOps = .{ .read = readRef, .write = writeRef, .coerce = 
 // heap_ref_ops：具体引用类型的简化 vtable
 // ════════════════════════════════════════════════════════════
 // 用于 str/Record/Closure/Array 等具体引用类型（通过 getOrCreateRefDesc 创建）。
-// 这些类型的通道只持有堆指针或 null，不会出现标量位模式，
-// 因此 readHeapRef 无需 msync/isValidHeapObj 检查，直接解引用。
-// ref_ops（含完整检查）仅保留给 ref_descriptor（单态化回退路径）。
+// 以及 nullable<ref<T>> 的 inner read。
+// 由于 nullable 数据区可能是字节对齐，使用 align(1) 读取。
+// 保留 msync/isValidHeapObj 检查以处理单态化回退路径中标量位模式残留。
 
 pub fn readHeapRef(ptr: *anyopaque) value.Value {
     // 使用 align(1) 指针读取，因为 nullable 数据区可能是字节对齐
@@ -1252,8 +1256,18 @@ pub fn readHeapRef(ptr: *anyopaque) value.Value {
     if (p.*) |rp| {
         const addr = @intFromPtr(rp);
         if (addr == 0) return value.Value.fromNull();
-        // 检查对齐：未对齐地址说明不是合法堆指针（可能是标量位模式残留）
+        // 过滤无效地址：低地址（< 0x1000）和内核空间（高位置 1，含负 i64 符号扩展）
+        if (addr < 0x1000 or addr >= 0x8000000000000000) {
+            const ip: *align(1) i64 = @ptrCast(ptr);
+            return value.Value.fromI64(ip.*);
+        }
+        // 检查对齐：未对齐地址说明不是合法堆指针
         if (addr % @alignOf(value.obj_header.ObjHeader) != 0) {
+            const ip: *align(1) i64 = @ptrCast(ptr);
+            return value.Value.fromI64(ip.*);
+        }
+        // 使用 msync 安全检查页面是否映射，避免对标量位模式调用 isValidHeapObj 导致段错误
+        if (!isReadable(addr)) {
             const ip: *align(1) i64 = @ptrCast(ptr);
             return value.Value.fromI64(ip.*);
         }

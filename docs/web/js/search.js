@@ -112,7 +112,10 @@ function renderSearchResults(query) {
     ).slice(0, 20);
 
     if (results.length === 0) {
-        container.innerHTML = '<div class="search-result" style="color:var(--text-muted);cursor:default">无匹配结果</div>';
+        const emptyMsg = typeof t !== 'undefined' ? t('search_empty') : '无匹配结果';
+        container.innerHTML = `<div class="search-result search-empty"><span class="search-empty-icon"></span>${emptyMsg}</div>`;
+        const emptyIcon = container.querySelector('.search-empty-icon');
+        if (emptyIcon && typeof ICONS !== 'undefined') emptyIcon.innerHTML = ICONS.alertCircle;
         return;
     }
 
@@ -131,11 +134,21 @@ function renderSearchResults(query) {
             }
         }
         return `<div class="search-result ${i === selectedIndex ? 'selected' : ''}" data-path="${r.path}" data-index="${i}" role="option">
-            <div class="search-result-title">${title}</div>
-            <div class="search-result-path">${r.chapter}</div>
-            ${preview ? `<div class="search-result-preview">${preview}</div>` : ''}
+            <span class="search-result-icon"></span>
+            <div class="search-result-content">
+                <div class="search-result-title">${title}</div>
+                <div class="search-result-path">${r.chapter}</div>
+                ${preview ? `<div class="search-result-preview">${preview}</div>` : ''}
+            </div>
+            <span class="search-result-arrow"></span>
         </div>`;
     }).join('');
+
+    // 注入图标
+    if (typeof ICONS !== 'undefined') {
+        container.querySelectorAll('.search-result-icon').forEach(el => el.innerHTML = ICONS.hash);
+        container.querySelectorAll('.search-result-arrow').forEach(el => el.innerHTML = ICONS.chevronRight);
+    }
 
     // 绑定点击
     container.querySelectorAll('.search-result').forEach(el => {
