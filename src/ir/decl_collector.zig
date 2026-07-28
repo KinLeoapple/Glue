@@ -496,6 +496,7 @@ pub const Methods = struct {
                     .adt => {
                         self.registerFieldId(bt.name, "__tag", 0);
                     },
+                    .trait => {},
                 }
             } else {
                 switch (bt.kind) {
@@ -550,6 +551,7 @@ pub const Methods = struct {
                             .type_params = &.{},
                         });
                     },
+                    .trait => {},
                 }
             }
         }

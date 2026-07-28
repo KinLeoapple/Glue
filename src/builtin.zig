@@ -22,11 +22,24 @@ const std = @import("std");
 
 /// Builtin 类型类别
 pub const BuiltinKind = enum {
-    /// Error 子类型（type X: Error = X(...) ）
+    /// Error 子类型（type X: Err = X(...) ）
     error_newtype,
     /// 关联 ADT（type X = | A | B(...) ），如 IOErrorKind / TimeErrorKind
     adt,
-    // 未来扩展：record / trait 等
+    /// Trait 定义（trait X { ... }），如 Err
+    trait,
+};
+
+/// Trait 方法签名元信息（kind == .trait 时使用）
+pub const TraitMethodInfo = struct {
+    name: []const u8,
+    /// 返回类型名（"str"/"i32"/...）
+    ret: []const u8,
+    /// 是否有默认实现
+    has_default: bool,
+    /// override 返回值（has_default=true 且为 const 返回时使用，如 "Error"/"io error"）。
+    /// null 表示默认实现为 field_access(self, "msg")
+    default_const_value: ?[]const u8 = null,
 };
 
 /// Builtin 字段元信息
@@ -55,6 +68,8 @@ pub const BuiltinTypeInfo = struct {
     source_path: []const u8,
     /// 所属 pack 名（用于模块导入解析）
     pack_name: []const u8,
+    /// Trait 方法列表（kind == .trait 时使用）
+    trait_methods: []const TraitMethodInfo = &[_]TraitMethodInfo{},
 };
 
 /// 所有 builtin 类型元信息表（comptime 单一真相来源）
@@ -62,10 +77,39 @@ pub const BuiltinTypeInfo = struct {
 /// 新增 builtin 类型时只需在此表追加条目，并在 src/builtin/ 下创建对应 .glue 文件。
 /// sema 与 IR builder 均通过此表加载，避免硬编码。
 pub const BUILTIN_TYPES = [_]BuiltinTypeInfo{
+    // ── Err trait ──
+    // message() 默认实现：field_access(self, "msg")
+    // type_name() 默认实现：返回 "Error"，子类型 override 返回自己的类型名
+    .{
+        .name = "Err",
+        .kind = .trait,
+        .parent_trait = "",
+        .constructor_name = "",
+        .fields = &[_]FieldInfo{},
+        .source_path = "src/builtin/error/Err.glue",
+        .pack_name = "error",
+        .trait_methods = &[_]TraitMethodInfo{
+            .{ .name = "message", .ret = "str", .has_default = true, .default_const_value = null },
+            .{ .name = "type_name", .ret = "str", .has_default = true, .default_const_value = "Error" },
+        },
+    },
+    // ── Error error_newtype（通用错误类型，用于 throw Error("msg")）──
+    .{
+        .name = "Error",
+        .kind = .error_newtype,
+        .parent_trait = "Err",
+        .constructor_name = "Error",
+        .fields = &[_]FieldInfo{
+            .{ .name = "msg", .type_name = "str" },
+        },
+        .source_path = "src/builtin/error/Error.glue",
+        .pack_name = "error",
+    },
+    // ── builtin error_newtype（parent_trait = "Err"）──
     .{
         .name = "CastError",
         .kind = .error_newtype,
-        .parent_trait = "Error",
+        .parent_trait = "Err",
         .constructor_name = "CastError",
         .fields = &[_]FieldInfo{
             .{ .name = "msg", .type_name = "str" },
@@ -79,7 +123,7 @@ pub const BUILTIN_TYPES = [_]BuiltinTypeInfo{
     .{
         .name = "IOError",
         .kind = .error_newtype,
-        .parent_trait = "Error",
+        .parent_trait = "Err",
         .constructor_name = "IOError",
         .fields = &[_]FieldInfo{
             .{ .name = "kind", .type_name = "IOErrorKind" },
@@ -93,7 +137,7 @@ pub const BUILTIN_TYPES = [_]BuiltinTypeInfo{
     .{
         .name = "TimeError",
         .kind = .error_newtype,
-        .parent_trait = "Error",
+        .parent_trait = "Err",
         .constructor_name = "TimeError",
         .fields = &[_]FieldInfo{
             .{ .name = "kind", .type_name = "TimeErrorKind" },

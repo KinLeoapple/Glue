@@ -23,7 +23,7 @@ const decl_classifier = @import("decl_classifier.zig");
 // ConcreteType 基础设施（替代 HM Type 系统）
 pub const concrete_type_mod = @import("concrete_type.zig");
 
-// TypeDescriptor + ScalarOps vtable（v3 spec §4.1）
+// TypeDescriptor + TypeOps vtable（v3 spec §4.1）
 pub const type_descriptor = @import("type_descriptor.zig");
 
 // v3 新增：sema 图构建驱动器子模块
@@ -79,6 +79,8 @@ fn typeNameOfType(ty: *Type) ?[]const u8 {
         .trait_type => |tt| tt.name,
         .ref_type => |rt| typeNameOfType(rt.inner),
         .nullable_type => |inner| typeNameOfType(inner),
+        .record_type => |rt| rt.name,
+        .throw_type => "Throw",
         else => null,
     };
 }
@@ -989,7 +991,7 @@ pub const TypeInferencer = struct {
                     };
                 }
                 const result = self.arena.allocator().create(Type) catch return error.OutOfMemory;
-                result.* = Type{ .record_type = .{ .fields = new_fields } };
+                result.* = Type{ .record_type = .{ .fields = new_fields, .name = rt.name } };
                 self.types.append(self.arena.allocator(), result) catch return error.OutOfMemory;
                 return result;
             },
@@ -1379,23 +1381,24 @@ pub const TypeInferencer = struct {
     pub fn inferExpr(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv, expected: ?*Type) SemaError!*Type {
         const ty = try self.inferExprInner(expr, env, expected);
         if (self.sema_result) |sr| {
-            if (semaTypeToTypeDesc(ty, sr)) |td| {
+            // 先 resolve 再提取 type_name，确保 type_var 已绑定的具体类型能被正确记录
+            const resolved_ty = self.resolve(ty);
+            if (semaTypeToTypeDesc(resolved_ty, sr)) |td| {
                 const type_name: ?[]const u8 = blk: {
-                    if (ty.* == .array_type) {
-                        const elem_name = typeNameOfType(ty.array_type.element_type) orelse break :blk null;
+                    if (resolved_ty.* == .array_type) {
+                        const elem_name = typeNameOfType(resolved_ty.array_type.element_type) orelse break :blk null;
                         break :blk std.fmt.allocPrint(self.arena.allocator(), "{s}[]", .{elem_name}) catch null;
                     }
-                    break :blk typeNameOfType(ty);
+                    break :blk typeNameOfType(resolved_ty);
                 };
                 var inner_td: ?*const type_descriptor.TypeDescriptor = null;
-                if (ty.* == .nullable_type) {
-                    inner_td = semaTypeToTypeDesc(ty.nullable_type, sr);
+                if (resolved_ty.* == .nullable_type) {
+                    inner_td = semaTypeToTypeDesc(resolved_ty.nullable_type, sr);
                 }
-                const is_ref = switch (ty.*) {
+                const is_ref = switch (resolved_ty.*) {
                     .ref_type => true,
                     else => false,
                 };
-                const resolved_ty = self.resolve(ty);
                 const is_raw_ref = switch (resolved_ty.*) {
                     .ref_type => |rt| rt.is_raw,
                     else => false,
@@ -1406,9 +1409,9 @@ pub const TypeInferencer = struct {
                     .type_name = type_name,
                     .is_ref_type = is_ref,
                     .is_raw_ref = is_raw_ref,
-                    .const_val = self.extractConstVal(expr, ty),
-                    .type_args = self.extractTypeArgs(ty),
-                    .fn_sig = self.extractFnSig(ty),
+                    .const_val = self.extractConstVal(expr, resolved_ty),
+                    .type_args = self.extractTypeArgs(resolved_ty),
+                    .fn_sig = self.extractFnSig(resolved_ty),
                 }) catch {};
             }
         }
@@ -1613,10 +1616,19 @@ pub const TypeInferencer = struct {
                     .expression => |e| try self.inferExpr(e, child_env, null),
                 };
                 self.popLinearScope();
+                // 若存在返回类型注解，则与 body 推断类型统一，并以注解作为返回类型
+                const effective_body_ty: *Type = if (lam.return_type) |rt| blk: {
+                    const annot_ty = try self.typeFromAst(rt);
+                    _ = self.tryWidenUnify(annot_ty, body_ty) catch {
+                        const loc = ast.exprLocation(expr);
+                        self.addErrorAt(.type_mismatch, loc.line, loc.column, "lambda return type annotation does not match inferred body type", .{});
+                    };
+                    break :blk annot_ty;
+                } else body_ty;
                 const ret_ty = if (lam.is_async)
-                    try self.makeGenericType("Async", &[_]*Type{body_ty})
+                    try self.makeGenericType("Async", &[_]*Type{effective_body_ty})
                 else
-                    body_ty;
+                    effective_body_ty;
                 return self.makeFnType(param_types, ret_ty);
             },
             .call => |c| {
@@ -1921,7 +1933,7 @@ pub const TypeInferencer = struct {
                             }
                         }
                         const t = try self.arena.allocator().create(Type);
-                        t.* = Type{ .record_type = .{ .fields = try all_fields.toOwnedSlice(self.arena.allocator()) } };
+                        t.* = Type{ .record_type = .{ .fields = try all_fields.toOwnedSlice(self.arena.allocator()), .name = rt.name } };
                         try self.types.append(self.arena.allocator(), t);
                         return t;
                     },
@@ -1954,18 +1966,26 @@ pub const TypeInferencer = struct {
                             }
                         }
                     }
+                    // 尝试用短名查找 exported_schemes（如 "std.time.SystemTime\x00UNIX_EPOCH"）
                     const key = std.fmt.allocPrint(self.arena.allocator(), "{s}\x00{s}", .{ mod_name, fa.field }) catch return self.freshTypeVar() catch unreachable;
                     defer self.arena.allocator().free(key);
                     if (self.exported_schemes.get(key)) |scheme| {
+                        return self.freshenType(scheme) catch unreachable;
+                    }
+                    // 尝试用 mangled 名查找（pub val 被 module_loader mangled 为 "mod_name.field"，
+                    // recordExportSymbol 用 mangled 名作 sym，故 key 为 "mod\x00mod.field"）
+                    const mangled_sym = std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ mod_name, fa.field }) catch return self.freshTypeVar() catch unreachable;
+                    defer self.arena.allocator().free(mangled_sym);
+                    const mangled_key = std.fmt.allocPrint(self.arena.allocator(), "{s}\x00{s}", .{ mod_name, mangled_sym }) catch return self.freshTypeVar() catch unreachable;
+                    defer self.arena.allocator().free(mangled_key);
+                    if (self.exported_schemes.get(mangled_key)) |scheme| {
                         return self.freshenType(scheme) catch unreachable;
                     }
                     // import 别名 fallback：模块短名的字段访问，确认函数存在
                     // 如 Calendar.is_leap_year → "std.time.Calendar.is_leap_year"
                     // 精确类型推断由 IR 层处理，sema 返回 fresh var
                     if (self.sema_result) |sr| {
-                        const mangled = std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ mod_name, fa.field }) catch return self.freshTypeVar() catch unreachable;
-                        defer self.arena.allocator().free(mangled);
-                        if (sr.func_sig_index.contains(mangled)) {
+                        if (sr.func_sig_index.contains(mangled_sym)) {
                             return self.freshTypeVar() catch unreachable;
                         }
                     }
@@ -2024,6 +2044,11 @@ pub const TypeInferencer = struct {
             },
             .method_call => |mc| {
                 const result_ty = try trait_resolve.inferMethodCall(self, expr, mc, env);
+                // Type-check arguments so their types are recorded in sema_result.
+                // inferMethodCall only resolves the return type; it does not infer argument types.
+                for (mc.arguments) |arg| {
+                    _ = self.inferExpr(arg, env, null) catch {};
+                }
                 if (std.mem.eql(u8, mc.method, "await") or std.mem.eql(u8, mc.method, "cancel")) {
                     const obj_ty = self.inferExpr(mc.object, env, null) catch return result_ty;
                     if (self.isAsyncType(obj_ty)) {
@@ -2504,8 +2529,22 @@ pub const TypeInferencer = struct {
             },
             .constructor => |con| {
                 if (gadt_check.refineConstructorPattern(self, con, expected_ty, env)) {} else {
-                    for (con.patterns) |sub_pat| {
-                        const sub_ty = try self.freshTypeVar();
+                    // 从 adt_types 查找构造器的字段类型，用作子模式的期望类型
+                    var ctor_field_types: ?[]const *Type = null;
+                    var adt_it = self.adt_types.valueIterator();
+                    while (adt_it.next()) |info| {
+                        for (info.constructor_names, 0..) |cn, ci| {
+                            if (std.mem.eql(u8, cn, con.name)) {
+                                if (ci < info.ctor_field_types.len) {
+                                    ctor_field_types = info.ctor_field_types[ci];
+                                }
+                                break;
+                            }
+                        }
+                        if (ctor_field_types != null) break;
+                    }
+                    for (con.patterns, 0..) |sub_pat, i| {
+                        const sub_ty = if (ctor_field_types) |fts| (if (i < fts.len) fts[i] else try self.freshTypeVar()) else try self.freshTypeVar();
                         try self.inferPattern(sub_pat, sub_ty, env);
                     }
                 }
@@ -2689,8 +2728,20 @@ pub const TypeInferencer = struct {
             }
         }
         self.suppress_errors = false;
+        // Process val/var declarations before function bodies so that
+        // cross-module val references (via import aliases → mangled names)
+        // resolve correctly. Functions and types are already predeclared above,
+        // so val initializers can reference them; function bodies can now
+        // reference vals whose mangled names are in env.
         for (module.declarations) |decl| {
-            self.checkDeclCollecting(decl, &env);
+            if (decl == .expr_decl) {
+                self.checkDeclCollecting(decl, &env);
+            }
+        }
+        for (module.declarations) |decl| {
+            if (decl != .expr_decl) {
+                self.checkDeclCollecting(decl, &env);
+            }
         }
         self.popLinearScope();
         self.recordModuleStructure(module, module_name);
@@ -2811,7 +2862,7 @@ pub const TypeInferencer = struct {
     }
     fn importUseDecl(self: *TypeInferencer, ud: anytype, env: *TypeEnv) void {
         if (ud.module_path.len == 0) return;
-        const mod = ud.module_path[0];
+        const mod = joinModulePath(self.arena.allocator(), ud.module_path) catch return;
         if (ud.items) |items| {
             for (items) |item| {
                 const key = std.fmt.allocPrint(self.arena.allocator(), "{s}\x00{s}", .{ mod, item.name }) catch continue;
@@ -3191,7 +3242,7 @@ pub const TypeInferencer = struct {
                         .ty = self.typeFromAstWithParams(f.ty, &type_param_map) catch return,
                     };
                 }
-                rec_ty.* = Type{ .record_type = .{ .fields = fields } };
+                rec_ty.* = Type{ .record_type = .{ .fields = fields, .name = td.name } };
                 const param_types = self.arena.allocator().alloc(*Type, rec_def.fields.len) catch return;
                 for (rec_def.fields, 0..) |f, i| {
                     param_types[i] = self.typeFromAstWithParams(f.ty, &type_param_map) catch return;
@@ -3348,65 +3399,41 @@ pub const TypeInferencer = struct {
             env.define("type", fn_ty) catch return;
             self.registerBuiltinName("type");
         }
-        const error_adt_ty = self.makeAdtType("Error", &[_]*Type{}) catch return;
-        const error_adt_key = self.arena.allocator().dupe(u8, "Error") catch return;
-        self.adt_types.put(error_adt_key, AdtInfo{ .ty = error_adt_ty, .constructor_names = &[_][]const u8{} }) catch return;
+        // Err trait 注册（从 BUILTIN_TYPES 元信息构建，替代原硬编码 Error trait）
+        // message()/type_name() 默认实现由 IR 层合成（field_access/const_str），支持 override。
         {
-            const val_ty = self.freshTypeVar() catch return;
-            const params = self.arena.allocator().alloc(*Type, 1) catch return;
-            params[0] = self.makeType(.str_type) catch return;
-            const throw_ty = self.arena.allocator().create(Type) catch return;
-            throw_ty.* = Type{ .throw_type = .{ .value_type = val_ty, .error_type = error_adt_ty } };
-            self.types.append(self.arena.allocator(), throw_ty) catch return;
-            const fn_ty = self.makeFnType(params, throw_ty) catch return;
-            const qvars = self.arena.allocator().alloc(usize, 1) catch return;
-            qvars[0] = val_ty.type_var.id;
-            env.define("Error", fn_ty) catch return;
-            self.registerBuiltinName("Error");
-        }
-        // Error 作为完全内建 trait 注册
-        // 设计：message/type_name 提供默认实现（读 ErrorValue 字段），用户可通过 override
-        // 自定义行为。prefix 已合并到 type_name（错误前缀直接使用 type_name()），故移除。
-        {
-            const error_trait_ty = self.arena.allocator().create(Type) catch return;
-            error_trait_ty.* = Type{ .trait_type = .{ .name = "Error", .type_args = &[_]*Type{} } };
-            self.types.append(self.arena.allocator(), error_trait_ty) catch return;
-            // method_names 包含所有方法；required_method_names 为空（message/type_name 均有默认实现）
-            const error_method_names = self.arena.allocator().alloc([]const u8, 2) catch return;
-            error_method_names[0] = "message";
-            error_method_names[1] = "type_name";
-            const error_required_names = &[_][]const u8{};
-            const error_assoc_names = &[_][]const u8{};
-            var error_method_schemes = std.StringHashMap(*Type).init(self.arena.allocator());
-            // message(self: Error) -> str
-            {
+            const err_trait_ty = self.arena.allocator().create(Type) catch return;
+            err_trait_ty.* = Type{ .trait_type = .{ .name = "Err", .type_args = &[_]*Type{} } };
+            self.types.append(self.arena.allocator(), err_trait_ty) catch return;
+            // 从 BUILTIN_TYPES 查找 Err trait 的方法元信息
+            const err_builtin = comptime blk: {
+                for (glue_builtin.BUILTIN_TYPES) |bt| {
+                    if (std.mem.eql(u8, bt.name, "Err")) break :blk bt;
+                }
+                unreachable;
+            };
+            const method_count = err_builtin.trait_methods.len;
+            const method_names = self.arena.allocator().alloc([]const u8, method_count) catch return;
+            var method_schemes = std.StringHashMap(*Type).init(self.arena.allocator());
+            inline for (err_builtin.trait_methods, 0..) |m, i| {
+                method_names[i] = m.name;
+                // (self: Err) -> ret
                 const self_type = self.arena.allocator().create(Type) catch return;
-                self_type.* = Type{ .trait_type = .{ .name = "Error", .type_args = &[_]*Type{} } };
+                self_type.* = Type{ .trait_type = .{ .name = "Err", .type_args = &[_]*Type{} } };
                 self.types.append(self.arena.allocator(), self_type) catch return;
                 const fn_params = self.arena.allocator().alloc(*Type, 1) catch return;
                 fn_params[0] = self_type;
-                const fn_ty = self.makeFnType(fn_params, self.makeType(.str_type) catch return) catch return;
-                const scheme = fn_ty;
-                error_method_schemes.put(self.arena.allocator().dupe(u8, "message") catch return, scheme) catch return;
+                const ret_ty = self.makeType(.str_type) catch return;
+                const fn_ty = self.makeFnType(fn_params, ret_ty) catch return;
+                method_schemes.put(self.arena.allocator().dupe(u8, m.name) catch return, fn_ty) catch return;
             }
-            // type_name(self: Error) -> str
-            {
-                const self_type = self.arena.allocator().create(Type) catch return;
-                self_type.* = Type{ .trait_type = .{ .name = "Error", .type_args = &[_]*Type{} } };
-                self.types.append(self.arena.allocator(), self_type) catch return;
-                const fn_params = self.arena.allocator().alloc(*Type, 1) catch return;
-                fn_params[0] = self_type;
-                const fn_ty = self.makeFnType(fn_params, self.makeType(.str_type) catch return) catch return;
-                const scheme = fn_ty;
-                error_method_schemes.put(self.arena.allocator().dupe(u8, "type_name") catch return, scheme) catch return;
-            }
-            const error_key = self.arena.allocator().dupe(u8, "Error") catch return;
-            self.trait_types.put(error_key, TraitInfo{
-                .ty = error_trait_ty,
-                .associated_type_names = error_assoc_names,
-                .method_names = error_method_names,
-                .required_method_names = error_required_names,
-                .method_schemes = error_method_schemes,
+            const err_key = self.arena.allocator().dupe(u8, "Err") catch return;
+            self.trait_types.put(err_key, TraitInfo{
+                .ty = err_trait_ty,
+                .associated_type_names = &[_][]const u8{},
+                .method_names = method_names,
+                .required_method_names = &[_][]const u8{},
+                .method_schemes = method_schemes,
                 .defining_module = "<builtin>",
             }) catch return;
         }
@@ -3442,6 +3469,7 @@ pub const TypeInferencer = struct {
                     }
                 },
                 .error_newtype => {},
+                .trait => {},
             }
         }
         // 第二遍：注册 error_newtype（字段类型可引用第一遍注册的 ADT）
@@ -3493,18 +3521,21 @@ pub const TypeInferencer = struct {
                     }) catch return;
                 },
                 .adt => {},
+                .trait => {},
             }
         }
         {
+            // Ok constructor: ∀T,E. fn(T) -> Throw<T, E>
+            // Both T (value type) and E (error type) are polymorphic so that
+            // matching `Ok(ar)` against `Throw<AcceptResult, IOError>` binds T=AcceptResult.
             const val_ty = self.freshTypeVar() catch return;
+            const err_ty = self.freshTypeVar() catch return;
             const params = self.arena.allocator().alloc(*Type, 1) catch return;
             params[0] = val_ty;
             const throw_ty = self.arena.allocator().create(Type) catch return;
-            throw_ty.* = Type{ .throw_type = .{ .value_type = val_ty, .error_type = error_adt_ty } };
+            throw_ty.* = Type{ .throw_type = .{ .value_type = val_ty, .error_type = err_ty } };
             self.types.append(self.arena.allocator(), throw_ty) catch return;
             const fn_ty = self.makeFnType(params, throw_ty) catch return;
-            const qvars = self.arena.allocator().alloc(usize, 1) catch return;
-            qvars[0] = val_ty.type_var.id;
             env.define("Ok", fn_ty) catch return;
             self.registerBuiltinName("Ok");
         }
@@ -4374,6 +4405,10 @@ pub const TypeInferencer = struct {
                 }
                 if (f.visibility == .public) {
                     self.recordExportSymbol(self.current_module, f.name, env);
+                } else if (std.mem.lastIndexOfScalar(u8, f.name, '.')) |dot_idx| {
+                    // mangled pub fun（module_loader 将 visibility 改为 .private 但保留 mangled 名）
+                    const module_path = f.name[0..dot_idx];
+                    self.recordExportSymbol(module_path, f.name, env);
                 }
                 for (f.bounds) |bound| {
                     self.checkTraitBound(bound, f.location);
@@ -4532,7 +4567,7 @@ pub const TypeInferencer = struct {
                             };
                         }
                         const rec_ty = self.arena.allocator().create(Type) catch return;
-                        rec_ty.* = Type{ .record_type = .{ .fields = fields } };
+                        rec_ty.* = Type{ .record_type = .{ .fields = fields, .name = td.name } };
                         self.types.append(self.arena.allocator(), rec_ty) catch return;
                         var param_types = self.arena.allocator().alloc(*Type, rec_def.fields.len) catch return;
                         for (rec_def.fields, 0..) |f, i| {
@@ -4921,6 +4956,25 @@ pub const TypeInferencer = struct {
                     _ = self.inferStmt(s, env) catch |err| {
                         self.reportInferError(err, ed.location);
                     };
+                    switch (s.*) {
+                        .val_decl => |vd| {
+                            if (vd.visibility == .public) {
+                                self.recordExportSymbol(self.current_module, vd.name, env);
+                            } else if (std.mem.lastIndexOfScalar(u8, vd.name, '.')) |dot_idx| {
+                                // mangled pub val（module_loader 将 visibility 改为 .private 但保留 mangled 名）
+                                // 从 mangled 名 "std.time.SystemTime.UNIX_EPOCH" 提取 module="std.time.SystemTime"
+                                // 并注册到 exported_schemes，使跨模块 field_access 能查到类型
+                                const module_path = vd.name[0..dot_idx];
+                                self.recordExportSymbol(module_path, vd.name, env);
+                            }
+                        },
+                        .var_decl => |vd| {
+                            if (vd.visibility == .public) {
+                                self.recordExportSymbol(self.current_module, vd.name, env);
+                            }
+                        },
+                        else => {},
+                    }
                 } else {
                     _ = self.inferExpr(ed.expr, env, null) catch |err| {
                         self.reportInferError(err, ed.location);
