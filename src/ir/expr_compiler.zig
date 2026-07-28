@@ -1733,8 +1733,8 @@ pub const Methods = struct {
                 const ret_chan_type = blk: {
                     if (binding.type_annotation) |tn| {
                         switch (tn.*) {
-                            .function => |f| break :blk self.chanTypeFromTypeNodeBound(f.return_type) orelse type_descriptor_mod.i64_descriptor,
-                            else => break :blk self.chanTypeFromTypeNodeBound(tn) orelse type_descriptor_mod.i64_descriptor,
+                            .function => |f| break :blk self.chanTypeFromTypeNodeBound(f.return_type) orelse @panic("sema failed to resolve function return type"),
+                            else => break :blk self.chanTypeFromTypeNodeBound(tn) orelse @panic("sema failed to resolve type node"),
                         }
                     }
                     break :blk type_descriptor_mod.i64_descriptor;
@@ -3260,7 +3260,7 @@ pub const Methods = struct {
 
                         // 结果类型：从 trait 方法返回类型推断
                         const ret_chan_type = if (methods[idx].return_type) |rt|
-                            self.chanTypeFromTypeNodeBound(rt) orelse type_descriptor_mod.i64_descriptor
+                            self.chanTypeFromTypeNodeBound(rt) orelse @panic("sema failed to resolve return type")
                         else
                             type_descriptor_mod.i64_descriptor;
                         const out = try self.allocChannel(ret_chan_type);
@@ -3327,7 +3327,7 @@ pub const Methods = struct {
             // ch.tryRecv() → orbit_chan_try_recv，返回 nullable<T>
             // 元素类型从 sema ExprInfo 查询（sema 对 Channel<T>.tryRecv 推导返回 nullable<T>），
             // 无 sema 信息时回退 i64
-            const elem_type = self.channelElemTypeFromExpr(call_expr, "tryRecv") orelse type_descriptor_mod.i64_descriptor;
+            const elem_type = self.channelElemTypeFromExpr(call_expr, "tryRecv") orelse @panic("sema failed to record channel tryRecv elem type");
             return try self.emitOrbitTryRecv(obj_chan, elem_type);
         }
         if (std.mem.eql(u8, method, "close")) {
@@ -3701,7 +3701,7 @@ pub const Methods = struct {
         var all_param_chans = try arena_alloc.alloc(u16, lam.params.len + upvalue_names.items.len);
         for (lam.params, 0..) |param, i| {
             const chan_type = if (param.type_annotation) |tn|
-                self.chanTypeFromTypeNodeBound(tn) orelse type_descriptor_mod.i64_descriptor
+                self.chanTypeFromTypeNodeBound(tn) orelse @panic("sema failed to resolve type node")
             else
                 type_descriptor_mod.i64_descriptor;
             const chan = try self.allocChannel(chan_type);
@@ -3962,7 +3962,7 @@ pub const Methods = struct {
             var param_chans = try arena_alloc.alloc(u16, method.params.len);
             for (method.params, 0..) |param, j| {
                 const chan_type = if (param.type_annotation) |tn|
-                    self.chanTypeFromTypeNodeBound(tn) orelse type_descriptor_mod.i64_descriptor
+                    self.chanTypeFromTypeNodeBound(tn) orelse @panic("sema failed to resolve type node")
                 else
                     type_descriptor_mod.i64_descriptor;
                 const chan = try self.allocChannel(chan_type);
