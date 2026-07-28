@@ -10,6 +10,7 @@ const ObjHeader = obj_header.ObjHeader;
 const ThreadContext = obj_header.ThreadContext;
 const value = @import("mod.zig");
 const Value = value.Value;
+const RecordValue = value.RecordValue;
 
 /// 错误值，携带类型名和消息，用于错误传播
 ///
@@ -34,18 +35,20 @@ pub const ThrowValue = struct {
     header: ObjHeader = .{ .type_tag = .throw_val },
     payload: Payload,
 
-    /// 抛出载荷：成功值或错误指针
+    /// 抛出载荷：成功值或错误 RecordValue 指针
+    /// err 持有 error_newtype 的 RecordValue（IOError/CastError/TimeError/Error 等），
+    /// message()/type_name() 通过 Err trait 方法分派，不再经 ErrorValue 中间层。
     pub const Payload = union(enum) {
         ok: Value,
-        err: *ErrorValue,
+        err: *RecordValue,
     };
 
-    /// 释放抛出值持有的资源，递减内部错误值的引用计数
+    /// 释放抛出值持有的资源，递减内部 RecordValue 的引用计数
     pub fn deinit(self: *ThrowValue, tctx: *ThreadContext) void {
         if (!obj_header.shutdown_mode.load(.acquire)) {
             switch (self.payload) {
                 .ok => |v| v.release(tctx),
-                .err => |e| obj_header.release(&e.header, tctx),
+                .err => |r| obj_header.release(&r.header, tctx),
             }
         }
     }

@@ -120,39 +120,20 @@ pub fn makeThrowOk(tctx: *ThreadContext, v: Value) SyscallError!Value {
     };
 }
 
-/// 构造 Throw.err(ErrorNewtype) 包装
+/// 构造 Throw.err(RecordValue) 包装
 ///
-/// 通用错误包装：err_val 为任意 error_newtype record（IOError / TimeError 等），
-/// msg 固定位于 fields[2]（__tag=0, kind=1, msg=2, ...）。从 RecordValue 提取 msg 后
-/// 构造 ErrorValue，包装为 Throw.err。type_name 为错误类别名（如 "io error" / "time error"），
-/// 仅作为 ErrorValue.type_name 元数据，不影响控制流。
+/// 通用错误包装：err_val 为任意 error_newtype record（IOError / TimeError 等）。
+/// ThrowValue.err 直接持有 RecordValue，message()/type_name() 通过 Err trait 分派。
 ///
-/// RC 语义：err_val 为窃取语义（调用方转移所有权）。提取 msg 后立即释放 err_val record；
-/// makeError 返回 RC=1 的 ErrorValue，直接交 makeThrow 窃取，无需额外 retain。
+/// RC 语义：err_val 为窃取语义（调用方转移所有权）。makeThrow 直接持有 RecordValue 指针，
+/// 无需提取 msg 重建 ErrorValue。
 pub fn makeThrowErr(tctx: *ThreadContext, err_val: Value, type_name: []const u8) SyscallError!Value {
+    _ = type_name; // 不再需要（type_name 由 trait 方法分派返回）
     const err_obj = err_val.asRef();
-    // 提取 msg（借用，不改变 RC）
-    const rec: *value.RecordValue = @alignCast(@fieldParentPtr("header", err_obj));
-    const msg_bytes = if (rec.fields.len > 2) switch (rec.fields[2]) {
-        .ref => |o| if (o.type_tag == .str) blk: {
-            const s: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", o));
-            break :blk s.bytes();
-        } else "",
-        else => "",
-    } else "";
-    // 构造 ErrorValue（RC=1）
-    const err_ev = Value.makeError(tctx, type_name, msg_bytes, true) catch {
-        // OOM：释放 err_val（所有权已转移）
+    const rec_ptr: *value.RecordValue = @alignCast(@fieldParentPtr("header", err_obj));
+    // makeThrow 窃取 err_val 的引用（RC=1）
+    return Value.makeThrow(tctx, .{ .err = rec_ptr }) catch {
         value.obj_header.release(err_obj, tctx);
-        return error.OutOfMemory;
-    };
-    // err_val 所有权已转移，释放 record（触发 deinit 释放其 msg/path 字段）
-    value.obj_header.release(err_obj, tctx);
-    // makeThrow 窃取 err_ev 的 RC=1
-    const err_val_ptr: *ErrorValue = @alignCast(@fieldParentPtr("header", err_ev.asRef()));
-    return Value.makeThrow(tctx, .{ .err = err_val_ptr }) catch {
-        // OOM：释放 err_ev
-        value.obj_header.release(err_ev.asRef(), tctx);
         return error.OutOfMemory;
     };
 }

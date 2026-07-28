@@ -1007,11 +1007,12 @@ pub const Value = union(enum) {
         const p: *ThrowValue = @alignCast(@fieldParentPtr("header", obj));
         switch (p.payload) {
             .ok => |v| return try Value.makeThrow(tctx, .{ .ok = try v.deepCopy(tctx) }),
-            .err => |e| {
-                // 深拷贝 ErrorValue（连续内存），引用计数为 1，所有权转给 ThrowValue
-                const err_val = try Value.makeError(tctx, e.type_name, e.message, e.is_error_subtype);
-                const new_e: *ErrorValue = @alignCast(@fieldParentPtr("header", err_val.ref));
-                return try Value.makeThrow(tctx, .{ .err = new_e });
+            .err => |rec_ptr| {
+                // 深拷贝 RecordValue（error_newtype 实例），引用计数为 1，所有权转给 ThrowValue
+                const rec_val = Value.fromRef(@ptrCast(&rec_ptr.header));
+                const new_rec_val = try rec_val.deepCopy(tctx);
+                const new_rec: *RecordValue = @alignCast(@fieldParentPtr("header", new_rec_val.ref));
+                return try Value.makeThrow(tctx, .{ .err = new_rec });
             },
         }
     }

@@ -27,7 +27,7 @@ pub const Methods = struct {
     // ════════════════════════════════════════════
 
     /// 从通道读取 Value
-    /// 统一通过 type_desc.scalar_ops vtable 读取（零运行时 switch）。
+    /// 统一通过 type_desc.ops vtable 读取（零运行时 switch）。
     /// 标量 + ref + unit/null + nullable 均通过 vtable 读写（nullable 使用 inner type 的 scalar_ops）。
     pub fn chanToValue(self: *Engine, chan: u16) value.Value {
         // 统一路径：通过 scalar_ops vtable 读取（标量/ref/unit/null/nullable 全覆盖）
@@ -36,7 +36,7 @@ pub const Methods = struct {
     }
 
     /// 将 Value 写入通道
-    /// 统一通过 type_desc.scalar_ops vtable 写入（coerce + write）。
+    /// 统一通过 type_desc.ops vtable 写入（coerce + write）。
     /// 标量 + ref + unit/null + nullable 均走 vtable 路径。
     pub fn valueToChan(self: *Engine, chan: u16, v: value.Value) void {
         // 所有类型：统一走 writeChannel（vtable coerce + write）
@@ -193,7 +193,7 @@ pub const Methods = struct {
                 const tv: *value.ThrowValue = @alignCast(@fieldParentPtr("header", v.ref));
                 switch (tv.payload) {
                     .ok => |inner| try self.trackValueTree(inner),
-                    .err => |err_ptr| try self.trackObj(&err_ptr.header),
+                    .err => |rec_ptr| try self.trackObj(&rec_ptr.header),
                 }
             },
             .error_val => {},
@@ -251,27 +251,16 @@ pub const Methods = struct {
         self.runtime.setChanLength(chan, count);
     }
 
-    /// 读取 ref_chan 中的堆对象，返回 *ObjHeader 或 null
+    /// 读取通道中的堆对象，返回 *ObjHeader 或 null
     ///
-    /// 通过 ObjHeader 字段语义验证指针合法性（架构无关）：
-    /// - null/低地址过滤：addr < 0x1000 不是合法堆对象（null 指针、小整数）
-    /// - 对齐检查：堆对象必须按 ObjHeader 对齐
-    /// - isValidHeapObj：type_tag 范围 + rc>=1 + flags 未用位为 0
-    ///
-    /// 废除 tagged scalar ref 后，ref_chan 中的标量引用统一通过 Cell 装箱，
-    /// Cell 是真实堆对象，会被正确识别；标量位模式由 isValidHeapObj 过滤。
+    /// 通过统一 readChannel 读取 Value，匹配 .ref 分支返回堆对象指针。
+    /// readChannel 内部调用 ref_ops.read，已通过 ObjHeader.isValidHeapObj
+    /// 验证指针合法性（低地址/对齐/内核空间/页面映射/字段一致性全由 vtable 处理）。
+    /// 标量位模式由 ref_ops.read 转为 Value.fromI64，不会匹配 .ref。
     pub fn readRefObj(self: *Engine, chan: u16) ?*value.obj_header.ObjHeader {
-        const ptr = self.runtime.readPtr(chan) orelse return null;
-        const addr = @intFromPtr(ptr);
-        if (addr < 0x1000) return null;
-        // 过滤内核空间地址（高位置 1，含负 i64 符号扩展），防止标量位模式误判为堆指针
-        if (addr >= 0x8000000000000000) return null;
-        if (addr % @alignOf(value.obj_header.ObjHeader) != 0) return null;
-        // 使用 msync 安全检查页面是否映射，避免对标量位模式调用 isValidHeapObj 导致段错误
-        if (!ir_mod.type_descriptor_mod.isReadable(addr)) return null;
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
-        if (!header.isValidHeapObj()) return null;
-        return header;
+        const v = self.runtime.readChannel(chan) orelse return null;
+        if (v != .ref) return null;
+        return v.ref;
     }
 
     /// 读取 ThrowValue 指针（ref_chan → *ThrowValue）
@@ -396,12 +385,12 @@ pub const Methods = struct {
     }
 
     /// 将 i64 位模式转为目标标量类型的 Value（用于从 ref_chan 读取后写入标量通道）
-    /// 统一通过 type_desc.scalar_ops.coerce vtable 分派，零运行时 switch。
+    /// 统一通过 type_desc.ops.coerce vtable 分派，零运行时 switch。
     /// 将 i64 bits 包装为 Value.fromI64，再由目标类型的 coerce 函数转换为目标类型。
     /// 目标为 128 位类型时不调用此函数（由 copyCrossType 特例处理）。
     fn i64BitsToValue(bits: i64, dst_type_desc: *const ir_mod.type_descriptor_mod.TypeDescriptor) value.Value {
         const i64_val = value.Value.fromI64(bits);
-        return dst_type_desc.scalar_ops.coerce(i64_val);
+        return dst_type_desc.ops.coerce(i64_val);
     }
 
     /// 将标量值写入通道（统一通过 scalar_ops vtable coerce + write）

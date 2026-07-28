@@ -51,7 +51,7 @@ pub const Methods = struct {
     }
 
     /// 从 ScalarTag + [16]u8 字节直接构造 Value（不经过通道）
-    /// 用于 cast_try_to 成功路径：避免在 ref_chan 通道上用 chanToValue 误读标量字节为指针
+    /// 用于 cast_try_to 成功路径：避免在通道上用 chanToValue 误读标量字节为指针
     pub fn scalarBytesToValue(tag: ScalarTag, bytes: [16]u8) value.Value {
         return switch (tag) {
             .boolean => value.Value.fromBool(bytes[0] != 0),
@@ -116,7 +116,7 @@ pub const Methods = struct {
     /// 行为（spec §4.3 决策 #29/#30）：
     ///   - 成功 → ThrowValue.ok(T)
     ///   - 越界/产生 Inf/解析失败 → ThrowValue.err(CastError)
-    /// 输出：ref_chan（ThrowValue 指针）
+    /// 输出：通道（ThrowValue 指针）
     pub fn execCastTryTo(self: *Engine, node: *const Node) EngineError!void {
         if (node.meta_index == 0 or node.meta_index >= self.ir.scalar_metas.len) return error.InvalidMetaIndex;
         const meta = self.ir.scalar_metas[node.meta_index];
@@ -134,14 +134,14 @@ pub const Methods = struct {
             const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
             _ = v.retain(self.tctx.?);
             try self.trackObj(throw_v.asRef());
-            self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+            _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(throw_v.asRef())));
             return;
         }
 
         const dst_tag = scalarKindToTag(meta.kind, meta.int_kind, meta.float_kind) orelse return error.UnsupportedOp;
 
-        // str→数值 解析路径：src 为 ref_chan (Str)，需在 chanToScalarTag 之前处理
-        // 因为 ref_chan 不能转换为 ScalarTag
+        // str→数值 解析路径：src 为通道 (Str)，需在 chanToScalarTag 之前处理
+        // 因为通道不能转换为 ScalarTag
         if (self.runtime.isRef(src_chan)) {
             // 读取源字符串
             const s = self.readStr(src_chan) orelse return error.UnsupportedOp;
@@ -166,12 +166,12 @@ pub const Methods = struct {
         }
 
         // 成功 → ThrowValue.ok(T)
-        // 直接从字节构造 Value，避免 ref_chan 上 chanToValue 把标量字节误读为指针
+        // 直接从字节构造 Value，避免通道上 chanToValue 把标量字节误读为指针
         const ok_v = scalarBytesToValue(dst_tag, result);
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = ok_v }) catch return error.OutOfMemory;
         _ = ok_v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(throw_v.asRef())));
     }
 
     /// str→数值 的 try_to 实现
@@ -189,7 +189,7 @@ pub const Methods = struct {
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = ok_v }) catch return error.OutOfMemory;
         _ = ok_v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(throw_v.asRef())));
     }
 
     /// 构造 CastError RecordValue + ThrowValue.err，写入 output 通道
@@ -234,27 +234,19 @@ pub const Methods = struct {
         const to_v: value.Value = .{ .ref = &to_obj.header };
         const value_v: value.Value = .{ .ref = &value_obj.header };
 
-        // 构造 CastError RecordValue
-        // 字段顺序：msg / from / to / value
+        // 构造 CastError RecordValue（带字段名，使 message() 默认实现能按名查找 msg）
         var fields_buf: [4]value.Value = .{ msg_v, from_v, to_v, value_v };
-        const cast_err_v = value.Value.makeRecord(self.tctx.?, "CastError", fields_buf[0..]) catch return error.OutOfMemory;
+        const field_names: [4]?[]const u8 = .{ "msg", "from", "to", "value" };
+        const cast_err_v = value.Value.makeRecordWithNames(self.tctx.?, "CastError", &fields_buf, &field_names) catch return error.OutOfMemory;
         try self.trackObj(cast_err_v.asRef());
-        // CastError 是 error_newtype，RecordValue.header.type_tag 已是 .record
-        // 4 字段：retain 引用计数
+        // 4 字段：retain 引用计数（makeRecordWithNames 窃取引用，需 retain）
         for (fields_buf) |fv| _ = value.obj_header.retain(fv.asRef(), self.tctx.?);
 
-        // 包装为 ErrorValue（is_error_subtype=true）使 throw 路径能识别
-        // 但 Phase 2 中 throw 直接处理 .record 类型，所以这里直接构造 ThrowValue.err 指向 RecordValue
-        // 需要先把 RecordValue 包装成 ErrorValue
-        const err_v = value.Value.makeError(self.tctx.?, "CastError", msg_str, true) catch return error.OutOfMemory;
-        try self.trackObj(err_v.asRef());
-        const err_val: *value.ErrorValue = @alignCast(@fieldParentPtr("header", err_v.asRef()));
-
-        // ThrowValue.err 持有 ErrorValue 指针
-        const throw_v = value.Value.makeThrow(self.tctx.?, .{ .err = err_val }) catch return error.OutOfMemory;
-        _ = value.obj_header.retain(&err_val.header, self.tctx.?);
+        // ThrowValue.err 直接持有 CastError RecordValue
+        const rec_ptr: *value.RecordValue = @alignCast(@fieldParentPtr("header", cast_err_v.asRef()));
+        const throw_v = value.Value.makeThrow(self.tctx.?, .{ .err = rec_ptr }) catch return error.OutOfMemory;
         try self.trackObj(throw_v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(throw_v.asRef())));
     }
 
     /// 从 ScalarKind + IntKind/FloatKind 推导 ScalarTag

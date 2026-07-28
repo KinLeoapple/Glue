@@ -24,7 +24,7 @@ pub const Methods = struct {
     // ════════════════════════════════════════════
 
     /// gate_check：检查值是否 Ok
-    /// inputs[0] = 值通道（ref_chan 指向 ThrowValue 或普通值）
+    /// inputs[0] = 值通道（ThrowValue 或普通值）
     /// output = mask_chan（1=Ok, 0=Err）
     pub fn execGateCheck(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
@@ -37,9 +37,13 @@ pub const Methods = struct {
             self.runtime.writeBool(node.output, is_ok);
             return;
         }
-        // 非 ThrowValue：非 null 则 Ok
-        const ptr = self.runtime.readPtr(val_chan);
-        self.runtime.writeBool(node.output, ptr != null);
+        // 非 ThrowValue：通过 readChannel 读取，非 null 则 Ok
+        const v = self.runtime.readChannel(val_chan) orelse {
+            self.runtime.writeBool(node.output, false);
+            return;
+        };
+        const is_ok = v != .null_val;
+        self.runtime.writeBool(node.output, is_ok);
     }
 
     /// gate_get_ok：从 ThrowValue 中提取 Ok 值
@@ -54,38 +58,37 @@ pub const Methods = struct {
                     return;
                 },
                 .err => {
-                    self.runtime.writePtr(node.output, null);
+                    _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
                     return;
                 },
             }
         }
-        // 非 ThrowValue：直接拷贝
-        const w = self.runtime.elemWidth(val_chan);
-        if (w > 0) {
-            const src = self.runtime.rawPtr(val_chan);
-            const dst = self.runtime.rawPtr(node.output);
-            @memcpy(dst[0..w], src[0..w]);
+        // 非 ThrowValue：通过统一通道复制（readChannel + writeChannel）
+        if (self.runtime.readChannel(val_chan)) |v| {
+            _ = self.runtime.writeChannel(node.output, v);
+        } else {
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
         }
     }
 
-    /// gate_get_err：从 ThrowValue 中提取 Error 值
+    /// gate_get_err：从 ThrowValue 中提取 Error RecordValue
     /// inputs[0] = ThrowValue 通道
-    /// output = ErrorValue 指针通道
+    /// output = RecordValue 指针通道
     pub fn execGateGetErr(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
         if (self.readThrow(val_chan)) |throw_val| {
             switch (throw_val.payload) {
-                .err => |err_ptr| {
-                    self.runtime.writePtr(node.output, @ptrCast(&err_ptr.header));
+                .err => |rec_ptr| {
+                    _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&rec_ptr.header)));
                     return;
                 },
                 .ok => {
-                    self.runtime.writePtr(node.output, null);
+                    _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
                     return;
                 },
             }
         }
-        self.runtime.writePtr(node.output, null);
+        _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
     }
 
     /// gate_propagate：OR 传播错误掩码
@@ -104,82 +107,70 @@ pub const Methods = struct {
     pub fn execGateSelect(self: *Engine, node: *const Node) EngineError!void {
         const mask = self.runtime.readBool(node.inputs[0]);
         const src_chan = if (mask) node.inputs[1] else node.inputs[2];
-        const w = self.runtime.elemWidth(src_chan);
-        if (w > 0) {
-            const src = self.runtime.rawPtr(src_chan);
-            const dst = self.runtime.rawPtr(node.output);
-            @memcpy(dst[0..w], src[0..w]);
+        // 统一通道复制
+        if (self.runtime.readChannel(src_chan)) |v| {
+            _ = self.runtime.writeChannel(node.output, v);
+        } else {
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
         }
     }
 
     /// gate_make_ok：构造 Ok 类型的 ThrowValue
     /// inputs[0] = 值通道
-    /// output = ref_chan（ThrowValue 指针）
+    /// output = ThrowValue 指针通道
     pub fn execGateMakeOk(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
         // 读取值并构造 ThrowValue{ .ok = value }
         const v = try self.readScalarValue(val_chan);
+        const vn = @tagName(v);
+        std.debug.print("DEBUG gate_make_ok: val_chan={d} variant={s}\n", .{ val_chan, vn });
+        if (v == .ref) {
+            std.debug.print("  ref type_tag={s}\n", .{@tagName(v.ref.type_tag)});
+        } else if (v == .i64) {
+            const iv: i64 = @bitCast(v.i64);
+            std.debug.print("  i64 value={d}\n", .{iv});
+        }
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
         _ = v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(throw_v.asRef())));
     }
 
-    /// gate_make_err：构造 ErrorValue + ThrowValue(err)
-    /// inputs[0] = 错误信息通道（ref_chan 指向 Str）
-    /// output = ref_chan（ThrowValue 指针）
+    /// gate_make_err：构造 ThrowValue(err)，err 持有 RecordValue
+    /// inputs[0] = 错误值通道（Str / RecordValue）
+    /// output = ThrowValue 指针通道
+    ///
+    /// Str 输入：构造 Error(msg) RecordValue（通用错误类型）
+    /// RecordValue 输入：error_newtype 实例（IOError/CastError 等），直接持有
     pub fn execGateMakeErr(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
+        const v = self.runtime.readChannel(val_chan) orelse return error.InvalidChannel;
+        if (v != .ref) return error.InvalidChannel;
+        const header = v.ref;
 
-        // 判断输入类型并提取 type_name 和 message
-        var type_name: []const u8 = "Error";
-        var msg_bytes: []const u8 = "";
-        var existing_err: ?*value.ErrorValue = null;
-
-        if (self.readRefObj(val_chan)) |header| {
-            switch (header.type_tag) {
-                .str => {
-                    const s: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", header));
-                    msg_bytes = s.bytes();
-                },
-                .error_val => {
-                    // 已经是 ErrorValue：直接使用
-                    const e: *value.ErrorValue = @alignCast(@fieldParentPtr("header", header));
-                    existing_err = e;
-                },
-                .record => {
-                    // error_newtype 构造器产生的 RecordValue
-                    // 提取 type_name 和第一个字段（message）
-                    const r: *value.RecordValue = @alignCast(@fieldParentPtr("header", header));
-                    type_name = r.type_name;
-                    // field_id=1 是第一个构造器字段（field_id=0 是 __tag）
-                    if (r.fields.len > 1) {
-                        const field_val = r.fields[1];
-                        if (field_val == .ref) {
-                            const fh: *value.obj_header.ObjHeader = @ptrCast(@alignCast(field_val.ref));
-                            if (fh.type_tag == .str) {
-                                const fs: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", fh));
-                                msg_bytes = fs.bytes();
-                            }
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-
-        // 如果已有 ErrorValue，直接用它构造 ThrowValue
-        const err_val = if (existing_err) |e| e else blk: {
-            const err_v = value.Value.makeError(self.tctx.?, type_name, msg_bytes, false) catch return error.OutOfMemory;
-            try self.trackObj(err_v.asRef());
-            const err_ptr: *value.ErrorValue = @alignCast(@fieldParentPtr("header", err_v.asRef()));
-            break :blk err_ptr;
+        const rec_ptr: *value.RecordValue = switch (header.type_tag) {
+            .str => blk: {
+                // 字符串输入：构造 Error(msg) RecordValue
+                const msg_val = v;
+                var fields: [1]value.Value = .{msg_val};
+                const field_names: [1]?[]const u8 = .{"msg"};
+                const rec_val = value.Value.makeRecordWithNames(self.tctx.?, "Error", &fields, &field_names) catch return error.OutOfMemory;
+                _ = value.obj_header.retain(header, self.tctx.?); // record 窃取 msg 引用，需 retain
+                try self.trackObj(rec_val.asRef());
+                break :blk @alignCast(@fieldParentPtr("header", rec_val.asRef()));
+            },
+            .record => blk: {
+                // error_newtype RecordValue：直接持有
+                _ = value.obj_header.retain(header, self.tctx.?);
+                try self.trackObj(header);
+                break :blk @alignCast(@fieldParentPtr("header", header));
+            },
+            else => return error.InvalidChannel,
         };
 
-        const throw_v = value.Value.makeThrow(self.tctx.?, .{ .err = err_val }) catch return error.OutOfMemory;
-        _ = value.obj_header.retain(&err_val.header, self.tctx.?);
+        const throw_v = value.Value.makeThrow(self.tctx.?, .{ .err = rec_ptr }) catch return error.OutOfMemory;
         try self.trackObj(throw_v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(throw_v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(throw_v.asRef())));
     }
 
     // ════════════════════════════════════════════
@@ -295,14 +286,15 @@ pub const Methods = struct {
         const val_chan = node.inputs[0];
 
         if (self.runtime.isRef(val_chan)) {
-            // 堆对象：读取 type_tag 的整数值作为 tag
-            const header = self.readRefObj(val_chan);
-            if (header) |h| {
-                const tag_val: i64 = @intFromEnum(h.type_tag);
-                self.runtime.writeI64(node.output, tag_val);
-            } else {
-                self.runtime.writeI64(node.output, 0);
+            // 堆对象：通过 readChannel 读取，再取 type_tag
+            if (self.runtime.readChannel(val_chan)) |v| {
+                if (v == .ref) {
+                    const tag_val: i64 = @intFromEnum(v.ref.type_tag);
+                    self.runtime.writeI64(node.output, tag_val);
+                    return;
+                }
             }
+            self.runtime.writeI64(node.output, 0);
         } else {
             // 标量值：用 type_desc.type_id 作为 tag（替代旧的 @intFromEnum(chan_type)）
             const tag_val: i64 = @intCast(self.runtime.typeDesc(val_chan).type_id);
@@ -344,28 +336,13 @@ pub const Methods = struct {
         // body 子图最后一个节点的 output 作为结果
         const body_out_chan = nodes[local_start + body_len - 1].output;
 
-        // 类型转换：body 输出 → 结果通道
-        if (self.runtime.isNullable(node.output) and !self.runtime.isNullable(body_out_chan)) {
-            // 结果是 nullable，body 输出不是 nullable → 包装为 nullable
-            const inner_w = self.nullableInnerWidth(node.output);
-            const dst = self.runtime.rawPtr(node.output);
-            if (self.runtime.isNull(body_out_chan)) {
-                // body 输出是 null → 设置 null flag
-                dst[inner_w] = 1;
-            } else {
-                // body 输出是值类型 → 拷贝值，清除 null flag
-                const src = self.runtime.rawPtr(body_out_chan);
-                if (inner_w > 0) @memcpy(dst[0..inner_w], src[0..inner_w]);
-                dst[inner_w] = 0;
-            }
+        // 统一通道复制：readChannel + writeChannel
+        // nullable 自动包装：body 输出非 null → writeChannel 让 nullable vtable 设 flag=0
+        //                   body 输出为 null  → writeChannel(null_val) 让 nullable vtable 设 flag=1
+        if (self.runtime.readChannel(body_out_chan)) |v| {
+            _ = self.runtime.writeChannel(node.output, v);
         } else {
-            // 直接拷贝（宽度取 body 输出和结果中较小者，避免越界）
-            const w = @min(self.runtime.elemWidth(body_out_chan), self.runtime.elemWidth(node.output));
-            if (w > 0) {
-                const src = self.runtime.rawPtr(body_out_chan);
-                const dst = self.runtime.rawPtr(node.output);
-                @memcpy(dst[0..w], src[0..w]);
-            }
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
         }
         return null;
     }
@@ -374,11 +351,10 @@ pub const Methods = struct {
     pub fn execRouteMerge(self: *Engine, node: *const Node) EngineError!void {
         if (node.input_count == 0) return;
         const src_chan = node.inputs[0];
-        const w = self.runtime.elemWidth(src_chan);
-        if (w > 0) {
-            const src = self.runtime.rawPtr(src_chan);
-            const dst = self.runtime.rawPtr(node.output);
-            @memcpy(dst[0..w], src[0..w]);
+        if (self.runtime.readChannel(src_chan)) |v| {
+            _ = self.runtime.writeChannel(node.output, v);
+        } else {
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
         }
     }
 
@@ -395,34 +371,14 @@ pub const Methods = struct {
     }
 
     /// nullable_make：将值包装为 Nullable<T>
-    /// inputs[0] = 值通道（如果 ref_chan 为 null 指针，则包装为 null）
+    /// inputs[0] = 值通道（如果为 null 指针或 null 类型，则包装为 null）
     /// output = nullable_chan
     pub fn execNullableMake(self: *Engine, node: *const Node) EngineError!void {
         const val_chan = node.inputs[0];
 
-        const inner_w = self.nullableInnerWidth(node.output);
-        const total_w = self.runtime.elemWidth(node.output); // inner_w + 1
-        const dst = self.runtime.rawPtr(node.output);
-
-        // 检查是否为 null（ref_chan 的 null 指针，或 null_chan）
-        const is_null = blk: {
-            if (self.runtime.isRef(val_chan)) break :blk self.runtime.readPtr(val_chan) == null;
-            if (self.runtime.isNull(val_chan)) break :blk true;
-            break :blk false;
-        };
-
-        if (is_null) {
-            // 设置 null flag = 1
-            dst[inner_w] = 1;
-        } else {
-            // 拷贝 inner 值，设置 null flag = 0
-            if (inner_w > 0) {
-                const src = self.runtime.rawPtr(val_chan);
-                @memcpy(dst[0..inner_w], src[0..inner_w]);
-            }
-            dst[inner_w] = 0;
-        }
-        _ = total_w;
+        // 通过 readChannel 读取值，writeChannel 让 nullable vtable 自动处理 null flag
+        const v = self.runtime.readChannel(val_chan) orelse value.Value.fromNull();
+        _ = self.runtime.writeChannel(node.output, v);
     }
 
     /// nullable_is_null：检查 Nullable<T> 是否为 null
@@ -430,10 +386,9 @@ pub const Methods = struct {
     /// output = bool_chan
     pub fn execNullableIsNull(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
-        const inner_w = self.nullableInnerWidth(src_chan);
-        const src = self.runtime.rawPtr(src_chan);
-        // null flag 在 inner_w 偏移处
-        const is_null = src[inner_w] != 0;
+        // nullable vtable 读取：null 时返回 null_val，非 null 返回 inner Value
+        const v = self.runtime.readChannel(src_chan) orelse value.Value.fromNull();
+        const is_null = v == .null_val;
         self.runtime.writeBool(node.output, is_null);
     }
 
@@ -442,18 +397,10 @@ pub const Methods = struct {
     /// output = inner 值通道
     pub fn execNullableUnwrap(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
-        const inner_w = self.nullableInnerWidth(src_chan);
-        const src = self.runtime.rawPtr(src_chan);
-
-        if (inner_w > 0) {
-            const dst = self.runtime.rawPtr(node.output);
-            if (src[inner_w] != 0) {
-                // null 值：写零（调用方应通过 nullable_is_null 判断后再使用）
-                @memset(dst[0..inner_w], 0);
-            } else {
-                @memcpy(dst[0..inner_w], src[0..inner_w]);
-            }
-        }
+        // nullable vtable 读取：null 返回 null_val，非 null 返回 inner
+        const v = self.runtime.readChannel(src_chan) orelse value.Value.fromNull();
+        // null 时 writeChannel 让目标 vtable 处理零值
+        _ = self.runtime.writeChannel(node.output, v);
     }
 
     /// nullable_unwrap_or：提取值，null 时返回默认值
@@ -462,17 +409,12 @@ pub const Methods = struct {
     pub fn execNullableUnwrapOr(self: *Engine, node: *const Node) EngineError!void {
         const src_chan = node.inputs[0];
         const default_chan = node.inputs[1];
-        const inner_w = self.nullableInnerWidth(src_chan);
-        const src = self.runtime.rawPtr(src_chan);
 
-        const is_null = src[inner_w] != 0;
-        const result_chan = if (is_null) default_chan else src_chan;
-
-        if (inner_w > 0) {
-            const result_src = self.runtime.rawPtr(result_chan);
-            const dst = self.runtime.rawPtr(node.output);
-            @memcpy(dst[0..inner_w], result_src[0..inner_w]);
-        }
+        const v = self.runtime.readChannel(src_chan) orelse value.Value.fromNull();
+        const result = if (v == .null_val) blk: {
+            break :blk self.runtime.readChannel(default_chan) orelse value.Value.fromNull();
+        } else v;
+        _ = self.runtime.writeChannel(node.output, result);
     }
 
     // ════════════════════════════════════════════
@@ -481,7 +423,7 @@ pub const Methods = struct {
 
     /// alloc：在堆上分配内存（通过 ThreadContext 对象池）
     /// meta_index 指向 ScalarMeta，const_val.int_val 存储分配字节数
-    /// output = ref_chan（指向分配的内存）
+    /// output = 分配内存指针通道
     pub fn execAlloc(self: *Engine, node: *const Node) EngineError!void {
         if (node.meta_index == 0 or node.meta_index > self.ir.scalar_metas.len) return error.InvalidMetaIndex;
         const sm = self.ir.scalar_metas[node.meta_index - 1];
@@ -489,7 +431,7 @@ pub const Methods = struct {
         const size: usize = @intCast(cv.int_val);
 
         if (size == 0) {
-            self.runtime.writePtr(node.output, null);
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
             return;
         }
 
@@ -497,7 +439,8 @@ pub const Methods = struct {
         const tctx = self.tctx orelse return error.OutOfMemory;
         const buf = tctx.allocBySize(size) catch return error.OutOfMemory;
         @memset(buf, 0);
-        self.runtime.writePtr(node.output, buf.ptr);
+        // 裸内存地址存为 i64 位模式（非 ObjHeader，不能用 fromRef）
+        _ = self.runtime.writeChannel(node.output, value.Value.fromI64(@bitCast(@intFromPtr(buf.ptr))));
     }
 
     /// free：释放堆内存（简化：不实际释放，由 arena reset 统一回收）
