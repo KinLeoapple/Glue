@@ -386,12 +386,22 @@ function renderCodeBlock(code, filename) {
     const id = 'code-' + Math.random().toString(36).slice(2, 11);
     const fn = filename || 'example.glue';
     const highlighted = highlightGlue(code);
+    const dots = platformWindowDots();
+    const copyBtn = `<button class="copy-btn" data-code-id="${id}" aria-label="${t('code_copy')}"><span class="copy-icon">${ICONS.copy}</span><span class="copy-text">${t('code_copy')}</span></button>`;
+    const isWin = detectedPlatform === 'windows';
+    // Windows：复制在左、窗口控件在右；macOS/Linux：窗口控件在左、复制在右
+    const dotsLeft = isWin ? '' : dots;
+    const dotsRight = isWin ? dots : '';
+    const copyLeft = isWin ? copyBtn : '';
+    const copyRight = isWin ? '' : copyBtn;
     return `
         <div class="code-block">
             <div class="code-header">
-                ${platformWindowDots()}
+                ${dotsLeft}
+                ${copyLeft}
                 <span class="code-filename">${ICONS.terminal} ${fn}</span>
-                <button class="copy-btn" data-code-id="${id}" aria-label="${t('code_copy')}"><span class="copy-icon">${ICONS.copy}</span><span class="copy-text">${t('code_copy')}</span></button>
+                ${copyRight}
+                ${dotsRight}
             </div>
             <div class="code-body">
                 <pre id="${id}">${highlighted}</pre>

@@ -313,6 +313,14 @@ function toggleLang() {
     navigate();
 }
 
+// 根据平台返回搜索快捷键标签（macOS 用 ⌘K，Windows/Linux 用 Ctrl K）
+function searchKbdLabel() {
+    const isMac = (typeof detectedPlatform !== 'undefined' && detectedPlatform)
+        ? detectedPlatform === 'mac'
+        : /mac|iphone|ipad/i.test(navigator.userAgent);
+    return isMac ? '⌘K' : 'Ctrl+K';
+}
+
 // 应用语言到静态 HTML 元素
 function applyLangToStatic() {
     // 导航栏按钮
@@ -327,10 +335,13 @@ function applyLangToStatic() {
     if (searchTrigger) {
         const kbd = searchTrigger.querySelector('kbd');
         searchTrigger.innerHTML = `<span class="nav-icon">${ICONS.search}</span><span>${t('nav_search')}</span>`;
-        if (kbd) searchTrigger.appendChild(kbd);
-        else {
+        const kbdLabel = searchKbdLabel();
+        if (kbd) {
+            kbd.textContent = kbdLabel;
+            searchTrigger.appendChild(kbd);
+        } else {
             const newKbd = document.createElement('kbd');
-            newKbd.textContent = t('nav_search_kbd');
+            newKbd.textContent = kbdLabel;
             searchTrigger.appendChild(newKbd);
         }
         searchTrigger.dataset.iconInit = '1';

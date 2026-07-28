@@ -643,6 +643,7 @@ a:hover { color: var(--accent-bright); text-decoration: underline; text-underlin
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
     padding: 10px 16px;
     background: var(--bg-tertiary);
     border-bottom: 1px solid var(--border);
