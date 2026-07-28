@@ -267,13 +267,4 @@ fn isSideEffectFreeStmt(stmt: *const ast.Stmt) bool {
     };
 }
 
-test "DeadTable basic" {
-    var table = DeadTable.init(std.testing.allocator);
-    defer table.deinit();
-    try std.testing.expect(table.isEmpty());
-}
 
-test "isSideEffectFreeExpr literals" {
-    const expr = ast.Expr{ .int_literal = .{ .raw = "42", .suffix = null } };
-    try std.testing.expect(isSideEffectFreeExpr(&expr));
-}

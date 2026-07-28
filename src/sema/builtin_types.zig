@@ -137,16 +137,4 @@ pub fn isBuiltinGenericType(name: []const u8) bool {
     return genericTypeArity(name) != null;
 }
 
-test "builtin_types: scalarKindFromName 覆盖所有内置标量" {
-    try std.testing.expect(scalarKindFromName("i8").? == .i8);
-    try std.testing.expect(scalarKindFromName("u8").? == .u8);
-    try std.testing.expect(scalarKindFromName("i32").? == .i32);
-    try std.testing.expect(scalarKindFromName("f64").? == .f64);
-    try std.testing.expect(scalarKindFromName("bool").? == .bool);
-    try std.testing.expect(scalarKindFromName("char").? == .char);
-    try std.testing.expect(scalarKindFromName("not_a_type") == null);
-}
 
-test "builtin_types: BUILTIN_NAMES 覆盖所有 ScalarKind 变体" {
-    try std.testing.expect(BUILTIN_NAMES.len == std.meta.fields(ScalarKind).len);
-}

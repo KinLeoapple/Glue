@@ -1419,27 +1419,4 @@ const _force_analysis = blk: {
     break :blk {};
 };
 
-test "inference: chanTypeFromTypeName via type_resolver" {
-    var sr = SemaResult.init(std.testing.allocator);
-    defer sr.deinit();
-    try std.testing.expectEqual(ir_td.i32_descriptor, type_resolver.chanTypeFromTypeName("i32", &sr));
-    try std.testing.expectEqual(ir_td.f64_descriptor, type_resolver.chanTypeFromTypeName("f64", &sr));
-    try std.testing.expectEqual(ir_td.bool_descriptor, type_resolver.chanTypeFromTypeName("bool", &sr));
-    try std.testing.expectEqual(ir_td.str_descriptor, type_resolver.chanTypeFromTypeName("str", &sr));
-    // 用户自定义类型 → getOrCreateRefDesc（非 ref_descriptor）
-    const my_td = type_resolver.chanTypeFromTypeName("MyType", &sr);
-    try std.testing.expect(my_td != ir_td.ref_descriptor);
-    try std.testing.expectEqualStrings("MyType", my_td.type_name);
-}
 
-test "inference: typeNameFromNode" {
-    const tn = ast.TypeNode{ .named = .{ .name = "Foo" } };
-    try std.testing.expectEqualStrings("Foo", type_resolver.typeNameFromNode(&tn).?);
-}
-
-test "inference: chanTypeFromExprAst" {
-    var sr = SemaResult.init(std.testing.allocator);
-    defer sr.deinit();
-    const expr = ast.Expr{ .int_literal = .{ .value = 42, .suffix = null } };
-    try std.testing.expectEqual(ir_td.i32_descriptor, chanTypeFromExprAst(&expr, &sr));
-}

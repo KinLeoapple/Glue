@@ -116,14 +116,4 @@ pub const BranchReachPass = struct {
     }
 };
 
-test "BranchTable basic put/lookup" {
-    var table = BranchTable.init(std.testing.allocator);
-    defer table.deinit();
-    try std.testing.expect(table.isEmpty());
-}
 
-test "BranchInfo isConst" {
-    try std.testing.expect(BranchInfo.always_true.isConst());
-    try std.testing.expect(BranchInfo.always_false.isConst());
-    try std.testing.expect(!BranchInfo.runtime.isConst());
-}

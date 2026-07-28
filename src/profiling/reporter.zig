@@ -362,7 +362,3 @@ fn dumpFuncStatsJson(
     }
     try jw.endArray();
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

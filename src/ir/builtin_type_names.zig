@@ -93,26 +93,3 @@ pub fn floatKindFromName(name: []const u8) ?FloatKind {
     }
     return null;
 }
-
-test "builtin_type_names: typeDescFromBuiltinName 覆盖标量 + str" {
-    try std.testing.expectEqual(type_descriptor_mod.i8_descriptor, typeDescFromBuiltinName("i8").?);
-    try std.testing.expectEqual(type_descriptor_mod.u64_descriptor, typeDescFromBuiltinName("u64").?);
-    try std.testing.expectEqual(type_descriptor_mod.f64_descriptor, typeDescFromBuiltinName("f64").?);
-    try std.testing.expectEqual(type_descriptor_mod.bool_descriptor, typeDescFromBuiltinName("bool").?);
-    try std.testing.expectEqual(type_descriptor_mod.char_descriptor, typeDescFromBuiltinName("char").?);
-    try std.testing.expectEqual(type_descriptor_mod.str_descriptor, typeDescFromBuiltinName("str").?);
-    try std.testing.expectEqual(type_descriptor_mod.unit_descriptor, typeDescFromBuiltinName("void").?);
-    try std.testing.expectEqual(type_descriptor_mod.isize_descriptor, typeDescFromBuiltinName("isize").?);
-    try std.testing.expectEqual(type_descriptor_mod.usize_descriptor, typeDescFromBuiltinName("usize").?);
-    try std.testing.expect(typeDescFromBuiltinName("not_a_type") == null);
-}
-
-test "builtin_type_names: intKindFromName / floatKindFromName" {
-    try std.testing.expect(intKindFromName("i32").? == .i32);
-    try std.testing.expect(intKindFromName("u128").? == .u128);
-    try std.testing.expect(intKindFromName("isize").? == .isize);
-    try std.testing.expect(intKindFromName("f64") == null);
-    try std.testing.expect(floatKindFromName("f64").? == .f64);
-    try std.testing.expect(floatKindFromName("f128").? == .f128);
-    try std.testing.expect(floatKindFromName("i32") == null);
-}

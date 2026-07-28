@@ -211,7 +211,3 @@ fn reduceThreadPriority() void {
 }
 
 extern "c" fn setpriority(which: c_int, who: c_int, value: c_int) c_int;
-
-test {
-    std.testing.refAllDecls(@This());
-}

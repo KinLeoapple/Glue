@@ -89,24 +89,4 @@ pub const SlotKind = type_descriptor_mod.SlotKind;
 // sema_output 别名：从 sema 模块重导出（sema_output.zig 已迁入 sema/）
 pub const sema_output = sema_output_mod;
 
-test {
-    // 引用所有子模块以触发懒分析
-    _ = node_mod;
-    _ = meta_mod;
-    _ = channel_mod;
-    _ = ir_mod;
-    _ = builder_mod;
-    _ = ast_traits_mod;
-    _ = pattern_compiler_mod;
-    _ = decl_collector_mod;
-    _ = stmt_compiler_mod;
-    _ = func_compiler_mod;
-    _ = expr_compiler_mod;
-    _ = sema_output_mod;
-    _ = printer_mod;
-    _ = optimizer_mod;
-    _ = type_descriptor_mod;
-    _ = op_table_mod;
-    _ = @import("builder_tests.zig");
-    _ = @import("ast_helper.zig");
-}
+

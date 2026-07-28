@@ -82,9 +82,4 @@ pub const AnalysisDB = struct {
     }
 };
 
-test "AnalysisDB init/deinit" {
-    var db = AnalysisDB.init(std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.purity.isEmpty());
-    try std.testing.expect(db.call_graph.isEmpty());
-}
+

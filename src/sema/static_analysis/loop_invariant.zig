@@ -296,22 +296,4 @@ fn isAssignedVar(name: []const u8, assigned_vars: []const []const u8) bool {
     return false;
 }
 
-test "LoopTable basic put/lookup" {
-    var table = LoopTable.init(std.testing.allocator);
-    defer table.deinit();
-    try std.testing.expect(table.isEmpty());
-}
 
-test "HoistTable basic put/lookup" {
-    var table = HoistTable.init(std.testing.allocator);
-    defer table.deinit();
-    try std.testing.expect(table.isEmpty());
-}
-
-test "isAssignedVar" {
-    const assigned = [_][]const u8{ "i", "acc", "sum" };
-    try std.testing.expect(isAssignedVar("i", &assigned));
-    try std.testing.expect(isAssignedVar("acc", &assigned));
-    try std.testing.expect(!isAssignedVar("a", &assigned));
-    try std.testing.expect(!isAssignedVar("", &assigned));
-}

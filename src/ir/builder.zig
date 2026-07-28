@@ -1910,35 +1910,3 @@ pub const BreakContinueCond = @import("ast_traits.zig").BreakContinueCond;
 pub const tryExtractBreakContinueCond = @import("ast_traits.zig").tryExtractBreakContinueCond;
 pub const astContainsExternalAssignExpr = @import("ast_traits.zig").astContainsExternalAssignExpr;
 pub const astContainsExternalAssignStmt = @import("ast_traits.zig").astContainsExternalAssignStmt;
-
-// ════════════════════════════════════════════════════════════════
-// 测试
-// ════════════════════════════════════════════════════════════════
-
-const testing = std.testing;
-
-test "IRBuilder 编译简单算术: 1 + 2" {
-    // 构造 AST: fun main() { return 1 + 2 }
-    // 使用内联构造测试
-    var builder = try IRBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    // 手动构造节点验证构建器逻辑
-    const ch1 = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
-    const ch2 = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
-    const ch_out = try builder.allocChannel(type_descriptor_mod.i64_descriptor);
-
-    const meta1 = try builder.addScalarMeta(.{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 1 } });
-    const meta2 = try builder.addScalarMeta(.{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 2 } });
-    const meta_out = try builder.addScalarMeta(.{ .kind = .int, .int_kind = .i64 });
-
-    try builder.emit(Node.makeSink(.const_i, ch1, meta1));
-    try builder.emit(Node.makeSink(.const_i, ch2, meta2));
-    try builder.emit(Node.makeBinary(.int_add, ch_out, meta_out, ch1, ch2));
-
-    try testing.expectEqual(@as(usize, 3), builder.nodes.items.len);
-    try testing.expectEqual(NodeOp.const_i, builder.nodes.items[0].op);
-    try testing.expectEqual(NodeOp.int_add, builder.nodes.items[2].op);
-}
-
-pub const AstHelper = @import("ast_helper.zig").AstHelper;

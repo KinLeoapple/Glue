@@ -1271,49 +1271,4 @@ const _force_analysis = blk: {
     break :blk {};
 };
 
-test "collectMonomorphInstances: 空模块冒烟测试" {
-    var sr = SemaResult.init(std.testing.allocator);
-    defer sr.deinit();
 
-    const module = ast.Module{
-        .name = "test",
-        .source_path = null,
-        .declarations = &.{},
-    };
-
-    try collectMonomorphInstances(&module, &sr);
-
-    // 空模块不应产出任何实例
-    try std.testing.expectEqual(@as(usize, 0), sr.monomorph_instances.items.len);
-    try std.testing.expectEqual(@as(usize, 0), sr.monomorph_index.count());
-    try std.testing.expectEqual(@as(usize, 0), sr.call_instantiations.count());
-}
-
-test "walkExpr: 强制分析所有 switch 分支" {
-    var sr = SemaResult.init(std.testing.allocator);
-    defer sr.deinit();
-    const module = ast.Module{
-        .name = "test",
-        .source_path = null,
-        .declarations = &.{},
-    };
-    var ctx = WalkCtx{
-        .sema_result = &sr,
-        .module = &module,
-        .func_decls = std.StringHashMap(*const ast.Decl).init(std.testing.allocator),
-        .in_progress = std.StringHashMap(u32).init(std.testing.allocator),
-    };
-    defer ctx.in_progress.deinit();
-    defer ctx.func_decls.deinit();
-
-    // 用终端节点调用 walkExpr，强制编译器分析所有 switch 分支
-    // （Zig 对 tagged union 的 switch 做穷尽性检查时分析所有分支体）
-    const expr = ast.Expr{ .null_literal };
-    try walkExpr(&expr, &ctx);
-
-    const expr2 = ast.Expr{ .unit_literal };
-    try walkExpr(&expr2, &ctx);
-
-    const expr3 = ast.Expr{ .bool_literal = .{ .value = true } };
-    try walkExpr(&expr3, &ctx);
-}

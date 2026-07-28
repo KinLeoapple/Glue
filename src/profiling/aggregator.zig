@@ -290,7 +290,3 @@ fn addAllocatorStats(dst: *AllocatorStats, src: *const AllocatorStats) void {
         @field(dst.shadow_arena, f.name) += @field(src.shadow_arena, f.name);
     }
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

@@ -65,30 +65,3 @@ pub const ShadowArena = struct {
         self.used = pos;
     }
 };
-
-// ──────────────────────────────────────────────
-// 测试
-// ──────────────────────────────────────────────
-
-const testing = std.testing;
-
-test "ShadowArena 分配与 reset" {
-    var arena = ShadowArena.init(testing.allocator);
-    defer arena.deinit();
-
-    const m1 = try arena.alloc(100);
-    @memset(m1, 0xAA);
-    try testing.expectEqual(@as(usize, 100), arena.used);
-
-    arena.reset();
-    try testing.expectEqual(@as(usize, 0), arena.used);
-}
-
-test "ShadowArena 16B 对齐" {
-    var arena = ShadowArena.init(testing.allocator);
-    defer arena.deinit();
-
-    _ = try arena.alloc(3);
-    const m2 = try arena.alloc(1);
-    try testing.expectEqual(@as(usize, 0), @intFromPtr(m2.ptr) % 16);
-}

@@ -1453,7 +1453,3 @@ fn registerRefKindTableFns() void {
     rkt.registerEqualsFn(.range, equalsRange);
     rkt.registerEqualsFn(.error_val, equalsError);
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

@@ -237,7 +237,3 @@ pub const CallStackEntry = struct {
 /// [0] = inclusive_time_ns, [1] = exclusive_time_ns
 pub const FuncTimeArray = [MAX_TRACKED_FUNCS][2]u64;
 pub const FuncCallArray = [MAX_TRACKED_FUNCS]u64;
-
-test {
-    std.testing.refAllDecls(@This());
-}

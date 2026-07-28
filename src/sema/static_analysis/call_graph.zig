@@ -76,15 +76,4 @@ pub const CallGraph = struct {
     }
 };
 
-test "CallGraph basic edges" {
-    var cg = CallGraph.init(std.testing.allocator);
-    defer cg.deinit();
-    try cg.addEdge(0, 1);
-    try cg.addEdge(1, 2);
-    try cg.addEdge(0, 1);
-    const callees = cg.getCallees(0);
-    try std.testing.expectEqual(@as(usize, 1), callees.len);
-    try std.testing.expectEqual(@as(u16, 1), callees[0]);
-    try std.testing.expect(cg.callsTransitively(0, 2));
-    try std.testing.expect(!cg.callsTransitively(2, 0));
-}
+

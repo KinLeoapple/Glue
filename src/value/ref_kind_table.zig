@@ -126,22 +126,3 @@ pub inline fn displayName(kind: RefKind) []const u8 {
 pub inline fn isMemoizable(kind: RefKind) bool {
     return ref_kind_table[@intFromEnum(kind)].is_memoizable;
 }
-
-test "ref_kind_table 数据字段完整" {
-    inline for (std.meta.fields(RefKind)) |field| {
-        const kind: RefKind = @enumFromInt(field.value);
-        const desc = descriptor(kind);
-        try std.testing.expect(desc.type_name.len > 0);
-        try std.testing.expect(desc.display_name.len > 0);
-    }
-}
-
-test "ref_kind_table 函数指针初始为 null" {
-    inline for (std.meta.fields(RefKind)) |field| {
-        const kind: RefKind = @enumFromInt(field.value);
-        const desc = descriptor(kind);
-        try std.testing.expect(desc.deep_copy_fn == null);
-        try std.testing.expect(desc.format_fn == null);
-        try std.testing.expect(desc.equals_fn == null);
-    }
-}

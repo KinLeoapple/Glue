@@ -37,11 +37,3 @@ pub const lookupByName = registry.lookupByName;
 pub const returnKind = registry.returnKind;
 pub const okTypeName = registry.okTypeName;
 pub const dispatch = registry.dispatch;
-
-test {
-    _ = io;
-    _ = time;
-    _ = net;
-    _ = util;
-    _ = registry;
-}

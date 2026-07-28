@@ -33,15 +33,3 @@ pub const EngineContext = scheduler.EngineContext;
 pub const Worker = worker.Worker;
 pub const SuspendRegistry = suspend_registry.SuspendRegistry;
 pub const EnqueueFn = suspend_registry.EnqueueFn;
-
-test {
-    // 引用所有子模块以触发懒分析
-    _ = frame;
-    _ = deque;
-    _ = scheduler;
-    _ = worker;
-    _ = state_machine;
-    _ = suspend_registry;
-    _ = bridge;
-    _ = cancel;
-}

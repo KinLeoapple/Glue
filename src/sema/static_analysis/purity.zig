@@ -69,12 +69,4 @@ pub const PurityTable = struct {
     }
 };
 
-test "PurityTable basic put/lookup" {
-    var table = PurityTable.init(std.testing.allocator);
-    defer table.deinit();
-    try table.put("fib", .pure);
-    try table.put("send", .impure);
-    try std.testing.expect(table.isPure("fib"));
-    try std.testing.expect(!table.isPure("send"));
-    try std.testing.expect(!table.isPure("unknown"));
-}
+

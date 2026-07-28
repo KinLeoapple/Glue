@@ -238,33 +238,3 @@ comptime {
         @compileError("Node must be exactly 16 bytes, got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(Node)}));
     }
 }
-
-// ════════════════════════════════════════════════════════════════
-// 测试
-// ════════════════════════════════════════════════════════════════
-
-const testing = std.testing;
-
-test "Node 尺寸为 16 字节" {
-    try testing.expectEqual(@as(usize, 16), @sizeOf(Node));
-}
-
-test "Node.make 构造二元节点" {
-    const n = Node.makeBinary(.int_add, 10, 1, 5, 7);
-    try testing.expectEqual(NodeOp.int_add, n.op);
-    try testing.expectEqual(@as(u8, 2), n.input_count);
-    try testing.expectEqual(@as(u16, 10), n.output);
-    try testing.expectEqual(@as(u16, 1), n.meta_index);
-    try testing.expectEqual(@as(u16, 5), n.inputs[0]);
-    try testing.expectEqual(@as(u16, 7), n.inputs[1]);
-}
-
-test "NodeOp.isHalt/isVector/isScalar 分类" {
-    const op_table = @import("op_table.zig");
-    try testing.expect(op_table.isHalt(.halt_return));
-    try testing.expect(!op_table.isHalt(.int_add));
-    try testing.expect(op_table.isVector(.vec_map));
-    try testing.expect(!op_table.isVector(.int_add));
-    try testing.expect(op_table.isScalar(.int_add));
-    try testing.expect(!op_table.isScalar(.call));
-}

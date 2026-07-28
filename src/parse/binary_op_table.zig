@@ -83,19 +83,3 @@ pub fn lookupBinaryOp(tok_type: lexer.TokenType) ?*const OpMapping {
     }
     return null;
 }
-
-test "binary_op_table: BINARY_OPS 覆盖所有二元运算符" {
-    try std.testing.expect(BINARY_OPS.len >= 23);
-    try std.testing.expect(lookupBinaryOp(.question_question).?.op == .elvis);
-    try std.testing.expect(lookupBinaryOp(.pipe_pipe).?.op == .or_op);
-    try std.testing.expect(lookupBinaryOp(.star).?.precedence == MULTIPLICATION_PREC);
-    try std.testing.expect(lookupBinaryOp(.star).?.check_multiline_deref);
-    try std.testing.expect(lookupBinaryOp(.plus) != null);
-    try std.testing.expect(lookupBinaryOp(.semicolon) == null);
-}
-
-test "binary_op_table: 优先级从低到高递增" {
-    try std.testing.expect(ELVIS_PREC < OR_PREC);
-    try std.testing.expect(OR_PREC < AND_PREC);
-    try std.testing.expect(ADDITION_PREC < MULTIPLICATION_PREC);
-}

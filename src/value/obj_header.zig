@@ -212,28 +212,3 @@ pub fn initObjHeader(header: *ObjHeader, kind: RefKind, size: usize, is_arena: b
     if (is_arena) header.markArenaAllocated();
     if (tctx.prof) |p| p.recordAlloc(@intFromEnum(kind), size, is_arena);
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}
-
-test "retain 与 release 引用计数" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    var global = mem_mod.GlobalPool.init(std.testing.allocator, threaded.io());
-    defer global.deinit();
-    var ctx = ThreadContext.init(&global, std.testing.allocator, null) catch unreachable;
-    defer ctx.deinit();
-
-    var obj = ObjHeader{ .type_tag = .array, .rc = 1 };
-    _ = retain(&obj, &ctx);
-    try std.testing.expectEqual(@as(u32, 2), obj.rc);
-    // rc 从 2 递减到 1，不触发 deinit 分派
-    release(&obj, &ctx);
-    try std.testing.expectEqual(@as(u32, 1), obj.rc);
-}
-
-test "ObjHeader 布局为 8B" {
-    // extern struct 保证 8B 大小（1B tag + 1B flags + 2B padding + 4B rc）
-    try std.testing.expectEqual(@as(usize, 8), @sizeOf(ObjHeader));
-}

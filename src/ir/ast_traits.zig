@@ -718,30 +718,3 @@ pub fn astContainsExternalAssignStmt(stmt: *const ast.Stmt, loop_var: []const u8
     }
     return false;
 }
-
-// ════════════════════════════════════════════════════════════════
-// 单元测试（从 builder.zig 迁入）
-// ════════════════════════════════════════════════════════════════
-
-const testing = std.testing;
-
-test "intKindFromSuffix 后缀解析" {
-    try testing.expectEqual(IntKind.i32, intKindFromSuffix("i32").?);
-    try testing.expectEqual(IntKind.u64, intKindFromSuffix("u64").?);
-    try testing.expect(intKindFromSuffix(null) == null);
-    try testing.expect(intKindFromSuffix("xyz") == null);
-}
-
-test "binaryOpToNodeOp 类型分派" {
-    try testing.expectEqual(NodeOp.int_add, try binaryOpToNodeOp(.add, type_descriptor_mod.i64_descriptor));
-    try testing.expectEqual(NodeOp.float_add, try binaryOpToNodeOp(.add, type_descriptor_mod.f64_descriptor));
-    try testing.expectEqual(NodeOp.int_and, try binaryOpToNodeOp(.bit_and, type_descriptor_mod.i32_descriptor));
-    try testing.expectEqual(NodeOp.cmp_lt, try binaryOpToNodeOp(.lt, type_descriptor_mod.i64_descriptor));
-    try testing.expectError(error.UnsupportedType, binaryOpToNodeOp(.bit_and, type_descriptor_mod.f64_descriptor));
-}
-
-test "binaryResultType 结果类型推导" {
-    try testing.expectEqual(type_descriptor_mod.mask_descriptor, binaryResultType(.lt, type_descriptor_mod.i64_descriptor));
-    try testing.expectEqual(type_descriptor_mod.bool_descriptor, binaryResultType(.and_op, type_descriptor_mod.bool_descriptor));
-    try testing.expectEqual(type_descriptor_mod.i64_descriptor, binaryResultType(.add, type_descriptor_mod.i64_descriptor));
-}

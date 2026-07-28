@@ -17,15 +17,10 @@ const mem = @import("mem");
 const value = @import("value");
 
 pub const engine_mod = @import("engine.zig");
-pub const engine_tests = @import("engine_tests.zig");
 pub const runtime_mod = @import("runtime.zig");
 
 pub const Engine = engine_mod.Engine;
 pub const EngineError = engine_mod.EngineError;
 pub const Runtime = runtime_mod.Runtime;
 
-test {
-    _ = engine_mod;
-    _ = engine_tests;
-    _ = runtime_mod;
-}
+

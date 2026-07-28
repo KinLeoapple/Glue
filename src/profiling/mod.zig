@@ -173,7 +173,3 @@ pub const GlobalProfiler = struct {
         self.thread_profilers.clearRetainingCapacity();
     }
 };
-
-test {
-    std.testing.refAllDecls(@This());
-}

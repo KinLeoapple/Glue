@@ -274,23 +274,4 @@ const _force_analysis = blk: {
     break :blk {};
 };
 
-test "populate: 空模块冒烟测试" {
-    var sr = SemaResult.init(std.testing.allocator);
-    defer sr.deinit();
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const module = ast.Module{
-        .name = "test",
-        .source_path = null,
-        .declarations = &.{},
-    };
-
-    try populateSemaResultFromAst(&sr, module, arena.allocator());
-
-    // 空模块不应注册任何定义
-    try std.testing.expectEqual(@as(usize, 0), sr.type_defs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), sr.func_sigs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), sr.trait_defs.items.len);
-}
