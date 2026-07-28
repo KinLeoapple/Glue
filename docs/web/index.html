@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Glue — 安全、自然、高效的并行函数式语言</title>
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <!-- 顶部导航栏 -->
+    <header class="navbar">
+        <div class="navbar-left">
+            <a href="#/" class="logo">▸ Glue</a>
+        </div>
+        <div class="navbar-center">
+            <div class="nav-dropdown">
+                <button class="nav-btn">教程 ▾</button>
+                <div class="nav-menu" id="nav-tutorial"></div>
+            </div>
+            <div class="nav-dropdown">
+                <button class="nav-btn">参考 ▾</button>
+                <div class="nav-menu" id="nav-reference"></div>
+            </div>
+        </div>
+        <div class="navbar-right">
+            <button class="search-trigger" id="search-trigger">
+                <span>搜索</span>
+                <kbd>⌘K</kbd>
+            </button>
+            <a href="https://github.com" class="github-link" target="_blank" rel="noopener">GitHub</a>
+        </div>
+    </header>
+
+    <!-- 主体三栏 -->
+    <div class="layout">
+        <!-- 左侧侧栏 -->
+        <aside class="sidebar" id="sidebar">
+            <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        </aside>
+
+        <!-- 右侧主内容 -->
+        <main class="content" id="content"></main>
+    </div>
+
+    <!-- 搜索模态 -->
+    <div class="search-modal" id="search-modal">
+        <div class="search-box">
+            <input type="text" id="search-input" placeholder="搜索文档..." autocomplete="off">
+            <div class="search-results" id="search-results"></div>
+        </div>
+    </div>
+
+    <!-- 汉堡菜单按钮（响应式） -->
+    <button class="menu-toggle" id="menu-toggle" aria-label="菜单">☰</button>
+
+    <script src="js/content.js"></script>
+    <script src="js/highlight.js"></script>
+    <script src="js/search.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>

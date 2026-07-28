@@ -542,7 +542,10 @@ pub const ModuleLoader = struct {
                     };
 
                     try retained_parsers.append(self.allocator, sub_parser_ptr);
-                    try retained_sources.append(self.allocator, sub_src);
+                    // stdlib 源（@embedFile）不需要释放，只有用户文件系统源需要
+                    if (!src.isStdlib(src.ctx)) {
+                        try retained_sources.append(self.allocator, sub_src);
+                    }
                     try retained_tokens.append(self.allocator, sub_tokens);
 
                     try self.collectAndMangleDecls(

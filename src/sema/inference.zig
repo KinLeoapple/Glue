@@ -100,7 +100,7 @@ pub const TypeBindingContext = struct {
 /// 不包含 IRBuilder 运行时状态（变量绑定/通道表/函数表），因此
 /// 依赖这些状态的 infer* 函数仍保留在 IRBuilder 中。
 pub const InferContext = struct {
-    sema_result: *const SemaResult,
+    sema_result: *SemaResult,
     module: *const ast.Module,
     arena: std.mem.Allocator,
     type_binding_ctx: ?*const TypeBindingContext = null,
@@ -204,7 +204,8 @@ pub fn inferTraitNameFromExpr(ctx: *const InferContext, expr: *const ast.Expr) ?
 ///
 /// 迁自 builder.zig:7430 chanTypeFromExprAst
 /// 纯 AST 推断，不依赖 IRBuilder 状态
-pub fn chanTypeFromExprAst(expr: *const ast.Expr) *const TypeDescriptor {
+/// 无回退实现：sema_result 必需，通过 resolveTypeNodeConcrete 解析类型
+pub fn chanTypeFromExprAst(expr: *const ast.Expr, sema_result: *SemaResult) *const TypeDescriptor {
     switch (expr.*) {
         .int_literal => |il| {
             if (il.suffix) |s| {
@@ -219,10 +220,14 @@ pub fn chanTypeFromExprAst(expr: *const ast.Expr) *const TypeDescriptor {
             return ir_td.f32_descriptor;
         },
         .bool_literal => return ir_td.bool_descriptor,
-        .string_literal, .string_interpolation => return ir_td.ref_descriptor,
+        .string_literal, .string_interpolation => return ir_td.str_descriptor,
         .char_literal => return ir_td.char_descriptor,
-        .cast_builder => |cb| return type_resolver.resolveChanType(cb.target_type, &.{}) orelse ir_td.i64_descriptor,
-        .type_cast => |tc| return type_resolver.resolveChanType(tc.target_type, &.{}) orelse ir_td.i64_descriptor,
+        .cast_builder => |cb| {
+            return type_resolver.resolveTypeNodeConcrete(cb.target_type, &.{}, sema_result) orelse ir_td.i64_descriptor;
+        },
+        .type_cast => |tc| {
+            return type_resolver.resolveTypeNodeConcrete(tc.target_type, &.{}, sema_result) orelse ir_td.i64_descriptor;
+        },
         else => return ir_td.i64_descriptor,
     }
 }
@@ -231,11 +236,11 @@ pub fn chanTypeFromExprAst(expr: *const ast.Expr) *const TypeDescriptor {
 ///
 /// 迁自 builder.zig:7352 inferArrayLiteralElemType
 /// 纯 AST 推断
-pub fn inferArrayLiteralElemType(arr_expr: *const ast.Expr) *const TypeDescriptor {
+pub fn inferArrayLiteralElemType(arr_expr: *const ast.Expr, sema_result: *SemaResult) *const TypeDescriptor {
     switch (arr_expr.*) {
         .array_literal => |al| {
             if (al.elements.len == 0) return ir_td.i64_descriptor;
-            return chanTypeFromExprAst(al.elements[0]);
+            return chanTypeFromExprAst(al.elements[0], sema_result);
         },
         else => return ir_td.i64_descriptor,
     }
@@ -424,9 +429,10 @@ pub fn inferExprChanType(ctx: *const InferContextExt, expr: *const ast.Expr) ?*c
                 .identifier => |id| id.name,
                 else => return null,
             };
-            // 构造器调用：返回 ref_chan（构造器在堆上分配，返回引用）
-            if (ctx.base.sema_result.getCtorDef(func_name) != null) {
-                return ir_td.ref_descriptor;
+            // 构造器调用：返回构造器类型的具名描述符（无回退到 ref_descriptor）
+            if (ctx.base.sema_result.getCtorDef(func_name)) |ctor| {
+                const ret_name = ctor.return_type_name orelse ctor.type_name;
+                return ctx.base.sema_result.getOrCreateRefDesc(ret_name) catch unreachable;
             }
             // 普通函数调用：查 func_sigs 的 return_type_desc
             if (ctx.base.sema_result.getFuncSig(func_name)) |sig| {
@@ -437,12 +443,12 @@ pub fn inferExprChanType(ctx: *const InferContextExt, expr: *const ast.Expr) ?*c
         .int_literal => return ir_td.i32_descriptor,
         .float_literal => return ir_td.f32_descriptor,
         .bool_literal => return ir_td.bool_descriptor,
-        .string_literal => return ir_td.ref_descriptor,
+        .string_literal => return ir_td.str_descriptor,
         .char_literal => return ir_td.char_descriptor,
         .identifier => |id| {
             if (ctx.lookupVar(id.name)) |binding| {
                 if (binding.type_annotation) |ta| {
-                    if (type_resolver.resolveChanType(ta, &.{})) |ct| return ct;
+                    if (type_resolver.resolveTypeNodeConcrete(ta, &.{}, ctx.base.sema_result)) |ct| return ct;
                 }
             }
             // 回退到 sema_result.expr_types
@@ -478,7 +484,7 @@ pub fn inferThrowOkChanType(ctx: *const InferContextExt, expr: *const ast.Expr) 
         .identifier => |id| {
             if (ctx.lookupVar(id.name)) |binding| {
                 if (binding.type_annotation) |ta| {
-                    return throwOkChanType(ta);
+                    return throwOkChanType(ta, ctx.base.sema_result);
                 }
                 if (binding.ast_expr) |src_expr| {
                     return inferThrowOkChanType(ctx, src_expr);
@@ -488,7 +494,7 @@ pub fn inferThrowOkChanType(ctx: *const InferContextExt, expr: *const ast.Expr) 
         },
         .cast_builder => |cb| {
             if (cb.mode != .try_to) return null;
-            return type_resolver.resolveChanType(cb.target_type, &.{});
+            return type_resolver.resolveTypeNodeConcrete(cb.target_type, &.{}, ctx.base.sema_result);
         },
         .method_call => |mc| {
             // await：解包 Async<T> → T
@@ -541,14 +547,14 @@ pub fn inferThrowOkTypeName(ctx: *const InferContextExt, expr: *const ast.Expr) 
 
 /// 从 TypeNode 提取 Throw Ok 的 TypeDescriptor
 /// 迁自 builder.zig throwOkChanType
-fn throwOkChanType(tn: *const ast.TypeNode) ?*const TypeDescriptor {
+fn throwOkChanType(tn: *const ast.TypeNode, sema_result: *SemaResult) ?*const TypeDescriptor {
     return switch (tn.*) {
         .named => |n| {
             // Throw<T> → T 的 TypeDescriptor
             if (std.mem.eql(u8, n.name, "Throw")) return null; // 需要类型参数
-            return type_resolver.chanTypeFromTypeName(n.name);
+            return type_resolver.chanTypeFromTypeName(n.name, sema_result);
         },
-        else => type_resolver.resolveChanType(tn, &.{}),
+        else => type_resolver.resolveTypeNodeConcrete(tn, &.{}, sema_result),
     };
 }
 
@@ -569,7 +575,7 @@ fn throwOkTypeName(tn: *const ast.TypeNode) ?[]const u8 {
 /// 支持：array_literal、identifier、method_call（s.bytes() → u8_chan）、binary.concat_list、field_access
 pub fn inferArrayElemType(ctx: *const InferContextExt, expr: *const ast.Expr) *const TypeDescriptor {
     switch (expr.*) {
-        .array_literal => return inferArrayLiteralElemType(expr),
+        .array_literal => return inferArrayLiteralElemType(expr, ctx.base.sema_result),
         .method_call => |mc| {
             // s.bytes() 返回 u8[]
             if (std.mem.eql(u8, mc.method, "bytes")) return ir_td.u8_descriptor;
@@ -578,7 +584,7 @@ pub fn inferArrayElemType(ctx: *const InferContextExt, expr: *const ast.Expr) *c
         .identifier => |id| {
             if (ctx.lookupVar(id.name)) |binding| {
                 if (binding.type_annotation) |ta| {
-                    if (ta.* == .array) return type_resolver.resolveChanType(ta.array.element_type, &.{}) orelse ir_td.i64_descriptor;
+                    if (ta.* == .array) return type_resolver.resolveTypeNodeConcrete(ta.array.element_type, &.{}, ctx.base.sema_result) orelse ir_td.i64_descriptor;
                 }
                 if (binding.ast_expr) |src_expr| {
                     return inferArrayElemType(ctx, src_expr);
@@ -953,7 +959,7 @@ fn throwOkTypeNode(type_node: ?*const ast.TypeNode) ?*ast.TypeNode {
 /// 由 IRBuilder 构造（栈上），传递给 sema 侧的 GADT 推断函数
 pub const GadtContext = struct {
     allocator: std.mem.Allocator,
-    sema_result: *const SemaResult,
+    sema_result: *SemaResult,
     current_type_args: []const TypeDescriptor,
     current_module: ?*const ast.Module,
     /// GADT 绑定栈（IRBuilder 持有内存，sema 通过指针操作）
@@ -1006,7 +1012,7 @@ pub const GadtContext = struct {
 
     /// 委托 sema type_resolver 解析类型节点的通道类型
     pub fn chanTypeFromTypeNodeBound(self: *const GadtContext, type_node: ?*ast.TypeNode) ?*const TypeDescriptor {
-        return type_resolver.chanTypeFromTypeNodeBound(type_node, self.current_type_args, null);
+        return type_resolver.chanTypeFromTypeNodeBound(type_node, self.current_type_args, null, self.sema_result);
     }
 
     /// 检查名称是否为类型参数
@@ -1119,34 +1125,18 @@ pub fn chanTypeWithTypeNode(
     type_node: ?*ast.TypeNode,
     type_bindings: std.StringHashMap(*const TypeDescriptor),
 ) ?*const TypeDescriptor {
-    if (type_bindings.count() == 0) {
-        return type_resolver.resolveTypeNode(type_node, &.{});
+    const tn = type_node orelse return null;
+
+    // For named type parameters: return the bound TypeDescriptor pointer directly
+    // (avoid creating a temporary type_args array whose elements would be dangling pointers)
+    if (tn.* == .named) {
+        const name = tn.named.name;
+        if (type_bindings.get(name)) |bound_td| return bound_td;
     }
 
-    var type_args = ctx.allocator.alloc(TypeDescriptor, type_bindings.count()) catch return null;
-    defer ctx.allocator.free(type_args);
-
-    var i: usize = 0;
-    var it = type_bindings.iterator();
-    while (it.next()) |entry| {
-        const base = entry.value_ptr.*;
-        type_args[i] = .{
-            .size = base.size,
-            .alignment = base.alignment,
-            .is_ref = base.is_ref,
-            .is_nullable = base.is_nullable,
-            .is_null_type = base.is_null_type,
-            .is_unit_type = base.is_unit_type,
-            .scalar_ops = base.scalar_ops,
-            .slots = base.slots,
-            .slot_kind = base.slot_kind,
-            .type_id = base.type_id,
-            .type_name = entry.key_ptr.*,
-        };
-        i += 1;
-    }
-
-    return type_resolver.resolveTypeNode(type_node, type_args);
+    // For non-parameter types or unbound parameters: resolve with concrete descriptors
+    // (为用户类型创建具体描述符，不回退到 ref_descriptor)
+    return type_resolver.resolveTypeNodeConcrete(type_node, &.{}, ctx.sema_result);
 }
 
 /// 推断构造器调用的通道类型（含 GADT 类型参数推断）
@@ -1157,7 +1147,8 @@ pub fn inferConstructorChanType(
     ctor: @import("sema_output.zig").CtorDefInfo,
     arguments: []*ast.Expr,
 ) ?*const TypeDescriptor {
-    const rt = ctx.getCtorAstReturnType(ctor.name) orelse return ir_td.ref_descriptor;
+    const rt = ctx.getCtorAstReturnType(ctor.name) orelse
+        return ctx.sema_result.getOrCreateRefDesc(ctor.type_name) catch unreachable;
 
     if (!typeNodeHasTypeParam(rt)) {
         return ctx.chanTypeFromTypeNodeBound(rt);
@@ -1215,19 +1206,22 @@ pub fn inferGenericCallReturnType(
     }
 
     const func_return_type = ctx.findFuncReturnTypeAst(func_name) orelse return null;
-    return chanTypeWithTypeNode(ctx, func_return_type, bindings);
+    const result = chanTypeWithTypeNode(ctx, func_return_type, bindings);
+    return result;
 }
 
 /// 使用 GADT 绑定栈解析类型节点的通道类型
 /// 从栈顶向下查找类型参数绑定，找到则返回具体类型
+/// 无回退实现：所有路径通过 getOrCreateRefDesc 创建具名描述符
 pub fn resolveFieldTypeWithBindings(
     ctx: *const GadtContext,
     type_node: ?*ast.TypeNode,
 ) *const TypeDescriptor {
-    const tn = type_node orelse return ir_td.ref_descriptor;
+    const tn = type_node orelse return ctx.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
     if (tn.* == .named) {
         const name = tn.named.name;
         if (ctx.isTypeParamName(name)) {
+            // 1. 优先查 GADT binding_stack（match arm 推送的构造器特定绑定）
             if (ctx.binding_stack) |stack| {
                 var i: usize = stack.items.len;
                 while (i > 0) {
@@ -1235,11 +1229,13 @@ pub fn resolveFieldTypeWithBindings(
                     if (stack.items[i].get(name)) |ct| return ct;
                 }
             }
-            return ir_td.i64_descriptor;
+            // 2. 查 current_type_args（当前单态化实例的类型参数绑定）
+            //    chanTypeFromTypeNodeBound 通过 type_name 匹配 type_args 中的 TypeDescriptor
+            return ctx.chanTypeFromTypeNodeBound(tn) orelse ctx.sema_result.getOrCreateRefDesc(name) catch unreachable;
         }
-        return ctx.chanTypeFromTypeNodeBound(tn) orelse ir_td.ref_descriptor;
+        return ctx.chanTypeFromTypeNodeBound(tn) orelse ctx.sema_result.getOrCreateRefDesc(name) catch unreachable;
     }
-    return ctx.chanTypeFromTypeNodeBound(tn) orelse ir_td.ref_descriptor;
+    return ctx.chanTypeFromTypeNodeBound(tn) orelse ctx.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
 }
 
 /// 为 match arm 推送 GADT 类型绑定
@@ -1424,11 +1420,16 @@ const _force_analysis = blk: {
 };
 
 test "inference: chanTypeFromTypeName via type_resolver" {
-    try std.testing.expectEqual(ir_td.i32_descriptor, type_resolver.chanTypeFromTypeName("i32"));
-    try std.testing.expectEqual(ir_td.f64_descriptor, type_resolver.chanTypeFromTypeName("f64"));
-    try std.testing.expectEqual(ir_td.bool_descriptor, type_resolver.chanTypeFromTypeName("bool"));
-    try std.testing.expectEqual(ir_td.ref_descriptor, type_resolver.chanTypeFromTypeName("str"));
-    try std.testing.expectEqual(ir_td.ref_descriptor, type_resolver.chanTypeFromTypeName("MyType"));
+    var sr = SemaResult.init(std.testing.allocator);
+    defer sr.deinit();
+    try std.testing.expectEqual(ir_td.i32_descriptor, type_resolver.chanTypeFromTypeName("i32", &sr));
+    try std.testing.expectEqual(ir_td.f64_descriptor, type_resolver.chanTypeFromTypeName("f64", &sr));
+    try std.testing.expectEqual(ir_td.bool_descriptor, type_resolver.chanTypeFromTypeName("bool", &sr));
+    try std.testing.expectEqual(ir_td.str_descriptor, type_resolver.chanTypeFromTypeName("str", &sr));
+    // 用户自定义类型 → getOrCreateRefDesc（非 ref_descriptor）
+    const my_td = type_resolver.chanTypeFromTypeName("MyType", &sr);
+    try std.testing.expect(my_td != ir_td.ref_descriptor);
+    try std.testing.expectEqualStrings("MyType", my_td.type_name);
 }
 
 test "inference: typeNameFromNode" {
@@ -1437,6 +1438,8 @@ test "inference: typeNameFromNode" {
 }
 
 test "inference: chanTypeFromExprAst" {
+    var sr = SemaResult.init(std.testing.allocator);
+    defer sr.deinit();
     const expr = ast.Expr{ .int_literal = .{ .value = 42, .suffix = null } };
-    try std.testing.expectEqual(ir_td.i32_descriptor, chanTypeFromExprAst(&expr));
+    try std.testing.expectEqual(ir_td.i32_descriptor, chanTypeFromExprAst(&expr, &sr));
 }

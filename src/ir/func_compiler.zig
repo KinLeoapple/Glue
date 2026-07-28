@@ -174,7 +174,7 @@ pub const Methods = struct {
         self.current_returns_throw = if (@hasField(@TypeOf(fd), "return_type")) builder_mod.isThrowType(effective_return_type) else false;
         // 提取 Throw<T, E> 的 Ok 值通道类型，供 ? 传播使用
         if (self.current_returns_throw and @hasField(@TypeOf(fd), "return_type")) {
-            self.current_throw_ok_type_desc = builder_mod.throwOkChanType(effective_return_type) orelse type_descriptor_mod.i64_descriptor;
+            self.current_throw_ok_type_desc = builder_mod.throwOkChanType(effective_return_type, self.sema_result) orelse type_descriptor_mod.i64_descriptor;
         }
 
         // 编译函数体（函数体在尾位置）
@@ -207,7 +207,9 @@ pub const Methods = struct {
         // 发射 halt_return
         try self.emit(Node.makeUnary(.halt_return, return_chan, 0, final_chan));
 
-        const node_count: u32 = @intCast(self.nodes.items.len - node_start);
+        // node_count：延迟实例化确保被实例化函数的体节点不会交错到当前函数范围内，
+        // 因此直接用 raw node count 即可
+        const node_count: u32 = @as(u32, @intCast(self.nodes.items.len - node_start));
         const chan_end: u16 = self.channels.count();
         // 更新占位条目（保留第一遍设置的 return_channel/is_entry/is_async）
         self.functions.items[func_idx].node_start = node_start;
@@ -495,23 +497,19 @@ pub const Methods = struct {
         // 6. 预占新 Function 索引
         const new_func_idx: u16 = @intCast(self.functions.items.len);
 
-        // 7. 写入进行中（防止递归无限展开）
+        // 7. 写入 instances_in_progress（同时作为"已排队"标记，防止重复排队）
+        //    不再用 defer remove：延迟编译完成后由 processDeferredInstantiations 移除
         try self.instances_in_progress.put(instance_id, new_func_idx);
-        defer _ = self.instances_in_progress.remove(instance_id);
 
-        // 8. 设置单态化上下文：current_instance + current_type_args
-        //    替代原 pushTypeBinding/popTypeBinding，sema 已是类型绑定权威来源
-        const instance_ptr = &self.sema_result.monomorph_instances.items[instance_id];
-        const prev_instance = self.current_instance;
-        const prev_type_args = self.current_type_args;
-        self.current_instance = instance_ptr;
-        self.current_type_args = instance_ptr.type_args;
-        defer {
-            self.current_instance = prev_instance;
-            self.current_type_args = prev_type_args;
-        }
+        // 8. 预分配占位 Function（return channel 用 bound 版本解析）
+        //    必须临时切换 current_type_args 到实例的 type_args，否则类型参数（如 A）
+        //    会因 caller 的空 type_args 而回退到 ref_descriptor，
+        //    导致 forceLazyArgIfNeeded 错误装箱标量实参。
+        const instance_type_args = self.sema_result.monomorph_instances.items[instance_id].type_args;
+        const saved_type_args = self.current_type_args;
+        self.current_type_args = instance_type_args;
+        defer self.current_type_args = saved_type_args;
 
-        // 9. 预分配占位 Function（return channel 用 bound 版本解析）
         const return_chan_type = self.chanTypeFromTypeNodeBound(fd.return_type) orelse type_descriptor_mod.i64_descriptor;
         const placeholder_return_chan = if (return_chan_type.is_nullable)
             try self.channels.allocNullable(type_descriptor_mod.i64_descriptor) // inner_type 暂用 i64，compileFunction 会修正
@@ -528,12 +526,51 @@ pub const Methods = struct {
             .is_async = fd.is_async,
         });
 
-        // 10. 编译函数体（compileFunction 会更新占位条目）
-        _ = try self.compileFunction(fd.*, new_func_idx);
-
-        // 11. 建立 sema instance_id → IR func_idx 映射
-        try self.instance_func_map.put(instance_id, new_func_idx);
+        // 9. 延迟编译：将实例化请求排队，待所有顶层函数编译完成后统一处理。
+        //    这避免了被实例化函数的体节点与调用者函数的体节点交错，
+        //    导致调用者 node_range 错误包含被实例化函数的节点。
+        try self.deferred_instantiations.append(self.allocator, .{
+            .func_name = func_name,
+            .instance_id = instance_id,
+            .func_idx = new_func_idx,
+        });
 
         return new_func_idx;
+    }
+
+    /// 处理延迟实例化队列：编译所有排队的泛型函数实例。
+    /// 在所有顶层函数编译完成后调用，确保被实例化函数的体节点
+    /// 不会与调用者函数的体节点交错。
+    /// 处理过程中可能触发新的实例化请求（递归泛型），循环处理直到队列为空。
+    pub fn processDeferredInstantiations(self: *IRBuilder) BuildError!void {
+        while (self.deferred_instantiations.items.len > 0) {
+            // 取出队首（FIFO 顺序保持实例化嵌套层次合理）
+            const req = self.deferred_instantiations.orderedRemove(0);
+
+            // 设置单态化上下文
+            const instance_ptr = &self.sema_result.monomorph_instances.items[req.instance_id];
+            const prev_instance_id = self.current_instance_id;
+            const prev_type_args = self.current_type_args;
+            self.current_instance_id = req.instance_id;
+            self.current_type_args = instance_ptr.type_args;
+            defer {
+                self.current_instance_id = prev_instance_id;
+                self.current_type_args = prev_type_args;
+            }
+
+            // 查找函数 AST
+            const fd = self.findFunDeclAst(req.func_name) orelse {
+                // AST 未找到，跳过（占位条目保持 node_count=0）
+                _ = self.instances_in_progress.remove(req.instance_id);
+                continue;
+            };
+
+            // 编译函数体（compileFunction 会更新占位条目的 node_start/node_count 等）
+            _ = try self.compileFunction(fd.*, req.func_idx);
+
+            // 标记为已编译：从 in_progress 移除，加入 instance_func_map
+            _ = self.instances_in_progress.remove(req.instance_id);
+            try self.instance_func_map.put(req.instance_id, req.func_idx);
+        }
     }
 };

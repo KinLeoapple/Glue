@@ -16,6 +16,18 @@
 const std = @import("std");
 const value = @import("value");
 
+/// 使用 msync 系统调用安全检查地址是否可读。
+/// msync 返回 -1（errno=ENOMEM）表示内存未映射，返回 0 表示已映射。
+/// 避免直接解引用可能无效的指针（如标量位模式被误判为堆指针）。
+extern "c" fn msync(addr: [*]const u8, len: usize, flags: c_int) c_int;
+
+pub fn isReadable(addr: usize) bool {
+    const ps = std.heap.page_size_min;
+    const page_addr = addr & ~(@as(usize, ps) - 1);
+    const result = msync(@ptrFromInt(page_addr), ps, 1); // MS_ASYNC = 1
+    return result == 0;
+}
+
 /// 标量操作 vtable
 pub const ScalarOps = struct {
     read: *const fn (ptr: *anyopaque) value.Value,
@@ -1069,10 +1081,15 @@ pub fn readRef(ptr: *anyopaque) value.Value {
     const p: *?*anyopaque = @ptrCast(@alignCast(ptr));
     if (p.*) |rp| {
         const addr = @intFromPtr(rp);
-        if (addr >= 0x1000 and addr % @alignOf(value.obj_header.ObjHeader) == 0) {
-            const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(rp));
-            if (header.isValidHeapObj()) {
-                return value.Value.fromRef(header);
+        // 过滤无效地址：低地址（< 0x1000）和内核空间（高位置 1，含负 i64 符号扩展）
+        // 后者防止标量位模式（如 -128i8 → 0xffffffffffffff80）被误判为堆指针
+        if (addr >= 0x1000 and addr < 0x8000000000000000 and addr % @alignOf(value.obj_header.ObjHeader) == 0) {
+            // 使用 msync 安全检查页面是否映射，避免对标量位模式调用 isValidHeapObj 导致段错误
+            if (isReadable(addr)) {
+                const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(rp));
+                if (header.isValidHeapObj()) {
+                    return value.Value.fromRef(header);
+                }
             }
         }
     }
@@ -1206,8 +1223,12 @@ const f64_descriptor_val: TypeDescriptor = .{ .size = 8, .alignment = 8, .is_ref
 const f128_descriptor_val: TypeDescriptor = .{ .size = 16, .alignment = 16, .is_ref = false, .type_id = 16, .type_name = "f128", .scalar_ops = &f128_ops };
 const bool_descriptor_val: TypeDescriptor = .{ .size = 1, .alignment = 1, .is_ref = false, .type_id = 17, .type_name = "bool", .scalar_ops = &bool_ops };
 const char_descriptor_val: TypeDescriptor = .{ .size = 4, .alignment = 4, .is_ref = false, .type_id = 18, .type_name = "char", .scalar_ops = &char_ops };
+/// str 类型：具体引用类型（8 字节堆指针），type_id=19
+const str_descriptor_val: TypeDescriptor = .{ .size = 8, .alignment = 8, .is_ref = true, .type_id = 19, .type_name = "str", .scalar_ops = &ref_ops };
 const null_descriptor_val: TypeDescriptor = .{ .size = 0, .alignment = 0, .is_ref = false, .is_null_type = true, .type_id = 0, .type_name = "Null", .scalar_ops = &null_ops };
 const unit_descriptor_val: TypeDescriptor = .{ .size = 0, .alignment = 0, .is_ref = false, .is_unit_type = true, .type_id = 0, .type_name = "void", .scalar_ops = &unit_ops };
+/// 通用引用描述符（废除 ref_chan 过渡期保留）：8 字节堆指针，is_ref=true
+/// 新代码应使用 TypeDescriptorPool.getOrCreateRefDesc(name) 获取具体类型描述符
 const ref_descriptor_val: TypeDescriptor = .{ .size = 8, .alignment = 8, .is_ref = true, .type_id = 0, .type_name = "ref", .scalar_ops = &ref_ops };
 const mask_descriptor_val: TypeDescriptor = .{ .size = 1, .alignment = 1, .is_ref = false, .type_id = 0, .type_name = "bool", .scalar_ops = &bool_ops };
 const nullable_descriptor_val: TypeDescriptor = .{ .size = 0, .alignment = 0, .is_ref = false, .is_nullable = true, .type_id = 0, .type_name = "nullable" };
@@ -1291,3 +1312,51 @@ pub const f16_descriptor: *const TypeDescriptor = &f16_descriptor_val;
 pub const f32_descriptor: *const TypeDescriptor = &f32_descriptor_val;
 pub const f64_descriptor: *const TypeDescriptor = &f64_descriptor_val;
 pub const f128_descriptor: *const TypeDescriptor = &f128_descriptor_val;
+/// str 类型描述符（具体引用类型，type_id=19）
+pub const str_descriptor: *const TypeDescriptor = &str_descriptor_val;
+
+// ════════════════════════════════════════════════════════════
+// 动态类型描述符池（废除 ref_chan：为每个用户类型创建具体引用描述符）
+// ════════════════════════════════════════════════════════════
+// 所有引用类型（ADT/record/newtype/array/fn/closure 等）均为 8 字节指针通道，
+// 但各自拥有唯一的 type_id 和 type_name，消除多态 ref_descriptor。
+// scalar_ops 统一使用 ref_ops（读写 8 字节指针），行为一致。
+
+/// 动态类型描述符池：为用户自定义类型创建具体引用类型描述符
+pub const TypeDescriptorPool = struct {
+    arena: std.heap.ArenaAllocator,
+    cache: std.StringHashMap(*const TypeDescriptor),
+    /// 下一个可分配的 type_id（1-18: 标量, 19: str, 20+: 用户类型）
+    next_type_id: u16 = 20,
+
+    pub fn init(backing: std.mem.Allocator) TypeDescriptorPool {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(backing),
+            .cache = std.StringHashMap(*const TypeDescriptor).init(backing),
+        };
+    }
+
+    pub fn deinit(self: *TypeDescriptorPool) void {
+        self.cache.deinit();
+        self.arena.deinit();
+    }
+
+    /// 获取或创建具名引用类型描述符（8 字节指针通道，is_ref=true）
+    /// 相同 name 返回相同指针（缓存去重）
+    pub fn getOrCreateRefDesc(self: *TypeDescriptorPool, name: []const u8) !*const TypeDescriptor {
+        if (self.cache.get(name)) |td| return td;
+        const td = try self.arena.allocator().create(TypeDescriptor);
+        const name_copy = try self.arena.allocator().dupe(u8, name);
+        td.* = .{
+            .size = 8,
+            .alignment = 8,
+            .is_ref = true,
+            .type_id = self.next_type_id,
+            .type_name = name_copy,
+            .scalar_ops = &ref_ops,
+        };
+        self.next_type_id += 1;
+        try self.cache.put(name_copy, td);
+        return td;
+    }
+};

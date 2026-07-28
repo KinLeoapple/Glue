@@ -591,7 +591,21 @@ pub const Runtime = struct {
             return false;
         }
         // 标量/ref/unit/null：通过 type_desc.scalar_ops vtable 写入
+        // 检查 type_desc 指针有效性
+        const td_addr = @intFromPtr(slot.type_desc);
+        if (td_addr < 0x1000 or td_addr >= 0x8000000000000000) {
+            return false;
+        }
         const ops = slot.type_desc.scalar_ops orelse return false;
+        // 检查 ops 指针有效性
+        const ops_addr = @intFromPtr(ops);
+        if (ops_addr < 0x1000 or ops_addr >= 0x8000000000000000) {
+            return false;
+        }
+        // 额外检查：用 isReadable 验证 ops 指向的内存是否可读
+        if (!type_descriptor_mod.isReadable(ops_addr)) {
+            return false;
+        }
         const coerced = ops.coerce(v);
         if (slot.ptr) |p| {
             ops.write(@ptrCast(p), coerced);

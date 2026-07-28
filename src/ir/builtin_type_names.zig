@@ -6,7 +6,7 @@
 //! 单一真相：type_descriptor.zig 的静态 TypeDescriptor 常量。
 //! 新增标量只需在 type_descriptor.zig 追加描述符，本文件自动覆盖。
 //!
-//! 注：chanTypeFromTypeNode 已统一委托 sema/type_resolver.resolveChanType。
+//! 注：chanTypeFromTypeNode 已统一委托 sema/type_resolver.resolveTypeNodeConcrete。
 //! 本文件提供 intKindFromName/floatKindFromName/typeDescFromBuiltinName 等 ir 内部专用查询。
 
 const std = @import("std");
@@ -54,7 +54,7 @@ const SCALAR_ENTRIES = blk: {
 
 /// 非标量内置类型（str 是堆引用，unit 是零字节类型）
 const NON_SCALAR_BUILTINS = [_]struct { name: []const u8, type_desc: *const TypeDescriptor }{
-    .{ .name = "str", .type_desc = type_descriptor_mod.ref_descriptor },
+    .{ .name = "str", .type_desc = type_descriptor_mod.str_descriptor },
     .{ .name = "void", .type_desc = type_descriptor_mod.unit_descriptor },
 };
 
@@ -100,7 +100,7 @@ test "builtin_type_names: typeDescFromBuiltinName 覆盖标量 + str" {
     try std.testing.expectEqual(type_descriptor_mod.f64_descriptor, typeDescFromBuiltinName("f64").?);
     try std.testing.expectEqual(type_descriptor_mod.bool_descriptor, typeDescFromBuiltinName("bool").?);
     try std.testing.expectEqual(type_descriptor_mod.char_descriptor, typeDescFromBuiltinName("char").?);
-    try std.testing.expectEqual(type_descriptor_mod.ref_descriptor, typeDescFromBuiltinName("str").?);
+    try std.testing.expectEqual(type_descriptor_mod.str_descriptor, typeDescFromBuiltinName("str").?);
     try std.testing.expectEqual(type_descriptor_mod.unit_descriptor, typeDescFromBuiltinName("void").?);
     try std.testing.expectEqual(type_descriptor_mod.isize_descriptor, typeDescFromBuiltinName("isize").?);
     try std.testing.expectEqual(type_descriptor_mod.usize_descriptor, typeDescFromBuiltinName("usize").?);

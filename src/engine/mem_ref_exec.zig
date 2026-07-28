@@ -102,10 +102,14 @@ pub const Methods = struct {
             const obj_ptr: ?*anyopaque = @ptrCast(@alignCast(@as(*?*anyopaque, @ptrCast(@alignCast(src))).*));
             if (obj_ptr) |p| {
                 const addr = @intFromPtr(p);
-                if (addr >= 0x1000 and addr % @alignOf(value.obj_header.ObjHeader) == 0) {
-                    const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(p));
-                    if (header.isValidHeapObj()) {
-                        _ = value.obj_header.retain(header, self.tctx.?);
+                // 过滤内核空间地址（高位置 1，含负 i64 符号扩展），防止标量位模式误判为堆指针
+                if (addr >= 0x1000 and addr < 0x8000000000000000 and addr % @alignOf(value.obj_header.ObjHeader) == 0) {
+                    // 使用 msync 安全检查页面是否映射，避免对标量位模式调用 isValidHeapObj 导致段错误
+                    if (ir_mod.type_descriptor_mod.isReadable(addr)) {
+                        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(p));
+                        if (header.isValidHeapObj()) {
+                            _ = value.obj_header.retain(header, self.tctx.?);
+                        }
                     }
                 }
             }

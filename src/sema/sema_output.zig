@@ -238,6 +238,8 @@ pub const SemaResult = struct {
     monomorph_index: std.StringHashMap(u32),
     // v3 新增：全局 TypeDescriptor 表
     type_descriptors: std.ArrayList(TypeDescriptor) = .empty,
+    // 废除 ref_chan：动态类型描述符池，为每个用户类型创建具体引用描述符
+    type_desc_pool: type_descriptor_mod.TypeDescriptorPool = undefined,
     // v3 新增：调用点 → 实例映射
     call_instantiations: std.AutoHashMap(u64, u32),
     // v3 新增：字段访问/方法分派元信息
@@ -274,6 +276,7 @@ pub const SemaResult = struct {
             .reflect_metas = std.AutoHashMap(u64, ReflectMeta).init(allocator),
             .resolved_type_descs = std.AutoHashMap(u64, *const TypeDescriptor).init(allocator),
             .field_id_map = std.StringHashMap(u16).init(allocator),
+            .type_desc_pool = type_descriptor_mod.TypeDescriptorPool.init(allocator),
         };
     }
 
@@ -298,6 +301,7 @@ pub const SemaResult = struct {
         self.monomorph_instances.deinit(self.allocator);
         self.monomorph_index.deinit();
         self.type_descriptors.deinit(self.allocator);
+        self.type_desc_pool.deinit();
         self.call_instantiations.deinit();
         self.field_accesses.deinit();
         self.method_dispatches.deinit();
@@ -316,6 +320,16 @@ pub const SemaResult = struct {
         }
     }
 
+    /// 将 type_desc_pool 所有权转移给调用方（IRBuilder.build 成功后调用）。
+    /// 转移后 sema_result 持有一个新的空 pool，deinit 不会释放已转移的描述符。
+    /// GlueIR.channels 中的 type_desc 指针引用此 pool 分配的内存，
+    /// 因此 pool 必须与 GlueIR 同生命周期。
+    pub fn takeTypeDescPool(self: *SemaResult) type_descriptor_mod.TypeDescriptorPool {
+        const pool = self.type_desc_pool;
+        self.type_desc_pool = type_descriptor_mod.TypeDescriptorPool.init(self.allocator);
+        return pool;
+    }
+
     /// 记录表达式类型
     pub fn putExpr(self: *SemaResult, expr_id: u64, info: ExprInfo) !void {
         try self.expr_types.put(expr_id, info);
@@ -324,6 +338,14 @@ pub const SemaResult = struct {
     /// 查询表达式类型
     pub fn getExpr(self: *const SemaResult, expr_id: u64) ?ExprInfo {
         return self.expr_types.get(expr_id);
+    }
+
+    /// 获取或创建具名引用类型描述符（废除 ref_chan：每个类型有独立 type_id/type_name）
+    /// str → str_descriptor (type_id=19)；用户类型 → 动态分配 (type_id=20+)
+    pub fn getOrCreateRefDesc(self: *SemaResult, name: []const u8) !*const TypeDescriptor {
+        // str 使用静态描述符（type_id=19）
+        if (std.mem.eql(u8, name, "str")) return type_descriptor_mod.str_descriptor;
+        return self.type_desc_pool.getOrCreateRefDesc(name);
     }
 
     /// 注册 import 别名（检测重复）

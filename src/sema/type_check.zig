@@ -50,15 +50,16 @@ const TypeDefKind = sema_output.TypeDefKind;
 
 /// 将 sema 内部 Type 表示转换为 *const TypeDescriptor（统一类型描述符）。
 /// 委托 type_resolver.fromConcreteType，返回 null 表示无法确定类型。
-fn semaTypeToTypeDesc(ty: *Type) ?*const type_descriptor.TypeDescriptor {
-    return type_resolver.fromConcreteType(ty.*);
+/// 无回退实现：命名用户类型通过 getOrCreateRefDesc 创建具名描述符。
+fn semaTypeToTypeDesc(ty: *Type, sema_result: *SemaResult) ?*const type_descriptor.TypeDescriptor {
+    return type_resolver.fromConcreteType(ty.*, sema_result);
 }
 
 /// 批量将 Type 列表转换为 *const TypeDescriptor 列表，无法确定的类型回退为 ref descriptor。
-fn typesToTypeDescs(allocator: std.mem.Allocator, types: []const *Type) ![]const *const type_descriptor.TypeDescriptor {
+fn typesToTypeDescs(allocator: std.mem.Allocator, types: []const *Type, sema_result: *SemaResult) ![]const *const type_descriptor.TypeDescriptor {
     const result = try allocator.alloc(*const type_descriptor.TypeDescriptor, types.len);
     for (types, 0..) |t, i| {
-        result[i] = semaTypeToTypeDesc(t) orelse &type_resolver.ref_type_descriptor;
+        result[i] = semaTypeToTypeDesc(t, sema_result) orelse &type_resolver.ref_type_descriptor;
     }
     return result;
 }
@@ -1359,9 +1360,9 @@ pub const TypeInferencer = struct {
             .fn_type => |ft| {
                 const param_type_descs = self.arena.allocator().alloc(*const type_descriptor.TypeDescriptor, ft.params.len) catch return null;
                 for (ft.params, 0..) |p, i| {
-                    param_type_descs[i] = semaTypeToTypeDesc(p) orelse &type_resolver.ref_type_descriptor;
+                    param_type_descs[i] = semaTypeToTypeDesc(p, self.sema_result.?) orelse &type_resolver.ref_type_descriptor;
                 }
-                const return_type_desc = semaTypeToTypeDesc(ft.return_type) orelse &type_resolver.ref_type_descriptor;
+                const return_type_desc = semaTypeToTypeDesc(ft.return_type, self.sema_result.?) orelse &type_resolver.ref_type_descriptor;
                 return .{
                     .param_type_descs = param_type_descs,
                     .return_type_desc = return_type_desc,
@@ -1378,11 +1379,17 @@ pub const TypeInferencer = struct {
     pub fn inferExpr(self: *TypeInferencer, expr: *const ast.Expr, env: *TypeEnv, expected: ?*Type) SemaError!*Type {
         const ty = try self.inferExprInner(expr, env, expected);
         if (self.sema_result) |sr| {
-            if (semaTypeToTypeDesc(ty)) |td| {
-                const type_name: ?[]const u8 = typeNameOfType(ty);
+            if (semaTypeToTypeDesc(ty, sr)) |td| {
+                const type_name: ?[]const u8 = blk: {
+                    if (ty.* == .array_type) {
+                        const elem_name = typeNameOfType(ty.array_type.element_type) orelse break :blk null;
+                        break :blk std.fmt.allocPrint(self.arena.allocator(), "{s}[]", .{elem_name}) catch null;
+                    }
+                    break :blk typeNameOfType(ty);
+                };
                 var inner_td: ?*const type_descriptor.TypeDescriptor = null;
                 if (ty.* == .nullable_type) {
-                    inner_td = semaTypeToTypeDesc(ty.nullable_type);
+                    inner_td = semaTypeToTypeDesc(ty.nullable_type, sr);
                 }
                 const is_ref = switch (ty.*) {
                     .ref_type => true,
@@ -1978,6 +1985,14 @@ pub const TypeInferencer = struct {
                     self.addErrorAt(.type_mismatch, fa_loc.line, fa_loc.column, "cannot access field '{s}' on nullable type; use '?.', '!', or narrow with 'if x != null' first", .{fa.field});
                     return self.freshTypeVar() catch unreachable;
                 }
+                // 内建反射类型（TypeInfo/LayoutInfo/TraitImplInfo 等）的字段访问
+                // 这些类型由 typeof() 返回或在运行时构造为 RecordValue，并非用户定义的 ADT，
+                // 因此不进入 adt_types 表；此处为链式字段访问提供类型名，使 IR 层
+                // inferTypeNameFromExpr 能解析出 "LayoutInfo"/"TraitImplInfo" 等名称，
+                // 进而 lookupFieldId 能查到已注册的 field_id。
+                if (typeNameOfType(eff_resolved)) |tn| {
+                    if (self.inferBuiltinReflectField(tn, fa.field)) |ft| return ft;
+                }
                 switch (eff_resolved.*) {
                     .record_type => |rt| {
                         for (rt.fields) |field| {
@@ -2116,7 +2131,13 @@ pub const TypeInferencer = struct {
                     else => return self.freshTypeVar() catch unreachable,
                 }
             },
-            .string_interpolation => {
+            .string_interpolation => |si| {
+                // 递归推断插值表达式的类型，使 ExprInfo 被记录到 sema_result
+                for (si.parts) |part| {
+                    if (part == .expression) {
+                        _ = try self.inferExpr(part.expression, env, null);
+                    }
+                }
                 return self.makeType(.str_type);
             },
             .type_cast => |tc| {
@@ -3299,7 +3320,7 @@ pub const TypeInferencer = struct {
             },
         }
     }
-    fn registerBuiltins(self: *TypeInferencer, env: *TypeEnv) void {
+    pub fn registerBuiltins(self: *TypeInferencer, env: *TypeEnv) void {
         {
             const params = self.arena.allocator().alloc(*Type, 1) catch return;
             params[0] = self.makeType(.str_type) catch return;
@@ -4023,6 +4044,63 @@ pub const TypeInferencer = struct {
         self.addErrorAt(.type_mismatch, loc.line, loc.column, "typeof: unknown type '{s}'", .{type_name});
         return self.makeType(.unit_type) catch error.OutOfMemory;
     }
+
+    /// 内建反射类型的字段类型推断。
+    /// TypeInfo / LayoutInfo / TraitImplInfo 等由 typeof() 返回或运行时构造的 RecordValue，
+    /// 并非用户定义类型，不进入 adt_types 表。此处为链式字段访问提供带正确 type_name 的类型，
+    /// 使 IR 层 inferTypeNameFromExpr 能解析出字段所属类型名，进而 lookupFieldId 成功。
+    /// 字段顺序与 IRBuilder.registerTypeInfoFields / engine.execBuiltinTypeof 一致。
+    fn inferBuiltinReflectField(self: *TypeInferencer, type_name: []const u8, field: []const u8) ?*Type {
+        // TypeInfo 顶层 7 字段
+        if (std.mem.eql(u8, type_name, "TypeInfo")) {
+            if (std.mem.eql(u8, field, "name") or
+                std.mem.eql(u8, field, "module") or
+                std.mem.eql(u8, field, "kind"))
+            {
+                return self.makeType(.str_type) catch null;
+            }
+            if (std.mem.eql(u8, field, "layout")) {
+                return self.makeAdtType("LayoutInfo", &[_]*Type{}) catch null;
+            }
+            if (std.mem.eql(u8, field, "impls")) {
+                return self.makeAdtType("TraitImplInfo", &[_]*Type{}) catch null;
+            }
+            if (std.mem.eql(u8, field, "structure")) {
+                return self.makeAdtType("TypeStructure", &[_]*Type{}) catch null;
+            }
+            if (std.mem.eql(u8, field, "type_params")) {
+                const elem = self.makeAdtType("TypeParamMeta", &[_]*Type{}) catch return null;
+                return self.makeArrayType(elem, null) catch null;
+            }
+            return null;
+        }
+        // LayoutInfo: (size: u32, alignment: u32)
+        if (std.mem.eql(u8, type_name, "LayoutInfo")) {
+            if (std.mem.eql(u8, field, "size") or std.mem.eql(u8, field, "alignment")) {
+                return self.makeType(.u32_type) catch null;
+            }
+            return null;
+        }
+        // TraitImplInfo: (parent_traits, implemented_traits, methods, associated_types) 均为数组
+        if (std.mem.eql(u8, type_name, "TraitImplInfo")) {
+            if (std.mem.eql(u8, field, "methods")) {
+                const elem = self.makeAdtType("MethodMeta", &[_]*Type{}) catch return null;
+                return self.makeArrayType(elem, null) catch null;
+            }
+            if (std.mem.eql(u8, field, "associated_types")) {
+                const elem = self.makeAdtType("AssociatedTypeMeta", &[_]*Type{}) catch return null;
+                return self.makeArrayType(elem, null) catch null;
+            }
+            if (std.mem.eql(u8, field, "parent_traits") or
+                std.mem.eql(u8, field, "implemented_traits"))
+            {
+                const elem = self.makeAdtType("TraitMeta", &[_]*Type{}) catch return null;
+                return self.makeArrayType(elem, null) catch null;
+            }
+            return null;
+        }
+        return null;
+    }
     fn unwrapAtomic(self: *TypeInferencer, ty: *Type) *Type {
         const resolved = self.resolve(ty);
         if (resolved.* == .generic_type) {
@@ -4042,7 +4120,7 @@ pub const TypeInferencer = struct {
         for (info.constructor_names, 0..) |ctor_name, i| {
             const field_types: []const *Type = if (i < info.ctor_field_types.len) info.ctor_field_types[i] else &[_]*Type{};
             const field_names: []const ?[]const u8 = if (i < info.ctor_field_names.len) info.ctor_field_names[i] else &[_]?[]const u8{};
-            const field_type_descs = try typesToTypeDescs(self.arena.allocator(), field_types);
+            const field_type_descs = try typesToTypeDescs(self.arena.allocator(), field_types, self.sema_result.?);
             const field_type_names = try typeNamesOfTypes(self.arena.allocator(), field_types);
             const return_type_name: ?[]const u8 = if (i < info.ctor_return_types.len)
                 (if (info.ctor_return_types[i]) |rt| typeNameOfType(self.resolve(rt)) else null)
@@ -4083,7 +4161,7 @@ pub const TypeInferencer = struct {
                 const resolved = self.resolve(scheme);
                 if (resolved.* == .fn_type) {
                     const param_count: u8 = @intCast(resolved.fn_type.params.len);
-                    const return_td = semaTypeToTypeDesc(resolved.fn_type.return_type) orelse &type_resolver.ref_type_descriptor;
+                    const return_td = semaTypeToTypeDesc(resolved.fn_type.return_type, self.sema_result.?) orelse &type_resolver.ref_type_descriptor;
                     methods[i] = .{
                         .name = mname,
                         .param_count = param_count,
@@ -4137,12 +4215,12 @@ pub const TypeInferencer = struct {
         const param_type_names = try self.arena.allocator().alloc(?[]const u8, ft.params.len);
         for (ft.params, 0..) |p, i| {
             const presolved = self.resolve(p);
-            param_type_descs[i] = semaTypeToTypeDesc(presolved) orelse &type_resolver.ref_type_descriptor;
+            param_type_descs[i] = semaTypeToTypeDesc(presolved, self.sema_result.?) orelse &type_resolver.ref_type_descriptor;
             param_is_ref[i] = (presolved.* == .ref_type);
             param_type_names[i] = typeNameOfType(presolved);
         }
         const return_resolved = self.resolve(ft.return_type);
-        const return_type_desc = semaTypeToTypeDesc(return_resolved) orelse &type_resolver.ref_type_descriptor;
+        const return_type_desc = semaTypeToTypeDesc(return_resolved, self.sema_result.?) orelse &type_resolver.ref_type_descriptor;
         const return_is_ref = (return_resolved.* == .ref_type);
         const tp_names = try self.arena.allocator().alloc([]const u8, ast_type_params.len);
         for (ast_type_params, 0..) |tp, i| tp_names[i] = tp.name;
@@ -4481,7 +4559,7 @@ pub const TypeInferencer = struct {
                                 .type_param_names = type_param_names,
                             }) catch return;
                             if (self.sema_result) |sr| {
-                                const field_type_descs = typesToTypeDescs(self.arena.allocator(), param_types) catch return;
+                                const field_type_descs = typesToTypeDescs(self.arena.allocator(), param_types, sr) catch return;
                                 const field_type_names = typeNamesOfTypes(self.arena.allocator(), param_types) catch return;
                                 const field_name_list = self.arena.allocator().alloc(?[]const u8, fields.len) catch return;
                                 for (fields, 0..) |f, i| field_name_list[i] = f.name;
@@ -4545,7 +4623,7 @@ pub const TypeInferencer = struct {
                                     .constructors = &[_]CtorDefInfo{},
                                     .type_params = owned_type_param_names,
                                     .target_type_name = typeNameOfType(resolved_target),
-                                    .target_type_desc = semaTypeToTypeDesc(resolved_target),
+                                    .target_type_desc = semaTypeToTypeDesc(resolved_target, sr),
                                 }) catch {};
                             }
                         }

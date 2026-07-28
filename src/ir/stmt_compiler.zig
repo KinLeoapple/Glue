@@ -82,7 +82,7 @@ pub const Methods = struct {
                             const value_meta = self.channels.get(chan);
                             if (value_meta.type_desc.is_null_type) {
                                 // null_literal → 分配 nullable 通道，nullable_make 会写入 null flag
-                                const inner_ct = self.chanTypeFromTypeNodeBound(tn.nullable.inner) orelse type_descriptor_mod.ref_descriptor;
+                                const inner_ct = self.chanTypeFromTypeNodeBound(tn.nullable.inner) orelse self.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
                                 const nc = try self.channels.allocNullable(inner_ct);
                                 try self.emit(Node.makeUnary(.nullable_make, nc, 0, chan));
                                 chan = nc;
@@ -151,7 +151,7 @@ pub const Methods = struct {
                 if (vd.type_annotation) |tn| {
                     if (tn.* == .nullable) {
                         if (value_meta.type_desc.is_null_type) {
-                            const inner_ct = self.chanTypeFromTypeNodeBound(tn.nullable.inner) orelse type_descriptor_mod.ref_descriptor;
+                            const inner_ct = self.chanTypeFromTypeNodeBound(tn.nullable.inner) orelse self.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
                             const nc = try self.channels.allocNullable(inner_ct);
                             try self.emit(Node.makeUnary(.nullable_make, nc, 0, value_chan));
                             value_chan = nc;

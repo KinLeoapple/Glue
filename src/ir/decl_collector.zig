@@ -13,7 +13,7 @@ const channel_mod = @import("channel.zig");
 const type_descriptor_mod = @import("type_descriptor.zig");
 const builder_mod = @import("builder.zig");
 const sema_output_mod = @import("sema").sema_output;
-const builtin_type_names = @import("builtin_type_names.zig");
+const sema_type_resolver = @import("sema").type_resolver;
 
 const IRBuilder = builder_mod.IRBuilder;
 const BuildError = builder_mod.BuildError;
@@ -233,7 +233,7 @@ pub const Methods = struct {
             if (method.body == null) continue; // trait 声明中的方法无体，跳过
             const mangled = try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ td.name, method.name });
             try self.func_table.put(mangled, func_count.*);
-            const placeholder_return_chan = try builder_mod.allocChanFromTypeNode(&self.channels, method.return_type);
+            const placeholder_return_chan = try builder_mod.allocChanFromTypeNode(&self.channels, method.return_type, self.sema_result);
             const placeholder_param_channels = try self.allocParamChannels(method.params, arena_alloc);
             try self.functions.append(arena_alloc, .{
                 .name = mangled,
@@ -256,7 +256,7 @@ pub const Methods = struct {
                 const mangled = try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ td.name, tm.name });
                 if (self.func_table.contains(mangled)) continue; // 已被 type 覆盖
                 try self.func_table.put(mangled, func_count.*);
-                const placeholder_return_chan = try builder_mod.allocChanFromTypeNode(&self.channels, tm.return_type);
+                const placeholder_return_chan = try builder_mod.allocChanFromTypeNode(&self.channels, tm.return_type, self.sema_result);
                 const placeholder_param_channels = try self.allocParamChannels(tm.params, arena_alloc);
                 try self.functions.append(arena_alloc, .{
                     .name = mangled,
@@ -317,20 +317,14 @@ pub const Methods = struct {
     }
 
     /// 从类型名字符串推导 TypeDescriptor（用于 builtin 类型注册）
-    pub fn chanTypeFromTypeName(type_name: []const u8) *const TypeDescriptor {
-        // 内置标量 + str/unit → TypeDescriptor
-        if (builtin_type_names.typeDescFromBuiltinName(type_name)) |td| return td;
-        // nullable 类型 "T?" → 返回内部类型的 TypeDescriptor
-        if (type_name.len > 1 and type_name[type_name.len - 1] == '?') {
-            return chanTypeFromTypeName(type_name[0 .. type_name.len - 1]);
-        }
-        // 用户自定义类型（ADT/record/newtype）→ ref
-        return type_descriptor_mod.ref_descriptor;
+    /// 无回退实现：委托 sema/type_resolver.chanTypeFromTypeName（单一权威来源）
+    pub fn chanTypeFromTypeName(self: *IRBuilder, type_name: []const u8) *const TypeDescriptor {
+        return sema_type_resolver.chanTypeFromTypeName(type_name, self.sema_result);
     }
 
     /// 从类型名字符串推导 TypeDescriptor（chanTypeFromTypeName 的别名）
-    pub fn typeDescFromTypeName(type_name: []const u8) *const TypeDescriptor {
-        return chanTypeFromTypeName(type_name);
+    pub fn typeDescFromTypeName(self: *IRBuilder, type_name: []const u8) *const TypeDescriptor {
+        return self.chanTypeFromTypeName(type_name);
     }
 
     /// 从 sema_result 查找构造器的 return_type TypeNode（GADT 专用）
@@ -513,7 +507,7 @@ pub const Methods = struct {
                         for (bt.fields, 0..) |f, fi| {
                             const fname = try std.fmt.allocPrint(arena_alloc, "_{d}", .{fi});
                             field_names[fi] = fname;
-                            field_type_descs[fi] = chanTypeFromTypeName(f.type_name);
+                            field_type_descs[fi] = self.chanTypeFromTypeName(f.type_name);
                             field_type_names[fi] = f.type_name;
                             // 位置别名 field_id = fi + 1（与 error_newtype 一致，0 是 __tag）
                             self.registerFieldId(bt.name, fname, @intCast(fi + 1));

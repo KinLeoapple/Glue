@@ -147,6 +147,13 @@ pub const LinearRecurrenceInfo = struct {
 // TypeBinding/BoundType 已删除：sema 侧 inference.zig 的 TypeBindingContext 是唯一权威来源
 // IR 侧不再维护独立类型绑定栈，current_type_args 直接引用 sema instance.type_args
 
+/// 延迟实例化请求：泛型函数调用时不内联编译，而是排队延迟处理
+const DeferredInstantiation = struct {
+    func_name: []const u8,
+    instance_id: u32,
+    func_idx: u16,
+};
+
 /// IR 构建器：从 AST 构建 GlueIR
 pub const IRBuilder = struct {
     allocator: std.mem.Allocator,
@@ -212,10 +219,11 @@ pub const IRBuilder = struct {
     current_func_type_params: ?[]const ast.TypeParam = null,
     /// 当前 trait default 方法中的 Self 类型名（用于 typeof(Self) 解析）
     current_self_type_name: ?[]const u8 = null,
-    /// 当前正在编译的 sema 单态化实例（null = 顶层非泛型函数）
-    /// 由 instantiateFunction 设置，chanTypeFromTypeNodeBound 等查询此实例的 type_args
-    current_instance: ?*const sema_output_mod.MonomorphInstance = null,
-    /// 当前实例的类型实参（= current_instance.type_args，空切片 = 非泛型上下文）
+    /// 当前正在编译的 sema 单态化实例 ID（null = 顶层非泛型函数）
+    /// 存储 instance_id 而非指针，因为 monomorph_instances ArrayList 可能在递归
+    /// 编译过程中扩容并移动，指针会悬垂。通过 ID 每次从 items 查询始终有效。
+    current_instance_id: ?u32 = null,
+    /// 当前实例的类型实参（空切片 = 非泛型上下文）
     /// 直接引用避免重复解引用；chanTypeFromTypeNodeBound 委托 sema type_resolver 时传入
     current_type_args: []const type_descriptor_mod.TypeDescriptor = &.{},
     /// sema MonomorphInstance.instance_id → IR func_table 索引
@@ -223,7 +231,13 @@ pub const IRBuilder = struct {
     instance_func_map: std.AutoHashMap(u32, u16),
     /// 正在编译的实例（递归循环检测，替代原 monomorph_in_progress）
     /// key = sema instance_id，value = 预占的 func_idx
+    /// 同时用于标记"已排队等待延迟编译"的实例，避免同一实例被重复排队
     instances_in_progress: std.AutoHashMap(u32, u16),
+    /// 延迟实例化队列：instantiateFunction 不再内联编译函数体，
+    /// 而是将实例化请求排队，在所有顶层函数编译完成后统一处理。
+    /// 这避免了被实例化函数的体节点与调用者函数的体节点交错，
+    /// 导致调用者 node_range 错误包含被实例化函数的节点。
+    deferred_instantiations: std.ArrayList(DeferredInstantiation) = .empty,
     /// 当前模式绑定的类型提示（从构造器字段类型继承）
     pattern_type_hint: ?*ast.TypeNode = null,
     /// 当前 match 的 scrutinee AST 表达式（用于 variable pattern 绑定时推断类型名）
@@ -422,9 +436,10 @@ pub const IRBuilder = struct {
         for (self.gadt_binding_stack.items) |*m| m.deinit();
         self.gadt_binding_stack.deinit(self.allocator);
         self.pre_declared_lambda_names.deinit(self.allocator);
-        // current_instance/current_type_args 不拥有资源（指向 sema_result），无需 deinit
+        // current_instance_id/current_type_args 不拥有资源（指向 sema_result），无需 deinit
         self.instance_func_map.deinit();
         self.instances_in_progress.deinit();
+        self.deferred_instantiations.deinit(self.allocator);
         if (self.arena_owned) {
             // type_metadata_entries/type_name_to_id/pending_alias_targets 用 arena 分配
             // 由 arena.deinit() 统一释放，无需单独 deinit
@@ -469,7 +484,7 @@ pub const IRBuilder = struct {
                     // 预分配占位 Function：返回通道暂为 0，编译时更新
                     // 预分配 param_channels：参数通道类型从 AST 类型注解推导，
                     // 使函数 A 调用尚未编译的函数 B 时可正确访问 B.param_channels
-                    const placeholder_return_chan = try allocChanFromTypeNode(&self.channels, fd.return_type);
+                    const placeholder_return_chan = try allocChanFromTypeNode(&self.channels, fd.return_type, self.sema_result);
                     const placeholder_param_channels = try self.allocParamChannels(fd.params, arena_alloc);
                     try self.functions.append(arena_alloc, .{
                         .name = fd.name,
@@ -519,7 +534,7 @@ pub const IRBuilder = struct {
                                 const chan_type = if (vd.type_annotation) |tn|
                                     self.chanTypeFromTypeNodeResolved(tn) orelse type_descriptor_mod.i64_descriptor
                                 else
-                                    self.inferChanTypeFromExpr(vd.value) orelse type_descriptor_mod.ref_descriptor;
+                                    self.inferChanTypeFromExpr(vd.value) orelse self.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
                                 const chan = try self.allocChannel(chan_type);
                                 // 保留 type_annotation：使 inferTypeNameFromExpr 可通过
                                 // binding.type_annotation 推断全局 val 的类型（如 UNIX_EPOCH: SystemTime）
@@ -530,7 +545,7 @@ pub const IRBuilder = struct {
                                 const chan_type = if (vd.type_annotation) |tn|
                                     self.chanTypeFromTypeNodeResolved(tn) orelse type_descriptor_mod.i64_descriptor
                                 else
-                                    self.inferChanTypeFromExpr(vd.value) orelse type_descriptor_mod.ref_descriptor;
+                                    self.inferChanTypeFromExpr(vd.value) orelse self.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
                                 const cell_chan = try self.allocCellChannel(chan_type);
                                 try self.scopeVarTyped(vd.name, cell_chan, true, null, vd.type_annotation);
                                 has_global_init = true;
@@ -631,6 +646,11 @@ pub const IRBuilder = struct {
             }
         }
 
+        // 第三遍：处理延迟实例化队列（泛型函数单态化体编译）
+        // 在所有顶层函数编译完成后统一处理，避免被实例化函数的体节点
+        // 与调用者函数的体节点交错导致 node_range 错误。
+        try self.processDeferredInstantiations();
+
         // 释放全局作用域
         self.popScope();
 
@@ -653,6 +673,9 @@ pub const IRBuilder = struct {
             .name_to_id = std.StringHashMap(u16).init(self.allocator),
         };
         try type_metadata_table.initNameMap(self.allocator);
+        // type_desc_pool 所有权转移：channels.type_desc 指针引用此 pool 分配的内存，
+        // pool 必须与 GlueIR 同生命周期，否则 sema_result.deinit() 会释放悬垂指针
+        const type_desc_pool = self.sema_result.takeTypeDescPool();
         return GlueIR{
             .nodes = try self.nodes.toOwnedSlice(arena_alloc),
             .scalar_metas = try self.scalar_metas.toOwnedSlice(arena_alloc),
@@ -676,6 +699,7 @@ pub const IRBuilder = struct {
             .arena = self.arena,
             .backing = self.allocator,
             .type_metadata_table = type_metadata_table,
+            .type_desc_pool = type_desc_pool,
         };
     }
 
@@ -1344,6 +1368,9 @@ pub const IRBuilder = struct {
     /// 从 sema call_instantiations 查询调用点的 type_args（消费 sema 产出）
     pub const typeArgsFromCallExpr = @import("expr_compiler.zig").Methods.typeArgsFromCallExpr;
 
+    /// 从当前单态化实例提取 type_args（直接递归调用使用）
+    pub const typeArgsFromCurrentInstance = @import("expr_compiler.zig").Methods.typeArgsFromCurrentInstance;
+
     /// 从参数类型注解匹配类型参数名，并从实参提取对应的 type_id
     /// 例如：参数注解 T，实参 typeof(Point) → name_to_typeid["T"] = Point 的 type_id
     ///
@@ -1426,7 +1453,7 @@ pub const IRBuilder = struct {
     /// 从栈顶向下查找类型参数绑定，找到则返回具体类型，否则用 chanTypeFromTypeNode
     pub const resolveFieldTypeWithBindings = @import("expr_compiler.zig").Methods.resolveFieldTypeWithBindings;
 
-    /// 从 AST 类型节点 + 泛型绑定映射推导通道类型（统一路径：委托 sema/type_resolver.resolveTypeNode）
+    /// 从 AST 类型节点 + 泛型绑定映射推导通道类型（统一路径：委托 sema/type_resolver.resolveTypeNodeConcrete）
     pub const chanTypeWithTypeNode = @import("expr_compiler.zig").Methods.chanTypeWithTypeNode;
 
     /// 推断泛型函数调用的返回通道类型
@@ -1583,7 +1610,7 @@ pub const IRBuilder = struct {
     /// 支持 method_call（如 s.bytes() → u8_chan）、identifier（从 var 类型推断）、array_literal
     /// v3 阶段 3：委托到 sema.inference.inferArrayElemType
     pub fn inferArrayElemType(self: *IRBuilder, expr: *const ast.Expr) *const type_descriptor_mod.TypeDescriptor {
-        var ctx = self.inferContext() orelse return sema.inference.inferArrayLiteralElemType(expr);
+        var ctx = self.inferContext() orelse return sema.inference.inferArrayLiteralElemType(expr, self.sema_result);
         var ext = self.inferContextExt(&ctx);
         return sema.inference.inferArrayElemType(&ext, expr);
     }
@@ -1642,6 +1669,13 @@ pub const IRBuilder = struct {
     /// 仅查 sema_result：若 sema 记录了表达式的 type_name，直接返回。
     /// v3 阶段 3：委托到 sema.inference.inferTypeNameFromExprComplete
     pub fn inferTypeNameFromExpr(self: *IRBuilder, expr: *const ast.Expr) ?[]const u8 {
+        // trait default 方法中的 self 参数：类型为 current_self_type_name（实现 trait 的类型）
+        // trait 方法声明的 self 无类型标注，需在此补全以支持 self.method() 分派
+        if (expr.* == .identifier and self.current_self_type_name != null) {
+            if (std.mem.eql(u8, expr.identifier.name, "self")) {
+                return self.current_self_type_name;
+            }
+        }
         var ctx = self.inferContext() orelse return null;
         var ext = self.inferContextExt(&ctx);
         return sema.inference.inferTypeNameFromExprComplete(&ext, expr);
@@ -1835,6 +1869,7 @@ pub const IRBuilder = struct {
     ///
     /// 非泛型函数（type_params.len == 0）直接返回原 func_table 索引，不做单态化。
     pub const instantiateFunction = @import("func_compiler.zig").Methods.instantiateFunction;
+    pub const processDeferredInstantiations = @import("func_compiler.zig").Methods.processDeferredInstantiations;
 };
 
 // ════════════════════════════════════════════════════════════════

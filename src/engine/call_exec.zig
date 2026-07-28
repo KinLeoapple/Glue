@@ -103,6 +103,9 @@ pub const Methods = struct {
         const dst_is_ref = self.runtime.isRef(dst_chan);
         const src_is_nullable = self.runtime.isNullable(arg_chan);
         const dst_is_nullable = self.runtime.isNullable(dst_chan);
+        if (src_is_ref and dst_is_ref) {
+            _ = self.runtime.readPtr(arg_chan);
+        }
 
         // ref_chan → 标量通道：可能是 Lazy<T> 强制求值或标量值解码
         if (src_is_ref and !dst_is_ref and !dst_is_nullable) {
@@ -287,7 +290,9 @@ pub const Methods = struct {
         const call_meta = self.ir.call_metas[node.meta_index - 1];
 
         // 读取 Closure / PartialApplication 值
-        const ptr = self.runtime.readPtr(node.inputs[0]) orelse return error.InvalidChannel;
+        const closure_chan = node.inputs[0];
+        const raw_ptr = self.runtime.readPtr(closure_chan);
+        const ptr = raw_ptr orelse return error.InvalidChannel;
         const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
         const is_partial = header.type_tag == .partial;
         if (header.type_tag != .closure and !is_partial) return error.InvalidChannel;

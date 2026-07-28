@@ -54,6 +54,14 @@ pub const Methods = struct {
             type_id = if (param_idx < type_args.len) type_args[param_idx] else 0;
         }
 
+        // 泛型 ref_chan 中的标量值类型恢复
+        // 标量通过 ref_of 装箱为 Cell，readRef 返回 Value.fromRef(cell_header)。
+        // 反射需解包 Cell 提取内部标量 Value，否则 __scalar_to_str 看到 .ref 而非标量。
+        if (target_value == .ref and target_value.ref.type_tag == .cell) {
+            const cell: *value.Cell = @alignCast(@fieldParentPtr("header", target_value.ref));
+            target_value = cell.inner;
+        }
+
         // type_id 未知时（泛型递归格式化：field_value 返回 freshTypeVar，
         // 编译期无法解析 type_id），从目标 RecordValue 的 type_name 反查 type_id。
         // 这使递归 ADT 格式化能正确获取 kind/构造器名/字段名，无需哨兵传播。

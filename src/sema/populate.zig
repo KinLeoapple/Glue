@@ -53,12 +53,12 @@ fn astFunDeclToFuncSig(
     const param_is_ref = try arena_alloc.alloc(bool, fd.params.len);
     const param_type_names = try arena_alloc.alloc(?[]const u8, fd.params.len);
     for (fd.params, 0..) |p, i| {
-        param_type_descs[i] = type_resolver.resolveTypeNode(p.type_annotation, &.{}) orelse &type_resolver.ref_type_descriptor;
+        param_type_descs[i] = type_resolver.resolveTypeNodeConcrete(p.type_annotation, &.{}, sema_result) orelse sema_result.getOrCreateRefDesc("param") catch unreachable;
         param_is_ref[i] = if (p.type_annotation) |ta| ta.* == .ref_type else false;
         param_type_names[i] = if (p.type_annotation) |tn| typeNameFromTypeNodeConst(tn) else null;
     }
 
-    const return_type_desc = type_resolver.resolveTypeNode(fd.return_type, &.{}) orelse type_descriptor.lookupByScalarKind(.i64);
+    const return_type_desc = type_resolver.resolveTypeNodeConcrete(fd.return_type, &.{}, sema_result) orelse type_descriptor.lookupByScalarKind(.i64);
     const is_throwing = isThrowType(fd.return_type);
 
     try sema_result.putFuncSig(.{
@@ -82,7 +82,7 @@ fn astTraitDeclToTraitDef(
 ) !void {
     const methods = try arena_alloc.alloc(TraitMethodSig, trd.methods.len);
     for (trd.methods, 0..) |m, i| {
-        const return_type_desc = type_resolver.resolveTypeNode(m.return_type, &.{}) orelse type_descriptor.lookupByScalarKind(.i64);
+        const return_type_desc = type_resolver.resolveTypeNodeConcrete(m.return_type, &.{}, sema_result) orelse type_descriptor.lookupByScalarKind(.i64);
         methods[i] = .{
             .name = m.name,
             .param_count = @intCast(m.params.len),
@@ -116,7 +116,7 @@ fn astTypeDeclToTypeDef(
                 const field_type_nodes = try arena_alloc.alloc(?*const ast.TypeNode, cdef.fields.len);
                 for (cdef.fields, 0..) |cf, fi| {
                     field_names[fi] = cf.name;
-                    field_type_descs[fi] = type_resolver.resolveTypeNode(cf.ty, &.{}) orelse &type_resolver.ref_type_descriptor;
+                    field_type_descs[fi] = type_resolver.resolveTypeNodeConcrete(cf.ty, &.{}, sema_result) orelse sema_result.getOrCreateRefDesc("field") catch unreachable;
                     field_type_names[fi] = typeNameFromTypeNodeConst(cf.ty);
                     field_type_nodes[fi] = cf.ty;
                 }
@@ -144,7 +144,7 @@ fn astTypeDeclToTypeDef(
             const field_type_names = try arena_alloc.alloc(?[]const u8, r.fields.len);
             for (r.fields, 0..) |f, fi| {
                 field_names[fi] = f.name;
-                field_type_descs[fi] = type_resolver.resolveTypeNode(f.ty, &.{}) orelse &type_resolver.ref_type_descriptor;
+                field_type_descs[fi] = type_resolver.resolveTypeNodeConcrete(f.ty, &.{}, sema_result) orelse sema_result.getOrCreateRefDesc("field") catch unreachable;
                 field_type_names[fi] = typeNameFromTypeNodeConst(f.ty);
             }
             const ctors = try arena_alloc.alloc(CtorDefInfo, 1);
@@ -169,7 +169,7 @@ fn astTypeDeclToTypeDef(
                 .constructors = &[_]CtorDefInfo{},
                 .type_params = type_params,
                 .target_type_name = typeNameFromTypeNodeConst(a.target),
-                .target_type_desc = type_resolver.resolveTypeNode(a.target, &.{}),
+                .target_type_desc = type_resolver.resolveTypeNodeConcrete(a.target, &.{}, sema_result),
             });
         },
         .newtype => |nt| {
@@ -177,7 +177,7 @@ fn astTypeDeclToTypeDef(
             const field_type_names = try arena_alloc.alloc(?[]const u8, 1);
             const field_names = try arena_alloc.alloc(?[]const u8, 1);
             const field_type_nodes = try arena_alloc.alloc(?*const ast.TypeNode, 1);
-            field_type_descs[0] = type_resolver.resolveTypeNode(nt.inner, &.{}) orelse &type_resolver.ref_type_descriptor;
+            field_type_descs[0] = type_resolver.resolveTypeNodeConcrete(nt.inner, &.{}, sema_result) orelse sema_result.getOrCreateRefDesc("field") catch unreachable;
             field_type_names[0] = typeNameFromTypeNodeConst(nt.inner);
             field_names[0] = "_0";
             field_type_nodes[0] = nt.inner;
@@ -205,7 +205,7 @@ fn astTypeDeclToTypeDef(
             const field_type_nodes = try arena_alloc.alloc(?*const ast.TypeNode, en.params.len);
             for (en.params, 0..) |p, pi| {
                 field_names[pi] = p.name;
-                field_type_descs[pi] = type_resolver.resolveTypeNode(p.type_annotation, &.{}) orelse &type_resolver.ref_type_descriptor;
+                field_type_descs[pi] = type_resolver.resolveTypeNodeConcrete(p.type_annotation, &.{}, sema_result) orelse sema_result.getOrCreateRefDesc("field") catch unreachable;
                 field_type_names[pi] = if (p.type_annotation) |tn| typeNameFromTypeNodeConst(tn) else null;
                 field_type_nodes[pi] = p.type_annotation;
             }

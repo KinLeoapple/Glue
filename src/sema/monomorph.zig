@@ -84,18 +84,22 @@ fn tdFromExprInfo(info: ExprInfo) *const TypeDescriptor {
 }
 
 /// 由 AST 类型节点推导 TypeDescriptor（用于显式 type_args）
-fn tdFromTypeNode(tn: *const ast.TypeNode) *const TypeDescriptor {
-    return type_resolver.resolveTypeNode(tn, &.{}) orelse &type_resolver.ref_type_descriptor;
+/// 使用 resolveTypeNodeConcrete 为用户类型创建具体描述符，不回退
+fn tdFromTypeNode(tn: *const ast.TypeNode, sema_result: *SemaResult) *const TypeDescriptor {
+    return type_resolver.resolveTypeNodeConcrete(tn, &.{}, sema_result) orelse
+        sema_result.getOrCreateRefDesc("unknown") catch unreachable;
 }
 
 /// 推导泛型调用的 type_args
 ///
 /// 优先级：
 /// 1. 显式类型实参（call expr 的 type_args 字段，如 foo<i32>(x)）
-/// 2. 隐式推断：参数类型注解中的类型参数名 → 实参 ExprInfo 的 TypeDescriptor
-///    依赖 sema_result.expr_types 已填充的语义信息
+/// 2. 隐式推断：
+///    a. .named 类型注解（如 init: A）→ 实参 ExprInfo 的 TypeDescriptor
+///    b. .function 类型注解（如 f: (A, T) -> A）→ lambda 实参的参数类型注解
+///    c. .function 返回类型注解 → lambda 实参的返回类型（注解或 body 推断）
 ///
-/// 对于无法解析的参数，回退到 ref_type_descriptor（type_id=0）
+/// 未匹配的类型参数用 getOrCreateRefDesc 创建具名描述符
 fn inferTypeArgs(
     func_name: []const u8,
     arguments: []const *const ast.Expr,
@@ -110,17 +114,19 @@ fn inferTypeArgs(
         if (hints.len > 0) {
             const args = try alloc.alloc(TypeDescriptor, hints.len);
             for (hints, 0..) |tn, i| {
-                args[i] = tdFromTypeNode(tn).*;
+                args[i] = tdFromTypeNode(tn, ctx.sema_result).*;
             }
             return args;
         }
     }
 
-    // 2. 隐式推断：匹配参数类型注解（类型参数名）与实参 ExprInfo
+    // 2. 隐式推断
     const fd_decl = ctx.func_decls.get(func_name) orelse {
-        // AST 不可达（可能是方法或内建函数）：返回全 ref_chan 占位
+        // AST 不可达（可能是方法或内建函数）：为每个类型参数创建具名描述符
         const args = try alloc.alloc(TypeDescriptor, sig.type_params.len);
-        for (args) |*a| a.* = type_resolver.ref_type_descriptor;
+        for (sig.type_params, 0..) |tp_name, i| {
+            args[i] = (ctx.sema_result.getOrCreateRefDesc(tp_name) catch unreachable).*;
+        }
         return args;
     };
     std.debug.assert(fd_decl.* == .fun_decl);
@@ -129,37 +135,127 @@ fn inferTypeArgs(
     var name_to_td = std.StringHashMap(*const TypeDescriptor).init(alloc);
     defer name_to_td.deinit();
 
-    // 遍历参数 × 实参，将类型参数名绑定到实参的 TypeDescriptor
+    // 辅助：检查 name 是否为类型参数
+    const isTypeParam = struct {
+        fn check(name: []const u8, params: []const []const u8) bool {
+            for (params) |tp| {
+                if (std.mem.eql(u8, tp, name)) return true;
+            }
+            return false;
+        }
+    }.check;
+
     const param_count = @min(fd.params.len, arguments.len);
+
+    // Pass 1: 匹配 .named 类型注解（如 init: A → 实参类型）
     for (0..param_count) |i| {
         const param_type = fd.params[i].type_annotation orelse continue;
         if (param_type.* != .named) continue;
         const pname = param_type.named.name;
-
-        // 确认 pname 是类型参数（避免误匹配 i32 等具体类型）
-        var is_type_param = false;
-        for (sig.type_params) |tp_name| {
-            if (std.mem.eql(u8, tp_name, pname)) {
-                is_type_param = true;
-                break;
-            }
-        }
-        if (!is_type_param) continue;
+        if (!isTypeParam(pname, sig.type_params)) continue;
         if (name_to_td.contains(pname)) continue;
 
-        // 从 sema_result.expr_types 查实参的 ExprInfo
         const arg_key = @intFromPtr(arguments[i]);
         if (ctx.sema_result.getExpr(arg_key)) |info| {
             try name_to_td.put(pname, tdFromExprInfo(info));
         }
     }
 
-    // 按函数定义的 type_params 顺序输出 TypeDescriptor
+    // Pass 2: 匹配 .function 类型注解（如 f: (A, T) -> A）against lambda 实参
+    for (0..param_count) |i| {
+        const param_type = fd.params[i].type_annotation orelse continue;
+        if (param_type.* != .function) continue;
+
+        // 实参必须是 lambda 表达式
+        if (arguments[i].* != .lambda) continue;
+        const lambda = &arguments[i].lambda;
+
+        // 匹配函数类型参数与 lambda 参数
+        const fn_params = param_type.function.params;
+        const lambda_params = lambda.params;
+        const match_count = @min(fn_params.len, lambda_params.len);
+        for (0..match_count) |j| {
+            const fn_ptype = fn_params[j];
+            if (fn_ptype.* != .named) continue;
+            const fp_name = fn_ptype.named.name;
+            if (!isTypeParam(fp_name, sig.type_params)) continue;
+            if (name_to_td.contains(fp_name)) continue;
+
+            // 从 lambda 参数的类型注解获取具体类型
+            if (lambda_params[j].type_annotation) |lt| {
+                if (type_resolver.resolveTypeNodeConcrete(lt, &.{}, ctx.sema_result)) |td| {
+                    try name_to_td.put(fp_name, td);
+                }
+            }
+        }
+
+        // 匹配函数返回类型注解 → lambda 返回类型
+        const fn_ret = param_type.function.return_type;
+        if (fn_ret.* == .named) {
+            const ret_name = fn_ret.named.name;
+            if (isTypeParam(ret_name, sig.type_params) and !name_to_td.contains(ret_name)) {
+                // 优先：lambda 显式返回类型注解
+                if (lambda.return_type) |lrt| {
+                    if (type_resolver.resolveTypeNodeConcrete(lrt, &.{}, ctx.sema_result)) |td| {
+                        try name_to_td.put(ret_name, td);
+                    }
+                } else {
+                    // 回退：从 lambda body 推断返回类型
+                    if (inferLambdaReturnType(lambda, ctx)) |td| {
+                        try name_to_td.put(ret_name, td);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: .generic 类型注解（如 l: Lst<T>）— 提取类型参数名
+    // 目前无法从 ref 通道提取元素类型，仅记录未绑定的类型参数名
+    // 依赖 Pass 1/2 已绑定的类型参数
+    for (0..param_count) |i| {
+        const param_type = fd.params[i].type_annotation orelse continue;
+        if (param_type.* != .generic) continue;
+        for (param_type.generic.args) |arg| {
+            if (arg.* != .named) continue;
+            const arg_name = arg.named.name;
+            if (!isTypeParam(arg_name, sig.type_params)) continue;
+            if (name_to_td.contains(arg_name)) continue;
+            // 无法从实参推断元素类型，跳过（依赖其他 pass 或回退）
+        }
+    }
+
+    // 输出 type_args：type_name 设为类型参数名，使 resolveTypeNode 按名匹配
+    // 未匹配的类型参数：用 getOrCreateRefDesc 创建具名描述符（而非回退到通用 ref_descriptor）
     const args = try alloc.alloc(TypeDescriptor, sig.type_params.len);
     for (sig.type_params, 0..) |tp_name, i| {
-        args[i] = if (name_to_td.get(tp_name)) |td| td.* else type_resolver.ref_type_descriptor;
+        var td = if (name_to_td.get(tp_name)) |t| t.* else (ctx.sema_result.getOrCreateRefDesc(tp_name) catch unreachable).*;
+        td.type_name = tp_name;
+        args[i] = td;
     }
     return args;
+}
+
+/// 从 lambda body 推断返回类型
+/// 优先：显式返回类型注解 → body expression 的 ExprInfo → block trailing_expr 的 ExprInfo
+fn inferLambdaReturnType(lambda: anytype, ctx: *WalkCtx) ?*const TypeDescriptor {
+    if (lambda.return_type) |rt| {
+        return type_resolver.resolveTypeNodeConcrete(rt, &.{}, ctx.sema_result);
+    }
+    switch (lambda.body) {
+        .expression => |body_expr| {
+            const key = @intFromPtr(body_expr);
+            if (ctx.sema_result.getExpr(key)) |info| return info.type_desc;
+        },
+        .block => |block_expr| {
+            if (block_expr.* == .block) {
+                if (block_expr.block.trailing_expr) |trailing| {
+                    const key = @intFromPtr(trailing);
+                    if (ctx.sema_result.getExpr(key)) |info| return info.type_desc;
+                }
+            }
+        },
+    }
+    return null;
 }
 
 /// 查找或创建 MonomorphInstance
@@ -198,7 +294,8 @@ fn getOrCreateInstance(
 
     const instance_id: u32 = @intCast(ctx.sema_result.monomorph_instances.items.len);
 
-    const return_td = type_resolver.resolveTypeNode(fd.return_type, type_args) orelse &type_resolver.ref_type_descriptor;
+    const return_td = type_resolver.resolveTypeNodeConcrete(fd.return_type, type_args, ctx.sema_result) orelse
+        ctx.sema_result.getOrCreateRefDesc("return") catch unreachable;
 
     // 空通道布局（实际布局由 IRBuilder 在编译实例体时计算）
     const empty_layout = ChanLayout{
@@ -536,7 +633,8 @@ pub fn collectMonomorphInstances(
                 if (fd.type_params.len == 0) {
                     const empty_type_args = try sema_result.allocator.alloc(TypeDescriptor, 0);
 
-                    const return_td = type_resolver.resolveTypeNode(fd.return_type, empty_type_args) orelse &type_resolver.ref_type_descriptor;
+                    const return_td = type_resolver.resolveTypeNodeConcrete(fd.return_type, empty_type_args, sema_result) orelse
+                        sema_result.getOrCreateRefDesc("return") catch unreachable;
 
                     const empty_layout = ChanLayout{
                         .local_chan_count = 0,
@@ -679,9 +777,10 @@ fn resolveInstanceBodyTypes(
     // 注册函数参数到变量绑定
     for (fd.params, 0..) |param, i| {
         const td = if (param.type_annotation) |ta|
-            type_resolver.resolveTypeNode(ta, instance.type_args) orelse &type_resolver.ref_type_descriptor
+            type_resolver.resolveTypeNodeConcrete(ta, instance.type_args, ctx.sema_result) orelse
+                ctx.sema_result.getOrCreateRefDesc("param") catch unreachable
         else
-            &type_resolver.ref_type_descriptor;
+            ctx.sema_result.getOrCreateRefDesc("param") catch unreachable;
         _ = i;
         try rctx.defineVar(param.name, td);
     }
@@ -742,46 +841,98 @@ fn inferTypeArgsInBody(
         if (hints.len > 0) {
             const args = try alloc.alloc(TypeDescriptor, hints.len);
             for (hints, 0..) |tn, i| {
-                args[i] = if (type_resolver.resolveTypeNode(tn, ctx.type_args)) |td| td.* else type_resolver.ref_type_descriptor;
+                args[i] = if (type_resolver.resolveTypeNodeConcrete(tn, ctx.type_args, ctx.sema_result)) |td| td.* else (ctx.sema_result.getOrCreateRefDesc("type_arg") catch unreachable).*;
             }
             return args;
         }
     }
 
-    // 2. 隐式推断：匹配参数类型注解中的类型参数名与实参类型
+    // 2. 直接递归：递归调用自身时，type_args 与当前实例一致
+    //    （如 foldl<T,A> 体内的 foldl(t, f(init,x), f) 使用相同 T,A）
+    //    这避免了从 .generic 类型参数（Lst<T>）和非 lambda 实参无法推断 T 的问题
+    if (std.mem.eql(u8, func_name, ctx.instance.func_name)) {
+        const args = try alloc.alloc(TypeDescriptor, ctx.type_args.len);
+        for (ctx.type_args, 0..) |ta, i| args[i] = ta;
+        return args;
+    }
+
+    // 3. 隐式推断
     std.debug.assert(fd_decl.* == .fun_decl);
     const fd = &fd_decl.fun_decl;
 
     var name_to_td = std.StringHashMap(*const TypeDescriptor).init(alloc);
     defer name_to_td.deinit();
 
+    const isTypeParam = struct {
+        fn check(name: []const u8, params: []const []const u8) bool {
+            for (params) |tp| {
+                if (std.mem.eql(u8, tp, name)) return true;
+            }
+            return false;
+        }
+    }.check;
+
     const param_count = @min(fd.params.len, arguments.len);
+
+    // Pass 1: .named 类型注解
     for (0..param_count) |i| {
         const param_type = fd.params[i].type_annotation orelse continue;
         if (param_type.* != .named) continue;
         const pname = param_type.named.name;
-
-        // 确认 pname 是类型参数
-        var is_type_param = false;
-        for (sig.type_params) |tp_name| {
-            if (std.mem.eql(u8, tp_name, pname)) {
-                is_type_param = true;
-                break;
-            }
-        }
-        if (!is_type_param) continue;
+        if (!isTypeParam(pname, sig.type_params)) continue;
         if (name_to_td.contains(pname)) continue;
 
-        // 用 resolveExprType 递归解析实参类型（利用当前实例的 type_args）
         const arg_td = resolveExprType(arguments[i], ctx) orelse continue;
         try name_to_td.put(pname, arg_td);
     }
 
-    _ = func_name;
+    // Pass 2: .function 类型注解 → lambda 实参的参数类型注解
+    for (0..param_count) |i| {
+        const param_type = fd.params[i].type_annotation orelse continue;
+        if (param_type.* != .function) continue;
+
+        if (arguments[i].* != .lambda) continue;
+        const lambda = &arguments[i].lambda;
+
+        const fn_params = param_type.function.params;
+        const lambda_params = lambda.params;
+        const match_count = @min(fn_params.len, lambda_params.len);
+        for (0..match_count) |j| {
+            const fn_ptype = fn_params[j];
+            if (fn_ptype.* != .named) continue;
+            const fp_name = fn_ptype.named.name;
+            if (!isTypeParam(fp_name, sig.type_params)) continue;
+            if (name_to_td.contains(fp_name)) continue;
+
+            if (lambda_params[j].type_annotation) |lt| {
+                if (type_resolver.resolveTypeNodeConcrete(lt, ctx.type_args, ctx.sema_result)) |td| {
+                    try name_to_td.put(fp_name, td);
+                }
+            }
+        }
+
+        // 返回类型注解 → lambda 返回类型
+        const fn_ret = param_type.function.return_type;
+        if (fn_ret.* == .named) {
+            const ret_name = fn_ret.named.name;
+            if (isTypeParam(ret_name, sig.type_params) and !name_to_td.contains(ret_name)) {
+                if (lambda.return_type) |lrt| {
+                    if (type_resolver.resolveTypeNodeConcrete(lrt, ctx.type_args, ctx.sema_result)) |td| {
+                        try name_to_td.put(ret_name, td);
+                    }
+                }
+            }
+        }
+    }
+
     // 按 sig.type_params 顺序输出 TypeDescriptor
+    // type_name 设为类型参数名，使 resolveTypeNode 能按名匹配类型参数
+    // 未匹配的类型参数：用 getOrCreateRefDesc 创建具名描述符（而非回退到通用 ref_descriptor）
     const args = try alloc.alloc(TypeDescriptor, sig.type_params.len);
     for (sig.type_params, 0..) |tp_name, i| {
-        args[i] = if (name_to_td.get(tp_name)) |td| td.* else type_resolver.ref_type_descriptor;
+        var td = if (name_to_td.get(tp_name)) |t| t.* else (ctx.sema_result.getOrCreateRefDesc(tp_name) catch unreachable).*;
+        td.type_name = tp_name;
+        args[i] = td;
     }
     return args;
 }
@@ -805,7 +956,8 @@ fn resolveExpr(expr: *const ast.Expr, ctx: *ResolveCtx) ResolveError!void {
         else => {},
     }
 
-    const td = resolveExprType(expr, ctx) orelse &type_resolver.ref_type_descriptor;
+    const td = resolveExprType(expr, ctx) orelse
+        ctx.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
 
     // 存入实例本地表达式类型表
     try ctx.instance.expr_types.put(@intFromPtr(expr), .{
@@ -821,7 +973,8 @@ fn resolveExpr(expr: *const ast.Expr, ctx: *ResolveCtx) ResolveError!void {
     switch (expr.*) {
         .field_access => |fa| {
             // 额外存入 field_accesses 元信息
-            const obj_td = resolveExprType(fa.object, ctx) orelse &type_resolver.ref_type_descriptor;
+            const obj_td = resolveExprType(fa.object, ctx) orelse
+                ctx.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
             if (ctx.sema_result.lookupFieldId(obj_td.type_name, fa.field)) |field_id| {
                 // 查询字段类型
                 if (ctx.sema_result.getCtorDef(obj_td.type_name)) |ctor| {
@@ -922,12 +1075,14 @@ fn resolveExpr(expr: *const ast.Expr, ctx: *ResolveCtx) ResolveError!void {
 fn resolveStmt(stmt: *const ast.Stmt, ctx: *ResolveCtx) ResolveError!void {
     switch (stmt.*) {
         .val_decl => |v| {
-            const td = resolveExprType(v.value, ctx) orelse &type_resolver.ref_type_descriptor;
+            const td = resolveExprType(v.value, ctx) orelse
+                ctx.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
             try resolveExpr(v.value, ctx);
             try ctx.defineVar(v.name, td);
         },
         .var_decl => |v| {
-            const td = resolveExprType(v.value, ctx) orelse &type_resolver.ref_type_descriptor;
+            const td = resolveExprType(v.value, ctx) orelse
+                ctx.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
             try resolveExpr(v.value, ctx);
             try ctx.defineVar(v.name, td);
         },
@@ -952,7 +1107,10 @@ fn resolveStmt(stmt: *const ast.Stmt, ctx: *ResolveCtx) ResolveError!void {
             try resolveExpr(f.iterable, ctx);
             try ctx.pushScope();
             defer ctx.popScope();
-            try ctx.defineVar(f.name, &type_resolver.ref_type_descriptor);
+            // 从迭代对象推断元素类型
+            const iter_td = resolveExprType(f.iterable, ctx) orelse
+                ctx.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
+            try ctx.defineVar(f.name, iter_td);
             try resolveExpr(f.body, ctx);
         },
         .while_stmt => |w| {
@@ -967,7 +1125,9 @@ fn resolveStmt(stmt: *const ast.Stmt, ctx: *ResolveCtx) ResolveError!void {
 fn resolvePattern(pattern: *const ast.Pattern, ctx: *ResolveCtx) ResolveError!void {
     switch (pattern.*) {
         .variable => |v| {
-            try ctx.defineVar(v.name, &type_resolver.ref_type_descriptor);
+            // pattern 变量类型未知，用 getOrCreateRefDesc 创建具名描述符
+            const td = ctx.sema_result.getOrCreateRefDesc("pattern_var") catch unreachable;
+            try ctx.defineVar(v.name, td);
         },
         .constructor => |cp| {
             for (cp.patterns) |fp| try resolvePattern(fp, ctx);
@@ -996,19 +1156,19 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
     switch (expr.*) {
         .int_literal => |il| {
             if (il.suffix) |s| {
-                if (type_resolver.resolveTypeNode(&.{ .named = .{ .name = s } }, ctx.type_args)) |td| return td;
+                if (type_resolver.resolveTypeNodeConcrete(&.{ .named = .{ .name = s } }, ctx.type_args, ctx.sema_result)) |td| return td;
             }
             return type_descriptor_mod.lookupByScalarKind(.i32);
         },
         .float_literal => |fl| {
             if (fl.suffix) |s| {
-                if (type_resolver.resolveTypeNode(&.{ .named = .{ .name = s } }, ctx.type_args)) |td| return td;
+                if (type_resolver.resolveTypeNodeConcrete(&.{ .named = .{ .name = s } }, ctx.type_args, ctx.sema_result)) |td| return td;
             }
             return type_descriptor_mod.lookupByScalarKind(.f64);
         },
         .bool_literal => return type_descriptor_mod.lookupByScalarKind(.bool),
         .char_literal => return type_descriptor_mod.lookupByScalarKind(.char),
-        .string_literal, .string_interpolation => return &type_resolver.ref_type_descriptor,
+        .string_literal, .string_interpolation => return ir_mod.type_descriptor_mod.str_descriptor,
         .null_literal => return &type_resolver.null_type_descriptor,
         .unit_literal => return &type_resolver.unit_type_descriptor,
         .identifier => |id| {
@@ -1034,13 +1194,14 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
                     }
                 }
             }
-            return &type_resolver.ref_type_descriptor;
+            return ctx.sema_result.getOrCreateRefDesc(obj_td.type_name) catch unreachable;
         },
         .call => |c| {
             if (c.callee.* == .identifier) {
-                // 构造器调用：返回构造器的类型名
-                if (ctx.sema_result.getCtorDef(c.callee.identifier.name)) |_| {
-                    return &type_resolver.ref_type_descriptor;
+                // 构造器调用：返回以类型名命名的具体描述符
+                if (ctx.sema_result.getCtorDef(c.callee.identifier.name)) |ctor| {
+                    const ret_name = ctor.return_type_name orelse ctor.type_name;
+                    return ctx.sema_result.getOrCreateRefDesc(ret_name) catch unreachable;
                 }
                 // 优先查询 call_instantiations：泛型调用点已由 processCallInBody 创建实例
                 // 实例的 return_type 用具体 type_args 解析，避免 sig.return_type_desc 的 ref_chan 回退
@@ -1054,7 +1215,7 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
                     return sig.return_type_desc;
                 }
             }
-            return &type_resolver.ref_type_descriptor;
+            return ctx.sema_result.getOrCreateRefDesc("call_result") catch unreachable;
         },
         .method_call, .safe_method_call => {
             // 查询 call_instantiations（processCallInBody 已为泛型方法调用创建实例）
@@ -1067,7 +1228,7 @@ fn resolveExprType(expr: *const ast.Expr, ctx: *ResolveCtx) ?*const TypeDescript
             if (ctx.sema_result.getExpr(@intFromPtr(expr))) |info| {
                 return info.type_desc;
             }
-            return &type_resolver.ref_type_descriptor;
+            return ctx.sema_result.getOrCreateRefDesc("method_result") catch unreachable;
         },
         .block => |b| {
             // 返回 block 的 trailing_expr 类型（最后一个表达式）

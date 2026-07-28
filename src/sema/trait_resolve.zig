@@ -621,6 +621,69 @@ pub fn checkTraitDecl(
     const mod_key = inferencer.arena.allocator().dupe(u8, td.name) catch return;
     const mod_val = inferencer.arena.allocator().dupe(u8, inferencer.current_module) catch return;
     inferencer.trait_defining_modules.put(mod_key, mod_val) catch return;
+
+    // 检查默认方法体：为有 body 的方法推断表达式类型，使 ExprInfo 被记录到 sema_result
+    // 这对 IRBuilder 在编译 trait 默认方法时能查到表达式类型信息至关重要
+    for (td.methods) |m| {
+        if (m.body == null) continue;
+        checkTraitMethodBody(inferencer, td, m, &type_param_map, self_type_var);
+    }
+}
+
+/// 检查 trait 默认方法体：设置环境并推断 body 表达式类型。
+/// 使 trait 默认方法中的表达式（如 val info = typeof(Self); info.name）的 ExprInfo 被记录。
+fn checkTraitMethodBody(
+    inferencer: *TypeInferencer,
+    td: @TypeOf(@as(ast.Decl, undefined).trait_decl),
+    m: ast.MethodDecl,
+    type_param_map: *std.StringHashMap(*Type),
+    self_type_var: *Type,
+) void {
+    var child_env = TypeEnv.init(inferencer.arena.allocator());
+    defer child_env.deinit();
+    inferencer.registerBuiltins(&child_env);
+
+    // 设置 Self 类型
+    const old_self_type = inferencer.current_self_type;
+    inferencer.current_self_type = self_type_var;
+    defer inferencer.current_self_type = old_self_type;
+
+    // 设置类型参数
+    var method_param_map = std.StringHashMap(*Type).init(inferencer.arena.allocator());
+    defer method_param_map.deinit();
+    {
+        var it = type_param_map.iterator();
+        while (it.next()) |e| method_param_map.put(e.key_ptr.*, e.value_ptr.*) catch {};
+    }
+    for (m.type_params) |mtp| {
+        const tv = inferencer.freshTypeVar() catch return;
+        method_param_map.put(mtp.name, tv) catch {};
+    }
+
+    // 定义参数（包括 self）
+    for (m.params) |param| {
+        const pt = if (param.type_annotation) |ta|
+            inferencer.typeFromAstWithParams(ta, &method_param_map) catch inferencer.freshTypeVar() catch return
+        else
+            inferencer.freshTypeVar() catch return;
+        child_env.define(param.name, pt) catch return;
+    }
+
+    // 设置返回类型和类型参数上下文
+    const prev_fn_return = inferencer.current_fn_return_type;
+    if (m.return_type) |rt| {
+        inferencer.current_fn_return_type = inferencer.typeFromAstWithParams(rt, &method_param_map) catch null;
+    } else {
+        inferencer.current_fn_return_type = null;
+    }
+    defer inferencer.current_fn_return_type = prev_fn_return;
+
+    const prev_type_params = inferencer.current_type_params;
+    inferencer.current_type_params = if (td.type_params.len > 0 or m.type_params.len > 0) &method_param_map else prev_type_params;
+    defer inferencer.current_type_params = prev_type_params;
+
+    // 推断 body 表达式
+    _ = inferencer.inferExpr(m.body.?, &child_env, null) catch return;
 }
 
 /// 判断 `name` 是否为内建基础类型名。

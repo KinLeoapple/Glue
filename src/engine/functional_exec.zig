@@ -233,18 +233,27 @@ pub const Methods = struct {
         self.runtime.writePtr(node.output, @ptrCast(&lazy.header));
     }
 
-    /// lazy_force：强制求值 Lazy<T>
-    /// inputs[0] = LazyValue (ref_chan)，output = 值通道
+    /// lazy_force：强制求值 Lazy<T>，或对非 LazyValue 的 ref_chan 做透传。
+    /// inputs[0] = ref_chan（LazyValue 或其他堆对象引用），output = 值通道
+    /// IR 的 forceLazyIfRef 对所有 ref_chan 统一发射 lazy_force；运行时按 type_tag 分派：
+    /// - LazyValue → 强制求值 thunk 并缓存
+    /// - 其他 ref（Cell/Record/Str/Array/Closure 等）→ 直接读值写出到 output
     pub fn execLazyForce(self: *Engine, node: *const Node) EngineError!void {
-        const lazy = self.readLazyValue(node.inputs[0]) orelse return error.InvalidChannel;
-        if (lazy.forced) {
-            if (lazy.cached) |c| {
-                self.writeScalarValue(node.output, c);
+        // 非 LazyValue 的 ref_chan：直接读取底层值并透传到 output
+        if (self.readLazyValue(node.inputs[0])) |lazy| {
+            if (lazy.forced) {
+                if (lazy.cached) |c| {
+                    self.writeScalarValue(node.output, c);
+                }
+                return;
             }
+            const result = try self.forceLazyValue(lazy);
+            self.writeScalarValue(node.output, result);
             return;
         }
-        const result = try self.forceLazyValue(lazy);
-        self.writeScalarValue(node.output, result);
+        // 非 LazyValue：ref_chan 透传（Cell 标量装箱 / 堆对象引用直接复制指针）
+        const v = self.chanToValue(node.inputs[0]);
+        self.writeScalarValue(node.output, v);
     }
 
     /// 读取 ref_chan 中的 LazyValue 指针

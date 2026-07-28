@@ -11,6 +11,7 @@ const std = @import("std");
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
+const type_descriptor_mod = @import("type_descriptor.zig");
 
 pub const Node = node_mod.Node;
 pub const NodeOp = node_mod.NodeOp;
@@ -108,6 +109,11 @@ pub const GlueIR = struct {
     /// 若为 null，则 nodes/metas/functions 为外部管理的内存，deinit 不释放
     arena: ?*std.heap.ArenaAllocator = null,
 
+    /// type_desc_pool 所有权：从 sema_result 转移而来。
+    /// ChannelMeta.type_desc 指针引用此 pool 分配的 TypeDescriptor 内存，
+    /// 因此 pool 必须与 GlueIR 同生命周期。deinit 时释放。
+    type_desc_pool: ?type_descriptor_mod.TypeDescriptorPool = null,
+
     /// 底层分配器（channels 等动态结构使用）
     backing: std.mem.Allocator,
 
@@ -122,6 +128,11 @@ pub const GlueIR = struct {
         } else {
             // 非 arena 模式：channels 自行管理内存
             self.channels.deinit();
+        }
+        // type_desc_pool 从 sema_result 转移而来，channels.type_desc 指针引用其内存
+        if (self.type_desc_pool) |*pool| {
+            pool.deinit();
+            self.type_desc_pool = null;
         }
         // type_metadata_table 的 name_to_id 用 backing 分配，需显式释放
         self.type_metadata_table.deinit();

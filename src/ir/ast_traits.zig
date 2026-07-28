@@ -10,12 +10,16 @@ const std = @import("std");
 const ast = @import("ast");
 const scalar = @import("value").scalar;
 const syscall = @import("syscall");
+const sema = @import("sema");
 
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
 const type_descriptor_mod = @import("type_descriptor.zig");
 const builtin_type_names = @import("builtin_type_names.zig");
+
+const SemaResult = sema.sema_output.SemaResult;
+const sema_type_resolver = sema.type_resolver;
 
 const NodeOp = node_mod.NodeOp;
 const ChannelSpace = channel_mod.ChannelSpace;
@@ -126,7 +130,7 @@ pub fn binaryResultType(op: ast.BinaryOp, operand_type: *const TypeDescriptor) *
     return switch (op) {
         .eq, .not_eq, .ref_eq, .ref_neq, .lt, .gt, .lt_eq, .gt_eq => type_descriptor_mod.mask_descriptor, // 比较输出 mask
         .and_op, .or_op => type_descriptor_mod.bool_descriptor,
-        .concat_list => type_descriptor_mod.ref_descriptor, // 字符串/数组拼接返回引用
+        .concat_list => operand_type, // 字符串/数组拼接继承操作数类型
         else => operand_type, // 算术/位运算继承操作数类型
     };
 }
@@ -201,13 +205,14 @@ pub fn throwOkTypeNode(type_node: ?*ast.TypeNode) ?*ast.TypeNode {
 }
 
 /// 从 Throw<T, E> 类型节点提取 Ok 值的类型描述符
-pub fn throwOkChanType(type_node: ?*ast.TypeNode) ?*const TypeDescriptor {
+/// 无回退实现：委托 sema/type_resolver.resolveTypeNodeConcrete
+pub fn throwOkChanType(type_node: ?*ast.TypeNode, sema_result: *SemaResult) ?*const TypeDescriptor {
     const tn = type_node orelse return null;
     switch (tn.*) {
         .generic => |g| {
             if (!std.mem.eql(u8, g.name, "Throw")) return null;
             if (g.args.len < 1) return null;
-            return chanTypeFromTypeNode(g.args[0]);
+            return sema_type_resolver.resolveTypeNodeConcrete(g.args[0], &.{}, sema_result);
         },
         else => return null,
     }
@@ -375,24 +380,22 @@ pub fn retKindToChanType(kind: syscall.SyscallRetKind) *const TypeDescriptor {
 }
 
 /// 从 TypeNode 推导类型描述符
-/// 统一路径：委托 sema/type_resolver.resolveChanType（消除并行 switch 实现）
-/// 无 type_args 上下文时调用（空 type_args），行为与 resolveTypeNode(type_node, &.{}) 等价
-pub fn chanTypeFromTypeNode(type_node: ?*ast.TypeNode) ?*const TypeDescriptor {
-    const sema = @import("sema");
-    return sema.type_resolver.resolveChanType(type_node, &.{});
+/// 无回退实现：委托 sema/type_resolver.resolveTypeNodeConcrete（通过 getOrCreateRefDesc 为用户类型创建具名描述符）
+pub fn chanTypeFromTypeNode(type_node: ?*ast.TypeNode, sema_result: *SemaResult) ?*const TypeDescriptor {
+    return sema_type_resolver.resolveTypeNodeConcrete(type_node, &.{}, sema_result);
 }
 
 /// 分配类型节点对应的通道（正确处理 nullable 类型）
 /// 返回通道索引
-pub fn allocChanFromTypeNode(channels: *ChannelSpace, type_node: ?*ast.TypeNode) !u16 {
+pub fn allocChanFromTypeNode(channels: *ChannelSpace, type_node: ?*ast.TypeNode, sema_result: *SemaResult) !u16 {
     const tn = type_node orelse return try channels.alloc(type_descriptor_mod.i64_descriptor);
     return switch (tn.*) {
         .nullable => |nb| {
-            const inner_td = chanTypeFromTypeNode(nb.inner) orelse type_descriptor_mod.ref_descriptor;
+            const inner_td = chanTypeFromTypeNode(nb.inner, sema_result) orelse sema_result.getOrCreateRefDesc("unknown") catch unreachable;
             return try channels.allocNullable(inner_td);
         },
         else => {
-            const td = chanTypeFromTypeNode(tn) orelse type_descriptor_mod.i64_descriptor;
+            const td = chanTypeFromTypeNode(tn, sema_result) orelse type_descriptor_mod.i64_descriptor;
             return try channels.alloc(td);
         },
     };

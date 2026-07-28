@@ -65,7 +65,7 @@ pub fn typeDescriptorPtrFromName(name: []const u8) ?*const TypeDescriptor {
 /// 内置类型名（含标量 + str/unit）→ *const TypeDescriptor，未匹配返回 null
 pub fn typeDescriptorFromBuiltinName(name: []const u8) ?*const TypeDescriptor {
     if (typeDescriptorPtrFromName(name)) |td| return td;
-    if (std.mem.eql(u8, name, "str")) return ir_mod.type_descriptor_mod.ref_descriptor;
+    if (std.mem.eql(u8, name, "str")) return ir_mod.type_descriptor_mod.str_descriptor;
     if (std.mem.eql(u8, name, "void")) return ir_mod.type_descriptor_mod.unit_descriptor;
     return null;
 }

@@ -264,7 +264,11 @@ pub const Methods = struct {
         const ptr = self.runtime.readPtr(chan) orelse return null;
         const addr = @intFromPtr(ptr);
         if (addr < 0x1000) return null;
+        // 过滤内核空间地址（高位置 1，含负 i64 符号扩展），防止标量位模式误判为堆指针
+        if (addr >= 0x8000000000000000) return null;
         if (addr % @alignOf(value.obj_header.ObjHeader) != 0) return null;
+        // 使用 msync 安全检查页面是否映射，避免对标量位模式调用 isValidHeapObj 导致段错误
+        if (!ir_mod.type_descriptor_mod.isReadable(addr)) return null;
         const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
         if (!header.isValidHeapObj()) return null;
         return header;

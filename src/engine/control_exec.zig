@@ -336,7 +336,8 @@ pub const Methods = struct {
         const local_start = body_start - func.node_start;
 
         // 如果 body 中遇到 halt 节点（halt_return/halt_throw），传播它
-        if (try self.execBodyNodes(nodes, local_start, body_len)) |halt_chan| {
+        const halt_result = try self.execBodyNodes(nodes, local_start, body_len);
+        if (halt_result) |halt_chan| {
             return halt_chan;
         }
 
