@@ -4,27 +4,33 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Glue — 安全、自然、高效的并行函数式语言</title>
+    <meta name="description" content="Glue 是一门通用编程语言，核心目标是让并行编程变得安全、自然、高效。">
     <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
     <!-- 顶部导航栏 -->
     <header class="navbar">
+        <!-- 滚动进度条（嵌在导航栏底部，随导航栏一起移动） -->
+        <div class="scroll-progress" id="scroll-progress"></div>
         <div class="navbar-left">
-            <a href="#/" class="logo">▸ Glue</a>
-        </div>
-        <div class="navbar-center">
-            <div class="nav-dropdown">
-                <button class="nav-btn">教程 ▾</button>
-                <div class="nav-menu" id="nav-tutorial"></div>
-            </div>
-            <div class="nav-dropdown">
-                <button class="nav-btn">参考 ▾</button>
-                <div class="nav-menu" id="nav-reference"></div>
-            </div>
+            <a href="#/" class="logo" aria-label="Glue 首页">▸ Glue</a>
+            <nav class="navbar-nav" aria-label="主导航">
+                <div class="nav-dropdown">
+                    <button class="nav-btn" aria-haspopup="true" aria-expanded="false">教程 ▾</button>
+                    <div class="nav-menu" id="nav-tutorial" role="menu"></div>
+                </div>
+                <div class="nav-dropdown">
+                    <button class="nav-btn" aria-haspopup="true" aria-expanded="false">参考 ▾</button>
+                    <div class="nav-menu" id="nav-reference" role="menu"></div>
+                </div>
+            </nav>
         </div>
         <div class="navbar-right">
-            <button class="search-trigger" id="search-trigger">
+            <button class="search-trigger" id="search-trigger" aria-label="搜索文档">
                 <span>搜索</span>
                 <kbd>⌘K</kbd>
             </button>
@@ -35,24 +41,29 @@
     <!-- 主体三栏 -->
     <div class="layout">
         <!-- 左侧侧栏 -->
-        <aside class="sidebar" id="sidebar">
-            <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <aside class="sidebar" id="sidebar" aria-label="文档目录">
+            <nav class="sidebar-nav" id="sidebar-nav" aria-label="侧边导航"></nav>
         </aside>
 
         <!-- 右侧主内容 -->
-        <main class="content" id="content"></main>
+        <div class="content-wrap">
+            <main class="content" id="content" role="main"></main>
+        </div>
     </div>
 
     <!-- 搜索模态 -->
-    <div class="search-modal" id="search-modal">
+    <div class="search-modal" id="search-modal" role="dialog" aria-modal="true" aria-label="搜索">
         <div class="search-box">
-            <input type="text" id="search-input" placeholder="搜索文档..." autocomplete="off">
-            <div class="search-results" id="search-results"></div>
+            <input type="text" id="search-input" placeholder="搜索文档..." autocomplete="off" aria-label="搜索输入">
+            <div class="search-results" id="search-results" role="listbox"></div>
         </div>
     </div>
 
     <!-- 汉堡菜单按钮（响应式） -->
-    <button class="menu-toggle" id="menu-toggle" aria-label="菜单">☰</button>
+    <button class="menu-toggle" id="menu-toggle" aria-label="切换菜单">☰</button>
+
+    <!-- 回到顶部按钮 -->
+    <button class="back-to-top" id="back-to-top" aria-label="回到顶部">↑</button>
 
     <script src="js/content.js"></script>
     <script src="js/highlight.js"></script>

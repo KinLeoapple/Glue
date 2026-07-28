@@ -25,10 +25,7 @@ fn scalarKindFromName(name: []const u8) ?ScalarKind {
 pub const ref_type_descriptor: TypeDescriptor = .{
     .size = 8,
     .alignment = 8,
-    .is_ref = true,
-    .scalar_ops = &ir_mod.type_descriptor_mod.ref_ops,
-    .slots = &.{},
-    .slot_kind = .none,
+    .scalar_ops = &ir_mod.type_descriptor_mod.heap_ref_ops,
     .type_id = 0,
     .type_name = "ref",
 };
@@ -37,10 +34,7 @@ pub const ref_type_descriptor: TypeDescriptor = .{
 pub const null_type_descriptor: TypeDescriptor = .{
     .size = 0,
     .alignment = 1,
-    .is_ref = false,
     .scalar_ops = &ir_mod.type_descriptor_mod.null_ops,
-    .slots = &.{},
-    .slot_kind = .none,
     .type_id = 17,
     .type_name = "null",
 };
@@ -49,10 +43,7 @@ pub const null_type_descriptor: TypeDescriptor = .{
 pub const unit_type_descriptor: TypeDescriptor = .{
     .size = 0,
     .alignment = 1,
-    .is_ref = false,
     .scalar_ops = &ir_mod.type_descriptor_mod.unit_ops,
-    .slots = &.{},
-    .slot_kind = .none,
     .type_id = 18,
     .type_name = "void",
 };

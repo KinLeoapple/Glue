@@ -348,6 +348,11 @@ pub const SemaResult = struct {
         return self.type_desc_pool.getOrCreateRefDesc(name);
     }
 
+    /// 获取或创建 nullable<T> 具名描述符（委托给 TypeDescriptorPool）
+    pub fn getOrCreateNullableDesc(self: *SemaResult, inner: *const TypeDescriptor) !*const TypeDescriptor {
+        return self.type_desc_pool.getOrCreateNullableDesc(inner);
+    }
+
     /// 注册 import 别名（检测重复）
     pub fn putImportAlias(self: *SemaResult, short_name: []const u8, target: AliasTarget) !void {
         if (self.import_aliases.contains(short_name)) {

@@ -83,8 +83,6 @@ pub const OptStats = optimizer_mod.OptStats;
 // v3 TypeDescriptor 类型重导出（定义已移至 ir/type_descriptor.zig）
 pub const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
 pub const ScalarOps = type_descriptor_mod.ScalarOps;
-pub const Slot = type_descriptor_mod.Slot;
-pub const SlotKind = type_descriptor_mod.SlotKind;
 
 // sema_output 别名：从 sema 模块重导出（sema_output.zig 已迁入 sema/）
 pub const sema_output = sema_output_mod;

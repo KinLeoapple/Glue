@@ -13,8 +13,6 @@ const ir_mod = @import("ir");
 // 类型定义已移至 ir/type_descriptor.zig，此处重导出以保持下游引用兼容
 pub const TypeDescriptor = ir_mod.type_descriptor_mod.TypeDescriptor;
 pub const ScalarOps = ir_mod.type_descriptor_mod.ScalarOps;
-pub const Slot = ir_mod.type_descriptor_mod.Slot;
-pub const SlotKind = ir_mod.type_descriptor_mod.SlotKind;
 
 /// 标量种类（对应 scalar_ops_table 的 key）
 pub const ScalarKind = enum {

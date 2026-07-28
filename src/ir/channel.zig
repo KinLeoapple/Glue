@@ -34,6 +34,8 @@ pub const ChannelSpace = struct {
     /// 全局通道数量（全局 val/var 通道，索引 [0, global_count)）
     /// 在 IR 构建完成后由 finalizeGlobalCount 填充
     global_count: u16 = 0,
+    /// 类型描述符池引用（用于 allocNullable 创建具名 nullable<T> 描述符）
+    pool: ?*type_descriptor_mod.TypeDescriptorPool = null,
 
     pub fn init(allocator: std.mem.Allocator) ChannelSpace {
         return .{
@@ -63,13 +65,19 @@ pub const ChannelSpace = struct {
 
     /// 分配一个 Nullable 通道
     pub fn allocNullable(self: *ChannelSpace, inner_type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
+        if (self.pool) |pool| {
+            const nullable_td = try pool.getOrCreateNullableDesc(inner_type_desc);
+            return self.alloc(nullable_td);
+        }
         return self.allocInner(type_descriptor_mod.nullable_descriptor, inner_type_desc, false);
     }
 
     fn allocInner(self: *ChannelSpace, type_desc: *const type_descriptor_mod.TypeDescriptor, inner_type_desc: ?*const type_descriptor_mod.TypeDescriptor, is_cell: bool) !u16 {
         const idx: u16 = @intCast(self.metas.items.len);
-        const elem_w: u8 = if (type_desc.is_nullable) blk: {
-            const inner = inner_type_desc orelse type_descriptor_mod.null_descriptor;
+        // nullable 通道宽度：优先用 type_desc.size（具名 nullable<T> 描述符已含 inner.size+1），
+        // 回退路径（nullable_descriptor + inner_type_desc）需要手动计算
+        const elem_w: u8 = if (type_desc.isNullable() and inner_type_desc != null) blk: {
+            const inner = inner_type_desc.?;
             break :blk inner.size + 1;
         } else type_desc.size;
         try self.metas.append(self.allocator, .{

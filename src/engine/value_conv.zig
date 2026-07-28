@@ -401,8 +401,7 @@ pub const Methods = struct {
     /// 目标为 128 位类型时不调用此函数（由 copyCrossType 特例处理）。
     fn i64BitsToValue(bits: i64, dst_type_desc: *const ir_mod.type_descriptor_mod.TypeDescriptor) value.Value {
         const i64_val = value.Value.fromI64(bits);
-        if (dst_type_desc.scalar_ops) |ops| return ops.coerce(i64_val);
-        return i64_val;
+        return dst_type_desc.scalar_ops.coerce(i64_val);
     }
 
     /// 将标量值写入通道（统一通过 scalar_ops vtable coerce + write）

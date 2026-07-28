@@ -456,7 +456,7 @@ pub fn inferExprChanType(ctx: *const InferContextExt, expr: *const ast.Expr) ?*c
         },
         .binary => |b| {
             return switch (b.op) {
-                .eq, .not_eq, .ref_eq, .ref_neq, .lt, .gt, .lt_eq, .gt_eq => ir_td.mask_descriptor,
+                .eq, .not_eq, .ref_eq, .ref_neq, .lt, .gt, .lt_eq, .gt_eq => ir_td.bool_descriptor,
                 .and_op, .or_op => ir_td.bool_descriptor,
                 else => inferExprChanType(ctx, b.left),
             };

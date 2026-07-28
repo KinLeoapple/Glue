@@ -469,10 +469,10 @@ pub const Methods = struct {
 
         // nullable == null / nullable != null 特殊处理：直接检查 null flag
         if (op == .eq or op == .not_eq) {
-            const left_is_nullable = left_meta.type_desc.is_nullable;
-            const right_is_nullable = right_meta.type_desc.is_nullable;
-            const left_is_null = left_meta.type_desc.is_null_type;
-            const right_is_null = right_meta.type_desc.is_null_type;
+            const left_is_nullable = left_meta.type_desc.isNullable();
+            const right_is_nullable = right_meta.type_desc.isNullable();
+            const left_is_null = left_meta.type_desc.isNullType();
+            const right_is_null = right_meta.type_desc.isNullType();
             if ((left_is_nullable and right_is_null) or (left_is_null and right_is_nullable)) {
                 const nullable_chan = if (left_is_nullable) left_ch else right_ch;
                 const is_null_out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
@@ -491,7 +491,7 @@ pub const Methods = struct {
         // ref_chan 可能是 Str/Array/Record/ADT/Newtype 等堆对象，value.equals 会按
         // type_tag 分派做递归比较；若误走 lazy_force 会对非 LazyValue 报 InvalidChannel。
         if ((op == .eq or op == .not_eq) and
-            left_meta.type_desc.is_ref and right_meta.type_desc.is_ref)
+            left_meta.type_desc.isRef() and right_meta.type_desc.isRef())
         {
             const eq_out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             try self.emit(Node.makeBinary(.builtin_eq, eq_out, 0, left_ch, right_ch));
@@ -504,7 +504,7 @@ pub const Methods = struct {
         // + 对两个 ref_chan 操作数：isStringExpr 可能无法识别 lambda 内的字符串参数，
         // 此处兜底路由到 string_concat（+ 在两个堆引用上只可能是字符串拼接）。
         if (op == .add and
-            left_meta.type_desc.is_ref and right_meta.type_desc.is_ref)
+            left_meta.type_desc.isRef() and right_meta.type_desc.isRef())
         {
             const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
             const meta_idx = try self.addScalarMeta(.{ .kind = .ref });
@@ -516,7 +516,7 @@ pub const Methods = struct {
         // ref_chan 堆对象中只有字符串支持有序比较（数组/记录/ADT 的 < 无语义），
         // 若误走 force_lazy 会把字符串当 i64 惰性值求值，触发 InvalidChannel。
         if ((op == .lt or op == .gt or op == .lt_eq or op == .gt_eq) and
-            left_meta.type_desc.is_ref and right_meta.type_desc.is_ref)
+            left_meta.type_desc.isRef() and right_meta.type_desc.isRef())
         {
             const out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             // _pad 编码：0=lt, 1=le, 2=gt, 3=ge
@@ -542,13 +542,13 @@ pub const Methods = struct {
             else => false,
         };
         if (force_lazy) {
-            if (left_meta.type_desc.is_ref and right_meta.type_desc.is_ref) {
+            if (left_meta.type_desc.isRef() and right_meta.type_desc.isRef()) {
                 // 两侧都是惰性引用，无法从上下文推断 T：保守地强制为 i64
                 left_ch = try self.emitLazyForce(left_ch, type_descriptor_mod.i64_descriptor);
                 right_ch = try self.emitLazyForce(right_ch, type_descriptor_mod.i64_descriptor);
-            } else if (left_meta.type_desc.is_ref) {
+            } else if (left_meta.type_desc.isRef()) {
                 left_ch = try self.emitLazyForce(left_ch, right_meta.type_desc);
-            } else if (right_meta.type_desc.is_ref) {
+            } else if (right_meta.type_desc.isRef()) {
                 right_ch = try self.emitLazyForce(right_ch, left_meta.type_desc);
             }
             left_meta = self.channels.get(left_ch);
@@ -585,7 +585,7 @@ pub const Methods = struct {
         const out = try self.allocChannel(result_type);
 
         const node_op = try binaryOpToNodeOp(op, unified_type);
-        const kind: ScalarKind = if (result_type.isInt()) .int else if (result_type.isFloat()) .float else if (result_type.is_ref) .ref else .bool;
+        const kind: ScalarKind = if (result_type.isInt()) .int else if (result_type.isFloat()) .float else if (result_type.isRef()) .ref else .bool;
         const meta_idx = try self.addScalarMeta(.{
             .kind = kind,
             .int_kind = result_type.toIntKind() orelse .i64,
@@ -622,7 +622,7 @@ pub const Methods = struct {
     /// 发射 lazy_force 节点强制求值。若已是标量通道则原样返回。
     pub fn forceLazyIfRef(self: *IRBuilder, chan: u16, expected_ct: *const type_descriptor_mod.TypeDescriptor) BuildError!u16 {
         const meta = self.channels.get(chan);
-        if (!meta.type_desc.is_ref) return chan;
+        if (!meta.type_desc.isRef()) return chan;
         return try self.emitLazyForce(chan, expected_ct);
     }
 
@@ -636,18 +636,18 @@ pub const Methods = struct {
         // 泛型参数装箱：标量实参 → 引用形参（如 println<T>(x: T) 调用 println(42)）
         // 使用 ref_of 节点将标量装箱为 Cell 写入引用通道。
         // 运行时 chanToValue 通过 ref_ops.read 读取 Cell 并提取标量值。
-        if (dst_ct.is_ref and !arg_meta.type_desc.is_ref and !arg_meta.type_desc.is_nullable) {
+        if (dst_ct.isRef() and !arg_meta.type_desc.isRef() and !arg_meta.type_desc.isNullable()) {
             // 标量/bool/char/unit → 引用通道：装箱
             const out = try self.allocChannel(dst_ct);
             try self.emit(Node.makeUnary(.ref_of, out, 0, arg_chan));
             return out;
         }
 
-        if (!arg_meta.type_desc.is_ref) return arg_chan;
-        if (dst_ct.is_ref) return arg_chan;
+        if (!arg_meta.type_desc.isRef()) return arg_chan;
+        if (dst_ct.isRef()) return arg_chan;
         // nullable<T> 参数：若内部类型已是引用，直接保留引用由运行时深拷贝到 nullable 通道
-        if (dst_ct.is_nullable and dst_meta.inner_type_desc != null and dst_meta.inner_type_desc.?.is_ref) return arg_chan;
-        if (dst_ct.is_nullable) return try self.emitLazyForce(arg_chan, dst_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
+        if (dst_ct.isNullable() and dst_meta.inner_type_desc != null and dst_meta.inner_type_desc.?.isRef()) return arg_chan;
+        if (dst_ct.isNullable()) return try self.emitLazyForce(arg_chan, dst_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
         return try self.emitLazyForce(arg_chan, dst_ct);
     }
 
@@ -657,7 +657,7 @@ pub const Methods = struct {
         var operand_meta = self.channels.get(operand_chan);
 
         // 严格运算上下文：ref_chan 操作数视为 Lazy<T>，先强制求值到标量。
-        if (operand_meta.type_desc.is_ref) {
+        if (operand_meta.type_desc.isRef()) {
             const force_ct: *const type_descriptor_mod.TypeDescriptor = switch (op) {
                 .not => type_descriptor_mod.bool_descriptor,
                 .neg, .bit_not => type_descriptor_mod.i64_descriptor,
@@ -780,10 +780,10 @@ pub const Methods = struct {
         // 类型统一：如果一个分支是 null_chan 而另一个是值类型，
         // 结果应为 nullable_chan（execRouteDispatch 会自动处理类型转换）
         const result_type: *const type_descriptor_mod.TypeDescriptor = blk: {
-            if (else_type == type_descriptor_mod.null_descriptor and then_type != type_descriptor_mod.null_descriptor and !then_type.is_nullable) {
+            if (else_type == type_descriptor_mod.null_descriptor and then_type != type_descriptor_mod.null_descriptor and !then_type.isNullable()) {
                 break :blk type_descriptor_mod.nullable_descriptor;
             }
-            if (then_type == type_descriptor_mod.null_descriptor and else_type != type_descriptor_mod.null_descriptor and !else_type.is_nullable) {
+            if (then_type == type_descriptor_mod.null_descriptor and else_type != type_descriptor_mod.null_descriptor and !else_type.isNullable()) {
                 break :blk type_descriptor_mod.nullable_descriptor;
             }
             // 默认：取 then 分支类型
@@ -800,9 +800,9 @@ pub const Methods = struct {
         body_lens[1] = then_len;
 
         // route_dispatch 按 winner 索引执行对应子图
-        const result_chan = if (result_type.is_nullable) blk: {
-            const inner_ct = if (then_type != type_descriptor_mod.null_descriptor and !then_type.is_nullable) then_type
-                else if (else_type != type_descriptor_mod.null_descriptor and !else_type.is_nullable) else_type
+        const result_chan = if (result_type.isNullable()) blk: {
+            const inner_ct = if (then_type != type_descriptor_mod.null_descriptor and !then_type.isNullable()) then_type
+                else if (else_type != type_descriptor_mod.null_descriptor and !else_type.isNullable()) else_type
                 else type_descriptor_mod.i64_descriptor;
             break :blk try self.channels.allocNullable(inner_ct);
         } else try self.allocChannel(result_type);
@@ -825,7 +825,7 @@ pub const Methods = struct {
         const src_chan = try self.forceLazyIfRef(try self.compileExpr(tc.expr), dst_chan_type);
 
         // str(x) 是内置函数调用，不是类型转换
-        if (dst_chan_type.is_ref) {
+        if (dst_chan_type.isRef()) {
             if (tc.target_type.* == .named and std.mem.eql(u8, tc.target_type.named.name, "str")) {
                 const out = try self.allocChannel(type_descriptor_mod.str_descriptor);
                 try self.emit(Node.makeUnary(.builtin_str, out, 0, src_chan));
@@ -875,7 +875,7 @@ pub const Methods = struct {
         const force_ct: *const type_descriptor_mod.TypeDescriptor = if (target_is_str) type_descriptor_mod.i64_descriptor else dst_chan_type;
         const needs_force = target_is_str or dst_chan_type.isInt() or dst_chan_type.isFloat() or dst_chan_type == type_descriptor_mod.bool_descriptor or dst_chan_type == type_descriptor_mod.char_descriptor;
         const raw_src_chan = try self.compileExpr(cb.expr);
-        const raw_is_ref = self.channels.get(raw_src_chan).type_desc.is_ref;
+        const raw_is_ref = self.channels.get(raw_src_chan).type_desc.isRef();
         const src_chan = if (needs_force and !raw_is_ref) try self.forceLazyIfRef(raw_src_chan, force_ct) else raw_src_chan;
 
         // str 目标：数值→str 永不失败，直接走 builtin_str，再按 mode 包装 Throw
@@ -1262,7 +1262,7 @@ pub const Methods = struct {
         const sema_ct: ?*const type_descriptor_mod.TypeDescriptor = blk: {
             { const sr = self.sema_result;
                 if (sr.getExpr(@intFromPtr(field_access_expr))) |info| {
-                    if (!info.type_desc.is_null_type) break :blk info.type_desc;
+                    if (!info.type_desc.isNullType()) break :blk info.type_desc;
                 }
             }
             break :blk null;
@@ -1414,7 +1414,7 @@ pub const Methods = struct {
         const chan = try self.compileExpr(e);
         const meta = self.channels.get(chan);
         // 字符串/引用类型直接使用
-        if (meta.type_desc.is_ref) return chan;
+        if (meta.type_desc.isRef()) return chan;
         // 其他类型通过 builtin_str 转换
         const out = try self.allocChannel(type_descriptor_mod.str_descriptor);
         try self.emit(Node.makeUnary(.builtin_str, out, 0, chan));
@@ -1792,7 +1792,7 @@ pub const Methods = struct {
         // 泛型函数：尝试从实参类型推断返回类型
         const inferred_ret_type = self.inferGenericCallReturnType(effective_name, arguments);
         const ret_chan_type = inferred_ret_type orelse ret_meta.type_desc;
-        const out = if (ret_chan_type.is_nullable)
+        const out = if (ret_chan_type.isNullable())
             try self.channels.allocNullable(ret_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor)
         else
             try self.allocChannel(ret_chan_type);
@@ -1985,7 +1985,7 @@ pub const Methods = struct {
     pub fn isMemoizableChanType(ct: *const type_descriptor_mod.TypeDescriptor) bool {
         return ct.isInt() or ct.isFloat() or
             ct == type_descriptor_mod.bool_descriptor or ct == type_descriptor_mod.char_descriptor or
-            ct.is_nullable;
+            ct.isNullable();
     }
 
     /// 尝试为纯函数分配 memo_slot。
@@ -2001,13 +2001,13 @@ pub const Methods = struct {
         // 返回类型必须为可 memoize 类型（标量/nullable<标量>）
         if (!isMemoizableChanType(ret_chan_type)) return 0;
         // nullable 返回的 inner_type 必须为标量（排除 nullable<ref>）
-        if (ret_chan_type.is_nullable and !isScalarChanType(ret_inner_type)) return 0;
+        if (ret_chan_type.isNullable() and !isScalarChanType(ret_inner_type)) return 0;
         // 所有实参通道必须为可 memoize 类型
         for (arg_chans) |ch| {
             const meta = self.channels.get(ch);
             if (!isMemoizableChanType(meta.type_desc)) return 0;
             // nullable 的 inner_type 必须为标量（排除 nullable<ref>）
-            if (meta.type_desc.is_nullable and !isScalarChanType(meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor)) return 0;
+            if (meta.type_desc.isNullable() and !isScalarChanType(meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor)) return 0;
         }
         // per-function memo_slot：同函数名复用同一 slot
         if (self.func_memo_slots.get(func_name)) |slot| return slot;
@@ -2205,7 +2205,7 @@ pub const Methods = struct {
         var arg_ref_bits: u8 = 0;
         for (func.param_channels, 0..) |pc, i| {
             if (i >= 8) break;
-            if (self.channels.get(pc).type_desc.is_ref) {
+            if (self.channels.get(pc).type_desc.isRef()) {
                 arg_ref_bits |= @as(u8, 1) << @intCast(i);
             }
         }
@@ -2431,14 +2431,14 @@ pub const Methods = struct {
         const val_meta = self.channels.get(val_chan);
 
         // null_literal 传播：a? 返回 null → 传播 null（返回零值通道）
-        if (val_meta.type_desc.is_null_type) {
+        if (val_meta.type_desc.isNullType()) {
             // null 传播：返回一个零值通道（后续使用时会有问题，但 ?? 会短路）
             // 简化：直接返回 null_chan，由调用方处理
             return val_chan;
         }
 
         // nullable 传播：a? — unwrap nullable，null 时返回零值（简化：不做短路返回）
-        if (val_meta.type_desc.is_nullable) {
+        if (val_meta.type_desc.isNullable()) {
             const inner_type = val_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor;
             const unwrapped_chan = try self.allocChannel(inner_type);
             try self.emit(Node.makeUnary(.nullable_unwrap, unwrapped_chan, 0, val_chan));
@@ -2456,7 +2456,7 @@ pub const Methods = struct {
             .gate_kind = .check,
             .error_type = 0,
         });
-        const ok_chan = try self.allocChannel(type_descriptor_mod.mask_descriptor);
+        const ok_chan = try self.allocChannel(type_descriptor_mod.bool_descriptor);
         try self.emit(Node.makeUnary(.gate_check, ok_chan, check_meta_idx, val_chan));
 
         // 使用 route_dispatch 实现短路：Err → halt_return，Ok → gate_get_ok
@@ -2513,14 +2513,14 @@ pub const Methods = struct {
         const src_meta = self.channels.get(src_chan);
 
         // 如果已经是 nullable_chan，直接 unwrap
-        if (src_meta.type_desc.is_nullable) {
+        if (src_meta.type_desc.isNullable()) {
             const out = try self.allocChannel(src_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
             try self.emit(Node.makeUnary(.nullable_unwrap, out, 0, src_chan));
             return out;
         }
 
         // 如果是 ref_chan，包装为 nullable 后 unwrap（null 时 panic）
-        if (src_meta.type_desc.is_ref) {
+        if (src_meta.type_desc.isRef()) {
             const nullable_chan = try self.channels.allocNullable(type_descriptor_mod.ref_descriptor);
             try self.emit(Node.makeUnary(.nullable_make, nullable_chan, 0, src_chan));
             const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
@@ -2542,10 +2542,10 @@ pub const Methods = struct {
         const sema_field_ct: ?*const type_descriptor_mod.TypeDescriptor = blk: {
             { const sr = self.sema_result;
                 if (sr.getExpr(@intFromPtr(safe_access_expr))) |info| {
-                    if (info.type_desc.is_nullable and info.inner_type_desc != null) {
+                    if (info.type_desc.isNullable() and info.inner_type_desc != null) {
                         break :blk info.inner_type_desc.?;
                     }
-                    if (info.type_desc != type_descriptor_mod.null_descriptor and !info.type_desc.is_nullable) {
+                    if (info.type_desc != type_descriptor_mod.null_descriptor and !info.type_desc.isNullable()) {
                         break :blk info.type_desc;
                     }
                 }
@@ -2554,23 +2554,23 @@ pub const Methods = struct {
         };
 
         // null_literal：直接返回 null_chan（结果确定为 null）
-        if (obj_meta.type_desc.is_null_type) {
+        if (obj_meta.type_desc.isNullType()) {
             const null_result = try self.allocChannel(type_descriptor_mod.null_descriptor);
             try self.emit(Node.makeSink(.const_null, null_result, 0));
             return null_result;
         }
 
         // 如果是 ref_chan，先包装为 nullable
-        const nullable_chan = if (obj_meta.type_desc.is_nullable)
+        const nullable_chan = if (obj_meta.type_desc.isNullable())
             obj_chan
-        else if (obj_meta.type_desc.is_ref) blk: {
+        else if (obj_meta.type_desc.isRef()) blk: {
             const nc = try self.channels.allocNullable(type_descriptor_mod.ref_descriptor);
             try self.emit(Node.makeUnary(.nullable_make, nc, 0, obj_chan));
             break :blk nc;
         } else obj_chan;
 
         // 如果不是 nullable（例如基本类型），直接做字段访问
-        if (!obj_meta.type_desc.is_nullable and !obj_meta.type_desc.is_ref and !obj_meta.type_desc.is_null_type) {
+        if (!obj_meta.type_desc.isNullable() and !obj_meta.type_desc.isRef() and !obj_meta.type_desc.isNullType()) {
             return self.compileFieldAccessOnChan(obj_chan, field, object, sema_field_ct);
         }
 
@@ -2579,7 +2579,7 @@ pub const Methods = struct {
         try self.emit(Node.makeUnary(.nullable_is_null, is_null_chan, 0, nullable_chan));
 
         // unwrap 后访问字段（null 时 unwrap 写零，record_get 需安全处理）
-        const inner_type = if (obj_meta.type_desc.is_nullable) (obj_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor) else obj_meta.type_desc;
+        const inner_type = if (obj_meta.type_desc.isNullable()) (obj_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor) else obj_meta.type_desc;
         const unwrapped_chan = try self.allocChannel(inner_type);
         try self.emit(Node.makeUnary(.nullable_unwrap, unwrapped_chan, 0, nullable_chan));
 
@@ -2884,11 +2884,11 @@ pub const Methods = struct {
     pub fn compileSafeMethodCall(self: *IRBuilder, obj_chan: u16, object: *ast.Expr, method: []const u8, arguments: []*ast.Expr, call_expr: *const ast.Expr) BuildError!u16 {
         const obj_meta = self.channels.get(obj_chan);
         // 非 nullable/ref 直接调用
-        if (!obj_meta.type_desc.is_nullable and !obj_meta.type_desc.is_ref) {
+        if (!obj_meta.type_desc.isNullable() and !obj_meta.type_desc.isRef()) {
             return try self.dispatchMethodCall(obj_chan, object, method, arguments, call_expr);
         }
         // 包装为 nullable
-        const nullable_chan = if (obj_meta.type_desc.is_nullable)
+        const nullable_chan = if (obj_meta.type_desc.isNullable())
             obj_chan
         else blk: {
             const nc = try self.channels.allocNullable(type_descriptor_mod.ref_descriptor);
@@ -2991,7 +2991,7 @@ pub const Methods = struct {
                 }
                 // 返回 nullable_chan 时传播 inner_type
                 const ret_meta = self.channels.get(func.return_channel);
-                const out = if (ret_meta.type_desc.is_nullable)
+                const out = if (ret_meta.type_desc.isNullable())
                     try self.channels.allocNullable(ret_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor)
                 else
                     try self.allocChannel(ret_meta.type_desc);
@@ -2999,11 +2999,11 @@ pub const Methods = struct {
                 var arg_ref_bits: u16 = 0;
                 for (func.param_channels, 0..) |pc, i| {
                     if (i >= 16) break;
-                    if (self.channels.get(pc).type_desc.is_ref) {
+                    if (self.channels.get(pc).type_desc.isRef()) {
                         arg_ref_bits |= @as(u16, 1) << @intCast(i);
                     }
                 }
-                const ret_is_ref = self.channels.get(func.return_channel).type_desc.is_ref;
+                const ret_is_ref = self.channels.get(func.return_channel).type_desc.isRef();
                 // 计算泛型类型实参（type_args）用于 typeof(T)/reflect(T) 运行时查表
                 // sema 已预先收集所有泛型调用点，IR 直接消费 sema call_instantiations
                 const type_args = try self.typeArgsFromCallExpr(call_expr);
@@ -3328,7 +3328,7 @@ pub const Methods = struct {
         }
         // 函数返回 nullable_chan 时，传播 inner_type（否则 nullable_is_null 读错字节）
         const ret_meta = self.channels.get(func.return_channel);
-        const out = if (ret_meta.type_desc.is_nullable)
+        const out = if (ret_meta.type_desc.isNullable())
             try self.channels.allocNullable(ret_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor)
         else
             try self.allocChannel(ret_meta.type_desc);
@@ -3336,12 +3336,12 @@ pub const Methods = struct {
         var arg_ref_bits: u16 = 0;
         for (func.param_channels, 0..) |pc, i| {
             if (i >= 16) break;
-            if (self.channels.get(pc).type_desc.is_ref) {
+            if (self.channels.get(pc).type_desc.isRef()) {
                 arg_ref_bits |= @as(u16, 1) << @intCast(i);
             }
         }
         // 返回值引用标记
-        const ret_is_ref = self.channels.get(func.return_channel).type_desc.is_ref;
+        const ret_is_ref = self.channels.get(func.return_channel).type_desc.isRef();
         const call_meta_idx = try self.addCallMeta(.{
             .func_index = func_idx,
             .arg_count = @intCast(arg_chans.len),
@@ -3586,7 +3586,7 @@ pub const Methods = struct {
             if (i >= 8) break;
             const meta = self.channels.get(ch);
             if (meta.is_cell) cell_upvalues |= @as(u8, 1) << @intCast(i);
-            if (meta.type_desc.is_ref) upvalue_ref_bits |= @as(u8, 1) << @intCast(i);
+            if (meta.type_desc.isRef()) upvalue_ref_bits |= @as(u8, 1) << @intCast(i);
         }
         const closure_meta_idx = try self.addClosureMeta(.{
             .func_index = func_idx,
@@ -3921,17 +3921,17 @@ pub const Methods = struct {
         const left_meta = self.channels.get(left_chan);
 
         // null_literal：直接返回 right（值确定为 null）
-        if (left_meta.type_desc.is_null_type) {
+        if (left_meta.type_desc.isNullType()) {
             return right_chan;
         }
 
         // 如果 left 不是 nullable/ref，直接返回 left（不可能为 null）
-        if (!left_meta.type_desc.is_nullable and !left_meta.type_desc.is_ref) {
+        if (!left_meta.type_desc.isNullable() and !left_meta.type_desc.isRef()) {
             return left_chan;
         }
 
         // 如果是 ref_chan，包装为 nullable
-        const nullable_chan = if (left_meta.type_desc.is_nullable)
+        const nullable_chan = if (left_meta.type_desc.isNullable())
             left_chan
         else blk: {
             const nc = try self.channels.allocNullable(left_meta.type_desc);
@@ -3940,7 +3940,7 @@ pub const Methods = struct {
         };
 
         // nullable_unwrap_or(nullable_chan, right_chan)
-        const inner_type = if (left_meta.type_desc.is_nullable) (left_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor) else left_meta.type_desc;
+        const inner_type = if (left_meta.type_desc.isNullable()) (left_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor) else left_meta.type_desc;
         const out = try self.allocChannel(inner_type);
         try self.emit(Node.makeBinary(.nullable_unwrap_or, out, 0, nullable_chan, right_chan));
         return out;
@@ -4034,7 +4034,7 @@ pub const Methods = struct {
             // newtype/nullable：查 sema type_defs 获取 inner 类型
             if (self.sema_result.getTypeDef(ta.type_name)) |td_info| {
                 if (td_info.target_type_desc) |inner_td| {
-                    if (!inner_td.is_ref) return inner_td;
+                    if (!inner_td.isRef()) return inner_td;
                 }
             }
         }

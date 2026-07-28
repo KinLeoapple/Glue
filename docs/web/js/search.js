@@ -1,9 +1,27 @@
-// docs/web/js/search.js — 全文检索
+// docs/web/js/search.js — 全文检索（优化版：含正文索引 + 预览）
 
 let searchIndex = [];
 let selectedIndex = 0;
 
-// 构建搜索索引：遍历 CONTENT 的所有 chapter/section
+// 提取 block 中的纯文本
+function blockToText(block) {
+    switch (block.type) {
+        case 'p': return block.text;
+        case 'ul':
+        case 'ol': return block.items.join(' ');
+        case 'table':
+            return block.headers.join(' ') + ' ' + block.rows.map(r => r.join(' ')).join(' ');
+        case 'tip':
+        case 'info':
+        case 'warn': return block.text;
+        case 'code': return block.code;
+        case 'h3': return block.text;
+        case 'quote': return block.text;
+        default: return '';
+    }
+}
+
+// 构建搜索索引：遍历 CONTENT 的所有 chapter/section + 正文内容
 function buildSearchIndex() {
     searchIndex = [];
     CHAPTERS.forEach(ch => {
@@ -16,30 +34,51 @@ function buildSearchIndex() {
             title: data.title || ch.title,
             path: `#/${ch.id}`,
             chapter: ch.title,
+            preview: '',
         });
 
-        // section 级别
+        // section 级别 + 正文内容索引
         if (data.sections) {
             Object.entries(data.sections).forEach(([secId, sec]) => {
+                // 收集该 section 的正文文本
+                const fullText = (sec.blocks || []).map(blockToText).join(' ');
                 searchIndex.push({
                     title: sec.title,
                     path: `#/${ch.id}/${secId}`,
                     chapter: ch.title,
+                    preview: fullText,
                 });
             });
         }
 
-        // intro 中的 h3
+        // intro 中的 h3 + 后续内容
         if (data.intro) {
+            let currentH3 = null;
+            let currentText = [];
             data.intro.forEach(block => {
                 if (block.type === 'h3') {
-                    searchIndex.push({
-                        title: block.text,
-                        path: `#/${ch.id}#${block.id}`,
-                        chapter: ch.title,
-                    });
+                    if (currentH3) {
+                        searchIndex.push({
+                            title: currentH3,
+                            path: `#/${ch.id}#${block.id || ''}`,
+                            chapter: ch.title,
+                            preview: currentText.join(' '),
+                        });
+                    }
+                    currentH3 = block.text;
+                    currentText = [];
+                } else {
+                    currentText.push(blockToText(block));
                 }
             });
+            if (currentH3) {
+                searchIndex.push({
+                    title: currentH3,
+                    path: `#/${ch.id}`,
+                    chapter: ch.title,
+                    preview: currentText.join(' '),
+                });
+            }
         }
     });
 }
@@ -68,19 +107,33 @@ function renderSearchResults(query) {
     const q = query.toLowerCase();
     const results = searchIndex.filter(item =>
         item.title.toLowerCase().includes(q) ||
-        item.chapter.toLowerCase().includes(q)
+        item.chapter.toLowerCase().includes(q) ||
+        (item.preview && item.preview.toLowerCase().includes(q))
     ).slice(0, 20);
 
     if (results.length === 0) {
-        container.innerHTML = '<div class="search-result" style="color:var(--text-muted)">无匹配结果</div>';
+        container.innerHTML = '<div class="search-result" style="color:var(--text-muted);cursor:default">无匹配结果</div>';
         return;
     }
 
     container.innerHTML = results.map((r, i) => {
         const title = highlightMatch(r.title, q);
-        return `<div class="search-result ${i === selectedIndex ? 'selected' : ''}" data-path="${r.path}" data-index="${i}">
+        // 提取匹配上下文作为预览
+        let preview = '';
+        if (r.preview) {
+            const lowerPreview = r.preview.toLowerCase();
+            const matchIdx = lowerPreview.indexOf(q);
+            if (matchIdx !== -1) {
+                const start = Math.max(0, matchIdx - 30);
+                const end = Math.min(r.preview.length, matchIdx + q.length + 50);
+                preview = (start > 0 ? '...' : '') + r.preview.slice(start, end) + (end < r.preview.length ? '...' : '');
+                preview = highlightMatch(preview, q);
+            }
+        }
+        return `<div class="search-result ${i === selectedIndex ? 'selected' : ''}" data-path="${r.path}" data-index="${i}" role="option">
             <div class="search-result-title">${title}</div>
             <div class="search-result-path">${r.chapter}</div>
+            ${preview ? `<div class="search-result-preview">${preview}</div>` : ''}
         </div>`;
     }).join('');
 
@@ -94,6 +147,7 @@ function renderSearchResults(query) {
 }
 
 function highlightMatch(text, query) {
+    if (!text) return text;
     const idx = text.toLowerCase().indexOf(query);
     if (idx === -1) return text;
     return text.slice(0, idx) +
@@ -155,4 +209,9 @@ function updateSearchSelection() {
     document.querySelectorAll('.search-result').forEach((el, i) => {
         el.classList.toggle('selected', i === selectedIndex);
     });
+    // 确保选中项可见
+    const selected = document.querySelector('.search-result.selected');
+    if (selected) {
+        selected.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
 }

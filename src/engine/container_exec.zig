@@ -324,8 +324,8 @@ pub const Methods = struct {
         if (count < 0) return error.Overflow;
         const n: usize = @intCast(count);
         const fill_value = self.chanToValue(node.inputs[1]);
-        // 元素类型是否为 &T / *T：优先从 fill_value 通道的 type_desc.is_ref 读取
-        const elem_is_ref = self.ir.channels.get(node.inputs[1]).type_desc.is_ref;
+        // 元素类型是否为 &T / *T：优先从 fill_value 通道的 type_desc.isRef() 读取
+        const elem_is_ref = self.ir.channels.get(node.inputs[1]).type_desc.isRef();
 
         const use_arena = self.currentFuncUseArena();
         const v = if (use_arena) blk: {

@@ -320,16 +320,16 @@ pub const Methods = struct {
         const else_meta = self.channels.get(self.nodes.items[else_start + else_len - 1].output);
         const then_type = then_meta.type_desc;
         const result_chan = blk: {
-            if (then_type.is_null_type and !else_meta.type_desc.is_null_type and !else_meta.type_desc.is_nullable) {
+            if (then_type.isNullType() and !else_meta.type_desc.isNullType() and !else_meta.type_desc.isNullable()) {
                 break :blk try self.channels.allocNullable(else_meta.type_desc);
             }
-            if (else_meta.type_desc.is_null_type and !then_type.is_null_type and !then_type.is_nullable) {
+            if (else_meta.type_desc.isNullType() and !then_type.isNullType() and !then_type.isNullable()) {
                 break :blk try self.channels.allocNullable(then_type);
             }
-            if (then_type.is_nullable) {
+            if (then_type.isNullable()) {
                 break :blk try self.channels.allocNullable(then_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
             }
-            if (else_meta.type_desc.is_nullable) {
+            if (else_meta.type_desc.isNullable()) {
                 break :blk try self.channels.allocNullable(else_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
             }
             break :blk try self.allocChannel(then_type);
@@ -372,7 +372,7 @@ pub const Methods = struct {
                 // 对于 nullable scrutinee（如 match Path? { null => ..., p => ... }），
                 // 需要 unwrap 后绑定到内部值，使 p.method() 能正确分派到 Path 方法
                 const scrut_meta = self.channels.get(scrutinee_chan);
-                if (scrut_meta.type_desc.is_nullable) {
+                if (scrut_meta.type_desc.isNullable()) {
                     // nullable unwrap → 内部值通道
                     const unwrapped_chan = try self.allocChannel(scrut_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
                     try self.emit(Node.makeUnary(.nullable_unwrap, unwrapped_chan, 0, scrutinee_chan));
@@ -462,7 +462,7 @@ pub const Methods = struct {
 
     /// 发射 cmp_eq 节点：left == right → mask_chan
     pub fn emitCmpEq(self: *IRBuilder, left_chan: u16, right_chan: u16) BuildError!u16 {
-        const out = try self.allocChannel(type_descriptor_mod.mask_descriptor);
+        const out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
         const meta = try self.addScalarMeta(.{ .kind = .bool });
         try self.emit(Node.makeBinary(.cmp_eq, out, meta, left_chan, right_chan));
         return out;

@@ -405,6 +405,7 @@ pub const IRBuilder = struct {
     /// 设置后，inferChanTypeFromExpr 从 SemaResult.expr_types 查询表达式类型。
     pub fn setSemaResult(self: *IRBuilder, sr: *SemaResult) void {
         self.sema_result = sr;
+        self.channels.pool = &sr.type_desc_pool;
     }
 
     /// 注入纯度表（驱动式接入）。必须在 build() 之前调用。

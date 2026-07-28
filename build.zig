@@ -254,22 +254,4 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(exe);
-
-    // ---- deepCopy 微基准可执行文件 ----
-    const deepcopy_bench_module = b.createModule(.{
-        .root_source_file = b.path("bench/deepcopy_bench.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    deepcopy_bench_module.addImport("value", value_module);
-    deepcopy_bench_module.addImport("mem", mem_module);
-    deepcopy_bench_module.addImport("ast", ast_module);
-    const deepcopy_bench_exe = b.addExecutable(.{
-        .name = "deepcopy_bench",
-        .root_module = deepcopy_bench_module,
-    });
-    deepcopy_bench_exe.root_module.linkSystemLibrary("c", .{});
-    const deepcopy_install = b.addInstallArtifact(deepcopy_bench_exe, .{});
-    const bench_step = b.step("bench-deepcopy", "Build deepCopy micro-benchmark");
-    bench_step.dependOn(&deepcopy_install.step);
 }

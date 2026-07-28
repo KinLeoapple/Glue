@@ -29,7 +29,7 @@ pub fn printIR(ir: *const GlueIR, allocator: std.mem.Allocator, buf: *std.ArrayL
             meta.elem_width,
         });
         if (meta.is_cell) try buf.appendSlice(allocator, " [cell]");
-        if (meta.type_desc.is_nullable) {
+        if (meta.type_desc.isNullable()) {
             if (meta.inner_type_desc) |inner| {
                 try buf.print(allocator, " inner={s}", .{inner.type_name});
             }

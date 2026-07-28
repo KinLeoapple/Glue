@@ -80,7 +80,7 @@ pub const Methods = struct {
                 } else 0;
                 try self.runtime.allocVector(node.output, count);
                 const desc = vm.elem_type_desc;
-                const ops = desc.scalar_ops orelse return error.UnsupportedOp;
+                const ops = desc.scalar_ops;
                 for (0..count) |i| {
                     const val = start + @as(i64, @intCast(i));
                     const elem_ptr = self.runtime.vectorElemPtr(node.output, i);

@@ -88,7 +88,7 @@ pub fn floatKindFromSuffix(suffix: ?[]const u8) ?FloatKind {
 pub fn binaryOpToNodeOp(op: ast.BinaryOp, operand_type: *const TypeDescriptor) BuildError!NodeOp {
     const is_int = operand_type.isInt();
     const is_float = operand_type.isFloat();
-    const is_ref = operand_type.is_ref;
+    const is_ref = operand_type.isRef();
     return switch (op) {
         .add => if (is_int) .int_add else if (is_float) .float_add else if (is_ref) .string_concat else return error.UnsupportedType,
         .sub => if (is_int) .int_sub else if (is_float) .float_sub else return error.UnsupportedType,
@@ -128,7 +128,7 @@ pub fn unaryOpToNodeOp(op: ast.UnaryOp, operand_type: *const TypeDescriptor) Bui
 /// 二元运算结果类型
 pub fn binaryResultType(op: ast.BinaryOp, operand_type: *const TypeDescriptor) *const TypeDescriptor {
     return switch (op) {
-        .eq, .not_eq, .ref_eq, .ref_neq, .lt, .gt, .lt_eq, .gt_eq => type_descriptor_mod.mask_descriptor, // 比较输出 mask
+        .eq, .not_eq, .ref_eq, .ref_neq, .lt, .gt, .lt_eq, .gt_eq => type_descriptor_mod.bool_descriptor, // 比较输出 bool
         .and_op, .or_op => type_descriptor_mod.bool_descriptor,
         .concat_list => operand_type, // 字符串/数组拼接继承操作数类型
         else => operand_type, // 算术/位运算继承操作数类型

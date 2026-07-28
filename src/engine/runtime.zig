@@ -42,9 +42,6 @@ pub const ChanSlot = struct {
     /// 类型描述符（含 is_ref/scalar_ops/is_nullable/is_null_type/is_unit_type 等编译期元信息）
     /// 所有类型判断统一通过 type_desc.<field> 获取，无任何通道派分
     type_desc: *const ir_mod.type_descriptor_mod.TypeDescriptor = ir_mod.type_descriptor_mod.null_descriptor,
-    /// nullable 通道的内部类型描述符（仅 type_desc.is_nullable 时有效）
-    /// 用于 readChannel/writeChannel 通过 inner type 的 scalar_ops 读写 inner data
-    inner_type_desc: ?*const ir_mod.type_descriptor_mod.TypeDescriptor = null,
     /// 元素宽度（字节，权威值——nullable 宽度因 inner_type 而异：inner.size + 1 byte flag）
     width: u8 = 0,
     /// 元素数量（标量=1，向量=N）
@@ -166,13 +163,11 @@ pub const Runtime = struct {
         self.chan_slots = try self.backing.alloc(ChanSlot, self.chan_count);
         @memset(self.chan_slots, .{});
 
-        // 为所有通道设置 type_desc/inner_type_desc/width（静态元信息，不随函数调用变化）
-        // 本地通道的 chan_slots.ptr 在 enterFunction 中设置，但 type_desc/inner_type_desc/width 在此处一次性设置
-        // nullable 通道的 inner_type_desc 从 ChannelMeta.inner_type_desc 获取，用于 vtable 读写 inner data
+        // 为所有通道设置 type_desc/width（静态元信息，不随函数调用变化）
+        // 本地通道的 chan_slots.ptr 在 enterFunction 中设置，但 type_desc/width 在此处一次性设置
         for (0..self.chan_count) |i| {
             const meta = channels.get(@intCast(i));
             self.chan_slots[i].type_desc = meta.type_desc;
-            self.chan_slots[i].inner_type_desc = meta.inner_type_desc;
             self.chan_slots[i].width = meta.elem_width;
         }
 
@@ -183,11 +178,9 @@ pub const Runtime = struct {
         for (0..gc) |i| {
             const meta = channels.get(@intCast(i));
             self.global_slots[i].type_desc = meta.type_desc;
-            self.global_slots[i].inner_type_desc = meta.inner_type_desc;
             self.global_slots[i].width = meta.elem_width;
             self.global_slots[i].length = 1;
             self.chan_slots[i].type_desc = meta.type_desc;
-            self.chan_slots[i].inner_type_desc = meta.inner_type_desc;
             self.chan_slots[i].width = meta.elem_width;
             self.chan_slots[i].length = 1;
             if (meta.elem_width == 0) {
@@ -527,30 +520,12 @@ pub const Runtime = struct {
     // ════════════════════════════════════════════
 
     /// 统一读取通道值为 value.Value（通过 scalar_ops vtable 分派）
-    /// 标量类型 + ref + unit/null 均有 vtable，零运行时 switch。
+    /// 标量类型 + ref + unit/null + nullable 均有专属 vtable，零运行时 switch。
     /// 零字节类型（unit/null）ptr 可能为 null，使用 dummy ptr 调用 vtable。
-    /// nullable 通道：通过 inner_type_desc.scalar_ops 读取 inner data，
-    /// 再读取 null flag，组装为 Value。所有类型均通过 vtable 读写。
+    /// nullable 通道：通过 nullable<T> 专属 scalar_ops 读写（内含 null flag 检查）。
     pub fn readChannel(self: *Runtime, chan: u16) ?value.Value {
         const slot = &self.chan_slots[chan];
-        // nullable 通道：[data (inner_w bytes) | 1 byte flag]
-        // 通过 inner_type_desc.scalar_ops 读取 inner data + 单独读取 flag
-        if (slot.type_desc.is_nullable) {
-            const inner_ops = if (slot.inner_type_desc) |itd| itd.scalar_ops else null;
-            if (inner_ops) |iops| {
-                if (slot.ptr) |p| {
-                    const inner_w = slot.width - 1; // 减去 flag 字节
-                    // 检查 null flag
-                    if (p[inner_w] != 0) return value.Value.fromUnit(); // null
-                    // 非 null：通过 inner type 的 scalar_ops 读取 inner data
-                    return iops.read(@ptrCast(p));
-                }
-                return value.Value.fromUnit();
-            }
-            return value.Value.fromUnit();
-        }
-        // 标量/ref/unit/null：通过 type_desc.scalar_ops vtable 读取
-        const ops = slot.type_desc.scalar_ops orelse return null;
+        const ops = slot.type_desc.scalar_ops;
         if (slot.ptr) |p| return ops.read(@ptrCast(p));
         // ptr 为 null：仅对零字节类型（unit/null）合法，使用 dummy ptr
         if (slot.width == 0) return ops.read(@ptrFromInt(@as(usize, 1)));
@@ -560,52 +535,10 @@ pub const Runtime = struct {
     /// 统一写入 value.Value 到通道（通过 scalar_ops vtable 分派）
     /// 先 coerce 将 Value 转为通道类型匹配的 Value，再 write 写入。
     /// 零运行时 switch，且安全处理跨类型写入（如 i32 写入 i64 通道）。
-    /// nullable 通道：通过 inner_type_desc.scalar_ops 写入 inner data + 设置 flag。
-    /// 所有类型均通过 vtable 读写。
+    /// nullable 通道：通过 nullable<T> 专属 scalar_ops 读写（内含 null flag 设置）。
     pub fn writeChannel(self: *Runtime, chan: u16, v: value.Value) bool {
         const slot = &self.chan_slots[chan];
-        // nullable 通道：[data (inner_w bytes) | 1 byte flag]
-        // 通过 inner_type_desc.scalar_ops 写入 inner data + 设置 flag
-        if (slot.type_desc.is_nullable) {
-            const inner_ops = if (slot.inner_type_desc) |itd| itd.scalar_ops else null;
-            if (inner_ops) |iops| {
-                if (slot.ptr) |p| {
-                    const inner_w = slot.width - 1; // 减去 flag 字节
-                    // null/unit 值：设置 null flag
-                    switch (v) {
-                        .null_val, .unit => {
-                            p[inner_w] = 1; // null flag
-                            return true;
-                        },
-                        else => {
-                            // 非 null：通过 inner type 的 scalar_ops 写入 inner data
-                            const coerced = iops.coerce(v);
-                            iops.write(@ptrCast(p), coerced);
-                            p[inner_w] = 0; // non-null flag
-                            return true;
-                        },
-                    }
-                }
-                return false;
-            }
-            return false;
-        }
-        // 标量/ref/unit/null：通过 type_desc.scalar_ops vtable 写入
-        // 检查 type_desc 指针有效性
-        const td_addr = @intFromPtr(slot.type_desc);
-        if (td_addr < 0x1000 or td_addr >= 0x8000000000000000) {
-            return false;
-        }
-        const ops = slot.type_desc.scalar_ops orelse return false;
-        // 检查 ops 指针有效性
-        const ops_addr = @intFromPtr(ops);
-        if (ops_addr < 0x1000 or ops_addr >= 0x8000000000000000) {
-            return false;
-        }
-        // 额外检查：用 isReadable 验证 ops 指向的内存是否可读
-        if (!type_descriptor_mod.isReadable(ops_addr)) {
-            return false;
-        }
+        const ops = slot.type_desc.scalar_ops;
         const coerced = ops.coerce(v);
         if (slot.ptr) |p| {
             ops.write(@ptrCast(p), coerced);
@@ -622,32 +555,34 @@ pub const Runtime = struct {
     }
 
     /// 统一引用判断：通道是否持有引用类型（堆对象指针）
-    /// 通过 type_desc.is_ref 字段获取（替代旧 chan_type 派分）
+    /// 通过 type_desc.isRef() 方法获取（替代旧 chan_type 派分）
     pub inline fn isRef(self: *Runtime, chan: u16) bool {
-        return self.chan_slots[chan].type_desc.is_ref;
+        return self.chan_slots[chan].type_desc.isRef();
     }
 
     /// 统一标量判断：通道是否持有标量值（有 scalar_ops vtable）
     pub inline fn isScalar(self: *Runtime, chan: u16) bool {
-        return self.chan_slots[chan].type_desc.scalar_ops != null;
+        _ = self;
+        _ = chan;
+        return true;
     }
 
     /// 统一 nullable 判断：通道是否为 nullable<T> 类型
-    /// 通过 type_desc.is_nullable 字段获取
+    /// 通过 type_desc.isNullable() 方法获取
     pub inline fn isNullable(self: *Runtime, chan: u16) bool {
-        return self.chan_slots[chan].type_desc.is_nullable;
+        return self.chan_slots[chan].type_desc.isNullable();
     }
 
     /// 统一 null 类型判断：通道是否为 null 类型
-    /// 通过 type_desc.is_null_type 字段获取
+    /// 通过 type_desc.type_id 判断（NULL_TYPE_ID=20）
     pub inline fn isNull(self: *Runtime, chan: u16) bool {
-        return self.chan_slots[chan].type_desc.is_null_type;
+        return self.chan_slots[chan].type_desc.isNullType();
     }
 
     /// 统一 unit 类型判断：通道是否为 unit 类型
-    /// 通过 type_desc.is_unit_type 字段获取
+    /// 通过 type_desc.type_id 判断（UNIT_TYPE_ID=21）
     pub inline fn isUnit(self: *Runtime, chan: u16) bool {
-        return self.chan_slots[chan].type_desc.is_unit_type;
+        return self.chan_slots[chan].type_desc.isUnitType();
     }
 
 
@@ -657,7 +592,7 @@ pub const Runtime = struct {
     pub fn formatChannel(self: *Runtime, chan: u16, buf: []u8) ?[]const u8 {
         const slot = &self.chan_slots[chan];
         if (slot.ptr == null) return null;
-        const ops = slot.type_desc.scalar_ops orelse return null;
+        const ops = slot.type_desc.scalar_ops;
         return ops.format(@ptrCast(slot.ptr.?), buf);
     }
 
@@ -665,7 +600,7 @@ pub const Runtime = struct {
     /// 用于 ref_chan 内嵌的标量引用场景：指针来自其他通道的 rawPtr，
     /// type_desc 来自源通道。零运行时 switch。
     pub fn formatScalarPtr(_: *Runtime, ptr: *anyopaque, type_desc: *const ir_mod.type_descriptor_mod.TypeDescriptor, buf: []u8) ?[]const u8 {
-        const ops = type_desc.scalar_ops orelse return null;
+        const ops = type_desc.scalar_ops;
         return ops.format(ptr, buf);
     }
 

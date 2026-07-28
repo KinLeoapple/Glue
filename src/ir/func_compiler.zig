@@ -193,9 +193,9 @@ pub const Methods = struct {
 
         // 若函数返回 nullable 类型且函数体未产生 nullable_chan，则包装为 nullable
         const return_meta = self.channels.get(return_chan);
-        const final_chan = if (return_meta.type_desc.is_nullable) blk: {
+        const final_chan = if (return_meta.type_desc.isNullable()) blk: {
             const body_meta = self.channels.get(throw_wrapped);
-            if (body_meta.type_desc.is_nullable) {
+            if (body_meta.type_desc.isNullable()) {
                 break :blk throw_wrapped; // 已是 nullable
             }
             // 需要包装（null_chan 或其他类型 → nullable_make）
@@ -511,7 +511,7 @@ pub const Methods = struct {
         defer self.current_type_args = saved_type_args;
 
         const return_chan_type = self.chanTypeFromTypeNodeBound(fd.return_type) orelse type_descriptor_mod.i64_descriptor;
-        const placeholder_return_chan = if (return_chan_type.is_nullable)
+        const placeholder_return_chan = if (return_chan_type.isNullable())
             try self.channels.allocNullable(type_descriptor_mod.i64_descriptor) // inner_type 暂用 i64，compileFunction 会修正
         else
             try self.allocChannel(return_chan_type);

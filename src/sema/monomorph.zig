@@ -963,7 +963,7 @@ fn resolveExpr(expr: *const ast.Expr, ctx: *ResolveCtx) ResolveError!void {
     try ctx.instance.expr_types.put(@intFromPtr(expr), .{
         .type_desc = td,
         .type_name = td.type_name,
-        .is_ref_type = td.is_ref,
+        .is_ref_type = td.isRef(),
     });
 
     // v3 阶段 1：同步填充 sema_result.resolved_type_descs（全局表达式→TypeDescriptor 映射）

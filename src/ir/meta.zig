@@ -246,7 +246,7 @@ pub const OrbitMeta = struct {
     /// 是否为 spawn（fire-and-forget，无 join）
     is_spawn: bool = false,
     /// 参数引用位图：第 i 位为 1 表示第 i 个参数为 &T / *T（引用语义，跳过深拷贝）。
-    /// 从 Function.param_channels 的 ChannelMeta.is_ref 提取。
+    /// 从 Function.param_channels 的 ChannelMeta.type_desc.isRef() 提取。
     /// 最多支持 8 个参数（与 CallMeta.arg_ref_bits 对齐）。
     arg_ref_bits: u8 = 0,
     /// 泛型类型实参（与 CallMeta.type_args 一致，支持 async 泛型函数）

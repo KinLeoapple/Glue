@@ -171,7 +171,7 @@ pub fn buildFrameLayout(
         slots[i] = .{
             .offset = offset,
             .size = cm.elem_width,
-            .is_ref = cm.type_desc.is_ref,
+            .is_ref = cm.type_desc.isRef(),
         };
     }
 

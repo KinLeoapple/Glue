@@ -80,13 +80,13 @@ pub const Methods = struct {
                     if (vd.type_annotation) |tn| {
                         if (tn.* == .nullable) {
                             const value_meta = self.channels.get(chan);
-                            if (value_meta.type_desc.is_null_type) {
+                            if (value_meta.type_desc.isNullType()) {
                                 // null_literal → 分配 nullable 通道，nullable_make 会写入 null flag
                                 const inner_ct = self.chanTypeFromTypeNodeBound(tn.nullable.inner) orelse self.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
                                 const nc = try self.channels.allocNullable(inner_ct);
                                 try self.emit(Node.makeUnary(.nullable_make, nc, 0, chan));
                                 chan = nc;
-                            } else if (!value_meta.type_desc.is_nullable) {
+                            } else if (!value_meta.type_desc.isNullable()) {
                                 // 非 null 值 → 包装为 nullable
                                 const nc = try self.channels.allocNullable(value_meta.type_desc);
                                 try self.emit(Node.makeUnary(.nullable_make, nc, 0, chan));
@@ -120,7 +120,7 @@ pub const Methods = struct {
                     // 与 async_handle_meta 映射，因此使用浅拷贝（_pad=1）并传播映射
                     const final_chan = blk: {
                         const src_meta = self.channels.get(chan);
-                        if (src_meta.type_desc.is_ref and !self.isRefExpr(vd.value)) {
+                        if (src_meta.type_desc.isRef() and !self.isRefExpr(vd.value)) {
                             const is_async_handle = self.async_handle_meta.get(chan) != null;
                             const copy_chan = try self.allocChannel(type_descriptor_mod.ref_descriptor);
                             var load_node = Node.makeUnary(.load, copy_chan, 0, chan);
@@ -150,13 +150,13 @@ pub const Methods = struct {
                 // 类型标注为 nullable 时，将值包装为 nullable_chan
                 if (vd.type_annotation) |tn| {
                     if (tn.* == .nullable) {
-                        if (value_meta.type_desc.is_null_type) {
+                        if (value_meta.type_desc.isNullType()) {
                             const inner_ct = self.chanTypeFromTypeNodeBound(tn.nullable.inner) orelse self.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
                             const nc = try self.channels.allocNullable(inner_ct);
                             try self.emit(Node.makeUnary(.nullable_make, nc, 0, value_chan));
                             value_chan = nc;
                             value_meta = self.channels.get(value_chan);
-                        } else if (!value_meta.type_desc.is_nullable) {
+                        } else if (!value_meta.type_desc.isNullable()) {
                             const nc = try self.channels.allocNullable(value_meta.type_desc);
                             try self.emit(Node.makeUnary(.nullable_make, nc, 0, value_chan));
                             value_chan = nc;
@@ -339,9 +339,9 @@ pub const Methods = struct {
                 } else raw_chan;
                 // 若返回通道为 nullable，包装返回值
                 const ret_meta = self.channels.get(ret_chan);
-                const value_chan = if (ret_meta.type_desc.is_nullable) blk: {
+                const value_chan = if (ret_meta.type_desc.isNullable()) blk: {
                     const body_meta = self.channels.get(throw_wrapped);
-                    if (body_meta.type_desc.is_nullable) break :blk throw_wrapped;
+                    if (body_meta.type_desc.isNullable()) break :blk throw_wrapped;
                     const nc = try self.channels.allocNullable(ret_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
                     try self.emit(Node.makeUnary(.nullable_make, nc, 0, throw_wrapped));
                     break :blk nc;
