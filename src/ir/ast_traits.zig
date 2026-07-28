@@ -395,7 +395,7 @@ pub fn allocChanFromTypeNode(channels: *ChannelSpace, type_node: ?*ast.TypeNode,
             return try channels.allocNullable(inner_td);
         },
         else => {
-            const td = chanTypeFromTypeNode(tn, sema_result) orelse type_descriptor_mod.i64_descriptor;
+            const td = chanTypeFromTypeNode(tn, sema_result) orelse unreachable;
             return try channels.alloc(td);
         },
     };
@@ -478,7 +478,6 @@ pub fn astContainsBreakOrContinueExpr(expr: *const ast.Expr) bool {
         .type_cast => |tc| return astContainsBreakOrContinueExpr(tc.expr),
         .atomic_expr => |ae| return astContainsBreakOrContinueExpr(ae.value),
         .lazy => |l| return astContainsBreakOrContinueExpr(l.expr),
-        .spawn_expr => |se| return astContainsBreakOrContinueExpr(se.expr),
         .array_literal => |al| {
             for (al.elements) |e| {
                 if (astContainsBreakOrContinueExpr(e)) return true;

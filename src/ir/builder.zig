@@ -160,6 +160,10 @@ pub const IRBuilder = struct {
     arena: *std.heap.ArenaAllocator,
 
     nodes: std.ArrayList(Node),
+    /// 节点源码位置表：与 nodes 平行，emit 时同步追加
+    node_locs: std.ArrayList(ast.SourceLocation) = .empty,
+    /// 当前编译位置（由 compileExpr/compileStmt 入口设置）
+    current_loc: ast.SourceLocation = .{ .line = 0, .column = 0 },
     scalar_metas: std.ArrayList(ScalarMeta),
     call_metas: std.ArrayList(CallMeta),
     vector_metas: std.ArrayList(VectorMeta),
@@ -213,6 +217,10 @@ pub const IRBuilder = struct {
     gadt_binding_stack: std.ArrayList(std.StringHashMap(*const type_descriptor_mod.TypeDescriptor)) = .empty,
     /// 当前函数名（用于判断递归调用）
     current_func_name: ?[]const u8 = null,
+    /// 调试用：记录最后编译的函数/val名（不恢复，用于错误定位）
+    debug_error_func_name: ?[]const u8 = null,
+    /// 调试用：记录最后编译的表达式种类（不恢复，用于错误定位）
+    debug_last_expr_tag: []const u8 = "",
     /// 当前函数的参数类型注解（用于 GADT 类型推断）
     current_func_param_types: ?[]const ast.Param = null,
     /// 当前函数的类型参数（用于 typeof(T) 哨兵发射）
@@ -325,7 +333,6 @@ pub const IRBuilder = struct {
     }
     pub const findFunDeclAst = @import("decl_collector.zig").Methods.findFunDeclAst;
     pub const getCtorTag = @import("decl_collector.zig").Methods.getCtorTag;
-    pub const registerBuiltinErrorTypes = @import("decl_collector.zig").Methods.registerBuiltinErrorTypes;
     pub const collectTypeMetadata = @import("decl_collector.zig").Methods.collectTypeMetadata;
     pub const resolveTypeMetadataRefs = @import("decl_collector.zig").Methods.resolveTypeMetadataRefs;
     pub const computeTypeLayout = @import("decl_collector.zig").Methods.computeTypeLayout;
@@ -462,15 +469,13 @@ pub const IRBuilder = struct {
         // 反射：注册内建类型（i32/str/bool/char/f64 等）到 TypeMetadataTable
         // 使 typeof(i32) 等返回 Primitive kind + 正确 name/layout，而非占位 "?"
         try self.registerBuiltinTypeMetadata(arena_alloc);
-        // 注册 builtin error_newtype 构造器（CastError 等）—— 从 glue_builtin 元信息表加载
-        // builtin 类型无 AST，但代码生成需要 sema_result/field_id_map 条目
-        // 决策 #18：sema 启动时全加载类型定义，代码生成阶段按需编译方法体
-        try self.registerBuiltinErrorTypes(arena_alloc);
 
         // 第一遍：注册所有函数名 + 预分配 Function 占位条目
         // 同时注册 type_decl（类型+构造器）和 trait_decl
         // 占位条目包含 is_async/return_type 信息，供 compileCall 在被调用函数尚未编译时查询
-        var func_count: u16 = 0;
+        // builtin error 类型（Err/Error/CastError/IOError/TimeError 等）由 module_loader
+        // 从 @embedFile 嵌入的 .glue 文件解析为 AST，走通用 registerTypeDecl 路径注册
+        var func_count: u16 = @intCast(self.functions.items.len);
         var has_global_init = false;
         for (module.declarations) |decl| {
             switch (decl) {
@@ -533,7 +538,7 @@ pub const IRBuilder = struct {
                         switch (stmt.*) {
                             .val_decl => |vd| {
                                 const chan_type = if (vd.type_annotation) |tn|
-                                    self.chanTypeFromTypeNodeResolved(tn) orelse type_descriptor_mod.i64_descriptor
+                                    self.chanTypeFromTypeNodeResolved(tn) orelse unreachable
                                 else
                                     self.inferChanTypeFromExpr(vd.value) orelse self.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
                                 const chan = try self.allocChannel(chan_type);
@@ -544,7 +549,7 @@ pub const IRBuilder = struct {
                             },
                             .var_decl => |vd| {
                                 const chan_type = if (vd.type_annotation) |tn|
-                                    self.chanTypeFromTypeNodeResolved(tn) orelse type_descriptor_mod.i64_descriptor
+                                    self.chanTypeFromTypeNodeResolved(tn) orelse unreachable
                                 else
                                     self.inferChanTypeFromExpr(vd.value) orelse self.sema_result.getOrCreateRefDesc("unknown") catch unreachable;
                                 const cell_chan = try self.allocCellChannel(chan_type);
@@ -584,6 +589,7 @@ pub const IRBuilder = struct {
                             switch (stmt.*) {
                                 .val_decl => |vd| {
                                     const binding = self.lookupVar(vd.name) orelse continue;
+                                    self.debug_error_func_name = vd.name;
                                     const value_chan = try self.compileExpr(vd.value);
                                     var store_node = Node.makeUnary(.store, binding.chan, 0, value_chan);
                                     store_node._pad = if (self.isRefExpr(vd.value)) 1 else 0;
@@ -591,6 +597,7 @@ pub const IRBuilder = struct {
                                 },
                                 .var_decl => |vd| {
                                     const binding = self.lookupVar(vd.name) orelse continue;
+                                    self.current_func_name = vd.name;
                                     const value_chan = try self.compileExpr(vd.value);
                                     var store_node = Node.makeUnary(.store, binding.chan, 0, value_chan);
                                     store_node._pad = if (self.isRefExpr(vd.value)) 1 else 0;
@@ -677,8 +684,14 @@ pub const IRBuilder = struct {
         // type_desc_pool 所有权转移：channels.type_desc 指针引用此 pool 分配的内存，
         // pool 必须与 GlueIR 同生命周期，否则 sema_result.deinit() 会释放悬垂指针
         const type_desc_pool = self.sema_result.takeTypeDescPool();
+
+        // 确保 node_locs 与 nodes 等长：编译器生成的节点（未经 emit）填充 {0, 0}
+        while (self.node_locs.items.len < self.nodes.items.len) {
+            try self.node_locs.append(arena_alloc, .{ .line = 0, .column = 0 });
+        }
         return GlueIR{
             .nodes = try self.nodes.toOwnedSlice(arena_alloc),
+            .node_locs = try self.node_locs.toOwnedSlice(arena_alloc),
             .scalar_metas = try self.scalar_metas.toOwnedSlice(arena_alloc),
             .call_metas = try self.call_metas.toOwnedSlice(arena_alloc),
             .vector_metas = try self.vector_metas.toOwnedSlice(arena_alloc),
@@ -822,6 +835,11 @@ pub const IRBuilder = struct {
 
     pub fn allocChannel(self: *IRBuilder, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
         return self.channels.alloc(type_desc);
+    }
+
+    /// 分配带 inner_type_desc 的通道（Lazy<T>/Channel<T> 等容器）
+    pub fn allocChannelWithInner(self: *IRBuilder, type_desc: *const type_descriptor_mod.TypeDescriptor, inner_type_desc: ?*const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.channels.allocWithInner(type_desc, inner_type_desc);
     }
 
     pub fn allocRef(self: *IRBuilder, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
@@ -991,6 +1009,7 @@ pub const IRBuilder = struct {
 
     pub fn emit(self: *IRBuilder, node: Node) !void {
         try self.nodes.append(self.arena.allocator(), node);
+        try self.node_locs.append(self.arena.allocator(), self.current_loc);
     }
 
     // ════════════════════════════════════════════
@@ -1190,6 +1209,12 @@ pub const IRBuilder = struct {
     /// 用于二元/一元运算等严格上下文：ref_chan 操作数在参与标量运算前先被观察。
     pub const emitLazyForce = @import("expr_compiler.zig").Methods.emitLazyForce;
 
+    /// 从 sema expr_types 查询 lazy 表达式的元素类型 T（Lazy<T> 中的 T）
+    pub const lazyElemTypeFromExpr = @import("expr_compiler.zig").Methods.lazyElemTypeFromExpr;
+
+    /// 从 sema expr_types 查询 channel 方法调用的元素类型 T（Channel<T> 的 recv/tryRecv）
+    pub const channelElemTypeFromExpr = @import("expr_compiler.zig").Methods.channelElemTypeFromExpr;
+
     /// 通用观察辅助：当通道是 ref_chan（Lazy<T> 或其他引用）且当前上下文需要标量值时，
     /// 发射 lazy_force 节点强制求值。若已是标量通道则原样返回。
     pub const forceLazyIfRef = @import("expr_compiler.zig").Methods.forceLazyIfRef;
@@ -1366,6 +1391,12 @@ pub const IRBuilder = struct {
     /// type_args_hint != null 时优先使用显式类型实参；否则从参数类型推断
     pub const compileCallWithTypeArgs = @import("expr_compiler.zig").Methods.compileCallWithTypeArgs;
 
+    /// 从 sema call_instantiations 查询调用点的 instance_id（消费 sema 产出）
+    pub const instanceIdFromCallExpr = @import("expr_compiler.zig").Methods.instanceIdFromCallExpr;
+
+    /// 从 instance_id 提取 type_args（u16 切片，用于 CallMeta/OrbitMeta）
+    pub const typeArgsFromInstanceId = @import("expr_compiler.zig").Methods.typeArgsFromInstanceId;
+
     /// 从 sema call_instantiations 查询调用点的 type_args（消费 sema 产出）
     pub const typeArgsFromCallExpr = @import("expr_compiler.zig").Methods.typeArgsFromCallExpr;
 
@@ -1481,7 +1512,7 @@ pub const IRBuilder = struct {
     pub const compileConstructorCall = @import("expr_compiler.zig").Methods.compileConstructorCall;
 
     // ════════════════════════════════════════════
-    // 星轨编译（async/spawn，Phase 5）
+    // 星轨编译（async，Phase 5）
     // ════════════════════════════════════════════
 
     /// 发射 orbit_async_create 节点：创建异步轨道，返回 handle 通道
@@ -1792,10 +1823,6 @@ pub const IRBuilder = struct {
     /// 编译 lazy 表达式：lazy expr → LazyValue（包装无参 thunk 闭包）
     /// thunk 捕获 lazy 表达式所在作用域的自由变量，body 直接返回 expr 的值。
     pub const compileLazyExpr = @import("expr_compiler.zig").Methods.compileLazyExpr;
-
-    /// 编译 spawn 表达式：spawn expr → orbit_async_create（不自动 await）
-    /// expr 应为 async 函数调用或 lambda
-    pub const compileSpawnExpr = @import("expr_compiler.zig").Methods.compileSpawnExpr;
 
     /// 编译 inline_trait_value：trait { methods } → record of closures
     /// 每个方法编译为闭包，存储在 record 字段中

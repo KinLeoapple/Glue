@@ -99,6 +99,9 @@ fn inferExprChanTypeAdapter(ctx: *anyopaque, expr: *const ast.Expr) ?*const type
 
 pub const Methods = struct {
     pub fn compileExpr(self: *IRBuilder, expr: *const ast.Expr) BuildError!u16 {
+        self.debug_last_expr_tag = @tagName(expr.*);
+        // 记录当前表达式的源码位置，供 emit 同步写入 node_locs
+        self.current_loc = ast.exprLocation(expr);
         // 尾位置传播：保存当前尾位置状态，函数返回时恢复
         // 尾位置传播的表达式（if/match/block/propagate/call）保持 in_tail_position，
         // 其他表达式清除 in_tail_position（其子表达式不在尾位置）
@@ -245,7 +248,6 @@ pub const Methods = struct {
             .compound_assign => |ca| return self.compileCompoundAssignExpr(ca.op, ca.target, ca.value),
             .atomic_expr => |ae| return self.compileAtomicExpr(ae.value),
             .lazy => |lz| return self.compileLazyExpr(lz.expr),
-            .spawn_expr => |se| return self.compileSpawnExpr(se.expr),
             .inline_trait_value => |itv| return self.compileInlineTraitValue(itv.methods),
         }
     }
@@ -543,13 +545,12 @@ pub const Methods = struct {
         };
         if (force_lazy) {
             if (left_meta.type_desc.isRef() and right_meta.type_desc.isRef()) {
-                // 两侧都是惰性引用，无法从上下文推断 T：保守地强制为 i64
-                left_ch = try self.emitLazyForce(left_ch, type_descriptor_mod.i64_descriptor);
-                right_ch = try self.emitLazyForce(right_ch, type_descriptor_mod.i64_descriptor);
+                left_ch = try self.emitLazyForce(left_ch);
+                right_ch = try self.emitLazyForce(right_ch);
             } else if (left_meta.type_desc.isRef()) {
-                left_ch = try self.emitLazyForce(left_ch, right_meta.type_desc);
+                left_ch = try self.emitLazyForce(left_ch);
             } else if (right_meta.type_desc.isRef()) {
-                right_ch = try self.emitLazyForce(right_ch, left_meta.type_desc);
+                right_ch = try self.emitLazyForce(right_ch);
             }
             left_meta = self.channels.get(left_ch);
             right_meta = self.channels.get(right_ch);
@@ -610,20 +611,70 @@ pub const Methods = struct {
         return out;
     }
 
-    /// 发射 lazy_force 节点：将 Lazy<T> 强制求值为标量 T。
-    /// 用于二元/一元运算等严格上下文：ref_chan 操作数在参与标量运算前先被观察。
-    pub fn emitLazyForce(self: *IRBuilder, src_chan: u16, dst_ct: *const type_descriptor_mod.TypeDescriptor) BuildError!u16 {
+    /// 从 sema expr_types 查询 lazy 表达式的元素类型 T（Lazy<T> 中的 T）
+    /// sema 在 inferExpr 中对 Lazy<T> 记录 inner_type_desc，此处直接读取
+    pub fn lazyElemTypeFromExpr(self: *IRBuilder, expr: *const ast.Expr) ?*const type_descriptor_mod.TypeDescriptor {
+        // 1. 优先查 instance.expr_types
+        if (self.current_instance_id) |id| {
+            if (id < self.sema_result.monomorph_instances.items.len) {
+                const inst = &self.sema_result.monomorph_instances.items[id];
+                if (inst.expr_types.get(@intFromPtr(expr))) |info| {
+                    return info.inner_type_desc;
+                }
+            }
+        }
+        // 2. 查 sema_result.expr_types
+        if (self.sema_result.getExpr(@intFromPtr(expr))) |info| {
+            return info.inner_type_desc;
+        }
+        return null;
+    }
+
+    /// 从 sema ExprInfo 查询 channel 方法调用的元素类型 T
+    /// sema 在 method_call 分支对 Channel<T> 的 recv/tryRecv/send 做类型推导：
+    /// - recv: 返回类型 = T → 读 type_desc
+    /// - tryRecv: 返回类型 = nullable<T> → 读 inner_type_desc
+    /// 消除 current_returns_throw 启发式和硬编码 i64_descriptor
+    pub fn channelElemTypeFromExpr(self: *IRBuilder, call_expr: *const ast.Expr, method: []const u8) ?*const type_descriptor_mod.TypeDescriptor {
+        const info = blk: {
+            if (self.current_instance_id) |id| {
+                if (id < self.sema_result.monomorph_instances.items.len) {
+                    const inst = &self.sema_result.monomorph_instances.items[id];
+                    if (inst.expr_types.get(@intFromPtr(call_expr))) |i| {
+                        break :blk i;
+                    }
+                }
+            }
+            if (self.sema_result.getExpr(@intFromPtr(call_expr))) |i| {
+                break :blk i;
+            }
+            break :blk null;
+        } orelse return null;
+
+        if (std.mem.eql(u8, method, "tryRecv")) {
+            return info.inner_type_desc;
+        }
+        // recv: 返回类型 = T
+        return info.type_desc;
+    }
+
+    /// 发射 lazy_force 节点：将 Lazy<T> 强制求值为 T。
+    /// 元素类型 T 从 ChannelMeta.inner_type_desc 读取（由 compileLazyExpr 存入），
+    /// 不再需要调用方传入 dst_ct，消除 14+ 处硬编码。
+    pub fn emitLazyForce(self: *IRBuilder, src_chan: u16) BuildError!u16 {
+        const meta = self.channels.get(src_chan);
+        const dst_ct = meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor;
         const out = try self.allocChannel(dst_ct);
         try self.emit(Node.makeUnary(.lazy_force, out, 0, src_chan));
         return out;
     }
 
-    /// 通用观察辅助：当通道是 ref_chan（Lazy<T> 或其他引用）且当前上下文需要标量值时，
+    /// 通用观察辅助：当通道是 ref_chan（Lazy<T> 或其他引用）时，
     /// 发射 lazy_force 节点强制求值。若已是标量通道则原样返回。
-    pub fn forceLazyIfRef(self: *IRBuilder, chan: u16, expected_ct: *const type_descriptor_mod.TypeDescriptor) BuildError!u16 {
+    pub fn forceLazyIfRef(self: *IRBuilder, chan: u16) BuildError!u16 {
         const meta = self.channels.get(chan);
         if (!meta.type_desc.isRef()) return chan;
-        return try self.emitLazyForce(chan, expected_ct);
+        return try self.emitLazyForce(chan);
     }
 
     /// 函数参数观察辅助：实参通道传入目标形参通道前，若实参是 Lazy<T>（ref_chan）
@@ -647,8 +698,8 @@ pub const Methods = struct {
         if (dst_ct.isRef()) return arg_chan;
         // nullable<T> 参数：若内部类型已是引用，直接保留引用由运行时深拷贝到 nullable 通道
         if (dst_ct.isNullable() and dst_meta.inner_type_desc != null and dst_meta.inner_type_desc.?.isRef()) return arg_chan;
-        if (dst_ct.isNullable()) return try self.emitLazyForce(arg_chan, dst_meta.inner_type_desc orelse type_descriptor_mod.i64_descriptor);
-        return try self.emitLazyForce(arg_chan, dst_ct);
+        if (dst_ct.isNullable()) return try self.emitLazyForce(arg_chan);
+        return try self.emitLazyForce(arg_chan);
     }
 
     /// 编译一元运算
@@ -658,11 +709,7 @@ pub const Methods = struct {
 
         // 严格运算上下文：ref_chan 操作数视为 Lazy<T>，先强制求值到标量。
         if (operand_meta.type_desc.isRef()) {
-            const force_ct: *const type_descriptor_mod.TypeDescriptor = switch (op) {
-                .not => type_descriptor_mod.bool_descriptor,
-                .neg, .bit_not => type_descriptor_mod.i64_descriptor,
-            };
-            operand_chan = try self.emitLazyForce(operand_chan, force_ct);
+            operand_chan = try self.emitLazyForce(operand_chan);
             operand_meta = self.channels.get(operand_chan);
         }
 
@@ -728,7 +775,7 @@ pub const Methods = struct {
     pub fn compileIf(self: *IRBuilder, ie: anytype) BuildError!u16 {
         var cond_chan = try self.compileExpr(ie.condition);
         // 严格上下文：条件表达式需要被观察为 bool；若是 Lazy<T> 则强制求值。
-        cond_chan = try self.forceLazyIfRef(cond_chan, type_descriptor_mod.bool_descriptor);
+        cond_chan = try self.forceLazyIfRef(cond_chan);
 
         // 条件转 winner 索引：bool cast 为 i64（true=1, false=0）
         // arm 0 = else, arm 1 = then → true→1→then, false→0→else
@@ -822,7 +869,7 @@ pub const Methods = struct {
     /// safe=true:  i32(x)?  — 安全转换，越界抛出错误（? 传播）
     pub fn compileTypeCast(self: *IRBuilder, tc: anytype) BuildError!u16 {
         const dst_chan_type = self.chanTypeFromTypeNodeResolved(tc.target_type) orelse return error.UnsupportedType;
-        const src_chan = try self.forceLazyIfRef(try self.compileExpr(tc.expr), dst_chan_type);
+        const src_chan = try self.forceLazyIfRef(try self.compileExpr(tc.expr));
 
         // str(x) 是内置函数调用，不是类型转换
         if (dst_chan_type.isRef()) {
@@ -872,11 +919,10 @@ pub const Methods = struct {
         // 例外：源为 ref_chan（字符串/数组/标量位模式）时跳过 forceLazyIfRef，
         // 因为 ref_chan 持有的不是 LazyValue，强制求值会触发 InvalidChannel。
         // 引擎 execBuiltinStr / execCastTryTo / execCastTo 均直接处理 ref_chan 源。
-        const force_ct: *const type_descriptor_mod.TypeDescriptor = if (target_is_str) type_descriptor_mod.i64_descriptor else dst_chan_type;
         const needs_force = target_is_str or dst_chan_type.isInt() or dst_chan_type.isFloat() or dst_chan_type == type_descriptor_mod.bool_descriptor or dst_chan_type == type_descriptor_mod.char_descriptor;
         const raw_src_chan = try self.compileExpr(cb.expr);
         const raw_is_ref = self.channels.get(raw_src_chan).type_desc.isRef();
-        const src_chan = if (needs_force and !raw_is_ref) try self.forceLazyIfRef(raw_src_chan, force_ct) else raw_src_chan;
+        const src_chan = if (needs_force and !raw_is_ref) try self.forceLazyIfRef(raw_src_chan) else raw_src_chan;
 
         // str 目标：数值→str 永不失败，直接走 builtin_str，再按 mode 包装 Throw
         if (target_is_str) {
@@ -997,7 +1043,6 @@ pub const Methods = struct {
             .cast_builder => |cb| self.preRegisterRecordFields(cb.expr),
             .atomic_expr => |ae| self.preRegisterRecordFields(ae.value),
             .lazy => |l| self.preRegisterRecordFields(l.expr),
-            .spawn_expr => |se| self.preRegisterRecordFields(se.expr),
             .if_expr => |ie| {
                 self.preRegisterRecordFields(ie.condition);
                 self.preRegisterRecordFields(ie.then_branch);
@@ -1328,7 +1373,7 @@ pub const Methods = struct {
     /// 数组 → array_get，字符串 → string_index
     pub fn compileIndex(self: *IRBuilder, object: *ast.Expr, index: *ast.Expr) BuildError!u16 {
         const obj_chan = try self.compileExpr(object);
-        const idx_chan = try self.forceLazyIfRef(try self.compileExpr(index), type_descriptor_mod.i64_descriptor);
+        const idx_chan = try self.forceLazyIfRef(try self.compileExpr(index));
         // 通过 AST 节点类型推断 + 参数类型标注
         const is_string = self.isStringExpr(object) or self.isStringParam(object);
         if (is_string) {
@@ -1348,8 +1393,8 @@ pub const Methods = struct {
     /// inclusive=true 时 end 包含在结果中（start..=end）
     pub fn compileSlice(self: *IRBuilder, object: *ast.Expr, start: *ast.Expr, end: *ast.Expr, inclusive: bool) BuildError!u16 {
         const obj_chan = try self.compileExpr(object);
-        const start_chan = try self.forceLazyIfRef(try self.compileExpr(start), type_descriptor_mod.i64_descriptor);
-        const end_chan = try self.forceLazyIfRef(try self.compileExpr(end), type_descriptor_mod.i64_descriptor);
+        const start_chan = try self.forceLazyIfRef(try self.compileExpr(start));
+        const end_chan = try self.forceLazyIfRef(try self.compileExpr(end));
         const is_string = self.isStringExpr(object) or self.isStringParam(object);
         const slice_td = if (is_string) type_descriptor_mod.str_descriptor else self.sema_result.getOrCreateRefDesc("array") catch unreachable;
         const out = try self.allocChannel(slice_td);
@@ -1710,12 +1755,18 @@ pub const Methods = struct {
         // 绕过 call_instantiations 避免实例混淆。
         const is_direct_recursion = self.current_instance_id != null and
             std.mem.eql(u8, effective_name, self.current_func_name orelse "");
-        const type_args = if (is_direct_recursion)
-            try self.typeArgsFromCurrentInstance()
+        // instance_id 直接来自 sema（current_instance_id 或 call_instantiations），
+        // 不再经过哈希反查；type_args 仅用于 CallMeta.type_args 运行时查表
+        const instance_id: ?u32 = if (is_direct_recursion)
+            self.current_instance_id
         else
-            try self.typeArgsFromCallExpr(call_expr);
-        const mono_func_idx = if (type_args.len > 0)
-            try self.instantiateFunction(effective_name, type_args)
+            self.instanceIdFromCallExpr(call_expr);
+        const type_args = if (instance_id) |id|
+            try self.typeArgsFromInstanceId(id)
+        else
+            &[_]u16{};
+        const mono_func_idx = if (instance_id) |id|
+            try self.instantiateFunction(id)
         else
             func_idx;
         const func = self.functions.items[mono_func_idx];
@@ -1807,6 +1858,10 @@ pub const Methods = struct {
             }
             break :blk false;
         };
+        const extra_args = if (arg_chans.len > 4)
+            try self.arena.allocator().dupe(u16, arg_chans[4..])
+        else
+            &.{};
         const call_meta_idx = try self.addCallMeta(.{
             .func_index = mono_func_idx,
             .arg_count = @intCast(arguments.len),
@@ -1815,15 +1870,15 @@ pub const Methods = struct {
             .type_args = type_args,
             .arg_ref_bits = arg_ref_bits,
             .ret_is_ref = ret_is_ref,
+            .extra_args = extra_args,
         });
 
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
-        for (arg_chans, 0..) |ch, i| {
-            if (i < 4) inputs[i] = ch;
-        }
+        const inline_n = @min(arg_chans.len, 4);
+        for (0..inline_n) |i| inputs[i] = arg_chans[i];
         try self.emit(Node{
             .op = .call,
-            .input_count = @intCast(@min(arguments.len, 4)),
+            .input_count = @intCast(inline_n),
             .output = out,
             .meta_index = call_meta_idx,
             .inputs = inputs,
@@ -1831,22 +1886,36 @@ pub const Methods = struct {
         return out;
     }
 
-    /// 从 sema call_instantiations 查询调用点的 type_args
+    /// 从 sema call_instantiations 查询调用点对应的单态化实例 id
     ///
     /// sema 已预先收集所有泛型调用点（collectMonomorphInstances），
-    /// IR 直接消费 sema 产出，不再重复推断。
+    /// IR 直接消费 sema 产出，不再重复推断或哈希。
+    /// 未命中返回 null（非泛型调用或非泛型函数）。
+    pub fn instanceIdFromCallExpr(self: *IRBuilder, call_expr: *const ast.Expr) ?u32 {
+        const id = self.sema_result.call_instantiations.get(@intFromPtr(call_expr)) orelse return null;
+        if (id >= self.sema_result.monomorph_instances.items.len) return null;
+        return id;
+    }
+
+    /// 从单态化实例 id 提取 type_args（type_id 列表，u16 切片）
+    ///
+    /// 用于 CallMeta/OrbitMeta.type_args（运行时 typeof/reflect 查表）。
+    /// 切片由 arena 拥有；instance_id 越界返回空切片。
+    pub fn typeArgsFromInstanceId(self: *IRBuilder, instance_id: u32) ![]const u16 {
+        if (instance_id >= self.sema_result.monomorph_instances.items.len) return &.{};
+        const instance = self.sema_result.monomorph_instances.items[instance_id];
+        const tds = try self.arena.allocator().alloc(u16, instance.type_args.len);
+        for (instance.type_args, 0..) |td, i| tds[i] = td.type_id;
+        return tds;
+    }
+
+    /// 从 sema call_instantiations 查询调用点的 type_args
+    ///
+    /// 委托 instanceIdFromCallExpr + typeArgsFromInstanceId。
     /// 返回切片由 arena 拥有；未命中时返回空切片。
     pub fn typeArgsFromCallExpr(self: *IRBuilder, call_expr: *const ast.Expr) ![]const u16 {
-        const arena_alloc = self.arena.allocator();
-        if (self.sema_result.call_instantiations.get(@intFromPtr(call_expr))) |instance_id| {
-            if (instance_id < self.sema_result.monomorph_instances.items.len) {
-                const instance = self.sema_result.monomorph_instances.items[instance_id];
-                const tds = try arena_alloc.alloc(u16, instance.type_args.len);
-                for (instance.type_args, 0..) |td, i| tds[i] = td.type_id;
-                return tds;
-            }
-        }
-        return &.{};
+        const instance_id = self.instanceIdFromCallExpr(call_expr) orelse return &.{};
+        return self.typeArgsFromInstanceId(instance_id);
     }
 
     /// 从当前单态化实例提取 type_args（type_id 列表）
@@ -1856,13 +1925,8 @@ pub const Methods = struct {
     /// 无法区分不同实例的递归调用。此处直接从 current_instance_id
     /// 获取当前实例的 type_args，确保递归调用指向正确的实例。
     pub fn typeArgsFromCurrentInstance(self: *IRBuilder) ![]const u16 {
-        const arena_alloc = self.arena.allocator();
         const instance_id = self.current_instance_id orelse return &.{};
-        if (instance_id >= self.sema_result.monomorph_instances.items.len) return &.{};
-        const instance = self.sema_result.monomorph_instances.items[instance_id];
-        const tds = try arena_alloc.alloc(u16, instance.type_args.len);
-        for (instance.type_args, 0..) |td, i| tds[i] = td.type_id;
-        return tds;
+        return self.typeArgsFromInstanceId(instance_id);
     }
 
     /// 从参数类型注解匹配类型参数名，并从实参提取对应的 type_id
@@ -2210,22 +2274,25 @@ pub const Methods = struct {
             }
         }
 
+        const extra_args = if (arg_chans.len > 4)
+            try self.arena.allocator().dupe(u16, arg_chans[4..])
+        else
+            &.{};
         const orbit_meta_idx = try self.addOrbitMeta(.{
             .func_index = func_idx,
             .arg_count = @intCast(arg_chans.len),
             .result_type_desc = result_type,
-            .is_spawn = false,
             .arg_ref_bits = arg_ref_bits,
             .type_args = type_args,
+            .extra_args = extra_args,
         });
 
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
-        for (arg_chans, 0..) |ch, i| {
-            if (i < 4) inputs[i] = ch;
-        }
+        const inline_n = @min(arg_chans.len, 4);
+        for (0..inline_n) |i| inputs[i] = arg_chans[i];
         try self.emit(Node{
             .op = .orbit_async_create,
-            .input_count = @intCast(@min(arg_chans.len, 4)),
+            .input_count = @intCast(inline_n),
             .output = handle_chan,
             .meta_index = orbit_meta_idx,
             .inputs = inputs,
@@ -2528,9 +2595,16 @@ pub const Methods = struct {
         const cast_meta_idx = try self.addScalarMeta(.{ .kind = .int, .int_kind = .i64 });
         try self.emit(Node.makeUnary(.cast, winner_chan, cast_meta_idx, ok_chan));
 
-        // arm 0 = Err: halt_return with original ThrowValue（传播错误）
+        // arm 0 = Err: 非 Throw 返回函数用 halt_throw（运行时 error.Thrown），Throw 返回函数用 halt_return（传播错误）
         const err_arm_start: u32 = @intCast(self.nodes.items.len);
-        try self.emit(Node.makeUnary(.halt_return, ret_chan, 0, val_chan));
+        if (self.current_returns_throw) {
+            try self.emit(Node.makeUnary(.halt_return, ret_chan, 0, val_chan));
+        } else {
+            // 非 Throw 函数：退化为 unwrap-or-throw，Err 时 halt_throw
+            const halt_out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
+            const halt_meta_idx = try self.addGateMeta(.{ .gate_kind = .make_err });
+            try self.emit(Node.makeUnary(.halt_throw, halt_out, halt_meta_idx, val_chan));
+        }
         const err_arm_len: u32 = @intCast(self.nodes.items.len - err_arm_start);
 
         // arm 1 = Ok: gate_get_ok（提取 Ok 值）
@@ -3028,11 +3102,13 @@ pub const Methods = struct {
 
     /// 按方法名分派：用户自定义方法优先，其次内置方法
     pub fn dispatchMethodCall(self: *IRBuilder, obj_chan: u16, object: *ast.Expr, method: []const u8, arguments: []*ast.Expr, call_expr: *const ast.Expr) BuildError!u16 {
+        self.debug_last_expr_tag = method;
         // ── 模块引用方法调用：Module.Sub.method(args) → call("Module.Sub.method", args) ──
         // 支持任意深度：std.time.Calendar.weekday_of → "std.time.Calendar.weekday_of"
         if (self.isModuleReference(object)) |mod_ref| {
             const arena_alloc = self.arena.allocator();
             const mangled = try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ mod_ref.full_path, method });
+            self.debug_last_expr_tag = mangled; // track mangled name for debugging
             if (self.func_table.get(mangled)) |func_idx| {
                 const func = self.functions.items[func_idx];
                 var arg_chans = try arena_alloc.alloc(u16, arguments.len);
@@ -3059,28 +3135,36 @@ pub const Methods = struct {
                     }
                 }
                 const ret_is_ref = self.channels.get(func.return_channel).type_desc.isRef();
-                // 计算泛型类型实参（type_args）用于 typeof(T)/reflect(T) 运行时查表
-                // sema 已预先收集所有泛型调用点，IR 直接消费 sema call_instantiations
-                const type_args = try self.typeArgsFromCallExpr(call_expr);
+                // instance_id 直接来自 sema call_instantiations，不再经过哈希反查；
+                // type_args 仅用于 CallMeta.type_args 运行时 typeof/reflect 查表
+                const instance_id = self.instanceIdFromCallExpr(call_expr);
+                const type_args = if (instance_id) |id|
+                    try self.typeArgsFromInstanceId(id)
+                else
+                    &[_]u16{};
                 // 单态化：泛型函数实例化为特化版本
-                const mono_func_idx = if (type_args.len > 0)
-                    try self.instantiateFunction(mangled, type_args)
+                const mono_func_idx = if (instance_id) |id|
+                    try self.instantiateFunction(id)
                 else
                     func_idx;
+                const extra_args = if (arg_chans.len > 4)
+                    try self.arena.allocator().dupe(u16, arg_chans[4..])
+                else
+                    &.{};
                 const call_meta_idx = try self.addCallMeta(.{
                     .func_index = mono_func_idx,
                     .arg_count = @intCast(arg_chans.len),
                     .arg_ref_bits = arg_ref_bits,
                     .ret_is_ref = ret_is_ref,
                     .type_args = type_args,
+                    .extra_args = extra_args,
                 });
                 var inputs: [4]u16 = .{ 0, 0, 0, 0 };
-                for (arg_chans, 0..) |ch, i| {
-                    if (i < 4) inputs[i] = ch;
-                }
+                const inline_n = @min(arg_chans.len, 4);
+                for (0..inline_n) |i| inputs[i] = arg_chans[i];
                 try self.emit(Node{
                     .op = .call,
-                    .input_count = @intCast(@min(arg_chans.len, 4)),
+                    .input_count = @intCast(inline_n),
                     .output = out,
                     .meta_index = call_meta_idx,
                     .inputs = inputs,
@@ -3110,6 +3194,38 @@ pub const Methods = struct {
             }
             if (self.lookupMethodBySuffix(type_name, method)) |func_idx| {
                 return try self.emitUserMethodCall(obj_chan, arguments, func_idx, arena_alloc, mangled, call_expr);
+            }
+            {
+                var dbg_buf: [256]u8 = undefined;
+                const dbg_msg = std.fmt.bufPrint(&dbg_buf, "type_found_but_method_not_found: type={s} method={s} mangled={s}", .{ type_name, method, mangled }) catch "type_found_but_method_not_found";
+                self.debug_last_expr_tag = dbg_msg;
+            }
+        } else {
+            // Debug: check sema result directly
+            if (self.sema_result.getExpr(@intFromPtr(object))) |info| {
+                var dbg_buf: [256]u8 = undefined;
+                const dbg_msg = std.fmt.bufPrint(&dbg_buf, "sema has expr: type_name={?s} type_id={d}\n", .{ info.type_name, info.type_desc.type_id }) catch "";
+                self.debug_last_expr_tag = dbg_msg;
+            } else {
+                // Check if object is a module reference and list matching func_table entries
+                if (self.isModuleReference(object)) |mod_ref| {
+                    const arena_alloc = self.arena.allocator();
+                    var found: ?[]const u8 = null;
+                    for (self.func_table.keys.items) |k| {
+                        if (std.mem.indexOf(u8, k, mod_ref.full_path) != null) {
+                            found = std.fmt.allocPrint(arena_alloc, "mod_ref={s} NOT in func_table; similar={s}", .{ mod_ref.full_path, k }) catch null;
+                            break;
+                        }
+                    }
+                    if (found) |f| {
+                        self.debug_last_expr_tag = f;
+                    } else {
+                        self.debug_last_expr_tag = "mod_ref NOT in func_table, no similar";
+                    }
+                } else {
+                    const arena_alloc = self.arena.allocator();
+                    self.debug_last_expr_tag = std.fmt.allocPrint(arena_alloc, "no_type: method={s} obj_kind={s}", .{ method, @tagName(object.*) }) catch "type_not_found_and_no_sema_entry";
+                }
             }
         }
 
@@ -3148,19 +3264,23 @@ pub const Methods = struct {
                         else
                             type_descriptor_mod.i64_descriptor;
                         const out = try self.allocChannel(ret_chan_type);
+                        const extra_args = if (arg_chans.len > 3)
+                            try self.arena.allocator().dupe(u16, arg_chans[3..])
+                        else
+                            &.{};
                         const call_meta_idx = try self.addCallMeta(.{
                             .func_index = 0,
                             .arg_count = @intCast(arguments.len + 1),
+                            .extra_args = extra_args,
                         });
 
                         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
                         inputs[0] = closure_chan;
-                        for (arg_chans, 0..) |ch, i| {
-                            if (i + 1 < 4) inputs[i + 1] = ch;
-                        }
+                        const inline_n = @min(arg_chans.len, 3);
+                        for (0..inline_n) |i| inputs[i + 1] = arg_chans[i];
                         try self.emit(Node{
                             .op = .call_indirect,
-                            .input_count = @intCast(@min(arguments.len + 1, 4)),
+                            .input_count = @intCast(inline_n + 1),
                             .output = out,
                             .meta_index = call_meta_idx,
                             .inputs = inputs,
@@ -3197,12 +3317,18 @@ pub const Methods = struct {
             return try self.emitOrbitSend(obj_chan, val_chan);
         }
         if (std.mem.eql(u8, method, "recv")) {
-            // ch.recv() → orbit_chan_recv，结果类型默认 i64
-            return try self.emitOrbitRecv(obj_chan, type_descriptor_mod.i64_descriptor);
+            // ch.recv() → orbit_chan_recv
+            // 元素类型从 sema ExprInfo 查询（sema 对 Channel<T>.recv 推导返回 T），
+            // 消除 current_returns_throw 启发式，无 sema 信息时回退 i64
+            const recv_type = self.channelElemTypeFromExpr(call_expr, "recv") orelse type_descriptor_mod.i64_descriptor;
+            return try self.emitOrbitRecv(obj_chan, recv_type);
         }
         if (std.mem.eql(u8, method, "tryRecv")) {
-            // ch.tryRecv() → orbit_chan_try_recv，返回 nullable
-            return try self.emitOrbitTryRecv(obj_chan, type_descriptor_mod.i64_descriptor);
+            // ch.tryRecv() → orbit_chan_try_recv，返回 nullable<T>
+            // 元素类型从 sema ExprInfo 查询（sema 对 Channel<T>.tryRecv 推导返回 nullable<T>），
+            // 无 sema 信息时回退 i64
+            const elem_type = self.channelElemTypeFromExpr(call_expr, "tryRecv") orelse type_descriptor_mod.i64_descriptor;
+            return try self.emitOrbitTryRecv(obj_chan, elem_type);
         }
         if (std.mem.eql(u8, method, "close")) {
             // ch.close() → channel_close，返回 unit
@@ -3313,19 +3439,6 @@ pub const Methods = struct {
             try self.emit(Node.makeBinary(.array_get_safe, out, 0, obj_chan, idx_chan));
             return out;
         }
-        if (std.mem.eql(u8, method, "message")) {
-            // e.message() → error_message，返回 str ref
-            const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
-            try self.emit(Node.makeUnary(.error_message, out, 0, obj_chan));
-            return out;
-        }
-        if (std.mem.eql(u8, method, "type_name")) {
-            // obj.type_name() → obj_type_name，返回 str ref
-            const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
-            try self.emit(Node.makeUnary(.obj_type_name, out, 0, obj_chan));
-            return out;
-        }
-
         return error.UnsupportedExpr;
     }
 
@@ -3397,19 +3510,23 @@ pub const Methods = struct {
         }
         // 返回值引用标记
         const ret_is_ref = self.channels.get(func.return_channel).type_desc.isRef();
+        const extra_args = if (arg_chans.len > 4)
+            try self.arena.allocator().dupe(u16, arg_chans[4..])
+        else
+            &.{};
         const call_meta_idx = try self.addCallMeta(.{
             .func_index = func_idx,
             .arg_count = @intCast(arg_chans.len),
             .arg_ref_bits = arg_ref_bits,
             .ret_is_ref = ret_is_ref,
+            .extra_args = extra_args,
         });
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
-        for (arg_chans, 0..) |ch, i| {
-            if (i < 4) inputs[i] = ch;
-        }
+        const inline_n = @min(arg_chans.len, 4);
+        for (0..inline_n) |i| inputs[i] = arg_chans[i];
         try self.emit(Node{
             .op = .call,
-            .input_count = @intCast(@min(arg_chans.len, 4)),
+            .input_count = @intCast(inline_n),
             .output = out,
             .meta_index = call_meta_idx,
             .inputs = inputs,
@@ -3607,7 +3724,7 @@ pub const Methods = struct {
         const lam_effective_return_type = unwrapAsyncType(lam.return_type);
         self.current_returns_throw = isThrowType(lam_effective_return_type);
         if (self.current_returns_throw) {
-            self.current_throw_ok_type_desc = throwOkChanType(lam_effective_return_type, self.sema_result) orelse type_descriptor_mod.i64_descriptor;
+            self.current_throw_ok_type_desc = throwOkChanType(lam_effective_return_type, self.sema_result) orelse unreachable;
         }
 
         // 编译函数体
@@ -3643,6 +3760,10 @@ pub const Methods = struct {
             if (meta.is_cell) cell_upvalues |= @as(u8, 1) << @intCast(i);
             if (meta.type_desc.isRef()) upvalue_ref_bits |= @as(u8, 1) << @intCast(i);
         }
+        const extra_upvalues = if (upvalue_chans.items.len > 4)
+            try self.arena.allocator().dupe(u16, upvalue_chans.items[4..])
+        else
+            &.{};
         const closure_meta_idx = try self.addClosureMeta(.{
             .func_index = func_idx,
             .upvalue_count = @intCast(upvalue_chans.items.len),
@@ -3651,15 +3772,15 @@ pub const Methods = struct {
             .body_len = node_count,
             .cell_upvalues = cell_upvalues,
             .upvalue_ref_bits = upvalue_ref_bits,
+            .extra_upvalues = extra_upvalues,
         });
 
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
-        for (upvalue_chans.items, 0..) |ch, i| {
-            if (i < 4) inputs[i] = ch;
-        }
+        const inline_n = @min(upvalue_chans.items.len, 4);
+        for (0..inline_n) |i| inputs[i] = upvalue_chans.items[i];
         try self.emit(Node{
             .op = .closure_make,
-            .input_count = @intCast(@min(upvalue_chans.items.len, 4)),
+            .input_count = @intCast(inline_n),
             .output = closure_out_chan,
             .meta_index = closure_meta_idx,
             .inputs = inputs,
@@ -3683,21 +3804,25 @@ pub const Methods = struct {
 
         // 使用传入的返回类型分配输出通道
         const out = try self.allocChannel(ret_chan_type);
+        const extra_args = if (arg_chans.len > 3)
+            try self.arena.allocator().dupe(u16, arg_chans[3..])
+        else
+            &.{};
         const call_meta_idx = try self.addCallMeta(.{
             .func_index = 0, // 运行时从 closure 值读取
             .arg_count = @intCast(arguments.len + 1), // +1 for closure_chan
             .arg_ref_bits = arg_ref_bits,
             .ret_is_ref = false,
+            .extra_args = extra_args,
         });
 
         var inputs: [4]u16 = .{ 0, 0, 0, 0 };
         inputs[0] = closure_chan;
-        for (arg_chans, 0..) |ch, i| {
-            if (i + 1 < 4) inputs[i + 1] = ch;
-        }
+        const inline_n = @min(arg_chans.len, 3);
+        for (0..inline_n) |i| inputs[i + 1] = arg_chans[i];
         try self.emit(Node{
             .op = .call_indirect,
-            .input_count = @intCast(@min(arguments.len + 1, 4)),
+            .input_count = @intCast(inline_n + 1),
             .output = out,
             .meta_index = call_meta_idx,
             .inputs = inputs,
@@ -3716,6 +3841,8 @@ pub const Methods = struct {
 
     /// 编译 lazy 表达式：lazy expr → LazyValue（包装无参 thunk 闭包）
     /// thunk 捕获 lazy 表达式所在作用域的自由变量，body 直接返回 expr 的值。
+    /// sema 推导 Lazy<T>，T 的 TypeDescriptor 存入 ChannelMeta.inner_type_desc，
+    /// 供 emitLazyForce 直接读取，消除硬编码。
     pub fn compileLazyExpr(self: *IRBuilder, expr: *const ast.Expr) BuildError!u16 {
         // 构造无参 lambda：fun() -> expr.type { expr }
         const arena_alloc = self.arena.allocator();
@@ -3730,58 +3857,11 @@ pub const Methods = struct {
             },
         };
         const closure_chan = try self.compileLambda(thunk.lambda);
-        const lazy_out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
+        // 从 sema 查询 Lazy<T> 的 T，存入 ChannelMeta.inner_type_desc
+        const inner_td = self.lazyElemTypeFromExpr(expr);
+        const lazy_out = try self.allocChannelWithInner(type_descriptor_mod.ref_descriptor, inner_td);
         try self.emit(Node.makeUnary(.lazy_make, lazy_out, 0, closure_chan));
         return lazy_out;
-    }
-
-    /// 编译 spawn 表达式：spawn expr → orbit_async_create（不自动 await）
-    /// expr 应为 async 函数调用或 lambda
-    pub fn compileSpawnExpr(self: *IRBuilder, expr: *const ast.Expr) BuildError!u16 {
-        // 如果是函数调用，编译为 async create（不 join）
-        switch (expr.*) {
-            .call => |c| {
-                // 检查是否为已注册的 async 函数
-                const func_name = switch (c.callee.*) {
-                    .identifier => |id| id.name,
-                    else => {
-                        // 非函数名调用：先编译为 lambda 变量，然后 spawn
-                        const lambda_chan = try self.compileExpr(expr);
-                        return lambda_chan;
-                    },
-                };
-
-                if (self.func_table.get(func_name)) |func_idx| {
-                    const func = self.functions.items[func_idx];
-                    if (func.is_async) {
-                        // 编译参数为通道
-                        var arg_chans_buf: [4]u16 = .{ 0, 0, 0, 0 };
-                        const arg_count = @min(c.arguments.len, 4);
-                        for (0..arg_count) |ai| {
-                            arg_chans_buf[ai] = try self.compileExpr(c.arguments[ai]);
-                        }
-                        return try self.emitOrbitCreate(func_idx, arg_chans_buf[0..arg_count], func, try self.typeArgsFromCallExpr(expr));
-                    }
-                    // 非 async 函数：包装为 async lambda 后 spawn
-                    // 简化：直接调用（同步执行）
-                    return try self.compileCallWithTypeArgs(c.callee, c.arguments, c.type_args, expr);
-                }
-
-                // 未知函数：尝试构造器或内置
-                return try self.compileCallWithTypeArgs(c.callee, c.arguments, c.type_args, expr);
-            },
-            .lambda => |lam| {
-                // 编译 lambda 为 async 闭包，然后 spawn
-                const lambda_chan = try self.compileLambda(lam);
-                // 对于 spawn，直接返回 lambda 通道
-                // 完整实现需要将 lambda 包装为 async task
-                return lambda_chan;
-            },
-            else => {
-                // 其他表达式：直接编译（可能只是引用一个已有的 async handle）
-                return try self.compileExpr(expr);
-            },
-        }
     }
 
     /// 编译 inline_trait_value：trait { methods } → record of closures
@@ -3857,7 +3937,7 @@ pub const Methods = struct {
             const wrapper_idx: u16 = @intCast(self.functions.items.len);
             try self.func_table.put(wrapper_name, wrapper_idx);
 
-            const return_type = self.chanTypeFromTypeNodeBound(method.return_type) orelse type_descriptor_mod.i64_descriptor;
+            const return_type = self.chanTypeFromTypeNodeBound(method.return_type) orelse unreachable;
             const wrapper_return_chan = try self.allocChannel(return_type);
             try self.functions.append(arena_alloc, .{
                 .name = wrapper_name,
@@ -3893,23 +3973,27 @@ pub const Methods = struct {
             self.current_return_chan = wrapper_return_chan;
             self.current_returns_throw = isThrowType(method.return_type);
             if (self.current_returns_throw) {
-                self.current_throw_ok_type_desc = throwOkChanType(method.return_type, self.sema_result) orelse type_descriptor_mod.i64_descriptor;
+                self.current_throw_ok_type_desc = throwOkChanType(method.return_type, self.sema_result) orelse unreachable;
             }
 
             // 发射 call 节点：调用模块函数
             const target_ret_type = self.channels.get(target_func.return_channel).type_desc;
             const call_out = try self.allocChannel(target_ret_type);
+            const extra_args = if (param_chans.len > 4)
+                try self.arena.allocator().dupe(u16, param_chans[4..])
+            else
+                &.{};
             const call_meta_idx = try self.addCallMeta(.{
                 .func_index = target_func_idx,
                 .arg_count = @intCast(param_chans.len),
+                .extra_args = extra_args,
             });
             var call_inputs: [4]u16 = .{ 0, 0, 0, 0 };
-            for (param_chans, 0..) |ch, j| {
-                if (j < 4) call_inputs[j] = ch;
-            }
+            const inline_n = @min(param_chans.len, 4);
+            for (0..inline_n) |j| call_inputs[j] = param_chans[j];
             try self.emit(Node{
                 .op = .call,
-                .input_count = @intCast(@min(param_chans.len, 4)),
+                .input_count = @intCast(inline_n),
                 .output = call_out,
                 .meta_index = call_meta_idx,
                 .inputs = call_inputs,

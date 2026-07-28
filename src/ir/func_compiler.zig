@@ -49,14 +49,19 @@ pub const Methods = struct {
         defer self.current_self_type_name = prev_self_type;
 
         for (td.implemented_traits) |tb| {
-            if (self.sema_result.getTraitDef(tb.trait_name) == null) continue;
-            const trait_methods = self.findTraitMethodsAst(tb.trait_name) orelse continue;
+            const trait_def = self.sema_result.getTraitDef(tb.trait_name);
+            if (trait_def == null) continue;
+            const trait_methods = self.findTraitMethodsAst(tb.trait_name) orelse {
+                continue;
+            };
             for (trait_methods) |tm| {
                 if (tm.body == null) continue;
                 const mangled = try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ td.name, tm.name });
                 // 仅编译未被 type 覆盖的默认方法（覆盖的已在上面编译）
                 if (self.isMethodOverridden(td, tm.name)) continue;
-                const func_idx = self.func_table.get(mangled) orelse continue;
+                const func_idx = self.func_table.get(mangled) orelse {
+                    continue;
+                };
                 const fd = .{
                     .params = tm.params,
                     .body = tm.body.?,
@@ -85,9 +90,9 @@ pub const Methods = struct {
         var param_channels = try arena_alloc.alloc(u16, params.len);
         for (params, 0..) |param, i| {
             const chan = if (param.type_annotation) |tn| switch (tn.*) {
-                .nullable => |nb| try self.channels.allocNullable(self.chanTypeFromTypeNodeBound(nb.inner) orelse type_descriptor_mod.i64_descriptor),
+                .nullable => |nb| try self.channels.allocNullable(self.chanTypeFromTypeNodeBound(nb.inner) orelse unreachable),
                 .ref_type, .raw_ptr => try self.channels.allocRef(type_descriptor_mod.ref_descriptor),
-                else => try self.allocChannel(self.chanTypeFromTypeNodeBound(tn) orelse type_descriptor_mod.i64_descriptor),
+                else => try self.allocChannel(self.chanTypeFromTypeNodeBound(tn) orelse unreachable),
             } else try self.allocChannel(type_descriptor_mod.i64_descriptor);
             param_channels[i] = chan;
         }
@@ -114,6 +119,7 @@ pub const Methods = struct {
         const prev_throw_ok_chan_type = self.current_throw_ok_type_desc;
         if (@hasField(@TypeOf(fd), "name")) {
             self.current_func_name = fd.name;
+            self.debug_error_func_name = fd.name;
             // stdlib 方法（如 "std.time.DateTime.add_duration"）：从函数名推断类型上下文
             // 使 self 参数的方法调用（如 self.to_components()）能解析到正确的类型
             // 提取倒数第二段作为类型名：std.time.DateTime.add_duration → DateTime
@@ -174,7 +180,7 @@ pub const Methods = struct {
         self.current_returns_throw = if (@hasField(@TypeOf(fd), "return_type")) builder_mod.isThrowType(effective_return_type) else false;
         // 提取 Throw<T, E> 的 Ok 值通道类型，供 ? 传播使用
         if (self.current_returns_throw and @hasField(@TypeOf(fd), "return_type")) {
-            self.current_throw_ok_type_desc = builder_mod.throwOkChanType(effective_return_type, self.sema_result) orelse type_descriptor_mod.i64_descriptor;
+            self.current_throw_ok_type_desc = builder_mod.throwOkChanType(effective_return_type, self.sema_result) orelse unreachable;
         }
 
         // 编译函数体（函数体在尾位置）
@@ -228,15 +234,58 @@ pub const Methods = struct {
         if (self.functions.items[func_idx].is_async) {
             const func_nodes = self.nodes.items[node_start .. node_start + node_count];
             const smt = @import("state_machine_transform.zig");
+            const arena_alloc = self.arena.allocator();
+
+            // IR-1: cleanup_metas/loop_metas/route_metas store GLOBAL body_start values
+            // (set during compileDefer/compileLoop/compileRoute as @intCast(self.nodes.items.len)),
+            // but transformToStateMachine operates on the LOCAL func_nodes sub-slice.
+            // Subtract node_start to convert global indices to local for correct segment
+            // matching (buildLoopTable/buildCatchTable) and captured_locals scanning
+            // (collectCapturedLocals). Without this, non-first functions never match
+            // because global body_start is outside the local sub-slice range.
+            const local_cleanup_metas = blk: {
+                if (node_start == 0) break :blk self.cleanup_metas.items;
+                const copies = try arena_alloc.alloc(builder_mod.CleanupMeta, self.cleanup_metas.items.len);
+                for (self.cleanup_metas.items, 0..) |cm, i| {
+                    copies[i] = cm;
+                    copies[i].body_start = if (cm.body_start >= node_start) cm.body_start - node_start else 0;
+                }
+                break :blk copies;
+            };
+            const local_loop_metas = blk: {
+                if (node_start == 0) break :blk self.loop_metas.items;
+                const copies = try arena_alloc.alloc(builder_mod.LoopMeta, self.loop_metas.items.len);
+                for (self.loop_metas.items, 0..) |lm, i| {
+                    copies[i] = lm;
+                    copies[i].body_start = if (lm.body_start >= node_start) lm.body_start - node_start else 0;
+                }
+                break :blk copies;
+            };
+            const local_route_metas = blk: {
+                if (node_start == 0) break :blk self.route_metas.items;
+                const copies = try arena_alloc.alloc(builder_mod.RouteMeta, self.route_metas.items.len);
+                for (self.route_metas.items, 0..) |rm, i| {
+                    copies[i] = rm;
+                    if (rm.body_starts.len > 0) {
+                        const new_starts = try arena_alloc.alloc(u32, rm.body_starts.len);
+                        for (rm.body_starts, 0..) |bs, j| {
+                            new_starts[j] = if (bs >= node_start) bs - node_start else 0;
+                        }
+                        copies[i].body_starts = new_starts;
+                    }
+                }
+                break :blk copies;
+            };
+
             var cm = smt.transformToStateMachine(
-                self.arena.allocator(),
+                arena_alloc,
                 func_idx,
                 func_nodes,
                 &self.functions.items[func_idx],
                 &self.channels,
-                self.cleanup_metas.items,
-                self.loop_metas.items,
-                self.route_metas.items,
+                local_cleanup_metas,
+                local_loop_metas,
+                local_route_metas,
             ) catch return BuildError.TransformFailed;
             // 修正段的全局节点偏移：transformToStateMachine 用 func_nodes 子切片的
             // 0-based 索引生成 seg.start_node/end_node，但 runSegment 用全局 nodes 数组
@@ -244,6 +293,15 @@ pub const Methods = struct {
             for (cm.segments) |*seg| {
                 seg.start_node += node_start;
                 seg.end_node += node_start;
+            }
+            // IR-1: block_body_start/handler_body_start were computed from local-adjusted
+            // metas; convert back to global for materializeCoroutineSyncFunctions (which
+            // uses them as global node_start values for independent sync functions).
+            for (cm.defer_table.entries) |*entry| {
+                entry.block_body_start += node_start;
+            }
+            for (cm.catch_table.entries) |*entry| {
+                entry.handler_body_start += node_start;
             }
             // 阶段 1b 完善：defer/catch 块体独立函数化，回填 func_idx
             self.materializeCoroutineSyncFunctions(&cm) catch return BuildError.TransformFailed;
@@ -269,7 +327,7 @@ pub const Methods = struct {
         const param_name = param.name;
         // 参数必须是整数类型
         const chan_type = if (param.type_annotation) |tn|
-            self.chanTypeFromTypeNodeBound(tn) orelse type_descriptor_mod.i64_descriptor
+            self.chanTypeFromTypeNodeBound(tn) orelse unreachable
         else
             type_descriptor_mod.i64_descriptor;
         if (!chan_type.isInt()) return null;
@@ -428,80 +486,56 @@ pub const Methods = struct {
         return result_chan;
     }
 
-    /// 单态化：计算 type_args 列表的 FNV-1a 哈希
-    pub fn hashTypeArgs(type_args: []const u16) u64 {
-        var h: u64 = 0xcbf29ce484222325;
-        for (type_args) |ta| {
-            h ^= @as(u64, ta);
-            h *%= 0x100000001b3;
-        }
-        return h;
-    }
-
     /// 单态化核心：实例化泛型函数，返回特化函数索引
     ///
-    /// sema 已预先收集所有泛型调用点（collectMonomorphInstances），IR 从 sema
-    /// monomorph_index 查询实例，编译函数体生成 IR 节点。
+    /// sema 已预先收集所有泛型调用点（collectMonomorphInstances）并产出
+    /// instance_id，IR 直接消费 instance_id，不再重复哈希或反查 monomorph_index。
     ///
-    /// 对每个 (func_name, type_args) 组合生成一份特化代码：
-    /// 1. 查 sema monomorph_index 获取 instance_id
+    /// 流程：
+    /// 1. 从 sema monomorph_instances[instance_id] 取实例（func_name + type_args）
     /// 2. 查 instance_func_map：已编译则返回
     /// 3. 查 instances_in_progress：递归中则返回预占索引
     /// 4. 查找函数 AST，预占 Function 索引
     /// 5. push type binding，编译函数体，建立映射
     ///
-    /// 非泛型函数（type_params.len == 0）直接返回原 func_table 索引，不做单态化。
+    /// 调用方负责保证 instance_id 来自 sema call_instantiations（即泛型调用点）。
+    /// 非泛型调用（instance_id 为 null）不应进入此函数。
     pub fn instantiateFunction(
         self: *IRBuilder,
-        func_name: []const u8,
-        type_args: []const u16,
+        instance_id: u32,
     ) !u16 {
-        // 1. 非泛型函数：直接返回原索引
-        const sig = self.sema_result.getFuncSig(func_name) orelse {
-            return self.func_table.get(func_name) orelse return error.UndefinedFunction;
-        };
-        if (sig.type_params.len == 0) {
-            return self.func_table.get(func_name) orelse return error.UndefinedFunction;
+        // 1. 从 sema 实例表取 func_name 与 type_args（单一权威来源）
+        //    instance_id 越界是 sema/IR 契约违反（不应发生），退化为 UndefinedFunction
+        if (instance_id >= self.sema_result.monomorph_instances.items.len) {
+            return error.UndefinedFunction;
         }
+        const instance = self.sema_result.monomorph_instances.items[instance_id];
+        const func_name = instance.func_name;
 
-        // 2. 查 sema monomorph_index（统一缓存）
-        //    IR 侧 hashTypeArgs 与 sema 侧 hashTypeArgs 实现兼容（均用 type_id 做 FNV-1a），
-        //    因此构造的 cache_key 与 sema 一致
-        const arena_alloc = self.arena.allocator();
-        const hash = hashTypeArgs(type_args);
-        const cache_key = try std.fmt.allocPrint(arena_alloc, "{s}#{x}", .{ func_name, hash });
-        defer arena_alloc.free(cache_key);
-
-        const instance_id = self.sema_result.monomorph_index.get(cache_key) orelse {
-            // sema 未收集（不应发生，collectMonomorphInstances 已收集所有调用点）
-            // 回退：返回原函数索引
-            return self.func_table.get(func_name) orelse return error.UndefinedFunction;
-        };
-
-        // 3. 查 instance_func_map：已编译则返回
+        // 2. 查 instance_func_map：已编译则返回
         if (self.instance_func_map.get(instance_id)) |func_idx| {
             return func_idx;
         }
 
-        // 4. 查进行中（递归占位）
+        // 3. 查进行中（递归占位）
         if (self.instances_in_progress.get(instance_id)) |func_idx| {
             return func_idx;
         }
 
-        // 5. 查找函数 AST
+        // 4. 查找函数 AST
         const fd = self.findFunDeclAst(func_name) orelse {
             // AST 未找到（可能是类型方法或内建函数），退化为原索引
             return self.func_table.get(func_name) orelse return error.UndefinedFunction;
         };
 
-        // 6. 预占新 Function 索引
+        // 5. 预占新 Function 索引
         const new_func_idx: u16 = @intCast(self.functions.items.len);
 
-        // 7. 写入 instances_in_progress（同时作为"已排队"标记，防止重复排队）
+        // 6. 写入 instances_in_progress（同时作为"已排队"标记，防止重复排队）
         //    不再用 defer remove：延迟编译完成后由 processDeferredInstantiations 移除
         try self.instances_in_progress.put(instance_id, new_func_idx);
 
-        // 8. 预分配占位 Function（return channel 用 bound 版本解析）
+        // 7. 预分配占位 Function（return channel 用 bound 版本解析）
         //    必须临时切换 current_type_args 到实例的 type_args，否则类型参数（如 A）
         //    会因 caller 的空 type_args 而回退到 ref_descriptor，
         //    导致 forceLazyArgIfNeeded 错误装箱标量实参。
@@ -510,11 +544,18 @@ pub const Methods = struct {
         self.current_type_args = instance_type_args;
         defer self.current_type_args = saved_type_args;
 
-        const return_chan_type = self.chanTypeFromTypeNodeBound(fd.return_type) orelse type_descriptor_mod.i64_descriptor;
-        const placeholder_return_chan = if (return_chan_type.isNullable())
-            try self.channels.allocNullable(type_descriptor_mod.i64_descriptor) // inner_type 暂用 i64，compileFunction 会修正
-        else
-            try self.allocChannel(return_chan_type);
+        const return_chan_type = self.chanTypeFromTypeNodeBound(fd.return_type) orelse unreachable;
+        // IR-3: Extract the correct inner type from the AST nullable type node instead of
+        // using i64_descriptor. compileFunction reuses this placeholder return_channel
+        // without re-allocating, so the inner type must be correct from the start.
+        const placeholder_return_chan = if (return_chan_type.isNullable()) blk: {
+            const inner_td = if (fd.return_type) |rt| switch (rt.*) {
+                .nullable => |nb| self.chanTypeFromTypeNodeBound(nb.inner) orelse unreachable,
+                else => type_descriptor_mod.i64_descriptor,
+            } else type_descriptor_mod.i64_descriptor;
+            break :blk try self.channels.allocNullable(inner_td);
+        } else try self.allocChannel(return_chan_type);
+        const arena_alloc = self.arena.allocator();
         const placeholder_param_channels = try self.allocParamChannels(fd.params, arena_alloc);
         try self.functions.append(arena_alloc, .{
             .name = func_name, // 特化版本用原名（不放入 func_table，仅通过 func_index 引用）
@@ -526,7 +567,7 @@ pub const Methods = struct {
             .is_async = fd.is_async,
         });
 
-        // 9. 延迟编译：将实例化请求排队，待所有顶层函数编译完成后统一处理。
+        // 8. 延迟编译：将实例化请求排队，待所有顶层函数编译完成后统一处理。
         //    这避免了被实例化函数的体节点与调用者函数的体节点交错，
         //    导致调用者 node_range 错误包含被实例化函数的节点。
         try self.deferred_instantiations.append(self.allocator, .{

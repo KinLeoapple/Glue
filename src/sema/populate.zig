@@ -58,7 +58,7 @@ fn astFunDeclToFuncSig(
         param_type_names[i] = if (p.type_annotation) |tn| typeNameFromTypeNodeConst(tn) else null;
     }
 
-    const return_type_desc = type_resolver.resolveTypeNodeConcrete(fd.return_type, &.{}, sema_result) orelse type_descriptor.lookupByScalarKind(.i64);
+    const return_type_desc = type_resolver.resolveTypeNodeConcrete(fd.return_type, &.{}, sema_result) orelse unreachable;
     const is_throwing = isThrowType(fd.return_type);
 
     try sema_result.putFuncSig(.{
@@ -82,7 +82,7 @@ fn astTraitDeclToTraitDef(
 ) !void {
     const methods = try arena_alloc.alloc(TraitMethodSig, trd.methods.len);
     for (trd.methods, 0..) |m, i| {
-        const return_type_desc = type_resolver.resolveTypeNodeConcrete(m.return_type, &.{}, sema_result) orelse type_descriptor.lookupByScalarKind(.i64);
+        const return_type_desc = type_resolver.resolveTypeNodeConcrete(m.return_type, &.{}, sema_result) orelse unreachable;
         methods[i] = .{
             .name = m.name,
             .param_count = @intCast(m.params.len),
