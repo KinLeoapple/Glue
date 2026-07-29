@@ -1,0 +1,15 @@
+[package]
+name = "glue-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bumpalo = "3"
+
+[[bin]]
+name = "glue"
+path = "src/main.rs"
+
+[lib]
+name = "glue_rs"
+path = "src/lib.rs"
