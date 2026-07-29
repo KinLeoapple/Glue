@@ -253,4 +253,19 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(exe);
+
+    // ---- AST 打印器工具：用于与 Rust 侧 AST 输出做 diff 验证 ----
+    const ast_printer_module = b.createModule(.{
+        .root_source_file = b.path("tools/ast_printer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_printer_module.addImport("ast", ast_module);
+    ast_printer_module.addImport("lexer", lexer_module);
+    ast_printer_module.addImport("parser", parser_module);
+    const ast_printer_exe = b.addExecutable(.{
+        .name = "ast_printer",
+        .root_module = ast_printer_module,
+    });
+    b.installArtifact(ast_printer_exe);
 }

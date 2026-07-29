@@ -18,26 +18,41 @@ pub const TypeInferencer = type_check.TypeInferencer;
 /// 依次按对应字段类型继续推断，最终返回 true 表示已由本函数处理。
 /// 若构造器未在环境中注册，返回 false 交由常规模式推断处理。
 /// 适用于 GADT、普通 ADT 和内置类型（如 Throw 的 Ok/Error）构造器。
+///
+/// 通用 Throw 虚拟构造器处理：当 expected_ty 是 throw_type 时，
+/// error_newtype ADT 构造器（如 Error/CastError/IOError）自动作为
+/// Throw 的错误分支构造器，子模式绑定到 error_type。
+/// 判断依据：构造器返回类型是 error_newtype ADT 且 expected_ty 是 throw_type。
+/// 不依赖具体构造器名字。
 pub fn refineConstructorPattern(
     inferencer: *TypeInferencer,
     con: @TypeOf(@as(ast.Pattern, undefined).constructor),
     expected_ty: *Type,
     env: *TypeEnv,
 ) bool {
-    // Error(e) pattern on Throw<T, E>: extract error_type E and bind e to E.
-    // Error is both an error_newtype constructor (fn(str) -> Error) and a Throw
-    // constructor pattern. When the scrutinee is a throw_type, treat Error(e) as
-    // a Throw pattern so e gets the correct error type (e.g. CastError), not str.
-    if (std.mem.eql(u8, con.name, "Error")) {
-        const resolved_expected = inferencer.resolve(expected_ty);
-        switch (resolved_expected.*) {
-            .throw_type => |tt| {
-                if (con.patterns.len > 0) {
-                    inferencer.inferPattern(con.patterns[0], tt.error_type, env) catch {};
+    const resolved_expected = inferencer.resolve(expected_ty);
+    // 通用 Throw 错误构造器处理：expected_ty 是 throw_type 时，
+    // 检查构造器是否是 error_newtype ADT 构造器（通过 env.lookup 的返回类型判断）。
+    // 如果是，子模式绑定到 throw_type.error_type，使 err.message() 等方法分派生效。
+    if (resolved_expected.* == .throw_type) {
+        if (env.lookup(con.name)) |scheme| {
+            const inst = inferencer.freshenType(scheme) catch return false;
+            const resolved = inferencer.resolve(inst);
+            if (resolved.* == .fn_type) {
+                const ret_resolved = inferencer.resolve(resolved.fn_type.return_type);
+                if (ret_resolved.* == .adt_type) {
+                    if (inferencer.adt_types.get(ret_resolved.adt_type.name)) |adt_info| {
+                        if (adt_info.is_error_newtype) {
+                            // 构造器是 error_newtype ADT，作为 Throw 错误分支构造器
+                            // 子模式绑定到 error_type（整个 ADT 类型，而非字段类型）
+                            if (con.patterns.len > 0) {
+                                inferencer.inferPattern(con.patterns[0], resolved_expected.throw_type.error_type, env) catch {};
+                            }
+                            return true;
+                        }
+                    }
                 }
-                return true;
-            },
-            else => {},
+            }
         }
     }
     const scheme = env.lookup(con.name) orelse return false;

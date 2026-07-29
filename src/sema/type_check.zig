@@ -1855,7 +1855,22 @@ pub const TypeInferencer = struct {
             },
             .match => |m| {
                 const scrutinee_ty = try self.inferExpr(m.scrutinee, env, null);
-                const resolved_scrutinee = self.resolve(scrutinee_ty);
+                var resolved_scrutinee = self.resolve(scrutinee_ty);
+                // 通用类型提升：error_newtype ADT 在 match 含 Throw 虚拟构造器 arm 时
+                // 自动提升为 Throw<?, ADT>，使 Ok/Error 模式能正确匹配。
+                // 判断依据：ADT 的 is_error_newtype 标志 + arm 构造器在 env 中返回 throw_type。
+                // 不依赖具体构造器名字。
+                if (resolved_scrutinee.* == .adt_type) {
+                    if (self.adt_types.get(resolved_scrutinee.adt_type.name)) |adt_info| {
+                        if (adt_info.is_error_newtype and self.armsUseThrowConstructors(m.arms, env)) {
+                            const val_var = self.freshTypeVar() catch scrutinee_ty;
+                            const promoted = self.arena.allocator().create(Type) catch scrutinee_ty;
+                            promoted.* = Type{ .throw_type = .{ .value_type = val_var, .error_type = scrutinee_ty } };
+                            self.types.append(self.arena.allocator(), promoted) catch {};
+                            resolved_scrutinee = promoted;
+                        }
+                    }
+                }
                 const nullable_inner: ?*Type = switch (resolved_scrutinee.*) {
                     .nullable_type => |inner| inner,
                     else => null,
@@ -1872,11 +1887,11 @@ pub const TypeInferencer = struct {
                     const child_env = try env.createChild();
                     const arm_matches_null = self.patternCoversNull(arm.pattern);
                     var pattern_ty: *Type = if (nullable_inner) |inner|
-                        if (arm_matches_null) scrutinee_ty else inner
+                        if (arm_matches_null) resolved_scrutinee else inner
                     else
-                        scrutinee_ty;
+                        resolved_scrutinee;
                     if (is_gadt_scrutinee) {
-                        pattern_ty = self.freshenType(scrutinee_ty) catch scrutinee_ty;
+                        pattern_ty = self.freshenType(resolved_scrutinee) catch resolved_scrutinee;
                     }
                     try self.inferPattern(arm.pattern, pattern_ty, child_env);
                     self.pushLinearScope();
@@ -1891,7 +1906,7 @@ pub const TypeInferencer = struct {
                         result_ty = body_ty;
                     }
                 }
-                self.checkExhaustiveness(scrutinee_ty, m.arms, ast.exprLocation(expr));
+                self.checkExhaustiveness(resolved_scrutinee, m.arms, ast.exprLocation(expr));
                 return result_ty orelse self.makeType(.unit_type);
             },
             .array_literal => |al| {
@@ -2500,7 +2515,13 @@ pub const TypeInferencer = struct {
             .for_stmt => |fs| {
                 const iterable_ty = try self.inferExpr(fs.iterable, env, null);
                 const child_env = try env.createChild();
-                const item_ty = try self.freshTypeVar();
+                // 通用元素类型提取：从 iterable 类型提取元素类型，而非创建新的类型变量。
+                // 数组 → element_type，字符串 → str_type，其他 → fresh type var（由后续推断确定）。
+                const item_ty: *Type = switch (self.resolve(iterable_ty).*) {
+                    .array_type => |at| at.element_type,
+                    .str_type => self.makeType(.str_type) catch try self.freshTypeVar(),
+                    else => try self.freshTypeVar(),
+                };
                 const resolved_iterable = self.resolve(iterable_ty);
                 const is_builtin_iterable = switch (resolved_iterable.*) {
                     .array_type => true,
@@ -2552,6 +2573,27 @@ pub const TypeInferencer = struct {
             },
         };
     }
+    /// 检查 match arms 是否使用了 Throw 虚拟构造器（Ok/Error）。
+    /// 通用判断：构造器在 env 中注册为返回 throw_type 的函数类型。
+    /// 不依赖具体构造器名字，而是基于类型结构判断。
+    pub fn armsUseThrowConstructors(self: *TypeInferencer, arms: []ast.MatchArm, env: *TypeEnv) bool {
+        for (arms) |arm| {
+            switch (arm.pattern.*) {
+                .constructor => |con| {
+                    if (env.lookup(con.name)) |scheme| {
+                        const inst = self.freshenType(scheme) catch continue;
+                        const resolved = self.resolve(inst);
+                        if (resolved.* == .fn_type) {
+                            if (self.resolve(resolved.fn_type.return_type).* == .throw_type) return true;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
     /// 推断模式类型。将模式变量绑定到 expected_ty，处理 GADT 精化等特殊情况。
     pub fn inferPattern(self: *TypeInferencer, pat: *const ast.Pattern, expected_ty: *Type, env: *TypeEnv) SemaError!void {
         switch (pat.*) {

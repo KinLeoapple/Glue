@@ -493,7 +493,9 @@ pub fn inferThrowOkChanType(ctx: *const InferContextExt, expr: *const ast.Expr) 
                 else => return null,
             };
             if (ctx.base.sema_result.getFuncSig(func_name)) |sig| {
-                if (sig.is_throwing) return sig.return_type_desc;
+                if (sig.is_throwing) {
+                    return sig.return_type_desc;
+                }
             }
             return null;
         },
@@ -512,12 +514,7 @@ pub fn inferThrowOkChanType(ctx: *const InferContextExt, expr: *const ast.Expr) 
             if (cb.mode != .try_to) return null;
             return type_resolver.resolveTypeNodeConcrete(cb.target_type, &.{}, ctx.base.sema_result);
         },
-        .method_call => |mc| {
-            // await：解包 Async<T> → T
-            if (std.mem.eql(u8, mc.method, "await")) {
-                // 简化：sema 阶段 await 返回类型记录在 expr_types
-                return inferChanTypeFromExpr(ctx.base, expr);
-            }
+        .method_call => {
             return inferChanTypeFromExpr(ctx.base, expr);
         },
         else => return null,

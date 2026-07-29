@@ -1,0 +1,81 @@
+// async trait 方法测试：&self 语法糖 + Reader/Writer trait 实现
+
+import std.io.Console.{println}
+
+// MemReader: 内存字节 Reader 实现（&self 引用语义，mutation 持久）
+type MemReader : Reader = MemReader(data: u8[], pos: usize) {
+    pub async fun read(&self, len: usize): Async<Throw<u8[], IOError>> {
+        if self.pos >= self.data.len() {
+            return Ok(self.data[0..0])
+        }
+        var end: usize = self.pos + len
+        if end > self.data.len() {
+            end = self.data.len()
+        }
+        val chunk = self.data[self.pos..end]
+        self.pos = end
+        Ok(chunk)
+    }
+
+    pub async fun read_byte(&self): Async<Throw<u8?, IOError>> {
+        if self.pos >= self.data.len() {
+            return Ok(null)
+        }
+        val b = self.data[self.pos]
+        self.pos = self.pos + 1
+        Ok(b)
+    }
+}
+
+// MemWriter: 内存字节 Writer 实现
+type MemWriter : Writer = MemWriter(buf: u8[]) {
+    pub async fun write(&self, buf: u8[], len: usize): Async<Throw<usize, IOError>> {
+        var i: usize = 0
+        while i < len {
+            self.buf = self.buf ++ [buf[i]]
+            i = i + 1
+        }
+        Ok(len)
+    }
+
+    pub async fun write_all(&self, buf: u8[], len: usize): Async<Throw<void, IOError>> {
+        var i: usize = 0
+        while i < len {
+            self.buf = self.buf ++ [buf[i]]
+            i = i + 1
+        }
+        Ok(void)
+    }
+}
+
+fun main(): void {
+    // ── Reader 测试 ──
+    val data: u8[] = [72, 101, 108, 108, 111]
+    val reader = MemReader(data, 0)
+
+    // read_byte（pos=0 → 72，pos 推进到 1）
+    val b1 = reader.read_byte().await()
+    match b1 {
+        Ok(v) => println("byte0: " + cast(v).to(str)),  // 72
+        Error(e) => println("err: " + e.message()),
+    }
+
+    // read 3 bytes（pos=1 → 读 [1..4]，pos 推进到 4）
+    val chunk = reader.read(3).await()
+    match chunk {
+        Ok(bytes) => println("read_len: " + cast(bytes.len()).to(str)),  // 3
+        Error(e) => println("err: " + e.message()),
+    }
+
+    // ── Writer 测试 ──
+    val w = MemWriter([])
+    val extra: u8[] = [65, 66, 67]
+    w.write(extra, 3).await()
+    println("write_len: " + cast(w.buf.len()).to(str))  // 3
+
+    val more: u8[] = [68, 69]
+    w.write_all(more, 2).await()
+    println("write_all_len: " + cast(w.buf.len()).to(str))  // 5
+
+    println("edge_async_trait: All tests passed!")
+}

@@ -831,7 +831,7 @@ pub const Engine = struct {
         obj.markTracked();
         // 持有强引用，防止对象在执行期间被 release 归零后释放，
         // 导致 deinit 遍历 tracked_objs 时访问悬挂指针（use-after-free）。
-        // deinit 循环通过 obj.rc = 1 释放此 retain。
+        // deinit 循环通过 release() 消费此 retain。
         _ = value.obj_header.retain(obj, self.tctx.?);
         if (self.is_worker) obj.markWorkerAllocated();
     }

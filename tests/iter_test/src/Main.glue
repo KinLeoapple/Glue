@@ -1,0 +1,28 @@
+import std.io.Console.{println}
+
+fun main(): void {
+    // 测试数组迭代器
+    val arr = [10, 20, 30, 40, 50]
+    val iter = arr.iter()
+
+    // 手动 next
+    println(iter.next() ?? -1)  // 10
+    println(iter.next() ?? -1)  // 20
+    println(iter.next() ?? -1)  // 30
+    println(iter.next() ?? -1)  // 40
+    println(iter.next() ?? -1)  // 50
+    println(iter.next() ?? -1)  // -1 (exhausted)
+
+    // 测试 while 循环消费迭代器（用 ?? 哨兵值避免 cast nullable）
+    val arr2 = [1, 2, 3]
+    val iter2 = arr2.iter()
+    var sum: i64 = 0
+    while true {
+        val x = iter2.next() ?? -1
+        if x == -1 { break }
+        sum = sum + x
+    }
+    println(sum)  // 6
+
+    println("iter_test: All tests passed!")
+}
