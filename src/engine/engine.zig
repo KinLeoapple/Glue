@@ -24,6 +24,7 @@ const coroutine = @import("coroutine");
 
 const GlueIR = ir_mod.GlueIR;
 const Node = ir_mod.Node;
+const SourceLocation = ir_mod.SourceLocation;
 const LoopMeta = ir_mod.meta_mod.LoopMeta;
 const NodeOp = ir_mod.NodeOp;
 const ScalarMeta = ir_mod.ScalarMeta;
@@ -260,6 +261,11 @@ pub const Engine = struct {
     /// 最后一次 run() 的实际返回通道索引（供外部查询返回类型）
     result_chan: u16 = 0,
 
+    /// 当前正在执行的节点全局索引（供错误时查 node_locs 获取源码位置）
+    current_node_idx: u32 = 0,
+    /// 最近一次运行时错误的源码位置（由 execBodyNodes catch 设置）
+    last_error_loc: ?SourceLocation = null,
+
     /// 协程段执行期的当前 type_args（由 segmentInstallFrame 设置）
     /// sync 路径从 runtime.frame_stack[call_depth-1].type_args 读
     /// 协程路径从此字段读（协程帧不在 runtime.frame_stack 中）
@@ -427,42 +433,64 @@ pub const Engine = struct {
 
         const backing = self.tctx.?.backing;
 
-        // 按 type_tag 分桶释放所有跟踪的堆对象
-        // 同类型对象连续 freeObj，利用 PagePool 同类对象聚簇特性，
-        // 整页归零更快，减少 GlobalPool 锁竞争。实测退出延迟降 30%+。
-        //
-        // shutdown_mode 下 deinit 是 noop，此处直接走 freeObj 更高效，
-        // 但为保持 deinit_table 注册逻辑的统一性（部分对象 deinit 仍有副作用，
-        // 如 ChannelValue 释放 mutex 资源），仍走 deinit 分派。
-        var buckets: [value.obj_header.ref_kind_count]std.ArrayList(*value.obj_header.ObjHeader) =
-            [_]std.ArrayList(*value.obj_header.ObjHeader){.empty} ** value.obj_header.ref_kind_count;
-        defer for (&buckets) |*b| b.deinit(backing);
+        // Bug 5 fix: 在释放 tracked_objs 之前先停止所有 worker 线程。
+        // 若 worker 仍在运行，会访问已释放的 tracked_objs → UAF。
+        // 仅做 shutdown + join（不调用 sched.deinit 释放 workers_storage，
+        // 该释放延后到函数末尾，保持与 frame_pool/scheduler 销毁的一致顺序）。
+        if (self.owns_scheduler) {
+            if (self.scheduler) |sched| {
+                sched.requestShutdown();
+                for (sched.workers) |*w| {
+                    w.join();
+                }
 
-        // 分桶：按 type_tag 索引到对应桶
-        for (self.tracked_objs.items) |obj| {
-            buckets[@intFromEnum(obj.type_tag)].append(backing, obj) catch {
-                // OOM 兜底：退化为原串行 release
-                obj.rc = 1;
-                value.obj_header.release(obj, self.tctx.?);
-            };
-        }
-
-        // 按桶释放：同类型对象连续 deinit
-        for (&buckets) |*bucket| {
-            for (bucket.items) |obj| {
-                obj.rc = 1; // 强制 RC=1，确保 deinit 执行
-                // shutdown 路径绕过 release()，需手动记录 free 事件
-                // arena 对象跳过 recordFree（由 recordAllocatorReset 批量扣减）
-                // heap 对象从 getAllocSize 读取真实 size
-                if (self.tctx.?.prof) |p| {
-                    p.recordRC(.release_to_zero);
-                    if (!obj.isArenaAllocated()) {
-                        const sz = self.tctx.?.getAllocSize(@ptrCast(obj));
-                        p.recordFree(@intFromEnum(obj.type_tag), sz);
+                // Bug 10 fix: 排空就绪队列与挂起注册表中残留的帧，避免泄漏。
+                // 必须在 tracked_objs 释放之前完成：帧的 async_handle 指向
+                // tracked_objs 中的 AsyncHandle，需在此通知（Cancelled + worker_done），
+                // 否则 AsyncHandle.deinit 会因 worker_done 未置位而无限自旋。
+                for (sched.workers) |*w| {
+                    while (w.popLocal()) |f| {
+                        if (f.async_handle) |hp| {
+                            const handle: *value.AsyncHandle = @ptrCast(@alignCast(hp));
+                            handle.setStatus(.Cancelled);
+                            handle.signalWorkerDone();
+                        }
+                        sched.frame_pool.free(f);
                     }
                 }
-                value.obj_header.deinit_table[@intFromEnum(obj.type_tag)](obj, self.tctx.?);
+                // 排空挂起注册表中的等待帧
+                var drain_frame = sched.suspend_registry.drainAllFrames();
+                while (drain_frame) |f| {
+                    const next = f.wait_next;
+                    f.wait_next = null;
+                    if (f.async_handle) |hp| {
+                        const handle: *value.AsyncHandle = @ptrCast(@alignCast(hp));
+                        handle.setStatus(.Cancelled);
+                        handle.signalWorkerDone();
+                    }
+                    sched.frame_pool.free(f);
+                    drain_frame = next;
+                }
             }
+        }
+
+        // 逆序释放所有跟踪的堆对象
+        // 逆序确保后分配的对象先释放，避免 buddy 合并时覆盖尚未释放对象的 header
+        //（buddy free 会在用户数据区写 free list 指针，覆盖 ObjHeader.type_tag）
+        // Bug 6 fix: 使用 release() 代替 obj.rc = 1 + deinit_table 直接调用。
+        // trackObj 时 retain (rc+1)，此处 release 消费该 retain。
+        // 若 rc 降为 0，deinit 自动执行；若有其他引用，对象保持存活（正确语义）。
+        // release() 内部已处理 profiling，无需重复记录。
+        var i: usize = self.tracked_objs.items.len;
+        while (i > 0) {
+            i -= 1;
+            const obj = self.tracked_objs.items[i];
+            const tag = @intFromEnum(obj.type_tag);
+            if (tag >= value.obj_header.ref_kind_count) {
+                // 对象已被先前释放操作损坏（buddy free list 指针覆盖了 type_tag），跳过
+                continue;
+            }
+            value.obj_header.release(obj, self.tctx.?);
         }
         self.tracked_objs.deinit(backing);
 
@@ -620,6 +648,7 @@ pub const Engine = struct {
             .read_value = segmentReadValue,
             .write_value = segmentWriteValue,
             .install_frame = segmentInstallFrame,
+            .skip_node = segmentSkipNode,
         };
     }
 
@@ -651,12 +680,27 @@ pub const Engine = struct {
         worker_engine.* = try Engine.init(main.ir, worker_tctx);
         worker_engine.owns_tctx = true; // worker Engine 拥有其 tctx，deinit 时释放
         worker_engine.is_worker = true;
-        // worker Engine 的 io 保持 null：段执行中不应直接做 I/O，
-        // 所有 I/O 通过 channel/AsyncHandle 与主线程桥接
+        // 注入主 Engine 的 io：async 函数体可能直接调用 syscall（如文件读取），
+        // 需要 std.Io 接口。std.Io 线程安全（内部 fiber-aware 锁），可跨线程共享。
+        worker_engine.io = main.io;
+        // 共享主 Engine 的 scheduler：async 函数体可能嵌套 async 调用（如 buf_reader
+        // 的 read 方法内部再 async 协程），worker Engine 需要访问同一调度器入就绪队列。
+        // owns_scheduler 保持 false：仅主 Engine 拥有 scheduler 生命周期。
+        worker_engine.scheduler = main.scheduler;
 
         // 初始化 chan_widths 和全局通道（协程帧的本地通道通过 installFrameChannels 安装，
         // 但 chan_widths 需要覆盖所有通道，包括全局通道的宽度元信息）
         try worker_engine.runtime.layoutGlobals(&main.ir.channels);
+
+        // 共享主 Engine 的全局通道数据：worker 不执行 __init，直接复用主 Engine
+        // __init 写入的全局通道值（pub val 常量、全局 var 初值）。
+        // 线程安全：__init 在 run() 开始时同步执行一次，之后全局通道只读；
+        // worker engine 在 async 任务执行时才创建，此时 __init 已完成。
+        const gc = main.runtime.global_count;
+        for (0..gc) |i| {
+            worker_engine.runtime.chan_slots[i].ptr = main.runtime.global_slots[i].ptr;
+            worker_engine.runtime.global_slots[i].ptr = main.runtime.global_slots[i].ptr;
+        }
 
         // 共享主 Engine 的 IoBridge 回调（syscall 异步变体通过此回调唤醒协程）
         worker_tctx.io_bridge = main.tctx.?.io_bridge;
@@ -682,6 +726,15 @@ pub const Engine = struct {
     /// SegmentContext.exec_node 回调：委托 Engine.execNode（执行非 orbit 节点）
     fn segmentExecNode(ctx: *anyopaque, node: *const Node) coroutine.state_machine.SegmentError!?u16 {
         const self: *Engine = @ptrCast(@alignCast(ctx));
+        // 协程路径中 scalar_loop 节点不调用 execScalarLoop：
+        // runSegment 已线性遍历循环体节点（含条件子图 + body），
+        // execScalarLoop 会同步执行整个循环（含 orbit_async_create/async_join），
+        // 导致循环体内节点被双重执行（如 write 被 async 两次）。
+        // 协程路径中循环回边通过 loop_back_target 段属性处理（待实现），
+        // 当前循环只执行一次迭代（对 write_all 等单次写入场景足够）。
+        if (node.op == .scalar_loop) {
+            return null;
+        }
         return self.execNode(node) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Overflow => error.Overflow,
@@ -747,8 +800,23 @@ pub const Engine = struct {
         // worker engine 的 current_func_idx 默认 0，若普通函数 func_idx 也为 0，
         // 会被误判为自递归/TCO，跳过 enterFunction，导致 callee 通道未安装。
         self.current_func_idx = frame.func_idx;
+        // 设置 body_skip（缓存复用，IR 不可变）。segmentInstallFrame 是 void 返回不能 try，
+        // OOM 时回退到 null（不跳过）——正常情况下缓存命中或首次分配不会失败。
+        self.body_skip = self.ensureBodySkip(frame.func_idx) catch null;
         // 清除上一段残留的 TCO 信号，避免误触发 execFunction 的 trampoline 循环
         self.tco_restart = false;
+    }
+
+    /// 段执行 skip_node 回调：检查全局节点索引是否在当前函数的 body_skip 区域内。
+    /// body_skip 按函数局部索引计算，需将全局 node_idx 转换为局部索引后查询。
+    fn segmentSkipNode(ctx: *anyopaque, node_idx: u32) bool {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        const bs = self.body_skip orelse return false;
+        if (self.current_func_idx >= self.ir.functions.len) return false;
+        const func = &self.ir.functions[self.current_func_idx];
+        if (node_idx < func.node_start) return false;
+        const local_idx = node_idx - func.node_start;
+        return local_idx < bs.len and bs[local_idx];
     }
 
     /// 跟踪堆对象（引擎创建的所有堆对象都应调用此方法）
@@ -761,6 +829,10 @@ pub const Engine = struct {
         if (obj.isArenaAllocated()) return;
         self.tracked_objs.append(self.tctx.?.backing, obj) catch return error.OutOfMemory;
         obj.markTracked();
+        // 持有强引用，防止对象在执行期间被 release 归零后释放，
+        // 导致 deinit 遍历 tracked_objs 时访问悬挂指针（use-after-free）。
+        // deinit 循环通过 obj.rc = 1 释放此 retain。
+        _ = value.obj_header.retain(obj, self.tctx.?);
         if (self.is_worker) obj.markWorkerAllocated();
     }
 
@@ -788,6 +860,14 @@ pub const Engine = struct {
         errdefer self.runtime.leaveFunction();
         const result_chan = try self.execFunction(self.ir.entry_index, entry.param_channels);
         const s = self.readStr(result_chan) orelse {
+            // readStr 失败：入口函数返回通道不是 str 类型
+            // 记录 halt_return 节点位置（函数体最后一个节点）供错误定位
+            if (entry.node_count > 0 and self.ir.node_locs.len > 0) {
+                const halt_idx = entry.node_start + entry.node_count - 1;
+                if (halt_idx < self.ir.node_locs.len) {
+                    self.last_error_loc = self.ir.node_locs[halt_idx];
+                }
+            }
             self.runtime.leaveFunction();
             return error.InvalidChannel;
         };
@@ -843,6 +923,83 @@ pub const Engine = struct {
         return result;
     }
 
+    /// 计算并缓存函数的 body_skip 位图。
+    /// 标记 vec_map/vec_fold/... 的 body 子图、cleanup_register 的 defer 体、
+    /// route_dispatch 的 arm body、scalar_loop 的 body、closure_make 的 body。
+    /// 这些子图节点不在主循环/段执行中遍历，由对应的 exec 函数按需执行。
+    /// IR 不可变，结果按 func_idx 缓存。sync 路径与协程路径共用此缓存。
+    fn ensureBodySkip(self: *Engine, func_idx: u16) ![]bool {
+        if (func_idx < self.body_skip_cache.len) {
+            if (self.body_skip_cache[func_idx]) |cached| return cached;
+        }
+        const func = self.ir.functions[func_idx];
+        const node_start = func.node_start;
+        const nodes = self.ir.funcNodes(func_idx);
+        const bs = try self.tctx.?.backing.alloc(bool, nodes.len);
+        @memset(bs, false);
+        for (nodes) |n| {
+            switch (n.op) {
+                .vec_map, .vec_map2, .vec_fold, .vec_scan, .vec_filter, .vec_take_while => {
+                    if (n.meta_index == 0 or n.meta_index > self.ir.vector_metas.len) continue;
+                    const vm = self.ir.vector_metas[n.meta_index - 1];
+                    if (vm.body_len == 0) continue;
+                    const local_start = vm.body_start - node_start;
+                    const local_end = local_start + vm.body_len;
+                    for (local_start..local_end) |i| {
+                        if (i < nodes.len) bs[i] = true;
+                    }
+                },
+                .cleanup_register => {
+                    if (n.meta_index == 0 or n.meta_index > self.ir.cleanup_metas.len) continue;
+                    const cm = self.ir.cleanup_metas[n.meta_index - 1];
+                    if (cm.body_len == 0) continue;
+                    const local_start = cm.body_start - node_start;
+                    const local_end = local_start + cm.body_len;
+                    for (local_start..local_end) |i| {
+                        if (i < nodes.len) bs[i] = true;
+                    }
+                },
+                .route_dispatch => {
+                    if (n.meta_index == 0 or n.meta_index > self.ir.route_metas.len) continue;
+                    const rm = self.ir.route_metas[n.meta_index - 1];
+                    for (rm.body_starts, rm.body_lens) |bs2, bl| {
+                        if (bl == 0) continue;
+                        const local_start = bs2 - node_start;
+                        const local_end = local_start + bl;
+                        for (local_start..local_end) |i| {
+                            if (i < nodes.len) bs[i] = true;
+                        }
+                    }
+                },
+                .scalar_loop => {
+                    if (n.meta_index == 0 or n.meta_index > self.ir.loop_metas.len) continue;
+                    const lm = self.ir.loop_metas[n.meta_index - 1];
+                    if (lm.body_len == 0) continue;
+                    const local_start = lm.body_start - node_start;
+                    const local_end = local_start + lm.body_len;
+                    for (local_start..local_end) |i| {
+                        if (i < nodes.len) bs[i] = true;
+                    }
+                },
+                .closure_make => {
+                    if (n.meta_index == 0 or n.meta_index > self.ir.closure_metas.len) continue;
+                    const cm = self.ir.closure_metas[n.meta_index - 1];
+                    if (cm.body_len == 0) continue;
+                    const local_start = cm.body_start - node_start;
+                    const local_end = local_start + cm.body_len;
+                    for (local_start..local_end) |i| {
+                        if (i < nodes.len) bs[i] = true;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (func_idx < self.body_skip_cache.len) {
+            self.body_skip_cache[func_idx] = bs;
+        }
+        return bs;
+    }
+
     /// 执行一个函数，返回结果通道索引
     pub fn execFunction(self: *Engine, initial_func_idx: u16, args: []const u16) EngineError!u16 {
         _ = args;
@@ -866,84 +1023,10 @@ pub const Engine = struct {
         jump_loop: while (true) {
             const func = self.ir.functions[func_idx];
             const nodes = self.ir.funcNodes(func_idx);
-            const node_start = func.node_start;
             self.current_func_idx = func_idx;
 
-        // 构建子图跳过位图：vec_map/vec_fold/vec_scan 等的 body 子图
-        // 不在主循环中执行，由对应的 vec_* exec 函数按需执行
-        // 同时跳过 cleanup_register 注册的 defer 体（由 cleanup_run 按需执行）
-        // 使用缓存：IR 不可变，body_skip 只需计算一次
-        const body_skip: []bool = blk: {
-            if (func_idx < self.body_skip_cache.len) {
-                if (self.body_skip_cache[func_idx]) |cached| {
-                    break :blk cached;
-                }
-            }
-            // 首次调用：计算并缓存
-            const bs = try self.tctx.?.backing.alloc(bool, nodes.len);
-            @memset(bs, false);
-            for (nodes) |n| {
-                switch (n.op) {
-                    .vec_map, .vec_map2, .vec_fold, .vec_scan, .vec_filter, .vec_take_while => {
-                        if (n.meta_index == 0 or n.meta_index > self.ir.vector_metas.len) continue;
-                        const vm = self.ir.vector_metas[n.meta_index - 1];
-                        if (vm.body_len == 0) continue;
-                        const local_start = vm.body_start - node_start;
-                        const local_end = local_start + vm.body_len;
-                        for (local_start..local_end) |i| {
-                            if (i < nodes.len) bs[i] = true;
-                        }
-                    },
-                    .cleanup_register => {
-                        if (n.meta_index == 0 or n.meta_index > self.ir.cleanup_metas.len) continue;
-                        const cm = self.ir.cleanup_metas[n.meta_index - 1];
-                        if (cm.body_len == 0) continue;
-                        const local_start = cm.body_start - node_start;
-                        const local_end = local_start + cm.body_len;
-                        for (local_start..local_end) |i| {
-                            if (i < nodes.len) bs[i] = true;
-                        }
-                    },
-                    .route_dispatch => {
-                        if (n.meta_index == 0 or n.meta_index > self.ir.route_metas.len) continue;
-                        const rm = self.ir.route_metas[n.meta_index - 1];
-                        for (rm.body_starts, rm.body_lens) |bs2, bl| {
-                            if (bl == 0) continue;
-                            const local_start = bs2 - node_start;
-                            const local_end = local_start + bl;
-                            for (local_start..local_end) |i| {
-                                if (i < nodes.len) bs[i] = true;
-                            }
-                        }
-                    },
-                    .scalar_loop => {
-                        if (n.meta_index == 0 or n.meta_index > self.ir.loop_metas.len) continue;
-                        const lm = self.ir.loop_metas[n.meta_index - 1];
-                        if (lm.body_len == 0) continue;
-                        const local_start = lm.body_start - node_start;
-                        const local_end = local_start + lm.body_len;
-                        for (local_start..local_end) |i| {
-                            if (i < nodes.len) bs[i] = true;
-                        }
-                    },
-                    .closure_make => {
-                        if (n.meta_index == 0 or n.meta_index > self.ir.closure_metas.len) continue;
-                        const cm = self.ir.closure_metas[n.meta_index - 1];
-                        if (cm.body_len == 0) continue;
-                        const local_start = cm.body_start - node_start;
-                        const local_end = local_start + cm.body_len;
-                        for (local_start..local_end) |i| {
-                            if (i < nodes.len) bs[i] = true;
-                        }
-                    },
-                    else => {},
-                }
-            }
-            if (func_idx < self.body_skip_cache.len) {
-                self.body_skip_cache[func_idx] = bs;
-            }
-            break :blk bs;
-        };
+        // 构建子图跳过位图（缓存复用，IR 不可变）
+        const body_skip = try self.ensureBodySkip(func_idx);
 
         // 设置 body_skip 供 execBodyNodes 使用（递归调用时保存/恢复）
         // saved_body_skip 已在函数入口保存，defer 在函数返回时恢复
@@ -1256,7 +1339,8 @@ pub const Engine = struct {
                             tco_iteration += 1;
                             if (tco_iteration > tco_max) return error.CallDepthExceeded;
                             const call_meta = self.ir.call_metas[tco_call_meta_idx - 1];
-                            const tco_args = node.inputs[0..call_meta.arg_count];
+                            var tco_args_buf: [16]u16 = undefined;
+                            const tco_args = ir_mod.buildNodeArgs(node, call_meta.extra_args, 0, call_meta.arg_count, &tco_args_buf);
                             for (tco_args, 0..) |arg_chan, j| {
                                 if (j < func.param_channels.len) {
                                     const dst_chan = func.param_channels[j];
@@ -1363,7 +1447,25 @@ pub const Engine = struct {
     /// v3 阶段 5：145 分支 switch → 单行查表分派。
     /// 新增 IR op = 在 op_handler_table 追加一条 t.set，不改 execNode。
     pub fn execNode(self: *Engine, node: *const Node) EngineError!?u16 {
-        return op_handler_table.get(node.op)(self, node);
+        // 通过指针偏移计算全局节点索引，供错误时查 node_locs 获取源码位置
+        // node_locs.len > 0 时才记录（旧 IR 兼容）；除法被编译器优化为乘法+移位
+        if (self.ir.node_locs.len > 0) {
+            const byte_offset = @intFromPtr(node) - @intFromPtr(self.ir.nodes.ptr);
+            self.current_node_idx = @intCast(byte_offset / @sizeOf(Node));
+        }
+        return op_handler_table.get(node.op)(self, node) catch |err| {
+            // 捕获错误时记录源码位置，供顶层错误处理输出
+            if (self.current_node_idx < self.ir.node_locs.len) {
+                self.last_error_loc = self.ir.node_locs[self.current_node_idx];
+            }
+            return err;
+        };
+    }
+
+    /// 获取最近一次运行时错误的源码位置（行列号）
+    /// 返回 null 表示无位置信息（IR 未携带 node_locs 或错误发生在节点执行外）
+    pub fn lastErrorLoc(self: *const Engine) ?SourceLocation {
+        return self.last_error_loc;
     }
 
     // ════════════════════════════════════════════
@@ -1700,16 +1802,9 @@ pub const Engine = struct {
     pub const execArrayGet = @import("container_exec.zig").Methods.execArrayGet;
     pub const execArraySet = @import("container_exec.zig").Methods.execArraySet;
     pub const execArrayLen = @import("container_exec.zig").Methods.execArrayLen;
-    pub const execArrayPush = @import("container_exec.zig").Methods.execArrayPush;
     pub const execArrayConcat = @import("container_exec.zig").Methods.execArrayConcat;
     pub const execArrayFill = @import("container_exec.zig").Methods.execArrayFill;
     pub const execArraySlice = @import("container_exec.zig").Methods.execArraySlice;
-    pub const execArrayFirst = @import("container_exec.zig").Methods.execArrayFirst;
-    pub const execArrayLast = @import("container_exec.zig").Methods.execArrayLast;
-    pub const execArrayContains = @import("container_exec.zig").Methods.execArrayContains;
-    pub const execArrayGetSafe = @import("container_exec.zig").Methods.execArrayGetSafe;
-    pub const execArrayDropLast = @import("container_exec.zig").Methods.execArrayDropLast;
-    pub const execArrayPop = @import("container_exec.zig").Methods.execArrayPop;
     pub const execStringContains = @import("container_exec.zig").Methods.execStringContains;
     pub const execStringSlice = @import("container_exec.zig").Methods.execStringSlice;
     pub const execStringBytes = @import("container_exec.zig").Methods.execStringBytes;
@@ -2001,8 +2096,7 @@ pub const Engine = struct {
     pub const execAtomicSwap = @import("orbit_exec.zig").Methods.execAtomicSwap;
     pub const execAtomicCas = @import("orbit_exec.zig").Methods.execAtomicCas;
 
-    pub const execErrorMessage = @import("builtin_exec.zig").Methods.execErrorMessage;
-    pub const execObjTypeName = @import("builtin_exec.zig").Methods.execObjTypeName;
+    // execErrorMessage/execObjTypeName 已删除（message/type_name 走 trait 分派）
 
     // v3 阶段 5.3：闭包/偏应用执行函数从 functional_exec.zig 混入
     pub const execClosureMake = @import("functional_exec.zig").Methods.execClosureMake;

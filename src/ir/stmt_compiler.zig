@@ -62,6 +62,8 @@ pub const Methods = struct {
     }
 
     pub fn compileStmt(self: *IRBuilder, stmt: *const ast.Stmt) BuildError!?u16 {
+        // 记录当前语句的源码位置，供 emit 同步写入 node_locs
+        self.current_loc = stmt.getLocation();
         switch (stmt.*) {
             .val_decl => |vd| {
                 // 对于 lambda 值，预声明名字以支持递归引用

@@ -24,6 +24,22 @@ pub fn refineConstructorPattern(
     expected_ty: *Type,
     env: *TypeEnv,
 ) bool {
+    // Error(e) pattern on Throw<T, E>: extract error_type E and bind e to E.
+    // Error is both an error_newtype constructor (fn(str) -> Error) and a Throw
+    // constructor pattern. When the scrutinee is a throw_type, treat Error(e) as
+    // a Throw pattern so e gets the correct error type (e.g. CastError), not str.
+    if (std.mem.eql(u8, con.name, "Error")) {
+        const resolved_expected = inferencer.resolve(expected_ty);
+        switch (resolved_expected.*) {
+            .throw_type => |tt| {
+                if (con.patterns.len > 0) {
+                    inferencer.inferPattern(con.patterns[0], tt.error_type, env) catch {};
+                }
+                return true;
+            },
+            else => {},
+        }
+    }
     const scheme = env.lookup(con.name) orelse return false;
     const inst = inferencer.freshenType(scheme) catch return false;
     const resolved = inferencer.resolve(inst);

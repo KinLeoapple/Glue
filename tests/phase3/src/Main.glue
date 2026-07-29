@@ -10,13 +10,13 @@ fun greet(user: (name: str)) : str {
 // 3. 记录更新
 
 // 4. Error 子类型
-type FileError: Error = FileError(msg: str) {
+type FileError: Err = FileError(msg: str) {
     override fun type_name(self): str {
         "file error"
     }
 }
 
-type NetworkError: Error = NetworkError(msg: str) {
+type NetworkError: Err = NetworkError(msg: str) {
     override fun type_name(self): str {
         "network error"
     }
@@ -36,7 +36,7 @@ fun handle_error(result: Throw<str, Error>) : str {
 }
 
 // 7. 多种错误类型
-type ParseError: Error = ParseError(msg: str) {
+type ParseError: Err = ParseError(msg: str) {
     override fun type_name(self): str {
         "parse error"
     }

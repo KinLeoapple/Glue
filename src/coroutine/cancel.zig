@@ -15,6 +15,7 @@
 const std = @import("std");
 const frame_mod = @import("frame.zig");
 const CoroutineFrame = frame_mod.CoroutineFrame;
+const CoroutineStatus = frame_mod.CoroutineStatus;
 const scheduler_mod = @import("scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 
@@ -27,8 +28,18 @@ pub fn cancelFrame(scheduler: *Scheduler, frame: *CoroutineFrame) void {
     // 1. 从挂起注册表移除（若在挂起中）
     scheduler.suspend_registry.remove(frame);
 
-    // 2. 标记 Cancelled
-    frame.setStatus(.cancelled);
+    // 2. CAS .suspended → .cancelled：仅当 CAS 成功才入队执行 cancel 路径。
+    //    CAS 保护：wakeChain 可能已将帧状态从 .suspended 改为 .ready，
+    //    此时 cancel 不应再入队（帧已在就绪队列中），避免双重入队（UAF）。
+    if (frame.status.cmpxchgStrong(
+        @intFromEnum(CoroutineStatus.suspended),
+        @intFromEnum(CoroutineStatus.cancelled),
+        .acq_rel,
+        .monotonic,
+    ) != null) {
+        // CAS failed: frame was already woken/completed — skip enqueue
+        return;
+    }
 
     // 3. 入就绪队列，worker 调度时检测 Cancelled 状态走 cancel 路径
     //    选最闲 worker 入队

@@ -42,11 +42,26 @@ pub const Methods = struct {
         }
 
         // 编译继承的 trait 默认方法体
-        // 注意：trait default 方法体可能引用 typeof(Self)，需设置 current_self_type_name
-        // 使 builder 在解析 typeof(Self) 时能查到 type_id
+        // trait 默认方法的 self 参数是 Self 类型——trait 的隐式类型参数。
+        // 编译时把 "Self" → 具体类型的 TypeDescriptor 加入 current_type_args，
+        // 使 type_resolver 的 self_type 分支能像泛型 T 一样按名查到具体类型。
         const prev_self_type = self.current_self_type_name;
         self.current_self_type_name = td.name;
         defer self.current_self_type_name = prev_self_type;
+
+        // 构造包含 "Self" 绑定的 type_args
+        const self_desc = self.sema_result.getOrCreateRefDesc(td.name) catch unreachable;
+        var self_type_args = try arena_alloc.alloc(type_descriptor_mod.TypeDescriptor, self.current_type_args.len + 1);
+        @memcpy(self_type_args[0..self.current_type_args.len], self.current_type_args);
+        self_type_args[self.current_type_args.len] = .{
+            .size = self_desc.size,
+            .ops = self_desc.ops,
+            .type_id = self_desc.type_id,
+            .type_name = "Self",
+        };
+        const prev_type_args = self.current_type_args;
+        self.current_type_args = self_type_args;
+        defer self.current_type_args = prev_type_args;
 
         for (td.implemented_traits) |tb| {
             const trait_def = self.sema_result.getTraitDef(tb.trait_name);

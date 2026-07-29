@@ -30,18 +30,20 @@ fun main(): void {
     println(ack(2, 3))         // 9
     println(ack(3, 3))         // 61
 
-    // ---- is_empty works on both arrays and strings ----
+    // ---- is_empty: arrays use len()==0, strings keep is_empty() ----
     val ea: i32[] = []
-    println(ea.is_empty())     // true
-    println([1].is_empty())    // false
+    println(ea.len() == 0)     // true
+    println([1].len() == 0)    // false
     println("".is_empty())     // true
     println("x".is_empty())    // false
 
-    // ---- empty array methods return null, not crash ----
-    println(ea.first())        // null
-    println(ea.last())         // null
-    println(ea.pop())          // null
-    println(ea.drop_last())    // []
+    // ---- empty array: safe access with len() guard ----
+    val ea_first: i32? = if ea.len() > 0 { ea[0] } else { null }
+    println(ea_first)          // null
+    val ea_last: i32? = if ea.len() > 0 { ea[ea.len() - 1] } else { null }
+    println(ea_last)           // null
+    println(ea.len())          // 0 (was pop returning null on empty)
+    println(ea[0..ea.len()])   // [] (was drop_last returning [])
 
     // ---- unicode string indexing ----
     val u = "héllo你好"

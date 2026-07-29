@@ -68,7 +68,7 @@ pub const CoroutineFrame = struct {
     status: std.atomic.Value(u8),
     /// 结果值（completed 时有效）
     result: ?Value,
-    /// 关联的 AsyncHandle（spawn 时由 Engine 写入，complete 时 worker 据此写结果 + 唤醒 join 等待者）
+    /// 关联的 AsyncHandle（async 时由 Engine 写入，complete 时 worker 据此写结果 + 唤醒 join 等待者）
     async_handle: ?*anyopaque = null,
     /// panic 消息缓冲（内联，无跨线程分配）
     panic_buf: [PANIC_BUF_SIZE]u8,
@@ -77,12 +77,16 @@ pub const CoroutineFrame = struct {
     locals_offset: u32,
     /// locals 区字节大小
     locals_size: u32,
+    /// 段内挂起节点索引（唤醒后从此节点之后继续，避免段前缀重执行）
+    /// 0 = 未挂起或从段头开始；挂起时写入挂起节点的全局索引 +1，
+    /// 唤醒后 runSegment 从 resume_node 开始扫描（跳过已执行的前缀）
+    resume_node: u32 = 0,
     /// 等待队列链表指针（SuspendRegistry 的 WaiterList 用）
     /// 帧挂起时串入对应 channel/handle 的等待链；唤醒时摘除
     wait_next: ?*CoroutineFrame = null,
     /// 就绪队列链表指针（Worker 本地就绪队列用，单线程访问无需原子）
     ready_next: ?*CoroutineFrame = null,
-    /// 泛型类型实参（spawn 时写入，segmentInstallFrame 段恢复时读取）
+    /// 泛型类型实参（async 时写入，segmentInstallFrame 段恢复时读取）
     /// 切片生命周期挂在 IR arena，帧只持有引用
     type_args: []const u16 = &[_]u16{},
 
@@ -205,6 +209,9 @@ pub const FramePool = struct {
             self.stats.active_frames += 1;
             const frame: *CoroutineFrame = @ptrCast(@alignCast(node));
             frame.* = CoroutineFrame.initFixed(func_idx, layout, type_args);
+            // Bug 17 fix: 清零 locals 区，避免复用帧残留上一协程的脏数据
+            const locals = frame.localsPtr();
+            @memset(locals[0..frame.locals_size], 0);
             return frame;
         }
 
@@ -216,6 +223,9 @@ pub const FramePool = struct {
 
         const frame: *CoroutineFrame = @ptrCast(@alignCast(mem.ptr));
         frame.* = CoroutineFrame.initFixed(func_idx, layout, type_args);
+        // Bug 17 fix: 清零 locals 区（保持两条路径行为一致）
+        const locals = frame.localsPtr();
+        @memset(locals[0..frame.locals_size], 0);
         return frame;
     }
 

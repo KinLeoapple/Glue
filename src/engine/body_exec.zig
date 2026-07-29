@@ -223,7 +223,8 @@ pub const Methods = struct {
         if (tco_call_node_idx != null and tco_call_meta_idx > 0 and tco_call_meta_idx <= self.ir.call_metas.len) {
             const call_meta = self.ir.call_metas[tco_call_meta_idx - 1];
             const tco_node = &nodes[tco_call_node_idx.?];
-            const tco_args = tco_node.inputs[0..call_meta.arg_count];
+            var tco_args_buf: [16]u16 = undefined;
+            const tco_args = ir_mod.buildNodeArgs(tco_node, call_meta.extra_args, 0, call_meta.arg_count, &tco_args_buf);
             const arg_count = @min(tco_args.len, 16);
             tco_arg_count = @intCast(arg_count);
             const param_channels = self.ir.functions[func_idx].param_channels;

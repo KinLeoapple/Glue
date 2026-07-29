@@ -222,16 +222,16 @@ pub fn runWithTimeout(
     var results_buf: [2]SelectResult = undefined;
     var sel = Io.Select(SelectResult).init(io, &results_buf);
 
-    // spawn op（Io 线程池跑）
+    // async op（Io 线程池跑）
     sel.concurrent(.op, op, .{ io, tctx, op_ctx }) catch {
         // ConcurrencyUnavailable：退化为直接调用（无超时保护）
         return op(io, tctx, op_ctx) catch |err| {
             return wrapOpError(tctx, err);
         };
     };
-    // spawn sleep（Io 线程池跑）
+    // async sleep（Io 线程池跑）
     sel.concurrent(.timed_out, sleepFn, .{ io, timeout_ns }) catch {
-        // ConcurrencyUnavailable：取消已 spawn 的 op，退化为直接调用
+        // ConcurrencyUnavailable：取消已 async 的 op，退化为直接调用
         sel.cancelDiscard();
         return op(io, tctx, op_ctx) catch |err| {
             return wrapOpError(tctx, err);

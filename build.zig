@@ -86,6 +86,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // ---- Builtin .glue 嵌入模块：@embedFile 把 builtin/ 下的 .glue 文件编进二进制 ----
+    // 供 module_loader 在加载用户模块前预加载 builtin 类型定义（走通用 sema/IR 路径）
+    const builtin_embed_module = b.createModule(.{
+        .root_source_file = b.path("src/builtin/embed.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const type_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/type_check.zig"),
         .target = target,
@@ -150,6 +158,7 @@ pub fn build(b: *std.Build) void {
     module_loader_module.addImport("sema", type_check_module);
     module_loader_module.addImport("analysis_db", analysis_db_module);
     module_loader_module.addImport("std_embed", std_embed_module);
+    module_loader_module.addImport("builtin_embed", builtin_embed_module);
     // v3 阶段 16：ast_rewrite 复用 sema/ast_visitor 的 walkExprChildrenMut
     module_loader_module.addImport("ast_visitor", ast_visitor_module);
 

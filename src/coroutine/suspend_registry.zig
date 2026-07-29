@@ -235,16 +235,73 @@ pub const SuspendRegistry = struct {
         }
         return .{ .recv = recv, .send = send, .join = join };
     }
+
+    /// 排空所有等待队列，返回所有挂起帧的链表（通过 wait_next 串联）。
+    /// shutdown 时调用：回收 registry 中残留的帧，避免泄漏。
+    /// 调用方负责释放帧并通知其 async_handle。
+    pub fn drainAllFrames(self: *SuspendRegistry) ?*CoroutineFrame {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var head: ?*CoroutineFrame = null;
+        // 三类等待队列的逐个排空逻辑相同，内联处理
+        var recv_it = self.chan_recv_waiters.valueIterator();
+        while (recv_it.next()) |list| {
+            var cur = list.head;
+            while (cur) |f| {
+                const next = f.wait_next;
+                f.wait_next = head;
+                head = f;
+                cur = next;
+            }
+            list.head = null;
+            list.tail = null;
+        }
+        var send_it = self.chan_send_waiters.valueIterator();
+        while (send_it.next()) |list| {
+            var cur = list.head;
+            while (cur) |f| {
+                const next = f.wait_next;
+                f.wait_next = head;
+                head = f;
+                cur = next;
+            }
+            list.head = null;
+            list.tail = null;
+        }
+        var join_it = self.async_join_waiters.valueIterator();
+        while (join_it.next()) |list| {
+            var cur = list.head;
+            while (cur) |f| {
+                const next = f.wait_next;
+                f.wait_next = head;
+                head = f;
+                cur = next;
+            }
+            list.head = null;
+            list.tail = null;
+        }
+        return head;
+    }
 };
 
-/// 唤醒链表上所有帧：逐个设 Ready + 入就绪队列
+/// 唤醒链表上所有帧：CAS .suspended → .ready，成功才入就绪队列
+/// CAS 保护：cancel/complete 可能已将帧状态从 .suspended 改为 .cancelled/.completed，
+/// 此时跳过唤醒，避免双重入队（UAF）。
 fn wakeChain(head: ?*CoroutineFrame, ctx: ?*anyopaque, enqueue_fn: ?EnqueueFn) void {
     var cur = head;
     while (cur) |f| {
         const next = f.wait_next;
         f.wait_next = null;
-        f.setStatus(.ready);
-        if (enqueue_fn) |fn_| if (ctx) |c| fn_(c, f);
+        // Only wake frames that are still suspended (CAS protects against cancel/complete)
+        if (f.status.cmpxchgStrong(
+            @intFromEnum(CoroutineStatus.suspended),
+            @intFromEnum(CoroutineStatus.ready),
+            .acq_rel,
+            .monotonic,
+        ) == null) {
+            if (enqueue_fn) |fn_| if (ctx) |c| fn_(c, f);
+        }
+        // If CAS fails, frame was already cancelled/completed — skip
         cur = next;
     }
 }

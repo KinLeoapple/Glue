@@ -1,17 +1,17 @@
-//! TypeDescriptor + ScalarOps vtable（类型定义 + 标量 vtable 实现）
+//! TypeDescriptor + TypeOps vtable（类型定义 + 标量 vtable 实现）
 //!
 //! v3 spec §4.1: 替代 TypeKind 枚举 + ConcreteType 的统一类型描述符。
 //! 所有类型（标量/引用/复合/容器）统一表示，递归 slots 支持任意嵌套。
-//! scalar_ops vtable 消除标量读写 switch，增加类型只需追加 scalar_ops_table 条目。
+//! ops vtable 消除标量读写 switch，增加类型只需追加 ops_table 条目。
 //!
 //! 本文件包含：
-//! - 类型定义（TypeDescriptor/ScalarOps）
+//! - 类型定义（TypeDescriptor/TypeOps）
 //! - 标量 vtable 实现（read/write/equal/format/hash，18 种标量共 90 个函数）
-//! - 静态 TypeDescriptor 常量（每个标量类型对应的 TypeDescriptor，标量类型已填充 scalar_ops）
+//! - 静态 TypeDescriptor 常量（每个标量类型对应的 TypeDescriptor，标量类型已填充 ops）
 //! - lookupByTypeId/lookupByIntKind/lookupByFloatKind（按 type_id/IntKind/FloatKind 查找）
 //!
-//! scalar_ops 实现已从 sema/type_descriptor.zig 迁入此文件，
-//! 引擎通过 ChanSlot.type_desc.scalar_ops 即可获得统一的标量读写接口。
+//! ops 实现已从 sema/type_descriptor.zig 迁入此文件，
+//! 引擎通过 ChanSlot.type_desc.ops 即可获得统一的标量读写接口。
 
 const std = @import("std");
 const value = @import("value");
@@ -29,7 +29,7 @@ pub fn isReadable(addr: usize) bool {
 }
 
 /// 标量操作 vtable
-pub const ScalarOps = struct {
+pub const TypeOps = struct {
     read: *const fn (ptr: *anyopaque) value.Value,
     write: *const fn (ptr: *anyopaque, v: value.Value) void,
     /// 将任意 Value 强制转换为本类型的标准 Value（用于跨类型通道写入）
@@ -44,11 +44,10 @@ pub const ScalarOps = struct {
 
 /// 统一类型描述符（替代 TypeKind 枚举 + ConcreteType）
 /// 所有类型信息集中于此，运行时通过 type_desc 获取类型属性，
-/// 通过 scalar_ops vtable 统一读写值，无任何通道派分。
+/// 通过 ops vtable 统一读写值，无任何通道派分。
 pub const TypeDescriptor = struct {
     size: u8,
-    alignment: u8,
-    scalar_ops: *const ScalarOps,
+    ops: *const TypeOps,
     type_id: u16,
     type_name: []const u8,
 
@@ -1111,30 +1110,30 @@ pub fn coerceChar(v: value.Value) value.Value {
 }
 
 // ════════════════════════════════════════════════════════════
-// 标量 ScalarOps 常量（每个标量类型一个，供静态 TypeDescriptor 引用）
+// 标量 TypeOps 常量（每个标量类型一个，供静态 TypeDescriptor 引用）
 // ════════════════════════════════════════════════════════════
 
-pub const i8_ops: ScalarOps = .{ .read = readI8, .write = writeI8, .coerce = coerceI8, .equal = eqI8, .format = fmtI8, .hash = hashI8, .clone = cloneI8 };
-pub const u8_ops: ScalarOps = .{ .read = readU8, .write = writeU8, .coerce = coerceU8, .equal = eqU8, .format = fmtU8, .hash = hashU8, .clone = cloneU8 };
-pub const i16_ops: ScalarOps = .{ .read = readI16, .write = writeI16, .coerce = coerceI16, .equal = eqI16, .format = fmtI16, .hash = hashI16, .clone = cloneI16 };
-pub const u16_ops: ScalarOps = .{ .read = readU16, .write = writeU16, .coerce = coerceU16, .equal = eqU16, .format = fmtU16, .hash = hashU16, .clone = cloneU16 };
-pub const i32_ops: ScalarOps = .{ .read = readI32, .write = writeI32, .coerce = coerceI32, .equal = eqI32, .format = fmtI32, .hash = hashI32, .clone = cloneI32 };
-pub const u32_ops: ScalarOps = .{ .read = readU32, .write = writeU32, .coerce = coerceU32, .equal = eqU32, .format = fmtU32, .hash = hashU32, .clone = cloneU32 };
-pub const i64_ops: ScalarOps = .{ .read = readI64, .write = writeI64, .coerce = coerceI64, .equal = eqI64, .format = fmtI64, .hash = hashI64, .clone = cloneI64 };
-pub const u64_ops: ScalarOps = .{ .read = readU64, .write = writeU64, .coerce = coerceU64, .equal = eqU64, .format = fmtU64, .hash = hashU64, .clone = cloneU64 };
-pub const i128_ops: ScalarOps = .{ .read = readI128, .write = writeI128, .coerce = coerceI128, .equal = eqI128, .format = fmtI128, .hash = hashI128, .clone = cloneI128 };
-pub const u128_ops: ScalarOps = .{ .read = readU128, .write = writeU128, .coerce = coerceU128, .equal = eqU128, .format = fmtU128, .hash = hashU128, .clone = cloneU128 };
-pub const isize_ops: ScalarOps = .{ .read = readIsize, .write = writeIsize, .coerce = coerceIsize, .equal = eqIsize, .format = fmtIsize, .hash = hashIsize, .clone = cloneIsize };
-pub const usize_ops: ScalarOps = .{ .read = readUsize, .write = writeUsize, .coerce = coerceUsize, .equal = eqUsize, .format = fmtUsize, .hash = hashUsize, .clone = cloneUsize };
-pub const f16_ops: ScalarOps = .{ .read = readF16, .write = writeF16, .coerce = coerceF16, .equal = eqF16, .format = fmtF16, .hash = hashF16, .clone = cloneF16 };
-pub const f32_ops: ScalarOps = .{ .read = readF32, .write = writeF32, .coerce = coerceF32, .equal = eqF32, .format = fmtF32, .hash = hashF32, .clone = cloneF32 };
-pub const f64_ops: ScalarOps = .{ .read = readF64, .write = writeF64, .coerce = coerceF64, .equal = eqF64, .format = fmtF64, .hash = hashF64, .clone = cloneF64 };
-pub const f128_ops: ScalarOps = .{ .read = readF128, .write = writeF128, .coerce = coerceF128, .equal = eqF128, .format = fmtF128, .hash = hashF128, .clone = cloneF128 };
-pub const bool_ops: ScalarOps = .{ .read = readBool, .write = writeBool, .coerce = coerceBool, .equal = eqBool, .format = fmtBool, .hash = hashBool, .clone = cloneBool };
-pub const char_ops: ScalarOps = .{ .read = readChar, .write = writeChar, .coerce = coerceChar, .equal = eqChar, .format = fmtChar, .hash = hashChar, .clone = cloneChar };
+pub const i8_ops: TypeOps = .{ .read = readI8, .write = writeI8, .coerce = coerceI8, .equal = eqI8, .format = fmtI8, .hash = hashI8, .clone = cloneI8 };
+pub const u8_ops: TypeOps = .{ .read = readU8, .write = writeU8, .coerce = coerceU8, .equal = eqU8, .format = fmtU8, .hash = hashU8, .clone = cloneU8 };
+pub const i16_ops: TypeOps = .{ .read = readI16, .write = writeI16, .coerce = coerceI16, .equal = eqI16, .format = fmtI16, .hash = hashI16, .clone = cloneI16 };
+pub const u16_ops: TypeOps = .{ .read = readU16, .write = writeU16, .coerce = coerceU16, .equal = eqU16, .format = fmtU16, .hash = hashU16, .clone = cloneU16 };
+pub const i32_ops: TypeOps = .{ .read = readI32, .write = writeI32, .coerce = coerceI32, .equal = eqI32, .format = fmtI32, .hash = hashI32, .clone = cloneI32 };
+pub const u32_ops: TypeOps = .{ .read = readU32, .write = writeU32, .coerce = coerceU32, .equal = eqU32, .format = fmtU32, .hash = hashU32, .clone = cloneU32 };
+pub const i64_ops: TypeOps = .{ .read = readI64, .write = writeI64, .coerce = coerceI64, .equal = eqI64, .format = fmtI64, .hash = hashI64, .clone = cloneI64 };
+pub const u64_ops: TypeOps = .{ .read = readU64, .write = writeU64, .coerce = coerceU64, .equal = eqU64, .format = fmtU64, .hash = hashU64, .clone = cloneU64 };
+pub const i128_ops: TypeOps = .{ .read = readI128, .write = writeI128, .coerce = coerceI128, .equal = eqI128, .format = fmtI128, .hash = hashI128, .clone = cloneI128 };
+pub const u128_ops: TypeOps = .{ .read = readU128, .write = writeU128, .coerce = coerceU128, .equal = eqU128, .format = fmtU128, .hash = hashU128, .clone = cloneU128 };
+pub const isize_ops: TypeOps = .{ .read = readIsize, .write = writeIsize, .coerce = coerceIsize, .equal = eqIsize, .format = fmtIsize, .hash = hashIsize, .clone = cloneIsize };
+pub const usize_ops: TypeOps = .{ .read = readUsize, .write = writeUsize, .coerce = coerceUsize, .equal = eqUsize, .format = fmtUsize, .hash = hashUsize, .clone = cloneUsize };
+pub const f16_ops: TypeOps = .{ .read = readF16, .write = writeF16, .coerce = coerceF16, .equal = eqF16, .format = fmtF16, .hash = hashF16, .clone = cloneF16 };
+pub const f32_ops: TypeOps = .{ .read = readF32, .write = writeF32, .coerce = coerceF32, .equal = eqF32, .format = fmtF32, .hash = hashF32, .clone = cloneF32 };
+pub const f64_ops: TypeOps = .{ .read = readF64, .write = writeF64, .coerce = coerceF64, .equal = eqF64, .format = fmtF64, .hash = hashF64, .clone = cloneF64 };
+pub const f128_ops: TypeOps = .{ .read = readF128, .write = writeF128, .coerce = coerceF128, .equal = eqF128, .format = fmtF128, .hash = hashF128, .clone = cloneF128 };
+pub const bool_ops: TypeOps = .{ .read = readBool, .write = writeBool, .coerce = coerceBool, .equal = eqBool, .format = fmtBool, .hash = hashBool, .clone = cloneBool };
+pub const char_ops: TypeOps = .{ .read = readChar, .write = writeChar, .coerce = coerceChar, .equal = eqChar, .format = fmtChar, .hash = hashChar, .clone = cloneChar };
 
 // ════════════════════════════════════════════════════════════
-// ref_chan ScalarOps：统一引用通道的读写路径
+// ref_chan TypeOps：统一引用通道的读写路径
 // ════════════════════════════════════════════════════════════
 // ref_chan 为多态通道，8 字节槽可持有：
 //   - 堆对象指针（真实 ref Value）
@@ -1240,7 +1239,7 @@ pub fn cloneRef(ptr: *anyopaque, allocator: std.mem.Allocator) value.Value {
     return readRef(ptr);
 }
 
-pub const ref_ops: ScalarOps = .{ .read = readRef, .write = writeRef, .coerce = coerceRef, .equal = eqRef, .format = fmtRef, .hash = hashRef, .clone = cloneRef };
+pub const ref_ops: TypeOps = .{ .read = readRef, .write = writeRef, .coerce = coerceRef, .equal = eqRef, .format = fmtRef, .hash = hashRef, .clone = cloneRef };
 
 // ════════════════════════════════════════════════════════════
 // heap_ref_ops：具体引用类型的简化 vtable
@@ -1287,7 +1286,7 @@ pub fn cloneHeapRef(ptr: *anyopaque, allocator: std.mem.Allocator) value.Value {
     return readHeapRef(ptr);
 }
 
-pub const heap_ref_ops: ScalarOps = .{
+pub const heap_ref_ops: TypeOps = .{
     .read = readHeapRef,
     .write = writeRef,
     .coerce = coerceRef,
@@ -1298,7 +1297,7 @@ pub const heap_ref_ops: ScalarOps = .{
 };
 
 // ════════════════════════════════════════════════════════════
-// nullable<T> ScalarOps：nullable 通道的专属 vtable
+// nullable<T> TypeOps：nullable 通道的专属 vtable
 // ════════════════════════════════════════════════════════════
 // nullable<T> 内存布局：[data (inner_size bytes) | 1 byte flag]
 // flag != 0 表示 null。read/write/coerce/equal/format/hash/clone 均先检查 flag，
@@ -1313,7 +1312,7 @@ fn nullableOps(
     comptime inner_format: *const fn (*anyopaque, []u8) []const u8,
     comptime inner_hash: *const fn (*anyopaque) u64,
     comptime inner_clone: *const fn (*anyopaque, std.mem.Allocator) value.Value,
-) ScalarOps {
+) TypeOps {
     return .{
         .read = struct {
             fn f(ptr: *anyopaque) value.Value {
@@ -1398,7 +1397,7 @@ pub const nullable_char_ops = nullableOps(4, readChar, writeChar, coerceChar, eq
 pub const nullable_ref_ops = nullableOps(8, readHeapRef, writeRef, coerceRef, eqRef, fmtRef, hashRef, cloneHeapRef);
 
 // ════════════════════════════════════════════════════════════
-// unit/null ScalarOps：零字节类型的统一读写
+// unit/null TypeOps：零字节类型的统一读写
 // ════════════════════════════════════════════════════════════
 // unit/null 通道 size=0，无数据。read 返回 fromUnit/fromNull，write 为 no-op。
 
@@ -1431,7 +1430,7 @@ pub fn cloneUnit(ptr: *anyopaque, allocator: std.mem.Allocator) value.Value {
     _ = allocator;
     return readUnit(ptr);
 }
-pub const unit_ops: ScalarOps = .{ .read = readUnit, .write = writeUnit, .coerce = coerceUnit, .equal = eqUnit, .format = fmtUnit, .hash = hashUnit, .clone = cloneUnit };
+pub const unit_ops: TypeOps = .{ .read = readUnit, .write = writeUnit, .coerce = coerceUnit, .equal = eqUnit, .format = fmtUnit, .hash = hashUnit, .clone = cloneUnit };
 
 pub fn readNull(ptr: *anyopaque) value.Value {
     _ = ptr;
@@ -1462,46 +1461,46 @@ pub fn cloneNull(ptr: *anyopaque, allocator: std.mem.Allocator) value.Value {
     _ = allocator;
     return readNull(ptr);
 }
-pub const null_ops: ScalarOps = .{ .read = readNull, .write = writeNull, .coerce = coerceNull, .equal = eqNull, .format = fmtNull, .hash = hashNull, .clone = cloneNull };
+pub const null_ops: TypeOps = .{ .read = readNull, .write = writeNull, .coerce = coerceNull, .equal = eqNull, .format = fmtNull, .hash = hashNull, .clone = cloneNull };
 
 // ════════════════════════════════════════════════════════════
 // 静态 TypeDescriptor 常量（替代原 builtin_chan_descriptors EnumArray）
 // ════════════════════════════════════════════════════════════
-// 所有类型的 scalar_ops 已填充，引擎通过 ChanSlot.type_desc.scalar_ops
+// 所有类型的 ops 已填充，引擎通过 ChanSlot.type_desc.ops
 // 即可获得统一的读写接口（read/write/equal/format/hash）。
-// - 标量类型（18 种）：各自的 scalar_ops vtable
+// - 标量类型（18 种）：各自的 ops vtable
 // - ref：ref_ops 处理多态 8 字节槽（堆指针/null/标量位模式）
 // - null/unit：null_ops/unit_ops 零字节类型
 // - mask：bool_ops（与 bool 相同）
 // - nullable：null_ops（is_nullable=true，通过 type_desc.is_nullable 分支处理）
 // nullable 的 size=0（占位），实际宽度由 ChanSlot.width 持有。
 
-const i8_descriptor_val: TypeDescriptor = .{ .size = 1, .alignment = 1, .type_id = 1, .type_name = "i8", .scalar_ops = &i8_ops };
-const i16_descriptor_val: TypeDescriptor = .{ .size = 2, .alignment = 2, .type_id = 2, .type_name = "i16", .scalar_ops = &i16_ops };
-const i32_descriptor_val: TypeDescriptor = .{ .size = 4, .alignment = 4, .type_id = 3, .type_name = "i32", .scalar_ops = &i32_ops };
-const i64_descriptor_val: TypeDescriptor = .{ .size = 8, .alignment = 8, .type_id = 4, .type_name = "i64", .scalar_ops = &i64_ops };
-const i128_descriptor_val: TypeDescriptor = .{ .size = 16, .alignment = 16, .type_id = 5, .type_name = "i128", .scalar_ops = &i128_ops };
-const u8_descriptor_val: TypeDescriptor = .{ .size = 1, .alignment = 1, .type_id = 6, .type_name = "u8", .scalar_ops = &u8_ops };
-const u16_descriptor_val: TypeDescriptor = .{ .size = 2, .alignment = 2, .type_id = 7, .type_name = "u16", .scalar_ops = &u16_ops };
-const u32_descriptor_val: TypeDescriptor = .{ .size = 4, .alignment = 4, .type_id = 8, .type_name = "u32", .scalar_ops = &u32_ops };
-const u64_descriptor_val: TypeDescriptor = .{ .size = 8, .alignment = 8, .type_id = 9, .type_name = "u64", .scalar_ops = &u64_ops };
-const u128_descriptor_val: TypeDescriptor = .{ .size = 16, .alignment = 16, .type_id = 10, .type_name = "u128", .scalar_ops = &u128_ops };
-const isize_descriptor_val: TypeDescriptor = .{ .size = @sizeOf(isize), .alignment = @alignOf(isize), .type_id = 11, .type_name = "isize", .scalar_ops = &isize_ops };
-const usize_descriptor_val: TypeDescriptor = .{ .size = @sizeOf(usize), .alignment = @alignOf(usize), .type_id = 12, .type_name = "usize", .scalar_ops = &usize_ops };
-const f16_descriptor_val: TypeDescriptor = .{ .size = 2, .alignment = 2, .type_id = 13, .type_name = "f16", .scalar_ops = &f16_ops };
-const f32_descriptor_val: TypeDescriptor = .{ .size = 4, .alignment = 4, .type_id = 14, .type_name = "f32", .scalar_ops = &f32_ops };
-const f64_descriptor_val: TypeDescriptor = .{ .size = 8, .alignment = 8, .type_id = 15, .type_name = "f64", .scalar_ops = &f64_ops };
-const f128_descriptor_val: TypeDescriptor = .{ .size = 16, .alignment = 16, .type_id = 16, .type_name = "f128", .scalar_ops = &f128_ops };
-const bool_descriptor_val: TypeDescriptor = .{ .size = 1, .alignment = 1, .type_id = 17, .type_name = "bool", .scalar_ops = &bool_ops };
-const char_descriptor_val: TypeDescriptor = .{ .size = 4, .alignment = 4, .type_id = 18, .type_name = "char", .scalar_ops = &char_ops };
+const i8_descriptor_val: TypeDescriptor = .{ .size = 1, .type_id = 1, .type_name = "i8", .ops = &i8_ops };
+const i16_descriptor_val: TypeDescriptor = .{ .size = 2, .type_id = 2, .type_name = "i16", .ops = &i16_ops };
+const i32_descriptor_val: TypeDescriptor = .{ .size = 4, .type_id = 3, .type_name = "i32", .ops = &i32_ops };
+const i64_descriptor_val: TypeDescriptor = .{ .size = 8, .type_id = 4, .type_name = "i64", .ops = &i64_ops };
+const i128_descriptor_val: TypeDescriptor = .{ .size = 16, .type_id = 5, .type_name = "i128", .ops = &i128_ops };
+const u8_descriptor_val: TypeDescriptor = .{ .size = 1, .type_id = 6, .type_name = "u8", .ops = &u8_ops };
+const u16_descriptor_val: TypeDescriptor = .{ .size = 2, .type_id = 7, .type_name = "u16", .ops = &u16_ops };
+const u32_descriptor_val: TypeDescriptor = .{ .size = 4, .type_id = 8, .type_name = "u32", .ops = &u32_ops };
+const u64_descriptor_val: TypeDescriptor = .{ .size = 8, .type_id = 9, .type_name = "u64", .ops = &u64_ops };
+const u128_descriptor_val: TypeDescriptor = .{ .size = 16, .type_id = 10, .type_name = "u128", .ops = &u128_ops };
+const isize_descriptor_val: TypeDescriptor = .{ .size = @sizeOf(isize), .type_id = 11, .type_name = "isize", .ops = &isize_ops };
+const usize_descriptor_val: TypeDescriptor = .{ .size = @sizeOf(usize), .type_id = 12, .type_name = "usize", .ops = &usize_ops };
+const f16_descriptor_val: TypeDescriptor = .{ .size = 2, .type_id = 13, .type_name = "f16", .ops = &f16_ops };
+const f32_descriptor_val: TypeDescriptor = .{ .size = 4, .type_id = 14, .type_name = "f32", .ops = &f32_ops };
+const f64_descriptor_val: TypeDescriptor = .{ .size = 8, .type_id = 15, .type_name = "f64", .ops = &f64_ops };
+const f128_descriptor_val: TypeDescriptor = .{ .size = 16, .type_id = 16, .type_name = "f128", .ops = &f128_ops };
+const bool_descriptor_val: TypeDescriptor = .{ .size = 1, .type_id = 17, .type_name = "bool", .ops = &bool_ops };
+const char_descriptor_val: TypeDescriptor = .{ .size = 4, .type_id = 18, .type_name = "char", .ops = &char_ops };
 /// str 类型：具体引用类型（8 字节堆指针），type_id=19
-const str_descriptor_val: TypeDescriptor = .{ .size = 8, .alignment = 8, .type_id = 19, .type_name = "str", .scalar_ops = &heap_ref_ops };
-const null_descriptor_val: TypeDescriptor = .{ .size = 0, .alignment = 0, .type_id = 20, .type_name = "Null", .scalar_ops = &null_ops };
-const unit_descriptor_val: TypeDescriptor = .{ .size = 0, .alignment = 0, .type_id = 21, .type_name = "void", .scalar_ops = &unit_ops };
+const str_descriptor_val: TypeDescriptor = .{ .size = 8, .type_id = 19, .type_name = "str", .ops = &heap_ref_ops };
+const null_descriptor_val: TypeDescriptor = .{ .size = 0, .type_id = 20, .type_name = "Null", .ops = &null_ops };
+const unit_descriptor_val: TypeDescriptor = .{ .size = 0, .type_id = 21, .type_name = "void", .ops = &unit_ops };
 /// 通用引用描述符（废除 ref_chan 过渡期保留）：8 字节堆指针，isRef()=true
 /// 新代码应使用 TypeDescriptorPool.getOrCreateRefDesc(name) 获取具体类型描述符
-const ref_descriptor_val: TypeDescriptor = .{ .size = 8, .alignment = 8, .type_id = 0, .type_name = "ref", .scalar_ops = &ref_ops };
-const nullable_descriptor_val: TypeDescriptor = .{ .size = 0, .alignment = 0, .type_id = 0, .type_name = "nullable", .scalar_ops = &null_ops };
+const ref_descriptor_val: TypeDescriptor = .{ .size = 8, .type_id = 0, .type_name = "ref", .ops = &ref_ops };
+const nullable_descriptor_val: TypeDescriptor = .{ .size = 0, .type_id = 0, .type_name = "nullable", .ops = &null_ops };
 
 /// 所有标量 TypeDescriptor 指针（type_id 1-18），供 lookupByTypeId 线性查找
 const scalar_descriptors = [_]*const TypeDescriptor{
@@ -1588,7 +1587,7 @@ pub const str_descriptor: *const TypeDescriptor = &str_descriptor_val;
 // ════════════════════════════════════════════════════════════
 // 所有引用类型（ADT/record/newtype/array/fn/closure 等）均为 8 字节指针通道，
 // 但各自拥有唯一的 type_id 和 type_name，消除多态 ref_descriptor。
-// scalar_ops 统一使用 ref_ops（读写 8 字节指针），行为一致。
+// ops 统一使用 ref_ops（读写 8 字节指针），行为一致。
 
 /// 动态类型描述符池：为用户自定义类型创建具体引用类型描述符
 pub const TypeDescriptorPool = struct {
@@ -1617,10 +1616,9 @@ pub const TypeDescriptorPool = struct {
         const name_copy = try self.arena.allocator().dupe(u8, name);
         td.* = .{
             .size = 8,
-            .alignment = 8,
             .type_id = self.next_type_id,
             .type_name = name_copy,
-            .scalar_ops = &heap_ref_ops,
+            .ops = &heap_ref_ops,
         };
         self.next_type_id += 1;
         try self.cache.put(name_copy, td);
@@ -1628,25 +1626,24 @@ pub const TypeDescriptorPool = struct {
     }
 
     /// 获取或创建 nullable<T> 具名描述符
-    /// inner_size + 1 byte flag，scalar_ops 为对应的 nullable ops
+    /// inner_size + 1 byte flag，ops 为对应的 nullable ops
     pub fn getOrCreateNullableDesc(self: *TypeDescriptorPool, inner: *const TypeDescriptor) !*const TypeDescriptor {
-        const ops: *const ScalarOps = if (inner.isRef()) &nullable_ref_ops else selectNullableScalarOps(inner);
+        const ops: *const TypeOps = if (inner.isRef()) &nullable_ref_ops else selectNullableTypeOps(inner);
         const name = try std.fmt.allocPrint(self.arena.allocator(), "nullable<{s}>", .{inner.type_name});
         if (self.cache.get(name)) |td| return td;
         const td = try self.arena.allocator().create(TypeDescriptor);
         td.* = .{
             .size = inner.size + 1,
-            .alignment = inner.alignment,
             .type_id = self.next_type_id,
             .type_name = name,
-            .scalar_ops = ops,
+            .ops = ops,
         };
         self.next_type_id += 1;
         try self.cache.put(name, td);
         return td;
     }
 
-    fn selectNullableScalarOps(inner: *const TypeDescriptor) *const ScalarOps {
+    fn selectNullableTypeOps(inner: *const TypeDescriptor) *const TypeOps {
         // 按 type_id 选择（1-18 对应标量）
         return switch (inner.type_id) {
             1 => &nullable_i8_ops,

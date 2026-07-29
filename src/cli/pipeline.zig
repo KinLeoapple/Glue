@@ -152,7 +152,7 @@ pub fn executeSource(
     var glue_ir = builder.build(entry_module) catch |err| {
         cli_ctx.prof.phases.phaseEnd(.ir_build_core);
         cli_ctx.prof.phases.phaseEnd(.ir_build);
-        args_mod.printError(io, "{s}: IR build error: {s}\n", .{ filename, @errorName(err) });
+        args_mod.printError(io, "{s}: IR build error: {s} (in func: {?s}, last expr: {s})\n", .{ filename, @errorName(err), builder.debug_error_func_name, builder.debug_last_expr_tag });
         builder.deinit();
         return .failed;
     };
@@ -196,7 +196,11 @@ pub fn executeSource(
     cli_ctx.prof.phases.phaseBegin(.engine_exec);
     const result = eng.run() catch |err| {
         cli_ctx.prof.phases.phaseEnd(.engine_exec);
-        args_mod.printError(io, "{s}: execution error: {s}\n", .{ filename, @errorName(err) });
+        if (eng.lastErrorLoc()) |loc| {
+            args_mod.printError(io, "{s}:{d}:{d}: execution error: {s}\n", .{ filename, loc.line, loc.column, @errorName(err) });
+        } else {
+            args_mod.printError(io, "{s}: execution error: {s}\n", .{ filename, @errorName(err) });
+        }
         return .failed;
     };
     cli_ctx.prof.phases.phaseEnd(.engine_exec);

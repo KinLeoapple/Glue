@@ -61,9 +61,8 @@ pub fn cmdInit(allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8) !voi
     const main_content =
         \\import std.io.Console.{println}
         \\
-        \\fun main() {
+        \\fun main(): void {
         \\    println("Hello, Glue!")
-        \\    0
         \\}
         \\
     ;

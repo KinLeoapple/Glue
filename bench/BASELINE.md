@@ -365,7 +365,7 @@ VM 阶段吞吐（`--profile`，指令数 / vm 阶段时间，排除进程启动
   - `self.peek(d)` → `stack_ptr[stack_len - 1 - d]`
   - `self.stack.items[i]` → `stack_ptr[i]`
   - `frame.ip` 读写 → `ip`（非 sync-point）
-- sync-point prong（call/return/make_*/index/set_*/compound_*/closure/for_next/get_field/spawn/cast/coerce 等约 20 处）：调用前 `self.stack.items.len = stack_len; frame.ip = ip;`，调用后完整重载 frame/func/code/slot_base/ip/stack_ptr/stack_len/stack_cap
+- sync-point prong（call/return/make_*/index/set_*/compound_*/closure/for_next/get_field/async/cast/coerce 等约 20 处）：调用前 `self.stack.items.len = stack_len; frame.ip = ip;`，调用后完整重载 frame/func/code/slot_base/ip/stack_ptr/stack_len/stack_cap
 - defer release 模式保留不变（release 释放的是 pop 出来的局部值，不涉及栈状态）
 
 **关键 bug 修复**：op_coerce 调用 doCoerce（直接读写 self.stack.items[len-1]）未作为 sync-point 处理，导致 doCoerce 读到 stale 的 self.stack.items.len（与 stack_len 不同步），栈顶下方的值被污染，触发 edge_recursion_methods 的 arithmetic overflow。修复：在 doCoerce 调用前 `self.stack.items.len = stack_len;`（doCoerce 仅原地改写栈顶，不改 len/cap/ptr，无需调用后重载）。
@@ -446,7 +446,7 @@ VM 阶段吞吐（`--profile`，短基准用此指标）：
 
 **Memoization 扩展**（延续 M6/M7，进一步放宽适用范围）：
 - [src/vm/compiler.zig](file:///d:/Projects/Zig/Glue/src/vm/compiler.zig): `getOrAssignMemoSlot` 移除 `allParamsMemoizable` 类型注解限制——hash 基于运行时 Value，与编译期类型无关
-- [src/value/mod.zig](file:///d:/Projects/Zig/Glue/src/value/mod.zig): 新增 `isMemoizableValue` 运行时谓词——值类型（标量+装箱复合+range/error/throw）返回 true，引用类型（cell/closure/channel/spawn/atomic/lazy/iterator/trait）返回 false
+- [src/value/mod.zig](file:///d:/Projects/Zig/Glue/src/value/mod.zig): 新增 `isMemoizableValue` 运行时谓词——值类型（标量+装箱复合+range/error/throw）返回 true，引用类型（cell/closure/channel/async/atomic/lazy/iterator/trait）返回 false
 - [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `doCallMemoized` 添加三层运行时守卫：(1) disabled slot 检查（连续 miss 超阈值直接走 doCall），(2) 引用类型守卫（参数含可变引用走 doCall），(3) per-slot miss tracking（cache miss 递增计数，超阈值禁用 slot；hit 重置）
 - [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `hashValueRecursive` 添加 `depth` 参数（`MAX_HASH_DEPTH=256`），超过则回退指针 hash，防止 50000 节点 LList 等深层 ADT 递归 hash 栈溢出
 - [src/vm/vm.zig](file:///d:/Projects/Zig/Glue/src/vm/vm.zig): `op_return` 缓存写入路径跳过 disabled slots；VM.deinit 清理 `memo_slot_misses` 与 `memo_disabled_slots`
@@ -576,7 +576,7 @@ VM 阶段吞吐（`--profile`，best-of-5）：
 **目标**：Phase 1 类型特化仅能跳过 tag 检查（icache 负收益已回退）。Phase 2-5 改为**减少指令数**：memoization 跳过整个调用帧、常量折叠消除算术 dispatch、死分支消除移除条件跳转。这是解释器唯一安全的优化策略。
 
 **架构**（5 个分析 pass + AnalysisDB 聚合 + 编译器查询）：
-- [src/sema/static_analysis/purity.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/purity.zig): PurityPass 不动点迭代标记纯/不纯函数（impure 内建：println/print/spawn/send/recv 等）
+- [src/sema/static_analysis/purity.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/purity.zig): PurityPass 不动点迭代标记纯/不纯函数（impure 内建：println/print/async/send/recv 等）
 - [src/sema/static_analysis/call_graph.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/call_graph.zig): CallGraphPass 构建 caller→callee 边（去重，callsTransitively 递归检测）
 - [src/sema/static_analysis/const_prop.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/const_prop.zig): ConstPropPass 函数内前向数据流，追踪 val 绑定的常量值（int/float/bool），evalBinary/evalUnary 编译期求值
 - [src/sema/static_analysis/branch_reach.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/branch_reach.zig): BranchReachPass 查询 ConstTable，标记 if_expr 条件为 always_true/always_false/runtime
@@ -712,7 +712,7 @@ VM 阶段吞吐（`--profile`，best-of-5）：
   - 单次 AST 遍历填充 const_prop / loop_invariant，收集 name_call_graph + direct_impure
   - purity fixpoint 基于 name_call_graph 反向传播（O(N+E)，替代原每轮重新递归 AST 的 O(N×D×AST_size)）
   - 复用 const_prop.zig 的 evalBinary/evalUnary/parseIntLiteral（镜像复制保持语义一致）
-  - impure 判定与原 purity.exprHasImpureCall 完全一致：间接调用→impure、method_call/safe_method_call/spawn/select/inline_trait_value→impure、impure builtin→impure、自递归不算 impure
+  - impure 判定与原 purity.exprHasImpureCall 完全一致：间接调用→impure、method_call/safe_method_call/async/select/inline_trait_value→impure、impure builtin→impure、自递归不算 impure
 - [src/sema/static_analysis/analysis_db.zig](file:///d:/Projects/Zig/Glue/src/sema/static_analysis/analysis_db.zig)：新增 fused_analysis 导出
 - [src/loader/module_loader.zig](file:///d:/Projects/Zig/Glue/src/loader/module_loader.zig)：替换原 4 个独立 pass 调用为 FusedAnalysis + branch_reach（branch_reach 依赖 const_prop 完成，保持独立）
 

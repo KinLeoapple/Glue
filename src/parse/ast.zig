@@ -474,9 +474,6 @@ pub const Expr = union(enum) {
     lazy: struct {
         expr: *Expr,
     },
-    spawn_expr: struct {
-        expr: *Expr,
-    },
     select: struct {
         arms: []SelectArm,
     },

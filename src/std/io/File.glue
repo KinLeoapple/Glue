@@ -130,7 +130,7 @@ pub async fun close(self: File): Async<Throw<void, IOError>> {
 // 单次 read 语义（不循环阻塞，兼容管道/交互式 IO）。
 // 不再接受 buf 参数就地填充：async fun 参数会被 orbit worker 深拷贝，
 // 就地修改 buf 对调用方不可见。改为返回新分配的 u8[] 数组。
-// __file_read_async 创建完成 channel + spawn read 线程，协程在 channel 上 recv 挂起；
+// __file_read_async 创建完成 channel + launch read 线程，协程在 channel 上 recv 挂起；
 // read 完成后 channel 收到 Throw<u8[], IOError>。
 pub async fun read(self: File, len: usize): Async<Throw<u8[], IOError>> {
     if self.is_closed {

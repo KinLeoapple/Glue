@@ -105,14 +105,7 @@ pub const OP_TABLE: std.EnumArray(NodeOp, OpEntry) = blk: {
     t.set(.array_get, .{ .op = .array_get, .name = "array_get", .category = .other });
     t.set(.array_set, .{ .op = .array_set, .name = "array_set", .category = .other });
     t.set(.array_len, .{ .op = .array_len, .name = "array_len", .category = .other });
-    t.set(.array_push, .{ .op = .array_push, .name = "array_push", .category = .other });
     t.set(.array_concat, .{ .op = .array_concat, .name = "array_concat", .category = .other });
-    t.set(.array_first, .{ .op = .array_first, .name = "array_first", .category = .other });
-    t.set(.array_last, .{ .op = .array_last, .name = "array_last", .category = .other });
-    t.set(.array_contains, .{ .op = .array_contains, .name = "array_contains", .category = .other });
-    t.set(.array_get_safe, .{ .op = .array_get_safe, .name = "array_get_safe", .category = .other });
-    t.set(.array_drop_last, .{ .op = .array_drop_last, .name = "array_drop_last", .category = .other });
-    t.set(.array_pop, .{ .op = .array_pop, .name = "array_pop", .category = .other });
     t.set(.array_fill, .{ .op = .array_fill, .name = "array_fill", .category = .other });
     t.set(.array_slice, .{ .op = .array_slice, .name = "array_slice", .category = .other });
 
@@ -234,9 +227,7 @@ pub const OP_TABLE: std.EnumArray(NodeOp, OpEntry) = blk: {
     t.set(.atomic_swap, .{ .op = .atomic_swap, .name = "atomic_swap", .category = .other });
     t.set(.atomic_cas, .{ .op = .atomic_cas, .name = "atomic_cas", .category = .other });
 
-    // === 反射方法（other） ===
-    t.set(.error_message, .{ .op = .error_message, .name = "error_message", .category = .other });
-    t.set(.obj_type_name, .{ .op = .obj_type_name, .name = "obj_type_name", .category = .other });
+    // === 反射方法已移除（message/type_name 走 trait 分派） ===
 
     // === 闭包（other；closure_make 持有捕获/函数体子图） ===
     t.set(.closure_make, .{ .op = .closure_make, .name = "closure_make", .category = .other, .has_nested = true });

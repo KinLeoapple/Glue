@@ -68,7 +68,7 @@ fun digitVal(c: char): i32 {
     }
 }
 
-type LexError: Error = LexError(msg: str) {
+type LexError: Err = LexError(msg: str) {
     override fun type_name(self): str { "lex error" }
 }
 
@@ -121,7 +121,7 @@ fun tokenize(s: str): Throw<List<Token>, Error> {
 // 求值：直接在 token 流上做递归下降 (expr = term (+|-) term, term = factor (*|/) factor)
 // 用记录携带 (剩余 token, 计算结果)
 // ============================================================
-type ParseError: Error = ParseError(msg: str) {
+type ParseError: Err = ParseError(msg: str) {
     override fun type_name(self): str { "parse error" }
 }
 

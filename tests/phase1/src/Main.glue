@@ -10,25 +10,25 @@
 
 // 自定义错误类型（Error 子类型）
 import std.io.Console.{println}
-type FileError: Error = FileError(msg: str) {
+type FileError: Err = FileError(msg: str) {
     override fun type_name(self): str {
         "file error"
     }
 }
 
-type NetworkError: Error = NetworkError(msg: str) {
+type NetworkError: Err = NetworkError(msg: str) {
     override fun type_name(self): str {
         "network error"
     }
 }
 
-type ParseError: Error = ParseError(msg: str) {
+type ParseError: Err = ParseError(msg: str) {
     override fun type_name(self): str {
         "parse error"
     }
 }
 
-type DbError: Error = DbError(msg: str) {
+type DbError: Err = DbError(msg: str) {
     override fun type_name(self): str {
         "database error"
     }
@@ -510,7 +510,7 @@ fun mapArray(arr: i32[], f: (i32) -> i32): i32[] {
     var result: i32[] = []
     var mi = 0i32
     while mi < cast(arr.len()).to(i32) {
-        result = result.push(f(arr[cast(mi).to(usize)]))
+        result = result ++ [f(arr[cast(mi).to(usize)])]
         mi = mi + 1
     }
     result
@@ -521,7 +521,7 @@ fun filterArray(arr: i32[], pred: (i32) -> bool): i32[] {
     var fi = 0i32
     while fi < cast(arr.len()).to(i32) {
         if pred(arr[cast(fi).to(usize)]) {
-            result = result.push(arr[cast(fi).to(usize)])
+            result = result ++ [arr[cast(fi).to(usize)]]
         }
         fi = fi + 1
     }
@@ -1064,35 +1064,42 @@ println(defer_throw_flag)
 var dyn_arr = [1, 2, 3]
 println(dyn_arr.len())
 
-// push 返回新数组
-dyn_arr = dyn_arr.push(4)
+// push 用 ++ 拼接
+dyn_arr = dyn_arr ++ [4]
 println(dyn_arr.len())
 println(dyn_arr)
 
-// pop 返回最后一个元素
-val popped = dyn_arr.pop()
+// pop: 取末尾元素再切片
+val popped = dyn_arr[dyn_arr.len() - 1]
+dyn_arr = dyn_arr[0..dyn_arr.len() - 1]
 println(popped)
 println(dyn_arr.len())
 
-// contains
-println(dyn_arr.contains(2))
-println(dyn_arr.contains(99))
+// contains: 手动循环
+var found2 = false
+for elem in dyn_arr { if elem == 2 { found2 = true } }
+println(found2)
+var found99 = false
+for elem in dyn_arr { if elem == 99 { found99 = true } }
+println(found99)
 
-// is_empty
-println(dyn_arr.is_empty())
-println([].is_empty())
+// is_empty: 用 len() == 0
+println(dyn_arr.len() == 0)
+println([].len() == 0)
 
-// first / last
-println(dyn_arr.first())
-println(dyn_arr.last())
+// first / last: 用索引
+println(dyn_arr[0])
+println(dyn_arr[dyn_arr.len() - 1])
 
-// 空数组的 first/last 返回 null
+// 空数组的 first/last: 用 len() 守卫返回 null
 val empty_arr: i32[] = []
-println(empty_arr.first())
-println(empty_arr.last())
+val empty_first: i32? = if empty_arr.len() > 0 { empty_arr[0] } else { null }
+println(empty_first)
+val empty_last: i32? = if empty_arr.len() > 0 { empty_arr[empty_arr.len() - 1] } else { null }
+println(empty_last)
 
-// drop_last
-val dropped = dyn_arr.drop_last()
+// drop_last: 用切片
+val dropped = dyn_arr[0..dyn_arr.len() - 1]
 println(dropped)
 
 // ============================================================
@@ -1377,15 +1384,13 @@ println(pointSum(pt3))
 // 70. 动态数组 — 操作组合
 // ============================================================
 var dyn2 = [10, 20, 30]
-dyn2 = dyn2.push(40)
-dyn2 = dyn2.push(50)
+dyn2 = dyn2 ++ [40]
+dyn2 = dyn2 ++ [50]
 println(dyn2.len())
 
-val last_elem = dyn2.last()
-println(last_elem ?? -1)
+println(if dyn2.len() > 0 { dyn2[dyn2.len() - 1] } else { -1 })
 
-val first_elem = dyn2.first()
-println(first_elem ?? -1)
+println(if dyn2.len() > 0 { dyn2[0] } else { -1 })
 
 // ============================================================
 // 71. Range — 求积
@@ -1713,9 +1718,13 @@ println(s2[0])
 // 103. 动态数组 — contains 和 is_empty
 // ============================================================
 val check_arr = [1, 2, 3, 4, 5]
-println(check_arr.contains(3))
-println(check_arr.contains(99))
-println(check_arr.is_empty())
+var found3 = false
+for elem in check_arr { if elem == 3 { found3 = true } }
+println(found3)
+var found99 = false
+for elem in check_arr { if elem == 99 { found99 = true } }
+println(found99)
+println(check_arr.len() == 0)
 
 // ============================================================
 // 104. Nullable — match 中 null 模式
@@ -1783,8 +1792,10 @@ val chain_str = "Hello"
 println(chain_str.len())
 
 val chain_arr = [1, 2, 3]
-println(chain_arr.push(4).len())
-println(chain_arr.push(10).push(20).len())
+val ca1 = chain_arr ++ [4]
+println(ca1.len())
+val ca2 = chain_arr ++ [10] ++ [20]
+println(ca2.len())
 
 // ============================================================
 // 111. 嵌套函数 — 嵌套调用
@@ -1834,13 +1845,17 @@ println(utf8_str.len())
 // 117. 数组 — 动态数组更多操作
 // ============================================================
 var da = [10, 20, 30, 40, 50]
-println(da.contains(30))
-println(da.contains(99))
-println(da.is_empty())
-println(da.first() ?? -1)
-println(da.last() ?? -1)
+var found30 = false
+for elem in da { if elem == 30 { found30 = true } }
+println(found30)
+var found99b = false
+for elem in da { if elem == 99 { found99b = true } }
+println(found99b)
+println(da.len() == 0)
+println(if da.len() > 0 { da[0] } else { -1 })
+println(if da.len() > 0 { da[da.len() - 1] } else { -1 })
 
-val da2 = da.drop_last()
+val da2 = da[0..da.len() - 1]
 println(da2)
 
 // ============================================================
@@ -1888,10 +1903,12 @@ println(top_full.m?.d?.v ?? -1)
 // 123. 数组 — 空数组操作
 // ============================================================
 val empty: i32[] = []
-println(empty.is_empty())
+println(empty.len() == 0)
 println(empty.len())
-println(empty.first())
-println(empty.last())
+val emp_first: i32? = if empty.len() > 0 { empty[0] } else { null }
+println(emp_first)
+val emp_last: i32? = if empty.len() > 0 { empty[empty.len() - 1] } else { null }
+println(emp_last)
 
 // ============================================================
 // 124. 闭包 — 闭包作为返回值组合（间接测试）
@@ -1931,9 +1948,9 @@ println(defer_throw_val2)
 // 128. 数组 — 数组拼接（push 链）
 // ============================================================
 var arr_chain = [1]
-arr_chain = arr_chain.push(2)
-arr_chain = arr_chain.push(3)
-arr_chain = arr_chain.push(4)
+arr_chain = arr_chain ++ [2]
+arr_chain = arr_chain ++ [3]
+arr_chain = arr_chain ++ [4]
 println(arr_chain)
 println(arr_chain.len())
 
@@ -2028,8 +2045,12 @@ while ss2_i < cast(search_arr.len()).to(i32) {
     ss2_i = ss2_i + 1
 }
 println(search_sum)
-println(search_arr.contains(15))
-println(search_arr.contains(99))
+var found15 = false
+for elem in search_arr { if elem == 15 { found15 = true } }
+println(found15)
+var found99 = false
+for elem in search_arr { if elem == 99 { found99 = true } }
+println(found99)
 
 // ============================================================
 // 138. Nullable — 三元替代（if-else 表达式）
@@ -2105,13 +2126,17 @@ println(applyTwice2(fun(x: i32) { x * 2 }, 3))
 // 146. 数组 — 数组操作综合
 // ============================================================
 var arr_ops = [1, 2, 3]
-arr_ops = arr_ops.push(4)
-arr_ops = arr_ops.push(5)
+arr_ops = arr_ops ++ [4]
+arr_ops = arr_ops ++ [5]
 println(arr_ops.len())
-println(arr_ops.contains(3))
-println(arr_ops.contains(99))
+var ops_found3 = false
+for elem in arr_ops { if elem == 3 { ops_found3 = true } }
+println(ops_found3)
+var ops_found99 = false
+for elem in arr_ops { if elem == 99 { ops_found99 = true } }
+println(ops_found99)
 
-val arr_drop = arr_ops.drop_last()
+val arr_drop = arr_ops[0..arr_ops.len() - 1]
 println(arr_drop.len())
 
 // ============================================================
@@ -2151,7 +2176,7 @@ var mapped: i32[] = []
 var map_src = [1i32, 2i32, 3i32, 4i32, 5i32]
 var map_i = 0i32
 while map_i < cast(map_src.len()).to(i32) {
-    mapped = mapped.push(map_src[cast(map_i).to(usize)] * map_src[cast(map_i).to(usize)])
+    mapped = mapped ++ [map_src[cast(map_i).to(usize)] * map_src[cast(map_i).to(usize)]]
     map_i = map_i + 1
 }
 println(mapped)
@@ -2161,7 +2186,7 @@ var filt_src = [1i32, 2i32, 3i32, 4i32, 5i32, 6i32]
 var filt_i = 0i32
 while filt_i < cast(filt_src.len()).to(i32) {
     if filt_src[cast(filt_i).to(usize)] % 2 == 0 {
-        evens = evens.push(filt_src[cast(filt_i).to(usize)])
+        evens = evens ++ [filt_src[cast(filt_i).to(usize)]]
     }
     filt_i = filt_i + 1
 }

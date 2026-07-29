@@ -35,7 +35,7 @@ pub async fun send_to(self: UdpSocket, dst: SocketAddr, buf: u8[]): Async<Throw<
 }
 
 // 接收 UDP 数据报。返回 RecvFromResult(data, src_addr)。
-// __net_udp_recv_from_async 创建完成 channel + spawn recv_from 线程，协程在 channel 上 recv 挂起；
+// __net_udp_recv_from_async 创建完成 channel + launch recv_from 线程，协程在 channel 上 recv 挂起；
 // recv_from 完成后 channel 收到 Throw<RecvFromResult, IOError>。
 pub async fun recv_from(self: UdpSocket, len: usize): Async<Throw<RecvFromResult, IOError>> {
     if self.is_closed {

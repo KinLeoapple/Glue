@@ -12,19 +12,19 @@ const ir_mod = @import("ir");
 
 // 类型定义已移至 ir/type_descriptor.zig，此处重导出以保持下游引用兼容
 pub const TypeDescriptor = ir_mod.type_descriptor_mod.TypeDescriptor;
-pub const ScalarOps = ir_mod.type_descriptor_mod.ScalarOps;
+pub const TypeOps = ir_mod.type_descriptor_mod.TypeOps;
 
-/// 标量种类（对应 scalar_ops_table 的 key）
+/// 标量种类（对应 ops_table 的 key）
 pub const ScalarKind = enum {
     i8, u8, i16, u16, i32, u32, i64, u64, i128, u128, isize, usize,
     f16, f32, f64, f128, bool, char,
 };
 
 // ════════════════════════════════════════════════════════════
-// scalar_ops_table：引用 ir 侧已实现的 ScalarOps 常量
+// ops_table：引用 ir 侧已实现的 TypeOps 常量
 // ════════════════════════════════════════════════════════════
 
-pub const scalar_ops_table: std.EnumArray(ScalarKind, ScalarOps) = .init(.{
+pub const scalar_ops_table: std.EnumArray(ScalarKind, TypeOps) = .init(.{
     .i8 = ir_mod.type_descriptor_mod.i8_ops,
     .u8 = ir_mod.type_descriptor_mod.u8_ops,
     .i16 = ir_mod.type_descriptor_mod.i16_ops,

@@ -462,14 +462,7 @@ pub const op_handler_table: std.EnumArray(NodeOp, OpHandler) = blk: {
     t.set(.array_get, Methods.wrapVoid(Engine.execArrayGet));
     t.set(.array_set, Methods.wrapVoid(Engine.execArraySet));
     t.set(.array_len, Methods.wrapVoid(Engine.execArrayLen));
-    t.set(.array_push, Methods.wrapVoid(Engine.execArrayPush));
     t.set(.array_concat, Methods.wrapVoid(Engine.execArrayConcat));
-    t.set(.array_first, Methods.wrapVoid(Engine.execArrayFirst));
-    t.set(.array_last, Methods.wrapVoid(Engine.execArrayLast));
-    t.set(.array_contains, Methods.wrapVoid(Engine.execArrayContains));
-    t.set(.array_get_safe, Methods.wrapVoid(Engine.execArrayGetSafe));
-    t.set(.array_drop_last, Methods.wrapVoid(Engine.execArrayDropLast));
-    t.set(.array_pop, Methods.wrapVoid(Engine.execArrayPop));
     t.set(.array_fill, Methods.wrapVoid(Engine.execArrayFill));
     t.set(.array_slice, Methods.wrapVoid(Engine.execArraySlice));
 
@@ -540,9 +533,7 @@ pub const op_handler_table: std.EnumArray(NodeOp, OpHandler) = blk: {
     t.set(.atomic_swap, Methods.wrapVoid(Engine.execAtomicSwap));
     t.set(.atomic_cas, Methods.wrapVoid(Engine.execAtomicCas));
 
-    // === 反射方法 ===
-    t.set(.error_message, Methods.wrapVoid(Engine.execErrorMessage));
-    t.set(.obj_type_name, Methods.wrapVoid(Engine.execObjTypeName));
+    // === 反射方法已移除（message/type_name 走 trait 分派） ===
 
     // === 闭包 ===
     t.set(.closure_make, Methods.wrapVoid(Engine.execClosureMake));

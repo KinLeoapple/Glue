@@ -12,6 +12,10 @@ const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
 const type_descriptor_mod = @import("type_descriptor.zig");
+const ast = @import("ast");
+
+/// 源码位置（与 ast.SourceLocation 同构），用于 IR 节点→源码行映射
+pub const SourceLocation = ast.SourceLocation;
 
 pub const Node = node_mod.Node;
 pub const NodeOp = node_mod.NodeOp;
@@ -46,6 +50,10 @@ pub const TypeMetadataTable = meta_mod.TypeMetadataTable;
 pub const GlueIR = struct {
     /// 节点流：所有节点连续存储，线性遍历
     nodes: []Node = &.{},
+
+    /// 节点源码位置表：与 nodes 平行索引，记录每个节点的源码行列号
+    /// 编译器生成节点（无对应 AST）的位置为 {0, 0}
+    node_locs: []const SourceLocation = &.{},
 
     /// 通道空间：全局通道索引 + 元信息
     channels: ChannelSpace,

@@ -34,7 +34,7 @@ pub const Methods = struct {
         // 连续内存分配：[Closure header | upvalues[upvalue_count]]
         // 先创建 Closure 对象（upvalues 暂为空），并写入输出通道
         // 这样自引用闭包（递归 lambda）能在收集上值时读取到自身指针
-        const upvalue_count = @as(usize, @min(cm.upvalue_count, node.input_count));
+        const upvalue_count: usize = cm.upvalue_count;
         const total = @sizeOf(value.Closure) + upvalue_count * @sizeOf(value.Value);
         const use_arena = self.currentFuncUseArena();
         const buf = if (use_arena)
@@ -51,15 +51,17 @@ pub const Methods = struct {
         };
         value.obj_header.initObjHeader(&closure.header, .closure, total, use_arena, self.tctx.?);
         try self.trackObj(&closure.header);
-        self.runtime.writePtr(node.output, @ptrCast(&closure.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&closure.header)));
 
         // 现在收集上值（自引用闭包可从 output 通道读到自身指针）
         // upvalues 缓冲区已随 Closure 连续分配，此处仅填充数据
         if (upvalue_count > 0) {
             const uv_ptr: [*]value.Value = @ptrCast(@alignCast(buf.ptr + @sizeOf(value.Closure)));
             const upvalues = uv_ptr[0..upvalue_count];
+            var uv_buf: [16]u16 = undefined;
+            const uv_chans = ir_mod.buildNodeArgs(node, cm.extra_upvalues, 0, upvalue_count, &uv_buf);
             for (0..upvalue_count) |i| {
-                const v = self.chanToValue(node.inputs[i]);
+                const v = self.chanToValue(uv_chans[i]);
                 const is_cell = (cm.cell_upvalues >> @intCast(i)) & 1 == 1;
                 const is_ref = (cm.upvalue_ref_bits >> @intCast(i)) & 1 == 1;
                 if (is_cell or is_ref) {
@@ -108,7 +110,7 @@ pub const Methods = struct {
             pm.bound_arg_ref_bits,
         ) catch return error.OutOfMemory;
         try self.trackObj(partial_v.ref);
-        self.runtime.writePtr(node.output, @ptrCast(partial_v.ref));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(partial_v.ref)));
     }
 
     /// 执行 PartialApplication 的调用：将已绑定参数与新实参合并后调用原函数
@@ -124,7 +126,8 @@ pub const Methods = struct {
         if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
 
         const arg_count = @as(usize, call_meta.arg_count) - 1;
-        const args = node.inputs[1 .. 1 + arg_count];
+        var args_buf: [16]u16 = undefined;
+        const args = ir_mod.buildNodeArgs(node, call_meta.extra_args, 1, arg_count, &args_buf);
         const bound = pa.bound_args;
         const total_params = callee_func.param_channels.len;
 
@@ -136,7 +139,14 @@ pub const Methods = struct {
             var saved_arg_values: [16]value.Value = undefined;
             for (args, 0..) |arg_chan, i| {
                 const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
-                if (!is_ref and self.runtime.isRef(arg_chan) and self.readRefObj(arg_chan) != null) {
+                // ref_chan 旁路已废除：用 readChannel 判断是否持有堆对象引用
+                var has_ref_obj = false;
+                if (!is_ref and self.runtime.isRef(arg_chan)) {
+                    if (self.runtime.readChannel(arg_chan)) |rv| {
+                        has_ref_obj = rv == .ref;
+                    }
+                }
+                if (has_ref_obj) {
                     const v = self.chanToValue(arg_chan);
                     saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                     try self.trackValueTree(saved_arg_values[i]);
@@ -210,8 +220,9 @@ pub const Methods = struct {
     /// lazy_make：构造 LazyValue 对象
     /// inputs[0] = thunk closure (ref_chan)，output = ref_chan
     pub fn execLazyMake(self: *Engine, node: *const Node) EngineError!void {
-        const closure_ptr = self.runtime.readPtr(node.inputs[0]) orelse return error.InvalidChannel;
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(closure_ptr));
+        const closure_v = self.runtime.readChannel(node.inputs[0]) orelse return error.InvalidChannel;
+        if (closure_v != .ref) return error.InvalidChannel;
+        const header: *value.obj_header.ObjHeader = closure_v.ref;
         if (header.type_tag != .closure) return error.InvalidChannel;
         const closure: *value.Closure = @alignCast(@fieldParentPtr("header", header));
 
@@ -230,7 +241,7 @@ pub const Methods = struct {
         try self.trackObj(&lazy.header);
         // LazyValue 持有 thunk 闭包的一次引用
         _ = (value.Value{ .ref = &closure.header }).retain(self.tctx.?);
-        self.runtime.writePtr(node.output, @ptrCast(&lazy.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&lazy.header)));
     }
 
     /// lazy_force：强制求值 Lazy<T>，或对非 LazyValue 的 ref_chan 做透传。
@@ -258,7 +269,9 @@ pub const Methods = struct {
 
     /// 读取 ref_chan 中的 LazyValue 指针
     pub fn readLazyValue(self: *Engine, chan: u16) ?*value.LazyValue {
-        const header = self.readRefObj(chan) orelse return null;
+        const v = self.runtime.readChannel(chan) orelse return null;
+        if (v != .ref) return null;
+        const header = v.ref;
         if (header.type_tag != .lazy_val) return null;
         return @alignCast(@fieldParentPtr("header", header));
     }

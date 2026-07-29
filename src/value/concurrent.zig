@@ -418,11 +418,16 @@ pub const AsyncHandle = struct {
         _ = tctx;
         // 通知 worker 可以清理（fire-and-forget 场景下 join 未调用）
         self.result_consumed.store(true, .release);
-        // 等待 worker 完全退出，确保 ChannelRegion 等 backing 资源已释放
+        // Bug 9 fix: 不再无限自旋。Bug 5 修复后 workers 在 deinit 前已 join，
+        // 但 fire-and-forget 协程可能在 shutdown 时被强制取消（worker_done 已由
+        // drainFrames 设置）。若 worker_done 仍未置位（异常路径），限时等待后强制退出。
+        var spins: u32 = 0;
         while (!self.worker_done.load(.acquire)) {
+            if (spins > 100000) break; // ~100ms 后强制退出
             std.Thread.yield() catch {};
+            spins += 1;
         }
-        // worker 已退出，result 由 worker engine.deinit 的 tracked_objs 循环释放
+        // worker 已退出（或超时），result 由 worker engine.deinit 的 tracked_objs 循环释放
         self.result = null;
     }
 

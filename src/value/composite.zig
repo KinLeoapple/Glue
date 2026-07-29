@@ -67,8 +67,8 @@ pub const NewtypeValue = struct {
 
 /// 数组值，支持定长和变长
 ///
-/// header 和 elements 分离分配：header 固定大小（页池），elements 可独立扩容
-/// 这是唯一不使用连续内存的变长类型，因为 array_push/pop 需要替换 elements 切片
+/// header 和 elements 分离分配：header 固定大小（页池），elements 独立分配
+/// 这是唯一不使用连续内存的变长类型，因为 array_concat/slice 需要创建新 elements 切片
 /// 同时保持 header 地址不变（tracked_objs 引用 header 指针）
 pub const ArrayValue = struct {
     header: ObjHeader = .{ .type_tag = .array },

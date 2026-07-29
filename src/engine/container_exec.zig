@@ -67,7 +67,7 @@ pub const Methods = struct {
     }
 
     /// string_concat：拼接两个字符串
-    /// inputs[0] = left, inputs[1] = right, output = ref_chan
+    /// inputs[0] = left, inputs[1] = right, output = 通道
     /// 快速路径：left 为堆模式且 rc==1 时，realloc 就地追加 right，零全量拷贝
     pub fn execStringConcat(self: *Engine, node: *const Node) EngineError!void {
         const left = self.readStr(node.inputs[0]) orelse return error.InvalidChannel;
@@ -75,14 +75,14 @@ pub const Methods = struct {
 
         // 就地追加快速路径：复用 left 对象（已 tracked），无需新建 Str、无需 trackObj
         if (left.concatInPlace(self.tctx.?, right)) {
-            self.runtime.writePtr(node.output, @ptrCast(&left.header));
+            _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&left.header)));
             return;
         }
 
         // 常规路径：创建新 Str 对象（连续内存 [header | buffer]）
         const obj = value.str_mod.Str.concatContiguous(self.tctx.?, left.*, right.*) catch return error.OutOfMemory;
         try self.trackObj(&obj.header);
-        self.runtime.writePtr(node.output, @ptrCast(&obj.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&obj.header)));
     }
 
     /// string_cmp：字符串字典序比较
@@ -172,7 +172,7 @@ pub const Methods = struct {
     // ════════════════════════════════════════════
 
     /// array_make：创建数组
-    /// inputs[0] = length 通道（i64），output = ref_chan
+    /// inputs[0] = length 通道（i64），output = 通道
     /// 逃逸分析驱动：非逃逸函数内的数组走 ShadowArena，endFunction 时 O(1) reset
     pub fn execArrayMake(self: *Engine, node: *const Node) EngineError!void {
         const len = try self.readIntAsI64(node.inputs[0]);
@@ -202,7 +202,7 @@ pub const Methods = struct {
         } else
             value.Value.makeArrayEx(self.tctx.?, elements, null, elem_is_ref) catch return error.OutOfMemory;
         try self.trackObj(v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
     }
 
     /// array_get：按索引获取元素
@@ -236,42 +236,8 @@ pub const Methods = struct {
         self.runtime.writeUsize(node.output, arr.elements.len);
     }
 
-    /// array_push：向数组追加元素（扩容）
-    /// inputs[0] = array, inputs[1] = value
-    /// arena 数组扩容：新 elements 也从 arena 分配，旧 elements 不释放（arena.reset 统一回收）
-    pub fn execArrayPush(self: *Engine, node: *const Node) EngineError!void {
-        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const v = self.chanToValue(node.inputs[1]);
-        const copied = try self.cloneValueForContainer(v, arr.elem_is_ref);
-        const old_len = arr.elements.len;
-        const new_len = old_len + 1;
-        const use_arena = arr.header.isArenaAllocated();
-        const new_size = new_len * @sizeOf(value.Value);
-        // alloc 失败时必须释放已克隆的 copied，避免泄漏
-        const buf = if (use_arena)
-            self.tctx.?.allocObjArena(new_size) catch {
-                copied.release(self.tctx.?);
-                return error.OutOfMemory;
-            }
-        else
-            self.tctx.?.allocObj(new_size) catch {
-                copied.release(self.tctx.?);
-                return error.OutOfMemory;
-            };
-        const new_elements: []value.Value = @as([*]value.Value, @ptrCast(@alignCast(buf.ptr)))[0..new_len];
-        @memcpy(new_elements[0..old_len], arr.elements);
-        new_elements[old_len] = copied;
-        // arena 数组的旧 elements 由 arena.reset 统一回收，跳过 freeObj
-        if (!use_arena and arr.elements.len > 0) {
-            self.tctx.?.freeObj(@ptrCast(arr.elements.ptr));
-        }
-        arr.elements = new_elements;
-        arr.capacity = new_len;
-        self.runtime.writePtr(node.output, @ptrCast(&arr.header));
-    }
-
     /// array_concat：拼接两个数组，返回新数组
-    /// inputs[0] = left, inputs[1] = right, output = ref_chan
+    /// inputs[0] = left, inputs[1] = right, output = 通道
     /// 逃逸分析驱动：非逃逸函数内的拼接结果走 ShadowArena
     pub fn execArrayConcat(self: *Engine, node: *const Node) EngineError!void {
         const left = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
@@ -314,11 +280,11 @@ pub const Methods = struct {
         // makeArrayEx/arena 成功，元素所有权已转移给新数组 v，失败时不再释放 new_elements
         elements_consumed = true;
         try self.trackObj(v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
     }
 
     /// array_fill：创建 count 个 value 副本的数组
-    /// inputs[0] = count, inputs[1] = value, output = ref_chan
+    /// inputs[0] = count, inputs[1] = value, output = 通道
     pub fn execArrayFill(self: *Engine, node: *const Node) EngineError!void {
         const count = try self.readIntAsI64(node.inputs[0]);
         if (count < 0) return error.Overflow;
@@ -366,7 +332,7 @@ pub const Methods = struct {
             break :blk value.Value.makeArrayEx(self.tctx.?, tmp, null, elem_is_ref) catch return error.OutOfMemory;
         };
         try self.trackObj(v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
     }
 
     /// array_slice：数组切片
@@ -422,118 +388,7 @@ pub const Methods = struct {
         // makeArrayEx/arena 成功，元素所有权已转移给新数组 v，失败时不再释放 new_elements
         elements_consumed = true;
         try self.trackObj(v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
-    }
-
-    /// array_first：返回数组首元素（nullable 输出，空数组返回 null）
-    pub fn execArrayFirst(self: *Engine, node: *const Node) EngineError!void {
-        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const inner_w = self.nullableInnerWidth(node.output);
-        const dst = self.runtime.rawPtr(node.output);
-        if (arr.elements.len == 0) {
-            if (inner_w > 0) dst[inner_w] = 1; // null 标志
-            return;
-        }
-        self.valueToRawPtr(dst, inner_w, arr.elements[0]);
-        if (inner_w > 0) dst[inner_w] = 0; // 清除 null 标志
-    }
-
-    /// array_last：返回数组末尾元素（nullable 输出，空数组返回 null）
-    pub fn execArrayLast(self: *Engine, node: *const Node) EngineError!void {
-        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const inner_w = self.nullableInnerWidth(node.output);
-        const dst = self.runtime.rawPtr(node.output);
-        if (arr.elements.len == 0) {
-            if (inner_w > 0) dst[inner_w] = 1; // null 标志
-            return;
-        }
-        self.valueToRawPtr(dst, inner_w, arr.elements[arr.elements.len - 1]);
-        if (inner_w > 0) dst[inner_w] = 0; // 清除 null 标志
-    }
-
-    /// array_contains：检查数组是否包含某值
-    pub fn execArrayContains(self: *Engine, node: *const Node) EngineError!void {
-        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const target = self.chanToValue(node.inputs[1]);
-        var found = false;
-        for (arr.elements) |elem| {
-            if (value.equals(elem, target)) {
-                found = true;
-                break;
-            }
-        }
-        self.runtime.writeBool(node.output, found);
-    }
-
-    /// array_get_safe：安全索引，越界返回 null
-    pub fn execArrayGetSafe(self: *Engine, node: *const Node) EngineError!void {
-        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        const idx = try self.readIntAsI64(node.inputs[1]);
-        const inner_w = self.nullableInnerWidth(node.output);
-        const dst = self.runtime.rawPtr(node.output);
-        if (idx < 0 or @as(usize, @intCast(idx)) >= arr.elements.len) {
-            dst[inner_w] = 1;
-            return;
-        }
-        const v = arr.elements[@intCast(idx)];
-        self.valueToRawPtr(dst, inner_w, v);
-        dst[inner_w] = 0;
-    }
-
-    /// array_drop_last：返回去掉末尾元素的新数组（空数组返回空数组）
-    pub fn execArrayDropLast(self: *Engine, node: *const Node) EngineError!void {
-        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        if (arr.elements.len == 0) {
-            // 空数组 → 返回空数组
-            const v = value.Value.makeArray(self.tctx.?, &[_]value.Value{}, null) catch return error.OutOfMemory;
-            try self.trackObj(v.asRef());
-            self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
-            return;
-        }
-        const new_len = arr.elements.len - 1;
-        // 临时元素切片（makeArray 会拷贝到自有缓冲区）
-        const new_elements = self.tctx.?.backing.alloc(value.Value, new_len) catch return error.OutOfMemory;
-        defer self.tctx.?.backing.free(new_elements);
-        @memcpy(new_elements, arr.elements[0..new_len]);
-        const v = value.Value.makeArray(self.tctx.?, new_elements, null) catch return error.OutOfMemory;
-        try self.trackObj(v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
-    }
-
-    /// array_pop：弹出末尾元素并返回（空数组返回 null）
-    pub fn execArrayPop(self: *Engine, node: *const Node) EngineError!void {
-        const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
-        if (arr.elements.len == 0) {
-            // 空数组 → 返回 null
-            self.runtime.writePtr(node.output, null);
-            return;
-        }
-        const last_idx = arr.elements.len - 1;
-        const v = arr.elements[last_idx];
-        const new_len = last_idx;
-        // arena 数组扩容/缩容与 push 保持一致：arena 分配新 elements，旧 elements 由 reset 回收
-        const use_arena = arr.header.isArenaAllocated();
-        if (new_len == 0) {
-            if (!use_arena and arr.elements.len > 0) {
-                self.tctx.?.freeObj(@ptrCast(arr.elements.ptr));
-            }
-            arr.elements = &.{};
-            arr.capacity = 0;
-        } else {
-            const new_size = new_len * @sizeOf(value.Value);
-            const buf = if (use_arena)
-                self.tctx.?.allocObjArena(new_size) catch return error.OutOfMemory
-            else
-                self.tctx.?.allocObj(new_size) catch return error.OutOfMemory;
-            const new_elements: []value.Value = @as([*]value.Value, @ptrCast(@alignCast(buf.ptr)))[0..new_len];
-            @memcpy(new_elements, arr.elements[0..new_len]);
-            if (!use_arena) {
-                self.tctx.?.freeObj(@ptrCast(arr.elements.ptr));
-            }
-            arr.elements = new_elements;
-            arr.capacity = new_len;
-        }
-        self.valueToChan(node.output, v);
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
     }
 
     /// string_contains：检查字符串是否包含子串
@@ -583,11 +438,11 @@ pub const Methods = struct {
         const sub_bytes = bytes[start_byte..end_byte];
         const new_str = value.str_mod.Str.createContiguous(self.tctx.?, sub_bytes) catch return error.OutOfMemory;
         try self.trackObj(&new_str.header);
-        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&new_str.header)));
     }
 
     /// string_bytes：字符串转 u8[]（UTF-8 编码）
-    /// inputs[0] = s, output = ref_chan (ArrayValue<u8>)
+    /// inputs[0] = s, output = 通道 (ArrayValue<u8>)
     pub fn execStringBytes(self: *Engine, node: *const Node) EngineError!void {
         const s = self.readStr(node.inputs[0]) orelse return error.InvalidChannel;
         const bytes = s.bytes();
@@ -614,11 +469,11 @@ pub const Methods = struct {
         } else
             value.Value.makeArray(self.tctx.?, tmp, null) catch return error.OutOfMemory;
         try self.trackObj(v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
     }
 
     /// array_to_str：u8[] 转字符串（UTF-8 解码）
-    /// inputs[0] = arr (ArrayValue<u8>), output = ref_chan (Str)
+    /// inputs[0] = arr (ArrayValue<u8>), output = 通道 (Str)
     pub fn execArrayToStr(self: *Engine, node: *const Node) EngineError!void {
         const arr = self.readArray(node.inputs[0]) orelse return error.InvalidChannel;
         // 收集字节数据
@@ -630,7 +485,7 @@ pub const Methods = struct {
         }
         const new_str = value.str_mod.Str.createContiguous(self.tctx.?, tmp_bytes) catch return error.OutOfMemory;
         try self.trackObj(&new_str.header);
-        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&new_str.header)));
     }
 
     // ════════════════════════════════════════════
@@ -672,7 +527,7 @@ pub const Methods = struct {
         value.obj_header.initObjHeader(&rec.header, .record, total, use_arena, self.tctx.?);
         const v = value.Value.fromRef(&rec.header);
         try self.trackObj(v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
     }
 
     /// record_get：按 field_id 读取字段值
@@ -849,6 +704,6 @@ pub const Methods = struct {
         value.obj_header.initObjHeader(&new_rec.header, .record, alloc_total, false, self.tctx.?);
         const v = value.Value.fromRef(&new_rec.header);
         try self.trackObj(v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
     }
 };

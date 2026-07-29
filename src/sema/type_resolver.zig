@@ -21,11 +21,10 @@ fn scalarKindFromName(name: []const u8) ?ScalarKind {
 
 /// 引用语义类型的 TypeDescriptor（ref_chan，8 字节指针）
 /// 用于 str/record/adt/array/fn/generic/trait/ref_type/raw_ptr 等堆引用类型
-/// scalar_ops 引用 ir 侧的 ref_ops，使 readChannel/writeChannel 能处理 ref_chan
+/// ops 引用 ir 侧的 ref_ops，使 readChannel/writeChannel 能处理 ref_chan
 pub const ref_type_descriptor: TypeDescriptor = .{
     .size = 8,
-    .alignment = 8,
-    .scalar_ops = &ir_mod.type_descriptor_mod.heap_ref_ops,
+    .ops = &ir_mod.type_descriptor_mod.heap_ref_ops,
     .type_id = 0,
     .type_name = "ref",
 };
@@ -33,8 +32,7 @@ pub const ref_type_descriptor: TypeDescriptor = .{
 /// null 类型的 TypeDescriptor
 pub const null_type_descriptor: TypeDescriptor = .{
     .size = 0,
-    .alignment = 1,
-    .scalar_ops = &ir_mod.type_descriptor_mod.null_ops,
+    .ops = &ir_mod.type_descriptor_mod.null_ops,
     .type_id = 17,
     .type_name = "null",
 };
@@ -42,8 +40,7 @@ pub const null_type_descriptor: TypeDescriptor = .{
 /// unit 类型的 TypeDescriptor
 pub const unit_type_descriptor: TypeDescriptor = .{
     .size = 0,
-    .alignment = 1,
-    .scalar_ops = &ir_mod.type_descriptor_mod.unit_ops,
+    .ops = &ir_mod.type_descriptor_mod.unit_ops,
     .type_id = 18,
     .type_name = "void",
 };
@@ -96,7 +93,15 @@ pub fn resolveTypeNodeConcrete(
         .record => sema_result.getOrCreateRefDesc("record") catch unreachable,
         .function => sema_result.getOrCreateRefDesc("fn") catch unreachable,
         .array => sema_result.getOrCreateRefDesc("array") catch unreachable,
-        .self_type => sema_result.getOrCreateRefDesc("Self") catch unreachable,
+        .self_type => {
+            // 查 type_args 中的 "Self" 绑定（与 named("Self") 走相同路径）
+            // 编译 trait 默认方法时，func_compiler 会把 "Self" → 具体类型加入 type_args
+            for (type_args) |*ta| {
+                if (std.mem.eql(u8, ta.type_name, "Self")) return ta;
+            }
+            // 未绑定（trait 声明自身类型检查）：回退到具名 "Self" 引用描述符
+            return sema_result.getOrCreateRefDesc("Self") catch unreachable;
+        },
         .kind_annotated => |ka| resolveTypeNodeConcrete(ka.inner, type_args, sema_result),
     };
 }
@@ -260,7 +265,13 @@ pub fn resolveTypeNodeResolved(
         .record => sema_result.getOrCreateRefDesc("record") catch unreachable,
         .function => sema_result.getOrCreateRefDesc("fn") catch unreachable,
         .array => sema_result.getOrCreateRefDesc("array") catch unreachable,
-        .self_type => sema_result.getOrCreateRefDesc("Self") catch unreachable,
+        .self_type => {
+            // 查 type_args 中的 "Self" 绑定（与 named("Self") 走相同路径）
+            for (type_args) |*ta| {
+                if (std.mem.eql(u8, ta.type_name, "Self")) return ta;
+            }
+            return sema_result.getOrCreateRefDesc("Self") catch unreachable;
+        },
         .kind_annotated => |ka| resolveTypeNodeResolved(ka.inner, type_args, sema_result),
     };
 }
@@ -355,7 +366,13 @@ pub fn chanTypeFromTypeNodeBound(
         .record => sema_result.getOrCreateRefDesc("record") catch unreachable,
         .function => sema_result.getOrCreateRefDesc("fn") catch unreachable,
         .array => sema_result.getOrCreateRefDesc("array") catch unreachable,
-        .self_type => sema_result.getOrCreateRefDesc("Self") catch unreachable,
+        .self_type => {
+            // 查 type_args 中的 "Self" 绑定（与 named("Self") 走相同路径）
+            for (type_args) |*ta| {
+                if (std.mem.eql(u8, ta.type_name, "Self")) return ta;
+            }
+            return sema_result.getOrCreateRefDesc("Self") catch unreachable;
+        },
         .kind_annotated => |ka| chanTypeFromTypeNodeBound(ka.inner, type_args, type_binding_ctx, sema_result),
     };
 }

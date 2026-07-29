@@ -46,7 +46,7 @@ pub const Methods = struct {
 
         const nt_v = value.Value.makeNewtype(self.tctx.?, type_name, inner) catch return error.OutOfMemory;
         try self.trackObj(nt_v.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(nt_v.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(nt_v.asRef())));
     }
 
     /// newtype_unwrap：从 NewtypeValue 提取内部值
@@ -54,7 +54,9 @@ pub const Methods = struct {
     /// output = 内部值通道
     pub fn execNewtypeUnwrap(self: *Engine, node: *const Node) EngineError!void {
         const ref_chan = node.inputs[0];
-        const header = self.readRefObj(ref_chan) orelse return error.Panic;
+        const v = self.runtime.readChannel(ref_chan) orelse return error.Panic;
+        if (v != .ref) return error.Panic;
+        const header = v.ref;
         if (header.type_tag != .newtype) return error.Panic;
         const nt: *value.NewtypeValue = @alignCast(@fieldParentPtr("header", header));
         self.writeScalarValue(node.output, nt.inner);
@@ -119,7 +121,7 @@ pub const Methods = struct {
             _ = inner.retain(self.tctx.?);
             const cell_v = value.Value.makeCell(self.tctx.?, inner) catch return error.OutOfMemory;
             try self.trackObj(cell_v.asRef());
-            self.runtime.writePtr(node.output, @ptrCast(cell_v.asRef()));
+            _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(cell_v.asRef())));
         } else if (src_w == 0) {
             // unit 类型：ref 无意义，写 null
             const dst_ptr: *?*anyopaque = @ptrCast(@alignCast(dst));

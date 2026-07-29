@@ -263,7 +263,7 @@ function renderBlock(block) {
     switch (block.type) {
         case 'p':   return `<p>${inline(block.text)}</p>`;
         case 'h3':  return `<h3 id="${block.id || ''}">${block.text}</h3>`;
-        case 'code': return renderCodeBlock(block.code, block.filename);
+        case 'code': return renderCodeBlock(block.code, block.filename, block.snippet);
         case 'ul':  return `<ul>${block.items.map(i => `<li>${inline(i)}</li>`).join('')}</ul>`;
         case 'ol':  return `<ol>${block.items.map(i => `<li>${inline(i)}</li>`).join('')}</ol>`;
         case 'table': return renderTable(block);
@@ -382,18 +382,48 @@ function initNavIcons() {
 // Part 5: 代码块渲染
 // ═══════════════════════════════════════════
 
-function renderCodeBlock(code, filename) {
+function renderCodeBlock(code, filename, snippet) {
     const id = 'code-' + Math.random().toString(36).slice(2, 11);
     const fn = filename || 'example.glue';
-    const highlighted = highlightGlue(code);
     const dots = platformWindowDots();
-    const copyBtn = `<button class="copy-btn" data-code-id="${id}" aria-label="${t('code_copy')}"><span class="copy-icon">${ICONS.copy}</span><span class="copy-text">${t('code_copy')}</span></button>`;
     const isWin = detectedPlatform === 'windows';
-    // Windows：复制在左、窗口控件在右；macOS/Linux：窗口控件在左、复制在右
+
+    // snippet 折叠模式：折叠显示关键片段，展开显示完整可执行代码
+    const hasSnippet = snippet && snippet.trim().length > 0;
+
+    // 复制按钮始终复制完整代码
+    const copyTargetId = hasSnippet ? 'full-' + id : id;
+    const copyBtn = `<button class="copy-btn" data-code-id="${copyTargetId}" aria-label="${t('code_copy')}"><span class="copy-icon">${ICONS.copy}</span><span class="copy-text">${t('code_copy')}</span></button>`;
+
     const dotsLeft = isWin ? '' : dots;
     const dotsRight = isWin ? dots : '';
     const copyLeft = isWin ? copyBtn : '';
     const copyRight = isWin ? '' : copyBtn;
+
+    if (hasSnippet) {
+        // 折叠态：显示 snippet；展开态：显示完整 code
+        const snippetHtml = highlightGlue(snippet);
+        const fullHtml = highlightGlue(code);
+        const expandBtn = `<button class="code-expand-btn" data-block-id="block-${id}" aria-label="${t('code_expand')}"><span class="chevron">${ICONS.chevronDown}</span><span class="expand-text">${t('code_expand')}</span></button>`;
+        return `
+        <div class="code-block collapsible" id="block-${id}">
+            <div class="code-header">
+                ${dotsLeft}
+                ${copyLeft}
+                <span class="code-filename">${ICONS.terminal} ${fn}</span>
+                ${copyRight}
+                ${dotsRight}
+            </div>
+            <div class="code-body">
+                <pre id="${id}" class="code-snippet">${snippetHtml}</pre>
+                <pre id="full-${id}" class="code-full" style="display:none">${fullHtml}</pre>
+            </div>
+            ${expandBtn}
+        </div>`;
+    }
+
+    // 无 snippet：普通渲染，不折叠
+    const highlighted = highlightGlue(code);
     return `
         <div class="code-block">
             <div class="code-header">
@@ -429,6 +459,24 @@ function initCopyButtons() {
                 btn.classList.remove('copied');
             }, 1500);
         });
+    });
+}
+
+// snippet 折叠/展开（事件委托）：切换 snippet / full pre 显隐
+function initExpandButtons() {
+    document.addEventListener('click', e => {
+        const btn = e.target.closest('.code-expand-btn');
+        if (!btn) return;
+        const block = document.getElementById(btn.dataset.blockId);
+        if (!block) return;
+        const snippetPre = block.querySelector('.code-snippet');
+        const fullPre = block.querySelector('.code-full');
+        if (!snippetPre || !fullPre) return;
+        const expanded = block.classList.toggle('expanded');
+        snippetPre.style.display = expanded ? 'none' : 'block';
+        fullPre.style.display = expanded ? 'block' : 'none';
+        const txt = btn.querySelector('.expand-text');
+        if (txt) txt.textContent = expanded ? t('code_collapse') : t('code_expand');
     });
 }
 
@@ -828,6 +876,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initNavIcons();
     applyLangToStatic();
     initCopyButtons();
+    initExpandButtons();
     initScrollFeatures();
     initCustomScrollbar();
     initPsHoverBehavior();

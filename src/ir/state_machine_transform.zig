@@ -132,10 +132,19 @@ fn buildSegments(
         }
     }
 
+    // IR-4: Always append a terminal segment, even when the last node is a suspend
+    // node (seg_start == nodes.len after the loop). Without this, async functions
+    // ending with a suspend node have no terminal state.
     if (seg_start < nodes.len) {
         try segments.append(arena, .{
             .start_node = seg_start,
             .end_node = @intCast(nodes.len - 1),
+            .suspend_kind = .terminal,
+        });
+    } else {
+        try segments.append(arena, .{
+            .start_node = @intCast(nodes.len),
+            .end_node = @intCast(nodes.len),
             .suspend_kind = .terminal,
         });
     }

@@ -42,7 +42,7 @@ fun mapAdd(arr: i64[], delta: i64): i64[] {
     var out: i64[] = []
     var i: i32 = 0
     while i < cast(arr.len()).to(i32) {
-        out = out.push(adder(arr[cast(i).to(usize)]))
+        out = out ++ [adder(arr[cast(i).to(usize)])]
         i = i + 1
     }
     out
@@ -52,7 +52,7 @@ fun buildArray(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        arr = arr.push(cast(i).to(i64))
+        arr = arr ++ [cast(i).to(i64)]
         i = i + 1
     }
     arr

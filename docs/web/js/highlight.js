@@ -7,7 +7,7 @@ const GLUE_KEYWORDS = new Set([
     'channel', 'select', 'atomic',
     'loop', 'for', 'in', 'while', 'break', 'continue', 'return',
     'true', 'false', 'null',
-    'throw', 'defer',
+    'throw', 'defer', 'lazy',
 ]);
 
 const GLUE_TYPES = new Set([

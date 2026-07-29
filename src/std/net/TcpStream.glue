@@ -35,7 +35,7 @@ pub fun from_accept_fd(fd: i64, peer: SocketAddr): TcpStream {
 
 // 从流读取数据，返回读到的字节数组（空数组 = EOF）。
 // 单次 read 语义（不循环阻塞）。
-// __net_tcp_read_async 创建完成 channel + spawn read 线程，协程在 channel 上 recv 挂起；
+// __net_tcp_read_async 创建完成 channel + launch read 线程，协程在 channel 上 recv 挂起；
 // read 完成后 channel 收到 Throw<u8[], IOError>。
 pub async fun read(self: TcpStream, len: usize): Async<Throw<u8[], IOError>> {
     if self.is_closed {
@@ -46,7 +46,7 @@ pub async fun read(self: TcpStream, len: usize): Async<Throw<u8[], IOError>> {
 }
 
 // 向流写入数据，返回实际写入字节数。
-// __net_tcp_write_async 创建完成 channel + spawn write 线程，协程在 channel 上 recv 挂起；
+// __net_tcp_write_async 创建完成 channel + launch write 线程，协程在 channel 上 recv 挂起；
 // write 完成后 channel 收到 Throw<usize, IOError>。
 pub async fun write(self: TcpStream, buf: u8[], len: usize): Async<Throw<usize, IOError>> {
     if self.is_closed {

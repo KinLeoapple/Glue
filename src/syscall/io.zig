@@ -232,7 +232,8 @@ pub fn file_open(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError
         };
         break :blk f;
     };
-    return makeThrowOk(tctx, Value.fromI64(fileToFd(file)));
+    const fd = fileToFd(file);
+    return makeThrowOk(tctx, Value.fromI64(fd));
 }
 
 /// __file_close(fd: i64) -> Throw<Unit, IOError>
@@ -339,7 +340,7 @@ pub fn file_seek(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError
 // 异步 File syscall
 // ──────────────────────────────────────────────
 //
-// 协议：创建完成 channel(cap=1) + spawn 独立线程跑 read/write（不阻塞协程 worker 线程），
+// 协议：创建完成 channel(cap=1) + launch 独立线程跑 read/write（不阻塞协程 worker 线程），
 // 完成后 chan.trySend(Throw<T, IOError>) + wake_chan_recv_fn 唤醒等待协程。
 // 协程在 channel 上挂起（orbit_chan_recv），唤醒后从 channel 取 Throw 值。
 //
@@ -364,7 +365,7 @@ const FileReadAsyncArgs = struct {
 
 /// __file_read_async(fd: i64, len: usize) -> *ChannelValue
 ///
-/// 异步文件读：创建完成 channel + spawn 线程跑 read，
+/// 异步文件读：创建完成 channel + launch 线程跑 read，
 /// 完成后 chan.trySend(Throw<u8[], IOError>) + wake_chan_recv_fn 唤醒协程。
 /// 返回 channel 指针，协程在 channel 上挂起（orbit_chan_recv）。
 pub fn file_read_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
@@ -381,7 +382,7 @@ pub fn file_read_async(io: Io, tctx: *ThreadContext, args: []const Value) Syscal
     // 创建完成 channel（cap=1，buffer 容纳一个 Throw 值）
     const chan = value.ChannelValue.create(tctx, 1) catch return error.OutOfMemory;
 
-    // spawn 线程跑 read + ioComplete
+    // launch 线程跑 read + ioComplete
     const args_ptr = tctx.backing.create(FileReadAsyncArgs) catch return error.OutOfMemory;
     args_ptr.* = .{
         .io = io,
@@ -395,8 +396,8 @@ pub fn file_read_async(io: Io, tctx: *ThreadContext, args: []const Value) Syscal
     };
     const thread = std.Thread.spawn(.{}, fileReadAsyncWorker, .{args_ptr}) catch {
         tctx.backing.destroy(args_ptr);
-        // spawn 失败：返回错误 Throw（不应发生）
-        const io_err = try makeIOError(tctx, .other, "file_read_async: spawn failed", 0, null);
+        // thread launch 失败：返回错误 Throw（不应发生）
+        const io_err = try makeIOError(tctx, .other, "file_read_async: thread launch failed", 0, null);
         return makeThrowErr(tctx, io_err, "io error");
     };
     thread.detach();
@@ -463,7 +464,7 @@ const FileWriteAsyncArgs = struct {
 
 /// __file_write_async(fd: i64, buf: u8[], len: usize) -> *ChannelValue
 ///
-/// 异步文件写：创建完成 channel + spawn 线程跑 write，
+/// 异步文件写：创建完成 channel + launch 线程跑 write，
 /// 完成后 chan.trySend(Throw<usize, IOError>) + wake_chan_recv_fn 唤醒协程。
 pub fn file_write_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 3) return error.InvalidArgument;
@@ -502,7 +503,7 @@ pub fn file_write_async(io: Io, tctx: *ThreadContext, args: []const Value) Sysca
         return error.OutOfMemory;
     };
 
-    // spawn 线程跑 write + ioComplete
+    // launch 线程跑 write + ioComplete
     const args_ptr = tctx.backing.create(FileWriteAsyncArgs) catch {
         tctx.backing.free(buf_copy);
         return error.OutOfMemory;
@@ -521,8 +522,8 @@ pub fn file_write_async(io: Io, tctx: *ThreadContext, args: []const Value) Sysca
     const thread = std.Thread.spawn(.{}, fileWriteAsyncWorker, .{args_ptr}) catch {
         tctx.backing.destroy(args_ptr);
         tctx.backing.free(buf_copy);
-        // spawn 失败：返回错误 Throw（不应发生）
-        const io_err = try makeIOError(tctx, .other, "file_write_async: spawn failed", 0, null);
+        // thread launch 失败：返回错误 Throw（不应发生）
+        const io_err = try makeIOError(tctx, .other, "file_write_async: thread launch failed", 0, null);
         return makeThrowErr(tctx, io_err, "io error");
     };
     thread.detach();

@@ -33,7 +33,6 @@ pub const TokenType = enum {
     kw_channel,
     kw_select,
     kw_atomic,
-    kw_spawn,
     kw_loop,
     kw_for,
     kw_in,
@@ -44,7 +43,6 @@ pub const TokenType = enum {
     kw_throw,
     kw_lazy,
     kw_defer,
-    kw_cast,
     identifier,
     plus,
     minus,
@@ -961,7 +959,6 @@ const KEYWORDS = std.StaticStringMap(TokenType).initComptime(.{
     .{ "channel", .kw_channel },
     .{ "select", .kw_select },
     .{ "atomic", .kw_atomic },
-    .{ "spawn", .kw_spawn },
     .{ "loop", .kw_loop },
     .{ "for", .kw_for },
     .{ "in", .kw_in },
@@ -975,7 +972,6 @@ const KEYWORDS = std.StaticStringMap(TokenType).initComptime(.{
     .{ "throw", .kw_throw },
     .{ "lazy", .kw_lazy },
     .{ "defer", .kw_defer },
-    .{ "cast", .kw_cast },
 });
 
 /// 查询文本是否为关键字，否则返回 identifier

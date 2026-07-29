@@ -117,8 +117,8 @@ fn collectAssignedVarsExprImpl(ctx: *AssignedVarsCtx, expr: *const ast.Expr) any
             for (b.statements) |s| try collectAssignedVarsStmtImpl(ctx, s);
             if (b.trailing_expr) |te| try collectAssignedVarsExprImpl(ctx, te);
         },
-        // 作用域隔离：不递归（lambda/select/inline_trait_value/spawn/lazy 内的赋值不影响外层）
-        .lambda, .select, .inline_trait_value, .spawn_expr, .lazy => {},
+        // 作用域隔离：不递归（lambda/select/inline_trait_value/lazy 内的赋值不影响外层）
+        .lambda, .select, .inline_trait_value, .lazy => {},
         // 默认：walkExprChildren 递归
         else => {
             try ast_visitor.walkExprChildren(@ptrCast(ctx), expr, collectAssignedVarsExprCb);
@@ -232,8 +232,8 @@ fn collectHoistsInExprImpl(ctx: *HoistCtx, expr: *const ast.Expr) anyerror!void 
             for (b.statements) |s| try collectHoistsInStmtImpl(ctx, s);
             if (b.trailing_expr) |te| try collectHoistsInExprImpl(ctx, te);
         },
-        // 作用域隔离：不递归（lambda/select/inline_trait_value/spawn/lazy 内的表达式不可外提到外层循环）
-        .lambda, .select, .inline_trait_value, .spawn_expr, .lazy => {},
+        // 作用域隔离：不递归（lambda/select/inline_trait_value/lazy 内的表达式不可外提到外层循环）
+        .lambda, .select, .inline_trait_value, .lazy => {},
         // 默认：walkExprChildren 递归
         else => {
             try ast_visitor.walkExprChildren(@ptrCast(ctx), expr, collectHoistsInExprCb);

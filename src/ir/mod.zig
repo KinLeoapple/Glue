@@ -10,7 +10,7 @@
 //! Phase 2：向量 op（循环/递归向量化）
 //! Phase 3：门控/路由/竞争/清理
 //! Phase 4：优化器（常量折叠/死节点消除/通道活跃性/向量融合）
-//! Phase 5：星轨扩展（async/spawn 并行执行层）
+//! Phase 5：星轨扩展（async 并行执行层）
 
 const std = @import("std");
 
@@ -41,10 +41,12 @@ pub const op_table = op_table_mod;
 // 核心类型重导出
 pub const Node = node_mod.Node;
 pub const NodeOp = node_mod.NodeOp;
+pub const SourceLocation = ir_mod.SourceLocation;
 pub const ScalarMeta = meta_mod.ScalarMeta;
 pub const ScalarKind = meta_mod.ScalarKind;
 pub const ConstVal = meta_mod.ConstVal;
 pub const CallMeta = meta_mod.CallMeta;
+pub const buildNodeArgs = meta_mod.buildNodeArgs;
 pub const VectorMeta = meta_mod.VectorMeta;
 pub const VecOp = meta_mod.VecOp;
 pub const GateMeta = meta_mod.GateMeta;
@@ -82,7 +84,7 @@ pub const OptStats = optimizer_mod.OptStats;
 
 // v3 TypeDescriptor 类型重导出（定义已移至 ir/type_descriptor.zig）
 pub const TypeDescriptor = type_descriptor_mod.TypeDescriptor;
-pub const ScalarOps = type_descriptor_mod.ScalarOps;
+pub const TypeOps = type_descriptor_mod.TypeOps;
 
 // sema_output 别名：从 sema 模块重导出（sema_output.zig 已迁入 sema/）
 pub const sema_output = sema_output_mod;

@@ -478,18 +478,6 @@ pub const Runtime = struct {
         ptr.* = if (val) 1 else 0;
     }
 
-    /// 读取堆对象指针（ref_chan）
-    pub inline fn readPtr(self: *Runtime, chan: u16) ?*anyopaque {
-        const ptr: *?*anyopaque = @ptrCast(@alignCast(self.chan_slots[chan].ptr.?));
-        return ptr.*;
-    }
-
-    /// 写入堆对象指针（ref_chan）
-    pub inline fn writePtr(self: *Runtime, chan: u16, val: ?*anyopaque) void {
-        const ptr: *?*anyopaque = @ptrCast(@alignCast(self.chan_slots[chan].ptr.?));
-        ptr.* = val;
-    }
-
     /// 泛型标量读取（指定通道）：按 comptime tag 直接指针读写，跳过 16B 中间缓冲
     /// 覆盖所有 int/uint/float 类型，零 memcpy
     pub fn readScalarAt(self: *Runtime, comptime tag: scalar.ScalarTag, chan: u16) scalar.NativeType(tag) {
@@ -505,7 +493,9 @@ pub const Runtime = struct {
         ptr.* = val;
     }
 
-    /// 读取原始字节指针（用于通用访问）
+    /// 读取原始字节指针（用于通用访问，如向量元素 memcpy）
+    /// 注意：这是字节级存储访问，不是 ref_chan 指针语义。
+    /// 堆对象指针的读写必须通过 writeChannel/readChannel（由 ref_ops vtable 处理）。
     pub inline fn rawPtr(self: *Runtime, chan: u16) [*]u8 {
         return self.chan_slots[chan].ptr.?;
     }
@@ -516,7 +506,7 @@ pub const Runtime = struct {
     }
 
     // ════════════════════════════════════════════
-    // 统一通道读写接口（基于 type_desc.scalar_ops vtable）
+    // 统一通道读写接口（基于 type_desc.ops vtable）
     // ════════════════════════════════════════════
 
     /// 统一读取通道值为 value.Value（通过 scalar_ops vtable 分派）
@@ -525,7 +515,7 @@ pub const Runtime = struct {
     /// nullable 通道：通过 nullable<T> 专属 scalar_ops 读写（内含 null flag 检查）。
     pub fn readChannel(self: *Runtime, chan: u16) ?value.Value {
         const slot = &self.chan_slots[chan];
-        const ops = slot.type_desc.scalar_ops;
+        const ops = slot.type_desc.ops;
         if (slot.ptr) |p| return ops.read(@ptrCast(p));
         // ptr 为 null：仅对零字节类型（unit/null）合法，使用 dummy ptr
         if (slot.width == 0) return ops.read(@ptrFromInt(@as(usize, 1)));
@@ -538,7 +528,7 @@ pub const Runtime = struct {
     /// nullable 通道：通过 nullable<T> 专属 scalar_ops 读写（内含 null flag 设置）。
     pub fn writeChannel(self: *Runtime, chan: u16, v: value.Value) bool {
         const slot = &self.chan_slots[chan];
-        const ops = slot.type_desc.scalar_ops;
+        const ops = slot.type_desc.ops;
         const coerced = ops.coerce(v);
         if (slot.ptr) |p| {
             ops.write(@ptrCast(p), coerced);
@@ -592,7 +582,7 @@ pub const Runtime = struct {
     pub fn formatChannel(self: *Runtime, chan: u16, buf: []u8) ?[]const u8 {
         const slot = &self.chan_slots[chan];
         if (slot.ptr == null) return null;
-        const ops = slot.type_desc.scalar_ops;
+        const ops = slot.type_desc.ops;
         return ops.format(@ptrCast(slot.ptr.?), buf);
     }
 
@@ -600,7 +590,7 @@ pub const Runtime = struct {
     /// 用于 ref_chan 内嵌的标量引用场景：指针来自其他通道的 rawPtr，
     /// type_desc 来自源通道。零运行时 switch。
     pub fn formatScalarPtr(_: *Runtime, ptr: *anyopaque, type_desc: *const ir_mod.type_descriptor_mod.TypeDescriptor, buf: []u8) ?[]const u8 {
-        const ops = type_desc.scalar_ops;
+        const ops = type_desc.ops;
         return ops.format(ptr, buf);
     }
 

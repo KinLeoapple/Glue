@@ -12,6 +12,7 @@ const type_check = @import("sema");
 const analysis_db_mod = @import("analysis_db");
 const ast_rewrite = @import("ast_rewrite.zig");
 const module_source = @import("module_source.zig");
+const builtin_embed = @import("builtin_embed");
 
 /// 字符串 intern 池：模块名等重复字符串统一去重分配，由池统一释放。
 const StringInterner = struct {
@@ -380,6 +381,14 @@ pub const ModuleLoader = struct {
         var extra_decls = std.ArrayList(ast.Decl).empty;
         defer extra_decls.deinit(self.allocator);
 
+        // builtin 声明单独存储：需放在 declarations 最前面，先于 stdlib 和用户代码被 sema 处理
+        var builtin_decls = std.ArrayList(ast.Decl).empty;
+        defer builtin_decls.deinit(self.allocator);
+
+        // 预加载 builtin 类型定义（error/pack.glue 等），走通用 sema/IR 路径
+        // builtin 声明不做 mangling，短名直接注册到全局环境
+        try self.loadBuiltinDecls(&builtin_decls, retained_parsers, retained_tokens, ast_arena);
+
         // 已加载的子模块集合（避免重复加载），key 格式："pack/sub"
         var loaded_submodules = std.StringHashMap(void).init(self.allocator);
         defer loaded_submodules.deinit();
@@ -432,11 +441,15 @@ pub const ModuleLoader = struct {
             }
         }
 
-        // 合并声明到主模块
-        if (extra_decls.items.len > 0) {
-            const combined = try ast_arena.alloc(ast.Decl, entry_module.declarations.len + extra_decls.items.len);
-            @memcpy(combined[0..entry_module.declarations.len], entry_module.declarations);
-            @memcpy(combined[entry_module.declarations.len..], extra_decls.items);
+        // 合并声明到主模块：builtin 声明 → 用户代码 → stdlib/其他依赖
+        // builtin 声明必须最前，确保 sema predeclare 阶段先注册 builtin 类型，
+        // 使 stdlib 代码中引用 IOError/TimeError 等能正确解析
+        const total = builtin_decls.items.len + entry_module.declarations.len + extra_decls.items.len;
+        if (total > entry_module.declarations.len) {
+            const combined = try ast_arena.alloc(ast.Decl, total);
+            @memcpy(combined[0..builtin_decls.items.len], builtin_decls.items);
+            @memcpy(combined[builtin_decls.items.len..][0..entry_module.declarations.len], entry_module.declarations);
+            @memcpy(combined[builtin_decls.items.len + entry_module.declarations.len ..], extra_decls.items);
             entry_module.declarations = combined;
         }
     }
@@ -708,6 +721,79 @@ pub const ModuleLoader = struct {
                             },
                             else => {},
                         }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// 预加载 builtin 类型定义（error/pack.glue 等）。
+    ///
+    /// 解析 builtin .glue 文件（通过 @embedFile 嵌入），将所有声明
+    /// （trait_decl / type_decl / fun_decl）不做 mangling 地合并到 extra_decls，
+    /// 使 builtin 类型走通用 sema → IR 路径。
+    ///
+    /// builtin 类型对所有用户代码默认可见（不需要 import），短名直接注册到全局环境。
+    fn loadBuiltinDecls(
+        self: *ModuleLoader,
+        extra_decls: *std.ArrayList(ast.Decl),
+        retained_parsers: *std.ArrayList(*parser_mod.Parser),
+        retained_tokens: *std.ArrayList([]lexer_mod.Token),
+        _: std.mem.Allocator,
+    ) !void {
+        // builtin 模块列表（每个模块有 pack.glue + 子文件）
+        const builtin_modules = [_][]const u8{ "error", "iter" };
+        for (builtin_modules) |mod_name| {
+            self.loadBuiltinModule(mod_name, extra_decls, retained_parsers, retained_tokens) catch {};
+        }
+    }
+
+    fn loadBuiltinModule(
+        self: *ModuleLoader,
+        mod_name: []const u8,
+        extra_decls: *std.ArrayList(ast.Decl),
+        retained_parsers: *std.ArrayList(*parser_mod.Parser),
+        retained_tokens: *std.ArrayList([]lexer_mod.Token),
+    ) !void {
+        // 读取 {mod}/pack.glue，解析子模块列表
+        const pack_path = std.fmt.allocPrint(self.allocator, "{s}/pack.glue", .{mod_name}) catch return;
+        defer self.allocator.free(pack_path);
+        const pack_src = builtin_embed.find(pack_path) orelse return;
+        var pack_lex = lexer_mod.Lexer.init(self.allocator, pack_src);
+        defer pack_lex.deinit();
+        const pack_tokens = pack_lex.tokenize() catch return;
+        defer self.allocator.free(pack_tokens);
+        var pack_parser = parser_mod.Parser.init(self.allocator, pack_tokens);
+        defer pack_parser.deinit();
+        const pack_module = pack_parser.parseModule(mod_name) catch return;
+
+        // 加载 pack 中声明的每个子模块
+        for (pack_module.declarations) |pack_decl| {
+            switch (pack_decl) {
+                .pack_decl => |pd| {
+                    const sub_name = pd.name;
+                    const sub_path = std.fmt.allocPrint(self.allocator, "{s}/{s}.glue", .{ mod_name, sub_name }) catch continue;
+                    defer self.allocator.free(sub_path);
+                    const sub_src = builtin_embed.find(sub_path) orelse continue;
+
+                    var sub_lex = lexer_mod.Lexer.init(self.allocator, sub_src);
+                    const sub_tokens = sub_lex.tokenize() catch continue;
+                    const sub_parser_ptr = try self.allocator.create(parser_mod.Parser);
+                    sub_parser_ptr.* = parser_mod.Parser.init(self.allocator, sub_tokens);
+                    const sub_module = sub_parser_ptr.parseModule(sub_name) catch {
+                        sub_parser_ptr.deinit();
+                        self.allocator.destroy(sub_parser_ptr);
+                        self.allocator.free(sub_tokens);
+                        continue;
+                    };
+
+                    try retained_parsers.append(self.allocator, sub_parser_ptr);
+                    try retained_tokens.append(self.allocator, sub_tokens);
+
+                    // builtin 声明不做 mangling，直接合并到 extra_decls
+                    for (sub_module.declarations) |sub_decl| {
+                        try extra_decls.append(self.allocator, sub_decl);
                     }
                 },
                 else => {},

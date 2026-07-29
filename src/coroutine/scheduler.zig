@@ -3,7 +3,7 @@
 //! M:N 调度——固定 N 个 worker 线程（默认 = CPU 核数），
 //! 可跑任意多协程。work-stealing 跨 worker 偷协程。
 //!
-//! spawn 流程（spec 2.3）：
+//! async 流程（spec 2.3）：
 //! 1. 从帧池分配帧 + 写参数 + state=0
 //! 2. 选目标 worker（轮询或最闲），入其就绪队列
 //! 3. 帧状态设 Ready
@@ -63,12 +63,12 @@ pub const Scheduler = struct {
     io: std.Io,
     shutdown: std.atomic.Value(bool),
     backing: std.mem.Allocator,
-    /// 轮询分配计数器（spawn 时选 worker 用）
+    /// 轮询分配计数器（async 时选 worker 用）
     next_worker: std.atomic.Value(u32),
     /// worker 句柄数组（init 时分配，deinit 时释放）
     workers_storage: ?[]Worker = null,
     /// CoroutineMeta 表（按 func_idx 索引），由 Engine 在启动协程前注入
-    /// 未注入 func_idx 对应的 meta 时，spawn 返回 error.MissingMeta
+    /// 未注入 func_idx 对应的 meta 时，launchAsync 返回 error.MissingMeta
     coroutine_metas: ?[]const CoroutineMeta = null,
     /// IR 节点流引用（runSegment 遍历段内节点用），由 Engine 注入
     ir_nodes: ?[]const Node = null,
@@ -137,7 +137,7 @@ pub const Scheduler = struct {
     }
 
     /// 提交协程：分配帧 + 写参数 + state=0 + 入就绪队列
-    pub fn spawn(
+    pub fn launchAsync(
         self: *Scheduler,
         coroutine_meta: *const CoroutineMeta,
         args: []const Value,
@@ -292,6 +292,8 @@ fn workerRun(worker: *Worker) void {
                 const AsyncHandle = @import("value").AsyncHandle;
                 const handle: *AsyncHandle = @ptrCast(@alignCast(hp));
                 handle.setPanic("no coroutine meta for func_idx");
+                // Bug 2 fix: 唤醒等待此 handle 的嵌套 await 协程
+                sched.suspend_registry.wakeAsyncJoin(handle);
                 handle.signalWorkerDone();
             }
             continue;
@@ -304,6 +306,8 @@ fn workerRun(worker: *Worker) void {
                 const AsyncHandle = @import("value").AsyncHandle;
                 const handle: *AsyncHandle = @ptrCast(@alignCast(hp));
                 handle.setPanic("state out of range");
+                // Bug 2 fix: 唤醒等待此 handle 的嵌套 await 协程
+                sched.suspend_registry.wakeAsyncJoin(handle);
                 handle.signalWorkerDone();
             }
             continue;
@@ -326,6 +330,8 @@ fn workerRun(worker: *Worker) void {
                 const AsyncHandle = @import("value").AsyncHandle;
                 const handle: *AsyncHandle = @ptrCast(@alignCast(hp));
                 handle.setPanic(@errorName(err));
+                // Bug 2 fix: 唤醒等待此 handle 的嵌套 await 协程
+                sched.suspend_registry.wakeAsyncJoin(handle);
                 handle.signalWorkerDone();
             }
             continue;
@@ -343,7 +349,6 @@ fn workerRun(worker: *Worker) void {
                 // suspend_target 与 status 已由 runSegment 设置
             },
             .complete => {
-                // 终态段完成：写结果到 AsyncHandle + 唤醒 join 等待者，回帧池
                 if (handle_ptr) |hp| {
                     const AsyncHandle = @import("value").AsyncHandle;
                     const handle: *AsyncHandle = @ptrCast(@alignCast(hp));
@@ -352,6 +357,9 @@ fn workerRun(worker: *Worker) void {
                     } else {
                         handle.setResult(Value.fromUnit());
                     }
+                    // Bug 2 fix: 唤醒等待此 handle 完成的嵌套 await 协程。
+                    // 必须在 setResult 之后、signalWorkerDone 之前调用。
+                    sched.suspend_registry.wakeAsyncJoin(handle);
                 }
                 f.setStatus(.completed);
                 sched.frame_pool.free(f);
@@ -378,6 +386,8 @@ fn workerRun(worker: *Worker) void {
                     } else {
                         handle.setPanic("segment failed");
                     }
+                    // Bug 2 fix: 唤醒等待此 handle 完成的嵌套 await 协程
+                    sched.suspend_registry.wakeAsyncJoin(handle);
                     handle.signalWorkerDone();
                 }
             },

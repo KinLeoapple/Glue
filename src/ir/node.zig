@@ -28,8 +28,7 @@ pub const NodeOp = enum(u8) {
     cast_try_to,
 
     // === 数据结构 ===
-    array_make, array_get, array_set, array_len, array_push, array_concat,
-    array_first, array_last, array_contains, array_get_safe, array_drop_last, array_pop,
+    array_make, array_get, array_set, array_len, array_concat,
     /// 数组填充：array_fill(output, count, value) — 创建 count 个 value 副本的数组
     array_fill,
     /// 数组切片：array_slice(output, arr, start, end) — _pad=0 左闭右开，_pad=1 左闭右闭
@@ -118,7 +117,7 @@ pub const NodeOp = enum(u8) {
     /// inputs[] 为参数通道，output 为结果通道
     syscall_call,
 
-    // === 星轨（async/spawn，Phase 5） ===
+    // === 星轨（async，Phase 5） ===
     orbit_async_create, orbit_async_join, orbit_async_status,
     orbit_chan_send, orbit_chan_recv, orbit_chan_try_recv, channel_close,
     channel_create, channel_sender, channel_receiver,
@@ -130,9 +129,6 @@ pub const NodeOp = enum(u8) {
     /// output = 旧值。_pad=0 为 add，_pad=1 为 sub
     atomic_fetch_add,
     atomic_swap, atomic_cas,
-
-    // === 反射方法（.message() / .type_name()） ===
-    error_message, obj_type_name,
 
     // === 闭包（lambda） ===
     closure_make, call_indirect,

@@ -28,7 +28,7 @@
 //! | lambda 捕获分配表达式且 lambda 逃逸 | 逃逸 |
 //! | throw 分配表达式 | 逃逸（异常跨函数传播） |
 //! | defer 内分配 | 逃逸（执行时机跨越函数返回） |
-//! | spawn / select / atomic / lazy | 逃逸（跨协程/延迟执行） |
+//! | async / select / atomic / lazy | 逃逸（跨协程/延迟执行） |
 //! | assignment 到字段/索引 | 逃逸 |
 //! | for 循环体分配且循环体逃逸 | 逃逸 |
 //!
@@ -75,7 +75,7 @@ const AllocSource = union(enum) {
 pub const ParamEscape = enum {
     /// 参数不逃逸（纯计算使用）
     no_escape,
-    /// 参数逃逸（被 return/store/capture/spawn 等）
+    /// 参数逃逸（被 return/store/capture/async 等）
     escapes,
     /// 未知（未分析或复杂控制流）
     unknown,
@@ -235,7 +235,7 @@ pub const EscapePass = struct {
 
     // ── 阶段 1：参数逃逸分析 ──
 
-    /// 分析函数参数的逃逸性：参数是否被 return/store/capture/spawn
+    /// 分析函数参数的逃逸性：参数是否被 return/store/capture/async
     fn analyzeParamEscape(self: *EscapePass, fd: anytype) !void {
         const param_count = fd.params.len;
         if (param_count == 0) {
@@ -449,11 +449,6 @@ pub const EscapePass = struct {
                 return .non_alloc;
             },
 
-            // ── 跨协程/延迟执行（必逃逸）──
-            .spawn_expr => {
-                ctx.escapes = true;
-                return .escaped;
-            },
             .select => {
                 ctx.escapes = true;
                 return .escaped;

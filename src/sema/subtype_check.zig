@@ -68,14 +68,13 @@ pub fn isSubtype(inferencer: *TypeInferencer, sub: *Type, super: *Type) bool {
 }
 
 /// 记录类型结构化子类型判定：`sub_fields` 是否覆盖 `super_fields` 的全部字段。
-/// 仅按字段名匹配，不递归校验字段类型（宽度子类型）。
+/// 按字段名匹配，并递归校验字段类型满足子类型关系（宽度+深度子类型）。
 pub fn isRecordSubtype(inferencer: *TypeInferencer, sub_fields: []const FieldType, super_fields: []const FieldType) bool {
-    _ = inferencer;
-
     for (super_fields) |super_field| {
         var found = false;
         for (sub_fields) |sub_field| {
             if (std.mem.eql(u8, super_field.name orelse "", sub_field.name orelse "")) {
+                if (!isSubtype(inferencer, sub_field.ty, super_field.ty)) return false;
                 found = true;
                 break;
             }
@@ -108,10 +107,10 @@ pub fn recordArgSatisfies(inferencer: *TypeInferencer, param: *Type, arg: *Type)
     return true;
 }
 
-/// 错误子类型判定：当 `super_name` 为内置 Error 类型时，
+/// 错误子类型判定：当 `super_name` 为内置 Err trait 时，
 /// 任何错误新类型（is_error_newtype）的 ADT 都是其子类型。
 pub fn isErrorSubtype(inferencer: *TypeInferencer, sub_name: []const u8, super_name: []const u8) bool {
-    if (std.mem.eql(u8, super_name, "Error")) {
+    if (std.mem.eql(u8, super_name, "Err")) {
         if (inferencer.adt_types.get(sub_name)) |info| {
             if (info.is_error_newtype) return true;
         }

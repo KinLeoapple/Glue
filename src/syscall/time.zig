@@ -147,7 +147,7 @@ pub fn sleep_ns(io: std.Io, _: *ThreadContext, args: []const Value) SyscallError
 
 /// __sleep_async(ns: i128) -> *ChannelValue
 ///
-/// 异步 sleep：创建完成 channel + spawn 线程跑 sleep，
+/// 异步 sleep：创建完成 channel + launch 线程跑 sleep，
 /// 完成后 chan.trySend(unit) + wake_chan_recv_fn 唤醒等待协程。
 /// 返回 channel 指针，协程在 channel 上挂起（orbit_chan_recv）。
 ///
@@ -163,7 +163,7 @@ pub fn sleep_async(io: std.Io, tctx: *ThreadContext, args: []const Value) Syscal
     // 创建完成 channel（cap=1，buffer 容纳一个 unit 值）
     const chan = value.ChannelValue.create(tctx, 1) catch return error.OutOfMemory;
 
-    // spawn 线程跑 sleep + ioComplete
+    // launch 线程跑 sleep + ioComplete
     const args_ptr = tctx.backing.create(SleepAsyncArgs) catch return error.OutOfMemory;
     args_ptr.* = .{
         .io = io,
@@ -175,7 +175,7 @@ pub fn sleep_async(io: std.Io, tctx: *ThreadContext, args: []const Value) Syscal
     };
     const thread = std.Thread.spawn(.{}, sleepAsyncWorker, .{args_ptr}) catch {
         tctx.backing.destroy(args_ptr);
-        // spawn 失败：同步 sleep 阻塞当前线程（保底，不应发生）
+        // thread launch 失败：同步 sleep 阻塞当前线程（保底，不应发生）
         std.Io.Clock.Duration.sleep(.{ .raw = .{ .nanoseconds = ns_clamped }, .clock = .awake }, io) catch {};
         return Value.fromUnit();
     };

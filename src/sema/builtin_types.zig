@@ -120,6 +120,7 @@ pub const BUILTIN_GENERIC_TYPES = [_]BuiltinGenericEntry{
     .{ .name = "Sender", .arity = 1 },
     .{ .name = "Receiver", .arity = 1 },
     .{ .name = "Lazy", .arity = 1 },
+    // Iter<T> 由 builtin/iter/Iter.glue 定义，不再作为 builtin generic type
     .{ .name = "TypeInfo", .arity = 1 },
     .{ .name = "Reflect", .arity = 1 },
 };

@@ -8,7 +8,7 @@
 // ─── sleep ─────────────────────────────────────────────────────────
 
 // 睡眠指定 Duration（阻塞当前协程）
-// __sleep_async 创建完成 channel + spawn sleep 线程，协程在 channel 上挂起
+// __sleep_async 创建完成 channel + launch sleep 线程，协程在 channel 上挂起
 pub async fun sleep(d: Duration): Async<void> {
     val done = __sleep_async(d.as_nanos())
     done.recv()

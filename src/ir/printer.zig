@@ -189,9 +189,6 @@ pub fn printIR(ir: *const GlueIR, allocator: std.mem.Allocator, buf: *std.ArrayL
                 meta.arg_count,
                 meta.result_type_desc.type_name,
             });
-            if (meta.is_spawn) {
-                try buf.appendSlice(allocator, " [spawn]");
-            }
             try buf.appendSlice(allocator, "\n");
         }
     }

@@ -3336,6 +3336,39 @@ pub const Methods = struct {
             try self.emit(Node.makeUnary(.channel_close, out, 0, obj_chan));
             return out;
         }
+        if (std.mem.eql(u8, method, "iter")) {
+            // arr.iter() → 构造 Iter<T> record (data: arr, pos: 0)
+            // Iter<T> 类型定义在 builtin/iter/Iter.glue
+            // 字段布局：__tag=0, data=1, pos=2
+            // .next() 通过正常方法分派查找 Iter.next
+            const is_string = self.isStringExpr(object) or self.isStringParam(object);
+            if (is_string) return error.UnsupportedExpr;
+
+            const rec_chan = try self.allocChannel(type_descriptor_mod.ref_descriptor);
+            // record_make: type_name="Iter", field_count=3, field_ref_bits=0b010 (data 是 ref)
+            const make_meta = try self.addRecordMakeMeta("Iter", 3, 0b010);
+            try self.emit(Node.makeSink(.record_make, rec_chan, make_meta));
+
+            // __tag = 0（单构造器）
+            const tag_chan = try self.allocChannel(type_descriptor_mod.i64_descriptor);
+            const tag_meta = try self.addScalarMeta(.{ .kind = .int, .int_kind = .i64, .const_val = .{ .int_val = 0 } });
+            try self.emit(Node.makeSink(.const_i, tag_chan, tag_meta));
+            const tag_field_meta = try self.addFieldIdMeta(0);
+            try self.emit(Node.makeBinary(.record_set, rec_chan, tag_field_meta, rec_chan, tag_chan));
+
+            // data = arr (field_id=1)
+            const data_field_meta = try self.addFieldIdMeta(1);
+            try self.emit(Node.makeBinary(.record_set, rec_chan, data_field_meta, rec_chan, obj_chan));
+
+            // pos = 0 (field_id=2)
+            const pos_chan = try self.allocChannel(type_descriptor_mod.usize_descriptor);
+            const pos_meta = try self.addScalarMeta(.{ .kind = .int, .int_kind = .usize, .const_val = .{ .int_val = 0 } });
+            try self.emit(Node.makeSink(.const_i, pos_chan, pos_meta));
+            const pos_field_meta = try self.addFieldIdMeta(2);
+            try self.emit(Node.makeBinary(.record_set, rec_chan, pos_field_meta, rec_chan, pos_chan));
+
+            return rec_chan;
+        }
         if (std.mem.eql(u8, method, "swap")) {
             // atm.swap(v) → atomic_swap，返回旧值（内部标量类型，非 ref_chan）
             if (arguments.len != 1) return error.UnsupportedExpr;
@@ -3367,40 +3400,13 @@ pub const Methods = struct {
             try self.emit(Node.makeUnary(.array_len, out, 0, obj_chan));
             return out;
         }
-        if (std.mem.eql(u8, method, "push")) {
-            // arr.push(v) → array_push，返回数组引用（支持 result = arr.push(x)）
-            if (arguments.len != 1) return error.UnsupportedExpr;
-            const val_chan = try self.compileExpr(arguments[0]);
-            const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
-            try self.emit(Node.makeBinary(.array_push, out, 0, obj_chan, val_chan));
-            return out;
-        }
-        if (std.mem.eql(u8, method, "pop")) {
-            // arr.pop() → array_pop，返回弹出的元素（ref）
-            const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
-            try self.emit(Node.makeUnary(.array_pop, out, 0, obj_chan));
-            return out;
-        }
-        if (std.mem.eql(u8, method, "first")) {
-            // arr.first() → array_first，返回 nullable i64（可能为空数组）
-            const out = try self.channels.allocNullable(type_descriptor_mod.i64_descriptor);
-            try self.emit(Node.makeUnary(.array_first, out, 0, obj_chan));
-            return out;
-        }
-        if (std.mem.eql(u8, method, "last")) {
-            // arr.last() → array_last，返回 nullable i64（可能为空数组）
-            const out = try self.channels.allocNullable(type_descriptor_mod.i64_descriptor);
-            try self.emit(Node.makeUnary(.array_last, out, 0, obj_chan));
-            return out;
-        }
         if (std.mem.eql(u8, method, "is_empty")) {
-            // arr.is_empty() / s.is_empty() → len == 0 → bool
+            // s.is_empty() → len == 0 → bool（仅字符串，数组用 arr.len() == 0）
             const is_string = self.isStringExpr(object);
-            const len_op: NodeOp = if (is_string) .string_len else .array_len;
-            // Phase 5: len 返回 usize
+            if (!is_string) return error.UnsupportedExpr;
+            const len_op: NodeOp = .string_len;
             const len_chan = try self.allocChannel(type_descriptor_mod.usize_descriptor);
             try self.emit(Node.makeUnary(len_op, len_chan, 0, obj_chan));
-            // 创建常量 0 通道用于比较
             const zero_chan = try self.allocChannel(type_descriptor_mod.usize_descriptor);
             const zero_meta = try self.addScalarMeta(.{ .kind = .int, .int_kind = .usize, .const_val = .{ .int_val = 0 } });
             try self.emit(Node.makeSink(.const_i, zero_chan, zero_meta));
@@ -3409,13 +3415,13 @@ pub const Methods = struct {
             return out;
         }
         if (std.mem.eql(u8, method, "contains")) {
-            // arr.contains(v) / s.contains(ch) → array_contains / string_contains
+            // s.contains(ch) → string_contains（仅字符串）
             if (arguments.len != 1) return error.UnsupportedExpr;
             const val_chan = try self.compileExpr(arguments[0]);
             const out = try self.allocChannel(type_descriptor_mod.bool_descriptor);
             const is_string = self.isStringExpr(object);
-            const op: NodeOp = if (is_string) .string_contains else .array_contains;
-            try self.emit(Node.makeBinary(op, out, 0, obj_chan, val_chan));
+            if (!is_string) return error.UnsupportedExpr;
+            try self.emit(Node.makeBinary(.string_contains, out, 0, obj_chan, val_chan));
             return out;
         }
         if (std.mem.eql(u8, method, "bytes")) {
@@ -3423,20 +3429,6 @@ pub const Methods = struct {
             if (arguments.len != 0) return error.UnsupportedExpr;
             const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
             try self.emit(Node.makeUnary(.string_bytes, out, 0, obj_chan));
-            return out;
-        }
-        if (std.mem.eql(u8, method, "drop_last")) {
-            // arr.drop_last() → array_drop_last，返回新数组（ref）
-            const out = try self.allocChannel(type_descriptor_mod.ref_descriptor);
-            try self.emit(Node.makeUnary(.array_drop_last, out, 0, obj_chan));
-            return out;
-        }
-        if (std.mem.eql(u8, method, "get")) {
-            // arr.get(i) → array_get_safe，返回 nullable（安全索引）
-            if (arguments.len != 1) return error.UnsupportedExpr;
-            const idx_chan = try self.compileExpr(arguments[0]);
-            const out = try self.channels.allocNullable(type_descriptor_mod.ref_descriptor);
-            try self.emit(Node.makeBinary(.array_get_safe, out, 0, obj_chan, idx_chan));
             return out;
         }
         return error.UnsupportedExpr;

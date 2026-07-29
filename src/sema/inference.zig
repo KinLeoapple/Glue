@@ -223,10 +223,26 @@ pub fn chanTypeFromExprAst(expr: *const ast.Expr, sema_result: *SemaResult) *con
         .string_literal, .string_interpolation => return ir_td.str_descriptor,
         .char_literal => return ir_td.char_descriptor,
         .cast_builder => |cb| {
-            return type_resolver.resolveTypeNodeConcrete(cb.target_type, &.{}, sema_result) orelse ir_td.i64_descriptor;
+            return type_resolver.resolveTypeNodeConcrete(cb.target_type, &.{}, sema_result) orelse return ir_td.i64_descriptor;
         },
         .type_cast => |tc| {
-            return type_resolver.resolveTypeNodeConcrete(tc.target_type, &.{}, sema_result) orelse ir_td.i64_descriptor;
+            return type_resolver.resolveTypeNodeConcrete(tc.target_type, &.{}, sema_result) orelse return ir_td.i64_descriptor;
+        },
+        .call => |c| {
+            // 构造器调用：Box([1]) 等
+            if (c.callee.* == .identifier) {
+                if (sema_result.getCtorDef(c.callee.identifier.name)) |ctor| {
+                    return sema_result.getOrCreateRefDesc(ctor.type_name) catch return ir_td.i64_descriptor;
+                }
+            }
+            return ir_td.i64_descriptor;
+        },
+        .identifier => |id| {
+            // 无参构造器引用：None、Nil 等
+            if (sema_result.getCtorDef(id.name)) |ctor| {
+                return sema_result.getOrCreateRefDesc(ctor.type_name) catch return ir_td.i64_descriptor;
+            }
+            return ir_td.i64_descriptor;
         },
         else => return ir_td.i64_descriptor,
     }
@@ -584,7 +600,7 @@ pub fn inferArrayElemType(ctx: *const InferContextExt, expr: *const ast.Expr) *c
         .identifier => |id| {
             if (ctx.lookupVar(id.name)) |binding| {
                 if (binding.type_annotation) |ta| {
-                    if (ta.* == .array) return type_resolver.resolveTypeNodeConcrete(ta.array.element_type, &.{}, ctx.base.sema_result) orelse ir_td.i64_descriptor;
+                    if (ta.* == .array) return type_resolver.resolveTypeNodeConcrete(ta.array.element_type, &.{}, ctx.base.sema_result) orelse return ir_td.i64_descriptor;
                 }
                 if (binding.ast_expr) |src_expr| {
                     return inferArrayElemType(ctx, src_expr);
@@ -680,9 +696,35 @@ pub fn inferTypeNameFromExprComplete(
         .propagate => |p| {
             return inferThrowOkTypeName(ctx, p.expr);
         },
+        .field_access => {
+            // 模块级常量引用：std.time.SystemTime.UNIX_EPOCH → 查全局变量绑定
+            if (buildDottedPath(ctx.base.arena, expr)) |path| {
+                if (ctx.lookupVar(path)) |binding| {
+                    if (binding.type_annotation) |tn| {
+                        return type_resolver.typeNameFromNode(tn);
+                    }
+                    if (binding.ast_expr) |var_expr| {
+                        return inferTypeNameFromExprComplete(ctx, var_expr);
+                    }
+                }
+            }
+        },
         else => {},
     }
     return null;
+}
+
+/// 递归构建 field_access 链的点分路径（如 "std.time.SystemTime.UNIX_EPOCH"）
+/// 用于模块级常量的变量查找。非 field_access/identifier 表达式返回 null。
+fn buildDottedPath(allocator: std.mem.Allocator, expr: *const ast.Expr) ?[]const u8 {
+    return switch (expr.*) {
+        .identifier => |id| id.name,
+        .field_access => |fa| {
+            const base = buildDottedPath(allocator, fa.object) orelse return null;
+            return std.fmt.allocPrint(allocator, "{s}.{s}", .{ base, fa.field }) catch null;
+        },
+        else => null,
+    };
 }
 
 /// 从表达式推断 Trait 类型名（完整版）

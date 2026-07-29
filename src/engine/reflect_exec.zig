@@ -32,7 +32,7 @@ pub const Methods = struct {
     /// builtin_reflect：运行时值反射，构造 Reflect RecordValue
     ///
     /// inputs[0] = 值通道，meta_index = type_id
-    /// output = ref_chan（Reflect RecordValue 指针）
+    /// output = 通道（Reflect RecordValue 指针）
     ///
     /// Reflect RecordValue 5 字段：
     ///   0=type_name (str), 1=kind (str), 2=field_count (usize)
@@ -43,7 +43,14 @@ pub const Methods = struct {
         const meta_idx = node.meta_index;
         var target_value = self.chanToValue(val_chan);
 
-        // chanToValue 已通过 ref_ops.read 处理 ref_chan（堆对象/null/标量位模式），
+        // LazyValue 自动强制求值：reflect 需要实际值而非 Lazy 包装。
+        // chanToValue 不强制 LazyValue（仅 readScalarValue 做），此处显式处理。
+        if (target_value == .ref and target_value.ref.type_tag == .lazy_val) {
+            const lazy: *value.LazyValue = @alignCast(@fieldParentPtr("header", target_value.ref));
+            target_value = try self.forceLazyValue(lazy);
+        }
+
+        // chanToValue 已通过 ref_ops.read 处理 通道（堆对象/null/标量位模式），
         // target_value 已是带类型信息的 Value，无需额外解箱。
 
         // 解析 meta_idx：可能是具体 type_id 或泛型参数引用 0x8000|param_idx
@@ -54,7 +61,7 @@ pub const Methods = struct {
             type_id = if (param_idx < type_args.len) type_args[param_idx] else 0;
         }
 
-        // 泛型 ref_chan 中的标量值类型恢复
+        // 泛型 通道 中的标量值类型恢复
         // 标量通过 ref_of 装箱为 Cell，readRef 返回 Value.fromRef(cell_header)。
         // 反射需解包 Cell 提取内部标量 Value，否则 __scalar_to_str 看到 .ref 而非标量。
         if (target_value == .ref and target_value.ref.type_tag == .cell) {
@@ -116,7 +123,7 @@ pub const Methods = struct {
         const field_ref_bits: u64 = if (target_value.isBoxed()) 0b1000 else 0;
         const rec = value.Value.makeRecordEx(tctx, "Reflect", &fields, field_ref_bits) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(rec.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(rec.asRef())));
     }
 
     /// 根据 TypeMetadata 和目标值计算 field_count
@@ -235,8 +242,8 @@ pub const Methods = struct {
     }
 
     /// 将 field_value 结果写入输出通道。
-    /// 标量值写入 ref_chan 时按位模式存储（类型信息由后续 reflect/format 通过
-    /// chanToValue 的标量引用路径恢复，或通过标量通道单态化避免 ref_chan 中转）。
+    /// 标量值写入 通道 时按位模式存储（类型信息由后续 reflect/format 通过
+    /// chanToValue 的标量引用路径恢复，或通过标量通道单态化避免 通道 中转）。
     /// 引用类型（.ref）直接写指针，零宽值（unit/null）按原逻辑写。
     pub fn writeFieldResult(self: *Engine, out_chan: u16, v: value.Value) EngineError!void {
         self.valueToChan(out_chan, v);
@@ -300,9 +307,9 @@ pub const Methods = struct {
 
     /// builtin_scalar_to_str：标量转字符串
     ///
-    /// inputs[0] = Reflect 对象通道（ref_chan → RecordValue），
+    /// inputs[0] = Reflect 对象通道（通道 → RecordValue），
     /// 从 fields[3]（__target）读取原始标量 Value 并格式化。
-    /// 直接从 Reflect 读取避免标量通过 ref_chan 中转时位模式被误判为指针。
+    /// 直接从 Reflect 读取避免标量通过 通道 中转时位模式被误判为指针。
     pub fn execBuiltinScalarToStr(self: *Engine, node: *const Node) EngineError!void {
         const tctx = self.tctx.?;
         const reflect_chan = node.inputs[0];
@@ -311,13 +318,13 @@ pub const Methods = struct {
         const reflect_rec = self.readRecord(reflect_chan) orelse {
             const fallback = value.Str.createContiguous(tctx, "<null>") catch return error.OutOfMemory;
             try self.trackObj(&fallback.header);
-            self.runtime.writePtr(node.output, @ptrCast(&fallback.header));
+            _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&fallback.header)));
             return;
         };
         if (reflect_rec.fields.len < 5) {
             const fallback = value.Str.createContiguous(tctx, "<null>") catch return error.OutOfMemory;
             try self.trackObj(&fallback.header);
-            self.runtime.writePtr(node.output, @ptrCast(&fallback.header));
+            _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&fallback.header)));
             return;
         }
         const v = reflect_rec.fields[3];
@@ -408,7 +415,7 @@ pub const Methods = struct {
 
         const new_str = value.Str.createContiguous(tctx, slice) catch return error.OutOfMemory;
         try self.trackObj(&new_str.header);
-        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&new_str.header)));
     }
 
     /// builtin_reflect_deref：返回 Reflect.__target
@@ -501,7 +508,7 @@ pub const Methods = struct {
 
         const new_str = value.Str.createContiguous(tctx, name) catch return error.OutOfMemory;
         try self.trackObj(&new_str.header);
-        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&new_str.header)));
     }
 
     /// 辅助：发射空字符串到输出通道
@@ -509,7 +516,7 @@ pub const Methods = struct {
         const tctx = self.tctx.?;
         const new_str = value.Str.createContiguous(tctx, "") catch return;
         self.trackObj(&new_str.header) catch return;
-        self.runtime.writePtr(node.output, @ptrCast(&new_str.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&new_str.header)));
     }
 
     /// 反射字段名归一化：位置参数占位符（`_0`、`_1` 等）返回空字符串，
@@ -527,7 +534,7 @@ pub const Methods = struct {
     ///
     /// inputs[0] = Reflect 通道，meta_index = 字段索引
     /// 0=type_name(str), 1=kind(str), 2=field_count(usize)
-    /// output = ref_chan（str）或 usize_chan（field_count）
+    /// output = 通道（str）或 usize_chan（field_count）
     pub fn execBuiltinReflectMeta(self: *Engine, node: *const Node) EngineError!void {
         const reflect_chan = node.inputs[0];
         const field_idx: usize = node.meta_index;

@@ -54,7 +54,7 @@ fun buildStudents(n: i32): Student[] {
     var i: i32 = 0
     while i < n {
         val s = Student("s" + cast(i).to(str), cast(i % 100).to(i64), 18 + (i % 5))
-        arr = arr.push(s)
+        arr = arr ++ [s]
         i = i + 1
     }
     arr

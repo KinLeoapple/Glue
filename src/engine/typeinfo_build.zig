@@ -102,7 +102,7 @@ pub const Methods = struct {
     pub fn emitNullableTypeInfo(self: *Engine, node: *const Node, inner_value: value.Value, tctx: *ThreadContext) EngineError!void {
         _ = tctx;
         const rv = try self.makeNullableTypeInfoValue(inner_value);
-        self.runtime.writePtr(node.output, @ptrCast(rv.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(rv.asRef())));
     }
 
     /// 构造占位 TypeInfo Value（不写入通道，返回 Value）
@@ -135,7 +135,7 @@ pub const Methods = struct {
             self.current_type_args;
     }
 
-    /// 获取父帧的 type_args（用于 call/spawn 边界解析泛型参数引用）
+    /// 获取父帧的 type_args（用于 call/async 边界解析泛型参数引用）
     /// sync 路径：frame_stack 栈顶是当前调用者（enterFunction 之前）
     /// 协程路径：current_type_args 是当前协程帧
     pub fn parentTypeArgs(self: *const Engine) []const u16 {
@@ -200,7 +200,7 @@ pub const Methods = struct {
         try self.trackRefFields(&placeholder_fields);
         const rec = value.Value.makeRecord(tctx, "TypeInfo", &placeholder_fields) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(rec.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(rec.asRef())));
     }
 
     /// 构造完整 TypeInfo RecordValue（7 顶层字段，完整嵌套结构）
@@ -225,7 +225,7 @@ pub const Methods = struct {
         try self.trackRefFields(&field_buf);
         const rec = value.Value.makeRecord(tctx, "TypeInfo", &field_buf) catch return error.OutOfMemory;
         try self.trackObj(rec.asRef());
-        self.runtime.writePtr(node.output, @ptrCast(rec.asRef()));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(rec.asRef())));
     }
 
     /// 构造 LayoutInfo RecordValue：(size, alignment)

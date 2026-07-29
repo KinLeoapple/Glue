@@ -61,6 +61,7 @@ pub const ConcreteType = union(enum) {
     },
     record_type: struct {
         fields: []FieldType,
+        name: ?[]const u8 = null,
     },
     adt_type: struct {
         name: []const u8,

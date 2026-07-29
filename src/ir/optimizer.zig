@@ -321,6 +321,22 @@ fn deadNodeElim(ir: *GlueIR) bool {
                 if (ch > max) max = ch;
             }
         }
+        // 溢出参数通道（extra_args/extra_upvalues）也需纳入位图范围
+        for (ir.call_metas) |cm| {
+            for (cm.extra_args) |ch| {
+                if (ch > max) max = ch;
+            }
+        }
+        for (ir.orbit_metas) |om| {
+            for (om.extra_args) |ch| {
+                if (ch > max) max = ch;
+            }
+        }
+        for (ir.closure_metas) |cm| {
+            for (cm.extra_upvalues) |ch| {
+                if (ch > max) max = ch;
+            }
+        }
         break :blk max + 1;
     };
 
@@ -369,6 +385,22 @@ fn deadNodeElim(ir: *GlueIR) bool {
             if (ch < max_chan) referenced[ch] = true;
         }
     }
+    // call/orbit/closure 的溢出参数通道（extra_args/extra_upvalues）间接引用，必须标记
+    for (ir.call_metas) |cm| {
+        for (cm.extra_args) |ch| {
+            if (ch < max_chan) referenced[ch] = true;
+        }
+    }
+    for (ir.orbit_metas) |om| {
+        for (om.extra_args) |ch| {
+            if (ch < max_chan) referenced[ch] = true;
+        }
+    }
+    for (ir.closure_metas) |cm| {
+        for (cm.extra_upvalues) |ch| {
+            if (ch < max_chan) referenced[ch] = true;
+        }
+    }
 
     // 标记死节点（用无效 op 标记，后续压缩）
     var changed = false;
@@ -393,9 +425,7 @@ fn hasSideEffect(op: NodeOp) bool {
     return switch (op) {
         .halt_return, .halt_throw, .halt_panic,
         .halt_break, .halt_continue,
-        .call, .store, .array_set, .array_push, .record_set,
-        // array_pop / array_drop_last 修改原数组（与 array_push 对称），不可消除
-        .array_pop, .array_drop_last,
+        .call, .store, .array_set, .record_set,
         .cleanup_register, .cleanup_run,
         .orbit_async_create, .orbit_async_join,
         .orbit_chan_send, .orbit_chan_recv, .orbit_chan_try_recv,

@@ -595,7 +595,7 @@ pub const Parser = struct {
                 _ = self.expect(.r_paren, "expected ')' after trait list") catch {};
             }
             for (implemented_traits.items) |trait_bound| {
-                if (std.mem.eql(u8, trait_bound.trait_name, "Error")) {
+                if (std.mem.eql(u8, trait_bound.trait_name, "Err")) {
                     has_error_trait = true;
                     break;
                 }
@@ -948,7 +948,7 @@ pub const Parser = struct {
         var params = std.ArrayList(ast.Param).empty;
         _ = self.expect(.l_paren, "expected '('") catch {};
         if (!self.check(.r_paren)) {
-            try self.parseParamList(&params);
+            try self.parseMethodParamList(&params);
         }
         _ = self.expect(.r_paren, "expected ')'") catch {};
         var return_type: ?*ast.TypeNode = null;
@@ -1163,6 +1163,33 @@ pub const Parser = struct {
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             type_annotation = try self.parseType();
+        }
+        return ast.Param{
+            .location = tokenLoc(name_tok),
+            .name = name_tok.lexeme,
+            .type_annotation = type_annotation,
+        };
+    }
+
+    /// 解析方法参数列表：与普通 parseParamList 相同，但名为 "self" 且无类型注解的参数
+    /// 自动补上 .self_type 类型注解。这样 trait 默认方法的 self 参数走与泛型 T 相同的
+    /// 类型解析路径（type_resolver 查 type_args 中的 "Self" 绑定）。
+    fn parseMethodParamList(self: *Parser, params: *std.ArrayList(ast.Param)) ParserError!void {
+        try params.append(self.arena.allocator(), try self.parseMethodParam());
+        while (self.matchToken(.comma)) {
+            if (self.check(.r_paren)) break;
+            try params.append(self.arena.allocator(), try self.parseMethodParam());
+        }
+    }
+
+    fn parseMethodParam(self: *Parser) ParserError!ast.Param {
+        const name_tok = try self.expect(.identifier, "expected parameter name");
+        var type_annotation: ?*ast.TypeNode = null;
+        if (self.matchToken(.colon)) {
+            type_annotation = try self.parseType();
+        } else if (std.mem.eql(u8, name_tok.lexeme, "self")) {
+            // self 参数无类型注解：补上 .self_type，使类型解析走与泛型 T 相同的路径
+            type_annotation = try self.allocType(tokenLoc(name_tok), ast.TypeNode{ .self_type = .{} });
         }
         return ast.Param{
             .location = tokenLoc(name_tok),
@@ -1849,16 +1876,14 @@ pub const Parser = struct {
         if (self.matchToken(.kw_lazy)) {
             return self.parseLazyExpr();
         }
-        if (self.matchToken(.kw_spawn)) {
-            return self.parseSpawnExpr();
-        }
         if (self.matchToken(.kw_atomic)) {
             return self.parseAtomicExpr();
         }
         if (self.matchToken(.kw_select)) {
             return self.parseSelectExpr();
         }
-        if (self.matchToken(.kw_cast)) {
+        if (self.checkIdentifier("cast")) {
+            _ = self.advance();
             return self.parseCastBuilder();
         }
         if (self.check(.kw_trait)) {
@@ -2313,17 +2338,6 @@ pub const Parser = struct {
         const expr = try self.parseExpr();
         return self.allocExpr(tokenLoc(lazy_tok), ast.Expr{
             .lazy = .{
-                .expr = expr,
-            },
-        });
-    }
-
-    /// 解析 spawn 表达式：spawn expr（创建异步任务，不自动 await）
-    fn parseSpawnExpr(self: *Parser) ParserError!*ast.Expr {
-        const spawn_tok = self.previous();
-        const expr = try self.parseExpr();
-        return self.allocExpr(tokenLoc(spawn_tok), ast.Expr{
-            .spawn_expr = .{
                 .expr = expr,
             },
         });

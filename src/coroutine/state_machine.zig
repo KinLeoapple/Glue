@@ -78,6 +78,9 @@ pub const SegmentContext = struct {
     read_value: *const fn (ctx: *anyopaque, chan_idx: u16) Value,
     write_value: *const fn (ctx: *anyopaque, chan_idx: u16, val: Value) void,
     install_frame: *const fn (ctx: *anyopaque, frame: *CoroutineFrame) void,
+    /// 检查节点是否在 body_skip 区域内（route_dispatch/vec_map 等的 arm body）。
+    /// runSegment 跳过这些节点，由对应的 exec 函数（如 execRouteDispatch）按需执行。
+    skip_node: *const fn (ctx: *anyopaque, node_idx: u32) bool,
 };
 
 /// 执行状态机段：驱动 IR 节点子序列。
@@ -98,11 +101,16 @@ pub fn runSegment(
     sctx: SegmentContext,
     registry: *SuspendRegistry,
 ) SegmentError!SegmentResult {
-    // 捕获 halt_return 的返回通道索引（exec_node 返回非 null 时记录）
-    var halt_ret_chan: ?u16 = null;
-
-    var i = seg.start_node;
+    // 段内恢复点：唤醒后从 resume_node 继续，跳过已执行的前缀（避免段前缀重执行 Bug 12）
+    // resume_node = 0 表示首次执行，从段头开始
+    var i = if (frame.resume_node != 0) frame.resume_node else seg.start_node;
+    // 进入循环前清除 resume_node（段内执行中若再次挂起会重新设置）
+    frame.resume_node = 0;
     while (i <= seg.end_node and i < nodes.len) : (i += 1) {
+        // 跳过 body_skip 区域内的子图节点（route_dispatch/vec_map 等的 arm body）。
+        // 这些节点由对应的 exec 函数（如 execRouteDispatch）按需执行，
+        // 段执行不能遍历它们，否则会执行非激活分支导致提前 halt_return。
+        if (sctx.skip_node(sctx.ctx, i)) continue;
         const node = &nodes[i];
         switch (node.op) {
             // ── orbit 挂起节点：try-first ──
@@ -114,12 +122,23 @@ pub fn runSegment(
                 if (chan.tryRecv()) |val| {
                     // try-first 成功：写值到 output，继续段内下一节点
                     sctx.write_value(sctx.ctx, node.output, val);
+                    // Bug 3 fix: 通知等待发送的协程（通道腾出空间）
+                    registry.wakeChanSend(chan);
                 } else {
-                    // try-first 失败：注册挂起，让出
-                    frame.suspend_target = .{ .chan_recv = @ptrCast(chan) };
-                    frame.setStatus(.suspended);
+                    // Bug 7 fix: register FIRST (while still .running), then double-check.
+                    // 避免 setStatus(.suspended) 在 register 之前导致的丢失唤醒。
                     registry.registerChanRecv(chan, frame);
-                    return .suspend_;
+                    if (chan.tryRecv()) |val| {
+                        // 注册后再次检查：若在 register 与 tryRecv 之间有发送方写入，立即消费
+                        registry.remove(frame);
+                        sctx.write_value(sctx.ctx, node.output, val);
+                        registry.wakeChanSend(chan);
+                    } else {
+                        frame.suspend_target = .{ .chan_recv = @ptrCast(chan) };
+                        frame.resume_node = i; // 唤醒后重新执行 recv 节点（tryRecv 重试 + write_value）
+                        frame.setStatus(.suspended);
+                        return .suspend_;
+                    }
                 }
             },
             .orbit_chan_send => {
@@ -130,12 +149,20 @@ pub fn runSegment(
                 const val = sctx.read_value(sctx.ctx, node.inputs[1]);
                 if (chan.trySend(val)) {
                     // try-first 成功：继续段内下一节点
+                    // Bug 3 fix: 通知等待接收的协程（通道有数据可读）
+                    registry.wakeChanRecv(chan);
                 } else {
-                    // try-first 失败：注册挂起，让出
-                    frame.suspend_target = .{ .chan_send = @ptrCast(chan) };
-                    frame.setStatus(.suspended);
+                    // Bug 7 fix: register FIRST, then double-check
                     registry.registerChanSend(chan, frame);
-                    return .suspend_;
+                    if (chan.trySend(val)) {
+                        registry.remove(frame);
+                        registry.wakeChanRecv(chan);
+                    } else {
+                        frame.suspend_target = .{ .chan_send = @ptrCast(chan) };
+                        frame.resume_node = i + 1; // 唤醒后从 send 之后继续
+                        frame.setStatus(.suspended);
+                        return .suspend_;
+                    }
                 }
             },
             .orbit_async_join => {
@@ -152,35 +179,41 @@ pub fn runSegment(
                         sctx.write_value(sctx.ctx, node.output, Value.fromUnit());
                     }
                 } else {
-                    // try-first 失败：注册挂起，让出
-                    frame.suspend_target = .{ .async_join = @ptrCast(handle) };
-                    frame.setStatus(.suspended);
+                    // Bug 7 fix: register FIRST, then double-check
                     registry.registerAsyncJoin(handle, frame);
-                    return .suspend_;
+                    if (handle.isFinished()) {
+                        registry.remove(frame);
+                        if (handle.join()) |result| {
+                            sctx.write_value(sctx.ctx, node.output, result);
+                        } else {
+                            sctx.write_value(sctx.ctx, node.output, Value.fromUnit());
+                        }
+                    } else {
+                        frame.suspend_target = .{ .async_join = @ptrCast(handle) };
+                        frame.resume_node = i; // 唤醒后重新执行 join 节点（isFinished 重试 + write_value）
+                        frame.setStatus(.suspended);
+                        return .suspend_;
+                    }
                 }
             },
             // ── 非 orbit 节点：委托 Engine.exec_node ──
             else => {
                 const ret = try sctx.exec_node(sctx.ctx, node);
                 if (ret) |chan| {
-                    halt_ret_chan = chan;
+                    // halt_return/halt_throw：立即终止段执行，设置 frame.result 并返回 complete。
+                    // 不能继续执行段内后续节点（会覆盖返回值），也不能 advance 到下一段。
+                    frame.result = sctx.read_value(sctx.ctx, chan);
+                    return .complete;
                 }
             },
         }
     }
 
-    // 段内所有节点执行完毕，根据 suspend_kind 决定段末动作
+    // 段内所有节点执行完毕（未遇到 halt），根据 suspend_kind 决定段末动作
     const r: SegmentResult = switch (seg.suspend_kind) {
         .none => .advance,
         .chan_recv, .chan_send, .async_join => .advance,
-        .terminal => blk: {
-            // 终态段完成：从返回通道读取结果值到 frame.result
-            if (halt_ret_chan) |chan| {
-                frame.result = sctx.read_value(sctx.ctx, chan);
-            } else {
-            }
-            break :blk .complete;
-        },
+        .terminal => .complete,
     };
     return r;
 }

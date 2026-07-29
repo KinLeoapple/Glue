@@ -52,7 +52,8 @@ pub const Methods = struct {
         if (self.call_depth >= MAX_CALL_DEPTH) return error.CallDepthExceeded;
 
         const callee_func = self.ir.functions[call_meta.func_index];
-        const args = node.inputs[0..call_meta.arg_count];
+        var args_buf: [16]u16 = undefined;
+        const args = ir_mod.buildNodeArgs(node, call_meta.extra_args, 0, call_meta.arg_count, &args_buf);
 
         // Memoization 快速路径：递归纯函数 + 标量/nullable<标量> 参数 + 非尾调用
         // 命中则直接复制结果，跳过整个函数执行（O(1) 替代 O(递归深度)）
@@ -104,18 +105,18 @@ pub const Methods = struct {
         const src_is_nullable = self.runtime.isNullable(arg_chan);
         const dst_is_nullable = self.runtime.isNullable(dst_chan);
         if (src_is_ref and dst_is_ref) {
-            _ = self.runtime.readPtr(arg_chan);
+            _ = self.runtime.readChannel(arg_chan);
         }
 
         // ref_chan → 标量通道：可能是 Lazy<T> 强制求值或标量值解码
         if (src_is_ref and !dst_is_ref and !dst_is_nullable) {
             // 先尝试作为堆对象读取（处理 Lazy<T> 强制求值）
-            if (self.readRefObj(arg_chan)) |_| {
+            if ((self.runtime.readChannel(arg_chan) orelse value.Value.fromNull()) == .ref) {
                 const v = try self.readScalarValue(arg_chan);
                 self.writeScalarValue(dst_chan, v);
                 return;
             }
-            // readRefObj 失败：ref_chan 持有标量位模式，按目标类型解码
+            // 读取结果非 .ref：通道持有标量位模式，按目标类型解码
             try self.copyCrossType(dst_chan, arg_chan);
             return;
         }
@@ -229,9 +230,9 @@ pub const Methods = struct {
             var saved_arg_values: [16]value.Value = undefined;
             for (args, 0..) |arg_chan, i| {
                 const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
-                if (!is_ref and self.runtime.isRef(arg_chan) and self.readRefObj(arg_chan) != null) {
-                    const v = self.chanToValue(arg_chan);
-                    saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                if (!is_ref and self.runtime.isRef(arg_chan) and (self.runtime.readChannel(arg_chan) orelse value.Value.fromNull()) == .ref) {
+                    const arg_v = self.chanToValue(arg_chan);
+                    saved_arg_values[i] = arg_v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                     try self.trackValueTree(saved_arg_values[i]);
                 } else {
                     saved_arg_values[i] = self.chanToValue(arg_chan);
@@ -299,9 +300,9 @@ pub const Methods = struct {
 
         // 读取 Closure / PartialApplication 值
         const closure_chan = node.inputs[0];
-        const raw_ptr = self.runtime.readPtr(closure_chan);
-        const ptr = raw_ptr orelse return error.InvalidChannel;
-        const header: *value.obj_header.ObjHeader = @ptrCast(@alignCast(ptr));
+        const v = self.runtime.readChannel(closure_chan) orelse return error.InvalidChannel;
+        if (v != .ref) return error.InvalidChannel;
+        const header: *value.obj_header.ObjHeader = v.ref;
         const is_partial = header.type_tag == .partial;
         if (header.type_tag != .closure and !is_partial) return error.InvalidChannel;
 
@@ -352,7 +353,8 @@ pub const Methods = struct {
 
         // 实际参数数量 = call_meta.arg_count - 1（减去 closure_chan）
         const arg_count = @as(usize, call_meta.arg_count) - 1;
-        const args = node.inputs[1 .. 1 + arg_count];
+        var args_buf: [16]u16 = undefined;
+        const args = ir_mod.buildNodeArgs(node, call_meta.extra_args, 1, arg_count, &args_buf);
 
         // SCC 问题：自递归 closure 调用时，enterFunction 覆盖实参通道的 chan_ptrs。
         // 自递归检测：func_idx == current_func_idx
@@ -363,9 +365,9 @@ pub const Methods = struct {
             var saved_arg_values: [16]value.Value = undefined;
             for (args, 0..) |arg_chan, i| {
                 const is_ref = ((call_meta.arg_ref_bits >> @intCast(i)) & 1) != 0;
-                if (!is_ref and self.runtime.isRef(arg_chan) and self.readRefObj(arg_chan) != null) {
-                    const v = self.chanToValue(arg_chan);
-                    saved_arg_values[i] = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+                if (!is_ref and self.runtime.isRef(arg_chan) and (self.runtime.readChannel(arg_chan) orelse value.Value.fromNull()) == .ref) {
+                    const arg_v = self.chanToValue(arg_chan);
+                    saved_arg_values[i] = arg_v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
                     try self.trackValueTree(saved_arg_values[i]);
                 } else {
                     saved_arg_values[i] = self.chanToValue(arg_chan);

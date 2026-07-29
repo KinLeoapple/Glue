@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const ast = @import("ast");
-const glue_builtin = @import("glue_builtin");
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");
 const channel_mod = @import("channel.zig");
@@ -28,7 +27,6 @@ const FieldMeta = meta_mod.FieldMeta;
 const ConstructorMeta = meta_mod.ConstructorMeta;
 const TypeParamMeta = meta_mod.TypeParamMeta;
 const MethodMeta = meta_mod.MethodMeta;
-const CtorDefInfo = sema_output_mod.CtorDefInfo;
 const TraitMethodSig = sema_output_mod.TraitMethodSig;
 
 pub const Methods = struct {
@@ -466,95 +464,6 @@ pub const Methods = struct {
         const sr = self.sema_result;
         const packed_idx = sr.ctor_def_index.get(ctor_name) orelse return null;
         return packed_idx & 0xFFFF;
-    }
-
-    /// 注册 builtin error_newtype 构造器（决策 #18/#23）
-    ///
-    /// 从 glue_builtin.BUILTIN_TYPES 元信息表读取所有 builtin error_newtype 类型定义，
-    /// 注册到 sema_result / field_id_map，使代码生成阶段能像用户自定义
-    /// error_newtype 一样处理 CastError 等类型。
-    ///
-    /// 字段命名规则与用户自定义 error_newtype 一致：
-    ///   - _<idx>（位置参数别名，field_id = idx + 1）
-    ///   - __tag（field_id = 0）
-    ///   - 用户源码字段名（field_id 同 _<idx>，便于 record_get 按名查询）
-    pub fn registerBuiltinErrorTypes(self: *IRBuilder, arena_alloc: std.mem.Allocator) !void {
-        const sr = self.sema_result;
-        inline for (glue_builtin.BUILTIN_TYPES) |bt| {
-            // 已由 sema 注册的类型跳过（sema 接入时 builtin 类型可能已注册）
-            if (sr.getTypeDef(bt.name) != null) {
-                // 仍需注册 field_id_map（sema 不负责 field_id_map）
-                switch (bt.kind) {
-                    .error_newtype => {
-                        for (bt.fields, 0..) |f, fi| {
-                            const fname = try std.fmt.allocPrint(arena_alloc, "_{d}", .{fi});
-                            self.registerFieldId(bt.name, fname, @intCast(fi + 1));
-                            self.registerFieldId(bt.name, f.name, @intCast(fi + 1));
-                        }
-                        self.registerFieldId(bt.name, "__tag", 0);
-                    },
-                    .adt => {
-                        self.registerFieldId(bt.name, "__tag", 0);
-                    },
-                    .trait => {},
-                }
-            } else {
-                switch (bt.kind) {
-                    .error_newtype => {
-                        // 构造器字段（位置参数别名 _0/_1/...）
-                        const field_names = try arena_alloc.alloc(?[]const u8, bt.fields.len);
-                        const field_type_descs = try arena_alloc.alloc(*const TypeDescriptor, bt.fields.len);
-                        const field_type_names = try arena_alloc.alloc(?[]const u8, bt.fields.len);
-                        for (bt.fields, 0..) |f, fi| {
-                            const fname = try std.fmt.allocPrint(arena_alloc, "_{d}", .{fi});
-                            field_names[fi] = fname;
-                            field_type_descs[fi] = self.chanTypeFromTypeName(f.type_name);
-                            field_type_names[fi] = f.type_name;
-                            // 位置别名 field_id = fi + 1（与 error_newtype 一致，0 是 __tag）
-                            self.registerFieldId(bt.name, fname, @intCast(fi + 1));
-                            // 用户源码字段名作为同义 field_id（便于 record_get(type, "msg") 查询）
-                            self.registerFieldId(bt.name, f.name, @intCast(fi + 1));
-                        }
-                        self.registerFieldId(bt.name, "__tag", 0);
-                        const ctors = try arena_alloc.alloc(CtorDefInfo, 1);
-                        ctors[0] = .{
-                            .name = bt.constructor_name,
-                            .type_name = bt.name,
-                            .field_names = field_names,
-                            .field_type_descs = field_type_descs,
-                            .field_type_names = field_type_names,
-                        };
-                        try sr.putTypeDef(.{
-                            .name = bt.name,
-                            .kind = .error_newtype,
-                            .constructors = ctors,
-                            .type_params = &.{},
-                        });
-                    },
-                    .adt => {
-                        // 关联 ADT（如 IOErrorKind / TimeErrorKind）：注册所有 unit constructor
-                        const ctors = try arena_alloc.alloc(CtorDefInfo, bt.constructors.len);
-                        for (bt.constructors, 0..) |con, i| {
-                            ctors[i] = .{
-                                .name = con,
-                                .type_name = bt.name,
-                                .field_names = &.{},
-                                .field_type_descs = &.{},
-                                .field_type_names = &.{},
-                            };
-                        }
-                        self.registerFieldId(bt.name, "__tag", 0);
-                        try sr.putTypeDef(.{
-                            .name = bt.name,
-                            .kind = .adt,
-                            .constructors = ctors,
-                            .type_params = &.{},
-                        });
-                    },
-                    .trait => {},
-                }
-            }
-        }
     }
 
     /// 收集类型元数据（typeof 反射机制）

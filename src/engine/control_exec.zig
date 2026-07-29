@@ -122,14 +122,6 @@ pub const Methods = struct {
         const val_chan = node.inputs[0];
         // 读取值并构造 ThrowValue{ .ok = value }
         const v = try self.readScalarValue(val_chan);
-        const vn = @tagName(v);
-        std.debug.print("DEBUG gate_make_ok: val_chan={d} variant={s}\n", .{ val_chan, vn });
-        if (v == .ref) {
-            std.debug.print("  ref type_tag={s}\n", .{@tagName(v.ref.type_tag)});
-        } else if (v == .i64) {
-            const iv: i64 = @bitCast(v.i64);
-            std.debug.print("  i64 value={d}\n", .{iv});
-        }
         const throw_v = value.Value.makeThrow(self.tctx.?, .{ .ok = v }) catch return error.OutOfMemory;
         _ = v.retain(self.tctx.?);
         try self.trackObj(throw_v.asRef());
@@ -150,10 +142,10 @@ pub const Methods = struct {
 
         const rec_ptr: *value.RecordValue = switch (header.type_tag) {
             .str => blk: {
-                // 字符串输入：构造 Error(msg) RecordValue
+                // 字符串输入：构造 Error(msg) RecordValue（含 __tag at index 0）
                 const msg_val = v;
-                var fields: [1]value.Value = .{msg_val};
-                const field_names: [1]?[]const u8 = .{"msg"};
+                var fields: [2]value.Value = .{ value.Value.fromI64(0), msg_val };
+                const field_names: [2]?[]const u8 = .{ "__tag", "msg" };
                 const rec_val = value.Value.makeRecordWithNames(self.tctx.?, "Error", &fields, &field_names) catch return error.OutOfMemory;
                 _ = value.obj_header.retain(header, self.tctx.?); // record 窃取 msg 引用，需 retain
                 try self.trackObj(rec_val.asRef());

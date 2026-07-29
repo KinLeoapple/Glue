@@ -1394,6 +1394,20 @@ pub const TypeInferencer = struct {
                 var inner_td: ?*const type_descriptor.TypeDescriptor = null;
                 if (resolved_ty.* == .nullable_type) {
                     inner_td = semaTypeToTypeDesc(resolved_ty.nullable_type, sr);
+                } else if (resolved_ty.* == .generic_type) {
+                    // 内置泛型容器：Lazy<T>/Channel<T>/Atomic<T>/Async<T>
+                    // 提取 T 存入 inner_type_desc，供 IR 侧 emitLazyForce/recv 等
+                    // 直接从 ExprInfo 读取元素类型，消除硬编码
+                    const gt = resolved_ty.generic_type;
+                    if (gt.args.len == 1) {
+                        if (std.mem.eql(u8, gt.name, "Lazy") or
+                            std.mem.eql(u8, gt.name, "Channel") or
+                            std.mem.eql(u8, gt.name, "Atomic") or
+                            std.mem.eql(u8, gt.name, "Async"))
+                        {
+                            inner_td = semaTypeToTypeDesc(gt.args[0], sr);
+                        }
+                    }
                 }
                 const is_ref = switch (resolved_ty.*) {
                     .ref_type => true,
@@ -2043,6 +2057,63 @@ pub const TypeInferencer = struct {
                 }
             },
             .method_call => |mc| {
+                // .iter() on array → Iter<T>
+                // sema 记录返回类型 Iter<T>（adt_type，由 builtin/iter/Iter.glue 定义），
+                // 供 IR 侧 .next() 方法分派查找 "Iter" 类型名
+                if (std.mem.eql(u8, mc.method, "iter") and mc.arguments.len == 0) {
+                    const obj_ty = self.inferExpr(mc.object, env, null) catch {
+                        return try trait_resolve.inferMethodCall(self, expr, mc, env);
+                    };
+                    const resolved = self.resolve(obj_ty);
+                    if (resolved.* == .array_type) {
+                        const elem_ty = resolved.array_type.element_type;
+                        const iter_args = self.arena.allocator().alloc(*Type, 1) catch return error.OutOfMemory;
+                        iter_args[0] = elem_ty;
+                        return self.makeAdtType("Iter", iter_args) catch return error.OutOfMemory;
+                    }
+                    // 非数组（如字符串）走 trait_resolve 回退
+                }
+                // Channel<T> built-in methods: recv/tryRecv/send
+                // sema 从 Channel<T> 提取元素类型 T，记录到 method_call 的 ExprInfo，
+                // 供 IR 侧 recv/tryRecv 直接查询，消除 current_returns_throw 启发式
+                if (std.mem.eql(u8, mc.method, "recv") or
+                    std.mem.eql(u8, mc.method, "tryRecv") or
+                    std.mem.eql(u8, mc.method, "send"))
+                {
+                    const obj_ty = self.inferExpr(mc.object, env, null) catch {
+                        const result_ty = try trait_resolve.inferMethodCall(self, expr, mc, env);
+                        for (mc.arguments) |arg| {
+                            _ = self.inferExpr(arg, env, null) catch {};
+                        }
+                        return result_ty;
+                    };
+                    const resolved_obj = self.resolve(obj_ty);
+                    if (resolved_obj.* == .generic_type) {
+                        const gt = resolved_obj.generic_type;
+                        if (gt.args.len == 1 and std.mem.eql(u8, gt.name, "Channel")) {
+                            const elem_ty = gt.args[0];
+                            for (mc.arguments) |arg| {
+                                _ = self.inferExpr(arg, env, null) catch {};
+                            }
+                            if (std.mem.eql(u8, mc.method, "send")) {
+                                // Unify T with argument type to resolve element type
+                                if (mc.arguments.len == 1) {
+                                    const arg_ty = self.inferExpr(mc.arguments[0], env, null) catch null;
+                                    if (arg_ty) |at| {
+                                        self.unify(elem_ty, at) catch {};
+                                    }
+                                }
+                                return self.makeType(.unit_type) catch unreachable;
+                            }
+                            if (std.mem.eql(u8, mc.method, "recv")) {
+                                return elem_ty;
+                            }
+                            if (std.mem.eql(u8, mc.method, "tryRecv")) {
+                                return try self.makeNullableType(elem_ty);
+                            }
+                        }
+                    }
+                }
                 const result_ty = try trait_resolve.inferMethodCall(self, expr, mc, env);
                 // Type-check arguments so their types are recorded in sema_result.
                 // inferMethodCall only resolves the return type; it does not infer argument types.
@@ -2258,16 +2329,10 @@ pub const TypeInferencer = struct {
                 return result_ty orelse try self.freshTypeVar();
             },
             .lazy => |lz| {
-                _ = self.inferExpr(lz.expr, env, null) catch {};
-                return self.freshTypeVar();
+                const inner_ty = self.inferExpr(lz.expr, env, null) catch try self.freshTypeVar();
+                return self.makeGenericType("Lazy", &[_]*Type{inner_ty}) catch error.OutOfMemory;
             },
             .inline_trait_value => {
-                return self.freshTypeVar();
-            },
-            .spawn_expr => |sp| {
-                // spawn 返回 Channel<T>，元素类型由派生表达式推断。
-                // sema 侧退化为 fresh type var（不阻塞图构建），实际通道类型由 builder 决定。
-                _ = self.inferExpr(sp.expr, env, null) catch try self.freshTypeVar();
                 return self.freshTypeVar();
             },
         };
@@ -3348,9 +3413,15 @@ pub const TypeInferencer = struct {
                 }
             },
             .error_newtype => |en| {
+                // error_newtype 构造器类型从 AST params 推导（通用方法，与 .record/.newtype 一致）
                 const error_adt = self.makeAdtType(en.name, &[_]*Type{}) catch return;
-                const ctor_params = self.arena.allocator().alloc(*Type, 1) catch return;
-                ctor_params[0] = self.makeType(.str_type) catch return;
+                const ctor_params = self.arena.allocator().alloc(*Type, en.params.len) catch return;
+                for (en.params, 0..) |p, i| {
+                    ctor_params[i] = if (p.type_annotation) |tn|
+                        self.typeFromAstWithParams(tn, null) catch (self.makeType(.str_type) catch return)
+                    else
+                        self.makeType(.str_type) catch return;
+                }
                 const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
                 if (!self.isBuiltinName(en.name)) {
                     env.define(en.name, ctor_ty) catch {};
@@ -3399,131 +3470,9 @@ pub const TypeInferencer = struct {
             env.define("type", fn_ty) catch return;
             self.registerBuiltinName("type");
         }
-        // Err trait 注册（从 BUILTIN_TYPES 元信息构建，替代原硬编码 Error trait）
-        // message()/type_name() 默认实现由 IR 层合成（field_access/const_str），支持 override。
-        {
-            const err_trait_ty = self.arena.allocator().create(Type) catch return;
-            err_trait_ty.* = Type{ .trait_type = .{ .name = "Err", .type_args = &[_]*Type{} } };
-            self.types.append(self.arena.allocator(), err_trait_ty) catch return;
-            // 从 BUILTIN_TYPES 查找 Err trait 的方法元信息
-            const err_builtin = comptime blk: {
-                for (glue_builtin.BUILTIN_TYPES) |bt| {
-                    if (std.mem.eql(u8, bt.name, "Err")) break :blk bt;
-                }
-                unreachable;
-            };
-            const method_count = err_builtin.trait_methods.len;
-            const method_names = self.arena.allocator().alloc([]const u8, method_count) catch return;
-            var method_schemes = std.StringHashMap(*Type).init(self.arena.allocator());
-            inline for (err_builtin.trait_methods, 0..) |m, i| {
-                method_names[i] = m.name;
-                // (self: Err) -> ret
-                const self_type = self.arena.allocator().create(Type) catch return;
-                self_type.* = Type{ .trait_type = .{ .name = "Err", .type_args = &[_]*Type{} } };
-                self.types.append(self.arena.allocator(), self_type) catch return;
-                const fn_params = self.arena.allocator().alloc(*Type, 1) catch return;
-                fn_params[0] = self_type;
-                const ret_ty = self.makeType(.str_type) catch return;
-                const fn_ty = self.makeFnType(fn_params, ret_ty) catch return;
-                method_schemes.put(self.arena.allocator().dupe(u8, m.name) catch return, fn_ty) catch return;
-            }
-            const err_key = self.arena.allocator().dupe(u8, "Err") catch return;
-            self.trait_types.put(err_key, TraitInfo{
-                .ty = err_trait_ty,
-                .associated_type_names = &[_][]const u8{},
-                .method_names = method_names,
-                .required_method_names = &[_][]const u8{},
-                .method_schemes = method_schemes,
-                .defining_module = "<builtin>",
-            }) catch return;
-        }
-        // builtin 类型注册（决策 #18/#23/#24）：从 glue_builtin.BUILTIN_TYPES 元信息表加载
-        // 采用两遍策略：
-        //   第一遍注册所有关联 ADT（IOErrorKind / TimeErrorKind）+ 构造器到 env
-        //   第二遍注册所有 error_newtype（CastError / IOError / TimeError），字段类型
-        //        可引用已注册的 ADT（如 IOError.kind: IOErrorKind）
-        // sema 启动时全加载类型定义，代码生成阶段按需编译方法体（Phase 3 实现按需加载）
-
-        // 第一遍：注册关联 ADT
-        inline for (glue_builtin.BUILTIN_TYPES) |bt| {
-            switch (bt.kind) {
-                .adt => {
-                    const adt_ty = self.makeAdtType(bt.name, &[_]*Type{}) catch return;
-                    const ctor_names = self.arena.allocator().alloc([]const u8, bt.constructors.len) catch return;
-                    for (bt.constructors, 0..) |c, i| {
-                        ctor_names[i] = c;
-                    }
-                    const adt_key = self.arena.allocator().dupe(u8, bt.name) catch return;
-                    self.adt_types.put(adt_key, AdtInfo{
-                        .ty = adt_ty,
-                        .constructor_names = ctor_names,
-                        .defining_module = "<builtin>",
-                    }) catch return;
-                    self.registerBuiltinName(bt.name);
-                    // 注册所有 unit constructor 到 env
-                    // 注意：constructor 名不注册为 builtin_name，允许用户 ADT 覆盖
-                    // （如 FileKind::Other 与 IOErrorKind::Other 可共存，后者会被前者覆盖）
-                    for (bt.constructors) |con| {
-                        const scheme = adt_ty;
-                        _ = env.define(con, scheme) catch return;
-                    }
-                },
-                .error_newtype => {},
-                .trait => {},
-            }
-        }
-        // 第二遍：注册 error_newtype（字段类型可引用第一遍注册的 ADT）
-        inline for (glue_builtin.BUILTIN_TYPES) |bt| {
-            switch (bt.kind) {
-                .error_newtype => {
-                    // 注册 ADT 类型
-                    const adt_ty = self.makeAdtType(bt.name, &[_]*Type{}) catch return;
-                    // 构造器参数类型按 bt.fields 中的 type_name 查找：
-                    //   1) 内建基础类型（i8/i16/.../str/bool）→ BUILTIN_TYPES 表
-                    //   2) 已注册 ADT（IOErrorKind 等）→ self.adt_types
-                    //   3) fallback → str_type
-                    const ctor_params = self.arena.allocator().alloc(*Type, bt.fields.len) catch return;
-                    inline for (bt.fields, 0..) |f, i| {
-                        const field_ty: *Type = blk: {
-                            inline for (BUILTIN_TYPES) |entry| {
-                                if (comptime std.mem.eql(u8, entry.name, f.type_name)) break :blk self.makeType(entry.ty) catch return;
-                            }
-                            if (self.adt_types.get(f.type_name)) |info| break :blk info.ty;
-                            break :blk self.makeType(.str_type) catch return;
-                        };
-                        ctor_params[i] = field_ty;
-                    }
-                    const ctor_ty = self.makeFnType(ctor_params, adt_ty) catch return;
-                    _ = env.define(bt.constructor_name, ctor_ty) catch return;
-                    self.registerBuiltinName(bt.constructor_name);
-                    self.registerBuiltinName(bt.name);
-                    // 注册到 adt_types（标记 is_error_newtype=true，作为 Error 子类型）
-                    // 同时填充 ctor_field_names/ctor_field_types，使 field_access 能解析字段类型
-                    const adt_key = self.arena.allocator().dupe(u8, bt.name) catch return;
-                    const ctor_names = self.arena.allocator().alloc([]const u8, 1) catch return;
-                    ctor_names[0] = bt.constructor_name;
-                    // 单构造器：ctor_field_types/ctor_field_names 第一维长度=1
-                    const ctor_field_types = self.arena.allocator().alloc([]const *Type, 1) catch return;
-                    const ctor_field_names = self.arena.allocator().alloc([]const ?[]const u8, 1) catch return;
-                    ctor_field_types[0] = ctor_params;
-                    const field_names = self.arena.allocator().alloc(?[]const u8, bt.fields.len) catch return;
-                    inline for (bt.fields, 0..) |f, i| {
-                        field_names[i] = f.name;
-                    }
-                    ctor_field_names[0] = field_names;
-                    self.adt_types.put(adt_key, AdtInfo{
-                        .ty = adt_ty,
-                        .constructor_names = ctor_names,
-                        .is_error_newtype = true,
-                        .defining_module = "<builtin>",
-                        .ctor_field_types = ctor_field_types,
-                        .ctor_field_names = ctor_field_names,
-                    }) catch return;
-                },
-                .adt => {},
-                .trait => {},
-            }
-        }
+        // builtin error 类型（Err trait / Error / CastError / IOError / TimeError / IOErrorKind / TimeErrorKind）
+        // 通过 module_loader 的 loadBuiltinDecls 从 @embedFile 嵌入的 .glue 文件解析为 AST，
+        // 走通用 sema trait_decl/type_decl 解析路径注册，不再在此特判注册。
         {
             // Ok constructor: ∀T,E. fn(T) -> Throw<T, E>
             // Both T (value type) and E (error type) are polymorphic so that
@@ -4756,8 +4705,14 @@ pub const TypeInferencer = struct {
                     },
                     .error_newtype => |en| {
                         const error_adt = self.makeAdtType(en.name, &[_]*Type{}) catch return;
-                        const ctor_params = self.arena.allocator().alloc(*Type, 1) catch return;
-                        ctor_params[0] = self.makeType(.str_type) catch return;
+                        // 构造器类型从 AST params 推导（通用方法，与 predeclareTypeDecl/.record 一致）
+                        const ctor_params = self.arena.allocator().alloc(*Type, en.params.len) catch return;
+                        for (en.params, 0..) |p, i| {
+                            ctor_params[i] = if (p.type_annotation) |tn|
+                                self.typeFromAstWithParams(tn, null) catch (self.makeType(.str_type) catch return)
+                            else
+                                self.makeType(.str_type) catch return;
+                        }
                         const ctor_ty = self.makeFnType(ctor_params, error_adt) catch return;
                         const is_predeclared = self.predeclared_types.contains(td.name);
                         if (self.isBuiltinName(en.name)) {

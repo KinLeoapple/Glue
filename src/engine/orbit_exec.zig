@@ -6,6 +6,7 @@
 //! 拆分模式：pub const Methods = struct { pub fn ... }，
 //! engine.zig 通过 pub const 别名注入 Engine 结构体。
 
+const std = @import("std");
 const ir_mod = @import("ir");
 const value = @import("value");
 const coroutine = @import("coroutine");
@@ -18,7 +19,7 @@ const Node = ir_mod.Node;
 
 pub const Methods = struct {
     // ════════════════════════════════════════════
-    // 星轨执行（Phase 7：async/spawn）
+    // 星轨执行（Phase 7：async）
     // ════════════════════════════════════════════
     // 设计要点：
     // - orbit_async_create：在独立线程中执行 async 函数，返回 AsyncHandle
@@ -36,12 +37,14 @@ pub const Methods = struct {
 
         // 协程调度路径是唯一路径：scheduler 由 run() 惰性启动，
         // 所有 async 函数都有 CoroutineMeta（builder 阶段对所有 is_async 函数生成）
-        const sched = self.scheduler orelse return error.SchedulerNotStarted;
+        const sched = self.scheduler orelse {
+            return error.SchedulerNotStarted;
+        };
         if (self.ir.getCoroutineMeta(om.func_index) == null) return error.InvalidMetaIndex;
         return self.execOrbitAsyncCreateViaScheduler(node, om, sched);
     }
 
-    /// 协程调度路径：通过 Scheduler.spawn 创建协程帧并入就绪队列。
+    /// 协程调度路径：通过 Scheduler.launchAsync 创建协程帧并入就绪队列。
     /// 参数从 IR 通道读取为 Value 切片，写入帧 locals 参数槽。
     /// AsyncHandle 输出到 node.output，状态设为 Running（worker 执行完会写结果）。
     pub fn execOrbitAsyncCreateViaScheduler(
@@ -63,24 +66,26 @@ pub const Methods = struct {
         const arg_count = om.arg_count;
         const args = self.tctx.?.backing.alloc(value.Value, arg_count) catch return error.OutOfMemory;
         defer self.tctx.?.backing.free(args);
+        var orbit_args_buf: [16]u16 = undefined;
+        const orbit_arg_chans = ir_mod.buildNodeArgs(node, om.extra_args, 0, arg_count, &orbit_args_buf);
         for (0..arg_count) |i| {
-            args[i] = self.readScalarValue(node.inputs[i]) catch value.Value.fromUnit();
+            args[i] = self.readScalarValue(orbit_arg_chans[i]) catch value.Value.fromUnit();
         }
 
         // 解析 type_args（从 OrbitMeta 获取，解析泛型参数引用当前 sync 帧）
         const resolved_type_args = try self.materializeTypeArgs(om.type_args);
 
-        // spawn 协程：分配帧 + 写参数 + state=0 + 入就绪队列
-        const frame = sched.spawn(meta, args, resolved_type_args) catch return error.OutOfMemory;
+        // async 协程：分配帧 + 写参数 + state=0 + 入就绪队列
+        const frame = sched.launchAsync(meta, args, resolved_type_args) catch return error.OutOfMemory;
         // 帧与 handle 关联（complete 时 worker 写结果到 handle）
         frame.async_handle = handle;
 
-        // 输出 AsyncHandle 指针
-        self.runtime.writePtr(node.output, @ptrCast(&handle.header));
+        // 输出 AsyncHandle（统一走 writeChannel，ref 类型由 ref_ops.write 处理）
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&handle.header)));
     }
 
     /// orbit_async_join：阻塞等待异步任务完成，提取结果
-    /// inputs[0] = handle 通道（ref_chan）
+    /// inputs[0] = handle 通道
     /// output = 结果通道
     /// 值语义：普通复合类型返回值深拷贝到主线程，&T / *T 保持共享
     ///
@@ -95,7 +100,6 @@ pub const Methods = struct {
             return error.InvalidChannel;
         };
 
-        // 阻塞等待完成
         const result_val = handle.join();
 
         // 确保无论如何都通知 worker 并等待其退出（避免 worker 永久阻塞）
@@ -104,23 +108,17 @@ pub const Methods = struct {
             handle.waitWorkerDone();
         }
 
-        // 将结果写入 output 通道
+        // 将结果写入 output 通道（统一走 writeChannel，无 ref_chan 旁路）
         if (result_val) |v| {
-            const out_meta = self.ir.channels.get(node.output);
-            const out_val = if (self.runtime.isRef(node.output) and !out_meta.type_desc.isRef()) blk: {
-                // 深拷贝到主线程 tctx：此时 worker tctx 仍存活，读取安全
-                const copied = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
-                try self.trackValueTree(copied);
-                break :blk copied;
-            } else v;
-            self.writeScalarValue(node.output, out_val);
+            // worker 线程分配的堆对象在 worker tctx 中，worker 退出后变为悬垂指针。
+            // 必须在 signalConsumed/waitWorkerDone 之前深拷贝到主线程 tctx（此时 worker tctx 仍存活）。
+            // 标量值 deepCopy 为 no-op（直接返回自身），堆引用值递归拷贝到主线程 tctx。
+            const out_val = v.deepCopy(self.tctx.?) catch return error.OutOfMemory;
+            try self.trackValueTree(out_val);
+            _ = self.runtime.writeChannel(node.output, out_val);
         } else {
-            // 任务失败或无结果：写入 0
-            const w = self.runtime.elemWidth(node.output);
-            if (w > 0) {
-                const dst = self.runtime.rawPtr(node.output);
-                @memset(dst[0..w], 0);
-            }
+            // 任务失败或无结果：写入 null（统一通道，由 vtable 处理零值）
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
         }
 
         // 迁移 worker 通过 &T 引用写入主线程对象的堆值到主线程 tctx。
@@ -148,18 +146,14 @@ pub const Methods = struct {
     }
 
     /// orbit_chan_recv：从通道接收值（阻塞直到有数据）
-    /// inputs[0] = handle/channel 通道（ref_chan）
+    /// inputs[0] = handle/channel 通道
     /// output = 结果通道
     pub fn execOrbitChanRecv(self: *Engine, node: *const Node) EngineError!void {
         const ch = self.readChannelValue(node.inputs[0]) orelse return error.InvalidChannel;
 
         const result_val = ch.recv() orelse {
-            // 通道已关闭且无数据
-            const w = self.runtime.elemWidth(node.output);
-            if (w > 0) {
-                const dst = self.runtime.rawPtr(node.output);
-                @memset(dst[0..w], 0);
-            }
+            // 通道已关闭且无数据：写入 null（统一通道，vtable 处理零值）
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
             return;
         };
 
@@ -167,32 +161,22 @@ pub const Methods = struct {
     }
 
     /// orbit_chan_try_recv：非阻塞接收，返回 nullable
-    /// inputs[0] = handle/channel 通道（ref_chan）
+    /// inputs[0] = handle/channel 通道
     /// output = nullable_chan
     pub fn execOrbitChanTryRecv(self: *Engine, node: *const Node) EngineError!void {
         const ch = self.readChannelValue(node.inputs[0]) orelse {
-            // 无效通道：写入 null
-            const inner_w = self.nullableInnerWidth(node.output);
-            const dst = self.runtime.rawPtr(node.output);
-            dst[inner_w] = 1; // null flag
+            // 无效通道：写入 null（nullable vtable 处理 null flag）
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
             return;
         };
 
         const result_val = ch.tryRecv();
-        const inner_w = self.nullableInnerWidth(node.output);
-        const dst = self.runtime.rawPtr(node.output);
-
         if (result_val) |v| {
-            // 有值：写入 inner 值 + null flag = 0
-            // 简化：将 Value 的 i64 表示写入
-            const tmp_buf = self.readScalarValueToBytes(v);
-            if (inner_w > 0) {
-                @memcpy(dst[0..inner_w], tmp_buf[0..inner_w]);
-            }
-            dst[inner_w] = 0;
+            // 有值：writeChannel 由 nullable vtable 设置 null flag = 0
+            _ = self.runtime.writeChannel(node.output, v);
         } else {
-            // 无值：null flag = 1
-            dst[inner_w] = 1;
+            // 无值：写入 null
+            _ = self.runtime.writeChannel(node.output, value.Value.fromNull());
         }
     }
 
@@ -218,6 +202,12 @@ pub const Methods = struct {
     pub fn execChannelClose(self: *Engine, node: *const Node) EngineError!void {
         const ch = self.readChannelValue(node.inputs[0]) orelse return error.InvalidChannel;
         ch.close();
+        // Bug 8 fix: 唤醒所有因通道阻塞的协程（recv/send 等待者）。
+        // 关闭后这些协程应立即被调度：recv 返回 null，send 返回 false。
+        if (self.scheduler) |sched| {
+            sched.suspend_registry.wakeChanRecv(ch);
+            sched.suspend_registry.wakeChanSend(ch);
+        }
     }
 
     /// channel_create：创建带缓冲的 ChannelValue
@@ -226,7 +216,7 @@ pub const Methods = struct {
         const cap: usize = if (capacity < 0) 0 else @intCast(capacity);
         const ch = value.ChannelValue.create(self.tctx.?, cap) catch return error.OutOfMemory;
         try self.trackObj(&ch.header);
-        self.runtime.writePtr(node.output, @ptrCast(&ch.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&ch.header)));
     }
 
     /// channel_sender：从 ChannelValue 创建 SenderValue
@@ -237,7 +227,7 @@ pub const Methods = struct {
         value.obj_header.initObjHeader(&sender.header, .sender_val, @sizeOf(value.SenderValue), false, self.tctx.?);
         _ = value.obj_header.retain(&ch.header, self.tctx.?);
         try self.trackObj(&sender.header);
-        self.runtime.writePtr(node.output, @ptrCast(&sender.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&sender.header)));
     }
 
     /// channel_receiver：从 ChannelValue 创建 ReceiverValue
@@ -248,11 +238,11 @@ pub const Methods = struct {
         value.obj_header.initObjHeader(&receiver.header, .receiver_val, @sizeOf(value.ReceiverValue), false, self.tctx.?);
         _ = value.obj_header.retain(&ch.header, self.tctx.?);
         try self.trackObj(&receiver.header);
-        self.runtime.writePtr(node.output, @ptrCast(&receiver.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&receiver.header)));
     }
 
     // ════════════════════════════════════════════
-    // 星轨执行辅助（Phase 7：async/spawn）
+    // 星轨执行辅助（Phase 7：async）
     // ════════════════════════════════════════════
     // 设计要点：
     // - orbit_async_create：在独立线程中执行 async 函数，返回 AsyncHandle
@@ -260,36 +250,39 @@ pub const Methods = struct {
     // - orbit_chan_send/recv/try_recv：通过 ChannelValue 进行线程间通信
     // - 异步函数在独立线程中执行，拥有自己的 Engine 实例（共享 IR，独立 Runtime）
 
-    /// 读取 ref_chan 中的 AsyncHandle 指针
+    /// 读取通道中的 AsyncHandle 指针（统一走 readChannel，无 ref_chan 旁路）
     pub fn readAsyncHandle(self: *Engine, chan: u16) ?*value.AsyncHandle {
-        const header = self.readRefObj(chan) orelse return null;
-        if (header.type_tag != .async_val) return null;
-        return @alignCast(@fieldParentPtr("header", header));
+        const v = self.runtime.readChannel(chan) orelse return null;
+        if (v != .ref) return null;
+        if (v.ref.type_tag != .async_val) return null;
+        return @alignCast(@fieldParentPtr("header", v.ref));
     }
 
-    /// 读取 ref_chan 中的 ChannelValue 指针
+    /// 读取通道中的 ChannelValue 指针
     /// 支持 ChannelValue、SenderValue、ReceiverValue 三种引用类型
     pub fn readChannelValue(self: *Engine, chan: u16) ?*value.ChannelValue {
-        const header = self.readRefObj(chan) orelse return null;
-        return switch (header.type_tag) {
-            .channel_val => @alignCast(@fieldParentPtr("header", header)),
+        const v = self.runtime.readChannel(chan) orelse return null;
+        if (v != .ref) return null;
+        return switch (v.ref.type_tag) {
+            .channel_val => @alignCast(@fieldParentPtr("header", v.ref)),
             .sender_val => blk: {
-                const sender: *value.SenderValue = @alignCast(@fieldParentPtr("header", header));
+                const sender: *value.SenderValue = @alignCast(@fieldParentPtr("header", v.ref));
                 break :blk sender.channel;
             },
             .receiver_val => blk: {
-                const receiver: *value.ReceiverValue = @alignCast(@fieldParentPtr("header", header));
+                const receiver: *value.ReceiverValue = @alignCast(@fieldParentPtr("header", v.ref));
                 break :blk receiver.channel;
             },
             else => null,
         };
     }
 
-    /// 读取 AtomicValue 指针（ref_chan → *AtomicValue）
+    /// 读取 AtomicValue 指针（通道 → *AtomicValue）
     pub fn readAtomicValue(self: *Engine, chan: u16) ?*value.AtomicValue {
-        const header = self.readRefObj(chan) orelse return null;
-        if (header.type_tag != .atomic_val) return null;
-        return @alignCast(@fieldParentPtr("header", header));
+        const v = self.runtime.readChannel(chan) orelse return null;
+        if (v != .ref) return null;
+        if (v.ref.type_tag != .atomic_val) return null;
+        return @alignCast(@fieldParentPtr("header", v.ref));
     }
 
     /// 迁移 worker 通过 &T 引用写入主线程对象的堆值到主线程 tctx。
@@ -361,7 +354,7 @@ pub const Methods = struct {
         av.* = .{ .data = init_val, .mutex = .{} };
         value.obj_header.initObjHeader(&av.header, .atomic_val, @sizeOf(value.AtomicValue), false, self.tctx.?);
         try self.trackObj(&av.header);
-        self.runtime.writePtr(node.output, @ptrCast(&av.header));
+        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&av.header)));
     }
 
     /// atomic_fetch_add：原子加/减法，返回旧值

@@ -501,8 +501,8 @@ pub const Methods = struct {
                 // 在堆上创建 Str 对象
                 const v = value.Value.fromStringBytes(self.tctx.?, bytes) catch return error.OutOfMemory;
                 try self.trackObj(v.asRef());
-                // 将 *ObjHeader 指针写入 ref_chan
-                self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+                // 将 *ObjHeader 指针写入通道
+                _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
             }
         }
     }

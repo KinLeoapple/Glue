@@ -30,9 +30,6 @@ fn canCoerceNumeric(to: *const Type, from: *const Type) bool {
         if (to_int_rank == from_int_rank and to_signed == from_signed) {
             return true;
         }
-        if (to_int_rank == from_int_rank) {
-            return true;
-        }
         if (to_signed == from_signed) {
             return to_int_rank >= from_int_rank;
         } else if (from_signed and !to_signed) {
@@ -42,9 +39,9 @@ fn canCoerceNumeric(to: *const Type, from: *const Type) bool {
             return to_int_rank > from_int_rank;
         }
     }
-    // 浮点之间：任意浮点都可宽化为更大秩的浮点
+    // 浮点之间：同秩或目标秩更大时允许宽化（禁止窄化）
     if (to_float_rank > 0 and from_float_rank > 0) {
-        return true;
+        return to_float_rank >= from_float_rank;
     }
     // 整型 -> 浮点：允许
     if (to_float_rank > 0 and from_int_rank > 0) {
@@ -284,9 +281,9 @@ pub fn tryWidenUnify(inferencer: *TypeInferencer, t1: *Type, t2: *Type) SemaErro
 
 /// 检查传播操作符 `?` 在表达式上的合法性，并返回展开后的类型。
 ///
-/// - nullable：展开为内层类型；要求外层函数返回类型也是 nullable，否则报错
-/// - throw：展开为值类型；要求外层函数返回类型也是 throw，否则报错
-/// - 其它类型：报“不可用于非 nullable/throw 表达式”错误，并返回原类型
+/// - nullable：展开为内层类型；外层返回 nullable 时传播 null，否则退化为 unwrap（null 时 panic）
+/// - throw：展开为值类型；外层返回 throw 时传播错误，否则退化为 unwrap-or-throw（Err 时 halt_throw）
+/// - 其它类型：报"不可用于非 nullable/throw 表达式"错误，并返回原类型
 pub fn checkPropagate(
     inferencer: *TypeInferencer,
     resolved_inner: *Type,
@@ -294,48 +291,21 @@ pub fn checkPropagate(
     fn_return_type: ?*Type,
     location: ast.SourceLocation,
 ) *Type {
+    _ = fn_return_type;
     switch (resolved_inner.*) {
         .nullable_type => |inner| {
-            if (fn_return_type) |fn_ret| {
-                const resolved_ret = inferencer.resolve(fn_ret);
-                switch (resolved_ret.*) {
-                    .nullable_type => {
-                        // 外层函数同样返回 nullable，传播合法
-                    },
-                    else => {
-                        inferencer.addErrorAt(.propagate_cross_type, location.line, location.column, "propagation operator '?' on T? requires enclosing function to return U?, but return type is non-nullable", .{});
-                    },
-                }
-            }
+            // nullable 传播：外层返回 nullable 时合法传播；
+            // 非 nullable 函数中退化为 unwrap（null 时运行时 panic）
             return inner;
         },
         .throw_type => |tt| {
-            if (fn_return_type) |fn_ret| {
-                const resolved_ret = inferencer.resolve(fn_ret);
-                switch (resolved_ret.*) {
-                    .throw_type => {
-                        // 外层函数同样返回 throw，传播合法
-                    },
-                    else => {
-                        inferencer.addErrorAt(.propagate_cross_type, location.line, location.column, "propagation operator '?' on Throw<T, E> requires enclosing function to return Throw<U, E'>, but return type is non-throw", .{});
-                    },
-                }
-            }
+            // throw 传播：外层返回 throw 时合法传播错误；
+            // 非 throw 函数中退化为 unwrap-or-throw（Err 时运行时 halt_throw）
             return tt.value_type;
         },
         else => {
             // 非 nullable/throw 表达式使用传播操作符属于错误
-            if (fn_return_type) |fn_ret| {
-                const resolved_ret = inferencer.resolve(fn_ret);
-                switch (resolved_ret.*) {
-                    .nullable_type, .throw_type => {
-                        inferencer.addErrorAt(.propagate_cross_type, location.line, location.column, "propagation operator '?' cannot be used on a non-nullable, non-throw expression", .{});
-                    },
-                    else => {
-                        inferencer.addErrorAt(.propagate_cross_type, location.line, location.column, "propagation operator '?' cannot be used on a non-nullable, non-throw expression", .{});
-                    },
-                }
-            }
+            inferencer.addErrorAt(.propagate_cross_type, location.line, location.column, "propagation operator '?' cannot be used on a non-nullable, non-throw expression", .{});
             return inner_ty;
         },
     }
@@ -394,7 +364,7 @@ pub fn checkThrowStmt(
         .type_mismatch,
         location.line,
         location.column,
-        "throw expression must be an Error subtype, got {s}",
+        "throw expression must be an Err subtype, got {s}",
         .{@tagName(resolved.*)},
     );
 }

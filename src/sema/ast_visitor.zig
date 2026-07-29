@@ -90,7 +90,6 @@ fn walkExprChildrenV(v: *const AstVisitor, expr: *const ast.Expr) anyerror!void 
         .cast_builder => |cb| try walkExpr(v, cb.expr),
         .atomic_expr => |ae| try walkExpr(v, ae.value),
         .lazy => |l| try walkExpr(v, l.expr),
-        .spawn_expr => |se| try walkExpr(v, se.expr),
 
         // 双子节点
         .assignment_expr => |a| {
@@ -267,7 +266,6 @@ pub fn walkExprChildren(ctx: *anyopaque, expr: *const ast.Expr, callback: ExprVi
         .cast_builder => |cb| try callback(ctx, cb.expr),
         .atomic_expr => |ae| try callback(ctx, ae.value),
         .lazy => |l| try callback(ctx, l.expr),
-        .spawn_expr => |se| try callback(ctx, se.expr),
 
         // 双子节点
         .assignment_expr => |a| {
@@ -445,7 +443,6 @@ pub fn walkExprChildrenMut(ctx: *anyopaque, expr: *ast.Expr, callback: ExprVisit
         .cast_builder => |cb| try callback(ctx, cb.expr),
         .atomic_expr => |ae| try callback(ctx, ae.value),
         .lazy => |l| try callback(ctx, l.expr),
-        .spawn_expr => |se| try callback(ctx, se.expr),
 
         // 双子节点
         .assignment_expr => |a| {

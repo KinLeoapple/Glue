@@ -631,7 +631,7 @@ pub fn net_udp_recv_from(io: Io, tctx: *ThreadContext, args: []const Value) Sysc
 // 异步 Net syscall
 // ──────────────────────────────────────────────
 //
-// 协议：创建完成 channel(cap=1) + spawn 独立线程跑阻塞 accept/read/write/recv_from
+// 协议：创建完成 channel(cap=1) + launch 独立线程跑阻塞 accept/read/write/recv_from
 // （不阻塞协程 worker 线程），完成后 chan.trySend(Throw<T, IOError>) + wake_chan_recv_fn
 // 唤醒等待协程。协程在 channel 上挂起（orbit_chan_recv），唤醒后从 channel 取 Throw 值。
 // 超时由 stdlib 在 Glue 层用 select + timeout channel 实现，syscall 层不处理超时。
@@ -653,7 +653,7 @@ const AcceptAsyncArgs = struct {
 
 /// __net_tcp_accept_async(fd: i64) -> *ChannelValue
 ///
-/// 异步 TCP accept：创建完成 channel + spawn 线程跑 accept，
+/// 异步 TCP accept：创建完成 channel + launch 线程跑 accept，
 /// 完成后 chan.trySend(Throw<AcceptResult, IOError>) + wake_chan_recv_fn 唤醒协程。
 pub fn net_tcp_accept_async(io: Io, tctx: *ThreadContext, args: []const Value) SyscallError!Value {
     if (args.len != 1) return error.InvalidArgument;
@@ -663,7 +663,7 @@ pub fn net_tcp_accept_async(io: Io, tctx: *ThreadContext, args: []const Value) S
     // 创建完成 channel（cap=1）
     const chan = value.ChannelValue.create(tctx, 1) catch return error.OutOfMemory;
 
-    // spawn 线程跑 accept + ioComplete
+    // launch 线程跑 accept + ioComplete
     const args_ptr = tctx.backing.create(AcceptAsyncArgs) catch return error.OutOfMemory;
     args_ptr.* = .{
         .io = io,
@@ -676,8 +676,8 @@ pub fn net_tcp_accept_async(io: Io, tctx: *ThreadContext, args: []const Value) S
     };
     const thread = std.Thread.spawn(.{}, acceptAsyncWorker, .{args_ptr}) catch {
         tctx.backing.destroy(args_ptr);
-        // spawn 失败：返回错误 Throw（不应发生）
-        const io_err = try makeIOError(tctx, .other, "net_tcp_accept_async: spawn failed", 0, null);
+        // thread launch 失败：返回错误 Throw（不应发生）
+        const io_err = try makeIOError(tctx, .other, "net_tcp_accept_async: thread launch failed", 0, null);
         return makeThrowErr(tctx, io_err, "io error");
     };
     thread.detach();
@@ -775,7 +775,7 @@ pub fn net_tcp_read_async(io: Io, tctx: *ThreadContext, args: []const Value) Sys
     };
     const thread = std.Thread.spawn(.{}, readAsyncWorker, .{args_ptr}) catch {
         tctx.backing.destroy(args_ptr);
-        const io_err = try makeIOError(tctx, .other, "net_tcp_read_async: spawn failed", 0, null);
+        const io_err = try makeIOError(tctx, .other, "net_tcp_read_async: thread launch failed", 0, null);
         return makeThrowErr(tctx, io_err, "io error");
     };
     thread.detach();
@@ -893,7 +893,7 @@ pub fn net_tcp_write_async(io: Io, tctx: *ThreadContext, args: []const Value) Sy
     const thread = std.Thread.spawn(.{}, writeAsyncWorker, .{args_ptr}) catch {
         tctx.backing.destroy(args_ptr);
         tctx.backing.free(buf_copy);
-        const io_err = try makeIOError(tctx, .other, "net_tcp_write_async: spawn failed", 0, null);
+        const io_err = try makeIOError(tctx, .other, "net_tcp_write_async: thread launch failed", 0, null);
         return makeThrowErr(tctx, io_err, "io error");
     };
     thread.detach();
@@ -978,7 +978,7 @@ pub fn net_udp_recv_from_async(io: Io, tctx: *ThreadContext, args: []const Value
     };
     const thread = std.Thread.spawn(.{}, recvFromAsyncWorker, .{args_ptr}) catch {
         tctx.backing.destroy(args_ptr);
-        const io_err = try makeIOError(tctx, .other, "net_udp_recv_from_async: spawn failed", 0, null);
+        const io_err = try makeIOError(tctx, .other, "net_udp_recv_from_async: thread launch failed", 0, null);
         return makeThrowErr(tctx, io_err, "io error");
     };
     thread.detach();

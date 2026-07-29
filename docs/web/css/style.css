@@ -100,35 +100,65 @@ body {
     font-size: 15px;
     line-height: 1.75;
     color: var(--text-primary);
-    background: var(--bg-base);
+    /* 多层背景：基础色 + 顶部铺底绿光 + 点阵网格纹理 */
+    background-color: var(--bg-base);
+    background-image:
+        radial-gradient(ellipse 80% 50% at 50% 0%, rgba(63, 185, 80, 0.05) 0%, rgba(63, 185, 80, 0) 90%),
+        radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.022) 1px, rgba(255, 255, 255, 0) 0);
+    background-size: 100% 700px, 28px 28px;
+    background-attachment: fixed, fixed;
+    background-repeat: no-repeat, repeat;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     overflow-x: hidden;
 }
 
-/* 背景氛围光晕 */
+/* 背景氛围光晕 — 左上绿，缓慢呼吸（9s 周期，向页面中心缩放）
+   用同色零 alpha 渐变 + 长尾淡出，避免 transparent 关键字导致的暗色截断 */
 body::before {
     content: '';
     position: fixed;
-    top: -20%;
-    left: -10%;
-    width: 60%;
-    height: 60%;
-    background: radial-gradient(circle, rgba(63, 185, 80, 0.06) 0%, transparent 60%);
+    top: -35%;
+    left: -25%;
+    width: 100%;
+    height: 100%;
+    background: radial-gradient(ellipse 55% 45% at 65% 65%, rgba(63, 185, 80, 0.09) 0%, rgba(63, 185, 80, 0.03) 50%, rgba(63, 185, 80, 0) 95%);
     pointer-events: none;
     z-index: 0;
+    transform-origin: bottom right;
+    animation: glowBreatheA 9s ease-in-out infinite;
+    will-change: opacity, transform;
 }
 
+/* 背景氛围光晕 — 右下蓝紫，缓慢呼吸（13s 周期，与 A 错开节奏） */
 body::after {
     content: '';
     position: fixed;
-    bottom: -20%;
-    right: -10%;
-    width: 50%;
-    height: 50%;
-    background: radial-gradient(circle, rgba(88, 166, 255, 0.04) 0%, transparent 60%);
+    bottom: -38%;
+    right: -25%;
+    width: 95%;
+    height: 95%;
+    background: radial-gradient(ellipse 50% 45% at 35% 35%, rgba(88, 166, 255, 0.07) 0%, rgba(88, 166, 255, 0.02) 50%, rgba(88, 166, 255, 0) 95%);
     pointer-events: none;
     z-index: 0;
+    transform-origin: top left;
+    animation: glowBreatheB 13s ease-in-out infinite;
+    will-change: opacity, transform;
+}
+
+@keyframes glowBreatheA {
+    0%, 100% { opacity: 0.8;  transform: scale(1); }
+    50%      { opacity: 1;    transform: scale(1.08); }
+}
+
+@keyframes glowBreatheB {
+    0%, 100% { opacity: 0.65; transform: scale(1.05); }
+    50%      { opacity: 1;    transform: scale(0.96); }
+}
+
+/* 降低动画偏好下，光晕退化为静态 */
+@media (prefers-reduced-motion: reduce) {
+    body::before, body::after { animation: none; }
 }
 
 a {
@@ -739,14 +769,6 @@ a:hover { color: var(--accent-bright); text-decoration: underline; text-underlin
     overflow-x: auto;
     position: relative;
 }
-.code-body::before {
-    content: '';
-    position: absolute;
-    left: 0; top: 0; bottom: 0;
-    width: 3px;
-    background: linear-gradient(180deg, var(--accent-dim) 0%, transparent 100%);
-    opacity: 0.5;
-}
 
 .code-body pre {
     font-family: var(--font-mono);
@@ -754,6 +776,41 @@ a:hover { color: var(--accent-bright); text-decoration: underline; text-underlin
     line-height: 1.65;
     color: var(--text-primary);
     white-space: pre;
+}
+
+/* ── 代码片段折叠/展开 ── */
+/* 折叠态显示关键片段，展开态显示完整代码 */
+.code-block .code-full { display: none; }
+.code-block.expanded .code-snippet { display: none; }
+.code-block.expanded .code-full { display: block; }
+
+/* 展开/收起按钮 */
+.code-expand-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    height: 36px;
+    background: var(--bg-tertiary);
+    border: none;
+    border-top: 1px solid var(--border);
+    color: var(--text-muted);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+.code-expand-btn:hover {
+    background: var(--bg-elevated);
+    color: var(--accent-bright);
+}
+.code-expand-btn .chevron {
+    transition: transform var(--transition-base);
+}
+.code-block.expanded .code-expand-btn .chevron {
+    transform: rotate(180deg);
 }
 
 /* 内联代码 */

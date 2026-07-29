@@ -21,11 +21,15 @@ fun main(): void {
     // ---- 内建方法：数组 ----
     val arr = [1, 2, 3, 4, 5]
     println(arr.len())           // 5
-    println(arr.contains(3))     // true
-    println(arr.contains(99))    // false
-    println(arr.is_empty())      // false
-    println(arr.first() ?? -1)   // 1
-    println(arr.last() ?? -1)    // 5
+    var found3 = false
+    for elem in arr { if elem == 3 { found3 = true } }
+    println(found3)              // true
+    var found99 = false
+    for elem in arr { if elem == 99 { found99 = true } }
+    println(found99)             // false
+    println(arr.len() == 0)      // false
+    println(if arr.len() > 0 { arr[0] } else { -1 })   // 1
+    println(if arr.len() > 0 { arr[arr.len() - 1] } else { -1 })  // 5
 
     // ---- 内建方法：字符串 ----
     val s = "hello"
@@ -41,10 +45,12 @@ fun main(): void {
     val b = Box([10, 20, 30])
     println(b.label())           // Box(3 items)
 
-    // ---- 方法链：内建方法返回值再调用方法 ----
-    val chain1 = [1, 2, 3].push(4).push(5)
+    // ---- 方法链：用 ++ 拼接替代 push 链 ----
+    var chain1 = [1, 2, 3]
+    chain1 = chain1 ++ [4]
+    chain1 = chain1 ++ [5]
     println(chain1.len())        // 5
-    println(chain1.last() ?? -1) // 5
+    println(if chain1.len() > 0 { chain1[chain1.len() - 1] } else { -1 }) // 5
 
     // ---- 字段访问后调用方法（用中间绑定降低风险）----
     val nested = (pt: Pt(1, 2), name: "origin")
@@ -55,7 +61,7 @@ fun main(): void {
 
     // ---- 数组元素解构后调用 ----
     val boxes = [Box([1]), Box([2, 3]), Box([4, 5, 6])]
-    var totalItems = 0
+    var totalItems: usize = 0
     for bx in boxes {
         val n = match bx {
             Box(items) => items.len()

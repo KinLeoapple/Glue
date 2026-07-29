@@ -5,13 +5,13 @@ type Addr = Addr(city: str, zip: i32)
 type User = User(name: str, addr: Addr?)
 type Account = Account(owner: User?, balance: i32)
 
-type NotFound: Error = NotFound(msg: str) {
+type NotFound: Err = NotFound(msg: str) {
     override fun type_name(self): str { "not found" }
 }
-type Timeout: Error = Timeout(msg: str) {
+type Timeout: Err = Timeout(msg: str) {
     override fun type_name(self): str { "timeout" }
 }
-type Denied: Error = Denied(msg: str) {
+type Denied: Err = Denied(msg: str) {
     override fun type_name(self): str { "denied" }
 }
 

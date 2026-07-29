@@ -350,20 +350,38 @@ pub fn inferMethodCall(
         }
     }
 
-    // 遍历所有 trait 查找同名方法
-    var trait_iter = inferencer.trait_types.iterator();
-    while (trait_iter.next()) |entry| {
-        if (entry.value_ptr.method_schemes.get(mc.method)) |scheme| {
-            const instantiated = inferencer.freshenType(scheme) catch return inferencer.freshTypeVar() catch unreachable;
-            const resolved = inferencer.resolve(instantiated);
-            switch (resolved.*) {
-                .fn_type => |ft| {
-                    if (ft.params.len > 0) {
-                        inferencer.unify(ft.params[0], obj_ty) catch {};
+    // 遍历对象类型实际实现的 trait 查找同名方法
+    {
+        const robj = inferencer.resolve(obj_ty);
+        const type_name: ?[]const u8 = switch (robj.*) {
+            .adt_type => |at| at.name,
+            .generic_type => |gt| gt.name,
+            .ref_type => |rt| switch (inferencer.resolve(rt.inner).*) {
+                .adt_type => |at| at.name,
+                .generic_type => |gt| gt.name,
+                else => null,
+            },
+            else => null,
+        };
+        if (type_name) |tn| {
+            var trait_iter = inferencer.trait_types.iterator();
+            while (trait_iter.next()) |entry| {
+                const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::{s}", .{ entry.key_ptr.*, tn }) catch return inferencer.freshTypeVar() catch unreachable;
+                defer inferencer.arena.allocator().free(trait_key);
+                if (!inferencer.registered_traits.contains(trait_key)) continue;
+                if (entry.value_ptr.method_schemes.get(mc.method)) |scheme| {
+                    const instantiated = inferencer.freshenType(scheme) catch return inferencer.freshTypeVar() catch unreachable;
+                    const resolved = inferencer.resolve(instantiated);
+                    switch (resolved.*) {
+                        .fn_type => |ft| {
+                            if (ft.params.len > 0) {
+                                inferencer.unify(ft.params[0], obj_ty) catch {};
+                            }
+                            return ft.return_type;
+                        },
+                        else => return resolved,
                     }
-                    return ft.return_type;
-                },
-                else => return resolved,
+                }
             }
         }
     }
@@ -378,16 +396,34 @@ pub fn inferSafeMethodCall(
     env: *TypeEnv,
 ) SemaError!*Type {
     const obj_ty = inferencer.inferExpr(smc.object, env, null) catch return inferencer.freshTypeVar() catch unreachable;
-    var trait_iter = inferencer.trait_types.iterator();
-    while (trait_iter.next()) |entry| {
-        for (entry.value_ptr.method_names) |mname| {
-            if (std.mem.eql(u8, mname, smc.method)) {
-                const inner = inferencer.freshTypeVar() catch unreachable;
-                return inferencer.makeNullableType(inner) catch unreachable;
+    const robj = inferencer.resolve(obj_ty);
+    // 提取对象类型名，仅在该类型实际实现的 trait 中查找方法
+    const type_name: ?[]const u8 = switch (robj.*) {
+        .adt_type => |at| at.name,
+        .generic_type => |gt| gt.name,
+        .ref_type => |rt| switch (inferencer.resolve(rt.inner).*) {
+            .adt_type => |at| at.name,
+            .generic_type => |gt| gt.name,
+            else => null,
+        },
+        else => null,
+    };
+    if (type_name) |tn| {
+        var trait_iter = inferencer.trait_types.iterator();
+        while (trait_iter.next()) |entry| {
+            const trait_key = std.fmt.allocPrint(inferencer.arena.allocator(), "{s}::{s}", .{ entry.key_ptr.*, tn }) catch return inferencer.freshTypeVar() catch unreachable;
+            defer inferencer.arena.allocator().free(trait_key);
+            if (!inferencer.registered_traits.contains(trait_key)) continue;
+            for (entry.value_ptr.method_names) |mname| {
+                if (std.mem.eql(u8, mname, smc.method)) {
+                    const inner = inferencer.freshTypeVar() catch unreachable;
+                    return inferencer.makeNullableType(inner) catch unreachable;
+                }
             }
         }
+        // 对象类型未在任何已实现 trait 中找到匹配方法
+        inferencer.addError(.type_mismatch, "no trait method '{s}' found for type '{s}' in safe method call", .{ smc.method, tn });
     }
-    _ = obj_ty;
     const inner = inferencer.freshTypeVar() catch unreachable;
     return inferencer.makeNullableType(inner) catch unreachable;
 }

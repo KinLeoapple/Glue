@@ -27,7 +27,7 @@ fun main(): void {
         Ok(l) => {
             println("bind ok")
 
-            // spawn 服务端发送任务
+            // async 服务端发送任务
             val sender = sender_task(l)
 
             // 客户端连接

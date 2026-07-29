@@ -250,7 +250,7 @@ fn isSideEffectFreeExpr(expr: *const ast.Expr) bool {
         // 以下表达式一律视为有副作用，不在此处逐条展开。
         .call, .method_call, .safe_method_call, .string_interpolation,
         .index, .slice, .record_literal, .record_extend, .array_literal,
-        .lambda, .match, .select, .lazy, .spawn_expr,
+        .lambda, .match, .select, .lazy,
         .assignment_expr, .compound_assign, .propagate,
         .atomic_expr, .inline_trait_value,
         => false,

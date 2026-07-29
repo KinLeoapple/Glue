@@ -534,7 +534,6 @@ fn walkExpr(expr: *const ast.Expr, ctx: *WalkCtx) WalkError!void {
         // ── 并发/异步 ──
         .atomic_expr => |ae| try walkExpr(ae.value, ctx),
         .lazy => |l| try walkExpr(l.expr, ctx),
-        .spawn_expr => |se| try walkExpr(se.expr, ctx),
         .select => |s| {
             for (s.arms) |arm| switch (arm) {
                 .receive => |r| {

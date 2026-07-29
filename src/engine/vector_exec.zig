@@ -80,7 +80,7 @@ pub const Methods = struct {
                 } else 0;
                 try self.runtime.allocVector(node.output, count);
                 const desc = vm.elem_type_desc;
-                const ops = desc.scalar_ops;
+                const ops = desc.ops;
                 for (0..count) |i| {
                     const val = start + @as(i64, @intCast(i));
                     const elem_ptr = self.runtime.vectorElemPtr(node.output, i);
@@ -703,7 +703,7 @@ pub const Methods = struct {
                 }
                 const v = value.Value.makeArray(self.tctx.?, elements, null) catch return error.OutOfMemory;
                 try self.trackObj(v.asRef());
-                self.runtime.writePtr(node.output, @ptrCast(v.asRef()));
+                _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
             },
             else => return error.InvalidMetaIndex,
         }
@@ -1062,13 +1062,13 @@ pub const Methods = struct {
 
     /// vec_zip：合并两个向量为 Pair(first, second) 记录向量
     /// inputs[0] = 左向量，inputs[1] = 右向量
-    /// output = ref_chan 向量，每个元素是指向 Pair 记录的指针
+    /// output = 引用通道向量，每个元素是指向 Pair 记录的指针
     pub fn execVecZip(self: *Engine, node: *const Node) EngineError!void {
         const left_chan = node.inputs[0];
         const right_chan = node.inputs[1];
         const count = @min(self.runtime.vectorLen(left_chan), self.runtime.vectorLen(right_chan));
 
-        // 输出通道必须是 ref_chan，每个元素存 Pair 记录指针
+        // 输出通道必须是引用通道，每个元素存 Pair 记录指针
         if (!self.runtime.isRef(node.output)) return error.InvalidChannel;
 
         try self.runtime.allocVector(node.output, count);

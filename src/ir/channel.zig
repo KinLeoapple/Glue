@@ -53,6 +53,12 @@ pub const ChannelSpace = struct {
         return self.allocInner(type_desc, null, false);
     }
 
+    /// 分配带 inner_type_desc 的通道（用于 Lazy<T>/Channel<T> 等容器，type_desc 为 ref，
+    /// inner_type_desc 记录元素类型 T，供 emitLazyForce/recv 等查询）
+    pub fn allocWithInner(self: *ChannelSpace, type_desc: *const type_descriptor_mod.TypeDescriptor, inner_type_desc: ?*const type_descriptor_mod.TypeDescriptor) !u16 {
+        return self.allocInner(type_desc, inner_type_desc, false);
+    }
+
     /// 分配一个引用类型通道（&T / *T）
     pub fn allocRef(self: *ChannelSpace, type_desc: *const type_descriptor_mod.TypeDescriptor) !u16 {
         return self.allocInner(type_desc, null, false);

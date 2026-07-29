@@ -94,19 +94,19 @@ fun merge(a: i64[], b: i64[]): i64[] {
     var j: i32 = 0
     while i < cast(a.len()).to(i32) && j < cast(b.len()).to(i32) {
         if a[cast(i).to(usize)] <= b[cast(j).to(usize)] {
-            result = result.push(a[cast(i).to(usize)])
+            result = result ++ [a[cast(i).to(usize)]]
             i = i + 1
         } else {
-            result = result.push(b[cast(j).to(usize)])
+            result = result ++ [b[cast(j).to(usize)]]
             j = j + 1
         }
     }
     while i < cast(a.len()).to(i32) {
-        result = result.push(a[cast(i).to(usize)])
+        result = result ++ [a[cast(i).to(usize)]]
         i = i + 1
     }
     while j < cast(b.len()).to(i32) {
-        result = result.push(b[cast(j).to(usize)])
+        result = result ++ [b[cast(j).to(usize)]]
         j = j + 1
     }
     result
@@ -120,9 +120,9 @@ fun mergeSort(arr: i64[]): i64[] {
     var i: i32 = 0
     while i < cast(arr.len()).to(i32) {
         if i < mid {
-            left = left.push(arr[cast(i).to(usize)])
+            left = left ++ [arr[cast(i).to(usize)]]
         } else {
-            right = right.push(arr[cast(i).to(usize)])
+            right = right ++ [arr[cast(i).to(usize)]]
         }
         i = i + 1
     }
@@ -152,7 +152,7 @@ fun main(): void {
     var input: i64[] = []
     var k: i32 = 5000
     while k > 0 {
-        input = input.push(cast(k).to(i64))
+        input = input ++ [cast(k).to(i64)]
         k = k - 1
     }
     var sorted = mergeSort(input)

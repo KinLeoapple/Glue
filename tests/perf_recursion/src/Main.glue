@@ -17,7 +17,7 @@ fun main(): void {
     var arr: i32[] = []
     var i: i32 = 0
     while i < 10000 {
-        arr = arr.push(i)
+        arr = arr ++ [i]
         i = i + 1
     }
     println(arr.len())                   // 10000

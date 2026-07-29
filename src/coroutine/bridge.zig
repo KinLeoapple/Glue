@@ -74,12 +74,12 @@ pub const IoBridge = struct {
     /// sleep 线程完成后 ioComplete + 释放资源 + 退出。
     ///
     /// 阶段 5 迁移到 Io.Mutex 后可改用 Io 线程池的定时器回调，避免每 sleep 一个线程。
-    pub fn spawnSleep(self: *IoBridge, chan: *ChannelValue, nanos: u64) void {
+    pub fn launchSleepAsync(self: *IoBridge, chan: *ChannelValue, nanos: u64) void {
         const args = self.backing.create(SleepArgs) catch return;
         args.* = .{ .bridge = self, .chan = chan, .nanos = nanos };
         const thread = std.Thread.spawn(.{}, sleepWorker, .{args}) catch {
             self.backing.destroy(args);
-            // spawn 失败：直接 ioComplete 发 unit（sleep 视为立即完成）
+            // 线程 launch 失败：直接 ioComplete 发 unit（sleep 视为立即完成）
             self.ioComplete(chan, Value.fromUnit());
             return;
         };

@@ -7,7 +7,7 @@ fun buildArray(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        arr = arr.push(cast(i).to(i64))
+        arr = arr ++ [cast(i).to(i64)]
         i = i + 1
     }
     arr
@@ -43,10 +43,10 @@ fun matMul(a: Matrix, b: Matrix, n: i32): Matrix {
                 sum = sum + matGet(a, i, k) * matGet(b, k, j)
                 k = k + 1
             }
-            row = row.push(sum)
+            row = row ++ [sum]
             j = j + 1
         }
-        result = result.push(row)
+        result = result ++ [row]
         i = i + 1
     }
     Matrix(result)
@@ -59,10 +59,10 @@ fun buildIdentity(n: i32): Matrix {
         var row: i64[] = []
         var j: i32 = 0
         while j < n {
-            if i == j { row = row.push(1) } else { row = row.push(0) }
+            if i == j { row = row ++ [1] } else { row = row ++ [0] }
             j = j + 1
         }
-        rows = rows.push(row)
+        rows = rows ++ [row]
         i = i + 1
     }
     Matrix(rows)
@@ -91,7 +91,7 @@ fun main(): void {
     var churn: i64[] = []
     var cci: i32 = 0
     while cci < 5000 {
-        churn = churn.push(cci)
+        churn = churn ++ [cci]
         cci = cci + 1
     }
     println(cast(churn.len()).to(i64))  // 5000

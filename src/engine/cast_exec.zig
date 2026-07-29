@@ -93,7 +93,15 @@ pub const Methods = struct {
 
         const src_chan = node.inputs[0];
         const src_meta = self.ir.channels.get(src_chan);
-        const src_tag = engine_mod.Engine.chanToScalarTag(src_meta) orelse return error.UnsupportedOp;
+        // nullable 源：解包到 inner type 的 scalar tag（如 nullable<i64> → i64）
+        const src_tag = blk: {
+            if (engine_mod.Engine.chanToScalarTag(src_meta)) |tag| break :blk tag;
+            if (src_meta.inner_type_desc) |inner_td| {
+                const inner_meta = ir_mod.ChannelMeta{ .elem_width = inner_td.size, .type_desc = inner_td };
+                break :blk engine_mod.Engine.chanToScalarTag(inner_meta) orelse return error.UnsupportedOp;
+            }
+            return error.UnsupportedOp;
+        };
         const dst_tag = scalarKindToTag(meta.kind, meta.int_kind, meta.float_kind) orelse return error.UnsupportedOp;
 
         // str→数值 在 to 模式 panic（决策 #27）
@@ -149,7 +157,14 @@ pub const Methods = struct {
             return self.execCastTryToStrNumeric(node, str_bytes, dst_tag);
         }
 
-        const src_tag = engine_mod.Engine.chanToScalarTag(src_meta) orelse return error.UnsupportedOp;
+        const src_tag = blk: {
+            if (engine_mod.Engine.chanToScalarTag(src_meta)) |tag| break :blk tag;
+            if (src_meta.inner_type_desc) |inner_td| {
+                const inner_meta = ir_mod.ChannelMeta{ .elem_width = inner_td.size, .type_desc = inner_td };
+                break :blk engine_mod.Engine.chanToScalarTag(inner_meta) orelse return error.UnsupportedOp;
+            }
+            return error.UnsupportedOp;
+        };
 
         // 数值→数值：走 tryCast
         const a = self.readChanBytes(src_chan);
@@ -234,13 +249,13 @@ pub const Methods = struct {
         const to_v: value.Value = .{ .ref = &to_obj.header };
         const value_v: value.Value = .{ .ref = &value_obj.header };
 
-        // 构造 CastError RecordValue（带字段名，使 message() 默认实现能按名查找 msg）
-        var fields_buf: [4]value.Value = .{ msg_v, from_v, to_v, value_v };
-        const field_names: [4]?[]const u8 = .{ "msg", "from", "to", "value" };
+        // 构造 CastError RecordValue（含 __tag at index 0，与 compileConstructorCall 一致）
+        var fields_buf: [5]value.Value = .{ value.Value.fromI64(0), msg_v, from_v, to_v, value_v };
+        const field_names: [5]?[]const u8 = .{ "__tag", "msg", "from", "to", "value" };
         const cast_err_v = value.Value.makeRecordWithNames(self.tctx.?, "CastError", &fields_buf, &field_names) catch return error.OutOfMemory;
         try self.trackObj(cast_err_v.asRef());
-        // 4 字段：retain 引用计数（makeRecordWithNames 窃取引用，需 retain）
-        for (fields_buf) |fv| _ = value.obj_header.retain(fv.asRef(), self.tctx.?);
+        // retain 引用计数（makeRecordWithNames 窃取引用，需 retain；__tag 是标量跳过）
+        for (fields_buf[1..]) |fv| _ = value.obj_header.retain(fv.asRef(), self.tctx.?);
 
         // ThrowValue.err 直接持有 CastError RecordValue
         const rec_ptr: *value.RecordValue = @alignCast(@fieldParentPtr("header", cast_err_v.asRef()));

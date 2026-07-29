@@ -66,6 +66,10 @@ pub const CallMeta = struct {
     arg_ref_bits: u16 = 0,
     /// 返回值是否为 &T / *T，为 true 时返回不执行深拷贝
     ret_is_ref: bool = false,
+    /// 溢出参数通道（Node.inputs 仅存前 4 个，call_indirect 存前 3 个）。
+    /// 存放无法放入 Node.inputs[4] 的参数通道索引，按参数顺序排列。
+    /// 运行时通过 buildNodeArgs 合并 inline + extra 为完整参数切片。
+    extra_args: []const u16 = &.{},
 };
 
 /// halt 种类：控制 cleanup 的触发时机
@@ -231,7 +235,7 @@ pub const CleanupMeta = struct {
 // Phase 5: 星轨元数据
 // ════════════════════════════════════════════════════════════════
 
-/// 星轨元数据：描述 async/spawn 的异步轨道
+/// 星轨元数据：描述 async 的异步轨道
 ///
 /// orbit_async_create 创建轨道实例（返回 handle），
 /// orbit_async_join 等待轨道完成并取结果，
@@ -243,14 +247,14 @@ pub const OrbitMeta = struct {
     arg_count: u8,
     /// 结果类型描述符（orbit_async_join 的输出类型）
     result_type_desc: *const TypeDescriptor = type_descriptor_mod.i64_descriptor,
-    /// 是否为 spawn（fire-and-forget，无 join）
-    is_spawn: bool = false,
     /// 参数引用位图：第 i 位为 1 表示第 i 个参数为 &T / *T（引用语义，跳过深拷贝）。
     /// 从 Function.param_channels 的 ChannelMeta.type_desc.isRef() 提取。
     /// 最多支持 8 个参数（与 CallMeta.arg_ref_bits 对齐）。
     arg_ref_bits: u8 = 0,
     /// 泛型类型实参（与 CallMeta.type_args 一致，支持 async 泛型函数）
     type_args: []const u16 = &[_]u16{},
+    /// 溢出参数通道（Node.inputs 仅存前 4 个），存放第 5 个及之后的参数通道索引。
+    extra_args: []const u16 = &.{},
 };
 
 /// 循环元数据：描述标量循环（含 break/continue 的 for/while/loop）
@@ -456,7 +460,39 @@ pub const ClosureMeta = struct {
     /// 每个 upvalue 是否为 &T / *T 引用类型，最多 8 个 upvalue
     /// 第 i 位为 1 表示第 i 个 upvalue 是引用类型，捕获时保持共享而非深拷贝
     upvalue_ref_bits: u8 = 0,
+    /// 溢出上值通道（Node.inputs 仅存前 4 个），存放第 5 个及之后的 upvalue 通道索引。
+    extra_upvalues: []const u16 = &.{},
 };
+
+/// 合并 Node.inputs 中的内联参数与 meta 侧的溢出参数，构建完整参数切片。
+///
+/// Node.inputs 固定 4 槽，参数超过 4 个时溢出部分存储在 CallMeta/OrbitMeta/ClosureMeta
+/// 的 extra_args/extra_upvalues 字段。本函数将两部分合并到 `buf` 中并返回切片。
+///
+/// 参数：
+///   - node: IR 节点（读取 node.inputs）
+///   - extra: 溢出参数切片（CallMeta.extra_args / OrbitMeta.extra_args / ClosureMeta.extra_upvalues）
+///   - offset: node.inputs 中参数起始偏移（call=0, call_indirect=1 跳过 closure_chan）
+///   - count: 参数总数（不含 closure_chan）
+///   - buf: 栈上缓冲区（至少 16 槽）
+///
+/// 返回 buf[0..count]，前 inline_count 个来自 node.inputs[offset..]，其余来自 extra。
+pub fn buildNodeArgs(
+    node: *const node_mod.Node,
+    extra: []const u16,
+    offset: u8,
+    count: usize,
+    buf: *[16]u16,
+) []const u16 {
+    const c = @min(count, 16);
+    const inline_avail: usize = if (4 > offset) @as(usize, 4) - offset else 0;
+    const inline_count = @min(c, inline_avail);
+    @memcpy(buf[0..inline_count], node.inputs[offset .. offset + inline_count]);
+    if (c > inline_count) {
+        @memcpy(buf[inline_count..c], extra[0 .. c - inline_count]);
+    }
+    return buf[0..c];
+}
 
 // ════════════════════════════════════════════════════════════════
 // 部分应用元数据

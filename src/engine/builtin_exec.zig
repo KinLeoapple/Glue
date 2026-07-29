@@ -1,7 +1,7 @@
 //! 非反射 builtin 执行函数（v3 阶段 5.3：从 engine.zig 物理拆分）
 //!
-//! 包含 ok / error / eq / ref_eq / str / type / typeof / syscall /
-//! error_message / obj_type_name 等 builtin 执行函数。
+//! 包含 ok / error / eq / ref_eq / str / type / typeof / syscall 等 builtin 执行函数。
+//! message/type_name 由 Err trait 的 .glue 方法体走通用编译路径实现。
 //!
 //! 拆分模式：pub const Methods = struct { pub fn ... }，
 //! engine.zig 通过 pub const 别名注入 Engine 结构体。
@@ -21,36 +21,6 @@ const Node = ir_mod.Node;
 const TypeMetadata = ir_mod.meta_mod.TypeMetadata;
 const ThreadContext = mem.ThreadContext;
 
-/// 从 RecordValue 按 field_names 查找 "msg" 字段，提取字符串。
-/// 用于 error_message 节点（向后兼容，Trait 分派就绪后随 execErrorMessage 一起删除）。
-/// 查找策略：优先按 field_names 查找 "msg"；找不到回退到 fields[0]（CastError 的 msg 在 index 0）。
-fn extractMsgFromRecord(r: *value.RecordValue) []const u8 {
-    // 按 field_names 查找 "msg"
-    if (r.field_names.len > 0) {
-        for (r.field_names, 0..) |opt_name, i| {
-            if (opt_name) |n| if (std.mem.eql(u8, n, "msg")) {
-                if (i < r.fields.len) {
-                    const fv = r.fields[i];
-                    if (fv == .ref and fv.ref.type_tag == .str) {
-                        const fs: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", fv.ref));
-                        return fs.bytes();
-                    }
-                }
-            };
-        }
-    }
-    // 回退：fields[0]（CastError 的 msg 在 index 0；IOError 的 msg 在 index 1）
-    // 注意：此回退不精确，将在 Task 6 中随函数删除而消除
-    if (r.fields.len > 0) {
-        const fv = r.fields[0];
-        if (fv == .ref and fv.ref.type_tag == .str) {
-            const fs: *value.str_mod.Str = @alignCast(@fieldParentPtr("header", fv.ref));
-            return fs.bytes();
-        }
-    }
-    return "";
-}
-
 pub const Methods = struct {
     /// builtin_ok：构造 ThrowValue(ok payload)
     /// inputs[0] = 值通道
@@ -69,9 +39,9 @@ pub const Methods = struct {
         const msg_chan = node.inputs[0];
         const msg_val = if (self.runtime.readChannel(msg_chan)) |v| v else return error.InvalidChannel;
 
-        // 构造 Error(msg) RecordValue
-        var fields: [1]value.Value = .{msg_val};
-        const field_names: [1]?[]const u8 = .{"msg"};
+        // 构造 Error(msg) RecordValue（含 __tag at index 0，与 compileConstructorCall 一致）
+        var fields: [2]value.Value = .{ value.Value.fromI64(0), msg_val };
+        const field_names: [2]?[]const u8 = .{ "__tag", "msg" };
         const rec_val = value.Value.makeRecordWithNames(self.tctx.?, "Error", &fields, &field_names) catch return error.OutOfMemory;
         if (msg_val == .ref) _ = value.obj_header.retain(msg_val.ref, self.tctx.?);
         try self.trackObj(rec_val.asRef());
@@ -124,6 +94,16 @@ pub const Methods = struct {
 
             if (self.runtime.isRef(val_chan)) {
                 if (self.readStr(val_chan)) |s| break :blk s.bytes();
+                // LazyValue：强制求值后递归格式化内层值
+                if (self.readLazyValue(val_chan)) |lazy| {
+                    const forced = try self.forceLazyValue(lazy);
+                    const formatted = forced.formatAlloc(self.tctx.?) catch return error.OutOfMemory;
+                    defer self.tctx.?.backing.free(formatted);
+                    const str_obj = value.str_mod.Str.createContiguous(self.tctx.?, formatted) catch return error.OutOfMemory;
+                    try self.trackObj(&str_obj.header);
+                    _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(&str_obj.header)));
+                    return;
+                }
                 // 检查是否为数组（u8[] → UTF-8 解码为字符串）
                 if (self.readArray(val_chan)) |arr| {
                     // 仅当所有元素都是 u8 时，按字节拼接为字符串（字节→str 语义转换）
@@ -318,71 +298,5 @@ pub const Methods = struct {
                 _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(obj)));
             },
         }
-    }
-
-    /// error_message：提取错误值的消息字符串
-    /// inputs[0] = error ref 通道
-    /// output = ref_chan（Str 指针）
-    /// 支持：
-    /// - .throw_val：从 ThrowValue.err 的 RecordValue 按 field_names 查找 "msg"
-    /// - .record：error_newtype 实例，按 field_names 查找 "msg"
-    /// - .error_val：遗留 ErrorValue，读取 .message 字段（向后兼容）
-    pub fn execErrorMessage(self: *Engine, node: *const Node) EngineError!void {
-        const in_chan = node.inputs[0];
-        const in_val = self.runtime.readChannel(in_chan) orelse return error.InvalidChannel;
-        if (in_val != .ref) return error.InvalidChannel;
-        const header: *value.obj_header.ObjHeader = in_val.ref;
-        const msg: []const u8 = switch (header.type_tag) {
-            .error_val => blk: {
-                const e: *value.ErrorValue = @alignCast(@fieldParentPtr("header", header));
-                break :blk e.message;
-            },
-            .throw_val => blk: {
-                const t: *value.ThrowValue = @alignCast(@fieldParentPtr("header", header));
-                break :blk switch (t.payload) {
-                    .err => |rec_ptr| extractMsgFromRecord(rec_ptr),
-                    else => "ok",
-                };
-            },
-            .record => blk: {
-                const r: *value.RecordValue = @alignCast(@fieldParentPtr("header", header));
-                break :blk extractMsgFromRecord(r);
-            },
-            else => "not an error",
-        };
-        const v = value.Value.fromStringBytes(self.tctx.?, msg) catch return error.OutOfMemory;
-        try self.trackObj(v.asRef());
-        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
-    }
-
-    /// obj_type_name：获取值的类型名
-    /// inputs[0] = ref 通道
-    /// output = ref_chan（Str 指针）
-    pub fn execObjTypeName(self: *Engine, node: *const Node) EngineError!void {
-        const in_val = self.runtime.readChannel(node.inputs[0]) orelse return error.InvalidChannel;
-        if (in_val != .ref) return error.InvalidChannel;
-        const header: *value.obj_header.ObjHeader = in_val.ref;
-        const name: []const u8 = switch (header.type_tag) {
-            .record => blk: {
-                const r: *value.RecordValue = @alignCast(@fieldParentPtr("header", header));
-                break :blk r.type_name;
-            },
-            .adt => blk: {
-                const a: *value.AdtValue = @alignCast(@fieldParentPtr("header", header));
-                break :blk a.type_name;
-            },
-            .newtype => blk: {
-                const n: *value.NewtypeValue = @alignCast(@fieldParentPtr("header", header));
-                break :blk n.type_name;
-            },
-            .error_val => blk: {
-                const e: *value.ErrorValue = @alignCast(@fieldParentPtr("header", header));
-                break :blk e.type_name;
-            },
-            else => @tagName(header.type_tag),
-        };
-        const v = value.Value.fromStringBytes(self.tctx.?, name) catch return error.OutOfMemory;
-        try self.trackObj(v.asRef());
-        _ = self.runtime.writeChannel(node.output, value.Value.fromRef(@ptrCast(v.asRef())));
     }
 };
