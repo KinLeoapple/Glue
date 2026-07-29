@@ -180,7 +180,7 @@ impl F128 {
         let bits = u128::from_le_bytes(self.0);
         let sign = ((bits >> 127) & 1) as u64;
         let exp = ((bits >> 112) & 0x7FFF) as i32;
-        let mant = (bits & 0xFFFFFFFFFFFFFFFFFFFFFFFFFF) as u128;
+        let mant = bits & ((1u128 << 112) - 1);
 
         if exp == 0x7FFF {
             let m: u64 = if mant != 0 {
@@ -4188,9 +4188,9 @@ mod union_tests {
         let v = Value::f16(f16);
         assert_eq!(v.as_f16(), Some(f16));
 
-        // F128 用整数值避免 pre-existing 精度 bug（原 scalar.rs 实现问题）
-        let f128 = F128::from_f64(1.0);
-        assert_eq!(f128.to_f64(), 1.0);
+        // F128 往返测试（已修复掩码 bug）
+        let f128 = F128::from_f64(3.14159);
+        assert_eq!(f128.to_f64(), 3.14159);
         let v = Value::f128(f128);
         assert_eq!(v.as_f128(), Some(f128));
     }
