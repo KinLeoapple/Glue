@@ -10,7 +10,6 @@
 const std = @import("std");
 const ast = @import("ast");
 const ir = @import("ir");
-const glue_builtin = @import("glue_builtin");
 const subtype_check = @import("subtype_check");
 const trait_resolve = @import("trait_resolve");
 const throw_check = @import("throw_check");
@@ -4811,8 +4810,9 @@ pub const TypeInferencer = struct {
 
                             const return_ty: *Type = blk: {
                                 if (method.body) |body| {
-                                    var method_env = TypeEnv.init(self.arena.allocator());
-                                    defer method_env.deinit();
+                                    // 用 env.createChild() 继承全局环境中的 builtin（Ok/Error/throw 等），
+                                    // 而非全新 TypeEnv.init()——否则方法体内 Ok()/? 等无法解析。
+                                    const method_env = env.createChild() catch continue;
                                     for (method.params) |param| {
                                         // self 参数：绑定到所在 type 的类型（td.name 对应的 self_type）
                                         // 否则 method 体内 self.field 会因为 type_var 无法解析字段类型，
@@ -4838,14 +4838,33 @@ pub const TypeInferencer = struct {
                                         self.freshTypeVar() catch continue;
                                     const old_return_type = self.current_fn_return_type;
                                     defer self.current_fn_return_type = old_return_type;
-                                    self.current_fn_return_type = rt;
-                                    const body_ty = self.inferExpr(body, &method_env, rt) catch |err| {
+                                    // async 方法：声明返回 Async<X>，body 产出 X。
+                                    // current_fn_return_type 设为 X（unwrap Async），使 ? 传播匹配 Throw 上下文
+                                    if (method.is_async) {
+                                        const resolved_rt = self.resolve(rt);
+                                        if (resolved_rt.* == .generic_type and
+                                            std.mem.eql(u8, resolved_rt.generic_type.name, "Async") and
+                                            resolved_rt.generic_type.args.len == 1)
+                                        {
+                                            self.current_fn_return_type = resolved_rt.generic_type.args[0];
+                                        } else {
+                                            self.current_fn_return_type = rt;
+                                        }
+                                    } else {
+                                        self.current_fn_return_type = rt;
+                                    }
+                                    const body_ty = self.inferExpr(body, method_env, null) catch |err| {
                                         self.reportInferError(err, method.location);
                                         break :blk rt;
                                     };
+                                    // async 方法：body_ty 包裹为 Async<body_ty> 再与 rt 统一
+                                    const effective_body_ty = if (method.is_async)
+                                        self.makeGenericType("Async", &[_]*Type{body_ty}) catch break :blk rt
+                                    else
+                                        body_ty;
                                     // 与普通函数一致：用 unifyReturnType（含 int/float 拓宽），
                                     // 避免字面量推断的窄类型（如 u8 的 3）与声明的 i32 严格 unify 失败
-                                    self.unifyReturnType(rt, body_ty) catch |err| {
+                                    self.unifyReturnType(rt, effective_body_ty) catch |err| {
                                         self.reportInferError(err, method.location);
                                     };
                                     break :blk rt;

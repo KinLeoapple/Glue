@@ -28,23 +28,12 @@ pub const Methods = struct {
         self.current_type_context = td.name;
         defer self.current_type_context = prev_type_ctx;
 
-        for (td.methods) |method| {
-            if (method.body == null) continue;
-            const mangled = try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ td.name, method.name });
-            const func_idx = self.func_table.get(mangled) orelse continue;
-
-            // 构造等价的 fun_decl 结构来复用 compileFunction（compileFunction 用 anytype）
-            const fd = .{
-                .params = method.params,
-                .body = method.body.?,
-            };
-            _ = try self.compileFunction(fd, func_idx);
-        }
-
-        // 编译继承的 trait 默认方法体
-        // trait 默认方法的 self 参数是 Self 类型——trait 的隐式类型参数。
-        // 编译时把 "Self" → 具体类型的 TypeDescriptor 加入 current_type_args，
-        // 使 type_resolver 的 self_type 分支能像泛型 T 一样按名查到具体类型。
+        // 设置 current_self_type_name 和 "Self" type_args 绑定，
+        // 使所有方法（常规方法 + trait 默认方法）中的 self 标识符能正确推断类型名，
+        // self_type 类型注解能解析到具体类型。
+        // 此前仅 trait 默认方法设置此项，导致常规方法中 field_assignment 的
+        // inferTypeNameFromExpr(self) 返回 null，field_id 回退到 0（__tag），
+        // 写入错误字段，突变不生效。
         const prev_self_type = self.current_self_type_name;
         self.current_self_type_name = td.name;
         defer self.current_self_type_name = prev_self_type;
@@ -63,6 +52,24 @@ pub const Methods = struct {
         self.current_type_args = self_type_args;
         defer self.current_type_args = prev_type_args;
 
+        for (td.methods) |method| {
+            if (method.body == null) continue;
+            const mangled = try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ td.name, method.name });
+            const func_idx = self.func_table.get(mangled) orelse continue;
+
+            // 构造等价的 fun_decl 结构来复用 compileFunction（compileFunction 用 anytype）
+            const fd = .{
+                .params = method.params,
+                .body = method.body.?,
+                .is_async = method.is_async,
+                .return_type = method.return_type,
+            };
+            _ = try self.compileFunction(fd, func_idx);
+        }
+
+        // 编译继承的 trait 默认方法体
+        // trait 默认方法的 self 参数是 Self 类型——trait 的隐式类型参数。
+        // current_self_type_name 和 "Self" type_args 已在上方设置。
         for (td.implemented_traits) |tb| {
             const trait_def = self.sema_result.getTraitDef(tb.trait_name);
             if (trait_def == null) continue;
@@ -80,6 +87,8 @@ pub const Methods = struct {
                 const fd = .{
                     .params = tm.params,
                     .body = tm.body.?,
+                    .is_async = tm.is_async,
+                    .return_type = tm.return_type,
                 };
                 _ = try self.compileFunction(fd, func_idx);
             }

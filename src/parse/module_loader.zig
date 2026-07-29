@@ -743,7 +743,7 @@ pub const ModuleLoader = struct {
         _: std.mem.Allocator,
     ) !void {
         // builtin 模块列表（每个模块有 pack.glue + 子文件）
-        const builtin_modules = [_][]const u8{ "error", "iter" };
+        const builtin_modules = [_][]const u8{ "error", "iter", "io" };
         for (builtin_modules) |mod_name| {
             self.loadBuiltinModule(mod_name, extra_decls, retained_parsers, retained_tokens) catch {};
         }

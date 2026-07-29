@@ -79,14 +79,6 @@ pub fn build(b: *std.Build) void {
     analysis_db_module.addImport("ast", ast_module);
     analysis_db_module.addImport("ast_visitor", ast_visitor_module);
 
-    // ---- Builtin 元信息模块：集中管理 builtin 类型字段布局（sema 与 ir 共用） ----
-    // 注意：import 名取 "glue_builtin" 避免与 Zig 标准内建模块 "builtin" 冲突
-    const builtin_module = b.createModule(.{
-        .root_source_file = b.path("src/builtin.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // ---- Builtin .glue 嵌入模块：@embedFile 把 builtin/ 下的 .glue 文件编进二进制 ----
     // 供 module_loader 在加载用户模块前预加载 builtin 类型定义（走通用 sema/IR 路径）
     const builtin_embed_module = b.createModule(.{
@@ -100,7 +92,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     type_check_module.addImport("ast", ast_module);
-    type_check_module.addImport("glue_builtin", builtin_module);
     const subtype_check_module = b.createModule(.{
         .root_source_file = b.path("src/sema/subtype_check.zig"),
         .target = target,
@@ -195,7 +186,6 @@ pub fn build(b: *std.Build) void {
     ir_module.addImport("ast", ast_module);
     ir_module.addImport("value", value_module);
     ir_module.addImport("analysis_db", analysis_db_module);
-    ir_module.addImport("glue_builtin", builtin_module);
     ir_module.addImport("syscall", syscall_module);
     // v3 阶段 3：ir → sema 导入（用于架构收敛，builder.zig 消费 sema 侧 infer*/chanTypeFrom*）
     // Zig 0.16 支持模块间循环依赖（type_check ↔ subtype_check 已在用）。

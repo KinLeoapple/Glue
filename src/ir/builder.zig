@@ -11,7 +11,6 @@
 const std = @import("std");
 const ast = @import("ast");
 const scalar = @import("value").scalar;
-const glue_builtin = @import("glue_builtin");
 const syscall = @import("syscall");
 const node_mod = @import("node.zig");
 const meta_mod = @import("meta.zig");

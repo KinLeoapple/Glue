@@ -308,6 +308,7 @@ pub const MethodDecl = struct {
     is_override: bool,
     delegate: ?DelegateInfo = null,
     visibility: Visibility = .private,
+    is_async: bool = false,
 };
 
 /// 委托信息：将方法委托给某个 trait 的某个方法

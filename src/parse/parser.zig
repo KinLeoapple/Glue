@@ -938,6 +938,10 @@ pub const Parser = struct {
         if (self.matchToken(.kw_override)) {
             is_override = true;
         }
+        var is_async = false;
+        if (self.matchToken(.kw_async)) {
+            is_async = true;
+        }
         _ = self.expect(.kw_fun, "expected 'fun'") catch {};
         const name_tok = try self.expect(.identifier, "expected method name");
         var type_params = std.ArrayList(ast.TypeParam).empty;
@@ -981,6 +985,7 @@ pub const Parser = struct {
             .is_override = is_override,
             .delegate = delegate,
             .visibility = visibility,
+            .is_async = is_async,
         };
     }
 
@@ -1183,13 +1188,27 @@ pub const Parser = struct {
     }
 
     fn parseMethodParam(self: *Parser) ParserError!ast.Param {
+        // &self 语法糖：&self ≡ self: &Self
+        var is_ref_self = false;
+        if (self.matchToken(.ampersand)) {
+            is_ref_self = true;
+        }
         const name_tok = try self.expect(.identifier, "expected parameter name");
         var type_annotation: ?*ast.TypeNode = null;
         if (self.matchToken(.colon)) {
             type_annotation = try self.parseType();
         } else if (std.mem.eql(u8, name_tok.lexeme, "self")) {
-            // self 参数无类型注解：补上 .self_type，使类型解析走与泛型 T 相同的路径
-            type_annotation = try self.allocType(tokenLoc(name_tok), ast.TypeNode{ .self_type = .{} });
+            // self 参数无类型注解：补上类型，使类型解析走与泛型 T 相同的路径
+            const self_ty = try self.allocType(tokenLoc(name_tok), ast.TypeNode{ .self_type = .{} });
+            if (is_ref_self) {
+                // &self → ref_type(self_type)
+                type_annotation = try self.allocType(tokenLoc(name_tok), ast.TypeNode{ .ref_type = .{ .inner = self_ty } });
+            } else {
+                type_annotation = self_ty;
+            }
+        } else if (is_ref_self) {
+            try self.reportError("'&' without type annotation is only allowed for 'self' parameter");
+            return error.UnexpectedToken;
         }
         return ast.Param{
             .location = tokenLoc(name_tok),

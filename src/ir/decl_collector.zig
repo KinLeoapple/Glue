@@ -240,7 +240,7 @@ pub const Methods = struct {
                 .param_channels = placeholder_param_channels,
                 .return_channel = placeholder_return_chan,
                 .is_entry = false,
-                .is_async = false,
+                .is_async = method.is_async,
             });
             func_count.* += 1;
         }
@@ -263,7 +263,7 @@ pub const Methods = struct {
                     .param_channels = placeholder_param_channels,
                     .return_channel = placeholder_return_chan,
                     .is_entry = false,
-                    .is_async = false,
+                    .is_async = tm.is_async,
                 });
                 func_count.* += 1;
             }

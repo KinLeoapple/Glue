@@ -7,9 +7,6 @@
 //!   - builtin 类型对所有用户代码默认可见（不需要 import）
 //!   - builtin 类型不走 mangling（短名直接注册到全局环境）
 //!   - builtin .glue 中的 trait_decl/type_decl/fun_decl 走通用 sema/IR 路径
-//!
-//! BUILTIN_TYPES 表 (src/builtin.zig) 仍保留，仅供 Zig 端构造值时查询字段布局，
-//! 不再驱动 sema/IR 层的类型注册和方法合成。
 
 const std = @import("std");
 
@@ -33,6 +30,10 @@ pub const BUILTIN_FILES = [_]BuiltinFile{
     // ── iter 模块 ──
     .{ .path = "iter/pack.glue", .content = @embedFile("iter/pack.glue") },
     .{ .path = "iter/Iter.glue", .content = @embedFile("iter/Iter.glue") },
+    // ── io 模块 ──
+    .{ .path = "io/pack.glue", .content = @embedFile("io/pack.glue") },
+    .{ .path = "io/Reader.glue", .content = @embedFile("io/Reader.glue") },
+    .{ .path = "io/Writer.glue", .content = @embedFile("io/Writer.glue") },
 };
 
 /// 按相对路径查找嵌入的 builtin 文件内容，未命中返回 null
