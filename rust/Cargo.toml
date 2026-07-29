@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 bumpalo = { version = "3", features = ["collections"] }
+wide = "0.7"
+rayon = "1"
 
 [[bin]]
 name = "glue"

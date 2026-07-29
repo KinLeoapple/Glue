@@ -2596,6 +2596,37 @@ pub struct Parser<'a> {
     pending_gt_eq: bool,
 }
 
+// --- 解析辅助宏 ---
+
+/// 生成逗号分隔列表解析方法：先解析一项，随后循环消费逗号直至遇到终止符。
+/// `check($tk)` 以给定 TokenKind 为终止符；`check_close_angle` 以闭合尖括号为终止符。
+macro_rules! impl_parse_comma_list {
+    ($method:ident, $item:ty, $parse_fn:ident, check($tk:expr)) => {
+        fn $method(&mut self, items: &mut Vec<$item>) -> ParseResult<()> {
+            items.push(self.$parse_fn()?);
+            while self.match_token(TokenKind::Comma) {
+                if self.check($tk) {
+                    break;
+                }
+                items.push(self.$parse_fn()?);
+            }
+            Ok(())
+        }
+    };
+    ($method:ident, $item:ty, $parse_fn:ident, check_close_angle) => {
+        fn $method(&mut self, items: &mut Vec<$item>) -> ParseResult<()> {
+            items.push(self.$parse_fn()?);
+            while self.match_token(TokenKind::Comma) {
+                if self.check_close_angle() {
+                    break;
+                }
+                items.push(self.$parse_fn()?);
+            }
+            Ok(())
+        }
+    };
+}
+
 impl<'a> Parser<'a> {
     /// 创建语法分析器
     pub fn new(tokens: &'a [Token<'a>], arena: &'a Bump) -> Self {
@@ -3307,16 +3338,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析构造器字段列表
-    fn parse_constructor_field_list(&mut self, fields: &mut Vec<ConstructorField<'a>>) -> ParseResult<()> {
-        fields.push(self.parse_constructor_field()?);
-        while self.match_token(TokenKind::Comma) {
-            if self.check(TokenKind::RParen) {
-                break;
-            }
-            fields.push(self.parse_constructor_field()?);
-        }
-        Ok(())
-    }
+    impl_parse_comma_list!(parse_constructor_field_list, ConstructorField<'a>, parse_constructor_field, check(TokenKind::RParen));
 
     /// 解析单个构造器字段
     fn parse_constructor_field(&mut self) -> ParseResult<ConstructorField<'a>> {
@@ -3528,16 +3550,7 @@ impl<'a> Parser<'a> {
     // 类型参数、Kind、参数、约束
     // =====================================================================
 
-    fn parse_type_param_list(&mut self, type_params: &mut Vec<TypeParam<'a>>) -> ParseResult<()> {
-        type_params.push(self.parse_type_param()?);
-        while self.match_token(TokenKind::Comma) {
-            if self.check_close_angle() {
-                break;
-            }
-            type_params.push(self.parse_type_param()?);
-        }
-        Ok(())
-    }
+    impl_parse_comma_list!(parse_type_param_list, TypeParam<'a>, parse_type_param, check_close_angle);
 
     fn parse_type_param(&mut self) -> ParseResult<TypeParam<'a>> {
         let name_tok = self.expect(TokenKind::Identifier, "expected type parameter name")?;
@@ -3611,16 +3624,7 @@ impl<'a> Parser<'a> {
         unreachable!()
     }
 
-    fn parse_param_list(&mut self, params: &mut Vec<Param<'a>>) -> ParseResult<()> {
-        params.push(self.parse_param()?);
-        while self.match_token(TokenKind::Comma) {
-            if self.check(TokenKind::RParen) {
-                break;
-            }
-            params.push(self.parse_param()?);
-        }
-        Ok(())
-    }
+    impl_parse_comma_list!(parse_param_list, Param<'a>, parse_param, check(TokenKind::RParen));
 
     fn parse_param(&mut self) -> ParseResult<Param<'a>> {
         let name_tok = self.expect(TokenKind::Identifier, "expected parameter name")?;
@@ -3635,16 +3639,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_method_param_list(&mut self, params: &mut Vec<Param<'a>>) -> ParseResult<()> {
-        params.push(self.parse_method_param()?);
-        while self.match_token(TokenKind::Comma) {
-            if self.check(TokenKind::RParen) {
-                break;
-            }
-            params.push(self.parse_method_param()?);
-        }
-        Ok(())
-    }
+    impl_parse_comma_list!(parse_method_param_list, Param<'a>, parse_method_param, check(TokenKind::RParen));
 
     fn parse_method_param(&mut self) -> ParseResult<Param<'a>> {
         let is_ref_self = self.match_token(TokenKind::Ampersand);
@@ -3674,16 +3669,7 @@ impl<'a> Parser<'a> {
         self.parse_trait_bound_list_inner(bounds)
     }
 
-    fn parse_trait_bound_list_inner(&mut self, bounds: &mut Vec<TraitBound<'a>>) -> ParseResult<()> {
-        bounds.push(self.parse_trait_bound()?);
-        while self.match_token(TokenKind::Comma) {
-            if self.check(TokenKind::RParen) {
-                break;
-            }
-            bounds.push(self.parse_trait_bound()?);
-        }
-        Ok(())
-    }
+    impl_parse_comma_list!(parse_trait_bound_list_inner, TraitBound<'a>, parse_trait_bound, check(TokenKind::RParen));
 
     fn parse_trait_bound(&mut self) -> ParseResult<TraitBound<'a>> {
         let name_tok = self.expect(TokenKind::Identifier, "expected trait name")?;
@@ -3698,16 +3684,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_type_constraints(&mut self, constraints: &mut Vec<TypeConstraint<'a>>) -> ParseResult<()> {
-        constraints.push(self.parse_type_constraint()?);
-        while self.match_token(TokenKind::Comma) {
-            if self.check(TokenKind::LBrace) {
-                break;
-            }
-            constraints.push(self.parse_type_constraint()?);
-        }
-        Ok(())
-    }
+    impl_parse_comma_list!(parse_type_constraints, TypeConstraint<'a>, parse_type_constraint, check(TokenKind::LBrace));
 
     fn parse_type_constraint(&mut self) -> ParseResult<TypeConstraint<'a>> {
         let type_param_tok = self.expect(TokenKind::Identifier, "expected type parameter name")?;
@@ -3726,16 +3703,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_type_arg_list(&mut self, type_args: &mut Vec<TypeRef<'a>>) -> ParseResult<()> {
-        type_args.push(self.parse_type()?);
-        while self.match_token(TokenKind::Comma) {
-            if self.check_close_angle() {
-                break;
-            }
-            type_args.push(self.parse_type()?);
-        }
-        Ok(())
-    }
+    impl_parse_comma_list!(parse_type_arg_list, TypeRef<'a>, parse_type, check_close_angle);
 
     // =====================================================================
     // 类型解析
@@ -4645,16 +4613,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_lambda_param_list(&mut self, params: &mut Vec<Param<'a>>) -> ParseResult<()> {
-        params.push(self.parse_lambda_param()?);
-        while self.match_token(TokenKind::Comma) {
-            if self.check(TokenKind::RParen) {
-                break;
-            }
-            params.push(self.parse_lambda_param()?);
-        }
-        Ok(())
-    }
+    impl_parse_comma_list!(parse_lambda_param_list, Param<'a>, parse_lambda_param, check(TokenKind::RParen));
 
     fn parse_lambda_param(&mut self) -> ParseResult<Param<'a>> {
         let name_tok = self.expect(TokenKind::Identifier, "expected parameter name")?;
@@ -5899,6 +5858,36 @@ pub struct Printer {
     indent: usize,
 }
 
+// --- 打印辅助宏 ---
+
+/// 为运算符类型生成 `(op <name>)` 打印方法
+macro_rules! impl_print_op {
+    ($method:ident, $op:ty, $conv:ident) => {
+        fn $method(&mut self, op: $op) {
+            self.write_line(&format!("(op {})", $conv(op)));
+        }
+    };
+}
+
+/// 生成带标签的列表打印方法：空列表输出 `(label ())`，否则逐项打印
+macro_rules! impl_print_list {
+    ($method:ident, $item:ty, $print_fn:ident) => {
+        fn $method(&mut self, label: &str, items: &[$item]) {
+            if items.is_empty() {
+                self.write_line(&format!("({} ())", label));
+                return;
+            }
+            self.write_line(&format!("({}", label));
+            self.indent();
+            for e in items {
+                self.$print_fn(&e.node);
+            }
+            self.dedent();
+            self.write_line(")");
+        }
+    };
+}
+
 impl Printer {
     /// 创建空打印器
     pub fn new() -> Self {
@@ -6332,17 +6321,7 @@ impl Printer {
         for b in bounds {
             self.write_line(&format!("(trait_bound \"{}\"", b.trait_name));
             self.indent();
-            if b.type_args.is_empty() {
-                self.write_line("(type_args ())");
-            } else {
-                self.write_line("(type_args");
-                self.indent();
-                for arg in &b.type_args {
-                    self.print_type(&arg.node);
-                }
-                self.dedent();
-                self.write_line(")");
-            }
+            self.print_type_list("type_args", &b.type_args);
             self.dedent();
             self.write_line(")");
         }
@@ -6376,17 +6355,7 @@ impl Printer {
             TypeNode::Generic { name, args } => {
                 self.write_line(&format!("(type_generic \"{}\"", name));
                 self.indent();
-                if args.is_empty() {
-                    self.write_line("(type_args ())");
-                } else {
-                    self.write_line("(type_args");
-                    self.indent();
-                    for arg in args {
-                        self.print_type(&arg.node);
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
+                self.print_type_list("type_args", args);
                 self.dedent();
                 self.write_line(")");
             }
@@ -6417,17 +6386,7 @@ impl Printer {
             } => {
                 self.write_line("(type_function");
                 self.indent();
-                if params.is_empty() {
-                    self.write_line("(params ())");
-                } else {
-                    self.write_line("(params");
-                    self.indent();
-                    for p in params {
-                        self.print_type(&p.node);
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
+                self.print_type_list("params", params);
                 self.write_line("(return_type");
                 self.indent();
                 self.print_type(&return_type.node);
@@ -7384,45 +7343,18 @@ impl Printer {
 
     // --- 运算符打印 ---
 
-    fn print_binary_op(&mut self, op: BinaryOp) {
-        self.write_line(&format!("(op {})", binary_op_str(op)));
-    }
-
-    fn print_unary_op(&mut self, op: UnaryOp) {
-        self.write_line(&format!("(op {})", unary_op_str(op)));
-    }
-
-    fn print_compound_assign_op(&mut self, op: CompoundAssignOp) {
-        self.write_line(&format!("(op {})", compound_assign_op_str(op)));
-    }
+    impl_print_op!(print_binary_op, BinaryOp, binary_op_str);
+    impl_print_op!(print_unary_op, UnaryOp, unary_op_str);
+    impl_print_op!(print_compound_assign_op, CompoundAssignOp, compound_assign_op_str);
 
     // --- 列表/可选辅助 ---
 
-    fn print_expr_list(&mut self, label: &str, exprs: &[ExprRef<'_>]) {
-        if exprs.is_empty() {
-            self.write_line(&format!("({} ())", label));
-            return;
-        }
-        self.write_line(&format!("({}", label));
-        self.indent();
-        for e in exprs {
-            self.print_expr(&e.node);
-        }
-        self.dedent();
-        self.write_line(")");
-    }
+    impl_print_list!(print_expr_list, ExprRef<'_>, print_expr);
+    impl_print_list!(print_type_list, TypeRef<'_>, print_type);
 
     fn print_type_args_option(&mut self, type_args: &Option<Vec<TypeRef<'_>>>) {
         match type_args {
-            Some(args) if !args.is_empty() => {
-                self.write_line("(type_args");
-                self.indent();
-                for arg in args {
-                    self.print_type(&arg.node);
-                }
-                self.dedent();
-                self.write_line(")");
-            }
+            Some(args) if !args.is_empty() => self.print_type_list("type_args", args),
             _ => self.write_line("(type_args ())"),
         }
     }

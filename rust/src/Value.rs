@@ -8,6 +8,9 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Mutex;
 
+use rayon::prelude::*;
+use wide::{f32x4, f64x4, i32x4, i64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, CmpNe};
+
 // =========================================================================
 // 第一部分：标量基础类型（scalar.rs + char.rs）
 // =========================================================================
@@ -1315,6 +1318,235 @@ impl_scalar_api! {
     F64 => f64 / f64_ / as_f64 : f64;
 }
 
+// ---- 标量分派宏（消除 12-18 臂重复 match）----
+//
+// `dispatch_scalar!` 按 `ScalarTag` 分派读取 `ScalarValue` union 字段，
+// 绑定到 `$val` 后执行 `$expr`。用于 Hash / equals / as_int_i64 / as_int_i128
+// 等可统一表达的场景。F32/F64 的 to_bits 语义由调用方处理（Hash 经
+// `f32::hash`/`f64::hash` 内部 to_bits 保留，equals 显式 to_bits 比较）。
+macro_rules! dispatch_scalar {
+    ($sv:expr, $tag:expr, $val:ident => $expr:expr) => {
+        match $tag {
+            ScalarTag::Bool  => { let $val = unsafe { $sv.b }; $expr }
+            ScalarTag::Char  => { let $val = unsafe { $sv.cp }; $expr }
+            ScalarTag::I8    => { let $val = unsafe { $sv.i8_ }; $expr }
+            ScalarTag::I16   => { let $val = unsafe { $sv.i16_ }; $expr }
+            ScalarTag::I32   => { let $val = unsafe { $sv.i32_ }; $expr }
+            ScalarTag::I64   => { let $val = unsafe { $sv.i64_ }; $expr }
+            ScalarTag::I128  => { let $val = unsafe { $sv.i128_ }; $expr }
+            ScalarTag::U8    => { let $val = unsafe { $sv.u8_ }; $expr }
+            ScalarTag::U16   => { let $val = unsafe { $sv.u16_ }; $expr }
+            ScalarTag::U32   => { let $val = unsafe { $sv.u32_ }; $expr }
+            ScalarTag::U64   => { let $val = unsafe { $sv.u64_ }; $expr }
+            ScalarTag::U128  => { let $val = unsafe { $sv.u128_ }; $expr }
+            ScalarTag::Isize => { let $val = unsafe { $sv.isz_ }; $expr }
+            ScalarTag::Usize => { let $val = unsafe { $sv.usz_ }; $expr }
+            ScalarTag::F16   => { let $val = unsafe { $sv.f16_ }; $expr }
+            ScalarTag::F32   => { let $val = unsafe { $sv.f32_ }; $expr }
+            ScalarTag::F64   => { let $val = unsafe { $sv.f64_ }; $expr }
+            ScalarTag::F128  => { let $val = unsafe { $sv.f128_ }; $expr }
+        }
+    };
+    // @bits：F32/F64 绑定为 to_bits()（u32/u64）。f32/f64 未实现 Hash，且
+    // equals 需按位比较，故 Hash 与逐位比较走此模式。
+    (@bits $sv:expr, $tag:expr, $val:ident => $expr:expr) => {
+        match $tag {
+            ScalarTag::Bool  => { let $val = unsafe { $sv.b }; $expr }
+            ScalarTag::Char  => { let $val = unsafe { $sv.cp }; $expr }
+            ScalarTag::I8    => { let $val = unsafe { $sv.i8_ }; $expr }
+            ScalarTag::I16   => { let $val = unsafe { $sv.i16_ }; $expr }
+            ScalarTag::I32   => { let $val = unsafe { $sv.i32_ }; $expr }
+            ScalarTag::I64   => { let $val = unsafe { $sv.i64_ }; $expr }
+            ScalarTag::I128  => { let $val = unsafe { $sv.i128_ }; $expr }
+            ScalarTag::U8    => { let $val = unsafe { $sv.u8_ }; $expr }
+            ScalarTag::U16   => { let $val = unsafe { $sv.u16_ }; $expr }
+            ScalarTag::U32   => { let $val = unsafe { $sv.u32_ }; $expr }
+            ScalarTag::U64   => { let $val = unsafe { $sv.u64_ }; $expr }
+            ScalarTag::U128  => { let $val = unsafe { $sv.u128_ }; $expr }
+            ScalarTag::Isize => { let $val = unsafe { $sv.isz_ }; $expr }
+            ScalarTag::Usize => { let $val = unsafe { $sv.usz_ }; $expr }
+            ScalarTag::F16   => { let $val = unsafe { $sv.f16_ }; $expr }
+            ScalarTag::F32   => { let $val = unsafe { $sv.f32_.to_bits() }; $expr }
+            ScalarTag::F64   => { let $val = unsafe { $sv.f64_.to_bits() }; $expr }
+            ScalarTag::F128  => { let $val = unsafe { $sv.f128_ }; $expr }
+        }
+    };
+}
+
+// `scalar_fmt!` 硬编码 Debug / Display 的逐臂格式化（两者格式不同，无法用
+// 统一 $expr，故各成一模式）。@debug 带 i8/u8/i64... 后缀，@display 不带。
+macro_rules! scalar_fmt {
+    (@debug $sv:expr, $tag:expr, $f:expr) => {
+        match $tag {
+            ScalarTag::Bool  => write!($f, "{}",     unsafe { $sv.b }),
+            ScalarTag::Char  => write!($f, "'{}'",   Char::from_codepoint_unchecked(unsafe { $sv.cp })),
+            ScalarTag::I8    => write!($f, "{}i8",   unsafe { $sv.i8_ }),
+            ScalarTag::I16   => write!($f, "{}i16",  unsafe { $sv.i16_ }),
+            ScalarTag::I32   => write!($f, "{}",     unsafe { $sv.i32_ }),
+            ScalarTag::I64   => write!($f, "{}i64",  unsafe { $sv.i64_ }),
+            ScalarTag::I128  => write!($f, "{}i128", unsafe { $sv.i128_ }),
+            ScalarTag::U8    => write!($f, "{}u8",    unsafe { $sv.u8_ }),
+            ScalarTag::U16   => write!($f, "{}u16",  unsafe { $sv.u16_ }),
+            ScalarTag::U32   => write!($f, "{}u32",  unsafe { $sv.u32_ }),
+            ScalarTag::U64   => write!($f, "{}u64",  unsafe { $sv.u64_ }),
+            ScalarTag::U128  => write!($f, "{}u128", unsafe { $sv.u128_ }),
+            ScalarTag::Isize => write!($f, "{}isize",unsafe { $sv.isz_ }),
+            ScalarTag::Usize => write!($f, "{}usize",unsafe { $sv.usz_ }),
+            ScalarTag::F16   => write!($f, "{:?}",   F16(unsafe { $sv.f16_ })),
+            ScalarTag::F32   => write!($f, "{}f32",  unsafe { $sv.f32_ }),
+            ScalarTag::F64   => write!($f, "{}",     unsafe { $sv.f64_ }),
+            ScalarTag::F128  => write!($f, "{:?}",   F128(unsafe { $sv.f128_ }.to_le_bytes())),
+        }
+    };
+    (@display $sv:expr, $tag:expr, $f:expr) => {
+        match $tag {
+            ScalarTag::Bool  => write!($f, "{}", unsafe { $sv.b }),
+            ScalarTag::Char  => write!($f, "{}", Char::from_codepoint_unchecked(unsafe { $sv.cp })),
+            ScalarTag::I8    => write!($f, "{}", unsafe { $sv.i8_ }),
+            ScalarTag::I16   => write!($f, "{}", unsafe { $sv.i16_ }),
+            ScalarTag::I32   => write!($f, "{}", unsafe { $sv.i32_ }),
+            ScalarTag::I64   => write!($f, "{}", unsafe { $sv.i64_ }),
+            ScalarTag::I128  => write!($f, "{}", unsafe { $sv.i128_ }),
+            ScalarTag::U8    => write!($f, "{}", unsafe { $sv.u8_ }),
+            ScalarTag::U16   => write!($f, "{}", unsafe { $sv.u16_ }),
+            ScalarTag::U32   => write!($f, "{}", unsafe { $sv.u32_ }),
+            ScalarTag::U64   => write!($f, "{}", unsafe { $sv.u64_ }),
+            ScalarTag::U128  => write!($f, "{}", unsafe { $sv.u128_ }),
+            ScalarTag::Isize => write!($f, "{}", unsafe { $sv.isz_ }),
+            ScalarTag::Usize => write!($f, "{}", unsafe { $sv.usz_ }),
+            ScalarTag::F16   => write!($f, "{}", F16(unsafe { $sv.f16_ }).to_f32()),
+            ScalarTag::F32   => write!($f, "{}", unsafe { $sv.f32_ }),
+            ScalarTag::F64   => write!($f, "{}", unsafe { $sv.f64_ }),
+            ScalarTag::F128  => write!($f, "{}", F128(unsafe { $sv.f128_ }.to_le_bytes()).to_f64()),
+        }
+    };
+}
+
+// `construct_int_from_i64!` 按 tag 从 i64 构造对应整数标量（非整数 tag 回退到 I64）。
+macro_rules! construct_int_from_i64 {
+    ($tag:expr, $v:expr) => {
+        match $tag {
+            ScalarTag::I8    => Value::Scalar(ScalarValue { i8_: $v as i8 },    ScalarTag::I8),
+            ScalarTag::I16   => Value::Scalar(ScalarValue { i16_: $v as i16 }, ScalarTag::I16),
+            ScalarTag::I32   => Value::Scalar(ScalarValue { i32_: $v as i32 }, ScalarTag::I32),
+            ScalarTag::I64   => Value::Scalar(ScalarValue { i64_: $v },        ScalarTag::I64),
+            ScalarTag::I128  => Value::Scalar(ScalarValue { i128_: $v as i128 },ScalarTag::I128),
+            ScalarTag::U8    => Value::Scalar(ScalarValue { u8_: $v as u8 },    ScalarTag::U8),
+            ScalarTag::U16   => Value::Scalar(ScalarValue { u16_: $v as u16 }, ScalarTag::U16),
+            ScalarTag::U32   => Value::Scalar(ScalarValue { u32_: $v as u32 }, ScalarTag::U32),
+            ScalarTag::U64   => Value::Scalar(ScalarValue { u64_: $v as u64 }, ScalarTag::U64),
+            ScalarTag::U128  => Value::Scalar(ScalarValue { u128_: $v as u128 },ScalarTag::U128),
+            ScalarTag::Isize => Value::Scalar(ScalarValue { isz_: $v as isize },ScalarTag::Isize),
+            ScalarTag::Usize => Value::Scalar(ScalarValue { usz_: $v as usize },ScalarTag::Usize),
+            _ => Value::Scalar(ScalarValue { i64_: $v }, ScalarTag::I64),
+        }
+    };
+}
+
+// `float_to_f64!` 按 tag 将浮点标量统一提升为 f64（非浮点 tag unreachable）。
+macro_rules! float_to_f64 {
+    ($sv:expr, $tag:expr) => {
+        match $tag {
+            ScalarTag::F16  => F16(unsafe { $sv.f16_ }).to_f64(),
+            ScalarTag::F32  => (unsafe { $sv.f32_ }) as f64,
+            ScalarTag::F64  => unsafe { $sv.f64_ },
+            ScalarTag::F128 => F128(unsafe { $sv.f128_ }.to_le_bytes()).to_f64(),
+            _ => unreachable!(),
+        }
+    };
+}
+
+// `scalar_equals!` 逐臂比较两个 `ScalarValue`：F32/F64 按 to_bits() 比较
+// （区分 +0.0/-0.0 与 NaN 位模式），其余字段类型一致直接 ==。
+// （嵌套 dispatch_scalar! 不可行：内层 match 会绑定全部 18 种类型，导致
+//   跨类型 `av == bv` 编译失败。）
+macro_rules! scalar_equals {
+    ($a:expr, $b:expr, $tag:expr) => {
+        match $tag {
+            ScalarTag::Bool  => unsafe { $a.b == $b.b },
+            ScalarTag::Char  => unsafe { $a.cp == $b.cp },
+            ScalarTag::I8    => unsafe { $a.i8_ == $b.i8_ },
+            ScalarTag::I16   => unsafe { $a.i16_ == $b.i16_ },
+            ScalarTag::I32   => unsafe { $a.i32_ == $b.i32_ },
+            ScalarTag::I64   => unsafe { $a.i64_ == $b.i64_ },
+            ScalarTag::I128  => unsafe { $a.i128_ == $b.i128_ },
+            ScalarTag::U8    => unsafe { $a.u8_ == $b.u8_ },
+            ScalarTag::U16   => unsafe { $a.u16_ == $b.u16_ },
+            ScalarTag::U32   => unsafe { $a.u32_ == $b.u32_ },
+            ScalarTag::U64   => unsafe { $a.u64_ == $b.u64_ },
+            ScalarTag::U128  => unsafe { $a.u128_ == $b.u128_ },
+            ScalarTag::Isize => unsafe { $a.isz_ == $b.isz_ },
+            ScalarTag::Usize => unsafe { $a.usz_ == $b.usz_ },
+            ScalarTag::F16   => unsafe { $a.f16_ == $b.f16_ },
+            ScalarTag::F32   => unsafe { $a.f32_.to_bits() == $b.f32_.to_bits() },
+            ScalarTag::F64   => unsafe { $a.f64_.to_bits() == $b.f64_.to_bits() },
+            ScalarTag::F128  => unsafe { $a.f128_ == $b.f128_ },
+        }
+    };
+}
+
+// `read_int_as!` 按 tag 从字节读取整数并提升为 i128 / u128。
+// 整数类型（含 Isize/Usize）经符号扩展后转目标类型，非整数 tag 回退 0。
+// 有符号源在转 u128 时经 i128 中转，以保留与原逐臂代码一致的语义。
+macro_rules! read_int_as {
+    ($tag:expr, $bytes:expr, i128) => {
+        match $tag {
+            ScalarTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128,
+            ScalarTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as i128,
+            ScalarTag::I16   => read_i16_le($bytes) as i128,
+            ScalarTag::U16   => read_u16_le($bytes) as i128,
+            ScalarTag::I32   => read_i32_le($bytes) as i128,
+            ScalarTag::U32   => read_u32_le($bytes) as i128,
+            ScalarTag::I64   => read_i64_le($bytes) as i128,
+            ScalarTag::U64   => read_u64_le($bytes) as i128,
+            ScalarTag::I128  => read_i128_le($bytes),
+            ScalarTag::U128  => read_u128_le($bytes) as i128,
+            ScalarTag::Isize => read_i64_le($bytes) as isize as i128,
+            ScalarTag::Usize => read_u64_le($bytes) as usize as i128,
+            _ => 0,
+        }
+    };
+    ($tag:expr, $bytes:expr, u128) => {
+        match $tag {
+            ScalarTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128 as u128,
+            ScalarTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as u128,
+            ScalarTag::I16   => read_i16_le($bytes) as i128 as u128,
+            ScalarTag::U16   => read_u16_le($bytes) as u128,
+            ScalarTag::I32   => read_i32_le($bytes) as i128 as u128,
+            ScalarTag::U32   => read_u32_le($bytes) as u128,
+            ScalarTag::I64   => read_i64_le($bytes) as i128 as u128,
+            ScalarTag::U64   => read_u64_le($bytes) as u128,
+            ScalarTag::I128  => read_i128_le($bytes) as u128,
+            ScalarTag::U128  => read_u128_le($bytes),
+            ScalarTag::Isize => read_i64_le($bytes) as isize as i128 as u128,
+            ScalarTag::Usize => read_u64_le($bytes) as usize as u128,
+            _ => 0,
+        }
+    };
+}
+
+// `write_int_bytes!` 按 dst_tag 将整数（i128 或 u128）写入目标字节缓冲，
+// 复用既有 write_*_le 辅助函数以保持与原逐臂代码一致的截断/填充语义。
+macro_rules! write_int_bytes {
+    ($val:expr, $tag:expr, $dst:expr) => {
+        match $tag {
+            ScalarTag::I8    => write_i8($val as i8, $dst),
+            ScalarTag::U8    => write_u8($val as u8, $dst),
+            ScalarTag::I16   => write_i16_le($val as i16, $dst),
+            ScalarTag::U16   => write_u16_le($val as u16, $dst),
+            ScalarTag::I32   => write_i32_le($val as i32, $dst),
+            ScalarTag::U32   => write_u32_le($val as u32, $dst),
+            ScalarTag::I64   => write_i64_le($val as i64, $dst),
+            ScalarTag::U64   => write_u64_le($val as u64, $dst),
+            ScalarTag::I128  => write_i128_le($val as i128, $dst),
+            ScalarTag::U128  => write_u128_le($val as u128, $dst),
+            ScalarTag::Isize => write_i64_le($val as isize as i64, $dst),
+            ScalarTag::Usize => write_u64_le($val as usize as u64, $dst),
+            _ => {}
+        }
+    };
+}
+
 // ---- Char / F16 / F128 特殊构造器与访问器 ----
 
 impl Value {
@@ -1619,21 +1851,7 @@ impl Value {
 
     /// 从 `i64` 按 `tag` 构造对应整数（用于 IR 加载立即数）
     pub fn int_from_i64(tag: ScalarTag, v: i64) -> Self {
-        match tag {
-            ScalarTag::I8 => Value::Scalar(ScalarValue { i8_: v as i8 }, ScalarTag::I8),
-            ScalarTag::I16 => Value::Scalar(ScalarValue { i16_: v as i16 }, ScalarTag::I16),
-            ScalarTag::I32 => Value::Scalar(ScalarValue { i32_: v as i32 }, ScalarTag::I32),
-            ScalarTag::I64 => Value::Scalar(ScalarValue { i64_: v }, ScalarTag::I64),
-            ScalarTag::I128 => Value::Scalar(ScalarValue { i128_: v as i128 }, ScalarTag::I128),
-            ScalarTag::U8 => Value::Scalar(ScalarValue { u8_: v as u8 }, ScalarTag::U8),
-            ScalarTag::U16 => Value::Scalar(ScalarValue { u16_: v as u16 }, ScalarTag::U16),
-            ScalarTag::U32 => Value::Scalar(ScalarValue { u32_: v as u32 }, ScalarTag::U32),
-            ScalarTag::U64 => Value::Scalar(ScalarValue { u64_: v as u64 }, ScalarTag::U64),
-            ScalarTag::U128 => Value::Scalar(ScalarValue { u128_: v as u128 }, ScalarTag::U128),
-            ScalarTag::Isize => Value::Scalar(ScalarValue { isz_: v as isize }, ScalarTag::Isize),
-            ScalarTag::Usize => Value::Scalar(ScalarValue { usz_: v as usize }, ScalarTag::Usize),
-            _ => Value::Scalar(ScalarValue { i64_: v }, ScalarTag::I64),
-        }
+        construct_int_from_i64!(tag, v)
     }
 }
 
@@ -1733,23 +1951,9 @@ impl Value {
     /// 将整数标量统一提升为 `i64`
     pub fn as_int_i64(&self) -> Option<i64> {
         match self {
-            Value::Scalar(sv, tag) if tag.is_int() => unsafe {
-                Some(match *tag {
-                    ScalarTag::I8 => sv.i8_ as i64,
-                    ScalarTag::I16 => sv.i16_ as i64,
-                    ScalarTag::I32 => sv.i32_ as i64,
-                    ScalarTag::I64 => sv.i64_,
-                    ScalarTag::I128 => sv.i128_ as i64,
-                    ScalarTag::U8 => sv.u8_ as i64,
-                    ScalarTag::U16 => sv.u16_ as i64,
-                    ScalarTag::U32 => sv.u32_ as i64,
-                    ScalarTag::U64 => sv.u64_ as i64,
-                    ScalarTag::U128 => sv.u128_ as i64,
-                    ScalarTag::Isize => sv.isz_ as i64,
-                    ScalarTag::Usize => sv.usz_ as i64,
-                    _ => unreachable!(),
-                })
-            },
+            Value::Scalar(sv, tag) if tag.is_int() => {
+                Some(dispatch_scalar!(sv, *tag, v => v as i64))
+            }
             _ => None,
         }
     }
@@ -1757,23 +1961,9 @@ impl Value {
     /// 将整数标量统一提升为 `i128`
     pub fn as_int_i128(&self) -> Option<i128> {
         match self {
-            Value::Scalar(sv, tag) if tag.is_int() => unsafe {
-                Some(match *tag {
-                    ScalarTag::I8 => sv.i8_ as i128,
-                    ScalarTag::I16 => sv.i16_ as i128,
-                    ScalarTag::I32 => sv.i32_ as i128,
-                    ScalarTag::I64 => sv.i64_ as i128,
-                    ScalarTag::I128 => sv.i128_,
-                    ScalarTag::U8 => sv.u8_ as i128,
-                    ScalarTag::U16 => sv.u16_ as i128,
-                    ScalarTag::U32 => sv.u32_ as i128,
-                    ScalarTag::U64 => sv.u64_ as i128,
-                    ScalarTag::U128 => sv.u128_ as i128,
-                    ScalarTag::Isize => sv.isz_ as i128,
-                    ScalarTag::Usize => sv.usz_ as i128,
-                    _ => unreachable!(),
-                })
-            },
+            Value::Scalar(sv, tag) if tag.is_int() => {
+                Some(dispatch_scalar!(sv, *tag, v => v as i128))
+            }
             _ => None,
         }
     }
@@ -1781,15 +1971,7 @@ impl Value {
     /// 将浮点标量统一提升为 `f64`
     pub fn as_float_f64(&self) -> Option<f64> {
         match self {
-            Value::Scalar(sv, tag) if tag.is_float() => unsafe {
-                Some(match *tag {
-                    ScalarTag::F16 => F16(sv.f16_).to_f64(),
-                    ScalarTag::F32 => sv.f32_ as f64,
-                    ScalarTag::F64 => sv.f64_,
-                    ScalarTag::F128 => F128(sv.f128_.to_le_bytes()).to_f64(),
-                    _ => unreachable!(),
-                })
-            },
+            Value::Scalar(sv, tag) if tag.is_float() => Some(float_to_f64!(sv, *tag)),
             _ => None,
         }
     }
@@ -1839,28 +2021,7 @@ fn equals_impl(a: &Value, b: &Value, depth: u32) -> bool {
 }
 
 fn scalar_equals(a: &ScalarValue, b: &ScalarValue, tag: ScalarTag) -> bool {
-    unsafe {
-        match tag {
-            ScalarTag::Bool => a.b == b.b,
-            ScalarTag::Char => a.cp == b.cp,
-            ScalarTag::I8 => a.i8_ == b.i8_,
-            ScalarTag::I16 => a.i16_ == b.i16_,
-            ScalarTag::I32 => a.i32_ == b.i32_,
-            ScalarTag::I64 => a.i64_ == b.i64_,
-            ScalarTag::I128 => a.i128_ == b.i128_,
-            ScalarTag::U8 => a.u8_ == b.u8_,
-            ScalarTag::U16 => a.u16_ == b.u16_,
-            ScalarTag::U32 => a.u32_ == b.u32_,
-            ScalarTag::U64 => a.u64_ == b.u64_,
-            ScalarTag::U128 => a.u128_ == b.u128_,
-            ScalarTag::Isize => a.isz_ == b.isz_,
-            ScalarTag::Usize => a.usz_ == b.usz_,
-            ScalarTag::F16 => a.f16_ == b.f16_,
-            ScalarTag::F32 => a.f32_.to_bits() == b.f32_.to_bits(),
-            ScalarTag::F64 => a.f64_.to_bits() == b.f64_.to_bits(),
-            ScalarTag::F128 => a.f128_ == b.f128_,
-        }
-    }
+    scalar_equals!(a, b, tag)
 }
 
 fn heap_equals(a: &HeapObj, b: &HeapObj, depth: u32) -> bool {
@@ -2103,28 +2264,8 @@ impl Hash for Value {
             Value::Null | Value::Void => {}
             Value::Scalar(sv, tag) => {
                 tag.hash(state);
-                unsafe {
-                    match *tag {
-                        ScalarTag::Bool => sv.b.hash(state),
-                        ScalarTag::Char => sv.cp.hash(state),
-                        ScalarTag::I8 => sv.i8_.hash(state),
-                        ScalarTag::I16 => sv.i16_.hash(state),
-                        ScalarTag::I32 => sv.i32_.hash(state),
-                        ScalarTag::I64 => sv.i64_.hash(state),
-                        ScalarTag::I128 => sv.i128_.hash(state),
-                        ScalarTag::U8 => sv.u8_.hash(state),
-                        ScalarTag::U16 => sv.u16_.hash(state),
-                        ScalarTag::U32 => sv.u32_.hash(state),
-                        ScalarTag::U64 => sv.u64_.hash(state),
-                        ScalarTag::U128 => sv.u128_.hash(state),
-                        ScalarTag::Isize => sv.isz_.hash(state),
-                        ScalarTag::Usize => sv.usz_.hash(state),
-                        ScalarTag::F16 => sv.f16_.hash(state),
-                        ScalarTag::F32 => sv.f32_.to_bits().hash(state),
-                        ScalarTag::F64 => sv.f64_.to_bits().hash(state),
-                        ScalarTag::F128 => sv.f128_.hash(state),
-                    }
-                }
+                // f32/f64 未实现 Hash，@bits 模式将它们绑定为 to_bits()（u32/u64）再 hash。
+                dispatch_scalar!(@bits sv, *tag, v => v.hash(state));
             }
             Value::Ref(r) => {
                 r.hash(state);
@@ -2142,28 +2283,7 @@ impl fmt::Debug for Value {
         match self {
             Value::Null => write!(f, "null"),
             Value::Void => write!(f, "()"),
-            Value::Scalar(sv, tag) => unsafe {
-                match *tag {
-                    ScalarTag::Bool => write!(f, "{}", sv.b),
-                    ScalarTag::Char => write!(f, "'{}'", Char::from_codepoint_unchecked(sv.cp)),
-                    ScalarTag::I8 => write!(f, "{}i8", sv.i8_),
-                    ScalarTag::I16 => write!(f, "{}i16", sv.i16_),
-                    ScalarTag::I32 => write!(f, "{}", sv.i32_),
-                    ScalarTag::I64 => write!(f, "{}i64", sv.i64_),
-                    ScalarTag::I128 => write!(f, "{}i128", sv.i128_),
-                    ScalarTag::U8 => write!(f, "{}u8", sv.u8_),
-                    ScalarTag::U16 => write!(f, "{}u16", sv.u16_),
-                    ScalarTag::U32 => write!(f, "{}u32", sv.u32_),
-                    ScalarTag::U64 => write!(f, "{}u64", sv.u64_),
-                    ScalarTag::U128 => write!(f, "{}u128", sv.u128_),
-                    ScalarTag::Isize => write!(f, "{}isize", sv.isz_),
-                    ScalarTag::Usize => write!(f, "{}usize", sv.usz_),
-                    ScalarTag::F16 => write!(f, "{:?}", F16(sv.f16_)),
-                    ScalarTag::F32 => write!(f, "{}f32", sv.f32_),
-                    ScalarTag::F64 => write!(f, "{}", sv.f64_),
-                    ScalarTag::F128 => write!(f, "{:?}", F128(sv.f128_.to_le_bytes())),
-                }
-            },
+            Value::Scalar(sv, tag) => scalar_fmt!(@debug sv, *tag, f),
             Value::Ref(r) => write!(f, "{:?}", r),
         }
     }
@@ -2174,28 +2294,7 @@ impl fmt::Display for Value {
         match self {
             Value::Null => write!(f, "null"),
             Value::Void => write!(f, "()"),
-            Value::Scalar(sv, tag) => unsafe {
-                match *tag {
-                    ScalarTag::Bool => write!(f, "{}", sv.b),
-                    ScalarTag::Char => write!(f, "{}", Char::from_codepoint_unchecked(sv.cp)),
-                    ScalarTag::I8 => write!(f, "{}", sv.i8_),
-                    ScalarTag::I16 => write!(f, "{}", sv.i16_),
-                    ScalarTag::I32 => write!(f, "{}", sv.i32_),
-                    ScalarTag::I64 => write!(f, "{}", sv.i64_),
-                    ScalarTag::I128 => write!(f, "{}", sv.i128_),
-                    ScalarTag::U8 => write!(f, "{}", sv.u8_),
-                    ScalarTag::U16 => write!(f, "{}", sv.u16_),
-                    ScalarTag::U32 => write!(f, "{}", sv.u32_),
-                    ScalarTag::U64 => write!(f, "{}", sv.u64_),
-                    ScalarTag::U128 => write!(f, "{}", sv.u128_),
-                    ScalarTag::Isize => write!(f, "{}", sv.isz_),
-                    ScalarTag::Usize => write!(f, "{}", sv.usz_),
-                    ScalarTag::F16 => write!(f, "{}", F16(sv.f16_).to_f32()),
-                    ScalarTag::F32 => write!(f, "{}", sv.f32_),
-                    ScalarTag::F64 => write!(f, "{}", sv.f64_),
-                    ScalarTag::F128 => write!(f, "{}", F128(sv.f128_.to_le_bytes()).to_f64()),
-                }
-            },
+            Value::Scalar(sv, tag) => scalar_fmt!(@display sv, *tag, f),
             Value::Ref(r) => match r.as_ref() {
                 HeapObj::Str(s) => write!(f, "{}", s),
                 _ => write!(f, "{:?}", r),
@@ -2523,6 +2622,27 @@ fn read_bool(bytes: &[u8]) -> bool {
     bytes.first().copied().unwrap_or(0) != 0
 }
 
+fn read_i16_le(bytes: &[u8]) -> i16 {
+    let mut buf = [0u8; 2];
+    let len = bytes.len().min(2);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    i16::from_le_bytes(buf)
+}
+
+fn read_u16_le(bytes: &[u8]) -> u16 {
+    let mut buf = [0u8; 2];
+    let len = bytes.len().min(2);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    u16::from_le_bytes(buf)
+}
+
+fn read_i32_le(bytes: &[u8]) -> i32 {
+    let mut buf = [0u8; 4];
+    let len = bytes.len().min(4);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    i32::from_le_bytes(buf)
+}
+
 fn read_u32_le(bytes: &[u8]) -> u32 {
     let mut buf = [0u8; 4];
     let len = bytes.len().min(4);
@@ -2587,79 +2707,11 @@ fn read_f128(bytes: &[u8]) -> F128 {
 }
 
 fn read_int_as_i128(tag: ScalarTag, bytes: &[u8]) -> i128 {
-    match tag {
-        ScalarTag::I8 => bytes.first().copied().unwrap_or(0) as i8 as i128,
-        ScalarTag::U8 => bytes.first().copied().unwrap_or(0) as u8 as i128,
-        ScalarTag::I16 => i16::from_le_bytes({
-            let mut b = [0u8; 2];
-            let l = bytes.len().min(2);
-            b[..l].copy_from_slice(&bytes[..l]);
-            b
-        }) as i128,
-        ScalarTag::U16 => u16::from_le_bytes({
-            let mut b = [0u8; 2];
-            let l = bytes.len().min(2);
-            b[..l].copy_from_slice(&bytes[..l]);
-            b
-        }) as i128,
-        ScalarTag::I32 => i32::from_le_bytes({
-            let mut b = [0u8; 4];
-            let l = bytes.len().min(4);
-            b[..l].copy_from_slice(&bytes[..l]);
-            b
-        }) as i128,
-        ScalarTag::U32 => u32::from_le_bytes({
-            let mut b = [0u8; 4];
-            let l = bytes.len().min(4);
-            b[..l].copy_from_slice(&bytes[..l]);
-            b
-        }) as i128,
-        ScalarTag::I64 => read_i64_le(bytes) as i128,
-        ScalarTag::U64 => read_u64_le(bytes) as i128,
-        ScalarTag::I128 => read_i128_le(bytes),
-        ScalarTag::U128 => read_u128_le(bytes) as i128,
-        ScalarTag::Isize => read_i64_le(bytes) as isize as i128,
-        ScalarTag::Usize => read_u64_le(bytes) as usize as i128,
-        _ => 0,
-    }
+    read_int_as!(tag, bytes, i128)
 }
 
 fn read_int_as_u128(tag: ScalarTag, bytes: &[u8]) -> u128 {
-    match tag {
-        ScalarTag::I8 => bytes.first().copied().unwrap_or(0) as i8 as i128 as u128,
-        ScalarTag::U8 => bytes.first().copied().unwrap_or(0) as u8 as u128,
-        ScalarTag::I16 => i16::from_le_bytes({
-            let mut b = [0u8; 2];
-            let l = bytes.len().min(2);
-            b[..l].copy_from_slice(&bytes[..l]);
-            b
-        }) as i128 as u128,
-        ScalarTag::U16 => u16::from_le_bytes({
-            let mut b = [0u8; 2];
-            let l = bytes.len().min(2);
-            b[..l].copy_from_slice(&bytes[..l]);
-            b
-        }) as u128,
-        ScalarTag::I32 => i32::from_le_bytes({
-            let mut b = [0u8; 4];
-            let l = bytes.len().min(4);
-            b[..l].copy_from_slice(&bytes[..l]);
-            b
-        }) as i128 as u128,
-        ScalarTag::U32 => u32::from_le_bytes({
-            let mut b = [0u8; 4];
-            let l = bytes.len().min(4);
-            b[..l].copy_from_slice(&bytes[..l]);
-            b
-        }) as u128,
-        ScalarTag::I64 => read_i64_le(bytes) as i128 as u128,
-        ScalarTag::U64 => read_u64_le(bytes) as u128,
-        ScalarTag::I128 => read_i128_le(bytes) as u128,
-        ScalarTag::U128 => read_u128_le(bytes),
-        ScalarTag::Isize => read_i64_le(bytes) as isize as i128 as u128,
-        ScalarTag::Usize => read_u64_le(bytes) as usize as u128,
-        _ => 0,
-    }
+    read_int_as!(tag, bytes, u128)
 }
 
 fn write_bool(b: bool, dst: &mut [u8]) {
@@ -2759,39 +2811,11 @@ fn cast_from_u32(cp: u32, dst_tag: ScalarTag, dst: &mut [u8]) {
 }
 
 fn cast_from_i128(val: i128, dst_tag: ScalarTag, dst: &mut [u8]) {
-    match dst_tag {
-        ScalarTag::I8 => write_i8(val as i8, dst),
-        ScalarTag::U8 => write_u8(val as u8, dst),
-        ScalarTag::I16 => write_i16_le(val as i16, dst),
-        ScalarTag::U16 => write_u16_le(val as u16, dst),
-        ScalarTag::I32 => write_i32_le(val as i32, dst),
-        ScalarTag::U32 => write_u32_le(val as u32, dst),
-        ScalarTag::I64 => write_i64_le(val as i64, dst),
-        ScalarTag::U64 => write_u64_le(val as u64, dst),
-        ScalarTag::I128 => write_i128_le(val, dst),
-        ScalarTag::U128 => write_u128_le(val as u128, dst),
-        ScalarTag::Isize => write_i64_le(val as isize as i64, dst),
-        ScalarTag::Usize => write_u64_le(val as usize as u64, dst),
-        _ => {}
-    }
+    write_int_bytes!(val, dst_tag, dst)
 }
 
 fn cast_from_u128(val: u128, dst_tag: ScalarTag, dst: &mut [u8]) {
-    match dst_tag {
-        ScalarTag::I8 => write_i8(val as i8, dst),
-        ScalarTag::U8 => write_u8(val as u8, dst),
-        ScalarTag::I16 => write_i16_le(val as i16, dst),
-        ScalarTag::U16 => write_u16_le(val as u16, dst),
-        ScalarTag::I32 => write_i32_le(val as i32, dst),
-        ScalarTag::U32 => write_u32_le(val as u32, dst),
-        ScalarTag::I64 => write_i64_le(val as i64, dst),
-        ScalarTag::U64 => write_u64_le(val as u64, dst),
-        ScalarTag::I128 => write_i128_le(val as i128, dst),
-        ScalarTag::U128 => write_u128_le(val, dst),
-        ScalarTag::Isize => write_i64_le(val as isize as i64, dst),
-        ScalarTag::Usize => write_u64_le(val as usize as u64, dst),
-        _ => {}
-    }
+    write_int_bytes!(val, dst_tag, dst)
 }
 
 fn cast_from_f64(val: f64, dst_tag: ScalarTag, dst: &mut [u8]) {
@@ -3006,23 +3030,62 @@ pub enum ReduceOp {
     Add, Mul, Band, Bor, Bxor,
 }
 
-/// 通用二元运算分派
+/// 大数组并行阈值：超过该长度时启用 rayon 并行分块。
+const PARALLEL_THRESHOLD: usize = 4096;
+
+/// 计算并行分块大小：将数组切成约 (线程数 × 4) 块，并对齐到 4 lane
+/// 以便 SIMD kernel 每个 chunk 都能尽量走满整 lane。
+#[inline]
+fn par_chunk_size(n: usize) -> usize {
+    let pieces = rayon::current_num_threads().max(1) * 4;
+    let chunk = (n + pieces - 1) / pieces;
+    // 向上对齐到 4 的倍数
+    let chunk = (chunk + 3) & !3;
+    chunk.max(4)
+}
+
+/// 通用二元运算分派（标量路径）。大数组（> PARALLEL_THRESHOLD）走 rayon 并行，
+/// 小数组走单线程标量以避免线程调度开销。
 pub fn batch_binop<T>(dst: &mut [T], a: &[T], b: &[T], op: BinOp)
-where T: Num + BitOps {
+where
+    T: Num + BitOps + Send + Sync,
+{
     let n = dst.len().min(a.len()).min(b.len());
-    for i in 0..n {
-        dst[i] = match op {
-            BinOp::Add => a[i].wrapping_add(b[i]),
-            BinOp::Sub => a[i].wrapping_sub(b[i]),
-            BinOp::Mul => a[i].wrapping_mul(b[i]),
-            BinOp::Div => a[i].checked_div(b[i]).unwrap_or_else(T::zero),
-            BinOp::Mod => a[i].checked_rem(b[i]).unwrap_or_else(T::zero),
-            BinOp::Band => a[i].bit_and(b[i]),
-            BinOp::Bor => a[i].bit_or(b[i]),
-            BinOp::Bxor => a[i].bit_xor(b[i]),
-            BinOp::Shl => a[i].shl(b[i].to_u32()),
-            BinOp::Shr => a[i].shr(b[i].to_u32()),
-        };
+    if n == 0 {
+        return;
+    }
+    if n > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        dst[..n]
+            .par_chunks_mut(chunk)
+            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+            .for_each(|(d, (av, bv))| {
+                let m = d.len();
+                for i in 0..m {
+                    d[i] = binop_scalar_t(av[i], bv[i], op);
+                }
+            });
+    } else {
+        for i in 0..n {
+            dst[i] = binop_scalar_t(a[i], b[i], op);
+        }
+    }
+}
+
+/// 标量二元运算（泛型后备，与原始 for 循环语义完全一致）。
+#[inline]
+fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
+    match op {
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        BinOp::Div => a.checked_div(b).unwrap_or_else(T::zero),
+        BinOp::Mod => a.checked_rem(b).unwrap_or_else(T::zero),
+        BinOp::Band => a.bit_and(b),
+        BinOp::Bor => a.bit_or(b),
+        BinOp::Bxor => a.bit_xor(b),
+        BinOp::Shl => a.shl(b.to_u32()),
+        BinOp::Shr => a.shr(b.to_u32()),
     }
 }
 
@@ -3039,26 +3102,71 @@ where T: Num + BitOps {
     }
 }
 
-/// 批量比较运算：输出 `u8` 掩码
+/// 批量比较运算：输出 `u8` 掩码（0/1）。大数组走 rayon 并行，小数组走标量。
 pub fn batch_cmp<T>(dst: &mut [u8], a: &[T], b: &[T], op: CmpOp)
-where T: PartialOrd {
+where
+    T: PartialOrd + Sync,
+{
     let n = dst.len().min(a.len()).min(b.len());
-    for i in 0..n {
-        dst[i] = match op {
-            CmpOp::Lt => a[i] < b[i],
-            CmpOp::Gt => a[i] > b[i],
-            CmpOp::Eq => a[i] == b[i],
-            CmpOp::Ne => a[i] != b[i],
-            CmpOp::Le => a[i] <= b[i],
-            CmpOp::Ge => a[i] >= b[i],
+    if n == 0 {
+        return;
+    }
+    if n > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        dst[..n]
+            .par_chunks_mut(chunk)
+            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+            .for_each(|(d, (av, bv))| {
+                let m = d.len();
+                for i in 0..m {
+                    d[i] = cmp_scalar_t(&av[i], &bv[i], op) as u8;
+                }
+            });
+    } else {
+        for i in 0..n {
+            dst[i] = cmp_scalar_t(&a[i], &b[i], op) as u8;
         }
-        .into();
     }
 }
 
-/// 批量归约运算
+/// 标量比较（泛型后备，按引用比较，因此不要求 T: Copy）。
+#[inline]
+fn cmp_scalar_t<T: PartialOrd + ?Sized>(a: &T, b: &T, op: CmpOp) -> bool {
+    match op {
+        CmpOp::Lt => a < b,
+        CmpOp::Gt => a > b,
+        CmpOp::Eq => a == b,
+        CmpOp::Ne => a != b,
+        CmpOp::Le => a <= b,
+        CmpOp::Ge => a >= b,
+    }
+}
+
+/// 批量归约运算。大数组走 rayon 并行归约（各分块局部归约后再合并，
+/// wrapping add/mul 与位运算均满足结合律，结果与顺序归约一致）。
 pub fn batch_reduce<T>(a: &[T], op: ReduceOp) -> T
-where T: Num + BitOps {
+where
+    T: Num + BitOps + Send + Sync,
+{
+    if a.is_empty() {
+        return T::zero();
+    }
+    if a.len() > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(a.len());
+        let partials: Vec<T> = a.par_chunks(chunk).map(|c| reduce_seq(c, op)).collect();
+        let mut acc = partials[0];
+        for &p in &partials[1..] {
+            acc = reduce_combine(acc, p, op);
+        }
+        acc
+    } else {
+        reduce_seq(a, op)
+    }
+}
+
+/// 顺序归约（从 a[0] 起累加，与原始实现语义一致）。
+#[inline]
+fn reduce_seq<T: Num + BitOps>(a: &[T], op: ReduceOp) -> T {
     if a.is_empty() {
         return T::zero();
     }
@@ -3075,6 +3183,18 @@ where T: Num + BitOps {
     acc
 }
 
+/// 合并两个归约部分结果。
+#[inline]
+fn reduce_combine<T: Num + BitOps>(a: T, b: T, op: ReduceOp) -> T {
+    match op {
+        ReduceOp::Add => a.wrapping_add(b),
+        ReduceOp::Mul => a.wrapping_mul(b),
+        ReduceOp::Band => a.bit_and(b),
+        ReduceOp::Bor => a.bit_or(b),
+        ReduceOp::Bxor => a.bit_xor(b),
+    }
+}
+
 /// 掩码选择
 pub fn batch_select<T>(dst: &mut [T], mask: &[u8], t: &[T], f: &[T])
 where T: Copy {
@@ -3089,6 +3209,482 @@ pub fn broadcast<T>(dst: &mut [T], val: T)
 where T: Copy {
     for slot in dst.iter_mut() {
         *slot = val;
+    }
+}
+
+// =========================================================================
+// 第十三部分补充：SIMD 加速特化（wide crate + rayon）
+//
+// 对 f32/f64/i32/i64 提供独立的 SIMD 特化函数（4-wide）。
+// - 算术/位运算走 SIMD lane，无法向量化的运算（整数 Div/Mod/Shl/Shr、
+//   浮点 Mod）回退到标量；
+// - 大数组（> PARALLEL_THRESHOLD）走 rayon 并行分块，每块由 SIMD kernel 处理；
+// - 这些是 *额外* 的 pub fn，泛型版本（batch_binop 等）保持不变。
+// =========================================================================
+
+/// SIMD lane 宽度。
+const SIMD_LANES: usize = 4;
+
+// -------------------- f32 --------------------
+
+#[inline]
+fn binop_f32_scalar(a: f32, b: f32, op: BinOp) -> f32 {
+    match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        BinOp::Div => a / b,
+        BinOp::Mod => a % b,
+        // f32 不支持位运算/移位，保持原值
+        _ => a,
+    }
+}
+
+fn binop_f32_kernel(dst: &mut [f32], a: &[f32], b: &[f32], op: BinOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    let blocks = n / SIMD_LANES;
+    let use_simd = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+    if use_simd {
+        for blk in 0..blocks {
+            let i = blk * SIMD_LANES;
+            let va = f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+            let vb = f32x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
+            let r = match op {
+                BinOp::Add => va + vb,
+                BinOp::Sub => va - vb,
+                BinOp::Mul => va * vb,
+                BinOp::Div => va / vb,
+                _ => unreachable!(),
+            };
+            dst[i..i + SIMD_LANES].copy_from_slice(&r.to_array());
+        }
+    } else {
+        for blk in 0..blocks {
+            let i = blk * SIMD_LANES;
+            for j in 0..SIMD_LANES {
+                dst[i + j] = binop_f32_scalar(a[i + j], b[i + j], op);
+            }
+        }
+    }
+    let tail = blocks * SIMD_LANES;
+    for i in tail..n {
+        dst[i] = binop_f32_scalar(a[i], b[i], op);
+    }
+}
+
+/// f32 SIMD + rayon 并行二元运算。
+pub fn batch_binop_f32(dst: &mut [f32], a: &[f32], b: &[f32], op: BinOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    if n == 0 {
+        return;
+    }
+    if n > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        dst[..n]
+            .par_chunks_mut(chunk)
+            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+            .for_each(|(d, (av, bv))| binop_f32_kernel(d, av, bv, op));
+    } else {
+        binop_f32_kernel(&mut dst[..n], &a[..n], &b[..n], op);
+    }
+}
+
+// -------------------- f64 --------------------
+
+#[inline]
+fn binop_f64_scalar(a: f64, b: f64, op: BinOp) -> f64 {
+    match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        BinOp::Div => a / b,
+        BinOp::Mod => a % b,
+        _ => a,
+    }
+}
+
+fn binop_f64_kernel(dst: &mut [f64], a: &[f64], b: &[f64], op: BinOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    let blocks = n / SIMD_LANES;
+    let use_simd = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+    if use_simd {
+        for blk in 0..blocks {
+            let i = blk * SIMD_LANES;
+            let va = f64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+            let vb = f64x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
+            let r = match op {
+                BinOp::Add => va + vb,
+                BinOp::Sub => va - vb,
+                BinOp::Mul => va * vb,
+                BinOp::Div => va / vb,
+                _ => unreachable!(),
+            };
+            dst[i..i + SIMD_LANES].copy_from_slice(&r.to_array());
+        }
+    } else {
+        for blk in 0..blocks {
+            let i = blk * SIMD_LANES;
+            for j in 0..SIMD_LANES {
+                dst[i + j] = binop_f64_scalar(a[i + j], b[i + j], op);
+            }
+        }
+    }
+    let tail = blocks * SIMD_LANES;
+    for i in tail..n {
+        dst[i] = binop_f64_scalar(a[i], b[i], op);
+    }
+}
+
+/// f64 SIMD + rayon 并行二元运算。
+pub fn batch_binop_f64(dst: &mut [f64], a: &[f64], b: &[f64], op: BinOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    if n == 0 {
+        return;
+    }
+    if n > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        dst[..n]
+            .par_chunks_mut(chunk)
+            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+            .for_each(|(d, (av, bv))| binop_f64_kernel(d, av, bv, op));
+    } else {
+        binop_f64_kernel(&mut dst[..n], &a[..n], &b[..n], op);
+    }
+}
+
+// -------------------- i32 --------------------
+
+#[inline]
+fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
+    match op {
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        // 整数除零返回 0（与泛型 checked_div 语义一致）
+        BinOp::Div => a.checked_div(b).unwrap_or(0),
+        BinOp::Mod => a.checked_rem(b).unwrap_or(0),
+        BinOp::Band => a & b,
+        BinOp::Bor => a | b,
+        BinOp::Bxor => a ^ b,
+        BinOp::Shl => a << (b as u32),
+        BinOp::Shr => a >> (b as u32),
+    }
+}
+
+fn binop_i32_kernel(dst: &mut [i32], a: &[i32], b: &[i32], op: BinOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    let blocks = n / SIMD_LANES;
+    // i32x4 支持算术 + 位运算（均 wrapping，与泛型语义一致）；
+    // Div/Mod（无 SIMD 整数除法、且需除零保护）与 Shl/Shr（逐 lane 变长移位
+    // 不支持）回退标量。
+    let use_simd = matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Band | BinOp::Bor | BinOp::Bxor
+    );
+    if use_simd {
+        for blk in 0..blocks {
+            let i = blk * SIMD_LANES;
+            let va = i32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+            let vb = i32x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
+            let r = match op {
+                BinOp::Add => va + vb,
+                BinOp::Sub => va - vb,
+                BinOp::Mul => va * vb,
+                BinOp::Band => va & vb,
+                BinOp::Bor => va | vb,
+                BinOp::Bxor => va ^ vb,
+                _ => unreachable!(),
+            };
+            dst[i..i + SIMD_LANES].copy_from_slice(&r.to_array());
+        }
+    } else {
+        for blk in 0..blocks {
+            let i = blk * SIMD_LANES;
+            for j in 0..SIMD_LANES {
+                dst[i + j] = binop_i32_scalar(a[i + j], b[i + j], op);
+            }
+        }
+    }
+    let tail = blocks * SIMD_LANES;
+    for i in tail..n {
+        dst[i] = binop_i32_scalar(a[i], b[i], op);
+    }
+}
+
+/// i32 SIMD + rayon 并行二元运算。
+pub fn batch_binop_i32(dst: &mut [i32], a: &[i32], b: &[i32], op: BinOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    if n == 0 {
+        return;
+    }
+    if n > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        dst[..n]
+            .par_chunks_mut(chunk)
+            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+            .for_each(|(d, (av, bv))| binop_i32_kernel(d, av, bv, op));
+    } else {
+        binop_i32_kernel(&mut dst[..n], &a[..n], &b[..n], op);
+    }
+}
+
+// -------------------- i64 --------------------
+
+#[inline]
+fn binop_i64_scalar(a: i64, b: i64, op: BinOp) -> i64 {
+    match op {
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        BinOp::Div => a.checked_div(b).unwrap_or(0),
+        BinOp::Mod => a.checked_rem(b).unwrap_or(0),
+        BinOp::Band => a & b,
+        BinOp::Bor => a | b,
+        BinOp::Bxor => a ^ b,
+        BinOp::Shl => a << (b as u32),
+        BinOp::Shr => a >> (b as u32),
+    }
+}
+
+fn binop_i64_kernel(dst: &mut [i64], a: &[i64], b: &[i64], op: BinOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    let blocks = n / SIMD_LANES;
+    let use_simd = matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Band | BinOp::Bor | BinOp::Bxor
+    );
+    if use_simd {
+        for blk in 0..blocks {
+            let i = blk * SIMD_LANES;
+            let va = i64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+            let vb = i64x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
+            let r = match op {
+                BinOp::Add => va + vb,
+                BinOp::Sub => va - vb,
+                BinOp::Mul => va * vb,
+                BinOp::Band => va & vb,
+                BinOp::Bor => va | vb,
+                BinOp::Bxor => va ^ vb,
+                _ => unreachable!(),
+            };
+            dst[i..i + SIMD_LANES].copy_from_slice(&r.to_array());
+        }
+    } else {
+        for blk in 0..blocks {
+            let i = blk * SIMD_LANES;
+            for j in 0..SIMD_LANES {
+                dst[i + j] = binop_i64_scalar(a[i + j], b[i + j], op);
+            }
+        }
+    }
+    let tail = blocks * SIMD_LANES;
+    for i in tail..n {
+        dst[i] = binop_i64_scalar(a[i], b[i], op);
+    }
+}
+
+/// i64 SIMD + rayon 并行二元运算。
+pub fn batch_binop_i64(dst: &mut [i64], a: &[i64], b: &[i64], op: BinOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    if n == 0 {
+        return;
+    }
+    if n > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        dst[..n]
+            .par_chunks_mut(chunk)
+            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+            .for_each(|(d, (av, bv))| binop_i64_kernel(d, av, bv, op));
+    } else {
+        binop_i64_kernel(&mut dst[..n], &a[..n], &b[..n], op);
+    }
+}
+
+// -------------------- 比较 f32 / f64 --------------------
+
+fn cmp_f32_kernel(dst: &mut [u8], a: &[f32], b: &[f32], op: CmpOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    let blocks = n / SIMD_LANES;
+    for blk in 0..blocks {
+        let i = blk * SIMD_LANES;
+        let va = f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+        let vb = f32x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
+        // wide 浮点比较返回 mask：true 为全 1 位（f32 表现为 NaN），
+        // false 为 0.0。用 to_bits() != 0 判定。
+        let m = match op {
+            CmpOp::Lt => va.cmp_lt(vb),
+            CmpOp::Gt => va.cmp_gt(vb),
+            CmpOp::Eq => va.cmp_eq(vb),
+            CmpOp::Ne => va.cmp_ne(vb),
+            CmpOp::Le => va.cmp_le(vb),
+            CmpOp::Ge => va.cmp_ge(vb),
+        };
+        let arr = m.to_array();
+        for j in 0..SIMD_LANES {
+            dst[i + j] = (arr[j].to_bits() != 0) as u8;
+        }
+    }
+    let tail = blocks * SIMD_LANES;
+    for i in tail..n {
+        dst[i] = cmp_scalar_t(&a[i], &b[i], op) as u8;
+    }
+}
+
+/// f32 SIMD + rayon 并行比较（输出 u8 掩码）。
+pub fn batch_cmp_f32(dst: &mut [u8], a: &[f32], b: &[f32], op: CmpOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    if n == 0 {
+        return;
+    }
+    if n > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        dst[..n]
+            .par_chunks_mut(chunk)
+            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+            .for_each(|(d, (av, bv))| cmp_f32_kernel(d, av, bv, op));
+    } else {
+        cmp_f32_kernel(&mut dst[..n], &a[..n], &b[..n], op);
+    }
+}
+
+fn cmp_f64_kernel(dst: &mut [u8], a: &[f64], b: &[f64], op: CmpOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    let blocks = n / SIMD_LANES;
+    for blk in 0..blocks {
+        let i = blk * SIMD_LANES;
+        let va = f64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+        let vb = f64x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
+        let m = match op {
+            CmpOp::Lt => va.cmp_lt(vb),
+            CmpOp::Gt => va.cmp_gt(vb),
+            CmpOp::Eq => va.cmp_eq(vb),
+            CmpOp::Ne => va.cmp_ne(vb),
+            CmpOp::Le => va.cmp_le(vb),
+            CmpOp::Ge => va.cmp_ge(vb),
+        };
+        let arr = m.to_array();
+        for j in 0..SIMD_LANES {
+            dst[i + j] = (arr[j].to_bits() != 0) as u8;
+        }
+    }
+    let tail = blocks * SIMD_LANES;
+    for i in tail..n {
+        dst[i] = cmp_scalar_t(&a[i], &b[i], op) as u8;
+    }
+}
+
+/// f64 SIMD + rayon 并行比较（输出 u8 掩码）。
+pub fn batch_cmp_f64(dst: &mut [u8], a: &[f64], b: &[f64], op: CmpOp) {
+    let n = dst.len().min(a.len()).min(b.len());
+    if n == 0 {
+        return;
+    }
+    if n > PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        dst[..n]
+            .par_chunks_mut(chunk)
+            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+            .for_each(|(d, (av, bv))| cmp_f64_kernel(d, av, bv, op));
+    } else {
+        cmp_f64_kernel(&mut dst[..n], &a[..n], &b[..n], op);
+    }
+}
+
+// -------------------- 归约 f32 / f64 --------------------
+
+fn reduce_add_f32_seq(a: &[f32]) -> f32 {
+    let n = a.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let blocks = n / SIMD_LANES;
+    let mut acc = f32x4::splat(0.0);
+    for blk in 0..blocks {
+        let i = blk * SIMD_LANES;
+        acc = acc + f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+    }
+    let mut sum = acc.reduce_add();
+    for i in (blocks * SIMD_LANES)..n {
+        sum += a[i];
+    }
+    sum
+}
+
+/// f32 归约：Add 走 SIMD（+ rayon 并行），Mul 走标量，位运算对 f32 无意义。
+pub fn batch_reduce_f32(a: &[f32], op: ReduceOp) -> f32 {
+    if a.is_empty() {
+        return 0.0;
+    }
+    match op {
+        ReduceOp::Add => {
+            let n = a.len();
+            if n > PARALLEL_THRESHOLD {
+                let chunk = par_chunk_size(n);
+                let partials: Vec<f32> =
+                    a.par_chunks(chunk).map(|c| reduce_add_f32_seq(c)).collect();
+                partials.iter().copied().fold(0.0, |x, y| x + y)
+            } else {
+                reduce_add_f32_seq(a)
+            }
+        }
+        _ => {
+            let mut acc = a[0];
+            for &v in &a[1..] {
+                acc = match op {
+                    ReduceOp::Mul => acc * v,
+                    _ => acc,
+                };
+            }
+            acc
+        }
+    }
+}
+
+fn reduce_add_f64_seq(a: &[f64]) -> f64 {
+    let n = a.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let blocks = n / SIMD_LANES;
+    let mut acc = f64x4::splat(0.0);
+    for blk in 0..blocks {
+        let i = blk * SIMD_LANES;
+        acc = acc + f64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+    }
+    let mut sum = acc.reduce_add();
+    for i in (blocks * SIMD_LANES)..n {
+        sum += a[i];
+    }
+    sum
+}
+
+/// f64 归约：Add 走 SIMD（+ rayon 并行），Mul 走标量。
+pub fn batch_reduce_f64(a: &[f64], op: ReduceOp) -> f64 {
+    if a.is_empty() {
+        return 0.0;
+    }
+    match op {
+        ReduceOp::Add => {
+            let n = a.len();
+            if n > PARALLEL_THRESHOLD {
+                let chunk = par_chunk_size(n);
+                let partials: Vec<f64> =
+                    a.par_chunks(chunk).map(|c| reduce_add_f64_seq(c)).collect();
+                partials.iter().copied().fold(0.0, |x, y| x + y)
+            } else {
+                reduce_add_f64_seq(a)
+            }
+        }
+        _ => {
+            let mut acc = a[0];
+            for &v in &a[1..] {
+                acc = match op {
+                    ReduceOp::Mul => acc * v,
+                    _ => acc,
+                };
+            }
+            acc
+        }
     }
 }
 
@@ -4071,6 +4667,288 @@ mod batch_tests {
         let mut dst = [0i32; 1];
         batch_binop(&mut dst, &a, &b, BinOp::Div);
         assert_eq!(dst[0], 0);
+    }
+
+    // =====================================================================
+    // SIMD 特化测试
+    // =====================================================================
+
+    fn ref_binop_f32(a: &[f32], b: &[f32], op: BinOp) -> Vec<f32> {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| match op {
+                BinOp::Add => x + y,
+                BinOp::Sub => x - y,
+                BinOp::Mul => x * y,
+                BinOp::Div => x / y,
+                BinOp::Mod => x % y,
+                _ => *x,
+            })
+            .collect()
+    }
+
+    fn ref_binop_f64(a: &[f64], b: &[f64], op: BinOp) -> Vec<f64> {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| match op {
+                BinOp::Add => x + y,
+                BinOp::Sub => x - y,
+                BinOp::Mul => x * y,
+                BinOp::Div => x / y,
+                BinOp::Mod => x % y,
+                _ => *x,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_simd_binop_f32() {
+        let lens = [0usize, 1, 3, 4, 7, 16, 100];
+        let ops = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod];
+        for &n in &lens {
+            let a: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 + 1.0).collect();
+            let b: Vec<f32> = (0..n).map(|i| (i as f32) * 0.25 + 2.0).collect();
+            for &op in &ops {
+                let mut got = vec![0.0f32; n];
+                batch_binop_f32(&mut got, &a, &b, op);
+                assert_eq!(got, ref_binop_f32(&a, &b, op), "f32 {:?} len {}", op, n);
+            }
+        }
+    }
+
+    #[test]
+    fn test_simd_binop_f64() {
+        let lens = [0usize, 1, 3, 4, 7, 16, 100];
+        let ops = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod];
+        for &n in &lens {
+            let a: Vec<f64> = (0..n).map(|i| (i as f64) * 0.5 + 1.0).collect();
+            let b: Vec<f64> = (0..n).map(|i| (i as f64) * 0.25 + 2.0).collect();
+            for &op in &ops {
+                let mut got = vec![0.0f64; n];
+                batch_binop_f64(&mut got, &a, &b, op);
+                assert_eq!(got, ref_binop_f64(&a, &b, op), "f64 {:?} len {}", op, n);
+            }
+        }
+    }
+
+    #[test]
+    fn test_simd_binop_i32() {
+        let ops = [
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::Div,
+            BinOp::Mod,
+            BinOp::Band,
+            BinOp::Bor,
+            BinOp::Bxor,
+            BinOp::Shl,
+            BinOp::Shr,
+        ];
+        for n in [0usize, 1, 3, 4, 7, 16, 100] {
+            let a: Vec<i32> = (0..n as i32).map(|i| i + 1).collect();
+            // b 始终 >= 1，避免除零；移位量 1..=5，避免溢出 panic
+            let b: Vec<i32> = (0..n as i32).map(|i| (i % 5) + 1).collect();
+            for &op in &ops {
+                let mut got = vec![0i32; n];
+                let mut want = vec![0i32; n];
+                batch_binop_i32(&mut got, &a, &b, op);
+                batch_binop(&mut want, &a, &b, op); // 泛型标量作参考
+                assert_eq!(got, want, "i32 {:?} len {}", op, n);
+            }
+        }
+    }
+
+    #[test]
+    fn test_simd_binop_i64() {
+        let ops = [
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::Div,
+            BinOp::Mod,
+            BinOp::Band,
+            BinOp::Bor,
+            BinOp::Bxor,
+            BinOp::Shl,
+            BinOp::Shr,
+        ];
+        for n in [0usize, 1, 3, 4, 7, 16, 100] {
+            let a: Vec<i64> = (0..n as i64).map(|i| i + 1).collect();
+            let b: Vec<i64> = (0..n as i64).map(|i| (i % 5) + 1).collect();
+            for &op in &ops {
+                let mut got = vec![0i64; n];
+                let mut want = vec![0i64; n];
+                batch_binop_i64(&mut got, &a, &b, op);
+                batch_binop(&mut want, &a, &b, op);
+                assert_eq!(got, want, "i64 {:?} len {}", op, n);
+            }
+        }
+    }
+
+    #[test]
+    fn test_simd_binop_i64_overflow_wrap() {
+        // SIMD 整数加法使用 wrapping 语义：i64::MAX + 1 == i64::MIN
+        let a = [i64::MAX];
+        let b = [1i64];
+        let mut got = [0i64; 1];
+        batch_binop_i64(&mut got, &a, &b, BinOp::Add);
+        assert_eq!(got[0], i64::MIN);
+    }
+
+    #[test]
+    fn test_simd_binop_i32_div_zero() {
+        // 整数除零走标量 checked_div → 返回 0
+        let a = [10i32, 20, 30, 40];
+        let b = [0i32, 2, 0, 4];
+        let mut got = [0i32; 4];
+        batch_binop_i32(&mut got, &a, &b, BinOp::Div);
+        assert_eq!(got, [0, 10, 0, 10]);
+    }
+
+    // ---- 大数组（> PARALLEL_THRESHOLD，触发 rayon 并行）----
+
+    #[test]
+    fn test_simd_binop_f32_large() {
+        let n = 10_000;
+        let a: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..n).map(|i| (i as f32) * 2.0 + 1.0).collect();
+        let mut got = vec![0.0f32; n];
+        batch_binop_f32(&mut got, &a, &b, BinOp::Add);
+        for i in 0..n {
+            assert_eq!(got[i], a[i] + b[i], "idx {}", i);
+        }
+    }
+
+    #[test]
+    fn test_simd_binop_i64_large() {
+        let n = 10_000;
+        let a: Vec<i64> = (0..n as i64).collect();
+        let b: Vec<i64> = (1..=n as i64).collect();
+        let mut got = vec![0i64; n];
+        let mut want = vec![0i64; n];
+        batch_binop_i64(&mut got, &a, &b, BinOp::Add);
+        batch_binop(&mut want, &a, &b, BinOp::Add); // 泛型并行标量
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn test_batch_binop_generic_parallel_large() {
+        let n = 10_000;
+        let a: Vec<i64> = (0..n as i64).collect();
+        let b: Vec<i64> = (1..=n as i64).collect();
+        let mut got = vec![0i64; n];
+        batch_binop(&mut got, &a, &b, BinOp::Add);
+        for i in 0..n {
+            assert_eq!(got[i], a[i] + b[i]);
+        }
+    }
+
+    #[test]
+    fn test_batch_reduce_parallel_large() {
+        let n = 10_000;
+        let a: Vec<i64> = (0..n as i64).collect();
+        let got = batch_reduce(&a, ReduceOp::Add);
+        // 0+1+...+9999 = 9999*10000/2
+        assert_eq!(got, (n as i64 - 1) * (n as i64) / 2);
+
+        let got_mul = batch_reduce(&[1i64, 2, 3, 4, 5, 6], ReduceOp::Mul);
+        assert_eq!(got_mul, 720);
+    }
+
+    // ---- 比较 SIMD ----
+
+    #[test]
+    fn test_simd_cmp_f32() {
+        let a: [f32; 4] = [1.0, 5.0, 3.0, 3.0];
+        let b: [f32; 4] = [2.0, 4.0, 3.0, 4.0];
+        let cases: [(CmpOp, [u8; 4]); 6] = [
+            (CmpOp::Lt, [1, 0, 0, 1]),
+            (CmpOp::Gt, [0, 1, 0, 0]),
+            (CmpOp::Eq, [0, 0, 1, 0]),
+            (CmpOp::Ne, [1, 1, 0, 1]),
+            (CmpOp::Le, [1, 0, 1, 1]),
+            (CmpOp::Ge, [0, 1, 1, 0]),
+        ];
+        for (op, exp) in cases {
+            let mut dst = [0u8; 4];
+            batch_cmp_f32(&mut dst, &a, &b, op);
+            assert_eq!(dst, exp, "f32 {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_simd_cmp_f32_tail() {
+        // len 5：1 个 SIMD block + 1 个尾部标量
+        let a = [1.0f32, 5.0, 3.0, 3.0, 9.0];
+        let b = [2.0f32, 4.0, 3.0, 4.0, 9.0];
+        let mut dst = [0u8; 5];
+        batch_cmp_f32(&mut dst, &a, &b, CmpOp::Le);
+        assert_eq!(dst, [1, 0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_simd_cmp_f64() {
+        let a = [1.5f64, 2.5, 3.0, 3.0];
+        let b = [2.0f64, 2.5, 2.9, 3.0];
+        let cases: [(CmpOp, [u8; 4]); 6] = [
+            (CmpOp::Lt, [1, 0, 0, 0]),
+            (CmpOp::Gt, [0, 0, 1, 0]),
+            (CmpOp::Eq, [0, 1, 0, 1]),
+            (CmpOp::Ne, [1, 0, 1, 0]),
+            (CmpOp::Le, [1, 1, 0, 1]),
+            (CmpOp::Ge, [0, 1, 1, 1]),
+        ];
+        for (op, exp) in cases {
+            let mut dst = [0u8; 4];
+            batch_cmp_f64(&mut dst, &a, &b, op);
+            assert_eq!(dst, exp, "f64 {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_simd_cmp_f64_large() {
+        let n = 10_000;
+        let a: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let b: Vec<f64> = (0..n).map(|i| (i as f64) + 0.5).collect(); // a < b 全部成立
+        let mut dst = vec![0u8; n];
+        batch_cmp_f64(&mut dst, &a, &b, CmpOp::Lt);
+        for v in &dst {
+            assert_eq!(*v, 1u8);
+        }
+    }
+
+    // ---- 归约 SIMD ----
+
+    #[test]
+    fn test_simd_reduce_f32() {
+        assert_eq!(batch_reduce_f32(&[], ReduceOp::Add), 0.0);
+        assert_eq!(batch_reduce_f32(&[1.0, 2.0, 3.0, 4.0], ReduceOp::Add), 10.0);
+        // 含尾部元素
+        assert_eq!(batch_reduce_f32(&[1.0, 2.0, 3.0, 4.0, 5.0], ReduceOp::Add), 15.0);
+        assert_eq!(batch_reduce_f32(&[2.0, 3.0, 4.0], ReduceOp::Mul), 24.0);
+    }
+
+    #[test]
+    fn test_simd_reduce_f64() {
+        assert_eq!(batch_reduce_f64(&[], ReduceOp::Add), 0.0);
+        assert_eq!(batch_reduce_f64(&[1.5, 2.5, 3.0, 4.0], ReduceOp::Add), 11.0);
+        assert_eq!(batch_reduce_f64(&[1.5, 2.5, 3.0], ReduceOp::Mul), 11.25);
+    }
+
+    #[test]
+    fn test_simd_reduce_f32_large() {
+        let n = 10_000;
+        let a: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let got = batch_reduce_f32(&a, ReduceOp::Add);
+        // 精确和（f64 累加再转 f32）作参考，SIMD 分组求和可能有微小舍入差异
+        let want = (0..n).map(|i| i as f64).sum::<f64>() as f32;
+        assert!(
+            (got - want).abs() < 50.0,
+            "got={} want={}",
+            got,
+            want
+        );
     }
 }
 
