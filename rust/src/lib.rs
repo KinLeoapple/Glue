@@ -1,4 +1,5 @@
 #[path = "Ast.rs"]
 pub mod Ast;
 
-pub mod value;
+#[path = "Value.rs"]
+pub mod Value;

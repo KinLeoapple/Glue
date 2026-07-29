@@ -6,7 +6,7 @@
 //! - 23 种堆对象的构造/访问/equals
 //! - equals/deep_clone 递归结构与深度限制
 
-use glue_rs::value::*;
+use glue_rs::Value::*;
 
 use std::rc::Rc;
 
@@ -345,7 +345,7 @@ fn test_heap_adt() {
     let a = Value::adt(
         "Option",
         "Some",
-        vec![composite::AdtField {
+        vec![AdtField {
             name: None,
             value: Value::i32(42),
         }],
@@ -402,7 +402,7 @@ fn test_heap_range_inclusive() {
 
 #[test]
 fn test_heap_closure() {
-    let c = Value::closure(callable::Closure {
+    let c = Value::closure(Closure {
         func_id: 42,
         arity: 2,
         upvalues: vec![Value::i32(1)],
@@ -422,7 +422,7 @@ fn test_heap_closure() {
 
 #[test]
 fn test_heap_partial() {
-    let p = Value::partial(callable::PartialApplication {
+    let p = Value::partial(PartialApplication {
         func_id: 1,
         bound_args: vec![Value::i32(42)],
         remaining_arity: 1,
@@ -446,7 +446,7 @@ fn test_heap_builtin() {
 
 #[test]
 fn test_heap_trait_val() {
-    let t = Value::trait_val(callable::TraitValue {
+    let t = Value::trait_val(TraitValue {
         trait_name: "Show".to_string(),
         method_names: vec!["show".to_string()],
         method_values: vec![Value::builtin(|_| Ok(Value::str("x")), "show")],
@@ -458,7 +458,7 @@ fn test_heap_trait_val() {
 
 #[test]
 fn test_heap_lazy() {
-    let l = Value::lazy(callable::LazyValue {
+    let l = Value::lazy(LazyValue {
         cached: Some(Value::i32(42)),
         forced: true,
         thunk: None,
@@ -481,14 +481,14 @@ fn test_heap_throw_ok() {
     assert_eq!(t.type_name(), "throw");
     let tv = t.as_throw_val().unwrap();
     match &tv.payload {
-        control::ThrowPayload::Ok(v) => assert_eq!(v.as_i32(), Some(42)),
+        ThrowPayload::Ok(v) => assert_eq!(v.as_i32(), Some(42)),
         _ => panic!("expected Ok payload"),
     }
 }
 
 #[test]
 fn test_heap_throw_err() {
-    let record = Rc::new(composite::RecordValue::new(
+    let record = Rc::new(RecordValue::new(
         "Error".to_string(),
         vec![Value::str("msg")],
         vec![Some("msg".to_string())],
@@ -496,7 +496,7 @@ fn test_heap_throw_err() {
     let t = Value::throw_err(record);
     let tv = t.as_throw_val().unwrap();
     match &tv.payload {
-        control::ThrowPayload::Err(_) => {}
+        ThrowPayload::Err(_) => {}
         _ => panic!("expected Err payload"),
     }
 }
@@ -519,10 +519,10 @@ fn test_heap_async_handle() {
     let h = Value::async_handle();
     assert_eq!(h.type_name(), "async");
     let ah = h.as_async_handle().unwrap();
-    assert_eq!(ah.status(), concurrent::AsyncStatus::Pending);
-    ah.set_status(concurrent::AsyncStatus::Completed);
+    assert_eq!(ah.status(), AsyncStatus::Pending);
+    ah.set_status(AsyncStatus::Completed);
     ah.set_result(Value::i32(42));
-    assert_eq!(ah.status(), concurrent::AsyncStatus::Completed);
+    assert_eq!(ah.status(), AsyncStatus::Completed);
     assert_eq!(ah.result().unwrap().as_i32(), Some(42));
 }
 
@@ -645,12 +645,12 @@ fn test_equals_records_with_fields() {
 
 #[test]
 fn test_equals_adt_variants() {
-    let some = Value::adt("Option", "Some", vec![composite::AdtField {
+    let some = Value::adt("Option", "Some", vec![AdtField {
         name: None,
         value: Value::i32(42),
     }]);
     let none = Value::adt("Option", "None", vec![]);
-    let some2 = Value::adt("Option", "Some", vec![composite::AdtField {
+    let some2 = Value::adt("Option", "Some", vec![AdtField {
         name: None,
         value: Value::i32(42),
     }]);
@@ -719,14 +719,14 @@ fn test_deep_clone_nested_array() {
     ));
     // 内层数组 Rc 也不同
     let orig_inner = match &original.as_ref().unwrap().as_ref() {
-        heap::HeapObj::Array(a) => match &a.elements[2] {
+        HeapObj::Array(a) => match &a.elements[2] {
             Value::Ref(r) => r.clone(),
             _ => panic!("expected Ref"),
         },
         _ => panic!("expected Array"),
     };
     let clone_inner = match &cloned.as_ref().unwrap().as_ref() {
-        heap::HeapObj::Array(a) => match &a.elements[2] {
+        HeapObj::Array(a) => match &a.elements[2] {
             Value::Ref(r) => r.clone(),
             _ => panic!("expected Ref"),
         },
