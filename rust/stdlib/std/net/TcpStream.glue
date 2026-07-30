@@ -5,7 +5,7 @@
 // 单次 read/write 语义（不循环阻塞，与 File.read 一致）。
 //
 // 底层 @extern("C") 原语（__net_tcp_connect_v4 / __net_tcp_close_raw 等）
-// 由 stdlib/syscall/syscall_net.glue 声明。本文件定义 Glue wrapper 将 C 原始返回值转为 Throw。
+// 由 stdlib/syscall/net.glue 声明。本文件定义 Glue wrapper 将 C 原始返回值转为 Throw。
 // async 函数体当前直接调用同步原语，等 IR/Engine 异步模型就绪后再补 spawn 语义。
 //
 // read_until 维护跨调用内部缓冲（rbuf/rpos/rcap），支持分隔符跨批量边界的正确扫描。

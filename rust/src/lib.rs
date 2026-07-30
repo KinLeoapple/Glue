@@ -20,3 +20,6 @@ pub mod Ffi;
 
 #[path = "Stdlib.rs"]
 pub mod Stdlib;
+
+#[path = "ModuleLoader.rs"]
+pub mod ModuleLoader;

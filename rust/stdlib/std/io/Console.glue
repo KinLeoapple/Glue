@@ -7,7 +7,7 @@
 // println 是真正的 Glue 函数，不再依赖编译期内联。
 //
 // 底层 @extern("C") 原语（__stdout_write_raw / __stderr_write_raw / __stdin_readln_into）
-// 由 stdlib/syscall/syscall_io.glue 声明，cc crate 编译为 glue_extern 静态库。
+// 由 stdlib/syscall/io.glue 声明，cc crate 编译为 glue_extern 静态库。
 // 本文件的 __stdout_write / __stderr_write / __stdin_readln 为 Glue wrapper，
 // 将 C 原始返回值（i32/i64）转换为 Throw<T, IOError>。
 //

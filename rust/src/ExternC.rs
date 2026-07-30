@@ -845,7 +845,7 @@ fun __bad_return(): u8[] #{
     #[test]
     #[cfg(has_extern_c)]
     fn test_end_to_end_wrapper_call() {
-        // stdlib/syscall/syscall_time.glue 中定义了 __instant_now_ns(): i64
+        // stdlib/syscall/time.glue 中定义了 __instant_now_ns(): i64
         let ns1 = unsafe { crate::Ffi::wrapper::__instant_now_ns() };
         assert!(ns1 > 0, "instant_now_ns 应返回正数");
 

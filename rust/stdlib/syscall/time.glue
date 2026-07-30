@@ -1,4 +1,4 @@
-// syscall_time.glue — 同步 Time syscall 原语 @extern("C") 声明
+// time.glue — 同步 Time syscall 原语 @extern("C") 声明
 //
 // 底层 POSIX/Windows 时间能力，由 cc crate 从 emit-c 生成的 .c 编译。
 // 跨平台逻辑通过 #if 条件编译在 C body 中实现。
