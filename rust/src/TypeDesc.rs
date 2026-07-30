@@ -1189,8 +1189,8 @@ mod tests {
         roundtrip!(&ISIZE_DESC, alloc_isize, get_isize, -99isize);
         roundtrip!(&USIZE_DESC, alloc_usize, get_usize, 99usize);
         roundtrip!(&F16_DESC, alloc_f16, get_f16, F16::from_f32(3.5).0);
-        roundtrip!(&F32_DESC, alloc_f32, get_f32, 3.14f32);
-        roundtrip!(&F64_DESC, alloc_f64, get_f64, 2.71828f64);
+        roundtrip!(&F32_DESC, alloc_f32, get_f32, 1.25f32);
+        roundtrip!(&F64_DESC, alloc_f64, get_f64, 2.5f64);
         roundtrip!(&F128_DESC, alloc_f128, get_f128, F128::from_f64(1.5));
         roundtrip!(&BOOL_DESC, bool, get_bool, true);
         roundtrip!(&BOOL_DESC, bool, get_bool, false);
@@ -1212,7 +1212,7 @@ mod tests {
         // i128 目标
         let h = arena.alloc_u64(0xdead_beef_cafe_babe);
         let h2 = I128_DESC.ops.coerce(h, &mut arena);
-        assert_eq!(arena.get_i128(h2), 0xdead_beef_cafe_babe as i128);
+        assert_eq!(arena.get_i128(h2), 0xdead_beef_cafe_babe_i128);
     }
 
     #[test]

@@ -96,6 +96,8 @@ pub const TokenType = enum {
     colon,
     dot,
     pipe,
+    at,
+    raw_block,
     eof,
     err,
 };
@@ -397,6 +399,14 @@ pub const Lexer = struct {
                 }
             },
             '~' => try self.addToken(.tilde, start, start_line, start_col),
+            '@' => try self.addToken(.at, start, start_line, start_col),
+            '#' => {
+                if (self.matchChar('{')) {
+                    try self.scanRawBlock(start, start_line, start_col);
+                } else {
+                    try self.addError(start, start_line, start_col);
+                }
+            },
             '\'' => try self.scanChar(start, start_line, start_col),
             '"' => try self.scanString(start, start_line, start_col),
             '0'...'9' => try self.scanNumber(start, start_line, start_col),
@@ -889,6 +899,36 @@ pub const Lexer = struct {
                 }
             } else if (ch == '\n') {
                 return LexerError.UnterminatedString;
+            } else {
+                self.position += 1;
+                self.column += 1;
+            }
+        }
+        return LexerError.UnterminatedString;
+    }
+
+    /// 扫描原始块 #{ ... }#：逐字符扫描直到匹配 }#，lexeme 为内部内容（不含 #{ 和 }#）
+    fn scanRawBlock(self: *Lexer, start: usize, start_line: u32, start_col: u32) LexerError!void {
+        _ = start;
+        const content_start = self.position;
+        while (self.position < self.source.len) {
+            const ch = self.source[self.position];
+            if (ch == '}' and self.position + 1 < self.source.len and self.source[self.position + 1] == '#') {
+                const content = self.source[content_start..self.position];
+                self.position += 2;
+                self.column += 2;
+                try self.tokens.append(self.allocator, Token{
+                    .type = .raw_block,
+                    .lexeme = content,
+                    .line = start_line,
+                    .column = start_col,
+                });
+                return;
+            }
+            if (ch == '\n') {
+                self.position += 1;
+                self.line += 1;
+                self.column = 1;
             } else {
                 self.position += 1;
                 self.column += 1;

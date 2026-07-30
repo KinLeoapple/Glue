@@ -4371,17 +4371,20 @@ pub const TypeInferencer = struct {
                     }
                     self.current_fn_info = prev_fn_info;
                 }
-                const body_ty = self.inferExpr(f.body, child_env, null) catch |err| {
-                    self.reportInferError(err, f.location);
-                    return;
-                };
-                const effective_body_ty = if (f.is_async)
-                    self.makeGenericType("Async", &[_]*Type{body_ty}) catch return
-                else
-                    body_ty;
-                self.unifyReturnType(ret_ty, effective_body_ty) catch |err| {
-                    self.reportUnifyError(err, f.location, ret_ty, effective_body_ty);
-                };
+                // @extern("C") 函数：跳过函数体类型检查（body 为 C 代码占位，非 Glue 表达式）
+                if (f.extern_c_body == null) {
+                    const body_ty = self.inferExpr(f.body, child_env, null) catch |err| {
+                        self.reportInferError(err, f.location);
+                        return;
+                    };
+                    const effective_body_ty = if (f.is_async)
+                        self.makeGenericType("Async", &[_]*Type{body_ty}) catch return
+                    else
+                        body_ty;
+                    self.unifyReturnType(ret_ty, effective_body_ty) catch |err| {
+                        self.reportUnifyError(err, f.location, ret_ty, effective_body_ty);
+                    };
+                }
                 if (self.isBuiltinName(f.name)) {
                     if (!std.mem.eql(u8, f.name, "compare") and !std.mem.eql(u8, f.name, "str")) {
                         self.addErrorAt(.type_mismatch, f.location.line, f.location.column, "cannot redefine built-in name '{s}'", .{f.name});

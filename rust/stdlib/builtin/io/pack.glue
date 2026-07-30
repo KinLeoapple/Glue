@@ -1,0 +1,5 @@
+// builtin io 包声明
+//
+// 暴露 Reader / Writer trait 给所有 Glue 用户代码默认可见。
+pub pack Reader
+pub pack Writer

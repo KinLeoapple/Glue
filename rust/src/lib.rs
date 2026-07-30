@@ -11,3 +11,12 @@ pub mod TypeDesc;
 
 #[path = "Sema.rs"]
 pub mod Sema;
+
+#[path = "ExternC.rs"]
+pub mod ExternC;
+
+#[path = "Ffi.rs"]
+pub mod Ffi;
+
+#[path = "Stdlib.rs"]
+pub mod Stdlib;

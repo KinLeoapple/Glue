@@ -4,6 +4,8 @@
 //!   glue parse <file>      解析 .glue 文件并打印 AST（规范 S-表达式）
 //!   glue lex <file>        仅词法分析，打印 Token 列表
 //!   glue parse -           从 stdin 读取源码并解析
+//!   glue emit-c <file>     提取 @extern("C") 函数，生成 .c 文件到 stdout
+//!   glue emit-ffi <file>   生成 Rust FFI 绑定 + wrapper 代码到 stdout
 
 use std::env;
 use std::fs;
@@ -36,6 +38,22 @@ fn main() {
             let source = read_source(&args[2]);
             run_lex(&source);
         }
+        "emit-c" => {
+            if args.len() < 3 {
+                usage();
+                process::exit(1);
+            }
+            let source = read_source(&args[2]);
+            run_emit_c(&source);
+        }
+        "emit-ffi" => {
+            if args.len() < 3 {
+                usage();
+                process::exit(1);
+            }
+            let source = read_source(&args[2]);
+            run_emit_ffi(&source);
+        }
         "help" | "--help" | "-h" => {
             usage();
         }
@@ -53,6 +71,8 @@ fn usage() {
     eprintln!("  glue parse <file>    解析 .glue 文件并打印 AST");
     eprintln!("  glue parse -         从 stdin 读取源码并解析");
     eprintln!("  glue lex <file>      仅词法分析，打印 Token 列表");
+    eprintln!("  glue emit-c <file>   提取 @extern(\"C\") 函数，生成 .c 文件");
+    eprintln!("  glue emit-ffi <file> 生成 Rust FFI 绑定 + wrapper 代码");
     eprintln!("  glue help            显示帮助");
 }
 
@@ -116,5 +136,65 @@ fn run_lex(source: &str) {
             format!("{:?}", tok.kind),
             tok.lexeme
         );
+    }
+}
+
+fn run_emit_c(source: &str) {
+    let arena = bumpalo::Bump::new();
+    let mut lexer = Lexer::new(source);
+    let mut sink = TokenCollector::new();
+    lexer.tokenize_into(&mut sink);
+    let tokens: Vec<Token<'_>> = sink.into_tokens();
+    let tokens_ref = arena.alloc_slice_copy(&tokens);
+    let mut parser = Parser::new(tokens_ref, &arena, ErrorCollector::new());
+
+    match parser.parse_module("stdin") {
+        Ok(module) => {
+            match glue_rs::ExternC::extract_c_from_module(&module) {
+                Ok(c_code) => print!("{}", c_code),
+                Err(e) => {
+                    eprintln!("Error extracting C: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("Parse error at {}:{}: {}", err.line, err.column, err.message);
+            process::exit(1);
+        }
+    }
+
+    for err in parser.errors() {
+        eprintln!("Warning: parse error at {}:{}: {}", err.line, err.column, err.message);
+    }
+}
+
+fn run_emit_ffi(source: &str) {
+    let arena = bumpalo::Bump::new();
+    let mut lexer = Lexer::new(source);
+    let mut sink = TokenCollector::new();
+    lexer.tokenize_into(&mut sink);
+    let tokens: Vec<Token<'_>> = sink.into_tokens();
+    let tokens_ref = arena.alloc_slice_copy(&tokens);
+    let mut parser = Parser::new(tokens_ref, &arena, ErrorCollector::new());
+
+    match parser.parse_module("stdin") {
+        Ok(module) => {
+            match glue_rs::ExternC::extract_rust_ffi_from_module(&module) {
+                Ok(ffi_code) => print!("{}", ffi_code),
+                Err(e) => {
+                    eprintln!("Error generating FFI: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("Parse error at {}:{}: {}", err.line, err.column, err.message);
+            process::exit(1);
+        }
+    }
+
+    for err in parser.errors() {
+        eprintln!("Warning: parse error at {}:{}: {}", err.line, err.column, err.message);
     }
 }

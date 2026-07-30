@@ -7040,7 +7040,7 @@ impl<'a> InferContext<'a> {
                         &type_params.iter().map(|tp| (tp.name,)).collect::<Vec<_>>(),
                     );
                 }
-                // @extern("c") 函数：注册签名但跳过函数体类型检查（body 为 C 代码，非 Glue 表达式）
+                // @extern("C") 函数：注册签名但跳过函数体类型检查（body 为 C 代码，非 Glue 表达式）
                 if extern_c_body.is_some() {
                     if !type_params.is_empty() {
                         self.pop_type_bindings();
@@ -7933,6 +7933,7 @@ impl FlowContext {
 /// - `x != null` → then: NonNull(x), else: 无
 /// - `x == null` → then: 无, else: NonNull(x)
 /// - `x is Type` → then: IsCheck(x, Type), else: 无
+///
 /// （ConstructorMatch 由 match 表达式处理，不在此函数）
 pub fn analyze_null_check_facts(
     arena: &TypeArena,
@@ -8185,12 +8186,12 @@ pub fn type_id_of(arena: &TypeArena, ty: TypeHandle, sema_result: &SemaResult) -
         ConcreteType::Adt { name, .. } => sema_result
             .type_def_index
             .get(name.as_ref())
-            .map(|&idx| 22 + idx as u16),
+            .map(|&idx| 22 + idx),
         // Generic：同 ADT，用 type_def 索引
         ConcreteType::Generic { name, .. } => sema_result
             .type_def_index
             .get(name.as_ref())
-            .map(|&idx| 22 + idx as u16),
+            .map(|&idx| 22 + idx),
         // TypeVar/Nullable/Throw/Fn/Record/Array/Trait/Ref/Never/Unknown/Null/Void
         _ => None,
     }

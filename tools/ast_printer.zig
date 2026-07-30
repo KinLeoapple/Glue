@@ -73,6 +73,22 @@ const Printer = struct {
             .fun_decl => |fd| {
                 try self.writeFmt("(fun_decl \"{s}\"", .{fd.name});
                 self.indent();
+                // 打印属性
+                for (fd.attributes) |attr| {
+                    if (attr.args.len == 0) {
+                        try self.writeFmt("(attribute \"{s}\")", .{attr.name});
+                    } else {
+                        var args_buf = std.ArrayList(u8).empty;
+                        defer args_buf.deinit(self.allocator);
+                        for (attr.args, 0..) |arg, i| {
+                            if (i > 0) try args_buf.appendSlice(self.allocator, " ");
+                            try args_buf.appendSlice(self.allocator, "\"");
+                            try args_buf.appendSlice(self.allocator, arg);
+                            try args_buf.appendSlice(self.allocator, "\"");
+                        }
+                        try self.writeFmt("(attribute \"{s}\" (args {s}))", .{ attr.name, args_buf.items });
+                    }
+                }
                 try self.printVisibility(fd.visibility);
                 try self.printTypeParams(fd.type_params);
                 try self.printParams(fd.params);
@@ -84,6 +100,21 @@ const Printer = struct {
                 try self.printExpr(fd.body);
                 self.dedent();
                 try self.writeLine(")");
+                // 打印 extern_c_body
+                if (fd.extern_c_body) |c_body| {
+                    try self.writeLine("(extern_c_body");
+                    self.indent();
+                    const escaped = try escapeStr(self.allocator, c_body);
+                    defer self.allocator.free(escaped);
+                    var line = std.ArrayList(u8).empty;
+                    defer line.deinit(self.allocator);
+                    try line.append(self.allocator, '"');
+                    try line.appendSlice(self.allocator, escaped);
+                    try line.append(self.allocator, '"');
+                    try self.writeLine(line.items);
+                    self.dedent();
+                    try self.writeLine(")");
+                }
                 self.dedent();
                 try self.writeLine(")");
             },

@@ -546,6 +546,12 @@ pub const Stmt = union(enum) {
     }
 };
 
+/// 通用属性：@name 或 @name("arg1", "arg2") 或 @name "arg"
+pub const Attribute = struct {
+    name: []const u8,
+    args: [][]const u8,
+};
+
 /// 顶层声明：函数、类型、trait、import、pack、表达式声明
 pub const Decl = union(enum) {
     fun_decl: struct {
@@ -559,6 +565,8 @@ pub const Decl = union(enum) {
         body: *Expr,
         is_async: bool = false,
         is_entry: bool = false,
+        attributes: []Attribute = &.{},
+        extern_c_body: ?[]const u8 = null,
     },
     type_decl: struct {
         location: SourceLocation,

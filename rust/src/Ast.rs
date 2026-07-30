@@ -3930,12 +3930,18 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         if self.match_token(TokenKind::KwWith) {
             self.parse_trait_bound_list(&mut bounds)?;
         }
-        let body = self.parse_expr()?;
+        // @extern("C") 函数：body 为 #{ }# 原始块，而非 Glue 表达式
         let extern_c_body = if self.check(TokenKind::RawBlock) {
             let tok = self.advance();
             Some(tok.lexeme)
         } else {
             None
+        };
+        // extern_c_body 存在时用占位表达式作为 body（Sema 会跳过检查）
+        let body = if extern_c_body.is_some() {
+            self.alloc_expr(token_span(&fun_tok), Expr::VoidLit)
+        } else {
+            self.parse_expr()?
         };
         Ok(self.spanned_decl(
             token_span(&fun_tok),

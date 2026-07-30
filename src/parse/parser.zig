@@ -351,7 +351,8 @@ pub const Parser = struct {
         while (!self.isAtEnd()) {
             const at_decl_kw = self.check(.kw_fun) or self.check(.kw_type) or
                 self.check(.kw_trait) or
-                self.check(.kw_import) or self.check(.kw_pack) or self.check(.kw_pub);
+                self.check(.kw_import) or self.check(.kw_pack) or self.check(.kw_pub) or
+                self.check(.at);
             if (self.tryParseDecl()) |decl| {
                 try declarations.append(self.arena.allocator(), decl);
                 continue;
@@ -409,8 +410,64 @@ pub const Parser = struct {
         };
     }
 
+    /// 解析 0..N 个属性前缀：@name 或 @name("arg") 或 @name "arg"
+    fn parseAttributes(self: *Parser) []ast.Attribute {
+        if (!self.check(.at)) return &.{};
+        var attrs = std.ArrayList(ast.Attribute).empty;
+        while (self.check(.at)) {
+            _ = self.advance(); // @
+            const name_tok = self.expect(.identifier, "expected attribute name") catch {
+                if (attrs.items.len > 0) {
+                    return attrs.toOwnedSlice(self.arena.allocator()) catch return &.{};
+                }
+                return &.{};
+            };
+            var args = std.ArrayList([]const u8).empty;
+            if (self.check(.l_paren)) {
+                _ = self.advance(); // (
+                while (!self.check(.r_paren) and !self.isAtEnd()) {
+                    if (self.check(.string_literal)) {
+                        const lex = self.advance().lexeme;
+                        // 去掉首尾引号
+                        if (lex.len >= 2) {
+                            args.append(self.arena.allocator(), lex[1 .. lex.len - 1]) catch {};
+                        } else {
+                            args.append(self.arena.allocator(), lex) catch {};
+                        }
+                    } else if (self.check(.identifier)) {
+                        args.append(self.arena.allocator(), self.advance().lexeme) catch {};
+                    } else {
+                        _ = self.advance();
+                    }
+                    if (self.check(.comma)) {
+                        _ = self.advance();
+                    }
+                }
+                _ = self.expect(.r_paren, "expected ')' after attribute args") catch {};
+            } else if (self.check(.string_literal)) {
+                const lex = self.advance().lexeme;
+                if (lex.len >= 2) {
+                    args.append(self.arena.allocator(), lex[1 .. lex.len - 1]) catch {};
+                } else {
+                    args.append(self.arena.allocator(), lex) catch {};
+                }
+            }
+            attrs.append(self.arena.allocator(), .{
+                .name = name_tok.lexeme,
+                .args = args.toOwnedSlice(self.arena.allocator()) catch &.{},
+            }) catch {};
+        }
+        return attrs.toOwnedSlice(self.arena.allocator()) catch &.{};
+    }
+
     /// 尝试解析顶层声明（容错版本，失败返回 null 而不抛出）
     fn tryParseDecl(self: *Parser) ?ast.Decl {
+        const saved = self.current;
+        const attributes = self.parseAttributes();
+        if (attributes.len > 0 and !self.check(.kw_pub) and !self.check(.kw_async) and !self.check(.kw_fun)) {
+            self.current = saved;
+            return null;
+        }
         var visibility: ast.Visibility = .private;
         if (self.matchToken(.kw_pub)) {
             visibility = .public;
@@ -421,7 +478,7 @@ pub const Parser = struct {
             is_async = true;
         }
         if (self.check(.kw_fun)) {
-            return self.parseFunDecl(visibility, is_async) catch return null;
+            return self.parseFunDecl(visibility, is_async, attributes) catch return null;
         }
         if (self.check(.kw_type)) {
             return self.parseTypeDecl(visibility) catch return null;
@@ -478,6 +535,7 @@ pub const Parser = struct {
 
     /// 解析单个顶层声明（严格版本，失败时抛出错误）
     pub fn parseDecl(self: *Parser) ParserError!ast.Decl {
+        const attributes = self.parseAttributes();
         var visibility: ast.Visibility = .private;
         if (self.matchToken(.kw_pub)) {
             visibility = .public;
@@ -491,7 +549,7 @@ pub const Parser = struct {
             is_async = true;
         }
         if (self.check(.kw_fun)) {
-            return self.parseFunDecl(visibility, is_async);
+            return self.parseFunDecl(visibility, is_async, attributes);
         }
         if (self.check(.kw_type)) {
             return self.parseTypeDecl(visibility);
@@ -528,7 +586,7 @@ pub const Parser = struct {
     }
 
     /// 解析函数声明：fun name<类型参数>(参数): 返回类型 with 约束 { body }
-    fn parseFunDecl(self: *Parser, visibility: ast.Visibility, is_async: bool) ParserError!ast.Decl {
+    fn parseFunDecl(self: *Parser, visibility: ast.Visibility, is_async: bool, attributes: []ast.Attribute) ParserError!ast.Decl {
         const fun_tok = self.advance();
         const name_tok = try self.expect(.identifier, "expected function name");
         var type_params = std.ArrayList(ast.TypeParam).empty;
@@ -555,7 +613,19 @@ pub const Parser = struct {
         if (self.matchToken(.kw_with)) {
             try self.parseTraitBoundList(&bounds);
         }
-        const body = self.parseExpr() catch |err| {
+        // @extern("C") 函数：body 为 #{ }# 原始块，而非 Glue 表达式
+        var extern_c_body: ?[]const u8 = null;
+        if (self.check(.raw_block)) {
+            const tok = self.advance();
+            extern_c_body = tok.lexeme;
+        }
+        // extern_c_body 存在时用占位表达式作为 body（Sema 会跳过检查）
+        const body: *ast.Expr = if (extern_c_body != null) blk: {
+            const placeholder = try self.allocExpr(tokenLoc(fun_tok), ast.Expr{
+                .unit_literal = {},
+            });
+            break :blk placeholder;
+        } else self.parseExpr() catch |err| {
             return err;
         };
         return ast.Decl{
@@ -570,6 +640,8 @@ pub const Parser = struct {
                 .body = body,
                 .is_async = is_async,
                 .is_entry = std.mem.eql(u8, name_tok.lexeme, "main"),
+                .attributes = attributes,
+                .extern_c_body = extern_c_body,
             },
         };
     }

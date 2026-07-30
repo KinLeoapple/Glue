@@ -1,0 +1,11 @@
+// Dns.glue — DNS / 主机名解析
+//
+// 设计文档 §6.5：DNS 解析。
+// 一期：仅 IP 字面量解析（非完整 DNS），返回单元素数组或空数组。
+// DNS（HostName.lookup）为二期补全。
+
+// 解析主机名为 IpAddr 数组。
+// 一期：IP 字面量（IPv4/IPv6）解析成功 → 单元素数组；失败 → 空数组（非错误）。
+pub async fun resolve(host: str): Async<Throw<IpAddr[], IOError>> {
+    __net_resolve(host)?
+}

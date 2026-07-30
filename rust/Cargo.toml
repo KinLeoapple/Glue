@@ -2,11 +2,15 @@
 name = "glue-rs"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 bumpalo = { version = "3", features = ["collections"] }
 wide = "0.7"
 rayon = "1"
+
+[build-dependencies]
+cc = "1"
 
 [[bin]]
 name = "glue"

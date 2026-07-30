@@ -1,0 +1,56 @@
+// Timer.glue — async sleep + ticker
+//
+// 设计文档 §5.8：async sleep/ticker/timeout
+// 仅此模块的 Time 操作为 async（sleep 阻塞当前协程）；时钟读取同步——决策 S04。
+// ticker/timeout 通过 channel + 后台 ticker_loop 实现；channel<Instant>(1)
+// 允许 newtype 元素深拷贝——决策 S12。
+//
+// 当前 sleep 直接调用同步 C 原语 __sleep_ns，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
+
+// ─── sleep ─────────────────────────────────────────────────────────
+
+// 睡眠指定 Duration（阻塞当前协程）
+// Duration.as_nanos() 返回 i128，__sleep_ns 接收 i64 纳秒（足够覆盖实际范围）
+pub async fun sleep(d: Duration): Async<void> {
+    __sleep_ns(cast(d.as_nanos()).to(i64))
+}
+
+// 睡眠指定秒数（便捷重载）
+pub async fun sleep_secs(secs: i64): Async<void> {
+    __sleep_ns(secs * 1_000_000_000)
+}
+
+// ─── ticker：周期性向 channel 推送当前 Instant ────────────────────
+
+// 后台循环：每 period 向 ch 发送当前 Instant.now()
+pub async fun ticker_loop(ch: Channel<Instant>, period: Duration): Async<void> {
+    loop {
+        sleep(period).await()
+        ch.send(Instant.now())
+    }
+}
+
+// 启动 ticker，返回 Receiver<Instant>，调用方周期性 recv 获取时间戳
+pub async fun ticker(period: Duration): Async<Receiver<Instant>> {
+    val ch = channel<Instant>(1)
+    ticker_loop(ch, period)
+    ch.receiver
+}
+
+// ─── timeout：d 后向 channel 推送一次 void ───────────────────────
+
+// 后台 worker：sleep(d) 后向 ch 发送一次 void，然后退出
+pub async fun timeout_worker(ch: Channel<void>, d: Duration): Async<void> {
+    sleep(d).await()
+    ch.send(void)
+}
+
+// 单次定时器：立即返回 Receiver<void>，d 后 channel 收到 void
+// 调用方 recv 会阻塞到超时触发（非 await 阻塞）
+// 修复：后台启动 timeout_worker（不 await），立即返回 receiver，
+// 避免原实现 sleep(d).await() 阻塞 timeout 函数自身导致调用方 await 即阻塞 d
+pub async fun timeout(d: Duration): Async<Receiver<void>> {
+    val ch = channel<void>(1)
+    timeout_worker(ch, d)
+    ch.receiver
+}

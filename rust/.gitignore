@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+
+# build.rs 从 stdlib/syscall/*.glue 自动生成的 C 中间产物，勿手动编辑
+stdlib/syscall/*.c
