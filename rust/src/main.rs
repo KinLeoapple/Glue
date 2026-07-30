@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::process;
 
-use glue_rs::Ast::{Lexer, Parser, Printer};
+use glue_rs::Ast::{ErrorCollector, Lexer, Parser, Printer, Token, TokenCollector};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -78,14 +78,16 @@ fn read_source(path: &str) -> String {
 fn run_parse(source: &str) {
     let arena = bumpalo::Bump::new();
     let mut lexer = Lexer::new(source);
-    let tokens = lexer.tokenize();
+    let mut sink = TokenCollector::new();
+    lexer.tokenize_into(&mut sink);
+    let tokens: Vec<Token<'_>> = sink.into_tokens();
     let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = Parser::new(tokens_ref, &arena);
+    let mut parser = Parser::new(tokens_ref, &arena, ErrorCollector::new());
 
     let module_name = "stdin";
     match parser.parse_module(module_name) {
         Ok(module) => {
-            let mut printer = Printer::new();
+            let mut printer = Printer::new(&module.arena);
             let output = printer.print_module(&module);
             print!("{}", output);
         }
@@ -103,7 +105,9 @@ fn run_parse(source: &str) {
 
 fn run_lex(source: &str) {
     let mut lexer = Lexer::new(source);
-    let tokens = lexer.tokenize();
+    let mut sink = TokenCollector::new();
+    lexer.tokenize_into(&mut sink);
+    let tokens = sink.into_tokens();
     for tok in &tokens {
         println!(
             "{:>4}:{:<3} {:<20} {}",
@@ -114,6 +118,3 @@ fn run_lex(source: &str) {
         );
     }
 }
-
-// 引入 print_module 以避免 unused import 警告
-// (已在上方直接使用 Printer)

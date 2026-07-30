@@ -110,7 +110,7 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     let m = mant >> 13;
     let rem = mant & 0x1FFF;
     let half = 0x1000;
-    let mut result: u32 = ((new_exp as u32) << 10) | (m as u32);
+    let mut result: u32 = ((new_exp as u32) << 10) | m;
     if rem > half || (rem == half && (m & 1) != 0) {
         result += 1;
     }
@@ -262,68 +262,79 @@ impl fmt::Display for F128 {
     }
 }
 
-// ---- ScalarTag — 18 种标量类型标签 ----
+// ---- ValueTag — 18 种标量类型标签 ----
 
 /// 标量类型标签：涵盖布尔、字符、整数与浮点共 18 种
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ScalarTag {
-    Bool,
-    Char,
-    I8,
-    I16,
-    I32,
-    I64,
-    I128,
-    U8,
-    U16,
-    U32,
-    U64,
-    U128,
-    Isize,
-    Usize,
-    F16,
-    F32,
-    F64,
-    F128,
+#[repr(u8)]
+pub enum ValueTag {
+    Null = 0,
+    Void = 1,
+    Bool = 2,
+    Char = 3,
+    I8 = 4,
+    I16 = 5,
+    I32 = 6,
+    I64 = 7,
+    U8 = 8,
+    U16 = 9,
+    U32 = 10,
+    U64 = 11,
+    Isize = 12,
+    Usize = 13,
+    I128 = 14,
+    U128 = 15,
+    F16 = 16,
+    F32 = 17,
+    F64 = 18,
+    F128 = 19,
+    Ref = 20,
 }
 
-impl ScalarTag {
+impl ValueTag {
+    pub fn is_scalar(self) -> bool {
+        !matches!(self, ValueTag::Null | ValueTag::Void | ValueTag::Ref)
+    }
+}
+
+impl ValueTag {
     pub fn byte_width(self) -> usize {
         match self {
-            ScalarTag::Bool | ScalarTag::I8 | ScalarTag::U8 => 1,
-            ScalarTag::I16 | ScalarTag::U16 | ScalarTag::F16 => 2,
-            ScalarTag::Char | ScalarTag::I32 | ScalarTag::U32 | ScalarTag::F32 => 4,
-            ScalarTag::I64 | ScalarTag::U64 | ScalarTag::Isize | ScalarTag::Usize | ScalarTag::F64 => 8,
-            ScalarTag::I128 | ScalarTag::U128 | ScalarTag::F128 => 16,
+            ValueTag::Bool | ValueTag::I8 | ValueTag::U8 => 1,
+            ValueTag::I16 | ValueTag::U16 | ValueTag::F16 => 2,
+            ValueTag::Char | ValueTag::I32 | ValueTag::U32 | ValueTag::F32 => 4,
+            ValueTag::I64 | ValueTag::U64 | ValueTag::Isize | ValueTag::Usize | ValueTag::F64 => 8,
+            ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
+            _ => 0,
         }
     }
 
     pub fn is_int(self) -> bool {
         matches!(
             self,
-            ScalarTag::I8 | ScalarTag::I16 | ScalarTag::I32 | ScalarTag::I64 | ScalarTag::I128
-                | ScalarTag::U8 | ScalarTag::U16 | ScalarTag::U32 | ScalarTag::U64 | ScalarTag::U128
-                | ScalarTag::Isize | ScalarTag::Usize
+            ValueTag::I8 | ValueTag::I16 | ValueTag::I32 | ValueTag::I64 | ValueTag::I128
+                | ValueTag::U8 | ValueTag::U16 | ValueTag::U32 | ValueTag::U64 | ValueTag::U128
+                | ValueTag::Isize | ValueTag::Usize
         )
     }
 
     pub fn is_float(self) -> bool {
-        matches!(self, ScalarTag::F16 | ScalarTag::F32 | ScalarTag::F64 | ScalarTag::F128)
+        matches!(self, ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128)
     }
 
     pub fn is_signed(self) -> bool {
         matches!(
             self,
-            ScalarTag::I8 | ScalarTag::I16 | ScalarTag::I32 | ScalarTag::I64 | ScalarTag::I128 | ScalarTag::Isize
+            ValueTag::I8 | ValueTag::I16 | ValueTag::I32 | ValueTag::I64 | ValueTag::I128 | ValueTag::Isize
         )
     }
 
     pub fn is_bool(self) -> bool {
-        matches!(self, ScalarTag::Bool)
+        matches!(self, ValueTag::Bool)
     }
 
     pub fn is_char(self) -> bool {
-        matches!(self, ScalarTag::Char)
+        matches!(self, ValueTag::Char)
     }
 
     pub fn is_numeric(self) -> bool {
@@ -332,37 +343,38 @@ impl ScalarTag {
 
     pub fn name(self) -> &'static str {
         match self {
-            ScalarTag::Bool => "bool",
-            ScalarTag::Char => "char",
-            ScalarTag::I8 => "i8",
-            ScalarTag::I16 => "i16",
-            ScalarTag::I32 => "i32",
-            ScalarTag::I64 => "i64",
-            ScalarTag::I128 => "i128",
-            ScalarTag::U8 => "u8",
-            ScalarTag::U16 => "u16",
-            ScalarTag::U32 => "u32",
-            ScalarTag::U64 => "u64",
-            ScalarTag::U128 => "u128",
-            ScalarTag::Isize => "isize",
-            ScalarTag::Usize => "usize",
-            ScalarTag::F16 => "f16",
-            ScalarTag::F32 => "f32",
-            ScalarTag::F64 => "f64",
-            ScalarTag::F128 => "f128",
+            ValueTag::Bool => "bool",
+            ValueTag::Char => "char",
+            ValueTag::I8 => "i8",
+            ValueTag::I16 => "i16",
+            ValueTag::I32 => "i32",
+            ValueTag::I64 => "i64",
+            ValueTag::I128 => "i128",
+            ValueTag::U8 => "u8",
+            ValueTag::U16 => "u16",
+            ValueTag::U32 => "u32",
+            ValueTag::U64 => "u64",
+            ValueTag::U128 => "u128",
+            ValueTag::Isize => "isize",
+            ValueTag::Usize => "usize",
+            ValueTag::F16 => "f16",
+            ValueTag::F32 => "f32",
+            ValueTag::F64 => "f64",
+            ValueTag::F128 => "f128",
+            _ => "unknown",
         }
     }
 
-    pub fn all() -> &'static [ScalarTag] {
+    pub fn all() -> &'static [ValueTag] {
         &[
-            ScalarTag::Bool, ScalarTag::Char, ScalarTag::I8, ScalarTag::I16, ScalarTag::I32,
-            ScalarTag::I64, ScalarTag::I128, ScalarTag::U8, ScalarTag::U16, ScalarTag::U32,
-            ScalarTag::U64, ScalarTag::U128, ScalarTag::Isize, ScalarTag::Usize, ScalarTag::F16,
-            ScalarTag::F32, ScalarTag::F64, ScalarTag::F128,
+            ValueTag::Bool, ValueTag::Char, ValueTag::I8, ValueTag::I16, ValueTag::I32,
+            ValueTag::I64, ValueTag::I128, ValueTag::U8, ValueTag::U16, ValueTag::U32,
+            ValueTag::U64, ValueTag::U128, ValueTag::Isize, ValueTag::Usize, ValueTag::F16,
+            ValueTag::F32, ValueTag::F64, ValueTag::F128,
         ]
     }
 
-    pub fn from_name(name: &str) -> Option<ScalarTag> {
+    pub fn from_name(name: &str) -> Option<ValueTag> {
         for tag in Self::all() {
             if tag.name() == name {
                 return Some(*tag);
@@ -372,29 +384,56 @@ impl ScalarTag {
     }
 }
 
-// ---- ScalarValue union — 16 字节 payload ----
+// ---- ValueHandle — 4B 索引句柄 ----
 
-/// 标量值联合体：18 种标量的 payload，由 `ScalarTag` 判别式守护访问
-#[derive(Clone, Copy)]
-pub union ScalarValue {
-    pub b: bool,
-    pub cp: u32,
-    pub i8_: i8,
-    pub i16_: i16,
-    pub i32_: i32,
-    pub i64_: i64,
-    pub i128_: i128,
-    pub u8_: u8,
-    pub u16_: u16,
-    pub u32_: u32,
-    pub u64_: u64,
-    pub u128_: u128,
-    pub isz_: isize,
-    pub usz_: usize,
-    pub f16_: u16,
-    pub f32_: f32,
-    pub f64_: f64,
-    pub f128_: u128,
+/// Glue 值的唯一句柄：4B 索引，编码类型桶 + 桶内索引。
+/// 高 8 位 = ValueTag，低 24 位 = 桶内索引。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValueHandle(u32);
+
+impl ValueHandle {
+    const TAG_SHIFT: u32 = 24;
+    const INDEX_MASK: u32 = 0x00FF_FFFF;
+
+    #[inline]
+    pub fn new(tag: ValueTag, index: usize) -> Self {
+        debug_assert!(index < (1 << 24));
+        Self(((tag as u8 as u32) << Self::TAG_SHIFT) | (index as u32 & Self::INDEX_MASK))
+    }
+
+    #[inline]
+    pub fn tag(self) -> ValueTag {
+        // SAFETY: tag 值始终在 ValueTag 的合法范围内
+        unsafe { std::mem::transmute((self.0 >> Self::TAG_SHIFT) as u8) }
+    }
+
+    #[inline]
+    pub fn index(self) -> usize {
+        (self.0 & Self::INDEX_MASK) as usize
+    }
+
+    pub const NULL: ValueHandle = ValueHandle((ValueTag::Null as u8 as u32) << 24);
+    pub const VOID: ValueHandle = ValueHandle((ValueTag::Void as u8 as u32) << 24);
+    pub const TRUE: ValueHandle = ValueHandle(((ValueTag::Bool as u8 as u32) << 24) | 1);
+    pub const FALSE: ValueHandle = ValueHandle((ValueTag::Bool as u8 as u32) << 24);
+}
+
+impl Default for ValueHandle {
+    fn default() -> Self {
+        ValueHandle::VOID
+    }
+}
+
+impl fmt::Debug for ValueHandle {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ValueHandle({:?}, {})", self.tag(), self.index())
+    }
+}
+
+impl fmt::Display for ValueHandle {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
 }
 
 // ---- Char / CharError ----
@@ -509,7 +548,7 @@ impl GlueStr {
     pub fn new(s: impl Into<String>) -> Self {
         Self { inner: Rc::from(s.into().as_str()) }
     }
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_rust_str(s: &str) -> Self {
         Self { inner: Rc::from(s) }
     }
     pub fn bytes(&self) -> &str {
@@ -528,7 +567,7 @@ impl GlueStr {
         let mut buf = String::with_capacity(self.byte_len() + other.byte_len());
         buf.push_str(&self.inner);
         buf.push_str(&other.inner);
-        Self::from_str(&buf)
+        Self::from_rust_str(&buf)
     }
     pub fn equals(&self, other: &Self) -> bool {
         self.inner == other.inner
@@ -562,17 +601,35 @@ impl fmt::Display for GlueStr {
 /// 数组值：元素可变（支持 push/pop），`fixed_size` 为 `Some` 时表示固定大小数组
 #[derive(Debug, Clone)]
 pub struct ArrayValue {
-    pub elements: Vec<Value>,
+    pub elements: Vec<ValueHandle>,
     pub fixed_size: Option<u64>,
     pub elem_is_ref: bool,
+    pub scalar_soa: Option<ScalarSoA>,
+}
+
+/// SoA 连续存储：当数组元素全为同类型标量时启用 SIMD 快路径
+#[derive(Debug, Clone)]
+pub enum ScalarSoA {
+    I8(Vec<i8>),
+    I16(Vec<i16>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+    Bool(Vec<bool>),
+    Char(Vec<u32>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
 }
 
 impl ArrayValue {
-    pub fn new(elements: Vec<Value>) -> Self {
-        Self { elements, fixed_size: None, elem_is_ref: false }
+    pub fn new(elements: Vec<ValueHandle>) -> Self {
+        Self { elements, fixed_size: None, elem_is_ref: false, scalar_soa: None }
     }
-    pub fn new_fixed(elements: Vec<Value>, size: u64) -> Self {
-        Self { elements, fixed_size: Some(size), elem_is_ref: false }
+    pub fn new_fixed(elements: Vec<ValueHandle>, size: u64) -> Self {
+        Self { elements, fixed_size: Some(size), elem_is_ref: false, scalar_soa: None }
     }
     pub fn len(&self) -> usize {
         self.elements.len()
@@ -580,13 +637,13 @@ impl ArrayValue {
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
     }
-    pub fn get(&self, index: usize) -> Option<&Value> {
+    pub fn get(&self, index: usize) -> Option<&ValueHandle> {
         self.elements.get(index)
     }
-    pub fn push(&mut self, val: Value) {
+    pub fn push(&mut self, val: ValueHandle) {
         self.elements.push(val);
     }
-    pub fn pop(&mut self) -> Option<Value> {
+    pub fn pop(&mut self) -> Option<ValueHandle> {
         self.elements.pop()
     }
 }
@@ -595,26 +652,26 @@ impl ArrayValue {
 #[derive(Debug, Clone)]
 pub struct RecordField {
     pub name: Option<String>,
-    pub value: Value,
+    pub value: ValueHandle,
 }
 
 /// 记录值：具名类型的结构化数据
 #[derive(Debug, Clone)]
 pub struct RecordValue {
     pub type_name: String,
-    pub fields: Vec<Value>,
+    pub fields: Vec<ValueHandle>,
     pub field_names: Vec<Option<String>>,
     pub field_ref_bits: u64,
 }
 
 impl RecordValue {
-    pub fn new(type_name: String, fields: Vec<Value>, field_names: Vec<Option<String>>) -> Self {
+    pub fn new(type_name: String, fields: Vec<ValueHandle>, field_names: Vec<Option<String>>) -> Self {
         Self { type_name, fields, field_names, field_ref_bits: 0 }
     }
-    pub fn get_field(&self, index: usize) -> Option<&Value> {
+    pub fn get_field(&self, index: usize) -> Option<&ValueHandle> {
         self.fields.get(index)
     }
-    pub fn find_field(&self, name: &str) -> Option<&Value> {
+    pub fn find_field(&self, name: &str) -> Option<&ValueHandle> {
         for (i, field_name) in self.field_names.iter().enumerate() {
             if let Some(n) = field_name {
                 if n == name {
@@ -630,7 +687,7 @@ impl RecordValue {
 #[derive(Debug, Clone)]
 pub struct AdtField {
     pub name: Option<String>,
-    pub value: Value,
+    pub value: ValueHandle,
 }
 
 /// ADT 值：代数数据类型实例
@@ -646,10 +703,10 @@ impl AdtValue {
     pub fn new(type_name: String, constructor: String, fields: Vec<AdtField>) -> Self {
         Self { type_name, constructor, fields, field_ref_bits: 0 }
     }
-    pub fn get_field(&self, index: usize) -> Option<&Value> {
+    pub fn get_field(&self, index: usize) -> Option<&ValueHandle> {
         self.fields.get(index).map(|f| &f.value)
     }
-    pub fn find_field(&self, name: &str) -> Option<&Value> {
+    pub fn find_field(&self, name: &str) -> Option<&ValueHandle> {
         for field in &self.fields {
             if let Some(n) = &field.name {
                 if n == name {
@@ -665,23 +722,23 @@ impl AdtValue {
 #[derive(Debug, Clone)]
 pub struct NewtypeValue {
     pub type_name: String,
-    pub inner: Value,
+    pub inner: ValueHandle,
 }
 
 /// Cell：可变引用单元
 #[derive(Debug, Clone)]
 pub struct Cell {
-    pub inner: RefCell<Value>,
+    pub inner: RefCell<ValueHandle>,
 }
 
 impl Cell {
-    pub fn new(val: Value) -> Self {
+    pub fn new(val: ValueHandle) -> Self {
         Self { inner: RefCell::new(val) }
     }
-    pub fn get(&self) -> std::cell::Ref<Value> {
+    pub fn get(&self) -> std::cell::Ref<'_, ValueHandle> {
         self.inner.borrow()
     }
-    pub fn set(&self, val: Value) {
+    pub fn set(&self, val: ValueHandle) {
         *self.inner.borrow_mut() = val;
     }
 }
@@ -718,6 +775,9 @@ impl Range {
             0
         }
     }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     pub fn iter(&self) -> RangeIter {
         RangeIter { current: self.start, end: self.end, inclusive: self.inclusive }
     }
@@ -734,7 +794,7 @@ pub struct RangeIter {
 // ---- callable.rs → BuiltinFn, Builtin, Closure, PartialApplication, TraitValue, LazyValue ----
 
 /// 内建函数指针类型
-pub type BuiltinFn = fn(&[Value]) -> Result<Value, String>;
+pub type BuiltinFn = fn(&[ValueHandle]) -> Result<ValueHandle, String>;
 
 /// 内建函数值
 #[derive(Clone)]
@@ -754,8 +814,8 @@ impl fmt::Debug for Builtin {
 pub struct Closure {
     pub func_id: u32,
     pub arity: u8,
-    pub upvalues: Vec<Value>,
-    pub bound_args: Vec<Value>,
+    pub upvalues: Vec<ValueHandle>,
+    pub bound_args: Vec<ValueHandle>,
     pub self_upvalue_idx: i32,
     pub upvalue_ref_bits: u8,
     pub cell_upvalues: u8,
@@ -765,7 +825,7 @@ pub struct Closure {
 #[derive(Debug, Clone)]
 pub struct PartialApplication {
     pub func_id: u32,
-    pub bound_args: Vec<Value>,
+    pub bound_args: Vec<ValueHandle>,
     pub remaining_arity: u8,
     pub bound_arg_ref_bits: u16,
 }
@@ -775,17 +835,17 @@ pub struct PartialApplication {
 pub struct TraitValue {
     pub trait_name: String,
     pub method_names: Vec<String>,
-    pub method_values: Vec<Value>,
-    pub data: Option<Value>,
+    pub method_values: Vec<ValueHandle>,
+    pub data: Option<ValueHandle>,
     pub owned: bool,
 }
 
 /// 惰性值
 #[derive(Clone)]
 pub struct LazyValue {
-    pub cached: Option<Value>,
+    pub cached: Option<ValueHandle>,
     pub forced: bool,
-    pub thunk: Option<Rc<dyn Fn() -> Value>>,
+    pub thunk: Option<Rc<dyn Fn() -> ValueHandle>>,
 }
 
 impl fmt::Debug for LazyValue {
@@ -811,7 +871,7 @@ pub struct ErrorValue {
 /// 抛出载荷
 #[derive(Debug, Clone)]
 pub enum ThrowPayload {
-    Ok(Value),
+    Ok(ValueHandle),
     Err(Rc<RecordValue>),
 }
 
@@ -826,17 +886,22 @@ pub struct ThrowValue {
 /// 数组迭代器
 #[derive(Debug, Clone)]
 pub struct ArrayIterator {
-    pub array: Rc<Vec<Value>>,
+    pub array: Rc<Vec<ValueHandle>>,
     pub index: usize,
 }
 
 impl ArrayIterator {
-    pub fn new(array: Rc<Vec<Value>>) -> Self {
+    pub fn new(array: Rc<Vec<ValueHandle>>) -> Self {
         Self { array, index: 0 }
     }
-    pub fn next(&mut self) -> Option<Value> {
+}
+
+impl Iterator for ArrayIterator {
+    type Item = ValueHandle;
+
+    fn next(&mut self) -> Option<ValueHandle> {
         if self.index < self.array.len() {
-            let val = self.array[self.index].clone();
+            let val = self.array[self.index];
             self.index += 1;
             Some(val)
         } else {
@@ -856,7 +921,12 @@ impl StringIterator {
     pub fn new(string: Rc<str>) -> Self {
         Self { string, byte_offset: 0 }
     }
-    pub fn next(&mut self) -> Option<u32> {
+}
+
+impl Iterator for StringIterator {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
         if self.byte_offset >= self.string.len() {
             return None;
         }
@@ -879,7 +949,12 @@ impl RangeIterator {
     pub fn new(start: i64, end: i64, inclusive: bool) -> Self {
         Self { current: start, end, inclusive }
     }
-    pub fn next(&mut self) -> Option<i64> {
+}
+
+impl Iterator for RangeIterator {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<i64> {
         if self.inclusive {
             if self.current <= self.end {
                 let v = self.current;
@@ -903,20 +978,20 @@ impl RangeIterator {
 /// 原子值
 #[derive(Debug)]
 pub struct AtomicValue {
-    data: Mutex<Value>,
+    data: Mutex<ValueHandle>,
 }
 
 impl AtomicValue {
-    pub fn new(val: Value) -> Self {
+    pub fn new(val: ValueHandle) -> Self {
         Self { data: Mutex::new(val) }
     }
-    pub fn load(&self) -> Value {
-        self.data.lock().unwrap().clone()
+    pub fn load(&self) -> ValueHandle {
+        *self.data.lock().unwrap()
     }
-    pub fn store(&self, val: Value) {
+    pub fn store(&self, val: ValueHandle) {
         *self.data.lock().unwrap() = val;
     }
-    pub fn swap(&self, val: Value) -> Value {
+    pub fn swap(&self, val: ValueHandle) -> ValueHandle {
         std::mem::replace(&mut *self.data.lock().unwrap(), val)
     }
 }
@@ -941,7 +1016,7 @@ pub enum AsyncStatus {
 #[derive(Debug)]
 pub struct AsyncHandle {
     status: Mutex<AsyncStatus>,
-    result: Mutex<Option<Value>>,
+    result: Mutex<Option<ValueHandle>>,
 }
 
 impl AsyncHandle {
@@ -954,10 +1029,10 @@ impl AsyncHandle {
     pub fn set_status(&self, status: AsyncStatus) {
         *self.status.lock().unwrap() = status;
     }
-    pub fn result(&self) -> Option<Value> {
-        self.result.lock().unwrap().clone()
+    pub fn result(&self) -> Option<ValueHandle> {
+        *self.result.lock().unwrap()
     }
-    pub fn set_result(&self, val: Value) {
+    pub fn set_result(&self, val: ValueHandle) {
         *self.result.lock().unwrap() = Some(val);
     }
 }
@@ -979,7 +1054,7 @@ impl Clone for AsyncHandle {
 /// 通道值
 #[derive(Debug)]
 pub struct ChannelValue {
-    buffer: Mutex<Vec<Value>>,
+    buffer: Mutex<Vec<ValueHandle>>,
     capacity: usize,
     closed: Mutex<bool>,
 }
@@ -988,7 +1063,7 @@ impl ChannelValue {
     pub fn new(capacity: usize) -> Self {
         Self { buffer: Mutex::new(Vec::new()), capacity, closed: Mutex::new(false) }
     }
-    pub fn send(&self, val: Value) -> Result<(), String> {
+    pub fn send(&self, val: ValueHandle) -> Result<(), String> {
         if *self.closed.lock().unwrap() {
             return Err("channel closed".to_string());
         }
@@ -999,7 +1074,7 @@ impl ChannelValue {
         buf.push(val);
         Ok(())
     }
-    pub fn recv(&self) -> Option<Value> {
+    pub fn recv(&self) -> Option<ValueHandle> {
         let mut buf = self.buffer.lock().unwrap();
         if !buf.is_empty() {
             Some(buf.remove(0))
@@ -1007,10 +1082,10 @@ impl ChannelValue {
             None
         }
     }
-    pub fn try_send(&self, val: Value) -> Result<(), String> {
+    pub fn try_send(&self, val: ValueHandle) -> Result<(), String> {
         self.send(val)
     }
-    pub fn try_recv(&self) -> Option<Value> {
+    pub fn try_recv(&self) -> Option<ValueHandle> {
         self.recv()
     }
     pub fn close(&self) {
@@ -1182,8 +1257,13 @@ impl Hash for HeapObj {
             HeapObj::Str(s) => s.hash(state),
             HeapObj::Array(a) => {
                 a.elements.len().hash(state);
-                for e in &a.elements {
-                    e.hash(state);
+                // SoA SIMD 快路径：批量哈希标量
+                if let Some(soa) = &a.scalar_soa {
+                    simd_hash_soa(soa, state);
+                } else {
+                    for e in &a.elements {
+                        e.hash(state);
+                    }
                 }
                 a.fixed_size.hash(state);
             }
@@ -1255,907 +1335,1549 @@ impl Hash for HeapObj {
 }
 
 // =========================================================================
-// 第三部分：Value enum（4 变体）
+// 第三部分：Bucket<T> + ValueArena（全分桶 SoA 存储）
 // =========================================================================
 
-/// Glue 统一值：标量内联 + 堆对象引用
-#[derive(Clone)]
-pub enum Value {
-    Null,
-    Void,
-    Scalar(ScalarValue, ScalarTag),
-    Ref(HeapRef),
+/// 类型分桶：连续存储同类型值 + 并行引用计数 + 空闲列表回收。
+struct Bucket<T: Clone> {
+    data: Vec<T>,
+    refcounts: Vec<u32>,
+    free_list: Vec<u32>,
 }
 
-impl Default for Value {
-    fn default() -> Self {
-        Value::Void
+impl<T: Clone> Bucket<T> {
+    fn new() -> Self {
+        Self { data: Vec::new(), refcounts: Vec::new(), free_list: Vec::new() }
+    }
+
+    fn alloc(&mut self, val: T) -> u32 {
+        if let Some(idx) = self.free_list.pop() {
+            self.data[idx as usize] = val;
+            self.refcounts[idx as usize] = 1;
+            idx
+        } else {
+            let idx = self.data.len() as u32;
+            self.data.push(val);
+            self.refcounts.push(1);
+            idx
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: u32) -> &T {
+        &self.data[idx as usize]
+    }
+
+    fn inc_ref(&mut self, idx: u32) {
+        self.refcounts[idx as usize] += 1;
+    }
+
+    fn dec_ref(&mut self, idx: u32) -> bool {
+        let rc = &mut self.refcounts[idx as usize];
+        *rc = rc.saturating_sub(1);
+        if *rc == 0 {
+            self.free_list.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn _refcount(&self, idx: u32) -> u32 {
+        self.refcounts[idx as usize]
     }
 }
 
-// =========================================================================
-// 第四部分：宏生成标量 API
-// =========================================================================
+/// Value 的统一存储：按类型分桶（SoA），每种标量类型独立连续存储。
+/// 堆对象（HeapObj）仍用 Rc，存于 ref_bucket。
+pub struct ValueArena {
+    char_bucket: Bucket<u32>,
+    i8_bucket: Bucket<i8>,
+    i16_bucket: Bucket<i16>,
+    i32_bucket: Bucket<i32>,
+    i64_bucket: Bucket<i64>,
+    u8_bucket: Bucket<u8>,
+    u16_bucket: Bucket<u16>,
+    u32_bucket: Bucket<u32>,
+    u64_bucket: Bucket<u64>,
+    isz_bucket: Bucket<isize>,
+    usz_bucket: Bucket<usize>,
+    i128_bucket: Bucket<[u64; 2]>,
+    u128_bucket: Bucket<[u64; 2]>,
+    f16_bucket: Bucket<u16>,
+    f32_bucket: Bucket<f32>,
+    f64_bucket: Bucket<f64>,
+    f128_bucket: Bucket<[u64; 2]>,
+    ref_bucket: Bucket<Rc<HeapObj>>,
+}
 
-macro_rules! impl_scalar_api {
-    ($($tag:ident => $ctor:ident / $field:ident / $acc:ident : $ty:ty);* $(;)?) => {
-        impl Value {
+macro_rules! impl_scalar_bucket_methods {
+    ($($tag:ident => $alloc:ident / $get:ident : $ty:ty, $bucket:ident);* $(;)?) => {
+        impl ValueArena {
             $(
                 #[inline]
-                pub fn $ctor(v: $ty) -> Self {
-                    Value::Scalar(ScalarValue { $field: v }, ScalarTag::$tag)
+                pub fn $alloc(&mut self, v: $ty) -> ValueHandle {
+                    let idx = self.$bucket.alloc(v);
+                    ValueHandle::new(ValueTag::$tag, idx as usize)
                 }
-
                 #[inline]
-                pub fn $acc(&self) -> Option<$ty> {
-                    match self {
-                        Value::Scalar(sv, t) if *t == ScalarTag::$tag => {
-                            Some(unsafe { sv.$field })
-                        }
-                        _ => None,
-                    }
+                pub fn $get(&self, h: ValueHandle) -> $ty {
+                    *self.$bucket.get(h.index() as u32)
                 }
             )*
         }
     };
 }
 
-impl_scalar_api! {
-    Bool => bool / b / as_bool : bool;
-    I8 => i8 / i8_ / as_i8 : i8;
-    I16 => i16 / i16_ / as_i16 : i16;
-    I32 => i32 / i32_ / as_i32 : i32;
-    I64 => i64 / i64_ / as_i64 : i64;
-    I128 => i128 / i128_ / as_i128 : i128;
-    U8 => u8 / u8_ / as_u8 : u8;
-    U16 => u16 / u16_ / as_u16 : u16;
-    U32 => u32 / u32_ / as_u32 : u32;
-    U64 => u64 / u64_ / as_u64 : u64;
-    U128 => u128 / u128_ / as_u128 : u128;
-    Isize => isize / isz_ / as_isize : isize;
-    Usize => usize / usz_ / as_usize : usize;
-    F32 => f32 / f32_ / as_f32 : f32;
-    F64 => f64 / f64_ / as_f64 : f64;
+impl_scalar_bucket_methods! {
+    Char => alloc_char / get_char : u32, char_bucket;
+    I8 => alloc_i8 / get_i8 : i8, i8_bucket;
+    I16 => alloc_i16 / get_i16 : i16, i16_bucket;
+    I32 => alloc_i32 / get_i32 : i32, i32_bucket;
+    I64 => alloc_i64 / get_i64 : i64, i64_bucket;
+    U8 => alloc_u8 / get_u8 : u8, u8_bucket;
+    U16 => alloc_u16 / get_u16 : u16, u16_bucket;
+    U32 => alloc_u32 / get_u32 : u32, u32_bucket;
+    U64 => alloc_u64 / get_u64 : u64, u64_bucket;
+    Isize => alloc_isize / get_isize : isize, isz_bucket;
+    Usize => alloc_usize / get_usize : usize, usz_bucket;
+    F16 => alloc_f16 / get_f16 : u16, f16_bucket;
+    F32 => alloc_f32 / get_f32 : f32, f32_bucket;
+    F64 => alloc_f64 / get_f64 : f64, f64_bucket;
 }
 
-// ---- 标量分派宏（消除 12-18 臂重复 match）----
-//
-// `dispatch_scalar!` 按 `ScalarTag` 分派读取 `ScalarValue` union 字段，
-// 绑定到 `$val` 后执行 `$expr`。用于 Hash / equals / as_int_i64 / as_int_i128
-// 等可统一表达的场景。F32/F64 的 to_bits 语义由调用方处理（Hash 经
-// `f32::hash`/`f64::hash` 内部 to_bits 保留，equals 显式 to_bits 比较）。
-macro_rules! dispatch_scalar {
-    ($sv:expr, $tag:expr, $val:ident => $expr:expr) => {
-        match $tag {
-            ScalarTag::Bool  => { let $val = unsafe { $sv.b }; $expr }
-            ScalarTag::Char  => { let $val = unsafe { $sv.cp }; $expr }
-            ScalarTag::I8    => { let $val = unsafe { $sv.i8_ }; $expr }
-            ScalarTag::I16   => { let $val = unsafe { $sv.i16_ }; $expr }
-            ScalarTag::I32   => { let $val = unsafe { $sv.i32_ }; $expr }
-            ScalarTag::I64   => { let $val = unsafe { $sv.i64_ }; $expr }
-            ScalarTag::I128  => { let $val = unsafe { $sv.i128_ }; $expr }
-            ScalarTag::U8    => { let $val = unsafe { $sv.u8_ }; $expr }
-            ScalarTag::U16   => { let $val = unsafe { $sv.u16_ }; $expr }
-            ScalarTag::U32   => { let $val = unsafe { $sv.u32_ }; $expr }
-            ScalarTag::U64   => { let $val = unsafe { $sv.u64_ }; $expr }
-            ScalarTag::U128  => { let $val = unsafe { $sv.u128_ }; $expr }
-            ScalarTag::Isize => { let $val = unsafe { $sv.isz_ }; $expr }
-            ScalarTag::Usize => { let $val = unsafe { $sv.usz_ }; $expr }
-            ScalarTag::F16   => { let $val = unsafe { $sv.f16_ }; $expr }
-            ScalarTag::F32   => { let $val = unsafe { $sv.f32_ }; $expr }
-            ScalarTag::F64   => { let $val = unsafe { $sv.f64_ }; $expr }
-            ScalarTag::F128  => { let $val = unsafe { $sv.f128_ }; $expr }
-        }
-    };
-    // @bits：F32/F64 绑定为 to_bits()（u32/u64）。f32/f64 未实现 Hash，且
-    // equals 需按位比较，故 Hash 与逐位比较走此模式。
-    (@bits $sv:expr, $tag:expr, $val:ident => $expr:expr) => {
-        match $tag {
-            ScalarTag::Bool  => { let $val = unsafe { $sv.b }; $expr }
-            ScalarTag::Char  => { let $val = unsafe { $sv.cp }; $expr }
-            ScalarTag::I8    => { let $val = unsafe { $sv.i8_ }; $expr }
-            ScalarTag::I16   => { let $val = unsafe { $sv.i16_ }; $expr }
-            ScalarTag::I32   => { let $val = unsafe { $sv.i32_ }; $expr }
-            ScalarTag::I64   => { let $val = unsafe { $sv.i64_ }; $expr }
-            ScalarTag::I128  => { let $val = unsafe { $sv.i128_ }; $expr }
-            ScalarTag::U8    => { let $val = unsafe { $sv.u8_ }; $expr }
-            ScalarTag::U16   => { let $val = unsafe { $sv.u16_ }; $expr }
-            ScalarTag::U32   => { let $val = unsafe { $sv.u32_ }; $expr }
-            ScalarTag::U64   => { let $val = unsafe { $sv.u64_ }; $expr }
-            ScalarTag::U128  => { let $val = unsafe { $sv.u128_ }; $expr }
-            ScalarTag::Isize => { let $val = unsafe { $sv.isz_ }; $expr }
-            ScalarTag::Usize => { let $val = unsafe { $sv.usz_ }; $expr }
-            ScalarTag::F16   => { let $val = unsafe { $sv.f16_ }; $expr }
-            ScalarTag::F32   => { let $val = unsafe { $sv.f32_.to_bits() }; $expr }
-            ScalarTag::F64   => { let $val = unsafe { $sv.f64_.to_bits() }; $expr }
-            ScalarTag::F128  => { let $val = unsafe { $sv.f128_ }; $expr }
-        }
-    };
-}
-
-// `scalar_fmt!` 硬编码 Debug / Display 的逐臂格式化（两者格式不同，无法用
-// 统一 $expr，故各成一模式）。@debug 带 i8/u8/i64... 后缀，@display 不带。
-macro_rules! scalar_fmt {
-    (@debug $sv:expr, $tag:expr, $f:expr) => {
-        match $tag {
-            ScalarTag::Bool  => write!($f, "{}",     unsafe { $sv.b }),
-            ScalarTag::Char  => write!($f, "'{}'",   Char::from_codepoint_unchecked(unsafe { $sv.cp })),
-            ScalarTag::I8    => write!($f, "{}i8",   unsafe { $sv.i8_ }),
-            ScalarTag::I16   => write!($f, "{}i16",  unsafe { $sv.i16_ }),
-            ScalarTag::I32   => write!($f, "{}",     unsafe { $sv.i32_ }),
-            ScalarTag::I64   => write!($f, "{}i64",  unsafe { $sv.i64_ }),
-            ScalarTag::I128  => write!($f, "{}i128", unsafe { $sv.i128_ }),
-            ScalarTag::U8    => write!($f, "{}u8",    unsafe { $sv.u8_ }),
-            ScalarTag::U16   => write!($f, "{}u16",  unsafe { $sv.u16_ }),
-            ScalarTag::U32   => write!($f, "{}u32",  unsafe { $sv.u32_ }),
-            ScalarTag::U64   => write!($f, "{}u64",  unsafe { $sv.u64_ }),
-            ScalarTag::U128  => write!($f, "{}u128", unsafe { $sv.u128_ }),
-            ScalarTag::Isize => write!($f, "{}isize",unsafe { $sv.isz_ }),
-            ScalarTag::Usize => write!($f, "{}usize",unsafe { $sv.usz_ }),
-            ScalarTag::F16   => write!($f, "{:?}",   F16(unsafe { $sv.f16_ })),
-            ScalarTag::F32   => write!($f, "{}f32",  unsafe { $sv.f32_ }),
-            ScalarTag::F64   => write!($f, "{}",     unsafe { $sv.f64_ }),
-            ScalarTag::F128  => write!($f, "{:?}",   F128(unsafe { $sv.f128_ }.to_le_bytes())),
-        }
-    };
-    (@display $sv:expr, $tag:expr, $f:expr) => {
-        match $tag {
-            ScalarTag::Bool  => write!($f, "{}", unsafe { $sv.b }),
-            ScalarTag::Char  => write!($f, "{}", Char::from_codepoint_unchecked(unsafe { $sv.cp })),
-            ScalarTag::I8    => write!($f, "{}", unsafe { $sv.i8_ }),
-            ScalarTag::I16   => write!($f, "{}", unsafe { $sv.i16_ }),
-            ScalarTag::I32   => write!($f, "{}", unsafe { $sv.i32_ }),
-            ScalarTag::I64   => write!($f, "{}", unsafe { $sv.i64_ }),
-            ScalarTag::I128  => write!($f, "{}", unsafe { $sv.i128_ }),
-            ScalarTag::U8    => write!($f, "{}", unsafe { $sv.u8_ }),
-            ScalarTag::U16   => write!($f, "{}", unsafe { $sv.u16_ }),
-            ScalarTag::U32   => write!($f, "{}", unsafe { $sv.u32_ }),
-            ScalarTag::U64   => write!($f, "{}", unsafe { $sv.u64_ }),
-            ScalarTag::U128  => write!($f, "{}", unsafe { $sv.u128_ }),
-            ScalarTag::Isize => write!($f, "{}", unsafe { $sv.isz_ }),
-            ScalarTag::Usize => write!($f, "{}", unsafe { $sv.usz_ }),
-            ScalarTag::F16   => write!($f, "{}", F16(unsafe { $sv.f16_ }).to_f32()),
-            ScalarTag::F32   => write!($f, "{}", unsafe { $sv.f32_ }),
-            ScalarTag::F64   => write!($f, "{}", unsafe { $sv.f64_ }),
-            ScalarTag::F128  => write!($f, "{}", F128(unsafe { $sv.f128_ }.to_le_bytes()).to_f64()),
-        }
-    };
-}
-
-// `construct_int_from_i64!` 按 tag 从 i64 构造对应整数标量（非整数 tag 回退到 I64）。
-macro_rules! construct_int_from_i64 {
-    ($tag:expr, $v:expr) => {
-        match $tag {
-            ScalarTag::I8    => Value::Scalar(ScalarValue { i8_: $v as i8 },    ScalarTag::I8),
-            ScalarTag::I16   => Value::Scalar(ScalarValue { i16_: $v as i16 }, ScalarTag::I16),
-            ScalarTag::I32   => Value::Scalar(ScalarValue { i32_: $v as i32 }, ScalarTag::I32),
-            ScalarTag::I64   => Value::Scalar(ScalarValue { i64_: $v },        ScalarTag::I64),
-            ScalarTag::I128  => Value::Scalar(ScalarValue { i128_: $v as i128 },ScalarTag::I128),
-            ScalarTag::U8    => Value::Scalar(ScalarValue { u8_: $v as u8 },    ScalarTag::U8),
-            ScalarTag::U16   => Value::Scalar(ScalarValue { u16_: $v as u16 }, ScalarTag::U16),
-            ScalarTag::U32   => Value::Scalar(ScalarValue { u32_: $v as u32 }, ScalarTag::U32),
-            ScalarTag::U64   => Value::Scalar(ScalarValue { u64_: $v as u64 }, ScalarTag::U64),
-            ScalarTag::U128  => Value::Scalar(ScalarValue { u128_: $v as u128 },ScalarTag::U128),
-            ScalarTag::Isize => Value::Scalar(ScalarValue { isz_: $v as isize },ScalarTag::Isize),
-            ScalarTag::Usize => Value::Scalar(ScalarValue { usz_: $v as usize },ScalarTag::Usize),
-            _ => Value::Scalar(ScalarValue { i64_: $v }, ScalarTag::I64),
-        }
-    };
-}
-
-// `float_to_f64!` 按 tag 将浮点标量统一提升为 f64（非浮点 tag unreachable）。
-macro_rules! float_to_f64 {
-    ($sv:expr, $tag:expr) => {
-        match $tag {
-            ScalarTag::F16  => F16(unsafe { $sv.f16_ }).to_f64(),
-            ScalarTag::F32  => (unsafe { $sv.f32_ }) as f64,
-            ScalarTag::F64  => unsafe { $sv.f64_ },
-            ScalarTag::F128 => F128(unsafe { $sv.f128_ }.to_le_bytes()).to_f64(),
-            _ => unreachable!(),
-        }
-    };
-}
-
-// `scalar_equals!` 逐臂比较两个 `ScalarValue`：F32/F64 按 to_bits() 比较
-// （区分 +0.0/-0.0 与 NaN 位模式），其余字段类型一致直接 ==。
-// （嵌套 dispatch_scalar! 不可行：内层 match 会绑定全部 18 种类型，导致
-//   跨类型 `av == bv` 编译失败。）
-macro_rules! scalar_equals {
-    ($a:expr, $b:expr, $tag:expr) => {
-        match $tag {
-            ScalarTag::Bool  => unsafe { $a.b == $b.b },
-            ScalarTag::Char  => unsafe { $a.cp == $b.cp },
-            ScalarTag::I8    => unsafe { $a.i8_ == $b.i8_ },
-            ScalarTag::I16   => unsafe { $a.i16_ == $b.i16_ },
-            ScalarTag::I32   => unsafe { $a.i32_ == $b.i32_ },
-            ScalarTag::I64   => unsafe { $a.i64_ == $b.i64_ },
-            ScalarTag::I128  => unsafe { $a.i128_ == $b.i128_ },
-            ScalarTag::U8    => unsafe { $a.u8_ == $b.u8_ },
-            ScalarTag::U16   => unsafe { $a.u16_ == $b.u16_ },
-            ScalarTag::U32   => unsafe { $a.u32_ == $b.u32_ },
-            ScalarTag::U64   => unsafe { $a.u64_ == $b.u64_ },
-            ScalarTag::U128  => unsafe { $a.u128_ == $b.u128_ },
-            ScalarTag::Isize => unsafe { $a.isz_ == $b.isz_ },
-            ScalarTag::Usize => unsafe { $a.usz_ == $b.usz_ },
-            ScalarTag::F16   => unsafe { $a.f16_ == $b.f16_ },
-            ScalarTag::F32   => unsafe { $a.f32_.to_bits() == $b.f32_.to_bits() },
-            ScalarTag::F64   => unsafe { $a.f64_.to_bits() == $b.f64_.to_bits() },
-            ScalarTag::F128  => unsafe { $a.f128_ == $b.f128_ },
-        }
-    };
-}
-
-// `read_int_as!` 按 tag 从字节读取整数并提升为 i128 / u128。
-// 整数类型（含 Isize/Usize）经符号扩展后转目标类型，非整数 tag 回退 0。
-// 有符号源在转 u128 时经 i128 中转，以保留与原逐臂代码一致的语义。
-macro_rules! read_int_as {
-    ($tag:expr, $bytes:expr, i128) => {
-        match $tag {
-            ScalarTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128,
-            ScalarTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as i128,
-            ScalarTag::I16   => read_i16_le($bytes) as i128,
-            ScalarTag::U16   => read_u16_le($bytes) as i128,
-            ScalarTag::I32   => read_i32_le($bytes) as i128,
-            ScalarTag::U32   => read_u32_le($bytes) as i128,
-            ScalarTag::I64   => read_i64_le($bytes) as i128,
-            ScalarTag::U64   => read_u64_le($bytes) as i128,
-            ScalarTag::I128  => read_i128_le($bytes),
-            ScalarTag::U128  => read_u128_le($bytes) as i128,
-            ScalarTag::Isize => read_i64_le($bytes) as isize as i128,
-            ScalarTag::Usize => read_u64_le($bytes) as usize as i128,
-            _ => 0,
-        }
-    };
-    ($tag:expr, $bytes:expr, u128) => {
-        match $tag {
-            ScalarTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128 as u128,
-            ScalarTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as u128,
-            ScalarTag::I16   => read_i16_le($bytes) as i128 as u128,
-            ScalarTag::U16   => read_u16_le($bytes) as u128,
-            ScalarTag::I32   => read_i32_le($bytes) as i128 as u128,
-            ScalarTag::U32   => read_u32_le($bytes) as u128,
-            ScalarTag::I64   => read_i64_le($bytes) as i128 as u128,
-            ScalarTag::U64   => read_u64_le($bytes) as u128,
-            ScalarTag::I128  => read_i128_le($bytes) as u128,
-            ScalarTag::U128  => read_u128_le($bytes),
-            ScalarTag::Isize => read_i64_le($bytes) as isize as i128 as u128,
-            ScalarTag::Usize => read_u64_le($bytes) as usize as u128,
-            _ => 0,
-        }
-    };
-}
-
-// `write_int_bytes!` 按 dst_tag 将整数（i128 或 u128）写入目标字节缓冲，
-// 复用既有 write_*_le 辅助函数以保持与原逐臂代码一致的截断/填充语义。
-macro_rules! write_int_bytes {
-    ($val:expr, $tag:expr, $dst:expr) => {
-        match $tag {
-            ScalarTag::I8    => write_i8($val as i8, $dst),
-            ScalarTag::U8    => write_u8($val as u8, $dst),
-            ScalarTag::I16   => write_i16_le($val as i16, $dst),
-            ScalarTag::U16   => write_u16_le($val as u16, $dst),
-            ScalarTag::I32   => write_i32_le($val as i32, $dst),
-            ScalarTag::U32   => write_u32_le($val as u32, $dst),
-            ScalarTag::I64   => write_i64_le($val as i64, $dst),
-            ScalarTag::U64   => write_u64_le($val as u64, $dst),
-            ScalarTag::I128  => write_i128_le($val as i128, $dst),
-            ScalarTag::U128  => write_u128_le($val as u128, $dst),
-            ScalarTag::Isize => write_i64_le($val as isize as i64, $dst),
-            ScalarTag::Usize => write_u64_le($val as usize as u64, $dst),
-            _ => {}
-        }
-    };
-}
-
-// ---- Char / F16 / F128 特殊构造器与访问器 ----
-
-impl Value {
-    /// 构造字符值
-    pub fn char(c: Char) -> Self {
-        Value::Scalar(ScalarValue { cp: c.codepoint }, ScalarTag::Char)
-    }
-
-    /// 从 codepoint 构造字符值（不校验）
-    pub fn char_from_codepoint(cp: u32) -> Self {
-        Value::Scalar(ScalarValue { cp }, ScalarTag::Char)
-    }
-
-    /// 从 Rust `char` 构造字符值
-    pub fn from_rust_char(c: char) -> Self {
-        Value::Scalar(ScalarValue { cp: c as u32 }, ScalarTag::Char)
-    }
-
-    /// 转为 `Char`
-    pub fn as_char(&self) -> Option<Char> {
-        match self {
-            Value::Scalar(sv, t) if *t == ScalarTag::Char => {
-                Some(Char::from_codepoint_unchecked(unsafe { sv.cp }))
-            }
-            _ => None,
+impl ValueArena {
+    pub fn new() -> Self {
+        Self {
+            char_bucket: Bucket::new(),
+            i8_bucket: Bucket::new(),
+            i16_bucket: Bucket::new(),
+            i32_bucket: Bucket::new(),
+            i64_bucket: Bucket::new(),
+            u8_bucket: Bucket::new(),
+            u16_bucket: Bucket::new(),
+            u32_bucket: Bucket::new(),
+            u64_bucket: Bucket::new(),
+            isz_bucket: Bucket::new(),
+            usz_bucket: Bucket::new(),
+            i128_bucket: Bucket::new(),
+            u128_bucket: Bucket::new(),
+            f16_bucket: Bucket::new(),
+            f32_bucket: Bucket::new(),
+            f64_bucket: Bucket::new(),
+            f128_bucket: Bucket::new(),
+            ref_bucket: Bucket::new(),
         }
     }
 
-    /// 构造 F16 值
-    pub fn f16(v: F16) -> Self {
-        Value::Scalar(ScalarValue { f16_: v.0 }, ScalarTag::F16)
+    #[inline]
+    pub fn alloc_i128(&mut self, v: i128) -> ValueHandle {
+        let idx = self.i128_bucket.alloc([(v as u128 & 0xFFFF_FFFF_FFFF_FFFF) as u64, ((v as u128) >> 64) as u64]);
+        ValueHandle::new(ValueTag::I128, idx as usize)
+    }
+    #[inline]
+    pub fn get_i128(&self, h: ValueHandle) -> i128 {
+        let [lo, hi] = *self.i128_bucket.get(h.index() as u32);
+        ((hi as i128) << 64) | (lo as i128)
     }
 
-    /// 转为 `F16`
-    pub fn as_f16(&self) -> Option<F16> {
-        match self {
-            Value::Scalar(sv, t) if *t == ScalarTag::F16 => {
-                Some(F16(unsafe { sv.f16_ }))
-            }
-            _ => None,
-        }
+    #[inline]
+    pub fn alloc_u128(&mut self, v: u128) -> ValueHandle {
+        let idx = self.u128_bucket.alloc([(v & 0xFFFF_FFFF_FFFF_FFFF) as u64, (v >> 64) as u64]);
+        ValueHandle::new(ValueTag::U128, idx as usize)
+    }
+    #[inline]
+    pub fn get_u128(&self, h: ValueHandle) -> u128 {
+        let [lo, hi] = *self.u128_bucket.get(h.index() as u32);
+        ((hi as u128) << 64) | (lo as u128)
     }
 
-    /// 构造 F128 值
-    pub fn f128(v: F128) -> Self {
-        Value::Scalar(ScalarValue { f128_: u128::from_le_bytes(v.0) }, ScalarTag::F128)
+    #[inline]
+    pub fn alloc_f128(&mut self, v: F128) -> ValueHandle {
+        let bits = u128::from_le_bytes(v.0);
+        let idx = self.f128_bucket.alloc([(bits & 0xFFFF_FFFF_FFFF_FFFF) as u64, (bits >> 64) as u64]);
+        ValueHandle::new(ValueTag::F128, idx as usize)
+    }
+    #[inline]
+    pub fn get_f128(&self, h: ValueHandle) -> F128 {
+        let [lo, hi] = *self.f128_bucket.get(h.index() as u32);
+        F128(((hi as u128) << 64 | lo as u128).to_le_bytes())
     }
 
-    /// 转为 `F128`
-    pub fn as_f128(&self) -> Option<F128> {
-        match self {
-            Value::Scalar(sv, t) if *t == ScalarTag::F128 => {
-                Some(F128(unsafe { sv.f128_ }.to_le_bytes()))
-            }
-            _ => None,
-        }
+    // ---- 堆对象分配 ----
+    #[inline]
+    pub fn alloc_ref(&mut self, obj: HeapObj) -> ValueHandle {
+        let idx = self.ref_bucket.alloc(Rc::new(obj));
+        ValueHandle::new(ValueTag::Ref, idx as usize)
     }
-}
-
-// =========================================================================
-// 第五部分：宏生成堆访问器
-// =========================================================================
-
-macro_rules! impl_heap_accessors {
-    ($($method:ident => $variant:ident as $ty:ty);* $(;)?) => {
-        impl Value {
-            $(
-                #[inline]
-                pub fn $method(&self) -> Option<&$ty> {
-                    match self {
-                        Value::Ref(r) => match r.as_ref() {
-                            HeapObj::$variant(v) => Some(v),
-                            _ => None,
-                        },
-                        _ => None,
-                    }
-                }
-            )*
-        }
-    };
-}
-
-impl_heap_accessors! {
-    as_str => Str as GlueStr;
-    as_array => Array as ArrayValue;
-    as_record => Record as RecordValue;
-    as_adt => Adt as AdtValue;
-    as_newtype => Newtype as NewtypeValue;
-    as_cell => Cell as Cell;
-    as_range => Range as Range;
-    as_closure => Closure as Closure;
-    as_partial => Partial as PartialApplication;
-    as_builtin => Builtin as Builtin;
-    as_trait_val => TraitVal as TraitValue;
-    as_lazy => LazyVal as LazyValue;
-    as_error_val => ErrorVal as ErrorValue;
-    as_throw_val => ThrowVal as ThrowValue;
-    as_array_iter => ArrayIter as ArrayIterator;
-    as_string_iter => StringIter as StringIterator;
-    as_range_iter_obj => RangeIter as RangeIterator;
-    as_atomic => AtomicVal as AtomicValue;
-    as_async_handle => AsyncVal as AsyncHandle;
-    as_channel => ChannelVal as ChannelValue;
-    as_sender => SenderVal as SenderValue;
-    as_receiver => ReceiverVal as ReceiverValue;
-}
-
-// =========================================================================
-// 第十五部分：堆构造器（来自 mod.rs）
-// =========================================================================
-
-impl Value {
-    /// 构造 `null` 值
-    pub fn null() -> Self {
-        Value::Null
+    #[inline]
+    pub fn alloc_ref_rc(&mut self, r: Rc<HeapObj>) -> ValueHandle {
+        let idx = self.ref_bucket.alloc(r);
+        ValueHandle::new(ValueTag::Ref, idx as usize)
+    }
+    #[inline]
+    pub fn get_ref(&self, h: ValueHandle) -> &Rc<HeapObj> {
+        self.ref_bucket.get(h.index() as u32)
     }
 
-    /// 构造 `void` 唯一值
-    pub fn void() -> Self {
-        Value::Void
+    // ---- Bool 单例 ----
+    #[inline]
+    pub fn bool_val(v: bool) -> ValueHandle {
+        if v { ValueHandle::TRUE } else { ValueHandle::FALSE }
+    }
+    #[inline]
+    pub fn get_bool(&self, h: ValueHandle) -> bool {
+        h.index() == 1
     }
 
-    /// 包装任意堆对象为 `Value`
-    pub fn heap(obj: HeapObj) -> Self {
-        Value::Ref(Rc::new(obj))
+    // ---- Null/Void 单例 ----
+    #[inline]
+    pub fn null(&self) -> ValueHandle {
+        ValueHandle::NULL
+    }
+    #[inline]
+    pub fn void(&self) -> ValueHandle {
+        ValueHandle::VOID
     }
 
-    /// 从 `HeapRef` 构造
-    pub fn from_ref(r: HeapRef) -> Self {
-        Value::Ref(r)
+    // ---- 堆对象快捷构造器 ----
+    pub fn alloc_str(&mut self, s: impl Into<String>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(GlueStr::new(s)))
     }
-
-    /// 构造字符串值
-    pub fn str(s: impl Into<String>) -> Self {
-        Value::heap(HeapObj::Str(GlueStr::new(s)))
+    pub fn alloc_str_from(&mut self, s: &str) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(GlueStr::from_rust_str(s)))
     }
-
-    /// 从 `&str` 构造字符串值（共享）
-    pub fn str_from(s: &str) -> Self {
-        Value::heap(HeapObj::Str(GlueStr::from_str(s)))
+    pub fn alloc_array(&mut self, arr: ArrayValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::Array(arr))
     }
-
-    /// 构造字符串值（从 `GlueStr`）
-    pub fn from_glue_str(s: GlueStr) -> Self {
-        Value::heap(HeapObj::Str(s))
+    pub fn alloc_record(&mut self, r: RecordValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::Record(r))
     }
-
-    /// 构造动态数组值
-    pub fn array(elements: Vec<Value>) -> Self {
-        Value::heap(HeapObj::Array(ArrayValue::new(elements)))
+    pub fn alloc_adt(&mut self, a: AdtValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::Adt(a))
     }
-
-    /// 构造固定大小数组值
-    pub fn array_fixed(elements: Vec<Value>, size: u64) -> Self {
-        Value::heap(HeapObj::Array(ArrayValue::new_fixed(elements, size)))
+    pub fn alloc_newtype(&mut self, type_name: impl Into<String>, inner: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::Newtype(NewtypeValue { type_name: type_name.into(), inner }))
     }
-
-    /// 构造记录值
-    pub fn record(
-        type_name: impl Into<String>,
-        fields: Vec<Value>,
-        field_names: Vec<Option<String>>,
-    ) -> Self {
-        Value::heap(HeapObj::Record(RecordValue::new(
-            type_name.into(),
-            fields,
-            field_names,
-        )))
+    pub fn alloc_cell(&mut self, val: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::Cell(Cell::new(val)))
     }
-
-    /// 构造 ADT 值
-    pub fn adt(
-        type_name: impl Into<String>,
-        constructor: impl Into<String>,
-        fields: Vec<AdtField>,
-    ) -> Self {
-        Value::heap(HeapObj::Adt(AdtValue::new(
-            type_name.into(),
-            constructor.into(),
-            fields,
-        )))
+    pub fn alloc_range(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
+        self.alloc_ref(HeapObj::Range(Range::new(start, end, inclusive)))
     }
-
-    /// 构造 Newtype 值
-    pub fn newtype(type_name: impl Into<String>, inner: Value) -> Self {
-        Value::heap(HeapObj::Newtype(NewtypeValue { type_name: type_name.into(), inner }))
+    pub fn alloc_closure(&mut self, c: Closure) -> ValueHandle {
+        self.alloc_ref(HeapObj::Closure(c))
     }
-
-    /// 构造 Cell 值
-    pub fn cell(val: Value) -> Self {
-        Value::heap(HeapObj::Cell(Cell::new(val)))
+    pub fn alloc_partial(&mut self, p: PartialApplication) -> ValueHandle {
+        self.alloc_ref(HeapObj::Partial(p))
     }
-
-    /// 构造 Range 值
-    pub fn range(start: i64, end: i64, inclusive: bool) -> Self {
-        Value::heap(HeapObj::Range(Range::new(start, end, inclusive)))
+    pub fn alloc_builtin(&mut self, fn_ptr: BuiltinFn, name: impl Into<String>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Builtin(Builtin { fn_ptr, name: name.into() }))
     }
-
-    /// 构造闭包值
-    pub fn closure(c: Closure) -> Self {
-        Value::heap(HeapObj::Closure(c))
+    pub fn alloc_trait_val(&mut self, t: TraitValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::TraitVal(t))
     }
-
-    /// 构造偏应用值
-    pub fn partial(p: PartialApplication) -> Self {
-        Value::heap(HeapObj::Partial(p))
+    pub fn alloc_lazy(&mut self, l: LazyValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::LazyVal(l))
     }
-
-    /// 构造内建函数值
-    pub fn builtin(fn_ptr: BuiltinFn, name: impl Into<String>) -> Self {
-        Value::heap(HeapObj::Builtin(Builtin { fn_ptr, name: name.into() }))
-    }
-
-    /// 构造 Trait 值
-    pub fn trait_val(t: TraitValue) -> Self {
-        Value::heap(HeapObj::TraitVal(t))
-    }
-
-    /// 构造惰性值
-    pub fn lazy(l: LazyValue) -> Self {
-        Value::heap(HeapObj::LazyVal(l))
-    }
-
-    /// 构造错误值
-    pub fn error_val(
-        type_name: impl Into<String>,
-        message: impl Into<String>,
-        is_error_subtype: bool,
-    ) -> Self {
-        Value::heap(HeapObj::ErrorVal(ErrorValue {
+    pub fn alloc_error_val(&mut self, type_name: impl Into<String>, message: impl Into<String>, is_error_subtype: bool) -> ValueHandle {
+        self.alloc_ref(HeapObj::ErrorVal(ErrorValue {
             type_name: type_name.into(),
             message: message.into(),
             is_error_subtype,
         }))
     }
-
-    /// 构造 `Ok` 抛出值
-    pub fn throw_ok(val: Value) -> Self {
-        Value::heap(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
+    pub fn alloc_throw_ok(&mut self, val: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
+    }
+    pub fn alloc_throw_err(&mut self, record: Rc<RecordValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    }
+    pub fn alloc_array_iter(&mut self, array: Rc<Vec<ValueHandle>>) -> ValueHandle {
+        self.alloc_ref(HeapObj::ArrayIter(ArrayIterator::new(array)))
+    }
+    pub fn alloc_string_iter(&mut self, s: Rc<str>) -> ValueHandle {
+        self.alloc_ref(HeapObj::StringIter(StringIterator::new(s)))
+    }
+    pub fn alloc_range_iter(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
+        self.alloc_ref(HeapObj::RangeIter(RangeIterator::new(start, end, inclusive)))
+    }
+    pub fn alloc_atomic(&mut self, val: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))
+    }
+    pub fn alloc_async_handle(&mut self) -> ValueHandle {
+        self.alloc_ref(HeapObj::AsyncVal(AsyncHandle::new()))
+    }
+    pub fn alloc_channel(&mut self, capacity: usize) -> ValueHandle {
+        self.alloc_ref(HeapObj::ChannelVal(ChannelValue::new(capacity)))
+    }
+    pub fn alloc_sender(&mut self, channel: Rc<ChannelValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::SenderVal(SenderValue { channel }))
+    }
+    pub fn alloc_receiver(&mut self, channel: Rc<ChannelValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::ReceiverVal(ReceiverValue { channel }))
     }
 
-    /// 构造 `Err` 抛出值
-    pub fn throw_err(record: Rc<RecordValue>) -> Self {
-        Value::heap(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
-    }
-
-    /// 构造数组迭代器
-    pub fn array_iter(array: Rc<Vec<Value>>) -> Self {
-        Value::heap(HeapObj::ArrayIter(ArrayIterator::new(array)))
-    }
-
-    /// 构造字符串迭代器
-    pub fn string_iter(s: Rc<str>) -> Self {
-        Value::heap(HeapObj::StringIter(StringIterator::new(s)))
-    }
-
-    /// 构造范围迭代器
-    pub fn range_iter(start: i64, end: i64, inclusive: bool) -> Self {
-        Value::heap(HeapObj::RangeIter(RangeIterator::new(start, end, inclusive)))
-    }
-
-    /// 构造原子值
-    pub fn atomic(val: Value) -> Self {
-        Value::heap(HeapObj::AtomicVal(AtomicValue::new(val)))
-    }
-
-    /// 构造异步句柄
-    pub fn async_handle() -> Self {
-        Value::heap(HeapObj::AsyncVal(AsyncHandle::new()))
-    }
-
-    /// 构造通道值
-    pub fn channel(capacity: usize) -> Self {
-        Value::heap(HeapObj::ChannelVal(ChannelValue::new(capacity)))
-    }
-
-    /// 构造发送端
-    pub fn sender(channel: Rc<ChannelValue>) -> Self {
-        Value::heap(HeapObj::SenderVal(SenderValue { channel }))
-    }
-
-    /// 构造接收端
-    pub fn receiver(channel: Rc<ChannelValue>) -> Self {
-        Value::heap(HeapObj::ReceiverVal(ReceiverValue { channel }))
-    }
-
-    /// 转为堆引用
-    pub fn as_ref(&self) -> Option<&HeapRef> {
-        match self {
-            Value::Ref(r) => Some(r),
-            _ => None,
+    /// 从 i64 按 tag 构造对应整数
+    pub fn int_from_i64(&mut self, tag: ValueTag, v: i64) -> ValueHandle {
+        match tag {
+            ValueTag::I8 => self.alloc_i8(v as i8),
+            ValueTag::I16 => self.alloc_i16(v as i16),
+            ValueTag::I32 => self.alloc_i32(v as i32),
+            ValueTag::I64 => self.alloc_i64(v),
+            ValueTag::I128 => self.alloc_i128(v as i128),
+            ValueTag::U8 => self.alloc_u8(v as u8),
+            ValueTag::U16 => self.alloc_u16(v as u16),
+            ValueTag::U32 => self.alloc_u32(v as u32),
+            ValueTag::U64 => self.alloc_u64(v as u64),
+            ValueTag::U128 => self.alloc_u128(v as u128),
+            ValueTag::Isize => self.alloc_isize(v as isize),
+            ValueTag::Usize => self.alloc_usize(v as usize),
+            _ => self.alloc_i64(v),
         }
     }
 
-    /// 获取堆对象引用类型（若为堆对象）
-    pub fn ref_kind(&self) -> Option<RefKind> {
-        match self {
-            Value::Ref(r) => Some(r.ref_kind()),
-            _ => None,
+    // ---- 引用计数 ----
+    pub fn inc_ref(&mut self, h: ValueHandle) {
+        match h.tag() {
+            ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
+            ValueTag::Char => self.char_bucket.inc_ref(h.index() as u32),
+            ValueTag::I8 => self.i8_bucket.inc_ref(h.index() as u32),
+            ValueTag::I16 => self.i16_bucket.inc_ref(h.index() as u32),
+            ValueTag::I32 => self.i32_bucket.inc_ref(h.index() as u32),
+            ValueTag::I64 => self.i64_bucket.inc_ref(h.index() as u32),
+            ValueTag::I128 => self.i128_bucket.inc_ref(h.index() as u32),
+            ValueTag::U8 => self.u8_bucket.inc_ref(h.index() as u32),
+            ValueTag::U16 => self.u16_bucket.inc_ref(h.index() as u32),
+            ValueTag::U32 => self.u32_bucket.inc_ref(h.index() as u32),
+            ValueTag::U64 => self.u64_bucket.inc_ref(h.index() as u32),
+            ValueTag::U128 => self.u128_bucket.inc_ref(h.index() as u32),
+            ValueTag::Isize => self.isz_bucket.inc_ref(h.index() as u32),
+            ValueTag::Usize => self.usz_bucket.inc_ref(h.index() as u32),
+            ValueTag::F16 => self.f16_bucket.inc_ref(h.index() as u32),
+            ValueTag::F32 => self.f32_bucket.inc_ref(h.index() as u32),
+            ValueTag::F64 => self.f64_bucket.inc_ref(h.index() as u32),
+            ValueTag::F128 => self.f128_bucket.inc_ref(h.index() as u32),
+            ValueTag::Ref => self.ref_bucket.inc_ref(h.index() as u32),
+        }
+    }
+    pub fn dec_ref(&mut self, h: ValueHandle) {
+        match h.tag() {
+            ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
+            ValueTag::Char => { self.char_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I8 => { self.i8_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I16 => { self.i16_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I32 => { self.i32_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I64 => { self.i64_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I128 => { self.i128_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U8 => { self.u8_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U16 => { self.u16_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U32 => { self.u32_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U64 => { self.u64_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U128 => { self.u128_bucket.dec_ref(h.index() as u32); }
+            ValueTag::Isize => { self.isz_bucket.dec_ref(h.index() as u32); }
+            ValueTag::Usize => { self.usz_bucket.dec_ref(h.index() as u32); }
+            ValueTag::F16 => { self.f16_bucket.dec_ref(h.index() as u32); }
+            ValueTag::F32 => { self.f32_bucket.dec_ref(h.index() as u32); }
+            ValueTag::F64 => { self.f64_bucket.dec_ref(h.index() as u32); }
+            ValueTag::F128 => { self.f128_bucket.dec_ref(h.index() as u32); }
+            ValueTag::Ref => { self.ref_bucket.dec_ref(h.index() as u32); }
         }
     }
 
-    /// 从 `i64` 按 `tag` 构造对应整数（用于 IR 加载立即数）
-    pub fn int_from_i64(tag: ScalarTag, v: i64) -> Self {
-        construct_int_from_i64!(tag, v)
+    /// 为数组填充 SoA 快路径（当元素同类型标量时）
+    pub fn optimize_array_soa(&mut self, arr: &mut ArrayValue) {
+        if arr.elements.is_empty() { return; }
+        let tag = arr.elements[0].tag();
+        if !tag.is_scalar() || !arr.elements.iter().all(|h| h.tag() == tag) {
+            return;
+        }
+        arr.scalar_soa = Some(match tag {
+            ValueTag::I8 => ScalarSoA::I8(arr.elements.iter().map(|h| self.get_i8(*h)).collect()),
+            ValueTag::I16 => ScalarSoA::I16(arr.elements.iter().map(|h| self.get_i16(*h)).collect()),
+            ValueTag::I32 => ScalarSoA::I32(arr.elements.iter().map(|h| self.get_i32(*h)).collect()),
+            ValueTag::I64 => ScalarSoA::I64(arr.elements.iter().map(|h| self.get_i64(*h)).collect()),
+            ValueTag::U8 => ScalarSoA::U8(arr.elements.iter().map(|h| self.get_u8(*h)).collect()),
+            ValueTag::U16 => ScalarSoA::U16(arr.elements.iter().map(|h| self.get_u16(*h)).collect()),
+            ValueTag::U32 => ScalarSoA::U32(arr.elements.iter().map(|h| self.get_u32(*h)).collect()),
+            ValueTag::U64 => ScalarSoA::U64(arr.elements.iter().map(|h| self.get_u64(*h)).collect()),
+            ValueTag::Bool => ScalarSoA::Bool(arr.elements.iter().map(|h| self.get_bool(*h)).collect()),
+            ValueTag::Char => ScalarSoA::Char(arr.elements.iter().map(|h| self.get_char(*h)).collect()),
+            ValueTag::F32 => ScalarSoA::F32(arr.elements.iter().map(|h| self.get_f32(*h)).collect()),
+            ValueTag::F64 => ScalarSoA::F64(arr.elements.iter().map(|h| self.get_f64(*h)).collect()),
+            _ => return,
+        });
+    }
+
+    /// 格式化值为字符串（Display 语义）
+    pub fn format_value(&self, h: ValueHandle) -> String {
+        self.display_value(h).to_string()
+    }
+
+    /// 返回一个实现 Display 的包装器
+    pub fn display_value<'a>(&'a self, h: ValueHandle) -> ValueDisplay<'a> {
+        ValueDisplay { arena: self, handle: h }
+    }
+
+    /// 返回一个实现 Debug 的包装器
+    pub fn debug_value<'a>(&'a self, h: ValueHandle) -> ValueDebug<'a> {
+        ValueDebug { arena: self, handle: h }
+    }
+}
+
+impl Default for ValueArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Display 包装器：通过 arena 格式化值
+pub struct ValueDisplay<'a> {
+    arena: &'a ValueArena,
+    handle: ValueHandle,
+}
+
+impl<'a> fmt::Display for ValueDisplay<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        arena_display(self.arena, self.handle, f)
+    }
+}
+
+/// Debug 包装器：通过 arena 格式化值
+pub struct ValueDebug<'a> {
+    arena: &'a ValueArena,
+    handle: ValueHandle,
+}
+
+impl<'a> fmt::Debug for ValueDebug<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        arena_debug(self.arena, self.handle, f)
+    }
+}
+
+fn arena_display(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> fmt::Result {
+    match h.tag() {
+        ValueTag::Null => write!(f, "null"),
+        ValueTag::Void => write!(f, "()"),
+        ValueTag::Bool => write!(f, "{}", arena.get_bool(h)),
+        ValueTag::Char => write!(f, "{}", Char::from_codepoint_unchecked(arena.get_char(h))),
+        ValueTag::I8 => write!(f, "{}", arena.get_i8(h)),
+        ValueTag::I16 => write!(f, "{}", arena.get_i16(h)),
+        ValueTag::I32 => write!(f, "{}", arena.get_i32(h)),
+        ValueTag::I64 => write!(f, "{}", arena.get_i64(h)),
+        ValueTag::I128 => write!(f, "{}", arena.get_i128(h)),
+        ValueTag::U8 => write!(f, "{}", arena.get_u8(h)),
+        ValueTag::U16 => write!(f, "{}", arena.get_u16(h)),
+        ValueTag::U32 => write!(f, "{}", arena.get_u32(h)),
+        ValueTag::U64 => write!(f, "{}", arena.get_u64(h)),
+        ValueTag::U128 => write!(f, "{}", arena.get_u128(h)),
+        ValueTag::Isize => write!(f, "{}", arena.get_isize(h)),
+        ValueTag::Usize => write!(f, "{}", arena.get_usize(h)),
+        ValueTag::F16 => write!(f, "{}", F16(arena.get_f16(h)).to_f32()),
+        ValueTag::F32 => write!(f, "{}", arena.get_f32(h)),
+        ValueTag::F64 => write!(f, "{}", arena.get_f64(h)),
+        ValueTag::F128 => write!(f, "{}", arena.get_f128(h).to_f64()),
+        ValueTag::Ref => match arena.get_ref(h).as_ref() {
+            HeapObj::Str(s) => write!(f, "{}", s),
+            other => write!(f, "{:?}", other),
+        },
+    }
+}
+
+fn arena_debug(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> fmt::Result {
+    match h.tag() {
+        ValueTag::Null => write!(f, "null"),
+        ValueTag::Void => write!(f, "()"),
+        ValueTag::Bool => write!(f, "{}", arena.get_bool(h)),
+        ValueTag::Char => write!(f, "'{}'", Char::from_codepoint_unchecked(arena.get_char(h))),
+        ValueTag::I8 => write!(f, "{}i8", arena.get_i8(h)),
+        ValueTag::I16 => write!(f, "{}i16", arena.get_i16(h)),
+        ValueTag::I32 => write!(f, "{}", arena.get_i32(h)),
+        ValueTag::I64 => write!(f, "{}i64", arena.get_i64(h)),
+        ValueTag::I128 => write!(f, "{}i128", arena.get_i128(h)),
+        ValueTag::U8 => write!(f, "{}u8", arena.get_u8(h)),
+        ValueTag::U16 => write!(f, "{}u16", arena.get_u16(h)),
+        ValueTag::U32 => write!(f, "{}u32", arena.get_u32(h)),
+        ValueTag::U64 => write!(f, "{}u64", arena.get_u64(h)),
+        ValueTag::U128 => write!(f, "{}u128", arena.get_u128(h)),
+        ValueTag::Isize => write!(f, "{}isize", arena.get_isize(h)),
+        ValueTag::Usize => write!(f, "{}usize", arena.get_usize(h)),
+        ValueTag::F16 => write!(f, "{:?}", F16(arena.get_f16(h))),
+        ValueTag::F32 => write!(f, "{}f32", arena.get_f32(h)),
+        ValueTag::F64 => write!(f, "{}", arena.get_f64(h)),
+        ValueTag::F128 => write!(f, "{:?}", arena.get_f128(h)),
+        ValueTag::Ref => write!(f, "{:?}", arena.get_ref(h).as_ref()),
     }
 }
 
 // =========================================================================
-// 第六部分：谓词 + type_name + scalar_tag
+// Value trait —— 对外统一接口（方法携带 &ValueArena）
 // =========================================================================
 
-impl Value {
-    pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+/// Glue 统一值 trait：所有值类型的对外接口。
+pub trait Value: Sized + Clone + Copy + PartialEq + Eq + Hash {
+    // ---- 谓词（仅看 tag，不需要 arena）----
+    fn is_null(&self) -> bool;
+    fn is_void(&self) -> bool;
+    fn is_bool(&self) -> bool;
+    fn is_char(&self) -> bool;
+    fn is_int(&self) -> bool;
+    fn is_float(&self) -> bool;
+    fn is_numeric(&self) -> bool;
+    fn is_scalar(&self) -> bool;
+    fn is_ref(&self) -> bool;
+    fn requires_release(&self) -> bool;
+
+    // ---- 堆谓词（需要 arena 解引用 HeapObj）----
+    fn is_string(&self, arena: &ValueArena) -> bool;
+    fn is_array(&self, arena: &ValueArena) -> bool;
+    fn is_record(&self, arena: &ValueArena) -> bool;
+    fn is_adt(&self, arena: &ValueArena) -> bool;
+    fn is_closure(&self, arena: &ValueArena) -> bool;
+    fn is_callable(&self, arena: &ValueArena) -> bool;
+
+    // ---- 类型信息 ----
+    fn type_name(&self, arena: &ValueArena) -> &'static str;
+    fn scalar_tag(&self) -> Option<ValueTag>;
+
+    // ---- 标量访问器（需要 arena 取值）----
+    fn as_bool(&self, arena: &ValueArena) -> Option<bool>;
+    fn as_i8(&self, arena: &ValueArena) -> Option<i8>;
+    fn as_i16(&self, arena: &ValueArena) -> Option<i16>;
+    fn as_i32(&self, arena: &ValueArena) -> Option<i32>;
+    fn as_i64(&self, arena: &ValueArena) -> Option<i64>;
+    fn as_i128(&self, arena: &ValueArena) -> Option<i128>;
+    fn as_u8(&self, arena: &ValueArena) -> Option<u8>;
+    fn as_u16(&self, arena: &ValueArena) -> Option<u16>;
+    fn as_u32(&self, arena: &ValueArena) -> Option<u32>;
+    fn as_u64(&self, arena: &ValueArena) -> Option<u64>;
+    fn as_u128(&self, arena: &ValueArena) -> Option<u128>;
+    fn as_isize(&self, arena: &ValueArena) -> Option<isize>;
+    fn as_usize(&self, arena: &ValueArena) -> Option<usize>;
+    fn as_f32(&self, arena: &ValueArena) -> Option<f32>;
+    fn as_f64(&self, arena: &ValueArena) -> Option<f64>;
+    fn as_char(&self, arena: &ValueArena) -> Option<Char>;
+    fn as_f16(&self, arena: &ValueArena) -> Option<F16>;
+    fn as_f128(&self, arena: &ValueArena) -> Option<F128>;
+
+    // ---- 堆访问器 ----
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a GlueStr>;
+    fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue>;
+    fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue>;
+    fn as_adt<'a>(&self, arena: &'a ValueArena) -> Option<&'a AdtValue>;
+    fn as_newtype<'a>(&self, arena: &'a ValueArena) -> Option<&'a NewtypeValue>;
+    fn as_cell<'a>(&self, arena: &'a ValueArena) -> Option<&'a Cell>;
+    fn as_range<'a>(&self, arena: &'a ValueArena) -> Option<&'a Range>;
+    fn as_closure<'a>(&self, arena: &'a ValueArena) -> Option<&'a Closure>;
+    fn as_partial<'a>(&self, arena: &'a ValueArena) -> Option<&'a PartialApplication>;
+    fn as_builtin<'a>(&self, arena: &'a ValueArena) -> Option<&'a Builtin>;
+    fn as_trait_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a TraitValue>;
+    fn as_lazy<'a>(&self, arena: &'a ValueArena) -> Option<&'a LazyValue>;
+    fn as_error_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ErrorValue>;
+    fn as_throw_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ThrowValue>;
+    fn as_array_iter<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayIterator>;
+    fn as_string_iter<'a>(&self, arena: &'a ValueArena) -> Option<&'a StringIterator>;
+    fn as_range_iter_obj<'a>(&self, arena: &'a ValueArena) -> Option<&'a RangeIterator>;
+    fn as_atomic<'a>(&self, arena: &'a ValueArena) -> Option<&'a AtomicValue>;
+    fn as_async_handle<'a>(&self, arena: &'a ValueArena) -> Option<&'a AsyncHandle>;
+    fn as_channel<'a>(&self, arena: &'a ValueArena) -> Option<&'a ChannelValue>;
+    fn as_sender<'a>(&self, arena: &'a ValueArena) -> Option<&'a SenderValue>;
+    fn as_receiver<'a>(&self, arena: &'a ValueArena) -> Option<&'a ReceiverValue>;
+    fn as_ref<'a>(&self, arena: &'a ValueArena) -> Option<&'a HeapRef>;
+    fn ref_kind(&self, arena: &ValueArena) -> Option<RefKind>;
+
+    // ---- 数值提升 ----
+    fn as_int_i64(&self, arena: &ValueArena) -> Option<i64>;
+    fn as_int_i128(&self, arena: &ValueArena) -> Option<i128>;
+    fn as_float_f64(&self, arena: &ValueArena) -> Option<f64>;
+
+    // ---- 相等与深克隆 ----
+    fn equals(&self, other: &Self, arena: &ValueArena) -> bool;
+    fn deep_clone(&self, arena: &mut ValueArena) -> Self;
+}
+
+// =========================================================================
+// =========================================================================
+// ValueHandle —— Value trait 实现（通过 ValueArena 访问桶内数据）
+// =========================================================================
+
+impl Value for ValueHandle {
+    // ---- 谓词（仅看 tag，不需要 arena）----
+    #[inline]
+    fn is_null(&self) -> bool {
+        self.tag() == ValueTag::Null
+    }
+    #[inline]
+    fn is_void(&self) -> bool {
+        self.tag() == ValueTag::Void
+    }
+    #[inline]
+    fn is_bool(&self) -> bool {
+        self.tag() == ValueTag::Bool
+    }
+    #[inline]
+    fn is_char(&self) -> bool {
+        self.tag() == ValueTag::Char
+    }
+    #[inline]
+    fn is_int(&self) -> bool {
+        self.tag().is_int()
+    }
+    #[inline]
+    fn is_float(&self) -> bool {
+        self.tag().is_float()
+    }
+    #[inline]
+    fn is_numeric(&self) -> bool {
+        self.tag().is_numeric()
+    }
+    #[inline]
+    fn is_scalar(&self) -> bool {
+        self.tag().is_scalar()
+    }
+    #[inline]
+    fn is_ref(&self) -> bool {
+        self.tag() == ValueTag::Ref
+    }
+    #[inline]
+    fn requires_release(&self) -> bool {
+        !matches!(self.tag(), ValueTag::Null | ValueTag::Void | ValueTag::Bool)
     }
 
-    pub fn is_void(&self) -> bool {
-        matches!(self, Value::Void)
+    // ---- 堆谓词（需要 arena 解引用 HeapObj）----
+    #[inline]
+    fn is_string(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Str(_)))
     }
-
-    pub fn is_bool(&self) -> bool {
-        matches!(self, Value::Scalar(_, t) if *t == ScalarTag::Bool)
+    #[inline]
+    fn is_array(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Array(_)))
     }
-
-    pub fn is_char(&self) -> bool {
-        matches!(self, Value::Scalar(_, t) if *t == ScalarTag::Char)
+    #[inline]
+    fn is_record(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Record(_)))
     }
-
-    pub fn is_int(&self) -> bool {
-        matches!(self, Value::Scalar(_, t) if t.is_int())
+    #[inline]
+    fn is_adt(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Adt(_)))
     }
-
-    pub fn is_float(&self) -> bool {
-        matches!(self, Value::Scalar(_, t) if t.is_float())
+    #[inline]
+    fn is_closure(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Closure(_)))
     }
-
-    pub fn is_numeric(&self) -> bool {
-        self.is_int() || self.is_float()
-    }
-
-    pub fn is_scalar(&self) -> bool {
-        self.is_bool() || self.is_char() || self.is_numeric()
-    }
-
-    pub fn is_string(&self) -> bool {
-        matches!(self, Value::Ref(r) if matches!(r.as_ref(), HeapObj::Str(_)))
-    }
-
-    pub fn is_array(&self) -> bool {
-        matches!(self, Value::Ref(r) if matches!(r.as_ref(), HeapObj::Array(_)))
-    }
-
-    pub fn is_record(&self) -> bool {
-        matches!(self, Value::Ref(r) if matches!(r.as_ref(), HeapObj::Record(_)))
-    }
-
-    pub fn is_adt(&self) -> bool {
-        matches!(self, Value::Ref(r) if matches!(r.as_ref(), HeapObj::Adt(_)))
-    }
-
-    pub fn is_closure(&self) -> bool {
-        matches!(self, Value::Ref(r) if matches!(r.as_ref(), HeapObj::Closure(_)))
-    }
-
-    pub fn is_ref(&self) -> bool {
-        matches!(self, Value::Ref(_))
-    }
-
-    pub fn is_callable(&self) -> bool {
+    #[inline]
+    fn is_callable(&self, arena: &ValueArena) -> bool {
         matches!(
-            self,
-            Value::Ref(r) if matches!(
-                r.as_ref(),
-                HeapObj::Closure(_) | HeapObj::Partial(_) | HeapObj::Builtin(_) | HeapObj::TraitVal(_)
-            )
+            arena.heap_obj_opt(*self),
+            Some(HeapObj::Closure(_) | HeapObj::Builtin(_) | HeapObj::Partial(_))
         )
     }
 
-    pub fn requires_release(&self) -> bool {
-        self.is_ref()
+    // ---- 类型信息 ----
+    fn type_name(&self, arena: &ValueArena) -> &'static str {
+        match self.tag() {
+            ValueTag::Null => "null",
+            ValueTag::Void => "void",
+            ValueTag::Ref => arena.get_ref(*self).type_name(),
+            t => t.name(),
+        }
     }
-
-    /// 获取值的类型名称
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            Value::Null => "null",
-            Value::Void => "void",
-            Value::Scalar(_, tag) => tag.name(),
-            Value::Ref(r) => r.type_name(),
+    #[inline]
+    fn scalar_tag(&self) -> Option<ValueTag> {
+        let t = self.tag();
+        if t.is_scalar() {
+            Some(t)
+        } else {
+            None
         }
     }
 
-    /// 获取对应的标量标签（若为标量）
-    pub fn scalar_tag(&self) -> Option<ScalarTag> {
-        match self {
-            Value::Scalar(_, tag) => Some(*tag),
+    // ---- 标量访问器（需要 arena 取值）----
+    #[inline]
+    fn as_bool(&self, arena: &ValueArena) -> Option<bool> {
+        if self.tag() == ValueTag::Bool {
+            Some(arena.get_bool(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i8(&self, arena: &ValueArena) -> Option<i8> {
+        if self.tag() == ValueTag::I8 {
+            Some(arena.get_i8(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i16(&self, arena: &ValueArena) -> Option<i16> {
+        if self.tag() == ValueTag::I16 {
+            Some(arena.get_i16(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i32(&self, arena: &ValueArena) -> Option<i32> {
+        if self.tag() == ValueTag::I32 {
+            Some(arena.get_i32(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i64(&self, arena: &ValueArena) -> Option<i64> {
+        if self.tag() == ValueTag::I64 {
+            Some(arena.get_i64(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i128(&self, arena: &ValueArena) -> Option<i128> {
+        if self.tag() == ValueTag::I128 {
+            Some(arena.get_i128(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u8(&self, arena: &ValueArena) -> Option<u8> {
+        if self.tag() == ValueTag::U8 {
+            Some(arena.get_u8(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u16(&self, arena: &ValueArena) -> Option<u16> {
+        if self.tag() == ValueTag::U16 {
+            Some(arena.get_u16(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u32(&self, arena: &ValueArena) -> Option<u32> {
+        if self.tag() == ValueTag::U32 {
+            Some(arena.get_u32(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u64(&self, arena: &ValueArena) -> Option<u64> {
+        if self.tag() == ValueTag::U64 {
+            Some(arena.get_u64(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u128(&self, arena: &ValueArena) -> Option<u128> {
+        if self.tag() == ValueTag::U128 {
+            Some(arena.get_u128(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_isize(&self, arena: &ValueArena) -> Option<isize> {
+        if self.tag() == ValueTag::Isize {
+            Some(arena.get_isize(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_usize(&self, arena: &ValueArena) -> Option<usize> {
+        if self.tag() == ValueTag::Usize {
+            Some(arena.get_usize(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_f32(&self, arena: &ValueArena) -> Option<f32> {
+        if self.tag() == ValueTag::F32 {
+            Some(arena.get_f32(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_f64(&self, arena: &ValueArena) -> Option<f64> {
+        if self.tag() == ValueTag::F64 {
+            Some(arena.get_f64(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_char(&self, arena: &ValueArena) -> Option<Char> {
+        if self.tag() == ValueTag::Char {
+            Some(Char::from_codepoint_unchecked(arena.get_char(*self)))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_f16(&self, arena: &ValueArena) -> Option<F16> {
+        if self.tag() == ValueTag::F16 {
+            Some(F16(arena.get_f16(*self)))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_f128(&self, arena: &ValueArena) -> Option<F128> {
+        if self.tag() == ValueTag::F128 {
+            Some(arena.get_f128(*self))
+        } else {
+            None
+        }
+    }
+
+    // ---- 堆访问器 ----
+    #[inline]
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a GlueStr> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Record(r) => Some(r),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_adt<'a>(&self, arena: &'a ValueArena) -> Option<&'a AdtValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Adt(a) => Some(a),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_newtype<'a>(&self, arena: &'a ValueArena) -> Option<&'a NewtypeValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Newtype(n) => Some(n),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_cell<'a>(&self, arena: &'a ValueArena) -> Option<&'a Cell> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Cell(c) => Some(c),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_range<'a>(&self, arena: &'a ValueArena) -> Option<&'a Range> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Range(r) => Some(r),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_closure<'a>(&self, arena: &'a ValueArena) -> Option<&'a Closure> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Closure(c) => Some(c),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_partial<'a>(&self, arena: &'a ValueArena) -> Option<&'a PartialApplication> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Partial(p) => Some(p),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_builtin<'a>(&self, arena: &'a ValueArena) -> Option<&'a Builtin> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Builtin(b) => Some(b),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_trait_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a TraitValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::TraitVal(t) => Some(t),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_lazy<'a>(&self, arena: &'a ValueArena) -> Option<&'a LazyValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::LazyVal(l) => Some(l),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_error_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ErrorValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ErrorVal(e) => Some(e),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_throw_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ThrowValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ThrowVal(t) => Some(t),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_array_iter<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayIterator> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ArrayIter(i) => Some(i),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_string_iter<'a>(&self, arena: &'a ValueArena) -> Option<&'a StringIterator> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::StringIter(i) => Some(i),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_range_iter_obj<'a>(&self, arena: &'a ValueArena) -> Option<&'a RangeIterator> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::RangeIter(i) => Some(i),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_atomic<'a>(&self, arena: &'a ValueArena) -> Option<&'a AtomicValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::AtomicVal(a) => Some(a),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_async_handle<'a>(&self, arena: &'a ValueArena) -> Option<&'a AsyncHandle> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::AsyncVal(a) => Some(a),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_channel<'a>(&self, arena: &'a ValueArena) -> Option<&'a ChannelValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ChannelVal(c) => Some(c),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_sender<'a>(&self, arena: &'a ValueArena) -> Option<&'a SenderValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::SenderVal(s) => Some(s),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_receiver<'a>(&self, arena: &'a ValueArena) -> Option<&'a ReceiverValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ReceiverVal(r) => Some(r),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_ref<'a>(&self, arena: &'a ValueArena) -> Option<&'a HeapRef> {
+        if self.tag() == ValueTag::Ref {
+            Some(arena.get_ref(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn ref_kind(&self, arena: &ValueArena) -> Option<RefKind> {
+        arena.heap_obj_opt(*self).map(|o| o.ref_kind())
+    }
+
+    // ---- 数值提升 ----
+    fn as_int_i64(&self, arena: &ValueArena) -> Option<i64> {
+        match self.tag() {
+            ValueTag::I8 => Some(arena.get_i8(*self) as i64),
+            ValueTag::I16 => Some(arena.get_i16(*self) as i64),
+            ValueTag::I32 => Some(arena.get_i32(*self) as i64),
+            ValueTag::I64 => Some(arena.get_i64(*self)),
+            ValueTag::I128 => Some(arena.get_i128(*self) as i64),
+            ValueTag::U8 => Some(arena.get_u8(*self) as i64),
+            ValueTag::U16 => Some(arena.get_u16(*self) as i64),
+            ValueTag::U32 => Some(arena.get_u32(*self) as i64),
+            ValueTag::U64 => Some(arena.get_u64(*self) as i64),
+            ValueTag::U128 => Some(arena.get_u128(*self) as i64),
+            ValueTag::Isize => Some(arena.get_isize(*self) as i64),
+            ValueTag::Usize => Some(arena.get_usize(*self) as i64),
+            _ => None,
+        }
+    }
+    fn as_int_i128(&self, arena: &ValueArena) -> Option<i128> {
+        match self.tag() {
+            ValueTag::I8 => Some(arena.get_i8(*self) as i128),
+            ValueTag::I16 => Some(arena.get_i16(*self) as i128),
+            ValueTag::I32 => Some(arena.get_i32(*self) as i128),
+            ValueTag::I64 => Some(arena.get_i64(*self) as i128),
+            ValueTag::I128 => Some(arena.get_i128(*self)),
+            ValueTag::U8 => Some(arena.get_u8(*self) as i128),
+            ValueTag::U16 => Some(arena.get_u16(*self) as i128),
+            ValueTag::U32 => Some(arena.get_u32(*self) as i128),
+            ValueTag::U64 => Some(arena.get_u64(*self) as i128),
+            ValueTag::U128 => Some(arena.get_u128(*self) as i128),
+            ValueTag::Isize => Some(arena.get_isize(*self) as i128),
+            ValueTag::Usize => Some(arena.get_usize(*self) as i128),
+            _ => None,
+        }
+    }
+    fn as_float_f64(&self, arena: &ValueArena) -> Option<f64> {
+        match self.tag() {
+            ValueTag::F16 => Some(F16(arena.get_f16(*self)).to_f64()),
+            ValueTag::F32 => Some(arena.get_f32(*self) as f64),
+            ValueTag::F64 => Some(arena.get_f64(*self)),
+            ValueTag::F128 => Some(arena.get_f128(*self).to_f64()),
             _ => None,
         }
     }
 
-    /// 将整数标量统一提升为 `i64`
-    pub fn as_int_i64(&self) -> Option<i64> {
-        match self {
-            Value::Scalar(sv, tag) if tag.is_int() => {
-                Some(dispatch_scalar!(sv, *tag, v => v as i64))
+    // ---- 相等与深克隆 ----
+    fn equals(&self, other: &Self, arena: &ValueArena) -> bool {
+        if self.tag() != other.tag() {
+            return false;
+        }
+        match self.tag() {
+            ValueTag::Null | ValueTag::Void => true,
+            ValueTag::Bool => arena.get_bool(*self) == arena.get_bool(*other),
+            ValueTag::Char => arena.get_char(*self) == arena.get_char(*other),
+            ValueTag::I8 => arena.get_i8(*self) == arena.get_i8(*other),
+            ValueTag::I16 => arena.get_i16(*self) == arena.get_i16(*other),
+            ValueTag::I32 => arena.get_i32(*self) == arena.get_i32(*other),
+            ValueTag::I64 => arena.get_i64(*self) == arena.get_i64(*other),
+            ValueTag::I128 => arena.get_i128(*self) == arena.get_i128(*other),
+            ValueTag::U8 => arena.get_u8(*self) == arena.get_u8(*other),
+            ValueTag::U16 => arena.get_u16(*self) == arena.get_u16(*other),
+            ValueTag::U32 => arena.get_u32(*self) == arena.get_u32(*other),
+            ValueTag::U64 => arena.get_u64(*self) == arena.get_u64(*other),
+            ValueTag::U128 => arena.get_u128(*self) == arena.get_u128(*other),
+            ValueTag::Isize => arena.get_isize(*self) == arena.get_isize(*other),
+            ValueTag::Usize => arena.get_usize(*self) == arena.get_usize(*other),
+            ValueTag::F16 => arena.get_f16(*self) == arena.get_f16(*other),
+            ValueTag::F32 => {
+                arena.get_f32(*self).to_bits() == arena.get_f32(*other).to_bits()
             }
-            _ => None,
-        }
-    }
-
-    /// 将整数标量统一提升为 `i128`
-    pub fn as_int_i128(&self) -> Option<i128> {
-        match self {
-            Value::Scalar(sv, tag) if tag.is_int() => {
-                Some(dispatch_scalar!(sv, *tag, v => v as i128))
+            ValueTag::F64 => {
+                arena.get_f64(*self).to_bits() == arena.get_f64(*other).to_bits()
             }
-            _ => None,
+            ValueTag::F128 => arena.get_f128(*self) == arena.get_f128(*other),
+            ValueTag::Ref => {
+                let a = arena.get_ref(*self);
+                let b = arena.get_ref(*other);
+                Rc::ptr_eq(a, b) || heap_equals(a, b, arena)
+            }
         }
     }
 
-    /// 将浮点标量统一提升为 `f64`
-    pub fn as_float_f64(&self) -> Option<f64> {
-        match self {
-            Value::Scalar(sv, tag) if tag.is_float() => Some(float_to_f64!(sv, *tag)),
-            _ => None,
-        }
+    fn deep_clone(&self, arena: &mut ValueArena) -> Self {
+        let mut cache: HashMap<*const HeapObj, ValueHandle> = HashMap::new();
+        deep_clone_handle(*self, arena, &mut cache)
     }
 }
 
 // =========================================================================
-// 第七部分：equals（ptr_eq 快速路径）
+// 堆对象深比较与深克隆（带 ptr_eq 缓存以共享子图）
 // =========================================================================
 
-const EQUALS_MAX_DEPTH: u32 = 4096;
+// -------------------- SoA SIMD 快路径 --------------------
 
-impl Value {
-    pub fn equals(&self, other: &Value) -> bool {
-        equals_impl(self, other, 0)
-    }
-}
-
-impl PartialEq for Value {
-    fn eq(&self, other: &Self) -> bool {
-        self.equals(other)
-    }
-}
-
-impl Eq for Value {}
-
-fn equals_impl(a: &Value, b: &Value, depth: u32) -> bool {
-    if depth > EQUALS_MAX_DEPTH {
-        return false;
-    }
+/// 尝试用 SIMD 批量比较两个 SoA 数组。
+/// 仅当双方 SoA 类型相同时生效，返回 `Some(bool)`。
+/// 类型不匹配时返回 `None`，由调用方回退到逐元素路径。
+fn try_simd_soa_equals(a: &ScalarSoA, b: &ScalarSoA) -> Option<bool> {
     match (a, b) {
-        (Value::Null, Value::Null) => true,
-        (Value::Void, Value::Void) => true,
-        (Value::Scalar(sva, ta), Value::Scalar(svb, tb)) => {
-            if ta != tb {
-                return false;
-            }
-            scalar_equals(sva, svb, *ta)
-        }
-        (Value::Ref(x), Value::Ref(y)) => {
-            if Rc::ptr_eq(x, y) {
-                return true;
-            }
-            heap_equals(x, y, depth + 1)
-        }
-        _ => false,
+        (ScalarSoA::I32(va), ScalarSoA::I32(vb)) => Some(simd_eq_i32(va, vb)),
+        (ScalarSoA::I64(va), ScalarSoA::I64(vb)) => Some(simd_eq_i64(va, vb)),
+        (ScalarSoA::F32(va), ScalarSoA::F32(vb)) => Some(simd_eq_f32_bits(va, vb)),
+        (ScalarSoA::F64(va), ScalarSoA::F64(vb)) => Some(simd_eq_f64_bits(va, vb)),
+        // 其余类型用普通 slice 比较（Rust slice PartialEq 已优化）
+        (ScalarSoA::I8(va), ScalarSoA::I8(vb)) => Some(va == vb),
+        (ScalarSoA::I16(va), ScalarSoA::I16(vb)) => Some(va == vb),
+        (ScalarSoA::U8(va), ScalarSoA::U8(vb)) => Some(va == vb),
+        (ScalarSoA::U16(va), ScalarSoA::U16(vb)) => Some(va == vb),
+        (ScalarSoA::U32(va), ScalarSoA::U32(vb)) => Some(va == vb),
+        (ScalarSoA::U64(va), ScalarSoA::U64(vb)) => Some(va == vb),
+        (ScalarSoA::Bool(va), ScalarSoA::Bool(vb)) => Some(va == vb),
+        (ScalarSoA::Char(va), ScalarSoA::Char(vb)) => Some(va == vb),
+        _ => None, // 类型不匹配，回退
     }
 }
 
-fn scalar_equals(a: &ScalarValue, b: &ScalarValue, tag: ScalarTag) -> bool {
-    scalar_equals!(a, b, tag)
-}
-
-fn heap_equals(a: &HeapObj, b: &HeapObj, depth: u32) -> bool {
-    if depth > EQUALS_MAX_DEPTH {
+#[inline]
+fn simd_eq_i32(a: &[i32], b: &[i32]) -> bool {
+    if a.len() != b.len() {
         return false;
     }
+    let n = a.len();
+    if n == 0 {
+        return true;
+    }
+    if n >= PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        return a.par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
+            .all(|(ca, cb)| simd_eq_i32_chunk(ca, cb));
+    }
+    simd_eq_i32_chunk(a, b)
+}
 
+#[inline]
+fn simd_eq_i32_chunk(a: &[i32], b: &[i32]) -> bool {
+    let n = a.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    for (ca, cb) in a[..simd_len]
+        .chunks_exact(SIMD_LANES)
+        .zip(b[..simd_len].chunks_exact(SIMD_LANES))
+    {
+        let va = i32x4::new(ca.try_into().unwrap());
+        let vb = i32x4::new(cb.try_into().unwrap());
+        let mask = va.cmp_eq(vb);
+        let arr = mask.to_array();
+        if arr.contains(&0) {
+            return false;
+        }
+    }
+    a[simd_len..]
+        .iter()
+        .zip(&b[simd_len..])
+        .all(|(&x, &y)| x == y)
+}
+
+#[inline]
+fn simd_eq_i64(a: &[i64], b: &[i64]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let n = a.len();
+    if n == 0 {
+        return true;
+    }
+    if n >= PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        return a.par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
+            .all(|(ca, cb)| simd_eq_i64_chunk(ca, cb));
+    }
+    simd_eq_i64_chunk(a, b)
+}
+
+#[inline]
+fn simd_eq_i64_chunk(a: &[i64], b: &[i64]) -> bool {
+    let n = a.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    for (ca, cb) in a[..simd_len]
+        .chunks_exact(SIMD_LANES)
+        .zip(b[..simd_len].chunks_exact(SIMD_LANES))
+    {
+        let va = i64x4::new(ca.try_into().unwrap());
+        let vb = i64x4::new(cb.try_into().unwrap());
+        let mask = va.cmp_eq(vb);
+        let arr = mask.to_array();
+        if arr.contains(&0) {
+            return false;
+        }
+    }
+    a[simd_len..]
+        .iter()
+        .zip(&b[simd_len..])
+        .all(|(&x, &y)| x == y)
+}
+
+/// f32 按位比较（避免 NaN 不等问题）。
+#[inline]
+fn simd_eq_f32_bits(a: &[f32], b: &[f32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let n = a.len();
+    if n == 0 {
+        return true;
+    }
+    if n >= PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        return a.par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
+            .all(|(ca, cb)| simd_eq_f32_bits_chunk(ca, cb));
+    }
+    simd_eq_f32_bits_chunk(a, b)
+}
+
+#[inline]
+fn simd_eq_f32_bits_chunk(a: &[f32], b: &[f32]) -> bool {
+    let n = a.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    for (ca, cb) in a[..simd_len]
+        .chunks_exact(SIMD_LANES)
+        .zip(b[..simd_len].chunks_exact(SIMD_LANES))
+    {
+        let va = i32x4::new([
+            ca[0].to_bits() as i32,
+            ca[1].to_bits() as i32,
+            ca[2].to_bits() as i32,
+            ca[3].to_bits() as i32,
+        ]);
+        let vb = i32x4::new([
+            cb[0].to_bits() as i32,
+            cb[1].to_bits() as i32,
+            cb[2].to_bits() as i32,
+            cb[3].to_bits() as i32,
+        ]);
+        let mask = va.cmp_eq(vb);
+        let arr = mask.to_array();
+        if arr.contains(&0) {
+            return false;
+        }
+    }
+    a[simd_len..]
+        .iter()
+        .zip(&b[simd_len..])
+        .all(|(&x, &y)| x.to_bits() == y.to_bits())
+}
+
+/// f64 按位比较（避免 NaN 不等问题）。
+#[inline]
+fn simd_eq_f64_bits(a: &[f64], b: &[f64]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let n = a.len();
+    if n == 0 {
+        return true;
+    }
+    if n >= PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        return a.par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
+            .all(|(ca, cb)| simd_eq_f64_bits_chunk(ca, cb));
+    }
+    simd_eq_f64_bits_chunk(a, b)
+}
+
+#[inline]
+fn simd_eq_f64_bits_chunk(a: &[f64], b: &[f64]) -> bool {
+    let n = a.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    for (ca, cb) in a[..simd_len]
+        .chunks_exact(SIMD_LANES)
+        .zip(b[..simd_len].chunks_exact(SIMD_LANES))
+    {
+        let va = i64x4::new([
+            ca[0].to_bits() as i64,
+            ca[1].to_bits() as i64,
+            ca[2].to_bits() as i64,
+            ca[3].to_bits() as i64,
+        ]);
+        let vb = i64x4::new([
+            cb[0].to_bits() as i64,
+            cb[1].to_bits() as i64,
+            cb[2].to_bits() as i64,
+            cb[3].to_bits() as i64,
+        ]);
+        let mask = va.cmp_eq(vb);
+        let arr = mask.to_array();
+        if arr.contains(&0) {
+            return false;
+        }
+    }
+    a[simd_len..]
+        .iter()
+        .zip(&b[simd_len..])
+        .all(|(&x, &y)| x.to_bits() == y.to_bits())
+}
+
+// -------------------- SoA SIMD 批量哈希 --------------------
+
+/// 用 SIMD 批量哈希 SoA 数据。
+/// 对 I32/I64/F32/F64 走 SIMD 累积，其余类型回退到逐元素哈希。
+fn simd_hash_soa<H: Hasher>(soa: &ScalarSoA, state: &mut H) {
+    match soa {
+        ScalarSoA::I32(v) => simd_hash_i32(v, state),
+        ScalarSoA::I64(v) => simd_hash_i64(v, state),
+        ScalarSoA::F32(v) => simd_hash_f32(v, state),
+        ScalarSoA::F64(v) => simd_hash_f64(v, state),
+        ScalarSoA::I8(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::I16(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U8(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U16(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U32(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U64(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::Bool(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::Char(v) => v.iter().for_each(|x| x.hash(state)),
+    }
+}
+
+fn simd_hash_i32<H: Hasher>(v: &[i32], state: &mut H) {
+    let n = v.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    let mut acc = i32x4::splat(0);
+    for chunk in v[..simd_len].chunks_exact(SIMD_LANES) {
+        let c = i32x4::new(chunk.try_into().unwrap());
+        acc = (acc << 1) ^ c;
+    }
+    for x in acc.to_array() {
+        x.hash(state);
+    }
+    for &x in &v[simd_len..] {
+        x.hash(state);
+    }
+}
+
+fn simd_hash_i64<H: Hasher>(v: &[i64], state: &mut H) {
+    let n = v.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    let mut acc = i64x4::splat(0);
+    for chunk in v[..simd_len].chunks_exact(SIMD_LANES) {
+        let c = i64x4::new(chunk.try_into().unwrap());
+        acc = (acc << 1) ^ c;
+    }
+    for x in acc.to_array() {
+        x.hash(state);
+    }
+    for &x in &v[simd_len..] {
+        x.hash(state);
+    }
+}
+
+fn simd_hash_f32<H: Hasher>(v: &[f32], state: &mut H) {
+    let n = v.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    let mut acc = i32x4::splat(0);
+    for chunk in v[..simd_len].chunks_exact(SIMD_LANES) {
+        let c = i32x4::new([
+            chunk[0].to_bits() as i32,
+            chunk[1].to_bits() as i32,
+            chunk[2].to_bits() as i32,
+            chunk[3].to_bits() as i32,
+        ]);
+        acc = (acc << 1) ^ c;
+    }
+    for x in acc.to_array() {
+        x.hash(state);
+    }
+    for &x in &v[simd_len..] {
+        x.to_bits().hash(state);
+    }
+}
+
+fn simd_hash_f64<H: Hasher>(v: &[f64], state: &mut H) {
+    let n = v.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    let mut acc = i64x4::splat(0);
+    for chunk in v[..simd_len].chunks_exact(SIMD_LANES) {
+        let c = i64x4::new([
+            chunk[0].to_bits() as i64,
+            chunk[1].to_bits() as i64,
+            chunk[2].to_bits() as i64,
+            chunk[3].to_bits() as i64,
+        ]);
+        acc = (acc << 1) ^ c;
+    }
+    for x in acc.to_array() {
+        x.hash(state);
+    }
+    for &x in &v[simd_len..] {
+        x.to_bits().hash(state);
+    }
+}
+
+// -------------------- SoA deep_clone 快路径 --------------------
+
+/// SoA 快路径：标量是 Copy 的，直接从 SoA 数据重新分配到 arena。
+fn simd_soa_deep_clone(soa: &ScalarSoA, arena: &mut ValueArena) -> Vec<ValueHandle> {
+    match soa {
+        ScalarSoA::I32(v) => v.iter().map(|&x| arena.alloc_i32(x)).collect(),
+        ScalarSoA::I64(v) => v.iter().map(|&x| arena.alloc_i64(x)).collect(),
+        ScalarSoA::F32(v) => v.iter().map(|&x| arena.alloc_f32(x)).collect(),
+        ScalarSoA::F64(v) => v.iter().map(|&x| arena.alloc_f64(x)).collect(),
+        ScalarSoA::I8(v) => v.iter().map(|&x| arena.alloc_i8(x)).collect(),
+        ScalarSoA::I16(v) => v.iter().map(|&x| arena.alloc_i16(x)).collect(),
+        ScalarSoA::U8(v) => v.iter().map(|&x| arena.alloc_u8(x)).collect(),
+        ScalarSoA::U16(v) => v.iter().map(|&x| arena.alloc_u16(x)).collect(),
+        ScalarSoA::U32(v) => v.iter().map(|&x| arena.alloc_u32(x)).collect(),
+        ScalarSoA::U64(v) => v.iter().map(|&x| arena.alloc_u64(x)).collect(),
+        ScalarSoA::Bool(v) => v.iter().map(|&x| ValueArena::bool_val(x)).collect(),
+        ScalarSoA::Char(v) => v.iter().map(|&x| arena.alloc_char(x)).collect(),
+    }
+}
+
+fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
     match (a, b) {
         (HeapObj::Str(x), HeapObj::Str(y)) => x.equals(y),
         (HeapObj::Array(x), HeapObj::Array(y)) => {
-            if x.elements.len() != y.elements.len() {
+            if x.fixed_size != y.fixed_size || x.elements.len() != y.elements.len() {
                 return false;
             }
-            for (xe, ye) in x.elements.iter().zip(y.elements.iter()) {
-                if !equals_impl(xe, ye, depth + 1) {
-                    return false;
+            // SoA SIMD 快路径：双方都有 scalar_soa 且同类型
+            if let (Some(sa), Some(sb)) = (&x.scalar_soa, &y.scalar_soa) {
+                if let Some(result) = try_simd_soa_equals(sa, sb) {
+                    return result;
                 }
             }
-            x.fixed_size == y.fixed_size
+            // 回退：逐元素比较
+            x.elements
+                .iter()
+                .zip(&y.elements)
+                .all(|(p, q)| p.equals(q, arena))
         }
         (HeapObj::Record(x), HeapObj::Record(y)) => {
-            if x.type_name != y.type_name || x.fields.len() != y.fields.len() {
-                return false;
-            }
-            for (xf, yf) in x.fields.iter().zip(y.fields.iter()) {
-                if !equals_impl(xf, yf, depth + 1) {
-                    return false;
-                }
-            }
-            x.field_names == y.field_names
+            x.type_name == y.type_name
+                && x.field_names == y.field_names
+                && x.fields.len() == y.fields.len()
+                && x.fields.iter().zip(&y.fields).all(|(p, q)| p.equals(q, arena))
         }
         (HeapObj::Adt(x), HeapObj::Adt(y)) => {
-            if x.type_name != y.type_name || x.constructor != y.constructor {
-                return false;
-            }
-            if x.fields.len() != y.fields.len() {
-                return false;
-            }
-            for (xf, yf) in x.fields.iter().zip(y.fields.iter()) {
-                if !equals_impl(&xf.value, &yf.value, depth + 1) {
-                    return false;
-                }
-            }
-            true
+            x.type_name == y.type_name
+                && x.constructor == y.constructor
+                && x.fields.len() == y.fields.len()
+                && x
+                    .fields
+                    .iter()
+                    .zip(&y.fields)
+                    .all(|(xf, yf)| xf.value.equals(&yf.value, arena))
         }
         (HeapObj::Newtype(x), HeapObj::Newtype(y)) => {
-            x.type_name == y.type_name && equals_impl(&x.inner, &y.inner, depth + 1)
+            x.type_name == y.type_name && x.inner.equals(&y.inner, arena)
         }
         (HeapObj::Cell(x), HeapObj::Cell(y)) => {
-            let xb = x.get();
-            let yb = y.get();
-            equals_impl(&xb, &yb, depth + 1)
+            let xb = *x.inner.borrow();
+            let yb = *y.inner.borrow();
+            xb.equals(&yb, arena)
         }
         (HeapObj::Range(x), HeapObj::Range(y)) => {
             x.start == y.start && x.end == y.end && x.inclusive == y.inclusive
         }
         (HeapObj::ErrorVal(x), HeapObj::ErrorVal(y)) => {
-            x.type_name == y.type_name && x.message == y.message && x.is_error_subtype == y.is_error_subtype
+            x.type_name == y.type_name
+                && x.message == y.message
+                && x.is_error_subtype == y.is_error_subtype
         }
         (HeapObj::ThrowVal(x), HeapObj::ThrowVal(y)) => match (&x.payload, &y.payload) {
-            (ThrowPayload::Ok(a), ThrowPayload::Ok(b)) => equals_impl(a, b, depth + 1),
+            (ThrowPayload::Ok(a), ThrowPayload::Ok(b)) => a.equals(b, arena),
             (ThrowPayload::Err(a), ThrowPayload::Err(b)) => Rc::ptr_eq(a, b),
             _ => false,
         },
         (HeapObj::Closure(x), HeapObj::Closure(y)) => {
-            x.func_id == y.func_id && x.arity == y.arity && x.upvalues.len() == y.upvalues.len()
+            x.func_id == y.func_id
+                && x.arity == y.arity
+                && x.upvalues.len() == y.upvalues.len()
+                && x
+                    .upvalues
+                    .iter()
+                    .zip(&y.upvalues)
+                    .all(|(p, q)| p.equals(q, arena))
         }
         (HeapObj::Builtin(x), HeapObj::Builtin(y)) => {
-            x.fn_ptr as usize == y.fn_ptr as usize && x.name == y.name
+            (x.fn_ptr as usize) == (y.fn_ptr as usize) && x.name == y.name
         }
-        (HeapObj::ArrayIter(x), HeapObj::ArrayIter(y)) => x.index == y.index,
-        (HeapObj::StringIter(x), HeapObj::StringIter(y)) => x.byte_offset == y.byte_offset,
+        (HeapObj::ArrayIter(x), HeapObj::ArrayIter(y)) => {
+            Rc::ptr_eq(&x.array, &y.array) && x.index == y.index
+        }
+        (HeapObj::StringIter(x), HeapObj::StringIter(y)) => {
+            Rc::ptr_eq(&x.string, &y.string) && x.byte_offset == y.byte_offset
+        }
         (HeapObj::RangeIter(x), HeapObj::RangeIter(y)) => {
             x.current == y.current && x.end == y.end && x.inclusive == y.inclusive
         }
-        _ => false,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
 }
 
-// =========================================================================
-// 第八部分：deep_clone（ptr_eq 缓存）
-// =========================================================================
-
-const DEEP_CLONE_MAX_DEPTH: u32 = 4096;
-
-impl Value {
-    pub fn deep_clone(&self) -> Value {
-        let mut cache: HashMap<*const HeapObj, HeapRef> = HashMap::new();
-        deep_clone_impl(self, 0, &mut cache)
-    }
-}
-
-fn deep_clone_impl(
-    v: &Value,
-    depth: u32,
-    cache: &mut HashMap<*const HeapObj, HeapRef>,
-) -> Value {
-    if depth > DEEP_CLONE_MAX_DEPTH {
-        return v.clone();
-    }
-    match v {
-        Value::Ref(r) => {
-            let key = Rc::as_ptr(r);
-            if let Some(cached) = cache.get(&key) {
-                return Value::Ref(cached.clone());
+fn deep_clone_handle(
+    h: ValueHandle,
+    arena: &mut ValueArena,
+    cache: &mut HashMap<*const HeapObj, ValueHandle>,
+) -> ValueHandle {
+    match h.tag() {
+        ValueTag::Null => ValueHandle::NULL,
+        ValueTag::Void => ValueHandle::VOID,
+        ValueTag::Bool => ValueArena::bool_val(arena.get_bool(h)),
+        ValueTag::Char => arena.alloc_char(arena.get_char(h)),
+        ValueTag::I8 => arena.alloc_i8(arena.get_i8(h)),
+        ValueTag::I16 => arena.alloc_i16(arena.get_i16(h)),
+        ValueTag::I32 => arena.alloc_i32(arena.get_i32(h)),
+        ValueTag::I64 => arena.alloc_i64(arena.get_i64(h)),
+        ValueTag::I128 => arena.alloc_i128(arena.get_i128(h)),
+        ValueTag::U8 => arena.alloc_u8(arena.get_u8(h)),
+        ValueTag::U16 => arena.alloc_u16(arena.get_u16(h)),
+        ValueTag::U32 => arena.alloc_u32(arena.get_u32(h)),
+        ValueTag::U64 => arena.alloc_u64(arena.get_u64(h)),
+        ValueTag::U128 => arena.alloc_u128(arena.get_u128(h)),
+        ValueTag::Isize => arena.alloc_isize(arena.get_isize(h)),
+        ValueTag::Usize => arena.alloc_usize(arena.get_usize(h)),
+        ValueTag::F16 => arena.alloc_f16(arena.get_f16(h)),
+        ValueTag::F32 => arena.alloc_f32(arena.get_f32(h)),
+        ValueTag::F64 => arena.alloc_f64(arena.get_f64(h)),
+        ValueTag::F128 => arena.alloc_f128(arena.get_f128(h)),
+        ValueTag::Ref => {
+            let rc = arena.get_ref(h).clone();
+            let key = Rc::as_ptr(&rc);
+            if let Some(&cached) = cache.get(&key) {
+                return cached;
             }
-            let cloned = Rc::new(heap_deep_clone(r, depth + 1, cache));
-            cache.insert(key, cloned.clone());
-            Value::Ref(cloned)
+            let new_obj = deep_clone_heap(&rc, arena, cache);
+            let new_h = arena.alloc_ref_rc(Rc::new(new_obj));
+            cache.insert(key, new_h);
+            new_h
         }
-        other => other.clone(),
     }
 }
 
-fn heap_deep_clone(
+fn deep_clone_heap(
     obj: &HeapObj,
-    depth: u32,
-    cache: &mut HashMap<*const HeapObj, HeapRef>,
+    arena: &mut ValueArena,
+    cache: &mut HashMap<*const HeapObj, ValueHandle>,
 ) -> HeapObj {
-    if depth > DEEP_CLONE_MAX_DEPTH {
-        return obj.clone();
-    }
     match obj {
         HeapObj::Str(s) => HeapObj::Str(s.clone()),
         HeapObj::Array(a) => {
-            let elements: Vec<Value> = a.elements.iter().map(|e| deep_clone_impl(e, depth + 1, cache)).collect();
+            // SoA 快路径：标量是 Copy 的，直接 clone SoA，元素重新分配但值相同
+            if let Some(soa) = &a.scalar_soa {
+                let elems: Vec<ValueHandle> = simd_soa_deep_clone(soa, arena);
+                return HeapObj::Array(ArrayValue {
+                    elements: elems,
+                    fixed_size: a.fixed_size,
+                    elem_is_ref: a.elem_is_ref,
+                    scalar_soa: Some(soa.clone()),
+                });
+            }
+            // 回退：逐元素 deep_clone
+            let elems: Vec<ValueHandle> = a
+                .elements
+                .iter()
+                .map(|e| deep_clone_handle(*e, arena, cache))
+                .collect();
             HeapObj::Array(ArrayValue {
-                elements,
+                elements: elems,
                 fixed_size: a.fixed_size,
                 elem_is_ref: a.elem_is_ref,
+                scalar_soa: a.scalar_soa.clone(),
             })
         }
         HeapObj::Record(r) => {
-            let fields: Vec<Value> = r.fields.iter().map(|e| deep_clone_impl(e, depth + 1, cache)).collect();
+            let fields: Vec<ValueHandle> = r
+                .fields
+                .iter()
+                .map(|e| deep_clone_handle(*e, arena, cache))
+                .collect();
             HeapObj::Record(RecordValue {
                 type_name: r.type_name.clone(),
                 fields,
@@ -2169,7 +2891,7 @@ fn heap_deep_clone(
                 .iter()
                 .map(|f| AdtField {
                     name: f.name.clone(),
-                    value: deep_clone_impl(&f.value, depth + 1, cache),
+                    value: deep_clone_handle(f.value, arena, cache),
                 })
                 .collect();
             HeapObj::Adt(AdtValue {
@@ -2181,16 +2903,24 @@ fn heap_deep_clone(
         }
         HeapObj::Newtype(n) => HeapObj::Newtype(NewtypeValue {
             type_name: n.type_name.clone(),
-            inner: deep_clone_impl(&n.inner, depth + 1, cache),
+            inner: deep_clone_handle(n.inner, arena, cache),
         }),
         HeapObj::Cell(c) => {
-            let inner = c.get();
-            HeapObj::Cell(Cell::new(deep_clone_impl(&inner, depth + 1, cache)))
+            let inner = *c.inner.borrow();
+            HeapObj::Cell(Cell::new(deep_clone_handle(inner, arena, cache)))
         }
         HeapObj::Range(r) => HeapObj::Range(r.clone()),
         HeapObj::Closure(c) => {
-            let upvalues: Vec<Value> = c.upvalues.iter().map(|e| deep_clone_impl(e, depth + 1, cache)).collect();
-            let bound_args: Vec<Value> = c.bound_args.iter().map(|e| deep_clone_impl(e, depth + 1, cache)).collect();
+            let upvalues: Vec<ValueHandle> = c
+                .upvalues
+                .iter()
+                .map(|e| deep_clone_handle(*e, arena, cache))
+                .collect();
+            let bound_args: Vec<ValueHandle> = c
+                .bound_args
+                .iter()
+                .map(|e| deep_clone_handle(*e, arena, cache))
+                .collect();
             HeapObj::Closure(Closure {
                 func_id: c.func_id,
                 arity: c.arity,
@@ -2202,7 +2932,11 @@ fn heap_deep_clone(
             })
         }
         HeapObj::Partial(p) => {
-            let bound_args: Vec<Value> = p.bound_args.iter().map(|e| deep_clone_impl(e, depth + 1, cache)).collect();
+            let bound_args: Vec<ValueHandle> = p
+                .bound_args
+                .iter()
+                .map(|e| deep_clone_handle(*e, arena, cache))
+                .collect();
             HeapObj::Partial(PartialApplication {
                 func_id: p.func_id,
                 bound_args,
@@ -2210,41 +2944,22 @@ fn heap_deep_clone(
                 bound_arg_ref_bits: p.bound_arg_ref_bits,
             })
         }
+        HeapObj::ThrowVal(t) => match &t.payload {
+            ThrowPayload::Ok(v) => HeapObj::ThrowVal(ThrowValue {
+                payload: ThrowPayload::Ok(deep_clone_handle(*v, arena, cache)),
+            }),
+            ThrowPayload::Err(r) => HeapObj::ThrowVal(ThrowValue {
+                payload: ThrowPayload::Err(r.clone()),
+            }),
+        },
+        HeapObj::ArrayIter(a) => HeapObj::ArrayIter(ArrayIterator::new(a.array.clone())),
+        HeapObj::StringIter(s) => HeapObj::StringIter(StringIterator::new(s.string.clone())),
+        HeapObj::RangeIter(r) => HeapObj::RangeIter(RangeIterator::new(r.current, r.end, r.inclusive)),
         HeapObj::Builtin(b) => HeapObj::Builtin(b.clone()),
-        HeapObj::TraitVal(t) => {
-            let method_values: Vec<Value> =
-                t.method_values.iter().map(|e| deep_clone_impl(e, depth + 1, cache)).collect();
-            HeapObj::TraitVal(TraitValue {
-                trait_name: t.trait_name.clone(),
-                method_names: t.method_names.clone(),
-                method_values,
-                data: t.data.as_ref().map(|d| deep_clone_impl(d, depth + 1, cache)),
-                owned: t.owned,
-            })
-        }
-        HeapObj::LazyVal(l) => {
-            let cached = l.cached.as_ref().map(|c| deep_clone_impl(c, depth + 1, cache));
-            HeapObj::LazyVal(LazyValue {
-                cached,
-                forced: l.forced,
-                thunk: l.thunk.clone(),
-            })
-        }
+        HeapObj::TraitVal(t) => HeapObj::TraitVal(t.clone()),
+        HeapObj::LazyVal(l) => HeapObj::LazyVal(l.clone()),
         HeapObj::ErrorVal(e) => HeapObj::ErrorVal(e.clone()),
-        HeapObj::ThrowVal(t) => {
-            let payload = match &t.payload {
-                ThrowPayload::Ok(v) => ThrowPayload::Ok(deep_clone_impl(v, depth + 1, cache)),
-                ThrowPayload::Err(r) => ThrowPayload::Err(r.clone()),
-            };
-            HeapObj::ThrowVal(ThrowValue { payload })
-        }
-        HeapObj::ArrayIter(a) => HeapObj::ArrayIter(a.clone()),
-        HeapObj::StringIter(s) => HeapObj::StringIter(s.clone()),
-        HeapObj::RangeIter(r) => HeapObj::RangeIter(r.clone()),
-        HeapObj::AtomicVal(a) => {
-            let val = a.load();
-            HeapObj::AtomicVal(AtomicValue::new(deep_clone_impl(&val, depth + 1, cache)))
-        }
+        HeapObj::AtomicVal(a) => HeapObj::AtomicVal(AtomicValue::new(deep_clone_handle(a.load(), arena, cache))),
         HeapObj::AsyncVal(a) => HeapObj::AsyncVal(a.clone()),
         HeapObj::ChannelVal(c) => HeapObj::ChannelVal(c.clone()),
         HeapObj::SenderVal(s) => HeapObj::SenderVal(s.clone()),
@@ -2254,53 +2969,377 @@ fn heap_deep_clone(
 }
 
 // =========================================================================
-// 第九部分：Hash impl
+// ValueArena 便捷构造器（镜像旧 ValueHandle 构造器 API）+ 格式化/哈希辅助
 // =========================================================================
 
-impl Hash for Value {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            Value::Null | Value::Void => {}
-            Value::Scalar(sv, tag) => {
-                tag.hash(state);
-                // f32/f64 未实现 Hash，@bits 模式将它们绑定为 to_bits()（u32/u64）再 hash。
-                dispatch_scalar!(@bits sv, *tag, v => v.hash(state));
+impl ValueArena {
+    /// 若句柄为 Ref，返回对应堆对象引用；否则返回 None。
+    #[inline]
+    pub fn heap_obj_opt(&self, h: ValueHandle) -> Option<&HeapObj> {
+        if h.tag() == ValueTag::Ref {
+            Some(self.get_ref(h).as_ref())
+        } else {
+            None
+        }
+    }
+
+    // ---- 单例便捷构造器（无分配）----
+    // null()/void() 由既有 impl ValueArena 提供（已改为 &self）。
+    #[inline]
+    pub fn bool(&self, v: bool) -> ValueHandle {
+        Self::bool_val(v)
+    }
+
+    // ---- 标量分配便捷别名 ----
+    #[inline]
+    pub fn i8(&mut self, v: i8) -> ValueHandle {
+        self.alloc_i8(v)
+    }
+    #[inline]
+    pub fn i16(&mut self, v: i16) -> ValueHandle {
+        self.alloc_i16(v)
+    }
+    #[inline]
+    pub fn i32(&mut self, v: i32) -> ValueHandle {
+        self.alloc_i32(v)
+    }
+    #[inline]
+    pub fn i64(&mut self, v: i64) -> ValueHandle {
+        self.alloc_i64(v)
+    }
+    #[inline]
+    pub fn i128(&mut self, v: i128) -> ValueHandle {
+        self.alloc_i128(v)
+    }
+    #[inline]
+    pub fn u8(&mut self, v: u8) -> ValueHandle {
+        self.alloc_u8(v)
+    }
+    #[inline]
+    pub fn u16(&mut self, v: u16) -> ValueHandle {
+        self.alloc_u16(v)
+    }
+    #[inline]
+    pub fn u32(&mut self, v: u32) -> ValueHandle {
+        self.alloc_u32(v)
+    }
+    #[inline]
+    pub fn u64(&mut self, v: u64) -> ValueHandle {
+        self.alloc_u64(v)
+    }
+    #[inline]
+    pub fn u128(&mut self, v: u128) -> ValueHandle {
+        self.alloc_u128(v)
+    }
+    #[inline]
+    pub fn isize(&mut self, v: isize) -> ValueHandle {
+        self.alloc_isize(v)
+    }
+    #[inline]
+    pub fn usize(&mut self, v: usize) -> ValueHandle {
+        self.alloc_usize(v)
+    }
+    #[inline]
+    pub fn f16(&mut self, v: F16) -> ValueHandle {
+        self.alloc_f16(v.0)
+    }
+    #[inline]
+    pub fn f32(&mut self, v: f32) -> ValueHandle {
+        self.alloc_f32(v)
+    }
+    #[inline]
+    pub fn f64(&mut self, v: f64) -> ValueHandle {
+        self.alloc_f64(v)
+    }
+    #[inline]
+    pub fn f128(&mut self, v: F128) -> ValueHandle {
+        self.alloc_f128(v)
+    }
+    #[inline]
+    pub fn char(&mut self, c: Char) -> ValueHandle {
+        self.alloc_char(c.codepoint)
+    }
+    #[inline]
+    pub fn from_rust_char(&mut self, c: char) -> ValueHandle {
+        self.alloc_char(c as u32)
+    }
+
+    // ---- 堆对象便捷构造器 ----
+    pub fn str(&mut self, s: impl Into<String>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(GlueStr::new(s)))
+    }
+    pub fn str_from(&mut self, s: &str) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(GlueStr::from_rust_str(s)))
+    }
+    pub fn from_glue_str(&mut self, s: GlueStr) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(s))
+    }
+    pub fn heap(&mut self, obj: HeapObj) -> ValueHandle {
+        self.alloc_ref(obj)
+    }
+    pub fn from_ref(&mut self, r: HeapRef) -> ValueHandle {
+        self.alloc_ref_rc(r)
+    }
+    pub fn array(&mut self, elements: Vec<ValueHandle>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Array(ArrayValue::new(elements)))
+    }
+    pub fn array_fixed(&mut self, elements: Vec<ValueHandle>, size: u64) -> ValueHandle {
+        self.alloc_ref(HeapObj::Array(ArrayValue::new_fixed(elements, size)))
+    }
+    pub fn record(
+        &mut self,
+        type_name: impl Into<String>,
+        fields: Vec<ValueHandle>,
+        field_names: Vec<Option<String>>,
+    ) -> ValueHandle {
+        self.alloc_ref(HeapObj::Record(RecordValue::new(
+            type_name.into(),
+            fields,
+            field_names,
+        )))
+    }
+    pub fn adt(
+        &mut self,
+        type_name: impl Into<String>,
+        constructor: impl Into<String>,
+        fields: Vec<AdtField>,
+    ) -> ValueHandle {
+        self.alloc_ref(HeapObj::Adt(AdtValue::new(
+            type_name.into(),
+            constructor.into(),
+            fields,
+        )))
+    }
+    pub fn newtype(&mut self, type_name: impl Into<String>, inner: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::Newtype(NewtypeValue {
+            type_name: type_name.into(),
+            inner,
+        }))
+    }
+    pub fn cell(&mut self, val: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::Cell(Cell::new(val)))
+    }
+    pub fn range(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
+        self.alloc_ref(HeapObj::Range(Range::new(start, end, inclusive)))
+    }
+    pub fn closure(&mut self, c: Closure) -> ValueHandle {
+        self.alloc_ref(HeapObj::Closure(c))
+    }
+    pub fn partial(&mut self, p: PartialApplication) -> ValueHandle {
+        self.alloc_ref(HeapObj::Partial(p))
+    }
+    pub fn builtin(&mut self, fn_ptr: BuiltinFn, name: impl Into<String>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Builtin(Builtin {
+            fn_ptr,
+            name: name.into(),
+        }))
+    }
+    pub fn trait_val(&mut self, t: TraitValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::TraitVal(t))
+    }
+    pub fn lazy(&mut self, l: LazyValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::LazyVal(l))
+    }
+    pub fn error_val(
+        &mut self,
+        type_name: impl Into<String>,
+        message: impl Into<String>,
+        is_error_subtype: bool,
+    ) -> ValueHandle {
+        self.alloc_ref(HeapObj::ErrorVal(ErrorValue {
+            type_name: type_name.into(),
+            message: message.into(),
+            is_error_subtype,
+        }))
+    }
+    pub fn throw_ok(&mut self, val: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue {
+            payload: ThrowPayload::Ok(val),
+        }))
+    }
+    pub fn throw_err(&mut self, record: Rc<RecordValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue {
+            payload: ThrowPayload::Err(record),
+        }))
+    }
+    pub fn array_iter(&mut self, array: Rc<Vec<ValueHandle>>) -> ValueHandle {
+        self.alloc_ref(HeapObj::ArrayIter(ArrayIterator::new(array)))
+    }
+    pub fn string_iter(&mut self, s: Rc<str>) -> ValueHandle {
+        self.alloc_ref(HeapObj::StringIter(StringIterator::new(s)))
+    }
+    pub fn range_iter(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
+        self.alloc_ref(HeapObj::RangeIter(RangeIterator::new(start, end, inclusive)))
+    }
+    pub fn atomic(&mut self, val: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))
+    }
+    pub fn async_handle(&mut self) -> ValueHandle {
+        self.alloc_ref(HeapObj::AsyncVal(AsyncHandle::new()))
+    }
+    pub fn channel(&mut self, capacity: usize) -> ValueHandle {
+        self.alloc_ref(HeapObj::ChannelVal(ChannelValue::new(capacity)))
+    }
+    pub fn sender(&mut self, channel: Rc<ChannelValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::SenderVal(SenderValue { channel }))
+    }
+    pub fn receiver(&mut self, channel: Rc<ChannelValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::ReceiverVal(ReceiverValue { channel }))
+    }
+
+    // ---- 格式化包装器 ----
+    pub fn display(&self, h: ValueHandle) -> ValueDisplay<'_> {
+        ValueDisplay { arena: self, handle: h }
+    }
+    pub fn debug(&self, h: ValueHandle) -> ValueDebug<'_> {
+        ValueDebug { arena: self, handle: h }
+    }
+
+    // ---- 按值哈希 ----
+    pub fn hash_value<H: Hasher>(&self, h: ValueHandle, state: &mut H) {
+        match h.tag() {
+            ValueTag::Null => 0u8.hash(state),
+            ValueTag::Void => 1u8.hash(state),
+            ValueTag::Bool => {
+                2u8.hash(state);
+                self.get_bool(h).hash(state)
             }
-            Value::Ref(r) => {
-                r.hash(state);
+            ValueTag::Char => {
+                3u8.hash(state);
+                self.get_char(h).hash(state)
+            }
+            ValueTag::I8 => {
+                4u8.hash(state);
+                self.get_i8(h).hash(state)
+            }
+            ValueTag::I16 => {
+                5u8.hash(state);
+                self.get_i16(h).hash(state)
+            }
+            ValueTag::I32 => {
+                6u8.hash(state);
+                self.get_i32(h).hash(state)
+            }
+            ValueTag::I64 => {
+                7u8.hash(state);
+                self.get_i64(h).hash(state)
+            }
+            ValueTag::I128 => {
+                8u8.hash(state);
+                self.get_i128(h).hash(state)
+            }
+            ValueTag::U8 => {
+                9u8.hash(state);
+                self.get_u8(h).hash(state)
+            }
+            ValueTag::U16 => {
+                10u8.hash(state);
+                self.get_u16(h).hash(state)
+            }
+            ValueTag::U32 => {
+                11u8.hash(state);
+                self.get_u32(h).hash(state)
+            }
+            ValueTag::U64 => {
+                12u8.hash(state);
+                self.get_u64(h).hash(state)
+            }
+            ValueTag::U128 => {
+                13u8.hash(state);
+                self.get_u128(h).hash(state)
+            }
+            ValueTag::Isize => {
+                14u8.hash(state);
+                self.get_isize(h).hash(state)
+            }
+            ValueTag::Usize => {
+                15u8.hash(state);
+                self.get_usize(h).hash(state)
+            }
+            ValueTag::F16 => {
+                16u8.hash(state);
+                self.get_f16(h).hash(state)
+            }
+            ValueTag::F32 => {
+                17u8.hash(state);
+                self.get_f32(h).to_bits().hash(state)
+            }
+            ValueTag::F64 => {
+                18u8.hash(state);
+                self.get_f64(h).to_bits().hash(state)
+            }
+            ValueTag::F128 => {
+                19u8.hash(state);
+                self.get_f128(h).hash(state)
+            }
+            ValueTag::Ref => {
+                20u8.hash(state);
+                self.get_ref(h).hash(state);
             }
         }
     }
 }
 
-// =========================================================================
-// 第十部分：Debug / Display impl
-// =========================================================================
-
-impl fmt::Debug for Value {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Value::Null => write!(f, "null"),
-            Value::Void => write!(f, "()"),
-            Value::Scalar(sv, tag) => scalar_fmt!(@debug sv, *tag, f),
-            Value::Ref(r) => write!(f, "{:?}", r),
+// `read_int_as!` 按 tag 从字节读取整数并提升为 i128 / u128。
+// 整数类型（含 Isize/Usize）经符号扩展后转目标类型，非整数 tag 回退 0。
+// 有符号源在转 u128 时经 i128 中转，以保留与原逐臂代码一致的语义。
+macro_rules! read_int_as {
+    ($tag:expr, $bytes:expr, i128) => {
+        match $tag {
+            ValueTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128,
+            ValueTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as i128,
+            ValueTag::I16   => read_i16_le($bytes) as i128,
+            ValueTag::U16   => read_u16_le($bytes) as i128,
+            ValueTag::I32   => read_i32_le($bytes) as i128,
+            ValueTag::U32   => read_u32_le($bytes) as i128,
+            ValueTag::I64   => read_i64_le($bytes) as i128,
+            ValueTag::U64   => read_u64_le($bytes) as i128,
+            ValueTag::I128  => read_i128_le($bytes),
+            ValueTag::U128  => read_u128_le($bytes) as i128,
+            ValueTag::Isize => read_i64_le($bytes) as isize as i128,
+            ValueTag::Usize => read_u64_le($bytes) as usize as i128,
+            _ => 0,
         }
-    }
+    };
+    ($tag:expr, $bytes:expr, u128) => {
+        match $tag {
+            ValueTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128 as u128,
+            ValueTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as u128,
+            ValueTag::I16   => read_i16_le($bytes) as i128 as u128,
+            ValueTag::U16   => read_u16_le($bytes) as u128,
+            ValueTag::I32   => read_i32_le($bytes) as i128 as u128,
+            ValueTag::U32   => read_u32_le($bytes) as u128,
+            ValueTag::I64   => read_i64_le($bytes) as i128 as u128,
+            ValueTag::U64   => read_u64_le($bytes) as u128,
+            ValueTag::I128  => read_i128_le($bytes) as u128,
+            ValueTag::U128  => read_u128_le($bytes),
+            ValueTag::Isize => read_i64_le($bytes) as isize as i128 as u128,
+            ValueTag::Usize => read_u64_le($bytes) as usize as u128,
+            _ => 0,
+        }
+    };
 }
 
-impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Value::Null => write!(f, "null"),
-            Value::Void => write!(f, "()"),
-            Value::Scalar(sv, tag) => scalar_fmt!(@display sv, *tag, f),
-            Value::Ref(r) => match r.as_ref() {
-                HeapObj::Str(s) => write!(f, "{}", s),
-                _ => write!(f, "{:?}", r),
-            },
+// `write_int_bytes!` 按 dst_tag 将整数（i128 或 u128）写入目标字节缓冲，
+// 复用既有 write_*_le 辅助函数以保持与原逐臂代码一致的截断/填充语义。
+macro_rules! write_int_bytes {
+    ($val:expr, $tag:expr, $dst:expr) => {
+        match $tag {
+            ValueTag::I8    => write_i8($val as i8, $dst),
+            ValueTag::U8    => write_u8($val as u8, $dst),
+            ValueTag::I16   => write_i16_le($val as i16, $dst),
+            ValueTag::U16   => write_u16_le($val as u16, $dst),
+            ValueTag::I32   => write_i32_le($val as i32, $dst),
+            ValueTag::U32   => write_u32_le($val as u32, $dst),
+            ValueTag::I64   => write_i64_le($val as i64, $dst),
+            ValueTag::U64   => write_u64_le($val as u64, $dst),
+            ValueTag::I128  => write_i128_le($val as i128, $dst),
+            ValueTag::U128  => write_u128_le($val as u128, $dst),
+            ValueTag::Isize => write_i64_le($val as isize as i64, $dst),
+            ValueTag::Usize => write_u64_le($val as usize as u64, $dst),
+            _ => {}
         }
-    }
+    };
 }
 
 // =========================================================================
@@ -2447,7 +3486,7 @@ pub enum ParseError {
     ParseFailed(String),
 }
 
-pub fn cast_value(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag) -> Vec<u8> {
+pub fn cast_value(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Vec<u8> {
     let dst_width = dst_tag.byte_width();
     let mut result = vec![0u8; dst_width];
 
@@ -2458,19 +3497,19 @@ pub fn cast_value(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag) -> V
     }
 
     match (src_tag, dst_tag) {
-        (ScalarTag::Bool, _) => {
+        (ValueTag::Bool, _) => {
             let b = read_bool(src_bytes);
             cast_from_bool(b, dst_tag, &mut result);
         }
-        (ScalarTag::Char, _) => {
+        (ValueTag::Char, _) => {
             let cp = read_u32_le(src_bytes);
             cast_from_u32(cp, dst_tag, &mut result);
         }
-        (_, ScalarTag::Bool) => {
+        (_, ValueTag::Bool) => {
             let b = cast_to_bool(src_tag, src_bytes);
             write_bool(b, &mut result);
         }
-        (_, ScalarTag::Char) => {
+        (_, ValueTag::Char) => {
             let cp = cast_to_u32(src_tag, src_bytes);
             write_u32_le(cp, &mut result);
         }
@@ -2492,12 +3531,12 @@ pub fn cast_value(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag) -> V
     result
 }
 
-pub fn try_cast_value(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag) -> Result<Vec<u8>, CastError> {
+pub fn try_cast_value(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Result<Vec<u8>, CastError> {
     if src_tag == dst_tag {
         return Ok(cast_value(src_tag, src_bytes, dst_tag));
     }
 
-    if src_tag.is_int() && dst_tag == ScalarTag::Char {
+    if src_tag.is_int() && dst_tag == ValueTag::Char {
         let cp = cast_to_u32(src_tag, src_bytes);
         if cp > 0x10FFFF || (0xD800..=0xDFFF).contains(&cp) {
             return Err(CastError::InvalidCodepoint);
@@ -2518,7 +3557,7 @@ pub fn try_cast_value(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag) 
     Ok(cast_value(src_tag, src_bytes, dst_tag))
 }
 
-pub fn parse_str(s: &str, dst_tag: ScalarTag) -> Result<Vec<u8>, ParseError> {
+pub fn parse_str(s: &str, dst_tag: ValueTag) -> Result<Vec<u8>, ParseError> {
     let trimmed = s.trim();
     let result = vec![0u8; dst_tag.byte_width()];
 
@@ -2529,7 +3568,7 @@ pub fn parse_str(s: &str, dst_tag: ScalarTag) -> Result<Vec<u8>, ParseError> {
     let mut result = result;
 
     match dst_tag {
-        ScalarTag::Bool => {
+        ValueTag::Bool => {
             let b = match trimmed.to_ascii_lowercase().as_str() {
                 "true" => true,
                 "false" => false,
@@ -2537,7 +3576,7 @@ pub fn parse_str(s: &str, dst_tag: ScalarTag) -> Result<Vec<u8>, ParseError> {
             };
             write_bool(b, &mut result);
         }
-        ScalarTag::Char => {
+        ValueTag::Char => {
             let mut chars = trimmed.chars();
             let c = chars.next().ok_or_else(|| ParseError::ParseFailed("empty char".to_string()))?;
             if chars.next().is_some() {
@@ -2545,72 +3584,73 @@ pub fn parse_str(s: &str, dst_tag: ScalarTag) -> Result<Vec<u8>, ParseError> {
             }
             write_u32_le(c as u32, &mut result);
         }
-        ScalarTag::I8 => {
+        ValueTag::I8 => {
             let v: i8 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_i8(v, &mut result);
         }
-        ScalarTag::I16 => {
+        ValueTag::I16 => {
             let v: i16 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_i16_le(v, &mut result);
         }
-        ScalarTag::I32 => {
+        ValueTag::I32 => {
             let v: i32 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_i32_le(v, &mut result);
         }
-        ScalarTag::I64 => {
+        ValueTag::I64 => {
             let v: i64 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_i64_le(v, &mut result);
         }
-        ScalarTag::I128 => {
+        ValueTag::I128 => {
             let v: i128 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_i128_le(v, &mut result);
         }
-        ScalarTag::U8 => {
+        ValueTag::U8 => {
             let v: u8 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_u8(v, &mut result);
         }
-        ScalarTag::U16 => {
+        ValueTag::U16 => {
             let v: u16 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_u16_le(v, &mut result);
         }
-        ScalarTag::U32 => {
+        ValueTag::U32 => {
             let v: u32 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_u32_le(v, &mut result);
         }
-        ScalarTag::U64 => {
+        ValueTag::U64 => {
             let v: u64 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_u64_le(v, &mut result);
         }
-        ScalarTag::U128 => {
+        ValueTag::U128 => {
             let v: u128 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_u128_le(v, &mut result);
         }
-        ScalarTag::Isize => {
+        ValueTag::Isize => {
             let v: isize = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_i64_le(v as i64, &mut result);
         }
-        ScalarTag::Usize => {
+        ValueTag::Usize => {
             let v: usize = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
             write_u64_le(v as u64, &mut result);
         }
-        ScalarTag::F32 => {
+        ValueTag::F32 => {
             let v: f32 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
             write_f32_le(v, &mut result);
         }
-        ScalarTag::F64 => {
+        ValueTag::F64 => {
             let v: f64 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
             write_f64_le(v, &mut result);
         }
-        ScalarTag::F16 => {
+        ValueTag::F16 => {
             let v: f32 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
             let f16 = F16::from_f32(v);
             write_u16_le(f16.0, &mut result);
         }
-        ScalarTag::F128 => {
+        ValueTag::F128 => {
             let v: f64 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
             let f128 = F128::from_f64(v);
             result.copy_from_slice(&f128.0);
         }
+        _ => return Err(ParseError::ParseFailed(format!("unsupported tag: {:?}", dst_tag))),
     }
 
     Ok(result)
@@ -2706,11 +3746,11 @@ fn read_f128(bytes: &[u8]) -> F128 {
     F128(buf)
 }
 
-fn read_int_as_i128(tag: ScalarTag, bytes: &[u8]) -> i128 {
+fn read_int_as_i128(tag: ValueTag, bytes: &[u8]) -> i128 {
     read_int_as!(tag, bytes, i128)
 }
 
-fn read_int_as_u128(tag: ScalarTag, bytes: &[u8]) -> u128 {
+fn read_int_as_u128(tag: ValueTag, bytes: &[u8]) -> u128 {
     read_int_as!(tag, bytes, u128)
 }
 
@@ -2788,76 +3828,77 @@ fn write_f128(f: F128, dst: &mut [u8]) {
     dst[..len].copy_from_slice(&f.0[..len]);
 }
 
-fn cast_from_bool(b: bool, dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_from_bool(b: bool, dst_tag: ValueTag, dst: &mut [u8]) {
     let val: i128 = if b { 1 } else { 0 };
     if dst_tag.is_int() {
         cast_from_i128(val, dst_tag, dst);
     } else if dst_tag.is_float() {
         let f = if b { 1.0 } else { 0.0 };
         cast_from_f64(f, dst_tag, dst);
-    } else if dst_tag == ScalarTag::Char {
+    } else if dst_tag == ValueTag::Char {
         write_u32_le(val as u32, dst);
     }
 }
 
-fn cast_from_u32(cp: u32, dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_from_u32(cp: u32, dst_tag: ValueTag, dst: &mut [u8]) {
     if dst_tag.is_int() {
         cast_from_u128(cp as u128, dst_tag, dst);
     } else if dst_tag.is_float() {
         cast_from_f64(cp as f64, dst_tag, dst);
-    } else if dst_tag == ScalarTag::Bool {
+    } else if dst_tag == ValueTag::Bool {
         write_bool(cp != 0, dst);
     }
 }
 
-fn cast_from_i128(val: i128, dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_from_i128(val: i128, dst_tag: ValueTag, dst: &mut [u8]) {
     write_int_bytes!(val, dst_tag, dst)
 }
 
-fn cast_from_u128(val: u128, dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_from_u128(val: u128, dst_tag: ValueTag, dst: &mut [u8]) {
     write_int_bytes!(val, dst_tag, dst)
 }
 
-fn cast_from_f64(val: f64, dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_from_f64(val: f64, dst_tag: ValueTag, dst: &mut [u8]) {
     match dst_tag {
-        ScalarTag::F16 => write_f16(F16::from_f32(val as f32), dst),
-        ScalarTag::F32 => write_f32_le(val as f32, dst),
-        ScalarTag::F64 => write_f64_le(val, dst),
-        ScalarTag::F128 => write_f128(F128::from_f64(val), dst),
+        ValueTag::F16 => write_f16(F16::from_f32(val as f32), dst),
+        ValueTag::F32 => write_f32_le(val as f32, dst),
+        ValueTag::F64 => write_f64_le(val, dst),
+        ValueTag::F128 => write_f128(F128::from_f64(val), dst),
         _ => {}
     }
 }
 
-fn cast_to_bool(src_tag: ScalarTag, src_bytes: &[u8]) -> bool {
+fn cast_to_bool(src_tag: ValueTag, src_bytes: &[u8]) -> bool {
     match src_tag {
-        ScalarTag::Bool => read_bool(src_bytes),
-        ScalarTag::Char => read_u32_le(src_bytes) != 0,
-        ScalarTag::I8 => src_bytes.first().copied().unwrap_or(0) as i8 != 0,
-        ScalarTag::U8 => src_bytes.first().copied().unwrap_or(0) != 0,
-        ScalarTag::I16 | ScalarTag::U16 => {
+        ValueTag::Bool => read_bool(src_bytes),
+        ValueTag::Char => read_u32_le(src_bytes) != 0,
+        ValueTag::I8 => src_bytes.first().copied().unwrap_or(0) as i8 != 0,
+        ValueTag::U8 => src_bytes.first().copied().unwrap_or(0) != 0,
+        ValueTag::I16 | ValueTag::U16 => {
             let mut b = [0u8; 2];
             let l = src_bytes.len().min(2);
             b[..l].copy_from_slice(&src_bytes[..l]);
             u16::from_le_bytes(b) != 0
         }
-        ScalarTag::I32 | ScalarTag::U32 => {
+        ValueTag::I32 | ValueTag::U32 => {
             let v = read_u32_le(src_bytes);
             v != 0
         }
-        ScalarTag::I64 | ScalarTag::U64 | ScalarTag::Isize | ScalarTag::Usize => {
+        ValueTag::I64 | ValueTag::U64 | ValueTag::Isize | ValueTag::Usize => {
             read_u64_le(src_bytes) != 0
         }
-        ScalarTag::I128 | ScalarTag::U128 => {
+        ValueTag::I128 | ValueTag::U128 => {
             read_u128_le(src_bytes) != 0
         }
-        ScalarTag::F32 => read_f32_le(src_bytes) != 0.0,
-        ScalarTag::F64 => read_f64_le(src_bytes) != 0.0,
-        ScalarTag::F16 => read_f16(src_bytes).to_f32() != 0.0,
-        ScalarTag::F128 => read_f128(src_bytes).to_f64() != 0.0,
+        ValueTag::F32 => read_f32_le(src_bytes) != 0.0,
+        ValueTag::F64 => read_f64_le(src_bytes) != 0.0,
+        ValueTag::F16 => read_f16(src_bytes).to_f32() != 0.0,
+        ValueTag::F128 => read_f128(src_bytes).to_f64() != 0.0,
+        _ => false,
     }
 }
 
-fn cast_to_u32(src_tag: ScalarTag, src_bytes: &[u8]) -> u32 {
+fn cast_to_u32(src_tag: ValueTag, src_bytes: &[u8]) -> u32 {
     if src_tag.is_int() {
         read_int_as_u128(src_tag, src_bytes) as u32
     } else if src_tag.is_float() {
@@ -2871,24 +3912,24 @@ fn cast_to_u32(src_tag: ScalarTag, src_bytes: &[u8]) -> u32 {
         } else {
             f as u32
         }
-    } else if src_tag == ScalarTag::Bool {
+    } else if src_tag == ValueTag::Bool {
         if read_bool(src_bytes) { 1 } else { 0 }
     } else {
         0
     }
 }
 
-fn read_float_as_f64(tag: ScalarTag, bytes: &[u8]) -> f64 {
+fn read_float_as_f64(tag: ValueTag, bytes: &[u8]) -> f64 {
     match tag {
-        ScalarTag::F16 => read_f16(bytes).to_f64(),
-        ScalarTag::F32 => read_f32_le(bytes) as f64,
-        ScalarTag::F64 => read_f64_le(bytes),
-        ScalarTag::F128 => read_f128(bytes).to_f64(),
+        ValueTag::F16 => read_f16(bytes).to_f64(),
+        ValueTag::F32 => read_f32_le(bytes) as f64,
+        ValueTag::F64 => read_f64_le(bytes),
+        ValueTag::F128 => read_f128(bytes).to_f64(),
         _ => 0.0,
     }
 }
 
-fn cast_int_to_int(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_int_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
     if dst_tag.is_signed() {
         let val = read_int_as_i128(src_tag, src_bytes);
         cast_from_i128(val, dst_tag, dst);
@@ -2898,7 +3939,7 @@ fn cast_int_to_int(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag, dst
     }
 }
 
-fn cast_int_to_float(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_int_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
     let val = if src_tag.is_signed() {
         read_int_as_i128(src_tag, src_bytes) as f64
     } else {
@@ -2907,41 +3948,41 @@ fn cast_int_to_float(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag, d
     cast_from_f64(val, dst_tag, dst);
 }
 
-fn cast_float_to_int(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_float_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
     let f = read_float_as_f64(src_tag, src_bytes);
     match dst_tag {
-        ScalarTag::I8 => write_i8(f as i8, dst),
-        ScalarTag::I16 => write_i16_le(f as i16, dst),
-        ScalarTag::I32 => write_i32_le(f as i32, dst),
-        ScalarTag::I64 => write_i64_le(f as i64, dst),
-        ScalarTag::I128 => write_i128_le(f as i128, dst),
-        ScalarTag::Isize => write_i64_le(f as isize as i64, dst),
-        ScalarTag::U8 => write_u8(f as u8, dst),
-        ScalarTag::U16 => write_u16_le(f as u16, dst),
-        ScalarTag::U32 => write_u32_le(f as u32, dst),
-        ScalarTag::U64 => write_u64_le(f as u64, dst),
-        ScalarTag::U128 => write_u128_le(f as u128, dst),
-        ScalarTag::Usize => write_u64_le(f as usize as u64, dst),
+        ValueTag::I8 => write_i8(f as i8, dst),
+        ValueTag::I16 => write_i16_le(f as i16, dst),
+        ValueTag::I32 => write_i32_le(f as i32, dst),
+        ValueTag::I64 => write_i64_le(f as i64, dst),
+        ValueTag::I128 => write_i128_le(f as i128, dst),
+        ValueTag::Isize => write_i64_le(f as isize as i64, dst),
+        ValueTag::U8 => write_u8(f as u8, dst),
+        ValueTag::U16 => write_u16_le(f as u16, dst),
+        ValueTag::U32 => write_u32_le(f as u32, dst),
+        ValueTag::U64 => write_u64_le(f as u64, dst),
+        ValueTag::U128 => write_u128_le(f as u128, dst),
+        ValueTag::Usize => write_u64_le(f as usize as u64, dst),
         _ => {}
     }
 }
 
-fn cast_float_to_float(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag, dst: &mut [u8]) {
+fn cast_float_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
     let f = read_float_as_f64(src_tag, src_bytes);
     cast_from_f64(f, dst_tag, dst);
 }
 
-fn try_cast_int_narrow(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag) -> Result<Vec<u8>, CastError> {
+fn try_cast_int_narrow(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Result<Vec<u8>, CastError> {
     let sval = read_int_as_i128(src_tag, src_bytes);
     let uval = read_int_as_u128(src_tag, src_bytes);
 
     let in_range = if dst_tag.is_signed() {
         match dst_tag {
-            ScalarTag::I8 => (i8::MIN as i128..=i8::MAX as i128).contains(&sval),
-            ScalarTag::I16 => (i16::MIN as i128..=i16::MAX as i128).contains(&sval),
-            ScalarTag::I32 => (i32::MIN as i128..=i32::MAX as i128).contains(&sval),
-            ScalarTag::I64 => (i64::MIN as i128..=i64::MAX as i128).contains(&sval),
-            ScalarTag::Isize => (isize::MIN as i128..=isize::MAX as i128).contains(&sval),
+            ValueTag::I8 => (i8::MIN as i128..=i8::MAX as i128).contains(&sval),
+            ValueTag::I16 => (i16::MIN as i128..=i16::MAX as i128).contains(&sval),
+            ValueTag::I32 => (i32::MIN as i128..=i32::MAX as i128).contains(&sval),
+            ValueTag::I64 => (i64::MIN as i128..=i64::MAX as i128).contains(&sval),
+            ValueTag::Isize => (isize::MIN as i128..=isize::MAX as i128).contains(&sval),
             _ => true,
         }
     } else {
@@ -2949,11 +3990,11 @@ fn try_cast_int_narrow(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag)
             false
         } else {
             match dst_tag {
-                ScalarTag::U8 => uval <= u8::MAX as u128,
-                ScalarTag::U16 => uval <= u16::MAX as u128,
-                ScalarTag::U32 => uval <= u32::MAX as u128,
-                ScalarTag::U64 => uval <= u64::MAX as u128,
-                ScalarTag::Usize => uval <= usize::MAX as u128,
+                ValueTag::U8 => uval <= u8::MAX as u128,
+                ValueTag::U16 => uval <= u16::MAX as u128,
+                ValueTag::U32 => uval <= u32::MAX as u128,
+                ValueTag::U64 => uval <= u64::MAX as u128,
+                ValueTag::Usize => uval <= usize::MAX as u128,
                 _ => true,
             }
         }
@@ -2966,7 +4007,7 @@ fn try_cast_int_narrow(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag)
     Ok(cast_value(src_tag, src_bytes, dst_tag))
 }
 
-fn try_cast_float_to_int(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTag) -> Result<Vec<u8>, CastError> {
+fn try_cast_float_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Result<Vec<u8>, CastError> {
     let f = read_float_as_f64(src_tag, src_bytes);
 
     if f.is_nan() || f.is_infinite() {
@@ -2975,22 +4016,22 @@ fn try_cast_float_to_int(src_tag: ScalarTag, src_bytes: &[u8], dst_tag: ScalarTa
 
     let in_range = if dst_tag.is_signed() {
         match dst_tag {
-            ScalarTag::I8 => f >= i8::MIN as f64 && f <= i8::MAX as f64,
-            ScalarTag::I16 => f >= i16::MIN as f64 && f <= i16::MAX as f64,
-            ScalarTag::I32 => f >= i32::MIN as f64 && f <= i32::MAX as f64,
-            ScalarTag::I64 => f >= i64::MIN as f64 && f <= i64::MAX as f64,
-            ScalarTag::I128 => f >= i128::MIN as f64 && f <= i128::MAX as f64,
-            ScalarTag::Isize => f >= isize::MIN as f64 && f <= isize::MAX as f64,
+            ValueTag::I8 => f >= i8::MIN as f64 && f <= i8::MAX as f64,
+            ValueTag::I16 => f >= i16::MIN as f64 && f <= i16::MAX as f64,
+            ValueTag::I32 => f >= i32::MIN as f64 && f <= i32::MAX as f64,
+            ValueTag::I64 => f >= i64::MIN as f64 && f <= i64::MAX as f64,
+            ValueTag::I128 => f >= i128::MIN as f64 && f <= i128::MAX as f64,
+            ValueTag::Isize => f >= isize::MIN as f64 && f <= isize::MAX as f64,
             _ => true,
         }
     } else {
         match dst_tag {
-            ScalarTag::U8 => f >= 0.0 && f <= u8::MAX as f64,
-            ScalarTag::U16 => f >= 0.0 && f <= u16::MAX as f64,
-            ScalarTag::U32 => f >= 0.0 && f <= u32::MAX as f64,
-            ScalarTag::U64 => f >= 0.0 && f <= u64::MAX as f64,
-            ScalarTag::U128 => f >= 0.0 && f <= u128::MAX as f64,
-            ScalarTag::Usize => f >= 0.0 && f <= usize::MAX as f64,
+            ValueTag::U8 => f >= 0.0 && f <= u8::MAX as f64,
+            ValueTag::U16 => f >= 0.0 && f <= u16::MAX as f64,
+            ValueTag::U32 => f >= 0.0 && f <= u32::MAX as f64,
+            ValueTag::U64 => f >= 0.0 && f <= u64::MAX as f64,
+            ValueTag::U128 => f >= 0.0 && f <= u128::MAX as f64,
+            ValueTag::Usize => f >= 0.0 && f <= usize::MAX as f64,
             _ => true,
         }
     };
@@ -3038,7 +4079,7 @@ const PARALLEL_THRESHOLD: usize = 4096;
 #[inline]
 fn par_chunk_size(n: usize) -> usize {
     let pieces = rayon::current_num_threads().max(1) * 4;
-    let chunk = (n + pieces - 1) / pieces;
+    let chunk = n.div_ceil(pieces);
     // 向上对齐到 4 的倍数
     let chunk = (chunk + 3) & !3;
     chunk.max(4)
@@ -3601,11 +4642,11 @@ fn reduce_add_f32_seq(a: &[f32]) -> f32 {
     let mut acc = f32x4::splat(0.0);
     for blk in 0..blocks {
         let i = blk * SIMD_LANES;
-        acc = acc + f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+        acc += f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
     }
     let mut sum = acc.reduce_add();
-    for i in (blocks * SIMD_LANES)..n {
-        sum += a[i];
+    for &v in a.iter().skip(blocks * SIMD_LANES) {
+        sum += v;
     }
     sum
 }
@@ -3621,7 +4662,7 @@ pub fn batch_reduce_f32(a: &[f32], op: ReduceOp) -> f32 {
             if n > PARALLEL_THRESHOLD {
                 let chunk = par_chunk_size(n);
                 let partials: Vec<f32> =
-                    a.par_chunks(chunk).map(|c| reduce_add_f32_seq(c)).collect();
+                    a.par_chunks(chunk).map(reduce_add_f32_seq).collect();
                 partials.iter().copied().fold(0.0, |x, y| x + y)
             } else {
                 reduce_add_f32_seq(a)
@@ -3649,11 +4690,11 @@ fn reduce_add_f64_seq(a: &[f64]) -> f64 {
     let mut acc = f64x4::splat(0.0);
     for blk in 0..blocks {
         let i = blk * SIMD_LANES;
-        acc = acc + f64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
+        acc += f64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
     }
     let mut sum = acc.reduce_add();
-    for i in (blocks * SIMD_LANES)..n {
-        sum += a[i];
+    for &v in a.iter().skip(blocks * SIMD_LANES) {
+        sum += v;
     }
     sum
 }
@@ -3669,7 +4710,7 @@ pub fn batch_reduce_f64(a: &[f64], op: ReduceOp) -> f64 {
             if n > PARALLEL_THRESHOLD {
                 let chunk = par_chunk_size(n);
                 let partials: Vec<f64> =
-                    a.par_chunks(chunk).map(|c| reduce_add_f64_seq(c)).collect();
+                    a.par_chunks(chunk).map(reduce_add_f64_seq).collect();
                 partials.iter().copied().fold(0.0, |x, y| x + y)
             } else {
                 reduce_add_f64_seq(a)
@@ -3695,8 +4736,8 @@ pub fn batch_reduce_f64(a: &[f64], op: ReduceOp) -> f64 {
 /// 内存分配器 trait
 pub trait Allocator: Clone {
     fn alloc_str(&self, s: &str) -> Rc<str>;
-    fn alloc_array(&self, vals: Vec<Value>) -> Rc<Vec<Value>>;
-    fn alloc_value(&self, val: Value) -> Value {
+    fn alloc_array(&self, vals: Vec<ValueHandle>) -> Rc<Vec<ValueHandle>>;
+    fn alloc_value(&self, val: ValueHandle) -> ValueHandle {
         val
     }
 }
@@ -3709,7 +4750,7 @@ impl Allocator for DefaultAllocator {
     fn alloc_str(&self, s: &str) -> Rc<str> {
         Rc::from(s)
     }
-    fn alloc_array(&self, vals: Vec<Value>) -> Rc<Vec<Value>> {
+    fn alloc_array(&self, vals: Vec<ValueHandle>) -> Rc<Vec<ValueHandle>> {
         Rc::new(vals)
     }
 }
@@ -3730,60 +4771,70 @@ mod value_tests {
 
     #[test]
     fn test_scalar_constructors() {
-        assert!(Value::null().is_null());
-        assert!(Value::void().is_void());
-        assert_eq!(Value::bool(true).as_bool(), Some(true));
-        assert_eq!(Value::i32(42).as_i32(), Some(42));
-        assert_eq!(Value::i64(-7).as_i64(), Some(-7));
-        assert_eq!(Value::u8(255).as_u8(), Some(255));
-        assert_eq!(Value::f64(2.5).as_f64(), Some(2.5));
+        let mut a = ValueArena::new();
+        assert!(a.null().is_null());
+        assert!(a.void().is_void());
+        assert_eq!(a.bool(true).as_bool(&a), Some(true));
+        assert_eq!(a.i32(42).as_i32(&a), Some(42));
+        assert_eq!(a.i64(-7).as_i64(&a), Some(-7));
+        assert_eq!(a.u8(255).as_u8(&a), Some(255));
+        assert_eq!(a.f64(2.5).as_f64(&a), Some(2.5));
     }
 
     #[test]
     fn test_char_constructor() {
-        let c = Value::from_rust_char('A');
+        let mut a = ValueArena::new();
+        let c = a.from_rust_char('A');
         assert!(c.is_char());
-        assert_eq!(c.as_char().unwrap().codepoint(), 65);
+        assert_eq!(c.as_char(&a).unwrap().codepoint(), 65);
     }
 
     #[test]
     fn test_int_promotion() {
-        assert_eq!(Value::i32(42).as_int_i64(), Some(42));
-        assert_eq!(Value::u64(100).as_int_i64(), Some(100));
-        assert_eq!(Value::i8(-5).as_int_i128(), Some(-5));
-        assert_eq!(Value::f64(2.5).as_int_i64(), None);
+        let mut a = ValueArena::new();
+        assert_eq!(a.i32(42).as_int_i64(&a), Some(42));
+        assert_eq!(a.u64(100).as_int_i64(&a), Some(100));
+        assert_eq!(a.i8(-5).as_int_i128(&a), Some(-5));
+        assert_eq!(a.f64(2.5).as_int_i64(&a), None);
     }
 
     #[test]
     fn test_float_promotion() {
-        assert_eq!(Value::f32(1.5).as_float_f64(), Some(1.5));
-        assert_eq!(Value::f64(2.5).as_float_f64(), Some(2.5));
-        assert_eq!(Value::i32(42).as_float_f64(), None);
+        let mut a = ValueArena::new();
+        assert_eq!(a.f32(1.5).as_float_f64(&a), Some(1.5));
+        assert_eq!(a.f64(2.5).as_float_f64(&a), Some(2.5));
+        assert_eq!(a.i32(42).as_float_f64(&a), None);
     }
 
     // ---- 谓词 ----
 
     #[test]
     fn test_predicates() {
-        assert!(Value::bool(false).is_bool());
-        assert!(Value::from_rust_char('x').is_char());
-        assert!(Value::i32(0).is_int());
-        assert!(Value::u64(1).is_int());
-        assert!(Value::f64(0.0).is_float());
-        assert!(Value::i32(0).is_numeric());
-        assert!(Value::f32(0.0).is_numeric());
-        assert!(!Value::bool(true).is_numeric());
-        assert!(Value::i32(0).is_scalar());
-        assert!(!Value::null().is_scalar());
+        let mut a = ValueArena::new();
+        assert!(a.bool(false).is_bool());
+        assert!(a.from_rust_char('x').is_char());
+        assert!(a.i32(0).is_int());
+        assert!(a.u64(1).is_int());
+        assert!(a.f64(0.0).is_float());
+        assert!(a.i32(0).is_numeric());
+        assert!(a.f32(0.0).is_numeric());
+        assert!(!a.bool(true).is_numeric());
+        assert!(a.i32(0).is_scalar());
+        assert!(!a.null().is_scalar());
     }
 
     #[test]
     fn test_heap_predicates() {
-        assert!(Value::str("hello").is_string());
-        assert!(Value::str("hello").is_ref());
-        assert!(Value::array(vec![Value::i32(1), Value::i32(2)]).is_array());
-        assert!(Value::record("Foo", vec![], vec![]).is_record());
-        assert!(Value::closure(Closure {
+        let mut a = ValueArena::new();
+        let s = a.str("hello");
+        assert!(s.is_string(&a));
+        assert!(s.is_ref());
+        let e1 = a.i32(1);
+        let e2 = a.i32(2);
+        let arr = a.array(vec![e1, e2]);
+        assert!(arr.is_array(&a));
+        assert!(a.record("Foo", vec![], vec![]).is_record(&a));
+        let cl = a.closure(Closure {
             func_id: 0,
             arity: 0,
             upvalues: vec![],
@@ -3791,193 +4842,222 @@ mod value_tests {
             self_upvalue_idx: -1,
             upvalue_ref_bits: 0,
             cell_upvalues: 0,
-        })
-        .is_closure());
-        assert!(Value::closure(Closure {
-            func_id: 0,
-            arity: 0,
-            upvalues: vec![],
-            bound_args: vec![],
-            self_upvalue_idx: -1,
-            upvalue_ref_bits: 0,
-            cell_upvalues: 0,
-        })
-        .is_callable());
+        });
+        assert!(cl.is_closure(&a));
+        assert!(cl.is_callable(&a));
     }
 
     // ---- 类型名称 ----
 
     #[test]
     fn test_type_names() {
-        assert_eq!(Value::null().type_name(), "null");
-        assert_eq!(Value::void().type_name(), "void");
-        assert_eq!(Value::bool(true).type_name(), "bool");
-        assert_eq!(Value::from_rust_char('x').type_name(), "char");
-        assert_eq!(Value::i32(0).type_name(), "i32");
-        assert_eq!(Value::u64(0).type_name(), "u64");
-        assert_eq!(Value::f64(0.0).type_name(), "f64");
-        assert_eq!(Value::str("x").type_name(), "str");
-        assert_eq!(Value::array(vec![]).type_name(), "array");
-        assert_eq!(Value::record("Foo", vec![], vec![]).type_name(), "record");
+        let mut a = ValueArena::new();
+        assert_eq!(a.null().type_name(&a), "null");
+        assert_eq!(a.void().type_name(&a), "void");
+        assert_eq!(a.bool(true).type_name(&a), "bool");
+        assert_eq!(a.from_rust_char('x').type_name(&a), "char");
+        assert_eq!(a.i32(0).type_name(&a), "i32");
+        assert_eq!(a.u64(0).type_name(&a), "u64");
+        assert_eq!(a.f64(0.0).type_name(&a), "f64");
+        assert_eq!(a.str("x").type_name(&a), "str");
+        assert_eq!(a.array(vec![]).type_name(&a), "array");
+        assert_eq!(a.record("Foo", vec![], vec![]).type_name(&a), "record");
     }
 
     #[test]
     fn test_scalar_tag() {
-        assert_eq!(Value::bool(true).scalar_tag(), Some(ScalarTag::Bool));
-        assert_eq!(Value::i32(0).scalar_tag(), Some(ScalarTag::I32));
-        assert_eq!(Value::f64(0.0).scalar_tag(), Some(ScalarTag::F64));
-        assert_eq!(Value::null().scalar_tag(), None);
-        assert_eq!(Value::str("x").scalar_tag(), None);
+        let mut a = ValueArena::new();
+        assert_eq!(a.bool(true).scalar_tag(), Some(ValueTag::Bool));
+        assert_eq!(a.i32(0).scalar_tag(), Some(ValueTag::I32));
+        assert_eq!(a.f64(0.0).scalar_tag(), Some(ValueTag::F64));
+        assert_eq!(a.null().scalar_tag(), None);
+        assert_eq!(a.str("x").scalar_tag(), None);
     }
 
     // ---- equals ----
 
     #[test]
     fn test_equals_scalars() {
-        assert!(Value::i32(42).equals(&Value::i32(42)));
-        assert!(!Value::i32(42).equals(&Value::i32(43)));
-        assert!(Value::bool(true).equals(&Value::bool(true)));
-        assert!(!Value::bool(true).equals(&Value::bool(false)));
-        assert!(Value::f64(2.5).equals(&Value::f64(2.5)));
-        assert!(Value::null().equals(&Value::null()));
-        assert!(Value::void().equals(&Value::void()));
-        assert!(!Value::null().equals(&Value::void()));
+        let mut a = ValueArena::new();
+        assert!(a.i32(42).equals(&a.i32(42), &a));
+        assert!(!a.i32(42).equals(&a.i32(43), &a));
+        assert!(a.bool(true).equals(&a.bool(true), &a));
+        assert!(!a.bool(true).equals(&a.bool(false), &a));
+        assert!(a.f64(2.5).equals(&a.f64(2.5), &a));
+        assert!(a.null().equals(&a.null(), &a));
+        assert!(a.void().equals(&a.void(), &a));
+        assert!(!a.null().equals(&a.void(), &a));
     }
 
     #[test]
     fn test_equals_different_types() {
+        let mut a = ValueArena::new();
         // 即使数值相同，不同标量类型不相等
-        assert!(!Value::i32(1).equals(&Value::i64(1)));
-        assert!(!Value::i32(1).equals(&Value::u32(1)));
-        assert!(!Value::i32(1).equals(&Value::bool(true)));
+        assert!(!a.i32(1).equals(&a.i64(1), &a));
+        assert!(!a.i32(1).equals(&a.u32(1), &a));
+        assert!(!a.i32(1).equals(&a.bool(true), &a));
     }
 
     #[test]
     fn test_equals_strings() {
-        let s1 = Value::str("hello");
-        let s2 = Value::str("hello");
-        let s3 = Value::str("world");
-        assert!(s1.equals(&s2));
-        assert!(!s1.equals(&s3));
+        let mut a = ValueArena::new();
+        let s1 = a.str("hello");
+        let s2 = a.str("hello");
+        let s3 = a.str("world");
+        assert!(s1.equals(&s2, &a));
+        assert!(!s1.equals(&s3, &a));
     }
 
     #[test]
     fn test_equals_arrays() {
-        let a1 = Value::array(vec![Value::i32(1), Value::i32(2), Value::i32(3)]);
-        let a2 = Value::array(vec![Value::i32(1), Value::i32(2), Value::i32(3)]);
-        let a3 = Value::array(vec![Value::i32(1), Value::i32(2)]);
-        let a4 = Value::array(vec![Value::i32(1), Value::i32(2), Value::i32(4)]);
-        assert!(a1.equals(&a2));
-        assert!(!a1.equals(&a3));
-        assert!(!a1.equals(&a4));
+        let mut a = ValueArena::new();
+        let es: Vec<ValueHandle> = [1, 2, 3].iter().map(|&v| a.i32(v)).collect();
+        let a1 = a.array(es);
+        let es: Vec<ValueHandle> = [1, 2, 3].iter().map(|&v| a.i32(v)).collect();
+        let a2 = a.array(es);
+        let es: Vec<ValueHandle> = [1, 2].iter().map(|&v| a.i32(v)).collect();
+        let a3 = a.array(es);
+        let es: Vec<ValueHandle> = [1, 2, 4].iter().map(|&v| a.i32(v)).collect();
+        let a4 = a.array(es);
+        assert!(a1.equals(&a2, &a));
+        assert!(!a1.equals(&a3, &a));
+        assert!(!a1.equals(&a4, &a));
     }
 
     #[test]
     fn test_equals_records() {
-        let r1 = Value::record("Foo", vec![Value::i32(1)], vec![Some("x".to_string())]);
-        let r2 = Value::record("Foo", vec![Value::i32(1)], vec![Some("x".to_string())]);
-        let r3 = Value::record("Bar", vec![Value::i32(1)], vec![Some("x".to_string())]);
-        assert!(r1.equals(&r2));
-        assert!(!r1.equals(&r3));
+        let mut a = ValueArena::new();
+        let v = a.i32(1);
+        let r1 = a.record("Foo", vec![v], vec![Some("x".to_string())]);
+        let v = a.i32(1);
+        let r2 = a.record("Foo", vec![v], vec![Some("x".to_string())]);
+        let v = a.i32(1);
+        let r3 = a.record("Bar", vec![v], vec![Some("x".to_string())]);
+        assert!(r1.equals(&r2, &a));
+        assert!(!r1.equals(&r3, &a));
     }
 
     #[test]
     fn test_equals_adt() {
-        let a1 = Value::adt("Option", "Some", vec![AdtField {
+        let mut a = ValueArena::new();
+        let v = a.i32(42);
+        let a1 = a.adt("Option", "Some", vec![AdtField {
             name: None,
-            value: Value::i32(42),
+            value: v,
         }]);
-        let a2 = Value::adt("Option", "Some", vec![AdtField {
+        let v = a.i32(42);
+        let a2 = a.adt("Option", "Some", vec![AdtField {
             name: None,
-            value: Value::i32(42),
+            value: v,
         }]);
-        let a3 = Value::adt("Option", "None", vec![]);
-        assert!(a1.equals(&a2));
-        assert!(!a1.equals(&a3));
+        let a3 = a.adt("Option", "None", vec![]);
+        assert!(a1.equals(&a2, &a));
+        assert!(!a1.equals(&a3, &a));
     }
 
     #[test]
     fn test_equals_range() {
-        let r1 = Value::range(1, 10, false);
-        let r2 = Value::range(1, 10, false);
-        let r3 = Value::range(1, 10, true);
-        assert!(r1.equals(&r2));
-        assert!(!r1.equals(&r3));
+        let mut a = ValueArena::new();
+        let r1 = a.range(1, 10, false);
+        let r2 = a.range(1, 10, false);
+        let r3 = a.range(1, 10, true);
+        assert!(r1.equals(&r2, &a));
+        assert!(!r1.equals(&r3, &a));
     }
 
     #[test]
     fn test_partial_eq_trait() {
-        assert_eq!(Value::i32(42), Value::i32(42));
-        assert_ne!(Value::i32(42), Value::i32(43));
-        assert_eq!(Value::str("x"), Value::str("x"));
+        // PartialEq 比较句柄身份：同一句柄相等；单例常量相等
+        let v = ValueHandle::TRUE;
+        assert_eq!(v, v);
+        assert_eq!(ValueHandle::NULL, ValueHandle::NULL);
+        assert_eq!(ValueHandle::VOID, ValueHandle::VOID);
+        assert_ne!(ValueHandle::NULL, ValueHandle::VOID);
     }
 
     // ---- deep_clone ----
 
     #[test]
     fn test_deep_clone_scalar() {
-        let v = Value::i32(42);
-        let c = v.deep_clone();
-        assert!(v.equals(&c));
+        let mut a = ValueArena::new();
+        let v = a.i32(42);
+        let c = v.deep_clone(&mut a);
+        assert!(v.equals(&c, &a));
         // 标量是 Copy，克隆后仍是同一变体
-        assert_eq!(c.as_i32(), Some(42));
+        assert_eq!(c.as_i32(&a), Some(42));
     }
 
     #[test]
     fn test_deep_clone_array() {
-        let v = Value::array(vec![Value::i32(1), Value::str("hello"), Value::bool(true)]);
-        let c = v.deep_clone();
-        assert!(v.equals(&c));
+        let mut a = ValueArena::new();
+        let e1 = a.i32(1);
+        let e2 = a.str("hello");
+        let e3 = a.bool(true);
+        let v = a.array(vec![e1, e2, e3]);
+        let c = v.deep_clone(&mut a);
+        assert!(v.equals(&c, &a));
         // 克隆后指针不同
-        assert!(!matches!(
-            (&v, &c),
-            (Value::Ref(a), Value::Ref(b)) if std::rc::Rc::ptr_eq(a, b)
-        ));
+        assert!(!Rc::ptr_eq(a.get_ref(v), a.get_ref(c)));
     }
 
     #[test]
     fn test_deep_clone_nested() {
-        let inner = Value::array(vec![Value::i32(1), Value::i32(2)]);
-        let outer = Value::array(vec![inner, Value::str("x")]);
-        let cloned = outer.deep_clone();
-        assert!(outer.equals(&cloned));
+        let mut a = ValueArena::new();
+        let i1 = a.i32(1);
+        let i2 = a.i32(2);
+        let inner = a.array(vec![i1, i2]);
+        let s = a.str("x");
+        let outer = a.array(vec![inner, s]);
+        let cloned = outer.deep_clone(&mut a);
+        assert!(outer.equals(&cloned, &a));
 
         // 修改克隆不影响原（语义验证：克隆是独立的）
-        if let Value::Ref(r) = &cloned {
-            if let HeapObj::Array(a) = r.as_ref() {
-                assert_eq!(a.elements.len(), 2);
-            }
-        }
+        let arr = cloned.as_array(&a).unwrap();
+        assert_eq!(arr.elements.len(), 2);
     }
 
     #[test]
     fn test_deep_clone_record() {
-        let r = Value::record(
+        let mut a = ValueArena::new();
+        let x = a.i32(1);
+        let y = a.i32(2);
+        let r = a.record(
             "Point",
-            vec![Value::i32(1), Value::i32(2)],
+            vec![x, y],
             vec![Some("x".to_string()), Some("y".to_string())],
         );
-        let c = r.deep_clone();
-        assert!(r.equals(&c));
+        let c = r.deep_clone(&mut a);
+        assert!(r.equals(&c, &a));
     }
 
     // ---- Display / Debug ----
 
     #[test]
     fn test_display() {
-        assert_eq!(format!("{}", Value::null()), "null");
-        assert_eq!(format!("{}", Value::void()), "()");
-        assert_eq!(format!("{}", Value::bool(true)), "true");
-        assert_eq!(format!("{}", Value::i32(42)), "42");
-        assert_eq!(format!("{}", Value::str("hello")), "hello");
-        assert_eq!(format!("{}", Value::from_rust_char('A')), "A");
+        let mut a = ValueArena::new();
+        let n = a.null();
+        let v = a.void();
+        let b = a.bool(true);
+        let i = a.i32(42);
+        let s = a.str("hello");
+        let c = a.from_rust_char('A');
+        assert_eq!(format!("{}", a.display(n)), "null");
+        assert_eq!(format!("{}", a.display(v)), "()");
+        assert_eq!(format!("{}", a.display(b)), "true");
+        assert_eq!(format!("{}", a.display(i)), "42");
+        assert_eq!(format!("{}", a.display(s)), "hello");
+        assert_eq!(format!("{}", a.display(c)), "A");
     }
 
     #[test]
     fn test_debug() {
-        assert_eq!(format!("{:?}", Value::i32(42)), "42");
-        assert_eq!(format!("{:?}", Value::i64(42)), "42i64");
-        assert_eq!(format!("{:?}", Value::u8(255)), "255u8");
+        let mut a = ValueArena::new();
+        let i = a.i32(42);
+        let i64v = a.i64(42);
+        let u = a.u8(255);
+        assert_eq!(format!("{:?}", a.debug(i)), "42");
+        assert_eq!(format!("{:?}", a.debug(i64v)), "42i64");
+        assert_eq!(format!("{:?}", a.debug(u)), "255u8");
     }
 
     // ---- Hash ----
@@ -3985,38 +5065,40 @@ mod value_tests {
     #[test]
     fn test_hash_consistency() {
         use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use std::hash::Hasher;
 
-        fn hash_of(v: &Value) -> u64 {
+        let mut a = ValueArena::new();
+
+        fn hash_of(arena: &ValueArena, v: ValueHandle) -> u64 {
             let mut h = DefaultHasher::new();
-            v.hash(&mut h);
+            arena.hash_value(v, &mut h);
             h.finish()
         }
 
-        // 相同标量哈希一致
-        assert_eq!(hash_of(&Value::i32(42)), hash_of(&Value::i32(42)));
-        assert_eq!(hash_of(&Value::str("x")), hash_of(&Value::str("x")));
+        // 相同标量按值哈希一致
+        let v1 = a.i32(42);
+        let v2 = a.i32(42);
+        assert_eq!(hash_of(&a, v1), hash_of(&a, v2));
         // 不同类型哈希不同
-        assert_ne!(hash_of(&Value::i32(1)), hash_of(&Value::i64(1)));
+        let v3 = a.i32(1);
+        let v4 = a.i64(1);
+        assert_ne!(hash_of(&a, v3), hash_of(&a, v4));
     }
 
     // ---- 内存语义 ----
 
     #[test]
     fn test_ref_sharing() {
-        let s1 = Value::str("shared");
-        let s2 = s1.clone();
-        // 克隆共享 Rc 指针
-        match (&s1, &s2) {
-            (Value::Ref(a), Value::Ref(b)) => assert!(Rc::ptr_eq(a, b)),
-            _ => panic!("expected Ref variants"),
-        }
-        assert!(s1.equals(&s2));
+        let mut a = ValueArena::new();
+        let s1 = a.str("shared");
+        let s2 = s1; // Copy：同一句柄，共享 Rc
+        assert!(Rc::ptr_eq(a.get_ref(s1), a.get_ref(s2)));
+        assert!(s1.equals(&s2, &a));
     }
 
     #[test]
     fn test_default_is_void() {
-        assert!(matches!(Value::default(), Value::Void));
+        assert!(ValueHandle::default().is_void());
     }
 }
 
@@ -4026,37 +5108,37 @@ mod scalar_tests {
 
     #[test]
     fn test_scalar_tag_count() {
-        assert_eq!(ScalarTag::all().len(), 18);
+        assert_eq!(ValueTag::all().len(), 18);
     }
 
     #[test]
     fn test_byte_width() {
-        assert_eq!(ScalarTag::Bool.byte_width(), 1);
-        assert_eq!(ScalarTag::Char.byte_width(), 4);
-        assert_eq!(ScalarTag::I8.byte_width(), 1);
-        assert_eq!(ScalarTag::I64.byte_width(), 8);
-        assert_eq!(ScalarTag::I128.byte_width(), 16);
-        assert_eq!(ScalarTag::F16.byte_width(), 2);
-        assert_eq!(ScalarTag::F128.byte_width(), 16);
+        assert_eq!(ValueTag::Bool.byte_width(), 1);
+        assert_eq!(ValueTag::Char.byte_width(), 4);
+        assert_eq!(ValueTag::I8.byte_width(), 1);
+        assert_eq!(ValueTag::I64.byte_width(), 8);
+        assert_eq!(ValueTag::I128.byte_width(), 16);
+        assert_eq!(ValueTag::F16.byte_width(), 2);
+        assert_eq!(ValueTag::F128.byte_width(), 16);
     }
 
     #[test]
     fn test_predicates() {
-        assert!(ScalarTag::I32.is_int());
-        assert!(!ScalarTag::Bool.is_int());
-        assert!(ScalarTag::F64.is_float());
-        assert!(ScalarTag::I32.is_signed());
-        assert!(!ScalarTag::U32.is_signed());
-        assert!(ScalarTag::Isize.is_signed());
+        assert!(ValueTag::I32.is_int());
+        assert!(!ValueTag::Bool.is_int());
+        assert!(ValueTag::F64.is_float());
+        assert!(ValueTag::I32.is_signed());
+        assert!(!ValueTag::U32.is_signed());
+        assert!(ValueTag::Isize.is_signed());
     }
 
     #[test]
     fn test_name_roundtrip() {
-        for tag in ScalarTag::all() {
+        for tag in ValueTag::all() {
             let name = tag.name();
-            assert_eq!(ScalarTag::from_name(name), Some(*tag));
+            assert_eq!(ValueTag::from_name(name), Some(*tag));
         }
-        assert_eq!(ScalarTag::from_name("not_a_type"), None);
+        assert_eq!(ValueTag::from_name("not_a_type"), None);
     }
 
     #[test]
@@ -4204,7 +5286,7 @@ mod cast_tests {
     #[test]
     fn test_cast_i32_to_i64() {
         let src = make_bytes(42);
-        let dst = cast_value(ScalarTag::I32, &src, ScalarTag::I64);
+        let dst = cast_value(ValueTag::I32, &src, ValueTag::I64);
         assert_eq!(i64::from_le_bytes({
             let mut b = [0u8; 8];
             b.copy_from_slice(&dst);
@@ -4215,7 +5297,7 @@ mod cast_tests {
     #[test]
     fn test_cast_i32_to_i8_wrap() {
         let src = make_bytes(300);
-        let dst = cast_value(ScalarTag::I32, &src, ScalarTag::I8);
+        let dst = cast_value(ValueTag::I32, &src, ValueTag::I8);
         assert_eq!(dst[0] as i8, 300i32 as i8);
     }
 
@@ -4223,7 +5305,7 @@ mod cast_tests {
     fn test_try_cast_i32_to_i8_overflow() {
         let src = make_bytes(300);
         assert_eq!(
-            try_cast_value(ScalarTag::I32, &src, ScalarTag::I8),
+            try_cast_value(ValueTag::I32, &src, ValueTag::I8),
             Err(CastError::Overflow)
         );
     }
@@ -4231,14 +5313,14 @@ mod cast_tests {
     #[test]
     fn test_try_cast_i32_to_i8_ok() {
         let src = make_bytes(100);
-        let dst = try_cast_value(ScalarTag::I32, &src, ScalarTag::I8).unwrap();
+        let dst = try_cast_value(ValueTag::I32, &src, ValueTag::I8).unwrap();
         assert_eq!(dst[0] as i8, 100);
     }
 
     #[test]
     fn test_cast_f64_to_i32_truncate() {
         let src = 3.7f64.to_le_bytes().to_vec();
-        let dst = cast_value(ScalarTag::F64, &src, ScalarTag::I32);
+        let dst = cast_value(ValueTag::F64, &src, ValueTag::I32);
         let v = i32::from_le_bytes({
             let mut b = [0u8; 4];
             b.copy_from_slice(&dst);
@@ -4250,7 +5332,7 @@ mod cast_tests {
     #[test]
     fn test_cast_f64_to_i32_nan() {
         let src = f64::NAN.to_le_bytes().to_vec();
-        let dst = cast_value(ScalarTag::F64, &src, ScalarTag::I32);
+        let dst = cast_value(ValueTag::F64, &src, ValueTag::I32);
         let v = i32::from_le_bytes({
             let mut b = [0u8; 4];
             b.copy_from_slice(&dst);
@@ -4262,7 +5344,7 @@ mod cast_tests {
     #[test]
     fn test_cast_f64_to_i32_inf() {
         let src = f64::INFINITY.to_le_bytes().to_vec();
-        let dst = cast_value(ScalarTag::F64, &src, ScalarTag::I32);
+        let dst = cast_value(ValueTag::F64, &src, ValueTag::I32);
         let v = i32::from_le_bytes({
             let mut b = [0u8; 4];
             b.copy_from_slice(&dst);
@@ -4275,7 +5357,7 @@ mod cast_tests {
     fn test_try_cast_f64_to_i32_nan() {
         let src = f64::NAN.to_le_bytes().to_vec();
         assert_eq!(
-            try_cast_value(ScalarTag::F64, &src, ScalarTag::I32),
+            try_cast_value(ValueTag::F64, &src, ValueTag::I32),
             Err(CastError::Overflow)
         );
     }
@@ -4283,7 +5365,7 @@ mod cast_tests {
     #[test]
     fn test_cast_bool_to_int() {
         let src = vec![1u8];
-        let dst = cast_value(ScalarTag::Bool, &src, ScalarTag::I32);
+        let dst = cast_value(ValueTag::Bool, &src, ValueTag::I32);
         let v = i32::from_le_bytes({
             let mut b = [0u8; 4];
             b.copy_from_slice(&dst);
@@ -4295,18 +5377,18 @@ mod cast_tests {
     #[test]
     fn test_cast_int_to_bool() {
         let src = make_bytes(0);
-        let dst = cast_value(ScalarTag::I32, &src, ScalarTag::Bool);
+        let dst = cast_value(ValueTag::I32, &src, ValueTag::Bool);
         assert_eq!(dst[0], 0);
 
         let src = make_bytes(42);
-        let dst = cast_value(ScalarTag::I32, &src, ScalarTag::Bool);
+        let dst = cast_value(ValueTag::I32, &src, ValueTag::Bool);
         assert_eq!(dst[0], 1);
     }
 
     #[test]
     fn test_cast_char_to_int() {
         let src = 65u32.to_le_bytes().to_vec();
-        let dst = cast_value(ScalarTag::Char, &src, ScalarTag::I64);
+        let dst = cast_value(ValueTag::Char, &src, ValueTag::I64);
         let v = i64::from_le_bytes({
             let mut b = [0u8; 8];
             b.copy_from_slice(&dst);
@@ -4319,7 +5401,7 @@ mod cast_tests {
     fn test_try_cast_int_to_char_invalid() {
         let src = 0x110000u32.to_le_bytes().to_vec();
         assert_eq!(
-            try_cast_value(ScalarTag::I32, &src, ScalarTag::Char),
+            try_cast_value(ValueTag::I32, &src, ValueTag::Char),
             Err(CastError::InvalidCodepoint)
         );
     }
@@ -4327,7 +5409,7 @@ mod cast_tests {
     #[test]
     fn test_try_cast_int_to_char_valid() {
         let src = 65i32.to_le_bytes().to_vec();
-        let dst = try_cast_value(ScalarTag::I32, &src, ScalarTag::Char).unwrap();
+        let dst = try_cast_value(ValueTag::I32, &src, ValueTag::Char).unwrap();
         let v = u32::from_le_bytes({
             let mut b = [0u8; 4];
             b.copy_from_slice(&dst);
@@ -4338,7 +5420,7 @@ mod cast_tests {
 
     #[test]
     fn test_parse_str_int() {
-        let dst = parse_str("42", ScalarTag::I32).unwrap();
+        let dst = parse_str("42", ValueTag::I32).unwrap();
         let v = i32::from_le_bytes({
             let mut b = [0u8; 4];
             b.copy_from_slice(&dst);
@@ -4349,16 +5431,16 @@ mod cast_tests {
 
     #[test]
     fn test_parse_str_bool() {
-        let dst = parse_str("true", ScalarTag::Bool).unwrap();
+        let dst = parse_str("true", ValueTag::Bool).unwrap();
         assert_eq!(dst[0], 1);
 
-        let dst = parse_str("false", ScalarTag::Bool).unwrap();
+        let dst = parse_str("false", ValueTag::Bool).unwrap();
         assert_eq!(dst[0], 0);
     }
 
     #[test]
     fn test_parse_str_float() {
-        let dst = parse_str("2.5", ScalarTag::F64).unwrap();
+        let dst = parse_str("2.5", ValueTag::F64).unwrap();
         let v = f64::from_le_bytes({
             let mut b = [0u8; 8];
             b.copy_from_slice(&dst);
@@ -4369,7 +5451,7 @@ mod cast_tests {
 
     #[test]
     fn test_parse_str_fail() {
-        assert!(parse_str("abc", ScalarTag::I32).is_err());
+        assert!(parse_str("abc", ValueTag::I32).is_err());
     }
 }
 
@@ -4985,9 +6067,10 @@ mod allocator_tests {
     #[test]
     fn test_alloc_array() {
         let alloc = DefaultAllocator;
-        let arr = alloc.alloc_array(vec![Value::i32(1), Value::i32(2), Value::i32(3)]);
+        let mut arena = ValueArena::new();
+        let arr = alloc.alloc_array(vec![arena.i32(1), arena.i32(2), arena.i32(3)]);
         assert_eq!(arr.len(), 3);
-        assert_eq!(arr[0].as_i32(), Some(1));
+        assert_eq!(arr[0].as_i32(&arena), Some(1));
     }
 
     #[test]
@@ -5000,9 +6083,10 @@ mod allocator_tests {
     #[test]
     fn test_alloc_value_default_impl() {
         let alloc = DefaultAllocator;
-        let v = Value::i32(42);
+        let mut arena = ValueArena::new();
+        let v = arena.i32(42);
         let allocated = alloc.alloc_value(v);
-        assert_eq!(allocated.as_i32(), Some(42));
+        assert_eq!(allocated.as_i32(&arena), Some(42));
     }
 
     #[test]
@@ -5035,58 +6119,61 @@ mod union_tests {
 
     #[test]
     fn test_union_construct_access_roundtrip() {
-        assert_eq!(Value::i8(-5).as_i8(), Some(-5));
-        assert_eq!(Value::i16(-1000).as_i16(), Some(-1000));
-        assert_eq!(Value::i32(42).as_i32(), Some(42));
-        assert_eq!(Value::i64(i64::MAX).as_i64(), Some(i64::MAX));
-        assert_eq!(Value::i128(i128::MIN).as_i128(), Some(i128::MIN));
-        assert_eq!(Value::u8(255).as_u8(), Some(255));
-        assert_eq!(Value::u16(65535).as_u16(), Some(65535));
-        assert_eq!(Value::u32(u32::MAX).as_u32(), Some(u32::MAX));
-        assert_eq!(Value::u64(u64::MAX).as_u64(), Some(u64::MAX));
-        assert_eq!(Value::u128(u128::MAX).as_u128(), Some(u128::MAX));
-        assert_eq!(Value::f32(3.14).as_f32(), Some(3.14));
-        assert_eq!(Value::f64(2.71828).as_f64(), Some(2.71828));
+        let mut a = ValueArena::new();
+        assert_eq!(a.i8(-5).as_i8(&a), Some(-5));
+        assert_eq!(a.i16(-1000).as_i16(&a), Some(-1000));
+        assert_eq!(a.i32(42).as_i32(&a), Some(42));
+        assert_eq!(a.i64(i64::MAX).as_i64(&a), Some(i64::MAX));
+        assert_eq!(a.i128(i128::MIN).as_i128(&a), Some(i128::MIN));
+        assert_eq!(a.u8(255).as_u8(&a), Some(255));
+        assert_eq!(a.u16(65535).as_u16(&a), Some(65535));
+        assert_eq!(a.u32(u32::MAX).as_u32(&a), Some(u32::MAX));
+        assert_eq!(a.u64(u64::MAX).as_u64(&a), Some(u64::MAX));
+        assert_eq!(a.u128(u128::MAX).as_u128(&a), Some(u128::MAX));
+        assert_eq!(a.f32(1.5).as_f32(&a), Some(1.5));
+        assert_eq!(a.f64(2.5).as_f64(&a), Some(2.5));
     }
 
     #[test]
     fn test_union_wrong_tag_returns_none() {
-        let v = Value::i32(42);
-        assert_eq!(v.as_i64(), None);
-        assert_eq!(v.as_u32(), None);
-        assert_eq!(v.as_f32(), None);
-        assert_eq!(v.as_bool(), None);
-        assert_eq!(v.as_char(), None);
+        let mut a = ValueArena::new();
+        let v = a.i32(42);
+        assert_eq!(v.as_i64(&a), None);
+        assert_eq!(v.as_u32(&a), None);
+        assert_eq!(v.as_f32(&a), None);
+        assert_eq!(v.as_bool(&a), None);
+        assert_eq!(v.as_char(&a), None);
     }
 
     #[test]
     fn test_f16_f128_bits_roundtrip() {
+        let mut a = ValueArena::new();
         let f16 = F16::from_f32(1.5);
         assert_eq!(f16.to_f32(), 1.5);
-        let v = Value::f16(f16);
-        assert_eq!(v.as_f16(), Some(f16));
+        let v = a.f16(f16);
+        assert_eq!(v.as_f16(&a), Some(f16));
 
         // F128 往返测试（已修复掩码 bug）
-        let f128 = F128::from_f64(3.14159);
-        assert_eq!(f128.to_f64(), 3.14159);
-        let v = Value::f128(f128);
-        assert_eq!(v.as_f128(), Some(f128));
+        let f128 = F128::from_f64(1.5);
+        assert_eq!(f128.to_f64(), 1.5);
+        let v = a.f128(f128);
+        assert_eq!(v.as_f128(&a), Some(f128));
     }
 
     #[test]
     fn test_char_roundtrip() {
+        let mut a = ValueArena::new();
         let c = Char::from_codepoint(0x4E2D).unwrap(); // '中'
-        let v = Value::char(c);
-        assert_eq!(v.as_char(), Some(c));
-        assert_eq!(v.as_i32(), None); // char 不是 int
+        let v = a.char(c);
+        assert_eq!(v.as_char(&a), Some(c));
+        assert_eq!(v.as_i32(&a), None); // char 不是 int
     }
 
     #[test]
     fn test_value_size() {
-        // Value = enum tag + ScalarValue(16B, align 16) + ScalarTag(1B)
-        // 因 i128 要求 16 字节对齐，整体为 32 字节
-        let size = std::mem::size_of::<Value>();
-        assert!(size <= 32, "Value size should be <= 32 bytes, got {}", size);
+        // ValueHandle 是 4B 索引（u32）
+        let size = std::mem::size_of::<ValueHandle>();
+        assert_eq!(size, 4, "ValueHandle should be 4 bytes, got {}", size);
     }
 }
 
@@ -5100,42 +6187,204 @@ mod deep_clone_cache_tests {
 
     #[test]
     fn test_deep_clone_diamond_shares_subgraph() {
+        let mut a = ValueArena::new();
         // 菱形引用：outer 两次引用同一 inner
-        let inner = Value::array(vec![Value::i32(1), Value::i32(2)]);
-        let outer = Value::array(vec![
-            Value::from_ref(inner.as_ref().unwrap().clone()),
-            Value::from_ref(inner.as_ref().unwrap().clone()),
-        ]);
+        let i1 = a.i32(1);
+        let i2 = a.i32(2);
+        let inner = a.array(vec![i1, i2]);
+        let inner_rc = a.get_ref(inner).clone();
+        let e0 = a.from_ref(inner_rc.clone());
+        let e1 = a.from_ref(inner_rc.clone());
+        let outer = a.array(vec![e0, e1]);
 
-        let cloned = outer.deep_clone();
+        let cloned = outer.deep_clone(&mut a);
 
         // 克隆后两个 inner 应共享同一 Rc（ptr_eq）
-        if let Value::Ref(r) = &cloned {
-            if let HeapObj::Array(a) = r.as_ref() {
-                if let (Value::Ref(r1), Value::Ref(r2)) = (&a.elements[0], &a.elements[1]) {
-                    assert!(Rc::ptr_eq(r1, r2), "cloned diamond should share subgraph");
-                    return;
-                }
-            }
-        }
-        panic!("expected cloned diamond structure");
+        let arr = cloned.as_array(&a).unwrap();
+        let c0 = arr.elements[0];
+        let c1 = arr.elements[1];
+        let r0 = a.get_ref(c0).clone();
+        let r1 = a.get_ref(c1).clone();
+        assert!(Rc::ptr_eq(&r0, &r1), "cloned diamond should share subgraph");
     }
 
     #[test]
     fn test_deep_clone_independent_objects_not_shared() {
-        let a = Value::array(vec![Value::i32(1)]);
-        let b = Value::array(vec![Value::i32(1)]);
-        let outer = Value::array(vec![a.clone(), b.clone()]);
-        let cloned = outer.deep_clone();
+        let mut a = ValueArena::new();
+        let i1 = a.i32(1);
+        let arr1 = a.array(vec![i1]);
+        let i2 = a.i32(1);
+        let arr2 = a.array(vec![i2]);
+        let outer = a.array(vec![arr1, arr2]);
+        let cloned = outer.deep_clone(&mut a);
 
-        if let Value::Ref(r) = &cloned {
-            if let HeapObj::Array(a) = r.as_ref() {
-                if let (Value::Ref(r1), Value::Ref(r2)) = (&a.elements[0], &a.elements[1]) {
-                    assert!(!Rc::ptr_eq(r1, r2), "independent objects should not share");
-                    return;
-                }
-            }
-        }
-        panic!("expected structure");
+        let arr = cloned.as_array(&a).unwrap();
+        let c0 = arr.elements[0];
+        let c1 = arr.elements[1];
+        let r0 = a.get_ref(c0).clone();
+        let r1 = a.get_ref(c1).clone();
+        assert!(!Rc::ptr_eq(&r0, &r1), "independent objects should not share");
+    }
+}
+
+#[cfg(test)]
+mod simd_internal_tests {
+    use super::*;
+
+    #[test]
+    fn test_simd_eq_i32() {
+        let a = vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9];
+        let b = vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert!(simd_eq_i32(&a, &b));
+        let c = vec![1i32, 2, 3, 4, 5, 6, 7, 8, 0];
+        assert!(!simd_eq_i32(&a, &c));
+    }
+
+    #[test]
+    fn test_simd_eq_i32_empty_and_mismatched_len() {
+        assert!(simd_eq_i32(&[], &[]));
+        assert!(!simd_eq_i32(&[1, 2], &[1]));
+    }
+
+    #[test]
+    fn test_simd_eq_i64_large() {
+        let a: Vec<i64> = (0..10000).collect();
+        let b: Vec<i64> = (0..10000).collect();
+        assert!(simd_eq_i64(&a, &b));
+        let mut c = b.clone();
+        c[9999] = 0;
+        assert!(!simd_eq_i64(&a, &c));
+    }
+
+    #[test]
+    fn test_simd_eq_f32_bits() {
+        let a = vec![1.0f32, 2.0, 3.0, f32::NAN, 5.0];
+        let b = vec![1.0f32, 2.0, 3.0, f32::NAN, 5.0];
+        assert!(simd_eq_f32_bits(&a, &b)); // NaN bits 相等
+    }
+
+    #[test]
+    fn test_simd_eq_f64_bits() {
+        let a = vec![1.0f64, 2.0, 3.0, f64::NAN, 5.0];
+        let b = vec![1.0f64, 2.0, 3.0, f64::NAN, 5.0];
+        assert!(simd_eq_f64_bits(&a, &b)); // NaN bits 相等
+        let c = vec![1.0f64, 2.0, 3.0, 0.0, 5.0];
+        assert!(!simd_eq_f64_bits(&a, &c));
+    }
+
+    #[test]
+    fn test_simd_eq_i32_large_parallel() {
+        let a: Vec<i32> = (0..20000).collect();
+        let b: Vec<i32> = (0..20000).collect();
+        assert!(simd_eq_i32(&a, &b));
+        let mut c = b.clone();
+        c[15000] = -1;
+        assert!(!simd_eq_i32(&a, &c));
+    }
+
+    #[test]
+    fn test_soa_equals_integration() {
+        let mut arena = ValueArena::new();
+        let elems1: Vec<ValueHandle> = (0..100).map(|i| arena.alloc_i32(i)).collect();
+        let elems2: Vec<ValueHandle> = (0..100).map(|i| arena.alloc_i32(i)).collect();
+        let mut arr1 = ArrayValue::new(elems1);
+        let mut arr2 = ArrayValue::new(elems2);
+        arena.optimize_array_soa(&mut arr1);
+        arena.optimize_array_soa(&mut arr2);
+        // 通过 heap_equals 走 SoA 快路径
+        let h1 = arena.alloc_ref(HeapObj::Array(arr1));
+        let h2 = arena.alloc_ref(HeapObj::Array(arr2));
+        assert!(h1.equals(&h2, &arena));
+    }
+
+    #[test]
+    fn test_soa_equals_inequality_integration() {
+        let mut arena = ValueArena::new();
+        let elems1: Vec<ValueHandle> = (0..100).map(|i| arena.alloc_i32(i)).collect();
+        let elems2: Vec<ValueHandle> = (0..100).map(|i| arena.alloc_i32(if i == 50 { 999 } else { i })).collect();
+        let mut arr1 = ArrayValue::new(elems1);
+        let mut arr2 = ArrayValue::new(elems2);
+        arena.optimize_array_soa(&mut arr1);
+        arena.optimize_array_soa(&mut arr2);
+        let h1 = arena.alloc_ref(HeapObj::Array(arr1));
+        let h2 = arena.alloc_ref(HeapObj::Array(arr2));
+        assert!(!h1.equals(&h2, &arena));
+    }
+
+    #[test]
+    fn test_soa_hash_integration() {
+        let mut arena = ValueArena::new();
+        let elems: Vec<ValueHandle> = (0..100).map(|i| arena.alloc_i64(i)).collect();
+        let mut arr = ArrayValue::new(elems);
+        arena.optimize_array_soa(&mut arr);
+        // 确保能 hash 不 panic（Hash impl 在 HeapObj 上）
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        HeapObj::Array(arr).hash(&mut hasher);
+    }
+
+    #[test]
+    fn test_soa_hash_consistency() {
+        // 两个值相同的 SoA 数组应产生相同哈希
+        let mut arena1 = ValueArena::new();
+        let elems1: Vec<ValueHandle> = (0..50).map(|i| arena1.alloc_i32(i)).collect();
+        let mut arr1 = ArrayValue::new(elems1);
+        arena1.optimize_array_soa(&mut arr1);
+        let mut h1 = std::collections::hash_map::DefaultHasher::new();
+        HeapObj::Array(arr1).hash(&mut h1);
+        let hash1 = std::collections::hash_map::DefaultHasher::finish(&h1);
+
+        let mut arena2 = ValueArena::new();
+        let elems2: Vec<ValueHandle> = (0..50).map(|i| arena2.alloc_i32(i)).collect();
+        let mut arr2 = ArrayValue::new(elems2);
+        arena2.optimize_array_soa(&mut arr2);
+        let mut h2 = std::collections::hash_map::DefaultHasher::new();
+        HeapObj::Array(arr2).hash(&mut h2);
+        let hash2 = std::collections::hash_map::DefaultHasher::finish(&h2);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_soa_deep_clone_integration() {
+        let mut arena = ValueArena::new();
+        let elems: Vec<ValueHandle> = (0..100).map(|i| arena.alloc_f64(i as f64)).collect();
+        let mut arr = ArrayValue::new(elems);
+        arena.optimize_array_soa(&mut arr);
+        let h = arena.alloc_ref(HeapObj::Array(arr));
+        let cloned = h.deep_clone(&mut arena);
+        assert!(h.equals(&cloned, &arena));
+    }
+
+    #[test]
+    fn test_soa_deep_clone_independent() {
+        // deep_clone 后修改克隆不影响原对象
+        let mut arena = ValueArena::new();
+        let elems: Vec<ValueHandle> = (0..10).map(|i| arena.alloc_i32(i)).collect();
+        let mut arr = ArrayValue::new(elems);
+        arena.optimize_array_soa(&mut arr);
+        let h = arena.alloc_ref(HeapObj::Array(arr));
+        let cloned = h.deep_clone(&mut arena);
+        assert!(h.equals(&cloned, &arena));
+    }
+
+    #[test]
+    fn test_try_simd_soa_equals_type_mismatch() {
+        let a = ScalarSoA::I32(vec![1, 2, 3]);
+        let b = ScalarSoA::I64(vec![1, 2, 3]);
+        assert_eq!(try_simd_soa_equals(&a, &b), None);
+    }
+
+    #[test]
+    fn test_try_simd_soa_equals_bool_and_char() {
+        let a = ScalarSoA::Bool(vec![true, false, true]);
+        let b = ScalarSoA::Bool(vec![true, false, true]);
+        assert_eq!(try_simd_soa_equals(&a, &b), Some(true));
+
+        let c = ScalarSoA::Char(vec![65, 66, 67]);
+        let d = ScalarSoA::Char(vec![65, 66, 67]);
+        assert_eq!(try_simd_soa_equals(&c, &d), Some(true));
+
+        let e = ScalarSoA::Char(vec![65, 66, 68]);
+        assert_eq!(try_simd_soa_equals(&c, &e), Some(false));
     }
 }
