@@ -28,7 +28,7 @@ use crate::TypeDesc::{
     TypeDescriptor, TypeDescriptorPool,
     BOOL_DESC, CHAR_DESC, F64_DESC, I32_DESC, NULL_DESC, VOID_DESC,
 };
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
 // =========================================================================
@@ -840,7 +840,7 @@ pub struct EnvId(pub u32);
 
 /// 类型环境节点：自身绑定 + 可选父环境（通过索引共享）。
 struct EnvNode {
-    bindings: HashMap<String, TypeHandle>,
+    bindings: FxHashMap<String, TypeHandle>,
     parent: Option<EnvId>,
 }
 
@@ -864,7 +864,7 @@ impl EnvArena {
     pub fn root(&mut self) -> EnvId {
         let id = EnvId(self.envs.len() as u32);
         self.envs.push(EnvNode {
-            bindings: HashMap::new(),
+            bindings: FxHashMap::default(),
             parent: None,
         });
         id
@@ -874,7 +874,7 @@ impl EnvArena {
     pub fn child(&mut self, parent: EnvId) -> EnvId {
         let id = EnvId(self.envs.len() as u32);
         self.envs.push(EnvNode {
-            bindings: HashMap::new(),
+            bindings: FxHashMap::default(),
             parent: Some(parent),
         });
         id
@@ -1144,9 +1144,9 @@ pub struct MonomorphInstance {
     pub return_type: &'static TypeDescriptor,
     pub is_async: bool,
     /// 实例本地表达式类型表（key = AST Expr 句柄地址）
-    pub expr_types: HashMap<u64, ExprInfo>,
+    pub expr_types: FxHashMap<u64, ExprInfo>,
     /// 字段访问元信息（key = AST field_access Expr 句柄地址）
-    pub field_accesses: HashMap<u64, FieldAccessInfo>,
+    pub field_accesses: FxHashMap<u64, FieldAccessInfo>,
 }
 
 /// 协程元数据（async 函数状态机变换产物）。
@@ -1190,10 +1190,10 @@ impl SemaError {
 /// sema 产出的图构建元信息。
 ///
 /// 从"检查器"升级为"图构建驱动器"，输出图构建所需的全部元信息。
-/// 所有字段均为自有数据（`Box<str>` / `Vec` / `HashMap`），无需额外 arena 所有权。
+/// 所有字段均为自有数据（`Box<str>` / `Vec` / `FxHashMap`），无需额外 arena 所有权。
 pub struct SemaResult {
     /// 表达式 → 类型信息（决定通道宽度），key = AST 表达式句柄地址
-    pub expr_types: HashMap<u64, ExprInfo>,
+    pub expr_types: FxHashMap<u64, ExprInfo>,
     /// 编译期错误
     pub errors: Vec<SemaError>,
     /// 是否有错误
@@ -1201,45 +1201,45 @@ pub struct SemaResult {
     /// 类型定义表（替代 IRBuilder 的 type_table + ctor_table）
     pub type_defs: Vec<TypeDefInfo>,
     /// 类型名 → type_defs 索引
-    pub type_def_index: HashMap<String, u16>,
+    pub type_def_index: FxHashMap<String, u16>,
     /// Trait 定义表
     pub trait_defs: Vec<TraitDefInfo>,
     /// Trait 名 → trait_defs 索引
-    pub trait_def_index: HashMap<String, u16>,
+    pub trait_def_index: FxHashMap<String, u16>,
     /// 函数签名表
     pub func_sigs: Vec<FuncSigInfo>,
     /// 函数名 → func_sigs 索引
-    pub func_sig_index: HashMap<String, u16>,
+    pub func_sig_index: FxHashMap<String, u16>,
     /// 协程元数据表
     pub coroutine_metas: Vec<CoroutineMeta>,
     /// 构造器名 → (type_def_index << 16 | ctor_index)
-    pub ctor_def_index: HashMap<String, u32>,
+    pub ctor_def_index: FxHashMap<String, u32>,
     /// import 别名表：短名 → 别名目标
-    pub import_aliases: HashMap<String, AliasTarget>,
+    pub import_aliases: FxHashMap<String, AliasTarget>,
     /// 单态化实例表
     pub monomorph_instances: Vec<MonomorphInstance>,
     /// 单态化实例名 → monomorph_instances 索引
-    pub monomorph_index: HashMap<String, u32>,
+    pub monomorph_index: FxHashMap<String, u32>,
     /// 全局 TypeDescriptor 表
     pub type_descriptors: Vec<&'static TypeDescriptor>,
     /// 动态类型描述符池（用户类型 / nullable 描述符）
     pub type_desc_pool: TypeDescriptorPool,
     /// 调用点 → 实例映射
-    pub call_instantiations: HashMap<u64, u32>,
+    pub call_instantiations: FxHashMap<u64, u32>,
     /// 字段访问元信息（全局，key = AST field_access Expr 句柄地址）
-    pub field_accesses: HashMap<u64, FieldAccessInfo>,
+    pub field_accesses: FxHashMap<u64, FieldAccessInfo>,
     /// 方法分派元信息（key = AST call Expr 句柄地址）
-    pub method_dispatches: HashMap<u64, DispatchInfo>,
+    pub method_dispatches: FxHashMap<u64, DispatchInfo>,
     /// typeof 已解析元信息
-    pub typeof_metas: HashMap<u64, TypeofMeta>,
+    pub typeof_metas: FxHashMap<u64, TypeofMeta>,
     /// reflect 已解析元信息
-    pub reflect_metas: HashMap<u64, ReflectMeta>,
+    pub reflect_metas: FxHashMap<u64, ReflectMeta>,
     /// 已解析类型描述符（key = AST Expr 句柄地址）
-    pub resolved_type_descs: HashMap<u64, &'static TypeDescriptor>,
+    pub resolved_type_descs: FxHashMap<u64, &'static TypeDescriptor>,
     /// 字段 ID 映射（key = "type_name\x00field_name" → field_id）
     /// ADT/newtype/error_newtype: `__tag=0`，字段从 1 开始
     /// Record: 字段按声明顺序 0..N-1
-    pub field_id_map: HashMap<String, u16>,
+    pub field_id_map: FxHashMap<String, u16>,
     /// witness table（trait 实现的静态分派表）。
     ///
     /// sema 检查期间由 InferContext 维护并跨模块累积，check 完成后
@@ -1256,29 +1256,29 @@ impl Default for SemaResult {
 impl SemaResult {
     pub fn new() -> Self {
         SemaResult {
-            expr_types: HashMap::new(),
+            expr_types: FxHashMap::default(),
             errors: Vec::new(),
             has_error: false,
             type_defs: Vec::new(),
-            type_def_index: HashMap::new(),
+            type_def_index: FxHashMap::default(),
             trait_defs: Vec::new(),
-            trait_def_index: HashMap::new(),
+            trait_def_index: FxHashMap::default(),
             func_sigs: Vec::new(),
-            func_sig_index: HashMap::new(),
+            func_sig_index: FxHashMap::default(),
             coroutine_metas: Vec::new(),
-            ctor_def_index: HashMap::new(),
-            import_aliases: HashMap::new(),
+            ctor_def_index: FxHashMap::default(),
+            import_aliases: FxHashMap::default(),
             monomorph_instances: Vec::new(),
-            monomorph_index: HashMap::new(),
+            monomorph_index: FxHashMap::default(),
             type_descriptors: Vec::new(),
             type_desc_pool: TypeDescriptorPool::new(),
-            call_instantiations: HashMap::new(),
-            field_accesses: HashMap::new(),
-            method_dispatches: HashMap::new(),
-            typeof_metas: HashMap::new(),
-            reflect_metas: HashMap::new(),
-            resolved_type_descs: HashMap::new(),
-            field_id_map: HashMap::new(),
+            call_instantiations: FxHashMap::default(),
+            field_accesses: FxHashMap::default(),
+            method_dispatches: FxHashMap::default(),
+            typeof_metas: FxHashMap::default(),
+            reflect_metas: FxHashMap::default(),
+            resolved_type_descs: FxHashMap::default(),
+            field_id_map: FxHashMap::default(),
             witness_table: WitnessTable::new(),
         }
     }
@@ -2063,7 +2063,7 @@ pub fn register_builtin_type_descriptors(sema_result: &mut SemaResult) {
 /// 类型绑定栈帧：泛型参数名 → TypeHandle（通常为 rigid TypeVar）
 #[derive(Debug, Default)]
 pub struct TypeBindingFrame {
-    bindings: HashMap<Box<str>, TypeHandle>,
+    bindings: FxHashMap<Box<str>, TypeHandle>,
 }
 
 impl TypeBindingFrame {
@@ -2189,7 +2189,7 @@ pub struct InferContext<'a> {
     pub witness_table: WitnessTable,
     /// 已注册的模块路径集合（用于 ModuleRef 逐级校验）
     /// 存储完整模块路径（如 "std.io.File"），import/register_module_aliases 时填充
-    pub known_module_paths: HashSet<String>,
+    pub known_module_paths: FxHashSet<String>,
 }
 
 impl<'a> InferContext<'a> {
@@ -2204,7 +2204,7 @@ impl<'a> InferContext<'a> {
             solver: ConstraintSolver::new(),
             flow_ctx: FlowContext::new(),
             witness_table: WitnessTable::new(),
-            known_module_paths: HashSet::new(),
+            known_module_paths: FxHashSet::default(),
         }
     }
 
@@ -2370,7 +2370,7 @@ impl<'a> InferContext<'a> {
         }
 
         // 1. 为每个泛型参数分配 fresh 非刚性 TypeVar，建立 rigid idx → fresh var 映射
-        let mut subst: HashMap<u32, TypeHandle> = HashMap::new();
+        let mut subst: FxHashMap<u32, TypeHandle> = FxHashMap::default();
         let type_args: Vec<TypeHandle> = generic_params
             .iter()
             .map(|&rigid_ty| {
@@ -2403,7 +2403,7 @@ impl<'a> InferContext<'a> {
 
     /// 递归收集类型中的所有 TypeVar idx，填入 subst（值为占位 TypeHandle(0)，仅用 key）。
     #[allow(dead_code)]
-    fn collect_type_vars(&self, ty: TypeHandle, subst: &mut HashMap<u32, TypeHandle>) {
+    fn collect_type_vars(&self, ty: TypeHandle, subst: &mut FxHashMap<u32, TypeHandle>) {
         let resolved = self.arena.resolve(ty);
         match self.arena.get(resolved) {
             ConcreteType::TypeVar(idx) => {
@@ -2453,7 +2453,7 @@ impl<'a> InferContext<'a> {
     ///
     /// 递归遍历复合类型，替换匹配的 TypeVar。用于将形参的 rigid var 替换为
     /// 调用点的 fresh 非刚性 var，使其可被 unify 绑定。
-    fn substitute_type(&mut self, ty: TypeHandle, subst: &HashMap<u32, TypeHandle>) -> TypeHandle {
+    fn substitute_type(&mut self, ty: TypeHandle, subst: &FxHashMap<u32, TypeHandle>) -> TypeHandle {
         let resolved = self.arena.resolve(ty);
         match self.arena.get(resolved).clone() {
             ConcreteType::TypeVar(idx) => {
@@ -3167,9 +3167,9 @@ pub fn find_instance(
 struct WalkCtx<'a> {
     ast: &'a AstArena<'a>,
     /// 函数名 → FunDecl 引用，用于推导 type_args 时查询参数类型注解与返回类型
-    func_decls: HashMap<&'a str, &'a Spanned<Decl<'a>>>,
+    func_decls: FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
     /// 循环检测：正在实例化的 cache_key → instance_id（前向引用支持）
-    in_progress: HashMap<String, u32>,
+    in_progress: FxHashMap<String, u32>,
 }
 
 /// 由 `ExprInfo` 推导对应 `TypeDescriptor`（隐式 type_args 推断用）。
@@ -3248,7 +3248,7 @@ fn infer_type_args<'a>(
         _ => unreachable!("func_decls only stores FunDecl"),
     };
 
-    let mut name_to_td: HashMap<&str, &'static TypeDescriptor> = HashMap::new();
+    let mut name_to_td: FxHashMap<&str, &'static TypeDescriptor> = FxHashMap::default();
 
     let is_type_param = |name: &str| sig.type_params.iter().any(|tp| tp.as_ref() == name);
 
@@ -3407,8 +3407,8 @@ fn get_or_create_instance<'a>(
     type_args: &[&'static TypeDescriptor],
     fd_decl: &'a Spanned<Decl<'a>>,
     ast: &'a AstArena<'a>,
-    func_decls: &HashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    in_progress: &mut HashMap<String, u32>,
+    func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
+    in_progress: &mut FxHashMap<String, u32>,
     sema_result: &mut SemaResult,
 ) -> u32 {
     let cache_key = build_cache_key(func_name, type_args);
@@ -3453,8 +3453,8 @@ fn get_or_create_instance<'a>(
         chan_layout: ChanLayout::empty(),
         return_type: return_td,
         is_async: fd.is_async,
-        expr_types: HashMap::new(),
-        field_accesses: HashMap::new(),
+        expr_types: FxHashMap::default(),
+        field_accesses: FxHashMap::default(),
     };
 
     // 4. 标记为正在实例化（前向引用支持）
@@ -3499,8 +3499,8 @@ fn process_call<'a>(
     type_args_hint: Option<&[AstTypeRef]>,
     call_expr: ExprId,
     ast: &'a AstArena<'a>,
-    func_decls: &HashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    in_progress: &mut HashMap<String, u32>,
+    func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
+    in_progress: &mut FxHashMap<String, u32>,
     sema_result: &mut SemaResult,
 ) {
     // 仅处理直接标识符调用：foo(args) 或 foo<T>(args)
@@ -3527,7 +3527,7 @@ fn process_call<'a>(
     let ctx = WalkCtx {
         ast,
         func_decls: func_decls.clone(),
-        in_progress: HashMap::new(),
+        in_progress: FxHashMap::default(),
     };
     let type_args = infer_type_args(func_name, arguments, type_args_hint, &sig, &ctx, sema_result);
 
@@ -3560,8 +3560,8 @@ fn process_method_call<'a>(
     type_args_hint: Option<&[AstTypeRef]>,
     call_expr: ExprId,
     ast: &'a AstArena<'a>,
-    func_decls: &HashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    in_progress: &mut HashMap<String, u32>,
+    func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
+    in_progress: &mut FxHashMap<String, u32>,
     sema_result: &mut SemaResult,
 ) {
     // 直接以方法名查 func_sig（覆盖同名顶层函数的罕见场景）
@@ -3579,7 +3579,7 @@ fn process_method_call<'a>(
     let ctx = WalkCtx {
         ast,
         func_decls: func_decls.clone(),
-        in_progress: HashMap::new(),
+        in_progress: FxHashMap::default(),
     };
     let type_args = infer_type_args(method, arguments, type_args_hint, &sig, &ctx, sema_result);
 
@@ -3899,8 +3899,8 @@ pub fn collect_monomorph_instances<'a>(
 
     let mut ctx = WalkCtx {
         ast: &module.arena,
-        func_decls: HashMap::new(),
-        in_progress: HashMap::new(),
+        func_decls: FxHashMap::default(),
+        in_progress: FxHashMap::default(),
     };
 
     // 1. 构建 func_name → &Spanned<Decl> 映射（仅顶层 fun_decl）
@@ -3942,8 +3942,8 @@ pub fn collect_monomorph_instances<'a>(
                         chan_layout: ChanLayout::empty(),
                         return_type: return_td,
                         is_async: *is_async,
-                        expr_types: HashMap::new(),
-                        field_accesses: HashMap::new(),
+                        expr_types: FxHashMap::default(),
+                        field_accesses: FxHashMap::default(),
                     };
                     sema_result.monomorph_instances.push(instance);
 
@@ -3995,16 +3995,16 @@ struct ResolveCtx<'a, 'b> {
     ast: &'a AstArena<'a>,
     type_args: &'a [&'static TypeDescriptor],
     /// 变量名 → 类型描述符（局部变量绑定，作用域栈）
-    bindings: Vec<HashMap<&'a str, &'static TypeDescriptor>>,
+    bindings: Vec<FxHashMap<&'a str, &'static TypeDescriptor>>,
     /// 类型参数名 → type_args 索引（快速查找）
-    type_param_map: HashMap<&'a str, u16>,
-    func_decls: &'a HashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    in_progress: &'a mut HashMap<String, u32>,
+    type_param_map: FxHashMap<&'a str, u16>,
+    func_decls: &'a FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
+    in_progress: &'a mut FxHashMap<String, u32>,
 }
 
 impl<'a, 'b> ResolveCtx<'a, 'b> {
     fn push_scope(&mut self) {
-        self.bindings.push(HashMap::new());
+        self.bindings.push(FxHashMap::default());
     }
 
     fn pop_scope(&mut self) {
@@ -4038,17 +4038,17 @@ fn resolve_instance_body_types<'a>(
     instance: &mut MonomorphInstance,
     fd: &FunDeclView<'a>,
     ast: &'a AstArena<'a>,
-    func_decls: &'a HashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    in_progress: &mut HashMap<String, u32>,
+    func_decls: &'a FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
+    in_progress: &mut FxHashMap<String, u32>,
     sema_result: &mut SemaResult,
     type_args: &[&'static TypeDescriptor],
 ) {
-    let mut type_param_map: HashMap<&'a str, u16> = HashMap::new();
+    let mut type_param_map: FxHashMap<&'a str, u16> = FxHashMap::default();
     for (i, tp) in fd.type_params.iter().enumerate() {
         type_param_map.insert(tp.name, i as u16);
     }
 
-    let bindings: Vec<HashMap<&'a str, &'static TypeDescriptor>> = vec![HashMap::new()];
+    let bindings: Vec<FxHashMap<&'a str, &'static TypeDescriptor>> = vec![FxHashMap::default()];
 
     let mut rctx = ResolveCtx {
         instance,
@@ -4195,7 +4195,7 @@ fn infer_type_args_in_body<'a>(
         _ => unreachable!("func_decls only stores FunDecl"),
     };
 
-    let mut name_to_td: HashMap<&str, &'static TypeDescriptor> = HashMap::new();
+    let mut name_to_td: FxHashMap<&str, &'static TypeDescriptor> = FxHashMap::default();
 
     let is_type_param = |name: &str| sig.type_params.iter().any(|tp| tp.as_ref() == name);
 
@@ -5397,7 +5397,7 @@ impl<'a> InferContext<'a> {
 
     /// 将 AST TypeNode 解析为 TypeHandle（便捷版，无类型参数映射）。
     pub fn type_from_ast(&mut self, type_ref: AstTypeRef, ast: &AstArena<'_>) -> TypeHandle {
-        let empty = HashMap::new();
+        let empty = FxHashMap::default();
         self.type_from_ast_with_params(type_ref, ast, &empty)
     }
 
@@ -5411,7 +5411,7 @@ impl<'a> InferContext<'a> {
         &mut self,
         type_ref: AstTypeRef,
         ast: &AstArena<'_>,
-        type_param_map: &HashMap<String, TypeHandle>,
+        type_param_map: &FxHashMap<String, TypeHandle>,
     ) -> TypeHandle {
         let tn = &ast.ty(type_ref).node;
         match tn {
@@ -5594,7 +5594,7 @@ impl<'a> InferContext<'a> {
             return ty;
         }
         // 2. 为每个 free var 分配 fresh var，构建替换表
-        let mut subst: HashMap<u32, TypeHandle> = HashMap::new();
+        let mut subst: FxHashMap<u32, TypeHandle> = FxHashMap::default();
         for idx in free_vars.iter() {
             let fresh = self.arena.fresh_type_var();
             subst.insert(*idx, fresh);
@@ -5657,7 +5657,7 @@ impl<'a> InferContext<'a> {
     pub fn apply_type_subst(
         &mut self,
         ty: TypeHandle,
-        subst: &HashMap<u32, TypeHandle>,
+        subst: &FxHashMap<u32, TypeHandle>,
     ) -> TypeHandle {
         self.substitute_type(ty, subst)
     }
@@ -7652,7 +7652,7 @@ impl<'a> InferContext<'a> {
                 .get(type_name.as_str())
                 .map(|&idx| 22 + idx);
             if let Some(tid) = type_id {
-                let mut slots = HashMap::new();
+                let mut slots = FxHashMap::default();
                 for (method_name, instance_id) in method_slots_vec {
                     slots.insert(method_name.into_boxed_str(), instance_id);
                 }
@@ -7942,7 +7942,7 @@ static NUMERIC_BUILTIN_NAMES: &[(&str, ConcreteType)] = &[
 // - 所有类型关系（相等、子类型、trait bound、narrowing）统一为 Constraint
 // - snapshot/rollback 支持尝试性推断（match 分支、重载选择）
 // - 批量求解：函数体结束时统一求解，而非立即 unify
-// - DOD：约束用 Vec，snapshot 用长度索引，subst 用 HashMap
+// - DOD：约束用 Vec，snapshot 用长度索引，subst 用 FxHashMap
 //
 // 与现有 TypeArena::unify 的关系：
 // solver 调用 unify 实现 Equality 约束，但增加延迟和回滚能力。
@@ -8008,7 +8008,7 @@ pub struct SnapshotId(pub u32);
 pub struct ConstraintSolver {
     pending: Vec<Constraint>,
     snapshots: Vec<SnapshotState>,
-    subst: HashMap<u32, TypeHandle>,
+    subst: FxHashMap<u32, TypeHandle>,
     errors: Vec<ConstraintError>,
 }
 
@@ -8016,7 +8016,7 @@ pub struct ConstraintSolver {
 #[derive(Debug, Clone)]
 struct SnapshotState {
     pending_len: usize,
-    subst_snapshot: HashMap<u32, TypeHandle>,
+    subst_snapshot: FxHashMap<u32, TypeHandle>,
     errors_len: usize,
 }
 
@@ -8031,7 +8031,7 @@ impl ConstraintSolver {
         ConstraintSolver {
             pending: Vec::new(),
             snapshots: Vec::new(),
-            subst: HashMap::new(),
+            subst: FxHashMap::default(),
             errors: Vec::new(),
         }
     }
@@ -8524,12 +8524,12 @@ pub struct FlowFact {
 
 /// Flow fact 表：存储当前 scope 内的所有 flow facts。
 ///
-/// DOD：facts 用 Vec，by_path 用 HashMap 索引。
+/// DOD：facts 用 Vec，by_path 用 FxHashMap 索引。
 #[derive(Default)]
 pub struct FlowFactTable {
     facts: Vec<FlowFact>,
     /// 按路径索引：path → fact indices
-    by_path: HashMap<Box<str>, Vec<u32>>,
+    by_path: FxHashMap<Box<str>, Vec<u32>>,
 }
 
 impl FlowFactTable {
@@ -8764,7 +8764,7 @@ fn extract_constructor_pattern<'a>(
 //
 // 数据结构：
 // - WitnessEntry { trait_name, type_id, method_slots }
-// - WitnessTable 用 Vec<WitnessEntry> + HashMap<(trait_name, type_id), idx> 索引
+// - WitnessTable 用 Vec<WitnessEntry> + FxHashMap<(trait_name, type_id), idx> 索引
 //
 // 分派流程：
 // 1. 推断接收者类型 → resolve → 取 type_id（标量直接有，ADT 查 type_def）
@@ -8783,7 +8783,7 @@ pub struct WitnessEntry {
     pub type_id: u16,
     /// 方法槽位：method_name → method slot index
     /// slot index 指向 MonomorphInstance.instance_id
-    pub method_slots: HashMap<Box<str>, u32>,
+    pub method_slots: FxHashMap<Box<str>, u32>,
     /// 实现类型的名字（用于错误信息）
     pub type_name: Box<str>,
 }
@@ -8796,7 +8796,7 @@ pub struct WitnessEntry {
 pub struct WitnessTable {
     entries: Vec<WitnessEntry>,
     /// 索引：(trait_name, type_id) → entries 下标
-    index: HashMap<(Box<str>, u16), u32>,
+    index: FxHashMap<(Box<str>, u16), u32>,
 }
 
 impl WitnessTable {
@@ -8812,7 +8812,7 @@ impl WitnessTable {
         trait_name: &str,
         type_id: u16,
         type_name: &str,
-        method_slots: HashMap<Box<str>, u32>,
+        method_slots: FxHashMap<Box<str>, u32>,
     ) {
         let key = (trait_name.into(), type_id);
         if let Some(&idx) = self.index.get(&key) {
@@ -9702,7 +9702,7 @@ mod tests {
     // ── chan_type_from_type_node_bound (TypeBindingContext) ──
 
     struct MockBindingCtx {
-        bindings: HashMap<String, BindingTarget>,
+        bindings: FxHashMap<String, BindingTarget>,
     }
 
     impl TypeBindingContext for MockBindingCtx {
@@ -11126,7 +11126,7 @@ mod tests {
     #[test]
     fn witness_table_register_and_query() {
         let mut wt = WitnessTable::new();
-        let mut slots = HashMap::new();
+        let mut slots = FxHashMap::default();
         slots.insert("show".into(), 42u32);
         wt.register("Show", 3, "i32", slots);
 
@@ -11142,7 +11142,7 @@ mod tests {
     #[test]
     fn witness_table_trait_methods() {
         let mut wt = WitnessTable::new();
-        let mut slots = HashMap::new();
+        let mut slots = FxHashMap::default();
         slots.insert("eq".into(), 10u32);
         slots.insert("neq".into(), 11u32);
         wt.register("Eq", 3, "i32", slots);
@@ -11156,11 +11156,11 @@ mod tests {
     #[test]
     fn witness_table_overwrite() {
         let mut wt = WitnessTable::new();
-        let mut slots1 = HashMap::new();
+        let mut slots1 = FxHashMap::default();
         slots1.insert("show".into(), 1u32);
         wt.register("Show", 3, "i32", slots1);
 
-        let mut slots2 = HashMap::new();
+        let mut slots2 = FxHashMap::default();
         slots2.insert("show".into(), 99u32);
         wt.register("Show", 3, "i32", slots2);
 

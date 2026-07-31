@@ -11,7 +11,7 @@
 
 use std::ffi::CString;
 
-use crate::Value::{HeapObj, RefKind, ValueArena, ValueHandle, ValueTag};
+use crate::Value::{F16, F128, HeapObj, RefKind, ScalarTag, Value, ValueArena, ValueHandle, ValueTag};
 
 // =========================================================================
 // TypeKind 枚举（与 Glue 侧 kind 值一致，供用户判断类型分类）
@@ -264,7 +264,8 @@ pub extern "C" fn __reflect_field_name(handle: u32, index: u16, out_data: *mut *
     write_str_out(&name, out_data, out_len);
 }
 
-/// 返回字段值（子 ValueHandle，用于递归反射）
+/// 返回字段值（子 ValueHandle，用于递归反射）。
+/// HeapObj 字段已迁移为 Value，需通过 alloc_value 转回 ValueHandle 供 FFI 返回。
 #[no_mangle]
 pub extern "C" fn __reflect_field_value(handle: u32, index: u16) -> u32 {
     let h = ValueHandle::from_raw(handle);
@@ -273,10 +274,18 @@ pub extern "C" fn __reflect_field_value(handle: u32, index: u16) -> u32 {
     }
     if let Some(obj) = ValueArena::get_global_obj(h) {
         match &*obj {
-            HeapObj::Record(r) => r.fields.get(index as usize).map(|f| f.to_raw()).unwrap_or(ValueHandle::NULL.to_raw()),
-            HeapObj::Adt(a) => a.fields.get(index as usize).map(|f| f.value.to_raw()).unwrap_or(ValueHandle::NULL.to_raw()),
+            // Record/Adt/Array 字段为 Value：alloc_value 转回 ValueHandle
+            HeapObj::Record(r) => r.fields.get(index as usize)
+                .map(|f| ValueArena::with_global_mut(|a| a.alloc_value(f)).to_raw())
+                .unwrap_or(ValueHandle::NULL.to_raw()),
+            HeapObj::Adt(a) => a.fields.get(index as usize)
+                .map(|f| ValueArena::with_global_mut(|a| a.alloc_value(&f.value)).to_raw())
+                .unwrap_or(ValueHandle::NULL.to_raw()),
+            // Newtype.inner 仍为 ValueHandle，直接返回
             HeapObj::Newtype(n) => if index == 0 { n.inner.to_raw() } else { ValueHandle::NULL.to_raw() },
-            HeapObj::Array(a) => a.elements.get(index as usize).map(|f| f.to_raw()).unwrap_or(ValueHandle::NULL.to_raw()),
+            HeapObj::Array(a) => a.elements.get(index as usize)
+                .map(|f| ValueArena::with_global_mut(|arena| arena.alloc_value(f)).to_raw())
+                .unwrap_or(ValueHandle::NULL.to_raw()),
             _ => ValueHandle::NULL.to_raw(),
         }
     } else {
@@ -372,38 +381,65 @@ pub extern "C" fn __reflect_scalar_to_str(handle: u32, out_data: *mut *const u8,
 /// 顶层格式化入口：递归 match HeapObj 生成字符串
 #[no_mangle]
 pub extern "C" fn __reflect_format(handle: u32, out_data: *mut *const u8, out_len: *mut usize) {
-    let result = format_value(ValueHandle::from_raw(handle), 0);
+    // 入口 handle → Value，后续递归全部走 Value 路径
+    let h = ValueHandle::from_raw(handle);
+    let v = ValueArena::with_global(|arena| arena.get_value(h));
+    let result = format_value(&v, 0);
     write_str_out(&result, out_data, out_len);
 }
 
 /// 递归格式化 Value 为 String（内部函数，非 extern "C"）。
 /// [R-3] depth 限制递归深度，防止环引用或极深嵌套导致栈溢出。
 const FORMAT_MAX_DEPTH: u32 = 64;
-fn format_value(h: ValueHandle, depth: u32) -> String {
+fn format_value(v: &Value, depth: u32) -> String {
     // 深度超限：截断为省略号，避免栈溢出（环/极深嵌套防御）
     if depth > FORMAT_MAX_DEPTH {
         return "...".to_string();
     }
-    let tag = h.tag();
-    if tag != ValueTag::Ref {
-        // 标量：用 __reflect_scalar_to_str 的逻辑
-        let mut data: *const u8 = std::ptr::null();
-        let mut len: usize = 0;
-        __reflect_scalar_to_str(h.to_raw(), &mut data, &mut len);
-        unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(data, len)).into_owned() }
-    } else {
-        // 堆对象：match ref_kind
-        if let Some(obj) = ValueArena::get_global_obj(h) {
-            match &*obj {
-                HeapObj::Record(r) => {
-                    let mut out = format!("{}(", r.type_name);
-                    for (i, f) in r.fields.iter().enumerate() {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Void => "void".to_string(),
+        Value::Scalar(sv, tag) => {
+            // 标量格式化：直接从 ScalarValue 读取，不经 ValueArena
+            unsafe {
+                match tag {
+                    ScalarTag::Bool => (if sv.bool_val { "true" } else { "false" }).to_string(),
+                    ScalarTag::Char => {
+                        let c = sv.char_val;
+                        if c <= 0x7F { (c as u8 as char).to_string() }
+                        else { format!("U+{:04X}", c) }
+                    }
+                    ScalarTag::I8 => sv.i8_val.to_string(),
+                    ScalarTag::I16 => sv.i16_val.to_string(),
+                    ScalarTag::I32 => sv.i32_val.to_string(),
+                    ScalarTag::I64 => sv.i64_val.to_string(),
+                    ScalarTag::U8 => sv.u8_val.to_string(),
+                    ScalarTag::U16 => sv.u16_val.to_string(),
+                    ScalarTag::U32 => sv.u32_val.to_string(),
+                    ScalarTag::U64 => sv.u64_val.to_string(),
+                    ScalarTag::Isize => sv.isize_val.to_string(),
+                    ScalarTag::Usize => sv.usize_val.to_string(),
+                    ScalarTag::I128 => i128::from_ne_bytes(std::mem::transmute(sv.i128_val)).to_string(),
+                    ScalarTag::U128 => u128::from_ne_bytes(std::mem::transmute(sv.u128_val)).to_string(),
+                    ScalarTag::F16 => format!("{:?}", F16(sv.f16_val)),
+                    ScalarTag::F32 => sv.f32_val.to_string(),
+                    ScalarTag::F64 => sv.f64_val.to_string(),
+                    ScalarTag::F128 => format!("{:?}", F128(std::mem::transmute(sv.f128_val))),
+                }
+            }
+        }
+        Value::Ref(r) => {
+            // 堆对象：match HeapObj
+            match &**r {
+                HeapObj::Record(rec) => {
+                    let mut out = format!("{}(", rec.type_name);
+                    for (i, f) in rec.fields.iter().enumerate() {
                         if i > 0 { out.push_str(", "); }
-                        if let Some(name) = r.field_names.get(i).and_then(|n| n.as_ref()) {
+                        if let Some(name) = rec.field_names.get(i).and_then(|n| n.as_ref()) {
                             out.push_str(name);
                             out.push_str(": ");
                         }
-                        out.push_str(&format_value(*f, depth + 1));
+                        out.push_str(&format_value(f, depth + 1));
                     }
                     out.push(')');
                     out
@@ -419,20 +455,22 @@ fn format_value(h: ValueHandle, depth: u32) -> String {
                                 out.push_str(name);
                                 out.push_str(": ");
                             }
-                            out.push_str(&format_value(f.value, depth + 1));
+                            out.push_str(&format_value(&f.value, depth + 1));
                         }
                         out.push(')');
                         out
                     }
                 }
                 HeapObj::Newtype(n) => {
-                    format!("{}({})", n.type_name, format_value(n.inner, depth + 1))
+                    // Newtype.inner 仍为 ValueHandle：转 Value 后递归
+                    let inner_val = ValueArena::with_global(|arena| arena.get_value(n.inner));
+                    format!("{}({})", n.type_name, format_value(&inner_val, depth + 1))
                 }
                 HeapObj::Array(a) => {
                     let mut out = String::from("[");
                     for (i, e) in a.elements.iter().enumerate() {
                         if i > 0 { out.push_str(", "); }
-                        out.push_str(&format_value(*e, depth + 1));
+                        out.push_str(&format_value(e, depth + 1));
                     }
                     out.push(']');
                     out
@@ -440,14 +478,9 @@ fn format_value(h: ValueHandle, depth: u32) -> String {
                 HeapObj::Str(glue_str) => glue_str.bytes().to_string(),
                 _ => {
                     // 其他堆对象：用 ref_kind 名兜底
-                    let mut data: *const u8 = std::ptr::null();
-                    let mut len: usize = 0;
-                    __reflect_scalar_to_str(h.to_raw(), &mut data, &mut len);
-                    unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(data, len)).into_owned() }
+                    "<non-scalar>".to_string()
                 }
             }
-        } else {
-            "<null-ref>".to_string()
         }
     }
 }
@@ -490,7 +523,7 @@ impl RefKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Value::{AdtField, AdtValue, ArrayValue, RecordValue, ValueArena};
+    use crate::Value::{AdtField, AdtValue, ArrayValue, RecordValue, Value, ValueArena};
 
     // 辅助：读取 str out 参数为 String
     unsafe fn read_out_str(data: *const u8, len: usize) -> String {
@@ -551,8 +584,8 @@ mod tests {
     #[test]
     fn test_reflect_field_count_and_value() {
         let rec_handle = ValueArena::with_global_mut(|a| {
-            let f0 = a.alloc_i32(1);
-            let f1 = a.alloc_f64(2.0);
+            let f0 = Value::i32(1);
+            let f1 = Value::f64(2.0);
             let rec = RecordValue::new(
                 "Point".to_string(),
                 vec![f0, f1],
@@ -578,8 +611,8 @@ mod tests {
     #[test]
     fn test_reflect_format_record() {
         let rec_handle = ValueArena::with_global_mut(|a| {
-            let x = a.alloc_i32(1);
-            let y = a.alloc_i32(2);
+            let x = Value::i32(1);
+            let y = Value::i32(2);
             let rec = RecordValue::new(
                 "Point".to_string(),
                 vec![x, y],
@@ -596,8 +629,8 @@ mod tests {
     #[test]
     fn test_reflect_format_array() {
         let arr_handle = ValueArena::with_global_mut(|a| {
-            let e0 = a.alloc_i32(10);
-            let e1 = a.alloc_i32(20);
+            let e0 = Value::i32(10);
+            let e1 = Value::i32(20);
             let arr = ArrayValue { elements: vec![e0, e1], fixed_size: None, elem_is_ref: false, scalar_soa: None };
             a.alloc_array(arr)
         });
@@ -619,9 +652,9 @@ mod tests {
     #[test]
     fn test_reflect_array_len() {
         let arr_handle = ValueArena::with_global_mut(|a| {
-            let e0 = a.alloc_i32(1);
-            let e1 = a.alloc_i32(2);
-            let e2 = a.alloc_i32(3);
+            let e0 = Value::i32(1);
+            let e1 = Value::i32(2);
+            let e2 = Value::i32(3);
             let arr = ArrayValue { elements: vec![e0, e1, e2], fixed_size: None, elem_is_ref: false, scalar_soa: None };
             a.alloc_array(arr)
         });
@@ -631,7 +664,7 @@ mod tests {
     #[test]
     fn test_reflect_adt_constructor() {
         let adt_handle = ValueArena::with_global_mut(|a| {
-            let inner = a.alloc_i32(42);
+            let inner = Value::i32(42);
             let adt = AdtValue::new(
                 "Option".to_string(),
                 "Some".to_string(),

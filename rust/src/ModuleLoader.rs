@@ -18,7 +18,7 @@
 //! → 解析为文件路径 "std/io/File.glue"
 //! → 先查 stdlib 嵌入表，再查文件系统搜索路径
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 
 use crate::Ast::{
@@ -142,7 +142,7 @@ struct LoadedModule {
     /// parse 产出的 AST 模块（'static 生命周期，可安全缓存）
     module: Module<'static>,
     /// 模块导出的公开符号（pub fun / pub type / pub val 的名称）
-    exports: HashSet<String>,
+    exports: FxHashSet<String>,
 }
 
 /// 模块加载失败的原因
@@ -178,23 +178,23 @@ impl LoadError {
 /// builtin 模块在 `new()` 时全量预加载。
 pub struct ModuleLoader {
     /// 模块缓存：相对路径（如 "std/io/File.glue"）→ LoadedModule
-    modules: HashMap<String, LoadedModule>,
+    modules: FxHashMap<String, LoadedModule>,
     /// 用户模块的文件系统搜索路径
     search_paths: Vec<PathBuf>,
     /// 加载失败记录（模块未找到 / 解析失败），按发生顺序排列
     load_errors: Vec<LoadError>,
     /// 已尝试加载但失败的路径集合，避免对同一路径重复记录错误
-    failed_paths: HashSet<String>,
+    failed_paths: FxHashSet<String>,
 }
 
 impl ModuleLoader {
     /// 创建新的加载器，并全量预加载 builtin 模块
     pub fn new() -> Self {
         let mut loader = Self {
-            modules: HashMap::new(),
+            modules: FxHashMap::default(),
             search_paths: Vec::new(),
             load_errors: Vec::new(),
-            failed_paths: HashSet::new(),
+            failed_paths: FxHashSet::default(),
         };
         loader.preload_builtins();
         loader
@@ -317,7 +317,7 @@ impl ModuleLoader {
     }
 
     /// 获取已加载模块的导出符号列表
-    pub fn get_exports(&self, path: &[&str]) -> Option<&HashSet<String>> {
+    pub fn get_exports(&self, path: &[&str]) -> Option<&FxHashSet<String>> {
         let path_str = module_path_to_file(path);
         self.modules.get(&path_str).map(|m| &m.exports)
     }
@@ -363,11 +363,11 @@ impl ModuleLoader {
     pub fn load_transitive_imports(&mut self, module: &Module<'_>) -> Vec<String> {
         let mut order: Vec<String> = Vec::new();
         // visited：已 finalize 的模块（已登记到 order）
-        let mut visited: HashSet<String> = HashSet::new();
+        let mut visited: FxHashSet<String> = FxHashSet::default();
         // visiting：当前栈中正在展开但未 finalize 的模块，用于检测循环依赖
         // 循环依赖（A↔B）下，第二次遇到 (A,false) 时 visiting.contains(A) 命中，
         // 直接跳过，避免无限展开。后序遍历对无环部分仍正确。
-        let mut visiting: HashSet<String> = HashSet::new();
+        let mut visiting: FxHashSet<String> = FxHashSet::default();
         // 栈元素：(模块路径段, 是否已展开收集子依赖)
         let mut stack: Vec<(Vec<String>, bool)> = collect_imports(module)
             .into_iter()
@@ -479,8 +479,8 @@ fn parse_source(path: &'static str, source: &'static str) -> Result<Module<'stat
 ///
 /// 遍历 Module.declarations，收集所有 pub 可见性的函数/类型名称。
 /// 用于后续 import 别名注册。
-fn collect_exports(module: &Module<'_>) -> HashSet<String> {
-    let mut exports = HashSet::new();
+fn collect_exports(module: &Module<'_>) -> FxHashSet<String> {
+    let mut exports = FxHashSet::default();
     for decl in &module.declarations {
         match &decl.node {
             Decl::FunDecl {

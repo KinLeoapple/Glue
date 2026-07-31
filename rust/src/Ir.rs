@@ -13,10 +13,10 @@
 //! - 节点固定 16B，只存拓扑引用，output 隐含 = 节点自身 id
 //! - kind 只有 6 种，仅用于调度器就绪判定，不用于运算分派
 //! - compute_fn 是构建期按类型特化绑定的函数索引，运行时数组索引取出调用
-//! - 值表槽使用 Value.rs 的 ValueHandle（4B DOD 句柄），非 Value enum
+//! - 值表槽使用 Value.rs 的 Value enum（含标量与 Arc<HeapObj> 引用）
 //! - 独立输入池连续存储所有节点输入，缓存友好
 
-use crate::Value::ValueHandle;
+use crate::Value::Value;
 
 // =========================================================================
 // 索引 newtype — 保证类型安全的句柄
@@ -160,9 +160,9 @@ impl Default for InputsPool {
 ///
 /// 槽级 RC：节点产出时设 refcount = 下游数量，每个下游消费时 -1，归零可清槽。
 /// 帧级兜底：帧结束时所有未归零槽统一回收（堆对象 decref）。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ValueSlot {
-    pub value: ValueHandle,
+    pub value: Value,
     pub ready: bool,
     pub refcount: u16,
 }
@@ -171,14 +171,14 @@ impl ValueSlot {
     /// 创建未就绪的空槽。
     pub fn unready() -> Self {
         Self {
-            value: ValueHandle::NULL,
+            value: Value::NULL,
             ready: false,
             refcount: 0,
         }
     }
 
     /// 设置产出值 + 下游消费者数量。
-    pub fn set_value(&mut self, value: ValueHandle, consumer_count: u16) {
+    pub fn set_value(&mut self, value: Value, consumer_count: u16) {
         self.value = value;
         self.ready = true;
         self.refcount = consumer_count;
@@ -202,7 +202,7 @@ impl ValueSlot {
 impl std::fmt::Debug for ValueSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ValueSlot")
-            .field("value", &self.value.to_raw())
+            .field("value", &self.value)
             .field("ready", &self.ready)
             .field("refcount", &self.refcount)
             .finish()
@@ -269,13 +269,13 @@ pub struct SelectBranch {
 ///
 /// run_ready_nodes 每次循环检查此字段，非 None 则停止处理。
 /// 由 control_signal_nodes 表标记的节点触发。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum ControlSignal {
     /// 无信号，正常执行
     #[default]
     None,
     /// return 语句触发：子图提前返回该值
-    Return(ValueHandle),
+    Return(Value),
     /// break 语句触发：循环跳出
     Break,
     /// continue 语句触发：循环下一轮
@@ -365,8 +365,8 @@ pub enum RuntimeEvent {
 pub struct PendingCall {
     /// 目标子图 id
     pub target_sg: SubGraphId,
-    /// 调用参数（值句柄列表）
-    pub args: Vec<crate::Value::ValueHandle>,
+    /// 调用参数（值列表）
+    pub args: Vec<Value>,
     /// 发起调用的节点（帧内局部 NodeId，子图完成后回写返回值）
     pub call_node_local: NodeId,
     /// async call 标记：true=不挂起当前帧，返回 AsyncHandle
@@ -385,8 +385,8 @@ pub struct PendingCall {
 pub struct PendingAwait {
     /// await 节点（帧内局部 NodeId，事件到达时回写值）
     pub await_node_local: NodeId,
-    /// 事件对象值（AsyncHandle/Channel/Timer 的 ValueHandle）
-    pub event_obj: crate::Value::ValueHandle,
+    /// 事件对象值（AsyncHandle/Channel/Timer 的 Value）
+    pub event_obj: Value,
     /// 事件种类（决定如何检查就绪 + 如何解析事件源 id）
     pub event_kind: EventSourceKind,
 }
@@ -406,6 +406,8 @@ pub struct PendingAwait {
 ///
 /// 帧级回收：帧结束时整个 value_table 释放，堆对象走 ValueArena RC。
 pub struct Frame {
+    /// 数据流图（只读共享，compute_fn 通过 frame.graph 访问）
+    pub graph: std::sync::Arc<DataFlowGraph>,
     /// 值表（按帧内局部 NodeId 索引，从 0 开始）
     pub value_table: Vec<ValueSlot>,
     /// 每节点剩余未就绪输入数
@@ -436,16 +438,17 @@ pub struct Frame {
     pub suspend_event: Option<RuntimeEvent>,
     /// 待取消的 async handle（cancel 方法调用设置，run_ready_nodes 消费）
     pub pending_cancel: Option<crate::Ir::AsyncHandleId>,
-    /// 待启动的 select 分支子图（run_ready_nodes 检查就绪后设置）
-    pub pending_select: Option<SubGraphId>,
     /// 待挂起的 select 等待（无就绪分支时设置，NodeId 是 Gate 节点局部 id）
     pub pending_select_wait: Option<NodeId>,
+    /// select 中已启动的 timer（branch_idx, timer_id），Timer 分支首次检查时启动
+    pub select_timers: Vec<(usize, crate::Ir::TimerId)>,
 }
 
 impl Frame {
     /// 创建新帧，值表和 pending_inputs 按子图节点数初始化。
-    pub fn new(id: FrameId, subgraph_id: SubGraphId, node_count: usize) -> Self {
+    pub fn new(id: FrameId, subgraph_id: SubGraphId, node_count: usize, graph: std::sync::Arc<DataFlowGraph>) -> Self {
         Self {
+            graph,
             value_table: vec![ValueSlot::unready(); node_count],
             pending_inputs: vec![0; node_count],
             ready_queue: std::collections::VecDeque::new(),
@@ -461,26 +464,26 @@ impl Frame {
             pending_await: None,
             suspend_event: None,
             pending_cancel: None,
-            pending_select: None,
             pending_select_wait: None,
+            select_timers: Vec::new(),
         }
     }
 
     /// 设置节点的产出值（局部 NodeId）。
-    pub fn set_value(&mut self, node: NodeId, value: ValueHandle, consumer_count: u16) {
+    pub fn set_value(&mut self, node: NodeId, value: Value, consumer_count: u16) {
         self.value_table[node.0 as usize].set_value(value, consumer_count);
     }
 
-    /// 获取节点的产出值（局部 NodeId）。
-    pub fn get_value(&self, node: NodeId) -> ValueHandle {
-        self.value_table[node.0 as usize].value
+    /// 获取节点的产出值（局部 NodeId，克隆返回）。
+    pub fn get_value(&self, node: NodeId) -> Value {
+        self.value_table[node.0 as usize].value.clone()
     }
 
-    /// 获取节点的产出值（全局 NodeId，自动转换为局部索引）。
+    /// 获取节点的产出值（全局 NodeId，自动转换为局部索引，克隆返回）。
     /// compute_fn 读取输入时使用此方法（inputs_pool 存全局 NodeId）。
-    pub fn get_value_by_global(&self, global_node: NodeId) -> ValueHandle {
+    pub fn get_value_by_global(&self, global_node: NodeId) -> Value {
         let local = global_node.0 - self.node_offset;
-        self.value_table[local as usize].value
+        self.value_table[local as usize].value.clone()
     }
 
     /// 检查节点是否就绪（所有输入已产出）。
@@ -648,28 +651,19 @@ pub struct SubGraph {
 // ComputeFn — 计算函数（构建期绑定，消除 dispatch）
 // =========================================================================
 
-/// 计算函数签名：接收帧 + 值 arena + 图 + 节点 id，返回产出值。
+/// 计算函数签名：接收帧 + 节点 id，返回产出值。
 ///
+/// frame 持有 graph（Arc<DataFlowGraph>），compute_fn 通过 frame.graph 访问图数据。
 /// 构建期绑定索引（ComputeFnId），运行时通过计算函数表索引调用。
 /// 每种运算+类型组合一个特化函数，运行时无类型检查、无 op 查表。
-pub type ComputeFn = fn(
-    frame: &mut Frame,
-    arena: &mut crate::Value::ValueArena,
-    graph: &DataFlowGraph,
-    node: NodeId,
-) -> ValueHandle;
+pub type ComputeFn = fn(frame: &mut Frame, node: NodeId) -> Value;
 
 /// 占位计算函数表（Ir.rs 内部测试用，Engine.rs 有真实表）。
 pub const COMPUTE_FN_TABLE: &[ComputeFn] = &[noop_compute];
 
 /// 占位计算函数（Const 节点不需要 compute_fn，帧初始化时预填充）。
-fn noop_compute(
-    _frame: &mut Frame,
-    _arena: &mut crate::Value::ValueArena,
-    _graph: &DataFlowGraph,
-    _node: NodeId,
-) -> ValueHandle {
-    ValueHandle::VOID
+fn noop_compute(_frame: &mut Frame, _node: NodeId) -> Value {
+    Value::VOID
 }
 
 /// 获取计算函数表（测试用）。
@@ -968,13 +962,13 @@ pub struct IrBuilder<'a> {
     pub compiling_builtin: Option<&'a crate::Ast::Module<'a>>,
     pub graph: DataFlowGraph,
     /// 函数名 → 子图 id 映射（Call 编译时查找绑定 call_target）
-    pub func_subgraphs: std::collections::HashMap<String, SubGraphId>,
+    pub func_subgraphs: rustc_hash::FxHashMap<String, SubGraphId>,
     /// 当前正在编译的函数子图 id（defer 注册用）
     pub current_function_sg: Option<SubGraphId>,
     /// 循环上下文栈：栈顶为当前循环的上下文（continue 跳转目标 + For 迭代器节点）
     pub loop_stack: Vec<LoopContext>,
     /// 变量作用域栈：变量名 → 产出该变量值的 NodeId
-    pub scope_stack: Vec<std::collections::HashMap<String, NodeId>>,
+    pub scope_stack: Vec<rustc_hash::FxHashMap<String, NodeId>>,
 }
 
 impl<'a> IrBuilder<'a> {
@@ -986,7 +980,7 @@ impl<'a> IrBuilder<'a> {
             builtin_modules: Vec::new(),
             compiling_builtin: None,
             graph: DataFlowGraph::new(),
-            func_subgraphs: std::collections::HashMap::new(),
+            func_subgraphs: rustc_hash::FxHashMap::default(),
             current_function_sg: None,
             loop_stack: Vec::new(),
             scope_stack: Vec::new(),
@@ -1009,7 +1003,7 @@ impl<'a> IrBuilder<'a> {
 
     /// 进入新作用域。
     fn enter_scope(&mut self) {
-        self.scope_stack.push(std::collections::HashMap::new());
+        self.scope_stack.push(rustc_hash::FxHashMap::default());
     }
 
     /// 退出作用域。
@@ -1467,7 +1461,7 @@ impl<'a> IrBuilder<'a> {
         };
 
         // 1. 自由变量分析：收集 body 中引用的外层变量（排除 lambda 自身参数）
-        let param_names: std::collections::HashSet<&str> =
+        let param_names: rustc_hash::FxHashSet<&str> =
             params.iter().map(|p| p.name).collect();
         let mut ident_names: Vec<String> = Vec::new();
         self.collect_free_idents_expr(body_expr, &mut ident_names);
@@ -3245,19 +3239,19 @@ mod tests {
 
     #[test]
     fn test_value_slot_set_ready() {
-        use crate::Value::{ValueHandle, ValueTag};
         let mut slot = ValueSlot::unready();
-        let handle = ValueHandle::new(ValueTag::I32, 42);
-        slot.set_value(handle, 2);
+        let handle = crate::Value::Value::i32(42);
+        slot.set_value(handle.clone(), 2);
         assert!(slot.ready);
-        assert_eq!(slot.value, handle);
+        // Value 未实现 PartialEq，通过 as_i32 比较值
+        assert_eq!(slot.value.as_i32(), 42);
         assert_eq!(slot.refcount, 2);
     }
 
     #[test]
     fn test_value_slot_decref() {
         let mut slot = ValueSlot::unready();
-        slot.set_value(ValueHandle::NULL, 2);
+        slot.set_value(crate::Value::Value::NULL, 2);
         assert!(slot.consume()); // refcount 1，未归零
         assert!(!slot.is_consumed());
         assert!(!slot.consume()); // refcount 0，归零
@@ -3781,7 +3775,7 @@ mod tests {
 
     #[test]
     fn test_control_signal_default_is_none() {
-        let frame = Frame::new(FrameId(0), SubGraphId(0), 0);
+        let frame = Frame::new(FrameId(0), SubGraphId(0), 0, std::sync::Arc::new(DataFlowGraph::new()));
         assert!(matches!(frame.control_signal, ControlSignal::None));
     }
 

@@ -18,7 +18,7 @@
 //! - 22+：用户类型（经 `TypeDescriptorPool::register` 分配）
 
 use crate::Value::{Char, F128, F16, ValueArena, ValueHandle, ValueTag};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 // =========================================================================
 // IntKind / FloatKind 枚举
@@ -1095,7 +1095,7 @@ pub fn lookup_by_float_kind(kind: FloatKind) -> &'static TypeDescriptor {
 /// 适用于进程级类型注册（与 Sema/Ir 的类型表语义一致）。
 pub struct TypeDescriptorPool {
     descriptors: Vec<&'static TypeDescriptor>,
-    name_to_id: HashMap<String, u16>,
+    name_to_id: FxHashMap<String, u16>,
 }
 
 impl TypeDescriptorPool {
@@ -1103,7 +1103,7 @@ impl TypeDescriptorPool {
     pub fn new() -> Self {
         TypeDescriptorPool {
             descriptors: Vec::new(),
-            name_to_id: HashMap::new(),
+            name_to_id: FxHashMap::default(),
         }
     }
 
