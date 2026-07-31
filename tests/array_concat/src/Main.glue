@@ -43,7 +43,7 @@ fun main(): void {
     println(merged[0])       // 1
     println(merged[3])       // 4
     var sum = 0
-    for n in merged {
+    for n in merged.iter() {
         sum = sum + n
     }
     println(sum)             // 10

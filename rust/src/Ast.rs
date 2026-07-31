@@ -192,15 +192,6 @@ pub enum UnaryOp {
     BitNot,
 }
 
-/// cast builder 转换模式
-/// - `To`: wrap on overflow（产生 Inf 时 panic），结果类型 = T
-/// - `TryTo`: 越界/解析失败/产生 Inf 时返回 `Throw<T, CastError>`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CastMode {
-    To,
-    TryTo,
-}
-
 /// 可见性修饰：区分私有与公开声明
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Visibility {
@@ -576,12 +567,6 @@ pub enum Expr<'a> {
         target: TypeRef,
         expr: ExprRef,
         safe: bool,
-    },
-    /// cast builder 表达式 `cast(expr).to(T)` / `cast(expr).try_to(T)`
-    CastBuilder {
-        expr: ExprRef,
-        target: TypeRef,
-        mode: CastMode,
     },
     /// 原子表达式 `atomic(expr)`
     Atomic(ExprRef),
@@ -1168,10 +1153,6 @@ pub fn walk_expr<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: 
         Expr::TypeCast { target, expr, .. } => {
             walk_type(v, arena, *target);
             walk_expr(v, arena, *expr);
-        }
-        Expr::CastBuilder { expr, target, .. } => {
-            walk_expr(v, arena, *expr);
-            walk_type(v, arena, *target);
         }
         Expr::Select(arms) => {
             for arm in arms {
@@ -5630,6 +5611,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     /// 解析 cast builder：cast(expr).to(T) / cast(expr).try_to(T)
+    ///
+    /// 废除特殊语法：降级为普通函数调用
+    ///   cast(x).to(T)      → __cast_to<T>(x)
+    ///   cast(x).try_to(T)  → __cast_try_to<T>(x)
+    ///
+    /// sema 推断源类型 S 后解析为 __cast_S_to_T(x) 函数调用。
     fn parse_cast_builder(&mut self) -> ParseResult<ExprRef> {
         let cast_tok = self.previous();
         let span = token_span(&cast_tok);
@@ -5642,9 +5629,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             unreachable!()
         }
         let method_tok = self.advance();
-        let mode = match method_tok.lexeme {
-            "to" => CastMode::To,
-            "try_to" => CastMode::TryTo,
+        let callee_name = match method_tok.lexeme {
+            "to" => "__cast_to",
+            "try_to" => "__cast_try_to",
             _ => {
                 self.report_error("expected 'to' or 'try_to' after cast(...).")?;
                 unreachable!()
@@ -5664,10 +5651,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         let target = self.alloc_type(token_span(&type_tok), TypeNode::Named { name: type_tok.lexeme });
         let _ = self.expect(TokenKind::RParen, "expected ')' after cast target type");
-        Ok(self.alloc_expr(span, Expr::CastBuilder {
-            expr,
-            target,
-            mode,
+        // 降级为普通 Call: __cast_to<T>(x) / __cast_try_to<T>(x)
+        let callee = self.alloc_expr(span, Expr::Ident(callee_name));
+        Ok(self.alloc_expr(span, Expr::Call {
+            callee,
+            args: vec![expr],
+            type_args: Some(vec![target]),
         }))
     }
 
@@ -7693,22 +7682,6 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 self.dedent();
                 self.write_line(")");
             }
-            Expr::CastBuilder { expr, target, mode } => {
-                self.write_line(&format!("(cast_builder (mode {})", cast_mode_str(*mode)));
-                self.indent();
-                self.write_line("(expr");
-                self.indent();
-                self.ve(expr);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(target");
-                self.indent();
-                self.vt(target);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
             Expr::Atomic(inner) => {
                 self.write_line("(atomic");
                 self.indent();
@@ -8346,13 +8319,6 @@ fn compound_assign_op_str(op: CompoundAssignOp) -> &'static str {
     }
 }
 
-fn cast_mode_str(mode: CastMode) -> &'static str {
-    match mode {
-        CastMode::To => "to",
-        CastMode::TryTo => "try_to",
-    }
-}
-
 /// 转义字符串中的特殊字符，用于打印带引号的字面量
 fn escape_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -8493,6 +8459,5 @@ mod printer_tests {
         assert_eq!(binary_op_str(BinaryOp::Elvis), "elvis");
         assert_eq!(unary_op_str(UnaryOp::Not), "not");
         assert_eq!(compound_assign_op_str(CompoundAssignOp::AddAssign), "add_assign");
-        assert_eq!(cast_mode_str(CastMode::To), "to");
     }
 }

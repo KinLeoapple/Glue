@@ -15,7 +15,7 @@ fun buildArray(n: i32): i64[] {
 
 fun sumArray(arr: i64[]): i64 {
     var s: i64 = 0
-    for x in arr {
+    for x in arr.iter() {
         s = s + x
     }
     s
@@ -111,8 +111,8 @@ fun main(): void {
     // ---- 嵌套数组迭代（双层 for-in）----
     val nested: i64[][] = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
     var nsum: i64 = 0
-    for row in nested {
-        for x in row {
+    for row in nested.iter() {
+        for x in row.iter() {
             nsum = nsum + x
         }
     }

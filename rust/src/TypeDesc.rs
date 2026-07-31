@@ -692,7 +692,7 @@ impl TypeOps for F128Ops {
     fn coerce(&self, v: ValueHandle, arena: &mut ValueArena) -> ValueHandle {
         let f: f64 = match v.tag() {
             ValueTag::Bool => arena.get_bool(v) as u8 as f64,
-            ValueTag::Char => arena.get_char(v) as u32 as f64,
+            ValueTag::Char => arena.get_char(v) as f64,
             ValueTag::I8 => arena.get_i8(v) as f64,
             ValueTag::I16 => arena.get_i16(v) as f64,
             ValueTag::I32 => arena.get_i32(v) as f64,
@@ -851,6 +851,9 @@ impl TypeOps for NullOps {
     }
     #[inline]
     fn format<'a>(&self, _ptr: *const u8, buf: &'a mut [u8]) -> &'a str {
+        if buf.len() < 4 {
+            return "";
+        }
         // SAFETY: "null" 为合法 ASCII。
         buf[..4].copy_from_slice(b"null");
         unsafe { std::str::from_utf8_unchecked(&buf[..4]) }
@@ -885,6 +888,9 @@ impl TypeOps for VoidOps {
     }
     #[inline]
     fn format<'a>(&self, _ptr: *const u8, buf: &'a mut [u8]) -> &'a str {
+        if buf.len() < 4 {
+            return "";
+        }
         // SAFETY: "void" 为合法 ASCII。
         buf[..4].copy_from_slice(b"void");
         unsafe { std::str::from_utf8_unchecked(&buf[..4]) }
@@ -1103,7 +1109,9 @@ impl TypeDescriptorPool {
 
     /// 注册一个用户类型，返回分配的 `type_id`（从 22 开始递增）。
     pub fn register(&mut self, name: &str, size: u8, ops: &'static dyn TypeOps) -> u16 {
-        let type_id = 22 + self.descriptors.len() as u16;
+        let len = self.descriptors.len();
+        assert!(22 + len <= u16::MAX as usize, "type_id overflow: too many type descriptors");
+        let type_id = 22 + len as u16;
         let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
         let desc: &'static TypeDescriptor = Box::leak(Box::new(TypeDescriptor {
             size,

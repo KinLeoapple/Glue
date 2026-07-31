@@ -30,10 +30,10 @@ fun main(): void {
 
     // ---- string iterates by char (unicode scalar) ----
     var n = 0
-    for ch in "héllo" { n = n + 1 }
+    for ch in str_iter("héllo") { n = n + 1 }
     println(n)                  // 5
     var e = 0
-    for ch in "" { e = e + 1 }
+    for ch in str_iter("") { e = e + 1 }
     println(e)                  // 0
 
     // ---- break / continue ----

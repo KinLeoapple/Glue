@@ -15,7 +15,7 @@ fun main(): void {
         val c = counter
         handles = handles ++ [incrOne(c)]
     }
-    for h in handles { h.await() }
+    for h in handles.iter() { h.await() }
     println(counter)          // 100 (no lost updates)
 
     // ---- mixed add/sub nets to zero ----
@@ -29,7 +29,7 @@ fun main(): void {
         val s = sum
         hs = hs ++ [subTwo(s)]
     }
-    for h in hs { h.await() }
+    for h in hs.iter() { h.await() }
     println(sum)              // 0
 
     // ---- generic-typed array of async handles parses and works ----
@@ -38,7 +38,7 @@ fun main(): void {
         results = results ++ [ret7()]
     }
     var total = 0
-    for r in results {
+    for r in results.iter() {
         total = total + r.await()
     }
     println(total)            // 35

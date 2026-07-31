@@ -4,7 +4,7 @@
 // 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>。
 //
 // 底层 @extern("C") 原语（__net_tcp_listen_v4 / __net_tcp_close_raw）
-// 由 stdlib/syscall/net.glue 声明。__net_tcp_listen 为 Glue wrapper。
+// 由 builtin/net/Raw.glue 声明。__net_tcp_listen 为 Glue wrapper。
 // __net_tcp_close 由 TcpStream.glue 定义（TCP/UDP 共用）。
 // async 函数体当前直接调用同步原语，等 IR/Engine 异步模型就绪后再补 spawn 语义。
 //
@@ -24,8 +24,12 @@ fun __net_tcp_listen(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOErro
             }
             Ok(fd)
         },
-        V6(_) => {
-            throw IOError(Other, "IPv6 not yet supported", 0, null)
+        V6(v6_addr) => {
+            val fd = __net_tcp_listen_v6(v6_addr.hi, v6_addr.lo, port, reuse_addr)
+            if fd < 0 {
+                throw IOError(AddrInUse, "tcp listen failed", 0, null)
+            }
+            Ok(fd)
         },
     }
 }

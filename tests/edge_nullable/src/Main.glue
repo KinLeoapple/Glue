@@ -137,7 +137,7 @@ fun main(): void {
 
     // error subtyping
     val results = [lookup(-1), lookup(0), lookup(50), lookup(200)]
-    for r in results {
+    for r in results.iter() {
         val msg = match r {
             Ok(v) => v
             Error(e) => "err:" + e.message()

@@ -8,6 +8,8 @@ build = "build.rs"
 bumpalo = { version = "3", features = ["collections"] }
 wide = "0.7"
 rayon = "1"
+crossbeam-deque = "0.8"
+parking_lot = "0.12"
 
 [build-dependencies]
 cc = { version = "1.0", features = ["parallel"] }

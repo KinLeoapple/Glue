@@ -22,10 +22,10 @@ fun main(): void {
     val arr = [1, 2, 3, 4, 5]
     println(arr.len())           // 5
     var found3 = false
-    for elem in arr { if elem == 3 { found3 = true } }
+    for elem in arr.iter() { if elem == 3 { found3 = true } }
     println(found3)              // true
     var found99 = false
-    for elem in arr { if elem == 99 { found99 = true } }
+    for elem in arr.iter() { if elem == 99 { found99 = true } }
     println(found99)             // false
     println(arr.len() == 0)      // false
     println(if arr.len() > 0 { arr[0] } else { -1 })   // 1
@@ -62,7 +62,7 @@ fun main(): void {
     // ---- 数组元素解构后调用 ----
     val boxes = [Box([1]), Box([2, 3]), Box([4, 5, 6])]
     var totalItems: usize = 0
-    for bx in boxes {
+    for bx in boxes.iter() {
         val n = match bx {
             Box(items) => items.len()
         }

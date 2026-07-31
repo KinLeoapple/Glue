@@ -76,7 +76,7 @@ pub fun join_segments_to_str(segs: str[], abs: bool): str {
         result = "/"
     }
     var first = true
-    for seg in segs {
+    for seg in segs.iter() {
         if !first {
             result = result + "/"
         }

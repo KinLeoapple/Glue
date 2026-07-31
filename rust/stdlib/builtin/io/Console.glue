@@ -1,22 +1,15 @@
-// Console.glue — 标准 IO 顶层入口（stdout/stderr/stdin）
+// builtin/io/Console.glue — 标准 IO 顶层入口（builtin，默认可见）
 //
 // println/print/eprintln/eprint 为同步函数，返回 Throw<void, IOError>。
 // scan/scanln 为同步函数，返回 Throw<str?, IOError>（null = EOF）。
 //
-// 格式化委托给 std.reflect.format（Glue 层递归实现，reflect/__scalar_to_str 为边界原语）。
-// println 是真正的 Glue 函数，不再依赖编译期内联。
-//
+// 格式化委托给 builtin/reflect/Reflect.format（builtin 默认可见，无需 import）。
 // 底层 @extern("C") 原语（__stdout_write_raw / __stderr_write_raw / __stdin_readln_into）
-// 由 stdlib/syscall/io.glue 声明，cc crate 编译为 glue_extern 静态库。
-// 本文件的 __stdout_write / __stderr_write / __stdin_readln 为 Glue wrapper，
-// 将 C 原始返回值（i32/i64）转换为 Throw<T, IOError>。
+// 由 builtin/io/Raw.glue 声明，cc crate 编译为 glue_extern 静态库。
 //
-// 用法：
-//   import std.io.Console.{println}
+// 用法（builtin 默认可见，无需 import）：
 //   println("hello")           // hello
 //   println(Point(3, 4))       // Point(x: 3, y: 4)
-
-import std.reflect.Reflect
 
 // ─── Glue wrapper：C 原始返回值 → Throw ──────────────────────────
 
@@ -58,13 +51,13 @@ fun __stdin_readln(): Throw<str?, IOError> {
 // ─── 标准输出 ──────────────────────────────────────────────────────
 
 pub fun print<T>(x: T): Throw<void, IOError> {
-    val s = std.reflect.Reflect.format(x)
+    val s = format(x)
     __stdout_write(s)?
     Ok(void)
 }
 
 pub fun println<T>(x: T): Throw<void, IOError> {
-    val s = std.reflect.Reflect.format(x)
+    val s = format(x)
     __stdout_write(s)?
     __stdout_write("\n")?
     Ok(void)
@@ -73,13 +66,13 @@ pub fun println<T>(x: T): Throw<void, IOError> {
 // ─── 标准错误 ──────────────────────────────────────────────────────
 
 pub fun eprint<T>(x: T): Throw<void, IOError> {
-    val s = std.reflect.Reflect.format(x)
+    val s = format(x)
     __stderr_write(s)?
     Ok(void)
 }
 
 pub fun eprintln<T>(x: T): Throw<void, IOError> {
-    val s = std.reflect.Reflect.format(x)
+    val s = format(x)
     __stderr_write(s)?
     __stderr_write("\n")?
     Ok(void)

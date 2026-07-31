@@ -7,7 +7,7 @@
 // Value.makeRecordWithNames(type_name="Name", ...) 构造的值能在 Glue 端被识别。
 //
 // 底层 @extern("C") 原语（__file_open_raw / __file_close / __file_read_into 等）
-// 由 stdlib/syscall/io.glue 声明。本文件定义 Glue wrapper 将 C 原始返回值转为 Throw。
+// 由 builtin/io/Raw.glue 声明。本文件定义 Glue wrapper 将 C 原始返回值转为 Throw。
 // async 函数体当前直接调用同步原语，等 IR/Engine 异步模型就绪后再补 spawn 语义。
 
 // ─── 顶层常量（POSIX flags） ───────────────────────────────────────

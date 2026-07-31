@@ -1077,10 +1077,10 @@ println(dyn_arr.len())
 
 // contains: 手动循环
 var found2 = false
-for elem in dyn_arr { if elem == 2 { found2 = true } }
+for elem in dyn_arr.iter() { if elem == 2 { found2 = true } }
 println(found2)
 var found99 = false
-for elem in dyn_arr { if elem == 99 { found99 = true } }
+for elem in dyn_arr.iter() { if elem == 99 { found99 = true } }
 println(found99)
 
 // is_empty: 用 len() == 0
@@ -1274,7 +1274,7 @@ println(deferReturn())
 // 59. 字符串迭代
 // ============================================================
 var char_count: i32 = 0
-for ch in "Hello" {
+for ch in str_iter("Hello") {
     char_count = char_count + 1
 }
 println(char_count)
@@ -1719,10 +1719,10 @@ println(s2[0])
 // ============================================================
 val check_arr = [1, 2, 3, 4, 5]
 var found3 = false
-for elem in check_arr { if elem == 3 { found3 = true } }
+for elem in check_arr.iter() { if elem == 3 { found3 = true } }
 println(found3)
 var found99 = false
-for elem in check_arr { if elem == 99 { found99 = true } }
+for elem in check_arr.iter() { if elem == 99 { found99 = true } }
 println(found99)
 println(check_arr.len() == 0)
 
@@ -1846,10 +1846,10 @@ println(utf8_str.len())
 // ============================================================
 var da = [10, 20, 30, 40, 50]
 var found30 = false
-for elem in da { if elem == 30 { found30 = true } }
+for elem in da.iter() { if elem == 30 { found30 = true } }
 println(found30)
 var found99b = false
-for elem in da { if elem == 99 { found99b = true } }
+for elem in da.iter() { if elem == 99 { found99b = true } }
 println(found99b)
 println(da.len() == 0)
 println(if da.len() > 0 { da[0] } else { -1 })
@@ -2046,10 +2046,10 @@ while ss2_i < cast(search_arr.len()).to(i32) {
 }
 println(search_sum)
 var found15 = false
-for elem in search_arr { if elem == 15 { found15 = true } }
+for elem in search_arr.iter() { if elem == 15 { found15 = true } }
 println(found15)
 var found99 = false
-for elem in search_arr { if elem == 99 { found99 = true } }
+for elem in search_arr.iter() { if elem == 99 { found99 = true } }
 println(found99)
 
 // ============================================================
@@ -2130,10 +2130,10 @@ arr_ops = arr_ops ++ [4]
 arr_ops = arr_ops ++ [5]
 println(arr_ops.len())
 var ops_found3 = false
-for elem in arr_ops { if elem == 3 { ops_found3 = true } }
+for elem in arr_ops.iter() { if elem == 3 { ops_found3 = true } }
 println(ops_found3)
 var ops_found99 = false
-for elem in arr_ops { if elem == 99 { ops_found99 = true } }
+for elem in arr_ops.iter() { if elem == 99 { ops_found99 = true } }
 println(ops_found99)
 
 val arr_drop = arr_ops[0..arr_ops.len() - 1]

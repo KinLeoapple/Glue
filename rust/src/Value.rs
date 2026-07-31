@@ -153,6 +153,11 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F128(pub [u8; 16]);
 
+/// # 已知限制 [V-7]
+/// `from_f64`/`to_f64` 对**非整数值**存在精度丢失（pre-existing，原 scalar.rs 遗留）：
+/// 仅对整数值保证精确往返。当前实现仅搬运 f64 的 53 位 mantissa 到 binary128 的高 53 位，
+/// 丢弃低 60 位 mantissa 信息，未实现完整的 113 位 mantissa 舍入逻辑。
+/// 依赖 f128 的数值程序在实现完整 IEEE 754 binary128 转换前，不应假设 f64↔f128 往返保真。
 impl F128 {
     pub fn from_f64(x: f64) -> Self {
         let bits = x.to_bits();
@@ -397,19 +402,59 @@ impl ValueHandle {
 
     #[inline]
     pub fn new(tag: ValueTag, index: usize) -> Self {
-        debug_assert!(index < (1 << 24));
+        // [V-3] release 也保留检查：index >= 2^24 会静默截断（MASK 抹掉高位）导致
+        // 两个不同索引产生相同 ValueHandle → 句柄别名损坏。这是不可恢复的不变式违反，
+        // 显式 panic 优于静默损坏（arena 不应分配超 16M 个同类型值）。
+        assert!(index < (1 << 24), "ValueHandle index overflow: {index} >= 2^24");
         Self(((tag as u8 as u32) << Self::TAG_SHIFT) | (index as u32 & Self::INDEX_MASK))
     }
 
     #[inline]
     pub fn tag(self) -> ValueTag {
-        // SAFETY: tag 值始终在 ValueTag 的合法范围内
-        unsafe { std::mem::transmute((self.0 >> Self::TAG_SHIFT) as u8) }
+        // FFI 防御：extern "C" 原语经 from_raw 还原的 u32 可能携带越界 tag
+        // （21..=255）。transmute 到 #[repr(u8)] enum 的非法判别值是 UB，
+        // 故用 match 显式映射，越界统一兜底为 Null，保证任何 u32 都安全。
+        match (self.0 >> Self::TAG_SHIFT) as u8 {
+            0 => ValueTag::Null,
+            1 => ValueTag::Void,
+            2 => ValueTag::Bool,
+            3 => ValueTag::Char,
+            4 => ValueTag::I8,
+            5 => ValueTag::I16,
+            6 => ValueTag::I32,
+            7 => ValueTag::I64,
+            8 => ValueTag::U8,
+            9 => ValueTag::U16,
+            10 => ValueTag::U32,
+            11 => ValueTag::U64,
+            12 => ValueTag::Isize,
+            13 => ValueTag::Usize,
+            14 => ValueTag::I128,
+            15 => ValueTag::U128,
+            16 => ValueTag::F16,
+            17 => ValueTag::F32,
+            18 => ValueTag::F64,
+            19 => ValueTag::F128,
+            20 => ValueTag::Ref,
+            _ => ValueTag::Null,
+        }
     }
 
     #[inline]
     pub fn index(self) -> usize {
         (self.0 & Self::INDEX_MASK) as usize
+    }
+
+    /// 从原始 u32 构造 ValueHandle（供 extern "C" 原语跨 ABI 边界还原）
+    #[inline]
+    pub fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// 转为原始 u32（供 extern "C" 原语跨 ABI 边界传递）
+    #[inline]
+    pub fn to_raw(self) -> u32 {
+        self.0
     }
 
     pub const NULL: ValueHandle = ValueHandle((ValueTag::Null as u8 as u32) << 24);
@@ -504,11 +549,27 @@ impl Char {
     }
 
     pub fn successor(self) -> Self {
-        Char { codepoint: self.codepoint.wrapping_add(1) }
+        // [V-6] 跳过代理区 + 饱和到 0x10FFFF，避免 wrapping 回绕产生非法 codepoint
+        let next = if self.codepoint >= 0x10FFFF {
+            0x10FFFF
+        } else if self.codepoint == 0xD7FF {
+            0xE000
+        } else {
+            self.codepoint + 1
+        };
+        Char { codepoint: next }
     }
 
     pub fn predecessor(self) -> Self {
-        Char { codepoint: self.codepoint.wrapping_sub(1) }
+        // [V-6] 跳过代理区 + 饱和到 0，避免 wrapping 回绕产生非法 codepoint
+        let prev = if self.codepoint == 0 {
+            0
+        } else if self.codepoint == 0xE000 {
+            0xD7FF
+        } else {
+            self.codepoint - 1
+        };
+        Char { codepoint: prev }
     }
 
     pub fn compare(self, other: Self) -> Ordering {
@@ -574,6 +635,13 @@ impl GlueStr {
     }
     pub fn compare(&self, other: &Self) -> Ordering {
         self.inner.cmp(&other.inner)
+    }
+
+    /// 按码点索引取字符（UTF-8 安全）。
+    ///
+    /// 返回第 idx 个 Unicode 码点。越界返回 None。
+    pub fn char_at(&self, idx: usize) -> Option<char> {
+        self.inner.chars().nth(idx)
     }
 }
 
@@ -881,97 +949,8 @@ pub struct ThrowValue {
     pub payload: ThrowPayload,
 }
 
-// ---- iterator.rs → ArrayIterator, StringIterator, RangeIterator ----
-
-/// 数组迭代器
-#[derive(Debug, Clone)]
-pub struct ArrayIterator {
-    pub array: Rc<Vec<ValueHandle>>,
-    pub index: usize,
-}
-
-impl ArrayIterator {
-    pub fn new(array: Rc<Vec<ValueHandle>>) -> Self {
-        Self { array, index: 0 }
-    }
-}
-
-impl Iterator for ArrayIterator {
-    type Item = ValueHandle;
-
-    fn next(&mut self) -> Option<ValueHandle> {
-        if self.index < self.array.len() {
-            let val = self.array[self.index];
-            self.index += 1;
-            Some(val)
-        } else {
-            None
-        }
-    }
-}
-
-/// 字符串迭代器
-#[derive(Debug, Clone)]
-pub struct StringIterator {
-    pub string: Rc<str>,
-    pub byte_offset: usize,
-}
-
-impl StringIterator {
-    pub fn new(string: Rc<str>) -> Self {
-        Self { string, byte_offset: 0 }
-    }
-}
-
-impl Iterator for StringIterator {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<u32> {
-        if self.byte_offset >= self.string.len() {
-            return None;
-        }
-        let rest = &self.string[self.byte_offset..];
-        let c = rest.chars().next()?;
-        self.byte_offset += c.len_utf8();
-        Some(c as u32)
-    }
-}
-
-/// 范围迭代器（堆对象）
-#[derive(Debug, Clone)]
-pub struct RangeIterator {
-    pub current: i64,
-    pub end: i64,
-    pub inclusive: bool,
-}
-
-impl RangeIterator {
-    pub fn new(start: i64, end: i64, inclusive: bool) -> Self {
-        Self { current: start, end, inclusive }
-    }
-}
-
-impl Iterator for RangeIterator {
-    type Item = i64;
-
-    fn next(&mut self) -> Option<i64> {
-        if self.inclusive {
-            if self.current <= self.end {
-                let v = self.current;
-                self.current += 1;
-                Some(v)
-            } else {
-                None
-            }
-        } else if self.current < self.end {
-            let v = self.current;
-            self.current += 1;
-            Some(v)
-        } else {
-            None
-        }
-    }
-}
+// ---- iterator.rs → 已全部迁移至 Glue builtin (Iterator.glue) ----
+// 注：ArrayIterator / StringIterator / RangeIterator 均已迁移至 Glue builtin。
 
 // ---- concurrent.rs → AtomicValue, AsyncStatus, AsyncHandle, ChannelValue, SenderValue, ReceiverValue ----
 
@@ -986,13 +965,13 @@ impl AtomicValue {
         Self { data: Mutex::new(val) }
     }
     pub fn load(&self) -> ValueHandle {
-        *self.data.lock().unwrap()
+        *self.data.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub fn store(&self, val: ValueHandle) {
-        *self.data.lock().unwrap() = val;
+        *self.data.lock().unwrap_or_else(|e| e.into_inner()) = val;
     }
     pub fn swap(&self, val: ValueHandle) -> ValueHandle {
-        std::mem::replace(&mut *self.data.lock().unwrap(), val)
+        std::mem::replace(&mut *self.data.lock().unwrap_or_else(|e| e.into_inner()), val)
     }
 }
 
@@ -1024,16 +1003,16 @@ impl AsyncHandle {
         Self { status: Mutex::new(AsyncStatus::Pending), result: Mutex::new(None) }
     }
     pub fn status(&self) -> AsyncStatus {
-        *self.status.lock().unwrap()
+        *self.status.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub fn set_status(&self, status: AsyncStatus) {
-        *self.status.lock().unwrap() = status;
+        *self.status.lock().unwrap_or_else(|e| e.into_inner()) = status;
     }
     pub fn result(&self) -> Option<ValueHandle> {
-        *self.result.lock().unwrap()
+        *self.result.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub fn set_result(&self, val: ValueHandle) {
-        *self.result.lock().unwrap() = Some(val);
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(val);
     }
 }
 
@@ -1064,10 +1043,11 @@ impl ChannelValue {
         Self { buffer: Mutex::new(Vec::new()), capacity, closed: Mutex::new(false) }
     }
     pub fn send(&self, val: ValueHandle) -> Result<(), String> {
-        if *self.closed.lock().unwrap() {
+        let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        // [V-5] 持 buffer 锁期间检查 closed，与 close（同样持 buffer 锁）互斥，消除 TOCTOU
+        if *self.closed.lock().unwrap_or_else(|e| e.into_inner()) {
             return Err("channel closed".to_string());
         }
-        let mut buf = self.buffer.lock().unwrap();
         if self.capacity > 0 && buf.len() >= self.capacity {
             return Err("channel full".to_string());
         }
@@ -1075,7 +1055,7 @@ impl ChannelValue {
         Ok(())
     }
     pub fn recv(&self) -> Option<ValueHandle> {
-        let mut buf = self.buffer.lock().unwrap();
+        let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
         if !buf.is_empty() {
             Some(buf.remove(0))
         } else {
@@ -1089,17 +1069,19 @@ impl ChannelValue {
         self.recv()
     }
     pub fn close(&self) {
-        *self.closed.lock().unwrap() = true;
+        // [V-5] 持 buffer 锁设置 closed，与 send 的持锁检查互斥（锁序 buffer→closed 一致，无死锁）
+        let _buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
     }
     pub fn is_closed(&self) -> bool {
-        *self.closed.lock().unwrap()
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 impl Clone for ChannelValue {
     fn clone(&self) -> Self {
-        let buf = self.buffer.lock().unwrap().clone();
-        Self { buffer: Mutex::new(buf), capacity: self.capacity, closed: Mutex::new(*self.closed.lock().unwrap()) }
+        let buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Self { buffer: Mutex::new(buf), capacity: self.capacity, closed: Mutex::new(*self.closed.lock().unwrap_or_else(|e| e.into_inner())) }
     }
 }
 
@@ -1134,9 +1116,6 @@ pub enum HeapObj {
     LazyVal(LazyValue),
     ErrorVal(ErrorValue),
     ThrowVal(ThrowValue),
-    ArrayIter(ArrayIterator),
-    StringIter(StringIterator),
-    RangeIter(RangeIterator),
     AtomicVal(AtomicValue),
     AsyncVal(AsyncHandle),
     ChannelVal(ChannelValue),
@@ -1152,7 +1131,7 @@ pub type HeapRef = Rc<HeapObj>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefKind {
     Str, Array, Record, Adt, Newtype, Cell, Range, Closure, Partial, Builtin,
-    TraitVal, LazyVal, ErrorVal, ThrowVal, ArrayIter, StringIter, RangeIter,
+    TraitVal, LazyVal, ErrorVal, ThrowVal,
     AtomicVal, AsyncVal, ChannelVal, SenderVal, ReceiverVal, CoroutineFrame,
 }
 
@@ -1173,9 +1152,6 @@ impl HeapObj {
             HeapObj::LazyVal(_) => RefKind::LazyVal,
             HeapObj::ErrorVal(_) => RefKind::ErrorVal,
             HeapObj::ThrowVal(_) => RefKind::ThrowVal,
-            HeapObj::ArrayIter(_) => RefKind::ArrayIter,
-            HeapObj::StringIter(_) => RefKind::StringIter,
-            HeapObj::RangeIter(_) => RefKind::RangeIter,
             HeapObj::AtomicVal(_) => RefKind::AtomicVal,
             HeapObj::AsyncVal(_) => RefKind::AsyncVal,
             HeapObj::ChannelVal(_) => RefKind::ChannelVal,
@@ -1201,9 +1177,6 @@ impl HeapObj {
             HeapObj::LazyVal(_) => "lazy",
             HeapObj::ErrorVal(_) => "error",
             HeapObj::ThrowVal(_) => "throw",
-            HeapObj::ArrayIter(_) => "array_iter",
-            HeapObj::StringIter(_) => "string_iter",
-            HeapObj::RangeIter(_) => "range_iter",
             HeapObj::AtomicVal(_) => "atomic",
             HeapObj::AsyncVal(_) => "async",
             HeapObj::ChannelVal(_) => "channel",
@@ -1229,9 +1202,6 @@ impl HeapObj {
             HeapObj::LazyVal(_) => "<lazy>",
             HeapObj::ErrorVal(_) => "<error>",
             HeapObj::ThrowVal(_) => "<throw>",
-            HeapObj::ArrayIter(_) => "<iter>",
-            HeapObj::StringIter(_) => "<iter>",
-            HeapObj::RangeIter(_) => "<iter>",
             HeapObj::AtomicVal(_) => "<atomic>",
             HeapObj::AsyncVal(_) => "<async>",
             HeapObj::ChannelVal(_) => "<channel>",
@@ -1320,13 +1290,6 @@ impl Hash for HeapObj {
                 (b.fn_ptr as usize).hash(state);
                 b.name.hash(state);
             }
-            HeapObj::ArrayIter(a) => a.index.hash(state),
-            HeapObj::StringIter(s) => s.byte_offset.hash(state),
-            HeapObj::RangeIter(r) => {
-                r.current.hash(state);
-                r.end.hash(state);
-                r.inclusive.hash(state);
-            }
             HeapObj::Partial(_) | HeapObj::TraitVal(_) | HeapObj::LazyVal(_)
             | HeapObj::AtomicVal(_) | HeapObj::AsyncVal(_) | HeapObj::ChannelVal(_)
             | HeapObj::SenderVal(_) | HeapObj::ReceiverVal(_) | HeapObj::CoroutineFrame => {}
@@ -1366,6 +1329,17 @@ impl<T: Clone> Bucket<T> {
     #[inline]
     fn get(&self, idx: u32) -> &T {
         &self.data[idx as usize]
+    }
+
+    #[inline]
+    fn get_mut(&mut self, idx: u32) -> &mut T {
+        &mut self.data[idx as usize]
+    }
+
+    /// 当前已分配槽位数（含空闲未回收），用于 FFI 边界校验 handle 合法性
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
     }
 
     fn inc_ref(&mut self, idx: u32) {
@@ -1447,6 +1421,63 @@ impl_scalar_bucket_methods! {
 }
 
 impl ValueArena {
+    // ─── 全局 arena 访问（供 extern "C" 反射原语使用）──────────────
+    // Glue 是单线程编译器，thread_local 足够。
+    thread_local! {
+        static GLOBAL_ARENA: RefCell<ValueArena> = RefCell::new(ValueArena::new());
+    }
+
+    /// 全局 arena 只读访问
+    pub fn with_global<R>(f: impl FnOnce(&ValueArena) -> R) -> R {
+        Self::GLOBAL_ARENA.with(|cell| f(&cell.borrow()))
+    }
+
+    /// 全局 arena 可变访问
+    pub fn with_global_mut<R>(f: impl FnOnce(&mut ValueArena) -> R) -> R {
+        Self::GLOBAL_ARENA.with(|cell| f(&mut cell.borrow_mut()))
+    }
+
+    /// 从 ValueHandle 查全局 arena 拿 HeapObj（反射原语核心路径）
+    /// 返回 Rc clone，避免 thread_local borrow 跨函数返回的生命周期问题。
+    pub fn get_global_obj(handle: ValueHandle) -> Option<Rc<HeapObj>> {
+        if handle.tag() != ValueTag::Ref {
+            return None;
+        }
+        Some(Self::with_global(|arena| arena.get_ref(handle).clone()))
+    }
+
+    /// 校验 handle 是否指向 arena 中合法槽位（FFI 边界防御）。
+    /// 标量按 tag 查对应分桶 index 范围；Null/Void/Bool 为单例恒有效。
+    /// 用于 extern "C" 反射原语入口，防止 C 侧脏 handle 导致越界 panic。
+    pub fn is_valid_handle(handle: ValueHandle) -> bool {
+        Self::with_global(|arena| arena.is_valid_handle_inner(handle))
+    }
+
+    pub(crate) fn is_valid_handle_inner(&self, h: ValueHandle) -> bool {
+        let idx = h.index();
+        match h.tag() {
+            ValueTag::Null | ValueTag::Void | ValueTag::Bool => true,
+            ValueTag::Char => idx < self.char_bucket.len(),
+            ValueTag::I8 => idx < self.i8_bucket.len(),
+            ValueTag::I16 => idx < self.i16_bucket.len(),
+            ValueTag::I32 => idx < self.i32_bucket.len(),
+            ValueTag::I64 => idx < self.i64_bucket.len(),
+            ValueTag::U8 => idx < self.u8_bucket.len(),
+            ValueTag::U16 => idx < self.u16_bucket.len(),
+            ValueTag::U32 => idx < self.u32_bucket.len(),
+            ValueTag::U64 => idx < self.u64_bucket.len(),
+            ValueTag::Isize => idx < self.isz_bucket.len(),
+            ValueTag::Usize => idx < self.usz_bucket.len(),
+            ValueTag::I128 => idx < self.i128_bucket.len(),
+            ValueTag::U128 => idx < self.u128_bucket.len(),
+            ValueTag::F16 => idx < self.f16_bucket.len(),
+            ValueTag::F32 => idx < self.f32_bucket.len(),
+            ValueTag::F64 => idx < self.f64_bucket.len(),
+            ValueTag::F128 => idx < self.f128_bucket.len(),
+            ValueTag::Ref => idx < self.ref_bucket.len(),
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             char_bucket: Bucket::new(),
@@ -1553,6 +1584,27 @@ impl ValueArena {
     pub fn alloc_record(&mut self, r: RecordValue) -> ValueHandle {
         self.alloc_ref(HeapObj::Record(r))
     }
+
+    /// 就地修改记录字段（通过 Rc::make_mut，refcount==1 时零拷贝）。
+    /// field_name 为字段名，在 record.field_names 中查找索引。
+    pub fn set_record_field_by_name(
+        &mut self,
+        handle: ValueHandle,
+        field_name: &str,
+        new_value: ValueHandle,
+    ) {
+        let rc = self.ref_bucket.get_mut(handle.index() as u32);
+        if let HeapObj::Record(ref mut r) = Rc::make_mut(rc) {
+            for (i, name) in r.field_names.iter().enumerate() {
+                if name.as_deref() == Some(field_name) {
+                    if i < r.fields.len() {
+                        r.fields[i] = new_value;
+                    }
+                    return;
+                }
+            }
+        }
+    }
     pub fn alloc_adt(&mut self, a: AdtValue) -> ValueHandle {
         self.alloc_ref(HeapObj::Adt(a))
     }
@@ -1592,15 +1644,6 @@ impl ValueArena {
     }
     pub fn alloc_throw_err(&mut self, record: Rc<RecordValue>) -> ValueHandle {
         self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
-    }
-    pub fn alloc_array_iter(&mut self, array: Rc<Vec<ValueHandle>>) -> ValueHandle {
-        self.alloc_ref(HeapObj::ArrayIter(ArrayIterator::new(array)))
-    }
-    pub fn alloc_string_iter(&mut self, s: Rc<str>) -> ValueHandle {
-        self.alloc_ref(HeapObj::StringIter(StringIterator::new(s)))
-    }
-    pub fn alloc_range_iter(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
-        self.alloc_ref(HeapObj::RangeIter(RangeIterator::new(start, end, inclusive)))
     }
     pub fn alloc_atomic(&mut self, val: ValueHandle) -> ValueHandle {
         self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))
@@ -1875,9 +1918,6 @@ pub trait Value: Sized + Clone + Copy + PartialEq + Eq + Hash {
     fn as_lazy<'a>(&self, arena: &'a ValueArena) -> Option<&'a LazyValue>;
     fn as_error_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ErrorValue>;
     fn as_throw_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ThrowValue>;
-    fn as_array_iter<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayIterator>;
-    fn as_string_iter<'a>(&self, arena: &'a ValueArena) -> Option<&'a StringIterator>;
-    fn as_range_iter_obj<'a>(&self, arena: &'a ValueArena) -> Option<&'a RangeIterator>;
     fn as_atomic<'a>(&self, arena: &'a ValueArena) -> Option<&'a AtomicValue>;
     fn as_async_handle<'a>(&self, arena: &'a ValueArena) -> Option<&'a AsyncHandle>;
     fn as_channel<'a>(&self, arena: &'a ValueArena) -> Option<&'a ChannelValue>;
@@ -2234,27 +2274,6 @@ impl Value for ValueHandle {
     fn as_throw_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ThrowValue> {
         match arena.heap_obj_opt(*self)? {
             HeapObj::ThrowVal(t) => Some(t),
-            _ => None,
-        }
-    }
-    #[inline]
-    fn as_array_iter<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayIterator> {
-        match arena.heap_obj_opt(*self)? {
-            HeapObj::ArrayIter(i) => Some(i),
-            _ => None,
-        }
-    }
-    #[inline]
-    fn as_string_iter<'a>(&self, arena: &'a ValueArena) -> Option<&'a StringIterator> {
-        match arena.heap_obj_opt(*self)? {
-            HeapObj::StringIter(i) => Some(i),
-            _ => None,
-        }
-    }
-    #[inline]
-    fn as_range_iter_obj<'a>(&self, arena: &'a ValueArena) -> Option<&'a RangeIterator> {
-        match arena.heap_obj_opt(*self)? {
-            HeapObj::RangeIter(i) => Some(i),
             _ => None,
         }
     }
@@ -2788,15 +2807,6 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
         (HeapObj::Builtin(x), HeapObj::Builtin(y)) => {
             (x.fn_ptr as usize) == (y.fn_ptr as usize) && x.name == y.name
         }
-        (HeapObj::ArrayIter(x), HeapObj::ArrayIter(y)) => {
-            Rc::ptr_eq(&x.array, &y.array) && x.index == y.index
-        }
-        (HeapObj::StringIter(x), HeapObj::StringIter(y)) => {
-            Rc::ptr_eq(&x.string, &y.string) && x.byte_offset == y.byte_offset
-        }
-        (HeapObj::RangeIter(x), HeapObj::RangeIter(y)) => {
-            x.current == y.current && x.end == y.end && x.inclusive == y.inclusive
-        }
         _ => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
 }
@@ -2952,9 +2962,6 @@ fn deep_clone_heap(
                 payload: ThrowPayload::Err(r.clone()),
             }),
         },
-        HeapObj::ArrayIter(a) => HeapObj::ArrayIter(ArrayIterator::new(a.array.clone())),
-        HeapObj::StringIter(s) => HeapObj::StringIter(StringIterator::new(s.string.clone())),
-        HeapObj::RangeIter(r) => HeapObj::RangeIter(RangeIterator::new(r.current, r.end, r.inclusive)),
         HeapObj::Builtin(b) => HeapObj::Builtin(b.clone()),
         HeapObj::TraitVal(t) => HeapObj::TraitVal(t.clone()),
         HeapObj::LazyVal(l) => HeapObj::LazyVal(l.clone()),
@@ -3161,15 +3168,6 @@ impl ValueArena {
         self.alloc_ref(HeapObj::ThrowVal(ThrowValue {
             payload: ThrowPayload::Err(record),
         }))
-    }
-    pub fn array_iter(&mut self, array: Rc<Vec<ValueHandle>>) -> ValueHandle {
-        self.alloc_ref(HeapObj::ArrayIter(ArrayIterator::new(array)))
-    }
-    pub fn string_iter(&mut self, s: Rc<str>) -> ValueHandle {
-        self.alloc_ref(HeapObj::StringIter(StringIterator::new(s)))
-    }
-    pub fn range_iter(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
-        self.alloc_ref(HeapObj::RangeIter(RangeIterator::new(start, end, inclusive)))
     }
     pub fn atomic(&mut self, val: ValueHandle) -> ValueHandle {
         self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))

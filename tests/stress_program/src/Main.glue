@@ -185,7 +185,7 @@ fun main(): void {
     while di < cast(dedup_vals.len()).to(i32) {
         val x = dedup_vals[cast(di).to(usize)]
         var found = false
-        for elem in seen {
+        for elem in seen.iter() {
             if elem == x { found = true }
         }
         if !found {

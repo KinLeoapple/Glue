@@ -1,7 +1,8 @@
-// io.glue — 同步 IO syscall 原语 @extern("C") 声明
+// builtin/io/Raw.glue — IO 原语 @extern("C") 声明（builtin，默认可见）
 //
 // 底层 POSIX/Windows IO 能力，由 cc crate 从 emit-c 生成的 .c 编译。
 // 跨平台逻辑通过 #if 条件编译在 C body 中实现。
+// 供 builtin/io/Console.glue 和 std/io/*.glue 的 wrapper 调用。
 
 @c_include("fcntl.h")
 @c_include("sys/stat.h")
@@ -140,7 +141,7 @@ fun __stdin_readln_into(buf: u8[]): i64 #{
 
 @c_include("sys/stat.h")
 @extern("C")
-fun __dir_create(path: str, recursive: bool): i32 #{
+fun __dir_create_raw(path: str, recursive: bool): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         if (recursive) {
             char buf[4096];
@@ -170,7 +171,7 @@ fun __dir_create(path: str, recursive: bool): i32 #{
 
 @c_include("unistd.h")
 @extern("C")
-fun __dir_remove(path: str, recursive: bool): i32 #{
+fun __dir_remove_raw(path: str, recursive: bool): i32 #{
     (void)recursive;
     #if defined(_WIN32) || defined(_WIN64)
         return _rmdir(path_data);

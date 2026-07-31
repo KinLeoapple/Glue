@@ -1,2 +1,2 @@
 // builtin iter 包声明
-pub pack Iter
+pub pack Iterator

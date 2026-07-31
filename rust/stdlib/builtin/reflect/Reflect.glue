@@ -1,0 +1,69 @@
+// builtin/reflect/Reflect.glue — 运行时反射（builtin，默认可见）
+//
+// Reflect 内建类型包装 Value (ValueHandle)，方法全部委托 @extern("C") 原语。
+// 原语接收 Value 直接 match HeapObj 读取已携带的类型信息。
+//
+// 无 type_table、无 type_id 注入、无 Sema 拦截。零元数据内存，零额外开销。
+//
+// 用法（builtin 默认可见，无需 import）：
+//   val r = reflect(x)        // 任意值 → Reflect
+//   val s = format(x)         // 任意值 → str
+//   val k = typeof(x)         // 任意值 → kind (u8)
+//   val tn = type_name(x)     // 任意值 → 类型名 (str)
+
+// ─── Reflect 内建类型：包装 Value ──────────────────────────────
+type Reflect = Reflect(inner: Value) {
+    // ─── 类型元信息方法 ───────────────────────────────────────────
+    pub fun kind(self): u8 {
+        __reflect_kind(self.inner)
+    }
+
+    pub fun type_name(self): str {
+        __reflect_type_name(self.inner)
+    }
+
+    pub fun size(self): u8 {
+        __reflect_size(self.inner)
+    }
+
+    pub fun field_count(self): u16 {
+        __reflect_field_count(self.inner)
+    }
+
+    // ─── 字段元信息方法 ───────────────────────────────────────────
+    pub fun field_name(self, index: u16): str {
+        __reflect_field_name(self.inner, index)
+    }
+
+    pub fun field_value(self, index: u16): Reflect {
+        Reflect(__reflect_field_value(self.inner, index))
+    }
+
+    // ─── 数组长度 ─────────────────────────────────────────────────
+    pub fun array_len(self): usize {
+        __reflect_array_len(self.inner)
+    }
+
+    // ─── ADT 构造器名 ─────────────────────────────────────────────
+    pub fun adt_constructor(self): str {
+        __reflect_adt_constructor(self.inner)
+    }
+}
+
+// ─── 顶层反射入口 ─────────────────────────────────────────────────
+// reflect(x): 包装 Value 为 Reflect，无 Sema 拦截，无 type_id 注入
+pub fun reflect(x: Value): Reflect {
+    Reflect(x)
+}
+
+pub fun typeof(x: Value): u8 {
+    __reflect_kind(x)
+}
+
+pub fun type_name(x: Value): str {
+    __reflect_type_name(x)
+}
+
+pub fun format(x: Value): str {
+    __reflect_format(x)
+}

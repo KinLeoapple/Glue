@@ -103,7 +103,7 @@ fun main(): void {
         val mapped = mapAdd(arr, cast(n).to(i64))
         // 求和验证
         var s: i64 = 0
-        for x in mapped {
+        for x in mapped.iter() {
             s = s + x
         }
         mapSum = (mapSum + s) % 1073741824

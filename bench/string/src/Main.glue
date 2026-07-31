@@ -29,7 +29,7 @@ fun repeatBuild(iters: i32, len: i32): i64 {
 fun mixedStringOps(s: str): i64 {
     var sum: i64 = 0
     // 字符迭代
-    for ch in s {
+    for ch in str_iter(s) {
         sum = sum + cast(ch).to(i64)
     }
     // 索引访问

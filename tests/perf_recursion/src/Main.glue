@@ -22,7 +22,7 @@ fun main(): void {
     }
     println(arr.len())                   // 10000
     var sum: i64 = 0
-    for x in arr {
+    for x in arr.iter() {
         sum = sum + cast(x).to(i64)
     }
     println(sum)                         // 49995000
