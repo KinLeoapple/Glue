@@ -476,6 +476,19 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     out
                 }
                 HeapObj::Str(glue_str) => glue_str.bytes().to_string(),
+                HeapObj::LazyVal(lazy) => {
+                    // 已 forced 的 LazyValue：格式化缓存值
+                    // 未 forced 的 LazyValue：由 Engine 的 force_lazy_value_sync 预先处理，
+                    // 此处仅处理嵌套结构中残留的未 forced LazyValue（防御性兜底）
+                    if lazy.forced.load(std::sync::atomic::Ordering::Relaxed) {
+                        match &*lazy.cached.lock().unwrap() {
+                            Some(v) => format_value(v, depth + 1),
+                            None => "<lazy:empty>".to_string(),
+                        }
+                    } else {
+                        "<lazy>".to_string()
+                    }
+                }
                 _ => {
                     // 其他堆对象：用 ref_kind 名兜底
                     "<non-scalar>".to_string()

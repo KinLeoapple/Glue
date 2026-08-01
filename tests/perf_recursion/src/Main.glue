@@ -1,7 +1,6 @@
 // 性能/大输入压测（手动跑，不纳入回归全绿集）
 // 观察点：尾递归深度（O(n)、TCO 不爆栈）、数组大输入
 
-import std.io.Console.{println}
 type List<T> = | Nil | Cons(T, List<T>)
 
 // 尾递归深度计数（TCO，O(n)，常数栈）

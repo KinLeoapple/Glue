@@ -2,7 +2,6 @@
 // 文档 §4.6 一等 Trait 值, §4.7 运行时表示 (vtable), §6.10 Lazy
 
 // ---- 内联 Trait 值 (§4.6.3) ----
-import std.io.Console.{println}
 trait Logger {
     fun log(msg: str) : void
 }

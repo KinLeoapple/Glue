@@ -1,6 +1,5 @@
 // 泛型 ADT 边缘测试：多参数、递归、泛型高阶函数（map/foldl/tree）
 
-import std.io.Console.{println}
 type Pair<A, B> = Pair(first: A, second: B)
 
 type Lst<T> = | Nil | Cons(T, Lst<T>)

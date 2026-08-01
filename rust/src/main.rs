@@ -616,6 +616,14 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
         .with_builtins(builtin_modules)
         .build();
 
+    // 检查 IR 编译错误（未实现的特性降级、找不到函数等）
+    if !graph.ir_errors.is_empty() {
+        for err in &graph.ir_errors {
+            eprintln!("{}: IR error: {}", entry_path, err);
+        }
+        process::exit(1);
+    }
+
     if debug {
         eprintln!("  IR: {} nodes, {} subgraphs, {} compute_fns",
             graph.nodes.len(), graph.subgraphs.len(), graph.compute_fns.len());

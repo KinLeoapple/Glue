@@ -837,11 +837,14 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         // ── reflect: Rust 侧实现（非 C 库函数），直接调用 Reflect::format_value ──
         "__reflect_format" => {
             let v = frame.get_value_by_global(inputs[0]);
+            // LazyValue 强制求值：格式化前触发 thunk 计算
+            let v = force_lazy_value_sync(frame, &v);
             let s = crate::Reflect::format_value(&v, 0);
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
         }
         "__reflect_scalar_to_str" => {
             let v = frame.get_value_by_global(inputs[0]);
+            let v = force_lazy_value_sync(frame, &v);
             let s = crate::Reflect::format_value(&v, 0);
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
         }
@@ -1330,6 +1333,97 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
+/// compute_fn: 切片 `recv[start..end]` / `recv[start..=end]`。
+///
+/// 三输入：recv, start, end。inclusive 标志从 graph.slice_inclusive[node] 读取。
+/// - str：按码点索引切片，返回新 str
+/// - array：按元素索引切片，返回新 array
+/// 越界时 clamp 到 [0, len]，与 Rust 切片语义一致（不 panic）。
+pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
+    use std::sync::Arc;
+    use crate::Value::{HeapObj, ArrayValue, GlueStr, RecordValue, ThrowValue, ThrowPayload};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let recv_val = frame.get_value_by_global(inputs[0]);
+    let start = frame.get_value_by_global(inputs[1]).as_usize();
+    let mut end = frame.get_value_by_global(inputs[2]).as_usize();
+    let inclusive = graph.slice_inclusive[node.0 as usize];
+    if inclusive {
+        end = end.saturating_add(1);
+    }
+    let make_err = |msg: &str| {
+        let record = Arc::new(RecordValue {
+            type_name: "SliceError".to_string(),
+            fields: vec![Value::ref_val(HeapObj::Str(GlueStr::new(msg)))],
+            field_names: vec![Some("message".to_string())],
+            field_ref_bits: 1,
+        });
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    };
+    match recv_val.heap_obj() {
+        Some(crate::Value::HeapObj::Array(arr)) => {
+            let len = arr.len();
+            let s = start.min(len);
+            let e = end.min(len);
+            if s > e {
+                return make_err(&format!("slice start {} > end {}", s, e));
+            }
+            let sliced: Vec<Value> = arr.elements[s..e].to_vec();
+            Value::ref_val(HeapObj::Array(ArrayValue {
+                elements: sliced,
+                fixed_size: None,
+                elem_is_ref: arr.elem_is_ref,
+                scalar_soa: None,
+            }))
+        }
+        Some(crate::Value::HeapObj::Str(s)) => {
+            // 按码点索引切片：collect chars in [start, end)，重组为 str
+            let chars: Vec<char> = s.bytes().chars().collect();
+            let len = chars.len();
+            let st = start.min(len);
+            let en = end.min(len);
+            if st > en {
+                return make_err(&format!("slice start {} > end {}", st, en));
+            }
+            let mut buf = String::with_capacity(en - st);
+            for c in &chars[st..en] {
+                buf.push(*c);
+            }
+            Value::ref_val(HeapObj::Str(GlueStr::new(buf)))
+        }
+        _ => make_err("slice on non-sliceable type"),
+    }
+}
+
+/// compute_fn: 字符串拼接 `lhs + rhs`（两侧均为 str）。
+///
+/// 两输入：lhs, rhs。任一非 str 时返回错误值。
+pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
+    use std::sync::Arc;
+    use crate::Value::{HeapObj, GlueStr, RecordValue, ThrowValue, ThrowPayload};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let lhs = frame.get_value_by_global(inputs[0]);
+    let rhs = frame.get_value_by_global(inputs[1]);
+    let make_err = |msg: &str| {
+        let record = Arc::new(RecordValue {
+            type_name: "TypeError".to_string(),
+            fields: vec![Value::ref_val(HeapObj::Str(GlueStr::new(msg)))],
+            field_names: vec![Some("message".to_string())],
+            field_ref_bits: 1,
+        });
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    };
+    match (lhs.heap_obj(), rhs.heap_obj()) {
+        (Some(HeapObj::Str(a)), Some(HeapObj::Str(b))) => {
+            Value::ref_val(HeapObj::Str(a.concat(b)))
+        }
+        _ => make_err("str concat on non-str operand"),
+    }
+}
+
 /// compute_fn: 记录字段赋值（就地修改 RecordValue 的字段，返回 void）
 ///
 /// inputs[0] = 记录值节点，inputs[1] = 新值。
@@ -1644,6 +1738,382 @@ pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
         upvalue_ref_bits: 0,
         cell_upvalues: 0,
     }))
+}
+
+/// compute_fn: inline_trait 构造（idx 266）。
+///
+/// 从 graph.trait_construct_infos 取 trait 名 + 方法列表，
+/// 合并节点 inputs（各方法 upvalues 依次拼接）构造多个 Closure，
+/// 打包成 TraitValue 堆对象。
+pub fn compute_trait_construct(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, Closure, TraitValue};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let info = graph.trait_construct_infos[node.0 as usize]
+        .as_ref()
+        .expect("trait construct node has no TraitConstructInfo");
+
+    // 从 inputs 按各方法 upvalue_count 依次切分，构造每个方法的 Closure
+    let mut method_values: Vec<Value> = Vec::with_capacity(info.methods.len());
+    let mut input_cursor = 0usize;
+    for m in &info.methods {
+        let upvalue_count = m.upvalue_count as usize;
+        let upvalues: Vec<Value> = inputs[input_cursor..input_cursor + upvalue_count]
+            .iter()
+            .map(|&in_node| frame.get_value_by_global(in_node))
+            .collect();
+        input_cursor += upvalue_count;
+        method_values.push(Value::ref_val(HeapObj::Closure(Closure {
+            func_id: m.subgraph_id.0,
+            arity: m.arity,
+            upvalues,
+            bound_args: Vec::new(),
+            self_upvalue_idx: -1,
+            upvalue_ref_bits: 0,
+            cell_upvalues: 0,
+        })));
+    }
+
+    Value::ref_val(HeapObj::TraitVal(TraitValue {
+        trait_name: info.trait_name.clone(),
+        method_names: info.method_names.clone(),
+        method_values,
+        data: None,
+        owned: true,
+    }))
+}
+
+/// compute_fn: lazy 构造（idx 267）。
+///
+/// 从 graph.lazy_construct_infos 取 thunk 子图 id，
+/// 合并节点 inputs（upvalues）构造 LazyValue 堆对象。
+/// thunk 未求值，首次 force 时启动子图计算并缓存结果。
+pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, LazyValue, Closure};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let info = graph.lazy_construct_infos[node.0 as usize]
+        .as_ref()
+        .expect("lazy construct node has no LazyConstructInfo");
+
+    // upvalues 从 inputs 收集，存入 Closure（thunk 首次 force 时用）
+    let upvalues: Vec<Value> = inputs
+        .iter()
+        .map(|&in_node| frame.get_value_by_global(in_node))
+        .collect();
+
+    // 用 Closure 包装 thunk 子图（func_id = thunk_sg），存为 LazyValue.data
+    // force 时从 data 取 Closure，启动子图计算，结果缓存到 cached
+    let thunk_closure = Value::ref_val(HeapObj::Closure(Closure {
+        func_id: info.thunk_sg.0,
+        arity: 0,
+        upvalues,
+        bound_args: Vec::new(),
+        self_upvalue_idx: -1,
+        upvalue_ref_bits: 0,
+        cell_upvalues: 0,
+    }));
+
+    Value::ref_val(HeapObj::LazyVal(LazyValue {
+        cached: std::sync::Mutex::new(None),
+        forced: std::sync::atomic::AtomicBool::new(false),
+        data: Some(thunk_closure),
+    }))
+}
+
+// =========================================================================
+// LazyValue force 机制：同步执行 thunk 子图，缓存结果
+// =========================================================================
+
+/// 强制求值 LazyValue：同步执行 thunk 子图，返回计算结果。
+///
+/// 若已 forced，直接返回 cached 值；否则创建 thunk 帧，同步运行至完成，
+/// 将结果缓存到 LazyValue（通过 Arc::make_mut 原地更新），返回结果。
+///
+/// 此函数在 compute_ffi_call 的 __reflect_format 处理器中调用，
+/// 用于在格式化前强制求值 lazy 值。
+pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Value {
+    use crate::Value::{Closure, HeapObj, LazyValue};
+
+    // 提取 LazyValue 引用
+    let arc = match lazy_val {
+        Value::Ref(r) => r,
+        _ => return lazy_val.clone(), // 非 LazyValue，直接返回
+    };
+
+    // 检查是否已 forced
+    {
+        if let HeapObj::LazyVal(lazy) = &**arc {
+            if lazy.forced.load(std::sync::atomic::Ordering::Relaxed) {
+                return lazy.cached.lock().unwrap().clone().unwrap_or(Value::NULL);
+            }
+        } else {
+            return lazy_val.clone(); // 非 LazyVal，直接返回
+        }
+    }
+
+    // 取 thunk Closure
+    let closure = {
+        let HeapObj::LazyVal(lazy) = &**arc else { return lazy_val.clone() };
+        match &lazy.data {
+            Some(v) => match v.heap_obj() {
+                Some(HeapObj::Closure(c)) => c.clone(),
+                _ => return Value::NULL,
+            },
+            None => return Value::NULL,
+        }
+    };
+
+    let graph = caller_frame.graph.clone();
+    let thunk_sg = SubGraphId(closure.func_id);
+
+    // 创建 thunk 帧
+    let (node_start, node_end) = graph.subgraphs[thunk_sg.0 as usize].node_range;
+    let node_count = (node_end.0 - node_start.0) as usize;
+    let mut thunk_frame = Frame::new(FrameId(0xFFFF_FFFF), thunk_sg, node_count, graph.clone());
+    prepare_frame_shared(&mut thunk_frame, &graph);
+
+    // 注入 upvalues 作为参数
+    let offset = node_start.0 as usize;
+    let param_count = graph.subgraphs[thunk_sg.0 as usize].param_count as usize;
+    for (i, arg) in closure.upvalues.iter().enumerate().take(param_count) {
+        let local_id = NodeId(i as u32);
+        let consumer_count = graph.downstreams[offset + i].len() as u16;
+        thunk_frame.set_value(local_id, arg.clone(), consumer_count);
+        thunk_frame.push_ready(local_id);
+    }
+
+    // 设置 parent_frame_ptr：thunk 内可通过帧链穿透访问外层变量
+    thunk_frame.parent_frame_ptr = caller_frame as *mut Frame;
+
+    // 同步执行 thunk 帧
+    let result = run_frame_sync(&mut thunk_frame, &graph);
+
+    // 缓存结果到 LazyValue（通过 Mutex/AtomicBool 的 interior mutability 更新）
+    if let HeapObj::LazyVal(lazy) = &**arc {
+        lazy.forced.store(true, std::sync::atomic::Ordering::Relaxed);
+        *lazy.cached.lock().unwrap() = Some(result.clone());
+    }
+
+    result
+}
+
+/// 同步执行帧至完成，处理嵌套函数调用、控制信号、vtable 分派。
+///
+/// 这是 Engine 异步执行模型的同步简化版：
+/// - 弹出就绪节点 → 调用 compute_fn → 处理 pending_call/control_signal
+/// - pending_call：递归创建子帧 + 同步执行 + 注入返回值
+/// - control_signal：Return 直接返回，Break/Continue 传播
+///
+/// 不支持：async/await、channel/timer 事件、select、循环体复用。
+/// 适用于 thunk 子图（纯计算 + 同步函数调用）。
+fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
+    use crate::Ir::{ControlSignal, LoopKind, NodeKind, PendingCall, SignalKind, SubGraphId};
+
+    loop {
+        // 1. 检查控制信号（return/break/continue 已触发）
+        let cs = frame.control_signal.clone();
+        match cs {
+            ControlSignal::Return(v) => return v,
+            ControlSignal::Break | ControlSignal::Continue => return Value::VOID,
+            ControlSignal::None => {}
+        }
+
+        // 2. 弹出就绪节点
+        let local_id = match frame.pop_ready() {
+            Some(n) => n,
+            None => {
+                // 无就绪节点：从 return_node 提取返回值
+                let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
+                return frame.get_value_by_global(sg.return_node);
+            }
+        };
+
+        let node_start = frame.node_offset;
+        let graph_node_id = NodeId(local_id.0 + node_start);
+        let node = graph.nodes[graph_node_id.0 as usize];
+
+        // 3. 执行 compute_fn
+        let pre_filled = frame.value_table.ready[local_id.0 as usize];
+        let value = if pre_filled {
+            frame.value_table.values[local_id.0 as usize].clone()
+        } else {
+            let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
+            compute_fn(frame, graph_node_id)
+        };
+
+        // 4. vtable 动态分派（Call 节点有 vtable_call_methods 但无 call_target）
+        if frame.pending_call.is_none() {
+            if let Some(ref method_name) = graph.vtable_call_methods[graph_node_id.0 as usize] {
+                let n = &graph.nodes[graph_node_id.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let recv_val = frame.get_value_by_global(inputs[0]);
+
+                let (target_sg, upvalues): (SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
+                    Some(crate::Value::HeapObj::TraitVal(tv)) => {
+                        match tv.method_names.iter().position(|m| m.as_str() == method_name.as_str()) {
+                            Some(i) => match tv.method_values[i].heap_obj() {
+                                Some(crate::Value::HeapObj::Closure(c)) => {
+                                    (SubGraphId(c.func_id), c.upvalues.clone())
+                                }
+                                _ => panic!("vtable method is not a Closure"),
+                            },
+                            None => panic!("TraitValue has no method '{}'", method_name),
+                        }
+                    }
+                    _ => panic!("vtable call on non-trait value"),
+                };
+
+                let arity = (graph.subgraphs[target_sg.0 as usize].param_count as usize)
+                    .saturating_sub(upvalues.len());
+                let mut args: Vec<Value> = Vec::with_capacity(arity + upvalues.len());
+                for &in_node in inputs.iter().skip(1).take(arity) {
+                    args.push(frame.get_value_by_global(in_node));
+                }
+                args.extend(upvalues);
+
+                let call_node_local = NodeId(graph_node_id.0.wrapping_sub(frame.node_offset));
+                frame.pending_call = Some(PendingCall {
+                    target_sg,
+                    args,
+                    call_node_local,
+                    is_async: false,
+                });
+            }
+        }
+
+        // 5. 处理 pending_call
+        let pending = frame.pending_call.clone();
+        if let Some(pending) = pending {
+            frame.pending_call = None;
+
+            // 尾调用：复用当前帧
+            if graph.tail_call_flags[graph_node_id.0 as usize] {
+                switch_subgraph_shared(frame, graph, pending.target_sg, &pending.args);
+                continue;
+            }
+
+            let target_loop_kind = graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
+
+            // LoopBody：不支持循环体复用（thunk 不应有循环），回退为普通调用
+            let (child_start, child_end) = graph.subgraphs[pending.target_sg.0 as usize].node_range;
+            let child_count = (child_end.0 - child_start.0) as usize;
+            let mut child_frame = Frame::new(
+                FrameId(0xFFFF_FFFE),
+                pending.target_sg,
+                child_count,
+                frame.graph.clone(),
+            );
+            prepare_frame_shared(&mut child_frame, graph);
+
+            // 注入参数
+            let child_offset = child_start.0 as usize;
+            let child_param_count = graph.subgraphs[pending.target_sg.0 as usize].param_count as usize;
+            for (i, arg) in pending.args.iter().enumerate().take(child_param_count) {
+                let lid = NodeId(i as u32);
+                let cc = graph.downstreams[child_offset + i].len() as u16;
+                child_frame.set_value(lid, arg.clone(), cc);
+                child_frame.push_ready(lid);
+            }
+
+            // 设置帧链指针（变量穿透访问）
+            let same_function = graph.subgraphs[frame.subgraph_id.0 as usize].function_id
+                == graph.subgraphs[pending.target_sg.0 as usize].function_id;
+            child_frame.parent_frame_ptr = if same_function {
+                frame as *mut Frame
+            } else {
+                std::ptr::null_mut()
+            };
+            child_frame.root_frame_ptr = if same_function {
+                if frame.root_frame_ptr.is_null() {
+                    frame as *mut Frame
+                } else {
+                    frame.root_frame_ptr
+                }
+            } else {
+                std::ptr::null_mut()
+            };
+
+            // 同步执行子帧
+            let child_result = run_frame_sync(&mut child_frame, graph);
+            let child_signal = child_frame.control_signal.clone();
+
+            // 注入返回值到当前帧
+            let consumer_count = graph.downstreams[graph_node_id.0 as usize].len() as u16;
+            frame.set_value(pending.call_node_local, child_result.clone(), consumer_count);
+
+            // throw 传播：返回值为 ThrowVal(Err) 时设 Return 信号
+            let is_throw_err = matches!(
+                child_result.heap_obj(),
+                Some(crate::Value::HeapObj::ThrowVal(t)) if matches!(t.payload, crate::Value::ThrowPayload::Err(_))
+            );
+            if is_throw_err {
+                frame.control_signal = ControlSignal::Return(child_result);
+                continue;
+            }
+
+            // Gate 分支控制信号传播（if/match 中的 return/break/continue）
+            let is_gate = graph.nodes[graph_node_id.0 as usize].kind == NodeKind::Gate;
+            if is_gate && !matches!(child_signal, ControlSignal::None) {
+                frame.control_signal = child_signal;
+                continue;
+            }
+
+            // LoopBody 完成处理
+            if target_loop_kind == LoopKind::LoopBody {
+                match child_signal {
+                    ControlSignal::Break | ControlSignal::Return(_) => {
+                        frame.control_signal = child_signal;
+                        continue;
+                    }
+                    ControlSignal::Continue | ControlSignal::None => {
+                        // 循环继续：通知下游，循环帧会重新触发 body 调用
+                        notify_downstream_shared(
+                            frame, graph, pending.call_node_local, graph_node_id, NodeId(node_start),
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // 检查控制信号节点（return/break/continue 声明）
+            if let Some(kind) = graph.control_signal_nodes[graph_node_id.0 as usize] {
+                frame.control_signal = match kind {
+                    SignalKind::Return => ControlSignal::Return(child_result),
+                    SignalKind::Break => ControlSignal::Break,
+                    SignalKind::Continue => ControlSignal::Continue,
+                };
+                continue;
+            }
+
+            notify_downstream_shared(frame, graph, pending.call_node_local, graph_node_id, NodeId(node_start));
+        } else {
+            // 6. 普通节点：写值表 + 检查控制信号 + 通知下游
+            let consumer_count = graph.downstreams[graph_node_id.0 as usize].len() as u16;
+            frame.set_value(local_id, value.clone(), consumer_count);
+
+            // 检查控制信号声明节点
+            if let Some(kind) = graph.control_signal_nodes[graph_node_id.0 as usize] {
+                frame.control_signal = match kind {
+                    SignalKind::Return => ControlSignal::Return(value),
+                    SignalKind::Break => ControlSignal::Break,
+                    SignalKind::Continue => ControlSignal::Continue,
+                };
+                continue;
+            }
+
+            // compute_propagate 等直接设 control_signal 的 compute_fn：
+            // 检查是否被设为非 None（compute_propagate 在 Err 时设 Return）
+            let cs2 = frame.control_signal.clone();
+            if !matches!(cs2, ControlSignal::None) {
+                continue;
+            }
+
+            notify_downstream_shared(frame, graph, local_id, graph_node_id, NodeId(node_start));
+        }
+    }
 }
 
 /// compute_fn: 闭包调用（idx 41）。
@@ -2563,7 +3033,8 @@ impl Engine {
                         self.graph.inputs_pool.get(n.inputs_offset, n.input_count);
                     let recv_val = self.frames.get(fid).get_value_by_global(inputs[0]);
 
-                    let target_sg = match recv_val.heap_obj() {
+                    // 从 TraitVal 查方法 Closure，取 subgraph_id + upvalues
+                    let (target_sg, upvalues): (crate::Ir::SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
                         Some(crate::Value::HeapObj::TraitVal(tv)) => {
                             match tv
                                 .method_names
@@ -2571,10 +3042,9 @@ impl Engine {
                                 .position(|m| m.as_str() == method_name.as_str())
                             {
                                 Some(i) => {
-                                    let method_handle = tv.method_values[i];
-                                    match self.arena.heap_obj_opt(method_handle) {
+                                    match tv.method_values[i].heap_obj() {
                                         Some(crate::Value::HeapObj::Closure(c)) => {
-                                            crate::Ir::SubGraphId(c.func_id)
+                                            (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
                                         }
                                         _ => panic!("vtable method is not a Closure"),
                                     }
@@ -2585,13 +3055,15 @@ impl Engine {
                         _ => panic!("vtable call on non-trait value"),
                     };
 
-                    let param_count =
-                        self.graph.subgraphs[target_sg.0 as usize].param_count as usize;
-                    let args: Vec<Value> = inputs
-                        .iter()
-                        .take(param_count)
-                        .map(|&in_node| self.frames.get(fid).get_value_by_global(in_node))
-                        .collect();
+                    // 参数组装：跳过 receiver (inputs[0])，取方法实参 (inputs[1..1+arity])，
+                    // 再追加 Closure 携带的 upvalues，与子图参数节点顺序一致。
+                    let arity = (self.graph.subgraphs[target_sg.0 as usize].param_count as usize)
+                        .saturating_sub(upvalues.len());
+                    let mut args: Vec<Value> = Vec::with_capacity(arity + upvalues.len());
+                    for &in_node in inputs.iter().skip(1).take(arity) {
+                        args.push(self.frames.get(fid).get_value_by_global(in_node));
+                    }
+                    args.extend(upvalues);
 
                     let call_node_local =
                         NodeId(graph_node_id.0 - self.frames.get(fid).node_offset);
@@ -4193,7 +4665,8 @@ fn run_frame_nodes(
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let recv_val = frame.get_value_by_global(inputs[0]);
 
-                let target_sg = match recv_val.heap_obj() {
+                // 从 TraitVal 查方法 Closure，取 subgraph_id + upvalues
+                let (target_sg, upvalues): (crate::Ir::SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
                     Some(crate::Value::HeapObj::TraitVal(tv)) => {
                         match tv
                             .method_names
@@ -4201,16 +4674,12 @@ fn run_frame_nodes(
                             .position(|m| m.as_str() == method_name.as_str())
                         {
                             Some(i) => {
-                                let method_handle = tv.method_values[i];
-                                // 短临界区：锁 arena 取 Closure func_id
-                                let func_id = {
-                                    let arena = shared.arena.lock();
-                                    match arena.heap_obj_opt(method_handle) {
-                                        Some(crate::Value::HeapObj::Closure(c)) => c.func_id,
-                                        _ => panic!("vtable method is not a Closure"),
+                                match tv.method_values[i].heap_obj() {
+                                    Some(crate::Value::HeapObj::Closure(c)) => {
+                                        (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
                                     }
-                                };
-                                crate::Ir::SubGraphId(func_id)
+                                    _ => panic!("vtable method is not a Closure"),
+                                }
                             }
                             None => panic!("TraitValue has no method '{}'", method_name),
                         }
@@ -4218,13 +4687,15 @@ fn run_frame_nodes(
                     _ => panic!("vtable call on non-trait value"),
                 };
 
-                let param_count =
-                    graph.subgraphs[target_sg.0 as usize].param_count as usize;
-                let args: Vec<Value> = inputs
-                    .iter()
-                    .take(param_count)
-                    .map(|&in_node| frame.get_value_by_global(in_node))
-                    .collect();
+                // 参数组装：跳过 receiver (inputs[0])，取方法实参 (inputs[1..1+arity])，
+                // 再追加 Closure 携带的 upvalues，与子图参数节点顺序一致。
+                let arity = (graph.subgraphs[target_sg.0 as usize].param_count as usize)
+                    .saturating_sub(upvalues.len());
+                let mut args: Vec<Value> = Vec::with_capacity(arity + upvalues.len());
+                for &in_node in inputs.iter().skip(1).take(arity) {
+                    args.push(frame.get_value_by_global(in_node));
+                }
+                args.extend(upvalues);
 
                 let call_node_local = NodeId(graph_node_id.0.wrapping_sub(frame.node_offset));
                 frame.pending_call = Some(PendingCall {

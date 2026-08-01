@@ -2,8 +2,6 @@
 import std.net.Addr
 import std.net.TcpListener
 import std.net.TcpStream
-import std.io.Console.{println}
-
 // 服务端发送任务：accept 后发送 3 行数据，然后关闭
 async fun sender_task(listener: TcpListener): Async<Throw<void, IOError>> {
     val ar = listener.accept(0i64).await()?

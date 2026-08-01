@@ -710,6 +710,39 @@ pub struct ClosureInfo {
     pub arity: u8,
 }
 
+/// inline_trait 构造节点信息（按 NodeId 索引）。
+///
+/// compute_trait_construct（compute_fn=266）运行时从此信息取每个方法的
+/// 子图 id + arity + upvalue 数量，合并节点 inputs（各方法 upvalues 依次拼接）
+/// 构造多个 Closure，打包成 TraitValue 堆对象。
+#[derive(Debug, Clone)]
+pub struct TraitConstructInfo {
+    /// trait 名（运行时填入 TraitValue.trait_name）
+    pub trait_name: String,
+    /// 方法名列表（与 methods 一一对应，填入 TraitValue.method_names）
+    pub method_names: Vec<String>,
+    /// 每个方法的子图信息（与 method_names 一一对应）
+    pub methods: Vec<TraitMethodEntry>,
+}
+
+/// inline_trait 单个方法的子图信息。
+#[derive(Debug, Clone, Copy)]
+pub struct TraitMethodEntry {
+    pub subgraph_id: SubGraphId,
+    pub arity: u8,         // 方法参数数（不含 upvalues）
+    pub upvalue_count: u8, // 该方法的 upvalue 数（从 inputs 中按顺序切分）
+}
+
+/// lazy 构造节点信息（按 NodeId 索引）。
+///
+/// compute_lazy_construct（compute_fn=267）运行时从此信息取 thunk 子图 id，
+/// 构造 LazyValue 堆对象（thunk 未求值，首次 force 时启动子图计算并缓存）。
+#[derive(Debug, Clone, Copy)]
+pub struct LazyConstructInfo {
+    /// thunk 子图 id（无参数，返回值为 lazy 表达式的值）
+    pub thunk_sg: SubGraphId,
+}
+
 // =========================================================================
 // EventSourceDecl — 事件源声明（静态，编译期）
 // =========================================================================
@@ -1116,6 +1149,11 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         crate::Engine::compute_range,               // 263
         crate::Engine::compute_range_inclusive,     // 264
         crate::Engine::compute_elvis,               // 265
+        // inline_trait / lazy 构造（266-267）
+        crate::Engine::compute_trait_construct,     // 266
+        crate::Engine::compute_lazy_construct,      // 267
+        crate::Engine::compute_slice,               // 268
+        crate::Engine::compute_str_concat,          // 269
     ]
 }
 
@@ -1177,6 +1215,14 @@ pub struct DataFlowGraph {
     /// 编译期 SIMD/并行批量化标记（按 NodeId 索引，None=不可批量化）
     /// compile_binary/compile_unary 设置，run_ready_nodes 按 (tag,op) 分组批算
     pub batch_infos: Vec<Option<BatchInfo>>,
+    /// IR 编译期错误（未实现的特性、找不到函数等），build() 末尾从 IrBuilder.errors 移入
+    pub ir_errors: Vec<String>,
+    /// inline_trait 构造节点信息（按 NodeId 索引，非 trait construct 节点为 None）
+    pub trait_construct_infos: Vec<Option<TraitConstructInfo>>,
+    /// lazy 构造节点信息（按 NodeId 索引，非 lazy construct 节点为 None）
+    pub lazy_construct_infos: Vec<Option<LazyConstructInfo>>,
+    /// 切片节点的 inclusive 标志（按 NodeId 索引，true = `[start..=end]`，false = `[start..end]`）
+    pub slice_inclusive: Vec<bool>,
 }
 
 impl DataFlowGraph {
@@ -1204,6 +1250,10 @@ impl DataFlowGraph {
             writeback_targets: Vec::new(),
             tail_call_flags: Vec::new(),
             batch_infos: Vec::new(),
+            ir_errors: Vec::new(),
+            trait_construct_infos: Vec::new(),
+            lazy_construct_infos: Vec::new(),
+            slice_inclusive: Vec::new(),
         }
     }
 
@@ -1227,6 +1277,9 @@ impl DataFlowGraph {
         self.writeback_targets.push(None);
         self.tail_call_flags.push(false);
         self.batch_infos.push(None);
+        self.trait_construct_infos.push(None);
+        self.lazy_construct_infos.push(None);
+        self.slice_inclusive.push(false);
         id
     }
 
@@ -1294,6 +1347,21 @@ impl DataFlowGraph {
     /// 设置闭包构造节点的信息（子图 id + arity）。
     pub fn set_closure_info(&mut self, node: NodeId, info: ClosureInfo) {
         self.closure_infos[node.0 as usize] = Some(info);
+    }
+
+    /// 设置 inline_trait 构造节点的信息（trait 名 + 方法列表）。
+    pub fn set_trait_construct_info(&mut self, node: NodeId, info: TraitConstructInfo) {
+        self.trait_construct_infos[node.0 as usize] = Some(info);
+    }
+
+    /// 设置 lazy 构造节点的信息（thunk 子图 id）。
+    pub fn set_lazy_construct_info(&mut self, node: NodeId, info: LazyConstructInfo) {
+        self.lazy_construct_infos[node.0 as usize] = Some(info);
+    }
+
+    /// 设置切片节点的 inclusive 标志（true = `[start..=end]`）。
+    pub fn set_slice_inclusive(&mut self, node: NodeId, inclusive: bool) {
+        self.slice_inclusive[node.0 as usize] = inclusive;
     }
 
     /// 设置 select gate 节点的分支信息。
@@ -1801,20 +1869,28 @@ impl<'a> IrBuilder<'a> {
             crate::Ast::Expr::StrInterp(_)
             | crate::Ast::Expr::RefOf(_)
             | crate::Ast::Expr::Deref(_)
-            | crate::Ast::Expr::Slice { .. }
             | crate::Ast::Expr::SafeMethodCall { .. }
             | crate::Ast::Expr::NonNullAssert(_)
             | crate::Ast::Expr::Elvis { .. }
             | crate::Ast::Expr::RecordExtend { .. }
             | crate::Ast::Expr::TypeCast { .. }
-            | crate::Ast::Expr::Atomic(_)
-            | crate::Ast::Expr::Lazy(_)
-            | crate::Ast::Expr::InlineTrait(_) => {
+            | crate::Ast::Expr::Atomic(_) => {
                 self.errors.push(format!(
                     "compile_expr: 尚未实现的 Expr 变体: {:?}",
                     expr
                 ));
                 self.compile_placeholder()
+            }
+
+            // inline_trait 表达式 → 每方法编译子图 + TraitValue 构造节点
+            crate::Ast::Expr::InlineTrait(methods) => self.compile_inline_trait(expr_id, methods),
+
+            // lazy 表达式 → thunk 子图 + LazyValue 构造节点
+            crate::Ast::Expr::Lazy(operand) => self.compile_lazy(expr_id, *operand),
+
+            // 切片 `recv[start..end]` / `recv[start..=end]` → 三输入节点 + inclusive 标志
+            crate::Ast::Expr::Slice { recv, start, end, inclusive } => {
+                self.compile_slice(*recv, *start, *end, *inclusive)
             }
 
             // 未来新增的 Expr 变体不应静默通过
@@ -2220,6 +2296,192 @@ impl<'a> IrBuilder<'a> {
                 subgraph_id: sg_id,
                 arity: params.len() as u8,
             },
+        );
+        construct_node
+    }
+
+    /// 编译 inline_trait 表达式：每个方法编译为子图（含 upvalues 捕获），
+    /// 构造 TraitValue 构造节点（compute_fn=266），运行时打包多个 Closure。
+    ///
+    /// 方法子图的编译参考 compile_lambda：自由变量分析 → 占位子图 →
+    /// 进入作用域（参数 + upvalues）→ 编译方法体 → 填充 node_range。
+    /// 所有方法的 upvalues 依次拼接为构造节点的 inputs。
+    fn compile_inline_trait(&mut self, expr_id: crate::Ast::ExprId, methods: &[crate::Ast::MethodDecl<'_>]) -> NodeId {
+        use crate::Ast::LambdaBody;
+
+        // 推断 trait 名（从 sema.expr_types 拿 ConcreteType::TraitObject）
+        let trait_name = self.expr_type_name(expr_id)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let mut method_names: Vec<String> = Vec::with_capacity(methods.len());
+        let mut method_entries: Vec<TraitMethodEntry> = Vec::with_capacity(methods.len());
+        let mut all_upvalue_nodes: Vec<NodeId> = Vec::new();
+
+        for m in methods {
+            let body_expr = match m.body {
+                Some(b) => b,
+                None => {
+                    self.errors.push(format!(
+                        "compile_inline_trait: 方法 {} 无方法体（inline_trait 要求所有方法有体）",
+                        m.name
+                    ));
+                    continue;
+                }
+            };
+
+            // 1. 自由变量分析：收集 body 中引用的外层变量（排除方法自身参数）
+            let param_names: rustc_hash::FxHashSet<&str> =
+                m.params.iter().map(|p| p.name).collect();
+            let mut ident_names: Vec<String> = Vec::new();
+            self.collect_free_idents_expr(body_expr, &mut ident_names);
+            let mut captured: Vec<(String, NodeId)> = Vec::new();
+            for name in &ident_names {
+                if param_names.contains(name.as_str()) {
+                    continue;
+                }
+                if let Some(node) = self.lookup_var(name) {
+                    if !captured.iter().any(|(n, _)| n == name) {
+                        captured.push((name.clone(), node));
+                    }
+                }
+            }
+
+            let param_count = (m.params.len() + captured.len()) as u8;
+
+            // 2. 注册占位子图
+            let sg_id = self.register_subgraph_placeholder("", param_count, m.is_async);
+            let node_start = self.graph.nodes.len() as u32;
+
+            // 3. 进入方法作用域：参数节点 + upvalue 节点
+            self.enter_scope();
+            for param in &m.params {
+                let inputs_offset = self.graph.inputs_pool.push(&[]);
+                let param_node = self.graph.add_node(Node {
+                    kind: NodeKind::Const,
+                    input_count: 0,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(0),
+                });
+                self.bind_var(param.name, param_node);
+            }
+            for (name, _outer_node) in &captured {
+                let inputs_offset = self.graph.inputs_pool.push(&[]);
+                let upvalue_node = self.graph.add_node(Node {
+                    kind: NodeKind::Const,
+                    input_count: 0,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(0),
+                });
+                self.bind_var(name, upvalue_node);
+            }
+
+            // 4. 编译方法体
+            let return_node = self.compile_expr(body_expr);
+            self.exit_scope();
+
+            // 5. 填充子图 node_range
+            let node_end = self.graph.nodes.len() as u32;
+            let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
+            sg.node_range = (NodeId(node_start), NodeId(node_end));
+            sg.entry_node = NodeId(node_start);
+            sg.return_node = return_node;
+            sg.has_suspend = m.is_async;
+
+            // 6. 收集 upvalue 节点 + 记录方法信息
+            let upvalue_count = captured.len() as u8;
+            for (_, n) in &captured {
+                all_upvalue_nodes.push(*n);
+            }
+            method_names.push(m.name.to_string());
+            method_entries.push(TraitMethodEntry {
+                subgraph_id: sg_id,
+                arity: m.params.len() as u8,
+                upvalue_count,
+            });
+        }
+
+        // 构造 TraitValue 构造节点（inputs = 所有方法 upvalues 依次拼接）
+        let inputs_offset = self.graph.inputs_pool.push(&all_upvalue_nodes);
+        let construct_node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: all_upvalue_nodes.len() as u8,
+            inputs_offset,
+            compute_fn: ComputeFnId(266), // compute_trait_construct
+        });
+        self.graph.set_trait_construct_info(
+            construct_node,
+            TraitConstructInfo {
+                trait_name,
+                method_names,
+                methods: method_entries,
+            },
+        );
+        construct_node
+    }
+
+    /// 编译 lazy 表达式：operand 编译为无参数 thunk 子图，
+    /// 构造 LazyValue 构造节点（compute_fn=267），运行时创建未求值的 LazyValue。
+    ///
+    /// thunk 子图捕获外层自由变量（与 lambda 相同的捕获机制），
+    /// 首次 force 时启动子图计算，结果缓存供后续 force 复用。
+    fn compile_lazy(&mut self, expr_id: crate::Ast::ExprId, operand: crate::Ast::ExprId) -> NodeId {
+        let _ = expr_id; // trait_name 推断暂不需要，保留参数供未来 force 语义使用
+        // 1. 自由变量分析
+        let mut ident_names: Vec<String> = Vec::new();
+        self.collect_free_idents_expr(operand, &mut ident_names);
+        let mut captured: Vec<(String, NodeId)> = Vec::new();
+        for name in &ident_names {
+            if let Some(node) = self.lookup_var(name) {
+                if !captured.iter().any(|(n, _)| n == name) {
+                    captured.push((name.clone(), node));
+                }
+            }
+        }
+
+        let param_count = captured.len() as u8;
+
+        // 2. 注册占位子图（thunk：无显式参数，仅 upvalues）
+        let sg_id = self.register_subgraph_placeholder("", param_count, false);
+        let node_start = self.graph.nodes.len() as u32;
+
+        // 3. 进入 thunk 作用域：upvalue 节点
+        self.enter_scope();
+        for (name, _outer_node) in &captured {
+            let inputs_offset = self.graph.inputs_pool.push(&[]);
+            let upvalue_node = self.graph.add_node(Node {
+                kind: NodeKind::Const,
+                input_count: 0,
+                inputs_offset,
+                compute_fn: ComputeFnId(0),
+            });
+            self.bind_var(name, upvalue_node);
+        }
+
+        // 4. 编译 operand 得到返回节点
+        let return_node = self.compile_expr(operand);
+        self.exit_scope();
+
+        // 5. 填充子图 node_range
+        let node_end = self.graph.nodes.len() as u32;
+        let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
+        sg.node_range = (NodeId(node_start), NodeId(node_end));
+        sg.entry_node = NodeId(node_start);
+        sg.return_node = return_node;
+        sg.has_suspend = false;
+
+        // 6. 构造 LazyValue 构造节点（inputs = upvalues）
+        let upvalue_nodes: Vec<NodeId> = captured.iter().map(|(_, n)| *n).collect();
+        let inputs_offset = self.graph.inputs_pool.push(&upvalue_nodes);
+        let construct_node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: upvalue_nodes.len() as u8,
+            inputs_offset,
+            compute_fn: ComputeFnId(267), // compute_lazy_construct
+        });
+        self.graph.set_lazy_construct_info(
+            construct_node,
+            LazyConstructInfo { thunk_sg: sg_id },
         );
         construct_node
     }
@@ -3114,6 +3376,11 @@ impl<'a> IrBuilder<'a> {
         let is_int = !is_float && ty_name != "bool";
         let base = Self::arith_base(ty_name);
 
+        // str + str → 字符串拼接（compute_str_concat, 269）
+        if ty_name == "str" && matches!(op, crate::Ast::BinaryOp::Add) {
+            return ComputeFnId(269);
+        }
+
         // 算术运算（add/sub/mul/div/mod）：整数和浮点都支持，按具体类型查表
         // 整数索引顺序: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9) neg(10) bitnot(11)
         // 浮点索引顺序: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
@@ -3878,6 +4145,31 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
+    /// 编译切片 `recv[start..end]`（inclusive=false）或 `recv[start..=end]`（inclusive=true）。
+    ///
+    /// 三输入节点（recv, start, end），inclusive 标志存于 graph.slice_inclusive。
+    /// 运行时对 str 按码点切片、对 array 按元素切片。
+    fn compile_slice(
+        &mut self,
+        recv: crate::Ast::ExprId,
+        start: crate::Ast::ExprId,
+        end: crate::Ast::ExprId,
+        inclusive: bool,
+    ) -> NodeId {
+        let recv_node = self.compile_subexpr(recv);
+        let start_node = self.compile_subexpr(start);
+        let end_node = self.compile_subexpr(end);
+        let inputs_offset = self.graph.inputs_pool.push(&[recv_node, start_node, end_node]);
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 3,
+            inputs_offset,
+            compute_fn: ComputeFnId(268), // compute_slice
+        });
+        self.graph.set_slice_inclusive(node, inclusive);
+        node
+    }
+
     /// 编译记录构造（按位置参数 + 类型名）。
     ///
     /// 用于 `Err(args)` / `IOError(args)` 等构造器调用，字段名自动生成 `_0`, `_1`, ...
@@ -4560,6 +4852,9 @@ impl<'a> IrBuilder<'a> {
 
         // 构建期填充计算函数表（运行时按 ComputeFnId 索引调用）
         self.graph.compute_fns = build_compute_fn_table();
+
+        // 移入 IR 编译期错误（未实现的特性等），供调用方检查
+        self.graph.ir_errors = std::mem::take(&mut self.errors);
 
         self.graph
     }

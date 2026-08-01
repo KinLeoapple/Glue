@@ -1,6 +1,5 @@
 // ++ array/list concatenation operator
 
-import std.io.Console.{println}
 fun main(): void {
     // ---- basic concat ----
     val a = [1, 2, 3]

@@ -1,8 +1,6 @@
 // Test: UDP echo + timeout — bind + send_to + recv_from + timeout
 import std.net.Addr
 import std.net.UdpSocket
-import std.io.Console.{println}
-
 // Sender task: bind a client socket, send "Ping" to server, recv echo, close
 async fun sender_task(server_addr: SocketAddr): Async<Throw<void, IOError>> {
     // Bind client socket on ephemeral port (port 0)

@@ -6802,6 +6802,27 @@ impl<'a> InferContext<'a> {
                         self.sema_result.errors.push(SemaError::new(&msg, span.line, span.column));
                     }
 
+                    // 类型检查各方法体：为参数绑定类型（有注解则用注解，无注解则 fresh_type_var），
+                    // 设置 expected_return，调用 infer_expr 填充 body 内各子表达式的 expr_types。
+                    // 这是 IR 编译期类型查询（如 str + str → concat）的数据来源。
+                    for m in methods.iter() {
+                        if let Some(body) = m.body {
+                            let method_env = self.env.child(env);
+                            for param in m.params.iter() {
+                                let param_ty = match param.type_annotation {
+                                    Some(ta) => self.type_from_ast(ta, ast),
+                                    None => self.arena.fresh_type_var(),
+                                };
+                                self.env.define(method_env, param.name, param_ty);
+                            }
+                            let prev_return = self.expected_return;
+                            self.expected_return =
+                                m.return_type.map(|rt| self.type_from_ast(rt, ast));
+                            let _ = self.infer_expr(body, ast, method_env, self.expected_return);
+                            self.expected_return = prev_return;
+                        }
+                    }
+
                     self.arena.make(ConcreteType::TraitObject {
                         trait_name: tname,
                         method_sigs: method_sigs.into_boxed_slice(),

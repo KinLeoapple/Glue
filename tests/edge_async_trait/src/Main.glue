@@ -1,7 +1,5 @@
 // async trait 方法测试：&self 语法糖 + Reader/Writer trait 实现
 
-import std.io.Console.{println}
-
 // MemReader: 内存字节 Reader 实现（&self 引用语义，mutation 持久）
 type MemReader : Reader = MemReader(data: u8[], pos: usize) {
     pub async fun read(&self, len: usize): Async<Throw<u8[], IOError>> {

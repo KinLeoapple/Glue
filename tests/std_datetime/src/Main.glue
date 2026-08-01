@@ -5,8 +5,6 @@
 import std.time.DateTime
 import std.time.Duration
 import std.time.TimeComponents
-import std.io.Console.{println}
-
 fun main(): void {
     // ── 1. 构造器 + 字段访问 ─────────────────────────────────────
     val dt = DateTime(2026, 7, 20, 14, 30, 45, 123, 1, 201)

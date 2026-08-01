@@ -7,8 +7,6 @@
 //   std.net.Addr.v4_octet(addr, 0u8)
 
 import std.net.Addr
-import std.io.Console.{println}
-
 fun main(): void {
     // ── Ipv4Addr 构造与访问 ───────────────────────────────────────
     val lo4 = std.net.Addr.v4_loopback()

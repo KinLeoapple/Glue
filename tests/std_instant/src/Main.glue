@@ -5,8 +5,6 @@
 //   std.time.Module.Type.method(value, args)
 import std.time.Duration
 import std.time.Instant
-import std.io.Console.{println}
-
 fun main(): void {
     // ── Duration 基础 ──────────────────────────────────────────────
     val d_zero = std.time.Duration.from_secs(0)

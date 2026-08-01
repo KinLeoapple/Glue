@@ -8,7 +8,6 @@
 // 5. 链式引用（&&T）
 
 // 测试 4：函数参数引用传递 + 回写
-import std.io.Console.{println}
 fun increment(r: &i32): void {
     *r = *r + 1
 }

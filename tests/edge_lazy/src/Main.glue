@@ -1,6 +1,5 @@
 // Edge cases: Lazy<T> 惰性求值与缓存
 
-import std.io.Console.{println}
 var compute_count = 0
 
 fun expensive(x: i32): i32 {

@@ -1,7 +1,6 @@
 // Recursion depth + string/array method edges (regression for fixes)
 
 // non-tail recursion within safe depth
-import std.io.Console.{println}
 fun sumTo(n: i32): i32 {
     if n == 0 { 0 } else { n + sumTo(n - 1) }
 }

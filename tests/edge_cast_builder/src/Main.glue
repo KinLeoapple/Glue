@@ -13,7 +13,6 @@
 //   9. try_to str→数值（合法解析 → Ok）
 //  10. try_to str→数值（非法解析 → Throw CastError）
 
-import std.io.Console.{println}
 fun main(): void {
     // ---- 1. 数值 widening（i8→i64） ----
     val a: i8 = 42i8

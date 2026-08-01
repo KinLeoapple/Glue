@@ -1,6 +1,4 @@
 // 最小测试：非 async &self mutation 持久性
-import std.io.Console.{println}
-
 type Counter = Counter(count: i64) {
     pub fun incr(&self): void {
         println("before: " + cast(self.count).to(str))

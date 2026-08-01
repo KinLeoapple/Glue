@@ -1,6 +1,5 @@
 // Trait 内联实现边缘测试：多 trait 组合、默认方法、按接收者类型分派
 
-import std.io.Console.{println}
 trait Greet {
     fun name(self): str
     fun hello(self): str {

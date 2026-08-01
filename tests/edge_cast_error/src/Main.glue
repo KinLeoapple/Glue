@@ -13,7 +13,6 @@
 //   - type(CastError 实例) 返回 "CastError"（当前对 RecordValue 返回通用 "record"）
 
 // ---- 构造与字段访问 ----
-import std.io.Console.{println}
 fun makeCastError(): CastError {
     CastError("value out of range", "i64", "i32", "9999999999")
 }

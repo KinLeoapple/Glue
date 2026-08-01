@@ -1,6 +1,5 @@
 // Newtype 类型安全边缘测试：模式匹配解包、不同 newtype 即使底层相同也不互通
 
-import std.io.Console.{println}
 type Celsius = Celsius(f64)
 type Fahrenheit = Fahrenheit(f64)
 type UserId = UserId(i64)

@@ -1,6 +1,5 @@
 // 部分应用边界测试：深拷贝、&T、nullable、嵌套 partial
 
-import std.io.Console.{println}
 fun add3(a: i32, b: i32, c: i32): i32 { a + b + c }
 
 fun addRec(a: (x: i32, y: i32), b: i32): i32 { a.x + a.y + b }

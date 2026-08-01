@@ -1,6 +1,5 @@
 // Edge cases: floating-point — zero/neg-zero, precision, IEEE 754 behavior, f32/f64/f16
 
-import std.io.Console.{println}
 fun main(): void {
     // ---- zero and negative zero ----
     val pos_zero: f64 = 0.0

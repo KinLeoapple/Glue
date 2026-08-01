@@ -1,6 +1,5 @@
 // Edge cases: type casts — widening, narrowing, int<->float, char<->int, str conversions
 
-import std.io.Console.{println}
 fun main(): void {
     // ---- widening: small int -> larger int preserves value and sign ----
     val i8v: i8 = -42

@@ -2,7 +2,6 @@
 // 文档 §2.13: 构造器用 `: ReturnType` 标注返回类型；match 时类型细化
 
 // GADT 定义：每个构造器通过 `:` 标注其返回的具体类型参数
-import std.io.Console.{println}
 type Expr<T> =
     | IntLit(i32)                       : Expr<i32>
     | BoolLit(bool)                     : Expr<bool>

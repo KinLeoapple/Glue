@@ -7,7 +7,6 @@
 // ============================================================
 
 // async 函数：调用返回 Async<T>，需 .await() 取结果
-import std.io.Console.{println}
 async fun make42(): i64 { 42 }
 
 // async 函数深拷贝捕获：内部修改不影响外部

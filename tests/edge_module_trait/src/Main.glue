@@ -1,8 +1,6 @@
 // 文件模块作为 Trait 值（结构化匹配，§4.6.2）
 // Store.Memory 模块结构上提供 KVStore 要求的全部方法，从而可作 Trait 值传入。
 import Store
-import std.io.Console.{println}
-
 trait KVStore {
     fun put(key: str, value: str): void
     fun get(key: str): str

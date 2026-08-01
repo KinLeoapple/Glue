@@ -1,6 +1,5 @@
 // Edge cases: defer — LIFO ordering, nested blocks, interaction with throw/return/loop
 
-import std.io.Console.{println}
 var log: str = ""
 
 // defer runs in LIFO order on normal scope exit

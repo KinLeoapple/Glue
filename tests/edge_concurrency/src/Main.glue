@@ -1,7 +1,6 @@
 // Edge cases: concurrency — async functions, atomic ops, channel buffer/close, select
 
 // async 函数：调用返回 Async<T>
-import std.io.Console.{println}
 async fun mul10x10(): i64 { 10 * 10 }
 async fun add20x5(): i64 { 20 + 5 }
 async fun sub100x1(): i64 { 100 - 1 }

@@ -6,6 +6,7 @@ use rustc_hash::FxHashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::AtomicBool;
 
 use rayon::prelude::*;
 use pastey::paste;
@@ -1884,25 +1885,39 @@ pub struct PartialApplication {
 pub struct TraitValue {
     pub trait_name: String,
     pub method_names: Vec<String>,
-    pub method_values: Vec<ValueHandle>,
-    pub data: Option<ValueHandle>,
+    pub method_values: Vec<Value>,
+    pub data: Option<Value>,
     pub owned: bool,
 }
 
 /// 惰性值
-#[derive(Clone)]
 pub struct LazyValue {
-    pub cached: Option<ValueHandle>,
-    pub forced: bool,
-    pub thunk: Option<Arc<dyn Fn() -> ValueHandle + Send + Sync>>,
+    /// 缓存的求值结果（首次 force 后填充）
+    /// Mutex 允许通过 &LazyValue 更新缓存（Arc 共享场景下的 interior mutability）
+    pub cached: Mutex<Option<Value>>,
+    /// 是否已求值
+    pub forced: AtomicBool,
+    /// thunk 子图的 Closure（func_id = thunk_sg, upvalues = 捕获值）
+    /// force 时取此 Closure 启动子图计算，结果存入 cached
+    pub data: Option<Value>,
+}
+
+impl Clone for LazyValue {
+    fn clone(&self) -> Self {
+        Self {
+            cached: Mutex::new(self.cached.lock().unwrap().clone()),
+            forced: AtomicBool::new(self.forced.load(std::sync::atomic::Ordering::Relaxed)),
+            data: self.data.clone(),
+        }
+    }
 }
 
 impl fmt::Debug for LazyValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("LazyValue")
-            .field("cached", &self.cached)
-            .field("forced", &self.forced)
-            .field("thunk", &self.thunk.as_ref().map(|_| "<thunk>"))
+            .field("cached", &self.cached.lock().unwrap().is_some())
+            .field("forced", &self.forced.load(std::sync::atomic::Ordering::Relaxed))
+            .field("has_data", &self.data.is_some())
             .finish()
     }
 }

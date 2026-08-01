@@ -1,6 +1,5 @@
 // Edge cases: pattern matching — nesting, or-patterns, guards, exhaustiveness, literals
 
-import std.io.Console.{println}
 type Tree =
     | Leaf
     | Node(i32, Tree, Tree)

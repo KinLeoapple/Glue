@@ -1,6 +1,5 @@
 // type() builtin — returns the runtime type name of any value
 
-import std.io.Console.{println}
 type Color = | Red | Green | Blue
 type UserId = UserId(i32)
 type Point = Point(x: i32, y: i32)

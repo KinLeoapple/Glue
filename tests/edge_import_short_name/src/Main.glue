@@ -2,8 +2,6 @@
 // 覆盖：模块短名、函数短名、常量短名、selective import alias
 import std.time.Calendar.{ is_leap_year, days_in_month as dim, weekday_of }
 import std.time.SystemTime.{ UNIX_EPOCH }
-import std.io.Console.{println}
-
 fun main(): void {
     // ── 函数短名（selective import） ────────────────────────────
     val leap = is_leap_year(2024)

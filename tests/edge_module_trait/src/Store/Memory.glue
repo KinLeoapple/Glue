@@ -1,5 +1,4 @@
 // Store.Memory 子模块：结构化满足 KVStore trait 契约（put/get/delete）
-import std.io.Console.{println}
 pub fun put(key: str, value: str): void {
     println("put " + key + "=" + value)
 }

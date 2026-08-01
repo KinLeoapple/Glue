@@ -1,7 +1,6 @@
 // Phase 3 逐步测试
 
 // 1. 记录宽度子类型
-import std.io.Console.{println}
 fun greet(user: (name: str)) : str {
     "Hello, " + user.name
 }
