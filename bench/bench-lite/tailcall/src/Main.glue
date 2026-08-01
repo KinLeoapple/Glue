@@ -1,0 +1,60 @@
+// Benchmark lite 5: 尾递归密集
+// 对标 Zig 基线 10万迭代，降为 1万（Rust 数据流引擎无 TCO，每次递归建帧）
+
+import builtin.io.Console.{println}
+
+fun countUp(n: i64, acc: i64): i64 {
+    if n == 0 { acc } else { countUp(n - 1, acc + n) }
+}
+
+fun factorialTail(n: i64, acc: i64): i64 {
+    if n <= 1 { acc } else { factorialTail(n - 1, acc * n) }
+}
+
+fun altSum(n: i64, acc: i64): i64 {
+    if n == 0 { acc } else { altSum(n - 1, acc + (if n % 2 == 0 { n } else { -n })) }
+}
+
+fun isEvenTCO(n: i64): bool {
+    if n == 0 { true } else { isOddTCO(n - 1) }
+}
+fun isOddTCO(n: i64): bool {
+    if n == 0 { false } else { isEvenTCO(n - 1) }
+}
+
+fun mod3_0(n: i64): i64 {
+    if n == 0 { 0 } else { mod3_1(n - 1) }
+}
+fun mod3_1(n: i64): i64 {
+    if n == 0 { 1 } else { mod3_2(n - 1) }
+}
+fun mod3_2(n: i64): i64 {
+    if n == 0 { 2 } else { mod3_0(n - 1) }
+}
+
+fun main(): void {
+    // 尾递归求和:1万次迭代
+    println(countUp(10000, 0))
+
+    // 尾递归阶乘:20!
+    println(factorialTail(20, 1))
+
+    // 尾递归交替和:1万次
+    println(altSum(10000, 0))
+
+    // 互相尾递归:1万次
+    println(isEvenTCO(10000))
+    println(isOddTCO(9999))
+
+    // 三函数互递归:1万次
+    println(mod3_0(10000))
+
+    // 密集调用:小 N 重复调用
+    var sum: i64 = 0
+    var i: i32 = 0
+    while i < 1000 {
+        sum = sum + countUp(100, 0)
+        i = i + 1
+    }
+    println(sum)
+}

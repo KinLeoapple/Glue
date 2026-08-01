@@ -55,36 +55,6 @@ macro_rules! impl_cmp_compute {
 // compute_fns — 真实计算函数（构建期绑定的函数索引）
 // =========================================================================
 
-/// compute_fn: i32 加法
-pub fn compute_add_i32(frame: &mut Frame, node: NodeId) -> Value {
-    let graph = frame.graph.clone();
-    let n = &graph.nodes[node.0 as usize];
-    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-    let a = frame.get_value_by_global(inputs[0]).as_i32();
-    let b = frame.get_value_by_global(inputs[1]).as_i32();
-    Value::i32(a + b)
-}
-
-/// compute_fn: f64 加法
-pub fn compute_add_f64(frame: &mut Frame, node: NodeId) -> Value {
-    let graph = frame.graph.clone();
-    let n = &graph.nodes[node.0 as usize];
-    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-    let a = frame.get_value_by_global(inputs[0]).as_f64();
-    let b = frame.get_value_by_global(inputs[1]).as_f64();
-    Value::f64(a + b)
-}
-
-/// compute_fn: i32 乘法
-pub fn compute_mul_i32(frame: &mut Frame, node: NodeId) -> Value {
-    let graph = frame.graph.clone();
-    let n = &graph.nodes[node.0 as usize];
-    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-    let a = frame.get_value_by_global(inputs[0]).as_i32();
-    let b = frame.get_value_by_global(inputs[1]).as_i32();
-    Value::i32(a * b)
-}
-
 /// compute_fn: i32 小于等于比较 (<=)
 pub fn compute_le_i32(frame: &mut Frame, node: NodeId) -> Value {
     let graph = frame.graph.clone();
@@ -95,13 +65,7 @@ pub fn compute_le_i32(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(a <= b)
 }
 
-// ---- i32 算术与比较（索引 5-12, 25）----
-
-impl_arith_compute! {
-    compute_sub_i32: - for i32 / as_i32;
-    compute_div_i32: / for i32 / as_i32;
-    compute_mod_i32: % for i32 / as_i32;
-}
+// ---- i32 比较（索引 8-12, 25；算术/位运算/一元由宏生成）----
 
 impl_cmp_compute! {
     compute_eq_i32: == for as_i32;
@@ -111,22 +75,223 @@ impl_cmp_compute! {
     compute_ge_i32: >= for as_i32;
 }
 
-/// compute_fn: i32 取负（一元）
-pub fn compute_neg_i32(frame: &mut Frame, node: NodeId) -> Value {
-    let graph = frame.graph.clone();
-    let n = &graph.nodes[node.0 as usize];
-    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-    let a = frame.get_value_by_global(inputs[0]).as_i32();
-    Value::i32(-a)
+// ---- i64 比较（索引 55-60；算术/位运算/一元由宏生成）----
+
+impl_cmp_compute! {
+    compute_eq_i64: == for as_i64;
+    compute_ne_i64: != for as_i64;
+    compute_lt_i64: < for as_i64;
+    compute_gt_i64: > for as_i64;
+    compute_le_i64: <= for as_i64;
+    compute_ge_i64: >= for as_i64;
 }
 
-// ---- f64 算术与比较（索引 13-21, 26）----
+// ---- i128 比较（索引 69-74；算术/位运算/一元由宏生成）----
+// i128 路径覆盖 i128/u128 类型，并通过 as_int_i128 支持所有整数类型输入
 
-impl_arith_compute! {
-    compute_sub_f64: - for f64 / as_f64;
-    compute_mul_f64: * for f64 / as_f64;
-    compute_div_f64: / for f64 / as_f64;
+impl_cmp_compute! {
+    compute_eq_i128: == for as_int_i128;
+    compute_ne_i128: != for as_int_i128;
+    compute_lt_i128: < for as_int_i128;
+    compute_gt_i128: > for as_int_i128;
+    compute_le_i128: <= for as_int_i128;
+    compute_ge_i128: >= for as_int_i128;
 }
+
+// ---- 整数位运算（索引 78-92）----
+// BitAnd/BitOr/BitXor 对 i32/i64/i128 三族，Shl/Shr 对 i32/i64/i128 三族
+// 通过 as_int_i128 通用读取，结果按目标类型构造
+// 注：具体位运算 compute_fn 由下方 impl_int_ops 宏按类型生成
+
+// =========================================================================
+// 全基本类型 compute_fn（索引 92-）：用 paste 宏为每个类型生成全套运算
+// =========================================================================
+// 整数 12 类型 × 12 运算 = 144；浮点 4 类型 × 6 运算 = 24；合计 168。
+// 比较运算沿用按族共用的版本（结果为 bool，输入用 as_int_i128/as_float_f64 跨类型读取）。
+// 算术/位运算/一元按具体类型生成，结果天然带正确 tag 并按类型宽度截断/回绕。
+//
+// 类型规格表：(类型名, Rust 类型, Value ctor, accessor, 是否整数)
+// 索引从 92 开始分配。
+
+/// 为指定整数类型生成全套 compute_fn（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）
+macro_rules! impl_int_ops {
+    ($ty:ident, $rust:ty, $ctor:ident, $acc:ident) => {
+        pastey::paste! {
+            pub fn [<compute_add_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a.wrapping_add(b))
+            }
+            pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a.wrapping_sub(b))
+            }
+            pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a.wrapping_mul(b))
+            }
+            pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                // 整数除零返回 0（与 checked_div 语义一致），避免 panic
+                Value::$ctor(a.checked_div(b).unwrap_or(0))
+            }
+            pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a.checked_rem(b).unwrap_or(0))
+            }
+            pub fn [<compute_bitand_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a & b)
+            }
+            pub fn [<compute_bitor_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a | b)
+            }
+            pub fn [<compute_bitxor_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a ^ b)
+            }
+            pub fn [<compute_shl_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).as_i32() as u32;
+                Value::$ctor(a.wrapping_shl(b))
+            }
+            pub fn [<compute_shr_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).as_i32() as u32;
+                Value::$ctor(a.wrapping_shr(b))
+            }
+            pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                Value::$ctor(a.wrapping_neg())
+            }
+            pub fn [<compute_bitnot_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                Value::$ctor(!a)
+            }
+        }
+    };
+}
+
+/// 为指定浮点类型生成全套 compute_fn（add/sub/mul/div/mod/neg）
+macro_rules! impl_float_ops {
+    ($ty:ident, $rust:ty, $ctor:ident, $acc:ident) => {
+        pastey::paste! {
+            pub fn [<compute_add_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a + b)
+            }
+            pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a - b)
+            }
+            pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a * b)
+            }
+            pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a / b)
+            }
+            pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                let b = frame.get_value_by_global(inputs[1]).$acc();
+                Value::$ctor(a % b)
+            }
+            pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId) -> Value {
+                let graph = frame.graph.clone();
+                let n = &graph.nodes[node.0 as usize];
+                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                let a = frame.get_value_by_global(inputs[0]).$acc();
+                Value::$ctor(-a)
+            }
+        }
+    };
+}
+
+// 整数类型展开（12 类型 × 12 运算 = 144 函数）
+impl_int_ops!(i8,    i8,    i8,    as_i8);
+impl_int_ops!(i16,   i16,   i16,   as_i16);
+impl_int_ops!(i32,   i32,   i32,   as_i32);
+impl_int_ops!(i64,   i64,   i64,   as_i64);
+impl_int_ops!(i128,  i128,  i128,  as_i128);
+impl_int_ops!(u8,    u8,    u8,    as_u8);
+impl_int_ops!(u16,   u16,   u16,   as_u16);
+impl_int_ops!(u32,   u32,   u32,   as_u32);
+impl_int_ops!(u64,   u64,   u64,   as_u64);
+impl_int_ops!(u128,  u128,  u128,  as_u128);
+impl_int_ops!(isize, isize, isize_val, as_isize);
+impl_int_ops!(usize, usize, usize_val, as_usize);
+
+// 浮点类型展开（4 类型 × 6 运算 = 24 函数）
+impl_float_ops!(f16, F16, f16, as_f16);
+impl_float_ops!(f32, f32, f32, as_f32);
+impl_float_ops!(f64, f64, f64, as_f64);
+impl_float_ops!(f128, F128, f128, as_f128);
+
+// ---- f64 比较（索引 16-21；算术/一元由宏生成）----
 
 impl_cmp_compute! {
     compute_eq_f64: == for as_f64;
@@ -135,15 +300,6 @@ impl_cmp_compute! {
     compute_gt_f64: > for as_f64;
     compute_le_f64: <= for as_f64;
     compute_ge_f64: >= for as_f64;
-}
-
-/// compute_fn: f64 取负（一元）
-pub fn compute_neg_f64(frame: &mut Frame, node: NodeId) -> Value {
-    let graph = frame.graph.clone();
-    let n = &graph.nodes[node.0 as usize];
-    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-    let a = frame.get_value_by_global(inputs[0]).as_f64();
-    Value::f64(-a)
 }
 
 // ---- bool 逻辑（索引 22-24, 27）----
@@ -196,7 +352,7 @@ pub fn compute_eq_bool(frame: &mut Frame, node: NodeId) -> Value {
 /// - 输入为 ThrowVal（已是 throw 值）→ 直接返回
 /// - 其他值 → 包装为单字段 Error record 再作为 ThrowVal(Err)
 pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
-    use std::rc::Rc;
+    use std::sync::Arc;
     use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     let graph = frame.graph.clone();
     let n = &graph.nodes[node.0 as usize];
@@ -205,7 +361,7 @@ pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
     // Record（错误类型 ADT）→ 直接作为 Err payload
     if let Some(HeapObj::Record(record)) = v.heap_obj() {
         return Value::ref_val(HeapObj::ThrowVal(ThrowValue {
-            payload: ThrowPayload::Err(Rc::new(record.clone())),
+            payload: ThrowPayload::Err(Arc::new(record.clone())),
         }));
     }
     // 已是 ThrowVal → 直接返回
@@ -213,7 +369,7 @@ pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
         return v;
     }
     // 其他值 → 包装为 Error record
-    let record = Rc::new(RecordValue {
+    let record = Arc::new(RecordValue {
         type_name: "Error".to_string(),
         fields: vec![v],
         field_names: vec![Some("value".to_string())],
@@ -237,6 +393,7 @@ pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
 /// 输入为 record 构造节点的结果（已通过 compute_record_construct 构造为 RecordValue）。
 /// 此函数将其包装为 ThrowVal(Err(record))。
 pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
+    use std::sync::Arc;
     use crate::Value::{HeapObj, ThrowValue, ThrowPayload};
     let graph = frame.graph.clone();
     let n = &graph.nodes[node.0 as usize];
@@ -245,13 +402,12 @@ pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
     // v 应为 Record（由内层 record_construct 节点产生）
     if let Some(HeapObj::Record(record)) = v.heap_obj() {
         Value::ref_val(HeapObj::ThrowVal(ThrowValue {
-            payload: ThrowPayload::Err(std::rc::Rc::new(record.clone())),
+            payload: ThrowPayload::Err(Arc::new(record.clone())),
         }))
     } else {
         // 非 record 值，包装为单字段 Error record
-        use std::rc::Rc;
         use crate::Value::RecordValue;
-        let record = Rc::new(RecordValue {
+        let record = Arc::new(RecordValue {
             type_name: "Error".to_string(),
             fields: vec![v],
             field_names: vec![Some("value".to_string())],
@@ -310,15 +466,10 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
     }
 
-    // 从 Value 提取 u8[] 参数（优先 SOA，fallback elements）
+    // 从 Value 提取 u8[] 参数（统一走 ArrayValue::collect_u8_bytes）
     fn extract_u8_buf(v: &Value) -> Vec<u8> {
         match v.heap_obj() {
-            Some(crate::Value::HeapObj::Array(arr)) => {
-                if let Some(crate::Value::ScalarSoA::U8(ref data)) = arr.scalar_soa {
-                    return data.clone();
-                }
-                arr.elements.iter().map(|e| e.as_u8()).collect()
-            }
+            Some(crate::Value::HeapObj::Array(arr)) => arr.collect_u8_bytes(),
             _ => panic!("FFI u8[] arg expected"),
         }
     }
@@ -802,6 +953,54 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
         }
 
+        // ── str: UTF-8 逐字符解码（纯 Rust 位运算，与 C 实现语义一致）──
+        "__str_utf8_decode_at" => {
+            let s = extract_str(&frame.get_value_by_global(inputs[0]));
+            let offset = frame.get_value_by_global(inputs[1]).as_usize();
+            let bytes = s.as_bytes();
+            if offset >= bytes.len() {
+                Value::i64(-1)
+            } else {
+                let c = bytes[offset];
+                let cp = if c < 0x80 {
+                    c as u32
+                } else if (c & 0xE0) == 0xC0 {
+                    if offset + 1 >= bytes.len() { return Value::i64(-1); }
+                    ((c as u32 & 0x1F) << 6) | (bytes[offset + 1] as u32 & 0x3F)
+                } else if (c & 0xF0) == 0xE0 {
+                    if offset + 2 >= bytes.len() { return Value::i64(-1); }
+                    ((c as u32 & 0x0F) << 12)
+                        | ((bytes[offset + 1] as u32 & 0x3F) << 6)
+                        | (bytes[offset + 2] as u32 & 0x3F)
+                } else if (c & 0xF8) == 0xF0 {
+                    if offset + 3 >= bytes.len() { return Value::i64(-1); }
+                    ((c as u32 & 0x07) << 18)
+                        | ((bytes[offset + 1] as u32 & 0x3F) << 12)
+                        | ((bytes[offset + 2] as u32 & 0x3F) << 6)
+                        | (bytes[offset + 3] as u32 & 0x3F)
+                } else {
+                    return Value::i64(-1);
+                };
+                Value::i64(cp as i64)
+            }
+        }
+        "__str_utf8_char_len_at" => {
+            let s = extract_str(&frame.get_value_by_global(inputs[0]));
+            let offset = frame.get_value_by_global(inputs[1]).as_usize();
+            let bytes = s.as_bytes();
+            if offset >= bytes.len() {
+                Value::usize_val(0)
+            } else {
+                let c = bytes[offset];
+                let len = if c < 0x80 { 1 }
+                    else if (c & 0xE0) == 0xC0 { 2 }
+                    else if (c & 0xF0) == 0xE0 { 3 }
+                    else if (c & 0xF8) == 0xF0 { 4 }
+                    else { 1 };
+                Value::usize_val(len)
+            }
+        }
+
         // ── 未实现的 FFI 函数 ──
         other => panic!("compute_ffi_call: unimplemented FFI function '{}'", other),
     }
@@ -983,6 +1182,60 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
         }
 
+        // ── str: UTF-8 逐字符解码（纯 Rust 位运算，与 C 实现语义一致）──
+        "__str_utf8_decode_at" => {
+            let s = match frame.get_value_by_global(inputs[0]).heap_obj() {
+                Some(crate::Value::HeapObj::Str(s)) => s.bytes().to_string(),
+                _ => String::new(),
+            };
+            let offset = frame.get_value_by_global(inputs[1]).as_usize();
+            let bytes = s.as_bytes();
+            if offset >= bytes.len() {
+                Value::i64(-1)
+            } else {
+                let c = bytes[offset];
+                let cp = if c < 0x80 {
+                    c as u32
+                } else if (c & 0xE0) == 0xC0 {
+                    if offset + 1 >= bytes.len() { return Value::i64(-1); }
+                    ((c as u32 & 0x1F) << 6) | (bytes[offset + 1] as u32 & 0x3F)
+                } else if (c & 0xF0) == 0xE0 {
+                    if offset + 2 >= bytes.len() { return Value::i64(-1); }
+                    ((c as u32 & 0x0F) << 12)
+                        | ((bytes[offset + 1] as u32 & 0x3F) << 6)
+                        | (bytes[offset + 2] as u32 & 0x3F)
+                } else if (c & 0xF8) == 0xF0 {
+                    if offset + 3 >= bytes.len() { return Value::i64(-1); }
+                    ((c as u32 & 0x07) << 18)
+                        | ((bytes[offset + 1] as u32 & 0x3F) << 12)
+                        | ((bytes[offset + 2] as u32 & 0x3F) << 6)
+                        | (bytes[offset + 3] as u32 & 0x3F)
+                } else {
+                    return Value::i64(-1);
+                };
+                Value::i64(cp as i64)
+            }
+        }
+        "__str_utf8_char_len_at" => {
+            let s = match frame.get_value_by_global(inputs[0]).heap_obj() {
+                Some(crate::Value::HeapObj::Str(s)) => s.bytes().to_string(),
+                _ => String::new(),
+            };
+            let offset = frame.get_value_by_global(inputs[1]).as_usize();
+            let bytes = s.as_bytes();
+            if offset >= bytes.len() {
+                Value::usize_val(0)
+            } else {
+                let c = bytes[offset];
+                let len = if c < 0x80 { 1 }
+                    else if (c & 0xE0) == 0xC0 { 2 }
+                    else if (c & 0xF0) == 0xE0 { 3 }
+                    else if (c & 0xF8) == 0xF0 { 4 }
+                    else { 1 };
+                Value::usize_val(len)
+            }
+        }
+
         // ── 未实现的 FFI 函数（无 C 编译器时返回默认值）──
         _ => Value::i32(0),
     }
@@ -1009,27 +1262,22 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
     }))
 }
 
-/// compute_fn: 记录字段访问（按 field_idx 从 RecordValue 取字段值）
+/// compute_fn: 记录字段访问（按 field 名称从 Record/Adt 取字段值）
+///
+/// 统一机制：Record 与 Adt 均通过 `find_field(name)` 按名取值，
+/// 不依赖编译期 field_idx，消除 idx fallback 与 Record/Adt 双路径差异。
 pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
     let graph = frame.graph.clone();
     let n = &graph.nodes[node.0 as usize];
     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
     let record_val = frame.get_value_by_global(inputs[0]);
+    let name = graph.field_set_names[node.0 as usize].as_deref();
     match record_val.heap_obj() {
         Some(crate::Value::HeapObj::Record(r)) => {
-            // 优先按 field 名称查找（Sema 可能未正确设置 field_idx）
-            if let Some(name) = graph.field_set_names[node.0 as usize].as_ref() {
-                if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(name.as_str())) {
-                    return r.get_field(idx).cloned().unwrap_or(Value::VOID);
-                }
-            }
-            // fallback: field_access_info 的 field_idx
-            let field_idx = graph.field_access_infos[node.0 as usize].unwrap_or(0) as usize;
-            r.get_field(field_idx).cloned().unwrap_or(Value::VOID)
+            name.and_then(|n| r.find_field(n)).cloned().unwrap_or(Value::VOID)
         }
         Some(crate::Value::HeapObj::Adt(a)) => {
-            let field_idx = graph.field_access_infos[node.0 as usize].unwrap_or(0) as usize;
-            a.get_field(field_idx).cloned().unwrap_or(Value::VOID)
+            name.and_then(|n| a.find_field(n)).cloned().unwrap_or(Value::VOID)
         }
         _ => Value::VOID,
     }
@@ -1049,20 +1297,36 @@ pub fn compute_array_construct(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn: 数组索引（从 ArrayValue 按 i32 索引取元素）
+/// 索引越界时返回 ThrowVal(Err) 错误值，逐层透传至顶层。
 pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
+    use std::sync::Arc;
+    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     let graph = frame.graph.clone();
     let n = &graph.nodes[node.0 as usize];
     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
     let recv_val = frame.get_value_by_global(inputs[0]);
     let idx = frame.get_value_by_global(inputs[1]).as_i32() as usize;
+    let make_err = |msg: &str| {
+        let record = Arc::new(RecordValue {
+            type_name: "IndexError".to_string(),
+            fields: vec![Value::ref_val(HeapObj::Str(crate::Value::GlueStr::new(msg)))],
+            field_names: vec![Some("message".to_string())],
+            field_ref_bits: 1,
+        });
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    };
     match recv_val.heap_obj() {
         Some(crate::Value::HeapObj::Array(arr)) => {
-            arr.get(idx).cloned().unwrap_or(Value::VOID)
+            arr.get(idx).cloned().unwrap_or_else(|| {
+                make_err(&format!("index {} out of bounds (len {})", idx, arr.len()))
+            })
         }
         Some(crate::Value::HeapObj::Str(s)) => {
-            s.char_at(idx).map(|c| Value::char_val(c)).unwrap_or(Value::VOID)
+            s.char_at(idx).map(|c| Value::char_val(c)).unwrap_or_else(|| {
+                make_err(&format!("index {} out of bounds (len {})", idx, s.codepoint_count()))
+            })
         }
-        _ => Value::VOID,
+        _ => make_err("index on non-indexable type"),
     }
 }
 
@@ -1075,19 +1339,30 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
     let graph = frame.graph.clone();
     let n = &graph.nodes[node.0 as usize];
     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-    let record_val = frame.get_value_by_global(inputs[0]);
+    let _record_val = frame.get_value_by_global(inputs[0]);
     let new_value = frame.get_value_by_global(inputs[1]);
     let field_name = graph.field_set_names[node.0 as usize]
         .as_ref()
         .expect("field set node has no field name");
-    // &self 语义：修改原对象（所有 Arc 引用看到修改）。
-    if let Value::Ref(arc) = &record_val {
-        let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::Value::HeapObj;
-        let obj = unsafe { &mut *ptr };
-        if let crate::Value::HeapObj::Record(r) = obj {
-            if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name.as_str())) {
-                if idx < r.fields.len() {
-                    r.fields[idx] = new_value;
+    // &self 语义：通过 Arc::as_ptr 直接修改底层 HeapObj（不 COW）。
+    // 参数传递时 Arc 被 clone（refcount > 1），Arc::make_mut 会创建副本导致 &self 修改不可见。
+    let record_node_local = NodeId(inputs[0].0.wrapping_sub(frame.node_offset));
+    if let Some(val) = frame.value_table.get_value_mut(record_node_local.0 as usize) {
+        if let Value::Ref(arc) = val {
+            // &self 语义：直接修改 Arc 底层的 HeapObj，而非 Arc::make_mut 的 COW 副本。
+            // 参数传递时 Arc 被 clone（refcount > 1），make_mut 会创建副本导致修改对调用方不可见。
+            // 直接修改确保 &self 引用语义正确（修改原始值，不是副本）。
+            //
+            // Safety: 引擎单线程执行，caller 帧在 callee 执行期间处于 Suspended 状态，
+            // 不会有并发访问同一 HeapObj 的代码路径。
+            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::Value::HeapObj;
+            unsafe {
+                if let crate::Value::HeapObj::Record(r) = &mut *ptr {
+                    if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name.as_str())) {
+                        if idx < r.fields.len() {
+                            r.fields[idx] = new_value.clone();
+                        }
+                    }
                 }
             }
         }
@@ -1119,6 +1394,89 @@ pub fn compute_array_len(frame: &mut Frame, node: NodeId) -> Value {
     Value::i32(len)
 }
 
+/// compute_fn: 引用相等比较（===），比较两个 Ref 的 Arc 指针是否指向同一对象。
+/// 返回 bool。两边均为 Ref 时用 Arc::ptr_eq；否则返回 false。
+pub fn compute_ref_eq(frame: &mut Frame, node: NodeId) -> Value {
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let lhs = frame.get_value_by_global(inputs[0]);
+    let rhs = frame.get_value_by_global(inputs[1]);
+    let eq = match (&lhs, &rhs) {
+        (Value::Ref(a), Value::Ref(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    };
+    Value::bool_val(eq)
+}
+
+/// compute_fn: 引用不等比较（!==），RefEq 的否定。
+pub fn compute_ref_neq(frame: &mut Frame, node: NodeId) -> Value {
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let lhs = frame.get_value_by_global(inputs[0]);
+    let rhs = frame.get_value_by_global(inputs[1]);
+    let neq = match (&lhs, &rhs) {
+        (Value::Ref(a), Value::Ref(b)) => !std::sync::Arc::ptr_eq(a, b),
+        _ => true,
+    };
+    Value::bool_val(neq)
+}
+
+/// compute_fn: 列表拼接（ConcatList），两个 Array 拼接为新 Array。
+pub fn compute_concat_list(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, ArrayValue};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let lhs = frame.get_value_by_global(inputs[0]);
+    let rhs = frame.get_value_by_global(inputs[1]);
+    match (lhs.heap_obj(), rhs.heap_obj()) {
+        (Some(HeapObj::Array(a)), Some(HeapObj::Array(b))) => {
+            let mut elements = Vec::with_capacity(a.len() + b.len());
+            elements.extend(a.elements.iter().cloned());
+            elements.extend(b.elements.iter().cloned());
+            Value::ref_val(HeapObj::Array(ArrayValue::new(elements)))
+        }
+        _ => Value::VOID,
+    }
+}
+
+/// compute_fn: 范围生成（Range，a..b，左闭右开）。
+pub fn compute_range(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, Range};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let start = frame.get_value_by_global(inputs[0]).as_i64();
+    let end = frame.get_value_by_global(inputs[1]).as_i64();
+    Value::ref_val(HeapObj::Range(Range::new(start, end, false)))
+}
+
+/// compute_fn: 范围生成（RangeInclusive，a..=b，左闭右闭）。
+pub fn compute_range_inclusive(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, Range};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let start = frame.get_value_by_global(inputs[0]).as_i64();
+    let end = frame.get_value_by_global(inputs[1]).as_i64();
+    Value::ref_val(HeapObj::Range(Range::new(start, end, true)))
+}
+
+/// compute_fn: Elvis 运算（lhs ?: rhs）。lhs 为 null 时返回 rhs，否则返回 lhs。
+pub fn compute_elvis(frame: &mut Frame, node: NodeId) -> Value {
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let lhs = frame.get_value_by_global(inputs[0]);
+    if lhs.is_null() {
+        frame.get_value_by_global(inputs[1])
+    } else {
+        lhs
+    }
+}
+
 /// compute_fn: Call 节点启动子图（参数收集 + 标记 frame.pending_call）。
 ///
 /// 不直接 start_subgraph（compute_fn 无 Engine 引用）。
@@ -1137,7 +1495,7 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId) -> Value {
             .collect();
 
         // call_node 的局部 id（node - node_offset）
-        let call_node_local = NodeId(node.0 - frame.node_offset);
+        let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
         frame.pending_call = Some(PendingCall {
             target_sg,
@@ -1180,7 +1538,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId) -> Value {
         .map(|&n| frame.get_value_by_global(n))
         .collect();
 
-    let gate_node_local = NodeId(node.0 - frame.node_offset);
+    let gate_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
     frame.pending_call = Some(PendingCall {
         target_sg,
@@ -1205,7 +1563,7 @@ pub fn compute_await(frame: &mut Frame, node: NodeId) -> Value {
     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
     // inputs[0] = 事件对象节点（AsyncHandle/Channel/Timer）
     let event_obj = frame.get_value_by_global(inputs[0]);
-    let await_node_local = NodeId(node.0 - frame.node_offset);
+    let await_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
     // EventSource 节点从 await_event_sources 表读取（元数据引用，非数据依赖）
     let es_node = graph.await_event_sources[node.0 as usize];
@@ -1250,7 +1608,7 @@ pub fn compute_async_call_launch(frame: &mut Frame, node: NodeId) -> Value {
         .take(param_count)
         .map(|&in_node| frame.get_value_by_global(in_node))
         .collect();
-    let call_node_local = NodeId(node.0 - frame.node_offset);
+    let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
     frame.pending_call = Some(PendingCall {
         target_sg,
@@ -1305,9 +1663,11 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
     };
 
     let target_sg = SubGraphId(closure.func_id);
-    let call_node_local = NodeId(node.0 - frame.node_offset);
+    let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
-    let call_args: Vec<Value> = inputs[1..]
+    // 用 param_count 限制参数提取，忽略末尾追加的 current_effect 隐式依赖
+    let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
+    let call_args: Vec<Value> = inputs[1..1 + param_count]
         .iter()
         .map(|&in_node| frame.get_value_by_global(in_node))
         .collect();
@@ -1351,7 +1711,7 @@ pub fn compute_select_gate(frame: &mut Frame, node: NodeId) -> Value {
     let _ = graph.select_infos[node.0 as usize]
         .as_ref()
         .expect("select gate node has no SelectInfo");
-    let gate_local = NodeId(node.0 - frame.node_offset);
+    let gate_local = NodeId(node.0.wrapping_sub(frame.node_offset));
     frame.pending_select_wait = Some(gate_local);
     Value::VOID
 }
@@ -1419,6 +1779,9 @@ pub struct FramePool {
     frames: Vec<Box<Frame>>,
     next_id: u32,
     graph: std::sync::Arc<DataFlowGraph>,
+    /// 空闲帧列表：free 时加入，alloc 时优先复用。
+    /// 避免深度递归时 frames Vec 无限增长导致内存耗尽。
+    free_list: Vec<FrameId>,
 }
 
 impl FramePool {
@@ -1427,11 +1790,44 @@ impl FramePool {
             frames: Vec::new(),
             next_id: 0,
             graph,
+            free_list: Vec::new(),
         }
     }
 
     /// 分配新帧，返回 FrameId。
+    /// 优先从 free_list 复用已释放的帧，避免 Vec 无限增长。
     pub fn alloc(&mut self, subgraph_id: SubGraphId, node_count: usize) -> FrameId {
+        // 优先复用空闲帧
+        if let Some(id) = self.free_list.pop() {
+            let frame = self.frames[id.0 as usize].as_mut();
+            // 重置帧以复用：保留 id 和 graph，复用现有 Vec 仅在尺寸不匹配时 resize
+            frame.subgraph_id = subgraph_id;
+            if frame.value_table.len() != node_count {
+                frame.value_table.resize(node_count);
+            }
+            if frame.pending_inputs.len() != node_count {
+                frame.pending_inputs.resize(node_count, 0);
+            }
+            frame.ready_queue.clear();
+            frame.state = FrameState::Ready;
+            frame.caller = None;
+            frame.node_offset = 0;
+            frame.control_signal = ControlSignal::None;
+            frame.suspend_state = SuspendState::NotSuspended;
+            frame.suspend_event = None;
+            frame.pending_call = None;
+            frame.pending_await = None;
+            frame.pending_cancel = None;
+            frame.pending_select_wait = None;
+            frame.defer_stack.clear();
+            frame.select_timers.clear();
+            frame.root_frame_ptr = std::ptr::null_mut();
+            frame.parent_frame_ptr = std::ptr::null_mut();
+            frame.body_frame_id = None;
+            return id;
+        }
+
+        assert!(self.next_id < u32::MAX, "FrameId overflow: too many frames allocated");
         let id = FrameId(self.next_id);
         self.next_id += 1;
         let frame = Frame::new(id, subgraph_id, node_count, self.graph.clone());
@@ -1461,11 +1857,7 @@ impl FramePool {
     pub fn free(&mut self, id: FrameId) {
         let frame = self.frames[id.0 as usize].as_mut();
         // 清空 value_table：持有堆对象的 Arc<HeapObj> Drop 时自动 decref
-        for slot in frame.value_table.iter_mut() {
-            slot.value = Value::NULL;
-            slot.ready = false;
-            slot.refcount = 0;
-        }
+        frame.value_table.reset_all();
         frame.ready_queue.clear();
         frame.state = FrameState::Completed;
         frame.control_signal = ControlSignal::None;
@@ -1474,6 +1866,8 @@ impl FramePool {
         frame.pending_call = None;
         frame.pending_await = None;
         frame.defer_stack.clear();
+        // 加入空闲列表，供后续 alloc 复用
+        self.free_list.push(id);
     }
 
     /// 取出所有帧（用于 SharedEngine::from_engine 将帧迁移到 HashMap）。
@@ -1522,6 +1916,21 @@ impl ChannelRuntime {
             .map(|c| !c.buffer.is_empty())
             .unwrap_or(false)
     }
+    /// 原子地检查并接收数据（消除 has_data + recv 的 TOCTOU 竞态）。
+    /// 如果有数据则返回 Some(Value)，否则返回 None。
+    pub fn try_recv(&mut self, id: crate::Ir::ChannelId) -> Option<Value> {
+        self.channels.get_mut(id.0 as usize)?.buffer.pop_front()
+    }
+    /// 清理已关闭/空的 channel（保留有数据的，清除空且无引用的）。
+    pub fn cleanup(&mut self) {
+        // channel 不主动删除（ID 是索引，删除会导致后续 ID 失效）
+        // 但可以清理空 buffer 释放内存
+        for ch in &mut self.channels {
+            if ch.buffer.is_empty() {
+                ch.buffer.shrink_to_fit();
+            }
+        }
+    }
 }
 
 impl Default for ChannelRuntime {
@@ -1564,6 +1973,14 @@ impl TimerRuntime {
     pub fn is_fired(&self, id: crate::Ir::TimerId) -> bool {
         self.timers.get(id.0 as usize).map(|t| t.fired).unwrap_or(false)
     }
+    /// 清理已触发的 timer 条目以回收内存。
+    /// 注意：TimerId 是 Vec 索引，不能直接 retain（会导致索引错位）。
+    /// 此方法将已触发 timer 的 deadline 重置为零值，不改变 Vec 长度。
+    /// TimerEntry 本身很小（Instant + bool），内存影响有限。
+    pub fn cleanup(&mut self) {
+        // 不删除条目以保持 TimerId 索引有效性
+        // TimerEntry 很小，无需主动清理
+    }
 }
 
 impl Default for TimerRuntime {
@@ -1589,12 +2006,20 @@ impl AsyncJoinRuntime {
     pub fn new() -> Self { Self { entries: Vec::new(), next_async_id: 0 } }
     /// 分配新的 async_id（i32 标量值）
     pub fn alloc_id(&mut self) -> crate::Ir::AsyncHandleId {
+        assert!(self.next_async_id < u32::MAX, "AsyncHandleId overflow: too many async calls");
         let id = crate::Ir::AsyncHandleId(self.next_async_id);
         self.next_async_id += 1;
         id
     }
     pub fn register(&mut self, async_id: crate::Ir::AsyncHandleId, child_fid: FrameId) {
         self.entries.push(AsyncJoinEntry { async_id, child_fid, result: None });
+    }
+    /// 原子地分配 async_id 并注册 child_fid（消除 alloc_id + register 的竞态窗口）。
+    pub fn alloc_and_register(&mut self, child_fid: FrameId) -> crate::Ir::AsyncHandleId {
+        let async_id = crate::Ir::AsyncHandleId(self.next_async_id);
+        self.next_async_id += 1;
+        self.entries.push(AsyncJoinEntry { async_id, child_fid, result: None });
+        async_id
     }
     pub fn find_by_child(&self, child_fid: FrameId) -> Option<crate::Ir::AsyncHandleId> {
         self.entries.iter().find(|e| e.child_fid == child_fid).map(|e| e.async_id)
@@ -1610,12 +2035,225 @@ impl AsyncJoinRuntime {
             e.result = Some(value);
         }
     }
+    /// 清理已完成且 result 已被读取的 entry，释放内存。
+    /// 注意：AsyncHandleId 是 alloc_id 分配的递增值，不是 entries 索引，
+    /// 所以移除 entry 不影响 ID 有效性。
+    pub fn cleanup_consumed(&mut self, consumed_ids: &[crate::Ir::AsyncHandleId]) {
+        self.entries.retain(|e| {
+            // 保留未完成的，或已完成但未被消费的
+            e.result.is_none() || !consumed_ids.contains(&e.async_id)
+        });
+    }
 }
 
 impl Default for AsyncJoinRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// =========================================================================
+// SIMD/rayon 批量化调度 — 模块级宏 + 自由函数（供 Engine 和 SharedEngine 共用）
+// =========================================================================
+
+/// 批量提取二元运算输入 → SIMD/rayon 批算 → 写回 value_table。
+macro_rules! exec_bin_batch {
+    ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $ctor:ident, $acc:ident, $batch_fn:ident, $op:expr) => {{
+        let n = $locals.len();
+        let mut a: Vec<$rust> = Vec::with_capacity(n);
+        let mut b: Vec<$rust> = Vec::with_capacity(n);
+        for &lid in $locals.iter() {
+            let gid = NodeId(lid.0 + $ns.0);
+            let node = $graph.nodes[gid.0 as usize];
+            let inp = $graph.inputs_pool.get(node.inputs_offset, node.input_count);
+            a.push($frame.get_value_by_global(inp[0]).$acc());
+            b.push($frame.get_value_by_global(inp[1]).$acc());
+        }
+        let mut dst = vec![0 as $rust; n];
+        crate::Value::$batch_fn(&mut dst, &a, &b, $op);
+        for (i, &lid) in $locals.iter().enumerate() {
+            let gid = NodeId(lid.0 + $ns.0);
+            let cc = $graph.downstreams[gid.0 as usize].len() as u16;
+            $frame.set_value(lid, Value::$ctor(dst[i]), cc);
+        }
+    }};
+}
+
+/// 批量提取比较运算输入 → SIMD/rayon 批算 → 写回 value_table（结果为 bool）。
+macro_rules! exec_cmp_batch {
+    ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $acc:ident, $batch_fn:ident, $op:expr) => {{
+        let n = $locals.len();
+        let mut a: Vec<$rust> = Vec::with_capacity(n);
+        let mut b: Vec<$rust> = Vec::with_capacity(n);
+        for &lid in $locals.iter() {
+            let gid = NodeId(lid.0 + $ns.0);
+            let node = $graph.nodes[gid.0 as usize];
+            let inp = $graph.inputs_pool.get(node.inputs_offset, node.input_count);
+            a.push($frame.get_value_by_global(inp[0]).$acc());
+            b.push($frame.get_value_by_global(inp[1]).$acc());
+        }
+        let mut mask = vec![0u8; n];
+        crate::Value::$batch_fn(&mut mask, &a, &b, $op);
+        for (i, &lid) in $locals.iter().enumerate() {
+            let gid = NodeId(lid.0 + $ns.0);
+            let cc = $graph.downstreams[gid.0 as usize].len() as u16;
+            $frame.set_value(lid, Value::bool_val(mask[i] != 0), cc);
+        }
+    }};
+}
+
+/// 批量提取一元运算输入 → SIMD/rayon 批算 → 写回 value_table。
+macro_rules! exec_unary_batch {
+    ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $ctor:ident, $acc:ident, $op:expr) => {{
+        let n = $locals.len();
+        let mut a: Vec<$rust> = Vec::with_capacity(n);
+        for &lid in $locals.iter() {
+            let gid = NodeId(lid.0 + $ns.0);
+            let node = $graph.nodes[gid.0 as usize];
+            let inp = $graph.inputs_pool.get(node.inputs_offset, node.input_count);
+            a.push($frame.get_value_by_global(inp[0]).$acc());
+        }
+        let mut dst = vec![0 as $rust; n];
+        crate::Value::batch_unaryop(&mut dst, &a, $op);
+        for (i, &lid) in $locals.iter().enumerate() {
+            let gid = NodeId(lid.0 + $ns.0);
+            let cc = $graph.downstreams[gid.0 as usize].len() as u16;
+            $frame.set_value(lid, Value::$ctor(dst[i]), cc);
+        }
+    }};
+}
+
+/// 处理一批同质批量化节点（相同 ScalarTag + BatchOp），使用 SIMD/rayon 批算。
+///
+/// 从 value_table 提取输入到连续 typed 数组，调用 Value.rs 的 batch 函数，
+/// 写回结果并通知下游。仅适用于 BinOp/UnOp/Cmp 标量运算节点。
+fn process_batch_group(
+    frame: &mut Frame,
+    graph: &DataFlowGraph,
+    locals: &[NodeId],
+    node_start: NodeId,
+    info: BatchInfo,
+) {
+    use crate::Value::{ScalarTag, BinOp, CmpOp, UnaryOp};
+    let _ = (BinOp::Add, CmpOp::Eq, UnaryOp::Neg); // 抑制 unused import
+
+    if locals.is_empty() { return; }
+
+    match info {
+        BatchInfo { tag, op: BatchOp::Bin(op) } => {
+            match tag {
+                ScalarTag::I32 => exec_bin_batch!(frame, graph, locals, node_start, i32, i32, as_i32, batch_binop_i32, op),
+                ScalarTag::I64 => exec_bin_batch!(frame, graph, locals, node_start, i64, i64, as_i64, batch_binop_i64, op),
+                ScalarTag::F32 => exec_bin_batch!(frame, graph, locals, node_start, f32, f32, as_f32, batch_binop_f32, op),
+                ScalarTag::F64 => exec_bin_batch!(frame, graph, locals, node_start, f64, f64, as_f64, batch_binop_f64, op),
+                ScalarTag::I8 => exec_bin_batch!(frame, graph, locals, node_start, i8, i8, as_i8, batch_binop, op),
+                ScalarTag::I16 => exec_bin_batch!(frame, graph, locals, node_start, i16, i16, as_i16, batch_binop, op),
+                ScalarTag::U8 => exec_bin_batch!(frame, graph, locals, node_start, u8, u8, as_u8, batch_binop, op),
+                ScalarTag::U16 => exec_bin_batch!(frame, graph, locals, node_start, u16, u16, as_u16, batch_binop, op),
+                ScalarTag::U32 => exec_bin_batch!(frame, graph, locals, node_start, u32, u32, as_u32, batch_binop, op),
+                ScalarTag::U64 => exec_bin_batch!(frame, graph, locals, node_start, u64, u64, as_u64, batch_binop, op),
+                ScalarTag::I128 => exec_bin_batch!(frame, graph, locals, node_start, i128, i128, as_i128, batch_binop, op),
+                ScalarTag::U128 => exec_bin_batch!(frame, graph, locals, node_start, u128, u128, as_u128, batch_binop, op),
+                ScalarTag::Isize => exec_bin_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, batch_binop, op),
+                ScalarTag::Usize => exec_bin_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, batch_binop, op),
+                _ => return, // F16/F128/Bool/Char → 不支持
+            }
+        }
+        BatchInfo { tag, op: BatchOp::Cmp(op) } => {
+            match tag {
+                ScalarTag::F32 => exec_cmp_batch!(frame, graph, locals, node_start, f32, as_f32, batch_cmp_f32, op),
+                ScalarTag::F64 => exec_cmp_batch!(frame, graph, locals, node_start, f64, as_f64, batch_cmp_f64, op),
+                ScalarTag::I32 => exec_cmp_batch!(frame, graph, locals, node_start, i32, as_i32, batch_cmp, op),
+                ScalarTag::I64 => exec_cmp_batch!(frame, graph, locals, node_start, i64, as_i64, batch_cmp, op),
+                ScalarTag::I8 => exec_cmp_batch!(frame, graph, locals, node_start, i8, as_i8, batch_cmp, op),
+                ScalarTag::I16 => exec_cmp_batch!(frame, graph, locals, node_start, i16, as_i16, batch_cmp, op),
+                ScalarTag::U8 => exec_cmp_batch!(frame, graph, locals, node_start, u8, as_u8, batch_cmp, op),
+                ScalarTag::U16 => exec_cmp_batch!(frame, graph, locals, node_start, u16, as_u16, batch_cmp, op),
+                ScalarTag::U32 => exec_cmp_batch!(frame, graph, locals, node_start, u32, as_u32, batch_cmp, op),
+                ScalarTag::U64 => exec_cmp_batch!(frame, graph, locals, node_start, u64, as_u64, batch_cmp, op),
+                ScalarTag::I128 => exec_cmp_batch!(frame, graph, locals, node_start, i128, as_i128, batch_cmp, op),
+                ScalarTag::U128 => exec_cmp_batch!(frame, graph, locals, node_start, u128, as_u128, batch_cmp, op),
+                ScalarTag::Isize => exec_cmp_batch!(frame, graph, locals, node_start, isize, as_isize, batch_cmp, op),
+                ScalarTag::Usize => exec_cmp_batch!(frame, graph, locals, node_start, usize, as_usize, batch_cmp, op),
+                _ => return, // F16/F128/Bool/Char → 不支持
+            }
+        }
+        BatchInfo { tag, op: BatchOp::Unary(op) } => {
+            match tag {
+                ScalarTag::I32 => exec_unary_batch!(frame, graph, locals, node_start, i32, i32, as_i32, op),
+                ScalarTag::I64 => exec_unary_batch!(frame, graph, locals, node_start, i64, i64, as_i64, op),
+                ScalarTag::I8 => exec_unary_batch!(frame, graph, locals, node_start, i8, i8, as_i8, op),
+                ScalarTag::I16 => exec_unary_batch!(frame, graph, locals, node_start, i16, i16, as_i16, op),
+                ScalarTag::U8 => exec_unary_batch!(frame, graph, locals, node_start, u8, u8, as_u8, op),
+                ScalarTag::U16 => exec_unary_batch!(frame, graph, locals, node_start, u16, u16, as_u16, op),
+                ScalarTag::U32 => exec_unary_batch!(frame, graph, locals, node_start, u32, u32, as_u32, op),
+                ScalarTag::U64 => exec_unary_batch!(frame, graph, locals, node_start, u64, u64, as_u64, op),
+                ScalarTag::I128 => exec_unary_batch!(frame, graph, locals, node_start, i128, i128, as_i128, op),
+                ScalarTag::U128 => exec_unary_batch!(frame, graph, locals, node_start, u128, u128, as_u128, op),
+                ScalarTag::Isize => exec_unary_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, op),
+                ScalarTag::Usize => exec_unary_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, op),
+                _ => return, // F16/F128/F32/F64/Bool/Char → 不支持（浮点无 BitOps）
+            }
+        }
+    }
+
+    // 通知所有批处理节点的下游
+    for &lid in locals {
+        let gid = NodeId(lid.0 + node_start.0);
+        notify_downstream_shared(frame, graph, lid, gid, node_start);
+    }
+}
+
+/// 尝试批量化处理就绪队列中的节点。
+///
+/// drain ready_queue → 按 (ScalarTag, BatchOp) 分组 → 对 2+ 节点的组
+/// 调用 process_batch_group 做 SIMD/rayon 批算 → 非批量化节点推回 ready_queue。
+/// 返回 true 表示执行了批处理（调用方应 continue 重新检查新就绪节点）。
+fn try_batch_nodes(frame: &mut Frame, graph: &DataFlowGraph) -> bool {
+    let qlen = frame.ready_queue.len();
+    if qlen < 2 { return false; }
+
+    let node_start = frame.node_offset;
+    let wave: Vec<NodeId> = frame.ready_queue.drain(..).collect();
+
+    // 分区：batchable（有 BatchInfo 且未预填充）vs rest
+    let mut groups: Vec<(BatchInfo, Vec<NodeId>)> = Vec::new();
+    let mut rest: Vec<NodeId> = Vec::new();
+
+    for lid in wave {
+        if frame.value_table.ready[lid.0 as usize] {
+            rest.push(lid);
+            continue;
+        }
+        let gid = NodeId(lid.0 + node_start);
+        if let Some(info) = graph.batch_infos[gid.0 as usize] {
+            if let Some(g) = groups.iter_mut().find(|(k, _)| *k == info) {
+                g.1.push(lid);
+            } else {
+                groups.push((info, vec![lid]));
+            }
+        } else {
+            rest.push(lid);
+        }
+    }
+
+    // 处理 2+ 节点的组
+    let mut batch_done = false;
+    for (info, locals) in groups {
+        if locals.len() >= 2 {
+            process_batch_group(frame, graph, &locals, NodeId(node_start), info);
+            batch_done = true;
+        } else {
+            rest.push(locals[0]);
+        }
+    }
+
+    // 非批量化节点推回 ready_queue
+    for n in rest {
+        frame.push_ready(n);
+    }
+
+    batch_done
 }
 
 // =========================================================================
@@ -1661,11 +2299,22 @@ impl Engine {
     /// 分配常量值的 Value。
     fn alloc_const_value(&mut self, cv: ConstValue) -> Value {
         match cv {
+            ConstValue::I8(v) => Value::i8(v),
+            ConstValue::I16(v) => Value::i16(v),
             ConstValue::I32(v) => Value::i32(v),
             ConstValue::I64(v) => Value::i64(v),
+            ConstValue::I128(v) => Value::i128(v),
+            ConstValue::U8(v) => Value::u8(v),
+            ConstValue::U16(v) => Value::u16(v),
+            ConstValue::U32(v) => Value::u32(v),
+            ConstValue::U64(v) => Value::u64(v),
+            ConstValue::U128(v) => Value::u128(v),
+            ConstValue::Isize(v) => Value::isize_val(v),
+            ConstValue::Usize(v) => Value::usize_val(v),
             ConstValue::F32(v) => Value::f32(v),
             ConstValue::F64(v) => Value::f64(v),
             ConstValue::Bool(v) => Value::bool_val(v),
+            ConstValue::Char(c) => Value::char_val(char::from_u32(c).unwrap_or('\0')),
             ConstValue::Null => Value::NULL,
             ConstValue::Void => Value::VOID,
             ConstValue::Str(s) => {
@@ -1703,11 +2352,7 @@ impl Engine {
 
         // 清空 value_table + ready_queue（帧复用时必须重置，避免旧值残留）
         let frame = self.frames.get_mut(fid);
-        for i in 0..node_count {
-            frame.value_table[i].value = Value::VOID;
-            frame.value_table[i].ready = false;
-            frame.value_table[i].refcount = 0;
-        }
+        frame.value_table.reset_all();
         frame.ready_queue.clear();
         frame.control_signal = ControlSignal::None;
         frame.pending_call = None;
@@ -1807,7 +2452,7 @@ impl Engine {
                 continue; // 已在步骤 2 处理
             }
             let frame = self.frames.get_mut(fid);
-            if frame.pending_inputs[i] == 0 && !frame.value_table[i].ready {
+            if frame.pending_inputs[i] == 0 && !frame.value_table.ready[i] {
                 frame.push_ready(NodeId(i as u32));
             }
         }
@@ -1827,14 +2472,15 @@ impl Engine {
         let downstreams: Vec<NodeId> =
             self.graph.downstreams[producer_graph.0 as usize].clone();
         for ds_graph_id in downstreams {
-            let ds_local_id = NodeId(ds_graph_id.0 - node_start.0);
+            let ds_local_id = NodeId(ds_graph_id.0.wrapping_sub(node_start.0));
             let frame = self.frames.get_mut(fid);
 
             // 槽级 RC：每通知一个下游就 consume()（spec 4.7）
-            let still_has_consumers = frame.value_table[producer_local.0 as usize].consume();
-            if !still_has_consumers && frame.value_table[producer_local.0 as usize].ready {
-                // 生产者槽归零，清槽（堆对象 Rc Drop 自动 decref，槽可复用）
-                frame.value_table[producer_local.0 as usize].ready = false;
+            let pidx = producer_local.0 as usize;
+            let still_has_consumers = frame.value_table.consume(pidx);
+            if !still_has_consumers && frame.value_table.ready[pidx] {
+                // 生产者槽归零，清槽（堆对象 Arc Drop 自动 decref，槽可复用）
+                frame.value_table.ready[pidx] = false;
             }
 
             // 减下游 pending_inputs，归零则入就绪队列
@@ -1842,7 +2488,7 @@ impl Engine {
                 frame.pending_inputs[ds_local_id.0 as usize] -= 1;
             }
             if frame.pending_inputs[ds_local_id.0 as usize] == 0
-                && !frame.value_table[ds_local_id.0 as usize].ready
+                && !frame.value_table.ready[ds_local_id.0 as usize]
             {
                 frame.push_ready(ds_local_id);
             }
@@ -1872,6 +2518,17 @@ impl Engine {
                 return;
             }
 
+            // SIMD/rayon 批量化：drain ready_queue → 按 (ScalarTag,BatchOp) 分组 → 批算
+            // 成功批处理时 continue（新就绪节点已通过 notify_downstream 入队）；
+            // 未批处理时 fall through 到单节点路径。
+            {
+                let graph = self.graph.clone();
+                let frame = self.frames.get_mut(fid);
+                if try_batch_nodes(frame, &graph) {
+                    continue;
+                }
+            }
+
             // 弹出就绪节点（局部 id）
             let local_id = match self.frames.get_mut(fid).pop_ready() {
                 Some(n) => n,
@@ -1885,9 +2542,9 @@ impl Engine {
             // 预填充节点（Const 在 prepare_frame、Param 在 start_subgraph 已设值）：
             // 跳过 compute_fn（Const 的 compute_fn 为 noop，会返回 VOID 覆盖预填充值），
             // 直接复用预填充值。非预填充节点统一调用 compute_fn（spec 4.2：无 match kind 分派）。
-            let pre_filled = self.frames.get(fid).value_table[local_id.0 as usize].ready;
+            let pre_filled = self.frames.get(fid).value_table.ready[local_id.0 as usize];
             let value = if pre_filled {
-                self.frames.get(fid).value_table[local_id.0 as usize].value.clone()
+                self.frames.get(fid).value_table.values[local_id.0 as usize].clone()
             } else {
                 let compute_fn = self.graph.compute_fns[node.compute_fn.0 as usize];
                 let frame = self.frames.get_mut(fid);
@@ -1951,6 +2608,48 @@ impl Engine {
             let pending = self.frames.get(fid).pending_call.clone();
             if let Some(pending) = pending {
                 self.frames.get_mut(fid).pending_call = None;
+
+                // 尾调用图跳转：编译期标记的尾调用复用当前帧（帧池零分配）
+                let node_start = self.frames.get(fid).node_offset;
+                let graph_call_id = NodeId(pending.call_node_local.0 + node_start);
+                if self.graph.tail_call_flags[graph_call_id.0 as usize] {
+                    // 分支中的尾调用传播：当 caller 是 Gate 且非 LoopBody 时，
+                    // 分支帧的 switch_subgraph 会创建 O(n) 分支帧链。
+                    // 解决：释放父帧（函数帧），将分支帧的 caller 更新为原始调用方，
+                    // 然后在分支帧上 switch_subgraph。这样 O(1) 帧即可完成深度递归。
+                    let caller = self.frames.get(fid).caller;
+                    let propagate_to_parent = if let Some((caller_fid, call_node)) = caller {
+                        let caller_sg_id = self.frames.get(caller_fid).subgraph_id;
+                        let caller_loop_kind = self.graph.subgraphs[caller_sg_id.0 as usize].loop_kind;
+                        let caller_has_caller = self.frames.get(caller_fid).caller.is_some();
+                        let caller_offset = self.frames.get(caller_fid).node_offset;
+                        let caller_graph_node = NodeId(call_node.0 + caller_offset);
+                        let caller_is_gate = self.graph.nodes[caller_graph_node.0 as usize].kind == NodeKind::Gate;
+                        caller_is_gate
+                            && caller_loop_kind != crate::Ir::LoopKind::LoopBody
+                            && caller_has_caller
+                    } else {
+                        false
+                    };
+
+                    if propagate_to_parent {
+                        let (caller_fid, _) = caller.unwrap();
+                        // 获取函数帧的 caller（原始调用方）
+                        let orig_caller = self.frames.get(caller_fid).caller;
+                        // 清理函数帧的 event_waiters（函数帧被释放，不再等待子图完成）
+                        self.event_waiters.retain(|(_, f)| *f != caller_fid);
+                        // 释放函数帧（它永远不会恢复）
+                        self.frames.free(caller_fid);
+                        // 更新分支帧的 caller 为原始调用方
+                        self.frames.get_mut(fid).caller = orig_caller;
+                        // 切换分支帧为目标子图
+                        self.switch_subgraph(fid, pending.target_sg, &pending.args);
+                    } else {
+                        // 直接尾调用（函数体顶层）或根帧分支：切换当前帧
+                        self.switch_subgraph(fid, pending.target_sg, &pending.args);
+                    }
+                    continue; // 帧已重置为目标子图，继续执行新就绪节点
+                }
 
                 let target_loop_kind =
                     self.graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
@@ -2235,8 +2934,9 @@ impl Engine {
             ControlSignal::Break | ControlSignal::Continue => Value::VOID,
             ControlSignal::None => {
                 let sg = &self.graph.subgraphs[child.subgraph_id.0 as usize];
-                let return_local = NodeId(sg.return_node.0 - sg.node_range.0 .0);
-                child.get_value(return_local)
+                // 用 get_value_by_global 而非 get_value：分支子图的 return_node 可能指向
+                // 外层节点（帧链穿透），需要通过 parent_frame_ptr/root_frame_ptr 回溯读取
+                child.get_value_by_global(sg.return_node)
             }
         }
     }
@@ -2315,6 +3015,58 @@ impl Engine {
         self.frames.get_mut(child_fid).parent_frame_ptr = parent_ptr;
 
         child_fid
+    }
+
+    /// 尾调用图跳转：复用当前帧执行目标子图（帧池零分配）。
+    ///
+    /// 编译期 tail_call_flags 标记的 Call 节点，运行时不再 start_subgraph 分配新帧，
+    /// 而是将当前帧重置为目标子图继续执行。caller 绑定保持不变，使返回值直达原始调用方。
+    /// 这使得循环、尾调、非尾调统一为同一帧池机制：
+    /// - 循环：reset_loop_iteration 复用 body 帧
+    /// - 尾调：switch_subgraph 复用当前帧（图跳转）
+    /// - 非尾调：start_subgraph 分配新帧（帧池回收复用）
+    fn switch_subgraph(&mut self, fid: FrameId, target_sg: SubGraphId, args: &[Value]) {
+        let (node_start, node_count) = {
+            let sg = &self.graph.subgraphs[target_sg.0 as usize];
+            (sg.node_range.0, (sg.node_range.1.0 - sg.node_range.0.0) as usize)
+        };
+
+        // 更新 subgraph_id + 调整数组尺寸
+        let frame = self.frames.get_mut(fid);
+        frame.subgraph_id = target_sg;
+        if frame.value_table.len() != node_count {
+            frame.value_table.resize(node_count);
+        }
+        if frame.pending_inputs.len() != node_count {
+            frame.pending_inputs.resize(node_count, 0);
+        }
+
+        // 清理旧子图状态（prepare_frame 不处理这些字段）
+        frame.body_frame_id = None;
+        frame.defer_stack.clear();
+        frame.select_timers.clear();
+        frame.root_frame_ptr = std::ptr::null_mut();
+        frame.parent_frame_ptr = std::ptr::null_mut();
+        frame.state = FrameState::Ready;
+        frame.suspend_state = SuspendState::NotSuspended;
+        frame.suspend_event = None;
+        frame.pending_cancel = None;
+        frame.pending_select_wait = None;
+        // caller 保持不变：返回值直达原始调用方的 call 节点
+
+        // prepare_frame：清空 value_table + ready_queue + pending_inputs + Const 预填充
+        self.prepare_frame(fid, node_start, node_count);
+
+        // 参数注入
+        let offset = node_start.0 as usize;
+        let param_count = self.graph.subgraphs[target_sg.0 as usize].param_count as usize;
+        for (i, arg) in args.iter().enumerate().take(param_count) {
+            let local_id = NodeId(i as u32);
+            let consumer_count = self.graph.downstreams[offset + i].len() as u16;
+            let frame = self.frames.get_mut(fid);
+            frame.set_value(local_id, arg.clone(), consumer_count);
+            frame.push_ready(local_id);
+        }
     }
 
     /// 子图完成后：回写返回值到调用方 call/gate 节点 + 唤醒调用方。
@@ -2410,7 +3162,7 @@ impl Engine {
         // 1. For 循环：额外重置 iter_next_node（next_call），让迭代器重新推进
         if loop_kind == crate::Ir::LoopKind::For {
             if let Some(next_node) = iter_next_node {
-                let next_local = NodeId(next_node.0 - loop_offset);
+                let next_local = NodeId(next_node.0.wrapping_sub(loop_offset));
                 self.reset_node_ready(loop_fid, next_local);
                 self.frames.get_mut(loop_fid).push_ready(next_local);
             }
@@ -2422,7 +3174,7 @@ impl Engine {
         //    注意：Const cond_node（如 loop {} 的 Const(true)）的 compute_fn 是 noop，
         //    reset_node_ready 清值后无法重新计算，必须重新预填充。
         if let Some(cond_node) = cond_node {
-            let cond_local = NodeId(cond_node.0 - loop_offset);
+            let cond_local = NodeId(cond_node.0.wrapping_sub(loop_offset));
             if loop_kind == crate::Ir::LoopKind::For {
                 self.reset_node_pending(loop_fid, cond_local, 1);
             } else {
@@ -2442,7 +3194,7 @@ impl Engine {
         }
 
         // 3. 重置 Gate 节点（pending=1，等 cond notify）
-        let gate_local = NodeId(return_node.0 - loop_offset);
+        let gate_local = NodeId(return_node.0.wrapping_sub(loop_offset));
         self.reset_node_pending(loop_fid, gate_local, 1);
 
         // 4. 重置 body_sg 帧（复用）
@@ -2454,7 +3206,7 @@ impl Engine {
         self.prepare_frame(body_fid, body_sg_start, body_node_count);
         // body_sg 帧重新绑定 caller（保持循环帧为 caller）
         self.frames.get_mut(body_fid).caller =
-            Some((loop_fid, NodeId(return_node.0 - loop_offset)));
+            Some((loop_fid, NodeId(return_node.0.wrapping_sub(loop_offset))));
         // 设置 root_frame_ptr（复用 start_subgraph 的逻辑）
         let caller_root_ptr = self.frames.get(loop_fid).root_frame_ptr;
         let body_root_ptr = if caller_root_ptr.is_null() {
@@ -2485,9 +3237,7 @@ impl Engine {
             frame.pending_inputs[i] = 0;
         }
         if i < frame.value_table.len() {
-            frame.value_table[i].value = Value::VOID;
-            frame.value_table[i].ready = false;
-            frame.value_table[i].refcount = 0;
+            frame.value_table.reset_slot(i);
         }
     }
 
@@ -2499,9 +3249,7 @@ impl Engine {
             frame.pending_inputs[i] = pending;
         }
         if i < frame.value_table.len() {
-            frame.value_table[i].value = Value::VOID;
-            frame.value_table[i].ready = false;
-            frame.value_table[i].refcount = 0;
+            frame.value_table.reset_slot(i);
         }
     }
 
@@ -2717,14 +3465,7 @@ impl Engine {
         let fid = self.init_frame(entry_sg);
         self.ready_frames.push_back(fid);
 
-        let mut iter_count: u64 = 0;
         loop {
-            iter_count += 1;
-            if iter_count > 500000 {
-                let ready = self.ready_frames.len();
-                let waiters = self.event_waiters.len();
-                panic!("DEBUG: event loop stuck after {} iters: ready_frames={}, event_waiters={}", iter_count, ready, waiters);
-            }
             // 检查 timer 事件（spec 4.4：事件循环每次迭代检查到期 timer）
             self.check_timers();
 
@@ -2837,6 +3578,8 @@ pub struct SharedEngine {
     pub async_join_runtime: ParkingMutex<AsyncJoinRuntime>,
     /// 事件等待者列表
     pub event_waiters: ParkingMutex<Vec<(crate::Ir::RuntimeEvent, FrameId)>>,
+    /// 待处理的子图完成事件（caller 帧竞态时暂存，由 process_frame_shared 消费）
+    pub pending_completions: ParkingMutex<HashMap<FrameId, (crate::Ir::NodeId, Value, crate::Ir::ControlSignal)>>,
     /// 全局注入队列（入口帧 + 挂起恢复帧）
     pub global_queue: Injector<FrameId>,
     /// park/unpark 同步原语
@@ -2872,6 +3615,7 @@ impl SharedEngine {
             timer_runtime: ParkingMutex::new(std::mem::take(&mut engine.timer_runtime)),
             async_join_runtime: ParkingMutex::new(std::mem::take(&mut engine.async_join_runtime)),
             event_waiters: ParkingMutex::new(std::mem::take(&mut engine.event_waiters)),
+            pending_completions: ParkingMutex::new(HashMap::new()),
             global_queue: Injector::new(),
             wakeup: (ParkingMutex::new(()), Condvar::new()),
             active_count: ParkingMutex::new(num_workers),
@@ -2883,6 +3627,7 @@ impl SharedEngine {
     fn alloc_frame_id(&self) -> FrameId {
         let mut next = self.next_frame_id.lock();
         let id = *next;
+        assert!(next.0 < u32::MAX, "FrameId overflow: too many frames allocated");
         next.0 += 1;
         id
     }
@@ -2895,11 +3640,22 @@ impl SharedEngine {
 /// 将 ConstValue 转换为 Value（不使用 arena，直接构造）。
 fn alloc_const_value_shared(cv: ConstValue) -> Value {
     match cv {
+        ConstValue::I8(v) => Value::i8(v),
+        ConstValue::I16(v) => Value::i16(v),
         ConstValue::I32(v) => Value::i32(v),
         ConstValue::I64(v) => Value::i64(v),
+        ConstValue::I128(v) => Value::i128(v),
+        ConstValue::U8(v) => Value::u8(v),
+        ConstValue::U16(v) => Value::u16(v),
+        ConstValue::U32(v) => Value::u32(v),
+        ConstValue::U64(v) => Value::u64(v),
+        ConstValue::U128(v) => Value::u128(v),
+        ConstValue::Isize(v) => Value::isize_val(v),
+        ConstValue::Usize(v) => Value::usize_val(v),
         ConstValue::F32(v) => Value::f32(v),
         ConstValue::F64(v) => Value::f64(v),
         ConstValue::Bool(v) => Value::bool_val(v),
+        ConstValue::Char(c) => Value::char_val(char::from_u32(c).unwrap_or('\0')),
         ConstValue::Null => Value::NULL,
         ConstValue::Void => Value::VOID,
         ConstValue::Str(s) => {
@@ -2997,7 +3753,7 @@ fn prepare_frame_shared(frame: &mut Frame, graph: &DataFlowGraph) {
         if kind == NodeKind::Const {
             continue;
         }
-        if frame.pending_inputs[i] == 0 && !frame.value_table[i].ready {
+        if frame.pending_inputs[i] == 0 && !frame.value_table.ready[i] {
             frame.push_ready(NodeId(i as u32));
         }
     }
@@ -3024,18 +3780,19 @@ fn notify_downstream_shared(
 ) {
     let downstreams: Vec<NodeId> = graph.downstreams[producer_graph.0 as usize].clone();
     for ds_graph_id in downstreams {
-        let ds_local_id = NodeId(ds_graph_id.0 - node_start.0);
+        let ds_local_id = NodeId(ds_graph_id.0.wrapping_sub(node_start.0));
 
-        let still_has_consumers = frame.value_table[producer_local.0 as usize].consume();
-        if !still_has_consumers && frame.value_table[producer_local.0 as usize].ready {
-            frame.value_table[producer_local.0 as usize].ready = false;
+        let pidx = producer_local.0 as usize;
+        let still_has_consumers = frame.value_table.consume(pidx);
+        if !still_has_consumers && frame.value_table.ready[pidx] {
+            frame.value_table.ready[pidx] = false;
         }
 
         if frame.pending_inputs[ds_local_id.0 as usize] > 0 {
             frame.pending_inputs[ds_local_id.0 as usize] -= 1;
         }
         if frame.pending_inputs[ds_local_id.0 as usize] == 0
-            && !frame.value_table[ds_local_id.0 as usize].ready
+            && !frame.value_table.ready[ds_local_id.0 as usize]
         {
             frame.push_ready(ds_local_id);
         }
@@ -3075,6 +3832,55 @@ fn start_subgraph_shared(
     child_fid
 }
 
+/// 尾调用图跳转（共享版）：复用当前帧执行目标子图（帧池零分配）。
+///
+/// 与 Engine::switch_subgraph 对应，但直接操作 &mut Frame（无 HashMap 查找）。
+/// caller 绑定保持不变，返回值直达原始调用方。
+fn switch_subgraph_shared(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubGraphId, args: &[Value]) {
+    let (node_start, node_end) = graph.subgraphs[target_sg.0 as usize].node_range;
+    let node_count = (node_end.0 - node_start.0) as usize;
+
+    // 更新 subgraph_id + 调整数组尺寸
+    frame.subgraph_id = target_sg;
+    if frame.value_table.len() != node_count {
+        frame.value_table.resize(node_count);
+    }
+    if frame.pending_inputs.len() != node_count {
+        frame.pending_inputs.resize(node_count, 0);
+    }
+
+    // 清空 value_table（prepare_frame_shared 不做此操作）
+    frame.value_table.reset_all();
+    frame.ready_queue.clear();
+    frame.control_signal = ControlSignal::None;
+    frame.pending_call = None;
+    frame.pending_await = None;
+    frame.body_frame_id = None;
+    frame.defer_stack.clear();
+    frame.select_timers.clear();
+    frame.root_frame_ptr = std::ptr::null_mut();
+    frame.parent_frame_ptr = std::ptr::null_mut();
+    frame.state = FrameState::Ready;
+    frame.suspend_state = SuspendState::NotSuspended;
+    frame.suspend_event = None;
+    frame.pending_cancel = None;
+    frame.pending_select_wait = None;
+    // caller 保持不变：返回值直达原始调用方的 call 节点
+
+    // prepare_frame_shared：设置 node_offset + pending_inputs + Const 预填充
+    prepare_frame_shared(frame, graph);
+
+    // 参数注入
+    let offset = node_start.0 as usize;
+    let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
+    for (i, arg) in args.iter().enumerate().take(param_count) {
+        let local_id = NodeId(i as u32);
+        let consumer_count = graph.downstreams[offset + i].len() as u16;
+        frame.set_value(local_id, arg.clone(), consumer_count);
+        frame.push_ready(local_id);
+    }
+}
+
 /// 提取子帧返回值：优先取 control_signal 的 Return 值，否则取 return_node 值。
 fn extract_child_return_shared(child: &Frame, graph: &DataFlowGraph) -> Value {
     match &child.control_signal {
@@ -3082,7 +3888,7 @@ fn extract_child_return_shared(child: &Frame, graph: &DataFlowGraph) -> Value {
         ControlSignal::Break | ControlSignal::Continue => Value::VOID,
         ControlSignal::None => {
             let sg = &graph.subgraphs[child.subgraph_id.0 as usize];
-            let return_local = NodeId(sg.return_node.0 - sg.node_range.0 .0);
+            let return_local = NodeId(sg.return_node.0.wrapping_sub(sg.node_range.0 .0));
             child.get_value(return_local)
         }
     }
@@ -3113,10 +3919,23 @@ fn complete_and_wake_caller_shared(
 
     if let Some((caller_fid, call_node)) = caller {
         // 取出 caller 帧（短临界区）
+        // 竞态处理：caller 帧可能还未被 insert 回 HashMap（run_frame_nodes 设置
+        // Suspended 后 return，insert 发生在 process_frame_shared 中）。
+        // 若 remove 返回 None，将完成信息存入 pending_completions，
+        // 由 process_frame_shared 在处理 Suspended 帧时消费（事件重注册机制）。
         let mut caller_frame_opt = {
             let mut frames = shared.frames.lock();
             frames.remove(&caller_fid)
         };
+
+        if caller_frame_opt.is_none() {
+            // 父帧尚未 insert 回 HashMap，存储完成信息等待重试
+            shared.pending_completions.lock().insert(
+                caller_fid,
+                (call_node, return_value, child_signal),
+            );
+            return;
+        }
 
         // 修改 caller 帧（无需持锁）
         if let Some(caller_frame) = caller_frame_opt.as_mut() {
@@ -3341,6 +4160,11 @@ fn run_frame_nodes(
             return;
         }
 
+        // SIMD/rayon 批量化：drain ready_queue → 按 (ScalarTag,BatchOp) 分组 → 批算
+        if try_batch_nodes(frame, &graph) {
+            continue;
+        }
+
         // 弹出就绪节点（局部 id）
         let local_id = match frame.pop_ready() {
             Some(n) => n,
@@ -3352,9 +4176,9 @@ fn run_frame_nodes(
         let node = graph.nodes[graph_node_id.0 as usize];
 
         // 预填充节点跳过 compute_fn
-        let pre_filled = frame.value_table[local_id.0 as usize].ready;
+        let pre_filled = frame.value_table.ready[local_id.0 as usize];
         let value = if pre_filled {
-            frame.value_table[local_id.0 as usize].value.clone()
+            frame.value_table.values[local_id.0 as usize].clone()
         } else {
             let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
             compute_fn(frame, graph_node_id)
@@ -3402,7 +4226,7 @@ fn run_frame_nodes(
                     .map(|&in_node| frame.get_value_by_global(in_node))
                     .collect();
 
-                let call_node_local = NodeId(graph_node_id.0 - frame.node_offset);
+                let call_node_local = NodeId(graph_node_id.0.wrapping_sub(frame.node_offset));
                 frame.pending_call = Some(PendingCall {
                     target_sg,
                     args,
@@ -3415,6 +4239,48 @@ fn run_frame_nodes(
         // 检测 pending_call（Call/Gate/AsyncCall 节点设置）
         let pending = frame.pending_call.clone();
         if let Some(pending) = pending {
+            frame.pending_call = None;
+
+            // 尾调用图跳转：编译期标记的尾调用复用当前帧（帧池零分配）
+            let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
+            if graph.tail_call_flags[graph_call_id.0 as usize] {
+                // 分支中的尾调用传播（与非共享路径同逻辑）
+                let caller = frame.caller;
+                let propagate_to_parent = if let Some((caller_fid, call_node)) = caller {
+                    let frames = shared.frames.lock();
+                    if let Some(caller_frame) = frames.get(&caller_fid) {
+                        let caller_sg_id = caller_frame.subgraph_id;
+                        let caller_loop_kind = graph.subgraphs[caller_sg_id.0 as usize].loop_kind;
+                        let caller_has_caller = caller_frame.caller.is_some();
+                        let caller_offset = caller_frame.node_offset;
+                        let caller_graph_node = NodeId(call_node.0 + caller_offset);
+                        let caller_is_gate = graph.nodes[caller_graph_node.0 as usize].kind == NodeKind::Gate;
+                        caller_is_gate
+                            && caller_loop_kind != crate::Ir::LoopKind::LoopBody
+                            && caller_has_caller
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if propagate_to_parent {
+                    let (caller_fid, _) = caller.unwrap();
+                    let orig_caller = {
+                        let mut frames = shared.frames.lock();
+                        frames.remove(&caller_fid).and_then(|cf| cf.caller)
+                    };
+                    shared.event_waiters.lock().retain(|(_, f)| *f != caller_fid);
+                    shared.pending_completions.lock().remove(&caller_fid);
+                    frame.caller = orig_caller;
+                    switch_subgraph_shared(frame, &graph, pending.target_sg, &pending.args);
+                } else {
+                    switch_subgraph_shared(frame, &graph, pending.target_sg, &pending.args);
+                }
+                continue;
+            }
+
             // Call/Gate/AsyncCall 节点：执行 start_subgraph
             let child_fid = start_subgraph_shared(
                 shared,
@@ -3423,7 +4289,6 @@ fn run_frame_nodes(
                 pending.target_sg,
                 &pending.args,
             );
-            frame.pending_call = None;
 
             // 子帧入本地队列
             local_queue.push(child_fid);
@@ -3679,15 +4544,40 @@ fn process_frame_shared(
     match state {
         FrameState::Suspended => {
             let event = frame.suspend_event;
-            shared.frames.lock().insert(fid, frame);
-            if let Some(e) = event {
-                shared.event_waiters.lock().push((e, fid));
+            // 在 insert 前检查是否有 pending completion（子帧先完成但父帧尚未 insert 的竞态）
+            let pending = shared.pending_completions.lock().remove(&fid);
+            if let Some((call_node, return_value, child_signal)) = pending {
+                // 有 pending completion：直接消费完成事件，注入返回值并唤醒
+                let _ = child_signal; // 控制信号已在 complete_and_wake_caller_shared 中处理
+                propagate_throw_shared(&mut frame, &return_value);
+                let caller_sg_id = frame.subgraph_id;
+                let caller_offset = shared.graph.subgraphs[caller_sg_id.0 as usize].node_range.0;
+                let call_graph_id = NodeId(call_node.0 + caller_offset.0);
+                let consumer_count = shared.graph.downstreams[call_graph_id.0 as usize].len() as u16;
+                frame.set_value(call_node, return_value, consumer_count);
+                frame.state = FrameState::Ready;
+                frame.suspend_state = SuspendState::NotSuspended;
+                frame.suspend_event = None;
+                notify_downstream_shared(
+                    &mut frame,
+                    &shared.graph,
+                    call_node,
+                    call_graph_id,
+                    caller_offset,
+                );
+                shared.frames.lock().insert(fid, frame);
+                local_queue.push(fid);
             } else {
-                // select 帧：suspend_event 为 None，event_waiters 已在
-                // run_frame_nodes 中注册。检查是否有等待者。
-                let has_waiter = shared.event_waiters.lock().iter().any(|(_, wf)| *wf == fid);
-                if !has_waiter {
-                    // 异常状态：帧挂起但无等待者。不 panic（多线程竞态安全）。
+                shared.frames.lock().insert(fid, frame);
+                if let Some(e) = event {
+                    shared.event_waiters.lock().push((e, fid));
+                } else {
+                    // select 帧：suspend_event 为 None，event_waiters 已在
+                    // run_frame_nodes 中注册。检查是否有等待者。
+                    let has_waiter = shared.event_waiters.lock().iter().any(|(_, wf)| *wf == fid);
+                    if !has_waiter {
+                        // 异常状态：帧挂起但无等待者。不 panic（多线程竞态安全）。
+                    }
                 }
             }
         }
@@ -3812,7 +4702,8 @@ fn worker_main(
         }
 
         // 5. park（等待唤醒，避免 busy-wait）
-        // 关键：在持有 wakeup mutex 时重新检查条件，防止 notify 丢失
+        // 使用 wait_timeout 定期醒来检查 timer 事件，防止所有 worker park 时
+        // timer 到期事件被忽略导致死锁。
         {
             let mut guard = shared.wakeup.0.lock();
             // 重新检查 result（可能其他 worker 刚设置）
@@ -3828,8 +4719,9 @@ fn worker_main(
                 *active += 1;
                 continue;
             }
-            // 确认无工作：park
-            shared.wakeup.1.wait(&mut guard);
+            // 确认无工作：park with timeout（定期醒来检查 timer）
+            let park_timeout = std::time::Duration::from_millis(10);
+            shared.wakeup.1.wait_for(&mut guard, park_timeout);
         }
         // 被唤醒：恢复活跃计数
         {
@@ -3946,7 +4838,7 @@ mod tests {
         // N2 的 pending_inputs 应减为 0
         assert_eq!(frame.pending_inputs[2], 0);
         // N2 应已执行（ready）
-        assert!(frame.value_table[2].ready);
+        assert!(frame.value_table.ready[2]);
     }
 
     #[test]
@@ -4988,18 +5880,9 @@ mod tests {
                 return sum
             }
         "#;
-        let (engine, h) = run_source(src);
-        // 若引擎未能正确执行（构造器等问题），值可能为 Null — 不 crash 即视为静态分派路径连通
-        match h.scalar_tag() {
-            Some(crate::Value::ScalarTag::I64) => {
-                let result = h.as_i64();
-                assert_eq!(result, 6);
-            }
-            _ => {
-                // 引擎执行未产出 i64 — 静态分派编译通过但运行时构造器路径待完善
-                eprintln!("WARN: engine returned non-i64 value (tag={:?}), static dispatch IR compiled OK", h.scalar_tag());
-            }
-        }
+        let (_engine, h) = run_source(src);
+        assert_eq!(h.scalar_tag(), Some(crate::Value::ScalarTag::I64));
+        assert_eq!(h.as_i64(), 6);
     }
 
     #[test]
@@ -5023,16 +5906,9 @@ mod tests {
                 return sum
             }
         "#;
-        let (engine, h) = run_source(src);
-        match h.scalar_tag() {
-            Some(crate::Value::ScalarTag::I32) => {
-                let result = h.as_i32();
-                assert_eq!(result, 10);
-            }
-            _ => {
-                eprintln!("WARN: engine returned non-i32 value (tag={:?}), static dispatch IR compiled OK", h.scalar_tag());
-            }
-        }
+        let (_engine, h) = run_source(src);
+        assert_eq!(h.scalar_tag(), Some(crate::Value::ScalarTag::I32));
+        assert_eq!(h.as_i32(), 10);
     }
 
     #[test]

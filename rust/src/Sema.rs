@@ -1366,6 +1366,11 @@ impl SemaResult {
     /// 添加类型定义并注册 `type_def_index` / `ctor_def_index`，同时自动填充
     /// `field_id_map`。重复类型名或构造器名返回 `false` 且不写入（拒绝部分写入）。
     pub fn put_type_def(&mut self, def: TypeDefInfo) -> bool {
+        // u16 索引溢出检查（与 TypeDesc.rs 的 register 对齐）
+        assert!(
+            self.type_defs.len() < u16::MAX as usize,
+            "type_def index overflow: too many type definitions"
+        );
         let idx: u16 = self.type_defs.len() as u16;
         // 前置校验：类型名与所有构造器名均不得重复，避免部分写入。
         if self.type_def_index.contains_key(def.name.as_ref()) {
@@ -1757,10 +1762,14 @@ pub fn resolve_type_node_concrete<'a>(
 /// 优先级：type_args 绑定 → 内置标量/str/void → type_defs alias/newtype 递归 →
 /// 用户自定义类型（getOrCreateRefDesc）。
 /// 提取为独立函数以便 `resolve_type_node_resolved` 的 alias 递归调用，无需构造临时 TypeNode。
+///
+/// `visiting` 用于循环 alias 检测：若 name 已在集合中，说明出现循环 alias 链，
+/// 返回 get_or_create_ref_desc(name) 而非继续递归（避免无限递归栈溢出）。
 fn resolve_named_type_resolved(
     name: &str,
     type_args: &[&'static TypeDescriptor],
     sema_result: &mut SemaResult,
+    visiting: &mut FxHashSet<String>,
 ) -> &'static TypeDescriptor {
     // 1. 优先查 type_args 绑定（泛型类型参数）
     for &ta in type_args {
@@ -1772,6 +1781,11 @@ fn resolve_named_type_resolved(
     if let Some(td) = type_descriptor_from_builtin_name(name) {
         return td;
     }
+    // 循环 alias 检测：name 已在 visiting 中说明出现循环，停止递归
+    if visiting.contains(name) {
+        return sema_result.get_or_create_ref_desc(name);
+    }
+    visiting.insert(name.to_string());
     // 3. 查 type_defs 解析 alias/newtype 链
     //    提取所需信息（owned String）以释放不可变借用，允许后续 &mut sema_result 调用。
     let (target_desc, target_name): (Option<&'static TypeDescriptor>, Option<String>) =
@@ -1784,14 +1798,18 @@ fn resolve_named_type_resolved(
         };
     if let Some(inner_td) = target_desc {
         // alias/newtype 有目标 TypeDescriptor：直接返回
+        visiting.remove(name);
         return inner_td;
     }
     if let Some(ttn) = target_name {
         // target_type_name 已知：递归解析到最终具体类型
         // resolve_named_type_resolved 总是返回描述符（永不失败），无需 fallback
-        return resolve_named_type_resolved(&ttn, type_args, sema_result);
+        let result = resolve_named_type_resolved(&ttn, type_args, sema_result, visiting);
+        visiting.remove(name);
+        return result;
     }
     // 4. 其他用户自定义类型 → 创建具名描述符
+    visiting.remove(name);
     sema_result.get_or_create_ref_desc(name)
 }
 
@@ -1808,8 +1826,9 @@ pub fn resolve_type_node_resolved<'a>(
 ) -> Option<&'static TypeDescriptor> {
     let type_ref = type_ref?;
     let tn = &ast.ty(type_ref).node;
+    let mut visiting: FxHashSet<String> = FxHashSet::default();
     Some(match tn {
-        TypeNode::Named { name } => resolve_named_type_resolved(name, type_args, sema_result),
+        TypeNode::Named { name } => resolve_named_type_resolved(name, type_args, sema_result, &mut visiting),
         TypeNode::Generic { name, args } => {
             // Lazy<T>：递归解析内部类型
             if *name == "Lazy" && !args.is_empty() {
@@ -2286,7 +2305,18 @@ impl<'a> InferContext<'a> {
         let self_ty = match self.current_self_type() {
             Some(ty) => ty,
             None => {
-                self.add_error("self parameter requires enclosing type or trait block");
+                // 从 type_annotation 获取 span（若有），否则无位置信息
+                let (line, column) = type_annotation
+                    .map(|ta| {
+                        let s = ast.ty(ta).span;
+                        (s.line, s.column)
+                    })
+                    .unwrap_or((0, 0));
+                self.add_error_at(
+                    "self parameter requires enclosing type or trait block",
+                    line,
+                    column,
+                );
                 return self.arena.fresh_type_var();
             }
         };
@@ -2301,28 +2331,35 @@ impl<'a> InferContext<'a> {
             }
             Some(ta) => {
                 let tn = &ast.ty(ta).node;
+                let span = ast.ty(ta).span;
                 match tn {
                     // `self`（解析器自动填 SelfType）→ 返回 scope 类型
                     TypeNode::SelfType => self_ty,
                     // `&self`（解析器自动填 RefType<SelfType>）→ 返回 Ref<scope类型>
                     TypeNode::RefType { inner } => {
                         if matches!(ast.ty(*inner).node, TypeNode::SelfType) {
-                            
+
                             self.arena.make(ConcreteType::Ref {
                                 inner: self_ty,
                                 is_raw: false,
                             })
                         } else {
                             // `&self: &Foo` 用户显式写引用注解 → 报错
-                            self.add_error(
+                            self.add_error_at(
                                 "self parameter does not allow explicit type annotation",
+                                span.line,
+                                span.column,
                             );
                             self.arena.fresh_type_var()
                         }
                     }
                     // `self: Foo` 用户显式写注解 → 报错
                     _ => {
-                        self.add_error("self parameter does not allow explicit type annotation");
+                        self.add_error_at(
+                            "self parameter does not allow explicit type annotation",
+                            span.line,
+                            span.column,
+                        );
                         self.arena.fresh_type_var()
                     }
                 }
@@ -2336,6 +2373,7 @@ impl<'a> InferContext<'a> {
     /// 调用方在处理 FunDecl 的 params 时，对每个名为 "self" 的参数调用此方法。
     pub fn check_top_level_self_param(&mut self, param_name: &str) {
         if param_name == "self" {
+            // 无 AST span 上下文（仅接收参数名），位置 0,0 为已知限制
             self.add_error("self parameter is not allowed in top-level function");
         }
     }
@@ -2565,8 +2603,10 @@ impl<'a> InferContext<'a> {
     /// **返回值**：`true` 表示已由本函数处理（构造器已注册）；
     /// `false` 表示构造器未注册，交由常规模式推断处理。
     ///
-    /// **Throw 错误构造器特例**：当 expected_ty 是 Throw 类型且构造器返回类型是
-    /// error_newtype ADT 时，构造器作为 Throw 错误分支，子模式绑定到 error_type。
+    /// **Throw 错误分支**：当 expected_ty 是 Throw 类型且构造器是 error_newtype
+    /// ADT 构造器时，`is_throw_error_branch` 标志为真，构造器返回类型与子模式
+    /// 统一绑定到 error_type。该标志贯穿返回类型解析与子模式绑定两个步骤，
+    /// 无独立早退分支，与常规 GADT 路径走同一控制流。
     pub fn refine_constructor_pattern(
         &mut self,
         ctor_name: &str,
@@ -2589,32 +2629,30 @@ impl<'a> InferContext<'a> {
                 )
             });
 
-        // Throw 错误构造器特例：expected_ty 是 Throw 类型时，
-        // 检查构造器是否是 error_newtype ADT 构造器
-        if let ConcreteType::Throw { error_type, .. } = self.arena.get(resolved_expected).clone() {
-            if let Some((_, is_newtype, _, _)) = &ctor_info {
-                if *is_newtype {
-                    // error_newtype 构造器作为 Throw 错误分支
-                    // 子模式绑定到 error_type（整个 ADT 类型）
-                    for &sub_pat in sub_patterns.iter() {
-                        self.infer_pattern(sub_pat, ast, error_type, env);
-                    }
-                    return true;
-                }
-            }
-        }
-
-        // 常规构造器处理
-        let (type_name, _is_newtype, return_type_node, field_type_nodes) = match ctor_info {
+        let (type_name, is_newtype, return_type_node, field_type_nodes) = match ctor_info {
             Some(info) => info,
             None => return false,
         };
 
-        // 解析构造器返回类型（GADT 用 return_type_node，普通 ADT 用 type_name）
-        let ctor_return_ty = if let Some(rtn) = return_type_node {
+        // 判定是否为 Throw 错误分支构造器：
+        // expected 是 Throw 类型且构造器是 error_newtype ADT 构造器时，
+        // 构造器作为 Throw 错误分支，返回类型与子模式均绑定到 error_type。
+        let expected_ct = self.arena.get(resolved_expected).clone();
+        let error_type = match &expected_ct {
+            ConcreteType::Throw { error_type, .. } => Some(*error_type),
+            _ => None,
+        };
+        let is_throw_error_branch = error_type.is_some() && is_newtype;
+
+        // 解析构造器返回类型（统一路径，无早退）：
+        // - Throw 错误分支 → error_type
+        // - GADT 构造器    → return_type_node
+        // - 普通 ADT      → type_name 对应的 Adt
+        let ctor_return_ty = if is_throw_error_branch {
+            error_type.expect("is_throw_error_branch implies error_type is Some")
+        } else if let Some(rtn) = return_type_node {
             self.resolve_type_node_to_handle(rtn, ast)
         } else {
-            // 普通 ADT：返回类型为 type_name 对应的 Adt
             self.arena.make(ConcreteType::Adt {
                 name: type_name,
                 type_args: Box::new([]),
@@ -2625,9 +2663,13 @@ impl<'a> InferContext<'a> {
         // unify 忽略错误（类型不匹配时由后续检查报错）
         let _ = self.arena.unify(ctor_return_ty, expected_ty);
 
-        // 对子模式按构造器字段类型递归推断并绑定变量
+        // 对子模式按构造器字段类型递归推断并绑定变量（统一路径，无早退）：
+        // - Throw 错误分支 → error_type
+        // - 常规          → 构造器字段类型
         for (i, &sub_pat) in sub_patterns.iter().enumerate() {
-            let sub_ty = if i < field_type_nodes.len() {
+            let sub_ty = if is_throw_error_branch {
+                error_type.expect("is_throw_error_branch implies error_type is Some")
+            } else if i < field_type_nodes.len() {
                 match field_type_nodes[i] {
                     Some(ftn) => self.resolve_type_node_to_handle(ftn, ast),
                     None => self.arena.fresh_type_var(),
@@ -4500,6 +4542,7 @@ fn resolve_stmt<'a, 'b>(stmt: StmtId, ctx: &mut ResolveCtx<'a, 'b>) {
             iterable,
             body,
         } => {
+            let span = ast.stmt(stmt).span;
             resolve_expr(*iterable, ctx);
             ctx.push_scope();
             let iter_td = resolve_expr_type(*iterable, ctx)
@@ -4519,8 +4562,8 @@ fn resolve_stmt<'a, 'b>(stmt: StmtId, ctx: &mut ResolveCtx<'a, 'b>) {
                         "类型 '{}' 未实现 Iterator，For 循环要求迭代器类型。数组请用 arr.iter()，字符串请用 str_iter(s)",
                         iter_type_name
                     ),
-                    0,
-                    0,
+                    span.line,
+                    span.column,
                 ));
             }
             ctx.define_var(name, iter_td);
@@ -5349,6 +5392,13 @@ impl ModuleChecker {
 //
 // 新增 InferContext 方法，移植自 `src/sema/type_check.zig` 与 `throw_check.zig`。
 // =========================================================================
+
+/// 内置 cast 函数注册表：(函数名, 是否 try 变体)。
+/// 新增 cast 变体只需追加一行，无需新增函数名特判分支。
+const CAST_BUILTINS: &[(&str, bool)] = &[
+    ("__cast_to", false),
+    ("__cast_try_to", true),
+];
 
 impl<'a> InferContext<'a> {
     // ── 类型解析（typeFromAst）──
@@ -6193,12 +6243,15 @@ impl<'a> InferContext<'a> {
 
             // ── 函数调用 ──
             Expr::Call { callee, args, type_args } => {
-                // cast 调用特殊解析：__cast_to<T>(x) / __cast_try_to<T>(x)
+                // cast 调用解析：__cast_to<T>(x) / __cast_try_to<T>(x)
                 // parser 将 cast(x).to(T) 降级为 __cast_to<T>(x) 普通 Call，
                 // sema 推断源类型 S，返回 T（或 Throw<T, CastError> for try_to）
+                // 通过 CAST_BUILTINS 注册表查表，避免函数名特判分支
                 if let Expr::Ident(name) = &ast.expr(*callee).node {
-                    if matches!(*name, "__cast_to" | "__cast_try_to") {
-                        let is_try = *name == "__cast_try_to";
+                    if let Some(is_try) = CAST_BUILTINS
+                        .iter()
+                        .find_map(|(n, t)| (*n == *name).then_some(*t))
+                    {
                         // 推断源表达式类型
                         let _ = self.infer_expr(args[0], ast, env, None);
                         // 从 type_args 取目标类型 T
@@ -7007,8 +7060,9 @@ impl<'a> InferContext<'a> {
                             let return_name = sig.return_type_desc.type_name;
                             return Some(self.build_fn_type_from_names(&param_names, return_name));
                         }
-                        // func_sigs 未命中（可能是 trait 默认方法无独立 sig），退化为 fresh
-                        return Some(self.arena.fresh_type_var());
+                        // witness 命中但 func_sigs 未命中（可能是 trait 默认方法无独立 sig），
+                        // 返回 None 让调用方处理查找失败
+                        return None;
                     }
                 }
             }
@@ -7088,11 +7142,13 @@ impl<'a> InferContext<'a> {
                         Some(def) if def.kind == TypeDefKind::Record => field_id as usize,
                         _ => (field_id as usize).saturating_sub(1),
                     };
-                    if let Some(_field_td) = ctor.field_type_descs.get(idx) {
-                        // 从 field_type_descs 无法直接得到 TypeHandle，
-                        // 返回 fresh var（完整实现需从 field_type_names 构造）
-                        return self.arena.fresh_type_var();
+                    // 从 field_type_names 获取字段类型名，构造真实 TypeHandle
+                    // 先克隆字段名以释放 sema_result 的不可变借用，再调用可变方法
+                    let field_type_name = ctor.field_type_names.get(idx).and_then(|n| n.as_deref().map(|s| s.to_string()));
+                    if let Some(name) = field_type_name {
+                        return self.type_handle_from_name(Some(&name));
                     }
+                    return self.arena.fresh_type_var();
                 }
             }
         }
@@ -7106,11 +7162,22 @@ impl<'a> InferContext<'a> {
             }
         }
         // 字段未找到：对 Record 类型报错（有明确 fields 列表，字段不存在就是错误）；
-        // Adt 不报错（sema v2 对 ADT 字段注册可能不完整，保守放行避免误报）；
+        // 已注册的 Adt 类型报错；未注册的 Adt 保守放行（sema v2 注册可能不完整）；
         // Unknown/TypeVar/Generic 等不报（推断未决或类型不明确）
         match &ct {
             ConcreteType::Record { .. } => {
                 self.add_error_at(&format!("no such field '{}' on this type", field), line, column);
+                self.arena.fresh_type_var()
+            }
+            ConcreteType::Adt { name, .. } => {
+                // 对已注册的 Adt 类型报字段不存在错误；未注册的保守放行
+                if self.sema_result.get_type_def(name).is_some() {
+                    self.add_error_at(
+                        &format!("no such field '{}' on type '{}'", field, name),
+                        line,
+                        column,
+                    );
+                }
                 self.arena.fresh_type_var()
             }
             _ => self.arena.fresh_type_var(),
@@ -7141,7 +7208,19 @@ impl<'a> InferContext<'a> {
                 let val_ty = self.infer_expr(*value, ast, env, expected_ty);
                 let bind_ty = if let Some(ta) = type_annotation {
                     let annot_ty = self.type_from_ast(*ta, ast);
-                    let _ = self.try_widen_unify(annot_ty, val_ty);
+                    if self.try_widen_unify(annot_ty, val_ty).is_err() {
+                        let annot_str = format!("{}", self.arena.display(annot_ty));
+                        let val_str = format!("{}", self.arena.display(val_ty));
+                        let span = ast.ty(*ta).span;
+                        self.add_error_at(
+                            &format!(
+                                "type annotation mismatch: expected '{}', found '{}'",
+                                annot_str, val_str
+                            ),
+                            span.line,
+                            span.column,
+                        );
+                    }
                     annot_ty
                 } else {
                     val_ty
@@ -7152,7 +7231,19 @@ impl<'a> InferContext<'a> {
             Stmt::Assignment { target, value } => {
                 let val_ty = self.infer_expr(*value, ast, env, None);
                 let target_ty = self.infer_expr(*target, ast, env, None);
-                let _ = self.arena.unify(target_ty, val_ty);
+                if self.arena.unify(target_ty, val_ty).is_err() {
+                    let target_str = format!("{}", self.arena.display(target_ty));
+                    let val_str = format!("{}", self.arena.display(val_ty));
+                    let span = ast.stmt(stmt).span;
+                    self.add_error_at(
+                        &format!(
+                            "assignment type mismatch: cannot assign '{}' to '{}'",
+                            val_str, target_str
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                }
                 None
             }
             Stmt::FieldAssignment { object, value, .. } => {
@@ -7173,7 +7264,19 @@ impl<'a> InferContext<'a> {
                 if let Some(v) = value {
                     let val_ty = self.infer_expr(*v, ast, env, None);
                     if let Some(fn_ret) = self.expected_return {
-                        let _ = self.unify_return_type(fn_ret, val_ty);
+                        if self.unify_return_type(fn_ret, val_ty).is_err() {
+                            let ret_str = format!("{}", self.arena.display(fn_ret));
+                            let val_str = format!("{}", self.arena.display(val_ty));
+                            let span = ast.stmt(stmt).span;
+                            self.add_error_at(
+                                &format!(
+                                    "return type mismatch: expected '{}', found '{}'",
+                                    ret_str, val_str
+                                ),
+                                span.line,
+                                span.column,
+                            );
+                        }
                     }
                     Some(val_ty)
                 } else {
@@ -7192,6 +7295,7 @@ impl<'a> InferContext<'a> {
             }
             Stmt::Break | Stmt::Continue => None,
             Stmt::For { name, iterable, body } => {
+                let span = ast.stmt(stmt).span;
                 let iterable_ty = self.infer_expr(*iterable, ast, env, None);
                 let child_env = self.env.child(env);
                 let item_ty = {
@@ -7208,14 +7312,14 @@ impl<'a> InferContext<'a> {
                             ConcreteType::Array { .. } => "array",
                             _ => ct.builtin_name().unwrap_or("unknown"),
                         };
-                        self.sema_result.add_error(SemaError::new(
+                        self.add_error_at(
                             &format!(
                                 "类型 '{}' 未实现 Iterator，For 循环要求迭代器类型。数组请用 arr.iter()，字符串请用 str_iter(s)",
                                 type_name
                             ),
-                            0,
-                            0,
-                        ));
+                            span.line,
+                            span.column,
+                        );
                     }
                     // 循环变量类型用 fresh_type_var（next() 返回 T? 的内层 T 由 IR 运行时分派）
                     self.arena.fresh_type_var()
@@ -7227,7 +7331,18 @@ impl<'a> InferContext<'a> {
             Stmt::While { condition, body } => {
                 let cond_ty = self.infer_expr(*condition, ast, env, None);
                 let bool_ty = self.make_builtin(ConcreteType::Bool);
-                let _ = self.arena.unify(cond_ty, bool_ty);
+                if self.arena.unify(cond_ty, bool_ty).is_err() {
+                    let cond_str = format!("{}", self.arena.display(cond_ty));
+                    let span = ast.stmt(stmt).span;
+                    self.add_error_at(
+                        &format!(
+                            "while condition must be bool, found '{}'",
+                            cond_str
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                }
                 let _ = self.infer_expr(*body, ast, env, None);
                 None
             }
@@ -7912,6 +8027,8 @@ pub enum Constraint {
 pub struct ConstraintError {
     pub constraint: Constraint,
     pub reason: Box<str>,
+    // 已知限制：Constraint 枚举不携带 span 信息，求解时无法回溯 AST 位置，
+    // 故 line/column 恒为 0,0。完整修复需为 Constraint 添加 span 字段。
     pub line: u32,
     pub column: u32,
 }
@@ -8072,6 +8189,7 @@ impl ConstraintSolver {
                             self.record_binding(arena, r1, r2);
                         }
                         Err(_) => {
+                            // Constraint 不携带 span，位置 0,0 为已知限制
                             self.errors.push(ConstraintError {
                                 constraint: Constraint::Equality(t1, t2),
                                 reason: "type mismatch".into(),
@@ -8083,6 +8201,7 @@ impl ConstraintSolver {
                 }
                 Constraint::Subtype(sub, sup) => {
                     if !is_subtype(arena, sub, sup) {
+                        // Constraint 不携带 span，位置 0,0 为已知限制
                         self.errors.push(ConstraintError {
                             constraint: Constraint::Subtype(sub, sup),
                             reason: "not a subtype".into(),
@@ -8106,6 +8225,7 @@ impl ConstraintSolver {
                         };
                         if let Some(tid) = type_id {
                             if !wt.implements(&trait_name, tid) {
+                                // Constraint 不携带 span，位置 0,0 为已知限制
                                 self.errors.push(ConstraintError {
                                     constraint: Constraint::TraitBound {
                                         ty,
@@ -9524,7 +9644,8 @@ mod tests {
             target_type_desc: None,
         };
         assert!(sr.put_type_def(alias_def));
-        let td = resolve_named_type_resolved("MyInt", &[], &mut sr);
+        let mut visiting: FxHashSet<String> = FxHashSet::default();
+        let td = resolve_named_type_resolved("MyInt", &[], &mut sr, &mut visiting);
         assert_eq!(td.type_id, 3); // 递归到 i32
     }
 
@@ -9552,7 +9673,8 @@ mod tests {
             target_type_desc: Some(bool_desc),
         };
         assert!(sr.put_type_def(newtype_def));
-        let td = resolve_named_type_resolved("MyBool", &[], &mut sr);
+        let mut visiting: FxHashSet<String> = FxHashSet::default();
+        let td = resolve_named_type_resolved("MyBool", &[], &mut sr, &mut visiting);
         assert_eq!(td.type_id, 17); // bool
     }
 

@@ -3,7 +3,7 @@
 //! 基于 Sema.rs 的 SemaResult 产出，定义：
 //! - Node（固定 16B，存拓扑引用，不存值）
 //! - InputsPool（独立连续输入池）
-//! - ValueSlot / Frame（运行时值表，本阶段仅定义结构）
+//! - ValueTable / Frame（运行时值表，SoA 布局）
 //! - SubGraph（函数=子图）
 //! - EventSource（channel/async/timer/子图完成事件源声明）
 //! - DataFlowGraph（全局图容器）
@@ -101,6 +101,37 @@ pub struct Node {
 const _: () = assert!(std::mem::size_of::<Node>() == 16);
 
 // =========================================================================
+// BatchInfo — 编译期 SIMD/并行批量化标记（per-Node，仿 tail_call_flags）
+// =========================================================================
+
+/// 批量化运算类型：映射到 Value.rs 的 SIMD/rayon 批算函数。
+///
+/// 编译期由 compile_binary/compile_unary 设置，运行期 run_ready_nodes 按
+/// (ScalarTag, BatchOp) 分组就绪节点，复用 Value.rs 的 batch_binop/batch_cmp/
+/// batch_unaryop 做 SIMD 向量化 + rayon 并行批算，避免逐节点 compute_fn 开销。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BatchOp {
+    /// 二元算术/位运算（返回同类型标量）
+    Bin(crate::Value::BinOp),
+    /// 比较运算（返回 bool）
+    Cmp(crate::Value::CmpOp),
+    /// 一元运算（返回同类型标量）
+    Unary(crate::Value::UnaryOp),
+}
+
+/// 编译期批量化信息（per-Node，按 NodeId 索引）。
+///
+/// 仅 BinOp/UnOp 且标量类型的节点有 BatchInfo；Call/Gate/Await/record/array/
+/// field 等节点为 None（不可批量化，走原有 compute_fn 顺序路径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BatchInfo {
+    /// 输入/输出的标量类型（决定 SIMD lane 宽度）
+    pub tag: crate::Value::ScalarTag,
+    /// 运算类型
+    pub op: BatchOp,
+}
+
+// =========================================================================
 // InputsPool — 独立连续输入池
 // =========================================================================
 
@@ -149,62 +180,125 @@ impl Default for InputsPool {
 }
 
 // =========================================================================
-// ValueSlot — 值表槽（运行时，每帧一个值表）
+// ValueTable — 值表（SoA 布局，运行时，每帧一个）
 // =========================================================================
 
-/// 值表槽：存储节点产出值 + 就绪状态 + 槽级 RC 计数。
+/// 值表（SoA 布局）：values / ready / refcounts 分离存储。
 ///
-/// - `value`：产出值（ValueHandle，4B DOD 句柄）
+/// 相比 AoS（Vec<ValueSlot>），SoA 让 Value 连续排布（stride = sizeof(Value)），
+/// 消除 bool/u16 交错，提升 SIMD 批量提取的缓存密度与向量化效率。
+///
+/// - `values`：节点产出值（按帧内局部 NodeId 索引）
 /// - `ready`：是否已产出
-/// - `refcount`：剩余下游消费者数量（双层 RC 的槽级，0 表示可回收）
+/// - `refcounts`：槽级 RC（剩余下游消费者数，0 可回收）
 ///
 /// 槽级 RC：节点产出时设 refcount = 下游数量，每个下游消费时 -1，归零可清槽。
-/// 帧级兜底：帧结束时所有未归零槽统一回收（堆对象 decref）。
+/// 帧级兜底：帧结束时所有未归零槽统一回收（堆对象 Arc Drop 自动 decref）。
 #[derive(Clone)]
-pub struct ValueSlot {
-    pub value: Value,
-    pub ready: bool,
-    pub refcount: u16,
+pub struct ValueTable {
+    pub values: Vec<Value>,
+    pub ready: Vec<bool>,
+    pub refcounts: Vec<u16>,
 }
 
-impl ValueSlot {
-    /// 创建未就绪的空槽。
-    pub fn unready() -> Self {
+impl ValueTable {
+    /// 创建空表。
+    pub fn new() -> Self {
         Self {
-            value: Value::NULL,
-            ready: false,
-            refcount: 0,
+            values: Vec::new(),
+            ready: Vec::new(),
+            refcounts: Vec::new(),
         }
     }
 
-    /// 设置产出值 + 下游消费者数量。
-    pub fn set_value(&mut self, value: Value, consumer_count: u16) {
-        self.value = value;
-        self.ready = true;
-        self.refcount = consumer_count;
+    /// 创建指定容量、全部未就绪的表。
+    pub fn with_unready(n: usize) -> Self {
+        Self {
+            values: vec![Value::NULL; n],
+            ready: vec![false; n],
+            refcounts: vec![0; n],
+        }
+    }
+
+    /// 节点数。
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// 调整尺寸（新槽为未就绪）。
+    pub fn resize(&mut self, n: usize) {
+        self.values.resize(n, Value::NULL);
+        self.ready.resize(n, false);
+        self.refcounts.resize(n, 0);
+    }
+
+    /// 设置产出值 + 下游消费者数量（局部索引）。
+    pub fn set_value(&mut self, idx: usize, value: Value, consumer_count: u16) {
+        self.values[idx] = value;
+        self.ready[idx] = true;
+        self.refcounts[idx] = consumer_count;
+    }
+
+    /// 获取产出值（克隆）。
+    pub fn get_value(&self, idx: usize) -> Value {
+        self.values[idx].clone()
+    }
+
+    /// 获取产出值可变引用（用于 &self 语义直接修改底层 HeapObj）。
+    pub fn get_value_mut(&mut self, idx: usize) -> Option<&mut Value> {
+        self.values.get_mut(idx)
     }
 
     /// 消费一次（下游读取）。返回 true 表示 refcount 仍 >0（未归零），
     /// 返回 false 表示已归零可回收。
-    pub fn consume(&mut self) -> bool {
-        if self.refcount > 0 {
-            self.refcount -= 1;
+    pub fn consume(&mut self, idx: usize) -> bool {
+        if self.refcounts[idx] > 0 {
+            self.refcounts[idx] -= 1;
         }
-        self.refcount > 0
+        self.refcounts[idx] > 0
     }
 
     /// 是否已被所有消费者消费完（refcount 归零）。
-    pub fn is_consumed(&self) -> bool {
-        self.ready && self.refcount == 0
+    pub fn is_consumed(&self, idx: usize) -> bool {
+        self.ready[idx] && self.refcounts[idx] == 0
+    }
+
+    /// 重置单个槽为未就绪（堆对象 Arc Drop 自动 decref）。
+    pub fn reset_slot(&mut self, idx: usize) {
+        self.values[idx] = Value::NULL;
+        self.ready[idx] = false;
+        self.refcounts[idx] = 0;
+    }
+
+    /// 重置所有槽为未就绪（堆对象 Arc Drop 自动 decref）。
+    pub fn reset_all(&mut self) {
+        for v in self.values.iter_mut() {
+            *v = Value::NULL;
+        }
+        for r in self.ready.iter_mut() {
+            *r = false;
+        }
+        for rc in self.refcounts.iter_mut() {
+            *rc = 0;
+        }
     }
 }
 
-impl std::fmt::Debug for ValueSlot {
+impl Default for ValueTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ValueTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ValueSlot")
-            .field("value", &self.value)
-            .field("ready", &self.ready)
-            .field("refcount", &self.refcount)
+        f.debug_struct("ValueTable")
+            .field("len", &self.values.len())
+            .field("ready_count", &self.ready.iter().filter(|&&r| r).count())
             .finish()
     }
 }
@@ -219,11 +313,22 @@ impl std::fmt::Debug for ValueSlot {
 /// Engine 在帧初始化时用 ValueArena 分配 ValueHandle 并预填充到 value_table。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConstValue {
+    I8(i8),
+    I16(i16),
     I32(i32),
     I64(i64),
+    I128(i128),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    U128(u128),
+    Isize(isize),
+    Usize(usize),
     F32(f32),
     F64(f64),
     Bool(bool),
+    Char(u32),
     Str(&'static str),
     Null,
     Void,
@@ -397,19 +502,19 @@ pub struct PendingAwait {
 
 /// 执行帧：一次函数调用的运行时状态。
 ///
-/// - `value_table`：按 NodeId 索引的值表（每节点一个槽）
+/// - `value_table`：按 NodeId 索引的值表（SoA 布局，每节点一个槽）
 /// - `pending_inputs`：每节点剩余未就绪输入数
 /// - `ready_queue`：就绪待执行节点队列
 /// - `state`：帧状态
 /// - `subgraph_id`：所属子图
 /// - `caller`：调用方帧+call节点（子图完成时回写返回值）
 ///
-/// 帧级回收：帧结束时整个 value_table 释放，堆对象走 ValueArena RC。
+/// 帧级回收：帧结束时整个 value_table 释放，堆对象走 Arc Drop RC。
 pub struct Frame {
     /// 数据流图（只读共享，compute_fn 通过 frame.graph 访问）
     pub graph: std::sync::Arc<DataFlowGraph>,
-    /// 值表（按帧内局部 NodeId 索引，从 0 开始）
-    pub value_table: Vec<ValueSlot>,
+    /// 值表（SoA 布局，按帧内局部 NodeId 索引，从 0 开始）
+    pub value_table: ValueTable,
     /// 每节点剩余未就绪输入数
     pub pending_inputs: Vec<u8>,
     /// 就绪待执行节点队列
@@ -457,7 +562,7 @@ impl Frame {
     pub fn new(id: FrameId, subgraph_id: SubGraphId, node_count: usize, graph: std::sync::Arc<DataFlowGraph>) -> Self {
         Self {
             graph,
-            value_table: vec![ValueSlot::unready(); node_count],
+            value_table: ValueTable::with_unready(node_count),
             pending_inputs: vec![0; node_count],
             ready_queue: std::collections::VecDeque::new(),
             state: FrameState::Ready,
@@ -482,12 +587,12 @@ impl Frame {
 
     /// 设置节点的产出值（局部 NodeId）。
     pub fn set_value(&mut self, node: NodeId, value: Value, consumer_count: u16) {
-        self.value_table[node.0 as usize].set_value(value, consumer_count);
+        self.value_table.set_value(node.0 as usize, value, consumer_count);
     }
 
     /// 获取节点的产出值（局部 NodeId，克隆返回）。
     pub fn get_value(&self, node: NodeId) -> Value {
-        self.value_table[node.0 as usize].value.clone()
+        self.value_table.get_value(node.0 as usize)
     }
 
     /// 获取节点的产出值（全局 NodeId，自动转换为局部索引，克隆返回）。
@@ -497,7 +602,7 @@ impl Frame {
     pub fn get_value_by_global(&self, global_node: NodeId) -> Value {
         let local = global_node.0.wrapping_sub(self.node_offset);
         if (local as usize) < self.value_table.len() {
-            self.value_table[local as usize].value.clone()
+            self.value_table.get_value(local as usize)
         } else if !self.parent_frame_ptr.is_null() {
             unsafe { (*self.parent_frame_ptr).get_value_by_global(global_node) }
         } else if !self.root_frame_ptr.is_null() {
@@ -772,6 +877,245 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         crate::Engine::compute_propagate,           // 47
         crate::Engine::compute_seq,                 // 48
         crate::Engine::compute_writeback,           // 49
+        // i64 算术与比较（50-63）
+        crate::Engine::compute_add_i64,             // 50
+        crate::Engine::compute_sub_i64,             // 51
+        crate::Engine::compute_mul_i64,             // 52
+        crate::Engine::compute_div_i64,             // 53
+        crate::Engine::compute_mod_i64,             // 54
+        crate::Engine::compute_eq_i64,              // 55
+        crate::Engine::compute_ne_i64,              // 56
+        crate::Engine::compute_lt_i64,              // 57
+        crate::Engine::compute_gt_i64,              // 58
+        crate::Engine::compute_le_i64,              // 59
+        crate::Engine::compute_ge_i64,              // 60
+        crate::Engine::compute_neg_i64,             // 61
+        crate::Engine::compute_bitnot_i32,          // 62
+        crate::Engine::compute_bitnot_i64,          // 63
+        // i128 算术与比较（64-77）
+        crate::Engine::compute_add_i128,            // 64
+        crate::Engine::compute_sub_i128,            // 65
+        crate::Engine::compute_mul_i128,            // 66
+        crate::Engine::compute_div_i128,            // 67
+        crate::Engine::compute_mod_i128,            // 68
+        crate::Engine::compute_eq_i128,             // 69
+        crate::Engine::compute_ne_i128,             // 70
+        crate::Engine::compute_lt_i128,             // 71
+        crate::Engine::compute_gt_i128,             // 72
+        crate::Engine::compute_le_i128,             // 73
+        crate::Engine::compute_ge_i128,             // 74
+        crate::Engine::compute_neg_i128,            // 75
+        crate::Engine::compute_bitnot_i128,         // 76
+        // 整数位运算（77-92）：BitAnd/BitOr/BitXor/Shl/Shr × i32/i64/i128
+        crate::Engine::compute_bitand_i32,          // 77
+        crate::Engine::compute_bitor_i32,           // 78
+        crate::Engine::compute_bitxor_i32,          // 79
+        crate::Engine::compute_bitand_i64,          // 80
+        crate::Engine::compute_bitor_i64,           // 81
+        crate::Engine::compute_bitxor_i64,          // 82
+        crate::Engine::compute_bitand_i128,         // 83
+        crate::Engine::compute_bitor_i128,          // 84
+        crate::Engine::compute_bitxor_i128,         // 85
+        crate::Engine::compute_shl_i32,             // 86
+        crate::Engine::compute_shr_i32,             // 87
+        crate::Engine::compute_shl_i64,             // 88
+        crate::Engine::compute_shr_i64,             // 89
+        crate::Engine::compute_shl_i128,            // 90
+        crate::Engine::compute_shr_i128,            // 91
+        // ---- 全基本类型 compute_fn（92-259）----
+        // 整数 12 类型 × 12 运算（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）
+        // i8: 92-103
+        crate::Engine::compute_add_i8,              // 92
+        crate::Engine::compute_sub_i8,              // 93
+        crate::Engine::compute_mul_i8,              // 94
+        crate::Engine::compute_div_i8,              // 95
+        crate::Engine::compute_mod_i8,              // 96
+        crate::Engine::compute_bitand_i8,           // 97
+        crate::Engine::compute_bitor_i8,            // 98
+        crate::Engine::compute_bitxor_i8,           // 99
+        crate::Engine::compute_shl_i8,              // 100
+        crate::Engine::compute_shr_i8,              // 101
+        crate::Engine::compute_neg_i8,              // 102
+        crate::Engine::compute_bitnot_i8,           // 103
+        // i16: 104-115
+        crate::Engine::compute_add_i16,             // 104
+        crate::Engine::compute_sub_i16,             // 105
+        crate::Engine::compute_mul_i16,             // 106
+        crate::Engine::compute_div_i16,             // 107
+        crate::Engine::compute_mod_i16,             // 108
+        crate::Engine::compute_bitand_i16,          // 109
+        crate::Engine::compute_bitor_i16,           // 110
+        crate::Engine::compute_bitxor_i16,          // 111
+        crate::Engine::compute_shl_i16,             // 112
+        crate::Engine::compute_shr_i16,             // 113
+        crate::Engine::compute_neg_i16,             // 114
+        crate::Engine::compute_bitnot_i16,          // 115
+        // i32: 116-127
+        crate::Engine::compute_add_i32,             // 116
+        crate::Engine::compute_sub_i32,             // 117
+        crate::Engine::compute_mul_i32,             // 118
+        crate::Engine::compute_div_i32,             // 119
+        crate::Engine::compute_mod_i32,             // 120
+        crate::Engine::compute_bitand_i32,          // 121
+        crate::Engine::compute_bitor_i32,           // 122
+        crate::Engine::compute_bitxor_i32,          // 123
+        crate::Engine::compute_shl_i32,             // 124
+        crate::Engine::compute_shr_i32,             // 125
+        crate::Engine::compute_neg_i32,             // 126
+        crate::Engine::compute_bitnot_i32,          // 127
+        // i64: 128-139
+        crate::Engine::compute_add_i64,             // 128
+        crate::Engine::compute_sub_i64,             // 129
+        crate::Engine::compute_mul_i64,             // 130
+        crate::Engine::compute_div_i64,             // 131
+        crate::Engine::compute_mod_i64,             // 132
+        crate::Engine::compute_bitand_i64,          // 133
+        crate::Engine::compute_bitor_i64,           // 134
+        crate::Engine::compute_bitxor_i64,          // 135
+        crate::Engine::compute_shl_i64,             // 136
+        crate::Engine::compute_shr_i64,             // 137
+        crate::Engine::compute_neg_i64,             // 138
+        crate::Engine::compute_bitnot_i64,          // 139
+        // i128: 140-151
+        crate::Engine::compute_add_i128,            // 140
+        crate::Engine::compute_sub_i128,            // 141
+        crate::Engine::compute_mul_i128,            // 142
+        crate::Engine::compute_div_i128,            // 143
+        crate::Engine::compute_mod_i128,            // 144
+        crate::Engine::compute_bitand_i128,         // 145
+        crate::Engine::compute_bitor_i128,          // 146
+        crate::Engine::compute_bitxor_i128,         // 147
+        crate::Engine::compute_shl_i128,            // 148
+        crate::Engine::compute_shr_i128,            // 149
+        crate::Engine::compute_neg_i128,            // 150
+        crate::Engine::compute_bitnot_i128,         // 151
+        // u8: 152-163
+        crate::Engine::compute_add_u8,              // 152
+        crate::Engine::compute_sub_u8,              // 153
+        crate::Engine::compute_mul_u8,              // 154
+        crate::Engine::compute_div_u8,              // 155
+        crate::Engine::compute_mod_u8,              // 156
+        crate::Engine::compute_bitand_u8,           // 157
+        crate::Engine::compute_bitor_u8,            // 158
+        crate::Engine::compute_bitxor_u8,           // 159
+        crate::Engine::compute_shl_u8,              // 160
+        crate::Engine::compute_shr_u8,              // 161
+        crate::Engine::compute_neg_u8,              // 162
+        crate::Engine::compute_bitnot_u8,           // 163
+        // u16: 164-175
+        crate::Engine::compute_add_u16,             // 164
+        crate::Engine::compute_sub_u16,             // 165
+        crate::Engine::compute_mul_u16,             // 166
+        crate::Engine::compute_div_u16,             // 167
+        crate::Engine::compute_mod_u16,             // 168
+        crate::Engine::compute_bitand_u16,          // 169
+        crate::Engine::compute_bitor_u16,           // 170
+        crate::Engine::compute_bitxor_u16,          // 171
+        crate::Engine::compute_shl_u16,             // 172
+        crate::Engine::compute_shr_u16,             // 173
+        crate::Engine::compute_neg_u16,             // 174
+        crate::Engine::compute_bitnot_u16,          // 175
+        // u32: 176-187
+        crate::Engine::compute_add_u32,             // 176
+        crate::Engine::compute_sub_u32,             // 177
+        crate::Engine::compute_mul_u32,             // 178
+        crate::Engine::compute_div_u32,             // 179
+        crate::Engine::compute_mod_u32,             // 180
+        crate::Engine::compute_bitand_u32,          // 181
+        crate::Engine::compute_bitor_u32,           // 182
+        crate::Engine::compute_bitxor_u32,          // 183
+        crate::Engine::compute_shl_u32,             // 184
+        crate::Engine::compute_shr_u32,             // 185
+        crate::Engine::compute_neg_u32,             // 186
+        crate::Engine::compute_bitnot_u32,          // 187
+        // u64: 188-199
+        crate::Engine::compute_add_u64,             // 188
+        crate::Engine::compute_sub_u64,             // 189
+        crate::Engine::compute_mul_u64,             // 190
+        crate::Engine::compute_div_u64,             // 191
+        crate::Engine::compute_mod_u64,             // 192
+        crate::Engine::compute_bitand_u64,          // 193
+        crate::Engine::compute_bitor_u64,           // 194
+        crate::Engine::compute_bitxor_u64,          // 195
+        crate::Engine::compute_shl_u64,             // 196
+        crate::Engine::compute_shr_u64,             // 197
+        crate::Engine::compute_neg_u64,             // 198
+        crate::Engine::compute_bitnot_u64,          // 199
+        // u128: 200-211
+        crate::Engine::compute_add_u128,            // 200
+        crate::Engine::compute_sub_u128,            // 201
+        crate::Engine::compute_mul_u128,            // 202
+        crate::Engine::compute_div_u128,            // 203
+        crate::Engine::compute_mod_u128,            // 204
+        crate::Engine::compute_bitand_u128,         // 205
+        crate::Engine::compute_bitor_u128,          // 206
+        crate::Engine::compute_bitxor_u128,         // 207
+        crate::Engine::compute_shl_u128,            // 208
+        crate::Engine::compute_shr_u128,            // 209
+        crate::Engine::compute_neg_u128,            // 210
+        crate::Engine::compute_bitnot_u128,         // 211
+        // isize: 212-223
+        crate::Engine::compute_add_isize,           // 212
+        crate::Engine::compute_sub_isize,           // 213
+        crate::Engine::compute_mul_isize,           // 214
+        crate::Engine::compute_div_isize,           // 215
+        crate::Engine::compute_mod_isize,           // 216
+        crate::Engine::compute_bitand_isize,        // 217
+        crate::Engine::compute_bitor_isize,         // 218
+        crate::Engine::compute_bitxor_isize,        // 219
+        crate::Engine::compute_shl_isize,           // 220
+        crate::Engine::compute_shr_isize,           // 221
+        crate::Engine::compute_neg_isize,           // 222
+        crate::Engine::compute_bitnot_isize,        // 223
+        // usize: 224-235
+        crate::Engine::compute_add_usize,           // 224
+        crate::Engine::compute_sub_usize,           // 225
+        crate::Engine::compute_mul_usize,           // 226
+        crate::Engine::compute_div_usize,           // 227
+        crate::Engine::compute_mod_usize,           // 228
+        crate::Engine::compute_bitand_usize,        // 229
+        crate::Engine::compute_bitor_usize,         // 230
+        crate::Engine::compute_bitxor_usize,        // 231
+        crate::Engine::compute_shl_usize,           // 232
+        crate::Engine::compute_shr_usize,           // 233
+        crate::Engine::compute_neg_usize,           // 234
+        crate::Engine::compute_bitnot_usize,        // 235
+        // 浮点 4 类型 × 6 运算（add/sub/mul/div/mod/neg）
+        // f16: 236-241
+        crate::Engine::compute_add_f16,             // 236
+        crate::Engine::compute_sub_f16,             // 237
+        crate::Engine::compute_mul_f16,             // 238
+        crate::Engine::compute_div_f16,             // 239
+        crate::Engine::compute_mod_f16,             // 240
+        crate::Engine::compute_neg_f16,             // 241
+        // f32: 242-247
+        crate::Engine::compute_add_f32,             // 242
+        crate::Engine::compute_sub_f32,             // 243
+        crate::Engine::compute_mul_f32,             // 244
+        crate::Engine::compute_div_f32,             // 245
+        crate::Engine::compute_mod_f32,             // 246
+        crate::Engine::compute_neg_f32,             // 247
+        // f64: 248-253
+        crate::Engine::compute_add_f64,             // 248
+        crate::Engine::compute_sub_f64,             // 249
+        crate::Engine::compute_mul_f64,             // 250
+        crate::Engine::compute_div_f64,             // 251
+        crate::Engine::compute_mod_f64,             // 252
+        crate::Engine::compute_neg_f64,             // 253
+        // f128: 254-259
+        crate::Engine::compute_add_f128,            // 254
+        crate::Engine::compute_sub_f128,            // 255
+        crate::Engine::compute_mul_f128,            // 256
+        crate::Engine::compute_div_f128,            // 257
+        crate::Engine::compute_mod_f128,            // 258
+        crate::Engine::compute_neg_f128,            // 259
+        // 语义运算（260-265）：RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis
+        crate::Engine::compute_ref_eq,              // 260
+        crate::Engine::compute_ref_neq,             // 261
+        crate::Engine::compute_concat_list,         // 262
+        crate::Engine::compute_range,               // 263
+        crate::Engine::compute_range_inclusive,     // 264
+        crate::Engine::compute_elvis,               // 265
     ]
 }
 
@@ -827,6 +1171,12 @@ pub struct DataFlowGraph {
     pub select_infos: Vec<Option<SelectInfo>>,
     /// WriteBack 节点的目标外层 NodeId（按 NodeId 索引，非 WriteBack 节点为 None）
     pub writeback_targets: Vec<Option<NodeId>>,
+    /// Call 节点的尾调用标记（按 NodeId 索引，true=尾调用帧复用）
+    /// 编译期由尾位置分析设置，运行时 switch_subgraph 复用当前帧
+    pub tail_call_flags: Vec<bool>,
+    /// 编译期 SIMD/并行批量化标记（按 NodeId 索引，None=不可批量化）
+    /// compile_binary/compile_unary 设置，run_ready_nodes 按 (tag,op) 分组批算
+    pub batch_infos: Vec<Option<BatchInfo>>,
 }
 
 impl DataFlowGraph {
@@ -852,6 +1202,8 @@ impl DataFlowGraph {
             closure_infos: Vec::new(),
             select_infos: Vec::new(),
             writeback_targets: Vec::new(),
+            tail_call_flags: Vec::new(),
+            batch_infos: Vec::new(),
         }
     }
 
@@ -873,12 +1225,24 @@ impl DataFlowGraph {
         self.closure_infos.push(None);
         self.select_infos.push(None);
         self.writeback_targets.push(None);
+        self.tail_call_flags.push(false);
+        self.batch_infos.push(None);
         id
     }
 
     /// 设置 Call 节点的目标子图。
     pub fn set_call_target(&mut self, node: NodeId, target: SubGraphId) {
         self.call_targets[node.0 as usize] = Some(target);
+    }
+
+    /// 标记 Call 节点为尾调用（运行时 switch_subgraph 复用当前帧）。
+    pub fn set_tail_call(&mut self, node: NodeId) {
+        self.tail_call_flags[node.0 as usize] = true;
+    }
+
+    /// 设置节点的 SIMD/并行批量化信息（编译期由 compile_binary/compile_unary 调用）。
+    pub fn set_batch_info(&mut self, node: NodeId, info: BatchInfo) {
+        self.batch_infos[node.0 as usize] = Some(info);
     }
 
     /// 设置 WriteBack 节点的目标外层 NodeId。
@@ -1045,7 +1409,66 @@ pub struct IrBuilder<'a> {
     pub current_sg_start: u32,
     /// 当前语句块中前一个效果节点（用于让后续效果节点依赖前一个，保证语句顺序）
     pub current_effect: Option<NodeId>,
+    /// 当前是否在尾位置（尾调用分析用）。
+    /// compile_function 入口设 true，Return value 设 true，
+    /// Block trailing 继承，If/Match 分支继承，参数/条件/赋值右侧设 false。
+    pub in_tail_position: bool,
+    /// 编译期错误列表（未实现特性、找不到函数等，编译结束后可检查）
+    pub errors: Vec<String>,
 }
+
+// =========================================================================
+// 内置构造/方法/cast 分派注册表（数据驱动，消除方法名/类型名特判分支）
+// =========================================================================
+
+/// cast 转换对注册表：不遵循默认 `__cast_{S}_to_{T}` 命名规则的转换对。
+/// 新增转换对只需追加一行，无需改编译分支。
+const SPECIAL_CAST_PAIRS: &[(&str, &str, &str)] = &[
+    // (source, target, mangled_fn)
+    ("u8[]", "str", "__cast_bytes_to_str"),
+    ("bytes", "str", "__cast_bytes_to_str"),
+    ("char", "str", "__cast_char_to_str"),
+];
+
+/// 解析 cast 函数名：先查特殊转换对注册表，未命中则按默认命名规则生成。
+fn cast_mangled_name(source: &str, target: &str) -> String {
+    for &(s, t, fn_name) in SPECIAL_CAST_PAIRS {
+        if s == source && t == target {
+            return fn_name.to_string();
+        }
+    }
+    format!("__cast_{}_to_{}", source, target)
+}
+
+/// 内置 nullary 方法（无参数）的降级策略。
+/// 新增单节点内置方法只需追加一行，无需新增 else-if 分支。
+enum BuiltinMethodLower {
+    /// 单节点一元运算（compute_fn 索引）
+    UnOp(u32),
+    /// 挂起等待事件源（await：EventSource + Await 双节点）
+    Await,
+}
+
+/// 内置 nullary 方法分派表：方法名 → 降级策略。
+const NULLARY_BUILTIN_METHODS: &[(&str, BuiltinMethodLower)] = &[
+    ("await", BuiltinMethodLower::Await),
+    ("cancel", BuiltinMethodLower::UnOp(42)),
+    ("len", BuiltinMethodLower::UnOp(35)),
+];
+
+/// Throw 内置构造器的降级策略。
+enum ThrowCtorLower {
+    /// Ok(val)：单节点 compute_throw_ok（idx 44）
+    Ok,
+    /// Err(...)：内层 record_construct + 外层 throw_err 包装（idx 45）
+    Err,
+}
+
+/// Throw 内置构造器分派表：构造器名 → 降级策略。
+const THROW_CTORS: &[(&str, ThrowCtorLower)] = &[
+    ("Ok", ThrowCtorLower::Ok),
+    ("Err", ThrowCtorLower::Err),
+];
 
 impl<'a> IrBuilder<'a> {
     /// 创建构建器。
@@ -1063,6 +1486,8 @@ impl<'a> IrBuilder<'a> {
             current_function_id: 0,
             current_sg_start: 0,
             current_effect: None,
+            in_tail_position: false,
+            errors: Vec::new(),
         }
     }
 
@@ -1128,21 +1553,35 @@ impl<'a> IrBuilder<'a> {
 
     /// CompoundAssignOp → 对应二元运算的 ComputeFnId。
     ///
-    /// 位运算（bitand/bitor/bitxor/shl/shr）尚未有专门 compute_fn，暂用 noop(0) 占位。
-    fn compound_assign_op_to_compute_fn(&self, op: crate::Ast::CompoundAssignOp) -> ComputeFnId {
+    /// 通过 arith_base 按具体类型查表，算术运算用 offset 0-4，
+    /// 位运算用 offset 5-9（仅整数）。
+    fn compound_assign_op_to_compute_fn(
+        &mut self,
+        op: crate::Ast::CompoundAssignOp,
+        target_expr: crate::Ast::ExprId,
+    ) -> ComputeFnId {
         use crate::Ast::CompoundAssignOp;
-        match op {
-            CompoundAssignOp::AddAssign => ComputeFnId(1),  // add_i32
-            CompoundAssignOp::SubAssign => ComputeFnId(5),  // sub_i32
-            CompoundAssignOp::MulAssign => ComputeFnId(3),  // mul_i32
-            CompoundAssignOp::DivAssign => ComputeFnId(6),  // div_i32
-            CompoundAssignOp::ModAssign => ComputeFnId(7),  // mod_i32
-            CompoundAssignOp::BitAndAssign => ComputeFnId(22), // and_bool（暂复用）
-            CompoundAssignOp::BitOrAssign => ComputeFnId(23),  // or_bool（暂复用）
-            CompoundAssignOp::BitXorAssign => ComputeFnId(0),  // noop（未实现）
-            CompoundAssignOp::ShlAssign => ComputeFnId(0),     // noop
-            CompoundAssignOp::ShrAssign => ComputeFnId(0),     // noop
-        }
+        let ty = self.expr_type_name(target_expr).unwrap_or("i32");
+        let is_float = matches!(ty, "f16" | "f32" | "f64" | "f128");
+        let base = Self::arith_base(ty).unwrap_or(116); // 回退 i32
+        // 整数 offset: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9)
+        // 浮点 offset: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
+        let offset = match op {
+            CompoundAssignOp::AddAssign => 0,
+            CompoundAssignOp::SubAssign => 1,
+            CompoundAssignOp::MulAssign => 2,
+            CompoundAssignOp::DivAssign => 3,
+            CompoundAssignOp::ModAssign => 4,
+            // 位运算仅整数支持；浮点走到这里表示 sema 未拦截，回退到 i32 路径
+            CompoundAssignOp::BitAndAssign if !is_float => 5,
+            CompoundAssignOp::BitOrAssign if !is_float => 6,
+            CompoundAssignOp::BitXorAssign if !is_float => 7,
+            CompoundAssignOp::ShlAssign if !is_float => 8,
+            CompoundAssignOp::ShrAssign if !is_float => 9,
+            // 浮点不应出现位运算；若出现则回退 noop
+            _ => return ComputeFnId(0),
+        };
+        ComputeFnId(base + offset)
     }
 
     /// 注册占位子图（节点范围待编译后填充）。
@@ -1248,7 +1687,7 @@ impl<'a> IrBuilder<'a> {
 
             // 赋值表达式：target = value
             crate::Ast::Expr::Assign { target, value } => {
-                let val_node = self.compile_expr(*value);
+                let val_node = self.compile_subexpr(*value);
                 let target_expr = &self.current_module().arena.expr(*target).node;
                 match target_expr {
                     crate::Ast::Expr::Ident(name) => {
@@ -1256,7 +1695,7 @@ impl<'a> IrBuilder<'a> {
                     }
                     crate::Ast::Expr::FieldAccess { recv: obj, field }
                     | crate::Ast::Expr::SafeAccess { recv: obj, field } => {
-                        let obj_node = self.compile_expr(*obj);
+                        let obj_node = self.compile_subexpr(*obj);
                         let off = self.graph.inputs_pool.push(&[obj_node, val_node]);
                         let set_node = self.graph.add_node(Node {
                             kind: NodeKind::BinOp,
@@ -1273,9 +1712,9 @@ impl<'a> IrBuilder<'a> {
 
             // 复合赋值：target op= value
             crate::Ast::Expr::CompoundAssign { op, target, value } => {
-                let val_node = self.compile_expr(*value);
+                let val_node = self.compile_subexpr(*value);
                 let target_expr = &self.current_module().arena.expr(*target).node;
-                let bin_compute = self.compound_assign_op_to_compute_fn(*op);
+                let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
                 match target_expr {
                     crate::Ast::Expr::Ident(name) => {
                         let cur_node = self
@@ -1293,7 +1732,7 @@ impl<'a> IrBuilder<'a> {
                     }
                     crate::Ast::Expr::FieldAccess { recv: obj, field }
                     | crate::Ast::Expr::SafeAccess { recv: obj, field } => {
-                        let obj_node = self.compile_expr(*obj);
+                        let obj_node = self.compile_subexpr(*obj);
                         // 读当前字段值
                         let get_off = self.graph.inputs_pool.push(&[obj_node]);
                         let get_node = self.graph.add_node(Node {
@@ -1330,7 +1769,7 @@ impl<'a> IrBuilder<'a> {
 
             // `?` 运算符（Propagate）：解包 Throw，Err 时提前返回
             crate::Ast::Expr::Propagate(inner) => {
-                let inner_node = self.compile_expr(*inner);
+                let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
                 self.graph.add_node(Node {
                     kind: NodeKind::UnOp,
@@ -1340,9 +1779,63 @@ impl<'a> IrBuilder<'a> {
                 })
             }
 
-            // 其他本阶段占位
-            _ => self.compile_placeholder(),
+            // 一元运算：!（逻辑非）、-（算术取负）、~（按位取反）
+            crate::Ast::Expr::Unary { op, operand } => {
+                let operand_node = self.compile_subexpr(*operand);
+                let inputs_offset = self.graph.inputs_pool.push(&[operand_node]);
+                let compute_fn = self.select_unary_compute_fn(*op, *operand);
+                let node = self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset,
+                    compute_fn,
+                });
+                // 编译期标记 SIMD 批量化：Neg/BitNot + 标量类型
+                if let Some(info) = self.unary_batch_info(*op, *operand) {
+                    self.graph.set_batch_info(node, info);
+                }
+                node
+            }
+
+            // 以下 Expr 变体尚未实现 IR 降级，记录编译错误并返回占位节点
+            crate::Ast::Expr::StrInterp(_)
+            | crate::Ast::Expr::RefOf(_)
+            | crate::Ast::Expr::Deref(_)
+            | crate::Ast::Expr::Slice { .. }
+            | crate::Ast::Expr::SafeMethodCall { .. }
+            | crate::Ast::Expr::NonNullAssert(_)
+            | crate::Ast::Expr::Elvis { .. }
+            | crate::Ast::Expr::RecordExtend { .. }
+            | crate::Ast::Expr::TypeCast { .. }
+            | crate::Ast::Expr::Atomic(_)
+            | crate::Ast::Expr::Lazy(_)
+            | crate::Ast::Expr::InlineTrait(_) => {
+                self.errors.push(format!(
+                    "compile_expr: 尚未实现的 Expr 变体: {:?}",
+                    expr
+                ));
+                self.compile_placeholder()
+            }
+
+            // 未来新增的 Expr 变体不应静默通过
+            _ => unreachable!("compile_expr: 未覆盖的 Expr 变体: {:?}", expr),
         }
+    }
+
+    /// 编译子表达式（非尾位置）。
+    ///
+    /// 操作数、函数参数、if 条件、字段访问基础值等子表达式的值会被父表达式
+    /// 消费而非直接作为函数返回值，因此一律不在尾位置：编译前关闭
+    /// in_tail_position，编译后恢复。这样子表达式内的 Call 不会被误标为
+    /// 尾调用（否则 switch_subgraph 帧复用会切走当前帧，破坏父表达式对其余
+    /// 子表达式/运算节点的执行，如 fib(n-1)+fib(n-2) 中 fib(n-1) 误标尾调用
+    /// 会导致 fib(n-2) 与加法节点永不执行）。
+    fn compile_subexpr(&mut self, expr_id: crate::Ast::ExprId) -> NodeId {
+        let prev_tail = self.in_tail_position;
+        self.in_tail_position = false;
+        let node = self.compile_expr(expr_id);
+        self.in_tail_position = prev_tail;
+        node
     }
 
     /// 编译常量表达式（无输入）。
@@ -1387,17 +1880,48 @@ impl<'a> IrBuilder<'a> {
     fn parse_const_value(&self, expr_id: crate::Ast::ExprId) -> Option<ConstValue> {
         let spanned = self.current_module().arena.expr(expr_id);
         match &spanned.node {
-            crate::Ast::Expr::IntLit { raw, suffix } => match suffix {
-                None | Some("i32") => raw.parse::<i32>().ok().map(ConstValue::I32),
-                Some("i64") => raw.parse::<i64>().ok().map(ConstValue::I64),
-                _ => raw.parse::<i32>().ok().map(ConstValue::I32),
-            },
+            crate::Ast::Expr::IntLit { raw, suffix } => {
+                // suffix 优先；无 suffix 时参考 sema 推断的类型选择对应整数 ConstValue，
+                // 确保字面量的运行时 tag 与上下文类型一致
+                let ty = suffix
+                    .map(|s| s.to_string())
+                    .or_else(|| self.expr_type_name(expr_id).map(|s| s.to_string()));
+                // 解析整数：支持 0x/0o/0b 前缀（Rust from_str_radix 语义）
+                let parse_int = |raw: &str, radix: u32| -> Option<i128> {
+                    let s = raw
+                        .strip_prefix("0x").map(|s| (s, 16))
+                        .or_else(|| raw.strip_prefix("0o").map(|s| (s, 8)))
+                        .or_else(|| raw.strip_prefix("0b").map(|s| (s, 2)))
+                        .unwrap_or((raw, 10));
+                    i128::from_str_radix(s.0, s.1).ok()
+                };
+                match ty.as_deref() {
+                    Some("i8") => parse_int(raw, 10).and_then(|v| i8::try_from(v).ok()).map(ConstValue::I8),
+                    Some("i16") => parse_int(raw, 10).and_then(|v| i16::try_from(v).ok()).map(ConstValue::I16),
+                    Some("i32") => parse_int(raw, 10).and_then(|v| i32::try_from(v).ok()).map(ConstValue::I32),
+                    Some("i64") => parse_int(raw, 10).and_then(|v| i64::try_from(v).ok()).map(ConstValue::I64),
+                    Some("i128") => parse_int(raw, 10).map(ConstValue::I128),
+                    Some("u8") => parse_int(raw, 10).and_then(|v| u8::try_from(v).ok()).map(ConstValue::U8),
+                    Some("u16") => parse_int(raw, 10).and_then(|v| u16::try_from(v).ok()).map(ConstValue::U16),
+                    Some("u32") => parse_int(raw, 10).and_then(|v| u32::try_from(v).ok()).map(ConstValue::U32),
+                    Some("u64") => parse_int(raw, 10).and_then(|v| u64::try_from(v).ok()).map(ConstValue::U64),
+                    Some("u128") => parse_int(raw, 10).map(|v| v as u128).map(ConstValue::U128),
+                    Some("isize") => parse_int(raw, 10).and_then(|v| isize::try_from(v).ok()).map(ConstValue::Isize),
+                    Some("usize") => parse_int(raw, 10).and_then(|v| usize::try_from(v).ok()).map(ConstValue::Usize),
+                    _ => parse_int(raw, 10).and_then(|v| i32::try_from(v).ok()).map(ConstValue::I32),
+                }
+            }
             crate::Ast::Expr::FloatLit { raw, suffix } => match suffix {
                 None | Some("f64") => raw.parse::<f64>().ok().map(ConstValue::F64),
                 Some("f32") => raw.parse::<f32>().ok().map(ConstValue::F32),
                 _ => raw.parse::<f64>().ok().map(ConstValue::F64),
             },
             crate::Ast::Expr::BoolLit(b) => Some(ConstValue::Bool(*b)),
+            crate::Ast::Expr::CharLit(c) => Some(ConstValue::Char(*c)),
+            crate::Ast::Expr::StrLit(s) => {
+                let static_s: &'static str = Box::leak(s.to_string().into_boxed_str());
+                Some(ConstValue::Str(static_s))
+            }
             crate::Ast::Expr::NullLit => Some(ConstValue::Null),
             crate::Ast::Expr::VoidLit => Some(ConstValue::Void),
             _ => None,
@@ -1426,7 +1950,9 @@ impl<'a> IrBuilder<'a> {
         then_branch: crate::Ast::ExprId,
         else_branch: Option<crate::Ast::ExprId>,
     ) -> NodeId {
-        let cond_node = self.compile_expr(cond);
+        // 条件不在尾位置：其值仅供 Gate 选择分支，而非直接返回。
+        // 分支结果表达式则继承当前尾位置（if 表达式的值=选中分支的值）。
+        let cond_node = self.compile_subexpr(cond);
         let (then_sg, then_inputs) = self.compile_branch_subgraph(then_branch);
         let (else_sg, else_inputs) = match else_branch {
             Some(e) => self.compile_branch_subgraph(e),
@@ -1538,11 +2064,11 @@ impl<'a> IrBuilder<'a> {
         for arm in arms {
             let (event_kind, event_source_node, body_expr) = match arm {
                 crate::Ast::SelectArm::Receive { channel_expr, body, .. } => {
-                    let ch_node = self.compile_expr(*channel_expr);
+                    let ch_node = self.compile_subexpr(*channel_expr);
                     (EventSourceKind::Channel, ch_node, *body)
                 }
                 crate::Ast::SelectArm::Timeout { duration, body } => {
-                    let dur_node = self.compile_expr(*duration);
+                    let dur_node = self.compile_subexpr(*duration);
                     (EventSourceKind::Timer, dur_node, *body)
                 }
             };
@@ -2214,7 +2740,7 @@ impl<'a> IrBuilder<'a> {
         });
 
         // 编译 condition
-        let cond_node = self.compile_expr(condition);
+        let cond_node = self.compile_subexpr(condition);
         // body 子图（末尾尾递归调用 while_sg）
         let body_sg = self.compile_loop_body_subgraph(body, sg_id);
         // void 子图（false 分支，循环结束）
@@ -2374,7 +2900,12 @@ impl<'a> IrBuilder<'a> {
         scrutinee: crate::Ast::ExprId,
         arms: &[crate::Ast::MatchArm],
     ) -> NodeId {
-        let scrutinee_node = self.compile_expr(scrutinee);
+        // 空 match：返回 void 常量节点，避免 panic
+        if arms.is_empty() {
+            return self.compile_void_const();
+        }
+
+        let scrutinee_node = self.compile_subexpr(scrutinee);
 
         // 编译每个 arm 的 body 为子图（捕获外层变量）
         let arm_body_subgraphs: Vec<(SubGraphId, Vec<NodeId>)> = arms
@@ -2547,6 +3078,31 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
+    /// 类型族：按整数宽度分派到 i32/i64/i128 路径（仅用于比较运算，结果为 bool）。
+    /// i8/i16/u8/u16/u32/char → I32 路径；i64/u64/isize/usize → I64 路径；i128/u128 → I128 路径。
+    fn int_family(ty_name: &str) -> &'static str {
+        match ty_name {
+            "i128" | "u128" => "i128",
+            "i64" | "u64" | "isize" | "usize" => "i64",
+            _ => "i32", // i8/i16/i32/u8/u16/u32/char 及未知整数
+        }
+    }
+
+    /// 算术/位运算 compute_fn 查表：按具体类型名返回 (add, sub, mul, div, mod, bitand, bitor, bitxor, shl, shr) 基址。
+    /// 整数类型每 12 个连续索引；浮点类型每 6 个连续索引（无位运算）。
+    /// 返回 None 表示该类型不支持该运算类别（如浮点位运算）。
+    fn arith_base(ty_name: &str) -> Option<u32> {
+        // 整数：12 运算/类型，从 92 开始
+        // 浮点：6 运算/类型，从 236 开始
+        match ty_name {
+            "i8" => Some(92), "i16" => Some(104), "i32" => Some(116), "i64" => Some(128),
+            "i128" => Some(140), "u8" => Some(152), "u16" => Some(164), "u32" => Some(176),
+            "u64" => Some(188), "u128" => Some(200), "isize" => Some(212), "usize" => Some(224),
+            "f16" => Some(236), "f32" => Some(242), "f64" => Some(248), "f128" => Some(254),
+            _ => None,
+        }
+    }
+
     /// 根据 op + 表达式类型选择 compute_fn id。
     fn select_binary_compute_fn(
         &self,
@@ -2554,53 +3110,127 @@ impl<'a> IrBuilder<'a> {
         lhs_expr: crate::Ast::ExprId,
     ) -> ComputeFnId {
         let ty_name = self.expr_type_name(lhs_expr).unwrap_or("i32");
+        let is_float = matches!(ty_name, "f16" | "f32" | "f64" | "f128");
+        let is_int = !is_float && ty_name != "bool";
+        let base = Self::arith_base(ty_name);
+
+        // 算术运算（add/sub/mul/div/mod）：整数和浮点都支持，按具体类型查表
+        // 整数索引顺序: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9) neg(10) bitnot(11)
+        // 浮点索引顺序: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
+        let arith_offset = |op: &crate::Ast::BinaryOp| -> Option<u32> {
+            match op {
+                crate::Ast::BinaryOp::Add => Some(0),
+                crate::Ast::BinaryOp::Sub => Some(1),
+                crate::Ast::BinaryOp::Mul => Some(2),
+                crate::Ast::BinaryOp::Div => Some(3),
+                crate::Ast::BinaryOp::Mod => Some(4),
+                _ => None,
+            }
+        };
+        if let Some(off) = arith_offset(&op) {
+            if let Some(b) = base {
+                return ComputeFnId(b + off);
+            }
+            // 未知类型回退到 i32 路径
+            return ComputeFnId(116 + off);
+        }
+
+        // 位运算（bitand/bitor/bitxor/shl/shr）：仅整数支持
+        if is_int {
+            let bit_offset = match op {
+                crate::Ast::BinaryOp::BitAnd => Some(5),
+                crate::Ast::BinaryOp::BitOr => Some(6),
+                crate::Ast::BinaryOp::BitXor => Some(7),
+                crate::Ast::BinaryOp::Shl => Some(8),
+                crate::Ast::BinaryOp::Shr => Some(9),
+                _ => None,
+            };
+            if let Some(off) = bit_offset {
+                if let Some(b) = base {
+                    return ComputeFnId(b + off);
+                }
+                return ComputeFnId(116 + off); // 回退 i32
+            }
+        }
+
+        // 比较运算：结果为 bool，输入按类型族读取
+        let fam = Self::int_family(ty_name);
         match op {
-            crate::Ast::BinaryOp::Add => match ty_name {
-                "f64" | "f32" => ComputeFnId(2),  // add_f64
-                _ => ComputeFnId(1),              // add_i32
-            },
-            crate::Ast::BinaryOp::Sub => match ty_name {
-                "f64" | "f32" => ComputeFnId(13), // sub_f64
-                _ => ComputeFnId(5),              // sub_i32
-            },
-            crate::Ast::BinaryOp::Mul => match ty_name {
-                "f64" | "f32" => ComputeFnId(14), // mul_f64
-                _ => ComputeFnId(3),              // mul_i32
-            },
-            crate::Ast::BinaryOp::Div => match ty_name {
-                "f64" | "f32" => ComputeFnId(15), // div_f64
-                _ => ComputeFnId(6),              // div_i32
-            },
-            crate::Ast::BinaryOp::Mod => ComputeFnId(7),  // mod_i32
-            crate::Ast::BinaryOp::Eq => match ty_name {
-                "f64" | "f32" => ComputeFnId(16), // eq_f64
-                "bool" => ComputeFnId(27),        // eq_bool
-                _ => ComputeFnId(8),              // eq_i32
-            },
-            crate::Ast::BinaryOp::NotEq => match ty_name {
-                "f64" | "f32" => ComputeFnId(17), // ne_f64
-                _ => ComputeFnId(9),              // ne_i32
-            },
-            crate::Ast::BinaryOp::Lt => match ty_name {
-                "f64" | "f32" => ComputeFnId(18), // lt_f64
-                _ => ComputeFnId(10),             // lt_i32
-            },
-            crate::Ast::BinaryOp::Gt => match ty_name {
-                "f64" | "f32" => ComputeFnId(19), // gt_f64
-                _ => ComputeFnId(11),             // gt_i32
-            },
-            crate::Ast::BinaryOp::LtEq => match ty_name {
-                "f64" | "f32" => ComputeFnId(20), // le_f64
-                _ => ComputeFnId(4),              // le_i32
-            },
-            crate::Ast::BinaryOp::GtEq => match ty_name {
-                "f64" | "f32" => ComputeFnId(21), // ge_f64
-                _ => ComputeFnId(12),             // ge_i32
-            },
+            crate::Ast::BinaryOp::Eq => {
+                if is_float { ComputeFnId(16) }     // eq_f64
+                else if ty_name == "bool" { ComputeFnId(27) } // eq_bool
+                else if fam == "i128" { ComputeFnId(69) } // eq_i128
+                else if fam == "i64" { ComputeFnId(55) }  // eq_i64
+                else { ComputeFnId(8) }              // eq_i32
+            }
+            crate::Ast::BinaryOp::NotEq => {
+                if is_float { ComputeFnId(17) }     // ne_f64
+                else if fam == "i128" { ComputeFnId(70) } // ne_i128
+                else if fam == "i64" { ComputeFnId(56) }  // ne_i64
+                else { ComputeFnId(9) }              // ne_i32
+            }
+            crate::Ast::BinaryOp::Lt => {
+                if is_float { ComputeFnId(18) }     // lt_f64
+                else if fam == "i128" { ComputeFnId(71) } // lt_i128
+                else if fam == "i64" { ComputeFnId(57) }  // lt_i64
+                else { ComputeFnId(10) }             // lt_i32
+            }
+            crate::Ast::BinaryOp::Gt => {
+                if is_float { ComputeFnId(19) }     // gt_f64
+                else if fam == "i128" { ComputeFnId(72) } // gt_i128
+                else if fam == "i64" { ComputeFnId(58) }  // gt_i64
+                else { ComputeFnId(11) }             // gt_i32
+            }
+            crate::Ast::BinaryOp::LtEq => {
+                if is_float { ComputeFnId(20) }     // le_f64
+                else if fam == "i128" { ComputeFnId(73) } // le_i128
+                else if fam == "i64" { ComputeFnId(59) }  // le_i64
+                else { ComputeFnId(4) }              // le_i32
+            }
+            crate::Ast::BinaryOp::GtEq => {
+                if is_float { ComputeFnId(21) }     // ge_f64
+                else if fam == "i128" { ComputeFnId(74) } // ge_i128
+                else if fam == "i64" { ComputeFnId(60) }  // ge_i64
+                else { ComputeFnId(12) }             // ge_i32
+            }
             crate::Ast::BinaryOp::And => ComputeFnId(22), // and_bool
             crate::Ast::BinaryOp::Or => ComputeFnId(23),  // or_bool
-            // 其他运算（RefEq/BitAnd/Shl/Range 等）本阶段用 noop，留后续
+            crate::Ast::BinaryOp::RefEq => ComputeFnId(260),          // ref_eq
+            crate::Ast::BinaryOp::RefNeq => ComputeFnId(261),         // ref_neq
+            crate::Ast::BinaryOp::ConcatList => ComputeFnId(262),     // concat_list
+            crate::Ast::BinaryOp::Range => ComputeFnId(263),          // range
+            crate::Ast::BinaryOp::RangeInclusive => ComputeFnId(264), // range_inclusive
+            crate::Ast::BinaryOp::Elvis => ComputeFnId(265),          // elvis
             _ => ComputeFnId(0),
+        }
+    }
+
+    /// 根据 op + operand 表达式类型选择一元运算 compute_fn id。
+    fn select_unary_compute_fn(
+        &self,
+        op: crate::Ast::UnaryOp,
+        operand_expr: crate::Ast::ExprId,
+    ) -> ComputeFnId {
+        let ty_name = self.expr_type_name(operand_expr).unwrap_or("i32");
+        let is_float = matches!(ty_name, "f16" | "f32" | "f64" | "f128");
+        let base = Self::arith_base(ty_name);
+        match op {
+            crate::Ast::UnaryOp::Not => ComputeFnId(24), // not_bool
+            crate::Ast::UnaryOp::Neg => {
+                // 整数 neg 在 base+10，浮点 neg 在 base+5
+                if let Some(b) = base {
+                    let off = if is_float { 5 } else { 10 };
+                    return ComputeFnId(b + off);
+                }
+                ComputeFnId(126) // 回退 neg_i32
+            }
+            crate::Ast::UnaryOp::BitNot => {
+                // 仅整数，bitnot 在 base+11
+                if let Some(b) = base {
+                    return ComputeFnId(b + 11);
+                }
+                ComputeFnId(127) // 回退 bitnot_i32
+            }
         }
     }
 
@@ -2611,25 +3241,121 @@ impl<'a> IrBuilder<'a> {
         lhs: crate::Ast::ExprId,
         rhs: crate::Ast::ExprId,
     ) -> NodeId {
-        let lhs_node = self.compile_expr(lhs);
-        let rhs_node = self.compile_expr(rhs);
+        // 操作数不在尾位置：其值被运算节点消费，而非直接返回。
+        let lhs_node = self.compile_subexpr(lhs);
+        let rhs_node = self.compile_subexpr(rhs);
         let inputs_offset = self.graph.inputs_pool.push(&[lhs_node, rhs_node]);
         let compute_fn = self.select_binary_compute_fn(op, lhs);
-        self.graph.add_node(Node {
+        let node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
             input_count: 2,
             inputs_offset,
             compute_fn,
+        });
+        // 编译期标记 SIMD 批量化信息：标量类型 + 运算 → 运行期按 (tag,op) 分组批算
+        if let Some(info) = self.binary_batch_info(op, lhs) {
+            self.graph.set_batch_info(node, info);
+        }
+        node
+    }
+
+    /// 将 Glue BinaryOp + 类型名映射为 BatchInfo（可批量化的运算+标量类型组合）。
+    ///
+    /// 返回 None 表示该运算不可 SIMD 批量化（如 And/Or/RefEq/ConcatList/Range
+    /// 等非标量算术运算，或非标量类型）。
+    fn binary_batch_info(
+        &self,
+        op: crate::Ast::BinaryOp,
+        lhs_expr: crate::Ast::ExprId,
+    ) -> Option<BatchInfo> {
+        use crate::Ast::BinaryOp;
+        use crate::Value::{BinOp as VBinOp, CmpOp as VCmpOp, ScalarTag};
+
+        let ty = self.expr_type_name(lhs_expr)?;
+        let tag = Self::ty_name_to_scalar_tag(ty)?;
+        let is_float = matches!(ty, "f16" | "f32" | "f64" | "f128");
+
+        let batch_op = match op {
+            BinaryOp::Add => BatchOp::Bin(VBinOp::Add),
+            BinaryOp::Sub => BatchOp::Bin(VBinOp::Sub),
+            BinaryOp::Mul => BatchOp::Bin(VBinOp::Mul),
+            BinaryOp::Div => BatchOp::Bin(VBinOp::Div),
+            BinaryOp::Mod => BatchOp::Bin(VBinOp::Mod),
+            BinaryOp::BitAnd if !is_float => BatchOp::Bin(VBinOp::Band),
+            BinaryOp::BitOr if !is_float => BatchOp::Bin(VBinOp::Bor),
+            BinaryOp::BitXor if !is_float => BatchOp::Bin(VBinOp::Bxor),
+            BinaryOp::Shl if !is_float => BatchOp::Bin(VBinOp::Shl),
+            BinaryOp::Shr if !is_float => BatchOp::Bin(VBinOp::Shr),
+            BinaryOp::Eq => BatchOp::Cmp(VCmpOp::Eq),
+            BinaryOp::NotEq => BatchOp::Cmp(VCmpOp::Ne),
+            BinaryOp::Lt => BatchOp::Cmp(VCmpOp::Lt),
+            BinaryOp::Gt => BatchOp::Cmp(VCmpOp::Gt),
+            BinaryOp::LtEq => BatchOp::Cmp(VCmpOp::Le),
+            BinaryOp::GtEq => BatchOp::Cmp(VCmpOp::Ge),
+            // And/Or/RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis → 不可批量化
+            _ => return None,
+        };
+        Some(BatchInfo { tag, op: batch_op })
+    }
+
+    /// 将 Glue UnaryOp + 类型名映射为 BatchInfo。
+    ///
+    /// Neg（整数/浮点取负）和 BitNot（整数按位取反）可批量化；
+    /// Not（bool 逻辑非）不走 SIMD 批算。
+    fn unary_batch_info(
+        &self,
+        op: crate::Ast::UnaryOp,
+        operand_expr: crate::Ast::ExprId,
+    ) -> Option<BatchInfo> {
+        use crate::Ast::UnaryOp;
+        use crate::Value::UnaryOp as VUnaryOp;
+
+        let ty = self.expr_type_name(operand_expr)?;
+        let tag = Self::ty_name_to_scalar_tag(ty)?;
+        let is_float = matches!(ty, "f16" | "f32" | "f64" | "f128");
+
+        let batch_op = match op {
+            UnaryOp::Neg => BatchOp::Unary(VUnaryOp::Neg),
+            UnaryOp::BitNot if !is_float => BatchOp::Unary(VUnaryOp::Bnot),
+            // Not（bool 逻辑非）→ 不可批量化
+            _ => return None,
+        };
+        Some(BatchInfo { tag, op: batch_op })
+    }
+
+    /// 类型名 → ScalarTag 映射（仅标量类型可批量化）。
+    fn ty_name_to_scalar_tag(ty: &str) -> Option<crate::Value::ScalarTag> {
+        use crate::Value::ScalarTag;
+        Some(match ty {
+            "i8" => ScalarTag::I8,
+            "i16" => ScalarTag::I16,
+            "i32" => ScalarTag::I32,
+            "i64" => ScalarTag::I64,
+            "i128" => ScalarTag::I128,
+            "u8" => ScalarTag::U8,
+            "u16" => ScalarTag::U16,
+            "u32" => ScalarTag::U32,
+            "u64" => ScalarTag::U64,
+            "u128" => ScalarTag::U128,
+            "f32" => ScalarTag::F32,
+            "f64" => ScalarTag::F64,
+            "bool" => ScalarTag::Bool,
+            "char" => ScalarTag::Char,
+            "isize" => ScalarTag::Isize,
+            "usize" => ScalarTag::Usize,
+            "f16" => ScalarTag::F16,
+            "f128" => ScalarTag::F128,
+            _ => return None,
         })
     }
 
     /// 编译 cast 调用：__cast_to<T>(x) / __cast_try_to<T>(x)。
     ///
     /// 从 type_args 获取目标类型名 T，从 args[0] 的 Sema 类型获取源类型名 S，
-    /// 映射到具体的 `__cast_S_to_Y` 函数调用。
+    /// 通过 `cast_mangled_name` 注册表解析为具体函数名并调用。
     fn compile_cast_call(
         &mut self,
-        name: &str,
+        _name: &str,
         args: &[crate::Ast::ExprId],
         type_args: Option<&[crate::Ast::TypeRef]>,
     ) -> NodeId {
@@ -2649,19 +3375,8 @@ impl<'a> IrBuilder<'a> {
         // 获取源类型名（从 Sema expr_types）
         let source_ty = self.expr_type_name(args[0]).unwrap_or("i64");
 
-        // 特殊类型对：str/bytes 等非数值 cast
-        if target_ty == "str" {
-            if source_ty == "u8[]" || source_ty == "bytes" {
-                // cast(bytes).to(str) → __cast_bytes_to_str
-                return self.compile_simple_call("__cast_bytes_to_str", args);
-            }
-            if source_ty == "char" {
-                return self.compile_simple_call("__cast_char_to_str", args);
-            }
-        }
-
-        // 数值类型 cast：映射到 __cast_S_to_T
-        let mangled = format!("__cast_{}_to_{}", source_ty, target_ty);
+        // 注册表驱动：特殊转换对查表，其余按默认 __cast_{S}_to_{T} 命名
+        let mangled = cast_mangled_name(source_ty, target_ty);
         self.compile_simple_call(&mangled, args)
     }
 
@@ -2671,7 +3386,7 @@ impl<'a> IrBuilder<'a> {
     fn compile_simple_call(&mut self, name: &str, args: &[crate::Ast::ExprId]) -> NodeId {
         let mut inputs = Vec::with_capacity(args.len());
         for &arg in args {
-            inputs.push(self.compile_expr(arg));
+            inputs.push(self.compile_subexpr(arg));
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
         let call_node = self.graph.add_node(Node {
@@ -2698,36 +3413,37 @@ impl<'a> IrBuilder<'a> {
         let callee_expr = self.current_module().arena.expr(callee);
 
         // 内置 Throw 构造器检测：Ok(val) / Err(record)
-        // 错误类型（IOError 等）现为普通 ADT，走下方 fallback record 构造路径
+        // 通过 THROW_CTORS 注册表查表降级，错误类型（IOError 等）走下方 record 构造路径
         if let crate::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
-                match *name {
-                    "Ok" => {
+                if let Some(lower) = THROW_CTORS.iter().find_map(|(n, l)| (*n == *name).then_some(l)) {
+                    return match lower {
                         // Ok(val) → compute_throw_ok（idx 44），输入 = val
-                        let mut inputs = Vec::with_capacity(args.len());
-                        for &arg in args {
-                            inputs.push(self.compile_expr(arg));
+                        ThrowCtorLower::Ok => {
+                            let mut inputs = Vec::with_capacity(args.len());
+                            for &arg in args {
+                                inputs.push(self.compile_subexpr(arg));
+                            }
+                            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                            self.graph.add_node(Node {
+                                kind: NodeKind::Call,
+                                input_count: inputs.len() as u8,
+                                inputs_offset,
+                                compute_fn: ComputeFnId(44), // throw_ok
+                            })
                         }
-                        let inputs_offset = self.graph.inputs_pool.push(&inputs);
-                        return self.graph.add_node(Node {
-                            kind: NodeKind::Call,
-                            input_count: inputs.len() as u8,
-                            inputs_offset,
-                            compute_fn: ComputeFnId(44), // throw_ok
-                        });
-                    }
-                    "Err" => {
-                        // Err(...) → 先 record_construct，再 throw_err 包装
-                        let inner = self.compile_record_like("Error", args);
-                        let inputs_offset = self.graph.inputs_pool.push(&[inner]);
-                        return self.graph.add_node(Node {
-                            kind: NodeKind::Call,
-                            input_count: 1,
-                            inputs_offset,
-                            compute_fn: ComputeFnId(45), // throw_err
-                        });
-                    }
-                    _ => {}
+                        // Err(...) → 先 record_construct，再 throw_err 包装（idx 45）
+                        ThrowCtorLower::Err => {
+                            let inner = self.compile_record_like("Error", args);
+                            let inputs_offset = self.graph.inputs_pool.push(&[inner]);
+                            self.graph.add_node(Node {
+                                kind: NodeKind::Call,
+                                input_count: 1,
+                                inputs_offset,
+                                compute_fn: ComputeFnId(45), // throw_err
+                            })
+                        }
+                    };
                 }
             }
         }
@@ -2742,7 +3458,7 @@ impl<'a> IrBuilder<'a> {
                     // 编译为记录构造（compute_record_construct = 29）
                     let mut inputs = Vec::with_capacity(args.len());
                     for &arg in args {
-                        inputs.push(self.compile_expr(arg));
+                        inputs.push(self.compile_subexpr(arg));
                     }
                     let inputs_offset = self.graph.inputs_pool.push(&inputs);
                     let node = self.graph.add_node(Node {
@@ -2761,14 +3477,18 @@ impl<'a> IrBuilder<'a> {
         }
 
         // 闭包调用检测：callee 是 Ident，非已知函数，但在作用域中绑定（变量持有 Closure）
-        // → 用 compute_closure_call（idx 41），inputs[0] = 闭包值节点，inputs[1..] = 调用参数
+        // → 用 compute_closure_call（idx 41），inputs[0] = 闭包值节点，inputs[1..1+param_count] = 调用参数
+        // 末尾追加 current_effect 作为隐式依赖（确保 Call 在前序 effect 完成后才执行）
         if let crate::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
                 if let Some(closure_node) = self.lookup_var(name) {
-                    let mut inputs = Vec::with_capacity(args.len() + 1);
+                    let mut inputs = Vec::with_capacity(args.len() + 2);
                     inputs.push(closure_node);
                     for &arg in args {
-                        inputs.push(self.compile_expr(arg));
+                        inputs.push(self.compile_subexpr(arg));
+                    }
+                    if let Some(eff) = self.current_effect {
+                        inputs.push(eff);
                     }
                     let inputs_offset = self.graph.inputs_pool.push(&inputs);
                     return self.graph.add_node(Node {
@@ -2782,11 +3502,15 @@ impl<'a> IrBuilder<'a> {
         }
 
         // @extern("C") FFI 调用检测：不启动子帧，直接调用 Ffi::wrapper
+        // 末尾追加 current_effect 作为隐式依赖（确保 FFI Call 在前序 effect 完成后才执行）
         if let crate::Ast::Expr::Ident(name) = &callee_expr.node {
             if self.is_extern_c_func(name) {
-                let mut inputs = Vec::with_capacity(args.len());
+                let mut inputs = Vec::with_capacity(args.len() + 1);
                 for &arg in args {
-                    inputs.push(self.compile_expr(arg));
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                if let Some(eff) = self.current_effect {
+                    inputs.push(eff);
                 }
                 let inputs_offset = self.graph.inputs_pool.push(&inputs);
                 let node = self.graph.add_node(Node {
@@ -2801,9 +3525,13 @@ impl<'a> IrBuilder<'a> {
         }
 
         // 普通函数调用
-        let mut inputs = Vec::with_capacity(args.len());
+        // 末尾追加 current_effect 作为隐式依赖（确保 Call 在前序 effect 完成后才执行）
+        let mut inputs = Vec::with_capacity(args.len() + 1);
         for &arg in args {
-            inputs.push(self.compile_expr(arg));
+            inputs.push(self.compile_subexpr(arg));
+        }
+        if let Some(eff) = self.current_effect {
+            inputs.push(eff);
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
         // 默认 sync call compute_fn（idx 36），async 函数用 compute_async_call_launch（idx 39）
@@ -2819,10 +3547,19 @@ impl<'a> IrBuilder<'a> {
             if let Some(&target_sg) = self.func_subgraphs.get(*name) {
                 self.graph.set_call_target(call_node, target_sg);
                 // async 函数：切换 compute_fn 为 compute_async_call_launch（idx 39）
-                if let Some(sg) = self.graph.subgraphs.get(target_sg.0 as usize) {
+                let is_async = if let Some(sg) = self.graph.subgraphs.get(target_sg.0 as usize) {
                     if sg.has_suspend {
                         self.graph.nodes[call_node.0 as usize].compute_fn = ComputeFnId(39);
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+                // 尾调用标记：尾位置 + 同步函数 + 有 call_target → 运行时 switch_subgraph 帧复用
+                if self.in_tail_position && !is_async {
+                    self.graph.set_tail_call(call_node);
                 }
             }
         }
@@ -2924,81 +3661,81 @@ impl<'a> IrBuilder<'a> {
 
     /// 编译方法调用。
     ///
-    /// 内置方法（len/is_empty 等）编译为专用 compute_fn 节点。
-    /// 类型方法编译为 Call 节点，通过 mangled name ("TypeName.method") 查找 call_target。
+    /// 内置 nullary 方法（await/cancel/len 等）通过 `NULLARY_BUILTIN_METHODS`
+    /// 注册表查表降级，避免方法名特判分支。类型/trait 方法编译为 Call 节点，
+    /// 通过 mangled name ("TypeName.method") 查找 call_target。
     fn compile_method_call(
         &mut self,
         recv: crate::Ast::ExprId,
         method: &str,
         args: &[crate::Ast::ExprId],
     ) -> NodeId {
-        let recv_node = self.compile_expr(recv);
+        let recv_node = self.compile_subexpr(recv);
 
-        // await 方法：编译为 Await 节点 + EventSource 声明节点
-        // spec 4.5：await 等待事件源就绪，未就绪→帧挂起
-        if method == "await" && args.is_empty() {
-            // 创建 EventSource 声明节点（input_count=0，永不就绪）
-            let es_inputs_offset = self.graph.inputs_pool.push(&[]);
-            let es_node = self.graph.add_node(Node {
-                kind: NodeKind::EventSource,
-                input_count: 0,
-                inputs_offset: es_inputs_offset,
-                compute_fn: ComputeFnId(0), // noop
-            });
-
-            // 事件种类判定：从 recv 类型推断
-            // Async<T> → AsyncJoin, Channel<T>/Receiver<T> → Channel, Timer → Timer
-            // 简化：默认 AsyncJoin（5a-2 主要支持 await async handle）
-            let event_kind = self.infer_event_source_kind(recv);
-            let current_sg = self.current_function_sg;
-            let es_decl = EventSourceDecl {
-                node: es_node,
-                kind: event_kind,
-            };
-            // 注册到当前子图的 event_source_decls
-            if let Some(sg_id) = current_sg {
-                if let Some(sg) = self.graph.subgraphs.get_mut(sg_id.0 as usize) {
-                    sg.event_source_decls.push(es_decl);
-                }
+        // 注册表驱动：nullary 内置方法查表降级
+        if args.is_empty() {
+            if let Some(lower) = NULLARY_BUILTIN_METHODS
+                .iter()
+                .find_map(|(n, l)| (*n == method).then_some(l))
+            {
+                return match lower {
+                    // await：EventSource 声明 + Await 节点（spec 4.5，未就绪→帧挂起）
+                    BuiltinMethodLower::Await => {
+                        let es_inputs_offset = self.graph.inputs_pool.push(&[]);
+                        let es_node = self.graph.add_node(Node {
+                            kind: NodeKind::EventSource,
+                            input_count: 0,
+                            inputs_offset: es_inputs_offset,
+                            compute_fn: ComputeFnId(0), // noop
+                        });
+                        let event_kind = self.infer_event_source_kind(recv);
+                        let current_sg = self.current_function_sg;
+                        let es_decl = EventSourceDecl {
+                            node: es_node,
+                            kind: event_kind,
+                        };
+                        if let Some(sg_id) = current_sg {
+                            if let Some(sg) = self.graph.subgraphs.get_mut(sg_id.0 as usize) {
+                                sg.event_source_decls.push(es_decl);
+                            }
+                        }
+                        let await_inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+                        let await_node = self.graph.add_node(Node {
+                            kind: NodeKind::Await,
+                            input_count: 1,
+                            inputs_offset: await_inputs_offset,
+                            compute_fn: ComputeFnId(38), // compute_await
+                        });
+                        self.graph.set_await_event_source(await_node, es_node);
+                        await_node
+                    }
+                    // 单节点一元运算（cancel/len 等）
+                    BuiltinMethodLower::UnOp(idx) => {
+                        let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+                        self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset,
+                            compute_fn: ComputeFnId(*idx),
+                        })
+                    }
+                };
             }
+        }
 
-            // 创建 Await 节点（inputs=[recv_node], compute_fn=compute_await idx 38）
-            // EventSource 节点作为元数据引用存储在 await_event_sources 表，不参与就绪判定
-            let await_inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
-            let await_node = self.graph.add_node(Node {
-                kind: NodeKind::Await,
-                input_count: 1,
-                inputs_offset: await_inputs_offset,
-                compute_fn: ComputeFnId(38), // compute_await
-            });
-            self.graph.set_await_event_source(await_node, es_node);
-            await_node
-        } else if method == "cancel" && args.is_empty() {
-            // cancel 方法：async_handle.cancel() → 标记 pending_cancel
-            let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
-            self.graph.add_node(Node {
-                kind: NodeKind::UnOp,
-                input_count: 1,
-                inputs_offset,
-                compute_fn: ComputeFnId(42), // cancel_async_handle
-            })
-        } else if method == "len" && args.is_empty() {
-            let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
-            self.graph.add_node(Node {
-                kind: NodeKind::UnOp,
-                input_count: 1,
-                inputs_offset,
-                compute_fn: ComputeFnId(35), // array_len
-            })
-        } else {
+        {
             // 类型/trait 方法：编译为 Call 节点，按以下优先级绑定目标：
             //   路径3  — trait 静态分派（recv 类型已知 → witness_table → func_subgraphs）
             //   路径3b — trait object 动态分派（vtable，运行时从 TraitVal 查方法子图）
             //   路径2  — 类型自有方法（func_subgraphs 后缀匹配）
-            let mut inputs = Vec::with_capacity(1 + args.len());
+            // 末尾追加 current_effect 作为隐式依赖（确保 Call 在前序 effect 完成后才执行）
+            let mut inputs = Vec::with_capacity(2 + args.len());
             inputs.push(recv_node);
             for &arg in args {
-                inputs.push(self.compile_expr(arg));
+                inputs.push(self.compile_subexpr(arg));
+            }
+            if let Some(eff) = self.current_effect {
+                inputs.push(eff);
             }
             let inputs_offset = self.graph.inputs_pool.push(&inputs);
             let call_node = self.graph.add_node(Node {
@@ -3107,14 +3844,14 @@ impl<'a> IrBuilder<'a> {
 
     /// 编译字段访问。
     ///
-    /// 查 Sema field_accesses 获取 field_idx，绑定 compute_record_field_get。
+    /// 绑定 compute_record_field_get，仅存储 field 名称作为运行时按名查找依据。
     fn compile_field_access(
         &mut self,
-        expr_id: crate::Ast::ExprId,
+        _expr_id: crate::Ast::ExprId,
         recv: crate::Ast::ExprId,
         field: &str,
     ) -> NodeId {
-        let recv_node = self.compile_expr(recv);
+        let recv_node = self.compile_subexpr(recv);
         let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
         let node = self.graph.add_node(Node {
             kind: NodeKind::FieldAccess,
@@ -3122,25 +3859,16 @@ impl<'a> IrBuilder<'a> {
             inputs_offset,
             compute_fn: ComputeFnId(30), // record_field_get
         });
-        // 查 Sema field_accesses 获取 field_idx（可能 miss → fallback 0）
-        let key = expr_id_to_key(expr_id);
-        let field_idx = self
-            .sema
-            .field_accesses
-            .get(&key)
-            .map(|info| info.field_idx)
-            .unwrap_or(0);
-        self.graph.set_field_access_info(node, field_idx);
-        // 始终存储 field 名称，运行时 compute_record_field_get 优先按名称查找
-        // （Sema 可能未正确设置 field_idx，按名称查找更可靠）
+        // 统一存储 field 名称作为运行时唯一查找依据：
+        // Record/Adt 均通过 find_field(name) 按名取值，无需编译期 field_idx
         self.graph.set_field_set_name(node, field.to_string());
         node
     }
 
     /// 编译索引访问。
     fn compile_index(&mut self, recv: crate::Ast::ExprId, index: crate::Ast::ExprId) -> NodeId {
-        let recv_node = self.compile_expr(recv);
-        let index_node = self.compile_expr(index);
+        let recv_node = self.compile_subexpr(recv);
+        let index_node = self.compile_subexpr(index);
         let inputs_offset = self.graph.inputs_pool.push(&[recv_node, index_node]);
         self.graph.add_node(Node {
             kind: NodeKind::BinOp,
@@ -3156,7 +3884,7 @@ impl<'a> IrBuilder<'a> {
     fn compile_record_like(&mut self, type_name: &str, args: &[crate::Ast::ExprId]) -> NodeId {
         let mut inputs = Vec::with_capacity(args.len());
         for &arg in args {
-            inputs.push(self.compile_expr(arg));
+            inputs.push(self.compile_subexpr(arg));
         }
         let field_names: Vec<Option<String>> = (0..args.len())
             .map(|i| Some(format!("_{}", i)))
@@ -3183,7 +3911,7 @@ impl<'a> IrBuilder<'a> {
         let mut inputs = Vec::with_capacity(fields.len());
         let mut field_names = Vec::with_capacity(fields.len());
         for field in fields {
-            inputs.push(self.compile_expr(field.value));
+            inputs.push(self.compile_subexpr(field.value));
             field_names.push(Some(field.name.to_string()));
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
@@ -3207,7 +3935,7 @@ impl<'a> IrBuilder<'a> {
     fn compile_array_lit(&mut self, elements: &[crate::Ast::ExprRef]) -> NodeId {
         let mut inputs = Vec::with_capacity(elements.len());
         for &elem in elements {
-            inputs.push(self.compile_expr(elem));
+            inputs.push(self.compile_subexpr(elem));
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
         self.graph.add_node(Node {
@@ -3233,7 +3961,11 @@ impl<'a> IrBuilder<'a> {
         for &stmt_id in stmts {
             // 设置 current_effect 让后续效果节点（如 WriteBack）依赖前一个效果
             self.current_effect = last_effect;
+            // 语句不在尾位置（Return 内部会为其 value 恢复 in_tail_position = true）
+            let prev_tail = self.in_tail_position;
+            self.in_tail_position = false;
             let effect = self.compile_stmt(stmt_id);
+            self.in_tail_position = prev_tail;
             if let Some(eff) = effect {
                 // 控制信号（Return/Break/Continue/Throw）必须延迟到前序副作用完成后才触发：
                 // 将信号从 eff 移到 chain_effects 创建的 seq 节点上，
@@ -3251,7 +3983,9 @@ impl<'a> IrBuilder<'a> {
                 last_effect = Some(chained);
             }
         }
-        self.current_effect = prev_effect;
+        // trailing 表达式编译时继承 block 内 effect 链，
+        // 确保 trailing 中的 Call 节点依赖前序 effect（与 stmts 中的行为一致）
+        self.current_effect = last_effect;
         let result = match trailing {
             Some(expr_id) => {
                 let result_node = self.compile_expr(*expr_id);
@@ -3259,6 +3993,7 @@ impl<'a> IrBuilder<'a> {
             }
             None => last_effect.unwrap_or_else(|| self.compile_void_const()),
         };
+        self.current_effect = prev_effect;
         self.exit_scope();
         result
     }
@@ -3271,16 +4006,16 @@ impl<'a> IrBuilder<'a> {
         match stmt {
             crate::Ast::Stmt::ValDecl { name, value, .. }
             | crate::Ast::Stmt::VarDecl { name, value, .. } => {
-                let value_node = self.compile_expr(*value);
+                let value_node = self.compile_subexpr(*value);
                 self.bind_var(name, value_node);
-                None
+                Some(value_node)
             }
             crate::Ast::Stmt::Expression { expr } => {
-                let expr_node = self.compile_expr(*expr);
+                let expr_node = self.compile_subexpr(*expr);
                 Some(expr_node)
             }
             crate::Ast::Stmt::Assignment { target, value } => {
-                let raw_val = self.compile_expr(*value);
+                let raw_val = self.compile_subexpr(*value);
                 // 链接 current_effect：确保赋值表达式在前序效果（如 if-Gate with continue）
                 // 完成后才执行。防止 continue 后的语句提前执行。
                 let val_node = self.chain_effects(self.current_effect, raw_val);
@@ -3305,8 +4040,8 @@ impl<'a> IrBuilder<'a> {
                 None
             }
             crate::Ast::Stmt::FieldAssignment { object, field, value } => {
-                let obj_node = self.compile_expr(*object);
-                let val_node = self.compile_expr(*value);
+                let obj_node = self.compile_subexpr(*object);
+                let val_node = self.compile_subexpr(*value);
                 let inputs_offset = self.graph.inputs_pool.push(&[obj_node, val_node]);
                 let set_node = self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
@@ -3318,9 +4053,9 @@ impl<'a> IrBuilder<'a> {
                 Some(set_node)
             }
             crate::Ast::Stmt::CompoundAssignment { target, op, value } => {
-                let val_node = self.compile_expr(*value);
+                let val_node = self.compile_subexpr(*value);
                 let target_expr = &self.current_module().arena.expr(*target).node;
-                let bin_compute = self.compound_assign_op_to_compute_fn(*op);
+                let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
                 if let crate::Ast::Expr::Ident(name) = target_expr {
                     let cur_node = self
                         .lookup_var(name)
@@ -3346,14 +4081,20 @@ impl<'a> IrBuilder<'a> {
             }
             crate::Ast::Stmt::Return { value } => {
                 let return_node = match value {
-                    Some(expr_id) => self.compile_expr(*expr_id),
+                    Some(expr_id) => {
+                        let prev_tail = self.in_tail_position;
+                        self.in_tail_position = true;
+                        let r = self.compile_expr(*expr_id);
+                        self.in_tail_position = prev_tail;
+                        r
+                    }
                     None => self.compile_void_const(),
                 };
                 self.graph.set_control_signal(return_node, SignalKind::Return);
                 Some(return_node)
             }
             crate::Ast::Stmt::Throw { expr } => {
-                let expr_node = self.compile_expr(*expr);
+                let expr_node = self.compile_subexpr(*expr);
                 // 包装为 ThrowVal(Err)
                 let wrap_off = self.graph.inputs_pool.push(&[expr_node]);
                 let wrap_node = self.graph.add_node(Node {
@@ -3395,7 +4136,7 @@ impl<'a> IrBuilder<'a> {
                 body,
             } => {
                 // For 循环 = iterable（已是迭代器）→ 递归子图 (next() + is_null + body)
-                let iterable_node = self.compile_expr(*iterable);
+                let iterable_node = self.compile_subexpr(*iterable);
                 // 从 Sema 获取 iterable 类型名（决定静态分派目标）
                 let iter_type_name = self.lookup_expr_type_name(*iterable);
                 // 注册 For 循环子图（静态分派：按类型名绑定 next()）
@@ -3439,10 +4180,16 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// 编译函数为子图（支持跨模块：用户模块 + builtin 模块）。
+    ///
+    /// 若函数不存在或声明类型不匹配，记录编译错误并返回占位子图（错误恢复）。
     pub fn compile_function(&mut self, name: &str) -> SubGraphId {
-        let location = self
-            .find_function_location(name)
-            .unwrap_or_else(|| panic!("function {} not found", name));
+        let location = match self.find_function_location(name) {
+            Some(loc) => loc,
+            None => {
+                self.errors.push(format!("function {} not found", name));
+                return self.register_subgraph_placeholder(name, 0, false);
+            }
+        };
 
         let module = match location {
             None => self.module,
@@ -3464,9 +4211,17 @@ impl<'a> IrBuilder<'a> {
                     params,
                     ..
                 } => (*body, *is_async, params.clone()),
-                _ => panic!("{} is not a function", name),
+                _ => {
+                    self.errors.push(format!("{} is not a function", name));
+                    self.compiling_builtin = prev_builtin;
+                    return self.register_subgraph_placeholder(name, 0, false);
+                }
             },
-            None => panic!("function {} not found", name),
+            None => {
+                self.errors.push(format!("function {} not found", name));
+                self.compiling_builtin = prev_builtin;
+                return self.register_subgraph_placeholder(name, 0, false);
+            }
         };
         let param_count = params.len();
 
@@ -3497,7 +4252,13 @@ impl<'a> IrBuilder<'a> {
             self.bind_var(param.name, param_node);
         }
 
-        let return_node = self.compile_expr(body_expr);
+        let return_node = {
+            let prev_tail = self.in_tail_position;
+            self.in_tail_position = true;
+            let r = self.compile_expr(body_expr);
+            self.in_tail_position = prev_tail;
+            r
+        };
         self.exit_scope();
         self.current_function_sg = None;
         self.compiling_builtin = prev_builtin;
@@ -3878,31 +4639,32 @@ mod tests {
     }
 
     #[test]
-    fn test_value_slot_unready() {
-        let slot = ValueSlot::unready();
-        assert!(!slot.ready);
-        assert_eq!(slot.refcount, 0);
+    fn test_value_table_unready() {
+        let vt = ValueTable::with_unready(3);
+        assert_eq!(vt.len(), 3);
+        assert!(!vt.ready[0]);
+        assert_eq!(vt.refcounts[0], 0);
     }
 
     #[test]
-    fn test_value_slot_set_ready() {
-        let mut slot = ValueSlot::unready();
+    fn test_value_table_set_ready() {
+        let mut vt = ValueTable::with_unready(2);
         let handle = crate::Value::Value::i32(42);
-        slot.set_value(handle.clone(), 2);
-        assert!(slot.ready);
+        vt.set_value(0, handle, 2);
+        assert!(vt.ready[0]);
         // Value 未实现 PartialEq，通过 as_i32 比较值
-        assert_eq!(slot.value.as_i32(), 42);
-        assert_eq!(slot.refcount, 2);
+        assert_eq!(vt.values[0].as_i32(), 42);
+        assert_eq!(vt.refcounts[0], 2);
     }
 
     #[test]
-    fn test_value_slot_decref() {
-        let mut slot = ValueSlot::unready();
-        slot.set_value(crate::Value::Value::NULL, 2);
-        assert!(slot.consume()); // refcount 1，未归零
-        assert!(!slot.is_consumed());
-        assert!(!slot.consume()); // refcount 0，归零
-        assert!(slot.is_consumed());
+    fn test_value_table_decref() {
+        let mut vt = ValueTable::with_unready(1);
+        vt.set_value(0, crate::Value::Value::NULL, 2);
+        assert!(vt.consume(0)); // refcount 1，未归零
+        assert!(!vt.is_consumed(0));
+        assert!(!vt.consume(0)); // refcount 0，归零
+        assert!(vt.is_consumed(0));
     }
 
     #[test]
@@ -4321,9 +5083,10 @@ mod tests {
         let module = make_test_module(arena, Vec::new());
         let mut builder = IrBuilder::new(&sema, &module);
         let node_id = builder.compile_expr(block);
-        // Ident("x") 直接返回 ValDecl 的值节点 NodeId(0)，不创建新节点
-        assert_eq!(node_id, NodeId(0));
-        assert_eq!(builder.graph.nodes.len(), 1);
+        // ValDecl 返回 effect 节点 NodeId(0)，trailing Ident("x") 查找得到 NodeId(0)，
+        // chain_effects(last_effect=Some(0), NodeId(0)) 创建 seq 节点 NodeId(1)
+        assert_eq!(node_id, NodeId(1));
+        assert_eq!(builder.graph.nodes.len(), 2);
     }
 
     #[test]
@@ -4465,7 +5228,7 @@ mod tests {
 
     #[test]
     fn test_compile_binary_binds_compute_fn() {
-        // 无 Sema 类型信息时，i32 Add → ComputeFnId(1) = add_i32
+        // 无 Sema 类型信息时，i32 Add → ComputeFnId(116) = add_i32（i32 族基址 116）
         let sema = crate::Sema::SemaResult::new();
         let mut arena = crate::Ast::AstArena::new();
         let lhs = arena.alloc_expr(
@@ -4489,7 +5252,7 @@ mod tests {
         let n = builder.compile_expr(bin);
         assert_eq!(
             builder.graph.nodes[n.0 as usize].compute_fn,
-            ComputeFnId(1)
+            ComputeFnId(116)
         );
     }
 

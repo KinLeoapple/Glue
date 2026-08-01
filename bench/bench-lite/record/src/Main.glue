@@ -1,0 +1,31 @@
+// 展开循环测试：手动展开 10 次的 10 万次循环
+import builtin.io.Console.{println}
+
+fun main(): void {
+    var sum: i64 = 0
+    var i: i64 = 0
+    while i < 100000 {
+        // 手动展开 10 次
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+        sum = (sum + i * 2 - i + 1) % 1073741824
+        i = i + 1
+    }
+    println(sum)
+}

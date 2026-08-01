@@ -71,8 +71,10 @@ fn main() {
 
     if c_files.is_empty() {
         if !glue_files.is_empty() && !find_glue_bin().exists() {
-            println!("cargo:warning=发现 @extern(\"C\") .glue 但 glue 二进制不可用，FFI 代码未生成");
-            println!("cargo:warning=请再次运行 cargo build 以自动生成");
+            println!(
+                "cargo:warning=Found @extern(\"C\") .glue but glue binary unavailable, FFI code not generated"
+            );
+            println!("cargo:warning=Please run cargo build again to generate automatically");
         }
         return;
     }
@@ -91,7 +93,9 @@ fn main() {
             if ffi_ok {
                 println!("cargo::rustc-cfg=has_extern_c");
             } else {
-                println!("cargo:warning=C 编译成功但 FFI 生成失败，跳过 has_extern_c cfg（wrapper 模块为空）");
+                println!(
+                    "cargo:warning=C compilation succeeded but FFI generation failed, skipping has_extern_c cfg (wrapper module empty)"
+                );
             }
             // 编译成功后删除 OUT_DIR 中的 .c 中间产物（不保留）
             for c_file in &c_files {
@@ -99,7 +103,7 @@ fn main() {
             }
         }
         Err(e) => {
-            println!("cargo:warning=C 编译失败，跳过 has_extern_c cfg: {}", e);
+            println!("cargo:warning=C compilation failed, skipping has_extern_c cfg: {}", e);
         }
     }
 }
@@ -115,7 +119,7 @@ fn glue_file_to_c_name(glue_file: &Path) -> String {
 
 /// 空的 FFI 模块（无 @extern("C") 函数时使用）
 fn empty_ffi_module() -> &'static str {
-    r#"// Auto-generated: 无 @extern("C") 函数
+    r#"// Auto-generated: no @extern("C") functions
 #[cfg(has_extern_c)]
 pub mod bindings {
     extern "C" {}
@@ -154,14 +158,14 @@ fn try_auto_extract_c(glue_files: &[PathBuf], out_dir: &str) {
             Ok(result) if result.status.success() => {
                 if fs::write(&c_path, &result.stdout).is_ok() {
                     println!(
-                        "cargo:warning=提取 C: {} → {}",
+                        "cargo:warning=Extracted C: {} → {}",
                         glue_file.display(),
                         c_path.display()
                     );
                 }
             }
             _ => {
-                println!("cargo:warning=C 提取失败: {}", glue_file.display());
+                println!("cargo:warning=C extraction failed: {}", glue_file.display());
             }
         }
     }
@@ -182,7 +186,7 @@ fn try_generate_ffi(glue_files: &[PathBuf]) -> Option<String> {
                 combined.push('\n');
             }
             Err(_) => {
-                println!("cargo:warning=读取失败: {}", glue_file.display());
+                println!("cargo:warning=Read failed: {}", glue_file.display());
                 return None;
             }
         }
@@ -199,7 +203,7 @@ fn try_generate_ffi(glue_files: &[PathBuf]) -> Option<String> {
     {
         Ok(child) => child,
         Err(_) => {
-            println!("cargo:warning=启动 glue debug --stage emit-ffi 失败");
+            println!("cargo:warning=Failed to start glue debug --stage emit-ffi");
             return None;
         }
     };
@@ -211,7 +215,7 @@ fn try_generate_ffi(glue_files: &[PathBuf]) -> Option<String> {
     let output = match child.wait_with_output() {
         Ok(o) => o,
         Err(_) => {
-            println!("cargo:warning=glue debug --stage emit-ffi 执行失败");
+            println!("cargo:warning=glue debug --stage emit-ffi execution failed");
             return None;
         }
     };
@@ -219,7 +223,7 @@ fn try_generate_ffi(glue_files: &[PathBuf]) -> Option<String> {
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        println!("cargo:warning=glue debug --stage emit-ffi 返回非零状态");
+        println!("cargo:warning=glue debug --stage emit-ffi returned non-zero status");
         None
     }
 }

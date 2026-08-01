@@ -5,12 +5,11 @@ use std::cmp::Ordering;
 use rustc_hash::FxHashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use rayon::prelude::*;
-use wide::{f32x4, f64x4, i32x4, i64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, CmpNe};
+use pastey::paste;
+use wide::{f32x4, f64x4, i8x16, i16x8, i32x4, i64x4, u8x16, u16x8, u32x4, u64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, CmpNe};
 
 // =========================================================================
 // 第一部分：标量基础类型（scalar.rs + char.rs）
@@ -50,6 +49,234 @@ impl F16 {
     }
     pub fn from_bits(b: u16) -> Self {
         F16(b)
+    }
+
+    // ---- IEEE 754 binary16 精确运算（不经过 f64 中转）----
+    // 布局：sign(1) | exp(5, bias=15) | fraction(10)
+    // 正规数 mantissa = (1 << 10) | fraction，共 11 位
+    // 次正规数 mantissa = fraction，指数 = 1 - bias = -14
+    // 与 F128 同一 unpack/pack 框架，因 mantissa 仅 11 位，u32 足够
+
+    fn nan_val() -> Self { F16(0x7C00 | 1) }
+    fn inf_val(sign: bool) -> Self { F16(if sign { 0xFC00 } else { 0x7C00 }) }
+    fn zero_val(sign: bool) -> Self { F16(if sign { 0x8000 } else { 0 }) }
+
+    /// 拆解为 (sign, unbiased_exp, mantissa)。
+    /// 正规数 mantissa 含隐含 1（bit 10 = 1）；次正规数/零 mantissa = fraction。
+    fn unpack(&self) -> (bool, i32, u32) {
+        let bits = self.0;
+        let sign = (bits >> 15) != 0;
+        let raw_exp = ((bits >> 10) & 0x1F) as i32;
+        let frac = (bits & 0x3FF) as u32;
+        if raw_exp == 0 {
+            (sign, 1 - 15, frac)
+        } else {
+            (sign, raw_exp - 15, frac | (1u32 << 10))
+        }
+    }
+
+    /// 将 (sign, exp, mant, sticky) 规范化并舍入为 F16。
+    /// mant 的 MSB 是隐含 1（可在任意位置），pack 负责对齐到 bit 10。
+    /// 舍入模式：round-to-nearest-even。
+    fn pack(sign: bool, exp: i32, mant: u32, sticky: bool) -> Self {
+        if mant == 0 {
+            return Self::zero_val(sign);
+        }
+        let msb = 31 - mant.leading_zeros() as i32;
+        let shift = msb - 10;
+        let mut adj_exp = exp + shift;
+        let mut m = mant;
+        let mut stk = sticky;
+        let mut guard = false;
+        if shift > 0 {
+            let sh = shift as u32;
+            if sh >= 32 {
+                m = 0;
+                stk = true;
+            } else {
+                guard = (mant >> (sh - 1)) & 1 != 0;
+                if sh > 1 {
+                    stk = stk || (mant & ((1u32 << (sh - 1)) - 1)) != 0;
+                }
+                m = mant >> sh;
+            }
+        } else if shift < 0 {
+            m = mant << (-shift as u32);
+        }
+        if m == 0 {
+            return Self::zero_val(sign);
+        }
+        let biased = adj_exp + 15;
+        if biased >= 0x1F {
+            return Self::inf_val(sign);
+        }
+        if biased <= 0 {
+            let extra = (1 - biased) as u32;
+            if extra >= 32 {
+                if guard && stk { return Self::zero_val(false); }
+                return Self::zero_val(sign);
+            }
+            if extra > 0 {
+                let new_guard = (m >> (extra - 1)) & 1 != 0;
+                if extra > 1 {
+                    stk = stk || (m & ((1u32 << (extra - 1)) - 1)) != 0;
+                }
+                guard = new_guard;
+                m >>= extra;
+            }
+            if guard && (stk || (m & 1) != 0) {
+                m = m.wrapping_add(1);
+                if m >= (1u32 << 10) {
+                    return F16((if sign { 0x8000 } else { 0 }) | (1u16 << 10));
+                }
+            }
+            return F16((if sign { 0x8000 } else { 0 }) | m as u16);
+        }
+        if guard && (stk || (m & 1) != 0) {
+            m = m.wrapping_add(1);
+            if m >= (1u32 << 11) {
+                m >>= 1;
+                adj_exp += 1;
+                if adj_exp + 15 >= 0x1F {
+                    return Self::inf_val(sign);
+                }
+            }
+        }
+        let frac = (m & 0x3FF) as u16;
+        F16((if sign { 0x8000 } else { 0 }) | (((adj_exp + 15) as u16) << 10) | frac)
+    }
+
+    pub fn neg_f16(self) -> Self {
+        F16(self.0 ^ 0x8000)
+    }
+
+    pub fn add_f16(self, other: Self) -> Self {
+        if self.is_nan() || other.is_nan() { return Self::nan_val(); }
+        if self.is_infinite() {
+            if other.is_infinite() {
+                let (sa, _, _) = self.unpack();
+                let (sb, _, _) = other.unpack();
+                return if sa == sb { self } else { Self::nan_val() };
+            }
+            return self;
+        }
+        if other.is_infinite() { return other; }
+
+        let (sa, ea, ma) = self.unpack();
+        let (sb, eb, mb) = other.unpack();
+        if ma == 0 && mb == 0 { return Self::zero_val(sa && sb); }
+        if ma == 0 { return other; }
+        if mb == 0 { return self; }
+
+        let ma_ext = ma << 2;
+        let mb_ext = mb << 2;
+        let result_exp;
+        let (aligned_a, aligned_b, stk) = if ea > eb {
+            let diff = (ea - eb) as u32;
+            result_exp = ea;
+            if diff >= 32 { (ma_ext, 0u32, mb_ext != 0) }
+            else {
+                let lost = mb_ext & ((1u32 << diff) - 1);
+                (ma_ext, mb_ext >> diff, lost != 0)
+            }
+        } else if eb > ea {
+            let diff = (eb - ea) as u32;
+            result_exp = eb;
+            if diff >= 32 { (0u32, mb_ext, ma_ext != 0) }
+            else {
+                let lost = ma_ext & ((1u32 << diff) - 1);
+                (ma_ext >> diff, mb_ext, lost != 0)
+            }
+        } else {
+            result_exp = ea;
+            (ma_ext, mb_ext, false)
+        };
+
+        let (result_sign, result_mant) = if sa == sb {
+            (sa, aligned_a.wrapping_add(aligned_b))
+        } else if aligned_a >= aligned_b {
+            (sa, aligned_a - aligned_b)
+        } else {
+            (sb, aligned_b - aligned_a)
+        };
+        if result_mant == 0 { return Self::zero_val(false); }
+        Self::pack(result_sign, result_exp - 2, result_mant, stk)
+    }
+
+    pub fn sub_f16(self, other: Self) -> Self {
+        self.add_f16(other.neg_f16())
+    }
+
+    pub fn mul_f16(self, other: Self) -> Self {
+        if self.is_nan() || other.is_nan() { return Self::nan_val(); }
+        let (sa, ea, ma) = self.unpack();
+        let (sb, eb, mb) = other.unpack();
+        let result_sign = sa ^ sb;
+        if self.is_infinite() && mb == 0 { return Self::nan_val(); }
+        if other.is_infinite() && ma == 0 { return Self::nan_val(); }
+        if self.is_infinite() || other.is_infinite() { return Self::inf_val(result_sign); }
+        if ma == 0 || mb == 0 { return Self::zero_val(result_sign); }
+
+        let result_exp = ea + eb;
+        // 11 × 11 = 22 位乘积，u32 足够
+        let prod = (ma as u32) * (mb as u32);
+        let total_bits = 32 - prod.leading_zeros() as i32;
+        let shift = total_bits - 11;
+        let (m, stk) = if shift > 0 {
+            let sh = shift as u32;
+            let lost = prod & ((1u32 << (sh - 1)) - 1);
+            (prod >> sh, lost != 0)
+        } else {
+            (prod, false)
+        };
+        Self::pack(result_sign, result_exp - 10 + shift, m, stk)
+    }
+
+    pub fn div_f16(self, other: Self) -> Self {
+        if self.is_nan() || other.is_nan() { return Self::nan_val(); }
+        let (sa, ea, ma) = self.unpack();
+        let (sb, eb, mb) = other.unpack();
+        let result_sign = sa ^ sb;
+        if self.is_infinite() && other.is_infinite() { return Self::nan_val(); }
+        if self.is_infinite() { return Self::inf_val(result_sign); }
+        if other.is_infinite() { return Self::zero_val(result_sign); }
+        if mb == 0 {
+            if ma == 0 { return Self::nan_val(); }
+            return Self::inf_val(result_sign);
+        }
+        if ma == 0 { return Self::zero_val(result_sign); }
+
+        let result_exp = ea - eb;
+        // (ma << 12) / mb，商 ~12 位，u32 足够
+        // ma/mb ∈ [0.5, 2)，(ma<<12)/mb ∈ [2^11, 2^13)，不溢出 u32
+        let quot = ((ma as u32) << 12) / mb;
+        let stk = ((ma << 12) % mb) != 0;
+        // pack 语义：值 = mant * 2^(exp - 10)
+        // 真实商 = (ma/mb) * 2^result_exp = quot * 2^(result_exp - 12)
+        // exp = result_exp - 12 + 10 = result_exp - 2
+        Self::pack(result_sign, result_exp - 2, quot, stk)
+    }
+
+    pub fn rem_f16(self, other: Self) -> Self {
+        if self.is_nan() || other.is_nan() { return Self::nan_val(); }
+        if other.is_infinite() { return self; }
+        if self.is_infinite() { return Self::nan_val(); }
+        let (_, _, mb) = other.unpack();
+        if mb == 0 { return Self::nan_val(); }
+        let (_, _, ma) = self.unpack();
+        if ma == 0 { return self; }
+
+        let quot = self.div_f16(other);
+        let q_bits = quot.0;
+        let q_exp = ((q_bits >> 10) & 0x1F) as i32 - 15;
+        let q_int = if q_exp >= 0 {
+            let shift = q_exp as u32;
+            let q_mant = ((q_bits & 0x3FF) as u32) | (1u32 << 10);
+            if shift >= 11 { 0u32 } else { q_mant >> shift }
+        } else { 0u32 };
+        let q_val = Self::from_f64(q_int as f64);
+        let prod = q_val.mul_f16(other);
+        self.sub_f16(prod)
     }
 }
 
@@ -204,6 +431,7 @@ impl F128 {
             if mant == 0 {
                 return f64::from_bits(sign << 63);
             }
+            // F128 subnormal 值转 f64 精度丢失，返回 ±0.0（已知限制）
             return f64::from_bits(sign << 63);
         }
 
@@ -228,13 +456,13 @@ impl F128 {
     pub fn is_nan(self) -> bool {
         let bits = u128::from_le_bytes(self.0);
         let exp = (bits >> 112) & 0x7FFF;
-        let mant = bits & 0xFFFFFFFFFFFFFFFFFFFFFFFFFF;
+        let mant = bits & ((1u128 << 112) - 1);
         exp == 0x7FFF && mant != 0
     }
     pub fn is_infinite(self) -> bool {
         let bits = u128::from_le_bytes(self.0);
         let exp = (bits >> 112) & 0x7FFF;
-        let mant = bits & 0xFFFFFFFFFFFFFFFFFFFFFFFFFF;
+        let mant = bits & ((1u128 << 112) - 1);
         exp == 0x7FFF && mant == 0
     }
     pub fn to_bits(self) -> [u8; 16] {
@@ -242,6 +470,399 @@ impl F128 {
     }
     pub fn from_bits(b: [u8; 16]) -> Self {
         F128(b)
+    }
+
+    // ---- IEEE 754 binary128 精确运算（不经过 f64 中转）----
+    // 布局：sign(1) | exp(15, bias=16383) | fraction(112)
+    // 正规数 mantissa = (1 << 112) | fraction，共 113 位
+    // 次正规数 mantissa = fraction，指数 = 1 - bias = -16382
+
+    fn nan_val() -> Self {
+        F128(((0x7FFFu128 << 112) | 1).to_le_bytes())
+    }
+    fn inf_val(sign: bool) -> Self {
+        F128((((sign as u128) << 127) | (0x7FFFu128 << 112)).to_le_bytes())
+    }
+    fn zero_val(sign: bool) -> Self {
+        F128(((sign as u128) << 127).to_le_bytes())
+    }
+
+    /// 拆解为 (sign, unbiased_exp, mantissa)。
+    /// 正规数 mantissa 含隐含 1（bit 112 = 1）；次正规数/零 mantissa = fraction。
+    fn unpack(&self) -> (bool, i32, u128) {
+        let bits = u128::from_le_bytes(self.0);
+        let sign = (bits >> 127) != 0;
+        let raw_exp = ((bits >> 112) & 0x7FFF) as i32;
+        let frac = bits & ((1u128 << 112) - 1);
+        if raw_exp == 0 {
+            (sign, 1 - 16383, frac)
+        } else {
+            (sign, raw_exp - 16383, frac | (1u128 << 112))
+        }
+    }
+
+    /// 将 (sign, exp, mant, sticky) 规范化并舍入为 F128。
+    /// mant 的 MSB 是隐含 1（可以在任意位置），pack 负责对齐到 bit 112。
+    /// sticky 表示低于 mant 最低有效位是否有非零信息。
+    /// 舍入模式：round-to-nearest-even。
+    fn pack(sign: bool, exp: i32, mant: u128, sticky: bool) -> Self {
+        if mant == 0 {
+            // 值极小，round-to-nearest-even 向下到 0
+            return Self::zero_val(sign);
+        }
+
+        // 规范化：将 MSB 对齐到 bit 112
+        let msb = 127 - mant.leading_zeros() as i32;
+        let shift = msb - 112;
+        let mut adj_exp = exp + shift;
+        let mut m = mant;
+        let mut stk = sticky;
+
+        // guard 位：右移时移出的最高位
+        let mut guard = false;
+        if shift > 0 {
+            let sh = shift as u32;
+            if sh >= 128 {
+                m = 0;
+                guard = false;
+                stk = true;
+            } else {
+                guard = (mant >> (sh - 1)) & 1 != 0;
+                if sh > 1 {
+                    stk = stk || (mant & ((1u128 << (sh - 1)) - 1)) != 0;
+                }
+                m = mant >> sh;
+            }
+        } else if shift < 0 {
+            m = mant << (-shift as u32);
+        }
+
+        if m == 0 {
+            return Self::zero_val(sign);
+        }
+
+        let biased = adj_exp + 16383;
+
+        // 溢出 → ±Inf
+        if biased >= 0x7FFF {
+            return Self::inf_val(sign);
+        }
+
+        // 次正规数或下溢
+        if biased <= 0 {
+            let extra = (1 - biased) as u32;
+            if extra >= 128 {
+                // 完全下溢
+                if guard && stk {
+                    return Self::zero_val(false); // 0 是偶数
+                }
+                return Self::zero_val(sign);
+            }
+            // 右移 extra 位，保留 guard/sticky
+            if extra > 0 {
+                let new_guard = (m >> (extra - 1)) & 1 != 0;
+                if extra > 1 {
+                    stk = stk || (m & ((1u128 << (extra - 1)) - 1)) != 0;
+                }
+                guard = new_guard;
+                m >>= extra;
+            }
+            // 舍入（round-to-nearest-even）
+            if guard && (stk || (m & 1) != 0) {
+                m = m.wrapping_add(1);
+                if m >= (1u128 << 112) {
+                    // 进位到最小正规数
+                    return F128((((sign as u128) << 127) | (1u128 << 112)).to_le_bytes());
+                }
+            }
+            return F128((((sign as u128) << 127) | m).to_le_bytes());
+        }
+
+        // 正规数：m 的 bit 112 = 1，小数 = bits 0-111
+        // 舍入（round-to-nearest-even）
+        if guard && (stk || (m & 1) != 0) {
+            m = m.wrapping_add(1);
+            // 进位可能使 mantissa 从 113 位变 114 位（bit 113 = 1）
+            if m >= (1u128 << 113) {
+                m >>= 1;
+                adj_exp += 1;
+                let biased2 = adj_exp + 16383;
+                if biased2 >= 0x7FFF {
+                    return Self::inf_val(sign);
+                }
+            }
+        }
+        let frac = m & ((1u128 << 112) - 1);
+        let bits = ((sign as u128) << 127) | (((adj_exp + 16383) as u128) << 112) | frac;
+        F128(bits.to_le_bytes())
+    }
+
+    /// 113 位 × 113 位 → 226 位乘积 (hi, lo)
+    fn mul_113(a: u128, b: u128) -> (u128, u128) {
+        let a_lo = a as u64 as u128;
+        let a_hi = (a >> 64) as u64 as u128;
+        let b_lo = b as u64 as u128;
+        let b_hi = (b >> 64) as u64 as u128;
+        let ll = a_lo * b_lo;
+        let lh = a_lo * b_hi;
+        let hl = a_hi * b_lo;
+        let hh = a_hi * b_hi;
+        let mid = (lh & 0xFFFF_FFFF_FFFF_FFFF) + (hl & 0xFFFF_FFFF_FFFF_FFFF) + (ll >> 64);
+        let lo = (mid << 64) | (ll & 0xFFFF_FFFF_FFFF_FFFF);
+        let hi = hh + (lh >> 64) + (hl >> 64) + (mid >> 64);
+        (hi, lo)
+    }
+
+    /// 256 位 / 113 位长除法，返回 (商, 余数!=0)
+    /// 被 rem 始终 < denom (< 2^113)，左移后 < 2^114，不会溢出 u128。
+    fn div_256_by_113(numer_hi: u128, numer_lo: u128, denom: u128) -> (u128, bool) {
+        let mut rem: u128 = 0;
+        let mut quot: u128 = 0;
+        for i in (0..256).rev() {
+            let bit: u128 = if i >= 128 {
+                (numer_hi >> (i - 128)) & 1
+            } else {
+                (numer_lo >> i) & 1
+            };
+            rem = (rem << 1) | bit;
+            if rem >= denom {
+                rem -= denom;
+                if i < 128 {
+                    quot |= 1u128 << i;
+                }
+            }
+        }
+        (quot, rem != 0)
+    }
+
+    /// 精确取负
+    pub fn neg_f128(self) -> Self {
+        let bits = u128::from_le_bytes(self.0) ^ (1u128 << 127);
+        F128(bits.to_le_bytes())
+    }
+
+    /// 精确加法
+    pub fn add_f128(self, other: Self) -> Self {
+        if self.is_nan() || other.is_nan() {
+            return Self::nan_val();
+        }
+        if self.is_infinite() {
+            if other.is_infinite() {
+                let (sa, _, _) = self.unpack();
+                let (sb, _, _) = other.unpack();
+                return if sa == sb { self } else { Self::nan_val() };
+            }
+            return self;
+        }
+        if other.is_infinite() {
+            return other;
+        }
+
+        let (sa, ea, ma) = self.unpack();
+        let (sb, eb, mb) = other.unpack();
+
+        if ma == 0 && mb == 0 {
+            // +0 + +0 = +0; -0 + -0 = -0; 混合 → +0 (round-to-nearest)
+            return Self::zero_val(sa && sb);
+        }
+        if ma == 0 {
+            return other;
+        }
+        if mb == 0 {
+            return self;
+        }
+
+        // 扩展 mantissa 左移 2 位（腾出 guard/round 位空间）
+        let ma_ext = ma << 2;
+        let mb_ext = mb << 2;
+        let result_exp;
+
+        // 对齐指数（较小的右移，保留 sticky）
+        let (aligned_a, aligned_b, stk) = if ea > eb {
+            let diff = (ea - eb) as u32;
+            result_exp = ea;
+            if diff >= 128 {
+                (ma_ext, 0u128, mb_ext != 0)
+            } else {
+                let lost = mb_ext & ((1u128 << diff) - 1);
+                (ma_ext, mb_ext >> diff, lost != 0)
+            }
+        } else if eb > ea {
+            let diff = (eb - ea) as u32;
+            result_exp = eb;
+            if diff >= 128 {
+                (0u128, mb_ext, ma_ext != 0)
+            } else {
+                let lost = ma_ext & ((1u128 << diff) - 1);
+                (ma_ext >> diff, mb_ext, lost != 0)
+            }
+        } else {
+            result_exp = ea;
+            (ma_ext, mb_ext, false)
+        };
+
+        // 带符号加法
+        let (result_sign, result_mant) = if sa == sb {
+            (sa, aligned_a.wrapping_add(aligned_b))
+        } else if aligned_a >= aligned_b {
+            (sa, aligned_a - aligned_b)
+        } else {
+            (sb, aligned_b - aligned_a)
+        };
+
+        if result_mant == 0 {
+            return Self::zero_val(false); // x + (-x) = +0
+        }
+
+        // result_mant 是 115 位（113 + 2），pack 负责规范化到 113 位
+        Self::pack(result_sign, result_exp - 2, result_mant, stk)
+    }
+
+    /// 精确减法
+    pub fn sub_f128(self, other: Self) -> Self {
+        self.add_f128(other.neg_f128())
+    }
+
+    /// 精确乘法
+    pub fn mul_f128(self, other: Self) -> Self {
+        if self.is_nan() || other.is_nan() {
+            return Self::nan_val();
+        }
+        let (sa, ea, ma) = self.unpack();
+        let (sb, eb, mb) = other.unpack();
+        let result_sign = sa ^ sb;
+
+        // Inf × 0 = NaN
+        if self.is_infinite() && mb == 0 {
+            return Self::nan_val();
+        }
+        if other.is_infinite() && ma == 0 {
+            return Self::nan_val();
+        }
+        if self.is_infinite() || other.is_infinite() {
+            return Self::inf_val(result_sign);
+        }
+        if ma == 0 || mb == 0 {
+            return Self::zero_val(result_sign);
+        }
+
+        let result_exp = ea + eb;
+
+        // 113 × 113 = 226 位乘积
+        let (hi, lo) = Self::mul_113(ma, mb);
+
+        // 确定乘积 MSB 位置
+        let total_bits = if hi != 0 {
+            128 + (128 - hi.leading_zeros() as i32)
+        } else {
+            128 - lo.leading_zeros() as i32
+        };
+        let shift = total_bits - 113; // 右移到 113 位
+
+        let (m, stk) = if shift >= 128 {
+            (0u128, hi != 0 || lo != 0)
+        } else if shift > 0 {
+            let sh = shift as u32;
+            let lost = if sh > 0 {
+                lo & ((1u128 << sh) - 1)
+            } else {
+                0
+            };
+            let m = (hi << (128 - sh)) | (lo >> sh);
+            (m, lost != 0)
+        } else {
+            (lo, false)
+        };
+
+        // pack 语义：值 = mant * 2^(exp - 112)
+        // 真实值 = (ma*mb) * 2^(result_exp - 224)
+        // mant = (ma*mb) >> shift，所以 exp = result_exp - 112 + shift
+        Self::pack(result_sign, result_exp - 112 + shift, m, stk)
+    }
+
+    /// 精确除法
+    pub fn div_f128(self, other: Self) -> Self {
+        if self.is_nan() || other.is_nan() {
+            return Self::nan_val();
+        }
+        let (sa, ea, ma) = self.unpack();
+        let (sb, eb, mb) = other.unpack();
+        let result_sign = sa ^ sb;
+
+        // Inf / Inf = NaN; x / 0 = NaN（x≠0）
+        if self.is_infinite() && other.is_infinite() {
+            return Self::nan_val();
+        }
+        if self.is_infinite() {
+            return Self::inf_val(result_sign);
+        }
+        if other.is_infinite() {
+            return Self::zero_val(result_sign);
+        }
+        if mb == 0 {
+            if ma == 0 {
+                return Self::nan_val(); // 0/0 = NaN
+            }
+            return Self::inf_val(result_sign); // x/0 = Inf
+        }
+        if ma == 0 {
+            return Self::zero_val(result_sign);
+        }
+
+        let result_exp = ea - eb;
+
+        // 计算 (ma << 114) / mb，得到 ~115 位商（在 u128 范围内）
+        // ma/mb ∈ [0.5, 2)，所以 (ma<<114)/mb ∈ [2^113, 2^115)，不溢出 u128
+        // pack 语义：值 = mant * 2^(exp - 112)
+        // 真实商 = (ma/mb) * 2^result_exp = quot * 2^(result_exp - 114)
+        // 所以 exp = result_exp - 114 + 112 = result_exp - 2
+        let numer_hi = ma >> 14;
+        let numer_lo = ma << 14;
+        let (quot, stk) = Self::div_256_by_113(numer_hi, numer_lo, mb);
+        Self::pack(result_sign, result_exp - 2, quot, stk)
+    }
+
+    /// 精确取模：IEEE 754 remainder（result = a - round_to_even(a/b) * b）
+    pub fn rem_f128(self, other: Self) -> Self {
+        if self.is_nan() || other.is_nan() {
+            return Self::nan_val();
+        }
+        if other.is_infinite() {
+            return self; // rem(x, Inf) = x
+        }
+        if self.is_infinite() {
+            return Self::nan_val(); // rem(Inf, y) = NaN
+        }
+        let (_, _, mb) = other.unpack();
+        if mb == 0 {
+            return Self::nan_val(); // rem(x, 0) = NaN
+        }
+        let (_, _, ma) = self.unpack();
+        if ma == 0 {
+            return self; // rem(0, y) = 0
+        }
+
+        // q = round_to_even(a / b)
+        let quot = self.div_f128(other);
+        // 将 q 舍入到最接近的偶数整数
+        let q_bits = u128::from_le_bytes(quot.0);
+        let q_exp = ((q_bits >> 112) & 0x7FFF) as i32 - 16383;
+        let q_int = if q_exp >= 0 {
+            // q >= 1，右移小数部分取整
+            let shift = q_exp as u32;
+            let q_mant = (q_bits & ((1u128 << 112) - 1)) | (1u128 << 112);
+            if shift >= 113 {
+                0u128
+            } else {
+                q_mant >> shift
+            }
+        } else {
+            0u128
+        };
+        // result = a - q_int * b
+        let q_val = Self::from_f64(q_int as f64);
+        let prod = q_val.mul_f128(other);
+        self.sub_f128(prod)
     }
 }
 
@@ -266,6 +887,58 @@ impl fmt::Display for F128 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
+}
+
+// F16 运算符 trait：走精确 IEEE 754 binary16 运算，不经过 f64 中转
+impl std::ops::Add for F16 {
+    type Output = F16;
+    fn add(self, rhs: F16) -> F16 { self.add_f16(rhs) }
+}
+impl std::ops::Sub for F16 {
+    type Output = F16;
+    fn sub(self, rhs: F16) -> F16 { self.sub_f16(rhs) }
+}
+impl std::ops::Mul for F16 {
+    type Output = F16;
+    fn mul(self, rhs: F16) -> F16 { self.mul_f16(rhs) }
+}
+impl std::ops::Div for F16 {
+    type Output = F16;
+    fn div(self, rhs: F16) -> F16 { self.div_f16(rhs) }
+}
+impl std::ops::Rem for F16 {
+    type Output = F16;
+    fn rem(self, rhs: F16) -> F16 { self.rem_f16(rhs) }
+}
+impl std::ops::Neg for F16 {
+    type Output = F16;
+    fn neg(self) -> F16 { self.neg_f16() }
+}
+
+// F128 运算符 trait：走精确 IEEE 754 binary128 运算，不经过 f64 中转
+impl std::ops::Add for F128 {
+    type Output = F128;
+    fn add(self, rhs: F128) -> F128 { self.add_f128(rhs) }
+}
+impl std::ops::Sub for F128 {
+    type Output = F128;
+    fn sub(self, rhs: F128) -> F128 { self.sub_f128(rhs) }
+}
+impl std::ops::Mul for F128 {
+    type Output = F128;
+    fn mul(self, rhs: F128) -> F128 { self.mul_f128(rhs) }
+}
+impl std::ops::Div for F128 {
+    type Output = F128;
+    fn div(self, rhs: F128) -> F128 { self.div_f128(rhs) }
+}
+impl std::ops::Rem for F128 {
+    type Output = F128;
+    fn rem(self, rhs: F128) -> F128 { self.rem_f128(rhs) }
+}
+impl std::ops::Neg for F128 {
+    type Output = F128;
+    fn neg(self) -> F128 { self.neg_f128() }
 }
 
 // ---- ValueTag — 18 种标量类型标签 ----
@@ -506,25 +1179,69 @@ impl Value {
     pub const NULL: Value = Value::Null;
     pub const VOID: Value = Value::Void;
 
-    // ---- 标量访问器（带 tag 守卫，类型不匹配返回零值）----
-    pub fn as_i32(&self) -> i32 { match self { Value::Scalar(v, ScalarTag::I32) => unsafe { v.i32_val }, _ => 0 } }
-    pub fn as_i64(&self) -> i64 { match self { Value::Scalar(v, ScalarTag::I64) => unsafe { v.i64_val }, _ => 0 } }
-    pub fn as_f64(&self) -> f64 { match self { Value::Scalar(v, ScalarTag::F64) => unsafe { v.f64_val }, _ => 0.0 } }
-    pub fn as_f32(&self) -> f32 { match self { Value::Scalar(v, ScalarTag::F32) => unsafe { v.f32_val }, _ => 0.0 } }
+    // ---- 标量访问器（带 tag 守卫，整数类型间自动提升/截断）----
+    /// 通用整数读取：覆盖所有整数 ScalarTag，统一中转为 i128。
+    /// 所有 as_iN/as_uN/as_isize/as_usize 委托本方法再 `as` 截断，避免特例匹配。
+    pub fn as_int_i128(&self) -> i128 {
+        match self {
+            Value::Scalar(v, t) => unsafe {
+                match t {
+                    ScalarTag::I8 => v.i8_val as i128,
+                    ScalarTag::I16 => v.i16_val as i128,
+                    ScalarTag::I32 => v.i32_val as i128,
+                    ScalarTag::I64 => v.i64_val as i128,
+                    ScalarTag::I128 => i128::from_ne_bytes(std::mem::transmute(v.i128_val)),
+                    ScalarTag::U8 => v.u8_val as i128,
+                    ScalarTag::U16 => v.u16_val as i128,
+                    ScalarTag::U32 => v.u32_val as i128,
+                    ScalarTag::U64 => v.u64_val as i128,
+                    ScalarTag::U128 => u128::from_ne_bytes(std::mem::transmute(v.u128_val)) as i128,
+                    ScalarTag::Isize => v.isize_val as i128,
+                    ScalarTag::Usize => v.usize_val as i128,
+                    ScalarTag::Char => v.char_val as i128,
+                    _ => 0,
+                }
+            },
+            _ => 0,
+        }
+    }
+    /// 通用浮点读取：覆盖 F16/F32/F64/F128，统一中转为 f64。
+    /// 所有 as_fN 委托本方法，避免特例匹配。
+    pub fn as_float_f64(&self) -> f64 {
+        match self {
+            Value::Scalar(v, t) => unsafe {
+                match t {
+                    ScalarTag::F16 => F16(v.f16_val).to_f64(),
+                    ScalarTag::F32 => v.f32_val as f64,
+                    ScalarTag::F64 => v.f64_val,
+                    ScalarTag::F128 => F128(std::mem::transmute(v.f128_val)).to_f64(),
+                    _ => 0.0,
+                }
+            },
+            _ => 0.0,
+        }
+    }
+    // ---- 整数访问器：统一委托 as_int_i128，支持任意整数类型互读 ----
+    pub fn as_i8(&self) -> i8 { self.as_int_i128() as i8 }
+    pub fn as_i16(&self) -> i16 { self.as_int_i128() as i16 }
+    pub fn as_i32(&self) -> i32 { self.as_int_i128() as i32 }
+    pub fn as_i64(&self) -> i64 { self.as_int_i128() as i64 }
+    pub fn as_i128(&self) -> i128 { self.as_int_i128() }
+    pub fn as_u8(&self) -> u8 { self.as_int_i128() as u8 }
+    pub fn as_u16(&self) -> u16 { self.as_int_i128() as u16 }
+    pub fn as_u32(&self) -> u32 { self.as_int_i128() as u32 }
+    pub fn as_u64(&self) -> u64 { self.as_int_i128() as u64 }
+    pub fn as_u128(&self) -> u128 { self.as_int_i128() as u128 }
+    pub fn as_isize(&self) -> isize { self.as_int_i128() as isize }
+    pub fn as_usize(&self) -> usize { self.as_int_i128() as usize }
+    // ---- 浮点访问器：统一委托 as_float_f64，支持任意浮点类型互读 ----
+    pub fn as_f16(&self) -> F16 { F16::from_f64(self.as_float_f64()) }
+    pub fn as_f32(&self) -> f32 { self.as_float_f64() as f32 }
+    pub fn as_f64(&self) -> f64 { self.as_float_f64() }
+    pub fn as_f128(&self) -> F128 { F128::from_f64(self.as_float_f64()) }
+    // ---- 其他标量访问器 ----
     pub fn as_bool(&self) -> bool { match self { Value::Scalar(v, ScalarTag::Bool) => unsafe { v.bool_val }, _ => false } }
     pub fn as_char(&self) -> char { match self { Value::Scalar(v, ScalarTag::Char) => unsafe { char::from_u32_unchecked(v.char_val) }, _ => '\0' } }
-    pub fn as_i8(&self) -> i8 { match self { Value::Scalar(v, ScalarTag::I8) => unsafe { v.i8_val }, _ => 0 } }
-    pub fn as_i16(&self) -> i16 { match self { Value::Scalar(v, ScalarTag::I16) => unsafe { v.i16_val }, _ => 0 } }
-    pub fn as_u8(&self) -> u8 { match self { Value::Scalar(v, ScalarTag::U8) => unsafe { v.u8_val }, _ => 0 } }
-    pub fn as_u16(&self) -> u16 { match self { Value::Scalar(v, ScalarTag::U16) => unsafe { v.u16_val }, _ => 0 } }
-    pub fn as_u32(&self) -> u32 { match self { Value::Scalar(v, ScalarTag::U32) => unsafe { v.u32_val }, _ => 0 } }
-    pub fn as_u64(&self) -> u64 { match self { Value::Scalar(v, ScalarTag::U64) => unsafe { v.u64_val }, _ => 0 } }
-    pub fn as_isize(&self) -> isize { match self { Value::Scalar(v, ScalarTag::Isize) => unsafe { v.isize_val }, _ => 0 } }
-    pub fn as_usize(&self) -> usize { match self { Value::Scalar(v, ScalarTag::Usize) => unsafe { v.usize_val }, _ => 0 } }
-    pub fn as_i128(&self) -> i128 { match self { Value::Scalar(v, ScalarTag::I128) => unsafe { i128::from_ne_bytes(std::mem::transmute(v.i128_val)) }, _ => 0 } }
-    pub fn as_u128(&self) -> u128 { match self { Value::Scalar(v, ScalarTag::U128) => unsafe { u128::from_ne_bytes(std::mem::transmute(v.u128_val)) }, _ => 0 } }
-    pub fn as_f16(&self) -> F16 { match self { Value::Scalar(v, ScalarTag::F16) => F16(unsafe { v.f16_val }), _ => F16(0) } }
-    pub fn as_f128(&self) -> F128 { match self { Value::Scalar(v, ScalarTag::F128) => F128(unsafe { std::mem::transmute(v.f128_val) }), _ => F128([0u8; 16]) } }
 
     // ---- 堆对象访问器 ----
     pub fn heap_obj(&self) -> Option<&HeapObj> { match self { Value::Ref(r) => Some(r.as_ref()), _ => None } }
@@ -538,6 +1255,19 @@ impl Value {
     // ---- 标量 tag 访问（供 Hash/Debug/反射适配）----
     pub fn scalar_tag(&self) -> Option<ScalarTag> {
         match self { Value::Scalar(_, t) => Some(*t), _ => None }
+    }
+
+    // ---- Weak 引用基础设施（用于打破 Cell 循环引用）----
+    /// 返回指向自身堆对象的 Weak 引用。
+    /// 仅对 `Value::Ref` 有意义；标量/Null/Void 返回 None。
+    /// 调用方可将 Weak 存入 Cell 内部以打破 `a = Cell(b); b = Cell(a)` 形成的环。
+    pub fn make_weak(&self) -> Option<Weak<HeapObj>> {
+        match self { Value::Ref(r) => Some(Arc::downgrade(r)), _ => None }
+    }
+
+    /// 将 Weak 引用升级回 Value。若原对象已被回收则返回 None。
+    pub fn upgrade_weak(weak: &Weak<HeapObj>) -> Option<Value> {
+        weak.upgrade().map(Value::from_ref)
     }
 }
 
@@ -821,15 +1551,15 @@ impl From<char> for Char {
 /// Glue 字符串：引用计数的不可变 UTF-8 字符串
 #[derive(Debug, Clone)]
 pub struct GlueStr {
-    inner: Rc<str>,
+    inner: Arc<str>,
 }
 
 impl GlueStr {
     pub fn new(s: impl Into<String>) -> Self {
-        Self { inner: Rc::from(s.into().as_str()) }
+        Self { inner: Arc::from(s.into().as_str()) }
     }
     pub fn from_rust_str(s: &str) -> Self {
-        Self { inner: Rc::from(s) }
+        Self { inner: Arc::from(s) }
     }
     pub fn bytes(&self) -> &str {
         &self.inner
@@ -933,6 +1663,14 @@ impl ArrayValue {
     pub fn pop(&mut self) -> Option<Value> {
         self.elements.pop()
     }
+    /// 统一收集 u8 字节：SOA 快路径（U8 连续存储）或回退到逐元素提取。
+    /// 封装双表示访问，调用方无需关心 SOA 是否启用。
+    pub fn collect_u8_bytes(&self) -> Vec<u8> {
+        if let Some(crate::Value::ScalarSoA::U8(ref data)) = self.scalar_soa {
+            return data.clone();
+        }
+        self.elements.iter().map(|e| e.as_u8()).collect()
+    }
 }
 
 /// 记录字段：可选名称 + 值
@@ -1013,20 +1751,44 @@ pub struct NewtypeValue {
 }
 
 /// Cell：可变引用单元
-#[derive(Debug, Clone)]
+///
+/// 注意：Cell 内部持有 ValueHandle（指向 arena 的 u64 索引）。
+/// 当两个 Cell 互相引用形成 `a = Cell(b); b = Cell(a)` 时，会经由 arena
+/// 产生 Arc<HeapObj::Cell> → Cell → ValueHandle → arena → Arc<HeapObj::Cell>
+/// 的循环引用。Arc 无法回收此类环。调用方可通过 [`Value::make_weak`] /
+/// [`Cell::downgrade`] 获取 `Weak<HeapObj>` 来手动打破循环。
+#[derive(Debug)]
 pub struct Cell {
-    pub inner: RefCell<ValueHandle>,
+    pub inner: parking_lot::Mutex<ValueHandle>,
+}
+
+impl Clone for Cell {
+    fn clone(&self) -> Self {
+        Self { inner: parking_lot::Mutex::new(self.get()) }
+    }
 }
 
 impl Cell {
     pub fn new(val: ValueHandle) -> Self {
-        Self { inner: RefCell::new(val) }
+        Self { inner: parking_lot::Mutex::new(val) }
     }
-    pub fn get(&self) -> std::cell::Ref<'_, ValueHandle> {
-        self.inner.borrow()
+    /// 返回内部值的克隆。parking_lot::Mutex 的 guard 无法跨函数返回，
+    /// 故直接 clone ValueHandle（Copy 类型，零开销）。
+    pub fn get(&self) -> ValueHandle {
+        *self.inner.lock()
     }
     pub fn set(&self, val: ValueHandle) {
-        *self.inner.borrow_mut() = val;
+        *self.inner.lock() = val;
+    }
+
+    /// 返回指向自身的 Weak 引用（用于打破循环引用）。
+    /// 调用方需确保 Cell 被包装在 `Arc<HeapObj::Cell>` 中；
+    /// 若传入的 Arc 并非 Cell，返回 None。
+    pub fn downgrade(arc: &Arc<HeapObj>) -> Option<Weak<HeapObj>> {
+        match arc.as_ref() {
+            HeapObj::Cell(_) => Some(Arc::downgrade(arc)),
+            _ => None,
+        }
     }
 }
 
@@ -1132,7 +1894,7 @@ pub struct TraitValue {
 pub struct LazyValue {
     pub cached: Option<ValueHandle>,
     pub forced: bool,
-    pub thunk: Option<Rc<dyn Fn() -> ValueHandle>>,
+    pub thunk: Option<Arc<dyn Fn() -> ValueHandle + Send + Sync>>,
 }
 
 impl fmt::Debug for LazyValue {
@@ -1159,7 +1921,7 @@ pub struct ErrorValue {
 #[derive(Debug, Clone)]
 pub enum ThrowPayload {
     Ok(Value),
-    Err(Rc<RecordValue>),
+    Err(Arc<RecordValue>),
 }
 
 /// 抛出值
@@ -1477,7 +2239,7 @@ impl Hash for HeapObj {
                 n.inner.hash(state);
             }
             HeapObj::Cell(c) => {
-                c.inner.borrow().hash(state);
+                c.inner.lock().hash(state);
             }
             HeapObj::Range(r) => {
                 r.start.hash(state);
@@ -1496,7 +2258,7 @@ impl Hash for HeapObj {
                 }
                 ThrowPayload::Err(r) => {
                     1u8.hash(state);
-                    let ptr: *const RecordValue = Rc::as_ptr(r);
+                    let ptr: *const RecordValue = Arc::as_ptr(r);
                     ptr.hash(state);
                 }
             },
@@ -1579,10 +2341,17 @@ impl<T: Clone> Bucket<T> {
     fn _refcount(&self, idx: u32) -> u32 {
         self.refcounts[idx as usize]
     }
+
+    /// 清空该桶的所有数据、引用计数与空闲列表，回收内存。
+    fn reset(&mut self) {
+        self.data.clear();
+        self.refcounts.clear();
+        self.free_list.clear();
+    }
 }
 
 /// Value 的统一存储：按类型分桶（SoA），每种标量类型独立连续存储。
-/// 堆对象（HeapObj）仍用 Rc，存于 ref_bucket。
+/// 堆对象（HeapObj）用 Arc，存于 ref_bucket。
 pub struct ValueArena {
     char_bucket: Bucket<u32>,
     i8_bucket: Bucket<i8>,
@@ -1657,7 +2426,7 @@ impl ValueArena {
     }
 
     /// 从 ValueHandle 查全局 arena 拿 HeapObj（反射原语核心路径）
-    /// 返回 Rc clone，避免 thread_local borrow 跨函数返回的生命周期问题。
+    /// 返回 Arc clone，避免 thread_local borrow 跨函数返回的生命周期问题。
     pub fn get_global_obj(handle: ValueHandle) -> Option<Arc<HeapObj>> {
         if handle.tag() != ValueTag::Ref {
             return None;
@@ -1718,6 +2487,29 @@ impl ValueArena {
             f128_bucket: Bucket::new(),
             ref_bucket: Bucket::new(),
         }
+    }
+
+    /// 重置 arena，清空所有分桶并回收内存。
+    /// 用于反射操作后的批量清理，避免反射原语 alloc 后无人 dec_ref 导致内存堆积。
+    pub fn reset(&mut self) {
+        self.char_bucket.reset();
+        self.i8_bucket.reset();
+        self.i16_bucket.reset();
+        self.i32_bucket.reset();
+        self.i64_bucket.reset();
+        self.u8_bucket.reset();
+        self.u16_bucket.reset();
+        self.u32_bucket.reset();
+        self.u64_bucket.reset();
+        self.isz_bucket.reset();
+        self.usz_bucket.reset();
+        self.i128_bucket.reset();
+        self.u128_bucket.reset();
+        self.f16_bucket.reset();
+        self.f32_bucket.reset();
+        self.f64_bucket.reset();
+        self.f128_bucket.reset();
+        self.ref_bucket.reset();
     }
 
     #[inline]
@@ -1925,7 +2717,7 @@ impl ValueArena {
     pub fn alloc_throw_ok(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
     }
-    pub fn alloc_throw_err(&mut self, record: Rc<RecordValue>) -> ValueHandle {
+    pub fn alloc_throw_err(&mut self, record: Arc<RecordValue>) -> ValueHandle {
         self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
     }
     pub fn alloc_atomic(&mut self, val: ValueHandle) -> ValueHandle {
@@ -3065,8 +3857,8 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
             x.type_name == y.type_name && x.inner.equals(&y.inner, arena)
         }
         (HeapObj::Cell(x), HeapObj::Cell(y)) => {
-            let xb = *x.inner.borrow();
-            let yb = *y.inner.borrow();
+            let xb = *x.inner.lock();
+            let yb = *y.inner.lock();
             xb.equals(&yb, arena)
         }
         (HeapObj::Range(x), HeapObj::Range(y)) => {
@@ -3079,7 +3871,7 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
         }
         (HeapObj::ThrowVal(x), HeapObj::ThrowVal(y)) => match (&x.payload, &y.payload) {
             (ThrowPayload::Ok(a), ThrowPayload::Ok(b)) => value_equals(a, b),
-            (ThrowPayload::Err(a), ThrowPayload::Err(b)) => Rc::ptr_eq(a, b),
+            (ThrowPayload::Err(a), ThrowPayload::Err(b)) => Arc::ptr_eq(a, b),
             _ => false,
         },
         (HeapObj::Closure(x), HeapObj::Closure(y)) => {
@@ -3270,7 +4062,7 @@ fn deep_clone_heap(
             inner: deep_clone_handle(n.inner, arena, cache),
         }),
         HeapObj::Cell(c) => {
-            let inner = *c.inner.borrow();
+            let inner = *c.inner.lock();
             // Cell.inner 仍为 ValueHandle
             HeapObj::Cell(Cell::new(deep_clone_handle(inner, arena, cache)))
         }
@@ -3523,7 +4315,7 @@ impl ValueArena {
             payload: ThrowPayload::Ok(val),
         }))
     }
-    pub fn throw_err(&mut self, record: Rc<RecordValue>) -> ValueHandle {
+    pub fn throw_err(&mut self, record: Arc<RecordValue>) -> ValueHandle {
         self.alloc_ref(HeapObj::ThrowVal(ThrowValue {
             payload: ThrowPayload::Err(record),
         }))
@@ -4988,6 +5780,302 @@ pub fn batch_cmp_f64(dst: &mut [u8], a: &[f64], b: &[f64], op: CmpOp) {
     }
 }
 
+// =========================================================================
+// SIMD 补全：i8/i16/u8/u16/u32/u64 binop + cmp，以及 i32/i64 cmp
+// 每类型用 wide 原生 lane 数（i8x16=16, i16x8=8, i32x4=4, i64x4=4,
+// u8x16=16, u16x8=8, u32x4=4, u64x4=4），最大化 SIMD 利用率。
+// =========================================================================
+
+/// 通用整数 SIMD binop kernel 生成宏（含乘法）
+/// 支持 add/sub/mul/and/or/xor 的 SIMD 加速；div/mod/shl/shr 回退标量。
+macro_rules! impl_simd_int_binop {
+    ($ty:ty, $vec:ty, $lanes:expr, $scalar_fn:ident) => {
+        #[inline]
+        fn $scalar_fn(a: $ty, b: $ty, op: BinOp) -> $ty {
+            match op {
+                BinOp::Add => a.wrapping_add(b),
+                BinOp::Sub => a.wrapping_sub(b),
+                BinOp::Mul => a.wrapping_mul(b),
+                BinOp::Div => a.checked_div(b).unwrap_or(0),
+                BinOp::Mod => a.checked_rem(b).unwrap_or(0),
+                BinOp::Band => a & b,
+                BinOp::Bor => a | b,
+                BinOp::Bxor => a ^ b,
+                BinOp::Shl => a << (b as u32),
+                BinOp::Shr => a >> (b as u32),
+            }
+        }
+
+        paste! {
+            #[inline]
+            fn [<binop_ $ty _kernel>](dst: &mut [$ty], a: &[$ty], b: &[$ty], op: BinOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                let blocks = n / $lanes;
+                let use_simd = matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Band | BinOp::Bor | BinOp::Bxor
+                );
+                if use_simd {
+                    for blk in 0..blocks {
+                        let i = blk * $lanes;
+                        let va = <$vec>::new(a[i..i + $lanes].try_into().unwrap());
+                        let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
+                        let r = match op {
+                            BinOp::Add => va + vb,
+                            BinOp::Sub => va - vb,
+                            BinOp::Mul => va * vb,
+                            BinOp::Band => va & vb,
+                            BinOp::Bor => va | vb,
+                            BinOp::Bxor => va ^ vb,
+                            _ => unreachable!(),
+                        };
+                        dst[i..i + $lanes].copy_from_slice(&r.to_array());
+                    }
+                } else {
+                    for blk in 0..blocks {
+                        let i = blk * $lanes;
+                        for j in 0..$lanes {
+                            dst[i + j] = $scalar_fn(a[i + j], b[i + j], op);
+                        }
+                    }
+                }
+                let tail = blocks * $lanes;
+                for i in tail..n {
+                    dst[i] = $scalar_fn(a[i], b[i], op);
+                }
+            }
+
+            pub fn [<batch_binop_ $ty>](dst: &mut [$ty], a: &[$ty], b: &[$ty], op: BinOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                if n == 0 { return; }
+                if n > PARALLEL_THRESHOLD {
+                    let chunk = par_chunk_size(n);
+                    dst[..n]
+                        .par_chunks_mut(chunk)
+                        .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+                        .for_each(|(d, (av, bv))| [<binop_ $ty _kernel>](d, av, bv, op));
+                } else {
+                    [<binop_ $ty _kernel>](&mut dst[..n], &a[..n], &b[..n], op);
+                }
+            }
+        }
+    };
+}
+
+/// i8/u8 专用宏：无 SIMD 乘法（8 位乘法无硬件支持），其余运算同上
+macro_rules! impl_simd_int_binop_no_mul {
+    ($ty:ty, $vec:ty, $lanes:expr, $scalar_fn:ident) => {
+        #[inline]
+        fn $scalar_fn(a: $ty, b: $ty, op: BinOp) -> $ty {
+            match op {
+                BinOp::Add => a.wrapping_add(b),
+                BinOp::Sub => a.wrapping_sub(b),
+                BinOp::Mul => a.wrapping_mul(b),
+                BinOp::Div => a.checked_div(b).unwrap_or(0),
+                BinOp::Mod => a.checked_rem(b).unwrap_or(0),
+                BinOp::Band => a & b,
+                BinOp::Bor => a | b,
+                BinOp::Bxor => a ^ b,
+                BinOp::Shl => a << (b as u32),
+                BinOp::Shr => a >> (b as u32),
+            }
+        }
+
+        paste! {
+            #[inline]
+            fn [<binop_ $ty _kernel>](dst: &mut [$ty], a: &[$ty], b: &[$ty], op: BinOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                let blocks = n / $lanes;
+                let use_simd = matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Band | BinOp::Bor | BinOp::Bxor
+                );
+                if use_simd {
+                    for blk in 0..blocks {
+                        let i = blk * $lanes;
+                        let va = <$vec>::new(a[i..i + $lanes].try_into().unwrap());
+                        let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
+                        let r = match op {
+                            BinOp::Add => va + vb,
+                            BinOp::Sub => va - vb,
+                            BinOp::Band => va & vb,
+                            BinOp::Bor => va | vb,
+                            BinOp::Bxor => va ^ vb,
+                            _ => unreachable!(),
+                        };
+                        dst[i..i + $lanes].copy_from_slice(&r.to_array());
+                    }
+                } else {
+                    for blk in 0..blocks {
+                        let i = blk * $lanes;
+                        for j in 0..$lanes {
+                            dst[i + j] = $scalar_fn(a[i + j], b[i + j], op);
+                        }
+                    }
+                }
+                let tail = blocks * $lanes;
+                for i in tail..n {
+                    dst[i] = $scalar_fn(a[i], b[i], op);
+                }
+            }
+
+            pub fn [<batch_binop_ $ty>](dst: &mut [$ty], a: &[$ty], b: &[$ty], op: BinOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                if n == 0 { return; }
+                if n > PARALLEL_THRESHOLD {
+                    let chunk = par_chunk_size(n);
+                    dst[..n]
+                        .par_chunks_mut(chunk)
+                        .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+                        .for_each(|(d, (av, bv))| [<binop_ $ty _kernel>](d, av, bv, op));
+                } else {
+                    [<binop_ $ty _kernel>](&mut dst[..n], &a[..n], &b[..n], op);
+                }
+            }
+        }
+    };
+}
+
+// i8/u8 无 SIMD 乘法（8 位乘法无硬件支持），其余整数类型有
+impl_simd_int_binop_no_mul!(i8, i8x16, 16, binop_i8_scalar);
+impl_simd_int_binop!(i16, i16x8, 8, binop_i16_scalar);
+impl_simd_int_binop_no_mul!(u8, u8x16, 16, binop_u8_scalar);
+impl_simd_int_binop!(u16, u16x8, 8, binop_u16_scalar);
+impl_simd_int_binop!(u32, u32x4, 4, binop_u32_scalar);
+impl_simd_int_binop!(u64, u64x4, 4, binop_u64_scalar);
+
+// -------------------- 有符号整数 SIMD cmp（i8/i16/i32/i64）--------------------
+// wide 对有符号整数提供 CmpEq/CmpLt/CmpGt，其余组合：Ne=!Eq, Le=Lt|Eq, Ge=Gt|Eq
+
+/// 有符号整数 SIMD cmp kernel 生成宏
+macro_rules! impl_simd_signed_cmp {
+    ($ty:ty, $vec:ty, $lanes:expr) => {
+        paste! {
+            #[inline]
+            fn [<cmp_ $ty _kernel>](dst: &mut [u8], a: &[$ty], b: &[$ty], op: CmpOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                let blocks = n / $lanes;
+                for blk in 0..blocks {
+                    let i = blk * $lanes;
+                    let va = <$vec>::new(a[i..i + $lanes].try_into().unwrap());
+                    let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
+                    // wide 有符号整数比较返回同类型 mask（全 1/0），转 bool
+                    let arr = match op {
+                        CmpOp::Eq => CmpEq::cmp_eq(va, vb).to_array(),
+                        CmpOp::Ne => {
+                            let m = CmpEq::cmp_eq(va, vb);
+                            (!m).to_array()
+                        }
+                        CmpOp::Lt => CmpLt::cmp_lt(va, vb).to_array(),
+                        CmpOp::Gt => CmpGt::cmp_gt(va, vb).to_array(),
+                        CmpOp::Le => {
+                            let lt = CmpLt::cmp_lt(va, vb);
+                            let eq = CmpEq::cmp_eq(va, vb);
+                            (lt | eq).to_array()
+                        }
+                        CmpOp::Ge => {
+                            let gt = CmpGt::cmp_gt(va, vb);
+                            let eq = CmpEq::cmp_eq(va, vb);
+                            (gt | eq).to_array()
+                        }
+                    };
+                    for j in 0..$lanes {
+                        dst[i + j] = (arr[j] != 0) as u8;
+                    }
+                }
+                let tail = blocks * $lanes;
+                for i in tail..n {
+                    dst[i] = cmp_scalar_t(&a[i], &b[i], op) as u8;
+                }
+            }
+
+            pub fn [<batch_cmp_ $ty>](dst: &mut [u8], a: &[$ty], b: &[$ty], op: CmpOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                if n == 0 { return; }
+                if n > PARALLEL_THRESHOLD {
+                    let chunk = par_chunk_size(n);
+                    dst[..n]
+                        .par_chunks_mut(chunk)
+                        .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+                        .for_each(|(d, (av, bv))| [<cmp_ $ty _kernel>](d, av, bv, op));
+                } else {
+                    [<cmp_ $ty _kernel>](&mut dst[..n], &a[..n], &b[..n], op);
+                }
+            }
+        }
+    };
+}
+
+impl_simd_signed_cmp!(i8, i8x16, 16);
+impl_simd_signed_cmp!(i16, i16x8, 8);
+impl_simd_signed_cmp!(i32, i32x4, 4);
+impl_simd_signed_cmp!(i64, i64x4, 4);
+
+// -------------------- 无符号整数 SIMD cmp（u8/u16/u32/u64）--------------------
+// wide 对无符号整数仅提供 CmpEq，其余比较回退标量（无 SIMD 无符号比较指令）
+
+/// 无符号整数 SIMD cmp kernel 生成宏：仅 Eq/Ne 走 SIMD，其余标量
+macro_rules! impl_simd_unsigned_cmp {
+    ($ty:ty, $vec:ty, $lanes:expr) => {
+        paste! {
+            #[inline]
+            fn [<cmp_ $ty _kernel>](dst: &mut [u8], a: &[$ty], b: &[$ty], op: CmpOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                let blocks = n / $lanes;
+                let use_simd = matches!(op, CmpOp::Eq | CmpOp::Ne);
+                if use_simd {
+                    for blk in 0..blocks {
+                        let i = blk * $lanes;
+                        let va = <$vec>::new(a[i..i + $lanes].try_into().unwrap());
+                        let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
+                        let arr = match op {
+                            CmpOp::Eq => CmpEq::cmp_eq(va, vb).to_array(),
+                            CmpOp::Ne => {
+                                let m = CmpEq::cmp_eq(va, vb);
+                                (!m).to_array()
+                            }
+                            _ => unreachable!(),
+                        };
+                        for j in 0..$lanes {
+                            dst[i + j] = (arr[j] != 0) as u8;
+                        }
+                    }
+                } else {
+                    for blk in 0..blocks {
+                        let i = blk * $lanes;
+                        for j in 0..$lanes {
+                            dst[i + j] = cmp_scalar_t(&a[i + j], &b[i + j], op) as u8;
+                        }
+                    }
+                }
+                let tail = blocks * $lanes;
+                for i in tail..n {
+                    dst[i] = cmp_scalar_t(&a[i], &b[i], op) as u8;
+                }
+            }
+
+            pub fn [<batch_cmp_ $ty>](dst: &mut [u8], a: &[$ty], b: &[$ty], op: CmpOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                if n == 0 { return; }
+                if n > PARALLEL_THRESHOLD {
+                    let chunk = par_chunk_size(n);
+                    dst[..n]
+                        .par_chunks_mut(chunk)
+                        .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+                        .for_each(|(d, (av, bv))| [<cmp_ $ty _kernel>](d, av, bv, op));
+                } else {
+                    [<cmp_ $ty _kernel>](&mut dst[..n], &a[..n], &b[..n], op);
+                }
+            }
+        }
+    };
+}
+
+impl_simd_unsigned_cmp!(u8, u8x16, 16);
+impl_simd_unsigned_cmp!(u16, u16x8, 8);
+impl_simd_unsigned_cmp!(u32, u32x4, 4);
+impl_simd_unsigned_cmp!(u64, u64x4, 4);
+
 // -------------------- 归约 f32 / f64 --------------------
 
 fn reduce_add_f32_seq(a: &[f32]) -> f32 {
@@ -5092,8 +6180,8 @@ pub fn batch_reduce_f64(a: &[f64], op: ReduceOp) -> f64 {
 
 /// 内存分配器 trait
 pub trait Allocator: Clone {
-    fn alloc_str(&self, s: &str) -> Rc<str>;
-    fn alloc_array(&self, vals: Vec<ValueHandle>) -> Rc<Vec<ValueHandle>>;
+    fn alloc_str(&self, s: &str) -> Arc<str>;
+    fn alloc_array(&self, vals: Vec<ValueHandle>) -> Arc<Vec<ValueHandle>>;
     fn alloc_value(&self, val: ValueHandle) -> ValueHandle {
         val
     }
@@ -5104,11 +6192,11 @@ pub trait Allocator: Clone {
 pub struct DefaultAllocator;
 
 impl Allocator for DefaultAllocator {
-    fn alloc_str(&self, s: &str) -> Rc<str> {
-        Rc::from(s)
+    fn alloc_str(&self, s: &str) -> Arc<str> {
+        Arc::from(s)
     }
-    fn alloc_array(&self, vals: Vec<ValueHandle>) -> Rc<Vec<ValueHandle>> {
-        Rc::new(vals)
+    fn alloc_array(&self, vals: Vec<ValueHandle>) -> Arc<Vec<ValueHandle>> {
+        Arc::new(vals)
     }
 }
 
@@ -5448,7 +6536,7 @@ mod value_tests {
     fn test_ref_sharing() {
         let mut a = ValueArena::new();
         let s1 = a.str("shared");
-        let s2 = s1; // Copy：同一句柄，共享 Rc
+        let s2 = s1; // Copy：同一句柄，共享 Arc
         assert!(Arc::ptr_eq(a.get_ref(s1), a.get_ref(s2)));
         assert!(s1.equals(&s2, &a));
     }
@@ -6402,8 +7490,8 @@ mod allocator_tests {
         let s2 = alloc.alloc_str("hello");
         assert_eq!(&*s1, "hello");
         assert_eq!(&*s2, "hello");
-        // 不同分配产生不同 Rc 指针
-        assert!(!Rc::ptr_eq(&s1, &s2));
+        // 不同分配产生不同 Arc 指针
+        assert!(!Arc::ptr_eq(&s1, &s2));
     }
 
     #[test]
@@ -6556,7 +7644,7 @@ mod deep_clone_cache_tests {
 
         let cloned = outer.deep_clone(&mut a);
 
-        // 克隆后两个 inner 应共享同一 Rc（ptr_eq）
+        // 克隆后两个 inner 应共享同一 Arc（ptr_eq）
         let arr = cloned.as_array(&a).unwrap();
         let c0 = arr.elements[0].clone();
         let c1 = arr.elements[1].clone();

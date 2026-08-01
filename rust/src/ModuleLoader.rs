@@ -160,6 +160,8 @@ pub enum LoadError {
         column: u32,
         message: String,
     },
+    /// 循环导入检测到（A 导入 B，B 导入 A）
+    CircularImport { path: String },
 }
 
 impl LoadError {
@@ -168,6 +170,7 @@ impl LoadError {
         match self {
             LoadError::ModuleNotFound { path } => path,
             LoadError::ParseFailed { path, .. } => path,
+            LoadError::CircularImport { path } => path,
         }
     }
 }
@@ -381,9 +384,11 @@ impl ModuleLoader {
                 continue;
             }
             if !expanded {
-                // 循环依赖检测：若 key 已在当前展开路径中，跳过避免无限循环
+                // 循环依赖检测：若 key 已在当前展开路径中，记录错误并跳过避免无限循环
                 if visiting.contains(&key) {
-                    eprintln!("warning: circular import detected, skipping: {}", key);
+                    self.load_errors.push(LoadError::CircularImport {
+                        path: key.clone(),
+                    });
                     continue;
                 }
                 visiting.insert(key.clone());

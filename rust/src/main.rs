@@ -422,6 +422,9 @@ fn debug_check(source: &str, filename: &str) {
                 glue_rs::ModuleLoader::LoadError::ParseFailed { path, line, column, message } => {
                     eprintln!("error: parse failed in {} at {}:{}: {}", path, line, column, message);
                 }
+                glue_rs::ModuleLoader::LoadError::CircularImport { path } => {
+                    eprintln!("error: circular import detected: {}", path);
+                }
             }
         }
         process::exit(1);
@@ -543,6 +546,9 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
                 glue_rs::ModuleLoader::LoadError::ParseFailed { path, line, column, message } => {
                     eprintln!("error: parse failed in {} at {}:{}: {}", path, line, column, message);
                 }
+                glue_rs::ModuleLoader::LoadError::CircularImport { path } => {
+                    eprintln!("error: circular import detected: {}", path);
+                }
             }
         }
         process::exit(1);
@@ -592,7 +598,7 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
     }
     ctx.check_module_with_env(&entry_module, root_env);
 
-    if !ctx.sema_result.errors.is_empty() {
+    if ctx.sema_result.errors.len() > prev_err_len {
         for err in &ctx.sema_result.errors[prev_err_len..] {
             eprintln!("{}:{}:{}: {}", entry_path, err.line, err.column, err.message);
         }
