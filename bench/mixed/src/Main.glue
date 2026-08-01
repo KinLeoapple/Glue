@@ -9,7 +9,7 @@
 // ============================================================
 // 1. 表达式 AST
 // ============================================================
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 type Expr =
     | ENum(i64)
     | EAdd(Expr, Expr)

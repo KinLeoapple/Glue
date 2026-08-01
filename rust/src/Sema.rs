@@ -977,8 +977,6 @@ pub enum TypeDefKind {
     Alias,
     /// newtype 包装
     Newtype,
-    /// error newtype
-    ErrorNewtype,
 }
 
 /// 构造器定义信息（压平后的 sema AdtInfo 构造器）。
@@ -1407,7 +1405,7 @@ impl SemaResult {
                 }
                 self.put_field_id(&def.name, "__tag", 0);
             }
-            TypeDefKind::Newtype | TypeDefKind::ErrorNewtype => {
+            TypeDefKind::Newtype => {
                 for (fi, fname) in def.constructors.iter().flat_map(|c| c.field_names.iter()).enumerate() {
                     let field_id = (fi + 1) as u16;
                     match fname {
@@ -2938,34 +2936,6 @@ fn ast_type_decl_to_type_def<'a>(
                 target_name.map(|n| n.into()),
                 Some(target_desc),
             )
-        }
-        AstTypeDef::ErrorNewtype { name: en_name, params } => {
-            let mut field_names: Vec<Option<Box<str>>> = Vec::with_capacity(params.len());
-            let mut field_type_descs: Vec<&'static TypeDescriptor> =
-                Vec::with_capacity(params.len());
-            let mut field_type_names: Vec<Option<Box<str>>> = Vec::with_capacity(params.len());
-            let mut field_type_nodes: Vec<Option<AstTypeRef>> = Vec::with_capacity(params.len());
-
-            for p in params {
-                field_names.push(Some(p.name.into()));
-                let (desc, _is_ref, name) = resolve_param_type(p, ast, sema_result);
-                field_type_descs.push(desc);
-                field_type_names.push(name);
-                field_type_nodes.push(p.type_annotation);
-            }
-
-            let ctor = CtorDefInfo {
-                name: (*en_name).into(),
-                type_name: name.clone(),
-                field_names: field_names.into_boxed_slice(),
-                field_type_descs: field_type_descs.into_boxed_slice(),
-                field_type_names: field_type_names.into_boxed_slice(),
-                is_newtype: true,
-                return_type_name: None,
-                return_type_node: None,
-                field_type_nodes: field_type_nodes.into_boxed_slice(),
-            };
-            (TypeDefKind::ErrorNewtype, vec![ctor], None, None)
         }
     };
 
@@ -4908,8 +4878,7 @@ impl SubtypeRule for RecordSubtypeRule {
     }
 }
 
-/// ADT 同名子类型：直接比较类型名。`error_newtype` 子类型由调用方通过
-/// `is_error_subtype`（需 `sema_result`）判定，不在本规则链内。
+/// ADT 同名子类型：直接比较类型名。
 struct AdtNameRule;
 impl SubtypeRule for AdtNameRule {
     fn check(&self, arena: &TypeArena, sub: TypeHandle, sup: TypeHandle) -> Option<bool> {
@@ -4947,8 +4916,8 @@ impl SubtypeRule for ThrowSubtypeRule {
 
 /// 子类型规则链：按顺序尝试每条规则，首条命中（返回 `Some`）即定夺。
 /// 顺序与原 if-let 链一致：自反 → null→nullable → nullable 内层 →
-/// record → ADT 同名 → throw。`error_newtype` 与 `trait 结构化` 需
-/// `sema_result`，由调用方通过 `is_error_subtype` / `is_trait_structural_subtype` 判定。
+/// record → ADT 同名 → throw。`trait 结构化` 子类型需
+/// `sema_result`，由调用方通过 `is_trait_structural_subtype` 判定。
 const SUBTYPE_RULES: &[&dyn SubtypeRule] = &[
     &ReflexiveRule,
     &NullToNullableRule,
@@ -4962,8 +4931,8 @@ const SUBTYPE_RULES: &[&dyn SubtypeRule] = &[
 ///
 /// 通过 `SUBTYPE_RULES` 规则链分派：自反性、null→nullable、nullable 内层、
 /// record 结构子类型、ADT 同名、Throw 子类型。任一规则命中即返回其结果；
-/// 全部未命中返回 `false`。`error_newtype` 与 `trait 结构化` 子类型需
-/// `sema_result`，由调用方通过 `is_error_subtype` / `is_trait_structural_subtype` 判定。
+/// 全部未命中返回 `false`。`trait 结构化` 子类型需
+/// `sema_result`，由调用方通过 `is_trait_structural_subtype` 判定。
 pub fn is_subtype(arena: &TypeArena, sub: TypeHandle, sup: TypeHandle) -> bool {
     for rule in SUBTYPE_RULES.iter() {
         if let Some(ok) = rule.check(arena, sub, sup) {
@@ -5019,17 +4988,6 @@ pub fn is_record_subtype(
 ) -> bool {
     // sub_fields 提供，sup_fields 要求；sub 字段类型须为 sup 字段类型的子类型。
     match_record_fields(arena, sup_fields, sub_fields, is_subtype)
-}
-
-/// 错误子类型判定：当 `sup_name` 为内置 Err trait 时，任何 error_newtype ADT 都是其子类型。
-pub fn is_error_subtype(sema_result: &SemaResult, sub_name: &str, sup_name: &str) -> bool {
-    if sup_name != "Err" {
-        return false;
-    }
-    match sema_result.get_type_def(sub_name) {
-        Some(def) => def.kind == TypeDefKind::ErrorNewtype,
-        None => false,
-    }
 }
 
 /// Throw 子类型判定：值类型与错误类型需同时满足子类型关系。
@@ -5900,30 +5858,17 @@ impl<'a> InferContext<'a> {
         }
     }
 
-    /// 检查 throw 语句的表达式是否为 Error 子类型。
-    /// 合法情况：error_newtype ADT、实现了 Error trait 的类型、throw 类型、type_var（延迟）。
-    pub fn check_throw_stmt(&mut self, thrown_ty: TypeHandle, line: u32, column: u32) {
+    /// 检查 throw 语句的表达式类型。
+    /// Glue 无 try-catch，throw 是通用抛出机制，接受任意 ADT/Record/Throw/TypeVar。
+    pub fn check_throw_stmt(&mut self, thrown_ty: TypeHandle, _line: u32, _column: u32) {
         let resolved = self.arena.resolve(thrown_ty);
         let ct = self.arena.get(resolved).clone();
         match &ct {
             ConcreteType::TypeVar(_) => return,   // 延迟到统一阶段
             ConcreteType::Throw { .. } => return, // throw Error("...") 返回 Throw，合法
-            ConcreteType::Adt { name, .. } | ConcreteType::Generic { name, .. } => {
-                // 检查是否为 error_newtype
-                if let Some(def) = self.sema_result.get_type_def(name) {
-                    if def.kind == TypeDefKind::ErrorNewtype {
-                        return;
-                    }
-                }
-                // 检查是否实现 Error trait（key 格式 "Error::TypeName"）
-                let trait_key = format!("Error::{}", name);
-                // registered_traits 在 Zig 中是 inferencer 字段；Rust 版暂用 type_def kind 判定
-                // 完整实现需 trait impl 注册表（phase6 补充），此处保守放行 error_newtype
-                let _ = trait_key;
-            }
-            _ => {}
+            ConcreteType::Adt { .. } | ConcreteType::Generic { .. } => return, // 错误类型（普通 ADT）
+            _ => return, // 保守放行，throw 是通用机制
         }
-        self.add_error_at("throw expression must be an Err subtype", line, column);
     }
 
     // ── infer_expr / infer_stmt / infer_pattern 占位（下方实现）──
@@ -7711,21 +7656,6 @@ impl<'a> InferContext<'a> {
                             let inner_ty = self.type_from_ast(*inner, &module.arena);
                             let ctor_fn_ty = self.arena.make(ConcreteType::Fn {
                                 params: vec![inner_ty].into_boxed_slice(),
-                                return_type: self_ty,
-                            });
-                            self.env.define(env, ctor_name, ctor_fn_ty);
-                        }
-                        crate::Ast::TypeDef::ErrorNewtype { name: ctor_name, params } => {
-                            // error_newtype 构造器：(params...) -> Self
-                            let param_types: Vec<TypeHandle> = params
-                                .iter()
-                                .map(|p| match p.type_annotation {
-                                    Some(ta) => self.type_from_ast(ta, &module.arena),
-                                    None => self.arena.fresh_type_var(),
-                                })
-                                .collect();
-                            let ctor_fn_ty = self.arena.make(ConcreteType::Fn {
-                                params: param_types.into_boxed_slice(),
                                 return_type: self_ty,
                             });
                             self.env.define(env, ctor_name, ctor_fn_ty);
@@ -10109,20 +10039,20 @@ mod tests {
     }
 
     #[test]
-    fn refine_constructor_pattern_throw_error_newtype() {
+    fn refine_constructor_pattern_throw_error_adt() {
         let mut arena = TypeArena::new();
         let mut sr = SemaResult::new();
-        // 注册一个 error_newtype 构造器
+        // 注册一个错误类型 ADT 构造器（普通单构造器 ADT）
         let error_def = TypeDefInfo {
             name: "MyError".into(),
-            kind: TypeDefKind::ErrorNewtype,
+            kind: TypeDefKind::Adt,
             constructors: Box::new([CtorDefInfo {
                 name: "MyError".into(),
                 type_name: "MyError".into(),
                 field_names: Box::new([Some("message".into())]),
                 field_type_descs: Box::new([]),
                 field_type_names: Box::new([Some("str".into())]),
-                is_newtype: true,
+                is_newtype: false,
                 return_type_name: None,
                 return_type_node: None,
                 field_type_nodes: Box::new([None]),
@@ -10146,8 +10076,7 @@ mod tests {
             error_type: my_error_ty,
         });
 
-        // MyError 构造器匹配 Throw 类型 → 走 error_newtype 特例，返回 true
-        // 分配一个 Wildcard 模式作为子模式（模拟 error_newtype 的字段绑定）
+        // MyError 构造器匹配 Throw 类型 → 错误类型 ADT 匹配 Throw.error_type
         let pat = ast.alloc_pattern(Span::new(1, 1), Pattern::Wildcard);
         let env = ctx.env.root();
         let result = ctx.refine_constructor_pattern("MyError", &[pat], throw_ty, &ast, env);
@@ -10603,40 +10532,6 @@ mod tests {
         assert_eq!(float_type_rank(&ConcreteType::F64), 3);
         assert_eq!(float_type_rank(&ConcreteType::F128), 4);
         assert_eq!(float_type_rank(&ConcreteType::I32), 0);
-    }
-
-    #[test]
-    fn is_error_subtype_err_target() {
-        let mut sr = SemaResult::new();
-        sr.put_type_def(TypeDefInfo {
-            name: "MyErr".into(),
-            kind: TypeDefKind::ErrorNewtype,
-            constructors: Box::new([]),
-            type_params: Box::new([]),
-            target_type_name: None,
-            target_type_desc: None,
-        });
-        // error_newtype 是 Err trait 的子类型
-        assert!(is_error_subtype(&sr, "MyErr", "Err"));
-        // 非 Err 目标不成立
-        assert!(!is_error_subtype(&sr, "MyErr", "Show"));
-        // 未注册类型不成立
-        assert!(!is_error_subtype(&sr, "Nope", "Err"));
-    }
-
-    #[test]
-    fn is_error_subtype_non_error_newtype() {
-        let mut sr = SemaResult::new();
-        sr.put_type_def(TypeDefInfo {
-            name: "PlainAdt".into(),
-            kind: TypeDefKind::Adt,
-            constructors: Box::new([]),
-            type_params: Box::new([]),
-            target_type_name: None,
-            target_type_desc: None,
-        });
-        // 普通 ADT 不是 Err 的子类型
-        assert!(!is_error_subtype(&sr, "PlainAdt", "Err"));
     }
 
     #[test]

@@ -144,6 +144,8 @@ fn try_auto_extract_c(glue_files: &[PathBuf], out_dir: &str) {
         let c_name = glue_file_to_c_name(glue_file);
         let c_path = Path::new(out_dir).join(&c_name);
         let output = Command::new(&glue_bin)
+            .arg("debug")
+            .arg("--stage")
             .arg("emit-c")
             .arg(glue_file)
             .output();
@@ -187,6 +189,8 @@ fn try_generate_ffi(glue_files: &[PathBuf]) -> Option<String> {
     }
 
     let mut child = match Command::new(&glue_bin)
+        .arg("debug")
+        .arg("--stage")
         .arg("emit-ffi")
         .arg("-")
         .stdin(Stdio::piped())
@@ -195,7 +199,7 @@ fn try_generate_ffi(glue_files: &[PathBuf]) -> Option<String> {
     {
         Ok(child) => child,
         Err(_) => {
-            println!("cargo:warning=启动 glue emit-ffi 失败");
+            println!("cargo:warning=启动 glue debug --stage emit-ffi 失败");
             return None;
         }
     };
@@ -207,7 +211,7 @@ fn try_generate_ffi(glue_files: &[PathBuf]) -> Option<String> {
     let output = match child.wait_with_output() {
         Ok(o) => o,
         Err(_) => {
-            println!("cargo:warning=glue emit-ffi 执行失败");
+            println!("cargo:warning=glue debug --stage emit-ffi 执行失败");
             return None;
         }
     };
@@ -215,7 +219,7 @@ fn try_generate_ffi(glue_files: &[PathBuf]) -> Option<String> {
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        println!("cargo:warning=glue emit-ffi 返回非零状态");
+        println!("cargo:warning=glue debug --stage emit-ffi 返回非零状态");
         None
     }
 }

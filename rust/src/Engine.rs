@@ -192,6 +192,9 @@ pub fn compute_eq_bool(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: 将值包装为 ThrowVal(Err)（throw 语句用）。
 ///
 /// Glue 无 try-catch，throw 产 ThrowVal(Err) + Return 信号，逐层透传至顶层。
+/// - 输入为 Record（错误类型 ADT 构造结果）→ 直接作为 ThrowVal(Err(record))
+/// - 输入为 ThrowVal（已是 throw 值）→ 直接返回
+/// - 其他值 → 包装为单字段 Error record 再作为 ThrowVal(Err)
 pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
     use std::rc::Rc;
     use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
@@ -199,6 +202,17 @@ pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
     let n = &graph.nodes[node.0 as usize];
     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
     let v = frame.get_value_by_global(inputs[0]);
+    // Record（错误类型 ADT）→ 直接作为 Err payload
+    if let Some(HeapObj::Record(record)) = v.heap_obj() {
+        return Value::ref_val(HeapObj::ThrowVal(ThrowValue {
+            payload: ThrowPayload::Err(Rc::new(record.clone())),
+        }));
+    }
+    // 已是 ThrowVal → 直接返回
+    if let Some(HeapObj::ThrowVal(_)) = v.heap_obj() {
+        return v;
+    }
+    // 其他值 → 包装为 Error record
     let record = Rc::new(RecordValue {
         type_name: "Error".to_string(),
         fields: vec![v],
@@ -206,6 +220,772 @@ pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
         field_ref_bits: 0,
     });
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+}
+
+/// compute_fn: 将值包装为 ThrowVal(Ok(val))（Ok 构造器用）。
+pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, ThrowValue, ThrowPayload};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let val = frame.get_value_by_global(inputs[0]);
+    Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
+}
+
+/// compute_fn: 将 Record 包装为 ThrowVal(Err(record))（Err 构造器用）。
+///
+/// 输入为 record 构造节点的结果（已通过 compute_record_construct 构造为 RecordValue）。
+/// 此函数将其包装为 ThrowVal(Err(record))。
+pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, ThrowValue, ThrowPayload};
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let v = frame.get_value_by_global(inputs[0]);
+    // v 应为 Record（由内层 record_construct 节点产生）
+    if let Some(HeapObj::Record(record)) = v.heap_obj() {
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue {
+            payload: ThrowPayload::Err(std::rc::Rc::new(record.clone())),
+        }))
+    } else {
+        // 非 record 值，包装为单字段 Error record
+        use std::rc::Rc;
+        use crate::Value::RecordValue;
+        let record = Rc::new(RecordValue {
+            type_name: "Error".to_string(),
+            fields: vec![v],
+            field_names: vec![Some("value".to_string())],
+            field_ref_bits: 0,
+        });
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    }
+}
+
+/// compute_fn (idx 47): `?` 运算符（Propagate）。
+///
+/// 输入为 ThrowVal：
+/// - Ok(val) → 返回 val（解包）
+/// - Err(err) → 设 frame.control_signal = Return(ThrowVal(Err))，函数提前返回错误
+pub fn compute_propagate(frame: &mut Frame, node: NodeId) -> Value {
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let v = frame.get_value_by_global(inputs[0]);
+
+    if let Some(crate::Value::HeapObj::ThrowVal(tv)) = v.heap_obj() {
+        match &tv.payload {
+            crate::Value::ThrowPayload::Ok(val) => val.clone(),
+            crate::Value::ThrowPayload::Err(_) => {
+                // 错误传播：设 Return 信号，携带原始 ThrowVal(Err) 逐层透传
+                frame.control_signal = ControlSignal::Return(v.clone());
+                Value::VOID
+            }
+        }
+    } else {
+        // 非 ThrowVal：直接透传（类型系统保证此处不应到达）
+        v
+    }
+}
+
+/// compute_fn (idx 46): @extern("C") FFI 调用。
+///
+/// 根据节点的 ffi_call_names 元数据获取函数名，从输入收集参数值，
+/// 分发到对应的 Ffi::wrapper 函数，返回结果 Value。
+/// FFI 调用是同步的，不设 pending_call，不挂起帧。
+#[cfg(has_extern_c)]
+pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Ffi::wrapper;
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let fn_name = graph.ffi_call_names[node.0 as usize]
+        .as_ref()
+        .expect("compute_ffi_call: no ffi_call_name");
+
+    // 从 Value 提取 str 参数（HeapObj::Str → owned String，避免临时 Value 生命周期问题）
+    fn extract_str(v: &Value) -> String {
+        match v.heap_obj() {
+            Some(crate::Value::HeapObj::Str(s)) => s.bytes().to_string(),
+            _ => panic!("FFI str arg expected, got non-str value"),
+        }
+    }
+
+    // 从 Value 提取 u8[] 参数（优先 SOA，fallback elements）
+    fn extract_u8_buf(v: &Value) -> Vec<u8> {
+        match v.heap_obj() {
+            Some(crate::Value::HeapObj::Array(arr)) => {
+                if let Some(crate::Value::ScalarSoA::U8(ref data)) = arr.scalar_soa {
+                    return data.clone();
+                }
+                arr.elements.iter().map(|e| e.as_u8()).collect()
+            }
+            _ => panic!("FFI u8[] arg expected"),
+        }
+    }
+
+    match fn_name.as_str() {
+        // ── IO: stdout/stderr ──
+        "__stdout_write_raw" => {
+            let s = extract_str(&frame.get_value_by_global(inputs[0]));
+            let rc = unsafe { wrapper::__stdout_write_raw(&s) };
+            Value::i32(rc)
+        }
+        "__stderr_write_raw" => {
+            let s = extract_str(&frame.get_value_by_global(inputs[0]));
+            let rc = unsafe { wrapper::__stderr_write_raw(&s) };
+            Value::i32(rc)
+        }
+
+        // ── IO: file ops ──
+        "__file_open_raw" => {
+            let path = extract_str(&frame.get_value_by_global(inputs[0]));
+            let flags = frame.get_value_by_global(inputs[1]).as_i32();
+            let mode = frame.get_value_by_global(inputs[2]).as_i32();
+            let fd = unsafe { wrapper::__file_open_raw(&path, flags, mode) };
+            Value::i64(fd)
+        }
+        "__file_close_raw" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let rc = unsafe { wrapper::__file_close_raw(fd) };
+            Value::i32(rc)
+        }
+        "__file_seek_raw" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let offset = frame.get_value_by_global(inputs[1]).as_i64();
+            let whence = frame.get_value_by_global(inputs[2]).as_i32();
+            let pos = unsafe { wrapper::__file_seek_raw(fd, offset, whence) };
+            Value::i64(pos)
+        }
+        "__file_remove_raw" => {
+            let path = extract_str(&frame.get_value_by_global(inputs[0]));
+            let rc = unsafe { wrapper::__file_remove_raw(&path) };
+            Value::i32(rc)
+        }
+        "__file_rename_raw" => {
+            let old = extract_str(&frame.get_value_by_global(inputs[0]));
+            let new = extract_str(&frame.get_value_by_global(inputs[1]));
+            let rc = unsafe { wrapper::__file_rename_raw(&old, &new) };
+            Value::i32(rc)
+        }
+        "__file_chmod_raw" => {
+            let path = extract_str(&frame.get_value_by_global(inputs[0]));
+            let mode = frame.get_value_by_global(inputs[1]).as_i32();
+            let rc = unsafe { wrapper::__file_chmod_raw(&path, mode) };
+            Value::i32(rc)
+        }
+
+        // ── IO: file read/write (u8[] + len) ──
+        "__file_read_into" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let len = frame.get_value_by_global(inputs[2]).as_usize();
+            let n = unsafe { wrapper::__file_read_into(fd, &mut buf, len) };
+            Value::i64(n)
+        }
+        "__file_write" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let len = frame.get_value_by_global(inputs[2]).as_usize();
+            let n = unsafe { wrapper::__file_write(fd, &buf, len) };
+            Value::i64(n)
+        }
+
+        // ── IO: stdin ──
+        "__stdin_readln_into" => {
+            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[0]));
+            let n = unsafe { wrapper::__stdin_readln_into(&mut buf) };
+            Value::i64(n)
+        }
+
+        // ── IO: stat/fstat ──
+        "__file_stat_into" => {
+            let path = extract_str(&frame.get_value_by_global(inputs[0]));
+            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let rc = unsafe { wrapper::__file_stat_into(&path, &mut buf) };
+            Value::i32(rc)
+        }
+        "__file_fstat_into" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let rc = unsafe { wrapper::__file_fstat_into(fd, &mut buf) };
+            Value::i32(rc)
+        }
+
+        // ── IO: dir ops ──
+        "__dir_create_raw" => {
+            let path = extract_str(&frame.get_value_by_global(inputs[0]));
+            let recursive = frame.get_value_by_global(inputs[1]).as_bool();
+            let rc = unsafe { wrapper::__dir_create_raw(&path, recursive) };
+            Value::i32(rc)
+        }
+        "__dir_remove_raw" => {
+            let path = extract_str(&frame.get_value_by_global(inputs[0]));
+            let recursive = frame.get_value_by_global(inputs[1]).as_bool();
+            let rc = unsafe { wrapper::__dir_remove_raw(&path, recursive) };
+            Value::i32(rc)
+        }
+
+        // ── IO: dir list ──
+        "__dir_list_into" => {
+            let path = extract_str(&frame.get_value_by_global(inputs[0]));
+            let mut names_buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let mut name_offsets = extract_u8_buf(&frame.get_value_by_global(inputs[2]));
+            let mut kinds_buf = extract_u8_buf(&frame.get_value_by_global(inputs[3]));
+            let max_count = frame.get_value_by_global(inputs[4]).as_usize();
+            let count = unsafe {
+                wrapper::__dir_list_into(&path, &mut names_buf, &mut name_offsets, &mut kinds_buf, max_count)
+            };
+            Value::i64(count)
+        }
+
+        // ── net: tcp ──
+        "__net_tcp_connect_v4" => {
+            let ip_bits = frame.get_value_by_global(inputs[0]).as_u32();
+            let port = frame.get_value_by_global(inputs[1]).as_u16();
+            let timeout_ns = frame.get_value_by_global(inputs[2]).as_i64();
+            let fd = unsafe { wrapper::__net_tcp_connect_v4(ip_bits, port, timeout_ns) };
+            Value::i64(fd)
+        }
+        "__net_tcp_listen_v4" => {
+            let ip_bits = frame.get_value_by_global(inputs[0]).as_u32();
+            let port = frame.get_value_by_global(inputs[1]).as_u16();
+            let reuse_addr = frame.get_value_by_global(inputs[2]).as_bool();
+            let fd = unsafe {
+                wrapper::__net_tcp_listen_v4(ip_bits, port, reuse_addr)
+            };
+            Value::i64(fd)
+        }
+        "__net_tcp_accept" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let conn_fd = unsafe { wrapper::__net_tcp_accept(fd) };
+            Value::i64(conn_fd)
+        }
+        "__net_tcp_read" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let len = frame.get_value_by_global(inputs[2]).as_usize();
+            let n = unsafe { wrapper::__net_tcp_read(fd, &mut buf, len) };
+            Value::i64(n)
+        }
+        "__net_tcp_write" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let len = frame.get_value_by_global(inputs[2]).as_usize();
+            let n = unsafe { wrapper::__net_tcp_write(fd, &buf, len) };
+            Value::i64(n)
+        }
+        "__net_tcp_close_raw" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let rc = unsafe { wrapper::__net_tcp_close_raw(fd) };
+            Value::i32(rc)
+        }
+
+        // ── net: udp v4 ──
+        "__net_udp_bind_v4" => {
+            let ip_bits = frame.get_value_by_global(inputs[0]).as_u32();
+            let port = frame.get_value_by_global(inputs[1]).as_u16();
+            let reuse_addr = frame.get_value_by_global(inputs[2]).as_bool();
+            let fd = unsafe {
+                wrapper::__net_udp_bind_v4(ip_bits, port, reuse_addr)
+            };
+            Value::i64(fd)
+        }
+        "__net_udp_send_to_v4" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let ip_bits = frame.get_value_by_global(inputs[1]).as_u32();
+            let port = frame.get_value_by_global(inputs[2]).as_u16();
+            let buf = extract_u8_buf(&frame.get_value_by_global(inputs[3]));
+            let len = frame.get_value_by_global(inputs[4]).as_usize();
+            let n = unsafe { wrapper::__net_udp_send_to_v4(fd, ip_bits, port, &buf, len) };
+            Value::i64(n)
+        }
+        "__net_udp_recv_from_v4" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let len = frame.get_value_by_global(inputs[2]).as_usize();
+            let n = unsafe { wrapper::__net_udp_recv_from_v4(fd, &mut buf, len) };
+            Value::i64(n)
+        }
+
+        // ── net: resolve ──
+        "__net_resolve_into" => {
+            let host = extract_str(&frame.get_value_by_global(inputs[0]));
+            let mut out_buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let max_count = frame.get_value_by_global(inputs[2]).as_usize();
+            let count = unsafe { wrapper::__net_resolve_into(&host, &mut out_buf, max_count) };
+            Value::i64(count)
+        }
+
+        // ── net: tcp/udp v6 ──
+        "__net_tcp_connect_v6" => {
+            let ip_hi = frame.get_value_by_global(inputs[0]).as_u64();
+            let ip_lo = frame.get_value_by_global(inputs[1]).as_u64();
+            let port = frame.get_value_by_global(inputs[2]).as_u16();
+            let timeout_ns = frame.get_value_by_global(inputs[3]).as_i64();
+            let fd = unsafe { wrapper::__net_tcp_connect_v6(ip_hi, ip_lo, port, timeout_ns) };
+            Value::i64(fd)
+        }
+        "__net_tcp_listen_v6" => {
+            let ip_hi = frame.get_value_by_global(inputs[0]).as_u64();
+            let ip_lo = frame.get_value_by_global(inputs[1]).as_u64();
+            let port = frame.get_value_by_global(inputs[2]).as_u16();
+            let reuse_addr = frame.get_value_by_global(inputs[3]).as_bool();
+            let fd = unsafe {
+                wrapper::__net_tcp_listen_v6(ip_hi, ip_lo, port, reuse_addr)
+            };
+            Value::i64(fd)
+        }
+        "__net_udp_bind_v6" => {
+            let ip_hi = frame.get_value_by_global(inputs[0]).as_u64();
+            let ip_lo = frame.get_value_by_global(inputs[1]).as_u64();
+            let port = frame.get_value_by_global(inputs[2]).as_u16();
+            let reuse_addr = frame.get_value_by_global(inputs[3]).as_bool();
+            let fd = unsafe {
+                wrapper::__net_udp_bind_v6(ip_hi, ip_lo, port, reuse_addr)
+            };
+            Value::i64(fd)
+        }
+        "__net_udp_send_to_v6" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let ip_hi = frame.get_value_by_global(inputs[1]).as_u64();
+            let ip_lo = frame.get_value_by_global(inputs[2]).as_u64();
+            let port = frame.get_value_by_global(inputs[3]).as_u16();
+            let buf = extract_u8_buf(&frame.get_value_by_global(inputs[4]));
+            let len = frame.get_value_by_global(inputs[5]).as_usize();
+            let n = unsafe { wrapper::__net_udp_send_to_v6(fd, ip_hi, ip_lo, port, &buf, len) };
+            Value::i64(n)
+        }
+        "__net_udp_recv_from_v6" => {
+            let fd = frame.get_value_by_global(inputs[0]).as_i64();
+            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let len = frame.get_value_by_global(inputs[2]).as_usize();
+            let n = unsafe { wrapper::__net_udp_recv_from_v6(fd, &mut buf, len) };
+            Value::i64(n)
+        }
+
+        // ── time ──
+        "__instant_now_ns" => {
+            let ns = unsafe { wrapper::__instant_now_ns() };
+            Value::i64(ns)
+        }
+        "__systemtime_now_ns" => {
+            let ns = unsafe { wrapper::__systemtime_now_ns() };
+            Value::i64(ns)
+        }
+        "__sleep_ns" => {
+            let ns = frame.get_value_by_global(inputs[0]).as_i64();
+            unsafe { wrapper::__sleep_ns(ns) };
+            Value::VOID
+        }
+        "__localtime_offset_minutes" => {
+            let minutes = unsafe { wrapper::__localtime_offset_minutes() };
+            Value::i32(minutes)
+        }
+
+        // ── cast: widening to i128 ──
+        "__cast_i8_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_i8();
+            let r = unsafe { wrapper::__cast_i8_to_i128(x) };
+            Value::i128(r)
+        }
+        "__cast_i16_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_i16();
+            let r = unsafe { wrapper::__cast_i16_to_i128(x) };
+            Value::i128(r)
+        }
+        "__cast_i32_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_i32();
+            let r = unsafe { wrapper::__cast_i32_to_i128(x) };
+            Value::i128(r)
+        }
+        "__cast_i64_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_i64();
+            let r = unsafe { wrapper::__cast_i64_to_i128(x) };
+            Value::i128(r)
+        }
+        "__cast_u8_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_u8();
+            let r = unsafe { wrapper::__cast_u8_to_i128(x) };
+            Value::i128(r)
+        }
+        "__cast_u16_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_u16();
+            let r = unsafe { wrapper::__cast_u16_to_i128(x) };
+            Value::i128(r)
+        }
+        "__cast_u32_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_u32();
+            let r = unsafe { wrapper::__cast_u32_to_i128(x) };
+            Value::i128(r)
+        }
+        "__cast_u64_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_u64();
+            let r = unsafe { wrapper::__cast_u64_to_i128(x) };
+            Value::i128(r)
+        }
+        "__cast_usize_to_i128" => {
+            let x = frame.get_value_by_global(inputs[0]).as_usize();
+            let r = unsafe { wrapper::__cast_usize_to_i128(x) };
+            Value::i128(r)
+        }
+
+        // ── cast: narrowing from i128 ──
+        "__cast_i128_to_i8" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_i8(v) };
+            Value::i8(r)
+        }
+        "__cast_i128_to_i16" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_i16(v) };
+            Value::i16(r)
+        }
+        "__cast_i128_to_i32" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_i32(v) };
+            Value::i32(r)
+        }
+        "__cast_i128_to_i64" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_i64(v) };
+            Value::i64(r)
+        }
+        "__cast_i128_to_u8" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_u8(v) };
+            Value::u8(r)
+        }
+        "__cast_i128_to_u16" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_u16(v) };
+            Value::u16(r)
+        }
+        "__cast_i128_to_u32" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_u32(v) };
+            Value::u32(r)
+        }
+        "__cast_i128_to_u64" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_u64(v) };
+            Value::u64(r)
+        }
+        "__cast_i128_to_usize" => {
+            let v = frame.get_value_by_global(inputs[0]).as_i128();
+            let r = unsafe { wrapper::__cast_i128_to_usize(v) };
+            Value::usize_val(r)
+        }
+
+        // ── cast: char ──
+        "__cast_char_to_u8" => {
+            let x = frame.get_value_by_global(inputs[0]).as_u32();
+            let r = unsafe { wrapper::__cast_char_to_u8(char::from_u32(x).unwrap_or('\0')) };
+            Value::u8(r)
+        }
+
+        // ── reflect: Rust 侧实现（非 C 库函数），直接调用 Reflect::format_value ──
+        "__reflect_format" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let s = crate::Reflect::format_value(&v, 0);
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
+        }
+        "__reflect_scalar_to_str" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let s = crate::Reflect::format_value(&v, 0);
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
+        }
+        "__reflect_kind" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let kind: u8 = match &v {
+                Value::Null => 0,
+                Value::Void => 1,
+                Value::Scalar(_, _) => 2,
+                Value::Ref(r) => match &**r {
+                    crate::Value::HeapObj::Str(_) => 3,
+                    crate::Value::HeapObj::Array(_) => 4,
+                    crate::Value::HeapObj::Record(_) => 5,
+                    crate::Value::HeapObj::Adt(_) => 6,
+                    crate::Value::HeapObj::Closure(_) => 7,
+                    crate::Value::HeapObj::TraitVal(_) => 8,
+                    crate::Value::HeapObj::ThrowVal(_) => 9,
+                    crate::Value::HeapObj::ChannelVal(_) => 10,
+                    crate::Value::HeapObj::AsyncVal(_) => 11,
+                    _ => 12,
+                }
+            };
+            Value::u8(kind)
+        }
+        "__reflect_type_name" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let name = match &v {
+                Value::Null => "null".to_string(),
+                Value::Void => "void".to_string(),
+                Value::Scalar(_, tag) => tag.type_name().to_string(),
+                Value::Ref(r) => match &**r {
+                    crate::Value::HeapObj::Str(_) => "str".to_string(),
+                    crate::Value::HeapObj::Array(_) => "array".to_string(),
+                    crate::Value::HeapObj::Record(rec) => rec.type_name.clone(),
+                    crate::Value::HeapObj::Adt(a) => a.constructor.clone(),
+                    _ => "unknown".to_string(),
+                },
+            };
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+        }
+        "__reflect_array_len" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            match v.heap_obj() {
+                Some(crate::Value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
+                _ => Value::usize_val(0),
+            }
+        }
+        "__reflect_field_count" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let count: u16 = match v.heap_obj() {
+                Some(crate::Value::HeapObj::Record(rec)) => rec.fields.len() as u16,
+                Some(crate::Value::HeapObj::Adt(a)) => a.fields.len() as u16,
+                _ => 0,
+            };
+            Value::u16(count)
+        }
+        "__reflect_size" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let size: u8 = match &v {
+                Value::Scalar(_, tag) => match tag {
+                    crate::Value::ScalarTag::Bool | crate::Value::ScalarTag::U8 | crate::Value::ScalarTag::I8 => 1,
+                    crate::Value::ScalarTag::U16 | crate::Value::ScalarTag::I16 | crate::Value::ScalarTag::F16 => 2,
+                    crate::Value::ScalarTag::U32 | crate::Value::ScalarTag::I32 | crate::Value::ScalarTag::F32 | crate::Value::ScalarTag::Char => 4,
+                    crate::Value::ScalarTag::U64 | crate::Value::ScalarTag::I64 | crate::Value::ScalarTag::F64 | crate::Value::ScalarTag::Usize | crate::Value::ScalarTag::Isize => 8,
+                    crate::Value::ScalarTag::U128 | crate::Value::ScalarTag::I128 | crate::Value::ScalarTag::F128 => 16,
+                },
+                _ => 0,
+            };
+            Value::u8(size)
+        }
+        "__reflect_field_name" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let i = frame.get_value_by_global(inputs[1]).as_u16();
+            let name = match v.heap_obj() {
+                Some(crate::Value::HeapObj::Record(rec)) => {
+                    rec.field_names.get(i as usize)
+                        .and_then(|n| n.as_ref())
+                        .cloned()
+                        .unwrap_or_default()
+                }
+                Some(crate::Value::HeapObj::Adt(a)) => {
+                    a.fields.get(i as usize)
+                        .and_then(|f| f.name.as_ref().cloned())
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+        }
+        "__reflect_field_value" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let i = frame.get_value_by_global(inputs[1]).as_u16();
+            match v.heap_obj() {
+                Some(crate::Value::HeapObj::Record(rec)) => {
+                    rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL)
+                }
+                Some(crate::Value::HeapObj::Adt(a)) => {
+                    a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL)
+                }
+                _ => Value::NULL,
+            }
+        }
+        "__reflect_adt_constructor" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let name = match v.heap_obj() {
+                Some(crate::Value::HeapObj::Adt(a)) => a.constructor.clone(),
+                _ => String::new(),
+            };
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+        }
+
+        // ── 未实现的 FFI 函数 ──
+        other => panic!("compute_ffi_call: unimplemented FFI function '{}'", other),
+    }
+}
+
+/// compute_fn (idx 46) fallback：has_extern_c 未设置时（无 C 编译器），
+/// 对纯 Rust 可实现的 FFI 函数（cast）用 Rust 直接计算，其余返回默认值。
+#[cfg(not(has_extern_c))]
+pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    let fn_name = graph.ffi_call_names[node.0 as usize]
+        .as_ref()
+        .expect("compute_ffi_call: no ffi_call_name");
+
+    match fn_name.as_str() {
+        // ── IO: 用 Rust std 直接实现 ──
+        "__stdout_write_raw" => {
+            if let Some(crate::Value::HeapObj::Str(s)) = frame.get_value_by_global(inputs[0]).heap_obj() {
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(s.bytes().as_bytes());
+                let _ = std::io::stdout().flush();
+                Value::i32(0)
+            } else {
+                Value::i32(-1)
+            }
+        }
+        "__stderr_write_raw" => {
+            if let Some(crate::Value::HeapObj::Str(s)) = frame.get_value_by_global(inputs[0]).heap_obj() {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(s.bytes().as_bytes());
+                Value::i32(0)
+            } else {
+                Value::i32(-1)
+            }
+        }
+
+        // ── time: 用 Rust std 直接实现 ──
+        "__instant_now_ns" => {
+            let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+            Value::i64(ns as i64)
+        }
+        "__systemtime_now_ns" => {
+            let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+            Value::i64(ns as i64)
+        }
+        "__sleep_ns" => {
+            let ns = frame.get_value_by_global(inputs[0]).as_i64();
+            std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
+            Value::VOID
+        }
+        "__localtime_offset_minutes" => {
+            Value::i32(0)
+        }
+
+        // ── cast: widening to i128（纯 Rust 计算）──
+        "__cast_i8_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_i8() as i128),
+        "__cast_i16_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_i16() as i128),
+        "__cast_i32_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_i32() as i128),
+        "__cast_i64_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_i64() as i128),
+        "__cast_u8_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_u8() as i128),
+        "__cast_u16_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_u16() as i128),
+        "__cast_u32_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_u32() as i128),
+        "__cast_u64_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_u64() as i128),
+        "__cast_usize_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_usize() as i128),
+
+        // ── cast: narrowing from i128（纯 Rust 计算）──
+        "__cast_i128_to_i8" => Value::i8(frame.get_value_by_global(inputs[0]).as_i128() as i8),
+        "__cast_i128_to_i16" => Value::i16(frame.get_value_by_global(inputs[0]).as_i128() as i16),
+        "__cast_i128_to_i32" => Value::i32(frame.get_value_by_global(inputs[0]).as_i128() as i32),
+        "__cast_i128_to_i64" => Value::i64(frame.get_value_by_global(inputs[0]).as_i128() as i64),
+        "__cast_i128_to_u8" => Value::u8(frame.get_value_by_global(inputs[0]).as_i128() as u8),
+        "__cast_i128_to_u16" => Value::u16(frame.get_value_by_global(inputs[0]).as_i128() as u16),
+        "__cast_i128_to_u32" => Value::u32(frame.get_value_by_global(inputs[0]).as_i128() as u32),
+        "__cast_i128_to_u64" => Value::u64(frame.get_value_by_global(inputs[0]).as_i128() as u64),
+        "__cast_i128_to_usize" => Value::usize_val(frame.get_value_by_global(inputs[0]).as_i128() as usize),
+
+        // ── cast: char ──
+        "__cast_char_to_u8" => Value::u8(frame.get_value_by_global(inputs[0]).as_u32() as u8),
+
+        // ── reflect: Rust 侧实现，直接调用 Reflect::format_value ──
+        "__reflect_format" | "__reflect_scalar_to_str" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let s = crate::Reflect::format_value(&v, 0);
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
+        }
+        "__reflect_kind" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let kind: u8 = match &v {
+                Value::Null => 0,
+                Value::Void => 1,
+                Value::Scalar(_, _) => 2,
+                Value::Ref(r) => match &**r {
+                    crate::Value::HeapObj::Str(_) => 3,
+                    crate::Value::HeapObj::Array(_) => 4,
+                    crate::Value::HeapObj::Record(_) => 5,
+                    crate::Value::HeapObj::Adt(_) => 6,
+                    _ => 7,
+                },
+            };
+            Value::u8(kind)
+        }
+        "__reflect_type_name" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let name = match &v {
+                Value::Null => "null".to_string(),
+                Value::Void => "void".to_string(),
+                Value::Scalar(_, tag) => tag.type_name().to_string(),
+                Value::Ref(r) => match &**r {
+                    crate::Value::HeapObj::Str(_) => "str".to_string(),
+                    crate::Value::HeapObj::Array(_) => "array".to_string(),
+                    crate::Value::HeapObj::Record(rec) => rec.type_name.clone(),
+                    crate::Value::HeapObj::Adt(a) => a.constructor.clone(),
+                    _ => "unknown".to_string(),
+                },
+            };
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+        }
+        "__reflect_array_len" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            match v.heap_obj() {
+                Some(crate::Value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
+                _ => Value::usize_val(0),
+            }
+        }
+        "__reflect_field_count" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let count: u16 = match v.heap_obj() {
+                Some(crate::Value::HeapObj::Record(rec)) => rec.fields.len() as u16,
+                Some(crate::Value::HeapObj::Adt(a)) => a.fields.len() as u16,
+                _ => 0,
+            };
+            Value::u16(count)
+        }
+        "__reflect_size" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let size: u8 = match &v {
+                Value::Scalar(_, tag) => match tag {
+                    crate::Value::ScalarTag::Bool | crate::Value::ScalarTag::U8 | crate::Value::ScalarTag::I8 => 1,
+                    crate::Value::ScalarTag::U16 | crate::Value::ScalarTag::I16 | crate::Value::ScalarTag::F16 => 2,
+                    crate::Value::ScalarTag::U32 | crate::Value::ScalarTag::I32 | crate::Value::ScalarTag::F32 | crate::Value::ScalarTag::Char => 4,
+                    crate::Value::ScalarTag::U64 | crate::Value::ScalarTag::I64 | crate::Value::ScalarTag::F64 | crate::Value::ScalarTag::Usize | crate::Value::ScalarTag::Isize => 8,
+                    crate::Value::ScalarTag::U128 | crate::Value::ScalarTag::I128 | crate::Value::ScalarTag::F128 => 16,
+                },
+                _ => 0,
+            };
+            Value::u8(size)
+        }
+        "__reflect_field_name" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let i = frame.get_value_by_global(inputs[1]).as_u16();
+            let name = match v.heap_obj() {
+                Some(crate::Value::HeapObj::Record(rec)) => {
+                    rec.field_names.get(i as usize).and_then(|n| n.as_ref()).cloned().unwrap_or_default()
+                }
+                Some(crate::Value::HeapObj::Adt(a)) => {
+                    a.fields.get(i as usize).and_then(|f| f.name.as_ref().cloned()).unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+        }
+        "__reflect_field_value" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let i = frame.get_value_by_global(inputs[1]).as_u16();
+            match v.heap_obj() {
+                Some(crate::Value::HeapObj::Record(rec)) => rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL),
+                Some(crate::Value::HeapObj::Adt(a)) => a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL),
+                _ => Value::NULL,
+            }
+        }
+        "__reflect_adt_constructor" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let name = match v.heap_obj() {
+                Some(crate::Value::HeapObj::Adt(a)) => a.constructor.clone(),
+                _ => String::new(),
+            };
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+        }
+
+        // ── 未实现的 FFI 函数（无 C 编译器时返回默认值）──
+        _ => Value::i32(0),
+    }
 }
 
 /// compute_fn: 记录构造（从输入收集字段值构造 RecordValue）
@@ -235,12 +1015,20 @@ pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
     let n = &graph.nodes[node.0 as usize];
     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
     let record_val = frame.get_value_by_global(inputs[0]);
-    let field_idx = graph.field_access_infos[node.0 as usize].unwrap_or(0) as usize;
     match record_val.heap_obj() {
         Some(crate::Value::HeapObj::Record(r)) => {
+            // 优先按 field 名称查找（Sema 可能未正确设置 field_idx）
+            if let Some(name) = graph.field_set_names[node.0 as usize].as_ref() {
+                if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(name.as_str())) {
+                    return r.get_field(idx).cloned().unwrap_or(Value::VOID);
+                }
+            }
+            // fallback: field_access_info 的 field_idx
+            let field_idx = graph.field_access_infos[node.0 as usize].unwrap_or(0) as usize;
             r.get_field(field_idx).cloned().unwrap_or(Value::VOID)
         }
         Some(crate::Value::HeapObj::Adt(a)) => {
+            let field_idx = graph.field_access_infos[node.0 as usize].unwrap_or(0) as usize;
             a.get_field(field_idx).cloned().unwrap_or(Value::VOID)
         }
         _ => Value::VOID,
@@ -287,25 +1075,23 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
     let graph = frame.graph.clone();
     let n = &graph.nodes[node.0 as usize];
     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-    let mut record_val = frame.get_value_by_global(inputs[0]);
+    let record_val = frame.get_value_by_global(inputs[0]);
     let new_value = frame.get_value_by_global(inputs[1]);
     let field_name = graph.field_set_names[node.0 as usize]
         .as_ref()
         .expect("field set node has no field name");
-    // 使用 Arc::make_mut 就地修改 record（如果 Arc 共享则先克隆 HeapObj）
-    if let Value::Ref(arc) = &mut record_val {
-        let obj = std::sync::Arc::make_mut(arc);
+    // &self 语义：修改原对象（所有 Arc 引用看到修改）。
+    if let Value::Ref(arc) = &record_val {
+        let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::Value::HeapObj;
+        let obj = unsafe { &mut *ptr };
         if let crate::Value::HeapObj::Record(r) = obj {
-            if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name)) {
+            if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name.as_str())) {
                 if idx < r.fields.len() {
                     r.fields[idx] = new_value;
                 }
             }
         }
     }
-    // 写回值表槽，使修改对其他读该节点的下游可见
-    let local = NodeId(inputs[0].0 - frame.node_offset);
-    frame.value_table[local.0 as usize].value = record_val;
     Value::VOID
 }
 
@@ -315,7 +1101,8 @@ pub fn compute_is_null(frame: &mut Frame, node: NodeId) -> Value {
     let n = &graph.nodes[node.0 as usize];
     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
     let val = frame.get_value_by_global(inputs[0]);
-    Value::bool_val(val.is_null())
+    let is_null = val.is_null();
+    Value::bool_val(is_null)
 }
 
 /// compute_fn: 数组长度（返回 i32，与默认整数运算类型一致）
@@ -575,13 +1362,61 @@ pub fn noop_compute_real(_frame: &mut Frame, _node: NodeId) -> Value {
     Value::VOID
 }
 
+/// compute_fn (idx 48): 序列节点 — 等待所有输入就绪后返回最后一个输入的值。
+///
+/// 用于语句顺序链接：inputs = [prev_effect, current_value]，返回 current_value。
+/// prev_effect 仅作数据依赖边（顺序约束），确保前一个语句完成后才执行当前语句。
+pub fn compute_seq(frame: &mut Frame, node: NodeId) -> Value {
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+    frame.get_value_by_global(inputs[n.input_count as usize - 1])
+}
+
+/// compute_writeback（idx 49）：赋值外层变量，通过 root_frame_ptr 写回函数根帧。
+///
+/// inputs[0] = 值来源（当前帧内节点），writeback_targets[node] = 外层全局 NodeId。
+/// 非阻塞：compute_fn 内直接完成写入，无 pending、无 Engine 层消费。
+pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
+    let graph = frame.graph.clone();
+    let n = &graph.nodes[node.0 as usize];
+    let val_node = graph.inputs_pool.get(n.inputs_offset, n.input_count)[0];
+    let val = frame.get_value_by_global(val_node);
+    let target = graph.writeback_targets[node.0 as usize]
+        .expect("WriteBack node missing target");
+    let consumer_count = graph.downstreams[target.0 as usize].len() as u16;
+
+    // 遍历 parent_frame_ptr 链找到包含 target 的帧（可能在中层帧如循环体帧）
+    let mut ptr = frame.parent_frame_ptr;
+    let mut found = false;
+    while !ptr.is_null() {
+        let f = unsafe { &mut *ptr };
+        let local = target.0.wrapping_sub(f.node_offset);
+        if (local as usize) < f.value_table.len() {
+            f.set_value(NodeId(local), val.clone(), consumer_count);
+            found = true;
+            break;
+        }
+        ptr = f.parent_frame_ptr;
+    }
+    // 回退到 root_frame_ptr（函数根帧）
+    if !found && !frame.root_frame_ptr.is_null() {
+        let root = unsafe { &mut *frame.root_frame_ptr };
+        let local = target.0.wrapping_sub(root.node_offset);
+        if (local as usize) < root.value_table.len() {
+            root.set_value(NodeId(local), val.clone(), consumer_count);
+        }
+    }
+    val
+}
+
 // =========================================================================
 // FramePool — 帧池
 // =========================================================================
 
 /// 帧池：管理帧的分配与访问。
 pub struct FramePool {
-    frames: Vec<Frame>,
+    frames: Vec<Box<Frame>>,
     next_id: u32,
     graph: std::sync::Arc<DataFlowGraph>,
 }
@@ -602,21 +1437,21 @@ impl FramePool {
         let frame = Frame::new(id, subgraph_id, node_count, self.graph.clone());
         if id.0 as usize >= self.frames.len() {
             self.frames.resize_with(id.0 as usize + 1, || {
-                Frame::new(FrameId(0), SubGraphId(0), 0, self.graph.clone())
+                Box::new(Frame::new(FrameId(0), SubGraphId(0), 0, self.graph.clone()))
             });
         }
-        self.frames[id.0 as usize] = frame;
+        self.frames[id.0 as usize] = Box::new(frame);
         id
     }
 
     /// 获取帧的可变引用。
     pub fn get_mut(&mut self, id: FrameId) -> &mut Frame {
-        &mut self.frames[id.0 as usize]
+        self.frames[id.0 as usize].as_mut()
     }
 
     /// 获取帧的不可变引用。
     pub fn get(&self, id: FrameId) -> &Frame {
-        &self.frames[id.0 as usize]
+        self.frames[id.0 as usize].as_ref()
     }
 
     /// 释放帧：清空 value_table（堆对象 Arc 自动 decref），重置状态。
@@ -624,7 +1459,7 @@ impl FramePool {
     /// spec 4.3 complete_subgraph 末尾 `engine.frames.free(child)`。
     /// spec 4.7 帧级兜底：遍历 slot，ready 的堆对象 decref（Rust Arc Drop 自动完成）。
     pub fn free(&mut self, id: FrameId) {
-        let frame = &mut self.frames[id.0 as usize];
+        let frame = self.frames[id.0 as usize].as_mut();
         // 清空 value_table：持有堆对象的 Arc<HeapObj> Drop 时自动 decref
         for slot in frame.value_table.iter_mut() {
             slot.value = Value::NULL;
@@ -643,7 +1478,7 @@ impl FramePool {
 
     /// 取出所有帧（用于 SharedEngine::from_engine 将帧迁移到 HashMap）。
     pub fn drain_frames(&mut self) -> Vec<Frame> {
-        std::mem::take(&mut self.frames)
+        self.frames.drain(..).map(|b| *b).collect()
     }
 }
 
@@ -866,6 +1701,18 @@ impl Engine {
         let sg_id = self.frames.get(fid).subgraph_id;
         let node_end_global = node_start.0 + node_count as u32;
 
+        // 清空 value_table + ready_queue（帧复用时必须重置，避免旧值残留）
+        let frame = self.frames.get_mut(fid);
+        for i in 0..node_count {
+            frame.value_table[i].value = Value::VOID;
+            frame.value_table[i].ready = false;
+            frame.value_table[i].refcount = 0;
+        }
+        frame.ready_queue.clear();
+        frame.control_signal = ControlSignal::None;
+        frame.pending_call = None;
+        frame.pending_await = None;
+
         // 收集嵌套子图范围（在当前子图 node_range 内但属于其他子图的节点范围）
         let nested_ranges: Vec<(u32, u32)> = self
             .graph
@@ -909,7 +1756,17 @@ impl Engine {
                         frame.pending_inputs[i] = 1;
                     }
                 } else {
-                    frame.pending_inputs[i] = graph_node.input_count;
+                    // 只统计当前帧内的输入（外层节点通过 root_frame_ptr 读取，
+                    // 不计入 pending — 外层节点在不同帧，不会通过 notify_downstream 通知）
+                    let inputs = self.graph.inputs_pool.get(
+                        graph_node.inputs_offset,
+                        graph_node.input_count,
+                    );
+                    let in_frame = inputs
+                        .iter()
+                        .filter(|&&n| (n.0.wrapping_sub(node_start.0) as usize) < node_count)
+                        .count() as u8;
+                    frame.pending_inputs[i] = in_frame;
                 }
             }
         }
@@ -1000,7 +1857,8 @@ impl Engine {
     pub fn run_ready_nodes(&mut self, fid: FrameId) {
         loop {
             // 检查控制信号（return/break/continue 已触发）
-            if !matches!(self.frames.get(fid).control_signal, ControlSignal::None) {
+            let cs = self.frames.get(fid).control_signal.clone();
+            if !matches!(cs, ControlSignal::None) {
                 break;
             }
 
@@ -1092,14 +1950,54 @@ impl Engine {
             // 检测 pending_call（Call/Gate/AsyncCall 节点设置）
             let pending = self.frames.get(fid).pending_call.clone();
             if let Some(pending) = pending {
-                // Call/Gate/AsyncCall 节点：执行 start_subgraph
-                let child_fid = self.start_subgraph(
-                    fid,
-                    pending.call_node_local,
-                    pending.target_sg,
-                    &pending.args,
-                );
                 self.frames.get_mut(fid).pending_call = None;
+
+                let target_loop_kind =
+                    self.graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
+
+                // LoopBody 帧复用：循环体子图已分配过帧时复用，避免每轮创建新帧（O(1) 内存）
+                let child_fid = if target_loop_kind == crate::Ir::LoopKind::LoopBody {
+                    if let Some(bfid) = self.frames.get(fid).body_frame_id {
+                        // 复用 body_sg 帧：注入参数 + 入就绪队列
+                        let target_sg = &self.graph.subgraphs[pending.target_sg.0 as usize];
+                        let offset = target_sg.node_range.0 .0 as usize;
+                        let param_count = target_sg.param_count as usize;
+                        for (i, arg) in pending.args.iter().enumerate().take(param_count) {
+                            let local_id = NodeId(i as u32);
+                            let consumer_count =
+                                self.graph.downstreams[offset + i].len() as u16;
+                            let frame = self.frames.get_mut(bfid);
+                            frame.set_value(local_id, arg.clone(), consumer_count);
+                            frame.push_ready(local_id);
+                        }
+                        // 重新绑定 caller（Gate 节点 local id）
+                        self.frames.get_mut(bfid).caller =
+                            Some((fid, pending.call_node_local));
+                        // 重新设置 parent_frame_ptr（指向循环帧）
+                        self.frames.get_mut(bfid).parent_frame_ptr =
+                            self.frames.get_mut(fid) as *mut crate::Ir::Frame;
+                        self.frames.get_mut(bfid).state = FrameState::Ready;
+                        bfid
+                    } else {
+                        // 首次创建 body_sg 帧
+                        let bfid = self.start_subgraph(
+                            fid,
+                            pending.call_node_local,
+                            pending.target_sg,
+                            &pending.args,
+                        );
+                        self.frames.get_mut(fid).body_frame_id = Some(bfid);
+                        bfid
+                    }
+                } else {
+                    // 非 LoopBody：正常 start_subgraph
+                    self.start_subgraph(
+                        fid,
+                        pending.call_node_local,
+                        pending.target_sg,
+                        &pending.args,
+                    )
+                };
 
                 // 子帧入就绪帧队列
                 self.ready_frames.push_back(child_fid);
@@ -1391,6 +2289,31 @@ impl Engine {
         // 绑定 caller
         self.frames.get_mut(child_fid).caller = Some((caller_fid, call_node));
 
+        // 设置 root_frame_ptr：同函数子图继承函数根帧，跨函数调用设为 null
+        let caller_sg_id = self.frames.get(caller_fid).subgraph_id;
+        let same_function = self.graph.subgraphs[caller_sg_id.0 as usize].function_id
+            == self.graph.subgraphs[subgraph_id.0 as usize].function_id;
+        let caller_root_ptr = self.frames.get(caller_fid).root_frame_ptr;
+        let root_ptr = if same_function {
+            if caller_root_ptr.is_null() {
+                // caller 是函数根帧，指向 caller
+                self.frames.get_mut(caller_fid) as *mut crate::Ir::Frame
+            } else {
+                caller_root_ptr
+            }
+        } else {
+            std::ptr::null_mut()
+        };
+        self.frames.get_mut(child_fid).root_frame_ptr = root_ptr;
+
+        // 设置 parent_frame_ptr：指向直接调用方帧，用于 get_value_by_global 遍历中间帧
+        let parent_ptr = if same_function {
+            self.frames.get_mut(caller_fid) as *mut crate::Ir::Frame
+        } else {
+            std::ptr::null_mut()
+        };
+        self.frames.get_mut(child_fid).parent_frame_ptr = parent_ptr;
+
         child_fid
     }
 
@@ -1398,7 +2321,37 @@ impl Engine {
     ///
     /// spec 4.4 on_event_arrived：事件到达→注入值+唤醒。
     fn complete_and_wake_caller(&mut self, child_fid: FrameId) {
+        // LoopBody 完成检测：循环体子图完成后，重置循环（Continue/None）或退出（Break/Return）
+        let child_sg_id = self.frames.get(child_fid).subgraph_id;
+        let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
+        if child_loop_kind == crate::Ir::LoopKind::LoopBody {
+            let child_signal = self.frames.get(child_fid).control_signal.clone();
+            let (loop_fid, _call_node) = self
+                .frames
+                .get(child_fid)
+                .caller
+                .expect("LoopBody frame missing caller");
+            match child_signal {
+                ControlSignal::Break | ControlSignal::Return(_) => {
+                    // break/return → 循环退出：释放 body 帧，传播信号到循环帧，循环帧正常完成
+                    self.frames.free(child_fid);
+                    self.frames.get_mut(loop_fid).body_frame_id = None;
+                    self.frames.get_mut(loop_fid).control_signal = child_signal;
+                    // 循环帧的 loop_kind 是 While/Loop/For（非 LoopBody），递归走原逻辑
+                    self.complete_and_wake_caller(loop_fid);
+                    return;
+                }
+                ControlSignal::Continue | ControlSignal::None => {
+                    // continue/正常完成 → 循环重置（帧复用）
+                    self.reset_loop_iteration(loop_fid, child_fid);
+                    return;
+                }
+            }
+        }
+
         let return_value = self.extract_child_return(child_fid);
+        // 获取子帧的控制信号（Return/Break/Continue），用于 Gate 分支子图传播
+        let child_signal = self.frames.get(child_fid).control_signal.clone();
 
         let caller = self.frames.get(child_fid).caller;
         if let Some((caller_fid, call_node)) = caller {
@@ -1417,6 +2370,14 @@ impl Engine {
             caller_frame.suspend_state = SuspendState::NotSuspended;
             caller_frame.suspend_event = None;
 
+            // Gate 分支子图的控制信号传播：if/match 分支中的 return/break/continue
+            // 应传播到父帧（分支只是控制流分派，不构成新的函数边界）。
+            // Call 节点的子图是函数调用，Return 信号已被 extract_child_return 消费为返回值，不传播。
+            let is_gate = self.graph.nodes[call_graph_id.0 as usize].kind == crate::Ir::NodeKind::Gate;
+            if is_gate && !matches!(child_signal, ControlSignal::None) {
+                caller_frame.control_signal = child_signal;
+            }
+
             // 通知 call/gate 节点下游
             self.notify_downstream(caller_fid, call_node, call_graph_id, caller_offset);
 
@@ -1426,6 +2387,122 @@ impl Engine {
 
         // 释放子帧：清空 value_table（堆对象 Arc 自动 decref），spec 4.3 frames.free(child)
         self.frames.free(child_fid);
+    }
+
+    /// 循环迭代重置：body_sg 完成后重置循环帧（cond + Gate）+ 复用 body_sg 帧。
+    ///
+    /// - 重置循环帧的 cond_node（重新计算 condition）+ Gate（pending=1 等 cond notify）
+    /// - 重置 body_sg 帧（prepare_frame 复用）
+    /// - 循环帧重新入就绪队列
+    fn reset_loop_iteration(&mut self, loop_fid: FrameId, body_fid: FrameId) {
+        let loop_sg_id = self.frames.get(loop_fid).subgraph_id;
+        let (loop_offset, loop_kind, cond_node, return_node, iter_next_node) = {
+            let sg = &self.graph.subgraphs[loop_sg_id.0 as usize];
+            (
+                sg.node_range.0 .0,
+                sg.loop_kind,
+                sg.cond_node,
+                sg.return_node,
+                sg.iter_next_node,
+            )
+        };
+
+        // 1. For 循环：额外重置 iter_next_node（next_call），让迭代器重新推进
+        if loop_kind == crate::Ir::LoopKind::For {
+            if let Some(next_node) = iter_next_node {
+                let next_local = NodeId(next_node.0 - loop_offset);
+                self.reset_node_ready(loop_fid, next_local);
+                self.frames.get_mut(loop_fid).push_ready(next_local);
+            }
+        }
+
+        // 2. 重置 cond_node（重新计算 condition）
+        //    For 循环：cond_node(is_null) 依赖 next_call → pending=1 等 notify，不 push_ready
+        //    While/Loop：cond_node 依赖外层变量 → pending=0 直接就绪
+        //    注意：Const cond_node（如 loop {} 的 Const(true)）的 compute_fn 是 noop，
+        //    reset_node_ready 清值后无法重新计算，必须重新预填充。
+        if let Some(cond_node) = cond_node {
+            let cond_local = NodeId(cond_node.0 - loop_offset);
+            if loop_kind == crate::Ir::LoopKind::For {
+                self.reset_node_pending(loop_fid, cond_local, 1);
+            } else {
+                self.reset_node_ready(loop_fid, cond_local);
+                // Const cond_node 重新预填充（compute_fn 是 noop，值丢失后无法恢复）
+                if self.graph.nodes[cond_node.0 as usize].kind == crate::Ir::NodeKind::Const {
+                    if let Some(cv) = self.graph.const_values[cond_node.0 as usize] {
+                        let handle = self.alloc_const_value(cv);
+                        let consumer_count =
+                            self.graph.downstreams[cond_node.0 as usize].len() as u16;
+                        self.frames.get_mut(loop_fid)
+                            .set_value(cond_local, handle, consumer_count);
+                    }
+                }
+                self.frames.get_mut(loop_fid).push_ready(cond_local);
+            }
+        }
+
+        // 3. 重置 Gate 节点（pending=1，等 cond notify）
+        let gate_local = NodeId(return_node.0 - loop_offset);
+        self.reset_node_pending(loop_fid, gate_local, 1);
+
+        // 4. 重置 body_sg 帧（复用）
+        let (body_sg_start, body_node_count) = {
+            let body_sg_id = self.frames.get(body_fid).subgraph_id;
+            let body_sg = &self.graph.subgraphs[body_sg_id.0 as usize];
+            (body_sg.node_range.0, (body_sg.node_range.1 .0 - body_sg.node_range.0 .0) as usize)
+        };
+        self.prepare_frame(body_fid, body_sg_start, body_node_count);
+        // body_sg 帧重新绑定 caller（保持循环帧为 caller）
+        self.frames.get_mut(body_fid).caller =
+            Some((loop_fid, NodeId(return_node.0 - loop_offset)));
+        // 设置 root_frame_ptr（复用 start_subgraph 的逻辑）
+        let caller_root_ptr = self.frames.get(loop_fid).root_frame_ptr;
+        let body_root_ptr = if caller_root_ptr.is_null() {
+            self.frames.get_mut(loop_fid) as *mut crate::Ir::Frame
+        } else {
+            caller_root_ptr
+        };
+        self.frames.get_mut(body_fid).root_frame_ptr = body_root_ptr;
+        // 设置 parent_frame_ptr：body 帧的直接父帧是循环帧
+        self.frames.get_mut(body_fid).parent_frame_ptr =
+            self.frames.get_mut(loop_fid) as *mut crate::Ir::Frame;
+
+        // 5. 重置循环帧状态 + 重新入就绪队列
+        let frame = self.frames.get_mut(loop_fid);
+        frame.control_signal = ControlSignal::None;
+        frame.state = FrameState::Ready;
+        frame.suspend_state = SuspendState::NotSuspended;
+        frame.suspend_event = None;
+        frame.pending_call = None;
+        self.ready_frames.push_back(loop_fid);
+    }
+
+    /// 重置节点为就绪状态（pending=0，清值，不入队）。
+    fn reset_node_ready(&mut self, fid: FrameId, node_local: NodeId) {
+        let frame = self.frames.get_mut(fid);
+        let i = node_local.0 as usize;
+        if i < frame.pending_inputs.len() {
+            frame.pending_inputs[i] = 0;
+        }
+        if i < frame.value_table.len() {
+            frame.value_table[i].value = Value::VOID;
+            frame.value_table[i].ready = false;
+            frame.value_table[i].refcount = 0;
+        }
+    }
+
+    /// 重置节点为待定状态（pending=N，清值）。
+    fn reset_node_pending(&mut self, fid: FrameId, node_local: NodeId, pending: u8) {
+        let frame = self.frames.get_mut(fid);
+        let i = node_local.0 as usize;
+        if i < frame.pending_inputs.len() {
+            frame.pending_inputs[i] = pending;
+        }
+        if i < frame.value_table.len() {
+            frame.value_table[i].value = Value::VOID;
+            frame.value_table[i].ready = false;
+            frame.value_table[i].refcount = 0;
+        }
     }
 
     /// 解析 await 事件源 id + 检查就绪状态。
@@ -1640,7 +2717,14 @@ impl Engine {
         let fid = self.init_frame(entry_sg);
         self.ready_frames.push_back(fid);
 
+        let mut iter_count: u64 = 0;
         loop {
+            iter_count += 1;
+            if iter_count > 500000 {
+                let ready = self.ready_frames.len();
+                let waiters = self.event_waiters.len();
+                panic!("DEBUG: event loop stuck after {} iters: ready_frames={}, event_waiters={}", iter_count, ready, waiters);
+            }
             // 检查 timer 事件（spec 4.4：事件循环每次迭代检查到期 timer）
             self.check_timers();
 
@@ -1869,7 +2953,16 @@ fn prepare_frame_shared(frame: &mut Frame, graph: &DataFlowGraph) {
                     frame.pending_inputs[i] = 1;
                 }
             } else {
-                frame.pending_inputs[i] = graph_node.input_count;
+                // 只统计当前帧内的输入（外层节点通过 root_frame_ptr 读取，不计入 pending）
+                let inputs = graph.inputs_pool.get(
+                    graph_node.inputs_offset,
+                    graph_node.input_count,
+                );
+                let in_frame = inputs
+                    .iter()
+                    .filter(|&&n| (n.0.wrapping_sub(node_start.0) as usize) < node_count)
+                    .count() as u8;
+                frame.pending_inputs[i] = in_frame;
             }
         }
     }
@@ -2015,6 +3108,7 @@ fn complete_and_wake_caller_shared(
     local_queue: &DequeWorker<FrameId>,
 ) {
     let return_value = extract_child_return_shared(child_frame, &shared.graph);
+    let child_signal = child_frame.control_signal.clone();
     let caller = child_frame.caller;
 
     if let Some((caller_fid, call_node)) = caller {
@@ -2037,6 +3131,12 @@ fn complete_and_wake_caller_shared(
             caller_frame.state = FrameState::Ready;
             caller_frame.suspend_state = SuspendState::NotSuspended;
             caller_frame.suspend_event = None;
+
+            // Gate 分支子图的控制信号传播（同 complete_and_wake_caller）
+            let is_gate = shared.graph.nodes[call_graph_id.0 as usize].kind == crate::Ir::NodeKind::Gate;
+            if is_gate && !matches!(child_signal, ControlSignal::None) {
+                caller_frame.control_signal = child_signal;
+            }
 
             notify_downstream_shared(
                 caller_frame,
@@ -2809,6 +3909,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(0));
         graph.compute_downstreams();
@@ -2904,6 +4009,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(0));
         graph.compute_downstreams();
@@ -2958,6 +4068,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SubGraph 1: main() = add(1, 2)
@@ -2992,6 +4107,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -3018,7 +4138,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(0), node_range: (NodeId(0), NodeId(3)), param_count: 2,
             entry_node: n0, return_node: n2, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         // SubGraph 1: main() = add(1, 2)
@@ -3032,7 +4152,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(1), node_range: (NodeId(3), NodeId(6)), param_count: 0,
             entry_node: n3, return_node: n5, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -3057,7 +4177,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(0), node_range: (NodeId(0), NodeId(3)), param_count: 1,
             entry_node: n0, return_node: n2, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         // SubGraph 1 (main): N3=Const(10), N4=ClosureConstruct(SG0, arity=1, upvalues=[]),
@@ -3071,7 +4191,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(1), node_range: (NodeId(3), NodeId(6)), param_count: 0,
             entry_node: n3, return_node: n5, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -3094,7 +4214,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(0), node_range: (NodeId(0), NodeId(1)), param_count: 0,
             entry_node: n0, return_node: n0, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         // SubGraph 1: else = 2
@@ -3103,7 +4223,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(1), node_range: (NodeId(1), NodeId(2)), param_count: 0,
             entry_node: n1, return_node: n1, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         // SubGraph 2: main = if true { then } else { else }
@@ -3117,7 +4237,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(2), node_range: (NodeId(2), NodeId(4)), param_count: 0,
             entry_node: n2, return_node: n3, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(2));
@@ -3138,7 +4258,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(0), node_range: (NodeId(0), NodeId(1)), param_count: 0,
             entry_node: n0, return_node: n0, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         let n1 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
@@ -3146,7 +4266,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(1), node_range: (NodeId(1), NodeId(2)), param_count: 0,
             entry_node: n1, return_node: n1, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         let n2 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
@@ -3159,7 +4279,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(2), node_range: (NodeId(2), NodeId(4)), param_count: 0,
             entry_node: n2, return_node: n3, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(2));
@@ -3194,7 +4314,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(0), node_range: (NodeId(0), NodeId(5)), param_count: 2,
             entry_node: n0, return_node: n4, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         // SubGraph 1: loop_body (递归调用 loop_iter(acc+i, i+1))
@@ -3213,7 +4333,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(1), node_range: (NodeId(5), NodeId(11)), param_count: 2,
             entry_node: n5, return_node: n10, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         // SubGraph 2: return acc
@@ -3221,7 +4341,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(2), node_range: (NodeId(11), NodeId(12)), param_count: 1,
             entry_node: n11, return_node: n11, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         // SubGraph 3: main = loop_iter(0, 1)
@@ -3235,7 +4355,7 @@ mod tests {
         graph.add_subgraph(SubGraph {
             id: SubGraphId(3), node_range: (NodeId(12), NodeId(15)), param_count: 0,
             entry_node: n12, return_node: n14, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(),
+            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(3));
@@ -3279,6 +4399,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(0));
         graph.compute_downstreams();
@@ -3864,7 +4989,6 @@ mod tests {
             }
         "#;
         let (engine, h) = run_source(src);
-        eprintln!("DEBUG: return value tag = {:?}", h.scalar_tag());
         // 若引擎未能正确执行（构造器等问题），值可能为 Null — 不 crash 即视为静态分派路径连通
         match h.scalar_tag() {
             Some(crate::Value::ScalarTag::I64) => {
@@ -3900,7 +5024,6 @@ mod tests {
             }
         "#;
         let (engine, h) = run_source(src);
-        eprintln!("DEBUG: return value tag = {:?}", h.scalar_tag());
         match h.scalar_tag() {
             Some(crate::Value::ScalarTag::I32) => {
                 let result = h.as_i32();
@@ -3986,6 +5109,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SubGraph 1: outer(x) = inner(x)  (param_count=1)
@@ -4013,6 +5141,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SubGraph 2: main() = outer(42)  (param_count=0)
@@ -4041,6 +5174,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(2));
@@ -4087,6 +5225,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SubGraph 1: else branch = 99  (param_count=0)
@@ -4107,6 +5250,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SubGraph 2: main = if true { add(1,2) } else { 99 }
@@ -4154,6 +5302,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(2));
@@ -4215,6 +5368,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SubGraph 1: then branch = 0  (param_count=0)
@@ -4235,6 +5393,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SubGraph 2: else branch = n + sum(n-1)  (param_count=1)
@@ -4283,6 +5446,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SubGraph 3: main() = sum(3)  (param_count=0)
@@ -4311,6 +5479,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(3));
@@ -4349,6 +5522,11 @@ mod tests {
             has_suspend: true, // async 标记
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SG1: main() = async_fn().await()
@@ -4391,6 +5569,11 @@ mod tests {
                 kind: EventSourceKind::AsyncJoin,
             }],
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -4429,6 +5612,11 @@ mod tests {
             has_suspend: true,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SG1: main() = async_fn().await() + async_fn().await()
@@ -4507,6 +5695,11 @@ mod tests {
                 EventSourceDecl { node: n5, kind: EventSourceKind::AsyncJoin },
             ],
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -4541,6 +5734,11 @@ mod tests {
             has_suspend: true,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SG1: main() = async_add(10, 32).await()
@@ -4566,6 +5764,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: vec![EventSourceDecl { node: n6, kind: EventSourceKind::AsyncJoin }],
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -4672,6 +5875,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: vec![EventSourceDecl { node: n1, kind: EventSourceKind::Channel }],
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(0));
         graph.compute_downstreams();
@@ -4743,6 +5951,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: vec![EventSourceDecl { node: n1, kind: EventSourceKind::Timer }],
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(0));
         graph.compute_downstreams();
@@ -4811,6 +6024,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SG1: main() = select { ch.recv() => 42 }
@@ -4848,6 +6066,11 @@ mod tests {
             has_suspend: true,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(1));
         graph.compute_downstreams();
@@ -4934,6 +6157,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SG1: main() = select { ch.recv() => 42 }
@@ -4969,6 +6197,11 @@ mod tests {
             has_suspend: true,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(1));
         graph.compute_downstreams();
@@ -5087,6 +6320,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(0));
         graph.compute_downstreams();
@@ -5143,6 +6381,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SG1: main() = show(占位 self)
@@ -5170,6 +6413,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -5213,6 +6461,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SG1: main() = (recv).next()  — recv 运行时注入 TraitValue
@@ -5239,6 +6492,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -5348,6 +6606,11 @@ mod tests {
             has_suspend: true,
             event_source_decls: vec![EventSourceDecl { node: n1, kind: EventSourceKind::Timer }],
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(0));
@@ -5398,6 +6661,11 @@ mod tests {
             has_suspend: false,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
         graph.set_entry_subgraph(SubGraphId(0));
         graph.compute_downstreams();
@@ -5460,6 +6728,11 @@ mod tests {
             has_suspend: true,
             event_source_decls: Vec::new(),
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         // SG1: main() = async_fn().await() + async_fn().await()
@@ -5517,6 +6790,11 @@ mod tests {
                 EventSourceDecl { node: n5, kind: EventSourceKind::AsyncJoin },
             ],
             defer_table: Vec::new(),
+            loop_kind: crate::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
         });
 
         graph.set_entry_subgraph(SubGraphId(1));
@@ -5536,5 +6814,158 @@ mod tests {
         let mut engine = Engine::new(graph);
         let result = engine.run_multi_worker(1);
         assert_eq!(result.as_i32(), 3);
+    }
+
+    // ===== Task 13-14: 循环状态穿透 + 迭代帧端到端测试 =====
+
+    /// while 循环内赋值外部可见性
+    #[test]
+    fn test_while_assignment_visible_outside() {
+        let src = r#"
+            fun main(): i32 {
+                var sum: i32 = 0
+                var i: i32 = 0
+                while i < 10 {
+                    sum = sum + i
+                    i = i + 1
+                }
+                return sum
+            }
+        "#;
+        let (_engine, h) = run_source(src);
+        assert_eq!(h.as_i32(), 45);
+    }
+
+    /// while 循环累加 1..=100
+    #[test]
+    fn test_while_sum_1_to_100() {
+        let src = r#"
+            fun main(): i32 {
+                var sum: i32 = 0
+                var i: i32 = 1
+                while i <= 100 {
+                    sum = sum + i
+                    i = i + 1
+                }
+                return sum
+            }
+        "#;
+        let (_engine, h) = run_source(src);
+        assert_eq!(h.as_i32(), 5050);
+    }
+
+    /// loop + break 赋值
+    #[test]
+    fn test_loop_break_assignment() {
+        let src = r#"
+            fun main(): i32 {
+                var x: i32 = 0
+                loop {
+                    x = x + 1
+                    if x >= 5 { break }
+                }
+                return x
+            }
+        "#;
+        let (_engine, h) = run_source(src);
+        assert_eq!(h.as_i32(), 5);
+    }
+
+    /// 嵌套 while 循环
+    #[test]
+    fn test_nested_while() {
+        let src = r#"
+            fun main(): i32 {
+                var total: i32 = 0
+                var i: i32 = 0
+                while i < 3 {
+                    var j: i32 = 0
+                    while j < 3 {
+                        total = total + 1
+                        j = j + 1
+                    }
+                    i = i + 1
+                }
+                return total
+            }
+        "#;
+        let (_engine, h) = run_source(src);
+        assert_eq!(h.as_i32(), 9);
+    }
+
+    /// if 分支内赋值外层变量
+    #[test]
+    fn test_if_assignment_outside() {
+        let src = r#"
+            fun main(): i32 {
+                var x: i32 = 1
+                if true { x = 2 }
+                return x
+            }
+        "#;
+        let (_engine, h) = run_source(src);
+        assert_eq!(h.as_i32(), 2);
+    }
+
+    /// match 分支内赋值外层变量（WriteBack 适配）
+    #[test]
+    fn test_match_assignment_outside() {
+        let src = r#"
+            fun main(): i32 {
+                var x: i32 = 1
+                match 1 {
+                    1 => { x = 2 }
+                    _ => { x = 3 }
+                }
+                return x
+            }
+        "#;
+        let (_engine, h) = run_source(src);
+        assert_eq!(h.as_i32(), 2);
+    }
+
+    /// while + continue 跳过偶数
+    #[test]
+    fn test_while_continue_skip_even() {
+        let src = r#"
+            fun main(): i32 {
+                var sum: i32 = 0
+                var i: i32 = 0
+                while i < 10 {
+                    i = i + 1
+                    if i % 2 == 0 { continue }
+                    sum = sum + i
+                }
+                return sum
+            }
+        "#;
+        let (_engine, h) = run_source(src);
+        // 1+3+5+7+9 = 25
+        assert_eq!(h.as_i32(), 25);
+    }
+
+    /// O(1) 内存验证：大循环不堆积帧
+    #[test]
+    fn test_loop_frame_count_stable() {
+        let src = r#"
+            fun main(): i32 {
+                var sum: i32 = 0
+                var i: i32 = 0
+                while i < 10000 {
+                    sum = sum + 1
+                    i = i + 1
+                }
+                return sum
+            }
+        "#;
+        let (engine, h) = run_source(src);
+        assert_eq!(h.as_i32(), 10000);
+        // 帧池大小应远小于循环次数（O(1) 内存）
+        // next_id 包含所有分配过的帧（含已释放），但活跃帧数应恒定
+        assert!(
+            engine.frames.next_id < 100,
+            "frame count {} should be O(1), not O(n)",
+            engine.frames.next_id
+        );
     }
 }

@@ -391,7 +391,7 @@ pub extern "C" fn __reflect_format(handle: u32, out_data: *mut *const u8, out_le
 /// 递归格式化 Value 为 String（内部函数，非 extern "C"）。
 /// [R-3] depth 限制递归深度，防止环引用或极深嵌套导致栈溢出。
 const FORMAT_MAX_DEPTH: u32 = 64;
-fn format_value(v: &Value, depth: u32) -> String {
+pub fn format_value(v: &Value, depth: u32) -> String {
     // 深度超限：截断为省略号，避免栈溢出（环/极深嵌套防御）
     if depth > FORMAT_MAX_DEPTH {
         return "...".to_string();

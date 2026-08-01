@@ -12,7 +12,7 @@
 // ============================================================
 // 1. 数组 push — O(n²) COW 复制
 // ============================================================
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 fun arrayPush(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0

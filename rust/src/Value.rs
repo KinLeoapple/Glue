@@ -403,6 +403,31 @@ pub enum ScalarTag {
     F16, F32, F64, F128,
 }
 
+impl ScalarTag {
+    pub fn type_name(self) -> &'static str {
+        match self {
+            ScalarTag::Bool => "bool",
+            ScalarTag::Char => "char",
+            ScalarTag::I8 => "i8",
+            ScalarTag::I16 => "i16",
+            ScalarTag::I32 => "i32",
+            ScalarTag::I64 => "i64",
+            ScalarTag::I128 => "i128",
+            ScalarTag::U8 => "u8",
+            ScalarTag::U16 => "u16",
+            ScalarTag::U32 => "u32",
+            ScalarTag::U64 => "u64",
+            ScalarTag::U128 => "u128",
+            ScalarTag::Isize => "isize",
+            ScalarTag::Usize => "usize",
+            ScalarTag::F16 => "f16",
+            ScalarTag::F32 => "f32",
+            ScalarTag::F64 => "f64",
+            ScalarTag::F128 => "f128",
+        }
+    }
+}
+
 // ---- ScalarValue — 标量值 union（16 字节）----
 
 /// 标量值 union（16 字节，容纳 i128/u128/F128）。

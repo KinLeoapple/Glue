@@ -2,7 +2,7 @@
 // 目标：压测 ArrayValue 构造、push、迭代、索引、拼接、矩阵运算
 // 强化：5000→20000 push，新增矩阵乘法和数组排序
 
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 fun buildArray(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0

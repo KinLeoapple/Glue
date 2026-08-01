@@ -759,8 +759,6 @@ pub enum TypeDef<'a> {
     Alias { target: TypeRef },
     /// 新类型 `newtype name = inner`
     Newtype { name: &'a str, inner: TypeRef },
-    /// 错误新类型 `error_newtype name(params)`
-    ErrorNewtype { name: &'a str, params: Vec<Param<'a>> },
 }
 
 // =========================================================================
@@ -910,11 +908,6 @@ pub fn walk_type_def<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, 
         }
         TypeDef::Newtype { inner, .. } => {
             walk_type(v, arena, *inner);
-        }
-        TypeDef::ErrorNewtype { params, .. } => {
-            for p in params {
-                walk_param(v, arena, p);
-            }
         }
     }
 }
@@ -3952,7 +3945,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             let _ = self.expect_close_angle("expected '>' to close type parameter list");
         }
         let mut implemented_traits = Vec::new();
-        let mut has_error_trait = false;
         if self.match_token(TokenKind::Colon) {
             let has_paren = self.check(TokenKind::LParen);
             if has_paren {
@@ -3962,15 +3954,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             if has_paren {
                 let _ = self.expect(TokenKind::RParen, "expected ')' after trait list");
             }
-            if implemented_traits.iter().any(|t| t.trait_name == "Err") {
-                has_error_trait = true;
-            }
         }
         let _ = self.expect(TokenKind::Eq, "expected '=' to define type body");
-        let mut def = self.parse_type_def(has_error_trait)?;
-        if let TypeDef::ErrorNewtype { name, .. } = &mut def {
-            *name = name_tok.lexeme;
-        }
+        let mut def = self.parse_type_def()?;
         let mut type_constraints = Vec::new();
         if self.match_token(TokenKind::KwWith) {
             self.parse_type_constraints(&mut type_constraints)?;
@@ -3995,7 +3981,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     /// 解析类型定义体
-    fn parse_type_def(&mut self, has_error_trait: bool) -> ParseResult<TypeDef<'a>> {
+    fn parse_type_def(&mut self) -> ParseResult<TypeDef<'a>> {
         if self.match_token(TokenKind::Pipe) {
             return self.parse_adt_body();
         }
@@ -4008,7 +3994,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         if self.check(TokenKind::Identifier) {
             let saved = self.current;
-            let name_tok = self.advance();
+            let _name_tok = self.advance();
             if self.check(TokenKind::LParen) {
                 self.advance();
                 if !self.check(TokenKind::RParen) {
@@ -4018,18 +4004,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         if self.check(TokenKind::Colon) {
                             // name: Type → 记录式参数
                             self.current = saved2;
-                            let mut params = Vec::new();
-                            self.parse_param_list(&mut params)?;
+                            let mut _params = Vec::new();
+                            self.parse_param_list(&mut _params)?;
                             if self.expect(TokenKind::RParen, "expected ')'").is_err() {
                                 self.current = saved;
                                 let target = self.parse_type()?;
                                 return Ok(TypeDef::Alias { target });
-                            }
-                            if has_error_trait {
-                                return Ok(TypeDef::ErrorNewtype {
-                                    name: name_tok.lexeme,
-                                    params,
-                                });
                             }
                             self.current = saved;
                             if let Some(def) = self.try_parse_single_ctor_adt() {
@@ -7066,13 +7046,6 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 self.write_line(&format!("(newtype \"{}\"", name));
                 self.indent();
                 self.vt(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeDef::ErrorNewtype { name, params } => {
-                self.write_line(&format!("(error_newtype \"{}\"", name));
-                self.indent();
-                self.print_params(params);
                 self.dedent();
                 self.write_line(")");
             }
