@@ -890,6 +890,15 @@ impl EnvArena {
         true
     }
 
+    /// 在 `env` 中强制定义绑定（覆盖已存在的同名绑定）。
+    ///
+    /// 用于构造器注册：`register_module_aliases` 先注册模块路径别名（如 "DateTime" → ModuleRef），
+    /// 随后 `predeclare_declarations` 注册构造器时需覆盖别名，使 `DateTime(...)` 解析为构造器而非 ModuleRef。
+    pub fn redefine(&mut self, env: EnvId, name: &str, ty: TypeHandle) {
+        let node = &mut self.envs[env.0 as usize];
+        node.bindings.insert(name.to_string(), ty);
+    }
+
     /// 自 `env` 向上查找名字（含父环境链）；未找到返回 `None`。
     pub fn lookup(&self, mut env: EnvId, name: &str) -> Option<TypeHandle> {
         loop {
@@ -1120,12 +1129,6 @@ pub struct DispatchInfo {
     pub instance_id: u32,
 }
 
-/// typeof 已解析元信息。
-#[derive(Debug, Clone, Copy)]
-pub struct TypeofMeta {
-    pub type_desc: &'static TypeDescriptor,
-}
-
 /// reflect 已解析元信息。
 #[derive(Debug, Clone, Copy)]
 pub struct ReflectMeta {
@@ -1228,8 +1231,6 @@ pub struct SemaResult {
     pub field_accesses: FxHashMap<u64, FieldAccessInfo>,
     /// 方法分派元信息（key = AST call Expr 句柄地址）
     pub method_dispatches: FxHashMap<u64, DispatchInfo>,
-    /// typeof 已解析元信息
-    pub typeof_metas: FxHashMap<u64, TypeofMeta>,
     /// reflect 已解析元信息
     pub reflect_metas: FxHashMap<u64, ReflectMeta>,
     /// 已解析类型描述符（key = AST Expr 句柄地址）
@@ -1273,7 +1274,6 @@ impl SemaResult {
             call_instantiations: FxHashMap::default(),
             field_accesses: FxHashMap::default(),
             method_dispatches: FxHashMap::default(),
-            typeof_metas: FxHashMap::default(),
             reflect_metas: FxHashMap::default(),
             resolved_type_descs: FxHashMap::default(),
             field_id_map: FxHashMap::default(),
@@ -2835,6 +2835,9 @@ fn module_logical_path(name: &str) -> Option<String> {
 }
 
 /// fun_decl → FuncSigInfo，注册到 sema_result.func_sigs。
+///
+/// 带 `self` 参数的方法使用 mangled 名 `TypeName.method` 存储，
+/// 使 `lookup_method_type` 能按接收者类型精确分派，避免同名方法冲突。
 fn ast_fun_decl_to_func_sig<'a>(
     sema_result: &mut SemaResult,
     name: &'a str,
@@ -2844,7 +2847,22 @@ fn ast_fun_decl_to_func_sig<'a>(
     is_async: bool,
     ast: &AstArena<'a>,
 ) -> bool {
-    let name: Box<str> = name.into();
+    // 对带 self 参数的方法，使用 mangled 名 `TypeName.method`
+    // 使 lookup_method_type 能按接收者类型查找正确签名
+    let name: Box<str> = if !params.is_empty() && params[0].name == "self" {
+        if let Some(tr) = params[0].type_annotation {
+            let node = &ast.ty(tr).node;
+            if let Some(type_name) = type_name_from_type_node(node) {
+                format!("{}.{}", type_name, name).into()
+            } else {
+                name.into()
+            }
+        } else {
+            name.into()
+        }
+    } else {
+        name.into()
+    };
 
     // type_params：取每个 TypeParam 的 name
     let type_params: Box<[Box<str>]> = type_params.iter().map(|tp| tp.name.into()).collect();
@@ -3660,6 +3678,20 @@ fn walk_stmt<'a>(
             walk_expr(*body, ctx, sema_result);
         }
         Stmt::Loop { body } => walk_expr(*body, ctx, sema_result),
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            crate::Ast::Decl::FunDecl { body, .. } => {
+                walk_expr(*body, ctx, sema_result);
+            }
+            crate::Ast::Decl::TypeDecl { methods, .. }
+            | crate::Ast::Decl::TraitDecl { methods, .. } => {
+                for m in methods.iter() {
+                    if let Some(body) = m.body {
+                        walk_expr(body, ctx, sema_result);
+                    }
+                }
+            }
+            _ => {}
+        },
     }
 }
 
@@ -4575,6 +4607,20 @@ fn resolve_stmt<'a, 'b>(stmt: StmtId, ctx: &mut ResolveCtx<'a, 'b>) {
             resolve_expr(*body, ctx);
         }
         Stmt::Loop { body } => resolve_expr(*body, ctx),
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            crate::Ast::Decl::FunDecl { body, .. } => {
+                resolve_expr(*body, ctx);
+            }
+            crate::Ast::Decl::TypeDecl { methods, .. }
+            | crate::Ast::Decl::TraitDecl { methods, .. } => {
+                for m in methods.iter() {
+                    if let Some(body) = m.body {
+                        resolve_expr(body, ctx);
+                    }
+                }
+            }
+            _ => {}
+        },
     }
 }
 
@@ -5409,6 +5455,84 @@ impl<'a> InferContext<'a> {
         self.type_from_ast_with_params(type_ref, ast, &empty)
     }
 
+    /// 按名称解析为 TypeHandle（别名穿透 + 循环检测）。
+    ///
+    /// 这是 Named 类型解析的核心：type_param_map → type_binding → 内置标量 →
+    /// trait → type_defs 中的 Alias 递归展开 → 用户自定义 Adt。
+    /// `visiting` 用于 alias 循环检测（A→B→A），出现循环时返回 Adt(name) 终止。
+    fn resolve_name_to_type(
+        &mut self,
+        name: &str,
+        type_param_map: &FxHashMap<String, TypeHandle>,
+        visiting: &mut FxHashSet<String>,
+    ) -> TypeHandle {
+        // 1. 类型参数映射
+        if let Some(ty) = type_param_map.get(name) {
+            return *ty;
+        }
+        // 2. 类型绑定栈（泛型作用域）
+        if let Some(ty) = self.lookup_type_binding(name) {
+            return ty;
+        }
+        // 3. 内置标量
+        match name {
+            "i8" => return self.arena.make(ConcreteType::I8),
+            "i16" => return self.arena.make(ConcreteType::I16),
+            "i32" => return self.arena.make(ConcreteType::I32),
+            "i64" => return self.arena.make(ConcreteType::I64),
+            "i128" => return self.arena.make(ConcreteType::I128),
+            "u8" => return self.arena.make(ConcreteType::U8),
+            "u16" => return self.arena.make(ConcreteType::U16),
+            "u32" => return self.arena.make(ConcreteType::U32),
+            "u64" => return self.arena.make(ConcreteType::U64),
+            "u128" => return self.arena.make(ConcreteType::U128),
+            "isize" => return self.arena.make(ConcreteType::Isize),
+            "usize" => return self.arena.make(ConcreteType::Usize),
+            "f16" => return self.arena.make(ConcreteType::F16),
+            "f32" => return self.arena.make(ConcreteType::F32),
+            "f64" => return self.arena.make(ConcreteType::F64),
+            "f128" => return self.arena.make(ConcreteType::F128),
+            "bool" => return self.arena.make(ConcreteType::Bool),
+            "str" => return self.arena.make(ConcreteType::Str),
+            "char" => return self.arena.make(ConcreteType::Char),
+            "Null" => return self.arena.make(ConcreteType::Null),
+            "void" => return self.arena.make(ConcreteType::Void),
+            _ => {}
+        }
+        // 4. trait 定义 → Trait 类型
+        if self.sema_result.get_trait_def(name).is_some() {
+            return self.arena.make(ConcreteType::Trait {
+                name: name.into(),
+                type_args: Box::new([]),
+            });
+        }
+        // 循环 alias 检测
+        if visiting.contains(name) {
+            return self.arena.make(ConcreteType::Adt {
+                name: name.into(),
+                type_args: Box::new([]),
+            });
+        }
+        visiting.insert(name.to_string());
+        // 5. 别名穿透：type Name = str → 解析 str
+        let alias_target: Option<String> = self
+            .sema_result
+            .get_type_def(name)
+            .filter(|td| td.kind == TypeDefKind::Alias)
+            .and_then(|td| td.target_type_name.as_deref().map(String::from));
+        if let Some(target_name) = alias_target {
+            let result = self.resolve_name_to_type(&target_name, type_param_map, visiting);
+            visiting.remove(name);
+            return result;
+        }
+        visiting.remove(name);
+        // 6. 用户自定义类型 → Adt
+        self.arena.make(ConcreteType::Adt {
+            name: name.into(),
+            type_args: Box::new([]),
+        })
+    }
+
     /// 将 AST TypeNode 解析为 TypeHandle（完整版，带类型参数映射）。
     ///
     /// 处理所有 TypeNode 变体：Named、SelfType、Generic、Nullable、RefType、RawPtr、
@@ -5424,51 +5548,9 @@ impl<'a> InferContext<'a> {
         let tn = &ast.ty(type_ref).node;
         match tn {
             TypeNode::Named { name } => {
-                // 1. 类型参数映射
-                if let Some(ty) = type_param_map.get(*name) {
-                    return *ty;
-                }
-                // 2. 类型绑定栈（泛型作用域）
-                if let Some(ty) = self.lookup_type_binding(name) {
-                    return ty;
-                }
-                // 3. 内置标量
-                match *name {
-                    "i8" => return self.arena.make(ConcreteType::I8),
-                    "i16" => return self.arena.make(ConcreteType::I16),
-                    "i32" => return self.arena.make(ConcreteType::I32),
-                    "i64" => return self.arena.make(ConcreteType::I64),
-                    "i128" => return self.arena.make(ConcreteType::I128),
-                    "u8" => return self.arena.make(ConcreteType::U8),
-                    "u16" => return self.arena.make(ConcreteType::U16),
-                    "u32" => return self.arena.make(ConcreteType::U32),
-                    "u64" => return self.arena.make(ConcreteType::U64),
-                    "u128" => return self.arena.make(ConcreteType::U128),
-                    "isize" => return self.arena.make(ConcreteType::Isize),
-                    "usize" => return self.arena.make(ConcreteType::Usize),
-                    "f16" => return self.arena.make(ConcreteType::F16),
-                    "f32" => return self.arena.make(ConcreteType::F32),
-                    "f64" => return self.arena.make(ConcreteType::F64),
-                    "f128" => return self.arena.make(ConcreteType::F128),
-                    "bool" => return self.arena.make(ConcreteType::Bool),
-                    "str" => return self.arena.make(ConcreteType::Str),
-                    "char" => return self.arena.make(ConcreteType::Char),
-                    "Null" => return self.arena.make(ConcreteType::Null),
-                    "void" => return self.arena.make(ConcreteType::Void),
-                    _ => {}
-                }
-                // 4. trait 定义 → Trait 类型
-                if self.sema_result.get_trait_def(name).is_some() {
-                    return self.arena.make(ConcreteType::Trait {
-                        name: (*name).into(),
-                        type_args: Box::new([]),
-                    });
-                }
-                // 5. 用户自定义类型 → Adt
-                self.arena.make(ConcreteType::Adt {
-                    name: (*name).into(),
-                    type_args: Box::new([]),
-                })
+                // 委托 resolve_name_to_type：内置标量 → trait → 别名穿透 → Adt
+                let mut visiting = FxHashSet::default();
+                self.resolve_name_to_type(name, type_param_map, &mut visiting)
             }
             TypeNode::SelfType => match self.current_self_type() {
                 Some(ty) => ty,
@@ -5705,6 +5787,13 @@ impl<'a> InferContext<'a> {
             if dn.as_ref() == "Async" && in_.as_ref() == "Async" && da.len() == 1 && ia.len() == 1
             {
                 return self.unify_return_type(da[0], ia[0]);
+            }
+        }
+        // async 函数 body 直接返回内层值（非 Async 包装）：
+        // 声明 Async<X>，body 推断为 Y → 递归统一 X 与 Y
+        if let ConcreteType::Generic { name: dn, args: da } = &declared_ct {
+            if dn.as_ref() == "Async" && da.len() == 1 {
+                return self.unify_return_type(da[0], r_inferred);
             }
         }
 
@@ -6201,11 +6290,16 @@ impl<'a> InferContext<'a> {
                         })
                     }
                     BinaryOp::Range | BinaryOp::RangeInclusive => {
-                        let usize_ty = self.make_builtin(ConcreteType::Usize);
-                        let _ = self.try_widen_unify(usize_ty, left_ty);
-                        let usize_ty = self.make_builtin(ConcreteType::Usize);
-                        let _ = self.try_widen_unify(usize_ty, right_ty);
-                        self.make_builtin(ConcreteType::Usize)
+                        // Range 表达式 a..b / a..=b 返回 RangeIterator 类型
+                        // （Range 本身是迭代器，For 循环通过 RangeIterator.next 静态分派）
+                        let i64_ty = self.make_builtin(ConcreteType::I64);
+                        let _ = self.try_widen_unify(i64_ty, left_ty);
+                        let i64_ty = self.make_builtin(ConcreteType::I64);
+                        let _ = self.try_widen_unify(i64_ty, right_ty);
+                        self.arena.make(ConcreteType::Generic {
+                            name: "RangeIterator".into(),
+                            args: Box::new([]),
+                        })
                     }
                     BinaryOp::Elvis => {
                         let rl = self.arena.resolve(left_ty);
@@ -6342,7 +6436,26 @@ impl<'a> InferContext<'a> {
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
                 let ret_ty = self.arena.fresh_type_var();
 
-                // 路径 0：env 中直接查找方法名（free function with self 参数）
+                // 路径 1（优先）：类型感知的方法查找
+                // 通过 lookup_method_type 按接收者类型查 witness_table / func_sigs / 内置方法，
+                // 确保同名方法（如 Instant.add_duration 与 DateTime.add_duration）分派到正确签名。
+                let method_fn_ty = self.lookup_method_type(recv_ty, method);
+                if let Some(fn_ty) = method_fn_ty {
+                    let resolved = self.arena.resolve(fn_ty);
+                    if let ConcreteType::Fn { params, return_type } =
+                        self.arena.get(resolved).clone()
+                    {
+                        // 第一个参数是 self，跳过
+                        let n = params.len().min(args.len() + 1);
+                        for i in 1..n {
+                            let _ = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
+                        }
+                        return return_type;
+                    }
+                }
+
+                // 路径 0（回退）：env 中直接查找方法名（free function with self 参数）
+                // 仅当类型感知查找未命中时使用，处理未注册到 func_sigs 的自由函数。
                 // Glue 中 `recv.method(args)` 是 `method(recv, args)` 的语法糖
                 if let Some(fn_ty) = self.env.lookup(env, method) {
                     let resolved = self.arena.resolve(fn_ty);
@@ -6358,21 +6471,6 @@ impl<'a> InferContext<'a> {
                     }
                 }
 
-                // 路径 1+：查 witness_table / func_sigs / 内置方法
-                let method_fn_ty = self.lookup_method_type(recv_ty, method);
-                if let Some(fn_ty) = method_fn_ty {
-                    let resolved = self.arena.resolve(fn_ty);
-                    if let ConcreteType::Fn { params, return_type } =
-                        self.arena.get(resolved).clone()
-                    {
-                        // 第一个参数是 self，跳过
-                        let n = params.len().min(args.len() + 1);
-                        for i in 1..n {
-                            let _ = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                        }
-                        return return_type;
-                    }
-                }
                 // 兜底：推断参数，返回 fresh var
                 for &a in args.iter() {
                     let _ = self.infer_expr(a, ast, env, None);
@@ -6444,16 +6542,25 @@ impl<'a> InferContext<'a> {
 
             // ── 数组字面量 ──
             Expr::ArrayLit { elements, .. } => {
+                // 从 expected 提取元素类型，使字面量元素能按注解提升
+                // （例如 `val data: u8[] = [72, 101]` 中 72 应提升为 u8 而非默认 i32）
+                let expected_elem = expected.and_then(|exp| {
+                    let r = self.arena.resolve(exp);
+                    match self.arena.get(r).clone() {
+                        ConcreteType::Array { element_type, .. } => Some(element_type),
+                        _ => None,
+                    }
+                });
                 if elements.is_empty() {
-                    let elem_ty = self.arena.fresh_type_var();
+                    let elem_ty = expected_elem.unwrap_or_else(|| self.arena.fresh_type_var());
                     return self.arena.make(ConcreteType::Array {
                         element_type: elem_ty,
                         size: None,
                     });
                 }
-                let first_ty = self.infer_expr(elements[0], ast, env, None);
+                let first_ty = self.infer_expr(elements[0], ast, env, expected_elem);
                 for &e in elements.iter().skip(1) {
-                    let elem_ty = self.infer_expr(e, ast, env, None);
+                    let elem_ty = self.infer_expr(e, ast, env, expected_elem);
                     let _ = self.try_widen_unify(first_ty, elem_ty);
                 }
                 self.arena.make(ConcreteType::Array {
@@ -6883,6 +6990,14 @@ impl<'a> InferContext<'a> {
                 | "isize" | "usize" | "f16" | "f32" | "f64" | "f128" | "bool" | "char"
                 | "Null" | "void" => self.arena.from_scalar_name(n),
                 "str" => self.arena.make(ConcreteType::Str),
+                // Throw 有专用 ConcreteType 变体，不能走 Generic 路径
+                // （check_propagate 等类型检查依赖 ConcreteType::Throw 模式匹配）
+                "Throw" => {
+                    let value_type = self.arena.fresh_type_var();
+                    let error_type = self.arena.fresh_type_var();
+                    self.arena
+                        .make(ConcreteType::Throw { value_type, error_type })
+                }
                 _ => {
                     if let Some(arity) = generic_type_arity(n) {
                         let args: Vec<TypeHandle> =
@@ -7371,6 +7486,11 @@ impl<'a> InferContext<'a> {
                 let _ = self.infer_expr(*body, ast, env, None);
                 None
             }
+            Stmt::LocalDecl { decl } => {
+                // 统一走 check_decl：函数、类型、trait 嵌套声明共享同一处理路径
+                self.check_decl(decl, ast, env);
+                None
+            }
         }
     }
 
@@ -7780,11 +7900,13 @@ impl<'a> InferContext<'a> {
                         self.arena.fresh_rigid_var()
                     };
                     // 注册构造器到环境
+                    // 使用 redefine 覆盖可能的 ModuleRef 别名（register_module_aliases 先注册了
+                    // 模块路径别名如 "DateTime" → ModuleRef，构造器注册需覆盖使 DateTime(...) 解析为构造器）
                     match def {
                         crate::Ast::TypeDef::Adt { constructors } => {
                             for ctor in constructors.iter() {
                                 let ctor_fn_ty = self.build_ctor_fn_type(ctor, name, &module.arena);
-                                self.env.define(env, ctor.name, ctor_fn_ty);
+                                self.env.redefine(env, ctor.name, ctor_fn_ty);
                             }
                         }
                         crate::Ast::TypeDef::Newtype { name: ctor_name, inner } => {
@@ -7794,7 +7916,7 @@ impl<'a> InferContext<'a> {
                                 params: vec![inner_ty].into_boxed_slice(),
                                 return_type: self_ty,
                             });
-                            self.env.define(env, ctor_name, ctor_fn_ty);
+                            self.env.redefine(env, ctor_name, ctor_fn_ty);
                         }
                         _ => {}
                     }
@@ -7850,21 +7972,39 @@ impl<'a> InferContext<'a> {
                     let _ = name;
                     return;
                 }
-                // 参数绑定
-                for param in params.iter() {
-                    let param_ty = match param.type_annotation {
+                // 参数绑定（同时收集参数类型用于构造函数类型）
+                let param_types: Vec<TypeHandle> = params.iter().map(|p| {
+                    let param_ty = match p.type_annotation {
                         Some(ta) => self.type_from_ast(ta, ast),
                         None => self.arena.fresh_type_var(),
                     };
-                    self.env.define(fn_env, param.name, param_ty);
-                }
+                    self.env.define(fn_env, p.name, param_ty);
+                    param_ty
+                }).collect();
+                // 返回类型（未标注时用 fresh_type_var，后续与函数体类型统一）
+                let ret_ty = match return_type {
+                    Some(rt) => self.type_from_ast(*rt, ast),
+                    None => self.arena.fresh_type_var(),
+                };
+                // 构造函数类型并注册到 fn_env（支持递归自引用）和 env（支持后续引用）
+                // 顶层函数已由 predeclare_declarations 预注册，define 返回 false 不覆盖
+                let fn_ty = self.arena.make(ConcreteType::Fn {
+                    params: param_types.into_boxed_slice(),
+                    return_type: ret_ty,
+                });
+                self.env.define(fn_env, *name, fn_ty);
+                self.env.define(env, *name, fn_ty);
                 // 设置返回类型
                 let prev_return = self.expected_return;
-                self.expected_return = return_type.map(|rt| self.type_from_ast(rt, ast));
+                self.expected_return = Some(ret_ty);
                 // 推导函数体
-                let _ = self.infer_expr(*body, ast, fn_env, self.expected_return);
+                let body_ty = self.infer_expr(*body, ast, fn_env, self.expected_return);
                 // 恢复
                 self.expected_return = prev_return;
+                // 返回类型未显式标注时，与函数体类型统一
+                if return_type.is_none() {
+                    let _ = self.arena.unify(ret_ty, body_ty);
+                }
                 if !type_params.is_empty() {
                     self.pop_type_bindings();
                 }
@@ -7877,8 +8017,10 @@ impl<'a> InferContext<'a> {
                     let _ = self.infer_expr(*expr, ast, env, None);
                 }
             }
-            Decl::TypeDecl { name, type_params, methods, .. } => {
-                // 类型方法检查
+            Decl::TypeDecl { name, type_params, def, methods, .. } => {
+                // 注册嵌套类型定义到 sema_result（使构造器调用可被类型检查识别）
+                ast_type_decl_to_type_def(self.sema_result, *name, type_params, def, ast);
+                // 构造 ADT 类型 handle
                 let self_ty = if type_params.is_empty() {
                     self.arena.make(ConcreteType::Adt {
                         name: (*name).into(),
@@ -7887,6 +8029,33 @@ impl<'a> InferContext<'a> {
                 } else {
                     self.arena.fresh_type_var()
                 };
+                // 将构造器函数类型注册到当前环境（使 Call 表达式能查找到构造器）
+                match def {
+                    crate::Ast::TypeDef::Record { fields } => {
+                        let param_types: Vec<TypeHandle> = fields.iter().map(|f| {
+                            self.type_from_ast(f.ty, ast)
+                        }).collect();
+                        let fn_ty = self.arena.make(ConcreteType::Fn {
+                            params: param_types.into_boxed_slice(),
+                            return_type: self_ty,
+                        });
+                        self.env.define(env, *name, fn_ty);
+                    }
+                    crate::Ast::TypeDef::Adt { constructors } => {
+                        for ctor in constructors {
+                            let param_types: Vec<TypeHandle> = ctor.fields.iter().map(|f| {
+                                self.type_from_ast(f.ty, ast)
+                            }).collect();
+                            let fn_ty = self.arena.make(ConcreteType::Fn {
+                                params: param_types.into_boxed_slice(),
+                                return_type: self_ty,
+                            });
+                            self.env.define(env, ctor.name, fn_ty);
+                        }
+                    }
+                    crate::Ast::TypeDef::Alias { .. } | crate::Ast::TypeDef::Newtype { .. } => {}
+                }
+                // 类型方法检查
                 self.push_self_type(self_ty);
                 for method in methods.iter() {
                     if let Some(body) = method.body {
@@ -7908,6 +8077,8 @@ impl<'a> InferContext<'a> {
                 self.pop_self_type();
             }
             Decl::TraitDecl { name, methods, .. } => {
+                // 注册嵌套 trait 定义到 sema_result（使 trait 类型标注可被识别）
+                ast_trait_decl_to_trait_def(self.sema_result, name, methods, ast);
                 let self_var = self.push_self_type_var();
                 for method in methods.iter() {
                     if let Some(body) = method.body {

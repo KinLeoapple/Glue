@@ -57,3 +57,15 @@ fun __reflect_scalar_to_str(v: Value): str #{
 @extern("C")
 fun __reflect_format(v: Value): str #{
 }#
+
+@extern("C")
+fun __reflect_kind_str(v: Value): str #{
+}#
+
+@extern("C")
+fun __reflect_layout_size(v: Value): u32 #{
+}#
+
+@extern("C")
+fun __reflect_layout_alignment(v: Value): u32 #{
+}#

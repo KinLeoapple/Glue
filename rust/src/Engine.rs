@@ -365,10 +365,22 @@ pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
     use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
-    // Record（错误类型 ADT）→ 直接作为 Err payload
+    // Record（错误类型）→ 直接作为 Err payload
     if let Some(HeapObj::Record(record)) = v.heap_obj() {
         return Value::ref_val(HeapObj::ThrowVal(ThrowValue {
             payload: ThrowPayload::Err(Arc::new(record.clone())),
+        }));
+    }
+    // Adt（错误类型 ADT）→ 转换为 Record 后作为 Err payload
+    if let Some(HeapObj::Adt(a)) = v.heap_obj() {
+        let record = RecordValue {
+            type_name: a.type_name.clone(),
+            fields: a.fields.iter().map(|f| f.value.clone()).collect(),
+            field_names: a.fields.iter().map(|f| f.name.clone()).collect(),
+            field_ref_bits: 0,
+        };
+        return Value::ref_val(HeapObj::ThrowVal(ThrowValue {
+            payload: ThrowPayload::Err(Arc::new(record)),
         }));
     }
     // 已是 ThrowVal → 直接返回
@@ -399,17 +411,25 @@ pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
 /// 此函数将其包装为 ThrowVal(Err(record))。
 pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
     use std::sync::Arc;
-    use crate::Value::{HeapObj, ThrowValue, ThrowPayload};
+    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
-    // v 应为 Record（由内层 record_construct 节点产生）
+    // v 应为 Record 或 Adt（由 record_construct 节点产生）
     if let Some(HeapObj::Record(record)) = v.heap_obj() {
         Value::ref_val(HeapObj::ThrowVal(ThrowValue {
             payload: ThrowPayload::Err(Arc::new(record.clone())),
         }))
+    } else if let Some(HeapObj::Adt(a)) = v.heap_obj() {
+        // Adt → 转换为 Record 后作为 Err payload
+        let record = RecordValue {
+            type_name: a.type_name.clone(),
+            fields: a.fields.iter().map(|f| f.value.clone()).collect(),
+            field_names: a.fields.iter().map(|f| f.name.clone()).collect(),
+            field_ref_bits: 0,
+        };
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(Arc::new(record)) }))
     } else {
-        // 非 record 值，包装为单字段 Error record
-        use crate::Value::RecordValue;
+        // 非 record/adt 值，包装为单字段 Error record
         let record = Arc::new(RecordValue {
             type_name: "Error".to_string(),
             fields: vec![v],
@@ -878,7 +898,8 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
                     crate::Value::HeapObj::Str(_) => "str".to_string(),
                     crate::Value::HeapObj::Array(_) => "array".to_string(),
                     crate::Value::HeapObj::Record(rec) => rec.type_name.clone(),
-                    crate::Value::HeapObj::Adt(a) => a.constructor.clone(),
+                    crate::Value::HeapObj::Adt(a) => a.type_name.clone(),
+                    crate::Value::HeapObj::Newtype(n) => n.type_name.clone(),
                     _ => "unknown".to_string(),
                 },
             };
@@ -953,6 +974,35 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
                 _ => String::new(),
             };
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+        }
+        "__reflect_kind_str" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let kind = match &v {
+                Value::Null => "Null",
+                Value::Void => "Void",
+                Value::Scalar(_, _) => "Primitive",
+                Value::Ref(r) => match &**r {
+                    crate::Value::HeapObj::Str(_) => "Str",
+                    crate::Value::HeapObj::Array(_) => "Array",
+                    crate::Value::HeapObj::Record(_) => "Record",
+                    crate::Value::HeapObj::Adt(_) => "Adt",
+                    crate::Value::HeapObj::Newtype(_) => "Newtype",
+                    crate::Value::HeapObj::Closure(_) => "Closure",
+                    crate::Value::HeapObj::TraitVal(_) => "Trait",
+                    _ => "Ref",
+                },
+            };
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(kind)))
+        }
+        "__reflect_layout_size" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let size: u32 = crate::Reflect::reflect_layout_size(&v);
+            Value::u32(size)
+        }
+        "__reflect_layout_alignment" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let align: u32 = crate::Reflect::reflect_layout_alignment(&v);
+            Value::u32(align)
         }
 
         // ── str: UTF-8 逐字符解码（纯 Rust 位运算，与 C 实现语义一致）──
@@ -1117,7 +1167,8 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
                     crate::Value::HeapObj::Str(_) => "str".to_string(),
                     crate::Value::HeapObj::Array(_) => "array".to_string(),
                     crate::Value::HeapObj::Record(rec) => rec.type_name.clone(),
-                    crate::Value::HeapObj::Adt(a) => a.constructor.clone(),
+                    crate::Value::HeapObj::Adt(a) => a.type_name.clone(),
+                    crate::Value::HeapObj::Newtype(n) => n.type_name.clone(),
                     _ => "unknown".to_string(),
                 },
             };
@@ -1184,6 +1235,35 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             };
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
         }
+        "__reflect_kind_str" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let kind = match &v {
+                Value::Null => "Null",
+                Value::Void => "Void",
+                Value::Scalar(_, _) => "Primitive",
+                Value::Ref(r) => match &**r {
+                    crate::Value::HeapObj::Str(_) => "Str",
+                    crate::Value::HeapObj::Array(_) => "Array",
+                    crate::Value::HeapObj::Record(_) => "Record",
+                    crate::Value::HeapObj::Adt(_) => "Adt",
+                    crate::Value::HeapObj::Newtype(_) => "Newtype",
+                    crate::Value::HeapObj::Closure(_) => "Closure",
+                    crate::Value::HeapObj::TraitVal(_) => "Trait",
+                    _ => "Ref",
+                },
+            };
+            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(kind)))
+        }
+        "__reflect_layout_size" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let size: u32 = crate::Reflect::reflect_layout_size(&v);
+            Value::u32(size)
+        }
+        "__reflect_layout_alignment" => {
+            let v = frame.get_value_by_global(inputs[0]);
+            let align: u32 = crate::Reflect::reflect_layout_alignment(&v);
+            Value::u32(align)
+        }
 
         // ── str: UTF-8 逐字符解码（纯 Rust 位运算，与 C 实现语义一致）──
         "__str_utf8_decode_at" => {
@@ -1244,23 +1324,53 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn: 记录构造（从输入收集字段值构造 RecordValue）
+/// compute_fn: 类型构造（从输入收集字段值，根据 kind 构造 Record/Adt/Newtype HeapObj）
 pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, RecordValue};
+    use crate::Ir::{RecordLitKind, RecordLitInfo};
+    use crate::Value::{AdtField, AdtValue, HeapObj, NewtypeValue, RecordValue, ValueArena};
     read_node_inputs!(frame, node, graph, n, inputs);
     let fields: Vec<Value> = inputs
         .iter()
         .map(|&input_node| frame.get_value_by_global(input_node))
         .collect();
-    let info = graph.record_lit_infos[node.0 as usize]
+    let info: &RecordLitInfo = graph.record_lit_infos[node.0 as usize]
         .as_ref()
         .expect("record construct node has no RecordLitInfo");
-    Value::ref_val(HeapObj::Record(RecordValue {
-        type_name: info.type_name.clone(),
-        fields,
-        field_names: info.field_names.clone(),
-        field_ref_bits: 0,
-    }))
+    match info.kind {
+        RecordLitKind::Record => {
+            Value::ref_val(HeapObj::Record(RecordValue {
+                type_name: info.type_name.clone(),
+                fields,
+                field_names: info.field_names.clone(),
+                field_ref_bits: 0,
+            }))
+        }
+        RecordLitKind::Adt => {
+            let adt_fields: Vec<AdtField> = fields
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| AdtField {
+                    name: info.field_names.get(i).and_then(|n| n.clone()),
+                    value: v,
+                })
+                .collect();
+            Value::ref_val(HeapObj::Adt(AdtValue {
+                type_name: info.type_name.clone(),
+                constructor: info.constructor.clone(),
+                fields: adt_fields,
+                field_ref_bits: 0,
+            }))
+        }
+        RecordLitKind::Newtype => {
+            // Newtype：单字段，将 inner Value 存入全局 arena 得到 ValueHandle
+            let inner_val = fields.into_iter().next().unwrap_or(Value::VOID);
+            let inner = ValueArena::with_global_mut(|a| a.alloc_value(&inner_val));
+            Value::ref_val(HeapObj::Newtype(NewtypeValue {
+                type_name: info.type_name.clone(),
+                inner,
+            }))
+        }
+    }
 }
 
 /// compute_fn: 记录字段访问（按 field 名称从 Record/Adt 取字段值）
@@ -1642,7 +1752,14 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
         "f128" => ScalarTag::F128,
         "bool" => ScalarTag::Bool,
         "char" => ScalarTag::Char,
-        _ => return Value::VOID,
+        // 未知目标类型：safe cast 返回 Null，否则返回 Void
+        _ => {
+            return if graph.safe_op_flags[node.0 as usize] {
+                Value::Null
+            } else {
+                Value::VOID
+            };
+        }
     };
 
     // 源值是否为浮点
@@ -1674,6 +1791,67 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
         ScalarTag::Char => Value::char_val(char::from_u32(val.as_int_i128() as u32).unwrap_or('\0')),
     }
 }
+
+/// compute_fn (idx 279): 非空断言 `expr!`。
+///
+/// 输入为 nullable 值：Null → panic（编程错误，非可恢复流程）；
+/// 非 Null → 原样返回（Scalar/Ref 透传，即解包 nullable）。
+pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let v = frame.get_value_by_global(inputs[0]);
+    if v.is_null() {
+        panic!("non-null assertion failed: value is null");
+    }
+    v
+}
+
+/// compute_fn (idx 280): 取引用 `&expr`（RefOf）。
+///
+/// 将输入值包装进 `Arc<HeapObj::Cell>`，返回 `Value::Ref(arc)`。
+/// 多个引用共享同一 Cell（通过 Arc clone），写入对所有人可见。
+/// 对于已是 Ref 的值（record 等），直接共享同一 Arc（无需二次包装）。
+pub fn compute_ref_of(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let v = frame.get_value_by_global(inputs[0]);
+    match &v {
+        // 标量/Null/Void → 包装进 Cell
+        Value::Scalar(_, _) | Value::Null | Value::Void => {
+            let cell = crate::Value::Cell::new(v.clone());
+            Value::ref_val(crate::Value::HeapObj::Cell(cell))
+        }
+        // 已是堆引用：直接共享 Arc（引用语义，不深拷贝）
+        Value::Ref(_) => v,
+    }
+}
+
+/// compute_fn (idx 281): 解引用读取 `*ref`（Deref）。
+///
+/// 输入为 `Arc<HeapObj::Cell>`：返回 Cell 内部值。
+/// 输入为其他 Ref（record/array 等）：原样返回（`&rec` 共享 Arc，`*r` 即 rec 本身）。
+pub fn compute_deref_read(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let v = frame.get_value_by_global(inputs[0]);
+    match v.heap_obj() {
+        Some(crate::Value::HeapObj::Cell(c)) => c.get(),
+        _ => v,
+    }
+}
+
+/// compute_fn (idx 282): 解引用写入 `*ref = value`（DerefAssign）。
+///
+/// inputs[0] = 引用（Cell），inputs[1] = 新值。
+/// 将新值写入 Cell，返回写入的值（供链式使用）。
+/// 对非 Cell 引用（record 共享 Arc）不做处理（record 字段写入走 record_field_set）。
+pub fn compute_deref_write(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let ref_val = frame.get_value_by_global(inputs[0]);
+    let new_val = frame.get_value_by_global(inputs[1]);
+    if let Some(crate::Value::HeapObj::Cell(c)) = ref_val.heap_obj() {
+        c.set(new_val.clone());
+    }
+    new_val
+}
+
 
 /// compute_fn: 记录字段赋值（就地修改 RecordValue 的字段，返回 void）
 ///
@@ -1915,6 +2093,51 @@ pub fn compute_await(frame: &mut Frame, node: NodeId) -> Value {
     Value::VOID
 }
 
+/// compute_channel_create（idx 283）：创建 ChannelValue 堆对象。
+///
+/// 输入：inputs[0] = capacity (usize)
+/// 输出：Value::ref_val(HeapObj::ChannelVal(ChannelValue))
+pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let capacity = frame.get_value_by_global(inputs[0]).as_usize();
+    Value::ref_val(crate::Value::HeapObj::ChannelVal(
+        crate::Value::ChannelValue::new(capacity),
+    ))
+}
+
+/// compute_channel_send（idx 284）：非阻塞发送 + 设置 pending_channel_notify。
+///
+/// 输入：inputs[0] = channel ref, inputs[1] = value
+/// 发送后设置 pending_channel_notify，run_ready_nodes 消费时触发 ChannelReady 事件
+/// 唤醒等待该 channel 的挂起帧（内联触发，零延迟）。
+pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let ch_val = frame.get_value_by_global(inputs[0]);
+    let val = frame.get_value_by_global(inputs[1]);
+    match ch_val.heap_obj() {
+        Some(crate::Value::HeapObj::ChannelVal(ch)) => {
+            let ch_id = crate::Ir::ChannelId(ch.id());
+            ch.send(val);
+            frame.pending_channel_notify = Some(ch_id);
+        }
+        _ => panic!("send on non-channel value"),
+    }
+    Value::VOID
+}
+
+/// compute_channel_close（idx 285）：关闭 channel。
+///
+/// 输入：inputs[0] = channel ref
+pub fn compute_channel_close(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let ch_val = frame.get_value_by_global(inputs[0]);
+    match ch_val.heap_obj() {
+        Some(crate::Value::HeapObj::ChannelVal(ch)) => ch.close(),
+        _ => panic!("close on non-channel value"),
+    }
+    Value::VOID
+}
+
 /// compute_async_call_launch（idx 39）：async 函数调用，启动子帧但不挂起当前帧。
 ///
 /// 与 compute_call_launch 相同参数收集逻辑，但 is_async=true。
@@ -1963,7 +2186,7 @@ pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
         arity: info.arity,
         upvalues,
         bound_args: Vec::new(),
-        self_upvalue_idx: -1,
+        self_upvalue_idx: info.self_upvalue_idx,
         upvalue_ref_bits: 0,
         cell_upvalues: 0,
     }))
@@ -2160,10 +2383,18 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
         let graph_node_id = NodeId(local_id.0 + node_start);
         let node = graph.nodes[graph_node_id.0 as usize];
 
-        // 3. 执行 compute_fn
+        // 3. 执行 compute_fn（safe_op 标记：inputs[0] 为 Null 时短路返回 Null）
         let pre_filled = frame.value_table.ready[local_id.0 as usize];
         let value = if pre_filled {
             frame.value_table.values[local_id.0 as usize].clone()
+        } else if graph.safe_op_flags[graph_node_id.0 as usize] {
+            let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
+            if !inputs.is_empty() && matches!(frame.get_value_by_global(inputs[0]), Value::Null) {
+                Value::Null
+            } else {
+                let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
+                compute_fn(frame, graph_node_id)
+            }
         } else {
             let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
             compute_fn(frame, graph_node_id)
@@ -2371,6 +2602,13 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
     }
     args.extend(closure.upvalues.iter().cloned());
 
+    // 递归闭包：将自身引用注入到 self_upvalue_idx 对应的 upvalue slot
+    if closure.self_upvalue_idx >= 0 {
+        let upvalues_start = args.len() - closure.upvalues.len();
+        let self_idx = upvalues_start + closure.self_upvalue_idx as usize;
+        args[self_idx] = closure_val.clone();
+    }
+
     frame.pending_call = Some(PendingCall {
         target_sg,
         args,
@@ -2398,7 +2636,7 @@ pub fn compute_cancel_async_handle(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn: select 门控节点（idx 43）— 检查所有分支事件源，选第一个就绪的。
 ///
-/// compute_fn 无法访问 Engine 的 channel_runtime/timer_runtime，因此这里只标记
+/// compute_fn 无法访问 Engine 的 timer_runtime，因此这里只标记
 /// `pending_select_wait`，由 `run_ready_nodes` 检查就绪状态（它能访问 Engine 全部状态）。
 pub fn compute_select_gate(frame: &mut Frame, node: NodeId) -> Value {
     let graph = frame.graph.clone();
@@ -2570,67 +2808,8 @@ impl FramePool {
 }
 
 // =========================================================================
-// ChannelRuntime / TimerRuntime / AsyncJoinRuntime — 图外运行时
+// TimerRuntime / AsyncJoinRuntime — 图外运行时
 // =========================================================================
-
-/// Channel 运行时：管理 channel buffer + send/recv。
-///
-/// spec 3.5 EventSource::Channel。5a-2 单线程，send 不阻塞（buffer 满则 panic）。
-pub struct ChannelRuntime {
-    channels: Vec<ChannelEntry>,
-}
-struct ChannelEntry {
-    buffer: std::collections::VecDeque<Value>,
-    capacity: usize,
-}
-impl ChannelRuntime {
-    pub fn new() -> Self { Self { channels: Vec::new() } }
-    pub fn create(&mut self, capacity: usize) -> crate::Ir::ChannelId {
-        let id = crate::Ir::ChannelId(self.channels.len() as u32);
-        self.channels.push(ChannelEntry {
-            buffer: std::collections::VecDeque::new(),
-            capacity,
-        });
-        id
-    }
-    pub fn send(&mut self, id: crate::Ir::ChannelId, value: Value) -> bool {
-        let ch = &mut self.channels[id.0 as usize];
-        if ch.buffer.len() >= ch.capacity { return false; }
-        ch.buffer.push_back(value);
-        true
-    }
-    pub fn recv(&mut self, id: crate::Ir::ChannelId) -> Option<Value> {
-        self.channels.get_mut(id.0 as usize)?.buffer.pop_front()
-    }
-    /// 检查 channel 是否有数据可读（不消费）。
-    pub fn has_data(&self, id: crate::Ir::ChannelId) -> bool {
-        self.channels
-            .get(id.0 as usize)
-            .map(|c| !c.buffer.is_empty())
-            .unwrap_or(false)
-    }
-    /// 原子地检查并接收数据（消除 has_data + recv 的 TOCTOU 竞态）。
-    /// 如果有数据则返回 Some(Value)，否则返回 None。
-    pub fn try_recv(&mut self, id: crate::Ir::ChannelId) -> Option<Value> {
-        self.channels.get_mut(id.0 as usize)?.buffer.pop_front()
-    }
-    /// 清理已关闭/空的 channel（保留有数据的，清除空且无引用的）。
-    pub fn cleanup(&mut self) {
-        // channel 不主动删除（ID 是索引，删除会导致后续 ID 失效）
-        // 但可以清理空 buffer 释放内存
-        for ch in &mut self.channels {
-            if ch.buffer.is_empty() {
-                ch.buffer.shrink_to_fit();
-            }
-        }
-    }
-}
-
-impl Default for ChannelRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Timer 运行时：管理 timer deadline + 触发检查。
 ///
@@ -2715,7 +2894,12 @@ impl AsyncJoinRuntime {
         async_id
     }
     pub fn find_by_child(&self, child_fid: FrameId) -> Option<crate::Ir::AsyncHandleId> {
-        self.entries.iter().find(|e| e.child_fid == child_fid).map(|e| e.async_id)
+        // 仅匹配未完成（result=None）的 entry：帧 ID 会被复用，
+        // 已完成的旧 entry 若仍匹配会导致新 async call 的完成事件被错误路由到旧 async_id。
+        self.entries
+            .iter()
+            .find(|e| e.child_fid == child_fid && e.result.is_none())
+            .map(|e| e.async_id)
     }
     pub fn find_child_by_async_id(&self, async_id: crate::Ir::AsyncHandleId) -> Option<FrameId> {
         self.entries.iter().find(|e| e.async_id == async_id).map(|e| e.child_fid)
@@ -2965,8 +3149,6 @@ pub struct Engine {
     pub ready_frames: std::collections::VecDeque<FrameId>,
     /// 事件等待者：挂起帧等待的运行时事件（如 SubgraphComplete）
     pub event_waiters: Vec<(crate::Ir::RuntimeEvent, FrameId)>,
-    /// Channel 运行时（图外）
-    pub channel_runtime: ChannelRuntime,
     /// Timer 运行时（图外）
     pub timer_runtime: TimerRuntime,
     /// AsyncJoin 运行时（async 调用完成事件管理）
@@ -2983,7 +3165,6 @@ impl Engine {
             frames: FramePool::new(graph),
             ready_frames: std::collections::VecDeque::new(),
             event_waiters: Vec::new(),
-            channel_runtime: ChannelRuntime::new(),
             timer_runtime: TimerRuntime::new(),
             async_join_runtime: AsyncJoinRuntime::new(),
         }
@@ -3238,6 +3419,16 @@ impl Engine {
             let pre_filled = self.frames.get(fid).value_table.ready[local_id.0 as usize];
             let value = if pre_filled {
                 self.frames.get(fid).value_table.values[local_id.0 as usize].clone()
+            } else if self.graph.safe_op_flags[graph_node_id.0 as usize] {
+                let inputs = self.graph.inputs_pool.get(node.inputs_offset, node.input_count);
+                let recv_val = self.frames.get(fid).get_value_by_global(inputs[0]);
+                if !inputs.is_empty() && matches!(recv_val, Value::Null) {
+                    Value::Null
+                } else {
+                    let compute_fn = self.graph.compute_fns[node.compute_fn.0 as usize];
+                    let frame = self.frames.get_mut(fid);
+                    compute_fn(frame, graph_node_id)
+                }
             } else {
                 let compute_fn = self.graph.compute_fns[node.compute_fn.0 as usize];
                 let frame = self.frames.get_mut(fid);
@@ -3411,12 +3602,21 @@ impl Engine {
                     continue;
                 } else {
                     // sync call：当前帧挂起等 SubgraphComplete 事件
+                    self.event_waiters.push((RuntimeEvent::SubgraphComplete(child_fid), fid));
                     let frame = self.frames.get_mut(fid);
                     frame.state = FrameState::Suspended;
                     frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
                     frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
                     return; // 帧挂起，不执行 defer，不标记 Completed
                 }
+            }
+
+            // 检测 pending_channel_notify（send 操作设置）
+            // 内联触发 ChannelReady 事件，唤醒等待该 channel 的挂起帧（零延迟）
+            let ch_notify = self.frames.get(fid).pending_channel_notify;
+            if let Some(ch_id) = ch_notify {
+                self.frames.get_mut(fid).pending_channel_notify = None;
+                self.on_event_arrived(RuntimeEvent::ChannelReady(ch_id), Value::VOID);
             }
 
             // 检测 pending_await（Await 节点设置）
@@ -3437,7 +3637,8 @@ impl Engine {
                     // 不挂起，继续循环
                     continue;
                 } else {
-                    // 未就绪：注册等待 + 帧挂起
+                    // 未就绪：帧挂起，立即注册 event_waiters（与 select 帧一致，
+                    // 保证 run_ready_nodes 单独调用时状态与等待表原子更新）
                     self.event_waiters.push((event, fid));
                     let frame = self.frames.get_mut(fid);
                     frame.state = FrameState::Suspended;
@@ -3480,8 +3681,10 @@ impl Engine {
                             self.frames.get(fid).get_value_by_global(branch.event_source_node);
                         let is_ready = match branch.event_kind {
                             EventSourceKind::Channel => {
-                                let ch_id = crate::Ir::ChannelId(event_val.as_i32() as u32);
-                                self.channel_runtime.has_data(ch_id)
+                                match event_val.heap_obj() {
+                                    Some(crate::Value::HeapObj::ChannelVal(ch)) => ch.has_data(),
+                                    _ => false,
+                                }
                             }
                             EventSourceKind::Timer => {
                                 // Timer 分支：首次检查时启动 timer，后续用缓存的 timer_id
@@ -3522,6 +3725,7 @@ impl Engine {
                         let child_fid = self.start_subgraph(fid, gate_local, sg_id, &[]);
                         self.ready_frames.push_back(child_fid);
                         // 当前帧挂起等子图完成
+                        self.event_waiters.push((RuntimeEvent::SubgraphComplete(child_fid), fid));
                         let frame = self.frames.get_mut(fid);
                         frame.state = FrameState::Suspended;
                         frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
@@ -3535,9 +3739,15 @@ impl Engine {
                                 .get(fid)
                                 .get_value_by_global(branch.event_source_node);
                             let event = match branch.event_kind {
-                                EventSourceKind::Channel => RuntimeEvent::ChannelReady(
-                                    crate::Ir::ChannelId(event_val.as_i32() as u32),
-                                ),
+                                EventSourceKind::Channel => {
+                                    let ch_id = match event_val.heap_obj() {
+                                        Some(crate::Value::HeapObj::ChannelVal(ch)) => {
+                                            crate::Ir::ChannelId(ch.id())
+                                        }
+                                        _ => panic!("select channel branch event_obj is not a ChannelValue"),
+                                    };
+                                    RuntimeEvent::ChannelReady(ch_id)
+                                }
                                 EventSourceKind::Timer => {
                                     // 用已启动的真实 timer_id 注册事件等待
                                     let timer_id = self
@@ -3968,16 +4178,29 @@ impl Engine {
                 }
             }
             EventSourceKind::Channel => {
-                let ch_id = crate::Ir::ChannelId(pending.event_obj.as_i32() as u32);
+                // Channel event_obj 是 ChannelValue 堆对象引用。
+                // 从堆对象提取 channel id + recv 数据。
+                let (ch_id, val) = match pending.event_obj.heap_obj() {
+                    Some(crate::Value::HeapObj::ChannelVal(ch)) => {
+                        (crate::Ir::ChannelId(ch.id()), ch.recv())
+                    }
+                    _ => panic!("await on non-channel value"),
+                };
                 let event = RuntimeEvent::ChannelReady(ch_id);
-                if let Some(val) = self.channel_runtime.recv(ch_id) {
-                    (event, Some(val))
-                } else {
-                    (event, None)
-                }
+                (event, val)
             }
             EventSourceKind::Timer => {
-                let timer_id = crate::Ir::TimerId(pending.event_obj.as_i32() as u32);
+                // Timer event_obj 是 Timer record（含 duration_ns 字段）。
+                // 惰性启动 timer：首次 resolve 时从 record 提取 duration 并 start。
+                let duration_ns = match pending.event_obj.heap_obj() {
+                    Some(crate::Value::HeapObj::Record(r)) => {
+                        r.find_field("duration_ns").map(|v| v.as_i64()).unwrap_or(0)
+                    }
+                    _ => pending.event_obj.as_i64(),
+                };
+                let timer_id = self
+                    .timer_runtime
+                    .start(std::time::Duration::from_nanos(duration_ns as u64));
                 let event = RuntimeEvent::TimerFired(timer_id);
                 if self.timer_runtime.is_fired(timer_id) {
                     (event, Some(Value::VOID))
@@ -4096,16 +4319,11 @@ impl Engine {
         let has_caller = self.frames.get(fid).caller.is_some();
         match state {
             FrameState::Suspended => {
-                let event = self.frames.get(fid).suspend_event;
-                if let Some(e) = event {
-                    self.event_waiters.push((e, fid));
-                } else {
-                    // select 帧：suspend_event 为 None，event_waiters 已在
-                    // run_ready_nodes 中注册。若无任何等待则 panic（异常状态）。
-                    let has_waiter = self.event_waiters.iter().any(|(_, wf)| *wf == fid);
-                    if !has_waiter {
-                        panic!("frame {} suspended without event", fid.0);
-                    }
+                // event_waiters 已在 run_ready_nodes 挂起点注册（普通 await 帧 + select 帧）
+                // 此处仅做一致性校验：挂起帧必须有等待登记，否则是异常状态
+                let has_waiter = self.event_waiters.iter().any(|(_, wf)| *wf == fid);
+                if !has_waiter {
+                    panic!("frame {} suspended without event waiter", fid.0);
                 }
             }
             FrameState::Completed => {
@@ -4265,8 +4483,6 @@ pub struct SharedEngine {
     pub next_frame_id: ParkingMutex<FrameId>,
     /// 值 arena（vtable 分派用，compute_fn 不使用）
     pub arena: ParkingMutex<ValueArena>,
-    /// Channel 运行时
-    pub channel_runtime: ParkingMutex<ChannelRuntime>,
     /// Timer 运行时
     pub timer_runtime: ParkingMutex<TimerRuntime>,
     /// AsyncJoin 运行时
@@ -4306,7 +4522,6 @@ impl SharedEngine {
             frames: ParkingMutex::new(frames_map),
             next_frame_id: ParkingMutex::new(FrameId(engine.frames.next_id)),
             arena: ParkingMutex::new(std::mem::take(&mut engine.arena)),
-            channel_runtime: ParkingMutex::new(std::mem::take(&mut engine.channel_runtime)),
             timer_runtime: ParkingMutex::new(std::mem::take(&mut engine.timer_runtime)),
             async_join_runtime: ParkingMutex::new(std::mem::take(&mut engine.async_join_runtime)),
             event_waiters: ParkingMutex::new(std::mem::take(&mut engine.event_waiters)),
@@ -4760,13 +4975,30 @@ fn resolve_and_check_await_shared(
             (event, val)
         }
         EventSourceKind::Channel => {
-            let ch_id = crate::Ir::ChannelId(pending.event_obj.as_i32() as u32);
+            // Channel event_obj 是 ChannelValue 堆对象引用。
+            // 从堆对象提取 channel id + recv 数据。
+            let (ch_id, val) = match pending.event_obj.heap_obj() {
+                Some(crate::Value::HeapObj::ChannelVal(ch)) => {
+                    (crate::Ir::ChannelId(ch.id()), ch.recv())
+                }
+                _ => panic!("await on non-channel value"),
+            };
             let event = RuntimeEvent::ChannelReady(ch_id);
-            let val = shared.channel_runtime.lock().recv(ch_id);
             (event, val)
         }
         EventSourceKind::Timer => {
-            let timer_id = crate::Ir::TimerId(pending.event_obj.as_i32() as u32);
+            // Timer event_obj 是 Timer record（含 duration_ns 字段）。
+            // 惰性启动 timer：首次 resolve 时从 record 提取 duration 并 start。
+            let duration_ns = match pending.event_obj.heap_obj() {
+                Some(crate::Value::HeapObj::Record(r)) => {
+                    r.find_field("duration_ns").map(|v| v.as_i64()).unwrap_or(0)
+                }
+                _ => pending.event_obj.as_i64(),
+            };
+            let timer_id = shared
+                .timer_runtime
+                .lock()
+                .start(std::time::Duration::from_nanos(duration_ns as u64));
             let event = RuntimeEvent::TimerFired(timer_id);
             let fired = shared.timer_runtime.lock().is_fired(timer_id);
             if fired {
@@ -4870,10 +5102,18 @@ fn run_frame_nodes(
         let graph_node_id = NodeId(local_id.0 + node_start);
         let node = graph.nodes[graph_node_id.0 as usize];
 
-        // 预填充节点跳过 compute_fn
+        // 预填充节点跳过 compute_fn（safe_op 标记：inputs[0] 为 Null 时短路返回 Null）
         let pre_filled = frame.value_table.ready[local_id.0 as usize];
         let value = if pre_filled {
             frame.value_table.values[local_id.0 as usize].clone()
+        } else if graph.safe_op_flags[graph_node_id.0 as usize] {
+            let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
+            if !inputs.is_empty() && matches!(frame.get_value_by_global(inputs[0]), Value::Null) {
+                Value::Null
+            } else {
+                let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
+                compute_fn(frame, graph_node_id)
+            }
         } else {
             let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
             compute_fn(frame, graph_node_id)
@@ -5008,11 +5248,25 @@ fn run_frame_nodes(
                 continue;
             } else {
                 // sync call：当前帧挂起等 SubgraphComplete 事件
+                shared.event_waiters.lock().push((RuntimeEvent::SubgraphComplete(child_fid), fid));
                 frame.state = FrameState::Suspended;
                 frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
                 frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
                 return;
             }
+        }
+
+        // 检测 pending_channel_notify（send 操作设置）
+        // 内联触发 ChannelReady 事件，唤醒等待该 channel 的挂起帧（零延迟）
+        let ch_notify = frame.pending_channel_notify;
+        if let Some(ch_id) = ch_notify {
+            frame.pending_channel_notify = None;
+            on_event_arrived_shared(
+                shared,
+                RuntimeEvent::ChannelReady(ch_id),
+                Value::VOID,
+                local_queue,
+            );
         }
 
         // 检测 pending_await（Await 节点设置）
@@ -5038,7 +5292,7 @@ fn run_frame_nodes(
                 );
                 continue;
             } else {
-                // 未就绪：注册等待 + 帧挂起
+                // 未就绪：帧挂起，立即注册 event_waiters（与单线程版一致）
                 shared.event_waiters.lock().push((event, fid));
                 frame.state = FrameState::Suspended;
                 frame.suspend_state = SuspendState::WaitingEvent(pending.await_node_local);
@@ -5078,8 +5332,10 @@ fn run_frame_nodes(
                     let event_val = frame.get_value_by_global(branch.event_source_node);
                     let is_ready = match branch.event_kind {
                         EventSourceKind::Channel => {
-                            let ch_id = crate::Ir::ChannelId(event_val.as_i32() as u32);
-                            shared.channel_runtime.lock().has_data(ch_id)
+                            match event_val.heap_obj() {
+                                Some(crate::Value::HeapObj::ChannelVal(ch)) => ch.has_data(),
+                                _ => false,
+                            }
                         }
                         EventSourceKind::Timer => {
                             let timer_id = {
@@ -5110,6 +5366,7 @@ fn run_frame_nodes(
                     // 有就绪分支：启动分支子图
                     let child_fid = start_subgraph_shared(shared, fid, gate_local, sg_id, &[]);
                     local_queue.push(child_fid);
+                    shared.event_waiters.lock().push((RuntimeEvent::SubgraphComplete(child_fid), fid));
                     frame.state = FrameState::Suspended;
                     frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
                     frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
@@ -5119,9 +5376,15 @@ fn run_frame_nodes(
                     for (branch_idx, branch) in info.branches.iter().enumerate() {
                         let event_val = frame.get_value_by_global(branch.event_source_node);
                         let event = match branch.event_kind {
-                            EventSourceKind::Channel => RuntimeEvent::ChannelReady(
-                                crate::Ir::ChannelId(event_val.as_i32() as u32),
-                            ),
+                            EventSourceKind::Channel => {
+                                let ch_id = match event_val.heap_obj() {
+                                    Some(crate::Value::HeapObj::ChannelVal(ch)) => {
+                                        crate::Ir::ChannelId(ch.id())
+                                    }
+                                    _ => panic!("select channel branch event_obj is not a ChannelValue"),
+                                };
+                                RuntimeEvent::ChannelReady(ch_id)
+                            }
                             EventSourceKind::Timer => {
                                 let timer_id = frame
                                     .select_timers
@@ -5242,6 +5505,12 @@ fn process_frame_shared(
             let pending = shared.pending_completions.lock().remove(&fid);
             if let Some((call_node, return_value, child_signal)) = pending {
                 // 有 pending completion：直接消费完成事件，注入返回值并唤醒
+                // 挂起点已注册 event_waiters，消费完成事件需清理对应等待项（避免泄露）
+                if let Some(e) = event {
+                    shared.event_waiters.lock().retain(|(we, wf)| !(*we == e && *wf == fid));
+                } else {
+                    shared.event_waiters.lock().retain(|(_, wf)| *wf != fid);
+                }
                 let _ = child_signal; // 控制信号已在 complete_and_wake_caller_shared 中处理
                 propagate_throw_shared(&mut frame, &return_value);
                 let caller_sg_id = frame.subgraph_id;
@@ -5262,17 +5531,8 @@ fn process_frame_shared(
                 shared.frames.lock().insert(fid, frame);
                 local_queue.push(fid);
             } else {
+                // event_waiters 已在 run_frame_nodes 挂起点注册，此处仅 insert 帧
                 shared.frames.lock().insert(fid, frame);
-                if let Some(e) = event {
-                    shared.event_waiters.lock().push((e, fid));
-                } else {
-                    // select 帧：suspend_event 为 None，event_waiters 已在
-                    // run_frame_nodes 中注册。检查是否有等待者。
-                    let has_waiter = shared.event_waiters.lock().iter().any(|(_, wf)| *wf == fid);
-                    if !has_waiter {
-                        // 异常状态：帧挂起但无等待者。不 panic（多线程竞态安全）。
-                    }
-                }
             }
         }
         FrameState::Completed => {
@@ -5771,7 +6031,7 @@ mod tests {
         let n3 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
         graph.const_values[n3.0 as usize] = Some(ConstValue::I32(10));
         let n4 = graph.add_node(Node { kind: NodeKind::BinOp, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(40) });
-        graph.set_closure_info(n4, ClosureInfo { subgraph_id: SubGraphId(0), arity: 1 });
+        graph.set_closure_info(n4, ClosureInfo { subgraph_id: SubGraphId(0), arity: 1, self_upvalue_idx: -1 });
         let call_off = graph.inputs_pool.push(&[n4, n3]);
         let n5 = graph.add_node(Node { kind: NodeKind::Call, input_count: 2, inputs_offset: call_off, compute_fn: ComputeFnId(41) });
         graph.add_subgraph(SubGraph {
@@ -7349,26 +7609,23 @@ mod tests {
         assert_eq!(result.as_i32(), 42);
     }
 
-    /// 单元测试：ChannelRuntime create + send + recv
+    /// 单元测试：ChannelValue create + send + recv
     #[test]
-    fn test_channel_runtime_basic() {
-        let mut rt = ChannelRuntime::new();
-        let ch = rt.create(2);
-        assert_eq!(ch, crate::Ir::ChannelId(0));
-
+    fn test_channel_value_basic() {
+        let ch = crate::Value::ChannelValue::new(2);
         let val = Value::NULL; // 用 NULL 作为占位值
-        assert!(rt.send(ch, val.clone()));
-        assert!(rt.recv(ch).is_some()); // 有数据
-        assert!(rt.recv(ch).is_none()); // buffer 空
+        ch.send(val.clone());
+        assert!(ch.recv().is_some()); // 有数据
+        assert!(ch.recv().is_none()); // buffer 空
     }
 
-    /// 单元测试：ChannelRuntime 容量限制
+    /// 单元测试：ChannelValue 容量限制
     #[test]
-    fn test_channel_runtime_capacity() {
-        let mut rt = ChannelRuntime::new();
-        let ch = rt.create(1);
-        assert!(rt.send(ch, Value::NULL));
-        assert!(!rt.send(ch, Value::VOID)); // 满了
+    #[should_panic(expected = "channel full")]
+    fn test_channel_value_capacity() {
+        let ch = crate::Value::ChannelValue::new(1);
+        ch.send(Value::NULL);
+        ch.send(Value::VOID); // 满了 → panic
     }
 
     /// 单元测试：TimerRuntime start + check_and_fire
@@ -7457,13 +7714,11 @@ mod tests {
         let mut engine = Engine::new(graph);
 
         // 预创建 channel + 发送值
-        // channel handle 是 i32 标量，值本身即 ChannelId
-        let ch_handle = Value::i32(0); // channel id = 0
-        let ch_id = engine.channel_runtime.create(1); // ChannelId(0)
-        debug_assert_eq!(ch_handle.as_i32() as usize, ch_id.0 as usize,
-            "channel handle value must match ChannelId");
+        // channel handle 是 ChannelValue 堆对象引用（Arc 共享）
+        let ch = crate::Value::ChannelValue::new(1);
         let sent_val = Value::i32(77);
-        engine.channel_runtime.send(ch_id, sent_val);
+        ch.send(sent_val); // 先发送数据，再包装为 Value
+        let ch_handle = Value::ref_val(crate::Value::HeapObj::ChannelVal(ch));
 
         // N0 的 Const 值设为 channel handle
         // 直接手动注入：先 init_frame，再手动设置 N0 的值
@@ -7482,13 +7737,15 @@ mod tests {
 
     /// 端到端：timer 事件源 — await 挂起 → timer 到期 → 事件唤醒 → 帧完成
     ///
-    /// SG0: N0=Const(timer_handle), N1=EventSource(Timer), N2=Await(N0)
-    /// 验证：await 检查 timer 未到期→挂起；timer 到期→on_event_arrived 唤醒；帧完成
+    /// SG0: N0=Const(Timer record), N1=EventSource(Timer), N2=Await(N0)
+    /// 验证：await 从 Timer record 提取 duration → 惰性启动 timer → 未到期→挂起；
+    ///       timer 到期→on_event_arrived 唤醒；帧完成
     #[test]
     fn test_timer_await_suspend_and_resume() {
+        use crate::Value::{HeapObj, RecordValue};
         let mut graph = DataFlowGraph::new();
 
-        // N0: Const (timer handle 占位，运行时注入)
+        // N0: Const (Timer record 占位，运行时注入)
         let n0 = graph.add_node(Node {
             kind: NodeKind::Const,
             input_count: 0,
@@ -7532,23 +7789,31 @@ mod tests {
 
         let mut engine = Engine::new(graph);
 
-        // 预创建 timer（10ms）+ 分配匹配值的 Value
-        // timer handle 是 i32 标量，值本身即 TimerId
-        let timer_handle = Value::i32(0); // timer id = 0
-        let timer_id = engine.timer_runtime.start(std::time::Duration::from_millis(10));
-        debug_assert_eq!(timer_handle.as_i32() as usize, timer_id.0 as usize,
-            "timer handle value must match TimerId");
+        // 构造 Timer record（duration_ns = 10ms = 10_000_000 ns）
+        let timer_record = Value::ref_val(HeapObj::Record(RecordValue {
+            type_name: "Timer".to_string(),
+            fields: vec![Value::i64(10_000_000)],
+            field_names: vec![Some("duration_ns".to_string())],
+            field_ref_bits: 0,
+        }));
 
-        // 初始化帧 + 手动注入 timer handle 到 N0
+        // 初始化帧 + 手动注入 Timer record 到 N0
         let fid = engine.init_frame(SubGraphId(0));
         let frame = engine.frames.get_mut(fid);
-        frame.set_value(NodeId(0), timer_handle, 1); // 1 downstream (N2)
+        frame.set_value(NodeId(0), timer_record, 1); // 1 downstream (N2)
         frame.push_ready(NodeId(0));
 
-        // 第一次执行：N0 就绪 → N2 (await) 就绪 → 检查 timer → 未到期 → 帧挂起
+        // 第一次执行：N0 就绪 → N2 (await) → resolve_and_check_await 惰性启动 timer
+        // → 未到期 → 帧挂起
         engine.run_ready_nodes(fid);
         assert_eq!(engine.frames.get(fid).state, FrameState::Suspended,
             "frame should be suspended waiting for timer");
+
+        // 从 suspend_event 提取惰性启动的 timer_id
+        let timer_id = match engine.frames.get(fid).suspend_event {
+            Some(crate::Ir::RuntimeEvent::TimerFired(tid)) => tid,
+            _ => panic!("suspend_event should be TimerFired"),
+        };
 
         // 等待 timer 到期
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -7647,12 +7912,11 @@ mod tests {
 
         let mut engine = Engine::new(graph);
 
-        // 预创建 channel + 发送值（channel handle 值即 ChannelId）
-        let ch_handle = Value::i32(0); // channel id = 0
-        let ch_id = engine.channel_runtime.create(1); // ChannelId(0)
-        debug_assert_eq!(ch_handle.as_i32() as usize, ch_id.0 as usize);
+        // 预创建 channel + 发送值（channel handle 是 ChannelValue 堆对象引用）
+        let ch = crate::Value::ChannelValue::new(1);
         let sent_val = Value::i32(77);
-        engine.channel_runtime.send(ch_id, sent_val);
+        ch.send(sent_val);
+        let ch_handle = Value::ref_val(crate::Value::HeapObj::ChannelVal(ch));
 
         // 初始化帧 + 手动注入 channel handle 到 N1（local id=0）
         let fid = engine.init_frame(SubGraphId(1));
@@ -7779,9 +8043,10 @@ mod tests {
         let mut engine = Engine::new(graph);
 
         // 预创建 channel（空，无数据）+ 分配匹配值的 Value
-        let ch_handle = Value::i32(0); // channel id = 0
-        let ch_id = engine.channel_runtime.create(1); // ChannelId(0)
-        debug_assert_eq!(ch_handle.as_i32() as usize, ch_id.0 as usize);
+        let ch = crate::Value::ChannelValue::new(1);
+        let ch_id = crate::Ir::ChannelId(ch.id()); // 提取 channel id 用于事件断言
+        let ch_handle = Value::ref_val(crate::Value::HeapObj::ChannelVal(ch));
+        let ch_handle_clone = ch_handle.clone(); // 保留引用用于后续 send
 
         // 初始化帧 + 手动注入 channel handle 到 N1（local id=0）
         let fid = engine.init_frame(SubGraphId(1));
@@ -7811,7 +8076,10 @@ mod tests {
 
         // 发送数据到 channel → 手动触发 ChannelReady 事件
         let sent_val = Value::i32(77);
-        engine.channel_runtime.send(ch_id, sent_val);
+        match ch_handle_clone.heap_obj() {
+            Some(crate::Value::HeapObj::ChannelVal(ch)) => ch.send(sent_val),
+            _ => panic!("ch_handle_clone should be a ChannelValue"),
+        }
         engine.on_event_arrived(RuntimeEvent::ChannelReady(ch_id), Value::VOID);
 
         assert_eq!(
@@ -8116,10 +8384,9 @@ mod tests {
             let has_caller = engine.frames.get(fid).caller.is_some();
             match state {
                 FrameState::Suspended => {
-                    let event = engine.frames.get(fid).suspend_event;
-                    if let Some(e) = event {
-                        engine.event_waiters.push((e, fid));
-                    }
+                    // event_waiters 已在 run_ready_nodes 挂起点注册，此处仅校验
+                    let has_waiter = engine.event_waiters.iter().any(|(_, wf)| *wf == fid);
+                    debug_assert!(has_waiter, "frame {} suspended without event waiter", fid.0);
                 }
                 FrameState::Completed => {
                     if has_caller {

@@ -673,6 +673,10 @@ pub enum Stmt<'a> {
     },
     /// loop 循环 `loop { body }`
     Loop { body: ExprRef },
+    /// 局部声明（嵌套 fun/type/trait 等）
+    LocalDecl {
+        decl: Box<Decl<'a>>,
+    },
 }
 
 // =========================================================================
@@ -980,6 +984,28 @@ pub fn walk_stmt<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: 
         Stmt::Loop { body } => {
             walk_expr(v, arena, *body);
         }
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            Decl::FunDecl { params, return_type, body, .. } => {
+                for p in params {
+                    walk_param(v, arena, p);
+                }
+                if let Some(rt) = return_type {
+                    walk_type(v, arena, *rt);
+                }
+                walk_expr(v, arena, *body);
+            }
+            Decl::TypeDecl { methods, .. } => {
+                for m in methods {
+                    walk_method_decl(v, arena, m);
+                }
+            }
+            Decl::TraitDecl { methods, .. } => {
+                for m in methods {
+                    walk_method_decl(v, arena, m);
+                }
+            }
+            _ => {}
+        },
     }
 }
 
@@ -5864,6 +5890,8 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             TokenKind::KwVal
                 | TokenKind::KwVar
                 | TokenKind::KwFun
+                | TokenKind::KwType
+                | TokenKind::KwTrait
                 | TokenKind::KwReturn
                 | TokenKind::KwDefer
                 | TokenKind::KwThrow
@@ -5885,6 +5913,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         if self.match_token(TokenKind::KwFun) {
             return self.parse_fun_stmt();
+        }
+        if self.check(TokenKind::KwType) {
+            let decl = self.parse_type_decl(Visibility::Private)?;
+            return Ok(self.alloc_stmt(decl.span, Stmt::LocalDecl { decl: Box::new(decl.node) }));
+        }
+        if self.check(TokenKind::KwTrait) {
+            let decl = self.parse_trait_decl(Visibility::Private)?;
+            return Ok(self.alloc_stmt(decl.span, Stmt::LocalDecl { decl: Box::new(decl.node) }));
         }
         if self.match_token(TokenKind::KwReturn) {
             return self.parse_return_stmt();
@@ -5916,11 +5952,18 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     /// 解析 fun 语句
+    /// 命名 fun → LocalDecl(Decl::FunDecl)（统一嵌套声明入口）
+    /// 匿名 fun(params) body → Expression(Lambda)
     fn parse_fun_stmt(&mut self) -> ParseResult<StmtRef> {
         let fun_tok = self.previous();
         let span = token_span(&fun_tok);
         if self.check(TokenKind::Identifier) && !self.check_identifier("in") {
-            let name_tok = self.advance();
+            let name_tok = self.expect(TokenKind::Identifier, "expected function name")?;
+            let mut type_params = Vec::new();
+            if self.match_token(TokenKind::Lt) {
+                self.parse_type_param_list(&mut type_params)?;
+                let _ = self.expect_close_angle("expected '>' to close type parameter list");
+            }
             let mut params = Vec::new();
             let _ = self.expect(TokenKind::LParen, "expected '('");
             if !self.check(TokenKind::RParen) {
@@ -5932,19 +5975,25 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             } else {
                 None
             };
-            let body_expr = self.parse_expr()?;
-            let lambda = self.alloc_expr(span, Expr::Lambda {
-                params,
-                body: LambdaBody::Block(body_expr),
-                is_async: false,
-                return_type,
-            });
-            return Ok(self.alloc_stmt(span, Stmt::ValDecl {
-                name: name_tok.lexeme,
-                type_annotation: None,
-                value: lambda,
+            let mut bounds = Vec::new();
+            if self.match_token(TokenKind::KwWith) {
+                self.parse_trait_bound_list(&mut bounds)?;
+            }
+            let body = self.parse_expr()?;
+            let decl = Decl::FunDecl {
                 visibility: Visibility::Private,
-            }));
+                name: name_tok.lexeme,
+                type_params,
+                params,
+                return_type,
+                bounds,
+                body,
+                is_async: false,
+                is_entry: false,
+                attributes: Vec::new(),
+                extern_c_body: None,
+            };
+            return Ok(self.alloc_stmt(span, Stmt::LocalDecl { decl: Box::new(decl) }));
         }
         // 匿名 lambda
         let mut params = Vec::new();
@@ -7927,6 +7976,25 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 self.ve(body);
                 self.dedent();
                 self.write_line(")");
+                self.dedent();
+                self.write_line(")");
+            }
+            Stmt::LocalDecl { decl } => {
+                self.write_line("(local-decl");
+                self.indent();
+                match decl.as_ref() {
+                    Decl::FunDecl { name, body, .. } => {
+                        self.write_line(&format!("(fun {})", name));
+                        self.ve(body);
+                    }
+                    Decl::TypeDecl { name, .. } => {
+                        self.write_line(&format!("(type {})", name));
+                    }
+                    Decl::TraitDecl { name, .. } => {
+                        self.write_line(&format!("(trait {})", name));
+                    }
+                    _ => self.write_line("(unknown)"),
+                }
                 self.dedent();
                 self.write_line(")");
             }

@@ -47,8 +47,8 @@ fun main(): void {
     }
     println(sum)             // 10
 
-    // ---- type() of concat result ----
-    println(type([1] ++ [2]))   // array
+    // ---- type_name() of concat result ----
+    println(type_name([1] ++ [2]))   // array
 
     println("array_concat: All tests passed!")
 }

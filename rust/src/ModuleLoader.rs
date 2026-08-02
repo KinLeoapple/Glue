@@ -313,7 +313,122 @@ impl ModuleLoader {
             }
         }
 
-        // 5. stdlib 和文件系统均未命中：记录模块未找到
+        // 4b. 目录模块检测：path 对应的不是文件而是目录（含 pack.glue）
+        // 例如 import Store → Store.glue 不存在，但 Store/pack.glue 存在。
+        // 加载 pack.glue 获取子模块声明，再加载每个子模块文件。
+        let dir_name = path_str.strip_suffix(".glue").unwrap_or(&path_str);
+        for base in &self.search_paths {
+            let pack_file = base.join(dir_name).join("pack.glue");
+            if !pack_file.exists() {
+                continue;
+            }
+            let pack_source = match std::fs::read_to_string(&pack_file) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let pack_path_key = format!("{}/pack.glue", dir_name);
+            let pack_path_static: &'static str = Box::leak(pack_path_key.into_boxed_str());
+            let pack_source_static: &'static str = Box::leak(pack_source.into_boxed_str());
+            let pack_module = match parse_source(pack_path_static, pack_source_static) {
+                Ok(m) => m,
+                Err(err) => {
+                    self.failed_paths.insert(path_str.clone());
+                    self.load_errors.push(LoadError::ParseFailed {
+                        path: path_str,
+                        line: err.line,
+                        column: err.column,
+                        message: err.message,
+                    });
+                    return None;
+                }
+            };
+            // 加载 pack 声明的每个子模块
+            for sub_name in collect_pack_submodules(&pack_module) {
+                let sub_path_str = format!("{}/{}.glue", dir_name, sub_name);
+                // 子模块可能已在缓存中（如被其他路径先加载）
+                if self.modules.contains_key(&sub_path_str) {
+                    continue;
+                }
+                let sub_full = base.join(&sub_path_str);
+                if let Ok(sub_source) = std::fs::read_to_string(&sub_full) {
+                    let sub_source_static: &'static str =
+                        Box::leak(sub_source.into_boxed_str());
+                    let sub_path_static: &'static str =
+                        Box::leak(sub_path_str.clone().into_boxed_str());
+                    if let Ok(sub_module) = parse_source(sub_path_static, sub_source_static) {
+                        let sub_exports = collect_exports(&sub_module);
+                        self.modules.insert(
+                            sub_path_str,
+                            LoadedModule {
+                                module: sub_module,
+                                exports: sub_exports,
+                            },
+                        );
+                    }
+                }
+            }
+            // 将 pack 模块注册为目录模块代表（key 为原始 path_str，如 "Store.glue"）
+            let pack_exports = collect_exports(&pack_module);
+            self.modules
+                .insert(path_str.clone(), LoadedModule {
+                    module: pack_module,
+                    exports: pack_exports,
+                });
+            return self.modules.get(&path_str).map(|m| &m.module);
+        }
+
+        // 5. stdlib 和文件系统均未命中：检查是否为同级模块导出的类型/符号
+        // 例如 import std.time.TimeComponents → TimeComponents 是 SystemTime.glue 导出的 type，
+        // 而非独立模块文件。此时不报错，符号通过已加载的同级模块可见。
+        if let Some(symbol_name) = extract_last_segment(&path_str) {
+            let parent_prefix = parent_directory(&path_str);
+
+            // 5a. 先检查已加载的同级模块
+            let already_exported = self
+                .modules
+                .iter()
+                .any(|(mod_path, mod_data)| {
+                    mod_path.starts_with(&parent_prefix) && mod_data.exports.contains(&symbol_name)
+                });
+
+            if already_exported {
+                self.failed_paths.insert(path_str);
+                return None;
+            }
+
+            // 5b. 检查 stdlib 嵌入表中尚未加载的同级模块
+            // 遍历 BUILTIN_FILES 和 STD_FILES 中父目录相同的所有文件，
+            // 找到导出该符号的文件并加载它。
+            for (sibling_file, _) in BUILTIN_FILES.iter().chain(STD_FILES.iter()) {
+                if !sibling_file.starts_with(&parent_prefix) || *sibling_file == path_str {
+                    continue;
+                }
+                // 已加载的模块也检查导出
+                if let Some(mod_data) = self.modules.get(*sibling_file) {
+                    if mod_data.exports.contains(&symbol_name) {
+                        self.failed_paths.insert(path_str);
+                        return None;
+                    }
+                    continue;
+                }
+                // 未加载的同级模块：加载并检查导出
+                if let Some(source) = find(sibling_file) {
+                    let sibling_static: &'static str =
+                        Box::leak(sibling_file.to_string().into_boxed_str());
+                    if let Ok(module) = parse_source(sibling_static, source) {
+                        let exports = collect_exports(&module);
+                        if exports.contains(&symbol_name) {
+                            self.modules
+                                .insert(sibling_file.to_string(), LoadedModule { module, exports });
+                            self.failed_paths.insert(path_str);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. 确实未找到：记录模块未找到
         self.failed_paths.insert(path_str.clone());
         self.load_errors.push(LoadError::ModuleNotFound { path: path_str });
         None
@@ -400,6 +515,13 @@ impl ModuleLoader {
                             child_path.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
                         );
                     }
+                    // 目录模块：pack.glue 中声明的子模块也需加入 check 顺序
+                    // 例如 import Store → pack.glue 声明 pub pack Memory → 子模块路径 ["Store", "Memory"]
+                    for sub_name in collect_pack_submodules(dep) {
+                        let mut child_segs: Vec<String> = path_segments.clone();
+                        child_segs.push(sub_name.to_string());
+                        child_segs_list.push(child_segs);
+                    }
                 }
                 // 自己重新入栈（标记 expanded），等子依赖处理完后再登记到 order
                 stack.push((path_segments, true));
@@ -443,6 +565,24 @@ fn module_path_to_file(path: &[&str]) -> String {
         joined
     } else {
         format!("{}.glue", joined)
+    }
+}
+
+/// 从文件路径中提取最后一段的模块名（去掉 .glue 后缀）
+/// `"std/time/TimeComponents.glue"` → `"TimeComponents"`
+fn extract_last_segment(path: &str) -> Option<String> {
+    path.rsplit('/')
+        .next()
+        .and_then(|last| last.strip_suffix(".glue"))
+        .map(|s| s.to_string())
+}
+
+/// 获取文件路径的父目录前缀
+/// `"std/time/TimeComponents.glue"` → `"std/time/"`
+fn parent_directory(path: &str) -> String {
+    match path.rfind('/') {
+        Some(idx) => path[..=idx].to_string(),
+        None => String::new(),
     }
 }
 
@@ -502,10 +642,36 @@ fn collect_exports(module: &Module<'_>) -> FxHashSet<String> {
             } => {
                 exports.insert((*name).to_string());
             }
+            Decl::PackDecl {
+                name,
+                visibility: Visibility::Public,
+            } => {
+                exports.insert((*name).to_string());
+            }
             _ => {}
         }
     }
     exports
+}
+
+/// 从模块的 `pub pack <Name>` 声明中提取子模块名列表。
+///
+/// 目录模块的 `pack.glue` 通过 PackDecl 声明其包含的子模块。
+/// 例如 `Store/pack.glue` 中的 `pub pack Memory` → 返回 `["Memory"]`。
+/// `load_transitive_imports` 用此结果构造子模块路径（如 `["Store", "Memory"]`），
+/// 确保子模块被加入 check 顺序。
+fn collect_pack_submodules<'a>(module: &'a Module<'a>) -> Vec<&'a str> {
+    let mut subs = Vec::new();
+    for decl in &module.declarations {
+        if let Decl::PackDecl {
+            name,
+            visibility: Visibility::Public,
+        } = &decl.node
+        {
+            subs.push(*name);
+        }
+    }
+    subs
 }
 
 // ─── ImportDecl 遍历辅助 ───────────────────────────────────────────

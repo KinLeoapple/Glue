@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use rustc_hash::FxHashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -1751,16 +1752,14 @@ pub struct NewtypeValue {
     pub inner: ValueHandle,
 }
 
-/// Cell：可变引用单元
+/// Cell：可变引用单元（`&T` 引用语义的运行时载体）
 ///
-/// 注意：Cell 内部持有 ValueHandle（指向 arena 的 u64 索引）。
-/// 当两个 Cell 互相引用形成 `a = Cell(b); b = Cell(a)` 时，会经由 arena
-/// 产生 Arc<HeapObj::Cell> → Cell → ValueHandle → arena → Arc<HeapObj::Cell>
-/// 的循环引用。Arc 无法回收此类环。调用方可通过 [`Value::make_weak`] /
-/// [`Cell::downgrade`] 获取 `Weak<HeapObj>` 来手动打破循环。
+/// 内部持有 `Value`（自包含值，标量内联 + 堆对象 Arc 共享）。
+/// `&expr` 创建 `Arc<HeapObj::Cell>` 包装当前值；`*r` 读取 Cell；
+/// `*r = v` 写入 Cell。多個引用共享同一 Arc，写入对所有引用可见。
 #[derive(Debug)]
 pub struct Cell {
-    pub inner: parking_lot::Mutex<ValueHandle>,
+    pub inner: parking_lot::Mutex<Value>,
 }
 
 impl Clone for Cell {
@@ -1770,15 +1769,14 @@ impl Clone for Cell {
 }
 
 impl Cell {
-    pub fn new(val: ValueHandle) -> Self {
+    pub fn new(val: Value) -> Self {
         Self { inner: parking_lot::Mutex::new(val) }
     }
-    /// 返回内部值的克隆。parking_lot::Mutex 的 guard 无法跨函数返回，
-    /// 故直接 clone ValueHandle（Copy 类型，零开销）。
-    pub fn get(&self) -> ValueHandle {
-        *self.inner.lock()
+    /// 返回内部值的克隆。
+    pub fn get(&self) -> Value {
+        self.inner.lock().clone()
     }
-    pub fn set(&self, val: ValueHandle) {
+    pub fn set(&self, val: Value) {
         *self.inner.lock() = val;
     }
 
@@ -2026,43 +2024,54 @@ impl Clone for AsyncHandle {
     }
 }
 
+/// 全局 channel id 计数器（线程安全，单/多 worker 共用）
+static CHANNEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 通道值
+///
+/// 统一存储 Engine 的 Value（非 ValueHandle），与 async 运行时一致。
+/// id 用于 RuntimeEvent::ChannelReady 事件标识（send 后内联触发 on_event_arrived）。
 #[derive(Debug)]
 pub struct ChannelValue {
-    buffer: Mutex<Vec<ValueHandle>>,
+    id: u64,
+    buffer: Mutex<VecDeque<Value>>,
     capacity: usize,
     closed: Mutex<bool>,
 }
 
 impl ChannelValue {
     pub fn new(capacity: usize) -> Self {
-        Self { buffer: Mutex::new(Vec::new()), capacity, closed: Mutex::new(false) }
+        Self {
+            id: CHANNEL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            buffer: Mutex::new(VecDeque::new()),
+            capacity,
+            closed: Mutex::new(false),
+        }
     }
-    pub fn send(&self, val: ValueHandle) -> Result<(), String> {
+    /// 返回 channel 的唯一 id（用于 RuntimeEvent::ChannelReady 事件标识）
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+    /// 非阻塞发送：push 到 buffer，满则 panic（设计决策：send 非阻塞，满为程序员错误）
+    pub fn send(&self, val: Value) {
         let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
         // [V-5] 持 buffer 锁期间检查 closed，与 close（同样持 buffer 锁）互斥，消除 TOCTOU
         if *self.closed.lock().unwrap_or_else(|e| e.into_inner()) {
-            return Err("channel closed".to_string());
+            panic!("send on closed channel");
         }
         if self.capacity > 0 && buf.len() >= self.capacity {
-            return Err("channel full".to_string());
+            panic!("channel full (capacity={})", self.capacity);
         }
-        buf.push(val);
-        Ok(())
+        buf.push_back(val);
     }
-    pub fn recv(&self) -> Option<ValueHandle> {
+    /// 接收：pop 从 buffer 前端，无数据返回 None（await 路径在 resolve_and_check_await 处理挂起）
+    pub fn recv(&self) -> Option<Value> {
         let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
-        if !buf.is_empty() {
-            Some(buf.remove(0))
-        } else {
-            None
-        }
+        buf.pop_front()
     }
-    pub fn try_send(&self, val: ValueHandle) -> Result<(), String> {
-        self.send(val)
-    }
-    pub fn try_recv(&self) -> Option<ValueHandle> {
-        self.recv()
+    /// 是否有数据可读
+    pub fn has_data(&self) -> bool {
+        !self.buffer.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
     pub fn close(&self) {
         // [V-5] 持 buffer 锁设置 closed，与 send 的持锁检查互斥（锁序 buffer→closed 一致，无死锁）
@@ -2077,7 +2086,12 @@ impl ChannelValue {
 impl Clone for ChannelValue {
     fn clone(&self) -> Self {
         let buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Self { buffer: Mutex::new(buf), capacity: self.capacity, closed: Mutex::new(*self.closed.lock().unwrap_or_else(|e| e.into_inner())) }
+        Self {
+            id: self.id,
+            buffer: Mutex::new(buf),
+            capacity: self.capacity,
+            closed: Mutex::new(*self.closed.lock().unwrap_or_else(|e| e.into_inner())),
+        }
     }
 }
 
@@ -2701,7 +2715,7 @@ impl ValueArena {
     pub fn alloc_newtype(&mut self, type_name: impl Into<String>, inner: ValueHandle) -> ValueHandle {
         self.alloc_ref(HeapObj::Newtype(NewtypeValue { type_name: type_name.into(), inner }))
     }
-    pub fn alloc_cell(&mut self, val: ValueHandle) -> ValueHandle {
+    pub fn alloc_cell(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::Cell(Cell::new(val)))
     }
     pub fn alloc_range(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
@@ -3872,9 +3886,9 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
             x.type_name == y.type_name && x.inner.equals(&y.inner, arena)
         }
         (HeapObj::Cell(x), HeapObj::Cell(y)) => {
-            let xb = *x.inner.lock();
-            let yb = *y.inner.lock();
-            xb.equals(&yb, arena)
+            let xb = x.inner.lock().clone();
+            let yb = y.inner.lock().clone();
+            value_equals(&xb, &yb)
         }
         (HeapObj::Range(x), HeapObj::Range(y)) => {
             x.start == y.start && x.end == y.end && x.inclusive == y.inclusive
@@ -4077,9 +4091,8 @@ fn deep_clone_heap(
             inner: deep_clone_handle(n.inner, arena, cache),
         }),
         HeapObj::Cell(c) => {
-            let inner = *c.inner.lock();
-            // Cell.inner 仍为 ValueHandle
-            HeapObj::Cell(Cell::new(deep_clone_handle(inner, arena, cache)))
+            let inner = c.inner.lock().clone();
+            HeapObj::Cell(Cell::new(deep_clone_value(&inner, arena, cache)))
         }
         HeapObj::Range(r) => HeapObj::Range(r.clone()),
         HeapObj::Closure(c) => {
@@ -4289,7 +4302,7 @@ impl ValueArena {
             inner,
         }))
     }
-    pub fn cell(&mut self, val: ValueHandle) -> ValueHandle {
+    pub fn cell(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::Cell(Cell::new(val)))
     }
     pub fn range(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
@@ -4624,8 +4637,8 @@ macro_rules! impl_bitops {
                 fn bit_or(self, other: Self) -> Self { self | other }
                 fn bit_xor(self, other: Self) -> Self { self ^ other }
                 fn bit_not(self) -> Self { !self }
-                fn shl(self, amount: u32) -> Self { self << amount }
-                fn shr(self, amount: u32) -> Self { self >> amount }
+                fn shl(self, amount: u32) -> Self { self.wrapping_shl(amount) }
+                fn shr(self, amount: u32) -> Self { self.wrapping_shr(amount) }
             }
         )*
     };
@@ -5571,8 +5584,8 @@ fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
         BinOp::Band => a & b,
         BinOp::Bor => a | b,
         BinOp::Bxor => a ^ b,
-        BinOp::Shl => a << (b as u32),
-        BinOp::Shr => a >> (b as u32),
+        BinOp::Shl => a.wrapping_shl(b as u32),
+        BinOp::Shr => a.wrapping_shr(b as u32),
     }
 }
 
@@ -5646,8 +5659,8 @@ fn binop_i64_scalar(a: i64, b: i64, op: BinOp) -> i64 {
         BinOp::Band => a & b,
         BinOp::Bor => a | b,
         BinOp::Bxor => a ^ b,
-        BinOp::Shl => a << (b as u32),
-        BinOp::Shr => a >> (b as u32),
+        BinOp::Shl => a.wrapping_shl(b as u32),
+        BinOp::Shr => a.wrapping_shr(b as u32),
     }
 }
 
@@ -5816,8 +5829,8 @@ macro_rules! impl_simd_int_binop {
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
-                BinOp::Shl => a << (b as u32),
-                BinOp::Shr => a >> (b as u32),
+                BinOp::Shl => a.wrapping_shl(b as u32),
+                BinOp::Shr => a.wrapping_shr(b as u32),
             }
         }
 
@@ -5891,8 +5904,8 @@ macro_rules! impl_simd_int_binop_no_mul {
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
-                BinOp::Shl => a << (b as u32),
-                BinOp::Shr => a >> (b as u32),
+                BinOp::Shl => a.wrapping_shl(b as u32),
+                BinOp::Shr => a.wrapping_shr(b as u32),
             }
         }
 

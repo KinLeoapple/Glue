@@ -540,6 +540,8 @@ pub struct Frame {
     pub pending_call: Option<PendingCall>,
     /// 待处理的 await 挂起（await 节点 compute_fn 产出，调度器消费）
     pub pending_await: Option<PendingAwait>,
+    /// 待通知的 channel 事件（send 操作设置，run_ready_nodes 消费：触发 ChannelReady 唤醒等待帧）
+    pub pending_channel_notify: Option<crate::Ir::ChannelId>,
     /// 挂起事件（子图完成等，驱动帧恢复）
     pub suspend_event: Option<RuntimeEvent>,
     /// 待取消的 async handle（cancel 方法调用设置，run_ready_nodes 消费）
@@ -576,6 +578,7 @@ impl Frame {
             defer_stack: Vec::new(),
             pending_call: None,
             pending_await: None,
+            pending_channel_notify: None,
             suspend_event: None,
             pending_cancel: None,
             pending_select_wait: None,
@@ -635,7 +638,7 @@ impl Frame {
 
 /// Channel id（运行时）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChannelId(pub u32);
+pub struct ChannelId(pub u64);
 
 /// Timer id（运行时）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -689,14 +692,37 @@ pub struct DeferEntry {
 // RecordLitInfo — 记录构造信息（RecordLit 节点用）
 // =========================================================================
 
+/// 构造种类：区分 Record / ADT / Newtype，驱动 compute_record_construct 构造不同的 HeapObj。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordLitKind {
+    Record,
+    Adt,
+    Newtype,
+}
+
+/// 类型字段信息（注册到 type_scope_stack，按构造器名或类型名索引）。
+///
+/// field_names: 构造器的字段名列表（Newtype 为空，走单独路径）
+/// type_name: 所属类型名（多构造器 ADT 的构造器名 != 类型名，需存储类型名）
+/// kind: 构造种类（Record / Adt / Newtype）
+#[derive(Debug, Clone)]
+pub struct TypeFieldInfo {
+    pub field_names: Vec<String>,
+    pub type_name: String,
+    pub kind: RecordLitKind,
+}
+
 /// 记录构造信息（RecordLit 节点用）。
 ///
-/// RecordLit 编译为构造节点，compute_fn 从输入收集字段值构造 RecordValue。
-/// type_name 和 field_names 存入此表（按 NodeId 索引）。
+/// RecordLit 编译为构造节点，compute_fn 从输入收集字段值构造 HeapObj。
+/// 根据 kind 构造 RecordValue / AdtValue / NewtypeValue。
+/// type_name 存所属类型名（非构造器名），constructor 存构造器名（ADT 用）。
 #[derive(Debug, Clone)]
 pub struct RecordLitInfo {
     pub type_name: String,
     pub field_names: Vec<Option<String>>,
+    pub constructor: String,
+    pub kind: RecordLitKind,
 }
 
 /// 闭包构造节点的信息（按 NodeId 索引，非闭包构造节点为 None）。
@@ -709,6 +735,8 @@ pub struct ClosureInfo {
     pub subgraph_id: SubGraphId,
     /// lambda 参数数（不含捕获的 upvalues）
     pub arity: u8,
+    /// 自身引用 upvalue 的索引（递归嵌套函数用，-1 表示无自身引用）
+    pub self_upvalue_idx: i32,
 }
 
 /// inline_trait 构造节点信息（按 NodeId 索引）。
@@ -1198,6 +1226,15 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         // 通用类型转换（277-278）
         277 => crate::Engine::compute_cast_to_str,
         278 => crate::Engine::compute_cast_scalar,
+        // 引用语义与非空断言（279-282）
+        279 => crate::Engine::compute_non_null_assert,
+        280 => crate::Engine::compute_ref_of,
+        281 => crate::Engine::compute_deref_read,
+        282 => crate::Engine::compute_deref_write,
+        // channel 操作（283-285）
+        283 => crate::Engine::compute_channel_create,
+        284 => crate::Engine::compute_channel_send,
+        285 => crate::Engine::compute_channel_close,
     }
 }
 
@@ -1247,6 +1284,7 @@ macro_rules! node_metadata {
             opt(cast_target_types, String, set_cast_target_type)
             ;
             bool_flag(tail_call_flags, set_tail_call)
+            bool_flag(safe_op_flags, set_safe_op)
             ;
             bool_val(slice_inclusive, set_slice_inclusive)
         }
@@ -1277,6 +1315,7 @@ macro_rules! node_metadata {
             opt(cast_target_types, String, set_cast_target_type)
             ;
             bool_flag(tail_call_flags, set_tail_call)
+            bool_flag(safe_op_flags, set_safe_op)
             ;
             bool_val(slice_inclusive, set_slice_inclusive)
         }
@@ -1372,6 +1411,9 @@ pub struct DataFlowGraph {
     pub writeback_targets: Vec<Option<NodeId>>,
     /// Call 节点的尾调用标记（按 NodeId 索引，true=尾调用帧复用）
     pub tail_call_flags: Vec<bool>,
+    /// 安全操作标记（按 NodeId 索引，true=inputs[0] 为 Null 时短路返回 Null）
+    /// 用于 ?.field / ?.method() / cast(x).to(T)?
+    pub safe_op_flags: Vec<bool>,
     /// 编译期 SIMD/并行批量化标记（按 NodeId 索引，None=不可批量化）
     pub batch_infos: Vec<Option<BatchInfo>>,
     /// IR 编译期错误（未实现的特性、找不到函数等），build() 末尾从 IrBuilder.errors 移入
@@ -1423,6 +1465,7 @@ impl DataFlowGraph {
             select_infos: Vec::new(),
             writeback_targets: Vec::new(),
             tail_call_flags: Vec::new(),
+            safe_op_flags: Vec::new(),
             batch_infos: Vec::new(),
             trait_construct_infos: Vec::new(),
             lazy_construct_infos: Vec::new(),
@@ -1603,6 +1646,8 @@ pub struct IrBuilder<'a> {
     pub loop_stack: Vec<LoopContext>,
     /// 变量作用域栈：变量名 → 产出该变量值的 NodeId
     pub scope_stack: Vec<rustc_hash::FxHashMap<String, NodeId>>,
+    /// 类型字段作用域栈：构造器/类型名 → 字段名列表（与 scope_stack 平行管理）
+    pub type_scope_stack: Vec<rustc_hash::FxHashMap<String, TypeFieldInfo>>,
     /// 当前正在编译的函数的 function_id（用于子图标记，root_frame_ptr 继承判定）
     pub current_function_id: u32,
     /// 当前正在编译的子图的节点起始 NodeId（用于判断变量是否为外层变量）
@@ -1644,34 +1689,48 @@ fn cast_mangled_name(source: &str, target: &str) -> String {
     format!("__cast_{}_to_{}", source, target)
 }
 
-/// 内置 nullary 方法（无参数）的降级策略。
-/// 新增单节点内置方法只需追加一行，无需新增 else-if 分支。
+/// 内置方法的降级策略。
+///
+/// 新增内置方法只需在 `BUILTIN_METHODS` 追加一行，无需新增 if 分支。
 enum BuiltinMethodLower {
-    /// 单节点一元运算（compute_fn 索引）
+    /// 单节点一元运算（无参数）：cancel/len/close
     UnOp(u32),
-    /// 挂起等待事件源（await：EventSource + Await 双节点）
+    /// 挂起等待事件源（无参数）：await（无条件降级）
     Await,
+    /// Channel 接收（无参数）：recv → 降级为 Await
+    /// 仅当 recv 类型为 Channel/Receiver 时降级，否则走 trait 方法
+    ChannelAwait,
+    /// 二元运算（recv + 1 参数）：send(value) → compute_fn
+    BinOp(u32),
 }
 
-/// 内置 nullary 方法分派表：方法名 → 降级策略。
-const NULLARY_BUILTIN_METHODS: &[(&str, BuiltinMethodLower)] = &[
+/// 内置方法分派表：方法名 → 降级策略。
+const BUILTIN_METHODS: &[(&str, BuiltinMethodLower)] = &[
     ("await", BuiltinMethodLower::Await),
     ("cancel", BuiltinMethodLower::UnOp(42)),
     ("len", BuiltinMethodLower::UnOp(35)),
+    ("close", BuiltinMethodLower::UnOp(285)), // compute_channel_close
+    ("recv", BuiltinMethodLower::ChannelAwait),
+    ("send", BuiltinMethodLower::BinOp(284)), // compute_channel_send
 ];
 
-/// Throw 内置构造器的降级策略。
-enum ThrowCtorLower {
+/// 内置构造器的降级策略。
+///
+/// 新增内置构造器只需在 `BUILTIN_CTORS` 追加一行，无需新增 if 分支。
+enum BuiltinCtorLower {
     /// Ok(val)：单节点 compute_throw_ok（idx 44）
     Ok,
     /// Err(...)：内层 record_construct + 外层 throw_err 包装（idx 45）
     Err,
+    /// channel(capacity)：单节点 compute_channel_create（idx 283）
+    Channel,
 }
 
-/// Throw 内置构造器分派表：构造器名 → 降级策略。
-const THROW_CTORS: &[(&str, ThrowCtorLower)] = &[
-    ("Ok", ThrowCtorLower::Ok),
-    ("Err", ThrowCtorLower::Err),
+/// 内置构造器分派表：构造器名 → 降级策略。
+const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
+    ("Ok", BuiltinCtorLower::Ok),
+    ("Err", BuiltinCtorLower::Err),
+    ("channel", BuiltinCtorLower::Channel),
 ];
 
 impl<'a> IrBuilder<'a> {
@@ -1694,6 +1753,7 @@ impl<'a> IrBuilder<'a> {
             errors: Vec::new(),
             global_var_slots: rustc_hash::FxHashMap::default(),
             top_level_var_decls: Vec::new(),
+            type_scope_stack: Vec::new(),
         }
     }
 
@@ -1711,14 +1771,33 @@ impl<'a> IrBuilder<'a> {
         self.compiling_builtin.unwrap_or(self.module)
     }
 
-    /// 进入新作用域。
+    /// 进入新作用域（变量和类型字段同步 push）。
     fn enter_scope(&mut self) {
         self.scope_stack.push(rustc_hash::FxHashMap::default());
+        self.type_scope_stack.push(rustc_hash::FxHashMap::default());
     }
 
-    /// 退出作用域。
+    /// 退出作用域（变量和类型字段同步 pop）。
     fn exit_scope(&mut self) {
         self.scope_stack.pop();
+        self.type_scope_stack.pop();
+    }
+
+    /// 在当前作用域注册类型字段信息（构造器名/类型名 → TypeFieldInfo）。
+    fn bind_type_fields(&mut self, name: &str, info: TypeFieldInfo) {
+        if let Some(scope) = self.type_scope_stack.last_mut() {
+            scope.insert(name.to_string(), info);
+        }
+    }
+
+    /// 从作用域栈逐层查找类型字段信息（构造器名或类型名）。
+    fn lookup_type_fields(&self, name: &str) -> Option<TypeFieldInfo> {
+        for scope in self.type_scope_stack.iter().rev() {
+            if let Some(info) = scope.get(name) {
+                return Some(info.clone());
+            }
+        }
+        None
     }
 
     /// 绑定变量名到 NodeId（当前作用域）。
@@ -1872,12 +1951,13 @@ impl<'a> IrBuilder<'a> {
                     Some(slot) => self.compile_global_load(slot),
                     None => {
                         // nullary ADT/类型构造器检测：当 Ident 既非局部变量也非全局变量，
-                        // 检查是否为无参构造器（如 `Lt`/`Leaf`），编译为无参构造节点。
+                        // 检查是否为无参构造器（如 `Lt`/`Leaf`/`Red`），编译为无参构造节点。
                         // 有参构造器（field_names 非空）不在此处理（应走 Call 路径带参数）。
-                        let field_names = self.lookup_constructor_field_names(name)
+                        // Newtype 总有 inner 值，不可能是 nullary。
+                        let tf_info = self.lookup_constructor_field_names(name)
                             .or_else(|| self.lookup_type_field_names(name));
-                        match field_names {
-                            Some(names) if names.is_empty() => {
+                        match tf_info {
+                            Some(info) if info.field_names.is_empty() && info.kind != RecordLitKind::Newtype => {
                                 let inputs_offset = self.graph.inputs_pool.push(&[]);
                                 let node = self.graph.add_node(Node {
                                     kind: NodeKind::BinOp,
@@ -1886,8 +1966,10 @@ impl<'a> IrBuilder<'a> {
                                     compute_fn: ComputeFnId(29), // record_construct
                                 });
                                 self.graph.set_record_lit_info(node, RecordLitInfo {
-                                    type_name: name.to_string(),
+                                    type_name: info.type_name.clone(),
                                     field_names: Vec::new(),
+                                    constructor: name.to_string(),
+                                    kind: info.kind,
                                 });
                                 node
                             }
@@ -1917,9 +1999,14 @@ impl<'a> IrBuilder<'a> {
             }
 
             // 字段访问
-            crate::Ast::Expr::FieldAccess { recv, field }
-            | crate::Ast::Expr::SafeAccess { recv, field } => {
+            crate::Ast::Expr::FieldAccess { recv, field } => {
                 self.compile_field_access(expr_id, *recv, field)
+            }
+            // 安全字段访问 recv?.field：编译为普通字段访问 + safe 标记
+            crate::Ast::Expr::SafeAccess { recv, field } => {
+                let node = self.compile_field_access(expr_id, *recv, field);
+                self.graph.set_safe_op(node);
+                node
             }
             crate::Ast::Expr::Index { recv, index } => self.compile_index(*recv, *index),
 
@@ -1943,7 +2030,10 @@ impl<'a> IrBuilder<'a> {
 
             // Lambda 表达式 → 闭包子图 + 闭包构造节点
             crate::Ast::Expr::Lambda { params, body, is_async, .. } => {
-                self.compile_lambda(params, body, *is_async)
+                let body_expr = match body {
+                    crate::Ast::LambdaBody::Block(e) | crate::Ast::LambdaBody::Expression(e) => *e,
+                };
+                self.compile_lambda(params, body_expr, *is_async, None)
             }
 
             // 数组构造
@@ -1959,8 +2049,7 @@ impl<'a> IrBuilder<'a> {
                     crate::Ast::Expr::Ident(name) => {
                         self.bind_var(name, val_node);
                     }
-                    crate::Ast::Expr::FieldAccess { recv: obj, field }
-                    | crate::Ast::Expr::SafeAccess { recv: obj, field } => {
+                    crate::Ast::Expr::FieldAccess { recv: obj, field } => {
                         let obj_node = self.compile_subexpr(*obj);
                         let off = self.graph.inputs_pool.push(&[obj_node, val_node]);
                         let set_node = self.graph.add_node(Node {
@@ -1970,6 +2059,30 @@ impl<'a> IrBuilder<'a> {
                             compute_fn: ComputeFnId(33), // record_field_set
                         });
                         self.graph.set_field_set_name(set_node, field.to_string());
+                    }
+                    // recv?.field = value：obj 为 null 时跳过赋值
+                    crate::Ast::Expr::SafeAccess { recv: obj, field } => {
+                        let obj_node = self.compile_subexpr(*obj);
+                        let off = self.graph.inputs_pool.push(&[obj_node, val_node]);
+                        let set_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: off,
+                            compute_fn: ComputeFnId(33), // record_field_set
+                        });
+                        self.graph.set_field_set_name(set_node, field.to_string());
+                        self.graph.set_safe_op(set_node);
+                    }
+                    // `*ref = value` → compute_deref_write(282)
+                    crate::Ast::Expr::Deref(ref_inner) => {
+                        let ref_node = self.compile_subexpr(*ref_inner);
+                        let off = self.graph.inputs_pool.push(&[ref_node, val_node]);
+                        let _write_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: off,
+                            compute_fn: ComputeFnId(282), // compute_deref_write
+                        });
                     }
                     _ => {}
                 }
@@ -2026,6 +2139,35 @@ impl<'a> IrBuilder<'a> {
                         self.graph.set_field_set_name(set_node, field.to_string());
                         result_node
                     }
+                    // `*ref op= value` → 读 Cell + 运算 + 写回 Cell
+                    crate::Ast::Expr::Deref(ref_inner) => {
+                        let ref_node = self.compile_subexpr(*ref_inner);
+                        // 读当前值：compute_deref_read(281)
+                        let read_off = self.graph.inputs_pool.push(&[ref_node]);
+                        let read_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset: read_off,
+                            compute_fn: ComputeFnId(281),
+                        });
+                        // 运算
+                        let bin_off = self.graph.inputs_pool.push(&[read_node, val_node]);
+                        let result_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: bin_off,
+                            compute_fn: bin_compute,
+                        });
+                        // 写回 Cell：compute_deref_write(282)
+                        let write_off = self.graph.inputs_pool.push(&[ref_node, result_node]);
+                        let _write_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: write_off,
+                            compute_fn: ComputeFnId(282),
+                        });
+                        result_node
+                    }
                     _ => self.compile_void_const(),
                 }
             }
@@ -2063,23 +2205,70 @@ impl<'a> IrBuilder<'a> {
                 node
             }
 
-            // 以下 Expr 变体尚未实现 IR 降级，记录编译错误并返回占位节点
-            crate::Ast::Expr::StrInterp(_)
-            | crate::Ast::Expr::RefOf(_)
-            | crate::Ast::Expr::Deref(_)
-            | crate::Ast::Expr::SafeMethodCall { .. }
-            | crate::Ast::Expr::NonNullAssert(_)
-            | crate::Ast::Expr::Elvis { .. } => {
-                self.errors.push(format!(
-                    "compile_expr: 尚未实现的 Expr 变体: {:?}",
-                    expr
-                ));
-                self.compile_placeholder()
+            // 字符串插值："text {expr} more {expr}" → 链式 str_concat
+            crate::Ast::Expr::StrInterp(parts) => {
+                self.compile_str_interp(parts)
+            }
+
+            // 取引用 `&expr` → compute_ref_of(280)：标量包装进 Cell，堆对象共享 Arc
+            crate::Ast::Expr::RefOf(inner) => {
+                let inner_node = self.compile_subexpr(*inner);
+                let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(280),
+                })
+            }
+
+            // 解引用读取 `*ref` → compute_deref_read(281)：Cell 返回内部值，其他 Ref 透传
+            crate::Ast::Expr::Deref(inner) => {
+                let inner_node = self.compile_subexpr(*inner);
+                let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(281),
+                })
+            }
+
+            // 非空断言 `expr!` → compute_non_null_assert(279)：Null panic，非 Null 透传
+            crate::Ast::Expr::NonNullAssert(inner) => {
+                let inner_node = self.compile_subexpr(*inner);
+                let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(279),
+                })
+            }
+
+            // Elvis：lhs ?: rhs → compute_elvis（idx 265）
+            crate::Ast::Expr::Elvis { lhs, rhs } => {
+                let lhs_node = self.compile_subexpr(*lhs);
+                let rhs_node = self.compile_subexpr(*rhs);
+                let inputs_offset = self.graph.inputs_pool.push(&[lhs_node, rhs_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(265), // compute_elvis
+                })
+            }
+
+            // 安全方法调用 recv?.method(args)：编译为普通方法调用 + safe 标记
+            crate::Ast::Expr::SafeMethodCall { recv, method, args, .. } => {
+                let node = self.compile_method_call(*recv, method, args);
+                self.graph.set_safe_op(node);
+                node
             }
 
             // 类型转换 `target(expr)` 或安全转换 `target(expr)?`
-            crate::Ast::Expr::TypeCast { target, expr: inner, .. } => {
-                self.compile_type_cast(*target, *inner)
+            crate::Ast::Expr::TypeCast { target, expr: inner, safe } => {
+                self.compile_type_cast(*target, *inner, *safe)
             }
 
             // 记录扩展 `(...base, field: value, ...)` → base + updates 输入节点 + RecordExtendInfo
@@ -2421,28 +2610,45 @@ impl<'a> IrBuilder<'a> {
     fn compile_lambda(
         &mut self,
         params: &[crate::Ast::Param<'_>],
-        body: &crate::Ast::LambdaBody,
+        body_expr: crate::Ast::ExprId,
         is_async: bool,
+        fn_name: Option<&str>,
     ) -> NodeId {
-        use crate::Ast::LambdaBody;
-
-        let body_expr = match body {
-            LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
-        };
-
         // 1. 自由变量分析：收集 body 中引用的外层变量（排除 lambda 自身参数）
         let param_names: rustc_hash::FxHashSet<&str> =
             params.iter().map(|p| p.name).collect();
         let mut ident_names: Vec<String> = Vec::new();
         self.collect_free_idents_expr(body_expr, &mut ident_names);
         let mut captured: Vec<(String, NodeId)> = Vec::new();
-        for name in &ident_names {
-            if param_names.contains(name.as_str()) {
+
+        // 自引用检测：命名函数在 body 中引用自身 → 作为 upvalue 占位
+        // 运行时 compute_closure_call 将闭包值注入该 slot，支持递归调用
+        let self_upvalue_idx = if let Some(fname) = fn_name {
+            if !param_names.contains(fname)
+                && ident_names.iter().any(|n| n == fname)
+            {
+                let void_node = self.compile_void_const();
+                let idx = captured.len();
+                captured.push((fname.to_string(), void_node));
+                idx as i32
+            } else {
+                -1
+            }
+        } else {
+            -1
+        };
+
+        for ident in &ident_names {
+            if param_names.contains(ident.as_str()) {
                 continue;
             }
-            if let Some(node) = self.lookup_var(name) {
-                if !captured.iter().any(|(n, _)| n == name) {
-                    captured.push((name.clone(), node));
+            // 跳过自引用名（已作为占位 upvalue 添加）
+            if Some(ident.as_str()) == fn_name && self_upvalue_idx >= 0 {
+                continue;
+            }
+            if let Some(node) = self.lookup_var(ident) {
+                if !captured.iter().any(|(n, _)| n == ident) {
+                    captured.push((ident.clone(), node));
                 }
             }
         }
@@ -2481,13 +2687,17 @@ impl<'a> IrBuilder<'a> {
         let return_node = self.compile_expr(body_expr);
         self.exit_scope();
 
-        // 5. 更新子图 node_range + return_node
+        // 5. 更新子图 node_range + return_node + function_id
+        // function_id 设为当前函数的 function_id，确保 lambda 子帧与外层函数帧
+        // 属于同一 function_id，parent_frame_ptr / root_frame_ptr 能正确链接，
+        // 使 lambda 内部分支子图可访问 lambda 帧中的 upvalue 参数节点。
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
         sg.node_range = (NodeId(node_start), NodeId(node_end));
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
         sg.has_suspend = is_async;
+        sg.function_id = self.current_function_id;
 
         // 6. 在当前作用域创建闭包构造节点（inputs = 捕获值外层节点，compute_fn 40）
         let upvalue_nodes: Vec<NodeId> = captured.iter().map(|(_, n)| *n).collect();
@@ -2503,6 +2713,7 @@ impl<'a> IrBuilder<'a> {
             ClosureInfo {
                 subgraph_id: sg_id,
                 arity: params.len() as u8,
+                self_upvalue_idx,
             },
         );
         construct_node
@@ -2911,6 +3122,12 @@ impl<'a> IrBuilder<'a> {
                 self.collect_free_idents_expr(*expr, names);
             }
             crate::Ast::Stmt::Break | crate::Ast::Stmt::Continue => {}
+            crate::Ast::Stmt::LocalDecl { decl } => match decl.as_ref() {
+                crate::Ast::Decl::FunDecl { body, .. } => {
+                    self.collect_free_idents_expr(*body, names);
+                }
+                _ => {}
+            },
         }
     }
 
@@ -3770,6 +3987,63 @@ impl<'a> IrBuilder<'a> {
         n
     }
 
+    /// 编译字符串插值：将 `"text {expr} more {expr}"` 降级为链式 str_concat。
+    ///
+    /// 每个 Literal 部分编译为字符串常量节点；
+    /// 每个 Expression 部分通过 `__reflect_format` FFI 调用转换为字符串；
+    /// 所有部分通过 `compute_str_concat`（idx 269）链式拼接。
+    fn compile_str_interp(
+        &mut self,
+        parts: &[crate::Ast::InterpolationPart<'_>],
+    ) -> NodeId {
+        if parts.is_empty() {
+            return self.compile_str_const("");
+        }
+
+        // 收集所有部分的节点
+        let mut nodes: Vec<NodeId> = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part {
+                crate::Ast::InterpolationPart::Literal(text) => {
+                    if !text.is_empty() {
+                        nodes.push(self.compile_str_const(text));
+                    }
+                }
+                crate::Ast::InterpolationPart::Expression(expr_id) => {
+                    let expr_node = self.compile_subexpr(*expr_id);
+                    // 通过 __reflect_format FFI 调用将任意值转为字符串
+                    let inputs_offset = self.graph.inputs_pool.push(&[expr_node]);
+                    let ffi_node = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: 1,
+                        inputs_offset,
+                        compute_fn: ComputeFnId(46), // compute_ffi_call
+                    });
+                    self.graph.set_ffi_call_name(ffi_node, "__reflect_format".to_string());
+                    nodes.push(ffi_node);
+                }
+            }
+        }
+
+        // 单个部分：直接返回
+        if nodes.len() == 1 {
+            return nodes[0];
+        }
+
+        // 链式拼接：((part0 concat part1) concat part2) ...
+        let mut result = nodes[0];
+        for &next in &nodes[1..] {
+            let inputs_offset = self.graph.inputs_pool.push(&[result, next]);
+            result = self.graph.add_node(Node {
+                kind: NodeKind::BinOp,
+                input_count: 2,
+                inputs_offset,
+                compute_fn: ComputeFnId(269), // compute_str_concat
+            });
+        }
+        result
+    }
+
     /// 查询表达式的类型名（来自 Sema）。
     ///
     /// 优先取 ExprInfo.type_name（adt/generic 等场景），回退到 type_desc.type_name。
@@ -3944,22 +4218,35 @@ impl<'a> IrBuilder<'a> {
         lhs: crate::Ast::ExprId,
         rhs: crate::Ast::ExprId,
     ) -> NodeId {
-        // 操作数不在尾位置：其值被运算节点消费，而非直接返回。
-        let lhs_node = self.compile_subexpr(lhs);
-        let rhs_node = self.compile_subexpr(rhs);
-        let inputs_offset = self.graph.inputs_pool.push(&[lhs_node, rhs_node]);
-        let compute_fn = self.select_binary_compute_fn(op, lhs);
-        let node = self.graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset,
-            compute_fn,
-        });
-        // 编译期标记 SIMD 批量化信息：标量类型 + 运算 → 运行期按 (tag,op) 分组批算
-        if let Some(info) = self.binary_batch_info(op, lhs) {
-            self.graph.set_batch_info(node, info);
+        // Range/RangeInclusive 编译为 range_iter(start, end, inclusive) 函数调用
+        // （Range 本身是迭代器，For 循环通过 RangeIterator.next 静态分派）
+        match op {
+            crate::Ast::BinaryOp::Range | crate::Ast::BinaryOp::RangeInclusive => {
+                let lhs_node = self.compile_subexpr(lhs);
+                let rhs_node = self.compile_subexpr(rhs);
+                let inclusive = matches!(op, crate::Ast::BinaryOp::RangeInclusive);
+                let bool_node = self.compile_bool_const(inclusive);
+                self.make_call_by_name("range_iter", &[lhs_node, rhs_node, bool_node])
+            }
+            _ => {
+                // 操作数不在尾位置：其值被运算节点消费，而非直接返回。
+                let lhs_node = self.compile_subexpr(lhs);
+                let rhs_node = self.compile_subexpr(rhs);
+                let inputs_offset = self.graph.inputs_pool.push(&[lhs_node, rhs_node]);
+                let compute_fn = self.select_binary_compute_fn(op, lhs);
+                let node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset,
+                    compute_fn,
+                });
+                // 编译期标记 SIMD 批量化信息：标量类型 + 运算 → 运行期按 (tag,op) 分组批算
+                if let Some(info) = self.binary_batch_info(op, lhs) {
+                    self.graph.set_batch_info(node, info);
+                }
+                node
+            }
         }
-        node
     }
 
     /// 将 Glue BinaryOp + 类型名映射为 BatchInfo（可批量化的运算+标量类型组合）。
@@ -4113,6 +4400,7 @@ impl<'a> IrBuilder<'a> {
         &mut self,
         target: crate::Ast::TypeRef,
         expr: crate::Ast::ExprRef,
+        safe: bool,
     ) -> NodeId {
         let target_ty = {
             let spanned = &self.current_module().arena.types[target.0 as usize];
@@ -4128,12 +4416,16 @@ impl<'a> IrBuilder<'a> {
         // 通用路径 1：任意类型 → str
         if target_ty == "str" {
             let inputs_offset = self.graph.inputs_pool.push(&[input]);
-            return self.graph.add_node(Node {
+            let node = self.graph.add_node(Node {
                 kind: NodeKind::UnOp,
                 input_count: 1,
                 inputs_offset,
                 compute_fn: ComputeFnId(277), // compute_cast_to_str
             });
+            if safe {
+                self.graph.set_safe_op(node);
+            }
+            return node;
         }
 
         // 通用路径 2：标量 → 标量
@@ -4148,6 +4440,9 @@ impl<'a> IrBuilder<'a> {
                 compute_fn: ComputeFnId(278), // compute_cast_scalar
             });
             self.graph.set_cast_target_type(node, target_ty.to_string());
+            if safe {
+                self.graph.set_safe_op(node);
+            }
             return node;
         }
 
@@ -4198,14 +4493,14 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let callee_expr = self.current_module().arena.expr(callee);
 
-        // 内置 Throw 构造器检测：Ok(val) / Err(record)
-        // 通过 THROW_CTORS 注册表查表降级，错误类型（IOError 等）走下方 record 构造路径
+        // 内置构造器检测：Ok(val) / Err(record) / channel(capacity)
+        // 通过 BUILTIN_CTORS 注册表查表降级，未命中的错误类型走下方 record 构造路径
         if let crate::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
-                if let Some(lower) = THROW_CTORS.iter().find_map(|(n, l)| (*n == *name).then_some(l)) {
+                if let Some(lower) = BUILTIN_CTORS.iter().find_map(|(n, l)| (*n == *name).then_some(l)) {
                     return match lower {
                         // Ok(val) → compute_throw_ok（idx 44），输入 = val
-                        ThrowCtorLower::Ok => {
+                        BuiltinCtorLower::Ok => {
                             let mut inputs = Vec::with_capacity(args.len());
                             for &arg in args {
                                 inputs.push(self.compile_subexpr(arg));
@@ -4219,7 +4514,7 @@ impl<'a> IrBuilder<'a> {
                             })
                         }
                         // Err(...) → 先 record_construct，再 throw_err 包装（idx 45）
-                        ThrowCtorLower::Err => {
+                        BuiltinCtorLower::Err => {
                             let inner = self.compile_record_like("Error", args);
                             let inputs_offset = self.graph.inputs_pool.push(&[inner]);
                             self.graph.add_node(Node {
@@ -4229,19 +4524,33 @@ impl<'a> IrBuilder<'a> {
                                 compute_fn: ComputeFnId(45), // throw_err
                             })
                         }
+                        // channel(capacity) → compute_channel_create（idx 283），输入 = args
+                        BuiltinCtorLower::Channel => {
+                            let mut inputs = Vec::with_capacity(args.len());
+                            for &arg in args {
+                                inputs.push(self.compile_subexpr(arg));
+                            }
+                            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                            self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: inputs.len() as u8,
+                                inputs_offset,
+                                compute_fn: ComputeFnId(283), // compute_channel_create
+                            })
+                        }
                     };
                 }
             }
         }
 
-        // 类型构造器/ADT 构造器检测：callee 是 Ident 且不是已知函数
+        // 类型构造器/ADT/Newtype 构造器检测：callee 是 Ident 且不是已知函数
         if let crate::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
                 // 先查类型名（Record 或单构造器 ADT），再查多构造器 ADT 的构造器名
-                let field_names = self.lookup_type_field_names(name)
+                let tf_info = self.lookup_type_field_names(name)
                     .or_else(|| self.lookup_constructor_field_names(name));
-                if let Some(field_names) = field_names {
-                    // 编译为记录构造（compute_record_construct = 29）
+                if let Some(info) = tf_info {
+                    // 编译为构造节点（compute_record_construct = 29，根据 kind 分派 HeapObj）
                     let mut inputs = Vec::with_capacity(args.len());
                     for &arg in args {
                         inputs.push(self.compile_subexpr(arg));
@@ -4254,8 +4563,10 @@ impl<'a> IrBuilder<'a> {
                         compute_fn: ComputeFnId(29), // record_construct
                     });
                     self.graph.set_record_lit_info(node, RecordLitInfo {
-                        type_name: name.to_string(),
-                        field_names: field_names.into_iter().map(Some).collect(),
+                        type_name: info.type_name.clone(),
+                        field_names: info.field_names.into_iter().map(Some).collect(),
+                        constructor: name.to_string(),
+                        kind: info.kind,
                     });
                     return node;
                 }
@@ -4353,80 +4664,18 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
-    /// 查找类型声明的字段名列表（按声明顺序）。
+    /// 查找类型声明的字段信息（按类型名）。
     ///
-    /// 在用户模块和 builtin 模块中搜索 TypeDecl，返回 Record 或单构造器 ADT 的字段名。
-    /// 用于类型构造器调用（如 `Iterator(arr, 0)`）编译为记录构造。
-    fn lookup_type_field_names(&self, type_name: &str) -> Option<Vec<String>> {
-        let extract = |def: &crate::Ast::TypeDef<'_>| -> Option<Vec<String>> {
-            match def {
-                crate::Ast::TypeDef::Record { fields } => {
-                    Some(fields.iter().map(|f| f.name.to_string()).collect())
-                }
-                crate::Ast::TypeDef::Adt { constructors } if constructors.len() == 1 => {
-                    let ctor = &constructors[0];
-                    Some(ctor.fields.iter()
-                        .map(|f| f.name.unwrap_or("_").to_string())
-                        .collect())
-                }
-                _ => None,
-            }
-        };
-        // 搜索用户模块
-        for d in &self.module.declarations {
-            if let crate::Ast::Decl::TypeDecl { name, def, .. } = &d.node {
-                if *name == type_name {
-                    if let Some(names) = extract(def) {
-                        return Some(names);
-                    }
-                }
-            }
-        }
-        // 搜索 builtin 模块
-        for m in &self.builtin_modules {
-            for d in &m.declarations {
-                if let crate::Ast::Decl::TypeDecl { name, def, .. } = &d.node {
-                    if *name == type_name {
-                        if let Some(names) = extract(def) {
-                            return Some(names);
-                        }
-                    }
-                }
-            }
-        }
-        None
+    /// 统一从 type_scope_stack 逐层查找（顶层 + 嵌套类型共享同一查找路径）。
+    fn lookup_type_field_names(&self, type_name: &str) -> Option<TypeFieldInfo> {
+        self.lookup_type_fields(type_name)
     }
 
-    /// 查找多构造器 ADT 中指定构造器的字段名列表。
+    /// 查找多构造器 ADT 中指定构造器的字段信息。
     ///
-    /// 遍历所有 ADT 类型声明，查找名为 `constructor_name` 的构造器，
-    /// 返回其字段名列表（用于编译为记录构造节点）。
-    fn lookup_constructor_field_names(&self, constructor_name: &str) -> Option<Vec<String>> {
-        // 搜索用户模块 + builtin 模块
-        let modules: Vec<&crate::Ast::Module<'_>> =
-            std::iter::once(self.module).chain(self.builtin_modules.iter().copied()).collect();
-        for m in modules {
-            for d in &m.declarations {
-                if let crate::Ast::Decl::TypeDecl { def, .. } = &d.node {
-                    match def {
-                        crate::Ast::TypeDef::Adt { constructors } => {
-                            for ctor in constructors {
-                                if ctor.name == constructor_name {
-                                    return Some(
-                                        ctor.fields
-                                            .iter()
-                                            .map(|f| f.name.unwrap_or("_").to_string())
-                                            .collect(),
-                                    );
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        None
+    /// 统一从 type_scope_stack 逐层查找（顶层 + 嵌套类型共享同一查找路径）。
+    fn lookup_constructor_field_names(&self, constructor_name: &str) -> Option<TypeFieldInfo> {
+        self.lookup_type_fields(constructor_name)
     }
 
     /// 检查函数名是否是 @extern("C") 函数（有 extern_c_body）。
@@ -4447,7 +4696,7 @@ impl<'a> IrBuilder<'a> {
 
     /// 编译方法调用。
     ///
-    /// 内置 nullary 方法（await/cancel/len 等）通过 `NULLARY_BUILTIN_METHODS`
+    /// 内置方法（await/cancel/len/send/recv/close 等）通过 `BUILTIN_METHODS`
     /// 注册表查表降级，避免方法名特判分支。类型/trait 方法编译为 Call 节点，
     /// 通过 mangled name ("TypeName.method") 查找 call_target。
     fn compile_method_call(
@@ -4458,54 +4707,48 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let recv_node = self.compile_subexpr(recv);
 
-        // 注册表驱动：nullary 内置方法查表降级
-        if args.is_empty() {
-            if let Some(lower) = NULLARY_BUILTIN_METHODS
-                .iter()
-                .find_map(|(n, l)| (*n == method).then_some(l))
-            {
-                return match lower {
-                    // await：EventSource 声明 + Await 节点（spec 4.5，未就绪→帧挂起）
-                    BuiltinMethodLower::Await => {
-                        let es_inputs_offset = self.graph.inputs_pool.push(&[]);
-                        let es_node = self.graph.add_node(Node {
-                            kind: NodeKind::EventSource,
-                            input_count: 0,
-                            inputs_offset: es_inputs_offset,
-                            compute_fn: ComputeFnId(0), // noop
-                        });
-                        let event_kind = self.infer_event_source_kind(recv);
-                        let current_sg = self.current_function_sg;
-                        let es_decl = EventSourceDecl {
-                            node: es_node,
-                            kind: event_kind,
-                        };
-                        if let Some(sg_id) = current_sg {
-                            if let Some(sg) = self.graph.subgraphs.get_mut(sg_id.0 as usize) {
-                                sg.event_source_decls.push(es_decl);
-                            }
-                        }
-                        let await_inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
-                        let await_node = self.graph.add_node(Node {
-                            kind: NodeKind::Await,
-                            input_count: 1,
-                            inputs_offset: await_inputs_offset,
-                            compute_fn: ComputeFnId(38), // compute_await
-                        });
-                        self.graph.set_await_event_source(await_node, es_node);
-                        await_node
+        // 注册表驱动：内置方法查表降级
+        // 命中但不满足参数/类型条件时 fall through 到 trait 方法路径
+        if let Some(lower) = BUILTIN_METHODS
+            .iter()
+            .find_map(|(n, l)| (*n == method).then_some(l))
+        {
+            match lower {
+                // await：无条件降级为 Await（EventSource + Await 双节点）
+                BuiltinMethodLower::Await if args.is_empty() => {
+                    return self.build_await_node(recv, recv_node);
+                }
+                // recv：仅当 recv 类型为 Channel/Receiver 时降级为 Await
+                BuiltinMethodLower::ChannelAwait if args.is_empty() => {
+                    if self.infer_event_source_kind(recv) == crate::Ir::EventSourceKind::Channel {
+                        return self.build_await_node(recv, recv_node);
                     }
-                    // 单节点一元运算（cancel/len 等）
-                    BuiltinMethodLower::UnOp(idx) => {
-                        let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
-                        self.graph.add_node(Node {
-                            kind: NodeKind::UnOp,
-                            input_count: 1,
-                            inputs_offset,
-                            compute_fn: ComputeFnId(*idx),
-                        })
+                }
+                // cancel/len/close：单节点一元运算（无参数）
+                BuiltinMethodLower::UnOp(idx) if args.is_empty() => {
+                    let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+                    return self.graph.add_node(Node {
+                        kind: NodeKind::UnOp,
+                        input_count: 1,
+                        inputs_offset,
+                        compute_fn: ComputeFnId(*idx),
+                    });
+                }
+                // send(value)：二元运算，inputs = [recv, value]
+                BuiltinMethodLower::BinOp(idx) => {
+                    let mut inputs = vec![recv_node];
+                    for &arg in args {
+                        inputs.push(self.compile_subexpr(arg));
                     }
-                };
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    return self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: ComputeFnId(*idx),
+                    });
+                }
+                _ => {} // 参数不匹配，走 trait 方法
             }
         }
 
@@ -4534,6 +4777,7 @@ impl<'a> IrBuilder<'a> {
             // 路径3：trait 方法静态分派
             if let Some(target_sg) = self.try_trait_static_dispatch(recv, method) {
                 self.graph.set_call_target(call_node, target_sg);
+                self.mark_async_call_if_needed(call_node, target_sg);
                 return call_node;
             }
 
@@ -4548,11 +4792,23 @@ impl<'a> IrBuilder<'a> {
             for (key, &target_sg) in &self.func_subgraphs {
                 if key.ends_with(&suffix) {
                     self.graph.set_call_target(call_node, target_sg);
+                    self.mark_async_call_if_needed(call_node, target_sg);
                     break;
                 }
             }
 
             call_node
+        }
+    }
+
+    /// 若目标子图含挂起点（async 函数），将 Call 节点的 compute_fn
+    /// 从 sync（idx 36）切换为 async（idx 39），使运行时走 async call 路径
+    /// （子帧启动 + AsyncHandle 写入 + 当前帧不挂起）。
+    fn mark_async_call_if_needed(&mut self, call_node: NodeId, target_sg: SubGraphId) {
+        if let Some(sg) = self.graph.subgraphs.get(target_sg.0 as usize) {
+            if sg.has_suspend {
+                self.graph.nodes[call_node.0 as usize].compute_fn = ComputeFnId(39);
+            }
         }
     }
 
@@ -4633,6 +4889,42 @@ impl<'a> IrBuilder<'a> {
         let info = self.sema.expr_types.get(&key)?;
         let type_name = info.type_name.as_deref()?;
         self.sema.type_def_index.get(type_name).map(|&idx| idx + 22)
+    }
+
+    /// 构建 Await 节点：EventSource 声明 + Await 节点（spec 4.5，未就绪→帧挂起）。
+    ///
+    /// await/recv 共用：推断事件源类型 → 注册 EventSourceDecl → 生成 Await 节点。
+    fn build_await_node(
+        &mut self,
+        recv: crate::Ast::ExprId,
+        recv_node: NodeId,
+    ) -> NodeId {
+        let es_inputs_offset = self.graph.inputs_pool.push(&[]);
+        let es_node = self.graph.add_node(Node {
+            kind: NodeKind::EventSource,
+            input_count: 0,
+            inputs_offset: es_inputs_offset,
+            compute_fn: ComputeFnId(0), // noop
+        });
+        let event_kind = self.infer_event_source_kind(recv);
+        let current_sg = self.current_function_sg;
+        if let Some(sg_id) = current_sg {
+            if let Some(sg) = self.graph.subgraphs.get_mut(sg_id.0 as usize) {
+                sg.event_source_decls.push(EventSourceDecl {
+                    node: es_node,
+                    kind: event_kind,
+                });
+            }
+        }
+        let await_inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+        let await_node = self.graph.add_node(Node {
+            kind: NodeKind::Await,
+            input_count: 1,
+            inputs_offset: await_inputs_offset,
+            compute_fn: ComputeFnId(38), // compute_await
+        });
+        self.graph.set_await_event_source(await_node, es_node);
+        await_node
     }
 
     /// 从 recv 表达式推断事件源种类。
@@ -4743,6 +5035,8 @@ impl<'a> IrBuilder<'a> {
             RecordLitInfo {
                 type_name: type_name.to_string(),
                 field_names,
+                constructor: type_name.to_string(),
+                kind: RecordLitKind::Record,
             },
         );
         node
@@ -4768,6 +5062,8 @@ impl<'a> IrBuilder<'a> {
             RecordLitInfo {
                 type_name: "Record".to_string(),
                 field_names,
+                constructor: "Record".to_string(),
+                kind: RecordLitKind::Record,
             },
         );
         node
@@ -5059,6 +5355,64 @@ impl<'a> IrBuilder<'a> {
                         .push(entry);
                 }
                 None
+            }
+            crate::Ast::Stmt::LocalDecl { decl } => {
+                match decl.as_ref() {
+                    crate::Ast::Decl::FunDecl {
+                        name, params, body, is_async, extern_c_body, ..
+                    } => {
+                        if extern_c_body.is_some() {
+                            return None;
+                        }
+                        let construct_node =
+                            self.compile_lambda(params, *body, *is_async, Some(name));
+                        self.bind_var(name, construct_node);
+                        Some(construct_node)
+                    }
+                    crate::Ast::Decl::TypeDecl { name, def, .. } => {
+                        // 注册嵌套类型字段到当前作用域（与顶层类型统一通过 type_scope_stack 查找）
+                        match def {
+                            crate::Ast::TypeDef::Record { fields } => {
+                                let field_names: Vec<String> = fields.iter().map(|f| f.name.to_string()).collect();
+                                self.bind_type_fields(name, TypeFieldInfo {
+                                    field_names,
+                                    type_name: name.to_string(),
+                                    kind: RecordLitKind::Record,
+                                });
+                            }
+                            crate::Ast::TypeDef::Adt { constructors } => {
+                                // 注册类型名 + 各构造器名（映射到类型名）
+                                self.bind_type_fields(name, TypeFieldInfo {
+                                    field_names: Vec::new(),
+                                    type_name: name.to_string(),
+                                    kind: RecordLitKind::Adt,
+                                });
+                                for ctor in constructors {
+                                    let field_names: Vec<String> = ctor.fields.iter()
+                                        .map(|f| f.name.unwrap_or("_").to_string())
+                                        .collect();
+                                    self.bind_type_fields(ctor.name, TypeFieldInfo {
+                                        field_names,
+                                        type_name: name.to_string(),
+                                        kind: RecordLitKind::Adt,
+                                    });
+                                }
+                            }
+                            crate::Ast::TypeDef::Newtype { name: nt_name, .. } => {
+                                self.bind_type_fields(nt_name, TypeFieldInfo {
+                                    field_names: Vec::new(),
+                                    type_name: nt_name.to_string(),
+                                    kind: RecordLitKind::Newtype,
+                                });
+                            }
+                            crate::Ast::TypeDef::Alias { .. } => {}
+                        }
+                        None
+                    }
+                    // trait 声明：Sema 层注册类型，IR 层无需生成代码
+                    crate::Ast::Decl::TraitDecl { .. } => None,
+                    _ => None,
+                }
             }
         }
     }
@@ -5470,6 +5824,55 @@ impl<'a> IrBuilder<'a> {
                         let slot = self.global_var_slots.len() as u32;
                         self.global_var_slots.insert(name.to_string(), slot);
                         self.top_level_var_decls.push(*stmt_id);
+                    }
+                }
+            }
+        }
+
+        // 0c. 注册所有模块的顶层类型到 base scope（与嵌套类型统一通过 type_scope_stack 查找）
+        //     ADT 同时注册类型名和各构造器名（构造器名映射到类型名，用于反射 type_name）
+        //     Newtype 注册构造器名（== 类型名），kind=Newtype 驱动 compute_record_construct 构造 NewtypeValue
+        self.type_scope_stack.push(rustc_hash::FxHashMap::default());
+        for m in &all_modules {
+            for d in &m.declarations {
+                if let crate::Ast::Decl::TypeDecl { name, def, .. } = &d.node {
+                    match def {
+                        crate::Ast::TypeDef::Record { fields } => {
+                            let field_names: Vec<String> = fields.iter().map(|f| f.name.to_string()).collect();
+                            self.bind_type_fields(name, TypeFieldInfo {
+                                field_names,
+                                type_name: name.to_string(),
+                                kind: RecordLitKind::Record,
+                            });
+                        }
+                        crate::Ast::TypeDef::Adt { constructors } => {
+                            // 注册类型名（nullary 路径用于类型名查找，field_names 为空仅当无字段构造器）
+                            self.bind_type_fields(name, TypeFieldInfo {
+                                field_names: Vec::new(),
+                                type_name: name.to_string(),
+                                kind: RecordLitKind::Adt,
+                            });
+                            // 注册每个构造器名（映射到类型名）
+                            for ctor in constructors {
+                                let field_names: Vec<String> = ctor.fields.iter()
+                                    .map(|f| f.name.unwrap_or("_").to_string())
+                                    .collect();
+                                self.bind_type_fields(ctor.name, TypeFieldInfo {
+                                    field_names,
+                                    type_name: name.to_string(),
+                                    kind: RecordLitKind::Adt,
+                                });
+                            }
+                        }
+                        crate::Ast::TypeDef::Newtype { name: nt_name, .. } => {
+                            // Newtype：构造器名 == 类型名，kind=Newtype
+                            self.bind_type_fields(nt_name, TypeFieldInfo {
+                                field_names: Vec::new(),
+                                type_name: nt_name.to_string(),
+                                kind: RecordLitKind::Newtype,
+                            });
+                        }
+                        crate::Ast::TypeDef::Alias { .. } => {}
                     }
                 }
             }

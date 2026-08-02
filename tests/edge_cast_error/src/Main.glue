@@ -10,7 +10,7 @@
 // 不在 Phase 2 范围（留给 Phase 3 按需加载方法体 / 后续反射机制完善）：
 //   - CastError.type_name() override 返回 "cast error"（当前返回类型名）
 //   - 直接 println(CastError 实例) 打印 RecordValue（当前输出 null）
-//   - type(CastError 实例) 返回 "CastError"（当前对 RecordValue 返回通用 "record"）
+//   - type_name(CastError 实例) 返回 "CastError"（当前对 RecordValue 返回通用 "record"）
 
 // ---- 构造与字段访问 ----
 fun makeCastError(): CastError {

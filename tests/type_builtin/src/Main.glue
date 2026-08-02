@@ -1,4 +1,4 @@
-// type() builtin — returns the runtime type name of any value
+// type_name() builtin — returns the runtime type name of any value
 
 type Color = | Red | Green | Blue
 type UserId = UserId(i32)
@@ -6,55 +6,55 @@ type Point = Point(x: i32, y: i32)
 
 fun main(): void {
     // ---- primitives: Rust 模式无约束回退 i32/f32 ----
-    println(type(42))         // i32
-    println(type(200))        // i32
-    println(type(100000))     // i32
-    println(type(3.14))       // f32
+    println(type_name(42))         // i32
+    println(type_name(200))        // i32
+    println(type_name(100000))     // i32
+    println(type_name(3.14))       // f32
 
     // ---- suffix overrides ----
-    println(type(42i32))      // i32
-    println(type(42u64))      // u64
-    println(type(3.14f32))    // f32
+    println(type_name(42i32))      // i32
+    println(type_name(42u64))      // u64
+    println(type_name(3.14f32))    // f32
 
     // ---- annotation overrides ----
     val a: i32 = 42
     val b: u8 = 200
     val c: f64 = 1.5
-    println(type(a))          // i32
-    println(type(b))          // u8
-    println(type(c))          // f64
+    println(type_name(a))          // i32
+    println(type_name(b))          // u8
+    println(type_name(c))          // f64
 
     // ---- other primitives ----
-    println(type("hello"))    // str
-    println(type(true))       // bool
-    println(type('x'))        // char
+    println(type_name("hello"))    // str
+    println(type_name(true))       // bool
+    println(type_name('x'))        // char
 
     // ---- composite ----
-    println(type([1, 2, 3]))      // array
-    println(type((x: 1, y: 2)))   // record
+    println(type_name([1, 2, 3]))      // array
+    println(type_name((x: 1, y: 2)))   // record
 
     // ---- user types ----
-    println(type(Red))            // Color
-    println(type(Green))          // Color
-    println(type(UserId(7)))      // UserId
-    println(type(Point(1, 2)))    // Point
+    println(type_name(Red))            // Color
+    println(type_name(Green))          // Color
+    println(type_name(UserId(7)))      // UserId
+    println(type_name(Point(1, 2)))    // Point
 
     // ---- throw / ok / error ----
-    println(type(Ok(5)))          // Throw
-    println(type(Error("e")))     // Throw
+    println(type_name(Ok(5)))          // Throw
+    println(type_name(Error("e")))     // Throw
 
     // ---- functions ----
-    println(type(fun(x) { x }))   // function
+    println(type_name(fun(x) { x }))   // function
 
-    // ---- type() result is a str, usable in interpolation and concat ----
-    val t = type(42)
+    // ---- type_name() result is a str, usable in interpolation and concat ----
+    val t = type_name(42)
     println("kind=" + t)          // kind=i32
-    println("the type is {type(true)}")  // the type is bool
-    println(type(t))              // str (type of a type-name is str)
+    println("the type is {type_name(true)}")  // the type is bool
+    println(type_name(t))              // str (type of a type-name is str)
 
-    // ---- type() inside match / comparison ----
+    // ---- type_name() inside match / comparison ----
     val x = 5
-    val desc = if type(x) == "i32" { "int" } else { "other" }
+    val desc = if type_name(x) == "i32" { "int" } else { "other" }
     println(desc)                 // int
 
     println("type_builtin: All tests passed!")

@@ -498,6 +498,183 @@ pub fn format_value(v: &Value, depth: u32) -> String {
     }
 }
 
+/// 返回类型种类字符串（"Primitive"/"Record"/"Adt"/"Newtype"/"Str"/"Array"/"Nullable"/"Ref"）
+#[no_mangle]
+pub extern "C" fn __reflect_kind_str(handle: u32, out_data: *mut *const u8, out_len: *mut usize) {
+    let h = ValueHandle::from_raw(handle);
+    let tag = h.tag();
+    let kind: &[u8] = if tag != ValueTag::Ref {
+        match tag {
+            ValueTag::Null => b"Null",
+            ValueTag::Void => b"Void",
+            _ => b"Primitive",
+        }
+    } else if let Some(obj) = ValueArena::get_global_obj(h) {
+        match obj.ref_kind() {
+            RefKind::Str => b"Str",
+            RefKind::Array => b"Array",
+            RefKind::Record => b"Record",
+            RefKind::Adt => b"Adt",
+            RefKind::Newtype => b"Newtype",
+            RefKind::Closure => b"Closure",
+            RefKind::TraitVal => b"Trait",
+            _ => b"Ref",
+        }
+    } else {
+        b"Null"
+    };
+    write_slice_out(kind, out_data, out_len);
+}
+
+/// 返回值的布局大小（标量按 tag，堆对象按 ref_kind 估算字段总大小）
+#[no_mangle]
+pub extern "C" fn __reflect_layout_size(handle: u32) -> u32 {
+    let h = ValueHandle::from_raw(handle);
+    let tag = h.tag();
+    match tag {
+        ValueTag::Null | ValueTag::Void => 0,
+        ValueTag::Bool => 1,
+        ValueTag::Char => 4,
+        ValueTag::I8 | ValueTag::U8 => 1,
+        ValueTag::I16 | ValueTag::U16 | ValueTag::F16 => 2,
+        ValueTag::I32 | ValueTag::U32 | ValueTag::F32 => 4,
+        ValueTag::I64 | ValueTag::U64 | ValueTag::F64 | ValueTag::Isize | ValueTag::Usize => 8,
+        ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
+        ValueTag::Ref => {
+            if let Some(obj) = ValueArena::get_global_obj(h) {
+                match &*obj {
+                    HeapObj::Str(_) => 16,
+                    HeapObj::Array(a) => {
+                        // 16B fat pointer + 元素大小 * len（估算）
+                        16
+                    }
+                    HeapObj::Record(r) => {
+                        // 字段大小总和（粗略估算，不含 padding）
+                        r.fields.iter().map(value_size).sum::<u32>()
+                    }
+                    HeapObj::Adt(a) => {
+                        // 字段大小总和（当前构造器的字段，不含 tag）
+                        a.fields.iter().map(|f| value_size(&f.value)).sum::<u32>()
+                    }
+                    HeapObj::Newtype(n) => {
+                        // inner 值大小
+                        ValueArena::with_global(|arena| value_size(&arena.get_value(n.inner)))
+                    }
+                    _ => 0,
+                }
+            } else { 0 }
+        }
+    }
+}
+
+/// 返回值的对齐（标量按大小，堆对象按最大字段对齐）
+#[no_mangle]
+pub extern "C" fn __reflect_layout_alignment(handle: u32) -> u32 {
+    let h = ValueHandle::from_raw(handle);
+    let tag = h.tag();
+    match tag {
+        ValueTag::Null | ValueTag::Void | ValueTag::Bool => 1,
+        ValueTag::Char => 4,
+        ValueTag::I8 | ValueTag::U8 => 1,
+        ValueTag::I16 | ValueTag::U16 | ValueTag::F16 => 2,
+        ValueTag::I32 | ValueTag::U32 | ValueTag::F32 => 4,
+        ValueTag::I64 | ValueTag::U64 | ValueTag::F64 | ValueTag::Isize | ValueTag::Usize => 8,
+        ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
+        ValueTag::Ref => {
+            if let Some(obj) = ValueArena::get_global_obj(h) {
+                match &*obj {
+                    HeapObj::Str(_) => 8,
+                    HeapObj::Array(_) => 8,
+                    HeapObj::Record(r) => {
+                        // 最大字段对齐
+                        r.fields.iter().map(value_alignment).max().unwrap_or(1)
+                    }
+                    HeapObj::Adt(a) => {
+                        // tag(1) 和最大字段对齐取最大
+                        a.fields.iter().map(|f| value_alignment(&f.value)).max().unwrap_or(1).max(1)
+                    }
+                    HeapObj::Newtype(n) => {
+                        ValueArena::with_global(|arena| value_alignment(&arena.get_value(n.inner)))
+                    }
+                    _ => 8,
+                }
+            } else { 8 }
+        }
+    }
+}
+
+/// 估算 Value 的字节大小（用于 Record/Adt/Newtype layout 估算）
+fn value_size(v: &Value) -> u32 {
+    match v {
+        Value::Null | Value::Void => 0,
+        Value::Scalar(_, tag) => {
+            match tag {
+                ScalarTag::Bool => 1,
+                ScalarTag::Char => 4,
+                ScalarTag::I8 | ScalarTag::U8 => 1,
+                ScalarTag::I16 | ScalarTag::U16 | ScalarTag::F16 => 2,
+                ScalarTag::I32 | ScalarTag::U32 | ScalarTag::F32 => 4,
+                ScalarTag::I64 | ScalarTag::U64 | ScalarTag::F64 | ScalarTag::Isize | ScalarTag::Usize => 8,
+                ScalarTag::I128 | ScalarTag::U128 | ScalarTag::F128 => 16,
+            }
+        }
+        Value::Ref(r) => {
+            match &**r {
+                HeapObj::Str(_) => 16,
+                HeapObj::Array(_) => 16,
+                HeapObj::Record(rec) => rec.fields.iter().map(value_size).sum(),
+                // ADT：字段大小总和（当前构造器的字段，不含 tag）
+                HeapObj::Adt(a) => a.fields.iter().map(|f| value_size(&f.value)).sum(),
+                // Newtype：从全局 arena 查找 inner 值的大小
+                HeapObj::Newtype(n) => {
+                    ValueArena::with_global(|arena| value_size(&arena.get_value(n.inner)))
+                }
+                _ => 8,
+            }
+        }
+    }
+}
+
+/// 估算 Value 的对齐
+fn value_alignment(v: &Value) -> u32 {
+    match v {
+        Value::Null | Value::Void => 1,
+        Value::Scalar(_, tag) => {
+            match tag {
+                ScalarTag::Bool => 1,
+                ScalarTag::Char => 4,
+                ScalarTag::I8 | ScalarTag::U8 => 1,
+                ScalarTag::I16 | ScalarTag::U16 | ScalarTag::F16 => 2,
+                ScalarTag::I32 | ScalarTag::U32 | ScalarTag::F32 => 4,
+                ScalarTag::I64 | ScalarTag::U64 | ScalarTag::F64 | ScalarTag::Isize | ScalarTag::Usize => 8,
+                ScalarTag::I128 | ScalarTag::U128 | ScalarTag::F128 => 16,
+            }
+        }
+        Value::Ref(r) => {
+            match &**r {
+                HeapObj::Str(_) | HeapObj::Array(_) => 8,
+                HeapObj::Record(rec) => rec.fields.iter().map(value_alignment).max().unwrap_or(1),
+                HeapObj::Adt(a) => a.fields.iter().map(|f| value_alignment(&f.value)).max().unwrap_or(1).max(1),
+                // Newtype：从全局 arena 查找 inner 值的对齐
+                HeapObj::Newtype(n) => {
+                    ValueArena::with_global(|arena| value_alignment(&arena.get_value(n.inner)))
+                }
+                _ => 8,
+            }
+        }
+    }
+}
+
+/// 公共 API：从 &Value 估算布局大小（供 Engine FFI 调用）
+pub fn reflect_layout_size(v: &Value) -> u32 {
+    value_size(v)
+}
+
+/// 公共 API：从 &Value 估算对齐（供 Engine FFI 调用）
+pub fn reflect_layout_alignment(v: &Value) -> u32 {
+    value_alignment(v)
+}
+
 // =========================================================================
 // RefKind::as_str 辅助（用于 type_name 兜底）
 // =========================================================================

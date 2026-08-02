@@ -525,6 +525,10 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
 
     // 2. 模块加载
     let mut loader = ModuleLoader::new();
+    // 添加入口文件所在目录为搜索路径，用于解析用户模块（如 Math/Geometry.glue）
+    if let Some(src_dir) = std::path::Path::new(&entry_path).parent() {
+        loader.add_search_path(src_dir);
+    }
     let dep_keys = loader.load_transitive_imports(&entry_module);
 
     // 预加载所有 std 模块
