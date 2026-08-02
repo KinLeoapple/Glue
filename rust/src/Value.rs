@@ -1953,20 +1953,20 @@ pub struct ThrowValue {
 /// 原子值
 #[derive(Debug)]
 pub struct AtomicValue {
-    data: Mutex<ValueHandle>,
+    data: Mutex<Value>,
 }
 
 impl AtomicValue {
-    pub fn new(val: ValueHandle) -> Self {
+    pub fn new(val: Value) -> Self {
         Self { data: Mutex::new(val) }
     }
-    pub fn load(&self) -> ValueHandle {
-        *self.data.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn load(&self) -> Value {
+        self.data.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
-    pub fn store(&self, val: ValueHandle) {
+    pub fn store(&self, val: Value) {
         *self.data.lock().unwrap_or_else(|e| e.into_inner()) = val;
     }
-    pub fn swap(&self, val: ValueHandle) -> ValueHandle {
+    pub fn swap(&self, val: Value) -> Value {
         std::mem::replace(&mut *self.data.lock().unwrap_or_else(|e| e.into_inner()), val)
     }
 }
@@ -2735,7 +2735,7 @@ impl ValueArena {
     pub fn alloc_throw_err(&mut self, record: Arc<RecordValue>) -> ValueHandle {
         self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
     }
-    pub fn alloc_atomic(&mut self, val: ValueHandle) -> ValueHandle {
+    pub fn alloc_atomic(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))
     }
     pub fn alloc_async_handle(&mut self) -> ValueHandle {
@@ -4131,8 +4131,8 @@ fn deep_clone_heap(
         HeapObj::TraitVal(t) => HeapObj::TraitVal(t.clone()),
         HeapObj::LazyVal(l) => HeapObj::LazyVal(l.clone()),
         HeapObj::ErrorVal(e) => HeapObj::ErrorVal(e.clone()),
-        // AtomicValue.data 仍为 ValueHandle
-        HeapObj::AtomicVal(a) => HeapObj::AtomicVal(AtomicValue::new(deep_clone_handle(a.load(), arena, cache))),
+        // AtomicValue.data 为 Value，递归深拷贝
+        HeapObj::AtomicVal(a) => HeapObj::AtomicVal(AtomicValue::new(deep_clone_value(&a.load(), arena, cache))),
         HeapObj::AsyncVal(a) => HeapObj::AsyncVal(a.clone()),
         HeapObj::ChannelVal(c) => HeapObj::ChannelVal(c.clone()),
         HeapObj::SenderVal(s) => HeapObj::SenderVal(s.clone()),
@@ -4335,7 +4335,7 @@ impl ValueArena {
             payload: ThrowPayload::Err(record),
         }))
     }
-    pub fn atomic(&mut self, val: ValueHandle) -> ValueHandle {
+    pub fn atomic(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))
     }
     pub fn async_handle(&mut self) -> ValueHandle {

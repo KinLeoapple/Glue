@@ -60,7 +60,7 @@ pub fun typeof(x: Value): u8 {
     __reflect_kind(x)
 }
 
-pub fun type_name(x: Value): str {
+pub fun type(x: Value): str {
     __reflect_type_name(x)
 }
 

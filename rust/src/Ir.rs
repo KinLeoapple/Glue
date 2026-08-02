@@ -17,6 +17,7 @@
 //! - 独立输入池连续存储所有节点输入，缓存友好
 
 use crate::Value::Value;
+use std::sync::Arc;
 
 // =========================================================================
 // 索引 newtype — 保证类型安全的句柄
@@ -743,6 +744,17 @@ pub struct LazyConstructInfo {
     pub thunk_sg: SubGraphId,
 }
 
+/// 记录扩展节点信息（按 NodeId 索引）。
+///
+/// compute_record_extend（compute_fn=272）运行时从此信息取更新字段名列表，
+/// 从 base RecordValue 克隆字段，按更新字段名替换/追加，构造新 RecordValue。
+/// inputs[0] = base record，inputs[1..] = 更新字段值（顺序对应 update_names）。
+#[derive(Debug, Clone)]
+pub struct RecordExtendInfo {
+    /// 更新字段名列表（长度 = input_count - 1，对应 inputs[1..]）
+    pub update_names: Vec<String>,
+}
+
 // =========================================================================
 // EventSourceDecl — 事件源声明（静态，编译期）
 // =========================================================================
@@ -855,306 +867,457 @@ pub fn compute_fn_table() -> &'static [ComputeFn] {
     COMPUTE_FN_TABLE
 }
 
+/// 计算函数表注册宏。
+///
+/// 接收 `idx => fn_path` 对列表，展开为带运行时索引断言的 Vec 构造。
+/// 每项 push 后立即断言 `table.len() == idx + 1`，确保索引与实际位置一致。
+/// 若删除某项但忘记更新后续索引，断言会立即失败，防止 ComputeFnId 错位。
+macro_rules! compute_fn_table {
+    ( $( $idx:literal => $f:expr ),* $(,)? ) => {{
+        let mut table: Vec<ComputeFn> = Vec::new();
+        $(
+            table.push($f);
+            assert_eq!(table.len(), ($idx as usize) + 1,
+                concat!("compute_fn_table: index ", stringify!($idx), " mismatch"));
+        )*
+        table
+    }};
+}
+
 /// 构建真实计算函数表（引用 Engine 模块的 compute_* 函数）。
 ///
 /// 索引与 ComputeFnId 一一对应，IrBuilder::build() 末尾填充到 graph.compute_fns。
+/// 使用 `compute_fn_table!` 宏：每项 `idx => fn_path` 自动生成运行时断言，
+/// 确保索引与实际位置一致——若删除某项但忘记更新后续索引，断言会立即失败。
 pub fn build_compute_fn_table() -> Vec<ComputeFn> {
-    vec![
-        crate::Engine::noop_compute_real,
-        crate::Engine::compute_add_i32,
-        crate::Engine::compute_add_f64,
-        crate::Engine::compute_mul_i32,
-        crate::Engine::compute_le_i32,
-        crate::Engine::compute_sub_i32,
-        crate::Engine::compute_div_i32,
-        crate::Engine::compute_mod_i32,
-        crate::Engine::compute_eq_i32,
-        crate::Engine::compute_ne_i32,
-        crate::Engine::compute_lt_i32,
-        crate::Engine::compute_gt_i32,
-        crate::Engine::compute_ge_i32,
-        crate::Engine::compute_sub_f64,
-        crate::Engine::compute_mul_f64,
-        crate::Engine::compute_div_f64,
-        crate::Engine::compute_eq_f64,
-        crate::Engine::compute_ne_f64,
-        crate::Engine::compute_lt_f64,
-        crate::Engine::compute_gt_f64,
-        crate::Engine::compute_le_f64,
-        crate::Engine::compute_ge_f64,
-        crate::Engine::compute_and_bool,
-        crate::Engine::compute_or_bool,
-        crate::Engine::compute_not_bool,
-        crate::Engine::compute_neg_i32,
-        crate::Engine::compute_neg_f64,
-        crate::Engine::compute_eq_bool,
-        crate::Engine::compute_throw_wrap_err,
-        crate::Engine::compute_record_construct,
-        crate::Engine::compute_record_field_get,
-        crate::Engine::compute_array_construct,
-        crate::Engine::compute_array_index,
-        crate::Engine::compute_record_field_set,
-        crate::Engine::compute_is_null,
-        crate::Engine::compute_array_len,
-        crate::Engine::compute_call_launch,   // 36
-        crate::Engine::compute_gate_launch,   // 37
-        crate::Engine::compute_await,         // 38
-        crate::Engine::compute_async_call_launch, // 39
-        crate::Engine::compute_closure_construct, // 40
-        crate::Engine::compute_closure_call,      // 41
-        crate::Engine::compute_cancel_async_handle, // 42
-        crate::Engine::compute_select_gate,         // 43
-        crate::Engine::compute_throw_ok,            // 44
-        crate::Engine::compute_throw_err,           // 45
-        crate::Engine::compute_ffi_call,            // 46
-        crate::Engine::compute_propagate,           // 47
-        crate::Engine::compute_seq,                 // 48
-        crate::Engine::compute_writeback,           // 49
+    compute_fn_table! {
+        0   => crate::Engine::noop_compute_real,
+        1   => crate::Engine::compute_add_i32,
+        2   => crate::Engine::compute_add_f64,
+        3   => crate::Engine::compute_mul_i32,
+        4   => crate::Engine::compute_le_i32,
+        5   => crate::Engine::compute_sub_i32,
+        6   => crate::Engine::compute_div_i32,
+        7   => crate::Engine::compute_mod_i32,
+        8   => crate::Engine::compute_eq_i32,
+        9   => crate::Engine::compute_ne_i32,
+        10  => crate::Engine::compute_lt_i32,
+        11  => crate::Engine::compute_gt_i32,
+        12  => crate::Engine::compute_ge_i32,
+        13  => crate::Engine::compute_sub_f64,
+        14  => crate::Engine::compute_mul_f64,
+        15  => crate::Engine::compute_div_f64,
+        16  => crate::Engine::compute_eq_f64,
+        17  => crate::Engine::compute_ne_f64,
+        18  => crate::Engine::compute_lt_f64,
+        19  => crate::Engine::compute_gt_f64,
+        20  => crate::Engine::compute_le_f64,
+        21  => crate::Engine::compute_ge_f64,
+        22  => crate::Engine::compute_and_bool,
+        23  => crate::Engine::compute_or_bool,
+        24  => crate::Engine::compute_not_bool,
+        25  => crate::Engine::compute_neg_i32,
+        26  => crate::Engine::compute_neg_f64,
+        27  => crate::Engine::compute_eq_bool,
+        28  => crate::Engine::compute_throw_wrap_err,
+        29  => crate::Engine::compute_record_construct,
+        30  => crate::Engine::compute_record_field_get,
+        31  => crate::Engine::compute_array_construct,
+        32  => crate::Engine::compute_array_index,
+        33  => crate::Engine::compute_record_field_set,
+        34  => crate::Engine::compute_is_null,
+        35  => crate::Engine::compute_array_len,
+        36  => crate::Engine::compute_call_launch,
+        37  => crate::Engine::compute_gate_launch,
+        38  => crate::Engine::compute_await,
+        39  => crate::Engine::compute_async_call_launch,
+        40  => crate::Engine::compute_closure_construct,
+        41  => crate::Engine::compute_closure_call,
+        42  => crate::Engine::compute_cancel_async_handle,
+        43  => crate::Engine::compute_select_gate,
+        44  => crate::Engine::compute_throw_ok,
+        45  => crate::Engine::compute_throw_err,
+        46  => crate::Engine::compute_ffi_call,
+        47  => crate::Engine::compute_propagate,
+        48  => crate::Engine::compute_seq,
+        49  => crate::Engine::compute_writeback,
         // i64 算术与比较（50-63）
-        crate::Engine::compute_add_i64,             // 50
-        crate::Engine::compute_sub_i64,             // 51
-        crate::Engine::compute_mul_i64,             // 52
-        crate::Engine::compute_div_i64,             // 53
-        crate::Engine::compute_mod_i64,             // 54
-        crate::Engine::compute_eq_i64,              // 55
-        crate::Engine::compute_ne_i64,              // 56
-        crate::Engine::compute_lt_i64,              // 57
-        crate::Engine::compute_gt_i64,              // 58
-        crate::Engine::compute_le_i64,              // 59
-        crate::Engine::compute_ge_i64,              // 60
-        crate::Engine::compute_neg_i64,             // 61
-        crate::Engine::compute_bitnot_i32,          // 62
-        crate::Engine::compute_bitnot_i64,          // 63
+        50  => crate::Engine::compute_add_i64,
+        51  => crate::Engine::compute_sub_i64,
+        52  => crate::Engine::compute_mul_i64,
+        53  => crate::Engine::compute_div_i64,
+        54  => crate::Engine::compute_mod_i64,
+        55  => crate::Engine::compute_eq_i64,
+        56  => crate::Engine::compute_ne_i64,
+        57  => crate::Engine::compute_lt_i64,
+        58  => crate::Engine::compute_gt_i64,
+        59  => crate::Engine::compute_le_i64,
+        60  => crate::Engine::compute_ge_i64,
+        61  => crate::Engine::compute_neg_i64,
+        62  => crate::Engine::compute_bitnot_i32,
+        63  => crate::Engine::compute_bitnot_i64,
         // i128 算术与比较（64-77）
-        crate::Engine::compute_add_i128,            // 64
-        crate::Engine::compute_sub_i128,            // 65
-        crate::Engine::compute_mul_i128,            // 66
-        crate::Engine::compute_div_i128,            // 67
-        crate::Engine::compute_mod_i128,            // 68
-        crate::Engine::compute_eq_i128,             // 69
-        crate::Engine::compute_ne_i128,             // 70
-        crate::Engine::compute_lt_i128,             // 71
-        crate::Engine::compute_gt_i128,             // 72
-        crate::Engine::compute_le_i128,             // 73
-        crate::Engine::compute_ge_i128,             // 74
-        crate::Engine::compute_neg_i128,            // 75
-        crate::Engine::compute_bitnot_i128,         // 76
+        64  => crate::Engine::compute_add_i128,
+        65  => crate::Engine::compute_sub_i128,
+        66  => crate::Engine::compute_mul_i128,
+        67  => crate::Engine::compute_div_i128,
+        68  => crate::Engine::compute_mod_i128,
+        69  => crate::Engine::compute_eq_i128,
+        70  => crate::Engine::compute_ne_i128,
+        71  => crate::Engine::compute_lt_i128,
+        72  => crate::Engine::compute_gt_i128,
+        73  => crate::Engine::compute_le_i128,
+        74  => crate::Engine::compute_ge_i128,
+        75  => crate::Engine::compute_neg_i128,
+        76  => crate::Engine::compute_bitnot_i128,
         // 整数位运算（77-92）：BitAnd/BitOr/BitXor/Shl/Shr × i32/i64/i128
-        crate::Engine::compute_bitand_i32,          // 77
-        crate::Engine::compute_bitor_i32,           // 78
-        crate::Engine::compute_bitxor_i32,          // 79
-        crate::Engine::compute_bitand_i64,          // 80
-        crate::Engine::compute_bitor_i64,           // 81
-        crate::Engine::compute_bitxor_i64,          // 82
-        crate::Engine::compute_bitand_i128,         // 83
-        crate::Engine::compute_bitor_i128,          // 84
-        crate::Engine::compute_bitxor_i128,         // 85
-        crate::Engine::compute_shl_i32,             // 86
-        crate::Engine::compute_shr_i32,             // 87
-        crate::Engine::compute_shl_i64,             // 88
-        crate::Engine::compute_shr_i64,             // 89
-        crate::Engine::compute_shl_i128,            // 90
-        crate::Engine::compute_shr_i128,            // 91
+        77  => crate::Engine::compute_bitand_i32,
+        78  => crate::Engine::compute_bitor_i32,
+        79  => crate::Engine::compute_bitxor_i32,
+        80  => crate::Engine::compute_bitand_i64,
+        81  => crate::Engine::compute_bitor_i64,
+        82  => crate::Engine::compute_bitxor_i64,
+        83  => crate::Engine::compute_bitand_i128,
+        84  => crate::Engine::compute_bitor_i128,
+        85  => crate::Engine::compute_bitxor_i128,
+        86  => crate::Engine::compute_shl_i32,
+        87  => crate::Engine::compute_shr_i32,
+        88  => crate::Engine::compute_shl_i64,
+        89  => crate::Engine::compute_shr_i64,
+        90  => crate::Engine::compute_shl_i128,
+        91  => crate::Engine::compute_shr_i128,
         // ---- 全基本类型 compute_fn（92-259）----
         // 整数 12 类型 × 12 运算（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）
         // i8: 92-103
-        crate::Engine::compute_add_i8,              // 92
-        crate::Engine::compute_sub_i8,              // 93
-        crate::Engine::compute_mul_i8,              // 94
-        crate::Engine::compute_div_i8,              // 95
-        crate::Engine::compute_mod_i8,              // 96
-        crate::Engine::compute_bitand_i8,           // 97
-        crate::Engine::compute_bitor_i8,            // 98
-        crate::Engine::compute_bitxor_i8,           // 99
-        crate::Engine::compute_shl_i8,              // 100
-        crate::Engine::compute_shr_i8,              // 101
-        crate::Engine::compute_neg_i8,              // 102
-        crate::Engine::compute_bitnot_i8,           // 103
+        92  => crate::Engine::compute_add_i8,
+        93  => crate::Engine::compute_sub_i8,
+        94  => crate::Engine::compute_mul_i8,
+        95  => crate::Engine::compute_div_i8,
+        96  => crate::Engine::compute_mod_i8,
+        97  => crate::Engine::compute_bitand_i8,
+        98  => crate::Engine::compute_bitor_i8,
+        99  => crate::Engine::compute_bitxor_i8,
+        100 => crate::Engine::compute_shl_i8,
+        101 => crate::Engine::compute_shr_i8,
+        102 => crate::Engine::compute_neg_i8,
+        103 => crate::Engine::compute_bitnot_i8,
         // i16: 104-115
-        crate::Engine::compute_add_i16,             // 104
-        crate::Engine::compute_sub_i16,             // 105
-        crate::Engine::compute_mul_i16,             // 106
-        crate::Engine::compute_div_i16,             // 107
-        crate::Engine::compute_mod_i16,             // 108
-        crate::Engine::compute_bitand_i16,          // 109
-        crate::Engine::compute_bitor_i16,           // 110
-        crate::Engine::compute_bitxor_i16,          // 111
-        crate::Engine::compute_shl_i16,             // 112
-        crate::Engine::compute_shr_i16,             // 113
-        crate::Engine::compute_neg_i16,             // 114
-        crate::Engine::compute_bitnot_i16,          // 115
+        104 => crate::Engine::compute_add_i16,
+        105 => crate::Engine::compute_sub_i16,
+        106 => crate::Engine::compute_mul_i16,
+        107 => crate::Engine::compute_div_i16,
+        108 => crate::Engine::compute_mod_i16,
+        109 => crate::Engine::compute_bitand_i16,
+        110 => crate::Engine::compute_bitor_i16,
+        111 => crate::Engine::compute_bitxor_i16,
+        112 => crate::Engine::compute_shl_i16,
+        113 => crate::Engine::compute_shr_i16,
+        114 => crate::Engine::compute_neg_i16,
+        115 => crate::Engine::compute_bitnot_i16,
         // i32: 116-127
-        crate::Engine::compute_add_i32,             // 116
-        crate::Engine::compute_sub_i32,             // 117
-        crate::Engine::compute_mul_i32,             // 118
-        crate::Engine::compute_div_i32,             // 119
-        crate::Engine::compute_mod_i32,             // 120
-        crate::Engine::compute_bitand_i32,          // 121
-        crate::Engine::compute_bitor_i32,           // 122
-        crate::Engine::compute_bitxor_i32,          // 123
-        crate::Engine::compute_shl_i32,             // 124
-        crate::Engine::compute_shr_i32,             // 125
-        crate::Engine::compute_neg_i32,             // 126
-        crate::Engine::compute_bitnot_i32,          // 127
+        116 => crate::Engine::compute_add_i32,
+        117 => crate::Engine::compute_sub_i32,
+        118 => crate::Engine::compute_mul_i32,
+        119 => crate::Engine::compute_div_i32,
+        120 => crate::Engine::compute_mod_i32,
+        121 => crate::Engine::compute_bitand_i32,
+        122 => crate::Engine::compute_bitor_i32,
+        123 => crate::Engine::compute_bitxor_i32,
+        124 => crate::Engine::compute_shl_i32,
+        125 => crate::Engine::compute_shr_i32,
+        126 => crate::Engine::compute_neg_i32,
+        127 => crate::Engine::compute_bitnot_i32,
         // i64: 128-139
-        crate::Engine::compute_add_i64,             // 128
-        crate::Engine::compute_sub_i64,             // 129
-        crate::Engine::compute_mul_i64,             // 130
-        crate::Engine::compute_div_i64,             // 131
-        crate::Engine::compute_mod_i64,             // 132
-        crate::Engine::compute_bitand_i64,          // 133
-        crate::Engine::compute_bitor_i64,           // 134
-        crate::Engine::compute_bitxor_i64,          // 135
-        crate::Engine::compute_shl_i64,             // 136
-        crate::Engine::compute_shr_i64,             // 137
-        crate::Engine::compute_neg_i64,             // 138
-        crate::Engine::compute_bitnot_i64,          // 139
+        128 => crate::Engine::compute_add_i64,
+        129 => crate::Engine::compute_sub_i64,
+        130 => crate::Engine::compute_mul_i64,
+        131 => crate::Engine::compute_div_i64,
+        132 => crate::Engine::compute_mod_i64,
+        133 => crate::Engine::compute_bitand_i64,
+        134 => crate::Engine::compute_bitor_i64,
+        135 => crate::Engine::compute_bitxor_i64,
+        136 => crate::Engine::compute_shl_i64,
+        137 => crate::Engine::compute_shr_i64,
+        138 => crate::Engine::compute_neg_i64,
+        139 => crate::Engine::compute_bitnot_i64,
         // i128: 140-151
-        crate::Engine::compute_add_i128,            // 140
-        crate::Engine::compute_sub_i128,            // 141
-        crate::Engine::compute_mul_i128,            // 142
-        crate::Engine::compute_div_i128,            // 143
-        crate::Engine::compute_mod_i128,            // 144
-        crate::Engine::compute_bitand_i128,         // 145
-        crate::Engine::compute_bitor_i128,          // 146
-        crate::Engine::compute_bitxor_i128,         // 147
-        crate::Engine::compute_shl_i128,            // 148
-        crate::Engine::compute_shr_i128,            // 149
-        crate::Engine::compute_neg_i128,            // 150
-        crate::Engine::compute_bitnot_i128,         // 151
+        140 => crate::Engine::compute_add_i128,
+        141 => crate::Engine::compute_sub_i128,
+        142 => crate::Engine::compute_mul_i128,
+        143 => crate::Engine::compute_div_i128,
+        144 => crate::Engine::compute_mod_i128,
+        145 => crate::Engine::compute_bitand_i128,
+        146 => crate::Engine::compute_bitor_i128,
+        147 => crate::Engine::compute_bitxor_i128,
+        148 => crate::Engine::compute_shl_i128,
+        149 => crate::Engine::compute_shr_i128,
+        150 => crate::Engine::compute_neg_i128,
+        151 => crate::Engine::compute_bitnot_i128,
         // u8: 152-163
-        crate::Engine::compute_add_u8,              // 152
-        crate::Engine::compute_sub_u8,              // 153
-        crate::Engine::compute_mul_u8,              // 154
-        crate::Engine::compute_div_u8,              // 155
-        crate::Engine::compute_mod_u8,              // 156
-        crate::Engine::compute_bitand_u8,           // 157
-        crate::Engine::compute_bitor_u8,            // 158
-        crate::Engine::compute_bitxor_u8,           // 159
-        crate::Engine::compute_shl_u8,              // 160
-        crate::Engine::compute_shr_u8,              // 161
-        crate::Engine::compute_neg_u8,              // 162
-        crate::Engine::compute_bitnot_u8,           // 163
+        152 => crate::Engine::compute_add_u8,
+        153 => crate::Engine::compute_sub_u8,
+        154 => crate::Engine::compute_mul_u8,
+        155 => crate::Engine::compute_div_u8,
+        156 => crate::Engine::compute_mod_u8,
+        157 => crate::Engine::compute_bitand_u8,
+        158 => crate::Engine::compute_bitor_u8,
+        159 => crate::Engine::compute_bitxor_u8,
+        160 => crate::Engine::compute_shl_u8,
+        161 => crate::Engine::compute_shr_u8,
+        162 => crate::Engine::compute_neg_u8,
+        163 => crate::Engine::compute_bitnot_u8,
         // u16: 164-175
-        crate::Engine::compute_add_u16,             // 164
-        crate::Engine::compute_sub_u16,             // 165
-        crate::Engine::compute_mul_u16,             // 166
-        crate::Engine::compute_div_u16,             // 167
-        crate::Engine::compute_mod_u16,             // 168
-        crate::Engine::compute_bitand_u16,          // 169
-        crate::Engine::compute_bitor_u16,           // 170
-        crate::Engine::compute_bitxor_u16,          // 171
-        crate::Engine::compute_shl_u16,             // 172
-        crate::Engine::compute_shr_u16,             // 173
-        crate::Engine::compute_neg_u16,             // 174
-        crate::Engine::compute_bitnot_u16,          // 175
+        164 => crate::Engine::compute_add_u16,
+        165 => crate::Engine::compute_sub_u16,
+        166 => crate::Engine::compute_mul_u16,
+        167 => crate::Engine::compute_div_u16,
+        168 => crate::Engine::compute_mod_u16,
+        169 => crate::Engine::compute_bitand_u16,
+        170 => crate::Engine::compute_bitor_u16,
+        171 => crate::Engine::compute_bitxor_u16,
+        172 => crate::Engine::compute_shl_u16,
+        173 => crate::Engine::compute_shr_u16,
+        174 => crate::Engine::compute_neg_u16,
+        175 => crate::Engine::compute_bitnot_u16,
         // u32: 176-187
-        crate::Engine::compute_add_u32,             // 176
-        crate::Engine::compute_sub_u32,             // 177
-        crate::Engine::compute_mul_u32,             // 178
-        crate::Engine::compute_div_u32,             // 179
-        crate::Engine::compute_mod_u32,             // 180
-        crate::Engine::compute_bitand_u32,          // 181
-        crate::Engine::compute_bitor_u32,           // 182
-        crate::Engine::compute_bitxor_u32,          // 183
-        crate::Engine::compute_shl_u32,             // 184
-        crate::Engine::compute_shr_u32,             // 185
-        crate::Engine::compute_neg_u32,             // 186
-        crate::Engine::compute_bitnot_u32,          // 187
+        176 => crate::Engine::compute_add_u32,
+        177 => crate::Engine::compute_sub_u32,
+        178 => crate::Engine::compute_mul_u32,
+        179 => crate::Engine::compute_div_u32,
+        180 => crate::Engine::compute_mod_u32,
+        181 => crate::Engine::compute_bitand_u32,
+        182 => crate::Engine::compute_bitor_u32,
+        183 => crate::Engine::compute_bitxor_u32,
+        184 => crate::Engine::compute_shl_u32,
+        185 => crate::Engine::compute_shr_u32,
+        186 => crate::Engine::compute_neg_u32,
+        187 => crate::Engine::compute_bitnot_u32,
         // u64: 188-199
-        crate::Engine::compute_add_u64,             // 188
-        crate::Engine::compute_sub_u64,             // 189
-        crate::Engine::compute_mul_u64,             // 190
-        crate::Engine::compute_div_u64,             // 191
-        crate::Engine::compute_mod_u64,             // 192
-        crate::Engine::compute_bitand_u64,          // 193
-        crate::Engine::compute_bitor_u64,           // 194
-        crate::Engine::compute_bitxor_u64,          // 195
-        crate::Engine::compute_shl_u64,             // 196
-        crate::Engine::compute_shr_u64,             // 197
-        crate::Engine::compute_neg_u64,             // 198
-        crate::Engine::compute_bitnot_u64,          // 199
+        188 => crate::Engine::compute_add_u64,
+        189 => crate::Engine::compute_sub_u64,
+        190 => crate::Engine::compute_mul_u64,
+        191 => crate::Engine::compute_div_u64,
+        192 => crate::Engine::compute_mod_u64,
+        193 => crate::Engine::compute_bitand_u64,
+        194 => crate::Engine::compute_bitor_u64,
+        195 => crate::Engine::compute_bitxor_u64,
+        196 => crate::Engine::compute_shl_u64,
+        197 => crate::Engine::compute_shr_u64,
+        198 => crate::Engine::compute_neg_u64,
+        199 => crate::Engine::compute_bitnot_u64,
         // u128: 200-211
-        crate::Engine::compute_add_u128,            // 200
-        crate::Engine::compute_sub_u128,            // 201
-        crate::Engine::compute_mul_u128,            // 202
-        crate::Engine::compute_div_u128,            // 203
-        crate::Engine::compute_mod_u128,            // 204
-        crate::Engine::compute_bitand_u128,         // 205
-        crate::Engine::compute_bitor_u128,          // 206
-        crate::Engine::compute_bitxor_u128,         // 207
-        crate::Engine::compute_shl_u128,            // 208
-        crate::Engine::compute_shr_u128,            // 209
-        crate::Engine::compute_neg_u128,            // 210
-        crate::Engine::compute_bitnot_u128,         // 211
+        200 => crate::Engine::compute_add_u128,
+        201 => crate::Engine::compute_sub_u128,
+        202 => crate::Engine::compute_mul_u128,
+        203 => crate::Engine::compute_div_u128,
+        204 => crate::Engine::compute_mod_u128,
+        205 => crate::Engine::compute_bitand_u128,
+        206 => crate::Engine::compute_bitor_u128,
+        207 => crate::Engine::compute_bitxor_u128,
+        208 => crate::Engine::compute_shl_u128,
+        209 => crate::Engine::compute_shr_u128,
+        210 => crate::Engine::compute_neg_u128,
+        211 => crate::Engine::compute_bitnot_u128,
         // isize: 212-223
-        crate::Engine::compute_add_isize,           // 212
-        crate::Engine::compute_sub_isize,           // 213
-        crate::Engine::compute_mul_isize,           // 214
-        crate::Engine::compute_div_isize,           // 215
-        crate::Engine::compute_mod_isize,           // 216
-        crate::Engine::compute_bitand_isize,        // 217
-        crate::Engine::compute_bitor_isize,         // 218
-        crate::Engine::compute_bitxor_isize,        // 219
-        crate::Engine::compute_shl_isize,           // 220
-        crate::Engine::compute_shr_isize,           // 221
-        crate::Engine::compute_neg_isize,           // 222
-        crate::Engine::compute_bitnot_isize,        // 223
+        212 => crate::Engine::compute_add_isize,
+        213 => crate::Engine::compute_sub_isize,
+        214 => crate::Engine::compute_mul_isize,
+        215 => crate::Engine::compute_div_isize,
+        216 => crate::Engine::compute_mod_isize,
+        217 => crate::Engine::compute_bitand_isize,
+        218 => crate::Engine::compute_bitor_isize,
+        219 => crate::Engine::compute_bitxor_isize,
+        220 => crate::Engine::compute_shl_isize,
+        221 => crate::Engine::compute_shr_isize,
+        222 => crate::Engine::compute_neg_isize,
+        223 => crate::Engine::compute_bitnot_isize,
         // usize: 224-235
-        crate::Engine::compute_add_usize,           // 224
-        crate::Engine::compute_sub_usize,           // 225
-        crate::Engine::compute_mul_usize,           // 226
-        crate::Engine::compute_div_usize,           // 227
-        crate::Engine::compute_mod_usize,           // 228
-        crate::Engine::compute_bitand_usize,        // 229
-        crate::Engine::compute_bitor_usize,         // 230
-        crate::Engine::compute_bitxor_usize,        // 231
-        crate::Engine::compute_shl_usize,           // 232
-        crate::Engine::compute_shr_usize,           // 233
-        crate::Engine::compute_neg_usize,           // 234
-        crate::Engine::compute_bitnot_usize,        // 235
+        224 => crate::Engine::compute_add_usize,
+        225 => crate::Engine::compute_sub_usize,
+        226 => crate::Engine::compute_mul_usize,
+        227 => crate::Engine::compute_div_usize,
+        228 => crate::Engine::compute_mod_usize,
+        229 => crate::Engine::compute_bitand_usize,
+        230 => crate::Engine::compute_bitor_usize,
+        231 => crate::Engine::compute_bitxor_usize,
+        232 => crate::Engine::compute_shl_usize,
+        233 => crate::Engine::compute_shr_usize,
+        234 => crate::Engine::compute_neg_usize,
+        235 => crate::Engine::compute_bitnot_usize,
         // 浮点 4 类型 × 6 运算（add/sub/mul/div/mod/neg）
         // f16: 236-241
-        crate::Engine::compute_add_f16,             // 236
-        crate::Engine::compute_sub_f16,             // 237
-        crate::Engine::compute_mul_f16,             // 238
-        crate::Engine::compute_div_f16,             // 239
-        crate::Engine::compute_mod_f16,             // 240
-        crate::Engine::compute_neg_f16,             // 241
+        236 => crate::Engine::compute_add_f16,
+        237 => crate::Engine::compute_sub_f16,
+        238 => crate::Engine::compute_mul_f16,
+        239 => crate::Engine::compute_div_f16,
+        240 => crate::Engine::compute_mod_f16,
+        241 => crate::Engine::compute_neg_f16,
         // f32: 242-247
-        crate::Engine::compute_add_f32,             // 242
-        crate::Engine::compute_sub_f32,             // 243
-        crate::Engine::compute_mul_f32,             // 244
-        crate::Engine::compute_div_f32,             // 245
-        crate::Engine::compute_mod_f32,             // 246
-        crate::Engine::compute_neg_f32,             // 247
+        242 => crate::Engine::compute_add_f32,
+        243 => crate::Engine::compute_sub_f32,
+        244 => crate::Engine::compute_mul_f32,
+        245 => crate::Engine::compute_div_f32,
+        246 => crate::Engine::compute_mod_f32,
+        247 => crate::Engine::compute_neg_f32,
         // f64: 248-253
-        crate::Engine::compute_add_f64,             // 248
-        crate::Engine::compute_sub_f64,             // 249
-        crate::Engine::compute_mul_f64,             // 250
-        crate::Engine::compute_div_f64,             // 251
-        crate::Engine::compute_mod_f64,             // 252
-        crate::Engine::compute_neg_f64,             // 253
+        248 => crate::Engine::compute_add_f64,
+        249 => crate::Engine::compute_sub_f64,
+        250 => crate::Engine::compute_mul_f64,
+        251 => crate::Engine::compute_div_f64,
+        252 => crate::Engine::compute_mod_f64,
+        253 => crate::Engine::compute_neg_f64,
         // f128: 254-259
-        crate::Engine::compute_add_f128,            // 254
-        crate::Engine::compute_sub_f128,            // 255
-        crate::Engine::compute_mul_f128,            // 256
-        crate::Engine::compute_div_f128,            // 257
-        crate::Engine::compute_mod_f128,            // 258
-        crate::Engine::compute_neg_f128,            // 259
+        254 => crate::Engine::compute_add_f128,
+        255 => crate::Engine::compute_sub_f128,
+        256 => crate::Engine::compute_mul_f128,
+        257 => crate::Engine::compute_div_f128,
+        258 => crate::Engine::compute_mod_f128,
+        259 => crate::Engine::compute_neg_f128,
         // 语义运算（260-265）：RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis
-        crate::Engine::compute_ref_eq,              // 260
-        crate::Engine::compute_ref_neq,             // 261
-        crate::Engine::compute_concat_list,         // 262
-        crate::Engine::compute_range,               // 263
-        crate::Engine::compute_range_inclusive,     // 264
-        crate::Engine::compute_elvis,               // 265
+        260 => crate::Engine::compute_ref_eq,
+        261 => crate::Engine::compute_ref_neq,
+        262 => crate::Engine::compute_concat_list,
+        263 => crate::Engine::compute_range,
+        264 => crate::Engine::compute_range_inclusive,
+        265 => crate::Engine::compute_elvis,
         // inline_trait / lazy 构造（266-267）
-        crate::Engine::compute_trait_construct,     // 266
-        crate::Engine::compute_lazy_construct,      // 267
-        crate::Engine::compute_slice,               // 268
-        crate::Engine::compute_str_concat,          // 269
-    ]
+        266 => crate::Engine::compute_trait_construct,
+        267 => crate::Engine::compute_lazy_construct,
+        268 => crate::Engine::compute_slice,
+        269 => crate::Engine::compute_str_concat,
+        // 全局变量读写（270-271）
+        270 => crate::Engine::compute_global_load,
+        271 => crate::Engine::compute_global_store,
+        // 记录扩展 / 原子构造（272-273）
+        272 => crate::Engine::compute_record_extend,
+        273 => crate::Engine::compute_atomic_construct,
+        // 模式匹配（274-276）
+        274 => crate::Engine::compute_pattern_ctor_match,
+        275 => crate::Engine::compute_pattern_adt_field_get,
+        276 => crate::Engine::compute_pattern_str_eq,
+        // 通用类型转换（277-278）
+        277 => crate::Engine::compute_cast_to_str,
+        278 => crate::Engine::compute_cast_scalar,
+    }
+}
+
+// =========================================================================
+// 节点元数据宏：消除 NodeId 索引字段的声明/new/add_node/setter 四件套重复
+// =========================================================================
+//
+// 中心定义宏 `node_metadata!($callback)` 列出所有按 NodeId 索引的元数据字段，
+// 通过不同 callback 宏展开为：
+//   - add_node() push（metadata_push!）   ← 自动同步
+//   - setter 方法（metadata_setters!）     ← 自动同步
+//   - struct 字段声明                      ← 手写（Rust 不允许宏在此位置展开）
+//   - new() 初始化                         ← 手写（同上）
+//
+// 三种字段类别：
+//   opt(field, Type, setter)   → Vec<Option<Type>>, set_setter(node, v: Type)
+//   bool_flag(field, setter)   → Vec<bool>, set_setter(node) { = true }
+//   bool_val(field, setter)    → Vec<bool>, set_setter(node, v: bool) { = v }
+//
+// 新增元数据字段：在 node_metadata! 追加一行（push+setter 自动同步），
+// 再在 struct 定义和 new() 各补一行（手写）。
+
+/// 中心定义：所有 NodeId 索引的元数据字段。
+macro_rules! node_metadata {
+    ($callback:ident) => {
+        $callback! {
+            opt(call_targets, SubGraphId, set_call_target)
+            opt(gate_branches, GateBranches, set_gate_branches)
+            opt(control_signal_nodes, SignalKind, set_control_signal)
+            opt(field_access_infos, u16, set_field_access_info)
+            opt(record_lit_infos, RecordLitInfo, set_record_lit_info)
+            opt(ffi_call_names, String, set_ffi_call_name)
+            opt(field_set_names, String, set_field_set_name)
+            opt(vtable_call_methods, String, set_vtable_call)
+            opt(await_event_sources, NodeId, set_await_event_source)
+            opt(closure_infos, ClosureInfo, set_closure_info)
+            opt(select_infos, SelectInfo, set_select_info)
+            opt(writeback_targets, NodeId, set_writeback_target)
+            opt(batch_infos, BatchInfo, set_batch_info)
+            opt(trait_construct_infos, TraitConstructInfo, set_trait_construct_info)
+            opt(lazy_construct_infos, LazyConstructInfo, set_lazy_construct_info)
+            opt(record_extend_infos, RecordExtendInfo, set_record_extend_info)
+            opt(global_load_slots, u32, set_global_load_slot)
+            opt(global_store_slots, u32, set_global_store_slot)
+            opt(pattern_ctor_names, String, set_pattern_ctor_name)
+            opt(pattern_field_indices, u16, set_pattern_field_index)
+            opt(cast_target_types, String, set_cast_target_type)
+            ;
+            bool_flag(tail_call_flags, set_tail_call)
+            ;
+            bool_val(slice_inclusive, set_slice_inclusive)
+        }
+    };
+    ($callback:ident, $self:ident) => {
+        $callback! {
+            $self ;
+            opt(call_targets, SubGraphId, set_call_target)
+            opt(gate_branches, GateBranches, set_gate_branches)
+            opt(control_signal_nodes, SignalKind, set_control_signal)
+            opt(field_access_infos, u16, set_field_access_info)
+            opt(record_lit_infos, RecordLitInfo, set_record_lit_info)
+            opt(ffi_call_names, String, set_ffi_call_name)
+            opt(field_set_names, String, set_field_set_name)
+            opt(vtable_call_methods, String, set_vtable_call)
+            opt(await_event_sources, NodeId, set_await_event_source)
+            opt(closure_infos, ClosureInfo, set_closure_info)
+            opt(select_infos, SelectInfo, set_select_info)
+            opt(writeback_targets, NodeId, set_writeback_target)
+            opt(batch_infos, BatchInfo, set_batch_info)
+            opt(trait_construct_infos, TraitConstructInfo, set_trait_construct_info)
+            opt(lazy_construct_infos, LazyConstructInfo, set_lazy_construct_info)
+            opt(record_extend_infos, RecordExtendInfo, set_record_extend_info)
+            opt(global_load_slots, u32, set_global_load_slot)
+            opt(global_store_slots, u32, set_global_store_slot)
+            opt(pattern_ctor_names, String, set_pattern_ctor_name)
+            opt(pattern_field_indices, u16, set_pattern_field_index)
+            opt(cast_target_types, String, set_cast_target_type)
+            ;
+            bool_flag(tail_call_flags, set_tail_call)
+            ;
+            bool_val(slice_inclusive, set_slice_inclusive)
+        }
+    };
+}
+
+// 注：struct 字段声明与 new() 初始化器无法用 macro_rules! 宏化——
+// Rust 不允许宏在 struct 字段声明位置和 struct 初始化器字段位置展开。
+// 这两处必须手写（见 DataFlowGraph 定义和 new()）。新增字段时：
+//   1. 在 node_metadata! 追加一行（自动同步 push + setter）
+//   2. 在 struct 定义补一行字段
+//   3. 在 new() 补一行 Vec::new()
+
+/// 展开为 add_node() 中的 push 语句。
+macro_rules! metadata_push {
+    ( $self:ident ; $( opt($f:ident, $t:ty, $_s:ident) )* ; $( bool_flag($bf:ident, $_bs:ident) )* ; $( bool_val($vf:ident, $_vs:ident) )* ) => {
+        $( $self.$f.push(None); )*
+        $( $self.$bf.push(false); )*
+        $( $self.$vf.push(false); )*
+    };
+}
+
+/// 展开为 impl DataFlowGraph 的 setter 方法。
+macro_rules! metadata_setters {
+    ( $( opt($f:ident, $t:ty, $s:ident) )* ; $( bool_flag($bf:ident, $bs:ident) )* ; $( bool_val($vf:ident, $vs:ident) )* ) => {
+        $(
+            pub fn $s(&mut self, node: NodeId, v: $t) {
+                self.$f[node.0 as usize] = Some(v);
+            }
+        )*
+        $(
+            pub fn $bs(&mut self, node: NodeId) {
+                self.$bf[node.0 as usize] = true;
+            }
+        )*
+        $(
+            pub fn $vs(&mut self, node: NodeId, v: bool) {
+                self.$vf[node.0 as usize] = v;
+            }
+        )*
+    };
 }
 
 // =========================================================================
@@ -1198,10 +1361,8 @@ pub struct DataFlowGraph {
     /// 字段赋值信息（按 NodeId 索引，存字段名，用于 compute_record_field_set）
     pub field_set_names: Vec<Option<String>>,
     /// vtable 动态分派 Call 节点的方法名（按 NodeId 索引，None=静态调用）
-    /// 当 Call 节点有 vtable 方法名时，运行时从 TraitVal 查方法子图 id
     pub vtable_call_methods: Vec<Option<String>>,
     /// Await 节点对应的 EventSource 声明节点（按 NodeId 索引，非 Await 节点为 None）
-    /// 解耦：EventSource 节点不参与数据流就绪判定，仅作为元数据引用
     pub await_event_sources: Vec<Option<NodeId>>,
     /// 闭包构造节点信息（按 NodeId 索引，非闭包构造节点为 None）
     pub closure_infos: Vec<Option<ClosureInfo>>,
@@ -1210,10 +1371,8 @@ pub struct DataFlowGraph {
     /// WriteBack 节点的目标外层 NodeId（按 NodeId 索引，非 WriteBack 节点为 None）
     pub writeback_targets: Vec<Option<NodeId>>,
     /// Call 节点的尾调用标记（按 NodeId 索引，true=尾调用帧复用）
-    /// 编译期由尾位置分析设置，运行时 switch_subgraph 复用当前帧
     pub tail_call_flags: Vec<bool>,
     /// 编译期 SIMD/并行批量化标记（按 NodeId 索引，None=不可批量化）
-    /// compile_binary/compile_unary 设置，run_ready_nodes 按 (tag,op) 分组批算
     pub batch_infos: Vec<Option<BatchInfo>>,
     /// IR 编译期错误（未实现的特性、找不到函数等），build() 末尾从 IrBuilder.errors 移入
     pub ir_errors: Vec<String>,
@@ -1221,8 +1380,22 @@ pub struct DataFlowGraph {
     pub trait_construct_infos: Vec<Option<TraitConstructInfo>>,
     /// lazy 构造节点信息（按 NodeId 索引，非 lazy construct 节点为 None）
     pub lazy_construct_infos: Vec<Option<LazyConstructInfo>>,
+    /// 记录扩展节点信息（按 NodeId 索引，非 record extend 节点为 None）
+    pub record_extend_infos: Vec<Option<RecordExtendInfo>>,
     /// 切片节点的 inclusive 标志（按 NodeId 索引，true = `[start..=end]`，false = `[start..end]`）
     pub slice_inclusive: Vec<bool>,
+    /// 全局变量运行时存储（顶层 var/val 声明，跨函数共享，不依赖帧链）
+    pub global_var_storage: Arc<Vec<std::sync::Mutex<Option<crate::Value::Value>>>>,
+    /// global_load 节点的 slot index（按 NodeId 索引，非 global_load 节点为 None）
+    pub global_load_slots: Vec<Option<u32>>,
+    /// global_store 节点的 slot index（按 NodeId 索引，非 global_store 节点为 None）
+    pub global_store_slots: Vec<Option<u32>>,
+    /// 模式匹配：构造器名判别节点存储的构造器名（按 NodeId 索引）
+    pub pattern_ctor_names: Vec<Option<String>>,
+    /// 模式匹配：ADT 按位置提取字段节点的索引（按 NodeId 索引）
+    pub pattern_field_indices: Vec<Option<u16>>,
+    /// 通用 cast 节点的目标类型名（按 NodeId 索引，非 cast 节点为 None）
+    pub cast_target_types: Vec<Option<String>>,
 }
 
 impl DataFlowGraph {
@@ -1236,6 +1409,7 @@ impl DataFlowGraph {
             compute_fns: build_compute_fn_table(),
             downstreams: Vec::new(),
             const_values: Vec::new(),
+            // 元数据字段初始化（Rust 不允许 struct 初始化器内展开宏，故手写）
             call_targets: Vec::new(),
             gate_branches: Vec::new(),
             control_signal_nodes: Vec::new(),
@@ -1250,10 +1424,17 @@ impl DataFlowGraph {
             writeback_targets: Vec::new(),
             tail_call_flags: Vec::new(),
             batch_infos: Vec::new(),
-            ir_errors: Vec::new(),
             trait_construct_infos: Vec::new(),
             lazy_construct_infos: Vec::new(),
+            record_extend_infos: Vec::new(),
             slice_inclusive: Vec::new(),
+            global_load_slots: Vec::new(),
+            global_store_slots: Vec::new(),
+            pattern_ctor_names: Vec::new(),
+            pattern_field_indices: Vec::new(),
+            cast_target_types: Vec::new(),
+            ir_errors: Vec::new(),
+            global_var_storage: Arc::new(Vec::new()),
         }
     }
 
@@ -1263,111 +1444,13 @@ impl DataFlowGraph {
         self.nodes.push(node);
         self.downstreams.push(Vec::new());
         self.const_values.push(None);
-        self.call_targets.push(None);
-        self.gate_branches.push(None);
-        self.control_signal_nodes.push(None);
-        self.field_access_infos.push(None);
-        self.record_lit_infos.push(None);
-        self.ffi_call_names.push(None);
-        self.field_set_names.push(None);
-        self.vtable_call_methods.push(None);
-        self.await_event_sources.push(None);
-        self.closure_infos.push(None);
-        self.select_infos.push(None);
-        self.writeback_targets.push(None);
-        self.tail_call_flags.push(false);
-        self.batch_infos.push(None);
-        self.trait_construct_infos.push(None);
-        self.lazy_construct_infos.push(None);
-        self.slice_inclusive.push(false);
+        // 元数据字段 push（由 node_metadata! 宏统一生成）
+        node_metadata!(metadata_push, self);
         id
     }
 
-    /// 设置 Call 节点的目标子图。
-    pub fn set_call_target(&mut self, node: NodeId, target: SubGraphId) {
-        self.call_targets[node.0 as usize] = Some(target);
-    }
-
-    /// 标记 Call 节点为尾调用（运行时 switch_subgraph 复用当前帧）。
-    pub fn set_tail_call(&mut self, node: NodeId) {
-        self.tail_call_flags[node.0 as usize] = true;
-    }
-
-    /// 设置节点的 SIMD/并行批量化信息（编译期由 compile_binary/compile_unary 调用）。
-    pub fn set_batch_info(&mut self, node: NodeId, info: BatchInfo) {
-        self.batch_infos[node.0 as usize] = Some(info);
-    }
-
-    /// 设置 WriteBack 节点的目标外层 NodeId。
-    pub fn set_writeback_target(&mut self, node: NodeId, target: NodeId) {
-        self.writeback_targets[node.0 as usize] = Some(target);
-    }
-
-    /// 标记节点为控制信号触发点。
-    pub fn set_control_signal(&mut self, node: NodeId, kind: SignalKind) {
-        self.control_signal_nodes[node.0 as usize] = Some(kind);
-    }
-
-    /// 设置节点的字段访问信息。
-    pub fn set_field_access_info(&mut self, node: NodeId, field_idx: u16) {
-        self.field_access_infos[node.0 as usize] = Some(field_idx);
-    }
-
-    /// 设置节点的记录构造信息。
-    pub fn set_record_lit_info(&mut self, node: NodeId, info: RecordLitInfo) {
-        self.record_lit_infos[node.0 as usize] = Some(info);
-    }
-
-    /// 设置 FFI 调用节点的 @extern("C") 函数名。
-    pub fn set_ffi_call_name(&mut self, node: NodeId, name: String) {
-        self.ffi_call_names[node.0 as usize] = Some(name);
-    }
-
-    /// 设置节点的字段赋值信息（字段名）。
-    pub fn set_field_set_name(&mut self, node: NodeId, field_name: String) {
-        self.field_set_names[node.0 as usize] = Some(field_name);
-    }
-
-    /// 标记 Call 节点为 vtable 动态分派，存储方法名。
-    /// 运行时 Engine 从 TraitVal 的 method_names 查方法，取 Closure.func_id 为子图 id。
-    pub fn set_vtable_call(&mut self, node: NodeId, method_name: String) {
-        self.vtable_call_methods[node.0 as usize] = Some(method_name);
-    }
-
-    /// 设置 Await 节点对应的 EventSource 声明节点。
-    pub fn set_await_event_source(&mut self, node: NodeId, es_node: NodeId) {
-        self.await_event_sources[node.0 as usize] = Some(es_node);
-    }
-
-    /// 设置 Gate 节点的分支信息。
-    pub fn set_gate_branches(&mut self, node: NodeId, branches: GateBranches) {
-        self.gate_branches[node.0 as usize] = Some(branches);
-    }
-
-    /// 设置闭包构造节点的信息（子图 id + arity）。
-    pub fn set_closure_info(&mut self, node: NodeId, info: ClosureInfo) {
-        self.closure_infos[node.0 as usize] = Some(info);
-    }
-
-    /// 设置 inline_trait 构造节点的信息（trait 名 + 方法列表）。
-    pub fn set_trait_construct_info(&mut self, node: NodeId, info: TraitConstructInfo) {
-        self.trait_construct_infos[node.0 as usize] = Some(info);
-    }
-
-    /// 设置 lazy 构造节点的信息（thunk 子图 id）。
-    pub fn set_lazy_construct_info(&mut self, node: NodeId, info: LazyConstructInfo) {
-        self.lazy_construct_infos[node.0 as usize] = Some(info);
-    }
-
-    /// 设置切片节点的 inclusive 标志（true = `[start..=end]`）。
-    pub fn set_slice_inclusive(&mut self, node: NodeId, inclusive: bool) {
-        self.slice_inclusive[node.0 as usize] = inclusive;
-    }
-
-    /// 设置 select gate 节点的分支信息。
-    pub fn set_select_info(&mut self, node: NodeId, info: SelectInfo) {
-        self.select_infos[node.0 as usize] = Some(info);
-    }
+    // ---- 节点元数据 setter（由 node_metadata! 宏统一生成）----
+    node_metadata!(metadata_setters);
 
     /// 添加子图，返回其 SubGraphId。
     pub fn add_subgraph(&mut self, sg: SubGraph) -> SubGraphId {
@@ -1449,6 +1532,55 @@ pub struct LoopContext {
 ///
 /// 以函数为单位编译子图：
 /// 1. 注册所有函数为 SubGraph
+
+// =========================================================================
+// TYPE_TABLE — 标量类型元信息表（单点定义，消除散落的魔法数字）
+// =========================================================================
+//
+// 集中存储每个标量类型的：
+//   - name:        类型名（Glue 源码中的名称）
+//   - tag:         ScalarTag（Value.rs 中的标签）
+//   - arith_base:  算术 compute_fn 基址（与 compute_fn_table! 索引一致）
+//   - family:      比较运算分派族（"i32"/"i64"/"i128"/"float"/"bool"）
+//   - is_float:    是否浮点（决定位运算可用性、neg 偏移量）
+//
+// arith_base 必须与 compute_fn_table! 中的索引严格一致。
+// 新增标量类型只需在此表追加一行，arith_base/int_family/ty_name_to_scalar_tag 自动同步。
+
+/// 标量类型元信息条目。
+struct TypeTableEntry {
+    name: &'static str,
+    tag: crate::Value::ScalarTag,
+    arith_base: u32,
+    family: &'static str,
+    is_float: bool,
+}
+
+/// 全标量类型元信息表（16 整数 + 4 浮点 = 20 类型）。
+const TYPE_TABLE: &[TypeTableEntry] = &[
+    // 整数 12 类型（arith_base 从 92 开始，每 12 个索引）
+    TypeTableEntry { name: "i8",     tag: crate::Value::ScalarTag::I8,     arith_base: 92,  family: "i32",   is_float: false },
+    TypeTableEntry { name: "i16",    tag: crate::Value::ScalarTag::I16,    arith_base: 104, family: "i32",   is_float: false },
+    TypeTableEntry { name: "i32",    tag: crate::Value::ScalarTag::I32,    arith_base: 116, family: "i32",   is_float: false },
+    TypeTableEntry { name: "i64",    tag: crate::Value::ScalarTag::I64,    arith_base: 128, family: "i64",   is_float: false },
+    TypeTableEntry { name: "i128",   tag: crate::Value::ScalarTag::I128,   arith_base: 140, family: "i128",  is_float: false },
+    TypeTableEntry { name: "u8",     tag: crate::Value::ScalarTag::U8,     arith_base: 152, family: "i32",   is_float: false },
+    TypeTableEntry { name: "u16",    tag: crate::Value::ScalarTag::U16,    arith_base: 164, family: "i32",   is_float: false },
+    TypeTableEntry { name: "u32",    tag: crate::Value::ScalarTag::U32,    arith_base: 176, family: "i32",   is_float: false },
+    TypeTableEntry { name: "u64",    tag: crate::Value::ScalarTag::U64,    arith_base: 188, family: "i64",   is_float: false },
+    TypeTableEntry { name: "u128",   tag: crate::Value::ScalarTag::U128,   arith_base: 200, family: "i128",  is_float: false },
+    TypeTableEntry { name: "isize",  tag: crate::Value::ScalarTag::Isize,  arith_base: 212, family: "i64",   is_float: false },
+    TypeTableEntry { name: "usize",  tag: crate::Value::ScalarTag::Usize,  arith_base: 224, family: "i64",   is_float: false },
+    // 浮点 4 类型（arith_base 从 236 开始，每 6 个索引）
+    TypeTableEntry { name: "f16",    tag: crate::Value::ScalarTag::F16,    arith_base: 236, family: "float", is_float: true },
+    TypeTableEntry { name: "f32",    tag: crate::Value::ScalarTag::F32,    arith_base: 242, family: "float", is_float: true },
+    TypeTableEntry { name: "f64",    tag: crate::Value::ScalarTag::F64,    arith_base: 248, family: "float", is_float: true },
+    TypeTableEntry { name: "f128",   tag: crate::Value::ScalarTag::F128,   arith_base: 254, family: "float", is_float: true },
+    // 非算术标量类型（bool/char，无 arith_base，仅用于 ty_name_to_scalar_tag）
+    TypeTableEntry { name: "bool",   tag: crate::Value::ScalarTag::Bool,   arith_base: 0,   family: "bool",  is_float: false },
+    TypeTableEntry { name: "char",   tag: crate::Value::ScalarTag::Char,   arith_base: 0,   family: "i32",   is_float: false },
+];
+
 /// 2. 编译每个函数的函数体
 /// 3. 计算 fan-out（downstreams）
 ///
@@ -1483,6 +1615,10 @@ pub struct IrBuilder<'a> {
     pub in_tail_position: bool,
     /// 编译期错误列表（未实现特性、找不到函数等，编译结束后可检查）
     pub errors: Vec<String>,
+    /// 全局变量名 → slot index 映射（顶层 var/val 声明，跨函数共享）
+    pub global_var_slots: rustc_hash::FxHashMap<String, u32>,
+    /// 顶层 var/val 声明语句列表（在 entry 函数编译时注入初始化代码）
+    pub top_level_var_decls: Vec<crate::Ast::StmtId>,
 }
 
 // =========================================================================
@@ -1556,6 +1692,8 @@ impl<'a> IrBuilder<'a> {
             current_effect: None,
             in_tail_position: false,
             errors: Vec::new(),
+            global_var_slots: rustc_hash::FxHashMap::default(),
+            top_level_var_decls: Vec::new(),
         }
     }
 
@@ -1597,7 +1735,41 @@ impl<'a> IrBuilder<'a> {
                 return Some(node_id);
             }
         }
+        // 全局变量：返回 None，由调用方通过 is_global_var + global_var_slots 处理
         None
+    }
+
+    /// 检查名称是否为全局变量，返回 slot index。
+    fn lookup_global_var(&self, name: &str) -> Option<u32> {
+        self.global_var_slots.get(name).copied()
+    }
+
+    /// 编译全局变量读取节点（compute_global_load, idx 270）。
+    /// 无输入，运行时从 global_var_storage[slot] 读取。
+    fn compile_global_load(&mut self, slot: u32) -> NodeId {
+        let inputs_offset = self.graph.inputs_pool.push(&[]);
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 0,
+            inputs_offset,
+            compute_fn: ComputeFnId(270),
+        });
+        self.graph.set_global_load_slot(node, slot);
+        node
+    }
+
+    /// 编译全局变量写入节点（compute_global_store, idx 271）。
+    /// inputs[0] = 值来源节点，运行时写入 global_var_storage[slot]。
+    fn compile_global_store(&mut self, val_node: NodeId, slot: u32) -> NodeId {
+        let inputs_offset = self.graph.inputs_pool.push(&[val_node]);
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 1,
+            inputs_offset,
+            compute_fn: ComputeFnId(271),
+        });
+        self.graph.set_global_store_slot(node, slot);
+        node
     }
 
     /// 判断 NodeId 是否在当前子图范围内（非外层变量）。
@@ -1630,7 +1802,7 @@ impl<'a> IrBuilder<'a> {
     ) -> ComputeFnId {
         use crate::Ast::CompoundAssignOp;
         let ty = self.expr_type_name(target_expr).unwrap_or("i32");
-        let is_float = matches!(ty, "f16" | "f32" | "f64" | "f128");
+        let is_float = TYPE_TABLE.iter().find(|e| e.name == ty).map(|e| e.is_float).unwrap_or(false);
         let base = Self::arith_base(ty).unwrap_or(116); // 回退 i32
         // 整数 offset: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9)
         // 浮点 offset: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
@@ -1696,7 +1868,33 @@ impl<'a> IrBuilder<'a> {
             // 变量引用
             crate::Ast::Expr::Ident(name) => match self.lookup_var(name) {
                 Some(node_id) => node_id,
-                None => self.compile_const(),
+                None => match self.lookup_global_var(name) {
+                    Some(slot) => self.compile_global_load(slot),
+                    None => {
+                        // nullary ADT/类型构造器检测：当 Ident 既非局部变量也非全局变量，
+                        // 检查是否为无参构造器（如 `Lt`/`Leaf`），编译为无参构造节点。
+                        // 有参构造器（field_names 非空）不在此处理（应走 Call 路径带参数）。
+                        let field_names = self.lookup_constructor_field_names(name)
+                            .or_else(|| self.lookup_type_field_names(name));
+                        match field_names {
+                            Some(names) if names.is_empty() => {
+                                let inputs_offset = self.graph.inputs_pool.push(&[]);
+                                let node = self.graph.add_node(Node {
+                                    kind: NodeKind::BinOp,
+                                    input_count: 0,
+                                    inputs_offset,
+                                    compute_fn: ComputeFnId(29), // record_construct
+                                });
+                                self.graph.set_record_lit_info(node, RecordLitInfo {
+                                    type_name: name.to_string(),
+                                    field_names: Vec::new(),
+                                });
+                                node
+                            }
+                            _ => self.compile_const(),
+                        }
+                    }
+                },
             },
 
             // 二元运算
@@ -1871,16 +2069,26 @@ impl<'a> IrBuilder<'a> {
             | crate::Ast::Expr::Deref(_)
             | crate::Ast::Expr::SafeMethodCall { .. }
             | crate::Ast::Expr::NonNullAssert(_)
-            | crate::Ast::Expr::Elvis { .. }
-            | crate::Ast::Expr::RecordExtend { .. }
-            | crate::Ast::Expr::TypeCast { .. }
-            | crate::Ast::Expr::Atomic(_) => {
+            | crate::Ast::Expr::Elvis { .. } => {
                 self.errors.push(format!(
                     "compile_expr: 尚未实现的 Expr 变体: {:?}",
                     expr
                 ));
                 self.compile_placeholder()
             }
+
+            // 类型转换 `target(expr)` 或安全转换 `target(expr)?`
+            crate::Ast::Expr::TypeCast { target, expr: inner, .. } => {
+                self.compile_type_cast(*target, *inner)
+            }
+
+            // 记录扩展 `(...base, field: value, ...)` → base + updates 输入节点 + RecordExtendInfo
+            crate::Ast::Expr::RecordExtend { base, updates } => {
+                self.compile_record_extend(*base, updates)
+            }
+
+            // 原子构造 `atomic expr` → 单输入节点包装为 AtomicValue
+            crate::Ast::Expr::Atomic(operand) => self.compile_atomic(*operand),
 
             // inline_trait 表达式 → 每方法编译子图 + TraitValue 构造节点
             crate::Ast::Expr::InlineTrait(methods) => self.compile_inline_trait(expr_id, methods),
@@ -3154,9 +3362,11 @@ impl<'a> IrBuilder<'a> {
     /// scrutinee 通过 Gate 的 branch inputs 逐层注入到 wrap 子图的 param 节点，
     /// 使每个 wrap 子图内的 pattern 判别能访问 scrutinee。
     ///
-    /// 最后一个 arm 的判别恒 true（穷尽保证）。
-    /// 本阶段模式支持：Wildcard/Variable → const(true)，Literal → eq(scrutinee, lit)，
-    /// 其他复杂模式保守放行（判别 true）。
+    /// 两阶段编译：
+    /// 1. 从前往后：对每个 arm 编译 pattern 判别 + 变量绑定 + body 子图
+    /// 2. 从后往前：构建 Gate else 链，包装 wrap 子图
+    ///
+    /// 模式变量通过 bind_var 绑定到字段提取节点，body 子图通过帧链穿透访问。
     fn compile_match(
         &mut self,
         scrutinee: crate::Ast::ExprId,
@@ -3168,23 +3378,23 @@ impl<'a> IrBuilder<'a> {
         }
 
         let scrutinee_node = self.compile_subexpr(scrutinee);
+        let n_arms = arms.len();
 
-        // 编译每个 arm 的 body 为子图（捕获外层变量）
-        let arm_body_subgraphs: Vec<(SubGraphId, Vec<NodeId>)> = arms
-            .iter()
-            .map(|arm| self.compile_branch_subgraph(arm.body))
-            .collect();
+        // 第一阶段：从前往后编译每个 arm 的 pattern + body
+        struct ArmData {
+            wrap_start: u32,
+            scrutinee_in_frame: NodeId,
+            cond_node: NodeId,
+            body_sg: SubGraphId,
+            body_inputs: Vec<NodeId>,
+        }
 
-        // 从最后一个 arm 往前构建 Gate 链。
-        // pending_else_sg：上一个迭代（i+1）创建的 wrap 子图，作为当前 arm 的 else 分支。
-        let mut pending_else_sg: Option<SubGraphId> = None;
-        let mut result_gate: Option<NodeId> = None;
+        let mut arm_data: Vec<ArmData> = Vec::with_capacity(n_arms);
 
-        for (i, arm) in arms.iter().enumerate().rev() {
+        for (i, arm) in arms.iter().enumerate() {
             let wrap_start = self.graph.nodes.len() as u32;
 
-            // 当前帧的 scrutinee 来源：首个 arm（i==0）在父帧直接用 scrutinee_node；
-            // 其余 arm 在 wrap 子图内用 param 节点（由 else 分支输入注入）。
+            // scrutinee 来源：i==0 在父帧直接用 scrutinee_node；i>0 用 param 节点
             let scrutinee_in_frame = if i == 0 {
                 scrutinee_node
             } else {
@@ -3197,17 +3407,48 @@ impl<'a> IrBuilder<'a> {
                 })
             };
 
-            let is_last = i == arms.len() - 1;
-            let pattern_node = if is_last {
-                self.compile_bool_const(true)
+            // 进入 scope 绑定模式变量
+            self.enter_scope();
+
+            // 编译 pattern：生成判别节点 + 绑定变量到字段提取节点
+            let pattern_node = self.compile_pattern_match(scrutinee_in_frame, arm.pattern);
+
+            // 守卫条件：pattern_match && guard
+            let cond_node = if let Some(guard) = arm.guard {
+                let guard_node = self.compile_subexpr(guard);
+                self.compile_bool_and(pattern_node, guard_node)
             } else {
-                self.compile_pattern_match(scrutinee_in_frame, arm.pattern)
+                pattern_node
             };
 
-            // false 分支：有 pending_else（来自 i+1）则用之并传入当前帧的 scrutinee；
-            // 否则（最后一个 arm）用 void_sg。
+            // 编译 body 子图（模式变量在 scope 中可查找）
+            let (body_sg, body_inputs) = self.compile_branch_subgraph(arm.body);
+
+            self.exit_scope();
+
+            arm_data.push(ArmData {
+                wrap_start,
+                scrutinee_in_frame,
+                cond_node,
+                body_sg,
+                body_inputs,
+            });
+        }
+
+        // 第二阶段：从后往前构建 Gate else 链
+        let mut pending_else_sg: Option<SubGraphId> = None;
+        let mut result_gate: Option<NodeId> = None;
+
+        for (i, ad) in arm_data.iter().enumerate().rev() {
+            // 所有 arm 都使用 cond_node 作为判别条件。
+            // 这确保 Gate 依赖字段提取节点（通过 cond_node 的依赖链），
+            // 使变量绑定的字段提取节点在 Gate 之前执行。
+            // 最后一个 arm 如果是穷尽匹配（如 _），cond_node 为 true，无额外开销。
+            let pattern_node = ad.cond_node;
+
+            // false 分支：有 pending_else（来自 i+1）则用之并传入当前帧的 scrutinee
             let (false_sg, false_inputs) = match pending_else_sg {
-                Some(else_sg) => (else_sg, vec![scrutinee_in_frame]),
+                Some(else_sg) => (else_sg, vec![ad.scrutinee_in_frame]),
                 None => (self.compile_void_subgraph(), Vec::new()),
             };
 
@@ -3223,34 +3464,31 @@ impl<'a> IrBuilder<'a> {
                 GateBranches {
                     condition_input: pattern_node,
                     branches: vec![
-                        (true, arm_body_subgraphs[i].0, arm_body_subgraphs[i].1.clone()),
+                        (true, ad.body_sg, ad.body_inputs.clone()),
                         (false, false_sg, false_inputs),
                     ],
                 },
             );
 
-            let wrap_end = self.graph.nodes.len() as u32;
-
             if i == 0 {
-                // 首个 arm：Gate 留在父帧，作为 Match 的结果节点
                 result_gate = Some(gate_node);
             } else {
-                // 包装为子图（param_count=1，scrutinee 参数），作为前一个 arm 的 else 分支
+                let wrap_end = self.graph.nodes.len() as u32;
                 let wrap_sg = SubGraphId(self.graph.subgraphs.len() as u32);
                 self.graph.add_subgraph(SubGraph {
                     id: wrap_sg,
-                    node_range: (NodeId(wrap_start), NodeId(wrap_end)),
+                    node_range: (NodeId(ad.wrap_start), NodeId(wrap_end)),
                     param_count: 1,
-                    entry_node: NodeId(wrap_start),
+                    entry_node: NodeId(ad.wrap_start),
                     return_node: gate_node,
                     has_suspend: false,
                     event_source_decls: Vec::new(),
                     defer_table: Vec::new(),
-            loop_kind: LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: self.current_function_id,
-            iter_next_node: None,
+                    loop_kind: LoopKind::None,
+                    loop_parent_sg: None,
+                    cond_node: None,
+                    function_id: self.current_function_id,
+                    iter_next_node: None,
                 });
                 pending_else_sg = Some(wrap_sg);
             }
@@ -3259,7 +3497,7 @@ impl<'a> IrBuilder<'a> {
         result_gate.expect("match must have at least one arm")
     }
 
-    /// 编译 bool 常量节点（Match 最后一个 arm 的穷尽判别用）。
+    /// 编译 bool 常量节点。
     fn compile_bool_const(&mut self, b: bool) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[]);
         let n = self.graph.add_node(Node {
@@ -3272,10 +3510,37 @@ impl<'a> IrBuilder<'a> {
         n
     }
 
-    /// 编译模式匹配判别节点（返回 bool）。
+    /// 编译 bool AND 节点（用于守卫条件 pattern && guard）。
+    fn compile_bool_and(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        let off = self.graph.inputs_pool.push(&[lhs, rhs]);
+        self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 2,
+            inputs_offset: off,
+            compute_fn: ComputeFnId(22), // and_bool
+        })
+    }
+
+    /// 编译 bool OR 节点（用于或模式 p1 | p2）。
+    fn compile_bool_or(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        let off = self.graph.inputs_pool.push(&[lhs, rhs]);
+        self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 2,
+            inputs_offset: off,
+            compute_fn: ComputeFnId(23), // or_bool
+        })
+    }
+
+    /// 编译模式匹配判别节点（返回 bool），同时绑定模式变量到字段提取节点。
     ///
-    /// 本阶段：Wildcard/Variable → const(true)，Literal → eq(scrutinee, lit)，
-    /// 其他复杂模式保守放行（判别 true，留后续阶段）。
+    /// 递归处理所有模式类型：
+    /// - Wildcard/Variable → const(true)，Variable 绑定变量到 scrutinee
+    /// - Literal → eq(scrutinee, lit)，按类型选择 compute_fn
+    /// - Constructor → 构造器名判别 + 递归子模式
+    /// - Record → 字段提取 + 递归子模式
+    /// - OrPattern → left_match || right_match
+    /// - Guard → pattern_match && condition
     fn compile_pattern_match(
         &mut self,
         scrutinee_node: NodeId,
@@ -3283,36 +3548,199 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let pattern = self.current_module().arena.pattern(pattern_id);
         match &pattern.node {
-            crate::Ast::Pattern::Wildcard | crate::Ast::Pattern::Variable { .. } => {
+            crate::Ast::Pattern::Wildcard => self.compile_bool_const(true),
+            crate::Ast::Pattern::Variable { name } => {
+                self.bind_var(name, scrutinee_node);
                 self.compile_bool_const(true)
             }
             crate::Ast::Pattern::Literal(pl) => {
-                // 字面量模式：eq(scrutinee, lit)
+                self.compile_pattern_literal_match(scrutinee_node, pl)
+            }
+            crate::Ast::Pattern::Constructor { name, patterns } => {
+                self.compile_pattern_constructor(scrutinee_node, name, patterns)
+            }
+            crate::Ast::Pattern::Record { fields } => {
+                self.compile_pattern_record(scrutinee_node, fields)
+            }
+            crate::Ast::Pattern::OrPattern { left, right } => {
+                let left_match = self.compile_pattern_match(scrutinee_node, *left);
+                let right_match = self.compile_pattern_match(scrutinee_node, *right);
+                self.compile_bool_or(left_match, right_match)
+            }
+            crate::Ast::Pattern::Guard { pattern, condition } => {
+                let pattern_match = self.compile_pattern_match(scrutinee_node, *pattern);
+                let cond_node = self.compile_subexpr(*condition);
+                self.compile_bool_and(pattern_match, cond_node)
+            }
+        }
+    }
+
+    /// 编译字面量模式判别节点。
+    fn compile_pattern_literal_match(
+        &mut self,
+        scrutinee_node: NodeId,
+        pl: &crate::Ast::PatternLiteral,
+    ) -> NodeId {
+        match pl {
+            crate::Ast::PatternLiteral::Null => {
+                // null 判别：compute_is_null（idx 34）
+                let off = self.graph.inputs_pool.push(&[scrutinee_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 1,
+                    inputs_offset: off,
+                    compute_fn: ComputeFnId(34),
+                })
+            }
+            crate::Ast::PatternLiteral::String(s) => {
+                // 字符串判别：compute_pattern_str_eq（idx 276）
+                let str_node = self.compile_str_const(s);
+                let off = self.graph.inputs_pool.push(&[scrutinee_node, str_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn: ComputeFnId(276),
+                })
+            }
+            crate::Ast::PatternLiteral::Int(s) => {
+                let lit_node = self.compile_pattern_literal(pl);
+                let compute_fn = self.select_literal_eq_fn(s, false);
+                let off = self.graph.inputs_pool.push(&[scrutinee_node, lit_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn,
+                })
+            }
+            crate::Ast::PatternLiteral::Float(s) => {
                 let lit_node = self.compile_pattern_literal(pl);
                 let off = self.graph.inputs_pool.push(&[scrutinee_node, lit_node]);
                 self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
                     input_count: 2,
                     inputs_offset: off,
-                    // 默认 eq_i32（索引 8），字面量类型差异留后续阶段特化
-                    compute_fn: ComputeFnId(8),
+                    compute_fn: ComputeFnId(16), // eq_f64
                 })
             }
-            // 其他复杂模式本阶段保守放行（判别 true）
-            _ => self.compile_bool_const(true),
+            crate::Ast::PatternLiteral::Bool(b) => {
+                let lit_node = self.compile_pattern_literal(pl);
+                let off = self.graph.inputs_pool.push(&[scrutinee_node, lit_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn: ComputeFnId(27), // eq_bool
+                })
+            }
+            crate::Ast::PatternLiteral::Char(c) => {
+                let lit_node = self.compile_pattern_literal(pl);
+                let off = self.graph.inputs_pool.push(&[scrutinee_node, lit_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn: ComputeFnId(8), // eq_i32 (char 存为 i32)
+                })
+            }
         }
+    }
+
+    /// 选择整数字面量相等判别的 compute_fn。
+    fn select_literal_eq_fn(&self, s: &str, _is_unsigned: bool) -> ComputeFnId {
+        // 检查后缀
+        if let Some(suffix) = s.find(|c: char| c.is_ascii_alphabetic()) {
+            let suffix_str = &s[suffix..];
+            return match suffix_str {
+                "i64" | "u64" | "isize" | "usize" => ComputeFnId(55), // eq_i64
+                "i128" | "u128" => ComputeFnId(69),                    // eq_i128
+                _ => ComputeFnId(8),                                    // eq_i32
+            };
+        }
+        ComputeFnId(8) // eq_i32 默认
+    }
+
+    /// 编译构造器模式：构造器名判别 + 递归子模式。
+    fn compile_pattern_constructor(
+        &mut self,
+        scrutinee_node: NodeId,
+        name: &str,
+        patterns: &[crate::Ast::PatternRef],
+    ) -> NodeId {
+        // 构造器名判别节点
+        let ctor_match_off = self.graph.inputs_pool.push(&[scrutinee_node]);
+        let ctor_match_node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 1,
+            inputs_offset: ctor_match_off,
+            compute_fn: ComputeFnId(274), // pattern_ctor_match
+        });
+        self.graph.set_pattern_ctor_name(ctor_match_node, name.to_string());
+
+        // 递归处理子模式：提取字段 + 判别
+        let mut result = ctor_match_node;
+        for (i, &sub_pattern_id) in patterns.iter().enumerate() {
+            // 字段提取节点（按位置）
+            let field_get_off = self.graph.inputs_pool.push(&[scrutinee_node]);
+            let field_get_node = self.graph.add_node(Node {
+                kind: NodeKind::BinOp,
+                input_count: 1,
+                inputs_offset: field_get_off,
+                compute_fn: ComputeFnId(275), // pattern_adt_field_get
+            });
+            self.graph.set_pattern_field_index(field_get_node, i as u16);
+
+            // 递归编译子模式（可能绑定变量）
+            let sub_match = self.compile_pattern_match(field_get_node, sub_pattern_id);
+
+            // result = result && sub_match
+            result = self.compile_bool_and(result, sub_match);
+        }
+
+        result
+    }
+
+    /// 编译记录模式：字段提取 + 递归子模式。
+    fn compile_pattern_record(
+        &mut self,
+        scrutinee_node: NodeId,
+        fields: &[crate::Ast::PatternRecordField<'_>],
+    ) -> NodeId {
+        let mut result = self.compile_bool_const(true);
+
+        for field in fields.iter() {
+            // 字段提取节点（按名访问，复用 compute_record_field_get idx 30）
+            let field_get_off = self.graph.inputs_pool.push(&[scrutinee_node]);
+            let field_get_node = self.graph.add_node(Node {
+                kind: NodeKind::FieldAccess,
+                input_count: 1,
+                inputs_offset: field_get_off,
+                compute_fn: ComputeFnId(30), // record_field_get
+            });
+            self.graph.set_field_set_name(field_get_node, field.name.to_string());
+
+            // 递归编译子模式
+            let sub_match = self.compile_pattern_match(field_get_node, field.pattern);
+
+            result = self.compile_bool_and(result, sub_match);
+        }
+
+        result
     }
 
     /// 编译字面量模式为 Const 节点。
     fn compile_pattern_literal(&mut self, pl: &crate::Ast::PatternLiteral) -> NodeId {
         let const_val = match pl {
-            crate::Ast::PatternLiteral::Int(s) => s.parse::<i32>().ok().map(ConstValue::I32),
+            crate::Ast::PatternLiteral::Int(s) => {
+                // 去除后缀再解析
+                let digits: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+').collect();
+                digits.parse::<i32>().ok().map(ConstValue::I32)
+            }
             crate::Ast::PatternLiteral::Float(s) => s.parse::<f64>().ok().map(ConstValue::F64),
             crate::Ast::PatternLiteral::Bool(b) => Some(ConstValue::Bool(*b)),
             crate::Ast::PatternLiteral::String(_) => {
-                // Str 常量需 'static，模式串来自 arena 非静态
-                // 本阶段字符串模式判别保守放行，留后续阶段
-                Some(ConstValue::Bool(true))
+                Some(ConstValue::Bool(true)) // 占位，实际用 compile_str_const
             }
             crate::Ast::PatternLiteral::Char(c) => Some(ConstValue::I32(*c as i32)),
             crate::Ast::PatternLiteral::Null => Some(ConstValue::Null),
@@ -3325,6 +3753,20 @@ impl<'a> IrBuilder<'a> {
             compute_fn: ComputeFnId(0),
         });
         self.graph.const_values[n.0 as usize] = const_val;
+        n
+    }
+
+    /// 编译字符串常量节点（用于模式匹配的字符串字面量）。
+    fn compile_str_const(&mut self, s: &str) -> NodeId {
+        let static_s: &'static str = Box::leak(s.to_string().into_boxed_str());
+        let inputs_offset = self.graph.inputs_pool.push(&[]);
+        let n = self.graph.add_node(Node {
+            kind: NodeKind::Const,
+            input_count: 0,
+            inputs_offset,
+            compute_fn: ComputeFnId(0),
+        });
+        self.graph.const_values[n.0 as usize] = Some(ConstValue::Str(static_s));
         n
     }
 
@@ -3343,26 +3785,19 @@ impl<'a> IrBuilder<'a> {
     /// 类型族：按整数宽度分派到 i32/i64/i128 路径（仅用于比较运算，结果为 bool）。
     /// i8/i16/u8/u16/u32/char → I32 路径；i64/u64/isize/usize → I64 路径；i128/u128 → I128 路径。
     fn int_family(ty_name: &str) -> &'static str {
-        match ty_name {
-            "i128" | "u128" => "i128",
-            "i64" | "u64" | "isize" | "usize" => "i64",
-            _ => "i32", // i8/i16/i32/u8/u16/u32/char 及未知整数
+        match TYPE_TABLE.iter().find(|e| e.name == ty_name) {
+            Some(e) => e.family,
+            None => "i32", // 未知整数类型回退到 i32 路径
         }
     }
 
-    /// 算术/位运算 compute_fn 查表：按具体类型名返回 (add, sub, mul, div, mod, bitand, bitor, bitxor, shl, shr) 基址。
-    /// 整数类型每 12 个连续索引；浮点类型每 6 个连续索引（无位运算）。
-    /// 返回 None 表示该类型不支持该运算类别（如浮点位运算）。
+    /// 算术/位运算 compute_fn 查表：按具体类型名返回算术基址。
+    /// 整数类型每 12 个连续索引（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）；
+    /// 浮点类型每 6 个连续索引（add/sub/mul/div/mod/neg，无位运算）。
+    /// 返回 None 表示该类型不支持算术运算。
+    /// 基址来自 TYPE_TABLE 常量，与 compute_fn_table! 的索引单点同步。
     fn arith_base(ty_name: &str) -> Option<u32> {
-        // 整数：12 运算/类型，从 92 开始
-        // 浮点：6 运算/类型，从 236 开始
-        match ty_name {
-            "i8" => Some(92), "i16" => Some(104), "i32" => Some(116), "i64" => Some(128),
-            "i128" => Some(140), "u8" => Some(152), "u16" => Some(164), "u32" => Some(176),
-            "u64" => Some(188), "u128" => Some(200), "isize" => Some(212), "usize" => Some(224),
-            "f16" => Some(236), "f32" => Some(242), "f64" => Some(248), "f128" => Some(254),
-            _ => None,
-        }
+        TYPE_TABLE.iter().find(|e| e.name == ty_name).map(|e| e.arith_base)
     }
 
     /// 根据 op + 表达式类型选择 compute_fn id。
@@ -3372,7 +3807,8 @@ impl<'a> IrBuilder<'a> {
         lhs_expr: crate::Ast::ExprId,
     ) -> ComputeFnId {
         let ty_name = self.expr_type_name(lhs_expr).unwrap_or("i32");
-        let is_float = matches!(ty_name, "f16" | "f32" | "f64" | "f128");
+        let ty_entry = TYPE_TABLE.iter().find(|e| e.name == ty_name);
+        let is_float = ty_entry.map(|e| e.is_float).unwrap_or(false);
         let is_int = !is_float && ty_name != "bool";
         let base = Self::arith_base(ty_name);
 
@@ -3479,7 +3915,7 @@ impl<'a> IrBuilder<'a> {
         operand_expr: crate::Ast::ExprId,
     ) -> ComputeFnId {
         let ty_name = self.expr_type_name(operand_expr).unwrap_or("i32");
-        let is_float = matches!(ty_name, "f16" | "f32" | "f64" | "f128");
+        let is_float = TYPE_TABLE.iter().find(|e| e.name == ty_name).map(|e| e.is_float).unwrap_or(false);
         let base = Self::arith_base(ty_name);
         match op {
             crate::Ast::UnaryOp::Not => ComputeFnId(24), // not_bool
@@ -3540,7 +3976,7 @@ impl<'a> IrBuilder<'a> {
 
         let ty = self.expr_type_name(lhs_expr)?;
         let tag = Self::ty_name_to_scalar_tag(ty)?;
-        let is_float = matches!(ty, "f16" | "f32" | "f64" | "f128");
+        let is_float = TYPE_TABLE.iter().find(|e| e.name == ty).map(|e| e.is_float).unwrap_or(false);
 
         let batch_op = match op {
             BinaryOp::Add => BatchOp::Bin(VBinOp::Add),
@@ -3579,7 +4015,7 @@ impl<'a> IrBuilder<'a> {
 
         let ty = self.expr_type_name(operand_expr)?;
         let tag = Self::ty_name_to_scalar_tag(ty)?;
-        let is_float = matches!(ty, "f16" | "f32" | "f64" | "f128");
+        let is_float = TYPE_TABLE.iter().find(|e| e.name == ty).map(|e| e.is_float).unwrap_or(false);
 
         let batch_op = match op {
             UnaryOp::Neg => BatchOp::Unary(VUnaryOp::Neg),
@@ -3590,36 +4026,18 @@ impl<'a> IrBuilder<'a> {
         Some(BatchInfo { tag, op: batch_op })
     }
 
-    /// 类型名 → ScalarTag 映射（仅标量类型可批量化）。
+    /// 类型名 → ScalarTag 映射（从 TYPE_TABLE 查表，仅标量类型可批量化）。
     fn ty_name_to_scalar_tag(ty: &str) -> Option<crate::Value::ScalarTag> {
-        use crate::Value::ScalarTag;
-        Some(match ty {
-            "i8" => ScalarTag::I8,
-            "i16" => ScalarTag::I16,
-            "i32" => ScalarTag::I32,
-            "i64" => ScalarTag::I64,
-            "i128" => ScalarTag::I128,
-            "u8" => ScalarTag::U8,
-            "u16" => ScalarTag::U16,
-            "u32" => ScalarTag::U32,
-            "u64" => ScalarTag::U64,
-            "u128" => ScalarTag::U128,
-            "f32" => ScalarTag::F32,
-            "f64" => ScalarTag::F64,
-            "bool" => ScalarTag::Bool,
-            "char" => ScalarTag::Char,
-            "isize" => ScalarTag::Isize,
-            "usize" => ScalarTag::Usize,
-            "f16" => ScalarTag::F16,
-            "f128" => ScalarTag::F128,
-            _ => return None,
-        })
+        TYPE_TABLE.iter().find(|e| e.name == ty).map(|e| e.tag)
     }
 
     /// 编译 cast 调用：__cast_to<T>(x) / __cast_try_to<T>(x)。
     ///
-    /// 从 type_args 获取目标类型名 T，从 args[0] 的 Sema 类型获取源类型名 S，
-    /// 通过 `cast_mangled_name` 注册表解析为具体函数名并调用。
+    /// 通用路径：
+    ///   - 标量 → str：compute_cast_to_str 单节点（idx 277），覆盖所有整数/浮点/bool/char
+    ///   - 标量 → 标量：compute_cast_scalar 单节点（idx 278），覆盖所有整数/浮点互转
+    /// 特殊路径（FFI）：
+    ///   - u8[]/bytes → str：仍走 cast_mangled_name 查 SPECIAL_CAST_PAIRS
     fn compile_cast_call(
         &mut self,
         _name: &str,
@@ -3640,11 +4058,112 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or("i64");
 
         // 获取源类型名（从 Sema expr_types）
-        let source_ty = self.expr_type_name(args[0]).unwrap_or("i64");
+        let source_ty = self.expr_type_name(args[0]).unwrap_or("i64").to_string();
 
-        // 注册表驱动：特殊转换对查表，其余按默认 __cast_{S}_to_{T} 命名
-        let mangled = cast_mangled_name(source_ty, target_ty);
-        self.compile_simple_call(&mangled, args)
+        let input = self.compile_subexpr(args[0]);
+
+        // 通用路径 1：任意类型 → str
+        if target_ty == "str" {
+            let inputs_offset = self.graph.inputs_pool.push(&[input]);
+            return self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count: 1,
+                inputs_offset,
+                compute_fn: ComputeFnId(277), // compute_cast_to_str
+            });
+        }
+
+        // 通用路径 2：标量 → 标量（int↔int, int↔float, float↔float, bool↔int, char↔int）
+        if Self::ty_name_to_scalar_tag(&source_ty).is_some()
+            && Self::ty_name_to_scalar_tag(target_ty).is_some()
+        {
+            let inputs_offset = self.graph.inputs_pool.push(&[input]);
+            let node = self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count: 1,
+                inputs_offset,
+                compute_fn: ComputeFnId(278), // compute_cast_scalar
+            });
+            self.graph.set_cast_target_type(node, target_ty.to_string());
+            return node;
+        }
+
+        // 特殊路径：u8[]/bytes → str 等 FFI cast
+        let mangled = cast_mangled_name(&source_ty, target_ty);
+        let inputs_offset = self.graph.inputs_pool.push(&[input]);
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: 1,
+            inputs_offset,
+            compute_fn: ComputeFnId(36), // compute_call_launch
+        });
+        if let Some(&target_sg) = self.func_subgraphs.get(mangled.as_str()) {
+            self.graph.set_call_target(call_node, target_sg);
+        }
+        call_node
+    }
+
+    /// 编译类型转换表达式 `target(expr)`：与 `cast(expr).to(target)` 共用通用 cast 路径。
+    ///
+    /// 从 TypeRef 获取目标类型名，从 Sema 获取源类型名，分派到：
+    ///   - compute_cast_to_str（idx 277）：任意 → str
+    ///   - compute_cast_scalar（idx 278）：标量 → 标量
+    ///   - FFI cast：u8[]/bytes → str 等特殊转换
+    fn compile_type_cast(
+        &mut self,
+        target: crate::Ast::TypeRef,
+        expr: crate::Ast::ExprRef,
+    ) -> NodeId {
+        let target_ty = {
+            let spanned = &self.current_module().arena.types[target.0 as usize];
+            if let crate::Ast::TypeNode::Named { name } = &spanned.node {
+                *name
+            } else {
+                "i64"
+            }
+        };
+        let source_ty = self.expr_type_name(expr).unwrap_or("i64").to_string();
+        let input = self.compile_subexpr(expr);
+
+        // 通用路径 1：任意类型 → str
+        if target_ty == "str" {
+            let inputs_offset = self.graph.inputs_pool.push(&[input]);
+            return self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count: 1,
+                inputs_offset,
+                compute_fn: ComputeFnId(277), // compute_cast_to_str
+            });
+        }
+
+        // 通用路径 2：标量 → 标量
+        if Self::ty_name_to_scalar_tag(&source_ty).is_some()
+            && Self::ty_name_to_scalar_tag(target_ty).is_some()
+        {
+            let inputs_offset = self.graph.inputs_pool.push(&[input]);
+            let node = self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count: 1,
+                inputs_offset,
+                compute_fn: ComputeFnId(278), // compute_cast_scalar
+            });
+            self.graph.set_cast_target_type(node, target_ty.to_string());
+            return node;
+        }
+
+        // 特殊路径：FFI cast
+        let mangled = cast_mangled_name(&source_ty, target_ty);
+        let inputs_offset = self.graph.inputs_pool.push(&[input]);
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: 1,
+            inputs_offset,
+            compute_fn: ComputeFnId(36), // compute_call_launch
+        });
+        if let Some(&target_sg) = self.func_subgraphs.get(mangled.as_str()) {
+            self.graph.set_call_target(call_node, target_sg);
+        }
+        call_node
     }
 
     /// 编译简单函数调用（已知函数名，参数直接传递）。
@@ -4040,11 +4559,13 @@ impl<'a> IrBuilder<'a> {
     /// 尝试 trait 静态分派：recv 类型已知 → witness_table → func_subgraphs。
     ///
     /// 遍历 sema.trait_defs 中所有已注册 trait，对 recv 的 type_id 查询
-    /// witness_table 是否实现了含该 method 的 trait；若命中则用
-    /// "TypeName.method" 形式查找已注册子图。
+    /// witness_table 是否实现了含该 method 的 trait；若类型覆盖了方法则用
+    /// "TypeName.method" 查找子图，否则若 trait 有默认实现则用
+    /// "TraitName.method" 查找默认方法子图。
     fn try_trait_static_dispatch(&self, recv: crate::Ast::ExprId, method: &str) -> Option<SubGraphId> {
         let type_id = self.expr_type_id(recv)?;
         for trait_def in &self.sema.trait_defs {
+            // 优先：类型自身覆盖了方法 → "TypeName.method"
             if let Some(mangled) = self
                 .sema
                 .witness_table
@@ -4054,8 +4575,37 @@ impl<'a> IrBuilder<'a> {
                     return Some(sg);
                 }
             }
+            // 次选：trait 提供默认实现 → "TraitName.method"
+            // witness_table 确认类型实现了该 trait，方法未覆盖时用 trait 默认 body
+            let type_implements_trait = self
+                .sema
+                .witness_table
+                .resolve_method_subgraph_name(&trait_def.name, type_id, method)
+                .is_some()
+                || self.type_implements_trait(type_id, &trait_def.name);
+            if type_implements_trait {
+                let has_default = trait_def.methods.iter().any(|m| {
+                    m.name.as_ref() == method && m.has_body
+                });
+                if has_default {
+                    let default_mangled = format!("{}.{}", trait_def.name, method);
+                    if let Some(&sg) = self.func_subgraphs.get(&default_mangled) {
+                        return Some(sg);
+                    }
+                }
+            }
         }
         None
+    }
+
+    /// 检查类型是否实现了指定 trait（通过 witness_table 查询任意方法槽位）。
+    fn type_implements_trait(&self, type_id: u16, trait_name: &str) -> bool {
+        for entry in self.sema.witness_table.entries().iter() {
+            if entry.trait_name.as_ref() == trait_name && entry.type_id == type_id {
+                return true;
+            }
+        }
+        false
     }
 
     /// 判断 recv 是否是 trait object（需运行时动态分派）。
@@ -4223,6 +4773,48 @@ impl<'a> IrBuilder<'a> {
         node
     }
 
+    /// 编译记录扩展表达式 `(...base, field: value, ...)`。
+    ///
+    /// inputs[0] = base record，inputs[1..] = 更新字段值。
+    /// RecordExtendInfo 存储更新字段名列表（顺序对应 inputs[1..]）。
+    /// 运行时从 base 克隆字段，按更新字段名替换/追加，构造新 RecordValue。
+    fn compile_record_extend(
+        &mut self,
+        base: crate::Ast::ExprId,
+        updates: &[crate::Ast::RecordFieldExpr<'_>],
+    ) -> NodeId {
+        let mut inputs = Vec::with_capacity(1 + updates.len());
+        let mut update_names = Vec::with_capacity(updates.len());
+        inputs.push(self.compile_subexpr(base));
+        for field in updates {
+            inputs.push(self.compile_subexpr(field.value));
+            update_names.push(field.name.to_string());
+        }
+        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: inputs.len() as u8,
+            inputs_offset,
+            compute_fn: ComputeFnId(272), // record_extend
+        });
+        self.graph.set_record_extend_info(node, RecordExtendInfo { update_names });
+        node
+    }
+
+    /// 编译原子构造表达式 `atomic expr`。
+    ///
+    /// 单输入节点，运行时将值包装为 AtomicValue（共享底层内存的原子容器）。
+    fn compile_atomic(&mut self, operand: crate::Ast::ExprId) -> NodeId {
+        let operand_node = self.compile_subexpr(operand);
+        let inputs_offset = self.graph.inputs_pool.push(&[operand_node]);
+        self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 1,
+            inputs_offset,
+            compute_fn: ComputeFnId(273), // atomic_construct
+        })
+    }
+
     /// 编译数组构造表达式。
     fn compile_array_lit(&mut self, elements: &[crate::Ast::ExprRef]) -> NodeId {
         let mut inputs = Vec::with_capacity(elements.len());
@@ -4325,6 +4917,10 @@ impl<'a> IrBuilder<'a> {
                         } else {
                             self.bind_var(name, val_node);
                         }
+                    } else if let Some(slot) = self.lookup_global_var(name) {
+                        // 全局变量 → global_store，返回效果节点确保被调度执行
+                        let store_node = self.compile_global_store(val_node, slot);
+                        return Some(store_node);
                     } else {
                         self.bind_var(name, val_node);
                     }
@@ -4349,9 +4945,14 @@ impl<'a> IrBuilder<'a> {
                 let target_expr = &self.current_module().arena.expr(*target).node;
                 let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
                 if let crate::Ast::Expr::Ident(name) = target_expr {
-                    let cur_node = self
-                        .lookup_var(name)
-                        .unwrap_or_else(|| self.compile_placeholder());
+                    // 读取当前值：局部变量 > 全局变量 > 占位
+                    let cur_node = if let Some(n) = self.lookup_var(name) {
+                        n
+                    } else if let Some(slot) = self.lookup_global_var(name) {
+                        self.compile_global_load(slot)
+                    } else {
+                        self.compile_placeholder()
+                    };
                     let off = self.graph.inputs_pool.push(&[cur_node, val_node]);
                     let raw_result = self.graph.add_node(Node {
                         kind: NodeKind::BinOp,
@@ -4361,7 +4962,12 @@ impl<'a> IrBuilder<'a> {
                     });
                     // 链接 current_effect：防止 continue 后的复合赋值提前执行
                     let result_node = self.chain_effects(self.current_effect, raw_result);
-                    if !self.is_in_current_subgraph(cur_node) {
+                    if self.lookup_global_var(name).is_some() && self.lookup_var(name).is_none() {
+                        // 全局变量 → global_store
+                        let slot = self.lookup_global_var(name).unwrap();
+                        let store_node = self.compile_global_store(result_node, slot);
+                        self.current_effect = Some(store_node);
+                    } else if !self.is_in_current_subgraph(cur_node) {
                         // 外层变量 → WriteBack + 绑定本地引用
                         self.compile_writeback_node(result_node, cur_node);
                         self.bind_var(name, result_node);
@@ -4495,14 +5101,15 @@ impl<'a> IrBuilder<'a> {
             Some(i) => Some(self.builtin_modules[i]),
         };
 
-        let (body_expr, is_async, params) = match module.find_function(name) {
+        let (body_expr, is_async, params, is_entry) = match module.find_function(name) {
             Some(d) => match &d.node {
                 crate::Ast::Decl::FunDecl {
                     body,
                     is_async,
                     params,
+                    is_entry,
                     ..
-                } => (*body, *is_async, params.clone()),
+                } => (*body, *is_async, params.clone(), *is_entry),
                 _ => {
                     self.errors.push(format!("{} is not a function", name));
                     self.compiling_builtin = prev_builtin;
@@ -4542,6 +5149,26 @@ impl<'a> IrBuilder<'a> {
                 compute_fn: ComputeFnId(0),
             });
             self.bind_var(param.name, param_node);
+        }
+
+        // entry 函数：在函数体之前编译顶层 var/val 声明的初始化
+        // 全局变量通过 global_store 写入共享存储区，所有函数通过 global_load 读取
+        if is_entry && !self.top_level_var_decls.is_empty() {
+            let decls: Vec<crate::Ast::StmtId> = std::mem::take(&mut self.top_level_var_decls);
+            for stmt_id in &decls {
+                let stmt = &self.module.arena.stmt(*stmt_id).node;
+                let (name, value_expr) = match stmt {
+                    crate::Ast::Stmt::VarDecl { name, value, .. } => (*name, *value),
+                    crate::Ast::Stmt::ValDecl { name, value, .. } => (*name, *value),
+                    _ => continue,
+                };
+                let init_node = self.compile_subexpr(value_expr);
+                let slot = self.global_var_slots.get(name).copied()
+                    .expect("global var slot must exist after collection");
+                let store_node = self.compile_global_store(init_node, slot);
+                self.current_effect = Some(store_node);
+            }
+            self.top_level_var_decls = decls;
         }
 
         let return_node = {
@@ -4726,7 +5353,81 @@ impl<'a> IrBuilder<'a> {
         self.func_subgraphs.insert(mangled, sg_id);
     }
 
-    /// 完整构建流程：编译 builtin 函数 + 用户函数 + 计算 fan-out。
+    /// 编译 trait 默认方法（用户模块）为子图，mangled name = "TraitName.method"。
+    ///
+    /// trait 默认方法在类型未覆盖时作为分派目标。方法 body 来自 TraitDecl，
+    /// 参数（含 self）编译为占位节点，与 compile_user_method 结构一致。
+    fn compile_trait_default_method(&mut self, trait_name: &str, method_name: &str) {
+        // 在用户模块中查找 TraitDecl 的有 body 方法
+        let found = self.module.declarations.iter().enumerate().find_map(|(decl_i, d)| {
+            if let crate::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
+                if *name == trait_name {
+                    for (method_i, method) in methods.iter().enumerate() {
+                        if method.name == method_name && method.body.is_some() {
+                            return Some((decl_i, method_i));
+                        }
+                    }
+                }
+            }
+            None
+        });
+
+        let (decl_i, method_i) = match found {
+            Some(x) => x,
+            None => return,
+        };
+
+        // 提取方法数据（避免借用冲突）
+        let (body_expr, is_async, params) = {
+            let d = &self.module.declarations[decl_i];
+            if let crate::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
+                if *name == trait_name {
+                    let method = &methods[method_i];
+                    (method.body.unwrap(), method.is_async, method.params.clone())
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        };
+
+        let mangled = format!("{}.{}", trait_name, method_name);
+        let param_count = params.len();
+
+        let sg_id = self.register_subgraph_placeholder(&mangled, param_count as u8, is_async);
+        self.func_subgraphs.insert(mangled.clone(), sg_id);
+        let node_start = self.graph.nodes.len() as u32;
+
+        self.current_function_sg = Some(sg_id);
+        self.current_function_id = sg_id.0;
+        self.enter_scope();
+
+        for param in &params {
+            let inputs_offset = self.graph.inputs_pool.push(&[]);
+            let param_node = self.graph.add_node(Node {
+                kind: NodeKind::Const,
+                input_count: 0,
+                inputs_offset,
+                compute_fn: ComputeFnId(0),
+            });
+            self.bind_var(param.name, param_node);
+        }
+
+        let return_node = self.compile_expr(body_expr);
+        self.exit_scope();
+        self.current_function_sg = None;
+
+        let node_end = self.graph.nodes.len() as u32;
+        let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
+        sg.node_range = (NodeId(node_start), NodeId(node_end));
+        sg.entry_node = NodeId(node_start);
+        sg.return_node = return_node;
+        sg.has_suspend = is_async;
+        sg.function_id = sg_id.0;
+
+        self.func_subgraphs.insert(mangled, sg_id);
+    }
     pub fn build(mut self) -> DataFlowGraph {
         // 0. 预注册所有函数（builtin + 用户）到 func_subgraphs，解决前向引用问题：
         //    函数 A 调用函数 B 时，B 可能尚未编译（未注册到 func_subgraphs），
@@ -4749,6 +5450,27 @@ impl<'a> IrBuilder<'a> {
                     }
                     let sg_id = self.register_subgraph_placeholder(name, params.len() as u8, *is_async);
                     self.func_subgraphs.insert(name.to_string(), sg_id);
+                }
+            }
+        }
+
+        // 0b. 收集用户模块顶层 var/val 声明（ExprDecl 中的 VarDecl/ValDecl stmt），
+        //     分配全局 slot。entry 函数编译时注入初始化代码。
+        //     全局变量存储在 DataFlowGraph.global_var_storage 中，跨函数共享，不依赖帧链。
+        for d in &self.module.declarations {
+            if let crate::Ast::Decl::ExprDecl { stmt: Some(stmt_id), .. } = &d.node {
+                let stmt = &self.module.arena.stmt(*stmt_id).node;
+                if matches!(stmt, crate::Ast::Stmt::VarDecl { name, .. } | crate::Ast::Stmt::ValDecl { name, .. }) {
+                    let name = match stmt {
+                        crate::Ast::Stmt::VarDecl { name, .. } => *name,
+                        crate::Ast::Stmt::ValDecl { name, .. } => *name,
+                        _ => unreachable!(),
+                    };
+                    if !self.global_var_slots.contains_key(name) {
+                        let slot = self.global_var_slots.len() as u32;
+                        self.global_var_slots.insert(name.to_string(), slot);
+                        self.top_level_var_decls.push(*stmt_id);
+                    }
                 }
             }
         }
@@ -4831,6 +5553,28 @@ impl<'a> IrBuilder<'a> {
             self.compile_user_method(type_name, method_name);
         }
 
+        // 2c. 编译用户模块中 TraitDecl 的默认方法（有 body 的方法），
+        //     mangled name = "TraitName.method"，供类型未覆盖时分派。
+        let trait_default_methods: Vec<(String, String)> = self
+            .module
+            .declarations
+            .iter()
+            .flat_map(|d| {
+                if let crate::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
+                    methods
+                        .iter()
+                        .filter(|mt| mt.body.is_some())
+                        .map(|mt| (name.to_string(), mt.name.to_string()))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        for (trait_name, method_name) in &trait_default_methods {
+            self.compile_trait_default_method(trait_name, method_name);
+        }
+
         // 3. 编译用户模块函数
         for name in &fun_names {
             self.compile_function(name);
@@ -4852,6 +5596,13 @@ impl<'a> IrBuilder<'a> {
 
         // 构建期填充计算函数表（运行时按 ComputeFnId 索引调用）
         self.graph.compute_fns = build_compute_fn_table();
+
+        // 初始化全局变量存储区（按 slot count 预分配 Mutex 槽）
+        let global_var_count = self.global_var_slots.len();
+        let storage: Vec<std::sync::Mutex<Option<crate::Value::Value>>> = (0..global_var_count)
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        self.graph.global_var_storage = Arc::new(storage);
 
         // 移入 IR 编译期错误（未实现的特性等），供调用方检查
         self.graph.ir_errors = std::mem::take(&mut self.errors);
