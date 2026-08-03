@@ -445,6 +445,24 @@ fn debug_check(source: &str, filename: &str) {
         .collect();
     ctx.register_module_aliases(root_env, &module_logical_paths);
 
+    // 预扫描：先 predeclare 所有模块的函数和类型构造器到 root_env，
+    // 解决模块间前向引用问题（如 SystemTime.glue 引用 Calendar.glue 的函数，
+    // 但 Calendar 在 STD_FILES 中位于 SystemTime 之后）。
+    // check_module_with_env 内部会再次 predeclare 当前模块（幂等，重复注册无害）。
+    for (_, m) in loader.builtin_modules() {
+        ctx.predeclare_declarations(m, root_env);
+    }
+    for key in &std_keys {
+        if let Some(m) = loader.get_module_by_key(key) {
+            ctx.predeclare_declarations(m, root_env);
+        }
+    }
+    for k in &dep_keys {
+        if let Some(m) = loader.get_module_by_key(k) {
+            ctx.predeclare_declarations(m, root_env);
+        }
+    }
+
     let mut prev_err_len = 0usize;
 
     for (path, m) in loader.builtin_modules() {
@@ -615,9 +633,20 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
     }
 
     // 4. IR 编译
-    let builtin_modules: Vec<&_> = loader.builtin_modules().map(|(_, m)| m).collect();
+    // 收集所有非 entry 模块（builtin + std + dep），传给 IR builder 编译为子图
+    let mut non_entry_modules: Vec<&_> = loader.builtin_modules().map(|(_, m)| m).collect();
+    for key in &std_keys {
+        if let Some(m) = loader.get_module_by_key(key) {
+            non_entry_modules.push(m);
+        }
+    }
+    for k in &dep_keys {
+        if let Some(m) = loader.get_module_by_key(k) {
+            non_entry_modules.push(m);
+        }
+    }
     let graph = IrBuilder::new(&sema_result, &entry_module)
-        .with_builtins(builtin_modules)
+        .with_builtins(non_entry_modules)
         .build();
 
     // 检查 IR 编译错误（未实现的特性降级、找不到函数等）
@@ -625,6 +654,12 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
         for err in &graph.ir_errors {
             eprintln!("{}: IR error: {}", entry_path, err);
         }
+        process::exit(1);
+    }
+
+    // 检查入口子图：无 main 函数时优雅报错，避免 Engine panic
+    if graph.entry_subgraph.is_none() {
+        eprintln!("error: no entry point found in {} (expected a `main` function)", entry_path);
         process::exit(1);
     }
 

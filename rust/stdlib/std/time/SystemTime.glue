@@ -13,7 +13,46 @@ pub type TimeComponents = TimeComponents(year: i32, month: u8, day: u8, hour: u8
 
 // ─── SystemTime ────────────────────────────────────────────────────
 
-pub type SystemTime = SystemTime(nanos: i128)
+pub type SystemTime = SystemTime(nanos: i128) {
+    // ─── 加减 Duration ─────────────────────────────────────────────────
+
+    pub fun add_duration(self, d: Duration): SystemTime {
+        SystemTime(self.nanos + d.nanos)
+    }
+
+    pub fun sub_duration(self, d: Duration): SystemTime {
+        SystemTime(self.nanos - d.nanos)
+    }
+
+    // self 相对 earlier 的时间长度
+    pub fun duration_since(self, earlier: SystemTime): Duration {
+        Duration(self.nanos - earlier.nanos)
+    }
+
+    // ─── 与 DateTime 转换 ──────────────────────────────────────────────
+
+    // 转换为本地时区的 DateTime
+    pub fun to_local(self): DateTime {
+        val comp = to_local_components(self.nanos)
+        DateTime.from_components(comp)
+    }
+
+    // 转换为 UTC 的 DateTime
+    pub fun to_utc(self): DateTime {
+        val comp = to_utc_components(self.nanos)
+        DateTime.from_components(comp)
+    }
+
+    // ─── 比较 ──────────────────────────────────────────────────────────
+
+    pub fun is_before(self, other: SystemTime): bool {
+        self.nanos < other.nanos
+    }
+
+    pub fun is_after(self, other: SystemTime): bool {
+        self.nanos > other.nanos
+    }
+}
 
 // Unix 纪元（1970-01-01 00:00:00 UTC）
 pub val UNIX_EPOCH: SystemTime = SystemTime(0)
@@ -21,21 +60,6 @@ pub val UNIX_EPOCH: SystemTime = SystemTime(0)
 // 获取当前墙钟时间
 pub fun now(): SystemTime {
     SystemTime(__systemtime_now_ns())
-}
-
-// ─── 加减 Duration ─────────────────────────────────────────────────
-
-pub fun add_duration(self: SystemTime, d: Duration): SystemTime {
-    SystemTime(self.nanos + d.nanos)
-}
-
-pub fun sub_duration(self: SystemTime, d: Duration): SystemTime {
-    SystemTime(self.nanos - d.nanos)
-}
-
-// self 相对 earlier 的时间长度
-pub fun duration_since(self: SystemTime, earlier: SystemTime): Duration {
-    Duration(self.nanos - earlier.nanos)
 }
 
 // ─── 纯 Glue 时间分量转换（替代原 syscall 实现） ─────────────────
@@ -117,34 +141,10 @@ pub fun components_to_ns_utc(comp: TimeComponents): Throw<i128, TimeError> {
     Ok(ns)
 }
 
-// ─── 与 DateTime 转换 ──────────────────────────────────────────────
-
-// 转换为本地时区的 DateTime
-pub fun to_local(self: SystemTime): DateTime {
-    val comp = to_local_components(self.nanos)
-    DateTime.from_components(comp)
-}
-
-// 转换为 UTC 的 DateTime
-pub fun to_utc(self: SystemTime): DateTime {
-    val comp = to_utc_components(self.nanos)
-    DateTime.from_components(comp)
-}
-
 // 从 UTC DateTime 构造 SystemTime（验证字段合法性）
 // 失败时返回 TimeError（字段越界 / 时间超出 1970 年后范围）
 pub fun from_datetime_utc(dt: DateTime): Throw<SystemTime, TimeError> {
     val comp = dt.to_components()
     val ns = components_to_ns_utc(comp)?
     SystemTime(ns)
-}
-
-// ─── 比较 ──────────────────────────────────────────────────────────
-
-pub fun is_before(self: SystemTime, other: SystemTime): bool {
-    self.nanos < other.nanos
-}
-
-pub fun is_after(self: SystemTime, other: SystemTime): bool {
-    self.nanos > other.nanos
 }

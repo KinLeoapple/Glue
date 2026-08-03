@@ -9,7 +9,85 @@
 // - 绝对性：检测首字符是否为 '/'
 // - 路径拼接：segments 数组拼接 + 绝对性继承
 
-pub type Path = Path(segments: str[], is_absolute: bool)
+pub type Path = Path(segments: str[], is_absolute: bool) {
+    // ─── 转换 ──────────────────────────────────────────────────────────
+
+    pub fun to_str(self): str {
+        join_segments_to_str(self.segments, self.is_absolute)
+    }
+
+    // ─── 拼接 ──────────────────────────────────────────────────────────
+
+    pub fun join(self, other: Path): Path {
+        Path(self.segments ++ other.segments, self.is_absolute)
+    }
+
+    pub fun join_str(self, other: str): Path {
+        self.join(path_from(other))
+    }
+
+    // ─── 路径分解 ──────────────────────────────────────────────────────
+
+    // 父目录：去掉最后一段。根路径或空 segments 返回 null
+    pub fun parent(self): Path? {
+        val len = self.segments.len()
+        if len == 0 {
+            null
+        } else {
+            val parent_segs = self.segments[0..len - 1]
+            Path(parent_segs, self.is_absolute)
+        }
+    }
+
+    // 末尾段（文件名）。空 segments 返回 null
+    pub fun filename(self): str? {
+        val len = self.segments.len()
+        if len == 0 {
+            null
+        } else {
+            self.segments[len - 1]
+        }
+    }
+
+    // 扩展名（不含点）。无点或点在首位返回 null
+    pub fun extension(self): str? {
+        val fname = self.filename()
+        match fname {
+            null => null,
+            name => {
+                val dot = std.io.Path.last_index_of(name, '.')
+                if dot <= 0 {
+                    null
+                } else {
+                    val dot_idx = cast(dot).to(usize)
+                    name[dot_idx + 1..name.len()]
+                }
+            },
+        }
+    }
+
+    // 文件名（去扩展名）。无点返回完整 filename
+    pub fun file_stem(self): str? {
+        match self.filename() {
+            null => null,
+            name => {
+                val dot = last_index_of(name, '.')
+                if dot <= 0 {
+                    name
+                } else {
+                    val dot_idx = cast(dot).to(usize)
+                    name[0..dot_idx]
+                }
+            },
+        }
+    }
+
+    // ─── 查询 ──────────────────────────────────────────────────────────
+
+    pub fun is_absolute_path(self): bool { self.is_absolute }
+
+    pub fun is_relative_path(self): bool { !self.is_absolute }
+}
 
 // ─── 辅助函数 ─────────────────────────────────────────────────────
 
@@ -108,81 +186,3 @@ pub fun path_from(s: str): Path {
     val abs = normalized.len() > 0 && normalized[0] == '/'
     Path(parts, abs)
 }
-
-// ─── 转换 ──────────────────────────────────────────────────────────
-
-pub fun to_str(self: Path): str {
-    join_segments_to_str(self.segments, self.is_absolute)
-}
-
-// ─── 拼接 ──────────────────────────────────────────────────────────
-
-pub fun join(self: Path, other: Path): Path {
-    Path(self.segments ++ other.segments, self.is_absolute)
-}
-
-pub fun join_str(self: Path, other: str): Path {
-    self.join(path_from(other))
-}
-
-// ─── 路径分解 ──────────────────────────────────────────────────────
-
-// 父目录：去掉最后一段。根路径或空 segments 返回 null
-pub fun parent(self: Path): Path? {
-    val len = self.segments.len()
-    if len == 0 {
-        null
-    } else {
-        val parent_segs = self.segments[0..len - 1]
-        Path(parent_segs, self.is_absolute)
-    }
-}
-
-// 末尾段（文件名）。空 segments 返回 null
-pub fun filename(self: Path): str? {
-    val len = self.segments.len()
-    if len == 0 {
-        null
-    } else {
-        self.segments[len - 1]
-    }
-}
-
-// 扩展名（不含点）。无点或点在首位返回 null
-pub fun extension(self: Path): str? {
-    val fname = self.filename()
-    match fname {
-        null => null,
-        name => {
-            val dot = std.io.Path.last_index_of(name, '.')
-            if dot <= 0 {
-                null
-            } else {
-                val dot_idx = cast(dot).to(usize)
-                name[dot_idx + 1..name.len()]
-            }
-        },
-    }
-}
-
-// 文件名（去扩展名）。无点返回完整 filename
-pub fun file_stem(self: Path): str? {
-    match self.filename() {
-        null => null,
-        name => {
-            val dot = last_index_of(name, '.')
-            if dot <= 0 {
-                name
-            } else {
-                val dot_idx = cast(dot).to(usize)
-                name[0..dot_idx]
-            }
-        },
-    }
-}
-
-// ─── 查询 ──────────────────────────────────────────────────────────
-
-pub fun is_absolute_path(self: Path): bool { self.is_absolute }
-
-pub fun is_relative_path(self: Path): bool { !self.is_absolute }

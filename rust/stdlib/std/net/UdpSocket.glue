@@ -60,7 +60,53 @@ fun __net_udp_send_to(fd: i64, ip: IpAddr, port: u16, buf: u8[]): Throw<usize, I
 pub type RecvFromResult = RecvFromResult(data: u8[], src_addr: SocketAddr)
 
 // UdpSocket：newtype，fd 跨平台 i64 存储句柄
-pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool)
+pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool) {
+    // 返回绑定地址（构造时传入的本地地址）
+    pub fun local_addr(self): SocketAddr {
+        self.local_addr
+    }
+
+    // 向目标地址发送 UDP 数据报。返回实际发送字节数。
+    // send_to 直接使用 buf 的完整长度（syscall 无 len 参数）。
+    pub async fun send_to(self, dst: SocketAddr, buf: u8[]): Async<Throw<usize, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "socket closed", 0, null)
+        }
+        __net_udp_send_to(self.fd, dst.ip, dst.port, buf)?
+    }
+
+    // 接收 UDP 数据报。返回 RecvFromResult(data, src_addr)。
+    // 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
+    // 注意：__net_udp_recv_from_v4/v6 当前不返回 src_addr，需要额外调用获取发送方地址。
+    // 暂用 local_addr 作为占位，后续 syscall 层补 recvfrom 的 src_addr 输出参数。
+    // 按 local_addr.ip 的 family 分派到对应原语（socket 创建时 family 已固定）。
+    pub async fun recv_from(self, len: usize): Async<Throw<RecvFromResult, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "socket closed", 0, null)
+        }
+        val buf: u8[] = [0u8] * len
+        val n = match self.local_addr.ip {
+            V4(_) => __net_udp_recv_from_v4(self.fd, buf, len),
+            V6(_) => __net_udp_recv_from_v6(self.fd, buf, len),
+        }
+        if n < 0 {
+            throw IOError(ConnectionReset, "udp recv_from failed", 0, null)
+        }
+        Ok(RecvFromResult(buf[0..cast(n).to(usize)], self.local_addr))
+    }
+
+    // 关闭套接字。幂等：重复 close 不报错。
+    // UDP 套接字复用 __net_tcp_close（底层都是 close(fd)）。
+    pub async fun close(self): Async<Throw<void, IOError>> {
+        if self.is_closed {
+            Ok(void)
+        } else {
+            self.is_closed = true
+            __net_tcp_close(self.fd)?
+            Ok(void)
+        }
+    }
+}
 
 // ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
 
@@ -68,52 +114,4 @@ pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool)
 pub async fun bind(addr: SocketAddr, reuse_addr: bool): Async<Throw<UdpSocket, IOError>> {
     val fd = __net_udp_bind(addr.ip, addr.port, reuse_addr)?
     Ok(UdpSocket(fd, addr, false))
-}
-
-// ─── 实例方法（self : UdpSocket） ─────────────────────────────────
-
-// 向目标地址发送 UDP 数据报。返回实际发送字节数。
-// send_to 直接使用 buf 的完整长度（syscall 无 len 参数）。
-pub async fun send_to(self: UdpSocket, dst: SocketAddr, buf: u8[]): Async<Throw<usize, IOError>> {
-    if self.is_closed {
-        throw IOError(InvalidInput, "socket closed", 0, null)
-    }
-    __net_udp_send_to(self.fd, dst.ip, dst.port, buf)?
-}
-
-// 接收 UDP 数据报。返回 RecvFromResult(data, src_addr)。
-// 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
-// 注意：__net_udp_recv_from_v4/v6 当前不返回 src_addr，需要额外调用获取发送方地址。
-// 暂用 local_addr 作为占位，后续 syscall 层补 recvfrom 的 src_addr 输出参数。
-// 按 local_addr.ip 的 family 分派到对应原语（socket 创建时 family 已固定）。
-pub async fun recv_from(self: UdpSocket, len: usize): Async<Throw<RecvFromResult, IOError>> {
-    if self.is_closed {
-        throw IOError(InvalidInput, "socket closed", 0, null)
-    }
-    val buf: u8[] = [0u8] * len
-    val n = match self.local_addr.ip {
-        V4(_) => __net_udp_recv_from_v4(self.fd, buf, len),
-        V6(_) => __net_udp_recv_from_v6(self.fd, buf, len),
-    }
-    if n < 0 {
-        throw IOError(ConnectionReset, "udp recv_from failed", 0, null)
-    }
-    Ok(RecvFromResult(buf[0..cast(n).to(usize)], self.local_addr))
-}
-
-// 关闭套接字。幂等：重复 close 不报错。
-// UDP 套接字复用 __net_tcp_close（底层都是 close(fd)）。
-pub async fun close(self: UdpSocket): Async<Throw<void, IOError>> {
-    if self.is_closed {
-        Ok(void)
-    } else {
-        self.is_closed = true
-        __net_tcp_close(self.fd)?
-        Ok(void)
-    }
-}
-
-// 返回绑定地址（构造时传入的本地地址）
-pub fun local_addr(self: UdpSocket): SocketAddr {
-    self.local_addr
 }

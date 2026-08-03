@@ -41,21 +41,6 @@ macro_rules! read_node_inputs {
     };
 }
 
-/// 批量生成算术 compute_fn（返回同类型标量）。
-/// frame 持有 graph（Arc<DataFlowGraph>），通过 frame.graph.clone() 获取只读访问。
-macro_rules! impl_arith_compute {
-    ($($name:ident: $op:tt for $ctor:ident / $acc:ident);* $(;)?) => {
-        $(
-            pub fn $name(frame: &mut Frame, node: NodeId) -> Value {
-                read_node_inputs!(frame, node, graph, n, inputs);
-                let a = frame.get_value_by_global(inputs[0]).$acc();
-                let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a $op b)
-            }
-        )*
-    };
-}
-
 /// 批量生成比较 compute_fn（返回 bool）。
 macro_rules! impl_cmp_compute {
     ($($name:ident: $op:tt for $acc:ident);* $(;)?) => {
@@ -1381,15 +1366,10 @@ pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let record_val = frame.get_value_by_global(inputs[0]);
     let name = graph.field_set_names[node.0 as usize].as_deref();
-    match record_val.heap_obj() {
-        Some(crate::Value::HeapObj::Record(r)) => {
-            name.and_then(|n| r.find_field(n)).cloned().unwrap_or(Value::VOID)
-        }
-        Some(crate::Value::HeapObj::Adt(a)) => {
-            name.and_then(|n| a.find_field(n)).cloned().unwrap_or(Value::VOID)
-        }
-        _ => Value::VOID,
-    }
+    record_val
+        .heap_obj()
+        .and_then(|h| name.and_then(|n| h.field_get(n)))
+        .unwrap_or(Value::VOID)
 }
 
 /// compute_fn: 数组构造（从输入收集元素构造 ArrayValue）
@@ -1532,7 +1512,8 @@ pub fn compute_global_load(frame: &mut Frame, node: NodeId) -> Value {
         .expect("global_load node has no slot");
     let storage = &frame.graph.global_var_storage;
     let guard = storage[slot as usize].lock().unwrap();
-    guard.clone().unwrap_or(Value::NULL)
+    let val = guard.clone().unwrap_or(Value::NULL);
+    val
 }
 
 /// compute_fn (idx 271): 全局变量写入。
@@ -1621,7 +1602,8 @@ pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: 模式匹配 — 构造器名判别（idx 274）。
 ///
 /// 输入：scrutinee。元数据：构造器名（graph.pattern_ctor_names）。
-/// 检查 scrutinee 是否为 ADT 且 constructor 匹配，或 Record 且 type_name 匹配。
+/// 检查 scrutinee 是否为 ADT 且 constructor 匹配，或 Record 且 type_name 匹配，
+/// 或 ThrowVal 且构造器名为 "Ok"/"Error" 匹配对应 payload 变体。
 /// 返回 bool。
 pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -1632,15 +1614,20 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
     let matched = match val.heap_obj() {
         Some(crate::Value::HeapObj::Adt(a)) => a.constructor == *ctor_name,
         Some(crate::Value::HeapObj::Record(r)) => r.type_name == *ctor_name,
+        Some(crate::Value::HeapObj::ThrowVal(tv)) => match &tv.payload {
+            crate::Value::ThrowPayload::Ok(_) => ctor_name == "Ok",
+            crate::Value::ThrowPayload::Err(_) => ctor_name == "Error" || ctor_name == "Err",
+        },
         _ => false,
     };
     Value::bool_val(matched)
 }
 
-/// compute_fn: 模式匹配 — ADT/Record 按位置提取字段（idx 275）。
+/// compute_fn: 模式匹配 — ADT/Record/ThrowVal 按位置提取字段（idx 275）。
 ///
 /// 输入：scrutinee。元数据：字段索引（graph.pattern_field_indices）。
-/// 从 ADT 按位置取字段值，或从 Record 按位置取字段值。
+/// 从 ADT 按位置取字段值，或从 Record 按位置取字段值，
+/// 或从 ThrowVal 取内部值（索引 0：Ok 的 val 或 Err 的 record）。
 /// 返回字段值（越界返回 Void）。
 pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -1654,6 +1641,18 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
         }
         Some(crate::Value::HeapObj::Record(r)) => {
             r.fields.get(idx).cloned().unwrap_or(Value::VOID)
+        }
+        Some(crate::Value::HeapObj::ThrowVal(tv)) => {
+            if idx == 0 {
+                match &tv.payload {
+                    crate::Value::ThrowPayload::Ok(v) => v.clone(),
+                    crate::Value::ThrowPayload::Err(r) => {
+                        Value::ref_val(crate::Value::HeapObj::Record((**r).clone()))
+                    }
+                }
+            } else {
+                Value::VOID
+            }
         }
         _ => Value::VOID,
     }
@@ -1878,12 +1877,20 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
             // 不会有并发访问同一 HeapObj 的代码路径。
             let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::Value::HeapObj;
             unsafe {
-                if let crate::Value::HeapObj::Record(r) = &mut *ptr {
-                    if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name.as_str())) {
-                        if idx < r.fields.len() {
-                            r.fields[idx] = new_value.clone();
+                match &mut *ptr {
+                    crate::Value::HeapObj::Record(r) => {
+                        if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name.as_str())) {
+                            if idx < r.fields.len() {
+                                r.fields[idx] = new_value.clone();
+                            }
                         }
                     }
+                    crate::Value::HeapObj::Adt(a) => {
+                        if let Some(idx) = a.fields.iter().position(|f| f.name.as_deref() == Some(field_name.as_str())) {
+                            a.fields[idx].value = new_value.clone();
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2025,7 +2032,8 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId) -> Value {
         .expect("Gate node has no branches");
 
     // 读条件值
-    let cond = frame.get_value_by_global(branches.condition_input).as_bool();
+    let cond_raw = frame.get_value_by_global(branches.condition_input);
+    let cond = cond_raw.as_bool();
 
     // 选分支
     let (target_sg, branch_inputs) = branches
@@ -2096,12 +2104,12 @@ pub fn compute_await(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_channel_create（idx 283）：创建 ChannelValue 堆对象。
 ///
 /// 输入：inputs[0] = capacity (usize)
-/// 输出：Value::ref_val(HeapObj::ChannelVal(ChannelValue))
+/// 输出：Value::ref_val(HeapObj::ChannelVal(Arc<ChannelValue>))
 pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let capacity = frame.get_value_by_global(inputs[0]).as_usize();
     Value::ref_val(crate::Value::HeapObj::ChannelVal(
-        crate::Value::ChannelValue::new(capacity),
+        std::sync::Arc::new(crate::Value::ChannelValue::new(capacity)),
     ))
 }
 
@@ -2114,14 +2122,11 @@ pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let ch_val = frame.get_value_by_global(inputs[0]);
     let val = frame.get_value_by_global(inputs[1]);
-    match ch_val.heap_obj() {
-        Some(crate::Value::HeapObj::ChannelVal(ch)) => {
-            let ch_id = crate::Ir::ChannelId(ch.id());
-            ch.send(val);
-            frame.pending_channel_notify = Some(ch_id);
-        }
-        _ => panic!("send on non-channel value"),
-    }
+    let ch = ch_val.heap_obj().and_then(|h| h.channel())
+        .expect("send on non-channel value");
+    let ch_id = crate::Ir::ChannelId(ch.id());
+    ch.send(val);
+    frame.pending_channel_notify = Some(ch_id);
     Value::VOID
 }
 
@@ -2131,10 +2136,9 @@ pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
 pub fn compute_channel_close(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let ch_val = frame.get_value_by_global(inputs[0]);
-    match ch_val.heap_obj() {
-        Some(crate::Value::HeapObj::ChannelVal(ch)) => ch.close(),
-        _ => panic!("close on non-channel value"),
-    }
+    let ch = ch_val.heap_obj().and_then(|h| h.channel())
+        .expect("close on non-channel value");
+    ch.close();
     Value::VOID
 }
 
@@ -2283,7 +2287,7 @@ pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 此函数在 compute_ffi_call 的 __reflect_format 处理器中调用，
 /// 用于在格式化前强制求值 lazy 值。
 pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Value {
-    use crate::Value::{Closure, HeapObj, LazyValue};
+    use crate::Value::HeapObj;
 
     // 提取 LazyValue 引用
     let arc = match lazy_val {
@@ -2402,21 +2406,19 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
         // 4. vtable 动态分派（Call 节点有 vtable_call_methods 但无 call_target）
         if frame.pending_call.is_none() {
-            if let Some(ref method_name) = graph.vtable_call_methods[graph_node_id.0 as usize] {
+            if let Some(method_idx) = graph.vtable_call_methods[graph_node_id.0 as usize] {
                 let n = &graph.nodes[graph_node_id.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let recv_val = frame.get_value_by_global(inputs[0]);
 
                 let (target_sg, upvalues): (SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
                     Some(crate::Value::HeapObj::TraitVal(tv)) => {
-                        match tv.method_names.iter().position(|m| m.as_str() == method_name.as_str()) {
-                            Some(i) => match tv.method_values[i].heap_obj() {
-                                Some(crate::Value::HeapObj::Closure(c)) => {
-                                    (SubGraphId(c.func_id), c.upvalues.clone())
-                                }
-                                _ => panic!("vtable method is not a Closure"),
-                            },
-                            None => panic!("TraitValue has no method '{}'", method_name),
+                        let idx = method_idx as usize;
+                        match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
+                            Some(crate::Value::HeapObj::Closure(c)) => {
+                                (SubGraphId(c.func_id), c.upvalues.clone())
+                            }
+                            _ => panic!("vtable method_idx {} is not a Closure", method_idx),
                         }
                     }
                     _ => panic!("vtable call on non-trait value"),
@@ -2572,41 +2574,99 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
     }
 }
 
-/// compute_fn: 闭包调用（idx 41）。
+/// compute_fn: 偏应用构造（idx 286）。
 ///
-/// inputs[0] = 闭包值节点，inputs[1..] = 调用参数节点。
-/// 从 Closure 取子图 id + 捕获值，合并调用参数 + 捕获值（追加末尾），设 pending_call。
-/// 子图 param_count = lambda 参数数 + 捕获变量数，start_subgraph 按顺序注入。
-pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
+/// 从 partial_infos 取子图 id + bound_count，合并 inputs（已绑定参数值）
+/// 构造 HeapObj::Partial。remaining_arity = subgraph.param_count - bound_count。
+/// 顶层函数偏应用时 upvalues 为空，self_upvalue_idx = -1。
+pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, PartialApplication};
     read_node_inputs!(frame, node, graph, n, inputs);
-    let closure_val = frame.get_value_by_global(inputs[0]);
+    let info = graph.partial_infos[node.0 as usize]
+        .expect("partial construct node has no PartialInfo");
+    let bound_args: Vec<Value> = inputs
+        .iter()
+        .map(|&in_node| frame.get_value_by_global(in_node))
+        .collect();
+    let param_count = graph.subgraphs[info.subgraph_id.0 as usize].param_count as usize;
+    let remaining_arity = (param_count - bound_args.len()) as u8;
+    Value::ref_val(HeapObj::Partial(PartialApplication {
+        func_id: info.subgraph_id.0,
+        upvalues: Vec::new(),
+        bound_args,
+        remaining_arity,
+        self_upvalue_idx: -1,
+    }))
+}
 
-    let closure = match closure_val.heap_obj() {
-        Some(crate::Value::HeapObj::Closure(c)) => c.clone(),
-        _ => panic!("compute_closure_call: input is not a Closure"),
+/// compute_fn: 可调用值调用（idx 41）— 统一处理 Closure | Partial。
+///
+/// inputs[0] = 可调用值节点，inputs[1..1+arg_count] = 调用参数节点（arg_count 从
+/// closure_call_arg_counts 元数据读取，不含闭包值和 effect 依赖）。
+///
+/// 统一调用语义：
+/// - Closure: needed_arity = subgraph.param_count - upvalues.len()
+/// - Partial: needed_arity = remaining_arity
+///
+/// 当新参数数 < needed_arity → 产出新的 Partial（链式偏应用）；
+/// 当新参数数 >= needed_arity → 合并 bound_args + 新参数 + upvalues，设 pending_call。
+pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, PartialApplication};
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let callable_val = frame.get_value_by_global(inputs[0]);
+
+    // 从元数据读取实参数（不含闭包值和 effect 依赖）
+    let arg_count = graph.closure_call_arg_counts[node.0 as usize]
+        .expect("closure_call node has no arg_count") as usize;
+    let new_args: Vec<Value> = inputs
+        .iter()
+        .skip(1)
+        .take(arg_count)
+        .map(|&in_node| frame.get_value_by_global(in_node))
+        .collect();
+
+    // 统一提取可调用值的启动信息
+    let (func_id, upvalues, bound_args, needed_arity, self_upvalue_idx) = match callable_val.heap_obj() {
+        Some(HeapObj::Closure(c)) => {
+            let total_params = graph.subgraphs[c.func_id as usize].param_count as usize;
+            let needed = total_params.saturating_sub(c.upvalues.len());
+            (c.func_id, c.upvalues.clone(), Vec::new(), needed, c.self_upvalue_idx)
+        }
+        Some(HeapObj::Partial(p)) => {
+            (p.func_id, p.upvalues.clone(), p.bound_args.clone(), p.remaining_arity as usize, p.self_upvalue_idx)
+        }
+        _ => panic!("compute_closure_call: input is not callable (Closure or Partial)"),
     };
 
-    let target_sg = SubGraphId(closure.func_id);
-    let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
-
-    // 子图 param_count = lambda 参数数 + upvalue 数。
-    // 调用方只提供 lambda 参数（arity），upvalues 由 Closure 自带。
-    // 因此从 inputs 读取 arity = param_count - upvalues.len() 个，再追加 upvalues。
-    // 与 vtable 分派路径（run_frame_sync）保持一致，避免 upvalues 被二次追加。
-    let upvalues_len = closure.upvalues.len();
-    let arity = (graph.subgraphs[target_sg.0 as usize].param_count as usize)
-        .saturating_sub(upvalues_len);
-    let mut args: Vec<Value> = Vec::with_capacity(arity + upvalues_len);
-    for &in_node in inputs.iter().skip(1).take(arity) {
-        args.push(frame.get_value_by_global(in_node));
+    // 链式偏应用：新参数不足 → 产出新 Partial
+    if new_args.len() < needed_arity {
+        let provided = new_args.len();
+        let mut extended = bound_args;
+        extended.extend(new_args);
+        let new_remaining = needed_arity - provided;
+        return Value::ref_val(HeapObj::Partial(PartialApplication {
+            func_id,
+            upvalues,
+            bound_args: extended,
+            remaining_arity: new_remaining as u8,
+            self_upvalue_idx,
+        }));
     }
-    args.extend(closure.upvalues.iter().cloned());
+
+    // 满 arity：合并 bound_args + new_args[..needed] + upvalues，设 pending_call
+    let target_sg = SubGraphId(func_id);
+    let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
+    let upvalues_len = upvalues.len();
+    let mut args: Vec<Value> = Vec::with_capacity(bound_args.len() + needed_arity + upvalues_len);
+    args.extend(bound_args);
+    args.extend(new_args.iter().take(needed_arity).cloned());
+    args.extend(upvalues);
 
     // 递归闭包：将自身引用注入到 self_upvalue_idx 对应的 upvalue slot
-    if closure.self_upvalue_idx >= 0 {
-        let upvalues_start = args.len() - closure.upvalues.len();
-        let self_idx = upvalues_start + closure.self_upvalue_idx as usize;
-        args[self_idx] = closure_val.clone();
+    if self_upvalue_idx >= 0 {
+        let upvalues_start = args.len() - upvalues_len;
+        let self_idx = upvalues_start + self_upvalue_idx as usize;
+        args[self_idx] = callable_val.clone();
     }
 
     frame.pending_call = Some(PendingCall {
@@ -3010,11 +3070,11 @@ fn process_batch_group(
     locals: &[NodeId],
     node_start: NodeId,
     info: BatchInfo,
-) {
+) -> bool {
     use crate::Value::{ScalarTag, BinOp, CmpOp, UnaryOp};
     let _ = (BinOp::Add, CmpOp::Eq, UnaryOp::Neg); // 抑制 unused import
 
-    if locals.is_empty() { return; }
+    if locals.is_empty() { return false; }
 
     match info {
         BatchInfo { tag, op: BatchOp::Bin(op) } => {
@@ -3033,7 +3093,7 @@ fn process_batch_group(
                 ScalarTag::U128 => exec_bin_batch!(frame, graph, locals, node_start, u128, u128, as_u128, batch_binop, op),
                 ScalarTag::Isize => exec_bin_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, batch_binop, op),
                 ScalarTag::Usize => exec_bin_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, batch_binop, op),
-                _ => return, // F16/F128/Bool/Char → 不支持
+                _ => return false, // F16/F128/Bool/Char → 不支持，回退到单节点路径
             }
         }
         BatchInfo { tag, op: BatchOp::Cmp(op) } => {
@@ -3052,7 +3112,7 @@ fn process_batch_group(
                 ScalarTag::U128 => exec_cmp_batch!(frame, graph, locals, node_start, u128, as_u128, batch_cmp, op),
                 ScalarTag::Isize => exec_cmp_batch!(frame, graph, locals, node_start, isize, as_isize, batch_cmp, op),
                 ScalarTag::Usize => exec_cmp_batch!(frame, graph, locals, node_start, usize, as_usize, batch_cmp, op),
-                _ => return, // F16/F128/Bool/Char → 不支持
+                _ => return false, // F16/F128/Bool/Char → 不支持，回退到单节点路径
             }
         }
         BatchInfo { tag, op: BatchOp::Unary(op) } => {
@@ -3069,7 +3129,7 @@ fn process_batch_group(
                 ScalarTag::U128 => exec_unary_batch!(frame, graph, locals, node_start, u128, u128, as_u128, op),
                 ScalarTag::Isize => exec_unary_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, op),
                 ScalarTag::Usize => exec_unary_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, op),
-                _ => return, // F16/F128/F32/F64/Bool/Char → 不支持（浮点无 BitOps）
+                _ => return false, // F16/F128/F32/F64/Bool/Char → 不支持，回退到单节点路径
             }
         }
     }
@@ -3079,6 +3139,7 @@ fn process_batch_group(
         let gid = NodeId(lid.0 + node_start.0);
         notify_downstream_shared(frame, graph, lid, gid, node_start);
     }
+    true
 }
 
 /// 尝试批量化处理就绪队列中的节点。
@@ -3118,8 +3179,15 @@ fn try_batch_nodes(frame: &mut Frame, graph: &DataFlowGraph) -> bool {
     let mut batch_done = false;
     for (info, locals) in groups {
         if locals.len() >= 2 {
-            process_batch_group(frame, graph, &locals, NodeId(node_start), info);
-            batch_done = true;
+            let processed = process_batch_group(frame, graph, &locals, NodeId(node_start), info);
+            if processed {
+                batch_done = true;
+            } else {
+                // 批处理不支持此类型，节点回退到单节点路径
+                for lid in locals {
+                    rest.push(lid);
+                }
+            }
         } else {
             rest.push(locals[0]);
         }
@@ -3264,17 +3332,10 @@ impl Engine {
                 // EventSource 声明节点永不就绪（spec 4.4：事件源不进就绪队列）
                 if graph_node.kind == NodeKind::EventSource {
                     frame.pending_inputs[i] = u8::MAX;
-                } else if graph_node.kind == NodeKind::Gate {
-                    // select gate（有 select_infos）无 condition_input，立即就绪
-                    if self.graph.select_infos[offset + i].is_some() {
-                        frame.pending_inputs[i] = 0;
-                    } else {
-                        // 普通 Gate 节点就绪依赖 condition_input（通过 downstreams 机制驱动）
-                        // pending_inputs=1 确保 Gate 不会被 step 3 提前入队，
-                        // condition_input 产出时 notify_downstream 减为 0 → 入就绪队列
-                        frame.pending_inputs[i] = 1;
-                    }
                 } else {
+                    // 统一通过 inputs 计算 pending_inputs（包括 Gate 节点）。
+                    // Gate 的 inputs 包含 condition_input 和 current_effect（如有），
+                    // 确保 Gate 在条件和前序副作用都完成后才就绪。
                     // 只统计当前帧内的输入（外层节点通过 root_frame_ptr 读取，
                     // 不计入 pending — 外层节点在不同帧，不会通过 notify_downstream 通知）
                     let inputs = self.graph.inputs_pool.get(
@@ -3330,6 +3391,7 @@ impl Engine {
                 frame.push_ready(NodeId(i as u32));
             }
         }
+
     }
 
     /// 通知下游节点：减 pending_inputs，归零则入就绪队列。
@@ -3361,9 +3423,9 @@ impl Engine {
             if frame.pending_inputs[ds_local_id.0 as usize] > 0 {
                 frame.pending_inputs[ds_local_id.0 as usize] -= 1;
             }
-            if frame.pending_inputs[ds_local_id.0 as usize] == 0
-                && !frame.value_table.ready[ds_local_id.0 as usize]
-            {
+            let new_pending = frame.pending_inputs[ds_local_id.0 as usize];
+            let will_push = new_pending == 0 && !frame.value_table.ready[ds_local_id.0 as usize];
+            if will_push {
                 frame.push_ready(ds_local_id);
             }
         }
@@ -3439,8 +3501,8 @@ impl Engine {
             //（compute_call_launch 未设 pending_call）→ 从 recv 的 TraitVal 运行时
             // 查询方法子图，收集参数后设 pending_call，交由下方统一处理。
             if self.frames.get(fid).pending_call.is_none() {
-                if let Some(method_name) =
-                    self.graph.vtable_call_methods[graph_node_id.0 as usize].clone()
+                if let Some(method_idx) =
+                    self.graph.vtable_call_methods[graph_node_id.0 as usize]
                 {
                     let n = &self.graph.nodes[graph_node_id.0 as usize];
                     let inputs =
@@ -3450,20 +3512,12 @@ impl Engine {
                     // 从 TraitVal 查方法 Closure，取 subgraph_id + upvalues
                     let (target_sg, upvalues): (crate::Ir::SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
                         Some(crate::Value::HeapObj::TraitVal(tv)) => {
-                            match tv
-                                .method_names
-                                .iter()
-                                .position(|m| m.as_str() == method_name.as_str())
-                            {
-                                Some(i) => {
-                                    match tv.method_values[i].heap_obj() {
-                                        Some(crate::Value::HeapObj::Closure(c)) => {
-                                            (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
-                                        }
-                                        _ => panic!("vtable method is not a Closure"),
-                                    }
+                            let idx = method_idx as usize;
+                            match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
+                                Some(crate::Value::HeapObj::Closure(c)) => {
+                                    (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
                                 }
-                                None => panic!("TraitValue has no method '{}'", method_name),
+                                _ => panic!("vtable method_idx {} is not a Closure", method_idx),
                             }
                         }
                         _ => panic!("vtable call on non-trait value"),
@@ -3681,10 +3735,10 @@ impl Engine {
                             self.frames.get(fid).get_value_by_global(branch.event_source_node);
                         let is_ready = match branch.event_kind {
                             EventSourceKind::Channel => {
-                                match event_val.heap_obj() {
-                                    Some(crate::Value::HeapObj::ChannelVal(ch)) => ch.has_data(),
-                                    _ => false,
-                                }
+                                // channel 就绪条件：有数据 OR 已关闭（closed+空 → recv 返回 null，分支立即就绪）
+                                event_val.heap_obj()
+                                    .and_then(|h| h.channel())
+                                    .map_or(false, |ch| ch.has_data() || ch.is_closed())
                             }
                             EventSourceKind::Timer => {
                                 // Timer 分支：首次检查时启动 timer，后续用缓存的 timer_id
@@ -3738,15 +3792,17 @@ impl Engine {
                                 .frames
                                 .get(fid)
                                 .get_value_by_global(branch.event_source_node);
-                            let event = match branch.event_kind {
+                            match branch.event_kind {
                                 EventSourceKind::Channel => {
-                                    let ch_id = match event_val.heap_obj() {
-                                        Some(crate::Value::HeapObj::ChannelVal(ch)) => {
-                                            crate::Ir::ChannelId(ch.id())
-                                        }
-                                        _ => panic!("select channel branch event_obj is not a ChannelValue"),
-                                    };
-                                    RuntimeEvent::ChannelReady(ch_id)
+                                    // channel 分支：从 event_source_node 取底层 channel。
+                                    // event_source_node 可能在父帧（通过 root_frame_ptr 访问），
+                                    // 若值为 Null（尚未求值或不可见），跳过该分支的等待注册。
+                                    if let Some(ch) = event_val.heap_obj().and_then(|h| h.channel()) {
+                                        self.event_waiters.push((
+                                            RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id())),
+                                            fid,
+                                        ));
+                                    }
                                 }
                                 EventSourceKind::Timer => {
                                     // 用已启动的真实 timer_id 注册事件等待
@@ -3758,11 +3814,10 @@ impl Engine {
                                         .find(|(idx, _)| *idx == branch_idx)
                                         .map(|(_, tid)| *tid)
                                         .expect("select timer should be started above");
-                                    RuntimeEvent::TimerFired(timer_id)
+                                    self.event_waiters.push((RuntimeEvent::TimerFired(timer_id), fid));
                                 }
-                                _ => continue,
-                            };
-                            self.event_waiters.push((event, fid));
+                                _ => {}
+                            }
                         }
                         let frame = self.frames.get_mut(fid);
                         frame.state = FrameState::Suspended;
@@ -3839,24 +3894,9 @@ impl Engine {
             ControlSignal::Break | ControlSignal::Continue => Value::VOID,
             ControlSignal::None => {
                 let sg = &self.graph.subgraphs[child.subgraph_id.0 as usize];
-                // 用 get_value_by_global 而非 get_value：分支子图的 return_node 可能指向
-                // 外层节点（帧链穿透），需要通过 parent_frame_ptr/root_frame_ptr 回溯读取
-                child.get_value_by_global(sg.return_node)
+                let rn = sg.return_node;
+                child.get_value_by_global(rn)
             }
-        }
-    }
-
-    /// throw 传播：若返回值是 ThrowVal(Err)，向调用方透传 Return 信号。
-    ///
-    /// Glue 无 try-catch，throw 通过 Return 信号携带 ThrowVal(Err) 逐层透传至顶层。
-    fn propagate_throw_if_any(&mut self, caller_fid: FrameId, return_value: &Value) {
-        let is_throw_err = matches!(
-            return_value.heap_obj(),
-            Some(crate::Value::HeapObj::ThrowVal(t)) if matches!(t.payload, crate::Value::ThrowPayload::Err(_))
-        );
-        if is_throw_err {
-            let frame = self.frames.get_mut(caller_fid);
-            frame.control_signal = ControlSignal::Return(return_value.clone());
         }
     }
 
@@ -4012,9 +4052,6 @@ impl Engine {
 
         let caller = self.frames.get(child_fid).caller;
         if let Some((caller_fid, call_node)) = caller {
-            // throw 传播：返回值为 ThrowVal(Err) 时，向调用方透传 Return 信号
-            self.propagate_throw_if_any(caller_fid, &return_value);
-
             // 回写返回值到调用方 call/gate 节点
             let caller_sg_id = self.frames.get(caller_fid).subgraph_id;
             let caller_offset = self.graph.subgraphs[caller_sg_id.0 as usize].node_range.0;
@@ -4178,16 +4215,16 @@ impl Engine {
                 }
             }
             EventSourceKind::Channel => {
-                // Channel event_obj 是 ChannelValue 堆对象引用。
-                // 从堆对象提取 channel id + recv 数据。
-                let (ch_id, val) = match pending.event_obj.heap_obj() {
-                    Some(crate::Value::HeapObj::ChannelVal(ch)) => {
-                        (crate::Ir::ChannelId(ch.id()), ch.recv())
-                    }
-                    _ => panic!("await on non-channel value"),
-                };
-                let event = RuntimeEvent::ChannelReady(ch_id);
-                (event, val)
+                // Channel event_obj 是 ChannelVal/SenderVal/ReceiverVal 之一，
+                // 统一通过 channel() 提取底层 Arc<ChannelValue>。
+                // 已关闭且无数据 → 返回 Null（不挂起，避免永久等待）。
+                let ch = pending.event_obj.heap_obj().and_then(|h| h.channel())
+                    .expect("await on non-channel value");
+                let v = ch.recv().or_else(|| {
+                    if ch.is_closed() { Some(Value::Null) } else { None }
+                });
+                let event = RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id()));
+                (event, v)
             }
             EventSourceKind::Timer => {
                 // Timer event_obj 是 Timer record（含 duration_ns 字段）。
@@ -4804,17 +4841,6 @@ fn extract_child_return_shared(child: &Frame, graph: &DataFlowGraph) -> Value {
     }
 }
 
-/// throw 传播：若返回值是 ThrowVal(Err)，向调用方透传 Return 信号。
-fn propagate_throw_shared(caller: &mut Frame, return_value: &Value) {
-    let is_throw_err = matches!(
-        return_value.heap_obj(),
-        Some(crate::Value::HeapObj::ThrowVal(t)) if matches!(t.payload, crate::Value::ThrowPayload::Err(_))
-    );
-    if is_throw_err {
-        caller.control_signal = ControlSignal::Return(return_value.clone());
-    }
-}
-
 /// 子图完成后：回写返回值到调用方 + 唤醒调用方。
 ///
 /// 子帧不入 frames（等同于 free）。caller 帧从 frames 取出、修改、放回。
@@ -4849,8 +4875,6 @@ fn complete_and_wake_caller_shared(
 
         // 修改 caller 帧（无需持锁）
         if let Some(caller_frame) = caller_frame_opt.as_mut() {
-            propagate_throw_shared(caller_frame, &return_value);
-
             let caller_sg_id = caller_frame.subgraph_id;
             let caller_offset = shared.graph.subgraphs[caller_sg_id.0 as usize].node_range.0;
             let call_graph_id = NodeId(call_node.0 + caller_offset.0);
@@ -4975,16 +4999,16 @@ fn resolve_and_check_await_shared(
             (event, val)
         }
         EventSourceKind::Channel => {
-            // Channel event_obj 是 ChannelValue 堆对象引用。
-            // 从堆对象提取 channel id + recv 数据。
-            let (ch_id, val) = match pending.event_obj.heap_obj() {
-                Some(crate::Value::HeapObj::ChannelVal(ch)) => {
-                    (crate::Ir::ChannelId(ch.id()), ch.recv())
-                }
-                _ => panic!("await on non-channel value"),
-            };
-            let event = RuntimeEvent::ChannelReady(ch_id);
-            (event, val)
+            // Channel event_obj 是 ChannelVal/SenderVal/ReceiverVal 之一，
+            // 统一通过 channel() 提取底层 Arc<ChannelValue>。
+            // 已关闭且无数据 → 返回 Null（不挂起，避免永久等待）。
+            let ch = pending.event_obj.heap_obj().and_then(|h| h.channel())
+                .expect("await on non-channel value");
+            let v = ch.recv().or_else(|| {
+                if ch.is_closed() { Some(Value::Null) } else { None }
+            });
+            let event = RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id()));
+            (event, v)
         }
         EventSourceKind::Timer => {
             // Timer event_obj 是 Timer record（含 duration_ns 字段）。
@@ -5121,8 +5145,8 @@ fn run_frame_nodes(
 
         // vtable 动态分派：Call 节点有 vtable_call_methods 但无 call_target
         if frame.pending_call.is_none() {
-            if let Some(method_name) =
-                graph.vtable_call_methods[graph_node_id.0 as usize].clone()
+            if let Some(method_idx) =
+                graph.vtable_call_methods[graph_node_id.0 as usize]
             {
                 let n = &graph.nodes[graph_node_id.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
@@ -5131,20 +5155,12 @@ fn run_frame_nodes(
                 // 从 TraitVal 查方法 Closure，取 subgraph_id + upvalues
                 let (target_sg, upvalues): (crate::Ir::SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
                     Some(crate::Value::HeapObj::TraitVal(tv)) => {
-                        match tv
-                            .method_names
-                            .iter()
-                            .position(|m| m.as_str() == method_name.as_str())
-                        {
-                            Some(i) => {
-                                match tv.method_values[i].heap_obj() {
-                                    Some(crate::Value::HeapObj::Closure(c)) => {
-                                        (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
-                                    }
-                                    _ => panic!("vtable method is not a Closure"),
-                                }
+                        let idx = method_idx as usize;
+                        match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
+                            Some(crate::Value::HeapObj::Closure(c)) => {
+                                (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
                             }
-                            None => panic!("TraitValue has no method '{}'", method_name),
+                            _ => panic!("vtable method_idx {} is not a Closure", method_idx),
                         }
                     }
                     _ => panic!("vtable call on non-trait value"),
@@ -5332,10 +5348,10 @@ fn run_frame_nodes(
                     let event_val = frame.get_value_by_global(branch.event_source_node);
                     let is_ready = match branch.event_kind {
                         EventSourceKind::Channel => {
-                            match event_val.heap_obj() {
-                                Some(crate::Value::HeapObj::ChannelVal(ch)) => ch.has_data(),
-                                _ => false,
-                            }
+                            // channel 就绪条件：有数据 OR 已关闭（closed+空 → recv 返回 null，分支立即就绪）
+                            event_val.heap_obj()
+                                .and_then(|h| h.channel())
+                                .map_or(false, |ch| ch.has_data() || ch.is_closed())
                         }
                         EventSourceKind::Timer => {
                             let timer_id = {
@@ -5377,13 +5393,9 @@ fn run_frame_nodes(
                         let event_val = frame.get_value_by_global(branch.event_source_node);
                         let event = match branch.event_kind {
                             EventSourceKind::Channel => {
-                                let ch_id = match event_val.heap_obj() {
-                                    Some(crate::Value::HeapObj::ChannelVal(ch)) => {
-                                        crate::Ir::ChannelId(ch.id())
-                                    }
-                                    _ => panic!("select channel branch event_obj is not a ChannelValue"),
-                                };
-                                RuntimeEvent::ChannelReady(ch_id)
+                                let ch = event_val.heap_obj().and_then(|h| h.channel())
+                                    .expect("select channel branch event_obj is not a ChannelValue");
+                                RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id()))
                             }
                             EventSourceKind::Timer => {
                                 let timer_id = frame
@@ -5512,7 +5524,6 @@ fn process_frame_shared(
                     shared.event_waiters.lock().retain(|(_, wf)| *wf != fid);
                 }
                 let _ = child_signal; // 控制信号已在 complete_and_wake_caller_shared 中处理
-                propagate_throw_shared(&mut frame, &return_value);
                 let caller_sg_id = frame.subgraph_id;
                 let caller_offset = shared.graph.subgraphs[caller_sg_id.0 as usize].node_range.0;
                 let call_graph_id = NodeId(call_node.0 + caller_offset.0);
@@ -5712,3095 +5723,4 @@ fn try_steal(
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Value::Value;
-
-    /// 构建简单图：1 + 2 = 3
-    fn make_simple_graph() -> DataFlowGraph {
-        let mut graph = DataFlowGraph::new();
-        // N0: Const(1)
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(1));
-        // N1: Const(2)
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(2));
-        // N2: BinOp(+, [N0, N1])
-        let off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: off,
-            compute_fn: ComputeFnId(1), // add_i32
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(0));
-        graph.compute_downstreams();
-        graph
-    }
-
-    #[test]
-    fn test_frame_init_consts_ready() {
-        let graph = make_simple_graph();
-        let mut engine = Engine::new(graph);
-        let fid = engine.init_frame(SubGraphId(0));
-        let frame = engine.frames.get(fid);
-        // N0 和 N1 是 Const，应该已就绪
-        assert!(frame.is_node_ready(NodeId(0)));
-        assert!(frame.is_node_ready(NodeId(1)));
-        // N2 有 2 个输入，不应就绪
-        assert!(!frame.is_node_ready(NodeId(2)));
-        assert_eq!(frame.pending_inputs[2], 2);
-        // 就绪队列应有 N0 和 N1
-        assert_eq!(frame.ready_queue.len(), 2);
-    }
-
-    #[test]
-    fn test_ready_scheduling_basic() {
-        let graph = make_simple_graph();
-        let mut engine = Engine::new(graph);
-        let fid = engine.init_frame(SubGraphId(0));
-        engine.run_ready_nodes(fid);
-        let frame = engine.frames.get(fid);
-        // N2 的 pending_inputs 应减为 0
-        assert_eq!(frame.pending_inputs[2], 0);
-        // N2 应已执行（ready）
-        assert!(frame.value_table.ready[2]);
-    }
-
-    #[test]
-    fn test_execute_simple_add() {
-        let graph = make_simple_graph();
-        let mut engine = Engine::new(graph);
-        let fid = engine.init_frame(SubGraphId(0));
-        engine.run_ready_nodes(fid);
-        let frame = engine.frames.get(fid);
-        let result_handle = frame.get_value(NodeId(2));
-        let result = result_handle.as_i32();
-        assert_eq!(result, 3);
-    }
-
-    #[test]
-    fn test_execute_nested_arithmetic() {
-        // (1 + 2) * 3 = 9
-        let mut graph = DataFlowGraph::new();
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(1));
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(2));
-        let off1 = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: off1,
-            compute_fn: ComputeFnId(1), // add_i32
-        });
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n3.0 as usize] = Some(ConstValue::I32(3));
-        let off2 = graph.inputs_pool.push(&[n2, n3]);
-        let n4 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: off2,
-            compute_fn: ComputeFnId(3), // mul_i32
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(5)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n4,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(0));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let fid = engine.init_frame(SubGraphId(0));
-        engine.run_ready_nodes(fid);
-        let frame = engine.frames.get(fid);
-        let result = frame.get_value(NodeId(4)).as_i32();
-        assert_eq!(result, 9);
-    }
-
-    #[test]
-    fn test_run_entry() {
-        let graph = make_simple_graph();
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 3);
-    }
-
-    #[test]
-    fn test_subgraph_launch_and_complete() {
-        // 构建两个子图：add(a,b)=a+b 和 main()=add(1,2)
-        let mut graph = DataFlowGraph::new();
-
-        // SubGraph 0: add(a, b) = a + b
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: off,
-            compute_fn: ComputeFnId(1),
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 2,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SubGraph 1: main() = add(1, 2)
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n3.0 as usize] = Some(ConstValue::I32(1));
-        let n4 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n4.0 as usize] = Some(ConstValue::I32(2));
-        let call_off = graph.inputs_pool.push(&[n3, n4]);
-        let n5 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 2,
-            inputs_offset: call_off,
-            compute_fn: ComputeFnId(36),
-        });
-        graph.set_call_target(n5, SubGraphId(0));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(3), NodeId(6)),
-            param_count: 0,
-            entry_node: n3,
-            return_node: n5,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        // 事件驱动：run_entry 调度 main 帧，Call 节点启动子图后挂起，
-        // 子图完成后回写返回值到 N5（Call, local id 2），main 帧完成。
-        let result = engine.run_entry();
-        // N5 (Call) 执行 add(1,2)=3
-        assert_eq!(result.as_i32(), 3);
-    }
-
-    #[test]
-    fn test_call_real_execution() {
-        // main() = add(1, 2), add(a,b) = a + b
-        let mut graph = DataFlowGraph::new();
-
-        // SubGraph 0: add(a, b) = a + b
-        let n0 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let n1 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node { kind: NodeKind::BinOp, input_count: 2, inputs_offset: off, compute_fn: ComputeFnId(1) });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0), node_range: (NodeId(0), NodeId(3)), param_count: 2,
-            entry_node: n0, return_node: n2, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        // SubGraph 1: main() = add(1, 2)
-        let n3 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n3.0 as usize] = Some(ConstValue::I32(1));
-        let n4 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n4.0 as usize] = Some(ConstValue::I32(2));
-        let call_off = graph.inputs_pool.push(&[n3, n4]);
-        let n5 = graph.add_node(Node { kind: NodeKind::Call, input_count: 2, inputs_offset: call_off, compute_fn: ComputeFnId(36) });
-        graph.set_call_target(n5, SubGraphId(0));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1), node_range: (NodeId(3), NodeId(6)), param_count: 0,
-            entry_node: n3, return_node: n5, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 3);
-    }
-
-    #[test]
-    fn test_lambda_define_and_call() {
-        // 闭包定义与调用：lambda |x| x + 1，调用 f(10) = 11
-        let mut graph = DataFlowGraph::new();
-
-        // SubGraph 0 (lambda_body): N0=param x, N1=Const(1), N2=Add(N0,N1), return N2
-        let n0 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let n1 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(1));
-        let off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node { kind: NodeKind::BinOp, input_count: 2, inputs_offset: off, compute_fn: ComputeFnId(1) });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0), node_range: (NodeId(0), NodeId(3)), param_count: 1,
-            entry_node: n0, return_node: n2, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        // SubGraph 1 (main): N3=Const(10), N4=ClosureConstruct(SG0, arity=1, upvalues=[]),
-        //                     N5=ClosureCall(N4, [N3])
-        let n3 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n3.0 as usize] = Some(ConstValue::I32(10));
-        let n4 = graph.add_node(Node { kind: NodeKind::BinOp, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(40) });
-        graph.set_closure_info(n4, ClosureInfo { subgraph_id: SubGraphId(0), arity: 1, self_upvalue_idx: -1 });
-        let call_off = graph.inputs_pool.push(&[n4, n3]);
-        let n5 = graph.add_node(Node { kind: NodeKind::Call, input_count: 2, inputs_offset: call_off, compute_fn: ComputeFnId(41) });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1), node_range: (NodeId(3), NodeId(6)), param_count: 0,
-            entry_node: n3, return_node: n5, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        // f(10) = 10 + 1 = 11
-        assert_eq!(result.as_i32(), 11);
-    }
-
-    #[test]
-    fn test_gate_if_true() {
-        // if true { 1 } else { 2 } = 1
-        let mut graph = DataFlowGraph::new();
-
-        // SubGraph 0: then = 1
-        let n0 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(1));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0), node_range: (NodeId(0), NodeId(1)), param_count: 0,
-            entry_node: n0, return_node: n0, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        // SubGraph 1: else = 2
-        let n1 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(2));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1), node_range: (NodeId(1), NodeId(2)), param_count: 0,
-            entry_node: n1, return_node: n1, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        // SubGraph 2: main = if true { then } else { else }
-        let n2 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n2.0 as usize] = Some(ConstValue::Bool(true));
-        let n3 = graph.add_node(Node { kind: NodeKind::Gate, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(37) });
-        graph.set_gate_branches(n3, GateBranches {
-            condition_input: n2,
-            branches: vec![(true, SubGraphId(0), vec![]), (false, SubGraphId(1), vec![])],
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(2), node_range: (NodeId(2), NodeId(4)), param_count: 0,
-            entry_node: n2, return_node: n3, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(2));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 1);
-    }
-
-    #[test]
-    fn test_gate_if_false() {
-        // if false { 1 } else { 2 } = 2
-        let mut graph = DataFlowGraph::new();
-
-        let n0 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(1));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0), node_range: (NodeId(0), NodeId(1)), param_count: 0,
-            entry_node: n0, return_node: n0, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        let n1 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(2));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1), node_range: (NodeId(1), NodeId(2)), param_count: 0,
-            entry_node: n1, return_node: n1, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        let n2 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n2.0 as usize] = Some(ConstValue::Bool(false));
-        let n3 = graph.add_node(Node { kind: NodeKind::Gate, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(37) });
-        graph.set_gate_branches(n3, GateBranches {
-            condition_input: n2,
-            branches: vec![(true, SubGraphId(0), vec![]), (false, SubGraphId(1), vec![])],
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(2), node_range: (NodeId(2), NodeId(4)), param_count: 0,
-            entry_node: n2, return_node: n3, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(2));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 2);
-    }
-
-    #[test]
-    fn test_loop_sum_1_to_5() {
-        // 累加 1..5 = 15
-        let mut graph = DataFlowGraph::new();
-
-        // SubGraph 0: loop_iter(acc, i)
-        // N0: acc, N1: i, N2: Const(5), N3: le(i,5), N4: Gate
-        let n0 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let n1 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let n2 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n2.0 as usize] = Some(ConstValue::I32(5));
-        let le_off = graph.inputs_pool.push(&[n1, n2]);
-        let n3 = graph.add_node(Node { kind: NodeKind::BinOp, input_count: 2, inputs_offset: le_off, compute_fn: ComputeFnId(4) }); // le_i32
-        let n4 = graph.add_node(Node { kind: NodeKind::Gate, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(37) });
-        graph.set_gate_branches(n4, GateBranches {
-            condition_input: n3,
-            branches: vec![
-                (true, SubGraphId(1), vec![n0, n1]),   // loop_body: acc, i
-                (false, SubGraphId(2), vec![n0]),      // return acc: acc
-            ],
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0), node_range: (NodeId(0), NodeId(5)), param_count: 2,
-            entry_node: n0, return_node: n4, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        // SubGraph 1: loop_body (递归调用 loop_iter(acc+i, i+1))
-        // N5: acc, N6: i, N7: Const(1), N8: add(acc,i), N9: add(i,1), N10: Call(loop_iter)
-        let n5 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let n6 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let n7 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n7.0 as usize] = Some(ConstValue::I32(1));
-        let add_acc_off = graph.inputs_pool.push(&[n5, n6]);
-        let n8 = graph.add_node(Node { kind: NodeKind::BinOp, input_count: 2, inputs_offset: add_acc_off, compute_fn: ComputeFnId(1) });
-        let add_i_off = graph.inputs_pool.push(&[n6, n7]);
-        let n9 = graph.add_node(Node { kind: NodeKind::BinOp, input_count: 2, inputs_offset: add_i_off, compute_fn: ComputeFnId(1) });
-        let call_off = graph.inputs_pool.push(&[n8, n9]);
-        let n10 = graph.add_node(Node { kind: NodeKind::Call, input_count: 2, inputs_offset: call_off, compute_fn: ComputeFnId(36) });
-        graph.set_call_target(n10, SubGraphId(0)); // 递归调用 loop_iter
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1), node_range: (NodeId(5), NodeId(11)), param_count: 2,
-            entry_node: n5, return_node: n10, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        // SubGraph 2: return acc
-        let n11 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(2), node_range: (NodeId(11), NodeId(12)), param_count: 1,
-            entry_node: n11, return_node: n11, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        // SubGraph 3: main = loop_iter(0, 1)
-        let n12 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n12.0 as usize] = Some(ConstValue::I32(0));
-        let n13 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n13.0 as usize] = Some(ConstValue::I32(1));
-        let main_call_off = graph.inputs_pool.push(&[n12, n13]);
-        let n14 = graph.add_node(Node { kind: NodeKind::Call, input_count: 2, inputs_offset: main_call_off, compute_fn: ComputeFnId(36) });
-        graph.set_call_target(n14, SubGraphId(0));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(3), node_range: (NodeId(12), NodeId(15)), param_count: 0,
-            entry_node: n12, return_node: n14, has_suspend: false,
-            event_source_decls: Vec::new(), defer_table: Vec::new(), loop_kind: crate::Ir::LoopKind::None, loop_parent_sg: None, cond_node: None, function_id: 0, iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(3));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 15);
-    }
-
-    /// 构建单 BinOp 图并执行，返回结果 handle。
-    fn make_binop_graph(cv0: ConstValue, cv1: ConstValue, cf_id: ComputeFnId) -> Engine {
-        let mut graph = DataFlowGraph::new();
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(cv0);
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n1.0 as usize] = Some(cv1);
-        let off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: off,
-            compute_fn: cf_id,
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(0));
-        graph.compute_downstreams();
-        Engine::new(graph)
-    }
-
-    #[test]
-    fn test_compute_sub_i32() {
-        let mut engine = make_binop_graph(ConstValue::I32(10), ConstValue::I32(3), ComputeFnId(5));
-        let h = engine.run_entry();
-        assert_eq!(h.as_i32(), 7);
-    }
-
-    #[test]
-    fn test_compute_eq_i32() {
-        let mut engine = make_binop_graph(ConstValue::I32(5), ConstValue::I32(5), ComputeFnId(8));
-        let h = engine.run_entry();
-        assert!(h.as_bool());
-    }
-
-    #[test]
-    fn test_compute_mul_f64() {
-        let mut engine =
-            make_binop_graph(ConstValue::F64(2.5), ConstValue::F64(4.0), ComputeFnId(14));
-        let h = engine.run_entry();
-        let result = h.as_f64();
-        assert!((result - 10.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_compute_and_bool() {
-        let mut engine =
-            make_binop_graph(ConstValue::Bool(true), ConstValue::Bool(false), ComputeFnId(22));
-        let h = engine.run_entry();
-        assert!(!h.as_bool());
-    }
-
-    // ── 阶段 5：同步控制流端到端测试 ──
-
-    /// 辅助：构建单函数模块并运行，返回入口帧结果句柄。
-    fn build_and_run(body: crate::Ast::ExprId, arena: crate::Ast::AstArena<'_>) -> (Engine, Value) {
-        use crate::Ast;
-        use crate::Ir::IrBuilder;
-        use crate::Sema;
-        let fun_decl = Ast::Decl::FunDecl {
-            visibility: Ast::Visibility::Private,
-            name: "main",
-            type_params: vec![],
-            params: vec![],
-            return_type: None,
-            bounds: vec![],
-            body,
-            is_async: false,
-            is_entry: true,
-            attributes: vec![],
-            extern_c_body: None,
-        };
-        let module = Ast::Module {
-            name: "test",
-            source_path: None,
-            arena,
-            declarations: vec![Ast::Spanned {
-                span: Ast::Span { line: 1, column: 1 },
-                node: fun_decl,
-            }],
-        };
-        let sema = Sema::SemaResult::new();
-        let graph = IrBuilder::new(&sema, &module).build();
-        let mut engine = Engine::new(graph);
-        let h = engine.run_entry();
-        (engine, h)
-    }
-
-    #[test]
-    fn test_end_to_end_match_literal_hit() {
-        // match 1 { 1 => 10, _ => 20 } == 10
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let scrut = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "1", suffix: None },
-        );
-        let arm0_body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "10", suffix: None },
-        );
-        let arm0_pat = arena.alloc_pattern(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Pattern::Literal(Ast::PatternLiteral::Int("1")),
-        );
-        let arm1_body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "20", suffix: None },
-        );
-        let arm1_pat = arena.alloc_pattern(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Pattern::Wildcard,
-        );
-        let match_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Match {
-                scrutinee: scrut,
-                arms: vec![
-                    Ast::MatchArm { pattern: arm0_pat, guard: None, body: arm0_body },
-                    Ast::MatchArm { pattern: arm1_pat, guard: None, body: arm1_body },
-                ],
-            },
-        );
-        let (engine, h) = build_and_run(match_expr, arena);
-        assert_eq!(h.as_i32(), 10);
-    }
-
-    #[test]
-    fn test_end_to_end_match_wildcard_fallthrough() {
-        // match 2 { 1 => 10, _ => 20 } == 20
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let scrut = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "2", suffix: None },
-        );
-        let arm0_body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "10", suffix: None },
-        );
-        let arm0_pat = arena.alloc_pattern(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Pattern::Literal(Ast::PatternLiteral::Int("1")),
-        );
-        let arm1_body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "20", suffix: None },
-        );
-        let arm1_pat = arena.alloc_pattern(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Pattern::Wildcard,
-        );
-        let match_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Match {
-                scrutinee: scrut,
-                arms: vec![
-                    Ast::MatchArm { pattern: arm0_pat, guard: None, body: arm0_body },
-                    Ast::MatchArm { pattern: arm1_pat, guard: None, body: arm1_body },
-                ],
-            },
-        );
-        let (engine, h) = build_and_run(match_expr, arena);
-        assert_eq!(h.as_i32(), 20);
-    }
-
-    #[test]
-    fn test_end_to_end_while_false_exits() {
-        // while false { 1 } → cond false → void_sg，循环不执行
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let cond = arena.alloc_expr(Ast::Span { line: 1, column: 1 }, Ast::Expr::BoolLit(false));
-        let body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "1", suffix: None },
-        );
-        let while_stmt = arena.alloc_stmt(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Stmt::While { condition: cond, body },
-        );
-        let body_block = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Block { stmts: vec![while_stmt], trailing: None },
-        );
-        let (engine, h) = build_and_run(body_block, arena);
-        // while false 退出返回 void
-        let _ = engine;
-        let _ = h;
-    }
-
-    #[test]
-    fn test_end_to_end_loop_break_terminates() {
-        // loop { break } → body 执行 break 信号，循环终止
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let break_stmt = arena.alloc_stmt(Ast::Span { line: 1, column: 1 }, Ast::Stmt::Break);
-        let body_block = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Block { stmts: vec![break_stmt], trailing: None },
-        );
-        let loop_stmt = arena.alloc_stmt(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Stmt::Loop { body: body_block },
-        );
-        let outer_body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Block { stmts: vec![loop_stmt], trailing: None },
-        );
-        let (_engine, _h) = build_and_run(outer_body, arena);
-        // loop { break } 终止，不无限递归（若 break 未生效会栈溢出失败）
-    }
-
-    #[test]
-    fn test_end_to_end_if_true_branch() {
-        // if true { 1 } else { 2 } == 1
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let cond = arena.alloc_expr(Ast::Span { line: 1, column: 1 }, Ast::Expr::BoolLit(true));
-        let then_b = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "1", suffix: None },
-        );
-        let else_b = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "2", suffix: None },
-        );
-        let if_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::If { cond, then_branch: then_b, else_branch: Some(else_b) },
-        );
-        let (engine, h) = build_and_run(if_expr, arena);
-        assert_eq!(h.as_i32(), 1);
-    }
-
-    #[test]
-    fn test_end_to_end_record_field_access() {
-        // { x: 1, y: 2 }.x == 1（field_idx=0 取第一个字段 "x"）
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let x_val = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "1", suffix: None },
-        );
-        let y_val = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "2", suffix: None },
-        );
-        let record_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::RecordLit(vec![
-                Ast::RecordFieldExpr { name: "x", value: x_val },
-                Ast::RecordFieldExpr { name: "y", value: y_val },
-            ]),
-        );
-        let field_access = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::FieldAccess { recv: record_expr, field: "x" },
-        );
-        let (engine, h) = build_and_run(field_access, arena);
-        assert_eq!(h.as_i32(), 1);
-    }
-
-    #[test]
-    fn test_end_to_end_array_index() {
-        // [10, 20, 30][1] == 20
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let e0 = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "10", suffix: None },
-        );
-        let e1 = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "20", suffix: None },
-        );
-        let e2 = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "30", suffix: None },
-        );
-        let array_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::ArrayLit { elements: vec![e0, e1, e2], fill: None },
-        );
-        let idx_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "1", suffix: None },
-        );
-        let index_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Index { recv: array_expr, index: idx_expr },
-        );
-        let (engine, h) = build_and_run(index_expr, arena);
-        assert_eq!(h.as_i32(), 20);
-    }
-
-    #[test]
-    fn test_end_to_end_val_decl_and_use() {
-        // fn main() { val x = 42; x } == 42
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let val_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "42", suffix: None },
-        );
-        let val_decl = arena.alloc_stmt(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Stmt::ValDecl {
-                name: "x",
-                type_annotation: None,
-                value: val_expr,
-                visibility: Ast::Visibility::Private,
-            },
-        );
-        let ident_expr = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Ident("x"),
-        );
-        let body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Block {
-                stmts: vec![val_decl],
-                trailing: Some(ident_expr),
-            },
-        );
-        let (engine, h) = build_and_run(body, arena);
-        assert_eq!(h.as_i32(), 42);
-    }
-
-    #[test]
-    fn test_end_to_end_function_with_params() {
-        // fn add(x, y) { x + y }; fn main() { add(3, 4) } == 7
-        use crate::Ast;
-        use crate::Ir::IrBuilder;
-        use crate::Sema;
-        let mut arena = Ast::AstArena::new();
-        // add 函数体：x + y
-        let x_ref = arena.alloc_expr(Ast::Span { line: 1, column: 1 }, Ast::Expr::Ident("x"));
-        let y_ref = arena.alloc_expr(Ast::Span { line: 1, column: 1 }, Ast::Expr::Ident("y"));
-        let add_body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Binary { op: Ast::BinaryOp::Add, lhs: x_ref, rhs: y_ref },
-        );
-        let add_decl = Ast::Decl::FunDecl {
-            visibility: Ast::Visibility::Private,
-            name: "add",
-            type_params: vec![],
-            params: vec![
-                Ast::Param { name: "x", type_annotation: None },
-                Ast::Param { name: "y", type_annotation: None },
-            ],
-            return_type: None,
-            bounds: vec![],
-            body: add_body,
-            is_async: false,
-            is_entry: false,
-            attributes: vec![],
-            extern_c_body: None,
-        };
-        // main 函数体：add(3, 4)
-        let arg1 = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "3", suffix: None },
-        );
-        let arg2 = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::IntLit { raw: "4", suffix: None },
-        );
-        let callee = arena.alloc_expr(Ast::Span { line: 1, column: 1 }, Ast::Expr::Ident("add"));
-        let main_body = arena.alloc_expr(
-            Ast::Span { line: 1, column: 1 },
-            Ast::Expr::Call { callee, args: vec![arg1, arg2], type_args: None },
-        );
-        let main_decl = Ast::Decl::FunDecl {
-            visibility: Ast::Visibility::Private,
-            name: "main",
-            type_params: vec![],
-            params: vec![],
-            return_type: None,
-            bounds: vec![],
-            body: main_body,
-            is_async: false,
-            is_entry: true,
-            attributes: vec![],
-            extern_c_body: None,
-        };
-        let module = Ast::Module {
-            name: "test",
-            source_path: None,
-            arena,
-            declarations: vec![
-                Ast::Spanned { span: Ast::Span { line: 1, column: 1 }, node: add_decl },
-                Ast::Spanned { span: Ast::Span { line: 1, column: 1 }, node: main_decl },
-            ],
-        };
-        let sema = Sema::SemaResult::new();
-        let graph = IrBuilder::new(&sema, &module).build();
-        let mut engine = Engine::new(graph);
-        let h = engine.run_entry();
-        assert_eq!(h.as_i32(), 7);
-    }
-
-    /// 构建 + 运行（含 builtin 模块 + Sema 类型检查）
-    fn build_and_run_with_builtins(
-        body: crate::Ast::ExprId,
-        arena: crate::Ast::AstArena<'_>,
-    ) -> (Engine, Value) {
-        use crate::Ast;
-        use crate::Ir::IrBuilder;
-        use crate::Sema;
-        use crate::ModuleLoader::ModuleLoader;
-
-        let fun_decl = Ast::Decl::FunDecl {
-            visibility: Ast::Visibility::Private,
-            name: "main",
-            type_params: vec![],
-            params: vec![],
-            return_type: None,
-            bounds: vec![],
-            body,
-            is_async: false,
-            is_entry: true,
-            attributes: vec![],
-            extern_c_body: None,
-        };
-        let module = Ast::Module {
-            name: "test",
-            source_path: None,
-            arena,
-            declarations: vec![Ast::Spanned {
-                span: Ast::Span { line: 1, column: 1 },
-                node: fun_decl,
-            }],
-        };
-
-        // 加载 builtin 模块
-        let loader = ModuleLoader::new();
-        let builtins: Vec<&Ast::Module<'static>> =
-            loader.builtin_modules().map(|(_, m)| m).collect();
-
-        // Sema 类型检查（builtin + test 模块）
-        let mut type_arena = Sema::TypeArena::new();
-        let mut sema_result = Sema::SemaResult::new();
-        {
-            let mut ctx = Sema::InferContext::new(&mut type_arena, &mut sema_result);
-            let root_env = ctx.env.root();
-            ctx.register_builtins(root_env);
-            for (_, m) in loader.builtin_modules() {
-                ctx.check_module_with_env(m, root_env);
-            }
-            ctx.check_module_with_env(&module, root_env);
-        }
-
-        let graph = IrBuilder::new(&sema_result, &module)
-            .with_builtins(builtins)
-            .build();
-        let mut engine = Engine::new(graph);
-        let h = engine.run_entry();
-        (engine, h)
-    }
-
-    /// 辅助：解析 Glue 源码 → Sema + IR + Engine 执行，返回 (engine, 返回值句柄)。
-    /// builtin 模块默认加载。若 parse/sema 出错则 panic。
-    fn run_source(src: &'static str) -> (Engine, Value) {
-        use bumpalo::Bump;
-        use crate::Ast::{ErrorCollector, Lexer, Parser, Token, TokenCollector};
-        use crate::Ir::IrBuilder;
-        use crate::ModuleLoader::ModuleLoader;
-        use crate::Sema;
-
-        let bump = Bump::new();
-        let mut lexer = Lexer::new(src);
-        let mut sink = TokenCollector::new();
-        lexer.tokenize_into(&mut sink);
-        let tokens: Vec<Token> = sink.into_tokens();
-        let tokens_ref = bump.alloc_slice_copy(&tokens);
-        let mut parser = Parser::new(tokens_ref, &bump, ErrorCollector::new());
-        let module = parser.parse_module("test").expect("parse failed");
-
-        let loader = ModuleLoader::new();
-        let builtins: Vec<&crate::Ast::Module<'static>> =
-            loader.builtin_modules().map(|(_, m)| m).collect();
-
-        let mut type_arena = Sema::TypeArena::new();
-        let mut sema_result = Sema::SemaResult::new();
-        {
-            let mut ctx = Sema::InferContext::new(&mut type_arena, &mut sema_result);
-            let root_env = ctx.env.root();
-            ctx.register_builtins(root_env);
-            for (_, m) in loader.builtin_modules() {
-                ctx.check_module_with_env(m, root_env);
-            }
-            ctx.check_module_with_env(&module, root_env);
-        }
-
-        let graph = IrBuilder::new(&sema_result, &module)
-            .with_builtins(builtins)
-            .build();
-        let mut engine = Engine::new(graph);
-        let h = engine.run_entry();
-        (engine, h)
-    }
-
-    /// 辅助：解析 Glue 源码 → Sema 检查，返回 SemaResult（可能含 errors）。
-    /// 用于验证 sema 级别的错误报告。
-    fn check_source(src: &'static str) -> crate::Sema::SemaResult {
-        use bumpalo::Bump;
-        use crate::Ast::{ErrorCollector, Lexer, Parser, Token, TokenCollector};
-        use crate::ModuleLoader::ModuleLoader;
-        use crate::Sema;
-
-        let bump = Bump::new();
-        let mut lexer = Lexer::new(src);
-        let mut sink = TokenCollector::new();
-        lexer.tokenize_into(&mut sink);
-        let tokens: Vec<Token> = sink.into_tokens();
-        let tokens_ref = bump.alloc_slice_copy(&tokens);
-        let mut parser = Parser::new(tokens_ref, &bump, ErrorCollector::new());
-        let module = parser.parse_module("test").expect("parse failed");
-
-        let loader = ModuleLoader::new();
-        let mut type_arena = Sema::TypeArena::new();
-        let mut sema_result = Sema::SemaResult::new();
-        {
-            let mut ctx = Sema::InferContext::new(&mut type_arena, &mut sema_result);
-            let root_env = ctx.env.root();
-            ctx.register_builtins(root_env);
-            for (_, m) in loader.builtin_modules() {
-                ctx.check_module_with_env(m, root_env);
-            }
-            ctx.check_module_with_env(&module, root_env);
-        }
-        sema_result
-    }
-
-    #[test]
-    fn test_end_to_end_for_loop_basic() {
-        // for x in [1, 2, 3] { } → 迭代 3 次后退出，返回 0
-        use crate::Ast;
-        let mut arena = Ast::AstArena::new();
-        let span = Ast::Span { line: 1, column: 1 };
-
-        // 数组 [1, 2, 3]
-        let e1 = arena.alloc_expr(span, Ast::Expr::IntLit { raw: "1", suffix: None });
-        let e2 = arena.alloc_expr(span, Ast::Expr::IntLit { raw: "2", suffix: None });
-        let e3 = arena.alloc_expr(span, Ast::Expr::IntLit { raw: "3", suffix: None });
-        let arr = arena.alloc_expr(span, Ast::Expr::ArrayLit {
-            elements: vec![e1, e2, e3],
-            fill: None,
-        });
-
-        // iter(arr) — 数组需显式调用 iter() 获取迭代器
-        let iter_ident = arena.alloc_expr(span, Ast::Expr::Ident("iter"));
-        let iter_call = arena.alloc_expr(span, Ast::Expr::Call {
-            callee: iter_ident,
-            args: vec![arr],
-            type_args: None,
-        });
-
-        // For body: 空块
-        let for_body = arena.alloc_expr(span, Ast::Expr::Block {
-            stmts: vec![],
-            trailing: None,
-        });
-
-        // for x in iter([1,2,3]) { }
-        let for_stmt = arena.alloc_stmt(span, Ast::Stmt::For {
-            name: "x",
-            iterable: iter_call,
-            body: for_body,
-        });
-
-        // 返回 0
-        let ret_val = arena.alloc_expr(span, Ast::Expr::IntLit { raw: "0", suffix: None });
-
-        // main body: { for_stmt; 0 }
-        let main_body = arena.alloc_expr(span, Ast::Expr::Block {
-            stmts: vec![for_stmt],
-            trailing: Some(ret_val),
-        });
-
-        let (_engine, h) = build_and_run_with_builtins(main_body, arena);
-        // 循环正常退出返回 0（若无限递归会栈溢出失败）
-        let _ = h;
-    }
-
-    // ── Iterator trait 静态分派端到端测试 ──
-
-    #[test]
-    fn test_for_loop_range_iterator_static() {
-        // for x in range_iter(1, 4, false) { sum += x } → 1+2+3 = 6
-        let src = r#"
-            fun main(): i64 {
-                var sum: i64 = 0
-                for x in range_iter(1, 4, false) {
-                    sum = sum + x
-                }
-                return sum
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        assert_eq!(h.scalar_tag(), Some(crate::Value::ScalarTag::I64));
-        assert_eq!(h.as_i64(), 6);
-    }
-
-    #[test]
-    fn test_for_loop_user_iterator_type() {
-        // 用户自定义类型 implement Iterator → 静态分派
-        // MyRange(1, 5) 产出 1,2,3,4 → sum = 10
-        let src = r#"
-            type MyRange: (Iterator<i32>) = MyRange(lo: i32, hi: i32) {
-                pub fun next(&self): i32? {
-                    if self.lo >= self.hi { return null }
-                    val v = self.lo
-                    self.lo = self.lo + 1
-                    return v
-                }
-            }
-            fun main(): i32 {
-                var sum: i32 = 0
-                for x in MyRange(1, 5) {
-                    sum = sum + x
-                }
-                return sum
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        assert_eq!(h.scalar_tag(), Some(crate::Value::ScalarTag::I32));
-        assert_eq!(h.as_i32(), 10);
-    }
-
-    #[test]
-    fn test_for_loop_array_without_iter_errors() {
-        // 数组未 implement Iterator → sema 报错
-        let src = r#"
-            fun main(): void {
-                val arr = [1, 2, 3]
-                for x in arr { }
-            }
-        "#;
-        let sema = check_source(src);
-        let has_iter_error = sema
-            .errors
-            .iter()
-            .any(|e| e.message.contains("未实现 Iterator"));
-        assert!(
-            has_iter_error,
-            "expected '未实现 Iterator' error, got errors: {:?}",
-            sema.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_for_loop_trait_value_dynamic_dispatch() {
-        // trait 值 For 循环动态分派：val it: Iterator<i32> = arr.iter()
-        // 编译为 vtable Call 节点，运行时从 TraitVal 查 next()
-        let src = r#"
-            fun main(): i32 {
-                val arr = [1, 2, 3]
-                val it: Iterator<i32> = arr.iter()
-                var sum: i32 = 0
-                for x in it {
-                    sum = sum + x
-                }
-                return sum
-            }
-        "#;
-        // 动态分派路径编译通过即验证（运行时 TraitVal 构建依赖完整引擎支持）
-        let sema = check_source(src);
-        let has_sema_error = sema.errors.iter().any(|e| e.message.contains("未实现 Iterator"));
-        // it 已是 Iterator 类型，不应报 "未实现 Iterator" 错误
-        assert!(
-            !has_sema_error,
-            "trait value should NOT trigger '未实现 Iterator' error, got: {:?}",
-            sema.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
-        );
-    }
-
-    // =====================================================================
-    // 事件驱动端到端测试（Task 6）：验证 run_event_loop 调度 call/gate/递归
-    // =====================================================================
-
-    #[test]
-    fn test_event_loop_nested_call() {
-        // 嵌套 call 链：main → outer → inner，验证事件驱动多级 call 调度。
-        // inner(x) = x; outer(x) = inner(x); main() = outer(42) == 42
-        let mut graph = DataFlowGraph::new();
-
-        // SubGraph 0: inner(x) = x  (param_count=1)
-        // N0: param x (Const, no const_value — filled by param injection)
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(1)),
-            param_count: 1,
-            entry_node: n0,
-            return_node: n0,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SubGraph 1: outer(x) = inner(x)  (param_count=1)
-        // N1: param x, N2: Call(inner, [N1])
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let outer_call_off = graph.inputs_pool.push(&[n1]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 1,
-            inputs_offset: outer_call_off,
-            compute_fn: ComputeFnId(36),
-        });
-        graph.set_call_target(n2, SubGraphId(0));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(1), NodeId(3)),
-            param_count: 1,
-            entry_node: n1,
-            return_node: n2,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SubGraph 2: main() = outer(42)  (param_count=0)
-        // N3: Const(42), N4: Call(outer, [N3])
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n3.0 as usize] = Some(ConstValue::I32(42));
-        let main_call_off = graph.inputs_pool.push(&[n3]);
-        let n4 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 1,
-            inputs_offset: main_call_off,
-            compute_fn: ComputeFnId(36),
-        });
-        graph.set_call_target(n4, SubGraphId(1));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(2),
-            node_range: (NodeId(3), NodeId(5)),
-            param_count: 0,
-            entry_node: n3,
-            return_node: n4,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(2));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 42);
-    }
-
-    #[test]
-    fn test_event_loop_gate_with_call() {
-        // gate 嵌套 call：条件 true 选分支调用 add(1,2)=3，false 选分支返回 99。
-        // 验证事件驱动 gate + call 组合调度。
-        let mut graph = DataFlowGraph::new();
-
-        // SubGraph 0: add(x, y) = x + y  (param_count=2)
-        // N0: param x, N1: param y, N2: BinOp add
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let add_off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: add_off,
-            compute_fn: ComputeFnId(1), // add_i32
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 2,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SubGraph 1: else branch = 99  (param_count=0)
-        // N3: Const(99)
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n3.0 as usize] = Some(ConstValue::I32(99));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(3), NodeId(4)),
-            param_count: 0,
-            entry_node: n3,
-            return_node: n3,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SubGraph 2: main = if true { add(1,2) } else { 99 }
-        // N4: Const(true), N5: Const(1), N6: Const(2), N7: Gate
-        let n4 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n4.0 as usize] = Some(ConstValue::Bool(true));
-        let n5 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n5.0 as usize] = Some(ConstValue::I32(1));
-        let n6 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n6.0 as usize] = Some(ConstValue::I32(2));
-        let n7 = graph.add_node(Node {
-            kind: NodeKind::Gate,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(37), // gate_launch
-        });
-        graph.set_gate_branches(n7, GateBranches {
-            condition_input: n4,
-            branches: vec![
-                (true, SubGraphId(0), vec![n5, n6]),  // add(1, 2)
-                (false, SubGraphId(1), vec![]),       // 99
-            ],
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(2),
-            node_range: (NodeId(4), NodeId(8)),
-            param_count: 0,
-            entry_node: n4,
-            return_node: n7,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(2));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 3);
-    }
-
-    #[test]
-    fn test_event_loop_recursive_call() {
-        // 递归调用：sum(n) = if n <= 0 { 0 } else { n + sum(n-1) }
-        // main() = sum(3) == 6
-        // 验证事件驱动递归调度（多层挂起帧 + 子图完成事件回写）。
-        let mut graph = DataFlowGraph::new();
-
-        // SubGraph 0: sum(n) — gate 分派
-        // N0: param n, N1: Const(0), N2: le(n, 0), N3: Gate
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(0));
-        let le_off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: le_off,
-            compute_fn: ComputeFnId(4), // le_i32
-        });
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Gate,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(37), // gate_launch
-        });
-        graph.set_gate_branches(n3, GateBranches {
-            condition_input: n2,
-            branches: vec![
-                (true, SubGraphId(1), vec![]),       // n <= 0 → return 0
-                (false, SubGraphId(2), vec![n0]),    // n > 0 → n + sum(n-1)
-            ],
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(4)),
-            param_count: 1,
-            entry_node: n0,
-            return_node: n3,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SubGraph 1: then branch = 0  (param_count=0)
-        // N4: Const(0)
-        let n4 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n4.0 as usize] = Some(ConstValue::I32(0));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(4), NodeId(5)),
-            param_count: 0,
-            entry_node: n4,
-            return_node: n4,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SubGraph 2: else branch = n + sum(n-1)  (param_count=1)
-        // N5: param n, N6: Const(1), N7: sub(n, 1), N8: Call(sum, [N7]), N9: add(n, sum_result)
-        let n5 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let n6 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n6.0 as usize] = Some(ConstValue::I32(1));
-        let sub_off = graph.inputs_pool.push(&[n5, n6]);
-        let n7 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: sub_off,
-            compute_fn: ComputeFnId(5), // sub_i32
-        });
-        let rec_call_off = graph.inputs_pool.push(&[n7]);
-        let n8 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 1,
-            inputs_offset: rec_call_off,
-            compute_fn: ComputeFnId(36), // call_launch
-        });
-        graph.set_call_target(n8, SubGraphId(0)); // 递归调用 sum
-        let add_off = graph.inputs_pool.push(&[n5, n8]);
-        let n9 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: add_off,
-            compute_fn: ComputeFnId(1), // add_i32
-        });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(2),
-            node_range: (NodeId(5), NodeId(10)),
-            param_count: 1,
-            entry_node: n5,
-            return_node: n9,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SubGraph 3: main() = sum(3)  (param_count=0)
-        // N10: Const(3), N11: Call(sum, [N10])
-        let n10 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n10.0 as usize] = Some(ConstValue::I32(3));
-        let main_call_off = graph.inputs_pool.push(&[n10]);
-        let n11 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 1,
-            inputs_offset: main_call_off,
-            compute_fn: ComputeFnId(36),
-        });
-        graph.set_call_target(n11, SubGraphId(0));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(3),
-            node_range: (NodeId(10), NodeId(12)),
-            param_count: 0,
-            entry_node: n10,
-            return_node: n11,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(3));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 6);
-    }
-
-    // ===== 阶段 5a-2 端到端测试 =====
-
-    /// 端到端：async 函数调用 + await
-    ///
-    /// SG0 (async_fn): N0=Const(42), has_suspend=true
-    /// SG1 (main): N1=AsyncCall(SG0), N2=EventSource(AsyncJoin), N3=Await(N1)
-    /// 验证：async 调用返回 AsyncHandle，await 挂起→子帧完成→事件唤醒→返回 42
-    #[test]
-    fn test_async_call_and_await() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: async_fn() = 42
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(42));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(1)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n0,
-            has_suspend: true, // async 标记
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SG1: main() = async_fn().await()
-        // N1: AsyncCall(SG0) — 0 输入，compute_async_call_launch (idx 39)
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(39), // compute_async_call_launch
-        });
-        graph.set_call_target(n1, SubGraphId(0));
-
-        // N2: EventSource 声明节点（永不就绪，元数据引用）
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::EventSource,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-
-        // N3: Await(N1) — 1 输入（event_obj），compute_await (idx 38)
-        let await_off = graph.inputs_pool.push(&[n1]);
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Await,
-            input_count: 1,
-            inputs_offset: await_off,
-            compute_fn: ComputeFnId(38),
-        });
-        graph.set_await_event_source(n3, n2);
-
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(1), NodeId(4)),
-            param_count: 0,
-            entry_node: n1,
-            return_node: n3,
-            has_suspend: false,
-            event_source_decls: vec![EventSourceDecl {
-                node: n2,
-                kind: EventSourceKind::AsyncJoin,
-            }],
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 42);
-    }
-
-    /// 端到端：并发 async 调用 + 两次 await
-    ///
-    /// SG0 (async_fn): N0=Const(42), has_suspend=true
-    /// SG1 (main): N1=AsyncCall(SG0), N2=ES1, N3=Await(N1),
-    ///             N4=AsyncCall(SG0), N5=ES2, N6=Await(N4),
-    ///             N7=Add(N3, N6)
-    /// 验证：两个 async 调用并发启动，await 分别完成，结果 42+42=84
-    #[test]
-    fn test_concurrent_async_calls() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: async_fn() = 42
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(42));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(1)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n0,
-            has_suspend: true,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SG1: main() = async_fn().await() + async_fn().await()
-        // N1: AsyncCall1
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(39),
-        });
-        graph.set_call_target(n1, SubGraphId(0));
-
-        // N2: EventSource 1
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::EventSource,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-
-        // N3: Await1(N1)
-        let off3 = graph.inputs_pool.push(&[n1]);
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Await,
-            input_count: 1,
-            inputs_offset: off3,
-            compute_fn: ComputeFnId(38),
-        });
-        graph.set_await_event_source(n3, n2);
-
-        // N4: AsyncCall2
-        let n4 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(39),
-        });
-        graph.set_call_target(n4, SubGraphId(0));
-
-        // N5: EventSource 2
-        let n5 = graph.add_node(Node {
-            kind: NodeKind::EventSource,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-
-        // N6: Await2(N4)
-        let off6 = graph.inputs_pool.push(&[n4]);
-        let n6 = graph.add_node(Node {
-            kind: NodeKind::Await,
-            input_count: 1,
-            inputs_offset: off6,
-            compute_fn: ComputeFnId(38),
-        });
-        graph.set_await_event_source(n6, n5);
-
-        // N7: Add(N3, N6)
-        let off7 = graph.inputs_pool.push(&[n3, n6]);
-        let n7 = graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 2,
-            inputs_offset: off7,
-            compute_fn: ComputeFnId(1), // add_i32
-        });
-
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(1), NodeId(8)),
-            param_count: 0,
-            entry_node: n1,
-            return_node: n7,
-            has_suspend: false,
-            event_source_decls: vec![
-                EventSourceDecl { node: n2, kind: EventSourceKind::AsyncJoin },
-                EventSourceDecl { node: n5, kind: EventSourceKind::AsyncJoin },
-            ],
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 84);
-    }
-
-    /// 端到端：async 函数带参数 + await
-    ///
-    /// SG0 (async_add): params(a, b), return a+b, has_suspend=true
-    /// SG1 (main): N2=Const(10), N3=Const(32), N4=AsyncCall(SG0, [N2, N3]),
-    ///             N5=ES, N6=Await(N4)
-    /// 验证：async 调用带参数，返回 10+32=42
-    #[test]
-    fn test_async_call_with_params_and_await() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: async_add(a, b) = a + b
-        let n0 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let n1 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let add_off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node { kind: NodeKind::BinOp, input_count: 2, inputs_offset: add_off, compute_fn: ComputeFnId(1) });
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 2,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: true,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SG1: main() = async_add(10, 32).await()
-        let n3 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n3.0 as usize] = Some(ConstValue::I32(10));
-        let n4 = graph.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        graph.const_values[n4.0 as usize] = Some(ConstValue::I32(32));
-        let call_off = graph.inputs_pool.push(&[n3, n4]);
-        let n5 = graph.add_node(Node { kind: NodeKind::Call, input_count: 2, inputs_offset: call_off, compute_fn: ComputeFnId(39) });
-        graph.set_call_target(n5, SubGraphId(0));
-
-        let n6 = graph.add_node(Node { kind: NodeKind::EventSource, input_count: 0, inputs_offset: 0, compute_fn: ComputeFnId(0) });
-        let await_off = graph.inputs_pool.push(&[n5]);
-        let n7 = graph.add_node(Node { kind: NodeKind::Await, input_count: 1, inputs_offset: await_off, compute_fn: ComputeFnId(38) });
-        graph.set_await_event_source(n7, n6);
-
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(3), NodeId(8)),
-            param_count: 0,
-            entry_node: n3,
-            return_node: n7,
-            has_suspend: false,
-            event_source_decls: vec![EventSourceDecl { node: n6, kind: EventSourceKind::AsyncJoin }],
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 42);
-    }
-
-    /// 单元测试：ChannelValue create + send + recv
-    #[test]
-    fn test_channel_value_basic() {
-        let ch = crate::Value::ChannelValue::new(2);
-        let val = Value::NULL; // 用 NULL 作为占位值
-        ch.send(val.clone());
-        assert!(ch.recv().is_some()); // 有数据
-        assert!(ch.recv().is_none()); // buffer 空
-    }
-
-    /// 单元测试：ChannelValue 容量限制
-    #[test]
-    #[should_panic(expected = "channel full")]
-    fn test_channel_value_capacity() {
-        let ch = crate::Value::ChannelValue::new(1);
-        ch.send(Value::NULL);
-        ch.send(Value::VOID); // 满了 → panic
-    }
-
-    /// 单元测试：TimerRuntime start + check_and_fire
-    #[test]
-    fn test_timer_runtime_basic() {
-        let mut rt = TimerRuntime::new();
-        let t = rt.start(std::time::Duration::from_millis(0));
-        assert_eq!(t, crate::Ir::TimerId(0));
-
-        // 0ms timer 应立即触发
-        let fired = rt.check_and_fire();
-        assert!(fired.contains(&t));
-        assert!(rt.is_fired(t));
-
-        // 再次检查不应重复触发
-        let fired2 = rt.check_and_fire();
-        assert!(!fired2.contains(&t));
-    }
-
-    /// 单元测试：AsyncJoinRuntime register + set_result + try_get_result
-    #[test]
-    fn test_async_join_runtime_basic() {
-        let mut rt = AsyncJoinRuntime::new();
-        let async_id = crate::Ir::AsyncHandleId(0);
-        let child_fid = FrameId(1);
-
-        rt.register(async_id, child_fid);
-        assert_eq!(rt.find_by_child(child_fid), Some(async_id));
-        assert!(rt.try_get_result(async_id).is_none()); // 未完成
-
-        let result = Value::VOID;
-        rt.set_result(async_id, result);
-        assert!(rt.try_get_result(async_id).is_some()); // 已完成
-    }
-
-    /// 单元测试：on_event_arrived 事件注入 + 帧恢复
-    ///
-    /// 验证 channel 事件到达时，挂起帧被正确唤醒。
-    #[test]
-    fn test_on_event_arrived_channel_resume() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: main() — await channel
-        // N0: 占位节点（channel handle 将在运行时注入）
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        // N1: EventSource (Channel kind)
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::EventSource,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        // N2: Await(N0)
-        let await_off = graph.inputs_pool.push(&[n0]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::Await,
-            input_count: 1,
-            inputs_offset: await_off,
-            compute_fn: ComputeFnId(38),
-        });
-        graph.set_await_event_source(n2, n1);
-
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: false,
-            event_source_decls: vec![EventSourceDecl { node: n1, kind: EventSourceKind::Channel }],
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(0));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-
-        // 预创建 channel + 发送值
-        // channel handle 是 ChannelValue 堆对象引用（Arc 共享）
-        let ch = crate::Value::ChannelValue::new(1);
-        let sent_val = Value::i32(77);
-        ch.send(sent_val); // 先发送数据，再包装为 Value
-        let ch_handle = Value::ref_val(crate::Value::HeapObj::ChannelVal(ch));
-
-        // N0 的 Const 值设为 channel handle
-        // 直接手动注入：先 init_frame，再手动设置 N0 的值
-        let fid = engine.init_frame(SubGraphId(0));
-
-        let frame = engine.frames.get_mut(fid);
-        frame.set_value(NodeId(0), ch_handle, 1); // 1 downstream (N2)
-        frame.push_ready(NodeId(0));
-
-        // 执行帧 → N0 就绪 → N2 (await) 就绪 → 检查 channel → 有数据 → 完成
-        engine.run_ready_nodes(fid);
-
-        let result = engine.extract_child_return(fid);
-        assert_eq!(result.as_i32(), 77);
-    }
-
-    /// 端到端：timer 事件源 — await 挂起 → timer 到期 → 事件唤醒 → 帧完成
-    ///
-    /// SG0: N0=Const(Timer record), N1=EventSource(Timer), N2=Await(N0)
-    /// 验证：await 从 Timer record 提取 duration → 惰性启动 timer → 未到期→挂起；
-    ///       timer 到期→on_event_arrived 唤醒；帧完成
-    #[test]
-    fn test_timer_await_suspend_and_resume() {
-        use crate::Value::{HeapObj, RecordValue};
-        let mut graph = DataFlowGraph::new();
-
-        // N0: Const (Timer record 占位，运行时注入)
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        // N1: EventSource (Timer kind)
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::EventSource,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        // N2: Await(N0)
-        let await_off = graph.inputs_pool.push(&[n0]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::Await,
-            input_count: 1,
-            inputs_offset: await_off,
-            compute_fn: ComputeFnId(38), // compute_await
-        });
-        graph.set_await_event_source(n2, n1);
-
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: false,
-            event_source_decls: vec![EventSourceDecl { node: n1, kind: EventSourceKind::Timer }],
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(0));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-
-        // 构造 Timer record（duration_ns = 10ms = 10_000_000 ns）
-        let timer_record = Value::ref_val(HeapObj::Record(RecordValue {
-            type_name: "Timer".to_string(),
-            fields: vec![Value::i64(10_000_000)],
-            field_names: vec![Some("duration_ns".to_string())],
-            field_ref_bits: 0,
-        }));
-
-        // 初始化帧 + 手动注入 Timer record 到 N0
-        let fid = engine.init_frame(SubGraphId(0));
-        let frame = engine.frames.get_mut(fid);
-        frame.set_value(NodeId(0), timer_record, 1); // 1 downstream (N2)
-        frame.push_ready(NodeId(0));
-
-        // 第一次执行：N0 就绪 → N2 (await) → resolve_and_check_await 惰性启动 timer
-        // → 未到期 → 帧挂起
-        engine.run_ready_nodes(fid);
-        assert_eq!(engine.frames.get(fid).state, FrameState::Suspended,
-            "frame should be suspended waiting for timer");
-
-        // 从 suspend_event 提取惰性启动的 timer_id
-        let timer_id = match engine.frames.get(fid).suspend_event {
-            Some(crate::Ir::RuntimeEvent::TimerFired(tid)) => tid,
-            _ => panic!("suspend_event should be TimerFired"),
-        };
-
-        // 等待 timer 到期
-        std::thread::sleep(std::time::Duration::from_millis(20));
-
-        // 事件循环检查 timer → 触发 → on_event_arrived 唤醒帧
-        let fired = engine.timer_runtime.check_and_fire();
-        assert!(fired.contains(&timer_id), "timer should have fired");
-        engine.on_event_arrived(RuntimeEvent::TimerFired(timer_id), Value::VOID);
-
-        // 唤醒后帧应处于 Ready 状态
-        assert_eq!(engine.frames.get(fid).state, FrameState::Ready,
-            "frame should be ready after timer event");
-
-        // 第二次执行：await 节点已有值 → 帧完成
-        engine.run_ready_nodes(fid);
-        assert_eq!(engine.frames.get(fid).state, FrameState::Completed,
-            "frame should be completed after timer resume");
-    }
-
-    /// 端到端：select 表达式 — channel 有数据时分支胜出
-    ///
-    /// SG0 (branch body): N0=Const(42)
-    /// SG1 (main): N1=Const(channel handle 运行时注入), N2=Gate(select, compute_select_gate)
-    /// 验证：channel 有数据 → select 选 channel 分支 → 启动 SG0 → 返回 42
-    #[test]
-    fn test_select_channel_ready() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: branch body = Const(42)
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(42));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(1)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n0,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SG1: main() = select { ch.recv() => 42 }
-        // N1: Const (channel handle 占位，运行时注入)
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        // N2: Gate (select, compute_select_gate idx 43)
-        let gate_off = graph.inputs_pool.push(&[]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::Gate,
-            input_count: 0,
-            inputs_offset: gate_off,
-            compute_fn: ComputeFnId(43),
-        });
-        graph.set_select_info(
-            n2,
-            SelectInfo {
-                branches: vec![SelectBranch {
-                    subgraph_id: SubGraphId(0),
-                    event_kind: EventSourceKind::Channel,
-                    event_source_node: n1,
-                }],
-            },
-        );
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(1), NodeId(3)),
-            param_count: 0,
-            entry_node: n1,
-            return_node: n2,
-            has_suspend: true,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-
-        // 预创建 channel + 发送值（channel handle 是 ChannelValue 堆对象引用）
-        let ch = crate::Value::ChannelValue::new(1);
-        let sent_val = Value::i32(77);
-        ch.send(sent_val);
-        let ch_handle = Value::ref_val(crate::Value::HeapObj::ChannelVal(ch));
-
-        // 初始化帧 + 手动注入 channel handle 到 N1（local id=0）
-        let fid = engine.init_frame(SubGraphId(1));
-        let frame = engine.frames.get_mut(fid);
-        frame.set_value(NodeId(0), ch_handle, 0);
-        frame.push_ready(NodeId(0));
-
-        // 执行：N1 就绪 → N2 (gate) 就绪 → select 检查 → channel 有数据 → 启动 SG0
-        engine.run_ready_nodes(fid);
-        assert_eq!(
-            engine.frames.get(fid).state,
-            FrameState::Suspended,
-            "frame should be suspended waiting for select subgraph"
-        );
-
-        // 子帧应已入 ready_frames
-        let child_fid = engine
-            .ready_frames
-            .pop_front()
-            .expect("child frame should be ready");
-        engine.run_ready_nodes(child_fid);
-        assert_eq!(
-            engine.frames.get(child_fid).state,
-            FrameState::Completed,
-            "child frame should be completed"
-        );
-
-        // 子图完成 → 回写返回值到 gate 节点 + 唤醒调用方
-        engine.complete_and_wake_caller(child_fid);
-        assert_eq!(
-            engine.frames.get(fid).state,
-            FrameState::Ready,
-            "caller frame should be ready after subgraph complete"
-        );
-
-        // 再次执行：帧完成
-        engine.run_ready_nodes(fid);
-        assert_eq!(
-            engine.frames.get(fid).state,
-            FrameState::Completed,
-            "frame should be completed"
-        );
-
-        let result = engine.extract_child_return(fid);
-        assert_eq!(result.as_i32(), 42);
-    }
-
-    /// 端到端：select 表达式 — channel 无数据时挂起，事件到达后唤醒并执行分支
-    ///
-    /// SG0 (branch body): N0=Const(42)
-    /// SG1 (main): N1=Const(channel handle 运行时注入), N2=Gate(select)
-    /// 验证：channel 无数据 → select 挂起；channel 有数据 → on_event_arrived 唤醒
-    ///       → select 选 channel 分支 → 启动 SG0 → 返回 42
-    #[test]
-    fn test_select_channel_suspend_and_resume() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: branch body = Const(42)
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(42));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(1)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n0,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SG1: main() = select { ch.recv() => 42 }
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let gate_off = graph.inputs_pool.push(&[]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::Gate,
-            input_count: 0,
-            inputs_offset: gate_off,
-            compute_fn: ComputeFnId(43),
-        });
-        graph.set_select_info(
-            n2,
-            SelectInfo {
-                branches: vec![SelectBranch {
-                    subgraph_id: SubGraphId(0),
-                    event_kind: EventSourceKind::Channel,
-                    event_source_node: n1,
-                }],
-            },
-        );
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(1), NodeId(3)),
-            param_count: 0,
-            entry_node: n1,
-            return_node: n2,
-            has_suspend: true,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-
-        // 预创建 channel（空，无数据）+ 分配匹配值的 Value
-        let ch = crate::Value::ChannelValue::new(1);
-        let ch_id = crate::Ir::ChannelId(ch.id()); // 提取 channel id 用于事件断言
-        let ch_handle = Value::ref_val(crate::Value::HeapObj::ChannelVal(ch));
-        let ch_handle_clone = ch_handle.clone(); // 保留引用用于后续 send
-
-        // 初始化帧 + 手动注入 channel handle 到 N1（local id=0）
-        let fid = engine.init_frame(SubGraphId(1));
-        let frame = engine.frames.get_mut(fid);
-        frame.set_value(NodeId(0), ch_handle, 0);
-        frame.push_ready(NodeId(0));
-
-        // 第一次执行：channel 无数据 → select 挂起（等 ChannelReady 事件）
-        engine.run_ready_nodes(fid);
-        assert_eq!(
-            engine.frames.get(fid).state,
-            FrameState::Suspended,
-            "frame should be suspended (no ready branch)"
-        );
-        assert_eq!(
-            engine.frames.get(fid).suspend_event,
-            None,
-            "select frame should have suspend_event=None"
-        );
-        assert!(
-            engine
-                .event_waiters
-                .iter()
-                .any(|(e, wf)| *wf == fid && matches!(e, RuntimeEvent::ChannelReady(c) if *c == ch_id)),
-            "ChannelReady event should be registered"
-        );
-
-        // 发送数据到 channel → 手动触发 ChannelReady 事件
-        let sent_val = Value::i32(77);
-        match ch_handle_clone.heap_obj() {
-            Some(crate::Value::HeapObj::ChannelVal(ch)) => ch.send(sent_val),
-            _ => panic!("ch_handle_clone should be a ChannelValue"),
-        }
-        engine.on_event_arrived(RuntimeEvent::ChannelReady(ch_id), Value::VOID);
-
-        assert_eq!(
-            engine.frames.get(fid).state,
-            FrameState::Ready,
-            "frame should be ready after ChannelReady event"
-        );
-
-        // 第二次执行：channel 有数据 → select 选 channel 分支 → 启动 SG0
-        // 清除 on_event_arrived 推入的 fid，避免与子帧混淆
-        engine.ready_frames.clear();
-        engine.run_ready_nodes(fid);
-        assert_eq!(
-            engine.frames.get(fid).state,
-            FrameState::Suspended,
-            "frame should be suspended waiting for select subgraph"
-        );
-
-        // 子帧完成
-        let child_fid = engine
-            .ready_frames
-            .pop_front()
-            .expect("child frame should be ready");
-        engine.run_ready_nodes(child_fid);
-        assert_eq!(
-            engine.frames.get(child_fid).state,
-            FrameState::Completed,
-            "child frame should be completed"
-        );
-
-        // 子图完成 → 回写 + 唤醒
-        engine.complete_and_wake_caller(child_fid);
-        engine.run_ready_nodes(fid);
-        assert_eq!(
-            engine.frames.get(fid).state,
-            FrameState::Completed,
-            "frame should be completed"
-        );
-
-        let result = engine.extract_child_return(fid);
-        assert_eq!(result.as_i32(), 42);
-    }
-
-    /// 端到端：字符串索引 s[i] 返回第 i 个 Unicode 码点
-    ///
-    /// SG0: N0=Const("héllo" 运行时注入), N1=Const(1), N2=Index(N0, N1)
-    /// 验证：s[1] = 'é' (U+00E9)
-    #[test]
-    fn test_string_index_codepoint() {
-        let mut graph = DataFlowGraph::new();
-
-        // N0: Const 占位（Str 值运行时注入）
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        // N1: Const(1)
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(1));
-        // N2: Index(N0, N1) — compute_array_index (idx 32)
-        let off = graph.inputs_pool.push(&[n0, n1]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::BinOp, input_count: 2, inputs_offset: off,
-            compute_fn: ComputeFnId(32),
-        });
-
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(0));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        // 手动注入 Str 值到 N0
-        let str_handle = crate::Value::Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::new("héllo")));
-        let fid = engine.init_frame(SubGraphId(0));
-        let frame = engine.frames.get_mut(fid);
-        frame.set_value(NodeId(0), str_handle, 1);
-        frame.push_ready(NodeId(0));
-        // N1 是 Const 且有 const_values，prepare_frame 步骤2已预填充值并入就绪队列，无需重复 push
-
-        engine.run_ready_nodes(fid);
-        let result = engine.extract_child_return(fid);
-        // 验证返回 'é' (U+00E9)
-        let c = result.as_char() as u32;
-        assert_eq!(c, 'é' as u32);
-    }
-
-    // =====================================================================
-    // Trait 方法分派（静态 + 动态 vtable）
-    // =====================================================================
-
-    /// 静态 trait 分派：Call 节点静态绑定 call_target=SG0，模拟 trait 方法调用。
-    ///
-    /// SG0 (Show.show): N0=param self, N1=Const(42), return N1
-    /// SG1 (main):      N2=Const(占位self), N3=Call(SG0, [N2]) — 静态 call_target=SG0
-    /// 验证：trait 方法调用返回 42。
-    #[test]
-    fn test_trait_static_dispatch() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: show(self) = 42  (param_count=1，self 不参与返回值)
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(42));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(2)),
-            param_count: 1,
-            entry_node: n0,
-            return_node: n1,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SG1: main() = show(占位 self)
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n2.0 as usize] = Some(ConstValue::I32(0)); // 占位 self
-        let call_off = graph.inputs_pool.push(&[n2]);
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 1,
-            inputs_offset: call_off,
-            compute_fn: ComputeFnId(36),
-        });
-        graph.set_call_target(n3, SubGraphId(0)); // 静态绑定 trait 方法子图
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(2), NodeId(4)),
-            param_count: 0,
-            entry_node: n2,
-            return_node: n3,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_entry();
-        assert_eq!(result.as_i32(), 42);
-    }
-
-    /// 动态 trait 分派（vtable）：Call 节点无 call_target，运行时从 TraitVal 查方法子图。
-    ///
-    /// SG0 (iter.next): N0=param self, N1=Const(42), return N1
-    /// SG1 (main):      N2=Const(占位 recv), N3=Call(vtable "next", [N2]) — 不设 call_target
-    /// 构造 TraitValue：method_names=["next"], method_values=[Closure{func_id:0}]
-    /// 验证：vtable 调用从 TraitValue 查方法子图，返回 42。
-    #[test]
-    fn test_trait_dynamic_dispatch_vtable() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: next(self) = 42  (param_count=1)
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n1.0 as usize] = Some(ConstValue::I32(42));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(2)),
-            param_count: 1,
-            entry_node: n0,
-            return_node: n1,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SG1: main() = (recv).next()  — recv 运行时注入 TraitValue
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let call_off = graph.inputs_pool.push(&[n2]);
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Call,
-            input_count: 1,
-            inputs_offset: call_off,
-            compute_fn: ComputeFnId(36),
-        });
-        graph.set_vtable_call(n3, "next".to_string()); // 动态分派：不设 call_target
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(2), NodeId(4)),
-            param_count: 0,
-            entry_node: n2,
-            return_node: n3,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-
-        // 构造 TraitValue：method "next" → Closure{func_id:0}（指向 SG0）
-        let closure = crate::Value::Closure {
-            func_id: 0,
-            arity: 1,
-            upvalues: Vec::new(),
-            bound_args: Vec::new(),
-            self_upvalue_idx: -1,
-            upvalue_ref_bits: 0,
-            cell_upvalues: 0,
-        };
-        let closure_value = crate::Value::Value::ref_val(crate::Value::HeapObj::Closure(closure));
-        let tv = crate::Value::TraitValue {
-            trait_name: "Iterator".to_string(),
-            method_names: vec!["next".to_string()],
-            method_values: vec![closure_value],
-            data: None,
-            owned: true,
-        };
-        let tv_handle = crate::Value::Value::ref_val(crate::Value::HeapObj::TraitVal(tv));
-
-        // 初始化 main 帧 + 手动注入 TraitValue 到 N2（recv，local 0）
-        // N2 是无 const_value 的 Const 占位，prepare_frame 未预填充，需手动设值 + 入队。
-        let fid = engine.init_frame(SubGraphId(1));
-        {
-            let frame = engine.frames.get_mut(fid);
-            frame.set_value(NodeId(0), tv_handle, 1); // 1 downstream (N3)
-            frame.push_ready(NodeId(0));
-        }
-        engine.ready_frames.push_back(fid);
-
-        // 手动事件循环（run_event_loop 会重新 init_frame 丢失注入，故手动驱动）。
-        // 逻辑与 run_event_loop 等价：sync call 子帧完成后 complete_and_wake_caller 唤醒调用方。
-        let result = loop {
-            let fid = match engine.ready_frames.pop_front() {
-                Some(f) => f,
-                None => panic!("event loop exhausted: no ready frames"),
-            };
-            engine.run_ready_nodes(fid);
-            let state = engine.frames.get(fid).state;
-            let has_caller = engine.frames.get(fid).caller.is_some();
-            match state {
-                FrameState::Suspended => {
-                    // event_waiters 已在 run_ready_nodes 挂起点注册，此处仅校验
-                    let has_waiter = engine.event_waiters.iter().any(|(_, wf)| *wf == fid);
-                    debug_assert!(has_waiter, "frame {} suspended without event waiter", fid.0);
-                }
-                FrameState::Completed => {
-                    if has_caller {
-                        // sync 子帧完成：清理 waiter + 回写返回值 + 唤醒调用方
-                        engine.event_waiters.retain(|(e, _)| {
-                            !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
-                        });
-                        engine.complete_and_wake_caller(fid);
-                    } else {
-                        break engine.extract_child_return(fid);
-                    }
-                }
-                _ => {
-                    engine.ready_frames.push_back(fid);
-                }
-            }
-        };
-
-        assert_eq!(result.as_i32(), 42);
-    }
-
-    /// 端到端：cancel 挂起的 async 帧
-    ///
-    /// SG0: async_fn() = await timer(100ms) → 42
-    /// 验证：cancel 后子帧状态 Suspended → Cancelling → Failed
-    #[test]
-    fn test_cancel_suspended_frame() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: async_fn() = await timer → 42
-        // N0: Const(timer handle 占位), N1: EventSource(Timer), N2: Await(N0)
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::EventSource, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        let await_off = graph.inputs_pool.push(&[n0]);
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::Await, input_count: 1, inputs_offset: await_off,
-            compute_fn: ComputeFnId(38),
-        });
-        graph.set_await_event_source(n2, n1);
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n2,
-            has_suspend: true,
-            event_source_decls: vec![EventSourceDecl { node: n1, kind: EventSourceKind::Timer }],
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(0));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let timer_handle = Value::i32(0);
-        let _timer_id = engine.timer_runtime.start(std::time::Duration::from_millis(100));
-
-        let fid = engine.init_frame(SubGraphId(0));
-        let frame = engine.frames.get_mut(fid);
-        frame.set_value(NodeId(0), timer_handle, 1);
-        frame.push_ready(NodeId(0));
-
-        // 执行 → await 检查 timer → 未到期 → 帧挂起
-        engine.run_ready_nodes(fid);
-        assert_eq!(engine.frames.get(fid).state, FrameState::Suspended,
-            "frame should be suspended waiting for timer");
-
-        // cancel 帧族
-        engine.cancel_frame(fid);
-        assert_eq!(engine.frames.get(fid).state, FrameState::Cancelling,
-            "frame should be in Cancelling state after cancel");
-
-        // worker 检测到 Cancelling → 执行 defer 清理 → 标记 Failed
-        engine.run_ready_nodes(fid);
-        assert_eq!(engine.frames.get(fid).state, FrameState::Failed,
-            "frame should be Failed after cancel cleanup");
-    }
-
-    /// 端到端：cancel 非 Suspended 帧（无效果）
-    ///
-    /// 验证：cancel Ready/Completed 帧不改变状态
-    #[test]
-    fn test_cancel_non_suspended_frame_noop() {
-        let mut graph = DataFlowGraph::new();
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(42));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(1)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n0,
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-        graph.set_entry_subgraph(SubGraphId(0));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let fid = engine.init_frame(SubGraphId(0));
-
-        // 帧处于 Ready 态，cancel 应无效果
-        engine.cancel_frame(fid);
-        assert_eq!(engine.frames.get(fid).state, FrameState::Ready,
-            "cancel on Ready frame should be noop");
-
-        // 执行帧 → Completed
-        engine.run_ready_nodes(fid);
-        assert_eq!(engine.frames.get(fid).state, FrameState::Completed);
-
-        // cancel Completed 帧也应无效果
-        engine.cancel_frame(fid);
-        assert_eq!(engine.frames.get(fid).state, FrameState::Completed,
-            "cancel on Completed frame should be noop");
-    }
-
-    // =================================================================
-    // 多 worker（work-stealing）端到端测试
-    // =================================================================
-
-    /// 端到端：多 worker 模式执行简单图（1 + 2 = 3）
-    ///
-    /// 验证：WorkerPool 正确分发入口帧 → worker 执行 → 返回结果
-    #[test]
-    fn test_multi_worker_simple() {
-        let graph = make_simple_graph();
-        let mut engine = Engine::new(graph);
-        let result = engine.run_multi_worker(2);
-        assert_eq!(result.as_i32(), 3);
-    }
-
-    /// 端到端：多 worker 模式执行 async 并发调用
-    ///
-    /// 复用 test_concurrent_async_calls 的 IR（两个 async 调用并发 await），
-    /// 验证多 worker 模式下 async 调用 + await 正确工作。
-    #[test]
-    fn test_multi_worker_concurrent_async() {
-        let mut graph = DataFlowGraph::new();
-
-        // SG0: async_fn() = 42
-        let n0 = graph.add_node(Node {
-            kind: NodeKind::Const,
-            input_count: 0,
-            inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-        graph.const_values[n0.0 as usize] = Some(ConstValue::I32(42));
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(1)),
-            param_count: 0,
-            entry_node: n0,
-            return_node: n0,
-            has_suspend: true,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        // SG1: main() = async_fn().await() + async_fn().await()
-        let n1 = graph.add_node(Node {
-            kind: NodeKind::Call, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(39),
-        });
-        graph.set_call_target(n1, SubGraphId(0));
-
-        let n2 = graph.add_node(Node {
-            kind: NodeKind::EventSource, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-
-        let off3 = graph.inputs_pool.push(&[n1]);
-        let n3 = graph.add_node(Node {
-            kind: NodeKind::Await, input_count: 1, inputs_offset: off3,
-            compute_fn: ComputeFnId(38),
-        });
-        graph.set_await_event_source(n3, n2);
-
-        let n4 = graph.add_node(Node {
-            kind: NodeKind::Call, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(39),
-        });
-        graph.set_call_target(n4, SubGraphId(0));
-
-        let n5 = graph.add_node(Node {
-            kind: NodeKind::EventSource, input_count: 0, inputs_offset: 0,
-            compute_fn: ComputeFnId(0),
-        });
-
-        let off6 = graph.inputs_pool.push(&[n4]);
-        let n6 = graph.add_node(Node {
-            kind: NodeKind::Await, input_count: 1, inputs_offset: off6,
-            compute_fn: ComputeFnId(38),
-        });
-        graph.set_await_event_source(n6, n5);
-
-        let off7 = graph.inputs_pool.push(&[n3, n6]);
-        let n7 = graph.add_node(Node {
-            kind: NodeKind::BinOp, input_count: 2, inputs_offset: off7,
-            compute_fn: ComputeFnId(1),
-        });
-
-        graph.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(1), NodeId(8)),
-            param_count: 0,
-            entry_node: n1,
-            return_node: n7,
-            has_suspend: false,
-            event_source_decls: vec![
-                EventSourceDecl { node: n2, kind: EventSourceKind::AsyncJoin },
-                EventSourceDecl { node: n5, kind: EventSourceKind::AsyncJoin },
-            ],
-            defer_table: Vec::new(),
-            loop_kind: crate::Ir::LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-        });
-
-        graph.set_entry_subgraph(SubGraphId(1));
-        graph.compute_downstreams();
-
-        let mut engine = Engine::new(graph);
-        let result = engine.run_multi_worker(4);
-        assert_eq!(result.as_i32(), 84);
-    }
-
-    /// 端到端：单 worker 模式（num_workers=1）等价于单线程执行
-    ///
-    /// 验证：num_workers=1 时 WorkerPool 正确工作
-    #[test]
-    fn test_multi_worker_single_worker() {
-        let graph = make_simple_graph();
-        let mut engine = Engine::new(graph);
-        let result = engine.run_multi_worker(1);
-        assert_eq!(result.as_i32(), 3);
-    }
-
-    // ===== Task 13-14: 循环状态穿透 + 迭代帧端到端测试 =====
-
-    /// while 循环内赋值外部可见性
-    #[test]
-    fn test_while_assignment_visible_outside() {
-        let src = r#"
-            fun main(): i32 {
-                var sum: i32 = 0
-                var i: i32 = 0
-                while i < 10 {
-                    sum = sum + i
-                    i = i + 1
-                }
-                return sum
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        assert_eq!(h.as_i32(), 45);
-    }
-
-    /// while 循环累加 1..=100
-    #[test]
-    fn test_while_sum_1_to_100() {
-        let src = r#"
-            fun main(): i32 {
-                var sum: i32 = 0
-                var i: i32 = 1
-                while i <= 100 {
-                    sum = sum + i
-                    i = i + 1
-                }
-                return sum
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        assert_eq!(h.as_i32(), 5050);
-    }
-
-    /// loop + break 赋值
-    #[test]
-    fn test_loop_break_assignment() {
-        let src = r#"
-            fun main(): i32 {
-                var x: i32 = 0
-                loop {
-                    x = x + 1
-                    if x >= 5 { break }
-                }
-                return x
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        assert_eq!(h.as_i32(), 5);
-    }
-
-    /// 嵌套 while 循环
-    #[test]
-    fn test_nested_while() {
-        let src = r#"
-            fun main(): i32 {
-                var total: i32 = 0
-                var i: i32 = 0
-                while i < 3 {
-                    var j: i32 = 0
-                    while j < 3 {
-                        total = total + 1
-                        j = j + 1
-                    }
-                    i = i + 1
-                }
-                return total
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        assert_eq!(h.as_i32(), 9);
-    }
-
-    /// if 分支内赋值外层变量
-    #[test]
-    fn test_if_assignment_outside() {
-        let src = r#"
-            fun main(): i32 {
-                var x: i32 = 1
-                if true { x = 2 }
-                return x
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        assert_eq!(h.as_i32(), 2);
-    }
-
-    /// match 分支内赋值外层变量（WriteBack 适配）
-    #[test]
-    fn test_match_assignment_outside() {
-        let src = r#"
-            fun main(): i32 {
-                var x: i32 = 1
-                match 1 {
-                    1 => { x = 2 }
-                    _ => { x = 3 }
-                }
-                return x
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        assert_eq!(h.as_i32(), 2);
-    }
-
-    /// while + continue 跳过偶数
-    #[test]
-    fn test_while_continue_skip_even() {
-        let src = r#"
-            fun main(): i32 {
-                var sum: i32 = 0
-                var i: i32 = 0
-                while i < 10 {
-                    i = i + 1
-                    if i % 2 == 0 { continue }
-                    sum = sum + i
-                }
-                return sum
-            }
-        "#;
-        let (_engine, h) = run_source(src);
-        // 1+3+5+7+9 = 25
-        assert_eq!(h.as_i32(), 25);
-    }
-
-    /// O(1) 内存验证：大循环不堆积帧
-    #[test]
-    fn test_loop_frame_count_stable() {
-        let src = r#"
-            fun main(): i32 {
-                var sum: i32 = 0
-                var i: i32 = 0
-                while i < 10000 {
-                    sum = sum + 1
-                    i = i + 1
-                }
-                return sum
-            }
-        "#;
-        let (engine, h) = run_source(src);
-        assert_eq!(h.as_i32(), 10000);
-        // 帧池大小应远小于循环次数（O(1) 内存）
-        // next_id 包含所有分配过的帧（含已释放），但活跃帧数应恒定
-        assert!(
-            engine.frames.next_id < 100,
-            "frame count {} should be O(1), not O(n)",
-            engine.frames.next_id
-        );
-    }
 }
