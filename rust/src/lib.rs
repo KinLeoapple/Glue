@@ -29,3 +29,6 @@ pub mod Ir;
 
 #[path = "Engine.rs"]
 pub mod Engine;
+
+#[path = "Analyzer.rs"]
+pub mod Analyzer;

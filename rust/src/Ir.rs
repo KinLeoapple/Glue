@@ -1250,6 +1250,11 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         285 => crate::Engine::compute_channel_close,
         // 偏应用构造（286）
         286 => crate::Engine::compute_partial_construct,
+        // str.bytes() → u8[]（287）
+        287 => crate::Engine::compute_str_bytes,
+        // 栈分配版构造（288-289）：分析器标记的不逃逸分配点使用
+        288 => crate::Engine::compute_record_construct_stack,
+        289 => crate::Engine::compute_array_construct_stack,
     }
 }
 
@@ -1669,6 +1674,10 @@ pub struct IrBuilder<'a> {
     pub builtin_modules: Vec<&'a crate::Ast::Module<'a>>,
     /// 当前正在编译的 builtin 模块（None = 用户模块）
     pub compiling_builtin: Option<&'a crate::Ast::Module<'a>>,
+    /// 静态分析报告（仅 entry 模块，None = 未接入分析器）
+    /// IrBuilder 在编译 entry 模块时查询报告跳过死代码/死函数，
+    /// 执行内联展开和栈分配标记。builtin 模块编译不受影响。
+    pub analysis: Option<&'a crate::Analyzer::AnalysisReport>,
     pub graph: DataFlowGraph,
     /// 函数名 → 子图 id 映射（Call 编译时查找绑定 call_target）
     pub func_subgraphs: rustc_hash::FxHashMap<String, SubGraphId>,
@@ -1729,31 +1738,6 @@ fn cast_mangled_name(source: &str, target: &str) -> String {
     format!("__cast_{}_to_{}", source, target)
 }
 
-/// 内置方法的降级策略。
-///
-/// 新增内置方法只需在 `BUILTIN_METHODS` 追加一行，无需新增 if 分支。
-enum BuiltinMethodLower {
-    /// 单节点一元运算（无参数）：cancel/len/close
-    UnOp(u32),
-    /// 挂起等待事件源（无参数）：await（无条件降级）
-    Await,
-    /// Channel 接收（无参数）：recv → 降级为 Await
-    /// 仅当 recv 类型为 Channel/Receiver 时降级，否则走 trait 方法
-    ChannelAwait,
-    /// 二元运算（recv + 1 参数）：send(value) → compute_fn
-    BinOp(u32),
-}
-
-/// 内置方法分派表：方法名 → 降级策略。
-const BUILTIN_METHODS: &[(&str, BuiltinMethodLower)] = &[
-    ("await", BuiltinMethodLower::Await),
-    ("cancel", BuiltinMethodLower::UnOp(42)),
-    ("len", BuiltinMethodLower::UnOp(35)),
-    ("close", BuiltinMethodLower::UnOp(285)), // compute_channel_close
-    ("recv", BuiltinMethodLower::ChannelAwait),
-    ("send", BuiltinMethodLower::BinOp(284)), // compute_channel_send
-];
-
 /// 内置构造器的降级策略。
 ///
 /// 新增内置构造器只需在 `BUILTIN_CTORS` 追加一行，无需新增 if 分支。
@@ -1781,6 +1765,7 @@ impl<'a> IrBuilder<'a> {
             module,
             builtin_modules: Vec::new(),
             compiling_builtin: None,
+            analysis: None,
             graph: DataFlowGraph::new(),
             func_subgraphs: rustc_hash::FxHashMap::default(),
             method_subgraphs: rustc_hash::FxHashMap::default(),
@@ -1806,6 +1791,57 @@ impl<'a> IrBuilder<'a> {
     ) -> Self {
         self.builtin_modules = modules;
         self
+    }
+
+    /// 注入静态分析报告（builder 风格，链式调用）。
+    /// 报告仅对 entry 模块有效，IrBuilder 编译 entry 模块时查询报告
+    /// 跳过死代码/死函数，执行内联与栈分配标记。
+    pub fn with_analysis(
+        mut self,
+        analysis: &'a crate::Analyzer::AnalysisReport,
+    ) -> Self {
+        self.analysis = Some(analysis);
+        self
+    }
+
+    /// 当前是否在编译 entry 模块（而非 builtin）。
+    /// 分析报告仅覆盖 entry 模块，builtin 编译不查询报告。
+    #[inline]
+    fn is_compiling_entry(&self) -> bool {
+        self.compiling_builtin.is_none()
+    }
+
+    /// 查询语句是否为死代码（仅在编译 entry 模块时查询）。
+    #[inline]
+    fn is_dead_stmt(&self, stmt_id: crate::Ast::StmtId) -> bool {
+        self.is_compiling_entry()
+            && self.analysis.map_or(false, |r| r.dead_code.dead_stmts.contains(&stmt_id))
+    }
+
+    /// 查询函数是否为死函数（仅在编译 entry 模块时查询）。
+    /// FuncId = entry 模块 declarations 索引。
+    #[inline]
+    fn is_dead_func(&self, decl_idx: usize) -> bool {
+        self.is_compiling_entry()
+            && self.analysis.map_or(false, |r| r.dead_func.dead.contains(&crate::Analyzer::FuncId(decl_idx as u32)))
+    }
+
+    /// 查询表达式是否为内联候选的调用点。
+    /// 返回被调函数的 FuncId，IrBuilder 应展开其 body 而非 launch 子图。
+    #[inline]
+    fn inline_target(&self, expr_id: crate::Ast::ExprId) -> Option<crate::Analyzer::FuncId> {
+        if !self.is_compiling_entry() {
+            return None;
+        }
+        let report = self.analysis?;
+        report.inline.expansions.get(&expr_id).copied()
+    }
+
+    /// 查询表达式是否标记为栈分配。
+    #[inline]
+    fn should_stack_alloc(&self, expr_id: crate::Ast::ExprId) -> bool {
+        self.is_compiling_entry()
+            && self.analysis.map_or(false, |r| r.stack_alloc.candidates.contains(&expr_id))
     }
 
     /// 返回当前正在编译的模块（builtin 优先，否则用户模块）。
@@ -2039,7 +2075,7 @@ impl<'a> IrBuilder<'a> {
                         return self.compile_cast_call(*name, args, type_args.as_deref());
                     }
                 }
-                self.compile_call(*callee, args)
+                self.compile_call(expr_id, *callee, args)
             }
             crate::Ast::Expr::MethodCall { recv, method, args, .. } => {
                 self.compile_method_call(*recv, method, args)
@@ -2073,7 +2109,7 @@ impl<'a> IrBuilder<'a> {
             }
 
             // 记录构造
-            crate::Ast::Expr::RecordLit(fields) => self.compile_record_lit(fields),
+            crate::Ast::Expr::RecordLit(fields) => self.compile_record_lit(expr_id, fields),
 
             // Lambda 表达式 → 闭包子图 + 闭包构造节点
             crate::Ast::Expr::Lambda { params, body, is_async, .. } => {
@@ -2085,7 +2121,7 @@ impl<'a> IrBuilder<'a> {
 
             // 数组构造
             crate::Ast::Expr::ArrayLit { elements, .. } => {
-                self.compile_array_lit(elements)
+                self.compile_array_lit(expr_id, elements)
             }
 
             // 赋值表达式：target = value
@@ -4565,9 +4601,20 @@ impl<'a> IrBuilder<'a> {
     /// 若 callee 是类型名（如 `Iterator(arr, 0)`）→ 编译为记录构造节点。
     fn compile_call(
         &mut self,
+        call_expr_id: crate::Ast::ExprId,
         callee: crate::Ast::ExprId,
         args: &[crate::Ast::ExprId],
     ) -> NodeId {
+        // ── 内联展开：分析器标记的调用点，直接编译 callee body 而非 launch 子图 ──
+        // 纯函数 + 小体 + 非递归 → 绑定实参到形参，编译 body，避免调用开销
+        if let Some(callee_func) = self.inline_target(call_expr_id) {
+            if let crate::Ast::Decl::FunDecl { params, body, .. } =
+                &self.module.declarations[callee_func.0 as usize].node
+            {
+                return self.compile_inline_expansion(*body, params, args);
+            }
+        }
+
         let callee_expr = self.current_module().arena.expr(callee);
 
         // 内置构造器检测：Ok(val) / Err(record) / channel(capacity)
@@ -4773,6 +4820,28 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
+    /// 内联展开：编译 callee body，形参绑定到实参节点。
+    ///
+    /// 进入新作用域 → 编译实参 → 绑定形参名 → 编译 body（非尾位置）→ 退出作用域。
+    /// 不生成 Call 节点和子图启动，直接把 body 的 IR 嵌入当前函数。
+    fn compile_inline_expansion(
+        &mut self,
+        body: crate::Ast::ExprRef,
+        params: &[crate::Ast::Param<'_>],
+        args: &[crate::Ast::ExprId],
+    ) -> NodeId {
+        self.enter_scope();
+        // 编译实参并绑定到形参名（实参节点在当前作用域上下文中编译）
+        for (param, &arg) in params.iter().zip(args.iter()) {
+            let arg_node = self.compile_subexpr(arg);
+            self.bind_var(param.name, arg_node);
+        }
+        // 编译 callee body（非尾位置，内联展开不保留尾调用语义）
+        let body_node = self.compile_subexpr(body);
+        self.exit_scope();
+        body_node
+    }
+
     /// 查找类型声明的字段信息（按类型名）。
     ///
     /// 统一从 type_scope_stack 逐层查找（顶层 + 嵌套类型共享同一查找路径）。
@@ -4805,9 +4874,10 @@ impl<'a> IrBuilder<'a> {
 
     /// 编译方法调用。
     ///
-    /// 内置方法（await/cancel/len/send/recv/close 等）通过 `BUILTIN_METHODS`
-    /// 注册表查表降级，避免方法名特判分支。类型/trait 方法编译为 Call 节点，
-    /// 通过 mangled name ("TypeName.method") 查找 call_target。
+    /// 方法分派统一走 (type_id, method_idx) 路径：
+    /// - intrinsic 方法（await/len/send/recv/close/bytes/cancel 等）通过
+    ///   MethodSigInfo.intrinsic 字段标注，直接降级为 compute_fn 节点
+    /// - 类型/trait 方法编译为 Call 节点，通过 (type_id, method_idx) 查 method_subgraphs
     fn compile_method_call(
         &mut self,
         recv: crate::Ast::ExprId,
@@ -4816,48 +4886,12 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let recv_node = self.compile_subexpr(recv);
 
-        // 注册表驱动：内置方法查表降级
-        // 命中但不满足参数/类型条件时 fall through 到 trait 方法路径
-        if let Some(lower) = BUILTIN_METHODS
-            .iter()
-            .find_map(|(n, l)| (*n == method).then_some(l))
-        {
-            match lower {
-                // await：无条件降级为 Await（EventSource + Await 双节点）
-                BuiltinMethodLower::Await if args.is_empty() => {
-                    return self.build_await_node(recv, recv_node);
-                }
-                // recv：仅当 recv 类型为 Channel/Receiver 时降级为 Await
-                BuiltinMethodLower::ChannelAwait if args.is_empty() => {
-                    if self.infer_event_source_kind(recv) == crate::Ir::EventSourceKind::Channel {
-                        return self.build_await_node(recv, recv_node);
-                    }
-                }
-                // cancel/len/close：单节点一元运算（无参数）
-                BuiltinMethodLower::UnOp(idx) if args.is_empty() => {
-                    let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
-                    return self.graph.add_node(Node {
-                        kind: NodeKind::UnOp,
-                        input_count: 1,
-                        inputs_offset,
-                        compute_fn: ComputeFnId(*idx),
-                    });
-                }
-                // send(value)：二元运算，inputs = [recv, value]
-                BuiltinMethodLower::BinOp(idx) => {
-                    let mut inputs = vec![recv_node];
-                    for &arg in args {
-                        inputs.push(self.compile_subexpr(arg));
-                    }
-                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
-                    return self.graph.add_node(Node {
-                        kind: NodeKind::BinOp,
-                        input_count: inputs.len() as u8,
-                        inputs_offset,
-                        compute_fn: ComputeFnId(*idx),
-                    });
-                }
-                _ => {} // 参数不匹配，走 trait 方法
+        // ── intrinsic 降级 ──
+        // 通过 (type_id, method_idx) 查 MethodSigInfo.intrinsic，命中则尝试降级。
+        // 条件不满足（如参数数量不匹配）时 fall through 到 Call 节点路径。
+        if let Some(intrinsic) = self.lookup_intrinsic(recv, method) {
+            if let Some(node) = self.try_lower_intrinsic(recv, recv_node, args, intrinsic) {
+                return node;
             }
         }
 
@@ -4941,6 +4975,75 @@ impl<'a> IrBuilder<'a> {
             }
 
             call_node
+        }
+    }
+
+    /// 通过 (type_id, method_idx) 查 MethodSigInfo.intrinsic，返回降级策略。
+    ///
+    /// 内置类型的 intrinsic 方法（如 Async.await、Channel.send、Array.len）在 Sema 层
+    /// 注册合成 TypeDefInfo 时已标注 intrinsic 字段，此处统一查表获取，不按方法名特判。
+    fn lookup_intrinsic(
+        &self,
+        recv: crate::Ast::ExprId,
+        method: &str,
+    ) -> Option<crate::Sema::IntrinsicKind> {
+        let type_name = self.expr_type_name(recv)?;
+        let type_id = self.expr_type_id(recv)?;
+        let method_idx = self.sema.lookup_method_idx(type_name, method)?;
+        let sig = self.sema.get_method_sig(type_id, method_idx)?;
+        sig.intrinsic
+    }
+
+    /// 根据 IntrinsicKind 尝试降级为 compute_fn 节点。
+    ///
+    /// 返回 None 表示条件不满足（如参数数量不匹配、recv 类型不符），
+    /// 调用方应 fall through 到 Call 节点路径。
+    fn try_lower_intrinsic(
+        &mut self,
+        recv: crate::Ast::ExprId,
+        recv_node: NodeId,
+        args: &[crate::Ast::ExprId],
+        kind: crate::Sema::IntrinsicKind,
+    ) -> Option<NodeId> {
+        use crate::Sema::IntrinsicKind;
+        match kind {
+            // await：无条件降级为 Await（EventSource + Await 双节点）
+            IntrinsicKind::Await if args.is_empty() => {
+                Some(self.build_await_node(recv, recv_node))
+            }
+            // recv：仅当 recv 类型为 Channel/Receiver 时降级为 Await
+            IntrinsicKind::ChannelAwait if args.is_empty() => {
+                if self.infer_event_source_kind(recv) == crate::Ir::EventSourceKind::Channel {
+                    Some(self.build_await_node(recv, recv_node))
+                } else {
+                    None
+                }
+            }
+            // cancel/len/close/bytes：单节点一元运算（无参数）
+            IntrinsicKind::UnOp(idx) if args.is_empty() => {
+                let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+                Some(self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(idx),
+                }))
+            }
+            // send(value)：二元运算，inputs = [recv, value]
+            IntrinsicKind::BinOp(idx) => {
+                let mut inputs = vec![recv_node];
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                Some(self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(idx),
+                }))
+            }
+            _ => None, // 参数不匹配，走 Call 节点路径
         }
     }
 
@@ -5151,7 +5254,8 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// 编译记录构造表达式。
-    fn compile_record_lit(&mut self, fields: &[crate::Ast::RecordFieldExpr<'_>]) -> NodeId {
+    /// 分析器标记为不逃逸的分配点使用栈分配 compute_fn（288）。
+    fn compile_record_lit(&mut self, expr_id: crate::Ast::ExprId, fields: &[crate::Ast::RecordFieldExpr<'_>]) -> NodeId {
         let mut inputs = Vec::with_capacity(fields.len());
         let mut field_names = Vec::with_capacity(fields.len());
         for field in fields {
@@ -5159,11 +5263,17 @@ impl<'a> IrBuilder<'a> {
             field_names.push(Some(field.name.to_string()));
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
+        // 栈分配标记：不逃逸的分配用 compute_record_construct_stack（288）
+        let compute_fn = if self.should_stack_alloc(expr_id) {
+            ComputeFnId(288) // record_construct_stack
+        } else {
+            ComputeFnId(29) // record_construct
+        };
         let node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
             input_count: inputs.len() as u8,
             inputs_offset,
-            compute_fn: ComputeFnId(29), // record_construct
+            compute_fn,
         });
         self.graph.set_record_lit_info(
             node,
@@ -5220,17 +5330,24 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// 编译数组构造表达式。
-    fn compile_array_lit(&mut self, elements: &[crate::Ast::ExprRef]) -> NodeId {
+    /// 分析器标记为不逃逸的分配点使用栈分配 compute_fn（289）。
+    fn compile_array_lit(&mut self, expr_id: crate::Ast::ExprId, elements: &[crate::Ast::ExprRef]) -> NodeId {
         let mut inputs = Vec::with_capacity(elements.len());
         for &elem in elements {
             inputs.push(self.compile_subexpr(elem));
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
+        // 栈分配标记：不逃逸的分配用 compute_array_construct_stack（289）
+        let compute_fn = if self.should_stack_alloc(expr_id) {
+            ComputeFnId(289) // array_construct_stack
+        } else {
+            ComputeFnId(31) // array_construct
+        };
         self.graph.add_node(Node {
             kind: NodeKind::BinOp,
             input_count: inputs.len() as u8,
             inputs_offset,
-            compute_fn: ComputeFnId(31), // array_construct
+            compute_fn,
         })
     }
 
@@ -5292,6 +5409,10 @@ impl<'a> IrBuilder<'a> {
     /// 编译语句，返回效果节点（需顺序链接到块结果的节点）。
     /// 返回 None 表示纯声明（变量绑定），其值节点通过变量引用自动可达。
     fn compile_stmt(&mut self, stmt_id: crate::Ast::StmtId) -> Option<NodeId> {
+        // 分析器标记的死语句（不可达代码/死声明/死存储）跳过，不生成 IR 节点
+        if self.is_dead_stmt(stmt_id) {
+            return None;
+        }
         let spanned = self.current_module().arena.stmt(stmt_id);
         let stmt = &spanned.node;
         match stmt {
@@ -6136,14 +6257,20 @@ impl<'a> IrBuilder<'a> {
             self.compile_builtin_method(type_name, *method_idx);
         }
 
-        // 2. 收集用户模块函数名（跳过 @extern("C") 函数）
+        // 2. 收集用户模块函数名（跳过 @extern("C") 函数 + 分析器标记的死函数）
+        //    死函数不编译子图：分析器已确认无调用路径可达（单模块分析）
         let fun_names: Vec<Box<str>> = self
             .module
             .declarations
             .iter()
-            .filter_map(|d| match &d.node {
-                crate::Ast::Decl::FunDecl { name, extern_c_body, .. } => {
+            .enumerate()
+            .filter_map(|(idx, d)| match &d.node {
+                crate::Ast::Decl::FunDecl { name, extern_c_body, is_entry, .. } => {
                     if extern_c_body.is_some() { return None; }
+                    // 入口函数永不消除（分析器已排除，这里双重保险）
+                    if *is_entry { return Some(name.to_string().into_boxed_str()); }
+                    // 分析器标记的死函数跳过
+                    if self.is_dead_func(idx) { return None; }
                     Some(name.to_string().into_boxed_str())
                 }
                 _ => None,

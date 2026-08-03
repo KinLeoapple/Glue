@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 
 use glue_rs::Ast::{ErrorCollector, Lexer, Parser as GlueParser, Printer, Token, TokenCollector};
 use glue_rs::Engine::Engine;
+use glue_rs::Analyzer;
 use glue_rs::Ir::IrBuilder;
 use glue_rs::ModuleLoader::ModuleLoader;
 use glue_rs::Sema::{InferContext, SemaResult, TypeArena};
@@ -632,7 +633,23 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
         eprintln!("[4/5] Compiling IR ...");
     }
 
-    // 4. IR 编译
+    // 4. 静态分析（Sema 后、IR 前）：死代码/死变量/死函数 + 记忆化策略
+    //    对 entry 模块运行分析；debug 模式下打印报告摘要。
+    let analysis_report = Analyzer::analyze(&entry_module, &entry_module.arena, &sema_result);
+    if debug {
+        eprintln!("  Analyzer: dead_code={} dead_var={} dead_func={} memo_candidates={} dead_param={} inline={} stack_alloc={} non_exhaustive={} unreachable_arms={}",
+            analysis_report.dead_code.dead_stmts.len(),
+            analysis_report.dead_var.dead_vars.len(),
+            analysis_report.dead_func.dead.len(),
+            analysis_report.memo.candidates.len(),
+            analysis_report.dead_param.dead_params.len(),
+            analysis_report.inline.candidates.len(),
+            analysis_report.stack_alloc.candidates.len(),
+            analysis_report.match_report.non_exhaustive.len(),
+            analysis_report.match_report.unreachable_arms.len());
+    }
+
+    // 5. IR 编译
     // 收集所有非 entry 模块（builtin + std + dep），传给 IR builder 编译为子图
     let mut non_entry_modules: Vec<&_> = loader.builtin_modules().map(|(_, m)| m).collect();
     for key in &std_keys {
@@ -647,6 +664,7 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
     }
     let graph = IrBuilder::new(&sema_result, &entry_module)
         .with_builtins(non_entry_modules)
+        .with_analysis(&analysis_report)
         .build();
 
     // 检查 IR 编译错误（未实现的特性降级、找不到函数等）

@@ -1383,6 +1383,23 @@ pub fn compute_array_construct(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Array(ArrayValue::new(elements)))
 }
 
+/// compute_fn: 栈分配版记录构造（288）
+///
+/// 分析器标记为不逃逸的分配点使用此 compute_fn。
+/// 当前实现等同 compute_record_construct（Value 模型限制下 Arc 是唯一引用方式），
+/// 预留分离点：未来 Value 模型支持帧局部分配后，此函数切换为真正的栈分配。
+pub fn compute_record_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
+    compute_record_construct(frame, node)
+}
+
+/// compute_fn: 栈分配版数组构造（289）
+///
+/// 分析器标记为不逃逸的分配点使用此 compute_fn。
+/// 当前实现等同 compute_array_construct，预留分离点。
+pub fn compute_array_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
+    compute_array_construct(frame, node)
+}
+
 /// compute_fn: 数组索引（从 ArrayValue 按 i32 索引取元素）
 /// 索引越界时返回 ThrowVal(Err) 错误值，逐层透传至顶层。
 pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
@@ -2597,6 +2614,22 @@ pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
         remaining_arity,
         self_upvalue_idx: -1,
     }))
+}
+
+/// compute_str_bytes（idx 287）：str.bytes() → u8[]
+/// 将 GlueStr 的 UTF-8 字节序列构造为 u8 数组。
+pub fn compute_str_bytes(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::Value::{HeapObj, ArrayValue};
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let val = frame.get_value_by_global(inputs[0]);
+    let bytes: Vec<Value> = match val.heap_obj() {
+        Some(HeapObj::Str(s)) => s.bytes().as_bytes()
+            .iter()
+            .map(|&b| Value::u8(b))
+            .collect(),
+        _ => Vec::new(),
+    };
+    Value::ref_val(HeapObj::Array(ArrayValue::new(bytes)))
 }
 
 /// compute_fn: 可调用值调用（idx 41）— 统一处理 Closure | Partial。

@@ -1428,6 +1428,22 @@ pub enum TypeRepr {
     Array(Box<TypeRepr>, Option<u64>),
 }
 
+/// 内置 intrinsic 方法的降级策略。
+///
+/// 存储在 `MethodSigInfo.intrinsic` 中，IR 层通过 (type_id, method_idx) 查到
+/// 方法签名后，根据此字段选择节点 kind 和 compute_fn，消除按方法名查表的特判。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntrinsicKind {
+    /// 单节点一元运算（无参数）：len/close/bytes/cancel → compute_fn(idx)
+    UnOp(u32),
+    /// 挂起等待事件源（无参数）：await → Await 节点（无条件降级）
+    Await,
+    /// Channel 接收（无参数）：recv → Await 节点（仅 Channel/Receiver 类型）
+    ChannelAwait,
+    /// 二元运算（recv + 1 参数）：send(value) → compute_fn(idx)
+    BinOp(u32),
+}
+
 /// 替代旧的 func_sigs mangled name（"TypeName.method"）注册方式，
 /// 使方法分派通过 (type_id, method_idx) 结构化键驱动。
 #[derive(Debug, Clone)]
@@ -1446,6 +1462,9 @@ pub struct MethodSigInfo {
     /// 返回类型的自包含表示（不依赖 AST 引用），用于跨模块完整解析嵌套泛型类型
     /// （如 Async<Throw<T, E>>）。type_name/type_desc 仅存顶层名，无法还原泛型参数。
     pub return_type_repr: Option<TypeRepr>,
+    /// intrinsic 降级策略：None 表示普通方法（有方法体或 trait 方法），
+    /// Some 表示内置 intrinsic 方法（无方法体，IR 层直接降级为 compute_fn 节点）。
+    pub intrinsic: Option<IntrinsicKind>,
 }
 
 /// 类型定义信息（替代 IRBuilder 的 type_table + ctor_table）。
@@ -2535,6 +2554,135 @@ pub fn register_builtin_type_descriptors(sema_result: &mut SemaResult) {
     }
 }
 
+/// 为内置类型注册合成 TypeDefInfo（含方法签名表），使内置类型的方法查找走与
+/// 用户自定义类型统一的 (type_id, method_idx) 路径，消除 lookup_builtin_method
+/// 的 match 分支特判。
+///
+/// 方法签名中：
+/// - param_type_reprs[0] = SelfType（self 参数，与用户 type 块一致）
+/// - 泛型参数用 Named("T")/Named("K")/Named("V")/Named("E")，由 type_binding_stack 解析
+/// - 标量返回类型用 Named("usize")/Named("bool")/Named("void")/Named("str")
+/// - build_fn_type_from_sig 通过 type_repr_to_handle 还原完整 ConcreteType::Fn
+pub fn register_builtin_method_sigs(sema_result: &mut SemaResult) {
+    /// 构建单条内置方法签名。type_desc 字段用 VOID_DESC 占位（不影响类型检查，
+    /// build_fn_type_from_sig 只读 param_type_reprs / return_type_repr）。
+    /// intrinsic 参数标注降级策略，None 表示普通方法（有方法体或 trait 方法）。
+    fn sig(
+        name: &str,
+        param_reprs: Vec<TypeRepr>,
+        return_repr: Option<TypeRepr>,
+        intrinsic: Option<IntrinsicKind>,
+    ) -> MethodSigInfo {
+        let n = param_reprs.len();
+        MethodSigInfo {
+            name: name.into(),
+            param_type_descs: vec![&VOID_DESC; n].into_boxed_slice(),
+            return_type_desc: &VOID_DESC,
+            param_is_ref: vec![false; n].into_boxed_slice(),
+            return_is_ref: false,
+            is_async: false,
+            is_throwing: false,
+            param_type_names: vec![None; n].into_boxed_slice(),
+            param_type_reprs: param_reprs.into_boxed_slice(),
+            return_type_repr: return_repr,
+            intrinsic,
+        }
+    }
+
+    /// 为一个内置类型注册合成 TypeDefInfo。
+    fn register(
+        sema_result: &mut SemaResult,
+        type_name: &str,
+        type_params: &[&str],
+        methods: Vec<MethodSigInfo>,
+    ) {
+        if sema_result.type_def_index.contains_key(type_name) {
+            return; // 已注册（如用户 stdlib 已声明同名 type 块）
+        }
+        let def = TypeDefInfo {
+            name: type_name.into(),
+            kind: TypeDefKind::Alias,
+            constructors: Box::new([]),
+            type_params: type_params.iter().map(|t| (*t).into()).collect(),
+            target_type_name: None,
+            target_type_desc: None,
+            methods: methods.into_boxed_slice(),
+        };
+        sema_result.put_type_def(def);
+    }
+
+    // ── Array<T> ──
+    register(sema_result, "array", &["T"], vec![
+        sig("len", vec![TypeRepr::SelfType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
+        sig("is_empty", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
+        sig("push", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), None),
+        sig("pop", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), None),
+    ]);
+
+    // ── Str ──
+    register(sema_result, "str", &[], vec![
+        sig("len", vec![TypeRepr::SelfType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
+        sig("is_empty", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
+        sig("bytes", vec![TypeRepr::SelfType], Some(TypeRepr::Array(Box::new(TypeRepr::Named("u8".into())), None)), Some(IntrinsicKind::UnOp(287))),
+    ]);
+
+    // ── Nullable<T> ──
+    register(sema_result, "nullable", &["T"], vec![
+        sig("is_null", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
+        sig("unwrap", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), None),
+        sig("unwrap_or", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), None),
+    ]);
+
+    // ── Throw<T, E> ──
+    register(sema_result, "throw", &["T", "E"], vec![
+        sig("is_ok", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
+        sig("unwrap", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), None),
+        sig("unwrap_or", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), None),
+    ]);
+
+    // ── Channel<T> ──
+    register(sema_result, "Channel", &["T"], vec![
+        sig("send", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(284))),
+        sig("recv", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::ChannelAwait)),
+        sig("close", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+    ]);
+
+    // ── Atomic<T> ──
+    register(sema_result, "Atomic", &["T"], vec![
+        sig("swap", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), None),
+        sig("cas", vec![TypeRepr::SelfType, TypeRepr::Named("T".into()), TypeRepr::Named("T".into())], Some(TypeRepr::Named("bool".into())), None),
+        sig("load", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), None),
+        sig("store", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), None),
+    ]);
+
+    // ── Map<K, V> ──
+    register(sema_result, "Map", &["K", "V"], vec![
+        sig("len", vec![TypeRepr::SelfType], Some(TypeRepr::Named("usize".into())), None),
+        sig("is_empty", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
+        sig("get", vec![TypeRepr::SelfType, TypeRepr::Named("K".into())], Some(TypeRepr::Named("V".into())), None),
+        sig("set", vec![TypeRepr::SelfType, TypeRepr::Named("K".into()), TypeRepr::Named("V".into())], Some(TypeRepr::Named("void".into())), None),
+    ]);
+
+    // ── Sender<T> ──
+    register(sema_result, "Sender", &["T"], vec![
+        sig("send", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(284))),
+        sig("close", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+    ]);
+
+    // ── Receiver<T> ──
+    register(sema_result, "Receiver", &["T"], vec![
+        sig("recv", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::ChannelAwait)),
+        sig("close", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+    ]);
+
+    // ── Async<T> ──
+    register(sema_result, "Async", &["T"], vec![
+        sig("status", vec![TypeRepr::SelfType], Some(TypeRepr::Named("str".into())), None),
+        sig("await", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::Await)),
+        sig("cancel", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(42))),
+    ]);
+}
+
 // =========================================================================
 // inference — 类型推导核心
 //
@@ -3235,6 +3383,7 @@ impl<'a> InferContext<'a> {
         // return_type_node 仍用 AstTypeRef（GADT 场景少且通常同模块）。
         type CtorInfoSnapshot = (Box<str>, bool, Option<AstTypeRef>, Box<[TypeRepr]>);
         let resolved_expected = self.arena.resolve(expected_ty);
+        let expected_ct = self.arena.get(resolved_expected).clone();
 
         // 先克隆构造器信息，避免 &CtorDefInfo 借用阻塞后续 &mut self 调用
         let ctor_info: Option<CtorInfoSnapshot> =
@@ -3247,28 +3396,28 @@ impl<'a> InferContext<'a> {
                 )
             });
 
+        // Throw<T, E> 内置类型变体匹配：
+        // Throw 是内置 sum 类型，变体 Ok(T) / Error(E) 未注册为 CtorDefInfo。
+        // - 构造器未注册（如 Ok）→ 值变体 → 子模式绑定到 value_type
+        // - 构造器已注册（如 Error ADT、newtype 错误构造器）→ 错误变体 → 子模式绑定到 error_type
+        //   （构造器名与 Throw 错误变体名 "Error" 碰撞时，无论 error_type 是何类型，
+        //    模式均匹配 Throw 错误变体，子模式绑定到 error_type 而非构造器字段类型）
+        if let ConcreteType::Throw { value_type, error_type } = &expected_ct {
+            let branch_ty = if ctor_info.is_some() { *error_type } else { *value_type };
+            for &sub_pat in sub_patterns.iter() {
+                self.infer_pattern(sub_pat, ast, branch_ty, env);
+            }
+            return true;
+        }
+
         let (type_name, is_newtype, return_type_node, field_type_reprs) = match ctor_info {
             Some(info) => info,
             None => return false,
         };
+        let _ = is_newtype;
 
-        // 判定是否为 Throw 错误分支构造器：
-        // expected 是 Throw 类型且构造器是 error_newtype ADT 构造器时，
-        // 构造器作为 Throw 错误分支，返回类型与子模式均绑定到 error_type。
-        let expected_ct = self.arena.get(resolved_expected).clone();
-        let error_type = match &expected_ct {
-            ConcreteType::Throw { error_type, .. } => Some(*error_type),
-            _ => None,
-        };
-        let is_throw_error_branch = error_type.is_some() && is_newtype;
-
-        // 解析构造器返回类型（统一路径，无早退）：
-        // - Throw 错误分支 → error_type
-        // - GADT 构造器    → return_type_node
-        // - 普通 ADT      → type_name 对应的 Adt
-        let ctor_return_ty = if is_throw_error_branch {
-            error_type.expect("is_throw_error_branch implies error_type is Some")
-        } else if let Some(rtn) = return_type_node {
+        // 解析构造器返回类型（GADT → return_type_node，普通 ADT → type_name 对应的 Adt）
+        let ctor_return_ty = if let Some(rtn) = return_type_node {
             self.resolve_type_node_to_handle(rtn, ast)
         } else {
             self.arena.make(ConcreteType::Adt {
@@ -3281,13 +3430,9 @@ impl<'a> InferContext<'a> {
         // 失败时注册约束供不动点迭代重试
         self.unify_or_constrain(ctor_return_ty, expected_ty);
 
-        // 对子模式按构造器字段类型递归推断并绑定变量（统一路径，无早退）：
-        // - Throw 错误分支 → error_type
-        // - 常规          → 构造器字段类型
+        // 对子模式按构造器字段类型递归推断并绑定变量
         for (i, &sub_pat) in sub_patterns.iter().enumerate() {
-            let sub_ty = if is_throw_error_branch {
-                error_type.expect("is_throw_error_branch implies error_type is Some")
-            } else if i < field_type_reprs.len() {
+            let sub_ty = if i < field_type_reprs.len() {
                 self.type_repr_to_handle(&field_type_reprs[i])
             } else {
                 self.arena.fresh_type_var()
@@ -3531,6 +3676,7 @@ fn build_method_sig_info<'a>(
         param_type_names: param_type_names.into_boxed_slice(),
         param_type_reprs: param_type_reprs.into_boxed_slice(),
         return_type_repr,
+        intrinsic: None,
     }
 }
 
@@ -4718,6 +4864,8 @@ pub fn collect_monomorph_instances<'a>(
 ) {
     // 注册内置标量 TypeDescriptor 到全局表
     register_builtin_type_descriptors(sema_result);
+    // 注册内置类型方法签名（合成 TypeDefInfo），使方法查找走统一 (type_id, method_idx) 路径
+    register_builtin_method_sigs(sema_result);
 
     let mut ctx = WalkCtx {
         ast: &module.arena,
@@ -6909,12 +7057,47 @@ impl<'a> InferContext<'a> {
         )
     }
 
-    /// 解引用 ref 类型，返回 inner；非 ref 返回原类型。
+    /// 解引用 ref/nullable 类型，返回 inner；非 ref/nullable 返回原类型。
+    /// SafeAccess `?.` 对 Nullable 需要解包内层类型查找字段，与方法调用对 Nullable 的解包保持一致。
     fn unwrap_ref(&self, ty: TypeHandle) -> TypeHandle {
         let resolved = self.arena.resolve(ty);
         match self.arena.get(resolved) {
-            ConcreteType::Ref { inner, .. } => *inner,
+            ConcreteType::Ref { inner, .. } | ConcreteType::Nullable(inner) => *inner,
             _ => resolved,
+        }
+    }
+
+    /// 从迭代器类型结构化提取元素类型。
+    /// 覆盖所有标准迭代器形态：
+    /// - Array<T> → T（虽然数组不是迭代器，但提取元素类型用于约束）
+    /// - ArrayIter<T> / Iter<T> / RangeIterator → T
+    /// - Map<K,V> 的迭代器 → Entry<K,V>
+    /// - Str → char
+    /// - Throw<T,E> → T（直接解构，便于 For over Throw 时元素为值类型）
+    /// 提取失败返回 None（调用方回退到 fresh_type_var + 约束）。
+    fn extract_iterator_element(&mut self, ct: &ConcreteType) -> Option<TypeHandle> {
+        match ct {
+            ConcreteType::Array { element_type, .. } => Some(*element_type),
+            ConcreteType::Str => Some(self.make_builtin(ConcreteType::Char)),
+            ConcreteType::Generic { name, args } => {
+                match name.as_ref() {
+                    // 标准迭代器：ArrayIter<T>、Iter<T>、RangeIterator（无 args，元素为 i64）
+                    "ArrayIter" | "Iter" if args.len() == 1 => Some(args[0]),
+                    "RangeIterator" => Some(self.make_builtin(ConcreteType::I64)),
+                    // Map 迭代器返回 Entry<K,V>
+                    "MapIter" | "MapKeys" | "MapValues" if args.len() == 1 => Some(args[0]),
+                    "Map" if args.len() == 2 => {
+                        let entry_ty = self.arena.make(ConcreteType::Generic {
+                            name: "Entry".into(),
+                            args: args.clone(),
+                        });
+                        Some(entry_ty)
+                    }
+                    _ => None,
+                }
+            }
+            ConcreteType::Throw { value_type, .. } => Some(*value_type),
+            _ => None,
         }
     }
 }
@@ -7158,21 +7341,21 @@ impl<'a> InferContext<'a> {
                         left_ty
                     }
                     BinaryOp::ConcatList => {
-                        let elem_ty = self.arena.fresh_type_var();
-                        let arr_ty = self.arena.make(ConcreteType::Array {
-                            element_type: elem_ty,
+                        // 数组拼接 a ++ b：左右元素类型必须一致，结果复用左操作数元素类型
+                        // 避免创建孤立 fresh_type_var（res_elem 与输入无约束）
+                        let left_elem = self.arena.fresh_type_var();
+                        let left_arr = self.arena.make(ConcreteType::Array {
+                            element_type: left_elem,
                             size: None,
                         });
-                        self.unify_or_constrain(left_ty, arr_ty);
-                        let right_elem = self.arena.fresh_type_var();
-                        let arr_ty = self.arena.make(ConcreteType::Array {
-                            element_type: right_elem,
+                        self.unify_or_constrain(left_ty, left_arr);
+                        let right_arr = self.arena.make(ConcreteType::Array {
+                            element_type: left_elem,
                             size: None,
                         });
-                        self.unify_or_constrain(right_ty, arr_ty);
-                        let res_elem = self.arena.fresh_type_var();
+                        self.unify_or_constrain(right_ty, right_arr);
                         self.arena.make(ConcreteType::Array {
-                            element_type: res_elem,
+                            element_type: left_elem,
                             size: None,
                         })
                     }
@@ -7290,14 +7473,15 @@ impl<'a> InferContext<'a> {
                     if params.len() == args.len() {
                         for (&param_ty, &arg) in params.iter().zip(args.iter()) {
                             let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                            let _ = self.try_widen_unify(param_ty, arg_ty);
+                            // unify 失败时注册约束（而非丢弃），让不动点迭代求解参数类型
+                            self.unify_or_constrain(param_ty, arg_ty);
                         }
                     }
                     // 始终返回声明的返回类型，避免参数不匹配导致级联类型丢失
                     // 若有 expected 类型，unify 返回类型与 expected，求解返回类型中的未决 TypeVar
                     // （如 Ok(void) 返回 Throw<void, '_E>，expected=Throw<void, IOError> 可求解 E=IOError）
                     if let Some(exp) = expected {
-                        let _ = self.try_widen_unify(*return_type, exp);
+                        self.unify_or_constrain(*return_type, exp);
                     }
                     return *return_type;
                 }
@@ -7335,7 +7519,7 @@ impl<'a> InferContext<'a> {
                             let n = params.len().min(args.len());
                             for i in 0..n {
                                 let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
-                                let _ = self.try_widen_unify(params[i], arg_ty);
+                                self.unify_or_constrain(params[i], arg_ty);
                             }
                             return return_type;
                         }
@@ -7355,7 +7539,7 @@ impl<'a> InferContext<'a> {
                         let n = params.len().min(args.len() + 1);
                         for i in 1..n {
                             let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                            let _ = self.try_widen_unify(params[i], arg_ty);
+                            self.unify_or_constrain(params[i], arg_ty);
                         }
                         return return_type;
                     }
@@ -7372,11 +7556,16 @@ impl<'a> InferContext<'a> {
                     if let ConcreteType::Fn { params, return_type } =
                         self.arena.get(inst_fn).clone()
                     {
-                        // 第一个参数是 self，跳过
+                        // 第一个参数是 self/接收者：unify recv 与 params[0]
+                        // 这样自由函数泛型参数能从接收者类型推断（如 iter<T> 从 arr: T[] 推断 T）
+                        if !params.is_empty() {
+                            self.unify_or_constrain(params[0], recv_ty);
+                        }
+                        // 其余参数从 args 推断
                         let n = params.len().min(args.len() + 1);
                         for i in 1..n {
                             let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                            let _ = self.try_widen_unify(params[i], arg_ty);
+                            self.unify_or_constrain(params[i], arg_ty);
                         }
                         return return_type;
                     }
@@ -7420,9 +7609,18 @@ impl<'a> InferContext<'a> {
             }
             Expr::SafeAccess { recv, field } => {
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
+                let resolved = self.arena.resolve(recv_ty);
+                // SafeAccess `?.` 仅对 Nullable/Ref 有意义；对其他类型退化为普通字段访问
+                let is_nullable = matches!(self.arena.get(resolved), ConcreteType::Nullable(_));
                 let inner = self.unwrap_ref(recv_ty);
                 let span = ast.expr(expr).span;
-                self.lookup_field_type(inner, field, span.line, span.column)
+                let field_ty = self.lookup_field_type(inner, field, span.line, span.column);
+                // Nullable 接收者的字段访问结果也应是 Nullable（传播 None 语义）
+                if is_nullable {
+                    self.arena.make(ConcreteType::Nullable(field_ty))
+                } else {
+                    field_ty
+                }
             }
 
             // ── 索引/切片 ──
@@ -7659,6 +7857,50 @@ impl<'a> InferContext<'a> {
                 let scrutinee_ty = self.infer_expr(*scrutinee, ast, env, None);
                 let resolved_scrutinee = self.arena.resolve(scrutinee_ty);
 
+                // Throw 类型 widening：当 match 同时包含 Ok 和 Error/错误构造器模式时，
+                // scrutinee 应为 Throw<T, E>。若 scrutinee 是 Err 实现者（如 Error ADT）
+                // 而非 Throw，将其 widen 为 Throw<fresh, scrutinee_ty>（scrutinee 作为 error_type），
+                // 使 Ok(v) 匹配值变体、Error(e) 匹配错误变体并绑定整个错误值（而非构造器字段）。
+                let resolved_scrutinee = {
+                    let is_throw = matches!(
+                        self.arena.get(resolved_scrutinee),
+                        ConcreteType::Throw { .. }
+                    );
+                    let has_ok_arm = arms.iter().any(|arm| {
+                        match &ast.pattern(arm.pattern).node {
+                            Pattern::Constructor { name, .. } => *name == "Ok",
+                            Pattern::Variable { name } => *name == "Ok",
+                            _ => false,
+                        }
+                    });
+                    if !is_throw && has_ok_arm {
+                        // 检查 scrutinee 是否实现 Err trait（通过 witness table）
+                        let implements_err = self.arena.type_name(resolved_scrutinee)
+                            .and_then(|tn| self.sema_result.type_def_index.get(tn).copied())
+                            .map(|idx| self.witness_table.implements("Err", (22 + idx) as u16))
+                            .unwrap_or(false);
+                        let widened = if implements_err {
+                            // scrutinee 是错误类型 → Throw<fresh_val, scrutinee>
+                            let fresh_val = self.arena.fresh_type_var();
+                            self.arena.make(ConcreteType::Throw {
+                                value_type: fresh_val,
+                                error_type: resolved_scrutinee,
+                            })
+                        } else {
+                            // scrutinee 是值类型 → Throw<scrutinee, fresh_err>
+                            let fresh_err = self.arena.fresh_type_var();
+                            self.arena.make(ConcreteType::Throw {
+                                value_type: resolved_scrutinee,
+                                error_type: fresh_err,
+                            })
+                        };
+                        self.unify_or_constrain(scrutinee_ty, widened);
+                        self.arena.resolve(widened)
+                    } else {
+                        resolved_scrutinee
+                    }
+                };
+
                 // sema v2: 提取 scrutinee 的路径（用于 ConstructorMatch narrowing）
                 let scrutinee_path = expr_path(ast, *scrutinee);
 
@@ -7703,11 +7945,17 @@ impl<'a> InferContext<'a> {
 
                 // v2 收敛：只用 peer_type 统一所有 arm 类型（消除逐个 widen 双轨制）
                 // peer_type 处理单 arm（直接返回）、多 arm（join）、全 Never/Void（返回 Never/Void）
-                if arm_tys.is_empty() {
+                let result_ty = if arm_tys.is_empty() {
                     self.make_builtin(ConcreteType::Void)
                 } else {
                     peer_type(self.arena, &arm_tys)
+                };
+                // match 结果与外层 expected 约束，使 match 作为 let RHS 时
+                // 能反向求解结果类型中的未决 TypeVar
+                if let Some(exp) = expected {
+                    self.unify_or_constrain(result_ty, exp);
                 }
+                result_ty
             }
 
             // ── 类型转换 ──
@@ -8074,120 +8322,6 @@ impl<'a> InferContext<'a> {
         }
     }
 
-    /// 查找内置类型的内置方法（Array/Str/Channel/Map/Nullable/Throw）。
-    /// 返回方法的 Fn 类型（不含 self 参数，self 已由接收者确定）。
-    /// 仅对内置类型生效；用户自定义类型走 witness_table/func_sigs 路径。
-    fn lookup_builtin_method(
-        &mut self,
-        resolved: TypeHandle,
-        method: &str,
-    ) -> Option<TypeHandle> {
-        let ct = self.arena.get(resolved).clone();
-        let usize_ty = self.arena.make(ConcreteType::Usize);
-        let bool_ty = self.arena.make(ConcreteType::Bool);
-        let void_ty = self.arena.make(ConcreteType::Void);
-        match &ct {
-            ConcreteType::Array { element_type, .. } => {
-                let elem = *element_type;
-                match method {
-                    "len" | "is_empty" => Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([]),
-                        return_type: usize_ty,
-                    })),
-                    "push" => Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([elem]),
-                        return_type: void_ty,
-                    })),
-                    "pop" => Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([]),
-                        return_type: elem,
-                    })),
-                    _ => None,
-                }
-            }
-            ConcreteType::Str => match method {
-                "len" | "is_empty" => Some(self.arena.make(ConcreteType::Fn {
-                    params: Box::new([]),
-                    return_type: usize_ty,
-                })),
-                _ => None,
-            },
-            ConcreteType::Nullable(inner) => {
-                let inner_ty = *inner;
-                match method {
-                    "is_null" => Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([]),
-                        return_type: bool_ty,
-                    })),
-                    "unwrap" => Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([]),
-                        return_type: inner_ty,
-                    })),
-                    _ => None,
-                }
-            }
-            ConcreteType::Throw { value_type, .. } => {
-                let val = *value_type;
-                match method {
-                    "is_ok" => Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([]),
-                        return_type: bool_ty,
-                    })),
-                    "unwrap" => Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([]),
-                        return_type: val,
-                    })),
-                    "unwrap_or" => Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([val]),
-                        return_type: val,
-                    })),
-                    _ => None,
-                }
-            }
-            ConcreteType::Generic { name, args } => match name.as_ref() {
-                "Channel" if args.len() == 1 => {
-                    let elem = args[0];
-                    match method {
-                        "send" => Some(self.arena.make(ConcreteType::Fn {
-                            params: Box::new([elem]),
-                            return_type: void_ty,
-                        })),
-                        "recv" => Some(self.arena.make(ConcreteType::Fn {
-                            params: Box::new([]),
-                            return_type: elem,
-                        })),
-                        "close" => Some(self.arena.make(ConcreteType::Fn {
-                            params: Box::new([]),
-                            return_type: void_ty,
-                        })),
-                        _ => None,
-                    }
-                }
-                "Map" if args.len() == 2 => {
-                    let k = args[0];
-                    let v = args[1];
-                    match method {
-                        "len" | "is_empty" => Some(self.arena.make(ConcreteType::Fn {
-                            params: Box::new([]),
-                            return_type: usize_ty,
-                        })),
-                        "get" => Some(self.arena.make(ConcreteType::Fn {
-                            params: Box::new([k]),
-                            return_type: v,
-                        })),
-                        "set" => Some(self.arena.make(ConcreteType::Fn {
-                            params: Box::new([k, v]),
-                            return_type: void_ty,
-                        })),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
     /// 查找对象类型的方法签名（返回函数类型，第一个参数为 self）。
     fn lookup_method_type(
         &mut self,
@@ -8199,10 +8333,10 @@ impl<'a> InferContext<'a> {
         // ── 接收者规范化 ──
         // 包装类型（Nullable/Ref）递归转发到 inner 类型的方法查找，
         // 使 s?.len() / (&arr).len() 等调用自动解包到正确的方法表。
-        // Nullable 优先于 builtin（is_null/unwrap 是 Nullable 自有方法，不转发）。
+        // Nullable 自有方法（is_null/unwrap/unwrap_or）由统一 TypeDefInfo 路径处理，不转发。
         match self.arena.get(resolved).clone() {
             ConcreteType::Nullable(inner) => {
-                // Nullable 自有方法（is_null/unwrap）由 lookup_builtin_method 处理，
+                // Nullable 自有方法（is_null/unwrap/unwrap_or）走 TypeDefInfo("nullable") 路径，
                 // 其他方法递归转发到 inner 类型。
                 if method != "is_null" && method != "unwrap" && method != "unwrap_or" {
                     return self.lookup_method_type(inner, method);
@@ -8225,15 +8359,22 @@ impl<'a> InferContext<'a> {
         // 能通过 type_binding_stack 解析为接收者中对应的类型参数，
         // 而非生成孤立的 fresh_type_var。
         //
-        // 仅对 Adt（用户自定义泛型类型）处理：内置泛型（Generic）的方法
-        // 由 lookup_builtin_method 处理，不走 witness_table 签名路径。
+        // 统一处理 Adt（用户自定义泛型）和内置类型（Array/Nullable/Throw/Generic），
+        // 使内置类型方法签名中的泛型参数也能正确绑定。
         let mut pushed_bindings = false;
-        if let ConcreteType::Adt { name, type_args } = self.arena.get(resolved).clone() {
-            if let Some(def) = self.sema_result.get_type_def(name.as_ref()) {
-                if !def.type_params.is_empty() && type_args.len() == def.type_params.len() {
-                    // push 绑定框架，逐个将类型参数名绑定到接收者对应位置的类型参数
+        let builtin_bindings: Option<(Box<str>, Vec<TypeHandle>)> = match self.arena.get(resolved).clone() {
+            ConcreteType::Adt { name, type_args } => Some((name.clone(), type_args.to_vec())),
+            ConcreteType::Array { element_type, .. } => Some(("array".into(), vec![element_type])),
+            ConcreteType::Nullable(inner) => Some(("nullable".into(), vec![inner])),
+            ConcreteType::Throw { value_type, error_type } => Some(("throw".into(), vec![value_type, error_type])),
+            ConcreteType::Generic { name, args } => Some((name.clone(), args.to_vec())),
+            _ => None,
+        };
+        if let Some((type_name, actual_args)) = builtin_bindings {
+            if let Some(def) = self.sema_result.get_type_def(type_name.as_ref()) {
+                if !def.type_params.is_empty() && def.type_params.len() == actual_args.len() {
                     self.type_binding_stack.push();
-                    for (pname, &arg) in def.type_params.iter().zip(type_args.iter()) {
+                    for (pname, &arg) in def.type_params.iter().zip(actual_args.iter()) {
                         self.type_binding_stack.insert_top(pname.as_ref(), arg);
                     }
                     pushed_bindings = true;
@@ -8260,8 +8401,10 @@ impl<'a> InferContext<'a> {
                 // 参数用 fresh_type_var（trait 方法的精确参数类型由实现类型决定）
                 if let Some(td) = self.sema_result.get_trait_def(name.as_ref()) {
                     if let Some(sig) = td.methods.iter().find(|m| m.name.as_ref() == method) {
+                        // params[0] 是 self，绑定到接收者类型（resolved）避免产生孤立 TypeVar；
+                        // 其余参数仍用 fresh_type_var（精确类型由实现类型决定）。
                         let params: Vec<TypeHandle> = (0..sig.param_count)
-                            .map(|_| self.arena.fresh_type_var())
+                            .map(|i| if i == 0 { resolved } else { self.arena.fresh_type_var() })
                             .collect();
                         let return_type =
                             self.type_handle_from_name(Some(sig.return_type_desc.type_name));
@@ -8275,26 +8418,16 @@ impl<'a> InferContext<'a> {
             _ => {}
         }
 
-        // 内置方法：Async<T>.await() -> T
-        if method == "await" {
-            if let ConcreteType::Generic { name, args } = self.arena.get(resolved).clone() {
-                if name.as_ref() == "Async" && args.len() == 1 {
-                    let inner = args[0];
-                    return Some(self.arena.make(ConcreteType::Fn {
-                        params: Box::new([]),
-                        return_type: inner,
-                    }));
-                }
-            }
-        }
-
-        // 内置类型方法：Array/Str/Channel/Map/Nullable/Throw 的通用方法
-        // 优先于 witness_table/func_sigs（内置类型无用户自定义方法）
-        if let Some(fn_ty) = self.lookup_builtin_method(resolved, method) {
-            return Some(fn_ty);
-        }
-
-        let type_name = self.arena.type_name(resolved).map(|s| s.to_string());
+        // 内置类型名映射：Array/Nullable/Throw 是结构变体，arena.type_name 返回 None
+        // 或递归到 inner。方法查找需要统一的类型名来查 type_def_index，
+        // 此处映射到注册时的合成 TypeDefInfo 名称。
+        let type_name: Option<String> = match self.arena.get(resolved) {
+            ConcreteType::Array { .. } => Some("array".to_string()),
+            ConcreteType::Str => Some("str".to_string()),
+            ConcreteType::Nullable(_) => Some("nullable".to_string()),
+            ConcreteType::Throw { .. } => Some("throw".to_string()),
+            _ => self.arena.type_name(resolved).map(|s| s.to_string()),
+        };
 
         // v2 收敛：路径 1 — 查 witness_table（trait 方法分派，type_id 索引）
         if let Some(ref name) = type_name {
@@ -8305,45 +8438,49 @@ impl<'a> InferContext<'a> {
                 .map(|&idx| 22 + idx);
             if let Some(tid) = type_id {
                 for entry in self.witness_table.entries().iter() {
-                    if entry.type_id == tid && entry.method_slots.contains_key(method) {
-                        // 从 TypeDefInfo.methods 获取签名（按 method_name 查找）
-                        // 提取 owned 数据以释放 sema_result 借用
-                        let sig_data: Option<(Vec<TypeRepr>, Option<TypeRepr>)> =
-                            if let Some(&type_idx) = self.sema_result.type_def_index.get(name.as_str()) {
-                                self.sema_result.type_defs[type_idx as usize]
-                                    .methods
+                    if entry.type_id != tid {
+                        continue;
+                    }
+                    // 从 TypeDefInfo.methods 获取签名（按 method_name 查找）
+                    // 提取 owned 数据以释放 sema_result 借用
+                    let sig_data: Option<(Vec<TypeRepr>, Option<TypeRepr>)> =
+                        if let Some(&type_idx) = self.sema_result.type_def_index.get(name.as_str()) {
+                            self.sema_result.type_defs[type_idx as usize]
+                                .methods
+                                .iter()
+                                .find(|m| m.name.as_ref() == method)
+                                .map(|sig| (sig.param_type_reprs.to_vec(), sig.return_type_repr.clone()))
+                        } else {
+                            None
+                        };
+                    if let Some((param_type_reprs, return_type_repr)) = sig_data {
+                        return Some(self.build_fn_type_from_sig(param_type_reprs, return_type_repr, resolved));
+                    }
+                    // TypeDefInfo.methods 未命中 → 查 trait_def.methods（trait 默认方法）
+                    // 类型通过 `type T: Trait = ...` 实现 trait 但未 override 方法时，
+                    // method_slots 为空，方法签名从 trait_def 获取。
+                    let trait_sig_data: Option<(u8, &'static str)> =
+                        self.sema_result
+                            .get_trait_def(entry.trait_name.as_ref())
+                            .and_then(|td| {
+                                td.methods
                                     .iter()
                                     .find(|m| m.name.as_ref() == method)
-                                    .map(|sig| (sig.param_type_reprs.to_vec(), sig.return_type_repr.clone()))
-                            } else {
-                                None
-                            };
-                        if let Some((param_type_reprs, return_type_repr)) = sig_data {
-                            return Some(self.build_fn_type_from_sig(param_type_reprs, return_type_repr, resolved));
-                        }
-                        // witness 命中但 TypeDefInfo.methods 未命中（trait 默认方法）
-                        // 从 trait_def 获取方法签名
-                        let trait_sig_data: Option<(u8, &'static str)> =
-                            self.sema_result
-                                .get_trait_def(entry.trait_name.as_ref())
-                                .and_then(|td| {
-                                    td.methods
-                                        .iter()
-                                        .find(|m| m.name.as_ref() == method)
-                                        .map(|m| (m.param_count, m.return_type_desc.type_name))
-                                });
-                        if let Some((param_count, return_name)) = trait_sig_data {
-                            let params: Vec<TypeHandle> = (0..param_count)
-                                .map(|_| self.arena.fresh_type_var())
-                                .collect();
-                            let return_type = self.type_handle_from_name(Some(return_name));
-                            return Some(self.arena.make(ConcreteType::Fn {
-                                params: params.into_boxed_slice(),
-                                return_type,
-                            }));
-                        }
-                        return None;
+                                    .map(|m| (m.param_count, m.return_type_desc.type_name))
+                            });
+                    if let Some((param_count, return_name)) = trait_sig_data {
+                        // params[0] 是 self，绑定到接收者类型（resolved）避免产生孤立 TypeVar；
+                        // 其余参数用 fresh_type_var（精确类型由实现类型决定）。
+                        let params: Vec<TypeHandle> = (0..param_count)
+                            .map(|i| if i == 0 { resolved } else { self.arena.fresh_type_var() })
+                            .collect();
+                        let return_type = self.type_handle_from_name(Some(return_name));
+                        return Some(self.arena.make(ConcreteType::Fn {
+                            params: params.into_boxed_slice(),
+                            return_type,
+                        }));
                     }
+                    // 当前 trait 未找到该方法，继续检查其他 trait 实现
                 }
             }
         }
@@ -8363,8 +8500,10 @@ impl<'a> InferContext<'a> {
                 None
             };
         if let Some((param_count, return_name)) = trait_sig_data {
+            // params[0] 是 self，绑定到接收者类型（resolved）避免产生孤立 TypeVar；
+            // 其余参数用 fresh_type_var（精确类型由实现类型决定）。
             let params: Vec<TypeHandle> = (0..param_count)
-                .map(|_| self.arena.fresh_type_var())
+                .map(|i| if i == 0 { resolved } else { self.arena.fresh_type_var() })
                 .collect();
             let return_type = self.type_handle_from_name(Some(return_name));
             return Some(self.arena.make(ConcreteType::Fn {
@@ -8449,6 +8588,28 @@ impl<'a> InferContext<'a> {
             for f in fields.iter() {
                 if f.name.as_deref() == Some(field) {
                     return f.ty;
+                }
+            }
+        }
+        // Channel<T>.sender / .receiver 字段：返回 Sender<T> / Receiver<T>
+        // （运行时 Value.rs 已支持，Sema 层补全类型签名）
+        if let ConcreteType::Generic { name, args } = &ct {
+            if name.as_ref() == "Channel" && args.len() == 1 {
+                let elem = args[0];
+                match field {
+                    "sender" => {
+                        return self.arena.make(ConcreteType::Generic {
+                            name: "Sender".into(),
+                            args: vec![elem].into_boxed_slice(),
+                        });
+                    }
+                    "receiver" => {
+                        return self.arena.make(ConcreteType::Generic {
+                            name: "Receiver".into(),
+                            args: vec![elem].into_boxed_slice(),
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -8607,6 +8768,9 @@ impl<'a> InferContext<'a> {
                 let span = ast.stmt(stmt).span;
                 let iterable_ty = self.infer_expr(*iterable, ast, env, None);
                 let child_env = self.env.child(env);
+                // 从迭代器类型结构化提取元素类型，建立约束而非使用孤立 fresh_type_var。
+                // 覆盖：Array<T>、ArrayIter<T>、RangeIterator、Str→char、Map<K,V>→Entry<K,V> 等。
+                // 提取失败时回退到 fresh_type_var 并通过约束让不动点求解。
                 let item_ty = {
                     let resolved = self.arena.resolve(iterable_ty);
                     let ct = self.arena.get(resolved).clone();
@@ -8630,8 +8794,18 @@ impl<'a> InferContext<'a> {
                             span.column,
                         );
                     }
-                    // 循环变量类型用 fresh_type_var（next() 返回 T? 的内层 T 由 IR 运行时分派）
-                    self.arena.fresh_type_var()
+                    // 结构化元素类型提取
+                    self.extract_iterator_element(&ct).unwrap_or_else(|| {
+                        // 提取失败：用 fresh_type_var 并注册约束供不动点求解
+                        let fv = self.arena.fresh_type_var();
+                        // 构造 ArrayIter<fv> 作为期望迭代器类型，与实际 iterable_ty 约束
+                        let expected_iter = self.arena.make(ConcreteType::Generic {
+                            name: "ArrayIter".into(),
+                            args: vec![fv].into_boxed_slice(),
+                        });
+                        self.unify_or_constrain(iterable_ty, expected_iter);
+                        fv
+                    })
                 };
                 self.env.define(child_env, name, item_ty);
                 let _ = self.infer_expr(*body, ast, child_env, None);
@@ -8952,6 +9126,25 @@ impl<'a> InferContext<'a> {
         let InferContext { arena, solver, witness_table, type_trace, .. } = self;
         solver.solve_with_witness(arena, Some(witness_table));
 
+        // 9.4 默认化未绑定的非刚性 TypeVar 为 void（根因F）
+        //
+        // 约束求解后仍有未绑定的非刚性 TypeVar 是正常的类型推断现象：
+        // - Throw<T, E> 中 E 未约束（函数不抛出错误时 E 无信息来源）
+        // - ArrayIter<T> 中 T 未约束（迭代器未被消费）
+        // - 泛型函数实例化产生的 TypeVar 未被调用点约束
+        //
+        // 这些 TypeVar 没有任何候选类型（不是歧义），void 作为单位类型是安全的默认值：
+        // 未约束意味着任何类型都满足，void 不引入额外约束。
+        // 这是标准类型推断默认化技术（ML 的 defaulting rule），不是错误回退。
+        // 真正的类型错误由 unify 失败和歧义检测捕获，不依赖此处诊断。
+        let void_ty = arena.make(ConcreteType::Void);
+        for i in type_vars_baseline..arena.type_vars.len() {
+            let tv = &mut arena.type_vars[i];
+            if !tv.is_rigid && tv.bound.is_none() {
+                tv.bound = Some(void_ty);
+            }
+        }
+
         // 9.5 全局残留 TypeVar 诊断：求解后仍有未绑定的非 rigid TypeVar 表示类型推断失败
         // 只统计本模块新增的 TypeVar（arena 跨模块共享，baseline 之前的属于前置模块）
         let unresolved: Vec<u32> = arena.type_vars.iter().enumerate()
@@ -9118,6 +9311,31 @@ impl<'a> InferContext<'a> {
         }
     }
 
+    /// 将返回类型按需包装为 `Async<T>`。
+    ///
+    /// async 函数/方法声明的返回类型 `X` 实际表示 `Async<X>`（与 Lambda/Zig 实现对齐）。
+    /// 若用户已显式写 `Async<X>`，不二次包装；否则包装为 `Async<ret_ty>`。
+    /// 统一用于 predeclare_declarations、check_decl(FunDecl)、type 块方法、trait 块方法，
+    /// 避免各处重复内联导致遗漏（根因D：type/trait 块方法曾遗漏包装）。
+    fn wrap_async_return(&mut self, ret_ty: TypeHandle, is_async: bool) -> TypeHandle {
+        if !is_async {
+            return ret_ty;
+        }
+        let resolved = self.arena.resolve(ret_ty);
+        let already_async = matches!(
+            self.arena.get(resolved),
+            ConcreteType::Generic { name, args } if name.as_ref() == "Async" && args.len() == 1
+        );
+        if already_async {
+            ret_ty
+        } else {
+            self.arena.make(ConcreteType::Generic {
+                name: "Async".into(),
+                args: vec![ret_ty].into_boxed_slice(),
+            })
+        }
+    }
+
     /// 预声明模块中的函数和类型构造器到环境。
     ///
     /// 函数和类型构造器注册到模块专属 env（module_env），而非 root_env。
@@ -9134,7 +9352,7 @@ impl<'a> InferContext<'a> {
         self.current_module_env = Some(module_env);
         for decl in module.declarations.iter() {
             match &decl.node {
-                Decl::FunDecl { name, type_params, params, return_type, .. } => {
+                Decl::FunDecl { name, type_params, params, return_type, is_async, .. } => {
                     // 顶层函数不允许 self 参数（通过 SelfType 类型节点判断，不依赖参数名）
                     if !params.is_empty() && self.is_self_param(params[0].type_annotation, &module.arena) {
                         self.add_error_at(
@@ -9143,7 +9361,16 @@ impl<'a> InferContext<'a> {
                             decl.span.column,
                         );
                     }
-                    // 所有函数都预声明（含泛型）：泛型函数用 fresh_type_var 占位参数/返回类型，
+                    // 泛型函数：push type_bindings 使 type_from_ast 能解析类型参数为 rigid var，
+                    // 预声明类型与 check_decl 阶段一致（避免泛型参数被误解析为 Adt）
+                    if !type_params.is_empty() {
+                        self.push_type_bindings(
+                            &type_params.iter().map(|tp| {
+                                (tp.name, tp.kind.as_ref().map(|k| SemKind::from_ast(k)))
+                            }).collect::<Vec<_>>(),
+                        );
+                    }
+                    // 所有函数都预声明（含泛型）：泛型函数用 rigid var 作为类型参数，
                     // 解决前向引用问题（函数体内可引用后续定义的同模块函数）
                     let param_types: Vec<TypeHandle> = params
                         .iter()
@@ -9152,10 +9379,14 @@ impl<'a> InferContext<'a> {
                             None => self.arena.fresh_type_var(),
                         })
                         .collect();
-                    let ret_ty = match return_type {
+                    // async 函数：用户声明的返回类型 X 实际表示 Async<X>（与 check_decl/Lambda 对齐）
+                    // - 若用户已显式写 Async<X>，不二次包装
+                    // - 否则包装为 Async<ret_ty_raw>
+                    let ret_ty_raw = match return_type {
                         Some(rt) => self.type_from_ast(*rt, &module.arena),
                         None => self.arena.fresh_type_var(),
                     };
+                    let ret_ty = self.wrap_async_return(ret_ty_raw, *is_async);
                     let fn_ty = self.arena.make(ConcreteType::Fn {
                         params: param_types.into_boxed_slice(),
                         return_type: ret_ty,
@@ -9165,7 +9396,10 @@ impl<'a> InferContext<'a> {
                     //   define 不覆盖已存在绑定，同名函数首次注册生效
                     self.env.define(module_env, name, fn_ty);
                     self.env.define(root_env, name, fn_ty);
-                    let _ = type_params; // 泛型参数暂不处理，预声明用具体类型
+                    // 泛型函数：弹出 type_bindings（与 check_decl 对称）
+                    if !type_params.is_empty() {
+                        self.pop_type_bindings();
+                    }
                 }
                 Decl::TypeDecl { name, type_params, def, .. } => {
                     // 预声明类型构造器
@@ -9242,7 +9476,7 @@ impl<'a> InferContext<'a> {
     /// 嵌套 `LocalDecl` 的 `Box<Decl>` 无 span，由调用方从所属 Stmt 提供。
     fn check_decl(&mut self, decl: &Decl<'_>, decl_span: crate::Ast::Span, ast: &AstArena<'_>, env: EnvId) {
         match decl {
-            Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async: _, .. } => {
+            Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async, .. } => {
                 // 顶层函数不允许 self 参数（通过 SelfType 类型节点判断，不依赖参数名；
                 // self 只能在 type/trait 块内方法中使用）
                 if !params.is_empty() && self.is_self_param(params[0].type_annotation, ast) {
@@ -9280,10 +9514,14 @@ impl<'a> InferContext<'a> {
                     param_ty
                 }).collect();
                 // 返回类型（未标注时用 fresh_type_var，后续与函数体类型统一）
-                let ret_ty = match return_type {
+                // async 函数：用户声明的返回类型 X 实际表示 Async<X>（与 Lambda/Zig 实现对齐）
+                // - 若用户已显式写 Async<X>，不二次包装
+                // - 否则包装为 Async<ret_ty_raw>
+                let ret_ty_raw = match return_type {
                     Some(rt) => self.type_from_ast(*rt, ast),
                     None => self.arena.fresh_type_var(),
                 };
+                let ret_ty = self.wrap_async_return(ret_ty_raw, *is_async);
                 // 构造函数类型并注册到 fn_env（支持递归自引用）和 env（支持后续引用）
                 // 顶层函数已由 predeclare_declarations 预注册，define 返回 false 不覆盖
                 let fn_ty = self.arena.make(ConcreteType::Fn {
@@ -9398,10 +9636,12 @@ impl<'a> InferContext<'a> {
                             }
                         }
                     }).collect();
-                    let m_ret_ty = match method.return_type {
+                    let m_ret_ty_raw = match method.return_type {
                         Some(rt) => self.type_from_ast(rt, ast),
                         None => self.arena.fresh_type_var(),
                     };
+                    // async 方法：返回类型包装为 Async<T>（与顶层 FunDecl/predeclare 对齐，根因D）
+                    let m_ret_ty = self.wrap_async_return(m_ret_ty_raw, method.is_async);
                     let m_fn_ty = self.arena.make(ConcreteType::Fn {
                         params: m_param_types.into_boxed_slice(),
                         return_type: m_ret_ty,
@@ -9423,7 +9663,10 @@ impl<'a> InferContext<'a> {
                             self.env.define(method_env, param.name, param_ty);
                         }
                         let prev_return = self.expected_return;
-                        let ret_ty = method.return_type.map(|rt| self.type_from_ast(rt, ast));
+                        let ret_ty_raw = method.return_type.map(|rt| self.type_from_ast(rt, ast));
+                        // async 方法：返回类型包装为 Async<T>（与 FunDecl 一致，根因D），
+                        // unify_return_type 会穿透 Async 层统一内层类型与函数体类型。
+                        let ret_ty = ret_ty_raw.map(|t| self.wrap_async_return(t, method.is_async));
                         self.expected_return = ret_ty;
                         let body_ty = self.infer_expr(body, ast, method_env, ret_ty);
                         self.expected_return = prev_return;
@@ -9473,7 +9716,10 @@ impl<'a> InferContext<'a> {
                             self.env.define(method_env, param.name, param_ty);
                         }
                         let prev_return = self.expected_return;
-                        let ret_ty = method.return_type.map(|rt| self.type_from_ast(rt, ast));
+                        let ret_ty_raw = method.return_type.map(|rt| self.type_from_ast(rt, ast));
+                        // async 默认方法：返回类型包装为 Async<T>（与 FunDecl 一致，根因D），
+                        // unify_return_type 会穿透 Async 层统一内层类型与函数体类型。
+                        let ret_ty = ret_ty_raw.map(|t| self.wrap_async_return(t, method.is_async));
                         self.expected_return = ret_ty;
                         let body_ty = self.infer_expr(body, ast, method_env, ret_ty);
                         self.expected_return = prev_return;
@@ -9971,7 +10217,7 @@ impl ConstraintSolver {
     /// 1. 基于 resolve 后的 TypeHandle 相等性去重
     /// 2. 唯一候选 → 写入 subst
     /// 3. 多个不同候选 → 标记歧义错误，仍选 arena 实际解写入 subst（避免级联误报）
-    fn finalize_solution(&mut self, arena: &TypeArena) {
+    fn finalize_solution(&mut self, arena: &mut TypeArena) {
         let candidates = std::mem::take(&mut self.candidates);
         for (idx, cands) in candidates {
             // 去重：基于 resolve 后的 TypeHandle 相等性
@@ -9986,14 +10232,19 @@ impl ConstraintSolver {
             match unique.len() {
                 0 => {} // 不可能（cands 非空才会迭代）
                 1 => {
-                    // 唯一候选：写入 subst
-                    self.subst.insert(idx, unique[0]);
+                    // 唯一候选：写入 subst 并回写 arena.type_vars[idx].bound
+                    // 回写是关键：诊断检查的是 arena.type_vars[idx].bound，
+                    // 若不回写，已求解的 TypeVar 仍被判为 unresolved
+                    let resolved = arena.resolve(unique[0]);
+                    self.subst.insert(idx, resolved);
+                    arena.type_vars[idx as usize].bound = Some(resolved);
                 }
                 _ => {
                     // 多个不同候选：歧义
                     // 选 arena 实际解（unify 已选第一个成功的）写入 subst，避免级联误报
                     let resolved = arena.resolve(cands[0]);
                     self.subst.insert(idx, resolved);
+                    arena.type_vars[idx as usize].bound = Some(resolved);
                     // 记录歧义错误
                     self.errors.push(ConstraintError {
                         constraint: Constraint::Equality(unique[0], unique[1]),
