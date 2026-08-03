@@ -9423,10 +9423,22 @@ impl<'a> InferContext<'a> {
                             self.env.define(method_env, param.name, param_ty);
                         }
                         let prev_return = self.expected_return;
-                        self.expected_return =
-                            method.return_type.map(|rt| self.type_from_ast(rt, ast));
-                        let _ = self.infer_expr(body, ast, method_env, self.expected_return);
+                        let ret_ty = method.return_type.map(|rt| self.type_from_ast(rt, ast));
+                        self.expected_return = ret_ty;
+                        let body_ty = self.infer_expr(body, ast, method_env, ret_ty);
                         self.expected_return = prev_return;
+                        // 统一方法体类型与声明返回类型（与 FunDecl 一致）：
+                        // - 无标注返回类型：ret_ty 为 None → fresh_type_var，用 unify_or_constrain 绑定
+                        // - 有标注返回类型：用 unify_return_type 统一（处理 async 穿透），
+                        //   失败时注册 Equality 约束供 solver 延迟重试
+                        // 这使 FieldAccess 等不依赖 expected 的表达式产生的 fresh var
+                        // 能被 ret_ty 约束求解，避免成为孤儿 TypeVar。
+                        let ret = ret_ty.unwrap_or_else(|| self.arena.fresh_type_var());
+                        if method.return_type.is_none() {
+                            self.unify_or_constrain(ret, body_ty);
+                        } else if self.unify_return_type(ret, body_ty).is_err() {
+                            self.solver.add_equality(ret, body_ty);
+                        }
                     }
                 }
                 self.pop_self_type();
@@ -9461,10 +9473,22 @@ impl<'a> InferContext<'a> {
                             self.env.define(method_env, param.name, param_ty);
                         }
                         let prev_return = self.expected_return;
-                        self.expected_return =
-                            method.return_type.map(|rt| self.type_from_ast(rt, ast));
-                        let _ = self.infer_expr(body, ast, method_env, self.expected_return);
+                        let ret_ty = method.return_type.map(|rt| self.type_from_ast(rt, ast));
+                        self.expected_return = ret_ty;
+                        let body_ty = self.infer_expr(body, ast, method_env, ret_ty);
                         self.expected_return = prev_return;
+                        // 统一方法体类型与声明返回类型（与 FunDecl 一致）：
+                        // - 无标注返回类型：ret_ty 为 None → fresh_type_var，用 unify_or_constrain 绑定
+                        // - 有标注返回类型：用 unify_return_type 统一（处理 async 穿透），
+                        //   失败时注册 Equality 约束供 solver 延迟重试
+                        // 这使 FieldAccess 等不依赖 expected 的表达式产生的 fresh var
+                        // 能被 ret_ty 约束求解，避免成为孤儿 TypeVar。
+                        let ret = ret_ty.unwrap_or_else(|| self.arena.fresh_type_var());
+                        if method.return_type.is_none() {
+                            self.unify_or_constrain(ret, body_ty);
+                        } else if self.unify_return_type(ret, body_ty).is_err() {
+                            self.solver.add_equality(ret, body_ty);
+                        }
                     }
                 }
                 self.pop_self_type();
