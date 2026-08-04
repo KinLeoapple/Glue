@@ -335,6 +335,72 @@ pub enum ConstValue {
     Void,
 }
 
+impl ConstValue {
+    /// 转为 Value（用于优化器/Engine 读取常量值）。
+    pub fn to_value(&self) -> crate::Value::Value {
+        match self {
+            ConstValue::I8(v) => crate::Value::Value::i8(*v),
+            ConstValue::I16(v) => crate::Value::Value::i16(*v),
+            ConstValue::I32(v) => crate::Value::Value::i32(*v),
+            ConstValue::I64(v) => crate::Value::Value::i64(*v),
+            ConstValue::I128(v) => crate::Value::Value::i128(*v),
+            ConstValue::U8(v) => crate::Value::Value::u8(*v),
+            ConstValue::U16(v) => crate::Value::Value::u16(*v),
+            ConstValue::U32(v) => crate::Value::Value::u32(*v),
+            ConstValue::U64(v) => crate::Value::Value::u64(*v),
+            ConstValue::U128(v) => crate::Value::Value::u128(*v),
+            ConstValue::Isize(v) => crate::Value::Value::isize_val(*v),
+            ConstValue::Usize(v) => crate::Value::Value::usize_val(*v),
+            ConstValue::F32(v) => crate::Value::Value::f32(*v),
+            ConstValue::F64(v) => crate::Value::Value::f64(*v),
+            ConstValue::Bool(v) => crate::Value::Value::bool_val(*v),
+            ConstValue::Char(cp) => crate::Value::Value::char_val(
+                char::from_u32(*cp).unwrap_or('\0'),
+            ),
+            ConstValue::Str(s) => crate::Value::Value::ref_val(
+                crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(s)),
+            ),
+            ConstValue::Null => crate::Value::Value::NULL,
+            ConstValue::Void => crate::Value::Value::VOID,
+        }
+    }
+
+    /// 从 Value 构造 ConstValue（用于 ConstFold 生成新常量）。
+    pub fn from_value(v: &crate::Value::Value) -> Option<ConstValue> {
+        use crate::Value::{ScalarTag, Value};
+        match v {
+            Value::Scalar(sv, tag) => match tag {
+                ScalarTag::I8 => Some(ConstValue::I8(unsafe { sv.i8_val })),
+                ScalarTag::I16 => Some(ConstValue::I16(unsafe { sv.i16_val })),
+                ScalarTag::I32 => Some(ConstValue::I32(unsafe { sv.i32_val })),
+                ScalarTag::I64 => Some(ConstValue::I64(unsafe { sv.i64_val })),
+                ScalarTag::I128 => {
+                    let bits = unsafe { (sv.i128_val[0] as u128) | ((sv.i128_val[1] as u128) << 64) };
+                    Some(ConstValue::I128(bits as i128))
+                }
+                ScalarTag::U8 => Some(ConstValue::U8(unsafe { sv.u8_val })),
+                ScalarTag::U16 => Some(ConstValue::U16(unsafe { sv.u16_val })),
+                ScalarTag::U32 => Some(ConstValue::U32(unsafe { sv.u32_val })),
+                ScalarTag::U64 => Some(ConstValue::U64(unsafe { sv.u64_val })),
+                ScalarTag::U128 => {
+                    let bits = unsafe { (sv.u128_val[0] as u128) | ((sv.u128_val[1] as u128) << 64) };
+                    Some(ConstValue::U128(bits))
+                }
+                ScalarTag::Isize => Some(ConstValue::Isize(unsafe { sv.isize_val })),
+                ScalarTag::Usize => Some(ConstValue::Usize(unsafe { sv.usize_val })),
+                ScalarTag::F32 => Some(ConstValue::F32(unsafe { sv.f32_val })),
+                ScalarTag::F64 => Some(ConstValue::F64(unsafe { sv.f64_val })),
+                ScalarTag::Bool => Some(ConstValue::Bool(unsafe { sv.bool_val })),
+                ScalarTag::Char => Some(ConstValue::Char(unsafe { sv.u32_val })),
+                _ => None,
+            },
+            Value::Null => Some(ConstValue::Null),
+            Value::Void => Some(ConstValue::Void),
+            _ => None,
+        }
+    }
+}
+
 /// Gate 节点的分支信息。
 ///
 /// Gate 节点根据条件值选择激活哪个分支子图。
@@ -1258,6 +1324,41 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     }
 }
 
+/// 纯 compute_fn 集合（无副作用，可 CSE/DCE）。
+///
+/// 包含：所有算术与比较（1-27, 50-91, 92-259）、纯读取（30/32/34/35）、
+/// 纯语义运算（260/261/265/274-276/278/279/287）、栈分配构造（288-289）。
+/// 不包含：call/gate/await（36-49）、堆分配（29/31）、mutation（33/271/282）、
+/// channel（283-285）、global_store（271）、throw（28/47）、ffi（46）。
+pub fn pure_compute_fn_set() -> rustc_hash::FxHashSet<ComputeFnId> {
+    let mut s = rustc_hash::FxHashSet::default();
+    // ── Legacy i32/f64/bool 算术与比较（1-27）──
+    for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
+    // ── i64/i128 算术比较 + 位运算（50-91）──
+    for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
+    // ── 全基本类型算术（92-259：12 整数类型×12 运算 + 4 浮点类型×6 运算）──
+    for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
+    // ── 纯读取与查询 ──
+    s.insert(ComputeFnId(30)); // record_field_get
+    s.insert(ComputeFnId(32)); // array_index
+    s.insert(ComputeFnId(34)); // is_null
+    s.insert(ComputeFnId(35)); // array_len
+    // ── 纯语义运算 ──
+    s.insert(ComputeFnId(260)); // ref_eq
+    s.insert(ComputeFnId(261)); // ref_neq
+    s.insert(ComputeFnId(265)); // elvis
+    s.insert(ComputeFnId(274)); // pattern_ctor_match
+    s.insert(ComputeFnId(275)); // pattern_adt_field_get
+    s.insert(ComputeFnId(276)); // pattern_str_eq
+    s.insert(ComputeFnId(278)); // cast_scalar
+    s.insert(ComputeFnId(279)); // non_null_assert
+    s.insert(ComputeFnId(287)); // str_bytes
+    // ── 栈分配构造（无外部可观察副作用）──
+    s.insert(ComputeFnId(288)); // record_construct_stack
+    s.insert(ComputeFnId(289)); // array_construct_stack
+    s
+}
+
 // =========================================================================
 // 节点元数据宏：消除 NodeId 索引字段的声明/new/add_node/setter 四件套重复
 // =========================================================================
@@ -1567,6 +1668,213 @@ impl DataFlowGraph {
                 }
             }
         }
+    }
+
+    /// 晚期压缩重建：根据 dead 集与 redirect 映射重建图。
+    /// 压缩 nodes/inputs_pool，重映射所有 NodeId 引用与 per-NodeId 元数据向量。
+    /// 重建后所有 NodeId 引用更新为新连续编号。
+    /// 返回 old_to_new 映射（供外部同步 expr_node_map 等）。
+    pub fn rebuild(
+        &mut self,
+        dead: &rustc_hash::FxHashSet<NodeId>,
+        redirect: &rustc_hash::FxHashMap<NodeId, NodeId>,
+    ) -> Vec<Option<NodeId>> {
+        // ── 递归解析重定向 ──
+        let resolve = |id: NodeId| -> NodeId {
+            let mut cur = id;
+            while let Some(&next) = redirect.get(&cur) { cur = next; }
+            cur
+        };
+
+        // ── 1. 顺序遍历计算保留节点的新编号 ──
+        // 必须保持原有节点顺序（0..total），因为子图 node_range 是嵌套的
+        // （父子图范围包含子子图节点），顺序遍历天然保证每个子图节点在新数组中连续。
+        let total = self.nodes.len();
+        let mut old_to_new: Vec<Option<NodeId>> = vec![None; total];
+        let mut new_to_old: Vec<usize> = Vec::with_capacity(total);
+        let mut new_nodes: Vec<Node> = Vec::with_capacity(total);
+
+        for old_idx in 0..total {
+            let old_id = NodeId(old_idx as u32);
+            if dead.contains(&old_id) || redirect.contains_key(&old_id) { continue; }
+            let new_id = NodeId(new_nodes.len() as u32);
+            old_to_new[old_idx] = Some(new_id);
+            new_to_old.push(old_idx);
+            new_nodes.push(self.nodes[old_idx]);
+        }
+
+        // ── 2. 重建 inputs_pool（resolve + remap）──
+        let mut new_inputs: Vec<NodeId> = Vec::new();
+        for node in &mut new_nodes {
+            let old_inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
+            let new_offset = new_inputs.len() as u32;
+            for &old_in in old_inputs {
+                let resolved = resolve(old_in);
+                let new_in = old_to_new[resolved.0 as usize]
+                    .expect("rebuild: input node not live");
+                new_inputs.push(new_in);
+            }
+            node.inputs_offset = new_offset;
+        }
+
+        self.nodes = new_nodes;
+        self.inputs_pool.data = new_inputs;
+
+        // ── 3. 压缩 per-NodeId 元数据向量 ──
+        // 用 new_to_old 映射按新编号顺序收集元数据
+        let remap_n = |id: NodeId| -> NodeId {
+            let r = resolve(id);
+            old_to_new[r.0 as usize].expect("rebuild: ref node not live")
+        };
+
+        // 3a. 压缩 Vec<Option<T: Clone>>（无内部 NodeId）
+        macro_rules! compress_opt {
+            ($field:ident) => {{
+                let mut v: Vec<_> = Vec::with_capacity(new_to_old.len());
+                for &old_idx in &new_to_old {
+                    v.push(self.$field[old_idx].clone());
+                }
+                self.$field = v;
+            }};
+        }
+        compress_opt!(const_values);
+        compress_opt!(call_targets);
+        compress_opt!(control_signal_nodes);
+        compress_opt!(field_access_infos);
+        compress_opt!(record_lit_infos);
+        compress_opt!(ffi_call_names);
+        compress_opt!(field_set_names);
+        compress_opt!(vtable_call_methods);
+        compress_opt!(closure_infos);
+        compress_opt!(partial_infos);
+        compress_opt!(closure_call_arg_counts);
+        compress_opt!(batch_infos);
+        compress_opt!(trait_construct_infos);
+        compress_opt!(lazy_construct_infos);
+        compress_opt!(record_extend_infos);
+        compress_opt!(global_load_slots);
+        compress_opt!(global_store_slots);
+        compress_opt!(pattern_ctor_names);
+        compress_opt!(pattern_field_indices);
+        compress_opt!(cast_target_types);
+
+        // 3b. 压缩 Vec<bool>
+        macro_rules! compress_bool {
+            ($field:ident) => {{
+                let mut v: Vec<_> = Vec::with_capacity(new_to_old.len());
+                for &old_idx in &new_to_old {
+                    v.push(self.$field[old_idx]);
+                }
+                self.$field = v;
+            }};
+        }
+        compress_bool!(tail_call_flags);
+        compress_bool!(safe_op_flags);
+        compress_bool!(slice_inclusive);
+
+        // 3c. 压缩含 NodeId 的向量
+        // await_event_sources: Vec<Option<NodeId>>
+        {
+            let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
+            for &old_idx in &new_to_old {
+                v.push(self.await_event_sources[old_idx].map(&remap_n));
+            }
+            self.await_event_sources = v;
+        }
+        // writeback_targets: Vec<Option<NodeId>>
+        {
+            let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
+            for &old_idx in &new_to_old {
+                v.push(self.writeback_targets[old_idx].map(&remap_n));
+            }
+            self.writeback_targets = v;
+        }
+        // gate_branches: Vec<Option<GateBranches>> — 内部 NodeId 需 remap
+        {
+            let mut v: Vec<Option<GateBranches>> = Vec::with_capacity(new_to_old.len());
+            for &old_idx in &new_to_old {
+                let opt = &self.gate_branches[old_idx];
+                v.push(opt.as_ref().map(|gb| GateBranches {
+                    condition_input: remap_n(gb.condition_input),
+                    branches: gb.branches.iter().map(|(b, sg, params)| {
+                        (*b, *sg, params.iter().map(|&n| remap_n(n)).collect())
+                    }).collect(),
+                }));
+            }
+            self.gate_branches = v;
+        }
+        // select_infos: Vec<Option<SelectInfo>> — SelectBranch.event_source_node 需 remap
+        {
+            let mut v: Vec<Option<SelectInfo>> = Vec::with_capacity(new_to_old.len());
+            for &old_idx in &new_to_old {
+                let opt = &self.select_infos[old_idx];
+                v.push(opt.as_ref().map(|si| SelectInfo {
+                    branches: si.branches.iter().map(|sb| SelectBranch {
+                        subgraph_id: sb.subgraph_id,
+                        event_kind: sb.event_kind,
+                        event_source_node: remap_n(sb.event_source_node),
+                    }).collect(),
+                }));
+            }
+            self.select_infos = v;
+        }
+
+        // ── 4. 重建 downstreams（含 Gate condition_input 边）──
+        let n = self.nodes.len();
+        self.downstreams = vec![Vec::new(); n];
+        for node_idx in 0..n {
+            let node = self.nodes[node_idx];
+            let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
+            for &input in inputs {
+                self.downstreams[input.0 as usize].push(NodeId(node_idx as u32));
+            }
+        }
+        // Gate condition_input → Gate 边（与 compute_downstreams 对齐）
+        for nid in 0..n {
+            if let Some(gb) = &self.gate_branches[nid] {
+                let node = self.nodes[nid];
+                let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
+                if !inputs.contains(&gb.condition_input) {
+                    self.downstreams[gb.condition_input.0 as usize].push(NodeId(nid as u32));
+                }
+            }
+        }
+
+        // ── 5. 重映射 subgraphs 内的 NodeId 引用 ──
+        // node_range 通过扫描旧范围内的存活节点重新计算，保证新范围内节点连续。
+        for sg in self.subgraphs.iter_mut() {
+            let old_start = sg.node_range.0.0 as usize;
+            let old_end = sg.node_range.1.0 as usize;
+            let mut new_start: Option<u32> = None;
+            let mut new_end: u32 = 0;
+            for old_idx in old_start..old_end {
+                if old_idx >= total { break; }
+                let old_id = NodeId(old_idx as u32);
+                if dead.contains(&old_id) || redirect.contains_key(&old_id) { continue; }
+                let new_id = old_to_new[old_idx].unwrap();
+                if new_start.is_none() { new_start = Some(new_id.0); }
+                new_end = new_id.0 + 1;
+            }
+            sg.node_range = match new_start {
+                Some(ns) => (NodeId(ns), NodeId(new_end)),
+                None => (NodeId(0), NodeId(0)), // 全部 dead，范围坍缩
+            };
+            sg.entry_node = remap_n(sg.entry_node);
+            sg.return_node = remap_n(sg.return_node);
+            if let Some(c) = sg.cond_node { sg.cond_node = Some(remap_n(c)); }
+            if let Some(n) = sg.iter_next_node { sg.iter_next_node = Some(remap_n(n)); }
+            // event_source_decls: EventSourceDecl.node
+            for decl in &mut sg.event_source_decls {
+                decl.node = remap_n(decl.node);
+            }
+            // defer_table: DeferEntry.trigger_node + captured_inputs
+            for entry in &mut sg.defer_table {
+                entry.trigger_node = remap_n(entry.trigger_node);
+                entry.captured_inputs = entry.captured_inputs.iter().map(|&n| remap_n(n)).collect();
+            }
+        }
+
+        old_to_new
     }
 }
 

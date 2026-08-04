@@ -662,7 +662,7 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
             non_entry_modules.push(m);
         }
     }
-    let graph = IrBuilder::new(&sema_result, &entry_module)
+    let mut graph = IrBuilder::new(&sema_result, &entry_module)
         .with_builtins(non_entry_modules)
         .with_analysis(&analysis_report)
         .build();
@@ -682,7 +682,17 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
     }
 
     if debug {
-        eprintln!("  IR: {} nodes, {} subgraphs, {} compute_fns",
+        eprintln!("  IR (before opt): {} nodes, {} subgraphs, {} compute_fns",
+            graph.nodes.len(), graph.subgraphs.len(), graph.compute_fns.len());
+    }
+
+    // IR 后优化：ConstFold/CSE/CopyProp/DCE 固定点迭代
+    if std::env::var("GLUE_NO_OPT").is_err() {
+        glue_rs::Optimizer::optimize(&mut graph);
+    }
+
+    if debug {
+        eprintln!("  IR (after opt):  {} nodes, {} subgraphs, {} compute_fns",
             graph.nodes.len(), graph.subgraphs.len(), graph.compute_fns.len());
         if let Some(entry) = graph.entry_subgraph {
             eprintln!("  Entry subgraph: {:?}", entry);

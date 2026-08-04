@@ -6273,3 +6273,77 @@ impl Allocator for DefaultAllocator {
 pub fn default_allocator() -> DefaultAllocator {
     DefaultAllocator
 }
+
+// =========================================================================
+// 第十五部分：纯算术核心 — 无 Frame 依赖，runtime compute_fn 与编译期 ConstFold 共用
+// =========================================================================
+//
+// 为所有整数/浮点类型生成纯算术函数，语义与 Engine.rs 的 compute_fn 宏严格一致：
+//   - 整数 add/sub/mul: wrapping 语义
+//   - 整数 div/mod: checked，除零返回 0
+//   - 整数 shl/shr: 移位量为 i32（与 Engine.rs 读取 as_i32 一致），cast u32 后 wrapping
+//   - 浮点 div: 原生除法（除零产生 inf/nan）
+// runtime compute_fn 调用这些纯函数（复用），编译期 ConstFold 也调用同一份算术（解耦 Frame）。
+
+/// 为指定整数类型生成全套纯算术函数（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）。
+/// shl/shr 的移位量参数为 i32（与 Engine.rs compute_shl_*/compute_shr_* 读取 as_i32 一致）。
+macro_rules! impl_arith_int {
+    ($ty:ident, $rust:ty) => {
+        paste! {
+            #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_add(b) }
+            #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_sub(b) }
+            #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_mul(b) }
+            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { a.checked_div(b).unwrap_or(0) }
+            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { a.checked_rem(b).unwrap_or(0) }
+            #[inline] pub fn [<arith_bitand_$ty>](a: $rust, b: $rust) -> $rust { a & b }
+            #[inline] pub fn [<arith_bitor_$ty>](a: $rust, b: $rust) -> $rust { a | b }
+            #[inline] pub fn [<arith_bitxor_$ty>](a: $rust, b: $rust) -> $rust { a ^ b }
+            #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> $rust { a.wrapping_shl(shift as u32) }
+            #[inline] pub fn [<arith_shr_$ty>](a: $rust, shift: i32) -> $rust { a.wrapping_shr(shift as u32) }
+            #[inline] pub fn [<arith_neg_$ty>](a: $rust) -> $rust { a.wrapping_neg() }
+            #[inline] pub fn [<arith_bitnot_$ty>](a: $rust) -> $rust { !a }
+        }
+    };
+}
+
+/// 为指定浮点类型生成全套纯算术函数（add/sub/mul/div/mod/neg）。
+macro_rules! impl_arith_float {
+    ($ty:ident, $rust:ty) => {
+        paste! {
+            #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust { a + b }
+            #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust { a - b }
+            #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust { a * b }
+            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { a / b }
+            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { a % b }
+            #[inline] pub fn [<arith_neg_$ty>](a: $rust) -> $rust { -a }
+        }
+    };
+}
+
+// 整数类型展开（12 类型 × 12 运算）
+impl_arith_int!(i8,    i8);
+impl_arith_int!(i16,   i16);
+impl_arith_int!(i32,   i32);
+impl_arith_int!(i64,   i64);
+impl_arith_int!(i128,  i128);
+impl_arith_int!(u8,    u8);
+impl_arith_int!(u16,   u16);
+impl_arith_int!(u32,   u32);
+impl_arith_int!(u64,   u64);
+impl_arith_int!(u128,  u128);
+impl_arith_int!(isize, isize);
+impl_arith_int!(usize, usize);
+
+// 浮点类型展开（4 类型 × 6 运算）
+impl_arith_float!(f16, F16);
+impl_arith_float!(f32, f32);
+impl_arith_float!(f64, f64);
+impl_arith_float!(f128, F128);
+
+// =========================================================================
+// 布尔纯算术 — 与 Engine.rs compute_and_bool/or/not 语义一致
+// =========================================================================
+
+#[inline] pub fn arith_and_bool(a: bool, b: bool) -> bool { a && b }
+#[inline] pub fn arith_or_bool(a: bool, b: bool) -> bool { a || b }
+#[inline] pub fn arith_not_bool(a: bool) -> bool { !a }

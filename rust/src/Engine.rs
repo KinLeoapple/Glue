@@ -116,6 +116,9 @@ impl_cmp_compute! {
 // 索引从 92 开始分配。
 
 /// 为指定整数类型生成全套 compute_fn（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）
+///
+/// 算术逻辑复用 Value.rs 的纯算术核心（`arith_*` 函数），runtime 与编译期 ConstFold 共用。
+/// compute_fn 仅负责 Frame 取值与 Value 包装，算术本身无 Frame 依赖。
 macro_rules! impl_int_ops {
     ($ty:ident, $rust:ty, $ctor:ident, $acc:ident) => {
         pastey::paste! {
@@ -125,7 +128,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a.wrapping_add(b))
+                Value::$ctor(crate::Value::[<arith_add_$ty>](a, b))
             }
             pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -133,7 +136,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a.wrapping_sub(b))
+                Value::$ctor(crate::Value::[<arith_sub_$ty>](a, b))
             }
             pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -141,7 +144,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a.wrapping_mul(b))
+                Value::$ctor(crate::Value::[<arith_mul_$ty>](a, b))
             }
             pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -149,8 +152,8 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                // 整数除零返回 0（与 checked_div 语义一致），避免 panic
-                Value::$ctor(a.checked_div(b).unwrap_or(0))
+                // 整数除零返回 0（checked 语义，由 arith_div_$ty 实现）
+                Value::$ctor(crate::Value::[<arith_div_$ty>](a, b))
             }
             pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -158,7 +161,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a.checked_rem(b).unwrap_or(0))
+                Value::$ctor(crate::Value::[<arith_mod_$ty>](a, b))
             }
             pub fn [<compute_bitand_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -166,7 +169,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a & b)
+                Value::$ctor(crate::Value::[<arith_bitand_$ty>](a, b))
             }
             pub fn [<compute_bitor_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -174,7 +177,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a | b)
+                Value::$ctor(crate::Value::[<arith_bitor_$ty>](a, b))
             }
             pub fn [<compute_bitxor_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -182,43 +185,46 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a ^ b)
+                Value::$ctor(crate::Value::[<arith_bitxor_$ty>](a, b))
             }
             pub fn [<compute_shl_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
                 let n = &graph.nodes[node.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                let b = frame.get_value_by_global(inputs[1]).as_i32() as u32;
-                Value::$ctor(a.wrapping_shl(b))
+                // 移位量按 i32 读取（与原语义一致），纯函数内部 cast u32
+                let shift = frame.get_value_by_global(inputs[1]).as_i32();
+                Value::$ctor(crate::Value::[<arith_shl_$ty>](a, shift))
             }
             pub fn [<compute_shr_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
                 let n = &graph.nodes[node.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                let b = frame.get_value_by_global(inputs[1]).as_i32() as u32;
-                Value::$ctor(a.wrapping_shr(b))
+                let shift = frame.get_value_by_global(inputs[1]).as_i32();
+                Value::$ctor(crate::Value::[<arith_shr_$ty>](a, shift))
             }
             pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
                 let n = &graph.nodes[node.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                Value::$ctor(a.wrapping_neg())
+                Value::$ctor(crate::Value::[<arith_neg_$ty>](a))
             }
             pub fn [<compute_bitnot_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
                 let n = &graph.nodes[node.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                Value::$ctor(!a)
+                Value::$ctor(crate::Value::[<arith_bitnot_$ty>](a))
             }
         }
     };
 }
 
 /// 为指定浮点类型生成全套 compute_fn（add/sub/mul/div/mod/neg）
+///
+/// 算术逻辑复用 Value.rs 的纯算术核心（`arith_*` 函数）。
 macro_rules! impl_float_ops {
     ($ty:ident, $rust:ty, $ctor:ident, $acc:ident) => {
         pastey::paste! {
@@ -228,7 +234,7 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a + b)
+                Value::$ctor(crate::Value::[<arith_add_$ty>](a, b))
             }
             pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -236,7 +242,7 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a - b)
+                Value::$ctor(crate::Value::[<arith_sub_$ty>](a, b))
             }
             pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -244,7 +250,7 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a * b)
+                Value::$ctor(crate::Value::[<arith_mul_$ty>](a, b))
             }
             pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -252,7 +258,7 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a / b)
+                Value::$ctor(crate::Value::[<arith_div_$ty>](a, b))
             }
             pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -260,14 +266,14 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(a % b)
+                Value::$ctor(crate::Value::[<arith_mod_$ty>](a, b))
             }
             pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
                 let n = &graph.nodes[node.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                Value::$ctor(-a)
+                Value::$ctor(crate::Value::[<arith_neg_$ty>](a))
             }
         }
     };
@@ -306,27 +312,27 @@ impl_cmp_compute! {
 
 // ---- bool 逻辑（索引 22-24, 27）----
 
-/// compute_fn: bool 与
+/// compute_fn: bool 与（复用纯算术核心）
 pub fn compute_and_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
     let b = frame.get_value_by_global(inputs[1]).as_bool();
-    Value::bool_val(a && b)
+    Value::bool_val(crate::Value::arith_and_bool(a, b))
 }
 
-/// compute_fn: bool 或
+/// compute_fn: bool 或（复用纯算术核心）
 pub fn compute_or_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
     let b = frame.get_value_by_global(inputs[1]).as_bool();
-    Value::bool_val(a || b)
+    Value::bool_val(crate::Value::arith_or_bool(a, b))
 }
 
-/// compute_fn: bool 非（一元）
+/// compute_fn: bool 非（一元，复用纯算术核心）
 pub fn compute_not_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
-    Value::bool_val(!a)
+    Value::bool_val(crate::Value::arith_not_bool(a))
 }
 
 /// compute_fn: bool 相等
@@ -3440,8 +3446,13 @@ impl Engine {
     ) {
         let downstreams: Vec<NodeId> =
             self.graph.downstreams[producer_graph.0 as usize].clone();
+        let pending_len = self.frames.get(fid).pending_inputs.len();
         for ds_graph_id in downstreams {
             let ds_local_id = NodeId(ds_graph_id.0.wrapping_sub(node_start.0));
+            // 跳过跨子图的下游（属于其他子图的节点，由各自帧处理）
+            if ds_local_id.0 as usize >= pending_len {
+                continue;
+            }
             let frame = self.frames.get_mut(fid);
 
             // 槽级 RC：每通知一个下游就 consume()（spec 4.7）

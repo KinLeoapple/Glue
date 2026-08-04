@@ -32,3 +32,6 @@ pub mod Engine;
 
 #[path = "Analyzer.rs"]
 pub mod Analyzer;
+
+#[path = "Optimizer.rs"]
+pub mod Optimizer;
