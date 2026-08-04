@@ -1,5 +1,5 @@
 [package]
-name = "glue-rs"
+name = "glue"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
@@ -23,5 +23,5 @@ name = "glue"
 path = "src/main.rs"
 
 [lib]
-name = "glue_rs"
+name = "glue"
 path = "src/lib.rs"

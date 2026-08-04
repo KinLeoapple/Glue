@@ -17,6 +17,7 @@
 //! - 21：void
 //! - 22+：用户类型（经 `TypeDescriptorPool::register` 分配）
 
+use crate::Sema::FIRST_DYNAMIC_TYPE_ID;
 use crate::Value::{Char, F128, F16, ValueArena, ValueHandle, ValueTag};
 use rustc_hash::FxHashMap;
 
@@ -1107,11 +1108,11 @@ impl TypeDescriptorPool {
         }
     }
 
-    /// 注册一个用户类型，返回分配的 `type_id`（从 22 开始递增）。
+    /// 注册一个用户类型，返回分配的 `type_id`（从 FIRST_DYNAMIC_TYPE_ID 开始递增）。
     pub fn register(&mut self, name: &str, size: u8, ops: &'static dyn TypeOps) -> u16 {
         let len = self.descriptors.len();
-        assert!(22 + len <= u16::MAX as usize, "type_id overflow: too many type descriptors");
-        let type_id = 22 + len as u16;
+        assert!(FIRST_DYNAMIC_TYPE_ID as usize + len <= u16::MAX as usize, "type_id overflow: too many type descriptors");
+        let type_id = FIRST_DYNAMIC_TYPE_ID + len as u16;
         let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
         let desc: &'static TypeDescriptor = Box::leak(Box::new(TypeDescriptor {
             size,

@@ -2032,12 +2032,12 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId) -> Value {
         // call_node 的局部 id（node - node_offset）
         let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
-        frame.pending_call = Some(PendingCall {
+        frame.pending = Some(Pending::Call(PendingCall {
             target_sg,
             args,
             call_node_local,
             is_async: false,
-        });
+        }));
         return Value::VOID;
     }
 
@@ -2076,12 +2076,12 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId) -> Value {
 
     let gate_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
-    frame.pending_call = Some(PendingCall {
+    frame.pending = Some(Pending::Call(PendingCall {
         target_sg,
         args,
         call_node_local: gate_node_local,
         is_async: false,
-    });
+    }));
 
     Value::VOID
 }
@@ -2115,11 +2115,11 @@ pub fn compute_await(frame: &mut Frame, node: NodeId) -> Value {
         None => crate::Ir::EventSourceKind::AsyncJoin,
     };
 
-    frame.pending_await = Some(PendingAwait {
+    frame.pending = Some(Pending::Await(PendingAwait {
         await_node_local,
         event_obj,
         event_kind,
-    });
+    }));
 
     Value::VOID
 }
@@ -2149,7 +2149,7 @@ pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
         .expect("send on non-channel value");
     let ch_id = crate::Ir::ChannelId(ch.id());
     ch.send(val);
-    frame.pending_channel_notify = Some(ch_id);
+    frame.pending = Some(Pending::ChannelNotify(ch_id));
     Value::VOID
 }
 
@@ -2185,12 +2185,12 @@ pub fn compute_async_call_launch(frame: &mut Frame, node: NodeId) -> Value {
         .collect();
     let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
-    frame.pending_call = Some(PendingCall {
+    frame.pending = Some(Pending::Call(PendingCall {
         target_sg,
         args,
         call_node_local,
         is_async: true,
-    });
+    }));
 
     Value::VOID
 }
@@ -2428,7 +2428,7 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
         };
 
         // 4. vtable 动态分派（Call 节点有 vtable_call_methods 但无 call_target）
-        if frame.pending_call.is_none() {
+        if frame.pending.is_none() {
             if let Some(method_idx) = graph.vtable_call_methods[graph_node_id.0 as usize] {
                 let n = &graph.nodes[graph_node_id.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
@@ -2456,19 +2456,19 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 args.extend(upvalues);
 
                 let call_node_local = NodeId(graph_node_id.0.wrapping_sub(frame.node_offset));
-                frame.pending_call = Some(PendingCall {
+                frame.pending = Some(Pending::Call(PendingCall {
                     target_sg,
                     args,
                     call_node_local,
                     is_async: false,
-                });
+                }));
             }
         }
 
         // 5. 处理 pending_call
-        let pending = frame.pending_call.clone();
-        if let Some(pending) = pending {
-            frame.pending_call = None;
+        let pending = frame.pending.clone();
+        if let Some(Pending::Call(pending)) = pending {
+            frame.pending = None;
 
             // 尾调用：复用当前帧
             if graph.tail_call_flags[graph_node_id.0 as usize] {
@@ -2708,12 +2708,12 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
         args[self_idx] = callable_val.clone();
     }
 
-    frame.pending_call = Some(PendingCall {
+    frame.pending = Some(Pending::Call(PendingCall {
         target_sg,
         args,
         call_node_local,
         is_async: false,
-    });
+    }));
 
     Value::VOID
 }
@@ -2729,7 +2729,7 @@ pub fn compute_cancel_async_handle(frame: &mut Frame, node: NodeId) -> Value {
     let handle_val = frame.get_value_by_global(inputs[0]);
     // async handle 是 i32 标量，值即 async_id
     let async_id = crate::Ir::AsyncHandleId(handle_val.as_i32() as u32);
-    frame.pending_cancel = Some(async_id);
+    frame.pending = Some(Pending::Cancel(async_id));
     Value::VOID
 }
 
@@ -2744,7 +2744,7 @@ pub fn compute_select_gate(frame: &mut Frame, node: NodeId) -> Value {
         .as_ref()
         .expect("select gate node has no SelectInfo");
     let gate_local = NodeId(node.0.wrapping_sub(frame.node_offset));
-    frame.pending_select_wait = Some(gate_local);
+    frame.pending = Some(Pending::SelectWait(gate_local));
     Value::VOID
 }
 
@@ -2780,6 +2780,9 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
     let mut ptr = frame.parent_frame_ptr;
     let mut found = false;
     while !ptr.is_null() {
+        // SAFETY: ptr 指向 FramePool 中的同函数帧，引擎单线程执行，
+        // caller 帧在 callee 执行期间处于 Suspended 状态，无并发访问。
+        // SharedEngine 路径下 parent_frame_ptr 恒为 null，此循环不执行。
         let f = unsafe { &mut *ptr };
         let local = target.0.wrapping_sub(f.node_offset);
         if (local as usize) < f.value_table.len() {
@@ -2791,6 +2794,8 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
     }
     // 回退到 root_frame_ptr（函数根帧）
     if !found && !frame.root_frame_ptr.is_null() {
+        // SAFETY: root_frame_ptr 指向函数根帧（同 FramePool），单线程下无并发访问。
+        // SharedEngine 路径下 root_frame_ptr 恒为 null，此分支不执行。
         let root = unsafe { &mut *frame.root_frame_ptr };
         let local = target.0.wrapping_sub(root.node_offset);
         if (local as usize) < root.value_table.len() {
@@ -2845,10 +2850,7 @@ impl FramePool {
             frame.control_signal = ControlSignal::None;
             frame.suspend_state = SuspendState::NotSuspended;
             frame.suspend_event = None;
-            frame.pending_call = None;
-            frame.pending_await = None;
-            frame.pending_cancel = None;
-            frame.pending_select_wait = None;
+            frame.pending = None;
             frame.defer_stack.clear();
             frame.select_timers.clear();
             frame.root_frame_ptr = std::ptr::null_mut();
@@ -2893,8 +2895,7 @@ impl FramePool {
         frame.control_signal = ControlSignal::None;
         frame.suspend_state = SuspendState::NotSuspended;
         frame.suspend_event = None;
-        frame.pending_call = None;
-        frame.pending_await = None;
+        frame.pending = None;
         frame.defer_stack.clear();
         // 加入空闲列表，供后续 alloc 复用
         self.free_list.push(id);
@@ -3336,8 +3337,7 @@ impl Engine {
         frame.value_table.reset_all();
         frame.ready_queue.clear();
         frame.control_signal = ControlSignal::None;
-        frame.pending_call = None;
-        frame.pending_await = None;
+        frame.pending = None;
 
         // 收集嵌套子图范围（在当前子图 node_range 内但属于其他子图的节点范围）
         let nested_ranges: Vec<(u32, u32)> = self
@@ -3544,7 +3544,7 @@ impl Engine {
             // vtable 动态分派：Call 节点有 vtable_call_methods 标记但无 call_target
             //（compute_call_launch 未设 pending_call）→ 从 recv 的 TraitVal 运行时
             // 查询方法子图，收集参数后设 pending_call，交由下方统一处理。
-            if self.frames.get(fid).pending_call.is_none() {
+            if self.frames.get(fid).pending.is_none() {
                 if let Some(method_idx) =
                     self.graph.vtable_call_methods[graph_node_id.0 as usize]
                 {
@@ -3579,19 +3579,20 @@ impl Engine {
 
                     let call_node_local =
                         NodeId(graph_node_id.0 - self.frames.get(fid).node_offset);
-                    self.frames.get_mut(fid).pending_call = Some(PendingCall {
+                    self.frames.get_mut(fid).pending = Some(Pending::Call(PendingCall {
                         target_sg,
                         args,
                         call_node_local,
                         is_async: false,
-                    });
+                    }));
                 }
             }
 
-            // 检测 pending_call（Call/Gate/AsyncCall 节点设置）
-            let pending = self.frames.get(fid).pending_call.clone();
+            // 统一消费 pending（compute_fn 产出，调度器消费）
+            let pending = self.frames.get_mut(fid).pending.take();
             if let Some(pending) = pending {
-                self.frames.get_mut(fid).pending_call = None;
+                match pending {
+                crate::Ir::Pending::Call(pending) => {
 
                 // 尾调用图跳转：编译期标记的尾调用复用当前帧（帧池零分配）
                 let node_start = self.frames.get(fid).node_offset;
@@ -3707,20 +3708,13 @@ impl Engine {
                     frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
                     return; // 帧挂起，不执行 defer，不标记 Completed
                 }
-            }
+                }
 
-            // 检测 pending_channel_notify（send 操作设置）
-            // 内联触发 ChannelReady 事件，唤醒等待该 channel 的挂起帧（零延迟）
-            let ch_notify = self.frames.get(fid).pending_channel_notify;
-            if let Some(ch_id) = ch_notify {
-                self.frames.get_mut(fid).pending_channel_notify = None;
-                self.on_event_arrived(RuntimeEvent::ChannelReady(ch_id), Value::VOID);
-            }
+                crate::Ir::Pending::ChannelNotify(ch_id) => {
+                    self.on_event_arrived(RuntimeEvent::ChannelReady(ch_id), Value::VOID);
+                }
 
-            // 检测 pending_await（Await 节点设置）
-            let pending_await = self.frames.get(fid).pending_await.clone();
-            if let Some(pending) = pending_await {
-                self.frames.get_mut(fid).pending_await = None;
+                crate::Ir::Pending::Await(pending) => {
 
                 // 解析事件源 id + 检查就绪
                 let (event, ready_value) = self.resolve_and_check_await(&pending);
@@ -3744,12 +3738,9 @@ impl Engine {
                     frame.suspend_event = Some(event);
                     return; // 帧挂起
                 }
-            }
+                }
 
-            // 检测 pending_cancel（cancel 方法调用设置）
-            let pending_cancel = self.frames.get(fid).pending_cancel;
-            if let Some(async_id) = pending_cancel {
-                self.frames.get_mut(fid).pending_cancel = None;
+                crate::Ir::Pending::Cancel(async_id) => {
                 // 从 AsyncJoinRuntime 查 child_fid → cancel_frame
                 if let Some(child_fid) = self.async_join_runtime.find_child_by_async_id(async_id) {
                     self.cancel_frame(child_fid);
@@ -3758,15 +3749,10 @@ impl Engine {
                 let consumer_count = self.graph.downstreams[graph_node_id.0 as usize].len() as u16;
                 self.frames.get_mut(fid).set_value(local_id, Value::VOID, consumer_count);
                 self.notify_downstream(fid, local_id, graph_node_id, NodeId(node_start));
-                continue;
-            }
+                    continue;
+                }
 
-            // 检测 pending_select_wait（select gate 节点设置）
-            // compute_select_gate 无法访问 Engine runtime，只标记 pending_select_wait，
-            // 实际就绪检查在此进行（run_ready_nodes 能访问 Engine 全部状态）。
-            let pending_select_wait = self.frames.get(fid).pending_select_wait;
-            if let Some(gate_local) = pending_select_wait {
-                self.frames.get_mut(fid).pending_select_wait = None;
+                crate::Ir::Pending::SelectWait(gate_local) => {
 
                 // clone SelectInfo 避免持有 graph 借用时访问 frames
                 let info = self.graph.select_infos[graph_node_id.0 as usize].clone();
@@ -3871,6 +3857,8 @@ impl Engine {
                         return;
                     }
                 }
+                }
+                }
             }
 
             // 普通节点：写值表 + 检查控制信号 + 通知下游
@@ -3967,7 +3955,9 @@ impl Engine {
         self.prepare_frame(child_fid, node_start, node_count);
 
         // 参数注入（前 param_count 个节点，覆盖参数节点的预填充值）
-        for (i, arg) in args.iter().enumerate() {
+        // 与 switch_subgraph / LoopBody 复用路径统一：用 param_count 限制注入数量
+        let param_count = self.graph.subgraphs[subgraph_id.0 as usize].param_count as usize;
+        for (i, arg) in args.iter().enumerate().take(param_count) {
             let local_id = NodeId(i as u32);
             let consumer_count = self.graph.downstreams[offset + i].len() as u16;
             let frame = self.frames.get_mut(child_fid);
@@ -4039,8 +4029,7 @@ impl Engine {
         frame.state = FrameState::Ready;
         frame.suspend_state = SuspendState::NotSuspended;
         frame.suspend_event = None;
-        frame.pending_cancel = None;
-        frame.pending_select_wait = None;
+        frame.pending = None;
         // caller 保持不变：返回值直达原始调用方的 call 节点
 
         // prepare_frame：清空 value_table + ready_queue + pending_inputs + Const 预填充
@@ -4211,7 +4200,7 @@ impl Engine {
         frame.state = FrameState::Ready;
         frame.suspend_state = SuspendState::NotSuspended;
         frame.suspend_event = None;
-        frame.pending_call = None;
+        frame.pending = None;
         self.ready_frames.push_back(loop_fid);
     }
 
@@ -4844,8 +4833,7 @@ fn switch_subgraph_shared(frame: &mut Frame, graph: &DataFlowGraph, target_sg: S
     frame.value_table.reset_all();
     frame.ready_queue.clear();
     frame.control_signal = ControlSignal::None;
-    frame.pending_call = None;
-    frame.pending_await = None;
+    frame.pending = None;
     frame.body_frame_id = None;
     frame.defer_stack.clear();
     frame.select_timers.clear();
@@ -4854,8 +4842,6 @@ fn switch_subgraph_shared(frame: &mut Frame, graph: &DataFlowGraph, target_sg: S
     frame.state = FrameState::Ready;
     frame.suspend_state = SuspendState::NotSuspended;
     frame.suspend_event = None;
-    frame.pending_cancel = None;
-    frame.pending_select_wait = None;
     // caller 保持不变：返回值直达原始调用方的 call 节点
 
     // prepare_frame_shared：设置 node_offset + pending_inputs + Const 预填充
@@ -5188,7 +5174,7 @@ fn run_frame_nodes(
         };
 
         // vtable 动态分派：Call 节点有 vtable_call_methods 但无 call_target
-        if frame.pending_call.is_none() {
+        if frame.pending.is_none() {
             if let Some(method_idx) =
                 graph.vtable_call_methods[graph_node_id.0 as usize]
             {
@@ -5221,19 +5207,20 @@ fn run_frame_nodes(
                 args.extend(upvalues);
 
                 let call_node_local = NodeId(graph_node_id.0.wrapping_sub(frame.node_offset));
-                frame.pending_call = Some(PendingCall {
+                frame.pending = Some(Pending::Call(PendingCall {
                     target_sg,
                     args,
                     call_node_local,
                     is_async: false,
-                });
+                }));
             }
         }
 
-        // 检测 pending_call（Call/Gate/AsyncCall 节点设置）
-        let pending = frame.pending_call.clone();
+        // 统一消费 pending（compute_fn 产出，调度器消费）
+        let pending = frame.pending.take();
         if let Some(pending) = pending {
-            frame.pending_call = None;
+            match pending {
+            crate::Ir::Pending::Call(pending) => {
 
             // 尾调用图跳转：编译期标记的尾调用复用当前帧（帧池零分配）
             let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
@@ -5314,25 +5301,19 @@ fn run_frame_nodes(
                 frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
                 return;
             }
-        }
+            }
 
-        // 检测 pending_channel_notify（send 操作设置）
-        // 内联触发 ChannelReady 事件，唤醒等待该 channel 的挂起帧（零延迟）
-        let ch_notify = frame.pending_channel_notify;
-        if let Some(ch_id) = ch_notify {
-            frame.pending_channel_notify = None;
-            on_event_arrived_shared(
+            crate::Ir::Pending::ChannelNotify(ch_id) => {
+                on_event_arrived_shared(
                 shared,
                 RuntimeEvent::ChannelReady(ch_id),
                 Value::VOID,
                 local_queue,
-            );
-        }
+                );
 
-        // 检测 pending_await（Await 节点设置）
-        let pending_await = frame.pending_await.clone();
-        if let Some(pending) = pending_await {
-            frame.pending_await = None;
+            }
+
+            crate::Ir::Pending::Await(pending) => {
 
             let (event, ready_value) = resolve_and_check_await_shared(shared, &pending);
 
@@ -5359,12 +5340,9 @@ fn run_frame_nodes(
                 frame.suspend_event = Some(event);
                 return;
             }
-        }
+            }
 
-        // 检测 pending_cancel（cancel 方法调用设置）
-        let pending_cancel = frame.pending_cancel;
-        if let Some(async_id) = pending_cancel {
-            frame.pending_cancel = None;
+            crate::Ir::Pending::Cancel(async_id) => {
             let child_fid = shared
                 .async_join_runtime
                 .lock()
@@ -5376,13 +5354,10 @@ fn run_frame_nodes(
                 graph.downstreams[graph_node_id.0 as usize].len() as u16;
             frame.set_value(local_id, Value::VOID, consumer_count);
             notify_downstream_shared(frame, &graph, local_id, graph_node_id, NodeId(node_start));
-            continue;
-        }
+                continue;
+            }
 
-        // 检测 pending_select_wait（select gate 节点设置）
-        let pending_select_wait = frame.pending_select_wait;
-        if let Some(gate_local) = pending_select_wait {
-            frame.pending_select_wait = None;
+            crate::Ir::Pending::SelectWait(gate_local) => {
 
             let info = graph.select_infos[graph_node_id.0 as usize].clone();
 
@@ -5459,6 +5434,8 @@ fn run_frame_nodes(
                     frame.suspend_event = None;
                     return;
                 }
+            }
+            }
             }
         }
 

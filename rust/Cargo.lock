@@ -201,7 +201,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "glue-rs"
+name = "glue"
 version = "0.1.0"
 dependencies = [
  "bumpalo",

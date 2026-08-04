@@ -8,7 +8,7 @@ use crate::Ast::{
     AstArena, Decl, Expr, ExprId, InterpolationPart, LambdaBody, Module, Pattern, PatternId,
     SelectArm, Stmt, StmtId, Visibility,
 };
-use crate::Sema::{module_expr_key, ConstVal, SemaResult};
+use crate::Sema::{dynamic_type_id, module_expr_key, ConstVal, SemaResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 // =========================================================================
@@ -883,7 +883,7 @@ fn mark_entry_reason(
         // 利用 witness_table 判定是否为 trait 方法实现：
         // 若该类型实现了某 trait 且该方法在 witness_table 的 method_slots 中，则为 TraitMethod
         if let Some(&type_idx) = sema.type_def_index.get(type_name) {
-            let type_id = type_idx + 22;
+            let type_id = dynamic_type_id(type_idx);
             for entry in sema.witness_table.entries().iter() {
                 if entry.type_id == type_id && entry.method_slots.contains_key(method_name) {
                     cg.entry_reasons.insert(func, ReachableReason::TraitMethod);
@@ -1043,7 +1043,15 @@ fn collect_call_edges(
                 }
             }
         }
-        Expr::Lambda { .. } | Expr::InlineTrait(_) => {}
+        Expr::Lambda { body, .. } => {
+            // 递归进入 lambda body：嵌套 lambda 中的调用归并到外层 caller
+            let inner = match body {
+                crate::Ast::LambdaBody::Block(e) => *e,
+                crate::Ast::LambdaBody::Expression(e) => *e,
+            };
+            collect_call_edges(inner, arena, caller, caller_name, module_name, sema, cg);
+        }
+        Expr::InlineTrait(_) => {}
         Expr::IntLit { .. }
         | Expr::FloatLit { .. }
         | Expr::BoolLit(_)
@@ -1100,7 +1108,13 @@ fn collect_call_edges_stmt(
         Stmt::Loop { body } => {
             collect_call_edges(*body, arena, caller, caller_name, module_name, sema, cg);
         }
-        Stmt::LocalDecl { .. } | Stmt::Break | Stmt::Continue => {}
+        Stmt::LocalDecl { decl } => {
+            // 递归进入嵌套函数 body：嵌套函数中的调用归并到外层 caller
+            if let crate::Ast::Decl::FunDecl { body, .. } = decl.as_ref() {
+                collect_call_edges(*body, arena, caller, caller_name, module_name, sema, cg);
+            }
+        }
+        Stmt::Break | Stmt::Continue => {}
     }
 }
 
@@ -1108,6 +1122,14 @@ fn collect_call_edges_stmt(
 fn detect_recursion(cg: &mut CallGraph) {
     let mut sccs = tarjan_scc(cg);
     sccs.retain(|s| s.len() > 1);
+    // 相互递归 SCC 中的所有函数也是递归函数，统一加入 recursive 集合。
+    // 使 cg.recursive 成为"所有递归函数"的权威来源，inline_pass 等消费者
+    // 只需检查 recursive 即可，无需分别检查 mutually_recursive。
+    for scc in &sccs {
+        for &func in scc {
+            cg.recursive.insert(func);
+        }
+    }
     cg.mutually_recursive = sccs;
 }
 
@@ -2397,6 +2419,11 @@ pub fn inline_pass(
                     continue;
                 }
             }
+            // 包含嵌套函数（Lambda/LocalDecl）的函数不内联：内联展开会引入新子图，
+            // 其节点范围与外层子图 node_range 冲突，导致 prepare_frame 误标为嵌套节点永不就绪
+            if has_nested_function(*body, arena) {
+                continue;
+            }
             let size = count_expr_nodes(*body, arena);
             if size <= INLINE_SIZE_THRESHOLD {
                 report.candidates.push((func, size));
@@ -2411,6 +2438,45 @@ pub fn inline_pass(
         }
     }
     report
+}
+
+/// 检测表达式中是否包含嵌套函数（Lambda 或 LocalDecl 中的 FunDecl）。
+/// 包含嵌套函数的函数不应内联：内联展开会引入新子图，
+/// 其节点范围与外层子图 node_range 冲突，导致 prepare_frame 误标为嵌套节点永不就绪。
+fn has_nested_function(expr_id: ExprId, arena: &AstArena) -> bool {
+    if matches!(arena.expr(expr_id).node, Expr::Lambda { .. }) {
+        return true;
+    }
+    let mut found = false;
+    walk_children_expr(expr_id, arena, |c| {
+        if !found {
+            found = has_nested_function(c, arena);
+        }
+    });
+    if !found {
+        walk_children_stmts_of_expr(expr_id, arena, |s| {
+            if !found {
+                found = has_nested_function_stmt(s, arena);
+            }
+        });
+    }
+    found
+}
+
+fn has_nested_function_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
+    let stmt = &arena.stmt(stmt_id).node;
+    if let Stmt::LocalDecl { decl } = stmt {
+        if matches!(decl.as_ref(), crate::Ast::Decl::FunDecl { .. }) {
+            return true;
+        }
+    }
+    let mut found = false;
+    walk_children_stmt(stmt_id, arena, |e| {
+        if !found {
+            found = has_nested_function(e, arena);
+        }
+    });
+    found
 }
 
 /// 递归统计表达式子树的 AST 节点数。

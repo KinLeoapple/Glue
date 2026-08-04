@@ -15,12 +15,12 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
-use glue_rs::Ast::{ErrorCollector, Lexer, Parser as GlueParser, Printer, Token, TokenCollector};
-use glue_rs::Engine::Engine;
-use glue_rs::Analyzer;
-use glue_rs::Ir::IrBuilder;
-use glue_rs::ModuleLoader::ModuleLoader;
-use glue_rs::Sema::{InferContext, SemaResult, TypeArena};
+use glue::Ast::{ErrorCollector, Lexer, Module, Parser as GlueParser, Printer, Token, TokenCollector};
+use glue::Engine::Engine;
+use glue::Analyzer;
+use glue::Ir::IrBuilder;
+use glue::ModuleLoader::ModuleLoader;
+use glue::Sema::{populate_module, InferContext, SemaResult, TypeArena};
 
 /// Glue 语言 Rust 实现 CLI
 #[derive(Parser)]
@@ -333,7 +333,7 @@ fn debug_emit_c(source: &str) {
                 }
                 process::exit(1);
             }
-            match glue_rs::ExternC::extract_c_from_module(&module) {
+            match glue::ExternC::extract_c_from_module(&module) {
                 Ok(c_code) => print!("{}", c_code),
                 Err(e) => {
                     eprintln!("Error extracting C: {}", e);
@@ -366,7 +366,7 @@ fn debug_emit_ffi(source: &str) {
                 }
                 process::exit(1);
             }
-            match glue_rs::ExternC::extract_rust_ffi_from_module(&module) {
+            match glue::ExternC::extract_rust_ffi_from_module(&module) {
                 Ok(ffi_code) => print!("{}", ffi_code),
                 Err(e) => {
                     eprintln!("Error generating FFI: {}", e);
@@ -381,17 +381,18 @@ fn debug_emit_ffi(source: &str) {
     }
 }
 
-/// 仅类型检查
-fn debug_check(source: &str, filename: &str) {
-    let arena = bumpalo::Bump::new();
+// ==================== 公共管线（debug_check / cmd_run 共享） ====================
+
+/// 解析入口模块。arena 必须在返回的 Module 存活期间保持有效。
+fn parse_entry_module<'a>(arena: &'a bumpalo::Bump, source: &'a str, filename: &'a str) -> Module<'a> {
     let mut lexer = Lexer::new(source);
     let mut sink = TokenCollector::new();
     lexer.tokenize_into(&mut sink);
     let tokens: Vec<Token<'_>> = sink.into_tokens();
     let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = GlueParser::new(tokens_ref, &arena, ErrorCollector::new());
+    let mut parser = GlueParser::new(tokens_ref, arena, ErrorCollector::new());
 
-    let entry_module = match parser.parse_module(filename) {
+    let module = match parser.parse_module(filename) {
         Ok(m) => m,
         Err(err) => {
             eprintln!("{}:{}:{}: parse error: {}", filename, err.line, err.column, err.message);
@@ -401,11 +402,22 @@ fn debug_check(source: &str, filename: &str) {
     for err in parser.errors() {
         eprintln!("Warning: {}:{}:{}: {}", filename, err.line, err.column, err.message);
     }
+    module
+}
 
+/// 加载全部模块（builtin + std + 用户依赖），返回 (loader, std_keys, dep_keys)。
+/// 入口文件所在目录被添加为搜索路径，以解析用户模块（如 Math/Geometry.glue）。
+fn load_all_modules(
+    entry_module: &Module,
+    entry_path: &str,
+) -> (ModuleLoader, Vec<String>, Vec<String>) {
     let mut loader = ModuleLoader::new();
-    let dep_keys = loader.load_transitive_imports(&entry_module);
+    if let Some(src_dir) = std::path::Path::new(entry_path).parent() {
+        loader.add_search_path(src_dir);
+    }
+    let dep_keys = loader.load_transitive_imports(entry_module);
 
-    let std_keys: Vec<String> = glue_rs::ModuleLoader::STD_FILES
+    let std_keys: Vec<String> = glue::ModuleLoader::STD_FILES
         .iter()
         .map(|(p, _)| p.to_string())
         .collect();
@@ -417,20 +429,31 @@ fn debug_check(source: &str, filename: &str) {
     if loader.has_load_errors() {
         for err in loader.load_errors() {
             match err {
-                glue_rs::ModuleLoader::LoadError::ModuleNotFound { path } => {
+                glue::ModuleLoader::LoadError::ModuleNotFound { path } => {
                     eprintln!("error: module not found: {}", path);
                 }
-                glue_rs::ModuleLoader::LoadError::ParseFailed { path, line, column, message } => {
+                glue::ModuleLoader::LoadError::ParseFailed { path, line, column, message } => {
                     eprintln!("error: parse failed in {} at {}:{}: {}", path, line, column, message);
                 }
-                glue_rs::ModuleLoader::LoadError::CircularImport { path } => {
+                glue::ModuleLoader::LoadError::CircularImport { path } => {
                     eprintln!("error: circular import detected: {}", path);
                 }
             }
         }
         process::exit(1);
     }
+    (loader, std_keys, dep_keys)
+}
 
+/// 运行完整 Sema 管线：注册内建类型 → predeclare 全部模块 → 逐模块检查。
+/// 任何模块的类型错误都会打印并 exit(1)。成功时返回 (type_arena, sema_result)。
+fn run_sema_pipeline(
+    loader: &ModuleLoader,
+    std_keys: &[String],
+    dep_keys: &[String],
+    entry_module: &Module,
+    entry_filename: &str,
+) -> (TypeArena, SemaResult) {
     let mut type_arena = TypeArena::new();
     let mut sema_result = SemaResult::new();
     let mut ctx = InferContext::new(&mut type_arena, &mut sema_result);
@@ -446,19 +469,17 @@ fn debug_check(source: &str, filename: &str) {
         .collect();
     ctx.register_module_aliases(root_env, &module_logical_paths);
 
-    // 预扫描：先 predeclare 所有模块的函数和类型构造器到 root_env，
-    // 解决模块间前向引用问题（如 SystemTime.glue 引用 Calendar.glue 的函数，
-    // 但 Calendar 在 STD_FILES 中位于 SystemTime 之后）。
-    // check_module_with_env 内部会再次 predeclare 当前模块（幂等，重复注册无害）。
+    // predeclare：先注册所有模块的函数和类型构造器到 root_env，
+    // 解决模块间前向引用问题。check_module_with_env 内部会再次 predeclare（幂等）。
     for (_, m) in loader.builtin_modules() {
         ctx.predeclare_declarations(m, root_env);
     }
-    for key in &std_keys {
+    for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
             ctx.predeclare_declarations(m, root_env);
         }
     }
-    for k in &dep_keys {
+    for k in dep_keys {
         if let Some(m) = loader.get_module_by_key(k) {
             ctx.predeclare_declarations(m, root_env);
         }
@@ -466,6 +487,25 @@ fn debug_check(source: &str, filename: &str) {
 
     let mut prev_err_len = 0usize;
 
+    // populate：在 check 前填充所有模块的定义表（类型方法签名等），
+    // 解决模块检查顺序导致的跨模块方法查找失败问题。
+    // check_module_with_env 内部会再次调用（幂等，put_type_def 拒绝重复）。
+    for (_, m) in loader.builtin_modules() {
+        populate_module(ctx.sema_result, m);
+    }
+    for key in std_keys {
+        if let Some(m) = loader.get_module_by_key(key) {
+            populate_module(ctx.sema_result, m);
+        }
+    }
+    for k in dep_keys {
+        if let Some(m) = loader.get_module_by_key(k) {
+            populate_module(ctx.sema_result, m);
+        }
+    }
+    populate_module(ctx.sema_result, entry_module);
+
+    // check: builtin → std → dep → entry
     for (path, m) in loader.builtin_modules() {
         ctx.check_module_with_env(m, root_env);
         for err in &ctx.sema_result.errors[prev_err_len..] {
@@ -473,8 +513,7 @@ fn debug_check(source: &str, filename: &str) {
         }
         prev_err_len = ctx.sema_result.errors.len();
     }
-
-    for key in &std_keys {
+    for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
             ctx.check_module_with_env(m, root_env);
             for err in &ctx.sema_result.errors[prev_err_len..] {
@@ -483,8 +522,7 @@ fn debug_check(source: &str, filename: &str) {
             prev_err_len = ctx.sema_result.errors.len();
         }
     }
-
-    for k in &dep_keys {
+    for k in dep_keys {
         if let Some(m) = loader.get_module_by_key(k) {
             ctx.check_module_with_env(m, root_env);
             for err in &ctx.sema_result.errors[prev_err_len..] {
@@ -493,17 +531,27 @@ fn debug_check(source: &str, filename: &str) {
             prev_err_len = ctx.sema_result.errors.len();
         }
     }
-
-    ctx.check_module_with_env(&entry_module, root_env);
+    ctx.check_module_with_env(entry_module, root_env);
     for err in &ctx.sema_result.errors[prev_err_len..] {
-        eprintln!("{}:{}:{}: {}", filename, err.line, err.column, err.message);
+        eprintln!("{}:{}:{}: {}", entry_filename, err.line, err.column, err.message);
     }
 
-    if ctx.sema_result.errors.is_empty() {
-        println!("ok: {} (no type errors)", filename);
-    } else {
+    if !ctx.sema_result.errors.is_empty() {
         process::exit(1);
     }
+    // ctx 借用 type_arena 和 sema_result，在此丢弃后两者所有权归还调用方。
+    drop(ctx);
+    (type_arena, sema_result)
+}
+
+/// 仅类型检查
+fn debug_check(source: &str, filename: &str) {
+    let arena = bumpalo::Bump::new();
+    let entry_module = parse_entry_module(&arena, source, filename);
+    let (loader, std_keys, dep_keys) = load_all_modules(&entry_module, filename);
+    let (_type_arena, _sema_result) =
+        run_sema_pipeline(&loader, &std_keys, &dep_keys, &entry_module, filename);
+    println!("ok: {} (no type errors)", filename);
 }
 
 // ==================== run 子命令（debug full 也复用） ====================
@@ -519,23 +567,7 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
 
     // 1. Parse
     let arena = bumpalo::Bump::new();
-    let mut lexer = Lexer::new(&source);
-    let mut sink = TokenCollector::new();
-    lexer.tokenize_into(&mut sink);
-    let tokens: Vec<Token<'_>> = sink.into_tokens();
-    let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = GlueParser::new(tokens_ref, &arena, ErrorCollector::new());
-
-    let entry_module = match parser.parse_module(&entry_path) {
-        Ok(m) => m,
-        Err(err) => {
-            eprintln!("{}:{}:{}: parse error: {}", entry_path, err.line, err.column, err.message);
-            process::exit(1);
-        }
-    };
-    for err in parser.errors() {
-        eprintln!("Warning: {}:{}:{}: {}", entry_path, err.line, err.column, err.message);
-    }
+    let entry_module = parse_entry_module(&arena, &source, &entry_path);
 
     if debug {
         eprintln!("  AST: {} declarations", entry_module.declarations.len());
@@ -543,90 +575,18 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
     }
 
     // 2. 模块加载
-    let mut loader = ModuleLoader::new();
-    // 添加入口文件所在目录为搜索路径，用于解析用户模块（如 Math/Geometry.glue）
-    if let Some(src_dir) = std::path::Path::new(&entry_path).parent() {
-        loader.add_search_path(src_dir);
-    }
-    let dep_keys = loader.load_transitive_imports(&entry_module);
-
-    // 预加载所有 std 模块
-    let std_keys: Vec<String> = glue_rs::ModuleLoader::STD_FILES
-        .iter()
-        .map(|(p, _)| p.to_string())
-        .collect();
-    for key in &std_keys {
-        let parts: Vec<&str> = key.strip_suffix(".glue").unwrap().split('/').collect();
-        let _ = loader.resolve_and_load(&parts);
-    }
-
-    if loader.has_load_errors() {
-        for err in loader.load_errors() {
-            match err {
-                glue_rs::ModuleLoader::LoadError::ModuleNotFound { path } => {
-                    eprintln!("error: module not found: {}", path);
-                }
-                glue_rs::ModuleLoader::LoadError::ParseFailed { path, line, column, message } => {
-                    eprintln!("error: parse failed in {} at {}:{}: {}", path, line, column, message);
-                }
-                glue_rs::ModuleLoader::LoadError::CircularImport { path } => {
-                    eprintln!("error: circular import detected: {}", path);
-                }
-            }
-        }
-        process::exit(1);
-    }
+    let (loader, std_keys, dep_keys) = load_all_modules(&entry_module, &entry_path);
 
     if debug {
         let builtin_count = loader.builtin_modules().count();
-        eprintln!("  Loaded: {} builtin + {} std + {} deps", 
+        eprintln!("  Loaded: {} builtin + {} std + {} deps",
             builtin_count, std_keys.len(), dep_keys.len());
         eprintln!("[3/5] Type checking ...");
     }
 
-    // 3. Sema check
-    let mut type_arena = TypeArena::new();
-    let mut sema_result = SemaResult::new();
-    let mut ctx = InferContext::new(&mut type_arena, &mut sema_result);
-
-    ctx.reset_state();
-    let root_env = ctx.env.root();
-    ctx.register_builtins(root_env);
-
-    let module_logical_paths: Vec<String> = loader
-        .loaded_keys()
-        .iter()
-        .filter_map(|k| k.strip_suffix(".glue").map(|s| s.replace('/', ".")))
-        .collect();
-    ctx.register_module_aliases(root_env, &module_logical_paths);
-
-    let mut prev_err_len = 0usize;
-
-    // builtin → std → 依赖 → entry
-    for (_path, m) in loader.builtin_modules() {
-        ctx.check_module_with_env(m, root_env);
-        prev_err_len = ctx.sema_result.errors.len();
-    }
-    for key in &std_keys {
-        if let Some(m) = loader.get_module_by_key(key) {
-            ctx.check_module_with_env(m, root_env);
-            prev_err_len = ctx.sema_result.errors.len();
-        }
-    }
-    for k in &dep_keys {
-        if let Some(m) = loader.get_module_by_key(k) {
-            ctx.check_module_with_env(m, root_env);
-            prev_err_len = ctx.sema_result.errors.len();
-        }
-    }
-    ctx.check_module_with_env(&entry_module, root_env);
-
-    if ctx.sema_result.errors.len() > prev_err_len {
-        for err in &ctx.sema_result.errors[prev_err_len..] {
-            eprintln!("{}:{}:{}: {}", entry_path, err.line, err.column, err.message);
-        }
-        process::exit(1);
-    }
+    // 3. Sema check（共享管线，任何模块类型错误均打印并 exit）
+    let (_type_arena, sema_result) =
+        run_sema_pipeline(&loader, &std_keys, &dep_keys, &entry_module, &entry_path);
 
     if debug {
         eprintln!("  Sema: OK (no type errors)");
@@ -688,7 +648,7 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
 
     // IR 后优化：ConstFold/CSE/CopyProp/DCE 固定点迭代
     if std::env::var("GLUE_NO_OPT").is_err() {
-        glue_rs::Optimizer::optimize(&mut graph);
+        glue::Optimizer::optimize(&mut graph);
     }
 
     if debug {

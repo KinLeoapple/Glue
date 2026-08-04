@@ -564,6 +564,28 @@ pub struct PendingAwait {
 }
 
 // =========================================================================
+// Pending — 统一挂起动作枚举
+// =========================================================================
+
+/// 帧的挂起动作。compute_fn 产出后由调度器消费。
+///
+/// 任意时刻一帧最多有一个 Pending 活跃（compute_fn 每次只设一个，
+/// 调度器在同一轮 loop 内消费并清空）。
+#[derive(Debug, Clone)]
+pub enum Pending {
+    /// 待发起的子图调用（Call/Gate 节点 compute_fn 产出）
+    Call(PendingCall),
+    /// 待处理的 await 挂起（Await 节点 compute_fn 产出）
+    Await(PendingAwait),
+    /// 待通知的 channel 事件（Send 操作设置，触发 ChannelReady 唤醒等待帧）
+    ChannelNotify(ChannelId),
+    /// 待取消的 async handle（Cancel 方法调用设置）
+    Cancel(AsyncHandleId),
+    /// 待挂起的 select 等待（Gate 节点局部 NodeId，无就绪分支时设置）
+    SelectWait(NodeId),
+}
+
+// =========================================================================
 // Frame — 执行帧（一次函数调用的运行时状态）
 // =========================================================================
 
@@ -602,18 +624,10 @@ pub struct Frame {
     pub suspend_state: SuspendState,
     /// defer 栈（运行时，帧释放时 LIFO 执行）
     pub defer_stack: Vec<DeferEntry>,
-    /// 待发起的子图调用（call 节点 compute_fn 产出，调度器消费）
-    pub pending_call: Option<PendingCall>,
-    /// 待处理的 await 挂起（await 节点 compute_fn 产出，调度器消费）
-    pub pending_await: Option<PendingAwait>,
-    /// 待通知的 channel 事件（send 操作设置，run_ready_nodes 消费：触发 ChannelReady 唤醒等待帧）
-    pub pending_channel_notify: Option<crate::Ir::ChannelId>,
+    /// 统一挂起动作（compute_fn 产出，调度器消费）
+    pub pending: Option<Pending>,
     /// 挂起事件（子图完成等，驱动帧恢复）
     pub suspend_event: Option<RuntimeEvent>,
-    /// 待取消的 async handle（cancel 方法调用设置，run_ready_nodes 消费）
-    pub pending_cancel: Option<crate::Ir::AsyncHandleId>,
-    /// 待挂起的 select 等待（无就绪分支时设置，NodeId 是 Gate 节点局部 id）
-    pub pending_select_wait: Option<NodeId>,
     /// select 中已启动的 timer（branch_idx, timer_id），Timer 分支首次检查时启动
     pub select_timers: Vec<(usize, crate::Ir::TimerId)>,
     /// 指向函数根帧。同函数子图继承，跨函数调用设为 null，async 子帧设为 null。
@@ -642,12 +656,8 @@ impl Frame {
             control_signal: ControlSignal::None,
             suspend_state: SuspendState::NotSuspended,
             defer_stack: Vec::new(),
-            pending_call: None,
-            pending_await: None,
-            pending_channel_notify: None,
+            pending: None,
             suspend_event: None,
-            pending_cancel: None,
-            pending_select_wait: None,
             select_timers: Vec::new(),
             root_frame_ptr: std::ptr::null_mut(),
             parent_frame_ptr: std::ptr::null_mut(),
@@ -672,7 +682,22 @@ impl Frame {
     pub fn get_value_by_global(&self, global_node: NodeId) -> Value {
         let local = global_node.0.wrapping_sub(self.node_offset);
         if (local as usize) < self.value_table.len() {
-            self.value_table.get_value(local as usize)
+            if self.value_table.ready[local as usize] {
+                self.value_table.get_value(local as usize)
+            } else if self.pending_inputs[local as usize] > 0 {
+                // 节点在当前帧范围内但永不会就绪（嵌套子图节点 pending_inputs=MAX，
+                // 或依赖嵌套节点的节点 pending_inputs>0 且永不归零）。
+                // 向上查找父帧获取值。
+                if !self.parent_frame_ptr.is_null() {
+                    unsafe { (*self.parent_frame_ptr).get_value_by_global(global_node) }
+                } else if !self.root_frame_ptr.is_null() {
+                    unsafe { (*self.root_frame_ptr).get_value_by_global(global_node) }
+                } else {
+                    Value::NULL
+                }
+            } else {
+                self.value_table.get_value(local as usize)
+            }
         } else if !self.parent_frame_ptr.is_null() {
             unsafe { (*self.parent_frame_ptr).get_value_by_global(global_node) }
         } else if !self.root_frame_ptr.is_null() {
@@ -960,19 +985,6 @@ pub enum LoopKind {
 /// 构建期绑定索引（ComputeFnId），运行时通过计算函数表索引调用。
 /// 每种运算+类型组合一个特化函数，运行时无类型检查、无 op 查表。
 pub type ComputeFn = fn(frame: &mut Frame, node: NodeId) -> Value;
-
-/// 占位计算函数表（Ir.rs 内部测试用，Engine.rs 有真实表）。
-pub const COMPUTE_FN_TABLE: &[ComputeFn] = &[noop_compute];
-
-/// 占位计算函数（Const 节点不需要 compute_fn，帧初始化时预填充）。
-fn noop_compute(_frame: &mut Frame, _node: NodeId) -> Value {
-    Value::VOID
-}
-
-/// 获取计算函数表（测试用）。
-pub fn compute_fn_table() -> &'static [ComputeFn] {
-    COMPUTE_FN_TABLE
-}
 
 /// 计算函数表注册宏。
 ///
@@ -2680,9 +2692,6 @@ impl<'a> IrBuilder<'a> {
             crate::Ast::Expr::Slice { recv, start, end, inclusive } => {
                 self.compile_slice(*recv, *start, *end, *inclusive)
             }
-
-            // 未来新增的 Expr 变体不应静默通过
-            _ => unreachable!("compile_expr: 未覆盖的 Expr 变体: {:?}", expr),
         }
     }
 
@@ -5201,6 +5210,14 @@ impl<'a> IrBuilder<'a> {
             if let Some(node) = self.try_lower_intrinsic(recv, recv_node, args, intrinsic) {
                 return node;
             }
+        }
+
+        // ── await 降级 ──
+        // 用户自定义类型（Timer/Channel 等）未注册 MethodSigInfo.intrinsic，
+        // 但 await 是通用挂起语义：无条件构建 Await 节点，
+        // 事件源种类由 infer_event_source_kind 根据 recv 类型决定。
+        if method == "await" && args.is_empty() {
+            return self.build_await_node(recv, recv_node);
         }
 
         {

@@ -1,7 +1,7 @@
 //! Optimizer.rs — IR 后优化器
 //!
 //! 对 IrBuilder 生成的 DataFlowGraph 做固定点迭代的图级优化。
-//! Pass 管线：ConstFold → CSE → CopyProp → DCE（→ BranchPrune → EscapeElim 待接入）。
+//! Pass 管线：ConstFold → CSE → CopyProp → DCE。
 //! 节点变换采用"标记 + 重定向 + 晚期压缩重建"策略，Engine 侧零改动。
 //! 详见 docs/superpowers/plans/2026-08-04-ir-optimizer.md
 
@@ -422,8 +422,14 @@ pub fn pass_const_fold(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext) {
         total_folded += 1;
     }
 
-    // ConstFold 直接修改 graph，不设置 ctx.mutated（避免固定点不收敛）
-    // 链式折叠已在单轮内完成，无需外层固定点迭代
+    // 折叠了节点就标记 mutated，让外层固定点继续跑下一轮：
+    // 新常量可能给 CSE/DCE 提供新机会（如 Const 节点可被消除）。
+    // 不会不收敛——每轮 ConstFold 至少折叠一个节点，节点总数有限，
+    // 最终 folded_this_round 为空退出循环。
+    if total_folded > 0 {
+        ctx.mutated = true;
+        ctx.cf_folded_count += total_folded;
+    }
 }
 
 // =========================================================================
