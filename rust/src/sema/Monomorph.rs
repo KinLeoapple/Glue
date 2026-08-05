@@ -1464,14 +1464,15 @@ fn resolve_stmt<'a, 'b>(stmt: StmtId, ctx: &mut ResolveCtx<'a, 'b>) {
                 .unwrap_or_else(|| ctx.sema_result.get_or_create_ref_desc("unknown"));
             // 检查 iterable 类型 implement Iterator
             // 已知迭代器类型：Iterator(trait 值)/ArrayIter/RangeIterator/StringIterator
-            // 已知非迭代器类型：array/str/基元类型 → 报错提示用 .iter()
+            // 已知非迭代器类型：array/所有内置类型(标量+str/null/void) → 报错提示用 .iter()
             // 其他类型（用户自定义）放行（witness_table 在 InferContext 中，此路径不可访问）
+            //
+            // 派生自 `Type::BUILTIN_TABLE`（单一真相源）：原静态表漏标了
+            // i8/i16/i128/isize/usize/f16/char 等 7 种标量类型。
             let iter_type_name = iter_td.type_name;
-            const NON_ITERATOR_TYPES: &[&str] = &[
-                "array", "str", "i32", "i64", "f32", "f64", "bool",
-                "u8", "u16", "u32", "u64", "f128", "void", "null",
-            ];
-            if NON_ITERATOR_TYPES.contains(&iter_type_name) {
+            let is_non_iterator = iter_type_name == "array"
+                || crate::Type::builtin_info_by_name(iter_type_name).is_some();
+            if is_non_iterator {
                 ctx.sema_result.add_error(SemaError::new(
                     &format!(
                         "类型 '{}' 未实现 Iterator，For 循环要求迭代器类型。数组请用 arr.iter()，字符串请用 str_iter(s)",

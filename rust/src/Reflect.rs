@@ -11,7 +11,7 @@
 
 use std::ffi::CString;
 
-use crate::Value::{F16, F128, HeapObj, RefKind, ScalarTag, Value, ValueArena, ValueHandle, ValueTag};
+use crate::Value::{F16, F128, HeapObj, RefKind, ValueTag, Value, ValueArena, ValueHandle};
 
 // =========================================================================
 // TypeKind 枚举（与 Glue 侧 kind 值一致，供用户判断类型分类）
@@ -140,36 +140,20 @@ pub extern "C" fn __reflect_kind(handle: u32) -> u8 {
 }
 
 /// 返回类型名（标量返回静态字符串，堆对象查 arena 读 type_name 字段）
+///
+/// 标量分支派生自 `Type::BUILTIN_TABLE`（单一真相源）：通过 `builtin_info_by_tag`
+/// 查表获取 `&'static str` 类型名，消除原 21 个硬编码 `b"..."` 分支。
+/// 不变量：外层 `tag != ValueTag::Ref` 保证 tag 必在 BUILTIN_TABLE 中（20 个非 Ref
+/// tag 全部登记），`.expect` 为不变量违反时的 fail-fast，非回退。
 #[no_mangle]
 pub extern "C" fn __reflect_type_name(handle: u32, out_data: *mut *const u8, out_len: *mut usize) {
     let h = ValueHandle::from_raw(handle);
     let tag = h.tag();
     if tag != ValueTag::Ref {
-        let name: &[u8] = match tag {
-            ValueTag::Null => b"null",
-            ValueTag::Void => b"void",
-            ValueTag::Bool => b"bool",
-            ValueTag::Char => b"char",
-            ValueTag::I8 => b"i8",
-            ValueTag::I16 => b"i16",
-            ValueTag::I32 => b"i32",
-            ValueTag::I64 => b"i64",
-            ValueTag::U8 => b"u8",
-            ValueTag::U16 => b"u16",
-            ValueTag::U32 => b"u32",
-            ValueTag::U64 => b"u64",
-            ValueTag::Isize => b"isize",
-            ValueTag::Usize => b"usize",
-            ValueTag::I128 => b"i128",
-            ValueTag::U128 => b"u128",
-            ValueTag::F16 => b"f16",
-            ValueTag::F32 => b"f32",
-            ValueTag::F64 => b"f64",
-            ValueTag::F128 => b"f128",
-            ValueTag::Ref => b"ref",
-        };
-        // name 是静态 &[u8]，指针 'static 有效，无悬垂风险
-        write_slice_out(name, out_data, out_len);
+        let info = crate::Type::builtin_info_by_tag(tag)
+            .expect("non-Ref ValueTag must be in BUILTIN_TABLE");
+        // info.name 是 &'static str，指针 'static 有效，无悬垂风险
+        write_slice_out(info.name.as_bytes(), out_data, out_len);
         return;
     }
     // 堆对象：查 arena 读用户类型名
@@ -400,28 +384,29 @@ pub fn format_value(v: &Value, depth: u32) -> String {
             // 标量格式化：直接从 ScalarValue 读取，不经 ValueArena
             unsafe {
                 match tag {
-                    ScalarTag::Bool => (if sv.bool_val { "true" } else { "false" }).to_string(),
-                    ScalarTag::Char => {
+                    ValueTag::Bool => (if sv.bool_val { "true" } else { "false" }).to_string(),
+                    ValueTag::Char => {
                         let c = sv.char_val;
                         // 码点 → Unicode 标量值 → 字符（覆盖所有合法码点，包括非 ASCII）
                         char::from_u32(c).map(|ch| ch.to_string()).unwrap_or_else(|| format!("U+{:04X}", c))
                     }
-                    ScalarTag::I8 => sv.i8_val.to_string(),
-                    ScalarTag::I16 => sv.i16_val.to_string(),
-                    ScalarTag::I32 => sv.i32_val.to_string(),
-                    ScalarTag::I64 => sv.i64_val.to_string(),
-                    ScalarTag::U8 => sv.u8_val.to_string(),
-                    ScalarTag::U16 => sv.u16_val.to_string(),
-                    ScalarTag::U32 => sv.u32_val.to_string(),
-                    ScalarTag::U64 => sv.u64_val.to_string(),
-                    ScalarTag::Isize => sv.isize_val.to_string(),
-                    ScalarTag::Usize => sv.usize_val.to_string(),
-                    ScalarTag::I128 => i128::from_ne_bytes(std::mem::transmute(sv.i128_val)).to_string(),
-                    ScalarTag::U128 => u128::from_ne_bytes(std::mem::transmute(sv.u128_val)).to_string(),
-                    ScalarTag::F16 => format!("{:?}", F16(sv.f16_val)),
-                    ScalarTag::F32 => sv.f32_val.to_string(),
-                    ScalarTag::F64 => sv.f64_val.to_string(),
-                    ScalarTag::F128 => format!("{:?}", F128(std::mem::transmute(sv.f128_val))),
+                    ValueTag::I8 => sv.i8_val.to_string(),
+                    ValueTag::I16 => sv.i16_val.to_string(),
+                    ValueTag::I32 => sv.i32_val.to_string(),
+                    ValueTag::I64 => sv.i64_val.to_string(),
+                    ValueTag::U8 => sv.u8_val.to_string(),
+                    ValueTag::U16 => sv.u16_val.to_string(),
+                    ValueTag::U32 => sv.u32_val.to_string(),
+                    ValueTag::U64 => sv.u64_val.to_string(),
+                    ValueTag::Isize => sv.isize_val.to_string(),
+                    ValueTag::Usize => sv.usize_val.to_string(),
+                    ValueTag::I128 => i128::from_ne_bytes(std::mem::transmute(sv.i128_val)).to_string(),
+                    ValueTag::U128 => u128::from_ne_bytes(std::mem::transmute(sv.u128_val)).to_string(),
+                    ValueTag::F16 => format!("{:?}", F16(sv.f16_val)),
+                    ValueTag::F32 => sv.f32_val.to_string(),
+                    ValueTag::F64 => sv.f64_val.to_string(),
+                    ValueTag::F128 => format!("{:?}", F128(std::mem::transmute(sv.f128_val))),
+                    _ => unreachable!("non-scalar tag in ScalarValue"),
                 }
             }
         }
@@ -606,13 +591,14 @@ fn value_size(v: &Value) -> u32 {
         Value::Null | Value::Void => 0,
         Value::Scalar(_, tag) => {
             match tag {
-                ScalarTag::Bool => 1,
-                ScalarTag::Char => 4,
-                ScalarTag::I8 | ScalarTag::U8 => 1,
-                ScalarTag::I16 | ScalarTag::U16 | ScalarTag::F16 => 2,
-                ScalarTag::I32 | ScalarTag::U32 | ScalarTag::F32 => 4,
-                ScalarTag::I64 | ScalarTag::U64 | ScalarTag::F64 | ScalarTag::Isize | ScalarTag::Usize => 8,
-                ScalarTag::I128 | ScalarTag::U128 | ScalarTag::F128 => 16,
+                ValueTag::Bool => 1,
+                ValueTag::Char => 4,
+                ValueTag::I8 | ValueTag::U8 => 1,
+                ValueTag::I16 | ValueTag::U16 | ValueTag::F16 => 2,
+                ValueTag::I32 | ValueTag::U32 | ValueTag::F32 => 4,
+                ValueTag::I64 | ValueTag::U64 | ValueTag::F64 | ValueTag::Isize | ValueTag::Usize => 8,
+                ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
+                _ => unreachable!("non-scalar tag in ScalarValue"),
             }
         }
         Value::Ref(r) => {
@@ -638,13 +624,14 @@ fn value_alignment(v: &Value) -> u32 {
         Value::Null | Value::Void => 1,
         Value::Scalar(_, tag) => {
             match tag {
-                ScalarTag::Bool => 1,
-                ScalarTag::Char => 4,
-                ScalarTag::I8 | ScalarTag::U8 => 1,
-                ScalarTag::I16 | ScalarTag::U16 | ScalarTag::F16 => 2,
-                ScalarTag::I32 | ScalarTag::U32 | ScalarTag::F32 => 4,
-                ScalarTag::I64 | ScalarTag::U64 | ScalarTag::F64 | ScalarTag::Isize | ScalarTag::Usize => 8,
-                ScalarTag::I128 | ScalarTag::U128 | ScalarTag::F128 => 16,
+                ValueTag::Bool => 1,
+                ValueTag::Char => 4,
+                ValueTag::I8 | ValueTag::U8 => 1,
+                ValueTag::I16 | ValueTag::U16 | ValueTag::F16 => 2,
+                ValueTag::I32 | ValueTag::U32 | ValueTag::F32 => 4,
+                ValueTag::I64 | ValueTag::U64 | ValueTag::F64 | ValueTag::Isize | ValueTag::Usize => 8,
+                ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
+                _ => unreachable!("non-scalar tag in ScalarValue"),
             }
         }
         Value::Ref(r) => {

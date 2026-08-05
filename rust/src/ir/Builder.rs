@@ -326,7 +326,7 @@ impl<'a> IrBuilder<'a> {
     ) -> ComputeFnId {
         use crate::ast::Ast::CompoundAssignOp;
         let ty = self.expr_type_name(target_expr).unwrap_or("i32");
-        let is_float = crate::Value::ScalarTag::from_name(ty).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
+        let is_float = crate::Value::ValueTag::from_name(ty).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
         let base = Self::arith_base(ty).unwrap_or(CF_ADD_I32_FULL.0); // 回退 i32
         // 整数 offset: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9)
         // 浮点 offset: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
@@ -2725,12 +2725,13 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or(false)
     }
 
-    /// 类型族：按整数宽度分派到 i32/i64/i128 路径（仅用于比较运算，结果为 bool）。
-    /// i8/i16/u8/u16/u32/char → I32 路径；i64/u64/isize/usize → I64 路径；i128/u128 → I128 路径。
-    fn int_family(ty_name: &str) -> &'static str {
-        match crate::Value::ScalarTag::from_name(ty_name).and_then(scalar_meta) {
+    /// 类型族：返回 `TypeFamily`（调用方用 `|` 合并整数变体按位宽分派）。
+    /// i8/i16/u8/u16/u32/char → SignedInt32/UnsignedInt32/Char；i64/u64/isize/usize → SignedInt64/UnsignedInt64；
+    /// i128/u128 → SignedInt128/UnsignedInt128；bool → Bool；浮点 → Float。
+    fn int_family(ty_name: &str) -> crate::Type::TypeFamily {
+        match crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta) {
             Some(m) => m.family,
-            None => "i32", // 未知整数类型回退到 i32 路径
+            None => crate::Type::TypeFamily::SignedInt32, // 未知整数类型回退到 Int32 路径
         }
     }
 
@@ -2740,7 +2741,7 @@ impl<'a> IrBuilder<'a> {
     /// 返回 None 表示该类型不支持算术运算。
     /// 基址来自 `scalar_meta`，与 compute_fn_table! 的索引单点同步。
     fn arith_base(ty_name: &str) -> Option<u32> {
-        crate::Value::ScalarTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.arith_base)
+        crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.arith_base)
     }
 
     /// 根据 op + 表达式类型选择 compute_fn id。
@@ -2750,9 +2751,10 @@ impl<'a> IrBuilder<'a> {
         lhs_expr: crate::ast::Ast::ExprId,
     ) -> ComputeFnId {
         let ty_name = self.expr_type_name(lhs_expr).unwrap_or("i32");
-        let ty_meta = crate::Value::ScalarTag::from_name(ty_name).and_then(scalar_meta);
+        let ty_meta = crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta);
         let is_float = ty_meta.as_ref().map(|m| m.is_float).unwrap_or(false);
-        let is_int = !is_float && ty_name != "bool";
+        // is_int：非浮点且非 bool（复用 TypeFamily 枚举，消除字符串比较）
+        let is_int = !is_float && Self::int_family(ty_name) != crate::Type::TypeFamily::Bool;
         let base = Self::arith_base(ty_name);
 
         // Elvis (??) 运算：lhs 为 null 时返回 rhs，否则返回 lhs。
@@ -2846,43 +2848,45 @@ impl<'a> IrBuilder<'a> {
         }
 
         // 比较运算：结果为 bool，输入按类型族读取
+        // fam 为 TypeFamily 枚举，用 | 合并有符号/无符号整数变体按位宽分派（编译器穷尽检查）
         let fam = Self::int_family(ty_name);
+        use crate::Type::TypeFamily;
         match op {
             crate::ast::Ast::BinaryOp::Eq => {
                 if is_float { CF_EQ_F64 }     // eq_f64
-                else if ty_name == "bool" { CF_EQ_BOOL } // eq_bool
-                else if fam == "i128" { CF_EQ_I128 } // eq_i128
-                else if fam == "i64" { CF_EQ_I64 }  // eq_i64
-                else { CF_EQ_I32 }              // eq_i32
+                else if fam == TypeFamily::Bool { CF_EQ_BOOL } // eq_bool
+                else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_EQ_I128 } // eq_i128
+                else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_EQ_I64 }  // eq_i64
+                else { CF_EQ_I32 }              // eq_i32 (Int32 含 char)
             }
             crate::ast::Ast::BinaryOp::NotEq => {
                 if is_float { CF_NE_F64 }     // ne_f64
-                else if fam == "i128" { CF_NE_I128 } // ne_i128
-                else if fam == "i64" { CF_NE_I64 }  // ne_i64
+                else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_NE_I128 } // ne_i128
+                else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_NE_I64 }  // ne_i64
                 else { CF_NE_I32 }              // ne_i32
             }
             crate::ast::Ast::BinaryOp::Lt => {
                 if is_float { CF_LT_F64 }     // lt_f64
-                else if fam == "i128" { CF_LT_I128 } // lt_i128
-                else if fam == "i64" { CF_LT_I64 }  // lt_i64
+                else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_LT_I128 } // lt_i128
+                else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_LT_I64 }  // lt_i64
                 else { CF_LT_I32 }             // lt_i32
             }
             crate::ast::Ast::BinaryOp::Gt => {
                 if is_float { CF_GT_F64 }     // gt_f64
-                else if fam == "i128" { CF_GT_I128 } // gt_i128
-                else if fam == "i64" { CF_GT_I64 }  // gt_i64
+                else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_GT_I128 } // gt_i128
+                else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_GT_I64 }  // gt_i64
                 else { CF_GT_I32 }             // gt_i32
             }
             crate::ast::Ast::BinaryOp::LtEq => {
                 if is_float { CF_LE_F64 }     // le_f64
-                else if fam == "i128" { CF_LE_I128 } // le_i128
-                else if fam == "i64" { CF_LE_I64 }  // le_i64
+                else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_LE_I128 } // le_i128
+                else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_LE_I64 }  // le_i64
                 else { CF_LE_I32 }              // le_i32
             }
             crate::ast::Ast::BinaryOp::GtEq => {
                 if is_float { CF_GE_F64 }     // ge_f64
-                else if fam == "i128" { CF_GE_I128 } // ge_i128
-                else if fam == "i64" { CF_GE_I64 }  // ge_i64
+                else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_GE_I128 } // ge_i128
+                else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_GE_I64 }  // ge_i64
                 else { CF_GE_I32 }             // ge_i32
             }
             crate::ast::Ast::BinaryOp::And => CF_AND_BOOL, // and_bool
@@ -2904,7 +2908,7 @@ impl<'a> IrBuilder<'a> {
         operand_expr: crate::ast::Ast::ExprId,
     ) -> ComputeFnId {
         let ty_name = self.expr_type_name(operand_expr).unwrap_or("i32");
-        let is_float = crate::Value::ScalarTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
+        let is_float = crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
         let base = Self::arith_base(ty_name);
         match op {
             crate::ast::Ast::UnaryOp::Not => CF_NOT_BOOL, // not_bool
@@ -3059,9 +3063,9 @@ impl<'a> IrBuilder<'a> {
         Some(BatchInfo { tag, op: batch_op })
     }
 
-    /// 类型名 → ScalarTag 映射（委托 `ScalarTag::from_name`，与 Value 单点同步）。
-    fn ty_name_to_scalar_tag(ty: &str) -> Option<crate::Value::ScalarTag> {
-        crate::Value::ScalarTag::from_name(ty)
+    /// 类型名 → ValueTag 映射（委托 `ValueTag::from_name`，与 Value 单点同步）。
+    fn ty_name_to_scalar_tag(ty: &str) -> Option<crate::Value::ValueTag> {
+        crate::Value::ValueTag::from_name(ty)
     }
 
     /// 编译 cast 调用：__cast_to<T>(x) / __cast_try_to<T>(x)。
@@ -3731,12 +3735,16 @@ impl<'a> IrBuilder<'a> {
         if let Some(info) = self.sema.expr_types.get(&key) {
             if let Some(ref tn) = info.type_name {
                 let tn = tn.as_ref();
-                if tn.starts_with("Async") {
-                    return EventSourceKind::AsyncJoin;
+                // 内置泛型：派生自 Ty::from_type_name + family()（消除 starts_with 前缀匹配）
+                if let Some(ty) = crate::Type::Ty::from_type_name(tn) {
+                    use crate::Type::TypeFamily;
+                    match ty.family() {
+                        TypeFamily::Async => return EventSourceKind::AsyncJoin,
+                        TypeFamily::Channel | TypeFamily::Receiver => return EventSourceKind::Channel,
+                        _ => {}
+                    }
                 }
-                if tn.starts_with("Channel") || tn.starts_with("Receiver") {
-                    return EventSourceKind::Channel;
-                }
+                // Timer 是用户自定义类型（非内置泛型），保留 contains 字符串匹配
                 if tn.contains("Timer") {
                     return EventSourceKind::Timer;
                 }

@@ -13,8 +13,8 @@ use rayon::prelude::*;
 use pastey::paste;
 use wide::{f32x4, f64x4, i8x16, i16x8, i32x4, i64x4, u8x16, u16x8, u32x4, u64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, CmpNe};
 
-// 从 Type 模块 re-export 类型判别标签（保持 crate::Value::ValueTag / ScalarTag 路径兼容）
-pub use crate::Type::{ValueTag, ScalarTag};
+// 从 Type 模块 re-export 类型判别标签
+pub use crate::Type::ValueTag;
 
 // =========================================================================
 // 第一部分：标量基础类型（scalar.rs + char.rs）
@@ -946,12 +946,12 @@ impl std::ops::Neg for F128 {
     fn neg(self) -> F128 { self.neg_f128() }
 }
 
-// ---- ValueTag / ScalarTag 已移至 Type.rs（通过 re-export 保持兼容）----
+// ---- ValueTag / ValueTag 已移至 Type.rs（通过 re-export 保持兼容）----
 
 // ---- ScalarValue — 标量值 union（16 字节）----
 
 /// 标量值 union（16 字节，容纳 i128/u128/F128）。
-/// 通过 ScalarTag 类型守卫访问，unsafe 代码必须有对应 tag 检查。
+/// 通过 ValueTag 类型守卫访问，unsafe 代码必须有对应 tag 检查。
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub union ScalarValue {
@@ -983,8 +983,19 @@ pub union ScalarValue {
 pub enum Value {
     Null,
     Void,
-    Scalar(ScalarValue, ScalarTag),
+    /// 标量值。tag 必须为标量变体（Bool/Char/I8.../F128），
+    /// 非标量 tag（Null/Void/Ref）禁止进入此路径。
+    Scalar(ScalarValue, ValueTag),
     Ref(Arc<HeapObj>),
+}
+
+impl Value {
+    /// 构造标量值，debug 构建检查 tag 为标量变体。
+    #[inline]
+    fn scalar(sv: ScalarValue, tag: ValueTag) -> Self {
+        debug_assert!(tag.is_scalar(), "non-scalar tag {:?} used for ScalarValue", tag);
+        Value::Scalar(sv, tag)
+    }
 }
 
 unsafe impl Send for Value {}
@@ -992,31 +1003,32 @@ unsafe impl Sync for Value {}
 
 impl Value {
     // ---- 标量构造器 ----
-    pub fn i32(v: i32) -> Self { Value::Scalar(ScalarValue { i32_val: v }, ScalarTag::I32) }
-    pub fn i64(v: i64) -> Self { Value::Scalar(ScalarValue { i64_val: v }, ScalarTag::I64) }
-    pub fn f64(v: f64) -> Self { Value::Scalar(ScalarValue { f64_val: v }, ScalarTag::F64) }
-    pub fn f32(v: f32) -> Self { Value::Scalar(ScalarValue { f32_val: v }, ScalarTag::F32) }
-    pub fn bool_val(v: bool) -> Self { Value::Scalar(ScalarValue { bool_val: v }, ScalarTag::Bool) }
-    pub fn char_val(v: char) -> Self { Value::Scalar(ScalarValue { char_val: v as u32 }, ScalarTag::Char) }
-    pub fn i8(v: i8) -> Self { Value::Scalar(ScalarValue { i8_val: v }, ScalarTag::I8) }
-    pub fn i16(v: i16) -> Self { Value::Scalar(ScalarValue { i16_val: v }, ScalarTag::I16) }
-    pub fn u8(v: u8) -> Self { Value::Scalar(ScalarValue { u8_val: v }, ScalarTag::U8) }
-    pub fn u16(v: u16) -> Self { Value::Scalar(ScalarValue { u16_val: v }, ScalarTag::U16) }
-    pub fn u32(v: u32) -> Self { Value::Scalar(ScalarValue { u32_val: v }, ScalarTag::U32) }
-    pub fn u64(v: u64) -> Self { Value::Scalar(ScalarValue { u64_val: v }, ScalarTag::U64) }
-    pub fn isize_val(v: isize) -> Self { Value::Scalar(ScalarValue { isize_val: v }, ScalarTag::Isize) }
-    pub fn usize_val(v: usize) -> Self { Value::Scalar(ScalarValue { usize_val: v }, ScalarTag::Usize) }
-    pub fn f16(v: F16) -> Self { Value::Scalar(ScalarValue { f16_val: v.0 }, ScalarTag::F16) }
+    // 所有构造器统一调用 Self::scalar()，使 debug_assert!(tag.is_scalar()) 守卫生效。
+    pub fn i32(v: i32) -> Self { Self::scalar(ScalarValue { i32_val: v }, ValueTag::I32) }
+    pub fn i64(v: i64) -> Self { Self::scalar(ScalarValue { i64_val: v }, ValueTag::I64) }
+    pub fn f64(v: f64) -> Self { Self::scalar(ScalarValue { f64_val: v }, ValueTag::F64) }
+    pub fn f32(v: f32) -> Self { Self::scalar(ScalarValue { f32_val: v }, ValueTag::F32) }
+    pub fn bool_val(v: bool) -> Self { Self::scalar(ScalarValue { bool_val: v }, ValueTag::Bool) }
+    pub fn char_val(v: char) -> Self { Self::scalar(ScalarValue { char_val: v as u32 }, ValueTag::Char) }
+    pub fn i8(v: i8) -> Self { Self::scalar(ScalarValue { i8_val: v }, ValueTag::I8) }
+    pub fn i16(v: i16) -> Self { Self::scalar(ScalarValue { i16_val: v }, ValueTag::I16) }
+    pub fn u8(v: u8) -> Self { Self::scalar(ScalarValue { u8_val: v }, ValueTag::U8) }
+    pub fn u16(v: u16) -> Self { Self::scalar(ScalarValue { u16_val: v }, ValueTag::U16) }
+    pub fn u32(v: u32) -> Self { Self::scalar(ScalarValue { u32_val: v }, ValueTag::U32) }
+    pub fn u64(v: u64) -> Self { Self::scalar(ScalarValue { u64_val: v }, ValueTag::U64) }
+    pub fn isize_val(v: isize) -> Self { Self::scalar(ScalarValue { isize_val: v }, ValueTag::Isize) }
+    pub fn usize_val(v: usize) -> Self { Self::scalar(ScalarValue { usize_val: v }, ValueTag::Usize) }
+    pub fn f16(v: F16) -> Self { Self::scalar(ScalarValue { f16_val: v.0 }, ValueTag::F16) }
     // 128 位标量构造器（bit pattern 存为 [u64; 2]）
     pub fn i128(v: i128) -> Self {
         let bits = v as u128;
-        Value::Scalar(ScalarValue { i128_val: [(bits & 0xFFFF_FFFF_FFFF_FFFF) as u64, (bits >> 64) as u64] }, ScalarTag::I128)
+        Self::scalar(ScalarValue { i128_val: [(bits & 0xFFFF_FFFF_FFFF_FFFF) as u64, (bits >> 64) as u64] }, ValueTag::I128)
     }
     pub fn u128(v: u128) -> Self {
-        Value::Scalar(ScalarValue { u128_val: [(v & 0xFFFF_FFFF_FFFF_FFFF) as u64, (v >> 64) as u64] }, ScalarTag::U128)
+        Self::scalar(ScalarValue { u128_val: [(v & 0xFFFF_FFFF_FFFF_FFFF) as u64, (v >> 64) as u64] }, ValueTag::U128)
     }
     pub fn f128(v: F128) -> Self {
-        Value::Scalar(ScalarValue { f128_val: unsafe { std::mem::transmute(v.0) } }, ScalarTag::F128)
+        Self::scalar(ScalarValue { f128_val: unsafe { std::mem::transmute(v.0) } }, ValueTag::F128)
     }
 
     // ---- 堆对象构造器 ----
@@ -1027,25 +1039,25 @@ impl Value {
     pub const VOID: Value = Value::Void;
 
     // ---- 标量访问器（带 tag 守卫，整数类型间自动提升/截断）----
-    /// 通用整数读取：覆盖所有整数 ScalarTag，统一中转为 i128。
+    /// 通用整数读取：覆盖所有整数 ValueTag，统一中转为 i128。
     /// 所有 as_iN/as_uN/as_isize/as_usize 委托本方法再 `as` 截断，避免特例匹配。
     pub fn as_int_i128(&self) -> i128 {
         match self {
             Value::Scalar(v, t) => unsafe {
                 match t {
-                    ScalarTag::I8 => v.i8_val as i128,
-                    ScalarTag::I16 => v.i16_val as i128,
-                    ScalarTag::I32 => v.i32_val as i128,
-                    ScalarTag::I64 => v.i64_val as i128,
-                    ScalarTag::I128 => i128::from_ne_bytes(std::mem::transmute(v.i128_val)),
-                    ScalarTag::U8 => v.u8_val as i128,
-                    ScalarTag::U16 => v.u16_val as i128,
-                    ScalarTag::U32 => v.u32_val as i128,
-                    ScalarTag::U64 => v.u64_val as i128,
-                    ScalarTag::U128 => u128::from_ne_bytes(std::mem::transmute(v.u128_val)) as i128,
-                    ScalarTag::Isize => v.isize_val as i128,
-                    ScalarTag::Usize => v.usize_val as i128,
-                    ScalarTag::Char => v.char_val as i128,
+                    ValueTag::I8 => v.i8_val as i128,
+                    ValueTag::I16 => v.i16_val as i128,
+                    ValueTag::I32 => v.i32_val as i128,
+                    ValueTag::I64 => v.i64_val as i128,
+                    ValueTag::I128 => i128::from_ne_bytes(std::mem::transmute(v.i128_val)),
+                    ValueTag::U8 => v.u8_val as i128,
+                    ValueTag::U16 => v.u16_val as i128,
+                    ValueTag::U32 => v.u32_val as i128,
+                    ValueTag::U64 => v.u64_val as i128,
+                    ValueTag::U128 => u128::from_ne_bytes(std::mem::transmute(v.u128_val)) as i128,
+                    ValueTag::Isize => v.isize_val as i128,
+                    ValueTag::Usize => v.usize_val as i128,
+                    ValueTag::Char => v.char_val as i128,
                     _ => 0,
                 }
             },
@@ -1058,10 +1070,10 @@ impl Value {
         match self {
             Value::Scalar(v, t) => unsafe {
                 match t {
-                    ScalarTag::F16 => F16(v.f16_val).to_f64(),
-                    ScalarTag::F32 => v.f32_val as f64,
-                    ScalarTag::F64 => v.f64_val,
-                    ScalarTag::F128 => F128(std::mem::transmute(v.f128_val)).to_f64(),
+                    ValueTag::F16 => F16(v.f16_val).to_f64(),
+                    ValueTag::F32 => v.f32_val as f64,
+                    ValueTag::F64 => v.f64_val,
+                    ValueTag::F128 => F128(std::mem::transmute(v.f128_val)).to_f64(),
                     _ => 0.0,
                 }
             },
@@ -1087,8 +1099,8 @@ impl Value {
     pub fn as_f64(&self) -> f64 { self.as_float_f64() }
     pub fn as_f128(&self) -> F128 { F128::from_f64(self.as_float_f64()) }
     // ---- 其他标量访问器 ----
-    pub fn as_bool(&self) -> bool { match self { Value::Scalar(v, ScalarTag::Bool) => unsafe { v.bool_val }, _ => false } }
-    pub fn as_char(&self) -> char { match self { Value::Scalar(v, ScalarTag::Char) => unsafe { char::from_u32_unchecked(v.char_val) }, _ => '\0' } }
+    pub fn as_bool(&self) -> bool { match self { Value::Scalar(v, ValueTag::Bool) => unsafe { v.bool_val }, _ => false } }
+    pub fn as_char(&self) -> char { match self { Value::Scalar(v, ValueTag::Char) => unsafe { char::from_u32_unchecked(v.char_val) }, _ => '\0' } }
 
     // ---- 堆对象访问器 ----
     pub fn heap_obj(&self) -> Option<&HeapObj> { match self { Value::Ref(r) => Some(r.as_ref()), _ => None } }
@@ -1100,7 +1112,7 @@ impl Value {
     pub fn is_ref(&self) -> bool { matches!(self, Value::Ref(_)) }
 
     // ---- 标量 tag 访问（供 Hash/Debug/反射适配）----
-    pub fn scalar_tag(&self) -> Option<ScalarTag> {
+    pub fn scalar_tag(&self) -> Option<ValueTag> {
         match self { Value::Scalar(_, t) => Some(*t), _ => None }
     }
 
@@ -1126,24 +1138,25 @@ impl fmt::Debug for Value {
             Value::Scalar(v, tag) => {
                 // 复用 ValueHandle 的标量格式化逻辑：按 tag 读取 union 字段
                 match tag {
-                    ScalarTag::Bool => write!(f, "{}", unsafe { v.bool_val }),
-                    ScalarTag::Char => write!(f, "'{}'", Char::from_codepoint_unchecked(unsafe { v.char_val })),
-                    ScalarTag::I8 => write!(f, "{}i8", unsafe { v.i8_val }),
-                    ScalarTag::I16 => write!(f, "{}i16", unsafe { v.i16_val }),
-                    ScalarTag::I32 => write!(f, "{}", unsafe { v.i32_val }),
-                    ScalarTag::I64 => write!(f, "{}i64", unsafe { v.i64_val }),
-                    ScalarTag::I128 => write!(f, "{}i128", unsafe { i128::from_ne_bytes(std::mem::transmute(v.i128_val)) }),
-                    ScalarTag::U8 => write!(f, "{}u8", unsafe { v.u8_val }),
-                    ScalarTag::U16 => write!(f, "{}u16", unsafe { v.u16_val }),
-                    ScalarTag::U32 => write!(f, "{}u32", unsafe { v.u32_val }),
-                    ScalarTag::U64 => write!(f, "{}u64", unsafe { v.u64_val }),
-                    ScalarTag::U128 => write!(f, "{}u128", unsafe { u128::from_ne_bytes(std::mem::transmute(v.u128_val)) }),
-                    ScalarTag::Isize => write!(f, "{}isize", unsafe { v.isize_val }),
-                    ScalarTag::Usize => write!(f, "{}usize", unsafe { v.usize_val }),
-                    ScalarTag::F16 => write!(f, "{:?}", F16(unsafe { v.f16_val })),
-                    ScalarTag::F32 => write!(f, "{}f32", unsafe { v.f32_val }),
-                    ScalarTag::F64 => write!(f, "{}", unsafe { v.f64_val }),
-                    ScalarTag::F128 => write!(f, "{:?}", F128(unsafe { std::mem::transmute(v.f128_val) })),
+                    ValueTag::Bool => write!(f, "{}", unsafe { v.bool_val }),
+                    ValueTag::Char => write!(f, "'{}'", Char::from_codepoint_unchecked(unsafe { v.char_val })),
+                    ValueTag::I8 => write!(f, "{}i8", unsafe { v.i8_val }),
+                    ValueTag::I16 => write!(f, "{}i16", unsafe { v.i16_val }),
+                    ValueTag::I32 => write!(f, "{}", unsafe { v.i32_val }),
+                    ValueTag::I64 => write!(f, "{}i64", unsafe { v.i64_val }),
+                    ValueTag::I128 => write!(f, "{}i128", unsafe { i128::from_ne_bytes(std::mem::transmute(v.i128_val)) }),
+                    ValueTag::U8 => write!(f, "{}u8", unsafe { v.u8_val }),
+                    ValueTag::U16 => write!(f, "{}u16", unsafe { v.u16_val }),
+                    ValueTag::U32 => write!(f, "{}u32", unsafe { v.u32_val }),
+                    ValueTag::U64 => write!(f, "{}u64", unsafe { v.u64_val }),
+                    ValueTag::U128 => write!(f, "{}u128", unsafe { u128::from_ne_bytes(std::mem::transmute(v.u128_val)) }),
+                    ValueTag::Isize => write!(f, "{}isize", unsafe { v.isize_val }),
+                    ValueTag::Usize => write!(f, "{}usize", unsafe { v.usize_val }),
+                    ValueTag::F16 => write!(f, "{:?}", F16(unsafe { v.f16_val })),
+                    ValueTag::F32 => write!(f, "{}f32", unsafe { v.f32_val }),
+                    ValueTag::F64 => write!(f, "{}", unsafe { v.f64_val }),
+                    ValueTag::F128 => write!(f, "{:?}", F128(unsafe { std::mem::transmute(v.f128_val) })),
+                    _ => unreachable!("non-scalar tag {:?} in ScalarValue", tag),
                 }
             }
             Value::Ref(r) => fmt::Debug::fmt(r.as_ref(), f),
@@ -1160,24 +1173,25 @@ impl Hash for Value {
                 tag.hash(state);
                 // 按 tag 哈希对应 union 字段
                 match tag {
-                    ScalarTag::Bool => unsafe { v.bool_val }.hash(state),
-                    ScalarTag::Char => unsafe { v.char_val }.hash(state),
-                    ScalarTag::I8 => unsafe { v.i8_val }.hash(state),
-                    ScalarTag::I16 => unsafe { v.i16_val }.hash(state),
-                    ScalarTag::I32 => unsafe { v.i32_val }.hash(state),
-                    ScalarTag::I64 => unsafe { v.i64_val }.hash(state),
-                    ScalarTag::I128 => unsafe { v.i128_val }.hash(state),
-                    ScalarTag::U8 => unsafe { v.u8_val }.hash(state),
-                    ScalarTag::U16 => unsafe { v.u16_val }.hash(state),
-                    ScalarTag::U32 => unsafe { v.u32_val }.hash(state),
-                    ScalarTag::U64 => unsafe { v.u64_val }.hash(state),
-                    ScalarTag::U128 => unsafe { v.u128_val }.hash(state),
-                    ScalarTag::Isize => unsafe { v.isize_val }.hash(state),
-                    ScalarTag::Usize => unsafe { v.usize_val }.hash(state),
-                    ScalarTag::F16 => unsafe { v.f16_val }.hash(state),
-                    ScalarTag::F32 => unsafe { v.f32_val }.to_bits().hash(state),
-                    ScalarTag::F64 => unsafe { v.f64_val }.to_bits().hash(state),
-                    ScalarTag::F128 => unsafe { v.f128_val }.hash(state),
+                    ValueTag::Bool => unsafe { v.bool_val }.hash(state),
+                    ValueTag::Char => unsafe { v.char_val }.hash(state),
+                    ValueTag::I8 => unsafe { v.i8_val }.hash(state),
+                    ValueTag::I16 => unsafe { v.i16_val }.hash(state),
+                    ValueTag::I32 => unsafe { v.i32_val }.hash(state),
+                    ValueTag::I64 => unsafe { v.i64_val }.hash(state),
+                    ValueTag::I128 => unsafe { v.i128_val }.hash(state),
+                    ValueTag::U8 => unsafe { v.u8_val }.hash(state),
+                    ValueTag::U16 => unsafe { v.u16_val }.hash(state),
+                    ValueTag::U32 => unsafe { v.u32_val }.hash(state),
+                    ValueTag::U64 => unsafe { v.u64_val }.hash(state),
+                    ValueTag::U128 => unsafe { v.u128_val }.hash(state),
+                    ValueTag::Isize => unsafe { v.isize_val }.hash(state),
+                    ValueTag::Usize => unsafe { v.usize_val }.hash(state),
+                    ValueTag::F16 => unsafe { v.f16_val }.hash(state),
+                    ValueTag::F32 => unsafe { v.f32_val }.to_bits().hash(state),
+                    ValueTag::F64 => unsafe { v.f64_val }.to_bits().hash(state),
+                    ValueTag::F128 => unsafe { v.f128_val }.hash(state),
+                    _ => unreachable!("non-scalar tag {:?} in ScalarValue", tag),
                 }
             }
             Value::Ref(r) => (Arc::as_ptr(r) as usize).hash(state),
@@ -2525,24 +2539,25 @@ impl ValueArena {
             Value::Void => ValueHandle::VOID,
             Value::Scalar(sv, tag) => unsafe {
                 match tag {
-                    ScalarTag::Bool => if sv.bool_val { ValueHandle::TRUE } else { ValueHandle::FALSE },
-                    ScalarTag::Char => self.alloc_char(sv.char_val),
-                    ScalarTag::I8 => self.alloc_i8(sv.i8_val),
-                    ScalarTag::I16 => self.alloc_i16(sv.i16_val),
-                    ScalarTag::I32 => self.alloc_i32(sv.i32_val),
-                    ScalarTag::I64 => self.alloc_i64(sv.i64_val),
-                    ScalarTag::U8 => self.alloc_u8(sv.u8_val),
-                    ScalarTag::U16 => self.alloc_u16(sv.u16_val),
-                    ScalarTag::U32 => self.alloc_u32(sv.u32_val),
-                    ScalarTag::U64 => self.alloc_u64(sv.u64_val),
-                    ScalarTag::Isize => self.alloc_isize(sv.isize_val),
-                    ScalarTag::Usize => self.alloc_usize(sv.usize_val),
-                    ScalarTag::I128 => self.alloc_i128(i128::from_ne_bytes(std::mem::transmute(sv.i128_val))),
-                    ScalarTag::U128 => self.alloc_u128(u128::from_ne_bytes(std::mem::transmute(sv.u128_val))),
-                    ScalarTag::F16 => self.alloc_f16(sv.f16_val),
-                    ScalarTag::F32 => self.alloc_f32(sv.f32_val),
-                    ScalarTag::F64 => self.alloc_f64(sv.f64_val),
-                    ScalarTag::F128 => self.alloc_f128(F128(std::mem::transmute(sv.f128_val))),
+                    ValueTag::Bool => if sv.bool_val { ValueHandle::TRUE } else { ValueHandle::FALSE },
+                    ValueTag::Char => self.alloc_char(sv.char_val),
+                    ValueTag::I8 => self.alloc_i8(sv.i8_val),
+                    ValueTag::I16 => self.alloc_i16(sv.i16_val),
+                    ValueTag::I32 => self.alloc_i32(sv.i32_val),
+                    ValueTag::I64 => self.alloc_i64(sv.i64_val),
+                    ValueTag::U8 => self.alloc_u8(sv.u8_val),
+                    ValueTag::U16 => self.alloc_u16(sv.u16_val),
+                    ValueTag::U32 => self.alloc_u32(sv.u32_val),
+                    ValueTag::U64 => self.alloc_u64(sv.u64_val),
+                    ValueTag::Isize => self.alloc_isize(sv.isize_val),
+                    ValueTag::Usize => self.alloc_usize(sv.usize_val),
+                    ValueTag::I128 => self.alloc_i128(i128::from_ne_bytes(std::mem::transmute(sv.i128_val))),
+                    ValueTag::U128 => self.alloc_u128(u128::from_ne_bytes(std::mem::transmute(sv.u128_val))),
+                    ValueTag::F16 => self.alloc_f16(sv.f16_val),
+                    ValueTag::F32 => self.alloc_f32(sv.f32_val),
+                    ValueTag::F64 => self.alloc_f64(sv.f64_val),
+                    ValueTag::F128 => self.alloc_f128(F128(std::mem::transmute(sv.f128_val))),
+                    _ => unreachable!("non-scalar tag {:?} in ScalarValue", tag),
                 }
             },
             Value::Ref(r) => self.alloc_ref_rc(r.clone()),
@@ -2746,18 +2761,18 @@ impl ValueArena {
             return;
         }
         arr.scalar_soa = Some(match tag {
-            ScalarTag::I8 => ScalarSoA::I8(arr.elements.iter().map(|h| h.as_i8()).collect()),
-            ScalarTag::I16 => ScalarSoA::I16(arr.elements.iter().map(|h| h.as_i16()).collect()),
-            ScalarTag::I32 => ScalarSoA::I32(arr.elements.iter().map(|h| h.as_i32()).collect()),
-            ScalarTag::I64 => ScalarSoA::I64(arr.elements.iter().map(|h| h.as_i64()).collect()),
-            ScalarTag::U8 => ScalarSoA::U8(arr.elements.iter().map(|h| h.as_u8()).collect()),
-            ScalarTag::U16 => ScalarSoA::U16(arr.elements.iter().map(|h| h.as_u16()).collect()),
-            ScalarTag::U32 => ScalarSoA::U32(arr.elements.iter().map(|h| h.as_u32()).collect()),
-            ScalarTag::U64 => ScalarSoA::U64(arr.elements.iter().map(|h| h.as_u64()).collect()),
-            ScalarTag::Bool => ScalarSoA::Bool(arr.elements.iter().map(|h| h.as_bool()).collect()),
-            ScalarTag::Char => ScalarSoA::Char(arr.elements.iter().map(|h| h.as_char() as u32).collect()),
-            ScalarTag::F32 => ScalarSoA::F32(arr.elements.iter().map(|h| h.as_f32()).collect()),
-            ScalarTag::F64 => ScalarSoA::F64(arr.elements.iter().map(|h| h.as_f64()).collect()),
+            ValueTag::I8 => ScalarSoA::I8(arr.elements.iter().map(|h| h.as_i8()).collect()),
+            ValueTag::I16 => ScalarSoA::I16(arr.elements.iter().map(|h| h.as_i16()).collect()),
+            ValueTag::I32 => ScalarSoA::I32(arr.elements.iter().map(|h| h.as_i32()).collect()),
+            ValueTag::I64 => ScalarSoA::I64(arr.elements.iter().map(|h| h.as_i64()).collect()),
+            ValueTag::U8 => ScalarSoA::U8(arr.elements.iter().map(|h| h.as_u8()).collect()),
+            ValueTag::U16 => ScalarSoA::U16(arr.elements.iter().map(|h| h.as_u16()).collect()),
+            ValueTag::U32 => ScalarSoA::U32(arr.elements.iter().map(|h| h.as_u32()).collect()),
+            ValueTag::U64 => ScalarSoA::U64(arr.elements.iter().map(|h| h.as_u64()).collect()),
+            ValueTag::Bool => ScalarSoA::Bool(arr.elements.iter().map(|h| h.as_bool()).collect()),
+            ValueTag::Char => ScalarSoA::Char(arr.elements.iter().map(|h| h.as_char() as u32).collect()),
+            ValueTag::F32 => ScalarSoA::F32(arr.elements.iter().map(|h| h.as_f32()).collect()),
+            ValueTag::F64 => ScalarSoA::F64(arr.elements.iter().map(|h| h.as_f64()).collect()),
             _ => return,
         });
     }
@@ -3839,24 +3854,25 @@ pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool
             // 注意：match arm 体以 unsafe{} 开头时，Rust 将其解析为「表达式块」并视作整条 arm 体，
             // 后续 `==` 会被当作下一条 arm 的模式。必须用括号包裹比较表达式。
             match at {
-                ScalarTag::Bool => (unsafe { av.bool_val } == unsafe { bv.bool_val }),
-                ScalarTag::Char => (unsafe { av.char_val } == unsafe { bv.char_val }),
-                ScalarTag::I8 => (unsafe { av.i8_val } == unsafe { bv.i8_val }),
-                ScalarTag::I16 => (unsafe { av.i16_val } == unsafe { bv.i16_val }),
-                ScalarTag::I32 => (unsafe { av.i32_val } == unsafe { bv.i32_val }),
-                ScalarTag::I64 => (unsafe { av.i64_val } == unsafe { bv.i64_val }),
-                ScalarTag::I128 => (unsafe { av.i128_val } == unsafe { bv.i128_val }),
-                ScalarTag::U8 => (unsafe { av.u8_val } == unsafe { bv.u8_val }),
-                ScalarTag::U16 => (unsafe { av.u16_val } == unsafe { bv.u16_val }),
-                ScalarTag::U32 => (unsafe { av.u32_val } == unsafe { bv.u32_val }),
-                ScalarTag::U64 => (unsafe { av.u64_val } == unsafe { bv.u64_val }),
-                ScalarTag::U128 => (unsafe { av.u128_val } == unsafe { bv.u128_val }),
-                ScalarTag::Isize => (unsafe { av.isize_val } == unsafe { bv.isize_val }),
-                ScalarTag::Usize => (unsafe { av.usize_val } == unsafe { bv.usize_val }),
-                ScalarTag::F16 => (unsafe { av.f16_val } == unsafe { bv.f16_val }),
-                ScalarTag::F32 => unsafe { av.f32_val }.to_bits() == unsafe { bv.f32_val }.to_bits(),
-                ScalarTag::F64 => unsafe { av.f64_val }.to_bits() == unsafe { bv.f64_val }.to_bits(),
-                ScalarTag::F128 => (unsafe { av.f128_val } == unsafe { bv.f128_val }),
+                ValueTag::Bool => (unsafe { av.bool_val } == unsafe { bv.bool_val }),
+                ValueTag::Char => (unsafe { av.char_val } == unsafe { bv.char_val }),
+                ValueTag::I8 => (unsafe { av.i8_val } == unsafe { bv.i8_val }),
+                ValueTag::I16 => (unsafe { av.i16_val } == unsafe { bv.i16_val }),
+                ValueTag::I32 => (unsafe { av.i32_val } == unsafe { bv.i32_val }),
+                ValueTag::I64 => (unsafe { av.i64_val } == unsafe { bv.i64_val }),
+                ValueTag::I128 => (unsafe { av.i128_val } == unsafe { bv.i128_val }),
+                ValueTag::U8 => (unsafe { av.u8_val } == unsafe { bv.u8_val }),
+                ValueTag::U16 => (unsafe { av.u16_val } == unsafe { bv.u16_val }),
+                ValueTag::U32 => (unsafe { av.u32_val } == unsafe { bv.u32_val }),
+                ValueTag::U64 => (unsafe { av.u64_val } == unsafe { bv.u64_val }),
+                ValueTag::U128 => (unsafe { av.u128_val } == unsafe { bv.u128_val }),
+                ValueTag::Isize => (unsafe { av.isize_val } == unsafe { bv.isize_val }),
+                ValueTag::Usize => (unsafe { av.usize_val } == unsafe { bv.usize_val }),
+                ValueTag::F16 => (unsafe { av.f16_val } == unsafe { bv.f16_val }),
+                ValueTag::F32 => unsafe { av.f32_val }.to_bits() == unsafe { bv.f32_val }.to_bits(),
+                ValueTag::F64 => unsafe { av.f64_val }.to_bits() == unsafe { bv.f64_val }.to_bits(),
+                ValueTag::F128 => (unsafe { av.f128_val } == unsafe { bv.f128_val }),
+                _ => unreachable!("non-scalar tag in ScalarValue"),
             }
         }
         (Value::Ref(ax), Value::Ref(bx)) => heap_equals(ax.as_ref(), bx.as_ref(), arena),

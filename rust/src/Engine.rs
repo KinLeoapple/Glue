@@ -1092,7 +1092,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         "__reflect_size" => {
             let v = frame.get_value_by_global(inputs[0]);
             let size: u8 = match &v {
-                Value::Scalar(_, tag) => tag.byte_width(),
+                Value::Scalar(_, tag) => tag.byte_width() as u8,
                 _ => 0,
             };
             Value::u8(size)
@@ -1290,7 +1290,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         "__reflect_size" => {
             let v = frame.get_value_by_global(inputs[0]);
             let size: u8 = match &v {
-                Value::Scalar(_, tag) => tag.byte_width(),
+                Value::Scalar(_, tag) => tag.byte_width() as u8,
                 _ => 0,
             };
             Value::u8(size)
@@ -1878,7 +1878,7 @@ pub fn compute_ge_str(frame: &mut Frame, node: NodeId) -> Value {
 ///   - Void → "void"
 ///   - 其他 Ref → "<non-scalar>"
 pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, GlueStr, ScalarTag};
+    use crate::Value::{HeapObj, GlueStr, ValueTag};
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
 
@@ -1887,13 +1887,13 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
         Value::Void => TYPE_NAME_VOID.to_string(),
         Value::Scalar(_, tag) => {
             match tag {
-                ScalarTag::Bool => val.as_bool().to_string(),
-                ScalarTag::Char => {
+                ValueTag::Bool => val.as_bool().to_string(),
+                ValueTag::Char => {
                     let c = val.as_char();
                     let mut buf = [0u8; 4];
                     c.encode_utf8(&mut buf).to_string()
                 }
-                ScalarTag::F16 | ScalarTag::F32 | ScalarTag::F64 | ScalarTag::F128 => {
+                ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128 => {
                     val.as_float_f64().to_string()
                 }
                 // 所有整数类型
@@ -1912,16 +1912,16 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
 ///
 /// 输入：源值节点。元数据：目标类型名（graph.cast_target_types）。
 /// 覆盖所有标量互转：int↔int（截断/扩展）、int↔float、float↔float、bool→int、char→int。
-/// 目标类型从 cast_target_types 元数据读取，按 ScalarTag 分派构造对应 Value。
+/// 目标类型从 cast_target_types 元数据读取，按 ValueTag 分派构造对应 Value。
 pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::ScalarTag;
+    use crate::Value::ValueTag;
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
     let target_ty = graph.cast_target_types[node.0 as usize]
         .as_ref()
         .expect("cast_scalar node has no target type");
 
-    let target_tag = match ScalarTag::from_name(target_ty) {
+    let target_tag = match ValueTag::from_name(target_ty) {
         Some(tag) => tag,
         // 未知目标类型：safe cast 返回 Null，否则返回 Void
         None => {
@@ -1936,30 +1936,31 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
     // 源值是否为浮点
     let src_is_float = matches!(
         &val,
-        Value::Scalar(_, ScalarTag::F16 | ScalarTag::F32 | ScalarTag::F64 | ScalarTag::F128)
+        Value::Scalar(_, ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128)
     );
     // 统一读取源值为 f64：浮点用 as_float_f64，整数用 as_int_i128 as f64
     let src_f64 = if src_is_float { val.as_float_f64() } else { val.as_int_i128() as f64 };
 
     match target_tag {
-        ScalarTag::I8 => Value::i8(if src_is_float { src_f64 as i8 } else { val.as_i8() }),
-        ScalarTag::I16 => Value::i16(if src_is_float { src_f64 as i16 } else { val.as_i16() }),
-        ScalarTag::I32 => Value::i32(if src_is_float { src_f64 as i32 } else { val.as_i32() }),
-        ScalarTag::I64 => Value::i64(if src_is_float { src_f64 as i64 } else { val.as_i64() }),
-        ScalarTag::I128 => Value::i128(if src_is_float { src_f64 as i128 } else { val.as_i128() }),
-        ScalarTag::U8 => Value::u8(if src_is_float { src_f64 as u8 } else { val.as_u8() }),
-        ScalarTag::U16 => Value::u16(if src_is_float { src_f64 as u16 } else { val.as_u16() }),
-        ScalarTag::U32 => Value::u32(if src_is_float { src_f64 as u32 } else { val.as_u32() }),
-        ScalarTag::U64 => Value::u64(if src_is_float { src_f64 as u64 } else { val.as_u64() }),
-        ScalarTag::U128 => Value::u128(if src_is_float { src_f64 as u128 } else { val.as_u128() }),
-        ScalarTag::Isize => Value::isize_val(if src_is_float { src_f64 as isize } else { val.as_isize() }),
-        ScalarTag::Usize => Value::usize_val(if src_is_float { src_f64 as usize } else { val.as_usize() }),
-        ScalarTag::F16 => Value::f16(crate::Value::F16::from_f64(src_f64)),
-        ScalarTag::F32 => Value::f32(src_f64 as f32),
-        ScalarTag::F64 => Value::f64(src_f64),
-        ScalarTag::F128 => Value::f128(crate::Value::F128::from_f64(src_f64)),
-        ScalarTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
-        ScalarTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
+        ValueTag::I8 => Value::i8(if src_is_float { src_f64 as i8 } else { val.as_i8() }),
+        ValueTag::I16 => Value::i16(if src_is_float { src_f64 as i16 } else { val.as_i16() }),
+        ValueTag::I32 => Value::i32(if src_is_float { src_f64 as i32 } else { val.as_i32() }),
+        ValueTag::I64 => Value::i64(if src_is_float { src_f64 as i64 } else { val.as_i64() }),
+        ValueTag::I128 => Value::i128(if src_is_float { src_f64 as i128 } else { val.as_i128() }),
+        ValueTag::U8 => Value::u8(if src_is_float { src_f64 as u8 } else { val.as_u8() }),
+        ValueTag::U16 => Value::u16(if src_is_float { src_f64 as u16 } else { val.as_u16() }),
+        ValueTag::U32 => Value::u32(if src_is_float { src_f64 as u32 } else { val.as_u32() }),
+        ValueTag::U64 => Value::u64(if src_is_float { src_f64 as u64 } else { val.as_u64() }),
+        ValueTag::U128 => Value::u128(if src_is_float { src_f64 as u128 } else { val.as_u128() }),
+        ValueTag::Isize => Value::isize_val(if src_is_float { src_f64 as isize } else { val.as_isize() }),
+        ValueTag::Usize => Value::usize_val(if src_is_float { src_f64 as usize } else { val.as_usize() }),
+        ValueTag::F16 => Value::f16(crate::Value::F16::from_f64(src_f64)),
+        ValueTag::F32 => Value::f32(src_f64 as f32),
+        ValueTag::F64 => Value::f64(src_f64),
+        ValueTag::F128 => Value::f128(crate::Value::F128::from_f64(src_f64)),
+        ValueTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
+        ValueTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
+        _ => unreachable!("non-scalar target_tag {:?} in cast", target_tag),
     }
 }
 
@@ -3301,7 +3302,7 @@ macro_rules! exec_unary_batch {
     }};
 }
 
-/// 处理一批同质批量化节点（相同 ScalarTag + BatchOp），使用 SIMD/rayon 批算。
+/// 处理一批同质批量化节点（相同 ValueTag + BatchOp），使用 SIMD/rayon 批算。
 ///
 /// 从 value_table 提取输入到连续 typed 数组，调用 Value.rs 的 batch 函数，
 /// 写回结果并通知下游。仅适用于 BinOp/UnOp/Cmp 标量运算节点。
@@ -3312,7 +3313,7 @@ fn process_batch_group(
     node_start: NodeId,
     info: BatchInfo,
 ) -> bool {
-    use crate::Value::{ScalarTag, BinOp, CmpOp, UnaryOp};
+    use crate::Value::{ValueTag, BinOp, CmpOp, UnaryOp};
     let _ = (BinOp::Add, CmpOp::Eq, UnaryOp::Neg); // 抑制 unused import
 
     if locals.is_empty() { return false; }
@@ -3320,56 +3321,56 @@ fn process_batch_group(
     match info {
         BatchInfo { tag, op: BatchOp::Bin(op) } => {
             match tag {
-                ScalarTag::I32 => exec_bin_batch!(frame, graph, locals, node_start, i32, i32, as_i32, batch_binop_i32, op),
-                ScalarTag::I64 => exec_bin_batch!(frame, graph, locals, node_start, i64, i64, as_i64, batch_binop_i64, op),
-                ScalarTag::F32 => exec_bin_batch!(frame, graph, locals, node_start, f32, f32, as_f32, batch_binop_f32, op),
-                ScalarTag::F64 => exec_bin_batch!(frame, graph, locals, node_start, f64, f64, as_f64, batch_binop_f64, op),
-                ScalarTag::I8 => exec_bin_batch!(frame, graph, locals, node_start, i8, i8, as_i8, batch_binop, op),
-                ScalarTag::I16 => exec_bin_batch!(frame, graph, locals, node_start, i16, i16, as_i16, batch_binop, op),
-                ScalarTag::U8 => exec_bin_batch!(frame, graph, locals, node_start, u8, u8, as_u8, batch_binop, op),
-                ScalarTag::U16 => exec_bin_batch!(frame, graph, locals, node_start, u16, u16, as_u16, batch_binop, op),
-                ScalarTag::U32 => exec_bin_batch!(frame, graph, locals, node_start, u32, u32, as_u32, batch_binop, op),
-                ScalarTag::U64 => exec_bin_batch!(frame, graph, locals, node_start, u64, u64, as_u64, batch_binop, op),
-                ScalarTag::I128 => exec_bin_batch!(frame, graph, locals, node_start, i128, i128, as_i128, batch_binop, op),
-                ScalarTag::U128 => exec_bin_batch!(frame, graph, locals, node_start, u128, u128, as_u128, batch_binop, op),
-                ScalarTag::Isize => exec_bin_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, batch_binop, op),
-                ScalarTag::Usize => exec_bin_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, batch_binop, op),
+                ValueTag::I32 => exec_bin_batch!(frame, graph, locals, node_start, i32, i32, as_i32, batch_binop_i32, op),
+                ValueTag::I64 => exec_bin_batch!(frame, graph, locals, node_start, i64, i64, as_i64, batch_binop_i64, op),
+                ValueTag::F32 => exec_bin_batch!(frame, graph, locals, node_start, f32, f32, as_f32, batch_binop_f32, op),
+                ValueTag::F64 => exec_bin_batch!(frame, graph, locals, node_start, f64, f64, as_f64, batch_binop_f64, op),
+                ValueTag::I8 => exec_bin_batch!(frame, graph, locals, node_start, i8, i8, as_i8, batch_binop, op),
+                ValueTag::I16 => exec_bin_batch!(frame, graph, locals, node_start, i16, i16, as_i16, batch_binop, op),
+                ValueTag::U8 => exec_bin_batch!(frame, graph, locals, node_start, u8, u8, as_u8, batch_binop, op),
+                ValueTag::U16 => exec_bin_batch!(frame, graph, locals, node_start, u16, u16, as_u16, batch_binop, op),
+                ValueTag::U32 => exec_bin_batch!(frame, graph, locals, node_start, u32, u32, as_u32, batch_binop, op),
+                ValueTag::U64 => exec_bin_batch!(frame, graph, locals, node_start, u64, u64, as_u64, batch_binop, op),
+                ValueTag::I128 => exec_bin_batch!(frame, graph, locals, node_start, i128, i128, as_i128, batch_binop, op),
+                ValueTag::U128 => exec_bin_batch!(frame, graph, locals, node_start, u128, u128, as_u128, batch_binop, op),
+                ValueTag::Isize => exec_bin_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, batch_binop, op),
+                ValueTag::Usize => exec_bin_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, batch_binop, op),
                 _ => return false, // F16/F128/Bool/Char → 不支持，回退到单节点路径
             }
         }
         BatchInfo { tag, op: BatchOp::Cmp(op) } => {
             match tag {
-                ScalarTag::F32 => exec_cmp_batch!(frame, graph, locals, node_start, f32, as_f32, batch_cmp_f32, op),
-                ScalarTag::F64 => exec_cmp_batch!(frame, graph, locals, node_start, f64, as_f64, batch_cmp_f64, op),
-                ScalarTag::I32 => exec_cmp_batch!(frame, graph, locals, node_start, i32, as_i32, batch_cmp, op),
-                ScalarTag::I64 => exec_cmp_batch!(frame, graph, locals, node_start, i64, as_i64, batch_cmp, op),
-                ScalarTag::I8 => exec_cmp_batch!(frame, graph, locals, node_start, i8, as_i8, batch_cmp, op),
-                ScalarTag::I16 => exec_cmp_batch!(frame, graph, locals, node_start, i16, as_i16, batch_cmp, op),
-                ScalarTag::U8 => exec_cmp_batch!(frame, graph, locals, node_start, u8, as_u8, batch_cmp, op),
-                ScalarTag::U16 => exec_cmp_batch!(frame, graph, locals, node_start, u16, as_u16, batch_cmp, op),
-                ScalarTag::U32 => exec_cmp_batch!(frame, graph, locals, node_start, u32, as_u32, batch_cmp, op),
-                ScalarTag::U64 => exec_cmp_batch!(frame, graph, locals, node_start, u64, as_u64, batch_cmp, op),
-                ScalarTag::I128 => exec_cmp_batch!(frame, graph, locals, node_start, i128, as_i128, batch_cmp, op),
-                ScalarTag::U128 => exec_cmp_batch!(frame, graph, locals, node_start, u128, as_u128, batch_cmp, op),
-                ScalarTag::Isize => exec_cmp_batch!(frame, graph, locals, node_start, isize, as_isize, batch_cmp, op),
-                ScalarTag::Usize => exec_cmp_batch!(frame, graph, locals, node_start, usize, as_usize, batch_cmp, op),
+                ValueTag::F32 => exec_cmp_batch!(frame, graph, locals, node_start, f32, as_f32, batch_cmp_f32, op),
+                ValueTag::F64 => exec_cmp_batch!(frame, graph, locals, node_start, f64, as_f64, batch_cmp_f64, op),
+                ValueTag::I32 => exec_cmp_batch!(frame, graph, locals, node_start, i32, as_i32, batch_cmp, op),
+                ValueTag::I64 => exec_cmp_batch!(frame, graph, locals, node_start, i64, as_i64, batch_cmp, op),
+                ValueTag::I8 => exec_cmp_batch!(frame, graph, locals, node_start, i8, as_i8, batch_cmp, op),
+                ValueTag::I16 => exec_cmp_batch!(frame, graph, locals, node_start, i16, as_i16, batch_cmp, op),
+                ValueTag::U8 => exec_cmp_batch!(frame, graph, locals, node_start, u8, as_u8, batch_cmp, op),
+                ValueTag::U16 => exec_cmp_batch!(frame, graph, locals, node_start, u16, as_u16, batch_cmp, op),
+                ValueTag::U32 => exec_cmp_batch!(frame, graph, locals, node_start, u32, as_u32, batch_cmp, op),
+                ValueTag::U64 => exec_cmp_batch!(frame, graph, locals, node_start, u64, as_u64, batch_cmp, op),
+                ValueTag::I128 => exec_cmp_batch!(frame, graph, locals, node_start, i128, as_i128, batch_cmp, op),
+                ValueTag::U128 => exec_cmp_batch!(frame, graph, locals, node_start, u128, as_u128, batch_cmp, op),
+                ValueTag::Isize => exec_cmp_batch!(frame, graph, locals, node_start, isize, as_isize, batch_cmp, op),
+                ValueTag::Usize => exec_cmp_batch!(frame, graph, locals, node_start, usize, as_usize, batch_cmp, op),
                 _ => return false, // F16/F128/Bool/Char → 不支持，回退到单节点路径
             }
         }
         BatchInfo { tag, op: BatchOp::Unary(op) } => {
             match tag {
-                ScalarTag::I32 => exec_unary_batch!(frame, graph, locals, node_start, i32, i32, as_i32, op),
-                ScalarTag::I64 => exec_unary_batch!(frame, graph, locals, node_start, i64, i64, as_i64, op),
-                ScalarTag::I8 => exec_unary_batch!(frame, graph, locals, node_start, i8, i8, as_i8, op),
-                ScalarTag::I16 => exec_unary_batch!(frame, graph, locals, node_start, i16, i16, as_i16, op),
-                ScalarTag::U8 => exec_unary_batch!(frame, graph, locals, node_start, u8, u8, as_u8, op),
-                ScalarTag::U16 => exec_unary_batch!(frame, graph, locals, node_start, u16, u16, as_u16, op),
-                ScalarTag::U32 => exec_unary_batch!(frame, graph, locals, node_start, u32, u32, as_u32, op),
-                ScalarTag::U64 => exec_unary_batch!(frame, graph, locals, node_start, u64, u64, as_u64, op),
-                ScalarTag::I128 => exec_unary_batch!(frame, graph, locals, node_start, i128, i128, as_i128, op),
-                ScalarTag::U128 => exec_unary_batch!(frame, graph, locals, node_start, u128, u128, as_u128, op),
-                ScalarTag::Isize => exec_unary_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, op),
-                ScalarTag::Usize => exec_unary_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, op),
+                ValueTag::I32 => exec_unary_batch!(frame, graph, locals, node_start, i32, i32, as_i32, op),
+                ValueTag::I64 => exec_unary_batch!(frame, graph, locals, node_start, i64, i64, as_i64, op),
+                ValueTag::I8 => exec_unary_batch!(frame, graph, locals, node_start, i8, i8, as_i8, op),
+                ValueTag::I16 => exec_unary_batch!(frame, graph, locals, node_start, i16, i16, as_i16, op),
+                ValueTag::U8 => exec_unary_batch!(frame, graph, locals, node_start, u8, u8, as_u8, op),
+                ValueTag::U16 => exec_unary_batch!(frame, graph, locals, node_start, u16, u16, as_u16, op),
+                ValueTag::U32 => exec_unary_batch!(frame, graph, locals, node_start, u32, u32, as_u32, op),
+                ValueTag::U64 => exec_unary_batch!(frame, graph, locals, node_start, u64, u64, as_u64, op),
+                ValueTag::I128 => exec_unary_batch!(frame, graph, locals, node_start, i128, i128, as_i128, op),
+                ValueTag::U128 => exec_unary_batch!(frame, graph, locals, node_start, u128, u128, as_u128, op),
+                ValueTag::Isize => exec_unary_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, op),
+                ValueTag::Usize => exec_unary_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, op),
                 _ => return false, // F16/F128/F32/F64/Bool/Char → 不支持，回退到单节点路径
             }
         }
@@ -3385,7 +3386,7 @@ fn process_batch_group(
 
 /// 尝试批量化处理就绪队列中的节点。
 ///
-/// drain ready_queue → 按 (ScalarTag, BatchOp) 分组 → 对 2+ 节点的组
+/// drain ready_queue → 按 (ValueTag, BatchOp) 分组 → 对 2+ 节点的组
 /// 调用 process_batch_group 做 SIMD/rayon 批算 → 非批量化节点推回 ready_queue。
 /// 返回 true 表示执行了批处理（调用方应 continue 重新检查新就绪节点）。
 fn try_batch_nodes(frame: &mut Frame, graph: &DataFlowGraph) -> bool {

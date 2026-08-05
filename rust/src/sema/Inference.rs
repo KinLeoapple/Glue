@@ -689,39 +689,18 @@ impl<'a> InferContext<'a> {
                 .current_self_type()
                 .unwrap_or_else(|| self.arena.fresh_type_var()),
             TypeNode::Named { name } => {
-                // 内置标量
-                match *name {
-                    "i8" => self.arena.make(ConcreteType::I8),
-                    "i16" => self.arena.make(ConcreteType::I16),
-                    "i32" => self.arena.make(ConcreteType::I32),
-                    "i64" => self.arena.make(ConcreteType::I64),
-                    "i128" => self.arena.make(ConcreteType::I128),
-                    "u8" => self.arena.make(ConcreteType::U8),
-                    "u16" => self.arena.make(ConcreteType::U16),
-                    "u32" => self.arena.make(ConcreteType::U32),
-                    "u64" => self.arena.make(ConcreteType::U64),
-                    "u128" => self.arena.make(ConcreteType::U128),
-                    "isize" => self.arena.make(ConcreteType::Isize),
-                    "usize" => self.arena.make(ConcreteType::Usize),
-                    "f16" => self.arena.make(ConcreteType::F16),
-                    "f32" => self.arena.make(ConcreteType::F32),
-                    "f64" => self.arena.make(ConcreteType::F64),
-                    "f128" => self.arena.make(ConcreteType::F128),
-                    "bool" => self.arena.make(ConcreteType::Bool),
-                    "str" => self.arena.make(ConcreteType::Str),
-                    "char" => self.arena.make(ConcreteType::Char),
-                    "Null" => self.arena.make(ConcreteType::Null),
-                    "void" => self.arena.make(ConcreteType::Void),
+                // 内置标量 + str/null/void：派生自 BUILTIN_TABLE
+                if let Some(ct) = name_to_concrete(name) {
+                    self.arena.make(ct)
+                } else {
                     // 其他命名类型 → 查 TypeBindingStack 或构造 Adt
-                    other => {
-                        if let Some(ty) = self.lookup_type_binding(other) {
-                            ty
-                        } else {
-                            self.arena.make(ConcreteType::Adt {
-                                name: (*other).into(),
-                                type_args: Box::new([]),
-                            })
-                        }
+                    if let Some(ty) = self.lookup_type_binding(name) {
+                        ty
+                    } else {
+                        self.arena.make(ConcreteType::Adt {
+                            name: (*name).into(),
+                            type_args: Box::new([]),
+                        })
                     }
                 }
             }
@@ -779,30 +758,9 @@ impl<'a> InferContext<'a> {
         if let Some(ty) = self.lookup_type_binding(name) {
             return ty;
         }
-        // 3. 内置标量
-        match name {
-            "i8" => return self.arena.make(ConcreteType::I8),
-            "i16" => return self.arena.make(ConcreteType::I16),
-            "i32" => return self.arena.make(ConcreteType::I32),
-            "i64" => return self.arena.make(ConcreteType::I64),
-            "i128" => return self.arena.make(ConcreteType::I128),
-            "u8" => return self.arena.make(ConcreteType::U8),
-            "u16" => return self.arena.make(ConcreteType::U16),
-            "u32" => return self.arena.make(ConcreteType::U32),
-            "u64" => return self.arena.make(ConcreteType::U64),
-            "u128" => return self.arena.make(ConcreteType::U128),
-            "isize" => return self.arena.make(ConcreteType::Isize),
-            "usize" => return self.arena.make(ConcreteType::Usize),
-            "f16" => return self.arena.make(ConcreteType::F16),
-            "f32" => return self.arena.make(ConcreteType::F32),
-            "f64" => return self.arena.make(ConcreteType::F64),
-            "f128" => return self.arena.make(ConcreteType::F128),
-            "bool" => return self.arena.make(ConcreteType::Bool),
-            "str" => return self.arena.make(ConcreteType::Str),
-            "char" => return self.arena.make(ConcreteType::Char),
-            "Null" => return self.arena.make(ConcreteType::Null),
-            "void" => return self.arena.make(ConcreteType::Void),
-            _ => {}
+        // 3. 内置标量 + str/null/void：派生自 BUILTIN_TABLE
+        if let Some(ct) = name_to_concrete(name) {
+            return self.arena.make(ct);
         }
         // 4. trait 定义 → Trait 类型
         if self.sema_result.get_trait_def(name).is_some() {
@@ -2464,21 +2422,23 @@ impl<'a> InferContext<'a> {
         }
     }
 
-    /// 整数后缀 → 对应整型 TypeHandle（委托 `from_scalar_name`，未命中返回 `None`）。
+    /// 整数后缀 → 对应整型 TypeHandle（派生自 `BUILTIN_TABLE`，未命中返回 `None`）。
     fn int_suffix_to_type(&mut self, suffix: &str) -> Option<TypeHandle> {
-        match suffix {
-            "i8" | "i16" | "i32" | "i64" | "i128"
-            | "u8" | "u16" | "u32" | "u64" | "u128"
-            | "isize" | "usize" => Some(self.arena.from_scalar_name(suffix)),
-            _ => None,
+        let tag = crate::Type::ValueTag::from_name(suffix)?;
+        if tag.is_int() {
+            Some(self.arena.from_scalar_name(suffix))
+        } else {
+            None
         }
     }
 
-    /// 浮点后缀 → 对应浮点 TypeHandle（委托 `from_scalar_name`，未命中返回 `None`）。
+    /// 浮点后缀 → 对应浮点 TypeHandle（派生自 `BUILTIN_TABLE`，未命中返回 `None`）。
     fn float_suffix_to_type(&mut self, suffix: &str) -> Option<TypeHandle> {
-        match suffix {
-            "f16" | "f32" | "f64" | "f128" => Some(self.arena.from_scalar_name(suffix)),
-            _ => None,
+        let tag = crate::Type::ValueTag::from_name(suffix)?;
+        if tag.is_float() {
+            Some(self.arena.from_scalar_name(suffix))
+        } else {
+            None
         }
     }
 
@@ -3271,7 +3231,7 @@ impl<'a> InferContext<'a> {
 
         // 数值类型构造器：i8/i16/.../f64 等作为 ∀T. (T) -> Self
         // 用 rigid var 注册，调用时由 instantiate_fn_type 实例化
-        for &(name, ref ct) in NUMERIC_BUILTIN_NAMES {
+        for (name, ct) in numeric_builtin_names() {
             let param = self.arena.fresh_rigid_var();
             let ret_ty = self.make_builtin(ct.clone());
             let fn_ty = self.arena.make(ConcreteType::Fn {
@@ -4113,27 +4073,55 @@ impl<'a> InferContext<'a> {
     }
 }
 
-/// 内置数值类型名与 ConcreteType 的映射表（用于 register_builtins）。
-static NUMERIC_BUILTIN_NAMES: &[(&str, ConcreteType)] = &[
-    ("i8", ConcreteType::I8),
-    ("i16", ConcreteType::I16),
-    ("i32", ConcreteType::I32),
-    ("i64", ConcreteType::I64),
-    ("i128", ConcreteType::I128),
-    ("u8", ConcreteType::U8),
-    ("u16", ConcreteType::U16),
-    ("u32", ConcreteType::U32),
-    ("u64", ConcreteType::U64),
-    ("u128", ConcreteType::U128),
-    ("isize", ConcreteType::Isize),
-    ("usize", ConcreteType::Usize),
-    ("f16", ConcreteType::F16),
-    ("f32", ConcreteType::F32),
-    ("f64", ConcreteType::F64),
-    ("f128", ConcreteType::F128),
-    ("bool", ConcreteType::Bool),
-    ("char", ConcreteType::Char),
-];
+/// 内置标量名 → ConcreteType（单一派生点，替代原三处重复 match）。
+///
+/// 派生自 `Type::BUILTIN_TABLE`：按 name 查 ValueTag，再按 ValueTag 分派 ConcreteType。
+/// ConcreteType 是 sema 层枚举（不下沉到 Type.rs），但 name→ValueTag 映射来自单一真相源。
+///
+/// 类型名统一为小写（与 .glue 源码语法一致）：null/void/bool/char/str 及各数值类型。
+fn name_to_concrete(name: &str) -> Option<ConcreteType> {
+    use crate::Type::{builtin_info_by_name, ValueTag};
+    let info = builtin_info_by_name(name)?;
+    let ct = match info.value_tag {
+        ValueTag::I8 => ConcreteType::I8,
+        ValueTag::I16 => ConcreteType::I16,
+        ValueTag::I32 => ConcreteType::I32,
+        ValueTag::I64 => ConcreteType::I64,
+        ValueTag::I128 => ConcreteType::I128,
+        ValueTag::U8 => ConcreteType::U8,
+        ValueTag::U16 => ConcreteType::U16,
+        ValueTag::U32 => ConcreteType::U32,
+        ValueTag::U64 => ConcreteType::U64,
+        ValueTag::U128 => ConcreteType::U128,
+        ValueTag::Isize => ConcreteType::Isize,
+        ValueTag::Usize => ConcreteType::Usize,
+        ValueTag::F16 => ConcreteType::F16,
+        ValueTag::F32 => ConcreteType::F32,
+        ValueTag::F64 => ConcreteType::F64,
+        ValueTag::F128 => ConcreteType::F128,
+        ValueTag::Bool => ConcreteType::Bool,
+        ValueTag::Char => ConcreteType::Char,
+        ValueTag::Ref => ConcreteType::Str,   // str 的 value_tag 是 Ref
+        ValueTag::Null => ConcreteType::Null,
+        ValueTag::Void => ConcreteType::Void,
+    };
+    Some(ct)
+}
+
+/// 返回所有数值内置类型名 + ConcreteType（派生自 BUILTIN_TABLE）。
+///
+/// 替代原静态 `NUMERIC_BUILTIN_NAMES` 表，自动同步 BUILTIN_TABLE 变更。
+/// 包含所有标量（含 bool/char，与原表一致），排除 str/null/void。
+fn numeric_builtin_names() -> Vec<(&'static str, ConcreteType)> {
+    use crate::Type::{BUILTIN_TABLE, ValueTag};
+    BUILTIN_TABLE.iter()
+        .filter(|s| !matches!(s.value_tag, ValueTag::Ref | ValueTag::Null | ValueTag::Void))
+        .filter_map(|s| {
+            let ct = name_to_concrete(s.name)?;
+            Some((s.name, ct))
+        })
+        .collect()
+}
 
 // =========================================================================
 // sema v2: Constraint Solver — 统一约束求解引擎

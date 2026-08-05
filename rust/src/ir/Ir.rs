@@ -458,7 +458,7 @@ const _: () = assert!(std::mem::size_of::<Node>() == 16);
 /// 批量化运算类型：映射到 Value.rs 的 SIMD/rayon 批算函数。
 ///
 /// 编译期由 compile_binary/compile_unary 设置，运行期 run_ready_nodes 按
-/// (ScalarTag, BatchOp) 分组就绪节点，复用 Value.rs 的 batch_binop/batch_cmp/
+/// (ValueTag, BatchOp) 分组就绪节点，复用 Value.rs 的 batch_binop/batch_cmp/
 /// batch_unaryop 做 SIMD 向量化 + rayon 并行批算，避免逐节点 compute_fn 开销。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatchOp {
@@ -477,7 +477,7 @@ pub enum BatchOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BatchInfo {
     /// 输入/输出的标量类型（决定 SIMD lane 宽度）
-    pub tag: crate::Value::ScalarTag,
+    pub tag: crate::Value::ValueTag,
     /// 运算类型
     pub op: BatchOp,
 }
@@ -717,31 +717,31 @@ impl ConstValue {
 
     /// 从 Value 构造 ConstValue（用于 ConstFold 生成新常量）。
     pub fn from_value(v: &crate::Value::Value) -> Option<ConstValue> {
-        use crate::Value::{ScalarTag, Value};
+        use crate::Value::{ValueTag, Value};
         match v {
             Value::Scalar(sv, tag) => match tag {
-                ScalarTag::I8 => Some(ConstValue::I8(unsafe { sv.i8_val })),
-                ScalarTag::I16 => Some(ConstValue::I16(unsafe { sv.i16_val })),
-                ScalarTag::I32 => Some(ConstValue::I32(unsafe { sv.i32_val })),
-                ScalarTag::I64 => Some(ConstValue::I64(unsafe { sv.i64_val })),
-                ScalarTag::I128 => {
+                ValueTag::I8 => Some(ConstValue::I8(unsafe { sv.i8_val })),
+                ValueTag::I16 => Some(ConstValue::I16(unsafe { sv.i16_val })),
+                ValueTag::I32 => Some(ConstValue::I32(unsafe { sv.i32_val })),
+                ValueTag::I64 => Some(ConstValue::I64(unsafe { sv.i64_val })),
+                ValueTag::I128 => {
                     let bits = unsafe { (sv.i128_val[0] as u128) | ((sv.i128_val[1] as u128) << 64) };
                     Some(ConstValue::I128(bits as i128))
                 }
-                ScalarTag::U8 => Some(ConstValue::U8(unsafe { sv.u8_val })),
-                ScalarTag::U16 => Some(ConstValue::U16(unsafe { sv.u16_val })),
-                ScalarTag::U32 => Some(ConstValue::U32(unsafe { sv.u32_val })),
-                ScalarTag::U64 => Some(ConstValue::U64(unsafe { sv.u64_val })),
-                ScalarTag::U128 => {
+                ValueTag::U8 => Some(ConstValue::U8(unsafe { sv.u8_val })),
+                ValueTag::U16 => Some(ConstValue::U16(unsafe { sv.u16_val })),
+                ValueTag::U32 => Some(ConstValue::U32(unsafe { sv.u32_val })),
+                ValueTag::U64 => Some(ConstValue::U64(unsafe { sv.u64_val })),
+                ValueTag::U128 => {
                     let bits = unsafe { (sv.u128_val[0] as u128) | ((sv.u128_val[1] as u128) << 64) };
                     Some(ConstValue::U128(bits))
                 }
-                ScalarTag::Isize => Some(ConstValue::Isize(unsafe { sv.isize_val })),
-                ScalarTag::Usize => Some(ConstValue::Usize(unsafe { sv.usize_val })),
-                ScalarTag::F32 => Some(ConstValue::F32(unsafe { sv.f32_val })),
-                ScalarTag::F64 => Some(ConstValue::F64(unsafe { sv.f64_val })),
-                ScalarTag::Bool => Some(ConstValue::Bool(unsafe { sv.bool_val })),
-                ScalarTag::Char => Some(ConstValue::Char(unsafe { sv.u32_val })),
+                ValueTag::Isize => Some(ConstValue::Isize(unsafe { sv.isize_val })),
+                ValueTag::Usize => Some(ConstValue::Usize(unsafe { sv.usize_val })),
+                ValueTag::F32 => Some(ConstValue::F32(unsafe { sv.f32_val })),
+                ValueTag::F64 => Some(ConstValue::F64(unsafe { sv.f64_val })),
+                ValueTag::Bool => Some(ConstValue::Bool(unsafe { sv.bool_val })),
+                ValueTag::Char => Some(ConstValue::Char(unsafe { sv.u32_val })),
                 _ => None,
             },
             Value::Null => Some(ConstValue::Null),
@@ -2372,7 +2372,7 @@ pub struct LoopContext {
 /// 1. 注册所有函数为 SubGraph
 
 // =========================================================================
-// SCALAR_META — 标量类型算术元信息（以 ScalarTag 为键，name 从 Value.rs 单点派生）
+// SCALAR_META — 标量类型算术元信息（以 ValueTag 为键，name 从 Value.rs 单点派生）
 // =========================================================================
 //
 // 集中存储每个标量类型的：
@@ -2380,40 +2380,48 @@ pub struct LoopContext {
 //   - family:      比较运算分派族（"i32"/"i64"/"i128"/"float"/"bool"）
 //   - is_float:    是否浮点（决定位运算可用性、neg 偏移量）
 //
-// 类型名 ↔ ScalarTag 的映射由 `Value::ScalarTag::from_name`/`type_name` 单点维护，
+// 类型名 ↔ ValueTag 的映射由 `Value::ValueTag::from_name`/`type_name` 单点维护，
 // 本表不再重复 name 字段。arith_base 必须与 compute_fn_table! 中的索引严格一致。
 
 /// 标量类型算术元信息。
+///
+/// `family` 为 `TypeFamily` 枚举（统一类型族，调用方用 `|` 合并整数变体按位宽分派）。
 pub struct ScalarMeta {
     pub arith_base: u32,
-    pub family: &'static str,
+    pub family: crate::Type::TypeFamily,
     pub is_float: bool,
 }
 
-/// 按 ScalarTag 查询算术元信息（const fn，编译期可求值）。
-pub const fn scalar_meta(tag: crate::Value::ScalarTag) -> Option<ScalarMeta> {
-    use crate::Value::ScalarTag;
+/// 按 ValueTag 查询算术元信息（const fn，编译期可求值）。
+///
+/// `family` 派生自 `ValueTag::family()`（单点维护，不再手写 18 个分支）。
+pub const fn scalar_meta(tag: crate::Value::ValueTag) -> Option<ScalarMeta> {
+    use crate::Value::ValueTag;
+    // family 由 ValueTag::family() 派生（保持单一真相源）
+    let family = tag.family();
     Some(match tag {
         // 整数 12 类型（arith_base 从 92 开始，每 12 个索引）
-        ScalarTag::I8    => ScalarMeta { arith_base: 92,  family: "i32",   is_float: false },
-        ScalarTag::I16   => ScalarMeta { arith_base: 104, family: "i32",   is_float: false },
-        ScalarTag::I32   => ScalarMeta { arith_base: 116, family: "i32",   is_float: false },
-        ScalarTag::I64   => ScalarMeta { arith_base: 128, family: "i64",   is_float: false },
-        ScalarTag::I128  => ScalarMeta { arith_base: 140, family: "i128",  is_float: false },
-        ScalarTag::U8    => ScalarMeta { arith_base: 152, family: "i32",   is_float: false },
-        ScalarTag::U16   => ScalarMeta { arith_base: 164, family: "i32",   is_float: false },
-        ScalarTag::U32   => ScalarMeta { arith_base: 176, family: "i32",   is_float: false },
-        ScalarTag::U64   => ScalarMeta { arith_base: 188, family: "i64",   is_float: false },
-        ScalarTag::U128  => ScalarMeta { arith_base: 200, family: "i128",  is_float: false },
-        ScalarTag::Isize => ScalarMeta { arith_base: 212, family: "i64",   is_float: false },
-        ScalarTag::Usize => ScalarMeta { arith_base: 224, family: "i64",   is_float: false },
+        ValueTag::I8    => ScalarMeta { arith_base: 92,  family, is_float: false },
+        ValueTag::I16   => ScalarMeta { arith_base: 104, family, is_float: false },
+        ValueTag::I32   => ScalarMeta { arith_base: 116, family, is_float: false },
+        ValueTag::I64   => ScalarMeta { arith_base: 128, family, is_float: false },
+        ValueTag::I128  => ScalarMeta { arith_base: 140, family, is_float: false },
+        ValueTag::U8    => ScalarMeta { arith_base: 152, family, is_float: false },
+        ValueTag::U16   => ScalarMeta { arith_base: 164, family, is_float: false },
+        ValueTag::U32   => ScalarMeta { arith_base: 176, family, is_float: false },
+        ValueTag::U64   => ScalarMeta { arith_base: 188, family, is_float: false },
+        ValueTag::U128  => ScalarMeta { arith_base: 200, family, is_float: false },
+        ValueTag::Isize => ScalarMeta { arith_base: 212, family, is_float: false },
+        ValueTag::Usize => ScalarMeta { arith_base: 224, family, is_float: false },
         // 浮点 4 类型（arith_base 从 236 开始，每 6 个索引）
-        ScalarTag::F16   => ScalarMeta { arith_base: 236, family: "float", is_float: true },
-        ScalarTag::F32   => ScalarMeta { arith_base: 242, family: "float", is_float: true },
-        ScalarTag::F64   => ScalarMeta { arith_base: 248, family: "float", is_float: true },
-        ScalarTag::F128  => ScalarMeta { arith_base: 254, family: "float", is_float: true },
+        ValueTag::F16   => ScalarMeta { arith_base: 236, family, is_float: true },
+        ValueTag::F32   => ScalarMeta { arith_base: 242, family, is_float: true },
+        ValueTag::F64   => ScalarMeta { arith_base: 248, family, is_float: true },
+        ValueTag::F128  => ScalarMeta { arith_base: 254, family, is_float: true },
         // 非算术标量类型（bool/char，无 arith_base）
-        ScalarTag::Bool  => ScalarMeta { arith_base: 0,   family: "bool",  is_float: false },
-        ScalarTag::Char  => ScalarMeta { arith_base: 0,   family: "i32",   is_float: false },
+        ValueTag::Bool  => ScalarMeta { arith_base: 0,   family, is_float: false },
+        ValueTag::Char  => ScalarMeta { arith_base: 0,   family, is_float: false },
+        // 非标量 tag：无算术元信息
+        _ => return None,
     })
 }

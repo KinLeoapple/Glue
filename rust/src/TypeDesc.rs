@@ -75,6 +75,47 @@ pub enum IntKind {
     Usize,
 }
 
+impl IntKind {
+    /// 转为对应的 `ValueTag`（派生自枚举变体，单点维护）。
+    #[inline]
+    pub const fn to_value_tag(self) -> crate::Type::ValueTag {
+        match self {
+            IntKind::I8 => crate::Type::ValueTag::I8,
+            IntKind::I16 => crate::Type::ValueTag::I16,
+            IntKind::I32 => crate::Type::ValueTag::I32,
+            IntKind::I64 => crate::Type::ValueTag::I64,
+            IntKind::I128 => crate::Type::ValueTag::I128,
+            IntKind::U8 => crate::Type::ValueTag::U8,
+            IntKind::U16 => crate::Type::ValueTag::U16,
+            IntKind::U32 => crate::Type::ValueTag::U32,
+            IntKind::U64 => crate::Type::ValueTag::U64,
+            IntKind::U128 => crate::Type::ValueTag::U128,
+            IntKind::Isize => crate::Type::ValueTag::Isize,
+            IntKind::Usize => crate::Type::ValueTag::Usize,
+        }
+    }
+
+    /// 从 `ValueTag` 转换（非整数返回 `None`）。
+    #[inline]
+    pub fn from_value_tag(tag: crate::Type::ValueTag) -> Option<Self> {
+        match tag {
+            crate::Type::ValueTag::I8 => Some(IntKind::I8),
+            crate::Type::ValueTag::I16 => Some(IntKind::I16),
+            crate::Type::ValueTag::I32 => Some(IntKind::I32),
+            crate::Type::ValueTag::I64 => Some(IntKind::I64),
+            crate::Type::ValueTag::I128 => Some(IntKind::I128),
+            crate::Type::ValueTag::U8 => Some(IntKind::U8),
+            crate::Type::ValueTag::U16 => Some(IntKind::U16),
+            crate::Type::ValueTag::U32 => Some(IntKind::U32),
+            crate::Type::ValueTag::U64 => Some(IntKind::U64),
+            crate::Type::ValueTag::U128 => Some(IntKind::U128),
+            crate::Type::ValueTag::Isize => Some(IntKind::Isize),
+            crate::Type::ValueTag::Usize => Some(IntKind::Usize),
+            _ => None,
+        }
+    }
+}
+
 /// 浮点种类枚举：覆盖 f16 / f32 / f64 / f128。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatKind {
@@ -82,6 +123,31 @@ pub enum FloatKind {
     F32,
     F64,
     F128,
+}
+
+impl FloatKind {
+    /// 转为对应的 `ValueTag`（派生自枚举变体，单点维护）。
+    #[inline]
+    pub const fn to_value_tag(self) -> crate::Type::ValueTag {
+        match self {
+            FloatKind::F16 => crate::Type::ValueTag::F16,
+            FloatKind::F32 => crate::Type::ValueTag::F32,
+            FloatKind::F64 => crate::Type::ValueTag::F64,
+            FloatKind::F128 => crate::Type::ValueTag::F128,
+        }
+    }
+
+    /// 从 `ValueTag` 转换（非浮点返回 `None`）。
+    #[inline]
+    pub fn from_value_tag(tag: crate::Type::ValueTag) -> Option<Self> {
+        match tag {
+            crate::Type::ValueTag::F16 => Some(FloatKind::F16),
+            crate::Type::ValueTag::F32 => Some(FloatKind::F32),
+            crate::Type::ValueTag::F64 => Some(FloatKind::F64),
+            crate::Type::ValueTag::F128 => Some(FloatKind::F128),
+            _ => None,
+        }
+    }
 }
 
 // =========================================================================
@@ -175,36 +241,18 @@ impl TypeDescriptor {
         matches!(self.type_id, FIRST_FLOAT_TYPE_ID..=LAST_FLOAT_TYPE_ID)
     }
 
-    /// 转换为 `IntKind`，非整数类型返回 `None`。
+    /// 转换为 `IntKind`，非整数类型返回 `None`（派生自 `BUILTIN_TABLE`）。
     #[inline]
     pub fn to_int_kind(&self) -> Option<IntKind> {
-        match self.type_id {
-            1 => Some(IntKind::I8),
-            2 => Some(IntKind::I16),
-            3 => Some(IntKind::I32),
-            4 => Some(IntKind::I64),
-            5 => Some(IntKind::I128),
-            6 => Some(IntKind::U8),
-            7 => Some(IntKind::U16),
-            8 => Some(IntKind::U32),
-            9 => Some(IntKind::U64),
-            10 => Some(IntKind::U128),
-            11 => Some(IntKind::Isize),
-            12 => Some(IntKind::Usize),
-            _ => None,
-        }
+        crate::Type::builtin_info_by_type_id(self.type_id)
+            .and_then(|info| IntKind::from_value_tag(info.value_tag))
     }
 
-    /// 转换为 `FloatKind`，非浮点类型返回 `None`。
+    /// 转换为 `FloatKind`，非浮点类型返回 `None`（派生自 `BUILTIN_TABLE`）。
     #[inline]
     pub fn to_float_kind(&self) -> Option<FloatKind> {
-        match self.type_id {
-            13 => Some(FloatKind::F16),
-            14 => Some(FloatKind::F32),
-            15 => Some(FloatKind::F64),
-            16 => Some(FloatKind::F128),
-            _ => None,
-        }
+        crate::Type::builtin_info_by_type_id(self.type_id)
+            .and_then(|info| FloatKind::from_value_tag(info.value_tag))
     }
 }
 
@@ -1060,63 +1108,62 @@ pub static VOID_DESC: TypeDescriptor = TypeDescriptor {
 // lookup 函数
 // =========================================================================
 
+/// 按 ValueTag 查标量静态描述符（18 个标量）。
+///
+/// 这是 TypeDesc 的固有结构：DESC 常量由 `impl_scalar_ops!` 宏生成，
+/// 无法纯派生自 BUILTIN_TABLE。但此函数将 18 条 match 集中在此一处，
+/// 避免在 `lookup_by_type_id` 中重复硬编码 type_id 数字。
+fn scalar_tag_to_desc(tag: crate::Type::ValueTag) -> &'static TypeDescriptor {
+    use crate::Type::ValueTag;
+    match tag {
+        ValueTag::I8 => &I8_DESC,
+        ValueTag::I16 => &I16_DESC,
+        ValueTag::I32 => &I32_DESC,
+        ValueTag::I64 => &I64_DESC,
+        ValueTag::I128 => &I128_DESC,
+        ValueTag::U8 => &U8_DESC,
+        ValueTag::U16 => &U16_DESC,
+        ValueTag::U32 => &U32_DESC,
+        ValueTag::U64 => &U64_DESC,
+        ValueTag::U128 => &U128_DESC,
+        ValueTag::Isize => &ISIZE_DESC,
+        ValueTag::Usize => &USIZE_DESC,
+        ValueTag::F16 => &F16_DESC,
+        ValueTag::F32 => &F32_DESC,
+        ValueTag::F64 => &F64_DESC,
+        ValueTag::F128 => &F128_DESC,
+        ValueTag::Bool => &BOOL_DESC,
+        ValueTag::Char => &CHAR_DESC,
+        _ => unreachable!("non-scalar tag {:?} has no TypeDescriptor", tag),
+    }
+}
+
 /// 按 `type_id` 查找静态类型描述符（1..=21），未命中返回 `None`。
+///
+/// type_id 1..=18 走 BUILTIN_TABLE → scalar_tag_to_desc 派生；
+/// type_id 19/20/21（str/null/void）直接返回静态描述符。
 #[inline]
 pub fn lookup_by_type_id(type_id: u16) -> Option<&'static TypeDescriptor> {
-    match type_id {
-        1 => Some(&I8_DESC),
-        2 => Some(&I16_DESC),
-        3 => Some(&I32_DESC),
-        4 => Some(&I64_DESC),
-        5 => Some(&I128_DESC),
-        6 => Some(&U8_DESC),
-        7 => Some(&U16_DESC),
-        8 => Some(&U32_DESC),
-        9 => Some(&U64_DESC),
-        10 => Some(&U128_DESC),
-        11 => Some(&ISIZE_DESC),
-        12 => Some(&USIZE_DESC),
-        13 => Some(&F16_DESC),
-        14 => Some(&F32_DESC),
-        15 => Some(&F64_DESC),
-        16 => Some(&F128_DESC),
-        17 => Some(&BOOL_DESC),
-        18 => Some(&CHAR_DESC),
-        19 => Some(&STR_DESC),
-        20 => Some(&NULL_DESC),
-        21 => Some(&VOID_DESC),
-        _ => None,
+    use crate::Type::builtin_info_by_type_id;
+    let info = builtin_info_by_type_id(type_id)?;
+    match info.name {
+        "str" => Some(&STR_DESC),
+        "null" => Some(&NULL_DESC),
+        "void" => Some(&VOID_DESC),
+        _ => Some(scalar_tag_to_desc(info.value_tag)),
     }
 }
 
-/// 按 `IntKind` 查找对应整数类型描述符。
+/// 按 `IntKind` 查找对应整数类型描述符（通过 `scalar_tag_to_desc` 派生）。
 #[inline]
 pub fn lookup_by_int_kind(kind: IntKind) -> &'static TypeDescriptor {
-    match kind {
-        IntKind::I8 => &I8_DESC,
-        IntKind::I16 => &I16_DESC,
-        IntKind::I32 => &I32_DESC,
-        IntKind::I64 => &I64_DESC,
-        IntKind::I128 => &I128_DESC,
-        IntKind::U8 => &U8_DESC,
-        IntKind::U16 => &U16_DESC,
-        IntKind::U32 => &U32_DESC,
-        IntKind::U64 => &U64_DESC,
-        IntKind::U128 => &U128_DESC,
-        IntKind::Isize => &ISIZE_DESC,
-        IntKind::Usize => &USIZE_DESC,
-    }
+    scalar_tag_to_desc(kind.to_value_tag())
 }
 
-/// 按 `FloatKind` 查找对应浮点类型描述符。
+/// 按 `FloatKind` 查找对应浮点类型描述符（通过 `scalar_tag_to_desc` 派生）。
 #[inline]
 pub fn lookup_by_float_kind(kind: FloatKind) -> &'static TypeDescriptor {
-    match kind {
-        FloatKind::F16 => &F16_DESC,
-        FloatKind::F32 => &F32_DESC,
-        FloatKind::F64 => &F64_DESC,
-        FloatKind::F128 => &F128_DESC,
-    }
+    scalar_tag_to_desc(kind.to_value_tag())
 }
 
 // =========================================================================

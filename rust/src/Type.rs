@@ -9,8 +9,6 @@
 //! 新增内置类型只需在 BUILTIN_TABLE 追加一行；新增类型族只需在
 //! TypeFamily 与 Ty::family() 各加一个变体。
 
-#![allow(dead_code)] // Ty/TypeFamily/BUILTIN_TABLE 此阶段尚未被调用方使用
-
 // =========================================================================
 // 第一部分：类型判别标签（从 Value.rs 移入）
 // =========================================================================
@@ -52,15 +50,10 @@ impl ValueTag {
 }
 
 impl ValueTag {
+    /// 字节宽度（派生自 `BUILTIN_TABLE`，非标量返回 0）。
+    #[inline]
     pub fn byte_width(self) -> usize {
-        match self {
-            ValueTag::Bool | ValueTag::I8 | ValueTag::U8 => 1,
-            ValueTag::I16 | ValueTag::U16 | ValueTag::F16 => 2,
-            ValueTag::Char | ValueTag::I32 | ValueTag::U32 | ValueTag::F32 => 4,
-            ValueTag::I64 | ValueTag::U64 | ValueTag::Isize | ValueTag::Usize | ValueTag::F64 => 8,
-            ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
-            _ => 0,
-        }
+        builtin_info_by_tag(self).map(|i| i.byte_width as usize).unwrap_or(0)
     }
 
     pub fn is_int(self) -> bool {
@@ -95,117 +88,56 @@ impl ValueTag {
         self.is_int() || self.is_float()
     }
 
-    pub fn name(self) -> &'static str {
-        match self {
-            ValueTag::Bool => "bool",
-            ValueTag::Char => "char",
-            ValueTag::I8 => "i8",
-            ValueTag::I16 => "i16",
-            ValueTag::I32 => "i32",
-            ValueTag::I64 => "i64",
-            ValueTag::I128 => "i128",
-            ValueTag::U8 => "u8",
-            ValueTag::U16 => "u16",
-            ValueTag::U32 => "u32",
-            ValueTag::U64 => "u64",
-            ValueTag::U128 => "u128",
-            ValueTag::Isize => "isize",
-            ValueTag::Usize => "usize",
-            ValueTag::F16 => "f16",
-            ValueTag::F32 => "f32",
-            ValueTag::F64 => "f64",
-            ValueTag::F128 => "f128",
-            _ => "unknown",
-        }
-    }
-
-    pub fn all() -> &'static [ValueTag] {
-        &[
-            ValueTag::Bool, ValueTag::Char, ValueTag::I8, ValueTag::I16, ValueTag::I32,
-            ValueTag::I64, ValueTag::I128, ValueTag::U8, ValueTag::U16, ValueTag::U32,
-            ValueTag::U64, ValueTag::U128, ValueTag::Isize, ValueTag::Usize, ValueTag::F16,
-            ValueTag::F32, ValueTag::F64, ValueTag::F128,
-        ]
-    }
-
-    pub fn from_name(name: &str) -> Option<ValueTag> {
-        for tag in Self::all() {
-            if tag.name() == name {
-                return Some(*tag);
-            }
-        }
-        None
-    }
-}
-
-// ---- ScalarTag — 18 种标量标签（用于 ScalarValue union 类型守卫）----
-
-/// 标量类型标签（18 种，用于 ScalarValue union 的类型守卫）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum ScalarTag {
-    Bool, Char,
-    I8, I16, I32, I64, I128,
-    U8, U16, U32, U64, U128,
-    Isize, Usize,
-    F16, F32, F64, F128,
-}
-
-impl ScalarTag {
-    pub fn type_name(self) -> &'static str {
-        match self {
-            ScalarTag::Bool => "bool",
-            ScalarTag::Char => "char",
-            ScalarTag::I8 => "i8",
-            ScalarTag::I16 => "i16",
-            ScalarTag::I32 => "i32",
-            ScalarTag::I64 => "i64",
-            ScalarTag::I128 => "i128",
-            ScalarTag::U8 => "u8",
-            ScalarTag::U16 => "u16",
-            ScalarTag::U32 => "u32",
-            ScalarTag::U64 => "u64",
-            ScalarTag::U128 => "u128",
-            ScalarTag::Isize => "isize",
-            ScalarTag::Usize => "usize",
-            ScalarTag::F16 => "f16",
-            ScalarTag::F32 => "f32",
-            ScalarTag::F64 => "f64",
-            ScalarTag::F128 => "f128",
-        }
-    }
-
-    /// 全部 18 种标量标签（与 `type_name` 单点同步）。
-    pub fn all() -> &'static [ScalarTag] {
-        &[
-            ScalarTag::Bool, ScalarTag::Char,
-            ScalarTag::I8, ScalarTag::I16, ScalarTag::I32, ScalarTag::I64, ScalarTag::I128,
-            ScalarTag::U8, ScalarTag::U16, ScalarTag::U32, ScalarTag::U64, ScalarTag::U128,
-            ScalarTag::Isize, ScalarTag::Usize,
-            ScalarTag::F16, ScalarTag::F32, ScalarTag::F64, ScalarTag::F128,
-        ]
-    }
-
-    /// 类型名 → ScalarTag（反向查找，与 `type_name` 单点同步）。
-    pub fn from_name(name: &str) -> Option<ScalarTag> {
-        for tag in Self::all() {
-            if tag.type_name() == name {
-                return Some(*tag);
-            }
-        }
-        None
-    }
-
-    /// 字节宽度（与 ValueTag::byte_width 单点同步）。
+    /// 类型家族（派生自 ValueTag，供 IR/Sema 层统一分派）。
+    ///
+    /// 调用方用 `matches!` 合并有符号/无符号整数变体即可按位宽分派，
+    /// 保持单一真相源（`TypeFamily`）。
     #[inline]
-    pub fn byte_width(self) -> u8 {
+    pub const fn family(self) -> TypeFamily {
         match self {
-            ScalarTag::Bool | ScalarTag::I8 | ScalarTag::U8 => 1,
-            ScalarTag::I16 | ScalarTag::U16 | ScalarTag::F16 => 2,
-            ScalarTag::Char | ScalarTag::I32 | ScalarTag::U32 | ScalarTag::F32 => 4,
-            ScalarTag::I64 | ScalarTag::U64 | ScalarTag::Isize | ScalarTag::Usize | ScalarTag::F64 => 8,
-            ScalarTag::I128 | ScalarTag::U128 | ScalarTag::F128 => 16,
+            ValueTag::I8 | ValueTag::I16 | ValueTag::I32 => TypeFamily::SignedInt32,
+            ValueTag::I64 | ValueTag::Isize => TypeFamily::SignedInt64,
+            ValueTag::I128 => TypeFamily::SignedInt128,
+            ValueTag::U8 | ValueTag::U16 | ValueTag::U32 => TypeFamily::UnsignedInt32,
+            ValueTag::U64 | ValueTag::Usize => TypeFamily::UnsignedInt64,
+            ValueTag::U128 => TypeFamily::UnsignedInt128,
+            ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128 => TypeFamily::Float,
+            ValueTag::Bool => TypeFamily::Bool,
+            ValueTag::Char => TypeFamily::Char,
+            ValueTag::Ref => TypeFamily::Str, // str 的 ValueTag 是 Ref
+            ValueTag::Null => TypeFamily::Null,
+            ValueTag::Void => TypeFamily::Void,
         }
+    }
+
+    /// 类型名（派生自 `BUILTIN_TABLE`，非标量返回 "unknown"）。
+    #[inline]
+    pub fn name(self) -> &'static str {
+        builtin_info_by_tag(self).map(|i| i.name).unwrap_or("unknown")
+    }
+
+    /// 所有 18 个标量 ValueTag（派生自 `BUILTIN_TABLE`，排除 Null/Void/Ref）。
+    pub fn all() -> &'static [ValueTag] {
+        const SCALAR_TAGS: &[ValueTag] = &[
+            ValueTag::I8, ValueTag::I16, ValueTag::I32, ValueTag::I64, ValueTag::I128,
+            ValueTag::U8, ValueTag::U16, ValueTag::U32, ValueTag::U64, ValueTag::U128,
+            ValueTag::Isize, ValueTag::Usize,
+            ValueTag::F16, ValueTag::F32, ValueTag::F64, ValueTag::F128,
+            ValueTag::Bool, ValueTag::Char,
+        ];
+        SCALAR_TAGS
+    }
+
+    /// 按 name 查 ValueTag（派生自 `BUILTIN_TABLE`）。
+    #[inline]
+    pub fn from_name(name: &str) -> Option<ValueTag> {
+        builtin_info_by_name(name).map(|i| i.value_tag)
+    }
+
+    /// 标量类型名（与 name() 相同，保留此方法名兼容旧调用方）。
+    #[inline]
+    pub fn type_name(self) -> &'static str {
+        self.name()
     }
 }
 
@@ -488,6 +420,61 @@ impl Ty {
             _ => ValueTag::Ref, // 复合类型运行时都是 Ref
         }
     }
+
+    /// 从类型名字符串构造 `Ty`。
+    ///
+    /// 覆盖：
+    /// - 21 个内置类型（标量 + str + null + void）：派生自 `BUILTIN_TABLE`
+    /// - 7 个内置泛型（Throw/Channel/Async/Lazy/Atomic/Sender/Receiver）：
+    ///   裸名识别（如 "Async" / "Async<i32>" 均识别为 `Ty::Async`）
+    /// - 其他：返回 `None`（用户自定义类型由 Sema 层 `type_binding_stack` 解析，
+    ///   不在此函数职责内）
+    ///
+    /// 用于替代 IR 层 `tn.starts_with("Async")` 等前缀匹配。
+    /// 内置泛型的 `TypeHandle` 字段用 `TypeHandle(0)` 占位（`family()` 不读字段值，
+    /// 仅 match 枚举变体，占位安全）。
+    pub fn from_type_name(name: &str) -> Option<Self> {
+        // 1. 内置标量 + str + null + void：派生自 BUILTIN_TABLE
+        if let Some(info) = builtin_info_by_name(name) {
+            return Some(match info.value_tag {
+                ValueTag::I8 => Ty::I8,
+                ValueTag::I16 => Ty::I16,
+                ValueTag::I32 => Ty::I32,
+                ValueTag::I64 => Ty::I64,
+                ValueTag::I128 => Ty::I128,
+                ValueTag::U8 => Ty::U8,
+                ValueTag::U16 => Ty::U16,
+                ValueTag::U32 => Ty::U32,
+                ValueTag::U64 => Ty::U64,
+                ValueTag::U128 => Ty::U128,
+                ValueTag::Isize => Ty::Isize,
+                ValueTag::Usize => Ty::Usize,
+                ValueTag::F16 => Ty::F16,
+                ValueTag::F32 => Ty::F32,
+                ValueTag::F64 => Ty::F64,
+                ValueTag::F128 => Ty::F128,
+                ValueTag::Bool => Ty::Bool,
+                ValueTag::Char => Ty::Char,
+                ValueTag::Ref => Ty::Str,
+                ValueTag::Null => Ty::Null,
+                ValueTag::Void => Ty::Void,
+            });
+        }
+        // 2. 内置泛型：裸名识别（支持 "Async" / "Async<i32>" 两种形式）
+        //    裸名直接比较；带 type_args 的取 `<` 前的部分。
+        let base_name = name.split('<').next().unwrap_or(name);
+        let placeholder = TypeHandle(0);
+        Some(match base_name {
+            "Throw" => Ty::Throw { value: placeholder, error: placeholder },
+            "Channel" => Ty::Channel { elem: placeholder },
+            "Async" => Ty::Async { value: placeholder },
+            "Lazy" => Ty::Lazy { value: placeholder },
+            "Atomic" => Ty::Atomic { elem: placeholder },
+            "Sender" => Ty::Sender { elem: placeholder },
+            "Receiver" => Ty::Receiver { elem: placeholder },
+            _ => return None,
+        })
+    }
 }
 
 // =========================================================================
@@ -505,8 +492,6 @@ pub struct BuiltinInfo {
     pub type_id: u16,
     /// 字节大小（标量: 1/2/4/8/16；str: 8；null/void: 0）
     pub byte_width: u8,
-    /// 字节对齐（标量: == byte_width；str: 8；null/void: 1）
-    pub align: u8,
 }
 
 /// 21 个内置类型的元信息表，按 type_id 升序排列。
@@ -518,30 +503,30 @@ pub struct BuiltinInfo {
 /// - Sema::int_kind_from_name / float_kind_from_name
 pub const BUILTIN_TABLE: &[BuiltinInfo] = &[
     // ---- 整数（1..=12）----
-    BuiltinInfo { name: "i8",    value_tag: ValueTag::I8,    type_id: 1,  byte_width: 1,  align: 1  },
-    BuiltinInfo { name: "i16",   value_tag: ValueTag::I16,   type_id: 2,  byte_width: 2,  align: 2  },
-    BuiltinInfo { name: "i32",   value_tag: ValueTag::I32,   type_id: 3,  byte_width: 4,  align: 4  },
-    BuiltinInfo { name: "i64",   value_tag: ValueTag::I64,   type_id: 4,  byte_width: 8,  align: 8  },
-    BuiltinInfo { name: "i128",  value_tag: ValueTag::I128,  type_id: 5,  byte_width: 16, align: 16 },
-    BuiltinInfo { name: "u8",    value_tag: ValueTag::U8,    type_id: 6,  byte_width: 1,  align: 1  },
-    BuiltinInfo { name: "u16",   value_tag: ValueTag::U16,   type_id: 7,  byte_width: 2,  align: 2  },
-    BuiltinInfo { name: "u32",   value_tag: ValueTag::U32,   type_id: 8,  byte_width: 4,  align: 4  },
-    BuiltinInfo { name: "u64",   value_tag: ValueTag::U64,   type_id: 9,  byte_width: 8,  align: 8  },
-    BuiltinInfo { name: "u128",  value_tag: ValueTag::U128,  type_id: 10, byte_width: 16, align: 16 },
-    BuiltinInfo { name: "isize", value_tag: ValueTag::Isize, type_id: 11, byte_width: 8,  align: 8  },
-    BuiltinInfo { name: "usize", value_tag: ValueTag::Usize, type_id: 12, byte_width: 8,  align: 8  },
+    BuiltinInfo { name: "i8",    value_tag: ValueTag::I8,    type_id: 1,  byte_width: 1  },
+    BuiltinInfo { name: "i16",   value_tag: ValueTag::I16,   type_id: 2,  byte_width: 2  },
+    BuiltinInfo { name: "i32",   value_tag: ValueTag::I32,   type_id: 3,  byte_width: 4  },
+    BuiltinInfo { name: "i64",   value_tag: ValueTag::I64,   type_id: 4,  byte_width: 8  },
+    BuiltinInfo { name: "i128",  value_tag: ValueTag::I128,  type_id: 5,  byte_width: 16 },
+    BuiltinInfo { name: "u8",    value_tag: ValueTag::U8,    type_id: 6,  byte_width: 1  },
+    BuiltinInfo { name: "u16",   value_tag: ValueTag::U16,   type_id: 7,  byte_width: 2  },
+    BuiltinInfo { name: "u32",   value_tag: ValueTag::U32,   type_id: 8,  byte_width: 4  },
+    BuiltinInfo { name: "u64",   value_tag: ValueTag::U64,   type_id: 9,  byte_width: 8  },
+    BuiltinInfo { name: "u128",  value_tag: ValueTag::U128,  type_id: 10, byte_width: 16 },
+    BuiltinInfo { name: "isize", value_tag: ValueTag::Isize, type_id: 11, byte_width: 8  },
+    BuiltinInfo { name: "usize", value_tag: ValueTag::Usize, type_id: 12, byte_width: 8  },
     // ---- 浮点（13..=16）----
-    BuiltinInfo { name: "f16",   value_tag: ValueTag::F16,   type_id: 13, byte_width: 2,  align: 2  },
-    BuiltinInfo { name: "f32",   value_tag: ValueTag::F32,   type_id: 14, byte_width: 4,  align: 4  },
-    BuiltinInfo { name: "f64",   value_tag: ValueTag::F64,   type_id: 15, byte_width: 8,  align: 8  },
-    BuiltinInfo { name: "f128",  value_tag: ValueTag::F128,  type_id: 16, byte_width: 16, align: 16 },
+    BuiltinInfo { name: "f16",   value_tag: ValueTag::F16,   type_id: 13, byte_width: 2  },
+    BuiltinInfo { name: "f32",   value_tag: ValueTag::F32,   type_id: 14, byte_width: 4  },
+    BuiltinInfo { name: "f64",   value_tag: ValueTag::F64,   type_id: 15, byte_width: 8  },
+    BuiltinInfo { name: "f128",  value_tag: ValueTag::F128,  type_id: 16, byte_width: 16 },
     // ---- 非算术标量（17..=18）----
-    BuiltinInfo { name: "bool",  value_tag: ValueTag::Bool,  type_id: 17, byte_width: 1,  align: 1  },
-    BuiltinInfo { name: "char",  value_tag: ValueTag::Char,  type_id: 18, byte_width: 4,  align: 4  },
+    BuiltinInfo { name: "bool",  value_tag: ValueTag::Bool,  type_id: 17, byte_width: 1  },
+    BuiltinInfo { name: "char",  value_tag: ValueTag::Char,  type_id: 18, byte_width: 4  },
     // ---- 非标量内置（19..=21）----
-    BuiltinInfo { name: "str",   value_tag: ValueTag::Ref,   type_id: 19, byte_width: 8,  align: 8  },
-    BuiltinInfo { name: "null",  value_tag: ValueTag::Null,  type_id: 20, byte_width: 0,  align: 1  },
-    BuiltinInfo { name: "void",  value_tag: ValueTag::Void,  type_id: 21, byte_width: 0,  align: 1  },
+    BuiltinInfo { name: "str",   value_tag: ValueTag::Ref,   type_id: 19, byte_width: 8  },
+    BuiltinInfo { name: "null",  value_tag: ValueTag::Null,  type_id: 20, byte_width: 0  },
+    BuiltinInfo { name: "void",  value_tag: ValueTag::Void,  type_id: 21, byte_width: 0  },
 ];
 
 // =========================================================================

@@ -343,7 +343,7 @@ scalar_table! {
     Bool  => Bool,        false, 1,                  0, "bool",  17,
     Char  => Char,        false, 32,                 0, "char",  18,
     Str   => Str,         false, 0,                  0, "str",   19,
-    Null  => Null,        false, 0,                  0, "Null",  20,
+    Null  => Null,        false, 0,                  0, "null",  20,
     Void  => Void,        false, 0,                  0, "void",  21,
 }
 
@@ -2215,65 +2215,52 @@ pub fn is_builtin_generic_type(name: &str) -> bool {
 }
 
 /// 标量名 → IntKind（非整数标量返回 `None`）。
+///
+/// 派生自 `Type::BUILTIN_TABLE`：按 name 查 ValueTag，再按 ValueTag 分派 IntKind。
+/// IntKind 是 sema 层枚举（不下沉到 Type.rs），但 name→ValueTag 映射来自单一真相源。
 pub fn int_kind_from_name(name: &str) -> Option<IntKind> {
-    Some(match name {
-        "i8" => IntKind::I8,
-        "i16" => IntKind::I16,
-        "i32" => IntKind::I32,
-        "i64" => IntKind::I64,
-        "i128" => IntKind::I128,
-        "u8" => IntKind::U8,
-        "u16" => IntKind::U16,
-        "u32" => IntKind::U32,
-        "u64" => IntKind::U64,
-        "u128" => IntKind::U128,
-        "isize" => IntKind::Isize,
-        "usize" => IntKind::Usize,
-        _ => return None,
-    })
+    use crate::Type::{builtin_info_by_name, ValueTag};
+    let info = builtin_info_by_name(name)?;
+    match info.value_tag {
+        ValueTag::I8 => Some(IntKind::I8),
+        ValueTag::I16 => Some(IntKind::I16),
+        ValueTag::I32 => Some(IntKind::I32),
+        ValueTag::I64 => Some(IntKind::I64),
+        ValueTag::I128 => Some(IntKind::I128),
+        ValueTag::U8 => Some(IntKind::U8),
+        ValueTag::U16 => Some(IntKind::U16),
+        ValueTag::U32 => Some(IntKind::U32),
+        ValueTag::U64 => Some(IntKind::U64),
+        ValueTag::U128 => Some(IntKind::U128),
+        ValueTag::Isize => Some(IntKind::Isize),
+        ValueTag::Usize => Some(IntKind::Usize),
+        _ => None,
+    }
 }
 
 /// 标量名 → FloatKind（非浮点标量返回 `None`）。
+///
+/// 派生自 `Type::BUILTIN_TABLE`：按 name 查 ValueTag，再按 ValueTag 分派 FloatKind。
 pub fn float_kind_from_name(name: &str) -> Option<FloatKind> {
-    Some(match name {
-        "f16" => FloatKind::F16,
-        "f32" => FloatKind::F32,
-        "f64" => FloatKind::F64,
-        "f128" => FloatKind::F128,
-        _ => return None,
-    })
+    use crate::Type::{builtin_info_by_name, ValueTag};
+    let info = builtin_info_by_name(name)?;
+    match info.value_tag {
+        ValueTag::F16 => Some(FloatKind::F16),
+        ValueTag::F32 => Some(FloatKind::F32),
+        ValueTag::F64 => Some(FloatKind::F64),
+        ValueTag::F128 => Some(FloatKind::F128),
+        _ => None,
+    }
 }
 
 /// 内置类型名（含标量 + str + null + void）→ TypeDescriptor，未匹配返回 `None`。
 ///
-/// 数据源：TypeDesc.rs 的 `lookup_by_type_id`（type_id 1..=21），单一真相。
-/// 新增标量只需在 TypeDesc.rs 追加描述符并在此追加 name → type_id 映射。
+/// 派生自 `Type::BUILTIN_TABLE`：按 name 查 type_id，委托 `TypeDesc::lookup_by_type_id`。
+/// 新增内置类型只需在 BUILTIN_TABLE 追加一行，此函数自动同步。
 pub fn type_descriptor_from_builtin_name(name: &str) -> Option<&'static TypeDescriptor> {
-    let type_id: u16 = match name {
-        "i8" => 1,
-        "i16" => 2,
-        "i32" => 3,
-        "i64" => 4,
-        "i128" => 5,
-        "u8" => 6,
-        "u16" => 7,
-        "u32" => 8,
-        "u64" => 9,
-        "u128" => 10,
-        "isize" => 11,
-        "usize" => 12,
-        "f16" => 13,
-        "f32" => 14,
-        "f64" => 15,
-        "f128" => 16,
-        "bool" => 17,
-        "char" => 18,
-        "str" => 19,
-        "null" => 20,
-        "void" => 21,
-        _ => return None,
-    };
-    lookup_by_type_id(type_id)
+    use crate::Type::builtin_info_by_name;
+    let info = builtin_info_by_name(name)?;
+    crate::TypeDesc::lookup_by_type_id(info.type_id)
 }
 
 // =========================================================================
