@@ -34,7 +34,7 @@ pub use Strategy::{LockStrategy, Lockable, Single, Multi, QueueHandle};
 pub use AsyncRt::{TimerRuntime, AsyncJoinRuntime};
 
 use crate::ir::Ir::*;
-use crate::Value::{Value, ValueArena};
+use crate::value::{Value, ValueArena};
 use std::cell::RefCell;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use hashbrown::HashMap;

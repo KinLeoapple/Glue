@@ -1501,7 +1501,7 @@ fn resolve_stmt<'a, 'b>(stmt: StmtId, ctx: &mut ResolveCtx<'a, 'b>, arena: &mut 
             if is_non_iterator {
                 ctx.sema_result.add_error(SemaError::new(
                     &format!(
-                        "类型 '{}' 未实现 Iterator，For 循环要求迭代器类型。数组请用 arr.iter()，字符串请用 str_iter(s)",
+                        "type '{}' does not implement Iterator; For loops require an iterator type. Use arr.iter() for arrays, str_iter(s) for strings",
                         iter_type_name
                     ),
                     span.line,

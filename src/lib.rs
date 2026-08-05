@@ -4,13 +4,9 @@ pub mod ast;
 
 pub mod types;
 
-#[path = "Value.rs"]
-pub mod Value;
+pub mod value;
 
 pub mod sema;
-
-#[path = "Reflect.rs"]
-pub mod Reflect;
 
 pub mod ffi;
 

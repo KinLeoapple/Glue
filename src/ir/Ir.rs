@@ -16,7 +16,7 @@
 //! - 值表槽使用 Value.rs 的 Value enum（含标量与 Arc<HeapObj> 引用）
 //! - 独立输入池连续存储所有节点输入，缓存友好
 
-use crate::Value::Value;
+use crate::value::Value;
 use std::sync::Arc;
 
 // =========================================================================
@@ -463,11 +463,11 @@ const _: () = assert!(std::mem::size_of::<Node>() == 16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatchOp {
     /// 二元算术/位运算（返回同类型标量）
-    Bin(crate::Value::BinOp),
+    Bin(crate::value::BinOp),
     /// 比较运算（返回 bool）
-    Cmp(crate::Value::CmpOp),
+    Cmp(crate::value::CmpOp),
     /// 一元运算（返回同类型标量）
-    Unary(crate::Value::UnaryOp),
+    Unary(crate::value::UnaryOp),
 }
 
 /// 编译期批量化信息（per-Node，按 NodeId 索引）。
@@ -477,7 +477,7 @@ pub enum BatchOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BatchInfo {
     /// 输入/输出的标量类型（决定 SIMD lane 宽度）
-    pub tag: crate::Value::ValueTag,
+    pub tag: crate::value::ValueTag,
     /// 运算类型
     pub op: BatchOp,
 }
@@ -687,37 +687,37 @@ pub enum ConstValue {
 
 impl ConstValue {
     /// 转为 Value（用于优化器/Engine 读取常量值）。
-    pub fn to_value(&self) -> crate::Value::Value {
+    pub fn to_value(&self) -> crate::value::Value {
         match self {
-            ConstValue::I8(v) => crate::Value::Value::i8(*v),
-            ConstValue::I16(v) => crate::Value::Value::i16(*v),
-            ConstValue::I32(v) => crate::Value::Value::i32(*v),
-            ConstValue::I64(v) => crate::Value::Value::i64(*v),
-            ConstValue::I128(v) => crate::Value::Value::i128(*v),
-            ConstValue::U8(v) => crate::Value::Value::u8(*v),
-            ConstValue::U16(v) => crate::Value::Value::u16(*v),
-            ConstValue::U32(v) => crate::Value::Value::u32(*v),
-            ConstValue::U64(v) => crate::Value::Value::u64(*v),
-            ConstValue::U128(v) => crate::Value::Value::u128(*v),
-            ConstValue::Isize(v) => crate::Value::Value::isize_val(*v),
-            ConstValue::Usize(v) => crate::Value::Value::usize_val(*v),
-            ConstValue::F32(v) => crate::Value::Value::f32(*v),
-            ConstValue::F64(v) => crate::Value::Value::f64(*v),
-            ConstValue::Bool(v) => crate::Value::Value::bool_val(*v),
-            ConstValue::Char(cp) => crate::Value::Value::char_val(
+            ConstValue::I8(v) => crate::value::Value::i8(*v),
+            ConstValue::I16(v) => crate::value::Value::i16(*v),
+            ConstValue::I32(v) => crate::value::Value::i32(*v),
+            ConstValue::I64(v) => crate::value::Value::i64(*v),
+            ConstValue::I128(v) => crate::value::Value::i128(*v),
+            ConstValue::U8(v) => crate::value::Value::u8(*v),
+            ConstValue::U16(v) => crate::value::Value::u16(*v),
+            ConstValue::U32(v) => crate::value::Value::u32(*v),
+            ConstValue::U64(v) => crate::value::Value::u64(*v),
+            ConstValue::U128(v) => crate::value::Value::u128(*v),
+            ConstValue::Isize(v) => crate::value::Value::isize_val(*v),
+            ConstValue::Usize(v) => crate::value::Value::usize_val(*v),
+            ConstValue::F32(v) => crate::value::Value::f32(*v),
+            ConstValue::F64(v) => crate::value::Value::f64(*v),
+            ConstValue::Bool(v) => crate::value::Value::bool_val(*v),
+            ConstValue::Char(cp) => crate::value::Value::char_val(
                 char::from_u32(*cp).unwrap_or('\0'),
             ),
-            ConstValue::Str(s) => crate::Value::Value::ref_val(
-                crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(s)),
+            ConstValue::Str(s) => crate::value::Value::ref_val(
+                crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(s)),
             ),
-            ConstValue::Null => crate::Value::Value::NULL,
-            ConstValue::Void => crate::Value::Value::VOID,
+            ConstValue::Null => crate::value::Value::NULL,
+            ConstValue::Void => crate::value::Value::VOID,
         }
     }
 
     /// 从 Value 构造 ConstValue（用于 ConstFold 生成新常量）。
-    pub fn from_value(v: &crate::Value::Value) -> Option<ConstValue> {
-        use crate::Value::{ValueTag, Value};
+    pub fn from_value(v: &crate::value::Value) -> Option<ConstValue> {
+        use crate::value::{ValueTag, Value};
         match v {
             Value::Scalar(sv, tag) => match tag {
                 ValueTag::I8 => Some(ConstValue::I8(unsafe { sv.i8_val })),
@@ -1954,7 +1954,7 @@ pub struct DataFlowGraph {
     /// 切片节点的 inclusive 标志（按 NodeId 索引，true = `[start..=end]`，false = `[start..end]`）
     pub slice_inclusive: Vec<bool>,
     /// 全局变量运行时存储（顶层 var/val 声明，跨函数共享，不依赖帧链）
-    pub global_var_storage: Arc<Vec<std::sync::Mutex<Option<crate::Value::Value>>>>,
+    pub global_var_storage: Arc<Vec<std::sync::Mutex<Option<crate::value::Value>>>>,
     /// global_load 节点的 slot index（按 NodeId 索引，非 global_load 节点为 None）
     pub global_load_slots: Vec<Option<u32>>,
     /// global_store 节点的 slot index（按 NodeId 索引，非 global_store 节点为 None）
@@ -2395,8 +2395,8 @@ pub struct ScalarMeta {
 /// 按 ValueTag 查询算术元信息（const fn，编译期可求值）。
 ///
 /// `family` 派生自 `ValueTag::family()`（单点维护，不再手写 18 个分支）。
-pub const fn scalar_meta(tag: crate::Value::ValueTag) -> Option<ScalarMeta> {
-    use crate::Value::ValueTag;
+pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
+    use crate::value::ValueTag;
     // family 由 ValueTag::family() 派生（保持单一真相源）
     let family = tag.family();
     Some(match tag {

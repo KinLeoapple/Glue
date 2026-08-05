@@ -3,7 +3,9 @@
 use super::*;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
-use crate::Value::Value;
+use crate::value::Value;
+use std::collections::BinaryHeap;
+use std::cmp::Reverse;
 
 /// Timer 事件 Record 中 duration 字段名。
 const TIMER_DURATION_NS_FIELD: &str = "duration_ns";
@@ -12,47 +14,87 @@ const TIMER_DURATION_NS_FIELD: &str = "duration_ns";
 // TimerRuntime / AsyncJoinRuntime — 图外运行时
 // =========================================================================
 
-/// Timer 运行时：管理 timer deadline + 触发检查。
+/// Timer 运行时：最小堆管理 timer deadline + 触发检查。
 ///
 /// spec 3.5 EventSource::Timer。事件循环每次迭代检查到期 timer。
+/// 堆顶 = 最早到期项，`next_deadline()` 供事件循环计算 park timeout。
 pub struct TimerRuntime {
-    timers: Vec<TimerEntry>,
+    /// 最小堆（Reverse 使 BinaryHeap 表现为 min-heap）
+    heap: BinaryHeap<Reverse<TimerHeapEntry>>,
+    /// 递增 ID 分配器（不再用 Vec 索引，允许弹出入堆）
+    next_id: u32,
+    /// 已触发但未被 is_fired 查询的 ID 集合（惰性清理）
+    fired_set: std::collections::HashSet<crate::ir::Ir::TimerId>,
 }
-struct TimerEntry {
+
+struct TimerHeapEntry {
     deadline: std::time::Instant,
-    fired: bool,
+    id: crate::ir::Ir::TimerId,
 }
+
+impl PartialEq for TimerHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline
+    }
+}
+impl Eq for TimerHeapEntry {}
+impl PartialOrd for TimerHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TimerHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // 按 deadline 升序（min-heap：最早到期在堆顶）
+        self.deadline.cmp(&other.deadline)
+    }
+}
+
 impl TimerRuntime {
-    pub fn new() -> Self { Self { timers: Vec::new() } }
+    pub fn new() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            next_id: 0,
+            fired_set: std::collections::HashSet::new(),
+        }
+    }
     pub fn start(&mut self, duration: std::time::Duration) -> crate::ir::Ir::TimerId {
-        let id = crate::ir::Ir::TimerId(self.timers.len() as u32);
-        self.timers.push(TimerEntry {
+        let id = crate::ir::Ir::TimerId(self.next_id);
+        self.next_id += 1;
+        self.heap.push(Reverse(TimerHeapEntry {
             deadline: std::time::Instant::now() + duration,
-            fired: false,
-        });
+            id,
+        }));
         id
     }
+    /// 检查到期 timer，弹出并返回已触发的 TimerId 列表。
+    /// 堆顶未到期时立即返回（O(log n) 弹出）。
     pub fn check_and_fire(&mut self) -> Vec<crate::ir::Ir::TimerId> {
         let now = std::time::Instant::now();
         let mut fired = Vec::new();
-        for (i, t) in self.timers.iter_mut().enumerate() {
-            if !t.fired && now >= t.deadline {
-                t.fired = true;
-                fired.push(crate::ir::Ir::TimerId(i as u32));
+        while let Some(Reverse(entry)) = self.heap.peek() {
+            if entry.deadline > now {
+                break;
             }
+            let Reverse(entry) = self.heap.pop().unwrap();
+            fired.push(entry.id);
+        }
+        // 记录到 fired_set 供 is_fired 查询
+        for id in &fired {
+            self.fired_set.insert(*id);
         }
         fired
     }
     pub fn is_fired(&self, id: crate::ir::Ir::TimerId) -> bool {
-        self.timers.get(id.0 as usize).map(|t| t.fired).unwrap_or(false)
+        self.fired_set.contains(&id)
     }
-    /// 清理已触发的 timer 条目以回收内存。
-    /// 注意：TimerId 是 Vec 索引，不能直接 retain（会导致索引错位）。
-    /// 此方法将已触发 timer 的 deadline 重置为零值，不改变 Vec 长度。
-    /// TimerEntry 本身很小（Instant + bool），内存影响有限。
+    /// 返回最近到期 timer 的 deadline（供事件循环计算 park timeout）。
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.heap.peek().map(|Reverse(e)| e.deadline)
+    }
+    /// 清理已被 is_fired 查询过的 ID，释放内存。
     pub fn cleanup(&mut self) {
-        // 不删除条目以保持 TimerId 索引有效性
-        // TimerEntry 很小，无需主动清理
+        self.fired_set.clear();
     }
 }
 
@@ -160,7 +202,7 @@ impl<S: LockStrategy> Engine<S> {
             }
             EventSourceKind::Timer => {
                 let duration_ns = match pending.event_obj.heap_obj() {
-                    Some(crate::Value::HeapObj::Record(r)) => {
+                    Some(crate::value::HeapObj::Record(r)) => {
                         r.find_field(TIMER_DURATION_NS_FIELD)
                             .map(|v| v.as_i64())
                             .expect("timer event record missing duration_ns field")

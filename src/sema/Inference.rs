@@ -78,6 +78,13 @@ pub struct InferContext<'a> {
     /// 诊断追踪表：记录每个表达式推断结果的 (TypeHandle, Span)，用于反向定位未解析 TypeVar 的代码位置。
     /// 仅在 GLUE_SEMA_TRACE 启用时填充，避免正常编译的内存开销。
     pub type_trace: Vec<(TypeHandle, crate::ast::Ast::Span)>,
+    /// 构造器短名 → 定义该类型的模块 EnvId（Zig @This 语义）。
+    ///
+    /// 当 `import std.time.Duration` 且模块内定义 `pub type Duration` 时，
+    /// predefine 用 redefine 将 ModuleRef 覆盖为构造器 Fn。此映射保留
+    /// "类型名 → 源模块 env"，使 MethodCall 路径 0b 能回退查找模块内自由函数
+    /// （类型名 == 文件名时，类型视作模块命名空间）。
+    pub ctor_module_envs: FxHashMap<String, EnvId>,
 }
 
 /// 检查类型是否引用了任何未解析的 TypeVar（在 unresolved_set 中）。
@@ -153,6 +160,7 @@ impl<'a> InferContext<'a> {
             current_module_env: None,
             current_module_name: String::new(),
             type_trace: Vec::new(),
+            ctor_module_envs: FxHashMap::default(),
         }
     }
 
@@ -1751,6 +1759,40 @@ impl<'a> InferContext<'a> {
                     }
                 }
 
+                // 路径 0b：构造器 recv（类型名 == 模块名）→ 模块函数调用（Zig @This 语义）
+                // 当 recv 是类型构造器（Fn，return_type 为 Adt）且类型名与某模块同名时，
+                // 在该模块 env 中按 method 裸名查找自由函数。
+                // 典型场景：import std.time.Duration 后 Duration.from_millis(100)，
+                // 其中 Duration 既是类型又是模块（文件同名，predefine redefine 覆盖了 ModuleRef）。
+                if let Ty::Fn(_) = self.arena.get(recv_resolved_0a) {
+                    let (_, ret_ty) = self.arena.fn_parts(recv_resolved_0a);
+                    let ret_resolved = self.arena.resolve(ret_ty);
+                    if let Ty::Adt(_) = self.arena.get(ret_resolved) {
+                        let (type_name, _) = self.arena.adt_parts(ret_resolved);
+                        if let Some(&mod_env) = self.ctor_module_envs.get(type_name) {
+                            if let Some(fn_ty) = self.env.lookup_local(mod_env, method) {
+                                let inst_fn = self.instantiate_fn_type(fn_ty);
+                                if let Ty::Fn(_) = self.arena.get(inst_fn) {
+                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
+                                    let params: Vec<TypeHandle> = params.to_vec();
+                                    let n = params.len().min(args.len());
+                                    for i in 0..n {
+                                        let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
+                                        self.unify_or_constrain(params[i], arg_ty);
+                                    }
+                                    // 标记 recv 为模块函数调用接收者，IR 编译时不传 recv
+                                    let recv_key = module_expr_key(
+                                        &self.current_module_name,
+                                        recv.0 as u64,
+                                    );
+                                    self.sema_result.module_func_recv_exprs.insert(recv_key);
+                                    return return_type;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 路径 1（优先）：类型感知的方法查找
                 // 通过 lookup_method_type 按接收者类型查 witness_table / func_sigs / 内置方法，
                 // 确保同名方法（如 Instant.add_duration 与 DateTime.add_duration）分派到正确签名。
@@ -2286,7 +2328,7 @@ impl<'a> InferContext<'a> {
                             })
                             .map(|req| {
                                 format!(
-                                    "inline_trait 缺少 trait {} 的必需方法 {} (参数个数 {})",
+                                    "inline_trait missing required method {} of trait {} (param count {})",
                                     tname, req.name, req.param_count
                                 )
                             })
@@ -2327,7 +2369,7 @@ impl<'a> InferContext<'a> {
                 } else {
                     let span = ast.expr(expr).span;
                     self.sema_result.errors.push(SemaError::new(
-                        "inline_trait 无法推断 trait 名：需要显式类型注解",
+                        "inline_trait cannot infer trait name: explicit type annotation required",
                         span.line,
                         span.column,
                     ));
@@ -2916,7 +2958,7 @@ impl<'a> InferContext<'a> {
                         };
                         self.add_error_at(
                             &format!(
-                                "类型 '{}' 未实现 Iterator，For 循环要求迭代器类型。数组请用 arr.iter()，字符串请用 str_iter(s)",
+                                "type '{}' does not implement Iterator; For loops require an iterator type. Use arr.iter() for arrays, str_iter(s) for strings",
                                 type_name
                             ),
                             span.line,
@@ -3538,6 +3580,9 @@ impl<'a> InferContext<'a> {
                             for ctor in constructors.iter() {
                                 let ctor_fn_ty = self.build_ctor_fn_type(ctor, name, &module.arena);
                                 self.env.redefine(root_env, ctor.name, ctor_fn_ty);
+                                // 记录构造器短名 → 模块 env（Zig @This 语义），
+                                // 使 `TypeName.free_func(args)` 能回退查找模块内自由函数
+                                self.ctor_module_envs.insert(ctor.name.to_string(), module_env);
                             }
                         }
                         crate::ast::Ast::TypeDef::Newtype { name: ctor_name, inner } => {
@@ -3548,6 +3593,9 @@ impl<'a> InferContext<'a> {
                                 self_ty,
                             );
                             self.env.redefine(root_env, ctor_name, ctor_fn_ty);
+                            // 记录构造器短名 → 模块 env（Zig @This 语义），
+                            // 使 `TypeName.free_func(args)` 能回退查找模块内自由函数
+                            self.ctor_module_envs.insert(ctor_name.to_string(), module_env);
                         }
                         _ => {}
                     }

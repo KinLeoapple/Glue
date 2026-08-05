@@ -48,7 +48,7 @@ fn two<T>(args: &[ConstValue], extract: fn(&ConstValue) -> Option<T>) -> Option<
 /// 尝试对给定 compute_fn 和常量参数执行编译期求值。
 /// 返回 None 表示无法折叠（类型不匹配或非可折叠 op）。
 pub fn try_fold(cf: ComputeFnId, args: &[ConstValue]) -> Option<ConstValue> {
-    use crate::Value as V;
+    use crate::value as V;
     match cf.0 {
         // ── Legacy i32 算术 (1,3,5,6,7) ──
         1  => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_add_i32(a, b))) }
@@ -149,18 +149,18 @@ pub fn try_fold(cf: ComputeFnId, args: &[ConstValue]) -> Option<ConstValue> {
 macro_rules! fold_int_arith {
     ($args:expr, $op:expr, $cv:ident, $ext:ident, $ty:ident) => { paste! {
         match $op {
-            0 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_add_$ty>](a, b))) }
-            1 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_sub_$ty>](a, b))) }
-            2 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_mul_$ty>](a, b))) }
-            3 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_div_$ty>](a, b))) }
-            4 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_mod_$ty>](a, b))) }
-            5 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_bitand_$ty>](a, b))) }
-            6 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_bitor_$ty>](a, b))) }
-            7 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_bitxor_$ty>](a, b))) }
-            8 => { let a = $ext($args.get(0)?)?; let s = cv_i32($args.get(1)?)?; Some(ConstValue::$cv(crate::Value::[<arith_shl_$ty>](a, s))) }
-            9 => { let a = $ext($args.get(0)?)?; let s = cv_i32($args.get(1)?)?; Some(ConstValue::$cv(crate::Value::[<arith_shr_$ty>](a, s))) }
-            10 => { let a = $ext($args.get(0)?)?; Some(ConstValue::$cv(crate::Value::[<arith_neg_$ty>](a))) }
-            11 => { let a = $ext($args.get(0)?)?; Some(ConstValue::$cv(crate::Value::[<arith_bitnot_$ty>](a))) }
+            0 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_add_$ty>](a, b))) }
+            1 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_sub_$ty>](a, b))) }
+            2 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_mul_$ty>](a, b))) }
+            3 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_div_$ty>](a, b))) }
+            4 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_mod_$ty>](a, b))) }
+            5 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_bitand_$ty>](a, b))) }
+            6 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_bitor_$ty>](a, b))) }
+            7 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_bitxor_$ty>](a, b))) }
+            8 => { let a = $ext($args.get(0)?)?; let s = cv_i32($args.get(1)?)?; Some(ConstValue::$cv(crate::value::[<arith_shl_$ty>](a, s))) }
+            9 => { let a = $ext($args.get(0)?)?; let s = cv_i32($args.get(1)?)?; Some(ConstValue::$cv(crate::value::[<arith_shr_$ty>](a, s))) }
+            10 => { let a = $ext($args.get(0)?)?; Some(ConstValue::$cv(crate::value::[<arith_neg_$ty>](a))) }
+            11 => { let a = $ext($args.get(0)?)?; Some(ConstValue::$cv(crate::value::[<arith_bitnot_$ty>](a))) }
             _ => None,
         }
     }};
@@ -170,12 +170,12 @@ macro_rules! fold_int_arith {
 macro_rules! fold_float_arith {
     ($args:expr, $op:expr, $cv:ident, $ext:ident, $ty:ident) => { paste! {
         match $op {
-            0 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_add_$ty>](a, b))) }
-            1 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_sub_$ty>](a, b))) }
-            2 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_mul_$ty>](a, b))) }
-            3 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_div_$ty>](a, b))) }
-            4 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::Value::[<arith_mod_$ty>](a, b))) }
-            5 => { let a = $ext($args.get(0)?)?; Some(ConstValue::$cv(crate::Value::[<arith_neg_$ty>](a))) }
+            0 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_add_$ty>](a, b))) }
+            1 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_sub_$ty>](a, b))) }
+            2 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_mul_$ty>](a, b))) }
+            3 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_div_$ty>](a, b))) }
+            4 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_mod_$ty>](a, b))) }
+            5 => { let a = $ext($args.get(0)?)?; Some(ConstValue::$cv(crate::value::[<arith_neg_$ty>](a))) }
             _ => None,
         }
     }};
@@ -623,7 +623,7 @@ pub fn optimize(graph: &mut DataFlowGraph) {
 
         max_iter -= 1;
         if max_iter == 0 {
-            eprintln!("Optimizer: 达到最大迭代次数，提前终止");
+            eprintln!("Optimizer: reached max iterations, terminating early");
             break;
         }
     }

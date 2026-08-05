@@ -328,7 +328,7 @@ impl<'a> IrBuilder<'a> {
     ) -> ComputeFnId {
         use crate::ast::Ast::CompoundAssignOp;
         let ty = self.expr_type_name(target_expr).unwrap_or("i32");
-        let is_float = crate::Value::ValueTag::from_name(ty).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
+        let is_float = crate::value::ValueTag::from_name(ty).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
         let base = Self::arith_base(ty).unwrap_or(CF_ADD_I32_FULL.0); // 回退 i32
         // 整数 offset: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9)
         // 浮点 offset: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
@@ -838,13 +838,14 @@ impl<'a> IrBuilder<'a> {
                 let ty = suffix
                     .map(|s| s.to_string())
                     .or_else(|| self.expr_type_name(expr_id).map(|s| s.to_string()));
-                // 解析整数：支持 0x/0o/0b 前缀（Rust from_str_radix 语义）
+                // 解析整数：支持 0x/0o/0b 前缀 + 下划线分隔符（Rust from_str_radix 不接受下划线）
                 let parse_int = |raw: &str| -> Option<i128> {
-                    let s = raw
+                    let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+                    let s = cleaned
                         .strip_prefix("0x").map(|s| (s, 16))
-                        .or_else(|| raw.strip_prefix("0o").map(|s| (s, 8)))
-                        .or_else(|| raw.strip_prefix("0b").map(|s| (s, 2)))
-                        .unwrap_or((raw, 10));
+                        .or_else(|| cleaned.strip_prefix("0o").map(|s| (s, 8)))
+                        .or_else(|| cleaned.strip_prefix("0b").map(|s| (s, 2)))
+                        .unwrap_or((cleaned.as_str(), 10));
                     i128::from_str_radix(s.0, s.1).ok()
                 };
                 match ty.as_deref() {
@@ -863,11 +864,15 @@ impl<'a> IrBuilder<'a> {
                     _ => parse_int(raw).and_then(|v| i32::try_from(v).ok()).map(ConstValue::I32),
                 }
             }
-            crate::ast::Ast::Expr::FloatLit { raw, suffix } => match suffix {
-                None | Some("f64") => raw.parse::<f64>().ok().map(ConstValue::F64),
-                Some("f32") => raw.parse::<f32>().ok().map(ConstValue::F32),
-                _ => raw.parse::<f64>().ok().map(ConstValue::F64),
-            },
+            crate::ast::Ast::Expr::FloatLit { raw, suffix } => {
+                // 去除下划线分隔符（Rust parse 不接受下划线）
+                let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+                match suffix {
+                    None | Some("f64") => cleaned.parse::<f64>().ok().map(ConstValue::F64),
+                    Some("f32") => cleaned.parse::<f32>().ok().map(ConstValue::F32),
+                    _ => cleaned.parse::<f64>().ok().map(ConstValue::F64),
+                }
+            }
             crate::ast::Ast::Expr::BoolLit(b) => Some(ConstValue::Bool(*b)),
             crate::ast::Ast::Expr::CharLit(c) => Some(ConstValue::Char(*c)),
             crate::ast::Ast::Expr::StrLit(s) => {
@@ -1298,7 +1303,7 @@ impl<'a> IrBuilder<'a> {
                 Some(b) => b,
                 None => {
                     self.errors.push(format!(
-                        "compile_inline_trait: 方法 {} 无方法体（inline_trait 要求所有方法有体）",
+                        "compile_inline_trait: method {} has no body (inline_trait requires all methods to have bodies)",
                         m.name
                     ));
                     continue;
@@ -2585,11 +2590,16 @@ impl<'a> IrBuilder<'a> {
     fn compile_pattern_literal(&mut self, pl: &crate::ast::Ast::PatternLiteral) -> NodeId {
         let const_val = match pl {
             crate::ast::Ast::PatternLiteral::Int(s) => {
-                // 去除后缀再解析
-                let digits: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+').collect();
+                // 去除下划线分隔符 + 后缀，只保留数字和正负号
+                let digits: String = s.chars()
+                    .filter(|c| *c != '_' && (c.is_ascii_digit() || *c == '-' || *c == '+'))
+                    .collect();
                 digits.parse::<i32>().ok().map(ConstValue::I32)
             }
-            crate::ast::Ast::PatternLiteral::Float(s) => s.parse::<f64>().ok().map(ConstValue::F64),
+            crate::ast::Ast::PatternLiteral::Float(s) => {
+                let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+                cleaned.parse::<f64>().ok().map(ConstValue::F64)
+            }
             crate::ast::Ast::PatternLiteral::Bool(b) => Some(ConstValue::Bool(*b)),
             crate::ast::Ast::PatternLiteral::String(_) => {
                 Some(ConstValue::Bool(true)) // 占位，实际用 compile_str_const
@@ -2734,7 +2744,7 @@ impl<'a> IrBuilder<'a> {
     /// i8/i16/u8/u16/u32/char → SignedInt32/UnsignedInt32/Char；i64/u64/isize/usize → SignedInt64/UnsignedInt64；
     /// i128/u128 → SignedInt128/UnsignedInt128；bool → Bool；浮点 → Float。
     fn int_family(ty_name: &str) -> crate::types::TypeFamily {
-        match crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta) {
+        match crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta) {
             Some(m) => m.family,
             None => crate::types::TypeFamily::SignedInt32, // 未知整数类型回退到 Int32 路径
         }
@@ -2746,7 +2756,7 @@ impl<'a> IrBuilder<'a> {
     /// 返回 None 表示该类型不支持算术运算。
     /// 基址来自 `scalar_meta`，与 compute_fn_table! 的索引单点同步。
     fn arith_base(ty_name: &str) -> Option<u32> {
-        crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.arith_base)
+        crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.arith_base)
     }
 
     /// 根据 op + 表达式类型选择 compute_fn id。
@@ -2756,7 +2766,7 @@ impl<'a> IrBuilder<'a> {
         lhs_expr: crate::ast::Ast::ExprId,
     ) -> ComputeFnId {
         let ty_name = self.expr_type_name(lhs_expr).unwrap_or("i32");
-        let ty_meta = crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta);
+        let ty_meta = crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta);
         let is_float = ty_meta.as_ref().map(|m| m.is_float).unwrap_or(false);
         // is_int：非浮点且非 bool（复用 TypeFamily 枚举，消除字符串比较）
         let is_int = !is_float && Self::int_family(ty_name) != crate::types::TypeFamily::Bool;
@@ -2913,7 +2923,7 @@ impl<'a> IrBuilder<'a> {
         operand_expr: crate::ast::Ast::ExprId,
     ) -> ComputeFnId {
         let ty_name = self.expr_type_name(operand_expr).unwrap_or("i32");
-        let is_float = crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
+        let is_float = crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
         let base = Self::arith_base(ty_name);
         match op {
             crate::ast::Ast::UnaryOp::Not => CF_NOT_BOOL, // not_bool
@@ -3014,7 +3024,7 @@ impl<'a> IrBuilder<'a> {
         lhs_expr: crate::ast::Ast::ExprId,
     ) -> Option<BatchInfo> {
         use crate::ast::Ast::BinaryOp;
-        use crate::Value::{BinOp as VBinOp, CmpOp as VCmpOp};
+        use crate::value::{BinOp as VBinOp, CmpOp as VCmpOp};
 
         let ty = self.expr_type_name(lhs_expr)?;
         let tag = Self::ty_name_to_scalar_tag(ty)?;
@@ -3053,7 +3063,7 @@ impl<'a> IrBuilder<'a> {
         operand_expr: crate::ast::Ast::ExprId,
     ) -> Option<BatchInfo> {
         use crate::ast::Ast::UnaryOp;
-        use crate::Value::UnaryOp as VUnaryOp;
+        use crate::value::UnaryOp as VUnaryOp;
 
         let ty = self.expr_type_name(operand_expr)?;
         let tag = Self::ty_name_to_scalar_tag(ty)?;
@@ -3069,8 +3079,8 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// 类型名 → ValueTag 映射（委托 `ValueTag::from_name`，与 Value 单点同步）。
-    fn ty_name_to_scalar_tag(ty: &str) -> Option<crate::Value::ValueTag> {
-        crate::Value::ValueTag::from_name(ty)
+    fn ty_name_to_scalar_tag(ty: &str) -> Option<crate::value::ValueTag> {
+        crate::value::ValueTag::from_name(ty)
     }
 
     /// 编译 cast 调用：__cast_to<T>(x) / __cast_try_to<T>(x)。
@@ -3464,6 +3474,37 @@ impl<'a> IrBuilder<'a> {
         // 事件源种类由 infer_event_source_kind 根据 recv 类型决定。
         if method == "await" && args.is_empty() {
             return self.build_await_node(recv, recv_node);
+        }
+
+        // 路径 0：模块函数调用（recv 是构造器/模块命名空间，不传 recv）
+        // sema MethodCall 路径 0b 标记的 recv：TypeName.free_func(args) → free_func(args)
+        // 不把 recv 作为参数传递（from_millis 是自由函数，不接收 Duration 构造器）
+        {
+            let recv_key = crate::sema::Sema::module_expr_key(
+                self.current_module().name,
+                recv.0 as u64,
+            );
+            if self.sema.module_func_recv_exprs.contains(&recv_key) {
+                if let Some(&target_sg) = self.func_subgraphs.get(method) {
+                    let mut inputs = Vec::with_capacity(args.len() + 1);
+                    for &arg in args {
+                        inputs.push(self.compile_subexpr(arg));
+                    }
+                    if let Some(eff) = self.current_effect {
+                        inputs.push(eff);
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    let call_node = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: CF_CALL_LAUNCH,
+                    });
+                    self.graph.set_call_target(call_node, target_sg);
+                    self.mark_async_call_if_needed(call_node, target_sg);
+                    return call_node;
+                }
+            }
         }
 
         {
@@ -5000,7 +5041,7 @@ impl<'a> IrBuilder<'a> {
 
         // 初始化全局变量存储区（按 slot count 预分配 Mutex 槽）
         let global_var_count = self.global_var_slots.len();
-        let storage: Vec<std::sync::Mutex<Option<crate::Value::Value>>> = (0..global_var_count)
+        let storage: Vec<std::sync::Mutex<Option<crate::value::Value>>> = (0..global_var_count)
             .map(|_| std::sync::Mutex::new(None))
             .collect();
         self.graph.global_var_storage = Arc::new(storage);

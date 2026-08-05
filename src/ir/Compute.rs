@@ -12,7 +12,7 @@
 //! ir/Ir.rs 的 build_compute_fn_table 通过 super::Compute:: 引用。
 
 use super::Ir::*;
-use crate::Value::Value;
+use crate::value::Value;
 use crate::engine::{prepare_frame_nodes, switch_subgraph, notify_downstream};
 
 // =========================================================================
@@ -57,15 +57,15 @@ fn reflect_kind(v: &Value) -> u8 {
         Value::Void => 1,
         Value::Scalar(_, _) => 2,
         Value::Ref(r) => match &**r {
-            crate::Value::HeapObj::Str(_) => 3,
-            crate::Value::HeapObj::Array(_) => 4,
-            crate::Value::HeapObj::Record(_) => 5,
-            crate::Value::HeapObj::Adt(_) => 6,
-            crate::Value::HeapObj::Closure(_) => 7,
-            crate::Value::HeapObj::TraitVal(_) => 8,
-            crate::Value::HeapObj::ThrowVal(_) => 9,
-            crate::Value::HeapObj::ChannelVal(_) => 10,
-            crate::Value::HeapObj::AsyncVal(_) => 11,
+            crate::value::HeapObj::Str(_) => 3,
+            crate::value::HeapObj::Array(_) => 4,
+            crate::value::HeapObj::Record(_) => 5,
+            crate::value::HeapObj::Adt(_) => 6,
+            crate::value::HeapObj::Closure(_) => 7,
+            crate::value::HeapObj::TraitVal(_) => 8,
+            crate::value::HeapObj::ThrowVal(_) => 9,
+            crate::value::HeapObj::ChannelVal(_) => 10,
+            crate::value::HeapObj::AsyncVal(_) => 11,
             _ => 12,
         },
     }
@@ -78,13 +78,13 @@ fn reflect_kind_str(v: &Value) -> &'static str {
         Value::Void => "Void",
         Value::Scalar(_, _) => "Primitive",
         Value::Ref(r) => match &**r {
-            crate::Value::HeapObj::Str(_) => "Str",
-            crate::Value::HeapObj::Array(_) => "Array",
-            crate::Value::HeapObj::Record(_) => "Record",
-            crate::Value::HeapObj::Adt(_) => "Adt",
-            crate::Value::HeapObj::Newtype(_) => "Newtype",
-            crate::Value::HeapObj::Closure(_) => "Closure",
-            crate::Value::HeapObj::TraitVal(_) => "Trait",
+            crate::value::HeapObj::Str(_) => "Str",
+            crate::value::HeapObj::Array(_) => "Array",
+            crate::value::HeapObj::Record(_) => "Record",
+            crate::value::HeapObj::Adt(_) => "Adt",
+            crate::value::HeapObj::Newtype(_) => "Newtype",
+            crate::value::HeapObj::Closure(_) => "Closure",
+            crate::value::HeapObj::TraitVal(_) => "Trait",
             _ => "Ref",
         },
     }
@@ -97,11 +97,11 @@ fn reflect_type_name(v: &Value) -> String {
         Value::Void => TYPE_NAME_VOID.to_string(),
         Value::Scalar(_, tag) => tag.type_name().to_string(),
         Value::Ref(r) => match &**r {
-            crate::Value::HeapObj::Str(_) => TYPE_NAME_STR.to_string(),
-            crate::Value::HeapObj::Array(_) => TYPE_NAME_ARRAY.to_string(),
-            crate::Value::HeapObj::Record(rec) => rec.type_name.clone(),
-            crate::Value::HeapObj::Adt(a) => a.type_name.clone(),
-            crate::Value::HeapObj::Newtype(n) => n.type_name.clone(),
+            crate::value::HeapObj::Str(_) => TYPE_NAME_STR.to_string(),
+            crate::value::HeapObj::Array(_) => TYPE_NAME_ARRAY.to_string(),
+            crate::value::HeapObj::Record(rec) => rec.type_name.clone(),
+            crate::value::HeapObj::Adt(a) => a.type_name.clone(),
+            crate::value::HeapObj::Newtype(n) => n.type_name.clone(),
             _ => TYPE_NAME_UNKNOWN.to_string(),
         },
     }
@@ -273,7 +273,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_add_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_add_$ty>](a, b))
             }
             pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -281,7 +281,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_sub_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_sub_$ty>](a, b))
             }
             pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -289,7 +289,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_mul_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_mul_$ty>](a, b))
             }
             pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -298,7 +298,7 @@ macro_rules! impl_int_ops {
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
                 // 整数除零返回 0（checked 语义，由 arith_div_$ty 实现）
-                Value::$ctor(crate::Value::[<arith_div_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_div_$ty>](a, b))
             }
             pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -306,7 +306,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_mod_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_mod_$ty>](a, b))
             }
             pub fn [<compute_bitand_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -314,7 +314,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_bitand_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_bitand_$ty>](a, b))
             }
             pub fn [<compute_bitor_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -322,7 +322,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_bitor_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_bitor_$ty>](a, b))
             }
             pub fn [<compute_bitxor_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -330,7 +330,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_bitxor_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_bitxor_$ty>](a, b))
             }
             pub fn [<compute_shl_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -339,7 +339,7 @@ macro_rules! impl_int_ops {
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 // 移位量按 i32 读取（与原语义一致），纯函数内部 cast u32
                 let shift = frame.get_value_by_global(inputs[1]).as_i32();
-                Value::$ctor(crate::Value::[<arith_shl_$ty>](a, shift))
+                Value::$ctor(crate::value::[<arith_shl_$ty>](a, shift))
             }
             pub fn [<compute_shr_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -347,21 +347,21 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let shift = frame.get_value_by_global(inputs[1]).as_i32();
-                Value::$ctor(crate::Value::[<arith_shr_$ty>](a, shift))
+                Value::$ctor(crate::value::[<arith_shr_$ty>](a, shift))
             }
             pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
                 let n = &graph.nodes[node.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                Value::$ctor(crate::Value::[<arith_neg_$ty>](a))
+                Value::$ctor(crate::value::[<arith_neg_$ty>](a))
             }
             pub fn [<compute_bitnot_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
                 let n = &graph.nodes[node.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                Value::$ctor(crate::Value::[<arith_bitnot_$ty>](a))
+                Value::$ctor(crate::value::[<arith_bitnot_$ty>](a))
             }
         }
     };
@@ -379,7 +379,7 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_add_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_add_$ty>](a, b))
             }
             pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -387,7 +387,7 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_sub_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_sub_$ty>](a, b))
             }
             pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -395,7 +395,7 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_mul_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_mul_$ty>](a, b))
             }
             pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -403,7 +403,7 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_div_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_div_$ty>](a, b))
             }
             pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
@@ -411,14 +411,14 @@ macro_rules! impl_float_ops {
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                Value::$ctor(crate::Value::[<arith_mod_$ty>](a, b))
+                Value::$ctor(crate::value::[<arith_mod_$ty>](a, b))
             }
             pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId) -> Value {
                 let graph = frame.graph.clone();
                 let n = &graph.nodes[node.0 as usize];
                 let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                Value::$ctor(crate::Value::[<arith_neg_$ty>](a))
+                Value::$ctor(crate::value::[<arith_neg_$ty>](a))
             }
         }
     };
@@ -462,7 +462,7 @@ pub fn compute_and_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
     let b = frame.get_value_by_global(inputs[1]).as_bool();
-    Value::bool_val(crate::Value::arith_and_bool(a, b))
+    Value::bool_val(crate::value::arith_and_bool(a, b))
 }
 
 /// compute_fn: bool 或（复用纯算术核心）
@@ -470,14 +470,14 @@ pub fn compute_or_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
     let b = frame.get_value_by_global(inputs[1]).as_bool();
-    Value::bool_val(crate::Value::arith_or_bool(a, b))
+    Value::bool_val(crate::value::arith_or_bool(a, b))
 }
 
 /// compute_fn: bool 非（一元，复用纯算术核心）
 pub fn compute_not_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
-    Value::bool_val(crate::Value::arith_not_bool(a))
+    Value::bool_val(crate::value::arith_not_bool(a))
 }
 
 /// compute_fn: bool 相等
@@ -498,7 +498,7 @@ pub fn compute_eq_bool(frame: &mut Frame, node: NodeId) -> Value {
 /// - 其他值 → 包装为单字段 Error record 再作为 ThrowVal(Err)
 pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
     use std::sync::Arc;
-    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
     // Record（错误类型）→ 直接作为 Err payload
@@ -535,7 +535,7 @@ pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn: 将值包装为 ThrowVal(Ok(val))（Ok 构造器用）。
 pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
@@ -547,7 +547,7 @@ pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
 /// 此函数将其包装为 ThrowVal(Err(record))。
 pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
     use std::sync::Arc;
-    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
     // v 应为 Record 或 Adt（由 record_construct 节点产生）
@@ -589,10 +589,10 @@ pub fn compute_propagate(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
 
-    if let Some(crate::Value::HeapObj::ThrowVal(tv)) = v.heap_obj() {
+    if let Some(crate::value::HeapObj::ThrowVal(tv)) = v.heap_obj() {
         match &tv.payload {
-            crate::Value::ThrowPayload::Ok(val) => val.clone(),
-            crate::Value::ThrowPayload::Err(_) => {
+            crate::value::ThrowPayload::Ok(val) => val.clone(),
+            crate::value::ThrowPayload::Err(_) => {
                 // 错误传播：设 Return 信号，携带原始 ThrowVal(Err) 逐层透传
                 frame.control_signal = ControlSignal::Return(v.clone());
                 Value::VOID
@@ -624,7 +624,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     // 从 Value 提取 str 参数（HeapObj::Str → owned String，避免临时 Value 生命周期问题）
     fn extract_str(v: &Value) -> String {
         match v.heap_obj() {
-            Some(crate::Value::HeapObj::Str(s)) => s.bytes().to_string(),
+            Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
             _ => panic!("FFI str arg expected, got non-str value"),
         }
     }
@@ -632,7 +632,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     // 从 Value 提取 u8[] 参数（统一走 ArrayValue::collect_u8_bytes）
     fn extract_u8_buf(v: &Value) -> Vec<u8> {
         match v.heap_obj() {
-            Some(crate::Value::HeapObj::Array(arr)) => arr.collect_u8_bytes(),
+            Some(crate::value::HeapObj::Array(arr)) => arr.collect_u8_bytes(),
             _ => panic!("FFI u8[] arg expected"),
         }
     }
@@ -646,12 +646,12 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         if let Value::Ref(arc) = buf_val {
             // Safety: 引擎单线程执行，caller 帧在 callee 执行期间 Suspended，
             // 不会有并发访问同一 HeapObj 的路径（与 compute_record_field_set 一致）。
-            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::Value::HeapObj;
+            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
             unsafe {
-                if let crate::Value::HeapObj::Array(arr) = &mut *ptr {
+                if let crate::value::HeapObj::Array(arr) = &mut *ptr {
                     let len = n.min(data.len()).min(arr.elements.len());
                     // SOA 快路径：U8 连续存储直接 memcpy
-                    if let Some(crate::Value::ScalarSoA::U8(ref mut soa_data)) = arr.scalar_soa {
+                    if let Some(crate::value::ScalarSoA::U8(ref mut soa_data)) = arr.scalar_soa {
                         let len = len.min(soa_data.len());
                         soa_data[..len].copy_from_slice(&data[..len]);
                     } else {
@@ -1059,20 +1059,20 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         "__reflect_type_name" => {
             let v = frame.get_value_by_global(inputs[0]);
             let name = reflect_type_name(&v);
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+            Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(&name)))
         }
         "__reflect_array_len" => {
             let v = frame.get_value_by_global(inputs[0]);
             match v.heap_obj() {
-                Some(crate::Value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
+                Some(crate::value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
                 _ => Value::usize_val(0),
             }
         }
         "__reflect_field_count" => {
             let v = frame.get_value_by_global(inputs[0]);
             let count: u16 = match v.heap_obj() {
-                Some(crate::Value::HeapObj::Record(rec)) => rec.fields.len() as u16,
-                Some(crate::Value::HeapObj::Adt(a)) => a.fields.len() as u16,
+                Some(crate::value::HeapObj::Record(rec)) => rec.fields.len() as u16,
+                Some(crate::value::HeapObj::Adt(a)) => a.fields.len() as u16,
                 _ => 0,
             };
             Value::u16(count)
@@ -1089,29 +1089,29 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             let v = frame.get_value_by_global(inputs[0]);
             let i = frame.get_value_by_global(inputs[1]).as_u16();
             let name = match v.heap_obj() {
-                Some(crate::Value::HeapObj::Record(rec)) => {
+                Some(crate::value::HeapObj::Record(rec)) => {
                     rec.field_names.get(i as usize)
                         .and_then(|n| n.as_ref())
                         .cloned()
                         .unwrap_or_default()
                 }
-                Some(crate::Value::HeapObj::Adt(a)) => {
+                Some(crate::value::HeapObj::Adt(a)) => {
                     a.fields.get(i as usize)
                         .and_then(|f| f.name.as_ref().cloned())
                         .unwrap_or_default()
                 }
                 _ => String::new(),
             };
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+            Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(&name)))
         }
         "__reflect_field_value" => {
             let v = frame.get_value_by_global(inputs[0]);
             let i = frame.get_value_by_global(inputs[1]).as_u16();
             match v.heap_obj() {
-                Some(crate::Value::HeapObj::Record(rec)) => {
+                Some(crate::value::HeapObj::Record(rec)) => {
                     rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL)
                 }
-                Some(crate::Value::HeapObj::Adt(a)) => {
+                Some(crate::value::HeapObj::Adt(a)) => {
                     a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL)
                 }
                 _ => Value::NULL,
@@ -1120,24 +1120,24 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         "__reflect_adt_constructor" => {
             let v = frame.get_value_by_global(inputs[0]);
             let name = match v.heap_obj() {
-                Some(crate::Value::HeapObj::Adt(a)) => a.constructor.clone(),
+                Some(crate::value::HeapObj::Adt(a)) => a.constructor.clone(),
                 _ => String::new(),
             };
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+            Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(&name)))
         }
         "__reflect_kind_str" => {
             let v = frame.get_value_by_global(inputs[0]);
             let kind = reflect_kind_str(&v);
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(kind)))
+            Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(kind)))
         }
         "__reflect_layout_size" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let size: u32 = crate::Reflect::reflect_layout_size(&v);
+            let size: u32 = crate::value::reflect_layout_size(&v);
             Value::u32(size)
         }
         "__reflect_layout_alignment" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let align: u32 = crate::Reflect::reflect_layout_alignment(&v);
+            let align: u32 = crate::value::reflect_layout_alignment(&v);
             Value::u32(align)
         }
 
@@ -1185,7 +1185,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     match fn_name.as_str() {
         // ── IO: 用 Rust std 直接实现 ──
         "__stdout_write_raw" => {
-            if let Some(crate::Value::HeapObj::Str(s)) = frame.get_value_by_global(inputs[0]).heap_obj() {
+            if let Some(crate::value::HeapObj::Str(s)) = frame.get_value_by_global(inputs[0]).heap_obj() {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(s.bytes().as_bytes());
                 let _ = std::io::stdout().flush();
@@ -1195,7 +1195,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             }
         }
         "__stderr_write_raw" => {
-            if let Some(crate::Value::HeapObj::Str(s)) = frame.get_value_by_global(inputs[0]).heap_obj() {
+            if let Some(crate::value::HeapObj::Str(s)) = frame.get_value_by_global(inputs[0]).heap_obj() {
                 use std::io::Write;
                 let _ = std::io::stderr().write_all(s.bytes().as_bytes());
                 Value::i32(IO_OK)
@@ -1257,20 +1257,20 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         "__reflect_type_name" => {
             let v = frame.get_value_by_global(inputs[0]);
             let name = reflect_type_name(&v);
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+            Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(&name)))
         }
         "__reflect_array_len" => {
             let v = frame.get_value_by_global(inputs[0]);
             match v.heap_obj() {
-                Some(crate::Value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
+                Some(crate::value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
                 _ => Value::usize_val(0),
             }
         }
         "__reflect_field_count" => {
             let v = frame.get_value_by_global(inputs[0]);
             let count: u16 = match v.heap_obj() {
-                Some(crate::Value::HeapObj::Record(rec)) => rec.fields.len() as u16,
-                Some(crate::Value::HeapObj::Adt(a)) => a.fields.len() as u16,
+                Some(crate::value::HeapObj::Record(rec)) => rec.fields.len() as u16,
+                Some(crate::value::HeapObj::Adt(a)) => a.fields.len() as u16,
                 _ => 0,
             };
             Value::u16(count)
@@ -1287,53 +1287,53 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             let v = frame.get_value_by_global(inputs[0]);
             let i = frame.get_value_by_global(inputs[1]).as_u16();
             let name = match v.heap_obj() {
-                Some(crate::Value::HeapObj::Record(rec)) => {
+                Some(crate::value::HeapObj::Record(rec)) => {
                     rec.field_names.get(i as usize).and_then(|n| n.as_ref()).cloned().unwrap_or_default()
                 }
-                Some(crate::Value::HeapObj::Adt(a)) => {
+                Some(crate::value::HeapObj::Adt(a)) => {
                     a.fields.get(i as usize).and_then(|f| f.name.as_ref().cloned()).unwrap_or_default()
                 }
                 _ => String::new(),
             };
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+            Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(&name)))
         }
         "__reflect_field_value" => {
             let v = frame.get_value_by_global(inputs[0]);
             let i = frame.get_value_by_global(inputs[1]).as_u16();
             match v.heap_obj() {
-                Some(crate::Value::HeapObj::Record(rec)) => rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL),
-                Some(crate::Value::HeapObj::Adt(a)) => a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL),
+                Some(crate::value::HeapObj::Record(rec)) => rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL),
+                Some(crate::value::HeapObj::Adt(a)) => a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL),
                 _ => Value::NULL,
             }
         }
         "__reflect_adt_constructor" => {
             let v = frame.get_value_by_global(inputs[0]);
             let name = match v.heap_obj() {
-                Some(crate::Value::HeapObj::Adt(a)) => a.constructor.clone(),
+                Some(crate::value::HeapObj::Adt(a)) => a.constructor.clone(),
                 _ => String::new(),
             };
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
+            Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(&name)))
         }
         "__reflect_kind_str" => {
             let v = frame.get_value_by_global(inputs[0]);
             let kind = reflect_kind_str(&v);
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(kind)))
+            Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(kind)))
         }
         "__reflect_layout_size" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let size: u32 = crate::Reflect::reflect_layout_size(&v);
+            let size: u32 = crate::value::reflect_layout_size(&v);
             Value::u32(size)
         }
         "__reflect_layout_alignment" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let align: u32 = crate::Reflect::reflect_layout_alignment(&v);
+            let align: u32 = crate::value::reflect_layout_alignment(&v);
             Value::u32(align)
         }
 
         // ── str: UTF-8 逐字符解码（纯 Rust 位运算，与 C 实现语义一致）──
         "__str_utf8_decode_at" => {
             let s = match frame.get_value_by_global(inputs[0]).heap_obj() {
-                Some(crate::Value::HeapObj::Str(s)) => s.bytes().to_string(),
+                Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
                 _ => String::new(),
             };
             let offset = frame.get_value_by_global(inputs[1]).as_usize();
@@ -1345,7 +1345,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
         "__str_utf8_char_len_at" => {
             let s = match frame.get_value_by_global(inputs[0]).heap_obj() {
-                Some(crate::Value::HeapObj::Str(s)) => s.bytes().to_string(),
+                Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
                 _ => String::new(),
             };
             let offset = frame.get_value_by_global(inputs[1]).as_usize();
@@ -1386,8 +1386,8 @@ pub fn compute_reflect_format(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, _n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
-    let s = crate::Reflect::format_value(&v, 0);
-    Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
+    let s = crate::value::format_value(&v, 0);
+    Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(&s)))
 }
 
 /// compute_fn (idx 291): `__reflect_scalar_to_str` — 标量值 → str
@@ -1398,14 +1398,14 @@ pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, _n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
-    let s = crate::Reflect::format_value(&v, 0);
-    Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
+    let s = crate::value::format_value(&v, 0);
+    Value::ref_val(crate::value::HeapObj::Str(crate::value::GlueStr::from_rust_str(&s)))
 }
 
 /// compute_fn: 类型构造（从输入收集字段值，根据 kind 构造 Record/Adt/Newtype HeapObj）
 pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
     use crate::ir::Ir::{RecordLitKind, RecordLitInfo};
-    use crate::Value::{AdtField, AdtValue, HeapObj, NewtypeValue, RecordValue, ValueArena};
+    use crate::value::{AdtField, AdtValue, HeapObj, NewtypeValue, RecordValue, ValueArena};
     read_node_inputs!(frame, node, graph, n, inputs);
     let fields: Vec<Value> = inputs
         .iter()
@@ -1457,14 +1457,14 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 不依赖编译期 field_idx，消除 idx fallback 与 Record/Adt 双路径差异。
 pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
     use std::sync::Arc;
-    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let record_val = frame.get_value_by_global(inputs[0]);
     let name = graph.field_set_names[node.0 as usize].as_deref();
     let make_err = |msg: &str| {
         let record = Arc::new(RecordValue {
             type_name: "FieldError".to_string(),
-            fields: vec![Value::ref_val(HeapObj::Str(crate::Value::GlueStr::new(msg)))],
+            fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
             field_names: vec![Some("message".to_string())],
             field_ref_bits: 1,
         });
@@ -1483,7 +1483,7 @@ pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn: 数组构造（从输入收集元素构造 ArrayValue）
 pub fn compute_array_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, ArrayValue};
+    use crate::value::{HeapObj, ArrayValue};
     read_node_inputs!(frame, node, graph, n, inputs);
     let elements: Vec<Value> = inputs
         .iter()
@@ -1513,26 +1513,26 @@ pub fn compute_array_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
 /// 索引越界时返回 ThrowVal(Err) 错误值，逐层透传至顶层。
 pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
     use std::sync::Arc;
-    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let recv_val = frame.get_value_by_global(inputs[0]);
     let idx = frame.get_value_by_global(inputs[1]).as_i32() as usize;
     let make_err = |msg: &str| {
         let record = Arc::new(RecordValue {
             type_name: "IndexError".to_string(),
-            fields: vec![Value::ref_val(HeapObj::Str(crate::Value::GlueStr::new(msg)))],
+            fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
             field_names: vec![Some("message".to_string())],
             field_ref_bits: 1,
         });
         Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
     };
     match recv_val.heap_obj() {
-        Some(crate::Value::HeapObj::Array(arr)) => {
+        Some(crate::value::HeapObj::Array(arr)) => {
             arr.get(idx).cloned().unwrap_or_else(|| {
                 make_err(&format!("index {} out of bounds (len {})", idx, arr.len()))
             })
         }
-        Some(crate::Value::HeapObj::Str(s)) => {
+        Some(crate::value::HeapObj::Str(s)) => {
             s.char_at(idx).map(|c| Value::char_val(c)).unwrap_or_else(|| {
                 make_err(&format!("index {} out of bounds (len {})", idx, s.codepoint_count()))
             })
@@ -1549,7 +1549,7 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
 /// 越界时 clamp 到 [0, len]，与 Rust 切片语义一致（不 panic）。
 pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
     use std::sync::Arc;
-    use crate::Value::{HeapObj, ArrayValue, GlueStr, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, ArrayValue, GlueStr, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let recv_val = frame.get_value_by_global(inputs[0]);
     let start = frame.get_value_by_global(inputs[1]).as_usize();
@@ -1568,7 +1568,7 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
         Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
     };
     match recv_val.heap_obj() {
-        Some(crate::Value::HeapObj::Array(arr)) => {
+        Some(crate::value::HeapObj::Array(arr)) => {
             let len = arr.len();
             let s = start.min(len);
             let e = end.min(len);
@@ -1583,7 +1583,7 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
                 scalar_soa: None,
             }))
         }
-        Some(crate::Value::HeapObj::Str(s)) => {
+        Some(crate::value::HeapObj::Str(s)) => {
             // 按码点索引切片：collect chars in [start, end)，重组为 str
             let chars: Vec<char> = s.bytes().chars().collect();
             let len = chars.len();
@@ -1607,7 +1607,7 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
 /// 两输入：lhs, rhs。任一非 str 时返回错误值。
 pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
     use std::sync::Arc;
-    use crate::Value::{HeapObj, GlueStr, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, GlueStr, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
     let rhs = frame.get_value_by_global(inputs[1]);
@@ -1664,7 +1664,7 @@ pub fn compute_global_store(frame: &mut Frame, node: NodeId) -> Value {
 /// 从 base 克隆字段与字段名，按 update_names 替换同名字段或追加新字段，
 /// 构造新 RecordValue（保留 base 的 type_name）。
 pub fn compute_record_extend(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, RecordValue};
+    use crate::value::{HeapObj, RecordValue};
     read_node_inputs!(frame, node, graph, n, inputs);
     let info = graph.record_extend_infos[node.0 as usize]
         .as_ref()
@@ -1719,7 +1719,7 @@ pub fn compute_record_extend(frame: &mut Frame, node: NodeId) -> Value {
 /// inputs[0] = 初始值节点，包装为 AtomicValue（共享底层内存的原子容器）。
 /// AtomicValue.data 为 Value，compute_fn 上下文无需 arena 即可构造。
 pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, AtomicValue};
+    use crate::value::{HeapObj, AtomicValue};
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
     Value::ref_val(HeapObj::AtomicVal(AtomicValue::new(val)))
@@ -1738,13 +1738,13 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
         .as_ref()
         .expect("pattern ctor match node has no ctor name");
     let matched = match val.heap_obj() {
-        Some(crate::Value::HeapObj::Adt(a)) => a.constructor == *ctor_name,
-        Some(crate::Value::HeapObj::Record(r)) => r.type_name == *ctor_name,
+        Some(crate::value::HeapObj::Adt(a)) => a.constructor == *ctor_name,
+        Some(crate::value::HeapObj::Record(r)) => r.type_name == *ctor_name,
         // Newtype：构造器名 == 类型名，匹配 NewtypeValue.type_name
-        Some(crate::Value::HeapObj::Newtype(n)) => n.type_name == *ctor_name,
-        Some(crate::Value::HeapObj::ThrowVal(tv)) => match &tv.payload {
-            crate::Value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
-            crate::Value::ThrowPayload::Err(_) => ctor_name == CTOR_ERR || ctor_name == CTOR_ERR_ALT,
+        Some(crate::value::HeapObj::Newtype(n)) => n.type_name == *ctor_name,
+        Some(crate::value::HeapObj::ThrowVal(tv)) => match &tv.payload {
+            crate::value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
+            crate::value::ThrowPayload::Err(_) => ctor_name == CTOR_ERR || ctor_name == CTOR_ERR_ALT,
         },
         _ => false,
     };
@@ -1764,26 +1764,26 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
         .expect("pattern adt field get node has no field index")
         as usize;
     match val.heap_obj() {
-        Some(crate::Value::HeapObj::Adt(a)) => {
+        Some(crate::value::HeapObj::Adt(a)) => {
             a.fields.get(idx).map(|f| f.value.clone()).unwrap_or(Value::VOID)
         }
-        Some(crate::Value::HeapObj::Record(r)) => {
+        Some(crate::value::HeapObj::Record(r)) => {
             r.fields.get(idx).cloned().unwrap_or(Value::VOID)
         }
         // Newtype：单字段，idx 0 取 inner 值（通过 ValueArena 全局句柄解引用）
-        Some(crate::Value::HeapObj::Newtype(n)) => {
+        Some(crate::value::HeapObj::Newtype(n)) => {
             if idx == 0 {
-                crate::Value::ValueArena::with_global(|a| a.get_value(n.inner))
+                crate::value::ValueArena::with_global(|a| a.get_value(n.inner))
             } else {
                 Value::VOID
             }
         }
-        Some(crate::Value::HeapObj::ThrowVal(tv)) => {
+        Some(crate::value::HeapObj::ThrowVal(tv)) => {
             if idx == 0 {
                 match &tv.payload {
-                    crate::Value::ThrowPayload::Ok(v) => v.clone(),
-                    crate::Value::ThrowPayload::Err(r) => {
-                        Value::ref_val(crate::Value::HeapObj::Record((**r).clone()))
+                    crate::value::ThrowPayload::Ok(v) => v.clone(),
+                    crate::value::ThrowPayload::Err(r) => {
+                        Value::ref_val(crate::value::HeapObj::Record((**r).clone()))
                     }
                 }
             } else {
@@ -1803,11 +1803,11 @@ pub fn compute_pattern_str_eq(frame: &mut Frame, node: NodeId) -> Value {
     let lhs = frame.get_value_by_global(inputs[0]);
     let rhs = frame.get_value_by_global(inputs[1]);
     let lhs_str = match lhs.heap_obj() {
-        Some(crate::Value::HeapObj::Str(s)) => s.bytes().to_string(),
+        Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
         _ => return Value::bool_val(false),
     };
     let rhs_str = match rhs.heap_obj() {
-        Some(crate::Value::HeapObj::Str(s)) => s.bytes().to_string(),
+        Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
         _ => return Value::bool_val(false),
     };
     Value::bool_val(lhs_str == rhs_str)
@@ -1823,7 +1823,7 @@ fn str_compare_operands(frame: &mut Frame, node: NodeId) -> Option<std::cmp::Ord
     let lhs = frame.get_value_by_global(inputs[0]);
     let rhs = frame.get_value_by_global(inputs[1]);
     match (lhs.heap_obj(), rhs.heap_obj()) {
-        (Some(crate::Value::HeapObj::Str(a)), Some(crate::Value::HeapObj::Str(b))) => {
+        (Some(crate::value::HeapObj::Str(a)), Some(crate::value::HeapObj::Str(b))) => {
             Some(a.compare(b))
         }
         _ => None,
@@ -1866,7 +1866,7 @@ pub fn compute_ge_str(frame: &mut Frame, node: NodeId) -> Value {
 ///   - Void → "void"
 ///   - 其他 Ref → "<non-scalar>"
 pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, GlueStr, ValueTag};
+    use crate::value::{HeapObj, GlueStr, ValueTag};
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
 
@@ -1902,7 +1902,7 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
 /// 覆盖所有标量互转：int↔int（截断/扩展）、int↔float、float↔float、bool→int、char→int。
 /// 目标类型从 cast_target_types 元数据读取，按 ValueTag 分派构造对应 Value。
 pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::ValueTag;
+    use crate::value::ValueTag;
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
     let target_ty = graph.cast_target_types[node.0 as usize]
@@ -1942,10 +1942,10 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
         ValueTag::U128 => Value::u128(if src_is_float { src_f64 as u128 } else { val.as_u128() }),
         ValueTag::Isize => Value::isize_val(if src_is_float { src_f64 as isize } else { val.as_isize() }),
         ValueTag::Usize => Value::usize_val(if src_is_float { src_f64 as usize } else { val.as_usize() }),
-        ValueTag::F16 => Value::f16(crate::Value::F16::from_f64(src_f64)),
+        ValueTag::F16 => Value::f16(crate::value::F16::from_f64(src_f64)),
         ValueTag::F32 => Value::f32(src_f64 as f32),
         ValueTag::F64 => Value::f64(src_f64),
-        ValueTag::F128 => Value::f128(crate::Value::F128::from_f64(src_f64)),
+        ValueTag::F128 => Value::f128(crate::value::F128::from_f64(src_f64)),
         ValueTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
         ValueTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
         _ => unreachable!("non-scalar target_tag {:?} in cast", target_tag),
@@ -1976,8 +1976,8 @@ pub fn compute_ref_of(frame: &mut Frame, node: NodeId) -> Value {
     match &v {
         // 标量/Null/Void → 包装进 Cell
         Value::Scalar(_, _) | Value::Null | Value::Void => {
-            let cell = crate::Value::Cell::new(v.clone());
-            Value::ref_val(crate::Value::HeapObj::Cell(cell))
+            let cell = crate::value::Cell::new(v.clone());
+            Value::ref_val(crate::value::HeapObj::Cell(cell))
         }
         // 已是堆引用：直接共享 Arc（引用语义，不深拷贝）
         Value::Ref(_) => v,
@@ -1992,7 +1992,7 @@ pub fn compute_deref_read(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
     match v.heap_obj() {
-        Some(crate::Value::HeapObj::Cell(c)) => c.get(),
+        Some(crate::value::HeapObj::Cell(c)) => c.get(),
         _ => v,
     }
 }
@@ -2006,7 +2006,7 @@ pub fn compute_deref_write(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let ref_val = frame.get_value_by_global(inputs[0]);
     let new_val = frame.get_value_by_global(inputs[1]);
-    if let Some(crate::Value::HeapObj::Cell(c)) = ref_val.heap_obj() {
+    if let Some(crate::value::HeapObj::Cell(c)) = ref_val.heap_obj() {
         c.set(new_val.clone());
     }
     new_val
@@ -2037,17 +2037,17 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
     // Arc 的引用计数不变（不 clone 也不 drop），仅修改堆数据。
     if let Some(val) = frame.value_table.get_value_mut(record_node_local.0 as usize) {
         if let Value::Ref(arc) = val {
-            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::Value::HeapObj;
+            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
             unsafe {
                 match &mut *ptr {
-                    crate::Value::HeapObj::Record(r) => {
+                    crate::value::HeapObj::Record(r) => {
                         if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name.as_str())) {
                             if idx < r.fields.len() {
                                 r.fields[idx] = new_value.clone();
                             }
                         }
                     }
-                    crate::Value::HeapObj::Adt(a) => {
+                    crate::value::HeapObj::Adt(a) => {
                         if let Some(idx) = a.fields.iter().position(|f| f.name.as_deref() == Some(field_name.as_str())) {
                             a.fields[idx].value = new_value.clone();
                         }
@@ -2075,8 +2075,8 @@ pub fn compute_array_len(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
     let len = match val.heap_obj() {
-        Some(crate::Value::HeapObj::Array(arr)) => arr.len() as i32,
-        Some(crate::Value::HeapObj::Str(s)) => s.codepoint_count() as i32,
+        Some(crate::value::HeapObj::Array(arr)) => arr.len() as i32,
+        Some(crate::value::HeapObj::Str(s)) => s.codepoint_count() as i32,
         _ => 0,
     };
     Value::i32(len)
@@ -2113,8 +2113,8 @@ pub fn compute_eq_obj(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
     let rhs = frame.get_value_by_global(inputs[1]);
-    let eq = crate::Value::ValueArena::with_global(|arena| {
-        crate::Value::value_equals_with_arena(&lhs, &rhs, arena)
+    let eq = crate::value::ValueArena::with_global(|arena| {
+        crate::value::value_equals_with_arena(&lhs, &rhs, arena)
     });
     Value::bool_val(eq)
 }
@@ -2124,15 +2124,15 @@ pub fn compute_ne_obj(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
     let rhs = frame.get_value_by_global(inputs[1]);
-    let neq = crate::Value::ValueArena::with_global(|arena| {
-        !crate::Value::value_equals_with_arena(&lhs, &rhs, arena)
+    let neq = crate::value::ValueArena::with_global(|arena| {
+        !crate::value::value_equals_with_arena(&lhs, &rhs, arena)
     });
     Value::bool_val(neq)
 }
 
 /// compute_fn: 列表拼接（ConcatList），两个 Array 拼接为新 Array。
 pub fn compute_concat_list(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, ArrayValue};
+    use crate::value::{HeapObj, ArrayValue};
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
     let rhs = frame.get_value_by_global(inputs[1]);
@@ -2149,7 +2149,7 @@ pub fn compute_concat_list(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn: 范围生成（Range，a..b，左闭右开）。
 pub fn compute_range(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, Range};
+    use crate::value::{HeapObj, Range};
     read_node_inputs!(frame, node, graph, n, inputs);
     let start = frame.get_value_by_global(inputs[0]).as_i64();
     let end = frame.get_value_by_global(inputs[1]).as_i64();
@@ -2158,7 +2158,7 @@ pub fn compute_range(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn: 范围生成（RangeInclusive，a..=b，左闭右闭）。
 pub fn compute_range_inclusive(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, Range};
+    use crate::value::{HeapObj, Range};
     read_node_inputs!(frame, node, graph, n, inputs);
     let start = frame.get_value_by_global(inputs[0]).as_i64();
     let end = frame.get_value_by_global(inputs[1]).as_i64();
@@ -2297,8 +2297,8 @@ pub fn compute_await(frame: &mut Frame, node: NodeId) -> Value {
 pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let capacity = frame.get_value_by_global(inputs[0]).as_usize();
-    Value::ref_val(crate::Value::HeapObj::ChannelVal(
-        std::sync::Arc::new(crate::Value::ChannelValue::new(capacity)),
+    Value::ref_val(crate::value::HeapObj::ChannelVal(
+        std::sync::Arc::new(crate::value::ChannelValue::new(capacity)),
     ))
 }
 
@@ -2309,14 +2309,14 @@ pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
 /// 唤醒等待该 channel 的挂起帧（内联触发，零延迟）。
 pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
     use std::sync::Arc;
-    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let ch_val = frame.get_value_by_global(inputs[0]);
     let val = frame.get_value_by_global(inputs[1]);
     let make_err = |msg: &str| {
         let record = Arc::new(RecordValue {
             type_name: "ChannelError".to_string(),
-            fields: vec![Value::ref_val(HeapObj::Str(crate::Value::GlueStr::new(msg)))],
+            fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
             field_names: vec![Some("message".to_string())],
             field_ref_bits: 1,
         });
@@ -2384,7 +2384,7 @@ pub fn compute_async_call_launch(frame: &mut Frame, node: NodeId) -> Value {
 /// 从 graph.closure_infos 取子图 id + arity，合并 inputs（捕获值）构造 Closure 堆对象。
 /// 节点的 inputs 即捕获的 upvalues（按 compile_lambda 中 captured 顺序）。
 pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, Closure, Cell};
+    use crate::value::{HeapObj, Closure, Cell};
     read_node_inputs!(frame, node, graph, n, inputs);
     let info = graph.closure_infos[node.0 as usize]
         .expect("closure construct node has no ClosureInfo");
@@ -2414,7 +2414,7 @@ pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 合并节点 inputs（各方法 upvalues 依次拼接）构造多个 Closure，
 /// 打包成 TraitValue 堆对象。
 pub fn compute_trait_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, Closure, TraitValue};
+    use crate::value::{HeapObj, Closure, TraitValue};
     read_node_inputs!(frame, node, graph, n, inputs);
     let info = graph.trait_construct_infos[node.0 as usize]
         .as_ref()
@@ -2456,7 +2456,7 @@ pub fn compute_trait_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 合并节点 inputs（upvalues）构造 LazyValue 堆对象。
 /// thunk 未求值，首次 force 时启动子图计算并缓存结果。
 pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, LazyValue, Closure};
+    use crate::value::{HeapObj, LazyValue, Closure};
     read_node_inputs!(frame, node, graph, n, inputs);
     let info = graph.lazy_construct_infos[node.0 as usize]
         .as_ref()
@@ -2499,7 +2499,7 @@ pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 此函数在 compute_reflect_format / compute_reflect_scalar_to_str 中调用，
 /// 用于在格式化前强制求值 lazy 值。
 pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Value {
-    use crate::Value::HeapObj;
+    use crate::value::HeapObj;
 
     // 提取 LazyValue 引用
     let arc = match lazy_val {
@@ -2663,10 +2663,10 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 let recv_val = frame.get_value_by_global(inputs[0]);
 
                 let (target_sg, upvalues): (SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
-                    Some(crate::Value::HeapObj::TraitVal(tv)) => {
+                    Some(crate::value::HeapObj::TraitVal(tv)) => {
                         let idx = method_idx as usize;
                         match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
-                            Some(crate::Value::HeapObj::Closure(c)) => {
+                            Some(crate::value::HeapObj::Closure(c)) => {
                                 (SubGraphId(c.func_id), c.upvalues.clone())
                             }
                             _ => panic!("vtable method_idx {} is not a Closure", method_idx),
@@ -2758,7 +2758,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             // throw 传播：返回值为 ThrowVal(Err) 时设 Return 信号
             let is_throw_err = matches!(
                 child_result.heap_obj(),
-                Some(crate::Value::HeapObj::ThrowVal(t)) if matches!(t.payload, crate::Value::ThrowPayload::Err(_))
+                Some(crate::value::HeapObj::ThrowVal(t)) if matches!(t.payload, crate::value::ThrowPayload::Err(_))
             );
             if is_throw_err {
                 frame.control_signal = ControlSignal::Return(child_result);
@@ -2833,7 +2833,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 /// 构造 HeapObj::Partial。remaining_arity = subgraph.param_count - bound_count。
 /// 顶层函数偏应用时 upvalues 为空，self_upvalue_idx = -1。
 pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, PartialApplication};
+    use crate::value::{HeapObj, PartialApplication};
     read_node_inputs!(frame, node, graph, n, inputs);
     let info = graph.partial_infos[node.0 as usize]
         .expect("partial construct node has no PartialInfo");
@@ -2855,7 +2855,7 @@ pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_str_bytes（idx 287）：str.bytes() → u8[]
 /// 将 GlueStr 的 UTF-8 字节序列构造为 u8 数组。
 pub fn compute_str_bytes(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, ArrayValue};
+    use crate::value::{HeapObj, ArrayValue};
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
     let bytes: Vec<Value> = match val.heap_obj() {
@@ -2883,13 +2883,13 @@ pub fn compute_str_bytes(frame: &mut Frame, node: NodeId) -> Value {
 /// 用于 compute_closure_call 将 Cell upvalues 转为原始值注入子帧参数。
 fn unwrap_cell(v: &Value) -> Value {
     match v.heap_obj() {
-        Some(crate::Value::HeapObj::Cell(cell)) => cell.get(),
+        Some(crate::value::HeapObj::Cell(cell)) => cell.get(),
         _ => v.clone(),
     }
 }
 
 pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, PartialApplication};
+    use crate::value::{HeapObj, PartialApplication};
     read_node_inputs!(frame, node, graph, n, inputs);
     let callable_val = frame.get_value_by_global(inputs[0]);
 
@@ -3065,15 +3065,15 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
         if let Some(ref closure_val) = frame.closure_val {
             if let Value::Ref(arc) = closure_val {
                 let upvalues: &[Value] = match arc.as_ref() {
-                    crate::Value::HeapObj::Closure(c) => &c.upvalues,
-                    crate::Value::HeapObj::Partial(p) => &p.upvalues,
+                    crate::value::HeapObj::Closure(c) => &c.upvalues,
+                    crate::value::HeapObj::Partial(p) => &p.upvalues,
                     _ => &[],
                 };
                 if !upvalues.is_empty() {
                     let sg = &frame.graph.subgraphs[frame.subgraph_id.0 as usize];
                     for (i, &outer_node) in sg.upvalue_outer_nodes.iter().enumerate() {
                         if outer_node == target && i < upvalues.len() {
-                            if let Some(crate::Value::HeapObj::Cell(cell)) = upvalues[i].heap_obj() {
+                            if let Some(crate::value::HeapObj::Cell(cell)) = upvalues[i].heap_obj() {
                                 cell.set(val.clone());
                                 written_cell = true;
                             }

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::ir::Ir::*;
-use crate::Value::{Value, ValueArena};
+use crate::value::{Value, ValueArena};
 use std::cell::{RefCell, RefMut};
 use std::ops::DerefMut;
 use parking_lot::{Condvar, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
@@ -98,32 +98,60 @@ impl Engine<Single> {
     }
 
     /// 单线程事件循环（替代 run_event_loop + run_entry）
+    ///
+    /// 空闲时策略（队列空 + 有 pending events）：
+    /// - 有 pending timer：park 到最近 deadline（Condvar.wait_for）
+    /// - 无 pending timer 但有 event_waiters：yield_now（等 channel/async 事件）
+    /// - 无 pending 且无 waiters：panic（死锁检测）
     pub(super) fn run_single(&self) -> Value {
         let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
         let fid = self.init_frame(entry_sg);
         let rq = self.ready_frames.as_ref().unwrap();
         rq.borrow_mut().push_back(fid);
 
+        // 单线程 park 用的 Condvar（无需被外部唤醒，仅用于 wait_for 精确等待）
+        let park_mutex = ParkingMutex::new(());
+        let park_cv = Condvar::new();
+
         let mut loop_guard: u64 = 0;
         loop {
             loop_guard += 1;
-            if loop_guard > 20000000 {
+            if loop_guard > 200000000 {
                 panic!("event loop stuck: guard={}", loop_guard);
             }
             let queue = QueueHandle::Single(rq);
-            let fid = match rq.borrow_mut().pop_front() {
+            // 先 pop（RefMut 在语句结束时释放），再处理空队列逻辑
+            let fid = rq.borrow_mut().pop_front();
+            let fid = match fid {
                 Some(f) => f,
                 None => {
-                    // 队列空时检查 timer（可能触发事件唤醒挂起帧）
+                    // 队列空：检查 timer（check_timers → on_event_arrived → push 需要 borrow_mut）
                     self.check_timers(&queue);
-                    let ew = self.event_waiters.lock();
-                    if ew.is_empty() {
-                        panic!(
-                            "event loop exhausted: no ready frames and no pending events"
-                        );
+                    if let Some(result) = self.result.lock().take() {
+                        return result;
                     }
-                    drop(ew);
-                    std::thread::yield_now();
+                    // 仍然无就绪帧：决定 park 策略
+                    if rq.borrow().is_empty() {
+                        let next_deadline = self.timer_runtime.lock().next_deadline();
+                        let ew_empty = self.event_waiters.lock().is_empty();
+                        if ew_empty && next_deadline.is_none() {
+                            panic!(
+                                "event loop exhausted: no ready frames and no pending events"
+                            );
+                        }
+                        if let Some(deadline) = next_deadline {
+                            // 有 pending timer：park 到 deadline（精确等待，不忙轮询）
+                            let now = std::time::Instant::now();
+                            let wait_dur = deadline.saturating_duration_since(now);
+                            if !wait_dur.is_zero() {
+                                let mut guard = park_mutex.lock();
+                                park_cv.wait_for(&mut guard, wait_dur);
+                            }
+                        } else {
+                            // 无 timer 但有 event_waiters：yield 等 channel/async/subgraph 事件
+                            std::thread::yield_now();
+                        }
+                    }
                     continue;
                 }
             };
@@ -272,7 +300,17 @@ fn worker_main(
                 *active += 1;
                 continue;
             }
-            let park_timeout = std::time::Duration::from_millis(10);
+            // park 前检查 timer（可能在 park 准备期间有 timer 到期）
+            let queue = QueueHandle::Multi(&local_queue);
+            shared.check_timers(&queue);
+            // park timeout = 最近 timer deadline（无 timer 则默认 10ms）
+            let park_timeout = shared.timer_runtime.lock().next_deadline()
+                .map(|deadline| {
+                    let now = std::time::Instant::now();
+                    deadline.saturating_duration_since(now)
+                })
+                .filter(|d| !d.is_zero())
+                .unwrap_or_else(|| std::time::Duration::from_millis(10));
             shared.wakeup.as_ref().unwrap().1.wait_for(&mut guard, park_timeout);
         }
         {

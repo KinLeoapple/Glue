@@ -8,7 +8,7 @@
 
 use super::Tag::*;
 use super::ty::*;
-use crate::Value::{Char, F128, F16, ValueArena, ValueHandle};
+use crate::value::{Char, F128, F16, ValueArena, ValueHandle};
 use rustc_hash::FxHashMap;
 
 /// 类型操作 trait：描述某种类型在原始字节缓冲区与 `ValueArena` 句柄之间的

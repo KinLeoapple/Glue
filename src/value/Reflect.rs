@@ -11,7 +11,8 @@
 
 use std::ffi::CString;
 
-use crate::Value::{F16, F128, HeapObj, RefKind, ValueTag, Value, ValueArena, ValueHandle};
+use super::arena::ValueArena;
+use super::value::{F16, F128, HeapObj, RefKind, ValueTag, Value, ValueHandle};
 
 // =========================================================================
 // TypeKind 枚举（与 Glue 侧 kind 值一致，供用户判断类型分类）

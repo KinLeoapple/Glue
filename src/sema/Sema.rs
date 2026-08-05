@@ -526,6 +526,13 @@ pub struct SemaResult {
     /// sema 检查期间由 InferContext 维护并跨模块累积，check 完成后
     /// 镜像到此字段供 IR 层（IrBuilder）访问 trait 方法分派信息。
     pub witness_table: WitnessTable,
+    /// 模块函数调用的 recv ExprId key 集合（Zig @This 语义）。
+    ///
+    /// 当 `import std.time.Duration` 且模块内定义 `pub type Duration` 时，
+    /// predefine 用 redefine 将 ModuleRef 覆盖为构造器 Fn。sema MethodCall 路径 0b
+    /// 检测到此情况后，在此集合标记 recv 的 expr key，使 IR 编译时不传 recv
+    /// （`Duration.from_millis(100)` → `from_millis(100)` 而非 `from_millis(Duration, 100)`）。
+    pub module_func_recv_exprs: FxHashSet<u64>,
 }
 
 impl Default for SemaResult {
@@ -583,6 +590,7 @@ impl SemaResult {
             resolved_types: FxHashMap::default(),
             field_id_map: FxHashMap::default(),
             witness_table: WitnessTable::new(),
+            module_func_recv_exprs: FxHashSet::default(),
         }
     }
 

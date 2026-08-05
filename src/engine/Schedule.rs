@@ -3,7 +3,7 @@
 use super::*;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
-use crate::Value::Value;
+use crate::value::Value;
 use crate::ir::Compute::char_from_u32_or_nul;
 
 // =========================================================================
@@ -24,7 +24,7 @@ macro_rules! exec_bin_batch {
             b.push($frame.get_value_by_global(inp[1]).$acc());
         }
         let mut dst = vec![0 as $rust; n];
-        crate::Value::$batch_fn(&mut dst, &a, &b, $op);
+        crate::value::$batch_fn(&mut dst, &a, &b, $op);
         for (i, &lid) in $locals.iter().enumerate() {
             let gid = NodeId(lid.0 + $ns.0);
             let cc = $graph.downstreams[gid.0 as usize].len() as u16;
@@ -47,7 +47,7 @@ macro_rules! exec_cmp_batch {
             b.push($frame.get_value_by_global(inp[1]).$acc());
         }
         let mut mask = vec![0u8; n];
-        crate::Value::$batch_fn(&mut mask, &a, &b, $op);
+        crate::value::$batch_fn(&mut mask, &a, &b, $op);
         for (i, &lid) in $locals.iter().enumerate() {
             let gid = NodeId(lid.0 + $ns.0);
             let cc = $graph.downstreams[gid.0 as usize].len() as u16;
@@ -68,7 +68,7 @@ macro_rules! exec_unary_batch {
             a.push($frame.get_value_by_global(inp[0]).$acc());
         }
         let mut dst = vec![0 as $rust; n];
-        crate::Value::batch_unaryop(&mut dst, &a, $op);
+        crate::value::batch_unaryop(&mut dst, &a, $op);
         for (i, &lid) in $locals.iter().enumerate() {
             let gid = NodeId(lid.0 + $ns.0);
             let cc = $graph.downstreams[gid.0 as usize].len() as u16;
@@ -88,7 +88,7 @@ fn process_batch_group(
     node_start: NodeId,
     info: BatchInfo,
 ) -> bool {
-    use crate::Value::{ValueTag, BinOp, CmpOp, UnaryOp};
+    use crate::value::{ValueTag, BinOp, CmpOp, UnaryOp};
     let _ = (BinOp::Add, CmpOp::Eq, UnaryOp::Neg); // 抑制 unused import
 
     if locals.is_empty() { return false; }
@@ -245,7 +245,7 @@ pub(super) fn alloc_const_value(cv: ConstValue) -> Value {
         ConstValue::Null => Value::NULL,
         ConstValue::Void => Value::VOID,
         ConstValue::Str(s) => {
-            use crate::Value::{HeapObj, GlueStr};
+            use crate::value::{HeapObj, GlueStr};
             Value::ref_val(HeapObj::Str(GlueStr::new(s)))
         }
     }
@@ -462,10 +462,10 @@ impl<S: LockStrategy> Engine<S> {
                     let (target_sg, upvalues): (crate::ir::Ir::SubGraphId, Vec<Value>) = match recv_val
                         .heap_obj()
                     {
-                        Some(crate::Value::HeapObj::TraitVal(tv)) => {
+                        Some(crate::value::HeapObj::TraitVal(tv)) => {
                             let idx = method_idx as usize;
                             match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
-                                Some(crate::Value::HeapObj::Closure(c)) => {
+                                Some(crate::value::HeapObj::Closure(c)) => {
                                     (crate::ir::Ir::SubGraphId(c.func_id), c.upvalues.clone())
                                 }
                                 _ => panic!("vtable method_idx {} is not a Closure", method_idx),
@@ -741,10 +741,10 @@ impl<S: LockStrategy> Engine<S> {
                                             {
                                                 *tid
                                             } else {
-                                                let duration_ms = event_val.as_i32();
+                                                let duration_ns = event_val.as_i64();
                                                 let tid = self.timer_runtime.lock().start(
-                                                    std::time::Duration::from_millis(
-                                                        duration_ms as u64,
+                                                    std::time::Duration::from_nanos(
+                                                        duration_ns as u64,
                                                     ),
                                                 );
                                                 frame.select_timers.push((branch_idx, tid));

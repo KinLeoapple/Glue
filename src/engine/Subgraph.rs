@@ -3,7 +3,7 @@
 use super::*;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
-use crate::Value::Value;
+use crate::value::Value;
 
 /// 尾调用图跳转：复用当前帧执行目标子图（帧池零分配）。
 pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubGraphId, args: &[Value]) {
