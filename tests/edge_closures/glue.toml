@@ -1,3 +1,0 @@
-name = "edge_closures"
-version = "0.1.0"
-entry = "src/Main.glue"

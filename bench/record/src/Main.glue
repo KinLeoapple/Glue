@@ -3,7 +3,7 @@
 // 强化：1M→10M 迭代，2 字段→6 字段，单构造器→多构造器，新增嵌套记录
 
 // 单构造器记录（测试 tag 检查跳过优化）
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 type Point = Point(x: i64, y: i64)
 
 // 多字段记录（测试 field_id 直接索引）

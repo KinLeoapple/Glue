@@ -1,0 +1,152 @@
+// 功能验证：模式匹配（嵌套构造器/or-pattern/guard/字面量/解构/通配）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+type Tree =
+    | Leaf
+    | Node(i32, Tree, Tree)
+
+type Shape =
+    | Circle(f64)
+    | Rect(f64, f64)
+
+type Pt = Pt(x: i32, y: i32)
+type Seg = Seg(a: Pt, b: Pt)
+
+// 嵌套构造器解构
+fun deepNest(t: Tree): i32 {
+    match t {
+        Node(_, Node(x, _, _), Node(y, _, _)) => x + y
+        Node(v, Leaf, Leaf) => v
+        Node(v, _, _) => v * 100
+        Leaf => -1
+    }
+}
+
+// or-pattern + guard
+fun classify(n: i32): str {
+    match n {
+        0 | 1 | 2 => "small"
+        n if n < 0 => "negative"
+        n if n % 2 == 0 => "even"
+        _ => "odd"
+    }
+}
+
+// 嵌套记录解构
+fun segLen(s: Seg): i32 {
+    match s {
+        Seg(Pt(x1, y1), Pt(x2, y2)) => (x2 - x1) + (y2 - y1)
+    }
+}
+
+// 字面量模式
+fun litMatch(s: str): i32 {
+    match s {
+        "a" | "b" | "c" => 1
+        "" => 0
+        _ => -1
+    }
+}
+
+// char 模式
+fun vowel(c: char): bool {
+    match c {
+        'a' | 'e' | 'i' | 'o' | 'u' => true
+        _ => false
+    }
+}
+
+fun main(): void {
+    println("=== Patterns ===")
+
+    // 嵌套构造器
+    val t1 = Node(1, Node(2, Leaf, Leaf), Node(3, Leaf, Leaf))
+    check(deepNest(t1) == 5, "nested Node destructuring")
+    check(deepNest(Node(7, Leaf, Leaf)) == 7, "Node Leaf Leaf")
+    check(deepNest(Node(7, Leaf, Node(1, Leaf, Leaf))) == 700, "Node _ _")
+    check(deepNest(Leaf) == -1, "Leaf")
+
+    // or-pattern + guard
+    check(classify(0) == "small", "or-pattern 0")
+    check(classify(1) == "small", "or-pattern 1")
+    check(classify(2) == "small", "or-pattern 2")
+    check(classify(-5) == "negative", "guard negative")
+    check(classify(4) == "even", "guard even")
+    check(classify(3) == "odd", "default odd")
+
+    // 嵌套记录解构
+    val seg = Seg(Pt(0, 0), Pt(3, 4))
+    check(segLen(seg) == 7, "nested record destructuring")
+
+    // 字面量模式
+    check(litMatch("a") == 1, "literal a")
+    check(litMatch("b") == 1, "literal b")
+    check(litMatch("c") == 1, "literal c")
+    check(litMatch("") == 0, "literal empty")
+    check(litMatch("xyz") == -1, "literal default")
+
+    // char 模式
+    check(vowel('a') == true, "vowel a")
+    check(vowel('e') == true, "vowel e")
+    check(vowel('x') == false, "not vowel x")
+
+    // 通配符
+    fun shapeName(s: Shape): str {
+        match s {
+            Circle(_) => "circle"
+            Rect(_, _) => "rect"
+        }
+    }
+    check(shapeName(Circle(1.0f64)) == "circle", "wildcard Circle")
+    check(shapeName(Rect(1.0f64, 2.0f64)) == "rect", "wildcard Rect")
+
+    // 带变量绑定
+    fun shapeDim(s: Shape): f64 {
+        match s {
+            Circle(r) => r
+            Rect(w, _) => w
+        }
+    }
+    check(shapeDim(Circle(5.0f64)) == 5.0f64, "binding Circle r")
+    check(shapeDim(Rect(3.0f64, 4.0f64)) == 3.0f64, "binding Rect w")
+
+    // match 表达式
+    val result = match 3 {
+        1 => 10
+        2 => 20
+        _ => 99
+    }
+    check(result == 99, "match expression default")
+
+    // 多 guard
+    fun signum(n: i32): i32 {
+        match n {
+            n if n > 0 => 1
+            n if n < 0 => -1
+            _ => 0
+        }
+    }
+    check(signum(5) == 1, "guard positive")
+    check(signum(-3) == -1, "guard negative")
+    check(signum(0) == 0, "guard zero")
+
+    summary()
+}

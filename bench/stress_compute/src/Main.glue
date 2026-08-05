@@ -17,7 +17,7 @@
 // ============================================================
 // 1. 嵌套循环算术 — 纯 VM dispatch 压力
 // ============================================================
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 fun nestedLoop(n: i32): i64 {
     var total: i64 = 0
     var i: i32 = 0

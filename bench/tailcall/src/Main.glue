@@ -3,7 +3,7 @@
 // 强化：10万→1000万迭代，新增 3+ 函数互递归、状态机 TCO
 
 // 尾递归求和
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 fun countUp(n: i64, acc: i64): i64 {
     if n == 0 { acc } else { countUp(n - 1, acc + n) }
 }

@@ -1,0 +1,31 @@
+// 性能测试：尾递归 TCO（压测递归优化/栈深度）
+
+fun countDown(n: i32, acc: i32): i32 {
+    if n <= 0 { acc } else { countDown(n - 1, acc + 1) }
+}
+
+fun sumTo(n: i32, acc: i32): i32 {
+    if n <= 0 { acc } else { sumTo(n - 1, acc + n) }
+}
+
+fun main(): void {
+    println("=== Recursion TCO Benchmark ===")
+
+    // 100万次尾递归
+    val t0 = __instant_now_ns()
+    val result1 = countDown(1000000, 0)
+    val t1 = __instant_now_ns()
+    println("countDown(1000000) = {result1}")
+    val elapsed1 = (t1 - t0) / 1000000i64
+    println("elapsed: {elapsed1} ms")
+
+    // 尾递归求和
+    val t2 = __instant_now_ns()
+    val result2 = sumTo(1000000, 0)
+    val t3 = __instant_now_ns()
+    println("sumTo(1000000) = {result2}")
+    val elapsed2 = (t3 - t2) / 1000000i64
+    println("elapsed: {elapsed2} ms")
+
+    println("=== Done ===")
+}

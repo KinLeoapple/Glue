@@ -1,0 +1,113 @@
+// 功能验证：Trait（定义/实现/多 trait 组合/按接收者分派/默认方法）
+// 已修复 P1 #12：trait 默认方法现在可用（单态化特化）。
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// 带默认方法的 trait（默认方法当前有 bug，仅测试显式实现的方法）
+trait Greet {
+    fun name(self): str
+    fun hello(self): str {
+        "Hello, " + self.name()
+    }
+}
+
+trait Sizeable {
+    fun sz(self): i32
+}
+
+trait Show {
+    fun show(self): str
+}
+
+// 多 trait 组合（hello 使用 trait 默认方法，不显式实现）
+type Ordering: (Greet, Sizeable, Show) = | Lt | Eq | Gt {
+    fun name(self): str {
+        match self {
+            Lt => "less"
+            Eq => "equal"
+            Gt => "greater"
+        }
+    }
+
+    fun sz(self): i32 {
+        match self {
+            Lt => -1
+            Eq => 0
+            Gt => 1
+        }
+    }
+
+    fun show(self): str {
+        "Ordering." + self.name()
+    }
+}
+
+// 不同类型实现同一 trait
+type Color: Sizeable = | Red | Green | Blue {
+    fun sz(self): i32 { 3 }
+}
+
+type Pt: (Sizeable, Show) = Pt(x: i32, y: i32) {
+    fun sz(self): i32 { 2 }
+    fun show(self): str {
+        "Pt(" + cast(self.x).to(str) + "," + cast(self.y).to(str) + ")"
+    }
+}
+
+// 实现 Greet 的记录（hello 使用 trait 默认方法）
+type Animal: Greet = Animal(species: str, sound: str) {
+    fun name(self): str {
+        self.species
+    }
+}
+
+fun main(): void {
+    println("=== Traits ===")
+
+    // 显式实现的 trait 方法
+    check(Lt.name() == "less", "implemented method name Lt")
+    // trait 默认方法（已修复 P1 #12：单态化特化使默认方法可用）
+    check(Lt.hello() == "Hello, less", "default hello Lt")
+    check(Eq.hello() == "Hello, equal", "default hello Eq")
+    check(Gt.hello() == "Hello, greater", "default hello Gt")
+
+    // 多 trait
+    check(Lt.sz() == -1, "Sizeable on Lt")
+    check(Lt.show() == "Ordering.less", "Show on Lt")
+    check(Eq.sz() == 0, "Sizeable on Eq")
+    check(Gt.sz() == 1, "Sizeable on Gt")
+
+    // 不同类型同一 trait
+    check(Red.sz() == 3, "Color sz")
+    check(Pt(1, 2).sz() == 2, "Pt sz")
+
+    // Show trait
+    check(Pt(3, 4).show() == "Pt(3,4)", "Pt show")
+
+    // Animal 实现 Greet
+    check(Animal("Dog", "Woof").name() == "Dog", "Animal name")
+    check(Animal("Dog", "Woof").hello() == "Hello, Dog", "Animal hello")
+
+    // 不同 Ordering 值的 trait 方法
+    check(Eq.show() == "Ordering.equal", "Show on Eq")
+    check(Gt.show() == "Ordering.greater", "Show on Gt")
+
+    summary()
+}

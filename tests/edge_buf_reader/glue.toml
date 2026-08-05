@@ -1,3 +1,0 @@
-name = "edge_buf_reader"
-version = "0.1.0"
-entry = "src/Main.glue"

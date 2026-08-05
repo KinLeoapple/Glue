@@ -2,7 +2,7 @@
 // 目标：压测 Str 的 SSO/堆切换、拼接、迭代、比较、子串
 // 强化：2000→20000 拼接，新增子串搜索和重复构建
 
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 fun buildString(n: i32): str {
     var s: str = ""
     var i: i32 = 0
@@ -29,7 +29,7 @@ fun repeatBuild(iters: i32, len: i32): i64 {
 fun mixedStringOps(s: str): i64 {
     var sum: i64 = 0
     // 字符迭代
-    for ch in s {
+    for ch in str_iter(s) {
         sum = sum + cast(ch).to(i64)
     }
     // 索引访问

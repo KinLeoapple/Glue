@@ -2,7 +2,7 @@
 // 目标：压测多变量跨作用域查找、深嵌套作用域
 // 强化：5000→10000 外层，1000→2000 内层，变量 4→8 个，嵌套 1→3 层
 
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 fun computeLevel3(seed: i64, outer_a: i64, outer_b: i64, outer_c: i64): i64 {
     val a: i64 = seed + 1
     val b: i64 = seed + 2

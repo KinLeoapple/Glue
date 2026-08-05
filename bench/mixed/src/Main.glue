@@ -9,7 +9,7 @@
 // ============================================================
 // 1. 表达式 AST
 // ============================================================
-import std.io.Console.{println}
+import builtin.io.Console.{println}
 type Expr =
     | ENum(i64)
     | EAdd(Expr, Expr)
@@ -63,7 +63,7 @@ fun buildStudents(n: i32): Student[] {
 fun avgScore(students: Student[]): i64 {
     var total: i64 = 0
     var count: i64 = 0
-    for s in students {
+    for s in students.iter() {
         match s {
             Student(_, score, _) => {
                 total = total + score
@@ -76,7 +76,7 @@ fun avgScore(students: Student[]): i64 {
 
 fun maxScore(students: Student[]): i64 {
     var max: i64 = 0
-    for s in students {
+    for s in students.iter() {
         match s {
             Student(_, score, _) => {
                 if score > max { max = score }
