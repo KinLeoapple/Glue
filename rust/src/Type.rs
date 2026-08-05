@@ -218,62 +218,103 @@ pub enum TypeFamily {
 }
 
 // =========================================================================
-// 第四部分：Ty — 统一类型枚举
+// 第四部分：Ty — 统一类型枚举（唯一类型来源，Copy，无外部依赖）
 // =========================================================================
 
-/// Glue 语义层统一类型表示。
+/// record 字段：`name == None` 表示位置字段。
 ///
-/// 所有内置类型有独立变体（编译器穷尽检查），用户自定义类型通过 Adt
-/// 引用 TypeArena。调用方通过 family() 区分类型族，通过 is_scalar()
-/// 等便捷方法判断类别。
-///
-/// 注意：因含 `Box<[TypeHandle]>` / `Box<str>` 字段，未 derive `Copy`。
-/// 标量变体（无 Box）可手动 `clone()`；复合变体克隆会分配堆内存。
+/// 字段类型通过 `TypeHandle` 索引 arena，避免自引用。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldType {
+    pub name: Option<Box<str>>,
+    pub ty: TypeHandle,
+}
+
+/// Trait 方法签名（压平后的 sema TraitInfo 方法）。
+///
+/// `return_type` 为返回类型的 arena 句柄（原 `&'static TypeDescriptor` 改为
+/// `TypeHandle`，避免 Type.rs 依赖 TypeDesc.rs 形成循环）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TraitMethodSig {
+    pub name: Box<str>,
+    pub param_count: u8,
+    pub return_type: TypeHandle,
+    pub is_async: bool,
+    /// 是否有 default 实现体（IRBuilder 据此决定是否从 AST 取 body）
+    pub has_body: bool,
+}
+
+/// 环境句柄：`EnvArena` 中的索引（从 sema/Sema.rs 移入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EnvId(pub u32);
+
+/// Glue 统一类型表示。
+///
+/// **唯一类型来源**：sema 和 IR 层都使用 `Ty`，不再有 `ConcreteType`。
+///
+/// **Copy 枚举**：所有载荷均为 `u32`（`TypeHandle` 或 `DetailId`），无堆分配。
+/// 结构数据（params/fields/method_sigs/name 等）存于 `TypeArena` 附属表，
+/// 通过 `DetailId` 索引。
+///
+/// **分层设计：**
+/// - **Basic types**（24 内置 + 4 复合 + 7 泛型）：内置类型，变体本身可做家族判断
+/// - **Other types**（6 用户类型）：用户自定义类型，携带 `DetailId` 索引结构数据
+///
+/// 通过 `is_basic()` / `is_other()` 区分两层，通过 `family()` 做家族分派。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
-    // ── 18 个标量 ──
+    // ── Basic: 18 个标量（无载荷）──
     Bool, Char,
     I8, I16, I32, I64, I128,
     U8, U16, U32, U64, U128,
     Isize, Usize,
     F16, F32, F64, F128,
 
-    // ── 非标量内置（3 个）──
+    // ── Basic: 3 个非标量内置（无载荷）──
     Str,    // fat pointer
     Null,   // 无值
     Void,   // 无类型
 
-    // ── 内置泛型（7 个，携带 TypeHandle 参数）──
-    /// Throw<V, E>
-    Throw { value: TypeHandle, error: TypeHandle },
-    /// Channel<T>
-    Channel { elem: TypeHandle },
-    /// Async<T>
-    Async { value: TypeHandle },
-    /// Lazy<T>
-    Lazy { value: TypeHandle },
-    /// Atomic<T>
-    Atomic { elem: TypeHandle },
-    /// Sender<T>
-    Sender { elem: TypeHandle },
-    /// Receiver<T>
-    Receiver { elem: TypeHandle },
+    // ── Basic: 7 个内置泛型（DetailId 索引 arena 中的子类型结构）──
+    /// Throw<V, E>（arena 存 { value: TypeHandle, error: TypeHandle }）
+    Throw(DetailId),
+    /// Channel<T>（arena 存 { elem: TypeHandle }）
+    Channel(DetailId),
+    /// Async<T>（arena 存 { value: TypeHandle }）
+    Async(DetailId),
+    /// Lazy<T>（arena 存 { value: TypeHandle }）
+    Lazy(DetailId),
+    /// Atomic<T>（arena 存 { elem: TypeHandle }）
+    Atomic(DetailId),
+    /// Sender<T>（arena 存 { elem: TypeHandle }）
+    Sender(DetailId),
+    /// Receiver<T>（arena 存 { elem: TypeHandle }）
+    Receiver(DetailId),
 
-    // ── 复合类型 ──
-    /// 数组 [T; N]，size == None 为切片
-    Array { elem: TypeHandle, size: Option<u64> },
-    /// 引用 &T（is_raw=false）/ 裸指针 *T（is_raw=true）
-    Ref { inner: TypeHandle, is_raw: bool },
-    /// 函数 (P1, P2) -> R
-    Fn { params: Box<[TypeHandle]>, return_type: TypeHandle },
-    /// 可空 T?
-    Nullable { inner: TypeHandle },
-    /// trait 类型 Ord<T>
-    Trait { name: Box<str>, args: Box<[TypeHandle]> },
+    // ── Basic: 4 个复合类型（DetailId 索引 arena 中的结构详情）──
+    /// 数组 [T; N]（arena 存 { elem: TypeHandle, size: Option<u64> }）
+    Array(DetailId),
+    /// 引用 &T / 裸指针 *T（arena 存 { inner: TypeHandle, is_raw: bool }）
+    Ref(DetailId),
+    /// 函数 (P1, P2) -> R（arena 存 { params: Box<[TypeHandle]>, return_type: TypeHandle }）
+    Fn(DetailId),
+    /// 可空 T?（arena 存 { inner: TypeHandle }）
+    Nullable(DetailId),
 
-    // ── 用户自定义类型 ──
-    /// Adt（代数数据类型），name + type_args
-    Adt { name: Box<str>, args: Box<[TypeHandle]> },
+    // ── Other: 用户自定义类型（DetailId 索引结构数据）──
+    /// Adt（代数数据类型）（arena 存 { name: Box<str>, args: Box<[TypeHandle]> }）
+    Adt(DetailId),
+    /// 记录类型 { x: i32, y: i32 }（arena 存 { fields: Box<[FieldType]>, name: Option<Box<str>> }）
+    Record(DetailId),
+    /// trait 类型 Ord<T>（arena 存 { name: Box<str>, args: Box<[TypeHandle]> }）
+    Trait(DetailId),
+    /// trait 对象类型：inline_trait 值的存在类型
+    /// （arena 存 { trait_name: Box<str>, method_sigs: Box<[TraitMethodSig]> }）
+    TraitObject(DetailId),
+    /// 模块引用类型（arena 存 { path: Box<str>, env: EnvId }）
+    ModuleRef(DetailId),
+    /// 用户泛型应用 List<i32>（arena 存 { name: Box<str>, args: Box<[TypeHandle]> }）
+    Generic(DetailId),
 
     // ── 特殊 ──
     /// 发散类型（return/throw 早退路径，与任意类型统一为对方）
@@ -283,6 +324,13 @@ pub enum Ty {
     /// 未知类型
     Unknown,
 }
+
+/// 类型结构详情 ID（u32 索引到 TypeArena::details 表）。
+///
+/// 复合类型和用户类型的结构数据存于 TypeArena 附属表，通过此 ID 索引。
+/// `Ty` 所有变体只携带 `TypeHandle`(u32) / `DetailId`(u32) / `u32`，因此 Copy。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DetailId(pub u32);
 
 impl Ty {
     /// 所有类型的家族分类（一次调用完成全部分派判断）。
@@ -306,21 +354,21 @@ impl Ty {
             Ty::Null => TypeFamily::Null,
             Ty::Void => TypeFamily::Void,
             // 内置泛型
-            Ty::Throw { .. } => TypeFamily::Throw,
-            Ty::Channel { .. } => TypeFamily::Channel,
-            Ty::Async { .. } => TypeFamily::Async,
-            Ty::Lazy { .. } => TypeFamily::Lazy,
-            Ty::Atomic { .. } => TypeFamily::Atomic,
-            Ty::Sender { .. } => TypeFamily::Sender,
-            Ty::Receiver { .. } => TypeFamily::Receiver,
+            Ty::Throw(_) => TypeFamily::Throw,
+            Ty::Channel(_) => TypeFamily::Channel,
+            Ty::Async(_) => TypeFamily::Async,
+            Ty::Lazy(_) => TypeFamily::Lazy,
+            Ty::Atomic(_) => TypeFamily::Atomic,
+            Ty::Sender(_) => TypeFamily::Sender,
+            Ty::Receiver(_) => TypeFamily::Receiver,
             // 复合
-            Ty::Array { .. } => TypeFamily::Array,
-            Ty::Ref { .. } => TypeFamily::Ref,
-            Ty::Fn { .. } => TypeFamily::Fn,
-            Ty::Nullable { .. } => TypeFamily::Nullable,
-            Ty::Trait { .. } => TypeFamily::Trait,
+            Ty::Array(_) => TypeFamily::Array,
+            Ty::Ref(_) => TypeFamily::Ref,
+            Ty::Fn(_) => TypeFamily::Fn,
+            Ty::Nullable(_) => TypeFamily::Nullable,
+            Ty::Trait(_) => TypeFamily::Trait,
             // 用户类型
-            Ty::Adt { .. } => TypeFamily::Adt,
+            Ty::Adt(_) => TypeFamily::Adt,
             // 特殊
             Ty::Never => TypeFamily::Never,
             Ty::TypeVar(_) => TypeFamily::TypeVar,
@@ -356,7 +404,10 @@ impl Ty {
 
     // ── 元信息方法（派生自 BUILTIN_TABLE）──
 
-    /// 类型名（标量返回 "i32"，Adt 返回 name，内置泛型返回 "Channel" 等）
+    /// 类型名（标量返回 "i32"，内置泛型返回 "Channel" 等，Adt/Trait 返回族名）
+    ///
+    /// 注意：Adt/Trait 的具体名字需通过 DefId 查 SemaResult 定义表，
+    /// 此方法仅返回族名（"adt"/"trait"）。
     pub fn name(&self) -> &str {
         match self {
             Ty::I8 => "i8", Ty::I16 => "i16", Ty::I32 => "i32", Ty::I64 => "i64", Ty::I128 => "i128",
@@ -365,19 +416,19 @@ impl Ty {
             Ty::F16 => "f16", Ty::F32 => "f32", Ty::F64 => "f64", Ty::F128 => "f128",
             Ty::Bool => "bool", Ty::Char => "char",
             Ty::Str => "str", Ty::Null => "null", Ty::Void => "void",
-            Ty::Throw { .. } => "Throw",
-            Ty::Channel { .. } => "Channel",
-            Ty::Async { .. } => "Async",
-            Ty::Lazy { .. } => "Lazy",
-            Ty::Atomic { .. } => "Atomic",
-            Ty::Sender { .. } => "Sender",
-            Ty::Receiver { .. } => "Receiver",
-            Ty::Array { .. } => "array",
-            Ty::Adt { name, .. } => name,
-            Ty::Trait { name, .. } => name,
-            Ty::Ref { .. } => "ref",
-            Ty::Fn { .. } => "fn",
-            Ty::Nullable { .. } => "nullable",
+            Ty::Throw(_) => "Throw",
+            Ty::Channel(_) => "Channel",
+            Ty::Async(_) => "Async",
+            Ty::Lazy(_) => "Lazy",
+            Ty::Atomic(_) => "Atomic",
+            Ty::Sender(_) => "Sender",
+            Ty::Receiver(_) => "Receiver",
+            Ty::Array(_) => "array",
+            Ty::Adt(_) => "adt",
+            Ty::Trait(_) => "trait",
+            Ty::Ref(_) => "ref",
+            Ty::Fn(_) => "fn",
+            Ty::Nullable(_) => "nullable",
             Ty::Never => "never",
             Ty::TypeVar(_) => "_",
             Ty::Unknown => "unknown",
@@ -385,16 +436,9 @@ impl Ty {
     }
 
     /// type_id（仅内置标量 + str/null/void 有，其他返回 None）
+    /// 派生自 BUILTIN_TABLE，消除硬编码数字。
     pub fn type_id(&self) -> Option<u16> {
-        match self {
-            Ty::I8 => Some(1), Ty::I16 => Some(2), Ty::I32 => Some(3), Ty::I64 => Some(4), Ty::I128 => Some(5),
-            Ty::U8 => Some(6), Ty::U16 => Some(7), Ty::U32 => Some(8), Ty::U64 => Some(9), Ty::U128 => Some(10),
-            Ty::Isize => Some(11), Ty::Usize => Some(12),
-            Ty::F16 => Some(13), Ty::F32 => Some(14), Ty::F64 => Some(15), Ty::F128 => Some(16),
-            Ty::Bool => Some(17), Ty::Char => Some(18),
-            Ty::Str => Some(19), Ty::Null => Some(20), Ty::Void => Some(21),
-            _ => None,
-        }
+        builtin_info_by_tag(self.to_value_tag()).map(|i| i.type_id)
     }
 
     /// 字节大小（标量: 1/2/4/8/16；str: 8；null/void: 0；复合: None）
@@ -462,16 +506,17 @@ impl Ty {
         }
         // 2. 内置泛型：裸名识别（支持 "Async" / "Async<i32>" 两种形式）
         //    裸名直接比较；带 type_args 的取 `<` 前的部分。
+        //    TypeHandle(0) 占位（family() 不读载荷，仅 match 枚举变体，占位安全）。
         let base_name = name.split('<').next().unwrap_or(name);
         let placeholder = TypeHandle(0);
         Some(match base_name {
-            "Throw" => Ty::Throw { value: placeholder, error: placeholder },
-            "Channel" => Ty::Channel { elem: placeholder },
-            "Async" => Ty::Async { value: placeholder },
-            "Lazy" => Ty::Lazy { value: placeholder },
-            "Atomic" => Ty::Atomic { elem: placeholder },
-            "Sender" => Ty::Sender { elem: placeholder },
-            "Receiver" => Ty::Receiver { elem: placeholder },
+            "Throw" => Ty::Throw(placeholder),
+            "Channel" => Ty::Channel(placeholder),
+            "Async" => Ty::Async(placeholder),
+            "Lazy" => Ty::Lazy(placeholder),
+            "Atomic" => Ty::Atomic(placeholder),
+            "Sender" => Ty::Sender(placeholder),
+            "Receiver" => Ty::Receiver(placeholder),
             _ => return None,
         })
     }
