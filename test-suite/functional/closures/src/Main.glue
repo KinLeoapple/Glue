@@ -1,0 +1,101 @@
+// 功能验证：闭包（捕获/var共享/逃逸/独立性/高阶函数/函数类型）
+// 注意：当前实现中，闭包修改的 var 无法被 == 直接比较（引擎 bug），
+// 因此本测试中闭包返回修改后的值，通过返回值比较来验证。
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+type IntFn = () -> i32
+
+// 逃逸闭包：捕获 mutable state
+fun makeCounter(): IntFn {
+    var n: i32 = 0
+    fun() {
+        n = n + 1
+        n
+    }
+}
+
+// 高阶函数
+fun apply(f: IntFn): i32 { f() }
+fun twice(f: IntFn): i32 { f() + f() }
+
+fun main(): void {
+    println("=== Closures ===")
+
+    // 捕获 val
+    val x: i32 = 10
+    val read = fun() { x }
+    check(read() == 10, "capture val")
+
+    // var 共享：闭包内修改后外部可见（已修复 P1 #6）
+    var y: i32 = 0
+    val inc = fun() { y = y + 1 }
+    inc(); inc(); inc()
+    check(y == 3, "var capture mutation visible externally")
+    inc()
+    check(y == 4, "var capture mutation after 4th call")
+
+    // var 共享：外部修改后闭包可见
+    var z: i32 = 10
+    val readZ = fun() { z }
+    z = 20
+    check(readZ() == 20, "external mutation visible in closure")
+
+    // 逃逸闭包：状态持久
+    val c = makeCounter()
+    check(c() == 1, "counter 1")
+    check(c() == 2, "counter 2")
+    check(c() == 3, "counter 3")
+
+    // 独立性
+    val a = makeCounter()
+    val b = makeCounter()
+    check(a() == 1, "independent counter a 1")
+    check(a() == 2, "independent counter a 2")
+    check(b() == 1, "independent counter b 1")
+
+    // 嵌套闭包共享 var：inner 返回修改后的值
+    var count: i32 = 0
+    val inner = fun() { count = count + 1; count }
+    val outer = fun() {
+        inner()
+        inner()
+    }
+    outer()
+    check(inner() == 3, "nested closures share var 1")
+    outer()
+    check(inner() == 6, "nested closures share var 2")
+
+    // 高阶函数
+    val f = fun() { 42 }
+    check(apply(f) == 42, "apply")
+    check(twice(f) == 84, "twice")
+
+    // 函数类型
+    val g = fun() { 100 }
+    check(g() == 100, "function value")
+
+    // 闭包捕获并运算
+    val base: i32 = 100
+    val adder = fun(n: i32) { base + n }
+    check(adder(5) == 105, "closure with parameter")
+
+    summary()
+}

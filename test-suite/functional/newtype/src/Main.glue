@@ -1,0 +1,103 @@
+// 功能验证：Newtype 类型安全（构造/相等/类型隔离/match 解包）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+type Celsius = Celsius(f64)
+type Fahrenheit = Fahrenheit(f64)
+type UserId = UserId(i64)
+type Email = Email(str)
+type Meters = Meters(f64)
+
+fun main(): void {
+    println("=== Newtype ===")
+
+    // 构造
+    val c = Celsius(100.0)
+    val uid = UserId(42)
+    val email = Email("test@example.com")
+    val m = Meters(5.0)
+
+    // 相等性（已修复 P1 #1：!= 不再始终返回 false）
+    check(Celsius(100.0) == Celsius(100.0), "Celsius equality")
+    check(UserId(42) == UserId(42), "UserId equality")
+    check(Email("a@b.com") == Email("a@b.com"), "Email equality")
+    check(Meters(5.0) == Meters(5.0), "Meters equality")
+
+    // newtype 不等（!= 修复后可用）
+    check(Celsius(100.0) != Celsius(50.0), "Celsius inequality (!=)")
+    check(UserId(42) != UserId(7), "UserId inequality (!=)")
+    check(Email("a@b.com") != Email("c@d.com"), "Email inequality (!=)")
+    check(!(Meters(5.0) != Meters(5.0)), "Meters equality via !(!=)")
+
+    // 类型安全：不同 newtype 即使底层相同也不互通
+    // （编译期类型隔离，此处验证运行时不报错）
+    val temp1 = Celsius(50.0)
+    val temp2 = Fahrenheit(50.0)
+    check(temp1 == Celsius(50.0), "Celsius type isolation")
+    check(temp2 == Fahrenheit(50.0), "Fahrenheit type isolation")
+
+    // newtype 作为函数参数
+    val m1 = Meters(3.0)
+    val m2 = Meters(4.0)
+    check(m1 == Meters(3.0), "Meters 3.0 preserved")
+    check(m2 == Meters(4.0), "Meters 4.0 preserved")
+
+    // newtype 数组
+    val temps: Celsius[] = [Celsius(0.0), Celsius(10.0), Celsius(20.0)]
+    check(temps[0] == Celsius(0.0), "newtype array elem 0")
+    check(temps[1] == Celsius(10.0), "newtype array elem 1")
+    check(temps[2] == Celsius(20.0), "newtype array elem 2")
+
+    // newtype 数组拼接
+    val more = temps ++ [Celsius(30.0)]
+    check(more[3] == Celsius(30.0), "newtype array concat")
+
+    // newtype match 解包（已修复 P0 #13）
+    fun areaM(m: Meters): f64 {
+        match m {
+            Meters(v) => v * v
+        }
+    }
+    check(areaM(Meters(5.0)) == 25.0, "newtype match unpack f64")
+
+    fun celsiusRaw(c: Celsius): f64 {
+        match c {
+            Celsius(v) => v
+        }
+    }
+    check(celsiusRaw(Celsius(100.0)) == 100.0, "newtype match unpack and return")
+
+    fun userIdRaw(u: UserId): i64 {
+        match u {
+            UserId(id) => id
+        }
+    }
+    check(userIdRaw(UserId(42)) == 42, "newtype match unpack i64")
+
+    // newtype match 在表达式中使用
+    fun doubleMeters(m: Meters): Meters {
+        match m {
+            Meters(v) => Meters(v * 2.0)
+        }
+    }
+    check(doubleMeters(Meters(3.0)) == Meters(6.0), "newtype match repackage")
+
+    summary()
+}

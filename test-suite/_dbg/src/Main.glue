@@ -1,0 +1,24 @@
+// Bug #12 复现：trait 默认方法返回 <non-scalar>
+trait Greet {
+    fun name(self): str
+    fun hello(self): str {
+        "Hello, " + self.name()
+    }
+}
+
+// 未显式实现 hello，使用 trait 默认实现
+type Ordering: Greet = | Lt | Eq | Gt {
+    fun name(self): str {
+        match self {
+            Lt => "less"
+            Eq => "equal"
+            Gt => "greater"
+        }
+    }
+}
+
+fun main(): void {
+    println("=== Bug #12 repro ===")
+    println(Lt.name())
+    println(Lt.hello())
+}

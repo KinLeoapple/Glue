@@ -1,0 +1,98 @@
+// 功能验证：算术运算（整数/浮点/运算符优先级/混合类型）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Arithmetic ===")
+
+    // 基本四则运算
+    check(1 + 2 == 3, "add")
+    check(10 - 7 == 3, "sub")
+    check(6 * 7 == 42, "mul")
+    check(100 / 7 == 14, "integer div")
+    check(100 % 7 == 2, "mod")
+
+    // 负数运算
+    check(-5 + 3 == -2, "negative add")
+    check(-10 - (-3) == -7, "double negative sub")
+    check(-3 * 4 == -12, "negative mul")
+    check(-100 / 7 == -14, "negative div (truncation)")
+    check(-100 % 7 == -2, "negative mod (truncation)")
+
+    // 零
+    check(0 + 0 == 0, "zero add")
+    check(5 * 0 == 0, "zero mul")
+    check(0 / 5 == 0, "zero dividend")
+
+    // 运算符优先级
+    check(1 + 2 * 3 == 7, "precedence: mul before add")
+    check(2 * 3 + 1 == 7, "precedence: mul before add reversed")
+    check(10 - 2 - 3 == 5, "left assoc: sub")
+    check(100 / 10 / 2 == 5, "left assoc: div")
+    check((1 + 2) * 3 == 9, "parentheses override")
+    check(2 + 3 * 4 - 1 == 13, "mixed precedence")
+
+    // 整数除法截断
+    check(7 / 2 == 3, "truncation: 7/2=3")
+    check(-7 / 2 == -3, "truncation: -7/2=-3")
+    check(7 / (-2) == -3, "truncation: 7/-2=-3")
+    check(-7 / (-2) == 3, "truncation: -7/-2=3")
+
+    // div/mod 不变式
+    val a: i32 = 100
+    val b: i32 = 7
+    check((a / b) * b + (a % b) == a, "div/mod invariant positive")
+    val na: i32 = -100
+    check((na / b) * b + (na % b) == na, "div/mod invariant negative")
+
+    // 浮点运算
+    check(1.0f64 + 2.0f64 == 3.0f64, "float add")
+    check(10.0f64 - 7.0f64 == 3.0f64, "float sub")
+    check(6.0f64 * 7.0f64 == 42.0f64, "float mul")
+    check(10.0f64 / 4.0f64 == 2.5f64, "float div exact")
+
+    // 浮点精度
+    check(0.1f64 + 0.2f64 != 0.3f64, "float precision: 0.1+0.2 != 0.3")
+
+    // i64 运算
+    val big: i64 = 1000000000
+    check(big * 2i64 == 2000000000i64, "i64 mul")
+    check(big + big == 2000000000i64, "i64 add")
+
+    // 混合大小运算（需要 cast）
+    val x: i32 = 100
+    val y: i64 = cast(x).to(i64) + 1i64
+    check(y == 101i64, "i32 to i64 cast + add")
+
+    // augmented assignment
+    var acc: i32 = 0
+    acc = acc + 10
+    check(acc == 10, "plus assignment")
+    acc = acc - 3
+    check(acc == 7, "minus assignment")
+    acc = acc * 2
+    check(acc == 14, "mul assignment")
+    acc = acc / 3
+    check(acc == 4, "div assignment")
+    acc = acc % 3
+    check(acc == 1, "mod assignment")
+
+    summary()
+}

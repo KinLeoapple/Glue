@@ -1,0 +1,89 @@
+// 功能验证：记录类型（构造/字段访问/更新/嵌套/相等/不等/解构）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+type Point = Point(x: i32, y: i32)
+type Person = Person(name: str, age: i32)
+type Box = Box(inner: Point)
+
+fun quadrant(pt: Point): i32 {
+    match pt {
+        Point(x, y) if x > 0 && y > 0 => 1
+        Point(x, y) if x < 0 && y > 0 => 2
+        Point(x, y) if x < 0 && y < 0 => 3
+        Point(x, y) if x > 0 && y < 0 => 4
+        _ => 0
+    }
+}
+
+fun main(): void {
+    println("=== Records ===")
+
+    // 构造与字段访问
+    val p = Point(3, 4)
+    check(p.x == 3, "field access x")
+    check(p.y == 4, "field access y")
+
+    // 相等性（值语义）
+    val p2 = Point(3, 4)
+    check(p == p2, "record value equality")
+
+    // 不等（已修复 P1 #1：record != 不再始终返回 false）
+    val p3 = Point(5, 6)
+    check(p != p3, "record inequality (!=)")
+    check(p.x != p3.x, "record inequality via field x")
+    check(p.y != p3.y, "record inequality via field y")
+    check(!(p != p2), "record equality via !(!=)")
+
+    // 字符串字段
+    val person = Person("Alice", 30)
+    check(person.name == "Alice", "str field name")
+    check(person.age == 30, "int field age")
+
+    // 嵌套记录
+    val box = Box(Point(1, 2))
+    check(box.inner.x == 1, "nested field access")
+    check(box.inner.y == 2, "nested field access y")
+
+    // 记录更新（显式构造，非 spread）
+    val older = Person(person.name, 31)
+    check(older.name == "Alice", "updated keeps name")
+    check(older.age == 31, "updated age")
+    check(person.age == 30, "original unchanged after update")
+
+    // 记录数组
+    val pts = [Point(0, 0), Point(1, 1), Point(2, 2)]
+    check(pts[1].x == 1, "record array elem 1 x")
+    check(pts[2].y == 2, "record array elem 2 y")
+
+    // 记录解构（match）
+    check(quadrant(Point(1, 1)) == 1, "quadrant 1")
+    check(quadrant(Point(-1, 1)) == 2, "quadrant 2")
+    check(quadrant(Point(-1, -1)) == 3, "quadrant 3")
+    check(quadrant(Point(1, -1)) == 4, "quadrant 4")
+    check(quadrant(Point(0, 0)) == 0, "quadrant origin")
+
+    // var 记录可变更新
+    var mp = Point(0, 0)
+    mp.x = 10
+    check(mp.x == 10, "var record field update")
+
+    summary()
+}

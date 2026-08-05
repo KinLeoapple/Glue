@@ -1,0 +1,36 @@
+// 性能测试：match 分派（压测模式匹配/ADT 构造/分派开销）
+
+type Op = | Add | Sub | Mul | Div
+
+fun compute(op: Op, a: i32, b: i32): i32 {
+    match op {
+        Add => a + b
+        Sub => a - b
+        Mul => a * b
+        Div => a / b
+    }
+}
+
+fun main(): void {
+    println("=== Match Dispatch Benchmark ===")
+
+    var sum: i32 = 0
+    val t0 = __instant_now_ns()
+    var i: i32 = 0
+    while i < 1000000 {
+        val op = match i % 4 {
+            0 => Add
+            1 => Sub
+            2 => Mul
+            _ => Div
+        }
+        sum = sum + compute(op, i, 3)
+        i = i + 1
+    }
+    val t1 = __instant_now_ns()
+    println("sum = {sum}")
+    val elapsed = (t1 - t0) / 1000000i64
+    println("elapsed: {elapsed} ms")
+
+    println("=== Done ===")
+}

@@ -1,0 +1,78 @@
+// 功能验证：位运算（AND/OR/XOR/NOT/移位/优先级/位操作）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Bitwise ===")
+
+    // 基本位运算（== 优先级高于位运算，需加括号）
+    check((0xFF & 0x0F) == 0x0F, "AND")
+    check((0xF0 | 0x0F) == 0xFF, "OR")
+    check((0xFF ^ 0x0F) == 0xF0, "XOR")
+    check((0xAA ^ 0xFF) == 0x55, "XOR all-ones = NOT")
+
+    // 移位
+    check((1 << 4) == 16, "left shift")
+    check((256 >> 4) == 16, "right shift")
+    check((1 << 0) == 1, "shift by zero")
+
+    // 运算符优先级
+    check((1 + 2 << 3) == 24, "precedence: + before <<")
+    check((0xFF & 0x0F | 0xF0) == 0xFF, "precedence: & before |")
+
+    // XOR 交换
+    var a: i32 = 42
+    var b: i32 = 99
+    a = a ^ b
+    b = a ^ b
+    a = a ^ b
+    check(a == 99, "XOR swap a")
+    check(b == 42, "XOR swap b")
+
+    // 位提取
+    val v: i32 = 0x12345678
+    check(((v >> 0) & 0xFF) == 0x78, "extract byte 0")
+    check(((v >> 8) & 0xFF) == 0x56, "extract byte 1")
+    check(((v >> 16) & 0xFF) == 0x34, "extract byte 2")
+    check(((v >> 24) & 0xFF) == 0x12, "extract byte 3")
+
+    // 位组装
+    val assembled: i32 = (0x12 << 24) | (0x34 << 16) | (0x56 << 8) | 0x78
+    check(assembled == 0x12345678, "bit assembly")
+
+    // u8 位运算
+    val u: u8 = 0xFF
+    check((u & 0x0F) == 0x0F, "u8 AND")
+    check((u | 0x00) == 0xFF, "u8 OR")
+
+    // 有符号右移
+    val si: i32 = -16
+    check((si >> 2) == -4, "arithmetic right shift negative")
+
+    // 按位取反
+    val z: i32 = 0
+    check((~z) == -1, "NOT zero = -1")
+
+    // 字面量
+    check(0b1010 == 10, "binary literal")
+    check(0o777 == 511, "octal literal")
+
+    summary()
+}
