@@ -2388,7 +2388,7 @@ pub struct LoopContext {
 /// `family` 为 `TypeFamily` 枚举（统一类型族，调用方用 `|` 合并整数变体按位宽分派）。
 pub struct ScalarMeta {
     pub arith_base: u32,
-    pub family: crate::Type::TypeFamily,
+    pub family: crate::types::TypeFamily,
     pub is_float: bool,
 }
 

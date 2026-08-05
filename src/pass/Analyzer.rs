@@ -9,7 +9,7 @@ use crate::ast::Ast::{
     SelectArm, Stmt, StmtId, Visibility,
 };
 use crate::sema::Sema::{module_expr_key, ConstVal, SemaResult};
-use crate::Type::dynamic_type_id;
+use crate::types::dynamic_type_id;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 // =========================================================================

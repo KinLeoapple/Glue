@@ -2733,10 +2733,10 @@ impl<'a> IrBuilder<'a> {
     /// 类型族：返回 `TypeFamily`（调用方用 `|` 合并整数变体按位宽分派）。
     /// i8/i16/u8/u16/u32/char → SignedInt32/UnsignedInt32/Char；i64/u64/isize/usize → SignedInt64/UnsignedInt64；
     /// i128/u128 → SignedInt128/UnsignedInt128；bool → Bool；浮点 → Float。
-    fn int_family(ty_name: &str) -> crate::Type::TypeFamily {
+    fn int_family(ty_name: &str) -> crate::types::TypeFamily {
         match crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta) {
             Some(m) => m.family,
-            None => crate::Type::TypeFamily::SignedInt32, // 未知整数类型回退到 Int32 路径
+            None => crate::types::TypeFamily::SignedInt32, // 未知整数类型回退到 Int32 路径
         }
     }
 
@@ -2759,7 +2759,7 @@ impl<'a> IrBuilder<'a> {
         let ty_meta = crate::Value::ValueTag::from_name(ty_name).and_then(scalar_meta);
         let is_float = ty_meta.as_ref().map(|m| m.is_float).unwrap_or(false);
         // is_int：非浮点且非 bool（复用 TypeFamily 枚举，消除字符串比较）
-        let is_int = !is_float && Self::int_family(ty_name) != crate::Type::TypeFamily::Bool;
+        let is_int = !is_float && Self::int_family(ty_name) != crate::types::TypeFamily::Bool;
         let base = Self::arith_base(ty_name);
 
         // Elvis (??) 运算：lhs 为 null 时返回 rhs，否则返回 lhs。
@@ -2855,7 +2855,7 @@ impl<'a> IrBuilder<'a> {
         // 比较运算：结果为 bool，输入按类型族读取
         // fam 为 TypeFamily 枚举，用 | 合并有符号/无符号整数变体按位宽分派（编译器穷尽检查）
         let fam = Self::int_family(ty_name);
-        use crate::Type::TypeFamily;
+        use crate::types::TypeFamily;
         match op {
             crate::ast::Ast::BinaryOp::Eq => {
                 if is_float { CF_EQ_F64 }     // eq_f64
@@ -3670,7 +3670,7 @@ impl<'a> IrBuilder<'a> {
                         .sema
                         .type_def_index
                         .get(ty.as_str())
-                        .map(|&idx| crate::Type::dynamic_type_id(idx));
+                        .map(|&idx| crate::types::dynamic_type_id(idx));
                 }
             }
         }
@@ -3686,7 +3686,7 @@ impl<'a> IrBuilder<'a> {
         self.sema
             .type_def_index
             .get(type_name)
-            .map(|&idx| crate::Type::dynamic_type_id(idx))
+            .map(|&idx| crate::types::dynamic_type_id(idx))
     }
 
     /// 构建 Await 节点：EventSource 声明 + Await 节点（spec 4.5，未就绪→帧挂起）。
@@ -3743,8 +3743,8 @@ impl<'a> IrBuilder<'a> {
             if let Some(ref tn) = info.type_name {
                 let tn = tn.as_ref();
                 // 内置泛型：派生自 Ty::from_type_name + family()（消除 starts_with 前缀匹配）
-                if let Some(ty) = crate::Type::Ty::from_type_name(tn) {
-                    use crate::Type::TypeFamily;
+                if let Some(ty) = crate::types::Ty::from_type_name(tn) {
+                    use crate::types::TypeFamily;
                     match ty.family() {
                         TypeFamily::Async => return EventSourceKind::AsyncJoin,
                         TypeFamily::Channel | TypeFamily::Receiver => return EventSourceKind::Channel,
@@ -4483,7 +4483,7 @@ impl<'a> IrBuilder<'a> {
 
         // 从 method_subgraphs 获取预注册的 sg_id（build() 步骤 0a 已创建）
         let type_id = match self.sema.type_def_index.get(type_name) {
-            Some(&idx) => crate::Type::dynamic_type_id(idx),
+            Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
         let sg_id = match self.method_subgraphs.get(&(type_id, method_idx as u16)) {
@@ -4551,7 +4551,7 @@ impl<'a> IrBuilder<'a> {
 
         // 从 method_subgraphs 获取预注册的 sg_id（build() 步骤 0a 已创建）
         let type_id = match self.sema.type_def_index.get(type_name) {
-            Some(&idx) => crate::Type::dynamic_type_id(idx),
+            Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
         let sg_id = match self.method_subgraphs.get(&(type_id, method_idx as u16)) {
@@ -4624,7 +4624,7 @@ impl<'a> IrBuilder<'a> {
             None => return,
         };
         let type_id = match self.sema.type_def_index.get(impl_type_name) {
-            Some(&idx) => crate::Type::dynamic_type_id(idx),
+            Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
         let sg_id = match self.trait_default_subgraphs.get(&(type_id, trait_idx, method_idx as u16)) {
@@ -4703,7 +4703,7 @@ impl<'a> IrBuilder<'a> {
         for m in &all_modules {
             for d in &m.declarations {
                 if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
-                    let type_id = self.sema.type_def_index.get(*name).map(|&idx| crate::Type::dynamic_type_id(idx));
+                    let type_id = self.sema.type_def_index.get(*name).map(|&idx| crate::types::dynamic_type_id(idx));
                     if let Some(tid) = type_id {
                         for (method_idx, method) in methods.iter().enumerate() {
                             if method.body.is_some() {

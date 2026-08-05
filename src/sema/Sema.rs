@@ -1,6 +1,6 @@
 //! Sema.rs — 语义分析核心数据结构
 //!
-//! 类型系统单一真相源为 `crate::Type`（`Ty` / `TypeArena` / `TypeOps`）。
+//! 类型系统单一真相源为 `crate::types`（`Ty` / `TypeArena` / `TypeOps`）。
 //! 不再依赖 `ConcreteType` / `TypeDescriptor`——干净切除，无兼容层。
 //!
 //! 关键设计：
@@ -10,13 +10,13 @@
 //! - **`Box<str>` / `Box<[...]>`** 持有复合类型自身数据，所有权清晰。
 //! - **`Result<(), UnifyError>`** 替代 Zig error union；`EnvArena` + `EnvId` 索引。
 //!
-//! 依赖关系：单向依赖 `crate::Type`（`Ty` / `TypeArena` / `TypeOps` / `DynamicOpsRegistry`）
+//! 依赖关系：单向依赖 `crate::types`（`Ty` / `TypeArena` / `TypeOps` / `DynamicOpsRegistry`）
 //! 以及 `crate::Ast`（`TypeRef`，仅 `CtorDefInfo` 的 GADT 回溯字段引用）。
 
 use crate::ast::Ast::{
     AstArena, Decl, TypeNode, TypeRef as AstTypeRef,
 };
-use crate::Type::{
+use crate::types::{
     FIRST_DYNAMIC_TYPE_ID, type_def_index_of,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 // 从 Type 模块 re-export 所有类型系统符号（打破 Type↔sema 循环依赖）。
 // sema 子模块（Inference.rs / Relations.rs / Monomorph.rs）通过
 // `use crate::sema::Sema::*;` glob import 获取这些符号。
-pub use crate::Type::{
+pub use crate::types::{
     TypeHandle, Ty, TypeFamily, DetailId, EnvId, FieldType, TraitMethodSig,
     SemKind, TypeVar, UnifyError, ArenaSnapshot, SnapshotId, TypeStateSnapshot,
     TypeArena, TypeDetail, TypeDisplay,

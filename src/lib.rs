@@ -2,7 +2,7 @@
 
 pub mod ast;
 
-pub mod Type;
+pub mod types;
 
 #[path = "Value.rs"]
 pub mod Value;
@@ -18,6 +18,6 @@ pub mod module;
 
 pub mod ir;
 
-pub mod Engine;
+pub mod engine;
 
 pub mod pass;

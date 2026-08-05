@@ -2339,7 +2339,7 @@ impl<'a> InferContext<'a> {
 
     /// 整数后缀 → 对应整型 TypeHandle（派生自 `BUILTIN_TABLE`，未命中返回 `None`）。
     fn int_suffix_to_type(&mut self, suffix: &str) -> Option<TypeHandle> {
-        let tag = crate::Type::ValueTag::from_name(suffix)?;
+        let tag = crate::types::ValueTag::from_name(suffix)?;
         if tag.is_int() {
             Some(self.arena.from_scalar_name(suffix))
         } else {
@@ -2349,7 +2349,7 @@ impl<'a> InferContext<'a> {
 
     /// 浮点后缀 → 对应浮点 TypeHandle（派生自 `BUILTIN_TABLE`，未命中返回 `None`）。
     fn float_suffix_to_type(&mut self, suffix: &str) -> Option<TypeHandle> {
-        let tag = crate::Type::ValueTag::from_name(suffix)?;
+        let tag = crate::types::ValueTag::from_name(suffix)?;
         if tag.is_float() {
             Some(self.arena.from_scalar_name(suffix))
         } else {
@@ -3905,7 +3905,7 @@ impl<'a> InferContext<'a> {
 ///
 /// 类型名统一为小写（与 .glue 源码语法一致）：null/void/bool/char/str 及各数值类型。
 fn name_to_concrete(name: &str) -> Option<Ty> {
-    use crate::Type::{builtin_info_by_name, ValueTag};
+    use crate::types::{builtin_info_by_name, ValueTag};
     let info = builtin_info_by_name(name)?;
     let ct = match info.value_tag {
         ValueTag::I8 => Ty::I8,
@@ -3938,7 +3938,7 @@ fn name_to_concrete(name: &str) -> Option<Ty> {
 /// 替代原静态 `NUMERIC_BUILTIN_NAMES` 表，自动同步 BUILTIN_TABLE 变更。
 /// 包含所有标量（含 bool/char，与原表一致），排除 str/null/void。
 fn numeric_builtin_names() -> Vec<(&'static str, Ty)> {
-    use crate::Type::{BUILTIN_TABLE, ValueTag};
+    use crate::types::{BUILTIN_TABLE, ValueTag};
     BUILTIN_TABLE.iter()
         .filter(|s| !matches!(s.value_tag, ValueTag::Ref | ValueTag::Null | ValueTag::Void))
         .filter_map(|s| {

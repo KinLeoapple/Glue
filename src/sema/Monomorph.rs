@@ -1497,7 +1497,7 @@ fn resolve_stmt<'a, 'b>(stmt: StmtId, ctx: &mut ResolveCtx<'a, 'b>, arena: &mut 
             // i8/i16/i128/isize/usize/f16/char 等 7 种标量类型。
             let iter_type_name: String = arena.type_name(iter_h).unwrap_or("unknown").to_string();
             let is_non_iterator = iter_type_name == "array"
-                || crate::Type::builtin_info_by_name(&iter_type_name).is_some();
+                || crate::types::builtin_info_by_name(&iter_type_name).is_some();
             if is_non_iterator {
                 ctx.sema_result.add_error(SemaError::new(
                     &format!(
@@ -1763,7 +1763,7 @@ pub fn collect_trait_default_instances<'a>(
                 .filter_map(|e| {
                     // type_id → type_name（反查 type_defs）
                     sema_result.type_defs.iter().enumerate()
-                        .find(|(i, _)| crate::Type::dynamic_type_id(*i as u16) == e.type_id)
+                        .find(|(i, _)| crate::types::dynamic_type_id(*i as u16) == e.type_id)
                         .map(|(_, td)| (e.type_id, td.name.to_string()))
                 })
                 .collect();

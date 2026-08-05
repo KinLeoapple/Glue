@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 
 use glue::ast::Ast::{Module, Printer};
 use glue::ast::Parser::{ErrorCollector, Lexer, Parser as GlueParser, Token, TokenCollector};
-use glue::Engine::EngineRef;
+use glue::engine::EngineRef;
 use glue::pass::Analyzer;
 use glue::ir::Builder::IrBuilder;
 use glue::module::ModuleLoader;

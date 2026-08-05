@@ -150,7 +150,7 @@ pub extern "C" fn __reflect_type_name(handle: u32, out_data: *mut *const u8, out
     let h = ValueHandle::from_raw(handle);
     let tag = h.tag();
     if tag != ValueTag::Ref {
-        let info = crate::Type::builtin_info_by_tag(tag)
+        let info = crate::types::builtin_info_by_tag(tag)
             .expect("non-Ref ValueTag must be in BUILTIN_TABLE");
         // info.name 是 &'static str，指针 'static 有效，无悬垂风险
         write_slice_out(info.name.as_bytes(), out_data, out_len);

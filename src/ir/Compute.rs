@@ -13,7 +13,7 @@
 
 use super::Ir::*;
 use crate::Value::Value;
-use crate::Engine::{prepare_frame_nodes, switch_subgraph, notify_downstream};
+use crate::engine::{prepare_frame_nodes, switch_subgraph, notify_downstream};
 
 // =========================================================================
 // 哨兵常量 — 集中定义，避免散落魔数

@@ -17,7 +17,7 @@ pub mod Tag;
 
 // 注意：Ty.rs 中的核心类型 `Ty` 枚举与模块同名。
 // 若用 `pub mod Ty;`，模块名会遮蔽 glob re-export 的 `Ty` 枚举，
-// 导致 `crate::Type::Ty` 指向模块而非枚举，破坏外部引用。
+// 导致 `crate::types::Ty` 指向模块而非枚举，破坏外部引用。
 // 因此用 `#[path]` 将模块命名为 `ty`（私有），仅通过 glob re-export 暴露其 pub 项。
 #[path = "Ty.rs"]
 mod ty;

@@ -14,7 +14,7 @@ use pastey::paste;
 use wide::{f32x4, f64x4, i8x16, i16x8, i32x4, i64x4, u8x16, u16x8, u32x4, u64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, CmpNe};
 
 // 从 Type 模块 re-export 类型判别标签
-pub use crate::Type::ValueTag;
+pub use crate::types::ValueTag;
 
 // =========================================================================
 // 第一部分：标量基础类型（scalar.rs + char.rs）
