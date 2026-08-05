@@ -1,5 +1,0 @@
-/target
-Cargo.lock
-
-# 中间产物全部在 OUT_DIR 中生成，编译后立即删除，源码目录无残留
-# （type_table.c/h 由 build.rs 调用 glue check 生成到 OUT_DIR，Raw.c 同理）

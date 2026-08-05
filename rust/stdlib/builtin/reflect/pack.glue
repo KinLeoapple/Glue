@@ -1,5 +1,0 @@
-// builtin reflect 包声明
-//
-// 暴露 Reflect 子模块给所有 Glue 用户代码默认可见（builtin 默认全可见）。
-// Reflect.format 为泛型格式化入口，供 builtin/io/Console.glue 的 println 等调用。
-pub pack Reflect
